@@ -11,7 +11,7 @@ pub(super) struct PrefSearchEntry {
 }
 
 macro_rules! entry {
-    ($anchor:literal, $page:ident, $title:literal, [$($keyword:literal),* $(,)?]) => {
+    ($anchor:literal, $page:ident, $title:expr, [$($keyword:literal),* $(,)?]) => {
         PrefSearchEntry {
             anchor: $anchor,
             page: PreferencesPage::$page,
@@ -175,6 +175,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["場所", "表示状態", "見開き", "ソート", "リセット", "クリア"]
     ),
     entry!(
+        "thumbnail/rating-sort-unrated",
+        Thumbnail,
+        "評価順での未評価の位置",
+        ["評価", "未評価", "並び", "ソート", "レーティング", "星"]
+    ),
+    entry!(
         "thumbnail/category-order",
         Thumbnail,
         "グリッドのカテゴリ表示順",
@@ -185,6 +191,27 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         Thumbnail,
         "動画サムネイルの目印",
         ["再生アイコン", "左下バッジ", "非表示"]
+    ),
+    entry!(
+        "thumbnail/audio-indicator",
+        Thumbnail,
+        "音声サムネイルの目印",
+        ["音声", "音楽", "マーク", "左下バッジ", "非表示"]
+    ),
+    entry!(
+        "thumbnail/resume-meter",
+        Thumbnail,
+        "本・動画・音声のサムネイルに前回の位置を表示",
+        [
+            "読書",
+            "再生位置",
+            "動画",
+            "音声",
+            "進捗",
+            "メーター",
+            "ZIP",
+            "PDF"
+        ]
     ),
     entry!(
         "thumbnail/idle-upgrade",
@@ -225,6 +252,34 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["詳細表示", "列設定", "専用設定"]
     ),
     entry!(
+        "thumbnail/details-name-colors",
+        Thumbnail,
+        "名前の色分け",
+        [
+            "詳細一覧",
+            "名前",
+            "色",
+            "フォルダ",
+            "本",
+            "単体画像",
+            "RAW",
+            "動画",
+            "音声",
+            "Light",
+            "Dark",
+            "HEX",
+            "カスタム",
+            "既定",
+            "コントラスト",
+            "通常行",
+            "交互行",
+            "hover",
+            "選択",
+            "チェック",
+            "切り取り"
+        ]
+    ),
+    entry!(
         "thumbnail/tooltip-items",
         Thumbnail,
         "ツールチップに表示する項目:",
@@ -253,6 +308,37 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         Capture,
         "保存形式",
         ["PNG", "JPEG", "JPG", "キャプチャ"]
+    ),
+    entry!(
+        "clipboard-capture/image",
+        ClipboardCapture,
+        "画像がコピーされたら自動で保存する",
+        [
+            "クリップボード",
+            "clipboard",
+            "コピー",
+            "画像",
+            "自動保存",
+            "監視"
+        ]
+    ),
+    entry!(
+        "clipboard-capture/folder",
+        ClipboardCapture,
+        "保存先フォルダ",
+        [
+            "クリップボード",
+            "clipboard",
+            "保存場所",
+            "出力先",
+            "既定に戻す"
+        ]
+    ),
+    entry!(
+        "clipboard-capture/html",
+        ClipboardCapture,
+        "ページ (HTML) がコピーされたら、含まれる画像を選んで保存できるようにする",
+        ["クリップボード", "HTML", "ページ", "画像", "コピー", "監視"]
     ),
     entry!(
         "capture/folder",
@@ -292,13 +378,49 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         "menu/layout",
         MenuLayout,
         "メニューバーの上位メニューと固定項目の表示順を変更します。登録済みお気に入り、タグ一覧、更新確認など状態で変わる項目は固定位置に残ります。",
-        ["メニュー構成", "表示", "非表示", "並べ替え", "順番"]
+        [
+            "通常メニュー",
+            "メニューバー",
+            "表示",
+            "非表示",
+            "並べ替え",
+            "順番"
+        ]
+    ),
+    entry!(
+        "context-menu/layout",
+        ContextMenuLayout,
+        "確認する表示場面",
+        [
+            "右クリックメニュー",
+            "コンテキストメニュー",
+            "区切り線",
+            "余白",
+            "ファイル",
+            "表示",
+            "非表示",
+            "並べ替え"
+        ]
     ),
     entry!(
         "parallelism/mode",
         Parallelism,
         "手動",
         ["自動", "スレッド", "CPU", "並列", "parallel"]
+    ),
+    entry!(
+        "raw-develop/settings",
+        RawDevelop,
+        "同時現像数:",
+        [
+            "RAW",
+            "現像",
+            "明るさ",
+            "プレビュー",
+            "補正しない",
+            "LibRaw",
+            "メモリ"
+        ]
     ),
     entry!(
         "parallelism/pdf",
@@ -433,10 +555,33 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["対応アーカイブ", "変換", "無視"]
     ),
     entry!(
+        "cache/epub-handling",
+        Cache,
+        "EPUB の処理",
+        ["確認", "PDF に変換", "無視"]
+    ),
+    entry!(
         "cache/archive-limit",
         Cache,
         "容量上限を有効にする",
         ["変換済みアーカイブ", "キャッシュ", "無制限", "MB"]
+    ),
+    entry!(
+        "folder/organize-destinations",
+        Folder,
+        "ファイル整理先",
+        [
+            "コピー",
+            "移動",
+            "登録",
+            "表示名",
+            "パス",
+            "順序",
+            "場所",
+            "表示",
+            "Remote",
+            "メニュー"
+        ]
     ),
     entry!(
         "folder/hidden-files",
@@ -506,7 +651,7 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     entry!(
         "duplicate/archive-folder",
         DuplicateFiles,
-        "同名の ZIP/PDF/RAR/7z/LZH ファイルとフォルダがある場合、アーカイブ側をスキップ",
+        "同名の ZIP/PDF/EPUB/RAR/7z/LZH ファイルとフォルダがある場合、本側をスキップ",
         ["重複", "同名", "archive"]
     ),
     entry!(
@@ -516,10 +661,16 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["重複", "優先", "archive"]
     ),
     entry!(
+        "duplicate/epub-pdf",
+        DuplicateFiles,
+        "同名の EPUB と PDF がある場合、PDF だけ表示",
+        ["重複", "優先", "本"]
+    ),
+    entry!(
         "duplicate/video-image",
         DuplicateFiles,
-        "同名の動画と画像がある場合、画像をスキップ",
-        ["重複", "sidecar", "サイドカー"]
+        "同名の動画・音声がある画像を省略",
+        ["重複", "動画", "音声", "sidecar", "サイドカー"]
     ),
     entry!(
         "duplicate/image-priority",
@@ -540,10 +691,41 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["MakerNote", "内部名", "EXIF タグ"]
     ),
     entry!(
+        "spread/chrome-suppression",
+        SpreadMode,
+        crate::ui_helpers::FULLSCREEN_CHROME_SUPPRESSION_SETTING_LABEL,
+        [
+            "F11",
+            "固定",
+            "ロック",
+            "上部バー",
+            "下部バー",
+            "ストリップ",
+            "右情報パネル",
+            "ナビゲータ"
+        ]
+    ),
+    entry!(
         "spread/side-panels",
         SpreadMode,
         "左右パネルの表示",
         ["サイドパネル", "ホバー", "クリック"]
+    ),
+    entry!(
+        "spread/image-margin-color",
+        SpreadMode,
+        "画像・動画の余白色",
+        [
+            "フルスクリーン",
+            "背景色",
+            "余白",
+            "レターボックス",
+            "サムネイル",
+            "黒",
+            "灰",
+            "白",
+            "RGB"
+        ]
     ),
     entry!(
         "spread/boundary-notice",
@@ -570,6 +752,30 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["単ページ", "見開き", "比較", "構成"]
     ),
     entry!(
+        "spread/document-direction",
+        SpreadMode,
+        "PDF / EPUB の右開き指定に従う",
+        ["PDF", "EPUB", "右開き", "綴じ方向"]
+    ),
+    entry!(
+        "spread/final-cover",
+        SpreadMode,
+        "末尾に表紙を添える",
+        ["表紙", "末尾", "見開き", "本ごとの設定"]
+    ),
+    entry!(
+        "spread/singleton-placement",
+        SpreadMode,
+        "見開き先頭の単ページを片側に配置",
+        ["単ページ", "先頭", "末尾", "片側", "本ごとの設定"]
+    ),
+    entry!(
+        "spread/page-alone",
+        SpreadMode,
+        "表紙の次のページを単独で表示",
+        ["最終ページ", "白い相方", "見開き", "本ごとの設定"]
+    ),
+    entry!(
         "spread/reading-flow",
         SpreadMode,
         "デフォルトの連結方式",
@@ -580,6 +786,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         SpreadMode,
         "横連結の方向",
         ["右から左", "左から右", "RTL", "LTR", "読み方向"]
+    ),
+    entry!(
+        "spread/fit-cycle",
+        SpreadMode,
+        "フィット循環に含めるモード",
+        ["切り替え", "リング", "ジェスチャ", "0キー", "倍率"]
     ),
     entry!(
         "spread/fit",
@@ -635,6 +847,23 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         SpreadMode,
         "マウスオーバーのサムネイル",
         ["静止画", "プレビュー", "サムネイル列", "常に表示"]
+    ),
+    entry!(
+        "spread/seek-preview-size",
+        SpreadMode,
+        "シーク位置プレビューの大きさ",
+        [
+            "静止画",
+            "シーク",
+            "サムネイル",
+            "最小",
+            "小",
+            "中",
+            "大",
+            "最大",
+            "px",
+            "個別"
+        ]
     ),
     entry!(
         "spread/seek-bar-with-strip",
@@ -788,6 +1017,20 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["再読み込み", "reload", "フォルダー", "ロード済み"]
     ),
     entry!(
+        "indexer/offline-change-scan",
+        IndexerSpeed,
+        crate::ui_helpers::OFFLINE_CHANGE_SCAN_SETTING_LABEL,
+        [
+            "起動",
+            "終了",
+            "スキャン",
+            "索引",
+            "今すぐ確認",
+            "検索",
+            "offline"
+        ]
+    ),
+    entry!(
         "indexer/speed",
         IndexerSpeed,
         "速度プロファイル",
@@ -908,6 +1151,23 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["動画", "最大", "px", "カスタマイズ", "seek"]
     ),
     entry!(
+        "video/seek-preview-size",
+        Video,
+        "シーク位置プレビューの大きさ",
+        [
+            "動画",
+            "シーク",
+            "サムネイル",
+            "最小",
+            "小",
+            "中",
+            "大",
+            "最大",
+            "px",
+            "個別"
+        ]
+    ),
+    entry!(
         "video/seek-strip-cycle",
         Video,
         "シークストリップをキーで切り替えるときに通す表示",
@@ -931,6 +1191,33 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         "リモート端末への動画配信を有効にする",
         ["リモート", "remote", "配信", "ストリーミング"]
     ),
+    #[cfg(not(feature = "portable"))]
+    entry!(
+        "video/effetune-input-limit",
+        Video,
+        "EffeTune に渡す前に 0dB を超える音を抑える",
+        ["音響調整", "OVERLOAD", "ピーク", "EffeTune"]
+    ),
+    #[cfg(not(feature = "portable"))]
+    entry!(
+        "video/effetune-auto-open",
+        Video,
+        "起動後の最初の動画再生で音響調整の窓を自動で開く",
+        [
+            "音響調整",
+            "ビジュアライザー",
+            "自動表示",
+            "初回",
+            "EffeTune"
+        ]
+    ),
+    #[cfg(not(feature = "portable"))]
+    entry!(
+        "video/effetune-minimized",
+        Video,
+        "メインウィンドウを最小化しても音響調整の窓を表示したままにする",
+        ["音響調整", "ビジュアライザー", "最小化", "EffeTune"]
+    ),
     entry!(
         "video/normalize-cache",
         Video,
@@ -939,9 +1226,9 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     ),
     entry!(
         "video/sidecar-thumbnail",
-        Video,
-        "同名ファイル名の画像があれば動画サムネに優先採用",
-        ["サイドカー", "sidecar", "動画サムネイル"]
+        Thumbnail,
+        "同名の画像をサムネイルに使う（動画・音声）",
+        ["サイドカー", "sidecar", "動画サムネイル", "音声", "音楽"]
     ),
     entry!(
         "vst3/enabled",
@@ -1026,6 +1313,8 @@ mod tests {
 
     const PAGES_SOURCE: &str = include_str!("pages.rs");
     const PREFERENCES_SOURCE: &str = include_str!("../preferences.rs");
+    const RAW_SETTINGS_SOURCE: &str = include_str!("../../ui_raw.rs");
+    const NAME_COLORS_SOURCE: &str = include_str!("name_colors.rs");
 
     fn anchors_in_pages_source(source: &str) -> Vec<&str> {
         source
@@ -1148,12 +1437,47 @@ mod tests {
                 entry.anchor
             );
             assert!(!entry.title.is_empty(), "title が空です: {}", entry.anchor);
-            assert!(
-                PAGES_SOURCE.contains(entry.title),
-                "title が pages.rs の表示文字列と一致しません: {} / {}",
-                entry.anchor,
-                entry.title
-            );
+            if entry.anchor == "indexer/offline-change-scan" {
+                // この項目はお気に入り編集と共有する描画 helper が表示文字列を所有する。
+                assert_eq!(
+                    entry.title,
+                    crate::ui_helpers::OFFLINE_CHANGE_SCAN_SETTING_LABEL
+                );
+                assert!(
+                    PAGES_SOURCE.contains("crate::ui_helpers::draw_offline_change_scan_setting(")
+                );
+            } else if entry.anchor == "spread/chrome-suppression" {
+                assert_eq!(
+                    entry.title,
+                    crate::ui_helpers::FULLSCREEN_CHROME_SUPPRESSION_SETTING_LABEL
+                );
+                assert!(
+                    PAGES_SOURCE
+                        .contains("crate::ui_helpers::draw_fullscreen_chrome_suppression_setting(")
+                );
+            } else {
+                let title_source = if entry.anchor == "raw-develop/settings" {
+                    assert!(
+                        PAGES_SOURCE
+                            .contains("crate::ui_raw::draw_settings(ui, &mut state.settings)")
+                    );
+                    RAW_SETTINGS_SOURCE
+                } else if entry.anchor == "thumbnail/details-name-colors" {
+                    assert!(
+                        PAGES_SOURCE
+                            .contains("super::name_colors::draw_settings(ui, &mut state.settings)")
+                    );
+                    NAME_COLORS_SOURCE
+                } else {
+                    PAGES_SOURCE
+                };
+                assert!(
+                    title_source.contains(entry.title),
+                    "title が pages.rs の表示文字列と一致しません: {} / {}",
+                    entry.anchor,
+                    entry.title
+                );
+            }
             let mut keywords = HashSet::new();
             for keyword in entry.keywords {
                 assert!(
@@ -1228,6 +1552,30 @@ mod tests {
     }
 
     #[test]
+    fn effetune_minimized_search_matches_the_build_flavor() {
+        let result = search_preferences("EffeTune 最小化", test_tree_position);
+        #[cfg(not(feature = "portable"))]
+        assert_eq!(
+            result.first().map(|entry| entry.anchor),
+            Some("video/effetune-minimized")
+        );
+        #[cfg(feature = "portable")]
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn effetune_auto_open_search_matches_the_build_flavor() {
+        let result = search_preferences("EffeTune 自動表示", test_tree_position);
+        #[cfg(not(feature = "portable"))]
+        assert_eq!(
+            result.first().map(|entry| entry.anchor),
+            Some("video/effetune-auto-open")
+        );
+        #[cfg(feature = "portable")]
+        assert!(result.is_empty());
+    }
+
+    #[test]
     fn title_prefix_precedes_title_substring() {
         let results = search_preferences("表示", test_tree_position);
         let prefix = results
@@ -1254,6 +1602,44 @@ mod tests {
                 .iter()
                 .any(|entry| entry.anchor == "spread/continuous-scroll")
         );
+    }
+
+    #[test]
+    fn raw_settings_search_targets_dedicated_page() {
+        for query in [
+            "raw",
+            "RAW 現像",
+            "同時現像数",
+            "RAW 明るさ",
+            "LibRaw",
+            "補正しない",
+        ] {
+            let results = search_preferences(query, test_tree_position);
+            assert!(!results.is_empty(), "no RAW settings result for {query}");
+            assert!(results.iter().any(|entry| {
+                entry.page == PreferencesPage::RawDevelop && entry.anchor == "raw-develop/settings"
+            }));
+        }
+    }
+
+    #[test]
+    fn offline_scan_and_full_check_keywords_open_the_indexer_setting_anchor() {
+        for query in [
+            "終了 スキャン",
+            "今すぐ確認",
+            "offline",
+            "検索インデックス 起動",
+        ] {
+            let result = search_preferences(query, test_tree_position)
+                .into_iter()
+                .find(|entry| entry.anchor == "indexer/offline-change-scan")
+                .unwrap();
+            assert_eq!(result.page, PreferencesPage::IndexerSpeed);
+            assert_eq!(
+                result.title,
+                crate::ui_helpers::OFFLINE_CHANGE_SCAN_SETTING_LABEL
+            );
+        }
     }
 
     #[test]
@@ -1292,5 +1678,70 @@ mod tests {
             .find(|entry| entry.anchor == "spread/seek-strip")
             .expect("静止画サムネイル列の最大高さが検索できる");
         assert_eq!(still_height.page, PreferencesPage::SpreadMode);
+    }
+
+    #[test]
+    fn clipboard_capture_search_finds_monitor_and_output_folder() {
+        for (query, anchor) in [
+            ("clipboard 自動保存", "clipboard-capture/image"),
+            ("クリップボード 保存場所", "clipboard-capture/folder"),
+        ] {
+            let result = search_preferences(query, test_tree_position)
+                .into_iter()
+                .find(|entry| entry.anchor == anchor)
+                .expect("clipboard capture settings must be discoverable");
+            assert_eq!(result.page, PreferencesPage::ClipboardCapture);
+        }
+    }
+    #[test]
+    fn audio_thumbnail_indicator_and_common_sidecar_settings_are_searchable() {
+        for (query, anchor, page) in [
+            (
+                "音声 マーク",
+                "thumbnail/audio-indicator",
+                PreferencesPage::Thumbnail,
+            ),
+            (
+                "音声 サイドカー",
+                "video/sidecar-thumbnail",
+                PreferencesPage::Thumbnail,
+            ),
+            (
+                "動画 サイドカー",
+                "video/sidecar-thumbnail",
+                PreferencesPage::Thumbnail,
+            ),
+            (
+                "音声 重複",
+                "duplicate/video-image",
+                PreferencesPage::DuplicateFiles,
+            ),
+        ] {
+            let entry = search_preferences(query, test_tree_position)
+                .into_iter()
+                .find(|entry| entry.anchor == anchor)
+                .expect("audio thumbnail setting is searchable");
+            assert_eq!(entry.page, page);
+            assert!(PAGES_SOURCE.contains(&format!("anchored(ui, state, \"{anchor}\"")));
+        }
+    }
+
+    #[test]
+    fn details_name_color_search_finds_categories_themes_and_validation() {
+        for query in [
+            "名前 色",
+            "RAW HEX",
+            "Light カスタム",
+            "通常行 コントラスト",
+            "切り取り 名前",
+        ] {
+            assert!(
+                search_preferences(query, test_tree_position)
+                    .iter()
+                    .any(|entry| entry.page == PreferencesPage::Thumbnail
+                        && entry.anchor == "thumbnail/details-name-colors"),
+                "missing name-color result: {query}"
+            );
+        }
     }
 }

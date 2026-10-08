@@ -5,6 +5,13 @@
 
 ---
 
+### 音声セルの代表画像 (§1.347、2026-10-08)
+
+Audio は既存 worker / texture backlog に乗り、同名 sidecar → MP3 先頭 ID3v2 の前面表紙優先 → 音楽アイコンの順で表示する。`ThumbnailState::NoArt` は正常終端で、Failed とともに一覧世代内では再投入・hover repaint を続けない。Loaded の画像寸法を Auto 比率へ使い、画像のない音声を分母から除く。全音声が終端なら Auto 未確定も現在の比率で終わる。
+
+`ThumbMsgPayload` が Pixels / NoArt / Failed / Canceled / Finalized を一つに所有する。Audio は保存完了後に一通知を送り、既存の他媒体の Finalized 通知は維持する。音声マークは `AudioThumbnailIndicator` の音楽アイコン (既定) / 文字バッジ / なし。画像なしではどの設定でも音楽アイコンを描く。音声を補正対象の画像ページにせず、再生画面・入力操作は保持する。[詳細設計](audio-album-art-plan.md)。
+
+
 ## 1. サムネイル表示パイプライン
 
 ### 1.1 状態機械
@@ -35,6 +42,21 @@ per-context の `PageDimsCache` の別 map に記録する。`source_dims` は�
 だけを破棄し、同じ `items_generation` で判明済みの両寸法は残す。idx 空間が変わるときだけ
 `invalidate_idx_state_and_queues` で clear し、cache 自身の generation 不一致も `None` へ
 fail-closed する。
+
+### 1.1.1 Windows の切り取り中表示
+
+App-global な `CutClipboardObserver` が、現在の Windows file clipboard に
+`CF_HDROP + Preferred DropEffect=MOVE` がある場合だけ、正規化済み実パス集合を公開する。
+描画時は `GridItem::drag_source_path` が返す 1 パスをこの集合へ照合する。ファイル走査や
+`canonicalize`、同期 clipboard I/O は描画経路へ入れず、ZIP / PDF 内ページ、Stack、
+SearchContainer など実パスを持たない仮想項目は対象外とする。
+
+サムネイルではセル背景を通常 alpha で描いた後、画像 / placeholder / 名前 / 評価 / 編集・タグ・
+形式・再生等の内容 badge だけを opacity 0.5 の painter へ描く。選択枠、チェック、見開きカーソル、
+hover と pointer owner は通常 alpha のまま後段で描く。詳細一覧も行背景、選択 accent、separator、
+カーソルを通常 alpha にし、preview icon と列文字だけを 0.5 にする。詳細行 helper を共有する
+下部情報バーは表示専用 caller なので opacity 1.0 を維持する。fullscreen 本体はこの projection を
+参照しない。
 
 ### 1.2 2 フェーズ優先ロード
 
@@ -91,6 +113,11 @@ Esc / BS で閉じてグリッドへ戻った直後、一部のサムネが**真
 `texture_backlog` は frame ごとの upload 上限だけを表す。回帰は caller の 4 early-return site、
 painter の no-surface delivery、viewport cleanup 中にも thumbnail upload を遅らせないテストで固定する。
 
+2026-09-27: 同じ shared painter の `set_window(viewport_id, None)` は、その viewport の
+surface だけを破棄する。fullscreen host の再生成時に全 surface を消すと、visible な root は
+egui pass を続けても `SurfaceAbsent` となり screenshot と表示更新が失われる。texture delta の
+共有 renderer への配送契約は維持する。
+
 ### 1.3 ワーカー側の流れ
 
 `thumb_loader.rs::process_load_request`:
@@ -105,13 +132,17 @@ painter の no-surface delivery、viewport cleanup 中にも thumbnail upload �
    ├─ ヒット (`source_policy != SourceOnly`): WebP バイト → ColorImage
    ├─ ミス + `CacheOnly`: 元ソースを開かず終了
    └─ ミス or `SourceOnly`:
-        ├─ ソースデコード (JPEG=turbojpeg, PNG/GIF/WebP/BMP=image crate,
-        │                   HEIC/AVIF/JXL/RAW=WIC, PDF=PDFium ワーカー)
-        ├─ EXIF Orientation 適用 (通常画像=path / ZIP=bytes、PDF は対象外)
+        ├─ ソースデコード (RAW=LibRaw preview、必要なら executor で half 現像,
+        │                   JPEG=turbojpeg, PNG/GIF/WebP/BMP=image crate,
+        │                   HEIC/AVIF/JXL=WIC, PDF=PDFium ワーカー)
+        ├─ EXIF Orientation 適用 (通常画像=path / ZIP=bytes。RAW は LibRaw の
+        │                   flip 適用済み、PDF は対象外)
         ├─ Lanczos3 で display_px までリサイズ
         ├─ CacheDecision::should_cache でキャッシュ可否判定
         └─ 必要なら WebP エンコードして catalog.db に保存
-3. mpsc で (idx, ColorImage, from_cache, from_edit_preview,
+3. RAW half は現像完了時に画像を持つ後続 LoadRequest を既存キューへ戻し、
+   thumbnail worker が縮小・cache 保存を続ける。画像と finalized の 2 通を送信し gen_done を進める
+4. mpsc で (idx, ColorImage, from_cache, from_edit_preview,
    edit_preview_adjustment, source_dims, layout_dims) を送信
 ```
 
@@ -204,12 +235,75 @@ SQLite 更新、LRU prune はすべて専用 worker 上で行い、UI スレッ�
    0.30em・縦 padding 0.12em とする。形式バッジと機械的に同じ 70% にはしない。
 
 サムネイル四隅 overlay の計測・padding・配置は `src/thumb_overlay_layout.rs` の
-`ThumbnailOverlayLayout` が所有する。v2.9.1 では左上と左下を移行済み。左上は
-ブックマーク時刻 → 動画 `UP` → 編集状態 / pin → タグの順に実測幅を予約し、幅不足時は
-タグだけを省略または非表示にする。描画とタグ hover / click は同じ `BadgePlacement.rect` を
+`ThumbnailOverlayLayout` が一括で所有する。チェック印の領域とスタック枚数を先に確保してから左上を配置する。左上は
+ブックマーク時刻 → 動画 `UP` → 編集状態 / pin → タグの順に実測幅を予約する。幅不足時は
+時刻・`UP` を省略表示し、編集状態は順序を保って入る分を置き、残りを ASCII の `+N` にまとめる。
+タグは残る幅に応じて省略または非表示にする。描画とタグ hover / click は同じ `BadgePlacement.rect` を
 使う。左下はフォルダ名または形式バッジとファイル名プレートを同じ下段へ配置し、その実測行の
-上へ評価を積む。色・角丸・フォントなど各要素の見た目は `ui_helpers.rs` の個別描画関数が持つ。
-右上のチェック / スタック枚数と右下の絞り込み件数は未移行で、バックログ §2.2 第3段階に残す。
+上へ評価を積む。評価の星が収まらない幅では数値へ短縮し、セル外や優先順位が高い左上の表示に
+重なる場合は左下の低優先要素を表示しない。右下の絞り込み件数は左上・左下と重ならない位置まで上げ、余地がなければ省略する。色・角丸・フォントなど各要素の見た目は
+`ui_helpers.rs` の個別描画関数が持つ。
+スタック枚数と絞り込み件数も狭幅では文字を短縮し、`draw_cell` の内容はセル内に clip する。
+共有設定 `thumb_show_resume_meter` がONなら、`ThumbnailOverlayLayout` は本・動画・音声・画像・その他の
+全セルに固定下端帯を予約する。位置記録なし・長さ未取得でも同じ予約を行い、設定boolを
+`fraction.is_some()` へ置き換えない。帯は `inner = cell.shrink(4)` の全幅、高さ9 logical pt、
+下端 `inner.max.y` (セル下端から4pt)。描画時は左端ceil・右端/下端floorでphysical pixelへ揃え、
+上端を丸めた下端から `floor(9 * pixels_per_point)` pixels戻す。上端まで元の矩形の内側へ丸める規則ではない。
+100/125/150/200%の厚さは9/11/13/18px (9/8.8/8.667/9 logical pt)。保存済み位置の有効な比率がある本のFolder/ZipFile/PdfFileと
+動画/音声だけ、不透明な角丸バーを描く。位置のないセルはtrackも描かず予約した空き領域を残す。
+ONでは左右の下端ラベルを一律13 logical pt上へ移す。右下の従来基準 `cell.max.y - 3` に対し、
+9ptの帯と最低3ptのgapを確保する量は `9 + 3 + (4 - 3) = 13`。右下のgapは3pt、
+左下の従来基準 `inner.max.y - 3` からのgapは7ptとなる。ファイル名・形式・フォルダ名・評価・
+長さ・絞り込み件数に同じ予約量を使う。純layout外のSearchContainerの件数とCollectionPlaceholderの
+単行captionも13pt移動する。SearchContainerの代表画像なし・未ロードの多行階層パスだけ、上端を固定アイコン下の元位置に保ち、
+下端だけ13pt縮めた矩形で既存階層layoutを再計算し、親階層から省略して末端の本/フォルダ名を優先する。
+代表画像ありでは、もともと小さい固定種別アイコンより下にある背景/パス全体の13pt移動を維持し、高さを縮めない。
+通常サイズで末端名の全消去を許さない。
+単行captionはON時だけ描画と同じpixel原点のgalley inkを確認し、cell・帯・固定主アイコンに
+収まらなければ省略する。代表画像なし・未ロードの階層パス全体を上へ移して交差時に丸ごと消す方式は使用しない。
+代替位置を探さず、収まりはviewport clipでなくcell境界で判定する。
+SearchContainerの代表画像ありのラベル背景はONなら元の上部アイコンより先に描き、OFFは元の順序を維持する。
+階層パスは `ui_helpers::layout_path_hierarchy` の既存計算を共有するため `pub(crate)` 可視性だけを変更する。
+OFFでは予約せず従来位置へ戻す。同じ設定状態では、媒体種別や
+バーの有無で帯・ラベルのgeometryを変えない。極小セルでは既存の低優先badge省略を使い、
+帯の位置・厚さは固定のまま既存のcell clipを適用する。
+画像fit・中央の再生/音楽アイコンの位置/大きさは維持し、画像幅との対応・バーの空き領域の上移動探索・実glyph/アイコンのobstacle追跡を行わない。
+通常セルの描画順はサムネイル/内容→バー→媒体アイコン/切り取りマーク→通常ラベル→選択/見開きcursorの枠→check。
+固定予約帯とラベルは交差しないため、バーをラベルより先に描く。実際にバーがあるセルだけ主マークを
+バー直後・通常ラベル前まで遅らせ、極小セルでバーが主マークを隠さず、主マークがファイル名を覆わない従来の優先関係を保つ。
+SearchContainer / CollectionPlaceholderの特殊captionは内容描画内の上記規則に従う。OFF/位置なしでは元の順序を維持し、
+枠とcheckのopacity、cutのcontent opacityも従来どおり。
+セル高・画像fit・並び順・hit-testは変更せず、内容bitmapへ焼き込まない。色は
+`os_theme::book_resume_meter_palette`。採用fillはLightがRGB(38, 67, 122) / `#26437A`、
+DarkがRGB(142, 176, 234) / `#8EB0EA`。選択strokeのRGB(60, 120, 220)と明度/彩度を変え、
+緑のFolder badgeとも区別する。track/boundaryは従来の不透明灰色を維持する。fill/trackのコントラスト比は
+Light 7.91 / Dark 6.26、fill/選択strokeはLight 2.27 / Dark 1.94。
+メーターは常に左から右へ伸び、`fullscreen_seek_direction` と本の読み方向には連動しない。
+本の比率はHUDの読み順で記録したanchor ordinal/totalで、見開きの相手ページは加算しない。
+動画/音声はliveのwatched集合にあれば長さ不要で満タンとする。それ以外はliveの再生位置表と現在source stampに一致した取得済み長さから求める。
+watchedなし・位置なしならバーを出さない。途中位置は長さ不明・失敗/不正比率ではバーを出さないが、ONなら帯予約とラベル位置は維持する。
+長さバッジOFFでも共通の前回位置設定がONなら既存の可視+近傍workerで長さを取得する。
+本は起動時writer全行readと稀なDB変更後read以外はAppのpath memo/mapだけを参照する。
+動画/音声用の位置mapは複製せず、描画からDB/ファイル/FFmpegへは到達しない。
+未読・NULL・不正値はtrackも出さず、設定OFFでも位置の記録は続く。動画/音声の長さ取得は、長さバッジまたは共通の前回位置設定がONのときに要求する。
+新しい状態・設定・worker・DB I/Oは追加しない。詳細と今回の検証記録は [book-resume-meter-plan.md §14](book-resume-meter-plan.md#14-全セルに固定下端帯を予約する方式へ再改訂) を参照する。
+補正済みサムネイルの生成は `thumb.adjustment_build` perf event で色調処理と
+`ctx.load_texture` を分けて計測できる。`origin=visible` は一覧描画中、
+`origin=prefetch` は可視外の先読み、`n` は `frame.begin` と同じ更新フレーム番号。
+元サムネイルが未ロード（トレイ格納による退去を含む）の間は生成しない。
+
+4K・Windows 175% で 10 列と 20 列の実機負荷を比較する場合は、`--perf-log` 付きで起動し、
+同じ画像フォルダと補正設定を使う。各列数で画面を静止させ、補正パネルの**グローバル標準**の
+明るさを変更して確定する。この経路は `copy_params_to_global` → `clear_all_color_caches` を通るので、
+全補正キャッシュ消去直後の可視セル再生成を記録できる。10 列と 20 列はそれぞれ起動し直して個別のログで測り、
+`%APPDATA%\mimageviewer\logs\perf_events.jsonl` を各測定後に別名で保存し、
+`python scripts/analyze_perf.py <perf_events.jsonl> thumbs` で可視/先読み・画像寸法別の
+`thumb.adjustment_build` 件数と、可視セルだけの 1 フレーム合計 (`session` / `n`、
+`apply_ms`・`texture_ms`・`total_ms`) を見る。比較は最大値と上位フレームの `cells` を使い、
+先読みの合計を可視フレームへ混ぜない。
+`python scripts/analyze_perf.py <perf_events.jsonl> hitches --ms 33` でフレーム間隔も確認する。
+イベントの `texture_ms` は egui のテクスチャ作成までで、GPU 転送時間を直接表さない。
+headless の ignored 計測テストも、可視セル補正生成の連続処理だけを測り、フレーム全体の描画時間と GPU 転送は測れない。
 
 **Video ピンの特殊経路**: pin source が動画の場合は `seed_folder_video_pin_thumbs`
 が起動時に `video_pins` DB の抽出済み WebP を pinned cache key として catalog にミラー
@@ -266,14 +360,14 @@ ZipFile / PdfFile / ConvertibleArchive の代表サムネには適用しない (
 
 **適用タイミング**:
 
-1. **可視セル**: `ui_main::render_grid` がセル描画直前に `maybe_apply_thumb_adjustment(idx)`
+1. **可視セル**: `ui_main::render_grid` がセル描画直前に `maybe_apply_thumb_adjustment(ctx, idx, "visible")`
    を同期呼び出し。`thumb_adjust_tex[idx]` がすでにあるか identity ならスキップ。
 2. **先読み分 (keep_range 内, 非可視)**: `update()` 終盤で `process_thumb_adjust_budget(ctx, 8)`
    が最大 8 枚/フレーム処理する (600px で ~3ms/枚 × 8 = 24ms 予算)。
 3. **スライダードラッグ中** (`App::adjustment_dragging == true`): 両経路ともスキップし、
    `draw_cell` も `adjusted_tex = None` を渡して生サムネを表示。
-4. **ドラッグ解放** (`adjustment_dragging` が `true → false` 遷移): `update_thumb_adjust_drag_state`
-   が `thumb_adjust_tex.clear()` → 次フレームで visible 優先で再生成される。
+4. **ドラッグ解放**: ページ個別の色調変更なら対象キーの補正 tex だけ失効させ、
+   次フレームに必要な可視セルだけ再生成する。標準の変更は一括失効する。
 
 **キャッシュ無効化** ([preset-and-adjustment.md §4](preset-and-adjustment.md) の早見表に追補):
 
@@ -313,6 +407,11 @@ idle frame で本全体を再走査しない。本体側の見開き解決規則
 `rotated_display_size` で 90° / 270° の縦横を入れ替えてから決め、描画は本体・列と共通の
 `draw_rotated_image` を使う。見開きも画面上の左右順を保ち、2 枚それぞれの回転と寸法を使う。
 テクスチャまたは回転が未取得のプレビュー枠は「読み込み中…」とする。
+`still_seek_preview_size` と `still_seek_preview_size_values` は吹き出しの表示寸法だけを変え、
+既定の最小 90 / 小 117 / 中 144 / 大 180 / 最大 360pt は従来の画像枠高 180pt の
+0.5 / 0.65 / 0.8 / 1 / 2 倍に当たる。画像枠の最大幅は高さ × 240/180 とする。
+既存のサムネイル読み込みと見開きの構成を変えない。上部バー・下部バー・列と画面端の
+間に収まるよう、描画時に縦横同率で縮小する。
 
 回帰は `src/ui_fullscreen/tests/still_seek_rotation.rs`。実 overlay を実行したスレッドの
 RotationDb read-only open / SELECT 回数が増えないこと、未確定セルの停止と worker 完了後の
@@ -332,7 +431,7 @@ Window の初期サイズ・最小サイズ・最大サイズと constrain rect 
 egui の content サイズには title / frame が後から加わるため、内側の余白と実外枠を同一視しない。
 プレビューの拡大クリック、スライダー、A/B 適用、全画面プレビュー、Esc とタイトルの閉じる処理を維持する。
 
-§1.200 の回帰は同 module の headless egui tests 8 件。日本語フォントを用いた詳細/サムネイル表示、
+§1.225 (旧 §1.200) の回帰は同 module の headless egui tests 8 件。日本語フォントを用いた詳細/サムネイル表示、
 fresh 480×420 と大画面からの縮小、実 ScrollArea 後の B 適用ボタン到達、プレビュークリック、
 タイトル閉じるクリックと後始末を確認する。適用ボタンの到達性は実 Response で観測し、
 ユーザーの設定保存は実行しない。2026-09-08 の焦点 gate は 8 件 PASS、独立 Astra レビューに blocking なし。
@@ -369,6 +468,20 @@ memo 化する。製本・synthetic 等の既存短絡条件を維持し、毎�
 
 ## 2. フルスクリーン表示パイプライン
 
+### 2.0 RAW の表示段 (S3)
+
+RAW は worker の info → 埋め込み preview → LibRaw フル現像の順で表示する。`RawPageStore` が context / items generation / 物理 source 指紋 / 要求 ID / 明るさを検証し、`RawPreview` を最終的に既存の Static へ置き換える。現像完了後は preview の追加保持をしない。preview より現像が先に完了した場合も、古い preview が表示段を戻さない。
+
+fullscreen に catalog サムネイルや色忠実 rendition を出せるのは、埋め込み preview の実デコードと向き検査を通った後だけ (`raw_fullscreen_fallback_allowed`)。preview 無し・壊れた JPEG・向き不一致では、half 現像由来のサムネイルが存在していても読み込み表示のまま待つ。現像も不可なら Terminal としてナビゲーションを終える。
+
+RAW の配置・fit・Original・Z・pan・回転・見開き・連結読み・座標変換の基準は全表示段で `developed_dims`。8192 clamp 後の Static や派生 final / AI texture の実寸を配置基準に戻さない。actual raster は canonical 枠へ contain し、ナビゲータ・ルーペ・capture の写像も共有 transform を使う。
+
+preview は生デコード段の表示専用で、編集・同期補正・AI・final composite の入力にしない。カラー化 / LUT の既存 gate は維持し、必要なページは検証済み preview の後だけ色忠実 rendition を表示する。ただし現像が Blocked (非対応・失敗) の RAW は処理入力が得られないため gate の対象外とし、rendition の有無にかかわらず埋め込み preview をそのまま表示して通知する。判定は owner の現像軸から導く `raw_development_blocked` に集約する。設定変更で Failed が Idle に戻れば通常の gate が再評価される (計画 7.10 K)。PreviewShown はその提示でページ送り・フォルダ lock を終えられる。PreviewAbsent は developed / complete final の提示か Terminal まで待つ。両ナビゲーション経路は RAW の分類と同じ readiness 述語を使う。編集の全入口・見開き左右・ツール内ページ切替・ボタン状態は、実際の編集対象に対する `raw_edit_target_gate` を mode / page mutation の前に確認する。
+
+明るさ変更と worker の Stale はページ単位の source transaction。既存の `capture_final_effect_source_reload_holdover` だけで提示中のユニット / 連結読み transition を退避し、入力と派生 cache を失効させる。明るさ変更では preview / 寸法の要求を残す。retained AI の source 指紋 + 明るさ key を更新し、他ページの retained epoch は変更しない。
+
+埋め込み preview texture 自体は現像軸の状態にかかわらず画面フィルターへ渡さない。paint resource の source texture と RawPreview の texture identity を照合するため、同じページの表示専用 rendition や前の通常画像の holdover は既存のフィルター処理を維持する。Full 完了時の同期補正は通常画像と同じく現在ページに限り、先読みや画面外の完了は既存の bounded final pipeline に処理を委ねる。
+
 ### 2.1 エントリポイント
 
 ```
@@ -387,6 +500,31 @@ ui_fullscreen.rs::render_fullscreen_viewport
     └─ update_prefetch_window(idx)     # フィルタ後の前後数枚を先読み / 範囲外を解放
 ```
 
+フルスクリーン余白色の正本は global な `Settings::fullscreen_image_margin_color` である。
+静止画キャンバスでは画像外の余白と seek strip のセル外空欄へ使い、通常画像、ZIP / PDF、
+単ページ、見開き、連結読み、比較、360 度パノラマ、画像分析で共有する。native 動画では DComp root
+最下層の canvas と、拡大・パン / display-resolved scaling の source 外画素へ同じ値を投影する。
+native 動画の seek strip は場面サムネイル / 波形の両表示とも全域で従来の暗色下地と配色を保ち、
+`NativeEguiOverlay` は canvas RGB の snapshot を持たない。動画画素、素材に含まれる黒帯、字幕、
+音声 / 動画の音声モード、HUD / 左右パネル、ナビゲータやルーペなど部品内部の黒も余白設定へ接続しない。
+
+透明下地は `fs_transparent_bg_mode` から不透明な黒 / 白 / 市松へ解決し、余白色には fallback
+しない。下地は `DisplayedImageTransform::paint_quad` が返す画像 texture と同じ 4 頂点へ描く。
+表示トリム後の `paint_rect` と任意角度回転中心を共有するため、回転 quad の AABB へ余分な色を
+塗らない。市松 texture の UV は page-local の幅 / 高さで反復し、quad と一緒に回転する。
+可視領域だけを再サンプルした texture でも、同じ clip 内で先に画像全体の paint quad 下地を描き、
+その上へ source-region texture を置く。この paint layer は画面表示専用で、画像画素、AI、copy、
+capture、export の合成には入らない。
+
+passive frozen single の direct texture も source-region mesh を使う。保存済み回転と表示 trim が
+同時に snapshot に残る場合、元の `image_rect` を geometry の基準にして trim bbox を位置と UV の
+両方へ渡すため、画像と透明下地は同じ trim 後 quad / clip になる。detached keepalive backstop は、
+両側を capture できた単ページ / 見開きを typed display unit で描き、片側だけ準備できた見開きで
+navigation holdover が無ければ canonical spread painter を呼んで両 slot を保つ。連結読みも canonical
+visible-pages painter を使う。general keepalive / embedded deferred の canvas は typed static unit が
+ある場合だけ現在の余白色にし、unit の無い media transition は egui 側の黒を保つ。native 動画の
+letterbox canvas は別の DComp owner が現在の余白色を描き、音声系だけ黒を保つ。
+
 frame 冒頭では、先読み窓ぶんの `fs_cache` を 1 回だけ走査し、`Static` / `Animated` / `Video` が
 現在の縦横判定に使う寸法を `PageDimsCache` へ回収する。見開きの判定順は `fs_cache` →
 ロード済みサムネイル → `PageDimsCache` → 未知なら縦長扱いであり、一度判明した寸法は live cache
@@ -394,15 +532,41 @@ frame 冒頭では、先読み窓ぶんの `fs_cache` を 1 回だけ走査し�
 各 cache が保持する寸法は回転前なので、見開きの横長判定は nav 分の保存済み回転を
 `rotation_db.get_many` で一括取得し、共通の `landscape_after_rotation` へ寸法とともに渡す。
 90° / 270° は幅と高さを入れ替え、0° / 180° は元の寸法比を使う。`rotation_cache` は item
-差し替え時に失効し、個別回転時は更新値を直接 memoize する。`SpreadDisplayUnit` は固定 cache を
-持たず表示・ナビゲーションの各解決時に組み直すため、回転変更後の次の解決から単独境界と後続ペアが変わる。
+差し替え時に失効し、個別回転時は更新値を直接 memoize する。`SpreadDisplayUnitsCache` は
+items 世代・読書順・見開き mode・ずらし位置・横長判定 epoch に対応する unit 列を保持する。
+回転変更による横長判定の更新を次の解決へ反映し、単独境界と後続ペアを再計算する。
 Remote の通常コンテナとコレクションも catalog の回転前寸法と同じ回転キーを一括で読み、同じ純関数を
-通す。寸法未確定を縦長扱いにする契約と、address-based `PageGroup` の通信形式は変更しない。
+通す。寸法未確定を縦長扱いにする契約は維持する。
+
+末尾に表紙を添える場合も `SpreadDisplayUnit` の navigation 列は変えない。
+`SpreadDisplayComposition` の slot は source idx・Navigation / FrontCoverSupplement role・読書 anchor
+を持ち、phase 所有の `FsNavigationDisplayDemand` が navigation と全 presentation の投影を一体で扱う。
+読書位置・シーク・履歴・ページ番号は navigation、読み込み・全 slot の ready/failure・描画・保持は
+presentation を参照する。末尾だけを先に確定して後から表紙を足す表示にはしない。
+連結読みは既存 still-image unit owner を使い、同じ source が先頭と末尾に現れる occurrence を
+unit anchor と role で区別する。保持対象は残存 unit の source の和集合から求める。
+全画像からなる単本の完全読書順の検証は items / nav identity ごとに保持し、回転だけで再走査しない。
+検索・stack・合成一覧などの一時条件は別に評価する。
+Remote は navigation の `PageGroup.anchor/pages/slice` を維持し、補助のある group だけに
+role 付き `presentation` を付加する。仕様・検証状況は[末尾表紙の設計書](final-cover-spread-plan.md)を参照。
+
+端の単ページを本来の側へ置く設定では、canonical `SpreadDisplayUnit` がpage列と
+`Paired / Singleton(UnpairedSlot | LandscapeBoundary | NonPairableBoundary)`の形成理由を一体で持ち、
+同じ `SpreadDisplayComposition` が `Center / Left / Right` の layout projection を所有する。
+末尾表紙補助を解決した後も実 1 page で、全ページを含む本であることを証明でき、かつ本当に相方slotが
+無い `UnpairedSlot` の先頭・末尾 unit だけが対象になる。現在または相方候補が横長で単独になったunitは、
+回転後判定を含め端でも `Center`。先頭側は cover 位相を含む見開き mode、末尾側は綴じ方向から決まり、
+1 page のportrait本は先頭規則を優先する。空き側は同じ page 寸法を
+使う仮想 slot であり、`SpreadPair`、navigation、occurrence、page count、source request は増やさない。
+paged / Z / 連結読み / Remote は composition の placement と物理 pixel 量子化済み gap を共用する。
+`FullscreenPageLayout` は実際に描いた側を transform に残し、navigator・範囲選択・edit hit はその値を読む。
+holdover は capture 時の transform から placement を取り込み、後から設定や canonical unit を再解決しない。
+詳細は[端の単ページ配置の設計・検証記録](section218-singleton-spread-placement.md)を参照。
 
 paged 表示でキーリピート由来の未消費ページ送り edge が同じ input frame に残る場合は、現在の
 表示 unit をカタログサムネイルで 1 frame 描き、processed texture と完成済み worker result の
 GPU upload を次の frame へ保留する。単ページは現在ページ、見開きは通常描画と同じ
-`SpreadDisplayUnit` resolver が返す全ページについて `ThumbnailState::Loaded` を要求し、1 ページでも
+共通 composition が返す補助を含む全 presentation ページについて `ThumbnailState::Loaded` を要求し、1 ページでも
 欠ける場合や unit を解決できない場合は通常の実体化へ fail-closed する。ただし、その display unit の
 全ページについて `current_final_composite_texture` が既に返せる場合は、未消費 edge があっても
 `Materialize` を維持し、完成表示からサムネイルへ降格しない。この在住確認は cache lookup だけで、
@@ -426,7 +590,8 @@ Ctrl+↑↓ のフォルダ横断と、同じ表示ユニットの final-effect 
   `capture_fs_nav_holdover` が作る。各 page は texture に加えて capture 時点の rotation、
   canonical coordinate source size、PDF page box（通常画像は source size）由来の独立した
   canonical layout size、実表示に使った単ページ / 見開き側別 content bbox、paint-time
-  post-filter と診断 identity を所有する。
+  post-filter と診断 identity を所有する。片側配置した endpoint singleton では、実paint transformが
+  確定した `Left / Right` も unit に保持し、待機中に中央へ戻さない。
 - `FinalEffectSourceReload { target_idx, previous, started_at }`: PDF の Z ズーム再レンダなど、同じ
   表示ユニットの source が差し替わる直前に、`previous.pages` へ単ページまたは見開き全体を保持する。
   `capture_final_effect_source_reload_holdover` だけが作り、左右別 slot は持たない。`started_at` は
@@ -697,11 +862,26 @@ viewer cache / AI / 先読み / スライドショーは単一 active session �
 detached bundle 間で保持・確定しない方針とし、always-new / ピン留めの連動なし窓では
 消しゴム・補正レイヤー・隠蔽加工・テキスト注釈・切り取り等の編集機能を起動できない。
 通常 F12 の linked detached viewer では従来どおり編集できるが、編集中はピン留めできない。
-passive snapshot は単ページでは 1 枚の texture を保持する。縦連結読みと見開き表示では、
-pause 時点で可視だった各ページの `TextureHandle` と正規化済み表示矩形を frozen page list に
-保持し、passive window 側で同じレイアウトを再描画する。見開きの片側がまだ未デコードで
-texture を取得できない場合は multi-page frozen を作らず、従来の現在ページ 1 枚 snapshot へ
-フォールバックする。
+passive snapshot の paged 経路は、pause 時点で最後に実際にpaintされたpresentationをtypedに選ぶ。
+navigation / source-reload holdoverがlive pageの後にoverlayされていれば、その旧resource unitをcloneし、
+index再利用後のcurrent itemを取り直さない。holdoverが無ければcurrent live unitをcaptureする。選択は
+read-onlyで、navigationの`Ready` phaseを進めずholdoverもclearしない。resource unitへ、painted
+`fullscreen_page_layout`（無ければcanonical composition）のexact `ResolvedDisplayPlacement`を合成した
+`CapturedPagedDisplayUnit`が唯一のbake入力である。
+
+unitはtexture、保存回転、canonical layout size、source size、trim/content bbox、post filter、page /
+occurrenceとtyped placementを一体で保持するため、passive側でcurrent item、設定、book preference、縦横を
+読み直さない。2 page見開きは2件、`Left / Right`のendpoint singleton、Z / ZipPla single、holdover singleは
+1件のfrozen pageとして、liveと同じ`DisplayedImageTransform`、fit / scale limit、物理pixel量子化済みgap、
+zoom / pan、自由回転、visible-source UV / clip規則で焼き込む。Zはactive / aimingとfactor / zoom-pan /
+singleton side/gapをcapture-time placementから取り、active doubleだけgapをzoom倍、fit scaleはzoom前のgap
+から求める。page / occurrence / requestはsingletonでも1件のままである。通常liveの`Center`（設定OFF、
+本別Center、横長 / 非pairable境界を含む）は従来のdirect-single snapshotを維持し、既定値のgeometryと
+丸めを変えない。paged bakeは既に確定したplacementと`pixels_per_point`だけを受ける純境界なので、parkの
+snapshot captureがegui `Context`を渡さない場合も同じ結果になる。縦連結読みはpause時点で可視だった
+各ページの`TextureHandle`と正規化済み表示矩形をfrozen page listに保持し、layout計算にegui `Context`が
+必要なため`Some(ctx)`のcapture時だけ従来どおり作る。必要なpage textureを取得できない場合はmulti-page
+frozenを作らず、従来の現在ページ1枚snapshotへフォールバックする。
 CUT 後、linked window は passive 化しない。設定 OFF の F12 linked window は最大 1 枚で
 メイン一覧に追従し、別の independent / ParkedLive window を Active 化する場合は閉じる。
 設定 `detached_viewer_open_images_in_window` が ON のときだけ、画像 / ZIP画像 / PDFページを
@@ -1227,10 +1407,18 @@ pinned/current RGBA 2枚だけを保持し、Diff用CPU画像 / managed texture�
 切り落とした範囲を uniform の UV 窓で元の合成画像座標へ戻す。テクスチャ採取と Wipe 境界判定は
 復元後の座標を共有するため、白線の基準である実画像矩形と一致する。ナビゲータは実画像矩形が
 パネル内に収まり UV 窓が常に全域となるので、このクリップによる表示変更はない。
-Wipe の白線はドラッグ中、またはポインタが`compare_wipe_grab_hit`と同じgrab band内にある間だけ描く。
-画像上のそれ以外の場所では隠し、touch chrome latchは表示条件に使わない。タッチ由来のprimary dragも
-`compare_wipe_dragging`を共有するため、指でドラッグしている間は表示する。境界 fraction は CPU の線 / clip と GPU uniform の双方で `0.0..=1.0` とし、左右端まで
-ドラッグできる。
+Wipe は `CompareViewMode::Wipe` の中に fraction と `CompareWipeInteraction` を一体で所有する。
+interaction は `Ready / Dragging` のどちらかで、セッション開始時は `Ready` とする。準備済み比較を
+描画できる main / navigator の CPU / GPU 4経路は、pointer hoverやdrag状態にかかわらず明暗二重
+stroke の境界線と中央handleを常時表示する。focused viewportで既存のCtrl非表示入力が押されている
+間だけ、`Ready / Dragging`の双方で境界とhandleを隠し、解除したframeで再表示する。drag reducerは
+実合成境界と同じrectのpress / releaseだけを所有し、描画はinteractionを変更しない。grab band、
+境界fractionの`0.0..=1.0`、CPUのclipとGPU uniform、画像合成は変更しない。比較準備の失効は
+`Dragging`だけを`Ready`へ戻す。
+
+比較は現行どおり App 全体で同時に一つの foreground セッションである。detached viewer を park
+すると比較を終了し、次に foreground で Shift+C を押したときは新しい案内セッションを開始する。
+passive detached snapshot や入力を持たない一時 context mount へ比較状態を複製しない。
 通常の単ページ / 見開きで利用者入力から `fs_pan` を更新するときは、直前の
 `FullscreenPageLayout` に記録された実表示矩形を使い、少なくとも 1 ページが viewport と
 各軸 48 logical point（ページまたは viewport がそれより小さい軸では、その小さい方の全幅）
@@ -1319,14 +1507,20 @@ resource を通る。見開きは高さ合わせ係数を含むページ別実�
 まま。比較表示 (wipe/diff) と 360 度パノラマは既存 callback ownership、thumbnail、animated、
 動画、mask、checker、UI preview は direct 経路のままである。
 
-GPU resampler cache は viewer context ごとに所有し、key は page idx、元 `TextureId`、
+GPU resampler cache は viewer context ごとに所有し、key は Page / SimilarPreview の source identity、元 `TextureId`、
 `items_generation`、ページ別 `input_generation`、目標寸法、正規化済み smoothing percent、
 拡大 / 縮小 branch から成る。拡大 entry だけは可視 source UV も key に含め、縮小 entry は
 従来どおり full source 固定である。設定値が変わると context 内の Lanczos 出力 cache を消去し、
 typed resource に保持した旧 percent と一致しない出力も再利用しない。source ごとの直近 2 寸法
 (拡大 / 縮小 branch 別)、context 全体 64 entry の LRU とし、
 fullscreen close / invalidation / context park・swap / 連結読み keep-set に追従する。native
-`TextureId` は cache、holdover、snapshot が共有する `Arc` lease の最終 drop で free する。
+`TextureId` は cache、holdover、snapshot、実 paint batch が共有する `Arc` lease の最終 drop で free する。
+UI closureの終了は実renderより前なので、frame-local変数だけではnative登録の寿命を保証できない。
+Lanczos resourceをpaintした同painter/clipへ、出力Arcを不変fieldに持つ有効なno-op egui_wgpu callbackを添える。
+callbackのrectはZEROで、画像のmeshとともにtessellate/paint outputへ保持される。通常/候補/holdover/
+backstop/frozenの全typed paint入口が共通helperを使う。callback内ではArcを破棄せず、callback_resourcesへ
+保存しない（renderer lockの再取得と循環所有を避ける）。surface不在等で描画をしないoutputも、その破棄で終端する。
+新しい任意frame遅延やvendorの解放queueは追加しない。ZEROでもmesh batchingの分割コストは残る。
 出力は `LanczosOutputs` として実寸・mip なしで VRAM 会計する。拡大 cache だけは context ごとに
 総画素 4096×4096 相当の 2 枚分を追加上限として古い entry を落とし、縮小 cache の保持規則は変えない。
 perf log の
@@ -1393,13 +1587,21 @@ panel rect resolver を描画と `touch_excluded` が共有する。表示中は
 priority 要求へ載せるため、停止位置とその先がロードされれば次フレームに外側へ成長する。
 セル矩形、画面順、要求範囲は `StillSeekStripLayout` が一度だけ解決し、描画と pointer hit test は
 同じ `cells` を読む。これにより、後から外側へセルが増えても既に置いたセルの位置は変わらない。
+`strip_content` は左右対称 inset の全幅を layout / request / paint の共通座標にする。通常バーを隠したときの
+表示切替と列固定ボタン、および通常バー表示時の列固定ボタンはセルの上へ後登録する overlay で、専用の
+空欄幅を取らない。body の press / hover / click / preview / source mapping は両 control の矩形を除外するが、
+body から始まった drag は control 上を横切っても同じ gesture owner が release まで継続する。
 静止画の高さは専用の `StillSeekStripHeight` と5段階の独立値で保存する。既定は
 最小36 / 小48 / 中72 / 大104 / 最大144、各値は36～320のlogical point（100%表示時のpx相当）。
 閲覧中は下部バー右端のフィルムボタンから、列の表示 / 非表示と5段階を同じ menu popup で
 選べる。各行は環境設定に保存済みの現在値を表示し、選択は既存の Settings setter / save と
 `StillSeekGeometry` へ合流するため、main / F12 と本・通常画像で同じ設定を使う。popup の開閉は
-viewport ごとの egui memory が所有し、新しい App state は持たない。popup 表示中は下部バーを維持し、
-Escape・矢印・Enter、pointer・touch は popup を優先して背面のページ移動や fullscreen close に流さない。
+viewport ごとの egui memory が所有し、新しい App state は持たない。
+高さとシーク位置プレビューの大きさの 5 段階は、動画 HUD と同じ見出し・段階表記・行寸法の 2 列に並べる。
+狭い画面では共通の短縮表記と行高を使い、非常に低い画面だけスクロールする。egui の floating scrollbar
+には幅を予約し、右列の文字や操作面へ重ねない。
+popup 表示中は下部バーを維持し、Escape・矢印・Enter、pointer・touch は popup を優先して
+背面のページ移動や fullscreen close に流さない。
 動画・音声のシークストリップも専用の `SeekStripHeight` と独立した5段階値を持ち、同じ既定値と
 36～320の解決時clampを使う。旧4段階の保存名と既定の大は保ち、静止画の値とは共有しない。
 動画側は `NativeBarLockState` が段階と値をsource切替・main/F12間へ運ぶ。実効下部バー、strip、
@@ -1489,7 +1691,10 @@ fit 解像度のまま (画像見開きは問題なし。PDF 見開きズーム�
 `zip_spread_zoom_pan` の倍率・パン解決は 1 回だけ行う。`Original` 以外は従来の高さ合わせ
 composite をそのまま使う。
 
-`settings.fullscreen_fit_mode` は <kbd>0</kbd> で循環する。ホバーバーのフィットボタンは
+`settings.fullscreen_fit_mode` は <kbd>0</kbd> と割り当てたリング／ジェスチャ／マウスボタン／
+パッドリングで、同じ `cycle_fullscreen_fit_mode` を経由して循環する。
+`FullscreenFitMode::next_for_flow` は `fullscreen_fit_cycle_excluded` を除外して通常順に進む。
+現在モードが対象外なら最初の有効モードへ、1つだけならその方式を設定／維持する。ホバーバーのフィットボタンは
 クリックで選択メニュー (`fit_popup_open`) を開き、flow で選べるモードを一覧表示して現在モードを
 青でハイライトする (見開きボタンのポップアップと同型)。メニュー項目選択は
 `set_fullscreen_fit_mode_for_current` を直接呼び、<kbd>0</kbd> 循環 (`cycle_fullscreen_fit_mode`)
@@ -2191,8 +2396,12 @@ scale_x=3.0443971, scale_y=3.0443973` で、論理 1440 × ppp1.5 = 実 2160px �
 
 単一ページは 1 ページ、見開きは左右 2 ページを表示単位として、**表示単位全体を 1 回で解決する**。
 受理時に current unit の texture / rotation / Part A の captured layout geometry を
-`FsNavigationSequence::previous` へ 1 unit として取り、target page set も 1 typed owner に保持する。
-`FsNavigationSequenceTarget::Display` の target page set は、page renderer が描く
+`FsNavigationSequence::previous` へ 1 unit として取る。`FsNavigationSequenceTarget::Display` は
+受理した `anchor_idx` と通過 rendition の許可方針を target の生存期間を通じて固定し、現在の
+canonical page set は `Awaiting / Ready / Presenting / RenditionFailed` phase が所有する。
+寸法または 90 度回転が後着して anchor の canonical unit が単ページ↔見開きへ変わった場合は、
+どの phase からでも新しい page set の `Awaiting` へ戻り、同じ許可方針で全ページを再検証する。
+`previous` と待機開始時刻はそのまま保持する。target page set は、page renderer が描く
 `GridItem::has_page_data` の項目だけで構成する。動画 / 音声など native presenter が描く項目を
 1 ページでも含む unit では `Display` sequence を作らず、そのまま移動先へ着地する。
 sequence を解放する presentation trace は page renderer だけが emit するため、native presenter 所有の
@@ -2211,6 +2420,21 @@ previous に属するなら提示とは数えない。
 推測しない。previous overlay を実際に描いたページは `Holdover` なので解放しない。
 したがって次の同 frame repeat が受理される場合でも、その前に target の draw command は確定済みで
 あり、見開き片側だけを提示済みと数えることはない。
+
+fullscreen frame は async 完了を `poll_prefetch` で取り込んだ後に canonical `SpreadPair` を 1 回
+解決し、その同じ pair で target の再 binding / readiness、holdover disposition、source 選択、描画、
+presentation trace を行う。poll 前に作った page-turn decision が同じ egui frame に cache 済みでも、
+page set が変わったときは rebound phase から decision を再計算して同じ cache slot を更新する。
+通常の sequence 非存在 frame は事前の target identity check で余分な spread 解決を行わない。
+target の generation / anchor が現在の mounted viewer context と一致しない場合は再 binding せず、
+兄弟 context の page set や holdover を変更しない。
+同一 context 内で common open、ページ編集の単ページ pivot、または連結読みの seek / scroll reanchor が
+別 anchor へ移る場合は、旧 `Display` intent とその lock / holdover を代入前に明示的に破棄する。
+同じ mounted bundle の items generation が実際に変わる場合も、旧 index identity を指す `Display` intent を
+generation owner で解放する。`FolderItems` は folder install 前の世代から新 items の bind までを所有するため
+この解放対象に含めず、同じ generation の再設定でも有効な `Display` intent を維持する。
+viewer-context の activation は `fullscreen_idx`、generation、navigation sequence、lock / holdover を
+bundle 単位で一緒に swap する ownership 移動なので、この in-context retarget cancellation は行わない。
 
 target の `materialized_ready` は、その frame の描画 resolver が実際に選ぶ source に対して評価する。
 `fs_display_bypasses_final_pipeline` が true の分析モード、またはナビゲーションシーケンスが
@@ -2609,3 +2833,11 @@ fullscreen の canonical decode は `AnimationPolicy` を正本にする。現�
 - `keep_range` (自分の idx が範囲外なら結果を捨てる)
 
 新しいワーカーを追加するときは同じパターンに従う。詳細は [async-architecture.md](async-architecture.md)。
+
+### F11での固定表示の実効値 (§1.344)
+
+保存値からの予約とHUD描画は `ResolvedViewerChrome` を共通に使用する。`ViewerChromeSurface` は
+projected contextのwindow bindingとexact active hostのapplied borderlessから導出し、mainやsiblingへ転用しない。
+通常content・holdover・navigation gapは同じresolverで上・下・右の予約を解放する。
+strip表示選択とresource ownerは変更せず、一時表示のrectだけをhit / sinkへ渡す。
+[設計](fullscreen-locked-chrome-suppression-plan.md) §4・5を参照。

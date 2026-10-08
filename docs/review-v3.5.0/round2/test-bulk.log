@@ -1,0 +1,159 @@
+   Compiling mimageviewer v3.5.0 (C:\home\mimageviewer)
+warning: duplicated attribute
+     --> src\app\tests.rs:26348:5
+      |
+26348 |     #[test]
+      |     ^^^^^^^
+      |
+      = note: `#[warn(duplicate_macro_attributes)]` on by default
+
+warning: duplicated attribute
+    --> src\materializer.rs:2127:5
+     |
+2127 |     #[test]
+     |     ^^^^^^^
+
+warning: duplicated attribute
+    --> src\panorama.rs:1822:5
+     |
+1822 |     #[test]
+     |     ^^^^^^^
+
+warning: duplicated attribute
+     --> src\video\native_presenter\render_core.rs:13324:5
+      |
+13324 |     #[test]
+      |     ^^^^^^^
+
+warning: use of deprecated method `quick_xml::events::attributes::Attribute::<'a>::decode_and_unescape_value`: use `Self::decoded_and_normalized_value()`
+   --> src\xmp_reader.rs:461:45
+    |
+461 |                         if let Ok(v) = attr.decode_and_unescape_value(decoder) {
+    |                                             ^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated method `quick_xml::events::attributes::Attribute::<'a>::decode_and_unescape_value`: use `Self::decoded_and_normalized_value()`
+   --> src\xmp_reader.rs:465:45
+    |
+465 |                         if let Ok(v) = attr.decode_and_unescape_value(decoder) {
+    |                                             ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `quick_xml::events::attributes::Attribute::<'a>::unescape_value`: use `Self::normalized_value()`
+   --> src\xmp_reader.rs:868:33
+    |
+868 |             if let Ok(v) = attr.unescape_value() {
+    |                                 ^^^^^^^^^^^^^^
+
+warning: use of deprecated method `quick_xml::events::attributes::Attribute::<'a>::decode_and_unescape_value`: use `Self::decoded_and_normalized_value()`
+    --> src\xmp_reader.rs:1056:42
+     |
+1056 |                     let Ok(value) = attr.decode_and_unescape_value(decoder) else {
+     |                                          ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `ctx`
+     --> src\app\tests.rs:25709:13
+      |
+25709 |         let ctx = egui::Context::default();
+      |             ^^^ help: if this is intentional, prefix it with an underscore: `_ctx`
+      |
+      = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `ctx`
+     --> src\app\tests.rs:25826:13
+      |
+25826 |         let ctx = egui::Context::default();
+      |             ^^^ help: if this is intentional, prefix it with an underscore: `_ctx`
+
+warning: variable does not need to be mutable
+    --> src\remote_ipc\container.rs:7993:13
+     |
+7993 |         let mut png = |width: u32, height: u32| {
+     |             ----^^^
+     |             |
+     |             help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `seek_strip_wheel_is_consumed_and_becomes_one_range_step` is never used
+     --> src\video\native_presenter\render_core.rs:13354:8
+      |
+13354 |     fn seek_strip_wheel_is_consumed_and_becomes_one_range_step() {
+      |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `axis_diagnostics` is never read
+   --> src\video\seek_strip_thumbs.rs:297:16
+    |
+295 | pub(crate) struct StripThumbnailSnapshot {
+    |                   ---------------------- field in this struct
+296 |     pub(crate) axis: StripAxisResolution,
+297 |     pub(crate) axis_diagnostics: Option<StripAxisDiagnostics>,
+    |                ^^^^^^^^^^^^^^^^
+    |
+    = note: `StripThumbnailSnapshot` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: unused `std::result::Result` that must be used
+     --> src\app\tests.rs:26367:9
+      |
+26367 | /         app.with_viewer_context(original, |mounted| {
+26368 | |             assert!(
+26369 | |                 mounted.fs_info_panel.locked,
+26370 | |                 "他方の窓の操作でロックが落ちた"
+...     |
+26377 | |             assert!(!mounted.fs_info_panel.hover_active);
+26378 | |         });
+      | |__________^
+      |
+      = note: this `Result` may be an `Err` variant, which should be handled
+      = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default
+help: use `let _ = ...` to ignore the resulting value
+      |
+26367 |         let _ = app.with_viewer_context(original, |mounted| {
+      |         +++++++
+
+warning: unused return value of `egui::Context::run` that must be used
+     --> src\ui_main.rs:22244:13
+      |
+22244 | /             ctx.run(input.clone(), |ctx| {
+22245 | |                 egui::TopBottomPanel::top("t").show(ctx, |ui| {
+22246 | |                     let right = ui.max_rect().right();
+22247 | |                     ui.horizontal_wrapped(|ui| {
+...     |
+22251 | |                 });
+22252 | |             });
+      | |______________^
+      |
+help: use `let _ = ...` to ignore the resulting value
+      |
+22244 |             let _ = ctx.run(input.clone(), |ctx| {
+      |             +++++++
+
+warning: `mimageviewer` (lib test) generated 15 warnings (run `cargo fix --lib -p mimageviewer --tests` to apply 3 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 41.89s
+     Running unittests src\lib.rs (target\debug\deps\mimageviewer-fe3ca2e444d02a8b.exe)
+
+running 19 tests
+test edit_bundle_bulk::tests::a_cancelled_run_reports_what_was_left_and_says_the_applied_part_stays ... ok
+test edit_bundle_bulk::tests::failures_and_dropped_non_targets_are_reported_alongside_a_cancel ... ok
+test edit_bundle_bulk::tests::checked_targets_win_over_cursor_and_non_targets_are_reported ... ok
+test edit_bundle_bulk::tests::per_kind_counts_include_mixed_and_unedited_targets ... ok
+test edit_bundle_bulk::tests::all_checked_non_targets_return_an_explicit_empty_result ... ok
+test edit_bundle_bulk::tests::reset_subset_clears_only_selected_bundle_fields ... ok
+test undo_stack::tests::edit_bundle_bulk_discard_keeps_metadata_and_other_page_changes ... ok
+test edit_bundle_bulk::tests::edit_bundle_bulk_exit_drain_receives_item_before_bounded_worker_finishes ... ok
+test conceal_db::tests::edit_bundle_bulk_conceal_strict_reader_rejects_corrupt_shapes ... ok
+test mask_db::tests::edit_bundle_bulk_mask_strict_reader_rejects_corrupt_vectors ... ok
+test export_crop::tests::edit_bundle_bulk_strict_reader_rejects_unknown_aspect_mode ... ok
+test comic_db::tests::edit_bundle_bulk_comic_strict_reader_rejects_corrupt_json ... ok
+test comic_db::tests::edit_bundle_bulk_comic_strict_reader_rejects_unknown_document_version ... ok
+test local_adjust_write_worker::tests::edit_bundle_bulk_fence_ack_follows_prior_write_completion ... ok
+test edit_bundle_bulk::tests::partial_reset_uses_the_in_memory_local_adjust_override ... ok
+test edit_bundle_bulk::tests::partial_reset_keeps_unselected_rows_without_a_source_size ... ok
+test edit_bundle_bulk::tests::cancelling_stops_before_the_next_target_and_still_delivers_the_ones_in_flight ... ok
+test edit_bundle_bulk::tests::partial_reset_keeps_newer_in_memory_comic_and_adjustment ... ok
+test edit_bundle_bulk::tests::a_bulk_result_lands_in_the_context_that_asked_for_it ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 7246 filtered out; finished in 0.52s
+

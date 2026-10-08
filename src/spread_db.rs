@@ -6,7 +6,11 @@
 use std::path::{Path, PathBuf};
 
 use crate::path_key;
-use crate::settings::{ReadingDirection, ReadingFlow, SpreadMode};
+use crate::settings::{
+    FinalCoverSpreadPreference, PageAlonePreference, PageAlonePreferences, ReadingDirection,
+    ReadingFlow, SingletonSpreadEndpointPreferences, SingletonSpreadPlacementPreference,
+    SpreadMode,
+};
 use rusqlite::{OpenFlags, OptionalExtension};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -53,6 +57,33 @@ impl SpreadDb {
         Self::open_at(&path)
     }
 
+    /// App startup may keep reading released preferences when a writable
+    /// migration fails. The read-only connection projects the old rows until
+    /// the completed marker exists and rejects all preference writes.
+    pub(crate) fn open_for_app() -> Result<Self, rusqlite::Error> {
+        Self::open_for_app_at(&Self::db_path())
+    }
+
+    pub(crate) fn open_for_app_at(path: &Path) -> Result<Self, rusqlite::Error> {
+        match Self::open_at(path) {
+            Ok(db) => Ok(db),
+            Err(migration_error) => {
+                let Some(db) = Self::open_existing_read_only_at(path)? else {
+                    return Err(migration_error);
+                };
+                if singleton_endpoint_placement_marker_present(&db.conn)?
+                    || !table_exists_checked(&db.conn, "singleton_spread_placements")?
+                {
+                    return Err(migration_error);
+                }
+                crate::logger::log(format!(
+                    "spread.db migration failed; using read-only released endpoint rows: {migration_error}"
+                ));
+                Ok(db)
+            }
+        }
+    }
+
     /// 任意の data directory 配下で使うため、DB ファイルを明示して開く。
     pub fn open_at(path: &Path) -> Result<Self, rusqlite::Error> {
         if let Some(parent) = path.parent() {
@@ -63,17 +94,33 @@ impl SpreadDb {
             "CREATE TABLE IF NOT EXISTS spreads (
                 path TEXT PRIMARY KEY,
                 mode INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS final_cover_spreads (
+                path TEXT PRIMARY KEY,
+                preference INTEGER NOT NULL CHECK (preference BETWEEN 0 AND 2)
+            );
+            CREATE TABLE IF NOT EXISTS singleton_spread_placements (
+                path TEXT PRIMARY KEY,
+                preference INTEGER NOT NULL CHECK (preference BETWEEN 0 AND 2)
+            );
+            CREATE TABLE IF NOT EXISTS page_alone_preferences (
+                path TEXT PRIMARY KEY,
+                after_cover_preference INTEGER NOT NULL CHECK (after_cover_preference BETWEEN 0 AND 2),
+                last_preference INTEGER NOT NULL CHECK (last_preference BETWEEN 0 AND 2)
             )",
         )?;
         ensure_column(&conn, "flow", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&conn, "direction", "INTEGER NOT NULL DEFAULT 0")?;
+        migrate_singleton_endpoint_placements(&conn)?;
         Ok(Self { conn })
     }
 
     /// 既存 DB を read-only で開く。remote IPC の表示設定参照用で、schema 作成や更新は行わない。
     pub fn open_existing_read_only_at(path: &Path) -> Result<Option<Self>, rusqlite::Error> {
-        if !path.try_exists().unwrap_or(false) {
-            return Ok(None);
+        match path.try_exists() {
+            Ok(false) => return Ok(None),
+            Ok(true) => {}
+            Err(error) => return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(error))),
         }
         let conn = rusqlite::Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         Ok(Some(Self { conn }))
@@ -159,6 +206,204 @@ impl SpreadDb {
         }
     }
 
+    pub(crate) fn get_final_cover_spread_preference(
+        &self,
+        path: &Path,
+    ) -> Option<FinalCoverSpreadPreference> {
+        let key = normalize_path(path);
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT preference FROM final_cover_spreads WHERE path = ?1")
+            .ok()?;
+        stmt.query_row([&key], |row| row.get::<_, i32>(0))
+            .ok()
+            .and_then(FinalCoverSpreadPreference::from_int)
+    }
+
+    /// Resolve the exact book preference before its optional container fallback.
+    /// An exact `FollowGlobal` is a real value and deliberately blocks fallback.
+    /// Read-only handles for old databases have no `final_cover_spreads` table;
+    /// the failed lookup is treated as an inherited setting without migrating it.
+    pub(crate) fn get_final_cover_spread_preference_with_fallback(
+        &self,
+        key: &Path,
+        fallback: Option<&Path>,
+    ) -> FinalCoverSpreadPreference {
+        self.get_final_cover_spread_preference(key)
+            .or_else(|| {
+                fallback.and_then(|fallback| self.get_final_cover_spread_preference(fallback))
+            })
+            .unwrap_or_default()
+    }
+
+    /// Store a final-cover override without creating or modifying the legacy
+    /// `spreads` row. At a root key, following the global value needs no row;
+    /// at a nested key it is stored explicitly so that it blocks root fallback.
+    pub(crate) fn set_final_cover_spread_preference(
+        &self,
+        path: &Path,
+        fallback: Option<&Path>,
+        preference: FinalCoverSpreadPreference,
+    ) -> Result<(), rusqlite::Error> {
+        let key = normalize_path(path);
+        if preference == FinalCoverSpreadPreference::FollowGlobal && fallback.is_none() {
+            self.conn
+                .execute("DELETE FROM final_cover_spreads WHERE path = ?1", [&key])?;
+        } else {
+            self.conn.execute(
+                "INSERT INTO final_cover_spreads (path, preference) VALUES (?1, ?2)
+                 ON CONFLICT(path) DO UPDATE SET preference = ?2",
+                rusqlite::params![key, preference.to_int()],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Marker-gated endpoint read. A read-only released DB projects each old
+    /// row to both endpoints; an interrupted new table cannot mask old rows.
+    pub(crate) fn get_singleton_spread_endpoint_preferences_with_fallback(
+        &self,
+        key: &Path,
+        fallback: Option<&Path>,
+    ) -> Result<SingletonSpreadEndpointPreferences, rusqlite::Error> {
+        let migrated = singleton_endpoint_placement_marker_present(&self.conn)?;
+        let read =
+            |path: &Path| -> Result<Option<SingletonSpreadEndpointPreferences>, rusqlite::Error> {
+                if migrated {
+                    let key = normalize_path(path);
+                    let values: Option<(i32, i32)> = self.conn.query_row(
+                    "SELECT first_preference, last_preference FROM singleton_spread_endpoint_placements WHERE path = ?1",
+                    [&key],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                ).optional()?;
+                    values
+                        .map(|(first, last)| {
+                            Ok(SingletonSpreadEndpointPreferences {
+                                first: SingletonSpreadPlacementPreference::from_int(first)
+                                    .ok_or(rusqlite::Error::InvalidQuery)?,
+                                last: SingletonSpreadPlacementPreference::from_int(last)
+                                    .ok_or(rusqlite::Error::InvalidQuery)?,
+                            })
+                        })
+                        .transpose()
+                } else if table_exists_checked(&self.conn, "singleton_spread_placements")? {
+                    let key = normalize_path(path);
+                    let old: Option<i32> = self
+                        .conn
+                        .query_row(
+                            "SELECT preference FROM singleton_spread_placements WHERE path = ?1",
+                            [&key],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    old.map(|value| {
+                        let preference = SingletonSpreadPlacementPreference::from_int(value)
+                            .ok_or(rusqlite::Error::InvalidQuery)?;
+                        Ok(SingletonSpreadEndpointPreferences {
+                            first: preference,
+                            last: preference,
+                        })
+                    })
+                    .transpose()
+                } else {
+                    Ok(None)
+                }
+            };
+        if migrated && !table_exists_checked(&self.conn, "singleton_spread_endpoint_placements")? {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        if let Some(preferences) = read(key)? {
+            return Ok(preferences);
+        }
+        if let Some(fallback) = fallback {
+            if let Some(preferences) = read(fallback)? {
+                return Ok(preferences);
+            }
+        }
+        Ok(SingletonSpreadEndpointPreferences::default())
+    }
+
+    pub(crate) fn set_singleton_spread_endpoint_preferences(
+        &self,
+        path: &Path,
+        fallback: Option<&Path>,
+        preferences: SingletonSpreadEndpointPreferences,
+    ) -> Result<(), rusqlite::Error> {
+        if !singleton_endpoint_placement_marker_present(&self.conn)? {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let key = normalize_path(path);
+        if preferences == SingletonSpreadEndpointPreferences::default() && fallback.is_none() {
+            self.conn.execute(
+                "DELETE FROM singleton_spread_endpoint_placements WHERE path = ?1",
+                [&key],
+            )?;
+        } else {
+            self.conn.execute(
+                "INSERT INTO singleton_spread_endpoint_placements (path, first_preference, last_preference) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(path) DO UPDATE SET first_preference = ?2, last_preference = ?3",
+                rusqlite::params![key, preferences.first.to_int(), preferences.last.to_int()],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// An absent table in a released read-only database means both controls
+    /// inherit their new default-OFF global settings. A damaged present table
+    /// remains an error rather than being mistaken for inherited preferences.
+    pub(crate) fn get_page_alone_preferences_with_fallback(
+        &self,
+        key: &Path,
+        fallback: Option<&Path>,
+    ) -> Result<PageAlonePreferences, rusqlite::Error> {
+        if !table_exists_checked(&self.conn, "page_alone_preferences")? {
+            return Ok(PageAlonePreferences::default());
+        }
+        let read = |path: &Path| -> Result<Option<PageAlonePreferences>, rusqlite::Error> {
+            let key = normalize_path(path);
+            self.conn.query_row(
+                "SELECT after_cover_preference, last_preference FROM page_alone_preferences WHERE path = ?1",
+                [&key],
+                |row| {
+                    let after_cover = PageAlonePreference::from_int(row.get(0)?)
+                        .ok_or(rusqlite::Error::InvalidQuery)?;
+                    let last = PageAlonePreference::from_int(row.get(1)?)
+                        .ok_or(rusqlite::Error::InvalidQuery)?;
+                    Ok(PageAlonePreferences { after_cover, last })
+                },
+            ).optional()
+        };
+        if let Some(preferences) = read(key)? {
+            return Ok(preferences);
+        }
+        if let Some(fallback) = fallback {
+            if let Some(preferences) = read(fallback)? {
+                return Ok(preferences);
+            }
+        }
+        Ok(PageAlonePreferences::default())
+    }
+
+    pub(crate) fn set_page_alone_preferences(
+        &self,
+        path: &Path,
+        fallback: Option<&Path>,
+        preferences: PageAlonePreferences,
+    ) -> Result<(), rusqlite::Error> {
+        let key = normalize_path(path);
+        if preferences == PageAlonePreferences::default() && fallback.is_none() {
+            self.conn
+                .execute("DELETE FROM page_alone_preferences WHERE path = ?1", [&key])?;
+        } else {
+            self.conn.execute(
+                "INSERT INTO page_alone_preferences (path, after_cover_preference, last_preference) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(path) DO UPDATE SET after_cover_preference = ?2, last_preference = ?3",
+                rusqlite::params![key, preferences.after_cover.to_int(), preferences.last.to_int()],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn set_mode_and_direction(
         &mut self,
         path: &Path,
@@ -234,17 +479,139 @@ impl SpreadDb {
         Ok(())
     }
 
+    /// Persist the displayed mode, flow, and direction as one SQLite statement.
+    /// UI setters use this before changing any in-memory presentation state.
+    pub(crate) fn set_presentation_state(
+        &self,
+        path: &Path,
+        mode: SpreadMode,
+        flow: ReadingFlow,
+        direction: ReadingDirection,
+        defaults: (SpreadMode, ReadingFlow, ReadingDirection),
+    ) -> Result<(), rusqlite::Error> {
+        let key = normalize_path(path);
+        if (mode, flow, direction) == defaults {
+            self.conn
+                .execute("DELETE FROM spreads WHERE path = ?1", [&key])?;
+        } else {
+            self.conn.execute(
+                "INSERT INTO spreads (path, mode, flow, direction) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(path) DO UPDATE SET mode = ?2, flow = ?3, direction = ?4",
+                rusqlite::params![key, mode.to_int(), flow.to_int(), direction.to_int()],
+            )?;
+        }
+        Ok(())
+    }
+
     /// 全レコードを削除 (リセット)
-    pub fn clear_all(&self) -> Result<usize, rusqlite::Error> {
-        self.conn.execute("DELETE FROM spreads", [])
+    pub fn clear_all(&mut self) -> Result<usize, rusqlite::Error> {
+        let transaction = self.conn.transaction()?;
+        let spreads = transaction.execute("DELETE FROM spreads", [])?;
+        let final_covers = transaction.execute("DELETE FROM final_cover_spreads", [])?;
+        let singleton_placements =
+            transaction.execute("DELETE FROM singleton_spread_endpoint_placements", [])?;
+        let page_alone = transaction.execute("DELETE FROM page_alone_preferences", [])?;
+        transaction.execute("DELETE FROM singleton_spread_placements", [])?;
+        transaction.commit()?;
+        Ok(spreads + final_covers + singleton_placements + page_alone)
     }
 
     /// 登録件数
     pub fn count(&self) -> usize {
+        let mut tables = vec!["spreads"];
+        if table_exists(&self.conn, "final_cover_spreads") {
+            tables.push("final_cover_spreads");
+        }
+        let endpoint_table =
+            if singleton_endpoint_placement_marker_present(&self.conn).unwrap_or(false) {
+                "singleton_spread_endpoint_placements"
+            } else {
+                "singleton_spread_placements"
+            };
+        if table_exists(&self.conn, endpoint_table) {
+            tables.push(endpoint_table);
+        }
+        if table_exists(&self.conn, "page_alone_preferences") {
+            tables.push("page_alone_preferences");
+        }
+        let union = tables
+            .iter()
+            .map(|table| format!("SELECT path FROM {table}"))
+            .collect::<Vec<_>>()
+            .join(" UNION ");
         self.conn
-            .query_row("SELECT COUNT(*) FROM spreads", [], |row| row.get(0))
+            .query_row(&format!("SELECT COUNT(*) FROM ({union})"), [], |row| {
+                row.get::<_, usize>(0)
+            })
             .unwrap_or(0)
     }
+}
+
+fn table_exists(conn: &rusqlite::Connection, table: &str) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1
+         )",
+        [table],
+        |row| row.get::<_, bool>(0),
+    )
+    .unwrap_or(false)
+}
+
+fn table_exists_checked(conn: &rusqlite::Connection, table: &str) -> Result<bool, rusqlite::Error> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false))
+}
+
+fn singleton_endpoint_placement_marker_present(
+    conn: &rusqlite::Connection,
+) -> Result<bool, rusqlite::Error> {
+    if !table_exists_checked(conn, "spread_meta")? {
+        return Ok(false);
+    }
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM spread_meta WHERE key = 'singleton_endpoint_placements_v1' AND value = '1'",
+            [],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false))
+}
+
+fn migrate_singleton_endpoint_placements(
+    conn: &rusqlite::Connection,
+) -> Result<(), rusqlite::Error> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS spread_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS singleton_spread_endpoint_placements (
+             path TEXT PRIMARY KEY,
+             first_preference INTEGER NOT NULL CHECK (first_preference BETWEEN 0 AND 2),
+             last_preference INTEGER NOT NULL CHECK (last_preference BETWEEN 0 AND 2)
+         );",
+    )?;
+    if !singleton_endpoint_placement_marker_present(&tx)? {
+        // A table left by an interrupted attempt is never authoritative.
+        tx.execute("DELETE FROM singleton_spread_endpoint_placements", [])?;
+        tx.execute(
+            "INSERT INTO singleton_spread_endpoint_placements (path, first_preference, last_preference)
+             SELECT path, preference, preference FROM singleton_spread_placements",
+            [],
+        )?;
+        tx.execute(
+            "INSERT INTO spread_meta(key, value) VALUES ('singleton_endpoint_placements_v1', '1')",
+            [],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 fn persist_explicit_spread(
@@ -538,5 +905,419 @@ mod tests {
         assert_eq!(db.get(book), Some(SpreadMode::LtrCover));
         assert_eq!(db.get_flow(book), Some(ReadingFlow::Horizontal));
         assert_eq!(db.get_direction(book), Some(ReadingDirection::Ltr));
+    }
+
+    #[test]
+    fn endpoint_preferences_project_read_only_legacy_and_retry_interrupted_migration() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("spread.db");
+        let root = Path::new("C:/books/outer.zip");
+        let nested = Path::new("C:/books/outer.zip/book");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE singleton_spread_placements (path TEXT PRIMARY KEY, preference INTEGER NOT NULL);
+                 CREATE TABLE singleton_spread_endpoint_placements (path TEXT PRIMARY KEY, first_preference INTEGER, last_preference INTEGER);",
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO singleton_spread_placements(path, preference) VALUES (?1, 1)",
+                [normalize_path(root)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO singleton_spread_placements(path, preference) VALUES (?1, 0)",
+                [normalize_path(nested)],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO singleton_spread_endpoint_placements(path, first_preference, last_preference) VALUES (?1, 2, 2)", [normalize_path(root)]).unwrap();
+        }
+        let read_only = SpreadDb::open_existing_read_only_at(&path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            read_only
+                .get_singleton_spread_endpoint_preferences_with_fallback(root, None)
+                .unwrap(),
+            SingletonSpreadEndpointPreferences::from(SingletonSpreadPlacementPreference::Place)
+        );
+        assert_eq!(
+            read_only
+                .get_singleton_spread_endpoint_preferences_with_fallback(nested, Some(root))
+                .unwrap(),
+            SingletonSpreadEndpointPreferences::default(),
+            "explicit nested FollowGlobal blocks root fallback"
+        );
+        drop(read_only);
+        let db = SpreadDb::open_at(&path).unwrap();
+        assert!(singleton_endpoint_placement_marker_present(&db.conn).unwrap());
+        assert_eq!(
+            db.get_singleton_spread_endpoint_preferences_with_fallback(root, None)
+                .unwrap(),
+            SingletonSpreadEndpointPreferences::from(SingletonSpreadPlacementPreference::Place)
+        );
+        assert_eq!(
+            db.get_singleton_spread_endpoint_preferences_with_fallback(nested, Some(root))
+                .unwrap(),
+            SingletonSpreadEndpointPreferences::default()
+        );
+        db.conn
+            .execute_batch("DROP TABLE singleton_spread_endpoint_placements")
+            .unwrap();
+        assert!(
+            db.get_singleton_spread_endpoint_preferences_with_fallback(root, None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn endpoint_preferences_are_independent_and_preserve_nested_override() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = SpreadDb::open_at(&temp.path().join("spread.db")).unwrap();
+        let root = Path::new("C:/books/outer.zip");
+        let nested = Path::new("C:/books/outer.zip/book");
+        db.set_singleton_spread_endpoint_preferences(
+            root,
+            None,
+            SingletonSpreadEndpointPreferences {
+                first: SingletonSpreadPlacementPreference::Place,
+                last: SingletonSpreadPlacementPreference::Center,
+            },
+        )
+        .unwrap();
+        db.set_singleton_spread_endpoint_preferences(
+            nested,
+            Some(root),
+            SingletonSpreadEndpointPreferences {
+                first: SingletonSpreadPlacementPreference::FollowGlobal,
+                last: SingletonSpreadPlacementPreference::Place,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_singleton_spread_endpoint_preferences_with_fallback(nested, Some(root))
+                .unwrap(),
+            SingletonSpreadEndpointPreferences {
+                first: SingletonSpreadPlacementPreference::FollowGlobal,
+                last: SingletonSpreadPlacementPreference::Place
+            }
+        );
+    }
+
+    #[test]
+    fn endpoint_migration_failure_keeps_legacy_rows_for_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("spread.db");
+        let key = Path::new("C:/books/book.zip");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE singleton_spread_placements (path TEXT PRIMARY KEY, preference INTEGER NOT NULL);
+                 CREATE TABLE singleton_spread_endpoint_placements (path TEXT PRIMARY KEY, first_preference INTEGER, last_preference INTEGER);
+                 CREATE TRIGGER fail_endpoint_copy BEFORE INSERT ON singleton_spread_endpoint_placements
+                 BEGIN SELECT RAISE(ABORT, 'injected migration failure'); END;",
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO singleton_spread_placements(path, preference) VALUES (?1, 1)",
+                [normalize_path(key)],
+            )
+            .unwrap();
+        }
+        assert!(SpreadDb::open_at(&path).is_err());
+        let read_only = SpreadDb::open_existing_read_only_at(&path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            read_only
+                .get_singleton_spread_endpoint_preferences_with_fallback(key, None)
+                .unwrap(),
+            SingletonSpreadEndpointPreferences::from(SingletonSpreadPlacementPreference::Place)
+        );
+        drop(read_only);
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_endpoint_copy")
+            .unwrap();
+        let retry = SpreadDb::open_at(&path).unwrap();
+        assert_eq!(
+            retry
+                .get_singleton_spread_endpoint_preferences_with_fallback(key, None)
+                .unwrap(),
+            SingletonSpreadEndpointPreferences::from(SingletonSpreadPlacementPreference::Place)
+        );
+    }
+
+    #[test]
+    fn final_cover_override_is_independent_and_exact_follow_global_blocks_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut db = SpreadDb::open_at(&temp.path().join("spread.db")).unwrap();
+        let root = Path::new("C:/books/outer.zip");
+        let nested = Path::new("C:/books/outer.zip/book");
+
+        db.set(
+            root,
+            SpreadMode::RtlCover,
+            SpreadMode::Single,
+            ReadingFlow::Paged,
+            ReadingDirection::Ltr,
+        )
+        .unwrap();
+        db.set_final_cover_spread_preference(root, None, FinalCoverSpreadPreference::Off)
+            .unwrap();
+        assert_eq!(
+            db.get_final_cover_spread_preference_with_fallback(nested, Some(root)),
+            FinalCoverSpreadPreference::Off
+        );
+
+        db.set_final_cover_spread_preference(
+            nested,
+            Some(root),
+            FinalCoverSpreadPreference::FollowGlobal,
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_final_cover_spread_preference_with_fallback(nested, Some(root)),
+            FinalCoverSpreadPreference::FollowGlobal
+        );
+        assert_eq!(db.get(root), Some(SpreadMode::RtlCover));
+
+        db.set_final_cover_spread_preference(nested, Some(root), FinalCoverSpreadPreference::On)
+            .unwrap();
+        db.set_flow(
+            root,
+            ReadingFlow::Horizontal,
+            ReadingDirection::Rtl,
+            SpreadMode::Single,
+            ReadingFlow::Paged,
+            ReadingDirection::Ltr,
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_final_cover_spread_preference_with_fallback(nested, Some(root)),
+            FinalCoverSpreadPreference::On
+        );
+        assert_eq!(db.get_flow(root), Some(ReadingFlow::Horizontal));
+        assert_eq!(db.count(), 2, "paths shared by both tables count once");
+        assert_eq!(db.clear_all().unwrap(), 3);
+        assert_eq!(db.count(), 0);
+        assert!(db.get(root).is_none());
+        assert_eq!(
+            db.get_final_cover_spread_preference_with_fallback(nested, Some(root)),
+            FinalCoverSpreadPreference::FollowGlobal
+        );
+    }
+
+    #[test]
+    fn singleton_placement_override_is_independent_and_exact_follow_global_blocks_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut db = SpreadDb::open_at(&temp.path().join("spread.db")).unwrap();
+        let root = Path::new("C:/books/outer.zip");
+        let nested = Path::new("C:/books/outer.zip/book");
+
+        db.set_singleton_spread_endpoint_preferences(
+            root,
+            None,
+            SingletonSpreadPlacementPreference::Center.into(),
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_singleton_spread_endpoint_preferences_with_fallback(nested, Some(root))
+                .unwrap(),
+            SingletonSpreadEndpointPreferences::from(SingletonSpreadPlacementPreference::Center)
+        );
+
+        db.set_singleton_spread_endpoint_preferences(
+            nested,
+            Some(root),
+            SingletonSpreadPlacementPreference::FollowGlobal.into(),
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_singleton_spread_endpoint_preferences_with_fallback(nested, Some(root))
+                .unwrap(),
+            SingletonSpreadEndpointPreferences::default()
+        );
+
+        db.set_singleton_spread_endpoint_preferences(
+            nested,
+            Some(root),
+            SingletonSpreadPlacementPreference::Place.into(),
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_singleton_spread_endpoint_preferences_with_fallback(nested, Some(root))
+                .unwrap(),
+            SingletonSpreadEndpointPreferences::from(SingletonSpreadPlacementPreference::Place)
+        );
+        assert_eq!(db.count(), 2, "root and nested keys count once each");
+        assert_eq!(db.clear_all().unwrap(), 2);
+        assert_eq!(db.count(), 0);
+    }
+
+    #[test]
+    fn page_alone_preferences_keep_independent_nested_overrides_and_read_only_compatibility() {
+        use crate::settings::{PageAlonePreference as Preference, PageAlonePreferences};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("spread.db");
+        let root = Path::new("C:/books/outer.zip");
+        let nested = Path::new("C:/books/outer.zip/book");
+        let db = SpreadDb::open_at(&path).unwrap();
+        db.set_page_alone_preferences(
+            root,
+            None,
+            PageAlonePreferences {
+                after_cover: Preference::On,
+                last: Preference::Off,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_page_alone_preferences_with_fallback(nested, Some(root))
+                .unwrap(),
+            PageAlonePreferences {
+                after_cover: Preference::On,
+                last: Preference::Off
+            },
+        );
+        db.set_page_alone_preferences(nested, Some(root), PageAlonePreferences::default())
+            .unwrap();
+        assert_eq!(
+            db.get_page_alone_preferences_with_fallback(nested, Some(root))
+                .unwrap(),
+            PageAlonePreferences::default(),
+            "explicit nested FollowGlobal must block the root row",
+        );
+        assert_eq!(db.count(), 2);
+        db.conn
+            .execute_batch(
+                "ALTER TABLE page_alone_preferences RENAME TO damaged_page_alone_preferences;",
+            )
+            .unwrap();
+        assert_eq!(
+            db.get_page_alone_preferences_with_fallback(root, None)
+                .unwrap(),
+            PageAlonePreferences::default(),
+            "missing table on a read-only released DB inherits defaults",
+        );
+        let old = SpreadDb::open_existing_read_only_at(&path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            old.get_page_alone_preferences_with_fallback(root, None)
+                .unwrap(),
+            PageAlonePreferences::default(),
+        );
+        assert!(
+            old.set_page_alone_preferences(root, None, PageAlonePreferences::default())
+                .is_err()
+        );
+        db.conn
+            .execute_batch(
+                "CREATE TABLE page_alone_preferences(path TEXT PRIMARY KEY, wrong INTEGER);",
+            )
+            .unwrap();
+        assert!(
+            db.get_page_alone_preferences_with_fallback(root, None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn old_read_only_schema_inherits_final_cover_without_migration() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("spread.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "CREATE TABLE spreads (path TEXT PRIMARY KEY, mode INTEGER NOT NULL DEFAULT 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO spreads (path, mode) VALUES ('c:/books/legacy.zip', 2)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = SpreadDb::open_existing_read_only_at(&path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.get_final_cover_spread_preference_with_fallback(
+                Path::new("C:/books/book.zip"),
+                None,
+            ),
+            FinalCoverSpreadPreference::FollowGlobal
+        );
+        assert_eq!(db.count(), 1);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(final_cover_spreads)")
+            .unwrap();
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.is_empty());
+        assert_eq!(
+            db.get_singleton_spread_endpoint_preferences_with_fallback(
+                Path::new("C:/books/book.zip"),
+                None,
+            )
+            .unwrap(),
+            SingletonSpreadEndpointPreferences::default()
+        );
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(singleton_spread_placements)")
+            .unwrap();
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.is_empty());
+    }
+
+    #[test]
+    fn transitional_read_only_schema_counts_each_optional_table_without_duplicates() {
+        for optional_table in ["final_cover_spreads", "singleton_spread_placements"] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("spread.db");
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute(
+                "CREATE TABLE spreads (path TEXT PRIMARY KEY, mode INTEGER NOT NULL DEFAULT 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                &format!(
+                    "CREATE TABLE {optional_table} (
+                        path TEXT PRIMARY KEY,
+                        preference INTEGER NOT NULL
+                    )"
+                ),
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO spreads (path, mode) VALUES ('c:/books/shared.zip', 2)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                &format!(
+                    "INSERT INTO {optional_table} (path, preference)
+                     VALUES ('c:/books/shared.zip', 1), ('c:/books/optional-only.zip', 2)"
+                ),
+                [],
+            )
+            .unwrap();
+            drop(conn);
+
+            let db = SpreadDb::open_existing_read_only_at(&path)
+                .unwrap()
+                .unwrap();
+            assert_eq!(db.count(), 2, "table={optional_table}");
+        }
     }
 }

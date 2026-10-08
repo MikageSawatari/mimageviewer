@@ -4,7 +4,103 @@
 //! claims. It does not mount a context, allocate a window identity, or advance a
 //! lifecycle transition.
 
-use super::{App, ContextResidence, FsCacheEntry, GridItem};
+use super::raw_page_store::RawPageLoadState;
+use super::{App, ContextResidence, DetachedWindowState, FsCacheEntry, GridItem};
+use crate::test_script::TestScriptWindowPresentation;
+
+fn test_script_window_presentation(
+    window_id: Option<u64>,
+    state: Option<DetachedWindowState>,
+    residence: ContextResidence,
+    has_frozen_view: bool,
+) -> TestScriptWindowPresentation {
+    match (window_id, state) {
+        (None, _) => TestScriptWindowPresentation::Root,
+        (Some(_), Some(DetachedWindowState::Parked))
+            if residence == ContextResidence::AtRest && has_frozen_view =>
+        {
+            TestScriptWindowPresentation::PassiveDeferredFrozen
+        }
+        (Some(_), Some(DetachedWindowState::ParkedLive)) => {
+            TestScriptWindowPresentation::ParkedLiveImmediate
+        }
+        (Some(_), Some(DetachedWindowState::Active)) => {
+            TestScriptWindowPresentation::ActiveImmediate
+        }
+        (Some(_), _) => TestScriptWindowPresentation::Other,
+    }
+}
+
+fn test_script_native_host_style(
+    role: &str,
+    viewport: String,
+    hwnd: u64,
+    backend_token: Option<u64>,
+) -> Option<crate::test_script::TestScriptHostStyle> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GW_OWNER, GWL_EXSTYLE, GetForegroundWindow, GetWindow, GetWindowLongPtrW, IsIconic,
+        IsWindow, IsWindowVisible, WS_EX_NOACTIVATE, WS_EX_TOPMOST,
+    };
+
+    if hwnd == 0 || !unsafe { IsWindow(Some(HWND(hwnd as usize as *mut _))) }.as_bool() {
+        return None;
+    }
+    let native = HWND(hwnd as usize as *mut _);
+    let ex_style = unsafe { GetWindowLongPtrW(native, GWL_EXSTYLE) } as u32;
+    let owner = unsafe { GetWindow(native, GW_OWNER) }.unwrap_or_default();
+    let foreground = unsafe { GetForegroundWindow() };
+    Some(crate::test_script::TestScriptHostStyle {
+        role: role.to_owned(),
+        window_id: None,
+        presentation: TestScriptWindowPresentation::Other,
+        viewport,
+        viewport_id: None,
+        hwnd,
+        backend_token,
+        topmost: ex_style & WS_EX_TOPMOST.0 != 0,
+        noactivate: ex_style & WS_EX_NOACTIVATE.0 != 0,
+        minimized: unsafe { IsIconic(native) }.as_bool(),
+        visible: unsafe { IsWindowVisible(native) }.as_bool(),
+        owner_hwnd: owner.0 as usize as u64,
+        foreground_hwnd: foreground.0 as usize as u64,
+    })
+}
+
+fn test_script_egui_host_style(
+    role: &str,
+    viewport_id: egui::ViewportId,
+) -> Option<crate::test_script::TestScriptHostStyle> {
+    let witness = eframe::miv_test_script_window_witness::latest(viewport_id)?;
+    let current = eframe::miv_test_script_window_witness::is_current(
+        viewport_id,
+        witness.hwnd(),
+        witness.token(),
+    )
+    .ok()?;
+    if !current {
+        return None;
+    }
+    let mut style = test_script_native_host_style(
+        role,
+        format!("{viewport_id:?}"),
+        witness.hwnd(),
+        Some(witness.token()),
+    )?;
+    style.viewport_id = Some(viewport_id);
+    Some(style)
+}
+
+fn test_script_detached_host_ids(
+    parked_or_live: impl IntoIterator<Item = u64>,
+    active: Option<u64>,
+) -> Vec<u64> {
+    let mut ids = parked_or_live.into_iter().collect::<Vec<_>>();
+    ids.extend(active);
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TestScriptActivePaintOwner {
@@ -48,6 +144,74 @@ fn test_script_active_paint_owner(
 }
 
 impl App {
+    pub(crate) fn test_script_host_styles(&self) -> Vec<crate::test_script::TestScriptHostStyle> {
+        let mut styles = Vec::new();
+        if let Some(root) = test_script_egui_host_style("root", egui::ViewportId::ROOT) {
+            styles.push(root);
+        }
+        let detached_ids = test_script_detached_host_ids(
+            self.detached_image_windows.iter().map(|window| window.id),
+            self.active_detached_window_id(),
+        );
+        for window_id in detached_ids {
+            let viewport_id = Self::detached_image_window_viewport_id(window_id);
+            if let Some(mut style) = test_script_egui_host_style("detached", viewport_id) {
+                style.window_id = Some(window_id);
+                style.presentation = match self.detached_window_state(window_id) {
+                    Some(DetachedWindowState::Parked)
+                        if self
+                            .detached_image_windows
+                            .iter()
+                            .any(|w| w.id == window_id) =>
+                    {
+                        TestScriptWindowPresentation::PassiveDeferredFrozen
+                    }
+                    Some(DetachedWindowState::ParkedLive) => {
+                        TestScriptWindowPresentation::ParkedLiveImmediate
+                    }
+                    Some(DetachedWindowState::Active) => {
+                        TestScriptWindowPresentation::ActiveImmediate
+                    }
+                    _ => TestScriptWindowPresentation::Other,
+                };
+                styles.push(style);
+            }
+        }
+        let fullscreen_id = self.fullscreen_viewport_id();
+        if self.fs_viewport_shown
+            && !styles
+                .iter()
+                .any(|style| style.viewport == format!("{fullscreen_id:?}"))
+            && let Some(style) = test_script_egui_host_style("fullscreen", fullscreen_id)
+        {
+            styles.push(style);
+        }
+        let preview_id = egui::ViewportId::from_hash_of("details_thumbnail_tooltip");
+        if self.details_hover_thumb_viewport_open
+            && let Some(style) = test_script_egui_host_style("preview", preview_id)
+        {
+            styles.push(style);
+        }
+        if let Some(FsCacheEntry::Video { player, .. }) =
+            self.fullscreen_idx.and_then(|idx| self.fs_cache.get(&idx))
+        {
+            if let Some(style) = test_script_native_host_style(
+                "presenter",
+                String::new(),
+                player.native_presenter_hwnd(),
+                None,
+            ) {
+                styles.push(style);
+            }
+            if let Some(style) =
+                test_script_native_host_style("hud", String::new(), player.native_hud_hwnd(), None)
+            {
+                styles.push(style);
+            }
+        }
+        styles
+    }
+
     pub(crate) fn test_script_pointer_show_owner(
         &self,
         window_id: u64,
@@ -157,15 +321,46 @@ impl App {
         identity: Option<crate::test_script::TestScriptWindowIdentity>,
     ) -> Option<crate::test_script::TestScriptWindowSnapshot> {
         let residence = self.viewer_context_residence(context_id);
+        let presentation = test_script_window_presentation(
+            window_id,
+            window_id.and_then(|id| self.detached_window_state(id)),
+            residence,
+            window_id.is_some_and(|id| {
+                self.detached_image_windows
+                    .iter()
+                    .any(|window| window.id == id)
+            }),
+        );
         self.with_viewer_context_ref(context_id, |context| {
             let page_index = context.fullscreen_idx();
             let item = page_index.and_then(|idx| context.items().get(idx));
             let item_identity = item.map(GridItem::perf_key).unwrap_or_default();
+            let selected_item_identity = context
+                .selected()
+                .and_then(|idx| context.items().get(idx))
+                .map(GridItem::perf_key)
+                .unwrap_or_default();
             let media_kind = item.map(test_script_media_kind).unwrap_or("none");
-            let page_ready = page_index.is_some_and(|idx| {
-                matches!(
+            let raw_state = page_index
+                .filter(|&idx| match context.items().get(idx) {
+                    Some(GridItem::Image(path)) => crate::raw_format::is_raw_path(path),
+                    Some(GridItem::ZipImage { entry_name, .. }) => {
+                        crate::raw_format::is_raw_path(std::path::Path::new(entry_name))
+                    }
+                    _ => false,
+                })
+                .map(|idx| context.raw_pages().classify(idx));
+            let edit_ready = page_index.is_some_and(|idx| match raw_state {
+                Some(state) => state == RawPageLoadState::Developed,
+                None => matches!(
                     context.fs_cache().get(&idx),
                     Some(FsCacheEntry::Static { .. } | FsCacheEntry::Animated { .. })
+                ),
+            });
+            let page_ready = raw_state.map_or(edit_ready, |state| {
+                matches!(
+                    state,
+                    RawPageLoadState::PreviewShown | RawPageLoadState::Developed
                 )
             });
             crate::test_script::TestScriptWindowSnapshot {
@@ -180,11 +375,14 @@ impl App {
                 context_serial: context_id.serial(),
                 viewport_id,
                 residence: test_script_residence(residence).to_string(),
+                presentation,
                 media_kind: media_kind.to_string(),
                 page_index,
                 items_generation: context.items_generation(),
                 item_identity,
+                selected_item_identity,
                 page_ready,
+                edit_ready,
                 viewport_rendered: false,
                 viewport_revision: 0,
                 paint_matches_current_page: false,
@@ -193,6 +391,22 @@ impl App {
                 paint_source_texture: String::new(),
                 painted_page_index: None,
                 paint_revision: 0,
+                paints: Vec::new(),
+                sidecar_imported: false,
+                sidecar_loaded: false,
+                seek_strip: context.video_seek_strip_test_script_snapshot(),
+                audio_track: page_index
+                    .and_then(|idx| context.fs_cache().get(&idx).map(|entry| (idx, entry)))
+                    .and_then(|(idx, entry)| match entry {
+                        FsCacheEntry::Video { player, .. } => Some(
+                            crate::test_script::TestScriptAudioTrackSnapshot::from_player(
+                                player,
+                                context.video_audio_mode() == Some(idx),
+                            ),
+                        ),
+                        _ => None,
+                    })
+                    .unwrap_or_else(crate::test_script::TestScriptAudioTrackSnapshot::absent),
             }
         })
     }
@@ -282,17 +496,18 @@ impl App {
     /// activation, and commits that queue immediately so a lower window id cannot
     /// be selected in between those steps.
     pub(crate) fn test_script_drive_targeted_activation(&mut self, ctx: &egui::Context) -> bool {
-        let Some(owner) = crate::test_script::pending_targeted_detached_owner() else {
+        let Some(target) = crate::test_script::pending_targeted_detached_action() else {
             return false;
         };
+        let owner = target.owner.clone();
         let crate::test_script::TestScriptWindowIdentity::Detached {
             window_id,
             viewport_id,
             ..
         } = &owner
         else {
-            crate::test_script::finish_targeted_detached_owner(
-                &owner,
+            crate::test_script::finish_targeted_detached_action(
+                &target,
                 Err("only a detached target may require activation".to_string()),
             );
             return false;
@@ -307,12 +522,19 @@ impl App {
 
         if self.active_detached_window_id() == Some(window_id) {
             if test_script_active_detached_target_matches(self, window_id, viewport_id, &owner) {
-                crate::test_script::finish_targeted_detached_owner(&owner, Ok(()));
-                ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus);
+                crate::test_script::finish_targeted_detached_action(&target, Ok(()));
+                if !crate::test_script::action_target_is_focused(ctx, &owner) && target.is_live() {
+                    crate::test_script::request_action_target_focus(
+                        ctx,
+                        &owner,
+                        self.test_script_window_identity(window_id, viewport_id)
+                            .as_ref(),
+                    );
+                }
                 ctx.request_repaint_of(viewport_id);
             } else {
-                crate::test_script::finish_targeted_detached_owner(
-                    &owner,
+                crate::test_script::finish_targeted_detached_action(
+                    &target,
                     Err(format!(
                         "run_action active target host changed: {}",
                         owner.describe()
@@ -323,8 +545,8 @@ impl App {
         }
 
         let Some((_, residence)) = self.locate_window_context(window_id) else {
-            crate::test_script::finish_targeted_detached_owner(
-                &owner,
+            crate::test_script::finish_targeted_detached_action(
+                &target,
                 Err(format!(
                     "run_action target has no current viewer context: {}",
                     owner.describe()
@@ -333,8 +555,8 @@ impl App {
             return false;
         };
         if self.test_script_window_identity(window_id, viewport_id) != Some(owner.clone()) {
-            crate::test_script::finish_targeted_detached_owner(
-                &owner,
+            crate::test_script::finish_targeted_detached_action(
+                &target,
                 Err(format!(
                     "run_action target host changed before activation: {}",
                     owner.describe()
@@ -344,8 +566,8 @@ impl App {
         }
 
         if residence != ContextResidence::AtRest || !self.detached_window_can_activate(window_id) {
-            crate::test_script::finish_targeted_detached_owner(
-                &owner,
+            crate::test_script::finish_targeted_detached_action(
+                &target,
                 Err(format!(
                     "run_action target cannot be activated: {} residence={residence:?}",
                     owner.describe()
@@ -354,6 +576,11 @@ impl App {
             return false;
         }
 
+        // This exact request admits acquisition immediately before it starts.
+        // The queue+commit may finish later; it does not acknowledge delivery.
+        if !target.is_live() {
+            return false;
+        }
         self.queue_deferred_detached_window_activation(window_id, "test_script_targeted_action");
         let committed = self.commit_pending_deferred_detached_window_activation(ctx);
         let actual_owner = self
@@ -361,12 +588,14 @@ impl App {
             .filter(|active| *active == window_id)
             .and_then(|_| self.test_script_window_identity(window_id, viewport_id));
         if committed && actual_owner.as_ref() == Some(&owner) {
-            crate::test_script::finish_targeted_detached_owner(&owner, Ok(()));
-            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus);
+            crate::test_script::finish_targeted_detached_action(&target, Ok(()));
+            if !crate::test_script::action_target_is_focused(ctx, &owner) && target.is_live() {
+                crate::test_script::request_action_target_focus(ctx, &owner, actual_owner.as_ref());
+            }
             ctx.request_repaint_of(viewport_id);
         } else {
-            crate::test_script::finish_targeted_detached_owner(
-                &owner,
+            crate::test_script::finish_targeted_detached_action(
+                &target,
                 Err(format!(
                     "run_action target activation did not establish the selected owner: expected={} actual={actual_owner:?}",
                     owner.describe()
@@ -399,11 +628,26 @@ impl App {
         source_kind: crate::test_script::TestScriptPaintSourceKind,
     ) -> Option<crate::test_script::TestScriptContentProof> {
         let context_id = self.mounted_viewer_context_id()?;
+        let current =
+            self.with_viewer_context_ref(context_id, |context| context.fullscreen_idx())?;
+        if current != Some(page_index) {
+            return None;
+        }
+        self.test_script_resource_content_proof(page_index, texture, source_kind)
+    }
+
+    /// Called only when an indexed page resource is selected. Unlike the
+    /// single-page legacy evidence, a spread may submit another visible page.
+    pub(crate) fn test_script_resource_content_proof(
+        &self,
+        page_index: usize,
+        texture: &egui::TextureHandle,
+        source_kind: crate::test_script::TestScriptPaintSourceKind,
+    ) -> Option<crate::test_script::TestScriptContentProof> {
+        let context_id = self.mounted_viewer_context_id()?;
         let context = self.with_viewer_context_ref(context_id, |context| {
-            let current = (context.fullscreen_idx() == Some(page_index))
-                .then(|| context.items().get(page_index))
-                .flatten()?;
-            Some((context.items_generation(), current.perf_key()))
+            let item = context.items().get(page_index)?;
+            Some((context.items_generation(), item.perf_key()))
         })??;
         Some(crate::test_script::TestScriptContentProof {
             context_serial: context_id.serial(),
@@ -412,6 +656,7 @@ impl App {
             item_identity: context.1,
             source_texture_id: texture.id(),
             source_kind,
+            final_composite_complete: self.final_composite_texture_is_complete(page_index, texture),
         })
     }
 
@@ -431,9 +676,11 @@ impl App {
         // proof with that manager-issued host incarnation.
         self.test_script_publish_window_snapshots();
         let Some(owner) = self.test_script_window_identity(window_id, viewport_id) else {
+            crate::test_script::discard_drawn_paint(viewport_id);
             return;
         };
         if !owner.matches_backend_witness(witness) {
+            crate::test_script::discard_drawn_paint(viewport_id);
             return;
         }
         crate::test_script::publish_window_frame(owner, content);
@@ -447,9 +694,11 @@ impl App {
     ) {
         self.test_script_publish_window_snapshots();
         let Some(owner) = self.test_script_root_window_identity(viewport_id) else {
+            crate::test_script::discard_drawn_paint(viewport_id);
             return;
         };
         if !owner.matches_backend_witness(witness) {
+            crate::test_script::discard_drawn_paint(viewport_id);
             return;
         }
         crate::test_script::publish_window_frame(owner, content);
@@ -466,6 +715,7 @@ impl App {
         )>,
     ) {
         let Some((painted_viewport_id, witness, content)) = painted else {
+            crate::test_script::discard_drawn_paint(expected_viewport_id);
             return;
         };
         match test_script_active_paint_owner(
@@ -482,7 +732,7 @@ impl App {
             }) => {
                 self.test_script_publish_detached_frame(window_id, viewport_id, witness, content);
             }
-            None => {}
+            None => crate::test_script::discard_drawn_paint(painted_viewport_id),
         }
     }
 }
@@ -512,6 +762,83 @@ fn test_script_media_kind(item: &GridItem) -> &'static str {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn host_probe_keeps_unbound_parked_id_and_deduplicates_active_handoff() {
+        assert_eq!(test_script_detached_host_ids([7, 9], Some(9)), vec![7, 9]);
+        assert_eq!(
+            test_script_detached_host_ids([7, 9], Some(11)),
+            vec![7, 9, 11]
+        );
+    }
+
+    #[test]
+    fn registered_opening_detached_presentation_is_not_active() {
+        for state in [
+            DetachedWindowState::Opening,
+            DetachedWindowState::Resuming,
+            DetachedWindowState::Closing,
+        ] {
+            assert_eq!(
+                test_script_window_presentation(
+                    Some(3),
+                    Some(state),
+                    ContextResidence::Mounted,
+                    false,
+                ),
+                TestScriptWindowPresentation::Other,
+                "{state:?}",
+            );
+        }
+        assert_eq!(
+            test_script_window_presentation(
+                Some(3),
+                Some(DetachedWindowState::Active),
+                ContextResidence::Mounted,
+                false,
+            ),
+            TestScriptWindowPresentation::ActiveImmediate,
+        );
+    }
+
+    #[test]
+    fn frozen_capture_presentation_requires_parked_at_rest_passive_view() {
+        let classify = |state, residence, has_frozen_view| {
+            test_script_window_presentation(Some(1), state, residence, has_frozen_view)
+        };
+        assert_eq!(
+            classify(
+                Some(DetachedWindowState::Parked),
+                ContextResidence::AtRest,
+                true
+            ),
+            TestScriptWindowPresentation::PassiveDeferredFrozen
+        );
+        assert_eq!(
+            classify(
+                Some(DetachedWindowState::Parked),
+                ContextResidence::AtRest,
+                false
+            ),
+            TestScriptWindowPresentation::Other
+        );
+        assert_eq!(
+            classify(
+                Some(DetachedWindowState::Active),
+                ContextResidence::AtRest,
+                true
+            ),
+            TestScriptWindowPresentation::ActiveImmediate
+        );
+        assert_eq!(
+            classify(
+                Some(DetachedWindowState::ParkedLive),
+                ContextResidence::AtRest,
+                true
+            ),
+            TestScriptWindowPresentation::ParkedLiveImmediate
+        );
+    }
 
     #[test]
     fn window_snapshot_reads_an_at_rest_context_without_mounting_it() {
@@ -546,6 +873,89 @@ mod tests {
         assert!(
             window.identity.is_none(),
             "no host was created by observation"
+        );
+    }
+
+    #[test]
+    fn seek_strip_snapshot_reads_each_bundle_owner_without_mounting_or_mutating_it() {
+        let mut app = crate::app::setup_app_for_test();
+        let root_path = PathBuf::from(r"C:\videos\root.mp4");
+        app.items = vec![GridItem::Video(root_path.clone())];
+        app.fullscreen_idx = Some(0);
+        let root_worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            root_path.clone(),
+            Some(0),
+            Some(0),
+            None,
+        );
+        app.seed_video_seek_strip_context_for_test(root_path, root_worker, 101, 17, 102);
+        let root_context = app.viewer_context_main();
+
+        let detached_path = PathBuf::from(r"C:\videos\detached.mp4");
+        let detached_context = app.build_window_context_for_test(706, |app| {
+            app.items = vec![GridItem::Video(detached_path.clone())];
+            app.fullscreen_idx = Some(0);
+            let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+                detached_path.clone(),
+                Some(0),
+                Some(0),
+                None,
+            );
+            app.seed_video_seek_strip_context_for_test(detached_path, worker, 201, 23, 202);
+        });
+        assert_eq!(
+            app.viewer_context_residence(root_context),
+            ContextResidence::Mounted
+        );
+        assert_eq!(
+            app.viewer_context_residence(detached_context),
+            ContextResidence::AtRest
+        );
+
+        let before_root = app
+            .with_viewer_context_ref(root_context, |context| {
+                context.video_seek_strip_test_script_snapshot()
+            })
+            .expect("root diagnostic");
+        let before_detached = app
+            .with_viewer_context_ref(detached_context, |context| {
+                context.video_seek_strip_test_script_snapshot()
+            })
+            .expect("detached diagnostic");
+        let windows = app.test_script_window_snapshots();
+        let after_root = app
+            .with_viewer_context_ref(root_context, |context| {
+                context.video_seek_strip_test_script_snapshot()
+            })
+            .expect("root diagnostic after snapshot");
+        let after_detached = app
+            .with_viewer_context_ref(detached_context, |context| {
+                context.video_seek_strip_test_script_snapshot()
+            })
+            .expect("detached diagnostic after snapshot");
+
+        assert_eq!(
+            before_root, after_root,
+            "snapshot observation must be read-only"
+        );
+        assert_eq!(
+            before_detached, after_detached,
+            "at-rest observation must be read-only"
+        );
+        assert_eq!(before_root.session_id, Some(101));
+        assert_eq!(before_root.visible_count, Some(17));
+        assert_eq!(before_detached.session_id, Some(201));
+        assert_eq!(before_detached.visible_count, Some(23));
+        assert_ne!(before_root.session_id, before_detached.session_id);
+        let detached = windows
+            .iter()
+            .find(|window| window.window_id == Some(706))
+            .expect("detached window diagnostic");
+        assert_eq!(detached.seek_strip, before_detached);
+        assert_eq!(
+            app.viewer_context_residence(detached_context),
+            ContextResidence::AtRest,
+            "diagnostic observation must not mount the detached owner"
         );
     }
 

@@ -114,6 +114,19 @@ fn folder_block_follows_filename_case_insensitive() {
 }
 
 #[test]
+fn folder_block_follows_filename_desc() {
+    let names = run(
+        vec![
+            (pdff("Zeta.pdf"), 1000),
+            (folder("alpha-folder"), 2000),
+            (zipf("BETA.zip"), 3000),
+        ],
+        SortOrder::FileNameDesc,
+    );
+    assert_eq!(names, vec!["Zeta.pdf", "BETA.zip", "alpha-folder"]);
+}
+
+#[test]
 fn folder_block_numeric_natural_order() {
     let names = run(
         vec![
@@ -126,6 +139,21 @@ fn folder_block_numeric_natural_order() {
         SortOrder::Numeric,
     );
     assert_eq!(names, vec!["vol1", "vol2", "vol9", "vol10", "vol11"]);
+}
+
+#[test]
+fn folder_block_numeric_desc_reverses_numbers() {
+    let names = run(
+        vec![
+            (folder("vol10"), 1000),
+            (folder("vol2"), 1000),
+            (folder("vol1"), 1000),
+            (folder("vol11"), 1000),
+            (folder("vol9"), 1000),
+        ],
+        SortOrder::NumericDesc,
+    );
+    assert_eq!(names, vec!["vol11", "vol10", "vol9", "vol2", "vol1"]);
 }
 
 #[test]

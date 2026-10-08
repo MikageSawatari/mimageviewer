@@ -85,6 +85,11 @@ idx へ hydrate し直す。これをやらないと差し替え前 idx の補�
 ページ編集 overlay を出さない)。Ctrl+F (単一フォルダ構造フィルタ) は検索ではないので
 rehydrate 側。`clear_page_edit_state()` 単独は上記 idx-keyed セットの正準 clear で、
 `replace_search_view_items` (Ctrl+G 結果差し替え) からも呼ばれる。
+サブフォルダ展開とコレクションは §1.268 Phase A 以降、prepare worker が実ページ key の
+exact lookup と index 投影を作り、受理済み世代へ install する。両ビューの初回 install は
+合成パスの prefix rehydrate に依存しない。以後の切替・復元は Phase A2 の対象。
+Ctrl+G・閲覧履歴・レーティング一覧は
+`virtual-list-page-edits-plan.md` Phase B の対象。
 content-identity restore 完了時は `is_physical_folder_listing()` が true のときだけ、rename 完了と
 同じ `current_folder` prefix から同関数で rehydrate する。完了待ち中に検索・snapshot 等へ
 移った場合は clear のみに倒し、cross-folder view へ overlay を漏らさない。
@@ -673,8 +678,9 @@ final composite の `params_hash` から `colorize` / `creative_lut` / `post_fil
   ワンショット操作なので許容)。
 - **サムネ無効化の色調 gate**: `set_page_params` / `clear_page_params` は
   `color_settings_eq` (brightness..midtone + auto_mode) が変わるときだけ
-  `thumb_adjust_tex` を落とす。スライダードラッグ release の全クリアも
-  `thumb_adjust_drag_color_dirty` (ドラッグ中に色調が動いたときだけ立つ) で gate される。
+  `thumb_adjust_tex` を落とす。ページ個別スライダードラッグ release は
+  `thumb_adjust_drag_color_dirty` (ドラッグ中に色調が動いたときだけ立つ) で
+  対象ページキーと参照元を共有するセルだけを失効させる。
   シャープ化 / post_filter のみの変更・ドラッグではサムネ補正を再生成しない。
 - **サムネイル非反映**: `is_color_identity()` には参加しないため、`thumb_adjust_tex` の
   生成判定・内容に影響しない。
@@ -918,7 +924,7 @@ Ctrl+E とキャプチャ保存は、補正レイヤーが有効なページで�
 | 「標準にする」 (global_preset 更新) | 残す | final cache を継承ページ中心にクリア | **全クリア** | AI 設定が変わる idx の final AI をキャンセル |
 | 「個別設定を解除」 (Ctrl+Backspace) | 残す | 該当 idx の final cache をクリア | 該当 idx のみクリア | AI 設定が変われば final AI キャンセル |
 | スライダードラッグ中 | 残す | 毎フレーム final composite のみ再生成 | **抑制** (描画時 `adjusted_tex = None`) | edit 系 pending は触らない |
-| スライダー release (true→false 遷移) | 残す | (変化なし) | ドラッグ中に色調が動いたときだけ**全クリア** → visible 優先で再生成 (`thumb_adjust_drag_color_dirty`)。シャープ化のみのドラッグでは温存 | — |
+| スライダー release (true→false 遷移) | 残す | (変化なし) | ページ個別で色調が動いた場合はそのページキーと参照する編集プレビューセルだけ失効 (`thumb_adjust_drag_color_dirty`)。標準の変更は通常の一括失効。シャープ化のみのドラッグでは温存 | — |
 | フォルダ切替 | 全クリア | 全クリア | **全クリア** + `thumb_pixels` も全クリア | pending をキャンセル |
 | keep_range / 連結読み keep-set からの eviction (texel は共有 pool 由来の HIGH 超過で発火し LOW まで退去) | 該当 idx の edit/final を evict | 該当 idx の final を evict | 該当 idx のみクリア + `thumb_pixels` も drop | keep-set 外の final-effect / final AI pending を cancel |
 | 回転変更 | **クリアしない** (描画時の GPU 行列で回転) | **クリアしない** (同左) | **クリアしない** | — |

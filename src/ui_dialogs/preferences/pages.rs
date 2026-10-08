@@ -1,9 +1,13 @@
 use super::*;
+use crate::context_menu_model::{
+    ContextMenuItemId, ContextMenuLayoutSettings, ContextMenuParentId, ContextMenuPreviewItemState,
+    ContextMenuPreviewScenario, ContextMenuSeparatorBefore, context_menu_layout_preview,
+};
 use crate::keymap::{
     BindingConflict, BindingConflictKind, Chord, KeyAction, KeyContext, KeyName, KeyTrigger,
-    Keymap, MenuCommandId, MenuCommandOrderSettings, MenuLayoutSettings, ModKind, TopMenuId,
-    menu_command_can_be_hidden, menu_command_spec, menu_commands_for_parent,
-    parse_chord_for_action,
+    Keymap, MenuCommandId, MenuCommandOrderSettings, MenuLayoutSettings, ModKind,
+    ReservedBindingKind, TopMenuId, menu_command_can_be_hidden, menu_command_spec,
+    menu_commands_for_parent, parse_chord_for_action, pin_settings_always_on_top_command,
 };
 use crate::ring_shortcut::{
     MouseGestureDirection, RightDragContext, RightDragMode, RingActionId, RingDirection,
@@ -21,6 +25,10 @@ use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
 
 pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    if state.transfer_feedback.is_some() {
+        super::transfer::render_transfer_feedback(ui, state.transfer_feedback.as_ref());
+        ui.separator();
+    }
     anchored(ui, state, "general/theme", |ui, state| {
         ui.label(egui::RichText::new("テーマ").strong());
         ui.add_space(4.0);
@@ -37,12 +45,12 @@ pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ui.radio_value(
             &mut state.settings.ui_theme,
             UiTheme::Light,
-            "ライト (サムネイル白基調 / フルスクリーン黒)",
+            "ライト (サムネイル白基調)",
         );
         ui.radio_value(
             &mut state.settings.ui_theme,
             UiTheme::Dark,
-            "ダーク (全体暗色 / フルスクリーン黒)",
+            "ダーク (全体暗色)",
         );
     });
     ui.add_space(10.0);
@@ -70,8 +78,8 @@ pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(12.0);
     ui.label(
         egui::RichText::new(
-            "フルスクリーン表示は画像鑑賞のためテーマに関係なく黒背景になります。\n\
-             Shift+B キーで透過画像の背景色を循環させられます (黒 → 白 → 市松)。",
+            "画像・動画の余白色は「表示 › 閲覧表示」で変更できます。\n\
+             Shift+B キーは透過画像内の背景だけを循環します (黒 → 白 → 市松)。",
         )
         .weak(),
     );
@@ -993,18 +1001,7 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
 
     if tool.launch.uses_process_options() {
         ui.add_space(6.0);
-        ui.label(egui::RichText::new("{files}").strong());
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new(concat!(
-                    "渡すファイルのパスに置き換わります。「1 件ずつ」なら 1 つ、",
-                    "「まとめて渡す」なら選んだ数だけ並びます。",
-                    "何も書かないときは {files} が 1 つ付きます。",
-                ))
-                .weak(),
-            )
-            .wrap(),
-        );
+        crate::external_tool::draw_external_tool_placeholder_help(ui);
     }
     ui.add_space(6.0);
     // 引数プレビューは毎フレーム組み立てる。起動計画のログはここでは出さない
@@ -1107,7 +1104,7 @@ pub(super) fn association_extension_groups() -> [(&'static str, &'static [&'stat
         ("画像", crate::folder_tree::SUPPORTED_EXTENSIONS),
         ("動画", crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS),
         ("音声", crate::folder_tree::SUPPORTED_AUDIO_EXTENSIONS),
-        ("書庫 / PDF", &["zip", "cbz", "pdf"]),
+        ("書庫 / PDF / EPUB", &["zip", "cbz", "pdf", "epub"]),
     ]
 }
 
@@ -1416,6 +1413,30 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(12.0);
     ui.separator();
     ui.add_space(8.0);
+    anchored(ui, state, "thumbnail/rating-sort-unrated", |ui, state| {
+        use crate::rating_sort::RatingSortUnratedPosition;
+        ui.label(egui::RichText::new("評価順での未評価の位置").strong());
+        ui.radio_value(
+            &mut state.settings.rating_sort_unrated_position,
+            RatingSortUnratedPosition::BetweenThreeAndTwo,
+            "★3 と ★2 の間（既定）",
+        );
+        let below_all = ui.radio_value(
+            &mut state.settings.rating_sort_unrated_position,
+            RatingSortUnratedPosition::BelowAll,
+            "すべての評価より下",
+        );
+        #[cfg(all(windows, feature = "test-script"))]
+        crate::test_script::register_clickable_widget("すべての評価より下", &below_all);
+        #[cfg(not(all(windows, feature = "test-script")))]
+        let _ = below_all;
+        ui.small(
+            "低い順では、この並びを逆にします。評価を変えた後は一覧を更新すると並びが変わります。",
+        );
+    });
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(8.0);
     anchored(ui, state, "thumbnail/category-order", |ui, state| {
         let s = &mut state.settings;
         ui.label(egui::RichText::new("グリッドのカテゴリ表示順").strong());
@@ -1455,8 +1476,22 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(12.0);
     ui.separator();
     ui.add_space(8.0);
+    anchored(ui, state, "video/sidecar-thumbnail", |ui, state| {
+        draw_media_sidecar_thumbnail_settings(ui, &mut state.settings);
+    });
+    ui.add_space(8.0);
     anchored(ui, state, "thumbnail/video-indicator", |ui, state| {
         draw_video_thumbnail_indicator_settings(ui, &mut state.settings);
+    });
+    ui.add_space(8.0);
+    anchored(ui, state, "thumbnail/audio-indicator", |ui, state| {
+        draw_audio_thumbnail_indicator_settings(ui, &mut state.settings);
+    });
+    draw_media_duration_settings(ui, &mut state.settings);
+
+    ui.add_space(8.0);
+    anchored(ui, state, "thumbnail/resume-meter", |ui, state| {
+        draw_book_resume_meter_settings(ui, &mut state.settings);
     });
 
     ui.add_space(12.0);
@@ -1541,6 +1576,13 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
         "サムネイル表示では一覧と同じ列設定を使います。詳細表示では、一覧と同じ設定・専用の設定・表示しないを選べます。",
     );
     });
+    ui.add_space(12.0);
+    ui.separator();
+    anchored(ui, state, "thumbnail/details-name-colors", |ui, state| {
+        super::name_colors::draw_settings(ui, &mut state.settings);
+    });
+    ui.add_space(12.0);
+    ui.separator();
     anchored(ui, state, "thumbnail/tooltip-items", |ui, state| {
         let s = &mut state.settings;
         ui.label("ツールチップに表示する項目:");
@@ -1568,6 +1610,19 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
     });
 }
 
+pub(super) fn draw_book_resume_meter_settings(
+    ui: &mut egui::Ui,
+    settings: &mut settings::Settings,
+) {
+    ui.checkbox(
+        &mut settings.thumb_show_resume_meter,
+        "本・動画・音声のサムネイルに前回の位置を表示",
+    );
+    ui.small(
+        "記録された読書位置・再生位置を、常に左から右へ伸びるメーターで表示します。最後まで視聴した動画・音声は、長さの取得を待たず満タンで表示します。途中位置はページ数・長さを確認できたものに表示します。以前に見終えたもので記録が残っていないものには表示しません。長さの表示とは独立して切り替えられます。",
+    );
+}
+
 pub(super) fn draw_video_thumbnail_indicator_settings(
     ui: &mut egui::Ui,
     settings: &mut settings::Settings,
@@ -1590,6 +1645,57 @@ pub(super) fn draw_video_thumbnail_indicator_settings(
     ui.small(
         "動画の代表画像に重ねる再生アイコンを、左下の小さなバッジへ替えるか、非表示にできます。音声の音楽アイコンには影響しません。",
     );
+}
+
+pub(super) fn draw_media_sidecar_thumbnail_settings(
+    ui: &mut egui::Ui,
+    settings: &mut settings::Settings,
+) {
+    ui.label(egui::RichText::new("動画・音声のサムネイル").strong());
+    ui.add_space(4.0);
+    ui.checkbox(
+        &mut settings.video_thumb_use_sidecar_image,
+        "同名の画像をサムネイルに使う（動画・音声）",
+    )
+    .on_hover_text(
+        "例: movie.mp4 + movie.jpg、song.mp3 + song.jpg を同じフォルダに置きます。\n\
+         「同名の動画・音声がある画像を省略」も ON にする必要があります。\n\
+         OFF の場合、動画は Windows 標準サムネイル、MP3 は埋め込み画像を使います。\n\
+         画像行の省略は別設定です。省略が ON なら、この項目を OFF にしても画像行は表示されません。\n\
+         既存設定の OFF は音声にも引き継ぎます。動画のピン留めフレームは常に最優先。",
+    );
+    ui.small("同名画像の表示・省略は「ファイル処理 → 同名ファイル」で設定します。");
+}
+
+pub(super) fn draw_audio_thumbnail_indicator_settings(
+    ui: &mut egui::Ui,
+    settings: &mut settings::Settings,
+) {
+    ui.label(egui::RichText::new("音声サムネイルの目印").strong());
+    ui.horizontal(|ui| {
+        ui.label("表示:");
+        egui::ComboBox::from_id_salt("audio_thumbnail_indicator")
+            .selected_text(settings.audio_thumbnail_indicator.label())
+            .show_ui(ui, |ui| {
+                for &indicator in crate::settings::AudioThumbnailIndicator::all() {
+                    ui.selectable_value(
+                        &mut settings.audio_thumbnail_indicator,
+                        indicator,
+                        indicator.label(),
+                    );
+                }
+            });
+    });
+    ui.small("同名画像・埋め込み画像に重ねる音楽アイコンを、左下の文字バッジへ替えるか、非表示にできます。画像がない場合の音楽アイコンは常に表示します。");
+}
+
+pub(super) fn draw_media_duration_settings(ui: &mut egui::Ui, settings: &mut settings::Settings) {
+    ui.add_space(6.0);
+    ui.checkbox(
+        &mut settings.thumb_show_media_duration,
+        "動画・音声の長さをサムネイルに表示する",
+    );
+    ui.small("右下に分:秒、1 時間以上は時:分:秒で表示します。フィルタ一致数や他の表示と重なる場合は上へ移し、収まらない場合は表示しません。");
 }
 
 pub(super) fn page_slideshow(ui: &mut egui::Ui, state: &mut PreferencesState) {
@@ -1781,6 +1887,162 @@ fn page_bake_stage_body(ui: &mut egui::Ui, state: &mut PreferencesState) {
         )
         .wrap(),
     );
+}
+
+pub(super) fn page_clipboard_capture(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    page_clipboard_capture_controls(ui, state, true);
+}
+
+// Preserve the already-approved S1 snapshots; S3 has separate snapshots of the
+// complete production page, including the new HTML monitoring control.
+pub(super) fn page_clipboard_capture_s1_snapshot(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    page_clipboard_capture_controls(ui, state, false);
+}
+
+fn page_clipboard_capture_controls(
+    ui: &mut egui::Ui,
+    state: &mut PreferencesState,
+    html_control: bool,
+) {
+    anchored(ui, state, "clipboard-capture/image", |ui, state| {
+        ui.checkbox(
+            &mut state.settings.clipboard_capture_image_enabled,
+            "画像がコピーされたら自動で保存する",
+        );
+        if html_control {
+            anchored(ui, state, "clipboard-capture/html", |ui, state| {
+                ui.checkbox(
+                    &mut state.settings.clipboard_capture_html_enabled,
+                    "ページ (HTML) がコピーされたら、含まれる画像を選んで保存できるようにする",
+                );
+            });
+        }
+        ui.label(egui::RichText::new(
+            "監視は mImageViewer の起動中だけ動きます。タスクトレイ常駐と組み合わせて使えます。",
+        ).weak());
+        if state.clipboard_capture_startup_failed {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                "この環境ではクリップボードの監視を開始できませんでした",
+            );
+        }
+    });
+    ui.add_space(12.0);
+    anchored(ui, state, "clipboard-capture/folder", |ui, state| {
+        ui.label("保存先フォルダ");
+        let pending = state.clipboard_capture_folder_task.is_some();
+        let mut choose = false;
+        let mut open = false;
+        ui.add_enabled_ui(!pending, |ui| {
+            let edit_width = ui.available_width();
+            let hint = state
+                .clipboard_capture_default_output_dir
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "確認中".to_owned());
+            let mut output = crate::ime_focus::show_singleline(
+                ui,
+                &mut state.clipboard_capture_output_dir_input,
+                None,
+                |edit| edit.desired_width(edit_width).hint_text(hint),
+            );
+            let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
+                ui,
+                &mut output,
+                &mut state.clipboard_capture_output_dir_input,
+            );
+            if output.response.changed() || menu_changed {
+                let path = state.clipboard_capture_output_dir_input.trim();
+                state.settings.clipboard_capture_output_dir =
+                    (!path.is_empty()).then(|| PathBuf::from(path));
+                state.clipboard_capture_folder_message = None;
+            }
+            ui.horizontal_wrapped(|ui| {
+                choose = ui.button("変更…").clicked();
+                if ui.button("既定に戻す").clicked() {
+                    state.clipboard_capture_output_dir_input.clear();
+                    state.settings.clipboard_capture_output_dir = None;
+                    state.clipboard_capture_folder_message = None;
+                }
+                open = ui
+                    .add_enabled(
+                        state.settings.clipboard_capture_output_dir.is_some()
+                            || state.clipboard_capture_default_output_dir.is_some(),
+                        egui::Button::new("フォルダを開く"),
+                    )
+                    .clicked();
+            });
+        });
+        let effective = state
+            .settings
+            .clipboard_capture_output_dir
+            .clone()
+            .or_else(|| state.clipboard_capture_default_output_dir.clone());
+        let effective_label = effective
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "確認中".to_owned());
+        ui.label(egui::RichText::new(format!("実際の保存先: {effective_label}")).weak());
+        ui.label(
+            egui::RichText::new(
+                "月ごとのフォルダに保存します。フォルダは最初に保存するときに作成します。",
+            )
+            .weak(),
+        );
+        if choose || open {
+            state.clipboard_capture_folder_message = None;
+            let (tx, rx) = mpsc::channel();
+            let ctx = ui.ctx().clone();
+            let spawn = std::thread::Builder::new()
+                .name("clipboard-capture-folder".into())
+                .spawn(move || {
+                    let result = if choose {
+                        let mut picker = rfd::FileDialog::new();
+                        if let Some(path) = &effective {
+                            picker = picker.set_directory(path);
+                        }
+                        Ok(ClipboardCaptureFolderResult::Selected(picker.pick_folder()))
+                    } else if let Some(effective) = effective {
+                        if !effective.is_dir() {
+                            Err(
+                                "保存先フォルダはまだありません。最初に保存するときに作成します。"
+                                    .into(),
+                            )
+                        } else {
+                            #[cfg(windows)]
+                            {
+                                std::process::Command::new("explorer.exe")
+                                    .arg(&effective)
+                                    .spawn()
+                                    .map(|_| ClipboardCaptureFolderResult::Opened)
+                                    .map_err(|error| format!("フォルダを開けませんでした: {error}"))
+                            }
+                            #[cfg(not(windows))]
+                            {
+                                Ok(ClipboardCaptureFolderResult::Opened)
+                            }
+                        }
+                    } else {
+                        Err("保存先フォルダを確認中です。".into())
+                    };
+                    let _ = tx.send(result);
+                    ctx.request_repaint();
+                });
+            match spawn {
+                Ok(_) => state.clipboard_capture_folder_task = Some(rx),
+                Err(error) => {
+                    state.clipboard_capture_folder_message =
+                        Some(format!("フォルダ操作を開始できませんでした: {error}"))
+                }
+            }
+        }
+        if pending {
+            ui.spinner();
+        }
+        if let Some(message) = &state.clipboard_capture_folder_message {
+            ui.label(egui::RichText::new(message).color(ui.visuals().warn_fg_color));
+        }
+    });
 }
 
 pub(super) fn page_capture(ui: &mut egui::Ui, state: &mut PreferencesState) {
@@ -2387,6 +2649,7 @@ fn ring_bindings_for_key_action(action: KeyAction) -> Vec<(RingShortcutContext, 
         KeyAction::GridSiblingFolderNext => RingActionId::SiblingFolderNext,
         KeyAction::GridToggleCheck => RingActionId::GridToggleCheck,
         KeyAction::GridSelectAll => RingActionId::GridSelectAll,
+        KeyAction::GridOrganizeFiles => RingActionId::GridOrganizeFiles,
         KeyAction::GridOpenSelectedAsPage => RingActionId::GridOpenSelectedAsPage,
         KeyAction::GridOpenSelectedAsList => RingActionId::GridOpenSelectedAsList,
         KeyAction::GridToggleDetailsView => RingActionId::GridToggleDetails,
@@ -2405,6 +2668,16 @@ fn ring_bindings_for_key_action(action: KeyAction) -> Vec<(RingShortcutContext, 
         KeyAction::GridColumnCount8 => RingActionId::GridColumnCount8,
         KeyAction::GridColumnCount9 => RingActionId::GridColumnCount9,
         KeyAction::GridColumnCount10 => RingActionId::GridColumnCount10,
+        KeyAction::GridColumnCount11 => RingActionId::GridColumnCount11,
+        KeyAction::GridColumnCount12 => RingActionId::GridColumnCount12,
+        KeyAction::GridColumnCount13 => RingActionId::GridColumnCount13,
+        KeyAction::GridColumnCount14 => RingActionId::GridColumnCount14,
+        KeyAction::GridColumnCount15 => RingActionId::GridColumnCount15,
+        KeyAction::GridColumnCount16 => RingActionId::GridColumnCount16,
+        KeyAction::GridColumnCount17 => RingActionId::GridColumnCount17,
+        KeyAction::GridColumnCount18 => RingActionId::GridColumnCount18,
+        KeyAction::GridColumnCount19 => RingActionId::GridColumnCount19,
+        KeyAction::GridColumnCount20 => RingActionId::GridColumnCount20,
         KeyAction::FsClose => RingActionId::CloseFullscreen,
         KeyAction::FsToggleMetadata => RingActionId::ImageToggleMetadata,
         KeyAction::FsToggleWindowMode => RingActionId::ToggleWindowMode,
@@ -2419,6 +2692,7 @@ fn ring_bindings_for_key_action(action: KeyAction) -> Vec<(RingShortcutContext, 
         KeyAction::FsZoomMode => RingActionId::ImageZoomMode,
         KeyAction::FsPixelGrid => RingActionId::ImagePixelGrid,
         KeyAction::FsBgCycle => RingActionId::ImageBackgroundCycle,
+        KeyAction::FsFitModeCycle => RingActionId::ImageFitModeCycle,
         KeyAction::FsCompareToggle => RingActionId::ImageComparePin,
         KeyAction::VideoCapture => RingActionId::VideoCapture,
         KeyAction::VideoMute => RingActionId::VideoMute,
@@ -2578,10 +2852,10 @@ fn assignment_summary(ui: &mut egui::Ui, groups: &[(&str, Vec<String>)]) {
 pub(super) fn page_command_settings(
     ui: &mut egui::Ui,
     state: &mut PreferencesState,
-    _ime_active: bool,
+    _keyboard_capture_blocked: bool,
 ) {
     ui.small("キーボード操作の割り当てを編集します。競合や予約キーへの割り当ては警告として表示しますが、保存は禁止しません。");
-    ui.small("Esc / Enter / 修飾なし矢印など、文脈依存が強い固定操作は現在の対象外です。");
+    ui.small("Esc / 修飾なし矢印 / サムネイル一覧の Shift+矢印は解除できない固定操作です。競合をなくすには、割り当てた側を変更または解除してください。");
     ui.add_space(8.0);
 
     let keymap = Keymap::from_settings(&state.settings.keymap);
@@ -2610,7 +2884,7 @@ pub(super) fn page_command_settings(
 pub(super) fn draw_operation_assignment_editor_dialog(
     ctx: &egui::Context,
     state: &mut PreferencesState,
-    ime_active: bool,
+    keyboard_capture_blocked: bool,
 ) {
     let Some(editor) = state.operation_assignment_editor.clone() else {
         return;
@@ -2645,7 +2919,7 @@ pub(super) fn draw_operation_assignment_editor_dialog(
                 )
             );
             if chord_keyboard_editor {
-                draw_operation_assignment_editor_body(ui, state, &editor, ime_active);
+                draw_operation_assignment_editor_body(ui, state, &editor, keyboard_capture_blocked);
             } else {
                 let available_h = ui.available_height().max(120.0);
                 egui::ScrollArea::vertical()
@@ -2653,7 +2927,12 @@ pub(super) fn draw_operation_assignment_editor_dialog(
                     .max_height(available_h)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        draw_operation_assignment_editor_body(ui, state, &editor, ime_active);
+                        draw_operation_assignment_editor_body(
+                            ui,
+                            state,
+                            &editor,
+                            keyboard_capture_blocked,
+                        );
                     });
             }
         });
@@ -3015,13 +3294,20 @@ fn draw_operation_assignment_editor_body(
     ui: &mut egui::Ui,
     state: &mut PreferencesState,
     editor: &OperationAssignmentEditor,
-    ime_active: bool,
+    keyboard_capture_blocked: bool,
 ) {
     match (&editor.target, editor.tab) {
         (OperationAssignmentTarget::Key(action), OperationAssignmentTab::Keyboard) => {
             let keymap = Keymap::from_settings(&state.settings.keymap);
             let conflicts = keymap.binding_conflicts();
-            command_editor_for_action(ui, state, &keymap, &conflicts, ime_active, *action);
+            command_editor_for_action(
+                ui,
+                state,
+                &keymap,
+                &conflicts,
+                keyboard_capture_blocked,
+                *action,
+            );
         }
         (OperationAssignmentTarget::Key(action), OperationAssignmentTab::RingPad) => {
             if let Some((context, ring_action)) = ring_binding_for_key_action(*action) {
@@ -3862,7 +4148,11 @@ fn command_conflict_summary(
                             open_command_editor_dialog(state, other, Some(conflict.chord));
                         }
                     } else {
-                        ui.label(conflict.reserved_name.unwrap_or("固定キー"));
+                        ui.label(
+                            conflict
+                                .reserved_kind
+                                .map_or("固定キー", ReservedBindingKind::label),
+                        );
                     }
                     ui.end_row();
                 }
@@ -3956,13 +4246,13 @@ fn command_editor_for_action(
     state: &mut PreferencesState,
     keymap: &Keymap,
     conflicts: &[BindingConflict],
-    ime_active: bool,
+    keyboard_capture_blocked: bool,
     action: KeyAction,
 ) {
     ui.label(egui::RichText::new("割り当て編集").strong());
     ensure_command_editor_loaded(state, keymap, action);
     if let Some(slot) = state.command_capture_slot
-        && let Some(result) = poll_command_chord_capture(ui.ctx(), action, ime_active)
+        && let Some(result) = poll_command_chord_capture(ui.ctx(), action, keyboard_capture_blocked)
     {
         match result {
             Ok(label) if slot < state.command_chord_inputs.len() => {
@@ -4162,8 +4452,8 @@ fn command_editor_for_action(
                     {
                         select_command_action(state, other);
                     }
-                } else if let Some(name) = conflict.reserved_name {
-                    ui.label(name);
+                } else if let Some(kind) = conflict.reserved_kind {
+                    ui.label(kind.label());
                 }
             });
         }
@@ -4229,7 +4519,7 @@ fn command_slot_conflict_label(
             conflict
                 .other_action
                 .map(compact_key_action_label)
-                .or_else(|| conflict.reserved_name.map(str::to_string))
+                .or_else(|| conflict.reserved_kind.map(|kind| kind.label().to_string()))
         } else {
             Some(compact_key_action_label(conflict.action))
         };
@@ -4371,9 +4661,9 @@ fn parse_command_chord_inputs_for_editor(
 fn poll_command_chord_capture(
     ctx: &egui::Context,
     action: KeyAction,
-    ime_active: bool,
+    keyboard_capture_blocked: bool,
 ) -> Option<Result<String, String>> {
-    if ime_active {
+    if keyboard_capture_blocked {
         return None;
     }
     #[cfg(windows)]
@@ -4509,7 +4799,7 @@ fn binding_conflict_kind_help(kind: BindingConflictKind) -> &'static str {
             "同じキーが、押下・長押し・修飾キー長押しなど別の種類の入力に割り当てられています。意図しない反応になる場合があります。"
         }
         BindingConflictKind::Reserved => {
-            "Esc / Enter / 修飾なし矢印など、固定操作として扱うキーへの割り当てです。固定操作が優先される場合があります。"
+            "解除できない固定操作と同じキーへの割り当てです。競合をなくすには、割り当てた側を変更または解除してください。競合したまま使う場合、どちらが動くかは処理順で決まり、画面によって異なります。"
         }
     }
 }
@@ -4525,6 +4815,7 @@ fn key_trigger_label(trigger: KeyTrigger) -> &'static str {
 pub(super) fn page_menu_layout(ui: &mut egui::Ui, state: &mut PreferencesState) {
     anchored(ui, state, "menu/layout", |ui, state| {
         ui.small("メニューバーの上位メニューと固定項目の表示順を変更します。登録済みお気に入り、タグ一覧、更新確認など状態で変わる項目は固定位置に残ります。");
+        ui.small("設定の「常に最前面」は先頭固定です。表示・非表示を切り替えられます。");
         ui.add_space(8.0);
 
         let layout_snapshot = state.settings.menu_layout.clone();
@@ -4614,7 +4905,12 @@ pub(super) fn page_menu_layout(ui: &mut egui::Ui, state: &mut PreferencesState) 
                                 ui.label(label);
 
                                 if ui
-                                    .add_enabled(command_index > 0, egui::Button::new("↑").small())
+                                    .add_enabled(
+                                        command_index > 0
+                                            && command != MenuCommandId::SettingsAlwaysOnTop
+                                            && !(top == TopMenuId::Settings && command_index == 1),
+                                        egui::Button::new("↑").small(),
+                                    )
                                     .on_hover_text("上へ")
                                     .clicked()
                                 {
@@ -4623,7 +4919,8 @@ pub(super) fn page_menu_layout(ui: &mut egui::Ui, state: &mut PreferencesState) 
                                 }
                                 if ui
                                     .add_enabled(
-                                        command_index + 1 < command_order.len(),
+                                        command_index + 1 < command_order.len()
+                                            && command != MenuCommandId::SettingsAlwaysOnTop,
                                         egui::Button::new("↓").small(),
                                     )
                                     .on_hover_text("下へ")
@@ -4641,6 +4938,399 @@ pub(super) fn page_menu_layout(ui: &mut egui::Ui, state: &mut PreferencesState) 
             apply_menu_layout_edit(&mut state.settings.menu_layout, edit);
         }
     });
+}
+
+pub(super) fn page_context_menu_layout(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    anchored(ui, state, "context-menu/layout", |ui, state| {
+        draw_context_menu_layout_settings(
+            ui,
+            &mut state.settings.context_menu_layout,
+            &mut state.context_menu_preview_scenario,
+        );
+    });
+}
+
+pub(super) fn draw_context_menu_layout_settings(
+    ui: &mut egui::Ui,
+    layout: &mut ContextMenuLayoutSettings,
+    scenario: &mut ContextMenuPreviewScenario,
+) {
+    const ITEM_PREVIEW_WIDTH: f32 = 18.0;
+    const ITEM_COLUMN_MIN_WIDTH: f32 = 260.0;
+    const ITEM_STATE_WIDTH: f32 = 62.0;
+    const ARROW_COLUMN_WIDTH: f32 = 32.0;
+    ui.small(
+        "一覧とフルスクリーンで共用する mImageViewer 項目の表示と順序です。\
+         その場面で利用できない項目は従来どおり省きます。",
+    );
+    ui.small("表示場面は確認用です。項目や区切り線の変更は、一覧とフルスクリーンの全場面へ共通に適用します。");
+    ui.add_space(6.0);
+
+    egui::ComboBox::from_label("確認する表示場面")
+        .selected_text(scenario.label())
+        .show_ui(ui, |ui| {
+            for value in ContextMenuPreviewScenario::ALL {
+                ui.selectable_value(scenario, *value, value.label());
+            }
+        });
+    ui.small(scenario.condition_note());
+    ui.small(
+        "検索結果や閲覧履歴など、場面ごとに使える項目だけが実際の右クリックメニューへ出ます。",
+    );
+    ui.add_space(6.0);
+
+    let snapshot = layout.clone();
+    let preview = context_menu_layout_preview(*scenario, &snapshot);
+    let mut edit = None;
+    let item_font = egui::TextStyle::Body.resolve(ui.style());
+    let max_item_label_width = ContextMenuItemId::ALL.iter().fold(0.0_f32, |width, item| {
+        width.max(
+            ui.painter()
+                .layout_no_wrap(
+                    item.label().to_owned(),
+                    item_font.clone(),
+                    egui::Color32::WHITE,
+                )
+                .size()
+                .x,
+        )
+    });
+    let item_column_width = ITEM_COLUMN_MIN_WIDTH.max(
+        ITEM_PREVIEW_WIDTH
+            + ui.spacing().item_spacing.x
+            + ui.spacing().icon_width
+            + ui.spacing().icon_spacing
+            + max_item_label_width
+            + ITEM_STATE_WIDTH,
+    );
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("右クリック設定をすべて既定に戻す").clicked() {
+            edit = Some(ContextMenuLayoutEdit::Reset);
+        }
+        if ui.button("右クリック項目をすべて表示").clicked() {
+            edit = Some(ContextMenuLayoutEdit::ShowAll);
+        }
+        if ui.button("区切り線だけ既定に戻す").clicked() {
+            edit = Some(ContextMenuLayoutEdit::ResetSeparators);
+        }
+    });
+
+    for &parent in ContextMenuParentId::ALL {
+        let order = snapshot.resolved_order(parent);
+        ui.add_space(6.0);
+        egui::CollapsingHeader::new(parent.label())
+            .id_salt(("context_menu_layout_parent", parent))
+            .default_open(parent == ContextMenuParentId::Root)
+            .show(ui, |ui| {
+                egui::Grid::new(("context_menu_layout_items", parent))
+                    .num_columns(4)
+                    .spacing([8.0, 4.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        let row_height = ui.spacing().interact_size.y;
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(item_column_width, row_height),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.set_min_width(item_column_width);
+                                ui.strong("表示・項目");
+                            },
+                        );
+                        ui.label("\u{00a0}");
+                        ui.label("\u{00a0}");
+                        ui.strong("前の区切り線");
+                        ui.end_row();
+                        for (index, &item) in order.iter().enumerate() {
+                            let mut visible = snapshot.is_visible(item);
+                            let separator = snapshot.separator_before(item);
+                            let preview_state = preview.state(item);
+                            let available_scenario_labels = preview
+                                .available_scenarios(item)
+                                .iter()
+                                .map(|candidate| candidate.label())
+                                .collect::<Vec<_>>()
+                                .join("、");
+                            let changed = ui
+                                .allocate_ui_with_layout(
+                                    egui::vec2(item_column_width, row_height),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.set_min_width(item_column_width);
+                                        let (preview_rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(ITEM_PREVIEW_WIDTH, row_height),
+                                            egui::Sense::hover(),
+                                        );
+                                        if matches!(
+                                            preview_state,
+                                            ContextMenuPreviewItemState::Available {
+                                                separator_before: true
+                                            }
+                                        ) {
+                                            ui.painter().hline(
+                                                preview_rect.x_range(),
+                                                preview_rect.center().y,
+                                                ui.visuals().widgets.noninteractive.fg_stroke,
+                                            );
+                                        }
+                                        let changed =
+                                            ui.checkbox(&mut visible, item.label()).changed();
+                                        match preview_state {
+                                            ContextMenuPreviewItemState::Unavailable => {
+                                                let status = ui.label(
+                                                    egui::RichText::new("対象外")
+                                                        .small()
+                                                        .weak(),
+                                                );
+                                                status.widget_info(|| {
+                                                    egui::WidgetInfo::labeled(
+                                                        egui::WidgetType::Label,
+                                                        true,
+                                                        format!(
+                                                            "{}はこの場面で対象外",
+                                                            item.label()
+                                                        ),
+                                                    )
+                                                });
+                                                status.on_hover_text(format!(
+                                                    "「{}」では使わない項目です。順序を変えても、この場面には追加されません。\n表示される確認場面：{}",
+                                                    scenario.label(), available_scenario_labels
+                                                ));
+                                            }
+                                            ContextMenuPreviewItemState::Hidden => {
+                                                let status = ui.label(
+                                                    egui::RichText::new("非表示中")
+                                                        .small()
+                                                        .weak(),
+                                                );
+                                                status.widget_info(|| {
+                                                    egui::WidgetInfo::labeled(
+                                                        egui::WidgetType::Label,
+                                                        true,
+                                                        format!("{}は項目非表示中", item.label()),
+                                                    )
+                                                });
+                                                status.on_hover_text(format!(
+                                                    "項目表示を ON にすると、次の確認場面に表示されます。\n{}",
+                                                    available_scenario_labels
+                                                ));
+                                            }
+                                            ContextMenuPreviewItemState::First => {
+                                                let status = ui.label(
+                                                    egui::RichText::new("先頭")
+                                                        .small()
+                                                        .weak(),
+                                                );
+                                                status.widget_info(|| {
+                                                    egui::WidgetInfo::labeled(
+                                                        egui::WidgetType::Label,
+                                                        true,
+                                                        format!("{}はこの場面で先頭", item.label()),
+                                                    )
+                                                });
+                                                status.on_hover_text(
+                                                    "この場面では同じ階層の先頭にあるため、前に区切り線を表示できません。",
+                                                );
+                                            }
+                                            ContextMenuPreviewItemState::Available { .. } => {}
+                                        }
+                                        changed
+                                    },
+                                )
+                                .inner;
+                            if changed {
+                                edit = Some(ContextMenuLayoutEdit::SetVisible(item, visible));
+                            }
+                            if order.len() > 1 {
+                                let up_enabled = index > 0;
+                                let up = ui
+                                    .add_enabled(
+                                        up_enabled,
+                                        egui::Button::new("↑")
+                                            .small()
+                                            .min_size(egui::vec2(ARROW_COLUMN_WIDTH, row_height)),
+                                    )
+                                    .on_hover_text("上へ");
+                                up.widget_info(|| {
+                                    egui::WidgetInfo::labeled(
+                                        egui::WidgetType::Button,
+                                        up_enabled,
+                                        format!("{}を上へ", item.label()),
+                                    )
+                                });
+                                if up.clicked() {
+                                    edit = Some(ContextMenuLayoutEdit::Move(parent, index, -1));
+                                }
+                                let down_enabled = index + 1 < order.len();
+                                let down = ui
+                                    .add_enabled(
+                                        down_enabled,
+                                        egui::Button::new("↓")
+                                            .small()
+                                            .min_size(egui::vec2(ARROW_COLUMN_WIDTH, row_height)),
+                                    )
+                                    .on_hover_text("下へ");
+                                down.widget_info(|| {
+                                    egui::WidgetInfo::labeled(
+                                        egui::WidgetType::Button,
+                                        down_enabled,
+                                        format!("{}を下へ", item.label()),
+                                    )
+                                });
+                                if down.clicked() {
+                                    edit = Some(ContextMenuLayoutEdit::Move(parent, index, 1));
+                                }
+                            } else {
+                                ui.label("\u{00a0}");
+                                ui.label("\u{00a0}");
+                            }
+                            ui.horizontal(|ui| {
+                                let explicit = separator != ContextMenuSeparatorBefore::Inherit;
+                                match preview_state {
+                                    ContextMenuPreviewItemState::Available { separator_before } => {
+                                        let selected = if explicit {
+                                            context_menu_separator_bool_label(separator_before)
+                                                .to_string()
+                                        } else {
+                                            format!(
+                                                "{}（既定）",
+                                                context_menu_separator_bool_label(separator_before)
+                                            )
+                                        };
+                                        let mut chosen = None;
+                                        let combo = egui::ComboBox::from_id_salt((
+                                            "context_menu_separator_before",
+                                            parent,
+                                            item,
+                                        ))
+                                        .selected_text(selected)
+                                        .show_ui(ui, |ui| {
+                                            if ui
+                                                .selectable_label(!separator_before, "非表示")
+                                                .clicked()
+                                            {
+                                                chosen = Some(ContextMenuSeparatorBefore::Absent);
+                                            }
+                                            if ui
+                                                .selectable_label(separator_before, "表示")
+                                                .clicked()
+                                            {
+                                                chosen = Some(ContextMenuSeparatorBefore::Present);
+                                            }
+                                        });
+                                        combo.response.widget_info(|| {
+                                            egui::WidgetInfo::labeled(
+                                                egui::WidgetType::ComboBox,
+                                                true,
+                                                format!("{}の前の区切り線", item.label()),
+                                            )
+                                        });
+                                        combo.response.on_hover_text(
+                                            "主表示は選択した場面で実際に描かれる線です。変更は全場面へ共通に適用します。",
+                                        );
+                                        if let Some(chosen) = chosen {
+                                            edit = Some(ContextMenuLayoutEdit::SetSeparatorBefore(
+                                                item, chosen,
+                                            ));
+                                        }
+                                    }
+                                    ContextMenuPreviewItemState::First => {
+                                        let response = ui
+                                            .add_enabled(
+                                                false,
+                                                egui::Button::new("非表示（先頭）"),
+                                            );
+                                        response.widget_info(|| {
+                                            egui::WidgetInfo::labeled(
+                                                egui::WidgetType::Button,
+                                                false,
+                                                format!(
+                                                    "{}の前の区切り線（先頭のため非表示）",
+                                                    item.label()
+                                                ),
+                                            )
+                                        });
+                                        response.on_disabled_hover_text(
+                                                "この場面では先頭項目なので、前に線を表示できません。",
+                                            );
+                                    }
+                                    ContextMenuPreviewItemState::Hidden => {
+                                        let response = ui.add_enabled(
+                                            false,
+                                            egui::Button::new("項目が非表示"),
+                                        );
+                                        response.widget_info(|| {
+                                            egui::WidgetInfo::labeled(
+                                                egui::WidgetType::Button,
+                                                false,
+                                                format!(
+                                                    "{}の前の区切り線（項目が非表示）",
+                                                    item.label()
+                                                ),
+                                            )
+                                        });
+                                        response.on_disabled_hover_text(format!(
+                                            "項目表示を ON にすると、次の確認場面に表示されます。\n{}",
+                                            available_scenario_labels
+                                        ));
+                                    }
+                                    ContextMenuPreviewItemState::Unavailable => {
+                                        let response =
+                                            ui.add_enabled(false, egui::Button::new("対象外"));
+                                        response.widget_info(|| {
+                                            egui::WidgetInfo::labeled(
+                                                egui::WidgetType::Button,
+                                                false,
+                                                format!(
+                                                    "{}の前の区切り線（この場面では対象外）",
+                                                    item.label()
+                                                ),
+                                            )
+                                        });
+                                        response.on_disabled_hover_text(format!(
+                                                "「{}」では使わない項目です。\n表示される確認場面：{}",
+                                                scenario.label(), available_scenario_labels
+                                            ));
+                                    }
+                                }
+                                if explicit {
+                                    let reset = ui
+                                        .small_button("↶")
+                                        .on_hover_text("この項目の区切り線を既定に戻す");
+                                    reset.widget_info(|| {
+                                        egui::WidgetInfo::labeled(
+                                            egui::WidgetType::Button,
+                                            true,
+                                            format!(
+                                                "{}の区切り線を既定に戻す",
+                                                item.label()
+                                            ),
+                                        )
+                                    });
+                                    if reset.clicked() {
+                                        edit = Some(ContextMenuLayoutEdit::SetSeparatorBefore(
+                                            item,
+                                            ContextMenuSeparatorBefore::Inherit,
+                                        ));
+                                    }
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    });
+            });
+    }
+    ui.small(
+        "外部ツール、関連付けアプリ、そのサブメニューと Windows のメニューは固定枠です。\
+         表示位置と内部の並び順は変更しません。",
+    );
+
+    if let Some(edit) = edit {
+        apply_context_menu_layout_edit(layout, edit);
+    }
+}
+
+fn context_menu_separator_bool_label(present: bool) -> &'static str {
+    if present { "表示" } else { "非表示" }
 }
 
 enum MenuLayoutEdit {
@@ -4679,7 +5369,9 @@ fn apply_menu_layout_edit(layout: &mut MenuLayoutSettings, edit: MenuLayoutEdit)
         }
         MenuLayoutEdit::MoveCommand(parent, index, delta) => {
             let mut order = menu_layout_command_order(layout, parent);
-            if move_index(&mut order, index, delta) {
+            let target = index as i32 + delta;
+            let crosses_pinned = parent == TopMenuId::Settings && (index == 0 || target == 0);
+            if !crosses_pinned && move_index(&mut order, index, delta) {
                 write_menu_layout_command_order(layout, parent, &order);
             }
         }
@@ -4693,6 +5385,38 @@ fn apply_menu_layout_edit(layout: &mut MenuLayoutSettings, edit: MenuLayoutEdit)
             write_menu_layout_hidden(layout, &hidden);
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn always_on_top_menu_editor_keeps_fixed_slot_and_allows_visibility_change() {
+    let mut layout = MenuLayoutSettings::default();
+    let original = menu_layout_command_order(&layout, TopMenuId::Settings);
+    assert_eq!(original[0], MenuCommandId::SettingsAlwaysOnTop);
+
+    apply_menu_layout_edit(
+        &mut layout,
+        MenuLayoutEdit::MoveCommand(TopMenuId::Settings, 0, 1),
+    );
+    apply_menu_layout_edit(
+        &mut layout,
+        MenuLayoutEdit::MoveCommand(TopMenuId::Settings, 1, -1),
+    );
+    assert_eq!(
+        menu_layout_command_order(&layout, TopMenuId::Settings),
+        original
+    );
+
+    apply_menu_layout_edit(
+        &mut layout,
+        MenuLayoutEdit::SetCommandVisible(MenuCommandId::SettingsAlwaysOnTop, false),
+    );
+    assert!(menu_layout_hidden_set(&layout).contains(&MenuCommandId::SettingsAlwaysOnTop));
+    apply_menu_layout_edit(
+        &mut layout,
+        MenuLayoutEdit::SetCommandVisible(MenuCommandId::SettingsAlwaysOnTop, true),
+    );
+    assert!(!menu_layout_hidden_set(&layout).contains(&MenuCommandId::SettingsAlwaysOnTop));
 }
 
 fn move_index<T>(items: &mut [T], index: usize, delta: i32) -> bool {
@@ -4753,6 +5477,7 @@ fn menu_layout_command_order(layout: &MenuLayoutSettings, parent: TopMenuId) -> 
             out.push(spec.id);
         }
     }
+    pin_settings_always_on_top_command(parent, &mut out);
     out
 }
 
@@ -5910,6 +6635,12 @@ pub(super) fn page_book(ui: &mut egui::Ui, state: &mut PreferencesState) {
     });
 }
 
+pub(super) fn page_raw_develop(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    anchored(ui, state, "raw-develop/settings", |ui, state| {
+        crate::ui_raw::draw_settings(ui, &mut state.settings);
+    });
+}
+
 pub(super) fn page_parallelism(ui: &mut egui::Ui, state: &mut PreferencesState) {
     anchored(ui, state, "parallelism/mode", |ui, state| {
         let s = &mut state.settings;
@@ -6320,10 +7051,9 @@ pub(super) fn page_ai_backend(ui: &mut egui::Ui, state: &mut PreferencesState) {
     } else {
         "DirectML"
     };
-    // TensorRT を選択しているが pack が未インストールの場合、OK 押下時に
-    // worker spawn 失敗 → エラー通知が出る代わりに、UI 上で「実際には
-    // DirectML で動作する」ことを明示する (= apply_ai_backend_change 側でも
-    // spawn 試行を skip する仕様と整合)。
+    // TensorRT を選択しているが pack が未インストールの場合、UI 上で「実際には
+    // DirectML で動作する」ことを明示する。lifecycle owner も pack status を
+    // `Disabled(PackUnavailable)` として保持し、AI demand ごとの再検査はしない。
     let trt_unavailable = new_choice == AiBackend::TensorRt && !state.trt_pack_installed;
     let pending_change = if trt_unavailable {
         false
@@ -6453,25 +7183,15 @@ pub(super) fn page_ai_backend(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 if do_delete {
                     // 実際の削除は App 側に委譲。理由:
                     // - TRT worker pool が DLL を握ったままだと remove_dir_all が失敗する
-                    //   ため、先に worker pool を detach する必要がある (= AiRuntime API)
-                    // - ai_backend = TensorRT のままだと AI 機能呼び出し時に再 attach で
+                    //   ため、lifecycle owner が全 request lease と background reaper の
+                    //   child shutdown 完了を待ってから削除する必要がある
+                    // - ai_backend = TensorRT のままだと削除完了後の AI 機能呼び出しで再 start して
                     //   失敗 (= 削除直後の DLL 不在) → エラーダイアログが出る
-                    // → App 側で「detach → 削除 → ai_backend を DirectML に切替 → save」を
+                    // → App 側で「disable → retire barrier → 背景削除 → DirectML 保存」を
                     //   一括処理する
                     state.uninstall_trt_pack_requested = true;
-                    // dialog 上の表示も即時切替 (= 「ダウンロード」分岐へ)
-                    state.trt_pack_installed = false;
-                    state.trt_pack_size_mib = 0;
-                    state.trt_engine_cache_size_mib = 0;
-                    // 「現在動作中」表記も DirectML に同期 (= App 側で detach するので
-                    // 実際の worker pool は止まる。state は dialog 開いた時のスナップ
-                    // ショットなので、ここで明示的に false にしないと表記が古いまま)。
-                    state.trt_worker_active = false;
-                    state.current_runtime_fallback_reason = None;
-                    // 設定 UI 上のラジオボタンも DirectML に同期
-                    // (= state.settings は draft、live settings は App 側で切替)
-                    state.settings.ai_backend =
-                        Some(crate::ai::AiBackend::DirectMl.as_str().to_string());
+                    // 実行を App/lifecycle owner が受理した後だけ projection を削除済みに
+                    // 更新する。modeless install と競合して拒否された場合は現在値を保つ。
                     state.trt_cache_delete_confirm_open = false;
                 } else if do_cancel {
                     state.trt_cache_delete_confirm_open = false;
@@ -6647,6 +7367,10 @@ pub(super) fn page_editing_addon(ui: &mut egui::Ui, state: &mut PreferencesState
     });
 }
 
+pub(super) fn reset_epub_file_handling(settings: &mut crate::settings::Settings) {
+    settings.epub_file_handling = crate::settings::EpubFileHandling::default();
+}
+
 pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.label(
         "サムネイルキャッシュをいつ生成するかを指定します。\n\
@@ -6808,6 +7532,25 @@ pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
     );
     });
     ui.add_space(8.0);
+    anchored(ui, state, "cache/epub-handling", |ui, state| {
+        let s = &mut state.settings;
+        ui.label(egui::RichText::new("EPUB の処理").strong());
+        for &handling in crate::settings::EpubFileHandling::all() {
+            ui.radio_value(&mut s.epub_file_handling, handling, handling.label())
+                .on_hover_text(handling.description());
+        }
+        if ui.button("既定値に戻す").clicked() {
+            reset_epub_file_handling(s);
+        }
+        ui.label(
+            egui::RichText::new(
+                "「無視する」では、EPUB を一覧・フォルダ移動の対象にせず、変換済みの本も開きません。",
+            )
+            .small()
+            .weak(),
+        );
+    });
+    ui.add_space(8.0);
     anchored(ui, state, "cache/archive-limit", |ui, state| {
         let s = &mut state.settings;
         let mut archive_limit_enabled = s.archive_cache_max_bytes > 0;
@@ -6855,13 +7598,28 @@ pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
     });
 }
 
-/// v0.8.0: 自動インデクサの速度プロファイル設定ページ。
+/// 検索インデックスの起動時確認と速度プロファイル設定ページ。
 ///
 /// `IndexerSpeedProfile` は `GlobalIoSemaphore` の permit 数を決める。
 /// 値の変更は **次回起動時に反映** される (ランタイム差し替えは `sync_with_favorites`
 /// でも反映されないので現状は再起動が必要)。
 pub(super) fn page_indexer_speed(ui: &mut egui::Ui, state: &mut PreferencesState) {
     use crate::settings::IndexerSpeedProfile;
+    anchored(ui, state, "indexer/offline-change-scan", |ui, state| {
+        crate::ui_helpers::draw_offline_change_scan_setting(
+            ui,
+            &mut state.settings.skip_offline_change_scan,
+        );
+        ui.label(
+            egui::RichText::new("[今すぐ確認] は「お気に入り > 編集」にあります。")
+                .weak()
+                .size(11.0),
+        );
+    });
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(6.0);
+
     anchored(ui, state, "indexer/speed", |ui, state| {
         let s = &mut state.settings;
 
@@ -6917,8 +7675,9 @@ pub(super) fn page_tray_residency(ui: &mut egui::Ui, state: &mut PreferencesStat
             "アプリを閉じる代わりに、タスクトレイに常駐する",
         )
         .on_hover_text(
-            "OFF (既定): [×] でプロセス終了。次回起動時にインデックスが再スキャンされます。\n\
-         ON: [×] でウィンドウを隠してタスクトレイに常駐。notify-rs でファイル変更を\n\
+            "OFF (既定): [×] でアプリ終了。終了中の変更を次回起動時に確認するかは\n\
+         「ライブラリ > 検索インデックス」で選べます。\n\
+         ON: [×] でウィンドウを隠してタスクトレイに常駐。ファイル変更を\n\
          追い続けるため、次回開いたときは最新のインデックスがそのまま使えます。\n\
          終了はタスクトレイアイコンを右クリックして「終了」を選んでください。",
         );
@@ -7265,6 +8024,11 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
         });
 
         ui.add_space(8.0);
+        anchored(ui, state, "video/seek-preview-size", |ui, state| {
+            draw_video_seek_preview_size_settings(ui, &mut state.settings);
+        });
+
+        ui.add_space(8.0);
         anchored(ui, state, "video/seek-strip-cycle", |ui, state| {
             let s = &mut state.settings;
             ui.label("シークストリップをキーで切り替えるときに通す表示");
@@ -7366,30 +8130,25 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ui.add_space(8.0);
     }
 
+    #[cfg(not(feature = "portable"))]
+    anchored(ui, state, "video/effetune-input-limit", |ui, state| {
+        draw_effetune_input_limit_settings(ui, &mut state.settings);
+    });
+    #[cfg(not(feature = "portable"))]
+    anchored(ui, state, "video/effetune-auto-open", |ui, state| {
+        draw_effetune_auto_open_settings(ui, &mut state.settings);
+    });
+    #[cfg(not(feature = "portable"))]
+    anchored(ui, state, "video/effetune-minimized", |ui, state| {
+        draw_effetune_minimized_settings(ui, &mut state.settings);
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(8.0);
+    });
+
     anchored(ui, state, "video/normalize-cache", |ui, state| {
         draw_audio_normalize_cache_controls(ui, state);
     });
-
-    ui.add_space(12.0);
-    ui.separator();
-    ui.add_space(8.0);
-
-    {
-        anchored(ui, state, "video/sidecar-thumbnail", |ui, state| {
-            let s = &mut state.settings;
-            ui.label(egui::RichText::new("グリッドサムネイル").strong());
-            ui.add_space(4.0);
-            ui.checkbox(
-                &mut s.video_thumb_use_sidecar_image,
-                "同名ファイル名の画像があれば動画サムネに優先採用",
-            )
-            .on_hover_text(
-                "例: movie.mp4 の隣に movie.jpg があれば、それをサムネに使う。\n\
-         OFF にすると Windows 標準のサムネのみ採用 (= 既定動作)。\n\
-         ピン留めしたフレーム (今後実装予定) は本設定に関わらず常に最優先。",
-            );
-        });
-    }
 
     // VST3 プラグイン処理は専用ページ "VST3 プラグイン" に分離した (= ユーザー要望
     // 「環境設定の中に新しい項目」)。動画タブには出さない。
@@ -7487,6 +8246,56 @@ pub(super) fn page_creative_lut(ui: &mut egui::Ui, state: &mut PreferencesState)
             }
         }
     });
+}
+
+pub(super) fn draw_effetune_input_limit_settings(ui: &mut egui::Ui, settings: &mut Settings) {
+    #[cfg(not(feature = "portable"))]
+    {
+        ui.label(egui::RichText::new("音響調整 (EffeTune)").strong());
+        ui.checkbox(
+            &mut settings.effetune_pre_limiter_enabled,
+            "EffeTune に渡す前に 0dB を超える音を抑える",
+        )
+        .on_hover_text(
+            "音量を全体的に下げず、0dB を超えるピークを抑えます。音の可視化だけでも OVERLOAD が出るのを防ぎます。\n\
+             EffeTune 内で音量を管理する場合は OFF にできます。出力の保護は常に有効です。\n\
+             OK を押すと再生中の音声にも反映します。リモート配信では先読み済みの音声の後から反映します。",
+        );
+    }
+    #[cfg(feature = "portable")]
+    let _ = (ui, settings);
+}
+
+pub(super) fn draw_effetune_auto_open_settings(ui: &mut egui::Ui, settings: &mut Settings) {
+    #[cfg(not(feature = "portable"))]
+    ui.checkbox(
+        &mut settings.effetune_auto_open_on_video,
+        "起動後の最初の動画再生で音響調整の窓を自動で開く",
+    )
+    .on_hover_text(
+        "初期値は OFF です。再生が始まったときに、この起動で一度だけ、キー操作を奪わずに開きます。\n\
+         全画面・最小化・トレイ格納・リモート閲覧中は開きません。復帰しただけでは開きません。\n\
+         音声ファイルは対象外です。OK を押すと反映します。再生中に ON にしても、その再生では開きません。\n\
+         未起動の音響調整を開始した場合、窓を閉じても終了まで音の処理を続けます。",
+    );
+    #[cfg(feature = "portable")]
+    let _ = (ui, settings);
+}
+
+pub(super) fn draw_effetune_minimized_settings(ui: &mut egui::Ui, settings: &mut Settings) {
+    #[cfg(not(feature = "portable"))]
+    ui.checkbox(
+        &mut settings.effetune_keep_visible_when_minimized,
+        "メインウィンドウを最小化しても音響調整の窓を表示したままにする",
+    )
+    .on_hover_text(
+        "表示していた音響調整の窓を、メインウィンドウの最小化中も残します。初期値は OFF です。\n\
+         OK を押すと反映します。最小化中でも切り替わります。自分で閉じた窓は開きません。\n\
+         リモート閲覧で操作している間は、この設定にかかわらず隠れます。\n\
+         タスクトレイへの格納だけでは窓は隠れません。",
+    );
+    #[cfg(feature = "portable")]
+    let _ = (ui, settings);
 }
 
 fn draw_audio_normalize_cache_controls(ui: &mut egui::Ui, state: &mut PreferencesState) {
@@ -8018,7 +8827,86 @@ pub(super) fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
 #[cfg(not(windows))]
 pub(super) fn page_vst3(_ui: &mut egui::Ui, _state: &mut PreferencesState) {}
 
+pub(super) fn draw_file_organize_destinations_settings(ui: &mut egui::Ui, settings: &mut Settings) {
+    ui.label(egui::RichText::new("ファイル整理先").strong());
+    ui.checkbox(
+        &mut settings.show_location_file_organize_destinations,
+        "場所▼と Remote の「場所」に整理先を表示する",
+    );
+    let destinations = &mut settings.file_organize_destinations;
+    ui.label("一覧の右クリックから使うコピー・移動先を登録します。OK で確定します。");
+    let count = destinations.len();
+    let mut reorder = None;
+    let mut remove = None;
+    for (index, destination) in destinations.iter_mut().enumerate() {
+        ui.push_id(("organize-destination", index), |ui| {
+            ui.group(|ui| {
+                // 狭い右ペインでも編集欄と操作列を上下に分け、パスを隠さない。
+                ui.horizontal(|ui| {
+                    ui.label("表示名");
+                    let width = ui.available_width().max(80.0);
+                    crate::ime_focus::add_singleline(ui, &mut destination.name, None, |edit| {
+                        edit.desired_width(width)
+                    });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("パス");
+                    let mut path = destination.path.to_string_lossy().into_owned();
+                    let width = ui.available_width().max(80.0);
+                    let response = crate::ime_focus::add_singleline(ui, &mut path, None, |edit| {
+                        edit.desired_width(width)
+                    });
+                    if response.changed() {
+                        destination.path = PathBuf::from(path);
+                    }
+                    response.on_hover_text(destination.path.display().to_string());
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("参照…").clicked()
+                        && let Some(path) = rfd::FileDialog::new().pick_folder()
+                    {
+                        destination.path = path;
+                    }
+                    if ui.add_enabled(index > 0, egui::Button::new("↑")).clicked() {
+                        reorder = Some((index, index - 1));
+                    }
+                    if ui
+                        .add_enabled(index + 1 < count, egui::Button::new("↓"))
+                        .clicked()
+                    {
+                        reorder = Some((index, index + 1));
+                    }
+                    if ui
+                        .button("削除")
+                        .on_hover_text("登録を外します。フォルダは削除しません。")
+                        .clicked()
+                    {
+                        remove = Some(index);
+                    }
+                });
+                if let Err(error) = destination.validate() {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                }
+            });
+        });
+    }
+    if let Some(index) = remove {
+        destinations.remove(index);
+    } else if let Some((from, to)) = reorder {
+        destinations.swap(from, to);
+    }
+    if ui.button("追加…").clicked()
+        && let Some(path) = rfd::FileDialog::new().pick_folder()
+    {
+        destinations.push(crate::settings::FileOrganizeDestination::from_path(path));
+    }
+}
+
 pub(super) fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    anchored(ui, state, "folder/organize-destinations", |ui, state| {
+        draw_file_organize_destinations_settings(ui, &mut state.settings);
+    });
+    ui.add_space(12.0);
     anchored(ui, state, "folder/hidden-files", |ui, state| {
         let s = &mut state.settings;
         ui.label(egui::RichText::new("ファイル・フォルダの表示").strong());
@@ -8044,7 +8932,7 @@ pub(super) fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
         egui::ComboBox::from_label("代表画像の選択基準")
             .selected_text(s.folder_thumb_sort.label())
             .show_ui(ui, |ui| {
-                for &order in SortOrder::all() {
+                for &order in SortOrder::folder_thumb_options() {
                     ui.selectable_value(&mut s.folder_thumb_sort, order, order.label());
                 }
             });
@@ -8057,7 +8945,7 @@ pub(super) fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ui.add_space(4.0);
         ui.label(
         "フォルダの代表画像を探すとき、サブフォルダを何階層まで探索するか。\n\
-         1 以上ではサブフォルダ内の画像を直接の子ファイルより優先します。0 にすると直接の子ファイルのみ使用します。",
+         直下の画像を設定した順序で優先します。画像がない場合だけ、子フォルダと作成済みサムネイルのある ZIP/PDF を設定した深さまで探します。0 では直下の画像のみ使用します。",
     );
         ui.add_space(4.0);
         ui.horizontal(|ui| {
@@ -8206,7 +9094,7 @@ pub(super) fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesSta
         let s = &mut state.settings;
         ui.checkbox(
             &mut s.skip_zip_if_folder_exists,
-            "同名の ZIP/PDF/RAR/7z/LZH ファイルとフォルダがある場合、アーカイブ側をスキップ",
+            "同名の ZIP/PDF/EPUB/RAR/7z/LZH ファイルとフォルダがある場合、本側をスキップ",
         );
     });
     ui.add_space(4.0);
@@ -8218,11 +9106,18 @@ pub(super) fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesSta
         );
     });
     ui.add_space(4.0);
+    anchored(ui, state, "duplicate/epub-pdf", |ui, state| {
+        ui.checkbox(
+            &mut state.settings.skip_epub_if_pdf_exists,
+            "同名の EPUB と PDF がある場合、PDF だけ表示",
+        );
+    });
+    ui.add_space(4.0);
     anchored(ui, state, "duplicate/video-image", |ui, state| {
         let s = &mut state.settings;
         ui.checkbox(
             &mut s.skip_image_if_video_exists,
-            "同名の動画と画像がある場合、画像をスキップ",
+            "同名の動画・音声がある画像を省略",
         );
     });
     ui.add_space(4.0);
@@ -8582,6 +9477,124 @@ pub(super) fn draw_video_seek_strip_height_settings(
     );
 }
 
+pub(super) fn draw_video_seek_preview_size_settings(
+    ui: &mut egui::Ui,
+    settings: &mut crate::settings::Settings,
+) {
+    let size = &mut settings.video_seek_preview_size;
+    let draw = |ui: &mut egui::Ui| {
+        ui.label("シーク位置プレビューの大きさ");
+        egui::ComboBox::from_id_salt("video_seek_preview_size")
+            .selected_text(size.label())
+            .show_ui(ui, |ui| {
+                for step in crate::settings::VideoSeekPreviewSize::ALL {
+                    ui.selectable_value(size, step, step.label());
+                }
+            });
+    };
+    if ui.available_width() < 320.0 {
+        ui.vertical(draw);
+    } else {
+        ui.horizontal(draw);
+    }
+    ui.label("各段階の画像幅の上限（100% 表示時の px 相当）");
+    let values = &mut settings.video_seek_preview_size_values;
+    for (preset, value) in [
+        (
+            crate::settings::VideoSeekPreviewSize::Maximum,
+            &mut values.maximum,
+        ),
+        (
+            crate::settings::VideoSeekPreviewSize::Large,
+            &mut values.large,
+        ),
+        (
+            crate::settings::VideoSeekPreviewSize::Medium,
+            &mut values.medium,
+        ),
+        (
+            crate::settings::VideoSeekPreviewSize::Small,
+            &mut values.small,
+        ),
+        (
+            crate::settings::VideoSeekPreviewSize::Smallest,
+            &mut values.smallest,
+        ),
+    ] {
+        ui.horizontal(|ui| {
+            ui.label(preset.label());
+            ui.add(
+                egui::DragValue::new(value)
+                    .range(
+                        crate::settings::VIDEO_SEEK_PREVIEW_WIDTH_MIN_POINTS
+                            ..=crate::settings::VIDEO_SEEK_PREVIEW_WIDTH_MAX_POINTS,
+                    )
+                    .suffix(" px"),
+            );
+        });
+    }
+    ui.small("各段階は個別に変更でき、シークストリップの高さや静止画の値には影響しません。画面が狭いときは収まる大きさに縮みます。");
+}
+
+pub(super) fn draw_still_seek_preview_size_settings(
+    ui: &mut egui::Ui,
+    settings: &mut crate::settings::Settings,
+) {
+    let size = &mut settings.still_seek_preview_size;
+    let draw = |ui: &mut egui::Ui| {
+        ui.label("シーク位置プレビューの大きさ");
+        egui::ComboBox::from_id_salt("still_seek_preview_size")
+            .selected_text(size.label())
+            .show_ui(ui, |ui| {
+                for step in crate::settings::StillSeekPreviewSize::ALL {
+                    ui.selectable_value(size, step, step.label());
+                }
+            });
+    };
+    if ui.available_width() < 320.0 {
+        ui.vertical(draw);
+    } else {
+        ui.horizontal(draw);
+    }
+    ui.label("各段階の画像枠の高さ（100% 表示時の px 相当）");
+    let values = &mut settings.still_seek_preview_size_values;
+    for (preset, value) in [
+        (
+            crate::settings::StillSeekPreviewSize::Maximum,
+            &mut values.maximum,
+        ),
+        (
+            crate::settings::StillSeekPreviewSize::Large,
+            &mut values.large,
+        ),
+        (
+            crate::settings::StillSeekPreviewSize::Medium,
+            &mut values.medium,
+        ),
+        (
+            crate::settings::StillSeekPreviewSize::Small,
+            &mut values.small,
+        ),
+        (
+            crate::settings::StillSeekPreviewSize::Smallest,
+            &mut values.smallest,
+        ),
+    ] {
+        ui.horizontal(|ui| {
+            ui.label(preset.label());
+            ui.add(
+                egui::DragValue::new(value)
+                    .range(
+                        crate::settings::STILL_SEEK_PREVIEW_HEIGHT_MIN_POINTS
+                            ..=crate::settings::STILL_SEEK_PREVIEW_HEIGHT_MAX_POINTS,
+                    )
+                    .suffix(" px"),
+            );
+        });
+    }
+    ui.small("各段階は個別に変更でき、サムネイル列の高さや動画の値には影響しません。画面が狭いときは収まる大きさに縮みます。");
+}
+
 pub(super) fn draw_still_seek_strip_settings(
     ui: &mut egui::Ui,
     settings: &mut crate::settings::Settings,
@@ -8661,7 +9674,37 @@ pub(super) fn draw_still_seek_strip_settings(
     ui.small("列の固定を ON にすると下部バーも固定し、バーと列を画像領域から除外します。列を閉じると列の固定も解除されます。");
 }
 
+pub(super) fn draw_fullscreen_fit_cycle_settings(
+    ui: &mut egui::Ui,
+    settings: &mut crate::settings::Settings,
+) {
+    ui.label(egui::RichText::new("フィット循環に含めるモード").strong());
+    for &mode in FullscreenFitMode::all() {
+        let mut included = mode.cycle_enabled(&settings.fullscreen_fit_cycle_excluded);
+        let can_toggle = !included
+            || FullscreenFitMode::all()
+                .iter()
+                .filter(|mode| mode.cycle_enabled(&settings.fullscreen_fit_cycle_excluded))
+                .count()
+                > 1;
+        if ui
+            .add_enabled(can_toggle, egui::Checkbox::new(&mut included, mode.label()))
+            .changed()
+        {
+            settings.set_fullscreen_fit_cycle_enabled(mode, included);
+        }
+    }
+    ui.small("1つ以上選択してください。0キー・リング・ジェスチャ・マウスボタンの循環に適用します。直接選択メニューにはすべてのモードが表示されます。");
+}
+
 pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    anchored(ui, state, "spread/chrome-suppression", |ui, state| {
+        crate::ui_helpers::draw_fullscreen_chrome_suppression_setting(
+            ui,
+            &mut state.settings.fullscreen_chrome_suppression,
+        );
+    });
+    ui.add_space(8.0);
     anchored(ui, state, "spread/side-panels", |ui, state| {
         let s = &mut state.settings;
         egui::ComboBox::from_label("左右パネルの表示")
@@ -8672,6 +9715,26 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
                 }
             });
         ui.small("通常ホバーは左端 / 右端で各パネルを表示します。クリック表示は最端の細いバーをクリックして開きます。");
+    });
+    ui.add_space(8.0);
+    anchored(ui, state, "spread/image-margin-color", |ui, state| {
+        let color = &mut state.settings.fullscreen_image_margin_color;
+        ui.label(egui::RichText::new("画像・動画の余白色").strong());
+        ui.horizontal_wrapped(|ui| {
+            for (label, preset) in [
+                ("黒", [0, 0, 0]),
+                ("灰", [128, 128, 128]),
+                ("白", [255, 255, 255]),
+            ] {
+                if ui.selectable_label(*color == preset, label).clicked() {
+                    *color = preset;
+                }
+            }
+            ui.separator();
+            ui.label("任意の色");
+            ui.color_edit_button_srgb(color);
+        });
+        ui.small("静止画・本の画像外、静止画サムネイル列の空欄、動画の映像外に共通で使います。透過画像内の黒 / 白 / 市松、音声画面、操作パネルは変わりません。");
     });
     ui.add_space(8.0);
     ui.label(egui::RichText::new("案内と状況表示").strong());
@@ -8711,6 +9774,34 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
                 }
             });
     });
+    anchored(ui, state, "spread/document-direction", |ui, state| {
+        ui.checkbox(
+            &mut state.settings.follow_document_reading_direction,
+            "PDF / EPUB の右開き指定に従う",
+        );
+        ui.small("本ごとに保存した見開き設定がある場合は、その設定を優先します。");
+    });
+    anchored(ui, state, "spread/final-cover", |ui, state| {
+        draw_final_cover_spread_setting(ui, &mut state.settings.final_cover_spread_enabled);
+    });
+    anchored(ui, state, "spread/singleton-placement", |ui, state| {
+        draw_singleton_spread_placement_setting(
+            ui,
+            &mut state.settings.singleton_spread_first_enabled,
+            &mut state.settings.singleton_spread_last_enabled,
+        );
+    });
+    anchored(ui, state, "spread/page-alone", |ui, state| {
+        ui.checkbox(
+            &mut state.settings.page_after_cover_alone_enabled,
+            "表紙の次のページを単独で表示",
+        );
+        ui.checkbox(
+            &mut state.settings.last_page_alone_enabled,
+            "最終ページを単独で表示",
+        );
+        ui.small("表紙あり見開きだけに適用します。単独ページの空き側は白く表示し、書き出し画像には含めません。本ごとに変更できます。");
+    });
     ui.add_space(8.0);
     anchored(ui, state, "spread/reading-flow", |ui, state| {
         let s = &mut state.settings;
@@ -8735,6 +9826,9 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
                     );
                 }
             });
+    });
+    anchored(ui, state, "spread/fit-cycle", |ui, state| {
+        draw_fullscreen_fit_cycle_settings(ui, &mut state.settings);
     });
     anchored(ui, state, "spread/fit", |ui, state| {
         let s = &mut state.settings;
@@ -8787,6 +9881,9 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     });
     anchored(ui, state, "spread/seek-strip", |ui, state| {
         draw_still_seek_strip_settings(ui, &mut state.settings);
+    });
+    anchored(ui, state, "spread/seek-preview-size", |ui, state| {
+        draw_still_seek_preview_size_settings(ui, &mut state.settings);
     });
     anchored(ui, state, "spread/seek-preview", |ui, state| {
         let s = &mut state.settings;
@@ -9017,6 +10114,268 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     });
 }
 
+pub(super) fn draw_final_cover_spread_setting(ui: &mut egui::Ui, enabled: &mut bool) {
+    ui.checkbox(enabled, "末尾に表紙を添える");
+    ui.small("表紙あり見開きで末尾が単ページになる本に適用します。本ごとの設定が優先されます。");
+}
+
+enum ContextMenuLayoutEdit {
+    Reset,
+    ShowAll,
+    ResetSeparators,
+    Move(ContextMenuParentId, usize, i32),
+    SetVisible(ContextMenuItemId, bool),
+    SetSeparatorBefore(ContextMenuItemId, ContextMenuSeparatorBefore),
+}
+
+fn apply_context_menu_layout_edit(
+    layout: &mut ContextMenuLayoutSettings,
+    edit: ContextMenuLayoutEdit,
+) {
+    match edit {
+        ContextMenuLayoutEdit::Reset => *layout = ContextMenuLayoutSettings::default(),
+        ContextMenuLayoutEdit::ShowAll => layout.show_all(),
+        ContextMenuLayoutEdit::ResetSeparators => layout.reset_separators(),
+        ContextMenuLayoutEdit::Move(parent, index, delta) => {
+            let mut order = layout.resolved_order(parent);
+            if move_index(&mut order, index, delta) {
+                layout.set_order(parent, &order);
+            }
+        }
+        ContextMenuLayoutEdit::SetVisible(item, visible) => layout.set_visible(item, visible),
+        ContextMenuLayoutEdit::SetSeparatorBefore(item, before) => {
+            layout.set_separator_before(item, before)
+        }
+    }
+}
+
+#[cfg(test)]
+mod context_menu_layout_settings_tests {
+    use super::*;
+
+    #[test]
+    fn edits_each_hierarchy_without_flattening_and_reset_restores_defaults() {
+        let mut layout = ContextMenuLayoutSettings::default();
+        let open_with_before = layout.resolved_order(ContextMenuParentId::OpenWith);
+
+        apply_context_menu_layout_edit(
+            &mut layout,
+            ContextMenuLayoutEdit::Move(ContextMenuParentId::Root, 1, -1),
+        );
+        assert_eq!(
+            &layout.resolved_order(ContextMenuParentId::Root)[..2],
+            &[ContextMenuItemId::CopyFiles, ContextMenuItemId::CutFiles]
+        );
+        assert_eq!(
+            layout.resolved_order(ContextMenuParentId::OpenWith),
+            open_with_before,
+            "root ordering must not flatten or reorder submenu children"
+        );
+
+        apply_context_menu_layout_edit(
+            &mut layout,
+            ContextMenuLayoutEdit::SetVisible(ContextMenuItemId::CopyPath, false),
+        );
+        apply_context_menu_layout_edit(
+            &mut layout,
+            ContextMenuLayoutEdit::SetSeparatorBefore(
+                ContextMenuItemId::CopyPath,
+                ContextMenuSeparatorBefore::Present,
+            ),
+        );
+        assert!(!layout.is_visible(ContextMenuItemId::CopyPath));
+        apply_context_menu_layout_edit(&mut layout, ContextMenuLayoutEdit::ShowAll);
+        assert!(layout.is_visible(ContextMenuItemId::CopyPath));
+        assert_eq!(
+            layout.separator_before(ContextMenuItemId::CopyPath),
+            ContextMenuSeparatorBefore::Present,
+            "show all changes visibility only"
+        );
+        apply_context_menu_layout_edit(&mut layout, ContextMenuLayoutEdit::ResetSeparators);
+        assert_eq!(
+            layout.separator_before(ContextMenuItemId::CopyPath),
+            ContextMenuSeparatorBefore::Inherit
+        );
+        assert_eq!(
+            &layout.resolved_order(ContextMenuParentId::Root)[..2],
+            &[ContextMenuItemId::CopyFiles, ContextMenuItemId::CutFiles],
+            "separator reset must preserve ordering"
+        );
+        apply_context_menu_layout_edit(&mut layout, ContextMenuLayoutEdit::Reset);
+        assert_eq!(layout, ContextMenuLayoutSettings::default());
+    }
+
+    #[test]
+    fn fit_cycle_subset_ui_keeps_the_last_mode_enabled() {
+        use egui_kittest::{
+            Harness,
+            kittest::{NodeT, Queryable},
+        };
+        let mut settings = crate::settings::Settings::default();
+        settings.fullscreen_fit_cycle_excluded =
+            vec!["Page".into(), "Width".into(), "Height".into()];
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(480.0, 300.0))
+            .build_state(
+                |ctx, (settings, fonts_ready)| {
+                    if !*fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        *fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default()
+                        .show(ctx, |ui| draw_fullscreen_fit_cycle_settings(ui, settings));
+                },
+                (settings, false),
+            );
+        harness.run();
+        assert!(
+            harness
+                .get_by_label("100%原寸")
+                .accesskit_node()
+                .is_disabled()
+        );
+        harness.get_by_label("ページ全体").click();
+        harness.run();
+        assert!(
+            !harness
+                .get_by_label("100%原寸")
+                .accesskit_node()
+                .is_disabled()
+        );
+        harness.get_by_label("100%原寸").click();
+        harness.run();
+        assert!(
+            harness
+                .get_by_label("ページ全体")
+                .accesskit_node()
+                .is_disabled()
+        );
+        assert!(
+            FullscreenFitMode::Page.cycle_enabled(&harness.state().0.fullscreen_fit_cycle_excluded)
+        );
+    }
+
+    #[test]
+    fn actual_settings_ui_scrolls_and_edits_move_hide_show_all_and_reset() {
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        let state = (
+            ContextMenuLayoutSettings::default(),
+            ContextMenuPreviewScenario::GridImageWithDynamicApps,
+            false,
+        );
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(620.0, 420.0))
+            .build_state(
+                |ctx, (layout, scenario, fonts_ready)| {
+                    if !*fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        *fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            draw_context_menu_layout_settings(ui, layout, scenario);
+                        });
+                    });
+                },
+                state,
+            );
+
+        harness.get_by_label("コピーの前の区切り線").click();
+        harness.run();
+        harness.get_by_label("表示").click();
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .0
+                .separator_before(ContextMenuItemId::CopyFiles),
+            ContextMenuSeparatorBefore::Present
+        );
+        let root_separator_column_x = harness.get_by_label("コピーの前の区切り線").rect().left();
+        harness.get_by_label("コピーの区切り線を既定に戻す").click();
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .0
+                .separator_before(ContextMenuItemId::CopyFiles),
+            ContextMenuSeparatorBefore::Inherit
+        );
+
+        harness.get_by_label("切り取りを下へ").click();
+        harness.run();
+        assert_eq!(
+            &harness.state().0.resolved_order(ContextMenuParentId::Root)[..2],
+            &[ContextMenuItemId::CopyFiles, ContextMenuItemId::CutFiles]
+        );
+
+        harness.get_by_label("コピー").click();
+        harness.run();
+        assert!(!harness.state().0.is_visible(ContextMenuItemId::CopyFiles));
+        harness.get_by_label("右クリック項目をすべて表示").click();
+        harness.run();
+        assert!(harness.state().0.is_visible(ContextMenuItemId::CopyFiles));
+
+        harness.get_by_label("コピー").click();
+        harness.run();
+        harness
+            .get_by_label("右クリック設定をすべて既定に戻す")
+            .click();
+        harness.run();
+        assert_eq!(harness.state().0, ContextMenuLayoutSettings::default());
+
+        harness
+            .get_by_label("「アプリケーションで開く…」内の項目")
+            .scroll_to_me();
+        harness.run();
+        harness
+            .get_by_label("「アプリケーションで開く…」内の項目")
+            .click();
+        harness.run();
+        // A newly opened egui Grid records its measured columns on the first frame and
+        // presents the shared widths on the requested follow-up repaint.
+        harness.run();
+        harness.get_by_label("外部ツールの設定…").scroll_to_me();
+        harness.run();
+        assert!(harness.query_by_label("外部ツールの設定…").is_some());
+        assert!(
+            harness.query_by_label("外部ツールの設定…を上へ").is_none(),
+            "a one-item hierarchy must not expose meaningless arrow buttons"
+        );
+        assert!(harness.query_by_label("外部ツールの設定…を下へ").is_none());
+        assert!(
+            harness
+                .query_by_label("外部ツールの設定…の前の区切り線")
+                .is_some(),
+            "the stable leaf still exposes its separator setting"
+        );
+        let open_with_separator_column_x = harness
+            .get_by_label("外部ツールの設定…の前の区切り線")
+            .rect()
+            .left();
+        assert!(
+            (root_separator_column_x - open_with_separator_column_x).abs() <= 1.0,
+            "both hierarchy grids must share the separator column: root={root_separator_column_x}, open_with={open_with_separator_column_x}"
+        );
+    }
+}
+
+pub(super) fn draw_singleton_spread_placement_setting(
+    ui: &mut egui::Ui,
+    first: &mut bool,
+    last: &mut bool,
+) {
+    ui.checkbox(first, "見開き先頭の単ページを片側に配置");
+    ui.checkbox(last, "見開き末尾の単ページを片側に配置");
+    ui.small("本の端に単独で残るページだけを、見開きで本来ある側へ配置します。本ごとの設定が優先されます。");
+}
+
 pub(super) fn page_playback_resume(ui: &mut egui::Ui, state: &mut PreferencesState) {
     use crate::settings::ResumeMode;
     anchored(ui, state, "resume/modes", |ui, state| {
@@ -9103,15 +10462,20 @@ pub(super) fn page_playback_resume(ui: &mut egui::Ui, state: &mut PreferencesSta
     ui.label(egui::RichText::new("保存済み位置の管理").strong());
     ui.add_space(4.0);
 
-    // 動画・音声 (再生位置は settings 内の同じ HashMap を path キーで共有。クリアは OK 適用時に反映)。
+    // 動画・音声の再生位置と音声トラック選択。クリアは OK 適用時に反映。
     anchored(ui, state, "resume/video-audio", |ui, state| {
         let video_count = state.settings.video_resume_positions.len();
+        let watched_count = state.settings.video_watched_to_end.len();
+        let track_count = state.settings.video_audio_track_choices.len();
         ui.label(format!(
-        "動画・音声の再生位置: {video_count} 件を記憶 (3 秒以上再生・末尾 5 秒以内に未到達のときのみ保存)。"
-    ));
-        if video_count > 0 && ui.button("動画・音声の再生位置をすべてクリア").clicked()
+            "動画・音声の再生位置: {video_count} 件、最後まで視聴: {watched_count} 件、音声トラックの選択: {track_count} 件を記憶。"
+        ));
+        if (video_count > 0 || watched_count > 0 || track_count > 0)
+            && ui
+                .button("再生位置・視聴済み記録と音声トラックの選択をすべてクリア")
+                .clicked()
         {
-            state.settings.video_resume_positions.clear();
+            state.clear_video_media_memory();
         }
     });
 
@@ -9454,6 +10818,8 @@ mod tests {
     #[test]
     fn operation_labels_sort_numbers_naturally() {
         let mut labels = vec![
+            "サムネイル列数を20列に",
+            "サムネイル列数を11列に",
             "サムネイル列数を10列に",
             "サムネイル列数を1列に",
             "サムネイル列数を2列に",
@@ -9467,6 +10833,8 @@ mod tests {
                 "サムネイル列数を2列に",
                 "サムネイル列数を9列に",
                 "サムネイル列数を10列に",
+                "サムネイル列数を11列に",
+                "サムネイル列数を20列に",
             ]
         );
     }
@@ -9597,6 +10965,17 @@ mod tests {
     #[test]
     fn settings_dialog_key_actions_map_to_grid_ring_actions() {
         assert_eq!(
+            ring_bindings_for_key_action(KeyAction::GridOrganizeFiles),
+            vec![(RingShortcutContext::Grid, RingActionId::GridOrganizeFiles)]
+        );
+        assert_eq!(
+            ring_bindings_for_key_action(KeyAction::FsFitModeCycle),
+            vec![(
+                RingShortcutContext::ImageFullscreen,
+                RingActionId::ImageFitModeCycle
+            )]
+        );
+        assert_eq!(
             ring_bindings_for_key_action(KeyAction::GridOpenPreferences),
             vec![(RingShortcutContext::Grid, RingActionId::OpenPreferences)]
         );
@@ -9643,11 +11022,10 @@ mod tests {
             );
             assert!(ring.is_valid_for_mouse_button_context(RingShortcutContext::VideoFullscreen));
             assert!(
-                !ring
-                    .is_available_for_mouse_button_assignment(RingShortcutContext::VideoFullscreen),
-                "the ring/key mapping must not make video seek a v3.7 mouse-button candidate"
+                ring.is_available_for_mouse_button_assignment(RingShortcutContext::VideoFullscreen),
+                "the next-version build must offer video seek as a mouse-button candidate"
             );
-            assert!(!operation_assignment_tab_enabled(
+            assert!(operation_assignment_tab_enabled(
                 &OperationAssignmentTarget::Key(key),
                 OperationAssignmentTab::MouseButtons,
             ));
@@ -9659,7 +11037,7 @@ mod tests {
                 &OperationAssignmentTarget::Key(key),
                 OperationAssignmentTab::MouseGesture,
             ));
-            assert!(!operation_assignment_tab_enabled(
+            assert!(operation_assignment_tab_enabled(
                 &OperationAssignmentTarget::Ring {
                     context: RingShortcutContext::VideoFullscreen,
                     action: ring.clone(),
@@ -9670,7 +11048,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_video_seek_projects_to_none_only_for_physical_mouse_ui() {
+    fn video_seek_assignment_is_visible_in_physical_mouse_ui() {
         let action = RingActionId::VideoSeekBackSmall;
         let context = RingShortcutContext::VideoFullscreen;
         let mut settings = RingShortcutSettings::default();
@@ -9678,12 +11056,13 @@ mod tests {
 
         assert_eq!(
             effective_mouse_button_action(&action, context),
-            RingActionId::None,
-            "the saved value is shown as the existing unassigned choice"
+            action,
+            "the saved value is shown as the active physical assignment"
         );
-        assert!(
-            mouse_assignment_labels(&settings, context, &action).is_empty(),
-            "an unavailable physical assignment must not look active in the overview"
+        assert_eq!(
+            mouse_assignment_labels(&settings, context, &action),
+            vec!["戻るボタン".to_string()],
+            "the active physical assignment must be visible in the overview"
         );
         assert_eq!(
             settings.mouse_button_profile(context).back,
@@ -9699,9 +11078,9 @@ mod tests {
                 action.clone(),
             ));
         let labels = mouse_assignment_labels(&settings, context, &action);
-        assert_eq!(labels.len(), 1);
-        assert!(labels[0].contains('↑'));
-        assert!(!labels[0].contains("戻るボタン"));
+        assert_eq!(labels.len(), 2);
+        assert_eq!(labels[0], "戻るボタン");
+        assert!(labels[1].contains('↑'));
     }
 
     #[test]
@@ -9725,6 +11104,7 @@ mod tests {
             &crate::settings::Settings::default(),
             crate::external_tool::LaunchTarget::None,
             None,
+            crate::ai::trt_worker_lifecycle::TrtWorkerLifecycleOwner::new().snapshot(),
             false,
             0,
             0,

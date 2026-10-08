@@ -448,11 +448,16 @@ impl App {
         };
 
         self.ensure_ai_runtime();
-        let Some(runtime) = self.ai_runtime.clone() else {
-            self.video_upscale_queue
-                .mark_failed(task.task_id, FailureReason::Io);
-            self.save_video_upscale_queue();
-            return;
+        let runtime = match self.ai_runtime_init.snapshot() {
+            crate::ai::runtime::AiRuntimeInitSnapshot::Ready(runtime) => runtime,
+            crate::ai::runtime::AiRuntimeInitSnapshot::Failed(_) => {
+                self.video_upscale_queue
+                    .mark_failed(task.task_id, FailureReason::Io);
+                self.save_video_upscale_queue();
+                return;
+            }
+            crate::ai::runtime::AiRuntimeInitSnapshot::Dormant
+            | crate::ai::runtime::AiRuntimeInitSnapshot::Initializing => return,
         };
         let model_manager = self.ai_model_manager.clone();
         let cancel = Arc::new(AtomicBool::new(false));

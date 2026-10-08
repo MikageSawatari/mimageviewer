@@ -11,6 +11,7 @@
 # Usage:
 #   PS> scripts\build-portable.ps1
 #   PS> scripts\build-portable.ps1 -SkipBuild      (re-assemble only, reuse last core build)
+#   PS> scripts\build-portable.ps1 -KeepRunning    (do not stop repo-built app processes)
 #   PS> scripts\build-portable.ps1 -SmokeTestScript (diagnostic package; no dist/zip/sign)
 #   PS> scripts\build-portable.ps1 -PreserveRuntime
 
@@ -18,6 +19,7 @@
 param(
     [switch] $SkipBuild,
     [switch] $Sign,
+    [switch] $KeepRunning,
     [switch] $SmokeTestScript,
     # Never stop mImageViewer processes; fail before build or package replacement.
     [switch] $PreserveRuntime
@@ -28,6 +30,9 @@ $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
 if ($SmokeTestScript -and $Sign) {
     throw '[portable-smoke-build] -Sign is not supported for diagnostic smoke artifacts'
+}
+if ($KeepRunning -and $PreserveRuntime) {
+    throw '[portable] -KeepRunning and -PreserveRuntime have different process contracts and cannot be combined'
 }
 
 function Get-NormalizedPath {
@@ -129,6 +134,7 @@ function Get-MivSourceFingerprintRecords {
         'crates',
         'assets',
         'vendor/eframe',
+        'vendor/egui',
         'vendor/egui-wgpu',
         'vendor/twemoji'
     )
@@ -185,7 +191,8 @@ function Write-SmokeBuildManifest {
         [string] $Path,
         [string] $SourceFingerprint,
         [string] $CorePath,
-        [string] $RemotePath
+        [string] $RemotePath,
+        [string] $EpubWorkerPath
     )
     $head = (& git -C $repoRoot rev-parse HEAD).Trim()
     if ($LASTEXITCODE -ne 0 -or -not $head) {
@@ -200,6 +207,7 @@ function Write-SmokeBuildManifest {
         source_fingerprint_sha256 = $SourceFingerprint
         core_sha256 = (Get-FileHash -LiteralPath $CorePath -Algorithm SHA256).Hash.ToLowerInvariant()
         remote_sha256 = (Get-FileHash -LiteralPath $RemotePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        epub_worker_sha256 = (Get-FileHash -LiteralPath $EpubWorkerPath -Algorithm SHA256).Hash.ToLowerInvariant()
     }
     $json = $manifest | ConvertTo-Json -Depth 3
     [System.IO.File]::WriteAllText($Path, $json, (New-Object System.Text.UTF8Encoding($false)))
@@ -210,7 +218,8 @@ function Assert-SmokeBuildManifest {
         [string] $Path,
         [string] $ExpectedSourceFingerprint,
         [string] $CorePath,
-        [string] $RemotePath
+        [string] $RemotePath,
+        [string] $EpubWorkerPath
     )
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         throw "[portable-smoke-build] diagnostic build manifest not found: $Path"
@@ -235,7 +244,9 @@ function Assert-SmokeBuildManifest {
     }
     $coreHash = (Get-FileHash -LiteralPath $CorePath -Algorithm SHA256).Hash.ToLowerInvariant()
     $remoteHash = (Get-FileHash -LiteralPath $RemotePath -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($manifest.core_sha256 -ne $coreHash -or $manifest.remote_sha256 -ne $remoteHash) {
+    $epubWorkerHash = (Get-FileHash -LiteralPath $EpubWorkerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($manifest.core_sha256 -ne $coreHash -or $manifest.remote_sha256 -ne $remoteHash -or
+        $manifest.epub_worker_sha256 -ne $epubWorkerHash) {
         throw '[portable-smoke-build] diagnostic artifact hash does not match its build manifest'
     }
 }
@@ -280,6 +291,8 @@ Write-Host "[portable] version = $version"
 # ---------------------------------------------------------------------------
 # Stop any running core/portable instances that may lock the exe.
 # Only repo-built ones (path under repo root) are touched.
+# -KeepRunning skips only this block so build/package preparation can proceed
+# while a portable copy is open. The default behavior remains unchanged.
 # ---------------------------------------------------------------------------
 $repoPrefix = ($repoRoot.TrimEnd('\') + '\').ToLower()
 # Exact names only. "mimageviewer*" also matches Cargo's test harnesses
@@ -289,10 +302,13 @@ $stoppableProcessNames = @(
     'mimageviewer',
     'mimageviewer-core',
     'mimageviewer-remote',
+    'mimageviewer-epub-pdf',
     'mimageviewer-vst3-host',
     'mimageviewer-susie32'
 )
-if ($PreserveRuntime) {
+if ($KeepRunning) {
+    Write-Host "[portable] leaving repo-built app processes running"
+} elseif ($PreserveRuntime) {
     $running = @(Get-Process -ErrorAction SilentlyContinue |
         Where-Object { $stoppableProcessNames -contains $_.Name })
     if ($running.Count -gt 0) {
@@ -324,6 +340,7 @@ $portableTargetName = if ($SmokeTestScript) { 'target-portable-test-script' } el
 $portableTargetDir = Join-Path $repoRoot $portableTargetName
 $coreExe = Join-Path $portableTargetDir 'release\mimageviewer-core.exe'
 $remoteExe = Join-Path $portableTargetDir 'release\mimageviewer-remote.exe'
+$epubWorkerExe = Join-Path $portableTargetDir 'release\mimageviewer-epub-pdf.exe'
 $smokeBuildManifest = Join-Path $portableTargetDir 'release\mimageviewer-core.build-manifest.json'
 Assert-NoReparsePath $portableTargetDir $repoRoot 'portable-target'
 $sourceFingerprint = $null
@@ -348,6 +365,11 @@ if (-not $SkipBuild) {
             & cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets --target-dir $portableTargetDir
             $cargoExit = $LASTEXITCODE
         }
+        if ($cargoExit -eq 0) {
+            Write-Host "[portable] cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf --target-dir $portableTargetName"
+            & cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf --target-dir $portableTargetDir
+            $cargoExit = $LASTEXITCODE
+        }
     }
     finally {
         Pop-Location
@@ -362,13 +384,15 @@ if (-not $SkipBuild) {
 }
 if (-not (Test-Path $coreExe)) { throw "[portable] core exe not found: $coreExe" }
 if (-not (Test-Path $remoteExe)) { throw "[portable] remote service exe not found: $remoteExe" }
+if (-not (Test-Path $epubWorkerExe)) { throw "[portable] EPUB worker exe not found: $epubWorkerExe" }
 Assert-NoReparsePath $coreExe $repoRoot 'portable-core'
 Assert-NoReparsePath $remoteExe $repoRoot 'portable-remote'
+Assert-NoReparsePath $epubWorkerExe $repoRoot 'portable-epub-worker'
 if ($SmokeTestScript) {
     if ($SkipBuild) {
-        Assert-SmokeBuildManifest $smokeBuildManifest $sourceFingerprint $coreExe $remoteExe
+        Assert-SmokeBuildManifest $smokeBuildManifest $sourceFingerprint $coreExe $remoteExe $epubWorkerExe
     } else {
-        Write-SmokeBuildManifest $smokeBuildManifest $sourceFingerprint $coreExe $remoteExe
+        Write-SmokeBuildManifest $smokeBuildManifest $sourceFingerprint $coreExe $remoteExe $epubWorkerExe
     }
 }
 
@@ -400,6 +424,7 @@ New-Item -ItemType Directory -Path (Join-Path $pkgDir 'models') | Out-Null
 $copies = @(
     @{ src = $coreExe; dst = 'mimageviewer.exe' }
     @{ src = $remoteExe; dst = 'mimageviewer-remote.exe' }
+    @{ src = $epubWorkerExe; dst = 'mimageviewer-epub-pdf.exe' }
     @{ src = 'vendor\ffmpeg\bin\avcodec-61.dll';     dst = 'avcodec-61.dll' }
     @{ src = 'vendor\ffmpeg\bin\avformat-61.dll';    dst = 'avformat-61.dll' }
     @{ src = 'vendor\ffmpeg\bin\avutil-59.dll';      dst = 'avutil-59.dll' }
@@ -409,6 +434,10 @@ $copies = @(
     @{ src = 'vendor\pdfium\bin\pdfium.dll';         dst = 'pdfium.dll' }
     @{ src = 'vendor\ort\onnxruntime.dll';           dst = 'onnxruntime.dll' }
     @{ src = 'vendor\ort\onnxruntime_providers_shared.dll'; dst = 'onnxruntime_providers_shared.dll' }
+    @{ src = 'vendor\vcrt\msvcp140.dll';             dst = 'msvcp140.dll' }
+    @{ src = 'vendor\vcrt\msvcp140_1.dll';           dst = 'msvcp140_1.dll' }
+    @{ src = 'vendor\vcrt\vcruntime140.dll';         dst = 'vcruntime140.dll' }
+    @{ src = 'vendor\vcrt\vcruntime140_1.dll';       dst = 'vcruntime140_1.dll' }
     @{ src = 'vendor\susie-worker\mimageviewer-susie32.exe'; dst = 'mimageviewer-susie32.exe' }
     # NOTE: mimageviewer-vst3-host.exe is intentionally NOT bundled. The unsigned
     # bridge exe is false-flagged by some security software, which blocked the
@@ -421,6 +450,9 @@ $copies = @(
     #  CLAUDE.md encoding policy: .ps1 = ASCII only.)
     @{ src = 'vendor\ffmpeg\LICENSE.txt';            dst = 'LICENSE-ffmpeg.txt' }
     @{ src = 'UNRAR-LICENSE.txt';                     dst = 'UNRAR-LICENSE.txt' }
+    @{ src = 'LIBRAW-LICENSE.txt';                    dst = 'LIBRAW-LICENSE.txt' }
+    @{ src = 'ZLIB-LICENSE.txt';                      dst = 'ZLIB-LICENSE.txt' }
+    @{ src = 'LIBJPEG-TURBO-LICENSE.txt';             dst = 'LIBJPEG-TURBO-LICENSE.txt' }
     @{ src = 'vendor\egui-wgpu\LICENSE-MIT';         dst = 'egui-LICENSE-MIT.txt' }
     @{ src = 'vendor\egui-wgpu\LICENSE-APACHE';      dst = 'egui-LICENSE-APACHE.txt' }
     @{ src = 'installer\readme_portable.txt';        dst = 'readme.txt' }
@@ -483,6 +515,7 @@ if ($Sign) {
     $portablePe = @(
         'mimageviewer.exe',
         'mimageviewer-remote.exe',
+        'mimageviewer-epub-pdf.exe',
         'pdfium.dll',
         'mimageviewer-susie32.exe',
         'avcodec-61.dll', 'avformat-61.dll', 'avutil-59.dll',
@@ -491,6 +524,10 @@ if ($Sign) {
     Write-Host "[portable] signing portable PE files"
     Invoke-MivSign -Files $portablePe -Verify
 }
+
+& (Join-Path $repoRoot 'scripts\check-vcrt-pe-dependencies.ps1') `
+    -InputPaths $pkgDir -RequireCompanionRuntime `
+    -ReportPath 'target\vcrt-pe-reports\portable.json'
 
 # ---------------------------------------------------------------------------
 # Zip it.

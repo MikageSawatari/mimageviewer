@@ -108,6 +108,22 @@ pub struct ClientFailure {
     pub retry_statuses: Vec<String>,
 }
 
+fn response_type_mismatch(
+    success: IpcSuccess<ServerMessage>,
+    label: &'static str,
+) -> ClientFailure {
+    ClientFailure {
+        error: ClientError::Protocol(protocol_failure(
+            "response_route",
+            "response_type_mismatch",
+            None,
+            format!("{label} request received another response type"),
+        )),
+        retry_count: success.retry_count,
+        retry_statuses: success.retry_statuses,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ProtocolFailure {
     pub stage: &'static str,
@@ -135,6 +151,7 @@ pub enum ClientError {
     Protocol(ProtocolFailure),
     Remote(ThumbnailError),
     CollectionRemote(CollectionError),
+    PersistentCollectionRemote(mimageviewer_ipc::PersistentCollectionError),
     MediaRemote(MediaError),
     WriteRemote(RemoteWriteError),
     SessionRemote(SessionResponse),
@@ -153,6 +170,7 @@ impl ClientError {
             )
             || matches!(self, Self::Remote(error) if error.code == ThumbnailErrorCode::Busy)
             || matches!(self, Self::CollectionRemote(error) if error.code == CollectionErrorCode::Busy)
+            || matches!(self, Self::PersistentCollectionRemote(error) if error.code == mimageviewer_ipc::PersistentCollectionErrorCode::Busy)
             || matches!(self, Self::MediaRemote(error) if error.code == MediaErrorCode::Busy)
             || matches!(self, Self::WriteRemote(error) if error.code == RemoteWriteErrorCode::Busy)
             || matches!(self, Self::VideoStreamRemote(error) if error.code == VideoStreamErrorCode::Busy)
@@ -175,6 +193,7 @@ impl ClientError {
                 ThumbnailErrorCode::Unsupported => "miv_unsupported",
                 ThumbnailErrorCode::NotReady => "miv_not_ready",
                 ThumbnailErrorCode::GenerationFailed => "miv_generation_failed",
+                ThumbnailErrorCode::NoThumbnail => "miv_no_thumbnail",
                 ThumbnailErrorCode::Busy => "miv_busy",
                 ThumbnailErrorCode::PasswordRequired => "miv_password_required",
                 ThumbnailErrorCode::PageOutOfRange => "miv_page_out_of_range",
@@ -191,6 +210,8 @@ impl ClientError {
                 MediaErrorCode::PageOutOfRange => "miv_media_page_out_of_range",
                 MediaErrorCode::Cancelled => "miv_media_cancelled",
                 MediaErrorCode::Busy => "miv_media_busy",
+                MediaErrorCode::RawPrefetchSkipped => "miv_raw_prefetch_skipped",
+                MediaErrorCode::RawCapacity => "miv_raw_capacity",
                 MediaErrorCode::RenderFailed => "miv_media_render_failed",
                 MediaErrorCode::Internal => "miv_media_internal",
             }
@@ -203,6 +224,9 @@ impl ClientError {
                 CollectionErrorCode::Internal => "miv_collection_internal",
             }
             .to_owned(),
+            Self::PersistentCollectionRemote(error) => {
+                format!("miv_persistent_collection_{:?}", error.code).to_lowercase()
+            }
             Self::VideoStreamRemote(error) => format!("miv_video_{:?}", error.code).to_lowercase(),
             Self::RemoteAi(error) => format!("miv_remote_ai_{:?}", error.code).to_lowercase(),
             Self::RemoteArchive(error) => {
@@ -244,6 +268,11 @@ impl fmt::Display for ClientError {
                     error.message
                 )
             }
+            Self::PersistentCollectionRemote(error) => write!(
+                f,
+                "mIV 本体がコレクション要求を拒否しました: {}",
+                error.message
+            ),
             Self::MediaRemote(error) => {
                 write!(f, "mIV 本体がコンテナ要求を拒否しました: {}", error.message)
             }
@@ -579,6 +608,104 @@ impl ThumbnailClient {
         })
     }
 
+    pub fn persistent_collection_catalog(
+        &self,
+        owner: &RemoteSessionIdentity,
+    ) -> Result<IpcSuccess<mimageviewer_ipc::PersistentCollectionCatalogPayload>, ClientFailure>
+    {
+        self.collection_request(|id| ClientMessage::PersistentCollectionCatalog {
+            id,
+            owner: owner.clone(),
+            request: mimageviewer_ipc::PersistentCollectionCatalogRequest,
+        })
+        .and_then(|success| match success.value {
+            ServerMessage::PersistentCollectionCatalog {
+                response: mimageviewer_ipc::PersistentCollectionCatalogResponse::Success(payload),
+                ..
+            } => Ok(IpcSuccess {
+                value: payload,
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+                connection_id: success.connection_id,
+            }),
+            ServerMessage::PersistentCollectionCatalog {
+                response: mimageviewer_ipc::PersistentCollectionCatalogResponse::Error(error),
+                ..
+            } => Err(ClientFailure {
+                error: ClientError::PersistentCollectionRemote(error),
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+            }),
+            _ => Err(response_type_mismatch(success, "collection catalog")),
+        })
+    }
+
+    pub fn persistent_collection_snapshot(
+        &self,
+        owner: &RemoteSessionIdentity,
+        request: mimageviewer_ipc::PersistentCollectionSnapshotRequest,
+    ) -> Result<IpcSuccess<mimageviewer_ipc::PersistentCollectionSnapshotPayload>, ClientFailure>
+    {
+        self.collection_request(|id| ClientMessage::PersistentCollectionSnapshot {
+            id,
+            owner: owner.clone(),
+            request: request.clone(),
+        })
+        .and_then(|success| match success.value {
+            ServerMessage::PersistentCollectionSnapshot {
+                response: mimageviewer_ipc::PersistentCollectionSnapshotResponse::Success(payload),
+                ..
+            } => Ok(IpcSuccess {
+                value: payload,
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+                connection_id: success.connection_id,
+            }),
+            ServerMessage::PersistentCollectionSnapshot {
+                response: mimageviewer_ipc::PersistentCollectionSnapshotResponse::Error(error),
+                ..
+            } => Err(ClientFailure {
+                error: ClientError::PersistentCollectionRemote(error),
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+            }),
+            _ => Err(response_type_mismatch(success, "collection snapshot")),
+        })
+    }
+
+    pub fn persistent_collection_navigate(
+        &self,
+        owner: &RemoteSessionIdentity,
+        request: mimageviewer_ipc::PersistentCollectionNavigateRequest,
+    ) -> Result<IpcSuccess<mimageviewer_ipc::PersistentCollectionNavigatePayload>, ClientFailure>
+    {
+        self.collection_request(|id| ClientMessage::PersistentCollectionNavigate {
+            id,
+            owner: owner.clone(),
+            request: request.clone(),
+        })
+        .and_then(|success| match success.value {
+            ServerMessage::PersistentCollectionNavigate {
+                response: mimageviewer_ipc::PersistentCollectionNavigateResponse::Success(payload),
+                ..
+            } => Ok(IpcSuccess {
+                value: payload,
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+                connection_id: success.connection_id,
+            }),
+            ServerMessage::PersistentCollectionNavigate {
+                response: mimageviewer_ipc::PersistentCollectionNavigateResponse::Error(error),
+                ..
+            } => Err(ClientFailure {
+                error: ClientError::PersistentCollectionRemote(error),
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+            }),
+            _ => Err(response_type_mismatch(success, "collection navigation")),
+        })
+    }
+
     pub fn favorite_search(
         &self,
         owner: &RemoteSessionIdentity,
@@ -841,6 +968,36 @@ impl ThumbnailClient {
                     "response_type_mismatch",
                     None,
                     "page request received another response type",
+                )),
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+            }),
+        })
+    }
+
+    pub fn raw_prefetch_window(
+        &self,
+        owner: &RemoteSessionIdentity,
+        request: mimageviewer_ipc::RawPrefetchWindowRequest,
+    ) -> Result<IpcSuccess<mimageviewer_ipc::RawPrefetchWindowAck>, ClientFailure> {
+        self.collection_request(|id| ClientMessage::RawPrefetchWindow {
+            id,
+            owner: owner.clone(),
+            request: request.clone(),
+        })
+        .and_then(|success| match success.value {
+            ServerMessage::RawPrefetchWindow { response, .. } => Ok(IpcSuccess {
+                value: response,
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+                connection_id: success.connection_id,
+            }),
+            _ => Err(ClientFailure {
+                error: ClientError::Protocol(protocol_failure(
+                    "response_route",
+                    "response_type_mismatch",
+                    None,
+                    "RAW window received another response type",
                 )),
                 retry_count: success.retry_count,
                 retry_statuses: success.retry_statuses,
@@ -1217,6 +1374,7 @@ impl ThumbnailClient {
         owner: &RemoteSessionIdentity,
         address: RemoteAddress,
         quality: VideoStreamQuality,
+        audio_track: Option<usize>,
     ) -> Result<IpcSuccess<VideoStreamStartPayload>, ClientFailure> {
         self.video_request(
             |id| ClientMessage::VideoStreamStart {
@@ -1224,6 +1382,7 @@ impl ThumbnailClient {
                 owner: owner.clone(),
                 address: address.clone(),
                 quality,
+                audio_track,
             },
             |message| match message {
                 ServerMessage::VideoStreamStart { response, .. } => Some(response),
@@ -2412,6 +2571,7 @@ mod tests {
             owner: test_owner(),
             address: RemoteAddress::file("C:/Movies/movie.mp4"),
             quality: VideoStreamQuality::Standard,
+            audio_track: None,
         };
         assert_eq!(
             response_timeout_for(&request),

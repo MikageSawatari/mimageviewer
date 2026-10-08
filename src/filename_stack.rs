@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::grid_item::GridItem;
-use crate::settings::SortOrder;
+use crate::settings::{ListingSortMetadata, SortOrder};
 
 /// サブ展開ビューなど複数フォルダのメディアを 1 本の一覧に混ぜるとき、同じ prefix が
 /// 別フォルダ間で衝突しないようにする内部区切り。
@@ -35,7 +35,7 @@ pub struct StackMember {
     /// 更新日時 (秒)。日付ソート用。
     pub mtime: i64,
     /// ファイルサイズ (バイト)。
-    pub size: i64,
+    pub size: Option<i64>,
     /// 動画か (動画は単独グループに固定する)。
     pub is_video: bool,
 }
@@ -193,16 +193,64 @@ pub fn group_by_keys(media: Vec<StackMember>, keys: &[String], sort: SortOrder) 
         .map(|group| {
             let rep = group.representative();
             let key = sort.name_key(name_of(&rep.path));
-            let mtime = rep.mtime;
-            (group, key, mtime)
+            let metadata =
+                ListingSortMetadata::new(rep.mtime, if group.is_stack() { None } else { rep.size });
+            (group, key, metadata)
         })
         .collect();
-    keyed_groups
-        .sort_by(|(_, ak, a_mt), (_, bk, b_mt)| sort.compare_name_keys(ak, *a_mt, bk, *b_mt));
+    keyed_groups.sort_by(|(_, ak, a_meta), (_, bk, b_meta)| {
+        sort.compare_listing_keys(ak, *a_meta, bk, *b_meta)
+    });
     keyed_groups
         .into_iter()
         .map(|(group, _, _)| group)
         .collect()
+}
+
+/// Rating ordering is stack-specific: first sort each group's members, then
+/// compare the representative of each group. The caller retains these keys for
+/// aggregate/flat switching; display badges may change independently.
+pub(crate) fn group_by_keys_with_order(
+    media: Vec<StackMember>,
+    keys: &[String],
+    order: crate::rating_sort::ListingOrderRequest,
+    rating_keys: Option<&HashMap<String, crate::rating_sort::RatingSortKey>>,
+) -> Vec<StackGroup> {
+    let crate::rating_sort::ListingOrderRequest::Rating(spec) = order else {
+        let crate::rating_sort::ListingOrderRequest::Standard(sort) = order else {
+            unreachable!()
+        };
+        return group_by_keys(media, keys, sort);
+    };
+    let rating_keys = rating_keys.expect("rating stack order requires complete physical facts");
+    let mut groups = group_by_keys(media, keys, SortOrder::FileName);
+    let member_key = |member: &StackMember| {
+        let key = crate::adjustment_db::normalize_path(&member.path);
+        *rating_keys
+            .get(&key)
+            .expect("stack member rating key was not requested")
+    };
+    for group in &mut groups {
+        group.members.sort_by(|a, b| {
+            spec.compare(
+                member_key(a),
+                &SortOrder::FileName.name_key(name_of(&a.path)),
+                member_key(b),
+                &SortOrder::FileName.name_key(name_of(&b.path)),
+            )
+        });
+    }
+    groups.sort_by(|a, b| {
+        let a = a.representative();
+        let b = b.representative();
+        spec.compare(
+            member_key(a),
+            &SortOrder::FileName.name_key(name_of(&a.path)),
+            member_key(b),
+            &SortOrder::FileName.name_key(name_of(&b.path)),
+        )
+    });
+    groups
 }
 
 /// スタックモードのビュー状態 (App が `Option<StackView>` で保持)。
@@ -223,14 +271,14 @@ pub struct StackView {
     pub folder: PathBuf,
     /// グループ化区切り文字 (構築時の値)。
     pub separator: char,
-    /// 構築時のソート順 (グループ/メンバーの並びはこれに従う)。
-    pub sort: SortOrder,
+    order: StackOrderSnapshot,
     /// 構築時のカテゴリ表示順。
     pub display_order: crate::settings::GridDisplayOrder,
     /// 画像以外のコンテナセル (両ビュー先頭の passthrough)。
     pub passthrough: Vec<GridItem>,
     /// `passthrough` と同インデックスの `(mtime, size)`。
     pub passthrough_metas: Vec<Option<(i64, i64)>>,
+    pub(crate) passthrough_sort_metas: Vec<ListingSortMetadata>,
     /// メディアグループ (表示順)。
     pub groups: Vec<StackGroup>,
     /// カテゴリ並べ替え後の index 写像。構築時に 1 回だけ計算し、ナビ操作では再ソートしない。
@@ -238,6 +286,17 @@ pub struct StackView {
     flat_group_starts: Vec<Option<usize>>,
     aggregated_group_by_index: Vec<Option<usize>>,
     aggregated_group_indices: Vec<usize>,
+    #[cfg(test)]
+    pub(crate) index_map_builds: usize,
+}
+
+#[derive(Clone)]
+enum StackOrderSnapshot {
+    Standard(SortOrder),
+    Rating {
+        spec: crate::rating_sort::RatingSortSpec,
+        keys: std::sync::Arc<HashMap<String, crate::rating_sort::RatingSortKey>>,
+    },
 }
 
 impl StackView {
@@ -250,14 +309,20 @@ impl StackView {
         separator: char,
         sort: SortOrder,
     ) -> Self {
+        let passthrough_sort_metas = passthrough_metas
+            .iter()
+            .map(|meta| ListingSortMetadata::new(meta.map(|(mtime, _)| mtime).unwrap_or(0), None))
+            .collect();
         let groups = group_media(media, separator, sort);
-        Self::from_groups(
+        Self::from_groups_with_display_order(
             folder,
             passthrough,
             passthrough_metas,
+            passthrough_sort_metas,
             separator,
             sort,
             groups,
+            crate::settings::GridDisplayOrder::default(),
         )
     }
 
@@ -272,10 +337,15 @@ impl StackView {
         sort: SortOrder,
         groups: Vec<StackGroup>,
     ) -> Self {
+        let passthrough_sort_metas = passthrough_metas
+            .iter()
+            .map(|meta| ListingSortMetadata::new(meta.map(|(mtime, _)| mtime).unwrap_or(0), None))
+            .collect();
         Self::from_groups_with_display_order(
             folder,
             passthrough,
             passthrough_metas,
+            passthrough_sort_metas,
             separator,
             sort,
             groups,
@@ -283,10 +353,11 @@ impl StackView {
         )
     }
 
-    pub fn from_groups_with_display_order(
+    pub(crate) fn from_groups_with_display_order(
         folder: PathBuf,
         passthrough: Vec<GridItem>,
         passthrough_metas: Vec<Option<(i64, i64)>>,
+        passthrough_sort_metas: Vec<ListingSortMetadata>,
         separator: char,
         sort: SortOrder,
         groups: Vec<StackGroup>,
@@ -295,18 +366,70 @@ impl StackView {
         let mut view = Self {
             folder,
             separator,
-            sort,
+            order: StackOrderSnapshot::Standard(sort),
             display_order,
             passthrough,
             passthrough_metas,
+            passthrough_sort_metas,
             groups,
             flat_group_by_index: Vec::new(),
             flat_group_starts: Vec::new(),
             aggregated_group_by_index: Vec::new(),
             aggregated_group_indices: Vec::new(),
+            #[cfg(test)]
+            index_map_builds: 0,
         };
         view.rebuild_materialized_index_maps();
         view
+    }
+
+    pub(crate) fn set_rating_order(
+        &mut self,
+        spec: crate::rating_sort::RatingSortSpec,
+        keys: std::sync::Arc<HashMap<String, crate::rating_sort::RatingSortKey>>,
+    ) {
+        self.order = StackOrderSnapshot::Rating { spec, keys };
+        if let StackOrderSnapshot::Rating { spec, keys } = &self.order {
+            debug_assert!(
+                self.groups
+                    .iter()
+                    .flat_map(|group| &group.members)
+                    .all(|member| {
+                        keys.contains_key(&crate::adjustment_db::normalize_path(&member.path))
+                    })
+            );
+            debug_assert!(
+                self.groups
+                    .iter()
+                    .all(|group| group.members.windows(2).all(|pair| {
+                        let left = &pair[0];
+                        let right = &pair[1];
+                        let left_key = keys[&crate::adjustment_db::normalize_path(&left.path)];
+                        let right_key = keys[&crate::adjustment_db::normalize_path(&right.path)];
+                        !spec
+                            .compare(
+                                left_key,
+                                &SortOrder::FileName.name_key(name_of(&left.path)),
+                                right_key,
+                                &SortOrder::FileName.name_key(name_of(&right.path)),
+                            )
+                            .is_gt()
+                    }))
+            );
+        }
+        self.rebuild_materialized_index_maps();
+    }
+
+    #[cfg(test)]
+    fn retained_rating_key_for_path(
+        &self,
+        path: &Path,
+    ) -> Option<crate::rating_sort::RatingSortKey> {
+        let StackOrderSnapshot::Rating { keys, .. } = &self.order else {
+            return None;
+        };
+        keys.get(&crate::adjustment_db::normalize_path(path))
+            .copied()
     }
 
     /// 畳めるスタック (画像 2 枚以上のグループ) が 1 つでもあるか。
@@ -321,6 +444,7 @@ impl StackView {
     pub fn materialize_aggregated(&self) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
         let mut items = self.passthrough.clone();
         let mut metas = self.passthrough_metas.clone();
+        let mut sort_metas = self.passthrough_sort_metas.clone();
         for g in &self.groups {
             let rep = g.representative();
             if g.is_stack() {
@@ -334,13 +458,21 @@ impl StackView {
             } else {
                 items.push(GridItem::Image(rep.path.clone()));
             }
-            metas.push(Some((rep.mtime, rep.size)));
+            metas.push(Some((rep.mtime, rep.size.unwrap_or(0))));
+            sort_metas.push(ListingSortMetadata::new(
+                rep.mtime,
+                if g.is_stack() { None } else { rep.size },
+            ));
         }
-        crate::grid_item::arrange_grid_items(
+        crate::grid_item::arrange_grid_items_with_sort_metadata(
             &mut items,
             &mut metas,
+            &mut sort_metas,
             &self.display_order,
-            Some(self.sort),
+            match &self.order {
+                StackOrderSnapshot::Standard(sort) => Some(*sort),
+                StackOrderSnapshot::Rating { .. } => None,
+            },
         );
         (items, metas)
     }
@@ -351,6 +483,7 @@ impl StackView {
     pub fn materialize_flat(&self) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
         let mut items = self.passthrough.clone();
         let mut metas = self.passthrough_metas.clone();
+        let mut sort_metas = self.passthrough_sort_metas.clone();
         for g in &self.groups {
             for m in &g.members {
                 items.push(if m.is_video {
@@ -358,14 +491,19 @@ impl StackView {
                 } else {
                     GridItem::Image(m.path.clone())
                 });
-                metas.push(Some((m.mtime, m.size)));
+                metas.push(Some((m.mtime, m.size.unwrap_or(0))));
+                sort_metas.push(ListingSortMetadata::new(m.mtime, m.size));
             }
         }
-        crate::grid_item::arrange_grid_items(
+        crate::grid_item::arrange_grid_items_with_sort_metadata(
             &mut items,
             &mut metas,
+            &mut sort_metas,
             &self.display_order,
-            Some(self.sort),
+            match &self.order {
+                StackOrderSnapshot::Standard(sort) => Some(*sort),
+                StackOrderSnapshot::Rating { .. } => None,
+            },
         );
         (items, metas)
     }
@@ -404,6 +542,25 @@ impl StackView {
             .unwrap_or(usize::MAX)
     }
 
+    pub(crate) fn group_key_at_aggregated_index(&self, index: usize) -> Option<&str> {
+        let group = self
+            .aggregated_group_by_index
+            .get(index)
+            .copied()
+            .flatten()?;
+        self.groups.get(group).map(|group| group.key.as_str())
+    }
+
+    pub(crate) fn group_key_at_flat_index(&self, index: usize) -> Option<&str> {
+        let group = self.group_of_flat_index(index)?;
+        self.groups.get(group).map(|group| group.key.as_str())
+    }
+
+    pub(crate) fn aggregated_index_for_group_key(&self, key: &str) -> Option<usize> {
+        let group = self.groups.iter().position(|group| group.key == key)?;
+        Some(self.aggregated_index_of_group(group))
+    }
+
     /// `Shift+↓↑` のジャンプ先 (フラットビュー index)。フラットビューの現在地 `cur` から:
     /// - `forward`: 次のスタックの先頭メンバー。最後のスタックなら `None`。
     /// - `backward`: スタック途中なら現スタックの先頭、既に先頭なら前のスタックの先頭。
@@ -438,6 +595,10 @@ impl StackView {
     /// 現在のカテゴリ表示順を適用した aggregate / flat items の index 写像を構築する。
     /// StackView 構築時だけ呼び、キー操作や close reconcile ではソートを繰り返さない。
     fn rebuild_materialized_index_maps(&mut self) {
+        #[cfg(test)]
+        {
+            self.index_map_builds += 1;
+        }
         let mut group_by_path: std::collections::HashMap<&Path, usize> =
             std::collections::HashMap::new();
         let mut group_by_stack_key: std::collections::HashMap<&str, usize> =
@@ -515,7 +676,14 @@ fn sort_members(members: &mut [StackMember], sort: SortOrder) {
             (member, key)
         })
         .collect();
-    keyed.sort_by(|(a, ak), (b, bk)| sort.compare_name_keys(ak, a.mtime, bk, b.mtime));
+    keyed.sort_by(|(a, ak), (b, bk)| {
+        sort.compare_listing_keys(
+            ak,
+            ListingSortMetadata::new(a.mtime, a.size),
+            bk,
+            ListingSortMetadata::new(b.mtime, b.size),
+        )
+    });
     for (slot, (member, _)) in members.iter_mut().zip(keyed) {
         *slot = member;
     }
@@ -529,7 +697,7 @@ mod tests {
         StackMember {
             path: PathBuf::from(format!(r"C:\dl\{name}")),
             mtime: 0,
-            size: 0,
+            size: Some(0),
             is_video: false,
         }
     }
@@ -538,7 +706,7 @@ mod tests {
         StackMember {
             path: PathBuf::from(format!(r"C:\dl\{folder}\{name}")),
             mtime: 0,
-            size: 0,
+            size: Some(0),
             is_video: false,
         }
     }
@@ -547,7 +715,7 @@ mod tests {
         StackMember {
             path: PathBuf::from(format!(r"C:\dl\{name}")),
             mtime,
-            size: 0,
+            size: Some(0),
             is_video: false,
         }
     }
@@ -556,7 +724,7 @@ mod tests {
         StackMember {
             path: PathBuf::from(format!(r"C:\dl\{name}")),
             mtime: 0,
-            size: 0,
+            size: Some(0),
             is_video: true,
         }
     }
@@ -567,6 +735,97 @@ mod tests {
 
     fn member_names(g: &StackGroup) -> Vec<&str> {
         g.members.iter().map(|m| name_of(&m.path)).collect()
+    }
+
+    #[test]
+    fn rating_stack_keeps_representative_group_order_and_flat_contiguity() {
+        use crate::rating_sort::{
+            ListingOrderRequest, RatingSortDirection, RatingSortKey, RatingSortSpec,
+            RatingSortUnratedPosition,
+        };
+        let media = vec![
+            img("a_1.jpg"),
+            img("a_2.jpg"),
+            img("b_1.jpg"),
+            img("b_2.jpg"),
+        ];
+        let group_keys = vec!["a".into(), "a".into(), "b".into(), "b".into()];
+        let mut ratings = HashMap::new();
+        for (member, stars) in media.iter().zip([1, 5, 3, 4]) {
+            ratings.insert(
+                crate::adjustment_db::normalize_path(&member.path),
+                RatingSortKey::supported(stars).unwrap(),
+            );
+        }
+        let request = ListingOrderRequest::Rating(RatingSortSpec {
+            direction: RatingSortDirection::Desc,
+            unrated_position: RatingSortUnratedPosition::BelowAll,
+        });
+        let groups = group_by_keys_with_order(media.clone(), &group_keys, request, Some(&ratings));
+        assert_eq!(keys(&groups), ["a", "b"]);
+        assert_eq!(member_names(&groups[0]), ["a_2.jpg", "a_1.jpg"]);
+        assert_eq!(member_names(&groups[1]), ["b_2.jpg", "b_1.jpg"]);
+        let mut view = StackView::from_groups(
+            PathBuf::from(r"C:\dl"),
+            Vec::new(),
+            Vec::new(),
+            '_',
+            SortOrder::FileName,
+            groups,
+        );
+        let ListingOrderRequest::Rating(spec) = request else {
+            unreachable!()
+        };
+        view.set_rating_order(spec, std::sync::Arc::new(ratings.clone()));
+        let (aggregated, _) = view.materialize_aggregated();
+        assert!(
+            matches!(&aggregated[0], GridItem::Stack { key, representative, .. } if key == "a" && representative.file_name().unwrap() == "a_2.jpg")
+        );
+        let (flat, _) = view.materialize_flat();
+        assert_eq!(
+            flat.iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["a_2.jpg", "a_1.jpg", "b_2.jpg", "b_1.jpg"]
+        );
+        assert_eq!(view.group_key_at_aggregated_index(0), Some("a"));
+        assert_eq!(view.flat_start_of_group(1), Some(2));
+
+        // A later rating edit leaves the retained view untouched. Explicit reload
+        // builds a new group order and restores selection by the stable group key.
+        ratings.insert(
+            crate::adjustment_db::normalize_path(&media[2].path),
+            RatingSortKey::supported(5).unwrap(),
+        );
+        ratings.insert(
+            crate::adjustment_db::normalize_path(&media[1].path),
+            RatingSortKey::supported(2).unwrap(),
+        );
+        ratings.insert(
+            crate::adjustment_db::normalize_path(&media[0].path),
+            RatingSortKey::supported(4).unwrap(),
+        );
+        let reloaded = group_by_keys_with_order(media, &group_keys, request, Some(&ratings));
+        let mut reloaded = StackView::from_groups(
+            PathBuf::from(r"C:\dl"),
+            Vec::new(),
+            Vec::new(),
+            '_',
+            SortOrder::FileName,
+            reloaded,
+        );
+        reloaded.set_rating_order(spec, std::sync::Arc::new(ratings.clone()));
+        assert_eq!(reloaded.groups[0].key, "b");
+        assert_eq!(reloaded.aggregated_index_for_group_key("a"), Some(1));
+        assert_eq!(
+            name_of(&reloaded.groups[1].representative().path),
+            "a_1.jpg"
+        );
+        assert_eq!(view.groups[0].key, "a");
+        assert_eq!(
+            view.retained_rating_key_for_path(&img("a_2.jpg").path),
+            RatingSortKey::supported(5)
+        );
     }
 
     // ── prefix_of ────────────────────────────────────────────────────
@@ -712,6 +971,20 @@ mod tests {
     }
 
     #[test]
+    fn name_and_numeric_desc_apply_inside_a_stack() {
+        let media = vec![img("post_p10.jpg"), img("post_p2.jpg"), img("post_p1.jpg")];
+        for order in [SortOrder::FileNameDesc, SortOrder::NumericDesc] {
+            let groups = group_media(media.clone(), '_', order);
+            assert_eq!(groups.len(), 1);
+            assert_eq!(
+                member_names(&groups[0]),
+                ["post_p10.jpg", "post_p2.jpg", "post_p1.jpg"],
+                "{order:?}"
+            );
+        }
+    }
+
+    #[test]
     fn date_sort_orders_groups_by_representative_mtime() {
         // DateDesc: 代表 (グループ内 sort 先頭 = 最新) が新しいグループほど前。
         let media = vec![
@@ -725,6 +998,34 @@ mod tests {
         // 各グループ内も DateDesc (新しい順)。
         assert_eq!(groups[0].representative().mtime, 201);
         assert_eq!(keys(&groups), vec!["new", "old"]);
+    }
+
+    #[test]
+    fn size_sort_uses_member_sizes_but_treats_collapsed_stack_as_unknown() {
+        let sized = |name: &str, size: Option<i64>| StackMember {
+            path: PathBuf::from(format!(r"C:\dl\{name}")),
+            mtime: 0,
+            size,
+            is_video: false,
+        };
+        let media = vec![
+            sized("post_p1.jpg", Some(10)),
+            sized("post_p0.jpg", Some(1)),
+            sized("large.jpg", Some(20)),
+            sized("zero.jpg", Some(0)),
+            sized("unknown.jpg", None),
+        ];
+        let asc = group_media(media.clone(), '_', SortOrder::SizeAsc);
+        assert_eq!(keys(&asc), ["zero", "large", "post", "unknown"]);
+        let post = asc.iter().find(|group| group.key == "post").unwrap();
+        assert_eq!(
+            member_names(post),
+            ["post_p0.jpg", "post_p1.jpg"],
+            "member size remains available inside the stack"
+        );
+
+        let desc = group_media(media, '_', SortOrder::SizeDesc);
+        assert_eq!(keys(&desc), ["large", "zero", "post", "unknown"]);
     }
 
     #[test]

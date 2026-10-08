@@ -12,6 +12,65 @@
 
 ---
 
+## v4.4.0 (2026-10-07)
+
+- **対象**: master `7f922b612` (配布ビルド後の追加コミットは docs / htdocs のみ。コードは配布ビルドと同一)。
+- **依存**: PDFium を `chromium/8076` から **`chromium/8086` へ更新** (利用者が更新後の確認ビルドで PDF 表示を確認)。
+  FFmpeg は `setup-ffmpeg.sh check` が `n7.1.5-12` を「新版」と出すが、同梱の `n7.1.5-16` の方が新しく更新なし (従来と同じ誤検知)。
+  LibRaw 0.22.2 は最新。対応ソース tarball は SHA-256 照合済みで htdocs に配置 (mikage.to への公開は利用者)。
+- **自動テスト**: `build-dist.ps1 -SkipVst3Bridge` の全体テストで **12,116 passed / 0 failed / 58 ignored** (63 suites)。
+  VST3 host は現ソースの identity (`b981fb61…`) と一致を確認して再利用。全 PE / VC runtime gate 通過。
+  開発中の lib 全体実行で、負荷時だけ落ちて単独再実行で通る 2 件を観測 (`indexer_manager::…supervisor_watcher…`、
+  `similar_index::…cannot_reuse_old_marker`)。配布ビルドの全体テストでは発生せず。
+- **署名**: 単体exe / setup.exe / portable の mimageviewer.exe を `signtool verify /pa` で確認 (Taku Sano 名義、RFC3161)。
+- **portable smoke**: `D:\` に展開して起動。応答・`data\` 生成・APPDATA 非接触・終了を確認 (ClaudeCode が実施、
+  利用者の実アプリ試験許可の範囲)。EffeTune は portable 非同梱のため BundleMissing (仕様)。
+- **実機 (利用者)**: §1.335、§1.328 (ZIP と ★3 一覧 → フォルダの ← 復帰)、最終確認ビルドで PDF と通常操作。
+  初回設定の小画面: サブ PC の Windows Sandbox 1093×614 で、修正版は見出しと「開始」が表示、v4.3.0 は表示されない。
+- **ui-smoke**: RatingFolderBack (600 行・10 列) のツールバー 6 ケース PASS。キー系は前面を取れず SKIPPED。
+- **panic.log**: 52 件 15 種すべて disposition あり (`check-panic-log.ps1` exit 0)。CI は最終 push 時に確認する。
+- **idle health (配布ビルドの core、利用者が実施)**: `static-foreground` / `static-background` / `tray-residency` とも **PASS**。
+  測定区間の perf event 0 件 (完全 sleep)、CPU 1 コア比 0.0125 / 0.0083 / 0.0042、`tray-residency` は `8/0 visible`。
+  `video-pin-background` は未実施 (waiver): v4.3.0 からアイドル高画質化 (`idle_upgrade`) のコードに差分なし。
+- **perf smoke (利用者が操作)**: 5,392 フレーム。直前が `request_repaint` の描画フレーム 2,417 件中 **98.4% が 16ms 未満**。
+  `ui.pre_grid_breakdown` total p50 0.04ms / p95 0.09ms / max 1.66ms。100ms 超の間隔 32 件のうち 30 件は `none` /
+  `request_repaint_after_idle_upgrade` (正常)、1 件は起動直後。残る 1 件は 7.5s の 529ms で直前が
+  `request_repaint_after_ai_upscale`、内訳は `fs_render_breakdown.viewport_render_ms` 508ms (同期 I/O の段ではない)。
+  直後に AI のタイル推論が始まっており、初回 AI アップスケール開始時の GPU 競合と推定 (未確認)。AI のコードは v4.3.0 から変更なし。
+  v4.3.0 でも同じかは比較していない。
+- **見送り**: 案A 段2 (初期フォルダの UI スレッド外化) はリリース後。§1.339 (★一覧の絞り込みが → で ZIP に残る) は次版。
+
+## v4.2.0 (2026-09-29)
+
+- **依存**: PDFium `chromium/8066` (最新)。FFmpeg は `setup-ffmpeg.sh check` が `n7.1.5-12` を「新版」と出すが、
+  現行 `n7.1.5-16` より古い (v3.4.0 と同じ誤検知)。DLL は v4.1.0 と同一で更新なし。ONNX Runtime / Susie / VST3 bridge は
+  v4.1.0 から変更なし (`-SkipVst3Bridge`)。`check-panic-log.ps1`: 52 件 15 種すべて disposition あり。
+- **CI**: この版の公開準備中に ubuntu の非 Windows cfg job を**廃止** (利用者判断、backlog §1.302)。残る fmt / viewer context audit は
+  master / main とも success。audit は EPUB / フォルダ履歴で増えた registry API の A4 allowlist 登録漏れで一度赤 (`aaa92558f` で登録)。
+- **Rust テスト**: 配布ビルド内の全体テストで **10,688 件通過 / 失敗 0** (`be04889d4`)。
+- **ui-smoke (使い捨て portable)**: 7 本すべて PASS。AlwaysOnTop は 2 つの理由で落ちた:
+  (1) 別ウィンドウは読み込み中の枠とページ表示で 2 回フォーカスを取り、smoke が 1 回目の後に root へ戻って OS の Right キーを
+  送っていた → 待ち合わせを「ページ描画済みかつ前面」まで延ばして 4 回連続 PASS (backlog §1.303)。
+  (2) Claude デスクトップのウィンドウが同じモニターで smoke の座標に重なり、実ポインタ / キーが届かなかった → 別モニターへ移して解消。
+  **smoke 中は Claude のウィンドウを別モニターに置く。**
+- **idle health (配布ビルドの core)**: `static-foreground` / `static-background` / `tray-residency` の 3 シナリオとも **PASS**。
+  全区間で perf event 0 件 (完全 sleep)、CPU 1 コア比 0.0062 / 0.0062 / 0.0187、`tray-residency` は `8/0 visible`。
+  `video-pin-background` は未実施 (waiver): v4.1.0 からアイドル高画質化 (`idle_upgrade`) のコードに差分なし。
+- **perf smoke**: 3,563 フレーム、16ms 以上 189 件、ログは `target/release-verification/v4.2.0-perf_smoke-perf_events.jsonl`。
+  直前が `request_repaint` の描画中フレームは n=1,696 で **16ms 未満 96.6%、p95 12ms、max 133ms**。
+  `pre_grid_breakdown.total_ms` は **p50 0.062 / p95 0.131 / max 2.81ms**。100ms 超 36 件の内訳は `none` 15、
+  `request_repaint_after_idle_upgrade` 14、`request_repaint_after_ai_upscale` 1、起動直後 1、`request_repaint` 5。
+  その 5 件はフルスクリーン viewport の `setup_ms` 96〜120ms (2 件)、初回フォルダの `thumbnail_polls_ms` 94ms (1 件)、
+  コレクションを開いたフレーム (read_lease の `active_ms` 92ms は lease の存続期間で UI 停止時間ではない、1 件) など。
+  **説明のつかない 100ms 超は 0 件。**
+- **配布物の確認で見つかったリリース阻害 (修正済み)**: 利用者がポータブル版 (空の data) で、一覧で PDF のサムネイルを作ってから
+  その PDF を開くと、ページのサムネイルが永久に「読込中」。キャッシュ済み PDF の即時表示 (§12) で、ページ数の照合成功時に
+  採用処理をやり直して thumbnail worker を止めていた (`b5e3c2340`、独立レビュー 3 回で ACCEPT、`76926e007`)。
+  普段の環境はページのサムネイルがキャッシュ済みで表に出なかった。**空の data での配布物確認が捕まえた。**
+  修正後の配布ビルドで利用者が PDF と動画を確認。
+
+---
+
 ## v3.4.0 (2026-09-01)
 
 - **依存**: PDFium を `chromium/8021` → **`chromium/8035` へ更新**。FFmpeg は

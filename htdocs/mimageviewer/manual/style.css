@@ -110,6 +110,10 @@ a:hover { text-decoration: underline; color: var(--accent); }
   text-decoration: none;
   border-left-color: var(--pink-pale);
 }
+.sidebar nav a.sub {
+  padding-left: 2.25rem;
+  font-size: 0.8rem;
+}
 .sidebar nav a.active {
   color: var(--pink);
   font-weight: 600;

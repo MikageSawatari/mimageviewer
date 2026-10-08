@@ -1,0 +1,13 @@
+[package]
+name = "audio-art-rust-gate"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+flate2 = "=1.1.9"
+
+[profile.dev]
+debug = 0

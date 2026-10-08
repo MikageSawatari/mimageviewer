@@ -36,6 +36,8 @@ struct DeletePurgeJournalEntry {
 pub(crate) struct DeletePurgeRetryReport {
     pub(crate) attempted: usize,
     pub(crate) purged: usize,
+    /// Worker-confirmed absent paths; reconcile live media memory without rereading SQLite.
+    pub(crate) removed_paths: Vec<PathBuf>,
     pub(crate) remaining: usize,
     pub(crate) rows: usize,
     pub(crate) errors: Vec<String>,
@@ -237,6 +239,13 @@ fn retry_delete_purge_journal_at(data_dir: &Path) -> DeletePurgeRetryReport {
         attempted: snapshot.len(),
         ..Default::default()
     };
+    // The released journal has no Exact/Tree field. Treat every restored root
+    // as Tree, and acquire before the orphan filesystem check or any purge.
+    let retry_scopes = snapshot
+        .iter()
+        .map(|entry| crate::delete_worker::DeleteSourceScope::Tree(entry.path.clone()))
+        .collect::<Vec<_>>();
+    let range_guard = crate::rename_key_migration::acquire_delete_epub_guard(&retry_scopes);
     let mut completed = Vec::new();
     for entry in &snapshot {
         if classify_path(&entry.path) != PathClassification::Orphan {
@@ -246,10 +255,12 @@ fn retry_delete_purge_journal_at(data_dir: &Path) -> DeletePurgeRetryReport {
             ));
             continue;
         }
-        let purge = crate::rename_key_migration::purge_removed_paths_at(
+        report.removed_paths.push(entry.path.clone());
+        let purge = crate::rename_key_migration::purge_removed_paths_guarded_at(
             data_dir,
             std::slice::from_ref(&entry.path),
             &entry.pdf_paths,
+            &range_guard,
         );
         report.rows += purge.rows;
         report.store_mutations.merge(purge.store_mutations);
@@ -552,7 +563,12 @@ fn open_for_scan(
     descriptor: &StoreDescriptor,
     state: &mut ScanState,
 ) -> Option<rusqlite::Connection> {
-    match open_readonly(path) {
+    let connection = if descriptor.file == crate::content_identity::LEDGER_DB_FILE {
+        crate::content_identity::open_ledger_connection_at(path)
+    } else {
+        open_readonly(path).map_err(|error| error.to_string())
+    };
+    match connection {
         Ok(connection) => Some(connection),
         Err(error) => {
             state
@@ -749,6 +765,37 @@ where
     let mut report = DeleteReport::default();
     let mut deleted = BTreeMap::<String, usize>::new();
     let mut protected = BTreeMap::<String, usize>::new();
+    // One cleanup request can delete from several stores. Keep a prepare from
+    // accepting an intermediate mixture between descriptor transactions.
+    let page_edit_write = scan
+        .candidates
+        .iter()
+        .filter_map(|candidate| STORES.get(candidate.descriptor_index))
+        .any(|descriptor| {
+            matches!(
+                descriptor.file,
+                "adjustment.db"
+                    | "mask.db"
+                    | "conceal.db"
+                    | "local_adjust.db"
+                    | "comic.db"
+                    | "export_crop.db"
+                    | "view_trim.db"
+            )
+        })
+        .then(|| crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin());
+    let rating_write = scan
+        .candidates
+        .iter()
+        .filter_map(|candidate| STORES.get(candidate.descriptor_index))
+        .any(|descriptor| descriptor.file == "rating.db")
+        .then(|| crate::rating_db::RATING_WRITES.begin());
+    let tag_write = scan
+        .candidates
+        .iter()
+        .filter_map(|candidate| STORES.get(candidate.descriptor_index))
+        .any(|descriptor| descriptor.file == "tags.db")
+        .then(|| crate::tags_db::TAG_WRITES.begin());
     for index in 0..STORES.len() {
         let candidates = scan
             .candidates
@@ -781,6 +828,9 @@ where
     }
     report.deleted_by_store = counts_to_vec(deleted);
     report.protected_after_scan = counts_to_vec(protected);
+    drop(rating_write);
+    drop(tag_write);
+    drop(page_edit_write);
     report
 }
 
@@ -800,13 +850,32 @@ fn delete_descriptor<F>(
     F: FnMut(),
 {
     let path = data_dir.join(descriptor.file);
-    let mut connection = match open_for_write(&path) {
+    let connection = if descriptor.file == crate::content_identity::LEDGER_DB_FILE {
+        crate::content_identity::open_ledger_connection_at(&path)
+    } else {
+        open_for_write(&path).map_err(|error| error.to_string())
+    };
+    let mut connection = match connection {
         Ok(connection) => connection,
         Err(error) => {
             report.errors.push(format!("{}: {error}", descriptor.file));
             return;
         }
     };
+    let _rating_write =
+        (descriptor.file == "rating.db").then(|| crate::rating_db::RATING_WRITES.begin());
+    let _tag_write = (descriptor.file == "tags.db").then(|| crate::tags_db::TAG_WRITES.begin());
+    let _page_edit_write = matches!(
+        descriptor.file,
+        "adjustment.db"
+            | "mask.db"
+            | "conceal.db"
+            | "local_adjust.db"
+            | "comic.db"
+            | "export_crop.db"
+            | "view_trim.db"
+    )
+    .then(|| crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin());
     let transaction =
         match connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
             Ok(transaction) => transaction,
@@ -1280,9 +1349,67 @@ mod tests {
         let report = retry_delete_purge_journal_at(&data_dir);
         assert_eq!(report.attempted, 1);
         assert_eq!(report.purged, 1);
+        assert_eq!(report.removed_paths, vec![removed.clone()]);
         assert_eq!(report.remaining, 0);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(rating.get(&key), 0);
         assert!(!data_dir.join(DELETE_PURGE_JOURNAL_FILE).exists());
+    }
+
+    #[test]
+    fn restored_delete_purge_journal_conservatively_covers_epub_descendants() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let files = temp.path().join("files");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&files).unwrap();
+        let removed_file = files.join("gone.png");
+        let db = crate::content_identity::open_ledger_connection_at(
+            &data_dir.join("content_identity.db"),
+        )
+        .unwrap();
+        drop(db);
+        assert!(journal_failed_delete_purge(
+            &data_dir,
+            std::slice::from_ref(&removed_file),
+            &[],
+        ));
+        assert_eq!(
+            load_delete_purge_journal_unlocked(&data_dir).unwrap().len(),
+            1
+        );
+
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let covered_book = removed_file.join("child.epub");
+        let holder = std::thread::spawn(move || {
+            crate::pdf_loader::with_epub_pin_guard(&covered_book, || {
+                ready_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        ready_rx.recv().unwrap();
+        let retry_data = data_dir.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let retry = std::thread::spawn(move || {
+            done_tx
+                .send(retry_delete_purge_journal_at(&retry_data))
+                .unwrap();
+        });
+        let early_report = done_rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .ok();
+        release_tx.send(()).unwrap();
+        let finished_early = early_report.is_some();
+        let report = early_report.unwrap_or_else(|| {
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+        });
+        holder.join().unwrap();
+        retry.join().unwrap();
+        assert!(!finished_early, "unknown restored scope must wait as Tree");
+        assert_eq!(report.purged, 1);
+        assert_eq!(report.remaining, 0);
     }
 }

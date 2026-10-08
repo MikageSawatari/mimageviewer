@@ -29,15 +29,102 @@ fn primary_mouse_button_physically_down() -> bool {
 /// だけが先に走るという順序の脆さを避ける (Codex P3)。
 #[derive(Debug)]
 pub(crate) enum ContextMenuAction {
-    /// 検索結果 (Ctrl+G / Ctrl+S) から実フォルダへ着地。検索を明示終了し、検索前フォルダを
-    /// 履歴に積んで `suppress_folder_nav_record_once` を立てる遷移。実適用は
-    /// `apply_jump_from_search_to`。
-    JumpFromSearch(PathBuf),
+    /// 検索結果・閲覧履歴・コレクション root から実フォルダへ着地する。
+    /// source、destination、移動後の exact selection を一つの request に保持し、
+    /// 優先度判定でこの action が勝った後だけ適用する。
+    JumpToFolder(JumpToFolderRequest),
     /// ZIP/PDF/対応アーカイブを、グローバル設定ではなく明示モードで開く。
     OpenGridContainer {
         idx: usize,
         mode: crate::app::GridContainerOpenMode,
     },
+}
+
+/// 「フォルダに移動」の行先種別。検索集約の ZIP はファイルであり directory scan へ
+/// 渡せないため、物理ディレクトリと archive container を型で分ける。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum JumpToFolderDestination {
+    PhysicalDirectory(PathBuf),
+    ArchiveContainer(PathBuf),
+}
+
+impl JumpToFolderDestination {
+    pub(crate) fn path(&self) -> &Path {
+        match self {
+            Self::PhysicalDirectory(path) | Self::ArchiveContainer(path) => path,
+        }
+    }
+}
+
+/// directory scan と同じ owner が成功 / target 消失 / cancel / error まで保持する選択。
+/// basename hint では同名や大小文字差を一意に扱えないため実パスを正本にする。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum JumpToFolderSelection {
+    None,
+    ExactPath(PathBuf),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JumpToFolderRequest {
+    pub(crate) destination: JumpToFolderDestination,
+    pub(crate) selection: JumpToFolderSelection,
+    /// A collection root keeps its displayed generation until this exact source open commits.
+    pub(crate) origin: Option<crate::app::top_level_grid_view::CollectionGridPhysicalLoadOwner>,
+}
+
+/// The grid menu belongs to one viewer context and one immutable item generation.
+/// An index alone can name another collection entry after an async install.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GridContextMenuOwner {
+    pub(crate) index: usize,
+    pub(crate) context_id: crate::app::ViewerContextId,
+    pub(crate) items_generation: u64,
+}
+
+fn jump_to_folder_request(item: &GridItem) -> Option<JumpToFolderRequest> {
+    use crate::grid_item::SearchContainerKind;
+
+    match item {
+        GridItem::Folder(path) => Some(JumpToFolderRequest {
+            destination: JumpToFolderDestination::PhysicalDirectory(native_nav_path(path)),
+            selection: JumpToFolderSelection::None,
+            origin: None,
+        }),
+        GridItem::SearchContainer { path, kind, .. } => {
+            let destination = match kind {
+                SearchContainerKind::Folder => {
+                    JumpToFolderDestination::PhysicalDirectory(native_nav_path(path))
+                }
+                SearchContainerKind::Zip => {
+                    JumpToFolderDestination::ArchiveContainer(native_nav_path(path))
+                }
+            };
+            Some(JumpToFolderRequest {
+                destination,
+                selection: JumpToFolderSelection::None,
+                origin: None,
+            })
+        }
+        _ => {
+            let exact_path = item.drag_source_path().map(native_nav_path)?;
+            let destination = parent_folder_for_nav(&exact_path)?;
+            Some(JumpToFolderRequest {
+                destination: JumpToFolderDestination::PhysicalDirectory(destination),
+                selection: JumpToFolderSelection::ExactPath(exact_path),
+                origin: None,
+            })
+        }
+    }
+}
+
+fn jump_to_book_folder_request(item: &GridItem) -> Option<JumpToFolderRequest> {
+    let exact_path = item.container_path().map(native_nav_path)?;
+    let destination = parent_folder_for_nav(&exact_path)?;
+    Some(JumpToFolderRequest {
+        destination: JumpToFolderDestination::PhysicalDirectory(destination),
+        selection: JumpToFolderSelection::ExactPath(exact_path),
+        origin: None,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -312,11 +399,24 @@ struct NativeGridContextMenuTarget {
     is_folder_context: bool,
     has_checked: bool,
     checked_count: usize,
-    external_tool_targets: Vec<crate::external_tool::LaunchTarget>,
+    external_tool_descriptor: crate::external_tool::ExternalTargetDescriptor,
     surface: ContextMenuSurface,
     explorer_folder: Option<PathBuf>,
     folder_command_target: Option<PathBuf>,
+    collection_root_delete: crate::app::collection_grid::CollectionRootDeleteResolution,
 }
+
+#[derive(Debug)]
+enum CollectionJumpRequestResolution {
+    Ready(JumpToFolderRequest),
+    NoParent,
+    Unavailable(String),
+}
+
+const COLLECTION_JUMP_STALE_MESSAGE: &str =
+    "コレクション一覧が更新されたため、もう一度選択してください";
+const COLLECTION_JUMP_NO_PARENT_MESSAGE: &str =
+    "ドライブまたは共有ルートには親フォルダがありません";
 
 impl NativeGridContextMenuTarget {
     fn is_fullscreen_video(&self) -> bool {
@@ -335,6 +435,19 @@ fn native_grid_context_menu_target_kind(target: &NativeGridContextMenuTarget) ->
         "virtual_item"
     } else {
         "item_path"
+    }
+}
+
+fn native_grid_shell_menu_placement(
+    target: &NativeGridContextMenuTarget,
+    show_windows_context_menu_inline: bool,
+) -> ShellMenuPlacement {
+    if target.collection_root_delete.is_collection_root() {
+        ShellMenuPlacement::CollectionSourceSubmenu
+    } else if show_windows_context_menu_inline {
+        ShellMenuPlacement::Inline
+    } else {
+        ShellMenuPlacement::Submenu
     }
 }
 
@@ -373,7 +486,9 @@ fn render_egui_menu_nodes(ui: &mut egui::Ui, nodes: &[MenuNode]) -> Option<MenuC
                     break;
                 }
             }
-            MenuNode::Submenu { label, children } => {
+            MenuNode::Submenu {
+                label, children, ..
+            } => {
                 egui::CollapsingHeader::new(label).show(ui, |ui| {
                     if selected.is_none() {
                         selected = render_egui_menu_nodes(ui, children);
@@ -463,7 +578,7 @@ fn build_delete_confirm_label(
     label
 }
 
-fn native_path_text(path: &Path) -> String {
+pub(crate) fn native_path_text(path: &Path) -> String {
     let text = path.to_string_lossy().to_string();
     #[cfg(windows)]
     {
@@ -492,7 +607,8 @@ fn context_item_path_text(item: &GridItem) -> String {
         | GridItem::Stack {
             representative: path,
             ..
-        } => native_path_text(path),
+        }
+        | GridItem::CollectionPlaceholder { path, .. } => native_path_text(path),
         GridItem::ZipImage {
             zip_path,
             entry_name,
@@ -671,6 +787,20 @@ fn windows_path_root_for_file_operation(path: &Path) -> Option<String> {
 }
 
 impl crate::app::App {
+    pub(crate) fn capture_grid_context_menu_owner(&self, index: usize) -> GridContextMenuOwner {
+        GridContextMenuOwner {
+            index,
+            context_id: self.collection_grid_context_id(),
+            items_generation: self.items_generation,
+        }
+    }
+
+    pub(crate) fn grid_context_menu_owner_is_current(&self, owner: GridContextMenuOwner) -> bool {
+        (owner.index == usize::MAX || self.grid_item_input_allowed())
+            && owner.context_id == self.collection_grid_context_id()
+            && owner.items_generation == self.items_generation
+    }
+
     fn show_bookmark_grid_context_menu(
         &mut self,
         ctx: &egui::Context,
@@ -766,7 +896,11 @@ impl crate::app::App {
     /// コンテキストメニューを表示する。
     pub(crate) fn show_context_menu(&mut self, ctx: &egui::Context) -> Option<ContextMenuAction> {
         let idx = match self.context_menu_idx {
-            Some(i) => i,
+            Some(owner) if self.grid_context_menu_owner_is_current(owner) => owner.index,
+            Some(_) => {
+                self.context_menu_idx = None;
+                return None;
+            }
             None => return None,
         };
 
@@ -917,6 +1051,7 @@ impl crate::app::App {
             } => format!("{}:Page {}", native_path_text(&pdf_path), page_num + 1),
             // ファイル名スタック: 代表画像の実パスをコピー。
             GridItem::Stack { representative, .. } => native_path_text(&representative),
+            GridItem::CollectionPlaceholder { path, .. } => native_path_text(&path),
         };
         ctx.copy_text(text);
         true
@@ -945,14 +1080,25 @@ impl crate::app::App {
         let rotation = self.get_rotation(idx);
         match item {
             GridItem::Image(path) => {
-                copy_image_to_clipboard(&path, rotation);
+                copy_image_to_clipboard(
+                    &path,
+                    rotation,
+                    self.raw_develop_executor.clone(),
+                    self.settings.raw_brightness,
+                );
                 true
             }
             GridItem::ZipImage {
                 zip_path,
                 entry_name,
             } => {
-                copy_zip_image_to_clipboard(&zip_path, &entry_name, rotation);
+                copy_zip_image_to_clipboard(
+                    &zip_path,
+                    &entry_name,
+                    rotation,
+                    self.raw_develop_executor.clone(),
+                    self.settings.raw_brightness,
+                );
                 true
             }
             _ => false,
@@ -977,6 +1123,7 @@ impl crate::app::App {
             GridItem::PdfPage { pdf_path, .. } => pdf_path,
             // ファイル名スタック: 代表画像を含むフォルダを開く。
             GridItem::Stack { representative, .. } => representative,
+            GridItem::CollectionPlaceholder { .. } => return false,
         };
         open_folder_in_explorer(&path);
         true
@@ -1060,11 +1207,10 @@ impl crate::app::App {
                 shell_paths
             },
             miv_items,
-            shell_menu_placement: if self.settings.show_windows_context_menu_inline {
-                ShellMenuPlacement::Inline
-            } else {
-                ShellMenuPlacement::Submenu
-            },
+            shell_menu_placement: native_grid_shell_menu_placement(
+                &target,
+                self.settings.show_windows_context_menu_inline,
+            ),
         };
         let native_result = crate::native_context_menu::show_native_context_menu(request);
         Self::resync_egui_modifiers_from_os(ctx);
@@ -1157,18 +1303,10 @@ impl crate::app::App {
                 .map(|path| vec![(idx, path.to_path_buf())])
                 .unwrap_or_default()
         };
-        let external_tool_targets = if is_folder_context {
-            // 背景は checked 項目ではなく、現在開いているフォルダー / 本そのものを渡す。
-            // effective_folder を所有する共通 helper 経由なので、変換 cache の ZIP ではなく
-            // ユーザー視点の元アーカイブになり、合成一覧の stale origin は拒否される。
-            self.external_tool_container_targets()
+        let external_tool_descriptor = if is_folder_context {
+            self.external_tool_container_descriptor()
         } else if surface == ContextMenuSurface::Grid && item.container_path().is_some() {
-            // コンテナー項目の右クリックは「項目集合を開く」ではなく「このコンテナーを開く」
-            // 専用入口。既存の平坦なツール列は保ち、対象だけ Container の 1 件へ切り替える。
-            crate::external_tool::resolve_external_targets(
-                &self.items,
-                self.current_grid_order(),
-                &self.checked,
+            self.external_tool_target_descriptor(
                 crate::external_tool::ExternalTargetSource::Container {
                     path: item.container_path().map(Path::to_path_buf),
                 },
@@ -1182,13 +1320,10 @@ impl crate::app::App {
                     crate::external_tool::ExternalTargetSource::Viewer { current: Some(idx) }
                 }
             };
-            crate::external_tool::resolve_external_targets(
-                &self.items,
-                self.current_grid_order(),
-                &self.checked,
-                source,
-            )
+            self.external_tool_context_menu_descriptor(source)
         };
+        let collection_root_delete = self
+            .collection_root_delete_resolution((!is_folder_context).then_some(idx), has_checked);
         NativeGridContextMenuTarget {
             shell_paths,
             real_paths,
@@ -1199,10 +1334,11 @@ impl crate::app::App {
             is_folder_context,
             has_checked,
             checked_count: if has_checked { self.checked.len() } else { 0 },
-            external_tool_targets,
+            external_tool_descriptor,
             surface,
             explorer_folder,
             folder_command_target,
+            collection_root_delete,
         }
     }
 
@@ -1213,9 +1349,7 @@ impl crate::app::App {
     ) -> Vec<MenuNode> {
         let external_items = crate::external_tool::external_tool_menu_items(
             &self.settings.external_tools,
-            crate::external_tool::ExternalToolMenuTarget::from_launch_targets(
-                &target.external_tool_targets,
-            ),
+            target.external_tool_descriptor.capability,
         );
         let labels: Vec<_> = external_items
             .iter()
@@ -1250,11 +1384,32 @@ impl crate::app::App {
             surface: target.surface,
             is_folder_context: target.is_folder_context,
             has_checked: target.has_checked,
+            has_epub_target: if target.has_checked {
+                self.selection_target_indices(crate::app::ActionSurface::MainWindow)
+                    .into_iter()
+                    .any(|index| matches!(self.items.get(index), Some(crate::grid_item::GridItem::PdfFile(path)) if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))))
+            } else {
+                matches!(&target.item, crate::grid_item::GridItem::PdfFile(path) if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("epub")))
+            },
             checked_count: target.checked_count,
             checked_file_operation_selection: target.checked_file_operation_selection,
             can_use_folder_commands: target.folder_command_target.is_some(),
             can_paste_edit_bundle: self.has_page_edit_bundle_clipboard(),
             has_explorer_folder: target.explorer_folder.is_some(),
+            collection_reference: match &target.collection_root_delete {
+                crate::app::collection_grid::CollectionRootDeleteResolution::Ready(_) => {
+                    crate::context_menu_model::CollectionReferenceAvailability::Ready
+                }
+                crate::app::collection_grid::CollectionRootDeleteResolution::Unavailable(
+                    reason,
+                ) => crate::context_menu_model::CollectionReferenceAvailability::Unavailable(
+                    (*reason).to_owned(),
+                ),
+                crate::app::collection_grid::CollectionRootDeleteResolution::NotCollectionRoot => {
+                    crate::context_menu_model::CollectionReferenceAvailability::NotCollectionRoot
+                }
+            },
+            collection_jump: self.collection_jump_action_state(target),
             view,
             pin: self.context_menu_pin_state(target, view),
             external_tools,
@@ -1282,11 +1437,18 @@ impl crate::app::App {
                 crate::context_menu_model::ContextMenuShortcutLabels {
                     cut: cut.and_then(|action| self.keymap.first_chord_label(action)),
                     copy: copy.and_then(|action| self.keymap.first_chord_label(action)),
+                    organize: (target.surface == ContextMenuSurface::Grid)
+                        .then(|| {
+                            self.keymap
+                                .first_chord_label(crate::keymap::KeyAction::GridOrganizeFiles)
+                        })
+                        .flatten(),
                     rotate_left: self.keymap.first_chord_label(rotate_ccw),
                     rotate_right: self.keymap.first_chord_label(rotate_cw),
                     deselect: deselect.and_then(|action| self.keymap.first_chord_label(action)),
                 }
             },
+            layout: self.settings.context_menu_layout.clone(),
         };
         crate::context_menu_model::build_context_menu(&input)
     }
@@ -1414,7 +1576,23 @@ impl crate::app::App {
             crate::native_context_menu::ShellClipboardVerb,
         ),
     {
+        if !self.grid_item_input_allowed()
+            && !(target.is_folder_context
+                && matches!(
+                    &command,
+                    MenuCommand::NewFolder
+                        | MenuCommand::Paste
+                        | MenuCommand::OpenFolderInExplorer
+                        | MenuCommand::OpenExternalToolSettings
+                ))
+        {
+            return None;
+        }
         match command {
+            MenuCommand::ConvertEpubToPdf => {
+                self.start_batch_convert_to_pdf_at(target.item_index);
+                None
+            }
             MenuCommand::NewFolder => {
                 if target.is_folder_context
                     && let Some(folder) = target.folder_command_target.clone()
@@ -1449,7 +1627,15 @@ impl crate::app::App {
                 if !target.is_folder_context
                     && let Some(path) = target.item.drag_source_path().map(Path::to_path_buf)
                 {
-                    self.request_rename_dialog(path);
+                    let target_is_file =
+                        !matches!(&target.item, crate::grid_item::GridItem::Folder(_));
+                    self.request_rename_dialog(path, target_is_file);
+                }
+                None
+            }
+            MenuCommand::OrganizeFiles => {
+                if target.surface == ContextMenuSurface::Grid && !target.is_folder_context {
+                    self.request_file_organize_dialog(target.item_index);
                 }
                 None
             }
@@ -1504,11 +1690,22 @@ impl crate::app::App {
                 if let Some(idx) = target.item_index {
                     let rotation = self.get_rotation(idx);
                     match &target.item {
-                        GridItem::Image(path) => copy_image_to_clipboard(path, rotation),
+                        GridItem::Image(path) => copy_image_to_clipboard(
+                            path,
+                            rotation,
+                            self.raw_develop_executor.clone(),
+                            self.settings.raw_brightness,
+                        ),
                         GridItem::ZipImage {
                             zip_path,
                             entry_name,
-                        } => copy_zip_image_to_clipboard(zip_path, entry_name, rotation),
+                        } => copy_zip_image_to_clipboard(
+                            zip_path,
+                            entry_name,
+                            rotation,
+                            self.raw_develop_executor.clone(),
+                            self.settings.raw_brightness,
+                        ),
                         _ => {}
                     }
                 }
@@ -1540,23 +1737,8 @@ impl crate::app::App {
                 }
                 None
             }
-            MenuCommand::JumpToFolder => match &target.item {
-                GridItem::Folder(path) => {
-                    Some(ContextMenuAction::JumpFromSearch(native_nav_path(path)))
-                }
-                GridItem::SearchContainer { path, .. } => {
-                    Some(ContextMenuAction::JumpFromSearch(native_nav_path(path)))
-                }
-                _ => target.item.drag_source_path().and_then(|path| {
-                    parent_folder_for_nav(path).map(ContextMenuAction::JumpFromSearch)
-                }),
-            },
-            MenuCommand::JumpToBookFolder => {
-                self.select_after_load = Some(target.item.name().to_string());
-                target.item.container_path().and_then(|path| {
-                    parent_folder_for_nav(path).map(ContextMenuAction::JumpFromSearch)
-                })
-            }
+            MenuCommand::JumpToFolder => self.dispatch_context_jump_request(target, false),
+            MenuCommand::JumpToBookFolder => self.dispatch_context_jump_request(target, true),
             MenuCommand::OpenContainerAsPage => {
                 target
                     .item_index
@@ -1625,11 +1807,10 @@ impl crate::app::App {
                     self.show_feedback_toast(format!("外部ツールが見つかりません (ID: {})", id.0));
                     return None;
                 };
-                self.queue_external_tool_launch_targets_from_context_menu(
+                self.queue_external_tool_launch_from_context_menu(
                     ctx,
                     &tool,
-                    &target.external_tool_targets,
-                    target.surface == ContextMenuSurface::Fullscreen,
+                    &target.external_tool_descriptor,
                 );
                 None
             }
@@ -1672,6 +1853,12 @@ impl crate::app::App {
                 }
                 None
             }
+            MenuCommand::RemoveFromCollection => {
+                if let Some(request) = target.collection_root_delete.ready_target().cloned() {
+                    self.request_collection_grid_remove(request);
+                }
+                None
+            }
             MenuCommand::Deselect => {
                 self.checked.clear();
                 None
@@ -1685,51 +1872,176 @@ impl crate::app::App {
         }
     }
 
-    /// `ContextMenuAction::JumpFromSearch` の副作用を適用する。検索終了 (Ctrl+G /
-    /// Ctrl+S) と、検索前フォルダを back stack に積んだうえで履歴の二重 push を抑止する。
+    fn dispatch_context_jump_request(
+        &mut self,
+        target: &NativeGridContextMenuTarget,
+        book: bool,
+    ) -> Option<ContextMenuAction> {
+        if target.collection_root_delete.is_collection_root() {
+            return match self.collection_jump_request_resolution(target) {
+                CollectionJumpRequestResolution::Ready(request) => {
+                    Some(ContextMenuAction::JumpToFolder(request))
+                }
+                CollectionJumpRequestResolution::NoParent => {
+                    self.show_feedback_toast(COLLECTION_JUMP_NO_PARENT_MESSAGE.to_owned());
+                    None
+                }
+                CollectionJumpRequestResolution::Unavailable(reason) => {
+                    self.show_feedback_toast(reason);
+                    None
+                }
+            };
+        }
+        self.context_jump_request(target, book)
+            .map(ContextMenuAction::JumpToFolder)
+    }
+
+    fn collection_jump_action_state(
+        &self,
+        target: &NativeGridContextMenuTarget,
+    ) -> Option<ContextMenuActionState> {
+        use crate::app::collection_grid::CollectionRootDeleteResolution;
+        if target.surface != ContextMenuSurface::Grid {
+            return None;
+        }
+        let disabled_reason = match &target.collection_root_delete {
+            CollectionRootDeleteResolution::NotCollectionRoot => return None,
+            CollectionRootDeleteResolution::Unavailable(reason) => Some((*reason).to_owned()),
+            CollectionRootDeleteResolution::Ready(_) => {
+                match self.collection_jump_request_resolution(target) {
+                    CollectionJumpRequestResolution::Ready(_) => None,
+                    CollectionJumpRequestResolution::NoParent => {
+                        Some(COLLECTION_JUMP_NO_PARENT_MESSAGE.to_owned())
+                    }
+                    CollectionJumpRequestResolution::Unavailable(reason) => Some(reason),
+                }
+            }
+        };
+        Some(ContextMenuActionState {
+            label: "元の場所へ移動".to_owned(),
+            enabled: disabled_reason.is_none(),
+            disabled_reason,
+        })
+    }
+
+    fn context_jump_request(
+        &self,
+        target: &NativeGridContextMenuTarget,
+        book: bool,
+    ) -> Option<JumpToFolderRequest> {
+        use crate::app::collection_grid::CollectionRootDeleteResolution;
+        if !matches!(
+            target.collection_root_delete,
+            CollectionRootDeleteResolution::NotCollectionRoot
+        ) {
+            return match self.collection_jump_request_resolution(target) {
+                CollectionJumpRequestResolution::Ready(request) => Some(request),
+                CollectionJumpRequestResolution::NoParent
+                | CollectionJumpRequestResolution::Unavailable(_) => None,
+            };
+        }
+        Some(if book {
+            jump_to_book_folder_request(&target.item)?
+        } else {
+            jump_to_folder_request(&target.item)?
+        })
+    }
+
+    fn collection_jump_request_resolution(
+        &self,
+        target: &NativeGridContextMenuTarget,
+    ) -> CollectionJumpRequestResolution {
+        use crate::app::collection_grid::CollectionRootDeleteResolution;
+        match &target.collection_root_delete {
+            CollectionRootDeleteResolution::Unavailable(reason) => {
+                return CollectionJumpRequestResolution::Unavailable((*reason).to_owned());
+            }
+            CollectionRootDeleteResolution::NotCollectionRoot => {
+                return CollectionJumpRequestResolution::Unavailable(
+                    COLLECTION_JUMP_STALE_MESSAGE.to_owned(),
+                );
+            }
+            CollectionRootDeleteResolution::Ready(_) => {}
+        }
+        let Some(source) = collection_jump_source_path(&target.item).map(native_nav_path) else {
+            return CollectionJumpRequestResolution::Unavailable(
+                COLLECTION_JUMP_STALE_MESSAGE.to_owned(),
+            );
+        };
+        let Some(parent) = parent_folder_for_nav(&source) else {
+            return CollectionJumpRequestResolution::NoParent;
+        };
+        let Some(index) = target.item_index else {
+            return CollectionJumpRequestResolution::Unavailable(
+                COLLECTION_JUMP_STALE_MESSAGE.to_owned(),
+            );
+        };
+        let Some(origin) = self.collection_grid_physical_load_owner(index, &source) else {
+            return CollectionJumpRequestResolution::Unavailable(
+                COLLECTION_JUMP_STALE_MESSAGE.to_owned(),
+            );
+        };
+        if !matches!(
+            &origin.origin,
+            crate::app::top_level_grid_view::CollectionGridPhysicalLoadOrigin::Root { .. }
+        ) || origin.accepted_revision != origin.wanted_revision
+            || !self.collection_grid_physical_load_owner_is_current(&origin, &source)
+        {
+            return CollectionJumpRequestResolution::Unavailable(
+                COLLECTION_JUMP_STALE_MESSAGE.to_owned(),
+            );
+        }
+        CollectionJumpRequestResolution::Ready(JumpToFolderRequest {
+            destination: JumpToFolderDestination::PhysicalDirectory(parent),
+            selection: JumpToFolderSelection::ExactPath(source),
+            origin: Some(origin),
+        })
+    }
+
+    /// `ContextMenuAction::JumpToFolder` の source surface 終了を適用する。検索終了
+    /// (Ctrl+G / Ctrl+S / タグ) と canonical return owner の消費を同じ境界で行い、
+    /// 検索前の実フォルダだけを back stack に積む。
     ///
     /// **呼び出しは context_nav が優先度判定で実際に勝ったあとに限る** (Codex P3): 副作用を
     /// show_context_menu 内で発火すると、同フレームに別 nav 源 (キーボード等) が勝った
     /// ときに、別ナビが意図せず検索終了済み・suppress 立て済みの状態を引き継いでしまう。
-    pub(crate) fn apply_jump_from_search_to(&mut self, target: &Path) {
-        // 検索を抜ける前に、検索開始時の実フォルダ C を捕捉する。検索中は
-        // current_folder がドリルイン先や合成パスを指しうるので、確実に検索前の
-        // 実フォルダを保持している saved_folder から取る。
-        let pre_search_folder = if self.global_search.active {
-            self.global_search.saved_folder.clone()
-        } else if self.favsearch.active {
-            self.favsearch.saved_folder.clone()
-        } else if self.tag_view.active {
-            self.tag_view.saved_folder.clone()
-        } else {
-            None
-        };
-        // saved_folder の復帰で旧フォルダへ無駄なロードが走らないよう、先に
-        // saved_folder を捨てる (toolbar_fav_nav と同じ手順)。
+    pub(crate) fn dismiss_source_for_jump_to_folder(&mut self, request: &JumpToFolderRequest) {
+        // `dismiss_*_without_restore` が canonical `return_to` を consume する。ここで
+        // `close_*` / `restore_view_return_context` を呼ぶと origin load と destination
+        // load が競合するため、戻り先は履歴用途にだけ使う。
+        let mut return_context = None;
         if self.global_search.active {
-            self.global_search.saved_folder = None;
-            self.close_global_search();
+            return_context = Some(self.dismiss_global_search_without_restore());
         }
         if self.favsearch.active {
-            self.favsearch.saved_folder = None;
-            self.close_favsearch();
+            let dismissed = self.dismiss_favsearch_without_restore();
+            return_context.get_or_insert(dismissed);
         }
         if self.tag_view.active {
-            self.tag_view.saved_folder = None;
-            self.close_tag_view();
+            let dismissed = self.dismiss_tag_view_without_restore();
+            return_context.get_or_insert(dismissed);
         }
-        // 「フォルダに移動」は検索を明示終了して実フォルダへ着地する正当な
-        // ナビゲーションなので「検索前フォルダ C → 移動先 X」を履歴に残す。
-        // X で ← を押すと検索前の C に戻れる。C == X のときは無意味なので積まない。
-        if let Some(c) = pre_search_folder {
-            if !crate::folder_tree::path_eq(&c, target) {
+
+        // active flag が stale でも typed surface が Search なら canonical owner を
+        // consume する。閲覧履歴の JumpToBookFolder には return owner がない。
+        if return_context.is_none()
+            && matches!(
+                self.top_level_grid_view.surface(),
+                crate::app::top_level_grid_view::TopLevelGridSurface::Search(_)
+            )
+        {
+            return_context = self.top_level_grid_view.take_return_to();
+        }
+
+        // synthetic origin を実フォルダ履歴へ平坦化しない。物理 Folder origin だけが
+        // 「移動先で戻る」を構成できる。
+        if let Some(crate::app::top_level_grid_view::TopLevelGridRestore::Folder(c)) =
+            return_context
+        {
+            if !crate::folder_tree::path_eq(&c, request.destination.path()) {
                 self.push_nav_history_entry(c);
             }
         }
-        // 直後に呼び出し元が行う load_folder(X) では back_stack への二重 push を
-        // 避ける (移動元 C は上で明示的に積み済み。X の recent 追加は
-        // record_folder_nav_transition 側で行われる)。
-        self.set_active_folder_nav_suppress_record_once(true);
     }
 
     /// フルスクリーン表示中のコンテキストメニューを表示する。
@@ -1985,6 +2297,7 @@ impl crate::app::App {
         if self.viewer_session_blocks_main_window()
             || self.address_has_focus
             || self.any_dialog_open()
+            || !self.grid_item_input_allowed()
         {
             return;
         }
@@ -1998,6 +2311,18 @@ impl crate::app::App {
         if self.items_are_bookmark_view {
             self.delete_selected_bookmarks();
             return;
+        }
+
+        match self.collection_root_delete_resolution(self.selected, !self.checked.is_empty()) {
+            crate::app::collection_grid::CollectionRootDeleteResolution::Ready(request) => {
+                self.request_collection_grid_remove(request);
+                return;
+            }
+            crate::app::collection_grid::CollectionRootDeleteResolution::Unavailable(reason) => {
+                self.show_feedback_toast(reason.to_string());
+                return;
+            }
+            crate::app::collection_grid::CollectionRootDeleteResolution::NotCollectionRoot => {}
         }
 
         if !self.checked.is_empty() {
@@ -2056,6 +2381,14 @@ fn clipboard_seq_is_latest(my_seq: u64) -> bool {
     CLIPBOARD_SEQ.load(std::sync::atomic::Ordering::Relaxed) == my_seq
 }
 
+fn decode_clipboard_raw(
+    source: crate::raw::RawOwnedSource,
+    executor: &crate::raw::RawDevelopExecutor,
+    brightness: crate::raw::RawBrightness,
+) -> Result<image::DynamicImage, crate::raw::RawError> {
+    crate::raw::develop_full_on_worker(executor, source, brightness, None)
+}
+
 /// Path を PowerShell の単一引用符文字列リテラル (`'...'`、内部の `'` を `''` へ
 /// エスケープ) に変換する。外部 D&D 受け取りのスクリプト生成で使う。
 #[cfg(windows)]
@@ -2071,34 +2404,57 @@ fn ps_quote(path: &std::path::Path) -> String {
 /// 数百ms〜秒単位かかるため、UI スレッドから同期実行すると右クリック操作で固まる。
 /// 発行時に `CLIPBOARD_SEQ` を bump し、set 直前に最新 seq と比較、自分が古ければ
 /// set をスキップする — 遅い A が速い B を追い越して上書きするのを防ぐ。
-fn copy_image_to_clipboard(path: &std::path::Path, rotation: crate::rotation_db::Rotation) {
+fn copy_image_to_clipboard(
+    path: &std::path::Path,
+    rotation: crate::rotation_db::Rotation,
+    raw_executor: std::sync::Arc<crate::raw::RawDevelopExecutor>,
+    raw_brightness: crate::raw::RawBrightness,
+) {
     let path = path.to_path_buf();
     let my_seq = bump_clipboard_seq();
     std::thread::Builder::new()
         .name("clipboard-image-copy".into())
         .spawn(move || {
-            let img = match image::open(&path) {
-                Ok(i) => i,
-                Err(_) => {
-                    #[cfg(windows)]
-                    {
-                        match crate::wic_decoder::decode_to_dynamic_image(&path)
-                            .or_else(|| crate::susie_loader::decode_file(&path, true, None).ok())
-                        {
-                            Some(i) => i,
-                            None => return,
-                        }
+            let img = if crate::raw_format::is_raw_path(&path) {
+                match decode_clipboard_raw(
+                    crate::raw::RawOwnedSource::Path(path.clone()),
+                    &raw_executor,
+                    raw_brightness,
+                ) {
+                    Ok(image) => image,
+                    Err(error) => {
+                        crate::logger::log(format!("RAW clipboard decode failed: {error}"));
+                        return;
                     }
-                    #[cfg(not(windows))]
-                    {
-                        match crate::susie_loader::decode_file(&path, true, None) {
-                            Ok(i) => i,
-                            Err(_) => return,
+                }
+            } else {
+                match image::open(&path) {
+                    Ok(i) => i,
+                    Err(_) => {
+                        #[cfg(windows)]
+                        {
+                            match crate::wic_decoder::decode_to_dynamic_image(&path).or_else(|| {
+                                crate::susie_loader::decode_file(&path, true, None).ok()
+                            }) {
+                                Some(i) => i,
+                                None => return,
+                            }
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            match crate::susie_loader::decode_file(&path, true, None) {
+                                Ok(i) => i,
+                                Err(_) => return,
+                            }
                         }
                     }
                 }
             };
-            let img = crate::thumb_loader::apply_exif_orientation(img, &path);
+            let img = if crate::raw_format::is_raw_path(&path) {
+                img
+            } else {
+                crate::thumb_loader::apply_exif_orientation(img, &path)
+            };
             let img = crate::capture::rotate_dynamic_image(img, rotation);
             // ここの pre-check は DIB 構築を省くだけの best-effort 短絡。
             // 正式な stale 判定は `set_image_to_clipboard` 内部で
@@ -2118,6 +2474,8 @@ fn copy_zip_image_to_clipboard(
     zip_path: &std::path::Path,
     entry_name: &str,
     rotation: crate::rotation_db::Rotation,
+    raw_executor: std::sync::Arc<crate::raw::RawDevelopExecutor>,
+    raw_brightness: crate::raw::RawBrightness,
 ) {
     let zip_path = zip_path.to_path_buf();
     let entry_name = entry_name.to_string();
@@ -2128,16 +2486,42 @@ fn copy_zip_image_to_clipboard(
             let Ok(bytes) = crate::zip_loader::read_entry_bytes(&zip_path, &entry_name) else {
                 return;
             };
-            let Some(img) = image::load_from_memory(&bytes)
-                .ok()
-                .or_else(|| crate::wic_decoder::decode_to_dynamic_image_from_bytes(&bytes))
-                .or_else(|| {
-                    crate::susie_loader::decode_bytes(&entry_name, &bytes, true, None).ok()
-                })
-            else {
-                return;
+            let raw = std::path::Path::new(&entry_name)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(crate::raw_format::is_raw_ext);
+            let img = if raw {
+                match decode_clipboard_raw(
+                    crate::raw::RawOwnedSource::Bytes(bytes.clone().into()),
+                    &raw_executor,
+                    raw_brightness,
+                ) {
+                    Ok(image) => image,
+                    Err(error) => {
+                        crate::logger::log(format!("ZIP RAW clipboard decode failed: {error}"));
+                        return;
+                    }
+                }
+            } else {
+                let Some(img) = image::load_from_memory(&bytes)
+                    .ok()
+                    .or_else(|| {
+                        crate::wic_decoder::decode_to_dynamic_image_from_bytes(
+                            &bytes,
+                            std::path::Path::new(&entry_name)
+                                .extension()
+                                .and_then(|ext| ext.to_str())
+                                .unwrap_or(""),
+                        )
+                    })
+                    .or_else(|| {
+                        crate::susie_loader::decode_bytes(&entry_name, &bytes, true, None).ok()
+                    })
+                else {
+                    return;
+                };
+                crate::thumb_loader::apply_exif_orientation_from_bytes(img, &bytes)
             };
-            let img = crate::thumb_loader::apply_exif_orientation_from_bytes(img, &bytes);
             let img = crate::capture::rotate_dynamic_image(img, rotation);
             // pre-check は best-effort 短絡 (DIB 構築省略)。正式な stale 判定は
             // `set_image_to_clipboard` 側の mutex 内で行う。
@@ -2196,13 +2580,6 @@ fn set_image_to_clipboard(img: &image::DynamicImage, my_seq: u64) {
 fn set_rgba_to_clipboard(width: u32, height: u32, rgba: &[u8], my_seq: u64) {
     #[cfg(windows)]
     {
-        use windows::Win32::Foundation::HANDLE;
-        use windows::Win32::System::DataExchange::{
-            CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
-        };
-        use windows::Win32::System::Memory::{
-            GLOBAL_ALLOC_FLAGS, GlobalAlloc, GlobalLock, GlobalUnlock,
-        };
         use windows::Win32::System::Ole::CF_DIB;
 
         let row_size = (width * 3 + 3) & !3;
@@ -2233,30 +2610,232 @@ fn set_rgba_to_clipboard(width: u32, height: u32, rgba: &[u8], my_seq: u64) {
         let Ok(_lock) = CLIPBOARD_WRITE_MUTEX.lock() else {
             return;
         };
-        if !clipboard_seq_is_latest(my_seq) {
-            return;
-        }
-
-        unsafe {
-            let hmem = GlobalAlloc(GLOBAL_ALLOC_FLAGS(0x0042), total_size);
-            let Ok(hmem) = hmem else { return };
-            let ptr = GlobalLock(hmem);
-            if ptr.is_null() {
-                return;
-            }
-            std::ptr::copy_nonoverlapping(buf.as_ptr(), ptr as *mut u8, total_size);
-            let _ = GlobalUnlock(hmem);
-
-            if OpenClipboard(None).is_ok() {
-                let _ = EmptyClipboard();
-                let _ = SetClipboardData(CF_DIB.0 as u32, Some(HANDLE(hmem.0)));
-                let _ = CloseClipboard();
-            }
-        }
+        write_image_clipboard_if_latest(
+            &mut NativeClipboardImageApi,
+            &buf,
+            CF_DIB.0 as u32,
+            crate::clipboard_capture::data::process_nonce(),
+            || clipboard_seq_is_latest(my_seq),
+        );
     }
     #[cfg(not(windows))]
     {
         let _ = (width, height, rgba, my_seq);
+    }
+}
+
+/// Only the native calls are injected: the production writer and tests share
+/// every branch that retains or transfers ownership of a clipboard allocation.
+#[cfg(any(windows, test))]
+trait ClipboardImageApi {
+    type Memory: Copy;
+    type Error: std::fmt::Display;
+
+    fn allocate(&mut self, size: usize) -> Result<Self::Memory, Self::Error>;
+    fn lock_and_copy(&mut self, memory: Self::Memory, bytes: &[u8]) -> Result<(), Self::Error>;
+    fn unlock(&mut self, memory: Self::Memory) -> Result<(), Self::Error>;
+    fn free(&mut self, memory: Self::Memory) -> Result<(), Self::Error>;
+    fn open(&mut self) -> Result<(), Self::Error>;
+    fn empty(&mut self) -> Result<(), Self::Error>;
+    fn set_data(&mut self, format: u32, memory: Self::Memory) -> Result<(), Self::Error>;
+    fn register_origin(&mut self) -> Result<u32, Self::Error>;
+    fn close(&mut self) -> Result<(), Self::Error>;
+    fn log(&mut self, message: String);
+}
+
+#[cfg(any(windows, test))]
+fn free_clipboard_memory<A: ClipboardImageApi>(api: &mut A, memory: A::Memory, role: &str) {
+    if let Err(error) = api.free(memory) {
+        api.log(format!("Clipboard {role} free failed: {error}"));
+    }
+}
+
+#[cfg(any(windows, test))]
+fn prepare_clipboard_memory<A: ClipboardImageApi>(
+    api: &mut A,
+    bytes: &[u8],
+    role: &str,
+) -> Option<A::Memory> {
+    let memory = match api.allocate(bytes.len()) {
+        Ok(memory) => memory,
+        Err(error) => {
+            api.log(format!("Clipboard {role} allocation failed: {error}"));
+            return None;
+        }
+    };
+    if let Err(error) = api.lock_and_copy(memory, bytes) {
+        api.log(format!("Clipboard {role} lock failed: {error}"));
+        free_clipboard_memory(api, memory, role);
+        return None;
+    }
+    if let Err(error) = api.unlock(memory) {
+        api.log(format!("Clipboard {role} unlock failed: {error}"));
+    }
+    Some(memory)
+}
+
+/// The caller holds CLIPBOARD_WRITE_MUTEX, including the final generation
+/// check. Once SetClipboardData succeeds, that allocation is system-owned.
+#[cfg(any(windows, test))]
+fn write_image_clipboard_if_latest<A: ClipboardImageApi>(
+    api: &mut A,
+    dib: &[u8],
+    dib_format: u32,
+    nonce: &[u8],
+    is_latest: impl FnOnce() -> bool,
+) -> bool {
+    if !is_latest() {
+        return false;
+    }
+    let Some(image) = prepare_clipboard_memory(api, dib, "image") else {
+        return false;
+    };
+    if let Err(error) = api.open() {
+        api.log(format!("OpenClipboard for image failed: {error}"));
+        free_clipboard_memory(api, image, "image");
+        return false;
+    }
+    let copied = match api.empty() {
+        Err(error) => {
+            api.log(format!("EmptyClipboard for image failed: {error}"));
+            free_clipboard_memory(api, image, "image");
+            false
+        }
+        Ok(()) => match api.set_data(dib_format, image) {
+            Err(error) => {
+                api.log(format!("SetClipboardData for image failed: {error}"));
+                free_clipboard_memory(api, image, "image");
+                false
+            }
+            Ok(()) => {
+                // Marker failures must never undo or prevent the saved CF_DIB.
+                match api.register_origin() {
+                    Err(error) => api.log(format!(
+                        "Clipboard image origin format registration failed: {error}"
+                    )),
+                    Ok(format) => {
+                        if let Some(marker) = prepare_clipboard_memory(api, nonce, "image origin") {
+                            if let Err(error) = api.set_data(format, marker) {
+                                api.log(format!(
+                                    "SetClipboardData for image origin failed: {error}"
+                                ));
+                                free_clipboard_memory(api, marker, "image origin");
+                            }
+                        }
+                    }
+                }
+                true
+            }
+        },
+    };
+    if let Err(error) = api.close() {
+        api.log(format!("CloseClipboard for image failed: {error}"));
+    }
+    copied
+}
+
+// GlobalUnlock returns zero both when the last lock was released and on
+// failure. GetLastError distinguishes those cases; a nonzero return succeeds.
+#[cfg(any(windows, test))]
+fn clipboard_unlock_succeeded(nonzero_return: bool, last_error: u32) -> bool {
+    nonzero_return || last_error == 0
+}
+
+#[cfg(windows)]
+struct NativeClipboardImageApi;
+
+#[cfg(windows)]
+impl ClipboardImageApi for NativeClipboardImageApi {
+    type Memory = windows::Win32::Foundation::HGLOBAL;
+    type Error = windows::core::Error;
+
+    fn allocate(&mut self, size: usize) -> Result<Self::Memory, Self::Error> {
+        use windows::Win32::System::Memory::{GLOBAL_ALLOC_FLAGS, GlobalAlloc};
+        unsafe { GlobalAlloc(GLOBAL_ALLOC_FLAGS(0x0042), size) }
+    }
+
+    fn lock_and_copy(&mut self, memory: Self::Memory, bytes: &[u8]) -> Result<(), Self::Error> {
+        let ptr = unsafe { windows::Win32::System::Memory::GlobalLock(memory) };
+        if ptr.is_null() {
+            return Err(windows::core::Error::from_win32());
+        }
+        // memory was allocated for bytes.len() and is exclusively owned here.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len()) };
+        Ok(())
+    }
+
+    fn unlock(&mut self, memory: Self::Memory) -> Result<(), Self::Error> {
+        use windows::Win32::Foundation::{ERROR_SUCCESS, GetLastError, SetLastError};
+        // The generated windows wrapper treats the documented zero-success
+        // return as an error. Read the native BOOL and last error directly.
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            #[link_name = "GlobalUnlock"]
+            fn native_global_unlock(memory: windows::Win32::Foundation::HGLOBAL) -> i32;
+        }
+        unsafe { SetLastError(ERROR_SUCCESS) };
+        let nonzero = unsafe { native_global_unlock(memory) } != 0;
+        let error = unsafe { GetLastError() };
+        if clipboard_unlock_succeeded(nonzero, error.0) {
+            Ok(())
+        } else {
+            Err(windows::core::Error::from_hresult(error.to_hresult()))
+        }
+    }
+
+    fn free(&mut self, memory: Self::Memory) -> Result<(), Self::Error> {
+        // GlobalFree's null return is success, unlike the generated wrapper's
+        // usual handle-return convention. A nonnull return retains ownership.
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            #[link_name = "GlobalFree"]
+            fn native_global_free(
+                memory: windows::Win32::Foundation::HGLOBAL,
+            ) -> windows::Win32::Foundation::HGLOBAL;
+        }
+        if unsafe { native_global_free(memory) }.0.is_null() {
+            Ok(())
+        } else {
+            Err(windows::core::Error::from_win32())
+        }
+    }
+
+    fn open(&mut self) -> Result<(), Self::Error> {
+        unsafe { windows::Win32::System::DataExchange::OpenClipboard(None) }
+    }
+
+    fn empty(&mut self) -> Result<(), Self::Error> {
+        unsafe { windows::Win32::System::DataExchange::EmptyClipboard() }
+    }
+
+    fn set_data(&mut self, format: u32, memory: Self::Memory) -> Result<(), Self::Error> {
+        use windows::Win32::{Foundation::HANDLE, System::DataExchange::SetClipboardData};
+        unsafe { SetClipboardData(format, Some(HANDLE(memory.0))) }.map(|_| ())
+    }
+
+    fn register_origin(&mut self) -> Result<u32, Self::Error> {
+        let name: Vec<u16> = crate::clipboard_capture::data::ORIGIN_FORMAT_NAME
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let format = unsafe {
+            windows::Win32::System::DataExchange::RegisterClipboardFormatW(windows::core::PCWSTR(
+                name.as_ptr(),
+            ))
+        };
+        if format == 0 {
+            Err(windows::core::Error::from_win32())
+        } else {
+            Ok(format)
+        }
+    }
+
+    fn close(&mut self) -> Result<(), Self::Error> {
+        unsafe { windows::Win32::System::DataExchange::CloseClipboard() }
+    }
+
+    fn log(&mut self, message: String) {
+        crate::logger::log(message);
     }
 }
 
@@ -2484,6 +3063,16 @@ fn parent_folder_for_nav(path: &std::path::Path) -> Option<PathBuf> {
     Some(native_nav_path(path.parent()?))
 }
 
+/// The registered source may be consulted only by the Collection Grid location jump.
+/// Keeping this separate from `GridItem::drag_source_path` prevents a missing placeholder from
+/// becoming eligible for shell, delete, drag, or external-tool operations.
+fn collection_jump_source_path(item: &GridItem) -> Option<&Path> {
+    match item {
+        GridItem::CollectionPlaceholder { path, .. } => Some(path),
+        _ => item.drag_source_path(),
+    }
+}
+
 /// 右クリック対象に対して「このフォルダ」が指す実ディレクトリを返す。
 /// 単一フォルダはそのフォルダ自身、ファイルや仮想ページは元コンテナの親、複数選択と
 /// 背景メニューは現在表示中の実フォルダを使う。検索結果の複数選択のように単一の
@@ -2516,6 +3105,7 @@ fn context_explorer_folder(
         }
         GridItem::PdfPage { pdf_path, .. } => pdf_path.parent().map(Path::to_path_buf),
         GridItem::Stack { representative, .. } => representative.parent().map(Path::to_path_buf),
+        GridItem::CollectionPlaceholder { .. } => None,
     }
 }
 
@@ -2551,8 +3141,99 @@ fn open_folder_in_explorer(path: &std::path::Path) {
 }
 
 #[cfg(test)]
+mod raw_clipboard_tests {
+    use super::*;
+    use image::GenericImageView;
+
+    #[cfg(windows)]
+    #[test]
+    fn raw_clipboard_file_and_zip_bytes_use_full_libraw() {
+        let executor = crate::raw::RawDevelopExecutor::new(1).unwrap();
+        for name in ["1018.cr2", "885.dng"] {
+            let path = std::path::Path::new("vendor/raw-samples").join(name);
+            assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+            let bytes = std::fs::read(&path).unwrap();
+            let info = crate::raw::raw_decoder::info(crate::raw::RawSource::Bytes(&bytes)).unwrap();
+            let source = if name.ends_with(".cr2") {
+                crate::raw::RawOwnedSource::Path(path)
+            } else {
+                crate::raw::RawOwnedSource::Bytes(bytes.into())
+            };
+            let image =
+                decode_clipboard_raw(source, &executor, crate::raw::RawBrightness::None).unwrap();
+            assert_eq!(
+                image.dimensions(),
+                (info.developed_dims[0], info.developed_dims[1])
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod delete_confirm_tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn jump_request_keeps_exact_leaf_and_separates_folder_from_zip_container() {
+        let image = PathBuf::from(r"C:\media\album\image.jpg");
+        assert_eq!(
+            jump_to_folder_request(&GridItem::Image(image.clone())),
+            Some(JumpToFolderRequest {
+                destination: JumpToFolderDestination::PhysicalDirectory(PathBuf::from(
+                    r"C:\media\album"
+                )),
+                selection: JumpToFolderSelection::ExactPath(image),
+                origin: None,
+            })
+        );
+
+        let folder = PathBuf::from(r"C:\media\album");
+        assert_eq!(
+            jump_to_folder_request(&GridItem::SearchContainer {
+                path: folder.clone(),
+                kind: crate::grid_item::SearchContainerKind::Folder,
+                hit_count: 2,
+                representative: None,
+            }),
+            Some(JumpToFolderRequest {
+                destination: JumpToFolderDestination::PhysicalDirectory(folder),
+                selection: JumpToFolderSelection::None,
+                origin: None,
+            })
+        );
+
+        let archive = PathBuf::from(r"C:\media\book.zip");
+        assert_eq!(
+            jump_to_folder_request(&GridItem::SearchContainer {
+                path: archive.clone(),
+                kind: crate::grid_item::SearchContainerKind::Zip,
+                hit_count: 2,
+                representative: None,
+            }),
+            Some(JumpToFolderRequest {
+                destination: JumpToFolderDestination::ArchiveContainer(archive),
+                selection: JumpToFolderSelection::None,
+                origin: None,
+            })
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn jump_to_book_folder_carries_container_path_without_eager_app_hint() {
+        let book = PathBuf::from(r"C:\media\shelf\book.zip");
+        assert_eq!(
+            jump_to_book_folder_request(&GridItem::ZipFile(book.clone())),
+            Some(JumpToFolderRequest {
+                destination: JumpToFolderDestination::PhysicalDirectory(PathBuf::from(
+                    r"C:\media\shelf"
+                )),
+                selection: JumpToFolderSelection::ExactPath(book),
+                origin: None,
+            })
+        );
+    }
 
     /// 拒否文は「なぜ実行されなかったか」と対処を伝えるので、読み切れる表示時間が要る。
     /// 表示時間は文字数から決まる (`feedback_toast_duration`) ので、文言を伸ばしたときに
@@ -2570,11 +3251,14 @@ mod delete_confirm_tests {
         );
     }
 
-    fn target(item: GridItem, surface: ContextMenuSurface) -> NativeGridContextMenuTarget {
+    fn target(
+        app: &crate::app::App,
+        item: GridItem,
+        surface: ContextMenuSurface,
+    ) -> NativeGridContextMenuTarget {
         let path = item.drag_source_path().map(Path::to_path_buf);
-        let external_tool_targets = vec![crate::external_tool::LaunchTarget::from_grid_item(Some(
-            &item,
-        ))];
+        let external_tool_descriptor =
+            crate::external_tool::ExternalTargetDescriptor::for_test_item(app, &item);
         NativeGridContextMenuTarget {
             shell_paths: path.clone().map(|path| vec![path]),
             real_paths: path.into_iter().collect(),
@@ -2585,10 +3269,12 @@ mod delete_confirm_tests {
             is_folder_context: false,
             has_checked: false,
             checked_count: 0,
-            external_tool_targets,
+            external_tool_descriptor,
             surface,
             explorer_folder: Some(PathBuf::from(r"C:\media")),
             folder_command_target: None,
+            collection_root_delete:
+                crate::app::collection_grid::CollectionRootDeleteResolution::NotCollectionRoot,
         }
     }
 
@@ -2606,10 +3292,31 @@ mod delete_confirm_tests {
                 }
             }
         }
-        let target = target(item, surface);
+        let target = target(app, item, surface);
         let mut commands = Vec::new();
         visit(&app.context_menu_nodes(&target, false), &mut commands);
         commands
+    }
+
+    #[test]
+    fn epub_grid_context_routes_pdf_conversion_but_plain_pdf_does_not() {
+        let mut app = crate::app::setup_app_for_test();
+        assert!(
+            menu_commands(
+                &mut app,
+                GridItem::PdfFile(PathBuf::from("C:/books/book.epub")),
+                ContextMenuSurface::Grid,
+            )
+            .contains(&MenuCommand::ConvertEpubToPdf)
+        );
+        assert!(
+            !menu_commands(
+                &mut app,
+                GridItem::PdfFile(PathBuf::from("C:/books/book.pdf")),
+                ContextMenuSurface::Grid,
+            )
+            .contains(&MenuCommand::ConvertEpubToPdf)
+        );
     }
 
     fn menu_labels(nodes: &[MenuNode]) -> Vec<String> {
@@ -2617,7 +3324,9 @@ mod delete_confirm_tests {
             for node in nodes {
                 match node {
                     MenuNode::Item { label, .. } => labels.push(label.clone()),
-                    MenuNode::Submenu { label, children } => {
+                    MenuNode::Submenu {
+                        label, children, ..
+                    } => {
                         labels.push(label.clone());
                         visit(children, labels);
                     }
@@ -2628,6 +3337,132 @@ mod delete_confirm_tests {
         let mut labels = Vec::new();
         visit(nodes, &mut labels);
         labels
+    }
+
+    #[test]
+    fn collection_jump_menu_projects_source_availability_without_disabling_reference_remove() {
+        fn state(nodes: &[MenuNode], wanted: MenuCommand) -> Option<(bool, Option<String>)> {
+            for node in nodes {
+                match node {
+                    MenuNode::Item {
+                        command,
+                        enabled,
+                        disabled_reason,
+                        ..
+                    } if *command == wanted => return Some((*enabled, disabled_reason.clone())),
+                    MenuNode::Submenu { children, .. } => {
+                        if let Some(found) = state(children, wanted.clone()) {
+                            return Some(found);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        let mut app = crate::app::setup_app_for_test();
+        let mut root = target(
+            &app,
+            GridItem::Image(PathBuf::from(r"C:\media\linked.jpg")),
+            ContextMenuSurface::Grid,
+        );
+        root.collection_root_delete =
+            crate::app::collection_grid::CollectionRootDeleteResolution::Ready(
+                crate::app::collection_grid::CollectionGridRemoveTarget {
+                    stamp: crate::app::top_level_grid_view::CollectionGridRequestStamp {
+                        context_id: crate::app::ViewerContextId::for_test(1),
+                        surface_generation: 2,
+                        collection_id: crate::collection_store::CollectionId::new(),
+                    },
+                    expected_revision: 3,
+                    entry_ids: vec![crate::collection_store::CollectionEntryId::new()],
+                },
+            );
+        let nodes = app.context_menu_nodes(&root, false);
+        let jump = state(&nodes, MenuCommand::JumpToFolder).expect("grid location jump");
+        assert!(!jump.0);
+        assert_eq!(jump.1.as_deref(), Some(COLLECTION_JUMP_STALE_MESSAGE));
+        assert_eq!(
+            state(&nodes, MenuCommand::RemoveFromCollection),
+            Some((true, None))
+        );
+        assert!(app.dispatch_context_jump_request(&root, false).is_none());
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|toast| { toast.0.contains("もう一度選択してください") })
+        );
+
+        root.surface = ContextMenuSurface::Fullscreen;
+        let nodes = app.context_menu_nodes(&root, false);
+        assert!(state(&nodes, MenuCommand::JumpToFolder).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn placeholder_location_source_stays_jump_only_and_roots_report_no_parent() {
+        use crate::collection_store::CollectionResolvedKind;
+        use crate::grid_item::CollectionPlaceholderReason;
+
+        let missing = GridItem::CollectionPlaceholder {
+            path: PathBuf::from(r"C:\media\missing.jpg"),
+            last_known_kind: CollectionResolvedKind::Image,
+            reason: CollectionPlaceholderReason::Missing,
+        };
+        assert!(missing.drag_source_path().is_none());
+        assert_eq!(
+            collection_jump_source_path(&missing),
+            Some(Path::new(r"C:\media\missing.jpg"))
+        );
+        let mut app = crate::app::setup_app_for_test();
+        let missing_target = target(&app, missing, ContextMenuSurface::Grid);
+        assert!(missing_target.shell_paths.is_none());
+        assert!(missing_target.real_paths.is_empty());
+        assert!(missing_target.delete_targets.is_empty());
+        assert!(missing_target.item.drag_source_path().is_none());
+
+        for root in [PathBuf::from(r"C:\"), PathBuf::from(r"\\server\share")] {
+            let mut target = target(
+                &app,
+                GridItem::CollectionPlaceholder {
+                    path: root,
+                    last_known_kind: CollectionResolvedKind::Image,
+                    reason: CollectionPlaceholderReason::Missing,
+                },
+                ContextMenuSurface::Grid,
+            );
+            target.collection_root_delete =
+                crate::app::collection_grid::CollectionRootDeleteResolution::Ready(
+                    crate::app::collection_grid::CollectionGridRemoveTarget {
+                        stamp: crate::app::top_level_grid_view::CollectionGridRequestStamp {
+                            context_id: crate::app::ViewerContextId::for_test(1),
+                            surface_generation: 2,
+                            collection_id: crate::collection_store::CollectionId::new(),
+                        },
+                        expected_revision: 3,
+                        entry_ids: vec![crate::collection_store::CollectionEntryId::new()],
+                    },
+                );
+            assert!(matches!(
+                app.collection_jump_request_resolution(&target),
+                CollectionJumpRequestResolution::NoParent
+            ));
+            let state = app
+                .collection_jump_action_state(&target)
+                .expect("collection jump state");
+            assert!(!state.enabled);
+            assert_eq!(
+                state.disabled_reason.as_deref(),
+                Some(COLLECTION_JUMP_NO_PARENT_MESSAGE)
+            );
+            assert!(app.dispatch_context_jump_request(&target, false).is_none());
+            assert!(!app.context_folder_jump_pending());
+            assert!(
+                app.fs_feedback_toast
+                    .as_ref()
+                    .is_some_and(|toast| { toast.0 == COLLECTION_JUMP_NO_PARENT_MESSAGE })
+            );
+        }
     }
 
     #[test]
@@ -2655,6 +3490,7 @@ mod delete_confirm_tests {
         let mut app = crate::app::setup_app_for_test();
         let ctx = egui::Context::default();
         let mut target = target(
+            &app,
             GridItem::Image(PathBuf::from(r"C:\media\clicked.jpg")),
             ContextMenuSurface::Grid,
         );
@@ -2802,6 +3638,7 @@ mod delete_confirm_tests {
     fn file_cut_copy_labels_follow_keymap_overrides_and_unbinding() {
         let mut app = crate::app::setup_app_for_test();
         let target = target(
+            &app,
             GridItem::Image(PathBuf::from(r"C:\media\image.jpg")),
             ContextMenuSurface::Grid,
         );
@@ -2844,7 +3681,8 @@ mod delete_confirm_tests {
             Some(PathBuf::from(r"C:\media")),
         );
         let paths: Vec<_> = target
-            .external_tool_targets
+            .external_tool_descriptor
+            .targets_for_test(&app)
             .iter()
             .map(|target| target.real_file().unwrap().to_path_buf())
             .collect();
@@ -2880,7 +3718,7 @@ mod delete_confirm_tests {
         );
 
         assert_eq!(
-            target.external_tool_targets,
+            target.external_tool_descriptor.targets_for_test(&app),
             vec![crate::external_tool::LaunchTarget::RealFile(PathBuf::from(
                 r"C:\media\book.zip"
             ))]
@@ -2902,7 +3740,7 @@ mod delete_confirm_tests {
             None,
         );
         assert_eq!(
-            target.external_tool_targets,
+            target.external_tool_descriptor.targets_for_test(&app),
             vec![crate::external_tool::LaunchTarget::RealFile(PathBuf::from(
                 r"C:\books\book.7z"
             ))]
@@ -2918,7 +3756,12 @@ mod delete_confirm_tests {
             ContextMenuSurface::Grid,
             None,
         );
-        assert!(target.external_tool_targets.is_empty());
+        assert!(
+            target
+                .external_tool_descriptor
+                .targets_for_test(&app)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2958,7 +3801,7 @@ mod delete_confirm_tests {
             )
         }));
         assert!(matches!(
-            &target.external_tool_targets[..],
+            &target.external_tool_descriptor.targets_for_test(&app)[..],
             [
                 crate::external_tool::LaunchTarget::ImagePage(_),
                 crate::external_tool::LaunchTarget::PdfPage { page_num: 2, .. }
@@ -2994,12 +3837,16 @@ mod delete_confirm_tests {
             is_folder_context: false,
             has_checked: true,
             checked_count: 1,
-            external_tool_targets: vec![crate::external_tool::LaunchTarget::RealFile(
-                PathBuf::from(r"C:\media\checked-other.jpg"),
-            )],
+            external_tool_descriptor: app.external_tool_target_descriptor(
+                crate::external_tool::ExternalTargetSource::Container {
+                    path: Some(PathBuf::from(r"C:\media\checked-other.jpg")),
+                },
+            ),
             surface: ContextMenuSurface::Grid,
             explorer_folder: Some(PathBuf::from(r"C:\media")),
             folder_command_target: None,
+            collection_root_delete:
+                crate::app::collection_grid::CollectionRootDeleteResolution::NotCollectionRoot,
         };
 
         let items = app.context_menu_nodes(&target, false);
@@ -3039,6 +3886,7 @@ mod delete_confirm_tests {
     fn missing_external_tool_id_is_reported_instead_of_ignored() {
         let mut app = crate::app::setup_app_for_test();
         let target = target(
+            &app,
             GridItem::Image(PathBuf::from(r"C:\media\clicked.jpg")),
             ContextMenuSurface::Grid,
         );
@@ -3140,6 +3988,142 @@ mod delete_confirm_tests {
         assert!(fullscreen_image.contains(&MenuCommand::RotateRight));
         assert!(!fullscreen_image.contains(&MenuCommand::SetCurrentVideoFrameThumbnail));
         assert!(fullscreen_image.contains(&MenuCommand::OpenFolderInExplorer));
+    }
+
+    #[test]
+    fn grid_and_fullscreen_consume_the_same_resolved_static_layout() {
+        use crate::context_menu_model::{ContextMenuItemId, ContextMenuParentId};
+
+        let mut app = crate::app::setup_app_for_test();
+        let mut order = app
+            .settings
+            .context_menu_layout
+            .resolved_order(ContextMenuParentId::Root);
+        let rotate_right = order
+            .iter()
+            .position(|item| *item == ContextMenuItemId::RotateRight)
+            .map(|index| order.remove(index))
+            .unwrap();
+        let rotate_left = order
+            .iter()
+            .position(|item| *item == ContextMenuItemId::RotateLeft)
+            .unwrap();
+        order.insert(rotate_left, rotate_right);
+        app.settings
+            .context_menu_layout
+            .set_order(ContextMenuParentId::Root, &order);
+        app.settings
+            .context_menu_layout
+            .set_visible(ContextMenuItemId::CopyPath, false);
+
+        for surface in [ContextMenuSurface::Grid, ContextMenuSurface::Fullscreen] {
+            let commands = menu_commands(
+                &mut app,
+                GridItem::Image(PathBuf::from("image.png")),
+                surface,
+            );
+            assert!(!commands.contains(&MenuCommand::CopyPath));
+            let right = commands
+                .iter()
+                .position(|command| *command == MenuCommand::RotateRight)
+                .unwrap();
+            let left = commands
+                .iter()
+                .position(|command| *command == MenuCommand::RotateLeft)
+                .unwrap();
+            assert!(right < left, "surface={surface:?}, commands={commands:?}");
+        }
+    }
+
+    #[test]
+    fn collection_root_forces_an_explicit_source_shell_submenu_even_when_inline_is_enabled() {
+        let app = crate::app::setup_app_for_test();
+        let mut root = target(
+            &app,
+            GridItem::Image(PathBuf::from(r"C:\media\linked.jpg")),
+            ContextMenuSurface::Grid,
+        );
+        root.collection_root_delete =
+            crate::app::collection_grid::CollectionRootDeleteResolution::Unavailable(
+                "binding refresh",
+            );
+        assert_eq!(
+            native_grid_shell_menu_placement(&root, true),
+            ShellMenuPlacement::CollectionSourceSubmenu
+        );
+
+        root.collection_root_delete =
+            crate::app::collection_grid::CollectionRootDeleteResolution::Ready(
+                crate::app::collection_grid::CollectionGridRemoveTarget {
+                    stamp: crate::app::top_level_grid_view::CollectionGridRequestStamp {
+                        context_id: crate::app::ViewerContextId::for_test(1),
+                        surface_generation: 2,
+                        collection_id: crate::collection_store::CollectionId::new(),
+                    },
+                    expected_revision: 3,
+                    entry_ids: vec![crate::collection_store::CollectionEntryId::new()],
+                },
+            );
+        assert_eq!(
+            native_grid_shell_menu_placement(&root, true),
+            ShellMenuPlacement::CollectionSourceSubmenu
+        );
+
+        root.collection_root_delete =
+            crate::app::collection_grid::CollectionRootDeleteResolution::NotCollectionRoot;
+        assert_eq!(
+            native_grid_shell_menu_placement(&root, true),
+            ShellMenuPlacement::Inline,
+            "Collection PhysicalSource and ordinary folders keep the global Inline setting"
+        );
+    }
+
+    #[test]
+    fn unavailable_collection_reference_is_visible_with_reason_but_physical_delete_remains_separate()
+     {
+        fn state<'a>(
+            nodes: &'a [MenuNode],
+            wanted: MenuCommand,
+        ) -> Option<(bool, Option<&'a str>)> {
+            for node in nodes {
+                match node {
+                    MenuNode::Item {
+                        command,
+                        enabled,
+                        disabled_reason,
+                        ..
+                    } if *command == wanted => {
+                        return Some((*enabled, disabled_reason.as_deref()));
+                    }
+                    MenuNode::Submenu { children, .. } => {
+                        if let Some(found) = state(children, wanted.clone()) {
+                            return Some(found);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        let mut app = crate::app::setup_app_for_test();
+        let mut target = target(
+            &app,
+            GridItem::Image(PathBuf::from(r"C:\media\linked.jpg")),
+            ContextMenuSurface::Grid,
+        );
+        target.collection_root_delete =
+            crate::app::collection_grid::CollectionRootDeleteResolution::Unavailable(
+                "コレクションの参照を確認しています",
+            );
+        let nodes = app.context_menu_nodes(&target, false);
+        assert_eq!(
+            state(&nodes, MenuCommand::RemoveFromCollection),
+            Some((false, Some("コレクションの参照を確認しています")))
+        );
+        assert_eq!(
+            state(&nodes, MenuCommand::MoveToRecycleBin),
+            Some((true, None))
+        );
     }
 
     #[test]
@@ -3725,5 +4709,291 @@ mod delete_confirm_tests {
         assert!(windows_drive_type_may_permanently_delete(2));
         assert!(windows_drive_type_may_permanently_delete(4));
         assert!(!windows_drive_type_may_permanently_delete(3));
+    }
+}
+
+#[cfg(test)]
+mod clipboard_image_writer_tests {
+    use super::*;
+
+    const DIB_FORMAT: u32 = 8;
+    const ORIGIN_FORMAT: u32 = 0xc001;
+    const DIB: &[u8] = b"image bytes";
+    const NONCE: &[u8] = b"process nonce";
+
+    #[derive(Default)]
+    struct FakeClipboardImageApi {
+        failures: Vec<&'static str>,
+        events: Vec<&'static str>,
+        logs: Vec<String>,
+        next_memory: usize,
+        allocated: Vec<usize>,
+        freed: Vec<usize>,
+        transferred: Vec<(u32, usize)>,
+        payloads: Vec<(usize, Vec<u8>)>,
+        opened: bool,
+    }
+
+    impl FakeClipboardImageApi {
+        fn with_failures(failures: &[&'static str]) -> Self {
+            Self {
+                failures: failures.to_vec(),
+                ..Self::default()
+            }
+        }
+
+        fn result(&mut self, event: &'static str) -> Result<(), &'static str> {
+            self.events.push(event);
+            if self.failures.contains(&event) {
+                Err(event)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn write(&mut self) -> bool {
+            write_image_clipboard_if_latest(self, DIB, DIB_FORMAT, NONCE, || true)
+        }
+    }
+
+    impl ClipboardImageApi for FakeClipboardImageApi {
+        type Memory = usize;
+        type Error = &'static str;
+
+        fn allocate(&mut self, _size: usize) -> Result<usize, Self::Error> {
+            self.next_memory += 1;
+            let memory = self.next_memory;
+            self.result(if memory == 1 {
+                "alloc_image"
+            } else {
+                "alloc_origin"
+            })?;
+            self.allocated.push(memory);
+            Ok(memory)
+        }
+
+        fn lock_and_copy(&mut self, memory: usize, bytes: &[u8]) -> Result<(), Self::Error> {
+            self.result(if memory == 1 {
+                "lock_image"
+            } else {
+                "lock_origin"
+            })?;
+            self.payloads.push((memory, bytes.to_vec()));
+            Ok(())
+        }
+
+        fn unlock(&mut self, memory: usize) -> Result<(), Self::Error> {
+            self.result(if memory == 1 {
+                "unlock_image"
+            } else {
+                "unlock_origin"
+            })
+        }
+
+        fn free(&mut self, memory: usize) -> Result<(), Self::Error> {
+            assert!(self.allocated.contains(&memory));
+            assert!(!self.freed.contains(&memory), "no double free");
+            assert!(
+                !self.transferred.iter().any(|(_, h)| *h == memory),
+                "system-owned memory"
+            );
+            self.result("free")?;
+            self.freed.push(memory);
+            Ok(())
+        }
+
+        fn open(&mut self) -> Result<(), Self::Error> {
+            assert!(!self.opened);
+            self.result("open")?;
+            self.opened = true;
+            Ok(())
+        }
+
+        fn empty(&mut self) -> Result<(), Self::Error> {
+            assert!(self.opened);
+            self.result("empty")
+        }
+
+        fn set_data(&mut self, format: u32, memory: usize) -> Result<(), Self::Error> {
+            assert!(self.opened);
+            assert!(!self.freed.contains(&memory));
+            assert!(!self.transferred.iter().any(|(_, h)| *h == memory));
+            self.result(if format == DIB_FORMAT {
+                "set_image"
+            } else {
+                "set_origin"
+            })?;
+            self.transferred.push((format, memory));
+            Ok(())
+        }
+
+        fn register_origin(&mut self) -> Result<u32, Self::Error> {
+            assert!(self.opened);
+            assert_eq!(self.transferred, vec![(DIB_FORMAT, 1)]);
+            self.result("register_origin")?;
+            Ok(ORIGIN_FORMAT)
+        }
+
+        fn close(&mut self) -> Result<(), Self::Error> {
+            assert!(self.opened);
+            self.result("close")?;
+            self.opened = false;
+            Ok(())
+        }
+
+        fn log(&mut self, message: String) {
+            self.logs.push(message);
+        }
+    }
+
+    #[test]
+    fn successful_image_and_marker_transfer_in_one_open_without_free() {
+        let mut api = FakeClipboardImageApi::default();
+        assert!(api.write());
+        assert_eq!(api.transferred, vec![(DIB_FORMAT, 1), (ORIGIN_FORMAT, 2)]);
+        assert_eq!(api.payloads, vec![(1, DIB.to_vec()), (2, NONCE.to_vec())]);
+        assert!(api.freed.is_empty());
+        assert!(api.logs.is_empty());
+        assert_eq!(
+            api.events,
+            vec![
+                "alloc_image",
+                "lock_image",
+                "unlock_image",
+                "open",
+                "empty",
+                "set_image",
+                "register_origin",
+                "alloc_origin",
+                "lock_origin",
+                "unlock_origin",
+                "set_origin",
+                "close",
+            ]
+        );
+        assert!(!api.opened);
+    }
+
+    #[test]
+    fn image_failures_release_only_owned_memory_and_close_only_after_open() {
+        for (failure, allocated, freed, closes) in [
+            ("alloc_image", vec![], vec![], 0),
+            ("lock_image", vec![1], vec![1], 0),
+            ("open", vec![1], vec![1], 0),
+            ("empty", vec![1], vec![1], 1),
+            ("set_image", vec![1], vec![1], 1),
+        ] {
+            let mut api = FakeClipboardImageApi::with_failures(&[failure]);
+            assert!(!api.write(), "{failure}");
+            assert_eq!(api.allocated, allocated, "{failure}");
+            assert_eq!(api.freed, freed, "{failure}");
+            assert!(api.transferred.is_empty(), "{failure}");
+            assert!(!api.events.contains(&"register_origin"), "{failure}");
+            assert_eq!(
+                api.events.iter().filter(|event| **event == "close").count(),
+                closes,
+                "{failure}"
+            );
+            assert_eq!(api.logs.len(), 1, "{failure}");
+            assert!(api.logs[0].contains(failure), "{failure}");
+            assert!(!api.opened, "{failure}");
+        }
+    }
+
+    #[test]
+    fn marker_failures_log_without_undoing_image_and_release_owned_marker() {
+        for (failure, allocated, freed) in [
+            ("register_origin", vec![1], vec![]),
+            ("alloc_origin", vec![1], vec![]),
+            ("lock_origin", vec![1, 2], vec![2]),
+            ("set_origin", vec![1, 2], vec![2]),
+        ] {
+            let mut api = FakeClipboardImageApi::with_failures(&[failure]);
+            assert!(api.write(), "{failure}");
+            assert_eq!(api.transferred, vec![(DIB_FORMAT, 1)], "{failure}");
+            assert_eq!(api.allocated, allocated, "{failure}");
+            assert_eq!(api.freed, freed, "{failure}");
+            assert_eq!(
+                api.events.iter().filter(|event| **event == "empty").count(),
+                1,
+                "{failure}"
+            );
+            assert_eq!(api.events.last(), Some(&"close"), "{failure}");
+            assert_eq!(api.logs.len(), 1, "{failure}");
+            assert!(api.logs[0].contains(failure), "{failure}");
+            assert!(api.logs[0].contains("origin"), "{failure}");
+            assert!(!api.opened, "{failure}");
+        }
+    }
+
+    #[test]
+    fn obsolete_generation_does_not_allocate_open_or_write() {
+        let mut api = FakeClipboardImageApi::default();
+        let mut checks = 0;
+        assert!(!write_image_clipboard_if_latest(
+            &mut api,
+            DIB,
+            DIB_FORMAT,
+            NONCE,
+            || {
+                checks += 1;
+                false
+            }
+        ));
+        assert_eq!(checks, 1);
+        assert!(api.events.is_empty());
+        assert!(api.logs.is_empty());
+    }
+
+    #[test]
+    fn final_unlock_zero_with_no_error_is_success() {
+        assert!(clipboard_unlock_succeeded(false, 0));
+        assert!(clipboard_unlock_succeeded(true, 0));
+        assert!(clipboard_unlock_succeeded(true, 123));
+        assert!(!clipboard_unlock_succeeded(false, 123));
+    }
+
+    #[test]
+    fn unlock_failures_log_and_do_not_undo_successfully_transferred_data() {
+        for failure in ["unlock_image", "unlock_origin"] {
+            let mut api = FakeClipboardImageApi::with_failures(&[failure]);
+            assert!(api.write(), "{failure}");
+            assert_eq!(api.transferred, vec![(DIB_FORMAT, 1), (ORIGIN_FORMAT, 2)]);
+            assert!(api.freed.is_empty());
+            assert_eq!(api.logs.len(), 1);
+            assert!(api.logs[0].contains(failure));
+            assert!(!api.opened);
+        }
+    }
+
+    #[test]
+    fn close_failure_is_logged_after_empty_failure_and_successful_transfers() {
+        for failures in [&["empty", "close"][..], &["close"][..]] {
+            let mut api = FakeClipboardImageApi::with_failures(failures);
+            assert_eq!(api.write(), !failures.contains(&"empty"));
+            assert_eq!(api.events.last(), Some(&"close"));
+            assert_eq!(api.logs.len(), failures.len());
+            assert!(api.logs.last().unwrap().contains("CloseClipboard"));
+            if failures.contains(&"empty") {
+                assert_eq!(api.freed, vec![1]);
+            } else {
+                assert!(api.freed.is_empty());
+                assert_eq!(api.transferred.len(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn free_failure_is_logged_without_retry_and_opened_clipboard_is_closed() {
+        let mut api = FakeClipboardImageApi::with_failures(&["empty", "free"]);
+        assert!(!api.write());
+        assert_eq!(api.logs.len(), 2);
+        assert!(api.logs[1].contains("image free failed"));
+        assert_eq!(
+            api.events.iter().filter(|event| **event == "free").count(),
+            1
+        );
+        assert_eq!(api.events.last(), Some(&"close"));
+        assert!(!api.opened);
     }
 }

@@ -1,0 +1,5 @@
+association reload=1: selected=[".jpg", ".png", ".gif", ".bmp", ".tif", ".avif", ".heic", ".jxl"]; ninth=["old-handler"]
+association reload=2: selected=[".jpg", ".png", ".gif", ".bmp", ".tif", ".avif", ".heic", ".jxl"]; ninth=["old-handler"]
+association reload=3: selected=[".jpg", ".png", ".gif", ".bmp", ".tif", ".avif", ".heic", ".jxl"]; ninth=["old-handler"]
+ring opened in B (before=1, preview=4), end in B: A=2 B=4 undo=[("B", 1, 4)]
+ring opened in B (before=1, preview=4), end in A: A=4 B=4 undo=[("A", 1, 4)]

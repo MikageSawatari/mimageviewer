@@ -28,6 +28,11 @@ fn main() {
     // 代わって復旧手順付きの明確なメッセージを出す。
     if target_is_windows {
         check_vendor_files();
+        if std::env::var("PROFILE").as_deref() == Ok("release")
+            && std::env::var_os("CARGO_FEATURE_PORTABLE").is_none()
+        {
+            check_release_vst3_host_identity();
+        }
     }
 
     // 絵文字スタンプ (Twemoji SVG) を exe に同梱するためのコード生成 (Inc 4c)。
@@ -38,6 +43,7 @@ fn main() {
 
     // 同梱 FFmpeg のビルド識別子を焼き込む (バージョン情報ダイアログの LGPL 通知)。
     emit_ffmpeg_build_id();
+    emit_libraw_build_id();
 
     // FFmpeg DLL は `target/release/` には自動でコピーしない。
     //
@@ -86,6 +92,46 @@ fn main() {
             eprintln!("winresource compile error: {e}");
         }
     }
+}
+
+fn check_release_vst3_host_identity() {
+    for path in [
+        "scripts/vst3-host-identity.ps1",
+        "scripts/sign-files.ps1",
+        "crates/vst3-host/CMakeLists.txt",
+        "crates/vst3-host/include",
+        "crates/vst3-host/src",
+        "crates/vst3-host/tests",
+        "vendor/vst3-host/mimageviewer-vst3-host.exe",
+    ] {
+        println!("cargo:rerun-if-changed={path}");
+    }
+    let mut command = std::process::Command::new("powershell.exe");
+    command
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            "scripts/vst3-host-identity.ps1",
+            "-ValidateRepo",
+        ])
+        .arg(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let output = command
+        .output()
+        .expect("VST3 host identity gate requires PowerShell");
+    assert!(
+        output.status.success(),
+        "Release VST3 host identity gate failed. Rebuild crates/vst3-host with CMake before embedding:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// Convert the canonical WGSL NIS shader to Shader Model 5 HLSL, then to DXBC.
@@ -455,6 +501,24 @@ fn emit_ffmpeg_build_id() {
         .and_then(|raw| parse_ffmpeg_build_id(raw.trim()))
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=MIV_FFMPEG_BUILD_ID={id}");
+}
+
+/// RAW のライセンス通知と対応ソース URL を、実際にビルドする同梱版から生成する。
+fn emit_libraw_build_id() {
+    println!("cargo:rerun-if-changed=vendor/libraw/VERSION");
+    let recovery = "Recovery: bash scripts/setup-libraw.sh (or bash scripts/bootstrap-vendor.sh)";
+    let version = std::fs::read_to_string("vendor/libraw/VERSION")
+        .unwrap_or_else(|error| panic!("Cannot read vendor/libraw/VERSION: {error}\n{recovery}"));
+    let version = version.trim();
+    let parts: Vec<_> = version.split('.').collect();
+    assert!(
+        parts.len() == 3
+            && parts
+                .iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())),
+        "Invalid vendor/libraw/VERSION: {version:?}\n{recovery}"
+    );
+    println!("cargo:rustc-env=MIV_LIBRAW_BUILD_ID={version}");
 }
 
 /// BtbN の資産名からビルド識別子を取り出す。

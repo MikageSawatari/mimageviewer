@@ -1,0 +1,156 @@
+512b49d4d Give the batch export test the bake stage it now takes
+52e811cf1 Keep the Windows-only pieces behind a gate the CI can see
+8da3f07cf Set the version to 3.5.0 and tell people what moved
+af4672216 Take the finished five off the backlog, and say what people must be told
+0653d9df6 Write down what v3.5.0 changes
+589b12dad Merge branch 'master' into display-geometry-rounding
+b7adf340b Merge branch 'master' into display-geometry-rounding
+916af295f Record that the external tool work is on master
+c1c3fab2f Merge branch 'master' into context-menu-owner-hwnd
+04995b972 Describe {files} without referring to what it replaced
+dfd52381c Record the second crop drag fix alongside the first
+81d604103 Leave {files} as the only notation
+0c3f3f34e Let a crop drag survive the pointer crossing the tool panel
+d0836b8e7 Say why the 360 roll is waiting rather than pending
+b07609035 Mark the crop anchoring report as fixed
+3a39c768c Let the restore ask the same question V does, and in every viewer
+846ef5dc6 Pin the ratio-locked crop to the point that was pressed
+a8f8ef7e6 Ship v1 with {files} only
+804522f7d Close the four items out, and leave the next reader a route
+96c2df547 Leave a probe where the menu is opened, and file what we do not know
+98c0f0dfb Separate the file we pass from the location we point at
+8187fb67f Keep the 360 view when the next thing you open is also 360
+6f5e72902 Stop materializing a file the arguments never pass
+45fc1b25f Give the file that is passed one spelling
+b2c030c58 Log the help that opens on the wrong window
+c49ed8544 Merge branch 'master' into rating-time-order
+8f0ac859d Count the entrances again: Back is one of them
+7b92bf697 Say what the video cache actually holds
+75cc0b9fb Show when the star was set, without teaching v3.4.0 a word it cannot read
+7418c9a02 File what the crop reports turned out to share
+2a25ab0eb Pin what the dangling-option rule does to the shapes people actually write
+3f54b21cd Keep the coarse waveform column across restarts
+36320a5f3 Make the video actually move when it is locked, and let music lock too
+579e465ad Make the argument preview say what the launch will actually pass
+e45d5a28c Let video lock the info panel too, since that is where the tagging happens
+e4f12d8e8 Merge branch 'master' into rating-time-order
+7fa36c1cc Cover the cancel, since the run ends before a hand can reach it
+9021ce1a9 Decide to keep the coarse waveform column across restarts
+db3f21949 Record what the review pass has closed
+b25cd7185 Rule out the settings combinations that promise something impossible
+61fce96cb Stop spelling "is the panel showing" twice, and ask the right question when closing
+de95cfa5e Resolve the PDF password and the page number the way the app already does
+9096effe5 Let the window the user acted in own the external tool modals
+8ea56cd5d Clear the shipped strip item out of the backlog
+6ed58ef98 Keep the review findings and what is done about them in the repo
+6cc840b3d Merge branch 'master' into seek-strip-modes
+0292abede Fix the three findings that make a setting or a modal not do what it says
+58b530b1c Carry the gamepad switch through the path that actually saves
+abc568180 Let people turn the gamepad off, and stop reading it when they do
+03b167239 Write the review brief, including the five things I got wrong
+d6d7b1804 Mark where the bake-stage work stands, and what gates the rest
+fef44cb2a Give the Creative LUT one place that turns a selection into a LUT
+f0ef37da9 Put the four outputs in one table so their differences are visible
+68efa1bec Let the composite run AI, and report what it actually did
+d3821dada Teach the worker composite how far to bake, without changing what anyone gets
+47f6177cc Give the info panel a lock, and the room it needs when it is locked
+5fc202492 Write down which bake stage each output takes, and why they disagree today
+38a52aeac Merge branch 'master' into context-menu-owner-hwnd
+f383e270b Record why the in-place refresh plan is not the one to build
+6133a6cc6 Give the grid export its own action instead of borrowing the fullscreen one
+af0bcf3de Keep the strip's span, height and cycle across restarts
+e772a14f0 Merge lane 1 into export-batch
+5559c7ca7 Put the bulk edit operations where the single ones already live
+b27a730f3 Write down that equal gaps outrank a layout that never moves
+274974929 Merge branch 'master' into rating-time-order
+d762f6616 Take the measuring gear back out, and correct what the backlog claimed
+21d15a0ea Send the tooltip a struct size comctl32 will accept
+a2df16688 Give the tooltip path reasons for staying silent
+e4920e71d Stop the disabled-reason tooltip from dragging the main window forward
+affaa21df Split the last three suspects apart
+12ad87a24 Merge lane A into export-batch, keeping the code it put back
+7bd436421 Sample the Z-order at each construction stage to find where it flips
+b4214d152 Measure Z-order too, since activation turned out not to move
+7160a3507 Measure which window owns the popup menu before guessing why it fronts
+86dd95ddf Merge branch 'master' into display-geometry-rounding
+5aebdce06 Merge branch 'master' into rating-time-order
+fe2bd29fd Merge branch 'master' into seek-strip-modes
+bddc20f0e Merge branch 'master' into external-tool-launch
+03830e0e5 Record what is done and what was split off
+29e1c3ef9 Bring the design docs to what the code actually does now
+f9881ddf1 Write the external tool feature up for the people who will use it
+c0dc4d0a8 Make each payload value mean one thing, whatever the page happens to carry
+d26213ef0 Decode the video frame in the worker, the way the clipboard copy already does
+24a148be8 Record why the video frame is not the small step it looked like
+6173584c0 Hand over the spread the reader is looking at, not half of it
+9442d2f66 Tell the tool what the target was, not just where the temp file landed
+63469e8f0 Ask where the window is with a value that knows while maximized
+18121cfd2 Say whether the tool gets a temp file or the real one, in the name of the setting
+2d52bcaf9 Give the progress modal one owner for whether it draws and whether it blocks
+da455b00e Never let one payload value mean a temp file sometimes and the real one others
+748449ce4 Name the contract instead of the purpose in the payload setting
+20a855f22 Record where the investigation stands, and why the current fix is not the final one
+6cb6efd59 Drive the materialize in embedded fullscreen too
+f1922897f Draw the progress where the user is, or the launch never finishes
+ab44af7a1 Stop the launch from cancelling its own work
+30c9e7f7f Stop closing the viewer to launch, and stop cancelling what the user asked for
+65ba85d70 Merge master v3.4.0, undoing the release revert first
+ea45f4803 Revert "Take the external tool launcher back out of v3.4.0"
+da5b50636 Merge branch 'master' into export-batch
+dacd97c33 Merge branch 'master' into display-geometry-rounding
+3cda4c6f4 Merge branch 'master' into seek-strip-modes
+1a86b08c6 Merge branch 'master' into rating-time-order
+598220194 Close the v3.4.0 release record
+1a9a79ed8 Materialize the pages we could only refuse
+44f1262f7 fix: preserve kept bulk edit state
+00680be94 Let one transform own where a frozen page is, where it ends, and how many texels
+9d1f83a98 feat: add bulk page edit paste and reset
+ae7f74e84 Add a step below small for the whole-video strip
+cea80b735 Keep the export request buildable from outside, and cover the batch writer
+6eaf547fe Drop the PDF option that had no meaning outside fullscreen
+27bbb8c68 Write down the whole-video reading and the height presets
+82af6bb1d Open a menu from the strip button instead of cycling
+1f991d4b6 Space continuous units by what gets drawn, not by what the layout wished for
+ce3023d65 Brief P3: materialize as a shared facility, and guard the editing tools
+1ccd6f7fe Put the whole video on the strip
+d46718bea Let Ctrl+E write out a whole grid selection at once
+bc1478b5b Give the batch export its own remembered folder, name, format, and size
+4c7669de5 Make every scale snap the paint rect, and hand the texel count down with it
+eb2d62d52 Write down who owns a temp file, and which orphans are safe to sweep
+92abe144c Give Ctrl+E its conceal presets back, without applying the mask twice
+5d900f93c Give the strip a height the whole presenter agrees on
+19e358806 Say who owns the order, in one place, at both entrances
+84de24d7d Resolve the strip's height and mode in one place
+605b7d59c Keep the time order the user asked for, all in one line
+3e2960dad Brief lane 4: give the export back its presets, then let it take many
+5be3ce316 Brief lane 3: the whole video on the strip, at a height you pick
+217d36280 Brief lane 2: the rounding of what we draw, and the room it gets
+da90757fe Brief lane 1: the list's time order, and the bulk edit ops
+cde1780ce Implement external tool P2c (real-app verification pending)
+934276d7a Brief P2c: cut the entry points back to two, and make counts refuse
+840803bda Record the decisions: two entry points, and counts that refuse instead of trimming
+791ed6ed6 Add external tool toolbar and file menu launchers
+e54dc617e Answer when the association open-with has no real file
+20b072c1c Log the launch plan, since Single/Each/Batch look alike from outside
+d73d72429 Give the tools a key of their own
+c279c4f17 Split P2b in two and fence off what the last run wandered into
+56abe13a2 Add the P2b duty the plan names, after sweeping for the rest
+7835cfb86 Fix the toolbar section I described too narrowly, and add the menu bar I dropped
+3e45f43c0 Brief P2b: give the tools a key, a toolbar, a picker, and the book
+01c2f82fe Leave fullscreen before opening something only the main window shows
+be1854b49 Make "recommended" mean something, then show where it ends
+d08f48694 Show every app Windows shows, ordered the way Windows orders them
+da3538fdd Ask the handler who it is, and launch it four ways
+46735ab74 Launch handler executables ourselves, since the shell will not
+ac8069b64 Log which handler we grabbed, before guessing why Paint did not open
+1629ede27 Let the preferences page stand on its own
+7cd6037fe Say why the association picker cannot run, before it is pressed
+6a358e14f Make the selection policy mean something
+81c9d50dc Say the spread question is settled, so the next run starts
+2020143e8 Mark the spread prose as the P4 shape, where grep for the type name could not reach
+92e4bdc37 Make the phase table say the same thing as the decision
+0a6abee0f Fix the line I left contradicting my own decision, and name the order owner
+26deae32d Fold the three answers into the P2a brief
+3c97e7fc4 Answer the three gaps P2a found, in the plan first
+93cfebac2 Brief P2a: resolve the target set once, and make SelectionPolicy real
+1a06094a5 Decide what a mixed selection does before P2 asks

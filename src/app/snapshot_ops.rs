@@ -8,8 +8,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::app::App;
-use crate::fs_animation::FsCacheEntry;
+use crate::app::{App, FsPageTransfer};
 use crate::grid_item::GridItem;
 use crate::snapshot::{
     FilterState, SnapshotEntry, SnapshotKey, SnapshotSourceLabel, SnapshotState, is_inside_fs,
@@ -25,7 +24,7 @@ struct SnapshotViewerIndexSwap {
     old_fullscreen_idx: usize,
     new_fullscreen_idx: usize,
     old_to_new: HashMap<usize, usize>,
-    preserved_fs_entry: Option<FsCacheEntry>,
+    preserved_fs_page: Option<FsPageTransfer>,
     opened_media_path: Option<PathBuf>,
     current_owns_global_media_indices: bool,
     restart_marker_thumb_decode: Option<PathBuf>,
@@ -33,6 +32,13 @@ struct SnapshotViewerIndexSwap {
     last_sync_stamp_new_idx: Option<usize>,
     #[cfg(windows)]
     last_sync_stamp_existed: bool,
+}
+
+#[derive(Clone, Copy)]
+enum SnapshotSubfolderRestoreSlot {
+    FavSearch,
+    GlobalSearch,
+    Expansion,
 }
 
 impl App {
@@ -157,6 +163,7 @@ impl App {
         self.analysis_hist_cache = None;
         self.analysis_sv_cache = None;
         self.fs_context_menu_idx = None;
+        self.fs_secondary_press.cancel();
         self.adjust_scope_selection_idx = None;
         self.cancel_mouse_ring_flick();
         self.mouse_ring_grid_target_idx = None;
@@ -171,8 +178,16 @@ impl App {
         };
         let remap = |idx: usize| swap.old_to_new.get(&idx).copied();
 
-        if let Some(entry) = swap.preserved_fs_entry.take() {
-            self.fs_cache.insert(swap.new_fullscreen_idx, entry);
+        match self.try_own_fullscreen_epub_at(swap.new_fullscreen_idx) {
+            super::OpenAdmission::Accepted => {}
+            super::OpenAdmission::NotApplicable => return,
+            super::OpenAdmission::Refused(reason) => {
+                self.show_open_admission_refusal(reason);
+                return;
+            }
+        }
+        if let Some(transfer) = swap.preserved_fs_page.take() {
+            self.restore_fs_page_from_snapshot(swap.new_fullscreen_idx, transfer);
         }
         self.fullscreen_idx = Some(swap.new_fullscreen_idx);
         self.video_audio_mode = self.video_audio_mode.and_then(&remap);
@@ -184,12 +199,19 @@ impl App {
         });
         self.normalize_ui_states = std::mem::take(&mut self.normalize_ui_states)
             .into_iter()
-            .filter_map(|(idx, state)| remap(idx).map(|new_idx| (new_idx, state)))
+            .filter_map(|(mut key, state)| {
+                key.fs_idx = remap(key.fs_idx)?;
+                Some((key, state))
+            })
             .collect();
         self.normalize_auto_scan_suppressed = self
             .normalize_auto_scan_suppressed
             .iter()
-            .filter_map(|&idx| remap(idx))
+            .filter_map(|key| {
+                let mut key = key.clone();
+                key.fs_idx = remap(key.fs_idx)?;
+                Some(key)
+            })
             .collect();
         self.last_loop_pos = std::mem::take(&mut self.last_loop_pos)
             .into_iter()
@@ -246,14 +268,20 @@ impl App {
     #[cfg(windows)]
     fn finish_snapshot_windows_media_index_swap(&mut self, swap: &SnapshotViewerIndexSwap) {
         let remap = |idx: usize| swap.old_to_new.get(&idx).copied();
-        self.video_audio_exit_pending =
-            self.video_audio_exit_pending.take().and_then(|mut state| {
-                remap(state.fs_idx).map(|new_idx| {
-                    state.fs_idx = new_idx;
-                    state
-                })
-            });
+        self.video_audio_mode_runtime =
+            self.video_audio_mode_runtime
+                .take()
+                .and_then(|mut runtime| {
+                    remap(runtime.fs_idx).map(|new_idx| {
+                        runtime.remap_fs_idx(new_idx);
+                        runtime
+                    })
+                });
         self.vst3_deferred_media_open = self.vst3_deferred_media_open.and_then(&remap);
+        self.remap_video_seek_strip_for_snapshot(
+            &swap.old_to_new,
+            swap.opened_media_path.as_deref(),
+        );
 
         if swap.current_owns_global_media_indices {
             if let Some(shell) = self.music_vst_shell.as_mut()
@@ -421,13 +449,13 @@ impl App {
 
         // `bump_items_generation` immediately discards old-generation entries, so ownership
         // must leave the generation map before the caller bumps it.
-        let preserved_fs_entry = self.fs_cache.remove(&old_fullscreen_idx);
+        let preserved_fs_page = self.take_fs_page_for_snapshot(old_fullscreen_idx);
 
         Some(SnapshotViewerIndexSwap {
             old_fullscreen_idx,
             new_fullscreen_idx,
             old_to_new,
-            preserved_fs_entry,
+            preserved_fs_page: Some(preserved_fs_page),
             opened_media_path,
             current_owns_global_media_indices,
             restart_marker_thumb_decode,
@@ -607,6 +635,7 @@ impl App {
     ///    items / thumbnails / visible_indices / scroll_offset / selected を退避して
     ///    snapshot subset で置き換え
     pub(crate) fn activate_snapshot(&mut self, source_label: SnapshotSourceLabel) {
+        let source_had_exact_page_edits = self.page_edit_snapshot.is_some();
         // Step 1: capture (= visible_indices から SnapshotEntry を構築)。
         let captured_entries: Vec<SnapshotEntry> = self
             .visible_indices
@@ -619,6 +648,7 @@ impl App {
             self.show_feedback_toast("固定する items がありません".into());
             return;
         }
+        self.capture_main_list_restore_cursor();
         let captured_thumbnails: Vec<crate::grid_item::ThumbnailState> = self
             .visible_indices
             .iter()
@@ -757,6 +787,11 @@ impl App {
         self.mark_color_filter_scope_dirty();
 
         self.snapshot = Some(SnapshotState {
+            page_edit_source: if source_had_exact_page_edits {
+                crate::snapshot::SnapshotPageEditSource::PreparedExact
+            } else {
+                crate::snapshot::SnapshotPageEditSource::PhysicalPrefix
+            },
             items: captured_entries,
             membership,
             origin,
@@ -796,19 +831,13 @@ impl App {
         // 保存される。`invalidate_idx_state_and_queues` は idx-keyed cache を落とすがユーザー
         // 設定マップ (adjustment_page_params 等) は残すため、ここで明示的に処理する必要がある。
         //
-        // cross-folder 検索 view 由来 snapshot (= Ctrl+S/Ctrl+G) は **clear のみ**:
-        // - subset が cross-folder で単一 prefix hydrate できない (origin = 検索前の実
-        //   current_folder なので、prefix 配下の subset item だけ部分的に hydrate されてしまう)。
-        // - 検索 view は元々ページ編集 overlay を出さない設計 (replace_search_view_items が
-        //   clear する) なので、その snapshot も overlay 無しで揃える。
-        // 判定は `pre_snapshot_search_origin.is_some()` (= Ctrl+S/Ctrl+G でのみ Some)。
-        // **`search_was_active` では判定しない**: あれは Ctrl+F (= 単一フォルダの構造フィルタ)
-        // でも true になるが、Ctrl+F の subset は origin 配下に収まるので通常どおり rehydrate
-        // すべき。`search_was_active` で gate すると Ctrl+F snapshot が誤って clear され、
-        // しかも list 復帰 (pre_snapshot_search_origin で判定) との非対称を生む (Codex follow-up)。
-        // 通常フォルダ / Ctrl+F filter 由来は origin の DB から subset idx で hydrate し直す。
-        // deactivate / list 復帰でも同じ判定で対称に処理する。
-        if let Some((origin, is_search_view)) = self
+        // A prepared virtual source carries exact page keys, so its subset must use the same
+        // worker projection. A physical folder / Ctrl+F source keeps its prefix rehydrate.
+        // A search result that has not accepted its first prepared snapshot cannot use a
+        // physical prefix; clear only that unprepared fallback.
+        if source_had_exact_page_edits {
+            self.prepare_page_edits_for_current_virtual_items();
+        } else if let Some((origin, is_search_view)) = self
             .snapshot
             .as_ref()
             .map(|s| (s.origin.clone(), s.pre_snapshot_search_origin.is_some()))
@@ -835,6 +864,72 @@ impl App {
     /// (or its drill target), while `pre_snapshot_search_origin` is the real view to which the
     /// user should return.  Callers that transition directly to another synthetic view must take
     /// the latter as return ownership instead of recording the result-grid path in history.
+    fn snapshot_fallback_path(&self, snap: &SnapshotState) -> Option<PathBuf> {
+        let at_origin = self.current_folder.as_ref().is_some_and(|path| {
+            crate::snapshot::snapshot_key_from_path(path)
+                == crate::snapshot::snapshot_key_from_path(&snap.origin)
+        });
+        if at_origin {
+            snap.pre_snapshot_search_origin
+                .clone()
+                .or_else(|| Some(snap.origin.clone()))
+        } else {
+            self.current_folder.clone()
+        }
+    }
+
+    fn snapshot_subfolder_restore_slot(
+        &self,
+        snap: &SnapshotState,
+        path: Option<&Path>,
+    ) -> Option<SnapshotSubfolderRestoreSlot> {
+        let path = path?;
+        if !crate::folder_tree::path_eq(path, &super::subfolder_expansion_synthetic_path()) {
+            return None;
+        }
+        Some(match &snap.source_label {
+            SnapshotSourceLabel::FavSearch { .. } if self.favsearch_subfolder_restore.is_some() => {
+                SnapshotSubfolderRestoreSlot::FavSearch
+            }
+            SnapshotSourceLabel::GlobalSearch { .. }
+                if self.global_search_subfolder_restore.is_some() =>
+            {
+                SnapshotSubfolderRestoreSlot::GlobalSearch
+            }
+            _ => SnapshotSubfolderRestoreSlot::Expansion,
+        })
+    }
+
+    pub(crate) fn snapshot_return_context_without_restore(
+        &self,
+    ) -> Option<super::top_level_grid_view::TopLevelGridRestore> {
+        let snap = self.snapshot.as_ref()?;
+        Some(
+            self.view_return_context_from_canonical_or_fallback(
+                self.top_level_grid_view
+                    .return_to()
+                    .map(std::borrow::Cow::Borrowed),
+                || {
+                    let path = self.snapshot_fallback_path(snap);
+                    let subfolder_restore =
+                        match self.snapshot_subfolder_restore_slot(snap, path.as_deref()) {
+                            Some(SnapshotSubfolderRestoreSlot::FavSearch) => {
+                                self.favsearch_subfolder_restore.clone()
+                            }
+                            Some(SnapshotSubfolderRestoreSlot::GlobalSearch) => {
+                                self.global_search_subfolder_restore.clone()
+                            }
+                            Some(SnapshotSubfolderRestoreSlot::Expansion) => {
+                                self.subfolder_expansion_restore_for_synthetic_path(path.as_deref())
+                            }
+                            None => None,
+                        };
+                    (path, subfolder_restore)
+                },
+            ),
+        )
+    }
+
     pub(crate) fn dismiss_snapshot_without_restore(
         &mut self,
     ) -> Option<super::top_level_grid_view::TopLevelGridRestore> {
@@ -842,40 +937,32 @@ impl App {
         let _ = self.restore_rating_filter_suppression();
         // Canonical return_to がある間は fallback slot を consume しない。検索由来 snapshot
         // を fork した sibling が、それぞれ自分の restore payload を保持できるようにする。
-        if let Some(return_to) = self.top_level_grid_view.take_return_to() {
-            self.show_feedback_toast("★固定を解除しました".into());
-            return Some(return_to);
-        }
-        let at_origin = self.current_folder.as_ref().is_some_and(|path| {
-            crate::snapshot::snapshot_key_from_path(path)
-                == crate::snapshot::snapshot_key_from_path(&snap.origin)
-        });
-        let path = if at_origin {
-            snap.pre_snapshot_search_origin
-                .clone()
-                .or_else(|| Some(snap.origin.clone()))
+        let canonical = self.top_level_grid_view.take_return_to();
+        let (path, subfolder_restore) = if canonical.is_none() {
+            let path = self.snapshot_fallback_path(&snap);
+            let subfolder_restore =
+                match self.snapshot_subfolder_restore_slot(&snap, path.as_deref()) {
+                    Some(SnapshotSubfolderRestoreSlot::FavSearch) => {
+                        self.favsearch_subfolder_restore.take()
+                    }
+                    Some(SnapshotSubfolderRestoreSlot::GlobalSearch) => {
+                        self.global_search_subfolder_restore.take()
+                    }
+                    Some(SnapshotSubfolderRestoreSlot::Expansion) => {
+                        self.take_subfolder_expansion_restore_for_synthetic_path(path.as_deref())
+                    }
+                    None => None,
+                };
+            (path, subfolder_restore)
         } else {
-            self.current_folder.clone()
+            (None, None)
         };
-        let subfolder_restore = if path.as_deref().is_some_and(|path| {
-            crate::folder_tree::path_eq(path, &super::subfolder_expansion_synthetic_path())
-        }) {
-            match snap.source_label {
-                SnapshotSourceLabel::FavSearch { .. } => self.favsearch_subfolder_restore.take(),
-                SnapshotSourceLabel::GlobalSearch { .. } => {
-                    self.global_search_subfolder_restore.take()
-                }
-                _ => None,
-            }
-            .or_else(|| self.take_subfolder_expansion_restore_for_synthetic_path(path.as_deref()))
-        } else {
-            None
-        };
+        let return_context = self.view_return_context_from_canonical_or_fallback(
+            canonical.map(std::borrow::Cow::Owned),
+            || (path, subfolder_restore),
+        );
         self.show_feedback_toast("★固定を解除しました".into());
-        let rating_view_stars = self.view_return_rating_view_stars_for_path(path.as_deref());
-        let fallback =
-            self.view_return_context_from_parts(path, subfolder_restore, rating_view_stars);
-        Some(fallback)
+        Some(return_context)
     }
 
     /// snapshot を deactivate する (= 退避していた items 等を復元)。
@@ -1038,7 +1125,11 @@ impl App {
             // (child folder 経路は load_folder 由来で既に hydrate 済みなので不要。検索 view 由来
             //  解除は上の at_origin + pre_search_origin 分岐で load_folder に入るのでこちらは通らない。)
             let origin = snap.origin.clone();
-            self.rehydrate_page_edit_state_for_current_items(&origin);
+            if snap.page_edit_source == crate::snapshot::SnapshotPageEditSource::PreparedExact {
+                self.prepare_page_edits_for_current_virtual_items();
+            } else {
+                self.rehydrate_page_edit_state_for_current_items(&origin);
+            }
             if self.color_filter.enabled {
                 self.mark_color_filter_scope_dirty();
                 self.rebuild_visible_indices();
@@ -1071,7 +1162,7 @@ impl App {
         // list_view_items / list_view_thumbnails は activate_snapshot 時に保存した clone を
         // 使う (= reconstruct だと folder 代表サムネが Pending に戻って「フォルダアイコン」
         // 表示になるユーザー報告対応)。
-        let (snap_origin, list_items, list_thumbs, list_image_metas, is_search_snapshot) = {
+        let (snap_origin, list_items, list_thumbs, list_image_metas, exact_page_edits) = {
             let Some(snap) = self.snapshot.as_ref() else {
                 return false;
             };
@@ -1082,9 +1173,20 @@ impl App {
                 snap.list_view_image_metas.clone(),
                 // 検索 view 由来 snapshot は origin が cross-folder prefix なので rehydrate せず
                 // clear のみ (= activate と同じ判定。pre_snapshot_search_origin Some が search 由来)。
-                snap.pre_snapshot_search_origin.is_some(),
+                snap.page_edit_source == crate::snapshot::SnapshotPageEditSource::PreparedExact,
             )
         };
+        let display_epub_source =
+            match crate::pdf_loader::LeasedEpubPath::try_new(snap_origin.clone()) {
+                Ok(source) => source,
+                Err(reason) => {
+                    self.show_open_admission_refusal(reason.into());
+                    return false;
+                }
+            };
+        let display_epub_source = display_epub_source
+            .has_epub_lease()
+            .then_some(display_epub_source);
         // 既に snapshot root に居れば何もしない (= 通常 BS の対象)
         let at_origin = self
             .current_folder
@@ -1116,6 +1218,7 @@ impl App {
         self.thumbnails = list_thumbs;
         self.image_metas = list_image_metas;
         self.visible_indices = (0..n).collect();
+        self.display_epub_source = display_epub_source;
         self.current_folder = Some(snap_origin.clone());
         self.address = snap_origin.display().to_string();
         self.scroll_offset_y = 0.0;
@@ -1130,9 +1233,9 @@ impl App {
         // snapshot list (= subset) に戻したので、ページ編集状態も subset idx で合わせ直す
         // (= activate と同じ、Codex P1)。通常フォルダ由来は origin の DB から hydrate
         // (child folder で編集した分は DB に同期保存済みなので subset 該当ページに反映される)。
-        // 検索 view 由来は cross-folder prefix なので clear のみ (= activate と対称)。
-        if is_search_snapshot {
-            self.clear_page_edit_state();
+        // Prepared virtual sources use their exact keys; physical sources keep prefix hydrate.
+        if exact_page_edits {
+            self.prepare_page_edits_for_current_virtual_items();
         } else {
             self.rehydrate_page_edit_state_for_current_items(&snap_origin);
         }
@@ -1217,10 +1320,12 @@ impl App {
             GridItem::PdfPage {
                 pdf_path, page_num, ..
             } => {
-                // `<pdf>/p:<num>` 形式
-                let mut p = pdf_path.clone();
-                p.push(format!("p:{page_num}"));
-                Some(p)
+                // `<book>/p:<num>` 形式。Windows で PathBuf::push("p:1") を使うと
+                // `p:` がドライブ指定と見なされ、本のパスが失われる。
+                let mut pseudo_path = pdf_path.as_os_str().to_os_string();
+                pseudo_path.push("/");
+                pseudo_path.push(format!("p:{page_num}"));
+                Some(pseudo_path.into())
             }
             _ => None,
         }
@@ -1302,6 +1407,25 @@ impl App {
         resume_slideshow: bool,
         history_trigger: crate::app::HistoryTrigger,
     ) -> bool {
+        self.snapshot_open_entry_with_navigation(entry_idx, resume_slideshow, history_trigger, None)
+    }
+
+    fn accept_snapshot_navigation(&mut self, ctx: Option<&egui::Context>, reload: bool) {
+        let (Some(ctx), Some(fs_idx)) = (ctx, self.fullscreen_idx) else {
+            return;
+        };
+        if reload {
+            self.begin_fs_folder_navigation_sequence(ctx, fs_idx);
+        }
+    }
+
+    fn snapshot_open_entry_with_navigation(
+        &mut self,
+        entry_idx: usize,
+        resume_slideshow: bool,
+        history_trigger: crate::app::HistoryTrigger,
+        ctx: Option<&egui::Context>,
+    ) -> bool {
         use crate::grid_item::GridItem;
         use crate::snapshot::{SnapshotEntryKind, SnapshotTarget};
         let Some(snap) = self.snapshot.as_ref() else {
@@ -1325,6 +1449,7 @@ impl App {
                     }
                     _ => false,
                 }) {
+                    self.accept_snapshot_navigation(ctx, false);
                     self.open_fullscreen(idx, history_trigger);
                     if resume_slideshow {
                         self.slideshow_playing = true;
@@ -1335,6 +1460,7 @@ impl App {
                 // (Codex 3rd P2 fix: 旧版は target を渡していなかったので first playable に
                 // 着地していた)
                 if let Some(folder) = target_path.parent().map(|p| p.to_path_buf()) {
+                    self.accept_snapshot_navigation(ctx, true);
                     self.snapshot_load_and_open(
                         folder,
                         resume_slideshow,
@@ -1361,6 +1487,7 @@ impl App {
                     } => *zp == zip_path && *en == entry_name,
                     _ => false,
                 }) {
+                    self.accept_snapshot_navigation(ctx, false);
                     self.open_fullscreen(idx, history_trigger);
                     if resume_slideshow {
                         self.slideshow_playing = true;
@@ -1368,6 +1495,7 @@ impl App {
                     return true;
                 }
                 // 該当 zip が現在開かれていない → zip を load してから対象 entry を open
+                self.accept_snapshot_navigation(ctx, true);
                 self.snapshot_load_and_open(
                     zip_path,
                     resume_slideshow,
@@ -1388,12 +1516,14 @@ impl App {
                     } => *pp == pdf_path && *pn == page_num,
                     _ => false,
                 }) {
+                    self.accept_snapshot_navigation(ctx, false);
                     self.open_fullscreen(idx, history_trigger);
                     if resume_slideshow {
                         self.slideshow_playing = true;
                     }
                     return true;
                 }
+                self.accept_snapshot_navigation(ctx, true);
                 self.snapshot_load_and_open(
                     pdf_path,
                     resume_slideshow,
@@ -1407,6 +1537,7 @@ impl App {
                     return false;
                 };
                 // container 経路は target None (= first playable に着地)
+                self.accept_snapshot_navigation(ctx, true);
                 self.snapshot_load_and_open(
                     container_path,
                     resume_slideshow,
@@ -1430,6 +1561,7 @@ impl App {
                     return false;
                 }
                 if let Some(cached) = self.try_archive_cache_lookup(&path) {
+                    self.accept_snapshot_navigation(ctx, true);
                     self.snapshot_load_and_open(cached, resume_slideshow, None, history_trigger);
                     true
                 } else {
@@ -1454,7 +1586,7 @@ impl App {
     ///
     /// `load_folder_with_scan` の snapshot guard を bypass するため、`snapshot_internal_nav`
     /// を true にしてから呼ぶ。flag は呼び出し後に false に戻す (= scope guard pattern)。
-    fn snapshot_load_and_open(
+    pub(crate) fn snapshot_load_and_open(
         &mut self,
         folder_path: std::path::PathBuf,
         resume_slideshow: bool,
@@ -1529,6 +1661,300 @@ impl App {
         }
     }
 
+    /// Open one explicitly chosen similar-result leaf without falling back to another item.
+    /// Physical directories are scanned by the existing worker first, so a failed read leaves
+    /// the current viewer untouched. Archive/PDF containers keep a typed navigation owner from
+    /// teardown through asynchronous enumerate and password retry.
+    pub(crate) fn open_required_fullscreen_location(
+        &mut self,
+        ctx: &egui::Context,
+        folder_path: PathBuf,
+        target: crate::snapshot::SnapshotTarget,
+        history_trigger: crate::app::HistoryTrigger,
+    ) {
+        self.open_required_fullscreen_location_with_purpose(
+            ctx,
+            folder_path,
+            target,
+            history_trigger,
+            crate::app::FsNavigationPurpose::Ordinary,
+        );
+    }
+
+    pub(crate) fn open_required_fullscreen_location_with_purpose(
+        &mut self,
+        ctx: &egui::Context,
+        folder_path: PathBuf,
+        target: crate::snapshot::SnapshotTarget,
+        history_trigger: crate::app::HistoryTrigger,
+        navigation_purpose: crate::app::FsNavigationPurpose,
+    ) {
+        self.capture_main_list_restore_cursor();
+        if matches!(target, crate::snapshot::SnapshotTarget::Fs(_)) {
+            // Accepting the new scan supersedes any old ZIP/PDF enumerate or password retry.
+            // The current viewer remains intact until this physical scan succeeds.
+            self.finish_similar_move_diagnostic("async_replaced");
+            self.retire_superseded_required_fullscreen_async_request();
+            self.start_required_fullscreen_folder_open(
+                folder_path,
+                target,
+                history_trigger,
+                navigation_purpose,
+            );
+            return;
+        }
+        self.open_required_fullscreen_from_location_load(
+            ctx,
+            folder_path,
+            target,
+            history_trigger,
+            navigation_purpose,
+        );
+    }
+
+    fn retire_superseded_required_fullscreen_async_request(&mut self) {
+        self.cancel_inflight_order_dependent_folder_nav();
+        self.pdf_enumerate_pending = None;
+        self.zip_enumerate_pending = None;
+        self.pdf_password_request = None;
+        self.pdf_password_pending_save = None;
+        self.pdf_password_input.clear();
+        self.pdf_password_error = None;
+        self.pdf_password_save = false;
+        self.fs_nav_after_pdf_enumerate = None;
+    }
+
+    /// A failed exact-folder scan returns to an existing page when one still exists. When a PDF
+    /// password gap has no page to return to, the same failure is the real end of the viewer.
+    pub(crate) fn finish_required_fullscreen_folder_scan_failure(&mut self) {
+        let finish = if self.fullscreen_idx.is_some() {
+            crate::app::FsNavigationSequenceFinish::Superseded
+        } else {
+            crate::app::FsNavigationSequenceFinish::RequestFailed
+        };
+        self.finish_fs_navigation_sequence(finish);
+    }
+
+    pub(crate) fn finish_fullscreen_navigation_for_true_close(&mut self) {
+        self.cancel_required_fullscreen_folder_open();
+        self.cancel_inflight_order_dependent_folder_nav();
+        if self.fs_nav_after_pdf_enumerate.is_some() || self.pdf_password_request.is_some() {
+            self.pdf_enumerate_pending = None;
+            self.zip_enumerate_pending = None;
+            self.pdf_password_request = None;
+            self.pdf_password_pending_save = None;
+            self.pdf_password_input.clear();
+            self.pdf_password_error = None;
+            self.pdf_password_save = false;
+            self.fs_nav_after_pdf_enumerate = None;
+        }
+        self.finish_fs_navigation_sequence(crate::app::FsNavigationSequenceFinish::ViewerExited);
+    }
+
+    pub(super) fn prepare_required_fullscreen_navigation(
+        &mut self,
+        ctx: &egui::Context,
+        navigation_purpose: crate::app::FsNavigationPurpose,
+    ) -> bool {
+        if !self.supersede_and_begin_fs_folder_navigation_sequence(ctx, navigation_purpose) {
+            return false;
+        }
+        // The new typed owner has replaced the old request. Retire the old async payload without
+        // publishing a fullscreen exit; the new owner now carries the same viewer forward.
+        self.retire_superseded_required_fullscreen_async_request();
+        if self.is_snapshot_active() {
+            let _ = self.dismiss_snapshot_without_restore();
+        }
+        // ZIP/PDF loaders clear and enumerate before the shared item-install teardown. Close the
+        // old content explicitly while the typed owner is already active; a physical directory
+        // reaches this same boundary only after its worker scan succeeds.
+        self.close_fullscreen_for_folder_nav_reopen();
+        true
+    }
+
+    pub(super) fn finish_required_fullscreen_load(
+        &mut self,
+        target: crate::snapshot::SnapshotTarget,
+        history_trigger: crate::app::HistoryTrigger,
+    ) {
+        if self.pdf_enumerate_pending.is_some() || self.zip_enumerate_pending.is_some() {
+            self.fs_nav_after_pdf_enumerate = Some(crate::app::DeferredFsReopen {
+                history_trigger,
+                resume_slideshow: false,
+                target: crate::app::DeferredFsTarget::Required(target),
+                resume_to_last_page: false,
+                from_explicit_open: false,
+                preserve_after_password_prompt: true,
+            });
+            return;
+        }
+        let Some(idx) = self.resolve_required_snapshot_target_idx(&target) else {
+            self.finish_fs_navigation_sequence(
+                crate::app::FsNavigationSequenceFinish::RequestFailed,
+            );
+            self.show_feedback_toast("移動先の画像が見つかりません".to_string());
+            return;
+        };
+        self.open_fullscreen(idx, history_trigger);
+        self.selected = Some(idx);
+        self.scroll_to_selected = true;
+        self.update_last_selected_image();
+    }
+
+    fn open_required_fullscreen_from_location_load(
+        &mut self,
+        ctx: &egui::Context,
+        folder_path: PathBuf,
+        target: crate::snapshot::SnapshotTarget,
+        history_trigger: crate::app::HistoryTrigger,
+        navigation_purpose: crate::app::FsNavigationPurpose,
+    ) {
+        if self.main_folder_history_available()
+            && matches!(
+                target,
+                crate::snapshot::SnapshotTarget::ZipImage { .. }
+                    | crate::snapshot::SnapshotTarget::PdfPage { .. }
+            )
+            && crate::folder_tree::is_virtual_folder(&folder_path)
+        {
+            // A prepared ZIP/PDF has no legacy enumerate receiver yet. Carry the required
+            // page into the staged owner so exact-leaf resolution runs after visible adoption.
+            self.snapshot_internal_nav = true;
+            let started = self
+                .claim_open_request_owner(&folder_path, &crate::app::OpenRequestOwner::Navigation)
+                && self.start_physical_history_transition(
+                    crate::app::PhysicalHistoryIntent::RequiredFullscreen {
+                        target,
+                        history_trigger,
+                        navigation_purpose,
+                    },
+                    folder_path,
+                    crate::app::StartupListIntent::PageContinuation,
+                );
+            self.snapshot_internal_nav = false;
+            if !started {
+                self.show_feedback_toast("画像の場所を開けません".to_string());
+            }
+            return;
+        }
+        if !self.prepare_required_fullscreen_navigation(ctx, navigation_purpose) {
+            self.show_feedback_toast("画像の場所を開けません".to_string());
+            return;
+        }
+        self.snapshot_internal_nav = true;
+        self.load_folder_with_scan_owned(
+            folder_path,
+            None,
+            crate::app::OpenRequestOwner::Navigation,
+            crate::app::StartupListIntent::PageContinuation,
+        );
+        self.snapshot_internal_nav = false;
+        self.finish_required_fullscreen_load(target, history_trigger);
+    }
+
+    pub(crate) fn open_required_fullscreen_from_completed_scan(
+        &mut self,
+        ctx: &egui::Context,
+        folder_path: PathBuf,
+        scan: crate::app::ScannedDir,
+        target: crate::snapshot::SnapshotTarget,
+        history_trigger: crate::app::HistoryTrigger,
+        navigation_purpose: crate::app::FsNavigationPurpose,
+    ) {
+        if !self.prepare_required_fullscreen_navigation(ctx, navigation_purpose) {
+            self.show_feedback_toast("画像の場所を開けません".to_string());
+            return;
+        }
+        self.snapshot_internal_nav = true;
+        self.load_folder_with_scan_owned(
+            folder_path,
+            Some(scan),
+            crate::app::OpenRequestOwner::Navigation,
+            crate::app::StartupListIntent::PageContinuation,
+        );
+        self.snapshot_internal_nav = false;
+        self.finish_required_fullscreen_load(target, history_trigger);
+    }
+
+    pub(crate) fn resolve_required_snapshot_target_idx(
+        &mut self,
+        target: &crate::snapshot::SnapshotTarget,
+    ) -> Option<usize> {
+        use crate::grid_item::GridItem;
+        use crate::snapshot::SnapshotTarget;
+        match target {
+            SnapshotTarget::Fs(path) => self.items.iter().position(|item| {
+                matches!(
+                    item,
+                    GridItem::Image(candidate) | GridItem::Video(candidate)
+                        if crate::path_key::eq_keep_drive(candidate, path)
+                )
+            }),
+            SnapshotTarget::PdfPage { pdf_path, page_num } => self.items.iter().position(|item| {
+                matches!(
+                    item,
+                    GridItem::PdfPage {
+                        pdf_path: candidate,
+                        page_num: candidate_page,
+                        ..
+                    } if crate::path_key::eq_keep_drive(candidate, pdf_path)
+                        && candidate_page == page_num
+                )
+            }),
+            SnapshotTarget::ZipImage {
+                zip_path,
+                entry_name,
+            } => {
+                let materialized =
+                    self.materialize_required_archive_target(zip_path, entry_name)?;
+                self.resolve_snapshot_target_idx(&materialized)
+            }
+            SnapshotTarget::ConvertibleArchive { .. } => None,
+        }
+    }
+
+    fn materialize_required_archive_target(
+        &mut self,
+        requested_outer: &Path,
+        requested_entry: &str,
+    ) -> Option<crate::snapshot::SnapshotTarget> {
+        let (tree_path, target) = {
+            let nav = self.zip_nav.as_ref()?;
+            let tree_path = nav.tree.zip_path.clone();
+            let direct = crate::path_key::eq_keep_drive(&tree_path, requested_outer);
+            let converted_alias = self
+                .archive_source_override
+                .as_deref()
+                .is_some_and(|source| {
+                    crate::path_key::eq_keep_drive(source, requested_outer)
+                        && self.current_folder.as_deref().is_some_and(|current| {
+                            crate::path_key::eq_keep_drive(current, &tree_path)
+                        })
+                });
+            if !direct && !converted_alias {
+                return None;
+            }
+            let target = crate::book_bookmarks::resolve_archive_bookmark_target(
+                &nav.tree,
+                requested_entry,
+                &self.settings.grid_display_order,
+            )?;
+            (tree_path, target)
+        };
+        let already_materialized = self.zip_nav.as_ref().is_some_and(|nav| {
+            let current = nav.current().join("/");
+            current == target.effective_prefix.trim_end_matches('/')
+        });
+        if !already_materialized {
+            self.zip_nav.as_mut()?.enter(&target.effective_prefix);
+            self.zip_nav_show_current_level(crate::app::StartupListIntent::PageContinuation);
+        }
+        Some(crate::snapshot::SnapshotTarget::ZipImage {
+            zip_path: tree_path,
+            entry_name: target.entry_name,
+        })
+    }
+
     /// `SnapshotTarget` を現在の `items` から解決して idx を返す (Codex P2 fix の共有 helper)。
     ///
     /// `snapshot_load_and_open` の同期 open 経路と、`poll_zip_enumerate` /
@@ -1548,13 +1974,31 @@ impl App {
             SnapshotTarget::ZipImage {
                 zip_path,
                 entry_name,
-            } => self.items.iter().position(|it| match it {
-                GridItem::ZipImage {
-                    zip_path: zp,
-                    entry_name: en,
-                } => zp == zip_path && en == entry_name,
-                _ => false,
-            }),
+            } => self
+                .items
+                .iter()
+                .position(|it| match it {
+                    GridItem::ZipImage {
+                        zip_path: zp,
+                        entry_name: en,
+                    } => zp == zip_path && en == entry_name,
+                    _ => false,
+                })
+                .or_else(|| {
+                    // The similar index stores its Windows/ZIP identity case-folded. Preserve
+                    // exact matching for normal snapshot callers, then accept that canonical
+                    // identity as a fallback for a result-row navigation target.
+                    self.items.iter().position(|it| match it {
+                        GridItem::ZipImage {
+                            zip_path: zp,
+                            entry_name: en,
+                        } => {
+                            crate::similar_index::item_key_for_zip_page(zp, en)
+                                == crate::similar_index::item_key_for_zip_page(zip_path, entry_name)
+                        }
+                        _ => false,
+                    })
+                }),
             SnapshotTarget::PdfPage { pdf_path, page_num } => {
                 self.items.iter().position(|it| match it {
                     GridItem::PdfPage {
@@ -1589,9 +2033,15 @@ impl App {
         entry_idx: usize,
         resume_slideshow: bool,
         history_trigger: crate::app::HistoryTrigger,
+        ctx: Option<&egui::Context>,
     ) -> bool {
         let gen_before = self.items_generation;
-        let opened = self.snapshot_open_entry(entry_idx, resume_slideshow, history_trigger);
+        let opened = self.snapshot_open_entry_with_navigation(
+            entry_idx,
+            resume_slideshow,
+            history_trigger,
+            ctx,
+        );
         if self.items_generation == gen_before && self.fs_nav_after_pdf_enumerate.is_none() {
             if !opened || !self.bind_fs_navigation_sequence_to_current_target() {
                 self.release_fs_nav_lock();
@@ -1629,7 +2079,12 @@ impl App {
         if let Some(idx) = next {
             // 直接 open 後の nav lock 解除を含めて wrapper に委譲 (= スライドショー経路と共有、
             // 経路漏れ防止)。
-            self.snapshot_open_entry_release_lock_if_direct(idx, resume_slideshow, history_trigger)
+            self.snapshot_open_entry_release_lock_if_direct(
+                idx,
+                resume_slideshow,
+                history_trigger,
+                Some(ctx),
+            )
         } else {
             // 末尾: boundary hint + nav lock 解除
             // snapshot 経路は apply_folder_nav_result を通らないので、capture_fs_nav_holdover
@@ -1813,6 +2268,7 @@ impl App {
                 idx,
                 /*resume_slideshow=*/ true,
                 crate::app::HistoryTrigger::AutoAdvance,
+                None,
             );
             true
         } else {
@@ -1888,11 +2344,138 @@ mod tests {
     }
 
     #[test]
+    fn required_snapshot_target_matches_scanned_path_separator_variants() {
+        use crate::snapshot::SnapshotTarget;
+
+        let mut app = test_app_with_items(vec![
+            GridItem::Image(PathBuf::from(r"E:\test\page.png")),
+            GridItem::Video(PathBuf::from(r"E:\test\clip.mp4")),
+            GridItem::PdfPage {
+                pdf_path: PathBuf::from(r"E:\test\book.pdf"),
+                page_num: 3,
+                content_type: None,
+            },
+        ]);
+        assert_eq!(
+            app.resolve_required_snapshot_target_idx(&SnapshotTarget::Fs(PathBuf::from(
+                "E:/test/page.png"
+            ))),
+            Some(0)
+        );
+        assert_eq!(
+            app.resolve_required_snapshot_target_idx(&SnapshotTarget::Fs(PathBuf::from(
+                "E:/test/clip.mp4"
+            ))),
+            Some(1)
+        );
+        assert_eq!(
+            app.resolve_required_snapshot_target_idx(&SnapshotTarget::PdfPage {
+                pdf_path: PathBuf::from("E:/test/book.pdf"),
+                page_num: 3,
+            }),
+            Some(2)
+        );
+
+        let zip_path = PathBuf::from(r"E:\test\book.zip");
+        app.items = vec![GridItem::ZipImage {
+            zip_path: zip_path.clone(),
+            entry_name: "page.png".into(),
+        }];
+        let tree = std::sync::Arc::new(crate::zip_tree::ZipTree::build(
+            zip_path.clone(),
+            vec![crate::zip_loader::ZipImageEntry {
+                entry_name: "page.png".into(),
+                uncompressed_size: 0,
+                mtime: 0,
+            }],
+        ));
+        app.zip_nav = Some(crate::zip_tree::ZipNavState::new(tree));
+        assert_eq!(
+            app.resolve_required_snapshot_target_idx(&SnapshotTarget::ZipImage {
+                zip_path: PathBuf::from("E:/test/book.zip"),
+                entry_name: "page.png".into(),
+            }),
+            Some(0)
+        );
+        app.archive_source_override = Some(PathBuf::from(r"E:\test\book.rar"));
+        app.current_folder = Some(PathBuf::from("E:/test/book.zip"));
+        assert_eq!(
+            app.resolve_required_snapshot_target_idx(&SnapshotTarget::ZipImage {
+                zip_path: PathBuf::from("E:/test/book.rar"),
+                entry_name: "page.png".into(),
+            }),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn required_virtual_leaf_stages_before_filesystem_preflight() {
+        use crate::snapshot::SnapshotTarget;
+
+        let temp = tempfile::tempdir().unwrap();
+        for (name, pdf) in [("missing.zip", false), ("missing.pdf", true)] {
+            let path = temp.path().join(name);
+            let target = if pdf {
+                SnapshotTarget::PdfPage {
+                    pdf_path: path.clone(),
+                    page_num: 0,
+                }
+            } else {
+                SnapshotTarget::ZipImage {
+                    zip_path: path.clone(),
+                    entry_name: "page.jpg".into(),
+                }
+            };
+            let old_page = temp.path().join("old.jpg");
+            let mut app = test_app_with_items(vec![GridItem::Image(old_page)]);
+            app.fullscreen_idx = Some(0);
+            let old_items = app.items.clone();
+
+            app.open_required_fullscreen_location(
+                &egui::Context::default(),
+                path,
+                target,
+                crate::app::HistoryTrigger::UserChosen,
+            );
+
+            assert!(
+                app.top_level_grid_view
+                    .history_navigation_transition()
+                    .is_some(),
+                "the worker must classify the container before changing the visible viewer"
+            );
+            assert_eq!(app.items, old_items);
+            assert_eq!(app.fullscreen_idx, Some(0));
+        }
+    }
+
+    #[test]
     fn snapshot_inactive_by_default() {
         let app = setup_app_for_test();
         assert!(!app.is_snapshot_active());
         assert_eq!(app.snapshot_count(), None);
         assert!(app.snapshot_origin().is_none());
+    }
+
+    #[test]
+    fn snapshot_index_space_change_retires_secondary_press_owner() {
+        let mut app = setup_app_for_test();
+        app.fullscreen_idx = Some(0);
+        app.fs_secondary_press = crate::ui_fullscreen::FullscreenSecondaryPress::armed_for_test(
+            app.edit_request_owner_context(),
+            app.items_generation,
+            0,
+            crate::ring_shortcut::RightDragContext::ImageFullscreen,
+            std::time::Instant::now(),
+            egui::pos2(100.0, 120.0),
+        );
+
+        app.clear_snapshot_index_space_derived_state();
+
+        assert_eq!(
+            app.fs_secondary_press,
+            crate::ui_fullscreen::FullscreenSecondaryPress::Idle
+        );
     }
 
     /// ネスト ZIP の本の中で ★固定 → zip_nav は必ず退避 (take) され、at_origin の解除で
@@ -2458,6 +3041,15 @@ mod tests {
             }),
             Some(2)
         );
+        // Similar-result identity is case-folded; exact lookup misses but canonical fallback lands
+        // on the enumerated entry without doing filesystem work on the UI thread.
+        assert_eq!(
+            app.resolve_snapshot_target_idx(&SnapshotTarget::ZipImage {
+                zip_path: PathBuf::from(r"e:\TEST\ARC.ZIP"),
+                entry_name: "SUB/IMG.PNG".into(),
+            }),
+            Some(2)
+        );
         // 別ページ番号は不一致 → None
         assert_eq!(
             app.resolve_snapshot_target_idx(&SnapshotTarget::PdfPage {
@@ -2524,6 +3116,147 @@ mod tests {
             !app.fs_nav_is_locked(),
             "直接 open 後は nav lock が解除され、次の Ctrl+↑↓ が block されない"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn snapshot_rejected_archive_keeps_scan_and_accepted_leaf_cancels_it() {
+        use crate::app::normalize::NormalizeScanState;
+        use crate::archive_converter::ArchiveFormat;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let ctx = egui::Context::default();
+        let old_path = PathBuf::from(r"E:\test\playing.mp4");
+        let next_path = PathBuf::from(r"E:\test\next.mp4");
+        let archive_path = PathBuf::from(r"E:\test\missing.7z");
+        let mut app = test_app_with_items(vec![
+            GridItem::Video(old_path.clone()),
+            GridItem::ConvertibleArchive {
+                path: archive_path,
+                format: ArchiveFormat::SevenZ,
+            },
+            GridItem::Video(next_path),
+        ]);
+        app.settings.archive_file_handling = crate::settings::ArchiveFileHandling::Ignore;
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        app.fullscreen_idx = Some(0);
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(old_path.clone());
+        player.set_opened_audio_stream_for_test(1, 0);
+        app.fs_cache.insert(
+            0,
+            crate::app::FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        app.normalize_state = Some(NormalizeScanState {
+            owner_context_id: app.projected_viewer_context_id(),
+            fs_idx: 0,
+            stream_index: 1,
+            cancel: cancelled.clone(),
+            progress: std::sync::Arc::new(
+                crate::video::normalize_scanner::NormalizeScanProgress::default(),
+            ),
+            rx: std::sync::mpsc::channel().1,
+            was_playing: false,
+            file_path: old_path,
+            target_lufs_milli: -14_000,
+            provisional_applied: false,
+            provisional_result: None,
+            _join: std::thread::spawn(|| {}),
+        });
+
+        assert!(!app.snapshot_navigate(
+            &ctx,
+            true,
+            false,
+            false,
+            crate::app::HistoryTrigger::UserChosen,
+        ));
+        assert!(
+            app.normalize_state.is_some(),
+            "開けない項目では scan を続ける"
+        );
+        assert!(!cancelled.load(Ordering::Acquire));
+
+        // The next accepted direct leaf uses the same snapshot owner path.
+        app.snapshot.as_mut().unwrap().items.remove(1);
+        assert!(app.snapshot_navigate(
+            &ctx,
+            true,
+            false,
+            false,
+            crate::app::HistoryTrigger::UserChosen,
+        ));
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(app.normalize_state.is_none());
+        assert_eq!(app.fullscreen_idx, Some(2));
+    }
+
+    #[test]
+    fn snapshot_epub_page_list_navigates_from_current_page() {
+        let ctx = egui::Context::default();
+        let book = PathBuf::from(r"E:\test\book.epub");
+        let mut app = test_app_with_items(
+            (0..3)
+                .map(|page_num| GridItem::PdfPage {
+                    pdf_path: book.clone(),
+                    page_num,
+                    content_type: None,
+                })
+                .collect(),
+        );
+        app.current_folder = Some(book);
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        assert!(app.snapshot_open_entry(1, false, crate::app::HistoryTrigger::UserChosen,));
+        assert_eq!(
+            app.snapshot_owner_entry(&app.snapshot_current_fullscreen_path().unwrap()),
+            Some(1)
+        );
+        assert!(app.snapshot_navigate(
+            &ctx,
+            true,
+            false,
+            false,
+            crate::app::HistoryTrigger::UserChosen,
+        ));
+        assert_eq!(app.fullscreen_idx, Some(2));
+        assert_eq!(
+            app.snapshot_owner_entry(&app.snapshot_current_fullscreen_path().unwrap()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn snapshot_pdf_pages_inside_epub_named_folder_keep_their_owner() {
+        let ctx = egui::Context::default();
+        let book = PathBuf::from(r"E:\test\shelf.epub\book.pdf");
+        let mut app = test_app_with_items(
+            (0..3)
+                .map(|page_num| GridItem::PdfPage {
+                    pdf_path: book.clone(),
+                    page_num,
+                    content_type: None,
+                })
+                .collect(),
+        );
+        app.current_folder = Some(book);
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        assert!(app.snapshot_open_entry(1, false, crate::app::HistoryTrigger::UserChosen));
+        assert_eq!(
+            app.snapshot_owner_entry(&app.snapshot_current_fullscreen_path().unwrap()),
+            Some(1),
+        );
+        assert!(app.snapshot_navigate(
+            &ctx,
+            true,
+            false,
+            false,
+            crate::app::HistoryTrigger::UserChosen,
+        ));
+        assert_eq!(app.fullscreen_idx, Some(2));
     }
 
     /// Codex follow-up (スライドショー経路): snapshot スライドショーの直接 leaf 送りでも

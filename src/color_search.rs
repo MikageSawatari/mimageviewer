@@ -56,6 +56,8 @@ pub struct PaletteEntry {
 #[derive(Debug, Default)]
 pub struct ScanPalettes {
     pub map: HashMap<ColorPaletteKey, PaletteEntry>,
+    /// Per-item thumbnail mutations, scoped to this listing. GPU eviction does not advance these.
+    pub representative_revisions: HashMap<String, u64>,
     pub active_scan_id: u64,
     pub last_scope_signature: Option<ScanScopeSignature>,
 }
@@ -72,6 +74,7 @@ impl ScanPalettes {
 
     pub fn clear(&mut self) {
         self.map.clear();
+        self.representative_revisions.clear();
         self.last_scope_signature = None;
     }
 }

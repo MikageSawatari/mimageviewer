@@ -893,13 +893,142 @@ pub(crate) fn seek_strip_may_open(context: SeekStripOpenContext) -> bool {
         && !context.hud_dimmed
 }
 
+/// A stable resource-session identity for one viewer context and source.
+///
+/// Layout changes intentionally keep this id: they advance [`SeekStripLayoutRevision`] while the
+/// thumbnail/wave workers and decoder remain owned by the same session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SeekStripSessionId(pub(crate) u64);
+
+/// Identifies the renderer layout which produced a strip command or feedback sample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SeekStripLayoutRevision(pub(crate) u64);
+
+/// Identity embedded in an overlay payload and copied into every command produced from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SeekStripRenderStamp {
+    pub session_id: SeekStripSessionId,
+    pub layout_revision: SeekStripLayoutRevision,
+}
+
+/// A renderer stamp joined with the presenter generation that delivered the command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SeekStripEventStamp {
+    pub session_id: SeekStripSessionId,
+    pub layout_revision: SeekStripLayoutRevision,
+    pub generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SeekStripSessionEventStamp {
+    pub session_id: SeekStripSessionId,
+    pub generation: u64,
+}
+
+impl SeekStripRenderStamp {
+    pub(crate) const fn at_generation(self, generation: u64) -> SeekStripEventStamp {
+        SeekStripEventStamp {
+            session_id: self.session_id,
+            layout_revision: self.layout_revision,
+            generation,
+        }
+    }
+
+    pub(crate) const fn session_at_generation(self, generation: u64) -> SeekStripSessionEventStamp {
+        SeekStripSessionEventStamp {
+            session_id: self.session_id,
+            generation,
+        }
+    }
+}
+
+/// Final logical seek-strip inventory committed by a successful presenter pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeekStripPresentedInventory {
+    Absent,
+    Hidden(SeekStripRenderStamp),
+    Visible(SeekStripRenderStamp),
+}
+
+impl SeekStripPresentedInventory {
+    /// Whether two successful presents describe the same App-visible lifecycle state.
+    ///
+    /// A layout revision invalidates geometry feedback, but it does not hide, show, close or
+    /// reopen the resource session. Presentation notifications therefore compare the stable
+    /// session id and visibility state while the renderer still keeps the newest full stamp for
+    /// RequestWindow validation.
+    pub(crate) fn same_presentation_state(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Absent, Self::Absent) => true,
+            (Self::Hidden(left), Self::Hidden(right))
+            | (Self::Visible(left), Self::Visible(right)) => left.session_id == right.session_id,
+            _ => false,
+        }
+    }
+}
+
+/// Latest-value presenter observation delivered to the App lifecycle reducer.
+///
+/// A successful visible present carries its exact final layout feedback in the same snapshot.
+/// Keeping the lifecycle edge and feedback together prevents a later Hidden snapshot from
+/// coalescing only the visibility half and leaving an already-deduplicated window request behind.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SeekStripPresentationEvent {
+    Hidden(SeekStripSessionEventStamp),
+    Visible {
+        stamp: SeekStripSessionEventStamp,
+        window: Option<SeekStripWindowEvent>,
+    },
+}
+
+/// Exact final-pass geometry attached to one successful visible presenter snapshot.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SeekStripWindowEvent {
+    pub center: SeekStripCenter,
+    pub visible_count: usize,
+    pub pixel_width: usize,
+    pub pixel_height: usize,
+    pub stamp: SeekStripEventStamp,
+}
+
+/// Renderer-owned form of [`SeekStripWindowEvent`] before the output loop stamps placement.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SeekStripPresentedWindow {
+    pub(crate) center: SeekStripCenter,
+    pub(crate) visible_count: usize,
+    pub(crate) pixel_width: usize,
+    pub(crate) pixel_height: usize,
+    pub(crate) stamp: SeekStripRenderStamp,
+}
+
+impl SeekStripPresentedWindow {
+    pub(crate) const fn at_generation(self, generation: u64) -> SeekStripWindowEvent {
+        SeekStripWindowEvent {
+            center: self.center,
+            visible_count: self.visible_count,
+            pixel_width: self.pixel_width,
+            pixel_height: self.pixel_height,
+            stamp: self.stamp.at_generation(generation),
+        }
+    }
+}
+
+/// Latest renderer snapshot waiting for accepted publication on the App output bus.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum SeekStripPresentedUpdate {
+    Hidden(SeekStripRenderStamp),
+    Visible {
+        stamp: SeekStripRenderStamp,
+        window: Option<SeekStripPresentedWindow>,
+    },
+}
+
 /// ストリップを閉じる lifecycle 境界。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SeekStripCloseCause {
     Toggle,
     DownwardDrag,
     Escape,
-    HudHidden,
     VideoChanged,
     FullscreenExit,
     TileModeOpened,
@@ -920,10 +1049,8 @@ impl SeekStripCloseCause {
     /// a video with no usable material, or a trip through the tile grid, would otherwise cancel
     /// the pin for every video after it.
     ///
-    /// `HudHidden` と `Unavailable` は 2026-08-31 にこちら側へ移した (§1.146)。**固定して
-    /// いない状態で `HudHidden` が選択を消していた**ので、シークバーが自動で隠れて出し直す
-    /// たびにストリップが「なし」に戻っていた。利用者はストリップを閉じていない。
-    /// `Unavailable` も同じで、素材の都合で開けなかった 1 本が、そのあとの動画すべてから
+    /// `Unavailable` は 2026-08-31 にこちら側へ移した (§1.146)。素材の都合で開けなかった
+    /// 1 本が、そのあとの動画すべてから
     /// 選択を奪っていた (固定中にそれを禁じている上のコメントと同じ理由が、固定して
     /// いなくても成り立つ)。
     ///
@@ -2140,11 +2267,10 @@ mod tests {
     }
 
     /// 宣言されている close cause 全部。増やしたらここへ足す。
-    const ALL_CLOSE_CAUSES: [SeekStripCloseCause; 8] = [
+    const ALL_CLOSE_CAUSES: [SeekStripCloseCause; 7] = [
         SeekStripCloseCause::Toggle,
         SeekStripCloseCause::DownwardDrag,
         SeekStripCloseCause::Escape,
-        SeekStripCloseCause::HudHidden,
         SeekStripCloseCause::VideoChanged,
         SeekStripCloseCause::FullscreenExit,
         SeekStripCloseCause::TileModeOpened,
@@ -2180,8 +2306,7 @@ mod tests {
                 // もう一方の面を明示的に開いた。復帰は tile 側の仕組みが持つ。
                 SeekStripCloseCause::TileModeOpened => (true, false),
                 // 利用者は何も閉じていない。選択は残す (§1.146)。
-                SeekStripCloseCause::HudHidden
-                | SeekStripCloseCause::Unavailable
+                SeekStripCloseCause::Unavailable
                 | SeekStripCloseCause::VideoChanged
                 | SeekStripCloseCause::FullscreenExit => (false, false),
             }
@@ -2211,7 +2336,6 @@ mod tests {
                 SeekStripCloseCause::Toggle
                 | SeekStripCloseCause::DownwardDrag
                 | SeekStripCloseCause::Escape
-                | SeekStripCloseCause::HudHidden
                 | SeekStripCloseCause::TileModeOpened
                 | SeekStripCloseCause::Unavailable => true,
             }

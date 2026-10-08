@@ -55,6 +55,111 @@ mod ffi {
 // 公開 API
 // -----------------------------------------------------------------------
 
+/// Native popup positioning uses physical pixels and the taskbar-excluded area.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PhysicalWorkArea {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+pub(crate) fn window_work_area(hwnd_raw: isize) -> Option<PhysicalWorkArea> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::Graphics::Gdi::{
+            GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
+            MonitorFromWindow,
+        };
+        let monitor = unsafe {
+            MonitorFromWindow(
+                HWND(hwnd_raw as *mut _),
+                if hwnd_raw == 0 {
+                    MONITOR_DEFAULTTOPRIMARY
+                } else {
+                    MONITOR_DEFAULTTONEAREST
+                },
+            )
+        };
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+            return None;
+        }
+        Some(PhysicalWorkArea {
+            left: info.rcWork.left,
+            top: info.rcWork.top,
+            right: info.rcWork.right,
+            bottom: info.rcWork.bottom,
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd_raw;
+        None
+    }
+}
+
+pub(crate) fn foreground_work_area() -> Option<PhysicalWorkArea> {
+    #[cfg(windows)]
+    {
+        let hwnd = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
+        window_work_area(hwnd.0 as isize)
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// Query only at root startup. HWND-based work area/DPI avoids guessing a
+/// monitor from logical coordinates on mixed-DPI desktops.
+pub(crate) fn startup_window_bounds(
+    hwnd_raw: isize,
+) -> Option<crate::startup_window_geometry::StartupWindowBounds> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::{HWND, RECT};
+        use windows::Win32::UI::HiDpi::GetDpiForWindow;
+        use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowRect};
+        let work = window_work_area(hwnd_raw)?;
+        let hwnd = HWND(hwnd_raw as *mut _);
+        let mut outer = RECT::default();
+        let mut client = RECT::default();
+        unsafe {
+            GetWindowRect(hwnd, &mut outer).ok()?;
+            GetClientRect(hwnd, &mut client).ok()?;
+        }
+        let dpi = unsafe { GetDpiForWindow(hwnd) };
+        if dpi == 0 || work.right <= work.left || work.bottom <= work.top {
+            return None;
+        }
+        Some(crate::startup_window_geometry::StartupWindowBounds {
+            work_area: egui::Rect::from_min_max(
+                egui::pos2(work.left as f32, work.top as f32),
+                egui::pos2(work.right as f32, work.bottom as f32),
+            ),
+            outer_rect: egui::Rect::from_min_max(
+                egui::pos2(outer.left as f32, outer.top as f32),
+                egui::pos2(outer.right as f32, outer.bottom as f32),
+            ),
+            client_size: egui::vec2(
+                (client.right - client.left) as f32,
+                (client.bottom - client.top) as f32,
+            ),
+            native_pixels_per_point: dpi as f32 / 96.0,
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd_raw;
+        None
+    }
+}
+
 /// タイトルバーの中央が接続済みモニター上にあるかを確認する。
 /// モニターが切断されて座標が画面外になっている場合 false を返す。
 /// 引数は egui 論理ピクセル座標。

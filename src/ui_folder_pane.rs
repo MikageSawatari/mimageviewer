@@ -3,7 +3,7 @@
 use eframe::egui;
 
 use crate::app::App;
-use crate::folder_pane::{self, FolderPaneCommand, FolderPaneTreeKey};
+use crate::folder_pane::{self, FolderPaneCommand, FolderPaneListingOptions, FolderPaneTreeKey};
 use crate::ui_main::AddressBarNav;
 
 const FOLDER_PANE_MIN_WIDTH: f32 = 180.0;
@@ -33,6 +33,24 @@ fn folder_pane_trailing_width(ui: &egui::Ui, has_trailing_widget: bool) -> f32 {
     }
 }
 
+fn folder_tree_sort_combo(
+    ui: &mut egui::Ui,
+    current: crate::settings::FolderTreeSortOrder,
+) -> crate::settings::FolderTreeSortOrder {
+    let mut next = current;
+    egui::ComboBox::from_id_salt("folder_pane_sort_combo")
+        .width(72.0)
+        .selected_text(current.short_label())
+        .show_ui(ui, |ui| {
+            for option in crate::settings::FolderTreeSortOrder::ALL {
+                ui.selectable_value(&mut next, option, option.label());
+            }
+        })
+        .response
+        .on_hover_text("フォルダツリーの並び順");
+    next
+}
+
 fn show_bounded_folder_pane_body<R>(
     ui: &mut egui::Ui,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
@@ -58,8 +76,7 @@ impl App {
             let active = self.effective_folder();
             self.folder_pane.sync_to_active(
                 active.as_deref(),
-                self.settings.sort_order,
-                self.settings.show_hidden_files,
+                FolderPaneListingOptions::from_settings(&self.settings),
             );
             self.folder_pane.set_focus_tree_at_active();
         } else {
@@ -95,8 +112,7 @@ impl App {
         let active = self.effective_folder();
         self.folder_pane.sync_to_active(
             active.as_deref(),
-            self.settings.sort_order,
-            self.settings.show_hidden_files,
+            FolderPaneListingOptions::from_settings(&self.settings),
         );
         if self.folder_pane.poll_pending() {
             ctx.request_repaint();
@@ -148,10 +164,7 @@ impl App {
                 }
             });
             if let Some(key) = key {
-                if let Some(FolderPaneCommand::Open(path)) = self
-                    .folder_pane
-                    .handle_tree_key(key, self.settings.sort_order)
-                {
+                if let Some(FolderPaneCommand::Open(path)) = self.folder_pane.handle_tree_key(key) {
                     self.folder_pane.set_focus_grid();
                     // クリック経路と同じく worker scan 経由で開く (UI スレッドの
                     // read_dir ブロック回避)。Enter は consume 済みなので、この後
@@ -233,7 +246,7 @@ impl App {
             let mut next_drive = selected_drive.clone();
             let drives = self.folder_pane.drives().to_vec();
             egui::ComboBox::from_id_salt("folder_pane_drive_combo")
-                .width(84.0)
+                .width(54.0)
                 .selected_text(selected_text)
                 .show_ui(ui, |ui| {
                     for drive in drives {
@@ -251,8 +264,23 @@ impl App {
                     .as_ref()
                     .is_none_or(|current| !crate::folder_tree::path_eq(current, &drive))
             {
-                self.folder_pane
-                    .select_drive(drive, self.settings.sort_order);
+                self.folder_pane.select_drive(drive);
+            }
+
+            let previous_sort = self.settings.folder_tree_sort_order;
+            let next_sort = folder_tree_sort_combo(ui, previous_sort);
+            if next_sort != previous_sort {
+                // The in-flight DFS/sibling/smart-folder result owns the previous tree-order
+                // snapshot. Drop it before publishing the new authoritative order; an exact-path
+                // pane open does not depend on ordering and remains valid.
+                self.cancel_inflight_order_dependent_folder_nav();
+                self.settings.folder_tree_sort_order = next_sort;
+                let active = self.effective_folder();
+                self.folder_pane.sync_to_active(
+                    active.as_deref(),
+                    FolderPaneListingOptions::from_settings(&self.settings),
+                );
+                self.settings.save();
             }
 
             let reload = ui
@@ -262,8 +290,7 @@ impl App {
                 let active = self.effective_folder();
                 self.folder_pane.reload_for_active(
                     active.as_deref(),
-                    self.settings.sort_order,
-                    self.settings.show_hidden_files,
+                    FolderPaneListingOptions::from_settings(&self.settings),
                 );
             }
         });
@@ -310,9 +337,7 @@ impl App {
                             } else {
                                 FolderPaneTreeKey::Right
                             };
-                            let _ = self
-                                .folder_pane
-                                .handle_tree_key(key, self.settings.sort_order);
+                            let _ = self.folder_pane.handle_tree_key(key);
                         }
 
                         let label = folder_pane::folder_label(&row.path);
@@ -387,6 +412,60 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sort_control_and_reload_fit_the_minimum_folder_pane_width() {
+        use egui_kittest::Harness;
+        use std::sync::{Arc, Mutex};
+
+        let extents = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&extents);
+        let mut fonts_ready = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(480.0, 240.0))
+            .build(move |ctx| {
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                let panel = egui::SidePanel::left("folder_tree_pane_sort_min_width_test")
+                    .resizable(false)
+                    .exact_width(FOLDER_PANE_MIN_WIDTH)
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            egui::ComboBox::from_id_salt("folder_pane_drive_combo_test")
+                                .width(54.0)
+                                .selected_text("C:")
+                                .show_ui(ui, |_| {});
+                            let selected = folder_tree_sort_combo(
+                                ui,
+                                crate::settings::FolderTreeSortOrder::NameAsc,
+                            );
+                            assert_eq!(selected, crate::settings::FolderTreeSortOrder::NameAsc);
+                            ui.small_button("↻")
+                        })
+                        .inner
+                        .rect
+                    });
+                captured
+                    .lock()
+                    .unwrap()
+                    .push((panel.response.rect, panel.inner));
+            });
+
+        harness.run_steps(3);
+        let extents = extents.lock().unwrap();
+        assert!(!extents.is_empty());
+        for (panel, header) in extents.iter() {
+            assert!(
+                header.right() <= panel.right() + 0.1,
+                "minimum pane header overflowed: panel={panel:?}, header={header:?}"
+            );
+        }
+        harness.snapshot("folder_tree_sort_header_min_width");
+    }
 
     #[test]
     fn loading_row_does_not_grow_folder_pane_across_frames() {

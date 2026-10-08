@@ -8,7 +8,7 @@ impl crate::app::App {
     ///
     /// パスワードが入力され OK されると、PDF を再読み込みする。
     pub(crate) fn show_pdf_password_dialog_window(&mut self, ctx: &egui::Context) {
-        if !self.show_pdf_password_dialog {
+        if self.pdf_password_dialog_path().is_none() {
             return;
         }
 
@@ -105,16 +105,16 @@ impl crate::app::App {
                 // パスワード検証は非同期 enumerate に任せ、成功時保存も同じ context の
                 // pending_save が所有する。
                 if self.retry_pdf_password_dialog_request(password, self.pdf_password_save) {
-                    self.show_pdf_password_dialog = false;
                     self.pdf_password_input.clear();
                     self.pdf_password_error = None;
+                    self.pdf_password_save = false;
                 }
             }
         } else if cancel || !open {
             self.cancel_pdf_password_dialog_request();
-            self.show_pdf_password_dialog = false;
             self.pdf_password_input.clear();
             self.pdf_password_error = None;
+            self.pdf_password_save = false;
         }
     }
 }

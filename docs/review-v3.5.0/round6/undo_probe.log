@@ -1,0 +1,18 @@
+row=PostFilter, terminal dispatched in B: commit B correct, undo scope=Page(0)
+  Undo in B: B=AdjustParams { post_filter: None, colorize: ColorizeParams { enabled: false }, upscale_model: None }, foreground=AdjustParams { post_filter: None, colorize: ColorizeParams { enabled: false }, upscale_model: None }
+  Redo in B: writes the B-selected params into B
+row=PostFilter, terminal dispatched in A: commit B correct, undo scope=Page(0)
+  Undo in A: B=AdjustParams { post_filter: BSelected, colorize: ColorizeParams { enabled: false }, upscale_model: None }, foreground=AdjustParams { post_filter: None, colorize: ColorizeParams { enabled: false }, upscale_model: None }
+  Redo in A: writes the B-selected params into A
+row=PostFilter, terminal dispatched in C: commit B correct, undo scope=Page(0)
+  Undo in C: B=AdjustParams { post_filter: BSelected, colorize: ColorizeParams { enabled: false }, upscale_model: None }, foreground=AdjustParams { post_filter: None, colorize: ColorizeParams { enabled: false }, upscale_model: None }
+  Redo in C: writes the B-selected params into C
+row=UpscaleModel, terminal dispatched in B: commit B correct, undo scope=Page(0)
+  Undo in B: B=AdjustParams { post_filter: None, colorize: ColorizeParams { enabled: false }, upscale_model: None }, foreground=AdjustParams { post_filter: None, colorize: ColorizeParams { enabled: false }, upscale_model: None }
+  Redo in B: writes the B-selected params into B
+row=UpscaleModel, terminal dispatched in A: commit B correct, undo scope=Page(0)
+  Undo in A: B=AdjustParams { post_filter: None, colorize: ColorizeParams { enabled: false }, upscale_model: Some("B-selected-model") }, foreground=AdjustParams { post_filter: None, colorize: ColorizeParams { enabled: false }, upscale_model: None }
+  Redo in A: writes the B-selected params into A
+row=UpscaleModel, terminal dispatched in C: commit B correct, undo scope=Page(0)
+  Undo in C: B=AdjustParams { post_filter: None, colorize: ColorizeParams { enabled: false }, upscale_model: Some("B-selected-model") }, foreground=AdjustParams { post_filter: None, colorize: ColorizeParams { enabled: false }, upscale_model: None }
+  Redo in C: writes the B-selected params into C

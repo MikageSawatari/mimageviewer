@@ -5,6 +5,75 @@ contains the broader project context and operational notes; read only the
 sections relevant to the current task instead of treating the whole file as
 always-active guidance.
 
+## Model Roles And Coordination
+
+- Default development roles (2026-09-23 decision, Codex models updated 2026-09-30):
+  ClaudeCode Opus 5.5 / `high` leads overall management, design, task assignment,
+  and acceptance; Codex `gpt-6.1-sol` / `high` implements and tests; a separate
+  `gpt-6.1-sol` / `xhigh` reviewer independently checks design and implementation.
+  (Before 2026-09-30 both used `gpt-6-sol` / `xhigh`. GPT-6.1 Sol at `high` beats
+  GPT-6 Sol's best DeepSWE v1.1 score; review stays one step higher because a
+  missed finding costs more than the extra reasoning.)
+  Opus verifies findings and acceptance evidence; its own review does not replace
+  the independent reviewer. Later explicit user instructions override these defaults.
+- Use `gpt-6-astra` / `medium` only for bounded second opinions on difficult
+  structural designs, unresolved root causes, or material disagreements between
+  the design lead and reviewer. State the unresolved question and provide the
+  relevant code, findings, and evidence. Astra is not a standing coordinator or
+  an automatic extra review gate. Do not automatically raise Opus above `high`
+  or Astra above `medium`, or substitute Fable, during this usage-saving trial.
+- Release preparation and publishing remain led by ClaudeCode Opus (the
+  2026-09-09 responsibility split); the current lead uses Opus 5.5 / `high`.
+  This includes the release checklist from changelog/version updates through distribution builds,
+  signing, GitHub Release, website updates, and distribution-channel submissions.
+  Product development follows the management/implementation split above. See
+  [the release handoff](docs/release-operations.md#開発と公開の担当・引き継ぎ).
+- Routine release operations do not require a Codex coordinator, subagent team,
+  or automatic Codex review. ClaudeCode Opus follows the existing release gates
+  and user approvals, reusing valid development evidence. Product-code fixes,
+  dependency upgrades, and build/signing/deployment logic changes found during
+  release work return to the development workflow; routine version, changelog,
+  and release-metadata edits remain with the release lead.
+- This policy authorizes bounded subagents for substantial implementation and
+  independent review. Handle simple questions and minor documentation changes
+  locally; do not create a team solely to satisfy the role table.
+- Codex implementation/review tasks execute bounded handoffs from the design
+  lead; do not create an additional Astra parent solely to coordinate them.
+  When substantial work is delegated inside Codex, use the Sol settings above
+  and keep implementation and independent review in separate contexts.
+- Instructions do not change the running model. Use explicit model/effort
+  overrides where supported, with a bounded handoff rather than full-history
+  inheritance. The user selects the parent in the GUI. Report a mismatch or
+  unavailable override without claiming the requested setting is active; do not
+  silently change personal config or substitute a more expensive model.
+- At a role change, finish the current safe checkpoint and hand off the diff,
+  rationale, open findings, and valid verification evidence. Reconfigure an
+  existing reviewer if supported; otherwise use a new reviewer with the requested
+  settings. Do not repeat completed work or keep assigning work to the old role.
+- The design lead defines scope, invariants, acceptance criteria, and file ownership
+  once per coherent chunk. Implementers verify key premises and make routine
+  decisions within that scope; report contradictions, scope changes, and blockers.
+  One writer owns each shared file. Do not require approval for every small edit.
+- Review important ownership/asynchronous/multi-window designs before substantial
+  implementation, and review coherent changes at completion. Check the design
+  itself, not just compliance with the implementation brief. Follow-up review
+  focuses on findings and their affected paths; broaden when new evidence warrants
+  it. Do not waive important defects or cap necessary correction rounds.
+- Keep internal messages to decisions, material discoveries, blockers, handoffs,
+  and completion. Avoid repeated status queries or unchanged acknowledgements;
+  continue useful independent work or wait. Keep user-facing progress updates.
+- Assign verification ownership and reuse valid results under
+  [the build/test policy](docs/development-build-and-test.md#検証の担当と結果の再利用).
+  Required regression/full gates, verification builds, interactive approval,
+  real-data protection, and feature preservation remain mandatory.
+- Historical ClaudeCode design/acceptance and Codex implementation/review duties
+  map to the roles above. Required structural agreement means agreement between
+  the design lead and independent reviewer, with implementation premise checks
+  by the implementer. Preserve historical records and detached plan constraints
+  and decision recording. For explicit Codex-led tasks, design/acceptance duties
+  map to the requested lead and independent reviewer, with the same structural
+  agreement requirements; do not infer an Astra coordinator.
+
 ## Before Editing
 
 - Start by identifying the affected area and read the matching docs from
@@ -60,6 +129,33 @@ always-active guidance.
   fix appears to require a behavior change, explain the trade-off and ask before
   editing. Bug fixes should preserve the intended feature set unless the user has
   approved the functional change.
+
+## Design Simplicity And Regression Consultation
+
+- Before designing machinery that handles every interleaving of asynchronous
+  work (rollback, supersession, resume), first ask whether the combinations can
+  be removed instead. Prefer making long or inconsistency-prone flows
+  (conversion, saving, password prompts) modal so other opens, navigation,
+  history and window switches cannot start meanwhile; prefer closing or
+  reloading a shown window/panel through an existing path when a setting
+  changes, rather than adding a dedicated live-rebuild path. Record in the
+  design document which simplification was considered and why it was or was
+  not used. (User direction 2026-09-28; see CLAUDE.md "設計の簡素化".)
+- For rare failures that ordinary use almost never hits (disk/DB write failures,
+  abrupt termination mid-operation), do not design retry loops, preserved
+  partial states, typed failure taxonomies or multi-step recovery on your own.
+  Rebuildable data (indexes, caches) may be handled crudely: log, notify the
+  user, and rebuild on next start. Raise such cases to the design owner, who
+  confirms with the user, instead of closing each one with more machinery;
+  stop when you find yourself handling a failure inside a recovery path. Data
+  the user created (settings, tags, collections) must not be dropped this way
+  without asking. As a reviewer, report a rare-failure gap together with the
+  crude option, not only the full-handling option. (User direction 2026-10-02;
+  see CLAUDE.md "まれな失敗への対処".)
+- If a new feature or fix would make ordinary use slower, add steps, or remove
+  released behavior, stop before implementing and ask the design owner/user
+  with the options and costs. Do not choose the behavior-removing option on
+  your own; check in code what released behavior an option would remove.
 
 ## Bug Fix Policy
 

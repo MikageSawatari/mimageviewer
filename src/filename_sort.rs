@@ -63,6 +63,15 @@ impl SortNameKey {
     }
 
     pub fn compare_natural(&self, other: &Self) -> Ordering {
+        self.compare_natural_primary(other)
+            .then_with(|| self.compare_file_name(other))
+    }
+
+    /// 区切りを除いた自然順 key だけを比較する。
+    ///
+    /// 降順の一覧はこの主 key だけを反転し、同値時のファイル名 tie-break は昇順のまま
+    /// 保つため、完全な [`Self::compare_natural`] とは分けて公開する。
+    pub fn compare_natural_primary(&self, other: &Self) -> Ordering {
         let self_fallback;
         let self_key = match &self.natural {
             Some(key) => key,
@@ -81,9 +90,7 @@ impl SortNameKey {
             }
         };
 
-        self_key
-            .cmp(other_key)
-            .then_with(|| self.compare_file_name(other))
+        self_key.cmp(other_key)
     }
 }
 

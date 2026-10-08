@@ -141,6 +141,7 @@ wait_until(|s| {
         && windows[0].paint_matches_current_page
         && windows[0].paint_revision > 0
 }, 30000);
+capture("first-detached", "all");
 
 let root_target = select_root();
 if root_target.target_mode != "targeted" || !root_target.current {
@@ -161,6 +162,7 @@ wait_until(|s| {
         && windows[0].paint_matches_current_page
         && windows[1].paint_matches_current_page
 }, 30000);
+capture("two-detached", "all");
 
 let before = detached_windows(snapshot());
 let first = before[0];

@@ -94,7 +94,11 @@ impl App {
         if !self.fullscreen_edit_mode_entry_allowed(fs_idx) {
             return;
         }
-        let target_idx = match self.resolve_spread_pair(fs_idx) {
+        let (target_idx, _) = self.plan_page_edit_pivot(fs_idx);
+        if !self.raw_edit_target_entry_allowed(target_idx) {
+            return;
+        }
+        let target_idx = match self.resolve_visible_spread_pair(fs_idx) {
             crate::ui_fullscreen::SpreadPair::Double { left, .. } => left,
             crate::ui_fullscreen::SpreadPair::Single => fs_idx,
         };
@@ -135,12 +139,15 @@ impl App {
             return false;
         }
         let (target_idx, pivot) = self.plan_page_edit_pivot(requested_fs_idx);
-        let current_target = self
-            .fullscreen_idx
-            .map(|idx| match self.resolve_spread_pair(idx) {
-                crate::ui_fullscreen::SpreadPair::Double { left, .. } => left,
-                crate::ui_fullscreen::SpreadPair::Single => idx,
-            });
+        if !self.raw_edit_target_entry_allowed(target_idx) {
+            return false;
+        }
+        let current_target =
+            self.fullscreen_idx
+                .map(|idx| match self.resolve_visible_spread_pair(idx) {
+                    crate::ui_fullscreen::SpreadPair::Double { left, .. } => left,
+                    crate::ui_fullscreen::SpreadPair::Single => idx,
+                });
         if current_target != Some(target_idx) {
             return false;
         }
@@ -295,6 +302,9 @@ impl App {
     /// 見開き隠蔽加工中に「左ページ」「右ページ」ボタンで編集対象を切り替える。
     /// 現ページのマスクを保存してから単ページ状態のままもう一方へ入り直す。
     pub(crate) fn switch_conceal_target_in_spread(&mut self, new_idx: usize) {
+        if !self.raw_edit_target_entry_allowed(new_idx) {
+            return;
+        }
         if self.fullscreen_idx == Some(new_idx) {
             return;
         }
@@ -307,10 +317,7 @@ impl App {
         self.conceal_mask_size = [0, 0];
         self.conceal_mask_texture = None;
         self.conceal_shapes.clear();
-        self.spread_mode = crate::settings::SpreadMode::Single;
-        self.fullscreen_idx = Some(new_idx);
-        self.fs_zoom = 1.0;
-        self.fs_pan = egui::Vec2::ZERO;
+        self.enter_page_edit_single_view(new_idx);
         self.enter_conceal_mode(new_idx);
     }
 
@@ -549,6 +556,7 @@ impl App {
             sibling_nav: None,
             mouse_nav: None,
             jump_to: None,
+            music_ctrl_wheel_gate_reached: false,
         };
 
         if !self.ime_input_active(ctx) && self.consume_context_shortcuts_help_key(ctx) {
@@ -2226,13 +2234,13 @@ impl App {
                                                 for &(label, target_idx) in pages.iter() {
                                                     let is_active =
                                                         self.fullscreen_idx == Some(target_idx);
-                                                    if panel_toggle_button(
+                                                    if ui.add_enabled_ui(self.raw_edit_target_gate(target_idx), |ui| panel_toggle_button(
                                                         ui,
                                                         label,
                                                         is_active,
                                                         Some(btn_size),
                                                         None,
-                                                    )
+                                                    )).inner
                                                     .clicked()
                                                         && !is_active
                                                     {

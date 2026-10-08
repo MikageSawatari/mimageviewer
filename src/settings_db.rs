@@ -27,8 +27,11 @@
 //! - 複合テーブルは hash skip (VST3) や hot-path upsert (video_resume_positions)
 //!   などの最適化を別個に適用できる
 
+use miv_startup::{Lane, Outcome, Stage, WatchSlot, span, watch_handle};
+use std::cell::Cell;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::{Map, Value};
@@ -47,11 +50,12 @@ const SCHEMA_VERSION: &str = "1";
 const EXTERNAL_TOOLS_MIGRATION_META_KEY: &str = "external_tools_migrated_from_custom_open_with";
 const RECENT_OPEN_WITH_LAUNCH_MIGRATION_META_KEY: &str = "recent_open_with_apps_launch_classified";
 const FOLDER_THUMB_SORT_DEFAULT_V2_META_KEY: &str = "folder_thumb_sort_default_v2";
+const SINGLETON_ENDPOINT_MIGRATION_META_KEY: &str = "singleton_spread_endpoints_v1";
 const REMOTE_LISTING_SETTINGS_SQL: &str = r#"SELECT key, value FROM settings_kv WHERE key IN (
-    'sort_order', 'show_hidden_files', 'grid_display_order',
-    'archive_file_handling', 'archive_convert_without_dialog',
-    'skip_zip_if_folder_exists', 'skip_archive_if_zip_exists',
-    'skip_image_if_video_exists', 'video_thumb_use_sidecar_image',
+    'sort_order', 'rating_sort_unrated_position', 'show_hidden_files', 'grid_display_order',
+    'archive_file_handling', 'archive_convert_without_dialog', 'epub_file_handling',
+    'skip_zip_if_folder_exists', 'skip_archive_if_zip_exists', 'skip_epub_if_pdf_exists',
+    'skip_image_if_video_exists', 'video_thumb_use_sidecar_image', 'audio_thumbnail_indicator',
     'skip_duplicate_images', 'image_ext_priority', 'book_root',
     'auto_fullscreen_zip_pdf', 'auto_fullscreen_image_folders',
     'detached_viewer_open_images_in_window', 'thumb_aspect', 'thumb_aspect_auto'
@@ -75,10 +79,13 @@ const REMOTE_LISTING_SETTINGS_SQL: &str = r#"SELECT key, value FROM settings_kv 
 /// `external_tools` は v3.5.0 から専用テーブルが正本。旧 `settings_kv` にこのキーを
 /// 書いた版は無く、それ以前の登録は専用の `custom_open_with_apps` →
 /// `external_tools` migration で保護する。
+/// `video_watched_to_end` も導入時から専用テーブルで、旧 JSON の kv 行は存在しない。
 const COMPLEX_FIELDS: &[&str] = &[
     "favorites",
     "tags",
     "video_resume_positions",
+    "video_watched_to_end",
+    "video_audio_track_choices",
     "vst3_plugins",
     "vst3_chain_slots",
     "recent_open_with_apps",
@@ -120,6 +127,9 @@ pub enum SettingsDbError {
     /// `boot_settings_db` が FailedFallbackDefault を返したあとなど。`with_db` が
     /// この variant を返すと、Phase 3 caller は `save_full` を呼ばずに skip する。
     SaveSuppressed,
+    /// 設定の復元・完全リセットが settings.db family の排他的所有を取得中。
+    /// 呼び出し側は stale settings へ fallback せず、操作完了後に再試行する。
+    SettingsFamilyQuiescing,
     /// その他の rusqlite エラー。
     Rusqlite(rusqlite::Error),
     /// JSON ラウンドトリップ失敗。
@@ -144,6 +154,9 @@ impl std::fmt::Display for SettingsDbError {
                  refusing to bootstrap to avoid clobbering existing user data"
             ),
             Self::SaveSuppressed => write!(f, "save suppressed this session"),
+            Self::SettingsFamilyQuiescing => {
+                write!(f, "settings.db family is quiescing for recovery")
+            }
             Self::Rusqlite(e) => write!(f, "sqlite error: {e}"),
             Self::Serde(e) => write!(f, "serde_json error: {e}"),
             Self::Poisoned => write!(f, "settings db mutex poisoned"),
@@ -161,7 +174,8 @@ impl std::error::Error for SettingsDbError {
             | Self::Poisoned
             | Self::AlreadyBootstrapped
             | Self::AmbiguousFamilyPresence
-            | Self::SaveSuppressed => None,
+            | Self::SaveSuppressed
+            | Self::SettingsFamilyQuiescing => None,
         }
     }
 }
@@ -280,14 +294,18 @@ pub struct SettingsDb {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RemoteListingSettings {
     sort_order: crate::settings::SortOrder,
+    rating_sort_unrated_position: crate::rating_sort::RatingSortUnratedPosition,
     show_hidden_files: bool,
     grid_display_order: crate::settings::GridDisplayOrder,
     archive_file_handling: crate::settings::ArchiveFileHandling,
+    epub_file_handling: crate::settings::EpubFileHandling,
     archive_convert_without_dialog: bool,
     skip_zip_if_folder_exists: bool,
     skip_archive_if_zip_exists: bool,
+    skip_epub_if_pdf_exists: bool,
     skip_image_if_video_exists: bool,
     video_thumb_use_sidecar_image: bool,
+    audio_thumbnail_indicator: crate::settings::AudioThumbnailIndicator,
     skip_duplicate_images: bool,
     image_ext_priority: Vec<String>,
     book_root: Option<PathBuf>,
@@ -298,18 +316,58 @@ pub(crate) struct RemoteListingSettings {
     thumb_aspect_auto: bool,
 }
 
+/// Small live snapshot used to resolve one Remote book presentation.
+///
+/// The long-lived Remote container engine keeps a startup `Settings` value for
+/// unrelated rendering defaults. These fields are user-editable while the
+/// engine is alive, so one container response reads them together from
+/// `settings_kv` rather than mixing a current final-cover switch with stale
+/// spread defaults or page gap.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct RemoteReadingSettings {
+    pub(crate) default_spread_mode: crate::settings::SpreadMode,
+    pub(crate) default_reading_direction: crate::settings::ReadingDirection,
+    pub(crate) follow_document_reading_direction: bool,
+    pub(crate) final_cover_spread_enabled: bool,
+    pub(crate) singleton_spread_first_enabled: bool,
+    pub(crate) singleton_spread_last_enabled: bool,
+    pub(crate) page_after_cover_alone_enabled: bool,
+    pub(crate) last_page_alone_enabled: bool,
+    pub(crate) spread_page_gap_px: u32,
+}
+
+impl RemoteReadingSettings {
+    pub(crate) fn from_settings(settings: &Settings) -> Self {
+        Self {
+            default_spread_mode: settings.default_spread_mode,
+            default_reading_direction: settings.default_reading_direction,
+            follow_document_reading_direction: settings.follow_document_reading_direction,
+            final_cover_spread_enabled: settings.final_cover_spread_enabled,
+            singleton_spread_first_enabled: settings.singleton_spread_first_enabled,
+            singleton_spread_last_enabled: settings.singleton_spread_last_enabled,
+            page_after_cover_alone_enabled: settings.page_after_cover_alone_enabled,
+            last_page_alone_enabled: settings.last_page_alone_enabled,
+            spread_page_gap_px: settings.spread_page_gap_px,
+        }
+    }
+}
+
 impl RemoteListingSettings {
     pub(crate) fn from_settings(settings: &Settings) -> Self {
         Self {
             sort_order: settings.sort_order,
+            rating_sort_unrated_position: settings.rating_sort_unrated_position,
             show_hidden_files: settings.show_hidden_files,
             grid_display_order: settings.grid_display_order.clone(),
             archive_file_handling: settings.archive_file_handling,
+            epub_file_handling: settings.epub_file_handling,
             archive_convert_without_dialog: settings.archive_convert_without_dialog,
             skip_zip_if_folder_exists: settings.skip_zip_if_folder_exists,
             skip_archive_if_zip_exists: settings.skip_archive_if_zip_exists,
+            skip_epub_if_pdf_exists: settings.skip_epub_if_pdf_exists,
             skip_image_if_video_exists: settings.skip_image_if_video_exists,
             video_thumb_use_sidecar_image: settings.video_thumb_use_sidecar_image,
+            audio_thumbnail_indicator: settings.audio_thumbnail_indicator.normalized(),
             skip_duplicate_images: settings.skip_duplicate_images,
             image_ext_priority: settings.image_ext_priority.clone(),
             book_root: settings.book_root.clone(),
@@ -323,14 +381,18 @@ impl RemoteListingSettings {
 
     pub(crate) fn apply_to(self, settings: &mut Settings) {
         settings.sort_order = self.sort_order;
+        settings.rating_sort_unrated_position = self.rating_sort_unrated_position;
         settings.show_hidden_files = self.show_hidden_files;
         settings.grid_display_order = self.grid_display_order;
         settings.archive_file_handling = self.archive_file_handling;
+        settings.epub_file_handling = self.epub_file_handling;
         settings.archive_convert_without_dialog = self.archive_convert_without_dialog;
         settings.skip_zip_if_folder_exists = self.skip_zip_if_folder_exists;
         settings.skip_archive_if_zip_exists = self.skip_archive_if_zip_exists;
+        settings.skip_epub_if_pdf_exists = self.skip_epub_if_pdf_exists;
         settings.skip_image_if_video_exists = self.skip_image_if_video_exists;
         settings.video_thumb_use_sidecar_image = self.video_thumb_use_sidecar_image;
+        settings.audio_thumbnail_indicator = self.audio_thumbnail_indicator.normalized();
         settings.skip_duplicate_images = self.skip_duplicate_images;
         settings.image_ext_priority = self.image_ext_priority;
         settings.book_root = self.book_root;
@@ -372,6 +434,7 @@ pub(crate) struct AdjustmentRenderSettings {
     pub(crate) erase_inpaint_mono_tolerance: u8,
     pub(crate) retained_final_ai_cache_max_entries: usize,
     pub(crate) retained_final_ai_cache_max_mib: u64,
+    pub(crate) raw_brightness: crate::raw::RawBrightness,
 }
 
 impl AdjustmentRenderSettings {
@@ -389,6 +452,7 @@ impl AdjustmentRenderSettings {
             erase_inpaint_mono_tolerance: settings.erase_inpaint_mono_tolerance,
             retained_final_ai_cache_max_entries: settings.retained_final_ai_cache_max_entries,
             retained_final_ai_cache_max_mib: settings.retained_final_ai_cache_max_mib,
+            raw_brightness: settings.raw_brightness,
         }
     }
 }
@@ -489,6 +553,12 @@ impl SettingsDb {
     }
 
     fn open_with_mode(data_dir: &Path, mode: OpenMode) -> Result<Self, SettingsDbError> {
+        startup_operation(Stage::SettingsOpen, || {
+            Self::open_with_mode_inner(data_dir, mode)
+        })
+    }
+
+    fn open_with_mode_inner(data_dir: &Path, mode: OpenMode) -> Result<Self, SettingsDbError> {
         let path = settings_db_path(data_dir);
         if let Some(parent) = path.parent() {
             // dir 作成失敗は無視 (= conn open でも同じエラーが出るのでそちらに任せる)。
@@ -497,7 +567,15 @@ impl SettingsDb {
 
         let mut last_err: Option<SettingsDbError> = None;
         for attempt in 0..OPEN_RETRY_ATTEMPTS {
-            match Self::try_open_once(&path, mode) {
+            let attempt_span =
+                startup_span(Stage::SettingsOpen).detail(&format!("attempt={}", attempt + 1));
+            let attempt_result = Self::try_open_once(&path, mode);
+            attempt_span.finish(if attempt_result.is_ok() {
+                Outcome::Ok
+            } else {
+                Outcome::Error
+            });
+            match attempt_result {
                 Ok(db) => {
                     if attempt > 0 {
                         log_diag(&format!(
@@ -528,6 +606,12 @@ impl SettingsDb {
     /// 途中のどのステップで `rusqlite::Error` が出ても、`classify_rusqlite_error_for_open`
     /// を通すことで Corrupted / Permission / Transient へ正しく分類される (Codex P1 対応)。
     fn try_open_once(path: &Path, mode: OpenMode) -> Result<Self, SettingsDbError> {
+        startup_operation(Stage::SettingsOpen, || {
+            Self::try_open_once_inner(path, mode)
+        })
+    }
+
+    fn try_open_once_inner(path: &Path, mode: OpenMode) -> Result<Self, SettingsDbError> {
         use rusqlite::OpenFlags;
         let flags = match mode {
             OpenMode::RequireExisting => {
@@ -586,6 +670,10 @@ impl SettingsDb {
     /// 完了時点で in-memory と DB が一致するので、VST3 hash を初期化する
     /// (= 起動後最初の `save_full` で無駄に DELETE+INSERT しないため)。
     pub fn load_into_settings(&self) -> Result<Settings, SettingsDbError> {
+        startup_operation(Stage::Settings, || self.load_into_settings_inner())
+    }
+
+    fn load_into_settings_inner(&self) -> Result<Settings, SettingsDbError> {
         let mut inner = self.inner.lock().map_err(|_| SettingsDbError::Poisoned)?;
         // 未知 enum の Incompatible だけは返す。これは「新しい版が書いた設定」の合図で、
         // 上層が save 抑止へ倒すために要る。それ以外 (書き込み失敗など) で load 全体を
@@ -620,6 +708,13 @@ impl SettingsDb {
             Err(e) => log_diag(&format!(
                 "settings_db: folder thumbnail sort default migration failed; \
                  continuing with stored settings and retrying on the next load: {e}"
+            )),
+        }
+        match migrate_singleton_spread_endpoints(&inner.conn) {
+            Ok(true) => log_diag("settings_db: migrated singleton spread endpoint settings"),
+            Ok(false) => {}
+            Err(e) => log_diag(&format!(
+                "settings_db: singleton endpoint migration failed; projecting legacy value and suppressing save until retry: {e}"
             )),
         }
         let settings = build_settings_from_db(&inner.conn)?;
@@ -739,6 +834,9 @@ impl SettingsDb {
                     "retained_final_ai_cache_max_mib",
                     || defaults.retained_final_ai_cache_max_mib,
                 )?,
+                raw_brightness: read_settings_kv_typed(&inner.conn, "raw_brightness", || {
+                    defaults.raw_brightness
+                })?,
             },
             lock_wait_ms,
         ))
@@ -757,7 +855,59 @@ impl SettingsDb {
         for (key, raw) in read_remote_listing_settings(&inner.conn)? {
             apply_remote_listing_setting(&mut settings, &key, &raw)?;
         }
+        crate::settings::normalize_image_ext_priority(&mut settings.image_ext_priority);
+        settings.audio_thumbnail_indicator = settings.audio_thumbnail_indicator.normalized();
         Ok(settings)
+    }
+
+    /// Read only the scalar settings that determine one Remote book layout.
+    ///
+    /// Missing keys in an older DB use the startup snapshot, matching the
+    /// serde/default compatibility of a full settings load. The shared DB lock
+    /// is held once so the layout values form one request snapshot.
+    pub(crate) fn load_remote_reading_settings(
+        &self,
+        fallback: &Settings,
+    ) -> Result<RemoteReadingSettings, SettingsDbError> {
+        let inner = self.inner.lock().map_err(|_| SettingsDbError::Poisoned)?;
+        let endpoints = read_singleton_endpoint_settings(&inner.conn)?;
+        Ok(RemoteReadingSettings {
+            default_spread_mode: read_settings_kv_typed(
+                &inner.conn,
+                "default_spread_mode",
+                || fallback.default_spread_mode,
+            )?,
+            default_reading_direction: read_settings_kv_typed(
+                &inner.conn,
+                "default_reading_direction",
+                || fallback.default_reading_direction,
+            )?,
+            follow_document_reading_direction: read_settings_kv_typed(
+                &inner.conn,
+                "follow_document_reading_direction",
+                || fallback.follow_document_reading_direction,
+            )?,
+            final_cover_spread_enabled: read_settings_kv_typed(
+                &inner.conn,
+                "final_cover_spread_enabled",
+                || fallback.final_cover_spread_enabled,
+            )?,
+            singleton_spread_first_enabled: endpoints.first,
+            singleton_spread_last_enabled: endpoints.last,
+            page_after_cover_alone_enabled: read_settings_kv_typed(
+                &inner.conn,
+                "page_after_cover_alone_enabled",
+                || fallback.page_after_cover_alone_enabled,
+            )?,
+            last_page_alone_enabled: read_settings_kv_typed(
+                &inner.conn,
+                "last_page_alone_enabled",
+                || fallback.last_page_alone_enabled,
+            )?,
+            spread_page_gap_px: read_settings_kv_typed(&inner.conn, "spread_page_gap_px", || {
+                fallback.spread_page_gap_px
+            })?,
+        })
     }
 
     /// Remote の集約系 worker が現在の共有並び順だけを読む。
@@ -778,6 +928,13 @@ impl SettingsDb {
     /// - commit 成功後にのみ hash を更新する (= 「メモリ更新済み、DB 未更新」防止)
     pub fn save_full(&self, settings: &Settings) -> Result<(), SettingsDbError> {
         let mut inner = self.inner.lock().map_err(|_| SettingsDbError::Poisoned)?;
+        let bootstrapped = existing_bootstrap_marker_present(&inner.conn)?;
+        if bootstrapped {
+            if !singleton_endpoint_marker_present(&inner.conn)? {
+                return Err(SettingsDbError::SaveSuppressed);
+            }
+            read_singleton_endpoint_settings(&inner.conn)?;
+        }
 
         // 1. 事前の差分判定 (transaction 外)。共有 `Arc` の同一性で見るので O(行数)。
         let chain_changed = inner
@@ -835,6 +992,8 @@ impl SettingsDb {
         write_favorites(&tx, &settings.favorites)?;
         write_tags(&tx, &settings.tags)?;
         write_video_resume_positions(&tx, &settings.video_resume_positions)?;
+        write_video_watched_to_end(&tx, &settings.video_watched_to_end)?;
+        write_video_audio_track_choices(&tx, &settings.video_audio_track_choices)?;
         // `custom_open_with_apps` は移行元の照合用にテーブルと既存行を残すが、
         // 外部ツール UI への載せ替え後は更新しない。
         write_external_tools(&tx, &settings.external_tools)?;
@@ -869,6 +1028,10 @@ impl SettingsDb {
         // marker を立ててよいのは「移行を実行した migration 自身」と「移行対象が原理的に
         // 存在しない新規 DB の bootstrap」の 2 つだけ。
         if bootstrap_save {
+            tx.execute(
+                "INSERT OR IGNORE INTO schema_meta(key, value) VALUES (?1, '1')",
+                params![SINGLETON_ENDPOINT_MIGRATION_META_KEY],
+            )?;
             tx.execute(
                 "INSERT OR IGNORE INTO schema_meta(key, value) VALUES (?1, '1')",
                 params![FOLDER_THUMB_SORT_DEFAULT_V2_META_KEY],
@@ -1091,6 +1254,17 @@ pub enum FamilyPresence {
 /// 同等に扱う (新規環境の clean install を許可するため。data_dir が ambiguous なら
 /// per-file metadata 側で先に Ambiguous が立つ)。
 pub fn settings_db_family_presence(data_dir: &Path) -> FamilyPresence {
+    let stage = startup_span(Stage::SettingsFamily);
+    let result = settings_db_family_presence_inner(data_dir);
+    stage.finish(if result == FamilyPresence::Ambiguous {
+        Outcome::Error
+    } else {
+        Outcome::Ok
+    });
+    result
+}
+
+fn settings_db_family_presence_inner(data_dir: &Path) -> FamilyPresence {
     let mut ambiguous = false;
     let candidates = family_filenames();
     for name in &candidates {
@@ -1186,7 +1360,30 @@ fn is_family_filename(name: &str) -> bool {
 // open / pragmas / schema
 // ---------------------------------------------------------------------------
 
+fn startup_span(stage: Stage) -> miv_startup::Span {
+    let operation = span(Lane::Core, stage);
+    match watch_handle(WatchSlot::CoreStartup) {
+        Some(watch) => operation.watched(watch),
+        None => operation,
+    }
+}
+
+fn startup_operation<T, E>(stage: Stage, operation: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+    let operation_span = startup_span(stage);
+    let result = operation();
+    operation_span.finish(if result.is_ok() {
+        Outcome::Ok
+    } else {
+        Outcome::Error
+    });
+    result
+}
+
 fn apply_pragmas(conn: &Connection) -> rusqlite::Result<()> {
+    startup_operation(Stage::SettingsPragma, || apply_pragmas_inner(conn))
+}
+
+fn apply_pragmas_inner(conn: &Connection) -> rusqlite::Result<()> {
     // journal_mode=WAL は in-memory DB で no-op になるので silently ignore する
     // (rusqlite が "memory" を返すケース)。本番では WAL に切り替わる。
     let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
@@ -1402,6 +1599,12 @@ fn existing_bootstrap_marker_present(conn: &Connection) -> Result<bool, Settings
 /// 戻り文字列が "ok" 以外なら `Corrupted` を返す (Codex P1 対応で旧
 /// `check_integrity` を retire したものの代替)。
 fn check_integrity_classified(conn: &Connection) -> Result<(), SettingsDbError> {
+    startup_operation(Stage::SettingsIntegrity, || {
+        check_integrity_classified_inner(conn)
+    })
+}
+
+fn check_integrity_classified_inner(conn: &Connection) -> Result<(), SettingsDbError> {
     let result: String = conn
         .query_row("PRAGMA integrity_check(1)", [], |row| row.get(0))
         .map_err(|e| classify_rusqlite_error_for_open(e, "integrity_check"))?;
@@ -1467,6 +1670,10 @@ fn reject_newer_app_version(conn: &Connection) -> Result<(), SettingsDbError> {
 }
 
 fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
+    startup_operation(Stage::SettingsSchema, || init_schema_inner(conn))
+}
+
+fn init_schema_inner(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_meta (
             key   TEXT PRIMARY KEY,
@@ -1485,7 +1692,8 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             sort_index            INTEGER NOT NULL,
             auto_index_structure  INTEGER NOT NULL DEFAULT 0,
             auto_index_metadata   INTEGER NOT NULL DEFAULT 0,
-            auto_index_thumbs     INTEGER NOT NULL DEFAULT 0
+            auto_index_thumbs     INTEGER NOT NULL DEFAULT 0,
+            auto_index_similar    INTEGER NOT NULL DEFAULT 0
          );
          CREATE INDEX IF NOT EXISTS favorites_sort ON favorites(sort_index);
 
@@ -1502,6 +1710,21 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             path_normalized TEXT PRIMARY KEY,
             position_secs   REAL NOT NULL,
             updated_at      INTEGER NOT NULL
+         );
+
+         CREATE TABLE IF NOT EXISTS video_watched_to_end (
+            path_normalized TEXT PRIMARY KEY,
+            updated_at      INTEGER NOT NULL
+         );
+
+         CREATE TABLE IF NOT EXISTS video_audio_track_choices (
+            path_normalized TEXT PRIMARY KEY,
+            stream_index INTEGER NOT NULL,
+            codec TEXT NOT NULL,
+            language TEXT,
+            channels INTEGER,
+            title TEXT,
+            updated_at INTEGER NOT NULL
          );
 
          CREATE TABLE IF NOT EXISTS vst3_plugins (
@@ -1569,6 +1792,7 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             [],
         )?;
     }
+    migrate_favorites_table(conn)?;
     // `external_tools` は v3.5.0 で出荷済み。登録を保持したまま列だけを追加する。
     // 開発中に使っていた shape marker による DROP TABLE 経路へ戻してはならない。
     if !table_has_column(conn, "external_tools", "show_console")? {
@@ -1598,6 +1822,18 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// `FavoriteEntry` はリリース済みの永続型なので、列追加は既存行を保つ ALTER で行う。
+/// JSON 側の serde default だけでは SQLite の複合テーブルを移行できない。
+fn migrate_favorites_table(conn: &Connection) -> rusqlite::Result<()> {
+    if !table_has_column(conn, "favorites", "auto_index_similar")? {
+        conn.execute(
+            "ALTER TABLE favorites
+             ADD COLUMN auto_index_similar INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
 fn table_has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let rows = stmt.query_map([], |row| {
@@ -1772,6 +2008,78 @@ fn migrate_folder_thumb_sort_default_v2(conn: &Connection) -> Result<bool, Setti
     Ok(true)
 }
 
+fn singleton_endpoint_marker_present(conn: &Connection) -> Result<bool, SettingsDbError> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM schema_meta WHERE key = ?1",
+            params![SINGLETON_ENDPOINT_MIGRATION_META_KEY],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// The marker is the authority. A partial pair of new keys cannot supersede the
+/// released value, even when the current process failed to commit migration.
+fn read_singleton_endpoint_settings(
+    conn: &Connection,
+) -> Result<crate::settings::SingletonSpreadEndpointSettings, SettingsDbError> {
+    let read_raw = |key: &str| -> Result<Option<bool>, SettingsDbError> {
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT value FROM settings_kv WHERE key = ?1",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        raw.map(|raw| serde_json::from_str(&raw).map_err(SettingsDbError::from))
+            .transpose()
+    };
+    if !singleton_endpoint_marker_present(conn)? {
+        let legacy = read_raw("singleton_spread_placement_enabled")?.unwrap_or(false);
+        return Ok(crate::settings::SingletonSpreadEndpointSettings {
+            first: legacy,
+            last: legacy,
+        });
+    }
+    let first = read_raw("singleton_spread_first_enabled")?.ok_or_else(|| {
+        SettingsDbError::Incompatible(
+            "completed singleton endpoint migration lacks first key".into(),
+        )
+    })?;
+    let last = read_raw("singleton_spread_last_enabled")?.ok_or_else(|| {
+        SettingsDbError::Incompatible(
+            "completed singleton endpoint migration lacks last key".into(),
+        )
+    })?;
+    Ok(crate::settings::SingletonSpreadEndpointSettings { first, last })
+}
+
+fn migrate_singleton_spread_endpoints(conn: &Connection) -> Result<bool, SettingsDbError> {
+    let tx = conn.unchecked_transaction()?;
+    if !existing_bootstrap_marker_present(&tx)? || singleton_endpoint_marker_present(&tx)? {
+        tx.commit()?;
+        return Ok(false);
+    }
+    let settings = read_singleton_endpoint_settings(&tx)?;
+    for (key, value) in [
+        ("singleton_spread_first_enabled", settings.first),
+        ("singleton_spread_last_enabled", settings.last),
+    ] {
+        tx.execute(
+            "INSERT INTO settings_kv(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, serde_json::to_string(&value)?],
+        )?;
+    }
+    tx.execute(
+        "INSERT INTO schema_meta(key, value) VALUES (?1, '1')",
+        params![SINGLETON_ENDPOINT_MIGRATION_META_KEY],
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
 fn write_settings_kv(
     tx: &rusqlite::Transaction<'_>,
     map: &Map<String, Value>,
@@ -1819,8 +2127,9 @@ fn write_favorites(
     let mut stmt = tx.prepare(
         "INSERT INTO favorites
             (id, name, path, sort_index,
-             auto_index_structure, auto_index_metadata, auto_index_thumbs)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             auto_index_structure, auto_index_metadata, auto_index_thumbs,
+             auto_index_similar)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
     )?;
     for (idx, fav) in favorites.iter().enumerate() {
         stmt.execute(params![
@@ -1831,6 +2140,7 @@ fn write_favorites(
             fav.auto_index_structure as i64,
             fav.auto_index_metadata as i64,
             fav.auto_index_thumbs as i64,
+            fav.auto_index_similar as i64,
         ])?;
     }
     Ok(())
@@ -1838,7 +2148,8 @@ fn write_favorites(
 
 fn read_favorites(conn: &Connection) -> Result<Vec<FavoriteEntry>, SettingsDbError> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, path, auto_index_structure, auto_index_metadata, auto_index_thumbs
+        "SELECT id, name, path, auto_index_structure, auto_index_metadata, auto_index_thumbs,
+                auto_index_similar
          FROM favorites
          ORDER BY sort_index ASC",
     )?;
@@ -1849,6 +2160,7 @@ fn read_favorites(conn: &Connection) -> Result<Vec<FavoriteEntry>, SettingsDbErr
         let auto_index_structure: i64 = row.get(3)?;
         let auto_index_metadata: i64 = row.get(4)?;
         let auto_index_thumbs: i64 = row.get(5)?;
+        let auto_index_similar: i64 = row.get(6)?;
         Ok((
             id_bytes,
             name,
@@ -1856,11 +2168,12 @@ fn read_favorites(conn: &Connection) -> Result<Vec<FavoriteEntry>, SettingsDbErr
             auto_index_structure != 0,
             auto_index_metadata != 0,
             auto_index_thumbs != 0,
+            auto_index_similar != 0,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (id_bytes, name, path, ais, aim, ait) = row?;
+        let (id_bytes, name, path, ais, aim, ait, aiv) = row?;
         // Codex P2 v8 (2026-05-13): UUID 長が 16 でないなら row 破損。silently nil に
         // fallback すると save_full 後に「ユーザーが個別 favorite を編集していた状態」
         // が消える。Corrupted で上層に伝え、bak / JSON migration へ倒す。
@@ -1877,6 +2190,7 @@ fn read_favorites(conn: &Connection) -> Result<Vec<FavoriteEntry>, SettingsDbErr
             auto_index_structure: ais,
             auto_index_metadata: aim,
             auto_index_thumbs: ait,
+            auto_index_similar: aiv,
         });
     }
     Ok(out)
@@ -1928,6 +2242,10 @@ impl SettingsFavoritesReader {
         }
         Ok(Arc::clone(&self.favorites))
     }
+
+    pub(crate) fn cached(&self) -> Arc<Vec<FavoriteEntry>> {
+        Arc::clone(&self.favorites)
+    }
 }
 
 fn read_stable_favorites(conn: &Connection) -> Result<(i64, Vec<FavoriteEntry>), SettingsDbError> {
@@ -1961,6 +2279,7 @@ fn favorite_entries_equal(left: &[FavoriteEntry], right: &[FavoriteEntry]) -> bo
                 && left.auto_index_structure == right.auto_index_structure
                 && left.auto_index_metadata == right.auto_index_metadata
                 && left.auto_index_thumbs == right.auto_index_thumbs
+                && left.auto_index_similar == right.auto_index_similar
         })
 }
 
@@ -2085,6 +2404,91 @@ fn read_video_resume_positions(
         }
     }
     Ok(out)
+}
+
+fn write_video_watched_to_end(
+    tx: &rusqlite::Transaction<'_>,
+    paths: &std::collections::HashSet<String>,
+) -> rusqlite::Result<()> {
+    tx.execute("DELETE FROM video_watched_to_end", [])?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let mut stmt = tx.prepare(
+        "INSERT INTO video_watched_to_end (path_normalized, updated_at) VALUES (?1, ?2)",
+    )?;
+    for path in paths {
+        stmt.execute(params![path, now])?;
+    }
+    Ok(())
+}
+
+fn read_video_watched_to_end(
+    conn: &Connection,
+) -> Result<std::collections::HashSet<String>, SettingsDbError> {
+    let mut stmt = conn.prepare("SELECT path_normalized FROM video_watched_to_end")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+}
+
+fn write_video_audio_track_choices(
+    tx: &rusqlite::Transaction<'_>,
+    map: &std::collections::HashMap<String, crate::video::SavedAudioTrackChoice>,
+) -> rusqlite::Result<()> {
+    tx.execute("DELETE FROM video_audio_track_choices", [])?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let mut stmt = tx.prepare(
+        "INSERT INTO video_audio_track_choices
+         (path_normalized, stream_index, codec, language, channels, title, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?;
+    for (path, choice) in map {
+        stmt.execute(params![
+            path,
+            choice.stream_index as i64,
+            choice.codec,
+            choice.language,
+            choice.channels.map(i64::from),
+            choice.title,
+            now,
+        ])?;
+    }
+    Ok(())
+}
+
+fn read_video_audio_track_choices(
+    conn: &Connection,
+) -> Result<std::collections::HashMap<String, crate::video::SavedAudioTrackChoice>, SettingsDbError>
+{
+    let mut stmt = conn.prepare(
+        "SELECT path_normalized, stream_index, codec, language, channels, title
+         FROM video_audio_track_choices",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let index: i64 = row.get(1)?;
+        let channels: Option<i64> = row.get(4)?;
+        Ok((
+            row.get::<_, String>(0)?,
+            crate::video::SavedAudioTrackChoice {
+                stream_index: usize::try_from(index)
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, index))?,
+                codec: row.get(2)?,
+                language: row.get(3)?,
+                channels: channels
+                    .map(|value| {
+                        u32::try_from(value)
+                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(4, value))
+                    })
+                    .transpose()?,
+                title: row.get(5)?,
+            },
+        ))
+    })?;
+    rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
 }
 
 // ---------------------------------------------------------------------------
@@ -2634,11 +3038,22 @@ fn migrate_recent_open_with_launch(conn: &Connection) -> Result<bool, SettingsDb
 
 fn build_settings_from_db(conn: &Connection) -> Result<Settings, SettingsDbError> {
     let mut map = read_settings_kv(conn)?;
+    let endpoints = read_singleton_endpoint_settings(conn)?;
+    map.insert(
+        "singleton_spread_first_enabled".into(),
+        Value::Bool(endpoints.first),
+    );
+    map.insert(
+        "singleton_spread_last_enabled".into(),
+        Value::Bool(endpoints.last),
+    );
 
     // 複合テーブルを読み、JSON Value にして Map に挿入する。
     let favorites = read_favorites(conn)?;
     let tags = read_tags(conn)?;
     let video_resume_positions = read_video_resume_positions(conn)?;
+    let video_watched_to_end = read_video_watched_to_end(conn)?;
+    let video_audio_track_choices = read_video_audio_track_choices(conn)?;
     let vst3_plugins = read_vst3_plugins(conn)?;
     let vst3_chain_slots = read_vst3_chain_slots(conn)?;
     let custom_apps = read_legacy_open_with_apps(conn)?;
@@ -2649,6 +3064,14 @@ fn build_settings_from_db(conn: &Connection) -> Result<Settings, SettingsDbError
     map.insert(
         "video_resume_positions".into(),
         serde_json::to_value(video_resume_positions)?,
+    );
+    map.insert(
+        "video_watched_to_end".into(),
+        serde_json::to_value(video_watched_to_end)?,
+    );
+    map.insert(
+        "video_audio_track_choices".into(),
+        serde_json::to_value(video_audio_track_choices)?,
     );
     map.insert("vst3_plugins".into(), serde_json::to_value(vst3_plugins)?);
     map.insert(
@@ -2702,14 +3125,18 @@ fn apply_remote_listing_setting(
     }
     match key {
         "sort_order" => assign!(sort_order),
+        "rating_sort_unrated_position" => assign!(rating_sort_unrated_position),
         "show_hidden_files" => assign!(show_hidden_files),
         "grid_display_order" => assign!(grid_display_order),
         "archive_file_handling" => assign!(archive_file_handling),
+        "epub_file_handling" => assign!(epub_file_handling),
         "archive_convert_without_dialog" => assign!(archive_convert_without_dialog),
         "skip_zip_if_folder_exists" => assign!(skip_zip_if_folder_exists),
         "skip_archive_if_zip_exists" => assign!(skip_archive_if_zip_exists),
+        "skip_epub_if_pdf_exists" => assign!(skip_epub_if_pdf_exists),
         "skip_image_if_video_exists" => assign!(skip_image_if_video_exists),
         "video_thumb_use_sidecar_image" => assign!(video_thumb_use_sidecar_image),
+        "audio_thumbnail_indicator" => assign!(audio_thumbnail_indicator),
         "skip_duplicate_images" => assign!(skip_duplicate_images),
         "image_ext_priority" => assign!(image_ext_priority),
         "book_root" => assign!(book_root),
@@ -3115,6 +3542,14 @@ fn rename_legacy_json_files(data_dir: &Path) -> usize {
 pub fn migrate_from_settings_json(
     data_dir: &Path,
 ) -> Result<(SettingsDb, Settings), SettingsDbError> {
+    startup_operation(Stage::SettingsJsonMigration, || {
+        migrate_from_settings_json_inner(data_dir)
+    })
+}
+
+fn migrate_from_settings_json_inner(
+    data_dir: &Path,
+) -> Result<(SettingsDb, Settings), SettingsDbError> {
     // Codex P2 v8b-2 (2026-05-14): data_dir 引数を **唯一の真** として使う。
     // `data_dir::get()` 経由のパスは一切経由しない。これで data_dir override と
     // 引数が乖離しても DB と JSON が別 dir に分裂しない。
@@ -3209,6 +3644,18 @@ pub fn migrate_from_settings_json(
 /// FailedFallbackDefault に倒れ、SAVE_SUPPRESSED でセッション全体を poison」する race を
 /// 防ぐ。
 pub fn boot_settings_db(data_dir: &Path) -> BootOutcome {
+    let stage = startup_span(Stage::Settings);
+    let result = boot_settings_db_observed(data_dir);
+    let stage = stage.detail(&format!("source={:?}", result.source));
+    stage.finish(if result.db.is_some() {
+        Outcome::Ok
+    } else {
+        Outcome::Error
+    });
+    result
+}
+
+fn boot_settings_db_observed(data_dir: &Path) -> BootOutcome {
     let _boot_guard = BOOT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
     // Fast-path: 同じ data_dir で既に boot 済みなら、その handle で再 load する。
@@ -3498,6 +3945,17 @@ fn boot_settings_db_inner(data_dir: &Path) -> BootOutcome {
 
 /// 壊れた main DB の家族を quarantine し、bak1..bak10 を新しい順に試行して復旧する。
 fn boot_recover_from_bak(data_dir: &Path) -> BootOutcome {
+    let stage = startup_span(Stage::SettingsRecovery);
+    let result = boot_recover_from_bak_inner(data_dir);
+    stage.finish(if result.db.is_some() {
+        Outcome::Ok
+    } else {
+        Outcome::Error
+    });
+    result
+}
+
+fn boot_recover_from_bak_inner(data_dir: &Path) -> BootOutcome {
     let result = quarantine_db_files(data_dir);
     // T06 Codex P2 round 5: quarantine が不完全 (sidecar 退避失敗で main を残した、
     // または main 退避失敗) のまま bak 復旧に進むと、新しい main (bak1 を copy したもの)
@@ -3662,6 +4120,178 @@ fn boot_recover_from_bak(data_dir: &Path) -> BootOutcome {
 
 static GLOBAL_DB: Mutex<Option<(PathBuf, Arc<SettingsDb>)>> = Mutex::new(None);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsFamilyAccessPhase {
+    Active,
+    Quiescing(u64),
+    Quiesced(u64),
+}
+
+#[derive(Debug)]
+struct SettingsFamilyAccessState {
+    phase: SettingsFamilyAccessPhase,
+    active_outer_leases: usize,
+    next_generation: u64,
+}
+
+impl Default for SettingsFamilyAccessState {
+    fn default() -> Self {
+        Self {
+            phase: SettingsFamilyAccessPhase::Active,
+            active_outer_leases: 0,
+            next_generation: 1,
+        }
+    }
+}
+
+static SETTINGS_FAMILY_ACCESS: OnceLock<(Mutex<SettingsFamilyAccessState>, Condvar)> =
+    OnceLock::new();
+
+fn settings_family_access() -> &'static (Mutex<SettingsFamilyAccessState>, Condvar) {
+    SETTINGS_FAMILY_ACCESS.get_or_init(|| {
+        (
+            Mutex::new(SettingsFamilyAccessState::default()),
+            Condvar::new(),
+        )
+    })
+}
+
+thread_local! {
+    /// Nested `with_db` calls belong to the already admitted outer operation. Counting them as
+    /// separate process leases would deadlock the outer closure when quiescing starts midway.
+    static SETTINGS_FAMILY_READ_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// RAII admission for one logical settings-family read/write operation.
+///
+/// The outermost lease contributes to the process-wide active count. Nested calls on the same
+/// thread only increment the thread-local depth and remain admitted even if quiescing begins after
+/// the outer call started.
+pub(crate) struct SettingsFamilyReadLease {
+    /// TLS depth must be released on the acquiring thread.
+    _not_send: PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for SettingsFamilyReadLease {
+    fn drop(&mut self) {
+        let became_zero = SETTINGS_FAMILY_READ_DEPTH.with(|depth| {
+            let current = depth.get();
+            debug_assert!(current > 0, "settings-family lease depth underflow");
+            let next = current.saturating_sub(1);
+            depth.set(next);
+            next == 0
+        });
+        if !became_zero {
+            return;
+        }
+        let (state, changed) = settings_family_access();
+        let mut state = state.lock().unwrap_or_else(|poison| poison.into_inner());
+        debug_assert!(state.active_outer_leases > 0);
+        state.active_outer_leases = state.active_outer_leases.saturating_sub(1);
+        if state.active_outer_leases == 0 {
+            changed.notify_all();
+        }
+    }
+}
+
+/// Admit one settings-family access without waiting. Remote's persistent favorites reader and the
+/// AI registry's final Ready-publication fence call this directly; ordinary DB callers are covered
+/// by `with_db` below.
+pub(crate) fn acquire_settings_family_read_lease()
+-> Result<SettingsFamilyReadLease, SettingsDbError> {
+    let nested = SETTINGS_FAMILY_READ_DEPTH.with(|depth| {
+        let current = depth.get();
+        if current == 0 {
+            false
+        } else {
+            depth.set(current.saturating_add(1));
+            true
+        }
+    });
+    if nested {
+        return Ok(SettingsFamilyReadLease {
+            _not_send: PhantomData,
+        });
+    }
+
+    let (state, _) = settings_family_access();
+    let mut state = state.lock().map_err(|_| SettingsDbError::Poisoned)?;
+    if state.phase != SettingsFamilyAccessPhase::Active {
+        return Err(SettingsDbError::SettingsFamilyQuiescing);
+    }
+    state.active_outer_leases = state.active_outer_leases.saturating_add(1);
+    drop(state);
+    SETTINGS_FAMILY_READ_DEPTH.with(|depth| depth.set(1));
+    Ok(SettingsFamilyReadLease {
+        _not_send: PhantomData,
+    })
+}
+
+/// Exclusive proof that every admitted settings-family access completed before a restore/reset.
+/// It is deliberately non-Clone and is validated by generation at each destructive boundary.
+pub(crate) struct SettingsFamilyMutationPermit {
+    generation: u64,
+}
+
+impl SettingsFamilyMutationPermit {
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), SettingsDbError> {
+        let (state, _) = settings_family_access();
+        let state = state.lock().map_err(|_| SettingsDbError::Poisoned)?;
+        if state.phase == SettingsFamilyAccessPhase::Quiesced(self.generation)
+            && state.active_outer_leases == 0
+        {
+            Ok(())
+        } else {
+            Err(SettingsDbError::SettingsFamilyQuiescing)
+        }
+    }
+
+    /// Reopen ordinary settings access after a family-unchanged/recoverable result.
+    pub(crate) fn resume_local(self) -> Result<(), SettingsDbError> {
+        let (state, changed) = settings_family_access();
+        let mut state = state.lock().map_err(|_| SettingsDbError::Poisoned)?;
+        if state.phase != SettingsFamilyAccessPhase::Quiesced(self.generation)
+            || state.active_outer_leases != 0
+        {
+            return Err(SettingsDbError::SettingsFamilyQuiescing);
+        }
+        state.phase = SettingsFamilyAccessPhase::Active;
+        changed.notify_all();
+        Ok(())
+    }
+}
+
+/// Block only the calling worker until all process-wide settings-family leases drain. The UI must
+/// never invoke this directly.
+pub(crate) fn quiesce_settings_family() -> Result<SettingsFamilyMutationPermit, SettingsDbError> {
+    if SETTINGS_FAMILY_READ_DEPTH.with(|depth| depth.get() != 0) {
+        return Err(SettingsDbError::SettingsFamilyQuiescing);
+    }
+    let (state, changed) = settings_family_access();
+    let mut state = state.lock().map_err(|_| SettingsDbError::Poisoned)?;
+    if state.phase != SettingsFamilyAccessPhase::Active {
+        return Err(SettingsDbError::SettingsFamilyQuiescing);
+    }
+    let generation = state.next_generation;
+    state.next_generation = state.next_generation.wrapping_add(1).max(1);
+    state.phase = SettingsFamilyAccessPhase::Quiescing(generation);
+    changed.notify_all();
+    while state.active_outer_leases != 0 {
+        state = changed
+            .wait(state)
+            .unwrap_or_else(|poison| poison.into_inner());
+        if state.phase != SettingsFamilyAccessPhase::Quiescing(generation) {
+            return Err(SettingsDbError::SettingsFamilyQuiescing);
+        }
+    }
+    state.phase = SettingsFamilyAccessPhase::Quiesced(generation);
+    Ok(SettingsFamilyMutationPermit { generation })
+}
+
 /// 本セッションの save を完全に抑止するフラグ (Codex P2 v8b-3 2026-05-14)。
 ///
 /// `boot_settings_db` が `BootOutcome.db == None` を返すとき (= 全復旧経路が失敗)
@@ -3724,6 +4354,10 @@ pub(crate) fn set_global_db(data_dir: &Path, db: Option<Arc<SettingsDb>>) {
 /// - 内部 lock は `Arc<SettingsDb>` を clone する間だけ。closure 実行中は
 ///   global lock を持たない (= 並列 `with_db` がブロックしない)
 pub fn with_db<R>(f: impl FnOnce(&SettingsDb) -> R) -> Result<R, SettingsDbError> {
+    // Family ownership takes precedence over save suppression. Restore/reset intentionally turns
+    // suppression on after quiescing; Remote callers must continue to receive the retryable Busy
+    // classification throughout that mutation instead of an unrelated persistence failure.
+    let _family_lease = acquire_settings_family_read_lease()?;
     if save_suppressed() {
         return Err(SettingsDbError::SaveSuppressed);
     }
@@ -3787,7 +4421,7 @@ pub fn with_db_result<X>(
 ///
 /// `with_db` は通らず GLOBAL_DB から直接 Arc を取り出すので、`SAVE_SUPPRESSED` の
 /// 影響を受けない。`GLOBAL_DB` が None (= まだ boot していない) なら no-op。
-pub fn checkpoint_global_db() -> Result<(), SettingsDbError> {
+fn checkpoint_global_db() -> Result<(), SettingsDbError> {
     let arc: Option<Arc<SettingsDb>> = {
         let guard = GLOBAL_DB.lock().unwrap_or_else(|p| p.into_inner());
         guard.as_ref().map(|(_, a)| Arc::clone(a))
@@ -3795,6 +4429,26 @@ pub fn checkpoint_global_db() -> Result<(), SettingsDbError> {
     if let Some(arc) = arc {
         arc.checkpoint_truncate()?;
     }
+    Ok(())
+}
+
+/// Restore/reset-only checkpoint. The exclusive permit proves that no ordinary `with_db` closure
+/// or Remote favorites read can retain a concurrent settings-family handle.
+pub(crate) fn checkpoint_global_db_for_mutation(
+    permit: &SettingsFamilyMutationPermit,
+) -> Result<(), SettingsDbError> {
+    permit.validate()?;
+    checkpoint_global_db()
+}
+
+/// Restore/reset-only global handle release. Boot and test setup continue to use `set_global_db`;
+/// destructive family mutation must come through this generation-checked boundary.
+pub(crate) fn take_global_db_for_mutation(
+    data_dir: &Path,
+    permit: &SettingsFamilyMutationPermit,
+) -> Result<(), SettingsDbError> {
+    permit.validate()?;
+    set_global_db(data_dir, None);
     Ok(())
 }
 
@@ -3807,6 +4461,22 @@ pub fn reset_global_for_test() {
     if let Ok(mut guard) = GLOBAL_DB.lock() {
         *guard = None;
     }
+    SETTINGS_FAMILY_READ_DEPTH.with(|depth| {
+        assert_eq!(
+            depth.get(),
+            0,
+            "settings-family lease leaked on the test thread"
+        );
+    });
+    let (state, changed) = settings_family_access();
+    let mut state = state.lock().unwrap_or_else(|poison| poison.into_inner());
+    assert_eq!(
+        state.active_outer_leases, 0,
+        "settings-family lease leaked across test isolation"
+    );
+    state.phase = SettingsFamilyAccessPhase::Active;
+    state.next_generation = state.next_generation.wrapping_add(1).max(1);
+    changed.notify_all();
 }
 
 // ---------------------------------------------------------------------------
@@ -3877,6 +4547,291 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
 
+    #[test]
+    fn skip_offline_change_scan_roundtrip_and_released_missing_key() {
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        let mut settings = Settings::default();
+        assert!(!settings.skip_offline_change_scan);
+        settings.skip_offline_change_scan = true;
+        settings.grid_cols = 7;
+        db.save_full(&settings).unwrap();
+        assert!(db.load_into_settings().unwrap().skip_offline_change_scan);
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'skip_offline_change_scan'",
+                [],
+            )
+            .unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert!(!loaded.skip_offline_change_scan);
+        assert_eq!(loaded.grid_cols, 7);
+    }
+
+    #[test]
+    fn effetune_editor_rect_round_trips_with_the_normal_full_save() {
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        let mut settings = Settings::default();
+        settings.grid_cols = 7;
+        settings.effetune_gui_pos = Some((10, 20));
+        settings.effetune_gui_size = Some((800, 600));
+        db.save_full(&settings).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert_eq!(loaded.grid_cols, 7);
+        assert_eq!(loaded.effetune_gui_pos, Some((10, 20)));
+        assert_eq!(loaded.effetune_gui_size, Some((800, 600)));
+    }
+
+    #[test]
+    fn effetune_pre_limiter_default_missing_blob_and_db_roundtrip() {
+        assert!(Settings::default().effetune_pre_limiter_enabled);
+        let mut blob = serde_json::to_value(Settings::default()).unwrap();
+        blob.as_object_mut()
+            .unwrap()
+            .remove("effetune_pre_limiter_enabled");
+        assert!(
+            serde_json::from_value::<Settings>(blob)
+                .unwrap()
+                .effetune_pre_limiter_enabled
+        );
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        let settings = Settings {
+            effetune_pre_limiter_enabled: false,
+            ..Settings::default()
+        };
+        db.save_full(&settings).unwrap();
+        assert!(
+            !db.load_into_settings()
+                .unwrap()
+                .effetune_pre_limiter_enabled
+        );
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'effetune_pre_limiter_enabled'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            db.load_into_settings()
+                .unwrap()
+                .effetune_pre_limiter_enabled
+        );
+    }
+
+    #[test]
+    fn effetune_minimized_default_missing_blob_and_db_roundtrip() {
+        assert!(!Settings::default().effetune_keep_visible_when_minimized);
+        let mut blob = serde_json::to_value(Settings::default()).unwrap();
+        blob.as_object_mut()
+            .unwrap()
+            .remove("effetune_keep_visible_when_minimized");
+        let old: Settings = serde_json::from_value(blob).unwrap();
+        assert!(!old.effetune_keep_visible_when_minimized);
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        for enabled in [true, false] {
+            let settings = Settings {
+                effetune_keep_visible_when_minimized: enabled,
+                ..Settings::default()
+            };
+            db.save_full(&settings).unwrap();
+            assert_eq!(
+                db.load_into_settings()
+                    .unwrap()
+                    .effetune_keep_visible_when_minimized,
+                enabled
+            );
+        }
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'effetune_keep_visible_when_minimized'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            !db.load_into_settings()
+                .unwrap()
+                .effetune_keep_visible_when_minimized
+        );
+    }
+
+    #[test]
+    fn effetune_auto_open_default_missing_blob_and_db_roundtrip() {
+        assert!(!Settings::default().effetune_auto_open_on_video);
+        let mut blob = serde_json::to_value(Settings::default()).unwrap();
+        blob.as_object_mut()
+            .unwrap()
+            .remove("effetune_auto_open_on_video");
+        let old: Settings = serde_json::from_value(blob).unwrap();
+        assert!(!old.effetune_auto_open_on_video);
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        for enabled in [true, false] {
+            let settings = Settings {
+                effetune_auto_open_on_video: enabled,
+                effetune_keep_visible_when_minimized: true,
+                ..Settings::default()
+            };
+            db.save_full(&settings).unwrap();
+            let loaded = db.load_into_settings().unwrap();
+            assert_eq!(loaded.effetune_auto_open_on_video, enabled);
+            assert!(loaded.effetune_keep_visible_when_minimized);
+        }
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'effetune_auto_open_on_video'",
+                [],
+            )
+            .unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert!(!loaded.effetune_auto_open_on_video);
+        assert!(loaded.effetune_keep_visible_when_minimized);
+    }
+
+    #[test]
+    fn twenty_grid_columns_roundtrip_without_changing_toolbar_choices() {
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        let mut settings = Settings::default();
+        settings.grid_cols = 20;
+        settings.toolbar_cols_items = vec![1, 4, 10];
+        db.save_full(&settings).unwrap();
+
+        let loaded = db.load_into_settings().unwrap();
+        assert_eq!(loaded.grid_cols, 20);
+        assert_eq!(loaded.toolbar_cols_items, vec![1, 4, 10]);
+    }
+
+    #[test]
+    fn quick_folder_active_slot_roundtrip_and_missing_key_default() {
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        for active in [
+            Some(crate::settings::QuickFolderSlotId::A),
+            Some(crate::settings::QuickFolderSlotId::B),
+            None,
+        ] {
+            let mut settings = Settings::default();
+            settings.active_quick_folder_slot = active;
+            let mut stale_preferences = Settings::default();
+            let mut live = settings.clone();
+            stale_preferences.overwrite_non_preferences_from(&mut live);
+            assert_eq!(stale_preferences.active_quick_folder_slot, active);
+            db.save_full(&settings).unwrap();
+            assert_eq!(
+                db.load_into_settings().unwrap().active_quick_folder_slot,
+                active
+            );
+            let json = serde_json::to_value(&settings).unwrap();
+            assert_eq!(
+                serde_json::from_value::<Settings>(json)
+                    .unwrap()
+                    .active_quick_folder_slot,
+                active
+            );
+        }
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'active_quick_folder_slot'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            db.load_into_settings().unwrap().active_quick_folder_slot,
+            Some(crate::settings::QuickFolderSlotId::A)
+        );
+        let mut old_json = serde_json::to_value(Settings::default()).unwrap();
+        old_json
+            .as_object_mut()
+            .unwrap()
+            .remove("active_quick_folder_slot");
+        assert_eq!(
+            serde_json::from_value::<Settings>(old_json)
+                .unwrap()
+                .active_quick_folder_slot,
+            Some(crate::settings::QuickFolderSlotId::A)
+        );
+    }
+
+    #[test]
+    fn section1335_missing_db_record_migrates_once_and_roundtrips_with_prefix() {
+        use crate::settings::{ListCursorHint, StartupListRestore, StartupListTarget};
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        let mut legacy = Settings::default();
+        legacy.last_folder = Some(PathBuf::from(r"C:\books\released.zip"));
+        legacy.last_cursor_name = Some("page.png".into());
+        legacy.last_cursor_rows_above = Some(4);
+        db.save_full(&legacy).unwrap();
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'startup_list_restore'",
+                [],
+            )
+            .unwrap();
+        let mut loaded = db.load_into_settings().unwrap();
+        assert_eq!(loaded.startup_list_restore, None);
+        crate::settings::apply_load_time_migrations(&mut loaded);
+        assert_eq!(
+            loaded.startup_list_restore,
+            Some(StartupListRestore::V1 {
+                target: StartupListTarget::PhysicalList {
+                    logical_path: legacy.last_folder.clone().unwrap(),
+                    zip_prefix: None,
+                },
+                cursor: Some(ListCursorHint {
+                    name: "page.png".into(),
+                    rows_above: Some(4)
+                }),
+            })
+        );
+        loaded.last_folder = Some(PathBuf::from(r"C:\books\another.zip"));
+        db.save_full(&loaded).unwrap();
+        let mut repeated = db.load_into_settings().unwrap();
+        assert!(!repeated.migrate_startup_list_restore());
+        assert_eq!(repeated.startup_list_restore, loaded.startup_list_restore);
+        repeated.startup_list_restore = Some(StartupListRestore::V1 {
+            target: StartupListTarget::PhysicalList {
+                logical_path: PathBuf::from(r"C:\books\nested.zip"),
+                zip_prefix: Some("chapter/inner.zip/pages/".into()),
+            },
+            cursor: Some(ListCursorHint {
+                name: "p2.png".into(),
+                rows_above: Some(2),
+            }),
+        });
+        db.save_full(&repeated).unwrap();
+        drop(db);
+        assert_eq!(
+            SettingsDb::open(dir.path())
+                .unwrap()
+                .load_into_settings()
+                .unwrap()
+                .startup_list_restore,
+            repeated.startup_list_restore
+        );
+    }
+
     fn sample_settings() -> Settings {
         let mut s = Settings::default();
         s.grid_cols = 7;
@@ -3894,6 +4849,7 @@ mod tests {
                 auto_index_structure: true,
                 auto_index_metadata: false,
                 auto_index_thumbs: true,
+                auto_index_similar: true,
             },
             FavoriteEntry {
                 id: Uuid::new_v4(),
@@ -3902,6 +4858,7 @@ mod tests {
                 auto_index_structure: false,
                 auto_index_metadata: true,
                 auto_index_thumbs: false,
+                auto_index_similar: false,
             },
         ];
         s.tags = vec![
@@ -4283,6 +5240,144 @@ mod tests {
         db.save_full(&original).unwrap();
         let loaded = db.load_into_settings().unwrap();
         assert_settings_eq(&original, &loaded);
+    }
+
+    #[test]
+    fn video_watched_to_end_upgrades_old_db_without_changing_resume_positions() {
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        let mut settings = Settings::default();
+        settings
+            .video_resume_positions
+            .insert("c:/media/unfinished.mp4".into(), 123.5);
+        db.save_full(&settings).unwrap();
+        drop(db);
+        let conn = Connection::open(dir.path().join("settings.db")).unwrap();
+        conn.execute("DROP TABLE video_watched_to_end", []).unwrap();
+        drop(conn);
+
+        let db = SettingsDb::open(dir.path()).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert!(loaded.video_watched_to_end.is_empty());
+        assert_eq!(
+            loaded.video_resume_positions,
+            settings.video_resume_positions
+        );
+        // Opening repeatedly keeps the old resume data and the additive table intact.
+        drop(db);
+        let reopened = SettingsDb::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened
+                .load_into_settings()
+                .unwrap()
+                .video_resume_positions,
+            settings.video_resume_positions
+        );
+    }
+
+    #[test]
+    fn video_watched_to_end_roundtrips_clears_and_stays_out_of_settings_kv() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let mut settings = Settings::default();
+        settings.video_watched_to_end.extend([
+            "c:/media/finished.mp4".into(),
+            "d:/music/finished.flac".into(),
+        ]);
+        settings
+            .video_resume_positions
+            .insert("c:/media/unfinished.mp4".into(), 12.5);
+        db.save_full(&settings).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert_eq!(loaded.video_watched_to_end, settings.video_watched_to_end);
+        assert_eq!(
+            loaded.video_resume_positions,
+            settings.video_resume_positions
+        );
+        {
+            let inner = db.inner.lock().unwrap();
+            assert_eq!(
+                inner
+                    .conn
+                    .query_row("SELECT COUNT(*) FROM video_watched_to_end", [], |row| row
+                        .get::<_, usize>(
+                        0
+                    ))
+                    .unwrap(),
+                2
+            );
+            assert_eq!(
+                inner
+                    .conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM settings_kv WHERE key = 'video_watched_to_end'",
+                        [],
+                        |row| row.get::<_, usize>(0)
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+        settings.video_watched_to_end.clear();
+        db.save_full(&settings).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert!(loaded.video_watched_to_end.is_empty());
+        assert_eq!(
+            loaded.video_resume_positions,
+            settings.video_resume_positions
+        );
+    }
+
+    #[test]
+    fn video_watched_to_end_serde_missing_defaults_to_empty() {
+        let mut json = serde_json::to_value(Settings::default()).unwrap();
+        json.as_object_mut().unwrap().remove("video_watched_to_end");
+        let loaded: Settings = serde_json::from_value(json).unwrap();
+        assert!(loaded.video_watched_to_end.is_empty());
+        assert!(Settings::default().video_watched_to_end.is_empty());
+    }
+
+    #[test]
+    fn saved_audio_track_choices_roundtrip_clear_and_upgrade_old_db() {
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        db.save_full(&Settings::default()).unwrap();
+        drop(db);
+        // A released database predates this additional table.
+        let conn = Connection::open(dir.path().join("settings.db")).unwrap();
+        conn.execute("DROP TABLE video_audio_track_choices", [])
+            .unwrap();
+        drop(conn);
+        let db = SettingsDb::open(dir.path()).unwrap();
+        assert!(
+            db.load_into_settings()
+                .unwrap()
+                .video_audio_track_choices
+                .is_empty()
+        );
+        let choice = crate::video::SavedAudioTrackChoice {
+            stream_index: 3,
+            codec: "flac".into(),
+            language: Some("jpn".into()),
+            channels: Some(2),
+            title: Some("日本語の解説".into()),
+        };
+        let mut settings = Settings::default();
+        settings
+            .video_audio_track_choices
+            .insert("test-path".into(), choice.clone());
+        db.save_full(&settings).unwrap();
+        assert_eq!(
+            db.load_into_settings().unwrap().video_audio_track_choices["test-path"],
+            choice
+        );
+        settings.video_audio_track_choices.clear();
+        db.save_full(&settings).unwrap();
+        assert!(
+            db.load_into_settings()
+                .unwrap()
+                .video_audio_track_choices
+                .is_empty()
+        );
     }
 
     #[test]
@@ -4774,6 +5869,48 @@ mod tests {
     }
 
     #[test]
+    fn audio_thumbnail_indicator_roundtrips_and_normalizes_live_unknown() {
+        use crate::settings::AudioThumbnailIndicator;
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let mut settings = Settings::default();
+        for &indicator in AudioThumbnailIndicator::all() {
+            settings.audio_thumbnail_indicator = indicator;
+            db.save_full(&settings).unwrap();
+            assert_eq!(
+                db.load_into_settings().unwrap().audio_thumbnail_indicator,
+                indicator
+            );
+        }
+        settings.audio_thumbnail_indicator = AudioThumbnailIndicator::Unknown;
+        db.save_full(&settings).unwrap();
+        let mut snapshot = Settings::default();
+        db.load_remote_listing_settings(&snapshot)
+            .unwrap()
+            .apply_to(&mut snapshot);
+        assert_eq!(
+            snapshot.audio_thumbnail_indicator,
+            AudioThumbnailIndicator::MusicNoteIcon
+        );
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'audio_thumbnail_indicator'",
+                [],
+            )
+            .unwrap();
+        snapshot.audio_thumbnail_indicator = AudioThumbnailIndicator::MusicNoteIcon;
+        db.load_remote_listing_settings(&snapshot)
+            .unwrap()
+            .apply_to(&mut snapshot);
+        assert_eq!(
+            snapshot.audio_thumbnail_indicator,
+            AudioThumbnailIndicator::MusicNoteIcon
+        );
+    }
+
+    #[test]
     fn remote_listing_settings_overlay_reads_every_live_field_only() {
         use crate::settings::{
             ArchiveFileHandling, GridDisplayOrder, GridItemDisplayKind, SortOrder, ThumbAspect,
@@ -4781,7 +5918,8 @@ mod tests {
 
         let db = SettingsDb::open_in_memory_for_test().unwrap();
         let mut live = Settings::default();
-        live.sort_order = SortOrder::DateDesc;
+        live.sort_order = SortOrder::RatingDesc;
+        live.rating_sort_unrated_position = crate::rating_sort::RatingSortUnratedPosition::BelowAll;
         live.show_hidden_files = true;
         live.grid_display_order = GridDisplayOrder::from_rows([
             vec![GridItemDisplayKind::Image],
@@ -4790,11 +5928,14 @@ mod tests {
             vec![GridItemDisplayKind::Folder],
         ]);
         live.archive_file_handling = ArchiveFileHandling::Ignore;
+        live.epub_file_handling = crate::settings::EpubFileHandling::Convert;
         live.archive_convert_without_dialog = true;
         live.skip_zip_if_folder_exists = false;
         live.skip_archive_if_zip_exists = false;
+        live.skip_epub_if_pdf_exists = false;
         live.skip_image_if_video_exists = false;
         live.video_thumb_use_sidecar_image = false;
+        live.audio_thumbnail_indicator = crate::settings::AudioThumbnailIndicator::Hidden;
         live.skip_duplicate_images = false;
         live.image_ext_priority = vec!["avif".to_owned(), "png".to_owned()];
         live.book_root = Some(PathBuf::from(r"D:\Books"));
@@ -4811,11 +5952,42 @@ mod tests {
             .unwrap()
             .apply_to(&mut startup_snapshot);
 
+        crate::settings::normalize_image_ext_priority(&mut live.image_ext_priority);
         assert_eq!(
             RemoteListingSettings::from_settings(&startup_snapshot),
             RemoteListingSettings::from_settings(&live)
         );
         assert_eq!(startup_snapshot.thumb_quality, 17);
+    }
+
+    #[test]
+    fn image_ext_priority_remote_overlay_completes_old_lists_without_writing() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let original = vec!["MOS".into(), "custom".into(), "png".into()];
+        let old = Settings {
+            image_ext_priority: original.clone(),
+            ..Settings::default()
+        };
+        db.save_full(&old).unwrap();
+        let mut mirror = Settings::default();
+        db.load_remote_listing_settings(&mirror)
+            .unwrap()
+            .apply_to(&mut mirror);
+        assert_eq!(&mirror.image_ext_priority[..original.len()], original);
+        assert_eq!(
+            mirror.image_ext_priority.len(),
+            crate::settings::default_image_ext_priority().len() + 1
+        );
+        assert!(
+            !mirror
+                .image_ext_priority
+                .iter()
+                .any(|extension| extension == "mos")
+        );
+        assert_eq!(
+            db.load_into_settings().unwrap().image_ext_priority,
+            original
+        );
     }
 
     #[test]
@@ -4839,6 +6011,159 @@ mod tests {
             .apply_to(&mut startup_snapshot);
 
         assert!(!startup_snapshot.video_thumb_use_sidecar_image);
+    }
+
+    #[test]
+    fn remote_reading_settings_are_live_and_keep_missing_old_key_defaults() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let mut live = Settings::default();
+        live.default_spread_mode = crate::settings::SpreadMode::RtlCover;
+        live.default_reading_direction = crate::settings::ReadingDirection::Rtl;
+        live.final_cover_spread_enabled = false;
+        live.singleton_spread_first_enabled = true;
+        live.singleton_spread_last_enabled = true;
+        live.spread_page_gap_px = 19;
+        db.save_full(&live).unwrap();
+
+        let mut fallback = Settings::default();
+        fallback.default_spread_mode = crate::settings::SpreadMode::Ltr;
+        fallback.default_reading_direction = crate::settings::ReadingDirection::Ltr;
+        fallback.final_cover_spread_enabled = true;
+        fallback.singleton_spread_first_enabled = false;
+        fallback.singleton_spread_last_enabled = false;
+        fallback.spread_page_gap_px = 3;
+        assert_eq!(
+            db.load_remote_reading_settings(&fallback).unwrap(),
+            RemoteReadingSettings::from_settings(&live)
+        );
+
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute_batch(
+                "DELETE FROM settings_kv WHERE key = 'final_cover_spread_enabled';
+                 DELETE FROM settings_kv WHERE key = 'singleton_spread_last_enabled';",
+            )
+            .unwrap();
+        assert!(db.load_remote_reading_settings(&fallback).is_err());
+    }
+
+    #[test]
+    fn singleton_endpoint_bootstrap_and_released_value_migration() {
+        for legacy in [Some(true), Some(false), None] {
+            let db = SettingsDb::open_in_memory_for_test().unwrap();
+            db.save_full(&Settings::default()).unwrap();
+            {
+                let inner = db.inner.lock().unwrap();
+                assert!(singleton_endpoint_marker_present(&inner.conn).unwrap());
+                assert_eq!(
+                    read_singleton_endpoint_settings(&inner.conn).unwrap(),
+                    crate::settings::SingletonSpreadEndpointSettings::default()
+                );
+                inner
+                    .conn
+                    .execute(
+                        "DELETE FROM schema_meta WHERE key = ?1",
+                        params![SINGLETON_ENDPOINT_MIGRATION_META_KEY],
+                    )
+                    .unwrap();
+                inner.conn.execute(
+                    "DELETE FROM settings_kv WHERE key IN ('singleton_spread_first_enabled', 'singleton_spread_last_enabled', 'singleton_spread_placement_enabled')",
+                    [],
+                ).unwrap();
+                if let Some(value) = legacy {
+                    inner.conn.execute(
+                        "INSERT INTO settings_kv(key, value) VALUES ('singleton_spread_placement_enabled', ?1)",
+                        [serde_json::to_string(&value).unwrap()],
+                    ).unwrap();
+                }
+                // One new key without the marker is explicitly incomplete.
+                inner.conn.execute(
+                    "INSERT INTO settings_kv(key, value) VALUES ('singleton_spread_first_enabled', 'false')",
+                    [],
+                ).unwrap();
+                assert_eq!(
+                    read_singleton_endpoint_settings(&inner.conn).unwrap(),
+                    crate::settings::SingletonSpreadEndpointSettings::from(legacy.unwrap_or(false))
+                );
+            }
+            assert!(matches!(
+                db.save_full(&Settings::default()),
+                Err(SettingsDbError::SaveSuppressed)
+            ));
+            let loaded = db.load_into_settings().unwrap();
+            assert_eq!(
+                loaded.singleton_spread_first_enabled,
+                legacy.unwrap_or(false)
+            );
+            assert_eq!(
+                loaded.singleton_spread_last_enabled,
+                legacy.unwrap_or(false)
+            );
+            assert_eq!(
+                db.load_remote_reading_settings(&Settings::default())
+                    .unwrap()
+                    .singleton_spread_last_enabled,
+                legacy.unwrap_or(false)
+            );
+            db.save_full(&loaded).unwrap();
+        }
+    }
+
+    #[test]
+    fn singleton_endpoint_failed_migration_projects_old_then_retries_and_backup_recovers() {
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        db.save_full(&Settings::default()).unwrap();
+        {
+            let inner = db.inner.lock().unwrap();
+            inner
+                .conn
+                .execute(
+                    "DELETE FROM schema_meta WHERE key = ?1",
+                    params![SINGLETON_ENDPOINT_MIGRATION_META_KEY],
+                )
+                .unwrap();
+            inner.conn.execute(
+                "INSERT INTO settings_kv(key, value) VALUES ('singleton_spread_placement_enabled', 'true')",
+                [],
+            ).unwrap();
+            inner
+                .conn
+                .execute_batch(
+                    "CREATE TRIGGER fail_singleton_endpoint BEFORE UPDATE ON settings_kv
+                 WHEN NEW.key = 'singleton_spread_last_enabled'
+                 BEGIN SELECT RAISE(ABORT, 'injected migration failure'); END;",
+                )
+                .unwrap();
+        }
+        let loaded = db.load_into_settings().unwrap();
+        assert!(loaded.singleton_spread_first_enabled && loaded.singleton_spread_last_enabled);
+        assert!(matches!(
+            db.save_full(&loaded),
+            Err(SettingsDbError::SaveSuppressed)
+        ));
+        {
+            let inner = db.inner.lock().unwrap();
+            assert!(!singleton_endpoint_marker_present(&inner.conn).unwrap());
+            inner
+                .conn
+                .execute_batch("DROP TRIGGER fail_singleton_endpoint")
+                .unwrap();
+        }
+        let backup = dir.path().join("settings.db.bak1");
+        db.backup_to(&backup).unwrap();
+        let recovered_dir = TempDir::new().unwrap();
+        std::fs::copy(&backup, recovered_dir.path().join("settings.db")).unwrap();
+        let recovered = SettingsDb::open(recovered_dir.path()).unwrap();
+        let recovered_settings = recovered.load_into_settings().unwrap();
+        assert!(recovered_settings.singleton_spread_first_enabled);
+        assert!(recovered_settings.singleton_spread_last_enabled);
+        assert!(singleton_endpoint_marker_present(&recovered.inner.lock().unwrap().conn).unwrap());
+        let retried = db.load_into_settings().unwrap();
+        assert!(retried.singleton_spread_first_enabled && retried.singleton_spread_last_enabled);
+        db.save_full(&retried).unwrap();
     }
 
     #[test]
@@ -4875,12 +6200,14 @@ mod tests {
             auto_index_structure: false,
             auto_index_metadata: false,
             auto_index_thumbs: false,
+            auto_index_similar: false,
         };
         settings.favorites = vec![favorite.clone()];
         settings.global_preset.brightness = 11.0;
         settings.conceal_type = crate::conceal::ConcealType::BlackFill;
         settings.conceal_fill_opacity_percent = 73;
         settings.erase_inpaint_mono_tolerance = 9;
+        settings.raw_brightness = crate::raw::RawBrightness::MatchPreview;
         db.save_full(&settings).unwrap();
 
         let first = db.load_adjustment_render_settings().unwrap();
@@ -4889,6 +6216,10 @@ mod tests {
         assert_eq!(first.favorites[0].path, favorite.path);
         assert_eq!(first.global_preset.brightness, 11.0);
         assert_eq!(first.erase_inpaint_mono_tolerance, 9);
+        assert_eq!(
+            first.raw_brightness,
+            crate::raw::RawBrightness::MatchPreview
+        );
         assert_eq!(first.creative_luts, settings.creative_luts);
         assert_eq!(
             first.conceal_preset,
@@ -4901,12 +6232,14 @@ mod tests {
         settings.conceal_type = crate::conceal::ConcealType::Blur;
         settings.conceal_blur_radius_px = 41.0;
         settings.erase_inpaint_mono_tolerance = 27;
+        settings.raw_brightness = crate::raw::RawBrightness::None;
         db.save_full(&settings).unwrap();
 
         let second = db.load_adjustment_render_settings().unwrap();
         assert!(second.favorites.is_empty());
         assert_eq!(second.global_preset.brightness, 37.0);
         assert_eq!(second.erase_inpaint_mono_tolerance, 27);
+        assert_eq!(second.raw_brightness, crate::raw::RawBrightness::None);
         assert!(second.creative_luts.is_empty());
         assert_eq!(
             second.conceal_preset,
@@ -5043,6 +6376,63 @@ mod tests {
         assert_eq!(outcome.source, BootSource::LoadedExistingDb);
         assert!(!outcome.settings.touch_still_chrome_learned);
         assert!(!outcome.settings.touch_video_chrome_learned);
+        assert!(
+            !std::fs::read_dir(guard.path())
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().contains(".corrupted-"))
+        );
+    }
+
+    #[test]
+    fn released_favorites_table_without_similar_flag_migrates_without_quarantine() {
+        let guard = DataDirOverrideGuard::new();
+        let db = SettingsDb::create_new(guard.path()).unwrap();
+        let mut settings = Settings::default();
+        let mut favorite = FavoriteEntry::new(
+            "既存のお気に入り".to_owned(),
+            PathBuf::from(r"C:\Pictures\old"),
+        );
+        favorite.auto_index_structure = true;
+        favorite.auto_index_metadata = true;
+        favorite.auto_index_similar = true;
+        settings.favorites.push(favorite);
+        db.save_full(&settings).unwrap();
+        drop(db);
+
+        // リリース済みの旧 favorites schema を実ファイル上に再現する。
+        let conn = Connection::open(guard.path().join("settings.db")).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE favorites RENAME TO favorites_legacy;
+             DROP INDEX favorites_sort;
+             CREATE TABLE favorites (
+                id                    BLOB PRIMARY KEY,
+                name                  TEXT NOT NULL,
+                path                  TEXT NOT NULL,
+                sort_index            INTEGER NOT NULL,
+                auto_index_structure  INTEGER NOT NULL DEFAULT 0,
+                auto_index_metadata   INTEGER NOT NULL DEFAULT 0,
+                auto_index_thumbs     INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO favorites
+                (id, name, path, sort_index, auto_index_structure,
+                 auto_index_metadata, auto_index_thumbs)
+             SELECT id, name, path, sort_index, auto_index_structure,
+                    auto_index_metadata, auto_index_thumbs
+             FROM favorites_legacy;
+             DROP TABLE favorites_legacy;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let outcome = boot_settings_db(guard.path());
+        assert_eq!(outcome.source, BootSource::LoadedExistingDb);
+        assert!(outcome.db.is_some());
+        assert_eq!(outcome.settings.favorites.len(), 1);
+        let loaded = &outcome.settings.favorites[0];
+        assert!(loaded.auto_index_structure);
+        assert!(loaded.auto_index_metadata);
+        assert!(!loaded.auto_index_similar);
         assert!(
             !std::fs::read_dir(guard.path())
                 .unwrap()
@@ -5878,19 +7268,21 @@ mod tests {
             )
             .unwrap()
         };
-        let mut statement = conn.prepare("SELECT value FROM settings_kv").unwrap();
-        let persisted_json = statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
-            .join("|");
-
-        assert!(!persisted_json.contains("RatedAt"));
+        for key in [
+            "details_sort_key",
+            "details_column_order",
+            "details_column_widths",
+            "details_selection_bar_column_order",
+            "details_selection_bar_column_widths",
+        ] {
+            assert!(
+                !read(key).contains("RatedAt"),
+                "{key} must remain readable by older details settings"
+            );
+        }
         assert_eq!(read("details_sort_key"), r#""Toolbar""#);
         assert_eq!(read("details_rated_at_width"), "154.0");
         assert_eq!(read("details_selection_bar_rated_at_width"), "176.0");
-        drop(statement);
         drop(conn);
 
         let mut loaded = db.load_into_settings().unwrap();
@@ -5954,6 +7346,51 @@ mod tests {
             crate::settings::apply_load_time_migrations(&mut loaded);
             assert_eq!(loaded.facet_name_filter_width, width);
         }
+    }
+
+    #[test]
+    fn chrome_suppression_settings_kv_roundtrip_and_missing_released_key_keep_raw_locks() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let mut settings = Settings::default();
+        settings.fullscreen_top_bar_locked = true;
+        settings.set_still_bottom_lock(crate::settings::BottomBarLock::BarAndStrip);
+        settings.video_top_bar_locked = true;
+        settings.set_video_bottom_lock(crate::settings::BottomBarLock::BarAndStrip);
+        settings.fullscreen_chrome_suppression = crate::settings::FullscreenChromeSuppression {
+            top: true,
+            bottom: true,
+            info: true,
+            navigator: true,
+        };
+        db.save_full(&settings).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert_eq!(
+            loaded.fullscreen_chrome_suppression,
+            settings.fullscreen_chrome_suppression
+        );
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'fullscreen_chrome_suppression'",
+                [],
+            )
+            .unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert_eq!(
+            loaded.fullscreen_chrome_suppression,
+            crate::settings::FullscreenChromeSuppression::default()
+        );
+        assert!(loaded.fullscreen_top_bar_locked && loaded.video_top_bar_locked);
+        assert_eq!(
+            loaded.still_bottom_lock(),
+            crate::settings::BottomBarLock::BarAndStrip
+        );
+        assert_eq!(
+            loaded.video_bottom_lock(),
+            crate::settings::BottomBarLock::BarAndStrip
+        );
     }
 
     #[test]
@@ -6730,6 +8167,92 @@ mod tests {
     }
 
     #[test]
+    fn section292_clean_install_defaults_persist_only_once() {
+        let guard = DataDirOverrideGuard::new();
+        let first = boot_settings_db(guard.path());
+        assert_eq!(first.source, BootSource::CleanInstall);
+        assert!(!first.settings.show_toolbar_sort);
+        assert!(first.settings.show_facet_sort);
+        let mut edited = first.settings.clone();
+        edited.show_toolbar_sort = true;
+        edited.show_facet_sort = false;
+        first.db.unwrap().save_full(&edited).unwrap();
+        let second = boot_settings_db(guard.path());
+        assert_eq!(second.source, BootSource::LoadedExistingDb);
+        assert!(second.settings.show_toolbar_sort);
+        assert!(!second.settings.show_facet_sort);
+    }
+
+    #[test]
+    fn section292_legacy_db_and_json_keep_top_sort_customization() {
+        for json in [false, true] {
+            for top in [None, Some(false), Some(true)] {
+                let guard = DataDirOverrideGuard::new();
+                let mut original = Settings::default();
+                original.show_toolbar_sort = top.unwrap_or(true);
+                original.toolbar_section_order.reverse();
+                original.toolbar_sort_items = vec![crate::settings::SortOrder::DateDesc];
+                original.toolbar_sort_display = crate::settings::ToolbarSectionDisplay::Buttons;
+                if json {
+                    let mut value = serde_json::to_value(&original).unwrap();
+                    value.as_object_mut().unwrap().remove("show_facet_sort");
+                    if top.is_none() {
+                        value.as_object_mut().unwrap().remove("show_toolbar_sort");
+                    }
+                    std::fs::write(
+                        guard.path().join("settings.json"),
+                        serde_json::to_vec(&value).unwrap(),
+                    )
+                    .unwrap();
+                } else {
+                    let db = SettingsDb::create_new(guard.path()).unwrap();
+                    db.save_full(&original).unwrap();
+                    db.inner
+                        .lock()
+                        .unwrap()
+                        .conn
+                        .execute("DELETE FROM settings_kv WHERE key = 'show_facet_sort'", [])
+                        .unwrap();
+                    if top.is_none() {
+                        db.inner
+                            .lock()
+                            .unwrap()
+                            .conn
+                            .execute(
+                                "DELETE FROM settings_kv WHERE key = 'show_toolbar_sort'",
+                                [],
+                            )
+                            .unwrap();
+                    }
+                }
+                let boot = boot_settings_db(guard.path());
+                assert_eq!(
+                    boot.source,
+                    if json {
+                        BootSource::MigratedFromJson
+                    } else {
+                        BootSource::LoadedExistingDb
+                    }
+                );
+                assert_eq!(boot.settings.show_toolbar_sort, top.unwrap_or(true));
+                assert!(!boot.settings.show_facet_sort);
+                assert_eq!(
+                    boot.settings.toolbar_section_order,
+                    original.toolbar_section_order
+                );
+                assert_eq!(
+                    boot.settings.toolbar_sort_items,
+                    original.toolbar_sort_items
+                );
+                assert_eq!(
+                    boot.settings.toolbar_sort_display,
+                    original.toolbar_sort_display
+                );
+            }
+        }
+    }
+
+    #[test]
     fn boot_clean_install() {
         let guard = DataDirOverrideGuard::new();
         let outcome = boot_settings_db(guard.path());
@@ -6804,6 +8327,73 @@ mod tests {
             )
             .unwrap();
         assert!(stored.contains("FutureEncoder"), "main DB was replaced");
+    }
+
+    #[test]
+    fn older_reader_treats_rating_sort_as_incompatible_without_quarantine() {
+        #[derive(serde::Deserialize)]
+        enum OldSortOrder {
+            FileName,
+            FileNameDesc,
+            Numeric,
+            NumericDesc,
+            DateAsc,
+            DateDesc,
+            SizeAsc,
+            SizeDesc,
+        }
+        let written = serde_json::to_string(&crate::settings::SortOrder::RatingDesc).unwrap();
+        assert!(serde_json::from_str::<OldSortOrder>(&written).is_err());
+
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        {
+            let db = SettingsDb::create_new(dir).unwrap();
+            let settings = Settings {
+                sort_order: crate::settings::SortOrder::RatingDesc,
+                rating_sort_unrated_position:
+                    crate::rating_sort::RatingSortUnratedPosition::BelowAll,
+                ..Default::default()
+            };
+            db.save_full(&settings).unwrap();
+            let loaded = db.load_into_settings().unwrap();
+            assert_eq!(loaded.sort_order, settings.sort_order);
+            assert_eq!(
+                loaded.rating_sort_unrated_position,
+                settings.rating_sort_unrated_position
+            );
+            db.backup_to(&dir.join("settings.db.bak1")).unwrap();
+        }
+        // A future variant stands in for RatingDesc when this code is the old reader.
+        let conn = rusqlite::Connection::open(dir.join("settings.db")).unwrap();
+        conn.execute(
+            "UPDATE settings_kv SET value = '\"FutureRatingDesc\"' WHERE key = 'sort_order'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let outcome = boot_settings_db(dir);
+        assert_eq!(outcome.source, BootSource::IncompatibleSettings);
+        assert!(save_suppressed());
+        assert!(dir.join("settings.db").is_file());
+        assert!(dir.join("settings.db.bak1").is_file());
+        assert_eq!(
+            std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .filter(|entry| { entry.file_name().to_string_lossy().contains(".corrupted-") })
+                .count(),
+            0
+        );
+        let conn = rusqlite::Connection::open(dir.join("settings.db")).unwrap();
+        let stored: String = conn
+            .query_row(
+                "SELECT value FROM settings_kv WHERE key = 'sort_order'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "\"FutureRatingDesc\"");
     }
 
     #[test]
@@ -6914,6 +8504,41 @@ mod tests {
     }
 
     #[test]
+    fn boot_recovers_released_singleton_value_from_backup_then_migrates_both_endpoints() {
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        {
+            let db = SettingsDb::create_new(dir).unwrap();
+            db.save_full(&Settings::default()).unwrap();
+            {
+                let inner = db.inner.lock().unwrap();
+                inner
+                    .conn
+                    .execute(
+                        "DELETE FROM schema_meta WHERE key = ?1",
+                        params![SINGLETON_ENDPOINT_MIGRATION_META_KEY],
+                    )
+                    .unwrap();
+                inner.conn.execute("INSERT INTO settings_kv(key, value) VALUES ('singleton_spread_placement_enabled', 'true')", []).unwrap();
+                inner.conn.execute("DELETE FROM settings_kv WHERE key IN ('singleton_spread_first_enabled', 'singleton_spread_last_enabled')", []).unwrap();
+            }
+            db.backup_to(&dir.join("settings.db.bak1")).unwrap();
+        }
+        std::fs::remove_file(dir.join("settings.db")).unwrap();
+        std::fs::write(dir.join("settings.db"), b"GARBAGE-NOT-A-SQLITE-DB-CONTENT").unwrap();
+        let _ = std::fs::remove_file(dir.join("settings.db-wal"));
+        let _ = std::fs::remove_file(dir.join("settings.db-shm"));
+        let outcome = boot_settings_db(dir);
+        assert_eq!(outcome.source, BootSource::RestoredFromDbBackup);
+        assert!(outcome.settings.singleton_spread_first_enabled);
+        assert!(outcome.settings.singleton_spread_last_enabled);
+        assert!(
+            singleton_endpoint_marker_present(&outcome.db.unwrap().inner.lock().unwrap().conn)
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn boot_failed_returns_default_with_suppress() {
         // 復旧の bak も json も無い + DB が transient で開けない状況をシミュレートする。
         // 簡単に作れるシナリオ: 「main は壊れている、bak も無い、json も無い」。
@@ -6923,6 +8548,8 @@ mod tests {
         let outcome = boot_settings_db(dir);
         assert_eq!(outcome.source, BootSource::FailedFallbackDefault);
         assert!(outcome.db.is_none());
+        assert!(!outcome.settings.show_toolbar_sort);
+        assert!(outcome.settings.show_facet_sort);
         // SAVE_SUPPRESSED が立っており、後続の with_db は SaveSuppressed で fail-fast する
         // (Codex P2 v8b-3 2026-05-14)。
         assert!(save_suppressed());
@@ -6973,6 +8600,80 @@ mod tests {
         assert_eq!(outcome.source, BootSource::CleanInstall);
         assert!(!save_suppressed());
         with_db(|_db| ()).expect("with_db should succeed after a fresh boot");
+    }
+
+    #[test]
+    fn settings_family_nested_leases_release_on_last_drop_even_out_of_order() {
+        let _guard = DataDirOverrideGuard::new();
+        let outer = acquire_settings_family_read_lease().expect("outer lease");
+        let inner = acquire_settings_family_read_lease().expect("nested lease");
+        drop(outer);
+        SETTINGS_FAMILY_READ_DEPTH.with(|depth| assert_eq!(depth.get(), 1));
+        {
+            let (state, _) = settings_family_access();
+            let state = state.lock().unwrap();
+            assert_eq!(state.active_outer_leases, 1);
+            assert_eq!(state.phase, SettingsFamilyAccessPhase::Active);
+        }
+        drop(inner);
+        SETTINGS_FAMILY_READ_DEPTH.with(|depth| assert_eq!(depth.get(), 0));
+        let (state, _) = settings_family_access();
+        assert_eq!(state.lock().unwrap().active_outer_leases, 0);
+    }
+
+    #[test]
+    fn settings_family_quiesce_drains_existing_outer_and_rejects_new_thread() {
+        let _guard = DataDirOverrideGuard::new();
+        let active = acquire_settings_family_read_lease().expect("active lease");
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            tx.send(quiesce_settings_family()).unwrap();
+        });
+        {
+            let (state, changed) = settings_family_access();
+            let mut state = state.lock().unwrap();
+            while matches!(state.phase, SettingsFamilyAccessPhase::Active) {
+                state = changed.wait(state).unwrap();
+            }
+            assert!(matches!(
+                state.phase,
+                SettingsFamilyAccessPhase::Quiescing(_)
+            ));
+        }
+        let rejected = std::thread::spawn(|| {
+            matches!(
+                acquire_settings_family_read_lease(),
+                Err(SettingsDbError::SettingsFamilyQuiescing)
+            )
+        })
+        .join()
+        .expect("admission thread");
+        assert!(rejected, "new thread must be rejected while quiescing");
+        assert!(
+            rx.try_recv().is_err(),
+            "quiesce must wait for the active lease"
+        );
+        drop(active);
+        let permit = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("quiesce completion")
+            .expect("mutation permit");
+        permit.validate().expect("current generation");
+        permit.resume_local().expect("resume active domain");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn settings_family_busy_precedes_save_suppression_during_mutation() {
+        let _guard = DataDirOverrideGuard::new();
+        let permit = quiesce_settings_family().expect("mutation permit");
+        set_save_suppressed(true);
+        assert!(matches!(
+            with_db(|_| ()),
+            Err(SettingsDbError::SettingsFamilyQuiescing)
+        ));
+        set_save_suppressed(false);
+        permit.resume_local().expect("resume active domain");
     }
 
     /// 2026-05-17 事故ガード回帰テスト: `with_db` は `GLOBAL_DB` の dir と

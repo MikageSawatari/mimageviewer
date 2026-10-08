@@ -20,19 +20,22 @@ mimageviewer パフォーマンスイベントログ (perf_events.jsonl) の解�
     priority            可視サムネイルが未 decode のうちに非可視が先に処理された違反を検出
     dump <seq>          指定 seq に紐づく全イベントを時系列で列挙
     timeline [seq]      ガントチャート (matplotlib が必要)。seq 指定可
-    thumbs              サムネイル decode 時間の分布 (priority=H/L 別)
+    thumbs              サムネイル decode と可視セル補正生成の時間分布
     remote-page         mIV Remote のページ生成を段・同時本数・lock 待ち別に集計
     colorize            カラー化 / final effect の段階別時間を解像度・方式別に集計
     nav                 Ctrl+↑↓ ナビの区間別 wall time (DFS / apply / load_folder /
                         start_loading_items / close_fullscreen) を集計
     pre-grid            App::update のグリッド直前区間を要素別に集計
-    hitches [--ms N]    フレーム間隔 N ms 超のヒッチを検出し、直前の nav.* 区間を
-                        表示 (デフォルト 33ms = 30fps 閾値)
+    collection          コレクション読取 lease を session + request_id で相関し、
+                        旧イベントは段別時間・outcome・未相関件数だけを集計
+    hitches [--ms N]    遅い update / フレーム間隔と logger・UI・thumb 区間、
+                        全カテゴリのイベント空白を表示 (デフォルト 33ms)
     idle-health         静止区間の update 頻度、repaint 理由の継続、同一 work の
                         反復を検査し、閾値超過時に終了コード 1 を返す
     startup             起動時間のフェーズ別 breakdown (data_dir / models /
                         susie_worker / settings / icon / fonts / theme / app_default /
                         creator_enter/exit / first_frame) を表示
+    memory              core の起動後 60 秒のプロセスメモリ時系列 (MiB) を表示
     av_drift [--plot]   動画再生中の音声・映像同期 (A/V drift) と audio underrun /
                         audio_pts_jump / Norm 操作 を時系列で集計する。
                         --plot で matplotlib グラフを開く
@@ -47,6 +50,7 @@ import json
 import math
 import sys
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
 
@@ -1222,8 +1226,30 @@ def cmd_dump(events: list[dict], seq: int, include_frames: bool) -> None:
 # thumbs
 # -----------------------------------------------------------------------
 
+def analyze_thumb_adjustment_frames(events: list[dict]) -> dict:
+    """Session and update-frame scoped visible adjustment work; prefetch is separate."""
+    session = 0
+    frames: dict[tuple[int, int], list[dict]] = defaultdict(list)
+    prefetch: list[dict] = []
+    legacy = 0
+    for event in events:
+        if event.get("cat") == "session" and event.get("kind") == "start":
+            session += 1
+        if event.get("cat") != "thumb" or event.get("kind") != "adjustment_build":
+            continue
+        origin = event.get("origin")
+        n = event.get("n")
+        if origin == "visible" and isinstance(n, int):
+            frames[(session, n)].append(event)
+        elif origin == "prefetch":
+            prefetch.append(event)
+        else:
+            legacy += 1
+    return {"frames": frames, "prefetch": prefetch, "legacy": legacy}
+
+
 def cmd_thumbs(events: list[dict]) -> None:
-    """thumb.decode_end の時間分布を priority=H/L、from_cache=True/False 別に表示。"""
+    """サムネイル decode と可視セル補正生成の時間分布を表示。"""
     # idx → 最後の priority (enqueue から取る)
     idx_priority: dict[int, bool] = {}
     buckets: dict[tuple[str, bool], list[float]] = defaultdict(list)
@@ -1261,6 +1287,31 @@ def cmd_thumbs(events: list[dict]) -> None:
         for cached in (True, False):
             label = f"priority={pri}  from_cache={cached}"
             stats(label, buckets.get((pri, cached), []))
+
+    adjustment_by_size: dict[tuple[str, int, int], list[dict]] = defaultdict(list)
+    for event in events:
+        if event.get("cat") == "thumb" and event.get("kind") == "adjustment_build":
+            adjustment_by_size[(event.get("origin", "legacy"), event.get("width", 0), event.get("height", 0))].append(event)
+    print("補正生成 (可視/先読み・画像寸法別、GPU 転送時間は含まない):")
+    for (origin, width, height), rows in sorted(adjustment_by_size.items()):
+        print(f"  {origin} {width}x{height}: {len(rows)} 件、total 合計={sum(row.get('total_ms', 0.0) for row in rows):.1f} ms")
+        for field in ("apply_ms", "texture_ms", "total_ms"):
+            stats(field, [row.get(field, 0.0) for row in rows])
+
+    report = analyze_thumb_adjustment_frames(events)
+    frame_rows = [
+        (session, n, len(rows), sum(row.get("apply_ms", 0.0) for row in rows),
+         sum(row.get("texture_ms", 0.0) for row in rows),
+         sum(row.get("total_ms", 0.0) for row in rows))
+        for (session, n), rows in report["frames"].items()
+    ]
+    print("可視セル補正生成の 1 フレーム合計 (同一 session / n、先読み除外):")
+    stats("visible total/frame", [row[5] for row in frame_rows])
+    for session, n, count, apply_ms, texture_ms, total_ms in sorted(
+        frame_rows, key=lambda row: row[5], reverse=True
+    )[:5]:
+        print(f"  session={session} n={n} cells={count} apply={apply_ms:.1f}ms texture={texture_ms:.1f}ms total={total_ms:.1f}ms")
+    print(f"  prefetch={len(report['prefetch'])} 件、旧形式/相関なし={report['legacy']} 件")
 
 
 # -----------------------------------------------------------------------
@@ -1652,6 +1703,45 @@ def cmd_nav(events: list[dict]) -> None:
 # -----------------------------------------------------------------------
 # startup — 起動時間のフェーズ別 breakdown
 # -----------------------------------------------------------------------
+
+def cmd_memory(events: list[dict]) -> None:
+    """Core PROCESS_MEMORY_COUNTERS_EX samples; keep stage and PID visible."""
+    samples = sorted(
+        (e for e in events if e.get("cat") == "process_memory"),
+        key=lambda e: e.get("t", 0.0),
+    )
+    if not samples:
+        print("(process_memory イベントなし — 初回起動から --perf-log で採取してください)")
+        return
+    session = next((e for e in events if e.get("cat") == "session" and e.get("kind") == "start"), {})
+    has_clock = "wall_unix_ms" in session and "wall_t" in session
+
+    def utc_time(unix_ms: float) -> str:
+        return datetime.fromtimestamp(unix_ms / 1000, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+    print("core プロセスメモリ時系列 (MiB; private = commit、pagefile = commit charge):")
+    if has_clock:
+        print(f"session pid={session.get('pid', '?')} wall={utc_time(session['wall_unix_ms'])} at t={session['wall_t']:.6f}s")
+        if "process_start_unix_ms" in session:
+            print(f"core process creation (UTC): {utc_time(session['process_start_unix_ms'])}")
+    else:
+        print("(UTC 対応情報なし — 旧ログは相対時刻のみ表示)")
+    utc_heading = f"{'UTC':<24} " if has_clock else ""
+    print(f"{utc_heading}{'t(s)':>8} {'pid':>7} {'private':>10} {'working':>10} {'peak WS':>10} {'pagefile':>10}  kind / stage")
+    for event in samples:
+        values = [
+            f"{float(event[field]) / (1024 * 1024):10.2f}" if field in event else f"{'-':>10}"
+            for field in ("private_bytes", "working_set_bytes", "peak_working_set_bytes", "pagefile_bytes")
+        ]
+        detail = f"{event.get('kind', '?')} / {event.get('stage', '?')}"
+        if event.get("kind") == "query_failed":
+            detail += f" (Win32 error={event.get('error', '?')})"
+        utc_prefix = ""
+        if has_clock:
+            unix_ms = session["wall_unix_ms"] + (event.get("t", 0.0) - session["wall_t"]) * 1000
+            utc_prefix = utc_time(unix_ms) + " "
+        print(f"{utc_prefix}{event.get('t', 0.0):8.3f} {str(event.get('pid', '-')):>7} {' '.join(values)}  {detail}")
+
 
 def cmd_startup(events: list[dict]) -> None:
     """main() 入口から first_frame までの各フェーズ経過時間を表示する。
@@ -2199,66 +2289,216 @@ def cmd_idle_health(
 
 
 # -----------------------------------------------------------------------
-# hitches — フレーム間隔の分布と nav 区間との重なり
+# hitches — update / フレーム間隔と待ち先の区間相関
 # -----------------------------------------------------------------------
 
+def _hitch_number(event: dict, field: str) -> float | None:
+    value = event.get(field)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value) if math.isfinite(value) else None
+    return None
+
+
+def _hitch_interval(event: dict) -> tuple[float, float] | None:
+    """Explicit times survive deferred emission; legacy spans end at event t."""
+    end = _hitch_number(event, "end_t")
+    if end is None:
+        end = _hitch_number(event, "t")
+    start = _hitch_number(event, "start_t")
+    if start is None:
+        ms = _hitch_number(event, "total_ms")
+        if ms is None or ms < 0 or end is None:
+            return None
+        start = end - ms / 1000.0
+    if end is None or end < start:
+        return None
+    return start, end
+
+
+def _hitch_overlaps(a: tuple[float, float], b: tuple[float, float]) -> bool:
+    return max(a[0], b[0]) < min(a[1], b[1])
+
+
+def _hitch_measurements(event: dict, fields: list[str]) -> str:
+    parts = []
+    for field in fields:
+        ms = _hitch_number(event, field + "_ms")
+        if ms is None:
+            continue
+        cycles = _hitch_number(event, field + "_cycles")
+        cycle_text = "cycles=n/a" if cycles is None else f"cycles={cycles:.0f}"
+        if cycles is not None and ms > 0:
+            cycle_text += f" ({cycles / ms:.0f}/ms)"
+        parts.append(f"{field}={ms:.1f}ms {cycle_text}")
+    return ", ".join(parts) or "(段階別フィールドなし)"
+
+
+def _print_hitch_context(events: list[dict], interval: tuple[float, float]) -> None:
+    logger_rows = []
+    thumb_rows = []
+    for event in events:
+        cat_kind = (event.get("cat"), event.get("kind"))
+        if cat_kind not in {("log", "slow_io"), ("thumb", "load_phases")}:
+            continue
+        span = _hitch_interval(event)
+        if span is not None and _hitch_overlaps(span, interval):
+            (logger_rows if cat_kind[0] == "log" else thumb_rows).append((event, span))
+    print(f"    logger 重複区間: {len(logger_rows)} 件")
+    for event, span in sorted(logger_rows, key=lambda row: row[1][0])[:10]:
+        print(
+            f"      [{span[0]:.3f}, {span[1]:.3f}]s "
+            f"logger={event.get('logger', '?')} tid={event.get('tid', '?')} "
+            f"operation={event.get('operation', '?')} acquired_t={event.get('acquired_t', '?')} "
+            f"site={event.get('call_site', '?')} "
+            f"holder(snapshot)={event.get('holder_tid')}/{event.get('holder_site')} "
+            + _hitch_measurements(event, ["wait", "hold", "write", "flush", "auxiliary", "rotation", "diagnostics"])
+        )
+    if logger_rows:
+        print("      write/flush/auxiliary は hold の内訳。holder は待ち開始時の best-effort snapshot。")
+    print(f"    thumb.load_phases 重複区間: {len(thumb_rows)} 件")
+    for event, span in sorted(thumb_rows, key=lambda row: -(row[1][1] - row[1][0]))[:10]:
+        print(
+            f"      [{span[0]:.3f}, {span[1]:.3f}]s tid={event.get('tid', '?')} "
+            f"idx={event.get('idx', '?')} key={fmt_key(event.get('key'))} "
+            + _hitch_measurements(event, [
+                "total", "decode", "display", "send_display", "cache_encode",
+                "cache_save", "cache_map", "offer_raster", "stats", "normal_log", "perf_log",
+                "prefill_db", "unaccounted",
+            ])
+        )
+        raw_async_ms = _hitch_number(event, "raw_async_decode_ms")
+        if raw_async_ms is not None:
+            print(
+                f"        区間外: raw_async_decode={raw_async_ms:.1f}ms "
+                "(先行する executor 待機/現像; 上記の区間・total・cycles に含まない)"
+            )
+    if thumb_rows:
+        print("      prefill_db は offer_raster の内訳 (重複加算しない)。区間重複だけでは待ち先は確定しない。")
+
+
 def cmd_hitches(events: list[dict], threshold_ms: float) -> None:
-    """frame.begin の間隔が threshold_ms を超えたヒッチを検出し、
-    その直前 500ms に発生した nav.* 区間を表示する。"""
-    frame_ts: list[float] = []
-    for e in events:
-        if e.get("cat") == "frame" and e.get("kind") == "begin":
-            frame_ts.append(e.get("t", 0.0))
-
-    if len(frame_ts) < 2:
+    """Correlate wall time / cycles by frame n and intervals, not JSONL order."""
+    dropped = sum(
+        _hitch_number(e, "count") or 0 for e in events
+        if e.get("cat") == "log" and e.get("kind") == "diagnostic_dropped"
+    )
+    if dropped:
+        print(f"logger 診断欠落: {dropped:.0f} 件 (queue 競合/飽和等、待ち先の証拠は不完全)")
+    frames = sorted(
+        [e for e in events if e.get("cat") == "frame" and e.get("kind") == "begin"
+         and _hitch_number(e, "t") is not None],
+        key=lambda e: e["t"],
+    )
+    gaps = [(previous["t"], current["t"]) for previous, current in zip(frames, frames[1:])
+            if (current["t"] - previous["t"]) * 1000.0 >= threshold_ms]
+    print(f"フレーム数: {len(frames)}  間隔 >= {threshold_ms}ms のヒッチ: {len(gaps)} 件")
+    if len(frames) < 2:
         print("(frame.begin が 2 件未満)")
-        return
+    if gaps:
+        gap_ms = sorted((end - start) * 1000.0 for start, end in gaps)
+        n = len(gap_ms)
+        print(
+            f"ヒッチ間隔: min={min(gap_ms):.1f} p50={gap_ms[n // 2]:.1f} "
+            f"p95={gap_ms[min(n - 1, int(n * 0.95))]:.1f} max={max(gap_ms):.1f} ms"
+        )
+    nav_ends = [e for e in events if e.get("cat") == "nav" and e.get("kind", "").endswith("_end")]
+    print("\n最も大きいヒッチ 10 件:")
+    for start, end in sorted(gaps, key=lambda row: -(row[1] - row[0]))[:10]:
+        nearby = [e for e in nav_ends if start - 0.5 <= e.get("t", 0.0) <= end]
+        nearby.sort(key=lambda e: -float(e.get("ms", 0.0)))
+        tags = [f"{e.get('kind')}={float(e.get('ms', 0.0)):.1f}ms" for e in nearby[:3]]
+        tags_str = ", ".join(tags) if tags else "(nav イベントなし)"
+        print(f"  [{start:.3f}, {end:.3f}]s gap={(end - start) * 1000.0:.1f}ms 直前 nav: {tags_str}")
+        _print_hitch_context(events, (start, end))
 
-    gaps: list[tuple[float, float]] = []  # (t_end, gap_ms)
-    for i in range(1, len(frame_ts)):
-        gap = (frame_ts[i] - frame_ts[i - 1]) * 1000.0
-        if gap >= threshold_ms:
-            gaps.append((frame_ts[i], gap))
-
-    print(f"フレーム数: {len(frame_ts)}  間隔 >= {threshold_ms}ms のヒッチ: {len(gaps)} 件")
-    if not gaps:
-        return
-
-    gaps_sorted = sorted(g for _, g in gaps)
-    n = len(gaps_sorted)
-    p50 = gaps_sorted[n // 2]
-    p95 = gaps_sorted[min(n - 1, int(n * 0.95))]
-    print(
-        f"ヒッチ間隔: min={min(gaps_sorted):.1f} p50={p50:.1f} "
-        f"p95={p95:.1f} max={max(gaps_sorted):.1f} ms"
+    inner_updates = [e for e in events if e.get("cat") == "ui" and e.get("kind") == "update_breakdown"]
+    outer_updates = []
+    # The current begin reports the previous outer App::update, including work
+    # outside update_frame and end-of-frame perf writes. Keep the previous n;
+    # an inner breakdown measures only a portion of that same update.
+    for previous, current in zip(frames, frames[1:]):
+        ms = _hitch_number(current, "prev_update_ms")
+        if ms is not None:
+            start = _hitch_number(current, "prev_update_start_t")
+            end = _hitch_number(current, "prev_update_end_t")
+            approximate = start is None or end is None or end < start
+            if approximate:
+                # Legacy/missing endpoints: begin.t is recorded after update
+                # starts, so this fallback and its overlap evidence are approximate.
+                start, end = previous["t"], previous["t"] + ms / 1000.0
+            outer_updates.append({
+                "n": previous.get("n"), "start_t": start,
+                "end_t": end, "total_ms": ms,
+                "total_cycles": current.get("prev_update_cycles"),
+                "outside_ms": current.get("prev_outside_ms"),
+                "interval_approximate": approximate,
+            })
+    outer_by_number = {e["n"]: e for e in outer_updates if e.get("n") is not None}
+    inner_numbers = {e["n"] for e in inner_updates if e.get("n") is not None}
+    updates = [
+        {"inner": e, "outer": outer_by_number.get(e.get("n"))}
+        for e in inner_updates
+    ]
+    updates.extend(
+        {"inner": None, "outer": e}
+        for e in outer_updates if e.get("n") is None or e["n"] not in inner_numbers
     )
 
-    # nav 区間 (end イベント) を直前 500ms 以内に含むものを列挙
-    nav_ends = [
-        e for e in events
-        if e.get("cat") == "nav" and e.get("kind", "").endswith("_end")
-    ]
-
-    print("\n最も大きいヒッチ 10 件:")
-    for t_end, gap in sorted(gaps, key=lambda x: -x[1])[:10]:
-        t_start = t_end - gap / 1000.0
-        # 直前 500ms ウィンドウ
-        window_start = t_start - 0.5
-        nearby = [
-            e for e in nav_ends
-            if window_start <= e.get("t", 0.0) <= t_end
-        ]
-        # ms 上位 3 件だけ出す
-        nearby.sort(key=lambda e: -float(e.get("ms", 0.0)))
-        tags = [
-            f"{e.get('kind')}={float(e.get('ms', 0.0)):.1f}ms"
-            for e in nearby[:3]
-        ]
-        tags_str = ", ".join(tags) if tags else "(nav イベントなし)"
-        print(
-            f"  t={t_end:>8.3f}s  gap={gap:>6.1f}ms  "
-            f"直前 nav: {tags_str}"
+    def update_ms(row: dict) -> float:
+        return max(
+            (_hitch_number(e, "total_ms") or 0)
+            for e in (row["outer"], row["inner"]) if e is not None
         )
+
+    slow_updates = [row for row in updates if update_ms(row) >= threshold_ms]
+    print(f"\nupdate >= {threshold_ms}ms: {len(slow_updates)} 件 (上位 10 件)")
+    if not updates:
+        print("  (update 計測なし: フレーム間隔は idle/present 等も含む)")
+    subevents = [e for e in events if e.get("cat") == "ui"
+                 and e.get("kind") == "other_worker_polls_breakdown"]
+    for row in sorted(slow_updates, key=lambda row: -update_ms(row))[:10]:
+        outer, inner = row["outer"], row["inner"]
+        event = outer if outer is not None else inner
+        span = _hitch_interval(event)
+        span_text = f"[{span[0]:.3f}, {span[1]:.3f}]s" if span else "[区間不明]"
+        scope = "outer App::update" if outer is not None else "inner update_frame のみ (部分計測; outer 未計測)"
+        if outer is not None and outer["interval_approximate"]:
+            scope += "; 区間と logger/thumb 重複判定は概算 (frame.begin 起点)"
+        print(f"  n={event.get('n', '?')} {span_text} " + _hitch_measurements(event, ["total"]) + f" ({scope})")
+        if outer is not None and _hitch_number(outer, "outside_ms") is not None:
+            print("    フレーム間の update 外: " + _hitch_measurements(outer, ["outside"]))
+        if outer is not None and inner is not None:
+            inner_span = _hitch_interval(inner)
+            inner_text = f"[{inner_span[0]:.3f}, {inner_span[1]:.3f}]s" if inner_span else "[区間不明]"
+            print("    inner update_frame " + inner_text + " " + _hitch_measurements(inner, ["total"]))
+        stage_event = inner if inner is not None else {}
+        stages = [field[:-3] for field in stage_event if field.endswith("_ms") and field != "total_ms"]
+        stages.sort(key=lambda field: -(_hitch_number(stage_event, field + "_ms") or 0))
+        print("    update 段 (上位 3): " + _hitch_measurements(stage_event, stages[:3]))
+        matching = [e for e in subevents if event.get("n") is not None and e.get("n") == event["n"]]
+        if not matching:
+            print("    (other_worker_polls 内訳なし: 旧ログまたは未計測)")
+        for detail in matching:
+            detail_span = _hitch_interval(detail)
+            detail_text = f"[{detail_span[0]:.3f}, {detail_span[1]:.3f}]s " if detail_span else ""
+            print("    other_worker_polls " + detail_text + _hitch_measurements(detail, [
+                "total", "details_meta", "global_search_events", "search_debounce",
+                "prepared_adoption", "tag_prewarm", "video_pin_fetch", "other",
+            ]))
+            print("      UI 段は排他的計測 (tag_prewarm/video_pin_fetch も独立、重複なし)。")
+        if span:
+            _print_hitch_context(events, span)
+
+    timestamps = sorted({e["t"] for e in events if _hitch_number(e, "t") is not None})
+    log_gaps = [(start, end) for start, end in zip(timestamps, timestamps[1:])
+                if (end - start) * 1000.0 >= threshold_ms]
+    print(f"\n全カテゴリイベント時刻の空白 >= {threshold_ms}ms: {len(log_gaps)} 件 (上位 10 件)")
+    for start, end in sorted(log_gaps, key=lambda row: -(row[1] - row[0]))[:10]:
+        print(f"  [{start:.3f}, {end:.3f}]s gap={(end - start) * 1000.0:.1f}ms")
+    print(
+        "注: 空白/同時停止だけでは OS paging・プロセス停止・logger 待ちを断定できない。"
+        "未計装/idle/遅延記録もあり、待機スタック・ディスク I/O・hard fault は OS trace で確認する。"
+    )
 
 
 # -----------------------------------------------------------------------
@@ -2948,6 +3188,351 @@ def cmd_display_integrity(events: list[dict], check: bool) -> int:
     return 0
 
 
+# -----------------------------------------------------------------------
+# collection — bounded read lease correlation and legacy stage summaries
+# -----------------------------------------------------------------------
+
+COLLECTION_LEASE_PROGRESS_OUTCOMES = {
+    "begin",
+    "phase",
+    "wait",
+    "pause",
+    "resume",
+    "deadline_elapsed",
+}
+
+COLLECTION_LEASE_TERMINAL_OUTCOMES = {
+    "adopted",
+    "cancelled",
+    "closed",
+    "disconnected",
+    "error",
+    "failed",
+    "not_found",
+    "prepare_error",
+    "ready",
+    "rejected",
+    "replaced",
+    "retired",
+    "shutdown",
+    "timeout",
+    "unavailable",
+    "worker_spawn_error",
+}
+
+
+def _collection_duration_stats(values: list[float]) -> dict:
+    return {
+        "n": len(values),
+        "p50_ms": percentile(values, 0.50),
+        "p95_ms": percentile(values, 0.95),
+        "max_ms": max(values) if values else None,
+    }
+
+
+def _positive_request_id(event: dict) -> int | None:
+    value = event.get("request_id")
+    if isinstance(value, bool):
+        return None
+    try:
+        request_id = int(value)
+    except (TypeError, ValueError):
+        return None
+    return request_id if request_id > 0 else None
+
+
+def analyze_collection(events: list[dict]) -> dict:
+    """Analyze collection events without guessing joins from UUIDs or timestamps.
+
+    A request identity is valid only inside one explicit `session.start` segment. The
+    read-lease begin may precede viewer binding, so an absent context/surface may become
+    assigned later; once assigned, contradictory values exclude the request. Missing,
+    partial, future, and unterminated records remain diagnostic counts and are never
+    classified as success or as a hang.
+    """
+    session_index: int | None = None
+    session_count = 0
+    annotated: list[tuple[tuple[str, int], bool, int, dict]] = []
+    for order, event in enumerate(events):
+        if event.get("cat") == "session" and event.get("kind") == "start":
+            session_index = session_count
+            session_count += 1
+            continue
+        if session_index is None:
+            session_key = ("partial", 0)
+            marked = False
+        else:
+            session_key = ("session", session_index)
+            marked = True
+        annotated.append((session_key, marked, order, event))
+
+    groups: dict[tuple[tuple[str, int], int], list[tuple[int, dict]]] = defaultdict(list)
+    malformed_lease_events = 0
+    for session_key, _marked, order, event in annotated:
+        if event.get("cat") != "collection" or event.get("kind") != "read_lease":
+            continue
+        request_id = _positive_request_id(event)
+        if request_id is None:
+            malformed_lease_events += 1
+            continue
+        groups[(session_key, request_id)].append((order, event))
+
+    completed_requests: list[dict] = []
+    correlated_keys: dict[
+        tuple[tuple[str, int], int], tuple[str, object | None, object | None]
+    ] = {}
+    terminal_outcomes: Counter[str] = Counter()
+    phase_outcomes: Counter[tuple[str, str, str]] = Counter()
+    incomplete_requests = 0
+    partial_session_requests = 0
+    unknown_terminal_requests = 0
+    conflicting_scope_requests = 0
+    unmatched_requests = 0
+
+    for key, rows in groups.items():
+        session_key, request_id = key
+        rows.sort(key=lambda row: row[0])
+        owner: str | None = None
+        context: object | None = None
+        surface: object | None = None
+        scope_conflict = False
+        begins: list[tuple[int, dict]] = []
+        terminals: list[tuple[int, dict]] = []
+        unknown: list[tuple[int, dict]] = []
+
+        for order, event in rows:
+            outcome = str(event.get("outcome", ""))
+            if outcome == "begin":
+                begins.append((order, event))
+            elif outcome in COLLECTION_LEASE_TERMINAL_OUTCOMES:
+                terminals.append((order, event))
+            elif outcome not in COLLECTION_LEASE_PROGRESS_OUTCOMES:
+                unknown.append((order, event))
+
+            if "owner" in event:
+                candidate_owner = str(event.get("owner", ""))
+                if not candidate_owner:
+                    scope_conflict = True
+                elif owner is None:
+                    owner = candidate_owner
+                elif owner != candidate_owner:
+                    scope_conflict = True
+            elif owner is not None:
+                # Production lease events always carry owner. Once observed, its
+                # disappearance is a malformed identity record, not a new request.
+                scope_conflict = True
+
+            has_context = "context" in event
+            has_surface = "surface_generation" in event
+            if has_context != has_surface:
+                scope_conflict = True
+                continue
+            if has_context:
+                candidate_context = event.get("context")
+                candidate_surface = event.get("surface_generation")
+                if context is None and surface is None:
+                    context = candidate_context
+                    surface = candidate_surface
+                elif context != candidate_context or surface != candidate_surface:
+                    scope_conflict = True
+
+        if owner is None:
+            scope_conflict = True
+            owner = "?"
+        for _order, event in rows:
+            phase_outcomes[
+                (owner, str(event.get("phase", "?")), str(event.get("outcome", "?")))
+            ] += 1
+
+        marked = session_key[0] == "session"
+        if not marked:
+            partial_session_requests += 1
+            continue
+        if scope_conflict:
+            conflicting_scope_requests += 1
+            continue
+        if unknown:
+            unknown_terminal_requests += 1
+            continue
+        if len(begins) != 1:
+            unmatched_requests += 1
+            continue
+        if not terminals:
+            incomplete_requests += 1
+            correlated_keys[key] = (owner, context, surface)
+            continue
+        if len(terminals) != 1 or terminals[0][0] < begins[0][0]:
+            unmatched_requests += 1
+            continue
+        terminal_order, terminal = terminals[0]
+        if any(order > terminal_order for order, _event in rows):
+            unmatched_requests += 1
+            continue
+
+        outcome = str(terminal.get("outcome"))
+        active_ms = terminal.get("active_ms")
+        wall_ms = terminal.get("wall_ms")
+        active_value = float(active_ms) if isinstance(active_ms, (int, float)) else None
+        wall_value = float(wall_ms) if isinstance(wall_ms, (int, float)) else None
+        request = {
+            "session": session_key[1],
+            "request_id": request_id,
+            "owner": owner,
+            "context": context,
+            "surface_generation": surface,
+            "outcome": outcome,
+            "active_ms": active_value,
+            "wall_ms": wall_value,
+        }
+        completed_requests.append(request)
+        terminal_outcomes[outcome] += 1
+        correlated_keys[key] = (owner, context, surface)
+
+    active_values = [
+        request["active_ms"]
+        for request in completed_requests
+        if request["active_ms"] is not None
+    ]
+    wall_values = [
+        request["wall_ms"]
+        for request in completed_requests
+        if request["wall_ms"] is not None
+    ]
+    by_owner: dict[str, dict] = {}
+    for owner in sorted({request["owner"] for request in completed_requests}):
+        owner_rows = [request for request in completed_requests if request["owner"] == owner]
+        by_owner[owner] = {
+            "count": len(owner_rows),
+            "outcomes": dict(Counter(request["outcome"] for request in owner_rows)),
+            "active": _collection_duration_stats(
+                [request["active_ms"] for request in owner_rows if request["active_ms"] is not None]
+            ),
+            "wall": _collection_duration_stats(
+                [request["wall_ms"] for request in owner_rows if request["wall_ms"] is not None]
+            ),
+        }
+
+    legacy_stages: dict[str, dict] = {}
+    legacy_matched = 0
+    legacy_unmatched = 0
+    legacy_scope_conflicts = 0
+    for session_key, marked, _order, event in annotated:
+        if event.get("cat") != "collection" or event.get("kind") == "read_lease":
+            continue
+        kind = str(event.get("kind", "?"))
+        detail = event.get("stage", event.get("operation"))
+        label = f"{kind}/{detail}" if detail not in (None, "", kind) else kind
+        stage = legacy_stages.setdefault(label, {"count": 0, "outcomes": Counter(), "ms": []})
+        stage["count"] += 1
+        if "outcome" in event:
+            stage["outcomes"][str(event.get("outcome"))] += 1
+        if isinstance(event.get("ms"), (int, float)):
+            stage["ms"].append(float(event["ms"]))
+
+        request_id = _positive_request_id(event)
+        key = (session_key, request_id) if request_id is not None else None
+        if not marked or key not in correlated_keys:
+            legacy_unmatched += 1
+            continue
+        owner, context, surface = correlated_keys[key]
+        if (
+            ("owner" in event and str(event.get("owner")) != owner)
+            or (context is not None and "context" in event and event.get("context") != context)
+            or (
+                surface is not None
+                and "surface_generation" in event
+                and event.get("surface_generation") != surface
+            )
+        ):
+            legacy_scope_conflicts += 1
+            legacy_unmatched += 1
+            continue
+        legacy_matched += 1
+
+    rendered_legacy: dict[str, dict] = {}
+    for label, stage in sorted(legacy_stages.items()):
+        rendered_legacy[label] = {
+            "count": stage["count"],
+            "outcomes": dict(stage["outcomes"]),
+            "duration": _collection_duration_stats(stage["ms"]),
+        }
+
+    return {
+        "sessions": session_count,
+        "lease": {
+            "completed": len(completed_requests),
+            "completed_requests": completed_requests,
+            "terminal_outcomes": dict(terminal_outcomes),
+            "active": _collection_duration_stats(active_values),
+            "wall": _collection_duration_stats(wall_values),
+            "by_owner": by_owner,
+            "phase_outcomes": {
+                f"{owner}/{phase}/{outcome}": count
+                for (owner, phase, outcome), count in sorted(phase_outcomes.items())
+            },
+            "incomplete": incomplete_requests,
+            "partial_session": partial_session_requests,
+            "unknown_terminal": unknown_terminal_requests,
+            "scope_conflict": conflicting_scope_requests,
+            "unmatched": unmatched_requests,
+            "malformed_events": malformed_lease_events,
+        },
+        "legacy": {
+            "stages": rendered_legacy,
+            "matched_by_request_id": legacy_matched,
+            "unmatched": legacy_unmatched,
+            "scope_conflict": legacy_scope_conflicts,
+        },
+    }
+
+
+def _format_collection_stats(stats: dict) -> str:
+    if not stats["n"]:
+        return "n=0"
+    return (
+        f"n={stats['n']} p50={stats['p50_ms']:.2f}ms "
+        f"p95={stats['p95_ms']:.2f}ms max={stats['max_ms']:.2f}ms"
+    )
+
+
+def cmd_collection(events: list[dict]) -> None:
+    report = analyze_collection(events)
+    lease = report["lease"]
+    legacy = report["legacy"]
+    print(f"collection sessions: {report['sessions']}")
+    print(
+        "read lease: "
+        f"completed={lease['completed']} incomplete={lease['incomplete']} "
+        f"partial={lease['partial_session']} unknown_terminal={lease['unknown_terminal']} "
+        f"scope_conflict={lease['scope_conflict']} unmatched={lease['unmatched']} "
+        f"malformed_events={lease['malformed_events']}"
+    )
+    print(f"  terminal outcomes: {lease['terminal_outcomes']}")
+    print(f"  active: {_format_collection_stats(lease['active'])}")
+    print(f"  wall  : {_format_collection_stats(lease['wall'])}")
+    for owner, owner_report in lease["by_owner"].items():
+        print(
+            f"  owner={owner} count={owner_report['count']} "
+            f"outcomes={owner_report['outcomes']} "
+            f"active[{_format_collection_stats(owner_report['active'])}] "
+            f"wall[{_format_collection_stats(owner_report['wall'])}]"
+        )
+    print(
+        "legacy collection events (explicit request_id only): "
+        f"matched={legacy['matched_by_request_id']} unmatched={legacy['unmatched']} "
+        f"scope_conflict={legacy['scope_conflict']}"
+    )
+    for label, stage in legacy["stages"].items():
+        print(
+            f"  {label}: count={stage['count']} outcomes={stage['outcomes']} "
+            f"ms[{_format_collection_stats(stage['duration'])}]"
+        )
+    print(
+        "note: incomplete/partial/unknown records are diagnostic only; this command does not "
+        "infer success or a hang from missing events, UUIDs, or nearby timestamps."
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="mimageviewer perf_events.jsonl analyzer"
@@ -2975,6 +3560,8 @@ def main() -> None:
     subs.add_parser("colorize")
     subs.add_parser("nav")
     subs.add_parser("startup")
+    subs.add_parser("memory")
+    subs.add_parser("collection")
     p_pre_grid = subs.add_parser("pre-grid")
     p_pre_grid.add_argument(
         "--min-ms",
@@ -3069,6 +3656,10 @@ def main() -> None:
         cmd_nav(events)
     elif args.cmd == "startup":
         cmd_startup(events)
+    elif args.cmd == "memory":
+        cmd_memory(events)
+    elif args.cmd == "collection":
+        cmd_collection(events)
     elif args.cmd == "pre-grid":
         cmd_pre_grid(events, args.min_ms)
     elif args.cmd == "hitches":

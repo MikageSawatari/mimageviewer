@@ -1,4 +1,4 @@
-﻿# リモート閲覧 (Web) 機能 計画書
+# リモート閲覧 (Web) 機能 計画書
 
 v3.0.0 の目玉として、外出先のスマートフォン / タブレット / PC のブラウザから
 自宅 PC の mIV ライブラリを閲覧できるようにする。本書がこの機能の正本。
@@ -35,7 +35,7 @@ v3.0.0 の目玉として、外出先のスマートフォン / タブレット 
 | 読み取り (画像・動画バイト) | remote-web が **直接** read-only で読む | HTTP の range / 画像配信を本体 UI から分離する |
 | 通常フォルダ一覧 | **IPC → 本体** | 表示対象・順序・sidecar 吸収・重複除去を本体の production materializer 1 箇所に固定する (§12.15) |
 | サムネイル参照・生成 | **IPC → 本体** | catalog の実態が当初想定と異なったため。本体の既存生成経路とキャッシュ方針を一元利用する (§9) |
-| 書き込み (読書履歴・ブックマーク・見開き・トリム・タグ・レーティング) | **必ず IPC → 本体** | 全永続ストアの writer を本体 1 つに固定する |
+| 書き込み (読書履歴・動画/音声の再生位置・ブックマーク・見開き・トリム・タグ・レーティング) | **必ず IPC → 本体** | 全永続ストアの writer を本体 1 つに固定する |
 | 重い生成 (PDF レンダ・AI アップスケール・カラー化・補正合成) | **IPC → 本体** | PDFium プール・ONNX セッション・GPU をステートフルに保持しているのは本体 |
 
 SQLite は DB ごとに journal 設定が異なる。特に `spread.db` は WAL / `busy_timeout` を設定せず、
@@ -50,7 +50,10 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
 
 本体に単一の remote session owner を置く。ブラウザは認証後に
 `POST /api/session/acquire` で確認なしに操作権を取得し、本体は「リモート接続中」ダイアログを
-出して main / fullscreen / detached / native presenter の通常入力をロックする。操作者は常に
+出す。取得 barrier は全ローカル viewer context、fullscreen、detached / メディア窓、player の
+閉鎖と AI の静止を確認してから RemoteActive に進む。閉鎖失敗または 30 秒の watchdog 超過時は
+取得を失敗として Local に戻す。AcquiringRemote 中は閉鎖の途中であり得るが、RemoteActive / DrainingRemote
+にはローカルの閲覧窓と player は残らない。操作者は常に
 1 人であり、2 台目やローカルとの競合は**後から操作した側が勝つ**。表示フォルダ等の状態同期はしない。
 
 - ダイアログには `tailscale status --json` の `Peer.TailscaleIPs` と接続元 IP の照合結果から
@@ -68,9 +71,21 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
   fail-closed guard で 401 とし、owner 解決へ進めない。
   認証後の全画面では左上の小さな badge に「操作中」または
   「別の端末が操作中 (操作すると取得します)」を常時表示し、確認や入力 blocking は行わない
-- session owner が変わった時、本体は既存の media pause、slideshow stop、owner-scoped native
-  pending cancel を通して動画・音声・音楽ビュー・スライドショー・GIF/APNG・連続送りを停止する。
-  player、停止位置、main/fullscreen/detached の window 構成は保持し、操作権返却時も自動再開しない
+- session owner が変わった時、本体は全 context の再生位置と確定済み音声トラック選択を収穫し、
+  取得前の delayed open / fullscreen restore を失効させる。起動・二重起動のパス解決結果、
+  閲覧用アーカイブ変換、本棚ショートカットの準備、サブ展開・ファイル名スタックの表示準備も
+  それぞれの終了処理で破棄する。変換結果を書くだけの sibling ZIP は閲覧を開かないため継続する。
+  明示された起動パス自体は保持し、取得失敗または返却で Local に戻った時に通常の起動先として開く。
+  通常の一覧の現在フォルダが無く、保留中の起動パスも無い場合は既定の起動先を開く。
+  二重起動のパスはパイプ受信時の所有状態と取得世代で判定し、Remote 所有中に届いたものと
+  取得前から保留されていたものはログと通知を出して拒否する。返却後に届いたものは Local で開く。
+  既存の全窓 terminal close 経路で
+  main / detached / ParkedLive / メディア窓を閉じる。Remote が見た再生位置は IPC write で
+  PC の settings と読書履歴に戻す。hidden / viewer 破棄の最終報告は keepalive で即時発信し、
+  viewer は配信開始時の所有 session ID を attach 成功後に報告へ固定し、再接続中の旧位置を新 owner として
+  送らない。通常報告の列は session ごとに独立し、core は session・path 単位の連番で逆順到着を捨てる。
+  端末の再生中は 5 秒ごとに報告するため、突然の所有終了では
+  最終報告以後の最大 5 秒分が残らないことがある
 - ブラウザは 30 秒ごとに `POST /api/session/ping` を送り、直近の利用者入力と video/audio 再生中を
   通知する。通常の IPC 要求と remote-web が直接処理する一覧/画像 API も活動として数える
 - 生存タイムアウトは ping/API が 60 秒無い場合、放置タイムアウトは「利用者操作なし、かつ
@@ -78,9 +93,8 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
 - active 中は watchdog thread が `ES_CONTINUOUS | ES_SYSTEM_REQUIRED` を保持し、解放時に
   `ES_CONTINUOUS` へ戻す
 - ローカルへ操作権が戻った瞬間、読書履歴・レーティング・ブックマーク・スマートフォルダ・
-  通常フォルダの既存「再読み込み」入口を 1 回呼ぶ。fullscreen 中は item identity を保持し、
-  一覧再構築後に同じ item を既存 `open_fullscreen` 経路で開き直す。再 open する media / animated
-  image には paused 状態を引き継ぎ、利用者が再生操作を行うまで動かさない
+  通常フォルダの既存「再読み込み」入口を 1 回呼ぶ。閉じた閲覧窓は復元せず一覧を表示する。
+  次に PC で開くと Remote が書いた位置と音声トラックで始まる
 - **その鏡像**として、リモートが操作権を取得した瞬間、端末は cache を破棄し、home 画面の
   データ (お気に入り / 場所 / スマートフォルダ定義) を取り直す。**この排他があるからこそ、
   セッション取得が「本体側で何か変わったかもしれない」の完全な信号になる** — 本体は
@@ -742,7 +756,7 @@ worker、request id 付き応答までを往復させ、両端の pipe 作成 fl
 
 ホームは「お気に入り」「スマートフォルダ」「場所」の 3 タブとする。「場所」を初期表示にし、
 場所タブは本体のフォルダバー「場所▼」と同じ列挙結果を使う。順序はドライブ一覧、閲覧履歴、
-ブックマーク、レーティング ★1〜5、本棚フォルダ、区切り、デスクトップ／ピクチャ／ダウンロード、
+ブックマーク、レーティング ★1〜5、本棚フォルダ、整理先、区切り、デスクトップ／ピクチャ／ダウンロード、
 区切り、各ドライブとする。各項目は本体と同じ `show_location_*` 設定に従い、ブックマークだけは
 本体側にも専用の非表示設定がないため常に表示する。既知フォルダは取得できた実在フォルダだけを
 載せ、`folder_tree::path_eq` で重複を除く。
@@ -751,6 +765,21 @@ worker、request id 付き応答までを往復させ、両端の pipe 作成 fl
 payload を順に描画するだけで、既知フォルダやドライブを独自に列挙しない。ドライブ一覧は本体 IPC
 が `available_drives()` を `RemoteEntry::Folder` へ写像する collection として返し、既知フォルダと
 各ドライブは Home payload の絶対 path を持つ folder entry から既存フォルダ route を開く。
+
+2026-10-05 の §1.263 追補: `LocationMenuEntry::FileOrganizeDestinations` が設定の登録順・
+名称・パスを一つのグループとして所有する。登録なし、または既定 ON の
+`show_location_file_organize_destinations` が OFF なら両 UI とも非表示。表示切替はフォルダバーの
+場所表示項目と、環境設定のファイル整理先登録欄に置き、同じ設定を使う。
+IPC の `PlaceSummary::FileOrganizeDestinations { name, entries }` を Home に追加し、
+`PROTOCOL_VERSION` は 65 → 66。core と remote-web は同じ `mimageviewer-ipc` の定数を
+使い、`build-dev.ps1` で両方を一緒にビルドする。片側だけ古い版なら既存 handshake が拒否する。
+Remote は「整理先」見出しの下に通常の folder card を登録順で描画し、絶対パスを tooltip に
+持たせ、既存 `folderHash` / `navigate` 経路から開く。登録先の存在確認や独自除去を Home 生成へ
+追加せず、不在先は元の絶対パスを維持する。開く時の実在・種別・Remote path guard は他の
+folder entry と同じであり、UNC 等の既存拒否条件も変えない。設定変更は既存 Home 更新で反映する。
+2026-10-06 の P2 修正で整理先の Home entry は登録名・パスの直接写像へ変更した。
+canonicalize／存在確認を行わず、応答の遅い登録先が Home worker と IPC deadline を塞がない。
+wire shape は同じなので protocol 66 を維持する。その他の場所項目の既存解決処理は変更しない。
 
 スマートフォルダの定義一覧と、ドライブ一覧・読書履歴・レーティング・本棚・ブックマーク・
 スマートフォルダの評価結果は本体 IPC から取得する。remote-web は DB の集約条件や並び順を
@@ -1016,6 +1045,12 @@ change は 180 ms debounce 後にこの判定を再実行する。
 
 `spread.db::get_direction` も本体側で同じ key / fallback から読み、`reading_direction` として応答する。
 LTR / RTL の見開きモードは本体と同じく方向をそのモードへ揃え、Single は保存済み方向を維持する。
+変換済み EPUB は PDF の本と同じ Remote 経路で開き、本とページの address は元 `.epub` とその
+`PdfPage` subresource を使う。Remote は変換を始めず、未変換時は PC の mImageViewer で一度開くよう
+案内する。一覧は本体の同名 PDF 優先設定を適用し、Web は EPUB バッジと表紙未取得時のプレースホルダーを表示する。
+本体の世代スタンプでページ数・表紙・見開き用寸法を照合する。EPUB の綴じ方向は保存済み本別値が無く、
+「文書の綴じ方向に従う」が有効なときに固定世代の方向を採用する。通常 PDF の `/Direction` は
+Remote では従来どおり既定方向への反映対象外である。
 Web で RTL から Single へ切り替えた場合も、そのセッションの RTL を request に引き継ぐ。
 RTL の横方向入力は画面上の方向を反転し、左 swipe / 左 tap zone / `ArrowLeft` を次グループ、
 右 swipe / 右 tap zone / `ArrowRight` を前グループとする。上下矢印と PageUp / PageDown は
@@ -1359,9 +1394,16 @@ topbar の親フォルダ / ホームだけに `navigation-icon` を付け、40�
 
 GET /api/list の remote-web ローカル走査を廃止し、FolderListRequest /
 FolderListPayload を本体 IPC へ追加する。正本は
-app::folder_scan::materialize_local_folder_listing である。App::load_folder が直接使い、
+app::folder_scan::materialize_local_folder_listing_with_order である。App::load_folder が直接使い、
 remote container / folder list は ContainerEngine::recompute_folder_listing という scan wrapper
 から同じ関数を使う。remote-web は一覧の分類・sort・sidecar / 重複規則を持たない。
+
+評価順では ContainerEngine の worker が `RemoteListingSettings` に載る並び順と未評価位置を
+一緒に読み、rating.db の対象 key 全件を完全に読んでから一覧を確定する。評価の書き込みは
+表示中の一覧の行を移動しない。物理フォルダの一覧 payload は評価 badge を運ばない。明示 reload、navigation、sort 変更は
+新しい一覧を取得する。sort 候補とラベルは既存の `RemoteGridSortState` の動的配列で運ぶ。
+評価の完全読み取りに失敗した物理フォルダは名前順で表示し、一覧の通知欄へ理由を示す。
+この通知用に `FolderListPayload.sort_notice` を追加したため protocol v61 とする。
 
 FolderListEntry は address、thumbnail_address、name、RemoteEntryKind、size、
 mtime を運ぶ。動画と同名画像が video_thumb_use_sidecar_image により吸収された場合、動画の
@@ -1871,7 +1913,10 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 
 `crates/remote-ipc` の protocol version を上げた増分では、**本体と remote-web の両方を
 再ビルドして再起動する**必要がある。片方だけだとハンドシェイクで弾かれる。
-collection の session spread request と address-based `page_groups` を追加した現行版は **v49**。
+現行版は **v67**。v67 は §1.347 の音声サムネイル生成と共通一覧 presentation の audio indicator を追加する。同名 sidecar は動画・音声の共通 discovery を使い、永続コレクションの snapshot / navigation replacement にも出所を含む。Web の無画像・失敗終端は一覧 owner が保持し、明示再取得で artEpoch とともに破棄する。v66 は場所一覧の本体 materializer の統一 (§12.15) を含む。v65 は表示位置の RAW 先読み窓の宣言と ack を追加した (§14.24)。v64 は RAW ブランチの v62 と master の v63 を統合し、RAW ページの `RawPrefetchSkipped` / `RawCapacity`、サムネイルの `NoThumbnail` と、EPUB・音声トラック選択・再生位置書き戻しをすべて含む。本体と service を同時に更新する。v63 は audio-tracks ブランチの追加を統合し、Remote 動画の音声トラック列挙・選択状態、start の選択指定、世代照合付き切り替え control と、端末で見た再生位置の PC への書き戻し (`RecordVideoProgress`、所有世代と連番の照合) を含む。audio-tracks ブランチでは音声トラック追加時に v62、再生位置追加時に v63 としていた。master の v62 は EPUB 対応で、wire の形と enum 値は変えず、既存の `RemoteEntryKind::Pdf` / `ContainerKind::Pdf` が元 `.epub` の論理パスも表すようになった。旧 remote-web は EPUB を PDF 本として再検証できないため版を上げた。統合後の v63 では EPUB と音声トラック・再生位置の追加をすべて含み、本体と service を同時に更新する。v61 は物理フォルダの評価順読み取り失敗を一覧へ通知する任意の `sort_notice` を追加した。v60 は表紙直後・最終ページの強制単独表示、白い表示側、二つの本別値と Remote write を追加した。v59 は見開き先頭・末尾の単ページ配置を別々の保存値と Remote write に分けた。v58 は永続コレクションの着地位置を実媒体別の
+`{ kind, ordinal, count }` にし、v57 はコレクションの shuffle order、v56 は永続コレクションの
+catalog / snapshot / navigation を追加した。collection の session spread request と
+address-based `page_groups` を追加した版は v49。
 v48 はブラウザの明示 logout で current owner を release する `SessionRelease` を追加した。
 v47 は root 以外の Serve path を型付きで通知する。v46 は
 `RemoteWebConnectionInfo.tailscale_https_certificate` と
@@ -2700,6 +2745,73 @@ Rust 1.94.1 の標準ライブラリ実装も確認した。`stdout().lock()` �
 集約コレクションが使う旧 `/api/image` / `/api/image-info` の URL にも generation を含める。
 session 再取得時の session cache epoch による HTTP cache 分離も従来どおり併用する。
 
+### 14.23 RAW ページとサムネイル (protocol v62, 2026-09-29)
+
+Remote の RAW ページは表示要求時に本体の LibRaw フル現像を待つ。RAW 現像を要する先読みは
+protocol v62 の `RawPrefetchSkipped` を HTTP 204、`X-mIV-Page-Skip: raw-prefetch`、session / generation
+ヘッダ、`no-store` で返す。Web は session / generation を先に検証し、同じ計画中の先読みを抑止する。
+表示需要が付けば即座に前景要求を始める。現像枠不足の `RawCapacity` は 503 `raw_busy` と
+`Retry-After` で返し、`ipc_busy` / `admission_busy` と共に表示需要が続く間だけ回数上限なしで
+再試行する。それ以外の 503 は従来の 3 回上限を守る。表示需要が消えた前景 job は直ちに
+cancel / release し、計画に残る場合は新しい有界の先読み job に戻す。混雑は job ごとに
+`page_congestion` 1 件へ集約して記録する。
+
+ZIP の代表は中央ディレクトリの情報 (候補順、画像拡張子、非暗号化、対応する圧縮方式) だけで
+特定する。書庫 root の `File` は既存 loader と同じ中央ディレクトリの index 順、
+`ZipDirectory` 等は従来の sort 順を保つ。外側の候補が先なら後続の入れ子 ZIP は展開しない。
+代表が入れ子 ZIP にあり得る
+ときは既存の上限付き cache へ取消可能な器の展開を行い、JPEG 等なら先読みを続け、RAW で
+現像済み cache が無ければ `RawPrefetchSkipped` とする。変換済み書庫の ZIP backing も同じ。
+RAW entry の payload は先読みの skip 判定前も AI の現像枠確保前も読まない。前景 flight 内、
+または AI 枠確保後の payload 読み込みが破損等で失敗した場合は、同じ要求で次候補へ進み、
+RAW 候補には同じ規則を繰り返す。候補は入れ子 ZIP の chain を含む entry index の安定 cursor
+で一方向へ進め、正規化名で再検索しない。選んだ代表と要求内の raster / payload pin は共有する。
+明示的な入れ子 `ZipEntry` は、同名の literal entry が暗号化・非対応圧縮なら既存 loader と同じく
+入れ子の解決へ進む。この判定でも画像 payload は読まない。
+AI は `ZipDirectory` 等の非 page を source 準備前に拒否する。その後 metadata で代表を先に特定し、
+RAW のときだけ最新要求優先の owner 別 capacity slot で待つ。
+同一 owner の旧 AI job は新規 job で supersede / cancel されるため、枠確保前の入れ子 ZIP の
+器の展開は owner あたり 1 個の live job に限定される。JPEG だけの書庫 AI は RAW 枠で待たない。
+
+Remote RAW サムネイルは half 現像を起こさず、埋め込みプレビューまたは既存 catalog の
+サムネイルを使う。どちらも無ければ protocol v62 の `NoThumbnail` を従来のサムネイル失敗
+応答へ写す。サムネイル専用 IPC admission は heavy の最後の 1 枠を使わない。
+旧 `/api/image` / `/api/image-info` では RAW を非対応とし、集約コレクション・検索・タグの
+画像 entry に address を付けて `/api/page` へ送る。
+
+### 14.24 表示位置の RAW 先読み窓 (S2c、protocol v65)
+
+POST /api/raw-prefetch-window は認証・session 必須の短い Home control 経路。
+本文は 32 KiB、entries は最大 8 件、address は page と同じ検証。成功 ack は session を attestation し
+no-store とする。古い世代・重複・終端の宣言も成功 ack、構文不正は 400 とする。
+
+Web は共通の presentation commit から、表示単位・進行方向・窓の address 順の印が変わったときだけ宣言する。
+画像の位置で先 2 枚・前 1 枚を数え、cache / SKIPPED の有無では除外しない。相方や補助表紙を group ごとに
+追加しない。viewer を閉じても session の generation counter は継続し、離れると空の窓を送る。
+宣言 module は実際に presentation commit した表示単位・方向・窓の snapshot を保持する。
+位置 owner の open による初期 displayed は宣言に使わず、session を取得し直しても初回 commit までは送らない。
+送信は最新値だけを保持し、本文読み取り中を含む通信失敗と、HTTP mapper が一時的とする 503
+(`ipc_timeout` / `ipc_busy` / `admission_busy` / `raw_busy` / Busy の `miv_media_error`) を既存の backoff で再試行する。
+`protocol_version_mismatch`、検証・認証エラーや不正な JSON などの恒久エラーは再送しない。
+session 失効で fetch / backoff を abort、取得し直した session では counter を振り直し最後に commit した snapshot から
+新しい宣言を作る。古い本文の replay は行わない。表示を離れると snapshot も破棄する。
+409 / 428 の本文を読んだ後にも captured session と abort を照合し、旧要求のエラーで新しい session を失効させない。
+
+core reader は owner lock 内で最大 generation より新しい宣言だけを最新値の受け箱へ置き、I/O 前に ack する。
+service に 1 本の worker が通常 RAW ファイル・直接 ZIP RAW entry の source だけを特定する。入れ子の器は展開せず、
+ZIP は中央ディレクトリの展開後サイズ 256 MiB 以下に限り、実際の読み込みにも同じ上限を課す。
+特定後に世代と終端を再確認して desired set を反映。重なる waiter は保ち、既存の foreground / AI flight にも
+窓自身の lease で join する。窓外はその lease だけを取り消す。Pending / Running / Retiring と waiter ID で所有し、
+spawn 前に slot を予約、Retiring も終了まで service 全体で数えて最大 6 thread とする。
+Pending がある間は最大 50ms の Condvar wait ごとに実際の admission を再試行し、capacity epoch は使わない。
+
+共通の session drain (logout・取得交代・liveness / idle 期限切れを含む) は窓を終端する。
+service stop / startup rollback も終端し全 waiter を取り消す。pipe の接続断は窓を変更しない。
+flight は作成時の admission class を保持し、foreground 最大 6・prefetch 最大 3・合計 9、Cancelling も完了まで数える。
+join は枠を消費せず、Submitting 中の最高要求優先度を記録し ticket 付与後にも必要なら lock 外で High に昇格する。
+窓の現像は Normal、PC と executor を共有。Remote 専用 cache は 4 件 / 1 GiB。PC の保持・page の S2b 経路は変更しない。
+実アプリでの動作・性能は未確認。自動検証の結果は S2c の実装引き継ぎを参照。
+
 ## 15. 横長ページの左右分割 (§1.119) をリモートへ (2026-08-25)
 
 本体側の設計は [page-split-plan.md](page-split-plan.md)。本節は**端末側で何が変わるか**だけを決める。
@@ -2830,3 +2942,24 @@ ZIP の中身が 1 つのフォルダにまとまっていると、本体は `co
 キーを求めるためだけに書庫を開くことになる。**サーバは既に解決結果を応答へ載せている**
 ので、端末がそれを使えばよい。ずれを見つけやすくするため、要求側と実効側でキーが別行に
 なることを ui.rs の試験で固定した。
+
+## 16. 見開き端の単ページ配置 (§1.218 / §1.239)
+
+coreのcanonical `SpreadDisplayUnit`がpage列とtyped形成理由を同じcache tokenで持ち、共通
+`SpreadDisplayComposition`がcomplete-book proof、unit位置、形成理由から`Center / Left / Right`を解決する。
+本当に相方slotが無い`UnpairedSlot`だけがfirst / lastで片側になり、現在または相方候補が回転後横長の
+`LandscapeBoundary`と非ペア境界は端でも`Center`。Remote serverはその値を`PageGroup.singleton_spread_placement`へ
+写すだけで、container / ZIP / PDFごとの端判定を複製しない。旧payloadでfieldが無い場合は
+`Center`。collection、truncated、syntheticなど本全体を証明できない列も`Center`である。
+
+Webは表示する1page自身を左右へ複製した寸法の仮想2-slot canvasとgapをlayoutとして確保し、選んだ
+slotへ実imageを1件だけ置く。`anchor / pages / presentation / slice`、DOM child、page request、decode
+leaseは増やさない。Page / Width / Originalのrefit、resize、調整blob差し替えも同じgroup-owned
+placementを使う。actual DOM回帰はLeft / Rightそれぞれで`ImageViewer.loadGroup`を通し、image 1件、
+仮想幅`2 * page + gap`、dataset、各refitとadjustment replacement後の維持を固定する。
+
+先頭と末尾はそれぞれ`全体設定に従う / 配置する / 中央表示`のtyped writeで、全体既定は各OFF。
+Remote payload は二端の preference と実効 bool を個別に返す。v59 write は endpoint を指定し、
+選んだ端だけを更新して同じ本の他端を保持する。書込後のrefreshは
+現在anchor / slice / historyを維持し、group layoutだけを更新する。詳細は
+[§1.218設計・検証記録](section218-singleton-spread-placement.md)を参照。

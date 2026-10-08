@@ -403,6 +403,10 @@ impl App {
             template,
             scale,
             items,
+            raw: Some(crate::raw::RawDecodeContext::new(
+                std::sync::Arc::clone(&self.raw_develop_executor),
+                self.settings.raw_brightness,
+            )),
             // 合成が消しゴム / AI 拡大を回し得るので、worker 終端までローカル AI 利用中に
             // 見せる (v3.5.0 レビュー F09)。
             local_ai_activity: self.local_ai_activity_lease(),

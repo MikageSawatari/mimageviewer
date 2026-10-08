@@ -5,6 +5,60 @@ use uuid::Uuid;
 
 pub const MAX_FAVORITES: usize = 100;
 
+/// お気に入りとは独立した、登録順で表示するファイル整理先。
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FileOrganizeDestination {
+    pub name: String,
+    pub path: PathBuf,
+}
+
+impl FileOrganizeDestination {
+    pub fn from_path(path: PathBuf) -> Self {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| path.display().to_string());
+        Self { name, path }
+    }
+
+    /// 入力の構文だけを検証する。不在・未接続のフォルダも登録を維持する。
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.name.trim().is_empty() {
+            return Err("表示名を入力してください。");
+        }
+        let path = self.path.as_os_str();
+        if path.is_empty() {
+            return Err("フォルダのパスを入力してください。");
+        }
+        #[cfg(windows)]
+        let contains_nul = {
+            use std::os::windows::ffi::OsStrExt;
+            path.encode_wide().any(|unit| unit == 0)
+        };
+        #[cfg(not(windows))]
+        let contains_nul = path.to_string_lossy().contains('\0');
+        if contains_nul {
+            return Err("パスに NUL 文字は使用できません。");
+        }
+        if !self.path.is_absolute() {
+            return Err("フォルダの絶対パスを入力してください。");
+        }
+        Ok(())
+    }
+}
+
+pub fn validate_file_organize_destinations(
+    destinations: &[FileOrganizeDestination],
+) -> Result<(), String> {
+    for (index, destination) in destinations.iter().enumerate() {
+        if let Err(error) = destination.validate() {
+            return Err(format!("ファイル整理先 {}: {error}", index + 1));
+        }
+    }
+    Ok(())
+}
+
 pub const UI_SCALE_FACTOR_MIN: f32 = 0.5;
 pub const UI_SCALE_FACTOR_MAX: f32 = 2.0;
 pub const UI_SCALE_FACTOR_STEP: f32 = 0.1;
@@ -13,6 +67,14 @@ pub const UI_SCALE_FACTOR_STEP_COUNT: usize = 16;
 pub const PDF_WORKER_COUNT_MIN: u32 = 3;
 pub const PDF_WORKER_COUNT_MAX: u32 = 10;
 pub const PDF_WORKER_COUNT_DEFAULT: u32 = 5;
+
+pub fn viewer_window_level(always_on_top: bool) -> egui::WindowLevel {
+    if always_on_top {
+        egui::WindowLevel::AlwaysOnTop
+    } else {
+        egui::WindowLevel::Normal
+    }
+}
 
 fn default_ui_scale_factor() -> f32 {
     1.0
@@ -139,6 +201,8 @@ pub struct FavoriteEntry {
     pub auto_index_metadata: bool,
     /// サムネイル事前キャッシュを自動生成するか。
     pub auto_index_thumbs: bool,
+    /// 現在の画像の別バージョンを探す索引の対象にするか。
+    pub auto_index_similar: bool,
 }
 
 // -----------------------------------------------------------------------
@@ -314,6 +378,8 @@ impl<'de> serde::Deserialize<'de> for FavoriteEntry {
                 auto_index_metadata: bool,
                 #[serde(default)]
                 auto_index_thumbs: bool,
+                #[serde(default)]
+                auto_index_similar: bool,
             },
         }
 
@@ -331,6 +397,7 @@ impl<'de> serde::Deserialize<'de> for FavoriteEntry {
                     auto_index_structure: false,
                     auto_index_metadata: false,
                     auto_index_thumbs: false,
+                    auto_index_similar: false,
                 })
             }
             Raw::Full {
@@ -340,6 +407,7 @@ impl<'de> serde::Deserialize<'de> for FavoriteEntry {
                 auto_index_structure,
                 auto_index_metadata,
                 auto_index_thumbs,
+                auto_index_similar,
             } => Ok(FavoriteEntry {
                 id: id.unwrap_or_else(Uuid::nil),
                 name,
@@ -347,6 +415,7 @@ impl<'de> serde::Deserialize<'de> for FavoriteEntry {
                 auto_index_structure,
                 auto_index_metadata,
                 auto_index_thumbs,
+                auto_index_similar,
             }),
         }
     }
@@ -358,13 +427,14 @@ impl serde::Serialize for FavoriteEntry {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("FavoriteEntry", 6)?;
+        let mut s = serializer.serialize_struct("FavoriteEntry", 7)?;
         s.serialize_field("id", &self.id)?;
         s.serialize_field("name", &self.name)?;
         s.serialize_field("path", &self.path)?;
         s.serialize_field("auto_index_structure", &self.auto_index_structure)?;
         s.serialize_field("auto_index_metadata", &self.auto_index_metadata)?;
         s.serialize_field("auto_index_thumbs", &self.auto_index_thumbs)?;
+        s.serialize_field("auto_index_similar", &self.auto_index_similar)?;
         s.end()
     }
 }
@@ -379,6 +449,7 @@ impl FavoriteEntry {
             auto_index_structure: false,
             auto_index_metadata: false,
             auto_index_thumbs: false,
+            auto_index_similar: false,
         }
     }
 }
@@ -579,6 +650,43 @@ impl VideoThumbnailIndicator {
     }
 }
 
+// 音声の画像がある場合だけ重ねる目印。無画像 fallback は設定に関係なく残す。
+/// サムネイル一覧で音声を示す目印の表示方法。
+///
+/// `Unknown` は将来版の値を旧版で読み込んだときの受け皿。設定の sanitize 時に、
+/// 既存動作の音楽アイコンへ正規化する。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AudioThumbnailIndicator {
+    #[default]
+    MusicNoteIcon,
+    BottomLeftBadge,
+    Hidden,
+    #[serde(other)]
+    Unknown,
+}
+
+impl AudioThumbnailIndicator {
+    pub fn label(self) -> &'static str {
+        match self.normalized() {
+            Self::MusicNoteIcon => "音楽アイコン",
+            Self::BottomLeftBadge => "左下バッジ",
+            Self::Hidden => "なし",
+            Self::Unknown => unreachable!("normalized audio thumbnail indicator"),
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[Self::MusicNoteIcon, Self::BottomLeftBadge, Self::Hidden]
+    }
+
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Unknown => Self::MusicNoteIcon,
+            indicator => indicator,
+        }
+    }
+}
+
 // -----------------------------------------------------------------------
 // 選択情報の表示方法
 // -----------------------------------------------------------------------
@@ -672,6 +780,16 @@ impl DetailsSelectionBarMode {
 // -----------------------------------------------------------------------
 // フルスクリーン左右パネルの表示方法
 // -----------------------------------------------------------------------
+
+/// One target set; the empty set is OFF, without a second enable flag.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct FullscreenChromeSuppression {
+    pub top: bool,
+    pub bottom: bool,
+    pub info: bool,
+    pub navigator: bool,
+}
 
 /// フルスクリーン左右パネルを呼び出す方法。
 ///
@@ -1641,7 +1759,8 @@ impl FacetEditFlag {
 /// ツールバーの各セクションの表示形式。
 ///
 /// `Buttons` (展開): 横並びの `selectable_label` 群。すべての選択肢が常時見える。
-/// `Collapsible` (折りたたみ): 展開と同じ横並びだが ▶/▽ で畳める (お気に入り/タグ/本棚のみ)。
+/// `Collapsible` (折りたたみ): 展開と同じ横並びだが ▶/▽ で畳める
+/// (お気に入り/タグ/本棚/コレクション)。
 /// `Dropdown` (プルダウン): `ComboBox` + アクションボタン。選択肢を一覧してスペース節約。
 /// `Unknown`: 将来バージョンの未知の値を旧バイナリが読んだ場合の安全弁 (= 展開扱い)。
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Default)]
@@ -1689,7 +1808,9 @@ impl ToolbarSectionDisplay {
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ToolbarSectionId {
     FolderTree,
+    EffeTune,
     Bookshelf,
+    Collections,
     Cols,
     Aspect,
     Sort,
@@ -1697,6 +1818,7 @@ pub enum ToolbarSectionId {
     Favorites,
     SmartFolders,
     Tags,
+    Folder,
     /// 未知のセクション (将来バージョンが書いた変種を旧バイナリが読んだ場合)。
     /// `#[serde(other)]` でデシリアライズをエラーにせずここへ落とし、
     /// `ordered_with_fallback` が描画前に除外する (ダウングレード時の settings 全損を防ぐ)。
@@ -1705,12 +1827,32 @@ pub enum ToolbarSectionId {
 }
 
 impl ToolbarSectionId {
+    /// 配布形態で提供されるセクション。実行時のファイル欠落では表示を隠さない。
+    pub fn available_in_build(self) -> bool {
+        match self {
+            Self::EffeTune => !cfg!(feature = "portable"),
+            Self::Unknown => false,
+            _ => true,
+        }
+    }
+
+    /// 保存順は保持したまま、現在の配布形態の描画対象だけを取り出す。
+    /// 非対応セクションの改行・セパレータ・ドラッグ領域も生成しない。
+    pub fn render_order(saved: &[Self]) -> Vec<Self> {
+        Self::ordered_with_fallback(saved)
+            .into_iter()
+            .filter(|id| id.available_in_build())
+            .collect()
+    }
+
     /// 既定の並び順 (= v1.x までのハードコード順)。これを崩すと既存ユーザーの
     /// 見た目が変わるので、`toolbar_section_order` 未設定時は必ずこの順を使う。
     pub fn default_order() -> &'static [Self] {
         &[
             Self::FolderTree,
+            Self::EffeTune,
             Self::Bookshelf,
+            Self::Collections,
             Self::Cols,
             Self::Aspect,
             Self::Sort,
@@ -1718,6 +1860,7 @@ impl ToolbarSectionId {
             Self::Favorites,
             Self::SmartFolders,
             Self::Tags,
+            Self::Folder,
         ]
     }
 
@@ -1884,45 +2027,126 @@ impl FacetNameFilterWidth {
 // SortOrder
 // -----------------------------------------------------------------------
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SortOrder {
     #[default]
     FileName, // ファイル名順（辞書順）
-    Numeric,  // 番号順（自然順: 1, 2, 9, 10, 11）
-    DateAsc,  // 日付順（昇順）
-    DateDesc, // 日付順（降順）
+    FileNameDesc, // ファイル名順（降順）
+    Numeric,      // 番号順（自然順: 1, 2, 9, 10, 11）
+    NumericDesc,  // 番号順（自然順、降順）
+    DateAsc,      // 日付順（昇順）
+    DateDesc,     // 日付順（降順）
+    SizeAsc,      // サイズ順（昇順、不明は末尾）
+    SizeDesc,     // サイズ順（降順、不明は末尾）
+    RatingAsc,    // 評価順（低い順）
+    RatingDesc,   // 評価順（高い順）
+}
+
+/// 一覧の並び替えだけが使うmetadata snapshot。
+///
+/// 表示・cache鮮度用の `(mtime, file_size)` は歴史的に0を取得失敗にも使うため、
+/// size availabilityをそこから推測しない。producerがmetadata成功時だけSomeを入れる。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ListingSortMetadata {
+    pub(crate) mtime: i64,
+    pub(crate) file_size: Option<i64>,
+}
+
+impl ListingSortMetadata {
+    pub(crate) const fn new(mtime: i64, file_size: Option<i64>) -> Self {
+        Self { mtime, file_size }
+    }
 }
 
 impl SortOrder {
     pub fn label(self) -> &'static str {
         match self {
-            Self::FileName => "ファイル名順",
-            Self::Numeric => "番号順（区切り無視）",
-            Self::DateAsc => "日付順（古い順）",
-            Self::DateDesc => "日付順（新しい順）",
+            Self::FileName => "名前（昇順）",
+            Self::FileNameDesc => "名前（降順）",
+            Self::Numeric => "番号（昇順）",
+            Self::NumericDesc => "番号（降順）",
+            Self::DateAsc => "日付（古い順）",
+            Self::DateDesc => "日付（新しい順）",
+            Self::SizeAsc => "サイズ順（小さい順）",
+            Self::SizeDesc => "サイズ順（大きい順）",
+            Self::RatingAsc => "評価（低い順）",
+            Self::RatingDesc => "評価（高い順）",
         }
     }
 
     pub fn short_label(self) -> &'static str {
         match self {
-            Self::FileName => "名前",
-            Self::Numeric => "番号*",
+            Self::FileName => "名前↑",
+            Self::FileNameDesc => "名前↓",
+            Self::Numeric => "番号↑",
+            Self::NumericDesc => "番号↓",
             Self::DateAsc => "日付↑",
             Self::DateDesc => "日付↓",
+            Self::SizeAsc => "サイズ↑",
+            Self::SizeDesc => "サイズ↓",
+            Self::RatingAsc => "評価↑",
+            Self::RatingDesc => "評価↓",
         }
     }
 
     pub fn description(self) -> &'static str {
         match self {
-            Self::FileName => "Windows に近い名前順で並び替えます",
-            Self::Numeric => "記号・空白などを無視して連番を優先して並び替えます",
+            Self::FileName => "Windows に近い名前の昇順で並び替えます",
+            Self::FileNameDesc => "Windows に近い名前の降順で並び替えます",
+            Self::Numeric => "記号・空白などの区切りを無視して連番を昇順で比較し、並び替えます",
+            Self::NumericDesc => "記号・空白などの区切りを無視して連番を降順で比較し、並び替えます",
             Self::DateAsc => "更新日時が古いものから並び替えます",
             Self::DateDesc => "更新日時が新しいものから並び替えます",
+            Self::SizeAsc => "ファイルサイズが小さいものから並び替えます（不明は末尾）",
+            Self::SizeDesc => "ファイルサイズが大きいものから並び替えます（不明は末尾）",
+            Self::RatingAsc => {
+                "評価の低い順。未評価は既定で★2と★3の間、設定で★1より下にもできます。評価を変えても、更新するまで並びは変わりません"
+            }
+            Self::RatingDesc => {
+                "評価の高い順。未評価は既定で★3と★2の間、設定で★1より下にもできます。評価を変えても、更新するまで並びは変わりません"
+            }
         }
     }
 
     pub fn all() -> &'static [Self] {
+        &[
+            Self::FileName,
+            Self::FileNameDesc,
+            Self::Numeric,
+            Self::NumericDesc,
+            Self::DateAsc,
+            Self::DateDesc,
+            Self::SizeAsc,
+            Self::SizeDesc,
+            Self::RatingAsc,
+            Self::RatingDesc,
+        ]
+    }
+
+    pub fn collection_options() -> &'static [Self] {
+        &Self::all()[..8]
+    }
+
+    pub const fn is_rating(self) -> bool {
+        matches!(self, Self::RatingAsc | Self::RatingDesc)
+    }
+
+    /// フォルダ代表サムネイルの探索に使える既存4候補。
+    /// 一覧のサイズ順を代表画像選択へ波及させない。
+    pub fn folder_thumb_options() -> &'static [Self] {
         &[Self::FileName, Self::Numeric, Self::DateAsc, Self::DateDesc]
+    }
+
+    pub(crate) fn sanitized_for_folder_thumb(self) -> Self {
+        if Self::folder_thumb_options().contains(&self) {
+            self
+        } else {
+            Self::FileName
+        }
+    }
+
+    pub(crate) const fn is_size(self) -> bool {
+        matches!(self, Self::SizeAsc | Self::SizeDesc)
     }
 
     /// 2 つのメディア項目をこのソート順で比較する。
@@ -1954,7 +2178,9 @@ impl SortOrder {
 
     pub fn name_key(self, name: &str) -> crate::filename_sort::SortNameKey {
         match self {
-            Self::Numeric => crate::filename_sort::SortNameKey::with_natural(name),
+            Self::Numeric | Self::NumericDesc => {
+                crate::filename_sort::SortNameKey::with_natural(name)
+            }
             _ => crate::filename_sort::SortNameKey::file_name(name),
         }
     }
@@ -1972,7 +2198,144 @@ impl SortOrder {
     ) -> std::cmp::Ordering {
         match self {
             Self::FileName => name_a.compare_file_name(name_b),
+            Self::FileNameDesc => name_b.compare_file_name(name_a),
             Self::Numeric => name_a.compare_natural(name_b),
+            Self::NumericDesc => name_b
+                .compare_natural_primary(name_a)
+                .then_with(|| name_a.compare_file_name(name_b)),
+            Self::DateAsc => mtime_a
+                .cmp(&mtime_b)
+                .then_with(|| name_a.compare_file_name(name_b)),
+            Self::DateDesc => mtime_b
+                .cmp(&mtime_a)
+                .then_with(|| name_a.compare_file_name(name_b)),
+            Self::SizeAsc | Self::SizeDesc => {
+                debug_assert!(
+                    false,
+                    "size list sort requires compare_listing_keys and typed availability"
+                );
+                name_a.compare_file_name(name_b)
+            }
+            Self::RatingAsc | Self::RatingDesc => {
+                debug_assert!(false, "rating list sort requires complete rating facts");
+                name_a.compare_file_name(name_b)
+            }
+        }
+    }
+
+    /// 事前に作った名前keyとtyped metadataで一覧項目を比較する。
+    pub(crate) fn compare_listing_keys(
+        self,
+        name_a: &crate::filename_sort::SortNameKey,
+        meta_a: ListingSortMetadata,
+        name_b: &crate::filename_sort::SortNameKey,
+        meta_b: ListingSortMetadata,
+    ) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+
+        let name_tie = || name_a.compare_file_name(name_b);
+        match self {
+            Self::FileName => name_tie(),
+            Self::FileNameDesc => name_b.compare_file_name(name_a),
+            Self::Numeric => name_a.compare_natural(name_b).then_with(name_tie),
+            Self::NumericDesc => name_b.compare_natural_primary(name_a).then_with(name_tie),
+            Self::DateAsc => meta_a.mtime.cmp(&meta_b.mtime).then_with(name_tie),
+            Self::DateDesc => meta_b.mtime.cmp(&meta_a.mtime).then_with(name_tie),
+            Self::SizeAsc | Self::SizeDesc => {
+                let size_order = match (meta_a.file_size, meta_b.file_size) {
+                    (Some(a), Some(b)) if self == Self::SizeAsc => a.cmp(&b),
+                    (Some(a), Some(b)) => b.cmp(&a),
+                    (Some(_), None) => Ordering::Less,
+                    (None, Some(_)) => Ordering::Greater,
+                    (None, None) => Ordering::Equal,
+                };
+                size_order.then_with(name_tie)
+            }
+            Self::RatingAsc | Self::RatingDesc => {
+                debug_assert!(false, "rating list sort requires complete rating facts");
+                name_tie()
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
+// FolderTreeSortOrder
+// -----------------------------------------------------------------------
+
+/// 左フォルダツリーと Ctrl+上下のフォルダ巡回だけに使う並び順。
+///
+/// 一覧の [`SortOrder`] から独立させ、一覧用の表示状態やお気に入り別表示状態を
+/// 切り替えてもフォルダツリーの順序が変わらないようにする。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FolderTreeSortOrder {
+    #[default]
+    NameAsc,
+    NameDesc,
+    NumericAsc,
+    NumericDesc,
+    DateAsc,
+    DateDesc,
+}
+
+impl FolderTreeSortOrder {
+    pub const ALL: [Self; 6] = [
+        Self::NameAsc,
+        Self::NameDesc,
+        Self::NumericAsc,
+        Self::NumericDesc,
+        Self::DateAsc,
+        Self::DateDesc,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NameAsc => "名前（昇順）",
+            Self::NameDesc => "名前（降順）",
+            Self::NumericAsc => "番号（昇順）",
+            Self::NumericDesc => "番号（降順）",
+            Self::DateAsc => "日付（古い順）",
+            Self::DateDesc => "日付（新しい順）",
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::NameAsc => "名前↑",
+            Self::NameDesc => "名前↓",
+            Self::NumericAsc => "番号↑",
+            Self::NumericDesc => "番号↓",
+            Self::DateAsc => "日付↑",
+            Self::DateDesc => "日付↓",
+        }
+    }
+
+    pub fn uses_mtime(self) -> bool {
+        matches!(self, Self::DateAsc | Self::DateDesc)
+    }
+
+    pub fn name_key(self, name: &str) -> crate::filename_sort::SortNameKey {
+        match self {
+            Self::NumericAsc | Self::NumericDesc => {
+                crate::filename_sort::SortNameKey::with_natural(name)
+            }
+            _ => crate::filename_sort::SortNameKey::file_name(name),
+        }
+    }
+
+    pub fn compare_name_keys(
+        self,
+        name_a: &crate::filename_sort::SortNameKey,
+        mtime_a: i64,
+        name_b: &crate::filename_sort::SortNameKey,
+        mtime_b: i64,
+    ) -> std::cmp::Ordering {
+        match self {
+            Self::NameAsc => name_a.compare_file_name(name_b),
+            Self::NameDesc => name_b.compare_file_name(name_a),
+            Self::NumericAsc => name_a.compare_natural(name_b),
+            Self::NumericDesc => name_b.compare_natural(name_a),
             Self::DateAsc => mtime_a
                 .cmp(&mtime_b)
                 .then_with(|| name_a.compare_file_name(name_b)),
@@ -2257,6 +2620,42 @@ impl ArchiveFileHandling {
             Self::Ignore => {
                 "RAR / 7z / LZH を一覧やフォルダ移動の対象にせず、変換キャッシュも開きません。"
             }
+        }
+    }
+}
+
+/// EPUB から PDF への変換を開始する際の扱い。書庫の旧設定移行とは独立する。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EpubFileHandling {
+    Ask,
+    Convert,
+    Ignore,
+}
+
+impl Default for EpubFileHandling {
+    fn default() -> Self {
+        Self::Ask
+    }
+}
+
+impl EpubFileHandling {
+    pub fn all() -> &'static [Self] {
+        &[Self::Ask, Self::Convert, Self::Ignore]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ask => "確認してから変換する",
+            Self::Convert => "確認せず変換する",
+            Self::Ignore => "無視する",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Ask => "未変換の EPUB を開くときに確認画面を表示します。",
+            Self::Convert => "確認画面を省略して PDF に変換します。進捗とエラーは表示します。",
+            Self::Ignore => "EPUB を一覧やフォルダ移動の対象にせず、変換済みの本も開きません。",
         }
     }
 }
@@ -2849,6 +3248,234 @@ impl SpreadMode {
 }
 
 // -----------------------------------------------------------------------
+/// Whether the final-cover supplement follows the environment default or is
+/// overridden for the current book container.
+///
+/// This is kept separate from [`SpreadMode`]: changing the supplement must not
+/// materialize or otherwise change a book's inherited spread/flow/direction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FinalCoverSpreadPreference {
+    #[default]
+    FollowGlobal,
+    On,
+    Off,
+}
+
+impl FinalCoverSpreadPreference {
+    pub(crate) const fn all() -> &'static [Self] {
+        &[Self::FollowGlobal, Self::On, Self::Off]
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::FollowGlobal => "全体に従う",
+            Self::On => "オン",
+            Self::Off => "オフ",
+        }
+    }
+
+    pub(crate) fn effective(self, global_enabled: bool) -> bool {
+        match self {
+            Self::FollowGlobal => global_enabled,
+            Self::On => true,
+            Self::Off => false,
+        }
+    }
+
+    pub(crate) fn to_int(self) -> i32 {
+        match self {
+            Self::FollowGlobal => 0,
+            Self::On => 1,
+            Self::Off => 2,
+        }
+    }
+
+    pub(crate) fn from_int(value: i32) -> Option<Self> {
+        match value {
+            0 => Some(Self::FollowGlobal),
+            1 => Some(Self::On),
+            2 => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
+
+/// Whether an endpoint singleton in spread mode follows the global placement
+/// setting or is overridden for the current book container.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SingletonSpreadPlacementPreference {
+    #[default]
+    FollowGlobal,
+    Place,
+    Center,
+}
+
+impl SingletonSpreadPlacementPreference {
+    pub(crate) const fn all() -> &'static [Self] {
+        &[Self::FollowGlobal, Self::Place, Self::Center]
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::FollowGlobal => "全体設定に従う",
+            Self::Place => "配置する",
+            Self::Center => "中央表示",
+        }
+    }
+
+    pub(crate) const fn effective(self, global_enabled: bool) -> bool {
+        match self {
+            Self::FollowGlobal => global_enabled,
+            Self::Place => true,
+            Self::Center => false,
+        }
+    }
+
+    pub(crate) const fn to_int(self) -> i32 {
+        match self {
+            Self::FollowGlobal => 0,
+            Self::Place => 1,
+            Self::Center => 2,
+        }
+    }
+
+    pub(crate) const fn from_int(value: i32) -> Option<Self> {
+        match value {
+            0 => Some(Self::FollowGlobal),
+            1 => Some(Self::Place),
+            2 => Some(Self::Center),
+            _ => None,
+        }
+    }
+}
+
+/// Independent global choices for singleton pages at the two book endpoints.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SingletonSpreadEndpointSettings {
+    pub first: bool,
+    pub last: bool,
+}
+
+impl From<bool> for SingletonSpreadEndpointSettings {
+    fn from(enabled: bool) -> Self {
+        Self {
+            first: enabled,
+            last: enabled,
+        }
+    }
+}
+
+/// A book may follow or override either endpoint independently.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SingletonSpreadEndpointPreferences {
+    pub first: SingletonSpreadPlacementPreference,
+    pub last: SingletonSpreadPlacementPreference,
+}
+
+impl From<SingletonSpreadPlacementPreference> for SingletonSpreadEndpointPreferences {
+    fn from(preference: SingletonSpreadPlacementPreference) -> Self {
+        Self {
+            first: preference,
+            last: preference,
+        }
+    }
+}
+
+impl PartialEq<SingletonSpreadPlacementPreference> for SingletonSpreadEndpointPreferences {
+    fn eq(&self, other: &SingletonSpreadPlacementPreference) -> bool {
+        self.first == *other && self.last == *other
+    }
+}
+
+impl SingletonSpreadEndpointPreferences {
+    pub(crate) const fn effective(
+        self,
+        global: SingletonSpreadEndpointSettings,
+    ) -> SingletonSpreadEndpointSettings {
+        SingletonSpreadEndpointSettings {
+            first: self.first.effective(global.first),
+            last: self.last.effective(global.last),
+        }
+    }
+}
+
+/// Whether a near-end real page is displayed alone in cover-on spread mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PageAlonePreference {
+    #[default]
+    FollowGlobal,
+    On,
+    Off,
+}
+
+impl PageAlonePreference {
+    pub(crate) const fn all() -> &'static [Self] {
+        &[Self::FollowGlobal, Self::On, Self::Off]
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::FollowGlobal => "全体設定に従う",
+            Self::On => "オン",
+            Self::Off => "オフ",
+        }
+    }
+
+    pub(crate) const fn effective(self, global_enabled: bool) -> bool {
+        match self {
+            Self::FollowGlobal => global_enabled,
+            Self::On => true,
+            Self::Off => false,
+        }
+    }
+
+    pub(crate) const fn to_int(self) -> i32 {
+        match self {
+            Self::FollowGlobal => 0,
+            Self::On => 1,
+            Self::Off => 2,
+        }
+    }
+
+    pub(crate) const fn from_int(value: i32) -> Option<Self> {
+        match value {
+            0 => Some(Self::FollowGlobal),
+            1 => Some(Self::On),
+            2 => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn toggled(self, global_enabled: bool) -> Self {
+        if self.effective(global_enabled) {
+            Self::Off
+        } else {
+            Self::On
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PageAloneSettings {
+    pub after_cover: bool,
+    pub last: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PageAlonePreferences {
+    pub after_cover: PageAlonePreference,
+    pub last: PageAlonePreference,
+}
+
+impl PageAlonePreferences {
+    pub(crate) const fn effective(self, global: PageAloneSettings) -> PageAloneSettings {
+        PageAloneSettings {
+            after_cover: self.after_cover.effective(global.after_cover),
+            last: self.last.effective(global.last),
+        }
+    }
+}
+
 // ReadingFlow (フルスクリーン連結方式)
 // -----------------------------------------------------------------------
 
@@ -3082,11 +3709,37 @@ impl FullscreenFitMode {
         Self::all()
     }
 
-    pub fn next_for_flow(self, flow: ReadingFlow) -> Self {
-        let modes = Self::selectable_for_flow(flow);
+    /// Stable IDs in the excluded set. Unknown IDs survive loading for forward compatibility.
+    pub fn cycle_id(self) -> &'static str {
+        match self {
+            Self::Page => "Page",
+            Self::MarginFit => "MarginFit",
+            Self::Width => "Width",
+            Self::Height => "Height",
+            Self::Original => "Original",
+        }
+    }
+
+    pub fn cycle_enabled(self, excluded: &[String]) -> bool {
+        !excluded.iter().any(|id| id == self.cycle_id())
+    }
+
+    pub fn next_for_flow(self, flow: ReadingFlow, excluded: &[String]) -> Self {
+        let modes: Vec<_> = Self::selectable_for_flow(flow)
+            .iter()
+            .copied()
+            .filter(|mode| mode.cycle_enabled(excluded))
+            .collect();
+        // Loading repairs an empty set to the first selectable mode. Keep the pure
+        // operation consistent even for an unsanitized caller's settings draft.
+        let Some(&first) = modes.first() else {
+            return Self::selectable_for_flow(flow)[0];
+        };
         let current = self.effective_for_flow(flow);
-        let pos = modes.iter().position(|&m| m == current).unwrap_or(0);
-        modes[(pos + 1) % modes.len()]
+        modes
+            .iter()
+            .position(|&mode| mode == current)
+            .map_or(first, |pos| modes[(pos + 1) % modes.len()])
     }
 }
 
@@ -3215,10 +3868,54 @@ where
 // StartupFolderMode (起動時に開く場所)
 // -----------------------------------------------------------------------
 
+/// Persistent identity of an A/B quick-folder workspace.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuickFolderSlotId {
+    A,
+    B,
+}
+
+/// Previous-startup state. Released `last_folder` remains a separate compatibility carrier.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "version", rename_all = "snake_case")]
+pub enum StartupListRestore {
+    V1 {
+        target: StartupListTarget,
+        cursor: Option<ListCursorHint>,
+    },
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StartupListTarget {
+    Unavailable,
+    DriveList,
+    PhysicalList {
+        logical_path: PathBuf,
+        /// Effective, tree-relative ZIP directory; never a filesystem path.
+        zip_prefix: Option<String>,
+    },
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ListCursorHint {
+    pub name: String,
+    pub rows_above: Option<u32>,
+}
+
+impl Default for StartupListRestore {
+    fn default() -> Self {
+        Self::V1 {
+            target: StartupListTarget::Unavailable,
+            cursor: None,
+        }
+    }
+}
+
 #[derive(serde::Serialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum StartupFolderMode {
-    /// 前回終了時に表示していた場所。既存挙動との互換のためデフォルト。
+    /// 最後に明示した復元可能な一覧。
     #[default]
     Previous,
     /// Windows のデスクトップ。
@@ -3562,6 +4259,9 @@ pub struct Settings {
     pub details_timestamp_show_seconds: bool,
     #[serde(default)]
     pub details_row_style: DetailsRowStyle,
+    /// 詳細一覧の名前列だけに適用するカテゴリ色。既存設定の欠落は既定 ON。
+    #[serde(default)]
+    pub details_name_colors: crate::details_name_colors::DetailsNameColors,
     #[serde(default)]
     pub details_column_order: Vec<DetailsColumnId>,
     #[serde(default)]
@@ -3682,6 +4382,9 @@ pub struct Settings {
     pub thumb_aspect_auto: bool,
     #[serde(default)]
     pub favorites: Vec<FavoriteEntry>,
+    /// 環境設定で編集する固定のコピー／移動先。Vec の順序が表示順。
+    #[serde(default)]
+    pub file_organize_destinations: Vec<FileOrganizeDestination>,
     /// お気に入り配下へ入ったとき、そのお気に入り専用の表示状態を適用・自動更新する。
     /// 既定 OFF。保存済みの専用状態は OFF にしても削除しない。
     #[serde(default)]
@@ -3695,6 +4398,9 @@ pub struct Settings {
     pub smart_folders: Vec<SmartFolderDefinition>,
     #[serde(default)]
     pub last_folder: Option<PathBuf>,
+    /// Missing only for released settings awaiting their one-time legacy projection.
+    #[serde(default)]
+    pub startup_list_restore: Option<StartupListRestore>,
     #[serde(default)]
     pub startup_folder_mode: StartupFolderMode,
     #[serde(default)]
@@ -3727,6 +4433,10 @@ pub struct Settings {
     pub quick_folder_recent_folders: [Vec<PathBuf>; 2],
     #[serde(default = "default_quick_folder_slots")]
     pub quick_folder_slots: [Option<PathBuf>; 2],
+    /// Accepted A/B workspace. Missing in older settings means A; explicit None
+    /// keeps startup navigation outside both workspaces.
+    #[serde(default = "default_active_quick_folder_slot")]
+    pub active_quick_folder_slot: Option<QuickFolderSlotId>,
     /// A/B クイックフォルダごとに保持するドライブ別の最後の場所。
     /// キーは `"C:"` のような大文字ドライブ表記。
     #[serde(default = "default_quick_folder_drive_current_dirs")]
@@ -3743,11 +4453,18 @@ pub struct Settings {
     /// 復元先が最大化サイズで潰れて戻れなくなる (detached 側の §1.115 と同じ根)。
     #[serde(default)]
     pub window_maximized: bool,
+    /// Keep the main and viewer host windows above other applications when requested.
+    #[serde(default)]
+    pub always_on_top: bool,
     /// 起動時にメインウィンドウを最大化するか。既定は従来どおり通常ウィンドウ。
     #[serde(default)]
     pub startup_window_state: StartupWindowState,
     #[serde(default)]
     pub parallelism: Parallelism,
+    #[serde(default = "default_raw_develop_parallelism")]
+    pub raw_develop_parallelism: u8,
+    #[serde(default)]
+    pub raw_brightness: crate::raw::RawBrightness,
     /// PDF worker pool のプロセス数。変更は次回起動時に反映される。
     #[serde(default = "default_pdf_worker_count")]
     pub pdf_worker_count: u32,
@@ -3766,6 +4483,11 @@ pub struct Settings {
     /// サムネイルグリッドのソート順
     #[serde(default)]
     pub sort_order: SortOrder,
+    /// ★1〜★5 のレーティング一覧で共通に使うソート順。
+    #[serde(default)]
+    pub rating_view_sort: crate::rating_view::RatingViewSort,
+    #[serde(default)]
+    pub rating_sort_unrated_position: crate::rating_sort::RatingSortUnratedPosition,
     /// サブフォルダ展開ビューでフォルダ境界を優先するか。
     #[serde(default)]
     pub subfolder_expansion_order: SubfolderExpansionOrder,
@@ -3789,6 +4511,9 @@ pub struct Settings {
     /// 動画サムネイルを示す目印。既定は従来どおり中央の再生アイコン。
     #[serde(default)]
     pub video_thumbnail_indicator: VideoThumbnailIndicator,
+    /// 音声の代表画像に重ねる目印。無画像時の音楽アイコンは常に表示する。
+    #[serde(default)]
+    pub audio_thumbnail_indicator: AudioThumbnailIndicator,
     /// ファイル名 prefix スタック (v2.0.0) のグループ化区切り文字。既定 '_'。
     /// 例: '_' のとき "12345678_p0.jpg" は prefix "12345678" でまとまる
     /// (docs/filename-stack-plan.md)。スタックモードの ON/OFF 自体は transient で
@@ -3851,6 +4576,9 @@ pub struct Settings {
     /// RAR / 7z / LZH などの変換対象アーカイブをどう扱うか。
     #[serde(default)]
     pub archive_file_handling: ArchiveFileHandling,
+    /// EPUB を PDF に変換して開くときの扱い。書庫の設定からは引き継がない。
+    #[serde(default)]
+    pub epub_file_handling: EpubFileHandling,
     /// 旧設定互換: RAR / 7z / LZH を開くとき、確認ダイアログを省略するか。
     /// 新規 UI / 実行時判定は `archive_file_handling` を source of truth とし、
     /// この bool は古い設定の読み込み互換と旧版へ戻した場合の近似互換のために同期する。
@@ -3894,6 +4622,12 @@ pub struct Settings {
     /// `On` : スクロール停止 + 他の要求が全て完了した後、visible 範囲から順次再デコード
     #[serde(default = "default_true")]
     pub thumb_idle_upgrade: bool,
+    /// サムネイル右下に動画・音声の長さを表示する。
+    #[serde(default = "default_true")]
+    pub thumb_show_media_duration: bool,
+    /// 本・動画・音声のサムネイル下端に、記録済みの読書・再生位置を表示する。
+    #[serde(default = "default_true")]
+    pub thumb_show_resume_meter: bool,
     /// 一覧の選択情報を表示する場所。
     #[serde(default)]
     pub selection_info_display_mode: SelectionInfoDisplayMode,
@@ -3958,6 +4692,9 @@ pub struct Settings {
     /// 左側の実フォルダツリーペインを表示する
     #[serde(default)]
     pub folder_tree_pane_visible: bool,
+    /// 左フォルダツリーと Ctrl+上下 / Ctrl+PageUp/PageDown の並び順。
+    #[serde(default)]
+    pub folder_tree_sort_order: FolderTreeSortOrder,
     /// フォルダツリー左右境界位置 (ウィンドウ幅に対する比率)。
     #[serde(default = "default_folder_tree_pane_width_ratio")]
     pub folder_tree_pane_width_ratio: f32,
@@ -3967,9 +4704,15 @@ pub struct Settings {
     /// ツールバーに「ツリー」ボタンを表示する
     #[serde(default = "default_true")]
     pub show_toolbar_folder_tree_button: bool,
+    /// ツールバーに EffeTune ボタンを表示する。
+    #[serde(default = "default_true")]
+    pub show_toolbar_effetune: bool,
     /// ツールバーに「本棚」セクションを表示する。
     #[serde(default = "default_true")]
     pub show_toolbar_bookshelf: bool,
+    /// ツールバーに「コレクション」管理セクションを表示する。
+    #[serde(default = "default_true")]
+    pub show_toolbar_collections: bool,
     /// フォルダバーに「履歴を戻る/進む」ボタンを表示する。
     #[serde(default = "default_true")]
     pub show_address_bar_history_nav: bool,
@@ -4029,6 +4772,9 @@ pub struct Settings {
     /// フォルダバーの「場所▼」に本棚フォルダを表示する。
     #[serde(default = "default_true")]
     pub show_location_bookshelf: bool,
+    /// フォルダバーの「場所▼」と Remote Home に整理先を表示する。
+    #[serde(default = "default_true")]
+    pub show_location_file_organize_destinations: bool,
     /// フォルダバーの「場所▼」にデスクトップを表示する。
     #[serde(default = "default_true")]
     pub show_location_desktop: bool,
@@ -4079,7 +4825,9 @@ pub struct Settings {
     /// 同名の ZIP/CBZ がある場合、RAR/7z/LZH 側をスキップする
     #[serde(default = "default_true")]
     pub skip_archive_if_zip_exists: bool,
-    /// 同名の動画と画像がある場合、画像をスキップする（動画サムネイルで代替）
+    #[serde(default = "default_true")]
+    pub skip_epub_if_pdf_exists: bool,
+    /// 同名の動画・音声と画像がある場合、画像を省略する。released field 名は互換性のため保持。
     #[serde(default = "default_true")]
     pub skip_image_if_video_exists: bool,
     /// 同名の画像が複数拡張子で存在する場合、優先度の低いものをスキップする
@@ -4106,6 +4854,20 @@ pub struct Settings {
     /// 新規フィールド (serde default = LoopFolder = 旧来挙動) なので移行不要。
     #[serde(default)]
     pub slideshow_end_action: SlideshowEndAction,
+
+    // ── クリップボード取り込み ──────────────────────────────────
+    /// 起動中の画像コピーを自動保存する。既定 OFF。
+    #[serde(default)]
+    pub clipboard_capture_image_enabled: bool,
+    /// HTML コピー内の画像を選んで保存する監視。S2 で UI に公開する。
+    #[serde(default)]
+    pub clipboard_capture_html_enabled: bool,
+    /// HTML 選択ダイアログの短辺フィルター (px)。既定 100。
+    #[serde(default = "default_clipboard_capture_min_short_side_px")]
+    pub clipboard_capture_min_short_side_px: u32,
+    /// None は capture::default_output_dir()/clipboard。保存まで作成しない。
+    #[serde(default)]
+    pub clipboard_capture_output_dir: Option<PathBuf>,
 
     // ── キャプチャ保存 ──────────────────────────────────────────
     /// Ctrl+S キャプチャ保存先。None のときは OS の Pictures/mimageviewer を使う。
@@ -4240,21 +5002,46 @@ pub struct Settings {
     /// デフォルトのページ構成
     #[serde(default)]
     pub default_spread_mode: SpreadMode,
+    /// 本に保存した見開きモードがない場合、PDF / EPUB の右開き指定に従う。
+    #[serde(default)]
+    pub follow_document_reading_direction: bool,
     /// デフォルトの連結方式
     #[serde(default)]
     pub default_reading_flow: ReadingFlow,
     /// デフォルトの横連結方向
     #[serde(default)]
     pub default_reading_direction: ReadingDirection,
+    /// 表紙あり見開きで、末尾の単ページへ表紙を添える全体既定。各本の明示設定が優先する。
+    #[serde(default = "default_true")]
+    pub final_cover_spread_enabled: bool,
+    /// 見開き先頭の単ページを本来の側へ置く全体既定。
+    #[serde(default)]
+    pub singleton_spread_first_enabled: bool,
+    /// 見開き末尾の単ページを本来の側へ置く全体既定。
+    #[serde(default)]
+    pub singleton_spread_last_enabled: bool,
+    /// In cover-on spread mode, show the real page after the cover alone.
+    #[serde(default)]
+    pub page_after_cover_alone_enabled: bool,
+    /// In cover-on spread mode, show the final real page alone.
+    #[serde(default)]
+    pub last_page_alone_enabled: bool,
     /// 見開き内の左右ページ間隔 (画面 px)。0 でページを隙間なく接続する。
     #[serde(default = "default_spread_page_gap_px")]
     pub spread_page_gap_px: u32,
     /// 縦/横連結読みで、次のページまたは次の見開きユニットまで空ける間隔 (画面 px)。
     #[serde(default = "default_continuous_reading_gap_px")]
     pub continuous_reading_gap_px: u32,
+    /// 静止画・本のフルスクリーンで、画像の外側に表示する RGB 色。
+    #[serde(default = "default_fullscreen_image_margin_color")]
+    pub fullscreen_image_margin_color: [u8; 3],
     /// フルスクリーンの倍率/フィット基準。
     #[serde(default)]
     pub fullscreen_fit_mode: FullscreenFitMode,
+    /// Excluded stable fit-mode IDs; empty means all modes, including future additions.
+    /// Unknown IDs are retained so an explicitly excluded future mode stays excluded.
+    #[serde(default)]
+    pub fullscreen_fit_cycle_excluded: Vec<String>,
     /// 自動フィット時に 100% を超える拡大をしない。
     #[serde(default)]
     pub fullscreen_fit_no_upscale: bool,
@@ -4280,6 +5067,9 @@ pub struct Settings {
     /// フルスクリーン左右パネルを呼び出す方法。
     #[serde(default)]
     pub fullscreen_side_panel_mode: FsSidePanelMode,
+    /// Targets whose fixed display becomes automatic only on the current F11 surface.
+    #[serde(default)]
+    pub fullscreen_chrome_suppression: FullscreenChromeSuppression,
     /// フルスクリーンで先頭 / 末尾に達したときの案内を表示する。
     #[serde(default = "default_true")]
     pub fullscreen_boundary_notice_visible: bool,
@@ -4316,6 +5106,12 @@ pub struct Settings {
     /// 静止画ページシークストリップの高さプリセット。
     #[serde(default)]
     pub still_seek_strip_height: StillSeekStripHeight,
+    /// 静止画シーク位置プレビューの大きさの段階。列の高さとは独立。
+    #[serde(default)]
+    pub still_seek_preview_size: StillSeekPreviewSize,
+    /// 静止画シーク位置プレビューの段階別高さ。保存値は解決時だけ制限する。
+    #[serde(default)]
+    pub still_seek_preview_size_values: StillSeekPreviewSizeValues,
     /// 静止画ページシークストリップのプリセット別高さ。保存値はそのまま保持し、
     /// 実描画時だけ安全範囲へ制限する。
     #[serde(default)]
@@ -4434,6 +5230,10 @@ pub struct Settings {
     /// ツールバーに表示する列数の選択肢
     #[serde(default = "default_toolbar_cols_items")]
     pub toolbar_cols_items: Vec<usize>,
+    /// 旧既定の列数候補 1〜10 を一度だけ 1〜20 へ補完した marker。
+    /// 旧保存では false、現行の新規設定では true。以後候補を外しても再追加しない。
+    #[serde(default)]
+    pub(crate) toolbar_cols_20_options_migrated: bool,
     /// ツールバーの列セクションに「詳細」切替を表示するか
     #[serde(default = "default_true")]
     pub toolbar_cols_details_visible: bool,
@@ -4463,6 +5263,16 @@ pub struct Settings {
     pub toolbar_tags_display: ToolbarSectionDisplay,
     #[serde(default)]
     pub toolbar_bookshelf_display: ToolbarSectionDisplay,
+    #[serde(default = "default_toolbar_collections_display")]
+    pub toolbar_collections_display: ToolbarSectionDisplay,
+    /// コレクションツールバーの追加先。管理windowの選択や現在表示中のcollectionとは独立。
+    /// catalog Ready時に存在確認し、削除済みなら先頭へ正規化する。
+    #[serde(default)]
+    pub toolbar_collection_target_id: Option<Uuid>,
+    /// ツールバーへ固定表示するコレクション。名前変更に追従するため安定 UUID を保持する。
+    /// authoritative な catalog Ready 時だけ重複・削除済み ID を整理する。
+    #[serde(default)]
+    pub pinned_collections: Vec<Uuid>,
     /// 折りたたみモード時の畳み状態 (true = 畳んで隠す)。v2.0.0。
     #[serde(default)]
     pub toolbar_favorites_collapsed: bool,
@@ -4472,9 +5282,25 @@ pub struct Settings {
     pub toolbar_tags_collapsed: bool,
     #[serde(default)]
     pub toolbar_bookshelf_collapsed: bool,
+    #[serde(default)]
+    pub toolbar_collections_collapsed: bool,
     /// ツールバーに表示するソート順の選択肢
     #[serde(default = "default_toolbar_sort_items")]
     pub toolbar_sort_items: Vec<SortOrder>,
+    /// v3.10以後の一覧サイズ順候補を旧既定4項目へ一度だけ補完したmarker。
+    ///
+    /// `#[serde(default)] = false` で旧保存を識別する。現行版の新規値は最初からtrueで、
+    /// 旧保存だけを初回loadでtrueへbootstrap保存する。以後利用者がサイズ2候補だけを
+    /// 非表示にしたcanonical4を維持する。
+    #[serde(default)]
+    pub(crate) toolbar_sort_size_options_migrated: bool,
+    /// 名前 / 番号の降順候補を旧既定6項目へ一度だけ補完したmarker。
+    /// custom順、部分集合、空vectorは変更せず、補完後に候補を隠した状態も復活させない。
+    #[serde(default)]
+    pub(crate) toolbar_sort_name_numeric_desc_options_migrated: bool,
+    /// 既定の8候補だけに評価順を一度追加する。利用者が変更した候補には触れない。
+    #[serde(default)]
+    pub(crate) toolbar_sort_rating_options_migrated: bool,
     /// スマートフィルタバーに表示するボタン。
     /// 空 Vec は「ボタンを全部隠す」。アクティブ条件のチップと全解除は引き続き表示する。
     #[serde(default = "default_toolbar_facet_filter_items")]
@@ -4503,11 +5329,17 @@ pub struct Settings {
     /// ツールバーに「ソート」セクションを表示する (v2.0.0)。
     #[serde(default = "default_true")]
     pub show_toolbar_sort: bool,
+    /// Show an independent dropdown on the right of the facet bar. Old settings omit it.
+    #[serde(default)]
+    pub show_facet_sort: bool,
     /// 「行頭に表示」= そのセクションの前で改行するセクション集合 (v2.0.0)。
     /// 自動折返し (horizontal_wrapped) に加え、ユーザーが行区切りを固定できる。
     /// 集合に入っているセクションは、その手前で必ず新しい行を始める (先頭セクションは無視)。
     #[serde(default)]
     pub toolbar_section_new_row: Vec<ToolbarSectionId>,
+    /// One-time upgrade of the released toolbar layout. Missing in old DB/JSON.
+    #[serde(default)]
+    pub(crate) toolbar_folder_section_migrated: bool,
     /// ツールバーセクションのドラッグ並べ替えを許可するか (v2.0.0、既定 false)。
     /// 既定 OFF にする理由: 常時ドラッグ可能にすると、通常操作中にラベル上で頻繁に
     /// マウスカーソルが「移動可能」形状へ変わって煩わしいため (実機フィードバック 2026-06-20)。
@@ -4520,6 +5352,10 @@ pub struct Settings {
     /// 空設定は catalog 既定順として解決する。描画への反映は menu layout resolver 経由。
     #[serde(default)]
     pub menu_layout: crate::keymap::MenuLayoutSettings,
+    /// Grid / fullscreen で共用する mIV 右クリック項目の表示順 / 表示 ON/OFF。
+    /// Windows Shell 項目はこの設定に含めず、従来どおり末尾へ置く。
+    #[serde(default)]
+    pub context_menu_layout: crate::context_menu_model::ContextMenuLayoutSettings,
 
     // ── コマンド / キーボード割り当て ───────────────────────────
     /// GUI で編集するキー割り当ての正本。旧 `keymap.ini` は初回ロード時にここへ
@@ -4673,6 +5509,11 @@ pub struct Settings {
     #[serde(default)]
     pub minimize_to_tray_on_close: bool,
 
+    /// 完全走査済みの索引は起動時に終了中の変更を確認しない。起動時だけ採用する。
+    /// 終了中の変更は「今すぐ確認」で反映する。旧設定の欠落キーは false。
+    #[serde(default)]
+    pub skip_offline_change_scan: bool,
+
     /// タスクトレイに常駐している間 (= ウィンドウ非表示中) にバックグラウンドインデクサ
     /// (初回スキャン + notify-rs 経由の ingest) を一時停止する。ウィンドウを開き直すと
     /// 自動的に再開し、溜まっていた notify-rs イベントを順次処理する。
@@ -4793,6 +5634,12 @@ pub struct Settings {
     /// ストリップの高さ (最大 / 大 / 中 / 小 / 最小)。
     #[serde(default)]
     pub video_seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight,
+    /// 動画シーク位置プレビューの大きさの段階。列の高さとは独立。
+    #[serde(default)]
+    pub video_seek_preview_size: VideoSeekPreviewSize,
+    /// 動画シーク位置プレビューの段階別最大画像幅。保存値は解決時だけ制限する。
+    #[serde(default)]
+    pub video_seek_preview_size_values: VideoSeekPreviewSizeValues,
     /// 動画・音声シークストリップの段階別高さ。静止画の値とは独立して保存する。
     #[serde(default)]
     pub video_seek_strip_height_values: crate::video::seek_strip_layout::SeekStripHeightValues,
@@ -4870,6 +5717,13 @@ pub struct Settings {
     /// 動画末尾近く (残り 5 秒以内) は 0 にリセットして "次回最初から" の挙動。
     #[serde(default)]
     pub video_resume_positions: std::collections::HashMap<String, f64>,
+    /// 最後まで視聴した動画・音声の正規化済み絶対パス。再生位置の復元とは独立。
+    #[serde(default)]
+    pub video_watched_to_end: std::collections::HashSet<String>,
+    /// 明示的に選んだ音声トラック。再生位置とは独立してファイルごとに保持する。
+    #[serde(default)]
+    pub video_audio_track_choices:
+        std::collections::HashMap<String, crate::video::SavedAudioTrackChoice>,
     /// 一覧から明示的に動画を開いたとき、保存済み resume 位置を使わず先頭から開くか。
     /// (v0.9.0 リリース済みの bool。位置復元マトリクスの「動画 × 一覧から開く」セルの保存先を
     /// 兼ねる。互換のため enum 化せず bool のまま残す。アクセスは `Settings::video_open_resume`
@@ -4914,11 +5768,11 @@ pub struct Settings {
     /// interlaced を示す場合に bwdif を適用する。
     #[serde(default)]
     pub video_deinterlace: VideoDeinterlaceMode,
-    /// 動画グリッドサムネに、同名ファイル名の画像 (= sidecar、例 movie.mp4 の隣の
-    /// movie.jpg) があれば優先採用するか。Phase 5.3 で導入。
-    /// 既存ユーザー (= 過去の動作と整合) のため既定 true。OFF にすると Windows Shell
-    /// 経由の動画自身のデフォルトサムネのみが使われる。
-    /// ピン留めサムネ (= Phase 5.4.1 で実装予定) は本設定とは独立で常に最優先。
+    /// 動画・音声の同 stem の sidecar 画像を代表サムネイルに使うか。
+    /// 例: movie.mp4 + movie.jpg、song.mp3 + song.jpg を同じフォルダへ置く。
+    /// released field 名と既定 true は維持する。既存 OFF は音声にも適用する。
+    /// OFF の場合、動画は Windows Shell、MP3 は埋め込み画像へ進む。
+    /// 動画のピン留めフレームは本設定とは独立で常に最優先。
     #[serde(default = "default_true")]
     pub video_thumb_use_sidecar_image: bool,
     /// 動画タイルモードの列数 (Phase 6.D)。タイル中 Ctrl+Wheel で
@@ -4975,6 +5829,20 @@ pub struct Settings {
     /// 全プラグイン共通の一斉トグル状態として扱う (個別表示の覚え書きはしない)。
     #[serde(default = "default_true")]
     pub vst3_gui_visible: bool,
+    /// EffeTune へ渡す前に 0 dBFS 超のサンプルを抑える。設定の確定時に音声処理へ公開する。
+    #[serde(default = "default_true")]
+    pub effetune_pre_limiter_enabled: bool,
+    /// 起動後の最初の適格なローカル動画再生で音響調整の窓を非アクティブ表示する。
+    #[serde(default)]
+    pub effetune_auto_open_on_video: bool,
+    /// メイン最小化中も、表示していた音響調整の窓を残す。
+    #[serde(default)]
+    pub effetune_keep_visible_when_minimized: bool,
+    /// EffeTune GUI の最後の位置と外枠サイズ。
+    #[serde(default)]
+    pub effetune_gui_pos: Option<(i32, i32)>,
+    #[serde(default)]
+    pub effetune_gui_size: Option<(u32, u32)>,
     /// 動画フルスクリーン再生中、動画を右上 1/4 に縮小表示する (= プラグイン作業領域確保用)。
     /// false (= 既定): 動画はフルスクリーン全体を使う。
     /// true: 動画を右上 1/4 (幅・高さ各 1/2 = 面積 1/4) に縮小、左下 3/4 はプラグイン GUI 用に空く。
@@ -5681,6 +6549,191 @@ pub enum StillSeekStripHeight {
     Smallest,
 }
 
+pub const STILL_SEEK_PREVIEW_HEIGHT_MIN_POINTS: u32 = 45;
+pub const STILL_SEEK_PREVIEW_HEIGHT_MAX_POINTS: u32 = 540;
+pub const VIDEO_SEEK_PREVIEW_WIDTH_MIN_POINTS: u32 = 88;
+pub const VIDEO_SEEK_PREVIEW_WIDTH_MAX_POINTS: u32 = 1056;
+
+/// 静止画シーク位置プレビューの高さプリセット。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StillSeekPreviewSize {
+    Maximum,
+    #[default]
+    Large,
+    Medium,
+    Small,
+    Smallest,
+}
+
+impl StillSeekPreviewSize {
+    pub const ALL: [Self; 5] = [
+        Self::Maximum,
+        Self::Large,
+        Self::Medium,
+        Self::Small,
+        Self::Smallest,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Maximum => "最大",
+            Self::Large => "大",
+            Self::Medium => "中",
+            Self::Small => "小",
+            Self::Smallest => "最小",
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StillSeekPreviewSizeValues {
+    #[serde(default = "default_still_seek_preview_height_smallest")]
+    pub smallest: u32,
+    #[serde(default = "default_still_seek_preview_height_small")]
+    pub small: u32,
+    #[serde(default = "default_still_seek_preview_height_medium")]
+    pub medium: u32,
+    #[serde(default = "default_still_seek_preview_height_large")]
+    pub large: u32,
+    #[serde(default = "default_still_seek_preview_height_maximum")]
+    pub maximum: u32,
+}
+
+const fn default_still_seek_preview_height_smallest() -> u32 {
+    90
+}
+const fn default_still_seek_preview_height_small() -> u32 {
+    117
+}
+const fn default_still_seek_preview_height_medium() -> u32 {
+    144
+}
+const fn default_still_seek_preview_height_large() -> u32 {
+    180
+}
+const fn default_still_seek_preview_height_maximum() -> u32 {
+    360
+}
+
+impl Default for StillSeekPreviewSizeValues {
+    fn default() -> Self {
+        Self {
+            smallest: 90,
+            small: 117,
+            medium: 144,
+            large: 180,
+            maximum: 360,
+        }
+    }
+}
+
+impl StillSeekPreviewSizeValues {
+    pub fn points(self, preset: StillSeekPreviewSize) -> f32 {
+        let stored = match preset {
+            StillSeekPreviewSize::Maximum => self.maximum,
+            StillSeekPreviewSize::Large => self.large,
+            StillSeekPreviewSize::Medium => self.medium,
+            StillSeekPreviewSize::Small => self.small,
+            StillSeekPreviewSize::Smallest => self.smallest,
+        };
+        stored.clamp(
+            STILL_SEEK_PREVIEW_HEIGHT_MIN_POINTS,
+            STILL_SEEK_PREVIEW_HEIGHT_MAX_POINTS,
+        ) as f32
+    }
+}
+
+/// 動画シーク位置プレビューの最大画像幅プリセット。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoSeekPreviewSize {
+    Maximum,
+    #[default]
+    Large,
+    Medium,
+    Small,
+    Smallest,
+}
+
+impl VideoSeekPreviewSize {
+    pub const ALL: [Self; 5] = [
+        Self::Maximum,
+        Self::Large,
+        Self::Medium,
+        Self::Small,
+        Self::Smallest,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Maximum => "最大",
+            Self::Large => "大",
+            Self::Medium => "中",
+            Self::Small => "小",
+            Self::Smallest => "最小",
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VideoSeekPreviewSizeValues {
+    #[serde(default = "default_video_seek_preview_width_smallest")]
+    pub smallest: u32,
+    #[serde(default = "default_video_seek_preview_width_small")]
+    pub small: u32,
+    #[serde(default = "default_video_seek_preview_width_medium")]
+    pub medium: u32,
+    #[serde(default = "default_video_seek_preview_width_large")]
+    pub large: u32,
+    #[serde(default = "default_video_seek_preview_width_maximum")]
+    pub maximum: u32,
+}
+
+const fn default_video_seek_preview_width_smallest() -> u32 {
+    176
+}
+const fn default_video_seek_preview_width_small() -> u32 {
+    229
+}
+const fn default_video_seek_preview_width_medium() -> u32 {
+    282
+}
+const fn default_video_seek_preview_width_large() -> u32 {
+    352
+}
+const fn default_video_seek_preview_width_maximum() -> u32 {
+    704
+}
+
+impl Default for VideoSeekPreviewSizeValues {
+    fn default() -> Self {
+        Self {
+            smallest: 176,
+            small: 229,
+            medium: 282,
+            large: 352,
+            maximum: 704,
+        }
+    }
+}
+
+impl VideoSeekPreviewSizeValues {
+    pub fn points(self, preset: VideoSeekPreviewSize) -> f32 {
+        let stored = match preset {
+            VideoSeekPreviewSize::Maximum => self.maximum,
+            VideoSeekPreviewSize::Large => self.large,
+            VideoSeekPreviewSize::Medium => self.medium,
+            VideoSeekPreviewSize::Small => self.small,
+            VideoSeekPreviewSize::Smallest => self.smallest,
+        };
+        stored.clamp(
+            VIDEO_SEEK_PREVIEW_WIDTH_MIN_POINTS,
+            VIDEO_SEEK_PREVIEW_WIDTH_MAX_POINTS,
+        ) as f32
+    }
+}
+
 impl StillSeekStripHeight {
     pub const ALL: [Self; 5] = [
         Self::Maximum,
@@ -5906,7 +6959,7 @@ fn default_video_seek_strip_waveform_span_secs() -> f64 {
 /// グリッド列数の最小値
 pub const MIN_GRID_COLS: usize = 1;
 /// グリッド列数の最大値
-pub const MAX_GRID_COLS: usize = 10;
+pub const MAX_GRID_COLS: usize = 20;
 pub const FULLSCREEN_JUMP_PERCENT_MIN: u32 = 1;
 pub const FULLSCREEN_JUMP_PERCENT_MAX: u32 = 100;
 pub const FULLSCREEN_JUMP_PERCENT_DEFAULT: u32 = 10;
@@ -5920,6 +6973,7 @@ pub const FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS: f32 = 1.0;
 pub const FULLSCREEN_NAVIGATOR_SIZE_MIN: f32 = 160.0;
 pub const FULLSCREEN_NAVIGATOR_SIZE_MAX: f32 = 520.0;
 pub const FULLSCREEN_NAVIGATOR_SIZE_DEFAULT: f32 = 260.0;
+pub const FULLSCREEN_IMAGE_MARGIN_COLOR_DEFAULT: [u8; 3] = [0, 0, 0];
 pub const RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_MIN: usize = 0;
 pub const RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_MAX: usize = 20;
 pub const RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_DEFAULT: usize = 10;
@@ -6013,6 +7067,9 @@ fn default_active_book_name() -> String {
 fn default_quick_folder_slots() -> [Option<PathBuf>; 2] {
     [None, None]
 }
+fn default_active_quick_folder_slot() -> Option<QuickFolderSlotId> {
+    Some(QuickFolderSlotId::A)
+}
 fn default_quick_folder_recent_folders() -> [Vec<PathBuf>; 2] {
     [Vec::new(), Vec::new()]
 }
@@ -6025,6 +7082,9 @@ fn default_fullscreen_cursor_hide_delay_secs() -> f32 {
 
 fn default_fullscreen_navigator_size() -> f32 {
     FULLSCREEN_NAVIGATOR_SIZE_DEFAULT
+}
+fn default_fullscreen_image_margin_color() -> [u8; 3] {
+    FULLSCREEN_IMAGE_MARGIN_COLOR_DEFAULT
 }
 pub(crate) fn default_folder_tree_pane_width_ratio() -> f32 {
     0.22
@@ -6118,19 +7178,46 @@ pub fn default_exif_hidden_tags() -> Vec<String> {
 }
 pub fn default_image_ext_priority() -> Vec<String> {
     // ロスレス系 > ロッシー系 > RAW 系
-    [
+    let mut priority = [
         "png", "bmp", "gif", "tiff", "tif", // ロスレス
         "webp", "jxl", "avif", "heic", "heif", // モダン (ロッシー/ロスレス混在)
         "jpg", "jpeg", // ロッシー
-        "dng", "cr2", "cr3", "nef", "nrw", "arw", // RAW (現像困難な場合が多い)
-        "srf", "sr2", "raf", "orf", "rw2", "pef", "ptx", "rwl", "iiq",
     ]
     .iter()
     .map(|s| s.to_string())
-    .collect()
+    .collect::<Vec<_>>();
+    priority.extend(
+        crate::raw_format::RAW_EXTENSIONS
+            .iter()
+            .map(|extension| (*extension).to_string()),
+    );
+    priority
+}
+
+/// Complete saved priorities without changing user entries, their casing or their order.
+pub(crate) fn normalize_image_ext_priority(priority: &mut Vec<String>) -> bool {
+    let previous_len = priority.len();
+    for extension in default_image_ext_priority() {
+        if !priority
+            .iter()
+            .any(|saved| saved.eq_ignore_ascii_case(&extension))
+        {
+            priority.push(extension);
+        }
+    }
+    priority.len() != previous_len
+}
+fn default_raw_develop_parallelism() -> u8 {
+    3
 }
 fn default_slideshow_interval() -> f32 {
     3.0
+}
+
+pub(crate) const CLIPBOARD_CAPTURE_MIN_SHORT_SIDE_MAX_PX: u32 = 32768;
+
+fn default_clipboard_capture_min_short_side_px() -> u32 {
+    100
 }
 fn default_slideshow_continuous_wait_secs() -> f32 {
     1.5
@@ -6174,6 +7261,9 @@ pub(crate) fn default_toolbar_aspect_items() -> Vec<ThumbAspect> {
 }
 pub(crate) fn default_toolbar_aspect_auto_visible() -> bool {
     true
+}
+fn default_toolbar_collections_display() -> ToolbarSectionDisplay {
+    ToolbarSectionDisplay::Buttons
 }
 pub(crate) fn default_toolbar_sort_items() -> Vec<SortOrder> {
     SortOrder::all().to_vec()
@@ -6275,6 +7365,7 @@ impl Default for Settings {
             details_size_display_mode: DetailsSizeDisplayMode::default(),
             details_timestamp_show_seconds: false,
             details_row_style: DetailsRowStyle::default(),
+            details_name_colors: crate::details_name_colors::DetailsNameColors::default(),
             details_column_order: Vec::new(),
             details_column_widths: Vec::new(),
             details_rated_at_width: None,
@@ -6326,10 +7417,12 @@ impl Default for Settings {
             thumb_aspect: ThumbAspect::default(),
             thumb_aspect_auto: false,
             favorites: Vec::new(),
+            file_organize_destinations: Vec::new(),
             remember_favorite_view_state: false,
             favorite_view_overlay: None,
             smart_folders: Vec::new(),
             last_folder: None,
+            startup_list_restore: Some(StartupListRestore::default()),
             restore_last_cursor: true,
             last_cursor_name: None,
             last_cursor_rows_above: None,
@@ -6338,18 +7431,24 @@ impl Default for Settings {
             recent_folders: Vec::new(),
             quick_folder_recent_folders: default_quick_folder_recent_folders(),
             quick_folder_slots: default_quick_folder_slots(),
+            active_quick_folder_slot: default_active_quick_folder_slot(),
             quick_folder_drive_current_dirs: default_quick_folder_drive_current_dirs(),
             window_pos: None,
             window_size: None,
             window_maximized: false,
+            always_on_top: false,
             startup_window_state: StartupWindowState::default(),
             parallelism: Parallelism::default(),
+            raw_develop_parallelism: default_raw_develop_parallelism(),
+            raw_brightness: crate::raw::RawBrightness::default(),
             pdf_worker_count: default_pdf_worker_count(),
             prefetch_back: default_prefetch_back(),
             prefetch_forward: default_prefetch_forward(),
             folder_skip_limit: default_folder_skip_limit(),
             show_hidden_files: false,
             sort_order: SortOrder::default(),
+            rating_view_sort: crate::rating_view::RatingViewSort::default(),
+            rating_sort_unrated_position: Default::default(),
             subfolder_expansion_order: SubfolderExpansionOrder::default(),
             subfolder_expansion_max_depth: default_subfolder_expansion_max_depth(),
             subfolder_expansion_filter_kinds: std::collections::BTreeSet::new(),
@@ -6357,6 +7456,7 @@ impl Default for Settings {
             subfolder_expansion_filter_size_preset: None,
             grid_display_order: GridDisplayOrder::default(),
             video_thumbnail_indicator: VideoThumbnailIndicator::default(),
+            audio_thumbnail_indicator: AudioThumbnailIndicator::default(),
             thumb_px: default_thumb_px(),
             text_preview_scale: default_text_preview_scale(),
             text_smart_snap_enabled: true,
@@ -6372,6 +7472,7 @@ impl Default for Settings {
             edit_preview_cache_max_bytes: default_edit_preview_cache_max_bytes(),
             archive_cache_max_bytes: 0,
             archive_file_handling: ArchiveFileHandling::Ask,
+            epub_file_handling: EpubFileHandling::Ask,
             archive_convert_without_dialog: false,
             batch_cache_zip_contents: false,
             batch_cache_pdf_contents: false,
@@ -6382,6 +7483,8 @@ impl Default for Settings {
             gpu_memory_percent: default_gpu_memory_percent(),
             thumb_idle_upgrade: true,
             selection_info_display_mode: SelectionInfoDisplayMode::Tooltip,
+            thumb_show_media_duration: true,
+            thumb_show_resume_meter: true,
             thumb_tooltip_show_filename: true,
             thumb_tooltip_show_image_dimensions: true,
             thumb_tooltip_show_video_duration: true,
@@ -6399,6 +7502,7 @@ impl Default for Settings {
             exif_hidden_tags: default_exif_hidden_tags(),
             skip_zip_if_folder_exists: true,
             skip_archive_if_zip_exists: true,
+            skip_epub_if_pdf_exists: true,
             skip_image_if_video_exists: true,
             skip_duplicate_images: true,
             image_ext_priority: default_image_ext_priority(),
@@ -6407,6 +7511,10 @@ impl Default for Settings {
             slideshow_continuous_scroll_secs: default_slideshow_continuous_scroll_secs(),
             slideshow_continuous_scroll_percent: default_slideshow_continuous_scroll_percent(),
             slideshow_end_action: SlideshowEndAction::default(),
+            clipboard_capture_image_enabled: false,
+            clipboard_capture_html_enabled: false,
+            clipboard_capture_min_short_side_px: default_clipboard_capture_min_short_side_px(),
+            clipboard_capture_output_dir: None,
             capture_output_dir: None,
             capture_format: crate::capture::CaptureFormat::default(),
             bake_stage_book: crate::bake_stage::BakeStage::default(),
@@ -6417,11 +7525,19 @@ impl Default for Settings {
             active_book_name: default_active_book_name(),
             pinned_books: Vec::new(),
             default_spread_mode: SpreadMode::default(),
+            follow_document_reading_direction: false,
             default_reading_flow: ReadingFlow::default(),
             default_reading_direction: ReadingDirection::default(),
+            final_cover_spread_enabled: true,
+            singleton_spread_first_enabled: false,
+            singleton_spread_last_enabled: false,
+            page_after_cover_alone_enabled: false,
+            last_page_alone_enabled: false,
             spread_page_gap_px: default_spread_page_gap_px(),
             continuous_reading_gap_px: default_continuous_reading_gap_px(),
+            fullscreen_image_margin_color: FULLSCREEN_IMAGE_MARGIN_COLOR_DEFAULT,
             fullscreen_fit_mode: FullscreenFitMode::default(),
+            fullscreen_fit_cycle_excluded: Vec::new(),
             fullscreen_fit_no_upscale: false,
             fullscreen_fit_no_downscale: false,
             downscale_smoothing_percent: DOWNSCALE_SMOOTHING_PERCENT_MIN,
@@ -6430,6 +7546,7 @@ impl Default for Settings {
             adjustment_settings_tab: AdjustmentSettingsTab::default(),
             creative_luts: crate::creative_lut::builtin_creative_lut_entries(),
             fullscreen_side_panel_mode: FsSidePanelMode::default(),
+            fullscreen_chrome_suppression: FullscreenChromeSuppression::default(),
             fullscreen_boundary_notice_visible: true,
             fullscreen_processing_status_visible: true,
             fullscreen_prefetch_status_visible: true,
@@ -6441,6 +7558,8 @@ impl Default for Settings {
             still_seek_strip_locked: false,
             still_seek_strip_visible: default_still_seek_strip_visible(),
             still_seek_strip_height: StillSeekStripHeight::default(),
+            still_seek_preview_size: StillSeekPreviewSize::default(),
+            still_seek_preview_size_values: StillSeekPreviewSizeValues::default(),
             still_seek_strip_height_values: StillSeekStripHeightValues::default(),
             still_seek_hover_preview_mode: default_still_seek_hover_preview_mode(),
             still_seek_bar_with_strip: default_still_seek_bar_with_strip(),
@@ -6476,10 +7595,13 @@ impl Default for Settings {
             show_toolbar_smart_folders: true,
             show_toolbar_tags: true,
             folder_tree_pane_visible: false,
+            folder_tree_sort_order: FolderTreeSortOrder::default(),
             folder_tree_pane_width_ratio: default_folder_tree_pane_width_ratio(),
             show_toolbar_folder: true,
             show_toolbar_folder_tree_button: true,
+            show_toolbar_effetune: true,
             show_toolbar_bookshelf: true,
+            show_toolbar_collections: true,
             show_address_bar_history_nav: true,
             show_address_bar_quick_folders: true,
             show_toolbar_parent_button: true,
@@ -6497,6 +7619,7 @@ impl Default for Settings {
             show_location_reading_history: true,
             show_location_rating: true,
             show_location_bookshelf: true,
+            show_location_file_organize_destinations: true,
             show_location_desktop: true,
             show_location_pictures: true,
             show_location_downloads: true,
@@ -6507,6 +7630,7 @@ impl Default for Settings {
             ring_shortcuts: crate::ring_shortcut::RingShortcutSettings::default(),
             rating_filter: default_rating_filter(),
             toolbar_cols_items: default_toolbar_cols_items(),
+            toolbar_cols_20_options_migrated: true,
             toolbar_cols_details_visible: true,
             toolbar_aspect_items: default_toolbar_aspect_items(),
             toolbar_aspect_auto_visible: default_toolbar_aspect_auto_visible(),
@@ -6523,21 +7647,31 @@ impl Default for Settings {
             toolbar_smart_folders_display: ToolbarSectionDisplay::default(),
             toolbar_tags_display: ToolbarSectionDisplay::default(),
             toolbar_bookshelf_display: ToolbarSectionDisplay::default(),
+            toolbar_collections_display: default_toolbar_collections_display(),
+            toolbar_collection_target_id: None,
+            pinned_collections: Vec::new(),
             toolbar_favorites_collapsed: false,
             toolbar_smart_folders_collapsed: false,
             toolbar_tags_collapsed: false,
             toolbar_bookshelf_collapsed: false,
+            toolbar_collections_collapsed: false,
             toolbar_sort_items: default_toolbar_sort_items(),
+            toolbar_sort_size_options_migrated: true,
+            toolbar_sort_name_numeric_desc_options_migrated: true,
+            toolbar_sort_rating_options_migrated: true,
             toolbar_facet_filter_items: default_toolbar_facet_filter_items(),
             toolbar_facet_name_filter_index_stash: None,
             facet_name_filter_width: FacetNameFilterWidth::default(),
             toolbar_section_order: Vec::new(),
             show_toolbar_cols: true,
             show_toolbar_aspect: true,
-            show_toolbar_sort: true,
-            toolbar_section_new_row: Vec::new(),
+            show_toolbar_sort: false,
+            show_facet_sort: true,
+            toolbar_section_new_row: vec![ToolbarSectionId::Folder],
+            toolbar_folder_section_migrated: true,
             toolbar_section_drag_enabled: false,
             menu_layout: crate::keymap::MenuLayoutSettings::default(),
+            context_menu_layout: crate::context_menu_model::ContextMenuLayoutSettings::default(),
             keymap: crate::keymap::KeymapSettings::default(),
             stack_separator: default_stack_separator(),
             stack_script_enabled: false,
@@ -6570,6 +7704,7 @@ impl Default for Settings {
             susie_enabled: true,
             susie_allow_parallel: true,
             minimize_to_tray_on_close: false,
+            skip_offline_change_scan: false,
             pause_indexer_while_minimized: false,
             write_rating_to_xmp: false,
             update_check_enabled: true,
@@ -6595,6 +7730,8 @@ impl Default for Settings {
             video_seek_strip_last_choice: VideoSeekStripMode::default(),
             video_seek_strip_span: crate::video::seek_strip_layout::SeekStripSpan::default(),
             video_seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight::default(),
+            video_seek_preview_size: VideoSeekPreviewSize::default(),
+            video_seek_preview_size_values: VideoSeekPreviewSizeValues::default(),
             video_seek_strip_height_values:
                 crate::video::seek_strip_layout::SeekStripHeightValues::default(),
             video_seek_strip_cycle: crate::video::seek_strip_layout::SeekStripCycleSet::default(),
@@ -6617,6 +7754,8 @@ impl Default for Settings {
             video_anime4k_measurement: None,
             video_preset_slots: crate::creative_lut::VideoPresetSlots::default(),
             video_resume_positions: std::collections::HashMap::new(),
+            video_watched_to_end: std::collections::HashSet::new(),
+            video_audio_track_choices: std::collections::HashMap::new(),
             video_grid_open_starts_from_beginning: false,
             video_nav_resume: ResumeMode::Resume,
             book_open_resume: ResumeMode::Resume,
@@ -6639,6 +7778,11 @@ impl Default for Settings {
             vst3_plugin_path: None,
             vst3_plugin_state: None,
             vst3_gui_visible: true,
+            effetune_pre_limiter_enabled: true,
+            effetune_auto_open_on_video: false,
+            effetune_keep_visible_when_minimized: false,
+            effetune_gui_pos: None,
+            effetune_gui_size: None,
             vst3_video_compact: false,
             vst3_panel_pos: None,
             vst3_chain_slots: Vst3ChainPresetSlots::default(),
@@ -6864,7 +8008,21 @@ fn try_parse_settings_file(path: &Path) -> LoadFileResult {
             return LoadFileResult::ParseError;
         }
     };
-    match serde_json::from_str::<Settings>(text) {
+    let parsed = serde_json::from_str::<serde_json::Value>(text).and_then(|mut value| {
+        if let Some(map) = value.as_object_mut() {
+            if let Some(legacy) = map
+                .get("singleton_spread_placement_enabled")
+                .and_then(serde_json::Value::as_bool)
+            {
+                map.entry("singleton_spread_first_enabled")
+                    .or_insert(serde_json::Value::Bool(legacy));
+                map.entry("singleton_spread_last_enabled")
+                    .or_insert(serde_json::Value::Bool(legacy));
+            }
+        }
+        serde_json::from_value::<Settings>(value)
+    });
+    match parsed {
         Ok(s) => LoadFileResult::Ok(s),
         Err(e) => {
             settings_diag_log(&format!(
@@ -7097,6 +8255,33 @@ pub(crate) fn legacy_json_family_presence(data_dir: &Path) -> crate::settings_db
 // migration / decision tree は data_dir 引数を唯一の真として `data_dir.join("settings.json")`
 // を使うので、`data_dir::get()` 経由のパス計算は不要になった。
 
+impl Settings {
+    /// Released values do not say whether the book's list was ever shown. Preserve that first
+    /// destination once; subsequent loads must never project the changing legacy carrier again.
+    pub(crate) fn migrate_startup_list_restore(&mut self) -> bool {
+        if self.startup_list_restore.is_some() {
+            return false;
+        }
+        let target = match self.last_folder.as_ref() {
+            None => StartupListTarget::Unavailable,
+            Some(path) if path.as_os_str().is_empty() => StartupListTarget::DriveList,
+            Some(path) => StartupListTarget::PhysicalList {
+                logical_path: path.clone(),
+                zip_prefix: None,
+            },
+        };
+        let cursor = matches!(target, StartupListTarget::PhysicalList { .. })
+            .then(|| self.last_cursor_name.as_ref())
+            .flatten()
+            .map(|name| ListCursorHint {
+                name: name.clone(),
+                rows_above: self.last_cursor_rows_above,
+            });
+        self.startup_list_restore = Some(StartupListRestore::V1 { target, cursor });
+        true
+    }
+}
+
 /// `Settings::load()` 経路で適用される **load-time migrations** を、外部呼び出し用に
 /// 公開した版 (Codex P2 v8b-1 2026-05-14)。Phase 2 の JSON migration はこの関数を
 /// 介して読み込んだ Settings を正規化してから SQLite に書き込む必要がある。
@@ -7106,13 +8291,22 @@ pub(crate) fn legacy_json_family_presence(data_dir: &Path) -> crate::settings_db
 /// - video_loop=true の旧 bool が video_loop_mode に伝搬しない
 ///
 /// `Settings::load()` の中身と同じ migrations を呼ぶ:
+/// 0. `migrate_startup_list_restore` (released last_folder の一度だけの移行)
 /// 1. `migrate_vst3_legacy`
 /// 2. `migrate_legacy_video_loop`
-/// 3. `sanitize` (favorites の nil UUID 発行、video_volume クランプ等)
+/// 3. `migrate_legacy_archive_file_handling`
+/// 4. ツールバーの列数・ソート候補・フォルダセクションの一度きりの補完
+/// 5. `sanitize` (favorites の nil UUID 発行、video_volume クランプ等)
 pub(crate) fn apply_load_time_migrations(settings: &mut Settings) {
+    settings.migrate_startup_list_restore();
     settings.migrate_vst3_legacy();
     settings.migrate_legacy_video_loop();
     settings.migrate_legacy_archive_file_handling();
+    settings.migrate_toolbar_cols_20_options();
+    settings.migrate_toolbar_sort_size_options();
+    settings.migrate_toolbar_sort_name_numeric_desc_options();
+    settings.migrate_toolbar_sort_rating_options();
+    settings.migrate_toolbar_folder_section();
     settings.sanitize();
 }
 
@@ -7586,6 +8780,22 @@ impl Settings {
             .resolved(self.archive_convert_without_dialog)
     }
 
+    pub fn epub_convert_suppresses_confirm(&self) -> bool {
+        self.epub_file_handling == EpubFileHandling::Convert
+    }
+
+    pub fn epub_file_handling_ignores_epub(&self) -> bool {
+        self.epub_file_handling == EpubFileHandling::Ignore
+    }
+
+    pub fn epub_file_handling_ignores_path(&self, path: &std::path::Path) -> bool {
+        self.epub_file_handling_ignores_epub()
+            && path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+    }
+
     pub fn archive_convert_suppresses_confirm(&self) -> bool {
         self.archive_file_handling_resolved() == ArchiveFileHandling::Convert
     }
@@ -7701,6 +8911,94 @@ impl Settings {
         true
     }
 
+    /// 保存済みの旧既定 1〜10 だけを一度 1〜20 へ補完する。
+    /// 部分集合や並び替え済みの配列は利用者の選択として保持する。
+    fn migrate_toolbar_cols_20_options(&mut self) -> bool {
+        if self.toolbar_cols_20_options_migrated {
+            return false;
+        }
+        const LEGACY_DEFAULT_COLS: [usize; 10] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        if self.toolbar_cols_items == LEGACY_DEFAULT_COLS {
+            self.toolbar_cols_items = (1..=20).collect();
+        }
+        self.toolbar_cols_20_options_migrated = true;
+        true
+    }
+
+    /// 一覧サイズ順を追加する前の既定4候補を、保存世代ごとに一度だけ6候補へ補完する。
+    /// markerを別に持つことで、移行後に利用者がサイズ2候補だけを非表示にした同じ4値を
+    /// 次回loadで再び既定扱いしない。
+    fn migrate_toolbar_sort_size_options(&mut self) -> bool {
+        if self.toolbar_sort_size_options_migrated {
+            return false;
+        }
+        const LEGACY_DEFAULT_SORT_ITEMS: [SortOrder; 4] = [
+            SortOrder::FileName,
+            SortOrder::Numeric,
+            SortOrder::DateAsc,
+            SortOrder::DateDesc,
+        ];
+        if self.toolbar_sort_items == LEGACY_DEFAULT_SORT_ITEMS {
+            self.toolbar_sort_items = vec![
+                SortOrder::FileName,
+                SortOrder::Numeric,
+                SortOrder::DateAsc,
+                SortOrder::DateDesc,
+                SortOrder::SizeAsc,
+                SortOrder::SizeDesc,
+            ];
+        }
+        self.toolbar_sort_size_options_migrated = true;
+        true
+    }
+
+    /// 名前 / 番号の降順を追加する前の既定6候補だけを、保存世代ごとに一度だけ8候補へ補完する。
+    fn migrate_toolbar_sort_name_numeric_desc_options(&mut self) -> bool {
+        if self.toolbar_sort_name_numeric_desc_options_migrated {
+            return false;
+        }
+        const LEGACY_DEFAULT_SORT_ITEMS: [SortOrder; 6] = [
+            SortOrder::FileName,
+            SortOrder::Numeric,
+            SortOrder::DateAsc,
+            SortOrder::DateDesc,
+            SortOrder::SizeAsc,
+            SortOrder::SizeDesc,
+        ];
+        if self.toolbar_sort_items == LEGACY_DEFAULT_SORT_ITEMS {
+            self.toolbar_sort_items = SortOrder::collection_options().to_vec();
+        }
+        self.toolbar_sort_name_numeric_desc_options_migrated = true;
+        true
+    }
+
+    fn migrate_toolbar_sort_rating_options(&mut self) -> bool {
+        if self.toolbar_sort_rating_options_migrated {
+            return false;
+        }
+        if self.toolbar_sort_items == SortOrder::collection_options() {
+            self.toolbar_sort_items = default_toolbar_sort_items();
+        }
+        self.toolbar_sort_rating_options_migrated = true;
+        true
+    }
+
+    fn migrate_toolbar_folder_section(&mut self) -> bool {
+        if self.toolbar_folder_section_migrated {
+            return false;
+        }
+        self.toolbar_section_order =
+            ToolbarSectionId::ordered_with_fallback(&self.toolbar_section_order);
+        if !self
+            .toolbar_section_new_row
+            .contains(&ToolbarSectionId::Folder)
+        {
+            self.toolbar_section_new_row.push(ToolbarSectionId::Folder);
+        }
+        self.toolbar_folder_section_migrated = true;
+        true
+    }
+
     /// `Settings::load()` と同じロードを行い、起動経路など load-time の判定材料も返す。
     ///
     /// 通常は `load()` を使う。main thread の起動処理だけが、リリース済み入力挙動の
@@ -7740,6 +9038,7 @@ impl Settings {
         let autoplay_mode_migrated =
             settings.video_autoplay_mode == VideoAutoplayMode::OnlyFromGrid;
         let video_volume_before_sanitize = settings.video_volume;
+        let image_ext_priority_len_before_sanitize = settings.image_ext_priority.len();
         let video_playback_speed_before_sanitize = settings.video_playback_speed;
         let video_seek_thumbnail_tolerance_before_sanitize =
             settings.video_seek_thumbnail_tolerance_secs;
@@ -7747,11 +9046,23 @@ impl Settings {
             settings.video_seek_strip_min_interval_secs;
         let video_seek_strip_waveform_span_before_sanitize =
             settings.video_seek_strip_waveform_span_secs;
+        let startup_list_restore_migrated = settings.migrate_startup_list_restore();
         let vst3_migrated = settings.migrate_vst3_legacy();
         let video_loop_migrated = settings.migrate_legacy_video_loop();
         let archive_file_handling_migrated = settings.migrate_legacy_archive_file_handling();
+        let toolbar_cols_20_options_migrated = settings.migrate_toolbar_cols_20_options();
+        let toolbar_sort_size_options_migrated = settings.migrate_toolbar_sort_size_options();
+        let toolbar_sort_name_numeric_desc_options_migrated =
+            settings.migrate_toolbar_sort_name_numeric_desc_options();
+        let toolbar_sort_rating_options_migrated = settings.migrate_toolbar_sort_rating_options();
+        let toolbar_folder_section_migrated = settings.migrate_toolbar_folder_section();
         settings.sanitize();
         let legacy_keymap_ini_path = data_dir.join("keymap.ini");
+        let keymap_span =
+            miv_startup::span(miv_startup::Lane::Core, miv_startup::Stage::SettingsKeymap)
+                .watched_optional(miv_startup::watch_handle(
+                    miv_startup::WatchSlot::CoreStartup,
+                ));
         let legacy_keymap_import =
             if db_loaded && !MAIN_UNREADABLE_THIS_SESSION.load(Ordering::Relaxed) {
                 settings
@@ -7760,6 +9071,15 @@ impl Settings {
             } else {
                 crate::keymap::LegacyKeymapIniImport::default()
             };
+        keymap_span.finish(
+            if !db_loaded || MAIN_UNREADABLE_THIS_SESSION.load(Ordering::Relaxed) {
+                miv_startup::Outcome::Skipped
+            } else if legacy_keymap_import.warnings.is_empty() {
+                miv_startup::Outcome::Ok
+            } else {
+                miv_startup::Outcome::Error
+            },
+        );
         if legacy_keymap_import.imported {
             settings_diag_log("settings: legacy keymap.ini imported into settings; backup pending");
         }
@@ -7823,9 +9143,12 @@ impl Settings {
             current_version,
         );
         let prev_version = settings.last_seen_version.clone();
-        let version_changed = prev_version.as_deref() != Some(current_version);
-        if version_changed && db_loaded {
-            let prev_label = prev_version.as_deref().unwrap_or("unknown");
+        let version_marker_changed = prev_version.as_deref() != Some(current_version);
+        let actual_version_change = prev_version
+            .as_deref()
+            .is_some_and(|previous| previous != current_version);
+        if actual_version_change && db_loaded {
+            let prev_label = prev_version.as_deref().expect("checked Some above");
             let pre_path = data_dir.join(format!(
                 "settings.db.preupgrade-v{}",
                 safe_version_label(prev_label)
@@ -7856,6 +9179,10 @@ impl Settings {
                     )),
                 }
             }
+        }
+        if version_marker_changed && db_loaded {
+            // Clean install has no previous version to snapshot. Record the current marker through
+            // the bootstrap save so later launches can distinguish a real version transition.
             settings.last_seen_version = Some(current_version.to_string());
         }
 
@@ -7872,10 +9199,13 @@ impl Settings {
         // `save_internal_no_rotation` を使う。spec §6.1 で rotation は「**user** save の
         // 最初の 1 回」と定義されており、`load()` 内の migration/version 書き戻しで
         // rotation を消費すると次の真の user save が in-place 書込みになってしまう。
-        let bootstrap_save_needed = vst3_migrated
+        let bootstrap_save_needed = startup_list_restore_migrated
+            || vst3_migrated
+            || settings.image_ext_priority.len() != image_ext_priority_len_before_sanitize
             || autoplay_mode_migrated
             || video_loop_migrated
             || archive_file_handling_migrated
+            || toolbar_cols_20_options_migrated
             || video_volume_sanitized
             || video_playback_speed_sanitized
             || video_seek_thumbnail_tolerance_sanitized
@@ -7884,17 +9214,31 @@ impl Settings {
             || mouse_nav_clean_install_defaulted
             || grid_click_selection_mode_migrated
             || ai_prefetch_forward_migrated
+            || toolbar_sort_size_options_migrated
+            || toolbar_sort_name_numeric_desc_options_migrated
+            || toolbar_sort_rating_options_migrated
+            || toolbar_folder_section_migrated
             || legacy_keymap_import.changed
-            || version_changed;
+            || version_marker_changed;
         let bootstrap_saved = if bootstrap_save_needed {
             settings.save_internal_no_rotation()
         } else {
             false
         };
         if bootstrap_saved && legacy_keymap_import.imported {
+            let keymap_span =
+                miv_startup::span(miv_startup::Lane::Core, miv_startup::Stage::SettingsKeymap)
+                    .watched_optional(miv_startup::watch_handle(
+                        miv_startup::WatchSlot::CoreStartup,
+                    ));
             let legacy_keymap_backup = settings
                 .keymap
                 .rename_imported_legacy_ini(&legacy_keymap_ini_path);
+            keymap_span.finish(if legacy_keymap_backup.warnings.is_empty() {
+                miv_startup::Outcome::Ok
+            } else {
+                miv_startup::Outcome::Error
+            });
             if let Some(path) = legacy_keymap_backup.backup_path.as_ref() {
                 settings_diag_log(&format!(
                     "settings: legacy keymap.ini backup saved {}",
@@ -8249,11 +9593,47 @@ impl Settings {
         self.details_selection_bar_name_width = self.details_name_width;
     }
 
+    pub fn set_fullscreen_fit_cycle_enabled(
+        &mut self,
+        mode: FullscreenFitMode,
+        enabled: bool,
+    ) -> bool {
+        if !FullscreenFitMode::all().contains(&mode)
+            || mode.cycle_enabled(&self.fullscreen_fit_cycle_excluded) == enabled
+        {
+            return false;
+        }
+        if enabled {
+            self.fullscreen_fit_cycle_excluded
+                .retain(|id| id != mode.cycle_id());
+        } else {
+            if FullscreenFitMode::all()
+                .iter()
+                .filter(|mode| mode.cycle_enabled(&self.fullscreen_fit_cycle_excluded))
+                .count()
+                <= 1
+            {
+                return false;
+            }
+            self.fullscreen_fit_cycle_excluded
+                .push(mode.cycle_id().to_owned());
+        }
+        true
+    }
+
     /// 読み込んだ設定値を安全範囲に補正する (JSON 手編集で範囲外の値が入った場合の防衛)。
     /// お気に入りの UUID マイグレーションもここで行う。
     fn sanitize(&mut self) {
+        if FullscreenFitMode::all()
+            .iter()
+            .all(|mode| !mode.cycle_enabled(&self.fullscreen_fit_cycle_excluded))
+        {
+            self.set_fullscreen_fit_cycle_enabled(FullscreenFitMode::all()[0], true);
+        }
+        normalize_image_ext_priority(&mut self.image_ext_priority);
         self.restore_post_filter_variants_after_load();
         self.restore_toolbar_name_filter_after_load();
+        self.folder_thumb_sort = self.folder_thumb_sort.sanitized_for_folder_thumb();
         self.text_contrast = self.text_contrast.normalized();
         self.ui_scale_factor = normalize_ui_scale_factor(self.ui_scale_factor);
         self.ui_font.sanitize();
@@ -8272,6 +9652,14 @@ impl Settings {
         );
         self.sns_split_frame_ratio = Some(sns_split_frame_ratio.stable_key().to_owned());
         self.grid_display_order.normalize();
+        // Collection は本棚と同じく全件 ComboBox を常設し、固定分だけをボタン表示する。
+        // 旧 compact Dropdown と将来値は読み込めるまま、Buttons 表示へ正規化する。
+        if matches!(
+            self.toolbar_collections_display,
+            ToolbarSectionDisplay::Dropdown | ToolbarSectionDisplay::Unknown
+        ) {
+            self.toolbar_collections_display = ToolbarSectionDisplay::Buttons;
+        }
         self.subfolder_expansion_filter_kinds.retain(|kind| {
             matches!(
                 kind,
@@ -8445,6 +9833,9 @@ impl Settings {
         } else {
             FULLSCREEN_NAVIGATOR_SIZE_DEFAULT
         };
+        self.clipboard_capture_min_short_side_px = self
+            .clipboard_capture_min_short_side_px
+            .min(CLIPBOARD_CAPTURE_MIN_SHORT_SIDE_MAX_PX);
         self.retained_final_ai_cache_max_entries = self.retained_final_ai_cache_max_entries.clamp(
             RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_MIN,
             RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_MAX,
@@ -8540,6 +9931,7 @@ impl Settings {
         self.facet_name_filter_width = self.facet_name_filter_width.normalized();
         self.grid_click_selection_mode = self.grid_click_selection_mode.normalized();
         self.video_thumbnail_indicator = self.video_thumbnail_indicator.normalized();
+        self.audio_thumbnail_indicator = self.audio_thumbnail_indicator.normalized();
         // grid_open_selected_item_on_click / grid_cursor_wrap は bool のため不正値を持たない。
         // 旧設定の欠落は serde default で false に補い、sanitize では読み込んだ ON/OFF を
         // そのまま維持する。
@@ -8695,6 +10087,7 @@ impl Settings {
         self.thumb_aspect = src.thumb_aspect;
         self.thumb_aspect_auto = src.thumb_aspect_auto;
         self.sort_order = src.sort_order;
+        self.rating_view_sort = src.rating_view_sort;
         self.subfolder_expansion_order = src.subfolder_expansion_order;
         self.subfolder_expansion_max_depth = src.subfolder_expansion_max_depth;
         self.subfolder_expansion_filter_kinds = src.subfolder_expansion_filter_kinds.clone();
@@ -8702,6 +10095,7 @@ impl Settings {
         self.subfolder_expansion_filter_size_preset = src.subfolder_expansion_filter_size_preset;
         self.rating_filter = src.rating_filter;
         self.folder_tree_pane_visible = src.folder_tree_pane_visible;
+        self.folder_tree_sort_order = src.folder_tree_sort_order;
         self.folder_tree_pane_width_ratio = src.folder_tree_pane_width_ratio;
         // UI 表示倍率は設定メニューから即時変更するため、環境設定ダイアログを開いたまま
         // 変更しても OK 押下時の古い snapshot で巻き戻さない。
@@ -8713,11 +10107,14 @@ impl Settings {
         self.show_toolbar_cols = src.show_toolbar_cols;
         self.show_toolbar_aspect = src.show_toolbar_aspect;
         self.show_toolbar_sort = src.show_toolbar_sort;
+        self.show_facet_sort = src.show_facet_sort;
         self.show_toolbar_favorites = src.show_toolbar_favorites;
         self.show_toolbar_smart_folders = src.show_toolbar_smart_folders;
         self.show_toolbar_tags = src.show_toolbar_tags;
         self.show_toolbar_folder_tree_button = src.show_toolbar_folder_tree_button;
+        self.show_toolbar_effetune = src.show_toolbar_effetune;
         self.show_toolbar_bookshelf = src.show_toolbar_bookshelf;
+        self.show_toolbar_collections = src.show_toolbar_collections;
         self.show_toolbar_rating = src.show_toolbar_rating;
         self.show_toolbar_facet_filter = src.show_toolbar_facet_filter;
         self.toolbar_cols_display = src.toolbar_cols_display;
@@ -8727,21 +10124,31 @@ impl Settings {
         self.toolbar_smart_folders_display = src.toolbar_smart_folders_display;
         self.toolbar_tags_display = src.toolbar_tags_display;
         self.toolbar_bookshelf_display = src.toolbar_bookshelf_display;
+        self.toolbar_collections_display = src.toolbar_collections_display;
+        self.toolbar_collection_target_id = src.toolbar_collection_target_id;
+        self.pinned_collections = std::mem::take(&mut src.pinned_collections);
         self.toolbar_favorites_collapsed = src.toolbar_favorites_collapsed;
         self.toolbar_smart_folders_collapsed = src.toolbar_smart_folders_collapsed;
         self.toolbar_tags_collapsed = src.toolbar_tags_collapsed;
         self.toolbar_bookshelf_collapsed = src.toolbar_bookshelf_collapsed;
+        self.toolbar_collections_collapsed = src.toolbar_collections_collapsed;
         self.toolbar_cols_items = std::mem::take(&mut src.toolbar_cols_items);
+        self.toolbar_cols_20_options_migrated = src.toolbar_cols_20_options_migrated;
         self.toolbar_cols_details_visible = src.toolbar_cols_details_visible;
         self.toolbar_aspect_items = std::mem::take(&mut src.toolbar_aspect_items);
         self.toolbar_aspect_auto_visible = src.toolbar_aspect_auto_visible;
         self.toolbar_sort_items = std::mem::take(&mut src.toolbar_sort_items);
+        self.toolbar_sort_size_options_migrated = src.toolbar_sort_size_options_migrated;
+        self.toolbar_sort_name_numeric_desc_options_migrated =
+            src.toolbar_sort_name_numeric_desc_options_migrated;
+        self.toolbar_sort_rating_options_migrated = src.toolbar_sort_rating_options_migrated;
         self.toolbar_facet_filter_items = std::mem::take(&mut src.toolbar_facet_filter_items);
         self.toolbar_facet_name_filter_index_stash =
             src.toolbar_facet_name_filter_index_stash.take();
         self.facet_name_filter_width = src.facet_name_filter_width;
         self.toolbar_section_order = std::mem::take(&mut src.toolbar_section_order);
         self.toolbar_section_new_row = std::mem::take(&mut src.toolbar_section_new_row);
+        self.toolbar_folder_section_migrated = src.toolbar_folder_section_migrated;
         self.toolbar_section_drag_enabled = src.toolbar_section_drag_enabled;
         // ── 操作カスタマイズ (設定メニューの専用ダイアログで編集) ──
         // 環境設定を開いたままキー / 右ドラッグ / リング / ジェスチャ設定を変更して OK した場合、
@@ -8771,6 +10178,7 @@ impl Settings {
         self.show_location_reading_history = src.show_location_reading_history;
         self.show_location_rating = src.show_location_rating;
         self.show_location_bookshelf = src.show_location_bookshelf;
+        // 整理先の表示切替は環境設定でも編集するため draft 値を維持する。
         self.show_location_desktop = src.show_location_desktop;
         self.show_location_pictures = src.show_location_pictures;
         self.show_location_downloads = src.show_location_downloads;
@@ -8797,6 +10205,7 @@ impl Settings {
         self.batch_cache_pdf_contents = src.batch_cache_pdf_contents;
         // ── ウィンドウ / ナビゲーション状態 ──
         self.last_folder = src.last_folder.take();
+        self.startup_list_restore = src.startup_list_restore.take();
         // カーソル名は `last_folder` と対の実行時状態。環境設定 OK の全体差し替えで
         // 片方だけ live 値、片方だけダイアログ側の値になると対応が崩れる。
         self.last_cursor_name = src.last_cursor_name.take();
@@ -8804,6 +10213,7 @@ impl Settings {
         self.recent_folders = std::mem::take(&mut src.recent_folders);
         self.quick_folder_recent_folders = std::mem::take(&mut src.quick_folder_recent_folders);
         self.quick_folder_slots = std::mem::take(&mut src.quick_folder_slots);
+        self.active_quick_folder_slot = src.active_quick_folder_slot;
         self.quick_folder_drive_current_dirs =
             std::mem::take(&mut src.quick_folder_drive_current_dirs);
         self.window_pos = src.window_pos;
@@ -8811,6 +10221,7 @@ impl Settings {
         // 最大化 flag は環境設定に出さない実行時状態。`startup_window_state` の方は
         // 利用者が編集する設定なので、ここで live 値へ巻き戻してはいけない。
         self.window_maximized = src.window_maximized;
+        self.always_on_top = src.always_on_top;
         self.detached_viewer_enabled = src.detached_viewer_enabled;
         self.detached_viewer_window_placement = src.detached_viewer_window_placement;
         // お気に入り表示 overlay は runtime 状態。環境設定を開いている間に viewer context
@@ -8848,6 +10259,8 @@ impl Settings {
         // self → state へ移送する。これで preferences OK で巻き戻る不具合を回避する
         // (Codex P3 2026-05-01)。
         // legacy migration field (deprecated path/state) のみ App 側を残す。
+        self.effetune_gui_pos = src.effetune_gui_pos;
+        self.effetune_gui_size = src.effetune_gui_size;
         for entry in self.vst3_plugins.iter_mut() {
             if let Some(latest) = src.vst3_plugins.iter().find(|e| e.path == entry.path) {
                 entry.bypass = latest.bypass;
@@ -9023,7 +10436,350 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn details_name_colors_legacy_missing_and_sqlite_roundtrip() {
+        use crate::details_name_colors::{DetailsNameColor, DetailsNameColors};
+        let old: Settings = serde_json::from_str(r#"{"details_name_width":222.0}"#).unwrap();
+        assert_eq!(old.details_name_colors, DetailsNameColors::default());
+        assert_eq!(old.details_name_width, 222.0);
+        let mut settings = old;
+        settings.details_name_colors.enabled = false;
+        settings.details_name_colors.colors[0] = DetailsNameColor::Custom {
+            light: [90, 60, 0],
+            dark: [214, 186, 102],
+        };
+        settings.text_contrast = TextContrast::Strong;
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::settings_db::SettingsDb::create_new(tmp.path()).unwrap();
+        db.save_full(&settings).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert_eq!(loaded.details_name_colors, settings.details_name_colors);
+        assert_eq!(loaded.text_contrast, TextContrast::Strong);
+        assert_eq!(loaded.details_name_width, 222.0);
+        drop(db);
+        let conn = rusqlite::Connection::open(tmp.path().join("settings.db")).unwrap();
+        conn.execute(
+            "DELETE FROM settings_kv WHERE key = 'details_name_colors'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let db = crate::settings_db::SettingsDb::open(tmp.path()).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert_eq!(loaded.details_name_colors, DetailsNameColors::default());
+        assert_eq!(loaded.details_name_width, 222.0);
+        assert_eq!(loaded.text_contrast, TextContrast::Strong);
+    }
+
+    #[test]
+    fn thumb_show_resume_meter_defaults_on_and_preserves_disabled_setting() {
+        assert!(Settings::default().thumb_show_resume_meter);
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert!(missing.thumb_show_resume_meter);
+        let disabled: Settings =
+            serde_json::from_str(r#"{"thumb_show_resume_meter":false}"#).unwrap();
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&disabled).unwrap()).unwrap();
+        assert!(!restored.thumb_show_resume_meter);
+    }
+
+    #[test]
+    fn thumb_show_resume_meter_missing_db_key_defaults_on() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = crate::settings_db::SettingsDb::create_new(temp.path()).unwrap();
+        db.save_full(&Settings::default()).unwrap();
+        drop(db);
+        let conn = rusqlite::Connection::open(temp.path().join("settings.db")).unwrap();
+        conn.execute(
+            "DELETE FROM settings_kv WHERE key = 'thumb_show_resume_meter'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let db = crate::settings_db::SettingsDb::open(temp.path()).unwrap();
+        assert!(db.load_into_settings().unwrap().thumb_show_resume_meter);
+    }
+
+    #[test]
+    fn thumb_show_media_duration_defaults_on_and_preserves_disabled_setting() {
+        assert!(Settings::default().thumb_show_media_duration);
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert!(old.thumb_show_media_duration);
+        let disabled: Settings =
+            serde_json::from_str(r#"{"thumb_show_media_duration":false}"#).unwrap();
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&disabled).unwrap()).unwrap();
+        assert!(!restored.thumb_show_media_duration);
+    }
+
+    #[test]
+    fn thumb_show_media_duration_missing_db_key_defaults_on_and_false_roundtrips() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = crate::settings_db::SettingsDb::create_new(temp.path()).unwrap();
+        db.save_full(&Settings::default()).unwrap();
+        drop(db);
+        let conn = rusqlite::Connection::open(temp.path().join("settings.db")).unwrap();
+        conn.execute(
+            "DELETE FROM settings_kv WHERE key = 'thumb_show_media_duration'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let db = crate::settings_db::SettingsDb::open(temp.path()).unwrap();
+        let mut loaded = db.load_into_settings().unwrap();
+        assert!(loaded.thumb_show_media_duration);
+        loaded.thumb_show_media_duration = false;
+        db.save_full(&loaded).unwrap();
+        drop(db);
+        let reopened = crate::settings_db::SettingsDb::open(temp.path()).unwrap();
+        assert!(
+            !reopened
+                .load_into_settings()
+                .unwrap()
+                .thumb_show_media_duration
+        );
+    }
+
     use super::*;
+
+    fn released_image_ext_priority() -> Vec<String> {
+        // Literal master/v4.2.0 default: 12 other image formats and 15 RAW formats.
+        [
+            "png", "bmp", "gif", "tiff", "tif", "webp", "jxl", "avif", "heic", "heif", "jpg",
+            "jpeg", "dng", "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf", "rw2",
+            "pef", "ptx", "rwl", "iiq",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+
+    #[test]
+    fn image_ext_priority_released_default_appends_exactly_eight_raw_formats() {
+        let original = released_image_ext_priority();
+        let mut settings = Settings {
+            image_ext_priority: original.clone(),
+            ..Settings::default()
+        };
+        apply_load_time_migrations(&mut settings);
+        assert_eq!(&settings.image_ext_priority[..original.len()], original);
+        assert_eq!(
+            &settings.image_ext_priority[original.len()..],
+            ["crw", "srw", "3fr", "erf", "kdc", "dcr", "mrw", "mos"]
+        );
+        assert_eq!(settings.image_ext_priority, default_image_ext_priority());
+    }
+
+    #[test]
+    fn image_ext_priority_custom_order_and_entries_survive_completion() {
+        let original = vec![
+            "mos".into(),
+            "custom".into(),
+            "jpg".into(),
+            "png".into(),
+            "jpg".into(),
+        ];
+        let mut settings = Settings {
+            image_ext_priority: original.clone(),
+            ..Settings::default()
+        };
+        apply_load_time_migrations(&mut settings);
+        assert_eq!(&settings.image_ext_priority[..original.len()], original);
+        let expected_tail: Vec<_> = default_image_ext_priority()
+            .into_iter()
+            .filter(|extension| !original.contains(extension))
+            .collect();
+        assert_eq!(
+            &settings.image_ext_priority[original.len()..],
+            expected_tail
+        );
+    }
+
+    #[test]
+    fn image_ext_priority_complete_list_is_unchanged_on_repeated_load_migrations() {
+        let mut original = default_image_ext_priority();
+        original.reverse();
+        original.push("custom".into());
+        let mut settings = Settings {
+            image_ext_priority: original.clone(),
+            ..Settings::default()
+        };
+        for _ in 0..2 {
+            apply_load_time_migrations(&mut settings);
+            assert_eq!(settings.image_ext_priority, original);
+        }
+    }
+
+    #[test]
+    fn image_ext_priority_completion_compares_case_insensitively() {
+        let original = vec!["CRW".into(), "crw".into(), "PNG".into(), "mOs".into()];
+        let mut priority = original.clone();
+        assert!(normalize_image_ext_priority(&mut priority));
+        assert_eq!(&priority[..original.len()], original);
+        let expected_tail: Vec<_> = default_image_ext_priority()
+            .into_iter()
+            .filter(|extension| {
+                !original
+                    .iter()
+                    .any(|saved| saved.eq_ignore_ascii_case(extension))
+            })
+            .collect();
+        assert_eq!(&priority[original.len()..], expected_tail);
+        let completed = priority.clone();
+        assert!(!normalize_image_ext_priority(&mut priority));
+        assert_eq!(priority, completed);
+    }
+
+    #[test]
+    fn image_ext_priority_sqlite_load_persists_completion_without_version_change() {
+        let _env = setup_backup_env();
+        // Finish unrelated first-load migrations so they cannot trigger the writeback for us.
+        let mut old = Settings::load();
+        old.image_ext_priority = released_image_ext_priority();
+        crate::settings_db::with_db_result(|db| db.save_full(&old)).unwrap();
+
+        let loaded = Settings::load_with_meta();
+        assert_eq!(
+            loaded.meta.previous_last_seen_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            loaded.meta.boot_source,
+            crate::settings_db::BootSource::LoadedExistingDb
+        );
+        assert_eq!(
+            loaded.settings.image_ext_priority,
+            default_image_ext_priority()
+        );
+        let stored = crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
+        assert_eq!(
+            stored.image_ext_priority,
+            loaded.settings.image_ext_priority
+        );
+        assert_eq!(
+            Settings::load().image_ext_priority,
+            stored.image_ext_priority
+        );
+    }
+
+    #[test]
+    fn image_ext_priority_json_migration_persists_completion() {
+        let env = setup_backup_env();
+        let old = Settings {
+            image_ext_priority: released_image_ext_priority(),
+            ..Settings::default()
+        };
+        std::fs::write(
+            env._tmp.path().join("settings.json"),
+            serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+        let loaded = Settings::load_with_meta();
+        assert_eq!(
+            loaded.meta.boot_source,
+            crate::settings_db::BootSource::MigratedFromJson
+        );
+        assert_eq!(
+            loaded.settings.image_ext_priority,
+            default_image_ext_priority()
+        );
+        let stored = crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
+        assert_eq!(
+            stored.image_ext_priority,
+            loaded.settings.image_ext_priority
+        );
+    }
+
+    #[test]
+    fn rating_view_sort_defaults_roundtrips_and_survives_preferences_merge() {
+        use crate::rating_view::RatingViewSort;
+
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(missing.rating_view_sort, RatingViewSort::RatedAtDesc);
+        assert_eq!(
+            Settings::default().rating_view_sort,
+            RatingViewSort::RatedAtDesc
+        );
+
+        let mut live = Settings::default();
+        live.rating_view_sort = RatingViewSort::Normal(SortOrder::DateAsc);
+        live.sort_order = SortOrder::FileName;
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&live).unwrap()).unwrap();
+        assert_eq!(
+            restored.rating_view_sort,
+            RatingViewSort::Normal(SortOrder::DateAsc)
+        );
+        assert_eq!(restored.sort_order, SortOrder::FileName);
+
+        let mut stale_draft = Settings::default();
+        stale_draft.overwrite_non_preferences_from(&mut live);
+        assert_eq!(
+            stale_draft.rating_view_sort,
+            RatingViewSort::Normal(SortOrder::DateAsc)
+        );
+    }
+
+    #[test]
+    fn always_on_top_defaults_off_roundtrips_and_survives_preferences_merge() {
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!old.always_on_top);
+        assert_eq!(viewer_window_level(false), egui::WindowLevel::Normal);
+        assert_eq!(viewer_window_level(true), egui::WindowLevel::AlwaysOnTop);
+
+        let mut live = Settings {
+            always_on_top: true,
+            ..Settings::default()
+        };
+        let saved = serde_json::to_string(&live).unwrap();
+        assert!(
+            serde_json::from_str::<Settings>(&saved)
+                .unwrap()
+                .always_on_top
+        );
+        let mut draft = Settings::default();
+        draft.overwrite_non_preferences_from(&mut live);
+        assert!(draft.always_on_top);
+
+        let mut previous =
+            egui::ViewportBuilder::default().with_window_level(viewer_window_level(false));
+        let (commands, _) = previous
+            .patch(egui::ViewportBuilder::default().with_window_level(viewer_window_level(true)));
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(
+            commands[0],
+            egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop)
+        ));
+    }
+
+    #[test]
+    fn page_alone_key_action_writes_opposite_effective_value() {
+        assert!(!Settings::default().page_after_cover_alone_enabled);
+        assert!(!Settings::default().last_page_alone_enabled);
+        let legacy: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.page_after_cover_alone_enabled);
+        assert!(!legacy.last_page_alone_enabled);
+        for global in [false, true] {
+            let selected = PageAlonePreference::FollowGlobal.toggled(global);
+            assert_eq!(
+                selected,
+                if global {
+                    PageAlonePreference::Off
+                } else {
+                    PageAlonePreference::On
+                }
+            );
+            assert_eq!(selected.effective(global), !global);
+        }
+        assert_eq!(
+            PageAlonePreference::On.toggled(false),
+            PageAlonePreference::Off
+        );
+        assert_eq!(
+            PageAlonePreference::Off.toggled(true),
+            PageAlonePreference::On
+        );
+    }
 
     /// ゲームパッドの有効/無効は既定 true。設定を知らない頃のファイルを読んでも、
     /// 既存利用者のパッドを黙って切らない。
@@ -9230,6 +10986,68 @@ mod tests {
         assert_eq!(
             restored.video_seek_bar_with_strip,
             VideoSeekBarWithStrip::Hide
+        );
+    }
+
+    #[test]
+    fn seek_preview_sizes_default_and_round_trip_independently() {
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(missing.still_seek_preview_size, StillSeekPreviewSize::Large);
+        assert_eq!(missing.video_seek_preview_size, VideoSeekPreviewSize::Large);
+        assert_eq!(
+            missing.still_seek_preview_size_values,
+            StillSeekPreviewSizeValues::default()
+        );
+        assert_eq!(
+            missing.video_seek_preview_size_values,
+            VideoSeekPreviewSizeValues::default()
+        );
+        for still in StillSeekPreviewSize::ALL {
+            for video in VideoSeekPreviewSize::ALL {
+                let mut settings = Settings::default();
+                settings.still_seek_preview_size = still;
+                settings.video_seek_preview_size = video;
+                settings.still_seek_preview_size_values.small = 123;
+                settings.video_seek_preview_size_values.maximum = 800;
+                let stored = serde_json::to_value(&settings).unwrap();
+                let loaded: Settings = serde_json::from_value(stored).unwrap();
+                assert_eq!(loaded.still_seek_preview_size, still);
+                assert_eq!(loaded.video_seek_preview_size, video);
+                assert_eq!(loaded.still_seek_preview_size_values.small, 123);
+                assert_eq!(loaded.video_seek_preview_size_values.maximum, 800);
+            }
+        }
+        let partial: Settings = serde_json::from_str(
+            r#"{"still_seek_preview_size_values":{"small":250},"video_seek_preview_size_values":{"maximum":900}}"#,
+        ).unwrap();
+        assert_eq!(partial.still_seek_preview_size_values.small, 250);
+        assert_eq!(partial.still_seek_preview_size_values.large, 180);
+        assert_eq!(partial.video_seek_preview_size_values.maximum, 900);
+        assert_eq!(partial.video_seek_preview_size_values.large, 352);
+        let mut out_of_range = partial;
+        out_of_range.still_seek_preview_size_values.smallest = 1;
+        out_of_range.video_seek_preview_size_values.maximum = 9999;
+        assert_eq!(
+            out_of_range
+                .still_seek_preview_size_values
+                .points(StillSeekPreviewSize::Smallest),
+            STILL_SEEK_PREVIEW_HEIGHT_MIN_POINTS as f32
+        );
+        assert_eq!(
+            out_of_range
+                .video_seek_preview_size_values
+                .points(VideoSeekPreviewSize::Maximum),
+            VIDEO_SEEK_PREVIEW_WIDTH_MAX_POINTS as f32
+        );
+        assert_eq!(out_of_range.still_seek_preview_size_values.smallest, 1);
+        assert_eq!(out_of_range.video_seek_preview_size_values.maximum, 9999);
+        assert!(
+            serde_json::from_str::<Settings>(r#"{"video_seek_preview_size":"future_size"}"#)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<Settings>(r#"{"still_seek_preview_size":"future_size"}"#)
+                .is_err()
         );
     }
 
@@ -9866,6 +11684,33 @@ mod tests {
     // -- Toolbar section order (v2.0.0 Phase 1) --
 
     #[test]
+    fn toolbar_section_render_order_matches_build_flavor_without_changing_saved_order() {
+        use ToolbarSectionId as TS;
+        // 通常版の設定持込み、重複、将来の既定順にも同じ表示制約を適用する。
+        let saved: Vec<TS> =
+            serde_json::from_str(r#"["Tags","EffeTune","Cols","EffeTune","Unknown"]"#).unwrap();
+        let original = saved.clone();
+        for order in [&saved[..], &[][..], TS::default_order()] {
+            let all = TS::ordered_with_fallback(order);
+            let rendered = TS::render_order(order);
+            assert_eq!(
+                rendered.contains(&TS::EffeTune),
+                !cfg!(feature = "portable")
+            );
+            let expected = all
+                .iter()
+                .copied()
+                .filter(|id| *id != TS::EffeTune || !cfg!(feature = "portable"))
+                .collect::<Vec<_>>();
+            assert_eq!(rendered, expected);
+            assert!(!rendered.contains(&TS::Unknown));
+            assert!(all.contains(&TS::EffeTune));
+        }
+        assert_eq!(saved, original);
+        assert_eq!(serde_json::to_value(TS::EffeTune).unwrap(), "EffeTune");
+    }
+
+    #[test]
     fn toolbar_section_order_empty_is_default() {
         let got = ToolbarSectionId::ordered_with_fallback(&[]);
         assert_eq!(got, ToolbarSectionId::default_order().to_vec());
@@ -9951,6 +11796,7 @@ mod tests {
         assert!(s.show_toolbar_cols);
         assert!(s.show_toolbar_aspect);
         assert!(s.show_toolbar_sort);
+        assert!(!s.show_facet_sort);
         assert!(
             s.toolbar_section_new_row.is_empty(),
             "新規 new_row 集合は欠落時 空"
@@ -9965,6 +11811,7 @@ mod tests {
                 && s.show_location_reading_history
                 && s.show_location_rating
                 && s.show_location_bookshelf
+                && s.show_location_file_organize_destinations
                 && s.show_location_desktop
                 && s.show_location_pictures
                 && s.show_location_downloads
@@ -10501,6 +12348,42 @@ mod tests {
         assert_eq!(
             loaded.video_thumbnail_indicator,
             VideoThumbnailIndicator::PlayIcon
+        );
+    }
+
+    #[test]
+    fn audio_thumbnail_indicator_defaults_to_the_music_note_icon() {
+        assert_eq!(
+            Settings::default().audio_thumbnail_indicator,
+            AudioThumbnailIndicator::MusicNoteIcon
+        );
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            loaded.audio_thumbnail_indicator,
+            AudioThumbnailIndicator::MusicNoteIcon
+        );
+        assert_eq!(
+            AudioThumbnailIndicator::all(),
+            &[
+                AudioThumbnailIndicator::MusicNoteIcon,
+                AudioThumbnailIndicator::BottomLeftBadge,
+                AudioThumbnailIndicator::Hidden,
+            ]
+        );
+    }
+
+    #[test]
+    fn audio_thumbnail_indicator_normalizes_unknown_to_the_existing_default() {
+        let mut loaded: Settings =
+            serde_json::from_str(r#"{"audio_thumbnail_indicator":"FutureIndicator"}"#).unwrap();
+        assert_eq!(
+            loaded.audio_thumbnail_indicator,
+            AudioThumbnailIndicator::Unknown
+        );
+        loaded.sanitize();
+        assert_eq!(
+            loaded.audio_thumbnail_indicator,
+            AudioThumbnailIndicator::MusicNoteIcon
         );
     }
 
@@ -11620,7 +13503,19 @@ mod tests {
         persisted.stash_details_place_for_persist();
         persisted.stash_details_page_count_for_persist();
         let json = serde_json::to_string(&persisted).unwrap();
-        assert!(!json.contains("RatedAt"));
+        let persisted_fields: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for key in [
+            "details_sort_key",
+            "details_column_order",
+            "details_column_widths",
+            "details_selection_bar_column_order",
+            "details_selection_bar_column_widths",
+        ] {
+            assert!(
+                !persisted_fields[key].to_string().contains("RatedAt"),
+                "{key} must remain readable by older details settings"
+            );
+        }
 
         let mut loaded: Settings = serde_json::from_str(&json).unwrap();
         loaded.sanitize();
@@ -11731,6 +13626,63 @@ mod tests {
     }
 
     #[test]
+    fn collection_toolbar_defaults_roundtrip_and_old_order_appends_the_new_section() {
+        let defaults = Settings::default();
+        assert!(defaults.show_toolbar_collections);
+        assert_eq!(
+            defaults.toolbar_collections_display,
+            ToolbarSectionDisplay::Buttons
+        );
+        assert!(!defaults.toolbar_collections_collapsed);
+        assert_eq!(
+            ToolbarSectionId::default_order()[2],
+            ToolbarSectionId::Bookshelf
+        );
+        assert_eq!(
+            ToolbarSectionId::default_order()[3],
+            ToolbarSectionId::Collections
+        );
+
+        let old_order = ToolbarSectionId::default_order()
+            .iter()
+            .copied()
+            .filter(|section| *section != ToolbarSectionId::Collections)
+            .collect::<Vec<_>>();
+        let upgraded = ToolbarSectionId::ordered_with_fallback(&old_order);
+        assert_eq!(upgraded[..old_order.len()], old_order);
+        assert_eq!(upgraded.last(), Some(&ToolbarSectionId::Collections));
+
+        let mut customized = Settings::default();
+        customized.show_toolbar_collections = false;
+        customized.toolbar_collections_display = ToolbarSectionDisplay::Collapsible;
+        let target = Uuid::new_v4();
+        customized.toolbar_collection_target_id = Some(target);
+        let pinned = Uuid::new_v4();
+        customized.pinned_collections = vec![pinned];
+        customized.toolbar_collections_collapsed = true;
+        let json = serde_json::to_string(&customized).unwrap();
+        let mut loaded: Settings = serde_json::from_str(&json).unwrap();
+        loaded.sanitize();
+        assert!(!loaded.show_toolbar_collections);
+        assert_eq!(
+            loaded.toolbar_collections_display,
+            ToolbarSectionDisplay::Collapsible
+        );
+        assert_eq!(loaded.toolbar_collection_target_id, Some(target));
+        assert_eq!(loaded.pinned_collections, vec![pinned]);
+        assert!(loaded.toolbar_collections_collapsed);
+
+        let mut compact = Settings::default();
+        compact.toolbar_collections_display = ToolbarSectionDisplay::Dropdown;
+        compact.sanitize();
+        assert_eq!(
+            compact.toolbar_collections_display,
+            ToolbarSectionDisplay::Buttons,
+            "legacy compact collection toolbar values normalize to the bookshelf layout"
+        );
+    }
+
+    #[test]
     fn stack_separator_roundtrips() {
         let mut s = Settings::default();
         s.stack_separator = '-';
@@ -11786,6 +13738,41 @@ mod tests {
         assert!(!json.contains("ヘルプ"));
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.menu_layout, s.menu_layout);
+    }
+
+    #[test]
+    fn context_menu_layout_defaults_when_missing_and_roundtrips_stable_ids() {
+        use crate::context_menu_model::{
+            ContextMenuItemId, ContextMenuLayoutSettings, ContextMenuOrderSettings,
+            ContextMenuParentId, ContextMenuSeparatorBefore, ContextMenuSeparatorSettings,
+        };
+
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            loaded.context_menu_layout,
+            ContextMenuLayoutSettings::default()
+        );
+
+        let mut settings = Settings::default();
+        settings.context_menu_layout = ContextMenuLayoutSettings {
+            order: vec![ContextMenuOrderSettings {
+                parent: ContextMenuParentId::Root.stable_name().to_string(),
+                items: vec![
+                    ContextMenuItemId::Rename.stable_name().to_string(),
+                    ContextMenuItemId::CutFiles.stable_name().to_string(),
+                ],
+            }],
+            hidden_items: vec![ContextMenuItemId::CopyPath.stable_name().to_string()],
+            separators: vec![ContextMenuSeparatorSettings {
+                item: ContextMenuItemId::Rename.stable_name().to_string(),
+                before: ContextMenuSeparatorBefore::Present,
+            }],
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains("Rename"));
+        assert!(!json.contains("名前の変更"));
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.context_menu_layout, settings.context_menu_layout);
     }
 
     // -- Settings defaults --
@@ -12064,6 +14051,7 @@ mod tests {
         );
         assert_eq!(s.archive_cache_max_bytes, 0);
         assert_eq!(s.archive_file_handling, ArchiveFileHandling::Ask);
+        assert_eq!(s.epub_file_handling, EpubFileHandling::Ask);
         assert!(!s.archive_convert_without_dialog);
         assert_eq!(s.thumb_prev_pages, 2);
         assert_eq!(s.thumb_next_pages, 4);
@@ -12071,6 +14059,10 @@ mod tests {
         assert!(s.thumb_idle_upgrade);
         assert_eq!(s.spread_page_gap_px, 4);
         assert_eq!(s.continuous_reading_gap_px, 20);
+        assert_eq!(
+            s.fullscreen_image_margin_color,
+            FULLSCREEN_IMAGE_MARGIN_COLOR_DEFAULT
+        );
         assert_eq!(s.slideshow_interval_secs, 3.0);
         assert_eq!(s.slideshow_continuous_wait_secs, 1.5);
         assert_eq!(s.slideshow_continuous_scroll_secs, 0.2);
@@ -12122,12 +14114,14 @@ mod tests {
         assert!(s.show_toolbar_favorites);
         assert!(s.show_toolbar_tags);
         assert!(!s.folder_tree_pane_visible);
+        assert_eq!(s.folder_tree_sort_order, FolderTreeSortOrder::NameAsc);
         assert_eq!(
             s.folder_tree_pane_width_ratio,
             default_folder_tree_pane_width_ratio()
         );
         assert!(s.show_toolbar_folder);
         assert!(s.show_toolbar_folder_tree_button);
+        assert!(s.show_toolbar_effetune);
         assert!(s.show_toolbar_bookshelf);
         assert!(s.show_address_bar_history_nav);
         assert!(s.show_address_bar_quick_folders);
@@ -12145,6 +14139,7 @@ mod tests {
         assert!(s.show_location_reading_history);
         assert!(s.show_location_rating);
         assert!(s.show_location_bookshelf);
+        assert!(s.show_location_file_organize_destinations);
         assert!(s.show_location_desktop);
         assert!(s.show_location_pictures);
         assert!(s.show_location_downloads);
@@ -12261,6 +14256,20 @@ mod tests {
                 assert_eq!(s.fullfeature_media_window, media_checkbox);
             }
         }
+    }
+
+    #[test]
+    fn effetune_runtime_window_rect_survives_preference_apply() {
+        let mut edited = Settings::default();
+        let mut live = Settings::default();
+        edited.show_toolbar_effetune = false;
+        live.show_toolbar_effetune = true;
+        live.effetune_gui_pos = Some((120, 240));
+        live.effetune_gui_size = Some((900, 700));
+        edited.overwrite_non_preferences_from(&mut live);
+        assert!(edited.show_toolbar_effetune);
+        assert_eq!(edited.effetune_gui_pos, Some((120, 240)));
+        assert_eq!(edited.effetune_gui_size, Some((900, 700)));
     }
 
     #[test]
@@ -12417,6 +14426,68 @@ mod tests {
     }
 
     #[test]
+    fn final_cover_spread_defaults_on_and_book_preference_resolves_explicitly() {
+        let legacy: Settings = serde_json::from_str("{}").unwrap();
+        assert!(legacy.final_cover_spread_enabled);
+        assert!(FinalCoverSpreadPreference::FollowGlobal.effective(true));
+        assert!(!FinalCoverSpreadPreference::FollowGlobal.effective(false));
+        assert!(FinalCoverSpreadPreference::On.effective(false));
+        assert!(!FinalCoverSpreadPreference::Off.effective(true));
+        for preference in [
+            FinalCoverSpreadPreference::FollowGlobal,
+            FinalCoverSpreadPreference::On,
+            FinalCoverSpreadPreference::Off,
+        ] {
+            assert_eq!(
+                FinalCoverSpreadPreference::from_int(preference.to_int()),
+                Some(preference)
+            );
+        }
+        assert_eq!(FinalCoverSpreadPreference::from_int(3), None);
+    }
+
+    #[test]
+    fn singleton_spread_placement_defaults_off_and_book_preference_resolves_explicitly() {
+        let legacy: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.singleton_spread_first_enabled);
+        assert!(!legacy.singleton_spread_last_enabled);
+        assert!(SingletonSpreadPlacementPreference::FollowGlobal.effective(true));
+        assert!(!SingletonSpreadPlacementPreference::FollowGlobal.effective(false));
+        assert!(SingletonSpreadPlacementPreference::Place.effective(false));
+        assert!(!SingletonSpreadPlacementPreference::Center.effective(true));
+        for preference in [
+            SingletonSpreadPlacementPreference::FollowGlobal,
+            SingletonSpreadPlacementPreference::Place,
+            SingletonSpreadPlacementPreference::Center,
+        ] {
+            assert_eq!(
+                SingletonSpreadPlacementPreference::from_int(preference.to_int()),
+                Some(preference)
+            );
+        }
+        assert_eq!(SingletonSpreadPlacementPreference::from_int(3), None);
+        let global = SingletonSpreadEndpointSettings {
+            first: true,
+            last: false,
+        };
+        assert_eq!(
+            SingletonSpreadEndpointPreferences {
+                first: SingletonSpreadPlacementPreference::Center,
+                last: SingletonSpreadPlacementPreference::Place,
+            }
+            .effective(global),
+            SingletonSpreadEndpointSettings {
+                first: false,
+                last: true
+            }
+        );
+        assert_eq!(
+            SingletonSpreadEndpointPreferences::default().effective(global),
+            global
+        );
+    }
+
+    #[test]
     fn spread_mode_with_reading_direction_preserves_cover_phase() {
         assert_eq!(
             SpreadMode::Ltr.with_reading_direction(ReadingDirection::Rtl),
@@ -12443,6 +14514,64 @@ mod tests {
     }
 
     #[test]
+    fn fit_cycle_subset_settings_default_sanitize_and_future_ids() {
+        let mut legacy = serde_json::to_value(Settings::default()).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("fullscreen_fit_cycle_excluded");
+        let old: Settings = serde_json::from_value(legacy).unwrap();
+        assert!(old.fullscreen_fit_cycle_excluded.is_empty());
+
+        let mut settings = Settings::default();
+        for &mode in &[
+            FullscreenFitMode::Page,
+            FullscreenFitMode::Width,
+            FullscreenFitMode::Height,
+        ] {
+            assert!(settings.set_fullscreen_fit_cycle_enabled(mode, false));
+        }
+        assert!(!settings.set_fullscreen_fit_cycle_enabled(FullscreenFitMode::Original, false));
+        assert!(FullscreenFitMode::Original.cycle_enabled(&settings.fullscreen_fit_cycle_excluded));
+        assert!(
+            !settings
+                .fullscreen_fit_cycle_excluded
+                .iter()
+                .any(|id| id == "FutureScale")
+        );
+
+        settings.fullscreen_fit_cycle_excluded = vec![
+            "FutureScale".into(),
+            "Original".into(),
+            "Page".into(),
+            "Width".into(),
+            "Height".into(),
+        ];
+        settings.sanitize();
+        assert!(FullscreenFitMode::Page.cycle_enabled(&settings.fullscreen_fit_cycle_excluded));
+        assert!(
+            !FullscreenFitMode::Original.cycle_enabled(&settings.fullscreen_fit_cycle_excluded)
+        );
+        assert!(
+            settings
+                .fullscreen_fit_cycle_excluded
+                .contains(&"FutureScale".into())
+        );
+        let mut loaded: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        loaded.sanitize();
+        assert_eq!(
+            loaded.fullscreen_fit_cycle_excluded,
+            settings.fullscreen_fit_cycle_excluded
+        );
+        let future_only = vec!["FutureScale".to_owned()];
+        assert_eq!(
+            FullscreenFitMode::Page.next_for_flow(ReadingFlow::Paged, &future_only),
+            FullscreenFitMode::Width
+        );
+    }
+
+    #[test]
     fn fullscreen_fit_mode_cycles_exclude_legacy_margin_fit() {
         assert_eq!(
             FullscreenFitMode::default_for_flow(ReadingFlow::Paged),
@@ -12457,11 +14586,11 @@ mod tests {
             FullscreenFitMode::Height
         );
         assert_eq!(
-            FullscreenFitMode::Page.next_for_flow(ReadingFlow::Paged),
+            FullscreenFitMode::Page.next_for_flow(ReadingFlow::Paged, &[]),
             FullscreenFitMode::Width
         );
         assert_eq!(
-            FullscreenFitMode::Page.next_for_flow(ReadingFlow::Vertical),
+            FullscreenFitMode::Page.next_for_flow(ReadingFlow::Vertical, &[]),
             FullscreenFitMode::Width
         );
         assert_eq!(
@@ -12483,7 +14612,7 @@ mod tests {
             assert!(!modes.contains(&FullscreenFitMode::MarginFit));
             // メニュー一覧は [0] 循環の対象集合と一致する。
             for &m in modes {
-                assert!(modes.contains(&m.next_for_flow(flow)));
+                assert!(modes.contains(&m.next_for_flow(flow, &[])));
             }
         }
     }
@@ -12955,6 +15084,72 @@ mod tests {
     }
 
     #[test]
+    fn section1335_legacy_json_migration_preserves_first_target_once() {
+        for path in [
+            None,
+            Some(PathBuf::new()),
+            Some(PathBuf::from(r"C:\books\released.zip")),
+        ] {
+            let mut value = serde_json::to_value(Settings::default()).unwrap();
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("startup_list_restore");
+            value["last_folder"] = serde_json::to_value(&path).unwrap();
+            value["last_cursor_name"] = serde_json::json!("page.png");
+            value["last_cursor_rows_above"] = serde_json::json!(5);
+            let mut loaded: Settings = serde_json::from_value(value).unwrap();
+            assert!(loaded.migrate_startup_list_restore());
+            let target = match path.as_ref() {
+                None => StartupListTarget::Unavailable,
+                Some(path) if path.as_os_str().is_empty() => StartupListTarget::DriveList,
+                Some(path) => StartupListTarget::PhysicalList {
+                    logical_path: path.clone(),
+                    zip_prefix: None,
+                },
+            };
+            let cursor =
+                matches!(target, StartupListTarget::PhysicalList { .. }).then(|| ListCursorHint {
+                    name: "page.png".into(),
+                    rows_above: Some(5),
+                });
+            let expected = Some(StartupListRestore::V1 { target, cursor });
+            assert_eq!(loaded.startup_list_restore, expected);
+            assert_eq!(loaded.last_folder, path);
+            assert_eq!(loaded.last_cursor_name.as_deref(), Some("page.png"));
+            loaded.last_folder = Some(PathBuf::from(r"C:\other"));
+            let mut reloaded: Settings =
+                serde_json::from_str(&serde_json::to_string(&loaded).unwrap()).unwrap();
+            assert!(!reloaded.migrate_startup_list_restore());
+            assert_eq!(reloaded.startup_list_restore, expected);
+        }
+    }
+
+    #[test]
+    fn section1335_preferences_ok_preserves_live_restore_record() {
+        let mut live = Settings::default();
+        live.startup_list_restore = Some(StartupListRestore::V1 {
+            target: StartupListTarget::PhysicalList {
+                logical_path: PathBuf::from(r"C:\books\nested.zip"),
+                zip_prefix: Some("chapter/".into()),
+            },
+            cursor: Some(ListCursorHint {
+                name: "p2.png".into(),
+                rows_above: Some(2),
+            }),
+        });
+        let expected = live.startup_list_restore.clone();
+        let mut dialog = Settings::default();
+        dialog.overwrite_non_preferences_from(&mut live);
+        assert_eq!(dialog.startup_list_restore, expected);
+        assert!(!dialog.migrate_startup_list_restore());
+        assert_eq!(
+            Settings::default().startup_list_restore,
+            Some(StartupListRestore::default())
+        );
+    }
+
+    #[test]
     fn sanitize_clamps_fullscreen_gap_settings() {
         let mut s = Settings::default();
         s.spread_page_gap_px = 999;
@@ -13297,6 +15492,19 @@ mod tests {
     }
 
     #[test]
+    fn missing_epub_handling_defaults_to_ask_without_archive_migration() {
+        let mut stored = serde_json::to_value(Settings::default()).unwrap();
+        stored.as_object_mut().unwrap().remove("epub_file_handling");
+        stored["archive_file_handling"] = serde_json::json!("Convert");
+        let loaded: Settings = serde_json::from_value(stored.clone()).unwrap();
+        assert_eq!(loaded.archive_file_handling, ArchiveFileHandling::Convert);
+        assert_eq!(loaded.epub_file_handling, EpubFileHandling::Ask);
+
+        stored["epub_file_handling"] = serde_json::json!("Legacy");
+        assert!(serde_json::from_value::<Settings>(stored).is_err());
+    }
+
+    #[test]
     fn sanitize_syncs_legacy_bool_from_mode_idempotent() {
         // mode を source of truth として bool を導出。sanitize は idempotent。
         let mut s = Settings::default();
@@ -13608,6 +15816,7 @@ mod tests {
         assert!(json.contains("\"auto_index_structure\""));
         assert!(json.contains("\"auto_index_metadata\""));
         assert!(json.contains("\"auto_index_thumbs\""));
+        assert!(json.contains("\"auto_index_similar\""));
     }
 
     #[test]
@@ -13620,6 +15829,7 @@ mod tests {
         assert!(!entry.auto_index_structure);
         assert!(!entry.auto_index_metadata);
         assert!(!entry.auto_index_thumbs);
+        assert!(!entry.auto_index_similar);
     }
 
     #[test]
@@ -13631,6 +15841,7 @@ mod tests {
         assert!(!entry.auto_index_structure);
         assert!(!entry.auto_index_metadata);
         assert!(!entry.auto_index_thumbs);
+        assert!(!entry.auto_index_similar);
     }
 
     #[test]
@@ -13639,13 +15850,18 @@ mod tests {
         e.auto_index_structure = true;
         e.auto_index_metadata = true;
         e.auto_index_thumbs = false;
+        e.auto_index_similar = true;
+        // Editing an unrelated visible field while the similar toggle is hidden must preserve
+        // the saved value for a future release that re-enables the capability.
+        e.name = "renamed".to_owned();
         let json = serde_json::to_string(&e).unwrap();
         let back: FavoriteEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(back.id, e.id);
-        assert_eq!(back.name, "x");
+        assert_eq!(back.name, "renamed");
         assert!(back.auto_index_structure);
         assert!(back.auto_index_metadata);
         assert!(!back.auto_index_thumbs);
+        assert!(back.auto_index_similar);
     }
 
     #[test]
@@ -13980,6 +16196,89 @@ mod tests {
         let result = ord.compare("Bbb.jpg", 0, "aaa.jpg", 0, |s: &str| s.to_string());
         assert_eq!(result, std::cmp::Ordering::Greater); // "bbb" > "aaa"
     }
+
+    #[test]
+    fn sort_order_serde_names_preserve_existing_ascending_values() {
+        assert_eq!(
+            serde_json::to_string(&SortOrder::FileName).unwrap(),
+            "\"FileName\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SortOrder::Numeric).unwrap(),
+            "\"Numeric\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SortOrder::FileNameDesc).unwrap(),
+            "\"FileNameDesc\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SortOrder::NumericDesc).unwrap(),
+            "\"NumericDesc\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SortOrder::RatingAsc).unwrap(),
+            "\"RatingAsc\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SortOrder::RatingDesc).unwrap(),
+            "\"RatingDesc\""
+        );
+    }
+
+    #[test]
+    fn name_and_numeric_desc_reverse_only_the_primary_key() {
+        let metadata = ListingSortMetadata::new(0, None);
+
+        let two = SortOrder::NumericDesc.name_key("page2.jpg");
+        let ten = SortOrder::NumericDesc.name_key("page10.jpg");
+        assert_eq!(
+            SortOrder::NumericDesc.compare_listing_keys(&two, metadata, &ten, metadata),
+            std::cmp::Ordering::Greater,
+            "descending numeric primary key must put page10 before page2"
+        );
+
+        let delimited = SortOrder::NumericDesc.name_key("#2.jpg");
+        let plain = SortOrder::NumericDesc.name_key("2.jpg");
+        assert_eq!(
+            delimited.compare_natural_primary(&plain),
+            std::cmp::Ordering::Equal,
+            "numeric comparison must continue to ignore delimiters"
+        );
+        assert_eq!(
+            SortOrder::NumericDesc.compare_listing_keys(&delimited, metadata, &plain, metadata),
+            delimited.compare_file_name(&plain),
+            "equal descending numeric keys must retain an ascending filename tie-break"
+        );
+
+        let alpha = SortOrder::FileNameDesc.name_key("alpha.jpg");
+        let beta = SortOrder::FileNameDesc.name_key("beta.jpg");
+        assert_eq!(
+            SortOrder::FileNameDesc.compare_listing_keys(&alpha, metadata, &beta, metadata),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn list_name_numeric_and_date_labels_match_folder_tree() {
+        let pairs = [
+            (SortOrder::FileName, FolderTreeSortOrder::NameAsc),
+            (SortOrder::FileNameDesc, FolderTreeSortOrder::NameDesc),
+            (SortOrder::Numeric, FolderTreeSortOrder::NumericAsc),
+            (SortOrder::NumericDesc, FolderTreeSortOrder::NumericDesc),
+            (SortOrder::DateAsc, FolderTreeSortOrder::DateAsc),
+            (SortOrder::DateDesc, FolderTreeSortOrder::DateDesc),
+        ];
+        for (list, tree) in pairs {
+            assert_eq!(list.label(), tree.label());
+            assert_eq!(list.short_label(), tree.short_label());
+        }
+        assert!(SortOrder::Numeric.description().contains("区切りを無視"));
+        assert!(
+            SortOrder::NumericDesc
+                .description()
+                .contains("区切りを無視")
+        );
+    }
     #[cfg(windows)]
     #[test]
     fn sort_order_compare_precomputed_name_keys() {
@@ -14017,6 +16316,314 @@ mod tests {
             SortOrder::DateDesc.compare("Bbb", 100, "aaa", 100, key),
             std::cmp::Ordering::Greater,
             "DateDesc 同 mtime でも名前昇順 (= 新しいもの優先で揃え、同 mtime は名前順)"
+        );
+    }
+
+    #[test]
+    fn size_sort_keeps_unknown_last_in_both_directions_and_ties_by_name() {
+        let rows = [
+            ("unknown-b", ListingSortMetadata::new(0, None)),
+            ("ten", ListingSortMetadata::new(0, Some(10))),
+            ("zero-b", ListingSortMetadata::new(0, Some(0))),
+            ("zero-a", ListingSortMetadata::new(0, Some(0))),
+            ("unknown-a", ListingSortMetadata::new(0, None)),
+        ];
+        let sorted = |order: SortOrder| {
+            let mut rows = rows;
+            rows.sort_by(|(a_name, a_meta), (b_name, b_meta)| {
+                let a_key = order.name_key(a_name);
+                let b_key = order.name_key(b_name);
+                order.compare_listing_keys(&a_key, *a_meta, &b_key, *b_meta)
+            });
+            rows.map(|(name, _)| name)
+        };
+        assert_eq!(
+            sorted(SortOrder::SizeAsc),
+            ["zero-a", "zero-b", "ten", "unknown-a", "unknown-b"]
+        );
+        assert_eq!(
+            sorted(SortOrder::SizeDesc),
+            ["ten", "zero-a", "zero-b", "unknown-a", "unknown-b"]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "size list sort requires compare_listing_keys")]
+    fn legacy_name_comparator_rejects_size_sort_in_debug_tests() {
+        let a = SortOrder::SizeAsc.name_key("a.jpg");
+        let b = SortOrder::SizeAsc.name_key("b.jpg");
+        let _ = SortOrder::SizeAsc.compare_name_keys(&a, 0, &b, 0);
+    }
+
+    #[test]
+    fn legacy_toolbar_defaults_gain_size_then_desc_once_without_rewriting_custom_choices() {
+        let mut defaults: Settings = serde_json::from_value(serde_json::json!({
+            "toolbar_sort_items": ["FileName", "Numeric", "DateAsc", "DateDesc"],
+            "folder_thumb_sort": "NumericDesc"
+        }))
+        .unwrap();
+        assert!(defaults.migrate_toolbar_sort_size_options());
+        assert_eq!(
+            defaults.toolbar_sort_items,
+            [
+                SortOrder::FileName,
+                SortOrder::Numeric,
+                SortOrder::DateAsc,
+                SortOrder::DateDesc,
+                SortOrder::SizeAsc,
+                SortOrder::SizeDesc,
+            ]
+        );
+        assert!(defaults.migrate_toolbar_sort_name_numeric_desc_options());
+        defaults.sanitize();
+        assert_eq!(defaults.toolbar_sort_items, SortOrder::collection_options());
+        assert!(defaults.toolbar_sort_size_options_migrated);
+        assert!(defaults.toolbar_sort_name_numeric_desc_options_migrated);
+        assert_eq!(defaults.folder_thumb_sort, SortOrder::FileName);
+        assert_eq!(
+            SortOrder::folder_thumb_options(),
+            [
+                SortOrder::FileName,
+                SortOrder::Numeric,
+                SortOrder::DateAsc,
+                SortOrder::DateDesc,
+            ]
+        );
+
+        // 移行後に降順2候補だけを隠してcanonical6へ戻しても、markerにより復活させない。
+        defaults.toolbar_sort_items = vec![
+            SortOrder::FileName,
+            SortOrder::Numeric,
+            SortOrder::DateAsc,
+            SortOrder::DateDesc,
+            SortOrder::SizeAsc,
+            SortOrder::SizeDesc,
+        ];
+        let mut reloaded: Settings =
+            serde_json::from_value(serde_json::to_value(&defaults).unwrap()).unwrap();
+        assert!(!reloaded.migrate_toolbar_sort_size_options());
+        assert!(!reloaded.migrate_toolbar_sort_name_numeric_desc_options());
+        assert_eq!(reloaded.toolbar_sort_items, defaults.toolbar_sort_items);
+
+        // 既にサイズ候補の移行を終え、その2候補を隠した利用者のcanonical4も補完しない。
+        let mut hidden_sizes: Settings = serde_json::from_value(serde_json::json!({
+            "toolbar_sort_items": ["FileName", "Numeric", "DateAsc", "DateDesc"],
+            "toolbar_sort_size_options_migrated": true
+        }))
+        .unwrap();
+        let hidden_sizes_expected = hidden_sizes.toolbar_sort_items.clone();
+        assert!(!hidden_sizes.migrate_toolbar_sort_size_options());
+        assert!(hidden_sizes.migrate_toolbar_sort_name_numeric_desc_options());
+        assert_eq!(hidden_sizes.toolbar_sort_items, hidden_sizes_expected);
+
+        for custom_items in [
+            serde_json::json!([]),
+            serde_json::json!(["DateDesc", "FileName"]),
+            serde_json::json!([
+                "Numeric", "FileName", "DateAsc", "DateDesc", "SizeAsc", "SizeDesc"
+            ]),
+        ] {
+            let mut custom: Settings = serde_json::from_value(serde_json::json!({
+                "toolbar_sort_items": custom_items
+            }))
+            .unwrap();
+            let expected = custom.toolbar_sort_items.clone();
+            assert!(custom.migrate_toolbar_sort_size_options());
+            assert!(custom.migrate_toolbar_sort_name_numeric_desc_options());
+            custom.sanitize();
+            assert_eq!(custom.toolbar_sort_items, expected);
+        }
+
+        let current = Settings::default();
+        assert!(current.toolbar_sort_name_numeric_desc_options_migrated);
+        assert_eq!(current.toolbar_sort_items.len(), 10);
+    }
+
+    #[test]
+    fn rating_toolbar_migration_only_extends_untouched_eight_options_once() {
+        let canonical = SortOrder::collection_options().to_vec();
+        let mut old: Settings = serde_json::from_value(serde_json::json!({
+            "toolbar_sort_items": canonical
+        }))
+        .unwrap();
+        assert!(old.migrate_toolbar_sort_rating_options());
+        assert_eq!(old.toolbar_sort_items, SortOrder::all());
+        assert!(!old.migrate_toolbar_sort_rating_options());
+        old.toolbar_sort_items.retain(|sort| !sort.is_rating());
+        let mut later_hidden: Settings =
+            serde_json::from_value(serde_json::to_value(&old).unwrap()).unwrap();
+        assert!(!later_hidden.migrate_toolbar_sort_rating_options());
+        assert_eq!(
+            later_hidden.toolbar_sort_items,
+            SortOrder::collection_options()
+        );
+
+        for items in [
+            vec![],
+            vec![SortOrder::FileName],
+            canonical.iter().copied().rev().collect(),
+            canonical
+                .iter()
+                .copied()
+                .filter(|sort| *sort != SortOrder::DateAsc)
+                .collect(),
+        ] {
+            let mut custom: Settings = serde_json::from_value(serde_json::json!({
+                "toolbar_sort_items": items,
+            }))
+            .unwrap();
+            let before = custom.toolbar_sort_items.clone();
+            assert!(custom.migrate_toolbar_sort_rating_options());
+            assert_eq!(custom.toolbar_sort_items, before);
+        }
+    }
+
+    #[test]
+    fn section207_folder_migration_json_is_once_and_preserves_customization() {
+        use ToolbarSectionId as TS;
+        let mut old: Settings = serde_json::from_value(serde_json::json!({
+            "toolbar_section_order": ["Tags", "Cols", "Tags", "FutureSection"],
+            "toolbar_section_new_row": ["Cols"],
+            "show_toolbar_sort": true,
+            "show_facet_sort": false,
+            "show_toolbar_folder": false,
+            "show_address_bar_history_nav": false
+        }))
+        .unwrap();
+        assert!(!old.toolbar_folder_section_migrated);
+        assert!(old.migrate_toolbar_folder_section());
+        assert_eq!(&old.toolbar_section_order[..2], &[TS::Tags, TS::Cols]);
+        assert_eq!(old.toolbar_section_order.last(), Some(&TS::Folder));
+        assert_eq!(
+            old.toolbar_section_order
+                .iter()
+                .filter(|&&id| id == TS::Folder)
+                .count(),
+            1
+        );
+        assert_eq!(old.toolbar_section_new_row, [TS::Cols, TS::Folder]);
+        assert!(!old.show_toolbar_folder);
+        assert!(!old.show_address_bar_history_nav);
+        assert!(old.show_toolbar_sort);
+        assert!(!old.show_facet_sort);
+        old.toolbar_section_new_row.retain(|&id| id != TS::Folder);
+        old.toolbar_section_order.rotate_right(1);
+        let order = old.toolbar_section_order.clone();
+        let mut restart: Settings =
+            serde_json::from_value(serde_json::to_value(old).unwrap()).unwrap();
+        assert!(!restart.migrate_toolbar_folder_section());
+        apply_load_time_migrations(&mut restart);
+        assert_eq!(restart.toolbar_section_order, order);
+        assert_eq!(restart.toolbar_section_new_row, [TS::Cols]);
+        let mut empty: Settings = serde_json::from_str("{}").unwrap();
+        apply_load_time_migrations(&mut empty);
+        assert!(empty.toolbar_folder_section_migrated);
+        assert_eq!(empty.toolbar_section_order, TS::default_order());
+        assert_eq!(empty.toolbar_section_new_row, [TS::Folder]);
+        assert_eq!(Settings::default().toolbar_section_new_row, [TS::Folder]);
+    }
+
+    #[test]
+    fn section207_folder_migration_db_writes_marker_and_keeps_later_off() {
+        let _env = setup_backup_env();
+        let dir = crate::data_dir::get();
+        let mut old = Settings::default();
+        old.toolbar_section_order = ToolbarSectionId::default_order()
+            .iter()
+            .copied()
+            .filter(|&id| id != ToolbarSectionId::Folder)
+            .rev()
+            .collect();
+        old.toolbar_section_new_row = vec![ToolbarSectionId::Tags];
+        old.show_toolbar_folder = false;
+        old.show_toolbar_sort = true;
+        old.show_facet_sort = false;
+        let expected_order = old.toolbar_section_order.clone();
+        old.save();
+        drop(crate::settings_db::SettingsDb::open(&dir).unwrap());
+        let db = rusqlite::Connection::open(dir.join("settings.db")).unwrap();
+        db.execute(
+            "DELETE FROM settings_kv WHERE key = 'toolbar_folder_section_migrated'",
+            [],
+        )
+        .unwrap();
+        drop(db);
+        reset_backup_state_for_test();
+        let mut migrated = Settings::load();
+        assert_eq!(
+            &migrated.toolbar_section_order[..expected_order.len()],
+            expected_order
+        );
+        assert_eq!(
+            migrated.toolbar_section_order.last(),
+            Some(&ToolbarSectionId::Folder)
+        );
+        assert_eq!(
+            migrated.toolbar_section_new_row,
+            [ToolbarSectionId::Tags, ToolbarSectionId::Folder]
+        );
+        let persisted = crate::settings_db::SettingsDb::open(&dir)
+            .unwrap()
+            .load_into_settings()
+            .unwrap();
+        assert!(persisted.toolbar_folder_section_migrated);
+        assert_eq!(
+            persisted.toolbar_section_new_row,
+            migrated.toolbar_section_new_row
+        );
+        migrated
+            .toolbar_section_new_row
+            .retain(|&id| id != ToolbarSectionId::Folder);
+        migrated.toolbar_section_order.rotate_right(1);
+        migrated.save();
+        reset_backup_state_for_test();
+        let restart = Settings::load();
+        assert_eq!(restart.toolbar_section_new_row, [ToolbarSectionId::Tags]);
+        assert_eq!(
+            restart.toolbar_section_order,
+            migrated.toolbar_section_order
+        );
+        assert!(!restart.show_toolbar_folder);
+        assert!(restart.show_toolbar_sort);
+        assert!(!restart.show_facet_sort);
+    }
+
+    #[test]
+    fn section207_folder_migration_legacy_json_uses_production_bootstrap() {
+        let _env = setup_backup_env();
+        let dir = crate::data_dir::get();
+        let mut json = serde_json::to_value(Settings::default()).unwrap();
+        let object = json.as_object_mut().unwrap();
+        object.remove("toolbar_folder_section_migrated");
+        object.insert(
+            "toolbar_section_order".into(),
+            serde_json::json!(["Tags", "Cols"]),
+        );
+        object.insert("toolbar_section_new_row".into(), serde_json::json!([]));
+        std::fs::write(
+            dir.join("settings.json"),
+            serde_json::to_vec(&json).unwrap(),
+        )
+        .unwrap();
+        let loaded = Settings::load_with_meta();
+        assert_eq!(
+            loaded.meta.boot_source,
+            crate::settings_db::BootSource::MigratedFromJson
+        );
+        assert_eq!(
+            loaded.settings.toolbar_section_order.last(),
+            Some(&ToolbarSectionId::Folder)
+        );
+        assert_eq!(
+            loaded.settings.toolbar_section_new_row,
+            [ToolbarSectionId::Folder]
+        );
+        assert!(
+            crate::settings_db::SettingsDb::open(&dir)
+                .unwrap()
+                .load_into_settings()
+                .unwrap()
+                .toolbar_folder_section_migrated
         );
     }
 
@@ -14121,6 +16728,232 @@ mod tests {
         let mut s = Settings::default();
         s.add_favorite(name.to_string(), PathBuf::from(format!(r"C:\{name}")));
         s
+    }
+
+    fn save_released_toolbar_cols_db(
+        dir: &std::path::Path,
+        cols: Vec<usize>,
+        display: ToolbarSectionDisplay,
+    ) {
+        let mut old = Settings::default();
+        old.toolbar_cols_items = cols;
+        old.toolbar_cols_20_options_migrated = false;
+        old.toolbar_cols_display = display;
+        let db = crate::settings_db::SettingsDb::create_new(dir).unwrap();
+        db.save_full(&old).unwrap();
+        drop(db);
+        // リリース済み DB にはこの新フィールド自体が無い。
+        let conn = rusqlite::Connection::open(dir.join("settings.db")).unwrap();
+        conn.execute(
+            "DELETE FROM settings_kv WHERE key = 'toolbar_cols_20_options_migrated'",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn toolbar_cols_20_migrates_released_default_once_and_preserves_later_choice() {
+        let _env = setup_backup_env();
+        let dir = crate::data_dir::get();
+        save_released_toolbar_cols_db(&dir, (1..=10).collect(), ToolbarSectionDisplay::Dropdown);
+
+        let mut loaded = Settings::load_with_meta();
+        assert_eq!(
+            loaded.meta.boot_source,
+            crate::settings_db::BootSource::LoadedExistingDb
+        );
+        assert_eq!(
+            loaded.settings.toolbar_cols_items,
+            (1..=20).collect::<Vec<_>>()
+        );
+        assert!(loaded.settings.toolbar_cols_20_options_migrated);
+        let db = crate::settings_db::SettingsDb::open(&dir).unwrap();
+        let persisted = db.load_into_settings().unwrap();
+        assert_eq!(persisted.toolbar_cols_items, (1..=20).collect::<Vec<_>>());
+        assert!(persisted.toolbar_cols_20_options_migrated);
+        drop(db);
+
+        // 利用者が追加候補を全部外すと旧既定と同じ配列へ戻るが、印が再移行を防ぐ。
+        loaded.settings.toolbar_cols_items = (1..=10).collect();
+        loaded.settings.save();
+        reset_backup_state_for_test();
+        let reloaded = Settings::load();
+        assert_eq!(reloaded.toolbar_cols_items, (1..=10).collect::<Vec<_>>());
+        assert!(reloaded.toolbar_cols_20_options_migrated);
+    }
+
+    #[test]
+    fn toolbar_cols_20_migrates_button_display_too() {
+        let _env = setup_backup_env();
+        let dir = crate::data_dir::get();
+        save_released_toolbar_cols_db(&dir, (1..=10).collect(), ToolbarSectionDisplay::Buttons);
+
+        let loaded = Settings::load();
+        assert_eq!(loaded.toolbar_cols_display, ToolbarSectionDisplay::Buttons);
+        assert_eq!(loaded.toolbar_cols_items, (1..=20).collect::<Vec<_>>());
+        assert!(loaded.toolbar_cols_20_options_migrated);
+        let persisted = crate::settings_db::SettingsDb::open(&dir)
+            .unwrap()
+            .load_into_settings()
+            .unwrap();
+        assert_eq!(
+            persisted.toolbar_cols_display,
+            ToolbarSectionDisplay::Buttons
+        );
+        assert_eq!(persisted.toolbar_cols_items, (1..=20).collect::<Vec<_>>());
+        assert!(persisted.toolbar_cols_20_options_migrated);
+    }
+
+    #[test]
+    fn toolbar_cols_20_leaves_custom_subset_untouched_and_marks_it_done() {
+        let _env = setup_backup_env();
+        let dir = crate::data_dir::get();
+        save_released_toolbar_cols_db(&dir, vec![1, 4, 10], ToolbarSectionDisplay::Dropdown);
+        let loaded = Settings::load();
+        assert_eq!(loaded.toolbar_cols_items, vec![1, 4, 10]);
+        assert!(loaded.toolbar_cols_20_options_migrated);
+        let persisted = crate::settings_db::SettingsDb::open(&dir)
+            .unwrap()
+            .load_into_settings()
+            .unwrap();
+        assert_eq!(persisted.toolbar_cols_items, vec![1, 4, 10]);
+        assert!(persisted.toolbar_cols_20_options_migrated);
+    }
+
+    #[test]
+    fn toolbar_cols_20_clean_install_starts_complete() {
+        let _env = setup_backup_env();
+        let loaded = Settings::load_with_meta();
+        assert_eq!(
+            loaded.meta.boot_source,
+            crate::settings_db::BootSource::CleanInstall
+        );
+        assert_eq!(
+            loaded.settings.toolbar_cols_items,
+            (1..=20).collect::<Vec<_>>()
+        );
+        assert!(loaded.settings.toolbar_cols_20_options_migrated);
+        let persisted = crate::settings_db::SettingsDb::open(&crate::data_dir::get())
+            .unwrap()
+            .load_into_settings()
+            .unwrap();
+        assert!(persisted.toolbar_cols_20_options_migrated);
+    }
+
+    #[test]
+    fn toolbar_cols_20_migrates_released_json_in_portable_data_dir() {
+        let _env = setup_backup_env();
+        let dir = crate::data_dir::get();
+        let mut old = Settings::default();
+        old.toolbar_cols_items = (1..=10).collect();
+        let mut json = serde_json::to_value(old).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("toolbar_cols_20_options_migrated");
+        std::fs::write(
+            dir.join("settings.json"),
+            serde_json::to_vec(&json).unwrap(),
+        )
+        .unwrap();
+        let loaded = Settings::load_with_meta();
+        assert_eq!(
+            loaded.meta.boot_source,
+            crate::settings_db::BootSource::MigratedFromJson
+        );
+        assert_eq!(
+            loaded.settings.toolbar_cols_items,
+            (1..=20).collect::<Vec<_>>()
+        );
+        assert!(loaded.settings.toolbar_cols_20_options_migrated);
+        assert_eq!(
+            crate::settings_db::SettingsDb::open(&dir)
+                .unwrap()
+                .load_into_settings()
+                .unwrap()
+                .toolbar_cols_items,
+            (1..=20).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn toolbar_cols_20_migrates_after_db_backup_recovery() {
+        let _env = setup_backup_env();
+        let dir = crate::data_dir::get();
+        save_released_toolbar_cols_db(&dir, (1..=10).collect(), ToolbarSectionDisplay::Dropdown);
+        let db = crate::settings_db::SettingsDb::open(&dir).unwrap();
+        db.backup_to(&dir.join("settings.db.bak1")).unwrap();
+        drop(db);
+        std::fs::remove_file(dir.join("settings.db")).unwrap();
+        std::fs::write(dir.join("settings.db"), b"GARBAGE-NOT-A-SQLITE-DB-CONTENT").unwrap();
+        let _ = std::fs::remove_file(dir.join("settings.db-wal"));
+        let _ = std::fs::remove_file(dir.join("settings.db-shm"));
+        let loaded = Settings::load_with_meta();
+        assert_eq!(
+            loaded.meta.boot_source,
+            crate::settings_db::BootSource::RestoredFromDbBackup
+        );
+        assert_eq!(
+            loaded.settings.toolbar_cols_items,
+            (1..=20).collect::<Vec<_>>()
+        );
+        assert!(loaded.settings.toolbar_cols_20_options_migrated);
+        let persisted = crate::settings_db::SettingsDb::open(&dir)
+            .unwrap()
+            .load_into_settings()
+            .unwrap();
+        assert_eq!(persisted.toolbar_cols_items, (1..=20).collect::<Vec<_>>());
+        assert!(persisted.toolbar_cols_20_options_migrated);
+    }
+
+    #[test]
+    fn toolbar_name_numeric_desc_migration_is_persisted_once_in_settings_db() {
+        let _env = setup_backup_env();
+        let canonical_six = vec![
+            SortOrder::FileName,
+            SortOrder::Numeric,
+            SortOrder::DateAsc,
+            SortOrder::DateDesc,
+            SortOrder::SizeAsc,
+            SortOrder::SizeDesc,
+        ];
+        let mut previous_release = Settings::default();
+        previous_release.toolbar_sort_items = canonical_six.clone();
+        previous_release.toolbar_sort_name_numeric_desc_options_migrated = false;
+        previous_release.toolbar_sort_rating_options_migrated = false;
+        previous_release.save();
+
+        reset_backup_state_for_test();
+        let mut migrated = Settings::load();
+        assert_eq!(migrated.toolbar_sort_items, SortOrder::all());
+        assert!(migrated.toolbar_sort_name_numeric_desc_options_migrated);
+
+        migrated.toolbar_sort_items = canonical_six.clone();
+        migrated.save();
+        reset_backup_state_for_test();
+        let reloaded = Settings::load();
+        assert_eq!(reloaded.toolbar_sort_items, canonical_six);
+        assert!(reloaded.toolbar_sort_name_numeric_desc_options_migrated);
+    }
+
+    #[test]
+    fn toolbar_rating_options_marker_survives_settings_db_reload() {
+        let _env = setup_backup_env();
+        let mut old = Settings::default();
+        old.toolbar_sort_items = SortOrder::collection_options().to_vec();
+        old.toolbar_sort_rating_options_migrated = false;
+        old.save();
+
+        reset_backup_state_for_test();
+        let mut loaded = Settings::load();
+        assert_eq!(loaded.toolbar_sort_items, SortOrder::all());
+        assert!(loaded.toolbar_sort_rating_options_migrated);
+        loaded.toolbar_sort_items = SortOrder::collection_options().to_vec();
+        loaded.save();
+
+        reset_backup_state_for_test();
+        let hidden = Settings::load();
+        assert_eq!(hidden.toolbar_sort_items, SortOrder::collection_options());
+        assert!(hidden.toolbar_sort_rating_options_migrated);
     }
 
     #[test]
@@ -14705,6 +17538,25 @@ mod tests {
             let _ = env;
             crate::data_dir::get().join("settings.db")
         }
+
+        #[test]
+        fn rating_view_sort_db_roundtrip_is_independent_of_normal_sort() {
+            use crate::rating_view::RatingViewSort;
+
+            let env = setup_backup_env();
+            let _initial = Settings::load();
+            assert!(data_db_path(&env).exists());
+
+            let mut settings = Settings::default();
+            settings.sort_order = SortOrder::DateDesc;
+            settings.rating_view_sort = RatingViewSort::RatedAtAsc;
+            settings.save();
+
+            reset_backup_state_for_test();
+            let loaded = Settings::load();
+            assert_eq!(loaded.sort_order, SortOrder::DateDesc);
+            assert_eq!(loaded.rating_view_sort, RatingViewSort::RatedAtAsc);
+        }
         fn db_bak_path(env: &BackupTestEnv, n: usize) -> PathBuf {
             let _ = env;
             crate::data_dir::get().join(format!("settings.db.bak{n}"))
@@ -14782,6 +17634,39 @@ mod tests {
         }
 
         #[test]
+        fn folder_tree_sort_defaults_roundtrips_and_stays_outside_favorite_view_state() {
+            let missing: Settings = serde_json::from_str("{}").unwrap();
+            assert_eq!(missing.folder_tree_sort_order, FolderTreeSortOrder::NameAsc);
+
+            let env = setup_backup_env();
+            let _initial = Settings::load();
+            assert!(data_db_path(&env).exists());
+
+            let mut settings = Settings::default();
+            settings.sort_order = SortOrder::DateDesc;
+            settings.folder_tree_sort_order = FolderTreeSortOrder::NumericDesc;
+            let favorite = FavoriteViewState::from_settings(&settings);
+            let mut applied = Settings::default();
+            applied.folder_tree_sort_order = FolderTreeSortOrder::DateAsc;
+            favorite.apply_to_settings(&mut applied);
+            assert_eq!(applied.sort_order, SortOrder::DateDesc);
+            assert_eq!(
+                applied.folder_tree_sort_order,
+                FolderTreeSortOrder::DateAsc,
+                "お気に入り表示状態はツリーの並びを上書きしない"
+            );
+
+            settings.save();
+            reset_backup_state_for_test();
+            let loaded = Settings::load();
+            assert_eq!(loaded.sort_order, SortOrder::DateDesc);
+            assert_eq!(
+                loaded.folder_tree_sort_order,
+                FolderTreeSortOrder::NumericDesc
+            );
+        }
+
+        #[test]
         fn fullscreen_notice_visibility_settings_db_roundtrip() {
             let missing: Settings = serde_json::from_str("{}").unwrap();
             assert!(missing.fullscreen_boundary_notice_visible);
@@ -14803,6 +17688,27 @@ mod tests {
             assert!(!loaded.fullscreen_boundary_notice_visible);
             assert!(!loaded.fullscreen_processing_status_visible);
             assert!(!loaded.fullscreen_prefetch_status_visible);
+        }
+
+        #[test]
+        fn fullscreen_image_margin_color_defaults_and_settings_db_roundtrips() {
+            let missing: Settings = serde_json::from_str("{}").unwrap();
+            assert_eq!(
+                missing.fullscreen_image_margin_color,
+                FULLSCREEN_IMAGE_MARGIN_COLOR_DEFAULT
+            );
+
+            let env = setup_backup_env();
+            let _initial = Settings::load();
+            assert!(data_db_path(&env).exists());
+
+            let mut settings = Settings::default();
+            settings.fullscreen_image_margin_color = [17, 34, 51];
+            settings.save();
+
+            reset_backup_state_for_test();
+            let loaded = Settings::load();
+            assert_eq!(loaded.fullscreen_image_margin_color, [17, 34, 51]);
         }
 
         /// 連続操作中の保存先送りは「変えた時点の世代」と現在の世代を比べて決める。
@@ -15637,6 +18543,49 @@ mod tests {
             let _ = env;
         }
 
+        /// A clean install has no previous version, so recording the initial version marker must
+        /// not manufacture an "upgrade from unknown" snapshot. The bootstrap writeback still
+        /// persists the marker for a later, genuine version transition.
+        #[test]
+        fn clean_install_records_version_without_preupgrade_snapshot() {
+            let env = setup_backup_env();
+            let initial_version = "3.10.0-clean-install-test";
+            let loaded = Settings::load_with_meta_for_version(initial_version);
+
+            assert_eq!(
+                loaded.settings.last_seen_version.as_deref(),
+                Some(initial_version)
+            );
+            assert_eq!(
+                loaded.meta.boot_source,
+                crate::settings_db::BootSource::CleanInstall
+            );
+            assert!(
+                std::fs::read_dir(crate::data_dir::get())
+                    .unwrap()
+                    .flatten()
+                    .all(|entry| !entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("settings.db.preupgrade-v")),
+                "clean install must not create a false preupgrade snapshot"
+            );
+
+            reset_backup_state_for_test();
+            let reloaded = Settings::load_with_meta_for_version(initial_version);
+            assert_eq!(
+                reloaded.settings.last_seen_version.as_deref(),
+                Some(initial_version)
+            );
+            assert!(
+                !crate::data_dir::get()
+                    .join("settings.db.preupgrade-vunknown")
+                    .exists(),
+                "later launches must not inherit a false unknown provenance"
+            );
+            let _ = env;
+        }
+
         /// 真の初回起動 (= 何もない dir) では SQLite 経路でも save 抑止は立たず、
         /// CleanInstall として settings.db が作られる。
         #[test]
@@ -15670,6 +18619,43 @@ mod tests {
             );
             let reloaded = Settings::load();
             assert_eq!(reloaded.favorites[0].name, "first_install");
+        }
+
+        #[test]
+        fn section1335_normal_load_persists_legacy_projection_without_user_rotation() {
+            let _env = setup_backup_env();
+            let mut legacy = Settings::load();
+            legacy.startup_list_restore = None;
+            legacy.last_folder = Some(PathBuf::from(r"C:\books\released.zip"));
+            legacy.last_cursor_name = Some("page.png".into());
+            legacy.last_cursor_rows_above = Some(3);
+            legacy.save();
+            reset_backup_state_for_test();
+            let migrated = Settings::load();
+            let expected = Some(StartupListRestore::V1 {
+                target: StartupListTarget::PhysicalList {
+                    logical_path: legacy.last_folder.clone().unwrap(),
+                    zip_prefix: None,
+                },
+                cursor: Some(ListCursorHint {
+                    name: "page.png".into(),
+                    rows_above: Some(3),
+                }),
+            });
+            assert_eq!(migrated.startup_list_restore, expected);
+            assert!(
+                !BACKUP_DONE_THIS_SESSION.load(Ordering::Relaxed),
+                "load-time migration must not consume the user-save rotation"
+            );
+            assert_eq!(
+                crate::settings_db::SettingsDb::open(&crate::data_dir::get())
+                    .unwrap()
+                    .load_into_settings()
+                    .unwrap()
+                    .startup_list_restore,
+                expected
+            );
+            assert_eq!(Settings::load().startup_list_restore, expected);
         }
 
         /// settings.db を壊して bak1 から復旧されるシナリオ (= spec §5 decision tree)。
@@ -15736,7 +18722,7 @@ mod tests {
         fn load_writeback_does_not_consume_rotation() {
             let env = setup_backup_env();
             // 初回 boot で clean install → settings.db 作成。load() 内部で
-            // version_changed=true なので save_internal_no_rotation が走る。
+            // initial version marker のため save_internal_no_rotation が走る。
             // ここで rotation が走ってしまっていないか確認する。
             let _ = Settings::load();
             // bak1 はまだ無いはず (= load() 内 writeback が rotation を発火させていない)。
@@ -15772,6 +18758,61 @@ mod tests {
                 "diag log should mention boot path, got:\n{content}"
             );
             let _ = env;
+        }
+    }
+
+    #[test]
+    fn clipboard_capture_settings_default_off_and_roundtrip() {
+        let defaults: super::Settings = serde_json::from_str("{}").unwrap();
+        assert!(!defaults.clipboard_capture_image_enabled);
+        assert!(!defaults.clipboard_capture_html_enabled);
+        assert_eq!(defaults.clipboard_capture_min_short_side_px, 100);
+        assert!(defaults.clipboard_capture_output_dir.is_none());
+        let configured = super::Settings {
+            clipboard_capture_image_enabled: true,
+            clipboard_capture_html_enabled: true,
+            clipboard_capture_min_short_side_px: 240,
+            clipboard_capture_output_dir: Some(std::path::PathBuf::from("C:/captures/clipboard")),
+            ..defaults
+        };
+        let restored: super::Settings =
+            serde_json::from_value(serde_json::to_value(&configured).unwrap()).unwrap();
+        assert!(restored.clipboard_capture_image_enabled);
+        assert!(restored.clipboard_capture_html_enabled);
+        assert_eq!(restored.clipboard_capture_min_short_side_px, 240);
+        assert_eq!(
+            restored.clipboard_capture_output_dir,
+            configured.clipboard_capture_output_dir
+        );
+    }
+
+    #[test]
+    fn clipboard_capture_minimum_is_bounded() {
+        let mut live = super::Settings {
+            clipboard_capture_min_short_side_px: u32::MAX,
+            ..Default::default()
+        };
+        live.sanitize();
+        assert_eq!(
+            live.clipboard_capture_min_short_side_px,
+            super::CLIPBOARD_CAPTURE_MIN_SHORT_SIDE_MAX_PX
+        );
+    }
+}
+
+impl Settings {
+    /// A lightweight immutable scan snapshot, without copying histories, preset rows or VST state.
+    pub(crate) fn thumbnail_source_discovery_snapshot(&self) -> Self {
+        Self {
+            skip_image_if_video_exists: self.skip_image_if_video_exists,
+            video_thumb_use_sidecar_image: self.video_thumb_use_sidecar_image,
+            show_hidden_files: self.show_hidden_files,
+            archive_file_handling: self.archive_file_handling,
+            epub_file_handling: self.epub_file_handling,
+            skip_duplicate_images: self.skip_duplicate_images,
+            image_ext_priority: self.image_ext_priority.clone(),
+            susie_enabled: self.susie_enabled,
+            ..Self::default()
         }
     }
 }

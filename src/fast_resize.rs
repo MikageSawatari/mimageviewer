@@ -213,6 +213,12 @@ pub fn resize_dynamic_fit_with_source_aspect(
 /// デコードはせず、PNG/JPEG/GIF/WebP/BMP のヘッダから幅×高さだけ取る。
 /// 失敗したら None (呼び出し側はフルデコード完了まで dims を出さない)。
 pub fn probe_dims(path: &std::path::Path) -> Option<[usize; 2]> {
+    if crate::raw_format::is_raw_path(path) {
+        let dims = crate::raw::raw_decoder::info(crate::raw::RawSource::Path(path))
+            .ok()?
+            .developed_dims;
+        return Some([dims[0] as usize, dims[1] as usize]);
+    }
     let reader = image::ImageReader::open(path)
         .ok()?
         .with_guessed_format()
@@ -222,7 +228,13 @@ pub fn probe_dims(path: &std::path::Path) -> Option<[usize; 2]> {
 }
 
 /// path を再 open できない検証済み relative page / archive entry 用。
-pub fn probe_dims_from_bytes(bytes: &[u8]) -> Option<[usize; 2]> {
+pub fn probe_dims_from_bytes(bytes: &[u8], extension: &str) -> Option<[usize; 2]> {
+    if crate::raw_format::is_raw_ext(extension) {
+        let dims = crate::raw::raw_decoder::info(crate::raw::RawSource::Bytes(bytes))
+            .ok()?
+            .developed_dims;
+        return Some([dims[0] as usize, dims[1] as usize]);
+    }
     let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .ok()?;
@@ -233,6 +245,23 @@ pub fn probe_dims_from_bytes(bytes: &[u8]) -> Option<[usize; 2]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn raw_path_and_byte_probes_report_libraw_developed_dimensions() {
+        for name in ["885.dng", "1018.cr2"] {
+            let path = std::path::Path::new("vendor/raw-samples").join(name);
+            assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+            let bytes = std::fs::read(&path).unwrap();
+            let expected = crate::raw::raw_decoder::info(crate::raw::RawSource::Bytes(&bytes))
+                .unwrap()
+                .developed_dims
+                .map(|dim| dim as usize);
+            let extension = path.extension().unwrap().to_str().unwrap();
+            assert_eq!(probe_dims(&path), Some(expected));
+            assert_eq!(probe_dims_from_bytes(&bytes, extension), Some(expected));
+        }
+    }
 
     #[test]
     fn bilinear_rgba8_exact_produces_correct_dims() {

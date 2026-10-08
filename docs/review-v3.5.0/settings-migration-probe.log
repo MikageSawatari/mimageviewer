@@ -1,0 +1,219 @@
+   Compiling windows-sys v0.61.2
+   Compiling base64ct v1.8.3
+   Compiling digest v0.10.7
+   Compiling windows v0.61.3
+   Compiling ffmpeg-sys-the-third v3.0.1+ffmpeg-7.1
+   Compiling num-traits v0.2.19
+   Compiling thiserror v2.0.18
+   Compiling hashbrown v0.16.1
+   Compiling indexmap v2.14.0
+   Compiling rand_core v0.6.4
+   Compiling egui-wgpu v0.33.3 (C:\home\mimageviewer\vendor\egui-wgpu)
+   Compiling webbrowser v1.2.4
+   Compiling comic-core v0.1.0 (C:\home\mimageviewer\crates\comic-core)
+   Compiling music-core v0.1.0 (C:\home\mimageviewer\crates\music-core)
+   Compiling local-adjust-core v0.1.0 (C:\home\mimageviewer\crates\local-adjust-core)
+   Compiling quick-xml v0.41.0
+   Compiling qrcode v0.14.1
+   Compiling blake2 v0.10.6
+   Compiling sha2 v0.10.9
+   Compiling md-5 v0.10.6
+   Compiling pem-rfc7468 v1.0.0
+   Compiling password-hash v0.5.0
+   Compiling der v0.8.1
+   Compiling half v2.7.1
+   Compiling argon2 v0.5.3
+   Compiling lopdf v0.36.0
+   Compiling sevenz-rust2 v0.20.2
+   Compiling mimageviewer-ipc v3.5.0 (C:\home\mimageviewer\crates\remote-ipc)
+   Compiling naga v27.0.3
+   Compiling ureq v3.3.0
+   Compiling winapi-util v0.1.11
+   Compiling tempfile v3.27.0
+   Compiling normpath v1.5.1
+   Compiling same-file v1.0.6
+   Compiling tantivy v0.26.1
+   Compiling walkdir v2.5.0
+   Compiling opener v0.8.5
+   Compiling egui_kittest v0.33.3
+   Compiling notify v8.2.0
+   Compiling ort-sys v2.0.0-rc.12
+   Compiling ort v2.0.0-rc.12
+   Compiling ffmpeg-the-third v3.0.2+ffmpeg-7.1
+   Compiling mimageviewer v3.5.0 (C:\home\mimageviewer)
+   Compiling accesskit_windows v0.29.2
+   Compiling accesskit_winit v0.29.2
+   Compiling egui-winit v0.33.3
+   Compiling eframe v0.33.3 (C:\home\mimageviewer\vendor\eframe)
+warning: use of deprecated method `quick_xml::events::attributes::Attribute::<'a>::decode_and_unescape_value`: use `Self::decoded_and_normalized_value()`
+   --> src\xmp_reader.rs:461:45
+    |
+461 |                         if let Ok(v) = attr.decode_and_unescape_value(decoder) {
+    |                                             ^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated method `quick_xml::events::attributes::Attribute::<'a>::decode_and_unescape_value`: use `Self::decoded_and_normalized_value()`
+   --> src\xmp_reader.rs:465:45
+    |
+465 |                         if let Ok(v) = attr.decode_and_unescape_value(decoder) {
+    |                                             ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `quick_xml::events::attributes::Attribute::<'a>::unescape_value`: use `Self::normalized_value()`
+   --> src\xmp_reader.rs:868:33
+    |
+868 |             if let Ok(v) = attr.unescape_value() {
+    |                                 ^^^^^^^^^^^^^^
+
+warning: use of deprecated method `quick_xml::events::attributes::Attribute::<'a>::decode_and_unescape_value`: use `Self::decoded_and_normalized_value()`
+    --> src\xmp_reader.rs:1056:42
+     |
+1056 |                     let Ok(value) = attr.decode_and_unescape_value(decoder) else {
+     |                                          ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `mode_available`
+     --> src\ui_fullscreen.rs:31802:17
+      |
+31802 |             let mode_available = reading_flow.is_paged() && !is_spread_double;
+      |                 ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_mode_available`
+      |
+      = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `set_local_adjust_layers_for_idx_memory_only_defer_render` is never used
+     --> src\app.rs:54998:19
+      |
+14912 | impl App {
+      | -------- method in this implementation
+...
+54998 |     pub(crate) fn set_local_adjust_layers_for_idx_memory_only_defer_render(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `build_launch_request` is never used
+    --> src\external_tool.rs:1083:15
+     |
+1083 | pub(crate) fn build_launch_request(
+     |               ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `build_launch_operation` is never used
+    --> src\external_tool.rs:1299:15
+     |
+1299 | pub(crate) fn build_launch_operation(
+     |               ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `is_empty` is never used
+   --> src\items_generation_cache.rs:424:19
+    |
+282 | impl<T> ItemsGenerationVec<T> {
+    | ----------------------------- method in this implementation
+...
+424 |     pub(crate) fn is_empty(&self) -> bool {
+    |                   ^^^^^^^^
+
+warning: method `seam_ratio` is never used
+  --> src\sns_split.rs:67:12
+   |
+20 | impl SnsTarget {
+   | -------------- method in this implementation
+...
+67 |     pub fn seam_ratio(self) -> f32 {
+   |            ^^^^^^^^^^
+
+warning: method `seam_ratio_parts` is never used
+   --> src\sns_split.rs:158:12
+    |
+157 | impl SnsSplitLayout {
+    | ------------------- method in this implementation
+158 |     pub fn seam_ratio_parts(self) -> (u128, u128) {
+    |            ^^^^^^^^^^^^^^^^
+
+warning: method `seek_for_remote_streaming` is never used
+    --> src\video\mod.rs:8730:19
+     |
+7533 | impl VideoPlayer {
+     | ---------------- method in this implementation
+...
+8730 |     pub(crate) fn seek_for_remote_streaming(&self, target_secs: f64) {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `command_tx` and `next_owner_id` are never read
+   --> src\video\audio.rs:269:5
+    |
+268 | pub(crate) struct AudioTapController {
+    |                   ------------------ fields in this struct
+269 |     command_tx: Sender<AudioTapCommand>,
+    |     ^^^^^^^^^^
+270 |     next_owner_id: Arc<AtomicU64>,
+    |     ^^^^^^^^^^^^^
+    |
+    = note: `AudioTapController` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: variant `Attach` is never constructed
+   --> src\video\audio.rs:283:5
+    |
+282 | enum AudioTapCommand {
+    |      --------------- variant in this enum
+283 |     Attach(ActiveAudioTap),
+    |     ^^^^^^
+
+warning: method `attach` is never used
+   --> src\video\audio.rs:294:19
+    |
+293 | impl AudioTapController {
+    | ----------------------- method in this implementation
+294 |     pub(crate) fn attach(
+    |                   ^^^^^^
+
+warning: field `next_remote_local_mute_owner` is never read
+   --> src\video\clock.rs:167:5
+    |
+ 98 | pub struct AvClock {
+    |            ------- field in this struct
+...
+167 |     next_remote_local_mute_owner: AtomicU64,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `acquire_remote_local_output_mute` is never used
+   --> src\video\clock.rs:910:19
+    |
+236 | impl AvClock {
+    | ------------ method in this implementation
+...
+910 |     pub(crate) fn acquire_remote_local_output_mute(self: &Arc<Self>) -> RemoteLocalOutputMuteLease {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `RemoteLocalOutputMuteLease` is never constructed
+   --> src\video\clock.rs:968:19
+    |
+968 | pub(crate) struct RemoteLocalOutputMuteLease {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `axis_diagnostics` is never read
+   --> src\video\seek_strip_thumbs.rs:297:16
+    |
+295 | pub(crate) struct StripThumbnailSnapshot {
+    |                   ---------------------- field in this struct
+296 |     pub(crate) axis: StripAxisResolution,
+297 |     pub(crate) axis_diagnostics: Option<StripAxisDiagnostics>,
+    |                ^^^^^^^^^^^^^^^^
+    |
+    = note: `StripThumbnailSnapshot` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: variant `Timeout` is never constructed
+  --> src\video\stream\session.rs:97:5
+   |
+92 | pub(crate) enum StreamResourceError {
+   |                 ------------------- variant in this enum
+...
+97 |     Timeout,
+   |     ^^^^^^^
+   |
+   = note: `StreamResourceError` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: `mimageviewer` (lib) generated 20 warnings (run `cargo fix --lib -p mimageviewer` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3m 00s
+     Running `target\debug\examples\review_v350_settings_migration.exe`
+after failed migration: legacy=1 external=0
+after ordinary save and reload: legacy=1 external=0 migration_marker=1
+CONFIRMED: the legacy registration is stranded by an unrelated successful save.

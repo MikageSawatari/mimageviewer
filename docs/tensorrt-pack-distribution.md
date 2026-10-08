@@ -24,6 +24,11 @@ NuGet / NVIDIA developer redist URL から ORT 1.24.2 GPU + CUDA 12.9 系 + cuDN
 `%APPDATA%/mimageviewer/tensorrt/` に展開する。完了で `INSTALL_OK` (JSON 版情報)
 が書かれる。
 
+`setup-tensorrt-pack.ps1` は `INSTALL_OK` を書く直前に
+`scripts/check-vcrt-pe-dependencies.ps1` を実行する。pack 内の全 PE imports、machine、SHA-256 と
+Microsoft ORT の署名を検査し、未知の VC runtime import や署名不正なら setup を完了扱いにしない。
+VC runtime 4本は pack へ重複同梱せず、本体 core exe 隣の app-local runtime を使う。
+
 この時点では builder_resource を含む全 ~6.7 GB が展開されている。
 
 ## 2. 全モデルの AMPERE_PLUS engine を事前ビルド
@@ -73,6 +78,9 @@ Apr 29 の v2 trim test (`scripts/trim_dlls_v2.sh` を使用、`session_run min 
 ```bash
 cargo run --release --features dev-tools --bin build_trt_pack
 ```
+
+pack builder は manifest 作成後に同じ全 PE gate を通し、成功した場合だけ生成完了とする。
+report は `target/vcrt-pe-reports/trt-pack-v3.json` に残る。
 
 出力:
 
@@ -164,6 +172,10 @@ Running フェーズ中に [キャンセル] を押す → 部分 DL ファイ�
 メッセージが出るか確認。
 
 ## 6. GitHub Releases へのアップロード
+
+通常は `scripts/upload-trt-pack.ps1` を使う。この script も upload の前に dist pack の全 PE gate を
+再実行するため、setup / build 後に DLL が置換された場合も公開しない。以下の `gh` 手順を手動で
+行う場合も、先に同 script と同じ gate が成功していることを確認する。
 
 ```bash
 # (a) タグを切る (git tag 名は manifest_format/PACK_VERSION と整合させる)

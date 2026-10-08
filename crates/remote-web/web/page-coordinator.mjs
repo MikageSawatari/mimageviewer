@@ -17,6 +17,7 @@ export const PageJobState = Object.freeze({
   READY: "ready",
   FAILED: "failed",
   ABORTED: "aborted",
+  SKIPPED: "skipped",
   CANCELLED: "cancelled",
 });
 
@@ -60,6 +61,7 @@ const TERMINAL_JOB_STATES = new Set([
   PageJobState.READY,
   PageJobState.FAILED,
   PageJobState.ABORTED,
+  PageJobState.SKIPPED,
 ]);
 
 const RELEASE_CAUSES = new Set(Object.values(PageCancelCause));
@@ -141,6 +143,7 @@ export class PageDisplayCoordinator {
   #jobsById;
   #currentJobIds;
   #terminalFailureKeys;
+  #skippedPlanKeys;
 
   constructor({
     hasBytes = () => false,
@@ -163,6 +166,7 @@ export class PageDisplayCoordinator {
     this.#jobsById = new Map();
     this.#currentJobIds = new Map();
     this.#terminalFailureKeys = new Set();
+    this.#skippedPlanKeys = new Set();
   }
 
   nextDisplayRequestId() {
@@ -237,6 +241,9 @@ export class PageDisplayCoordinator {
     }
     this.#planKeys = uniqueKeys(keys);
     this.#planKeySet = new Set(this.#planKeys);
+    for (const keyId of this.#skippedPlanKeys) {
+      if (!this.#planKeySet.has(keyId)) this.#skippedPlanKeys.delete(keyId);
+    }
     const effects = [];
     this.#reconcile(effects, PageCancelCause.NO_DEMAND);
     this.#collectGroupOutcomes(effects);
@@ -269,6 +276,14 @@ export class PageDisplayCoordinator {
       }];
     }
     job.state = outcome.status;
+    if (outcome.status === PageJobState.SKIPPED) {
+      this.#currentJobIds.delete(job.keyId);
+      if (this.#planKeySet.has(job.keyId)) this.#skippedPlanKeys.add(job.keyId);
+      const effects = [];
+      this.#reconcile(effects, PageCancelCause.NO_DEMAND);
+      this.#collectGroupOutcomes(effects);
+      return orderedEffects(effects);
+    }
     if (
       outcome.status === PageJobState.FAILED ||
       outcome.status === PageJobState.ABORTED
@@ -309,6 +324,7 @@ export class PageDisplayCoordinator {
     this.#planKeySet.clear();
     this.#currentJobIds.clear();
     this.#terminalFailureKeys.clear();
+    this.#skippedPlanKeys.clear();
     this.#pruneJobHistory();
     return orderedEffects(effects);
   }
@@ -341,6 +357,10 @@ export class PageDisplayCoordinator {
 
   openRequestIds() {
     return [...this.#requests.keys()];
+  }
+
+  hasPendingDisplayDemand(keyId) {
+    return this.#pendingDisplayRequestId(keyId) !== undefined;
   }
 
   #hasDemand(keyId) {
@@ -392,7 +412,10 @@ export class PageDisplayCoordinator {
     }
     for (const [keyId, jobId] of [...this.#currentJobIds]) {
       const job = this.#jobsById.get(jobId);
-      if (this.#hasDemand(keyId)) continue;
+      const orphanedForeground = job?.state === PageJobState.RUNNING
+        && job.priority === PageJobPriority.FOREGROUND
+        && !this.hasPendingDisplayDemand(keyId);
+      if (this.#hasDemand(keyId) && !orphanedForeground) continue;
       this.#currentJobIds.delete(keyId);
       if (job?.state !== PageJobState.RUNNING) continue;
       job.state = PageJobState.CANCELLED;
@@ -429,6 +452,7 @@ export class PageDisplayCoordinator {
     for (const keyId of this.#planKeys) {
       if (activePrefetches >= this.#prefetchConcurrency) break;
       if (this.#terminalFailureKeys.has(keyId)) continue;
+      if (this.#skippedPlanKeys.has(keyId)) continue;
       if (this.#displayDemands.get(keyId)?.size) continue;
       if (this.#currentJob(keyId) || this.#hasBytes(keyId)) continue;
       if (!this.#prefetchAdmits(keyId)) break;

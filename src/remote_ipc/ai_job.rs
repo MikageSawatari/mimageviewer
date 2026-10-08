@@ -27,11 +27,13 @@ impl ContainerRemoteAiExecutor {
 impl RemoteAiExecutor for ContainerRemoteAiExecutor {
     fn execute(
         &self,
+        owner: &str,
         request: &RemoteAiStartRequest,
         progress: &dyn RemoteAiProgressSink,
         cancel: &Arc<AtomicBool>,
     ) -> RemoteAiExecutionOutcome {
-        self.engine.execute_remote_ai(request, progress, cancel)
+        self.engine
+            .execute_remote_ai(owner, request, progress, cancel)
     }
 }
 
@@ -45,6 +47,7 @@ pub(crate) trait RemoteAiProgressSink: Send + Sync {
 pub(crate) trait RemoteAiExecutor: Send + Sync {
     fn execute(
         &self,
+        owner: &str,
         request: &RemoteAiStartRequest,
         progress: &dyn RemoteAiProgressSink,
         cancel: &Arc<AtomicBool>,
@@ -62,6 +65,7 @@ pub(crate) enum RemoteAiPageExecutionOutcome {
 pub(crate) enum RemoteAiExecutionOutcome {
     Completed(Vec<RemoteAiPageExecutionOutcome>),
     Superseded(String),
+    SettingsRecoveryInProgress(String),
     Failed(String),
 }
 
@@ -134,6 +138,22 @@ pub(crate) struct RemoteAiJobRegistry {
     inner: Mutex<RegistryState>,
     executor: Arc<dyn RemoteAiExecutor>,
     origin: Instant,
+    #[cfg(test)]
+    completion_publication_hooks: Mutex<CompletionPublicationTestHooks>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct CompletionPublicationTestBarrier {
+    arrived: Arc<std::sync::Barrier>,
+    release: Arc<std::sync::Barrier>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct CompletionPublicationTestHooks {
+    before_admission: Option<CompletionPublicationTestBarrier>,
+    after_admission: Option<CompletionPublicationTestBarrier>,
 }
 
 impl RemoteAiJobRegistry {
@@ -142,7 +162,26 @@ impl RemoteAiJobRegistry {
             inner: Mutex::new(RegistryState::default()),
             executor,
             origin: Instant::now(),
+            #[cfg(test)]
+            completion_publication_hooks: Mutex::new(CompletionPublicationTestHooks::default()),
         })
+    }
+
+    #[cfg(test)]
+    fn wait_at_completion_publication_test_barrier(
+        &self,
+        select: impl FnOnce(&CompletionPublicationTestHooks) -> Option<CompletionPublicationTestBarrier>,
+    ) {
+        let barrier = select(
+            &self
+                .completion_publication_hooks
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
+        if let Some(barrier) = barrier {
+            barrier.arrived.wait();
+            barrier.release.wait();
+        }
     }
 
     fn now(&self) -> Duration {
@@ -257,7 +296,7 @@ impl RemoteAiJobRegistry {
         state.jobs.insert(
             job_id.clone(),
             JobEntry {
-                owner,
+                owner: owner.clone(),
                 request: request.clone(),
                 snapshot: snapshot.clone(),
                 cancel,
@@ -268,13 +307,14 @@ impl RemoteAiJobRegistry {
         );
         drop(state);
 
-        self.spawn_job(job_id, request, RemoteAiJobLease::new(operation));
+        self.spawn_job(job_id, owner, request, RemoteAiJobLease::new(operation));
         RemoteAiStartResponse::Accepted(snapshot)
     }
 
     fn spawn_job(
         self: &Arc<Self>,
         job_id: String,
+        owner: String,
         request: RemoteAiStartRequest,
         lease: RemoteAiJobLease,
     ) {
@@ -316,16 +356,55 @@ impl RemoteAiJobRegistry {
                 );
                 let cancel = registry.cancel_for(&thread_job_id);
                 let outcome = match cancel {
-                    Some(cancel) => executor.execute(&request, &reporter, &cancel),
+                    Some(cancel) => executor.execute(&owner, &request, &reporter, &cancel),
                     None => {
                         RemoteAiExecutionOutcome::Failed("AI 処理を開始できませんでした".to_owned())
                     }
                 };
-                let success = matches!(outcome, RemoteAiExecutionOutcome::Completed(_));
                 if let Some(cause) = lease.drain_cause() {
                     registry.on_session_drain_inner(cause);
                 }
+                #[cfg(test)]
+                if matches!(outcome, RemoteAiExecutionOutcome::Completed(_)) {
+                    registry.wait_at_completion_publication_test_barrier(|hooks| {
+                        hooks.before_admission.clone()
+                    });
+                }
+                let (outcome, publication_lease) =
+                    if matches!(outcome, RemoteAiExecutionOutcome::Completed(_)) {
+                        match crate::settings_db::acquire_settings_family_read_lease() {
+                        Ok(publication_lease) => {
+                            #[cfg(test)]
+                            registry.wait_at_completion_publication_test_barrier(|hooks| {
+                                hooks.after_admission.clone()
+                            });
+                            (outcome, Some(publication_lease))
+                        }
+                        Err(crate::settings_db::SettingsDbError::SettingsFamilyQuiescing) => (
+                            RemoteAiExecutionOutcome::SettingsRecoveryInProgress(
+                                "設定の復元またはリセット中です。完了後にもう一度実行してください"
+                                    .to_owned(),
+                            ),
+                            None,
+                        ),
+                        Err(error) => {
+                            crate::logger::log(format!(
+                                "remote_ipc: remote AI completion publication failed: {error}"
+                            ));
+                            (
+                                RemoteAiExecutionOutcome::Failed(
+                                    "AI 処理結果を公開できませんでした".to_owned(),
+                                ),
+                                None,
+                            )
+                        }
+                    }
+                    } else {
+                        (outcome, None)
+                    };
+                let success = matches!(outcome, RemoteAiExecutionOutcome::Completed(_));
                 registry.complete(&thread_job_id, outcome);
+                drop(publication_lease);
                 lease.finish(success);
             });
         if let Err(error) = spawn {
@@ -428,6 +507,16 @@ impl RemoteAiJobRegistry {
                 job,
                 RemoteAiJobState::Superseded,
                 terminal_detail(RemoteAiTerminalCode::SourceChanged, message, None),
+                now,
+            ),
+            RemoteAiExecutionOutcome::SettingsRecoveryInProgress(message) => set_terminal(
+                job,
+                RemoteAiJobState::Failed,
+                terminal_detail(
+                    RemoteAiTerminalCode::SettingsRecoveryInProgress,
+                    message,
+                    None,
+                ),
                 now,
             ),
             RemoteAiExecutionOutcome::Failed(message) => set_terminal(
@@ -774,9 +863,11 @@ fn missing_job_error(state: &RegistryState, owner: &str, job_id: &str) -> Remote
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Barrier;
     use std::sync::mpsc;
 
     struct FakeCall {
+        owner: String,
         request_id: String,
         cancel: Arc<AtomicBool>,
         complete: mpsc::Sender<FakeCompletion>,
@@ -785,6 +876,7 @@ mod tests {
     enum FakeCompletion {
         Ready,
         Failed(&'static str),
+        SettingsRecoveryInProgress,
         NotApplicable(RemoteAiTerminalCode),
         Mixed(RemoteAiTerminalCode),
     }
@@ -796,6 +888,7 @@ mod tests {
     impl RemoteAiExecutor for ControlledExecutor {
         fn execute(
             &self,
+            owner: &str,
             request: &RemoteAiStartRequest,
             _progress: &dyn RemoteAiProgressSink,
             cancel: &Arc<AtomicBool>,
@@ -803,6 +896,7 @@ mod tests {
             let (complete, wait) = mpsc::channel();
             self.calls
                 .send(FakeCall {
+                    owner: owner.to_owned(),
                     request_id: request.request_id.clone(),
                     cancel: Arc::clone(cancel),
                     complete,
@@ -818,6 +912,11 @@ mod tests {
                 ),
                 FakeCompletion::Failed(message) => {
                     RemoteAiExecutionOutcome::Failed(message.to_owned())
+                }
+                FakeCompletion::SettingsRecoveryInProgress => {
+                    RemoteAiExecutionOutcome::SettingsRecoveryInProgress(
+                        "settings recovery; retry this operation".to_owned(),
+                    )
                 }
                 FakeCompletion::NotApplicable(code) => RemoteAiExecutionOutcome::Completed(
                     request
@@ -889,10 +988,15 @@ mod tests {
     }
 
     fn fixture() -> (
+        crate::settings_db::DataDirOverrideGuard,
         super::super::session::SessionHandle,
         Arc<RemoteAiJobRegistry>,
         mpsc::Receiver<FakeCall>,
     ) {
+        // Completed publication acquires the process-global settings-family lease. Keep this
+        // guard alive through terminal observation so parallel recovery tests cannot lend this
+        // fixture their temporary Quiescing/Quiesced phase.
+        let data_dir = crate::settings_db::DataDirOverrideGuard::new();
         let (calls, call_rx) = mpsc::channel();
         let registry = RemoteAiJobRegistry::new(Arc::new(ControlledExecutor { calls }));
         let session = super::super::session::SessionHandle::new();
@@ -908,7 +1012,7 @@ mod tests {
         );
         let generation = session.snapshot().generation;
         assert!(session.finish_acquire(generation));
-        (session, registry, call_rx)
+        (data_dir, session, registry, call_rx)
     }
 
     fn start(
@@ -935,6 +1039,7 @@ mod tests {
     }
 
     fn wait_for_state(
+        session: &super::super::session::SessionHandle,
         registry: &RemoteAiJobRegistry,
         job_id: &str,
         expected: RemoteAiJobState,
@@ -946,6 +1051,20 @@ mod tests {
                 RemoteAiStateResponse::Error(error) => panic!("state failed: {error:?}"),
             };
             if snapshot.state == expected {
+                if expected.is_terminal() {
+                    while session
+                        .snapshot()
+                        .active
+                        .as_ref()
+                        .is_some_and(|active| active.running_count != 0)
+                    {
+                        assert!(
+                            Instant::now() < deadline,
+                            "terminal state was visible before its executor operation finished"
+                        );
+                        std::thread::yield_now();
+                    }
+                }
                 return snapshot;
             }
             assert!(
@@ -959,12 +1078,13 @@ mod tests {
 
     #[test]
     fn ready_result_is_retained_then_becomes_typed_gone_tombstone() {
-        let (session, registry, calls) = fixture();
+        let (_data_dir, session, registry, calls) = fixture();
         let job = start(&session, &registry, "ready");
         let call = calls.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(call.owner, "client");
         assert_eq!(call.request_id, "ready");
         call.complete.send(FakeCompletion::Ready).unwrap();
-        wait_for_state(&registry, &job.job_id, RemoteAiJobState::Ready);
+        wait_for_state(&session, &registry, &job.job_id, RemoteAiJobState::Ready);
         assert!(matches!(
             registry.result("client", &job.job_id, 0),
             RemoteAiResultResponse::Success(PagePayload { bytes, .. }) if bytes == vec![1, 2, 3]
@@ -981,8 +1101,130 @@ mod tests {
     }
 
     #[test]
+    fn settings_recovery_failure_keeps_a_distinct_retry_terminal_code() {
+        let (_data_dir, session, registry, calls) = fixture();
+        let job = start(&session, &registry, "settings-recovery");
+        let call = calls.recv_timeout(Duration::from_secs(1)).unwrap();
+        call.complete
+            .send(FakeCompletion::SettingsRecoveryInProgress)
+            .unwrap();
+
+        let snapshot = wait_for_state(&session, &registry, &job.job_id, RemoteAiJobState::Failed);
+        assert!(matches!(
+            snapshot.terminal,
+            Some(RemoteAiTerminalDetail {
+                code: RemoteAiTerminalCode::SettingsRecoveryInProgress,
+                message,
+                ..
+            }) if message.contains("retry")
+        ));
+    }
+
+    #[test]
+    fn settings_recovery_started_before_completed_publication_prevents_ready() {
+        let (_data_dir, session, registry, calls) = fixture();
+        let arrived = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        registry
+            .completion_publication_hooks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .before_admission = Some(CompletionPublicationTestBarrier {
+            arrived: Arc::clone(&arrived),
+            release: Arc::clone(&release),
+        });
+
+        let job = start(&session, &registry, "settings-recovery-before-publication");
+        calls
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .complete
+            .send(FakeCompletion::Ready)
+            .unwrap();
+        arrived.wait();
+        let permit = crate::settings_db::quiesce_settings_family().unwrap();
+        release.wait();
+
+        let snapshot = wait_for_state(&session, &registry, &job.job_id, RemoteAiJobState::Failed);
+        assert!(matches!(
+            snapshot.terminal,
+            Some(RemoteAiTerminalDetail {
+                code: RemoteAiTerminalCode::SettingsRecoveryInProgress,
+                ..
+            })
+        ));
+        assert!(!matches!(
+            registry.result("client", &job.job_id, 0),
+            RemoteAiResultResponse::Success(_)
+        ));
+        permit.resume_local().unwrap();
+    }
+
+    #[test]
+    fn completed_publication_lease_delays_settings_recovery_until_ready_is_visible() {
+        let (_data_dir, session, registry, calls) = fixture();
+        let arrived = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        registry
+            .completion_publication_hooks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .after_admission = Some(CompletionPublicationTestBarrier {
+            arrived: Arc::clone(&arrived),
+            release: Arc::clone(&release),
+        });
+
+        let job = start(&session, &registry, "publication-before-settings-recovery");
+        calls
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .complete
+            .send(FakeCompletion::Ready)
+            .unwrap();
+        arrived.wait();
+
+        let (permit_tx, permit_rx) = mpsc::channel();
+        let quiesce = std::thread::spawn(move || {
+            permit_tx
+                .send(crate::settings_db::quiesce_settings_family())
+                .unwrap();
+        });
+        let quiescing_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match crate::settings_db::acquire_settings_family_read_lease() {
+                Err(crate::settings_db::SettingsDbError::SettingsFamilyQuiescing) => break,
+                Ok(probe) => drop(probe),
+                Err(error) => panic!("settings-family phase probe failed: {error}"),
+            }
+            assert!(
+                Instant::now() < quiescing_deadline,
+                "settings recovery did not enter quiescing"
+            );
+            std::thread::yield_now();
+        }
+        assert!(matches!(
+            permit_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        release.wait();
+
+        let snapshot = wait_for_state(&session, &registry, &job.job_id, RemoteAiJobState::Ready);
+        assert!(snapshot.terminal.is_none());
+        assert!(matches!(
+            registry.result("client", &job.job_id, 0),
+            RemoteAiResultResponse::Success(_)
+        ));
+        let permit = permit_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("quiesce completes after publication")
+            .expect("mutation permit");
+        quiesce.join().unwrap();
+        permit.resume_local().unwrap();
+    }
+
+    #[test]
     fn disconnect_drain_waits_for_executor_acknowledgement() {
-        let (session, registry, calls) = fixture();
+        let (_data_dir, session, registry, calls) = fixture();
         let job = start(&session, &registry, "disconnect");
         let call = calls.recv_timeout(Duration::from_secs(1)).unwrap();
         let generation = session.snapshot().generation;
@@ -990,7 +1232,13 @@ mod tests {
         session.local_disconnect();
         assert!(call.cancel.load(Ordering::Acquire));
         assert_eq!(
-            wait_for_state(&registry, &job.job_id, RemoteAiJobState::Cancelling).state,
+            wait_for_state(
+                &session,
+                &registry,
+                &job.job_id,
+                RemoteAiJobState::Cancelling,
+            )
+            .state,
             RemoteAiJobState::Cancelling
         );
         assert!(!session.complete_app_drain(generation));
@@ -1000,7 +1248,12 @@ mod tests {
         );
 
         call.complete.send(FakeCompletion::Ready).unwrap();
-        let terminal = wait_for_state(&registry, &job.job_id, RemoteAiJobState::DiscardedByHost);
+        let terminal = wait_for_state(
+            &session,
+            &registry,
+            &job.job_id,
+            RemoteAiJobState::DiscardedByHost,
+        );
         assert_eq!(
             terminal.terminal.unwrap().code,
             RemoteAiTerminalCode::DiscardedByHost
@@ -1014,7 +1267,7 @@ mod tests {
 
     #[test]
     fn explicit_cancel_and_supersede_are_distinct_terminal_results() {
-        let (session, registry, calls) = fixture();
+        let (_data_dir, session, registry, calls) = fixture();
         let cancelled = start(&session, &registry, "cancel");
         let cancelled_call = calls.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(matches!(
@@ -1027,6 +1280,7 @@ mod tests {
         assert!(cancelled_call.cancel.load(Ordering::Acquire));
         cancelled_call.complete.send(FakeCompletion::Ready).unwrap();
         wait_for_state(
+            &session,
             &registry,
             &cancelled.job_id,
             RemoteAiJobState::CancelledByUser,
@@ -1039,13 +1293,18 @@ mod tests {
         assert!(old_call.cancel.load(Ordering::Acquire));
         old_call.complete.send(FakeCompletion::Ready).unwrap();
         new_call.complete.send(FakeCompletion::Ready).unwrap();
-        wait_for_state(&registry, &old.job_id, RemoteAiJobState::Superseded);
-        wait_for_state(&registry, &new.job_id, RemoteAiJobState::Ready);
+        wait_for_state(
+            &session,
+            &registry,
+            &old.job_id,
+            RemoteAiJobState::Superseded,
+        );
+        wait_for_state(&session, &registry, &new.job_id, RemoteAiJobState::Ready);
     }
 
     #[test]
     fn recoverable_query_keeps_the_same_nonterminal_job_identity() {
-        let (session, registry, calls) = fixture();
+        let (_data_dir, session, registry, calls) = fixture();
         let job = start(&session, &registry, "recover");
         let call = calls.recv_timeout(Duration::from_secs(1)).unwrap();
         let recovered = match registry.recoverable("client") {
@@ -1057,12 +1316,12 @@ mod tests {
         call.complete
             .send(FakeCompletion::Failed("expected failure"))
             .unwrap();
-        wait_for_state(&registry, &job.job_id, RemoteAiJobState::Failed);
+        wait_for_state(&session, &registry, &job.job_id, RemoteAiJobState::Failed);
     }
 
     #[test]
     fn all_not_applicable_pages_complete_as_ready_with_typed_page_outcomes() {
-        let (session, registry, calls) = fixture();
+        let (_data_dir, session, registry, calls) = fixture();
         for (index, code) in [
             RemoteAiTerminalCode::VectorPdf,
             RemoteAiTerminalCode::SizeGate,
@@ -1080,7 +1339,8 @@ mod tests {
                 .complete
                 .send(FakeCompletion::NotApplicable(code))
                 .unwrap();
-            let completed = wait_for_state(&registry, &job.job_id, RemoteAiJobState::Ready);
+            let completed =
+                wait_for_state(&session, &registry, &job.job_id, RemoteAiJobState::Ready);
             assert!(completed.terminal.is_none());
             assert_eq!(completed.page_outcomes.len(), 1);
             assert_eq!(
@@ -1107,7 +1367,7 @@ mod tests {
 
     #[test]
     fn mixed_ready_and_not_applicable_pages_publish_only_the_ready_result() {
-        let (session, registry, calls) = fixture();
+        let (_data_dir, session, registry, calls) = fixture();
         let mut mixed_request = request("mixed-page-outcomes");
         mixed_request
             .pages
@@ -1124,7 +1384,7 @@ mod tests {
             .send(FakeCompletion::Mixed(RemoteAiTerminalCode::VectorPdf))
             .unwrap();
 
-        let completed = wait_for_state(&registry, &job.job_id, RemoteAiJobState::Ready);
+        let completed = wait_for_state(&session, &registry, &job.job_id, RemoteAiJobState::Ready);
         assert!(completed.terminal.is_none());
         assert_eq!(completed.page_outcomes.len(), 2);
         assert_eq!(
@@ -1151,6 +1411,7 @@ mod tests {
 
     #[test]
     fn waiting_for_local_drain_dispatches_only_after_acquire_finishes() {
+        let _data_dir = crate::settings_db::DataDirOverrideGuard::new();
         let (calls, call_rx) = mpsc::channel();
         let registry = RemoteAiJobRegistry::new(Arc::new(ControlledExecutor { calls }));
         let session = super::super::session::SessionHandle::new();
@@ -1169,12 +1430,12 @@ mod tests {
         assert!(session.finish_acquire(session.snapshot().generation));
         let call = call_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         call.complete.send(FakeCompletion::Ready).unwrap();
-        wait_for_state(&registry, &job.job_id, RemoteAiJobState::Ready);
+        wait_for_state(&session, &registry, &job.job_id, RemoteAiJobState::Ready);
     }
 
     #[test]
     fn expired_start_is_rejected_before_registry_insert_or_executor_dispatch() {
-        let (session, registry, calls) = fixture();
+        let (_data_dir, session, registry, calls) = fixture();
         let owner = session.owner_for_test("client");
         let operation = session
             .begin_operation(&owner, "expired remote AI test".to_owned())
@@ -1195,15 +1456,25 @@ mod tests {
 
     #[test]
     fn background_expiry_keeps_typed_terminal_until_executor_ack() {
-        let (session, registry, calls) = fixture();
+        let (_data_dir, session, registry, calls) = fixture();
         let job = start(&session, &registry, "background-expiry");
         let call = calls.recv_timeout(Duration::from_secs(1)).unwrap();
         registry.on_session_drain(RemoteLongJobDrainCause::BackgroundExpired);
         assert!(call.cancel.load(Ordering::Acquire));
-        wait_for_state(&registry, &job.job_id, RemoteAiJobState::Cancelling);
+        wait_for_state(
+            &session,
+            &registry,
+            &job.job_id,
+            RemoteAiJobState::Cancelling,
+        );
 
         call.complete.send(FakeCompletion::Ready).unwrap();
-        let terminal = wait_for_state(&registry, &job.job_id, RemoteAiJobState::BackgroundExpired);
+        let terminal = wait_for_state(
+            &session,
+            &registry,
+            &job.job_id,
+            RemoteAiJobState::BackgroundExpired,
+        );
         assert_eq!(
             terminal.terminal.unwrap().code,
             RemoteAiTerminalCode::BackgroundExpired
@@ -1212,11 +1483,11 @@ mod tests {
 
     #[test]
     fn terminal_retention_expires_at_ten_minute_boundary() {
-        let (session, registry, calls) = fixture();
+        let (_data_dir, session, registry, calls) = fixture();
         let job = start(&session, &registry, "retention-boundary");
         let call = calls.recv_timeout(Duration::from_secs(1)).unwrap();
         call.complete.send(FakeCompletion::Ready).unwrap();
-        wait_for_state(&registry, &job.job_id, RemoteAiJobState::Ready);
+        wait_for_state(&session, &registry, &job.job_id, RemoteAiJobState::Ready);
 
         let mut state = registry
             .inner
@@ -1240,11 +1511,11 @@ mod tests {
 
     #[test]
     fn repeated_result_reads_return_stored_bytes_without_reexecuting() {
-        let (session, registry, calls) = fixture();
+        let (_data_dir, session, registry, calls) = fixture();
         let job = start(&session, &registry, "stored-result");
         let call = calls.recv_timeout(Duration::from_secs(1)).unwrap();
         call.complete.send(FakeCompletion::Ready).unwrap();
-        wait_for_state(&registry, &job.job_id, RemoteAiJobState::Ready);
+        wait_for_state(&session, &registry, &job.job_id, RemoteAiJobState::Ready);
 
         for _ in 0..2 {
             assert!(matches!(

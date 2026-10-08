@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use crate::grid_item::GridItem;
 use crate::rating_db::{RatingItemKind, RatingRow};
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum RatingViewSort {
     Normal(crate::settings::SortOrder),
     RatedAtDesc,
@@ -22,6 +22,15 @@ impl Default for RatingViewSort {
 }
 
 impl RatingViewSort {
+    pub(crate) fn normalized_for_rating_view(self) -> Self {
+        match self {
+            Self::Normal(order) if order.is_rating() => {
+                Self::Normal(crate::settings::SortOrder::FileName)
+            }
+            _ => self,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Normal(order) => order.label(),
@@ -61,10 +70,55 @@ pub struct RatingViewBuildResult {
     pub stars: u8,
     pub rows: Vec<RatingViewRow>,
     pub skipped: usize,
+    pub(crate) prepared: Option<RatingViewPreparedItems>,
+}
+
+pub(crate) struct RatingViewPreparedItems {
+    pub(crate) items: Vec<GridItem>,
+    pub(crate) image_metas: Vec<Option<(i64, i64)>>,
+    pub(crate) existing_keys: std::collections::HashSet<String>,
+    pub(crate) pin_map:
+        std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    pub(crate) video_items: Vec<(usize, PathBuf, u64)>,
+    pub(crate) video_thumb_overrides: std::collections::HashMap<String, PathBuf>,
+    pub(crate) page_edits: crate::app::page_edit_snapshot::StablePageEditProjection,
+    pub(crate) rating_stamp: crate::page_edit_write_epoch::WriteStamp,
+    pub(crate) tag_stamp: crate::page_edit_write_epoch::WriteStamp,
+    pub(crate) rating_cache: std::collections::HashMap<usize, u8>,
+    pub(crate) tags_cache: std::collections::HashMap<String, Vec<String>>,
+}
+
+pub(crate) struct RatingViewPrepareOptions {
+    pub(crate) sort: RatingViewSort,
+    pub(crate) include_epub: bool,
+    pub(crate) intent: RatingViewBuildIntent,
+    pub(crate) display_order: crate::settings::GridDisplayOrder,
+    pub(crate) pin_db: Option<Arc<crate::folder_thumb_pins::FolderThumbPinDb>>,
+    pub(crate) folder_thumb_sort: crate::settings::SortOrder,
+    pub(crate) folder_thumb_depth: u32,
+    pub(crate) edits: crate::app::page_edit_snapshot::PageEditAvailability,
+    pub(crate) tags_db_path: Option<PathBuf>,
+    pub(crate) sidecar_settings: crate::settings::Settings,
+}
+
+/// A rating write changes membership without replacing the installed order.
+/// Explicit open, sort and reload requests instead establish a new order.
+pub(crate) enum RatingViewBuildIntent {
+    Reorder,
+    Membership { survivor_keys: Vec<String> },
 }
 
 pub struct RatingViewPending {
     pub stars: u8,
+    pub sequence: u64,
+    pub source_generation: u64,
+    pub(crate) context: crate::app::ViewerContextId,
+    pub rating_write_generation: u64,
+    pub sort: RatingViewSort,
+    pub(crate) membership_only: bool,
+    /// Direct/history entry keeps its outgoing grid mounted until prepared rows are adopted.
+    /// Ordinary reorder and membership refreshes leave this empty.
+    pub(crate) navigation: Option<crate::app::RatingNavigationTransition>,
     pub cancel: Arc<AtomicBool>,
     pub rx: mpsc::Receiver<Result<RatingViewBuildResult, String>>,
 }
@@ -75,19 +129,44 @@ impl RatingViewPending {
     }
 }
 
-pub fn spawn_rating_view_build(db_path: PathBuf, stars: u8) -> RatingViewPending {
+pub(crate) fn spawn_rating_view_build(
+    db_path: PathBuf,
+    stars: u8,
+    sequence: u64,
+    source_generation: u64,
+    context: crate::app::ViewerContextId,
+    rating_write_generation: u64,
+    options: RatingViewPrepareOptions,
+) -> RatingViewPending {
+    let options_sort = options.sort;
+    let membership_only = matches!(options.intent, RatingViewBuildIntent::Membership { .. });
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_worker = Arc::clone(&cancel);
     let (tx, rx) = mpsc::channel();
+    #[cfg(test)]
+    let test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::capture();
     std::thread::Builder::new()
         .name("rating-view-build".to_string())
         .spawn(move || {
-            let result = build_rating_view_rows(db_path, stars, &cancel_worker)
-                .map_err(|err| err.to_string());
+            #[cfg(test)]
+            let _test_epoch_scope =
+                test_epoch_scope.map(crate::page_edit_write_epoch::TestEpochScope::enter);
+            let result = prepare_rating_view(db_path, stars, options, &cancel_worker);
             let _ = tx.send(result);
         })
         .ok();
-    RatingViewPending { stars, cancel, rx }
+    RatingViewPending {
+        stars,
+        sequence,
+        source_generation,
+        context,
+        rating_write_generation,
+        sort: options_sort,
+        membership_only,
+        navigation: None,
+        cancel,
+        rx,
+    }
 }
 
 fn build_rating_view_rows(
@@ -117,7 +196,183 @@ fn build_rating_view_rows(
         stars,
         rows: out,
         skipped,
+        prepared: None,
     })
+}
+
+fn prepare_rating_view(
+    db_path: PathBuf,
+    stars: u8,
+    options: RatingViewPrepareOptions,
+    cancel: &AtomicBool,
+) -> Result<RatingViewBuildResult, String> {
+    let rating_before = crate::rating_db::RATING_WRITES.sample();
+    let mut result = match build_rating_view_rows(db_path, stars, cancel) {
+        Ok(result) => result,
+        Err(error) => return Err(error.to_string()),
+    };
+    if !options.include_epub {
+        result.rows.retain(|row| {
+            !matches!(&row.item, GridItem::PdfFile(path) if path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("epub")))
+        });
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Err("cancelled".into());
+    }
+    let (mut items, mut image_metas) = sort_and_materialize_rows(
+        &mut result.rows,
+        options.sort.normalized_for_rating_view(),
+        &options.display_order,
+    );
+    if let RatingViewBuildIntent::Membership { survivor_keys } = options.intent {
+        retain_rating_view_survivors_and_append_candidates(&mut result.rows, &survivor_keys);
+        (items, image_metas) = crate::grid_item::materialize_view_rows(
+            &mut result.rows,
+            &options.display_order,
+            false,
+            |row| &row.item,
+            |row| row.image_meta,
+        );
+    }
+    let video_items = items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            let GridItem::Video(path) = item else {
+                return None;
+            };
+            let size = image_metas[index]
+                .map(|(_, size)| size.max(0) as u64)
+                .unwrap_or(0);
+            Some((index, path.clone(), size))
+        })
+        .collect();
+    let media_paths = items
+        .iter()
+        .filter_map(|item| match item {
+            GridItem::Video(path) | GridItem::Audio(path) => Some(path.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let sidecars = crate::app::folder_scan::discover_aggregate_video_sidecars_while(
+        &options.sidecar_settings,
+        &media_paths,
+        64,
+        || !cancel.load(Ordering::Relaxed),
+    )
+    .ok_or_else(|| "cancelled".to_string())?;
+    if sidecars.skipped_parents > 0 {
+        crate::logger::log(format!(
+            "rating sidecar discovery capped: scanned={} skipped={}",
+            sidecars.scanned_parents, sidecars.skipped_parents
+        ));
+    }
+    for (parent, error) in &sidecars.scan_errors {
+        crate::logger::log(format!(
+            "rating sidecar discovery failed {}: {error}",
+            parent.display()
+        ));
+    }
+    let video_thumb_overrides = sidecars.by_video_path;
+    let pin_map = if let Some(db) = options.pin_db.as_ref() {
+        let containers = items
+            .iter()
+            .filter_map(GridItem::container_path)
+            .collect::<Vec<_>>();
+        db.lookup_many(containers)
+    } else {
+        Default::default()
+    };
+    let existing_keys = items
+        .iter()
+        .zip(image_metas.iter())
+        .flat_map(|(item, meta)| {
+            crate::app::folder_thumb_existing_keys_for(
+                item,
+                *meta,
+                &pin_map,
+                options.pin_db.as_deref(),
+                Some(options.folder_thumb_sort),
+                options.folder_thumb_depth,
+                true,
+            )
+        })
+        .collect();
+    let page_edits = crate::app::page_edit_snapshot::PageEditSnapshot::load_and_project_stable(
+        &items,
+        options.edits,
+        cancel,
+    )?
+    .ok_or_else(|| "page-edit read changed during rating prepare".to_string())?;
+    let rating_cache = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.accepts_rating())
+        .map(|(index, _)| (index, stars))
+        .collect();
+    let tag_keys = items
+        .iter()
+        .filter_map(crate::app::tag_item_path)
+        .map(crate::tags_db::item_key_for_path)
+        .collect::<std::collections::HashSet<_>>();
+    let tag_before = crate::tags_db::TAG_WRITES.sample();
+    if tag_before.active_writers != 0 {
+        return Err("tag read changed during rating prepare".into());
+    }
+    let mut loaded_tags = options
+        .tags_db_path
+        .as_deref()
+        .and_then(|path| crate::tags_db::TagsDb::open_readonly(path).ok())
+        .map(|db| db.get_many_display_tags(&tag_keys.iter().cloned().collect::<Vec<_>>()))
+        .unwrap_or_default();
+    let tags_cache = tag_keys
+        .into_iter()
+        .map(|key| {
+            let tags = loaded_tags.remove(&key).unwrap_or_default();
+            (key, tags)
+        })
+        .collect();
+    let tag_stamp = crate::tags_db::TAG_WRITES.sample();
+    if !crate::page_edit_write_epoch::EditWriteEpoch::read_is_stable(tag_before, tag_stamp) {
+        return Err("tag read changed during rating prepare".into());
+    }
+    let rating_stamp = rating_before;
+    result.prepared = Some(RatingViewPreparedItems {
+        items,
+        image_metas,
+        existing_keys,
+        pin_map,
+        video_items,
+        video_thumb_overrides,
+        page_edits,
+        rating_stamp,
+        tag_stamp,
+        rating_cache,
+        tags_cache,
+    });
+    Ok(result)
+}
+
+fn retain_rating_view_survivors_and_append_candidates(
+    rows: &mut Vec<RatingViewRow>,
+    survivor_keys: &[String],
+) {
+    let candidates = std::mem::take(rows);
+    let mut by_key = candidates
+        .iter()
+        .cloned()
+        .map(|row| (row.key.clone(), row))
+        .collect::<std::collections::HashMap<_, _>>();
+    for key in survivor_keys {
+        if let Some(row) = by_key.remove(key) {
+            rows.push(row);
+        }
+    }
+    for candidate in candidates {
+        if let Some(row) = by_key.remove(&candidate.key) {
+            rows.push(row);
+        }
+    }
 }
 
 pub fn sort_rows(rows: &mut [RatingViewRow], sort: RatingViewSort) {
@@ -163,9 +418,21 @@ fn compare_row_names(
     let name_b = b.item.name();
     let key_a = order.name_key(name_a.as_ref());
     let key_b = order.name_key(name_b.as_ref());
-    let mtime_a = a.image_meta.map(|(mtime, _)| mtime).unwrap_or(0);
-    let mtime_b = b.image_meta.map(|(mtime, _)| mtime).unwrap_or(0);
-    order.compare_name_keys(&key_a, mtime_a, &key_b, mtime_b)
+    let meta_a = crate::grid_item::listing_sort_metadata_for_item(
+        &a.item,
+        crate::settings::ListingSortMetadata::new(
+            a.image_meta.map(|(mtime, _)| mtime).unwrap_or(0),
+            a.image_meta.map(|(_, size)| size),
+        ),
+    );
+    let meta_b = crate::grid_item::listing_sort_metadata_for_item(
+        &b.item,
+        crate::settings::ListingSortMetadata::new(
+            b.image_meta.map(|(mtime, _)| mtime).unwrap_or(0),
+            b.image_meta.map(|(_, size)| size),
+        ),
+    );
+    order.compare_listing_keys(&key_a, meta_a, &key_b, meta_b)
 }
 
 fn cmp_optional_i64_none_last(
@@ -261,15 +528,14 @@ fn item_from_legacy_key(row: &RatingRow) -> Option<GridItem> {
         return item_from_plain_path(&existing_path(PathBuf::from(&row.key))?);
     };
     let container = existing_path(PathBuf::from(left))?;
-    let ext = ext_lower(&container);
-    if ext == "pdf" {
-        if let Some(page_num) = parse_page_key(right) {
-            return Some(GridItem::PdfPage {
-                pdf_path: container,
-                page_num,
-                content_type: None,
-            });
-        }
+    if crate::folder_tree::is_paged_document_path(&container)
+        && let Some(page_num) = parse_page_key(right)
+    {
+        return Some(GridItem::PdfPage {
+            pdf_path: container,
+            page_num,
+            content_type: None,
+        });
     }
     if entry_is_image(right) {
         let entry_name = resolve_legacy_zip_entry_name(&container, right)?;
@@ -298,7 +564,7 @@ fn item_from_plain_path(path: &Path) -> Option<GridItem> {
         Some(GridItem::Audio(path.to_path_buf()))
     } else if crate::folder_tree::is_zip_extension(&ext) {
         Some(GridItem::ZipFile(path.to_path_buf()))
-    } else if ext == "pdf" {
+    } else if crate::folder_tree::is_paged_document_path(path) {
         Some(GridItem::PdfFile(path.to_path_buf()))
     } else if let Some(format) = crate::archive_converter::ArchiveFormat::from_extension(&ext) {
         Some(GridItem::ConvertibleArchive {
@@ -324,10 +590,12 @@ fn key_source_path(key: &str) -> Option<PathBuf> {
 }
 
 fn existing_path(path: PathBuf) -> Option<PathBuf> {
-    if matches!(path.try_exists(), Ok(true)) {
-        return Some(path);
-    }
-    find_case_insensitive_sibling(&path)
+    let existing = if matches!(path.try_exists(), Ok(true)) {
+        path
+    } else {
+        find_case_insensitive_sibling(&path)?
+    };
+    Some(crate::path_key::restore_existing_path_casing(&existing).unwrap_or(existing))
 }
 
 fn find_case_insensitive_sibling(path: &Path) -> Option<PathBuf> {
@@ -438,6 +706,72 @@ mod tests {
     use crate::rating_db::{RatingItemKind, RatingRow};
     use std::io::Write;
 
+    #[test]
+    fn rating_view_normalizes_its_selected_rating_sort_only() {
+        let mut rows = vec![
+            RatingViewRow {
+                key: "b".into(),
+                item: GridItem::Image(PathBuf::from(r"C:\rating\b.jpg")),
+                image_meta: Some((20, 1)),
+                rated_at_ms: Some(20),
+            },
+            RatingViewRow {
+                key: "a".into(),
+                item: GridItem::Image(PathBuf::from(r"C:\rating\a.jpg")),
+                image_meta: Some((10, 1)),
+                rated_at_ms: Some(10),
+            },
+        ];
+        sort_rows(
+            &mut rows,
+            RatingViewSort::Normal(crate::settings::SortOrder::DateDesc)
+                .normalized_for_rating_view(),
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.key.as_str()).collect::<Vec<_>>(),
+            ["b", "a"]
+        );
+        sort_rows(
+            &mut rows,
+            RatingViewSort::Normal(crate::settings::SortOrder::RatingDesc)
+                .normalized_for_rating_view(),
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.key.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        sort_rows(
+            &mut rows,
+            RatingViewSort::RatedAtDesc.normalized_for_rating_view(),
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.key.as_str()).collect::<Vec<_>>(),
+            ["b", "a"]
+        );
+    }
+
+    #[test]
+    fn rating_membership_keeps_survivors_and_appends_newcomers() {
+        let make = |key: &str| RatingViewRow {
+            key: key.into(),
+            item: GridItem::Image(PathBuf::from(format!(r"C:\rating\{key}.jpg"))),
+            image_meta: None,
+            rated_at_ms: None,
+        };
+        let mut candidates = vec![make("a"), make("c"), make("d")];
+        retain_rating_view_survivors_and_append_candidates(
+            &mut candidates,
+            &["b".into(), "c".into(), "a".into()],
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|row| row.key.as_str())
+                .collect::<Vec<_>>(),
+            ["c", "a", "d"]
+        );
+    }
+
     fn row(key: String, kind: Option<RatingItemKind>, source_path: Option<String>) -> RatingRow {
         RatingRow {
             key,
@@ -516,6 +850,7 @@ mod tests {
     /// §1.142: ★時刻順の間はカテゴリ再配置を通さず、`sort_rows` の結果がそのまま出る。
     #[test]
     fn rated_at_sort_is_not_regrouped_by_category() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let display_order = crate::settings::GridDisplayOrder::default();
         let mut expected = mixed_rows();
         sort_rows(&mut expected, RatingViewSort::RatedAtDesc);
@@ -537,6 +872,7 @@ mod tests {
     /// 昇順でも同じ。NULL は昇順でも末尾に残る。
     #[test]
     fn rated_at_ascending_sort_is_not_regrouped_by_category() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let display_order = crate::settings::GridDisplayOrder::default();
         let mut expected = mixed_rows();
         sort_rows(&mut expected, RatingViewSort::RatedAtAsc);
@@ -554,6 +890,7 @@ mod tests {
     /// `Normal` は従来どおりカテゴリ順 (1 行目 = フォルダ + アーカイブ)。
     #[test]
     fn normal_sort_still_groups_by_category() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let display_order = crate::settings::GridDisplayOrder::default();
         let mut rows = mixed_rows();
         let (items, _) = sort_and_materialize_rows(
@@ -570,6 +907,67 @@ mod tests {
         assert_eq!(keys(&rows), item_keys(&items, &rows));
     }
 
+    #[test]
+    fn normal_size_sort_distinguishes_real_zero_and_virtual_unknown() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut rows = vec![
+            RatingViewRow {
+                key: "virtual".into(),
+                item: GridItem::PdfPage {
+                    pdf_path: PathBuf::from(r"C:\x\book.pdf"),
+                    page_num: 1,
+                    content_type: None,
+                },
+                image_meta: Some((1, 1)),
+                rated_at_ms: Some(1),
+            },
+            RatingViewRow {
+                key: "ten".into(),
+                item: GridItem::Image(PathBuf::from(r"C:\x\ten.jpg")),
+                image_meta: Some((1, 10)),
+                rated_at_ms: Some(1),
+            },
+            RatingViewRow {
+                key: "zero".into(),
+                item: GridItem::Image(PathBuf::from(r"C:\x\zero.jpg")),
+                image_meta: Some((1, 0)),
+                rated_at_ms: Some(1),
+            },
+        ];
+        sort_rows(
+            &mut rows,
+            RatingViewSort::Normal(crate::settings::SortOrder::SizeAsc),
+        );
+        assert_eq!(keys(&rows), ["zero", "ten", "virtual"]);
+    }
+
+    #[test]
+    fn normal_sort_applies_name_and_numeric_desc() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let base = vec![
+            RatingViewRow {
+                key: "two".into(),
+                item: GridItem::Image(PathBuf::from(r"C:\x\page2.jpg")),
+                image_meta: Some((1, 1)),
+                rated_at_ms: Some(1),
+            },
+            RatingViewRow {
+                key: "ten".into(),
+                item: GridItem::Image(PathBuf::from(r"C:\x\page10.jpg")),
+                image_meta: Some((1, 1)),
+                rated_at_ms: Some(1),
+            },
+        ];
+        for order in [
+            crate::settings::SortOrder::FileNameDesc,
+            crate::settings::SortOrder::NumericDesc,
+        ] {
+            let mut rows = base.clone();
+            sort_rows(&mut rows, RatingViewSort::Normal(order));
+            assert_eq!(keys(&rows), ["ten", "two"], "{order:?}");
+        }
+    }
+
     fn write_zip_entries(zip_path: &Path, entries: &[&str]) {
         let file = std::fs::File::create(zip_path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
@@ -584,6 +982,7 @@ mod tests {
 
     #[test]
     fn restores_explicit_pdf_page_without_index_conversion() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let pdf = temp.path().join("Book.pdf");
         std::fs::write(&pdf, b"pdf").unwrap();
@@ -599,10 +998,57 @@ mod tests {
             GridItem::PdfPage { page_num, .. } => assert_eq!(page_num, 0),
             _ => panic!("expected PdfPage"),
         }
+        let epub = temp.path().join("Book.EPUB");
+        std::fs::write(&epub, b"epub").unwrap();
+        let mut rated_page = row(
+            "ignored".to_string(),
+            Some(RatingItemKind::PdfPage),
+            Some(epub.to_string_lossy().to_string()),
+        );
+        rated_page.page_num = Some(0);
+        assert!(
+            matches!(rating_row_to_view_row(&rated_page).unwrap().item, GridItem::PdfPage { pdf_path, page_num: 0, .. } if pdf_path == epub)
+        );
+        let rated_book = row(epub.to_string_lossy().to_string(), None, None);
+        assert!(
+            matches!(rating_row_to_view_row(&rated_book).unwrap().item, GridItem::PdfFile(path) if path == epub)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rated_folder_uses_physical_name_and_path_instead_of_normalized_store_key() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("MiXeDParent").join("AlbumF");
+        std::fs::create_dir_all(&folder).unwrap();
+        let db_path = temp.path().join("rating.db");
+        let db = crate::rating_db::RatingDb::open_at(&db_path).unwrap();
+        let key = crate::path_key::normalize_keep_drive(&folder);
+        let meta = crate::rating_db::RatingMeta::new(RatingItemKind::Folder)
+            .with_source_path(Path::new(&key));
+        db.set_user_rating(&key, 1, Some(&meta)).unwrap();
+
+        let result = build_rating_view_rows(db_path, 1, &AtomicBool::new(false)).unwrap();
+        assert_eq!(result.skipped, 0);
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].key, key, "rating.db key stays normalized");
+        assert_eq!(result.rows[0].item.name(), "AlbumF");
+        assert!(
+            matches!(&result.rows[0].item, GridItem::Folder(path) if path.to_string_lossy() == folder.to_string_lossy())
+        );
+
+        let legacy = row(key, None, None);
+        let restored = rating_row_to_view_row(&legacy).unwrap();
+        assert_eq!(restored.item.name(), "AlbumF");
+        assert!(
+            matches!(&restored.item, GridItem::Folder(path) if path.to_string_lossy() == folder.to_string_lossy())
+        );
     }
 
     #[test]
     fn restores_legacy_zip_image_key() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let zip = temp.path().join("Book.zip");
         write_zip_entries(&zip, &["Dir/Page.JPG"]);
@@ -618,6 +1064,7 @@ mod tests {
 
     #[test]
     fn skips_ambiguous_legacy_zip_image_key() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let zip = temp.path().join("Book.zip");
         write_zip_entries(&zip, &["Dir/Page.JPG", "dir/page.jpg"]);
@@ -629,6 +1076,7 @@ mod tests {
 
     #[test]
     fn rated_at_sort_keeps_null_last() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let a = temp.path().join("a.jpg");
         let b = temp.path().join("b.jpg");
@@ -666,5 +1114,49 @@ mod tests {
         assert_eq!(rows[0].rated_at_ms, Some(10));
         assert_eq!(rows[1].rated_at_ms, Some(20));
         assert_eq!(rows[2].rated_at_ms, None);
+    }
+    #[test]
+    fn audio_sidecar_is_prepared_by_rating_worker_with_released_setting_off_preserved() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let audio = temp.path().join("song.flac");
+        let cover = temp.path().join("song.png");
+        std::fs::write(&audio, b"flac").unwrap();
+        std::fs::write(&cover, b"image").unwrap();
+        let db_path = temp.path().join("rating.db");
+        let db = crate::rating_db::RatingDb::open_at(&db_path).unwrap();
+        let key = crate::path_key::normalize_keep_drive(&audio);
+        let meta =
+            crate::rating_db::RatingMeta::new(RatingItemKind::Audio).with_source_path(&audio);
+        db.set_user_rating(&key, 3, Some(&meta)).unwrap();
+        drop(db);
+        for enabled in [true, false] {
+            let mut settings = crate::settings::Settings::default();
+            settings.video_thumb_use_sidecar_image = enabled;
+            let result = prepare_rating_view(
+                db_path.clone(),
+                3,
+                RatingViewPrepareOptions {
+                    sort: RatingViewSort::default(),
+                    include_epub: true,
+                    intent: RatingViewBuildIntent::Reorder,
+                    display_order: settings.grid_display_order.clone(),
+                    pin_db: None,
+                    folder_thumb_sort: settings.folder_thumb_sort,
+                    folder_thumb_depth: settings.folder_thumb_depth,
+                    edits: Default::default(),
+                    tags_db_path: None,
+                    sidecar_settings: settings.thumbnail_source_discovery_snapshot(),
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            let prepared = result.prepared.unwrap();
+            assert!(matches!(&prepared.items[..], [GridItem::Audio(path)] if path == &audio));
+            assert_eq!(
+                prepared.video_thumb_overrides.get(&key),
+                enabled.then_some(&cover)
+            );
+        }
     }
 }

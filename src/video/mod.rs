@@ -29,6 +29,8 @@ pub mod anime4k_policy;
 pub mod audio;
 pub mod audio_diagnostics;
 pub mod audio_stretch;
+pub mod audio_track_selection;
+pub mod audio_track_ui;
 pub mod avio_progress;
 pub mod clock;
 pub mod clockless_transcode;
@@ -61,6 +63,7 @@ pub(crate) mod native_window_host;
 mod native_window_pump;
 #[cfg(all(test, windows))]
 mod native_window_thread_spike;
+pub(crate) mod normalize_gain;
 pub mod normalize_scanner;
 pub mod normalize_types;
 pub mod screenshot;
@@ -89,8 +92,13 @@ pub mod zoom_view;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
+use audio_track_selection::{AudioTrackRequestOutcome, AudioTrackSelection};
+pub use audio_track_selection::{
+    AudioTrackSelectOutcome, AudioTrackSelectResult, AudioTrackSelectionDisplayState,
+    AudioTrackSelectionSnapshot, AudioTrackSwitchFailureReason, SavedAudioTrackChoice,
+};
 use clock::AvClock;
 use decoder::{DecodeHandles, VideoFrame, VideoFrameData, VideoInfo};
 use thumbnail::{Thumbnail, ThumbnailWorker};
@@ -99,6 +107,9 @@ use std::sync::{Mutex, OnceLock};
 
 use engine::EngineEvent;
 use engine::actor::{EngineActor, OpenOptions};
+pub use engine::actor::{
+    InternalContinuation, PlaybackStartContext, PlaybackStartOrigin, PlaybackSuccess,
+};
 
 /// Worker/native-window notifications share one root-viewport wake owner per player.
 ///
@@ -152,6 +163,18 @@ impl EngineEventSender {
         result
     }
 
+    pub(crate) fn send_timeout(
+        &self,
+        event: EngineEvent,
+        timeout: std::time::Duration,
+    ) -> Result<(), crossbeam_channel::SendTimeoutError<EngineEvent>> {
+        let result = self.tx.send_timeout(event, timeout);
+        if result.is_ok() {
+            self.ui_wake.wake();
+        }
+        result
+    }
+
     #[allow(dead_code)]
     pub(crate) fn send(
         &self,
@@ -188,7 +211,8 @@ pub(crate) struct RemoteStreamStartInputs {
     pub(crate) has_video: bool,
     pub(crate) has_audio: bool,
     pub(crate) source_origin_secs: f64,
-    pub(crate) normalize_gain: f64,
+    pub(crate) audio_stream_index: usize,
+    pub(crate) default_audio_stream_index: Option<usize>,
 }
 
 fn engine_state_code_name(code: u8) -> &'static str {
@@ -245,6 +269,36 @@ impl VideoContinuousMode {
             Self::ContinuousLoop => "連続再生 + ループ",
         }
     }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum LocalDspPosition {
+    CurrentAfterMetadata,
+    Exact(f64),
+}
+
+#[cfg(windows)]
+impl LocalDspPosition {
+    fn resolve(self, current_position_secs: f64) -> f64 {
+        match self {
+            Self::CurrentAfterMetadata => current_position_secs,
+            Self::Exact(position_secs) => position_secs,
+        }
+    }
+}
+
+#[cfg(windows)]
+struct PendingLocalDspHandoff {
+    handoff: audio::LocalDspHandoff,
+    requested_position: LocalDspPosition,
+}
+
+#[cfg(windows)]
+enum LocalDspAcquisition {
+    Idle,
+    AwaitingMetadata(LocalDspPosition),
+    Waiting(PendingLocalDspHandoff),
 }
 
 pub struct VideoPlayer {
@@ -309,7 +363,15 @@ pub struct VideoPlayer {
     video_output: VideoOutputState,
     /// 保持目的に加え、Remote streaming session が audio tap controller を取得する。
     audio: Option<audio::AudioOutput>,
+    #[cfg(windows)]
+    dsp_handoff: Mutex<LocalDspAcquisition>,
     info: Option<VideoInfo>,
+    /// Created by demux only after audio setup succeeds and accepted here only
+    /// when the output device is active.
+    audio_track_selection: Option<Arc<AudioTrackSelection>>,
+    /// InfoReceived から 1 回だけ UI へ渡す。音声出力 lane とは独立。
+    audio_track_open_notice: Mutex<Option<audio_track_selection::AudioTrackOpenNotice>>,
+    last_saved_audio_track_generation: AtomicU64,
     /// open 失敗 / DLL ロード失敗のメッセージ。Some なら UI は赤字エラー表示する。
     error: Option<String>,
     /// シーク先サムネ抽出ワーカー。Drop で停止する。
@@ -343,14 +405,14 @@ pub struct VideoPlayer {
     /// シーク完了 (override が 1 度クリア) で None に戻す。
     seek_inflight_since: Option<std::time::Instant>,
     /// 「seek が EOF に達したまま完了しない」状態を最初に観測した壁時計時刻。
-    /// `is_seeking() && is_eof_reached()` が継続して true の間だけ `Some`。
+    /// `is_seeking() && is_demux_exhausted()` が継続して true の間だけ `Some`。
     /// `info.duration_secs` (コンテナ尺) が最終フレーム PTS より後ろのことが多く、
     /// その付近を target にした seek は backward seek 自体は成功する (= seek 失敗
     /// 経路の override clear が走らない) のに、video decoder が target 以降の
     /// フレームを 1 枚も返せず post-seek frame / 音声による override clear 経路も
     /// 発火しない。結果 `seek_target_override` が固着して「シーク中...」が出続ける。
     /// この時刻から一定時間 (`SEEK_STUCK_EOF_TIMEOUT`) 経過しても解除されなければ、
-    /// tick 側の保険として override を強制クリアする。`is_eof_reached()` は demux が
+    /// tick 側の保険として override を強制クリアする。`is_demux_exhausted()` は demux が
     /// ファイル全体を読み切ったときだけ true (request_seek で一旦クリア) なので、
     /// 進行中の通常 seek を誤検出しない。
     /// (詳細は [docs/video-architecture.md] の seek HUD 節を参照。)
@@ -444,13 +506,13 @@ fn native_child_should_set_focus(placement: NativeVideoPlacement, activate_on_sh
 }
 
 /// 上下バーの固定表示状態を 1 つの値として扱う。presenter の生成時に渡す初期値と、
-/// 後からの変更 (`SetBarLockState`) の両方が同じ型を通ることで、「生まれたときだけ固定を
+/// 後からの変更 (`SetChromeSnapshot`) の両方が同じ型を通ることで、「生まれたときだけ固定を
 /// 知らない」状態を作らない。
 ///
 /// シークストリップの高さも同じ値に含める。**帯が場所を取るかどうかは snapshot の有無で
 /// 変わるが、取るときにいくつ取るかは設定でしか変わらない**ので、snapshot と一緒に運ぶと
 /// 動画の切替中に予約高さだけ消える (§1.162 と同型)。presenter を作り直しても
-/// `cur_bar_lock` として保たれる、この経路が高さの正本になる。
+/// `cur_chrome_policy.bars` として保たれる、この経路が高さの正本になる。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NativeBarLockState {
     pub top_locked: bool,
@@ -458,6 +520,8 @@ pub struct NativeBarLockState {
     pub fixed_bar_gap_px: u32,
     pub seek_strip_height: crate::video::seek_strip_layout::SeekStripHeight,
     pub seek_strip_height_values: crate::video::seek_strip_layout::SeekStripHeightValues,
+    pub seek_preview_size: crate::settings::VideoSeekPreviewSize,
+    pub seek_preview_size_values: crate::settings::VideoSeekPreviewSizeValues,
     pub seek_hover_preview_mode: crate::settings::VideoSeekHoverPreviewMode,
     pub seek_bar_with_strip: crate::settings::VideoSeekBarWithStrip,
 }
@@ -471,6 +535,285 @@ impl NativeBarLockState {
                 .min(crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX),
             ..self
         }
+    }
+}
+
+/// Raw policy owned by the source's viewer context. Resolve at the render destination.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NativeChromePolicy {
+    pub bars: NativeBarLockState,
+    pub side_panel_mode: crate::settings::FsSidePanelMode,
+    pub(crate) info_open: crate::ui_helpers::MetadataPanelOpenState,
+    pub info_locked: bool,
+    pub suppression: crate::settings::FullscreenChromeSuppression,
+}
+
+/// Exact existing window lease/host incarnation, carried across the prepare boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeDetachedChromeHost {
+    pub window_id: u64,
+    pub incarnation: u64,
+    pub hwnd: u64,
+    pub borderless_applied: bool,
+}
+
+impl NativeDetachedChromeHost {
+    fn same_host(self, other: Self) -> bool {
+        self.window_id == other.window_id
+            && self.incarnation == other.incarnation
+            && self.hwnd == other.hwnd
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeDetachedChromeFact {
+    pub host: NativeDetachedChromeHost,
+    pub generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NativeChromeSnapshot {
+    pub policy: NativeChromePolicy,
+    pub detached: Option<NativeDetachedChromeFact>,
+}
+
+/// Target-local facts live with the core, so rollback restores them with that core.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NativeChromeState {
+    pub(crate) policy: NativeChromePolicy,
+    pub(crate) placement: NativeVideoPlacement,
+    pub(crate) generation: u64,
+    pub(crate) detached: Option<NativeDetachedChromeHost>,
+}
+
+#[cfg(windows)]
+impl NativeChromeState {
+    pub(crate) fn apply(&mut self, snapshot: NativeChromeSnapshot) {
+        self.policy = snapshot.policy;
+        self.policy.bars = self.policy.bars.clamped();
+        if let (Some(current), Some(fact)) = (self.detached, snapshot.detached)
+            && fact.generation == self.generation
+            && current.same_host(fact.host)
+        {
+            self.detached = Some(fact.host);
+        }
+    }
+
+    pub(crate) fn surface(self) -> crate::ui_helpers::ViewerChromeSurface {
+        use crate::ui_helpers::ViewerChromeSurface;
+        match self.placement {
+            NativeVideoPlacement::FullscreenBorderless => ViewerChromeSurface::Fullscreen,
+            NativeVideoPlacement::DetachedViewerChild => {
+                self.detached
+                    .map_or(ViewerChromeSurface::MainEmbedded, |host| {
+                        ViewerChromeSurface::Detached {
+                            window_id: host.window_id,
+                            borderless_applied: host.borderless_applied,
+                        }
+                    })
+            }
+            _ => ViewerChromeSurface::MainEmbedded,
+        }
+    }
+
+    pub(crate) fn resolved(self) -> crate::ui_helpers::ResolvedViewerChrome {
+        crate::ui_helpers::ResolvedViewerChrome::resolve(
+            self.surface(),
+            self.policy.suppression,
+            self.policy.bars.top_locked,
+            self.policy.bars.bottom_lock,
+            self.policy.info_locked,
+            false,
+        )
+    }
+}
+
+#[cfg(all(windows, test))]
+mod chrome_suppression_transport_tests {
+    use super::*;
+    use crate::settings::{BottomBarLock, FullscreenChromeSuppression};
+
+    fn policy() -> NativeChromePolicy {
+        NativeChromePolicy {
+            bars: NativeBarLockState {
+                top_locked: true,
+                bottom_lock: BottomBarLock::BarAndStrip,
+                ..Default::default()
+            },
+            info_locked: true,
+            suppression: FullscreenChromeSuppression {
+                top: true,
+                bottom: true,
+                info: true,
+                navigator: true,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn chrome_suppression_command_bus_defers_one_latest_policy_across_commit_and_abort() {
+        for (abort, retire_phase) in [(false, false), (true, false), (true, true)] {
+            let (tx, rx) = native_command_bus(8, Arc::new(AtomicBool::new(false)));
+            let mut first = policy();
+            first.info_locked = false;
+            tx.send(NativeVideoOutputCommand::SetChromeSnapshot {
+                snapshot: NativeChromeSnapshot {
+                    policy: first,
+                    detached: None,
+                },
+                source_epoch: 3,
+            })
+            .unwrap();
+            let mut latest = policy();
+            latest.bars.fixed_bar_gap_px = 17;
+            latest.info_open = crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle;
+            tx.send(NativeVideoOutputCommand::SetChromeSnapshot {
+                snapshot: NativeChromeSnapshot {
+                    policy: latest,
+                    detached: None,
+                },
+                source_epoch: 3,
+            })
+            .unwrap();
+            tx.send(if abort {
+                NativeVideoOutputCommand::AbortPlacement { request_id: 41 }
+            } else {
+                NativeVideoOutputCommand::CommitPlacement {
+                    request_id: 41,
+                    generation: 2,
+                }
+            })
+            .unwrap();
+            let mut deferred = std::collections::VecDeque::new();
+            let control =
+                consume_placement_transition_batch(rx.drain(), &mut deferred, 41, 2, retire_phase);
+            assert!(matches!(control, Some(PlacementTransitionControl::Abort)) == abort);
+            assert_eq!(
+                deferred.len(),
+                1,
+                "the bar/panel latest slot must retain one coherent policy"
+            );
+            let NativeVideoOutputCommand::SetChromeSnapshot {
+                snapshot,
+                source_epoch,
+            } = deferred.pop_front().unwrap()
+            else {
+                panic!("normal chrome command must survive placement waiting");
+            };
+            assert_eq!(source_epoch, 3);
+            let mut applied = NativeChromeState {
+                policy: first,
+                placement: if abort {
+                    NativeVideoPlacement::MainWindowChild
+                } else {
+                    NativeVideoPlacement::FullscreenBorderless
+                },
+                generation: if abort { 1 } else { 2 },
+                detached: None,
+            };
+            applied.apply(snapshot);
+            assert_eq!(applied.policy, latest);
+            assert_eq!(applied.resolved().top_locked, abort);
+            assert_eq!(applied.resolved().info_locked, abort);
+        }
+    }
+
+    #[test]
+    fn chrome_suppression_delayed_raw_update_uses_committed_target_and_abort_restores_old_surface()
+    {
+        let mut old = NativeChromeState {
+            policy: policy(),
+            placement: NativeVideoPlacement::MainWindowChild,
+            generation: 1,
+            detached: None,
+        };
+        let snapshot = NativeChromeSnapshot {
+            policy: policy(),
+            detached: None,
+        };
+        let mut candidate = NativeChromeState {
+            placement: NativeVideoPlacement::FullscreenBorderless,
+            generation: 2,
+            ..old
+        };
+        candidate.apply(snapshot); // A pre-commit App snapshot deferred until after commit.
+        assert!(!candidate.resolved().top_locked);
+        assert_eq!(candidate.resolved().bottom_lock, BottomBarLock::None);
+        assert!(!candidate.resolved().info_locked);
+        // Both pre-commit rejection and post-commit rollback retain this original core's facts.
+        old.apply(snapshot);
+        assert!(old.resolved().top_locked && old.resolved().info_locked);
+        assert_eq!(old.resolved().bottom_lock, BottomBarLock::BarAndStrip);
+        let mut changed = snapshot;
+        changed.policy.bars.top_locked = false;
+        old.apply(changed);
+        assert!(!old.resolved().top_locked); // Raw changes are retained, not backed up/restored.
+    }
+
+    #[test]
+    fn chrome_suppression_host_updates_require_exact_identity_and_generation_without_losing_raw_policy()
+     {
+        let host = NativeDetachedChromeHost {
+            window_id: 9,
+            incarnation: 3,
+            hwnd: 44,
+            borderless_applied: true,
+        };
+        let mut target = NativeChromeState {
+            policy: policy(),
+            placement: NativeVideoPlacement::DetachedViewerChild,
+            generation: 8,
+            detached: Some(host),
+        };
+        for stale in [
+            None,
+            Some(NativeDetachedChromeFact {
+                host: NativeDetachedChromeHost {
+                    borderless_applied: false,
+                    ..host
+                },
+                generation: 7,
+            }),
+            Some(NativeDetachedChromeFact {
+                host: NativeDetachedChromeHost {
+                    incarnation: 2,
+                    borderless_applied: false,
+                    ..host
+                },
+                generation: 8,
+            }),
+            Some(NativeDetachedChromeFact {
+                host: NativeDetachedChromeHost {
+                    window_id: 10,
+                    borderless_applied: false,
+                    ..host
+                },
+                generation: 8,
+            }),
+        ] {
+            let mut update = policy();
+            update.bars.fixed_bar_gap_px = 17;
+            target.apply(NativeChromeSnapshot {
+                policy: update,
+                detached: stale,
+            });
+            assert!(!target.resolved().top_locked);
+            assert_eq!(target.policy.bars.fixed_bar_gap_px, 17);
+            assert_eq!(target.detached, Some(host));
+        }
+        target.apply(NativeChromeSnapshot {
+            policy: policy(),
+            detached: Some(NativeDetachedChromeFact {
+                host: NativeDetachedChromeHost {
+                    borderless_applied: false,
+                    ..host
+                },
+                generation: 8,
+            }),
+        });
+        assert!(target.resolved().top_locked && target.resolved().info_locked);
     }
 }
 
@@ -502,11 +845,10 @@ pub struct NativeVideoOutputConfig {
     pub anime4k_variant: Option<anime4k_policy::VideoAnime4kVariant>,
     pub anime4k_budget: anime4k_policy::VideoAnime4kBudgetPreset,
     /// CP7: HUD raise の allowlist 判定 (`foreground_allows_hud_raise`) で参照する
-    /// VST editor container HWND の snapshot。App が `dsp_bridge.editor_hwnds_snapshot()` を
+    /// VST editor container HWND/PID の snapshot。App が `dsp_bridge.editor_ui_snapshot()` を
     /// 渡す。`None` のとき HUD HWND を作っても raise 判定で常に false (= raise 起動しない)
     /// になるが、`SetWindowRgn` 経由の click-through は機能する。
-    pub editor_hwnds_snapshot:
-        Option<std::sync::Arc<std::sync::RwLock<std::collections::HashSet<u64>>>>,
+    pub editor_ui_snapshot: Option<dsp::SharedEditorUiSnapshot>,
     /// CP7: `foreground_allows_hud_raise` 判定用の main HWND (mIV メインウィンドウ)。
     /// 0 だと「mIV 既知 HWND」判定で main HWND が許可されなくなる (= presenter / HUD のみ
     /// 許可)。App が `self.main_hwnd` を渡す。
@@ -537,10 +879,13 @@ pub struct NativeVideoOutputConfig {
     ///   tick に十分な間隔にして無駄なスピンを避ける。
     /// `false` のとき従来の動画経路と**バイト等価**。
     pub audio_only: bool,
+    /// Opaque sRGB-byte color for the video canvas outside decoded pixels.
+    /// Audio-only presenters always receive black from the App boundary.
+    pub video_canvas_color: [u8; 3],
     /// presenter が最初のフレームを出す前から使う上下バー固定状態。
     /// これを渡さないと presenter は「固定なし」で生まれ、App の次フレームの
     /// `sync_native_video_metadata` が届くまで全域に描いてから縮む。
-    pub bar_lock: NativeBarLockState,
+    pub chrome: NativeChromeSnapshot,
 }
 
 #[cfg(any(windows, test))]
@@ -675,6 +1020,9 @@ fn video_scale_feedback_toast(
 #[cfg(windows)]
 #[derive(Clone, Debug)]
 pub enum NativeVideoOutputEvent {
+    SelectAudioTrack {
+        stream_index: usize,
+    },
     Window(native_window::NativeVideoWindowEvent),
     /// Latest presenter-side input ownership snapshot. This is observation
     /// state, not an App command, so `NativeVideoOutput::drain_events` consumes
@@ -732,30 +1080,39 @@ pub enum NativeVideoOutputEvent {
     },
     /// hover が外れて hover thumbnail 要求がもう不要 (T35)。
     ClearSeekThumbnail,
-    OpenSeekStrip,
+    OpenSeekStrip {
+        generation: u64,
+    },
     CloseSeekStrip {
         cause: seek_strip::SeekStripCloseCause,
+        stamp: seek_strip::SeekStripSessionEventStamp,
     },
     MoveSeekStrip {
         center: seek_strip::SeekStripCenter,
+        stamp: seek_strip::SeekStripEventStamp,
     },
     CommitSeekStrip {
         center: seek_strip::SeekStripCenter,
-    },
-    RequestSeekStripWindow {
-        center: seek_strip::SeekStripCenter,
-        visible_count: usize,
-        pixel_width: usize,
-        pixel_height: usize,
+        stamp: seek_strip::SeekStripEventStamp,
     },
     SetSeekStripView {
         view: seek_strip_layout::SeekStripView,
+        generation: u64,
+        expected: Option<seek_strip::SeekStripEventStamp>,
     },
     SetSeekStripHeight {
         height: seek_strip_layout::SeekStripHeight,
+        generation: u64,
+        expected: Option<seek_strip::SeekStripEventStamp>,
+    },
+    SetSeekPreviewSize {
+        size: crate::settings::VideoSeekPreviewSize,
+        generation: u64,
+        expected: Option<seek_strip::SeekStripEventStamp>,
     },
     StepSeekStripRange {
-        step: seek_strip::SeekStripRangeStep,
+        steps: Vec<seek_strip::SeekStripRangeStep>,
+        stamp: seek_strip::SeekStripEventStamp,
     },
     ToggleTileMode,
     TogglePerfOverlay,
@@ -763,8 +1120,13 @@ pub enum NativeVideoOutputEvent {
     ToggleBarLock {
         bar: NativeVideoBar,
     },
-    ToggleSeekStripLock,
+    ToggleSeekStripLock {
+        generation: u64,
+        expected: Option<seek_strip::SeekStripEventStamp>,
+    },
+    SeekStripPresentation(seek_strip::SeekStripPresentationEvent),
     ToggleClickInfoOpen,
+    CloseInfoPanel,
     ToggleInfoPanelLock,
     OpenTouchInfoPanel,
     DismissTouchSidePanels,
@@ -943,7 +1305,7 @@ const OUTPUT_EVENT_LATEST_OVERLAY_INPUT_ROUTING: usize = 3;
 #[cfg(windows)]
 const OUTPUT_EVENT_LATEST_SEEK_STRIP_MOVE: usize = 4;
 #[cfg(windows)]
-const OUTPUT_EVENT_LATEST_SEEK_STRIP_WINDOW: usize = 5;
+const OUTPUT_EVENT_LATEST_SEEK_STRIP_PRESENTATION: usize = 5;
 #[cfg(windows)]
 const OUTPUT_EVENT_LATEST_SLOTS: usize = 6;
 
@@ -961,8 +1323,8 @@ fn native_output_event_latest_slot(event: &NativeVideoOutputEvent) -> Option<usi
             Some(OUTPUT_EVENT_LATEST_OVERLAY_INPUT_ROUTING)
         }
         NativeVideoOutputEvent::MoveSeekStrip { .. } => Some(OUTPUT_EVENT_LATEST_SEEK_STRIP_MOVE),
-        NativeVideoOutputEvent::RequestSeekStripWindow { .. } => {
-            Some(OUTPUT_EVENT_LATEST_SEEK_STRIP_WINDOW)
+        NativeVideoOutputEvent::SeekStripPresentation(_) => {
+            Some(OUTPUT_EVENT_LATEST_SEEK_STRIP_PRESENTATION)
         }
         _ => None,
     }
@@ -973,6 +1335,17 @@ struct SequencedNativeOutputEvent {
     sequence: u64,
     source_epoch: u64,
     event: NativeVideoOutputEvent,
+    #[cfg(feature = "test-script")]
+    ui_smoke_button_dispatch: Option<native_ui_smoke::NativeUiSmokeButtonDispatchMetadata>,
+}
+
+#[cfg(windows)]
+pub(crate) struct NativeVideoOutputEventEnvelope {
+    pub(crate) source_epoch: u64,
+    pub(crate) event: NativeVideoOutputEvent,
+    #[cfg(feature = "test-script")]
+    pub(crate) ui_smoke_button_dispatch:
+        Option<native_ui_smoke::NativeUiSmokeButtonDispatchMetadata>,
 }
 
 #[cfg(windows)]
@@ -1024,11 +1397,39 @@ fn native_output_event_bus(
 #[cfg(windows)]
 impl NativeOutputEventSender {
     pub(crate) fn send(&self, source_epoch: u64, event: NativeVideoOutputEvent) {
+        self.send_inner(
+            source_epoch,
+            event,
+            #[cfg(feature = "test-script")]
+            None,
+        );
+    }
+
+    #[cfg(feature = "test-script")]
+    pub(crate) fn send_with_ui_smoke_button_dispatch(
+        &self,
+        source_epoch: u64,
+        event: NativeVideoOutputEvent,
+        dispatch: native_ui_smoke::NativeUiSmokeButtonDispatchMetadata,
+    ) {
+        self.send_inner(source_epoch, event, Some(dispatch));
+    }
+
+    fn send_inner(
+        &self,
+        source_epoch: u64,
+        event: NativeVideoOutputEvent,
+        #[cfg(feature = "test-script")] ui_smoke_button_dispatch: Option<
+            native_ui_smoke::NativeUiSmokeButtonDispatchMetadata,
+        >,
+    ) {
         let sequence = self.shared.next_sequence.fetch_add(1, Ordering::Relaxed);
         let queued = SequencedNativeOutputEvent {
             sequence,
             source_epoch,
             event,
+            #[cfg(feature = "test-script")]
+            ui_smoke_button_dispatch,
         };
         if let Some(slot) = native_output_event_latest_slot(&queued.event) {
             match self.shared.latest.lock() {
@@ -1051,11 +1452,38 @@ impl NativeOutputEventSender {
     pub(crate) fn wake_ui(&self) {
         self.shared.ui_wake.wake();
     }
+
+    fn publish_seek_strip_presentation(
+        &self,
+        source_epoch: u64,
+        event: seek_strip::SeekStripPresentationEvent,
+    ) -> Result<(), ()> {
+        let sequence = self.shared.next_sequence.fetch_add(1, Ordering::Relaxed);
+        let queued = SequencedNativeOutputEvent {
+            sequence,
+            source_epoch,
+            event: NativeVideoOutputEvent::SeekStripPresentation(event),
+            #[cfg(feature = "test-script")]
+            ui_smoke_button_dispatch: None,
+        };
+        match self.shared.latest.lock() {
+            Ok(mut latest) => {
+                latest[OUTPUT_EVENT_LATEST_SEEK_STRIP_PRESENTATION] = Some(queued);
+                self.shared.ui_wake.wake();
+                Ok(())
+            }
+            Err(_) => {
+                self.shared.overflow_fault.store(true, Ordering::Release);
+                self.shared.ui_wake.wake();
+                Err(())
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
 impl NativeOutputEventReceiver {
-    fn drain(&self) -> Vec<(u64, NativeVideoOutputEvent)> {
+    fn drain(&self) -> Vec<NativeVideoOutputEventEnvelope> {
         let mut events: Vec<_> = self.lossless_rx.try_iter().collect();
         match self.shared.latest.lock() {
             Ok(mut latest) => events.extend(latest.iter_mut().filter_map(Option::take)),
@@ -1064,7 +1492,12 @@ impl NativeOutputEventReceiver {
         events.sort_unstable_by_key(|event| event.sequence);
         events
             .into_iter()
-            .map(|event| (event.source_epoch, event.event))
+            .map(|event| NativeVideoOutputEventEnvelope {
+                source_epoch: event.source_epoch,
+                event: event.event,
+                #[cfg(feature = "test-script")]
+                ui_smoke_button_dispatch: event.ui_smoke_button_dispatch,
+            })
             .collect()
     }
 }
@@ -1126,6 +1559,9 @@ enum NativeVideoOutputCommand {
     SetVideoZoomState {
         state: Option<crate::video::zoom_view::VideoZoomState>,
     },
+    SetVideoCanvasColor {
+        color: [u8; 3],
+    },
     StartAnime4kMeasurement,
     SetAnime4kState {
         budget: anime4k_policy::VideoAnime4kBudgetPreset,
@@ -1141,13 +1577,9 @@ enum NativeVideoOutputCommand {
     SetMetadata {
         metadata: Option<native_presenter::NativeOverlayMetadata>,
     },
-    SetSidePanelState {
-        mode: crate::settings::FsSidePanelMode,
-        info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
-        info_panel_locked: bool,
-    },
-    SetBarLockState {
-        state: NativeBarLockState,
+    SetChromeSnapshot {
+        snapshot: NativeChromeSnapshot,
+        source_epoch: u64,
     },
     ResetSidePanelSession,
     SetLoopEnabled {
@@ -1230,6 +1662,7 @@ enum NativeVideoOutputCommand {
         rect: windows::Win32::Foundation::RECT,
         activate_on_show: bool,
         visible: bool,
+        chrome_host: Option<NativeDetachedChromeHost>,
     },
     CommitPlacement {
         request_id: u64,
@@ -1601,7 +2034,7 @@ impl<F> FramePresentationState<F> {
 }
 
 #[cfg(windows)]
-const NATIVE_COMMAND_LATEST_SLOTS: usize = 33;
+const NATIVE_COMMAND_LATEST_SLOTS: usize = 34;
 
 #[cfg(windows)]
 fn native_command_latest_slot(command: &NativeVideoOutputCommand) -> Option<usize> {
@@ -1612,7 +2045,7 @@ fn native_command_latest_slot(command: &NativeVideoOutputCommand) -> Option<usiz
         NativeVideoOutputCommand::SetJumpEntries { .. } => Some(3),
         NativeVideoOutputCommand::SetVideoGrade { .. } => Some(4),
         NativeVideoOutputCommand::SetMetadata { .. } => Some(5),
-        NativeVideoOutputCommand::SetSidePanelState { .. } => Some(6),
+        NativeVideoOutputCommand::SetChromeSnapshot { .. } => Some(6),
         NativeVideoOutputCommand::SetLoopEnabled { .. } => Some(7),
         NativeVideoOutputCommand::SetLoopMode { .. } => Some(8),
         NativeVideoOutputCommand::SetContinuousMode { .. } => Some(9),
@@ -1635,10 +2068,10 @@ fn native_command_latest_slot(command: &NativeVideoOutputCommand) -> Option<usiz
         NativeVideoOutputCommand::RaisePresenterToFront => Some(26),
         NativeVideoOutputCommand::RequestVideoScaleSettings { .. } => Some(27),
         NativeVideoOutputCommand::SetAnime4kState { .. } => Some(28),
-        NativeVideoOutputCommand::SetBarLockState { .. } => Some(29),
         NativeVideoOutputCommand::SetSeekStrip { .. } => Some(30),
         NativeVideoOutputCommand::SetPanoramaPose { .. } => Some(31),
         NativeVideoOutputCommand::SetVideoZoomState { .. } => Some(32),
+        NativeVideoOutputCommand::SetVideoCanvasColor { .. } => Some(33),
         NativeVideoOutputCommand::ResetSidePanelSession
         | NativeVideoOutputCommand::StartAnime4kMeasurement
         | NativeVideoOutputCommand::ShowToast { .. }
@@ -1676,6 +2109,50 @@ struct NativeCommandSender {
 struct NativeCommandReceiver {
     lossless_rx: crossbeam_channel::Receiver<SequencedNativeCommand>,
     shared: Arc<NativeCommandBusShared>,
+}
+
+#[cfg(all(windows, test))]
+pub(crate) struct NativeUiProbeForTest {
+    event_tx: NativeOutputEventSender,
+    command_rx: NativeCommandReceiver,
+}
+
+#[cfg(all(windows, test))]
+#[derive(Debug, PartialEq)]
+pub(crate) enum NativeUiCommandForTest {
+    Compact(bool),
+    Panel(Option<native_presenter::NativeOverlayVst3Panel>),
+    Available(bool),
+}
+
+#[cfg(all(windows, test))]
+impl NativeUiProbeForTest {
+    pub(crate) fn send_event(&self, event: NativeVideoOutputEvent) {
+        self.event_tx.send(0, event);
+    }
+
+    pub(crate) fn send_overlay_command(&self, command: native_presenter::NativeOverlayCommand) {
+        send_native_overlay_command(&self.event_tx, 0, 0, command);
+    }
+
+    pub(crate) fn drain_ui_commands(&self) -> Vec<NativeUiCommandForTest> {
+        self.command_rx
+            .drain()
+            .into_iter()
+            .filter_map(|command| match command {
+                NativeVideoOutputCommand::SetVideoCompact { compact } => {
+                    Some(NativeUiCommandForTest::Compact(compact))
+                }
+                NativeVideoOutputCommand::SetVst3Panel { panel } => {
+                    Some(NativeUiCommandForTest::Panel(panel))
+                }
+                NativeVideoOutputCommand::SetVst3Available { available } => {
+                    Some(NativeUiCommandForTest::Available(available))
+                }
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 #[cfg(windows)]
@@ -1742,6 +2219,13 @@ enum PlacementTransitionControl {
     Commit,
     Retire,
     Abort,
+}
+
+#[cfg(windows)]
+fn placement_control_releases_candidate_seek_strip_passive(
+    control: &PlacementTransitionControl,
+) -> bool {
+    matches!(control, PlacementTransitionControl::Retire)
 }
 
 #[cfg(windows)]
@@ -2060,7 +2544,19 @@ impl PresenterSourceState {
 }
 
 #[cfg(windows)]
+fn pack_native_video_canvas_color(color: [u8; 3]) -> u32 {
+    u32::from(color[0]) | (u32::from(color[1]) << 8) | (u32::from(color[2]) << 16)
+}
+
+#[cfg(all(windows, test))]
+fn unpack_native_video_canvas_color(packed: u32) -> [u8; 3] {
+    [packed as u8, (packed >> 8) as u8, (packed >> 16) as u8]
+}
+
+#[cfg(windows)]
 pub(crate) struct NativeVideoOutput {
+    #[cfg(feature = "test-script")]
+    ui_smoke_output_id: native_ui_smoke::NativeUiSmokeOutputId,
     cancel: Arc<AtomicBool>,
     hwnd: Arc<AtomicU64>,
     /// HUD overlay HWND (= bars / interactive UI 用の独立 top-level)。
@@ -2095,6 +2591,7 @@ pub(crate) struct NativeVideoOutput {
     last_vst3_available: AtomicBool,
     last_checked: AtomicBool,
     last_text_contrast_strong: AtomicBool,
+    last_video_canvas_color: AtomicU32,
     visibility_gate: Arc<NativeVideoOutputVisibilityGate>,
     command_tx: NativeCommandSender,
     event_rx: std::sync::Mutex<NativeOutputEventReceiver>,
@@ -2153,6 +2650,11 @@ struct NativeVideoOutputThreads {
 
 #[cfg(windows)]
 impl NativeVideoOutput {
+    #[cfg(feature = "test-script")]
+    pub(crate) fn ui_smoke_output_id(&self) -> native_ui_smoke::NativeUiSmokeOutputId {
+        self.ui_smoke_output_id
+    }
+
     #[cfg(test)]
     pub(crate) fn disconnected_for_test() -> Self {
         Self::disconnected_for_test_with_event_sender(Arc::new(VideoUiWake::default())).0
@@ -2172,6 +2674,8 @@ impl NativeVideoOutput {
             Arc::clone(&hwnd),
         ));
         let output = Self {
+            #[cfg(feature = "test-script")]
+            ui_smoke_output_id: native_ui_smoke::allocate_output_id(),
             cancel: Arc::new(AtomicBool::new(false)),
             hwnd,
             hud_hwnd: Arc::new(AtomicU64::new(0)),
@@ -2188,6 +2692,7 @@ impl NativeVideoOutput {
             last_vst3_available: AtomicBool::new(false),
             last_checked: AtomicBool::new(false),
             last_text_contrast_strong: AtomicBool::new(false),
+            last_video_canvas_color: AtomicU32::new(pack_native_video_canvas_color([0, 0, 0])),
             visibility_gate,
             command_tx,
             event_rx: std::sync::Mutex::new(event_rx),
@@ -2234,6 +2739,7 @@ impl NativeVideoOutput {
         let initial_checked = config.checked;
         let initial_text_contrast_strong =
             matches!(config.text_contrast, crate::settings::TextContrast::Strong);
+        let initial_video_canvas_color = config.video_canvas_color;
         let channel_fault = Arc::new(AtomicBool::new(false));
         let health = native_window_health::NativeWindowHealth::new_registered();
         let (event_tx, event_rx) =
@@ -2333,6 +2839,8 @@ impl NativeVideoOutput {
             }
         };
         Some(Self {
+            #[cfg(feature = "test-script")]
+            ui_smoke_output_id: native_ui_smoke_output_id,
             cancel,
             hwnd,
             hud_hwnd,
@@ -2347,6 +2855,9 @@ impl NativeVideoOutput {
             last_vst3_available: AtomicBool::new(initial_vst3_available),
             last_checked: AtomicBool::new(initial_checked),
             last_text_contrast_strong: AtomicBool::new(initial_text_contrast_strong),
+            last_video_canvas_color: AtomicU32::new(pack_native_video_canvas_color(
+                initial_video_canvas_color,
+            )),
             visibility_gate,
             command_tx,
             event_rx: std::sync::Mutex::new(event_rx),
@@ -2476,6 +2987,27 @@ impl NativeVideoOutput {
         crate::video::native_window::post_wake(self.hwnd.load(Ordering::Acquire));
     }
 
+    fn set_video_canvas_color(&self, color: [u8; 3]) {
+        let packed = pack_native_video_canvas_color(color);
+        if self.last_video_canvas_color.load(Ordering::Acquire) == packed {
+            return;
+        }
+        if self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetVideoCanvasColor { color })
+            .is_ok()
+        {
+            self.last_video_canvas_color
+                .store(packed, Ordering::Release);
+            crate::video::native_window::post_wake(self.hwnd.load(Ordering::Acquire));
+        }
+    }
+
+    #[cfg(test)]
+    fn video_canvas_color_for_test(&self) -> [u8; 3] {
+        unpack_native_video_canvas_color(self.last_video_canvas_color.load(Ordering::Acquire))
+    }
+
     fn start_anime4k_measurement(&self) {
         let _ = self
             .command_tx
@@ -2531,25 +3063,13 @@ impl NativeVideoOutput {
             .send(NativeVideoOutputCommand::SetMetadata { metadata });
     }
 
-    fn set_side_panel_state(
-        &self,
-        mode: crate::settings::FsSidePanelMode,
-        info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
-        info_panel_locked: bool,
-    ) {
+    pub(crate) fn set_chrome_snapshot(&self, snapshot: NativeChromeSnapshot) {
         let _ = self
             .command_tx
-            .send(NativeVideoOutputCommand::SetSidePanelState {
-                mode,
-                info_panel_open,
-                info_panel_locked,
+            .send(NativeVideoOutputCommand::SetChromeSnapshot {
+                snapshot,
+                source_epoch: self.source_epoch(),
             });
-    }
-
-    fn set_bar_lock_state(&self, state: NativeBarLockState) {
-        let _ = self
-            .command_tx
-            .send(NativeVideoOutputCommand::SetBarLockState { state });
     }
 
     fn reset_side_panel_session(&self) {
@@ -2703,6 +3223,7 @@ impl NativeVideoOutput {
         owner_hwnd: u64,
         rect: windows::Win32::Foundation::RECT,
         activate_on_show: bool,
+        chrome_host: Option<NativeDetachedChromeHost>,
     ) {
         let visible = self.visibility_gate.effective_visible();
         let _ = self
@@ -2714,6 +3235,7 @@ impl NativeVideoOutput {
                 rect,
                 activate_on_show,
                 visible,
+                chrome_host,
             });
     }
 
@@ -2812,13 +3334,13 @@ impl NativeVideoOutput {
             .send(NativeVideoOutputCommand::SetNormalizeOverlayState { state });
     }
 
-    pub(crate) fn drain_events(&self) -> Vec<(u64, NativeVideoOutputEvent)> {
+    pub(crate) fn drain_events(&self) -> Vec<NativeVideoOutputEventEnvelope> {
         let Ok(rx) = self.event_rx.lock() else {
             return Vec::new();
         };
         let mut events = rx.drain();
         let mut latest_routing = None;
-        events.retain(|(_, event)| match event {
+        events.retain(|envelope| match &envelope.event {
             NativeVideoOutputEvent::OverlayInputRouting(routing) => {
                 latest_routing = Some(*routing);
                 false
@@ -4004,6 +4526,58 @@ fn publish_native_overlay_input_routing(
 }
 
 #[cfg(windows)]
+fn publish_pending_seek_strip_presentation(
+    presenter: &mut native_presenter::NativeRenderCore,
+    tx: &NativeOutputEventSender,
+    source_epoch: u64,
+    generation: u64,
+) {
+    let Some(update) = presenter.pending_seek_strip_presentation() else {
+        return;
+    };
+    let event = match update {
+        seek_strip::SeekStripPresentedUpdate::Hidden(stamp) => {
+            seek_strip::SeekStripPresentationEvent::Hidden(stamp.session_at_generation(generation))
+        }
+        seek_strip::SeekStripPresentedUpdate::Visible { stamp, window } => {
+            seek_strip::SeekStripPresentationEvent::Visible {
+                stamp: stamp.session_at_generation(generation),
+                window: window.map(|window| window.at_generation(generation)),
+            }
+        }
+    };
+    if tx
+        .publish_seek_strip_presentation(source_epoch, event)
+        .is_ok()
+    {
+        match event {
+            seek_strip::SeekStripPresentationEvent::Hidden(stamp) => crate::logger::log(format!(
+                "[native-video] seek-strip presented update published: source_epoch={source_epoch} session={} generation={} visible=false",
+                stamp.session_id.0, stamp.generation
+            )),
+            seek_strip::SeekStripPresentationEvent::Visible { stamp, window } => {
+                crate::logger::log(format!(
+                    "[native-video] seek-strip presented update published: source_epoch={source_epoch} session={} generation={} visible=true revision={:?} reported_count={:?}",
+                    stamp.session_id.0,
+                    stamp.generation,
+                    window.map(|window| window.stamp.layout_revision.0),
+                    window.map(|window| window.visible_count)
+                ));
+            }
+        }
+        presenter.acknowledge_seek_strip_presentation(update);
+    }
+}
+
+#[cfg(windows)]
+fn native_window_event_should_forward_to_app(
+    event: &native_window::NativeVideoWindowEvent,
+    overlay_forwards: bool,
+) -> bool {
+    overlay_forwards || native_window::native_video_mouse_seek_hold_terminal(event)
+}
+
+#[cfg(windows)]
 fn send_native_overlay_command(
     tx: &NativeOutputEventSender,
     source_epoch: u64,
@@ -4012,6 +4586,9 @@ fn send_native_overlay_command(
 ) {
     use crate::video::native_presenter::NativeOverlayCommand as Command;
     let event = match command {
+        Command::SelectAudioTrack { stream_index } => {
+            NativeVideoOutputEvent::SelectAudioTrack { stream_index }
+        }
         Command::Seek { target_secs } => NativeVideoOutputEvent::Seek { target_secs },
         Command::SeekRelative { delta_secs } => NativeVideoOutputEvent::SeekRelative { delta_secs },
         Command::SeekMedium { forward } => NativeVideoOutputEvent::SeekMedium { forward },
@@ -4054,32 +4631,61 @@ fn send_native_overlay_command(
             pixels_per_point,
         },
         Command::ClearSeekThumbnail => NativeVideoOutputEvent::ClearSeekThumbnail,
-        Command::OpenSeekStrip => NativeVideoOutputEvent::OpenSeekStrip,
-        Command::CloseSeekStrip { cause } => NativeVideoOutputEvent::CloseSeekStrip { cause },
-        Command::MoveSeekStrip { center } => NativeVideoOutputEvent::MoveSeekStrip { center },
-        Command::CommitSeekStrip { center } => NativeVideoOutputEvent::CommitSeekStrip { center },
-        Command::RequestSeekStripWindow {
-            center,
-            visible_count,
-            pixel_width,
-            pixel_height,
-        } => NativeVideoOutputEvent::RequestSeekStripWindow {
-            center,
-            visible_count,
-            pixel_width,
-            pixel_height,
+        Command::OpenSeekStrip => NativeVideoOutputEvent::OpenSeekStrip { generation },
+        Command::CloseSeekStrip { cause, stamp } => NativeVideoOutputEvent::CloseSeekStrip {
+            cause,
+            stamp: stamp.session_at_generation(generation),
         },
-        Command::SetSeekStripView { view } => NativeVideoOutputEvent::SetSeekStripView { view },
-        Command::SetSeekStripHeight { height } => {
-            NativeVideoOutputEvent::SetSeekStripHeight { height }
+        Command::MoveSeekStrip { center, stamp } => NativeVideoOutputEvent::MoveSeekStrip {
+            center,
+            stamp: stamp.at_generation(generation),
+        },
+        Command::CommitSeekStrip { center, stamp } => NativeVideoOutputEvent::CommitSeekStrip {
+            center,
+            stamp: stamp.at_generation(generation),
+        },
+        Command::RequestSeekStripWindow { .. } => {
+            debug_assert!(
+                false,
+                "RequestSeekStripWindow must be attached to the presented snapshot"
+            );
+            return;
         }
-        Command::StepSeekStripRange { step } => NativeVideoOutputEvent::StepSeekStripRange { step },
+        Command::SetSeekStripView { view, expected } => NativeVideoOutputEvent::SetSeekStripView {
+            view,
+            generation,
+            expected: expected.map(|stamp| stamp.at_generation(generation)),
+        },
+        Command::SetSeekStripHeight { height, expected } => {
+            NativeVideoOutputEvent::SetSeekStripHeight {
+                height,
+                generation,
+                expected: expected.map(|stamp| stamp.at_generation(generation)),
+            }
+        }
+        Command::SetSeekPreviewSize { size, expected } => {
+            NativeVideoOutputEvent::SetSeekPreviewSize {
+                size,
+                generation,
+                expected: expected.map(|stamp| stamp.at_generation(generation)),
+            }
+        }
+        Command::StepSeekStripRange { steps, stamp } => {
+            NativeVideoOutputEvent::StepSeekStripRange {
+                steps,
+                stamp: stamp.at_generation(generation),
+            }
+        }
         Command::ToggleTileMode => NativeVideoOutputEvent::ToggleTileMode,
         Command::TogglePerfOverlay => NativeVideoOutputEvent::TogglePerfOverlay,
         Command::ToggleSidePanelMode => NativeVideoOutputEvent::ToggleSidePanelMode,
         Command::ToggleBarLock { bar } => NativeVideoOutputEvent::ToggleBarLock { bar },
-        Command::ToggleSeekStripLock => NativeVideoOutputEvent::ToggleSeekStripLock,
+        Command::ToggleSeekStripLock { expected } => NativeVideoOutputEvent::ToggleSeekStripLock {
+            generation,
+            expected: expected.map(|stamp| stamp.at_generation(generation)),
+        },
         Command::ToggleClickInfoOpen => NativeVideoOutputEvent::ToggleClickInfoOpen,
+        Command::CloseInfoPanel => NativeVideoOutputEvent::CloseInfoPanel,
         Command::ToggleInfoPanelLock => NativeVideoOutputEvent::ToggleInfoPanelLock,
         Command::OpenTouchInfoPanel => NativeVideoOutputEvent::OpenTouchInfoPanel,
         Command::DismissTouchSidePanels => NativeVideoOutputEvent::DismissTouchSidePanels,
@@ -4447,13 +5053,20 @@ fn run_native_video_output(
                 height: initial_attach.height,
                 os_pixels_per_point: initial_attach.pixels_per_point,
                 initial_observation: initial_attach.observation,
+                editor_ui_snapshot: config.editor_ui_snapshot.clone(),
                 test_overlay: std::env::var_os("MIV_NATIVE_VIDEO_TEST_OVERLAY").is_some(),
                 egui_overlay: native_video_env_flag_enabled("MIV_NATIVE_VIDEO_EGUI_OVERLAY", true),
                 cursor_hide_delay_secs: config.cursor_hide_delay_secs,
                 ui_scale: config.ui_scale,
                 text_contrast: config.text_contrast,
                 ui_font: config.ui_font.clone(),
-                bar_lock: config.bar_lock,
+                chrome: NativeChromeState {
+                    policy: config.chrome.policy,
+                    placement: config.placement,
+                    generation: cur_generation,
+                    detached: config.chrome.detached.map(|fact| fact.host),
+                },
+                video_canvas_color: config.video_canvas_color,
                 scale_filter: config.scale_filter,
                 downscale_smoothing_percent: config.downscale_smoothing_percent,
                 anime4k_variant: config.anime4k_variant,
@@ -4512,13 +5125,17 @@ fn run_native_video_output(
         crate::panorama::PanoUvTransform,
     )> = None;
     let mut cur_video_zoom_state: Option<zoom_view::VideoZoomState> = None;
+    let mut cur_video_canvas_color = config.video_canvas_color;
     let mut cur_scale_filter = config.scale_filter;
     // presenter を作り直す経路 (F12 の placement 切替) でも固定状態を持ち越す。
     // open 時の config 値のまま作ると、切替のたびに固定なしの 1 枚が出る。
-    let mut cur_bar_lock = config.bar_lock.clamped();
+    let mut cur_chrome_policy = config.chrome.policy;
     let mut cur_downscale_smoothing_percent = config.downscale_smoothing_percent;
     let mut cur_anime4k_variant = config.anime4k_variant;
     let mut cur_anime4k_status = crate::video::native_presenter::NativeVideoAnime4kStatus::Waiting;
+    let mut cur_seek_strip: Option<native_presenter::NativeOverlaySeekStrip> = None;
+    let mut cur_seek_strip_material_availability =
+        seek_strip::SeekStripMaterialAvailability::Unknown;
     fn sync_hud_regions(
         window_pump: &native_window_pump::NativeWindowPumpRenderClient,
         epoch: u64,
@@ -4533,6 +5150,32 @@ fn run_native_video_output(
             fullscreen_overlay_active: presenter.fullscreen_overlay_active(),
             debug_description: presenter.hud_debug_description(&outcome.hud_regions),
         });
+    }
+
+    #[cfg(feature = "test-script")]
+    fn publish_ui_smoke_inventory(
+        publisher: &native_ui_smoke::NativeUiSmokeRenderPublisher,
+        presenter: &crate::video::native_presenter::NativeRenderCore,
+        source_epoch: u64,
+        generation: u64,
+        placement: NativeVideoPlacement,
+        owner_hwnd: u64,
+        presenter_hwnd: u64,
+    ) -> Result<Option<u64>, String> {
+        let Some(inventory) = presenter.ui_smoke_committed_inventory() else {
+            return Ok(None);
+        };
+        publisher
+            .publish(
+                source_epoch,
+                generation,
+                placement,
+                owner_hwnd,
+                presenter_hwnd,
+                presenter.ui_smoke_canvas_geometry(),
+                inventory,
+            )
+            .map(Some)
     }
 
     let run_started = Instant::now();
@@ -4628,6 +5271,16 @@ fn run_native_video_output(
         ui_smoke_output_id,
         &requested_source_epoch,
     );
+    #[cfg(feature = "test-script")]
+    let _ = publish_ui_smoke_inventory(
+        &ui_smoke_render_publisher,
+        &presenter,
+        source.source_epoch,
+        cur_generation,
+        cur_placement,
+        cur_owner_hwnd,
+        cur_presenter_hwnd,
+    )?;
     health.record_source_generation(source.source_epoch);
     let mut last_summary_log = Instant::now();
     let mut last_present_log = Instant::now();
@@ -4652,8 +5305,8 @@ fn run_native_video_output(
     let mut startup_probe_count = 0_u32;
     let mut first_present_probe_logged = false;
     let mut native_events = Vec::new();
-    #[cfg(feature = "test-script")]
     let mut native_event_envelopes = Vec::new();
+    let mouse_seek_trace_enabled = crate::mouse_seek_debug::is_enabled();
     let trace_every_present = std::env::var_os("MIV_NATIVE_VIDEO_PRESENT_TRACE").is_some();
     let mut pending_navigation_preview_clear_at: Option<Instant> = None;
     const NAVIGATION_PREVIEW_CLEAR_DELAY: Duration = Duration::from_millis(40);
@@ -4661,15 +5314,6 @@ fn run_native_video_output(
     // owner. `source.queue` remains an unpresented pacing queue and is never a
     // placement/grade fallback.
     let mut frame_output = NativeFrameOutputContext::new();
-    /// presenter 側 `source.queue` の最大長 (Codex 助言、2026-05-15)。旧コードは
-    /// `video_rx.try_recv()` を空になるまで drain して queue に積み込んでいたため、
-    /// 高負荷 / pool exhausted 時に queue が 23 まで肥大化 → present_retire / shared
-    /// pool / cache 合算で adapter memory が枯渇し wgpu OOM していた。queue を 8 で
-    /// cap し、超えたら decoder 側に back-pressure を返す (= video_tx (cap=8) が満杯に
-    /// なって decoder が `try_send` 失敗 → 古い frame を drop して新 frame に置換)。
-    /// 30fps で約 270ms 分 = pacing 上は十分。これは visible の display pacing 専用で、
-    /// hidden は EOF まで decoder を進めるため全件 drain する。
-    const MAX_NATIVE_SOURCE_QUEUE: usize = 8;
     // Inc 7 hidden presenter (動画→音声モード): pump が公開する可視状態を consume policy の
     // 唯一の正本にする。source swap はこの output-lifetime state を交換しない。
     let mut hidden_frame_scratch = Vec::with_capacity(MAX_NATIVE_SOURCE_QUEUE.saturating_mul(2));
@@ -4701,6 +5345,12 @@ fn run_native_video_output(
         }
     }
     while !cancel.load(Ordering::Acquire) {
+        publish_pending_seek_strip_presentation(
+            &mut presenter,
+            &ui_event_tx,
+            source.source_epoch,
+            cur_generation,
+        );
         let mut measurement_finished = false;
         if let Some(measurement) = anime4k_measurement.as_ref() {
             loop {
@@ -5059,6 +5709,38 @@ fn run_native_video_output(
                         )),
                     }
                 }
+                NativeVideoOutputCommand::SetVideoCanvasColor { color } => {
+                    match presenter.set_video_canvas_color(color) {
+                        Ok(changed) => {
+                            if changed {
+                                cur_video_canvas_color = color;
+                            }
+                            if frame_output.should_represent_for_visual_change(changed) {
+                                let refresh = frame_output
+                                    .visible_frame()
+                                    .map(|frame| presenter.present(frame, config.sync_interval));
+                                match refresh {
+                                    Some(Ok(outcome)) => {
+                                        debug_assert!(
+                                            frame_output
+                                                .mark_current_visible(outcome.copy_fence_value)
+                                        );
+                                        frame_output.retire_completed(
+                                            presenter.copy_fence_completed_value(),
+                                        );
+                                    }
+                                    Some(Err(error)) => crate::logger::log(format!(
+                                        "[native-video] canvas color refresh present failed: {error}"
+                                    )),
+                                    None => {}
+                                }
+                            }
+                        }
+                        Err(error) => crate::logger::log(format!(
+                            "[native-video] canvas color update failed: {error}"
+                        )),
+                    }
+                }
                 NativeVideoOutputCommand::StartAnime4kMeasurement => {
                     anime4k_measurement = None;
                     match presenter.start_anime4k_measurement() {
@@ -5101,27 +5783,17 @@ fn run_native_video_output(
                 NativeVideoOutputCommand::SetMetadata { metadata } => {
                     presenter.set_overlay_metadata(metadata);
                 }
-                NativeVideoOutputCommand::SetSidePanelState {
-                    mode,
-                    info_panel_open,
-                    info_panel_locked,
+                NativeVideoOutputCommand::SetChromeSnapshot {
+                    snapshot,
+                    source_epoch,
                 } => {
-                    // 固定の切替は映像の transform を作り直す。バーの固定と同じ扱い。
-                    if let Err(err) = presenter.set_overlay_side_panel_state(
-                        mode,
-                        info_panel_open,
-                        info_panel_locked,
-                    ) {
-                        crate::logger::log(format!(
-                            "[native-video] set info panel reservation transform failed: {err}"
-                        ));
+                    if source_epoch != source.source_epoch {
+                        continue;
                     }
-                }
-                NativeVideoOutputCommand::SetBarLockState { state } => {
-                    cur_bar_lock = state.clamped();
-                    if let Err(err) = presenter.set_overlay_bar_lock_state(state) {
+                    cur_chrome_policy = snapshot.policy;
+                    if let Err(err) = presenter.set_overlay_chrome_snapshot(snapshot) {
                         crate::logger::log(format!(
-                            "[native-video] set fixed-bar transform failed: {err}"
+                            "[native-video] set chrome transform failed: {err}"
                         ));
                     } else if source
                         .video_scale_state
@@ -5233,21 +5905,25 @@ fn run_native_video_output(
                 NativeVideoOutputCommand::SetSeekStrip {
                     seek_strip,
                     material_availability,
-                } => match presenter.set_overlay_seek_strip(seek_strip, material_availability) {
-                    Ok(true) => {
-                        if source
-                            .video_scale_state
-                            .invalidate_preparation_and_keep_desired()
-                        {
-                            presenter.discard_prepared_video_scale_settings();
-                            desired_scale_apply_due = true;
+                } => {
+                    cur_seek_strip = seek_strip.clone();
+                    cur_seek_strip_material_availability = material_availability;
+                    match presenter.set_overlay_seek_strip(seek_strip, material_availability) {
+                        Ok(true) => {
+                            if source
+                                .video_scale_state
+                                .invalidate_preparation_and_keep_desired()
+                            {
+                                presenter.discard_prepared_video_scale_settings();
+                                desired_scale_apply_due = true;
+                            }
                         }
+                        Ok(false) => {}
+                        Err(err) => crate::logger::log(format!(
+                            "[native-video] set seek-strip transform failed: {err}"
+                        )),
                     }
-                    Ok(false) => {}
-                    Err(err) => crate::logger::log(format!(
-                        "[native-video] set seek-strip transform failed: {err}"
-                    )),
-                },
+                }
                 NativeVideoOutputCommand::SetRingPickerOverlay { overlay } => {
                     presenter.set_overlay_ring_picker(overlay);
                 }
@@ -5353,6 +6029,13 @@ fn run_native_video_output(
                     }
                 }
                 NativeVideoOutputCommand::SwitchSource { payload } => {
+                    #[cfg(feature = "test-script")]
+                    {
+                        ui_smoke_render_publisher.invalidate(
+                            "native mouse source changed while the diagnostic target was live",
+                        )?;
+                        presenter.invalidate_ui_smoke_committed_inventory();
+                    }
                     emit_native_vram_trace(
                         "switch_source_begin",
                         "before_drain_old_source",
@@ -5438,6 +6121,9 @@ fn run_native_video_output(
                             "[native-video] reset seek-strip transform failed: {err}"
                         ));
                     }
+                    cur_seek_strip = None;
+                    cur_seek_strip_material_availability =
+                        seek_strip::SeekStripMaterialAvailability::Unknown;
                     // 前ソースの perf 履歴 (interval_ms / source_delta_ms / av_offset_ms)
                     // が残ったまま新ソースの最初のサンプルが入ると、median ベースの Y 軸が
                     // 古い fps を引きずって新サンプル蓄積後にガクッと切り替わる。新動画は
@@ -5510,6 +6196,7 @@ fn run_native_video_output(
                     rect: new_rect,
                     activate_on_show,
                     visible,
+                    chrome_host,
                 } => {
                     if presentation_prepare_must_wait_for_frame(
                         placement != cur_placement,
@@ -5524,6 +6211,7 @@ fn run_native_video_output(
                                 rect: new_rect,
                                 activate_on_show,
                                 visible,
+                                chrome_host,
                             },
                         );
                         // この Prepare を次の frame へ送るなら、後ろに並んでいる分も
@@ -5694,6 +6382,7 @@ fn run_native_video_output(
                                 height: attach.height,
                                 os_pixels_per_point: attach.pixels_per_point,
                                 initial_observation: attach.observation,
+                                editor_ui_snapshot: config.editor_ui_snapshot.clone(),
                                 test_overlay: std::env::var_os("MIV_NATIVE_VIDEO_TEST_OVERLAY")
                                     .is_some(),
                                 egui_overlay: native_video_env_flag_enabled(
@@ -5704,7 +6393,13 @@ fn run_native_video_output(
                                 ui_scale: cur_ui_scale,
                                 text_contrast: cur_text_contrast,
                                 ui_font: config.ui_font.clone(),
-                                bar_lock: cur_bar_lock,
+                                chrome: NativeChromeState {
+                                    policy: cur_chrome_policy,
+                                    placement,
+                                    generation: candidate_epoch,
+                                    detached: chrome_host,
+                                },
+                                video_canvas_color: cur_video_canvas_color,
                                 scale_filter: cur_scale_filter,
                                 downscale_smoothing_percent: cur_downscale_smoothing_percent,
                                 anime4k_variant: cur_anime4k_variant,
@@ -5772,6 +6467,10 @@ fn run_native_video_output(
                                 file_size: 0,
                             },
                         );
+                        new_presenter.set_overlay_seek_strip(
+                            cur_seek_strip.clone(),
+                            cur_seek_strip_material_availability,
+                        )?;
                         let overlay_outcome = new_presenter.tick_overlay_video_state(
                             source.clock.now_secs(),
                             f64::from_bits(source.duration_secs_bits.load(Ordering::Acquire)),
@@ -5822,6 +6521,9 @@ fn run_native_video_output(
                         &new_presenter,
                         &overlay_outcome,
                     );
+                    // Candidate semantic commands are not delivered: the candidate may still be
+                    // aborted. Its passive presentation snapshot already owns the exact final
+                    // RequestWindow and is released only after the commit/Retire acknowledgement.
                     let hud_ms = publish_t0.elapsed().as_secs_f64() * 1000.0;
                     let retire_t0 = std::time::Instant::now();
                     frame_output.retire_completed(presenter.copy_fence_completed_value());
@@ -5938,6 +6640,19 @@ fn run_native_video_output(
                         true,
                         &cancel,
                     )?;
+                    if placement_control_releases_candidate_seek_strip_passive(&retire_control) {
+                        // App has accepted PlacementCommitted, applied the transition effect,
+                        // and advanced the player's committed generation before it can issue
+                        // this Retire. Publish the candidate's passive strip state only past that
+                        // acknowledgement boundary; publishing it in the same drain as
+                        // PlacementCommitted makes App validate it against the old generation.
+                        publish_pending_seek_strip_presentation(
+                            &mut presenter,
+                            &ui_event_tx,
+                            source.source_epoch,
+                            cur_generation,
+                        );
+                    }
                     match retire_control {
                         PlacementTransitionControl::Retire => {
                             window_pump.target_retire(
@@ -5992,42 +6707,43 @@ fn run_native_video_output(
             }
         }
         #[cfg(feature = "test-script")]
-        let _ = ui_smoke_render_publisher.publish(
+        let _ = publish_ui_smoke_inventory(
+            &ui_smoke_render_publisher,
+            &presenter,
             source.source_epoch,
             cur_generation,
             cur_placement,
             cur_owner_hwnd,
             cur_presenter_hwnd,
-            presenter.ui_smoke_canvas_geometry(),
         )?;
         native_events.clear();
-        #[cfg(feature = "test-script")]
-        {
-            native_event_envelopes.clear();
-            for envelope in window_pump.drain_window_events() {
-                if window_event_belongs_to_generation(&envelope, cur_generation) {
+        native_event_envelopes.clear();
+        for envelope in window_pump.drain_window_events() {
+            let accepted = window_event_belongs_to_generation(&envelope, cur_generation);
+            crate::mouse_seek_debug::log_render_gate(&envelope, cur_generation, accepted);
+            if accepted {
+                #[cfg(feature = "test-script")]
+                {
+                    native_events.push(envelope.event.clone());
                     native_event_envelopes.push(envelope);
-                } else if let Some(metadata) = envelope.smoke_metadata {
+                }
+                #[cfg(not(feature = "test-script"))]
+                if mouse_seek_trace_enabled {
+                    native_events.push(envelope.event.clone());
+                    native_event_envelopes.push(envelope);
+                } else {
+                    native_events.push(envelope.event);
+                }
+            } else {
+                #[cfg(feature = "test-script")]
+                if let Some(metadata) = envelope.smoke_metadata {
                     native_ui_smoke::record_render_failure(
                         metadata,
                         "native mouse event was stale at the render generation gate",
                     );
                 }
             }
-            native_events.extend(
-                native_event_envelopes
-                    .iter()
-                    .map(|envelope| envelope.event.clone()),
-            );
         }
-        #[cfg(not(feature = "test-script"))]
-        native_events.extend(
-            window_pump
-                .drain_window_events()
-                .into_iter()
-                .filter(|envelope| window_event_belongs_to_generation(envelope, cur_generation))
-                .map(|envelope| envelope.event),
-        );
 
         let now = Instant::now();
         for event in &native_events {
@@ -6138,7 +6854,7 @@ fn run_native_video_output(
             #[cfg(feature = "test-script")]
             let mut ui_smoke_render_succeeded = false;
             #[cfg(feature = "test-script")]
-            let mut ui_smoke_command_count = 0_usize;
+            let mut ui_smoke_geometry_version = None;
             presenter.update_overlay_video_state(
                 source.clock.now_secs(),
                 f64::from_bits(source.duration_secs_bits.load(Ordering::Acquire)),
@@ -6156,12 +6872,66 @@ fn run_native_video_output(
                     #[cfg(feature = "test-script")]
                     {
                         ui_smoke_render_succeeded = true;
-                        ui_smoke_command_count = outcome.commands.len();
+                        ui_smoke_geometry_version = publish_ui_smoke_inventory(
+                            &ui_smoke_render_publisher,
+                            &presenter,
+                            source.source_epoch,
+                            cur_generation,
+                            cur_placement,
+                            cur_owner_hwnd,
+                            cur_presenter_hwnd,
+                        )?;
                     }
                     sync_hud_regions(&window_pump, cur_generation, &presenter, &outcome);
-                    for command in std::mem::take(&mut outcome.commands) {
+                    #[cfg(feature = "test-script")]
+                    let mut ui_smoke_dispatch_by_command = std::collections::HashMap::new();
+                    #[cfg(feature = "test-script")]
+                    for attribution in &outcome.ui_smoke_command_attributions {
+                        let is_exact_producer = outcome
+                            .commands
+                            .get(attribution.command_index)
+                            .is_some_and(|command| {
+                                matches!(
+                                    command,
+                                    crate::video::native_presenter::NativeOverlayCommand::TogglePanorama
+                                )
+                            });
+                        if !is_exact_producer {
+                            native_ui_smoke::record_render_failure(
+                                attribution.metadata,
+                                "native_top_panorama command attribution did not name its producer command",
+                            );
+                            continue;
+                        }
+                        if let Some(dispatch) =
+                            native_ui_smoke::claim_presented_button_dispatch(attribution.metadata)
+                        {
+                            if ui_smoke_dispatch_by_command
+                                .insert(attribution.command_index, dispatch)
+                                .is_some()
+                            {
+                                native_ui_smoke::record_render_failure(
+                                    attribution.metadata,
+                                    "native_top_panorama producer command had duplicate attribution",
+                                );
+                            }
+                        }
+                    }
+                    for (command_index, command) in std::mem::take(&mut outcome.commands)
+                        .into_iter()
+                        .enumerate()
+                    {
+                        #[cfg(not(feature = "test-script"))]
+                        let _ = command_index;
                         let event_epoch = source.source_epoch;
                         match command {
+                            crate::video::native_presenter::NativeOverlayCommand::SelectAudioTrack { stream_index } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::SelectAudioTrack { stream_index },
+                                );
+                            }
                             crate::video::native_presenter::NativeOverlayCommand::Seek {
                                 target_secs,
                             } => {
@@ -6232,6 +7002,17 @@ fn run_native_video_output(
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::TogglePanorama => {
+                                #[cfg(feature = "test-script")]
+                                if let Some(dispatch) =
+                                    ui_smoke_dispatch_by_command.remove(&command_index)
+                                {
+                                    ui_event_tx.send_with_ui_smoke_button_dispatch(
+                                        event_epoch,
+                                        NativeVideoOutputEvent::TogglePanorama,
+                                        dispatch,
+                                    );
+                                    continue;
+                                }
                                 send_native_output_event(
                                     &ui_event_tx,
                                     event_epoch,
@@ -6330,61 +7111,85 @@ fn run_native_video_output(
                                 send_native_output_event(
                                     &ui_event_tx,
                                     event_epoch,
-                                    NativeVideoOutputEvent::OpenSeekStrip,
-                                );
-                            }
-                            crate::video::native_presenter::NativeOverlayCommand::CloseSeekStrip { cause } => {
-                                send_native_output_event(
-                                    &ui_event_tx,
-                                    event_epoch,
-                                    NativeVideoOutputEvent::CloseSeekStrip { cause },
-                                );
-                            }
-                            crate::video::native_presenter::NativeOverlayCommand::MoveSeekStrip { center } => {
-                                send_native_output_event(
-                                    &ui_event_tx,
-                                    event_epoch,
-                                    NativeVideoOutputEvent::MoveSeekStrip { center },
-                                );
-                            }
-                            crate::video::native_presenter::NativeOverlayCommand::CommitSeekStrip { center } => {
-                                send_native_output_event(
-                                    &ui_event_tx,
-                                    event_epoch,
-                                    NativeVideoOutputEvent::CommitSeekStrip { center },
-                                );
-                            }
-                            crate::video::native_presenter::NativeOverlayCommand::RequestSeekStripWindow { center, visible_count, pixel_width, pixel_height } => {
-                                send_native_output_event(
-                                    &ui_event_tx,
-                                    event_epoch,
-                                    NativeVideoOutputEvent::RequestSeekStripWindow {
-                                        center,
-                                        visible_count,
-                                        pixel_width,
-                                        pixel_height,
+                                    NativeVideoOutputEvent::OpenSeekStrip {
+                                        generation: cur_generation,
                                     },
                                 );
                             }
-                            crate::video::native_presenter::NativeOverlayCommand::SetSeekStripView { view } => {
+                            crate::video::native_presenter::NativeOverlayCommand::CloseSeekStrip { cause, stamp } => {
                                 send_native_output_event(
                                     &ui_event_tx,
                                     event_epoch,
-                                    NativeVideoOutputEvent::SetSeekStripView { view },
+                                    NativeVideoOutputEvent::CloseSeekStrip {
+                                        cause,
+                                        stamp: stamp.session_at_generation(cur_generation),
+                                    },
                                 );
                             }
-                            crate::video::native_presenter::NativeOverlayCommand::SetSeekStripHeight { height } => {
+                            crate::video::native_presenter::NativeOverlayCommand::MoveSeekStrip { center, stamp } => {
                                 send_native_output_event(
                                     &ui_event_tx,
                                     event_epoch,
-                                    NativeVideoOutputEvent::SetSeekStripHeight { height },
+                                    NativeVideoOutputEvent::MoveSeekStrip {
+                                        center,
+                                        stamp: stamp.at_generation(cur_generation),
+                                    },
                                 );
                             }
-                            crate::video::native_presenter::NativeOverlayCommand::StepSeekStripRange { step } => {
+                            crate::video::native_presenter::NativeOverlayCommand::CommitSeekStrip { center, stamp } => {
                                 send_native_output_event(
                                     &ui_event_tx,
                                     event_epoch,
-                                    NativeVideoOutputEvent::StepSeekStripRange { step },
+                                    NativeVideoOutputEvent::CommitSeekStrip {
+                                        center,
+                                        stamp: stamp.at_generation(cur_generation),
+                                    },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::RequestSeekStripWindow { .. } => {
+                                debug_assert!(false, "RequestSeekStripWindow must be attached to the presented snapshot");
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::SetSeekStripView { view, expected } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::SetSeekStripView {
+                                        view,
+                                        generation: cur_generation,
+                                        expected: expected.map(|stamp| stamp.at_generation(cur_generation)),
+                                    },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::SetSeekStripHeight { height, expected } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::SetSeekStripHeight {
+                                        height,
+                                        generation: cur_generation,
+                                        expected: expected.map(|stamp| stamp.at_generation(cur_generation)),
+                                    },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::SetSeekPreviewSize { size, expected } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::SetSeekPreviewSize {
+                                        size,
+                                        generation: cur_generation,
+                                        expected: expected.map(|stamp| stamp.at_generation(cur_generation)),
+                                    },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::StepSeekStripRange { steps, stamp } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::StepSeekStripRange {
+                                        steps,
+                                        stamp: stamp.at_generation(cur_generation),
+                                    },
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::ToggleTileMode => {
@@ -6415,11 +7220,14 @@ fn run_native_video_output(
                                     NativeVideoOutputEvent::ToggleBarLock { bar },
                                 );
                             }
-                            crate::video::native_presenter::NativeOverlayCommand::ToggleSeekStripLock => {
+                            crate::video::native_presenter::NativeOverlayCommand::ToggleSeekStripLock { expected } => {
                                 send_native_output_event(
                                     &ui_event_tx,
                                     event_epoch,
-                                    NativeVideoOutputEvent::ToggleSeekStripLock,
+                                    NativeVideoOutputEvent::ToggleSeekStripLock {
+                                        generation: cur_generation,
+                                        expected: expected.map(|stamp| stamp.at_generation(cur_generation)),
+                                    },
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::ToggleClickInfoOpen => {
@@ -6428,6 +7236,9 @@ fn run_native_video_output(
                                     event_epoch,
                                     NativeVideoOutputEvent::ToggleClickInfoOpen,
                                 );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::CloseInfoPanel => {
+                                send_native_output_event(&ui_event_tx, event_epoch, NativeVideoOutputEvent::CloseInfoPanel);
                             }
                             crate::video::native_presenter::NativeOverlayCommand::ToggleInfoPanelLock => {
                                 send_native_output_event(
@@ -6874,10 +7685,20 @@ fn run_native_video_output(
                 overlay_routing,
             );
             for (event_index, event) in native_events.iter().enumerate() {
-                let should_forward = overlay_outcome.as_ref().map_or_else(
+                let overlay_forwards = overlay_outcome.as_ref().map_or_else(
                     || overlay_routing.should_forward_to_ui(event),
                     |outcome| outcome.should_forward_to_ui(event_index, event),
                 );
+                // A raw XButton release terminates an App-owned hold. Once its window
+                // generation/epoch passed the render gate it must survive a later overlay
+                // ownership change; an unmatched release is inert in App.
+                let should_forward =
+                    native_window_event_should_forward_to_app(event, overlay_forwards);
+                if mouse_seek_trace_enabled
+                    && let Some(envelope) = native_event_envelopes.get(event_index)
+                {
+                    crate::mouse_seek_debug::log_render_disposition(envelope, should_forward);
+                }
                 if should_forward {
                     send_native_output_event(
                         &ui_event_tx,
@@ -6889,25 +7710,40 @@ fn run_native_video_output(
             #[cfg(feature = "test-script")]
             if ui_smoke_render_succeeded {
                 let geometry = presenter.ui_smoke_canvas_geometry();
-                let geometry_version = ui_smoke_render_publisher.publish(
-                    source.source_epoch,
-                    cur_generation,
-                    cur_placement,
-                    cur_owner_hwnd,
-                    cur_presenter_hwnd,
-                    geometry,
-                )?;
+                let geometry_version = ui_smoke_geometry_version.ok_or_else(|| {
+                    "native mouse render completed without a committed UI observation".to_string()
+                })?;
                 for (event_index, envelope) in native_event_envelopes.iter().enumerate() {
                     if let Some(metadata) = envelope.smoke_metadata {
-                        let native_window::NativeVideoWindowEvent::MouseMove(mouse) =
-                            &envelope.event
-                        else {
-                            native_ui_smoke::record_render_failure(
-                                metadata,
-                                "tagged native mouse event was not a mouse move at the render tail",
-                            );
-                            continue;
+                        let (input_kind, event_x, event_y) = match &envelope.event {
+                            native_window::NativeVideoWindowEvent::MouseMove(mouse) => (
+                                native_ui_smoke::NativeUiSmokeInputKind::MouseMove,
+                                mouse.x,
+                                mouse.y,
+                            ),
+                            native_window::NativeVideoWindowEvent::MouseButton(button)
+                                if button.button == native_window::NativeVideoMouseButton::Left =>
+                            {
+                                (
+                                    if button.down {
+                                        native_ui_smoke::NativeUiSmokeInputKind::LeftButtonDown
+                                    } else {
+                                        native_ui_smoke::NativeUiSmokeInputKind::LeftButtonUp
+                                    },
+                                    button.x,
+                                    button.y,
+                                )
+                            }
+                            _ => {
+                                native_ui_smoke::record_render_failure(
+                                    metadata,
+                                    "tagged native mouse event had an unsupported render-tail kind",
+                                );
+                                continue;
+                            }
                         };
+                        let (pointer_released, drag_latches_released) =
+                            presenter.ui_smoke_pointer_release_state();
                         native_ui_smoke::record_render_receipt(
                             metadata,
                             native_ui_smoke::NativeUiSmokeRenderReceipt {
@@ -6919,16 +7755,23 @@ fn run_native_video_output(
                                 presenter_hwnd: cur_presenter_hwnd,
                                 geometry,
                                 geometry_version,
-                                raw_forwarded: overlay_outcome.as_ref().map_or_else(
-                                    || overlay_routing.should_forward_to_ui(&envelope.event),
-                                    |outcome| {
-                                        outcome.should_forward_to_ui(event_index, &envelope.event)
-                                    },
+                                raw_forwarded: native_window_event_should_forward_to_app(
+                                    &envelope.event,
+                                    overlay_outcome.as_ref().map_or_else(
+                                        || overlay_routing.should_forward_to_ui(&envelope.event),
+                                        |outcome| {
+                                            outcome
+                                                .should_forward_to_ui(event_index, &envelope.event)
+                                        },
+                                    ),
                                 ),
-                                command_count: ui_smoke_command_count,
                                 source: envelope.source,
-                                event_x: mouse.x,
-                                event_y: mouse.y,
+                                event_x,
+                                event_y,
+                                input_kind,
+                                event_count: native_event_envelopes.len(),
+                                pointer_released,
+                                drag_latches_released,
                             },
                         );
                     }
@@ -6957,6 +7800,16 @@ fn run_native_video_output(
                 source.clock.current_seek_serial(),
             ) {
                 Ok(outcome) => {
+                    #[cfg(feature = "test-script")]
+                    let _ = publish_ui_smoke_inventory(
+                        &ui_smoke_render_publisher,
+                        &presenter,
+                        source.source_epoch,
+                        cur_generation,
+                        cur_placement,
+                        cur_owner_hwnd,
+                        cur_presenter_hwnd,
+                    )?;
                     publish_native_overlay_input_routing(
                         &ui_event_tx,
                         source.source_epoch,
@@ -7661,6 +8514,16 @@ fn run_native_video_output(
 /// パターン (~400ms) + HDD random read (~100-300ms) を ~800ms buffer で
 /// 吸収して UI tick の空振りを抑える (Phase 8.J)。
 pub(crate) const MAX_RENDER_QUEUE: usize = 24;
+/// presenter 側 `source.queue` の最大長 (Codex 助言、2026-05-15)。旧コードは
+/// `video_rx.try_recv()` を空になるまで drain して queue に積み込んでいたため、
+/// 高負荷 / pool exhausted 時に queue が 23 まで肥大化 → present_retire / shared
+/// pool / cache 合算で adapter memory が枯渇し wgpu OOM していた。queue を 8 で
+/// cap し、超えたら decoder 側に back-pressure を返す (= video_tx (cap=8) が満杯に
+/// なって decoder が `try_send` 失敗 → 古い frame を drop して新 frame に置換)。
+/// 30fps で約 270ms 分 = pacing 上は十分。これは visible の display pacing 専用で、
+/// hidden は EOF まで decoder を進めるため全件 drain する。
+#[cfg(windows)]
+const MAX_NATIVE_SOURCE_QUEUE: usize = 8;
 const FRAME_STEP_NO_PENDING_SEQ: u64 = u64::MAX;
 const USER_SEEK_REISSUE_AFTER: std::time::Duration = std::time::Duration::from_millis(250);
 /// The former EOF drain rule was three 16 ms UI ticks. Preserve its wall-clock meaning
@@ -7718,8 +8581,15 @@ fn eof_drain_observed_deadline(
 #[derive(Debug, Default)]
 struct UserSeekCoalesceState {
     pending_target_secs: Option<f64>,
-    last_issued_at: Option<std::time::Instant>,
-    last_issued_display_seq: u64,
+    last_issued: Option<IssuedUserSeek>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IssuedUserSeek {
+    target_secs: f64,
+    serial: u64,
+    at: std::time::Instant,
+    displayed_seq: u64,
 }
 
 fn user_seek_ready_to_issue(
@@ -7729,10 +8599,10 @@ fn user_seek_ready_to_issue(
     now: std::time::Instant,
 ) -> bool {
     !is_seeking
-        || displayed_seq > state.last_issued_display_seq
+        || displayed_seq > state.last_issued.map_or(0, |issued| issued.displayed_seq)
         || state
-            .last_issued_at
-            .is_some_and(|issued_at| now.duration_since(issued_at) >= USER_SEEK_REISSUE_AFTER)
+            .last_issued
+            .is_some_and(|issued| now.duration_since(issued.at) >= USER_SEEK_REISSUE_AFTER)
 }
 
 fn frame_step_base_secs(
@@ -7825,7 +8695,12 @@ impl VideoPlayer {
             decode: dummy_decode_handles(),
             video_output: VideoOutputState::Inactive,
             audio: None,
+            #[cfg(windows)]
+            dsp_handoff: Mutex::new(LocalDspAcquisition::Idle),
             info: None,
+            audio_track_selection: None,
+            audio_track_open_notice: Mutex::new(None),
+            last_saved_audio_track_generation: AtomicU64::new(0),
             error: None,
             thumb_worker: None,
             remote_seek_thumbnail_request: Mutex::new(None),
@@ -7880,6 +8755,21 @@ impl VideoPlayer {
             audio_codec: Some("aac".to_owned()),
             audio_bit_rate_bps: 128_000,
             has_audio: true,
+            audio_tracks: vec![decoder::AudioTrackInfo {
+                stream_index: 1,
+                ordinal: 1,
+                language: None,
+                title: None,
+                codec: "aac".to_owned(),
+                channels: Some(2),
+                sample_rate: Some(48_000),
+                disposition_default: true,
+                start_secs: None,
+                end_secs: None,
+            }],
+            default_audio_stream_index: Some(1),
+            opened_audio_stream_index: Some(1),
+            open_notice: None,
             has_video: true,
             hw_decode_active: false,
             gpu_path_active: false,
@@ -7898,6 +8788,81 @@ impl VideoPlayer {
             sar_den: 1,
         });
         player
+    }
+
+    #[cfg(all(windows, test))]
+    pub(crate) fn install_native_ui_probe_for_test(&mut self) -> NativeUiProbeForTest {
+        let (mut output, event_tx) =
+            NativeVideoOutput::disconnected_for_test_with_event_sender(Arc::clone(&self.ui_wake));
+        let (command_tx, command_rx) = native_command_bus(16, Arc::new(AtomicBool::new(false)));
+        output.command_tx = command_tx.clone();
+        output.visibility_gate = Arc::new(NativeVideoOutputVisibilityGate::new(
+            true,
+            command_tx,
+            Arc::clone(&output.hwnd),
+        ));
+        self.native_output = Some(output);
+        NativeUiProbeForTest {
+            event_tx,
+            command_rx,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_opened_audio_stream_for_test(
+        &mut self,
+        stream_index: usize,
+        default_stream_index: usize,
+    ) {
+        let info = self.info.as_mut().expect("stream-ready test player");
+        if !info
+            .audio_tracks
+            .iter()
+            .any(|track| track.stream_index == stream_index)
+        {
+            info.audio_tracks.push(decoder::AudioTrackInfo {
+                stream_index,
+                ordinal: info.audio_tracks.len() + 1,
+                language: None,
+                title: None,
+                codec: "aac".to_owned(),
+                channels: Some(2),
+                sample_rate: Some(48_000),
+                disposition_default: false,
+                start_secs: None,
+                end_secs: None,
+            });
+        }
+        info.opened_audio_stream_index = Some(stream_index);
+        info.default_audio_stream_index = Some(default_stream_index);
+        self.audio_track_selection = Some(Arc::new(AudioTrackSelection::new(stream_index)));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply_desired_audio_track_for_test(&self) {
+        let selection = self
+            .audio_track_selection
+            .as_ref()
+            .expect("audio selection");
+        selection.apply(selection.snapshot().desired);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_desired_audio_track_for_test(&self) {
+        let selection = self
+            .audio_track_selection
+            .as_ref()
+            .expect("audio selection");
+        selection.fail(
+            selection.snapshot().desired,
+            AudioTrackSwitchFailureReason::SetupFailed,
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_saved_audio_track_open_notice_for_test(&self) {
+        *self.audio_track_open_notice.lock().unwrap() =
+            Some(audio_track_selection::AudioTrackOpenNotice::SavedTrackUnavailable);
     }
 
     #[cfg(test)]
@@ -7986,6 +8951,11 @@ impl VideoPlayer {
     }
 
     #[cfg(test)]
+    pub(crate) fn user_seek_base_secs_for_test(&self) -> f64 {
+        self.user_seek_base_secs()
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_duration_for_test(&mut self, duration_secs: f64) {
         self.info
             .as_mut()
@@ -8008,8 +8978,13 @@ impl VideoPlayer {
     }
 
     #[cfg(all(test, windows))]
-    pub(crate) fn notify_eof_for_test(&self) {
-        self.clock.notify_eof_reached();
+    pub(crate) fn notify_demux_exhausted_for_test(&self) {
+        self.clock.notify_demux_exhausted();
+        // These timing fixtures have no running decode/pump workers.
+        let serial = self.clock.current_seek_serial();
+        self.clock.note_audio_decoded_eos(serial);
+        self.clock.begin_audio_tail(serial);
+        self.clock.complete_audio_tail(serial);
     }
 
     #[cfg(all(test, windows))]
@@ -8037,16 +9012,16 @@ impl VideoPlayer {
     ///
     /// `initial_volume` は線形ゲイン (0.0..+18dB 相当)。1.0 超は音声ポンプ側の
     /// 手動 boost として扱う。
-    /// `initial_normalize_gain` は線形ゲイン (1.0 = 素通し)。open 前に DB hit が
-    /// 分かっている場合、音声ワーカー起動前に設定して最初の chunk から反映する。
+    /// `initial_normalize_gain` は既存 `open` 呼び出し用の初期値。
+    /// Norm ON の App 経路は `open_with_output_consumer` へ `normalize_enabled=true` を
+    /// 渡し、stream 別の解決まで表の既定 `Pending` で音声を止める。
     /// `initial_audio_preroll_suspended` が true の間は、測定前 Norm などのために
     /// audio-pump の raw→processed 先読みを一時停止する。
     /// `resume_secs` を指定すると、最初の動画情報受領後に自動的にその位置へシークする。
     /// `hw_decode` が true なら D3D11VA HW デコードを試行する。D3D11VA 非対応 codec は
     /// SW で開き、D3D11VA 対応 codec の HW 初期化 / open 失敗はエラーにする。
-    /// VST3 プラグイン処理用の DspBridge は `dsp_bridge` 引数で渡す。
-    /// `None` または `is_enabled()=false` なら audio-pump はパススルー。
-    /// `is_enabled()=true` のときは pump thread で `bridge.process_block` を呼ぶ。
+    /// `dsp_chain` はユーザー VST3 と EffeTune の共有スロットを音声 pump へ渡す。
+    /// RemoteHeadless はローカル音声出力を持たないので `None` を渡す。
     pub fn open(
         path: PathBuf,
         initial_volume: f64,
@@ -8054,27 +9029,30 @@ impl VideoPlayer {
         initial_audio_preroll_suspended: bool,
         autoplay: bool,
         resume_secs: Option<f64>,
+        initial_audio_track: Option<SavedAudioTrackChoice>,
         hw_decode: bool,
         deinterlace: crate::settings::VideoDeinterlaceMode,
         #[cfg(windows)] gpu_video_device: Option<
             std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>,
         >,
-        #[cfg(windows)] dsp_bridge: Option<std::sync::Arc<crate::video::dsp::DspBridge>>,
+        #[cfg(windows)] dsp_chain: Option<audio::AudioDspChain>,
         #[cfg(windows)] native_output_config: Option<NativeVideoOutputConfig>,
     ) -> Self {
         Self::open_with_output_consumer(
             path,
             initial_volume,
             initial_normalize_gain,
+            false,
             initial_audio_preroll_suspended,
             autoplay,
             resume_secs,
+            initial_audio_track,
             hw_decode,
             deinterlace,
             #[cfg(windows)]
             gpu_video_device,
             #[cfg(windows)]
-            dsp_bridge,
+            dsp_chain,
             VideoOutputConsumer::Presentation,
             #[cfg(windows)]
             native_output_config,
@@ -8085,15 +9063,17 @@ impl VideoPlayer {
         path: PathBuf,
         initial_volume: f64,
         initial_normalize_gain: f64,
+        normalize_enabled: bool,
         initial_audio_preroll_suspended: bool,
         autoplay: bool,
         resume_secs: Option<f64>,
+        initial_audio_track: Option<SavedAudioTrackChoice>,
         hw_decode: bool,
         deinterlace: crate::settings::VideoDeinterlaceMode,
         #[cfg(windows)] gpu_video_device: Option<
             std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>,
         >,
-        #[cfg(windows)] dsp_bridge: Option<std::sync::Arc<crate::video::dsp::DspBridge>>,
+        #[cfg(windows)] dsp_chain: Option<audio::AudioDspChain>,
         output_consumer: VideoOutputConsumer,
         #[cfg(windows)] native_output_config: Option<NativeVideoOutputConfig>,
     ) -> Self {
@@ -8108,8 +9088,12 @@ impl VideoPlayer {
             // begin_loading は呼ばない (= Phase 3+ で resume 適用も走らない)。
             // 共有 seek_serial を 1 個作り、AvClock と EngineActor 双方に clone を渡す。
             let seek_serial = Arc::new(AtomicU64::new(0));
-            let dummy_clock = Arc::new(AvClock::new(initial_volume, seek_serial.clone()));
-            dummy_clock.set_normalize_gain(initial_normalize_gain);
+            let dummy_clock = Arc::new(AvClock::new_with_normalize(
+                initial_volume,
+                seek_serial.clone(),
+                normalize_enabled,
+                initial_normalize_gain,
+            ));
             dummy_clock.set_audio_preroll_suspended(initial_audio_preroll_suspended);
             let engine = Arc::new(Mutex::new(EngineActor::new(
                 OpenOptions {
@@ -8148,7 +9132,12 @@ impl VideoPlayer {
                 decode: dummy_decode_handles(),
                 video_output: VideoOutputState::Inactive,
                 audio: None,
+                #[cfg(windows)]
+                dsp_handoff: Mutex::new(LocalDspAcquisition::Idle),
                 info: None,
+                audio_track_selection: None,
+                audio_track_open_notice: Mutex::new(None),
+                last_saved_audio_track_generation: AtomicU64::new(0),
                 error: Some(format!("FFmpeg DLL のロードに失敗しました: {e}")),
                 thumb_worker: None,
                 remote_seek_thumbnail_request: Mutex::new(None),
@@ -8194,10 +9183,14 @@ impl VideoPlayer {
         // 渡す。これで両者の seek 世代が構造的に常に一致する (= 旧版の「2 つのカウンタを
         // 規律で同期」設計を撤去)。詳細は EngineActor.seek_serial の doc コメント参照。
         let seek_serial = Arc::new(AtomicU64::new(0));
-        let clock = Arc::new(AvClock::new(initial_volume, seek_serial.clone()));
+        let clock = Arc::new(AvClock::new_with_normalize(
+            initial_volume,
+            seek_serial.clone(),
+            normalize_enabled,
+            initial_normalize_gain,
+        ));
         // DB hit 済みの Norm gain は audio pump 起動前に入れる。open / source-swap 直後の
         // 最初の processed chunk から反映されるので、旧 gain の一瞬の鳴りを避けられる。
-        clock.set_normalize_gain(initial_normalize_gain);
         clock.set_audio_preroll_suspended(initial_audio_preroll_suspended);
         let cancel = Arc::new(AtomicBool::new(false));
 
@@ -8217,6 +9210,7 @@ impl VideoPlayer {
             resume_secs,
             loop_enabled: false, // VideoPlayer 側で個別管理 (Phase 3+ で統合予定)
             hw_decode,
+            playback_start: PlaybackStartContext::default(),
         };
         let engine = Arc::new(Mutex::new(EngineActor::new(
             opts,
@@ -8247,7 +9241,7 @@ impl VideoPlayer {
         // 共有するための atomic 群。VideoInfo にも同じ Arc を載せて UI が読む。
         let dynamic = Arc::new(crate::video::decoder::VideoDynamicState::default());
 
-        let decode = decoder::spawn(
+        let decode = decoder::spawn_with_initial_audio_track(
             path.clone(),
             clock.clone(),
             cancel.clone(),
@@ -8260,6 +9254,7 @@ impl VideoPlayer {
             engine_event_tx.clone(),
             decoder_dropped_full_count.clone(),
             Arc::clone(&dynamic),
+            initial_audio_track,
         );
 
         // 音声出力起動。失敗してもプレイヤーは生きる (映像のみ再生)。
@@ -8269,6 +9264,7 @@ impl VideoPlayer {
             video_rx,
             audio_rx,
             info_rx,
+            audio_track_selection_rx,
             prep_progress,
             video_tap,
         } = decode;
@@ -8281,7 +9277,7 @@ impl VideoPlayer {
             engine_state_handle.clone(),
             Arc::clone(&audio_diagnostics),
             #[cfg(windows)]
-            dsp_bridge,
+            dsp_chain,
         ) {
             Ok(a) => Some(a),
             Err(e) => {
@@ -8404,12 +9400,18 @@ impl VideoPlayer {
                 video_rx,
                 audio_rx: dummy_audio_rx(),
                 info_rx,
+                audio_track_selection_rx,
                 prep_progress,
                 video_tap,
             },
             video_output,
             audio,
+            #[cfg(windows)]
+            dsp_handoff: Mutex::new(LocalDspAcquisition::Idle),
             info: None,
+            audio_track_selection: None,
+            audio_track_open_notice: Mutex::new(None),
+            last_saved_audio_track_generation: AtomicU64::new(0),
             error: headless_init_error.or(native_init_error),
             thumb_worker,
             remote_seek_thumbnail_request: Mutex::new(None),
@@ -8443,6 +9445,10 @@ impl VideoPlayer {
         if player.error.is_some() {
             player.shutdown_workers_for_error();
         }
+        #[cfg(windows)]
+        if autoplay && player.error.is_none() {
+            player.begin_dsp_acquisition(LocalDspPosition::CurrentAfterMetadata);
+        }
         crate::logger::log(format!(
             "[video-debug] VideoPlayer::open done path={} autoplay={} volume={:.2} normalize_gain={:.3} audio_preroll_suspended={} engine_state={} resume_secs={:?} video_rx_len={} audio_rx_len={}",
             player.path.display(),
@@ -8461,11 +9467,15 @@ impl VideoPlayer {
     /// Phase 3c: engine event channel から events を drain して engine actor に
     /// dispatch する。tick の冒頭で呼ぶ。
     /// 1 tick 内で全 events を処理する (= UI 60fps なら遅くても 16ms 内に decoder/
-    /// audio events が actor に届く)。channel が full のときは decoder/audio 側で
-    /// drop されるが、Phase 3c では非クリティカル events のみ流すので問題ない。
+    /// audio events が actor に届く)。満杯時に破棄してよいのは非クリティカル event
+    /// のみ。demux の終端 Failed は cancel まで空きを待って送る。
     fn drain_engine_events(&mut self) {
         let mut engine = self.engine.lock().unwrap();
+        let mut audio_only_failed = false;
         while let Ok(ev) = self.engine_event_rx.try_recv() {
+            if let EngineEvent::Decoder(engine::state::DecoderEvent::Failed { reason }) = &ev {
+                audio_only_failed |= reason == decoder::AUDIO_ONLY_LANE_LOST_REASON;
+            }
             let readiness_event = match &ev {
                 EngineEvent::Decoder(engine::state::DecoderEvent::SeekCompleted {
                     epoch,
@@ -8499,6 +9509,11 @@ impl VideoPlayer {
                     ));
                 }
             }
+        }
+        drop(engine);
+        if audio_only_failed && self.error.is_none() {
+            self.error = Some(decoder::AUDIO_ONLY_LANE_LOST_REASON.to_owned());
+            self.shutdown_workers_for_error();
         }
     }
 
@@ -8690,6 +9705,162 @@ impl VideoPlayer {
         self.info.as_ref()
     }
 
+    pub fn audio_track_selection(&self) -> Option<AudioTrackSelectionSnapshot> {
+        self.audio_track_selection
+            .as_ref()
+            .map(|selection| selection.snapshot())
+    }
+
+    #[cfg(feature = "test-script")]
+    pub(crate) fn test_script_processed_frequency_hz(&self) -> Option<f64> {
+        self.audio
+            .as_ref()
+            .and_then(audio::AudioOutput::test_script_processed_frequency_hz)
+    }
+
+    fn saved_audio_track_for_stream(&self, stream_index: usize) -> Option<SavedAudioTrackChoice> {
+        self.info
+            .as_ref()?
+            .audio_tracks
+            .iter()
+            .find(|track| track.stream_index == stream_index)
+            .map(SavedAudioTrackChoice::from)
+    }
+
+    /// UI-thread writer harvests a completed explicit request, including during retirement.
+    pub(crate) fn take_confirmed_audio_track_choice(&self) -> Option<SavedAudioTrackChoice> {
+        let snapshot = self.audio_track_selection()?;
+        if snapshot.applied.generation == 0
+            || snapshot.desired.generation != snapshot.applied.generation
+            || self
+                .last_saved_audio_track_generation
+                .load(Ordering::Acquire)
+                >= snapshot.applied.generation
+        {
+            return None;
+        }
+        let choice = self.saved_audio_track_for_stream(snapshot.applied.stream_index)?;
+        self.last_saved_audio_track_generation
+            .store(snapshot.applied.generation, Ordering::Release);
+        Some(choice)
+    }
+
+    pub(crate) fn explicit_unchanged_audio_track_choice(&self) -> Option<SavedAudioTrackChoice> {
+        let snapshot = self.audio_track_selection()?;
+        if snapshot.desired != snapshot.applied {
+            return None;
+        }
+        let choice = self.saved_audio_track_for_stream(snapshot.applied.stream_index)?;
+        self.last_saved_audio_track_generation
+            .fetch_max(snapshot.applied.generation, Ordering::Release);
+        Some(choice)
+    }
+
+    pub fn take_audio_track_open_notice(
+        &self,
+    ) -> Option<audio_track_selection::AudioTrackOpenNotice> {
+        self.audio_track_open_notice.lock().unwrap().take()
+    }
+
+    pub fn audio_track_display_state(&self) -> Option<AudioTrackSelectionDisplayState> {
+        let deferred = self.engine_state_code() == engine::actor::state_code::EOF;
+        self.audio_track_selection()
+            .map(|selection| selection.display_state(deferred))
+    }
+
+    /// UI thread polls this on the owning player. A failure is announced once per generation.
+    pub fn take_audio_track_failure_notification(&self) -> bool {
+        let deferred = self.engine_state_code() == engine::actor::state_code::EOF;
+        self.audio_track_selection
+            .as_ref()
+            .is_some_and(|selection| selection.take_failure_notification(deferred))
+    }
+
+    /// Publishes the desired stream before issuing one immediate, position-preserving seek.
+    /// Decoder setup and FFmpeg seek run on demux; this method never waits for either.
+    pub fn select_audio_track(&self, stream_index: usize) -> AudioTrackSelectResult {
+        let rejected = AudioTrackSelectResult {
+            outcome: AudioTrackSelectOutcome::Rejected,
+            normalize_unresolved: false,
+        };
+        let Some(selection) = self.audio_track_selection.as_ref() else {
+            return rejected;
+        };
+        if !self.info.as_ref().is_some_and(|info| {
+            info.audio_tracks
+                .iter()
+                .any(|track| track.stream_index == stream_index)
+        }) {
+            return rejected;
+        }
+        let (request, choice) = selection.request_with_choice(stream_index);
+        match request {
+            AudioTrackRequestOutcome::Rejected => return rejected,
+            AudioTrackRequestOutcome::Unchanged => {
+                return AudioTrackSelectResult {
+                    outcome: AudioTrackSelectOutcome::Unchanged,
+                    normalize_unresolved: self
+                        .clock
+                        .normalize_gain_for_stream(stream_index)
+                        .is_none(),
+                };
+            }
+            AudioTrackRequestOutcome::Accepted => {}
+        }
+        // The DSP handoff deliberately pauses the engine. Keep the original play
+        // request when a track switch supersedes that handoff.
+        let should_play = self.intent_playing() || {
+            #[cfg(windows)]
+            {
+                !matches!(
+                    &*self.dsp_handoff.lock().unwrap(),
+                    LocalDspAcquisition::Idle
+                )
+            }
+            #[cfg(not(windows))]
+            {
+                false
+            }
+        };
+        if self.engine_state_code() == engine::actor::state_code::EOF {
+            return AudioTrackSelectResult {
+                outcome: AudioTrackSelectOutcome::Deferred,
+                normalize_unresolved: self.clock.normalize_gain_for_stream(stream_index).is_none(),
+            };
+        }
+        let mut base = self.audio_track_seek_base_secs();
+        #[cfg(windows)]
+        {
+            let handoff = self.dsp_handoff.lock().unwrap();
+            let requested = match &*handoff {
+                LocalDspAcquisition::AwaitingMetadata(position) => Some(*position),
+                LocalDspAcquisition::Waiting(pending) => Some(pending.requested_position),
+                LocalDspAcquisition::Idle => None,
+            };
+            if let Some(requested) = requested {
+                base = requested.resolve(self.position());
+            }
+        }
+        let track = self.info.as_ref().and_then(|info| {
+            info.audio_tracks
+                .iter()
+                .find(|track| track.stream_index == stream_index)
+        });
+        if track.is_some_and(|track| !audio_track_selection::audio_track_available_at(track, base))
+        {
+            selection.defer_if_current(choice.expect("accepted audio choice"));
+            return AudioTrackSelectResult {
+                outcome: AudioTrackSelectOutcome::Deferred,
+                normalize_unresolved: self.clock.normalize_gain_for_stream(stream_index).is_none(),
+            };
+        }
+        self.seek_with_play_state(base, should_play);
+        AudioTrackSelectResult {
+            outcome: AudioTrackSelectOutcome::Requested,
+            normalize_unresolved: self.clock.normalize_gain_for_stream(stream_index).is_none(),
+        }
+    }
+
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
     }
@@ -8749,30 +9920,242 @@ impl VideoPlayer {
 
     /// Phase 9.C: engine state machine に Play / Pause を伝える。
     /// `toggle_play` / `set_playing` から共有。`apply_command` は idempotent。
-    fn dispatch_play_pause(&self, playing: bool) {
-        let cmd = if playing {
-            engine::actor::TransportCommand::Play
-        } else {
-            engine::actor::TransportCommand::Pause
+    fn dispatch_play_pause(&self, playing: bool, continuation: InternalContinuation) {
+        #[cfg(windows)]
+        if playing && self.begin_dsp_acquisition(LocalDspPosition::CurrentAfterMetadata) {
+            return;
+        }
+        #[cfg(windows)]
+        if !playing {
+            self.cancel_dsp_acquisition();
+        }
+        self.engine
+            .lock()
+            .unwrap()
+            .apply_internal_continuation(playing, continuation);
+    }
+
+    #[cfg(windows)]
+    fn begin_dsp_acquisition(&self, requested_position: LocalDspPosition) -> bool {
+        let Some(audio) = self.audio.as_ref() else {
+            return false;
         };
-        self.engine.lock().unwrap().apply_command(cmd);
+        if !audio.has_applicable_dsp() {
+            audio.note_dsp_acquisition_not_started();
+            return false;
+        }
+        if audio.has_dsp_token() {
+            return false;
+        }
+        {
+            let mut acquisition = self.dsp_handoff.lock().unwrap();
+            match &mut *acquisition {
+                LocalDspAcquisition::Waiting(_) => return true,
+                LocalDspAcquisition::AwaitingMetadata(existing) if self.info.is_none() => {
+                    if matches!(requested_position, LocalDspPosition::Exact(_)) {
+                        *existing = requested_position;
+                    }
+                    return true;
+                }
+                LocalDspAcquisition::AwaitingMetadata(_) => {
+                    *acquisition = LocalDspAcquisition::Idle;
+                }
+                LocalDspAcquisition::Idle => {}
+            }
+        }
+        let position_secs = requested_position.resolve(self.position());
+        let requested_position = if self.info.is_some() {
+            LocalDspPosition::Exact(position_secs)
+        } else {
+            requested_position
+        };
+        // Freeze the clock and output before revoking the old owner's token.
+        self.engine
+            .lock()
+            .unwrap()
+            .apply_internal_continuation(false, InternalContinuation::Dsp);
+        self.clock.set_paused_position(position_secs);
+        if self.info.is_none() {
+            *self.dsp_handoff.lock().unwrap() =
+                LocalDspAcquisition::AwaitingMetadata(requested_position);
+            return true;
+        }
+        let handoff = match audio.request_dsp_handoff(Arc::clone(&self.ui_wake)) {
+            Ok(handoff) => handoff,
+            Err(error) => {
+                // This activation has ended. Repeated UI ticks must not pause and
+                // seek again for a worker that cannot be started.
+                audio.note_dsp_activation_handled();
+                crate::logger::log(format!("local DSP handoff start failed: {error}"));
+                self.seek_with_play_state(position_secs, false);
+                if audio.local_dry_resume_allowed() {
+                    self.engine
+                        .lock()
+                        .unwrap()
+                        .apply_internal_continuation(true, InternalContinuation::Dsp);
+                }
+                return true;
+            }
+        };
+        *self.dsp_handoff.lock().unwrap() = LocalDspAcquisition::Waiting(PendingLocalDspHandoff {
+            handoff,
+            requested_position,
+        });
+        audio.note_dsp_activation_handled();
+        true
+    }
+
+    #[cfg(windows)]
+    fn cancel_dsp_acquisition(&self) -> bool {
+        match std::mem::replace(
+            &mut *self.dsp_handoff.lock().unwrap(),
+            LocalDspAcquisition::Idle,
+        ) {
+            LocalDspAcquisition::Idle => false,
+            LocalDspAcquisition::AwaitingMetadata(_) => true,
+            LocalDspAcquisition::Waiting(pending) => {
+                pending.handoff.coordinator.cancel(pending.handoff.request);
+                true
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn start_dsp_acquisition_after_metadata(&self) {
+        if self.info.is_none() {
+            return;
+        }
+        let requested_position = {
+            let mut acquisition = self.dsp_handoff.lock().unwrap();
+            match &*acquisition {
+                LocalDspAcquisition::AwaitingMetadata(position) => {
+                    let position = *position;
+                    *acquisition = LocalDspAcquisition::Idle;
+                    Some(position)
+                }
+                _ => None,
+            }
+        };
+        if let Some(position) = requested_position {
+            if !self.begin_dsp_acquisition(position) {
+                // Pausing for metadata cleared autoplay intent. A failed acquisition
+                // must restore that intent and the requested position for dry playback.
+                self.seek_with_play_state(position.resolve(self.position()), false);
+                if self
+                    .audio
+                    .as_ref()
+                    .is_none_or(|audio| audio.local_dry_resume_allowed())
+                {
+                    self.engine
+                        .lock()
+                        .unwrap()
+                        .apply_internal_continuation(true, InternalContinuation::Dsp);
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn poll_dsp_acquisition(&self) {
+        let completion = {
+            let mut pending = self.dsp_handoff.lock().unwrap();
+            let LocalDspAcquisition::Waiting(current) = &*pending else {
+                return;
+            };
+            match current.handoff.receiver.try_recv() {
+                Ok(result) => match std::mem::replace(&mut *pending, LocalDspAcquisition::Idle) {
+                    LocalDspAcquisition::Waiting(request) => Some((request, result)),
+                    _ => unreachable!(),
+                },
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    match std::mem::replace(&mut *pending, LocalDspAcquisition::Idle) {
+                        LocalDspAcquisition::Waiting(request) => {
+                            Some((request, audio::LocalDspHandoffResult::Cancelled))
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        };
+        let Some((pending, result)) = completion else {
+            return;
+        };
+        let request = pending.handoff.request;
+        let coordinator = pending.handoff.coordinator;
+        let requested_position_secs = pending.requested_position.resolve(self.position());
+        if !coordinator.is_desired(request)
+            && !(matches!(result, audio::LocalDspHandoffResult::TimedOut)
+                && coordinator.is_latest_request(request))
+        {
+            if coordinator.local_dry_resume_allowed() {
+                self.seek_with_play_state(requested_position_secs, false);
+                self.engine
+                    .lock()
+                    .unwrap()
+                    .apply_internal_continuation(true, InternalContinuation::Dsp);
+            }
+            return;
+        }
+        match result {
+            audio::LocalDspHandoffResult::Ready(handoff) => {
+                self.seek_with_play_state(requested_position_secs, false);
+                if handoff.grant() {
+                    self.engine
+                        .lock()
+                        .unwrap()
+                        .apply_internal_continuation(true, InternalContinuation::Dsp);
+                } else if coordinator.local_dry_resume_allowed() {
+                    self.engine
+                        .lock()
+                        .unwrap()
+                        .apply_internal_continuation(true, InternalContinuation::Dsp);
+                }
+            }
+            audio::LocalDspHandoffResult::TimedOut | audio::LocalDspHandoffResult::ResetFailed => {
+                if matches!(result, audio::LocalDspHandoffResult::TimedOut) {
+                    crate::logger::log("local DSP handoff timeout; resuming without DSP");
+                }
+                self.seek_with_play_state(requested_position_secs, false);
+                coordinator.cancel(request);
+                if coordinator.local_dry_resume_allowed() {
+                    self.engine
+                        .lock()
+                        .unwrap()
+                        .apply_internal_continuation(true, InternalContinuation::Dsp);
+                }
+            }
+            audio::LocalDspHandoffResult::Cancelled => {}
+        }
     }
 
     pub fn toggle_play(&self) {
+        #[cfg(windows)]
+        if self.cancel_dsp_acquisition() {
+            self.engine.lock().unwrap().discard_playback_start();
+            return;
+        }
+        if self.is_at_eof() || !self.intent_playing() {
+            self.register_playback_start(PlaybackStartOrigin::UserPlay);
+        } else {
+            self.engine.lock().unwrap().discard_playback_start();
+        }
         // EOF で停止中に Space を押されたら 0 から再生し直す (replay)。
         // 通常の再生中は単純トグル。
         //
-        // **EOF 判定** (2026-05-18 update): EofReached は engine に同期配線され、EOF 到達時に
-        // engine.state=Eof + AvClock playing=false + is_eof_reached=true が atomic に確定する。
-        // 「`!is_playing() && is_eof_reached()`」は engine_state==Eof と等価で、EOF 検出条件
-        // として有効。`apply_command(Play)` の Eof arm 経由でも replay できる
-        // (= `set_playing(true)` 経路) が、user の Space 入力は user seek 経路で
-        // epoch 競合なく扱いたいので、ここでは明示的に `request_seek(0)` + `handle_seek_request(0)`
-        // + `apply_command(Play)` を発行する。
-        if !self.clock.is_playing() && self.clock.is_eof_reached() {
+        // demux の先読み完了は再生終了ではない。pause で clock が停止していても
+        // 出力待ちの packet / frame / audio が残るため、再生終了の唯一の owner である
+        // engine の published Eof を使う。drain 後に tick が Eof を確定する。
+        // user の Space 入力は明示的な seek 経路で epoch を一度だけ進める。
+        if self.is_at_eof() {
+            #[cfg(windows)]
+            if self.begin_dsp_acquisition(LocalDspPosition::Exact(0.0)) {
+                return;
+            }
             self.clear_pending_user_seek();
             self.clear_frame_step_target();
             self.clock.request_seek(0.0);
+            self.record_issued_seek(0.0);
             self.clear_audio_output_buffer();
             // 2026-05 root fix: `clock.set_playing(true)` の直書きは撤去。
             // 続く `handle_seek_request` → `apply_command(Play)` → engine 内部で
@@ -8791,7 +10174,7 @@ impl VideoPlayer {
             // autoplay=true 設定だけ走る。
             let mut g = self.engine.lock().unwrap();
             g.handle_seek_request(0.0);
-            g.apply_command(engine::actor::TransportCommand::Play);
+            g.apply_internal_continuation(true, InternalContinuation::Transport);
             return;
         }
         // 非 EOF: **intent 基準で方向決定** (Codex P2 2026-05-17)。
@@ -8806,10 +10189,97 @@ impl VideoPlayer {
         } else {
             self.clear_pending_user_seek();
         }
-        self.dispatch_play_pause(new_playing);
+        self.dispatch_play_pause(new_playing, InternalContinuation::Transport);
     }
 
+    pub(crate) fn bind_playback_viewer_context(&self, viewer_context: u64) {
+        self.engine
+            .lock()
+            .unwrap()
+            .bind_playback_viewer_context(viewer_context);
+    }
+
+    pub(crate) fn classify_pending_playback_start(&self, origin: PlaybackStartOrigin) {
+        self.engine
+            .lock()
+            .unwrap()
+            .classify_pending_playback_start(origin);
+    }
+
+    pub fn register_playback_start(&self, origin: PlaybackStartOrigin) {
+        self.engine.lock().unwrap().register_playback_start(origin);
+    }
+
+    pub(crate) fn playback_success_is_current(&self, id: u64) -> bool {
+        self.engine.lock().unwrap().playback_success_is_current(id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_playback_success_for_test(&self) -> Option<PlaybackSuccess> {
+        self.engine
+            .lock()
+            .unwrap()
+            .pending_playback_success_for_test()
+    }
+
+    pub fn take_playback_success(&self) -> Option<PlaybackSuccess> {
+        self.engine.lock().unwrap().take_playback_success()
+    }
+
+    /// Explicit user/source request. Internal resumes must use the continuation API.
+    pub fn set_playing_with_origin(&self, p: bool, origin: PlaybackStartOrigin) {
+        if p {
+            self.register_playback_start(origin);
+        } else {
+            self.engine.lock().unwrap().discard_playback_start();
+        }
+        self.set_playing_internal(p, InternalContinuation::Transport);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn confirm_playback_start_for_test(&self, origin: PlaybackStartOrigin) {
+        let mut actor = self.engine.lock().unwrap();
+        if actor.published_state_code() == engine::actor::state_code::IDLE {
+            actor.begin_loading();
+            let epoch = actor.current_seek_epoch();
+            actor.handle_decoder_event(engine::state::DecoderEvent::InfoReceived {
+                epoch,
+                duration_secs: 30.0,
+                has_audio: false,
+                has_video: true,
+            });
+        }
+        actor.register_playback_start(origin);
+        actor.apply_internal_continuation(true, InternalContinuation::Transport);
+        let epoch = actor.current_seek_epoch();
+        actor
+            .handle_decoder_event(engine::state::DecoderEvent::FirstFrameReady { epoch, pts: 0.0 });
+    }
+
+    pub(crate) fn set_auto_presentation_reader(
+        &self,
+        reader: crate::effetune::gui_gate::AutoPresentationReader,
+    ) {
+        self.engine
+            .lock()
+            .unwrap()
+            .set_auto_presentation_reader(reader);
+    }
+
+    /// Compatibility transport continuation; never infer a user start from this API.
     pub fn set_playing(&self, p: bool) {
+        self.set_playing_internal(p, InternalContinuation::Transport);
+    }
+
+    pub fn set_playing_internal(&self, p: bool, continuation: InternalContinuation) {
+        #[cfg(windows)]
+        if !p && self.cancel_dsp_acquisition() {
+            self.engine
+                .lock()
+                .unwrap()
+                .apply_internal_continuation(false, continuation);
+            return;
+        }
         // **intent 基準で dispatch 判定** (Codex P2 2026-05-17): 旧版は
         // `prev = self.clock.is_playing()` を見ていたが、`is_playing()` は engine state
         // が Playing のときだけ true なので、Loading/Buffering/Seeking 中 (autoplay=true)
@@ -8838,9 +10308,21 @@ impl VideoPlayer {
         // play ボタンを押したときは replay (= 0 から再生) を期待する。EOF + p=true は
         // 強制 dispatch することで `handle_play` の Eof arm (= `handle_seek_request(0)` +
         // autoplay 強制) を発火させ replay する。
-        let force_dispatch = p && self.clock.is_eof_reached();
-        if prev_intent != p || force_dispatch {
-            self.dispatch_play_pause(p);
+        let force_dispatch = p && self.is_at_eof();
+        #[cfg(windows)]
+        if force_dispatch && self.begin_dsp_acquisition(LocalDspPosition::Exact(0.0)) {
+            return;
+        }
+        #[cfg(windows)]
+        let needs_dsp_acquisition = p
+            && self
+                .audio
+                .as_ref()
+                .is_some_and(|audio| audio.has_applicable_dsp() && !audio.has_dsp_token());
+        #[cfg(not(windows))]
+        let needs_dsp_acquisition = false;
+        if prev_intent != p || force_dispatch || needs_dsp_acquisition {
+            self.dispatch_play_pause(p, continuation);
         }
         crate::logger::log(format!(
             "[video-debug] set_playing({p}) done: engine_state={} playing={} intent={} seek_serial={}",
@@ -8881,7 +10363,55 @@ impl VideoPlayer {
             .unwrap_or_else(|| self.position())
     }
 
+    /// The seek target wins only while it has not produced a displayed frame.
+    /// Otherwise use the last real frame, including during demux EOF drain:
+    /// the clock can already be beyond the last decodable video frame then.
+    fn audio_track_seek_base_secs(&self) -> f64 {
+        if self.is_frame_step_active() {
+            return self
+                .last_displayed_pts_secs()
+                .unwrap_or_else(|| self.position());
+        }
+        if let Ok(state) = self.user_seek_coalesce.lock() {
+            if let Some(target) = state.pending_target_secs {
+                return target;
+            }
+            if self.info.as_ref().is_some_and(|info| !info.has_video) {
+                // Audio-only has no displayed-frame sequence to retire an
+                // issued seek. The audio clock is its position source.
+                return self.position();
+            }
+            if let Some(issued) = state.last_issued.filter(|issued| {
+                issued.serial == self.clock.current_seek_serial()
+                    && !self.clock.seek_was_interrupted(issued.serial)
+            }) {
+                // Audio output can clear the clock override before video has
+                // displayed the seek result, or leave it set after display.
+                // The display sequence identifies which side of that boundary
+                // the choice belongs to, independently of the audio callback.
+                if self.displayed_frame_seq.load(Ordering::Acquire) <= issued.displayed_seq {
+                    return issued.target_secs;
+                }
+                return self
+                    .last_displayed_pts_secs()
+                    .unwrap_or_else(|| self.position());
+            }
+        }
+        if self.clock.is_seeking()
+            && !self
+                .clock
+                .seek_was_interrupted(self.clock.current_seek_serial())
+        {
+            // During an issued seek, position() is the target override. The
+            // old displayed frame can still belong to the previous generation.
+            return self.position();
+        }
+        self.last_displayed_pts_secs()
+            .unwrap_or_else(|| self.position())
+    }
+
     fn issue_user_seek_locked(&self, state: &mut UserSeekCoalesceState, target_secs: f64) {
+        let displayed_seq_at_issue = self.displayed_frame_seq.load(Ordering::Acquire);
         self.clock.request_seek(target_secs);
         self.clear_audio_output_buffer();
         // 2026-05 root fix: `clock.set_playing(true)` の直書きは撤去。続く
@@ -8891,10 +10421,24 @@ impl VideoPlayer {
         // (詳細は toggle_play を参照)。
         let mut g = self.engine.lock().unwrap();
         g.handle_seek_request(target_secs);
-        g.apply_command(engine::actor::TransportCommand::Play);
+        g.apply_internal_continuation(true, InternalContinuation::Seek);
         state.pending_target_secs = None;
-        state.last_issued_at = Some(std::time::Instant::now());
-        state.last_issued_display_seq = self.displayed_frame_seq.load(Ordering::Acquire);
+        state.last_issued = Some(IssuedUserSeek {
+            target_secs,
+            serial: self.clock.current_seek_serial(),
+            at: std::time::Instant::now(),
+            displayed_seq: displayed_seq_at_issue,
+        });
+    }
+
+    fn record_issued_seek(&self, target_secs: f64) {
+        let mut state = self.user_seek_coalesce.lock().unwrap();
+        state.last_issued = Some(IssuedUserSeek {
+            target_secs,
+            serial: self.clock.current_seek_serial(),
+            at: std::time::Instant::now(),
+            displayed_seq: self.displayed_frame_seq.load(Ordering::Acquire),
+        });
     }
 
     fn request_user_seek(&self, target_secs: f64) {
@@ -8935,8 +10479,8 @@ impl VideoPlayer {
             self.issue_user_seek_locked(&mut state, target);
             None
         } else {
-            state.last_issued_at.map(|issued_at| {
-                USER_SEEK_REISSUE_AFTER.saturating_sub(now.saturating_duration_since(issued_at))
+            state.last_issued.map(|issued| {
+                USER_SEEK_REISSUE_AFTER.saturating_sub(now.saturating_duration_since(issued.at))
             })
         }
     }
@@ -8949,6 +10493,13 @@ impl VideoPlayer {
     pub fn seek(&self, target_secs: f64) {
         self.clear_frame_step_target();
         let clamped = self.clamp_seek_target(target_secs);
+        #[cfg(windows)]
+        {
+            self.cancel_dsp_acquisition();
+            if self.begin_dsp_acquisition(LocalDspPosition::Exact(clamped)) {
+                return;
+            }
+        }
         crate::logger::log(format!(
             "[video-debug] seek({target_secs:.3}) called: clamped={clamped:.3} engine_state={} prev_seek_serial={} playing={} video_rx_len={} audio_rx_len={}",
             self.engine_state_name(),
@@ -8973,6 +10524,17 @@ impl VideoPlayer {
     pub fn seek_with_play_state(&self, target_secs: f64, should_play: bool) {
         self.clear_frame_step_target();
         let clamped = self.clamp_seek_target(target_secs);
+        #[cfg(windows)]
+        if should_play {
+            self.cancel_dsp_acquisition();
+            if self.begin_dsp_acquisition(LocalDspPosition::Exact(clamped)) {
+                return;
+            }
+        }
+        #[cfg(windows)]
+        if !should_play {
+            self.cancel_dsp_acquisition();
+        }
         if should_play {
             let mut state = self.user_seek_coalesce.lock().unwrap();
             self.issue_user_seek_locked(&mut state, clamped);
@@ -9000,9 +10562,8 @@ impl VideoPlayer {
     /// `position_secs`, so the source origin is already final even though a paused player can keep
     /// its seek override indefinitely. We therefore must not wait for `clock.is_seeking()` here.
     ///
-    /// The remote player is opened with autoplay disabled, which also disables deferred normalize
-    /// scanning. Its gain is installed before decoder/audio workers start; copying it into this
-    /// snapshot fixes the value used by the independent generation.
+    /// The remote player is opened with autoplay disabled and is metadata-only. The opened audio
+    /// stream is fixed here for both transcode and the generation worker's independent Norm lookup.
     pub(crate) fn remote_stream_start_inputs(&self) -> Option<RemoteStreamStartInputs> {
         let info = self.info.as_ref()?;
         if self.pending_resume_secs.is_some() {
@@ -9013,7 +10574,8 @@ impl VideoPlayer {
             has_video: info.has_video,
             has_audio: info.has_audio,
             source_origin_secs: self.position_secs(),
-            normalize_gain: self.normalize_gain(),
+            audio_stream_index: info.opened_audio_stream_index?,
+            default_audio_stream_index: info.default_audio_stream_index,
         })
     }
 
@@ -9189,7 +10751,7 @@ impl VideoPlayer {
             self.request_user_seek(target);
             return RelativeSeekOutcome::Seeked;
         };
-        // 境界に達したときの pending / override クリアは **`is_eof_reached()` のときだけ**
+        // 境界に達したときの pending / override クリアは **`is_demux_exhausted()` のときだけ**
         // 行う (Codex P1 反映)。
         //
         // 末尾付近を target にした seek は decoder が target 以降のフレームを返せず、
@@ -9201,15 +10763,17 @@ impl VideoPlayer {
         // ここで無条件にクリアすると、その正当な in-flight seek の override と、
         // まだ発行されていない pending seek を巻き込んで潰してしまう。
         //
-        // `is_eof_reached()` は demux がファイル全体を読み切ったときだけ true になり、
+        // `is_demux_exhausted()` は demux がファイル全体を読み切ったときだけ true になり、
         // 「override がもう post-seek フレームを得られない = 固着」状態と一致する。
         // false のときは進行中 / pending の seek は正当なので touch しない —
         // 通常の override 解除経路、または tick 側の保険 (`seek_eof_stuck_since`,
         // 1200ms) に回収を任せる。
         // `current_seek_serial()` を completed_serial に渡すことで、直近のシーク
         // 世代の override だけを CAS で外す (新しいシークが割り込んでいたら何もしない)。
-        if self.clock.is_eof_reached() {
+        if self.clock.is_demux_exhausted() {
             self.clear_pending_user_seek();
+            self.clock
+                .mark_seek_interrupted(self.clock.current_seek_serial());
             self.clock
                 .clear_seek_target_override(self.clock.current_seek_serial());
         }
@@ -9218,6 +10782,9 @@ impl VideoPlayer {
 
     /// フレーム送り用の精密シーク。到着後は必ず一時停止状態に保つ。
     pub fn seek_paused(&self, target_secs: f64) {
+        self.engine.lock().unwrap().discard_playback_start();
+        #[cfg(windows)]
+        self.cancel_dsp_acquisition();
         self.clear_pending_user_seek();
         self.clear_frame_step_target();
         self.seek_paused_internal(target_secs);
@@ -9227,6 +10794,7 @@ impl VideoPlayer {
         self.clear_pending_user_seek();
         let clamped = self.clamp_seek_target(target_secs);
         self.clock.request_seek(clamped);
+        self.record_issued_seek(clamped);
         self.clear_audio_output_buffer();
         // 2026-05 root fix: `clock.set_playing(false)` の直書きは撤去。続く
         // `apply_command(Pause)` が transition_to_seeking → transition_to_paused
@@ -9234,7 +10802,7 @@ impl VideoPlayer {
         // FirstFrameReady で Paused 入場) 経由で AvClock を freeze する。
         let mut g = self.engine.lock().unwrap();
         g.handle_seek_request(clamped);
-        g.apply_command(engine::actor::TransportCommand::Pause);
+        g.apply_internal_continuation(false, InternalContinuation::Seek);
     }
 
     fn seek_paused_frame_step_internal(
@@ -9258,7 +10826,7 @@ impl VideoPlayer {
         self.clock.set_paused_position(base);
         let mut g = self.engine.lock().unwrap();
         g.handle_seek_request(base);
-        g.apply_command(engine::actor::TransportCommand::Pause);
+        g.apply_internal_continuation(false, InternalContinuation::Seek);
     }
 
     /// 前後 1 フレームへ移動し、一時停止する。
@@ -9266,6 +10834,7 @@ impl VideoPlayer {
         if direction == 0 {
             return;
         }
+        self.engine.lock().unwrap().discard_playback_start();
         self.clear_pending_user_seek();
         let pending_step_base = self.frame_step_base();
         let displayed_seq = self.displayed_frame_seq.load(Ordering::Acquire);
@@ -9386,6 +10955,12 @@ impl VideoPlayer {
         self.audio_diagnostics.load_av_drift_ms()
     }
 
+    /// Identity of the successfully started CPAL stream owned by this player. `None` keeps
+    /// video-only/headless/open-failure players out of audio correlation logs.
+    pub(crate) fn audio_stream_id(&self) -> Option<u64> {
+        self.audio.as_ref().and_then(audio::AudioOutput::stream_id)
+    }
+
     fn frame_step_base(&self) -> Option<f64> {
         let pts = f64::from_bits(self.frame_step_base_bits.load(Ordering::Acquire));
         if pts.is_finite() {
@@ -9436,7 +11011,9 @@ impl VideoPlayer {
 
     /// 音量ノーマライズの線形ゲイン (1.0 = 素通し)。
     pub fn normalize_gain(&self) -> f64 {
-        self.clock.normalize_gain()
+        self.applied_audio_stream_index()
+            .and_then(|stream| self.clock.normalize_gain_for_stream(stream))
+            .unwrap_or(1.0)
     }
 
     /// 出力セーフティリミッターが天井 (0 dBFS) を叩いた累積回数。
@@ -9461,12 +11038,69 @@ impl VideoPlayer {
     /// **A/V offset = −5000ms 級の永続ズレ**が残った (= 1 回の Norm toggle で 5 秒、
     /// 累積で 10 秒 / 15 秒 / 20 秒 と永続的にズレた)。
     ///
-    /// 本 method 単独では `processed` / `raw_pending` のいずれも触らない atomic store
+    /// 本 method 単独では `processed` / `raw_pending` のいずれも触らない表の更新
     /// なので、上記問題は起きない。詳細は `docs/video-architecture.md` の
     /// 「Norm clear で audio が 5+ 秒先行する」節と
     /// `src/app/native_video.rs::apply_normalize_gain_with_perf` を参照。
     pub fn set_normalize_gain(&self, gain: f64) {
-        self.clock.set_normalize_gain(gain);
+        if let Some(stream) = self.applied_audio_stream_index() {
+            self.clock.normalize_gain_table().set_gain(stream, gain);
+        }
+    }
+
+    pub(crate) fn applied_audio_stream_index(&self) -> Option<usize> {
+        self.audio_track_selection()
+            .map(|selection| selection.applied.stream_index)
+            .or_else(|| {
+                self.info
+                    .as_ref()
+                    .and_then(|info| info.opened_audio_stream_index)
+            })
+    }
+
+    pub(crate) fn begin_normalize_lookup(
+        &self,
+        stream_index: usize,
+        target_lufs_milli: i32,
+    ) -> Option<normalize_gain::NormalizeLookupRequest> {
+        self.clock
+            .normalize_gain_table()
+            .begin_lookup(stream_index, target_lufs_milli)
+    }
+
+    pub(crate) fn normalize_track_gain(
+        &self,
+        stream_index: usize,
+    ) -> normalize_gain::NormalizeTrackGain {
+        self.clock.normalize_gain_table().get(stream_index)
+    }
+
+    pub(crate) fn normalize_gain_for_stream(&self, stream_index: usize) -> Option<f64> {
+        self.clock.normalize_gain_for_stream(stream_index)
+    }
+
+    pub(crate) fn resolve_normalize_lookup(
+        &self,
+        request: normalize_gain::NormalizeLookupRequest,
+        gain: f64,
+    ) -> bool {
+        self.clock.normalize_gain_table().resolve(request, gain)
+    }
+
+    pub(crate) fn set_normalize_gain_for_stream(&self, stream_index: usize, gain: f64) {
+        self.clock
+            .normalize_gain_table()
+            .set_gain(stream_index, gain);
+    }
+
+    pub(crate) fn reset_normalize_gains(&self, enabled: bool) {
+        self.clock.normalize_gain_table().reset(enabled);
+    }
+
+    pub(crate) fn rearm_normalize_lookups_after_context_transfer(&self) -> Vec<usize> {
+        self.clock
+            .normalize_gain_table()
+            .rearm_pending_after_context_transfer()
     }
 
     pub fn audio_preroll_suspended(&self) -> bool {
@@ -9552,6 +11186,20 @@ impl VideoPlayer {
             .unwrap_or(false)
     }
 
+    #[cfg(all(test, windows))]
+    pub(crate) fn set_native_presenter_hidden_for_test(&self, hidden: bool) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.presenter_visibility.publish_hidden(hidden);
+        }
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn native_presenter_visibility_requested_for_test(&self) -> Option<bool> {
+        self.native_output
+            .as_ref()
+            .map(|output| output.visibility_gate.base_visible.load(Ordering::Acquire))
+    }
+
     /// HUD overlay HWND (= bars / interactive UI 用の独立 top-level)。
     /// CP4 で presenter thread が `HudOverlayWindow::create` 成功時に store する。
     /// store されていなければ 0。
@@ -9617,6 +11265,15 @@ impl VideoPlayer {
         self.native_output
             .as_ref()
             .map(NativeVideoOutput::source_epoch)
+    }
+
+    #[cfg(feature = "test-script")]
+    pub(crate) fn native_ui_smoke_output_id(
+        &self,
+    ) -> Option<native_ui_smoke::NativeUiSmokeOutputId> {
+        self.native_output
+            .as_ref()
+            .map(NativeVideoOutput::ui_smoke_output_id)
     }
 
     /// App が信頼する現在の presenter placement 世代 (native_output があるときのみ)。
@@ -9735,9 +11392,17 @@ impl VideoPlayer {
         owner_hwnd: u64,
         rect: windows::Win32::Foundation::RECT,
         activate_on_show: bool,
+        chrome_host: Option<NativeDetachedChromeHost>,
     ) {
         if let Some(output) = self.native_output.as_ref() {
-            output.prepare_placement(request_id, placement, owner_hwnd, rect, activate_on_show);
+            output.prepare_placement(
+                request_id,
+                placement,
+                owner_hwnd,
+                rect,
+                activate_on_show,
+                chrome_host,
+            );
         }
     }
 
@@ -9851,6 +11516,20 @@ impl VideoPlayer {
     }
 
     #[cfg(windows)]
+    pub fn set_native_video_canvas_color(&self, color: [u8; 3]) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_video_canvas_color(color);
+        }
+    }
+
+    #[cfg(all(windows, test))]
+    pub(crate) fn native_video_canvas_color_for_test(&self) -> Option<[u8; 3]> {
+        self.native_output
+            .as_ref()
+            .map(NativeVideoOutput::video_canvas_color_for_test)
+    }
+
+    #[cfg(windows)]
     pub fn start_native_anime4k_measurement(&self) {
         if let Some(output) = self.native_output.as_ref() {
             output.start_anime4k_measurement();
@@ -9930,21 +11609,9 @@ impl VideoPlayer {
     }
 
     #[cfg(windows)]
-    pub(crate) fn set_native_side_panel_state(
-        &self,
-        mode: crate::settings::FsSidePanelMode,
-        info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
-        info_panel_locked: bool,
-    ) {
+    pub(crate) fn set_native_chrome_snapshot(&self, snapshot: NativeChromeSnapshot) {
         if let Some(output) = self.native_output.as_ref() {
-            output.set_side_panel_state(mode, info_panel_open, info_panel_locked);
-        }
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn set_native_bar_lock_state(&self, state: crate::video::NativeBarLockState) {
-        if let Some(output) = self.native_output.as_ref() {
-            output.set_bar_lock_state(state);
+            output.set_chrome_snapshot(snapshot);
         }
     }
 
@@ -10115,7 +11782,7 @@ impl VideoPlayer {
     }
 
     #[cfg(windows)]
-    pub fn drain_native_presenter_events(&self) -> Vec<(u64, NativeVideoOutputEvent)> {
+    pub(crate) fn drain_native_presenter_events(&self) -> Vec<NativeVideoOutputEventEnvelope> {
         self.native_output
             .as_ref()
             .map(NativeVideoOutput::drain_events)
@@ -10157,12 +11824,39 @@ impl VideoPlayer {
         // dispatch する。EngineActor は state machine のみ更新し、AvClock の挙動には
         // まだ影響しない (= Phase 3d までは AvClock が引き続き source of truth)。
         self.drain_engine_events();
+        // A terminal decoder event may have stopped audio output before the
+        // first InfoReceived is consumed. Do not reinterpret that stopped
+        // output as an open-time audio initialization failure below.
+        if self.error.is_some() {
+            return None;
+        }
+        #[cfg(windows)]
+        self.start_dsp_acquisition_after_metadata();
+        #[cfg(windows)]
+        self.poll_dsp_acquisition();
+        #[cfg(windows)]
+        let newly_applicable = self
+            .audio
+            .as_ref()
+            .is_some_and(|audio| audio.newly_applicable_dsp());
+        #[cfg(windows)]
+        if self.intent_playing() && newly_applicable {
+            self.begin_dsp_acquisition(LocalDspPosition::CurrentAfterMetadata);
+        }
 
         // info を取り込む
         if self.info.is_none() {
             if let Ok(result) = self.decode.info_rx.try_recv() {
                 match result {
-                    Ok(info) => {
+                    Ok(mut info) => {
+                        *self.audio_track_open_notice.lock().unwrap() = info.open_notice.take();
+                        if self.audio.is_some()
+                            && info.opened_audio_stream_index.is_some()
+                            && !self.clock.audio_lane_lost()
+                        {
+                            self.audio_track_selection =
+                                self.decode.audio_track_selection_rx.try_recv().ok();
+                        }
                         #[cfg(windows)]
                         self.duration_secs_bits
                             .store(info.duration_secs.to_bits(), Ordering::Release);
@@ -10222,11 +11916,30 @@ impl VideoPlayer {
                         // resume 指定があれば最初の info 到着時に 1 度だけ実行。
                         // 末尾近く (残り 5 秒以下) なら 0 から再生 (= 完走済みと見なす)。
                         // 保存側 (`save_video_resume_position`) と同じ閾値で gate する。
-                        if let Some(resume) = sanitize_resume_for_duration(
-                            self.pending_resume_secs.take(),
-                            info.duration_secs,
-                        ) {
+                        let requested_before_metadata = {
+                            #[cfg(windows)]
+                            {
+                                matches!(
+                                    &*self.dsp_handoff.lock().unwrap(),
+                                    LocalDspAcquisition::AwaitingMetadata(LocalDspPosition::Exact(
+                                        _
+                                    ))
+                                )
+                            }
+                            #[cfg(not(windows))]
+                            {
+                                false
+                            }
+                        };
+                        let pending_resume = self.pending_resume_secs.take();
+                        let resume = if requested_before_metadata {
+                            None
+                        } else {
+                            sanitize_resume_for_duration(pending_resume, info.duration_secs)
+                        };
+                        if let Some(resume) = resume {
                             self.clock.request_seek(resume);
+                            self.record_issued_seek(resume);
                             // 共有 seek_serial は clock.request_seek で 1 回 bump。
                             // 続く engine.handle_seek_request は adaptive ロジックで
                             // 「外部 bump 検知」となり、自身は bump せず state 更新のみ。
@@ -10244,6 +11957,13 @@ impl VideoPlayer {
                             self.engine.lock().unwrap().handle_seek_request(resume);
                         }
                         self.info = Some(info);
+                        #[cfg(windows)]
+                        if matches!(
+                            &*self.dsp_handoff.lock().unwrap(),
+                            LocalDspAcquisition::AwaitingMetadata(_)
+                        ) {
+                            ctx.request_repaint();
+                        }
                     }
                     Err(e) => {
                         // T13 (Claude R-VENG-3): info_rx Err 経路でも他経路と同じく
@@ -10321,9 +12041,9 @@ impl VideoPlayer {
         //
         // `seek_relative` の境界判定でも回収するが、それは「次にもう一度 ←→ を
         // 押す」操作が前提。ここでは tick 側の最終保険として、`is_seeking()` のまま
-        // `is_eof_reached()` (= demux がファイル全体を読み切った) が継続して true で
+        // `is_demux_exhausted()` (= demux がファイル全体を読み切った) が継続して true で
         // ある状態が `SEEK_STUCK_EOF_TIMEOUT` 続いたら override を強制クリアする。
-        // - `is_eof_reached()` は `request_seek` で一旦クリアされ、demux が末尾まで
+        // - `is_demux_exhausted()` は `request_seek` で一旦クリアされ、demux が末尾まで
         //   読み切ったときだけ true になるので、進行中の通常 seek を誤検出しない。
         // - 通常の near-end seek は post-seek フレームが presenter / tick に届いた
         //   時点で override が clear され `is_seeking()` が false になるため、この
@@ -10331,7 +12051,7 @@ impl VideoPlayer {
         // override をクリアするだけに留め、playing / 位置の更新は後段の既存 EOF
         // 処理 (native: ループ block / 非 native: line 末尾の EOF block) に任せる。
         const SEEK_STUCK_EOF_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1200);
-        if self.clock.is_seeking() && self.clock.is_eof_reached() {
+        if self.clock.is_seeking() && self.clock.is_demux_exhausted() {
             let stuck_since = *self
                 .seek_eof_stuck_since
                 .get_or_insert_with(std::time::Instant::now);
@@ -10340,6 +12060,7 @@ impl VideoPlayer {
                 self.seek_eof_stuck_since = None;
                 self.clear_pending_user_seek();
                 let serial = self.clock.current_seek_serial();
+                self.clock.mark_seek_interrupted(serial);
                 self.clock.clear_seek_target_override(serial);
                 crate::logger::log(format!(
                     "[video] stuck seek override force-cleared after {}ms \
@@ -10370,7 +12091,7 @@ impl VideoPlayer {
 
         #[cfg(windows)]
         if self.native_output.is_some() {
-            // EOF 処理: native presenter 経路でも `clock.is_eof_reached()` を見て、
+            // EOF 処理: native presenter 経路でも `clock.is_demux_exhausted()` を見て、
             // ループ ON ならループ seek、ループ OFF なら duration 位置で停止する。
             // native 経路はこの直後の early return で抜けるため非 native 経路の EOF
             // block (`set_position_at_eof` + `set_playing(false)`) には到達しない。
@@ -10378,7 +12099,7 @@ impl VideoPlayer {
             // duration を超えて進み続ける (= ユーザー報告 2026-05「動画末尾を超えて
             // 再生が進む」)。
             // ★末尾の音声 drain と最終フレーム表示を待つ★ (Codex P1 第10ラウンド +
-            // 第11ラウンド — demux EOF 時点で `is_eof_reached` が立つが、その直後に
+            // 第11ラウンド — demux EOF 時点で `is_demux_exhausted` が立つが、その直後に
             // audio worker が残フレームを drain しており、また pump 内には raw_pending /
             // processed / tx_queued の各 buffer が残っている。ここで即 seek すると
             // 末尾 ~10-100ms の音声 / 最終フレームが失われる)。
@@ -10397,19 +12118,24 @@ impl VideoPlayer {
             //   (publish processed) と段階を経るので、その handoff window 中に 3 counter が
             //   全て 0 を読む race がある。重めの VST3 plugin で 1 frame の処理が ~10-30ms
             //   かかる場合があるため、48ms 連続で quiet を観測してから seek する。
-            // 完全な解決には pump 側から「EOF drain 完了 / in-flight 数」を publish する形が
-            // 良いが、連続観測ラッチで実用上は十分。VST/stretch が 48ms 超ブロックする状況は
-            // UI 不応答相当 (= 通常運用ではほぼ起きない) なので、その race で末尾 1 frame が
-            // 切れる確率は許容範囲とする。
+            // AudioEos の Complete は decoder drain → raw 処理 → DSP 末尾の queue commit
+            // までを保証する。48ms quiet はその後の出力/presenter drain にだけ使い、
+            // IPC 中に counter が全て 0 でも EOF/loop を先行させない。
             const EOF_DRAIN_AUDIO_QUIET_TOL: f64 = 0.020;
-            let audio_drained = self.clock.audio_processed_secs() < EOF_DRAIN_AUDIO_QUIET_TOL
+            let audio_active_for_eof =
+                self.audio.is_some() && self.info.as_ref().is_some_and(|i| i.has_audio);
+            let audio_drained = (!audio_active_for_eof
+                || self.clock.audio_lane_lost()
+                || self.clock.audio_worker_exited()
+                || self.clock.audio_tail_complete())
+                && self.clock.audio_processed_secs() < EOF_DRAIN_AUDIO_QUIET_TOL
                 && self.clock.audio_raw_pending_secs() < EOF_DRAIN_AUDIO_QUIET_TOL
                 && self.clock.audio_tx_queued_secs() < EOF_DRAIN_AUDIO_QUIET_TOL;
             let channels_drained = self.audio_rx_len() == 0 && self.video_rx_len() == 0;
             // `loop_enabled` は **発火条件には含めない** (ループ ON/OFF どちらでも EOF
             // drain 完了を待つ)。発火後のアクションだけ loop_enabled で分岐する。
             let loop_enabled = self.loop_enabled.load(std::sync::atomic::Ordering::Acquire);
-            let quiet_now = self.clock.is_eof_reached()
+            let quiet_now = self.clock.is_demux_exhausted()
                 && !self.clock.is_seeking()
                 && self.is_playing()
                 && channels_drained
@@ -10432,12 +12158,13 @@ impl VideoPlayer {
                     let target = self.clamp_loop_seek_target(raw);
                     self.clear_pending_user_seek();
                     self.clock.request_seek(target);
+                    self.record_issued_seek(target);
                     self.clear_audio_output_buffer();
                     // 2026-05 root fix: `clock.set_playing(true)` 直書きは撤去
                     // (engine 経由で更新)。
                     let mut g = self.engine.lock().unwrap();
                     g.handle_seek_request(target);
-                    g.apply_command(engine::actor::TransportCommand::Play);
+                    g.apply_internal_continuation(true, InternalContinuation::Loop);
                 } else {
                     // ループ OFF: 末端到達 → engine に `EofReached` を **同期的に** 渡す。
                     // engine の `transition_to_eof(duration)` が走り:
@@ -10477,7 +12204,10 @@ impl VideoPlayer {
                     &mut next_semantic_wake,
                     Some(EOF_DRAIN_QUIET_DURATION.saturating_sub(elapsed)),
                 );
-            } else if self.clock.is_eof_reached() && !self.clock.is_seeking() && self.is_playing() {
+            } else if self.clock.is_demux_exhausted()
+                && !self.clock.is_seeking()
+                && self.is_playing()
+            {
                 merge_next_wake(
                     &mut next_semantic_wake,
                     eof_drain_observed_deadline(
@@ -10555,7 +12285,7 @@ impl VideoPlayer {
 
         // Step 1: video_rx を future_frames に drain (上限まで)
         // EOF 後は decoder が wait ループに入るため channel は disconnect しない。
-        // EOF 検出は clock.is_eof_reached() で行う (= decoder thread alive のまま
+        // EOF 検出は clock.is_demux_exhausted() で行う (= decoder thread alive のまま
         // post-EOF seek が可能)。
         while self.future_frames.len() < MAX_RENDER_QUEUE {
             match self.decode.video_rx.try_recv() {
@@ -10603,7 +12333,7 @@ impl VideoPlayer {
             break;
         }
 
-        // EOF 処理: clock.is_eof_reached() (= decoder が EOF wait に入った)
+        // EOF 処理: clock.is_demux_exhausted() (= decoder が EOF wait に入った)
         // + queue 空 + 今 tick 表示なし + 進行中の seek なし → 本当に最後と判定。
         // 「seek 進行中」は seek_target_override が立っている時。
         //
@@ -10619,12 +12349,15 @@ impl VideoPlayer {
         let audio_active_for_eof =
             self.audio.is_some() && self.info.as_ref().map(|i| i.has_audio).unwrap_or(false);
         let audio_drained = !audio_active_for_eof
-            || (self.clock.audio_processed_secs() < EOF_DRAIN_AUDIO_QUIET_TOL
+            || ((self.clock.audio_lane_lost()
+                || self.clock.audio_worker_exited()
+                || self.clock.audio_tail_complete())
+                && self.clock.audio_processed_secs() < EOF_DRAIN_AUDIO_QUIET_TOL
                 && self.clock.audio_raw_pending_secs() < EOF_DRAIN_AUDIO_QUIET_TOL
                 && self.clock.audio_tx_queued_secs() < EOF_DRAIN_AUDIO_QUIET_TOL
                 && self.audio_rx_len() == 0);
         let seek_in_flight = self.clock.is_seeking();
-        let eof_ready_now = self.clock.is_eof_reached()
+        let eof_ready_now = self.clock.is_demux_exhausted()
             && self.future_frames.is_empty()
             && latest_renderable.is_none()
             && !seek_in_flight
@@ -10648,6 +12381,7 @@ impl VideoPlayer {
                 let target = self.clamp_loop_seek_target(raw);
                 self.clear_pending_user_seek();
                 self.clock.request_seek(target);
+                self.record_issued_seek(target);
                 self.clear_audio_output_buffer();
                 // 2026-05 root fix: `clock.set_playing(true)` 直書きは撤去
                 // (engine 経由で更新)。
@@ -10657,7 +12391,7 @@ impl VideoPlayer {
                 // (詳細は toggle_play を参照)。
                 let mut g = self.engine.lock().unwrap();
                 g.handle_seek_request(target);
-                g.apply_command(engine::actor::TransportCommand::Play);
+                g.apply_internal_continuation(true, InternalContinuation::Loop);
             } else {
                 // 末端到達 → engine に EofReached を同期的に流し、state=Eof +
                 // AvClock freeze(duration) + playing=false を atomic に確定する。
@@ -10999,7 +12733,7 @@ impl VideoPlayer {
     }
 
     /// EngineActor の published state が terminal EOF なら true。
-    /// AvClock の eof_reached は互換複製なので、resume ownership 判定ではこちらを使う。
+    /// demux の先読み完了とは異なり、出力の drain 後に再生が終了した状態。
     pub fn is_at_eof(&self) -> bool {
         self.engine_state_code() == engine::actor::state_code::EOF
     }
@@ -11090,6 +12824,8 @@ impl VideoPlayer {
     fn shutdown_workers_for_error(&mut self) {
         self.cancel
             .store(true, std::sync::atomic::Ordering::Release);
+        #[cfg(windows)]
+        self.cancel_dsp_acquisition();
         self.stop_video_output();
         self.pause_audio_output();
         self.clear_audio_output_buffer();
@@ -11113,6 +12849,7 @@ impl VideoPlayer {
     /// 現象が観測される。先に shutdown() を呼ぶことで、entry を
     /// fs_cache から消す瞬間に音声が止まる。
     pub fn shutdown(&mut self) {
+        self.engine.lock().unwrap().discard_playback_start();
         self.cancel
             .store(true, std::sync::atomic::Ordering::Release);
         self.stop_video_output();
@@ -11133,6 +12870,7 @@ impl VideoPlayer {
 
 impl Drop for VideoPlayer {
     fn drop(&mut self) {
+        self.engine.lock().unwrap().discard_playback_start();
         // shutdown() が事前に呼ばれていなければここで stop。
         self.cancel
             .store(true, std::sync::atomic::Ordering::Release);
@@ -11155,10 +12893,12 @@ fn dummy_decode_handles() -> DecodeHandles {
     let (_, video_rx) = crossbeam_channel::bounded(0);
     let (_, audio_rx) = crossbeam_channel::bounded(0);
     let (_, info_rx) = crossbeam_channel::bounded(0);
+    let (_, audio_track_selection_rx) = crossbeam_channel::bounded(0);
     DecodeHandles {
         video_rx,
         audio_rx,
         info_rx,
+        audio_track_selection_rx,
         prep_progress: crate::video::avio_progress::PreparingProgress::new(),
         video_tap: crate::video::stream::video_tap::VideoTapController::disconnected(),
     }
@@ -11176,6 +12916,1725 @@ fn dummy_video_rx() -> crossbeam_channel::Receiver<VideoFrame> {
 
 #[cfg(test)]
 mod tests {
+    fn playback_start_test_player() -> super::VideoPlayer {
+        use crate::effetune::gui_gate::{AutoSuppression, GuiGate};
+        let player = super::VideoPlayer::disconnected_for_test("logical-start.mp4".into(), 0.0);
+        let gate = GuiGate::create_for_test();
+        gate.set_auto_factor(AutoSuppression::SettingOff, false);
+        gate.set_auto_factor(AutoSuppression::RootHidden, false);
+        player.set_auto_presentation_reader(gate.auto_reader());
+        player
+    }
+
+    #[test]
+    fn playback_start_player_user_pause_invalidates_drained_fact_and_next_play_is_new() {
+        use super::PlaybackStartOrigin;
+        let player = playback_start_test_player();
+        player.confirm_playback_start_for_test(PlaybackStartOrigin::NewSource);
+        let first = player.take_playback_success().unwrap();
+        player.set_playing_with_origin(false, PlaybackStartOrigin::UserPlay);
+        assert!(!player.playback_success_is_current(first.id));
+        player.set_playing_with_origin(true, PlaybackStartOrigin::UserPlay);
+        let next = player.take_playback_success().unwrap();
+        assert_eq!(next.origin, PlaybackStartOrigin::UserPlay);
+        assert_ne!(next.id, first.id);
+    }
+
+    #[test]
+    fn playback_start_player_toggle_is_user_request_internal_resume_is_not() {
+        use super::{InternalContinuation, PlaybackStartOrigin};
+        let player = playback_start_test_player();
+        player.confirm_playback_start_for_test(PlaybackStartOrigin::NewSource);
+        let first = player.take_playback_success().unwrap();
+        player.set_playing_internal(false, InternalContinuation::Normalize);
+        player.set_playing_internal(true, InternalContinuation::Normalize);
+        assert!(player.take_playback_success().is_none());
+        assert!(player.playback_success_is_current(first.id));
+        player.toggle_play();
+        assert!(!player.playback_success_is_current(first.id));
+        player.toggle_play();
+        let next = player.take_playback_success().unwrap();
+        assert_eq!(next.origin, PlaybackStartOrigin::UserPlay);
+        assert_ne!(next.id, first.id);
+    }
+
+    #[test]
+    fn playback_start_player_viewer_move_before_and_after_success_follows_binding() {
+        use super::PlaybackStartOrigin;
+        let player = playback_start_test_player();
+        player.bind_playback_viewer_context(1);
+        player.bind_playback_viewer_context(2);
+        player.confirm_playback_start_for_test(PlaybackStartOrigin::NewSource);
+        assert_eq!(
+            player.take_playback_success().unwrap().viewer_context,
+            Some(2)
+        );
+        player.set_playing_with_origin(false, PlaybackStartOrigin::UserPlay);
+        player.set_playing_with_origin(true, PlaybackStartOrigin::UserPlay);
+        player.bind_playback_viewer_context(3);
+        assert!(player.take_playback_success().is_none());
+        player.set_playing_internal(false, super::InternalContinuation::Normalize);
+        player.set_playing_internal(true, super::InternalContinuation::Normalize);
+        assert!(player.take_playback_success().is_none());
+    }
+
+    #[test]
+    fn playback_start_player_shutdown_discards_unconsumed_success_without_touching_sibling() {
+        use super::PlaybackStartOrigin;
+        let mut first = playback_start_test_player();
+        let second = playback_start_test_player();
+        first.confirm_playback_start_for_test(PlaybackStartOrigin::NewSource);
+        second.confirm_playback_start_for_test(PlaybackStartOrigin::ContinuousAdvance);
+        first.shutdown();
+        assert!(first.take_playback_success().is_none());
+        assert_eq!(
+            second.take_playback_success().unwrap().origin,
+            PlaybackStartOrigin::ContinuousAdvance
+        );
+    }
+
+    #[cfg(windows)]
+    fn real_audio_tail_player(name: &str, sample_rate: u32) -> super::VideoPlayer {
+        use super::engine::state::DecoderEvent;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/audio-tail")
+            .join(name);
+        let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        player.cancel = Arc::new(AtomicBool::new(false));
+        player.engine.lock().unwrap().begin_loading();
+        player.decode = super::decoder::spawn(
+            path,
+            Arc::clone(&player.clock),
+            Arc::clone(&player.cancel),
+            sample_rate,
+            false,
+            crate::settings::VideoDeinterlaceMode::Off,
+            None,
+            Arc::clone(&player.engine_state_atomic),
+            player.engine_event_tx.clone(),
+            Arc::clone(&player.decoder_dropped_full_count),
+            Arc::clone(&player.dynamic),
+        );
+        let info = player
+            .decode
+            .info_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("fixture metadata")
+            .expect("fixture opens");
+        assert!(info.has_audio);
+        assert!((info.duration_secs - 2.0).abs() < 0.001);
+        player.audio_track_selection = Some(
+            player
+                .decode
+                .audio_track_selection_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("opened fixture audio track"),
+        );
+        player
+            .engine
+            .lock()
+            .unwrap()
+            .handle_decoder_event(DecoderEvent::InfoReceived {
+                epoch: 0,
+                duration_secs: info.duration_secs,
+                has_audio: info.has_audio,
+                has_video: info.has_video,
+            });
+        player.info_event_emitted = true;
+        if !info.has_video {
+            player.native_output = None;
+        }
+        player.info = Some(info);
+        // The real pump is the sole consumer of decoder audio. The callback below consumes
+        // only its processed output; it never injects audio or completes a seek/EOS itself.
+        player.audio = Some(super::audio::AudioOutput::pumping_without_device_for_test(
+            sample_rate,
+            player.decode.audio_rx.clone(),
+            Arc::clone(&player.clock),
+            player.engine_event_tx.clone(),
+            Arc::clone(&player.engine_state_atomic),
+        ));
+        player.set_loop_enabled(true); // Full loop's production default target is 0.0.
+        player.set_playing(true);
+        player
+    }
+
+    #[cfg(windows)]
+    fn assert_one_fixture_burst(samples: &[f32], rate: u32, name: &str, serial: u64) {
+        let frames = samples.len() / 2;
+        let expected_frames = rate as usize * 2;
+        assert!(
+            frames.abs_diff(expected_frames) <= 1,
+            "{name} rate={rate} serial={serial}: consumed {frames}, expected {expected_frames}"
+        );
+        let signal_frames: Vec<_> = samples
+            .chunks_exact(2)
+            .enumerate()
+            .filter_map(|(frame, pair)| pair.iter().any(|v| v.abs() > 0.01).then_some(frame))
+            .collect();
+        assert!(
+            !signal_frames.is_empty(),
+            "{name} rate={rate} serial={serial}: missing burst"
+        );
+        // Zero crossings inside the 1kHz tone are not separate bursts. A silent gap of 2ms
+        // is, including an old limiter tail replayed at the beginning of the next epoch.
+        let bursts = 1 + signal_frames
+            .windows(2)
+            .filter(|pair| pair[1] - pair[0] > rate as usize / 500)
+            .count();
+        assert_eq!(
+            bursts, 1,
+            "{name} rate={rate} serial={serial}: duplicated burst"
+        );
+        let (start, end) = if name.starts_with("mid4ms") {
+            (1.0, 1.004)
+        } else if name.starts_with("tail4ms") {
+            (1.996, 2.0)
+        } else {
+            (1.990, 2.0)
+        };
+        let first = signal_frames[0] as f64 / rate as f64;
+        let last = (*signal_frames.last().unwrap() + 1) as f64 / rate as f64;
+        // Allow the resampler's finite filter support and integer sample rounding at 44.1kHz.
+        assert!(
+            (first - start).abs() < 0.001,
+            "{name} rate={rate} serial={serial}: burst starts at {first}, expected {start}"
+        );
+        assert!(
+            (last - end).abs() < 0.001,
+            "{name} rate={rate} serial={serial}: burst ends at {last}, expected {end}"
+        );
+        assert!(
+            samples[..rate as usize / 4 * 2]
+                .iter()
+                .all(|v| v.abs() < 1e-4),
+            "{name} rate={rate} serial={serial}: new epoch has stale tail in its silent head"
+        );
+    }
+
+    #[cfg(windows)]
+    fn assert_one_device_burst(samples: &[f32], rate: u32, name: &str, serial: u64) {
+        // Preserve every callback sample, including its underrun silence. Joining only
+        // consumed PCM could hide a tail split into two separately audible clicks.
+        let signal_frames: Vec<_> = samples
+            .chunks_exact(2)
+            .enumerate()
+            .filter_map(|(frame, pair)| pair.iter().any(|v| v.abs() > 0.01).then_some(frame))
+            .collect();
+        assert!(
+            !signal_frames.is_empty(),
+            "{name} rate={rate} serial={serial}: device callback lost the burst"
+        );
+        let bursts = 1 + signal_frames
+            .windows(2)
+            .filter(|pair| pair[1] - pair[0] > rate as usize / 500)
+            .count();
+        assert_eq!(
+            bursts, 1,
+            "{name} rate={rate} serial={serial}: callback output split/duplicated the burst"
+        );
+        let span = (*signal_frames.last().unwrap() + 1 - signal_frames[0]) as f64 / rate as f64;
+        let expected_span = if name.starts_with("tail10ms") {
+            0.010
+        } else {
+            0.004
+        };
+        assert!(
+            (span - expected_span).abs() < 0.001,
+            "{name} rate={rate} serial={serial}: callback burst spans {span}s, expected {expected_span}s with at most 1ms resampler support"
+        );
+    }
+
+    #[cfg(windows)]
+    fn capture_real_eof_full_loops(name: &str, rate: u32) {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+
+        let mut player = real_audio_tail_player(name, rate);
+        let ctx = egui::Context::default();
+        let mut presenter_frames = std::collections::VecDeque::new();
+        let mut presenter_last_seen_serial = player.current_seek_serial();
+        let mut presenter_waiting_for_first = true;
+        let callback_frames = rate as usize / 200;
+        let callback_period = Duration::from_secs_f64(callback_frames as f64 / rate as f64);
+        let mut callback_samples = vec![0.0; callback_frames * 2];
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut next_callback = Instant::now();
+        let mut serial = 0;
+        let mut samples = Vec::new();
+        let mut device_samples = Vec::new();
+        let mut completed_epochs = Vec::new();
+        let mut last_callback_pts = 0.0;
+        while serial < 3 && Instant::now() < deadline {
+            if player.native_output.is_some() {
+                // Substitute only the display/device side of native presentation. Real decoded
+                // frames retain their serial, pacing and FirstFrameReady engine event, without
+                // creating an HWND, D3D device, CPAL device, or interacting with the desktop.
+                let clock_serial = player.current_seek_serial();
+                if clock_serial != presenter_last_seen_serial {
+                    super::native_drain_unpresented_queue(&mut presenter_frames);
+                    presenter_last_seen_serial = clock_serial;
+                    presenter_waiting_for_first = true;
+                }
+                while presenter_frames.len() < super::MAX_NATIVE_SOURCE_QUEUE {
+                    let Ok(frame) = player.decode.video_rx.try_recv() else {
+                        break;
+                    };
+                    if frame.seek_serial < clock_serial {
+                        super::native_reset_unpresented_frame(frame);
+                        continue;
+                    }
+                    presenter_frames.push_back(frame);
+                }
+                let candidates: Vec<_> = presenter_frames
+                    .iter()
+                    .map(|frame| super::frame_selection::FrameCandidate {
+                        pts_secs: frame.pts_secs,
+                        seek_serial: frame.seek_serial,
+                    })
+                    .collect();
+                let selection = super::frame_selection::select_frame_for_present(
+                    &candidates,
+                    player.clock.now_secs(),
+                    clock_serial,
+                    presenter_last_seen_serial,
+                    presenter_waiting_for_first,
+                    player.clock.is_seeking(),
+                    super::clock::DISPLAY_LEAD_TOLERANCE_SECS,
+                );
+                for action in selection.actions {
+                    let frame = presenter_frames.pop_front().unwrap();
+                    match action {
+                        super::frame_selection::PopAction::DiscardStale
+                        | super::frame_selection::PopAction::LateDrop => {
+                            super::native_reset_unpresented_frame(frame);
+                        }
+                        super::frame_selection::PopAction::Display => {
+                            if presenter_waiting_for_first {
+                                assert!(super::try_send_native_first_frame_ready(
+                                    &player.engine_event_tx,
+                                    frame.seek_serial,
+                                    frame.pts_secs,
+                                ));
+                                presenter_waiting_for_first = false;
+                            }
+                            player
+                                .last_displayed_pts_bits
+                                .store(frame.pts_secs.to_bits(), Ordering::Release);
+                            player.displayed_frame_seq.fetch_add(1, Ordering::Release);
+                        }
+                    }
+                }
+            }
+            // Tick BEFORE the callback: the production EOF decision can see a partially
+            // drained final block. Tick alone creates every subsequent Full-loop seek serial.
+            player.tick(&ctx);
+            assert!(
+                player.error.is_none(),
+                "{name} rate={rate}: {:?}",
+                player.error
+            );
+            let current_serial = player.current_seek_serial();
+            if current_serial != serial {
+                assert_eq!(current_serial, serial + 1, "one seek per EOF Full-loop");
+                assert_one_device_burst(&device_samples, rate, name, serial);
+                completed_epochs.push(std::mem::take(&mut samples));
+                device_samples.clear();
+                last_callback_pts = 0.0;
+                serial = current_serial;
+                if serial == 3 {
+                    break;
+                }
+            }
+            let (consumed, audible_end) = player
+                .audio
+                .as_ref()
+                .unwrap()
+                .fill_samples_without_device_for_test(
+                    &mut callback_samples,
+                    &player.clock,
+                    &player.engine_state_atomic,
+                );
+            device_samples.extend_from_slice(&callback_samples);
+            if consumed > 0 {
+                let end = audible_end.expect("real callback consumption publishes audible PTS");
+                let start = end - consumed as f64 / rate as f64;
+                assert!(
+                    (start - last_callback_pts).abs() < 0.002,
+                    "{name} rate={rate} serial={serial}: callback timeline gap/overlap: start={start} previous_end={last_callback_pts}"
+                );
+                if serial > 0 && samples.len() < rate as usize / 4 * 2 {
+                    let head_remaining = rate as usize / 4 * 2 - samples.len();
+                    let head = &callback_samples[..(consumed * 2).min(head_remaining)];
+                    let first_nonsilent = head.iter().position(|v| v.abs() >= 1e-4);
+                    let first_pcm_frame = first_nonsilent.map(|index| (samples.len() + index) / 2);
+                    let first_device_frame = first_nonsilent
+                        .map(|index| (device_samples.len() - callback_samples.len() + index) / 2);
+                    let peak = head.iter().fold(0.0_f32, |peak, v| peak.max(v.abs()));
+                    assert!(
+                        first_nonsilent.is_none(),
+                        "{name} rate={rate} serial={serial}: post-loop callback emitted stale tail in the silent head; first_pcm_frame={first_pcm_frame:?} first_device_frame={first_device_frame:?} peak={peak}"
+                    );
+                }
+                last_callback_pts = end;
+                samples.extend_from_slice(&callback_samples[..consumed * 2]);
+            }
+            next_callback += callback_period;
+            std::thread::sleep(next_callback.saturating_duration_since(Instant::now()));
+        }
+        assert_eq!(
+            serial,
+            3,
+            "{name} rate={rate}: actual EOF Full-loop did not complete three epochs; state={} seeking={} demux_eof={} tail_complete={} processed={} raw={} audio_rx={}",
+            player.engine_state_atomic.load(Ordering::Acquire),
+            player.clock.is_seeking(),
+            player.clock.is_demux_exhausted(),
+            player.clock.audio_tail_complete(),
+            player.clock.audio_processed_secs(),
+            player.clock.audio_raw_pending_secs(),
+            player.audio_rx_len()
+        );
+        // Check exact logical lengths after capturing the loop path, so a fresh-stream
+        // resampler tail loss cannot mask stale audio emitted on a later real Flush.
+        for (serial, samples) in completed_epochs.iter().enumerate() {
+            assert_one_fixture_burst(samples, rate, name, serial as u64);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn real_decoder_eof_full_loop_preserves_single_tail_burst_per_epoch() {
+        // These fixtures reproduce the hardware dry-loop report: no-loop is one click,
+        // Full-loop produced two for tail4ms/tail10ms, while mid4ms remained one.
+        // WAV exercises audio-only tick, MKV exercises native EOF tick; 44.1kHz additionally
+        // traverses the real FFmpeg resampler, including its Flush between loop epochs.
+        for rate in [48_000, 44_100] {
+            for name in [
+                "tail4ms.wav",
+                "tail10ms.wav",
+                "mid4ms.wav",
+                "tail4ms.mkv",
+                "tail10ms.mkv",
+                "mid4ms.mkv",
+            ] {
+                capture_real_eof_full_loops(name, rate);
+            }
+        }
+    }
+
+    // Deterministic six-second stream: the decoder has read ahead while output
+    // remains at 2.9/3.8 seconds. No native HWND or audio device is created.
+    fn short_stream_before_end(position: f64, audio_only: bool) -> super::VideoPlayer {
+        use super::engine::state::{AudioEvent, DecoderEvent};
+        let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(
+            std::path::PathBuf::from("short-eof.mkv"),
+        );
+        let info = player.info.as_mut().unwrap();
+        info.duration_secs = 6.0;
+        info.has_video = !audio_only;
+        #[cfg(windows)]
+        if audio_only {
+            player.native_output = None;
+        }
+        {
+            let mut actor = player.engine.lock().unwrap();
+            actor.begin_loading();
+            actor.handle_decoder_event(DecoderEvent::InfoReceived {
+                epoch: 0,
+                duration_secs: 6.0,
+                has_audio: true,
+                has_video: !audio_only,
+            });
+            actor.handle_audio_event(AudioEvent::BufferReady {
+                epoch: 0,
+                pts: position,
+                wall_now: std::time::Instant::now(),
+            });
+            if !audio_only {
+                actor.handle_decoder_event(DecoderEvent::FirstFrameReady {
+                    epoch: 0,
+                    pts: position,
+                });
+            }
+            actor.apply_command(super::engine::actor::TransportCommand::Play);
+        }
+        player.clock.set_audio_pts_jump(position);
+        player.clock.notify_demux_exhausted();
+        player
+    }
+
+    fn assert_resume_without_seek(player: &super::VideoPlayer, paused_position: f64) {
+        assert!(!player.is_at_eof());
+        assert!(player.is_playing());
+        assert!(player.clock.is_demux_exhausted());
+        assert_eq!(player.current_seek_serial(), 0);
+        assert!(player.clock.take_seek_request().is_none());
+        assert!((player.position() - paused_position).abs() < 0.1);
+    }
+
+    #[test]
+    fn toggle_play_after_demux_exhausted_resumes_before_end_without_seek() {
+        for audio_only in [false, true] {
+            for position in [2.4, 2.9, 3.8] {
+                let player = short_stream_before_end(position, audio_only);
+                player.toggle_play();
+                assert!(!player.is_playing());
+                assert!(!player.is_at_eof());
+                let paused = player.position();
+                player.toggle_play();
+                assert_resume_without_seek(&player, paused);
+            }
+        }
+    }
+
+    #[test]
+    fn set_playing_after_demux_exhausted_resumes_before_end_without_seek() {
+        for audio_only in [false, true] {
+            for position in [2.9, 3.8] {
+                let player = short_stream_before_end(position, audio_only);
+                player.set_playing(false);
+                let paused = player.position();
+                player.set_playing(true);
+                assert_resume_without_seek(&player, paused);
+                player.set_playing(true); // Idempotent while output still drains.
+                assert_resume_without_seek(&player, paused);
+            }
+        }
+    }
+
+    #[test]
+    fn play_after_true_eof_replays_once_through_both_player_commands() {
+        for audio_only in [false, true] {
+            for toggle in [false, true] {
+                let player = short_stream_before_end(3.8, audio_only);
+                player.mark_eof_for_test(6.0);
+                assert!(player.is_at_eof());
+                assert!(!player.is_playing());
+                assert!(player.intent_playing(), "EOF retains autoplay intent");
+                assert!((player.position() - 6.0).abs() < 1e-9);
+                if toggle {
+                    player.toggle_play();
+                } else {
+                    player.set_playing(true);
+                }
+                assert!(!player.is_at_eof());
+                assert_eq!(player.current_seek_serial(), 1);
+                assert_eq!(player.clock.take_seek_request().unwrap().target_secs, 0.0);
+                assert!(!player.clock.is_demux_exhausted());
+                assert!(player.intent_playing());
+                assert_eq!(
+                    player.engine_state_code(),
+                    super::engine::actor::state_code::SEEKING
+                );
+                assert_eq!(player.position(), 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn play_after_true_eof_does_not_depend_on_demux_flag() {
+        for toggle in [false, true] {
+            let player = short_stream_before_end(3.8, false);
+            player.clock.clear_demux_exhausted();
+            player.mark_eof_for_test(6.0);
+            assert!(player.is_at_eof());
+            if toggle {
+                player.toggle_play();
+            } else {
+                player.set_playing(true);
+            }
+            assert_eq!(player.current_seek_serial(), 1);
+            assert_eq!(player.clock.take_seek_request().unwrap().target_secs, 0.0);
+            assert!(player.intent_playing());
+        }
+    }
+
+    #[test]
+    fn real_short_stream_demux_exhausted_pause_resume_keeps_output_position() {
+        let player = selection_player_with_demux_at_eof();
+        for position in [2.9, 3.8] {
+            player.clock.set_audio_pts_jump(position);
+            player.toggle_play();
+            let paused = player.position();
+            player.toggle_play();
+            assert_resume_without_seek(&player, paused);
+            player.set_playing(false);
+            let paused = player.position();
+            player.set_playing(true);
+            assert_resume_without_seek(&player, paused);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn set_playing_dsp_after_demux_exhausted_acquires_at_paused_position() {
+        use crate::video::audio::AudioDspChain;
+        use crate::video::dsp::coordinator::DspProcessingCoordinator;
+        let mut player = short_stream_before_end(3.8, false);
+        player.set_playing(false);
+        let paused = player.position();
+        player.audio = Some(player.audio.take().unwrap().with_dsp_chain_for_test(
+            AudioDspChain {
+                user: None,
+                effetune: std::sync::Arc::new(crate::effetune::EffetuneAudioSlot::default()),
+                coordinator: std::sync::Arc::new(DspProcessingCoordinator::default()),
+            },
+            true,
+        ));
+        player.set_playing(true);
+        let acquisition = player.dsp_handoff.lock().unwrap();
+        let super::LocalDspAcquisition::Waiting(pending) = &*acquisition else {
+            panic!("expected DSP acquisition");
+        };
+        assert!((pending.requested_position.resolve(0.0) - paused).abs() < 1e-9);
+        assert!((player.position() - paused).abs() < 1e-9);
+        assert_eq!(player.current_seek_serial(), 0);
+    }
+
+    fn selection_player(playing: bool) -> super::VideoPlayer {
+        use super::engine::state::{AudioEvent, DecoderEvent};
+        let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(
+            std::path::PathBuf::from("selection-test.mkv"),
+        );
+        let info = player.info.as_mut().unwrap();
+        info.audio_tracks.push(super::decoder::AudioTrackInfo {
+            stream_index: 2,
+            ordinal: 2,
+            language: None,
+            title: None,
+            codec: "flac".to_owned(),
+            channels: Some(1),
+            sample_rate: Some(32_000),
+            disposition_default: false,
+            start_secs: None,
+            end_secs: None,
+        });
+        player.audio_track_selection =
+            Some(std::sync::Arc::new(super::AudioTrackSelection::new(1)));
+        {
+            let mut actor = player.engine.lock().unwrap();
+            actor.begin_loading();
+            actor.handle_decoder_event(DecoderEvent::InfoReceived {
+                epoch: 0,
+                duration_secs: 30.0,
+                has_audio: true,
+                has_video: true,
+            });
+            actor.handle_audio_event(AudioEvent::BufferReady {
+                epoch: 0,
+                pts: 0.0,
+                wall_now: std::time::Instant::now(),
+            });
+            actor.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
+            if playing {
+                actor.apply_command(super::engine::actor::TransportCommand::Play);
+            }
+        }
+        player
+    }
+
+    /// Drive the real demux through the six-second file while keeping the
+    /// displayed frame at the start. This fixes the EOF read-ahead ordering.
+    fn selection_player_with_demux_at_eof() -> super::VideoPlayer {
+        selection_player_with_demux_at_eof_fixture("multi.mkv", 2)
+    }
+
+    fn selection_player_with_demux_at_eof_fixture(
+        name: &str,
+        initial_stream: usize,
+    ) -> super::VideoPlayer {
+        use super::engine::state::{AudioEvent, DecoderEvent};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/audio-tracks")
+            .join(name);
+        let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        player.cancel = std::sync::Arc::new(AtomicBool::new(false));
+        player.engine.lock().unwrap().begin_loading();
+        player.decode = super::decoder::spawn(
+            path,
+            std::sync::Arc::clone(&player.clock),
+            std::sync::Arc::clone(&player.cancel),
+            48_000,
+            false,
+            crate::settings::VideoDeinterlaceMode::Off,
+            #[cfg(windows)]
+            None,
+            std::sync::Arc::clone(&player.engine_state_atomic),
+            player.engine_event_tx.clone(),
+            std::sync::Arc::clone(&player.decoder_dropped_full_count),
+            #[cfg(windows)]
+            std::sync::Arc::clone(&player.dynamic),
+            #[cfg(not(windows))]
+            std::sync::Arc::new(super::decoder::VideoDynamicState::default()),
+        );
+        let info = player
+            .decode
+            .info_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(info.opened_audio_stream_index, Some(initial_stream));
+        player.audio_track_selection = Some(
+            player
+                .decode
+                .audio_track_selection_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap(),
+        );
+        player
+            .engine
+            .lock()
+            .unwrap()
+            .handle_decoder_event(DecoderEvent::InfoReceived {
+                epoch: 0,
+                duration_secs: info.duration_secs,
+                has_audio: info.has_audio,
+                has_video: info.has_video,
+            });
+        let has_video = info.has_video;
+        player.info = Some(info);
+        let video_pts = has_video.then(|| {
+            player
+                .decode
+                .video_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("initial video frame")
+                .pts_secs
+        });
+        let audio_pts = player
+            .decode
+            .audio_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("initial audio frame")
+            .pts_secs;
+        if let Some(video_pts) = video_pts {
+            player.set_last_displayed_pts_for_test(video_pts);
+        }
+        {
+            let mut actor = player.engine.lock().unwrap();
+            actor.handle_audio_event(AudioEvent::BufferReady {
+                epoch: 0,
+                pts: audio_pts,
+                wall_now: std::time::Instant::now(),
+            });
+            if let Some(video_pts) = video_pts {
+                actor.handle_decoder_event(DecoderEvent::FirstFrameReady {
+                    epoch: 0,
+                    pts: video_pts,
+                });
+            }
+            actor.apply_command(super::engine::actor::TransportCommand::Play);
+        }
+        // A test clock seam makes read-ahead deterministic without waiting for
+        // wall-clock playback. The displayed PTS stays on the initial frame.
+        player
+            .clock
+            .set_audio_pts_jump(player.info.as_ref().unwrap().duration_secs);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !player.clock.is_demux_exhausted() && std::time::Instant::now() < deadline {
+            let _ = player
+                .decode
+                .video_rx
+                .recv_timeout(std::time::Duration::from_millis(5));
+            while player.decode.audio_rx.try_recv().is_ok() {}
+        }
+        assert!(
+            player.clock.is_demux_exhausted(),
+            "real demux did not reach EOF"
+        );
+        assert_eq!(
+            player.engine_state_code(),
+            super::engine::actor::state_code::PLAYING
+        );
+        assert!(!player.cancel.load(Ordering::Acquire));
+        player
+    }
+
+    fn assert_new_track_pcm(frame: &super::decoder::AudioFrame) -> bool {
+        assert_eq!(frame.seek_serial, 1);
+        assert_eq!(frame.stream_index, 1);
+        // AAC priming/padding distorts boundary frames; count zero crossings
+        // in the steady sine section, but check stream identity everywhere.
+        if (0.3..=5.5).contains(&frame.pts_secs)
+            && frame.duration_secs >= 0.015
+            && frame.samples.iter().any(|sample| sample.abs() >= 0.02)
+        {
+            let mut rising = 0;
+            let mut previous = frame.samples[0];
+            for sample in frame.samples.chunks_exact(2).skip(1).map(|pair| pair[0]) {
+                if previous <= 0.0 && sample > 0.0 {
+                    rising += 1;
+                }
+                previous = sample;
+            }
+            let measured = rising as f64 / frame.duration_secs;
+            assert!((measured - 440.0).abs() < 110.0, "{measured:.1} Hz");
+            return true;
+        }
+        false
+    }
+
+    #[test]
+    fn audio_select_paused_and_frame_step_pause_seek_at_displayed_pts() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        let player = selection_player(false);
+        player.set_last_displayed_pts_for_test(5.0);
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        let req = player.clock.take_seek_request().unwrap();
+        assert!((req.target_secs - 5.0).abs() < 1e-9);
+        assert!(!player.intent_playing());
+
+        let player = selection_player(false);
+        player.set_last_displayed_pts_for_test(7.0);
+        player.step_frame(1);
+        assert!(player.is_frame_step_active());
+        player.set_last_displayed_pts_for_test(7.25);
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        let req = player.clock.take_seek_request().unwrap();
+        assert!((req.target_secs - 7.25).abs() < 1e-9);
+        assert!(!player.intent_playing());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn audio_track_switch_during_dsp_handoff_keeps_play_request_and_new_seek() {
+        use crate::video::audio::AudioDspChain;
+        use crate::video::dsp::coordinator::{DspOwner, DspProcessingCoordinator};
+
+        let coordinator = std::sync::Arc::new(DspProcessingCoordinator::default());
+        let remote = coordinator
+            .reserve(DspOwner::Remote {
+                session: 42,
+                generation: 1,
+            })
+            .unwrap();
+        assert!(
+            coordinator
+                .wait_handoff(
+                    remote,
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                    &std::sync::atomic::AtomicBool::new(false),
+                )
+                .unwrap()
+                .grant()
+        );
+        let mut player = selection_player(true);
+        player.audio = Some(player.audio.take().unwrap().with_dsp_chain_for_test(
+            AudioDspChain {
+                user: None,
+                effetune: std::sync::Arc::new(crate::effetune::EffetuneAudioSlot::default()),
+                coordinator: std::sync::Arc::clone(&coordinator),
+            },
+            true,
+        ));
+        assert!(player.begin_dsp_acquisition(super::LocalDspPosition::Exact(4.0)));
+        assert!(!player.intent_playing());
+        assert_eq!(
+            player.select_audio_track(2).outcome,
+            super::AudioTrackSelectOutcome::Requested
+        );
+        assert!(matches!(
+            &*player.dsp_handoff.lock().unwrap(),
+            super::LocalDspAcquisition::Waiting(_)
+        ));
+        assert_eq!(
+            player.current_seek_serial(),
+            0,
+            "handoff still owns the seek"
+        );
+        coordinator.cancel(remote);
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !player.audio.as_ref().unwrap().has_dsp_token()
+            && std::time::Instant::now() < deadline
+        {
+            player.tick(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(player.audio.as_ref().unwrap().has_dsp_token());
+        assert!(player.current_seek_serial() > 0);
+        assert!(player.intent_playing());
+        assert!((player.position() - 4.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn confirmed_choice_is_harvested_once_but_pending_and_failed_are_not() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        let player = selection_player(false);
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        assert!(player.take_confirmed_audio_track_choice().is_none());
+        assert!(player.explicit_unchanged_audio_track_choice().is_none());
+        player.apply_desired_audio_track_for_test();
+        let choice = player.take_confirmed_audio_track_choice().unwrap();
+        assert_eq!(choice.stream_index, 2);
+        assert!(player.take_confirmed_audio_track_choice().is_none());
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Unchanged);
+        assert_eq!(player.explicit_unchanged_audio_track_choice(), Some(choice));
+
+        let player = selection_player(false);
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        player.fail_desired_audio_track_for_test();
+        assert!(player.take_confirmed_audio_track_choice().is_none());
+
+        let player = selection_player(true);
+        player.engine.lock().unwrap().handle_decoder_event(
+            super::engine::state::DecoderEvent::EofReached {
+                epoch: 0,
+                duration_secs: 30.0,
+            },
+        );
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Deferred);
+        assert!(player.take_confirmed_audio_track_choice().is_none());
+
+        let player = selection_player(false);
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        player.apply_desired_audio_track_for_test();
+        assert_eq!(player.select_audio_track(1).outcome, Outcome::Requested);
+        assert!(
+            player.take_confirmed_audio_track_choice().is_none(),
+            "old generation"
+        );
+    }
+
+    #[test]
+    fn audio_select_paused_seek_uses_unshown_target_instead_of_old_display() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        let player = selection_player(false);
+        player.set_last_displayed_pts_for_test(5.0);
+        player.seek_paused(10.0);
+        assert!(player.clock.is_seeking());
+        assert!((player.last_displayed_pts_secs().unwrap() - 5.0).abs() < 1e-9);
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        let req = player.clock.take_seek_request().unwrap();
+        assert!((req.target_secs - 10.0).abs() < 1e-9);
+        assert!(!player.intent_playing());
+    }
+
+    #[test]
+    fn audio_select_uses_issued_target_until_display_even_if_audio_clears_override() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        let player = selection_player(true);
+        player.set_last_displayed_pts_for_test(5.0);
+        player.seek(10.0);
+        let old_serial = player.clock.current_seek_serial();
+        player.clock.clear_seek_target_override(old_serial);
+        assert!(!player.clock.is_seeking());
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        assert!((player.clock.take_seek_request().unwrap().target_secs - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn interrupted_seek_targets_retire_but_audio_clear_retains_target() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        let player = selection_player(true);
+        player.set_last_displayed_pts_for_test(5.0);
+        player.seek(10.0);
+        let serial = player.clock.current_seek_serial();
+        player.clock.clear_seek_target_override(serial); // normal audio consumption
+        assert!((player.audio_track_seek_base_secs() - 10.0).abs() < 1e-9);
+        player.clock.mark_seek_interrupted(serial); // demux abort/EOF insurance
+        assert!((player.audio_track_seek_base_secs() - 5.0).abs() < 1e-9);
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        assert!((player.clock.take_seek_request().unwrap().target_secs - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn relative_seek_at_end_retires_unshown_target() {
+        use super::{AudioTrackSelectOutcome as Outcome, RelativeSeekOutcome};
+        let player = selection_player(true);
+        player.set_last_displayed_pts_for_test(5.0);
+        player.seek(29.9);
+        let serial = player.clock.current_seek_serial();
+        player.clock.notify_demux_exhausted();
+        assert_eq!(player.seek_relative(1.0), RelativeSeekOutcome::AtEnd);
+        assert!(player.clock.seek_was_interrupted(serial));
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        assert!((player.clock.take_seek_request().unwrap().target_secs - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn eof_stuck_insurance_retires_unshown_target() {
+        let mut player = selection_player(true);
+        #[cfg(windows)]
+        {
+            player.native_output = None;
+        }
+        player.set_last_displayed_pts_for_test(5.0);
+        player.seek(29.9);
+        let serial = player.clock.current_seek_serial();
+        player.clock.notify_demux_exhausted();
+        player.seek_eof_stuck_since =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+        player.tick(&egui::Context::default());
+        assert!(player.clock.seek_was_interrupted(serial));
+        assert!((player.audio_track_seek_base_secs() - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn real_demux_seek_failure_retires_selection_base() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        let player = selection_player_with_demux_at_eof();
+        player.set_last_displayed_pts_for_test(4.0);
+        player.clock.fail_next_demux_seek_for_test();
+        player.seek(5.0);
+        let aborted_serial = player.clock.current_seek_serial();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !player.clock.seek_was_interrupted(aborted_serial)
+            && std::time::Instant::now() < deadline
+        {
+            while player.decode.video_rx.try_recv().is_ok() {}
+            while player.decode.audio_rx.try_recv().is_ok() {}
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(player.clock.seek_was_interrupted(aborted_serial));
+        assert_eq!(player.select_audio_track(1).outcome, Outcome::Requested);
+        assert!((player.clock.take_seek_request().unwrap().target_secs - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn first_display_pending_seek_and_position_choose_selection_base() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        use std::sync::atomic::Ordering;
+        let player = selection_player(false);
+        player
+            .last_displayed_pts_bits
+            .store(f64::NAN.to_bits(), Ordering::Release);
+        player.seek_paused(8.0);
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        assert!((player.clock.take_seek_request().unwrap().target_secs - 8.0).abs() < 1e-9);
+
+        let player = selection_player(false);
+        player
+            .last_displayed_pts_bits
+            .store(f64::NAN.to_bits(), Ordering::Release);
+        player.clock.set_audio_pts_jump(4.0);
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        assert!((player.clock.take_seek_request().unwrap().target_secs - 4.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn audio_select_uses_newly_displayed_pts_even_if_audio_override_remains() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        use std::sync::atomic::Ordering;
+        let player = selection_player(true);
+        player.set_last_displayed_pts_for_test(5.0);
+        player.seek(10.0);
+        player.set_last_displayed_pts_for_test(10.1);
+        player.displayed_frame_seq.fetch_add(1, Ordering::Release);
+        assert!(player.clock.is_seeking());
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        assert!((player.clock.take_seek_request().unwrap().target_secs - 10.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn audio_only_selection_uses_current_audio_position_after_previous_seek() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        use std::sync::atomic::Ordering;
+        let mut player = selection_player(true);
+        player.info.as_mut().unwrap().has_video = false;
+        player
+            .last_displayed_pts_bits
+            .store(f64::NAN.to_bits(), Ordering::Release);
+        player.clock.set_audio_pts_jump(4.0);
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        let first = player.clock.take_seek_request().unwrap();
+        assert!(
+            (first.target_secs - 4.0).abs() < 0.1,
+            "{}",
+            first.target_secs
+        );
+        player.apply_desired_audio_track_for_test();
+        player.clock.clear_seek_target_override(first.serial);
+        player.clock.set_audio_pts_jump(4.5);
+        assert_eq!(player.select_audio_track(1).outcome, Outcome::Requested);
+        let second = player.clock.take_seek_request().unwrap();
+        assert!(
+            (second.target_secs - 4.5).abs() < 0.1,
+            "{}",
+            second.target_secs
+        );
+    }
+
+    #[test]
+    fn audio_select_uses_pending_seek_target_and_coalesces_to_one_request() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        let player = selection_player(true);
+        player
+            .user_seek_coalesce
+            .lock()
+            .unwrap()
+            .pending_target_secs = Some(6.0);
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        let req = player.clock.take_seek_request().unwrap();
+        assert!((req.target_secs - 6.0).abs() < 1e-9);
+        assert!(
+            player
+                .user_seek_coalesce
+                .lock()
+                .unwrap()
+                .pending_target_secs
+                .is_none()
+        );
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Unchanged);
+        assert!(player.clock.take_seek_request().is_none());
+
+        let player = selection_player(true);
+        player.clock.request_seek(4.0);
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        let req = player.clock.take_seek_request().unwrap();
+        assert!((req.target_secs - 4.0).abs() < 1e-9);
+        assert_eq!(req.serial, 2);
+    }
+
+    #[test]
+    fn audio_select_playing_uses_displayed_pts_when_clock_is_ahead() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        let player = selection_player(true);
+        player.set_last_displayed_pts_for_test(5.0);
+        player.clock.set_audio_pts_jump(8.0);
+        assert!(player.position() > 7.9);
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        assert!((player.clock.take_seek_request().unwrap().target_secs - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn audio_select_defers_only_after_engine_eof() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        let player = selection_player(true);
+        player.set_last_displayed_pts_for_test(5.0);
+        player.clock.notify_demux_exhausted();
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        assert!((player.clock.take_seek_request().unwrap().target_secs - 5.0).abs() < 1e-9);
+        assert_eq!(
+            player.audio_track_display_state(),
+            Some(super::AudioTrackSelectionDisplayState::Switching)
+        );
+
+        let player = selection_player(false);
+        player.set_last_displayed_pts_for_test(5.0);
+        player.clock.notify_demux_exhausted();
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        assert!((player.clock.take_seek_request().unwrap().target_secs - 5.0).abs() < 1e-9);
+
+        let player = selection_player(true);
+        player.engine.lock().unwrap().handle_decoder_event(
+            super::engine::state::DecoderEvent::EofReached {
+                epoch: 0,
+                duration_secs: 30.0,
+            },
+        );
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Deferred);
+        assert!(player.clock.take_seek_request().is_none());
+        assert_eq!(
+            player.audio_track_display_state(),
+            Some(super::AudioTrackSelectionDisplayState::Deferred)
+        );
+    }
+
+    #[test]
+    fn audio_select_defers_known_unavailable_track_without_seeking_or_stopping() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        for position in [3.0, 9.7, 11.0] {
+            let mut player = selection_player(true);
+            let track = &mut player.info.as_mut().unwrap().audio_tracks[1];
+            track.start_secs = Some(4.0);
+            track.end_secs = Some(10.0);
+            player.set_last_displayed_pts_for_test(position);
+            assert_eq!(player.select_audio_track(2).outcome, Outcome::Deferred);
+            assert!(player.clock.take_seek_request().is_none());
+            assert_eq!(
+                player.engine_state_code(),
+                super::engine::actor::state_code::PLAYING
+            );
+            assert_eq!(
+                player.audio_track_display_state(),
+                Some(super::AudioTrackSelectionDisplayState::Deferred)
+            );
+            let snapshot = player.audio_track_selection().unwrap();
+            assert_eq!(snapshot.deferred_gen, Some(snapshot.desired.generation));
+        }
+    }
+
+    #[test]
+    fn audio_select_after_demux_eof_switches_real_pcm_at_playback_start() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        let player = selection_player_with_demux_at_eof();
+        assert!(player.clock.is_demux_exhausted());
+        assert_eq!(player.select_audio_track(1).outcome, Outcome::Requested);
+        assert_eq!(
+            player.audio_track_display_state(),
+            Some(super::AudioTrackSelectionDisplayState::Switching)
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut audible = 0;
+        while audible < 3 && std::time::Instant::now() < deadline {
+            while player.decode.video_rx.try_recv().is_ok() {}
+            let Ok(frame) = player
+                .decode
+                .audio_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+            else {
+                continue;
+            };
+            if frame.seek_serial != 1 {
+                continue;
+            }
+            if assert_new_track_pcm(&frame) {
+                audible += 1;
+            }
+        }
+        assert_eq!(audible, 3, "new-track PCM missing after EOF read-ahead");
+        let snapshot = player.audio_track_selection().unwrap();
+        assert_eq!(snapshot.applied.stream_index, 1);
+        assert_eq!(snapshot.applied, snapshot.desired);
+    }
+
+    #[test]
+    fn audio_select_before_last_frame_reenters_playing_through_real_actor() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        use super::engine::EngineEvent;
+        use super::engine::state::{AudioEvent, DecoderEvent};
+        let player = selection_player_with_demux_at_eof_fixture("tail-audio.mkv", 1);
+        let displayed_pts = 5.8;
+        assert!(displayed_pts < player.info.as_ref().unwrap().duration_secs);
+        // The fixture's final video frame is 5.9 s, but audio lasts beyond it.
+        // A position-based target clamps beyond 5.9 s and has no video frame.
+        assert!(player.info.as_ref().unwrap().duration_secs - 0.1 > 5.9);
+        player.set_last_displayed_pts_for_test(displayed_pts);
+        player
+            .clock
+            .set_audio_pts_jump(player.info.as_ref().unwrap().duration_secs);
+        assert!(player.position() > displayed_pts);
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        assert_eq!(
+            player.engine_state_code(),
+            super::engine::actor::state_code::SEEKING
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut completed = None;
+        let mut video_pts = None;
+        let mut audio_pts = None;
+        while std::time::Instant::now() < deadline
+            && (completed.is_none() || video_pts.is_none() || audio_pts.is_none())
+        {
+            while let Ok(event) = player.engine_event_rx.try_recv() {
+                if let EngineEvent::Decoder(DecoderEvent::SeekCompleted {
+                    epoch: 1,
+                    actual_pts,
+                }) = event
+                {
+                    completed = Some(actual_pts);
+                }
+            }
+            while let Ok(frame) = player.decode.video_rx.try_recv() {
+                if frame.seek_serial == 1 && frame.pts_secs >= displayed_pts - 0.01 {
+                    video_pts.get_or_insert(frame.pts_secs);
+                }
+            }
+            while let Ok(frame) = player.decode.audio_rx.try_recv() {
+                if frame.seek_serial == 1 {
+                    assert_eq!(frame.stream_index, 2);
+                    audio_pts.get_or_insert(frame.pts_secs);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let completed = completed.expect("real demux SeekCompleted");
+        let video_pts = video_pts.expect("post-seek video frame near the last frame");
+        let audio_pts = audio_pts.expect("post-seek audio frame near the last frame");
+        assert!((completed - displayed_pts).abs() < 0.01);
+        {
+            let mut actor = player.engine.lock().unwrap();
+            actor.handle_decoder_event(DecoderEvent::SeekCompleted {
+                epoch: 1,
+                actual_pts: completed,
+            });
+            actor.handle_audio_event(AudioEvent::BufferReady {
+                epoch: 1,
+                pts: audio_pts,
+                wall_now: std::time::Instant::now(),
+            });
+            actor.handle_decoder_event(DecoderEvent::FirstFrameReady {
+                epoch: 1,
+                pts: video_pts,
+            });
+        }
+        assert_eq!(
+            player.engine_state_code(),
+            super::engine::actor::state_code::PLAYING,
+            "the near-end switch must not strand the engine in Seeking/Buffering"
+        );
+    }
+
+    #[test]
+    fn near_last_frame_switch_plays_and_reaches_eof_with_real_pump_and_display() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        use super::engine::actor::state_code;
+        let mut player = selection_player_with_demux_at_eof_fixture("tail-audio.mkv", 1);
+        #[cfg(windows)]
+        {
+            player.native_output = None;
+        }
+        player.audio = Some(super::audio::AudioOutput::pumping_without_device_for_test(
+            48_000,
+            player.decode.audio_rx.clone(),
+            std::sync::Arc::clone(&player.clock),
+            player.engine_event_tx.clone(),
+            std::sync::Arc::clone(&player.engine_state_atomic),
+        ));
+        player.set_last_displayed_pts_for_test(5.8);
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+        let ctx = egui::Context::default();
+        let mut saw_playing = false;
+        let mut audible = false;
+        while std::time::Instant::now() < deadline {
+            player.tick(&ctx);
+            let state = player.engine_state_code();
+            if state == state_code::PLAYING {
+                saw_playing = true;
+                let (heard, _) = player
+                    .audio
+                    .as_ref()
+                    .unwrap()
+                    .fill_without_device_for_test(&player.clock, &player.engine_state_atomic);
+                audible |= heard;
+            }
+            if state == state_code::EOF {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            saw_playing,
+            "selection stayed in Seeking/Buffering: readiness={:?} eof={} seeking={} now={:.3} displayed={:?} seq={} future={:?} raw={:.3} processed={:.3} video_rx={} audio_rx={} selection={:?}",
+            player.engine.lock().unwrap().readiness_snapshot(),
+            player.clock.is_demux_exhausted(),
+            player.clock.is_seeking(),
+            player.clock.now_secs(),
+            player.last_displayed_pts_secs(),
+            player.displayed_frame_seq(),
+            player
+                .future_frames
+                .front()
+                .map(|frame| (frame.seek_serial, frame.pts_secs)),
+            player.clock.audio_raw_pending_secs(),
+            player.clock.audio_processed_secs(),
+            player.decode.video_rx.len(),
+            player.decode.audio_rx.len(),
+            player.audio_track_selection(),
+        );
+        assert!(audible, "real pump output was not consumed");
+        assert_eq!(player.engine_state_code(), state_code::EOF);
+    }
+
+    #[test]
+    fn audio_only_near_end_switch_reaches_eof_with_real_pump() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        use super::engine::actor::state_code;
+        let mut player = selection_player_with_demux_at_eof_fixture("multi-audio.m4a", 1);
+        #[cfg(windows)]
+        {
+            player.native_output = None;
+        }
+        player.audio = Some(super::audio::AudioOutput::pumping_without_device_for_test(
+            48_000,
+            player.decode.audio_rx.clone(),
+            std::sync::Arc::clone(&player.clock),
+            player.engine_event_tx.clone(),
+            std::sync::Arc::clone(&player.engine_state_atomic),
+        ));
+        player.clock.set_audio_pts_jump(5.4);
+        assert_eq!(player.select_audio_track(0).outcome, Outcome::Requested);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+        let ctx = egui::Context::default();
+        let mut saw_playing = false;
+        let mut audible = false;
+        while std::time::Instant::now() < deadline {
+            player.tick(&ctx);
+            let state = player.engine_state_code();
+            if state == state_code::PLAYING {
+                saw_playing = true;
+                let (heard, _) = player
+                    .audio
+                    .as_ref()
+                    .unwrap()
+                    .fill_without_device_for_test(&player.clock, &player.engine_state_atomic);
+                audible |= heard;
+            }
+            if state == state_code::EOF {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(saw_playing);
+        assert!(audible);
+        assert_eq!(player.engine_state_code(), state_code::EOF);
+    }
+
+    #[test]
+    fn audio_select_rejects_missing_track_or_audio_lane() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        let player = selection_player(true);
+        assert_eq!(player.select_audio_track(99).outcome, Outcome::Rejected);
+        player.audio_track_selection.as_ref().unwrap().close_lane();
+        player.clock.mark_audio_lane_lost();
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Rejected);
+        let player = super::VideoPlayer::disconnected_for_test("silent.mp4".into(), 0.0);
+        assert_eq!(player.select_audio_track(1).outcome, Outcome::Rejected);
+    }
+
+    #[test]
+    fn audio_select_rejects_after_audio_only_lane_is_lost() {
+        use super::AudioTrackSelectOutcome as Outcome;
+        let mut player = selection_player(false);
+        player.info.as_mut().unwrap().has_video = false;
+        player.audio_track_selection.as_ref().unwrap().close_lane();
+        player.clock.mark_audio_lane_lost();
+        assert_eq!(player.select_audio_track(2).outcome, Outcome::Rejected);
+        assert!(player.clock.take_seek_request().is_none());
+    }
+
+    #[test]
+    fn audio_only_decoder_failure_surfaces_error_and_stops_player() {
+        use std::sync::atomic::Ordering;
+
+        let mut player = selection_player(true);
+        player
+            .engine_event_tx
+            .try_send(super::EngineEvent::Decoder(
+                super::engine::state::DecoderEvent::Failed {
+                    reason: super::decoder::AUDIO_ONLY_LANE_LOST_REASON.to_owned(),
+                },
+            ))
+            .unwrap();
+        player.drain_engine_events();
+        assert_eq!(
+            player.error(),
+            Some(super::decoder::AUDIO_ONLY_LANE_LOST_REASON)
+        );
+        assert_eq!(
+            player.engine_state_code(),
+            super::engine::actor::state_code::IDLE
+        );
+        assert!(player.cancel.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn first_tick_keeps_audio_only_terminal_reason_when_info_is_also_ready() {
+        use std::sync::atomic::Ordering;
+
+        let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(
+            std::path::PathBuf::from("audio-only.flac"),
+        );
+        player.engine.lock().unwrap().begin_loading();
+        player.cancel.store(false, Ordering::Release);
+        let mut info = player.info.take().unwrap();
+        info.has_video = false;
+        let (info_tx, info_rx) = crossbeam_channel::bounded(1);
+        info_tx.send(Ok(info)).unwrap();
+        player.decode.info_rx = info_rx;
+        player
+            .engine_event_tx
+            .try_send(super::EngineEvent::Decoder(
+                super::engine::state::DecoderEvent::Failed {
+                    reason: super::decoder::AUDIO_ONLY_LANE_LOST_REASON.to_owned(),
+                },
+            ))
+            .unwrap();
+
+        assert_eq!(player.tick(&egui::Context::default()), None);
+        assert_eq!(
+            player.error(),
+            Some(super::decoder::AUDIO_ONLY_LANE_LOST_REASON)
+        );
+        assert_eq!(
+            player.engine_state_code(),
+            super::engine::actor::state_code::IDLE
+        );
+        assert!(player.cancel.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn saved_track_open_notice_survives_audio_output_start_failure() {
+        let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(
+            std::path::PathBuf::from("saved-track.mkv"),
+        );
+        let mut info = player.info.take().unwrap();
+        info.open_notice =
+            Some(super::audio_track_selection::AudioTrackOpenNotice::SavedTrackUnavailable);
+        player.audio = None;
+        let (info_tx, info_rx) = crossbeam_channel::bounded(1);
+        info_tx.send(Ok(info)).unwrap();
+        player.decode.info_rx = info_rx;
+
+        player.tick(&egui::Context::default());
+        assert!(player.audio_track_selection.is_none());
+        assert!(player.take_audio_track_open_notice().is_some());
+        assert_eq!(player.take_audio_track_open_notice(), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn inactive_dsp_does_not_handoff_on_play_but_activation_acquires_while_playing() {
+        use crate::video::audio::AudioDspChain;
+        use crate::video::dsp::coordinator::DspProcessingCoordinator;
+
+        let coordinator = std::sync::Arc::new(DspProcessingCoordinator::default());
+        let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(
+            std::path::PathBuf::from("dry-then-active.mp4"),
+        );
+        player.clock.set_paused_position(7.0);
+        player.audio = Some(player.audio.take().unwrap().with_dsp_chain_for_test(
+            AudioDspChain {
+                user: None,
+                effetune: std::sync::Arc::new(crate::effetune::EffetuneAudioSlot::default()),
+                coordinator,
+            },
+            false,
+        ));
+        assert!(!player.begin_dsp_acquisition(super::LocalDspPosition::CurrentAfterMetadata));
+        player.set_playing(true);
+        assert!(player.intent_playing());
+        assert_eq!(player.current_seek_serial(), 0);
+        assert!(matches!(
+            &*player.dsp_handoff.lock().unwrap(),
+            super::LocalDspAcquisition::Idle
+        ));
+
+        player
+            .audio
+            .as_ref()
+            .unwrap()
+            .set_dsp_applicable_for_test(true);
+        let ctx = egui::Context::default();
+        player.tick(&ctx);
+        assert!(matches!(
+            &*player.dsp_handoff.lock().unwrap(),
+            super::LocalDspAcquisition::Waiting(_)
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !player.audio.as_ref().unwrap().has_dsp_token()
+            && std::time::Instant::now() < deadline
+        {
+            player.tick(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(player.audio.as_ref().unwrap().has_dsp_token());
+        assert!(player.current_seek_serial() > 0);
+        assert!((player.position() - 7.0).abs() < 0.001);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_dsp_handoff_waits_for_metadata_and_reseeks_at_requested_position() {
+        use crate::video::audio::AudioDspChain;
+        use crate::video::dsp::coordinator::DspProcessingCoordinator;
+
+        for (requested, expected) in [
+            (super::LocalDspPosition::CurrentAfterMetadata, 12.0),
+            (super::LocalDspPosition::Exact(20.0), 20.0),
+        ] {
+            let coordinator = std::sync::Arc::new(DspProcessingCoordinator::default());
+            let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(
+                std::path::PathBuf::from("handoff.mp4"),
+            );
+            let info = player.info.take().unwrap();
+            let (info_tx, info_rx) = crossbeam_channel::bounded(1);
+            player.decode.info_rx = info_rx;
+            player.pending_resume_secs = Some(12.0);
+            player.audio = Some(player.audio.take().unwrap().with_dsp_chain_for_test(
+                AudioDspChain {
+                    user: None,
+                    effetune: std::sync::Arc::new(crate::effetune::EffetuneAudioSlot::default()),
+                    coordinator: std::sync::Arc::clone(&coordinator),
+                },
+                true,
+            ));
+
+            assert!(player.begin_dsp_acquisition(requested));
+            assert!(matches!(
+                &*player.dsp_handoff.lock().unwrap(),
+                super::LocalDspAcquisition::AwaitingMetadata(_)
+            ));
+            assert_eq!(player.current_seek_serial(), 0);
+            assert!(!player.audio.as_ref().unwrap().has_dsp_token());
+
+            info_tx.send(Ok(info)).unwrap();
+            let ctx = egui::Context::default();
+            player.tick(&ctx);
+            assert!(player.info.is_some());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while !player.audio.as_ref().unwrap().has_dsp_token()
+                && std::time::Instant::now() < deadline
+            {
+                player.tick(&ctx);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(player.audio.as_ref().unwrap().has_dsp_token());
+            assert!(matches!(
+                &*player.dsp_handoff.lock().unwrap(),
+                super::LocalDspAcquisition::Idle
+            ));
+            assert!((player.position() - expected).abs() < 0.001);
+            assert!(player.current_seek_serial() >= 1);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn metadata_stage_failure_restores_requested_dry_autoplay() {
+        use crate::video::audio::AudioDspChain;
+        use crate::video::dsp::coordinator::DspProcessingCoordinator;
+
+        let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(
+            std::path::PathBuf::from("metadata-stage-failure.mp4"),
+        );
+        let info = player.info.take().unwrap();
+        let (info_tx, info_rx) = crossbeam_channel::bounded(1);
+        player.decode.info_rx = info_rx;
+        player.pending_resume_secs = Some(12.0);
+        player.audio = Some(player.audio.take().unwrap().with_dsp_chain_for_test(
+            AudioDspChain {
+                user: None,
+                effetune: std::sync::Arc::new(crate::effetune::EffetuneAudioSlot::default()),
+                coordinator: std::sync::Arc::new(DspProcessingCoordinator::default()),
+            },
+            true,
+        ));
+        player.set_playing(true);
+        assert!(matches!(
+            &*player.dsp_handoff.lock().unwrap(),
+            super::LocalDspAcquisition::AwaitingMetadata(_)
+        ));
+        assert!(
+            !player.intent_playing(),
+            "handoff pause clears autoplay intent"
+        );
+        player
+            .audio
+            .as_ref()
+            .unwrap()
+            .set_dsp_applicable_for_test(false);
+        info_tx.send(Ok(info)).unwrap();
+        let ctx = egui::Context::default();
+        player.tick(&ctx);
+        player.tick(&ctx);
+        assert!(matches!(
+            &*player.dsp_handoff.lock().unwrap(),
+            super::LocalDspAcquisition::Idle
+        ));
+        assert!(player.intent_playing(), "dry autoplay must be restored");
+        assert!((player.position() - 12.0).abs() < 0.001);
+        assert!(player.current_seek_serial() > 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn applicability_flicker_before_reservation_does_not_lose_acquisition() {
+        use crate::video::audio::AudioDspChain;
+        use crate::video::dsp::coordinator::DspProcessingCoordinator;
+
+        let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(
+            std::path::PathBuf::from("applicability-flicker.mp4"),
+        );
+        player.audio = Some(player.audio.take().unwrap().with_dsp_chain_for_test(
+            AudioDspChain {
+                user: None,
+                effetune: std::sync::Arc::new(crate::effetune::EffetuneAudioSlot::default()),
+                coordinator: std::sync::Arc::new(DspProcessingCoordinator::default()),
+            },
+            false,
+        ));
+        player.set_playing(true);
+        let audio = player.audio.as_ref().unwrap();
+        audio.set_dsp_applicable_for_test(true);
+        assert!(audio.newly_applicable_dsp());
+        audio.set_dsp_applicable_for_test(false);
+        assert!(!player.begin_dsp_acquisition(super::LocalDspPosition::CurrentAfterMetadata));
+        audio.set_dsp_applicable_for_test(true);
+        player.tick(&egui::Context::default());
+        assert!(matches!(
+            &*player.dsp_handoff.lock().unwrap(),
+            super::LocalDspAcquisition::Waiting(_)
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn handoff_worker_spawn_failure_is_terminal_for_one_activation() {
+        use crate::video::audio::AudioDspChain;
+        use crate::video::dsp::coordinator::DspProcessingCoordinator;
+
+        let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(
+            std::path::PathBuf::from("handoff-spawn-failure.mp4"),
+        );
+        player.audio = Some(player.audio.take().unwrap().with_dsp_chain_for_test(
+            AudioDspChain {
+                user: None,
+                effetune: std::sync::Arc::new(crate::effetune::EffetuneAudioSlot::default()),
+                coordinator: std::sync::Arc::new(DspProcessingCoordinator::default()),
+            },
+            false,
+        ));
+        player.set_playing(true);
+        player
+            .audio
+            .as_ref()
+            .unwrap()
+            .set_handoff_spawn_failure_for_test(true);
+        player
+            .audio
+            .as_ref()
+            .unwrap()
+            .set_dsp_applicable_for_test(true);
+        let ctx = egui::Context::default();
+        player.tick(&ctx);
+        assert_eq!(
+            player.audio.as_ref().unwrap().handoff_attempts_for_test(),
+            1
+        );
+        assert!(player.intent_playing());
+        assert!(!player.audio.as_ref().unwrap().has_dsp_token());
+        let serial_after_failure = player.current_seek_serial();
+        for _ in 0..5 {
+            player.tick(&ctx);
+        }
+        assert_eq!(
+            player.audio.as_ref().unwrap().handoff_attempts_for_test(),
+            1
+        );
+        assert_eq!(player.current_seek_serial(), serial_after_failure);
+
+        player
+            .audio
+            .as_ref()
+            .unwrap()
+            .set_dsp_applicable_for_test(false);
+        player.tick(&ctx);
+        player
+            .audio
+            .as_ref()
+            .unwrap()
+            .set_dsp_applicable_for_test(true);
+        player.tick(&ctx);
+        assert_eq!(
+            player.audio.as_ref().unwrap().handoff_attempts_for_test(),
+            2
+        );
+        player.set_playing(true);
+        assert_eq!(
+            player.audio.as_ref().unwrap().handoff_attempts_for_test(),
+            3
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn changed_video_placement_cannot_be_ready_before_a_frame_is_owned() {
@@ -11214,6 +14673,7 @@ mod tests {
             generation,
             source: NativeVideoWindowSource::Presenter,
             event: NativeVideoWindowEvent::KeyDown(NativeVideoKeyEvent {
+                receipt: crate::mouse_seek_debug::test_receipt(1),
                 virtual_key: 0x7B,
                 scan_code: 0x58,
                 extended: false,
@@ -11238,6 +14698,55 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn raw_xbutton_release_reaches_app_after_overlay_ownership_changes() {
+        use crate::video::native_window::{
+            NativeVideoMouseButton, NativeVideoMouseButtonEvent, NativeVideoMouseInputOwner,
+            NativeVideoWindowEvent, NativeVideoWindowSource,
+        };
+
+        let event = |button, down| {
+            NativeVideoWindowEvent::MouseButton(NativeVideoMouseButtonEvent {
+                receipt: crate::mouse_seek_debug::test_receipt(81),
+                owner: NativeVideoMouseInputOwner {
+                    window_source: NativeVideoWindowSource::Presenter,
+                    receiver_hwnd: 0x1234,
+                    window_generation: 7,
+                },
+                button,
+                down,
+                double_click: false,
+                x: 0,
+                y: 0,
+                shift: false,
+                ctrl: false,
+                #[cfg(feature = "test-script")]
+                smoke_metadata: None,
+            })
+        };
+        let extra_down = event(NativeVideoMouseButton::Extra1, true);
+        let extra_up = event(NativeVideoMouseButton::Extra1, false);
+        let left_up = event(NativeVideoMouseButton::Left, false);
+
+        assert!(!super::native_window_event_should_forward_to_app(
+            &extra_down,
+            false
+        ));
+        assert!(super::native_window_event_should_forward_to_app(
+            &extra_up, false
+        ));
+        assert!(!super::native_window_event_should_forward_to_app(
+            &left_up, false
+        ));
+        assert!(
+            super::native_output_event_latest_slot(&super::NativeVideoOutputEvent::Window(
+                extra_up
+            ))
+            .is_none()
+        );
     }
 
     #[cfg(windows)]
@@ -11961,6 +15470,39 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn native_video_canvas_color_transport_preserves_asymmetric_rgb_and_deduplicates() {
+        let color = [17, 34, 201];
+        let packed = super::pack_native_video_canvas_color(color);
+        assert_eq!(super::unpack_native_video_canvas_color(packed), color);
+
+        let fault = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = super::native_command_bus(8, std::sync::Arc::clone(&fault));
+        tx.send(super::NativeVideoOutputCommand::SetVideoCanvasColor { color: [1, 2, 3] })
+            .unwrap();
+        tx.send(super::NativeVideoOutputCommand::SetVideoCanvasColor { color })
+            .unwrap();
+        let commands = rx.drain();
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(
+            commands[0],
+            super::NativeVideoOutputCommand::SetVideoCanvasColor { color: actual } if actual == color
+        ));
+        assert!(!fault.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn disconnected_native_output_tracks_the_latest_canvas_color_without_gpu_work() {
+        let output = super::NativeVideoOutput::disconnected_for_test();
+        assert_eq!(output.video_canvas_color_for_test(), [0, 0, 0]);
+        output.set_video_canvas_color([17, 34, 201]);
+        assert_eq!(output.video_canvas_color_for_test(), [17, 34, 201]);
+        output.set_video_canvas_color([17, 34, 201]);
+        assert_eq!(output.video_canvas_color_for_test(), [17, 34, 201]);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn native_command_bus_coalesces_hud_state_and_keeps_actions_lossless() {
         let fault = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (tx, rx) = super::native_command_bus(8, std::sync::Arc::clone(&fault));
@@ -12038,6 +15580,7 @@ mod tests {
             super::NativeVideoOutputEvent::Window(
                 crate::video::native_window::NativeVideoWindowEvent::KeyDown(
                     crate::video::native_window::NativeVideoKeyEvent {
+                        receipt: crate::mouse_seek_debug::test_receipt(1),
                         virtual_key: 0x41,
                         scan_code: 0,
                         extended: false,
@@ -12053,17 +15596,256 @@ mod tests {
         let events = rx.drain();
         assert_eq!(events.len(), 2);
         assert!(matches!(
-            &events[0].1,
+            &events[0].event,
             super::NativeVideoOutputEvent::Window(
                 crate::video::native_window::NativeVideoWindowEvent::MouseMove(mouse)
             ) if mouse.x == 30 && mouse.y == 40
         ));
         assert!(matches!(
-            events[1].1,
+            events[1].event,
             super::NativeVideoOutputEvent::Window(
                 crate::video::native_window::NativeVideoWindowEvent::KeyDown(_)
             )
         ));
+        assert!(!fault.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn seek_strip_presented_snapshot_coalesces_visibility_and_window_atomically() {
+        let fault = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = super::native_output_event_bus(
+            8,
+            std::sync::Arc::clone(&fault),
+            std::sync::Arc::new(super::VideoUiWake::default()),
+        );
+        let render_stamp = crate::video::seek_strip::SeekStripRenderStamp {
+            session_id: crate::video::seek_strip::SeekStripSessionId(5),
+            layout_revision: crate::video::seek_strip::SeekStripLayoutRevision(2),
+        };
+        let visible =
+            |visible_count| crate::video::seek_strip::SeekStripPresentationEvent::Visible {
+                stamp: render_stamp.session_at_generation(3),
+                window: Some(crate::video::seek_strip::SeekStripWindowEvent {
+                    center: crate::video::seek_strip::SeekStripCenter::Thumbnails {
+                        center_index: (visible_count as f64 - 1.0) / 2.0,
+                    },
+                    visible_count,
+                    pixel_width: 1280,
+                    pixel_height: 104,
+                    stamp: render_stamp.at_generation(3),
+                }),
+            };
+        let hidden = crate::video::seek_strip::SeekStripPresentationEvent::Hidden(
+            render_stamp.session_at_generation(3),
+        );
+
+        // If App has not drained yet, a later successful Hidden present replaces both Visible and
+        // its RequestWindow. The renderer clears its dedup baseline on Hidden, so the next Visible
+        // can publish the geometry again.
+        tx.publish_seek_strip_presentation(13, visible(17)).unwrap();
+        tx.publish_seek_strip_presentation(13, hidden).unwrap();
+        let events = rx.drain();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0].event,
+            super::NativeVideoOutputEvent::SeekStripPresentation(
+                crate::video::seek_strip::SeekStripPresentationEvent::Hidden(_)
+            )
+        ));
+
+        // Conversely, Hidden followed by a successful Visible present delivers one compound
+        // snapshot. There is no interval in which App can observe Visible without its final width.
+        tx.publish_seek_strip_presentation(13, hidden).unwrap();
+        tx.publish_seek_strip_presentation(13, visible(17)).unwrap();
+        let events = rx.drain();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0].event,
+            super::NativeVideoOutputEvent::SeekStripPresentation(
+                crate::video::seek_strip::SeekStripPresentationEvent::Visible {
+                    window: Some(crate::video::seek_strip::SeekStripWindowEvent {
+                        visible_count: 17,
+                        ..
+                    }),
+                    ..
+                }
+            )
+        ));
+
+        // PlacementCommitted remains lossless and drains independently before a candidate's
+        // compound snapshot is released at its exact Retire acknowledgement.
+        tx.send(
+            13,
+            super::NativeVideoOutputEvent::PlacementCommitted {
+                request_id: 9,
+                placement: super::NativeVideoPlacement::FullscreenBorderless,
+                generation: 3,
+            },
+        );
+        let committed = rx.drain();
+        assert_eq!(committed.len(), 1);
+        assert!(matches!(
+            committed[0].event,
+            super::NativeVideoOutputEvent::PlacementCommitted { generation: 3, .. }
+        ));
+
+        assert!(!fault.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn candidate_strip_passive_output_is_released_only_by_the_exact_retire_ack() {
+        assert!(
+            !super::placement_control_releases_candidate_seek_strip_passive(
+                &super::PlacementTransitionControl::Commit,
+            )
+        );
+        assert!(
+            !super::placement_control_releases_candidate_seek_strip_passive(
+                &super::PlacementTransitionControl::Abort,
+            )
+        );
+        assert!(
+            super::placement_control_releases_candidate_seek_strip_passive(
+                &super::PlacementTransitionControl::Retire,
+            )
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_strip_config_commands_preserve_the_full_expected_layout_stamp() {
+        let fault = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = super::native_output_event_bus(
+            8,
+            std::sync::Arc::clone(&fault),
+            std::sync::Arc::new(super::VideoUiWake::default()),
+        );
+        let render_stamp = crate::video::seek_strip::SeekStripRenderStamp {
+            session_id: crate::video::seek_strip::SeekStripSessionId(17),
+            layout_revision: crate::video::seek_strip::SeekStripLayoutRevision(23),
+        };
+        let expected = render_stamp.at_generation(31);
+
+        super::send_native_overlay_command(
+            &tx,
+            41,
+            31,
+            crate::video::native_presenter::NativeOverlayCommand::SetSeekStripView {
+                view: crate::video::seek_strip_layout::SeekStripView::Hidden,
+                expected: Some(render_stamp),
+            },
+        );
+        super::send_native_overlay_command(
+            &tx,
+            41,
+            31,
+            crate::video::native_presenter::NativeOverlayCommand::SetSeekStripHeight {
+                height: crate::video::seek_strip_layout::SeekStripHeight::Large,
+                expected: Some(render_stamp),
+            },
+        );
+        super::send_native_overlay_command(
+            &tx,
+            41,
+            31,
+            crate::video::native_presenter::NativeOverlayCommand::SetSeekPreviewSize {
+                size: crate::settings::VideoSeekPreviewSize::Medium,
+                expected: Some(render_stamp),
+            },
+        );
+        super::send_native_overlay_command(
+            &tx,
+            41,
+            31,
+            crate::video::native_presenter::NativeOverlayCommand::StepSeekStripRange {
+                steps: vec![crate::video::seek_strip::SeekStripRangeStep::Narrower],
+                stamp: render_stamp,
+            },
+        );
+        super::send_native_overlay_command(
+            &tx,
+            41,
+            31,
+            crate::video::native_presenter::NativeOverlayCommand::ToggleSeekStripLock {
+                expected: Some(render_stamp),
+            },
+        );
+
+        let events = rx.drain();
+        assert_eq!(events.len(), 5);
+        assert!(matches!(
+            events[0].event,
+            super::NativeVideoOutputEvent::SetSeekStripView {
+                generation: 31,
+                expected: Some(actual),
+                ..
+            } if actual == expected
+        ));
+        assert!(matches!(
+            events[1].event,
+            super::NativeVideoOutputEvent::SetSeekStripHeight {
+                generation: 31,
+                expected: Some(actual),
+                ..
+            } if actual == expected
+        ));
+        assert!(matches!(
+            events[2].event,
+            super::NativeVideoOutputEvent::SetSeekPreviewSize {
+                size: crate::settings::VideoSeekPreviewSize::Medium,
+                generation: 31,
+                expected: Some(actual),
+            } if actual == expected
+        ));
+        assert!(matches!(
+            events[3].event,
+            super::NativeVideoOutputEvent::StepSeekStripRange {
+                stamp: actual,
+                ..
+            } if actual == expected
+        ));
+        assert!(matches!(
+            events[4].event,
+            super::NativeVideoOutputEvent::ToggleSeekStripLock {
+                generation: 31,
+                expected: Some(actual),
+            } if actual == expected
+        ));
+        assert!(!fault.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[cfg(all(windows, feature = "test-script"))]
+    #[test]
+    fn native_output_event_bus_keeps_exact_button_dispatch_on_existing_toggle_variant() {
+        let fault = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = super::native_output_event_bus(
+            8,
+            std::sync::Arc::clone(&fault),
+            std::sync::Arc::new(super::VideoUiWake::default()),
+        );
+        let dispatch = crate::video::native_ui_smoke::button_dispatch_metadata_for_test(51, 52);
+        tx.send(10, super::NativeVideoOutputEvent::TogglePanorama);
+        tx.send_with_ui_smoke_button_dispatch(
+            11,
+            super::NativeVideoOutputEvent::TogglePanorama,
+            dispatch,
+        );
+
+        let events = rx.drain();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0].event,
+            super::NativeVideoOutputEvent::TogglePanorama
+        ));
+        assert_eq!(events[0].ui_smoke_button_dispatch, None);
+        assert!(matches!(
+            events[1].event,
+            super::NativeVideoOutputEvent::TogglePanorama
+        ));
+        assert_eq!(events[1].source_epoch, 11);
+        assert_eq!(events[1].ui_smoke_button_dispatch, Some(dispatch));
         assert!(!fault.load(std::sync::atomic::Ordering::Acquire));
     }
 
@@ -12113,13 +15895,11 @@ mod tests {
 
         let events = rx.drain();
         assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source_epoch, 41);
         assert!(matches!(
-            events[0],
-            (
-                41,
-                super::NativeVideoOutputEvent::SetPanoramaProjection(
-                    crate::panorama::PanoProjection::Equidistant
-                )
+            events[0].event,
+            super::NativeVideoOutputEvent::SetPanoramaProjection(
+                crate::panorama::PanoProjection::Equidistant
             )
         ));
         assert!(!fault.load(std::sync::atomic::Ordering::Acquire));
@@ -12183,10 +15963,22 @@ mod tests {
         let now = std::time::Instant::now();
         let state = super::UserSeekCoalesceState {
             pending_target_secs: Some(12.0),
-            last_issued_at: Some(now),
-            last_issued_display_seq: 7,
+            last_issued: Some(super::IssuedUserSeek {
+                target_secs: 10.0,
+                serial: 1,
+                at: now,
+                displayed_seq: 7,
+            }),
         };
         assert!(!super::user_seek_ready_to_issue(&state, true, 7, now));
+    }
+
+    #[test]
+    fn user_seek_coalesce_keeps_initial_display_gate_for_external_seek() {
+        let state = super::UserSeekCoalesceState::default();
+        let now = std::time::Instant::now();
+        assert!(!super::user_seek_ready_to_issue(&state, true, 0, now));
+        assert!(super::user_seek_ready_to_issue(&state, true, 1, now));
     }
 
     #[test]
@@ -12194,8 +15986,12 @@ mod tests {
         let now = std::time::Instant::now();
         let state = super::UserSeekCoalesceState {
             pending_target_secs: Some(12.0),
-            last_issued_at: Some(now - super::USER_SEEK_REISSUE_AFTER),
-            last_issued_display_seq: 7,
+            last_issued: Some(super::IssuedUserSeek {
+                target_secs: 10.0,
+                serial: 1,
+                at: now - super::USER_SEEK_REISSUE_AFTER,
+                displayed_seq: 7,
+            }),
         };
         assert!(super::user_seek_ready_to_issue(&state, true, 8, now));
         assert!(super::user_seek_ready_to_issue(&state, true, 7, now));
@@ -12317,7 +16113,7 @@ mod tests {
             super::VideoPlayer::disconnected_for_test(std::path::PathBuf::from("stuck.mp4"), 29.0);
         player.configure_native_timing_for_test(29.0, 30.0, true, false);
         player.seek(29.9);
-        player.notify_eof_for_test();
+        player.notify_demux_exhausted_for_test();
 
         let due = player.tick(&egui::Context::default()).unwrap();
         assert!(due > std::time::Duration::from_millis(1190), "due={due:?}");
@@ -12347,7 +16143,7 @@ mod tests {
             super::VideoPlayer::disconnected_for_test(std::path::PathBuf::from("eof.mp4"), 30.0);
         player.configure_native_timing_for_test(30.0, 30.0, true, false);
         player.set_loop_enabled(true);
-        player.notify_eof_for_test();
+        player.notify_demux_exhausted_for_test();
 
         let first_due = player.tick(&egui::Context::default()).unwrap();
         assert!(first_due > std::time::Duration::from_millis(47));
@@ -12361,6 +16157,92 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn eos_tick_waits_for_in_flight_audio_tail_on_native_and_headless_paths() {
+        for native in [false, true] {
+            let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(
+                std::path::PathBuf::from("eos-tail.mp4"),
+            );
+            player.configure_native_timing_for_test(30.0, 30.0, true, false);
+            if !native {
+                player.native_output = None;
+            }
+            player.set_loop_enabled(true);
+            let serial = player.current_seek_serial();
+            player.clock.notify_demux_exhausted();
+            player.clock.note_audio_decoded_eos(serial);
+            assert!(player.clock.begin_audio_tail(serial));
+            // All counters/channels are quiet, and the old quiet interval has
+            // expired, but DSP still owns a tail block (including a slow IPC).
+            player.backdate_eof_quiet_for_test(std::time::Duration::from_secs(1));
+            let (ctx, requests) = repaint_probe();
+            let in_flight_deadline = player.tick(&ctx);
+            if native {
+                assert_eq!(in_flight_deadline, None);
+            }
+            assert_eq!(player.current_seek_serial(), serial);
+            assert!(player.is_playing());
+            assert!(player.eof_loop_quiet_since.is_none());
+            requests.lock().unwrap().clear();
+            super::audio::complete_audio_tail_and_wake(
+                &player.clock,
+                serial,
+                &player.engine_event_tx,
+            );
+            assert!(
+                requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.viewport_id == egui::ViewportId::ROOT && r.delay.is_zero())
+            );
+            let quiet_deadline = player
+                .tick(&ctx)
+                .expect("completion wake must start the quiet timer");
+            assert!(quiet_deadline <= super::EOF_DRAIN_QUIET_DURATION);
+
+            player.backdate_eof_quiet_for_test(std::time::Duration::from_millis(49));
+            let _ = player.tick(&ctx);
+            assert!(player.current_seek_serial() > serial);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn eos_empty_audio_seek_completes_through_real_pump_and_tick() {
+        let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(
+            std::path::PathBuf::from("eos-empty-seek.mp4"),
+        );
+        player.configure_native_timing_for_test(30.0, 30.0, true, false);
+        player.set_loop_enabled(true);
+        let (_tx, rx) = crossbeam_channel::bounded(1);
+        player.audio = Some(super::audio::AudioOutput::pumping_without_device_for_test(
+            48_000,
+            rx,
+            std::sync::Arc::clone(&player.clock),
+            player.engine_event_tx.clone(),
+            std::sync::Arc::clone(&player.engine_state_atomic),
+        ));
+        player.clock.request_seek(30.0);
+        let serial = player.current_seek_serial();
+        player.clock.clear_seek_target_override(serial);
+        player.clock.notify_demux_exhausted();
+        player.clock.note_audio_decoded_eos(serial);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !player.clock.audio_tail_complete() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            player.clock.audio_tail_complete(),
+            "EOF after a seek can contain no AudioFrame"
+        );
+        let _ = player.tick(&egui::Context::default());
+        player.backdate_eof_quiet_for_test(std::time::Duration::from_millis(49));
+        let _ = player.tick(&egui::Context::default());
+        assert!(player.current_seek_serial() > serial);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn native_tick_schedules_observed_eof_drain_completion() {
         let mut player = super::VideoPlayer::disconnected_for_test(
             std::path::PathBuf::from("eof-buffered.mp4"),
@@ -12369,7 +16251,7 @@ mod tests {
         player.configure_native_timing_for_test(30.0, 30.0, true, false);
         player.set_playback_speed(0.5);
         player.set_audio_processed_secs_for_test(0.5);
-        player.notify_eof_for_test();
+        player.notify_demux_exhausted_for_test();
 
         let due = player.tick(&egui::Context::default()).unwrap();
         assert!(due > std::time::Duration::from_millis(490));

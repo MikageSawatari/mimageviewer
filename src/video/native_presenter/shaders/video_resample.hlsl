@@ -6,6 +6,7 @@ cbuffer ResampleConstants : register(b0) {
     float4 source_region;  // oriented source origin x/y and extent x/y
     float4 inverse_axes;   // d(raw xy)/d(oriented x), d(raw xy)/d(oriented y)
     float4 inverse_offset; // raw xy at oriented (0,0), unused
+    float4 outside_color;  // opaque RGB code values for source-exterior pixels
 };
 
 struct VsOut {
@@ -39,7 +40,7 @@ float4 ps_horizontal(VsOut input) : SV_Target {
     float source_position = source_region.x
         + input.position.x * source_region.z / target_width - 0.5;
     if (source_position < -0.5 || source_position >= source_axis_x - 0.5) {
-        return float4(0.0, 0.0, 0.0, 1.0);
+        return outside_color;
     }
     float oriented_y = clamp(input.position.y - 0.5, 0.0, source_axis_y - 1.0);
     float stretch = axis_filter.z;
@@ -69,7 +70,7 @@ float4 ps_vertical(VsOut input) : SV_Target {
     float source_position = source_region.y
         + input.position.y * source_region.w / target_height - 0.5;
     if (source_position < -0.5 || source_position >= source_axis_y - 0.5) {
-        return float4(0.0, 0.0, 0.0, 1.0);
+        return outside_color;
     }
     float stretch = axis_filter.w;
     int radius = (int)ceil(3.0 * stretch);
@@ -94,7 +95,7 @@ float4 ps_nearest(VsOut input) : SV_Target {
         + input.position.xy * source_region.zw / source_target.zw - 0.5;
     if (any(oriented_position < float2(-0.5, -0.5))
         || any(oriented_position >= axis_filter.xy - float2(0.5, 0.5))) {
-        return float4(0.0, 0.0, 0.0, 1.0);
+        return outside_color;
     }
     float2 raw_position =
         round(oriented_position.x) * inverse_axes.xy

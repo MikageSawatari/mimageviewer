@@ -1,0 +1,20 @@
+
+running 15 tests
+test app::tests::rating_write_failure_tests::history_trigger_routes_manual_and_all_auto_advance_origins ... ok
+test app::tests::rating_write_failure_tests::a_ring_container_rating_lands_on_the_folder_it_was_opened_in ... ok
+test app::tests::rating_write_failure_tests::failed_rating_undo_keeps_entry_and_display_on_undo_side ... ok
+test app::tests::rating_write_failure_tests::compiled_book_page_rating_undo_redo_never_starts_xmp_writer ... ok
+test app::tests::favorite_adjustment_defaults_tests::the_association_prewarm_runs_once_per_folder_load ... ok
+test app::tests::favorite_adjustment_defaults_tests::a_finished_prewarm_batch_wakes_the_ui_and_starts_the_next_one ... ok
+test app::tests::rating_write_failure_tests::missing_rating_db_does_not_publish_generation_or_optimistic_item_cache ... ok
+test app::tests::rating_write_failure_tests::losing_the_pad_still_records_the_undo_for_a_rating_made_in_the_ring ... ok
+test app::tests::rating_write_failure_tests::ring_rating_failure_does_not_register_phantom_undo ... ok
+test app::tests::favorite_adjustment_defaults_tests::every_extension_in_the_folder_eventually_gets_re_enumerated ... ok
+test app::tests::rating_write_failure_tests::sqlite_write_failure_does_not_publish_container_cache_or_generation ... ok
+test app::tests::rating_write_failure_tests::the_pad_teardown_leaves_the_ring_commit_to_the_normal_dispatch ... ok
+test app::tests::rating_write_failure_tests::ring_rating_registers_only_one_undo_after_durable_success ... ok
+test app::tests::rating_write_failure_tests::failed_rating_redo_keeps_entry_and_display_on_redo_side ... ok
+test app::tests::rating_write_failure_tests::ring_rating_keeps_stable_target_after_items_are_reordered ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 7268 filtered out; finished in 3.19s
+

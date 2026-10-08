@@ -36,7 +36,9 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let args = parse_args()?;
-    let probe = mimageviewer::audio_decode::probe_audio_file(&args.audio)
+    let audio_stream_index = mimageviewer::video::mvexport::default_audio_stream_index(&args.audio)
+        .map_err(|error| format!("音声情報を取得できません: {error}"))?;
+    let probe = mimageviewer::audio_decode::probe_audio_file(&args.audio, audio_stream_index)
         .map_err(|error| format!("音声情報を取得できません: {error}"))?;
     let duration_secs = args.seconds.unwrap_or(probe.duration_secs);
     if !duration_secs.is_finite() || duration_secs <= 0.0 {

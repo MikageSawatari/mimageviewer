@@ -14,6 +14,12 @@ mod mux;
 
 pub use driver::verify_exported_mp4;
 
+/// The audio stream an export decodes. The CLI probes the same stream so its duration
+/// and the exported audio cannot come from different tracks.
+pub fn default_audio_stream_index(path: &Path) -> Result<usize, ExportError> {
+    driver::default_audio_stream_index(path)
+}
+
 /// H.264 エンコーダの選択。`Auto` は Remote 配信と同じ優先順を使う。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum EncoderPreference {

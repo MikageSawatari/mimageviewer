@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::time::Instant;
 
 use mimageviewer::catalog::{self, CatalogDb};
+use mimageviewer::folder_thumb_pins::FolderThumbPinDb;
 use mimageviewer::folder_tree::{
     SUPPORTED_EXTENSIONS, SUPPORTED_VIDEO_EXTENSIONS, is_apple_double,
 };
@@ -362,6 +363,9 @@ fn make_load_request(
                 )),
                 folder_thumb_sort: Some(folder_thumb_sort),
                 folder_thumb_depth,
+                folder_thumb_provenance: Some(
+                    mimageviewer::catalog::FolderThumbProvenance::AutoSelected,
+                ),
                 ..base
             })
         }
@@ -467,6 +471,7 @@ fn run_bench(
     contents: &FolderContents,
     cache_map: Arc<RwLock<HashMap<String, catalog::CacheEntry>>>,
     catalog_arc: Option<Arc<CatalogDb>>,
+    pin_db: Arc<FolderThumbPinDb>,
 ) -> BenchResult {
     let cols = args.cols;
     let rows = args.rows;
@@ -517,6 +522,7 @@ fn run_bench(
         let hint_w = Arc::clone(&scroll_hint);
         let cache_map_w = Arc::clone(&cache_map);
         let catalog_w = catalog_arc.clone();
+        let pin_db_w = Arc::clone(&pin_db);
         let done_w = Arc::clone(&cache_gen_done);
         let display_px_w = Arc::clone(&display_px_shared);
         let stats_w = Arc::clone(&stats);
@@ -576,9 +582,8 @@ fn run_bench(
                             &ke_w,
                             // 静止画 seek UI はベンチ対象外。
                             None,
-                            // ベンチでは folder_thumb_pin DB を使わない (pin-aware
-                            // auto-pick 無し = 純粋 auto-pick で計測)
-                            None,
+                            // Empty but revisioned pin store keeps automatic proofs verifiable.
+                            Some(&pin_db_w),
                             // 編集プレビューキャッシュはベンチ対象外。
                             None,
                             None,
@@ -827,6 +832,12 @@ fn main() {
     println!("Folder scan: {scan_ms:.0} ms");
 
     let cache_dir = catalog::default_cache_dir();
+    // Keep the benchmark's empty pin store stable across runs, so a warm
+    // representative row can validate against the same store instance ID.
+    let pin_db = Arc::new(
+        FolderThumbPinDb::open_at(&cache_dir.join("bench_scroll_empty_folder_pins.db"))
+            .expect("open benchmark pin store"),
+    );
 
     // --delete-cache
     if args.delete_cache {
@@ -857,14 +868,26 @@ fn main() {
     // ── Run 1: キャッシュあり ──
     {
         let cache_map = Arc::new(RwLock::new(full_cache_map));
-        let result = run_bench(&args, &contents, cache_map, catalog_arc.clone());
+        let result = run_bench(
+            &args,
+            &contents,
+            cache_map,
+            catalog_arc.clone(),
+            Arc::clone(&pin_db),
+        );
         print_result("With cache", &result);
     }
 
     // ── Run 2: キャッシュなし ──
     if !args.no_cache {
         let cache_map = Arc::new(RwLock::new(HashMap::new()));
-        let result = run_bench(&args, &contents, cache_map, catalog_arc.clone());
+        let result = run_bench(
+            &args,
+            &contents,
+            cache_map,
+            catalog_arc.clone(),
+            Arc::clone(&pin_db),
+        );
         print_result("Without cache", &result);
     }
 }

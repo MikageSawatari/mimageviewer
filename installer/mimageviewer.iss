@@ -2,7 +2,7 @@
 ; Build: "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\mimageviewer.iss
 
 #define MyAppName "mImageViewer"
-#define MyAppVersion "3.7.0"
+#define MyAppVersion "4.4.0"
 #define MyAppPublisher "Mikage Sawatari"
 #define MyAppURL "https://mikage.to/mimageviewer/"
 #define MyAppExeName "mimageviewer.exe"
@@ -44,7 +44,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 ; 配布する exe はランチャー (`mimageviewer.exe`) のみ。ランチャーは本体
-; `mimageviewer-core.exe`、`mimageviewer-remote.exe` と FFmpeg LGPL DLL を include_bytes! で
+; `mimageviewer-core.exe`、`mimageviewer-remote.exe`、`mimageviewer-epub-pdf.exe` と FFmpeg LGPL DLL を include_bytes! で
 ; 内包しており、初回起動時に %APPDATA%\mimageviewer\runtime\<version>\ へ
 ; 自動展開する。詳細は CLAUDE.md「FFmpeg LGPL DLL 管理」節。
 Source: "..\target\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
@@ -61,6 +61,10 @@ Source: "..\vendor\ffmpeg\LICENSE.txt"; DestDir: "{app}"; DestName: "FFmpeg-LICE
 ; RAR 展開には unrar crate 経由で RARLAB UnRAR ソースを組み込むため、
 ; UnRAR ライセンス本文をインストール先にも配置する。
 Source: "..\UNRAR-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
+; Static RAW and JPEG components: full upstream licenses and attributions.
+Source: "..\LIBRAW-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\ZLIB-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\LIBJPEG-TURBO-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
 ; ローカル差し替えした egui-wgpu を含む egui 0.33.3 のデュアルライセンス本文。
 Source: "..\vendor\egui-wgpu\LICENSE-MIT"; DestDir: "{app}"; DestName: "egui-LICENSE-MIT.txt"; Flags: ignoreversion
 Source: "..\vendor\egui-wgpu\LICENSE-APACHE"; DestDir: "{app}"; DestName: "egui-LICENSE-APACHE.txt"; Flags: ignoreversion

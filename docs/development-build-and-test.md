@@ -13,7 +13,7 @@
 | 実アプリ用の軽量ビルド | `.\scripts\build-dev.ps1` | core と remote service を `dev-runtime` でビルド |
 | 自動操作用の使い捨て環境を準備 | `.\scripts\prepare-portable-smoke.ps1 -TestScript` | 診断portableを別出力先でbuildし、固定sandboxへ配置。起動はしない |
 | 了承済みのリリース前実アプリ検証 | `.\scripts\ui-smoke.ps1 -Scenario <対象> -InteractiveApproved` | [実行確認](interactive-release-verification.md)後だけ。通常の開発反復・test-fullへ自動連結しない |
-| リリース前の自動テスト一式 | `.\scripts\test-full.ps1` | workspace 全体 + テストを持つ補助 bin |
+| リリース前の自動テスト一式 | `.\scripts\test-full.ps1` | workspace 全体 + テストを持つ補助 bin + 除外された vendor 3 crate の lib test |
 | 配布成果物を生成 | `.\scripts\build-dist.ps1` | 全体テスト、clean、release、installer、portable |
 
 テスト名フィルタは実行するテストを絞るだけで、Cargo がコンパイルする target の種類は
@@ -40,6 +40,35 @@ Windowsのクラッシュダイアログだけをそのプロセスで抑え、�
 テストの非ゼロ終了は失敗のままとし、自動再試行や期待値変更は行わない。
 スクリプトの回帰確認は `scripts/test-release-build-safety.ps1` を参照する。
 
+### 長い経過時間を扱う collection テスト
+
+Windows の `Instant` は起動直後に大きな時間を引くと underflow するため、過去の
+`Instant` を `checked_sub(Duration)` と `unwrap()` で作らない。collection read の
+長時間回帰は `TestReadClock::long_elapsed_since(started)` で観測時刻を24時間進める。
+これは `cfg(test)` 限定の thread-local scope で、poll・poll delay と後続 Grid read の時計を差し替え、
+製品ビルドの時計・動作を変えない。終了・panic 時の復元とスレッド分離、時間減算の再導入は
+`collection_store::test_clock::tests` で検査する。実時間の待機期限は通常の `Instant` を使う。
+
+## 検証の担当と結果の再利用
+
+モデル分担・委任・レビューの粒度は [AGENTS.md](../AGENTS.md#model-roles-and-coordination) を正本とする。
+節約するのは重複した調整・実行であり、品質条件や必要な検証範囲は維持する。
+
+- 一まとまりの変更ごとに検証担当を決め、他担当は同じCargo targetへの重複実行を避ける。
+  早期の型確認・焦点テストは行い、関連変更が統合された区切りで広い検証と確認用buildを行う。
+  検証対象ソースの編集は実行中に重ねず、無関係な調査は継続できる。
+- 結果には対象commitまたは未コミット差分、command、feature/profile、必要な環境条件、
+  exit code、実行件数、ログの所在を残す。0件一致・中断・準備成功をテスト成功と扱わない。
+  既存の台帳を更新し、同じ結果を担当ごとに別文書へ転記し続けない。
+- 対象コード・依存関係・build設定・fixture・実行条件が引き続き有効な成功結果は、親と
+  レビュー担当も共有して使う。担当交代や文書のみの更新を理由に同じ検証を再実行しない。
+  古い結果の有効範囲が不明なら確認し、変更の影響に応じて必要な部分を再実行する。
+- 再実行の理由は、変更による失効、失敗の修正、新しい懸念、条件不成立などを短く残す。
+  テスト側の不備と製品の不具合を分け、期待値の緩和で失敗を隠さない。既知の非ゼロ失敗を
+  放置したまま「節約」を理由に完了としない。
+- 全体gate・feature固有テスト・実機検証用buildの要件は既存のまま。検証済み範囲と
+  未検証範囲を分けて報告し、実アプリ操作は明示了承を得た検証枠でのみ実施する。
+
 ## 軽量化している範囲
 
 ### ビルドキャッシュの容量管理
@@ -56,10 +85,24 @@ Windowsのクラッシュダイアログだけをそのプロセスで抑え、�
 削除前に絶対パスが当該repositoryの対象profile配下であることとreparse pointを確認し、
 他系統のビルドや証跡・利用者データに触れない。実施前後の容量と削除対象を記録する。
 
-### テストプロファイル
+実施記録 (2026-09-17): C: の空き 531 GiB → 1,728 GiB。削除対象は `target/debug` (622 GB、
+うち `deps` 394 GB / `incremental` 197 GB)、`target-codex`、`target-portable`、
+`target-portable-test-script`、調査用の入れ子 cargo 出力 3 つ (`codex-v330-p1/debug`、
+`section243-focused-20260915/debug`、`v370-work/debug`)、`mimageviewer-musicvideo` と
+`mimageviewer-xpost` の `target`、統合済み worktree `mimageviewer-dupe` 一式。reparse point は 0 件。
+`dev-runtime`・`release`・検証記録は保持した。`target/debug` を消すとテスト実行体の隣の
+FFmpeg DLL も消えるので、`vendor/ffmpeg/bin/*.dll` を `target/debug/deps/` へ置き直す。
 
-`[profile.test]` は `debug = "line-tables-only"` としている。失敗時の関数名・ソース行付き
-バックトレースは維持し、完全な型デバッグ情報を含む巨大な PDB の生成量を抑える。
+### dev / test プロファイル
+
+`[profile.dev]` は `debug = "line-tables-only"` + `split-debuginfo = "packed"` としている。
+test profile は dev を継承するので、設定は `[profile.dev]` だけに書く。失敗時の関数名・
+ソース行付きバックトレース (panic、cdb のスタック) は維持し、完全な型デバッグ情報を含む
+巨大な PDB / rlib の生成量を抑える。dev と test で設定を分けると、依存クレートが
+`target/debug` に 2 通りビルドされるため、分けない。
+
+デバッガでローカル変数・型情報を見る必要があるときだけ、そのビルドで
+`$env:CARGO_PROFILE_DEV_DEBUG = "full"` を指定する。
 
 ### 実アプリの開発ビルド
 
@@ -76,6 +119,10 @@ Windowsのクラッシュダイアログだけをそのプロセスで抑え、�
   切り替えるものではない
 
 スクリプトは必要な FFmpeg DLL を変更時だけ出力先へコピーし、成果物を起動しない。
+実行中のアプリを停止できない場合は `.\scripts\build-dev.ps1 -PreserveRuntime` を使う。
+出力先と同じ絶対パスの core または remote が実行中なら、停止せずエラーで終了する。
+この指定を省略した場合は、従来どおり同じ出力先のプロセスを停止してからビルドする。
+停止分岐の回帰は `scripts/test-build-dev-safety.ps1` で実プロセスを操作せず確認できる。
 通常profileを汚さない隔離確認が明示的に必要な場合は、同じバイナリへ
 `--data-dir .\target\dev-runtime\data` を渡す。build flavor自体をportableへ変えない。
 C++ VST3 bridge 自体を変更した場合は、従来どおり先にCMakeでbridgeを再ビルドする。
@@ -149,7 +196,18 @@ cargo run --release --features dev-tools --bin bench_search -- --docs 50000
 
 `test-full.ps1` は次のコマンドを実行し、失敗すれば非ゼロで終了する。
 
-`cargo test --workspace --features pack-build-tools --no-fail-fast`
+```powershell
+cargo test --workspace --features pack-build-tools --no-fail-fast
+cargo test --manifest-path vendor/egui/Cargo.toml --lib
+cargo test --manifest-path vendor/egui-wgpu/Cargo.toml --features winit --lib
+cargo test --manifest-path vendor/eframe/Cargo.toml --no-default-features --features wgpu --lib
+```
+
+vendor 3 crate は workspace から除外されているため、各 manifest から無 filter で lib test を実行する。
+egui の判定済み release 列 API、GPU mipmap、native repaint scheduler の回帰をこの経路で保持する。
+`vendor/egui` は既存と同じ 0.33.3 に読み取り API だけを加えたもので、root と standalone の
+`vendor/eframe` / `vendor/egui-wgpu` に同じ path patch を置く。更新時は各 dependency graph が
+同じ local egui を参照することを確認し、直接依存と transitive 依存の型を分裂させない。
 
 workspace 全体、統合テスト、doc testに加え、単体テストを持つpack builder 2本を同じ
 `mimageviewer` libのコンパイル結果で実行する。

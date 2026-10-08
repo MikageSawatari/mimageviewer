@@ -14,6 +14,7 @@ use super::path_guard::{ResolveError, ResolvedPath, resolve_existing};
 
 pub(super) struct ThumbnailEngine {
     settings: Arc<crate::settings::Settings>,
+    io_sem: Arc<crate::io_semaphore::GlobalIoSemaphore>,
     stats: Arc<Mutex<crate::stats::ThumbStats>>,
     inflight: Mutex<HashMap<RequestKey, Arc<Flight>>>,
 }
@@ -98,6 +99,8 @@ struct RequestKey {
     address: RemoteAddress,
     source_address: Option<RemoteAddress>,
     target_px: u32,
+    session: (String, String),
+    admission: crate::catalog::CatalogAdmission,
 }
 
 impl PartialEq for RequestKey {
@@ -105,6 +108,8 @@ impl PartialEq for RequestKey {
         self.address == other.address
             && self.source_address == other.source_address
             && self.target_px == other.target_px
+            && self.session == other.session
+            && self.admission == other.admission
     }
 }
 
@@ -113,6 +118,8 @@ impl Hash for RequestKey {
         self.address.hash(state);
         self.source_address.hash(state);
         self.target_px.hash(state);
+        self.session.hash(state);
+        self.admission.hash(state);
     }
 }
 
@@ -122,8 +129,20 @@ struct Flight {
 }
 
 impl ThumbnailEngine {
+    #[cfg(test)]
     pub(super) fn new(settings: crate::settings::Settings) -> Self {
+        Self::new_with_io_sem(
+            settings,
+            Arc::new(crate::io_semaphore::GlobalIoSemaphore::new(1)),
+        )
+    }
+
+    pub(super) fn new_with_io_sem(
+        settings: crate::settings::Settings,
+        io_sem: Arc<crate::io_semaphore::GlobalIoSemaphore>,
+    ) -> Self {
         Self {
+            io_sem,
             settings: Arc::new(settings),
             stats: Arc::new(Mutex::new(crate::stats::ThumbStats::new())),
             inflight: Mutex::new(HashMap::new()),
@@ -136,11 +155,18 @@ impl ThumbnailEngine {
         request: ThumbnailRequest,
         context: &WorkerContext,
         container_engine: &ContainerEngine,
+        owner: &mimageviewer_ipc::RemoteSessionIdentity,
+        cancellation: &super::session::RemoteOperationCancellation,
     ) -> ThumbnailResponse {
+        let admission =
+            crate::catalog::CatalogAccess::for_cache_dir(&crate::catalog::default_cache_dir())
+                .admit();
         let key = RequestKey {
             address: request.address.clone(),
             source_address: request.source_address.clone(),
             target_px: request.target_px,
+            session: (owner.client_id.clone(), owner.session_id.clone()),
+            admission,
         };
         let (flight, owner) = {
             let mut inflight = self
@@ -174,7 +200,7 @@ impl ThumbnailEngine {
         }
 
         let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.generate(&request, context, container_engine)
+            self.generate(&request, context, container_engine, admission, cancellation)
         }))
         .unwrap_or_else(|_| {
             error_response(
@@ -202,7 +228,15 @@ impl ThumbnailEngine {
         request: &ThumbnailRequest,
         context: &WorkerContext,
         container_engine: &ContainerEngine,
+        admission: crate::catalog::CatalogAdmission,
+        cancellation: &super::session::RemoteOperationCancellation,
     ) -> ThumbnailResponse {
+        if cancellation.is_cancelled() {
+            return error_response(
+                ThumbnailErrorCode::NotReady,
+                "音声サムネイル要求は取り消されました",
+            );
+        }
         if request.target_px == 0 || request.target_px > 4096 {
             return error_response(
                 ThumbnailErrorCode::BadRequest,
@@ -212,17 +246,35 @@ impl ThumbnailEngine {
         if !matches!(request.address.subresource, RemoteSubresource::File)
             || is_container_path(Path::new(&request.address.path))
         {
-            return container_engine.thumbnail(request, context);
+            return container_engine.thumbnail_admitted(
+                request,
+                context,
+                admission,
+                &cancellation.flag(),
+            );
         }
         let resolved = match resolve_existing(&request.address.path) {
             Ok(path) => path,
             Err(error) => return resolve_error_response(error),
+        };
+        let settings = match container_engine.settings_for_listing() {
+            Ok(settings) => settings,
+            Err(_) => {
+                return error_response(
+                    ThumbnailErrorCode::Internal,
+                    "現在の表示設定を取得できませんでした",
+                );
+            }
         };
         match self.generate_resolved(
             &resolved,
             request.source_address.as_ref(),
             request.target_px,
             context,
+            &settings,
+            admission,
+            container_engine.raw_develop_executor(),
+            cancellation,
         ) {
             Ok(webp_bytes) => ThumbnailResponse::Success { webp_bytes },
             Err(error) => error,
@@ -235,9 +287,33 @@ impl ThumbnailEngine {
         source_address: Option<&RemoteAddress>,
         target_px: u32,
         context: &WorkerContext,
+        settings: &crate::settings::Settings,
+        admission: crate::catalog::CatalogAdmission,
+        raw_executor: &crate::raw::RawDevelopExecutor,
+        cancellation: &super::session::RemoteOperationCancellation,
     ) -> Result<Vec<u8>, ThumbnailResponse> {
+        if is_supported_audio(&resolved.canonical) {
+            return self.generate_audio_resolved(
+                resolved,
+                source_address,
+                target_px,
+                context,
+                settings,
+                admission,
+                raw_executor,
+                cancellation,
+            );
+        }
         if is_supported_video(&resolved.canonical) {
-            return self.generate_video_resolved(resolved, source_address, target_px, context);
+            return self.generate_video_resolved_with_settings(
+                resolved,
+                source_address,
+                target_px,
+                context,
+                settings,
+                admission,
+                &cancellation.flag(),
+            );
         }
         if source_address.is_some() {
             return Err(error_response(
@@ -245,14 +321,41 @@ impl ThumbnailEngine {
                 "サムネイル出所は動画にだけ指定できます",
             ));
         }
-        self.generate_catalog_resolved(resolved, target_px, context)
+        self.generate_catalog_resolved_admitted(
+            resolved,
+            target_px,
+            context,
+            admission,
+            &cancellation.flag(),
+        )
     }
 
+    #[cfg(test)]
     fn generate_catalog_resolved(
         &self,
         resolved: &ResolvedPath,
         target_px: u32,
         context: &WorkerContext,
+    ) -> Result<Vec<u8>, ThumbnailResponse> {
+        let admission =
+            crate::catalog::CatalogAccess::for_cache_dir(&crate::catalog::default_cache_dir())
+                .admit();
+        self.generate_catalog_resolved_admitted(
+            resolved,
+            target_px,
+            context,
+            admission,
+            &Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    fn generate_catalog_resolved_admitted(
+        &self,
+        resolved: &ResolvedPath,
+        target_px: u32,
+        context: &WorkerContext,
+        admission: crate::catalog::CatalogAdmission,
+        cancellation: &Arc<AtomicBool>,
     ) -> Result<Vec<u8>, ThumbnailResponse> {
         let metadata = std::fs::metadata(&resolved.canonical)
             .map_err(|_| error_response(ThumbnailErrorCode::NotFound, "対象が見つかりません"))?;
@@ -305,6 +408,8 @@ impl ThumbnailEngine {
             cache_key_override: Some(cache_key),
             folder_thumb_sort: is_folder.then_some(self.settings.folder_thumb_sort),
             folder_thumb_depth: self.settings.folder_thumb_depth,
+            folder_thumb_provenance: is_folder
+                .then_some(crate::catalog::FolderThumbProvenance::AutoSelected),
             ..Default::default()
         };
         if is_folder {
@@ -315,19 +420,50 @@ impl ThumbnailEngine {
             );
         }
 
-        let catalog = Arc::new(
-            crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), parent).map_err(
-                |error| {
-                    crate::logger::log(format!("remote_ipc: catalog open failed: {error}"));
-                    error_response(
-                        ThumbnailErrorCode::Internal,
-                        "サムネイルカタログを開けませんでした",
-                    )
-                },
-            )?,
+        // Resolve a folder representative before the catalog lookup. Remote
+        // accepts any usable RAW preview, and otherwise only reads the catalog.
+        let raw_requirement = crate::thumb_loader::remote_raw_thumbnail_requirement(
+            &load_request,
+            context.folder_pin_db.as_ref(),
         );
+        match raw_requirement {
+            crate::thumb_loader::RemoteRawThumbRequirement::NotRaw => {}
+            crate::thumb_loader::RemoteRawThumbRequirement::PreviewAvailable => {
+                load_request.source_policy = crate::thumb_loader::LoadSourcePolicy::SourceOnly;
+            }
+            crate::thumb_loader::RemoteRawThumbRequirement::CatalogOnly => {
+                load_request.source_policy = crate::thumb_loader::LoadSourcePolicy::CacheOnly;
+            }
+        }
+
+        let cache_dir = crate::catalog::default_cache_dir();
+        let access = crate::catalog::CatalogAccess::for_cache_dir(&cache_dir);
+        let mut catalog = crate::catalog::CatalogDb::open_admitted(&cache_dir, parent, admission)
+            .ok()
+            .map(Arc::new);
+        if matches!(
+            load_request.source_policy,
+            crate::thumb_loader::LoadSourcePolicy::CacheOnly
+        ) && catalog.is_none()
+        {
+            let read_admission = access.wait_read_admission(cancellation).ok_or_else(|| {
+                error_response(
+                    ThumbnailErrorCode::NotReady,
+                    "サムネイル要求は取り消されました",
+                )
+            })?;
+            catalog = crate::catalog::CatalogDb::open_existing_read_only_admitted(
+                &cache_dir,
+                parent,
+                read_admission,
+            )
+            .ok()
+            .flatten()
+            .map(Arc::new);
+        }
         let cache_map = Arc::new(RwLock::new(HashMap::new()));
         if let Some(key) = crate::thumb_loader::cache_key_for_request(&load_request)
+            && let Some(catalog) = &catalog
             && let Ok(Some(entry)) = catalog.load_one(key.as_ref())
             && let Ok(mut map) = cache_map.write()
         {
@@ -336,36 +472,68 @@ impl ThumbnailEngine {
 
         let (tx, rx) = mpsc::channel();
         let done = Arc::new(AtomicUsize::new(0));
-        let cancel = Arc::new(AtomicBool::new(false));
         let keep_start = Arc::new(AtomicUsize::new(0));
         let keep_end = Arc::new(AtomicUsize::new(usize::MAX));
         let effective_target = target_px.min(self.settings.thumb_px.max(1));
+        let (raw_unavailable_tx, raw_unavailable_rx) = mpsc::channel();
+        let raw_handoff =
+            crate::thumb_loader::RawThumbHandoff::RemotePreviewOnly(raw_unavailable_tx);
+        let cache_decision = if matches!(
+            raw_requirement,
+            crate::thumb_loader::RemoteRawThumbRequirement::NotRaw
+        ) {
+            crate::thumb_loader::CacheDecision::from_settings(&self.settings)
+        } else {
+            // A small Remote preview must not replace a PC half-developed row.
+            crate::thumb_loader::CacheDecision::without_thumbnail()
+        };
         crate::thumb_loader::process_load_request(
-            &load_request,
+            &mut load_request,
             &cache_map,
             &tx,
-            Some(&catalog),
+            catalog.as_ref(),
             self.settings.thumb_px,
             self.settings.thumb_quality,
             effective_target,
-            crate::thumb_loader::CacheDecision::from_settings(&self.settings),
+            cache_decision,
             &done,
             &self.stats,
-            Some(&cancel),
+            Some(cancellation),
             &keep_start,
             &keep_end,
             None,
             context.folder_pin_db.as_ref(),
             None,
             context.adjustment_db.as_ref(),
+            Some(&raw_handoff),
         );
+        if matches!(
+            raw_unavailable_rx.try_recv(),
+            Ok(crate::thumb_loader::RawThumbUnavailable::NeedsHalfDevelopment)
+        ) {
+            return Err(error_response(
+                ThumbnailErrorCode::NoThumbnail,
+                "RAW に使えるサムネイルがありません",
+            ));
+        }
         drop(tx);
         let color_image = rx
             .into_iter()
-            .find_map(|message| (!message.finalized && !message.canceled).then_some(message.image))
-            .flatten()
+            .find_map(|message| match message.payload {
+                crate::thumb_loader::ThumbMsgPayload::Pixels(pixels) => Some(pixels.image),
+                _ => None,
+            })
             .ok_or_else(|| {
-                if is_folder {
+                if matches!(
+                    raw_requirement,
+                    crate::thumb_loader::RemoteRawThumbRequirement::CatalogOnly
+                        | crate::thumb_loader::RemoteRawThumbRequirement::PreviewAvailable
+                ) {
+                    error_response(
+                        ThumbnailErrorCode::NoThumbnail,
+                        "RAW に使えるサムネイルがありません",
+                    )
+                } else if is_folder {
                     // process_load_request 内の本体共通 resolve_folder_thumb_image が
                     // None を返した結果。Web 独自探索ではなく、本体 UI と同じ条件で
                     // 代表画像が無いことを 404 として区別する。
@@ -413,12 +581,199 @@ impl ThumbnailEngine {
         })
     }
 
+    fn generate_audio_resolved(
+        &self,
+        resolved: &ResolvedPath,
+        source_address: Option<&RemoteAddress>,
+        target_px: u32,
+        context: &WorkerContext,
+        settings: &crate::settings::Settings,
+        admission: crate::catalog::CatalogAdmission,
+        raw_executor: &crate::raw::RawDevelopExecutor,
+        cancellation: &super::session::RemoteOperationCancellation,
+    ) -> Result<Vec<u8>, ThumbnailResponse> {
+        let cancel_flag = cancellation.flag();
+        let _io_permit = self
+            .io_sem
+            .acquire_cancellable(crate::io_semaphore::IoPriority::Normal, &cancel_flag)
+            .ok_or_else(|| {
+                error_response(
+                    ThumbnailErrorCode::NotReady,
+                    "音声サムネイル要求は取り消されました",
+                )
+            })?;
+        let sidecar = match source_address {
+            Some(source) => self.resolve_media_sidecar(resolved, source, settings)?,
+            None => None,
+        };
+        let original_stamp = thumbnail_source_stamp(&resolved.logical)?;
+        // Keep successful sidecar pixels on the existing image catalog/RAW-preview
+        // path. A failed decode needs source classification: its channel terminal
+        // deliberately carries no error detail, so it alone cannot authorize fallback.
+        if let Some(sidecar) = &sidecar {
+            let sidecar_stamp = thumbnail_source_stamp(&sidecar.logical)?;
+            let result = self.generate_catalog_resolved_admitted(
+                sidecar,
+                target_px,
+                context,
+                admission,
+                &cancel_flag,
+            );
+            if cancellation.is_cancelled() {
+                return Err(error_response(
+                    ThumbnailErrorCode::NotReady,
+                    "音声サムネイル要求は取り消されました",
+                ));
+            }
+            let invalid = match &result {
+                Err(ThumbnailResponse::Error(ThumbnailError {
+                    code: ThumbnailErrorCode::NoThumbnail,
+                    ..
+                })) => true,
+                Err(ThumbnailResponse::Error(ThumbnailError {
+                    code: ThumbnailErrorCode::GenerationFailed,
+                    ..
+                })) => {
+                    let usable = if crate::raw_format::is_raw_path(&sidecar.logical) {
+                        // Diagnostic classification must not promote a Remote preview
+                        // request into a new half-development job.
+                        crate::raw::raw_decoder::preview(crate::raw::RawSource::Path(
+                            &sidecar.logical,
+                        ))
+                        .map(|_| true)
+                    } else {
+                        crate::thumb_loader::decode_image_for_thumb_with_dims(
+                            &sidecar.logical,
+                            target_px,
+                            raw_executor,
+                        )
+                        .map(|image| image.is_some())
+                    };
+                    match usable {
+                        Ok(usable) => !usable,
+                        Err(
+                            crate::raw::RawError::Corrupt(_)
+                            | crate::raw::RawError::Unsupported(_)
+                            | crate::raw::RawError::NoUsablePreview(_)
+                            | crate::raw::RawError::TooLarge,
+                        ) => true,
+                        Err(crate::raw::RawError::Cancelled | crate::raw::RawError::Stale) => {
+                            return Err(error_response(
+                                ThumbnailErrorCode::NotReady,
+                                "音声サムネイル要求は取り消されました",
+                            ));
+                        }
+                        Err(error) => {
+                            return Err(error_response(
+                                ThumbnailErrorCode::GenerationFailed,
+                                format!("audio sidecar: {error}"),
+                            ));
+                        }
+                    }
+                }
+                _ => false,
+            };
+            if cancellation.is_cancelled() {
+                return Err(error_response(
+                    ThumbnailErrorCode::NotReady,
+                    "音声サムネイル要求は取り消されました",
+                ));
+            }
+            if thumbnail_source_stamp(&resolved.logical)? != original_stamp
+                || thumbnail_source_stamp(&sidecar.logical)? != sidecar_stamp
+            {
+                return Err(error_response(
+                    ThumbnailErrorCode::GenerationFailed,
+                    "サムネイル生成中に出所が変更されました",
+                ));
+            }
+            if !invalid {
+                return result;
+            }
+            crate::logger::log(format!(
+                "remote_ipc: invalid audio sidecar fallback path={}",
+                sidecar.logical.display()
+            ));
+        }
+        let pixels = crate::audio_thumbnail::generate(
+            &resolved.logical,
+            None,
+            settings,
+            crate::thumb_loader::LoadSourcePolicy::CacheOrSource,
+            admission,
+            target_px,
+            &|| cancellation.is_cancelled(),
+        )
+        .map_err(|error| match error {
+            crate::audio_thumbnail::AudioThumbnailError::Canceled => error_response(
+                ThumbnailErrorCode::NotReady,
+                "音声サムネイル要求は取り消されました",
+            ),
+            crate::audio_thumbnail::AudioThumbnailError::Failed(message) => {
+                error_response(ThumbnailErrorCode::GenerationFailed, message)
+            }
+        })?;
+        if thumbnail_source_stamp(&resolved.logical)? != original_stamp {
+            return Err(error_response(
+                ThumbnailErrorCode::GenerationFailed,
+                "サムネイル生成中に出所が変更されました",
+            ));
+        }
+        let pixels = pixels.ok_or_else(|| {
+            error_response(
+                ThumbnailErrorCode::NoThumbnail,
+                "音声ファイルに画像がありません",
+            )
+        })?;
+        let image = color_image_to_dynamic(&pixels.image).ok_or_else(|| {
+            error_response(
+                ThumbnailErrorCode::GenerationFailed,
+                "画像変換に失敗しました",
+            )
+        })?;
+        crate::catalog::encode_thumb_webp(
+            &image,
+            target_px.min(settings.thumb_px.max(1)),
+            settings.thumb_quality as f32,
+        )
+        .map(|(bytes, _, _)| bytes)
+        .ok_or_else(|| {
+            error_response(
+                ThumbnailErrorCode::GenerationFailed,
+                "WebP エンコードに失敗しました",
+            )
+        })
+    }
+
+    #[cfg(test)]
     fn generate_video_resolved(
         &self,
         resolved: &ResolvedPath,
         source_address: Option<&RemoteAddress>,
         target_px: u32,
         context: &WorkerContext,
+    ) -> Result<Vec<u8>, ThumbnailResponse> {
+        self.generate_video_resolved_with_settings(
+            resolved,
+            source_address,
+            target_px,
+            context,
+            &self.settings,
+            crate::catalog::CatalogAccess::for_cache_dir(&crate::catalog::default_cache_dir())
+                .admit(),
+            &Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    fn generate_video_resolved_with_settings(
+        &self,
+        resolved: &ResolvedPath,
+        source_address: Option<&RemoteAddress>,
+        target_px: u32,
+        context: &WorkerContext,
+        settings: &crate::settings::Settings,
+        admission: crate::catalog::CatalogAdmission,
+        cancellation: &Arc<AtomicBool>,
     ) -> Result<Vec<u8>, ThumbnailResponse> {
         let metadata = std::fs::metadata(&resolved.canonical)
             .map_err(|_| error_response(ThumbnailErrorCode::NotFound, "対象が見つかりません"))?;
@@ -448,9 +803,15 @@ impl ThumbnailEngine {
         }
 
         if let Some(source_address) = source_address
-            && let Some(sidecar) = self.resolve_video_sidecar(resolved, source_address)?
+            && let Some(sidecar) = self.resolve_media_sidecar(resolved, source_address, settings)?
         {
-            return self.generate_catalog_resolved(&sidecar, target_px, context);
+            return self.generate_catalog_resolved_admitted(
+                &sidecar,
+                target_px,
+                context,
+                admission,
+                cancellation,
+            );
         }
 
         let effective_target = target_px.min(self.settings.thumb_px.max(1));
@@ -496,13 +857,22 @@ impl ThumbnailEngine {
         })
     }
 
+    #[cfg(test)]
     fn resolve_video_sidecar(
         &self,
         video: &ResolvedPath,
         source_address: &RemoteAddress,
     ) -> Result<Option<ResolvedPath>, ThumbnailResponse> {
-        if !self.settings.skip_image_if_video_exists || !self.settings.video_thumb_use_sidecar_image
-        {
+        self.resolve_media_sidecar(video, source_address, &self.settings)
+    }
+
+    fn resolve_media_sidecar(
+        &self,
+        video: &ResolvedPath,
+        source_address: &RemoteAddress,
+        settings: &crate::settings::Settings,
+    ) -> Result<Option<ResolvedPath>, ThumbnailResponse> {
+        if !settings.skip_image_if_video_exists || !settings.video_thumb_use_sidecar_image {
             return Ok(None);
         }
         source_address.validate_syntax().map_err(|error| {
@@ -527,7 +897,34 @@ impl ThumbnailEngine {
             return Ok(None);
         }
 
-        let sidecar = resolve_existing(&source_address.path).map_err(resolve_error_response)?;
+        let hinted = Path::new(&source_address.path);
+        let logical_parent_matches =
+            hinted
+                .parent()
+                .zip(video.logical.parent())
+                .is_some_and(|(a, b)| {
+                    crate::path_key::normalize_keep_drive(a)
+                        == crate::path_key::normalize_keep_drive(b)
+                });
+        let logical_stem_matches = file_stem_lower(hinted)
+            .zip(file_stem_lower(&video.logical))
+            .is_some_and(|(a, b)| a == b);
+        if !logical_parent_matches || !logical_stem_matches || !is_supported_image(hinted) {
+            return Err(error_response(
+                ThumbnailErrorCode::PathRejected,
+                "同じフォルダ・stem の画像だけを使用できます",
+            ));
+        }
+        let sidecar = match resolve_existing(&source_address.path) {
+            Ok(source) => source,
+            Err(ResolveError::Unavailable)
+                if std::fs::metadata(hinted)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(resolve_error_response(error)),
+        };
         let same_parent = sidecar
             .canonical
             .parent()
@@ -577,7 +974,20 @@ fn apply_supported_folder_pin(
         // ZIP / PDF / 動画は今回の縦串増分の明示的な非スコープ。
         _ => return,
     };
-    let Some(base_key) = request.cache_key_override.as_deref() else {
+    let provenance = if matches!(resolved.kind, ResolvedKind::Folder) {
+        crate::catalog::FolderThumbProvenance::AutoSelected
+    } else {
+        crate::catalog::FolderThumbProvenance::Seeded
+    };
+    let Some(base_key) = crate::thumb_loader::folder_thumb_cache_key_for_path(
+        container,
+        container
+            .parent()
+            .is_some_and(crate::path_key::is_drive_or_share_root),
+        request.folder_thumb_sort.unwrap_or_default(),
+        request.folder_thumb_depth,
+        provenance,
+    ) else {
         return;
     };
     request.cache_key_override = Some(format!(
@@ -589,6 +999,7 @@ fn apply_supported_folder_pin(
     request.mtime = resolved.mtime;
     request.file_size = resolved.file_size;
     request.resolve_override = Some(strategy);
+    request.folder_thumb_provenance = Some(provenance);
 }
 
 fn color_image_to_dynamic(image: &egui::ColorImage) -> Option<image::DynamicImage> {
@@ -621,12 +1032,13 @@ fn file_stem_lower(path: &Path) -> Option<String> {
 }
 
 fn is_container_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            let extension = extension.to_ascii_lowercase();
-            extension == "pdf" || crate::folder_tree::is_zip_extension(&extension)
-        })
+    crate::folder_tree::is_paged_document_path(path)
+        || path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                crate::folder_tree::is_zip_extension(&extension.to_ascii_lowercase())
+            })
 }
 
 fn resolve_error_response(error: ResolveError) -> ThumbnailResponse {
@@ -652,6 +1064,288 @@ fn error_response(code: ThumbnailErrorCode, message: impl Into<String>) -> Thumb
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn remote_raw_thumbnail_uses_small_preview_without_half_development() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let folder = data_dir.path().join("remote-raw-thumbnail");
+        std::fs::create_dir_all(&folder).unwrap();
+        let source = Path::new("vendor/raw-samples/1018.cr2");
+        assert!(source.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let path = folder.join("page.cr2");
+        std::fs::copy(source, &path).unwrap();
+        let mut settings = crate::settings::Settings::default();
+        settings.thumb_px = 2048;
+        let engine = ThumbnailEngine::new(settings);
+        let context = WorkerContext::open();
+        let resolved = resolve_existing(path.to_string_lossy().as_ref()).unwrap();
+        let preview = crate::raw::raw_decoder::preview(crate::raw::RawSource::Path(&path)).unwrap();
+        assert!(preview.image.width().max(preview.image.height()) < 2048);
+        let catalog =
+            crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &folder).unwrap();
+        let cached = image::DynamicImage::new_rgb8(8, 8);
+        let webp = crate::catalog::encode_thumb_webp(&cached, 8, 80.0)
+            .unwrap()
+            .0;
+        let metadata = std::fs::metadata(&path).unwrap();
+        catalog
+            .save(
+                "page.cr2",
+                crate::ui_helpers::mtime_secs(&metadata),
+                metadata.len() as i64,
+                8,
+                8,
+                Some((8, 8)),
+                &webp,
+            )
+            .unwrap();
+        let bytes = engine
+            .generate_catalog_resolved(&resolved, 2048, &context)
+            .unwrap();
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        assert!(decoded.width().max(decoded.height()) > 8);
+        let saved = catalog.load_one("page.cr2").unwrap().unwrap();
+        let saved = image::load_from_memory(&saved.jpeg_data).unwrap();
+        assert_eq!((saved.width(), saved.height()), (8, 8));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remote_raw_without_preview_uses_catalog_only_or_no_thumbnail() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let folder = data_dir.path().join("remote-raw-catalog-only");
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("page.cr2");
+        std::fs::write(&path, b"invalid raw with no preview").unwrap();
+        let engine = ThumbnailEngine::new(crate::settings::Settings::default());
+        let context = WorkerContext::open();
+        let resolved = resolve_existing(path.to_string_lossy().as_ref()).unwrap();
+        let missing = engine.generate_catalog_resolved(&resolved, 256, &context);
+        assert!(matches!(
+            missing,
+            Err(ThumbnailResponse::Error(ThumbnailError {
+                code: ThumbnailErrorCode::NoThumbnail,
+                ..
+            }))
+        ));
+
+        let catalog =
+            crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &folder).unwrap();
+        let cached = image::DynamicImage::new_rgb8(8, 8);
+        let webp = crate::catalog::encode_thumb_webp(&cached, 8, 80.0)
+            .unwrap()
+            .0;
+        let metadata = std::fs::metadata(&path).unwrap();
+        catalog
+            .save(
+                "page.cr2",
+                crate::ui_helpers::mtime_secs(&metadata),
+                metadata.len() as i64,
+                8,
+                8,
+                Some((8, 8)),
+                &webp,
+            )
+            .unwrap();
+        let bytes = engine
+            .generate_catalog_resolved(&resolved, 256, &context)
+            .unwrap();
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (8, 8));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cached_raw_folder_representative_with_no_preview_uses_catalog() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = data_dir.path().join("remote-cached-raw-folder");
+        let folder = root.join("pages");
+        std::fs::create_dir_all(&folder).unwrap();
+        let raw_path = folder.join("page.cr2");
+        std::fs::write(&raw_path, b"invalid raw with no preview").unwrap();
+        let mut settings = crate::settings::Settings::default();
+        settings.thumb_px = 2048;
+        let engine = ThumbnailEngine::new(settings);
+        let resolved = resolve_existing(folder.to_string_lossy().as_ref()).unwrap();
+        let context = WorkerContext::open();
+        assert!(matches!(
+            engine.generate_catalog_resolved(&resolved, 2048, &context),
+            Err(ThumbnailResponse::Error(ThumbnailError {
+                code: ThumbnailErrorCode::NoThumbnail,
+                ..
+            }))
+        ));
+        let key = crate::thumb_loader::folder_thumb_auto_cache_key_for_path(
+            &resolved.logical,
+            false,
+            engine.settings.folder_thumb_sort,
+            engine.settings.folder_thumb_depth,
+        )
+        .unwrap();
+        let catalog =
+            crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &root).unwrap();
+        let cached = image::DynamicImage::new_rgb8(8, 8);
+        let webp = crate::catalog::encode_thumb_webp(&cached, 8, 80.0)
+            .unwrap()
+            .0;
+        let meta = std::fs::metadata(&folder).unwrap();
+        let raw_meta = std::fs::metadata(&raw_path).unwrap();
+        let proof = crate::catalog::FolderSelectionProof {
+            directories: Vec::new(),
+            pin_store: crate::catalog::PinStoreProof::NotConsulted,
+            winner: crate::catalog::FolderSelectionWinner {
+                path: raw_path,
+                mtime: crate::ui_helpers::mtime_secs(&raw_meta),
+                file_size: raw_meta.len() as i64,
+                archive_row_key: None,
+            },
+        };
+        catalog
+            .save_auto_folder_bytes(
+                &key,
+                crate::ui_helpers::mtime_secs(&meta),
+                0,
+                Some((8, 8)),
+                None,
+                &webp,
+                Some(&proof),
+            )
+            .unwrap();
+        assert!(catalog.load_one(&key).unwrap().is_some());
+        let bytes = engine
+            .generate_catalog_resolved(&resolved, 2048, &context)
+            .unwrap();
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (8, 8));
+    }
+
+    #[test]
+    fn remote_folder_pins_use_typed_seeded_and_auto_keys() {
+        use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("folder");
+        let child = root.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(root.join("cover.jpg"), b"not decoded").unwrap();
+        let db = crate::folder_thumb_pins::FolderThumbPinDb::open_at(&temp.path().join("pins.db"))
+            .unwrap();
+        let make_request = || crate::thumb_loader::LoadRequest {
+            path: root.clone(),
+            cache_key_override: crate::thumb_loader::folder_thumb_auto_cache_key_for_path(
+                &root,
+                false,
+                crate::settings::SortOrder::Numeric,
+                3,
+            ),
+            folder_thumb_sort: Some(crate::settings::SortOrder::Numeric),
+            folder_thumb_depth: 3,
+            folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::AutoSelected),
+            ..Default::default()
+        };
+        db.set(
+            &root,
+            &FolderPinSource::File {
+                rel: "cover.jpg".to_owned(),
+                kind: FileKind::Image,
+            },
+        )
+        .unwrap();
+        let mut image_pin = make_request();
+        apply_supported_folder_pin(&mut image_pin, &root, Some(&db));
+        assert_eq!(
+            image_pin.folder_thumb_provenance,
+            Some(crate::catalog::FolderThumbProvenance::Seeded)
+        );
+        assert!(
+            image_pin
+                .cache_key_override
+                .as_deref()
+                .unwrap()
+                .contains("auto-v2")
+        );
+
+        db.set(
+            &root,
+            &FolderPinSource::File {
+                rel: "child".to_owned(),
+                kind: FileKind::Folder,
+            },
+        )
+        .unwrap();
+        let mut folder_pin = make_request();
+        apply_supported_folder_pin(&mut folder_pin, &root, Some(&db));
+        assert_eq!(
+            folder_pin.folder_thumb_provenance,
+            Some(crate::catalog::FolderThumbProvenance::AutoSelected)
+        );
+        assert!(
+            folder_pin
+                .cache_key_override
+                .as_deref()
+                .unwrap()
+                .contains("auto-v3")
+        );
+    }
+
+    #[test]
+    fn remote_folder_round_trip_reselects_after_archive_tile_write() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = data_dir.path().join("library");
+        let child = root.join("20-child");
+        std::fs::create_dir_all(&child).unwrap();
+        let red = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            8,
+            8,
+            image::Rgba([230, 20, 20, 255]),
+        ));
+        red.save(child.join("cover.png")).unwrap();
+        let archive = root.join("10-book.cbz");
+        std::fs::write(&archive, b"invalid archive bytes").unwrap();
+        let mut settings = crate::settings::Settings::default();
+        settings.cache_policy = crate::settings::CachePolicy::Always;
+        settings.folder_thumb_sort = crate::settings::SortOrder::Numeric;
+        let engine = ThumbnailEngine::new(settings);
+        let context = WorkerContext::open();
+        let resolved = resolve_existing(root.to_string_lossy().as_ref()).unwrap();
+        let first = engine
+            .generate_catalog_resolved(&resolved, 64, &context)
+            .unwrap();
+        let pixel = image::load_from_memory(&first)
+            .unwrap()
+            .to_rgba8()
+            .get_pixel(0, 0)
+            .0;
+        assert!(pixel[0] > pixel[2], "initial representative should be red");
+
+        let blue = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            8,
+            8,
+            image::Rgba([20, 20, 230, 255]),
+        ));
+        let webp = crate::catalog::encode_thumb_webp(&blue, 8, 80.0).unwrap().0;
+        let meta = std::fs::metadata(&archive).unwrap();
+        let catalog =
+            crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &root).unwrap();
+        catalog
+            .save_thumb_bytes(
+                "zipthumb:10-book.cbz",
+                crate::ui_helpers::mtime_secs(&meta),
+                meta.len() as i64,
+                Some((8, 8)),
+                &webp,
+            )
+            .unwrap();
+        let second = engine
+            .generate_catalog_resolved(&resolved, 64, &context)
+            .unwrap();
+        let pixel = image::load_from_memory(&second)
+            .unwrap()
+            .to_rgba8()
+            .get_pixel(0, 0)
+            .0;
+        assert!(pixel[2] > pixel[0], "new archive tile should win on reload");
+    }
+
     fn worker_context_with_video_pin(
         video_pin_db: Option<crate::video_pins::VideoPinDb>,
     ) -> WorkerContext {
@@ -669,11 +1363,304 @@ mod tests {
     }
 
     #[test]
+    fn audio_sidecar_flac_preserves_audio_address_and_falls_back_after_removal_or_disable() {
+        let _data = crate::data_dir::TestDataDirGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let audio = temp.path().join("song.flac");
+        let sidecar = temp.path().join("song.png");
+        std::fs::write(&audio, b"audio").unwrap();
+        image::DynamicImage::new_rgb8(12, 8).save(&sidecar).unwrap();
+        let settings = crate::settings::Settings::default();
+        let engine = ThumbnailEngine::new(settings.clone());
+        let context = WorkerContext::without_databases();
+        let (cancel, _wake) = super::super::session::RemoteOperationCancellation::for_test();
+        let raw_executor = crate::raw::RawDevelopExecutor::new(1).unwrap();
+        let resolved = resolve_existing(audio.to_string_lossy().as_ref()).unwrap();
+        let hint = RemoteAddress::file(sidecar.to_string_lossy().into_owned());
+        let admission =
+            crate::catalog::CatalogAccess::for_cache_dir(&crate::catalog::default_cache_dir())
+                .admit();
+        let bytes = engine
+            .generate_audio_resolved(
+                &resolved,
+                Some(&hint),
+                64,
+                &context,
+                &settings,
+                admission,
+                &raw_executor,
+                &cancel,
+            )
+            .unwrap();
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (12, 8));
+        let mut disabled = settings.clone();
+        disabled.video_thumb_use_sidecar_image = false;
+        let result = engine.generate_audio_resolved(
+            &resolved,
+            Some(&hint),
+            64,
+            &context,
+            &disabled,
+            admission,
+            &raw_executor,
+            &cancel,
+        );
+        assert!(matches!(
+            result,
+            Err(ThumbnailResponse::Error(ThumbnailError {
+                code: ThumbnailErrorCode::NoThumbnail,
+                ..
+            }))
+        ));
+        std::fs::remove_file(&sidecar).unwrap();
+        let result = engine.generate_audio_resolved(
+            &resolved,
+            Some(&hint),
+            64,
+            &context,
+            &settings,
+            admission,
+            &raw_executor,
+            &cancel,
+        );
+        assert!(matches!(
+            result,
+            Err(ThumbnailResponse::Error(ThumbnailError {
+                code: ThumbnailErrorCode::NoThumbnail,
+                ..
+            }))
+        ));
+        assert_eq!(resolved.logical.file_name().unwrap(), "song.flac");
+    }
+
+    #[test]
+    fn invalid_audio_sidecar_falls_back_to_embedded_mp3_and_flac_no_art() {
+        let _data = crate::data_dir::TestDataDirGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(12, 8)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let mut picture = b"\0image/png\0\x03\0".to_vec();
+        picture.extend(png.into_inner());
+        let mut tag = b"APIC".to_vec();
+        tag.extend((picture.len() as u32).to_be_bytes());
+        tag.extend([0, 0]);
+        tag.extend(picture);
+        let size = tag.len() as u32;
+        let mut bytes = b"ID3\x03\0\0".to_vec();
+        bytes.extend([
+            (size >> 21) as u8 & 127,
+            (size >> 14) as u8 & 127,
+            (size >> 7) as u8 & 127,
+            size as u8 & 127,
+        ]);
+        bytes.extend(tag);
+        let settings = crate::settings::Settings::default();
+        let engine = ThumbnailEngine::new(settings.clone());
+        let context = WorkerContext::without_databases();
+        let (cancel, _wake) = super::super::session::RemoteOperationCancellation::for_test();
+        let raw_executor = crate::raw::RawDevelopExecutor::new(1).unwrap();
+        let admission =
+            crate::catalog::CatalogAccess::for_cache_dir(&crate::catalog::default_cache_dir())
+                .admit();
+        for extension in ["mp3", "flac"] {
+            let audio = temp.path().join(format!("song.{extension}"));
+            std::fs::write(
+                &audio,
+                if extension == "mp3" {
+                    bytes.as_slice()
+                } else {
+                    b"audio"
+                },
+            )
+            .unwrap();
+            let sidecar = temp.path().join("song.png");
+            std::fs::write(&sidecar, b"corrupt PNG").unwrap();
+            let resolved = resolve_existing(audio.to_string_lossy().as_ref()).unwrap();
+            let hint = RemoteAddress::file(sidecar.to_string_lossy().into_owned());
+            let result = engine.generate_audio_resolved(
+                &resolved,
+                Some(&hint),
+                64,
+                &context,
+                &settings,
+                admission,
+                &raw_executor,
+                &cancel,
+            );
+            if extension == "mp3" {
+                let image = image::load_from_memory(&result.unwrap()).unwrap();
+                assert_eq!((image.width(), image.height()), (12, 8));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(ThumbnailResponse::Error(ThumbnailError {
+                        code: ThumbnailErrorCode::NoThumbnail,
+                        ..
+                    }))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn missing_audio_sidecar_falls_back_to_embedded_mp3_and_flac_no_art() {
+        let _data = crate::data_dir::TestDataDirGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(12, 8)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let mut picture = b"\0image/png\0\x03\0".to_vec();
+        picture.extend(png.into_inner());
+        let mut tag = b"APIC".to_vec();
+        tag.extend((picture.len() as u32).to_be_bytes());
+        tag.extend([0, 0]);
+        tag.extend(picture);
+        let size = tag.len() as u32;
+        let mut bytes = b"ID3\x03\0\0".to_vec();
+        bytes.extend([
+            (size >> 21) as u8 & 127,
+            (size >> 14) as u8 & 127,
+            (size >> 7) as u8 & 127,
+            size as u8 & 127,
+        ]);
+        bytes.extend(tag);
+        let settings = crate::settings::Settings::default();
+        let engine = ThumbnailEngine::new(settings.clone());
+        let context = WorkerContext::without_databases();
+        let (cancel, _wake) = super::super::session::RemoteOperationCancellation::for_test();
+        let raw_executor = crate::raw::RawDevelopExecutor::new(1).unwrap();
+        let admission =
+            crate::catalog::CatalogAccess::for_cache_dir(&crate::catalog::default_cache_dir())
+                .admit();
+        for extension in ["mp3", "flac"] {
+            let audio = temp.path().join(format!("song.{extension}"));
+            std::fs::write(
+                &audio,
+                if extension == "mp3" {
+                    bytes.as_slice()
+                } else {
+                    b"audio"
+                },
+            )
+            .unwrap();
+            let sidecar = temp.path().join("song.png");
+            std::fs::write(&sidecar, b"previously discovered sidecar").unwrap();
+            std::fs::remove_file(&sidecar).unwrap();
+            let resolved = resolve_existing(audio.to_string_lossy().as_ref()).unwrap();
+            let hint = RemoteAddress::file(sidecar.to_string_lossy().into_owned());
+            let result = engine.generate_audio_resolved(
+                &resolved,
+                Some(&hint),
+                64,
+                &context,
+                &settings,
+                admission,
+                &raw_executor,
+                &cancel,
+            );
+            if extension == "mp3" {
+                let image = image::load_from_memory(&result.unwrap()).unwrap();
+                assert_eq!((image.width(), image.height()), (12, 8));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(ThumbnailResponse::Error(ThumbnailError {
+                        code: ThumbnailErrorCode::NoThumbnail,
+                        ..
+                    }))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn audio_sidecar_rejects_other_stem_without_hiding_path_violation() {
+        let temp = tempfile::tempdir().unwrap();
+        let audio = temp.path().join("song.mp3");
+        std::fs::write(&audio, b"audio").unwrap();
+        let engine = ThumbnailEngine::new(crate::settings::Settings::default());
+        let resolved = resolve_existing(audio.to_string_lossy().as_ref()).unwrap();
+        let result = engine.resolve_media_sidecar(
+            &resolved,
+            &RemoteAddress::file(temp.path().join("other.jpg").to_string_lossy().into_owned()),
+            &engine.settings,
+        );
+        assert!(matches!(
+            result,
+            Err(ThumbnailResponse::Error(ThumbnailError {
+                code: ThumbnailErrorCode::PathRejected,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn missing_audio_sidecar_still_rejects_wrong_parent_stem_extension_and_subresource() {
+        let temp = tempfile::tempdir().unwrap();
+        let audio = temp.path().join("song.mp3");
+        std::fs::write(&audio, b"audio").unwrap();
+        let other_parent = temp.path().join("other");
+        std::fs::create_dir(&other_parent).unwrap();
+        let engine = ThumbnailEngine::new(crate::settings::Settings::default());
+        let resolved = resolve_existing(audio.to_string_lossy().as_ref()).unwrap();
+        for hint in [
+            RemoteAddress::file(other_parent.join("song.jpg").to_string_lossy().into_owned()),
+            RemoteAddress::file(temp.path().join("other.jpg").to_string_lossy().into_owned()),
+            RemoteAddress::file(temp.path().join("song.txt").to_string_lossy().into_owned()),
+        ] {
+            assert!(!Path::new(&hint.path).exists());
+            assert!(matches!(
+                engine.resolve_media_sidecar(&resolved, &hint, &engine.settings),
+                Err(ThumbnailResponse::Error(ThumbnailError {
+                    code: ThumbnailErrorCode::PathRejected,
+                    ..
+                }))
+            ));
+        }
+        let hint = RemoteAddress {
+            path: temp.path().join("song.jpg").to_string_lossy().into_owned(),
+            subresource: RemoteSubresource::PdfPage { page_number: 0 },
+        };
+        assert!(matches!(
+            engine.resolve_media_sidecar(&resolved, &hint, &engine.settings),
+            Err(ThumbnailResponse::Error(ThumbnailError {
+                code: ThumbnailErrorCode::BadRequest,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn flights_do_not_merge_session_or_catalog_admission_epochs() {
+        let first = RequestKey {
+            address: RemoteAddress::file("C:/Music/song.mp3"),
+            source_address: None,
+            target_px: 128,
+            session: ("client".into(), "session-a".into()),
+            admission: crate::catalog::CatalogAdmission::Admitted(1),
+        };
+        let mut second = first.clone();
+        second.session.1 = "session-b".into();
+        assert!(first != second);
+        second = first.clone();
+        second.admission = crate::catalog::CatalogAdmission::Admitted(2);
+        assert!(first != second);
+        second.admission = crate::catalog::CatalogAdmission::DisplayOnly(1);
+        assert!(first != second);
+    }
+
+    #[test]
     fn identical_requests_share_one_flight() {
         let key = RequestKey {
             address: RemoteAddress::file("C:/Pictures/b.jpg"),
             source_address: None,
             target_px: 128,
+            session: ("client".into(), "session".into()),
+            admission: crate::catalog::CatalogAdmission::Admitted(0),
         };
         let mut map = HashMap::new();
         let flight = Arc::new(Flight {
@@ -747,4 +1734,21 @@ mod tests {
             })
         ));
     }
+}
+
+fn is_supported_audio(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "mp3" | "m4a" | "flac" | "aac" | "ogg" | "opus" | "wav" | "wma"
+            )
+        })
+}
+
+fn thumbnail_source_stamp(path: &Path) -> Result<(i64, u64), ThumbnailResponse> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|_| error_response(ThumbnailErrorCode::NotFound, "対象が見つかりません"))?;
+    Ok((crate::ui_helpers::mtime_secs(&metadata), metadata.len()))
 }

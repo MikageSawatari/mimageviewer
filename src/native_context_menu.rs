@@ -50,6 +50,9 @@ pub struct NativeContextMenuRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellMenuPlacement {
     Submenu,
+    /// Collection root sources remain available, but their destructive Shell verbs are placed
+    /// behind an explicit source-file label instead of looking like reference operations.
+    CollectionSourceSubmenu,
     Inline,
 }
 
@@ -91,11 +94,19 @@ fn leaf_commands(nodes: &[MenuNode]) -> Vec<&MenuCommand> {
 
 fn shell_menu_insert_position(placement: ShellMenuPlacement, nodes: &[MenuNode]) -> Option<u32> {
     match placement {
-        ShellMenuPlacement::Submenu => Some(0),
+        ShellMenuPlacement::Submenu | ShellMenuPlacement::CollectionSourceSubmenu => Some(0),
         ShellMenuPlacement::Inline => {
             let top_level_positions = u32::try_from(nodes.len()).ok()?;
             top_level_positions.checked_add(u32::from(!nodes.is_empty()))
         }
+    }
+}
+
+fn shell_submenu_label(placement: ShellMenuPlacement) -> Option<&'static str> {
+    match placement {
+        ShellMenuPlacement::Submenu => Some("Windows のメニュー"),
+        ShellMenuPlacement::CollectionSourceSubmenu => Some("元ファイルのWindowsメニュー"),
+        ShellMenuPlacement::Inline => None,
     }
 }
 
@@ -113,12 +124,13 @@ pub fn show_native_context_menu(request: NativeContextMenuRequest) -> NativeCont
 }
 
 #[cfg(windows)]
-pub fn invoke_shell_file_verb(
+pub(crate) fn invoke_shell_file_verb(
     hwnd: isize,
     paths: &[PathBuf],
     verb: ShellClipboardVerb,
-) -> Result<(), String> {
-    windows_impl::invoke_shell_file_verb(hwnd, paths, verb)
+    cut_data_object: Option<crate::cut_clipboard::LocalCutDataObject>,
+) -> Result<u32, String> {
+    windows_impl::invoke_shell_file_verb(hwnd, paths, verb, cut_data_object)
 }
 
 #[cfg(windows)]
@@ -139,12 +151,13 @@ pub fn show_native_context_menu(request: NativeContextMenuRequest) -> NativeCont
 }
 
 #[cfg(not(windows))]
-pub fn invoke_shell_file_verb(
+pub(crate) fn invoke_shell_file_verb(
     hwnd: isize,
     paths: &[PathBuf],
     verb: ShellClipboardVerb,
-) -> Result<(), String> {
-    let _ = (hwnd, paths, verb);
+    cut_data_object: Option<crate::cut_clipboard::LocalCutDataObject>,
+) -> Result<u32, String> {
+    let _ = (hwnd, paths, verb, cut_data_object);
     Err("Shell clipboard verbs are available only on Windows".to_string())
 }
 
@@ -177,7 +190,9 @@ mod windows_impl {
         DVASPECT_CONTENT, FORMATETC, IAdviseSink, IBindCtx, IDataObject, IDataObject_Impl,
         IEnumFORMATETC, IEnumSTATDATA, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
     };
-    use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
+    use windows::Win32::System::DataExchange::{
+        GetClipboardSequenceNumber, RegisterClipboardFormatW,
+    };
     use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
     use windows::Win32::System::Ole::{OleSetClipboard, ReleaseStgMedium};
     use windows::Win32::UI::Controls::{
@@ -487,8 +502,10 @@ mod windows_impl {
                         return NativeContextMenuResult::Fallback { reason };
                     }
                 }
-                ShellMenuPlacement::Submenu => {
-                    let submenu = match append_lazy_shell_submenu(menu.handle()) {
+                ShellMenuPlacement::Submenu | ShellMenuPlacement::CollectionSourceSubmenu => {
+                    let label = shell_submenu_label(request.shell_menu_placement)
+                        .expect("submenu placement has an explicit label");
+                    let submenu = match append_lazy_shell_submenu(menu.handle(), label) {
                         Ok(submenu) => submenu,
                         Err(reason) => return NativeContextMenuResult::Fallback { reason },
                     };
@@ -658,9 +675,10 @@ mod windows_impl {
         _hwnd: isize,
         paths: &[PathBuf],
         verb: ShellClipboardVerb,
-    ) -> Result<(), String> {
+        cut_data_object: Option<crate::cut_clipboard::LocalCutDataObject>,
+    ) -> Result<u32, String> {
         if paths.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         let preferred_drop_effect = preferred_drop_effect_for_file_verb(verb)
             .ok_or_else(|| "file clipboard path accepts only Copy or Cut".to_string())?;
@@ -689,7 +707,8 @@ mod windows_impl {
         }
 
         let stage_t0 = Instant::now();
-        let effect_result = data_object_with_preferred_drop_effect(data, preferred_drop_effect);
+        let effect_result =
+            data_object_with_preferred_drop_effect(data, preferred_drop_effect, cut_data_object);
         let ms = elapsed_ms(stage_t0);
         emit_shell_verb_timing(
             "verb_set_preferred_drop_effect",
@@ -713,12 +732,13 @@ mod windows_impl {
             paths.len(),
             result.is_ok(),
         );
-        result
+        result.map(|_| unsafe { GetClipboardSequenceNumber() })
     }
 
     fn data_object_with_preferred_drop_effect(
         shell_data: IDataObject,
         effect: u32,
+        cut_data_object: Option<crate::cut_clipboard::LocalCutDataObject>,
     ) -> Result<IDataObject, String> {
         let format_id = unsafe { RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT) };
         if format_id == 0 {
@@ -726,12 +746,31 @@ mod windows_impl {
         }
         let cf_format = u16::try_from(format_id)
             .map_err(|_| format!("Preferred DropEffect format ID is out of range: {format_id}"))?;
+        let owner_format = cut_data_object.as_ref().and_then(|_| {
+            optional_cut_owner_format(crate::cut_clipboard::windows_impl::cut_owner_format_id())
+        });
         Ok(ClipboardDataObject {
             inner: shell_data,
             preferred_format: cf_format,
             preferred_effect: effect,
+            owner_format,
+            cut_data_object,
         }
         .into())
+    }
+
+    fn optional_cut_owner_format(result: Result<u16, String>) -> Option<u16> {
+        match result {
+            Ok(format) => Some(format),
+            Err(error) => {
+                // This format is observational only. Registration failure must not turn a
+                // pre-existing Shell Cut operation into an error.
+                crate::logger::log(format!(
+                    "cut_clipboard: private owner format unavailable; continuing Cut: {error}"
+                ));
+                None
+            }
+        }
     }
 
     fn preferred_drop_effect_format(cf_format: u16) -> FORMATETC {
@@ -786,6 +825,8 @@ mod windows_impl {
         inner: IDataObject,
         preferred_format: u16,
         preferred_effect: u32,
+        owner_format: Option<u16>,
+        cut_data_object: Option<crate::cut_clipboard::LocalCutDataObject>,
     }
 
     impl IDataObject_Impl for ClipboardDataObject_Impl {
@@ -793,12 +834,21 @@ mod windows_impl {
             let Some(format_ref) = (unsafe { format.as_ref() }) else {
                 return Err(windows::core::Error::from_hresult(E_INVALIDARG));
             };
-            if format_ref.cfFormat != self.preferred_format {
-                return unsafe { self.inner.GetData(format) };
+            if format_ref.cfFormat == self.preferred_format {
+                validate_preferred_drop_effect_request(format_ref)
+                    .map_err(windows::core::Error::from_hresult)?;
+                return preferred_drop_effect_medium(self.preferred_effect);
             }
-            validate_preferred_drop_effect_request(format_ref)
-                .map_err(windows::core::Error::from_hresult)?;
-            preferred_drop_effect_medium(self.preferred_effect)
+            if self.owner_format == Some(format_ref.cfFormat)
+                && let Some(cut_data_object) = self.cut_data_object.as_ref()
+            {
+                validate_preferred_drop_effect_request(format_ref)
+                    .map_err(windows::core::Error::from_hresult)?;
+                return crate::cut_clipboard::windows_impl::bytes_medium(
+                    &cut_data_object.identity_payload(),
+                );
+            }
+            unsafe { self.inner.GetData(format) }
         }
 
         fn GetDataHere(
@@ -813,10 +863,13 @@ mod windows_impl {
             let Some(format_ref) = (unsafe { format.as_ref() }) else {
                 return E_INVALIDARG;
             };
-            if format_ref.cfFormat != self.preferred_format {
-                return unsafe { self.inner.QueryGetData(format) };
+            if format_ref.cfFormat == self.preferred_format
+                || self.owner_format == Some(format_ref.cfFormat)
+            {
+                return validate_preferred_drop_effect_request(format_ref)
+                    .map_or_else(|error| error, |_| S_OK);
             }
-            validate_preferred_drop_effect_request(format_ref).map_or_else(|error| error, |_| S_OK)
+            unsafe { self.inner.QueryGetData(format) }
         }
 
         fn GetCanonicalFormatEtc(
@@ -833,7 +886,27 @@ mod windows_impl {
             medium: *const STGMEDIUM,
             release: windows::core::BOOL,
         ) -> windows::core::Result<()> {
-            unsafe { self.inner.SetData(format, medium, release.as_bool()) }
+            let completion = unsafe { format.as_ref() }
+                .filter(|format| validate_preferred_drop_effect_request(format).is_ok())
+                .and_then(|format| {
+                    crate::cut_clipboard::windows_impl::read_effect_medium(medium).map(|effect| {
+                        crate::cut_clipboard::windows_impl::completion_format_signal(
+                            format.cfFormat,
+                            effect,
+                        )
+                    })
+                })
+                .filter(|signal| *signal != crate::cut_clipboard::ClipboardTransferSignal::Other);
+            let result = unsafe { self.inner.SetData(format, medium, release.as_bool()) };
+            // Shell folder IDataObject commonly returns E_NOTIMPL here. The callback itself is
+            // still authoritative after validating its format and medium; preserve the exact
+            // inner HRESULT and STGMEDIUM ownership while publishing the observation.
+            if let (Some(cut_data_object), Some(signal)) =
+                (self.cut_data_object.as_ref(), completion)
+            {
+                cut_data_object.publish_completion(signal);
+            }
+            result
         }
 
         fn EnumFormatEtc(&self, direction: u32) -> windows::core::Result<IEnumFORMATETC> {
@@ -870,6 +943,11 @@ mod windows_impl {
                 .any(|format| format.cfFormat == self.preferred_format)
             {
                 formats.push(preferred_drop_effect_format(self.preferred_format));
+            }
+            if let Some(owner_format) = self.owner_format
+                && !formats.iter().any(|format| format.cfFormat == owner_format)
+            {
+                formats.push(preferred_drop_effect_format(owner_format));
             }
             let result = unsafe { SHCreateStdEnumFmtEtc(&formats) };
             for format in &formats {
@@ -950,14 +1028,14 @@ mod windows_impl {
             .map_err(|error| format!("AppendMenuW(separator) failed: {error}"))
     }
 
-    fn append_lazy_shell_submenu(menu: HMENU) -> Result<HMENU, String> {
+    fn append_lazy_shell_submenu(menu: HMENU, submenu_label: &str) -> Result<HMENU, String> {
         let mut submenu = MenuGuard::new(
             unsafe { CreatePopupMenu() }
                 .map_err(|error| format!("CreatePopupMenu(Windows submenu) failed: {error}"))?,
         );
         append_menu_string(submenu.handle(), 0, "読み込み中…", false)
             .map_err(|error| format!("AppendMenuW(Windows placeholder) failed: {error}"))?;
-        let label = wide_null("Windows のメニュー");
+        let label = wide_null(submenu_label);
         unsafe {
             AppendMenuW(
                 menu,
@@ -1003,7 +1081,9 @@ mod windows_impl {
                     );
                     *leaf_index += 1;
                 }
-                MenuNode::Submenu { label, children } => {
+                MenuNode::Submenu {
+                    label, children, ..
+                } => {
                     let mut child =
                         MenuGuard::new(unsafe { CreatePopupMenu() }.map_err(|error| {
                             format!("CreatePopupMenu(submenu) failed: {error}")
@@ -1743,7 +1823,7 @@ mod windows_impl {
             let (data, failed_paths) = crate::file_drag::shell_data_object_for_paths(&paths)
                 .expect("cross-folder Shell IDataObject");
             assert_eq!(failed_paths, 0);
-            let data = data_object_with_preferred_drop_effect(data, DROP_EFFECT_MOVE_VALUE)
+            let data = data_object_with_preferred_drop_effect(data, DROP_EFFECT_MOVE_VALUE, None)
                 .expect("Preferred DropEffect");
 
             let file_drop_format = FORMATETC {
@@ -1768,6 +1848,151 @@ mod windows_impl {
             );
             let _ = unsafe { GlobalUnlock(hglobal) };
             unsafe { ReleaseStgMedium(&mut medium) };
+        }
+
+        #[test]
+        fn explorer_style_cut_without_private_owner_reaches_move_and_hdrop() {
+            let _com = ComStaGuard::new().expect("COM STA");
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let paths = [root.join("Cargo.toml"), root.join("src/lib.rs")];
+            let (data, failed_paths) = crate::file_drag::shell_data_object_for_paths(&paths)
+                .expect("Explorer-style Shell IDataObject");
+            assert_eq!(failed_paths, 0);
+            // Explorer does not expose mImageViewer's observational private owner format.
+            // The preferred MOVE wrapper models the remaining standard Shell formats without
+            // touching the process clipboard.
+            let data = data_object_with_preferred_drop_effect(data, DROP_EFFECT_MOVE_VALUE, None)
+                .expect("Preferred DropEffect");
+
+            for path in &paths {
+                assert!(
+                    crate::cut_clipboard::windows_impl::external_cut_data_object_contains_for_test(
+                        &data, path,
+                    )
+                    .expect("read standard Shell MOVE + CF_HDROP after absent private format"),
+                    "missing external cut path: {}",
+                    path.display()
+                );
+            }
+        }
+
+        #[test]
+        fn private_owner_format_failure_does_not_fail_existing_cut_contract() {
+            assert_eq!(optional_cut_owner_format(Ok(42)), Some(42));
+            assert_eq!(
+                optional_cut_owner_format(Err("registration unavailable".to_string())),
+                None
+            );
+        }
+
+        #[test]
+        fn cut_data_object_exposes_private_owner_identity_without_changing_file_formats() {
+            let _com = ComStaGuard::new().expect("COM STA");
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let paths = [root.join("Cargo.toml"), root.join("src/lib.rs")];
+            let (data, failed_paths) = crate::file_drag::shell_data_object_for_paths(&paths)
+                .expect("cross-folder Shell IDataObject");
+            assert_eq!(failed_paths, 0);
+            let owner = crate::cut_clipboard::LocalCutDataObject::inert_for_test([9; 16], 77);
+            let expected = owner.identity_payload();
+            let data =
+                data_object_with_preferred_drop_effect(data, DROP_EFFECT_MOVE_VALUE, Some(owner))
+                    .expect("cut clipboard wrapper");
+
+            let owner_format = crate::cut_clipboard::windows_impl::cut_owner_format_id()
+                .expect("private owner format");
+            let format = preferred_drop_effect_format(owner_format);
+            assert_eq!(unsafe { data.QueryGetData(&format) }, S_OK);
+            let mut medium = unsafe { data.GetData(&format) }.expect("private owner data");
+            let hglobal = unsafe { medium.u.hGlobal };
+            let locked = unsafe { GlobalLock(hglobal) };
+            assert!(!locked.is_null());
+            let actual =
+                unsafe { std::slice::from_raw_parts(locked.cast::<u8>(), expected.len()).to_vec() };
+            let _ = unsafe { GlobalUnlock(hglobal) };
+            unsafe { ReleaseStgMedium(&mut medium) };
+            assert_eq!(actual, expected);
+
+            let file_drop_format = FORMATETC {
+                cfFormat: windows::Win32::System::Ole::CF_HDROP.0,
+                ptd: std::ptr::null_mut(),
+                dwAspect: DVASPECT_CONTENT.0,
+                lindex: -1,
+                tymed: TYMED_HGLOBAL.0 as u32,
+            };
+            assert_eq!(unsafe { data.QueryGetData(&file_drop_format) }, S_OK);
+        }
+
+        #[test]
+        fn cut_data_object_forwards_set_data_result_without_claiming_shell_ownership() {
+            let _com = ComStaGuard::new().expect("COM STA");
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+            let (expected_inner, expected_failed) =
+                crate::file_drag::shell_data_object_for_paths(std::slice::from_ref(&path))
+                    .expect("expected Shell IDataObject");
+            let (wrapped_inner, wrapped_failed) =
+                crate::file_drag::shell_data_object_for_paths(std::slice::from_ref(&path))
+                    .expect("wrapped Shell IDataObject");
+            assert_eq!(expected_failed, 0);
+            assert_eq!(wrapped_failed, 0);
+            let owner = crate::cut_clipboard::LocalCutDataObject::inert_for_test([7; 16], 31);
+            let observations = owner.completion_observations_for_test();
+            let wrapped = data_object_with_preferred_drop_effect(
+                wrapped_inner,
+                DROP_EFFECT_MOVE_VALUE,
+                Some(owner),
+            )
+            .expect("cut clipboard wrapper");
+            let performed = unsafe {
+                RegisterClipboardFormatW(windows::Win32::UI::Shell::CFSTR_PERFORMEDDROPEFFECT)
+            };
+            assert_ne!(performed, 0);
+            let format = preferred_drop_effect_format(
+                u16::try_from(performed).expect("performed format in u16 range"),
+            );
+            let mut expected_medium = crate::cut_clipboard::windows_impl::bytes_medium(
+                &DROP_EFFECT_MOVE_VALUE.to_le_bytes(),
+            )
+            .expect("expected effect medium");
+            let mut wrapped_medium = crate::cut_clipboard::windows_impl::bytes_medium(
+                &DROP_EFFECT_MOVE_VALUE.to_le_bytes(),
+            )
+            .expect("wrapped effect medium");
+
+            let expected = unsafe { expected_inner.SetData(&format, &expected_medium, false) }
+                .map_err(|error| error.code());
+            let actual = unsafe { wrapped.SetData(&format, &wrapped_medium, false) }
+                .map_err(|error| error.code());
+            unsafe {
+                ReleaseStgMedium(&mut expected_medium);
+                ReleaseStgMedium(&mut wrapped_medium);
+            }
+            assert_eq!(expected, Err(windows::Win32::Foundation::E_NOTIMPL));
+            assert_eq!(actual, expected, "wrapper must preserve the inner HRESULT");
+            assert_eq!(
+                *observations
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                vec![crate::cut_clipboard::ClipboardTransferSignal::PerformedMove],
+                "a validated Shell completion is observed even when the inner returns E_NOTIMPL"
+            );
+
+            let mut invalid_format = format;
+            invalid_format.dwAspect = 0;
+            let mut invalid_medium = crate::cut_clipboard::windows_impl::bytes_medium(
+                &DROP_EFFECT_MOVE_VALUE.to_le_bytes(),
+            )
+            .expect("invalid request effect medium");
+            let _ = unsafe { wrapped.SetData(&invalid_format, &invalid_medium, false) };
+            unsafe { ReleaseStgMedium(&mut invalid_medium) };
+            assert_eq!(
+                observations
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .len(),
+                1,
+                "invalid FORMATETC must not publish a completion observation"
+            );
         }
     }
 }
@@ -1830,6 +2055,23 @@ mod tests {
             shell_menu_insert_position(ShellMenuPlacement::Submenu, &nodes),
             Some(0)
         );
+    }
+
+    #[test]
+    fn collection_source_submenu_has_an_explicit_source_file_label() {
+        assert_eq!(
+            shell_menu_insert_position(ShellMenuPlacement::CollectionSourceSubmenu, &[]),
+            Some(0)
+        );
+        assert_eq!(
+            shell_submenu_label(ShellMenuPlacement::CollectionSourceSubmenu),
+            Some("元ファイルのWindowsメニュー")
+        );
+        assert_eq!(
+            shell_submenu_label(ShellMenuPlacement::Submenu),
+            Some("Windows のメニュー")
+        );
+        assert_eq!(shell_submenu_label(ShellMenuPlacement::Inline), None);
     }
 
     #[test]

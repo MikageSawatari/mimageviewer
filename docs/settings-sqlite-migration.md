@@ -37,6 +37,16 @@
 - `TagDef` は `{ id, tag_key, name, show_shortcut }` になり、`FacetFilter.tags` は
   表示文字列 `#タグ` ではなく `tag_key` を永続化する。
 
+2026-10-06 追記（起動時に戻る一覧）:
+- `startup_list_restore` は既存 `settings_kv` に保存する、一覧 target と対応 cursor の一つの record。
+  新しい DB テーブルや永続 navigation stack は追加しない。
+- released `last_folder` は引き続き互換値として保存する。新 key が欠落する既存 DB／旧 JSON だけ、
+  `last_folder` と旧 cursor を一度そのまま移行する。更新直後の最初の復元先には旧挙動が残り得る。
+  新 key がある設定を legacy 値で再構築せず、Preferences OK は live record を維持する。
+- load 時の移行書き戻しは既存の rotation なし保存を使い、ユーザー保存の backup 世代を消費しない。
+  保存失敗への retry／journal／recovery は追加しない。record は環境設定の export/import から除外する。
+  契約と検証は [起動復元の所有設計](startup-restore-target-plan.md#10-phase-2-の安全な区切りと-viewport-完了経路への追加合意事項) を参照。
+
 将来の delete (本ロードマップ外):
 - **旧 `*.json` save 経路の物理削除**: spec §9 Phase 6 で「数バージョン後に」と明記。
   現状は `try_load_with_recovery` / `rotate_backups` / `write_atomic` / `quarantine_path` /
@@ -273,7 +283,8 @@ CREATE TABLE favorites (
     sort_index            INTEGER NOT NULL,
     auto_index_structure  INTEGER NOT NULL DEFAULT 0,
     auto_index_metadata   INTEGER NOT NULL DEFAULT 0,
-    auto_index_thumbs     INTEGER NOT NULL DEFAULT 0
+    auto_index_thumbs     INTEGER NOT NULL DEFAULT 0,
+    auto_index_similar    INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX favorites_sort ON favorites(sort_index);
 
@@ -600,9 +611,9 @@ VACUUM INTO は SQLite が**新規 .db ファイルに consistent な snapshot �
 ### 6.4 設定の復元 UI とダウングレード
 
 「設定の復元」は main / bak1..bak10 に加えて `settings.db.preupgrade-v<old>` も一覧化し、
-各行に保存元版と現バイナリとの版互換性を表示する。通常世代は `schema_meta.app_version`、
-preupgrade は旧実装で metadata が open 時に上書きされていた可能性があるためファイル名の
-`v<old>` を正とする。現バイナリより新しい版の行は復元不可とし、同版・旧版・版不明の候補も、実際の置換前に一時コピーを
+各行に保存元版と現バイナリとの版互換性を表示する。復元可否と「保存した版」は全世代で
+DB 内容の `schema_meta.app_version` を正本とする。preupgrade ファイル名の `v<old>` は
+snapshot を作った経緯を示す世代ラベルであり、内容の版を上書きしない。現バイナリより新しい版の行は復元不可とし、同版・旧版・版不明の候補も、実際の置換前に一時コピーを
 `SettingsDb::open + load_into_settings` して最終検証する。
 
 互換性ガードを備えた版で、それより新しい版が保存した設定を起動した場合は main / WAL /
@@ -615,6 +626,26 @@ SHM / backup chain を変更せず、セッション全体の設定保存を抑�
 抑止を維持し、既定設定による unreadable な DB の上書きを許可しない。
 このガードは v2.6.0 からのため、既公開の v2.5.0 以前へ戻す場合は下記 10.5 の
 保存形式互換も併用する。
+
+#### 6.4.1 復元・完全リセット時の設定 family 排他所有
+
+`settings.db` の復元と完全リセットは、UI threadではなく専用workerでprocess-wideの
+settings-family lease domainをquiesceする。全`with_db*` closureとRemoteの常設
+`SettingsFavoritesReader`が同じdomainへ参加し、既存readの終了と常設readerのDropを確認した
+世代付きpermitだけがcheckpoint、`GLOBAL_DB`解放、WAL/SHM削除、main置換へ進める。
+`settings.db-shm`の共有違反だけを無視したり、固定delayで削除を再試行したりはしない。
+
+quiesce中に始まったRemoteの設定readと`SetSortOrder`は、in-memory設定を変える前に既存protocolの
+Busyを返す。画像decode、stream、別DBのwriteは止めない。ファイルを変更する前のrecoverable失敗は
+常設readerとlocal accessを再開し、再openだけが失敗した場合はFavorites依存requestだけを
+再試行可能なBusyに保つ。置換開始後の成功・terminal失敗ではdomainを閉じたままアプリ終了を要求し、
+古いin-memory設定が復元後のDBへ保存されることを防ぐ。所有境界と検証条件の正本は
+[`settings-recovery-234-231-plan.md`](settings-recovery-234-231-plan.md)に置く。
+
+Remote AIのReady公開は、最終設定再検証からregistry公開までの間にもquiesceが入り得るため、
+公開直前から完了までだけ短期leaseで囲む。設定family workerと再開retryはAppがJoinHandleごと所有し、
+通常frameでは完了済みだけを回収する。process終了closeはworker terminalまで保留して再発行し、
+tray-hidden中は既存wake bridgeでterminal観測を継続する。`on_exit`もsettings保存前に残taskをjoinする。
 
 ### 6.5 失敗 bootstrap の orphan cleanup
 

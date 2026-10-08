@@ -9,10 +9,13 @@
 //! PRIMARY KEY にする (rotation_db / adjustment_db / catalog と同じ規約)。
 //! ドライブ文字は保持する (お気に入りフォルダごとのスコープ判定に必要)。
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
 
+#[cfg(test)]
+use rusqlite::OptionalExtension;
 use rusqlite::{Connection, params};
 
 pub const SEARCH_RESULT_LIMIT: usize = 5000;
@@ -81,15 +84,115 @@ fn subtree_bounds(root_path: &Path) -> (String, String) {
     (root_norm, prefix)
 }
 
+/// `upsert_children` が更新する直下エントリの BINARY collation 範囲。
+///
+/// `lower` は末尾 `/` をちょうど 1 つ持つ正規化済み親パス、`upper` はその末尾の
+/// ASCII `/` (U+002F) を直後の `0` (U+0030) へ進めた厳密な上限である。これにより
+/// 複合主キー `(favorite_root, path)` の path 部分を範囲検索でき、LIKE の `%` / `_`
+/// を実パス中のワイルドカードとして扱うこともない。
+fn direct_children_path_bounds(parent: &Path) -> (String, String) {
+    let parent_norm = normalize_path(parent);
+    let mut lower = parent_norm.trim_end_matches('/').to_owned();
+    lower.push('/');
+    let mut upper = lower
+        .strip_suffix('/')
+        .expect("direct-child lower bound ends in a separator")
+        .to_owned();
+    upper.push('0');
+    (lower, upper)
+}
+
+const UPSERT_CHILDREN_DELETE_SQL: &str = "DELETE FROM entries \
+     WHERE favorite_root = ?1 \
+     AND path >= ?2 \
+     AND path < ?3 \
+     AND instr(substr(path, length(?2) + 1), '/') = 0";
+
 // -----------------------------------------------------------------------
 // SearchIndexDb
 // -----------------------------------------------------------------------
 
 pub struct SearchIndexDb {
     conn: Mutex<Connection>,
+    #[cfg(test)]
+    full_scan_write_gate: Mutex<
+        Option<(
+            crossbeam_channel::Sender<()>,
+            crossbeam_channel::Receiver<()>,
+        )>,
+    >,
 }
 
 impl SearchIndexDb {
+    /// Full が別の構成で行を変更する前に、旧構成の完走印を失効させる。
+    /// commit が失敗した場合は呼び出し側も走査を開始しない。同じ構成の印は
+    /// 通常の途中終了でも維持するため、指紋が違う行だけを削除する。
+    pub(crate) fn prepare_full_scan(&self, root: &Path, fingerprint: &str) -> rusqlite::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM scanned_once WHERE root = ?1 AND fingerprint <> ?2",
+            params![normalize_path(root), fingerprint],
+        )?;
+        tx.commit()
+    }
+
+    /// Full の最初の直下置換 commit 後を固定する。待機中は DB lock を保持しない。
+    #[cfg(test)]
+    pub(crate) fn set_full_scan_write_gate(
+        &self,
+        entered: crossbeam_channel::Sender<()>,
+        resume: crossbeam_channel::Receiver<()>,
+    ) {
+        *self.full_scan_write_gate.lock().unwrap() = Some((entered, resume));
+    }
+
+    /// 印と rebuild pending は同じ lock で読む。再構築要求済みの起動では省略しない。
+    pub(crate) fn can_reuse_initial_scan(
+        &self,
+        root: &Path,
+        fingerprint: &str,
+    ) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM scanned_once WHERE root = ?1 AND fingerprint = ?2) \
+             AND NOT EXISTS(SELECT 1 FROM name_index_rebuild_state WHERE pending <> 0)",
+            params![normalize_path(root), fingerprint],
+            |row| row.get(0),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scanned_once_fingerprint(&self, root: &Path) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT fingerprint FROM scanned_once WHERE root = ?1",
+                [normalize_path(root)],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    /// 呼び出し側は typed Complete のときだけ使う。rebuild 待ちは再び印を立てない。
+    pub(crate) fn record_complete_scan(
+        &self,
+        root: &Path,
+        fingerprint: &str,
+    ) -> rusqlite::Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO scanned_once (root, fingerprint) SELECT ?1, ?2 \
+             WHERE NOT EXISTS(SELECT 1 FROM name_index_rebuild_state WHERE pending <> 0) \
+             ON CONFLICT(root) DO UPDATE SET fingerprint = excluded.fingerprint",
+                params![normalize_path(root), fingerprint],
+            )
+            .map(|_| ())
+    }
+
     /// `%APPDATA%/mimageviewer/search_index.db` を開く (なければ作成)。
     pub fn open() -> rusqlite::Result<Self> {
         let db_path = Self::db_path();
@@ -99,8 +202,11 @@ impl SearchIndexDb {
         let conn = Connection::open(&db_path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
         init_schema(&conn)?;
+        rebuild_names_if_requested(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            #[cfg(test)]
+            full_scan_write_gate: Mutex::new(None),
         })
     }
 
@@ -108,8 +214,11 @@ impl SearchIndexDb {
     pub fn open_in_memory() -> rusqlite::Result<Self> {
         let conn = Connection::open_in_memory()?;
         init_schema(&conn)?;
+        rebuild_names_if_requested(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            #[cfg(test)]
+            full_scan_write_gate: Mutex::new(None),
         })
     }
 
@@ -121,8 +230,11 @@ impl SearchIndexDb {
         let conn = Connection::open(db_path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
         init_schema(&conn)?;
+        rebuild_names_if_requested(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            #[cfg(test)]
+            full_scan_write_gate: Mutex::new(None),
         })
     }
 
@@ -141,6 +253,8 @@ impl SearchIndexDb {
         conn.busy_timeout(std::time::Duration::from_millis(750))?;
         Ok(Self {
             conn: Mutex::new(conn),
+            #[cfg(test)]
+            full_scan_write_gate: Mutex::new(None),
         })
     }
 
@@ -163,28 +277,83 @@ impl SearchIndexDb {
         children: &[IndexEntry],
     ) -> rusqlite::Result<()> {
         let mut conn = self.conn.lock().unwrap();
+        Self::upsert_children_locked(&mut conn, favorite_root, parent, children)
+    }
+
+    /// フル走査用。直下の集合が同じなら transaction を開かず、書き込みを省く。
+    /// 比較から置換まで同じ lock を保持し、別の書き手が割り込まないようにする。
+    pub fn upsert_children_if_changed(
+        &self,
+        favorite_root: &Path,
+        parent: &Path,
+        children: &[IndexEntry],
+    ) -> rusqlite::Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let (lower, upper) = direct_children_path_bounds(parent);
+        let fav_norm = normalize_path(favorite_root);
+        let mut observed: Vec<_> = children
+            .iter()
+            .map(|entry| {
+                (
+                    normalize_path(&entry.path),
+                    entry.path.to_string_lossy().into_owned(),
+                    entry.display_name.clone(),
+                    entry.kind as i64,
+                    entry.mtime,
+                )
+            })
+            .collect();
+        observed.sort_unstable();
+        let existing = {
+            let mut stmt = conn.prepare(
+                "SELECT path, display_path, display_name, kind, mtime FROM entries \
+                 WHERE favorite_root = ?1 AND path >= ?2 AND path < ?3 \
+                 AND instr(substr(path, length(?2) + 1), '/') = 0 ORDER BY path",
+            )?;
+            stmt.query_map(params![fav_norm, lower, upper], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if existing == observed {
+            return Ok(false);
+        }
+        Self::upsert_children_locked(&mut conn, favorite_root, parent, children)?;
+        #[cfg(test)]
+        {
+            drop(conn);
+            let gate = self.full_scan_write_gate.lock().unwrap().take();
+            if let Some((entered, resume)) = gate {
+                let _ = entered.send(());
+                let _ = resume.recv();
+            }
+        }
+        Ok(true)
+    }
+
+    fn upsert_children_locked(
+        conn: &mut Connection,
+        favorite_root: &Path,
+        parent: &Path,
+        children: &[IndexEntry],
+    ) -> rusqlite::Result<()> {
         let tx = conn.transaction()?;
 
-        // 親フォルダ直下の既存エントリを一度消してから入れ直す
-        // (LIKE 'parent_norm/%' で直下以外も消えるのを避けるため、パス区切り単位で比較)
-        let parent_norm = normalize_path(parent);
-        // 直下 = path が "parent_norm/{name}" で '/' が parent_norm の直後に 1 回のみ
-        let prefix = if parent_norm.ends_with('/') {
-            parent_norm.clone()
-        } else {
-            format!("{}/", parent_norm)
-        };
+        // 親フォルダ直下の既存エントリを一度消してから入れ直す。
+        // prefix 範囲内の深い子孫を消さないよう、パス区切り単位でも比較する。
+        // 直下 = path が "parent_norm/{name}" で '/' が parent_norm の直後に 1 回のみ。
+        // literal range を複合 PK へ渡し、同じ favorite の範囲外行を走査しない。
+        let (lower, upper) = direct_children_path_bounds(parent);
         let fav_norm = normalize_path(favorite_root);
-        // 直下判定: path LIKE 'prefix%' かつ substr(path, len(prefix)+1) に '/' を含まない
-        // かつ **favorite_root が一致する** 行のみ対象 (nested favorites で他 fav の
-        // 行を巻き込まないように)。
-        tx.execute(
-            "DELETE FROM entries \
-             WHERE favorite_root = ?1 \
-             AND path LIKE ?2 || '%' \
-             AND instr(substr(path, length(?2) + 1), '/') = 0",
-            params![fav_norm, prefix],
-        )?;
+        // 範囲内の suffix に '/' が無い行だけを削除する。深い子孫と、nested
+        // favorite が所有する同一 path の行は保持する。
+        tx.execute(UPSERT_CHILDREN_DELETE_SQL, params![fav_norm, lower, upper])?;
 
         let now = next_write_stamp();
         {
@@ -213,43 +382,109 @@ impl SearchIndexDb {
         tx.commit()
     }
 
-    /// `favorite_root` 配下で `updated_at < cutoff` の行を一括削除する。
-    ///
-    /// フルバルクスキャン完了後に呼ぶ。`upsert_children` は親フォルダ直下の行しか
-    /// DELETE しないため、アプリ停止中に親フォルダごと消えたサブツリーの孫行は
-    /// upsert の経路で掃除できない。cutoff = scan 開始時に取った
-    /// `next_write_stamp()` にすれば、scan 中の upsert は **strictly greater** な
-    /// stamp を取るので `updated_at >= cutoff`、未観測の stale 行は `< cutoff` で
-    /// 分離できる。`next_write_stamp` は process-wide atomic で単調増加なので、
-    /// 同秒で連続スキャンしても cutoff が衝突しない (Codex P2 回帰対策)。
-    ///
-    /// `favorite_root = ?` スコープなので nested favorites の他 favorite の行は
-    /// 巻き込まない。戻り値: 削除行数 (診断用)。
+    /// 完全なフル走査で未訪問だった親の古い行だけを削除する。
+    /// 訪問済みの不変行は stamp を更新しなくても保持し、走査開始後に別の書き手が
+    /// 入れた行は cutoff で保護する。列挙・訪問集合との比較・削除は同じ lock 内。
     pub fn prune_stale_for_favorite(
         &self,
         favorite_root: &Path,
+        visited_parents: &HashSet<String>,
         updated_at_cutoff: i64,
     ) -> rusqlite::Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
         let fav_norm = normalize_path(favorite_root);
-        let affected = conn.execute(
-            "DELETE FROM entries \
-             WHERE favorite_root = ?1 \
-             AND updated_at < ?2",
-            params![fav_norm, updated_at_cutoff],
-        )?;
+        let stale_paths = {
+            let mut stmt = conn
+                .prepare("SELECT path FROM entries WHERE favorite_root = ?1 AND updated_at < ?2")?;
+            let paths = stmt.query_map(params![fav_norm, updated_at_cutoff], |row| {
+                row.get::<_, String>(0)
+            })?;
+            let mut stale = Vec::new();
+            for path in paths {
+                let path = path?;
+                // DB key は '/' 区切り。drive root の親だけは末尾 '/' を保持する。
+                let parent = path.rsplit_once('/').map(|(parent, _)| {
+                    if parent.ends_with(':') || parent.is_empty() {
+                        &path[..parent.len() + 1]
+                    } else {
+                        parent
+                    }
+                });
+                if !parent.is_some_and(|parent| visited_parents.contains(parent)) {
+                    stale.push(path);
+                }
+            }
+            stale
+        };
+        if stale_paths.is_empty() {
+            return Ok(0);
+        }
+        // 大きな削除でも行ごとの autocommit を避ける。比較中から lock は保持したまま。
+        let tx = conn.transaction()?;
+        let mut affected = 0;
+        {
+            let mut stmt = tx.prepare(
+                "DELETE FROM entries WHERE favorite_root = ?1 AND path = ?2 AND updated_at < ?3",
+            )?;
+            for path in stale_paths {
+                affected += stmt.execute(params![fav_norm, path, updated_at_cutoff])?;
+            }
+        }
+        tx.commit()?;
         Ok(affected)
+    }
+
+    /// 前回のフォルダ行数 + root をフル走査の進捗目安にする。行が無ければ未知。
+    pub fn previous_folder_count(&self, favorite_root: &Path) -> rusqlite::Result<Option<u64>> {
+        let conn = self.conn.lock().unwrap();
+        let (rows, folders): (u64, u64) = conn.query_row(
+            "SELECT count(*), coalesce(sum(kind = ?2), 0) FROM entries WHERE favorite_root = ?1",
+            params![normalize_path(favorite_root), IndexKind::Folder as i64],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((rows > 0).then_some(folders + 1))
     }
 
     /// インデックス作成時に、お気に入り配下のエントリを全削除する。
     pub fn clear_for_favorite(&self, favorite_root: &Path) -> rusqlite::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        self.clear_for_favorite_with_hook(favorite_root, invalidate_name_completion_marker)
+    }
+
+    /// marker 無効化もこの transaction 内。hook 失敗時は rows も戻す。
+    pub fn clear_for_favorite_with_hook(
+        &self,
+        favorite_root: &Path,
+        invalidate_marker: impl FnOnce(&rusqlite::Transaction<'_>, &str) -> rusqlite::Result<()>,
+    ) -> rusqlite::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
         let fav_norm = normalize_path(favorite_root);
-        conn.execute(
+        let tx = conn.transaction()?;
+        tx.execute(
             "DELETE FROM entries WHERE favorite_root = ?1",
             params![fav_norm],
         )?;
-        Ok(())
+        invalidate_marker(&tx, &fav_norm)?;
+        tx.commit()
+    }
+
+    /// Ctrl+S の「すべて」は OFF root も検索するため、clear 失敗は次回起動で回復する。
+    /// marker の書込だけ FULL にして、成功した印が再起動をまたいで残るようにする。
+    pub fn request_rebuild_on_next_start(&self) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let synchronous: i64 = conn.query_row("PRAGMA synchronous", [], |r| r.get(0))?;
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        let result = (|| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "INSERT INTO name_index_rebuild_state (id, pending) VALUES (1, 1) \
+             ON CONFLICT(id) DO UPDATE SET pending = 1",
+                [],
+            )?;
+            tx.execute("DELETE FROM scanned_once", [])?;
+            tx.commit()
+        })();
+        let restore = conn.pragma_update(None, "synchronous", synchronous);
+        result.and(restore)
     }
 
     /// `root_path` 自身と配下のすべての行を `favorite_root` スコープで削除する。
@@ -352,6 +587,20 @@ impl SearchIndexDb {
         kind: Option<IndexKind>,
         mode: crate::search_query::MatchMode,
     ) -> rusqlite::Result<Vec<IndexEntry>> {
+        self.search_with_epub(query, favorite_roots, kind, mode, true)
+    }
+
+    /// Apply EPUB visibility in SQLite before the result limit. Both PC and
+    /// Remote favorite search use this query, so ignored rows cannot consume
+    /// slots that belong to later PDF results.
+    pub fn search_with_epub(
+        &self,
+        query: &str,
+        favorite_roots: &[PathBuf],
+        kind: Option<IndexKind>,
+        mode: crate::search_query::MatchMode,
+        include_epub: bool,
+    ) -> rusqlite::Result<Vec<IndexEntry>> {
         let tokens = crate::search_query::parse(query);
 
         let conn = self.conn.lock().unwrap();
@@ -397,6 +646,14 @@ impl SearchIndexDb {
         match kind_val {
             Some(_) => where_clauses.push("kind = ?".to_string()),
             None => where_clauses.push(format!("kind <> {}", IndexKind::VideoFile as i64)),
+        }
+        if !include_epub {
+            // LIKE is ASCII case-insensitive in SQLite. The filename extension
+            // is at the end of display_path, so this matches .EPUB as well.
+            where_clauses.push(format!(
+                "NOT (kind = {} AND display_path LIKE '%.epub')",
+                IndexKind::PdfFile as i64
+            ));
         }
 
         let where_sql = if where_clauses.is_empty() {
@@ -506,11 +763,25 @@ impl SearchIndexDb {
     }
 }
 
+/// 名前行の clear と印の削除を同じ transaction に含める。
+fn invalidate_name_completion_marker(
+    tx: &rusqlite::Transaction<'_>,
+    root: &str,
+) -> rusqlite::Result<()> {
+    tx.execute("DELETE FROM scanned_once WHERE root = ?1", [root])
+        .map(|_| ())
+}
+
 // -----------------------------------------------------------------------
 // スキーマ
 // -----------------------------------------------------------------------
 
 fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS name_index_rebuild_state (\
+         id INTEGER PRIMARY KEY CHECK(id = 1), pending INTEGER NOT NULL); \
+         CREATE TABLE IF NOT EXISTS scanned_once (root TEXT PRIMARY KEY, fingerprint TEXT NOT NULL);",
+    )?;
     // 新規 DB 用: 複合 PRIMARY KEY `(favorite_root, path)` で作る。
     // 同じ実体 path が複数 favorite に所属する (nested favorites) ケースを表現できる。
     // idx_entries_fav_updated は `prune_stale_for_favorite` の
@@ -575,6 +846,7 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         pk_cols.len() == 1 && pk_cols[0].1 == "path"
     };
     if old_pk_is_path_only {
+        conn.execute("DELETE FROM scanned_once", [])?;
         crate::logger::log("search_index_db: migrating PRIMARY KEY (path) → (favorite_root, path)");
         conn.execute_batch(
             "CREATE TABLE entries_new (
@@ -614,6 +886,25 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         bump_write_stamp_floor(max_stamp);
     }
 
+    Ok(())
+}
+
+/// schema を壊さず rows を同一 transaction で再作成。readonly open は印を消費しない。
+fn rebuild_names_if_requested(conn: &Connection) -> rusqlite::Result<()> {
+    let pending: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM name_index_rebuild_state WHERE id = 1 AND pending <> 0)",
+        [],
+        |r| r.get(0),
+    )?;
+    if !pending {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM entries", [])?;
+    tx.execute("DELETE FROM scanned_once", [])?;
+    tx.execute("DELETE FROM name_index_rebuild_state", [])?;
+    tx.commit()?;
+    crate::logger::log("search_index_db: rebuilding name index after failed clear".to_owned());
     Ok(())
 }
 
@@ -706,12 +997,14 @@ pub fn is_under(path: &Path, favorite_root: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::StatementStatus;
 
     fn open_mem() -> SearchIndexDb {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         SearchIndexDb {
             conn: Mutex::new(conn),
+            full_scan_write_gate: Mutex::new(None),
         }
     }
 
@@ -725,8 +1018,418 @@ mod tests {
     }
 
     #[test]
+    fn released_db_gets_empty_marker_table_without_changing_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("names.db");
+        let root = Path::new("C:/fav");
+        let db = SearchIndexDb::open_at(&path).unwrap();
+        db.upsert_children(
+            root,
+            root,
+            &[entry("C:/fav/a.zip", "a.zip", IndexKind::ZipFile)],
+        )
+        .unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TABLE scanned_once; DROP TABLE name_index_rebuild_state;")
+            .unwrap();
+        drop(db);
+        let reopened = SearchIndexDb::open_at(&path).unwrap();
+        assert_eq!(reopened.count_for_favorite(root).unwrap(), 1);
+        assert_eq!(reopened.scanned_once_fingerprint(root).unwrap(), None);
+        assert!(!reopened.can_reuse_initial_scan(root, "v1").unwrap());
+    }
+
+    #[test]
+    fn scanned_once_persists_per_root_and_clear_removes_same_root_atomically() {
+        let db = open_mem();
+        let root = Path::new("C:/fav");
+        let nested = Path::new("C:/fav/inner");
+        db.record_complete_scan(root, "outer").unwrap();
+        db.record_complete_scan(nested, "inner").unwrap();
+        db.upsert_children(
+            root,
+            root,
+            &[entry("C:/fav/a.zip", "a.zip", IndexKind::ZipFile)],
+        )
+        .unwrap();
+        db.conn.lock().unwrap().execute_batch("CREATE TRIGGER fail_marker_clear BEFORE DELETE ON scanned_once BEGIN SELECT RAISE(FAIL, 'injected'); END;").unwrap();
+        assert!(db.clear_for_favorite(root).is_err());
+        assert_eq!(db.count_for_favorite(root).unwrap(), 1);
+        assert_eq!(
+            db.scanned_once_fingerprint(root).unwrap().as_deref(),
+            Some("outer")
+        );
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_marker_clear;")
+            .unwrap();
+        db.clear_for_favorite(root).unwrap();
+        assert_eq!(db.scanned_once_fingerprint(root).unwrap(), None);
+        assert_eq!(
+            db.scanned_once_fingerprint(nested).unwrap().as_deref(),
+            Some("inner")
+        );
+    }
+
+    #[test]
+    fn full_scan_preparation_invalidates_only_changed_root_marker_transactionally() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("names.db");
+        let root = Path::new("C:/fav");
+        let sibling = Path::new("C:/other");
+        let db = SearchIndexDb::open_at(&path).unwrap();
+        db.record_complete_scan(root, "old").unwrap();
+        db.record_complete_scan(sibling, "sibling").unwrap();
+        db.conn.lock().unwrap().execute_batch("CREATE TRIGGER fail_marker_delete BEFORE DELETE ON scanned_once BEGIN SELECT RAISE(FAIL, 'injected'); END;").unwrap();
+        // 同じ構成は印を変更しない。別構成の失効失敗は caller に返し、rollback する。
+        db.prepare_full_scan(root, "old").unwrap();
+        assert!(db.prepare_full_scan(root, "new").is_err());
+        assert_eq!(
+            db.scanned_once_fingerprint(root).unwrap().as_deref(),
+            Some("old")
+        );
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_marker_delete;")
+            .unwrap();
+        db.prepare_full_scan(Path::new("c:/FAV"), "new").unwrap();
+        drop(db);
+        let reopened = SearchIndexDb::open_at(&path).unwrap();
+        assert_eq!(reopened.scanned_once_fingerprint(root).unwrap(), None);
+        assert_eq!(
+            reopened
+                .scanned_once_fingerprint(sibling)
+                .unwrap()
+                .as_deref(),
+            Some("sibling")
+        );
+    }
+
+    #[test]
+    fn rebuild_pending_invalidates_scan_marker_in_same_startup_and_after_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("names.db");
+        let root = Path::new("C:/fav");
+        let db = SearchIndexDb::open_at(&path).unwrap();
+        db.record_complete_scan(root, "v1").unwrap();
+        assert!(db.can_reuse_initial_scan(root, "v1").unwrap());
+        db.request_rebuild_on_next_start().unwrap();
+        assert!(!db.can_reuse_initial_scan(root, "v1").unwrap());
+        db.record_complete_scan(root, "v1").unwrap();
+        assert_eq!(db.scanned_once_fingerprint(root).unwrap(), None);
+        // 再構築までに旧版相当の書き手が印を残しても writable open で消える。
+        db.conn
+            .lock()
+            .unwrap()
+            .execute("INSERT INTO scanned_once VALUES ('c:/fav', 'v1')", [])
+            .unwrap();
+        drop(db);
+        let reopened = SearchIndexDb::open_at(&path).unwrap();
+        assert_eq!(reopened.scanned_once_fingerprint(root).unwrap(), None);
+        assert!(!reopened.can_reuse_initial_scan(root, "v1").unwrap());
+    }
+
+    #[test]
+    fn scan_marker_survives_reopen_and_event_deletion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("names.db");
+        let root = Path::new("C:/fav");
+        let db = SearchIndexDb::open_at(&path).unwrap();
+        db.record_complete_scan(root, "v1").unwrap();
+        db.upsert_children(
+            root,
+            root,
+            &[entry("C:/fav/a.zip", "a.zip", IndexKind::ZipFile)],
+        )
+        .unwrap();
+        db.delete_subtree(root, root).unwrap();
+        drop(db);
+        let reopened = SearchIndexDb::open_at(&path).unwrap();
+        assert!(reopened.can_reuse_initial_scan(root, "v1").unwrap());
+    }
+
+    #[test]
+    fn clear_and_completion_hook_commit_or_rollback_together() {
+        let db = open_mem();
+        let root = Path::new("C:/fav");
+        db.upsert_children(
+            root,
+            root,
+            &[entry("C:/fav/a.zip", "a.zip", IndexKind::ZipFile)],
+        )
+        .unwrap();
+        db.conn.lock().unwrap().execute_batch(
+            "CREATE TABLE test_completion (root TEXT PRIMARY KEY); INSERT INTO test_completion VALUES ('c:/fav');",
+        ).unwrap();
+        let failed = db.clear_for_favorite_with_hook(root, |tx, key| {
+            tx.execute("DELETE FROM test_completion WHERE root = ?1", [key])?;
+            Err(rusqlite::Error::InvalidQuery)
+        });
+        assert!(failed.is_err());
+        assert_eq!(db.count_for_favorite(root).unwrap(), 1);
+        let markers: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM test_completion", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(markers, 1);
+        db.clear_for_favorite_with_hook(root, |tx, key| {
+            tx.execute("DELETE FROM test_completion WHERE root = ?1", [key])
+                .map(|_| ())
+        })
+        .unwrap();
+        assert_eq!(db.count_for_favorite(root).unwrap(), 0);
+        let markers: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM test_completion", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(markers, 0);
+    }
+
+    #[test]
+    fn rebuild_marker_survives_reopen_and_readonly_does_not_consume_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("names.db");
+        let root = Path::new("C:/fav");
+        let db = SearchIndexDb::open_at(&path).unwrap();
+        db.upsert_children(
+            root,
+            root,
+            &[entry("C:/fav/a.zip", "a.zip", IndexKind::ZipFile)],
+        )
+        .unwrap();
+        db.request_rebuild_on_next_start().unwrap();
+        // 通常の名前索引の書込設定は marker の FULL 書込後も復元される。
+        let synchronous: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 1);
+        drop(db);
+        let readonly = SearchIndexDb::open_readonly_at(&path).unwrap();
+        assert_eq!(readonly.count_for_favorite(root).unwrap(), 1);
+        drop(readonly);
+        let rebuilt = SearchIndexDb::open_at(&path).unwrap();
+        assert_eq!(rebuilt.count_for_favorite(root).unwrap(), 0);
+        // 印は1回だけ消費される。その後の有効な行を次の open で消さない。
+        rebuilt
+            .upsert_children(
+                root,
+                root,
+                &[entry("C:/fav/b.zip", "b.zip", IndexKind::ZipFile)],
+            )
+            .unwrap();
+        drop(rebuilt);
+        assert_eq!(
+            SearchIndexDb::open_at(&path)
+                .unwrap()
+                .count_for_favorite(root)
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn rebuild_failure_preserves_rows_and_pending_marker_for_next_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("names.db");
+        let root = Path::new("C:/fav");
+        let db = SearchIndexDb::open_at(&path).unwrap();
+        db.upsert_children(
+            root,
+            root,
+            &[entry("C:/fav/a.zip", "a.zip", IndexKind::ZipFile)],
+        )
+        .unwrap();
+        db.request_rebuild_on_next_start().unwrap();
+        db.conn.lock().unwrap().execute_batch(
+            "CREATE TRIGGER fail_rebuild BEFORE DELETE ON entries BEGIN SELECT RAISE(FAIL, 'injected'); END;",
+        ).unwrap();
+        drop(db);
+        assert!(SearchIndexDb::open_at(&path).is_err());
+        let conn = Connection::open(&path).unwrap();
+        let pending: i64 = conn
+            .query_row(
+                "SELECT pending FROM name_index_rebuild_state WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!((pending, rows), (1, 1));
+        conn.execute_batch("DROP TRIGGER fail_rebuild").unwrap();
+        drop(conn);
+        assert_eq!(
+            SearchIndexDb::open_at(&path)
+                .unwrap()
+                .count_for_favorite(root)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn normalize_path_basic() {
         assert_eq!(normalize_path(Path::new(r"C:\Foo\Bar")), "c:/foo/bar");
+    }
+
+    #[test]
+    fn unchanged_children_skip_write_in_any_order_and_keep_stamp() {
+        let db = open_mem();
+        let root = Path::new("C:/fav");
+        let children = vec![
+            entry("C:/fav/b.pdf", "b.pdf", IndexKind::PdfFile),
+            entry("C:/fav/a.zip", "a.zip", IndexKind::ZipFile),
+        ];
+        db.upsert_children(root, root, &children).unwrap();
+        let before: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT max(updated_at) FROM entries", [], |row| row.get(0))
+            .unwrap();
+        let mut reverse = children.clone();
+        reverse.reverse();
+        // 読み取り専用でも同一集合なら成功する (DELETE/INSERT を行わない)。
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("PRAGMA query_only=ON")
+            .unwrap();
+        assert!(!db.upsert_children_if_changed(root, root, &reverse).unwrap());
+        assert!(
+            !db.upsert_children_if_changed(root, Path::new("C:/fav/empty"), &[])
+                .unwrap()
+        );
+        let after: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT max(updated_at) FROM entries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn changed_children_compare_every_persisted_field() {
+        let root = Path::new("C:/fav");
+        let base = entry("C:/fav/a.zip", "a.zip", IndexKind::ZipFile);
+        for field in 0..5 {
+            let db = open_mem();
+            db.upsert_children(root, root, &[base.clone()]).unwrap();
+            let mut changed = base.clone();
+            match field {
+                0 => changed.path = "C:/fav/b.zip".into(),
+                1 => changed.path = "C:/FAV/a.zip".into(),
+                2 => changed.display_name = "A.zip".into(),
+                3 => changed.kind = IndexKind::PdfFile,
+                4 => changed.mtime = 42,
+                _ => unreachable!(),
+            }
+            assert!(
+                db.upsert_children_if_changed(root, root, &[changed.clone()])
+                    .unwrap(),
+                "field {field}"
+            );
+            assert!(
+                !db.upsert_children_if_changed(root, root, &[changed])
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn visited_prune_preserves_old_observed_and_fresh_unobserved_rows_in_scope() {
+        let db = open_mem();
+        let root = Path::new("C:/fav");
+        db.upsert_children(root, root, &[entry("C:/fav/sub", "sub", IndexKind::Folder)])
+            .unwrap();
+        let old = entry("C:/fav/sub/old.zip", "old.zip", IndexKind::ZipFile);
+        db.upsert_children(root, Path::new("C:/fav/sub"), &[old.clone()])
+            .unwrap();
+        let nested = Path::new("C:/fav/sub");
+        db.upsert_children(nested, nested, &[old]).unwrap();
+        db.upsert_children(
+            root,
+            Path::new("C:/fav/gone"),
+            &[entry(
+                "C:/fav/gone/stale.pdf",
+                "stale.pdf",
+                IndexKind::PdfFile,
+            )],
+        )
+        .unwrap();
+        let cutoff = next_write_stamp();
+        db.upsert_children(
+            root,
+            Path::new("C:/fav/new"),
+            &[entry(
+                "C:/fav/new/fresh.zip",
+                "fresh.zip",
+                IndexKind::ZipFile,
+            )],
+        )
+        .unwrap();
+        let visited = HashSet::from(["c:/fav".into(), "c:/fav/sub".into()]);
+        assert_eq!(
+            db.prune_stale_for_favorite(root, &visited, cutoff).unwrap(),
+            1
+        );
+        assert_eq!(db.count_for_favorite(root).unwrap(), 3);
+        assert_eq!(db.count_for_favorite(nested).unwrap(), 1);
+    }
+
+    #[test]
+    fn visited_prune_handles_drive_root_parent_and_literal_wildcards() {
+        let db = open_mem();
+        let root = Path::new("C:/");
+        db.upsert_children(root, root, &[entry("C:/a_%", "a_%", IndexKind::Folder)])
+            .unwrap();
+        db.upsert_children(
+            root,
+            Path::new("C:/a_%"),
+            &[entry("C:/a_%/book.zip", "book.zip", IndexKind::ZipFile)],
+        )
+        .unwrap();
+        let visited = HashSet::from(["c:/".into(), "c:/a_%".into()]);
+        assert_eq!(
+            db.prune_stale_for_favorite(root, &visited, next_write_stamp())
+                .unwrap(),
+            0
+        );
+        assert_eq!(db.count_for_favorite(root).unwrap(), 2);
+    }
+
+    #[test]
+    fn previous_folder_count_uses_folder_rows_and_root_in_favorite_scope() {
+        let db = open_mem();
+        let root = Path::new("C:/fav");
+        assert_eq!(db.previous_folder_count(root).unwrap(), None);
+        db.upsert_children(
+            root,
+            root,
+            &[
+                entry("C:/fav/sub", "sub", IndexKind::Folder),
+                entry("C:/fav/book.zip", "book.zip", IndexKind::ZipFile),
+            ],
+        )
+        .unwrap();
+        assert_eq!(db.previous_folder_count(root).unwrap(), Some(2));
+        assert_eq!(
+            db.previous_folder_count(Path::new("C:/other")).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -857,6 +1560,321 @@ mod tests {
         assert!(names.contains(&"w"));
         assert!(names.contains(&"z"));
         assert!(!names.contains(&"y"));
+    }
+
+    #[test]
+    fn upsert_children_uses_literal_parent_boundary_and_preserves_other_owners() {
+        let db = open_mem();
+        let fav = PathBuf::from(r"C:\Fav");
+        let target = PathBuf::from(r"C:\Fav\100%_set");
+        let pattern_sibling = PathBuf::from(r"C:\Fav\100xxset");
+        let nested_fav = target.clone();
+
+        db.upsert_children(
+            &fav,
+            &target,
+            &[
+                entry(r"C:\Fav\100%_set\old.zip", "old.zip", IndexKind::ZipFile),
+                entry(
+                    r"C:\Fav\100%_set\日本語.pdf",
+                    "日本語.pdf",
+                    IndexKind::PdfFile,
+                ),
+            ],
+        )
+        .unwrap();
+        db.upsert_children(
+            &fav,
+            &target.join("sub"),
+            &[entry(
+                r"C:\Fav\100%_set\sub\deep.zip",
+                "deep.zip",
+                IndexKind::ZipFile,
+            )],
+        )
+        .unwrap();
+        db.upsert_children(
+            &fav,
+            &pattern_sibling,
+            &[entry(
+                r"C:\Fav\100xxset\victim.zip",
+                "victim.zip",
+                IndexKind::ZipFile,
+            )],
+        )
+        .unwrap();
+        db.upsert_children(
+            &nested_fav,
+            &target,
+            &[entry(
+                r"C:\Fav\100%_set\nested.pdf",
+                "nested.pdf",
+                IndexKind::PdfFile,
+            )],
+        )
+        .unwrap();
+
+        db.upsert_children(
+            &fav,
+            &target,
+            &[entry(
+                r"C:\Fav\100%_set\new.zip",
+                "new.zip",
+                IndexKind::ZipFile,
+            )],
+        )
+        .unwrap();
+
+        let conn = db.conn.lock().unwrap();
+        let exists = |favorite_root: &str, path: &str| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM entries WHERE favorite_root = ?1 AND path = ?2)",
+                params![favorite_root, path],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap()
+        };
+        assert!(!exists("c:/fav", "c:/fav/100%_set/old.zip"));
+        assert!(!exists("c:/fav", "c:/fav/100%_set/日本語.pdf"));
+        assert!(exists("c:/fav", "c:/fav/100%_set/new.zip"));
+        assert!(exists("c:/fav", "c:/fav/100%_set/sub/deep.zip"));
+        assert!(exists("c:/fav", "c:/fav/100xxset/victim.zip"));
+        assert!(exists("c:/fav/100%_set", "c:/fav/100%_set/nested.pdf"));
+        drop(conn);
+
+        db.upsert_children(&fav, &target, &[]).unwrap();
+        let conn = db.conn.lock().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM entries
+                 WHERE favorite_root = 'c:/fav'
+                   AND path = 'c:/fav/100%_set/new.zip'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "empty replacement removes the old direct child"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM entries
+                 WHERE path IN (
+                   'c:/fav/100%_set/sub/deep.zip',
+                   'c:/fav/100xxset/victim.zip',
+                   'c:/fav/100%_set/nested.pdf'
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            3,
+            "deep, pattern-sibling, and nested-favorite rows remain"
+        );
+    }
+
+    #[test]
+    fn direct_children_bounds_normalize_trailing_slashes_and_drive_root() {
+        assert_eq!(
+            direct_children_path_bounds(Path::new(r"C:\")),
+            ("c:/".to_owned(), "c:0".to_owned())
+        );
+        assert_eq!(
+            direct_children_path_bounds(Path::new("C:/Fav///")),
+            ("c:/fav/".to_owned(), "c:/fav0".to_owned())
+        );
+        assert_eq!(
+            direct_children_path_bounds(Path::new(r"C:\お気に入り")),
+            ("c:/お気に入り/".to_owned(), "c:/お気に入り0".to_owned())
+        );
+    }
+
+    #[test]
+    fn upsert_children_insert_failure_rolls_back_delete_and_stamp() {
+        let db = open_mem();
+        let fav = PathBuf::from(r"C:\Fav");
+        let parent = PathBuf::from(r"C:\Fav\parent");
+        db.upsert_children(
+            &fav,
+            &parent,
+            &[entry(
+                r"C:\Fav\parent\old.zip",
+                "old.zip",
+                IndexKind::ZipFile,
+            )],
+        )
+        .unwrap();
+        let old_stamp = {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER reject_upsert_child
+                 BEFORE INSERT ON entries
+                 WHEN NEW.name = 'reject.zip'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'test upsert failure');
+                 END;",
+            )
+            .unwrap();
+            conn.query_row(
+                "SELECT updated_at FROM entries WHERE favorite_root = 'c:/fav'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+
+        assert!(
+            db.upsert_children(
+                &fav,
+                &parent,
+                &[entry(
+                    r"C:\Fav\parent\reject.zip",
+                    "reject.zip",
+                    IndexKind::ZipFile,
+                )],
+            )
+            .is_err()
+        );
+        {
+            let conn = db.conn.lock().unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT path FROM entries WHERE favorite_root = 'c:/fav'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+                "c:/fav/parent/old.zip"
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT updated_at FROM entries WHERE favorite_root = 'c:/fav'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                old_stamp
+            );
+            conn.execute("DROP TRIGGER reject_upsert_child", [])
+                .unwrap();
+        }
+
+        db.upsert_children(
+            &fav,
+            &parent,
+            &[entry(
+                r"C:\Fav\parent\after.zip",
+                "after.zip",
+                IndexKind::ZipFile,
+            )],
+        )
+        .unwrap();
+        let conn = db.conn.lock().unwrap();
+        let (path, stamp): (String, i64) = conn
+            .query_row(
+                "SELECT path, updated_at FROM entries WHERE favorite_root = 'c:/fav'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(path, "c:/fav/parent/after.zip");
+        assert!(stamp > old_stamp);
+    }
+
+    fn upsert_children_delete_query_evidence(
+        unrelated_rows: usize,
+    ) -> (String, i32, i32, i32, usize) {
+        let db = open_mem();
+        let mut conn = db.conn.lock().unwrap();
+        conn.execute(
+            "WITH RECURSIVE ids(value) AS (
+               VALUES(1) UNION ALL SELECT value + 1 FROM ids WHERE value < ?1
+             )
+             INSERT INTO entries
+               (path, display_path, name, display_name, kind, favorite_root, mtime, updated_at)
+             SELECT printf('c:/fav/outside/%08d.zip', value),
+                    printf('C:/Fav/outside/%08d.zip', value),
+                    printf('%08d.zip', value), printf('%08d.zip', value),
+                    1, 'c:/fav', 1, 1 FROM ids",
+            [i64::try_from(unrelated_rows).unwrap()],
+        )
+        .unwrap();
+        for index in 0..8 {
+            conn.execute(
+                "INSERT INTO entries
+                   (path, display_path, name, display_name, kind, favorite_root, mtime, updated_at)
+                 VALUES (?1, ?1, ?2, ?2, 1, 'c:/fav', 1, 1)",
+                params![
+                    format!("c:/fav/target/{index:02}.zip"),
+                    format!("{index:02}.zip")
+                ],
+            )
+            .unwrap();
+        }
+        for index in 0..4 {
+            conn.execute(
+                "INSERT INTO entries
+                   (path, display_path, name, display_name, kind, favorite_root, mtime, updated_at)
+                 VALUES (?1, ?1, ?2, ?2, 1, 'c:/fav', 1, 1)",
+                params![
+                    format!("c:/fav/target/deep/{index:02}.zip"),
+                    format!("{index:02}.zip")
+                ],
+            )
+            .unwrap();
+        }
+        let (lower, upper) = direct_children_path_bounds(Path::new("C:/Fav/target"));
+        let explain_sql = format!("EXPLAIN QUERY PLAN {UPSERT_CHILDREN_DELETE_SQL}");
+        let plan = conn
+            .prepare(&explain_sql)
+            .unwrap()
+            .query_map(params!["c:/fav", lower, upper], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join(" | ");
+
+        let tx = conn.transaction().unwrap();
+        let mut statement = tx.prepare(UPSERT_CHILDREN_DELETE_SQL).unwrap();
+        let deleted = statement.execute(params!["c:/fav", lower, upper]).unwrap();
+        let evidence = (
+            plan,
+            statement.get_status(StatementStatus::VmStep),
+            statement.get_status(StatementStatus::FullscanStep),
+            statement.get_status(StatementStatus::Sort),
+            deleted,
+        );
+        drop(statement);
+        tx.rollback().unwrap();
+        evidence
+    }
+
+    #[test]
+    fn upsert_children_delete_query_work_is_independent_of_unrelated_rows() {
+        let small = upsert_children_delete_query_evidence(4_096);
+        let large = upsert_children_delete_query_evidence(32_768);
+        for evidence in [&small, &large] {
+            assert!(
+                evidence.0.contains("sqlite_autoindex_entries_1"),
+                "{}",
+                evidence.0
+            );
+            assert!(
+                evidence.0.contains("favorite_root=? AND path>? AND path<?"),
+                "{}",
+                evidence.0
+            );
+            assert!(!evidence.0.contains("SCAN entries"), "{}", evidence.0);
+            assert_eq!(evidence.2, 0, "unexpected full scan: {evidence:?}");
+            assert_eq!(evidence.3, 0, "unexpected sort: {evidence:?}");
+            assert_eq!(evidence.4, 8, "direct children deleted: {evidence:?}");
+        }
+        assert!(
+            large.1 <= small.1.saturating_add(32),
+            "DELETE work grew with unrelated rows: small={small:?}, large={large:?}"
+        );
     }
 
     #[test]

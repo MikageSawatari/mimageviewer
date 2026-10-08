@@ -1,19 +1,131 @@
 use super::*;
+use miv_startup::{Lane, Outcome, Stage, WatchHandle, WatchSlot, event_span};
+
+/// Diagnostics for this existing resolver request, through UI acceptance/refusal.
+/// This is not the lifetime of downstream async enumeration or conversion.
+pub(super) struct InitialNavigationTrace {
+    dispatch: Option<miv_startup::Span>,
+    watch: Option<WatchHandle>,
+}
+
+impl InitialNavigationTrace {
+    fn begin(boundary: &str) -> Self {
+        let watch = miv_startup::first_dispatch_watch();
+        if let Some(watch) = watch {
+            watch.begin();
+        }
+        Self {
+            dispatch: Some(
+                event_span(Lane::Navigation, Stage::InitialTargetResolve, 0)
+                    .watched_optional(watch)
+                    .detail(boundary),
+            ),
+            watch,
+        }
+    }
+    fn correlation(&self) -> u64 {
+        self.dispatch.as_ref().map_or(0, miv_startup::Span::id)
+    }
+    fn finish(mut self, outcome: Outcome) {
+        if let Some(dispatch) = self.dispatch.take() {
+            dispatch.finish(outcome);
+        }
+        if let Some(watch) = self.watch.take() {
+            watch.retire(outcome);
+        }
+    }
+}
+
+impl Drop for InitialNavigationTrace {
+    fn drop(&mut self) {
+        if let Some(dispatch) = self.dispatch.take() {
+            dispatch.finish(Outcome::Cancelled);
+        }
+        if let Some(watch) = self.watch.take() {
+            watch.retire(Outcome::Cancelled);
+        }
+    }
+}
 
 const STARTUP_OPEN_PATH_RESOLVE_TOAST_DELAY: std::time::Duration =
     std::time::Duration::from_millis(400);
+
+#[must_use]
+enum StartupOpenApplyOutcome {
+    Opened,
+    NotOpenable,
+    Refused(FolderOpenRefusal),
+    #[cfg(windows)]
+    DetachedRefused(OpenAdmissionRefusal),
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_STARTUP_OPEN_RESOLVE_SPAWN_FAILURE: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(test)]
+pub(super) fn force_startup_open_resolve_spawn_failure_for_test(force: bool) {
+    FORCE_STARTUP_OPEN_RESOLVE_SPAWN_FAILURE.with(|slot| slot.set(force));
+}
 
 impl App {
     pub(crate) fn set_startup_open_path(&mut self, path: PathBuf) {
         self.startup_open_path = Some(path);
     }
 
+    pub(super) fn poll_deferred_startup_open_path(&mut self, ctx: &egui::Context) {
+        if !self.initialized
+            || self.remote_session_blocks_local_control()
+            || self.startup_open_path_resolve_pending.is_some()
+            || self.document_open_modal_admission_blocked()
+        {
+            return;
+        }
+        if let Some(path) = self.startup_open_path.take() {
+            self.start_startup_open_path_resolve(path, StartupOpenPathSource::InitialStartup, ctx);
+        }
+    }
+
     #[cfg(windows)]
     pub(super) fn poll_activation_open_paths(&mut self, ctx: &egui::Context) {
-        let paths: Vec<PathBuf> = self.activation_open_path_rx.try_iter().collect();
-        let Some(path) = paths.into_iter().last() else {
+        if self.remote_session_blocks_local_control() {
+            self.reject_activation_open_paths_for_remote(ctx);
+            return;
+        }
+        // Keep the channel queued while a document dialog owns local admission. Draining it
+        // after terminal naturally applies the existing last-activation-wins rule.
+        if self.document_open_modal_admission_blocked() {
+            return;
+        }
+        let current_acquisition_sequence = self
+            .remote_session_handle()
+            .map(|handle| handle.snapshot().acquisition_sequence);
+        let requests: Vec<_> = self.activation_open_path_rx.try_iter().collect();
+        let rejected = requests
+            .iter()
+            .filter(|request| request.rejected_for_remote(current_acquisition_sequence))
+            .count();
+        self.notify_rejected_remote_activation_paths(rejected, ctx);
+        let paths: Vec<_> = requests
+            .into_iter()
+            .filter(|request| !request.rejected_for_remote(current_acquisition_sequence))
+            .collect();
+        if self.sidecar_restore_active() {
+            if !paths.is_empty() {
+                crate::logger::log(format!(
+                    "single_instance: discarded {} activation open request(s) during sidecar restore",
+                    paths.len()
+                ));
+            }
+            return;
+        }
+        let Some(path) = paths.into_iter().max_by_key(|request| request.received_at) else {
             return;
         };
+        let path = path.path;
         crate::logger::log(format!(
             "single_instance: resolving forwarded path in worker: {}",
             path.display()
@@ -22,12 +134,78 @@ impl App {
         ctx.request_repaint();
     }
 
+    #[cfg(windows)]
+    pub(crate) fn reject_activation_open_paths_for_remote(&mut self, ctx: &egui::Context) {
+        let current_acquisition_sequence = self
+            .remote_session_handle()
+            .map(|handle| handle.snapshot().acquisition_sequence);
+        let requests: Vec<_> = self.activation_open_path_rx.try_iter().collect();
+        let (rejected, deferred): (Vec<_>, Vec<_>) = requests
+            .into_iter()
+            .partition(|request| request.rejected_for_remote(current_acquisition_sequence));
+        // The phase observed by poll_remote_session may be stale after a return. Put requests
+        // received in that Local phase back for the ordinary activation poll; their original
+        // receive time preserves the last-activation-wins ordering.
+        for request in deferred {
+            let _ = self.activation_open_path_tx.send(request);
+        }
+        self.notify_rejected_remote_activation_paths(rejected.len(), ctx);
+    }
+
+    #[cfg(windows)]
+    fn notify_rejected_remote_activation_paths(&mut self, rejected: usize, ctx: &egui::Context) {
+        if rejected != 0 {
+            crate::logger::log(format!(
+                "single_instance: rejected {rejected} activation open request(s) during Remote ownership"
+            ));
+            self.show_feedback_toast(
+                "リモート閲覧中のため、二重起動で渡されたパスを開けません".to_string(),
+            );
+            ctx.request_repaint();
+        }
+    }
+
     pub(crate) fn start_startup_open_path_resolve(
         &mut self,
         requested: PathBuf,
         source: StartupOpenPathSource,
         ctx: &egui::Context,
     ) {
+        if self.remote_session_blocks_local_control() {
+            if matches!(source, StartupOpenPathSource::InitialStartup) {
+                self.startup_open_path = Some(requested);
+                return;
+            }
+            crate::logger::log(format!(
+                "startup open: rejected resolve while Remote owns local control source={} requested={}",
+                source.perf_tag(),
+                requested.display()
+            ));
+            if matches!(source, StartupOpenPathSource::Activation) {
+                self.show_feedback_toast(
+                    "リモート閲覧中のため、二重起動で渡されたパスを開けません".to_string(),
+                );
+            }
+            return;
+        }
+        if self.document_open_modal_admission_blocked() {
+            match source {
+                StartupOpenPathSource::Activation => {
+                    #[cfg(windows)]
+                    let request = crate::single_instance::ActivationOpenPath::received(
+                        requested,
+                        self.remote_session_handle(),
+                    );
+                    #[cfg(windows)]
+                    let _ = self.activation_open_path_tx.send(request);
+                    #[cfg(not(windows))]
+                    let _ = requested;
+                }
+                StartupOpenPathSource::InitialStartup => self.startup_open_path = Some(requested),
+                StartupOpenPathSource::Bookmark => {}
+            }
+            return;
+        }
         let Some(owner) = self.startup_open_path_owner(source) else {
             crate::logger::log(format!(
                 "startup open: reject ownerless resolve source={} requested={}",
@@ -35,6 +213,33 @@ impl App {
                 requested.display()
             ));
             return;
+        };
+        // The suffix is known before the filesystem resolver runs. A directory ending in
+        // `.epub` holds this provisional lease only until classification returns Directory.
+        let requested_owner = match crate::pdf_loader::LeasedEpubPath::try_new(requested.clone()) {
+            Ok(owner) => owner,
+            Err(reason) => {
+                match source {
+                    StartupOpenPathSource::Activation => {
+                        #[cfg(windows)]
+                        let request = crate::single_instance::ActivationOpenPath::received(
+                            requested,
+                            self.remote_session_handle(),
+                        );
+                        #[cfg(windows)]
+                        let _ = self.activation_open_path_tx.send(request);
+                        #[cfg(not(windows))]
+                        let _ = requested;
+                    }
+                    StartupOpenPathSource::InitialStartup => {
+                        self.startup_open_path = Some(requested)
+                    }
+                    StartupOpenPathSource::Bookmark => {
+                        self.show_open_admission_refusal(reason.into());
+                    }
+                }
+                return;
+            }
         };
         let defer_activation_supersede =
             matches!(source, StartupOpenPathSource::Activation) && self.is_snapshot_active();
@@ -71,6 +276,9 @@ impl App {
                         pending.owner.perf_tag(),
                         pending.requested.display()
                     ));
+                    if let Some(watch) = pending.diagnostic.as_ref().and_then(|trace| trace.watch) {
+                        watch.suspend();
+                    }
                     held_resolve_for_activation_admission = Some(Box::new(pending));
                 }
             } else {
@@ -83,6 +291,10 @@ impl App {
             }
         }
 
+        let diagnostic = matches!(source, StartupOpenPathSource::InitialStartup)
+            .then(|| InitialNavigationTrace::begin("initial-resolver-dispatch-to-ui-admission"));
+        let trace_correlation = diagnostic.as_ref().map(InitialNavigationTrace::correlation);
+        let trace_watch = diagnostic.as_ref().and_then(|trace| trace.watch);
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_w = Arc::clone(&cancel);
@@ -97,31 +309,57 @@ impl App {
             .flatten();
         let worker_bookmark = bookmark.clone();
         let repaint_ctx = ctx.clone();
-        let spawn_result = std::thread::Builder::new()
-            .name("startup-open-resolve".to_string())
-            .spawn(move || {
-                if cancel_w.load(Ordering::Relaxed) {
-                    return;
-                }
-                let result =
-                    resolve_startup_open_path(worker_requested, source, worker_bookmark.as_ref());
-                if cancel_w.load(Ordering::Relaxed) {
-                    return;
-                }
-                let _ = tx.send(result);
-                repaint_ctx.request_repaint();
+        let worker = move || {
+            if cancel_w.load(Ordering::Relaxed) {
+                return;
+            }
+            let resolve_span = trace_correlation.map(|id| {
+                event_span(Lane::Navigation, Stage::InitialTargetResolve, id)
+                    .watched_optional(trace_watch)
             });
+            let result =
+                resolve_startup_open_path(worker_requested, source, worker_bookmark.as_ref());
+            if let Some(resolve_span) = resolve_span {
+                resolve_span.finish(if cancel_w.load(Ordering::Relaxed) {
+                    Outcome::Cancelled
+                } else if result.resolved.is_some() {
+                    Outcome::Ok
+                } else {
+                    Outcome::Error
+                });
+            }
+            if cancel_w.load(Ordering::Relaxed) {
+                return;
+            }
+            let _ = tx.send(result);
+            repaint_ctx.request_repaint();
+        };
+        #[cfg(test)]
+        let force_spawn_failure =
+            FORCE_STARTUP_OPEN_RESOLVE_SPAWN_FAILURE.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let force_spawn_failure = false;
+        let spawn_result = if force_spawn_failure {
+            Err(std::io::Error::other(
+                "forced startup path resolver spawn failure",
+            ))
+        } else {
+            std::thread::Builder::new()
+                .name("startup-open-resolve".to_string())
+                .spawn(worker)
+        };
 
         match spawn_result {
             Ok(_) => {
                 self.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
-                    requested,
+                    requested: requested_owner,
                     owner,
                     cancel,
                     rx,
                     started_at: std::time::Instant::now(),
                     toast_shown: false,
                     held_resolve_for_activation_admission,
+                    diagnostic,
                 });
             }
             Err(e) => {
@@ -129,13 +367,26 @@ impl App {
                     "startup open: resolve worker spawn failed: {e}; running synchronously"
                 ));
                 let resolve_started_at = std::time::Instant::now();
+                let resolve_span = trace_correlation.map(|id| {
+                    event_span(Lane::Navigation, Stage::InitialTargetResolve, id)
+                        .watched_optional(trace_watch)
+                });
                 let result = resolve_startup_open_path(requested, source, bookmark.as_ref());
+                if let Some(resolve_span) = resolve_span {
+                    resolve_span.finish(if result.resolved.is_some() {
+                        Outcome::Ok
+                    } else {
+                        Outcome::Error
+                    });
+                }
                 let held_duration = resolve_started_at.elapsed();
                 self.finish_startup_open_path_resolve_with_held(
                     owner,
                     result,
                     held_resolve_for_activation_admission,
                     held_duration,
+                    Some(requested_owner),
+                    diagnostic,
                     ctx,
                 );
             }
@@ -143,6 +394,32 @@ impl App {
     }
 
     pub(super) fn poll_startup_open_path_resolve(&mut self, ctx: &egui::Context) {
+        if self.remote_session_blocks_local_control() {
+            self.cancel_unresolved_open_for_remote_session();
+            return;
+        }
+        // This request was accepted before the restore modal started. Keep the receiver and its
+        // owner intact so the ordinary completion tail runs exactly once after restore terminal;
+        // taking it here would let `load_folder` replace the restore target mid-transaction.
+        if self.sidecar_restore_active() || self.document_open_modal_admission_blocked() {
+            if let Some(watch) = self
+                .startup_open_path_resolve_pending
+                .as_ref()
+                .and_then(|pending| pending.diagnostic.as_ref())
+                .and_then(|trace| trace.watch)
+            {
+                watch.suspend();
+            }
+            return;
+        }
+        if let Some(watch) = self
+            .startup_open_path_resolve_pending
+            .as_ref()
+            .and_then(|pending| pending.diagnostic.as_ref())
+            .and_then(|trace| trace.watch)
+        {
+            watch.resume();
+        }
         let recv = match self.startup_open_path_resolve_pending.as_ref() {
             Some(pending) => pending.rx.try_recv(),
             None => return,
@@ -154,12 +431,16 @@ impl App {
                 let owner = pending.owner.clone();
                 let held = pending.held_resolve_for_activation_admission.take();
                 let held_duration = pending.elapsed();
+                let requested_owner = pending.requested.clone();
+                let diagnostic = pending.diagnostic.take();
                 drop(pending);
                 self.finish_startup_open_path_resolve_with_held(
                     owner,
                     result,
                     held,
                     held_duration,
+                    Some(requested_owner),
+                    diagnostic,
                     ctx,
                 );
                 ctx.request_repaint();
@@ -187,6 +468,9 @@ impl App {
                 let owner = pending.owner.clone();
                 let held = pending.held_resolve_for_activation_admission.take();
                 let held_duration = pending.elapsed();
+                if let Some(diagnostic) = pending.diagnostic.take() {
+                    diagnostic.finish(Outcome::Error);
+                }
                 crate::logger::log(format!(
                     "startup open: resolve worker disconnected source={} requested={}",
                     owner.perf_tag(),
@@ -221,6 +505,8 @@ impl App {
             result,
             None,
             std::time::Duration::ZERO,
+            None,
+            None,
             ctx,
         );
     }
@@ -231,6 +517,8 @@ impl App {
         result: StartupOpenPathResolveResult,
         held: Option<Box<StartupOpenPathResolvePending>>,
         held_duration: std::time::Duration,
+        requested_owner: Option<crate::pdf_loader::LeasedEpubPath>,
+        diagnostic: Option<InitialNavigationTrace>,
         ctx: &egui::Context,
     ) {
         if !self.startup_open_path_owner_is_current(&owner) {
@@ -239,6 +527,36 @@ impl App {
                 owner.perf_tag(),
                 result.requested.display()
             ));
+            return;
+        }
+        #[cfg(windows)]
+        let detached_route = match &owner {
+            StartupOpenPathOwner::Bookmark(bookmark_owner) => bookmark_owner
+                .detached_lease
+                .map(|lease| (lease.window_id, bookmark_owner.request_id)),
+            _ => None,
+        };
+        #[cfg(windows)]
+        if let Some((window_id, request_id)) = detached_route
+            && self.detached_viewer_window_id() != Some(window_id)
+        {
+            let routed = self.with_window_viewer_context(window_id, |app| {
+                app.finish_startup_open_path_resolve_with_held(
+                    owner,
+                    result,
+                    held,
+                    held_duration,
+                    requested_owner,
+                    diagnostic,
+                    ctx,
+                );
+            });
+            if let Err(error) = routed {
+                crate::logger::log(format!(
+                    "startup open: detached owner mount failed window_id={window_id} error={error:?}"
+                ));
+                self.cancel_bookmark_open_request(request_id, "detached_resolve_owner_missing");
+            }
             return;
         }
         let source = owner.source();
@@ -279,8 +597,51 @@ impl App {
             return;
         }
         let requested_display = result.requested.display().to_string();
-        if self.apply_startup_open_path_resolve_result(&owner, result, ctx) {
-            return;
+        let correlation = diagnostic.as_ref().map(InitialNavigationTrace::correlation);
+        let watch = diagnostic.as_ref().and_then(|trace| trace.watch);
+        let adoption = correlation.map(|id| {
+            event_span(Lane::Navigation, Stage::InitialTargetAdopt, id)
+                .watched_optional(watch)
+                .detail("resolver-result-ui-admission")
+        });
+        let outcome =
+            self.apply_startup_open_path_resolve_result(&owner, result, ctx, correlation, watch);
+        let trace_outcome = if matches!(outcome, StartupOpenApplyOutcome::Opened) {
+            Outcome::Ok
+        } else {
+            Outcome::Error
+        };
+        if let Some(adoption) = adoption {
+            adoption.finish(trace_outcome);
+        }
+        if let Some(diagnostic) = diagnostic {
+            diagnostic.finish(trace_outcome);
+        }
+        match outcome {
+            StartupOpenApplyOutcome::Opened => return,
+            StartupOpenApplyOutcome::Refused(reason) => {
+                if let StartupOpenPathOwner::Bookmark(bookmark_owner) = &owner {
+                    self.cancel_bookmark_open_request(bookmark_owner.request_id, "epub_ignored");
+                }
+                crate::logger::log(format!(
+                    "startup open: refused source={} requested={} reason={reason:?}",
+                    source.perf_tag(),
+                    requested_display
+                ));
+                if matches!(source, StartupOpenPathSource::InitialStartup) {
+                    self.open_default_startup_target();
+                }
+                return;
+            }
+            #[cfg(windows)]
+            StartupOpenApplyOutcome::DetachedRefused(reason) => {
+                if let StartupOpenPathOwner::Bookmark(bookmark_owner) = &owner {
+                    self.cancel_bookmark_open_request(bookmark_owner.request_id, "epub_deleting");
+                }
+                self.show_open_admission_refusal(reason);
+                return;
+            }
+            StartupOpenApplyOutcome::NotOpenable => {}
         }
         if matches!(source, StartupOpenPathSource::InitialStartup) {
             self.open_default_startup_target();
@@ -313,6 +674,9 @@ impl App {
         let Some(held) = held else {
             return;
         };
+        if let Some(watch) = held.diagnostic.as_ref().and_then(|trace| trace.watch) {
+            watch.resume();
+        }
         crate::logger::log(format!(
             "startup open: resume held resolve after activation refusal source={} requested={}",
             held.owner.perf_tag(),
@@ -359,7 +723,14 @@ impl App {
                 let request_id = self.bookmark_open_pending.as_ref()?.request_id();
                 let target = self.bookmark_view_target()?.clone();
                 Some(StartupOpenPathOwner::Bookmark(
-                    crate::bookmark_browser::BookmarkOpenRequestOwner { request_id, target },
+                    crate::bookmark_browser::BookmarkOpenRequestOwner {
+                        request_id,
+                        target,
+                        #[cfg(windows)]
+                        detached_lease: self
+                            .detached_viewer_window_id()
+                            .map(Self::detached_session_lease),
+                    },
                 ))
             }
         }
@@ -376,10 +747,30 @@ impl App {
         &self,
         owner: &crate::bookmark_browser::BookmarkOpenRequestOwner,
     ) -> bool {
-        self.bookmark_open_pending
+        let projected_owner_matches = self
+            .bookmark_open_pending
             .as_ref()
             .is_some_and(|pending| pending.request_id() == owner.request_id)
-            && self.bookmark_view_target() == Some(&owner.target)
+            && self.bookmark_view_target() == Some(&owner.target);
+        if projected_owner_matches {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            owner.detached_lease.is_some_and(|lease| {
+                self.bookmark_open_request_seq == owner.request_id.0
+                    && self.active_detached_window_id() == Some(lease.window_id)
+                    && self.active_detached_session.is_some_and(|session| {
+                        session.window_id == lease.window_id
+                            && session.content_phase == DetachedSessionContentPhase::Preparing
+                    })
+                    && self.bookmark_view_target() == Some(&owner.target)
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
     }
 
     pub(crate) fn begin_bookmark_page_wait(
@@ -417,6 +808,13 @@ impl App {
     ) {
         let held = pending.held_resolve_for_activation_admission.take();
         let owner = pending.owner.clone();
+        if let Some(diagnostic) = pending.diagnostic.take() {
+            diagnostic.finish(if reason == "remote_session_acquired" {
+                Outcome::SuspendedNotWatched
+            } else {
+                Outcome::Cancelled
+            });
+        }
         drop(pending);
         self.finish_replaced_startup_open_owner(owner, reason);
         if let Some(held) = held {
@@ -428,15 +826,37 @@ impl App {
     /// resolver is removed before its receiver can be polled; bookmark-owned state is cleared
     /// only when its request ID is still current.
     pub(crate) fn cancel_unresolved_open_for_navigation(&mut self) {
+        self.cancel_unresolved_open("normal_navigation");
+    }
+
+    pub(crate) fn cancel_unresolved_open_for_remote_session(&mut self) {
+        if let Some(watch) = miv_startup::watch_handle(WatchSlot::InitialDispatch) {
+            watch.retire(Outcome::SuspendedNotWatched);
+        }
+        // The worker result is stale after Remote acquires, but the explicit command line
+        // target must remain pending until Local owns the viewer again.
+        let mut held = self.startup_open_path_resolve_pending.as_ref();
+        while let Some(pending) = held {
+            if matches!(pending.owner, StartupOpenPathOwner::InitialStartup) {
+                self.startup_open_path
+                    .get_or_insert_with(|| pending.requested.to_path_buf());
+                break;
+            }
+            held = pending.held_resolve_for_activation_admission.as_deref();
+        }
+        self.cancel_unresolved_open("remote_session_acquired");
+    }
+
+    fn cancel_unresolved_open(&mut self, reason: &'static str) {
         let Some(pending) = self.startup_open_path_resolve_pending.take() else {
             return;
         };
         crate::logger::log(format!(
-            "startup open: navigation cancels resolve source={} requested={}",
+            "startup open: cancel resolve reason={reason} source={} requested={}",
             pending.owner.perf_tag(),
             pending.requested.display()
         ));
-        self.finish_replaced_startup_open_pending(pending, "normal_navigation");
+        self.finish_replaced_startup_open_pending(pending, reason);
     }
 
     /// Once resolution has completed, page enumeration/player setup may still be pending. A
@@ -464,6 +884,50 @@ impl App {
         request_id: crate::bookmark_browser::BookmarkOpenRequestId,
         reason: &'static str,
     ) -> bool {
+        #[cfg(windows)]
+        let detached_lease = self
+            .startup_open_path_resolve_pending
+            .as_ref()
+            .and_then(|pending| match &pending.owner {
+                StartupOpenPathOwner::Bookmark(owner) if owner.request_id == request_id => {
+                    owner.detached_lease
+                }
+                _ => pending
+                    .held_resolve_for_activation_admission
+                    .as_deref()
+                    .and_then(|held| match &held.owner {
+                        StartupOpenPathOwner::Bookmark(owner) if owner.request_id == request_id => {
+                            owner.detached_lease
+                        }
+                        _ => None,
+                    }),
+            })
+            .or_else(|| {
+                self.archive_convert
+                    .as_ref()
+                    .and_then(|state| state.completion.bookmark_owner())
+                    .filter(|owner| owner.request_id == request_id)
+                    .and_then(|owner| owner.detached_lease)
+            })
+            .or_else(|| {
+                (self.bookmark_open_request_seq == request_id.0)
+                    .then_some(self.active_detached_session)
+                    .flatten()
+                    .filter(|session| {
+                        session.content_phase == DetachedSessionContentPhase::Preparing
+                    })
+                    .map(|session| Self::detached_session_lease(session.window_id))
+            });
+        #[cfg(windows)]
+        if let Some(lease) = detached_lease
+            && self.detached_viewer_window_id() != Some(lease.window_id)
+        {
+            return self
+                .with_window_viewer_context(lease.window_id, |app| {
+                    app.cancel_bookmark_open_request(request_id, reason)
+                })
+                .unwrap_or(false);
+        }
         let resolver_matches =
             self.startup_open_path_resolve_pending
                 .as_ref()
@@ -507,16 +971,40 @@ impl App {
             .bookmark_open_pending
             .as_ref()
             .is_some_and(|pending| pending.request_id() == request_id);
-        if !pending_matches {
-            return resolver_matches || held_resolver_matches || archive_matches;
+        let owned = resolver_matches || held_resolver_matches || archive_matches || pending_matches;
+        if pending_matches {
+            crate::logger::log(format!(
+                "[bookmark-open] finish request id={} reason={reason}",
+                request_id.0
+            ));
+            self.bookmark_open_pending = None;
+            #[cfg(windows)]
+            let retain_detached_target_for_close = detached_lease.is_some_and(|lease| {
+                self.detached_viewer_window_id() == Some(lease.window_id)
+                    && matches!(
+                        self.bookmark_view_state,
+                        Some(BookmarkViewState::Detached { .. })
+                    )
+            });
+            #[cfg(not(windows))]
+            let retain_detached_target_for_close = false;
+            if !retain_detached_target_for_close {
+                self.clear_bookmark_view_return_state();
+            }
         }
-        crate::logger::log(format!(
-            "[bookmark-open] finish request id={} reason={reason}",
-            request_id.0
-        ));
-        self.bookmark_open_pending = None;
-        self.clear_bookmark_view_return_state();
-        true
+        #[cfg(windows)]
+        if owned
+            && detached_lease.is_some_and(|lease| {
+                self.detached_viewer_window_id() == Some(lease.window_id)
+                    && self.active_detached_session.is_some_and(|session| {
+                        session.window_id == lease.window_id
+                            && session.content_phase == DetachedSessionContentPhase::Preparing
+                    })
+            })
+        {
+            self.begin_active_detached_session_close(reason);
+        }
+        owned
     }
 
     fn apply_startup_open_path_resolve_result(
@@ -524,17 +1012,26 @@ impl App {
         owner: &StartupOpenPathOwner,
         result: StartupOpenPathResolveResult,
         ctx: &egui::Context,
-    ) -> bool {
+        trace_correlation: Option<u64>,
+        trace_watch: Option<WatchHandle>,
+    ) -> StartupOpenApplyOutcome {
         let source = owner.source();
         let Some(resolution) = result.resolved else {
             crate::logger::log(format!(
                 "startup open: no openable path for {}",
                 result.requested.display()
             ));
-            return false;
+            return StartupOpenApplyOutcome::NotOpenable;
         };
 
         let openable = resolution.path;
+        if matches!(resolution.kind, crate::folder_tree::OpenablePathKind::File)
+            && matches!(owner, StartupOpenPathOwner::Bookmark(_))
+            && let Some(reason) = self.pdf_open_refusal(&openable)
+        {
+            self.show_pdf_open_refusal(reason);
+            return StartupOpenApplyOutcome::Refused(reason);
+        }
         crate::logger::log(format!(
             "startup open: requested={} resolved={} resolve_ms={:.1}",
             result.requested.display(),
@@ -542,11 +1039,60 @@ impl App {
             result.elapsed_ms
         ));
 
+        self.capture_main_list_restore_cursor();
         let select_requested_file = resolution.requested_is_file
             && matches!(
                 resolution.kind,
                 crate::folder_tree::OpenablePathKind::Directory
             );
+        #[cfg(windows)]
+        if matches!(source, StartupOpenPathSource::Bookmark)
+            && self.navigation_scope.is_detached_physical()
+            && self.active_detached_session.is_some_and(|session| {
+                session.content_phase == DetachedSessionContentPhase::Preparing
+            })
+        {
+            if self
+                .bookmark_open_pending
+                .as_ref()
+                .and_then(crate::bookmark_browser::PendingBookmarkOpen::media)
+                .is_some()
+            {
+                let outcome = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                    openable,
+                    true,
+                    owner.open_request_owner(),
+                    super::StartupListIntent::PageContinuation,
+                );
+                if select_requested_file && matches!(outcome, FolderOpenOutcome::Loaded) {
+                    self.open_startup_file_if_visible(&result.requested);
+                }
+                return match outcome {
+                    FolderOpenOutcome::Loaded
+                    | FolderOpenOutcome::Classifying
+                    | FolderOpenOutcome::ConversionDialogOpened => StartupOpenApplyOutcome::Opened,
+                    FolderOpenOutcome::Ignored => StartupOpenApplyOutcome::NotOpenable,
+                    FolderOpenOutcome::Refused(reason) => StartupOpenApplyOutcome::Refused(reason),
+                };
+            }
+            match self.bookmark_detached_descriptor(&openable, resolution.kind) {
+                DetachedBuild::Built(descriptor) => {
+                    return if self.continue_active_detached_book_context_from_descriptor(descriptor)
+                    {
+                        StartupOpenApplyOutcome::Opened
+                    } else {
+                        StartupOpenApplyOutcome::NotOpenable
+                    };
+                }
+                DetachedBuild::Refused(reason) => {
+                    return StartupOpenApplyOutcome::DetachedRefused(reason);
+                }
+                DetachedBuild::NotApplicable => {}
+            }
+            // OtherArchive without a cache remains in this same loading context.  The ordinary
+            // owned loader below starts probe/conversion and carries the bookmark's window lease
+            // through its completion policy.
+        }
         #[cfg(windows)]
         if matches!(source, StartupOpenPathSource::Bookmark)
             && self.settings.effective_media_in_media_window()
@@ -563,20 +1109,33 @@ impl App {
                 })
             )
         {
-            return self.open_bookmark_media_in_detached_context(
+            return if self.open_bookmark_media_in_detached_context(
                 ctx,
                 &result.requested,
                 openable,
                 select_requested_file,
-            );
+            ) {
+                StartupOpenApplyOutcome::Opened
+            } else {
+                StartupOpenApplyOutcome::NotOpenable
+            };
         }
         #[cfg(windows)]
         if matches!(source, StartupOpenPathSource::Bookmark)
             && self.settings.detached_viewer_open_images_in_window
-            && let Some(opened) =
-                self.open_bookmark_book_in_detached_context(ctx, openable.clone(), resolution.kind)
         {
-            return opened;
+            match self.open_bookmark_book_in_detached_context(
+                ctx,
+                openable.clone(),
+                resolution.kind,
+            ) {
+                DetachedBuild::Built(true) => return StartupOpenApplyOutcome::Opened,
+                DetachedBuild::Built(false) => return StartupOpenApplyOutcome::NotOpenable,
+                DetachedBuild::Refused(reason) => {
+                    return StartupOpenApplyOutcome::DetachedRefused(reason);
+                }
+                DetachedBuild::NotApplicable => {}
+            }
         }
         #[cfg(windows)]
         if matches!(source, StartupOpenPathSource::Bookmark)
@@ -588,17 +1147,45 @@ impl App {
                 .is_some()
             && !self.park_detached_media_before_fullfeature_bookmark_book_open(ctx)
         {
-            return false;
+            return StartupOpenApplyOutcome::NotOpenable;
         }
         let auto_fullscreen = matches!(source, StartupOpenPathSource::Bookmark)
             || startup_openable_should_auto_fullscreen(&self.settings, &openable, resolution.kind);
+        let scan = trace_correlation.map(|id| {
+            event_span(Lane::Navigation, Stage::InitialTargetScan, id)
+                .watched_optional(trace_watch)
+                .detail("existing-loader-call-return")
+        });
         let outcome = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
             openable,
             auto_fullscreen,
             owner.open_request_owner(),
+            if select_requested_file {
+                super::StartupListIntent::PageContinuation
+            } else {
+                super::StartupListIntent::container_open(auto_fullscreen)
+            },
         );
-        if matches!(outcome, FolderOpenOutcome::Ignored) {
-            return false;
+        if let Some(scan) = scan {
+            scan.finish(
+                if matches!(
+                    outcome,
+                    FolderOpenOutcome::Ignored | FolderOpenOutcome::Refused(_)
+                ) {
+                    Outcome::Error
+                } else {
+                    Outcome::Ok
+                },
+            );
+        }
+        match outcome {
+            FolderOpenOutcome::Ignored => return StartupOpenApplyOutcome::NotOpenable,
+            FolderOpenOutcome::Refused(reason) => {
+                return StartupOpenApplyOutcome::Refused(reason);
+            }
+            FolderOpenOutcome::Loaded
+            | FolderOpenOutcome::Classifying
+            | FolderOpenOutcome::ConversionDialogOpened => {}
         }
         if matches!(source, StartupOpenPathSource::Bookmark)
             && matches!(outcome, FolderOpenOutcome::Loaded)
@@ -609,23 +1196,77 @@ impl App {
         if select_requested_file && matches!(outcome, FolderOpenOutcome::Loaded) {
             self.open_startup_file_if_visible(&result.requested);
         }
-        true
+        StartupOpenApplyOutcome::Opened
     }
 
     /// Route a bookmark-backed book into the same independent context seam used by normal
-    /// PDF/ZIP grid opens. `None` means the container still needs the archive-conversion flow;
-    /// `Some` means this method owns the request and main must not load the container.
+    /// PDF/ZIP grid opens. An inapplicable container still needs archive conversion;
+    /// EPUB admission refusal is terminal and must not fall through to that route.
+    #[cfg(windows)]
+    fn bookmark_detached_descriptor(
+        &mut self,
+        openable: &Path,
+        kind: crate::folder_tree::OpenablePathKind,
+    ) -> DetachedBuild<ViewerContextDescriptor> {
+        let Some(pending) = self
+            .bookmark_open_pending
+            .as_ref()
+            .and_then(crate::bookmark_browser::PendingBookmarkOpen::book)
+        else {
+            return DetachedBuild::NotApplicable;
+        };
+        match pending.bookmark.container_kind {
+            crate::book_bookmarks::BookContainerKind::Pdf
+                if matches!(kind, crate::folder_tree::OpenablePathKind::File) =>
+            {
+                Self::detached_pdf_descriptor(openable, None)
+            }
+            crate::book_bookmarks::BookContainerKind::Zip
+                if matches!(kind, crate::folder_tree::OpenablePathKind::File) =>
+            {
+                DetachedBuild::Built(ViewerContextDescriptor::Zip {
+                    path: openable.to_path_buf(),
+                    entry_name: None,
+                    archive_source_override: None,
+                })
+            }
+            crate::book_bookmarks::BookContainerKind::CompiledBook
+            | crate::book_bookmarks::BookContainerKind::ImageFolder
+                if matches!(kind, crate::folder_tree::OpenablePathKind::Directory) =>
+            {
+                DetachedBuild::Built(ViewerContextDescriptor::BookFolder {
+                    path: openable.to_path_buf(),
+                })
+            }
+            crate::book_bookmarks::BookContainerKind::OtherArchive => {
+                let source = pending.bookmark.container_path.clone();
+                let Some(cached) = self.try_archive_cache_lookup(&source) else {
+                    return DetachedBuild::NotApplicable;
+                };
+                DetachedBuild::Built(ViewerContextDescriptor::Zip {
+                    path: cached,
+                    entry_name: None,
+                    archive_source_override: Some(source),
+                })
+            }
+            _ => DetachedBuild::NotApplicable,
+        }
+    }
+
     #[cfg(windows)]
     pub(super) fn open_bookmark_book_in_detached_context(
         &mut self,
         ctx: &egui::Context,
         openable: PathBuf,
         kind: crate::folder_tree::OpenablePathKind,
-    ) -> Option<bool> {
-        let pending = self
+    ) -> DetachedBuild<bool> {
+        let Some(pending) = self
             .bookmark_open_pending
             .as_ref()
-            .and_then(crate::bookmark_browser::PendingBookmarkOpen::book)?;
+            .and_then(crate::bookmark_browser::PendingBookmarkOpen::book)
+        else {
+            return DetachedBuild::NotApplicable;
+        };
         let target_matches = matches!(
             self.bookmark_view_state.as_ref(),
             Some(BookmarkViewState::Opening {
@@ -634,50 +1275,28 @@ impl App {
             }) if crate::path_key::eq_keep_drive(path, &pending.bookmark.container_path)
         );
         if !target_matches {
-            return None;
+            return DetachedBuild::NotApplicable;
         }
 
-        let descriptor = match pending.bookmark.container_kind {
-            crate::book_bookmarks::BookContainerKind::Pdf
-                if matches!(kind, crate::folder_tree::OpenablePathKind::File) =>
-            {
-                ViewerContextDescriptor::Pdf {
-                    path: openable,
-                    page_num: None,
-                }
-            }
-            crate::book_bookmarks::BookContainerKind::Zip
-                if matches!(kind, crate::folder_tree::OpenablePathKind::File) =>
-            {
-                ViewerContextDescriptor::Zip {
-                    path: openable,
-                    entry_name: None,
-                    archive_source_override: None,
-                }
-            }
-            crate::book_bookmarks::BookContainerKind::CompiledBook
-            | crate::book_bookmarks::BookContainerKind::ImageFolder
-                if matches!(kind, crate::folder_tree::OpenablePathKind::Directory) =>
-            {
-                ViewerContextDescriptor::BookFolder { path: openable }
-            }
-            crate::book_bookmarks::BookContainerKind::OtherArchive => {
-                let source = pending.bookmark.container_path.clone();
-                let cached = self.try_archive_cache_lookup(&source)?;
-                ViewerContextDescriptor::Zip {
-                    path: cached,
-                    entry_name: None,
-                    archive_source_override: Some(source),
-                }
-            }
-            _ => return None,
+        let request_id = pending.request_id;
+        let descriptor = match self.bookmark_detached_descriptor(&openable, kind) {
+            DetachedBuild::Built(descriptor) => descriptor,
+            DetachedBuild::NotApplicable => return DetachedBuild::NotApplicable,
+            DetachedBuild::Refused(reason) => return DetachedBuild::Refused(reason),
         };
+        if let ViewerContextDescriptor::Pdf { path, .. } = &descriptor
+            && let Some(reason) = self.pdf_open_refusal(path)
+        {
+            self.show_pdf_open_refusal(reason);
+            self.cancel_bookmark_open_request(request_id, "epub_ignored");
+            return DetachedBuild::Built(false);
+        }
 
         let pending = match self.bookmark_open_pending.take() {
             Some(crate::bookmark_browser::PendingBookmarkOpen::Book(pending)) => pending,
             other => {
                 self.bookmark_open_pending = other;
-                return None;
+                return DetachedBuild::NotApplicable;
             }
         };
         let base_placement = self.active_detached_viewer_current_placement();
@@ -685,11 +1304,11 @@ impl App {
         if !self.park_and_close_current_active_detached_viewer(ctx) {
             self.bookmark_open_pending =
                 Some(crate::bookmark_browser::PendingBookmarkOpen::Book(pending));
-            return Some(false);
+            return DetachedBuild::Built(false);
         }
         let placement_seed = had_active_detached
             .then(|| self.offset_detached_image_window_placement(base_placement));
-        Some(self.start_active_detached_book_context(
+        DetachedBuild::Built(self.start_active_detached_book_context(
             descriptor,
             ctx,
             placement_seed,
@@ -852,16 +1471,60 @@ impl App {
         true
     }
 
-    pub(super) fn open_default_startup_target(&mut self) {
+    pub(crate) fn open_default_startup_target(&mut self) {
+        let diagnostic = InitialNavigationTrace::begin("default-target-existing-loader-return");
+        let correlation = diagnostic.correlation();
+        let watch = diagnostic.watch;
+        let adoption = event_span(Lane::Navigation, Stage::InitialTargetAdopt, correlation)
+            .watched_optional(watch)
+            .detail("default-target-call-return");
+        let outcome = self.open_default_startup_target_observed(correlation, watch);
+        adoption.finish(outcome);
+        diagnostic.finish(outcome);
+    }
+
+    fn open_default_startup_target_observed(
+        &mut self,
+        correlation: u64,
+        watch: Option<WatchHandle>,
+    ) -> Outcome {
+        if self.settings.startup_folder_mode == crate::settings::StartupFolderMode::Previous {
+            let load = event_span(Lane::Navigation, Stage::InitialTargetScan, correlation)
+                .watched_optional(watch)
+                .detail("previous-list-call-return");
+            self.open_previous_startup_list();
+            load.finish(Outcome::Ok);
+            return Outcome::Ok;
+        }
         if self.settings.startup_folder_mode == crate::settings::StartupFolderMode::ReadingHistory {
+            let load = event_span(Lane::Navigation, Stage::InitialTargetScan, correlation)
+                .watched_optional(watch)
+                .detail("reading-history-call-return");
             self.enter_reading_history();
+            load.finish(Outcome::Ok);
         } else if should_start_in_drive_list(&self.settings) {
+            let load = event_span(Lane::Navigation, Stage::InitialTargetScan, correlation)
+                .watched_optional(watch)
+                .detail("drive-list-call-return");
             self.enter_drive_list(None);
-        } else if let Some(folder) = crate::known_folders::startup_folder(
-            self.settings.startup_folder_mode,
-            self.settings.last_folder.as_deref(),
-            self.settings.startup_folder_path.as_deref(),
-        ) {
+            load.finish(Outcome::Ok);
+        } else {
+            let resolve = event_span(Lane::Navigation, Stage::InitialTargetResolve, correlation)
+                .watched_optional(watch)
+                .detail("default-known-folder-resolution");
+            let folder = crate::known_folders::startup_folder(
+                self.settings.startup_folder_mode,
+                self.settings.last_folder.as_deref(),
+                self.settings.startup_folder_path.as_deref(),
+            );
+            resolve.finish(if folder.is_some() {
+                Outcome::Ok
+            } else {
+                Outcome::Skipped
+            });
+            let Some(folder) = folder else {
+                return Outcome::Skipped;
+            };
             // last_folder には変換アーカイブ (RAR/CBR/7z/LZH) の元パスが入りうるので、
             // load_folder ではなく load_folder_or_convert_archive を通す。キャッシュが
             // あれば open_archive_via_cache が元アーカイブを開き直し (current_folder は
@@ -873,11 +1536,27 @@ impl App {
             // にそのまま乗る (名前でケース無視照合 → フィルタで隠れていれば直近の可視 idx)。
             // 代入が無条件なのは、起動フォルダを開く時点で `select_after_load` に意見を
             // 持つ経路が他に無いため (BS 戻りも親フォルダボタンも、まだ 1 度も動いていない)。
+            let previous_selection = self.select_after_load.clone();
+            let previous_scroll = self.scroll_selected_to_rows_above;
             let hint = crate::known_folders::startup_cursor_hint(&self.settings, &folder);
             self.select_after_load = hint.as_ref().map(|(name, _)| name.clone());
             self.scroll_selected_to_rows_above = hint.and_then(|(_, rows)| rows);
-            let _ = self.load_folder_or_convert_archive(folder);
+            let load = event_span(Lane::Navigation, Stage::InitialTargetScan, correlation)
+                .watched_optional(watch)
+                .detail("default-existing-loader-call-return");
+            let outcome = self.load_folder_or_convert_archive(folder);
+            let refused = matches!(
+                outcome,
+                FolderOpenOutcome::Ignored | FolderOpenOutcome::Refused(_)
+            );
+            load.finish(if refused { Outcome::Error } else { Outcome::Ok });
+            if refused {
+                self.select_after_load = previous_selection;
+                self.scroll_selected_to_rows_above = previous_scroll;
+                return Outcome::Error;
+            }
         }
+        Outcome::Ok
     }
 
     fn open_startup_file_if_visible(&mut self, requested: &Path) {
@@ -951,6 +1630,14 @@ pub(crate) fn startup_openable_should_auto_fullscreen(
     }
     match kind {
         crate::folder_tree::OpenablePathKind::File => {
+            if settings.epub_file_handling_ignores_epub()
+                && openable
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+            {
+                return false;
+            }
             crate::folder_tree::is_open_as_container(openable)
                 || (!settings.archive_file_handling_ignores_convertible()
                     && crate::folder_tree::is_convertible_archive_path(openable))

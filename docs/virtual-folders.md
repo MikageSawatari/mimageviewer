@@ -1,7 +1,71 @@
-# 仮想フォルダ (ZIP / RAR / PDF) 処理
+# 仮想フォルダ (ZIP / RAR / PDF / EPUB) 処理
+
+## EPUB → PDF 読み取り境界とオープン導線 (S2b / S2c-1)
+
+S2b は `pdf_loader` の読み取り経路を用意した。S2c-1 では、アドレスバー・起動引数・復元先に指定された
+`.epub` を PDF 系の本として開く。S3a では通常フォルダ・スマートフォルダ・サブ展開などの一覧でも
+`PdfFile` として分類し、元 EPUB パスを保つ。同じフォルダに同名 PDF がある場合は設定に従って EPUB を隠す。
+S3b の明示保存では同じフォルダの同名 PDF を上書きせず作り、検証後に通常の PDF として開く。現在の EPUB 変換結果を再利用できる場合はそれを複写し、古い場合は保存先へ直接変換してキャッシュ世代を増やさない。スマートフォルダやコレクションから保存した場合も、元 EPUB の行を親として保って PDF を開く。バッチ保存後は一覧を読み直し、同名 PDF 優先の設定を反映する。
+未変換の場合はファイル処理設定に従い、確認、直接変換、または無視する。確認時は別プロセスで内容を調べ、
+レイアウト、開き方向、章数を表示する。保護された EPUB は変換を提示せず理由を表示する。
+変換中の進捗と取消はダイアログが所有し、公開または既存世代の採用後は元 EPUB パスを開き直す。
+元ファイルが変換中に変わった場合は再試行を提示する。変換器の制限時間は 600 秒。
+開いた本の `PdfPage` と履歴・保存キーは元 EPUB の論理パスを保持する。一覧タイルの
+`PdfFile` も同じ論理パスを使い、未変換時はアイコンと EPUB バッジ、変換済みなら第 1 ページを表示する。
+Remote でも同じ本・ページの論理パスと世代スタンプを使う。変換済みの表紙とページは本体の PDF
+読み取り経路で生成し、未変換のタイルは EPUB の目印を出す。Remote から変換は開始しない。
+`pdf_loader::resolve_read_target` は論理パスを変換世代の PDF パスへ解決する。EPUB の初回解決は背景スレッドで行い、
+PDFium の open admission・worker 文書キャッシュ・列挙合流にはその実ファイルのパスを渡す。
+EPUB の世代を返す `ReadTarget` は本ごとの読取リースを持ち、列挙・描画・サムネイルや派生データの処理が終わるまで削除を拒否する。
+表示や perf のキーは論理パスのままにする。通常 PDF の解決はパスをそのまま返し、stat を追加しない。
+IPC の要求生成には `ResolvedReadPath` を必須にし、PDF pool へは要求 bytes と解決済みパスを `PdfPoolRequest` で対にして渡す。
+変換 PDF の物理 `.part` 検証だけは例外で、キャッシュの世代予約時に発行した `ReservedOutput` token を必須にする。
+非同期列挙では通常 PDF と固定表にある EPUB の待ち手を呼出元で直ちに登録する。
+新しいハンドルを受け取ってから旧ハンドルを破棄しても同じ実行要求に合流できる。
+未固定の EPUB だけは元ファイル stat と DB 照合を背景スレッドで済ませてから登録する。
+固定表の mutex はメモリ検索と挿入だけを保護し、元ファイルの stat や DB 照合中は保持しない。
+
+EPUB の初回解決では元ファイルの完全精度の FILETIME とサイズを `epub_cache.db` の現在世代と照合する。
+有効な世代が無ければ `NotConverted`、起動時の削除ゲートが無効なら `EpubUnavailable` を返す。
+世代ファイルが欠落していれば現在表から条件付きで切り離す。
+成功した世代は正規化した論理パスでプロセス内の固定表へ挿入し、以後は元 EPUB の変更や別接続の
+再公開があっても実行中は同じ世代を読み続ける。派生データの照合には PDF の従来の時刻・サイズと
+区別した `DocumentStamp::Generation { id, pdf_size }` を使う。
+固定した EPUB 世代行の `direction` (`rtl` / `ltr` / `default`) も列挙結果へ渡す。EPUB の変換 PDF は方向取得のために再読込しない。
+通常 PDF の `/ViewerPreferences /Direction` は `EnumerateOptions.want_direction=true` の要求時だけ取得する。
+その場合だけ PDF ワーカーは公開 PDFium bindings で PDF をもう一度開いて方向を読み、必ず閉じる。
+追加 open の失敗時は方向無しとしてページ列挙を維持する。既定の `false` では追加 open を行わない。
+S2c-1 は D10 設定が ON かつ本ごとの見開き保存値が無い場合だけ `true` を渡す。
+直接 open の PDF/EPUB は、列挙成功まで元の一覧を表示し、`pdf_meta` の仮ページを先出ししない。
+固定済み EPUB の世代 ID と世代 PDF サイズによる `pdf_meta` 照合は、スマートフォルダの
+staged 子 open など採用を所有する経路で使う。未固定 EPUB は UI で元ファイルや DB を読まず列挙を待つ。
+
+S2c-2 の派生データは EPUB について `(世代 ID, 世代 PDF サイズ)` で照合する。既存の
+サムネイル・`pdf_meta` の整数列をそのまま使い、`image_metas` の更新日時とサイズは元 EPUB の
+表示用属性に保つ。タイルとページの UI 要求は worker 解決印を持ち、worker は同一 `ReadTarget` で
+cache hit 判定、PDFium 描画、保存を行う。auto-aspect の初期 seed は EPUB の元属性から
+hit させず、worker サムネイル結果で比率を集める。ピンの EPUB source ID は worker が固定世代を
+付けて確定する。内容同定は論理パスの EPUB 種別を使い、固定済みなら世代表の元サイズ・時刻・
+ハッシュを読み、未固定なら元 EPUB を読む。非同期 backfill は分岐時の来歴を保存し、
+本ごとの固定ロック内で固定状態と元ファイル状態を再照合して台帳を書き込む。
+stage-0 検出と復元時の台帳更新も同じ境界を使う。復元候補は検出時の未固定元状態を保持し、
+復元 worker は本単位ガード内でコピー前に再照合してから編集行のコピーと台帳昇格を行う。
+ドライブ一覧の間接ピンでは、UI は従来と同じ親 catalog 行を先に seed する。cache-only worker は現行子ピンを設定深さで解決し、子代表の書込側と同じキーを作って親 catalog の一行を完全一致で読む。EPUB は固定世代 suffix と整数 stamp を照合する。行が異なれば最終画像へ差し替え、行が無い・旧世代・変更済みピンなら固定ドライブアイコンへ戻る。同じ画像・stamp・寸法ならテクスチャを作り直さない。子ピンの対象が移動・削除されて解決できない場合は、自動代表の保存行を通常の子フォルダ読取と同じ選定証明で検証する。選定元の状態・pin revision・依存 catalog のいずれかが変わっていればアイコンへ戻る。画像・通常 PDF の初回表示は従来の seed を使う。再起動後に EPUB が再変換された場合、worker の判定まで旧表紙が一時表示され得るが、最終表示には現行世代の代表だけを採用する。
+仮想フォルダを開く際の親子 WebP seed / writeback は EPUB を対象にせず、
+PDFium の先読み抑制だけは PDF と同じ 100 ms を適用する。
+親とページ 0 を個別に描画する。
 
 ZIP アーカイブ、直接閲覧できる RAR/CBR、PDF ドキュメントは「中身のページをフォルダ内のファイルに見立てて扱う」仮想フォルダとして実装されている。
 通常画像ファイルとの処理分岐が多く、修正漏れが起きやすい。**ZIP/PDF 対応のある機能を触るときは必ずこのドキュメントを見る**。
+
+スマートフォルダから物理子の Folder/PDF/ZIP/変換アーカイブへ入る場合は、
+新要求の scan/列挙を表示中の一覧と別 owner で進める。成功して表示する直前にだけ
+旧一覧・旧 PDF/ZIP receiver を退役し、準備結果を一回 install する。PDF warm cache の
+placeholder は採用後も同じ enumerate handle で検証する。取消・未採用エラー・古い完了は
+旧一覧と履歴に触れない。変換 cache ZIP は実ロード先であり、favorite・address・履歴・pin
+の元 source は元アーカイブである。詳細は [§1.257 の実装記録](section257-smart-folder-navigation.md)。
+スマートフォルダの Ctrl+↑/↓ は最終 root 一覧の表示順から Folder/PDF/ZIP/変換書庫だけを
+一つの列として横断する。Folder 内部では従来の DFS を続け、単体画像・動画は横断対象にしない。
 
 ---
 
@@ -16,7 +80,7 @@ ZIP アーカイブ、直接閲覧できる RAR/CBR、PDF ドキュメントは�
 | `Video(PathBuf)` | 通常フォルダ内 | 動画ファイル |
 | `Audio(PathBuf)` | 通常フォルダ内 | 音声ファイル |
 | `ZipFile(PathBuf)` | 通常フォルダ内 | ZIP アーカイブ (未展開)。`.zip` と別名 `.cbz` を含む (`folder_tree::is_zip_extension` で判定) |
-| `PdfFile(PathBuf)` | 通常フォルダ内 | PDF ドキュメント (未展開) |
+| `PdfFile(PathBuf)` | 通常フォルダ内 | PDF または EPUB の本 (元の論理パスを保持) |
 | `ConvertibleArchive { path, format }` | 通常フォルダ内 | RAR/7z/LZH 等。RAR は worker 判定で直接閲覧または ZIP 変換キャッシュ、7z/LZH は ZIP 変換キャッシュ経由で開く |
 | `ZipImage { zip_path, entry_name }` | ZIP を開いた中 | ZIP 内の画像エントリ。`entry_name` はネストでも `"outer/ch01.zip/p.jpg"` のフルパス |
 | `ZipDir { zip_path, dir_prefix, is_archive, representative }` | ネスト ZIP を開いた中 (v1.3.0) | 「入れる」子ディレクトリ / 内側アーカイブ。Enter で降りる。仮想コンテナで実パスなし |
@@ -35,13 +99,34 @@ mtime / size と画像認識 fingerprint を identity に catalog cache へ保�
 `ZipImage/ZipDir/PdfPage` は「内側」= 仮想フォルダのリスト。`SearchContainer` は Ctrl+G 専用ビュー。
 同じリストに外側と内側が混在することはない。
 
+名前付きコレクションの root は、複数の実フォルダにある外側の項目を 1 つの一覧へ並べる
+`TopLevelGridView::Collection` である。登録できるのは実ファイル・実フォルダ・ZIP/PDF
+などの本体で、`ZipImage` / `ZipDir` / `PdfPage` の仮想ページや階層は単独登録しない。
+通常フォルダでは短いファイル名で引ける sidecar / video pin / thumbnail の対応も、
+コレクションでは同名ファイルが異なる親に存在し得るため正規化した full path をキーにする。
+root の準備は worker が行い、source を開いて子へ入った後も root の戻り先と現在 entry を
+viewer context が保持する。別の実フォルダへの明示移動は読込成功時だけその owner を退役し、
+取消・失敗では元の root を保つ。コレクションから開いた PDF / ZIP のページを Esc / Enter /
+右クリックで閉じる場合も、実ファイルの親フォルダではなく、collection ID・revision・entry ID・
+source key を持つ typed restore で同じ root へ戻る。ネストした ZIP 内の子から直接閉じる場合も
+同じ root entry を選択し、コレクションの順序とスクロール復元を維持する。
+
+サムネイルの full-path cache key を使うかどうかの正本は
+`App::use_full_path_cache_keys()`。検索結果（Ctrl+S / Ctrl+G）、タグ一覧、閲覧履歴、
+レーティング一覧、コレクションに加え、synthetic view path の一覧（★固定等）と
+ドライブ/共有ルートを対象とする。要求生成・読出し・seed・欠損整理で同じ判定を共有し、
+一覧の種類ごとに basename/full-path の分岐を独自追加しない。
+
 通常グリッドの表示順は `Settings.grid_display_order` の 4 行割り当てで決まる。カテゴリは
 実フォルダ (`Folder`) / アーカイブ類 (`ZipFile` / `PdfFile` / `ConvertibleArchive`、ZIP 内では
 `ZipDir`) / 画像 (`Image` / `ZipImage` / `PdfPage` / `Stack`) / 動画・音声 (`Video` / `Audio`)。
 同じ行へ割り当てたカテゴリは共通の `sort_order` で混在ソートし、空行は読み飛ばす。既定は
 1 行目が実フォルダ + アーカイブ類、2 行目が画像 + 動画・音声。組み立ては
-`grid_item::arrange_grid_items` を通常フォルダ、ZIP materialize、ファイル名スタック、
+`grid_item::arrange_grid_items` 系を通常フォルダ、ZIP materialize、ファイル名スタック、
 レーティング一覧、サブフォルダ展開から共有する。全文検索の flat result は対象外。
+一覧のサイズ順は実ファイルだけを既知サイズとして扱う。実フォルダ、ZIP/PDF内ページ、
+検索用コンテナ、複数項目を畳んだStackなどの合成セルは不明とし、昇順・降順とも同じ割当行の
+既知項目より後ろへ置く。実在する0バイトファイルは既知の0として並べる。
 
 サブフォルダ展開では、再帰走査で見つけた ZIP/CBZ と PDF の**本体だけ**をそれぞれ
 `ZipFile` / `PdfFile` 1 項目として同じ外側リストへ入れ、内部の `ZipImage` / `PdfPage` は
@@ -201,9 +286,32 @@ importは選択originへ復元する前に対象ページ区分のsource/cache�
 新しく「現在のフォルダ」を永続化・ナビゲーションに使う箇所を足すときは、`current_folder` を
 直接使わず **`effective_folder()` を使う** こと。過去に漏れた実例:
 
-- **`last_folder` (次回起動の復元先)**: `start_loading_items` の保存で `source_path` (= キャッシュ
+- **`last_folder` (旧復元値と互換 carrier)**: `start_loading_items` の保存で `source_path` (= キャッシュ
   ZIP) を入れていたため、再起動で `archive_cache\..\book.zip` を素の ZIP として開き、address に
   キャッシュパスが漏れた。`effective_folder()` を保存するよう修正。
+- **明示一覧の起動復元 (`startup_list_restore`)**: 「前回終了した場所」は main で最後に
+  明示した物理フォルダ／本／ドライブ一覧と、その一覧のカーソルを復元する。本を直接ページ
+  表示するための内部 load、読書中の本移動、reload は更新しない。本一覧を明示表示する要求を
+  main が受理したら採用済みの本一覧へ更新する。検索／Collection／Smart 等の合成 root と、
+  そこから直接ページ表示中は直前の物理一覧を保持し、実際に物理子の一覧を明示した時だけ更新する。
+  F12 linked の表示先切替と independent viewer は main の復元先を変更しない。
+  ZIP は現在の実効 prefix と cursor を対で保存する。変換書庫は元 source を保存し、cache ZIP の
+  hydration は `InternalHydration(Box<StartupListIntent>)` として、同じ request が元の意図を
+  所有する。Collection の Ctrl+↑↓ も Folder／ZIP／prepared PDF の hydration 自体では通知せず、
+  physical-child の採用後に元の意図を一度通知する。sidecar 待ちは同じ既存 continuation が受け取る。
+  materialization は内側の RestoreList を投影し、同期列挙でも保存 prefix の行を
+  最初から作る。hydration 自体は記録せず、override と surface 採用後に既存列挙 request へ
+  元の意図を渡すか、同期採用の tail で一度記録する。`InternalInstall` だけで prefix を落とす
+  経路や、root の行を作ってから階層を作り直す経路は使わない。EPUB、password、sidecar 等の
+  continuation も同じ意図を保持する。
+  旧値は初回だけそのまま移行し、現在の auto-open 設定で過去の一覧を推測しない。
+  tray 格納で main の静止画読書を閉じる場合も、本一覧を明示しておらず保存先がその親一覧なら、
+  既存の親戻りを使って親一覧へ戻す。これは自動復帰なので一覧 record を採用し直さず、
+  親の cursor と読書位置を保持する。明示済み本一覧、動画、detached／switching は従来どおり。
+  画像のみフォルダを本として直接開く場合も同じ親戻りを使う。判定は採用済みの一覧と保存済み親一覧に基づき、
+  読書中に画像フォルダの自動オープン設定を変更しても復帰先は変わらない。
+  tray 復帰そのものは起動復元を実行しない。
+  所有契約と完了した自動検証、利用者の実機確認手順は [起動復元の所有設計](startup-restore-target-plan.md) を参照。
 - **起動時復元のルーティング**: `App::update` 初回フレームは `load_folder` ではなく
   `load_folder_or_convert_archive` を通す。元アーカイブパスを渡すとキャッシュ参照 →
   `open_archive_via_cache` で開き直し、キャッシュが無ければ変換ダイアログを出す。
@@ -217,6 +325,13 @@ importは選択originへ復元する前に対象ページ区分のsource/cache�
   `folder_should_stop` と `sorted_subdirs` は RAR/CBR/7z/CB7/LZH/LHA も ZIP/PDF と同じ
   コンテナ候補として扱い、`App::load_folder_nav_target` から
   `load_folder_or_convert_archive` へ渡す。`Ignore` では一覧スキャンと同じく候補から外す。
+  現在開いている実ファイルは、`Ignore` や同名フォルダ/ZIP 優先で着地候補から外れても
+  ツリー順の起点として保持する。別窓の静止画 viewer では、RAR/CBR は画像を含む直読み可能な
+  アーカイブか、画像を含む検証済み変換キャッシュがある場合だけ着地できる。直読みを優先し、
+  変換が必要な未キャッシュのアーカイブには着地しない。RAR header 検査が失敗したときも
+  着地しない。判定とキャッシュのページ検証は DFS worker 上で行い、同じ移動内の列挙・
+  停止判定・target 作成で判定結果を再利用する。別窓の読込では検証済み backing を直接渡し、
+  UI thread でキャッシュ DB を再照会しない。
   通常フォルダ一覧には分割 RAR の後続パートも実ファイルとして表示するが、フォルダ横断では
   同じ本へ何度も停止しないよう後続パートを候補から外す。この判定は DFS worker で指定された
   ファイルの RAR header `volume_info()` を確認する。`unrar` の `is_multipart()` /
@@ -239,6 +354,37 @@ importは選択originへ復元する前に対象ページ区分のsource/cache�
 ## 2. 仮想フォルダの展開
 
 ### 2.1 ZIP / 直接閲覧 RAR を開く (`App::load_zip_as_folder`)
+
+#### 親一覧の位置保存と履歴復帰 (§1.328)
+
+通常 item install と ZIP の先出し表示は `folder_history` (scroll / selected) の保存処理を
+`save_leaving_folder_grid_position` に集約する。通常 install は `start_loading_items_inner` から呼び、
+ZIP / 直接閲覧 RAR / 変換キャッシュ ZIP は、列挙待ち表示のために旧 items・選択・scroll・
+`current_folder` を消す直前に同じ処理を呼ぶ。列挙完了時の空の旧一覧は保存対象外なので、
+親の位置を上書きしない。取消・失敗で親に戻る場合も既存の復元処理を使う。
+検索等の合成一覧は保存対象外という従来の境界を維持する。PDF は旧一覧を保持して採用時に
+通常 install を通るため、追加の保存は不要。
+
+これは session 内の履歴位置で、§1.335 の明示一覧の起動復元とは別の記録である。
+`StartupListIntent` の運搬・成功採用はそのまま保ち、ここから復元先の採用を通知しない。
+直接読書の `PageContinuation` でも履歴位置は保存するが、明示一覧の復元先は保持する。
+
+レーティング一覧への ← / → replay は発行時の `effective_folder()` を
+`RatingNavigationTransition.select_opened_path` に持ち、成功採用後に元コンテナの行を選んで
+既存の ensure-visible を使う。変換書庫は cache ZIP ではなく元アーカイブのパスで照合する。
+キーによる選択追従は維持し、数値 index による fallback は同じ ★一覧の再構築だけに限る。
+Backspace の既存の opened-path 指定と Collection の anchor は変更しない。
+
+Auto比率の★一覧では、同じ保存helperが `TopLevelGridView` の★段別session位置へ
+選択キー・scroll・確定比率seedをまとめる。Rating installのtyped authorityから初回描画前に
+比率を復元し、replay/Backspaceで同じ座標系の位置を採用する。古いindex sampleは引き継がず、
+新rowsの統計を既存cache gateで検証する。詳細と同型調査の残件は
+[Auto比率のsession復帰契約](auto-thumb-aspect-plan.md) を参照。
+
+簡素化として、ZIP 専用の保存状態・rollback・新しい modal は追加せず、既存の保存処理と
+復帰要求の owner に揃えた。同型調査の残件 (閲覧履歴・サブ展開の復帰 anchor) は
+[backlog §1.328](next-release-backlog.md)
+に記録する。実アプリでの確認は利用者による検証待ち。
 
 ```
 1. `zip_loader::enumerate_image_entries(zip_path)`。RAR/CBR パスでは末端 dispatch により
@@ -311,7 +457,7 @@ PDF は **非同期**で開く:
 
 ```
 1. 即座に items = [] で画面を更新
-2. `PdfEnumerateCoordinator` で同じ `(path, password)` の実行中 enumerate を確認する
+2. 背景 admission で解決し、`PdfEnumerateCoordinator` で同じ `(実読込パス, password, want_direction)` の実行中 enumerate を確認する
    - cancel されていなければ新しい pool 要求を作らず waiter として合流
    - cancel 済み、または key が異なる場合は明示的に新規要求を開始
    - 時間窓と完了結果 cache は使わない
@@ -433,13 +579,19 @@ ON のとき、**grid から ZIP/PDF を Enter / ダブルクリックで開く�
 | GridItem | `zip_entry` | `pdf_page` | `cache_key_override` | サムネ取得方法 |
 | --- | --- | --- | --- | --- |
 | Image | None | None | なし | ファイル直接デコード |
-| Folder | None | None | `folderthumb:auto-vN:{sort}:d{depth}:{dirname-or-fullpath}` | 再帰的に代表画像を探してデコード |
+| Folder | None | None | `folderthumb:auto-v3:{sort}:d{depth}:{dirname-or-fullpath}` | 直下画像を優先し、無ければ子フォルダと既存 ZIP/PDF WebP を設定順で選ぶ。詳細は [選定 proof](folder-representative-plan.md) |
 | ZipFile | None | None | `zipthumb:{filename}` | `zip_loader::read_first_image_bytes` で先頭画像 |
 | PdfFile | None | Some(0) | `pdfthumb:{filename}` | PDF ワーカーでページ 0 をレンダリング |
 | ConvertibleArchive | None または Some(entry) | None | `archivethumb:{format}:{filename-or-fullpath}` | 有効な変換キャッシュ ZIP があれば、その ZIP から先頭画像またはピン画像を読む。キャッシュ未作成/失効時は LoadRequest なしでアイコン表示 |
 | ZipImage | Some(entry) | None | なし (entry が自動キー) | ZIP からエントリバイト → decode → bytes から EXIF Orientation 適用 |
 | ZipDir | Some(representative) または None (`ZipDirRepresentative`) | None | `zipdir:{dir_prefix}` | 通常は部分木代表 entry を直接読む。ZipDir source pin は `zip_dir_prefix` を worker に渡し、同じ sort で部分木代表を選び直す |
 | PdfPage | None | Some(page) | `pdf_page_cache_key(page)` | PDF ワーカーでそのページをレンダリング |
+
+ZIP 内 RAW は拡張子で先に LibRaw へ振り分け、entry bytes から info / preview を読む。
+プレビューが要求長辺に足りないときは half 現像を thumbnail queue へ非同期で引き継ぐ。
+`ZipFile` の先頭ページと `ZipDir` の代表 entry も同じ経路を通る。RAW の向きは LibRaw の
+flip が適用済みであり、ZIP bytes の rexif や WIC の Orientation を重ねない。
+catalog の `source_*` には縮小画像ではなく LibRaw の `developed_dims` を保存する。
 
 PDF ワーカーの render 結果は raster に加えて、PDFium が読んだページ box の point 寸法を返す。
 `thumbnails.source_width/source_height` は PDF を含め raster の**ピクセル寸法**を保存する。
@@ -573,8 +725,9 @@ worker を再起動しない。archive 候補が desired scope から外れて s
   - `folder_thumb_existing_keys_for` も同じ cascade を実行して existing_keys に leaf
     pinned_key を含める。これをしないと delete_missing が cascade 由来の cache 行を
     毎ロード掃除してしまう (Phase D 後のバグ修正 / 二重実装で識別)。
-  - **実フォルダ再帰の cache-only 境界**: 上位 Folder の既存代表 cache hit は従来どおり
-    再探索しない。miss して `resolve_folder_thumb_image` が子フォルダを辿る場合、非 Image
+  - **実フォルダ再帰の cache-only 境界**: 上位 Folder の既存代表 cache hit は
+    [選定 proof](folder-representative-plan.md) を worker で検証し、有効なら再探索しない。
+    miss して `resolve_folder_thumb_image` が子フォルダを辿る場合、非 Image
     leaf (PDF / ZIP / Video / 仮想ページ) は、子フォルダが直上一覧で作った
     `folderthumb:auto-v2:{sort}:d{depth}:{child}#pin:{source_id}` の完全一致 WebP だけを
     直上 catalog から読み取り専用で再利用する。DB / 行が無い、metadata 不一致、WebP
@@ -640,12 +793,14 @@ fullscreen viewport、detached window、in-window がそれぞれの実 inner si
 **ZipImage でできないことリスト**:
 
 - GIF / APNG アニメーション (fs_animation がパス API)
-- ZIP 内 RAW/WIC 系の Orientation 読み取り (bytes 版は rexif で読める EXIF のみ。JPEG などは自動回転される)
+- ZIP 内 WIC 系の Orientation 読み取り (bytes 版は rexif で読める EXIF のみ。JPEG などは自動回転される)
 
 WIC デコードは `wic_decoder::decode_to_dynamic_image_from_bytes` でバイト列から
-直接デコードできるため、ZIP 内の HEIC/AVIF/JXL/TIFF/RAW も開ける
+直接デコードできるため、ZIP 内の HEIC/AVIF/JXL/TIFF も開ける
 (対応コーデックがインストールされていれば)。サムネイル・フルスクリーン両方の
-ZIP エントリ経路で `image::load_from_memory` 失敗時のフォールバックとして使われる。
+非 RAW ZIP エントリ経路で `image::load_from_memory` 失敗時のフォールバックとして使われる。
+ZIP 内 RAW は拡張子で先に LibRaw へ分岐し、entry bytes から preview または現像結果と
+向きを得る。RAW の失敗時は他のデコーダへフォールバックしない。
 JPEG など EXIF Orientation を持つ ZIP 内画像は、サムネイル・フルスクリーンとも
 エントリ bytes から向きを読んで正立表示する。
 
@@ -741,3 +896,11 @@ ZIP/PDF 用の相対キーは **ZIP/PDF ファイルの親フォルダ** に置�
 片側だけ足すとインポートで復元されない。
 
 詳細は [preset-and-adjustment.md §9](preset-and-adjustment.md) を参照。
+
+## ZIP の小読み取りバッファ
+
+`zip_loader::PositionedFileReader` は位置をreaderごとに持つ既存の共有file handle方式に加え、256 bytes×2領域のsmall-read bufferをreader単位で持つ。依存zipの中央ディレクトリ解析は各local headerの検証と交互にseekするため、片方の領域を使っている間ももう片方を再利用できる。これは類似索引だけでなく通常ZIP閲覧・サムネイル・アーカイブcache経由の読み取りに共通する。
+
+bufferは初回small readでのみ確保し、miss時は領域を再利用する。request/templateのcloneは空のbufferで開始し、可変bufferや取消tokenを兄弟request間で共有しない。cache hit前にも取消を確認し、大きなreadは直接読み、EOF/short read/seekの位置契約を維持する。書庫のfreshness判定、entry列挙、CP932/UTF-8正規化、legacy rename、入れ子ZIP、復号や失敗の扱いを省略しない。
+
+局所比較と検証結果は [類似索引の増分照合と収束](similar-index-incremental-reconcile-plan.md) の起動Full短縮節に記録する。small readのOS呼出しは減るがread-aheadによる読み取りbytesは増え得るため、局所fixtureの速度を実機全体の起動時間に読み替えない。

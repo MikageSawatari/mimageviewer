@@ -16,12 +16,15 @@
 //!
 //! Phase 2b 以降、`AvClock` は実装の大半を `engine::clock::MasterClock` (anchor 部分)
 //! および `engine::audio_bookkeeping::AudioBookkeeping` (バッファ会計) に委譲した
-//! **薄い facade**。残りの状態は所有関係が 2 種類に分かれている:
+//! **薄い facade**。残りの状態は以下の所有関係に分かれている:
 //!
 //! - **EngineActor と並列管理されている互換複製** (`playing` / `audio_active` /
-//!   `eof_reached` / `seek_request` / `seek_serial` / `seek_target_override`):
+//!   `seek_request` / `seek_serial` / `seek_target_override`):
 //!   `EngineActor` の `published_state` (`Arc<AtomicU8>`) + 内部 epoch が source of
 //!   truth。新規コードはこれらを `EngineActor` 経由で読むこと。
+//! - **demux 入力の終端** (`demux_exhausted`): demux が先読みを終えた状態。
+//!   packet / frame / audio の出力はまだ残り得る。再生終了の判定には使わず、
+//!   EngineActor の published `Eof` を読む。seek 要求でクリアする。
 //! - **AvClock 単独で source of truth を保持しているレガシー所有状態** (`volume` /
 //!   `muted`): `TransportCommand::SetVolume / SetMuted` は `EngineActor` 側では
 //!   no-op で、`audio.rs` が `clock.output_volume()` / `clock.pre_limiter_gain()` を
@@ -86,6 +89,14 @@ pub(super) enum SeekRequestKind {
     FrameStep { base_secs: f64, direction: i32 },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AudioEos {
+    Decoding,
+    Decoded(u64),
+    Draining(u64),
+    Complete(u64),
+}
+
 /// 動画再生用 AV マスタークロック (facade)。
 ///
 /// Phase 2b: 内部状態は `MasterClock` (anchor 部分) と `AudioBookkeeping`
@@ -110,6 +121,32 @@ pub struct AvClock {
     /// take/request の両方が Mutex を取り、整合性のある (target, serial)
     /// ペアを観測できるようにする。
     seek_request: Mutex<Option<SeekRequest>>,
+    #[cfg(test)]
+    demux_packet_gate: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
+    #[cfg(test)]
+    demux_after_audio_packet_gate: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
+    #[cfg(test)]
+    fail_next_demux_seek: AtomicBool,
+    #[cfg(test)]
+    fail_next_audio_setup: AtomicBool,
+    #[cfg(test)]
+    fail_next_audio_flush: AtomicBool,
+    /// Audio decode worker の終了通知。出力 channel に未読 frame が残り、pump が
+    /// 逆圧中でも lane の喪失を検知できるようにする。
+    audio_worker_exited: AtomicBool,
+    /// Decoder and pump jointly own normal EOS; quiet counters alone cannot
+    /// prove completion while a delayed DSP block is in flight.
+    audio_eos: Mutex<AudioEos>,
     /// 直近のシーク要求の世代。`request_seek` のたびに +1。
     /// 音声 RT コールバック (`fill_output`) と UI の `tick` がポーリングで読むので
     /// atomic で公開する。Mutex を取らずに「自分が処理中の世代より新しい seek が
@@ -130,6 +167,8 @@ pub struct AvClock {
     /// 「古い fill_output コールバックが、新たに発生した override を誤クリアする」
     /// race を排除する。
     seek_override_serial: AtomicU64,
+    /// Latest serial abandoned before its video frame was displayed.
+    interrupted_seek_serial: AtomicU64,
     /// 音声バッファ会計 (pump 残量 + tx queued)。
     /// Phase 2a で `AudioBookkeeping` に切り出し、AvClock は委譲のみ。動作は等価。
     audio_bookkeeping: AudioBookkeeping,
@@ -146,12 +185,15 @@ pub struct AvClock {
     /// false なら `now_secs()` はフォールバック wall clock を使う (= MasterClock の
     /// `ClockSource::Wall`)。
     audio_active: AtomicBool,
+    /// Demux が audio routing を永久に外したことを worker / engine に公開する。
+    /// `audio_active` は通常の preroll 中も false なので、lane 喪失とは別の状態。
+    audio_lane_lost: AtomicBool,
     /// 測定前の音量ノーマライズなど、再生開始前に audio-pump の処理済み先読みを一時停止する。
     /// true の間は audio-pump が raw→processed 変換を止め、解除後に現行 gain で preroll する。
     audio_preroll_suspended: AtomicBool,
-    /// decoder が EOF (= demux 末端) に到達したか。post-EOF seek を検出する。
-    /// `notify_eof_reached` で立て、`request_seek` / `clear_eof_reached` で降ろす。
-    eof_reached: AtomicBool,
+    /// demux が入力を読み切ったか。出力の drain 完了 / 再生終了とは異なる。
+    /// `notify_demux_exhausted` で立て、`request_seek` / `clear_demux_exhausted` で降ろす。
+    demux_exhausted: AtomicBool,
     /// 動画 decode thread が致命的なエラー (例: HW decode 初期化失敗、connect-stuck)
     /// で exit したか。`set_decode_failed(true)` で立てる。UI 側は `decode_failed()` を
     /// polling して「準備中…」表示の代わりに「再生に失敗しました」を出すなど
@@ -168,11 +210,11 @@ pub struct AvClock {
     /// safety limiter が最終出力 ceiling 超過を検出した回数。
     /// audio-pump thread が増やし、UI thread / native overlay が差分を一時表示する。
     limiter_ceiling_hit_seq: AtomicU64,
-    /// 音量ノーマライズの線形ゲイン (f64 bits)。1.0 = 素通し、>1.0 = boost、<1.0 = attenuation。
-    /// `[10^(-24/20), 10^(24/20)]` (= 約 0.063 〜 15.85) にクランプされる。
-    /// 状態判定 (Off / OnApplied / OnUnmeasured) はこの値で行わず、App 側の
+    /// 音量ノーマライズの stream 別の確定 gain または Pending。
+    /// 確定値は `[10^(-24/20), 10^(24/20)]` (= 約 0.063 〜 15.85) にクランプされる。
+    /// 状態判定 (Off / OnApplied / OnUnmeasured) は gain 値で行わず、App 側の
     /// `NormalizeUiState` enum で扱う (gain = 1.0 でも測定済みのケースがあるため)。
-    normalize_gain_bits: AtomicU64,
+    normalize_gain_table: super::normalize_gain::NormalizeGainTable,
 }
 
 const SEEK_NONE: u64 = u64::MAX;
@@ -237,6 +279,15 @@ impl AvClock {
     /// `seek_serial` は `EngineActor` と共有する `Arc<AtomicU64>`。
     /// 構築側 (`VideoPlayer::open`) が 1 個作って両方に clone を渡す。
     pub fn new(initial_volume: f64, seek_serial: Arc<AtomicU64>) -> Self {
+        Self::new_with_normalize(initial_volume, seek_serial, false, 1.0)
+    }
+
+    pub(crate) fn new_with_normalize(
+        initial_volume: f64,
+        seek_serial: Arc<AtomicU64>,
+        normalize_enabled: bool,
+        initial_normalize_gain: f64,
+    ) -> Self {
         // 初期 anchor は (pts=0.0、wall=now、Frozen)。
         // playing=false / audio_active=false の間は now_secs() が anchor PTS を
         // そのまま返す挙動を再現するため、Frozen で開始するのが等価。
@@ -245,16 +296,30 @@ impl AvClock {
             master_clock,
             playing: AtomicBool::new(false),
             seek_request: Mutex::new(None),
+            #[cfg(test)]
+            demux_packet_gate: Mutex::new(None),
+            #[cfg(test)]
+            demux_after_audio_packet_gate: Mutex::new(None),
+            #[cfg(test)]
+            fail_next_demux_seek: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_audio_setup: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_audio_flush: AtomicBool::new(false),
+            audio_worker_exited: AtomicBool::new(false),
+            audio_eos: Mutex::new(AudioEos::Decoding),
             seek_serial,
             seek_target_override_bits: AtomicU64::new(SEEK_NONE),
             seek_override_serial: AtomicU64::new(0),
+            interrupted_seek_serial: AtomicU64::new(0),
             audio_bookkeeping: AudioBookkeeping::new(),
             playback_speed_bits: AtomicU64::new(1.0_f64.to_bits()),
             playback_speed_update_lock: Mutex::new(()),
             audio_tx_accounting_epoch: AtomicU64::new(0),
             audio_active: AtomicBool::new(false),
+            audio_lane_lost: AtomicBool::new(false),
             audio_preroll_suspended: AtomicBool::new(false),
-            eof_reached: AtomicBool::new(false),
+            demux_exhausted: AtomicBool::new(false),
             decode_failed: AtomicBool::new(false),
             volume_bits: AtomicU64::new(
                 crate::settings::clamp_video_volume(initial_volume).to_bits(),
@@ -263,7 +328,10 @@ impl AvClock {
             remote_local_mute_owner: AtomicU64::new(0),
             next_remote_local_mute_owner: AtomicU64::new(1),
             limiter_ceiling_hit_seq: AtomicU64::new(0),
-            normalize_gain_bits: AtomicU64::new(1.0_f64.to_bits()),
+            normalize_gain_table: super::normalize_gain::NormalizeGainTable::new(
+                normalize_enabled,
+                initial_normalize_gain,
+            ),
         }
     }
 
@@ -518,6 +586,15 @@ impl AvClock {
         self.audio_active.store(false, Ordering::Release);
     }
 
+    pub(super) fn mark_audio_lane_lost(&self) {
+        self.audio_lane_lost.store(true, Ordering::Release);
+        self.mark_audio_inactive();
+    }
+
+    pub(super) fn audio_lane_lost(&self) -> bool {
+        self.audio_lane_lost.load(Ordering::Acquire)
+    }
+
     pub fn is_audio_active(&self) -> bool {
         self.audio_active.load(Ordering::Acquire)
     }
@@ -606,15 +683,156 @@ impl AvClock {
     /// へ移動し、video/audio とも target まで preroll trim してから再開する。
     /// keyframe preview は表示しないため、細かい相対 seek でも映像が逆方向に跳ねない。
     pub fn request_seek(&self, target_secs: f64) {
+        self.request_seek_with_before_publish(target_secs, || {});
+    }
+
+    /// Test seam for the interval where the live serial has advanced but the
+    /// seek request is not yet visible to demux.
+    #[cfg(test)]
+    pub(super) fn request_seek_before_publish_for_test(
+        &self,
+        target_secs: f64,
+        before_publish: impl FnOnce(),
+    ) {
+        self.request_seek_with_before_publish(target_secs, before_publish);
+    }
+
+    #[cfg(test)]
+    pub(super) fn gate_next_demux_packet_for_test(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        *self.demux_packet_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    pub(super) fn wait_at_demux_packet_gate_for_test(&self) {
+        if let Some((entered_tx, release_rx)) = self.demux_packet_gate.lock().unwrap().take() {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn gate_after_audio_packet_for_test(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        *self.demux_after_audio_packet_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    pub(super) fn wait_after_audio_packet_for_test(&self) {
+        if let Some((entered_tx, release_rx)) =
+            self.demux_after_audio_packet_gate.lock().unwrap().take()
+        {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn fail_next_demux_seek_for_test(&self) {
+        self.fail_next_demux_seek.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(super) fn take_demux_seek_failure_for_test(&self) -> bool {
+        self.fail_next_demux_seek.swap(false, Ordering::AcqRel)
+    }
+
+    #[cfg(test)]
+    pub(super) fn fail_next_audio_setup_for_test(&self) {
+        self.fail_next_audio_setup.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(super) fn take_audio_setup_failure_for_test(&self) -> bool {
+        self.fail_next_audio_setup.swap(false, Ordering::AcqRel)
+    }
+
+    #[cfg(test)]
+    pub(super) fn fail_next_audio_flush_for_test(&self) {
+        self.fail_next_audio_flush.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(super) fn take_audio_flush_failure_for_test(&self) -> bool {
+        self.fail_next_audio_flush.swap(false, Ordering::AcqRel)
+    }
+
+    pub(super) fn note_audio_worker_exit(&self) {
+        self.audio_worker_exited.store(true, Ordering::Release);
+    }
+
+    pub(super) fn audio_worker_exited(&self) -> bool {
+        self.audio_worker_exited.load(Ordering::Acquire)
+    }
+
+    pub(super) fn note_audio_decoded_eos(&self, serial: u64) {
+        let mut state = self.audio_eos.lock().unwrap();
+        if serial == self.current_seek_serial() && *state == AudioEos::Decoding {
+            *state = AudioEos::Decoded(serial);
+        }
+    }
+
+    pub(super) fn audio_decoded_eos(&self, serial: u64) -> bool {
+        let state = self.audio_eos.lock().unwrap();
+        serial == self.current_seek_serial() && *state == AudioEos::Decoded(serial)
+    }
+
+    pub(super) fn begin_audio_tail(&self, serial: u64) -> bool {
+        let mut state = self.audio_eos.lock().unwrap();
+        if serial == self.current_seek_serial() && *state == AudioEos::Decoded(serial) {
+            *state = AudioEos::Draining(serial);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(super) fn complete_audio_tail(&self, serial: u64) -> bool {
+        let mut state = self.audio_eos.lock().unwrap();
+        if serial == self.current_seek_serial() && *state == AudioEos::Draining(serial) {
+            *state = AudioEos::Complete(serial);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(super) fn audio_tail_complete(&self) -> bool {
+        let state = self.audio_eos.lock().unwrap();
+        *state == AudioEos::Complete(self.current_seek_serial())
+    }
+
+    fn begin_seek_audio_eos(&self, target_secs: f64) -> u64 {
+        let mut state = self.audio_eos.lock().unwrap();
+        self.demux_exhausted.store(false, Ordering::Release);
+        let serial = self.seek_serial.fetch_add(1, Ordering::AcqRel) + 1;
+        *state = AudioEos::Decoding;
+        self.seek_override_serial.store(serial, Ordering::Release);
+        self.seek_target_override_bits
+            .store(target_secs.to_bits(), Ordering::Release);
+        serial
+    }
+
+    fn request_seek_with_before_publish(&self, target_secs: f64, before_publish: impl FnOnce()) {
         let clamped = target_secs.max(0.0);
         // post-EOF seek サポート: tick が EOF を見て pause しないように先にクリア。
         // decoder の EOF wait ループも peek_seek_request_pending で起床する。
-        self.eof_reached.store(false, Ordering::Release);
-        let new_serial = self.seek_serial.fetch_add(1, Ordering::AcqRel) + 1;
-        self.seek_override_serial
-            .store(new_serial, Ordering::Release);
-        self.seek_target_override_bits
-            .store(clamped.to_bits(), Ordering::Release);
+        let new_serial = self.begin_seek_audio_eos(clamped);
+        before_publish();
         let mut guard = self.seek_request.lock().unwrap();
         *guard = Some(SeekRequest {
             target_secs: clamped,
@@ -649,12 +867,7 @@ impl AvClock {
         let seek_start = seek_start_secs.max(0.0);
         let base = base_secs.max(0.0);
         let direction = direction.signum();
-        self.eof_reached.store(false, Ordering::Release);
-        let new_serial = self.seek_serial.fetch_add(1, Ordering::AcqRel) + 1;
-        self.seek_override_serial
-            .store(new_serial, Ordering::Release);
-        self.seek_target_override_bits
-            .store(base.to_bits(), Ordering::Release);
+        let new_serial = self.begin_seek_audio_eos(base);
         let mut guard = self.seek_request.lock().unwrap();
         *guard = Some(SeekRequest {
             target_secs: seek_start,
@@ -687,14 +900,16 @@ impl AvClock {
         self.seek_target_override_bits.load(Ordering::Acquire) != SEEK_NONE
     }
 
-    pub fn notify_eof_reached(&self) {
-        self.eof_reached.store(true, Ordering::Release);
+    /// demux の先読み完了を通知する。再生 state / clock は停止しない。
+    pub fn notify_demux_exhausted(&self) {
+        self.demux_exhausted.store(true, Ordering::Release);
     }
-    pub fn clear_eof_reached(&self) {
-        self.eof_reached.store(false, Ordering::Release);
+    pub fn clear_demux_exhausted(&self) {
+        self.demux_exhausted.store(false, Ordering::Release);
     }
-    pub fn is_eof_reached(&self) -> bool {
-        self.eof_reached.load(Ordering::Acquire)
+    /// 入力終端。再生終了は EngineActor の published Eof が所有する。
+    pub fn is_demux_exhausted(&self) -> bool {
+        self.demux_exhausted.load(Ordering::Acquire)
     }
     /// video decode thread が致命的なエラーで exit したことを通知する。
     /// `set_decode_failed(true)` 後、`VideoPlayer::tick()` が `decode_failed()` を
@@ -801,6 +1016,17 @@ impl AvClock {
     /// 整合しないクロック状態を作ってしまうため、失敗経路ではこちらを使う。
     pub fn reset_audio_bookkeeping_only(&self) {
         self.audio_bookkeeping.reset();
+    }
+
+    /// Aborting a seek retires its target; ordinary sample/frame consumption
+    /// must only clear the override and leave this serial untouched.
+    pub(super) fn mark_seek_interrupted(&self, serial: u64) {
+        self.interrupted_seek_serial
+            .fetch_max(serial, Ordering::AcqRel);
+    }
+
+    pub(super) fn seek_was_interrupted(&self, serial: u64) -> bool {
+        self.interrupted_seek_serial.load(Ordering::Acquire) == serial
     }
 
     /// fallback wall clock を `(pts, 今)` に再アンカー。
@@ -944,13 +1170,20 @@ impl AvClock {
 
     /// 音量ノーマライズ用の線形ゲイン (1.0 = 素通し)。
     pub fn normalize_gain(&self) -> f64 {
-        f64::from_bits(self.normalize_gain_bits.load(Ordering::Acquire))
+        self.normalize_gain_for_stream(0).unwrap_or(1.0)
     }
 
     /// 音量ノーマライズ用の線形ゲインを設定 (内部で `[10^(-24/20), 10^(24/20)]` にクランプ)。
     pub fn set_normalize_gain(&self, gain: f64) {
-        self.normalize_gain_bits
-            .store(clamp_normalize_gain(gain).to_bits(), Ordering::Release);
+        self.normalize_gain_table.set_gain(0, gain);
+    }
+
+    pub(crate) fn normalize_gain_for_stream(&self, stream_index: usize) -> Option<f64> {
+        self.normalize_gain_table.gain(stream_index)
+    }
+
+    pub(crate) fn normalize_gain_table(&self) -> &super::normalize_gain::NormalizeGainTable {
+        &self.normalize_gain_table
     }
 
     /// audio-pump の先読み停止フラグ。解除後の raw→processed はその時点の Norm gain を使う。
@@ -1015,6 +1248,31 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn eos_completion_is_once_per_seek_and_stale_publications_are_rejected() {
+        let clock = AvClock::new(1.0, Arc::new(AtomicU64::new(0)));
+        assert!(!clock.audio_tail_complete());
+        clock.note_audio_decoded_eos(0);
+        assert!(clock.audio_decoded_eos(0));
+        assert!(clock.begin_audio_tail(0));
+        assert!(!clock.begin_audio_tail(0));
+        assert!(!clock.audio_tail_complete());
+        clock.complete_audio_tail(0);
+        assert!(clock.audio_tail_complete());
+        clock.note_audio_decoded_eos(0);
+        assert!(!clock.begin_audio_tail(0));
+        clock.request_seek(1.0);
+        clock.note_audio_decoded_eos(0);
+        clock.complete_audio_tail(0);
+        assert!(!clock.audio_tail_complete());
+        assert!(!clock.audio_decoded_eos(0));
+        clock.note_audio_decoded_eos(1);
+        assert!(clock.begin_audio_tail(1));
+        clock.request_frame_step_seek(0.0, 1.0, 1);
+        clock.complete_audio_tail(1);
+        assert!(!clock.audio_tail_complete());
+    }
 
     #[test]
     fn speed_change_invalidates_old_audio_tx_accounting_epoch() {

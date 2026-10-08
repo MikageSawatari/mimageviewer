@@ -7,6 +7,9 @@ mod live_favorites;
 mod long_job;
 mod page_jobs;
 mod path_guard;
+mod persistent_collections;
+mod raw_flights;
+mod raw_prefetch;
 mod service;
 mod thumbnail;
 mod video_jump;
@@ -15,6 +18,7 @@ mod video_stream;
 #[cfg(windows)]
 mod pipe;
 pub(crate) mod session;
+pub(crate) use live_favorites::RemoteSettingsReaderControl;
 pub(crate) use service::{RemoteServiceControl, RemoteServiceManager, RemoteServiceStatus};
 
 #[cfg(test)]
@@ -67,7 +71,7 @@ pub(super) fn response_entry_limit(
 /// Remote grid thumbnail provenance shared by physical folders and aggregate lists.
 ///
 /// Sidecar discovery remains owned by `folder_scan::filter_video_image_duplicates`.
-/// Aggregate lists only group videos by physical parent and feed one scan per parent
+/// Aggregate lists group videos and audio by physical parent and feed one scan per parent
 /// into that existing rule; they never remove entries from the aggregate result set.
 #[derive(Default)]
 pub(super) struct RemoteThumbnailSources {
@@ -87,75 +91,60 @@ impl RemoteThumbnailSources {
         settings: &crate::settings::Settings,
         entries: &[mimageviewer_ipc::RemoteEntry],
     ) -> Self {
+        Self::for_paths_while(
+            settings,
+            &entries
+                .iter()
+                .map(|entry| (std::path::PathBuf::from(&entry.path), entry.kind))
+                .collect::<Vec<_>>(),
+            || true,
+        )
+        .expect("unconditional remote sidecar discovery cannot be cancelled")
+    }
+
+    /// Both listing producers use the canonical core discovery. No endpoint rescans.
+    pub(super) fn for_paths_while(
+        settings: &crate::settings::Settings,
+        paths: &[(std::path::PathBuf, mimageviewer_ipc::RemoteEntryKind)],
+        keep_running: impl FnMut() -> bool,
+    ) -> Option<Self> {
         if !settings.skip_image_if_video_exists || !settings.video_thumb_use_sidecar_image {
-            return Self::default();
+            return Some(Self::default());
         }
-
-        let videos = entries
+        let media = paths
             .iter()
-            .filter(|entry| entry.kind == mimageviewer_ipc::RemoteEntryKind::Video)
-            .map(|entry| std::path::PathBuf::from(&entry.path))
+            .filter(|(_, kind)| {
+                matches!(
+                    kind,
+                    mimageviewer_ipc::RemoteEntryKind::Video
+                        | mimageviewer_ipc::RemoteEntryKind::Audio
+                )
+            })
+            .map(|(path, _)| path.clone())
             .collect::<Vec<_>>();
-        if videos.is_empty() {
-            return Self::default();
-        }
-
-        let requested = videos
-            .iter()
-            .map(|path| crate::path_key::normalize_keep_drive(path))
-            .collect::<std::collections::HashSet<_>>();
-        let mut parent_keys = std::collections::HashSet::new();
-        let mut parents = Vec::new();
-        for video in &videos {
-            if let Some(parent) = video.parent() {
-                let key = crate::path_key::normalize_keep_drive(parent);
-                if parent_keys.insert(key) {
-                    parents.push(parent.to_path_buf());
-                }
-            }
-        }
-
-        let skipped_parents = parents
-            .len()
-            .saturating_sub(MAX_REMOTE_AGGREGATE_SIDECAR_PARENT_SCANS);
-        if skipped_parents > 0 {
+        let discovered = crate::app::folder_scan::discover_aggregate_video_sidecars_while(
+            settings,
+            &media,
+            MAX_REMOTE_AGGREGATE_SIDECAR_PARENT_SCANS,
+            keep_running,
+        )?;
+        for (parent, error) in &discovered.scan_errors {
             crate::logger::log(format!(
-                "remote_ipc: aggregate sidecar parent scan capped limit={} scanned={} skipped_parents={skipped_parents}",
-                MAX_REMOTE_AGGREGATE_SIDECAR_PARENT_SCANS,
-                MAX_REMOTE_AGGREGATE_SIDECAR_PARENT_SCANS,
+                "remote_ipc: aggregate sidecar scan failed parent={} error={error}",
+                parent.display()
             ));
         }
-
-        // 64 parents bounds synchronous read_dir latency while covering clustered
-        // aggregate results; later parents safely fall through to the Shell thumbnail.
-        // With V requested videos and capped parents p, this is expected
-        // O(V + sum(E_p + S_p)) time and O(V + max(E_p + S_p)) working memory.
-        let mut sources = Self::default();
-        for parent in parents
-            .into_iter()
-            .take(MAX_REMOTE_AGGREGATE_SIDECAR_PARENT_SCANS)
-        {
-            let mut scan =
-                match crate::app::folder_scan::scan_directory_with_settings(&parent, settings) {
-                    Ok(scan) => scan,
-                    Err(error) => {
-                        crate::logger::log(format!(
-                            "remote_ipc: aggregate sidecar scan failed parent={} error={error}",
-                            parent.display()
-                        ));
-                        continue;
-                    }
-                };
-            let found =
-                crate::app::folder_scan::filter_video_image_duplicates(&mut scan.all_media, true);
-            for (video, image) in found.sidecars {
-                let key = crate::path_key::normalize_keep_drive(&video);
-                if requested.contains(&key) {
-                    sources.video_sidecars.insert(key, image);
-                }
-            }
+        if discovered.skipped_parents > 0 {
+            crate::logger::log(format!(
+                "remote_ipc: aggregate sidecar parent scan capped limit={} scanned={} skipped_parents={}",
+                MAX_REMOTE_AGGREGATE_SIDECAR_PARENT_SCANS,
+                discovered.scanned_parents,
+                discovered.skipped_parents
+            ));
         }
-        sources
+        Some(Self {
+            video_sidecars: discovered.by_video_path,
+        })
     }
 
     pub(super) fn source_address(
@@ -163,7 +152,10 @@ impl RemoteThumbnailSources {
         path: &std::path::Path,
         kind: mimageviewer_ipc::RemoteEntryKind,
     ) -> Option<mimageviewer_ipc::RemoteAddress> {
-        if kind != mimageviewer_ipc::RemoteEntryKind::Video {
+        if !matches!(
+            kind,
+            mimageviewer_ipc::RemoteEntryKind::Video | mimageviewer_ipc::RemoteEntryKind::Audio
+        ) {
             return None;
         }
         let source = self
@@ -213,6 +205,31 @@ mod remote_thumbnail_source_tests {
         std::fs::write(&video, b"video").unwrap();
         std::fs::write(parent.join("clip.jpg"), b"sidecar").unwrap();
         video
+    }
+
+    #[test]
+    fn aggregate_audio_sidecars_use_shared_discovery_and_cancellation() {
+        let temp = tempfile::tempdir().unwrap();
+        let audio = temp.path().join("song.flac");
+        std::fs::write(&audio, b"audio").unwrap();
+        std::fs::write(temp.path().join("song.jpg"), b"image").unwrap();
+        let mut entry = entry(&audio);
+        entry.kind = mimageviewer_ipc::RemoteEntryKind::Audio;
+        let settings = crate::settings::Settings::default();
+        let sources = RemoteThumbnailSources::for_remote_entries(&settings, &[entry]);
+        assert!(
+            sources
+                .source_address(&audio, mimageviewer_ipc::RemoteEntryKind::Audio)
+                .is_some()
+        );
+        assert!(
+            RemoteThumbnailSources::for_paths_while(
+                &settings,
+                &[(audio, mimageviewer_ipc::RemoteEntryKind::Audio)],
+                || false
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -359,10 +376,11 @@ pub(super) enum RemoteSortSettingsSource {
 }
 
 impl RemoteSortSettingsSource {
-    pub(super) fn load(&self) -> Result<crate::settings::SortOrder, String> {
+    pub(super) fn load(
+        &self,
+    ) -> Result<crate::settings::SortOrder, crate::settings_db::SettingsDbError> {
         match self {
-            Self::Live => crate::settings_db::with_db_result(|db| db.load_sort_order())
-                .map_err(|error| error.to_string()),
+            Self::Live => crate::settings_db::with_db_result(|db| db.load_sort_order()),
             #[cfg(test)]
             Self::Snapshot(order) => Ok(*order),
         }
@@ -812,15 +830,46 @@ pub(crate) struct RemoteIpcServer {
     _guard: pipe::ServerGuard,
 }
 
+#[derive(Clone)]
+pub(crate) struct RemoteIpcServerControl {
+    #[cfg(windows)]
+    inner: pipe::ServerControl,
+}
+
+impl RemoteIpcServerControl {
+    pub(crate) fn begin_app_exit(&self) {
+        #[cfg(windows)]
+        self.inner.begin_app_exit();
+    }
+}
+
 impl RemoteIpcServer {
-    pub(crate) fn start(settings: crate::settings::Settings) -> Result<Self, String> {
+    pub(crate) fn start(
+        settings: crate::settings::Settings,
+        persistent_collection_producer: Option<
+            crate::collection_store::CollectionRemoteProducerControl,
+        >,
+        raw_develop_executor: std::sync::Arc<crate::raw::RawDevelopExecutor>,
+        io_sem: std::sync::Arc<crate::io_semaphore::GlobalIoSemaphore>,
+    ) -> Result<Self, String> {
         #[cfg(windows)]
         {
-            return pipe::ServerGuard::start(settings).map(|guard| Self { _guard: guard });
+            return pipe::ServerGuard::start(
+                settings,
+                persistent_collection_producer,
+                raw_develop_executor,
+                io_sem,
+            )
+            .map(|guard| Self { _guard: guard });
         }
         #[cfg(not(windows))]
         {
-            let _ = settings;
+            let _ = (
+                settings,
+                persistent_collection_producer,
+                raw_develop_executor,
+                io_sem,
+            );
             Err("リモート接続は Windows の名前付きパイプ専用です".to_owned())
         }
     }
@@ -834,5 +883,46 @@ impl RemoteIpcServer {
         {
             unreachable!("remote IPC server is Windows-only")
         }
+    }
+
+    pub(crate) fn control(&self) -> RemoteIpcServerControl {
+        #[cfg(windows)]
+        {
+            RemoteIpcServerControl {
+                inner: self._guard.control(),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            unreachable!("remote IPC server is Windows-only")
+        }
+    }
+
+    pub(crate) fn settings_reader_control(&self) -> RemoteSettingsReaderControl {
+        #[cfg(windows)]
+        {
+            self._guard.settings_reader_control()
+        }
+        #[cfg(not(windows))]
+        {
+            unreachable!("remote IPC server is Windows-only")
+        }
+    }
+}
+
+/// Snapshot presentation once per adopted listing; thumbnail generation is unaffected.
+pub(super) fn thumbnail_presentation(
+    settings: &crate::settings::Settings,
+) -> mimageviewer_ipc::ThumbnailPresentation {
+    use crate::settings::AudioThumbnailIndicator;
+    use mimageviewer_ipc::RemoteAudioThumbnailIndicator;
+    mimageviewer_ipc::ThumbnailPresentation {
+        audio_indicator: match settings.audio_thumbnail_indicator.normalized() {
+            AudioThumbnailIndicator::BottomLeftBadge => {
+                RemoteAudioThumbnailIndicator::BottomLeftBadge
+            }
+            AudioThumbnailIndicator::Hidden => RemoteAudioThumbnailIndicator::Hidden,
+            _ => RemoteAudioThumbnailIndicator::MusicNoteIcon,
+        },
     }
 }

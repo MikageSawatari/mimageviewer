@@ -159,6 +159,27 @@ CREATE TABLE restore_declined (
 > 積み、全件 snapshot へ merge してから Ready に戻す。段 0 は引き続きメモリだけを参照し、
 > SQLite を開かない。
 
+> **v4.3.0 初回 schema 競合修正 (§1.286)**: 起動時は recorder worker と検出 index
+> loader が別接続で同時に `open_at` を呼んでいた。空の DB では両方の `DEFERRED`
+> transaction が `user_version=0` / `edit_origin` 不在を読めるため、後から
+> `CREATE TABLE` へ昇格する片方が `SQLITE_BUSY` で即時失敗する。各接続の 5 秒
+> busy timeout は既に有効で、read→write の競合を解決できない。空の DB で
+> `journal_mode=WAL` を同時に設定する場合も timeout を待たずに `SQLITE_BUSY`
+> となる。共通の台帳 open 関数で、busy timeout 設定、WAL 設定、schema 確認を
+> プロセス共通の短い mutex 区間に置く。schema 関数はまず書き込み枠を取らずに
+> `user_version` と現行 schema を確認し、現行版ならそのまま返す。旧版または空 DB
+> の場合だけ `IMMEDIATE` transaction を開始し、その中で版を読み直してから
+> 作成・更新する。これにより、別接続の長い書き込み中でも現行版の open は
+> writer の完了を待たない。recorder、検出 index loader、検出、
+> backfill、restore、リネーム移行・コピー・purge、孤児メタデータ整理の台帳接続は
+> この open 関数を通る。区間を抜けた後の index 全件ロードや通常の読み書きは
+> 直列化しない。移行・コピー・purge 本体の read→write transaction も
+> `IMMEDIATE` にし、同型の昇格競合を除く。
+> recorder の完了を loader が待つ仕組みは使わないので、recorder が panic
+> しても loader は永久待ちにならない。DB 形式は変更しない。失敗時は
+> ディレクトリ作成、SQLite open、WAL 設定、schema 初期化、index 読込の
+> 段階をログへ残す。retry の追加や初回 schema 書込みの固定所有者は不要。
+
 ### 3.3 記録のタイミング
 
 - **編集の確定点** (`save_mask_with_sidecar` / `save_conceal_with_sidecar` / `set_page_params` 等)
@@ -473,3 +494,56 @@ A2 / A3 を実装している間に開発機の台帳が埋まり、A3 の実機
   `delete_missing_originals` / `clear_all` / `prune_to_size_limit_locked` / `total_size` の
   すべてが「1 行 = 1 ファイル所有」を前提にしており、参照カウント導入が必要になる。
   §4 のとおりキー付け替えだけで足りるので不要。
+
+---
+
+## 12. §1.289 大量復元の prefix 検索 (2026-09-27 実装)
+
+利用者の 12,403 件復元で、候補ごとに各 DB 表を読む `substr(key,1,n)=prefix` が
+全件スキャンになっていた。`copy_prefix`、`move_prefix`、復元後の 7 表の
+`query_family_rows` を、BINARY のキー索引を使う `[prefix, prefix_upper_bound(prefix))`
+へ変更した。上限が表現できない Unicode 境界は `key >= prefix AND substr(...)` とし、
+文字数で判定する旧結果を維持しながら索引の下限を使う。`query_family_rows` の
+exact と virtual prefix は別クエリに分け、`OR substr(...)` を残さない。
+旧 `substr` と範囲検索が同じキー集合を返す前提は、保存済みキーと prefix に NUL が
+含まれないこと。Windows の実 path は NUL を含められず、これらのキーは実 path 由来。
+`ratings.source_path` の改名後・コピー後の再計算対象も同じ範囲に変更した。
+値を導出する `substr(path,1,instr(path,'::')-1)` 自体は検索条件ではなく維持する。
+
+`STORES` のキー列は下表のとおりすべて既定 BINARY collation。`TEXT PRIMARY KEY`
+またはキー列先頭の複合 PK を持つ。非一意の `video_bookmarks.path` は
+`idx_video_bookmarks_path` を持つ。索引追加・schema version 変更は不要。
+
+| DB | 対象表・キー列 | 索引 |
+| --- | --- | --- |
+| rating.db | ratings.path | PK |
+| content_identity.db | edit_origin.file_key | PK |
+| adjustment.db | page_params.page_path、sidecar_sync.folder_key | 各 PK |
+| mask.db / conceal.db / local_adjust.db / comic.db | masks.path、conceal_entries.page_path、local_adjust_pages.page_path、comic_entries.page_path | 各 PK |
+| export_crop.db / edit_preview_cache.db / rotation.db | export_crop_pages.page_path、edit_previews.item_key、rotations.path | 各 PK |
+| tags.db | item_tags.item_key、tag_item_state.item_key、tag_sidecar_sync.folder_key | 先頭列の複合 PK、他は PK |
+| view_trim.db | view_trim_pages.page_path、view_trim_books.book_key | 各 PK |
+| video_pins.db / video_bookmarks.db | video_pins.path、video_bookmarks.path | PK、`idx_video_bookmarks_path` |
+| folder_thumb_pins.db / book_resume.db | folder_thumb_pins.container_key、book_resume.path | 各 PK |
+| spread.db | spreads.path、final_cover_spreads.path、singleton_spread_placements.path、singleton_spread_endpoint_placements.path、page_alone_preferences.path | 各 PK |
+| reading_history.db | reading_history.key | PK |
+
+索引の回帰テストは本番の各 `open_at` / schema migration 経路で一時 DB を作り、
+新規作成・現行スキーマの再オープン・旧スキーマからの移行後に `PRAGMA index_xinfo` と
+`EXPLAIN QUERY PLAN` を確認する。移行 fixture は ratings、content identity、
+sidecar sync、mask、export crop、edit preview、video pins/bookmarks、folder thumb pins、
+spread、reading history を含む。読み取り専用・既存 DB 専用の open 経路はスキーマを
+作成・移行せず、通常の open 経路で初期化済みの DB を参照する。
+
+画像は Exact mapping のみ。ZIP / PDF / EPUB は Exact と VirtualPrefix、変換アーカイブは
+元パスと予測 cache ZIP の各 Exact / VirtualPrefix の 4 面を維持する。分類には
+`ContentKind` を使う。worker は開始、コピー mapping 操作・台帳項目の 1,000 件ごとの
+進捗、完了を通常ログと `content_identity` perf event に記録する。進捗の
+`processed/total` は `stage=copy` なら表×mapping 操作、`stage=ledger` なら候補と
+辞退の件数、`stage=epub` なら EPUB 専用コピーの表×mapping 操作と台帳昇格の合計であり、
+画面の進捗ではない。Quiescing の文言・中断設計は別レビューに残す。
+
+計測用 `#[ignore]` テスト `measure_thousand_restores_against_hundred_thousand_rows` は
+メモリ上の 1 表に 10 万行を置き、1,000 件のコンテナ prefix コピーと destination
+family 読込を旧/新 SQL で実行した。開発機の同一実行で **旧 19.998 秒 / 新 36.5 ms**。
+行の準備時間は除外。実 DB 群・台帳更新・sidecar 処理・HDD I/O を含む総復元時間ではない。

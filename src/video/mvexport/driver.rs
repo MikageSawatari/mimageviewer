@@ -50,16 +50,19 @@ pub(super) fn export(
 
     let mut partial = PartialOutput::new(&request.output_path)?;
     let audio_decode_started = Instant::now();
-    let mut decoded =
-        crate::audio_decode::decode_audio_file_to_stereo_f32(&request.audio_path, cancel).map_err(
-            |error| {
-                if cancel.load(Ordering::Relaxed) {
-                    ExportError::Cancelled
-                } else {
-                    ExportError::AudioDecode(format!("音声をデコードできません: {error}"))
-                }
-            },
-        )?;
+    let audio_stream_index = default_audio_stream_index(&request.audio_path)?;
+    let mut decoded = crate::audio_decode::decode_audio_file_to_stereo_f32(
+        &request.audio_path,
+        audio_stream_index,
+        cancel,
+    )
+    .map_err(|error| {
+        if cancel.load(Ordering::Relaxed) {
+            ExportError::Cancelled
+        } else {
+            ExportError::AudioDecode(format!("音声をデコードできません: {error}"))
+        }
+    })?;
     let audio_decode_secs = audio_decode_started.elapsed().as_secs_f64();
     check_cancel(cancel)?;
     fit_audio_to_duration(
@@ -396,6 +399,18 @@ fn fit_audio_to_duration(
     Ok(())
 }
 
+/// The export has no track picker, so it takes the container's default audio stream,
+/// which is what the decoder chose on its own before it started taking a stream index.
+pub(super) fn default_audio_stream_index(path: &Path) -> Result<usize, ExportError> {
+    let input = ffmpeg::format::input(&path.to_path_buf())
+        .map_err(|error| ExportError::AudioDecode(format!("音声を開けません: {error}")))?;
+    input
+        .streams()
+        .best(ffmpeg::media::Type::Audio)
+        .map(|stream| stream.index())
+        .ok_or_else(|| ExportError::AudioDecode("音声ストリームが見つかりません".to_string()))
+}
+
 fn encode_audio(
     encoder: &mut OpenedAacEncoder,
     pcm: &[f32],
@@ -415,6 +430,7 @@ fn encode_audio(
             source_secs_per_output_sec: 1.0,
             seek_serial: 0,
             pdc_latency_secs_at_process: 0.0,
+            effetune_generation: None,
         };
         packets.extend(encoder.push_chunk(chunk).map_err(|error| {
             ExportError::Encoder(format!("AAC 音声をエンコードできません: {error}"))

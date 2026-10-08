@@ -234,8 +234,10 @@ D15 は「離す前の再生状態を保つ」という当初の既定を置き�
   - **利用者が自分で閉じたら固定も外れる** (`Toggle` / `DownwardDrag` / `Escape`)。
     そうしないと次の動画でまた開き、閉じた操作が無視されたように見える。
   - **利用者が閉じたのではない close は固定を壊さない**。`Unavailable` (この動画の素材が
-    使えない) / `TileModeOpened` / `HudHidden` は表示状態も消さない。消すと「1 本だけ
-    素材が合わなかった」ことで以降の全動画の固定が消える。
+    使えない) は表示状態も残す。`TileModeOpened` はもう一方の面を明示的に開いたので選択を
+    畳むが、どちらも固定自体は外さない。素材都合の 1 本だけで以降の固定を消さないためである。
+  - HUD の自動 hide/show は close ではない。同じ resource session と選択を保持したまま
+    `Visible` / `Suspended` を遷移し、hidden 中は新しい request を作らない。
   - 入口は `Settings::set_video_seek_strip_locked` 1 か所。鍵ボタンと環境設定の
     チェックボックスは両方ここを通る。
 - 永続化は既存の `video_seek_bar_locked` と未リリースの `video_seek_strip_locked` の 2 bool を
@@ -695,9 +697,9 @@ D27 の優先順位:
   これを境界のヒステリシス latch とし、往復操作で要求が発振しないようにする。
 - **新しいラスタが届くまで、古いラスタを描き続ける。** 空白を挟まない。可視範囲が解析済み
   範囲から完全に外れた場合だけ、やむを得ず空白になる。
-- preference 変更時は旧 worker と LRU を捨て、旧 raster の Arc と旧可視 span だけを display-only
-  holdover にする。新 first paint 到着時に画像と span を同じ frame で交換し、blank / 誤スケールを
-  挟まない。
+- preference 変更時も同じ worker/decoder/LRU を保持し、layout revision と request signatureを更新する。
+  旧 raster の Arc と旧可視 span は display-only holdover にし、新 first paint 到着時に画像と span を
+  同じ frame で交換して blank / 誤スケールを挟まない。
 - 再生追従は 100ms 間隔で中心だけを更新する。毎 frame の解析 / upload にはならない。
 
 `render_timeline_row_image` を「窓 = 1 行」として呼ぶ。
@@ -904,9 +906,10 @@ RGBA payload に worker-local content revision を含める。これは永続 id
 1000 本 (平均 1 時間) で約 250 MB。タイルサムネは 2 時間の映画 1 本で十数 MB なので、**その 1/50 程度**。
 1 本あたりの上限は `MAX_COARSE_WAVEFORM_BYTES = 64 MiB` で設計上すでに効いている。
 
-**副次的な効果**: いま `rebuild_video_seek_strip_waveform_span` は波形の範囲設定を変えるたびに worker を
-作り直し、列を丸ごと捨てている ([native_video.rs](../src/app/native_video.rs) の同名関数にその旨の
-コメントがある)。保存が入ると、その作り直しが DB 読みになる。
+**次版の寿命契約**: 波形の範囲設定を変えてもresource session、worker、decoder、LRUを保持する。
+`rebuild_video_seek_strip_waveform_span` はlayout revisionとrequest signatureを更新し、旧rasterだけを
+新first paintまでdisplay holdoverとして残す。粗い列を再利用できるため、保存済みchunkを毎回DBから
+読み直す経路にもならない。
 
 **モジュール冒頭の宣言を書き換える**: `seek_strip_wave.rs` の
 「All caches are process-memory-only by design」は本決定で偽になる。**粗い列だけが永続で、raster と
@@ -924,7 +927,9 @@ RGBA payload に worker-local content revision を含める。これは永続 id
   - `OpenSeekStrip` / `CloseSeekStrip`
   - `SetSeekStripState { state }`
   - `MoveSeekStrip { center }` / `CommitSeekStrip { center }`
-  - `RequestSeekStripWindow { center, visible_count, pixel_width, pixel_height }`
+  - renderer内部ではfinal-pass `RequestSeekStripWindow { center, visible_count, pixel_width,
+    pixel_height }` observationを作る。native outputでは独立eventにせず、成功presentの
+    `SeekStripPresentation::Visible { window }`へ内包してAppが表示遷移後に原子的に適用する。
 
 ## 7. 入力とジェスチャ
 
@@ -1035,7 +1040,8 @@ enum SeekRowGesture {
 - 3600 / 7200 / 10800 秒は可視幅を 1 回だけ要求し、同幅 upgrade を作らず、25% 移動後に
   replacement を要求すること。
 - 保持中の波形 texture から設定可視 span の部分を切り出す UV / 部分 gap の算術。
-- preference 変更時に旧 raster が request coverage にならず、新 first paint まで display holdover になること。
+- preference 変更時にworker/decoder/LRUを保持し、旧 rasterだけがrequest coverageにならず新first paint
+  までdisplay holdoverになること。
 - 粗い 7-byte bin の量子化往復誤差、現在中心に最も近い未試行 chunk の選択、failed chunk の
   選択除外と非被覆扱い、`Unavailable` の全体終了、D27 の順序付き 3 経路、bitset coverage の
   連続区間合成、chunk bin の全尺列への合成。

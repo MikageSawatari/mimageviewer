@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 52;
+pub const PROTOCOL_VERSION: u32 = 67;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -196,13 +196,33 @@ pub struct FolderListEntry {
     pub mtime: i64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteAudioThumbnailIndicator {
+    #[default]
+    MusicNoteIcon,
+    BottomLeftBadge,
+    Hidden,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ThumbnailPresentation {
+    #[serde(default)]
+    pub audio_indicator: RemoteAudioThumbnailIndicator,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct FolderListPayload {
+    #[serde(default)]
+    pub thumbnail_presentation: ThumbnailPresentation,
     pub effective_address: RemoteAddress,
     /// 起点の種類を公開せずパンくず先頭を表示するための名前。
     pub root_name: String,
     pub thumb_aspect_height_ratio: f64,
     pub sort_state: RemoteGridSortState,
+    /// Visible when a requested rating order fell back to name order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_notice: Option<String>,
     pub entries: Vec<FolderListEntry>,
     /// Time spent scanning the directory and reading metadata.
     pub scan_ms: f64,
@@ -578,6 +598,24 @@ pub enum RemoteWriteRequest {
         spread_mode: RemoteSpreadMode,
         reading_direction: RemoteReadingDirection,
     },
+    SetFinalCoverSpreadPreference {
+        address: RemoteAddress,
+        preference: RemoteFinalCoverSpreadPreference,
+    },
+    SetSingletonSpreadPlacementPreference {
+        address: RemoteAddress,
+        preference: RemoteSingletonSpreadPlacementPreference,
+    },
+    SetSingletonSpreadEndpointPreference {
+        address: RemoteAddress,
+        endpoint: RemoteSingletonSpreadEndpoint,
+        preference: RemoteSingletonSpreadPlacementPreference,
+    },
+    SetPageAlonePreference {
+        address: RemoteAddress,
+        endpoint: RemotePageAloneEndpoint,
+        preference: RemotePageAlonePreference,
+    },
     /// 表示完了済みのページ位置。page fields と record_history は remote-web の
     /// 観測値として受けるが、本体 write worker がローカルと同じ列挙規則で検証・
     /// 正規化してから UI thread へ渡す。
@@ -590,6 +628,14 @@ pub enum RemoteWriteRequest {
         /// write worker がローカルの resume 対象規則から上書きする。
         record_resume: bool,
         record_history: bool,
+    },
+    RecordVideoProgress {
+        address: RemoteAddress,
+        /// 端末が session ごとに採番する単調増加の報告番号。
+        sequence: u64,
+        position_secs: f64,
+        duration_secs: f64,
+        ended: bool,
     },
     SetRating {
         address: RemoteAddress,
@@ -662,7 +708,12 @@ impl RemoteWriteRequest {
     pub fn address(&self) -> Option<&RemoteAddress> {
         match self {
             Self::SetSpread { address, .. }
+            | Self::SetFinalCoverSpreadPreference { address, .. }
+            | Self::SetSingletonSpreadPlacementPreference { address, .. }
+            | Self::SetSingletonSpreadEndpointPreference { address, .. }
+            | Self::SetPageAlonePreference { address, .. }
             | Self::RecordReadingProgress { address, .. }
+            | Self::RecordVideoProgress { address, .. }
             | Self::SetRating { address, .. }
             | Self::SetBookmark { address, .. }
             | Self::GetItemState { address, .. }
@@ -680,7 +731,12 @@ impl RemoteWriteRequest {
     pub fn address_mut(&mut self) -> Option<&mut RemoteAddress> {
         match self {
             Self::SetSpread { address, .. }
+            | Self::SetFinalCoverSpreadPreference { address, .. }
+            | Self::SetSingletonSpreadPlacementPreference { address, .. }
+            | Self::SetSingletonSpreadEndpointPreference { address, .. }
+            | Self::SetPageAlonePreference { address, .. }
             | Self::RecordReadingProgress { address, .. }
+            | Self::RecordVideoProgress { address, .. }
             | Self::SetRating { address, .. }
             | Self::SetBookmark { address, .. }
             | Self::GetItemState { address, .. }
@@ -722,6 +778,11 @@ impl RemoteWriteRequest {
                 context_address, ..
             } => Some(context_address),
             Self::SetSpread { .. }
+            | Self::SetFinalCoverSpreadPreference { .. }
+            | Self::SetSingletonSpreadPlacementPreference { .. }
+            | Self::SetSingletonSpreadEndpointPreference { .. }
+            | Self::SetPageAlonePreference { .. }
+            | Self::RecordVideoProgress { .. }
             | Self::SetRating { .. }
             | Self::SetAdjustment { .. }
             | Self::GetAdjustmentState { .. }
@@ -756,6 +817,11 @@ impl RemoteWriteRequest {
                 context_address, ..
             } => Some(context_address),
             Self::SetSpread { .. }
+            | Self::SetFinalCoverSpreadPreference { .. }
+            | Self::SetSingletonSpreadPlacementPreference { .. }
+            | Self::SetSingletonSpreadEndpointPreference { .. }
+            | Self::SetPageAlonePreference { .. }
+            | Self::RecordVideoProgress { .. }
             | Self::SetRating { .. }
             | Self::SetAdjustment { .. }
             | Self::GetAdjustmentState { .. }
@@ -766,7 +832,16 @@ impl RemoteWriteRequest {
     pub fn kind_name(&self) -> &'static str {
         match self {
             Self::SetSpread { .. } => "set_spread",
+            Self::SetFinalCoverSpreadPreference { .. } => "set_final_cover_spread_preference",
+            Self::SetSingletonSpreadPlacementPreference { .. } => {
+                "set_singleton_spread_placement_preference"
+            }
+            Self::SetSingletonSpreadEndpointPreference { .. } => {
+                "set_singleton_spread_endpoint_preference"
+            }
+            Self::SetPageAlonePreference { .. } => "set_page_alone_preference",
             Self::RecordReadingProgress { .. } => "record_reading_progress",
+            Self::RecordVideoProgress { .. } => "record_video_progress",
             Self::SetRating { .. } => "set_rating",
             Self::SetBookmark { .. } => "set_bookmark",
             Self::GetItemState { .. } => "get_item_state",
@@ -952,13 +1027,92 @@ pub struct PageGroup {
     /// 特定できない。位置の照合は `(anchor, slice)` の組で行うこと。
     pub anchor: RemoteAddress,
     pub pages: Vec<RemoteAddress>,
+    /// Full screen-order presentation when it differs from `pages`.
+    ///
+    /// Ordinary groups omit this field. A client that does not receive it must
+    /// synthesize one `Navigation` slot per entry in `pages`; this keeps old
+    /// browser assets safe while avoiding another address copy for every group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation: Option<Vec<RemotePagePresentationSlot>>,
     /// 分割中にこの表示単位が元ページのどちら側か。分割していなければ `Full`。
     #[serde(default)]
     pub slice: RemotePageSlice,
+    /// Layout-only endpoint placement. It never adds a page request.
+    #[serde(default)]
+    pub singleton_placement: RemoteSingletonSpreadPlacement,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemotePagePresentationRole {
+    Navigation,
+    FrontCoverSupplement,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemotePagePresentationSlot {
+    pub address: RemoteAddress,
+    pub role: RemotePagePresentationRole,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteFinalCoverSpreadPreference {
+    #[default]
+    FollowGlobal,
+    On,
+    Off,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteSingletonSpreadPlacementPreference {
+    #[default]
+    FollowGlobal,
+    Place,
+    Center,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteSingletonSpreadEndpoint {
+    #[default]
+    First,
+    Last,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteSingletonSpreadPlacement {
+    #[default]
+    Center,
+    Left,
+    Right,
+    LeftWhite,
+    RightWhite,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemotePageAlonePreference {
+    #[default]
+    FollowGlobal,
+    On,
+    Off,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemotePageAloneEndpoint {
+    #[default]
+    AfterCover,
+    Last,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ContainerPayload {
+    #[serde(default)]
+    pub thumbnail_presentation: ThumbnailPresentation,
     pub title: String,
     /// 起点の種類を公開せずパンくず先頭を表示するための名前。
     pub root_name: String,
@@ -979,6 +1133,30 @@ pub struct ContainerPayload {
     pub effective_spread_mode: RemoteSpreadMode,
     /// Single を含む物理的なページ送り方向。spread.db の reading direction を反映する。
     pub reading_direction: RemoteReadingDirection,
+    /// 本の保存値。`FollowGlobal` も nested ZIP の fallback を遮る明示値になり得る。
+    pub final_cover_spread_preference: RemoteFinalCoverSpreadPreference,
+    /// 全体設定と本の保存値を解決した結果。実際の適用可否は各 group の構成が表す。
+    pub final_cover_spread_enabled: bool,
+    #[serde(default)]
+    pub singleton_spread_placement_preference: RemoteSingletonSpreadPlacementPreference,
+    #[serde(default)]
+    pub singleton_spread_placement_enabled: bool,
+    #[serde(default)]
+    pub singleton_spread_first_preference: RemoteSingletonSpreadPlacementPreference,
+    #[serde(default)]
+    pub singleton_spread_last_preference: RemoteSingletonSpreadPlacementPreference,
+    #[serde(default)]
+    pub singleton_spread_first_enabled: bool,
+    #[serde(default)]
+    pub singleton_spread_last_enabled: bool,
+    #[serde(default)]
+    pub page_after_cover_alone_preference: RemotePageAlonePreference,
+    #[serde(default)]
+    pub last_page_alone_preference: RemotePageAlonePreference,
+    #[serde(default)]
+    pub page_after_cover_alone_enabled: bool,
+    #[serde(default)]
+    pub last_page_alone_enabled: bool,
     /// 本体 seek overlay と同じ nav item 分類による件数内訳。
     pub image_count: usize,
     pub video_count: usize,
@@ -1070,6 +1248,31 @@ pub struct PageDemandRequest {
     pub release: Vec<PageDemandRelease>,
 }
 
+/// A display-position declaration, independent of page byte requests.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RawPrefetchWindowRequest {
+    pub window_generation: u64,
+    pub entries: Vec<RemoteAddress>,
+}
+
+pub const MAX_RAW_PREFETCH_WINDOW_ENTRIES: usize = 8;
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RawPrefetchWindowStatus {
+    Accepted,
+    Stale,
+    Duplicate,
+    Terminal,
+    Rejected,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RawPrefetchWindowAck {
+    pub window_generation: u64,
+    pub status: RawPrefetchWindowStatus,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PageDemandPromoteStatus {
@@ -1149,6 +1352,8 @@ pub enum MediaErrorCode {
     PageOutOfRange,
     Cancelled,
     Busy,
+    RawPrefetchSkipped,
+    RawCapacity,
     RenderFailed,
     Internal,
 }
@@ -1165,13 +1370,30 @@ pub struct SmartFolderSummary {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PlaceSummary {
-    DriveList { name: String },
-    ReadingHistory { name: String },
-    Bookmarks { name: String },
-    Rating { name: String, stars: Vec<u8> },
-    Bookshelf { name: String },
+    DriveList {
+        name: String,
+    },
+    ReadingHistory {
+        name: String,
+    },
+    Bookmarks {
+        name: String,
+    },
+    Rating {
+        name: String,
+        stars: Vec<u8>,
+    },
+    Bookshelf {
+        name: String,
+    },
+    FileOrganizeDestinations {
+        name: String,
+        entries: Vec<RemoteEntry>,
+    },
     Separator,
-    Folder { entry: RemoteEntry },
+    Folder {
+        entry: RemoteEntry,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1237,6 +1459,8 @@ pub struct RemoteEntry {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct CollectionPayload {
+    #[serde(default)]
+    pub thumbnail_presentation: ThumbnailPresentation,
     pub title: String,
     pub thumb_aspect_height_ratio: f64,
     pub sort_state: RemoteGridSortState,
@@ -1257,6 +1481,300 @@ pub struct CollectionPayload {
 pub enum CollectionResponse {
     Success(CollectionPayload),
     Error(CollectionError),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PersistentCollectionCatalogRequest;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PersistentCollectionOrderSummary {
+    Manual,
+    Shuffle,
+    Standard {
+        value: String,
+        label: String,
+        short_label: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PersistentCollectionSummary {
+    pub collection_id: String,
+    pub name: String,
+    pub order: PersistentCollectionOrderSummary,
+    pub collection_revision: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PersistentCollectionCatalogPayload {
+    pub catalog_revision: u64,
+    pub collections: Vec<PersistentCollectionSummary>,
+    pub limit: usize,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub enum PersistentCollectionCatalogResponse {
+    Success(PersistentCollectionCatalogPayload),
+    Error(PersistentCollectionError),
+}
+
+#[derive(Clone, Debug, Deserialize, Hash, PartialEq, Eq, Serialize)]
+pub struct PersistentCollectionIdentity {
+    pub entry_id: String,
+    pub source_identity: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PersistentCollectionEntryState {
+    Available {
+        address: RemoteAddress,
+        kind: RemoteEntryKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thumbnail_address: Option<RemoteAddress>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rating: Option<u8>,
+    },
+    Missing {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_known_kind: Option<RemoteEntryKind>,
+    },
+    Unsupported {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_known_kind: Option<RemoteEntryKind>,
+    },
+    AccessError {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_known_kind: Option<RemoteEntryKind>,
+    },
+    BlockedByRemotePolicy {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_known_kind: Option<RemoteEntryKind>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PersistentCollectionEntry {
+    #[serde(flatten)]
+    pub identity: PersistentCollectionIdentity,
+    pub name: String,
+    pub state: PersistentCollectionEntryState,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PersistentCollectionPageSlot {
+    #[serde(flatten)]
+    pub identity: PersistentCollectionIdentity,
+    pub address: RemoteAddress,
+    pub role: RemotePagePresentationRole,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PersistentCollectionPageGroup {
+    pub anchor: PersistentCollectionIdentity,
+    pub pages: Vec<PersistentCollectionPageSlot>,
+    #[serde(default)]
+    pub slice: RemotePageSlice,
+    #[serde(default)]
+    pub singleton_placement: RemoteSingletonSpreadPlacement,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PersistentCollectionSnapshotRequest {
+    pub collection_id: String,
+    pub spread_mode: Option<RemoteSpreadMode>,
+    pub reading_direction: Option<RemoteReadingDirection>,
+    pub force_single_page: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct PersistentCollectionSnapshotPayload {
+    #[serde(default)]
+    pub thumbnail_presentation: ThumbnailPresentation,
+    pub collection_id: String,
+    pub collection_revision: u64,
+    pub view_token: String,
+    pub title: String,
+    pub order: PersistentCollectionOrderSummary,
+    pub entries: Vec<PersistentCollectionEntry>,
+    pub configured_spread_mode: RemoteSpreadMode,
+    pub effective_spread_mode: RemoteSpreadMode,
+    pub reading_direction: RemoteReadingDirection,
+    pub image_count: usize,
+    pub page_groups: Vec<PersistentCollectionPageGroup>,
+    pub spread_page_gap_px: u32,
+    pub entry_limit: usize,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub enum PersistentCollectionSnapshotResponse {
+    Success(PersistentCollectionSnapshotPayload),
+    Error(PersistentCollectionError),
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistentCollectionNavigationDirection {
+    Forward,
+    Backward,
+    First,
+    Last,
+    Current,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistentCollectionNavigationKind {
+    NavigableMedia,
+    StillImage,
+    Video,
+    Audio,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistentCollectionNavigationTail {
+    Stop,
+    Loop,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PersistentCollectionNavigationAnchor {
+    pub primary: PersistentCollectionIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partner: Option<PersistentCollectionIdentity>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PersistentCollectionNavigateRequest {
+    pub collection_id: String,
+    pub presented_revision: u64,
+    pub presented_view_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<PersistentCollectionNavigationAnchor>,
+    /// Entry-ID-only locator for a pasted/deep route that has no prior source token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locate_entry_id: Option<String>,
+    /// Zero-based ordinal in the requested media-kind projection of the latest prepared view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locate_ordinal: Option<usize>,
+    pub direction: PersistentCollectionNavigationDirection,
+    pub target_kind: PersistentCollectionNavigationKind,
+    pub tail: PersistentCollectionNavigationTail,
+    pub viewer_sequence: u64,
+    pub spread_mode: Option<RemoteSpreadMode>,
+    pub reading_direction: Option<RemoteReadingDirection>,
+    pub force_single_page: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PersistentCollectionSparseTarget {
+    DirectImageDisplayUnit {
+        group: PersistentCollectionPageGroup,
+    },
+    DirectVideo {
+        identity: PersistentCollectionIdentity,
+        address: RemoteAddress,
+    },
+    DirectAudio {
+        identity: PersistentCollectionIdentity,
+        address: RemoteAddress,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistentCollectionPositionKind {
+    StillImage,
+    Video,
+    Audio,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PersistentCollectionTargetPosition {
+    pub kind: PersistentCollectionPositionKind,
+    pub ordinal: usize,
+    pub count: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistentCollectionAnchorResolution {
+    EntryId,
+    SourceIdentity,
+    Ordinal,
+    Head,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistentCollectionBoundaryReason {
+    Start,
+    End,
+    Empty,
+    TargetUnavailable,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum PersistentCollectionNavigatePayload {
+    Landed {
+        exact_revision: u64,
+        exact_view_token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replacement: Option<PersistentCollectionSnapshotPayload>,
+        target: PersistentCollectionSparseTarget,
+        position: PersistentCollectionTargetPosition,
+        anchor_resolution: PersistentCollectionAnchorResolution,
+    },
+    Boundary {
+        exact_revision: u64,
+        exact_view_token: String,
+        anchor_resolution: PersistentCollectionAnchorResolution,
+        reason: PersistentCollectionBoundaryReason,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub enum PersistentCollectionNavigateResponse {
+    Success(PersistentCollectionNavigatePayload),
+    Error(PersistentCollectionError),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PersistentCollectionError {
+    pub code: PersistentCollectionErrorCode,
+    pub message: String,
+}
+
+impl PersistentCollectionError {
+    pub fn new(code: PersistentCollectionErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistentCollectionErrorCode {
+    BadRequest,
+    Starting,
+    Busy,
+    NotFound,
+    Conflict,
+    Incompatible,
+    Unavailable,
+    PrepareFailed,
+    Cancelled,
+    Internal,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1501,6 +2019,11 @@ pub enum VideoStreamControlAction {
         quality: VideoStreamQuality,
         position_secs: f64,
     },
+    AudioTrack {
+        stream_index: usize,
+        position_secs: f64,
+        expected_generation: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1544,6 +2067,13 @@ pub struct VideoStreamAudioProcessing {
     pub vst3_warning: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemoteAudioTrack {
+    pub stream_index: usize,
+    pub label: String,
+    pub is_default: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct VideoStreamStartPayload {
     pub session: u64,
@@ -1556,6 +2086,8 @@ pub struct VideoStreamStartPayload {
     pub video_size: VideoStreamSize,
     pub codecs: String,
     pub audio_processing: VideoStreamAudioProcessing,
+    pub audio_tracks: Vec<RemoteAudioTrack>,
+    pub audio_track: Option<usize>,
     pub end_behavior: VideoStreamEndBehavior,
 }
 
@@ -1654,6 +2186,8 @@ pub struct VideoStreamStatePayload {
     pub video_size: VideoStreamSize,
     pub codecs: String,
     pub audio_processing: VideoStreamAudioProcessing,
+    pub audio_tracks: Vec<RemoteAudioTrack>,
+    pub audio_track: Option<usize>,
     pub play_intent: bool,
     pub volume: f64,
 }
@@ -1773,6 +2307,7 @@ pub enum RemoteAiTerminalCode {
     DiscardedByHost,
     BackgroundExpired,
     SourceChanged,
+    SettingsRecoveryInProgress,
     ExecutionFailed,
 }
 
@@ -1968,6 +2503,7 @@ pub enum RemoteArchiveTerminalCode {
     IgnoredBySettings,
     UnsupportedFormat,
     NoImages,
+    SettingsRecoveryInProgress,
     ExecutionFailed,
 }
 
@@ -2148,6 +2684,21 @@ pub enum ClientMessage {
         owner: RemoteSessionIdentity,
         request: CollectionRequest,
     },
+    PersistentCollectionCatalog {
+        id: RequestId,
+        owner: RemoteSessionIdentity,
+        request: PersistentCollectionCatalogRequest,
+    },
+    PersistentCollectionSnapshot {
+        id: RequestId,
+        owner: RemoteSessionIdentity,
+        request: PersistentCollectionSnapshotRequest,
+    },
+    PersistentCollectionNavigate {
+        id: RequestId,
+        owner: RemoteSessionIdentity,
+        request: PersistentCollectionNavigateRequest,
+    },
     FavoriteSearch {
         id: RequestId,
         owner: RemoteSessionIdentity,
@@ -2182,6 +2733,11 @@ pub enum ClientMessage {
         id: RequestId,
         owner: RemoteSessionIdentity,
         request: PageDemandRequest,
+    },
+    RawPrefetchWindow {
+        id: RequestId,
+        owner: RemoteSessionIdentity,
+        request: RawPrefetchWindowRequest,
     },
     RemoteAiStart {
         id: RequestId,
@@ -2254,6 +2810,7 @@ pub enum ClientMessage {
         owner: RemoteSessionIdentity,
         address: RemoteAddress,
         quality: VideoStreamQuality,
+        audio_track: Option<usize>,
     },
     VideoStreamControl {
         id: RequestId,
@@ -2322,6 +2879,9 @@ impl ClientMessage {
             | Self::Thumbnail { id, .. }
             | Self::Home { id, .. }
             | Self::Collection { id, .. }
+            | Self::PersistentCollectionCatalog { id, .. }
+            | Self::PersistentCollectionSnapshot { id, .. }
+            | Self::PersistentCollectionNavigate { id, .. }
             | Self::FavoriteSearch { id, .. }
             | Self::TagBrowse { id, .. }
             | Self::TagItems { id, .. }
@@ -2329,6 +2889,7 @@ impl ClientMessage {
             | Self::Container { id, .. }
             | Self::Page { id, .. }
             | Self::PageDemand { id, .. }
+            | Self::RawPrefetchWindow { id, .. }
             | Self::RemoteAiStart { id, .. }
             | Self::RemoteAiState { id, .. }
             | Self::RemoteAiRecoverable { id, .. }
@@ -2380,6 +2941,18 @@ pub enum ServerMessage {
         id: RequestId,
         response: CollectionResponse,
     },
+    PersistentCollectionCatalog {
+        id: RequestId,
+        response: PersistentCollectionCatalogResponse,
+    },
+    PersistentCollectionSnapshot {
+        id: RequestId,
+        response: PersistentCollectionSnapshotResponse,
+    },
+    PersistentCollectionNavigate {
+        id: RequestId,
+        response: PersistentCollectionNavigateResponse,
+    },
     FavoriteSearch {
         id: RequestId,
         response: FavoriteSearchResponse,
@@ -2407,6 +2980,10 @@ pub enum ServerMessage {
     PageDemand {
         id: RequestId,
         response: PageDemandResponse,
+    },
+    RawPrefetchWindow {
+        id: RequestId,
+        response: RawPrefetchWindowAck,
     },
     RemoteAiStart {
         id: RequestId,
@@ -2510,6 +3087,9 @@ impl ServerMessage {
             | Self::Thumbnail { id, .. }
             | Self::Home { id, .. }
             | Self::Collection { id, .. }
+            | Self::PersistentCollectionCatalog { id, .. }
+            | Self::PersistentCollectionSnapshot { id, .. }
+            | Self::PersistentCollectionNavigate { id, .. }
             | Self::FavoriteSearch { id, .. }
             | Self::TagBrowse { id, .. }
             | Self::TagItems { id, .. }
@@ -2517,6 +3097,7 @@ impl ServerMessage {
             | Self::FolderList { id, .. }
             | Self::Page { id, .. }
             | Self::PageDemand { id, .. }
+            | Self::RawPrefetchWindow { id, .. }
             | Self::RemoteAiStart { id, .. }
             | Self::RemoteAiState { id, .. }
             | Self::RemoteAiRecoverable { id, .. }
@@ -2574,6 +3155,7 @@ pub enum ThumbnailErrorCode {
     NotFound,
     Unsupported,
     NotReady,
+    NoThumbnail,
     GenerationFailed,
     Busy,
     PasswordRequired,
@@ -2670,8 +3252,67 @@ mod tests {
     }
 
     #[test]
+    fn protocol_v67_audio_thumbnail_presentation_has_three_stable_values_and_default() {
+        for (indicator, label) in [
+            (
+                RemoteAudioThumbnailIndicator::MusicNoteIcon,
+                "music_note_icon",
+            ),
+            (
+                RemoteAudioThumbnailIndicator::BottomLeftBadge,
+                "bottom_left_badge",
+            ),
+            (RemoteAudioThumbnailIndicator::Hidden, "hidden"),
+        ] {
+            let value = ThumbnailPresentation {
+                audio_indicator: indicator,
+            };
+            assert_eq!(
+                serde_json::to_value(value).unwrap()["audio_indicator"],
+                label
+            );
+            assert_eq!(
+                serde_json::from_str::<ThumbnailPresentation>(
+                    &serde_json::to_string(&value).unwrap()
+                )
+                .unwrap(),
+                value
+            );
+        }
+        assert_eq!(
+            serde_json::from_str::<ThumbnailPresentation>("{}").unwrap(),
+            ThumbnailPresentation::default()
+        );
+        assert_eq!(PROTOCOL_VERSION, 67);
+    }
+
+    #[test]
     fn current_protocol_version_is_accepted() {
         assert!(negotiate(PROTOCOL_VERSION).accepted);
+    }
+
+    #[test]
+    fn protocol_v63_audio_track_control_round_trips() {
+        assert_eq!(PROTOCOL_VERSION, 67);
+        let action = VideoStreamControlAction::AudioTrack {
+            stream_index: 3,
+            position_secs: 42.5,
+            expected_generation: 9,
+        };
+        let value = serde_json::to_value(&action).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "action": "audio_track",
+                "stream_index": 3,
+                "position_secs": 42.5,
+                "expected_generation": 9,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<VideoStreamControlAction>(value).unwrap(),
+            action
+        );
     }
 
     #[test]
@@ -2704,6 +3345,12 @@ mod tests {
                 vst3_active_slots: 5,
                 vst3_warning: None,
             },
+            audio_tracks: vec![RemoteAudioTrack {
+                stream_index: 2,
+                label: "2: 日本語 — aac 2ch".to_owned(),
+                is_default: false,
+            }],
+            audio_track: Some(2),
             play_intent: true,
             volume: 0.75,
         };
@@ -2713,6 +3360,14 @@ mod tests {
         assert_eq!(value["generated_end_secs"], 300.0);
         assert_eq!(value["buffer_target_secs"], 60.0);
         assert_eq!(value["play_intent"], true);
+        assert_eq!(value["audio_track"], 2);
+        assert_eq!(value["audio_tracks"][0]["stream_index"], 2);
+        assert_eq!(
+            serde_json::from_value::<VideoStreamStatePayload>(value.clone())
+                .unwrap()
+                .audio_track,
+            Some(2)
+        );
         assert_eq!(value["ended"], false);
         assert!(value.get("position_secs").is_none());
         assert!(value.get("playing").is_none());
@@ -2787,8 +3442,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v52_connection_info_round_trips_with_tailnet_prerequisites_without_credentials() {
-        assert_eq!(PROTOCOL_VERSION, 52);
+    fn protocol_v55_connection_info_round_trips_with_tailnet_prerequisites_without_credentials() {
+        assert_eq!(PROTOCOL_VERSION, 67);
         let expected = ClientMessage::RemoteWebConnectionInfo {
             id: 10,
             info: RemoteWebConnectionInfo {
@@ -2827,6 +3482,72 @@ mod tests {
         let actual: ClientMessage =
             read_frame(&mut bytes.as_slice(), MAX_CONTROL_FRAME_BYTES).unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn protocol_v62_raw_error_codes_round_trip() {
+        assert_eq!(PROTOCOL_VERSION, 67);
+        for (code, wire) in [
+            (MediaErrorCode::RawPrefetchSkipped, "raw_prefetch_skipped"),
+            (MediaErrorCode::RawCapacity, "raw_capacity"),
+        ] {
+            let encoded = serde_json::to_string(&code).unwrap();
+            assert_eq!(encoded, format!("\"{wire}\""));
+            assert_eq!(
+                serde_json::from_str::<MediaErrorCode>(&encoded).unwrap(),
+                code
+            );
+        }
+        let encoded = serde_json::to_string(&ThumbnailErrorCode::NoThumbnail).unwrap();
+        assert_eq!(encoded, "\"no_thumbnail\"");
+        assert_eq!(
+            serde_json::from_str::<ThumbnailErrorCode>(&encoded).unwrap(),
+            ThumbnailErrorCode::NoThumbnail
+        );
+    }
+
+    #[test]
+    fn protocol_v65_raw_window_request_and_all_ack_outcomes_round_trip() {
+        assert_eq!(PROTOCOL_VERSION, 67);
+        let expected = ClientMessage::RawPrefetchWindow {
+            id: 65,
+            owner: test_owner("window-client"),
+            request: RawPrefetchWindowRequest {
+                window_generation: 11,
+                entries: vec![RemoteAddress::file("C:/Pictures/page.dng")],
+            },
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &expected).unwrap();
+        assert_eq!(
+            read_frame::<_, ClientMessage>(&mut bytes.as_slice(), MAX_CONTROL_FRAME_BYTES).unwrap(),
+            expected
+        );
+        assert_eq!(expected.id(), 65);
+        for status in [
+            RawPrefetchWindowStatus::Accepted,
+            RawPrefetchWindowStatus::Stale,
+            RawPrefetchWindowStatus::Duplicate,
+            RawPrefetchWindowStatus::Terminal,
+            RawPrefetchWindowStatus::Rejected,
+        ] {
+            let expected = ServerMessage::RawPrefetchWindow {
+                id: 65,
+                response: RawPrefetchWindowAck {
+                    window_generation: 11,
+                    status,
+                },
+            };
+            let mut bytes = Vec::new();
+            write_frame(&mut bytes, &expected).unwrap();
+            assert_eq!(
+                read_frame::<_, ServerMessage>(&mut bytes.as_slice(), MAX_RESPONSE_FRAME_BYTES)
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(expected.id(), 65);
+        }
+        assert_eq!(MAX_RAW_PREFETCH_WINDOW_ENTRIES, 8);
     }
 
     #[test]
@@ -2933,10 +3654,12 @@ mod tests {
         let response = ServerMessage::FolderList {
             id: 49,
             response: FolderListResponse::Success(FolderListPayload {
+                thumbnail_presentation: ThumbnailPresentation::default(),
                 effective_address: RemoteAddress::file("C:/Movies"),
                 root_name: "Fixture".to_owned(),
                 thumb_aspect_height_ratio: 9.0 / 16.0,
                 sort_state: test_sort_state(None),
+                sort_notice: None,
                 entries: vec![FolderListEntry {
                     address: video,
                     thumbnail_address: sidecar,
@@ -2963,14 +3686,37 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v52_remote_video_thumbnail_shape_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 52);
+    fn folder_sort_notice_is_additive_and_old_payloads_remain_readable() {
+        let payload = serde_json::json!({
+            "effective_address": RemoteAddress::file("C:/Pictures"),
+            "root_name": "Pictures",
+            "thumb_aspect_height_ratio": 1.0,
+            "sort_state": test_sort_state(None),
+            "entries": [],
+            "scan_ms": 0.0,
+            "materialize_ms": 0.0
+        });
+        let old: FolderListPayload = serde_json::from_value(payload.clone()).unwrap();
+        assert_eq!(old.sort_notice, None);
+        let mut with_notice = payload;
+        with_notice["sort_notice"] = serde_json::json!("評価順を読み込めませんでした");
+        let current: FolderListPayload = serde_json::from_value(with_notice).unwrap();
+        assert_eq!(
+            current.sort_notice.as_deref(),
+            Some("評価順を読み込めませんでした")
+        );
+    }
+
+    #[test]
+    fn protocol_v55_remote_video_thumbnail_shape_round_trips() {
+        assert_eq!(PROTOCOL_VERSION, 67);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
                 owner: test_owner("test-client"),
                 address: RemoteAddress::file("C:/Music/sample.flac"),
                 quality: VideoStreamQuality::Standard,
+                audio_track: Some(2),
             },
             ClientMessage::VideoStreamPlaylist {
                 id: 51,
@@ -3035,6 +3781,12 @@ mod tests {
                         vst3_active_slots: 0,
                         vst3_warning: Some("VST3 を適用できませんでした".to_owned()),
                     },
+                    audio_tracks: vec![RemoteAudioTrack {
+                        stream_index: 2,
+                        label: "2: 日本語 — aac 2ch".to_owned(),
+                        is_default: false,
+                    }],
+                    audio_track: Some(2),
                     end_behavior: VideoStreamEndBehavior::Next { wrap: true },
                 }),
             },
@@ -3090,6 +3842,18 @@ mod tests {
     }
 
     #[test]
+    fn protocol_v55_names_settings_recovery_job_terminals_for_client_retry() {
+        assert_eq!(
+            serde_json::to_string(&RemoteAiTerminalCode::SettingsRecoveryInProgress).unwrap(),
+            "\"settings_recovery_in_progress\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RemoteArchiveTerminalCode::SettingsRecoveryInProgress).unwrap(),
+            "\"settings_recovery_in_progress\""
+        );
+    }
+
+    #[test]
     fn container_spread_request_and_groups_round_trip() {
         let container = RemoteAddress::file("C:/Books/book.pdf");
         let page = |page_number| RemoteAddress {
@@ -3099,6 +3863,7 @@ mod tests {
         let expected = ServerMessage::Container {
             id: 44,
             response: ContainerResponse::Success(ContainerPayload {
+                thumbnail_presentation: ThumbnailPresentation::default(),
                 title: "book.pdf".to_owned(),
                 root_name: "Fixture".to_owned(),
                 kind: ContainerKind::Pdf,
@@ -3111,14 +3876,38 @@ mod tests {
                 configured_spread_mode: RemoteSpreadMode::RtlCover,
                 effective_spread_mode: RemoteSpreadMode::RtlCover,
                 reading_direction: RemoteReadingDirection::Rtl,
+                final_cover_spread_preference: RemoteFinalCoverSpreadPreference::On,
+                final_cover_spread_enabled: true,
+                singleton_spread_placement_preference:
+                    RemoteSingletonSpreadPlacementPreference::Place,
+                singleton_spread_placement_enabled: true,
+                singleton_spread_first_preference: RemoteSingletonSpreadPlacementPreference::Place,
+                singleton_spread_last_preference: RemoteSingletonSpreadPlacementPreference::Center,
+                singleton_spread_first_enabled: true,
+                singleton_spread_last_enabled: false,
+                page_after_cover_alone_preference: RemotePageAlonePreference::FollowGlobal,
+                last_page_alone_preference: RemotePageAlonePreference::FollowGlobal,
+                page_after_cover_alone_enabled: false,
+                last_page_alone_enabled: false,
                 image_count: 2,
                 video_count: 0,
                 other_count: 0,
                 spread_page_gap_px: 8,
                 page_groups: vec![PageGroup {
-                    anchor: page(0),
-                    pages: vec![page(1), page(0)],
+                    anchor: page(1),
+                    pages: vec![page(1)],
+                    presentation: Some(vec![
+                        RemotePagePresentationSlot {
+                            address: page(0),
+                            role: RemotePagePresentationRole::FrontCoverSupplement,
+                        },
+                        RemotePagePresentationSlot {
+                            address: page(1),
+                            role: RemotePagePresentationRole::Navigation,
+                        },
+                    ]),
                     slice: RemotePageSlice::Full,
+                    singleton_placement: RemoteSingletonSpreadPlacement::Left,
                 }],
                 entry_limit: 1000,
                 truncated: false,
@@ -3130,6 +3919,9 @@ mod tests {
             read_frame(&mut bytes.as_slice(), MAX_RESPONSE_FRAME_BYTES).unwrap();
         assert_eq!(actual, expected);
 
+        let encoded = serde_json::to_string(&expected).unwrap();
+        assert!(encoded.contains("\"front_cover_supplement\""));
+
         let request = ContainerRequest {
             address: RemoteAddress::file("C:/Books/book.pdf"),
             spread_mode: Some(RemoteSpreadMode::Ltr),
@@ -3140,6 +3932,35 @@ mod tests {
         assert!(encoded.contains("\"spread_mode\":\"ltr\""));
         assert!(encoded.contains("\"reading_direction\":\"ltr\""));
         assert!(encoded.contains("\"force_single_page\":true"));
+    }
+
+    #[test]
+    fn ordinary_page_group_omits_presentation_and_legacy_shape_restores_navigation_fallback() {
+        let address = RemoteAddress::file("C:/Books/page.jpg");
+        let group = PageGroup {
+            anchor: address.clone(),
+            pages: vec![address],
+            presentation: None,
+            slice: RemotePageSlice::Full,
+            singleton_placement: RemoteSingletonSpreadPlacement::Center,
+        };
+        let encoded = serde_json::to_string(&group).unwrap();
+        assert!(!encoded.contains("presentation"));
+
+        let decoded: PageGroup = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.presentation, None);
+        assert_eq!(decoded.pages, group.pages);
+
+        let mut legacy = serde_json::to_value(&group).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("singleton_placement");
+        let legacy: PageGroup = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            legacy.singleton_placement,
+            RemoteSingletonSpreadPlacement::Center
+        );
     }
 
     #[test]
@@ -3162,6 +3983,24 @@ mod tests {
             unreachable!();
         };
         assert_eq!(request.kind_name(), "set_spread");
+
+        let preference = ClientMessage::Write {
+            id: 46,
+            owner: test_owner("test-client"),
+            request: RemoteWriteRequest::SetFinalCoverSpreadPreference {
+                address: RemoteAddress::file("C:/Books/book.pdf"),
+                preference: RemoteFinalCoverSpreadPreference::Off,
+            },
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &preference).unwrap();
+        let actual: ClientMessage =
+            read_frame(&mut bytes.as_slice(), MAX_CONTROL_FRAME_BYTES).unwrap();
+        assert_eq!(actual, preference);
+        let ClientMessage::Write { request, .. } = actual else {
+            unreachable!();
+        };
+        assert_eq!(request.kind_name(), "set_final_cover_spread_preference");
     }
 
     #[test]
@@ -3172,6 +4011,19 @@ mod tests {
             subresource: RemoteSubresource::PdfPage { page_number: 2 },
         };
         let requests = [
+            RemoteWriteRequest::SetFinalCoverSpreadPreference {
+                address: container.clone(),
+                preference: RemoteFinalCoverSpreadPreference::FollowGlobal,
+            },
+            RemoteWriteRequest::SetSingletonSpreadPlacementPreference {
+                address: container.clone(),
+                preference: RemoteSingletonSpreadPlacementPreference::Place,
+            },
+            RemoteWriteRequest::SetSingletonSpreadEndpointPreference {
+                address: container.clone(),
+                endpoint: RemoteSingletonSpreadEndpoint::Last,
+                preference: RemoteSingletonSpreadPlacementPreference::Center,
+            },
             RemoteWriteRequest::RecordReadingProgress {
                 address: page.clone(),
                 context_address: container.clone(),
@@ -3180,6 +4032,13 @@ mod tests {
                 page_count: 12,
                 record_resume: true,
                 record_history: true,
+            },
+            RemoteWriteRequest::RecordVideoProgress {
+                address: RemoteAddress::file("C:/media/movie.mp4"),
+                sequence: 1,
+                position_secs: 19.5,
+                duration_secs: 120.0,
+                ended: false,
             },
             RemoteWriteRequest::SetRating {
                 address: page.clone(),
@@ -3437,6 +4296,7 @@ mod tests {
         let expected = ServerMessage::Collection {
             id: 77,
             response: CollectionResponse::Success(CollectionPayload {
+                thumbnail_presentation: ThumbnailPresentation::default(),
                 title: "最近読んだ本".to_owned(),
                 thumb_aspect_height_ratio: 1.0,
                 sort_state: test_sort_state(Some("この一覧では並び順が固定されています")),
@@ -3448,7 +4308,9 @@ mod tests {
                 page_groups: vec![PageGroup {
                     anchor: page.clone(),
                     pages: vec![page],
+                    presentation: None,
                     slice: RemotePageSlice::Full,
+                    singleton_placement: RemoteSingletonSpreadPlacement::Center,
                 }],
                 entry_limit: 1000,
                 truncated: false,
@@ -3492,6 +4354,7 @@ mod tests {
             id: 78,
             response: FavoriteSearchResponse::Success(FavoriteSearchPayload {
                 listing: CollectionPayload {
+                    thumbnail_presentation: ThumbnailPresentation::default(),
                     title: "検索結果".to_owned(),
                     thumb_aspect_height_ratio: 1.0,
                     sort_state: test_sort_state(Some("この一覧では並び順が固定されています")),
@@ -3556,6 +4419,7 @@ mod tests {
             id: 80,
             response: TagItemsResponse::Success(TagItemsPayload {
                 listing: CollectionPayload {
+                    thumbnail_presentation: ThumbnailPresentation::default(),
                     title: "タグの項目".to_owned(),
                     thumb_aspect_height_ratio: 1.0,
                     sort_state: test_sort_state(Some("この一覧では並び順が固定されています")),
@@ -3690,6 +4554,38 @@ mod tests {
         assert_eq!(json[1]["stars"], serde_json::json!([1, 2, 3, 4, 5]));
         assert_eq!(json[2]["kind"], "separator");
         assert_eq!(json[3]["entry"]["kind"], "folder");
+    }
+
+    #[test]
+    fn file_organize_destinations_home_roundtrips_typed_folder_entries() {
+        let entry = |name: &str, path: &str| RemoteEntry {
+            path: path.to_owned(),
+            name: name.to_owned(),
+            kind: RemoteEntryKind::Folder,
+            thumbnail_address: None,
+            detail: None,
+            progress_current: None,
+            progress_total: None,
+            rating: None,
+        };
+        let payload = HomePayload {
+            smart_folders: vec![],
+            places: vec![PlaceSummary::FileOrganizeDestinations {
+                name: "整理先".into(),
+                entries: vec![entry("保管", "C:/archive"), entry("未接続", "Z:/absent")],
+            }],
+        };
+        let encoded = serde_json::to_vec(&payload).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<HomePayload>(&encoded).unwrap(),
+            payload
+        );
+        let json: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(json["places"][0]["kind"], "file_organize_destinations");
+        assert_eq!(json["places"][0]["entries"][0]["name"], "保管");
+        assert_eq!(json["places"][0]["entries"][1]["path"], "Z:/absent");
+        assert_eq!(json["places"][0]["entries"][1]["kind"], "folder");
+        assert_eq!(PROTOCOL_VERSION, 67);
     }
 
     #[test]
@@ -3883,5 +4779,98 @@ mod tests {
         assert!(!encoded.contains("super-secret"));
         let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
         assert!(value.get("password").is_none());
+    }
+
+    #[test]
+    fn persistent_collection_shuffle_order_round_trips_on_protocol_59() {
+        assert_eq!(PROTOCOL_VERSION, 67);
+        let encoded = serde_json::to_value(PersistentCollectionOrderSummary::Shuffle).unwrap();
+        assert_eq!(encoded, serde_json::json!({ "kind": "shuffle" }));
+        let decoded: PersistentCollectionOrderSummary = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, PersistentCollectionOrderSummary::Shuffle);
+    }
+
+    #[test]
+    fn persistent_collection_navigation_positions_and_locator_round_trip() {
+        let identity = PersistentCollectionIdentity {
+            entry_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+            source_identity: "a".repeat(64),
+        };
+        for direction in [
+            PersistentCollectionNavigationDirection::Forward,
+            PersistentCollectionNavigationDirection::Backward,
+            PersistentCollectionNavigationDirection::First,
+            PersistentCollectionNavigationDirection::Last,
+            PersistentCollectionNavigationDirection::Current,
+        ] {
+            let request = PersistentCollectionNavigateRequest {
+                collection_id: "22222222-2222-4222-8222-222222222222".to_owned(),
+                presented_revision: 7,
+                presented_view_token: "view".to_owned(),
+                anchor: Some(PersistentCollectionNavigationAnchor {
+                    primary: identity.clone(),
+                    partner: None,
+                }),
+                locate_entry_id: (direction == PersistentCollectionNavigationDirection::Current)
+                    .then(|| identity.entry_id.clone()),
+                locate_ordinal: None,
+                direction,
+                target_kind: PersistentCollectionNavigationKind::NavigableMedia,
+                tail: PersistentCollectionNavigationTail::Stop,
+                viewer_sequence: 9,
+                spread_mode: Some(RemoteSpreadMode::Ltr),
+                reading_direction: Some(RemoteReadingDirection::Ltr),
+                force_single_page: false,
+            };
+            let encoded = serde_json::to_vec(&request).unwrap();
+            let decoded: PersistentCollectionNavigateRequest =
+                serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(decoded, request);
+        }
+    }
+
+    #[test]
+    fn persistent_collection_landed_position_is_a_typed_protocol_59_field() {
+        let identity = PersistentCollectionIdentity {
+            entry_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+            source_identity: "a".repeat(64),
+        };
+        for (kind, target) in [
+            (
+                PersistentCollectionPositionKind::Video,
+                PersistentCollectionSparseTarget::DirectVideo {
+                    identity: identity.clone(),
+                    address: RemoteAddress::file("C:/media/movie.mp4"),
+                },
+            ),
+            (
+                PersistentCollectionPositionKind::Audio,
+                PersistentCollectionSparseTarget::DirectAudio {
+                    identity: identity.clone(),
+                    address: RemoteAddress::file("C:/media/song.mp3"),
+                },
+            ),
+        ] {
+            let payload = PersistentCollectionNavigatePayload::Landed {
+                exact_revision: 7,
+                exact_view_token: "view".to_owned(),
+                replacement: None,
+                target,
+                position: PersistentCollectionTargetPosition {
+                    kind,
+                    ordinal: 2,
+                    count: 5,
+                },
+                anchor_resolution: PersistentCollectionAnchorResolution::EntryId,
+            };
+            let encoded = serde_json::to_value(&payload).unwrap();
+            assert_eq!(encoded["position"]["ordinal"], 2);
+            assert_eq!(encoded["position"]["count"], 5);
+            assert!(encoded.get("target_ordinal").is_none());
+            assert!(encoded.get("target_count").is_none());
+            let decoded: PersistentCollectionNavigatePayload =
+                serde_json::from_value(encoded).unwrap();
+            assert_eq!(decoded, payload);
+        }
     }
 }

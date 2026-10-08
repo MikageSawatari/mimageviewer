@@ -35,6 +35,7 @@
 #include <cstdlib>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -51,6 +52,10 @@
 #include "host_app.h"
 #include "plugin_loader.h"
 #include "protocol.h"
+#include "ipc_strings.h"
+#include "utf8_paths.h"
+#include "vcrt_preload.h"
+#include "build_identity.h"
 
 namespace miv {
 
@@ -182,16 +187,10 @@ void send_event_gui_bypass_toggle(uint64_t slot_id) {
 }
 
 static std::string wide_to_utf8(const wchar_t* text) {
-    if (!text || !*text) {
-        return {};
-    }
-    int needed = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
-    if (needed <= 1) {
-        return {};
-    }
-    std::string out(static_cast<size_t>(needed - 1), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, text, -1, out.data(), needed, nullptr, nullptr);
-    return out;
+    // Window titles originate in third-party plugins; a malformed surrogate
+    // should not terminate the host just while producing a diagnostic.
+    try { return text ? miv::utf16_to_utf8(text) : std::string{}; }
+    catch (const std::exception&) { return "(invalid UTF-16)"; }
 }
 
 static BOOL CALLBACK enum_current_thread_window_proc(HWND hwnd, LPARAM param) {
@@ -331,6 +330,7 @@ public:
         // メインスレッド: メッセージポンプ + コマンド処理ループ
         run_gui_loop();
         enter_main_state(BridgeMainState::ShuttingDown);
+        cancel_and_drain_captures();
         running_ = false;
         cmd_cv_.notify_all();
         if (watchdog_thread.joinable()) {
@@ -371,6 +371,64 @@ public:
     }
 
 private:
+    enum class CapturePhase { Queued, Running, Canceled, Done };
+    struct ConcurrentCapture {
+        uint64_t id = 0;
+        std::atomic<CapturePhase> phase{CapturePhase::Queued};
+        std::atomic<ULONGLONG> started_tick{0};
+    };
+
+    void send_capture_error(uint64_t id, const std::string& detail) {
+        write_message("{\"event\":\"plugin_state\",\"request_id\":" +
+                      std::to_string(id) + ",\"state\":\"\",\"error\":\"" +
+                      json_escape(detail) + "\"}");
+    }
+
+    bool begin_capture(const std::shared_ptr<ConcurrentCapture>& capture) {
+        std::lock_guard<std::mutex> lk(captures_mutex_);
+        auto it = captures_.find(capture->id);
+        if (it == captures_.end() || it->second != capture) return false;
+        capture->started_tick.store(GetTickCount64(), std::memory_order_release);
+        capture->phase.store(CapturePhase::Running, std::memory_order_release);
+        return true;
+    }
+
+    void complete_capture(const std::shared_ptr<ConcurrentCapture>& capture,
+                          bool ok, std::vector<uint8_t> bytes) {
+        if (ok) {
+            write_message("{\"event\":\"plugin_state\",\"request_id\":" +
+                          std::to_string(capture->id) + ",\"state\":\"" +
+                          base64_encode(bytes) + "\"}");
+        } else {
+            send_capture_error(capture->id, "getState failed");
+        }
+        {
+            std::lock_guard<std::mutex> lk(captures_mutex_);
+            capture->phase.store(CapturePhase::Done, std::memory_order_release);
+            captures_.erase(capture->id);
+        }
+        captures_cv_.notify_all();
+    }
+
+    void cancel_and_drain_captures() {
+        std::vector<uint64_t> canceled;
+        {
+            std::unique_lock<std::mutex> lk(captures_mutex_);
+            for (auto it = captures_.begin(); it != captures_.end();) {
+                if (it->second->phase.load(std::memory_order_acquire) == CapturePhase::Queued) {
+                    it->second->phase.store(CapturePhase::Canceled, std::memory_order_release);
+                    canceled.push_back(it->first);
+                    it = captures_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        for (uint64_t id : canceled) send_capture_error(id, "interrupted");
+        std::unique_lock<std::mutex> lk(captures_mutex_);
+        captures_cv_.wait(lk, [this] { return captures_.empty(); });
+    }
+
     void enter_main_state(BridgeMainState state) {
         main_state_entered_tick_.store(GetTickCount64(), std::memory_order_release);
         main_state_.store(static_cast<int>(state), std::memory_order_release);
@@ -388,11 +446,35 @@ private:
 
     void watchdog_loop() {
         ULONGLONG last_idle_heartbeat_tick = 0;
+        ULONGLONG last_diagnostic_tick = 0;
         uint64_t last_idle_cmds_received = UINT64_MAX;
         uint64_t last_idle_cmds_processed = UINT64_MAX;
-        while (running_) {
-            ::Sleep(1000);
+        for (;;) {
+            ::Sleep(100);
             const ULONGLONG now = GetTickCount64();
+            bool captures_active = false;
+            {
+                std::lock_guard<std::mutex> lk(captures_mutex_);
+                captures_active = !captures_.empty();
+                for (const auto& [id, capture] : captures_) {
+                    if (capture->phase.load(std::memory_order_acquire) != CapturePhase::Running)
+                        continue;
+                    const ULONGLONG started =
+                        capture->started_tick.load(std::memory_order_acquire);
+                    if (started != 0 && now - started >= 5000) {
+                        std::fprintf(stderr,
+                                     "[BRIDGE] concurrent getState watchdog expired request=%llu\n",
+                                     static_cast<unsigned long long>(id));
+                        std::fflush(stderr);
+                        // Distinct process exit status lets the Rust controller
+                        // distinguish the capture watchdog from another host exit.
+                        ::ExitProcess(0xEFFEC001u);
+                    }
+                }
+            }
+            if (!running_ && !captures_active) break;
+            if (now - last_diagnostic_tick < 1000) continue;
+            last_diagnostic_tick = now;
             const int main_state = main_state_.load(std::memory_order_acquire);
             const int reader_state = reader_state_.load(std::memory_order_acquire);
             const ULONGLONG main_entered =
@@ -570,16 +652,7 @@ private:
     // 単純な JSON 解析: { "cmd": "<value>", ... } から cmd を取り出す。
     // POC 用なので本格的な JSON パーサは入れない (将来 nlohmann/json 採用検討)。
     static std::string extract_string_field(const std::string& json, const std::string& key) {
-        std::string needle = "\"" + key + "\"";
-        auto pos = json.find(needle);
-        if (pos == std::string::npos) return {};
-        pos = json.find(':', pos);
-        if (pos == std::string::npos) return {};
-        pos = json.find('"', pos);
-        if (pos == std::string::npos) return {};
-        auto end = json.find('"', pos + 1);
-        if (end == std::string::npos) return {};
-        return json.substr(pos + 1, end - pos - 1);
+        return extract_json_string_field(json, key);
     }
 
     static uint64_t extract_number_field(const std::string& json, const std::string& key) {
@@ -821,13 +894,23 @@ private:
             GuiWindowOptions options;
             options.slot_id = slot_id;
             options.owner_hwnd = reinterpret_cast<void*>(extract_number_field(msg, "owner_hwnd"));
-            if (!options.owner_hwnd) {
+            options.unowned = extract_number_field(msg, "unowned") != 0;
+            options.gui_gate_name = extract_string_field(msg, "gui_gate_name");
+            options.main_hwnd = reinterpret_cast<void*>(extract_number_field(msg, "main_hwnd"));
+            if (options.unowned) {
+                if (options.owner_hwnd || !options.main_hwnd ||
+                    !IsWindow(reinterpret_cast<HWND>(options.main_hwnd))) {
+                    send_event_error("show_gui: unowned editor requires a valid main reference and no owner");
+                    return true;
+                }
+            } else if (!options.owner_hwnd) {
                 send_event_error("show_gui: owner_hwnd missing");
                 return true;
             }
             options.width = static_cast<uint32_t>(extract_number_field(msg, "width"));
             options.height = static_cast<uint32_t>(extract_number_field(msg, "height"));
             options.resizable = extract_number_field(msg, "resizable") != 0;
+            options.show_bypass_button = extract_number_field(msg, "hide_bypass_button") == 0;
             options.has_initial_pos = extract_number_field(msg, "has_initial_pos") != 0;
             options.x = static_cast<int32_t>(extract_i64_field(msg, "x"));
             options.y = static_cast<int32_t>(extract_i64_field(msg, "y"));
@@ -862,6 +945,33 @@ private:
         if (cmd == "hide_gui") {
             if (PluginLoader* loader = loader_for_message(msg)) loader->hide_gui();
             write_message("{\"event\":\"gui_detached\"}");
+            return true;
+        }
+        if (cmd == "set_gui_remote_session") {
+            if (PluginLoader* loader = loader_for_message(msg))
+                loader->set_gui_remote_session(extract_number_field(msg, "active") != 0);
+            return true;
+        }
+        if (cmd == "sync_gui_main_visibility") {
+            if (PluginLoader* loader = loader_for_message(msg)) loader->sync_gui_main_visibility();
+            return true;
+        }
+        if (cmd == "activate_gui") {
+            if (PluginLoader* loader = loader_for_message(msg)) loader->activate_gui();
+            return true;
+        }
+        if (cmd == "set_gui_visibility_checked") {
+            const uint64_t id = extract_number_field(msg, "request_id");
+            const uint64_t slot = extract_number_field(msg, "slot_id");
+            const bool visible = extract_number_field(msg, "visible") != 0;
+            const GuiGateSnapshot permit {extract_number_field(msg, "minimized_sequence"), extract_number_field(msg, "remote_token"), 0,
+                                          extract_number_field(msg, "auto_video") != 0, extract_number_field(msg, "auto_revision")};
+            auto reply = [id, slot](const char* outcome) {
+                write_message("{\"event\":\"gui_visibility_result\",\"request_id\":" + std::to_string(id) +
+                              ",\"slot_id\":" + std::to_string(slot) + ",\"outcome\":\"" + outcome + "\"}");
+            };
+            if (PluginLoader* loader = loader_for_message(msg)) loader->set_gui_visibility_checked(visible, permit, std::move(reply));
+            else reply("error");
             return true;
         }
         if (cmd == "set_gui_visible") {
@@ -989,6 +1099,36 @@ private:
             pipe_.wake_input();
             return true;
         }
+        if (cmd == "query_state_concurrent") {
+            const uint64_t id = extract_number_field(msg, "request_id");
+            PluginLoader* loader = loader_for_message(msg);
+            if (id == 0 || !loader) {
+                send_capture_error(id, "no plugin loaded or invalid request ID");
+                return true;
+            }
+            auto capture = std::make_shared<ConcurrentCapture>();
+            capture->id = id;
+            bool duplicate = false;
+            {
+                std::lock_guard<std::mutex> lk(captures_mutex_);
+                duplicate = captures_.count(id) != 0;
+                if (!duplicate) captures_.emplace(id, capture);
+            }
+            if (duplicate) {
+                send_capture_error(id, "duplicate request ID");
+                return true;
+            }
+            loader->query_state_concurrent(
+                [this, capture] {
+                    if (capture->phase.load(std::memory_order_acquire) == CapturePhase::Canceled)
+                        return false;
+                    return begin_capture(capture);
+                },
+                [this, capture](bool ok, std::vector<uint8_t> bytes) {
+                    complete_capture(capture, ok, std::move(bytes));
+                });
+            return true;
+        }
         if (cmd == "restore_state") {
             // base64 state を decode して audio thread fence 経由で setState する。
             // **初回 auto-restore は Cmd::Open の state field 経由** (= audio_thread 起動前)
@@ -1015,6 +1155,7 @@ private:
             return true;
         }
         if (cmd == "close") {
+            cancel_and_drain_captures();
             audio_running_ = false;
             pipe_.wake_input();
             if (audio_thread_.joinable()) audio_thread_.join();
@@ -1042,6 +1183,7 @@ private:
     }
 
     bool handle_open(const std::string& msg) {
+        cancel_and_drain_captures();
         std::string plugin_path = extract_string_field(msg, "plugin_path");
         std::string shm_name = extract_string_field(msg, "shm_name");
         std::string sig_in_name = extract_string_field(msg, "sig_in");
@@ -1101,16 +1243,27 @@ private:
         // 方式と違い「pre-warm が古い state で走る」race が発生しない。
         // 旧 Cmd::RestoreState は runtime 用に残し、audio thread fence 経由で適用する。
         std::string init_state = extract_string_field(msg, "state");
+        const bool strict_state = extract_number_field(msg, "strict_state") != 0;
         if (!init_state.empty()) {
             std::vector<uint8_t> bytes;
-            if (base64_decode(init_state, bytes)) {
-                if (!loader_->restore_state(bytes)) {
-                    std::fprintf(stderr,
-                        "[BRIDGE] initial restore_state failed (continuing with default)\n");
-                }
-            } else {
+            const bool decoded = base64_decode(init_state, bytes);
+            const bool restored = decoded && loader_->restore_state(bytes);
+            if (!restored && strict_state) {
+                send_event_error(decoded ? "restore_state: setState failed" :
+                                           "restore_state: invalid base64");
+                std::lock_guard<std::mutex> lk(loaders_mutex_);
+                loader_->unload();
+                loader_.reset();
+                rebuild_chain_snapshot_unlocked();
+                pipe_.detach();
+                return true;
+            }
+            if (!decoded) {
                 std::fprintf(stderr,
                     "[BRIDGE] initial state base64 decode failed (continuing with default)\n");
+            } else if (!restored) {
+                std::fprintf(stderr,
+                    "[BRIDGE] initial restore_state failed (continuing with default)\n");
             }
             std::fflush(stderr);
         }
@@ -1174,16 +1327,23 @@ private:
         std::fflush(stderr);
 
         std::string init_state = extract_string_field(msg, "state");
+        const bool strict_state = extract_number_field(msg, "strict_state") != 0;
         if (!init_state.empty()) {
             std::vector<uint8_t> bytes;
-            if (base64_decode(init_state, bytes)) {
-                if (!loader->restore_state(bytes)) {
-                    std::fprintf(stderr,
-                        "[BRIDGE] add_plugin restore_state failed (continuing with default)\n");
-                }
-            } else {
+            const bool decoded = base64_decode(init_state, bytes);
+            const bool restored = decoded && loader->restore_state(bytes);
+            if (!restored && strict_state) {
+                send_event_error(decoded ? "add_plugin restore_state: setState failed" :
+                                           "add_plugin restore_state: invalid base64");
+                loader->unload();
+                return true;
+            }
+            if (!decoded) {
                 std::fprintf(stderr,
                     "[BRIDGE] add_plugin state base64 decode failed (continuing with default)\n");
+            } else if (!restored) {
+                std::fprintf(stderr,
+                    "[BRIDGE] add_plugin restore_state failed (continuing with default)\n");
             }
             std::fflush(stderr);
         }
@@ -1758,6 +1918,9 @@ private:
     std::atomic<uint64_t> pending_state_slot_{0};
     std::mutex restore_state_mutex_;          // protects restore_state_bytes_
     std::vector<uint8_t> restore_state_bytes_;
+    std::mutex captures_mutex_;
+    std::condition_variable captures_cv_;
+    std::unordered_map<uint64_t, std::shared_ptr<ConcurrentCapture>> captures_;
 };
 
 }  // namespace miv
@@ -1801,12 +1964,14 @@ static void start_parent_watchdog(DWORD parent_pid) {
 }
 
 int main(int argc, char** argv) {
+    std::fprintf(stderr, "%s\n", MIV_VST3_HOST_SOURCE_MARKER);
     // bridge プロセスを Per-Monitor v2 DPI Aware に設定する。
     // これがないと GetDpiForSystem / GetDpiForWindow がプライマリ DPI ではなく
     // 96 を返してしまい、setContentScaleFactor で正しい scale を伝えられない。
     // VST3 GUI を任意のスレッドで attached する前に必ずプロセス全体に設定する必要がある。
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     start_parent_watchdog(parse_parent_pid_arg(argc, argv));
+    if (!miv::preload_vcrt()) return 1;
     miv::Bridge bridge;
     return bridge.run();
 }

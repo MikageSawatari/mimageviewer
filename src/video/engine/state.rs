@@ -133,7 +133,8 @@ pub enum DecoderEvent {
     SeekCompleted { epoch: SeekEpoch, actual_pts: f64 },
     /// post-seek (or open) の最初の動画 frame が decode/blit 完了し UI に届いた。
     FirstFrameReady { epoch: SeekEpoch, pts: f64 },
-    /// decoder が file 末尾 (demux EOF) に到達。
+    /// demux 入力終端後、出力の drain が完了し再生末尾に到達。
+    /// VideoPlayer::tick が確定する。demux の先読み完了通知とは別。
     EofReached {
         epoch: SeekEpoch,
         duration_secs: f64,

@@ -1,7 +1,9 @@
 //! settings モジュールの統合テスト。
 //! JSON ファイル経由での設定読み書きをテストする。
 
-use mimageviewer::settings::{CachePolicy, Parallelism, Settings, SortOrder, ThumbAspect};
+use mimageviewer::settings::{
+    CachePolicy, EpubFileHandling, Parallelism, Settings, SortOrder, ThumbAspect,
+};
 use tempfile::TempDir;
 
 /// Settings を JSON ファイルに保存し、そこから読み込むラウンドトリップ。
@@ -15,6 +17,7 @@ fn settings_json_file_roundtrip() {
     original.grid_cols = 6;
     original.thumb_px = 256;
     original.thumb_quality = 90;
+    original.epub_file_handling = EpubFileHandling::Convert;
 
     // ファイルに保存
     let json = serde_json::to_string_pretty(&original).unwrap();
@@ -27,6 +30,7 @@ fn settings_json_file_roundtrip() {
     assert_eq!(loaded.grid_cols, 6);
     assert_eq!(loaded.thumb_px, 256);
     assert_eq!(loaded.thumb_quality, 90);
+    assert_eq!(loaded.epub_file_handling, EpubFileHandling::Convert);
 }
 
 #[test]
@@ -68,6 +72,7 @@ fn partial_json_uses_defaults_for_missing_fields() {
     assert_eq!(loaded.thumb_quality, 75);
     assert_eq!(loaded.prefetch_back, 4);
     assert_eq!(loaded.cache_policy, CachePolicy::Auto);
+    assert_eq!(loaded.epub_file_handling, EpubFileHandling::Ask);
 }
 
 #[test]
@@ -99,5 +104,11 @@ fn all_enums_survive_roundtrip() {
         let json = serde_json::to_string(par).unwrap();
         let loaded: Parallelism = serde_json::from_str(&json).unwrap();
         assert_eq!(*par, loaded);
+    }
+
+    for handling in EpubFileHandling::all() {
+        let json = serde_json::to_string(handling).unwrap();
+        let loaded: EpubFileHandling = serde_json::from_str(&json).unwrap();
+        assert_eq!(*handling, loaded);
     }
 }

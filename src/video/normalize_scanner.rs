@@ -37,7 +37,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use ffmpeg::format::sample::{Sample, Type as SampleType};
-use ffmpeg::media::Type as MediaType;
 use ffmpeg::util::frame::audio::Audio;
 use ffmpeg_the_third as ffmpeg;
 
@@ -110,11 +109,12 @@ struct PreparedNormalizeAudio {
 /// The packet loop retains its stream-index check as a defensive boundary.
 fn prepare_normalize_audio_stream(
     input: &mut ffmpeg::format::context::Input,
+    stream_index: usize,
 ) -> Result<PreparedNormalizeAudio, NormalizeScanError> {
     let (stream_idx, stream_tb, codec_context) = {
         let audio_stream = input
-            .streams()
-            .best(MediaType::Audio)
+            .stream(stream_index)
+            .filter(|stream| stream.parameters().medium() == ffmpeg::media::Type::Audio)
             .ok_or(NormalizeScanError::NoAudio)?;
         let stream_idx = audio_stream.index();
         let stream_tb = audio_stream.time_base();
@@ -141,12 +141,21 @@ fn prepare_normalize_audio_stream(
 /// 内部計算用に `target_lufs_milli as f32 / 1000.0` で float に戻して使う。
 pub fn scan_audio_loudness(
     path: &Path,
+    stream_index: usize,
     target_lufs_milli: i32,
     cancel: Arc<AtomicBool>,
     progress: Arc<NormalizeScanProgress>,
 ) -> Result<NormalizeResult, NormalizeScanError> {
     let mut noop = |_result: NormalizeResult| {};
-    scan_audio_loudness_impl(path, target_lufs_milli, cancel, progress, None, &mut noop)
+    scan_audio_loudness_impl(
+        path,
+        stream_index,
+        target_lufs_milli,
+        cancel,
+        progress,
+        None,
+        &mut noop,
+    )
 }
 
 /// `provisional_after_secs` ぶん処理できた時点で、算出可能なら仮 `NormalizeResult` を
@@ -156,6 +165,7 @@ pub fn scan_audio_loudness(
 /// App 側は再生開始用のセッション内 gain として扱い、最終 `Ok` の結果だけを永続化する。
 pub fn scan_audio_loudness_with_provisional(
     path: &Path,
+    stream_index: usize,
     target_lufs_milli: i32,
     cancel: Arc<AtomicBool>,
     progress: Arc<NormalizeScanProgress>,
@@ -164,6 +174,7 @@ pub fn scan_audio_loudness_with_provisional(
 ) -> Result<NormalizeResult, NormalizeScanError> {
     scan_audio_loudness_impl(
         path,
+        stream_index,
         target_lufs_milli,
         cancel,
         progress,
@@ -174,6 +185,7 @@ pub fn scan_audio_loudness_with_provisional(
 
 fn scan_audio_loudness_impl(
     path: &Path,
+    stream_index: usize,
     target_lufs_milli: i32,
     cancel: Arc<AtomicBool>,
     progress: Arc<NormalizeScanProgress>,
@@ -200,7 +212,7 @@ fn scan_audio_loudness_impl(
         stream_idx,
         stream_tb,
         mut decoder,
-    } = prepare_normalize_audio_stream(&mut input)?;
+    } = prepare_normalize_audio_stream(&mut input, stream_index)?;
 
     let in_fmt = decoder.format();
     let in_rate = decoder.rate();
@@ -659,11 +671,34 @@ mod tests {
         let progress = Arc::new(NormalizeScanProgress::default());
         let result = scan_audio_loudness(
             Path::new("C:/this/path/should/not/exist.mp4"),
+            0,
             -14000,
             cancel,
             progress,
         );
         assert!(result.is_err(), "expected Err, got {:?}", result.ok());
+    }
+
+    #[test]
+    fn scanner_measures_the_requested_stream() {
+        ffmpeg::init().expect("ffmpeg init");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/audio-tracks/multi.mkv");
+        let scan = |stream_index| {
+            scan_audio_loudness(
+                &path,
+                stream_index,
+                -14000,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(NormalizeScanProgress::default()),
+            )
+            .expect("scan requested stream")
+        };
+        let loud = scan(1);
+        let quiet = scan(3);
+        assert!(
+            loud.integrated_lufs > quiet.integrated_lufs + 5.0,
+            "different stream amplitudes must be measured: {loud:?}, {quiet:?}"
+        );
     }
 
     #[test]
@@ -746,13 +781,14 @@ mod tests {
             .collect::<Vec<_>>();
         let fresh_selected_idx = fresh_input
             .streams()
-            .best(MediaType::Audio)
+            .best(ffmpeg::media::Type::Audio)
             .expect("best audio in fresh fixture")
             .index();
 
         let mut prepared_input =
             ffmpeg::format::input(&multi).expect("open prepared fixture input");
-        let prepared = prepare_normalize_audio_stream(&mut prepared_input).expect("prepare audio");
+        let prepared = prepare_normalize_audio_stream(&mut prepared_input, fresh_selected_idx)
+            .expect("prepare audio");
         assert_eq!(prepared.stream_idx, fresh_selected_idx);
         assert_eq!(
             prepared.stream_idx, 2,
@@ -782,6 +818,7 @@ mod tests {
         let full_multi_progress = Arc::new(NormalizeScanProgress::default());
         let full_multi = scan_audio_loudness(
             &multi,
+            2,
             -14000,
             Arc::new(AtomicBool::new(false)),
             Arc::clone(&full_multi_progress),
@@ -789,6 +826,7 @@ mod tests {
         .expect("scan multi-stream fixture");
         let full_selected = scan_audio_loudness(
             &selected_audio,
+            0,
             -14000,
             Arc::new(AtomicBool::new(false)),
             Arc::new(NormalizeScanProgress::default()),
@@ -807,6 +845,7 @@ mod tests {
         let mut provisional_multi = Vec::new();
         let provisional_multi_final = scan_audio_loudness_with_provisional(
             &multi,
+            2,
             -14000,
             Arc::new(AtomicBool::new(false)),
             Arc::new(NormalizeScanProgress::default()),
@@ -817,6 +856,7 @@ mod tests {
         let mut provisional_selected = Vec::new();
         let provisional_selected_final = scan_audio_loudness_with_provisional(
             &selected_audio,
+            0,
             -14000,
             Arc::new(AtomicBool::new(false)),
             Arc::new(NormalizeScanProgress::default()),
@@ -834,6 +874,7 @@ mod tests {
         let mut pre_cancel_provisional = Vec::new();
         let pre_cancel_result = scan_audio_loudness_with_provisional(
             &multi,
+            2,
             -14000,
             pre_cancel,
             Arc::new(NormalizeScanProgress::default()),
@@ -851,6 +892,7 @@ mod tests {
         let mut callback_cancel_provisional = Vec::new();
         let callback_cancel_result = scan_audio_loudness_with_provisional(
             &multi,
+            2,
             -14000,
             callback_cancel,
             Arc::new(NormalizeScanProgress::default()),

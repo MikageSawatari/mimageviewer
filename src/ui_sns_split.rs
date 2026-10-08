@@ -42,12 +42,14 @@ const SNS_SPLIT_INSTAGRAM_RATIO_REASON: &str = "Instagram はこの比率を切�
 pub(crate) enum SnsSplitEntryError {
     Rotated,
     ImageLoading,
+    RawDevelopmentPending,
 }
 
 impl SnsSplitEntryError {
     pub(crate) fn message(self) -> &'static str {
         match self {
             Self::Rotated => SNS_SPLIT_ROTATION_DISABLED_REASON,
+            Self::RawDevelopmentPending => "RAW の現像が終わると編集できます",
             Self::ImageLoading => "[SNS 分割] 画像読み込み待ち",
         }
     }
@@ -667,6 +669,10 @@ impl App {
     }
 
     pub(crate) fn enter_sns_split_mode(&mut self, fs_idx: usize) -> Result<(), SnsSplitEntryError> {
+        let (raw_target_idx, _) = self.plan_page_edit_pivot(fs_idx);
+        if !self.raw_edit_target_entry_allowed(raw_target_idx) {
+            return Err(SnsSplitEntryError::RawDevelopmentPending);
+        }
         if self.sns_split.is_some() {
             if let Some(error) = self.sns_split_rotation_error(fs_idx) {
                 return Err(error);
@@ -725,6 +731,7 @@ impl App {
             sibling_nav: None,
             mouse_nav: None,
             jump_to: None,
+            music_ctrl_wheel_gate_reached: false,
         };
         if let Some(error) = self.sns_split_rotation_error(fs_idx) {
             self.reset_sns_split_mode();
@@ -2056,11 +2063,7 @@ mod tests {
 
     #[test]
     fn default_ctrl_e_uses_normal_export_guard_and_guides_to_panel_button() {
-        let _key_input_guard = crate::key_input::TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
-        crate::key_input::clear_test_frame();
+        let _key_input_guard = crate::key_input::lock_test_input();
 
         let image_size = [3, 3];
         let layout = SnsSplitLayout::centered_max(SnsTarget::X, 4, image_size);
@@ -2155,11 +2158,7 @@ mod tests {
 
     #[test]
     fn custom_execute_shortcut_opens_numbered_single_page_export_from_spread() {
-        let _key_input_guard = crate::key_input::TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
-        crate::key_input::clear_test_frame();
+        let _key_input_guard = crate::key_input::lock_test_input();
 
         let mut app = crate::app::setup_app_for_test();
         let ctx = egui::Context::default();

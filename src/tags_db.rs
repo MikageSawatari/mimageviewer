@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use rusqlite::{Connection, OptionalExtension, params, types::Value};
@@ -33,21 +34,33 @@ pub struct RetagReport {
     pub removed_conflicts: usize,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct LegacyImportReport {
-    pub skipped_already_imported: bool,
-    pub scanned_docs: usize,
-    pub imported_items: usize,
-    pub inserted_tags: usize,
-    pub skipped_decided_items: usize,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedSidecarTagItem {
+    pub(crate) item_key: String,
+    tags: Vec<ItemTag>,
 }
 
-pub const LEGACY_TANTIVY_IMPORTED_META: &str = "legacy_tantivy_imported";
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SidecarTagBatchReport {
+    pub(crate) imported_items: usize,
+    pub(crate) inserted_tags: usize,
+    pub(crate) skipped_decided_items: usize,
+    pub(crate) imported: Vec<(String, Vec<String>)>,
+    pub(crate) transaction_committed: bool,
+    pub(crate) sync_marker_recorded: bool,
+    pub(crate) transaction_elapsed: std::time::Duration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SidecarTagBatchOutcome {
+    AlreadySynchronized,
+    Applied(SidecarTagBatchReport),
+    Cancelled,
+}
 
 /// `tag_item_state.source` に入れる値。
 pub mod source {
     pub const EDIT: &str = "edit";
-    pub const TANTIVY_MIGRATION: &str = "tantivy_migration";
     pub const XMP_LEGACY: &str = "xmp_legacy";
     pub const SIDECAR: &str = "sidecar";
     pub const METADATA_IMPORT: &str = "metadata_import";
@@ -57,6 +70,10 @@ pub struct TagsDb {
     conn: Connection,
     path: PathBuf,
 }
+
+/// All tags.db writers, including worker and migration connections, publish here.
+pub(crate) static TAG_WRITES: crate::page_edit_write_epoch::EditWriteEpoch =
+    crate::page_edit_write_epoch::EditWriteEpoch::new();
 
 impl TagsDb {
     pub fn open() -> Result<Self, rusqlite::Error> {
@@ -245,6 +262,7 @@ impl TagsDb {
         S: AsRef<str>,
     {
         self.rotate_backups_once();
+        let _tag_write = TAG_WRITES.begin();
         let now = now_unix_secs();
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM item_tags WHERE item_key = ?1", [item_key])?;
@@ -277,6 +295,7 @@ impl TagsDb {
         S: AsRef<str>,
     {
         self.rotate_backups_once();
+        let _tag_write = TAG_WRITES.begin();
         let now = now_unix_secs();
         let normalized = collapse_tags(tags, now);
         let tx = self.conn.transaction()?;
@@ -296,52 +315,108 @@ impl TagsDb {
         Ok((self.display_tags_for_item(item_key), inserted_tags))
     }
 
-    /// §7.2 legacy seed 専用の原子的 union。`Ok(None)` = 決定済みで何もしなかった。
+    /// Import one sidecar snapshot in one WAL transaction.
     ///
-    /// 旧 XMP の読み取り (遅いファイル I/O) と DB 反映の間に通常編集
-    /// (tag_write_worker、別コネクション) が割り込むと、読み取り時点の状態に基づく
-    /// 全置換 (`set_item_tags`) は編集を巻き戻す (削除タグの復活 = §7.2 が禁じる事象)。
-    /// よって seed は **同一トランザクション内で `tag_item_state` を再チェック**し、
-    /// 決定済みなら何もしない。反映自体も INSERT OR IGNORE の union で、既存行を
-    /// 削除しない。
-    pub fn seed_legacy_tags_if_undecided<I, S>(
+    /// Both the durable decision row and legacy rows without a decision are
+    /// authoritative.  The checks live in the same IMMEDIATE transaction as
+    /// the inserts, so another connection cannot slip a user edit between the
+    /// check and the write.  A disk sync marker, when eligible, is committed in
+    /// this transaction too.  Pending writer sequence numbers are deliberately
+    /// represented by `None` and are never persisted as disk markers.
+    pub(crate) fn import_sidecar_tags_atomic(
         &mut self,
-        item_key: &str,
-        tags: I,
-    ) -> Result<Option<(Vec<String>, usize)>, rusqlite::Error>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        self.rotate_backups_once();
-        let now = now_unix_secs();
-        let normalized = collapse_tags(tags, now);
-        let tx = self.conn.transaction()?;
-        let decided = tx
-            .query_row(
-                "SELECT 1 FROM tag_item_state WHERE item_key = ?1 LIMIT 1",
-                [item_key],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if decided {
-            return Ok(None); // tx は drop で rollback (変更なし)
-        }
-        let mut inserted = 0usize;
+        folder_key: &str,
+        sync_marker: Option<i64>,
+        items: &[PreparedSidecarTagItem],
+        cancel: &AtomicBool,
+    ) -> Result<SidecarTagBatchOutcome, rusqlite::Error> {
+        if let Some(marker) = sync_marker
+            && self.sidecar_sync_get(folder_key) == Some(marker)
         {
-            let mut stmt = tx.prepare(
-                "INSERT OR IGNORE INTO item_tags (item_key, tag, tag_key, applied_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-            )?;
-            for tag in &normalized {
-                inserted +=
-                    stmt.execute(params![item_key, tag.tag, tag.tag_key, tag.applied_at])?;
+            return Ok(SidecarTagBatchOutcome::AlreadySynchronized);
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(SidecarTagBatchOutcome::Cancelled);
+        }
+
+        self.rotate_backups_once();
+        let _tag_write = TAG_WRITES.begin();
+        let transaction_started = std::time::Instant::now();
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some(marker) = sync_marker {
+            let current = tx
+                .query_row(
+                    "SELECT sidecar_mtime FROM tag_sidecar_sync WHERE folder_key = ?1",
+                    [folder_key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            if current == Some(marker) {
+                return Ok(SidecarTagBatchOutcome::AlreadySynchronized);
             }
         }
-        upsert_item_state_tx(&tx, item_key, source::XMP_LEGACY, now)?;
+        let mut report = SidecarTagBatchReport::default();
+        for item in items {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(SidecarTagBatchOutcome::Cancelled);
+            }
+            let decided_or_existing = tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM tag_item_state WHERE item_key = ?1
+                 ) OR EXISTS(
+                    SELECT 1 FROM item_tags WHERE item_key = ?1
+                 )",
+                [&item.item_key],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if decided_or_existing {
+                report.skipped_decided_items += 1;
+                continue;
+            }
+
+            let mut inserted = 0usize;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO item_tags (item_key, tag, tag_key, applied_at)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(item_key, tag_key) DO NOTHING",
+                )?;
+                for tag in &item.tags {
+                    inserted +=
+                        stmt.execute(params![item.item_key, tag.tag, tag.tag_key, tag.applied_at])?;
+                }
+            }
+            upsert_item_state_tx(&tx, &item.item_key, source::SIDECAR, now_unix_secs())?;
+            report.imported_items += 1;
+            report.inserted_tags += inserted;
+            report.imported.push((
+                item.item_key.clone(),
+                item.tags
+                    .iter()
+                    .map(|tag| format_display_tag(&tag.tag))
+                    .collect(),
+            ));
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(SidecarTagBatchOutcome::Cancelled);
+        }
+        if let Some(marker) = sync_marker {
+            tx.execute(
+                "INSERT INTO tag_sidecar_sync (folder_key, sidecar_mtime) VALUES (?1, ?2)
+                 ON CONFLICT(folder_key) DO UPDATE SET sidecar_mtime = excluded.sidecar_mtime",
+                params![folder_key, marker],
+            )?;
+            report.sync_marker_recorded = true;
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(SidecarTagBatchOutcome::Cancelled);
+        }
         tx.commit()?;
-        Ok(Some((self.display_tags_for_item(item_key), inserted)))
+        report.transaction_committed = true;
+        report.transaction_elapsed = transaction_started.elapsed();
+        Ok(SidecarTagBatchOutcome::Applied(report))
     }
 
     pub fn toggle_item_tag(
@@ -350,6 +425,7 @@ impl TagsDb {
         tag_name: &str,
     ) -> Result<(TagToggleOutcome, Vec<String>, Vec<String>), rusqlite::Error> {
         self.rotate_backups_once();
+        let _tag_write = TAG_WRITES.begin();
         let now = now_unix_secs();
         let tag = normalize_tag_display_name(tag_name);
         let tag_key = normalize_tag_key(&tag);
@@ -386,6 +462,7 @@ impl TagsDb {
         item_key: &str,
     ) -> Result<(bool, Vec<String>, Vec<String>), rusqlite::Error> {
         self.rotate_backups_once();
+        let _tag_write = TAG_WRITES.begin();
         let now = now_unix_secs();
         let before = self.display_tags_for_item(item_key);
         let tx = self.conn.transaction()?;
@@ -400,6 +477,7 @@ impl TagsDb {
             return Ok(());
         }
         self.rotate_backups_once();
+        let _tag_write = TAG_WRITES.begin();
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM item_tags WHERE item_key = ?1", [to_key])?;
         tx.execute("DELETE FROM tag_item_state WHERE item_key = ?1", [to_key])?;
@@ -425,6 +503,7 @@ impl TagsDb {
             return Ok(());
         }
         self.rotate_backups_once();
+        let _tag_write = TAG_WRITES.begin();
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM item_tags WHERE item_key = ?1", [to_key])?;
         tx.execute("DELETE FROM tag_item_state WHERE item_key = ?1", [to_key])?;
@@ -460,6 +539,7 @@ impl TagsDb {
         }
 
         self.rotate_backups_once();
+        let _tag_write = TAG_WRITES.begin();
         let now = now_unix_secs();
         let tx = self.conn.transaction()?;
         let affected_items = item_keys_for_tag_key_tx(&tx, &old_key)?;
@@ -514,33 +594,6 @@ impl TagsDb {
             .collect()
     }
 
-    /// 指定キーのうち `tag_item_state` 行が存在するものを返す (500 件ずつの IN クエリ)。
-    /// legacy seed worker の事前フィルタ用 — フォルダ再訪時に per-file の点クエリ
-    /// (`has_item_state` × N) を発行しないための bulk 版。
-    pub fn keys_with_item_state(&self, item_keys: &[String]) -> HashSet<String> {
-        let mut out = HashSet::new();
-        for chunk in item_keys.chunks(500) {
-            let placeholders = (0..chunk.len())
-                .map(|i| format!("?{}", i + 1))
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql =
-                format!("SELECT item_key FROM tag_item_state WHERE item_key IN ({placeholders})");
-            let mut stmt = match self.conn.prepare(&sql) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            let params: Vec<&dyn rusqlite::ToSql> =
-                chunk.iter().map(|k| k as &dyn rusqlite::ToSql).collect();
-            if let Ok(rows) = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
-                row.get::<_, String>(0)
-            }) {
-                out.extend(rows.flatten());
-            }
-        }
-        out
-    }
-
     pub fn has_item_state(&self, item_key: &str) -> bool {
         self.conn
             .query_row(
@@ -557,22 +610,16 @@ impl TagsDb {
         source: &str,
     ) -> Result<(), rusqlite::Error> {
         self.rotate_backups_once();
+        let _tag_write = TAG_WRITES.begin();
         let now = now_unix_secs();
         let tx = self.conn.transaction()?;
         upsert_item_state_tx(&tx, item_key, source, now)?;
         tx.commit()
     }
 
-    pub fn meta(&self, key: &str) -> Option<String> {
-        self.conn
-            .query_row("SELECT value FROM tag_meta WHERE key = ?1", [key], |row| {
-                row.get(0)
-            })
-            .ok()
-    }
-
     pub fn set_meta(&self, key: &str, value: &str) -> Result<(), rusqlite::Error> {
         self.rotate_backups_once();
+        let _tag_write = TAG_WRITES.begin();
         self.conn.execute(
             "INSERT INTO tag_meta (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -594,6 +641,7 @@ impl TagsDb {
         folder_key: &str,
         sidecar_mtime: i64,
     ) -> Result<(), rusqlite::Error> {
+        let _tag_write = TAG_WRITES.begin();
         self.conn.execute(
             "INSERT INTO tag_sidecar_sync (folder_key, sidecar_mtime) VALUES (?1, ?2)
              ON CONFLICT(folder_key) DO UPDATE SET sidecar_mtime = excluded.sidecar_mtime",
@@ -603,81 +651,13 @@ impl TagsDb {
     }
 
     pub fn sidecar_sync_clear(&self, folder_key: &str) -> Result<(), rusqlite::Error> {
+        let _tag_write = TAG_WRITES.begin();
         self.conn
             .execute(
                 "DELETE FROM tag_sidecar_sync WHERE folder_key = ?1",
                 [folder_key],
             )
             .map(|_| ())
-    }
-
-    pub fn import_legacy_tantivy_tags<I, K, T>(
-        &mut self,
-        docs: I,
-    ) -> Result<LegacyImportReport, rusqlite::Error>
-    where
-        I: IntoIterator<Item = (K, T)>,
-        K: AsRef<str>,
-        T: AsRef<str>,
-    {
-        if self.meta(LEGACY_TANTIVY_IMPORTED_META).as_deref() == Some("1") {
-            return Ok(LegacyImportReport {
-                skipped_already_imported: true,
-                ..LegacyImportReport::default()
-            });
-        }
-
-        self.rotate_backups_once();
-        let now = now_unix_secs();
-        let tx = self.conn.transaction()?;
-        let mut report = LegacyImportReport::default();
-        for (item_key, tags_column) in docs {
-            report.scanned_docs += 1;
-            let item_key = item_key.as_ref().trim();
-            if item_key.is_empty() {
-                continue;
-            }
-            let already_decided = tx
-                .query_row(
-                    "SELECT 1 FROM tag_item_state WHERE item_key = ?1 LIMIT 1",
-                    [item_key],
-                    |_| Ok(()),
-                )
-                .optional()?
-                .is_some();
-            if already_decided {
-                report.skipped_decided_items += 1;
-                continue;
-            }
-
-            let legacy_tags = crate::ingest_text::parse_tags_column(tags_column.as_ref())
-                .into_iter()
-                .filter(|tag| tag.trim_start().starts_with('#'));
-            let normalized = collapse_tags(legacy_tags, now);
-            if normalized.is_empty() {
-                continue;
-            }
-            {
-                let mut stmt = tx.prepare(
-                    "INSERT OR IGNORE INTO item_tags (item_key, tag, tag_key, applied_at)
-                     VALUES (?1, ?2, ?3, ?4)",
-                )?;
-                for tag in &normalized {
-                    let inserted =
-                        stmt.execute(params![item_key, tag.tag, tag.tag_key, tag.applied_at])?;
-                    report.inserted_tags += inserted;
-                }
-            }
-            upsert_item_state_tx(&tx, item_key, source::TANTIVY_MIGRATION, now)?;
-            report.imported_items += 1;
-        }
-        tx.execute(
-            "INSERT INTO tag_meta (key, value) VALUES (?1, '1')
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [LEGACY_TANTIVY_IMPORTED_META],
-        )?;
-        tx.commit()?;
-        Ok(report)
     }
 
     pub fn tag_summaries(&self) -> Vec<TagSummary> {
@@ -883,6 +863,7 @@ impl TagsDb {
             return Ok(0);
         }
         self.rotate_backups_once();
+        let _tag_write = TAG_WRITES.begin();
         let tx = self.conn.transaction()?;
         let mut removed_tags = 0usize;
         {
@@ -1031,25 +1012,34 @@ where
     by_key.into_values().collect()
 }
 
+pub(crate) fn prepare_sidecar_tag_item(
+    item_key: String,
+    tags: &[String],
+) -> Result<Option<PreparedSidecarTagItem>, String> {
+    if tags.is_empty() {
+        return Ok(None);
+    }
+    let mut normalized = Vec::with_capacity(tags.len());
+    for raw in tags {
+        let display = normalize_tag_display_name(strip_display_hash(raw));
+        let tag_key = normalize_tag_key(&display);
+        if tag_key.is_empty()
+            || display.chars().count() > 64
+            || tag_display_name_has_whitespace(&display)
+        {
+            return Err(format!("invalid sidecar tag for {item_key}"));
+        }
+        normalized.push(display);
+    }
+    Ok(Some(PreparedSidecarTagItem {
+        item_key,
+        tags: collapse_tags(normalized, now_unix_secs()),
+    }))
+}
+
 /// SQL LIKE エスケープは [`crate::adjustment_db::escape_like_pattern`] を共有する
 /// (独自コピーを持つと将来のエスケープ修正が片方にしか入らない)。
 pub use crate::adjustment_db::escape_like_pattern;
-
-/// dc:subject 値のうち「mIV v1.0 が付けた legacy タグ」(= `#` 始まり) だけを抽出し、
-/// 表示形 (`#` 付き) で返す。
-///
-/// 自動 seed (`tag_legacy_seed_worker`) が使う判定の正本。
-pub fn miv_legacy_tags(subjects: Vec<String>) -> Vec<String> {
-    collapse_tags(
-        subjects
-            .into_iter()
-            .filter(|tag| tag.trim_start().starts_with('#')),
-        0,
-    )
-    .into_iter()
-    .map(|tag| format_display_tag(&tag.tag))
-    .collect()
-}
 
 fn upsert_item_state_tx(
     tx: &rusqlite::Transaction<'_>,
@@ -1092,19 +1082,6 @@ fn now_unix_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// 自動 seed と明示インポートが共有する legacy タグ判定の正本テスト
-    /// (旧: 両 worker に同一テストが複製されていた)。
-    #[test]
-    fn miv_legacy_tags_filters_hash_tags_only() {
-        let tags = miv_legacy_tags(vec![
-            "#Cat".to_string(),
-            "external".to_string(),
-            " #ＤＯＧ ".to_string(),
-            "#".to_string(),
-        ]);
-        assert_eq!(tags, vec!["#Cat".to_string(), "#DOG".to_string()]);
-    }
 
     fn memory_db() -> TagsDb {
         let conn = Connection::open_in_memory().unwrap();
@@ -1379,48 +1356,5 @@ mod tests {
         assert_eq!(db.display_tags_for_item("c:/a.jpg"), vec!["#dog"]);
         assert_eq!(db.display_tags_for_item("c:/b.jpg"), vec!["#dog"]);
         assert!(db.item_keys_by_tag_exact("cat", 10).is_empty());
-    }
-
-    #[test]
-    fn legacy_tantivy_import_copies_only_hash_tags_once() {
-        let mut db = memory_db();
-        let report = db
-            .import_legacy_tantivy_tags([
-                ("c:/a.jpg", "#原神 external #風景"),
-                ("c:/b.jpg", "external"),
-            ])
-            .unwrap();
-        assert_eq!(report.scanned_docs, 2);
-        assert_eq!(report.imported_items, 1);
-        assert_eq!(report.inserted_tags, 2);
-        assert_eq!(report.skipped_decided_items, 0);
-        assert_eq!(db.meta(LEGACY_TANTIVY_IMPORTED_META).as_deref(), Some("1"));
-
-        let tags = db.display_tags_for_item("c:/a.jpg");
-        assert!(tags.contains(&"#原神".to_string()));
-        assert!(tags.contains(&"#風景".to_string()));
-        assert!(db.display_tags_for_item("c:/b.jpg").is_empty());
-        assert!(db.has_item_state("c:/a.jpg"));
-
-        let skipped = db
-            .import_legacy_tantivy_tags([("c:/c.jpg", "#未実行")])
-            .unwrap();
-        assert!(skipped.skipped_already_imported);
-        assert!(db.display_tags_for_item("c:/c.jpg").is_empty());
-    }
-
-    #[test]
-    fn legacy_tantivy_import_skips_decided_items() {
-        let mut db = memory_db();
-        db.set_item_tags("c:/a.jpg", ["既存"], source::EDIT)
-            .unwrap();
-        let report = db
-            .import_legacy_tantivy_tags([("c:/a.jpg", "#旧タグ")])
-            .unwrap();
-        assert_eq!(report.scanned_docs, 1);
-        assert_eq!(report.imported_items, 0);
-        assert_eq!(report.inserted_tags, 0);
-        assert_eq!(report.skipped_decided_items, 1);
-        assert_eq!(db.display_tags_for_item("c:/a.jpg"), vec!["#既存"]);
     }
 }

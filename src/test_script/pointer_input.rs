@@ -1597,11 +1597,14 @@ mod tests {
             hwnd: Some(owner.hwnd()),
             backend_token: Some(owner.backend_token()),
             residence: "mounted".to_string(),
+            presentation: crate::test_script::TestScriptWindowPresentation::ActiveImmediate,
             media_kind: "image".to_string(),
             page_index: Some(page_index),
             items_generation: 7,
             item_identity: item_identity.to_string(),
+            selected_item_identity: String::new(),
             page_ready: true,
+            edit_ready: true,
             viewport_rendered: true,
             viewport_revision: 1,
             paint_matches_current_page: true,
@@ -1610,6 +1613,11 @@ mod tests {
             paint_source_texture: "source".to_string(),
             painted_page_index: Some(page_index),
             paint_revision: 1,
+            paints: Vec::new(),
+            sidecar_imported: false,
+            sidecar_loaded: false,
+            seek_strip: crate::test_script::TestScriptSeekStripSnapshot::closed(),
+            audio_track: crate::test_script::TestScriptAudioTrackSnapshot::absent(),
         }
     }
 
@@ -1736,11 +1744,7 @@ mod tests {
 
     #[test]
     fn completion_revision_rejects_its_own_show_and_accepts_only_a_following_paint() {
-        let _serial = crate::key_input::TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
-        crate::key_input::clear_test_synthetic_input();
+        let _serial = crate::key_input::lock_test_input();
         let ctx = egui::Context::default();
         let viewport = egui::ViewportId::ROOT;
         let backend = eframe::miv_test_script_window_witness::WindowWitnessFixture::new();

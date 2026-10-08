@@ -10,11 +10,12 @@
 # Steps:
 #   1. complete Rust test gate (scripts\test-full.ps1)
 #   2. idle-health analyzer regression tests
-#   3. cargo clean --release -p mimageviewer -p mimageviewer-remote -p mimageviewer-launcher
-#      (+ the portable target dir's mimageviewer + remote packages)
-#   4. build-release.ps1   -> target\release\mimageviewer.exe (launcher) + core + remote
+#   3. cargo clean --release -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-launcher
+#      (+ the portable target dir's mimageviewer + remote + EPUB worker packages)
+#   4. build-release.ps1   -> target\release\mimageviewer.exe (launcher) + core + remote + EPUB worker
 #   5. ISCC                -> installer\Output\mImageViewer_setup.exe
 #   6. build-portable.ps1  -> dist\mImageViewer_portable_v<ver>.zip (target-portable)
+#   7. inspect the final runtime/portable/installer PE closure
 #
 # For day-to-day development keep using scripts\build-release.ps1 directly: it is
 # the fast incremental build and does NOT clean. This script is only for cutting
@@ -46,6 +47,13 @@ $scripts = Join-Path $repoRoot 'scripts'
 $expectedRepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $workspaceTargetDir = Join-Path $repoRoot 'target'
 $portableTargetDir = Join-Path $repoRoot 'target-portable'
+. (Join-Path $scripts 'effetune-distribution.ps1')
+. (Join-Path $scripts 'vst3-host-identity.ps1')
+if ($SkipVst3Bridge) { Assert-MivVst3HostIdentity -RepoRoot $repoRoot }
+# Fail before tests/clean if the complete release bundle or tracked licenses are
+# missing. build-release stages a fresh copy and signs its PE(s) before embedding.
+$null = Assert-MivEffetuneSource -SourceRoot (Join-Path $repoRoot 'vendor\effetune-mixwright') `
+    -NoticesRoot (Join-Path $repoRoot 'third_party\effetune-mixwright')
 
 if ($PreserveRuntime) {
     if (-not $repoRoot.Equals($expectedRepoRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -77,7 +85,8 @@ if ($PreserveRuntime) {
 # Code signing is ON by default for distribution builds; pass -NoSign to skip it.
 # Assert the signing certificate up front (SimplySign Desktop must be running and
 # logged in) so a missing cert fails before the multi-minute clean+build, not
-# after. build-release.ps1 / build-portable.ps1 do the actual interleaved signing.
+# after. build-release.ps1 / build-portable.ps1 do the actual interleaved signing,
+# including EffeTune's .vst3 PE in a staged copy before launcher embeds it.
 $sign = -not $NoSign
 if ($sign) {
     . (Join-Path $scripts 'sign-files.ps1')
@@ -95,6 +104,7 @@ $runningNames = @(
     'mimageviewer',
     'mimageviewer-core',
     'mimageviewer-remote',
+    'mimageviewer-epub-pdf',
     'mimageviewer-vst3-host',
     'mimageviewer-susie32'
 )
@@ -109,10 +119,12 @@ if ($running.Count -gt 0) {
 
 # Run the complete Rust gate before cleaning release outputs. The explicit skip
 # exists for retrying packaging/signing on an unchanged, already-tested tree.
+. (Join-Path $scripts 'vst3-host-vcrt.ps1')
+Assert-MivVst3HostVcrt -RepoRoot $repoRoot
 if ($SkipRustTests) {
-    Write-Warning '[build-dist] (1/6) Rust test gate skipped; use only for an unchanged tested tree'
+    Write-Warning '[build-dist] (1/7) Rust test gate skipped; use only for an unchanged tested tree'
 } else {
-    Write-Host '[build-dist] (1/6) scripts\test-full.ps1'
+    Write-Host '[build-dist] (1/7) scripts\test-full.ps1'
     $testArgs = @()
     if ($PreserveRuntime) { $testArgs += '-SuppressCrashDialogs' }
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts 'test-full.ps1') @testArgs
@@ -123,28 +135,36 @@ if ($SkipRustTests) {
 
 # The idle-health smoke is a release gate, so its analyzer tests must be part of
 # the distribution path rather than relying on a separate remembered command.
-Write-Host "[build-dist] (2/6) python scripts\test_analyze_perf.py"
+Write-Host "[build-dist] (2/7) python scripts\test_analyze_perf.py"
 & python (Join-Path $scripts 'test_analyze_perf.py')
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] idle-health analyzer tests failed (exit {0})" -f $LASTEXITCODE) }
+Write-Host '[build-dist]       EffeTune staging/signing-enumeration regression tests'
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts 'test-effetune-distribution.ps1')
+if ($LASTEXITCODE -ne 0) { throw ("[build-dist] EffeTune script tests failed (exit {0})" -f $LASTEXITCODE) }
+Write-Host '[build-dist]       VST3 host source-identity regression tests'
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts 'test-vst3-host-identity.ps1')
+if ($LASTEXITCODE -ne 0) { throw ("[build-dist] VST3 host identity tests failed (exit {0})" -f $LASTEXITCODE) }
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts 'test-vst3-host-vcrt.ps1')
+if ($LASTEXITCODE -ne 0) { throw ("[build-dist] VST3 host CRT preflight tests failed (exit {0})" -f $LASTEXITCODE) }
 
 # --- 1. Clean the workspace package so the app is rebuilt from current source ---
 # NOTE: $ErrorActionPreference='Stop' does NOT stop on a native command's non-zero
 # exit in PowerShell 5.1, so check $LASTEXITCODE explicitly. A silently-failed
 # clean would let the build reuse a stale fingerprint -- the exact bug this script
 # exists to prevent.
-Write-Host "[build-dist] (3/6) cargo clean --release -p mimageviewer -p mimageviewer-remote -p mimageviewer-launcher"
-& cargo clean --release -p mimageviewer -p mimageviewer-remote -p mimageviewer-launcher
+Write-Host "[build-dist] (3/7) cargo clean --release -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-launcher"
+& cargo clean --release -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-launcher
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] cargo clean (workspace) failed (exit {0})" -f $LASTEXITCODE) }
-Write-Host "[build-dist]       cargo clean --release --target-dir target-portable -p mimageviewer -p mimageviewer-remote"
-& cargo clean --release --target-dir $portableTargetDir -p mimageviewer -p mimageviewer-remote
+Write-Host "[build-dist]       cargo clean --release --target-dir target-portable -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker"
+& cargo clean --release --target-dir $portableTargetDir -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] cargo clean (portable) failed (exit {0})" -f $LASTEXITCODE) }
 
-# --- 2. Core + remote + launcher (fresh, since cleaned above) ---
+# --- 2. Core + remote + EPUB worker + launcher (fresh, since cleaned above) ---
 $releaseArgs = @()
 if ($SkipVst3Bridge) { $releaseArgs += '-SkipVst3Bridge' }
 if ($sign) { $releaseArgs += '-Sign' }
 if ($PreserveRuntime) { $releaseArgs += '-PreserveRuntime' }
-Write-Host ("[build-dist] (4/6) build-release.ps1 {0}" -f ($releaseArgs -join ' '))
+Write-Host ("[build-dist] (4/7) build-release.ps1 {0}" -f ($releaseArgs -join ' '))
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts 'build-release.ps1') @releaseArgs
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] build-release.ps1 failed (exit {0})" -f $LASTEXITCODE) }
 
@@ -160,14 +180,14 @@ if (-not $isccPath) {
     }
 }
 if (-not $isccPath) { throw "[build-dist] ISCC.exe not found. Install Inno Setup 6." }
-Write-Host ("[build-dist] (5/6) {0} installer\mimageviewer.iss" -f $isccPath)
+Write-Host ("[build-dist] (5/7) {0} installer\mimageviewer.iss" -f $isccPath)
 & $isccPath (Join-Path $repoRoot 'installer\mimageviewer.iss')
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] ISCC failed (exit {0})" -f $LASTEXITCODE) }
 
+$setupExe = Join-Path $repoRoot 'installer\Output\mImageViewer_setup.exe'
 if ($sign) {
     # Sign the installer itself. The launcher inside it was already signed in
     # step 2 (build-release), before Inno embedded it.
-    $setupExe = Join-Path $repoRoot 'installer\Output\mImageViewer_setup.exe'
     Write-Host ("[build-dist]       signing {0}" -f $setupExe)
     Invoke-MivSign -Files @($setupExe) -Verify
 }
@@ -176,9 +196,38 @@ if ($sign) {
 $portableArgs = @()
 if ($sign) { $portableArgs += '-Sign' }
 if ($PreserveRuntime) { $portableArgs += '-PreserveRuntime' }
-Write-Host "[build-dist] (6/6) build-portable.ps1"
+Write-Host "[build-dist] (6/7) build-portable.ps1"
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts 'build-portable.ps1') @portableArgs
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] build-portable.ps1 failed (exit {0})" -f $LASTEXITCODE) }
+
+# The sub-builds inspect their source and staging layouts. Re-run the gate over
+# the final loose package and the final installer wrapper before declaring the
+# distribution complete. The installer does not load ORT and embeds the launcher,
+# so its own directory does not require the app-local companion DLLs.
+$cargoToml = Get-Content -LiteralPath (Join-Path $repoRoot 'Cargo.toml')
+$version = $null
+foreach ($line in $cargoToml) {
+    if ($line -match '^version\s*=\s*"([^"]+)"') { $version = $Matches[1]; break }
+}
+if (-not $version) { throw '[build-dist] could not parse version from Cargo.toml' }
+$portableDir = Join-Path $repoRoot "dist\mImageViewer_portable_v$version"
+$finalRuntimePe = @(
+    (Join-Path $repoRoot 'target\release\mimageviewer.exe'),
+    (Join-Path $repoRoot 'target\release\mimageviewer-core.exe'),
+    (Join-Path $repoRoot 'target\release\mimageviewer-remote.exe'),
+    (Join-Path $repoRoot 'target\release\mimageviewer-epub-pdf.exe'),
+    $portableDir,
+    (Join-Path $repoRoot 'target\effetune-dist-source\EffeTune Mixwright.vst3')
+)
+Write-Host '[build-dist] (7/7) final PE dependency closure'
+Assert-MivVst3HostIdentity -RepoRoot $repoRoot
+Assert-MivEffetuneStage -RepoRoot $repoRoot -SourceRoot (Join-Path $repoRoot 'target\effetune-dist-source')
+& (Join-Path $scripts 'check-vcrt-pe-dependencies.ps1') `
+    -InputPaths $finalRuntimePe -RequireCompanionRuntime `
+    -ReportPath 'target\vcrt-pe-reports\dist-runtime-portable.json'
+& (Join-Path $scripts 'check-vcrt-pe-dependencies.ps1') `
+    -InputPaths $setupExe `
+    -ReportPath 'target\vcrt-pe-reports\dist-installer.json'
 
 # --- Summary ---
 Write-Host ""

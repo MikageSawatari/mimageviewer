@@ -72,12 +72,72 @@ pub struct A1111Metadata {
 pub struct ComfyUIMetadata {
     pub prompt_json: serde_json::Value,
     pub workflow_json: Option<serde_json::Value>,
-    /// CLIPTextEncode ノード等から抽出した正プロンプト
-    pub extracted_prompts: Vec<String>,
-    /// 同・負プロンプト
-    pub extracted_negatives: Vec<String>,
+    /// topology と小さい passthrough 契約から生成時の文字列だと確定できた prompt。
+    pub resolved_prompts: Vec<ResolvedComfyPrompt>,
+    /// positive / negative topology から到達したが、変換後の出力を証明できない入力。
+    /// 検索へ採用する場合も unresolved のまま UI に表示する。
+    pub unresolved_inputs: Vec<UnresolvedComfyInput>,
     /// KSampler ノード等から抽出した生成パラメータ
     pub sampler_params: Vec<(String, String)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ComfyPromptRole {
+    Positive,
+    Negative,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ComfyPromptProvenance {
+    ClipLiteral {
+        node_id: String,
+    },
+    PrimitivePassthrough {
+        clip_node_id: String,
+        source_node_id: String,
+        input_key: String,
+        output_index: u64,
+    },
+    ParametersPositive,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ResolvedComfyPrompt {
+    pub text: String,
+    pub role: ComfyPromptRole,
+    pub provenance: ComfyPromptProvenance,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum UnresolvedInputSafety {
+    SearchablePlain,
+    TemplateSyntax,
+    TooLarge,
+    TooManyLines,
+}
+
+impl UnresolvedInputSafety {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SearchablePlain => "短い平文",
+            Self::TemplateSyntax => "テンプレート",
+            Self::TooLarge => "サイズ上限超過",
+            Self::TooManyLines => "行数上限超過",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct UnresolvedComfyInput {
+    pub text: String,
+    pub role: ComfyPromptRole,
+    pub source_node_id: String,
+    pub source_class: String,
+    /// 候補文字列を実際に読んだ source node の input key。
+    pub input_key: String,
+    /// CLIPTextEncode の `text` link に記録された source output index。
+    pub output_index: u64,
+    pub safety: UnresolvedInputSafety,
 }
 
 /// 検出されたメタデータのフォーマット
@@ -418,9 +478,26 @@ fn detect_and_parse_outcome(chunks: &[(String, String)]) -> Option<ParseOutcome>
             && val.is_object()
         {
             let workflow = chunk_value(chunks, "workflow").and_then(parse_comfyui_json_value);
+            let mut meta = parse_comfyui(val, workflow);
+            // ComfyUI を認識した時点で同居 parameters は常に AI metadata として consumed。
+            // raw text / Negative を非 AI chunk 経路から再混入させない。resolved positive が
+            // 取れない場合だけ、A1111 の構造を持つ parameters の positive を代替にする。
+            if !meta.resolved_prompts.iter().any(|prompt| {
+                prompt.role == ComfyPromptRole::Positive && !prompt.text.trim().is_empty()
+            }) && let Some(raw) = chunk_value(chunks, "parameters")
+                && looks_like_a1111(raw)
+                && let Some(parameters) = parse_a1111_as(raw, AiToolKind::A1111)
+                && !parameters.prompt.trim().is_empty()
+            {
+                meta.resolved_prompts.push(ResolvedComfyPrompt {
+                    text: parameters.prompt,
+                    role: ComfyPromptRole::Positive,
+                    provenance: ComfyPromptProvenance::ParametersPositive,
+                });
+            }
             return Some(ParseOutcome {
-                meta: AiMetadata::ComfyUI(parse_comfyui(val, workflow)),
-                consumed_keys: vec!["prompt", "workflow"],
+                meta: AiMetadata::ComfyUI(meta),
+                consumed_keys: vec!["prompt", "workflow", "parameters"],
             });
         }
     }
@@ -1476,7 +1553,8 @@ fn parse_dream_flags(flags: &str) -> Vec<(String, String)> {
 ///
 /// **Negative prompt は除外される**。
 /// - A1111 / Forge / Midjourney: `prompt` + `params` (Steps, Sampler, Model 等)
-/// - ComfyUI: `extracted_prompts` + `sampler_params`
+/// - ComfyUI: resolved positive を優先し、無い場合だけ safety-accepted な unresolved positive
+///   + `sampler_params`
 /// - Unknown: 全チャンク値 (正負の区別ができないため全部含める)
 ///
 /// 各値は改行区切りで連結される。`search_query::matches` に渡せば内部で
@@ -1491,8 +1569,22 @@ pub fn build_searchable_text(meta: &AiMetadata) -> String {
             }
         }
         AiMetadata::ComfyUI(m) => {
-            for p in &m.extracted_prompts {
-                append_line(&mut out, p);
+            let resolved_positive: Vec<&ResolvedComfyPrompt> = m
+                .resolved_prompts
+                .iter()
+                .filter(|prompt| prompt.role == ComfyPromptRole::Positive)
+                .collect();
+            if resolved_positive.is_empty() {
+                for input in m.unresolved_inputs.iter().filter(|input| {
+                    input.role == ComfyPromptRole::Positive
+                        && input.safety == UnresolvedInputSafety::SearchablePlain
+                }) {
+                    append_line(&mut out, &input.text);
+                }
+            } else {
+                for prompt in resolved_positive {
+                    append_line(&mut out, &prompt.text);
+                }
             }
             for (k, v) in &m.sampler_params {
                 append_kv(&mut out, k, v);
@@ -1501,7 +1593,7 @@ pub fn build_searchable_text(meta: &AiMetadata) -> String {
         AiMetadata::Unknown(chunks) => {
             // 未知フォーマットは正負の分離ができないので全部入れる
             for (_, v) in chunks {
-                append_line(&mut out, v);
+                append_unconsumed_chunk(&mut out, v);
             }
         }
     }
@@ -1516,6 +1608,17 @@ fn append_line(out: &mut String, s: &str) {
         out.push('\n');
     }
     out.push_str(s);
+}
+
+/// 出所を判別できないチャンクを検索へ素通しする経路の 1 chunk 上限。
+/// 正常な Author / Comment 等には十分広く、巨大な任意チャンクが Tantivy STORED text を
+/// 膨らませるのを防ぐ。超過時は途中で切らず、その chunk 全体を検索対象外にする。
+const MAX_UNCONSUMED_SEARCH_CHUNK_BYTES: usize = 16 * 1024;
+
+fn append_unconsumed_chunk(out: &mut String, value: &str) {
+    if value.len() <= MAX_UNCONSUMED_SEARCH_CHUNK_BYTES {
+        append_line(out, value);
+    }
 }
 
 fn append_kv(out: &mut String, k: &str, v: &str) {
@@ -1797,7 +1900,7 @@ pub fn build_searchable_from_chunks(chunks: &[(String, String)]) -> String {
             {
                 continue;
             }
-            append_line(&mut out, v);
+            append_unconsumed_chunk(&mut out, v);
         }
     }
 
@@ -2082,8 +2185,8 @@ fn parse_comfyui(
     prompt_json: serde_json::Value,
     workflow_json: Option<serde_json::Value>,
 ) -> ComfyUIMetadata {
-    let mut extracted_prompts = Vec::new();
-    let mut extracted_negatives = Vec::new();
+    let mut resolved_prompts = Vec::new();
+    let mut unresolved_inputs = Vec::new();
     let mut sampler_params = Vec::new();
 
     // prompt JSON はノード ID → ノード定義のマップ
@@ -2091,6 +2194,7 @@ fn parse_comfyui(
         // まず KSampler ノードを見つけて positive/negative の入力元を特定
         let mut positive_refs: Vec<String> = Vec::new();
         let mut negative_refs: Vec<String> = Vec::new();
+        let mut saw_supported_sampler_topology = false;
 
         for (_node_id, node) in nodes {
             let class = node
@@ -2100,6 +2204,10 @@ fn parse_comfyui(
 
             match class {
                 "KSampler" | "KSamplerAdvanced" | "SamplerCustom" => {
+                    // refs が欠落 / 不正でも、既知 sampler topology の存在は独立に記録する。
+                    // この状態を抽出 Vec の空判定で代用すると、known negative や無関係な
+                    // CLIPTextEncode を positive fallback として救済してしまう。
+                    saw_supported_sampler_topology = true;
                     // 生成パラメータを抽出
                     if let Some(inputs) = node.get("inputs").and_then(|i| i.as_object()) {
                         for &key in &[
@@ -2155,21 +2263,37 @@ fn parse_comfyui(
         }
 
         // positive/negative 参照先からプロンプトテキストを抽出
-        // 参照先が CLIPTextEncode ならテキストを取得
+        // visited は root ごとに分け、同じ node が positive / negative の両方から
+        // 到達した場合にも先に辿った role で潰さない。
         for ref_id in &positive_refs {
-            if let Some(node) = nodes.get(ref_id.as_str()) {
-                extract_text_from_node(node, nodes, &mut extracted_prompts);
-            }
+            let mut visited = std::collections::HashSet::new();
+            trace_comfy_prompt_node(
+                ref_id,
+                ComfyPromptRole::Positive,
+                nodes,
+                &mut visited,
+                0,
+                &mut resolved_prompts,
+                &mut unresolved_inputs,
+            );
         }
         for ref_id in &negative_refs {
-            if let Some(node) = nodes.get(ref_id.as_str()) {
-                extract_text_from_node(node, nodes, &mut extracted_negatives);
-            }
+            let mut visited = std::collections::HashSet::new();
+            trace_comfy_prompt_node(
+                ref_id,
+                ComfyPromptRole::Negative,
+                nodes,
+                &mut visited,
+                0,
+                &mut resolved_prompts,
+                &mut unresolved_inputs,
+            );
         }
 
-        // 参照関係が解決できなかった場合、全 CLIPTextEncode からテキストを集める
-        if extracted_prompts.is_empty() && extracted_negatives.is_empty() {
-            for (_node_id, node) in nodes {
+        // KSampler topology 自体が無い古い workflow だけ、全 CLIPTextEncode の直接 literal を
+        // positive として拾う。既知 topology の refs が欠落 / 不正 / 未解決でも発火させない。
+        if !saw_supported_sampler_topology {
+            for (node_id, node) in nodes {
                 let class = node
                     .get("class_type")
                     .and_then(|c| c.as_str())
@@ -2181,7 +2305,13 @@ fn parse_comfyui(
                         .and_then(|t| t.as_str())
                     {
                         if !text.trim().is_empty() {
-                            extracted_prompts.push(text.to_string());
+                            resolved_prompts.push(ResolvedComfyPrompt {
+                                text: text.to_string(),
+                                role: ComfyPromptRole::Positive,
+                                provenance: ComfyPromptProvenance::ClipLiteral {
+                                    node_id: node_id.clone(),
+                                },
+                            });
                         }
                     }
                 }
@@ -2192,8 +2322,8 @@ fn parse_comfyui(
     ComfyUIMetadata {
         prompt_json,
         workflow_json,
-        extracted_prompts,
-        extracted_negatives,
+        resolved_prompts,
+        unresolved_inputs,
         sampler_params,
     }
 }
@@ -2210,13 +2340,26 @@ fn comfyui_model_input_keys(class: &str) -> Option<&'static [&'static str]> {
     }
 }
 
-/// ノードからテキストを抽出する。CLIPTextEncode ならテキストを直接取得。
-/// それ以外なら入力の参照先を再帰的にたどる。
-fn extract_text_from_node(
-    node: &serde_json::Value,
+const MAX_COMFY_TRACE_DEPTH: usize = 64;
+const MAX_UNRESOLVED_INPUT_BYTES: usize = 8 * 1024;
+const MAX_UNRESOLVED_INPUT_LINES: usize = 64;
+
+/// Conditioning topology を辿る。cycle / 異常に深いグラフは、その root traversal だけを止める。
+fn trace_comfy_prompt_node(
+    node_id: &str,
+    role: ComfyPromptRole,
     all_nodes: &serde_json::Map<String, serde_json::Value>,
-    out: &mut Vec<String>,
+    visited: &mut std::collections::HashSet<String>,
+    depth: usize,
+    resolved: &mut Vec<ResolvedComfyPrompt>,
+    unresolved: &mut Vec<UnresolvedComfyInput>,
 ) {
+    if depth >= MAX_COMFY_TRACE_DEPTH || !visited.insert(node_id.to_string()) {
+        return;
+    }
+    let Some(node) = all_nodes.get(node_id) else {
+        return;
+    };
     let class = node
         .get("class_type")
         .and_then(|c| c.as_str())
@@ -2224,40 +2367,55 @@ fn extract_text_from_node(
 
     if class.contains("CLIPTextEncode") {
         if let Some(inputs) = node.get("inputs").and_then(|i| i.as_object()) {
-            // text が文字列ならそのまま取得
+            // CLIPTextEncode.text の直接 literal は生成へ渡った文字列として確定できる。
             if let Some(text) = inputs.get("text").and_then(|t| t.as_str()) {
                 if !text.trim().is_empty() {
-                    out.push(text.to_string());
+                    resolved.push(ResolvedComfyPrompt {
+                        text: text.to_string(),
+                        role,
+                        provenance: ComfyPromptProvenance::ClipLiteral {
+                            node_id: node_id.to_string(),
+                        },
+                    });
                 }
             }
-            // text が参照 [node_id, output_idx] の場合もある
-            if let Some(arr) = inputs.get("text").and_then(|t| t.as_array()) {
-                if let Some(ref_id) = arr.first().and_then(|v| v.as_str()) {
-                    if let Some(ref_node) = all_nodes.get(ref_id) {
-                        extract_text_from_ref_node(ref_node, all_nodes, out);
-                    }
-                }
+            // link は source node の「入力」しか保存していない。PrimitiveNode の
+            // class/value/output0 契約だけ resolved、それ以外は出所付き unresolved にする。
+            if let Some((source_node_id, output_index)) = inputs.get("text").and_then(comfy_link)
+                && let Some(source_node) = all_nodes.get(source_node_id)
+            {
+                collect_linked_comfy_text(
+                    node_id,
+                    source_node_id,
+                    output_index,
+                    source_node,
+                    role,
+                    resolved,
+                    unresolved,
+                );
             }
         }
     } else {
-        // 条件分岐ノード等の場合、入力を追跡
+        // Conditioning 系 wrapper の入力だけを再帰的に辿る。任意 node graph を評価しない。
         if let Some(inputs) = node.get("inputs").and_then(|i| i.as_object()) {
             for (_key, val) in inputs {
-                if let Some(arr) = val.as_array() {
-                    if arr.len() == 2 {
-                        if let Some(ref_id) = arr.first().and_then(|v| v.as_str()) {
-                            if let Some(ref_node) = all_nodes.get(ref_id) {
-                                let ref_class = ref_node
-                                    .get("class_type")
-                                    .and_then(|c| c.as_str())
-                                    .unwrap_or("");
-                                if ref_class.contains("CLIPTextEncode")
-                                    || ref_class.contains("Conditioning")
-                                {
-                                    extract_text_from_node(ref_node, all_nodes, out);
-                                }
-                            }
-                        }
+                if let Some((ref_id, _)) = comfy_link(val)
+                    && let Some(ref_node) = all_nodes.get(ref_id)
+                {
+                    let ref_class = ref_node
+                        .get("class_type")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("");
+                    if ref_class.contains("CLIPTextEncode") || ref_class.contains("Conditioning") {
+                        trace_comfy_prompt_node(
+                            ref_id,
+                            role,
+                            all_nodes,
+                            visited,
+                            depth + 1,
+                            resolved,
+                            unresolved,
+                        );
                     }
                 }
             }
@@ -2265,23 +2423,117 @@ fn extract_text_from_node(
     }
 }
 
-/// 参照先ノードからテキスト値を抽出（STRING 出力ノード等）。
-fn extract_text_from_ref_node(
-    node: &serde_json::Value,
-    _all_nodes: &serde_json::Map<String, serde_json::Value>,
-    out: &mut Vec<String>,
+fn comfy_link(value: &serde_json::Value) -> Option<(&str, u64)> {
+    let link = value.as_array()?;
+    if link.len() != 2 {
+        return None;
+    }
+    Some((link.first()?.as_str()?, link.get(1)?.as_u64()?))
+}
+
+fn collect_linked_comfy_text(
+    clip_node_id: &str,
+    source_node_id: &str,
+    output_index: u64,
+    source_node: &serde_json::Value,
+    role: ComfyPromptRole,
+    resolved: &mut Vec<ResolvedComfyPrompt>,
+    unresolved: &mut Vec<UnresolvedComfyInput>,
 ) {
-    if let Some(inputs) = node.get("inputs").and_then(|i| i.as_object()) {
-        // テキスト系ノード: "text", "string", "value" 等のキーを探す
-        for &key in &["text", "string", "value", "text_positive", "text_negative"] {
+    let source_class = source_node
+        .get("class_type")
+        .and_then(|class| class.as_str())
+        .unwrap_or("");
+    if let Some(inputs) = source_node
+        .get("inputs")
+        .and_then(|inputs| inputs.as_object())
+    {
+        for &key in &[
+            "text",
+            "string",
+            "value",
+            "text_positive",
+            "text_negative",
+            "populated_text",
+        ] {
             if let Some(text) = inputs.get(key).and_then(|t| t.as_str()) {
-                if !text.trim().is_empty() {
-                    out.push(text.to_string());
-                    return;
+                if text.trim().is_empty() {
+                    continue;
+                }
+                if source_class == "PrimitiveNode" && key == "value" && output_index == 0 {
+                    resolved.push(ResolvedComfyPrompt {
+                        text: text.to_string(),
+                        role,
+                        provenance: ComfyPromptProvenance::PrimitivePassthrough {
+                            clip_node_id: clip_node_id.to_string(),
+                            source_node_id: source_node_id.to_string(),
+                            input_key: key.to_string(),
+                            output_index,
+                        },
+                    });
+                } else {
+                    // `text_negative` は positive link の source node に同居していても
+                    // positive へ昇格させない。negative traversal は全候補を negative のまま保つ。
+                    let candidate_role =
+                        if role == ComfyPromptRole::Negative || key == "text_negative" {
+                            ComfyPromptRole::Negative
+                        } else {
+                            ComfyPromptRole::Positive
+                        };
+                    unresolved.push(UnresolvedComfyInput {
+                        text: text.to_string(),
+                        role: candidate_role,
+                        source_node_id: source_node_id.to_string(),
+                        source_class: source_class.to_string(),
+                        input_key: key.to_string(),
+                        output_index,
+                        safety: classify_unresolved_input(text),
+                    });
                 }
             }
         }
     }
+}
+
+fn classify_unresolved_input(text: &str) -> UnresolvedInputSafety {
+    if contains_dynamic_prompt_syntax(text) {
+        UnresolvedInputSafety::TemplateSyntax
+    } else if text.len() > MAX_UNRESOLVED_INPUT_BYTES {
+        UnresolvedInputSafety::TooLarge
+    } else if text.lines().count() > MAX_UNRESOLVED_INPUT_LINES {
+        UnresolvedInputSafety::TooManyLines
+    } else {
+        UnresolvedInputSafety::SearchablePlain
+    }
+}
+
+fn contains_dynamic_prompt_syntax(text: &str) -> bool {
+    let mut rest = text;
+    while let Some(open) = rest.find('{') {
+        let after_open = &rest[open + 1..];
+        if let Some(close) = after_open.find('}') {
+            if after_open[..close].contains('|') {
+                return true;
+            }
+            rest = &after_open[close + 1..];
+        } else {
+            break;
+        }
+    }
+
+    let mut rest = text;
+    while let Some(open) = rest.find("__") {
+        let after_open = &rest[open + 2..];
+        if let Some(close) = after_open.find("__") {
+            if close > 0 {
+                return true;
+            }
+            rest = &after_open[close + 2..];
+        } else {
+            break;
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -2319,6 +2571,22 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
     }
 
+    fn comfy_fixture(relative: &str) -> ComfyUIMetadata {
+        let path = fixture_root(relative);
+        let Some(AiMetadata::ComfyUI(meta)) = extract_metadata(&path) else {
+            panic!("{} must contain ComfyUI metadata", path.display());
+        };
+        meta
+    }
+
+    fn resolved_texts(meta: &ComfyUIMetadata, role: ComfyPromptRole) -> Vec<&str> {
+        meta.resolved_prompts
+            .iter()
+            .filter(|prompt| prompt.role == role)
+            .map(|prompt| prompt.text.as_str())
+            .collect()
+    }
+
     #[test]
     fn fixture_png_path_and_bytes_readers_match_all() {
         let roots = [
@@ -2341,6 +2609,25 @@ mod tests {
             }
         }
         assert!(checked > 0, "PNG fixtures must be discovered");
+    }
+
+    #[test]
+    fn comfyui_provenance_fixtures_match_searchable_path_and_bytes_entry_points() {
+        for name in [
+            "comfyui_linked_template_with_parameters.png",
+            "comfyui_linked_template_without_parameters.png",
+            "comfyui_parameters_comfyui_version.png",
+            "comfyui_primitive_passthrough.png",
+            "comfyui_unresolved_plain.png",
+        ] {
+            let path = fixture_root(&format!("tests/fixtures/ai_metadata/{name}"));
+            let bytes = std::fs::read(&path).unwrap();
+            assert_eq!(
+                build_searchable_from_path_with_origin(&path),
+                build_searchable_from_bytes_with_origin(&bytes),
+                "Ctrl+F path and Ctrl+G ingest bytes must share the provenance decision: {name}"
+            );
+        }
     }
 
     #[test]
@@ -2729,11 +3016,14 @@ mod tests {
         }"#;
         let val: serde_json::Value = serde_json::from_str(json_str).unwrap();
         let meta = parse_comfyui(val, None);
+        assert!(meta.resolved_prompts.iter().any(|prompt| {
+            prompt.role == ComfyPromptRole::Positive && prompt.text == "a beautiful sunset"
+        }));
         assert!(
-            meta.extracted_prompts
-                .contains(&"a beautiful sunset".to_string())
+            meta.resolved_prompts.iter().any(|prompt| {
+                prompt.role == ComfyPromptRole::Negative && prompt.text == "ugly"
+            })
         );
-        assert!(meta.extracted_negatives.contains(&"ugly".to_string()));
         assert!(
             meta.sampler_params
                 .iter()
@@ -2744,6 +3034,323 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k == "model" && v == "sd_xl_base_1.0.safetensors")
         );
+    }
+
+    #[test]
+    fn comfyui_provenance_fixtures_apply_resolved_priority_and_safe_fallback() {
+        let with_parameters =
+            comfy_fixture("tests/fixtures/ai_metadata/comfyui_linked_template_with_parameters.png");
+        assert!(with_parameters.resolved_prompts.iter().any(|prompt| {
+            prompt.role == ComfyPromptRole::Positive
+                && prompt.text == "resolved parameter positive"
+                && prompt.provenance == ComfyPromptProvenance::ParametersPositive
+        }));
+        assert!(with_parameters.unresolved_inputs.iter().any(|input| {
+            input.role == ComfyPromptRole::Positive
+                && input.source_class == "PromptTransform"
+                && input.input_key == "text"
+                && input.output_index == 0
+                && input.safety == UnresolvedInputSafety::TemplateSyntax
+        }));
+        let searchable = build_searchable_text(&AiMetadata::ComfyUI(with_parameters));
+        assert!(searchable.contains("resolved parameter positive"));
+        assert!(searchable.contains("fixtureModel"));
+        assert!(!searchable.contains("template-token"));
+        assert!(!searchable.contains("parameter-negative-leak"));
+        assert!(!searchable.contains("negative-leak"));
+
+        let without_parameters = comfy_fixture(
+            "tests/fixtures/ai_metadata/comfyui_linked_template_without_parameters.png",
+        );
+        let searchable = build_searchable_text(&AiMetadata::ComfyUI(without_parameters));
+        assert!(searchable.contains("literal-positive"));
+        assert!(!searchable.contains("template-token"));
+        assert!(!searchable.contains("negative-leak"));
+
+        let primitive =
+            comfy_fixture("tests/fixtures/ai_metadata/comfyui_primitive_passthrough.png");
+        assert!(primitive.resolved_prompts.iter().any(|prompt| {
+            prompt.text == "primitive-positive"
+                && matches!(
+                    &prompt.provenance,
+                    ComfyPromptProvenance::PrimitivePassthrough {
+                        input_key,
+                        output_index: 0,
+                        ..
+                    } if input_key == "value"
+                )
+        }));
+        assert!(
+            build_searchable_text(&AiMetadata::ComfyUI(primitive)).contains("primitive-positive")
+        );
+
+        let unresolved = comfy_fixture("tests/fixtures/ai_metadata/comfyui_unresolved_plain.png");
+        assert!(
+            resolved_texts(&unresolved, ComfyPromptRole::Positive).is_empty(),
+            "unknown transform input must not be promoted to resolved"
+        );
+        assert!(unresolved.unresolved_inputs.iter().any(|input| {
+            input.text == "short unresolved positive"
+                && input.safety == UnresolvedInputSafety::SearchablePlain
+        }));
+        assert!(
+            build_searchable_text(&AiMetadata::ComfyUI(unresolved))
+                .contains("short unresolved positive")
+        );
+
+        let version_fallback =
+            comfy_fixture("tests/fixtures/ai_metadata/comfyui_parameters_comfyui_version.png");
+        assert!(version_fallback.resolved_prompts.iter().any(|prompt| {
+            prompt.text == "version fallback positive"
+                && prompt.provenance == ComfyPromptProvenance::ParametersPositive
+        }));
+        let searchable = build_searchable_text(&AiMetadata::ComfyUI(version_fallback));
+        assert!(searchable.contains("version fallback positive"));
+        assert!(!searchable.contains("version-negative-leak"));
+        assert!(!searchable.contains("__wildcard__"));
+    }
+
+    #[test]
+    fn comfyui_parameters_are_consumed_and_never_override_resolved_positive() {
+        let prompt = r#"{
+            "1":{"class_type":"CLIPTextEncode","inputs":{"text":"comfy-positive"}},
+            "2":{"class_type":"CLIPTextEncode","inputs":{"text":"comfy-negative"}},
+            "3":{"class_type":"KSampler","inputs":{"positive":["1",0],"negative":["2",0]}}
+        }"#;
+        let chunks = vec![
+            ("prompt".to_string(), prompt.to_string()),
+            (
+                "parameters".to_string(),
+                "parameter-positive\nNegative prompt: parameter-negative\nSteps: 20, Version: ComfyUI"
+                    .to_string(),
+            ),
+            ("Author".to_string(), "fixture-author".to_string()),
+        ];
+        let text = build_searchable_from_chunks(&chunks);
+        assert!(text.contains("comfy-positive"));
+        assert!(text.contains("fixture-author"));
+        assert!(!text.contains("comfy-negative"));
+        assert!(!text.contains("parameter-positive"));
+        assert!(!text.contains("parameter-negative"));
+
+        let malformed_parameters = vec![
+            ("prompt".to_string(), prompt.to_string()),
+            (
+                "parameters".to_string(),
+                "unparsed-parameters-negative-leak".to_string(),
+            ),
+        ];
+        let text = build_searchable_from_chunks(&malformed_parameters);
+        assert!(text.contains("comfy-positive"));
+        assert!(!text.contains("unparsed-parameters-negative-leak"));
+    }
+
+    #[test]
+    fn comfyui_known_sampler_never_rescues_unrelated_clip_as_positive() {
+        let chunks = vec![(
+            "prompt".to_string(),
+            r#"{
+                "1":{"class_type":"CLIPTextEncode","inputs":{"text":"unrelated-positive-leak"}},
+                "2":{"class_type":"CLIPTextEncode","inputs":{"text":"known-negative-leak"}},
+                "3":{"class_type":"KSampler","inputs":{"positive":"invalid", "negative":["2",0]}}
+            }"#
+            .to_string(),
+        )];
+        let Some(AiMetadata::ComfyUI(meta)) = detect_and_parse(&chunks) else {
+            panic!("expected ComfyUI");
+        };
+        assert!(resolved_texts(&meta, ComfyPromptRole::Positive).is_empty());
+        assert_eq!(
+            resolved_texts(&meta, ComfyPromptRole::Negative),
+            vec!["known-negative-leak"]
+        );
+        let text = build_searchable_text(&AiMetadata::ComfyUI(meta));
+        assert!(!text.contains("unrelated-positive-leak"));
+        assert!(!text.contains("known-negative-leak"));
+    }
+
+    #[test]
+    fn comfyui_trace_preserves_roles_and_stops_cycles() {
+        let chunks = vec![(
+            "prompt".to_string(),
+            r#"{
+                "1":{"class_type":"CLIPTextEncode","inputs":{"text":"shared-text"}},
+                "2":{"class_type":"ConditioningCombine","inputs":{"a":["1",0],"cycle":["2",0]}},
+                "3":{"class_type":"KSampler","inputs":{"positive":["2",0],"negative":["2",0]}}
+            }"#
+            .to_string(),
+        )];
+        let Some(AiMetadata::ComfyUI(meta)) = detect_and_parse(&chunks) else {
+            panic!("expected ComfyUI");
+        };
+        assert_eq!(
+            resolved_texts(&meta, ComfyPromptRole::Positive),
+            vec!["shared-text"]
+        );
+        assert_eq!(
+            resolved_texts(&meta, ComfyPromptRole::Negative),
+            vec!["shared-text"]
+        );
+        assert_eq!(
+            build_searchable_text(&AiMetadata::ComfyUI(meta))
+                .matches("shared-text")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn unresolved_safety_keeps_novelai_emphasis_but_rejects_templates_and_limits() {
+        assert_eq!(
+            classify_unresolved_input("portrait, {best quality}, (eyes:1.2)"),
+            UnresolvedInputSafety::SearchablePlain
+        );
+        assert_eq!(
+            classify_unresolved_input("{red|blue}"),
+            UnresolvedInputSafety::TemplateSyntax
+        );
+        assert_eq!(
+            classify_unresolved_input("prefix __weather__ suffix"),
+            UnresolvedInputSafety::TemplateSyntax
+        );
+        assert_eq!(
+            classify_unresolved_input(&"plain\n".repeat(MAX_UNRESOLVED_INPUT_LINES + 1)),
+            UnresolvedInputSafety::TooManyLines
+        );
+        assert_eq!(
+            classify_unresolved_input(&"x".repeat(MAX_UNRESOLVED_INPUT_BYTES + 1)),
+            UnresolvedInputSafety::TooLarge
+        );
+    }
+
+    #[test]
+    fn populated_text_is_unresolved_without_class_contract() {
+        let chunks = vec![(
+            "prompt".to_string(),
+            r#"{
+                "1":{"class_type":"CLIPTextEncode","inputs":{"text":["2",0]}},
+                "2":{"class_type":"UnknownWildcardNode","inputs":{"populated_text":"saved-looking-text"}},
+                "3":{"class_type":"KSampler","inputs":{"positive":["1",0]}}
+            }"#
+            .to_string(),
+        )];
+        let Some(AiMetadata::ComfyUI(meta)) = detect_and_parse(&chunks) else {
+            panic!("expected ComfyUI");
+        };
+        assert!(resolved_texts(&meta, ComfyPromptRole::Positive).is_empty());
+        assert!(meta.unresolved_inputs.iter().any(|input| {
+            input.input_key == "populated_text" && input.text == "saved-looking-text"
+        }));
+    }
+
+    #[test]
+    fn unresolved_multi_key_source_never_promotes_text_negative() {
+        let chunks = vec![(
+            "prompt".to_string(),
+            r#"{
+                "1":{"class_type":"CLIPTextEncode","inputs":{"text":["2",0]}},
+                "2":{"class_type":"UnknownPromptNode","inputs":{"text_positive":"good-unresolved","text_negative":"negative-leak"}},
+                "3":{"class_type":"KSampler","inputs":{"positive":["1",0]}}
+            }"#
+            .to_string(),
+        )];
+        let Some(AiMetadata::ComfyUI(meta)) = detect_and_parse(&chunks) else {
+            panic!("expected ComfyUI");
+        };
+        assert!(meta.unresolved_inputs.iter().any(|input| {
+            input.text == "good-unresolved" && input.role == ComfyPromptRole::Positive
+        }));
+        assert!(meta.unresolved_inputs.iter().any(|input| {
+            input.text == "negative-leak" && input.role == ComfyPromptRole::Negative
+        }));
+        let searchable = build_searchable_text(&AiMetadata::ComfyUI(meta));
+        assert!(searchable.contains("good-unresolved"));
+        assert!(!searchable.contains("negative-leak"));
+    }
+
+    #[test]
+    fn existing_nine_comfyui_fixtures_preserve_prompt_counts_and_roles() {
+        let cases = [
+            (
+                "tests/fixtures/ai_metadata/comfyui_basic.png",
+                1,
+                1,
+                "calico cat",
+            ),
+            (
+                "tests/fixtures/ai_metadata/comfyui_nan.png",
+                1,
+                1,
+                "calico cat",
+            ),
+            (
+                "tests/fixtures/ai_metadata/comfyui_infinity.png",
+                1,
+                1,
+                "calico cat",
+            ),
+            (
+                "tests/fixtures/ai_metadata/comfyui_multi_ckpt.png",
+                1,
+                1,
+                "calico cat",
+            ),
+            (
+                "tests/fixtures/ai_metadata/comfyui_unet_loader.png",
+                1,
+                1,
+                "calico cat",
+            ),
+            (
+                "tests/fixtures/sd_parsers_upstream/ComfyUI/img2img_cropped.png",
+                1,
+                1,
+                "victorian woman",
+            ),
+            (
+                "tests/fixtures/sd_parsers_upstream/ComfyUI/night_evening_day_morning_cropped.png",
+                6,
+                2,
+                "night",
+            ),
+            (
+                "tests/fixtures/sd_parsers_upstream/ComfyUI/noisy_latents_3_subjects_cropped.png",
+                6,
+                6,
+                "fennec ears",
+            ),
+            (
+                "tests/fixtures/sd_parsers_upstream/ComfyUI/unclip_2pass_cropped.png",
+                2,
+                2,
+                "waifu",
+            ),
+        ];
+        for (path, positive_count, negative_count, marker) in cases {
+            let meta = comfy_fixture(path);
+            let positive = resolved_texts(&meta, ComfyPromptRole::Positive);
+            let negative = resolved_texts(&meta, ComfyPromptRole::Negative);
+            assert_eq!(positive.len(), positive_count, "{path}: positive count");
+            assert_eq!(negative.len(), negative_count, "{path}: negative count");
+            assert!(
+                positive.iter().any(|text| text.contains(marker)),
+                "{path}: missing marker {marker:?}"
+            );
+            assert!(
+                meta.unresolved_inputs.is_empty(),
+                "{path}: direct literals only"
+            );
+        }
+    }
+
+    #[test]
+    fn unconsumed_chunk_cap_omits_oversized_stored_text() {
+        let oversized = "x".repeat(MAX_UNCONSUMED_SEARCH_CHUNK_BYTES + 1);
+        let chunks = vec![
+            ("Author".to_string(), "small-author".to_string()),
+            ("Comment".to_string(), oversized),
+        ];
+        assert_eq!(build_searchable_from_chunks(&chunks), "small-author");
     }
 
     #[test]
@@ -2795,10 +3402,9 @@ mod tests {
         let AiMetadata::ComfyUI(meta) = result else {
             panic!("expected ComfyUI");
         };
-        assert!(
-            meta.extracted_prompts
-                .contains(&"literal NaN prompt".to_string())
-        );
+        assert!(meta.resolved_prompts.iter().any(|prompt| {
+            prompt.role == ComfyPromptRole::Positive && prompt.text == "literal NaN prompt"
+        }));
         assert_eq!(model_names(&AiMetadata::ComfyUI(meta)), vec!["nan-model"]);
     }
 

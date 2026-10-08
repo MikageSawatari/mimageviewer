@@ -28,6 +28,114 @@ use super::decoder::AudioFrame;
 use super::engine::actor::state_code;
 
 const MAX_STALE_AUDIO_DRAIN_PER_TICK: usize = 256;
+pub(crate) const READY_THRESHOLD_SECS: f64 = 0.10;
+pub(crate) const AUDIO_TRACK_READY_MARGIN_SECS: f64 = 0.50;
+
+#[cfg(windows)]
+static NEXT_LOCAL_DSP_PUMP: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(windows)]
+struct LocalDspControl {
+    pump_instance: u64,
+    epoch: AtomicU64,
+    chain: AudioDspChain,
+    // The ordinary no-stage pump reads only this atomic per block.
+    dsp_armed: AtomicBool,
+    applicable_seen: AtomicBool,
+    #[cfg(test)]
+    test_applicable: AtomicBool,
+    #[cfg(test)]
+    test_handoff_spawn_failure: AtomicBool,
+    #[cfg(test)]
+    test_handoff_attempts: AtomicU64,
+    #[cfg(test)]
+    before_dry_commit: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+#[cfg(windows)]
+impl LocalDspControl {
+    fn has_applicable_stage(&self) -> bool {
+        self.chain.has_applicable_stage() || {
+            #[cfg(test)]
+            {
+                self.test_applicable.load(Ordering::Acquire)
+            }
+            #[cfg(not(test))]
+            {
+                false
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) enum LocalDspHandoffResult {
+    Ready(crate::video::dsp::coordinator::DspHandoff),
+    Cancelled,
+    TimedOut,
+    ResetFailed,
+}
+
+#[cfg(windows)]
+pub(crate) struct LocalDspHandoff {
+    pub request: crate::video::dsp::coordinator::DspRequest,
+    pub coordinator: Arc<crate::video::dsp::coordinator::DspProcessingCoordinator>,
+    pub receiver: std::sync::mpsc::Receiver<LocalDspHandoffResult>,
+}
+
+#[cfg(windows)]
+pub(crate) enum LocalDspHandoffStartError {
+    CoordinatorUnavailable,
+    WorkerSpawnFailed(std::io::Error),
+}
+
+#[cfg(windows)]
+impl std::fmt::Display for LocalDspHandoffStartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CoordinatorUnavailable => write!(f, "DSP coordinator unavailable"),
+            Self::WorkerSpawnFailed(error) => write!(f, "DSP handoff worker spawn failed: {error}"),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn finish_handoff_spawn_failure(
+    control: &LocalDspControl,
+    coordinator: &Arc<crate::video::dsp::coordinator::DspProcessingCoordinator>,
+    request: crate::video::dsp::coordinator::DspRequest,
+    error: std::io::Error,
+) -> LocalDspHandoffStartError {
+    coordinator.cancel(request);
+    control.dsp_armed.store(false, Ordering::Release);
+    LocalDspHandoffStartError::WorkerSpawnFailed(error)
+}
+
+fn duration_ns_u64(duration: std::time::Duration) -> u64 {
+    duration.as_nanos().min(u64::MAX as u128) as u64
+}
+
+fn device_error_category_label(category: u64) -> &'static str {
+    match category {
+        1 => "device_not_available",
+        2 => "backend_specific",
+        _ => "unknown",
+    }
+}
+
+struct FillTiming<'a> {
+    diagnostics: &'a AudioDiagnostics,
+    started_at: Option<std::time::Instant>,
+}
+
+impl Drop for FillTiming<'_> {
+    fn drop(&mut self) {
+        if let Some(started_at) = self.started_at {
+            self.diagnostics
+                .record_fill_duration(duration_ns_u64(started_at.elapsed()));
+        }
+    }
+}
 
 /// 音声出力ストリーム。drop すると `pause` + Stream drop + pump スレッド join を
 /// 順序通りに行い、別動画への切替時に前動画の音声が残らないようにする。
@@ -44,6 +152,7 @@ pub struct AudioOutput {
     /// pump スレッドハンドル。drop で join する。
     pump: Option<std::thread::JoinHandle<()>>,
     pub sample_rate: u32,
+    stream_id: u64,
     /// A/V sync drift 計装用 atomic bundle。`clear_buffer` で `audio_out.buffer_clear` を
     /// emit するために保持する (callback / pump へは spawn 時に Arc clone を渡す)。
     diagnostics: Arc<AudioDiagnostics>,
@@ -51,13 +160,23 @@ pub struct AudioOutput {
     /// producer は常に audio-pump であり、session は [`AudioTapLease`] を所有する。
     #[allow(dead_code)] // 増分 5 で streaming session から接続する。
     audio_tap: AudioTapController,
+    #[cfg(windows)]
+    dsp_control: Option<Arc<LocalDspControl>>,
 }
 
 impl AudioOutput {
+    #[cfg(feature = "test-script")]
+    pub(crate) fn test_script_processed_frequency_hz(&self) -> Option<f64> {
+        // Snapshot sampling must not wait for the audio callback or pump on the UI thread.
+        self.buffer.try_lock().ok()?.last_processed_frequency_hz
+    }
+
     #[cfg(test)]
     pub(crate) fn connected_without_output_for_test(sample_rate: u32) -> Self {
         let buffer = Arc::new(Mutex::new(AudioBuffer {
             processed: std::collections::VecDeque::new(),
+            #[cfg(feature = "test-script")]
+            last_processed_frequency_hz: None,
             drain_offset_in_first: 0,
             raw_pending: std::collections::VecDeque::new(),
             next_pts_secs: 0.0,
@@ -79,18 +198,347 @@ impl AudioOutput {
             shutdown_tx,
             pump: None,
             sample_rate,
+            stream_id: 0,
             diagnostics: Arc::new(AudioDiagnostics::new(std::time::Instant::now())),
             audio_tap: AudioTapController {
                 command_tx,
                 next_owner_id: Arc::new(AtomicU64::new(1)),
             },
+            #[cfg(windows)]
+            dsp_control: None,
         }
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn with_dsp_chain_for_test(
+        mut self,
+        chain: AudioDspChain,
+        applicable: bool,
+    ) -> Self {
+        self.dsp_control = Some(Arc::new(LocalDspControl {
+            pump_instance: NEXT_LOCAL_DSP_PUMP.fetch_add(1, Ordering::Relaxed),
+            epoch: AtomicU64::new(0),
+            chain,
+            dsp_armed: AtomicBool::new(false),
+            applicable_seen: AtomicBool::new(false),
+            test_applicable: AtomicBool::new(applicable),
+            test_handoff_spawn_failure: AtomicBool::new(false),
+            test_handoff_attempts: AtomicU64::new(0),
+            before_dry_commit: None,
+        }));
+        self
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn set_dsp_applicable_for_test(&self, applicable: bool) {
+        self.dsp_control
+            .as_ref()
+            .unwrap()
+            .test_applicable
+            .store(applicable, Ordering::Release);
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn set_handoff_spawn_failure_for_test(&self, fail: bool) {
+        self.dsp_control
+            .as_ref()
+            .unwrap()
+            .test_handoff_spawn_failure
+            .store(fail, Ordering::Release);
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn handoff_attempts_for_test(&self) -> u64 {
+        self.dsp_control
+            .as_ref()
+            .unwrap()
+            .test_handoff_attempts
+            .load(Ordering::Acquire)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn has_applicable_dsp(&self) -> bool {
+        self.dsp_control
+            .as_ref()
+            .is_some_and(|control| control.has_applicable_stage())
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn newly_applicable_dsp(&self) -> bool {
+        self.dsp_control.as_ref().is_some_and(|control| {
+            let applicable = control.has_applicable_stage();
+            if !applicable {
+                control.applicable_seen.store(false, Ordering::Release);
+                if control.dsp_armed.swap(false, Ordering::AcqRel) {
+                    control
+                        .chain
+                        .coordinator
+                        .revoke_local(control.pump_instance);
+                }
+            }
+            applicable && !control.applicable_seen.load(Ordering::Acquire)
+        })
+    }
+
+    #[cfg(windows)]
+    /// The activation was reserved or ended with a terminal start error.
+    /// A later inactive observation or explicit play request permits another attempt.
+    pub(crate) fn note_dsp_activation_handled(&self) {
+        if let Some(control) = self.dsp_control.as_ref() {
+            control.applicable_seen.store(true, Ordering::Release);
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn note_dsp_acquisition_not_started(&self) {
+        if let Some(control) = self.dsp_control.as_ref() {
+            control.applicable_seen.store(false, Ordering::Release);
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn has_dsp_token(&self) -> bool {
+        self.dsp_control.as_ref().is_some_and(|control| {
+            control
+                .chain
+                .coordinator
+                .local_has_token(control.pump_instance)
+        })
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn local_dry_resume_allowed(&self) -> bool {
+        self.dsp_control
+            .as_ref()
+            .is_none_or(|control| control.chain.coordinator.local_dry_resume_allowed())
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn request_dsp_handoff(
+        &self,
+        ui_wake: Arc<super::VideoUiWake>,
+    ) -> Result<LocalDspHandoff, LocalDspHandoffStartError> {
+        use crate::video::dsp::coordinator::{DspOwner, HandoffWaitError};
+        let control = self
+            .dsp_control
+            .as_ref()
+            .ok_or(LocalDspHandoffStartError::CoordinatorUnavailable)?
+            .clone();
+        #[cfg(test)]
+        control.test_handoff_attempts.fetch_add(1, Ordering::AcqRel);
+        control.dsp_armed.store(true, Ordering::Release);
+        let epoch = control.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        let coordinator = Arc::clone(&control.chain.coordinator);
+        let Some(request) = coordinator.reserve(DspOwner::Local {
+            pump_instance: control.pump_instance,
+            epoch,
+        }) else {
+            control.dsp_armed.store(false, Ordering::Release);
+            return Err(LocalDspHandoffStartError::CoordinatorUnavailable);
+        };
+        #[cfg(test)]
+        if control.test_handoff_spawn_failure.load(Ordering::Acquire) {
+            return Err(finish_handoff_spawn_failure(
+                &control,
+                &coordinator,
+                request,
+                std::io::Error::other("injected handoff worker spawn failure"),
+            ));
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let cancel = Arc::clone(&self.cancel);
+        let coordinator_worker = Arc::clone(&coordinator);
+        let worker_control = Arc::clone(&control);
+        let spawn = std::thread::Builder::new()
+            .name("local-dsp-handoff".into())
+            .spawn(move || {
+                let outcome = match coordinator_worker.wait_handoff(
+                    request,
+                    std::time::Instant::now() + std::time::Duration::from_secs(2),
+                    &cancel,
+                ) {
+                    Ok(handoff) => {
+                        let user_failure = worker_control
+                            .chain
+                            .user
+                            .as_ref()
+                            .filter(|bridge| {
+                                !cancel.load(Ordering::Acquire)
+                                    && coordinator_worker.is_desired(request)
+                                    && bridge.is_enabled()
+                                    && bridge.active_slot_count() > 0
+                            })
+                            .and_then(|bridge| {
+                                trace_handoff_reset(
+                                    bridge,
+                                    worker_control.pump_instance,
+                                    "user_vst",
+                                )
+                                .err()
+                                .map(|error| (bridge, error))
+                            });
+                        let still_desired = || {
+                            !cancel.load(Ordering::Acquire)
+                                && coordinator_worker.is_desired(request)
+                        };
+                        if !still_desired() {
+                            LocalDspHandoffResult::Cancelled
+                        } else {
+                            let effetune_failure =
+                                worker_control.chain.effetune.snapshot().and_then(
+                                    |(generation, bridge)| {
+                                        trace_handoff_reset(
+                                            &bridge,
+                                            worker_control.pump_instance,
+                                            "effetune",
+                                        )
+                                        .err()
+                                        .map(|error| (generation, error))
+                                    },
+                                );
+                            if !still_desired() {
+                                LocalDspHandoffResult::Cancelled
+                            } else if user_failure.is_some() || effetune_failure.is_some() {
+                                if let Some((bridge, error)) = user_failure {
+                                    bridge.disable_with_reason(Some(format!(
+                                        "handoff reset: {error}"
+                                    )));
+                                }
+                                if let Some((generation, error)) = effetune_failure {
+                                    worker_control.chain.effetune.report_failure_once(
+                                        generation,
+                                        crate::effetune::EffetuneFailure::ProcessFailed(format!(
+                                            "handoff reset: {error}"
+                                        )),
+                                    );
+                                }
+                                LocalDspHandoffResult::ResetFailed
+                            } else {
+                                LocalDspHandoffResult::Ready(handoff)
+                            }
+                        }
+                    }
+                    Err(HandoffWaitError::Cancelled) => LocalDspHandoffResult::Cancelled,
+                    Err(HandoffWaitError::TimedOut) => LocalDspHandoffResult::TimedOut,
+                };
+                let _ = sender.send(outcome);
+                ui_wake.wake();
+            });
+        if let Err(error) = spawn {
+            return Err(finish_handoff_spawn_failure(
+                &control,
+                &coordinator,
+                request,
+                error,
+            ));
+        }
+        Ok(LocalDspHandoff {
+            request,
+            coordinator,
+            receiver,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pumping_without_device_for_test(
+        sample_rate: u32,
+        rx: Receiver<AudioFrame>,
+        clock: Arc<AvClock>,
+        engine_event_tx: crate::video::EngineEventSender,
+        engine_state: Arc<AtomicU8>,
+    ) -> Self {
+        let mut output = Self::connected_without_output_for_test(sample_rate);
+        let (shutdown_tx, shutdown_rx) = bounded(1);
+        let (tap_tx, tap_rx) = unbounded();
+        output.shutdown_tx = shutdown_tx;
+        output.audio_tap.command_tx = tap_tx;
+        let buffer = Arc::clone(&output.buffer);
+        let cancel = Arc::clone(&output.cancel);
+        let diagnostics = Arc::clone(&output.diagnostics);
+        output.pump = Some(std::thread::spawn(move || {
+            run_pump(
+                rx,
+                shutdown_rx,
+                buffer,
+                cancel,
+                clock,
+                engine_event_tx,
+                engine_state,
+                diagnostics,
+                tap_rx,
+                #[cfg(windows)]
+                None,
+                #[cfg(windows)]
+                None,
+            );
+        }));
+        output
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fill_without_device_for_test(
+        &self,
+        clock: &Arc<AvClock>,
+        engine_state: &Arc<AtomicU8>,
+    ) -> (bool, Option<f64>) {
+        let before = self
+            .diagnostics
+            .audio_audible_pts_bits
+            .load(Ordering::Acquire);
+        let mut samples = [0.0_f32; 960];
+        fill_output(
+            &mut samples,
+            &self.buffer,
+            clock,
+            engine_state,
+            &self.diagnostics,
+            None,
+        );
+        let after = self
+            .diagnostics
+            .audio_audible_pts_bits
+            .load(Ordering::Acquire);
+        (
+            samples.iter().any(|sample| sample.abs() > 1e-4),
+            (after != before).then(|| f64::from_bits(after)),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fill_samples_without_device_for_test(
+        &self,
+        samples: &mut [f32],
+        clock: &Arc<AvClock>,
+        engine_state: &Arc<AtomicU8>,
+    ) -> (usize, Option<f64>) {
+        let before = self.diagnostics.output_frames_total.load(Ordering::Acquire);
+        fill_output(
+            samples,
+            &self.buffer,
+            clock,
+            engine_state,
+            &self.diagnostics,
+            None,
+        );
+        let consumed = self.diagnostics.output_frames_total.load(Ordering::Acquire) - before;
+        let pts = (consumed > 0).then(|| {
+            f64::from_bits(
+                self.diagnostics
+                    .audio_audible_pts_bits
+                    .load(Ordering::Acquire),
+            )
+        });
+        (consumed as usize, pts)
     }
 
     pub fn pause_stream(&self) {
         if let Some(stream) = self.stream.as_ref() {
             let _ = stream.pause();
         }
+    }
+
+    pub(crate) fn stream_id(&self) -> Option<u64> {
+        (self.stream_id != 0).then_some(self.stream_id)
     }
 
     pub fn clear_buffer(&self, clock: &AvClock) {
@@ -120,6 +568,10 @@ impl AudioOutput {
                 ));
             }
             buf.processed.clear();
+            #[cfg(feature = "test-script")]
+            {
+                buf.last_processed_frequency_hz = None;
+            }
             buf.raw_pending.clear();
             buf.drain_offset_in_first = 0;
             buf.next_pts_secs = clock.now_secs();
@@ -179,10 +631,21 @@ pub fn warm_up_default_output_device() {
                 return;
             };
             let config = supported.config();
+            let error_count = Arc::new(AtomicU64::new(0));
+            let error_category = Arc::new(AtomicU64::new(0));
+            let error_count_callback = Arc::clone(&error_count);
+            let error_category_callback = Arc::clone(&error_category);
             let Ok(stream) = device.build_output_stream(
                 &config,
                 |out: &mut [f32], _: &cpal::OutputCallbackInfo| out.fill(0.0),
-                |err| crate::logger::log(format!("cpal warm-up stream error: {err}")),
+                move |err| {
+                    let category = match err {
+                        cpal::StreamError::DeviceNotAvailable => 1,
+                        cpal::StreamError::BackendSpecific { .. } => 2,
+                    };
+                    error_category_callback.store(category, Ordering::Relaxed);
+                    error_count_callback.fetch_add(1, Ordering::Relaxed);
+                },
                 None,
             ) else {
                 crate::logger::log(
@@ -198,6 +661,13 @@ pub fn warm_up_default_output_device() {
             }
             std::thread::sleep(std::time::Duration::from_millis(150));
             let _ = stream.pause();
+            let errors = error_count.load(Ordering::Relaxed);
+            if errors > 0 {
+                crate::logger::log(format!(
+                    "cpal warm-up stream error: category={} count={errors}",
+                    device_error_category_label(error_category.load(Ordering::Relaxed))
+                ));
+            }
             crate::logger::log(format!(
                 "[startup] cpal warm-up done ms={:.1}",
                 started.elapsed().as_secs_f64() * 1000.0
@@ -209,12 +679,50 @@ impl Drop for AudioOutput {
     fn drop(&mut self) {
         // 1. pump 停止指示
         self.cancel.store(true, Ordering::Release);
+        #[cfg(windows)]
+        if let Some(control) = &self.dsp_control {
+            control
+                .chain
+                .coordinator
+                .end_local_pump(control.pump_instance);
+        }
         let _ = self.shutdown_tx.try_send(());
         // 2. Stream を pause して直ちに新規 callback を停止 → drop で完全終了
         if let Some(stream) = self.stream.take() {
             use cpal::traits::StreamTrait;
             let _ = stream.pause();
             drop(stream);
+        }
+        if self.stream_id != 0 && crate::perf::is_enabled() {
+            crate::perf::event(
+                "audio_out",
+                "stream_end",
+                None,
+                0,
+                &[
+                    ("stream_id", serde_json::Value::from(self.stream_id)),
+                    (
+                        "callback_count",
+                        serde_json::Value::from(
+                            self.diagnostics.callback_count.load(Ordering::Acquire),
+                        ),
+                    ),
+                    (
+                        "device_error_count",
+                        serde_json::Value::from(
+                            self.diagnostics.device_error_count.load(Ordering::Acquire),
+                        ),
+                    ),
+                    (
+                        "device_error_category",
+                        serde_json::Value::from(device_error_category_label(
+                            self.diagnostics
+                                .device_error_category
+                                .load(Ordering::Acquire),
+                        )),
+                    ),
+                ],
+            );
         }
         // 3. pump を join。通常は cancel + shutdown signal で 100ms 以内に終了するが、
         //    decoder/engine 側の back-pressure デッドロック等で pump が動けないと join が
@@ -223,10 +731,21 @@ impl Drop for AudioOutput {
         //    付け替え、Drop は即時返す。万一 pump が exit しなくても thread は単に
         //    残るだけで UI には影響しない。
         if let Some(p) = self.pump.take() {
+            #[cfg(windows)]
+            let retirement = self.dsp_control.as_ref().map(|control| {
+                (
+                    Arc::clone(&control.chain.coordinator),
+                    control.pump_instance,
+                )
+            });
             let _ = std::thread::Builder::new()
                 .name("audio-output-drop-join".to_string())
                 .spawn(move || {
                     let _ = p.join();
+                    #[cfg(windows)]
+                    if let Some((coordinator, pump_instance)) = retirement {
+                        coordinator.retire_local(pump_instance);
+                    }
                 });
         }
     }
@@ -247,7 +766,9 @@ pub(crate) struct ProcessedChunk {
     pub(crate) samples: Vec<f32>,
     /// **audible PTS** = この chunk の最初のサンプルが「実際にスピーカーから聞こえる」
     /// PTS (秒)。`input_pts - pdc_latency_at_process` で計算。video clock 同期に使う。
-    /// mIV Remote の AAC input PTS にもこの source timeline 値を使う。
+    /// mIV Remote の AAC input PTS にもこの source timeline 値を使う。remote では
+    /// 適用した合計 latency が chunk 間で変わった場合に重複 sample の除去または無音の挿入を行い、
+    /// 最初に残る sample の PTS に補正してから AAC に渡す。
     pub(crate) audible_pts_secs: f64,
     /// chunk の音声時間 (秒) = `samples.len() / samples_per_sec`。
     /// BufferReady 判定や processed cap 比較で再計算を避けるためキャッシュ。
@@ -260,8 +781,40 @@ pub(crate) struct ProcessedChunk {
     /// VST / safety limiter / stretcher を含む処理時点の合計 latency (source 秒)。
     /// 後続 chunk と差があれば video clock jump で吸収
     /// (旧 `pdc_latency_secs_applied` 比較ロジックを chunk 単位に分離)。
-    /// mIV Remote は tap metadata の有限性も AAC input 前に検証する。
+    /// mIV Remote は latency 変化時に sample/PTS を補正してもこの処理時点の値を保ち、
+    /// AAC input 前に metadata の有限性も検証する。
     pub(crate) pdc_latency_secs_at_process: f64,
+    /// EffeTune slot generation actually applied to this chunk.
+    pub(crate) effetune_generation: Option<u64>,
+}
+
+/// Estimate the actual post-processing tone from positive zero crossings of one
+/// stereo channel. Crossing interpolation avoids the large one-period rounding
+/// error on short AAC chunks. This observation never enters production builds.
+#[cfg(feature = "test-script")]
+fn estimate_processed_frequency_hz(samples: &[f32], sample_rate: u32) -> Option<f64> {
+    let mut previous = *samples.first()?;
+    let mut first_crossing = None;
+    let mut last_crossing = None;
+    let mut crossings = 0_u32;
+    let mut peak = previous.abs();
+    for (frame, pair) in samples.chunks_exact(2).enumerate().skip(1) {
+        let current = pair[0];
+        peak = peak.max(current.abs());
+        if previous < 0.0 && current >= 0.0 {
+            let fraction = -f64::from(previous) / f64::from(current - previous);
+            let position = (frame - 1) as f64 + fraction;
+            first_crossing.get_or_insert(position);
+            last_crossing = Some(position);
+            crossings += 1;
+        }
+        previous = current;
+    }
+    if peak < 1e-4 || crossings < 2 {
+        return None;
+    }
+    let span = last_crossing? - first_crossing?;
+    (span > 0.0).then_some((crossings - 1) as f64 * f64::from(sample_rate) / span)
 }
 
 #[derive(Clone)]
@@ -411,6 +964,9 @@ struct AudioBuffer {
     /// post-VST 処理済 chunk queue。fill_output が `drain_offset_in_first` を進めて
     /// drain。chunk が空になったら pop_front + drain_offset_in_first=0 にリセット。
     processed: std::collections::VecDeque<ProcessedChunk>,
+    /// Last chunk admitted to the output queue. Test-script only; reset at every seek/clear.
+    #[cfg(feature = "test-script")]
+    last_processed_frequency_hz: Option<f64>,
     /// `processed.front()` 内の **次に drain されるサンプルの index** (= interleaved stereo)。
     /// fill_output が advance、chunk fully drain で 0 にリセット + pop_front。
     drain_offset_in_first: usize,
@@ -498,7 +1054,7 @@ fn drain_stale_audio_rx(
     result
 }
 
-const SAFETY_LIMITER_LOOKAHEAD_SECS: f64 = 0.005;
+pub(crate) const SAFETY_LIMITER_LOOKAHEAD_SECS: f64 = 0.005;
 const SAFETY_LIMITER_RELEASE_SECS: f64 = 0.100;
 /// セーフティリミッターが信号を抑え込む上限。0 dBFS = フルスケール = 波形表現の上限
 /// そのもの。これを超えた分だけゲインを下げて hard clip を防ぐ。視聴用の保護なので
@@ -514,12 +1070,12 @@ const SAFETY_LIMITER_INDICATOR_GR_DB: f32 = 1.0;
 /// normalize gain の変更を dB 空間でならす時間。仮 gain → 確定 gain の段差を隠す。
 const NORMALIZE_GAIN_RAMP_SECS: f64 = 4.0;
 
-/// VST3 チェーン後段と 0dB 超の手動音量 boost の保険用 lookahead limiter。
+/// 最終出力の保護と、任意の EffeTune 入力制限に使う lookahead limiter。
 ///
 /// ユーザーがチェーン末尾に limiter を入れていない場合でも、過大出力が WASAPI /
 /// OS mixer 側で hard clip するのを避けるための最終安全網。制作向け limiter ではなく
-/// 視聴用の保護なので、パラメータは固定し、VST3 チェーンまたは手動 boost が active の
-/// ときだけ動かす。
+/// 視聴用の保護なのでパラメータは固定。最終段は常時適用し、音量や段の有無による
+/// delay-line reset / PDC 切替を起こさない。EffeTune 前段は別 instance の任意設定。
 pub(crate) struct SafetyLimiter {
     channels: usize,
     lookahead_frames: usize,
@@ -577,6 +1133,18 @@ impl SafetyLimiter {
     /// 内部信号に作用するので、戻り値は「内部チェーンが 0 dBFS をどれだけ超えたか」を
     /// そのまま表す。
     pub(crate) fn process_block(&mut self, samples: &mut [f32]) -> bool {
+        self.process_block_with_mix(samples, &mut 1.0, 1.0, 0.0)
+    }
+
+    /// Mix limited and raw samples from the SAME delay line. The final limiter
+    /// always uses mix=1; only the EffeTune input stage ramps this value.
+    fn process_block_with_mix(
+        &mut self,
+        samples: &mut [f32],
+        mix: &mut f32,
+        target: f32,
+        step: f32,
+    ) -> bool {
         if samples.is_empty() || self.channels == 0 {
             return false;
         }
@@ -611,12 +1179,282 @@ impl SafetyLimiter {
                 self.gain = target_gain + (self.gain - target_gain) * self.release_coeff;
             }
 
+            *mix += (target - *mix).clamp(-step, step);
             for (ch, &d) in self.delayed_frame.iter().enumerate() {
-                samples[in_base + ch] = (d * self.gain).clamp(-self.ceiling, self.ceiling);
+                let limited = (d * self.gain).clamp(-self.ceiling, self.ceiling);
+                samples[in_base + ch] = if *mix >= 1.0 {
+                    limited
+                } else if *mix <= 0.0 {
+                    d
+                } else {
+                    d + (limited - d) * *mix
+                };
             }
             self.write_frame = (self.write_frame + 1) % self.lookahead_frames;
         }
         min_target_gain <= self.indicator_gain_threshold
+    }
+}
+
+/// Owns the fixed EffeTune input delay and live wet/dry ramp. Preserve the user-chain buffer so
+/// a failed EffeTune block can fall back without either limiting or added latency.
+pub(crate) struct EffetuneInputLimiter {
+    limiter: SafetyLimiter,
+    samples: Vec<f32>,
+    generation: Option<u64>,
+    mix: f32,
+}
+
+impl EffetuneInputLimiter {
+    pub(crate) fn new(sample_rate: u32) -> Self {
+        Self {
+            limiter: SafetyLimiter::new(sample_rate, 2),
+            samples: Vec::new(),
+            generation: None,
+            mix: 1.0,
+        }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.limiter.reset();
+        self.generation = None;
+    }
+
+    pub(crate) fn prepare<'a>(
+        &'a mut self,
+        input: &'a [f32],
+        generation: u64,
+        enabled: bool,
+    ) -> (&'a [f32], f64) {
+        if self.generation != Some(generation) {
+            self.reset();
+            self.generation = Some(generation);
+            self.mix = if enabled { 1.0 } else { 0.0 };
+        }
+        self.samples.clear();
+        self.samples.extend_from_slice(input);
+        // The HUD indicator continues to describe the final output limiter only.
+        // Keep peak/gain history warm while bypassed. Ramp over the same 5ms
+        // interval as lookahead, per frame (both channels share one mix).
+        self.limiter.process_block_with_mix(
+            &mut self.samples,
+            &mut self.mix,
+            if enabled { 1.0 } else { 0.0 },
+            1.0 / self.limiter.lookahead_frames as f32,
+        );
+        (&self.samples, self.limiter.latency_secs())
+    }
+}
+
+#[cfg(windows)]
+fn trace_handoff_reset(
+    bridge: &super::dsp::DspBridge,
+    pump_instance: u64,
+    stage: &str,
+) -> Result<(), String> {
+    let result = bridge.try_reset_plugins_sync();
+    let fields = [
+        ("pump_instance", serde_json::Value::from(pump_instance)),
+        ("stage", serde_json::Value::from(stage)),
+        (
+            "latency_frames",
+            serde_json::Value::from(bridge.total_latency_samples()),
+        ),
+        ("acknowledged", serde_json::Value::from(result.is_ok())),
+    ];
+    crate::logger::log(format!(
+        "[audio-dsp] handoff_reset: pump_instance={pump_instance} stage={stage} latency_frames={} acknowledged={}",
+        bridge.total_latency_samples(),
+        result.is_ok()
+    ));
+    if crate::perf::is_enabled() {
+        crate::perf::event("audio_dsp", "handoff_reset", None, 0, &fields);
+    }
+    result
+}
+
+/// Worker-owned diagnostics; never changes transport or DSP state.
+#[derive(Default)]
+struct AudioEpochTrace {
+    serial: u64,
+    first_non_silent: [bool; 4],
+    drained_frames: usize,
+}
+
+impl AudioEpochTrace {
+    fn first(&mut self, stage: usize, samples: &[f32], pts: f64, source_rate: f64, rate: u32) {
+        if self.first_non_silent[stage] {
+            return;
+        }
+        if let Some(index) = samples.iter().position(|sample| sample.abs() > 1e-6) {
+            self.first_non_silent[stage] = true;
+            audio_epoch_event(
+                "first_non_silent",
+                self.serial,
+                &[
+                    (
+                        "stage",
+                        serde_json::Value::from(
+                            ["decoded", "user_vst", "effetune", "prepared_output"][stage],
+                        ),
+                    ),
+                    (
+                        "pts",
+                        serde_json::Value::from(
+                            pts + (index / 2) as f64 / rate as f64 * source_rate,
+                        ),
+                    ),
+                    ("sample_rate", serde_json::Value::from(rate)),
+                ],
+            );
+        }
+    }
+}
+
+fn audio_epoch_event(name: &str, serial: u64, fields: &[(&str, serde_json::Value)]) {
+    crate::logger::log(format!(
+        "[audio-epoch] {name}: serial={serial} {}",
+        fields
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    ));
+    if crate::perf::is_enabled() {
+        let mut fields = fields.to_vec();
+        fields.push(("seek_serial", serde_json::Value::from(serial)));
+        crate::perf::event("audio_epoch", name, None, 0, &fields);
+    }
+}
+
+/// Only normal EOS drains these delays. Seek/stop discard the owner along with
+/// the limiter state. Metadata is captured before trimming/reconciliation so a
+/// short last block can still release its held audio with the original PDC.
+#[derive(Default)]
+pub(crate) enum AudioDspTail {
+    #[default]
+    Empty,
+    Armed(AudioDspTailPlan),
+    Draining(AudioDspTailPlan),
+}
+
+pub(crate) struct AudioDspTailPlan {
+    chunk: ProcessedChunk,
+    upstream_frames: usize,
+    effetune_frames: usize,
+    final_frames: usize,
+    gain: f32,
+}
+
+impl AudioDspTail {
+    pub(crate) fn capture(
+        &mut self,
+        chunk: &ProcessedChunk,
+        effetune_frames: usize,
+        pre_frames: usize,
+        final_frames: usize,
+        gain: f32,
+    ) {
+        let metadata = ProcessedChunk {
+            samples: Vec::new(),
+            audible_pts_secs: chunk.audible_pts_secs
+                + chunk.duration_secs * chunk.source_secs_per_output_sec,
+            duration_secs: 0.0,
+            source_secs_per_output_sec: chunk.source_secs_per_output_sec,
+            seek_serial: chunk.seek_serial,
+            pdc_latency_secs_at_process: chunk.pdc_latency_secs_at_process,
+            effetune_generation: chunk.effetune_generation,
+        };
+        *self = Self::Armed(AudioDspTailPlan {
+            chunk: metadata,
+            upstream_frames: effetune_frames + pre_frames,
+            effetune_frames,
+            final_frames,
+            gain,
+        });
+    }
+
+    pub(crate) fn start(&mut self, serial: u64) {
+        let previous = std::mem::take(self);
+        *self = match previous {
+            Self::Armed(plan) if plan.chunk.seek_serial == serial => Self::Draining(plan),
+            Self::Draining(plan) if plan.chunk.seek_serial == serial => Self::Draining(plan),
+            _ => Self::Empty,
+        };
+    }
+
+    pub(crate) fn complete(&self) -> bool {
+        match self {
+            Self::Empty => true,
+            Self::Draining(plan) => plan.upstream_frames == 0 && plan.final_frames == 0,
+            Self::Armed(_) => false,
+        }
+    }
+
+    fn discard_stale(&mut self, serial: u64) {
+        if matches!(self, Self::Armed(plan) | Self::Draining(plan) if plan.chunk.seek_serial != serial)
+        {
+            *self = Self::Empty;
+        }
+    }
+
+    pub(crate) fn next(
+        &mut self,
+        sample_rate: u32,
+        pre: &mut EffetuneInputLimiter,
+        final_limiter: &mut SafetyLimiter,
+        pre_enabled: bool,
+        mut process_effetune: impl FnMut(u64, usize, &[f32], &mut [f32]) -> bool,
+        mut ceiling_hit: impl FnMut(),
+    ) -> Option<ProcessedChunk> {
+        let Self::Draining(plan) = self else {
+            return None;
+        };
+        // Match ordinary small audio blocks; one bridge deadline must never cover
+        // the whole admitted (up to two seconds) plugin delay.
+        let block_frames = (sample_rate as usize / 100).max(1);
+        let mut samples;
+        if plan.upstream_frames > 0 {
+            let frames = plan.upstream_frames.min(block_frames);
+            let zeros = vec![0.0; frames * 2];
+            let generation = plan
+                .chunk
+                .effetune_generation
+                .expect("upstream tail has an EffeTune stage");
+            let (input, _) = pre.prepare(&zeros, generation, pre_enabled);
+            samples = vec![0.0; zeros.len()];
+            if process_effetune(generation, plan.effetune_frames, input, &mut samples) {
+                plan.upstream_frames -= frames;
+                if plan.gain > 1.0 {
+                    for sample in &mut samples {
+                        *sample *= plan.gain;
+                    }
+                }
+            } else {
+                // A disabled/replaced/failed stage cannot receive old-generation
+                // audio. Retain only the final limiter's already processed tail.
+                pre.reset();
+                plan.upstream_frames = 0;
+                let frames = plan.final_frames.min(block_frames);
+                plan.final_frames -= frames;
+                samples = vec![0.0; frames * 2];
+            }
+        } else {
+            let frames = plan.final_frames.min(block_frames);
+            plan.final_frames -= frames;
+            samples = vec![0.0; frames * 2];
+        }
+        if samples.is_empty() {
+            return None;
+        }
+        if final_limiter.process_block(&mut samples) {
+            ceiling_hit();
+        }
+        let mut chunk = plan.chunk.clone();
+        chunk.samples = samples;
+        chunk.duration_secs = chunk.samples.len() as f64 / (sample_rate as f64 * 2.0);
+        plan.chunk.audible_pts_secs += chunk.duration_secs * chunk.source_secs_per_output_sec;
+        Some(chunk)
     }
 }
 
@@ -663,8 +1501,8 @@ impl NormalizeGainRamp {
         self.remaining_frames = 0;
     }
 
-    /// `samples` に現在の ramp gain を掛け、block 内の最大 normalize gain を返す。
-    fn apply_to_samples(&mut self, samples: &mut [f32], target_linear: f32) -> f32 {
+    /// `samples` に現在の ramp gain を掛ける。
+    fn apply_to_samples(&mut self, samples: &mut [f32], target_linear: f32) {
         let requested_db = normalize_linear_to_db(target_linear);
         if (requested_db - self.target_db).abs() > 0.001 {
             self.target_db = requested_db;
@@ -674,21 +1512,19 @@ impl NormalizeGainRamp {
         }
 
         if samples.is_empty() {
-            return normalize_db_to_linear(self.current_db);
+            return;
         }
 
         let frames = samples.len() / self.channels;
-        let mut max_gain = 0.0_f32;
         if self.remaining_frames == 0 {
             self.current_db = self.target_db;
             let gain = normalize_db_to_linear(self.current_db);
-            max_gain = gain;
             if (gain - 1.0).abs() > f32::EPSILON {
                 for s in samples {
                     *s *= gain;
                 }
             }
-            return max_gain;
+            return;
         }
 
         for frame in 0..frames {
@@ -701,7 +1537,6 @@ impl NormalizeGainRamp {
                 }
             }
             let gain = normalize_db_to_linear(self.current_db);
-            max_gain = max_gain.max(gain);
             if (gain - 1.0).abs() > f32::EPSILON {
                 let base = frame * self.channels;
                 for ch in 0..self.channels {
@@ -716,12 +1551,10 @@ impl NormalizeGainRamp {
         let tail_start = frames * self.channels;
         if tail_start < samples.len() {
             let gain = normalize_db_to_linear(self.current_db);
-            max_gain = max_gain.max(gain);
             for s in &mut samples[tail_start..] {
                 *s *= gain;
             }
         }
-        max_gain
     }
 
     #[cfg(test)]
@@ -749,16 +1582,14 @@ fn normalize_db_to_linear(db: f32) -> f32 {
 /// output/wall 秒で測った DSP latency を source timeline 秒へ写し、先頭 sample の
 /// audible PTS を返す。time stretch、VST PDC、safety limiter の latency はすべて
 /// output 側で加算されるため、変速率を掛けてから source PTS から引く。
+/// 負の PTS も pre-target trim まで保持し、0 秒開始時の delay-line silence を除く。
 fn audible_pts_after_latency(
     input_pts_secs: f64,
     latency_output_secs: f64,
     source_secs_per_output_sec: f64,
 ) -> (f64, f64) {
     let latency_source_secs = latency_output_secs * source_secs_per_output_sec;
-    (
-        (input_pts_secs - latency_source_secs).max(0.0),
-        latency_source_secs,
-    )
+    (input_pts_secs - latency_source_secs, latency_source_secs)
 }
 
 /// 既定音声出力デバイスのサンプルレートを取得する (実際にはストリームは開かない)。
@@ -774,6 +1605,27 @@ pub fn default_output_sample_rate() -> Option<u32> {
     Some(cfg.sample_rate().0)
 }
 
+#[cfg(windows)]
+#[derive(Clone)]
+pub struct AudioDspChain {
+    pub user: Option<Arc<crate::video::dsp::DspBridge>>,
+    pub effetune: Arc<crate::effetune::EffetuneAudioSlot>,
+    pub coordinator: Arc<crate::video::dsp::coordinator::DspProcessingCoordinator>,
+}
+
+#[cfg(windows)]
+impl AudioDspChain {
+    fn has_applicable_stage(&self) -> bool {
+        self.user
+            .as_ref()
+            .is_some_and(|bridge| bridge.is_enabled() && bridge.active_slot_count() > 0)
+            || self
+                .effetune
+                .snapshot()
+                .is_some_and(|(_, bridge)| bridge.is_enabled() && bridge.active_slot_count() > 0)
+    }
+}
+
 /// 音声出力ストリームを開く。デフォルトデバイスを使う。
 ///
 /// `audio_rx` がドロップされると pump スレッドは終了するが、cpal Stream は無音で
@@ -784,16 +1636,15 @@ pub fn default_output_sample_rate() -> Option<u32> {
 /// emit する。EngineActor が Buffering → Playing に遷移するためのトリガ。
 /// 旧 Phase 3d の「1 度だけ emit」では Loading 中に届いた event が latch reset
 /// で消える race があったため、Phase 8.K で level 化した。
-/// 音声出力ストリームを起動する。`dsp_bridge` を渡すと audio-pump で VST3 プラグイン
-/// 処理 (チェーン) を挿入する。`is_enabled()=true` かつアクティブスロット
-/// (= bypass=false の Loaded スロット) が 1 個以上のときのみ実行され、それ以外はパススルー。
+/// 音声出力ストリームを起動する。`dsp_chain` はユーザー VST3 を先に、EffeTune を後に
+/// 適用する。EffeTune の共有スロットは各ブロックで 1 回だけ読む。
 pub(crate) fn start(
     audio_rx: Receiver<AudioFrame>,
     clock: Arc<AvClock>,
     engine_event_tx: crate::video::EngineEventSender,
     engine_state: Arc<AtomicU8>,
     diagnostics: Arc<AudioDiagnostics>,
-    #[cfg(windows)] dsp_bridge: Option<std::sync::Arc<crate::video::dsp::DspBridge>>,
+    #[cfg(windows)] dsp_chain: Option<AudioDspChain>,
 ) -> Result<AudioOutput, String> {
     let host = cpal::default_host();
     let device = host
@@ -804,6 +1655,17 @@ pub(crate) fn start(
         .map_err(|e| format!("default_output_config: {e}"))?;
     let sample_rate = supported.sample_rate().0;
     let device_default_channels = supported.channels();
+    let device_name = device.name().unwrap_or_else(|_| "unknown".to_owned());
+    let diagnostics_enabled = crate::perf::is_enabled();
+    #[cfg(windows)]
+    let (vst_enabled, vst_active_slots) = dsp_chain
+        .as_ref()
+        .and_then(|chain| chain.user.as_ref())
+        .as_ref()
+        .map(|bridge| (bridge.is_enabled(), bridge.active_slot_count()))
+        .unwrap_or((false, 0));
+    #[cfg(not(windows))]
+    let (vst_enabled, vst_active_slots) = (false, 0usize);
 
     // Stereo packed f32 で固定 (decoder 側 swresample に合わせる)。
     // WASAPI Shared モードの auto-mix で 5.1 / 7.1 デバイスでも 2 ch 出力できる
@@ -821,6 +1683,8 @@ pub(crate) fn start(
 
     let buffer = Arc::new(Mutex::new(AudioBuffer {
         processed: std::collections::VecDeque::with_capacity(32),
+        #[cfg(feature = "test-script")]
+        last_processed_frequency_hz: None,
         drain_offset_in_first: 0,
         raw_pending: std::collections::VecDeque::with_capacity(64),
         next_pts_secs: 0.0,
@@ -848,7 +1712,27 @@ pub(crate) fn start(
     let pump_engine_state = engine_state.clone();
     let pump_diagnostics = Arc::clone(&diagnostics);
     #[cfg(windows)]
-    let pump_dsp_bridge = dsp_bridge;
+    let dsp_control = dsp_chain.as_ref().map(|chain| {
+        Arc::new(LocalDspControl {
+            pump_instance: NEXT_LOCAL_DSP_PUMP.fetch_add(1, Ordering::Relaxed),
+            epoch: AtomicU64::new(0),
+            chain: chain.clone(),
+            dsp_armed: AtomicBool::new(false),
+            applicable_seen: AtomicBool::new(false),
+            #[cfg(test)]
+            test_applicable: AtomicBool::new(false),
+            #[cfg(test)]
+            test_handoff_spawn_failure: AtomicBool::new(false),
+            #[cfg(test)]
+            test_handoff_attempts: AtomicU64::new(0),
+            #[cfg(test)]
+            before_dry_commit: None,
+        })
+    });
+    #[cfg(windows)]
+    let pump_dsp_control = dsp_control.clone();
+    #[cfg(windows)]
+    let pump_dsp_chain = dsp_chain;
     let pump_handle = std::thread::Builder::new()
         .name("audio-pump".into())
         .spawn(move || {
@@ -863,7 +1747,9 @@ pub(crate) fn start(
                 pump_diagnostics,
                 audio_tap_command_rx,
                 #[cfg(windows)]
-                pump_dsp_bridge,
+                pump_dsp_chain,
+                #[cfg(windows)]
+                pump_dsp_control,
             );
         })
         .map_err(|e| format!("spawn audio-pump: {e}"))?;
@@ -873,19 +1759,48 @@ pub(crate) fn start(
     let cb_clock = clock.clone();
     let cb_engine_state = engine_state.clone();
     let cb_diagnostics = Arc::clone(&diagnostics);
+    let error_diagnostics = Arc::clone(&diagnostics);
+    let mut previous_callback_entry: Option<std::time::Instant> = None;
+    let mut previous_expected_period_ns: u64 = 0;
     let stream = device
         .build_output_stream(
             &config,
             move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                let callback_entry = diagnostics_enabled.then(std::time::Instant::now);
+                if let Some(entry) = callback_entry {
+                    let interval_ns = previous_callback_entry
+                        .map(|previous| duration_ns_u64(entry.duration_since(previous)));
+                    let expected_period_ns = previous_expected_period_ns;
+                    cb_diagnostics.record_callback_entry(
+                        cb_diagnostics.wall_ns_now(),
+                        interval_ns,
+                        expected_period_ns,
+                        cb_clock.current_seek_serial(),
+                        cb_engine_state.load(Ordering::Relaxed),
+                    );
+                    previous_callback_entry = Some(entry);
+                    previous_expected_period_ns = (((out.len() / channels as usize) as u128)
+                        * 1_000_000_000u128
+                        / sample_rate.max(1) as u128)
+                        .min(u64::MAX as u128) as u64;
+                }
+                let fill_started_at = diagnostics_enabled.then(std::time::Instant::now);
                 fill_output(
                     out,
                     &cb_buffer,
                     &cb_clock,
                     &cb_engine_state,
                     &cb_diagnostics,
+                    fill_started_at,
                 );
             },
-            |err| crate::logger::log(format!("cpal output stream error: {err}")),
+            move |err| {
+                let category = match err {
+                    cpal::StreamError::DeviceNotAvailable => 1,
+                    cpal::StreamError::BackendSpecific { .. } => 2,
+                };
+                error_diagnostics.record_device_error(category);
+            },
             None,
         )
         .map_err(|e| {
@@ -897,7 +1812,34 @@ pub(crate) fn start(
             )
         })?;
 
+    let stream_id = AudioDiagnostics::allocate_stream_id();
     stream.play().map_err(|e| format!("stream.play: {e}"))?;
+    diagnostics.publish_stream_id(stream_id);
+
+    if diagnostics_enabled {
+        crate::perf::event(
+            "audio_out",
+            "stream_open",
+            None,
+            0,
+            &[
+                ("stream_id", serde_json::Value::from(stream_id)),
+                ("device", serde_json::Value::from(device_name)),
+                ("sample_rate", serde_json::Value::from(sample_rate)),
+                ("channels", serde_json::Value::from(channels)),
+                ("buffer_size", serde_json::Value::from("default")),
+                (
+                    "normalize_gain_linear",
+                    serde_json::Value::from(clock.normalize_gain()),
+                ),
+                ("vst_enabled", serde_json::Value::from(vst_enabled)),
+                (
+                    "vst_active_slots",
+                    serde_json::Value::from(vst_active_slots as u64),
+                ),
+            ],
+        );
+    }
 
     Ok(AudioOutput {
         stream: Some(stream),
@@ -906,8 +1848,11 @@ pub(crate) fn start(
         shutdown_tx,
         pump: Some(pump_handle),
         sample_rate,
+        stream_id,
         diagnostics,
         audio_tap,
+        #[cfg(windows)]
+        dsp_control,
     })
 }
 
@@ -946,6 +1891,31 @@ fn publish_buffer_secs(buf: &AudioBuffer, clock: &AvClock) {
     clock.set_audio_pump_buf_secs(processed_secs.max(0.0));
     clock.set_audio_raw_pending_secs(raw_pending_secs.max(0.0));
     clock.set_vst3_pdc_latency_secs(buf.pdc_latency_secs);
+}
+
+pub(super) fn complete_audio_tail_and_wake(
+    clock: &AvClock,
+    serial: u64,
+    events: &crate::video::EngineEventSender,
+) -> bool {
+    if clock.complete_audio_tail(serial) {
+        // Commit precedes completion; wake ROOT even when tick has no remaining
+        // time deadline while the tail is in flight.
+        events.wake_ui();
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(windows)]
+fn local_tail_dsp_allowed(
+    dsp_allowed: bool,
+    serial: u64,
+    clock: &AvClock,
+    cancel: &AtomicBool,
+) -> bool {
+    dsp_allowed && !cancel.load(Ordering::Acquire) && clock.current_seek_serial() == serial
 }
 
 /// audio-pump スレッドの Windows 優先度を `THREAD_PRIORITY_ABOVE_NORMAL` に上げる。
@@ -998,14 +1968,26 @@ fn run_pump(
     engine_state: Arc<AtomicU8>,
     diagnostics: Arc<AudioDiagnostics>,
     audio_tap_command_rx: Receiver<AudioTapCommand>,
-    #[cfg(windows)] dsp_bridge: Option<std::sync::Arc<crate::video::dsp::DspBridge>>,
+    #[cfg(windows)] dsp_chain: Option<AudioDspChain>,
+    #[cfg(windows)] dsp_control: Option<Arc<LocalDspControl>>,
 ) {
     #[cfg(windows)]
     boost_audio_pump_priority();
+    #[cfg(windows)]
+    let (dsp_bridge, effetune_slot) = match dsp_chain {
+        Some(chain) => (chain.user, Some(chain.effetune)),
+        None => (None, None),
+    };
 
     // VST3 process_block 用の出力バッファ。再利用して realloc を抑える。
     #[cfg(windows)]
     let mut fx_out: Vec<f32> = Vec::with_capacity(4096);
+    #[cfg(windows)]
+    let mut effetune_out: Vec<f32> = Vec::with_capacity(4096);
+    #[cfg(windows)]
+    let mut effetune_health = crate::effetune::composition::StageHealth::default();
+    #[cfg(windows)]
+    let mut effetune_reset_failed_serial: Option<u64> = None;
 
     // ── processed queue cap (= EQ latency target) ──
     // EQ 設定変更が音に届くまでの最大時間 = processed 秒数。
@@ -1013,7 +1995,6 @@ fn run_pump(
     const TARGET_PROCESSED_SECS: f64 = 0.10;
     // ── BufferReady 閾値 ──
     // Buffering → Playing の遷移トリガ (level event)。
-    const READY_THRESHOLD_SECS: f64 = 0.10;
     // ── raw_pending back-pressure / warning ──
     // 以前は 30 秒を超えたら最新フレームで再 anchor していたが、video packet overflow
     // queue 導入後は demux が audio を大きく先読みできるため、通常の seek/open でも
@@ -1034,8 +2015,15 @@ fn run_pump(
     let samples_per_sec = (sample_rate as f64) * 2.0;
     let _ = (samples_per_sec * TARGET_PROCESSED_SECS) as usize; // future use: explicit cap_samples cache
     let mut safety_limiter = SafetyLimiter::new(sample_rate, 2);
+    let mut effetune_input_limiter = EffetuneInputLimiter::new(sample_rate);
+    let mut dsp_tail = AudioDspTail::default();
+    let mut epoch_trace = AudioEpochTrace::default();
+    let mut logged_first_output_serial = u64::MAX;
     let mut time_stretcher = TimeStretcher::new(sample_rate);
     let mut normalize_gain_ramp = NormalizeGainRamp::new(sample_rate, 2);
+    let mut last_processed_normalize_stream: Option<usize> = None;
+    let mut pending_normalize_stream: Option<usize> = None;
+    let mut snap_next_normalize_gain = true;
     // preroll 解除エッジ検出。preroll 中 (測定前待機) は毎ブロック snap_to_target するが、
     // UI スレッドは「set_normalize_gain(確定 gain) → set_audio_preroll_suspended(false)」を
     // 連続で store するため、pump が preroll=true のまま新 gain を snap するブロックを
@@ -1047,7 +2035,6 @@ fn run_pump(
     // 読んでから gain を snap する。preroll=false 観測時は直前に Release された確定 gain も
     // 必ず可視 (clock.rs の set_normalize_gain / set_audio_preroll_suspended は共に Release)。
     let mut was_preroll_suspended = clock.audio_preroll_suspended();
-    normalize_gain_ramp.snap_to_target(clock.normalize_gain() as f32);
 
     let mut activated = false;
     let mut active_audio_tap = None;
@@ -1109,11 +2096,27 @@ fn run_pump(
     // ここから 1Hz / edge で emit する (Codex 3 巡目 P1 ① 反映、xrun 防止)。
     let mut last_diag_log_at = std::time::Instant::now();
     let mut last_silence_total_logged: u64 = 0;
+    let mut last_callback_count_logged: u64 = 0;
+    let mut last_callback_late_count_logged: u64 = 0;
+    let mut last_underrun_begin_seq_logged: u64 = 0;
+    let mut last_underrun_end_seq_logged: u64 = 0;
     let mut last_seen_underrun_begin_seq: u64 = 0;
     let mut last_seen_underrun_end_seq: u64 = 0;
     let mut last_seen_pts_jump_seq: u64 = 0;
+    let mut last_seen_device_error_count: u64 = 0;
+    let mut last_seen_stale_clear_seq: u64 = 0;
+    let mut last_seen_pdc_change_seq: u64 = 0;
 
+    let mut input_disconnected = false;
     while !cancel.load(Ordering::Acquire) {
+        // The receiver can still contain queued frames while raw back-pressure
+        // prevents recv() from observing a disconnected sender. The decode
+        // worker's exit publication covers that case without consuming audio
+        // ahead of the normal back-pressure limit.
+        if clock.audio_worker_exited() {
+            input_disconnected = true;
+            break;
+        }
         // ── frame 受信 (timeout 付き、Codex 助言): audio_rx 到着を待たず自律 refill ──
         let raw_backpressure_secs = if engine_state.load(Ordering::Acquire) == state_code::PLAYING {
             RAW_BACKPRESSURE_PLAYING_SECS
@@ -1136,7 +2139,10 @@ fn run_pump(
                 recv(shutdown_rx) -> _ => return,
                 recv(rx) -> msg => match msg {
                     Ok(f) => Some(f),
-                    Err(_) => break,
+                    Err(_) => {
+                        input_disconnected = true;
+                        break;
+                    }
                 },
                 default(std::time::Duration::from_millis(REFILL_TICK_MS)) => None,
             }
@@ -1161,6 +2167,20 @@ fn run_pump(
             let should_reset_plugins = frame_seek_serial >= cur_clock_serial
                 && (!seen_valid_audio_frame || frame_seek_serial > last_seen_seek_serial);
             if should_reset_plugins {
+                epoch_trace = AudioEpochTrace {
+                    serial: frame_seek_serial,
+                    ..Default::default()
+                };
+                #[cfg(windows)]
+                let _reset_permit = dsp_control
+                    .as_ref()
+                    .filter(|control| control.dsp_armed.load(Ordering::Acquire))
+                    .and_then(|control| {
+                        control
+                            .chain
+                            .coordinator
+                            .local_permit(control.pump_instance)
+                    });
                 #[cfg(windows)]
                 if let Some(b) = &dsp_bridge {
                     // T20 (Claude R3-3): cancel check を `reset_plugins_sync` 前に挟む。
@@ -1170,17 +2190,82 @@ fn run_pump(
                     // 切り替え済 (`audio-output-drop-join`) なので UI は freeze しないが、
                     // pump exit が遅れて次の動画で audio 再起動が遅延する。cancel check で
                     // shutdown 中は reset を skip して即 exit させる。
-                    if !cancel.load(Ordering::Acquire)
+                    if _reset_permit.is_some()
+                        && !cancel.load(Ordering::Acquire)
                         && b.is_enabled()
                         && b.active_slot_count() > 0
                     {
-                        b.reset_plugins_sync();
+                        let result = b.try_reset_plugins_sync();
+                        audio_epoch_event(
+                            "plugin_reset",
+                            frame_seek_serial,
+                            &[
+                                ("stage", serde_json::Value::from("user_vst")),
+                                (
+                                    "latency_frames",
+                                    serde_json::Value::from(b.total_latency_samples()),
+                                ),
+                                ("acknowledged", serde_json::Value::from(result.is_ok())),
+                            ],
+                        );
+                        if let Err(error) = result {
+                            crate::logger::log(format!(
+                                "[VST3] CRITICAL: reset_plugins_sync failed: {error}; pre-seek audio may leak briefly"
+                            ));
+                        }
+                    }
+                }
+                #[cfg(windows)]
+                if _reset_permit.is_some()
+                    && seen_valid_audio_frame
+                    && !cancel.load(Ordering::Acquire)
+                    && let Some(slot) = effetune_slot.as_ref()
+                    && let Some((generation, bridge)) = slot.snapshot()
+                {
+                    let result = bridge.try_reset_plugins_sync();
+                    audio_epoch_event(
+                        "plugin_reset",
+                        frame_seek_serial,
+                        &[
+                            ("stage", serde_json::Value::from("effetune")),
+                            ("generation", serde_json::Value::from(generation)),
+                            (
+                                "latency_frames",
+                                serde_json::Value::from(bridge.total_latency_samples()),
+                            ),
+                            ("acknowledged", serde_json::Value::from(result.is_ok())),
+                        ],
+                    );
+                    if let Err(error) = result {
+                        effetune_reset_failed_serial = Some(frame_seek_serial);
+                        slot.report_failure_once(
+                            generation,
+                            crate::effetune::EffetuneFailure::ProcessFailed(format!(
+                                "seek reset: {error}"
+                            )),
+                        );
                     }
                 }
                 last_seen_seek_serial = frame_seek_serial;
                 seen_valid_audio_frame = true;
                 // 新 seek 世代: target / activate を reset
                 safety_limiter.reset();
+                audio_epoch_event(
+                    "reset",
+                    frame_seek_serial,
+                    &[
+                        ("input_pts", serde_json::Value::from(frame.pts_secs)),
+                        ("sample_rate", serde_json::Value::from(sample_rate)),
+                        (
+                            "final_limiter_frames",
+                            serde_json::Value::from(safety_limiter.lookahead_frames),
+                        ),
+                        ("pre_limiter_reset", serde_json::Value::from(true)),
+                    ],
+                );
+                dsp_tail = AudioDspTail::Empty;
+                #[cfg(windows)]
+                effetune_input_limiter.reset();
                 // AV seek ではここで reset。1.0x bypass 境界の reset は
                 // TimeStretcher::process 内で自動的に行う。
                 time_stretcher.reset();
@@ -1241,6 +2326,10 @@ fn run_pump(
                 // pump_seek_serial 切替 → processed + raw_pending 両方クリア
                 if frame_seek_serial > buf.pump_seek_serial {
                     buf.processed.clear();
+                    #[cfg(feature = "test-script")]
+                    {
+                        buf.last_processed_frequency_hz = None;
+                    }
                     buf.drain_offset_in_first = 0;
                     buf.raw_pending.clear();
                     buf.next_pts_secs = frame.pts_secs;
@@ -1309,9 +2398,14 @@ fn run_pump(
                 if buf.pump_seek_serial < cur_clock_serial {
                     let old_serial = buf.pump_seek_serial;
                     buf.processed.clear();
+                    #[cfg(feature = "test-script")]
+                    {
+                        buf.last_processed_frequency_hz = None;
+                    }
                     buf.drain_offset_in_first = 0;
                     buf.raw_pending.clear();
                     clock.zero_audio_tx_queued_secs();
+                    buf.pump_seek_serial = cur_clock_serial;
                     publish_buffer_secs(&buf, &clock);
                     Some(old_serial)
                 } else {
@@ -1320,6 +2414,9 @@ fn run_pump(
             };
 
             if let Some(old_serial) = cleared_pump_serial {
+                safety_limiter.reset();
+                effetune_input_limiter.reset();
+                dsp_tail = AudioDspTail::Empty;
                 seek_target_secs = None;
                 pump_anchor_target_secs = None;
                 activated = false;
@@ -1380,7 +2477,6 @@ fn run_pump(
 
         let preroll_now = clock.audio_preroll_suspended();
         if preroll_now {
-            normalize_gain_ramp.snap_to_target(clock.normalize_gain() as f32);
             was_preroll_suspended = true;
             if let Ok(buf) = buffer.lock() {
                 publish_buffer_secs(&buf, &clock);
@@ -1388,9 +2484,8 @@ fn run_pump(
             continue;
         }
         if preroll_release_edge(was_preroll_suspended, preroll_now) {
-            // preroll 解除エッジ: 測定確定 gain で即再生開始する (4 秒 ramp を避ける)。
-            // ここで snap しておけば直後の apply_to_samples は target 一致で ramp を arm しない。
-            normalize_gain_ramp.snap_to_target(clock.normalize_gain() as f32);
+            // The next decoded stream owns the target gain. Snap when that frame is processed.
+            snap_next_normalize_gain = true;
         }
         was_preroll_suspended = preroll_now;
 
@@ -1400,12 +2495,44 @@ fn run_pump(
         // 2. process_block (no lock)
         // 3. lock → seek_serial check → push processed → unlock
         loop {
+            if cancel.load(Ordering::Acquire) {
+                break;
+            }
+            #[cfg(windows)]
+            let block_mode = dsp_control
+                .as_ref()
+                .filter(|control| control.dsp_armed.load(Ordering::Acquire))
+                .map(|control| {
+                    control
+                        .chain
+                        .coordinator
+                        .local_block_mode(control.pump_instance)
+                });
+            #[cfg(windows)]
+            if matches!(
+                block_mode.as_ref(),
+                Some(crate::video::dsp::coordinator::LocalBlockMode::Acquiring)
+            ) {
+                break;
+            }
+            #[cfg(windows)]
+            let dsp_allowed = matches!(
+                block_mode.as_ref(),
+                Some(crate::video::dsp::coordinator::LocalBlockMode::Dsp(_))
+            );
             // 現在の processed 秒数 (= cap 比較用) を lock 内で取得
             let (current_processed_secs, raw_chunk_opt, target_serial) = {
                 let mut buf = buffer.lock().unwrap();
                 let cur_secs: f64 = buf.processed.iter().map(|c| c.duration_secs).sum::<f64>()
                     + remaining_first_chunk_secs(&buf);
                 if cur_secs >= TARGET_PROCESSED_SECS {
+                    (cur_secs, None, buf.pump_seek_serial)
+                } else if buf
+                    .raw_pending
+                    .front()
+                    .is_some_and(|raw| clock.normalize_gain_for_stream(raw.stream_index).is_none())
+                {
+                    pending_normalize_stream = buf.raw_pending.front().map(|raw| raw.stream_index);
                     (cur_secs, None, buf.pump_seek_serial)
                 } else if let Some(raw) = buf.raw_pending.pop_front() {
                     (cur_secs, Some(raw), buf.pump_seek_serial)
@@ -1415,149 +2542,408 @@ fn run_pump(
             };
 
             let _ = current_processed_secs; // 計測用に取得、未使用なら drop
-            let raw = match raw_chunk_opt {
-                Some(r) => r,
-                None => break,
-            };
+            let untrimmed = if let Some(raw) = raw_chunk_opt {
+                let Some(normalize_gain) = clock.normalize_gain_for_stream(raw.stream_index) else {
+                    // A toggle may have reset the table between the head check and this load.
+                    let mut buf = buffer.lock().unwrap();
+                    if raw.seek_serial == buf.pump_seek_serial {
+                        buf.raw_pending.push_front(raw);
+                    }
+                    break;
+                };
+                if snap_next_normalize_gain
+                    || last_processed_normalize_stream != Some(raw.stream_index)
+                    || pending_normalize_stream == Some(raw.stream_index)
+                {
+                    normalize_gain_ramp.snap_to_target(normalize_gain as f32);
+                    snap_next_normalize_gain = false;
+                }
+                last_processed_normalize_stream = Some(raw.stream_index);
+                pending_normalize_stream = None;
 
-            // ── Time stretch → normalize gain → VST process_block (mutex 解放中) ──
-            let playback_speed = clock.playback_speed();
-            let mut stretched =
-                time_stretcher.process(&raw.samples, raw.duration_secs, playback_speed);
-            // 音量ノーマライズの線形ゲイン (Phase 2-A): VST3 入力前に掛ける。
-            // VST3 (Pro-L2 等) が「-14 LUFS に揃った入力」を見られるよう前段に置く。
-            // 目標変更は dB 空間で ramp する。測定前待機からの解除時は上の
-            // `snap_to_target` により、最初の可聴 chunk から仮 gain で始まる。
-            let max_normalize_gain_in_block = normalize_gain_ramp
-                .apply_to_samples(&mut stretched.samples, clock.normalize_gain() as f32);
-            #[cfg(windows)]
-            let (mut output_samples, mut current_pdc_latency_secs, vst_chain_active): (
-                Vec<f32>,
-                f64,
-                bool,
-            ) = if let Some(b) = &dsp_bridge {
-                if b.is_enabled() && b.active_slot_count() > 0 {
-                    fx_out.resize(stretched.samples.len(), 0.0);
-                    let process_result = b.process_block(&stretched.samples, &mut fx_out);
-                    let success = process_result.is_ok();
-                    if success {
-                        // 連続成功カウンタを進め、`HEALTHY_RESET` 回連続成功でようやく
-                        // 失敗カウンタをリセット (= partial desync 中の偶発 Ok で counter が
-                        // 不当にゼロ戻りするのを防ぐ)
-                        vst3_consecutive_successes = vst3_consecutive_successes.saturating_add(1);
-                        if vst3_consecutive_successes >= VST3_HEALTHY_RESET {
-                            vst3_consecutive_failures = 0;
-                        }
-                        let total_lat_samples = b.total_latency_samples();
-                        let lat_secs = if total_lat_samples > 0 {
-                            total_lat_samples as f64 / sample_rate as f64
+                // ── Time stretch → normalize gain → VST process_block (mutex 解放中) ──
+                epoch_trace.first(0, &raw.samples, raw.pts_secs, 1.0, sample_rate);
+                let playback_speed = clock.playback_speed();
+                let mut stretched =
+                    time_stretcher.process(&raw.samples, raw.duration_secs, playback_speed);
+                // 音量ノーマライズの線形ゲイン (Phase 2-A): VST3 入力前に掛ける。
+                // VST3 (Pro-L2 等) が「-14 LUFS に揃った入力」を見られるよう前段に置く。
+                // 目標変更は dB 空間で ramp する。測定前待機からの解除時は上の
+                // `snap_to_target` により、最初の可聴 chunk から仮 gain で始まる。
+                normalize_gain_ramp.apply_to_samples(&mut stretched.samples, normalize_gain as f32);
+                #[cfg(windows)]
+                let (output_samples, mut current_pdc_latency_secs): (
+                    Vec<f32>,
+                    f64,
+                ) = if let Some(b) = &dsp_bridge {
+                    if dsp_allowed && b.is_enabled() && b.active_slot_count() > 0 {
+                        fx_out.resize(stretched.samples.len(), 0.0);
+                        let process_result = b.process_block(&stretched.samples, &mut fx_out);
+                        let success = process_result.is_ok();
+                        if success {
+                            // 連続成功カウンタを進め、`HEALTHY_RESET` 回連続成功でようやく
+                            // 失敗カウンタをリセット (= partial desync 中の偶発 Ok で counter が
+                            // 不当にゼロ戻りするのを防ぐ)
+                            vst3_consecutive_successes =
+                                vst3_consecutive_successes.saturating_add(1);
+                            if vst3_consecutive_successes >= VST3_HEALTHY_RESET {
+                                vst3_consecutive_failures = 0;
+                            }
+                            let total_lat_samples = b.total_latency_samples();
+                            let lat_secs = if total_lat_samples > 0 {
+                                total_lat_samples as f64 / sample_rate as f64
+                            } else {
+                                0.0
+                            };
+                            (fx_out.clone(), lat_secs)
                         } else {
-                            0.0
-                        };
-                        (fx_out.clone(), lat_secs, true)
-                    } else {
-                        // T07 (v0.9.0): VST3 process_block 失敗時の dry fallback
-                        // を **PDC=0 + vst_chain_active=false** にする。旧コードは
-                        // VST latency を残したまま dry サンプルを流していたので、
-                        // dry にも PDC 補正が掛かって timing がずれていた。
-                        // 連続失敗カウンタを進めて、閾値に達したら auto-disable。
-                        vst3_consecutive_failures = vst3_consecutive_failures.saturating_add(1);
-                        vst3_consecutive_successes = 0;
-                        // ログ rate-limit: 最初の失敗と 10 回ごとに出す
-                        if vst3_consecutive_failures == 1 || vst3_consecutive_failures % 10 == 0 {
-                            crate::logger::log(format!(
-                                "vst3 process_block failed (consecutive #{}): {}",
-                                vst3_consecutive_failures,
-                                process_result.unwrap_err()
-                            ));
-                        }
-                        // T07 (v0.9.0) Codex P1 round 3 反映: 閾値 trigger は `>=` を使う +
-                        // chain が現に enabled なときだけ disable を呼ぶ + 呼んだら counter を
-                        // 0 にリセットする。
-                        //
-                        // `==` だけだと:
-                        //   1. failures が threshold (3) に到達 → disable
-                        //   2. ユーザーが GUI から re-enable
-                        //   3. 次の失敗で counter が threshold+1 に → `==` を満たさず
-                        //      二度と auto-disable が走らない
-                        // という穴ができる。`>=` + counter reset で再 enable 後も正しく動く。
-                        if vst3_consecutive_failures >= VST3_CONSECUTIVE_FAILURE_DISABLE
-                            && b.is_enabled()
-                        {
-                            crate::logger::log(format!(
-                                "vst3 process_block has failed {} consecutive times; \
+                            // T07 (v0.9.0): VST3 process_block 失敗時の dry fallback
+                            // を **plugin PDC=0** にする。旧コードは
+                            // VST latency を残したまま dry サンプルを流していたので、
+                            // dry にも PDC 補正が掛かって timing がずれていた。
+                            // 連続失敗カウンタを進めて、閾値に達したら auto-disable。
+                            vst3_consecutive_failures = vst3_consecutive_failures.saturating_add(1);
+                            vst3_consecutive_successes = 0;
+                            // ログ rate-limit: 最初の失敗と 10 回ごとに出す
+                            if vst3_consecutive_failures == 1 || vst3_consecutive_failures % 10 == 0
+                            {
+                                crate::logger::log(format!(
+                                    "vst3 process_block failed (consecutive #{}): {}",
+                                    vst3_consecutive_failures,
+                                    process_result.unwrap_err()
+                                ));
+                            }
+                            // T07 (v0.9.0) Codex P1 round 3 反映: 閾値 trigger は `>=` を使う +
+                            // chain が現に enabled なときだけ disable を呼ぶ + 呼んだら counter を
+                            // 0 にリセットする。
+                            //
+                            // `==` だけだと:
+                            //   1. failures が threshold (3) に到達 → disable
+                            //   2. ユーザーが GUI から re-enable
+                            //   3. 次の失敗で counter が threshold+1 に → `==` を満たさず
+                            //      二度と auto-disable が走らない
+                            // という穴ができる。`>=` + counter reset で再 enable 後も正しく動く。
+                            if vst3_consecutive_failures >= VST3_CONSECUTIVE_FAILURE_DISABLE
+                                && b.is_enabled()
+                            {
+                                crate::logger::log(format!(
+                                    "vst3 process_block has failed {} consecutive times; \
                                  auto-disabling VST3 chain for this session",
-                                vst3_consecutive_failures
-                            ));
-                            b.disable_with_reason(Some(format!(
+                                    vst3_consecutive_failures
+                                ));
+                                b.disable_with_reason(Some(format!(
                                 "VST3 chain wedged after {} consecutive process_block failures; auto-disabled for this session",
                                 vst3_consecutive_failures
                             )));
-                            vst3_consecutive_failures = 0;
+                                vst3_consecutive_failures = 0;
+                            }
+                            // 注 (Codex P1 round 3 限界事項): HEALTHY_RESET の hysteresis は
+                            // 「N 回 Ok 連続 → 正常復帰」と heuristic 判定する。pipe-pairing drift
+                            // (= tail of previous + head of current の偶発 Ok 連発) は構造的に
+                            // 検出できない。完全な解決には bridge との discard/reset handshake が
+                            // 必要で v0.10 で導入予定。drift 継続なら結局再 fail → 再 disable で
+                            // 救う。
+                            (stretched.samples.clone(), 0.0)
                         }
-                        // 注 (Codex P1 round 3 限界事項): HEALTHY_RESET の hysteresis は
-                        // 「N 回 Ok 連続 → 正常復帰」と heuristic 判定する。pipe-pairing drift
-                        // (= tail of previous + head of current の偶発 Ok 連発) は構造的に
-                        // 検出できない。完全な解決には bridge との discard/reset handshake が
-                        // 必要で v0.10 で導入予定。drift 継続なら結局再 fail → 再 disable で
-                        // 救う。
-                        (stretched.samples.clone(), 0.0, false)
+                    } else {
+                        // bridge は enable だが active slot が無い: dry 通過。
+                        // active slot 不在のフレームは "成功でも失敗でもない"。counter は
+                        // そのまま (= 一度 wedge 警告状態に入ったらユーザーが GUI で
+                        // bypass を切る/再有効化するまで保つ)。
+                        (stretched.samples.clone(), 0.0)
                     }
                 } else {
-                    // bridge は enable だが active slot が無い: dry 通過。
-                    // active slot 不在のフレームは "成功でも失敗でもない"。counter は
-                    // そのまま (= 一度 wedge 警告状態に入ったらユーザーが GUI で
-                    // bypass を切る/再有効化するまで保つ)。
-                    (stretched.samples.clone(), 0.0, false)
-                }
-            } else {
-                // dsp_bridge ハンドル自体が無い: VST3 サポートが無効化されている。
-                vst3_consecutive_failures = 0;
-                vst3_consecutive_successes = 0;
-                (stretched.samples.clone(), 0.0, false)
-            };
-            #[cfg(not(windows))]
-            let (mut output_samples, mut current_pdc_latency_secs, vst_chain_active): (
-                Vec<f32>,
-                f64,
-                bool,
-            ) = (stretched.samples.clone(), 0.0, false);
+                    // dsp_bridge ハンドル自体が無い: VST3 サポートが無効化されている。
+                    vst3_consecutive_failures = 0;
+                    vst3_consecutive_successes = 0;
+                    (stretched.samples.clone(), 0.0)
+                };
+                #[cfg(not(windows))]
+                let (mut output_samples, mut current_pdc_latency_secs): (
+                    Vec<f32>,
+                    f64,
+                ) = (stretched.samples.clone(), 0.0);
 
-            let pre_limiter_gain = clock.pre_limiter_gain();
-            if pre_limiter_gain > 1.0 {
-                for sample in &mut output_samples {
-                    *sample *= pre_limiter_gain;
+                epoch_trace.first(
+                    1,
+                    &output_samples,
+                    raw.pts_secs
+                        - (current_pdc_latency_secs + stretched.stretcher_latency_output_secs)
+                            * stretched.source_secs_per_output_sec,
+                    stretched.source_secs_per_output_sec,
+                    sample_rate,
+                );
+
+                #[cfg(windows)]
+                let mut effetune_applied = false;
+                #[cfg(windows)]
+                let user_latency_secs = current_pdc_latency_secs;
+                #[cfg(windows)]
+                let mut applied_effetune_latency_secs = 0.0;
+                #[cfg(windows)]
+                let mut effetune_generation = None;
+                #[cfg(windows)]
+                if dsp_allowed && let Some(slot) = effetune_slot.as_ref() {
+                    if let Some((generation, bridge)) = slot.snapshot() {
+                        if effetune_reset_failed_serial != Some(raw.seek_serial) {
+                            let effetune_latency_secs =
+                                bridge.total_latency_samples() as f64 / sample_rate as f64;
+                            match crate::effetune::composition::admit_effetune(
+                                current_pdc_latency_secs,
+                                effetune_latency_secs,
+                            ) {
+                                Err(total_secs) => {
+                                    slot.report_failure_once(
+                                        generation,
+                                        crate::effetune::EffetuneFailure::LatencyExceeded {
+                                            total_secs,
+                                        },
+                                    );
+                                }
+                                Ok(()) => {
+                                    effetune_out.resize(output_samples.len(), 0.0);
+                                    let (input, input_latency_secs) = effetune_input_limiter
+                                        .prepare(
+                                            &output_samples,
+                                            generation,
+                                            slot.pre_limiter_enabled(),
+                                        );
+                                    match bridge.process_block(input, &mut effetune_out) {
+                                        Ok(()) => {
+                                            effetune_applied = true;
+                                            effetune_generation = Some(generation);
+                                            effetune_health.succeeded();
+                                            applied_effetune_latency_secs =
+                                                effetune_latency_secs + input_latency_secs;
+                                        }
+                                        Err(error) => {
+                                            let threshold_reached = effetune_health.failed();
+                                            let failures = effetune_health.failure_count();
+                                            if failures == 1 || failures % 10 == 0 {
+                                                crate::logger::log(format!(
+                                                    "EffeTune process_block failed (consecutive #{}): {error}",
+                                                    failures
+                                                ));
+                                            }
+                                            if threshold_reached {
+                                                slot.report_failure_once(
+                                                    generation,
+                                                    crate::effetune::EffetuneFailure::ProcessFailed(
+                                                        error,
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        effetune_health = crate::effetune::composition::StageHealth::default();
+                    }
                 }
-            }
-            // Phase 2-B: normalize gain が +側 (>1.0) のときも safety_limiter を通す。
-            // VST3 無効 + 音量0dB以下 + normalize +20dB のケースで clip を防ぐ。
-            // 下げ方向 (<1.0) は clip 不可なので limiter 不要 (5ms latency 節約)。
-            let normalize_boost_active = max_normalize_gain_in_block > 1.0 + f32::EPSILON;
-            let limiter_active =
-                vst_chain_active || pre_limiter_gain > 1.0 || normalize_boost_active;
-            if limiter_active {
+
+                #[cfg(windows)]
+                if !effetune_applied {
+                    effetune_input_limiter.reset();
+                }
+
+                #[cfg(windows)]
+                let (mut output_samples, reusable_effetune_out, composition) =
+                    crate::effetune::composition::compose_samples(
+                        output_samples,
+                        effetune_out,
+                        user_latency_secs,
+                        effetune_applied,
+                        applied_effetune_latency_secs,
+                        effetune_generation,
+                    );
+                #[cfg(windows)]
+                {
+                    effetune_out = reusable_effetune_out;
+                    current_pdc_latency_secs = composition.plugin_latency_secs;
+                }
+
+                epoch_trace.first(
+                    2,
+                    &output_samples,
+                    raw.pts_secs
+                        - (current_pdc_latency_secs + stretched.stretcher_latency_output_secs)
+                            * stretched.source_secs_per_output_sec,
+                    stretched.source_secs_per_output_sec,
+                    sample_rate,
+                );
+
+                let pre_limiter_gain = clock.pre_limiter_gain();
+                if pre_limiter_gain > 1.0 {
+                    for sample in &mut output_samples {
+                        *sample *= pre_limiter_gain;
+                    }
+                }
+                // The final output delay is always present, independent of effects/gain.
                 if safety_limiter.process_block(&mut output_samples) {
                     clock.mark_limiter_ceiling_hit();
                 }
                 current_pdc_latency_secs += safety_limiter.latency_secs();
-            } else {
-                safety_limiter.reset();
-            }
 
-            // ── chunk metadata 計算 ──
-            // latency は output 秒で発生するため、source timeline に換算する。
-            let duration_secs = output_samples.len() as f64 / samples_per_sec;
-            let source_secs_per_output_sec = if duration_secs > 0.0 {
-                stretched.source_secs_per_output_sec
+                // ── chunk metadata 計算 ──
+                // latency は output 秒で発生するため、source timeline に換算する。
+                let duration_secs = output_samples.len() as f64 / samples_per_sec;
+                let source_secs_per_output_sec = if duration_secs > 0.0 {
+                    stretched.source_secs_per_output_sec
+                } else {
+                    playback_speed
+                };
+                current_pdc_latency_secs += stretched.stretcher_latency_output_secs;
+                let (audible_pts_secs, current_latency_source_secs) = audible_pts_after_latency(
+                    raw.pts_secs,
+                    current_pdc_latency_secs,
+                    source_secs_per_output_sec,
+                );
+
+                let full_chunk = ProcessedChunk {
+                    samples: output_samples,
+                    audible_pts_secs,
+                    duration_secs,
+                    source_secs_per_output_sec,
+                    seek_serial: raw.seek_serial,
+                    pdc_latency_secs_at_process: current_latency_source_secs,
+                    #[cfg(windows)]
+                    effetune_generation: composition.effetune_generation,
+                    #[cfg(not(windows))]
+                    effetune_generation: None,
+                };
+                #[cfg(windows)]
+                let (effect_frames, pre_frames) = if effetune_applied {
+                    let pre_frames = effetune_input_limiter.limiter.lookahead_frames;
+                    (
+                        ((applied_effetune_latency_secs * sample_rate as f64).round() as usize)
+                            .saturating_sub(pre_frames),
+                        pre_frames,
+                    )
+                } else {
+                    (0, 0)
+                };
+                #[cfg(not(windows))]
+                let (effect_frames, pre_frames) = (0, 0);
+                dsp_tail.capture(
+                    &full_chunk,
+                    effect_frames,
+                    pre_frames,
+                    safety_limiter.lookahead_frames,
+                    pre_limiter_gain,
+                );
+                full_chunk
             } else {
-                playback_speed
+                if current_processed_secs >= TARGET_PROCESSED_SECS {
+                    break;
+                }
+                // Read completion before checking the channel: after Decoded, this
+                // generation cannot send another real frame. A seek resets the owner.
+                let eos_serial = clock.current_seek_serial();
+                dsp_tail.discard_stale(eos_serial);
+                if clock.audio_decoded_eos(eos_serial)
+                    && rx.is_empty()
+                    && deferred_frame.is_none()
+                    && buffer.lock().unwrap().raw_pending.is_empty()
+                {
+                    if clock.begin_audio_tail(eos_serial) {
+                        dsp_tail.start(eos_serial);
+                        audio_epoch_event(
+                            "drain_begin",
+                            eos_serial,
+                            &[("sample_rate", serde_json::Value::from(sample_rate))],
+                        );
+                    }
+                }
+                let next = dsp_tail.next(
+                    sample_rate,
+                    &mut effetune_input_limiter,
+                    &mut safety_limiter,
+                    {
+                        #[cfg(windows)]
+                        {
+                            effetune_slot
+                                .as_ref()
+                                .is_some_and(|slot| slot.pre_limiter_enabled())
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            false
+                        }
+                    },
+                    |generation, latency_frames, input, output| {
+                        #[cfg(windows)]
+                        {
+                            if !local_tail_dsp_allowed(dsp_allowed, eos_serial, &clock, &cancel) {
+                                return false;
+                            }
+                            let Some(slot) = effetune_slot.as_ref() else {
+                                return false;
+                            };
+                            let Some((live_generation, bridge)) = slot.snapshot() else {
+                                return false;
+                            };
+                            if live_generation != generation
+                                || !bridge.is_enabled()
+                                || bridge.active_slot_count() == 0
+                                || bridge.total_latency_samples() as usize != latency_frames
+                            {
+                                return false;
+                            }
+                            match bridge.process_block(input, output) {
+                                Ok(()) => {
+                                    effetune_health.succeeded();
+                                    true
+                                }
+                                Err(error) => {
+                                    let threshold_reached = effetune_health.failed();
+                                    crate::logger::log(format!(
+                                        "EffeTune EOS tail process failed: {error}"
+                                    ));
+                                    if threshold_reached {
+                                        slot.report_failure_once(
+                                            generation,
+                                            crate::effetune::EffetuneFailure::ProcessFailed(error),
+                                        );
+                                    }
+                                    false
+                                }
+                            }
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            let _ = (generation, latency_frames, input, output);
+                            false
+                        }
+                    },
+                    || clock.mark_limiter_ceiling_hit(),
+                );
+                let Some(chunk) = next else {
+                    if dsp_tail.complete() {
+                        if complete_audio_tail_and_wake(&clock, eos_serial, &engine_event_tx) {
+                            audio_epoch_event(
+                                "drain_complete",
+                                eos_serial,
+                                &[
+                                    (
+                                        "drained_frames",
+                                        serde_json::Value::from(epoch_trace.drained_frames),
+                                    ),
+                                    ("sample_rate", serde_json::Value::from(sample_rate)),
+                                ],
+                            );
+                        }
+                    }
+                    break;
+                };
+                epoch_trace.drained_frames += chunk.samples.len() / 2;
+                chunk
             };
-            current_pdc_latency_secs += stretched.stretcher_latency_output_secs;
-            let (audible_pts_secs, current_latency_source_secs) = audible_pts_after_latency(
-                raw.pts_secs,
-                current_pdc_latency_secs,
-                source_secs_per_output_sec,
-            );
+            let current_latency_source_secs = untrimmed.pdc_latency_secs_at_process;
+            let audible_pts_secs = untrimmed.audible_pts_secs;
+            let duration_secs = untrimmed.duration_secs;
+            let source_secs_per_output_sec = untrimmed.source_secs_per_output_sec;
 
             // ── pre-target trim (Codex P1-1: PDC plugin で早すぎる BufferReady 防止) ──
             //
@@ -1569,7 +2955,7 @@ fn run_pump(
             // 対策: pre_target_trim_decision で DropAll / TrimFront / KeepAll を判定。
             // 最初の post-target chunk (= TrimFront or KeepAll で push 成功) が
             // 出来た時点で seek_target_secs を None にする (= 以降は無条件 push)。
-            let mut samples = output_samples;
+            let mut samples = untrimmed.samples;
             let mut chunk_audible_pts = audible_pts_secs;
             if let Some(target) = seek_target_secs {
                 match pre_target_trim_decision(
@@ -1606,47 +2992,103 @@ fn run_pump(
                 audible_pts_secs: chunk_audible_pts,
                 duration_secs: chunk_duration,
                 source_secs_per_output_sec,
-                seek_serial: raw.seek_serial,
+                seek_serial: untrimmed.seek_serial,
                 pdc_latency_secs_at_process: current_latency_source_secs,
+                effetune_generation: untrimmed.effetune_generation,
             };
+            epoch_trace.first(
+                3,
+                &chunk.samples,
+                chunk.audible_pts_secs,
+                chunk.source_secs_per_output_sec,
+                sample_rate,
+            );
+            #[cfg(feature = "test-script")]
+            let processed_frequency_hz =
+                estimate_processed_frequency_hz(&chunk.samples, sample_rate);
 
             refresh_audio_tap(&audio_tap_command_rx, &mut active_audio_tap);
             // tap 接続時だけ samples を clone する。cpal callback と共有する AudioBuffer
             // mutex の外なので、この allocation が PC 側の drain を待たせることはない。
             let prepared_audio_tap = prepare_audio_tap_chunk(&active_audio_tap, &chunk);
 
-            // ── lock 再取得して processed に push (= seek serial check) ──
-            let mut buf = buffer.lock().unwrap();
-            if chunk.seek_serial != target_serial || chunk.seek_serial != buf.pump_seek_serial {
-                // seek 世代が変わった (= chunk は stale) → drop
+            #[cfg(all(test, windows))]
+            if matches!(
+                block_mode.as_ref(),
+                Some(crate::video::dsp::coordinator::LocalBlockMode::Dry(_))
+            ) && let Some(hook) = dsp_control
+                .as_ref()
+                .and_then(|control| control.before_dry_commit.as_ref())
+            {
+                hook();
+            }
+            // Dry commits hold the coordinator's ownership lock through the queue push.
+            // A grant after dequeue therefore either invalidates this block or follows it.
+            let mut cap_exceeded = None;
+            let mut latency_change = None;
+            let commit = || {
+                let mut buf = buffer.lock().unwrap();
+                if cancel.load(Ordering::Acquire)
+                    || !processed_chunk_matches_live_seek(
+                        chunk.seek_serial,
+                        target_serial,
+                        buf.pump_seek_serial,
+                        clock.current_seek_serial(),
+                    )
+                {
+                    return false;
+                }
+                // ── cap exceedance check (Codex P2-3): 単 chunk が処理済 cap を超える ──
+                // AAC/Opus 等は 23ms/frame なので通常は cap=100ms に余裕。長い frame
+                // (= 一部の独自エンコード) では cap を一時的に超える可能性があるので
+                // ログだけ出して push する (= 分割は将来課題)。
+                let cur_processed_secs: f64 =
+                    buf.processed.iter().map(|c| c.duration_secs).sum::<f64>()
+                        + remaining_first_chunk_secs(&buf);
+                if cur_processed_secs + chunk.duration_secs > TARGET_PROCESSED_SECS * 1.5 {
+                    cap_exceeded = Some((cur_processed_secs, chunk.duration_secs));
+                }
+                // PDC latency 変化のログ + 同期 (= 既存挙動、chunk metadata だが
+                // global pdc_latency_secs も維持)
+                if (buf.pdc_latency_secs - current_latency_source_secs).abs() > 1e-6 {
+                    latency_change = Some((buf.pdc_latency_secs, current_latency_source_secs));
+                    buf.pdc_latency_secs = current_latency_source_secs;
+                }
+                #[cfg(feature = "test-script")]
+                {
+                    buf.last_processed_frequency_hz = processed_frequency_hz;
+                }
+                buf.processed.push_back(chunk);
+                true
+            };
+            #[cfg(windows)]
+            let committed = match block_mode.as_ref() {
+                Some(crate::video::dsp::coordinator::LocalBlockMode::Dry(dry)) => {
+                    dry.commit_if_current(commit)
+                }
+                Some(crate::video::dsp::coordinator::LocalBlockMode::Dsp(_)) | None => commit(),
+                Some(crate::video::dsp::coordinator::LocalBlockMode::Acquiring) => unreachable!(),
+            };
+            #[cfg(not(windows))]
+            let committed = commit();
+            if !committed {
                 continue;
             }
-            // ── cap exceedance check (Codex P2-3): 単 chunk が処理済 cap を超える ──
-            // AAC/Opus 等は 23ms/frame なので通常は cap=100ms に余裕。長い frame
-            // (= 一部の独自エンコード) では cap を一時的に超える可能性があるので
-            // ログだけ出して push する (= 分割は将来課題)。
-            let cur_processed_secs: f64 =
-                buf.processed.iter().map(|c| c.duration_secs).sum::<f64>()
-                    + remaining_first_chunk_secs(&buf);
-            if cur_processed_secs + chunk.duration_secs > TARGET_PROCESSED_SECS * 1.5 {
+            publish_prepared_audio_tap_chunk(&mut active_audio_tap, prepared_audio_tap);
+            if let Some((processed_secs, chunk_secs)) = cap_exceeded {
                 crate::logger::log(format!(
-                    "[audio-pump] processed cap exceeded: {:.3}s + {:.3}s > {:.3}s target \
+                    "[audio-pump] processed cap exceeded: {processed_secs:.3}s + {chunk_secs:.3}s > {:.3}s target \
                      (chunk too large to fit; EQ latency briefly elevated)",
-                    cur_processed_secs, chunk.duration_secs, TARGET_PROCESSED_SECS,
+                    TARGET_PROCESSED_SECS,
                 ));
             }
-            // PDC latency 変化のログ + 同期 (= 既存挙動、chunk metadata だが
-            // global pdc_latency_secs も維持)
-            if (buf.pdc_latency_secs - current_latency_source_secs).abs() > 1e-6 {
+            if let Some((old_latency, new_latency)) = latency_change {
                 crate::logger::log(format!(
                     "Audio latency changed: {:.3}ms -> {:.3}ms source-time",
-                    buf.pdc_latency_secs * 1000.0,
-                    current_latency_source_secs * 1000.0
+                    old_latency * 1000.0,
+                    new_latency * 1000.0
                 ));
-                buf.pdc_latency_secs = current_latency_source_secs;
             }
-            publish_prepared_audio_tap_chunk(&mut active_audio_tap, prepared_audio_tap);
-            buf.processed.push_back(chunk);
         }
 
         // ── publish_buffer_secs + BufferReady emit ──
@@ -1664,7 +3106,7 @@ fn run_pump(
         //   - PDC 等で audible < target → max は target. anchor が target で固定
         //   - 失敗 / 初期 open: pump_anchor_target = None → audible 単独 (既存挙動)
         //   - BufferStarved (再 buffering): audible は再生位置 >> 旧 target → audible 採用
-        let (processed_secs, cur_audible_pts, cur_serial) = {
+        let (processed_secs, cur_audible_pts, cur_serial, pending_at_head) = {
             let buf = buffer.lock().unwrap();
             publish_buffer_secs(&buf, &clock);
             let secs: f64 = buf.processed.iter().map(|c| c.duration_secs).sum::<f64>()
@@ -1676,15 +3118,21 @@ fn run_pump(
             } else {
                 buf.next_pts_secs
             };
-            (secs, audible, buf.pump_seek_serial)
+            let pending_at_head = buf
+                .raw_pending
+                .front()
+                .is_some_and(|raw| clock.normalize_gain_for_stream(raw.stream_index).is_none());
+            (secs, audible, buf.pump_seek_serial, pending_at_head)
         };
         // 音声実長が閾値未満のファイル (0.1 秒未満の SFX 等 / 極短音声トラックの動画) は
         // processed がこの閾値に永久に届かず、BufferReady が一度も emit されないまま
         // Buffering 固着する (再生開始不能)。demux がファイル全体を読み切っている
-        // (`is_eof_reached`) ならこれ以上 processed が増える見込みは無いので、残量に
+        // (`is_demux_exhausted`) ならこれ以上 processed が増える見込みは無いので、残量に
         // 関わらず readiness を通知する (review-v2.3.0 P2-6)。post-seek で末尾間際に
         // 到達した場合も同様 (残り実データが閾値未満でも開始してよい)。
-        if processed_secs >= READY_THRESHOLD_SECS || clock.is_eof_reached() {
+        if !pending_at_head
+            && (processed_secs >= READY_THRESHOLD_SECS || clock.is_demux_exhausted())
+        {
             // T15 (Codex R-VENG-001): BufferReady を **engine が待っている state でのみ** 送る。
             // 旧コードは Playing 中も pump loop ごと (audio frame rate ≈ 100-200Hz) に
             // BufferReady を try_send していた。engine 側はそれを epoch < current 早期 return
@@ -1734,8 +3182,39 @@ fn run_pump(
         // ── A/V drift instrumentation: 1Hz snapshot + edge JSONL emit (Codex P1 ① 反映) ──
         // RT callback は atomic を書くだけ。実際の `perf::event` (= JSON 構築 + writer
         // mutex) は pump スレッドのここでまとめる。callback への影響ゼロ。
+        // The callback publishes this pair under the same existing buffer lock. Copy only;
+        // formatting/logging after unlocking keeps the serial and PTS coherent and RT-safe.
+        let first_output = {
+            let _buf = buffer.lock().unwrap();
+            let serial = diagnostics.first_output_serial.load(Ordering::Acquire);
+            (serial != u64::MAX && serial != logged_first_output_serial).then(|| {
+                (
+                    serial,
+                    f64::from_bits(diagnostics.first_output_pts_bits.load(Ordering::Relaxed)),
+                )
+            })
+        };
+        if let Some((serial, pts)) = first_output {
+            logged_first_output_serial = serial;
+            audio_epoch_event(
+                "first_device_output",
+                serial,
+                &[
+                    ("pts", serde_json::Value::from(pts)),
+                    (
+                        "stream_id",
+                        serde_json::Value::from(
+                            diagnostics.audio_stream_id.load(Ordering::Acquire),
+                        ),
+                    ),
+                    ("sample_rate", serde_json::Value::from(sample_rate)),
+                ],
+            );
+        }
+
         if crate::perf::is_enabled() {
             let log_now = std::time::Instant::now();
+            let stream_id = diagnostics.audio_stream_id.load(Ordering::Acquire);
 
             // (1) 1Hz snapshot: underrun 状態 / 直近 1 秒の silence ms / バッファ残量
             if log_now.duration_since(last_diag_log_at) >= std::time::Duration::from_secs(1) {
@@ -1746,6 +3225,25 @@ fn run_pump(
                 let silence_delta_samples = silence_total.saturating_sub(last_silence_total_logged);
                 last_silence_total_logged = silence_total;
                 let silence_delta_ms = (silence_delta_samples as f64 / samples_per_sec) * 1000.0;
+                let callback_count = diagnostics.callback_count.load(Ordering::Acquire);
+                let callback_count_delta =
+                    callback_count.saturating_sub(last_callback_count_logged);
+                last_callback_count_logged = callback_count;
+                let callback_late_count = diagnostics.callback_late_count.load(Ordering::Acquire);
+                let callback_late_count_delta =
+                    callback_late_count.saturating_sub(last_callback_late_count_logged);
+                last_callback_late_count_logged = callback_late_count;
+                let underrun_begin_seq =
+                    diagnostics.audio_underrun_begin_seq.load(Ordering::Acquire);
+                let underrun_begin_delta =
+                    underrun_begin_seq.saturating_sub(last_underrun_begin_seq_logged);
+                last_underrun_begin_seq_logged = underrun_begin_seq;
+                let underrun_end_seq = diagnostics.audio_underrun_end_seq.load(Ordering::Acquire);
+                let underrun_end_delta =
+                    underrun_end_seq.saturating_sub(last_underrun_end_seq_logged);
+                last_underrun_end_seq_logged = underrun_end_seq;
+                let (interval_max_ns, late_max_ns, lock_wait_max_ns, fill_max_ns) =
+                    diagnostics.take_interval_maxima_ns();
                 crate::perf::event(
                     "audio_out",
                     "snapshot",
@@ -1759,8 +3257,99 @@ fn run_pump(
                         ),
                         ("processed_secs", serde_json::Value::from(processed_secs)),
                         (
+                            "raw_pending_secs",
+                            serde_json::Value::from(clock.audio_raw_pending_secs()),
+                        ),
+                        (
                             "audio_tx_queued_secs",
                             serde_json::Value::from(clock.audio_tx_queued_secs()),
+                        ),
+                        ("callback_count", serde_json::Value::from(callback_count)),
+                        (
+                            "callback_count_delta",
+                            serde_json::Value::from(callback_count_delta),
+                        ),
+                        (
+                            "callback_late_count",
+                            serde_json::Value::from(callback_late_count),
+                        ),
+                        (
+                            "callback_late_count_delta",
+                            serde_json::Value::from(callback_late_count_delta),
+                        ),
+                        (
+                            "callback_expected_period_ms",
+                            serde_json::Value::from(
+                                diagnostics
+                                    .callback_expected_period_ns
+                                    .load(Ordering::Acquire) as f64
+                                    / 1.0e6,
+                            ),
+                        ),
+                        (
+                            "callback_interval_ms_latest",
+                            serde_json::Value::from(
+                                diagnostics
+                                    .callback_interval_latest_ns
+                                    .load(Ordering::Acquire) as f64
+                                    / 1.0e6,
+                            ),
+                        ),
+                        (
+                            "callback_latest_wall_ns",
+                            serde_json::Value::from(
+                                diagnostics.callback_latest_wall_ns.load(Ordering::Acquire),
+                            ),
+                        ),
+                        (
+                            "callback_interval_ms_max",
+                            serde_json::Value::from(interval_max_ns as f64 / 1.0e6),
+                        ),
+                        (
+                            "callback_late_ms_max",
+                            serde_json::Value::from(late_max_ns as f64 / 1.0e6),
+                        ),
+                        (
+                            "buffer_lock_wait_ms_max",
+                            serde_json::Value::from(lock_wait_max_ns as f64 / 1.0e6),
+                        ),
+                        (
+                            "fill_ms_max",
+                            serde_json::Value::from(fill_max_ns as f64 / 1.0e6),
+                        ),
+                        (
+                            "seek_serial",
+                            serde_json::Value::from(
+                                diagnostics.callback_seek_serial.load(Ordering::Acquire),
+                            ),
+                        ),
+                        (
+                            "engine_state",
+                            serde_json::Value::from(
+                                diagnostics.callback_engine_state.load(Ordering::Acquire),
+                            ),
+                        ),
+                        (
+                            "stream_id",
+                            serde_json::Value::from(
+                                diagnostics.audio_stream_id.load(Ordering::Acquire),
+                            ),
+                        ),
+                        (
+                            "underrun_begin_seq",
+                            serde_json::Value::from(underrun_begin_seq),
+                        ),
+                        (
+                            "underrun_begin_delta",
+                            serde_json::Value::from(underrun_begin_delta),
+                        ),
+                        (
+                            "underrun_end_seq",
+                            serde_json::Value::from(underrun_end_seq),
+                        ),
+                        (
+                            "underrun_end_delta",
+                            serde_json::Value::from(underrun_end_delta),
                         ),
                     ],
                 );
@@ -1771,6 +3360,7 @@ fn run_pump(
             //     その変化を poll して即時 emit (50-200ms 解像度で取りたい)。
             let cur_begin_seq = diagnostics.audio_underrun_begin_seq.load(Ordering::Acquire);
             if cur_begin_seq != last_seen_underrun_begin_seq {
+                let edge_delta = cur_begin_seq.saturating_sub(last_seen_underrun_begin_seq);
                 last_seen_underrun_begin_seq = cur_begin_seq;
                 let wall_ns = diagnostics
                     .audio_underrun_begin_wall_ns
@@ -1783,6 +3373,21 @@ fn run_pump(
                     None,
                     0,
                     &[
+                        ("stream_id", serde_json::Value::from(stream_id)),
+                        ("count", serde_json::Value::from(cur_begin_seq)),
+                        ("delta", serde_json::Value::from(edge_delta)),
+                        (
+                            "seek_serial",
+                            serde_json::Value::from(
+                                diagnostics.callback_seek_serial.load(Ordering::Acquire),
+                            ),
+                        ),
+                        (
+                            "engine_state",
+                            serde_json::Value::from(
+                                diagnostics.callback_engine_state.load(Ordering::Acquire),
+                            ),
+                        ),
                         ("edge_wall_ns", serde_json::Value::from(wall_ns as i64)),
                         ("edge_age_ms", serde_json::Value::from(edge_age_ms)),
                     ],
@@ -1790,6 +3395,7 @@ fn run_pump(
             }
             let cur_end_seq = diagnostics.audio_underrun_end_seq.load(Ordering::Acquire);
             if cur_end_seq != last_seen_underrun_end_seq {
+                let edge_delta = cur_end_seq.saturating_sub(last_seen_underrun_end_seq);
                 last_seen_underrun_end_seq = cur_end_seq;
                 let wall_ns = diagnostics
                     .audio_underrun_end_wall_ns
@@ -1802,6 +3408,21 @@ fn run_pump(
                     None,
                     0,
                     &[
+                        ("stream_id", serde_json::Value::from(stream_id)),
+                        ("count", serde_json::Value::from(cur_end_seq)),
+                        ("delta", serde_json::Value::from(edge_delta)),
+                        (
+                            "seek_serial",
+                            serde_json::Value::from(
+                                diagnostics.callback_seek_serial.load(Ordering::Acquire),
+                            ),
+                        ),
+                        (
+                            "engine_state",
+                            serde_json::Value::from(
+                                diagnostics.callback_engine_state.load(Ordering::Acquire),
+                            ),
+                        ),
                         ("edge_wall_ns", serde_json::Value::from(wall_ns as i64)),
                         ("edge_age_ms", serde_json::Value::from(edge_age_ms)),
                     ],
@@ -1811,6 +3432,7 @@ fn run_pump(
             // (3) audio_pts_jump: callback 側で閾値判定済みのものだけ seq が上がる。
             let cur_jump_seq = diagnostics.audio_pts_jump_seq.load(Ordering::Acquire);
             if cur_jump_seq != last_seen_pts_jump_seq {
+                let edge_delta = cur_jump_seq.saturating_sub(last_seen_pts_jump_seq);
                 last_seen_pts_jump_seq = cur_jump_seq;
                 let req = f64::from_bits(
                     diagnostics
@@ -1838,6 +3460,9 @@ fn run_pump(
                     None,
                     0,
                     &[
+                        ("stream_id", serde_json::Value::from(stream_id)),
+                        ("count", serde_json::Value::from(cur_jump_seq)),
+                        ("delta", serde_json::Value::from(edge_delta)),
                         ("requested_pts", serde_json::Value::from(req)),
                         ("prev_now", serde_json::Value::from(prev)),
                         ("after_now", serde_json::Value::from(after)),
@@ -1852,6 +3477,148 @@ fn run_pump(
                 );
             }
         }
+
+        let device_errors = diagnostics.device_error_count.load(Ordering::Acquire);
+        if device_errors != last_seen_device_error_count {
+            let delta = device_errors.saturating_sub(last_seen_device_error_count);
+            last_seen_device_error_count = device_errors;
+            let category = diagnostics.device_error_category.load(Ordering::Acquire);
+            crate::logger::log(format!(
+                "cpal output stream error: category={} count={} delta={}",
+                device_error_category_label(category),
+                device_errors,
+                delta
+            ));
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "audio_out",
+                    "device_error",
+                    None,
+                    0,
+                    &[
+                        (
+                            "stream_id",
+                            serde_json::Value::from(
+                                diagnostics.audio_stream_id.load(Ordering::Acquire),
+                            ),
+                        ),
+                        (
+                            "category",
+                            serde_json::Value::from(device_error_category_label(category)),
+                        ),
+                        ("count", serde_json::Value::from(device_errors)),
+                        ("delta", serde_json::Value::from(delta)),
+                        (
+                            "edge_wall_ns",
+                            serde_json::Value::from(
+                                diagnostics.device_error_wall_ns.load(Ordering::Acquire),
+                            ),
+                        ),
+                    ],
+                );
+            }
+        }
+        let stale_seq = diagnostics.stale_clear_seq.load(Ordering::Acquire);
+        if stale_seq != last_seen_stale_clear_seq {
+            let stale_delta = stale_seq.saturating_sub(last_seen_stale_clear_seq);
+            last_seen_stale_clear_seq = stale_seq;
+            let pump_serial = diagnostics.stale_clear_pump_serial.load(Ordering::Acquire);
+            let live_serial = diagnostics.stale_clear_live_serial.load(Ordering::Acquire);
+            let processed_secs = f64::from_bits(
+                diagnostics
+                    .stale_clear_processed_secs_bits
+                    .load(Ordering::Acquire),
+            );
+            let raw_pending_secs = f64::from_bits(
+                diagnostics
+                    .stale_clear_raw_pending_secs_bits
+                    .load(Ordering::Acquire),
+            );
+            crate::logger::log(format!(
+                "[audio-out] fill_output stale clear: count={stale_seq} delta={stale_delta} pump_serial={pump_serial} live_serial={live_serial} processed_secs={processed_secs:.3} raw_pending_secs={raw_pending_secs:.3}"
+            ));
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "audio_out",
+                    "fill_output_stale_clear",
+                    None,
+                    0,
+                    &[
+                        (
+                            "stream_id",
+                            serde_json::Value::from(
+                                diagnostics.audio_stream_id.load(Ordering::Acquire),
+                            ),
+                        ),
+                        ("count", serde_json::Value::from(stale_seq)),
+                        ("delta", serde_json::Value::from(stale_delta)),
+                        ("pump_serial", serde_json::Value::from(pump_serial)),
+                        ("live_serial", serde_json::Value::from(live_serial)),
+                        ("processed_secs", serde_json::Value::from(processed_secs)),
+                        (
+                            "raw_pending_secs",
+                            serde_json::Value::from(raw_pending_secs),
+                        ),
+                    ],
+                );
+            }
+        }
+        let pdc_seq = diagnostics.pdc_change_seq.load(Ordering::Acquire);
+        if pdc_seq != last_seen_pdc_change_seq {
+            let pdc_delta = pdc_seq.saturating_sub(last_seen_pdc_change_seq);
+            last_seen_pdc_change_seq = pdc_seq;
+            let delta_secs = f64::from_bits(
+                diagnostics
+                    .pdc_change_delta_secs_bits
+                    .load(Ordering::Acquire),
+            );
+            let pts_secs =
+                f64::from_bits(diagnostics.pdc_change_pts_secs_bits.load(Ordering::Acquire));
+            crate::logger::log(format!(
+                "[VST3 PDC] fill_output: count={pdc_seq} delta={pdc_delta} chunk latency change ({:+.1}ms) -> jump video clock to {:.3}s",
+                delta_secs * 1000.0,
+                pts_secs
+            ));
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "audio_out",
+                    "pdc_change",
+                    None,
+                    0,
+                    &[
+                        (
+                            "stream_id",
+                            serde_json::Value::from(
+                                diagnostics.audio_stream_id.load(Ordering::Acquire),
+                            ),
+                        ),
+                        ("count", serde_json::Value::from(pdc_seq)),
+                        ("delta", serde_json::Value::from(pdc_delta)),
+                        ("delta_ms", serde_json::Value::from(delta_secs * 1000.0)),
+                        ("pts", serde_json::Value::from(pts_secs)),
+                    ],
+                );
+            }
+        }
+    }
+    if input_disconnected {
+        // No producer can refill these queues. Publishing zero is required for
+        // the EOF/loop quiet gate, including when raw back-pressure was active.
+        let mut buf = buffer.lock().unwrap();
+        buf.processed.clear();
+        #[cfg(feature = "test-script")]
+        {
+            buf.last_processed_frequency_hz = None;
+        }
+        buf.raw_pending.clear();
+        buf.drain_offset_in_first = 0;
+        buf.pdc_latency_secs = 0.0;
+        buf.pdc_latency_secs_applied = 0.0;
+        buf.next_pts_secs = clock.now_secs();
+        publish_buffer_secs(&buf, &clock);
+        drop(buf);
+        clock.reset_audio_bookkeeping_only();
+        clock.mark_audio_inactive();
     }
     // ── 終了時の silence flush (= 既存) ──
     // T20 (Codex P2 2026-05-16): cancel が立っているときは flush_silence をスキップする。
@@ -1859,14 +3626,38 @@ fn run_pump(
     // 通常終了 (= 動画 EOF / 停止) では tail silence を吐き切る価値があるが、cancel 経由
     // (= 動画切替 / Drop) では即 exit したいので skip。
     #[cfg(windows)]
-    if !cancel.load(Ordering::Acquire) {
+    if !cancel.load(Ordering::Acquire)
+        && let Some(_flush_permit) = dsp_control
+            .as_ref()
+            .filter(|control| control.dsp_armed.load(Ordering::Acquire))
+            .and_then(|control| {
+                control
+                    .chain
+                    .coordinator
+                    .local_permit(control.pump_instance)
+            })
+    {
         if let Some(b) = &dsp_bridge {
             if b.is_enabled() && b.active_slot_count() > 0 {
                 b.flush_silence(480, 10);
             }
         }
+        if let Some((_, bridge)) = effetune_slot.as_ref().and_then(|slot| slot.snapshot()) {
+            if bridge.is_enabled() && bridge.active_slot_count() > 0 {
+                bridge.flush_silence(480, 10);
+            }
+        }
     }
     crate::logger::log("audio-pump terminated");
+}
+
+fn processed_chunk_matches_live_seek(
+    chunk_serial: u64,
+    dequeued_serial: u64,
+    pump_serial: u64,
+    clock_serial: u64,
+) -> bool {
+    chunk_serial == dequeued_serial && chunk_serial == pump_serial && chunk_serial == clock_serial
 }
 
 /// pre-target trim 結果。
@@ -1988,10 +3779,19 @@ fn fill_output(
     clock: &Arc<AvClock>,
     engine_state: &Arc<AtomicU8>,
     diagnostics: &Arc<AudioDiagnostics>,
+    callback_started_at: Option<std::time::Instant>,
 ) {
+    let _timing = FillTiming {
+        diagnostics,
+        started_at: callback_started_at,
+    };
     // ── pre-seek discard (= state gate より先、Codex P1-4) ──
     let clock_serial = clock.current_seek_serial();
+    let lock_started_at = callback_started_at.map(|_| std::time::Instant::now());
     let mut buf = buffer.lock().unwrap();
+    if let Some(started_at) = lock_started_at {
+        diagnostics.record_buffer_lock_wait(duration_ns_u64(started_at.elapsed()));
+    }
 
     if buf.pump_seek_serial < clock_serial {
         let pump_serial = buf.pump_seek_serial;
@@ -2003,32 +3803,21 @@ fn fill_output(
             buf.last_fill_stale_clear_logged_serial = clock_serial;
         }
         buf.processed.clear();
+        #[cfg(feature = "test-script")]
+        {
+            buf.last_processed_frequency_hz = None;
+        }
         buf.drain_offset_in_first = 0;
         buf.raw_pending.clear();
         publish_buffer_secs(&buf, clock);
         drop(buf);
         if should_log {
-            crate::logger::log(format!(
-                "[audio-out] fill_output stale clear: pump_serial={} live_serial={} processed_secs={:.3} raw_pending_secs={:.3}",
-                pump_serial, clock_serial, processed_secs, raw_pending_secs
-            ));
-            if crate::perf::is_enabled() {
-                crate::perf::event(
-                    "audio_out",
-                    "fill_output_stale_clear",
-                    None,
-                    0,
-                    &[
-                        ("pump_serial", serde_json::Value::from(pump_serial as i64)),
-                        ("live_serial", serde_json::Value::from(clock_serial as i64)),
-                        ("processed_secs", serde_json::Value::from(processed_secs)),
-                        (
-                            "raw_pending_secs",
-                            serde_json::Value::from(raw_pending_secs),
-                        ),
-                    ],
-                );
-            }
+            diagnostics.record_stale_clear(
+                pump_serial,
+                clock_serial,
+                processed_secs,
+                raw_pending_secs,
+            );
         }
         out.fill(0.0);
         return;
@@ -2105,6 +3894,22 @@ fn fill_output(
         for i in 0..take {
             out[written + i] = first.samples[buf.drain_offset_in_first + i] * vol;
         }
+        let output_serial = first.seek_serial;
+        if diagnostics.first_output_serial.load(Ordering::Relaxed) != output_serial
+            && let Some(index) = out[written..written + take]
+                .iter()
+                .position(|sample| sample.abs() > 1e-6)
+        {
+            let pts = chunk_audible_pts
+                + ((buf.drain_offset_in_first + index) / 2) as f64 / (samples_per_sec / 2.0)
+                    * chunk_source_rate;
+            diagnostics
+                .first_output_pts_bits
+                .store(pts.to_bits(), Ordering::Relaxed);
+            diagnostics
+                .first_output_serial
+                .store(output_serial, Ordering::Release);
+        }
         written += take;
         real_consumed += take;
         buf.drain_offset_in_first += take;
@@ -2133,6 +3938,10 @@ fn fill_output(
     // **buf.next_pts_secs を audible PTS で更新** (= chunk metadata baked-in)。
     // 以後 publish_buffer_secs / underrun resync は audible PTS ベースで動く。
     if let Some(audible) = next_audible_pts {
+        diagnostics
+            .output_frames_total
+            .fetch_add((real_consumed / 2) as u64, Ordering::Release);
+
         buf.next_pts_secs = audible;
     }
     let pts_for_video = next_audible_pts.unwrap_or(buf.next_pts_secs);
@@ -2147,11 +3956,7 @@ fn fill_output(
         let delta_secs = latency - buf.pdc_latency_secs_applied;
         if delta_secs.abs() > PDC_JUMP_THRESHOLD_SECS {
             latency_jumped = true;
-            crate::logger::log(format!(
-                "[VST3 PDC] fill_output: chunk latency change ({:+.1}ms) -> jump video clock to {:.3}s",
-                delta_secs * 1000.0,
-                pts_for_video
-            ));
+            diagnostics.record_pdc_change(delta_secs, pts_for_video);
         }
         if delta_secs.abs() > 1e-6 {
             buf.pdc_latency_secs_applied = latency;
@@ -2241,8 +4046,412 @@ mod tests {
     //! 各シナリオで意図通り動くことを構造的に保証する。
 
     use super::*;
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn processed_chunk_frequency_estimator_identifies_fixture_tones() {
+        for tone in [440.0, 880.0, 1320.0] {
+            let samples = (0..2048)
+                .flat_map(|frame| {
+                    let phase = std::f64::consts::TAU * tone * frame as f64 / 48_000.0;
+                    [phase.sin() as f32, phase.sin() as f32]
+                })
+                .collect::<Vec<_>>();
+            let estimated = estimate_processed_frequency_hz(&samples, 48_000).unwrap();
+            assert!(
+                (estimated - tone).abs() < 2.0,
+                "tone={tone} estimated={estimated}"
+            );
+        }
+        assert_eq!(
+            estimate_processed_frequency_hz(&vec![0.0; 4096], 48_000),
+            None
+        );
+    }
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn dry_block_dequeued_before_seek_cannot_commit_after_clock_serial_advances() {
+        assert!(super::processed_chunk_matches_live_seek(7, 7, 7, 7));
+        // The pump's buffer serial can lag the clock after a seek request.
+        assert!(!super::processed_chunk_matches_live_seek(7, 7, 7, 8));
+        assert!(!super::processed_chunk_matches_live_seek(7, 7, 8, 8));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn eos_local_tail_host_admission_rechecks_permit_seek_and_cancel() {
+        let clock = make_clock();
+        let cancel = AtomicBool::new(false);
+        assert!(local_tail_dsp_allowed(true, 0, &clock, &cancel));
+        assert!(!local_tail_dsp_allowed(false, 0, &clock, &cancel));
+        cancel.store(true, Ordering::Release);
+        assert!(!local_tail_dsp_allowed(true, 0, &clock, &cancel));
+        cancel.store(false, Ordering::Release);
+        clock.request_seek(1.0);
+        assert!(!local_tail_dsp_allowed(true, 0, &clock, &cancel));
+        assert!(local_tail_dsp_allowed(true, 1, &clock, &cancel));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dry_pump_block_cannot_commit_after_concurrent_grant() {
+        use crate::video::dsp::coordinator::{DspOwner, DspProcessingCoordinator};
+
+        let coordinator = Arc::new(DspProcessingCoordinator::default());
+        let chain = AudioDspChain {
+            user: None,
+            effetune: Arc::new(crate::effetune::EffetuneAudioSlot::default()),
+            coordinator: Arc::clone(&coordinator),
+        };
+        let (at_commit_tx, at_commit_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        let control = Arc::new(LocalDspControl {
+            pump_instance: 81,
+            epoch: AtomicU64::new(0),
+            chain: chain.clone(),
+            dsp_armed: AtomicBool::new(true),
+            applicable_seen: AtomicBool::new(false),
+            test_applicable: AtomicBool::new(false),
+            test_handoff_spawn_failure: AtomicBool::new(false),
+            test_handoff_attempts: AtomicU64::new(0),
+            before_dry_commit: Some(Arc::new(move || {
+                at_commit_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })),
+        });
+        let buffer = make_buffer(48_000);
+        let clock = make_clock();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (audio_tx, audio_rx) = bounded(1);
+        let (shutdown_tx, shutdown_rx) = bounded(1);
+        let (event_tx, _event_rx) = bounded(8);
+        let event_tx = crate::video::EngineEventSender::new(
+            event_tx,
+            Arc::new(crate::video::VideoUiWake::default()),
+        );
+        let (_tap_tx, tap_rx) = unbounded();
+        let pump = {
+            let buffer = Arc::clone(&buffer);
+            let cancel = Arc::clone(&cancel);
+            let clock = Arc::clone(&clock);
+            std::thread::spawn(move || {
+                run_pump(
+                    audio_rx,
+                    shutdown_rx,
+                    buffer,
+                    cancel,
+                    clock,
+                    event_tx,
+                    playing_state(),
+                    make_diag(),
+                    tap_rx,
+                    Some(chain),
+                    Some(control),
+                );
+            })
+        };
+        audio_tx
+            .send(AudioFrame {
+                samples: vec![0.25; 1_920],
+                pts_secs: 0.0,
+                stream_index: 0,
+                seek_serial: 0,
+                duration_secs: 0.02,
+                queued_wall_secs: 0.02,
+                audio_tx_accounting_epoch: 0,
+                seek_target_secs: Some(0.0),
+            })
+            .unwrap();
+        at_commit_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("pump must reach the real dry-block commit");
+        let request = coordinator
+            .reserve(DspOwner::Local {
+                pump_instance: 81,
+                epoch: 1,
+            })
+            .unwrap();
+        let handoff = coordinator
+            .wait_handoff(
+                request,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(handoff.grant());
+        release_tx.send(()).unwrap();
+        cancel.store(true, Ordering::Release);
+        let _ = shutdown_tx.send(());
+        pump.join().unwrap();
+        assert!(buffer.lock().unwrap().processed.is_empty());
+    }
+
+    #[cfg(windows)]
+    fn test_chain(
+        coordinator: Arc<crate::video::dsp::coordinator::DspProcessingCoordinator>,
+    ) -> AudioDspChain {
+        AudioDspChain {
+            user: None,
+            effetune: Arc::new(crate::effetune::EffetuneAudioSlot::default()),
+            coordinator,
+        }
+    }
+
+    #[cfg(windows)]
+    fn start_test_pump(
+        chain: AudioDspChain,
+        control: Arc<LocalDspControl>,
+    ) -> (
+        Sender<AudioFrame>,
+        Sender<()>,
+        Arc<AtomicBool>,
+        Arc<Mutex<AudioBuffer>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let buffer = make_buffer(48_000);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (audio_tx, audio_rx) = bounded(2);
+        let (shutdown_tx, shutdown_rx) = bounded(1);
+        let (event_tx, _event_rx) = bounded(8);
+        let event_tx = crate::video::EngineEventSender::new(
+            event_tx,
+            Arc::new(crate::video::VideoUiWake::default()),
+        );
+        let (_tap_tx, tap_rx) = unbounded();
+        let pump_buffer = Arc::clone(&buffer);
+        let pump_cancel = Arc::clone(&cancel);
+        let pump = std::thread::spawn(move || {
+            run_pump(
+                audio_rx,
+                shutdown_rx,
+                pump_buffer,
+                pump_cancel,
+                make_clock(),
+                event_tx,
+                playing_state(),
+                make_diag(),
+                tap_rx,
+                Some(chain),
+                Some(control),
+            );
+        });
+        (audio_tx, shutdown_tx, cancel, buffer, pump)
+    }
+
+    #[cfg(windows)]
+    fn send_test_frame(tx: &Sender<AudioFrame>, pts_secs: f64) {
+        tx.send(AudioFrame {
+            samples: vec![0.25; 1_920],
+            pts_secs,
+            stream_index: 0,
+            seek_serial: 0,
+            duration_secs: 0.02,
+            queued_wall_secs: 0.02,
+            audio_tx_accounting_epoch: 0,
+            seek_target_secs: Some(0.0),
+        })
+        .unwrap();
+    }
+
+    #[cfg(windows)]
+    fn processed_reaches(buffer: &Arc<Mutex<AudioBuffer>>, count: usize) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if buffer.lock().unwrap().processed.len() >= count {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        false
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn other_playing_pump_grant_preserves_dry_pump_commit() {
+        use crate::video::dsp::coordinator::{DspOwner, DspProcessingCoordinator};
+
+        let coordinator = Arc::new(DspProcessingCoordinator::default());
+        let chain = test_chain(Arc::clone(&coordinator));
+        let (at_commit_tx, at_commit_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        let dry_control = Arc::new(LocalDspControl {
+            pump_instance: 91,
+            epoch: AtomicU64::new(0),
+            chain: chain.clone(),
+            dsp_armed: AtomicBool::new(true),
+            applicable_seen: AtomicBool::new(false),
+            test_applicable: AtomicBool::new(false),
+            test_handoff_spawn_failure: AtomicBool::new(false),
+            test_handoff_attempts: AtomicU64::new(0),
+            before_dry_commit: Some(Arc::new(move || {
+                at_commit_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })),
+        });
+        let (dry_tx, dry_shutdown, dry_cancel, dry_buffer, dry_pump) =
+            start_test_pump(chain.clone(), dry_control);
+        send_test_frame(&dry_tx, 0.0);
+        at_commit_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("dry pump must reach commit");
+
+        let owner_control = Arc::new(LocalDspControl {
+            pump_instance: 92,
+            epoch: AtomicU64::new(0),
+            chain: chain.clone(),
+            dsp_armed: AtomicBool::new(true),
+            applicable_seen: AtomicBool::new(true),
+            test_applicable: AtomicBool::new(true),
+            test_handoff_spawn_failure: AtomicBool::new(false),
+            test_handoff_attempts: AtomicU64::new(0),
+            before_dry_commit: None,
+        });
+        let (owner_tx, owner_shutdown, owner_cancel, owner_buffer, owner_pump) =
+            start_test_pump(chain, owner_control);
+        let request = coordinator
+            .reserve(DspOwner::Local {
+                pump_instance: 92,
+                epoch: 1,
+            })
+            .unwrap();
+        assert!(
+            coordinator
+                .wait_handoff(
+                    request,
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                    &AtomicBool::new(false),
+                )
+                .unwrap()
+                .grant()
+        );
+        send_test_frame(&owner_tx, 0.0);
+        let owner_committed = processed_reaches(&owner_buffer, 1);
+        release_tx.send(()).unwrap();
+        let dry_committed = processed_reaches(&dry_buffer, 1);
+        dry_cancel.store(true, Ordering::Release);
+        owner_cancel.store(true, Ordering::Release);
+        let _ = dry_shutdown.send(());
+        let _ = owner_shutdown.send(());
+        dry_pump.join().unwrap();
+        owner_pump.join().unwrap();
+        assert!(
+            owner_committed,
+            "new owner's playing pump must emit DSP audio"
+        );
+        assert!(
+            dry_committed,
+            "unrelated dry pump must retain its audible block"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tokenless_stage_deactivation_preserves_in_flight_dry_audio() {
+        use crate::video::dsp::coordinator::{DspOwner, DspProcessingCoordinator};
+
+        let coordinator = Arc::new(DspProcessingCoordinator::default());
+        let owner = coordinator
+            .reserve(DspOwner::Local {
+                pump_instance: 102,
+                epoch: 1,
+            })
+            .unwrap();
+        assert!(
+            coordinator
+                .wait_handoff(
+                    owner,
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                    &AtomicBool::new(false),
+                )
+                .unwrap()
+                .grant()
+        );
+
+        let chain = test_chain(Arc::clone(&coordinator));
+        let (at_commit_tx, at_commit_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        let control = Arc::new(LocalDspControl {
+            pump_instance: 101,
+            epoch: AtomicU64::new(0),
+            chain: chain.clone(),
+            dsp_armed: AtomicBool::new(true),
+            applicable_seen: AtomicBool::new(true),
+            test_applicable: AtomicBool::new(true),
+            test_handoff_spawn_failure: AtomicBool::new(false),
+            test_handoff_attempts: AtomicU64::new(0),
+            before_dry_commit: Some(Arc::new(move || {
+                at_commit_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })),
+        });
+        let mut output = AudioOutput::connected_without_output_for_test(48_000);
+        output.dsp_control = Some(Arc::clone(&control));
+        let (audio_tx, shutdown_tx, cancel, buffer, pump) = start_test_pump(chain, control);
+        send_test_frame(&audio_tx, 0.0);
+        at_commit_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("dry block must pause before commit");
+
+        output.set_dsp_applicable_for_test(false);
+        assert!(!output.newly_applicable_dsp());
+        release_tx.send(()).unwrap();
+        let committed = processed_reaches(&buffer, 1);
+        cancel.store(true, Ordering::Release);
+        let _ = shutdown_tx.send(());
+        pump.join().unwrap();
+        drop(output);
+        assert!(
+            committed,
+            "deactivation must not discard an unrelated dry block"
+        );
+        assert!(coordinator.is_granted(owner));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn no_stage_pump_uses_only_atomic_gate_while_coordinator_lock_is_held() {
+        use crate::video::dsp::coordinator::DspProcessingCoordinator;
+
+        let coordinator = Arc::new(DspProcessingCoordinator::default());
+        let chain = test_chain(Arc::clone(&coordinator));
+        let control = Arc::new(LocalDspControl {
+            pump_instance: 93,
+            epoch: AtomicU64::new(0),
+            chain: chain.clone(),
+            dsp_armed: AtomicBool::new(false),
+            applicable_seen: AtomicBool::new(false),
+            test_applicable: AtomicBool::new(false),
+            test_handoff_spawn_failure: AtomicBool::new(false),
+            test_handoff_attempts: AtomicU64::new(0),
+            before_dry_commit: None,
+        });
+        let (audio_tx, shutdown_tx, cancel, buffer, pump) = start_test_pump(chain, control);
+        send_test_frame(&audio_tx, 0.0);
+        assert!(processed_reaches(&buffer, 1));
+
+        let (locked_tx, locked_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        let holder = std::thread::spawn(move || {
+            coordinator.with_state_lock_for_test(|| {
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        locked_rx.recv().unwrap();
+        send_test_frame(&audio_tx, 0.02);
+        let committed_while_locked = processed_reaches(&buffer, 2);
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        cancel.store(true, Ordering::Release);
+        let _ = shutdown_tx.send(());
+        pump.join().unwrap();
+        assert!(
+            committed_while_locked,
+            "no-stage pump must not take the coordinator lock"
+        );
+    }
 
     fn make_clock() -> Arc<AvClock> {
         let seek_serial = Arc::new(AtomicU64::new(0));
@@ -2255,6 +4464,8 @@ mod tests {
     fn make_buffer(sample_rate: u32) -> Arc<Mutex<AudioBuffer>> {
         Arc::new(Mutex::new(AudioBuffer {
             processed: std::collections::VecDeque::new(),
+            #[cfg(feature = "test-script")]
+            last_processed_frequency_hz: None,
             drain_offset_in_first: 0,
             raw_pending: std::collections::VecDeque::new(),
             next_pts_secs: 0.0,
@@ -2287,11 +4498,1140 @@ mod tests {
             source_secs_per_output_sec: 1.0,
             seek_serial: 0,
             pdc_latency_secs_at_process: 0.0,
+            effetune_generation: None,
         }
     }
 
     #[test]
-    fn audible_pts_uses_source_timeline_latency_and_clamps_at_zero() {
+    fn callback_trace_records_first_non_silent_pts_and_actual_consumption_per_seek() {
+        let clock = make_clock();
+        clock.set_volume(1.0);
+        let buffer = make_buffer(1_000);
+        let diagnostics = make_diag();
+        let state = playing_state();
+        buffer.lock().unwrap().processed.push_back(make_chunk(
+            vec![0.0, 0.0, 0.0, 0.0, 0.25, -0.25],
+            0.0,
+            2_000.0,
+        ));
+        let mut out = [0.0; 10];
+        fill_output(&mut out, &buffer, &clock, &state, &diagnostics, None);
+        assert_eq!(diagnostics.output_frames_total.load(Ordering::Acquire), 3);
+        assert_eq!(diagnostics.first_output_serial.load(Ordering::Acquire), 0);
+        assert_eq!(
+            f64::from_bits(diagnostics.first_output_pts_bits.load(Ordering::Acquire)),
+            0.002
+        );
+        assert_eq!(&out[6..], &[0.0; 4]); // underrun padding is not counted as real PCM
+
+        clock.request_seek(0.0);
+        clock.notify_seek_completed(0.0);
+        clock.clear_seek_target_override(clock.current_seek_serial());
+        clock.set_playing(true);
+        let serial = clock.current_seek_serial();
+        let mut chunk = make_chunk(vec![0.0, 0.0, 0.3, -0.3], 0.0, 2_000.0);
+        chunk.seek_serial = serial;
+        {
+            let mut buf = buffer.lock().unwrap();
+            buf.pump_seek_serial = serial;
+            buf.processed.push_back(chunk);
+        }
+        fill_output(&mut out, &buffer, &clock, &state, &diagnostics, None);
+        assert_eq!(diagnostics.output_frames_total.load(Ordering::Acquire), 5);
+        assert_eq!(
+            diagnostics.first_output_serial.load(Ordering::Acquire),
+            serial
+        );
+        assert_eq!(
+            f64::from_bits(diagnostics.first_output_pts_bits.load(Ordering::Acquire)),
+            0.001
+        );
+    }
+
+    #[test]
+    fn eos_tail_releases_pre_and_final_limiter_through_delayed_effetune() {
+        for rate in [1_000, 44_100, 48_000] {
+            for enabled in [false, true] {
+                for frames in [3, rate as usize / 50] {
+                    let mut pre = EffetuneInputLimiter::new(rate);
+                    let mut final_limiter = SafetyLimiter::new(rate, 2);
+                    let pre_frames = final_limiter.lookahead_frames;
+                    let effect_frames = rate as usize / 200;
+                    let mut delay = std::collections::VecDeque::from(vec![0.0; effect_frames * 2]);
+                    let mut effect =
+                        |generation, latency_frames, input: &[f32], output: &mut [f32]| {
+                            assert_eq!(generation, 7);
+                            assert_eq!(latency_frames, effect_frames);
+                            for (src, dst) in input.iter().zip(output) {
+                                delay.push_back(*src);
+                                *dst = delay.pop_front().unwrap();
+                            }
+                            true
+                        };
+                    let input = vec![0.35, -0.7].repeat(frames);
+                    let (limited, _) = pre.prepare(&input, 7, enabled);
+                    let mut samples = vec![0.0; input.len()];
+                    effect(7, effect_frames, limited, &mut samples);
+                    final_limiter.process_block(&mut samples);
+                    let mut chunk = make_chunk(samples.clone(), 10.0, rate as f64 * 2.0);
+                    chunk.effetune_generation = Some(7);
+                    chunk.source_secs_per_output_sec = 2.0;
+                    chunk.pdc_latency_secs_at_process =
+                        (pre_frames + effect_frames + final_limiter.lookahead_frames) as f64
+                            / rate as f64
+                            * 2.0;
+                    let mut tail = AudioDspTail::default();
+                    tail.capture(
+                        &chunk,
+                        effect_frames,
+                        pre_frames,
+                        final_limiter.lookahead_frames,
+                        1.0,
+                    );
+                    tail.start(0);
+                    let mut end_pts = chunk.audible_pts_secs + chunk.duration_secs * 2.0;
+                    while !tail.complete() {
+                        let next = tail
+                            .next(
+                                rate,
+                                &mut pre,
+                                &mut final_limiter,
+                                enabled,
+                                &mut effect,
+                                || panic!("no reduction expected"),
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            next.pdc_latency_secs_at_process,
+                            chunk.pdc_latency_secs_at_process
+                        );
+                        assert!((next.audible_pts_secs - end_pts).abs() < 1e-9);
+                        assert!(next.samples.len() <= (rate as usize / 100).max(1) * 2);
+                        end_pts += next.duration_secs * 2.0;
+                        samples.extend(next.samples);
+                    }
+                    let leading = (pre_frames + effect_frames + final_limiter.lookahead_frames) * 2;
+                    assert_eq!(&samples[..leading], vec![0.0; leading]);
+                    assert_eq!(&samples[leading..], input);
+                    // Repeated EOS cannot emit the same lookahead twice.
+                    tail.start(0);
+                    assert!(
+                        tail.next(
+                            rate,
+                            &mut pre,
+                            &mut final_limiter,
+                            enabled,
+                            &mut effect,
+                            || {}
+                        )
+                        .is_none()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn eos_tail_stale_generation_or_failed_stage_discards_upstream_audio() {
+        let rate = 1_000;
+        let mut pre = EffetuneInputLimiter::new(rate);
+        let mut final_limiter = SafetyLimiter::new(rate, 2);
+        let input = vec![0.6; 40];
+        let (limited, _) = pre.prepare(&input, 7, true);
+        let mut output = limited.to_vec();
+        final_limiter.process_block(&mut output);
+        let mut chunk = make_chunk(output, 0.0, 2_000.0);
+        chunk.effetune_generation = Some(7);
+        let mut tail = AudioDspTail::default();
+        tail.capture(&chunk, 0, 5, 5, 1.0);
+        tail.start(0);
+        let next = tail
+            .next(
+                rate,
+                &mut pre,
+                &mut final_limiter,
+                true,
+                |_, _, _, _| false,
+                || {},
+            )
+            .unwrap();
+        assert_eq!(next.samples, vec![0.6; 10]);
+        assert!(tail.complete());
+        tail.capture(&chunk, 0, 5, 5, 1.0);
+        tail.discard_stale(1);
+        tail.start(1);
+        assert!(
+            tail.next(
+                rate,
+                &mut pre,
+                &mut final_limiter,
+                true,
+                |_, _, _, _| panic!("stale stage"),
+                || {}
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn eos_local_pump_commits_nonzero_final_tail_once_and_only_on_normal_eos() {
+        for (normal_eos, frames, volume, input, expected) in [
+            (false, 20, 1.0, 0.25, 0.25),
+            (true, 3, 1.0, 0.25, 0.25),
+            (true, 20, 1.0, 1.28, 1.0),
+            (true, 20, 2.0, 0.25, 0.5),
+        ] {
+            let clock = make_clock();
+            clock.set_volume(volume);
+            let buffer = make_buffer(1_000);
+            let (tx, rx) = bounded(2);
+            let (shutdown_tx, shutdown_rx) = bounded(1);
+            let (event_tx, _event_rx) = bounded(8);
+            let event_tx = crate::video::EngineEventSender::new(
+                event_tx,
+                Arc::new(crate::video::VideoUiWake::default()),
+            );
+            let (_tap_tx, tap_rx) = unbounded();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let worker = {
+                let (clock, buffer, cancel) = (clock.clone(), buffer.clone(), cancel.clone());
+                std::thread::spawn(move || {
+                    run_pump(
+                        rx,
+                        shutdown_rx,
+                        buffer,
+                        cancel,
+                        clock,
+                        event_tx,
+                        playing_state(),
+                        make_diag(),
+                        tap_rx,
+                        #[cfg(windows)]
+                        None,
+                        #[cfg(windows)]
+                        None,
+                    )
+                })
+            };
+            tx.send(AudioFrame {
+                samples: vec![input; frames * 2],
+                pts_secs: 1.0,
+                duration_secs: frames as f64 / 1_000.0,
+                seek_serial: 0,
+                stream_index: 0,
+                seek_target_secs: None,
+                queued_wall_secs: frames as f64 / 1_000.0,
+                audio_tx_accounting_epoch: 0,
+            })
+            .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            if !normal_eos {
+                while buffer.lock().unwrap().processed.is_empty()
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                assert!(!buffer.lock().unwrap().processed.is_empty());
+            }
+            if normal_eos {
+                clock.note_audio_decoded_eos(0);
+                while !clock.audio_tail_complete() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                assert!(clock.audio_tail_complete());
+                clock.note_audio_decoded_eos(0);
+            }
+            cancel.store(true, Ordering::Release);
+            let _ = shutdown_tx.send(());
+            worker.join().unwrap();
+            let samples: Vec<_> = buffer
+                .lock()
+                .unwrap()
+                .processed
+                .iter()
+                .flat_map(|chunk| chunk.samples.clone())
+                .collect();
+            assert_eq!(
+                samples.len(),
+                if normal_eos {
+                    frames * 2
+                } else {
+                    (frames - 5) * 2
+                }
+            );
+            assert_eq!(samples, vec![expected; samples.len()]);
+            let buf = buffer.lock().unwrap();
+            assert!(
+                buf.processed
+                    .iter()
+                    .all(|chunk| chunk.pdc_latency_secs_at_process == 0.005)
+            );
+            assert_eq!(clock.limiter_ceiling_hit_seq() > 0, input > 1.0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn zero_start_pump_trims_latency_and_preserves_samples_through_eos_loop_and_seek() {
+        for rate in [44_100, 48_000] {
+            let lookahead = (SAFETY_LIMITER_LOOKAHEAD_SECS * rate as f64).round() as usize;
+            for chunks in [
+                vec![3],
+                vec![lookahead],
+                vec![lookahead + 1],
+                vec![1, 2],
+                vec![rate as usize / 50; 2],
+            ] {
+                for native in [false, true] {
+                    let frames: usize = chunks.iter().sum();
+                    let duration = frames as f64 / rate as f64;
+                    let expected: Vec<f32> = (0..frames)
+                        .flat_map(|index| {
+                            let sample = 0.2 + index as f32 / frames as f32 * 0.2;
+                            [sample, -sample]
+                        })
+                        .collect();
+                    let mut player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(
+                        "zero-start.mp4".into(),
+                    );
+                    player.configure_native_timing_for_test(0.0, duration, true, false);
+                    if !native {
+                        player.native_output = None;
+                    }
+                    player.clock.set_volume(1.0);
+                    player.clock.set_muted(false);
+                    player.clock.notify_audio_active();
+                    player.set_loop_enabled(true);
+                    let (tx, rx) = bounded(8);
+                    player.audio = Some(AudioOutput::pumping_without_device_for_test(
+                        rate,
+                        rx,
+                        player.clock.clone(),
+                        player.engine_event_tx.clone(),
+                        player.engine_state_atomic.clone(),
+                    ));
+                    let ctx = egui::Context::default();
+                    for phase in 0..3 {
+                        let serial = player.current_seek_serial();
+                        // Model the decoder's post-seek acknowledgement; the actual loop/seek
+                        // requests below create the serial and clear/reset the real pump.
+                        player.clock.notify_seek_completed(0.0);
+                        player.clock.clear_seek_target_override(serial);
+                        player.clock.set_playing(true);
+                        player
+                            .engine_state_atomic
+                            .store(state_code::PLAYING, Ordering::Release);
+                        let mut offset = 0;
+                        for count in &chunks {
+                            tx.send(AudioFrame {
+                                samples: expected[offset * 2..(offset + count) * 2].to_vec(),
+                                pts_secs: offset as f64 / rate as f64,
+                                duration_secs: *count as f64 / rate as f64,
+                                seek_serial: serial,
+                                stream_index: 0,
+                                seek_target_secs: (phase != 0).then_some(0.0),
+                                queued_wall_secs: *count as f64 / rate as f64,
+                                audio_tx_accounting_epoch: player
+                                    .clock
+                                    .audio_tx_accounting_snapshot()
+                                    .1,
+                            })
+                            .unwrap();
+                            offset += count;
+                        }
+                        player.clock.note_audio_decoded_eos(serial);
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(3);
+                        while !player.clock.audio_tail_complete()
+                            && std::time::Instant::now() < deadline
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                        assert!(
+                            player.clock.audio_tail_complete(),
+                            "rate={rate} phase={phase}"
+                        );
+                        let audio = player.audio.as_ref().unwrap();
+                        {
+                            let buf = audio.buffer.lock().unwrap();
+                            let output: Vec<f32> = buf
+                                .processed
+                                .iter()
+                                .flat_map(|chunk| chunk.samples.iter().copied())
+                                .collect();
+                            assert_eq!(
+                                output.len() / 2,
+                                frames,
+                                "rate={rate} phase={phase} chunks={chunks:?}"
+                            );
+                            assert_eq!(
+                                output, expected,
+                                "no startup silence, missing samples or stale tail"
+                            );
+                            let mut end = 0.0;
+                            for chunk in &buf.processed {
+                                assert_eq!(chunk.seek_serial, serial);
+                                assert!(
+                                    (chunk.audible_pts_secs - end).abs() < 1e-12,
+                                    "overlap/gap: rate={rate} phase={phase} pts={} end={end}",
+                                    chunk.audible_pts_secs
+                                );
+                                assert!(
+                                    (chunk.pdc_latency_secs_at_process
+                                        - lookahead as f64 / rate as f64)
+                                        .abs()
+                                        < 1e-12
+                                );
+                                end += chunk.duration_secs;
+                            }
+                            assert!((end - duration).abs() < 1e-12);
+                        }
+                        let mut consumed = vec![0.0; expected.len()];
+                        fill_output(
+                            &mut consumed,
+                            &audio.buffer,
+                            &player.clock,
+                            &player.engine_state_atomic,
+                            &audio.diagnostics,
+                            None,
+                        );
+                        assert_eq!(consumed, expected);
+                        assert!(audio.buffer.lock().unwrap().processed.is_empty());
+                        player.displayed_frame_seq.fetch_add(1, Ordering::AcqRel);
+                        if phase == 0 {
+                            player.clock.notify_demux_exhausted();
+                            let _ = player.tick(&ctx);
+                            player
+                                .backdate_eof_quiet_for_test(std::time::Duration::from_millis(49));
+                            let _ = player.tick(&ctx);
+                            assert!(
+                                player.current_seek_serial() > serial,
+                                "real EOF loop must seek to zero"
+                            );
+                        } else if phase == 1 {
+                            player.seek(0.0);
+                            assert!(
+                                player.current_seek_serial() > serial,
+                                "user seek to zero must be issued"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn final_limiter_local_keeps_delay_during_normalize_ramp_across_unity() {
+        let clock = make_clock();
+        clock.set_volume(1.0);
+        clock.set_normalize_gain(0.5);
+        let buffer = make_buffer(1_000);
+        let (tx, rx) = bounded(2);
+        let (shutdown_tx, shutdown_rx) = bounded(1);
+        let (event_tx, _event_rx) = bounded(8);
+        let event_tx = crate::video::EngineEventSender::new(
+            event_tx,
+            Arc::new(crate::video::VideoUiWake::default()),
+        );
+        let (_tap_tx, tap_rx) = unbounded();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let (clock, buffer, cancel) = (clock.clone(), buffer.clone(), cancel.clone());
+            std::thread::spawn(move || {
+                run_pump(
+                    rx,
+                    shutdown_rx,
+                    buffer,
+                    cancel,
+                    clock,
+                    event_tx,
+                    playing_state(),
+                    make_diag(),
+                    tap_rx,
+                    #[cfg(windows)]
+                    None,
+                    #[cfg(windows)]
+                    None,
+                )
+            })
+        };
+        let send = |frames: usize, pts_secs| {
+            tx.send(AudioFrame {
+                samples: vec![0.25; frames * 2],
+                pts_secs,
+                duration_secs: frames as f64 / 1_000.0,
+                seek_serial: 0,
+                stream_index: 0,
+                seek_target_secs: None,
+                queued_wall_secs: frames as f64 / 1_000.0,
+                audio_tx_accounting_epoch: 0,
+            })
+            .unwrap()
+        };
+        send(20, 1.0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while buffer.lock().unwrap().processed.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(!buffer.lock().unwrap().processed.is_empty());
+        clock.set_normalize_gain(2.0);
+        send(4_000, 1.02);
+        while buffer.lock().unwrap().processed.len() < 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        cancel.store(true, Ordering::Release);
+        let _ = shutdown_tx.send(());
+        worker.join().unwrap();
+        let buf = buffer.lock().unwrap();
+        assert_eq!(buf.processed.len(), 2);
+        let first = &buf.processed[0];
+        let ramp = &buf.processed[1];
+        assert_eq!(first.samples.len(), 30);
+        assert!(
+            first
+                .samples
+                .iter()
+                .all(|sample| (*sample - 0.125).abs() < 1e-7)
+        );
+        assert_eq!(&ramp.samples[..10], &first.samples[..10]);
+        assert!(ramp.samples.windows(2).all(|pair| pair[1] >= pair[0]));
+        assert!(ramp.samples.last().unwrap() > &0.49);
+        for chunk in &buf.processed {
+            assert_eq!(chunk.pdc_latency_secs_at_process, 0.005);
+        }
+        assert!(
+            (ramp.audible_pts_secs - first.audible_pts_secs - first.duration_secs).abs() < 1e-9
+        );
+        assert_eq!(clock.limiter_ceiling_hit_seq(), 0);
+    }
+
+    #[test]
+    fn eos_completion_wakes_root_once_and_rejects_stale_or_cancelled_work() {
+        let clock = make_clock();
+        let ctx = egui::Context::default();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let callback_requests = requests.clone();
+        ctx.set_request_repaint_callback(move |request| {
+            callback_requests.lock().unwrap().push(request)
+        });
+        let wake = Arc::new(crate::video::VideoUiWake::default());
+        wake.bind_egui_context(&ctx);
+        let (tx, _rx) = bounded(1);
+        let events = crate::video::EngineEventSender::new(tx, wake);
+        clock.note_audio_decoded_eos(0);
+        assert!(clock.begin_audio_tail(0));
+        complete_audio_tail_and_wake(&clock, 0, &events);
+        assert!(clock.audio_tail_complete());
+        complete_audio_tail_and_wake(&clock, 0, &events);
+        clock.request_seek(0.0);
+        complete_audio_tail_and_wake(&clock, 0, &events);
+        complete_audio_tail_and_wake(&clock, 1, &events);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].viewport_id, egui::ViewportId::ROOT);
+        assert!(requests[0].delay.is_zero());
+    }
+
+    #[test]
+    fn track_switch_output_pts_and_clock_stay_continuous_through_pump_and_callback() {
+        use crate::video::decoder;
+
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/audio-tracks/multi-timebase.mp4");
+        let input = ffmpeg_the_third::format::input(&fixture).unwrap();
+        let time_bases: Vec<_> = [1, 2, 3]
+            .map(|index| {
+                let base = input.stream(index).unwrap().time_base();
+                (base.numerator(), base.denominator())
+            })
+            .into_iter()
+            .collect();
+        assert_eq!(time_bases, [(1, 48_000), (1, 44_100), (1, 32_000)]);
+
+        let serial = Arc::new(AtomicU64::new(0));
+        let clock = Arc::new(AvClock::new(1.0, serial));
+        clock.set_playing(true);
+        let demux_cancel = Arc::new(AtomicBool::new(false));
+        let engine_state = playing_state();
+        let (raw_event_tx, event_rx) = bounded(256);
+        let engine_event_tx = crate::video::EngineEventSender::new(
+            raw_event_tx,
+            Arc::new(crate::video::VideoUiWake::default()),
+        );
+        let handles = decoder::spawn(
+            fixture,
+            Arc::clone(&clock),
+            Arc::clone(&demux_cancel),
+            48_000,
+            false,
+            crate::settings::VideoDeinterlaceMode::Off,
+            #[cfg(windows)]
+            None,
+            Arc::clone(&engine_state),
+            engine_event_tx.clone(),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(decoder::VideoDynamicState::default()),
+        );
+        let info = handles
+            .info_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            info.audio_tracks
+                .iter()
+                .map(|track| (track.sample_rate, track.channels))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some(48_000), Some(2)),
+                (Some(44_100), Some(6)),
+                (Some(32_000), Some(1))
+            ]
+        );
+        let selection = handles
+            .audio_track_selection_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let buffer = make_buffer(48_000);
+        let diagnostics = make_diag();
+        let pump_cancel = Arc::new(AtomicBool::new(false));
+        let (shutdown_tx, shutdown_rx) = bounded(1);
+        let (tap_tx, tap_rx) = unbounded();
+        let pump = {
+            let rx = handles.audio_rx.clone();
+            let buffer = Arc::clone(&buffer);
+            let cancel = Arc::clone(&pump_cancel);
+            let clock = Arc::clone(&clock);
+            let state = Arc::clone(&engine_state);
+            let diagnostics = Arc::clone(&diagnostics);
+            std::thread::spawn(move || {
+                run_pump(
+                    rx,
+                    shutdown_rx,
+                    buffer,
+                    cancel,
+                    clock,
+                    engine_event_tx,
+                    state,
+                    diagnostics,
+                    tap_rx,
+                    #[cfg(windows)]
+                    None,
+                    #[cfg(windows)]
+                    None,
+                );
+            })
+        };
+
+        let mut previous_pts: Option<f64> = None;
+        let mut previous_clock: Option<f64> = None;
+        let mut previous_callback_at: Option<std::time::Instant> = None;
+        for stream_index in [2, 1, 3, 2] {
+            let target = if stream_index == 2 && previous_pts.is_none() {
+                None
+            } else {
+                let target = clock.now_secs();
+                assert_eq!(
+                    selection.request(stream_index),
+                    crate::video::audio_track_selection::AudioTrackRequestOutcome::Accepted
+                );
+                clock.request_seek(target);
+                Some(target)
+            };
+            let expected_serial = clock.current_seek_serial();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut consumed = 0;
+            let mut first_pts = None;
+            while consumed < 8 && std::time::Instant::now() < deadline {
+                while handles.video_rx.try_recv().is_ok() {}
+                while event_rx.try_recv().is_ok() {}
+                let before = diagnostics.audio_audible_pts_bits.load(Ordering::Acquire);
+                let buffer_serial = buffer.lock().unwrap().pump_seek_serial;
+                let mut output = [0.0_f32; 960]; // 10 ms at 48 kHz stereo
+                fill_output(
+                    &mut output,
+                    &buffer,
+                    &clock,
+                    &engine_state,
+                    &diagnostics,
+                    None,
+                );
+                let after = diagnostics.audio_audible_pts_bits.load(Ordering::Acquire);
+                if buffer_serial == expected_serial
+                    && after != before
+                    && output.iter().any(|sample| sample.abs() > 1e-4)
+                {
+                    let pts = f64::from_bits(after);
+                    let now = clock.now_secs();
+                    let callback_at = std::time::Instant::now();
+                    let elapsed = previous_callback_at
+                        .map(|at| callback_at.duration_since(at).as_secs_f64())
+                        .unwrap_or(0.0);
+                    if first_pts.is_none() {
+                        first_pts = Some(pts);
+                        if let Some(target) = target {
+                            assert!(
+                                (pts - target).abs() < 0.18,
+                                "stream={stream_index} first output PTS={pts} target={target}"
+                            );
+                            assert!(
+                                previous_pts.is_none_or(|prev| pts >= prev - 0.04),
+                                "stream={stream_index} output PTS regressed"
+                            );
+                        }
+                    }
+                    if let Some(prev) = previous_pts {
+                        assert!(pts >= prev - 0.04 && pts - prev < elapsed + 0.18);
+                    }
+                    if let Some(prev) = previous_clock {
+                        assert!(now >= prev - 0.04 && now - prev < elapsed + 0.18);
+                    }
+                    assert!((now - pts).abs() < elapsed + 0.18);
+                    previous_pts = Some(pts);
+                    previous_clock = Some(now);
+                    previous_callback_at = Some(callback_at);
+                    consumed += 1;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(consumed, 8, "no output for stream={stream_index}");
+            assert_eq!(selection.snapshot().applied.stream_index, stream_index);
+        }
+
+        pump_cancel.store(true, Ordering::Release);
+        let _ = shutdown_tx.try_send(());
+        demux_cancel.store(true, Ordering::Release);
+        pump.join().unwrap();
+        drop(tap_tx);
+    }
+
+    fn disconnected_pump_releases_eof_gate(loop_enabled: bool) {
+        use crate::video::engine::EngineEvent;
+        use crate::video::engine::actor::{EngineActor, OpenOptions};
+        use crate::video::engine::state::{AudioEvent, DecoderEvent};
+
+        let seek_serial = Arc::new(AtomicU64::new(0));
+        let clock = Arc::new(AvClock::new(1.0, Arc::clone(&seek_serial)));
+        let mut actor = EngineActor::new(
+            OpenOptions {
+                loop_enabled,
+                ..OpenOptions::default()
+            },
+            seek_serial,
+            Arc::clone(&clock),
+        );
+        actor.begin_loading();
+        actor.handle_decoder_event(DecoderEvent::InfoReceived {
+            epoch: 0,
+            duration_secs: 1.0,
+            has_audio: true,
+            has_video: true,
+        });
+        actor.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
+
+        let buffer = make_buffer(48_000);
+        let diagnostics = make_diag();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (audio_tx, audio_rx) = bounded(32);
+        let (_shutdown_tx, shutdown_rx) = bounded(1);
+        let (raw_event_tx, event_rx) = bounded(64);
+        let event_tx = crate::video::EngineEventSender::new(
+            raw_event_tx,
+            Arc::new(crate::video::VideoUiWake::default()),
+        );
+        let (_tap_tx, tap_rx) = unbounded();
+        let pump = {
+            let buffer = Arc::clone(&buffer);
+            let cancel = Arc::clone(&cancel);
+            let clock = Arc::clone(&clock);
+            let state = actor.published_state_handle();
+            std::thread::spawn(move || {
+                run_pump(
+                    audio_rx,
+                    shutdown_rx,
+                    buffer,
+                    cancel,
+                    clock,
+                    event_tx,
+                    state,
+                    diagnostics,
+                    tap_rx,
+                    #[cfg(windows)]
+                    None,
+                    #[cfg(windows)]
+                    None,
+                );
+            })
+        };
+        for index in 0..20 {
+            audio_tx
+                .send(AudioFrame {
+                    samples: vec![0.0; 9_600],
+                    pts_secs: index as f64 * 0.1,
+                    seek_serial: 0,
+                    stream_index: 0,
+                    duration_secs: 0.1,
+                    queued_wall_secs: 0.0,
+                    audio_tx_accounting_epoch: 0,
+                    seek_target_secs: None,
+                })
+                .unwrap();
+        }
+        let ready = event_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let EngineEvent::Audio(AudioEvent::BufferReady {
+            epoch,
+            pts,
+            wall_now,
+        }) = ready
+        else {
+            panic!("expected pump BufferReady");
+        };
+        actor.handle_audio_event(AudioEvent::BufferReady {
+            epoch,
+            pts,
+            wall_now,
+        });
+        assert_eq!(actor.published_state_code(), state_code::PLAYING);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while clock.audio_raw_pending_secs() <= 0.1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(clock.audio_raw_pending_secs() > 0.1);
+
+        drop(audio_tx);
+        pump.join().unwrap();
+        assert!(buffer.lock().unwrap().raw_pending.is_empty());
+        assert!(buffer.lock().unwrap().processed.is_empty());
+        assert_eq!(clock.audio_raw_pending_secs(), 0.0);
+        assert_eq!(clock.audio_processed_secs(), 0.0);
+        assert_eq!(clock.audio_tx_queued_secs(), 0.0);
+        assert!(!clock.is_audio_active());
+        actor.handle_audio_event(AudioEvent::AudioInactive);
+        clock.notify_demux_exhausted();
+        let quiet = clock.is_demux_exhausted()
+            && clock.audio_processed_secs() < 0.020
+            && clock.audio_raw_pending_secs() < 0.020
+            && clock.audio_tx_queued_secs() < 0.020;
+        assert!(quiet, "EOF/loop quiet gate must open after pump disconnect");
+        actor.handle_decoder_event(DecoderEvent::EofReached {
+            epoch: 0,
+            duration_secs: 1.0,
+        });
+        assert_eq!(
+            actor.published_state_code(),
+            if loop_enabled {
+                state_code::SEEKING
+            } else {
+                state_code::EOF
+            }
+        );
+    }
+
+    #[test]
+    fn disconnected_pump_with_raw_pending_allows_eof() {
+        disconnected_pump_releases_eof_gate(false);
+    }
+
+    #[test]
+    fn disconnected_pump_with_raw_pending_allows_loop_seek() {
+        disconnected_pump_releases_eof_gate(true);
+    }
+
+    #[test]
+    fn pending_track_gates_only_its_frames_and_blocks_eof_ready() {
+        use crate::video::engine::EngineEvent;
+        use crate::video::engine::state::AudioEvent;
+        let clock = Arc::new(AvClock::new_with_normalize(
+            1.0,
+            Arc::new(AtomicU64::new(0)),
+            true,
+            1.0,
+        ));
+        clock.normalize_gain_table().set_gain(1, 1.0);
+        let request = clock
+            .normalize_gain_table()
+            .begin_lookup(2, -14000)
+            .unwrap();
+        let buffer = make_buffer(48_000);
+        let diagnostics = make_diag();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (audio_tx, audio_rx) = bounded(8);
+        let (shutdown_tx, shutdown_rx) = bounded(1);
+        let (raw_event_tx, event_rx) = bounded(16);
+        let event_tx = crate::video::EngineEventSender::new(
+            raw_event_tx,
+            Arc::new(crate::video::VideoUiWake::default()),
+        );
+        let (_tap_tx, tap_rx) = unbounded();
+        let state = Arc::new(AtomicU8::new(state_code::BUFFERING));
+        let worker = {
+            let clock = Arc::clone(&clock);
+            let buffer = Arc::clone(&buffer);
+            let cancel = Arc::clone(&cancel);
+            std::thread::spawn(move || {
+                run_pump(
+                    audio_rx,
+                    shutdown_rx,
+                    buffer,
+                    cancel,
+                    clock,
+                    event_tx,
+                    state,
+                    diagnostics,
+                    tap_rx,
+                    #[cfg(windows)]
+                    None,
+                    #[cfg(windows)]
+                    None,
+                )
+            })
+        };
+        let frame = |stream_index, pts_secs| AudioFrame {
+            samples: vec![0.1; 4_800],
+            pts_secs,
+            seek_serial: 0,
+            stream_index,
+            duration_secs: 0.05,
+            queued_wall_secs: 0.0,
+            audio_tx_accounting_epoch: 0,
+            seek_target_secs: None,
+        };
+        audio_tx.send(frame(1, 0.0)).unwrap();
+        audio_tx.send(frame(2, 0.05)).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while (buffer.lock().unwrap().processed.is_empty()
+            || buffer.lock().unwrap().raw_pending.is_empty())
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            !buffer.lock().unwrap().processed.is_empty(),
+            "resolved stream must process"
+        );
+        assert_eq!(
+            buffer
+                .lock()
+                .unwrap()
+                .raw_pending
+                .front()
+                .unwrap()
+                .stream_index,
+            2
+        );
+        clock.notify_demux_exhausted();
+        assert!(
+            event_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "EOF must not publish readiness while a Pending frame blocks raw"
+        );
+        assert!(clock.normalize_gain_table().resolve(request, 2.0));
+        let ready = event_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        assert!(matches!(
+            ready,
+            EngineEvent::Audio(AudioEvent::BufferReady { .. })
+        ));
+        // Readiness can be published as soon as the head is resolved, before
+        // the worker finishes draining that frame into processed audio.
+        let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !buffer.lock().unwrap().raw_pending.is_empty()
+            && std::time::Instant::now() < drain_deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(buffer.lock().unwrap().raw_pending.is_empty());
+        cancel.store(true, Ordering::Release);
+        let _ = shutdown_tx.send(());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn selected_track_is_pending_before_seek_publication_and_pump_processing() {
+        let mut player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(
+            std::path::PathBuf::from("selection-pump-seam.mkv"),
+        );
+        player.set_opened_audio_stream_for_test(2, 1);
+        player.set_opened_audio_stream_for_test(1, 1);
+        player.reset_normalize_gains(true);
+        player.set_normalize_gain_for_stream(1, 1.0);
+        let selection = player.select_audio_track(2);
+        assert_eq!(
+            selection.outcome,
+            crate::video::AudioTrackSelectOutcome::Requested
+        );
+        assert!(selection.normalize_unresolved);
+        let seek = player
+            .clock
+            .take_seek_request()
+            .expect("selection publishes seek");
+        assert_eq!(player.normalize_gain_for_stream(2), None);
+
+        let clock = Arc::clone(&player.clock);
+        let buffer = make_buffer(48_000);
+        let diagnostics = make_diag();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (audio_tx, audio_rx) = bounded(8);
+        let (shutdown_tx, shutdown_rx) = bounded(1);
+        let (raw_event_tx, _event_rx) = bounded(16);
+        let event_tx = crate::video::EngineEventSender::new(
+            raw_event_tx,
+            Arc::new(crate::video::VideoUiWake::default()),
+        );
+        let (_tap_tx, tap_rx) = unbounded();
+        let state = Arc::new(AtomicU8::new(state_code::BUFFERING));
+        let worker = {
+            let clock = Arc::clone(&clock);
+            let buffer = Arc::clone(&buffer);
+            let cancel = Arc::clone(&cancel);
+            std::thread::spawn(move || {
+                run_pump(
+                    audio_rx,
+                    shutdown_rx,
+                    buffer,
+                    cancel,
+                    clock,
+                    event_tx,
+                    state,
+                    diagnostics,
+                    tap_rx,
+                    #[cfg(windows)]
+                    None,
+                    #[cfg(windows)]
+                    None,
+                )
+            })
+        };
+        audio_tx
+            .send(AudioFrame {
+                samples: vec![0.1; 4_800],
+                pts_secs: 0.0,
+                seek_serial: seek.serial,
+                stream_index: 2,
+                duration_secs: 0.05,
+                queued_wall_secs: 0.0,
+                audio_tx_accounting_epoch: 0,
+                seek_target_secs: Some(0.0),
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while buffer.lock().unwrap().raw_pending.is_empty() && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let pending = buffer.lock().unwrap();
+        assert!(
+            pending.processed.is_empty(),
+            "selected stream cannot process at unity"
+        );
+        assert_eq!(pending.raw_pending.front().unwrap().stream_index, 2);
+        drop(pending);
+        cancel.store(true, Ordering::Release);
+        let _ = shutdown_tx.send(());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn exited_decode_worker_clears_raw_backpressure_without_receiving_queued_frames() {
+        use crate::video::engine::actor::{EngineActor, OpenOptions};
+        use crate::video::engine::state::DecoderEvent;
+
+        let seek_serial = Arc::new(AtomicU64::new(0));
+        let clock = Arc::new(AvClock::new(1.0, Arc::clone(&seek_serial)));
+        let mut actor = EngineActor::new(OpenOptions::default(), seek_serial, Arc::clone(&clock));
+        actor.begin_loading();
+        actor.handle_decoder_event(DecoderEvent::InfoReceived {
+            epoch: 0,
+            duration_secs: 6.0,
+            has_audio: true,
+            has_video: true,
+        });
+
+        let buffer = make_buffer(48_000);
+        let frame = AudioFrame {
+            samples: vec![0.0; 576_000],
+            pts_secs: 0.0,
+            seek_serial: 0,
+            stream_index: 0,
+            duration_secs: 6.0,
+            queued_wall_secs: 0.0,
+            audio_tx_accounting_epoch: 0,
+            seek_target_secs: None,
+        };
+        buffer.lock().unwrap().raw_pending.push_back(frame);
+        publish_buffer_secs(&buffer.lock().unwrap(), &clock);
+        assert!(clock.audio_raw_pending_secs() > 5.0);
+        let (audio_tx, audio_rx) = bounded(1);
+        audio_tx
+            .send(AudioFrame {
+                samples: vec![0.0; 9_600],
+                pts_secs: 6.0,
+                seek_serial: 0,
+                stream_index: 0,
+                duration_secs: 0.1,
+                queued_wall_secs: 0.0,
+                audio_tx_accounting_epoch: 0,
+                seek_target_secs: None,
+            })
+            .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (shutdown_tx, shutdown_rx) = bounded(1);
+        let (raw_event_tx, _event_rx) = bounded(64);
+        let event_tx = crate::video::EngineEventSender::new(
+            raw_event_tx,
+            Arc::new(crate::video::VideoUiWake::default()),
+        );
+        let (_tap_tx, tap_rx) = unbounded();
+        let (done_tx, done_rx) = bounded(1);
+        clock.note_audio_worker_exit();
+        let pump = {
+            let buffer = Arc::clone(&buffer);
+            let cancel = Arc::clone(&cancel);
+            let clock = Arc::clone(&clock);
+            let state = actor.published_state_handle();
+            std::thread::spawn(move || {
+                run_pump(
+                    audio_rx,
+                    shutdown_rx,
+                    buffer,
+                    cancel,
+                    clock,
+                    event_tx,
+                    state,
+                    make_diag(),
+                    tap_rx,
+                    #[cfg(windows)]
+                    None,
+                    #[cfg(windows)]
+                    None,
+                );
+                done_tx.send(()).unwrap();
+            })
+        };
+        let exited = done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .is_ok();
+        if !exited {
+            cancel.store(true, Ordering::Release);
+            shutdown_tx.send(()).unwrap();
+        }
+        pump.join().unwrap();
+        assert!(
+            exited,
+            "pump stayed behind raw back-pressure after worker exit"
+        );
+        assert!(buffer.lock().unwrap().raw_pending.is_empty());
+        assert_eq!(clock.audio_raw_pending_secs(), 0.0);
+        drop(audio_tx);
+    }
+
+    #[test]
+    fn audible_pts_uses_source_timeline_latency_and_preserves_negative_pts() {
         let (audible, latency_source) = audible_pts_after_latency(10.0, 0.125, 1.0);
         assert!((audible - 9.875).abs() < 1.0e-12);
         assert!((latency_source - 0.125).abs() < 1.0e-12);
@@ -2300,8 +5640,8 @@ mod tests {
         assert!((audible_2x - 9.75).abs() < 1.0e-12);
         assert!((latency_source_2x - 0.25).abs() < 1.0e-12);
 
-        let (clamped, _) = audible_pts_after_latency(0.05, 0.125, 1.0);
-        assert_eq!(clamped, 0.0);
+        let (negative, _) = audible_pts_after_latency(0.05, 0.125, 1.0);
+        assert!((negative + 0.075).abs() < 1.0e-12);
     }
 
     #[test]
@@ -2369,7 +5709,7 @@ mod tests {
             .push_back(make_chunk(vec![0.5; 480], 0.0, samples_per_sec));
 
         let mut out = [1.0_f32; 480];
-        fill_output(&mut out, &buf, &clock, &playing_state(), &make_diag());
+        fill_output(&mut out, &buf, &clock, &playing_state(), &make_diag(), None);
 
         assert!(buf.lock().unwrap().processed.is_empty());
         assert!(out.iter().all(|sample| *sample == 0.0));
@@ -2415,6 +5755,8 @@ mod tests {
                     tap_rx,
                     #[cfg(windows)]
                     None,
+                    #[cfg(windows)]
+                    None,
                 );
             })
         };
@@ -2427,6 +5769,7 @@ mod tests {
                     samples: vec![0.0; (SAMPLE_RATE as f64 * 2.0 * FRAME_SECS) as usize],
                     pts_secs,
                     seek_serial: 0,
+                    stream_index: 0,
                     duration_secs: FRAME_SECS,
                     queued_wall_secs: FRAME_SECS,
                     audio_tx_accounting_epoch: 0,
@@ -2458,7 +5801,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let produced_all = loop {
             let mut out = vec![0.0; 1_920];
-            fill_output(&mut out, &buffer, &clock, &engine_state, &diagnostics);
+            fill_output(&mut out, &buffer, &clock, &engine_state, &diagnostics, None);
             match producer_done_rx.try_recv() {
                 Ok(result) => break result,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => break false,
@@ -2477,7 +5820,7 @@ mod tests {
         );
         while queue_observer.len() > 0 && std::time::Instant::now() < deadline {
             let mut out = vec![0.0; 1_920];
-            fill_output(&mut out, &buffer, &clock, &engine_state, &diagnostics);
+            fill_output(&mut out, &buffer, &clock, &engine_state, &diagnostics, None);
             std::thread::yield_now();
         }
         assert_eq!(
@@ -2552,6 +5895,7 @@ mod tests {
             samples: vec![0.0; 2],
             pts_secs: seek_serial as f64,
             seek_serial,
+            stream_index: 0,
             duration_secs: 0.01,
             queued_wall_secs: 0.01,
             audio_tx_accounting_epoch: 0,
@@ -2565,19 +5909,17 @@ mod tests {
         let target = 10.0_f32.powf(6.0 / 20.0);
         let mut first_quarter = vec![1.0_f32; 20]; // 10 stereo frames; full ramp = 40 frames.
 
-        let max_gain = ramp.apply_to_samples(&mut first_quarter, target);
+        ramp.apply_to_samples(&mut first_quarter, target);
 
         assert!(first_quarter[0] > 1.0);
         assert!(first_quarter[18] < target);
-        assert!(max_gain < target);
         assert_eq!(ramp.remaining_frames(), 30);
 
         let mut rest = vec![1.0_f32; 80];
-        let max_gain = ramp.apply_to_samples(&mut rest, target);
+        ramp.apply_to_samples(&mut rest, target);
 
         assert_eq!(ramp.remaining_frames(), 0);
         assert!((rest[78] - target).abs() < 1.0e-5);
-        assert!((max_gain - target).abs() < 1.0e-5);
     }
 
     #[test]
@@ -2587,10 +5929,9 @@ mod tests {
         ramp.snap_to_target(0.5);
 
         let mut samples = vec![1.0_f32; 8];
-        let max_gain = ramp.apply_to_samples(&mut samples, 0.5);
+        ramp.apply_to_samples(&mut samples, 0.5);
 
         assert_eq!(ramp.remaining_frames(), 0);
-        assert!((max_gain - 0.5).abs() < 1.0e-6);
         assert!(samples.iter().all(|s| (*s - 0.5).abs() < 1.0e-6));
     }
 
@@ -2620,13 +5961,12 @@ mod tests {
         ramp.snap_to_target(2.0);
         // 解除後の最初の可聴ブロック: target=2.0 を適用しても snap 済みなので ramp を arm しない。
         let mut samples = vec![1.0_f32; 32];
-        let max_gain = ramp.apply_to_samples(&mut samples, 2.0);
+        ramp.apply_to_samples(&mut samples, 2.0);
         assert_eq!(
             ramp.remaining_frames(),
             0,
             "解除エッジ snap 後は ramp しない"
         );
-        assert!((max_gain - 2.0).abs() < 1.0e-4);
         assert!(
             samples.iter().all(|s| (*s - 2.0).abs() < 1.0e-4),
             "最初のブロックから確定 gain で始まる (徐々に上がらない)"
@@ -2807,6 +6147,100 @@ mod tests {
         );
     }
 
+    #[test]
+    fn effetune_pre_limiter_limits_a_copy_and_off_preserves_delayed_input() {
+        let input = vec![1.28, -1.27].repeat(32);
+        let mut limiter = EffetuneInputLimiter::new(1_000);
+        let (limited, latency) = limiter.prepare(&input, 1, true);
+        assert_eq!(latency, 0.005);
+        assert!(limited.iter().all(|sample| sample.abs() <= 1.0));
+        assert!(limited.iter().any(|sample| sample.abs() > 0.9));
+        assert_eq!(input[0], 1.28);
+        let (dry, latency) = limiter.prepare(&input, 1, false);
+        assert_eq!(&dry[12..], &input[12..]);
+        assert_eq!(latency, 0.005);
+        let mut bypassed = EffetuneInputLimiter::new(1_000);
+        let (dry, latency) = bypassed.prepare(&input, 1, false);
+        assert_eq!(&dry[..10], &[0.0; 10]);
+        assert_eq!(&dry[10..], &input[..input.len() - 10]);
+        assert_eq!(latency, 0.005);
+    }
+
+    #[test]
+    fn effetune_pre_limiter_reset_and_generation_clear_old_audio() {
+        let mut limiter = EffetuneInputLimiter::new(1_000);
+        for reset_kind in 0..2 {
+            limiter.prepare(&[0.8, -0.8].repeat(3), 1, true);
+            let generation = match reset_kind {
+                0 => {
+                    limiter.reset();
+                    1
+                }
+                _ => 2,
+            };
+            let (samples, _) = limiter.prepare(&[0.0; 20], generation, true);
+            assert!(samples.iter().all(|sample| *sample == 0.0));
+        }
+    }
+
+    #[test]
+    fn effetune_pre_limiter_live_toggle_keeps_frames_latency_and_history() {
+        for rate in [1_000, 44_100, 48_000] {
+            let mut pre = EffetuneInputLimiter::new(rate);
+            let delay = pre.limiter.lookahead_frames;
+            let input: Vec<_> = (0..delay * 9)
+                .flat_map(|i| {
+                    let x = (i + 1) as f32 / (delay * 10) as f32;
+                    [x, -x]
+                })
+                .collect();
+            let mut output = Vec::new();
+            // One-frame blocks, including rapid reversals, must neither drop nor
+            // duplicate even a sub-ceiling frame held across a setting change.
+            for (i, frame) in input.chunks_exact(2).enumerate() {
+                let enabled = i < delay * 2 || i >= delay * 5 || i == delay * 3;
+                let (samples, latency) = pre.prepare(frame, 7, enabled);
+                assert_eq!(latency, delay as f64 / rate as f64);
+                output.extend_from_slice(samples);
+                assert_eq!(pre.generation, Some(7));
+            }
+            let zeros = vec![0.0; delay * 2];
+            let (tail, _) = pre.prepare(&zeros, 7, true);
+            output.extend_from_slice(tail);
+            assert_eq!(&output[..delay * 2], vec![0.0; delay * 2]);
+            assert_eq!(&output[delay * 2..], input);
+        }
+    }
+
+    #[test]
+    fn effetune_pre_limiter_live_toggle_crossfades_without_reset_or_channel_skew() {
+        for rate in [1_000, 44_100, 48_000] {
+            let mut pre = EffetuneInputLimiter::new(rate);
+            let n = pre.limiter.lookahead_frames;
+            pre.prepare(&vec![2.0, -2.0].repeat(n * 2), 9, true);
+            let mut previous = 1.0_f32;
+            let input = [2.0, -2.0].repeat(n + 1);
+            for enabled in [false, true, false, true] {
+                let (samples, latency) = pre.prepare(&input, 9, enabled);
+                assert_eq!(latency, n as f64 / rate as f64);
+                for frame in samples.chunks_exact(2) {
+                    assert_eq!(frame[0], -frame[1]);
+                    assert!((frame[0] - previous).abs() <= 1.0 / n as f32 + 1e-5);
+                    assert!((1.0..=2.0).contains(&frame[0]));
+                    previous = frame[0];
+                }
+                assert!((previous - if enabled { 1.0 } else { 2.0 }).abs() < 1e-5);
+                assert_eq!(pre.limiter.gain, 0.5);
+                assert_eq!(pre.generation, Some(9));
+            }
+            // Reverse in the middle of the ramp, from its current mix.
+            pre.prepare(&[2.0, -2.0], 9, false);
+            let mix = pre.mix;
+            pre.prepare(&[2.0, -2.0], 9, true);
+            assert!(pre.mix > mix);
+        }
+    }
+
     /// 完全 underrun (= processed 空) で callback が来ても `next_pts_secs` が進まない。
     #[test]
     fn fill_output_empty_buffer_does_not_advance_pts() {
@@ -2815,7 +6249,7 @@ mod tests {
         let pts_before = buf.lock().unwrap().next_pts_secs;
 
         let mut out = [1.0_f32; 480];
-        fill_output(&mut out, &buf, &clock, &playing_state(), &make_diag());
+        fill_output(&mut out, &buf, &clock, &playing_state(), &make_diag(), None);
 
         let pts_after = buf.lock().unwrap().next_pts_secs;
         assert_eq!(
@@ -2843,7 +6277,7 @@ mod tests {
         let pts_before = buf.lock().unwrap().next_pts_secs;
 
         let mut out = [0.0_f32; 480];
-        fill_output(&mut out, &buf, &clock, &playing_state(), &make_diag());
+        fill_output(&mut out, &buf, &clock, &playing_state(), &make_diag(), None);
 
         let pts_after = buf.lock().unwrap().next_pts_secs;
         let expected_advance = 100.0 / (48_000.0 * 2.0);
@@ -2874,7 +6308,7 @@ mod tests {
         let pts_before = buf.lock().unwrap().next_pts_secs;
 
         let mut out = [0.0_f32; 480];
-        fill_output(&mut out, &buf, &clock, &playing_state(), &make_diag());
+        fill_output(&mut out, &buf, &clock, &playing_state(), &make_diag(), None);
 
         let pts_after = buf.lock().unwrap().next_pts_secs;
         let expected_advance = 480.0 / (48_000.0 * 2.0);
@@ -2906,7 +6340,7 @@ mod tests {
 
         let buffering_state = Arc::new(AtomicU8::new(state_code::BUFFERING));
         let mut out = [1.0_f32; 480];
-        fill_output(&mut out, &buf, &clock, &buffering_state, &make_diag());
+        fill_output(&mut out, &buf, &clock, &buffering_state, &make_diag(), None);
 
         let len_after: usize = buf
             .lock()
@@ -2938,7 +6372,7 @@ mod tests {
         let pts_before = buf.lock().unwrap().next_pts_secs;
 
         let mut out = [1.0_f32; 480];
-        fill_output(&mut out, &buf, &clock, &state, &make_diag());
+        fill_output(&mut out, &buf, &clock, &state, &make_diag(), None);
         assert!(
             out.iter().all(|&s| s == 0.0),
             "Paused: output must be silence"
@@ -2955,7 +6389,7 @@ mod tests {
         );
 
         state.store(state_code::PLAYING, Ordering::Release);
-        fill_output(&mut out, &buf, &clock, &state, &make_diag());
+        fill_output(&mut out, &buf, &clock, &state, &make_diag(), None);
         assert!(
             out.iter().all(|&s| (s - 0.3).abs() < 1e-6),
             "Playing: buffered samples should be drained with volume applied"
@@ -3085,12 +6519,13 @@ mod tests {
                 source_secs_per_output_sec: 1.0,
                 seek_serial: 0,
                 pdc_latency_secs_at_process: 1.0,
+                effetune_generation: None,
             };
             b.processed.push_back(chunk);
         }
 
         let mut out = [0.0_f32; 480];
-        fill_output(&mut out, &buf, &clock, &playing_state(), &make_diag());
+        fill_output(&mut out, &buf, &clock, &playing_state(), &make_diag(), None);
 
         // drain 後、buf.next_pts_secs が audible_pts ベースで更新されている
         let expected_audible_after = target_audible + 480.0 / samples_per_sec;
@@ -3125,7 +6560,7 @@ mod tests {
         }
 
         let mut out = [0.0_f32; 480];
-        fill_output(&mut out, &buf, &clock, &playing_state(), &make_diag());
+        fill_output(&mut out, &buf, &clock, &playing_state(), &make_diag(), None);
 
         // 最初 240 samples: 0.5 * 0.6 = 0.3
         for &v in out.iter().take(240) {

@@ -46,13 +46,13 @@ impl ItemKey {
 
 #[derive(Debug)]
 pub(crate) struct ContextRequest {
+    pub(crate) pin_materialization: super::pin_materialization::Request,
     pub(crate) context_id: ViewerContextId,
     pub(crate) items_generation: u64,
     pub(crate) items: Vec<ItemKey>,
-    /// UIの段階snapshot中に収集済みのlegacy XMP tag seed対象。
-    pub(crate) legacy_seed_paths: Vec<PathBuf>,
     pub(crate) current_rating_key: Option<String>,
     pub(crate) spread_container_path: Option<PathBuf>,
+    pub(crate) spread_container_fallback: Option<PathBuf>,
     pub(crate) old_folder_pin_keys: HashSet<String>,
     pub(crate) folder_pin_paths: Vec<PathBuf>,
     pub(crate) folder_pin_aliases: Vec<(String, String)>,
@@ -66,18 +66,20 @@ pub(crate) struct ContextResult {
     pub(crate) current_rating: Option<u8>,
     pub(crate) page_state: Option<PageStateResult>,
     pub(crate) folder_pin_map: Option<HashMap<String, crate::folder_thumb_pins::FolderPinSource>>,
-    pub(crate) folder_pin_reset_indices: Option<Vec<usize>>,
+    pub(crate) folder_pin_materializations: Option<super::pin_materialization::Prepared>,
     pub(crate) video_pin_blobs: Option<HashMap<PathBuf, Vec<u8>>>,
     pub(crate) video_items: Option<Vec<(usize, PathBuf, u64)>>,
     pub(crate) container_state: Option<ContainerStateResult>,
-    /// `ContextRequest`からcloneせず所有権を返し、UIで再走査せずworkerを再生成する。
-    pub(crate) legacy_seed_paths: Vec<PathBuf>,
 }
 
 pub(crate) struct ContainerStateResult {
     pub(crate) spread_mode: Option<crate::settings::SpreadMode>,
     pub(crate) reading_flow: Option<crate::settings::ReadingFlow>,
     pub(crate) reading_direction: Option<crate::settings::ReadingDirection>,
+    pub(crate) final_cover_spread_preference: crate::settings::FinalCoverSpreadPreference,
+    pub(crate) singleton_spread_endpoint_preferences:
+        crate::settings::SingletonSpreadEndpointPreferences,
+    pub(crate) page_alone_preferences: crate::settings::PageAlonePreferences,
     pub(crate) view_trim: Option<crate::view_trim::ViewTrimBookState>,
 }
 
@@ -530,17 +532,53 @@ fn build_context_result(
     });
     let container_state =
         if changed.container_state && spread_db.is_some() && container_trim_db.is_some() {
-            request.spread_container_path.as_deref().map(|path| {
-                let spread_mode = spread_db.and_then(|db| db.get(path));
-                let reading_flow = spread_db.and_then(|db| db.get_flow(path));
-                let reading_direction = spread_db.and_then(|db| db.get_direction(path));
+            request.spread_container_path.as_deref().and_then(|path| {
+                let fallback = request.spread_container_fallback.as_deref();
+                let stored = spread_db
+                    .map(|db| db.get_state_with_fallback(path, fallback))
+                    .unwrap_or_default();
+                let spread_mode = stored.mode;
+                let reading_flow = stored.flow;
+                let reading_direction = stored.direction;
+                let final_cover_spread_preference = spread_db
+                    .map(|db| db.get_final_cover_spread_preference_with_fallback(path, fallback))
+                    .unwrap_or_default();
+                let singleton_spread_endpoint_preferences = match spread_db
+                    .map(|db| {
+                        db.get_singleton_spread_endpoint_preferences_with_fallback(path, fallback)
+                    })
+                    .transpose()
+                {
+                    Ok(value) => value.unwrap_or_default(),
+                    Err(error) => {
+                        crate::logger::log(format!(
+                            "spread: metadata refresh endpoint read failed: {error}"
+                        ));
+                        return None;
+                    }
+                };
+                let page_alone_preferences = match spread_db
+                    .map(|db| db.get_page_alone_preferences_with_fallback(path, fallback))
+                    .transpose()
+                {
+                    Ok(value) => value.unwrap_or_default(),
+                    Err(error) => {
+                        crate::logger::log(format!(
+                            "spread: metadata refresh page-alone read failed: {error}"
+                        ));
+                        return None;
+                    }
+                };
                 let view_trim = container_trim_db.and_then(|db| db.get_book_state(path));
-                ContainerStateResult {
+                Some(ContainerStateResult {
                     spread_mode,
                     reading_flow,
                     reading_direction,
+                    final_cover_spread_preference,
+                    singleton_spread_endpoint_preferences,
+                    page_alone_preferences,
                     view_trim,
-                }
+                })
             })
         } else {
             None
@@ -549,6 +587,17 @@ fn build_context_result(
     if cancel.load(Ordering::Relaxed) {
         return None;
     }
+    let folder_pin_materializations = if let Some(pins) = &folder_pin_map {
+        Some(request.pin_materialization.prepare(
+            folder_pin_reset_indices.unwrap_or_default(),
+            pins,
+            folder_pin_db,
+            video_pin_db,
+            cancel,
+        )?)
+    } else {
+        None
+    };
     Some(ContextResult {
         context_id: request.context_id,
         items_generation: request.items_generation,
@@ -557,11 +606,10 @@ fn build_context_result(
         current_rating,
         page_state,
         folder_pin_map,
-        folder_pin_reset_indices,
+        folder_pin_materializations,
         video_pin_blobs,
         video_items,
         container_state,
-        legacy_seed_paths: request.legacy_seed_paths,
     })
 }
 
@@ -603,9 +651,28 @@ mod tests {
         let data_dir = temp.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
         let key = "c:/pictures/a.jpg".to_string();
-        let untagged_key = "c:/pictures/b.jpg".to_string();
+        let legacy_xmp_path = temp.path().join("legacy-only.jpg");
+        let xmp = br#"<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+  <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+    <rdf:Description rdf:about='' xmlns:dc='http://purl.org/dc/elements/1.1/'>
+      <dc:subject><rdf:Bag><rdf:li>#legacy-only</rdf:li></rdf:Bag></dc:subject>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>"#;
+        let xmp_id = b"http://ns.adobe.com/xap/1.0/\0";
+        let payload = xmp_id.iter().chain(xmp.iter()).copied().collect::<Vec<_>>();
+        let mut jpeg = vec![0xff, 0xd8, 0xff, 0xe1];
+        jpeg.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        jpeg.extend_from_slice(&payload);
+        jpeg.extend_from_slice(&[0xff, 0xda, 0x00, 0x02, 0xff, 0xd9]);
+        std::fs::write(&legacy_xmp_path, &jpeg).unwrap();
+        assert_eq!(
+            crate::xmp_reader::try_read_dc_subject(&legacy_xmp_path).unwrap(),
+            vec!["#legacy-only".to_string()],
+            "一般XMP readerはmetadata refreshでも現役"
+        );
+        let untagged_key = crate::tags_db::item_key_for_path(&legacy_xmp_path);
         let tag_only_key = "c:/pictures/search-container".to_string();
-        let legacy_seed_path = PathBuf::from("c:/pictures/a.jpg");
         crate::rating_db::RatingDb::open_at(data_dir.join("rating.db"))
             .unwrap()
             .set(&key, 4)
@@ -618,6 +685,7 @@ mod tests {
         let result = run(
             data_dir,
             vec![ContextRequest {
+                pin_materialization: Default::default(),
                 context_id: ViewerContextId::for_test(0),
                 items_generation: 7,
                 items: vec![
@@ -658,9 +726,9 @@ mod tests {
                         video_size: 0,
                     },
                 ],
-                legacy_seed_paths: vec![legacy_seed_path.clone()],
                 current_rating_key: Some(key.clone()),
                 spread_container_path: None,
+                spread_container_fallback: None,
                 old_folder_pin_keys: HashSet::new(),
                 folder_pin_paths: Vec::new(),
                 folder_pin_aliases: Vec::new(),
@@ -694,9 +762,9 @@ mod tests {
         assert!(!context.rating_cache.as_ref().unwrap().contains_key(&5));
         assert_eq!(context.current_rating, Some(4));
         assert_eq!(
-            context.legacy_seed_paths,
-            vec![legacy_seed_path],
-            "legacy seed path ownership must round-trip through the refresh worker"
+            std::fs::read(&legacy_xmp_path).unwrap(),
+            jpeg,
+            "metadata refreshは旧XMP原本を変更しない"
         );
     }
 
@@ -706,6 +774,7 @@ mod tests {
         let result = run(
             temp.path().join("missing"),
             vec![ContextRequest {
+                pin_materialization: Default::default(),
                 context_id: ViewerContextId::for_test(0),
                 items_generation: 1,
                 items: vec![ItemKey {
@@ -720,9 +789,9 @@ mod tests {
                     video_path: None,
                     video_size: 0,
                 }],
-                legacy_seed_paths: Vec::new(),
                 current_rating_key: None,
                 spread_container_path: None,
+                spread_container_fallback: None,
                 old_folder_pin_keys: HashSet::new(),
                 folder_pin_paths: Vec::new(),
                 folder_pin_aliases: Vec::new(),
@@ -755,6 +824,119 @@ mod tests {
     }
 
     #[test]
+    fn spread_preferences_refresh_preserves_nested_fallback_and_explicit_follow_global() {
+        use crate::settings::{
+            FinalCoverSpreadPreference, PageAlonePreference, PageAlonePreferences,
+            SingletonSpreadPlacementPreference,
+        };
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let root = PathBuf::from("c:/books/outer.zip");
+        let nested = root.join("inner/book");
+        let spread_db = crate::spread_db::SpreadDb::open_at(&data_dir.join("spread.db")).unwrap();
+        crate::view_trim_db::ViewTrimDb::open_at(&data_dir.join("view_trim.db")).unwrap();
+        spread_db
+            .set_final_cover_spread_preference(&root, None, FinalCoverSpreadPreference::Off)
+            .unwrap();
+        spread_db
+            .set_singleton_spread_endpoint_preferences(
+                &root,
+                None,
+                SingletonSpreadPlacementPreference::Center.into(),
+            )
+            .unwrap();
+        spread_db
+            .set_page_alone_preferences(
+                &root,
+                None,
+                PageAlonePreferences {
+                    after_cover: PageAlonePreference::On,
+                    last: PageAlonePreference::Off,
+                },
+            )
+            .unwrap();
+
+        let refresh = || {
+            run(
+                data_dir.clone(),
+                vec![ContextRequest {
+                    pin_materialization: Default::default(),
+                    context_id: ViewerContextId::for_test(0),
+                    items_generation: 1,
+                    items: Vec::new(),
+                    current_rating_key: None,
+                    spread_container_path: Some(nested.clone()),
+                    spread_container_fallback: Some(root.clone()),
+                    old_folder_pin_keys: HashSet::new(),
+                    folder_pin_paths: Vec::new(),
+                    folder_pin_aliases: Vec::new(),
+                }],
+                ImportChangedSections {
+                    container_state: true,
+                    ..Default::default()
+                },
+                &AtomicBool::new(false),
+            )
+            .expect("refresh should complete")
+            .contexts
+            .into_iter()
+            .next()
+            .and_then(|context| context.container_state)
+            .expect("container state should be rebuilt")
+        };
+
+        let state = refresh();
+        assert_eq!(
+            state.final_cover_spread_preference,
+            FinalCoverSpreadPreference::Off
+        );
+        assert_eq!(
+            state.singleton_spread_endpoint_preferences,
+            SingletonSpreadPlacementPreference::Center
+        );
+        assert_eq!(
+            state.page_alone_preferences,
+            PageAlonePreferences {
+                after_cover: PageAlonePreference::On,
+                last: PageAlonePreference::Off
+            }
+        );
+
+        spread_db
+            .set_final_cover_spread_preference(
+                &nested,
+                Some(&root),
+                FinalCoverSpreadPreference::FollowGlobal,
+            )
+            .unwrap();
+        spread_db
+            .set_singleton_spread_endpoint_preferences(
+                &nested,
+                Some(&root),
+                SingletonSpreadPlacementPreference::FollowGlobal.into(),
+            )
+            .unwrap();
+        spread_db
+            .set_page_alone_preferences(&nested, Some(&root), PageAlonePreferences::default())
+            .unwrap();
+        let state = refresh();
+        assert_eq!(
+            state.final_cover_spread_preference,
+            FinalCoverSpreadPreference::FollowGlobal
+        );
+        assert_eq!(
+            state.singleton_spread_endpoint_preferences,
+            SingletonSpreadPlacementPreference::FollowGlobal
+        );
+        assert_eq!(
+            state.page_alone_preferences,
+            PageAlonePreferences::default()
+        );
+    }
+
+    #[test]
     fn page_refresh_resets_thumbnails_for_added_and_removed_edit_state() {
         let temp = tempfile::TempDir::new().unwrap();
         let data_dir = temp.path().join("data");
@@ -776,6 +958,7 @@ mod tests {
         let result = run(
             data_dir,
             vec![ContextRequest {
+                pin_materialization: Default::default(),
                 context_id: ViewerContextId::for_test(0),
                 items_generation: 4,
                 items: vec![
@@ -804,9 +987,9 @@ mod tests {
                         video_size: 0,
                     },
                 ],
-                legacy_seed_paths: Vec::new(),
                 current_rating_key: None,
                 spread_container_path: None,
+                spread_container_fallback: None,
                 old_folder_pin_keys: HashSet::new(),
                 folder_pin_paths: Vec::new(),
                 folder_pin_aliases: Vec::new(),
@@ -850,6 +1033,7 @@ mod tests {
         let result = run(
             data_dir,
             vec![ContextRequest {
+                pin_materialization: Default::default(),
                 context_id: ViewerContextId::for_test(0),
                 items_generation: 9,
                 items: vec![ItemKey {
@@ -864,9 +1048,9 @@ mod tests {
                     video_path: Some(video.clone()),
                     video_size: 123,
                 }],
-                legacy_seed_paths: Vec::new(),
                 current_rating_key: None,
                 spread_container_path: None,
+                spread_container_fallback: None,
                 old_folder_pin_keys: HashSet::new(),
                 folder_pin_paths: vec![effective],
                 folder_pin_aliases: vec![(literal_key.clone(), effective_key)],

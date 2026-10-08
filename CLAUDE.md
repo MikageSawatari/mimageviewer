@@ -7,6 +7,28 @@
 コマンド・ログ抜粋など、そのまま示すべき固有部分は原文のままでよい)。コミットメッセージや
 コード内コメントは従来どおり (本書の各節の方針に従う)。
 
+## 開発・公開担当とレビューの既定
+
+モデル分担と調整の正本は [AGENTS.md の Model Roles And Coordination](AGENTS.md#model-roles-and-coordination)。
+新規の開発タスク、途中の担当変更、独立レビューではこの節を読む。
+旧ClaudeCode/Codex担当名は同節の役割へ読み替え、過去の合意・検証記録は保持する。
+**2026-09-23決定 (Codex のモデルは 2026-09-30 更新): 管理・設計・作業指示・検収は ClaudeCode Opus 5.5 / high、
+実装・テストは Codex GPT-6.1 Sol / high、独立レビューは実装者とは別の GPT-6.1 Sol / xhigh。**
+(2026-09-30 より前は実装・レビューとも GPT-6 Sol / xhigh。GPT-6.1 Sol は high で GPT-6 Sol の最高設定を上回るため実装は high、
+レビューは見落としの手戻りが高くつくので 1 段上の xhigh。利用者決定。)
+Opusは指摘と検証結果を確認して検収する。Opus自身の確認だけで独立レビューを代替しない。
+重要な所有境界・非同期・複数ウィンドウの設計は、実装前にもSolの独立レビューを受ける。
+実装者は指示の主要な前提をコードで確認し、矛盾があれば設計担当へ返す。
+難しい構造設計、原因未解明の不具合、設計担当とレビュー担当の重要な見解相違に限り、
+GPT-6 Astra / mediumへ論点を絞った追加確認を依頼する。常設の親役や毎回の追加レビューにはしない。
+Opusのhigh超・Astraのmedium超への自動昇格、Fableへの自動切替は行わない。
+公開準備・公開作業は引き続き **ClaudeCode Opus 5.5 / high** が主導する (担当範囲は2026-09-09決定を継続)。
+公開時は下記リリースチェックリストと [担当・引き継ぎ](docs/release-operations.md#開発と公開の担当・引き継ぎ) に従う。
+明示された別の担当指定を優先する。文書だけではGUIのモデル設定や起動済みの担当は変わらない。
+進行中の担当は安全な区切りで変更し、対象差分・判断根拠・未解決指摘・有効な検証結果を引き継ぐ。
+Codexへの実装委任とレビュー依頼は別の担当・会話で扱い、レビューは指示への適合だけでなく設計自体を確認する。
+検証の集約・再実行条件は [開発ビルドとテスト](docs/development-build-and-test.md#検証の担当と結果の再利用) を参照。
+
 ## 作業開始時に必読
 
 **修正作業を始める前に、必ず `docs/README.md` から関連する設計ドキュメントを開いて全体像を把握すること。**
@@ -86,6 +108,89 @@ detached viewer (F12 別ウィンドウ / 複数ウィンドウ) は構造リワ
 揃える。IME 確定、OS clipboard、D&D、右クリック、マウス、ゲームパッドなど固定扱いにする
 入力は、固定である理由を `docs/keymap-spec.md` に残す。
 
+## 設計の簡素化: 状態の組み合わせを減らす (2026-09-28 利用者指示)
+
+設計を決めるとき、非同期の割り込みや状態の組み合わせを**全部扱う前に、組み合わせそのものを
+減らせないか**を必ず検討する。扱う組み合わせを減らすほうが、正しく扱い切るより設計も実装も
+単純で、見落としも起きにくい。検討した結果 (採用した / しなかった理由) を設計書に書く。
+
+- **長い処理はモーダルにして割り込みを消せないか**。変換・保存・パスワード入力のように、
+  途中で他の操作が入ると状態が食い違いやすい処理は、処理中はモーダルにして他の操作
+  (開く・移動・履歴・別ウィンドウへの切り替えなど) を受け付けない形を先に検討する。
+  「処理中に何が起きても元に戻せる」仕組みを作るのは、モーダルにできない理由があるときだけ。
+- **設定変更や状態の切り替えで、表示中のウィンドウ・パネルを閉じて作り直せないか**。
+  表示中のものを変更に追従させる処理を足す前に、閉じる・一覧を読み直すなど既存の単純な
+  経路に乗せられないかを見る。専用の作り直し処理は、既存経路で済まない理由があるときだけ。
+- ほかにも、同じ効果で状態を減らせる手 (1 つの所有者にまとめる、確定の時点を 1 つにする、
+  既存機能と同じ経路・同じタイミングに揃える) がないかを考える。
+- 経緯: 2026-09-27〜28、フォルダ履歴と EPUB 変換の組み合わせで、「変換中に別の本を開く」
+  「直接開く途中に履歴で移動する」などの割り込みを元に戻す仕組みで扱おうとし、独立レビューの
+  たびに別の組み合わせで P1 が出続けた。利用者の指摘で「変換中はモーダル」にしたところ、
+  扱う組み合わせが大きく減った。また設定変更時に表示中の一覧を EPUB 専用に作り直す処理が
+  直すたびに別の問題を出し、既存の RAR 設定と同じ経路に揃えて解消した。
+
+### まれな失敗への対処で設計が複雑になるときは、雑に扱ってよいか利用者に相談する (2026-10-02 利用者指示)
+
+ディスク書き込み失敗・DB の異常・処理途中の強制終了など、**通常の使い方ではまず起きない失敗**に
+きちんと対処しようとして、再試行・途中状態の保持・失敗の種類分け・回復手順などの仕組みが
+増えそうなときは、その仕組みを作る前に利用者へ相談する。利用者は、こうしたケースを
+「再起動してください」「次回起動時に作り直します」「その操作はやり直してください」のような
+**運用上の割り切り**で扱うことを多くの場合望む。個人開発では、まれな失敗を実機で再現して
+確かめること自体が難しく、検証できない回復処理はかえって不具合の元になる。
+
+- 相談のしかた: 起きる条件 (どの操作・どの失敗で)、どれくらいまれか、割り切った場合に
+  利用者から何が見えるか (検索結果が古い・再起動で直る 等)、きちんと扱う場合に増える仕組み、を
+  短く並べる。割り切り案を推奨として示してよい。
+- 割り切るときも、**黙って壊れたままにしない**。最低限、ログと利用者への通知、可能なら
+  「次回起動で作り直す」印のような単純な復旧の入口を 1 つ置く。索引・キャッシュなど作り直せる
+  データでは、作り直しを復旧手段にするのが基本。利用者が作ったデータ (設定・タグ・
+  コレクション等) が失われる場合は割り切らず、相談の段階でそのことを明示する。
+- **「例外への対処の中の例外」に入り始めたら止まる**。回復処理そのものが失敗した場合の対処、
+  その対処が終了をまたいだ場合の対処…と段が重なり出したら、それ以上設計を足さず相談する。
+- 独立レビュー・実装担当から「まれな失敗の組み合わせ」の指摘が続くときも同じ。指摘を
+  1 件ずつ仕組みで塞ぐ前に、割り切りで閉じられないかを利用者に確認する。
+- 経緯: 2026-10-02、起動時索引スキャン軽減の設計で、お気に入りの構成変更中の書き込み失敗に
+  対して、設計レビューの指摘を受けるたびに「書き込みを済ませて止める停止」「失敗の種類分け」
+  「自動再試行 (5 秒・30 秒・5 分)」「削除前の無効化」を足し、さらに再試行中の失敗が終了を
+  またぐ場合…と質問が続いた。利用者の判断で「失敗したら次回起動時に索引を作り直す + 通知」に
+  割り切り、これらをすべて外した。
+
+## 通常の使い方が不便になる変更は、着手前に利用者へ相談する
+
+新機能の実装や不具合修正のために、**今の通常の使い方が遅くなる・手間が増える・できなくなる**
+変更 (リリース済みの挙動の退行) が必要になりそうなときは、**実装に着手する前に**利用者へ
+設計を相談する。何が不便になるか、避ける案とその費用を並べて示し、判断をもらってから進める。
+
+- 実装担当・レビュー担当への指示 (brief) でも、既存の挙動を削る選択肢を設計担当が勝手に
+  優先しない。指示を出す前に、その選択で失われる既存の挙動がないかをコードで確かめる。
+- 実装中・レビュー中に退行が見つかったら、黙って進めず止めて相談する。
+- 経緯: 2026-09-27、不具合修正の指示で「開き終わるまで表示を変えない」案を優先させた結果、
+  キャッシュ済み PDF をすぐ表示するリリース済みの挙動を削ってしまった。指示の時点で、
+  その近道があることを確かめていなかった。
+
+## 観測の出どころを落とさない (対外文書・バックログ・報告)
+
+**エージェントは製品バイナリを起動しない** (「実機検証用バイナリの準備」節)。
+したがって **実行時の挙動について、エージェント自身の観測は存在しない**。
+ここから次が従う。心がけではなく、持っていない観測を主張しないという構造上の帰結。
+
+- **「再現しました」「確認しました」「動作を確認」を一人称で書かない。**
+  主語がエージェントになる位置でこれらの語を使わない。
+- **実行時の挙動に触れる文には、観測者を必ず書く。** 「利用者が再現」「<報告者> の報告」
+  「perf ログから」「未確認」。**観測者を書けない文は、書けない文**として扱う。
+- **未回答の確認質問がある事実は、成果物に断定として書かない。** 質問を出した時点で
+  その事実は「回答待ち」であって前提ではない。**下書きには答えではなく質問を残す。**
+- 対外メール・バックログ・完了報告は、書き終えた後に**事実文ごとに出どころを 1 回たどる**。
+  たどれるのは (a) コードの参照、(b) 観測者名のある観測、(c) 明示の未確認 の 3 つだけ。
+
+伝聞は restatement のたびに保留と出どころを落とす。落ちるのは対外文書の下書きで、
+確信のある文体に但し書きが馴染まないため。**検査はその境界に置く。**
+
+経緯: 2026-09 に 2 度、実機で一度も動かしていない症状へ「再現しました」と書いた。
+2 度目は**曖昧さに気づいて確認質問を出した後、その回答を待たずに下書きを書き**、
+下書きの中で伝聞が断定へ変わっていた。コードに関する主張は同じ期間ずっと持ちこたえて
+いたので、不足していたのは「コードが何をするか」の規律ではなく「誰が何を見たか」の規律。
+
 ## Overview
 
 A Windows 11 native image viewer built in Rust. Inspired by ViX (legacy 32-bit viewer),
@@ -96,17 +201,18 @@ dual-window approach.
 
 - **Language**: Rust (edition 2024, stable MSVC toolchain)
 - **GUI**: eframe 0.33 + egui 0.33 (wgpu backend)
-- **Image decoding**: `image` crate (PNG, GIF, WebP, BMP) + `turbojpeg` (JPEG, libjpeg-turbo SIMD) + WIC (HEIC, AVIF, JXL, TIFF, RAW)
+- **Image decoding**: `image` crate (PNG, GIF, WebP, BMP) + `turbojpeg` (JPEG, libjpeg-turbo SIMD) + WIC (HEIC, AVIF, JXL, TIFF) + LibRaw (RAW、CDDL-1.0、静的リンク)
 - **JPEG 高速デコード**: `turbojpeg` クレート (libjpeg-turbo スタティックリンク、SIMD 最適化)。サムネ生成時は **DCT スケール (1/8〜1/1)** で decode して 5-30MB カメラ JPEG を 2.5-6× 高速化 ([docs/dct-scale-plan.md](docs/dct-scale-plan.md))。圧縮入力 128MB 超は image クレート / WIC chain にフォールバック (並列ワーカー × 圧縮 buffer の積算メモリ圧迫を回避)。ビルドに cmake + NASM が必要。
 - **Parallel loading**: `rayon` (dedicated thread pool per folder load)
 - **Thumbnail cache**: SQLite via `rusqlite` (bundled), WebP encoding via `webp` crate
 - **Video thumbnails**: Windows Shell API (IShellItemImageFactory)
-- **Video inline playback**: `ffmpeg-the-third` クレート + FFmpeg LGPL shared DLL (BtbN ビルド) + `cpal` (WASAPI Shared 音声出力)。フルスクリーンで動画を MP4 / MKV / MOV / AVI / WMV / MPG / MPEG / HEVC / AV1 として再生する。`avcodec / avformat / avutil / avfilter / swscale / swresample` の 6 DLL を launcher (`crates/launcher/`) が core / remote service とともに `include_bytes!` で内包し、初回起動時に `%APPDATA%/mimageviewer/runtime/<version>/` へ展開して本体 (`mimageviewer-core.exe`) を spawn する。本体側は exe と同じディレクトリの DLL を Windows ローダが解決するだけで個別ロード処理は持たない。ビルドに libclang (LLVM/Clang) が必要。詳細は「FFmpeg LGPL DLL 管理」節を参照
+- **Video inline playback**: `ffmpeg-the-third` クレート + FFmpeg LGPL shared DLL (BtbN ビルド) + `cpal` (WASAPI Shared 音声出力)。フルスクリーンで動画を MP4 / MKV / MOV / AVI / WMV / MPG / MPEG / HEVC / AV1 として再生する。`avcodec / avformat / avutil / avfilter / swscale / swresample` の 6 DLL を launcher (`crates/launcher/`) が core / remote service / EPUB converter / EffeTune Mixwright bundle とともに `include_bytes!` で内包し、初回起動時に `%APPDATA%/mimageviewer/runtime/<version>/` へ展開して本体 (`mimageviewer-core.exe`) を spawn する。本体側は exe と同じディレクトリの DLL を Windows ローダが解決するだけで個別ロード処理は持たない。ビルドに libclang (LLVM/Clang) が必要。詳細は「FFmpeg LGPL DLL 管理」節を参照
 - **ZIP support**: `zip` crate
 - **PDF support**: `pdfium-render` crate + PDFium DLL (exe に埋め込み) + マルチプロセスワーカープール (設定 3〜10、既定 5、1 つを Critical 予約)
+- **EPUB conversion**: `crates/epub-pdf-worker` が WebView2 で DRM のない EPUB を PDF 化する。配布ビルドでは `mimageviewer-epub-pdf.exe` を署名後に launcher へ内包し、core と同じ versioned runtime へ展開する。portable 版は core exe の隣に loose 同梱する
 - **PDF password**: `windows-dpapi` crate (DPAPI 暗号化でパスワード永続保存)
 - **AI upscaling**: `ort` crate (ONNX Runtime v2、`load-dynamic` モード、`directml` + `cuda` + `tensorrt` features)。Real-ESRGAN / Real-CUGAN / NMKD-Siax ONNX モデルでタイル分割 4x アップスケール。バックエンドは Settings の `ai_backend` で DirectML / TensorRT を切替 (TRT は NVIDIA 専用)
-- **ONNX Runtime DLL**: `onnxruntime.dll` / `onnxruntime_providers_shared.dll` (Microsoft.ML.OnnxRuntime.DirectML NuGet v1.24.2) を exe に `include_bytes!` で埋め込み、初回 AiRuntime 作成時に `%APPDATA%/mimageviewer/` に展開。`ort::init_from()` で動的ロードする。これにより VC++ 再頒布可能パッケージ不要
+- **ONNX Runtime DLL**: `onnxruntime.dll` / `onnxruntime_providers_shared.dll` (Microsoft.ML.OnnxRuntime.DirectML NuGet v1.24.2) を exe に `include_bytes!` で埋め込み、AI runtime 初期化 worker が `%APPDATA%/mimageviewer/` に展開して `ort::init_from()` で動的ロードする。Microsoft 公式 app-local VC runtime 4 本も全配布 exe の隣へ同梱するため、利用者による VC++ 再頒布可能パッケージの追加インストールは不要
 - **TensorRT 対応 (NVIDIA GPU 高速化、オプション)**: `Microsoft.ML.OnnxRuntime.Gpu.Windows` + NVIDIA CUDA Runtime / cuBLAS / cuFFT / cuRAND / cuSOLVER / cuSPARSE / NVRTC / nvJitLink / cuDNN / TensorRT (合計 ~6.8 GB) を `%APPDATA%/mimageviewer/tensorrt/` に展開して使用。pack DL は `scripts/setup-tensorrt-pack.ps1` (PoC 版、アプリ内 DL UI は将来実装)。実測 1.4-3.4x (アップスケール) / 4.5x (デノイズ) 高速化。エンジンビルダーは `mimageviewer.exe --tensorrt-build <model>` 子プロセス。詳細は [docs/archive/ai/tensorrt-batching-feasibility.md](docs/archive/ai/tensorrt-batching-feasibility.md)
 - **AI image classification**: ヒューリスティクスでイラスト/漫画/CG/写真を自動判別
 - **AI inpainting**: MI-GAN (ONNX, DirectML) を消しゴムツールから利用してマスク領域を補完
@@ -172,13 +278,19 @@ mimageviewer/
 │   ├── settings.rs          # 設定の読み書き API (Phase 3 で SQLite 経路に切替)
 │   ├── settings_db.rs       # 設定永続化 SQLite バックエンド (settings.db、bak1..bak10 世代、JSON migration、boot decision tree、quarantine)
 │   ├── catalog.rs           # SQLite サムネイルカタログ
+│   ├── collection_store/    # 名前付きコレクション（v4.0.0）の永続化。単一 actor + immutable snapshot。
+│   │                        # db/model/path/prepare/read_lease/runtime/text/export_all（collection.db、bak1..bak10）
+│   ├── app/collection_grid.rs      # コレクション直下の一覧（items 生成・並べ替え・右クリック）
+│   ├── app/collection_navigation.rs # コレクションの有効な順番でのページ送り・連続再生・親への復帰
+│   ├── ui_dialogs/collections.rs   # コレクション管理ウィンドウ（作成/固定/削除/並べ替え/取り込み/書き出し）
+│   ├── remote_ipc/persistent_collections.rs # mIV Remote への読み取り専用公開
 │   ├── folder_tree.rs       # フォルダツリー走査ヘルパー
 │   ├── folder_thumb_pins.rs # 親コンテナ（Folder/ZipFile/PdfFile）の代表サムネ手動ピン DB（v0.9.x、`#pin:` cache key suffix で identity を表現）
 │   ├── grid_item.rs         # GridItem（Folder/Image/Video/Audio/ZipFile/PdfFile/ZipImage/ZipDir/PdfPage/Stack）/ ThumbnailState 定義
 │   ├── filename_stack.rs    # ファイル名 prefix スタック（v2.0.0）の純ロジック（StackGroup/StackView/group_media/materialize_*）
 │   ├── filename_stack_ui.rs # 上記の App グルー（トグル・集約⇔フラット切替・Shift+↓↑ ジャンプ）
 │   ├── thumb_loader.rs      # サムネイル並列ロード
-│   ├── wic_decoder.rs       # WIC 画像デコード（HEIC/AVIF/JXL/TIFF/RAW）
+│   ├── wic_decoder.rs       # WIC 画像デコード（HEIC/AVIF/JXL/TIFF。RAW は src/raw/）
 │   ├── susie_loader.rs      # Susie プラグイン 32bit ワーカープール + IPC（v0.7.0、PI/MAG/Q0/PIC/MAKI…）
 │   ├── os_theme.rs          # UI テーマ（System/Light/Dark）Windows レジストリ連携（v0.7.0）
 │   ├── video/               # 動画インライン再生 (FFmpeg LGPL DLL)
@@ -249,15 +361,17 @@ bash scripts/bootstrap-vendor.sh           # 不足分のみ取得
 bash scripts/bootstrap-vendor.sh --force   # 既存ファイルも再取得 (デバッグ用)
 ```
 
+上の bash はエージェント自身が実行するセットアップ手順であり、利用者へ渡すコマンドではない。
 このスクリプトは以下を順に実行する:
 
 1. `setup-pdfium.sh` — `vendor/pdfium/bin/pdfium.dll` を取得
-2. `setup-ort.sh` — `vendor/ort/onnxruntime*.dll` を取得
-3. `setup-ffmpeg.sh` — `vendor/ffmpeg/{bin,include,lib}/` を取得
-4. `setup-susie-worker.sh` — `vendor/susie-worker/mimageviewer-susie32.exe` を再ビルド
-5. `setup-twemoji.sh` — `vendor/twemoji/svg/*.svg` を取得 (注釈スタンプの絵文字。
+2. `setup-libraw.sh` — `vendor/libraw/` に LibRaw 0.22.2 と zlib 1.3.1 のソース、`VERSION` を取得
+3. `setup-ort.sh` — `vendor/ort/onnxruntime*.dll` を取得
+4. `setup-ffmpeg.sh` — `vendor/ffmpeg/{bin,include,lib}/` を取得
+5. `setup-susie-worker.sh` — `vendor/susie-worker/mimageviewer-susie32.exe` を再ビルド
+6. `setup-twemoji.sh` — `vendor/twemoji/svg/*.svg` を取得 (注釈スタンプの絵文字。
    build.rs が exe へ `include_bytes!` で同梱。未配置でもビルドは通るがスタンプは無効)
-6. `vendor/models/*.onnx` を `%APPDATA%/mimageviewer/models/` から自動 copy
+7. `vendor/models/*.onnx` を `%APPDATA%/mimageviewer/models/` から自動 copy
    (= 一度 mIV をインストール / 起動して APPDATA に展開させた後でないと取れない)
 
 ### bootstrap で取れないもの
@@ -265,7 +379,9 @@ bash scripts/bootstrap-vendor.sh --force   # 既存ファイルも再取得 (デ
 - **`vendor/vst3-host/mimageviewer-vst3-host.exe`**: VST3 SDK の DL が ~490 MB と
   大きいので bootstrap には含めていない。以下のいずれかで配置する:
   - **既存ビルド済み exe をコピー** (推奨): 別 worktree やバックアップに残っている
-    `mimageviewer-vst3-host.exe` を `vendor/vst3-host/` に置く。SDK 不要で即解決
+    `mimageviewer-vst3-host.exe` と必須の `vcrt/` (公式CRT4本) を
+    `vendor/vst3-host/` に実ファイルでコピーする。現ソースidentityが一致する成果物のみ再利用可。
+    SDK不要だが、exe単体のコピーではhostを直接起動できない
   - **CMake で再ビルド**:
     ```bash
     bash scripts/setup-vst3-sdk.sh
@@ -283,7 +399,7 @@ bash scripts/bootstrap-vendor.sh --force   # 既存ファイルも再取得 (デ
 
 ### 消えると再取得できないもの — ツリー外バックアップ必須
 
-`bootstrap-vendor.sh` で再取得できる物 (pdfium / ort / ffmpeg / susie) と違い、
+`bootstrap-vendor.sh` で再取得できる物 (pdfium / libraw / ort / ffmpeg / susie) と違い、
 **以下は失うと復旧手段が限られる / 無い**:
 
 - **`vendor/models/*.onnx`** — DL スクリプトが**存在しない**。`%APPDATA%\mimageviewer\
@@ -298,11 +414,12 @@ bash scripts/bootstrap-vendor.sh --force   # 既存ファイルも再取得 (デ
 ```
 C:\home\mimageviewer_vendor_backup\
   ├ models\        (*.onnx 一式)
-  └ vst3-host\     (mimageviewer-vst3-host.exe)
+  └ vst3-host\     (mimageviewer-vst3-host.exe と vcrt\ の公式CRT4本)
 ```
 
 - **定期ジョブは不要**。`vendor/` の中身は静的なので、モデル追加や vst3-host を
-  再ビルドした**ときだけ**バックアップを取り直す。
+  再ビルドした**ときだけ**バックアップを取り直す。hostはexeと `vcrt/` を含む
+  ディレクトリ全体を `C:\home\mimageviewer_vendor_backup\vst3-host` へ実ファイルでコピーする。
 - **復旧手順**: `vendor/` 消失時、`bootstrap-vendor.sh` を流した後に
   `cp -r C:/home/mimageviewer_vendor_backup/models vendor/` と
   `cp -r C:/home/mimageviewer_vendor_backup/vst3-host vendor/` で埋め戻す。
@@ -370,6 +487,19 @@ C:\home\mimageviewer_vendor_backup\
 - **ScrollArea の横幅**: ダイアログ右端に縦スクロールバーを置く一覧は
   `.auto_shrink([false, ...])` を指定し、利用可能幅を使い切る。既定の横 shrink のままだと
   内容幅まで縮み、スクロールバーがダイアログの途中に出る。
+- **起動時ダイアログの小画面要件**: 初回設定・更新後の告知・設定の保護起動/復元案内など、
+  起動時または初回設定直後に出る画面は **1093×614 logical points** でも確定/閉じる操作を
+  完全に表示すること。`ctx.content_rect()` から枠・初期位置・見出し・操作行・画面余白を引いて
+  本文の高さを制限し、見出しと操作ボタンは縦 `ScrollArea` の外へ置く。
+  自動サイズの `Modal` ではスクロールの親領域も明示確保する。リサイズ可能な `Window` は
+  `available_height()` の制約も尊重し、初期本文が不必要に狭くならない `default_height()` を指定する。
+  本文の上限は実際の枠/見出し/折り返し操作行から計算し、余った高さを使う。一律の大きな控除や
+  固定本文高は使わない。縦auto_shrinkで短文は自然高に縮め、長文の表示面積も回帰検査する。
+  長いパス・エラー文・版またぎ告知もテストし、1093×614 / 1366×728 の snapshot と
+  UI倍率100%/200%で、固定操作行の全ボタン（再接続等の別状態も含む）とタイトル×の
+  矩形/クリック到達性の回帰検査を残す。起動時書庫変換の列挙/確認/変換/エラーも対象。
+  初回設定の Enter 確定は IME helper を使い、
+  選択肢/リンクにフォーカスがある場合はその widget 操作を優先する。Esc で初回設定を省略しない。
 - **折り返し本文と floating scrollbar**: 長文を折り返すダイアログでは、floating scrollbar の
   `floating_allocated_width` を少なくとも `bar_inner_margin + bar_width` 確保する。共通 style は
   一覧の表示面積を優先して予約幅 0 のため、そのまま使うと右端の文字へバーが重なる。
@@ -471,7 +601,7 @@ egui::Window::new("...").show(ctx, |ui| {
 
 ### セキュリティ
 - `image` クレート（純粋Rust、メモリ安全）で画像デコード。
-- HEIC/AVIF/JXL/TIFF/RAW は WIC 経由（`unsafe` ブロックに局所化）。
+- HEIC/AVIF/JXL/TIFF は WIC 経由（`unsafe` ブロックに局所化）。RAW は LibRaw へ先に振り分け、FFI は `crates/libraw-sys` に局所化。
 - ONNX Runtime (ort crate) 経由の AI 推論は safe Rust API。DirectML EP で GPU アクセラレーション。
 
 ### 並行処理: try_lock + sleep は使わない ⚠️
@@ -719,7 +849,9 @@ print(c.most_common())
 ## Supported Image Formats
 
 - **内蔵**: JPEG, PNG, GIF, WebP, BMP
-- **WIC 経由**: HEIC, HEIF, AVIF, JXL, TIFF, TIF, DNG, CR2, CR3, NEF, NRW, ARW, SRF, SR2, RAF, ORF, RW2, PEF, PTX, RWL, IIQ
+- **RAW（内蔵 LibRaw）**: DNG, CR2, CR3, NEF, NRW, ARW, SRF, SR2, RAF, ORF, RW2, PEF, PTX, RWL, IIQ, CRW, SRW, 3FR, ERF, KDC, DCR, MRW, MOS
+  - Nikon HE/HE* と JPEG XL 圧縮 DNG は現像非対応。使える埋め込みプレビューは表示可能。
+- **WIC 経由**: HEIC, HEIF, AVIF, JXL, TIFF, TIF
 - **動画（サムネイルのみ）**: MP4, AVI, MOV, MKV, WMV, MPG, MPEG
 
 ## Performance Notes
@@ -810,11 +942,19 @@ bash scripts/setup-pdfium.sh check  # 新しいバージョンの有無を確認
 AI 機能 (アップスケール・ノイズ除去・消しゴム) は ONNX Runtime + DirectML EP を
 使用する。`ort` クレートの `load-dynamic` 機能で、メイン exe は静的リンクせず、起動時に
 `%APPDATA%\mimageviewer\onnxruntime.dll` を動的ロードする。DLL は PDFium と同様
-`include_bytes!` で exe に埋め込み、初回 `AiRuntime::new()` で APPDATA へ展開する。
+`include_bytes!` で exe に埋め込み、process 共通 AI runtime 初期化 worker が APPDATA へ展開する。
 
-この方式の利点:
-- Visual C++ 再頒布可能パッケージへの依存が不要になる (VCRUNTIME140.dll 等が消える)
-- 利用者は単体 exe 版・インストーラ版どちらでも追加セットアップ不要
+`onnxruntime.dll` は Microsoft の動的 CRT build なので、公式 VC/Redist 由来の
+`msvcp140.dll` / `msvcp140_1.dll` / `vcruntime140.dll` / `vcruntime140_1.dll` を
+app-local 配置する。単体 launcher は versioned runtime directory へ hash 検証付きで展開し、
+portable / 開発 build は exe 隣へ loose 配置する。利用者による追加セットアップは不要。
+由来、版、署名、hash の正本は `vendor/vcrt/provenance.json` とし、native dependency 更新時は
+`scripts/check-vcrt-pe-dependencies.ps1` を通して4本を一体更新する。
+
+GUI process の ORT constructor は process 共通 `AiRuntimeInitOwner` だけが worker 上で一度実行する。
+App / Remote / materializer は同じ Ready / Failed terminal snapshot を使い、UI thread は待たない。
+`ort` 2.0.0-rc.12 は upstream `17ed727` を `crates/ort-patched` へ backport し、dynamic load / export /
+C API version の初期化失敗を ORT API に再入せず `LoadDynamicError` として返す。
 
 ### セットアップ
 
@@ -878,13 +1018,16 @@ HEVC / AV1 を再生する) のために、FFmpeg の **LGPL shared build** を 
 直接の本体には適用できない (ローダの解決タイミングに間に合わない)。`/DELAYLOAD` も
 rustc 経由の link.exe で機能しない (Delay Import Directory が空のまま、原因未解明)。
 
-そこで **launcher が core・remote service・FFmpeg DLL を内包する構成**で「単体 exe 配布」を実現している:
+そこで **launcher が core・remote service・EPUB converter・FFmpeg DLL・VC runtime・EffeTune Mixwright bundle を内包する構成**で「単体 exe 配布」を実現している:
 
 ```
 配布する mimageviewer.exe (= ランチャー、crates/launcher/ が生成)
 ├── include_bytes! で内包:
 │   ├── mimageviewer-core.exe   (本体、ffmpeg-the-third を import library リンク)
 │   ├── mimageviewer-remote.exe (本体と remote-ipc protocol version を共有、Web UI 資産も内包)
+│   ├── mimageviewer-epub-pdf.exe (EPUB → PDF 変換器)
+│   ├── effetune/EffeTune Mixwright.vst3/ (全424ファイル、v0.12.0。入力は別の VERSION と計425ファイル)
+│   ├── app-local VC runtime 4 DLL (Microsoft 署名を保持)
 │   ├── avcodec-61.dll
 │   ├── avformat-61.dll
 │   ├── avutil-59.dll
@@ -892,10 +1035,12 @@ rustc 経由の link.exe で機能しない (Delay Import Directory が空のま
 │   ├── swscale-8.dll
 │   └── swresample-5.dll
 └── 起動時の動作:
-    1. %APPDATA%\mimageviewer\runtime\<version>\ に上記 8 ファイルを展開
-       (サイズ一致チェックでスキップ、不一致なら .tmp → atomic rename)
+    1. %APPDATA%\mimageviewer\runtime\<version>\ に上記 exe / DLL と app-local VC runtime を展開
+       (版別 SHA-256 sidecar で照合し、不一致なら atomic replace)
+       EffeTune は同ディレクトリ下の不変世代へ全hash検証して公開し、atomic更新するのはcurrent pointerだけ。
+       一覧・サイズ・更新時刻・作成時刻とstampが一致すれば再hash／write lockなし。修復失敗もcore起動を継続。
     2. std::process::Command で mimageviewer-core.exe を spawn (引数 forward)
-    3. ランチャー即終了 (GUI なので exit code を待たない)
+    3. core が使用中lockを引き継いだ通知後にランチャー終了 (coreの通常終了は待たない)
 ```
 
 ランチャーは **FFmpeg API を一切呼ばない** ので Windows ローダの DLL 解決問題に
@@ -903,28 +1048,40 @@ rustc 経由の link.exe で機能しない (Delay Import Directory が空のま
 Windows の DLL 検索順 (exe 同居が最優先) で確実に解決される。
 
 **バージョン別 runtime ディレクトリ**: `runtime\<version>\` のように分けることで、
-古い core / remote が走行中に新ランチャーが上書きしようとして file lock で失敗する事象を回避
-(Codex レビュー助言)。古いバージョンの runtime ディレクトリはユーザーが手動で
-削除可能 (将来的にランチャー側で「最新 N 世代だけ残す」掃除処理を追加するかも)。
+古い core / remote / EPUB worker が走行中に新ランチャーが上書きしようとして file lock で失敗する事象を回避
+(Codex レビュー助言)。core の起動完了・初回描画後、短命の背景 worker が現在実行中の
+`CARGO_PKG_VERSION` と使用中lockで保護された版を残し、他の版を best-effort 削除する。
+coreはexeの版directoryと固定EffeTune世代のshared leaseを寿命中保持し、launcherもcoreへの
+引き渡しまで保持する。清掃はcandidateのexclusive leaseと抽出／公開lockを非blocking取得し、
+削除完了まで保持する。cooperative lockは削除対象外の `runtime/.locks/` に置き、微小なfileを永久保持する。
+launcherは版directoryを作る前に外側版leaseを取得する。旧launcherのpublisher互換用lockも併用する。
+workerが実行中process画像を一度だけ列挙し、候補内の画像があれば旧版も
+保持する。同版の別coreが存在する間は全旧EffeTune世代を保守的に保持する。未知の名前と再解析ポイントは
+残し、削除失敗はログだけで次回起動へ回す。ダウングレード時には新しい版も削除対象となり、
+その版を再び起動すると launcher が再展開する。portable は清掃しない。
 
 **ビルド順序**: cargo は同一ワークスペース内 bin の依存順序を表現できないので
-`scripts/build-release.{sh,ps1}` が 3 段階に分けて呼ぶ:
+`scripts/build-release.{sh,ps1}` が 4 段階に分けて呼ぶ:
 1. `cargo build --release --bin mimageviewer-core` → 本体生成 (package `mimageviewer` 内の bin なので `-p` 不要)
 2. `cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets`
    → Web UI 資産を内包した remote service 生成
-3. `cargo build --release -p mimageviewer-launcher --bin mimageviewer` → ランチャー生成 (core + remote を include_bytes!)。**bare `cargo build --release --bin mimageviewer` は失敗する** (`no bin target named mimageviewer in default-run packages`。`mimageviewer` bin は package `mimageviewer-launcher` にあり workspace default-members 外なので `-p` 必須)
+3. `cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf` → EPUB converter 生成
+4. `cargo build --release -p mimageviewer-launcher --bin mimageviewer` → ランチャー生成 (core + remote + EPUB worker + EffeTune bundle 等を include_bytes!)。**bare `cargo build --release --bin mimageviewer` は失敗する** (`no bin target named mimageviewer in default-run packages`。`mimageviewer` bin は package `mimageviewer-launcher` にあり workspace default-members 外なので `-p` 必須)
 
-ラッパーは 3 つの cargo 呼び出しすべてで `CARGO_INCREMENTAL=0` を明示する。`Cargo.toml` の
+ラッパーは 4 つの cargo 呼び出しすべてで `CARGO_INCREMENTAL=0` を明示する。`Cargo.toml` の
 release profile はローカル rebuild 高速化のため `incremental = true` だが、ThinLTO +
 rust-lld で stale incremental object が残ると `fast_image_resize` などの SIMD symbol が
 release link 時に未解決になることがあるため、配布ビルドは安定優先で incremental を切る。
 
-`cargo build --release` を直接打つ場合は ① → ② → ③ の順で 3 回打つこと。
-ランチャー側 build.rs が `target/release` の core / remote 両方の存在をチェックし、
-無ければ復旧手順付きで止まる。
+`cargo build --release` を直接打つ場合は ① → ② → ③ → ④ の順で 4 回打つこと。
+ランチャー側 build.rs が `target/release` の core / remote / EPUB worker の存在をチェックし、
+無ければ復旧手順付きで止まる。EffeTune も `vendor/effetune-mixwright/VERSION` と
+`EffeTune Mixwright.vst3/` を必須検証する。`MIMV_EFFETUNE_DIR` で staging root を指定できる。
+配布署名時は build-dist.ps1 が bundle を target にコピーして PE を署名し、埋め込み元を指定する
+(vendor 原本は変更しない)。
 
 **配布物**:
-- 単体 exe 版: `mimageviewer.exe` 1 ファイル (内包する core + remote + DLL を含む)
+- 単体 exe 版: `mimageviewer.exe` 1 ファイル (内包する core + remote + EPUB worker + DLL + EffeTune bundle を含む)
 - インストーラ版: `mImageViewer_setup.exe` (Inno Setup が同じランチャーを配置)
 - どちらも初回起動時に APPDATA に展開、2 回目以降は展開済みなのでスキップして高速
 
@@ -1046,6 +1203,25 @@ x264 / x265 (エンコーダ) は GPL なので含まれない (mIV はデコー
 ワーカー exe のパスを直接指定できる。`setup-susie-worker.sh` を走らせて
 `vendor/susie-worker/` に配置済みであれば、テストは自動でそれを拾う。
 
+## LibRaw ソース・ライセンス管理
+
+RAW は LibRaw 0.22.2 を CDDL-1.0 で静的リンクする。zlib 1.3.1 と既存の
+libjpeg-turbo 静的ライブラリを使い、新しい DLL / exe は追加しない。
+エージェント用セットアップは `bash scripts/setup-libraw.sh`（bootstrap に含む）、
+更新確認は `bash scripts/setup-libraw.sh check`。この bash 手順は利用者には渡さない。
+`vendor/libraw/VERSION` はセットアップが生成し、`build.rs` が `MIV_LIBRAW_BUILD_ID` に
+焼き込んでアプリ内の同梱版と対応ソース URL を揃える。欠落・不正なら復旧手順付きで失敗する。
+
+- tracked notice はルートの `LIBRAW-LICENSE.txt` / `ZLIB-LICENSE.txt` /
+  `LIBJPEG-TURBO-LICENSE.txt`。installer / portable の双方へ同梱する。
+  3 本とも root ファイルから `include_str!` で本体へ埋め込み、バージョン情報で全文を表示する。
+  単体 exe 版でも全文と IJG 帰属文を読めることを維持する。
+- LibRaw 本体は無改変の公式 tarball、shim は本リポジトリの MIT コード。
+- 対応ソースは [docs/libraw-source-distribution.md](docs/libraw-source-distribution.md) に従って
+  SHA-256 を照合し、mikage.to へ配置する。tarball は git に入れず、`.sha256` を追跡する。
+- LibRaw 更新時はソース・checksum・notice・製品ページの同梱版とリンクを同時に更新し、
+  古い配布版の対応ソースも残す。
+
 ## VST3 host bridge 管理 (v0.9.0+)
 
 動画音声に VST3 プラグインを挿入する機能 (LUFS 測定 / EQ / 等) のために、
@@ -1056,6 +1232,24 @@ VST3 SDK は **MIT ライセンス化されている** (3.8.0、2025-10-20 以�
 互換。bridge ビルド成果物は通常の `include_bytes!` で本体に内包する (PDFium / Susie ワーカーと
 同じパターン)。
 
+Windows SDK hosting moduleのMIT原文を `crates/vst3-host/src/sdk/` に保持し、UTF-8 pathを
+明示的にUTF-16へ変換するwide API版を保守する。process全体のACPは変更しない。
+2026-10-03 v4.3.0 release check: pluginが観測するmodule／CRT load pathは、通常絶対pathが
+260 UTF-16単位未満かつ同一pathへの正規化round-tripが成立する場合だけ通常Win32形式にする。
+末尾dot／spaceやDOS device名、正規化差分／失敗、260以上は拡張形式を維持する (Codex P2/P3 対応)。
+UNC namespace markerは大小文字を区別しない。host内FS検査は拡張形式を維持する。
+`GetModuleFileNameW`が保持する `\\?\` とpluginが付加する `/` の組合せによるEffeTune missing-assetsを避ける。
+2026-10-02 R2ではhost PE内の `MIV_VST3_HOST_SOURCE_SHA256:` markerを、CMakeLists／include／src／testsの
+現ソースhashと照合する。APPDATA等から旧hostをimportするfallbackはない。
+identityは `scripts/vst3-host-identity.ps1` に計算を一本化し、CMakeも同scriptの
+`-HashSourceRoot` を使う。対象ファイルのCRLFだけをbyte単位でLFへ正規化し、他のbyteは保持する。
+ordinal順のslash相対名と各正規化SHA256を `name:hash\n` としてUTF-8/BOMなしで連結しSHA256化する。
+Gitの改行変換によるLF／CRLF checkout差を無視するが、未コミットのソース変更は検知する。
+SDK欠落時や `-SkipVst3Bridge` は現ソースと一致するvendor hostのみ再利用可能。不一致／欠落は復旧案内付きで停止する。
+build-release／build-distの署名前・core埋込前と、非portable coreのbare cargo release buildにも同じgateを通す。
+`dev-runtime` もrelease継承profileのためこのgate対象。host変更時は先にCMakeで再buildする。
+再build成果物のSHA256／sizeを記録し、内側hostの署名→core→launcherの順で埋め込む。
+
 ### セットアップ (メインビルド前に必須)
 
 ```bash
@@ -1065,14 +1259,23 @@ bash scripts/setup-vst3-sdk.sh
 # 2. CMake で C++ bridge をビルド
 cmake -S crates/vst3-host -B crates/vst3-host/build -G "Visual Studio 18 2026" -A x64
 cmake --build crates/vst3-host/build --config Release
-# → vendor/vst3-host/mimageviewer-vst3-host.exe (~640 KB)
+# → vendor/vst3-host/mimageviewer-vst3-host.exe と vendor/vst3-host/vcrt/ の公式CRT4本
 ```
 
 - 前提:
   - Visual Studio 2026 (18) BuildTools (MSVC C++ デスクトップ開発ワークロード)
   - CMake 3.20+
   - 一度ビルドしたら、C++ ソースを変更しない限り再ビルド不要
-- 出力: `vendor/vst3-host/mimageviewer-vst3-host.exe` (.gitignore)。
+- CMakeは `vendor/vcrt/` の公式 `vcruntime140.dll` / `vcruntime140_1.dll` /
+  `msvcp140.dll` / `msvcp140_1.dll` を `vendor/vst3-host/vcrt/` へcopy-if-differentで配置する。
+  hostが再リンク不要でも配置targetは実行される。正本が欠けた場合は復旧案内付きでbuildを停止する。
+  コピーはMicrosoft署名を保持し、mIVとして再署名しない。CRTをhost直下には置かない。
+  testerと `test-full.ps1` 内の直接起動テストはこのvendor exeと隣の `vcrt/` を使うので、
+  full gateの前にこのCMake build（または現ソース一致のexe＋CRTセットの復元）を済ませる。
+  `test-full.ps1`／`build-dist.ps1` はテスト前に非起動preflightでCRT4本と正本の完全一致を検査し、
+  欠落／破損ならCMake buildまたはセット全体の復元を案内して停止する。
+  `build-dev.ps1` のcoreは公式CRTを埋め込み、通常の抽出経路で同じ `vcrt/` layoutを作る。
+- 出力: `vendor/vst3-host/mimageviewer-vst3-host.exe` と `vcrt/` (.gitignore)。
   メイン exe のリリースビルド時に `include_bytes!` で内包される
 - 動作確認用: `crates/vst3-host-tester/` (Rust 単独 GUI exe)。本体に依存せずに
   プラグインのロード / GUI / 音声パススルーをテストできる。`cargo run -p vst3-host-tester`
@@ -1087,8 +1290,10 @@ This software supports VST3 plugins via the Steinberg VST3 SDK
 (https://github.com/steinbergmedia/vst3sdk) under the MIT License.
 ```
 
-**VST トレードマーク (ロゴ) は使わない**。「VST3 プラグインをサポート」テキスト表記のみで運用
-(= トレードマークガイドライン回避)。
+**VST トレードマークについての採用方針**: VST3 プラグインへの対応を文字で説明し、
+VST のロゴは使用しない。名称の文字表記も商標ガイドラインの対象となり得るため、
+文字表記によってガイドラインを回避できるとは扱わない。この記録は採用した表記方針を
+示すもので、ガイドラインへの適合や商標侵害の有無を断定するものではない。
 
 ## Markdown / テキストファイルのエンコーディング (BOM 必須ケース)
 
@@ -1251,15 +1456,16 @@ cargo test -p mimageviewer --test <integration-test-name>
 [docs/development-build-and-test.md](docs/development-build-and-test.md) を参照。
 
 ⚠️ **`test-full.ps1` は `target\release\mimageviewer-core.exe` と
-`target\release\mimageviewer-remote.exe` が既に在ることを前提にする**。`--workspace` が
-launcher package を含み、その build.rs が内包対象 exe の存在を検査するため、どちらかが
+`target\release\mimageviewer-remote.exe`、`target\release\mimageviewer-epub-pdf.exe` が既に在ることを前提にする**。`--workspace` が
+launcher package を含み、その build.rs が内包対象 exe の存在を検査するため、いずれかが
 無いと**テストが 1 件も走らないままビルドエラーで落ちる**。新しい clone や
-`cargo clean` 直後は、先に 2 本を作ってから走らせる (どちらでもよい):
+`cargo clean` 直後は、先に 3 本を作ってから走らせる (どちらでもよい):
 
 ```powershell
-.\scripts\build-release.ps1     # core -> remote -> launcher を正しい順で作る
+.\scripts\build-release.ps1     # core -> remote -> EPUB worker -> launcher を正しい順で作る
 cargo build --release --bin mimageviewer-core
 cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets
+cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf
 ```
 
 `build-dist.ps1` は test-full を `cargo clean` の**前**に回すので、直前のビルド成果物が
@@ -1334,9 +1540,12 @@ VST3 bridge、署名、packagingなどrelease構成そのものを確認する�
 | 経路 | 呼び出し元 | 書き込む物 | 条件 |
 | --- | --- | --- | --- |
 | レーティング | `rating_write_worker` → `xmp_writer::apply_rating` | `xmp:Rating` | 設定 `write_rating_to_xmp` (**既定 OFF**) + `GridItem::Image` かつ JPEG / PNG / WebP。製本ページは除外 |
-| 旧 XMP タグの取り込み後削除 | `tag_legacy_xmp_worker` → `xmp_writer::apply_tag_op(TagOp::ClearMiv)` | `dc:subject` から `#` 始まりの要素だけ除去 | ユーザーが「旧XMPタグを取り込んでファイルから削除」を明示実行したときのみ |
 
-どちらも `src/xmp_writer.rs` の `XMP_WRITE_LOCK` で直列化されている (同一ファイルへの read-modify-write を
+**旧 XMP タグの経路は 2 つとも既に無い。** 手動の「旧XMPタグを取り込む / 取り込んでファイルから削除」は
+`e63600147` (2026-08-30、v3.4.0) で、初訪問時の自動 seed は v3.9.1 で撤去した (`39390ec77`、§1.226)。
+`src/tag_legacy_xmp_worker.rs` も `src/tag_legacy_seed_worker.rs` も存在しない。**復活させない。**
+
+この経路は `src/xmp_writer.rs` の `XMP_WRITE_LOCK` で直列化されている (同一ファイルへの read-modify-write を
 並走させると後勝ちで相手の編集を消すため)。**新しい書き込み経路を足すときもこのロックを通す**。
 
 ### ExifTool でのラウンドトリップ検証
@@ -1478,7 +1687,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 
 | 配布形態 | ファイル名 | 中身 / 性質 | data 保存先 | 管理者権限 |
 | --- | --- | --- | --- | --- |
-| **単体exe版** (旧称「ポータブル版」) | `mimageviewer.exe` | launcher。core + remote service + FFmpeg DLL を `include_bytes!` 内包、起動時に APPDATA へ展開して spawn | `%APPDATA%\mimageviewer` | 不要 |
+| **単体exe版** (旧称「ポータブル版」) | `mimageviewer.exe` | launcher。core + remote service + EPUB converter + FFmpeg DLL + VC runtime + EffeTune Mixwright bundle を `include_bytes!` 内包、起動時に APPDATA へ展開して spawn | `%APPDATA%\mimageviewer` | 不要 |
 | **インストーラ版** | `mImageViewer_setup.exe` | Inno Setup 出力 | `%APPDATA%\mimageviewer` | **要 (UAC)** |
 | **ポータブル版** (v1.1.0 新) | `mImageViewer_portable_v<VER>.zip` | loose-deps。native 依存を埋め込まず exe 隣に同梱、展開ゼロ | `<exe_dir>\data` (APPDATA 不使用) | 不要 |
 
@@ -1490,7 +1699,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 - **Vector**: インストーラ (.exe) + `installer/readme.txt` (利用者向け説明書) を zip にまとめて申請。
   readme 同梱を Vector が要件化しているため、単体 exe やインストーラ単独での申請は不可。
 - **インストーラ**: Inno Setup 6（`installer/mimageviewer.iss`）
-- **配布ビルド**: `.\scripts\build-dist.ps1` (全体テスト → clean → core → remote → launcher → ISCC → portable を 1 コマンド、
+- **配布ビルド**: `.\scripts\build-dist.ps1` (全体テスト → clean → core → remote → EPUB worker → launcher → ISCC → portable を 1 コマンド、
   stale 配布物を構造的に防ぐ)。開発中の素早い反復だけ `.\scripts\build-release.ps1` 単体を使う
   (clean/ガードなしなので配布物には使わない)。
 - **出力**: `installer/Output/mImageViewer_setup.exe`
@@ -1502,20 +1711,55 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 - **ポータブル版ビルド**: 配布時は build-dist.ps1 が内部で `.\scripts\build-portable.ps1` を呼ぶ。
   `cargo build --release --bin mimageviewer-core --features portable --target-dir target-portable` と
   `cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets --target-dir target-portable`
+  と `cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf --target-dir target-portable`
   (非portable core を上書きしないよう専用 target dir に分離) → loose 同梱フォルダ +
   `dist\mImageViewer_portable_v<VER>.zip` を生成する。`portable` feature で native 依存
   (pdfium / onnxruntime / susie / vst3-host / モデル) を埋め込まず exe 隣から解決し、`data_dir` を
   `<exe_dir>\data` に向ける。launcher は使わず core を `mimageviewer.exe` にリネームし、
-  remote service をその隣へ同梱。
+  remote service と EPUB converter をその隣へ同梱。
+  VST host と EffeTune bundle は利用者決定により非同梱。音響調整は bundle 不在で利用不可のまま。
+  `portable` build flavor では音響調整ボタン・カスタマイズ候補・v4.3.0の関連告知も表示しない。
+  保存済みセクション順は維持し、描画対象だけを除外する。通常版のbundle欠落は表示で隠さない。
   設計・保守方針 (CI guard 等) は [docs/portable-build-plan.md](docs/portable-build-plan.md)。
   `portable` feature の cfg 分岐は `.git/hooks/pre-push` の `cargo check --features portable` が番人。
-- **CRT 静的リンク**: `.cargo/config.toml` でメイン exe (x86_64) と Susie ワーカー (i686)
-  の両方に `+crt-static` を有効にしている。これにより `VCRUNTIME140.dll` / `MSVCP140.dll`
-  など Visual C++ 再頒布可能パッケージへの依存を排除している。
-  - メイン exe は `ort` クレートの `load-dynamic` 機能と組み合わせて成立している
-    (静的リンク版 `onnxruntime.lib` は動的 CRT 前提でビルドされており、crt-static と
-    両立しない)。どちらも触らないこと。
-  - **解除すると Vector の「要ソフト」欄指摘が再発する**。
+- **EffeTune 配布境界**: 単体exe版／インストーラ版は承認済み v0.12.0 の VERSION と全424ファイルを
+  `third_party/effetune-mixwright/v0.12.0/manifest.sha256` に固定し、署名前とlauncher build時に欠落・追加・
+  改変を拒否する。署名stageは固定target配下だけ許可し、PEのchecksum／証明書以外は原本と同一、
+  指定発行元の有効署名があることも検証する。未署名の開発buildはraw原本の完全一致が必要。
+  launcherは `runtime/<version>/effetune/<hash12>-<generation>/EffeTune Mixwright.vst3/` に
+  検証済み世代を一度だけ公開する。公開処理は既存・使用中treeの移動、置換、削除をしない。**atomicなのは
+  完全な世代を指す小さなcurrent pointerの更新**であり、treeのin-place修復ではない。
+  正常時は一覧・サイズ・更新時刻・作成時刻stampだけを検査し、全量再hashとwrite lockを避ける。
+  不一致は別世代を全hash検証して公開する。core の起動後の runtime 清掃 worker が、current と
+  使用中の固定世代以外を best-effort 削除する。各coreが世代shared leaseを保持し、
+  清掃はcandidateのexclusive leaseと版の公開lockを削除完了まで保持する。
+  lease／抽出／公開lockは削除tree外の `runtime/.locks/` に固定して削除しない。
+  publisherは外側lock→既存 `.effetune.lock` の順に両方を取得して旧launcherとも直列化する。
+  ロック未対応旧coreもprocess画像で確認し、同版の別coreが動く間は全旧世代を保持する。
+  公開用 OS lock が busy、current が不明、
+  core の固定世代が未確定・未知の配置なら世代清掃を見送り、初期化は待たせない。
+  hash12はcontent SHA256先頭12桁（stampはfull hashを比較）。公開前に最深fileのUTF-16長を確認し、
+  260以上なら明示理由で拒否する。publisher busyはworkerのOS lockを最大60秒待ってpointerを再確認する。
+  repair不能／timeoutでもcoreは起動し、理由と実際に拒否した世代をenvで渡してUnavailableにする。
+  音響調整ボタンで既存load workerから再確認し、拒否世代とは別の公開済み世代だけ採用する。
+  成功時も選択したgenerationをenvで渡し、coreはそのpathを一度解決して固定する。
+  メタデータを保持した内容改変は既存asset shortcutと同様に検出範囲外。
+  通知原文とmanifestは `third_party/effetune-mixwright/v0.12.0/` に追跡し、`.gitattributes -text`で
+  checkout時の改行変換を防ぐ。
+- **CRT 境界**: `.cargo/config.toml` で mIV 自身の x86_64 exe と Susie ワーカー (i686) は
+  `+crt-static` を維持する。一方、Microsoft build の ONNX Runtime は動的 VC runtime を import
+  するため、公式 VC/Redist 由来の x64 4本を全配布 exe の隣へ app-local 配置する。
+  EffeTune pluginも動的VC runtimeをimportする。hostは
+  `data_dir/vst3/hosts/<host+CRT SHA256>/mimageviewer-vst3-host.exe`、同梱CRTは非検索subdir `vcrt/`。
+  hostはCRTを一組で選ぶ。System32の全4本が存在・版数読取可能で各DLLのfile versionが
+  同梱版以上なら全4本System32、それ以外は全4本同梱。選択後に依存順で絶対pathからpreloadし、
+  途中のsource切替はしない。選択元と両版数をlogへ記録する。shared host直下に固定CRTを置かず、抽出は一致bytesを
+  書き換えず、成功だけcacheして失敗の再試行を許す。portableはこの抽出経路を使わない。
+  `scripts/check-vcrt-pe-dependencies.ps1` が全配布 PE の machine / import closure と、CRT・ORT の
+  Microsoft 署名、CRT の同一版・最低版・manifest hash を検査する。未知の `msvcp*` /
+  `vcruntime*` / `concrt*` import は gate failure とし、追加 DLL を場当たり的に配布しない。
+  app-local CRT は Windows Update で更新されないため、toolchain / native dependency 更新時に
+  `vendor/vcrt/provenance.json` と実体を一体で見直す。
 - **設定保存先**: インストーラ版・単体exe版は `%APPDATA%\mimageviewer`、
   ポータブル版は `<exe_dir>\data` (書込不可なら APPDATA へフォールバックせずエラー起動拒否)。
 
@@ -1605,7 +1849,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 
 判断材料 / 進め方:
 
-- 前回リリースの範囲は **README.md の更新履歴** と **GitHub Releases** で確認する。
+- 前回リリースの範囲は **CHANGELOG.md の更新履歴** と **GitHub Releases** で確認する。
   どのバージョンで出した機能か不明なら git log / git tag で追う。
 - コード上は完成して見えても「リリース済み」とは限らない。実装済みでも未出荷の
   サブシステムがあり得る。判断に迷ったら **ユーザーに確認する** (推測で決め打ちしない)。
@@ -1616,13 +1860,19 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 
 ## リリース手順チェックリスト
 
+**担当: ClaudeCode Opus 5.5 / high (担当範囲は2026-09-09決定、モデルは2026-09-23更新)。** Phase 0〜5の公開準備、
+配布ビルド・署名、公開、配布チャネルへの反映を通して担当する。開発側から対象commitと
+検証記録を受け取り、定型公開作業ごとのCodexレビューや親役の追加は不要。
+製品コード等の修正が必要になった場合の境界は
+[開発と公開の担当・引き継ぎ](docs/release-operations.md#開発と公開の担当・引き継ぎ) を参照する。
+
 リリース時は以下を漏れなく更新・作成すること。
 
 **過去リリースで踏んだ落とし穴・判断基準・復旧手順は
 [docs/release-operations.md](docs/release-operations.md) に集約している。**
 本チェックリストが手順の正本で、release-operations.md はその補助 (stale core cache /
 署名セッション切れ / タグ再打ち直し / FFmpeg LGPL ソース同一性 / ポータブル AV 誤検知 /
-配布チャネル別の注意など)。リリースを別セッションや Codex に引き継ぐ前に一読する。
+配布チャネル別の注意など)。開発担当からClaudeCode Opusの公開タスクへ引き継ぐ際に一読する。
 
 ### Phase 0: 変更履歴の準備とユーザーレビュー (必ず最初)
 
@@ -1630,7 +1880,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 表示される (= GitHub Releases の `body` がユーザーに読まれる)。誤字・内部用語の
 混入・粗い表現があると公開後に取り返しが付かないので、以下の順で進める。
 
-- **README.md の更新履歴セクション** にこのバージョンの新エントリを追加 (旧版と
+- **CHANGELOG.md の更新履歴セクション** にこのバージョンの新エントリを追加 (旧版と
   同じ `### vX.Y.Z (YYYY-MM-DD)` ヘッダ + 箇条書きフォーマット)。書き方は CLAUDE.md
   「マニュアル・製品ページの記述方針」に従う:
   - **見出しにリリース日を `(YYYY-MM-DD)` 形式で付ける** (他バージョンと揃える)。
@@ -1641,23 +1891,25 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
   - バージョン番号タグ (v0.8.2+ 等) は本文に書かない (見出しに 1 回だけ)
   - 過去のユーザー報告日付 / コミットハッシュは書かない
   - 「⚠️ 」プレフィックスは初回起動時に何かが起きる注意 (索引再構築等) に限定
-- **ユーザーに README.md の更新履歴を見せて承認を得る**。OK が出るまで Phase 1 へ
+  - 更新履歴は 2026-09 に README.md から `CHANGELOG.md` へ移した。README には書かない
+    (README は概要・特長・ダウンロードを冒頭に置く入口で、更新履歴へはリンクだけ置く)
+- **ユーザーに CHANGELOG.md の更新履歴を見せて承認を得る**。OK が出るまで Phase 1 へ
   進まない。
-- (任意) GitHub Release 用 body は基本 README.md の該当セクションをそのまま
+- (任意) GitHub Release 用 body は基本 CHANGELOG.md の該当セクションをそのまま
   コピペで OK。手作業で別途書き直さない (= 表記ゆれを生まない)。
 - **⚠️ 8KB 上限チェック (大型リリースで必須)**: アプリ内更新通知は
   `update_check.rs` の `BODY_CAP = 8 * 1024` で **先頭 8KB (UTF-8 バイト)** に切られる。
-  README の該当セクションが 8KB を超えると、後半の項目 (= 末尾に置きがちな新機能 /
+  CHANGELOG.md の該当セクションが 8KB を超えると、後半の項目 (= 末尾に置きがちな新機能 /
   バグ修正) が通知に出ない。リリース前に必ずバイト数を測る:
   ```bash
   # 見出しは "### vX.Y.Z (YYYY-MM-DD)" 形式なので、版番号の後ろは空白か行末で区切る
-  awk '/^### vX\.Y\.Z( |$)/{f=1} /^### v<前版>( |$)/{f=0} f' README.md | wc -c
+  awk '/^### vX\.Y\.Z( |$)/{f=1} /^### v<前版>( |$)/{f=0} f' CHANGELOG.md | wc -c
   ```
-  - **8KB 以内**: README セクションをそのまま Release body に使う (上記)。
-  - **8KB 超過**: README はフル版のまま残し、**`docs/release-body-<version>.md` に
+  - **8KB 以内**: CHANGELOG.md のセクションをそのまま Release body に使う (上記)。
+  - **8KB 超過**: CHANGELOG.md はフル版のまま残し、**`docs/release-body-<version>.md` に
     8KB 以内の短縮版を別途作成**する (BOM なし、Markdown。通知ダイアログは Markdown
     レンダリング対応なので見出し・箇条書き可)。短縮版は「目玉の新機能 → 主な改善 →
-    主なバグ修正」の順で前方に重要項目を寄せ、全項目は README を参照する旨のリンクを
+    主なバグ修正」の順で前方に重要項目を寄せ、全項目は CHANGELOG.md を参照する旨のリンクを
     冒頭に入れる。**この短縮版ファイルを Phase 4 の Release body に使う** (下記)。
     作成後 `wc -c docs/release-body-<version>.md` で 8192 以下を確認。
     - 注意: 8KB 上限は **更新を受け取る側 (= 旧バージョンのバイナリ)** に焼かれている
@@ -1678,9 +1930,11 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
    リリース日 (= GitHub Release 公開日と揃える) を記入する。
    **ポータブル版のダウンロードリンク URL もバージョンを含む** (`mImageViewer_portable_v<VER>.zip`)
    ので、バージョン表記と一緒に link href も更新すること (単体exe / setup.exe は非バージョン名で固定)。
-4.5. **マニュアルの更新履歴ページを再生成** — Phase 0 で README の更新履歴セクションが
+   同じファイル冒頭の JSON-LD (`SoftwareApplication`) の **`softwareVersion` と `dateModified`** も
+   揃えて更新する (`dateModified` は「最終更新」と同じ日付)。
+4.5. **マニュアルの更新履歴ページを再生成** — Phase 0 で CHANGELOG.md の更新履歴セクションが
    承認されたら、`python scripts/gen-changelog-html.py` を実行して
-   `htdocs/mimageviewer/manual/changelog.html` を作り直す。changelog.html は README の
+   `htdocs/mimageviewer/manual/changelog.html` を作り直す。changelog.html は CHANGELOG.md の
    `## 更新履歴` から生成される**生成物**なので手で編集しない (編集すると次回再生成で消える)。
    生成後 `git diff` で最新版エントリが反映されていることを確認する。
 5. `htdocs/mimageviewer/manual/index.html` — マニュアルのバージョン表記
@@ -1691,7 +1945,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
    操作・既定の変更が無いリリースでは追記不要。追記したら
    `cargo test --lib version_highlights::` でテーブルがパースできることを確認。
 6. `htdocs/` 以下 — 新機能がマニュアル・製品ページに反映されていることを確認
-   - マニュアル左サイドバーを持つ通常ページ 29 ページでリンク一覧が揃っているか
+   - マニュアル左サイドバーを持つ通常ページ 31 ページでリンク一覧が揃っているか
      `htdocs/mimageviewer/manual/` 配下で一括確認:
      ```bash
      cd htdocs/mimageviewer/manual && for f in *.html; do
@@ -1701,7 +1955,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
          | grep -E 'href="[a-z-]+\.html"' | wc -l
      done
      ```
-     各ページが 29 以外 (= いずれかのページ名リンクが抜けている) なら同期を合わせる。
+     各ページが 31 以外 (= いずれかのページ名リンクが抜けている) なら同期を合わせる。
      ページを増減したらこの数も更新する (数そのものより、**全ページが同じ数で揃っている**ことが要件)。
      `tut-*.html` など `sidebar-section` を持たないチュートリアルページは別レイアウトなので対象外。
      新規の通常ページを追加した際はサイドバーを持つ全ページを更新すること
@@ -1714,6 +1968,16 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
    - 載せる基準: ①通常の操作で遭遇し得る ②不具合だと思う見た目をしている ③回避策があるか
      「環境のせいではない」と言える ④次の版で直らない。backlog の大半は設計上の負債なので載せない。
    - **このステップを飛ばすとページが腐る**。以前ページを置いたときに放置されて消えた経緯がある。
+6.6. **サイトマップを再生成** — htdocs の編集がすべて終わったら
+   `python scripts/gen-sitemap-xml.py` を実行して `htdocs/sitemap.xml` を作り直し、
+   出力に出た added / removed が意図どおりか確認してコミットする。sitemap.xml は
+   **生成物**なので手で編集しない。`<lastmod>` は git の最終コミット日から取るため、
+   **htdocs の編集をコミットした後に実行する** (未コミットのページは当日付になる)。
+   `--check` を付けると書き換えずに、古ければ exit 1 で知らせる。
+   - **このステップを飛ばすと sitemap が静かに腐る**。2026-09 の点検時、8/23 から
+     37 ページが変わったのに `<lastmod>` が 1 つも動いておらず、`manual/external-tools.html`
+     は追加されたまま一度も sitemap に入っていなかった。手順のどこからも参照されて
+     いなかったので、腐る以外の道が無かった。
 
 ### Phase 2: 依存物の確認 + 性能回帰チェック
 
@@ -1739,10 +2003,10 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
      (バックログ §1.196)
 
 6.5. **GitHub Actions の CI が緑であることを確認** (`gh run list --limit 5`)。
-   赤なら原因を直してからリリース作業に入る。特に `cargo check (ubuntu / non-Windows cfg)` は
-   **`cfg(windows)` 漏れの番人**で、Windows 機のローカルビルドでは原理的に出ない失敗を拾う
-   (例: `#[cfg(windows)]` フィールドを cfg なしの経路から参照している)。ローカルの
-   `cargo check` / `test-full.ps1` が全部通っていても、この job だけ落ちていることがある。
+   赤なら原因を直してからリリース作業に入る。現在の job は `cargo fmt --check` と viewer context 監査の 2 本。
+   (ubuntu での非 Windows cfg の `cargo check` job は 2026-09-29 に廃止した。mIV は Windows 専用で、
+   この job のための修正と、どこでも実行されない `cfg(not(windows))` 側のコードが増え続けていたため。
+   非 Windows でコンパイルが通るかは今後は検査しないので、復活させない。)
    失敗ログの読み方: `gh run view <run-id> --log-failed` はビルド全体の warning も含むため、
    ファイルへ落として `error[E` で絞り込む (`-->` の行に実ファイル位置が出る)。
 7. PDFium の更新確認（`bash scripts/setup-pdfium.sh check`）
@@ -1753,6 +2017,10 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
     `vendor/ffmpeg/VERSION`・実 DLL の `ProductVersion`・対応ソースを同じ commit に揃え、
     `src/video/ffmpeg_loader.rs` の DLL 名も一致するか確認。LGPL 通知の更新も忘れずに
     (本ファイル「FFmpeg LGPL DLL 管理」節)
+10.1. LibRaw の更新確認（エージェント用 `bash scripts/setup-libraw.sh check`）。
+    リリース前に [docs/libraw-source-distribution.md](docs/libraw-source-distribution.md) の SHA-256 と
+    同梱版を照合し、LibRaw の対応ソースを mikage.to に配置する。installer / portable に
+    `LIBRAW-LICENSE.txt` / `ZLIB-LICENSE.txt` / `LIBJPEG-TURBO-LICENSE.txt` が入ることも確認する。
 11. VST3 host bridge の確認 (v0.9.0+):
     - `vendor/vst3sdk/` が配置済み (`bash scripts/setup-vst3-sdk.sh`)
     - `vendor/vst3-host/mimageviewer-vst3-host.exe` が最新の C++ ソースでビルド済み
@@ -1771,8 +2039,12 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
    ```
    - 初回 (vendor/bench_baseline.json の queries が空) は `--save` で baseline を登録:
      `python scripts/check_bench_regression.py --save vendor/bench_baseline.json /tmp/bench_new.json`
-   - 既存 baseline と比較して **+30% 超の劣化**で exit 1。原因を切り分けてから先に進む。
+   - 既存 baseline と比較して **+30% 超 かつ +1.0ms 超の劣化**で exit 1。原因を切り分けてから先に進む。
      Tantivy 等の依存更新で正当な変動なら `--save` で baseline を更新する。
+     比率だけ超えたミリ秒未満のクエリは `NOISE` と表示されるだけで失敗にならない (計測ばらつきのほうが大きいため)。
+   - 1 回きりの計測は外れ値を引く。失敗したら同じバイナリで 2〜3 回測り、JSON を並べて渡すと query ごとの最良値で判定する:
+     `python scripts/check_bench_regression.py vendor/bench_baseline.json run1.json run2.json run3.json`。
+     **ノイズと判断した場合に `--save` で baseline を上書きしない** (`--save` は 1 ファイルだけ受け付ける)。
 
 9.6. **perf smoke** (UI 周り / I/O 経路に変更を入れたリリースで実施):
    ```powershell
@@ -1842,19 +2114,21 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 
 ### Phase 3: ビルド・配布成果物
 
-10. **配布ビルドは `.\scripts\build-dist.ps1` を使う** (1 コマンドで全体テスト → clean → core → remote → launcher → ISCC → portable)。
+10. **配布ビルドは `.\scripts\build-dist.ps1` を使う** (1 コマンドで全体テスト → clean → core → remote → EPUB worker → launcher → ISCC → portable)。
     - build-dist.ps1 は Rust 全体テストを通してから
-      `cargo clean --release -p mimageviewer -p mimageviewer-remote -p mimageviewer-launcher`
-      (+ `target-portable` の `-p mimageviewer -p mimageviewer-remote`) してから実コンパイルするので、
+      `cargo clean --release -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-launcher`
+      (+ `target-portable` の `-p mimageviewer -p mimageviewer-remote -p epub-pdf-worker`) してから実コンパイルするので、
       cargo の偽 up-to-date 由来の **stale 配布物を構造的に防ぐ**
       ([docs/release-operations.md](docs/release-operations.md) §2.1 参照)。内部で build-release.ps1 (常駐 mIV を自動停止して
       LNK1104 を回避) と build-portable.ps1 を子 PowerShell で呼び、各 `$LASTEXITCODE` を検査する。
     - VST3 bridge の C++ を変えていなければ `.\scripts\build-dist.ps1 -SkipVst3Bridge` (cmake 再ビルドを省く)。
     - **コード署名は build-dist.ps1 が既定で ON** (Certum Open Source Code Signing 証明書、SimplySign Desktop
       のクラウド鍵)。配布する全 PE に Authenticode 署名 + RFC3161 タイムスタンプを付ける: 単体exe (launcher) /
-      core / remote / susie32 / vst3-host / pdfium / FFmpeg 6 DLL / `mImageViewer_setup.exe` / portable の各 loose PE。
+      core / remote / EPUB worker / susie32 / vst3-host / pdfium / FFmpeg 6 DLL / EffeTune plugin (`.vst3` PE) / `mImageViewer_setup.exe` / portable の各 loose PE。
       **`include_bytes!` で埋め込む物は「埋め込み前」に署名する**
-      (内側 vendor PE → core + remote → launcher → setup.exe の順)。
+      (内側 vendor PE → core + remote + EPUB worker → launcher → setup.exe の順)。
+      EffeTune は vendor 原本ではなく target staging の全 PE を署名し、`MIMV_EFFETUNE_DIR` で
+      launcher 埋め込み元を切り替える。`.vst3` の拡張子でも PE なら署名対象とする。
       でないと APPDATA へ展開されたコピーが未署名になり、AV 誤検知
       ([docs/release-operations.md](docs/release-operations.md) §7) が
       再発する。`onnxruntime*.dll` は Microsoft 署名済みなので**再署名しない**、`*.onnx` は PE でないので対象外。
@@ -1863,7 +2137,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
       (証明書選択は既定 subject `/n "Open Source Developer Taku Sano"`。証明書更新で拇印を固定したいときは
       `$env:MIV_SIGN_SHA1`、TS 変更は `$env:MIV_SIGN_TS`)。ポータブルの vst3-host は署名対応後も当面**非同梱据え置き**。
     - **通常の開発反復は `.\scripts\build-dev.ps1`**。通常feature set（portableなし）を
-      `dev-runtime` profileで `target\dev-runtime` へ core + remote をビルドし、launcherなしで必要な
+      `dev-runtime` profileで `target\dev-runtime` へ core + remote + EPUB worker をビルドし、launcherなしで必要な
       FFmpeg DLLだけを変更時に配置する。引数なしの起動は通常版と同じ
       `%APPDATA%\mimageviewer` を使う。launcher／release最適化／埋め込みasset／変更したVST3
       bridgeまで含む実機確認は `.\scripts\build-release.ps1` (incremental・cleanなし、署名は
@@ -1888,11 +2162,13 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
       いずれかを 1 回ずつ確認。`<exe_dir>\data` が作られ APPDATA が触られないこと、
       インストール版をトレイ常駐させたまま起動しても両方独立に動く (mutex 分離) ことを確認。
       検証チェックリスト全項目は [docs/portable-build-plan.md](docs/portable-build-plan.md) §8。
-12. 依存 DLL の回帰チェック — リリース exe に対して `dumpbin /dependents` を走らせ、
-    `VCRUNTIME140.dll` / `MSVCP140.dll` が現れていないことを確認する。もし現れていたら:
-    - メイン exe: `ort` クレート機能から `load-dynamic` が抜けていないか確認
-    - Susie ワーカー: `.cargo/config.toml` の `i686-pc-windows-msvc` 向け
-      `+crt-static` 設定が残っているか確認
+12. **全 PE / app-local VC runtime gate** — `build-dist.ps1` が installer / portable 完成後に
+    `scripts/check-vcrt-pe-dependencies.ps1` を必須実行する。launcher / core / remote / EPUB worker / installer、
+    portable 配下、埋め込み元 PDFium / DirectML ORT / FFmpeg / Susie / VST host / EffeTune plugin PE を filesystem から
+    列挙し、artifact 別 machine、direct import closure、全 input SHA-256 を report に残す。
+    4 CRT は Microsoft 署名、manifest exact hash、全4本同一版かつ最低 14.44 を必須とし、
+    `onnxruntime*.dll` も Microsoft 署名を必須にする。未知の VC runtime import、companion CRT 欠落、
+    package copy の hash 不一致は配布停止。TRT pack は setup / build / upload の各入口で同じ gate を通す。
 12.5. **コード署名の回帰チェック** — 配布成果物 (単体exe / setup.exe / portable の mimageviewer.exe) に
     `signtool verify /pa /v <exe>` を走らせ、`Open Source Developer Taku Sano` 名義の証明書チェーン
     (Certum Code Signing → Certum Trusted Network CA) と **RFC3161 タイムスタンプ**が付いていることを
@@ -1904,10 +2180,10 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 
 13. ローカルで `git tag v<VERSION>` → `git push origin v<VERSION>` (GitHub `main` も同期)
 14. GitHub Releases UI で新リリースを作成。**body の出所は Phase 0 で確定した版に従う**:
-    - **通常 (README セクションが 8KB 以内)**: README.md の該当 `### vX.Y.Z` セクション
+    - **通常 (CHANGELOG.md のセクションが 8KB 以内)**: CHANGELOG.md の該当 `### vX.Y.Z` セクション
       本文をそのままコピペ。
-    - **短縮版を作った場合 (README セクションが 8KB 超)**: Phase 0 で作成した
-      `docs/release-body-<version>.md` の本文をコピペする (README フル版ではなく
+    - **短縮版を作った場合 (CHANGELOG.md のセクションが 8KB 超)**: Phase 0 で作成した
+      `docs/release-body-<version>.md` の本文をコピペする (CHANGELOG.md のフル版ではなく
       **こちらを使う**)。短縮版が存在するかは `ls docs/release-body-<version>.md` で確認。
       別セッションで Phase 4 を実施する場合もこのファイルの有無で判断できる。
     - どちらの場合も、この body がアプリ内アップデート通知にそのまま表示される。
@@ -1920,7 +2196,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
     - 実例: v1.0.0 は短縮版 [docs/archive/release/release-body-v1.0.0.md](docs/archive/release/release-body-v1.0.0.md) を使用。
 15. **表示崩れの確認は自動テストが持つ。目視は任意。**
     `changelog_markdown::tests::the_newest_changelog_entry_only_uses_markup_this_renderer_handles`
-    が README の最新節を読み、更新通知ダイアログの描画器が解釈できない記法
+    が CHANGELOG.md の最新節を読み、更新通知ダイアログの描画器が解釈できない記法
     (リンク・画像・閉じ忘れた `**` など) が混ざっていないかを機械的に見る。
     `cargo test` で毎回走るので、**公開前**に落ちる。
     - 以前はここを「公開後に別マシンで目視」としていたが、目視は体裁しか見られず、
@@ -1958,6 +2234,11 @@ GitHub Release 公開後、各配布チャネルへ反映・申請する。**Vec
         (Store が再DLして再検証する)。
       - リダイレクト無しを確認: `curl -sI <URL>` が `200 OK` (301/302 が出ないこと)、
         `Content-Length` が署名済み setup.exe と一致すること。
+    - **①.5 申請前にクリーンな Windows で起動を確かめる**: 署名済み setup.exe を Windows Sandbox (VC++ ランタイム無し) に
+      同じサイレント引数で入れ、初回・2 回目の起動で窓が出て応答し続けることを見る (v3.6.0 / v4.1.0 は「起動中のまま」で却下された。
+      サブ PC の手順は `C:\miv-sandbox\`、経緯はバックログ §1.241)。Sandbox では WebView2 が動かないので、音響調整と EPUB 変換の失敗は対象外
+      ([EffeTune 計画 §10](docs/effetune-integration-plan.md#10-決定済みの配布方針と残る対象外事項))。
+    - **認定の注意事項**: EXE/MSI アプリは「プロパティ」ページの「認定の注意事項」(2,000 字) に書く (MSIX の「提出オプション」ではない)。
     - **② Partner Center で更新**: [partner.microsoft.com](https://partner.microsoft.com/) →
       mImageViewer → 「アプリを更新」→ **パッケージ**のパッケージ URL を新 URL に差し替え →
       **各ページで必ず「下書きの保存」** (保存せず「次へ」だと入力が消える) → 「すべて保存」→
@@ -1972,7 +2253,41 @@ GitHub Release 公開後、各配布チャネルへ反映・申請する。**Vec
       コード署名は build-dist.ps1 が実施済み (本書 Phase 3 / 「code signing」)。詳細な経緯・ハマりどころは
       [docs/release-operations.md](docs/release-operations.md) §8 参照。
 
+
+### Phase 6: 公開後の後始末 (毎リリース、2026-10-07 利用者指示)
+
+GitHub Release の公開と Phase 5 の案内が済んだら、同じ作業の中で次を片付ける。放置するとビルドキャッシュは
+数百 GB に膨らみ (2026-10-07 時点で本体 `target` 523 GB、worktree 12 個で計約 785 GB)、バックログは出荷済み項目で読みにくくなる。
+
+20. **ビルドキャッシュの整理** (作り直せるので確認不要):
+    - 本体 worktree の `target/*/incremental` (`debug` / `dev-runtime` / `release` / `dev-runtime-staging/*`) を削除する。
+      配布物 (`target/release/mimageviewer*.exe`、`installer/Output/`、`dist/`) は Phase 4 の添付と Store 申請が済むまで消さない。
+    - 撤去しない worktree も、しばらく使わないなら `target/` を削除してよい (次回ビルドが遅くなるだけ)。
+    - 削除前後のサイズを報告する。
+21. **完了した worktree の撤去** (元に戻せないので、候補一覧を利用者に見せて了承を得てから):
+    - `git worktree list` の各 worktree について、HEAD が master に取り込み済みか (`git merge-base --is-ancestor`)、
+      未コミット変更が無いかを確認して候補を出す。保留中の作業 (backlog-on-hold の検証ラボ等) と未統合ブランチは残す。
+    - 撤去は必ず `scripts/safe-worktree-remove.ps1` 経由 (「worktree + Windows junction の地雷」節)。
+    - **`Filename too long` で git が途中まで消して止まることがある** (2026-10-07、EffeTune bundle などの深いパス)。
+      その場合 worktree の登録は外れ、フォルダの中身が一部残る。reparse point が無いことを
+      `Get-ChildItem -Recurse -Attributes ReparsePoint` で確かめてから、`cmd /c rmdir /s /q "\\?\<フォルダ>"` で残りを消し、
+      `git worktree prune` と `git branch -d` を行う。先に `target*` を同じ方法で消しておくと失敗しにくい。
+      取り込み済みのブランチは `git branch -d` で消す。`.claude/worktrees/` 配下は Claude アプリが作ったものなので、
+      アプリ側の片付け (`clean_up_worktrees`) を優先する。
+22. **バックログの整理**: 今回出荷した項目を `docs/next-release-backlog.md` から削除し (経緯は git 履歴と
+    CHANGELOG に残る)、出荷しなかった残件・見送りは見出しの状態を更新する。報告者に返信済みかどうかの記録は残す。
+    削除した項目の一覧をコミットメッセージに書く。
+23. **メモの更新**: `project_next_version_plan.md` 等の進行メモを「公開済み」に更新し、次の版の予定を書く。
+
 ## Codex CLI レビュー
+
+担当・実施粒度は [AGENTS.md](AGENTS.md#model-roles-and-coordination) に従う。
+独立レビュー担当を使える場合はその担当を再利用し、同じ差分のCLIレビューを重ねない。
+ClaudeCode主導の開発またはCLIレビューが必要な場合は以下を使い、新規reviewは「モデル指定について」の
+GPT-6.1 Sol / xhighを明示する。重要指摘の修正・再確認は維持し、小さな中間変更ごとの承認は求めない。
+以下の自発的レビュー規則は開発変更が対象。ClaudeCode Opusによる定型の公開準備・公開作業
+(版番号・更新履歴・公開メタデータの更新を含む) には適用しない。
+利用者が明示的にレビューを依頼した場合、または製品コード等の開発変更が生じた場合は実施する。
 
 ユーザーから「Codex にレビューしてもらって」「Codex レビューを取って」等と指示された場合は、
 **ユーザーに手作業で中継してもらわず、`codex` CLI を直接叩いて結果を取り込む**。
@@ -1982,6 +2297,12 @@ GitHub Release 公開後、各配布チャネルへ反映・申請する。**Vec
 ユーザーから個別の指示がなくても、以下のタイミングでは **自分から `codex exec` を起動して
 意見を取り込む**こと。Claude 単体で先に進むより、別モデルの目を入れた方が早く正解に
 辿り着くため。
+
+重要な所有境界・非同期・複数ウィンドウの設計は、以下の完成時レビューに加えて
+**実装前に**独立したGPT-6.1 Sol / xhighへ確認を依頼する。前提のコード上の根拠、不変条件、
+影響する同型経路、受入条件を渡し、設計の誤り・見落としも指摘対象にする。
+以下の第二意見はまずSolへ依頼し、それでも解けない論点や難しい構造設計は
+AGENTS.mdの条件に従いAstra / mediumへ絞って依頼する。
 
 1. **作業の一塊が終わった時点でレビューを取る**
    - まとまった機能追加・バグ修正・リファクタが「ローカルで動くようになった」段階で
@@ -2098,6 +2419,22 @@ codex exec resume "$SID" -o /tmp/codex-2.txt - < /tmp/codex-prompt.txt > /tmp/co
   参照したファイルの中身は記録されていないので、`HEAD~1` 等で渡した基準コミットが
   rebase で動くと差分の意味が変わる。
 
+#### 実装の委任でも同じ段階は同じセッションで続ける
+
+上の規則はレビューだけでなく、**実装担当 (Codex Sol) への委任にも適用する**。
+
+- **同じ機能の同じ段階** (例: X 投稿予約の R2a-2) の実装・修正・残作業は、最初の実装セッションを
+  `codex exec resume <SID>` で続ける。実装担当が作った規約・コードの理解が残るので、読み直しが要らない。
+- 新しいセッションを開くのは、**段階が変わるとき** (例: R2a → R2b)、**担当・モデルが替わるとき**、
+  利用者が明示したときだけ。レビュー担当は実装担当とは別のセッションにする (独立性のため)。
+- **長さを理由に新しいセッションへ切り替えない**。入力の大半はキャッシュ読み込みで、Codex は自動で
+  コンパクトする。`turn.completed` の `input_tokens` だけを見て判断せず、`cached_input_tokens` と並べて見る。
+- 実装 brief に「緑の区切りで止めて報告してよい」と書かない。止めてよいのは、設計判断が必要なとき・
+  前提の矛盾を見つけたときだけにする。区切りの許可があると、作業が細切れになり往復が増える。
+- 経緯 (2026-09-24): X 投稿予約 R2a-2 で、1 回の resume の入力 9,300 万トークンを見て新しいセッションへ
+  切り替えたが、うち 98.7% はキャッシュだった。新しいセッションは 1,200 万トークンを使って小さな 1 件を
+  片付けただけだった。作業の細切れは、セッションの長さではなく brief の「区切りで止めてよい」が原因だった。
+
 ### 差分範囲の決め方
 
 基準となるコミットは「**前回 Codex にレビューしてもらった地点より後**」にする。具体的には:
@@ -2186,21 +2523,24 @@ awk '/^codex$/{found=1; next} found' /tmp/codex-out.txt
 
 ### モデル指定について
 
-利用モデルは `~/.codex/config.toml` の `model` フィールドに書いてあり、`codex exec` は
-そこで指定されたモデルで動く (対話モードで表示される `model: <name>` と同じ)。
-以下のケースで失敗することがある:
+新規の独立レビューは個人configの既定値に依存させず、次を明示する。
+この節の簡略化したCLI例にも、実行時には同じmodel/effortを付ける。
 
-- **CLI が古い**: 新モデル (例: `gpt-5.5`) は CLI 更新が必要。対話起動時に
-  `Update available! X.Y.Z -> A.B.C` が出ていたら `npm install -g @openai/codex` で更新。
-  対話モードでは動くのに `codex exec` で「model doesn't exist」が出る場合、
-  まさにこの状態。
-- **アカウントの制限**: ChatGPT アカウントでは `gpt-5` / `o3` 等の生モデル ID は
-  使えず、Codex 向けに用意された ID (`gpt-5.5` / `gpt-5.4` 等) のみ。
-- **config のタイポ**: 利用可能なモデル一覧は `~/.codex/models_cache.json` の
-  `models[].slug` で確認できる。
+```bash
+codex exec --model gpt-6.1-sol -c 'model_reasoning_effort="xhigh"' --sandbox read-only -o <FILE> "<review prompt>"
+```
 
-`-c model="<name>"` で 1 回限りの override も可能。デフォルト設定を書き換える前に
-ユーザーに相談すること (config はユーザーの個人設定で、勝手に変えない)。
+実装・テスト担当は `gpt-6.1-sol` / `high` を明示し、上のread-onlyレビューとは別の担当・会話にする
+(`codex exec --model gpt-6.1-sol -c 'model_reasoning_effort="high"' --sandbox workspace-write ...`)。
+`gpt-6.1-sol` には Codex CLI 0.159.0 以上が要る。
+Astraの追加確認が必要な場合だけ、上のmodelを `gpt-6-astra`、effortを `medium` に変え、
+read-onlyのまま未解決の論点を渡す。個人configの既定値には依存させない。
+
+同じレビューの継続は既存のresume手順を使い、旧Astra担当・GPT-5.6 Sol担当・GPT-6 Sol担当等からの移行時はmodel/effortが
+実際に切り替わったことを確認する。切り替えられなければ、既知指摘・判断根拠・対象差分と
+検証記録を指定モデルの新しい担当へ渡す。解決済み事項の全件再レビューは不要。
+利用可否やoverrideの失敗はCLIの実出力で確認し、未確認の設定を適用済みと報告しない。
+個人の `~/.codex/config.toml` は、このリポジトリの既定分担を理由に書き換えない。
 
 ## 実機検証用バイナリの準備 (Windows ネイティブ機能)
 
@@ -2240,15 +2580,15 @@ HWND owner・focus・z-order / IME の実挙動 / マルチモニター DPI な�
   `%APPDATA%\mimageviewer` を使う。`dev-runtime` はアプリのデータprofile名ではない。
 - **release構成依存の実行**: launcher、release-only cfg／最適化、exact release performance、
   埋め込みasset展開、変更したVST3 bridge、署名、packagingに依存する場合は
-  `.\scripts\build-release.ps1`。内部で core → remote → launcher の3段cargo buildを回し、常駐mIVを
+  `.\scripts\build-release.ps1`。内部で core → remote → EPUB worker → launcher の4段cargo buildを回し、常駐mIVを
   自動停止してLNK1104を回避する。出力は `target\release\mimageviewer.exe` (launcher) と
-  `target\release\mimageviewer-core.exe` (本体)、`target\release\mimageviewer-remote.exe`。
+  `target\release\mimageviewer-core.exe` (本体)、`target\release\mimageviewer-remote.exe`、`target\release\mimageviewer-epub-pdf.exe`。
 - **配布ではないので `build-dist.ps1` は使わない**。配布物を作るときだけclean-firstの
   `build-dist.ps1`。
 - **⚠️ エージェントのツールから呼ぶときは `*>&1` を付けない**。PowerShell の `-ErrorAction Stop`
   下で cargo の stderr が terminating error 化して即失敗する
   ([docs/release-operations.md](docs/release-operations.md) §2.2)。PowerShell ツールは stderr を自前で拾うので、素の
-  `.\scripts\build-release.ps1` で呼ぶ。失敗する場合は core → remote → launcher の 3 段 cargo build を
+  `.\scripts\build-release.ps1` で呼ぶ。失敗する場合は core → remote → EPUB worker → launcher の 4 段 cargo build を
   直接叩く。
 - **依頼のしかた**: core検証なら
   `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`、release構成検証なら
@@ -2443,7 +2783,7 @@ reparse point 共有しない**。個別サブディレクトリ単位でも禁�
 
 - Comfortable reading C++ but not familiar with Rust's borrow checker details
 - Has RTX 4090, Windows 11
-- AI-assisted development workflow: Claude generates code, user reviews and tests
+- AI-assisted development workflow: role defaults and independent AI review are defined in `AGENTS.md`; user performs approved/manual verification as required
 
 ## Claude Code tool call reliability rules（ツール呼び出しの生テキスト漏れ対策）
 

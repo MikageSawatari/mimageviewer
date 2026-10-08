@@ -102,8 +102,8 @@ allowlist チェックする (= command / event / polling のすべての raise 
 **foreground HWND** を以下で判定:
 
 - **許可**: `presenter HWND` / `HUD HWND` / `main HWND` の既知 mIV HWND 3 つ、または
-  `editor_hwnds: Arc<RwLock<HashSet<u64>>>` snapshot (= 現在 visible な editor container
-  HWND) に含まれる HWND (`GA_ROOT` で正規化、`IsWindow` + `IsWindowVisible` で stale 排除)
+  `EditorUiSnapshot.hwnds` (= 現在 visible な editor container HWND) に含まれる HWND
+  (`GA_ROOT` で正規化、`IsWindow` + `IsWindowVisible` で stale 排除)
 - **skip**:
   - file dialog 等 plugin 外の top-level: foreground 自身も `GA_ROOT` も editor allowlist に
     無いので不一致で skip。
@@ -118,9 +118,10 @@ allowlist チェックする (= command / event / polling のすべての raise 
 **`GA_ROOTOWNER` は使わない** — editor を owner にする modal popup を辿ると editor 本体に
 戻るため誤許可リスクがある。`GA_ROOT` までで止める。
 
-既存の `foreground_belongs_to_miv_or_bridge` (PID ベース、`set_all_guis_app_active` で
-「bridge が foreground」判定として使用中) は変更せず、HUD raise 用に別 helper
-`foreground_allows_hud_raise` を新規追加してセマンティクスを分離 (Codex P1 反映)。
+`foreground_belongs_to_miv_or_bridge` は editor の HWND→PID 登録と bridge PID 集合を
+同じ snapshot から読み、共通の `foreground_ui_group` 分類を使う。登録 editor と bridge の
+別 popup は区別する。HUD raise の `foreground_allows_hud_raise` は editor HWND allowlist を
+使い、foreground 分類と raise 許可の判定目的を分ける。
 
 **`current_gui_owner_hwnd` の fullscreen 強制**:
 
@@ -131,18 +132,21 @@ HUD HWND を `WindowFromPoint` が拾って VST が HUD owned になり、目的
 HUD HWND は `set_hud_hwnd` で別系統に登録し、**`current_gui_owner_hwnd` の候補からは
 絶対に出ない**。
 
-**`editor_hwnds` snapshot の更新タイミング**:
+**editor UI snapshot の更新タイミングと公開順序**:
 
-allowlist 判定で参照される `editor_hwnds: Arc<RwLock<HashSet<u64>>>` は、editor 表示状態が
-変わる全経路で `refresh_editor_hwnds_snapshot()` 経由で再構築する (= slot add / show / hide /
-user_hidden / remove / bridge disconnect / 一括 visibility 変更)。「現在 `gui_visible == true`
-かつ `IsWindow` で生存している HWND だけ」を含める (= `gui_hwnd` は hidden 後も残るので
-slot に HWND があるだけでは入れない)。`disable_with_reason` でも明示的に `editor_hwnds.clear()`
-する (= HWND 再利用時の誤許可リスク排除、Codex P2 反映)。
+`EditorUiSnapshot` は可視 editor HWND の集合、HWND→bridge PID 対応、稼働中 bridge PID の
+集合を一つの不変値に持つ。共有先は `Arc<RwLock<Arc<EditorUiSnapshot>>>`。slot add / show /
+hide / user_hidden / remove / bridge disconnect / 一括 visibility 変更で
+`refresh_editor_hwnds_snapshot()` が再構築する。editor 集合には `gui_visible == true` かつ
+`IsWindow` で生存する HWND だけを含める (`gui_hwnd` は hidden 後も残る)。
 
-Lock 取得順序として `DspBridgeInner` の lock を握ったまま Windows API (`IsWindow`) や
-`hud_raise_hook` を呼ばない (inner lock → ローカル `Vec` にコピー → inner 解放 → API 呼び出し →
-`editor_hwnds.write()` の順序、deadlock 防止)。
+refresh は `DspBridgeInner` の lock 下で revision と候補を取得し、lock 外で `IsWindow` を
+検査して次の不変値を作る。再度 inner lock 下で revision・editor 候補・bridge PID 候補を
+検証し、一回の短い write lock で Arc を差し替える。古い refresh は公開しない。
+`disable_with_reason` は同じ inner lock 下で revision を進め、空 snapshot を公開する。
+reader は短い read lock で Arc を clone し、lock を離してから Windows API や別 lock を使う。
+公開中の reader は swap の完了を待って完全な snapshot で分類し、`try_read` の失敗分岐はない。
+inner lock を保持して `IsWindow` や `hud_raise_hook` は呼ばない。
 
 **フォールバック**: 環境変数 `MIV_HUD_OVERLAY=0` で HUD 経路を無効化できる。HUD HWND 作らず、
 従来通り egui overlay を presenter HWND の DComp tree に attach する経路 (= CP8 以前と等価)。
@@ -179,14 +183,14 @@ for plugin relayout/paint work on every mouse step.
 
 ```
 mimageviewer-core.exe (Rust)
-├─ DspBridge (ローカル再生 singleton, src/video/dsp/mod.rs)
+├─ DspBridge (ユーザー VST 共有 singleton, src/video/dsp/mod.rs)
 │   ├─ Vec<PluginSlot>          ← チェーン (順番が音声適用順)
 │   │   ├─ Slot[0]: bridge: Arc<Bridge> ──┐
 │   │   ├─ Slot[1]: bridge: Arc<Bridge> ──┤  全 slot が同じ Arc を共有
 │   │   └─ ...                            ┘  (= 1 bridge プロセスが全プラグインを host)
 │   └─ active_slot_count (atomic): bypass=false の Loaded 個数
-├─ Remote streaming session (配信中だけ)
-│   └─ DspBridge × 1: active plugin の同順 chain。全 generation が Arc 共有
+├─ DspProcessingCoordinator (src/video/dsp/coordinator.rs)
+│   └─ ローカル pump / リモート (session, generation) の host 操作をブロック単位で調停
 ├─ src/video/audio.rs: audio-pump thread が local DspBridge::process_block を呼ぶ。
 │   bridges を Arc::ptr_eq で dedup するため、N 個のプラグインがあっても
 │   IPC roundtrip は **1 回だけ** (= bridge 内部で chain 順に処理して 1 回で返す)
@@ -217,20 +221,72 @@ vendor/vst3-host/mimageviewer-vst3-host.exe (C++ bridge)
 └─ Named events: sig_in / sig_out で同期
 
 include_bytes! でメイン exe に埋め込み、初回 enable 時に
-%APPDATA%\mimageviewer\vst3\mimageviewer-vst3-host.exe へ展開
+%APPDATA%\mimageviewer\vst3\hosts\<host+CRT SHA256>\mimageviewer-vst3-host.exe へ展開
 (PDFium / Susie ワーカー / FFmpeg DLL と同パターン)
 ```
+
+通常版のhost／CRTは内容hash別ディレクトリへ抽出する。CRT4本は非検索subdir `vcrt/` に置き、
+System32の全4本が存在・版数読取可能で各DLLのfile versionが同梱版以上なら全4本System32、
+他は全4本同梱を選び、依存順に絶対pathでpreloadする。選択元と両版数をlogへ記録する。既存host／CRTを
+上書きせず、抽出成功だけcacheする。portableのhost非同梱は維持する。
+Windows SDK hosting moduleは `crates/vst3-host/src/sdk/` のMIT原文付きcopyを使い、IPCのUTF-8
+pathを明示的にUTF-16へ変換してwide APIでload／探索する。ACP manifestは変更しない。
+directory checkはNotFound以外のerrorを報告して停止し、Win32へnative backslash pathを渡す。
+2026-10-03 v4.3.0 release checkではEffeTuneのmissing-assets画面を調査し、pluginから観測できる
+load pathを `loader_path_from_utf8` に統一した。通常Win32絶対形式 (`C:\...` / `\\server\share\...`) の
+長さがMAX_PATH (260、NULを除くUTF-16単位) 未満で同一pathを保持できる場合だけ通常形式にする。
+Codex P2/P3 対応では、通常候補を `GetFullPathNameW` に通して再拡張し、検査済み拡張pathとの
+完全一致を要求する (UNC namespace markerだけ大小文字を区別しない)。正規化差分／失敗、260以上、
+通常形式を持たないdevice namespaceは `\\?\` / `\\?\UNC\` 等の元の拡張形式を維持する。
+さらに各componentの末尾dot／spaceとDOS device名 (`CON` / `NUL` / `PRN` / `AUX`、
+`COM1`〜`COM9` / `LPT1`〜`LPT9`、superscript 1/2/3、`CONIN$` / `CONOUT$`、
+大小文字・拡張子付きも含む) は拡張形式を維持する。`GetFullPathNameW` 単独ではdevice名や
+一部の途中component末尾spaceが変わらず、file APIが別の対象へ解釈するための保守的な除外である。
+これによりplugin binary／CRTの検査とloadで対象が変わることを防ぐ。
+入力のforward slashはbackslashへ正規化し、日本語・emojiとstrict UTF-8変換を維持する。
+host内の探索・bundle検査・resource検査は従来どおり拡張形式を使う。EffeTuneはlauncherが
+最深file pathの260以上を公開前に拒否するため、通常のAPPDATA配下ではplugin binaryは通常形式でloadする。
+上記の同一性例外を含む祖先pathでは短くても拡張形式を維持し、asset解決の制限が残り得る。
+
+非製品の専用DLLによる回帰テストで、`LoadLibraryW` の拡張pathを `GetModuleFileNameW` がそのまま返すこと、
+存在するassetに `/css/effetune.css` を付加すると通常pathの `GetFileAttributesW` は成功し、拡張pathは
+ERROR_INVALID_NAME (123) になることを確認した。EffeTune PEは両APIをimportし、fallback HTMLと
+forward slash付きasset名を含む。ただしplugin内部のasset root組立てと実機UI復旧は推定／未確認であり、
+signed v4.3.0の完全bundleから音響調整を開くrelease確認を必要とする。製品／pluginはこの調査では起動しない。
+
+path境界の監査範囲:
+
+- package／legacy DLL load (`src/sdk/module_win32.cpp`) は最終binary pathへ上記規則を適用。
+- CRT preload (`src/vcrt_preload.cpp`) もpluginがmodule filenameを観測可能なので同じ規則を適用。
+  選択元・依存順・System32限定の依存検索は維持する。
+- probe／通常load／chain追加はすべて `Module::create` を通る。
+- `IHostApplication` はhost名と空のmessage／attribute listを返すのみ。component／controllerのinitialize、
+  factory host context、editor attachにはpathを渡さない。state／presetは `MemoryStream` のopaque bytesでpath属性なし。
+- module discovery／`Module::getPath`、moduleinfo、bundle validation、snapshot／PNGはhost側の情報でpluginへ渡さない。
+  IPC shared-memory名もfilesystem pathではない。その他のplugin向けbundle／resource path APIは実装していない。
+
+`ctest --test-dir crates/vst3-host/build -C Release --verbose` は `vst3-path-boundaries` を実行し、
+日本語＋emoji、短いlocal／UNC、slash正規化、259／260境界、長いlocal／UNC、strict変換、
+末尾dot／space、DOS device名のcomponent／file名、通常pathのround-trip、UNC／unc／UnC、
+専用DLLの短い通常／拡張loadと長い拡張loadを検査する。`gui_visibility.cpp` はbuild時のstatic_assert検査。
+host PE内のsourcehash markerを現在のCMakeLists／include／src／testsと照合する。releaseは古いAPPDATA等の
+hostをimportせず、現vendor hostが一致しなければCMakeで再buildする。bare cargo releaseにも同じgateがある。
+state／presetデータはopaque bytesでありhostによるnarrow pathファイル操作はない。
+IPC JSONのpath decoderはescape／Unicode surrogateを扱う。日本語APPDATA、ユーザーVST path、
+state保存・復元の実機確認は承認済み手動検証で行う。
 
 音声処理 entry は `DspBridge::process_block` だけである。per-plugin bridge 時代の
 `chain_process` と ping-pong scratch buffer は削除済み。
 
-時計なしリモート配信はローカル再生の plugin state と高速 feed の timeline を混在させないため、
-streaming session 専用 `DspBridge` を 1 個持つ。設定の active plugin を worker 内で一度だけ load し、
-seek / 画質変更による新旧 generation は同じ processor `Arc` を使う。generation resource lease が
-旧 worker の FFmpeg/VST drop 後に新 worker を進めるため、切替中も host process は
-**ローカル 1 + リモート 1 = 最大 2** から増えない。ロードは start 残予算から後段用 3 秒を
-予約した値（上限 10 秒）で打ち切り、load/process 失敗は normalize 済み dry へ fallback して
-配信を継続し、IPC/Web と本体 modal に warning を公開する。
+時計なしリモート配信は、起動時に読み込んだユーザー VST と音響調整の bridge をローカル再生と共有する。
+旧方式のセッション専用 bridge は、Mixwright の状態復元後に WebView がパイプラインを組み直す間、
+配信の冒頭数秒が EQ なしになるため廃止した。`DspProcessingCoordinator` は
+`Local { pump_instance, epoch }` と `Remote { session, generation }` の札を管理する。
+新しい所有者は実行中の音声ブロックが終わるのを worker 上で待ち、結果を返す reset を経てから札を得る。
+許可は raw 音声の取り出しから 2 段の処理、出力の確定まで保持する。札を失ったローカル pump は
+host を呼ばず素通しで処理し、再取得時は一時停止のまま再 seek して古いキューを消す。
+リモートの段は受け付け時に独立して採用し、未準備や失敗の段は warning とともに外す。
+host 数はユーザー VST と音響調整で通常最大 2、配信中も増えない。
 
 ## 3. ディレクトリ / モジュールマップ
 
@@ -273,7 +329,7 @@ decoder → audio_rx → audio-pump thread:
 ```
 
 時計なしリモート配信では time stretch と cpal 出力を持たず、
-`decode/resample → fixed normalize gain → session VST3 → safety limiter → AAC` とする。
+`decode/resample → fixed normalize gain → shared user VST → shared 音響調整 → safety limiter → AAC` とする。
 normalize/VST/limiter の前後関係と PDC/lookahead 補正はローカル再生と同じである。
 
 設計判断:
@@ -298,6 +354,24 @@ bridge IPC のレイテンシ実測 (Phase 0b):
 - 100ms buffer に対して十分小さい。realtime 維持可能。
 
 ## 5. プラグイン GUI ホスティング
+
+EffeTune 専用 bridge は `GuiOwnerPolicy::Unowned` (2026-09-30 利用者決定)。owner=0 の
+tool window なのでメインをクリックするとメインを手前にでき、タスクバーボタンは増えない。
+`main_hwnd` は DPI / 最小化参照であり owner ではない。ユーザー VST の `Auto`、fullscreen の
+owner / TOPMOST / focus handoff は従来どおり。EffeTune は owner 変更 IPC と app-active relay の対象外。
+表示希望と一時非表示理由 (`Minimized` / `RemoteSession`) は host の `GuiVisibility` に集約し、
+最後の理由が解除されたときだけ元の表示希望を復元する。詳細とボタンの foreground 判定は
+[EffeTune 計画 §4](effetune-integration-plan.md#4-ウィンドウ) を参照。
+
+host protocol v4 は `show_gui` の明示的 `unowned` と `main_hwnd`、
+`sync_gui_main_visibility`、`set_gui_remote_session`、`activate_gui` を追加した。
+owner=0 は明示的な Unowned だけで許可し、旧 host が新しい表示規則を無視することを
+hello/ready の版照合で防ぐ。C++ 変更後は host を再ビルドする必要がある。
+
+v5 は EffeTune の専用 suppression-source mapping と `set_gui_visibility_checked` /
+`gui_visibility_result` を追加した。表示・前面化は GUI thread で発行時の permit を照合して確定し、
+pipe 書き込みでは Rust の表示情報を更新しない。表示／非表示の結果と native close は同じ FIFO
+signal で処理する。mapping は最小化・Remote の正本を運ぶだけで、表示希望の持ち主は host のまま。
 
 要件:
 - アプリ起動中ずっとプラグイン GUI を表示しておける
@@ -454,10 +528,10 @@ VST3 SDK 3.8.0 (MIT、2025-10-20 以降) を採用しているため、**追加�
 
 ## 11. 配布物への影響
 
-- `mimageviewer.exe` (launcher) のサイズ: 既存 ~365MB に bridge exe (~640KB) 追加 → ~366MB
+- host exeのサイズはR2 buildで826,880 bytes。coreがhostとfallback CRT4本を内包し、launcherがそのcoreを内包する。サイズ／SHA256は各検証buildで記録する。
 - `mimageviewer-core.exe`: 既存に bridge exe を `include_bytes!` で内包
 - 初回 VST3 enable 時 (= デフォルトでは展開されない) に
-  `%APPDATA%\mimageviewer\vst3\mimageviewer-vst3-host.exe` を展開
+  `%APPDATA%\mimageviewer\vst3\hosts\<host+CRT SHA256>\mimageviewer-vst3-host.exe` を展開
 - **bridge exe を埋め込む位置はメイン exe (= core)**。launcher は変更不要。
 
 ## 12. リリース前チェックリスト追加項目

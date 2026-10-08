@@ -1,0 +1,272 @@
+[test-full] cargo test --workspace --features pack-build-tools --no-fail-fast
+    Blocking waiting for file lock on artifact directory
+   Compiling mimageviewer v3.5.0 (C:\home\mimageviewer)
+warning: use of deprecated method `quick_xml::events::attributes::Attribute::<'a>::decode_and_unescape_value`: use `Self::decoded_and_normalized_value()`
+   --> src\xmp_reader.rs:461:45
+    |
+461 |                         if let Ok(v) = attr.decode_and_unescape_value(decoder) {
+    |                                             ^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated method `quick_xml::events::attributes::Attribute::<'a>::decode_and_unescape_value`: use `Self::decoded_and_normalized_value()`
+   --> src\xmp_reader.rs:465:45
+    |
+465 |                         if let Ok(v) = attr.decode_and_unescape_value(decoder) {
+    |                                             ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `quick_xml::events::attributes::Attribute::<'a>::unescape_value`: use `Self::normalized_value()`
+   --> src\xmp_reader.rs:868:33
+    |
+868 |             if let Ok(v) = attr.unescape_value() {
+    |                                 ^^^^^^^^^^^^^^
+
+warning: use of deprecated method `quick_xml::events::attributes::Attribute::<'a>::decode_and_unescape_value`: use `Self::decoded_and_normalized_value()`
+    --> src\xmp_reader.rs:1056:42
+     |
+1056 |                     let Ok(value) = attr.decode_and_unescape_value(decoder) else {
+     |                                          ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: duplicated attribute
+     --> src\app\tests.rs:26348:5
+      |
+26348 |     #[test]
+      |     ^^^^^^^
+      |
+      = note: `#[warn(duplicate_macro_attributes)]` on by default
+
+warning: duplicated attribute
+    --> src\materializer.rs:2127:5
+     |
+2127 |     #[test]
+     |     ^^^^^^^
+
+warning: duplicated attribute
+    --> src\panorama.rs:1822:5
+     |
+1822 |     #[test]
+     |     ^^^^^^^
+
+warning: duplicated attribute
+     --> src\video\native_presenter\render_core.rs:13324:5
+      |
+13324 |     #[test]
+      |     ^^^^^^^
+
+warning: method `set_local_adjust_layers_for_idx_memory_only_defer_render` is never used
+     --> src\app.rs:55258:19
+      |
+14952 | impl App {
+      | -------- method in this implementation
+...
+55258 |     pub(crate) fn set_local_adjust_layers_for_idx_memory_only_defer_render(
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `build_launch_request` is never used
+    --> src\external_tool.rs:1090:15
+     |
+1090 | pub(crate) fn build_launch_request(
+     |               ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `build_launch_operation` is never used
+    --> src\external_tool.rs:1306:15
+     |
+1306 | pub(crate) fn build_launch_operation(
+     |               ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `is_empty` is never used
+   --> src\items_generation_cache.rs:424:19
+    |
+282 | impl<T> ItemsGenerationVec<T> {
+    | ----------------------------- method in this implementation
+...
+424 |     pub(crate) fn is_empty(&self) -> bool {
+    |                   ^^^^^^^^
+
+warning: method `seam_ratio` is never used
+  --> src\sns_split.rs:67:12
+   |
+20 | impl SnsTarget {
+   | -------------- method in this implementation
+...
+67 |     pub fn seam_ratio(self) -> f32 {
+   |            ^^^^^^^^^^
+
+warning: method `seam_ratio_parts` is never used
+   --> src\sns_split.rs:158:12
+    |
+157 | impl SnsSplitLayout {
+    | ------------------- method in this implementation
+158 |     pub fn seam_ratio_parts(self) -> (u128, u128) {
+    |            ^^^^^^^^^^^^^^^^
+
+warning: method `seek_for_remote_streaming` is never used
+    --> src\video\mod.rs:8730:19
+     |
+7533 | impl VideoPlayer {
+     | ---------------- method in this implementation
+...
+8730 |     pub(crate) fn seek_for_remote_streaming(&self, target_secs: f64) {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `command_tx` and `next_owner_id` are never read
+   --> src\video\audio.rs:269:5
+    |
+268 | pub(crate) struct AudioTapController {
+    |                   ------------------ fields in this struct
+269 |     command_tx: Sender<AudioTapCommand>,
+    |     ^^^^^^^^^^
+270 |     next_owner_id: Arc<AtomicU64>,
+    |     ^^^^^^^^^^^^^
+    |
+    = note: `AudioTapController` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: variant `Attach` is never constructed
+   --> src\video\audio.rs:283:5
+    |
+282 | enum AudioTapCommand {
+    |      --------------- variant in this enum
+283 |     Attach(ActiveAudioTap),
+    |     ^^^^^^
+
+warning: method `attach` is never used
+   --> src\video\audio.rs:294:19
+    |
+293 | impl AudioTapController {
+    | ----------------------- method in this implementation
+294 |     pub(crate) fn attach(
+    |                   ^^^^^^
+
+warning: field `next_remote_local_mute_owner` is never read
+   --> src\video\clock.rs:167:5
+    |
+ 98 | pub struct AvClock {
+    |            ------- field in this struct
+...
+167 |     next_remote_local_mute_owner: AtomicU64,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `acquire_remote_local_output_mute` is never used
+   --> src\video\clock.rs:910:19
+    |
+236 | impl AvClock {
+    | ------------ method in this implementation
+...
+910 |     pub(crate) fn acquire_remote_local_output_mute(self: &Arc<Self>) -> RemoteLocalOutputMuteLease {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `RemoteLocalOutputMuteLease` is never constructed
+   --> src\video\clock.rs:968:19
+    |
+968 | pub(crate) struct RemoteLocalOutputMuteLease {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `axis_diagnostics` is never read
+   --> src\video\seek_strip_thumbs.rs:297:16
+    |
+295 | pub(crate) struct StripThumbnailSnapshot {
+    |                   ---------------------- field in this struct
+296 |     pub(crate) axis: StripAxisResolution,
+297 |     pub(crate) axis_diagnostics: Option<StripAxisDiagnostics>,
+    |                ^^^^^^^^^^^^^^^^
+    |
+    = note: `StripThumbnailSnapshot` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: variant `Timeout` is never constructed
+  --> src\video\stream\session.rs:97:5
+   |
+92 | pub(crate) enum StreamResourceError {
+   |                 ------------------- variant in this enum
+...
+97 |     Timeout,
+   |     ^^^^^^^
+   |
+   = note: `StreamResourceError` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: unused variable: `ctx`
+     --> src\app\tests.rs:25709:13
+      |
+25709 |         let ctx = egui::Context::default();
+      |             ^^^ help: if this is intentional, prefix it with an underscore: `_ctx`
+      |
+      = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `ctx`
+     --> src\app\tests.rs:25826:13
+      |
+25826 |         let ctx = egui::Context::default();
+      |             ^^^ help: if this is intentional, prefix it with an underscore: `_ctx`
+
+warning: variable does not need to be mutable
+    --> src\remote_ipc\container.rs:7993:13
+     |
+7993 |         let mut png = |width: u32, height: u32| {
+     |             ----^^^
+     |             |
+     |             help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `seek_strip_wheel_is_consumed_and_becomes_one_range_step` is never used
+     --> src\video\native_presenter\render_core.rs:13354:8
+      |
+13354 |     fn seek_strip_wheel_is_consumed_and_becomes_one_range_step() {
+      |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused `std::result::Result` that must be used
+     --> src\app\tests.rs:26367:9
+      |
+26367 | /         app.with_viewer_context(original, |mounted| {
+26368 | |             assert!(
+26369 | |                 mounted.fs_info_panel.locked,
+26370 | |                 "他方の窓の操作でロックが落ちた"
+...     |
+26377 | |             assert!(!mounted.fs_info_panel.hover_active);
+26378 | |         });
+      | |__________^
+      |
+      = note: this `Result` may be an `Err` variant, which should be handled
+      = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default
+help: use `let _ = ...` to ignore the resulting value
+      |
+26367 |         let _ = app.with_viewer_context(original, |mounted| {
+      |         +++++++
+
+warning: unused return value of `egui::Context::run` that must be used
+     --> src\ui_main.rs:22244:13
+      |
+22244 | /             ctx.run(input.clone(), |ctx| {
+22245 | |                 egui::TopBottomPanel::top("t").show(ctx, |ui| {
+22246 | |                     let right = ui.max_rect().right();
+22247 | |                     ui.horizontal_wrapped(|ui| {
+...     |
+22251 | |                 });
+22252 | |             });
+      | |______________^
+      |
+help: use `let _ = ...` to ignore the resulting value
+      |
+22244 |             let _ = ctx.run(input.clone(), |ctx| {
+      |             +++++++
+
+warning: `mimageviewer` (lib) generated 19 warnings
+error[E0433]: failed to resolve: could not find `LocalAiActivityLease` in `mimageviewer`
+   --> tests\export_integration.rs:675:46
+    |
+675 |             local_ai_activity: mimageviewer::LocalAiActivityLease::new(
+    |                                              ^^^^^^^^^^^^^^^^^^^^ could not find `LocalAiActivityLease` in `mimageviewer`
+
+error[E0433]: failed to resolve: could not find `LocalAiActivityLease` in `mimageviewer`
+   --> tests\export_integration.rs:718:46
+    |
+718 |             local_ai_activity: mimageviewer::LocalAiActivityLease::new(
+    |                                              ^^^^^^^^^^^^^^^^^^^^ could not find `LocalAiActivityLease` in `mimageviewer`
+
+For more information about this error, try `rustc --explain E0433`.
+error: could not compile `mimageviewer` (test "export_integration") due to 2 previous errors
+warning: build failed, waiting for other jobs to finish...
+warning: `mimageviewer` (lib test) generated 15 warnings (5 duplicates) (run `cargo fix --lib -p mimageviewer --tests` to apply 3 suggestions)

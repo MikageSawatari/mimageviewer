@@ -1,0 +1,8 @@
+[
+  {
+    "operation": "replace_paragraph",
+    "anchor": "[← READMEに戻る](README.md)",
+    "replacement": "[← mImageViewer での使い方へ](https://mikage.to/mimageviewer/manual/effetune.html)",
+    "reason": "Replace obsolete return-to-installation overview with mIV introduction."
+  }
+]

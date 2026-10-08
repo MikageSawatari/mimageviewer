@@ -58,11 +58,21 @@
 # GlobalMetadataSearch = Ctrl+G ; 全フォルダのメタデータを検索する
 # GlobalOpenFolder = Ctrl+O ; フォルダを開くダイアログを表示する
 # ToggleDetachedViewerMode = F12 ; 画像・動画ビューアの別ウィンドウモードを切り替える
+# ToggleAlwaysOnTop = none ; 常に最前面を切り替える
 # HelpShowContextShortcuts = ? ; 現在のコンテキストで使えるショートカット一覧を表示する
 
 [Grid] ; サムネイル一覧
 # GridFavoritePrev = none ; 前のお気に入りへ移動する
 # GridFavoriteNext = none ; 次のお気に入りへ移動する
+# GridManageFavorites = none ; お気に入りの管理を開く
+# GridBookPrev = none ; 前の本を開く
+# GridBookNext = none ; 次の本を開く
+# GridOpenActiveBook = none ; 追加先の本を開く
+# GridManageBooks = none ; 製本の管理を開く
+# GridCollectionPrev = none ; 前のコレクションを開く
+# GridCollectionNext = none ; 次のコレクションを開く
+# GridOpenCollectionTarget = none ; 追加先のコレクションを開く
+# GridManageCollections = none ; コレクションの管理を開く
 # GridOpenFavorite1 = none ; お気に入り1を開く
 # GridOpenFavorite2 = none ; お気に入り2を開く
 # GridOpenFavorite3 = none ; お気に入り3を開く
@@ -83,6 +93,46 @@
 # GridOpenFavorite18 = none ; お気に入り18を開く
 # GridOpenFavorite19 = none ; お気に入り19を開く
 # GridOpenFavorite20 = none ; お気に入り20を開く
+# GridOpenBook1 = none ; 本1を開く
+# GridOpenBook2 = none ; 本2を開く
+# GridOpenBook3 = none ; 本3を開く
+# GridOpenBook4 = none ; 本4を開く
+# GridOpenBook5 = none ; 本5を開く
+# GridOpenBook6 = none ; 本6を開く
+# GridOpenBook7 = none ; 本7を開く
+# GridOpenBook8 = none ; 本8を開く
+# GridOpenBook9 = none ; 本9を開く
+# GridOpenBook10 = none ; 本10を開く
+# GridOpenBook11 = none ; 本11を開く
+# GridOpenBook12 = none ; 本12を開く
+# GridOpenBook13 = none ; 本13を開く
+# GridOpenBook14 = none ; 本14を開く
+# GridOpenBook15 = none ; 本15を開く
+# GridOpenBook16 = none ; 本16を開く
+# GridOpenBook17 = none ; 本17を開く
+# GridOpenBook18 = none ; 本18を開く
+# GridOpenBook19 = none ; 本19を開く
+# GridOpenBook20 = none ; 本20を開く
+# GridOpenCollection1 = none ; コレクション1を開く
+# GridOpenCollection2 = none ; コレクション2を開く
+# GridOpenCollection3 = none ; コレクション3を開く
+# GridOpenCollection4 = none ; コレクション4を開く
+# GridOpenCollection5 = none ; コレクション5を開く
+# GridOpenCollection6 = none ; コレクション6を開く
+# GridOpenCollection7 = none ; コレクション7を開く
+# GridOpenCollection8 = none ; コレクション8を開く
+# GridOpenCollection9 = none ; コレクション9を開く
+# GridOpenCollection10 = none ; コレクション10を開く
+# GridOpenCollection11 = none ; コレクション11を開く
+# GridOpenCollection12 = none ; コレクション12を開く
+# GridOpenCollection13 = none ; コレクション13を開く
+# GridOpenCollection14 = none ; コレクション14を開く
+# GridOpenCollection15 = none ; コレクション15を開く
+# GridOpenCollection16 = none ; コレクション16を開く
+# GridOpenCollection17 = none ; コレクション17を開く
+# GridOpenCollection18 = none ; コレクション18を開く
+# GridOpenCollection19 = none ; コレクション19を開く
+# GridOpenCollection20 = none ; コレクション20を開く
 # GridOpenDriveC = none ; ドライブ C:\ のルートを開く
 # GridOpenDriveD = none ; ドライブ D:\ のルートを開く
 # GridOpenDriveE = none ; ドライブ E:\ のルートを開く
@@ -182,8 +232,9 @@
 # GridDeselect.2 = Ctrl+Shift+A ; チェックをすべて解除する
 # GridCutFiles = Ctrl+X ; 選択中またはチェック済みの実ファイル/実フォルダを切り取る
 # GridCopyFiles = Ctrl+C ; 選択中またはチェック済みの実ファイル/実フォルダをコピーする
+# GridOrganizeFiles = none ; 選択中またはチェック済みの実ファイル/実フォルダの整理先を選ぶ
 # GridToggleCheck = Space ; 選択中の項目のチェックを切り替える
-# GridDelete = Delete ; 選択中またはチェック済みの実ファイル/実フォルダを削除する
+# GridDelete = Delete ; 通常一覧では実ファイル/実フォルダを削除し、コレクション直下では参照登録を外す
 # GridRename = none ; 選択中の実ファイル/実フォルダの名前を変更する
 # GridReload = none ; 現在の一覧を最新の情報に更新する
 # GridOpenSelected = Enter ; 選択中の項目を開く
@@ -205,6 +256,7 @@
 # GridToggleMaximize = F11 ; メインウィンドウを最大化/復元する
 # GridToggleFolderTreePane = F ; フォルダツリーペインの表示を切り替える
 # GridToggleStackMode = none ; スタック表示を切り替える
+# GridConvertEpubToPdf = none ; 選択中の EPUB を PDF ファイルに変換する
 # GridTagApply = T ; タグを付ける/外すダイアログを開く
 # GridTagView = Ctrl+T ; タグビューを開く
 # GridRotateCw = R ; 選択中の画像を右に90度回転する
@@ -212,6 +264,7 @@
 # GridPin = P ; 選択中の項目を代表サムネイルに固定または解除する
 # GridComparePin = X ; 選択中の画像を比較スロットに固定または解除する
 # GridAddToActiveBook = Ctrl+B ; 選択中またはチェック済みのページを追加先の本へ追加する
+# GridAddToCollectionTarget = none ; 選択中またはチェック済みの実項目を追加先のコレクションへ追加する
 # GridExportSelection = Ctrl+E ; 選択中またはチェック済みの画像をまとめて書き出す
 # GridColumnCount1.1 = Alt+1 ; サムネイル列数を1列にする
 # GridColumnCount1.2 = Alt+Numpad1 ; サムネイル列数を1列にする
@@ -233,6 +286,16 @@
 # GridColumnCount9.2 = Alt+Numpad9 ; サムネイル列数を9列にする
 # GridColumnCount10.1 = Alt+0 ; サムネイル列数を10列にする
 # GridColumnCount10.2 = Alt+Numpad0 ; サムネイル列数を10列にする
+# GridColumnCount11 = none ; サムネイル列数を11列にする
+# GridColumnCount12 = none ; サムネイル列数を12列にする
+# GridColumnCount13 = none ; サムネイル列数を13列にする
+# GridColumnCount14 = none ; サムネイル列数を14列にする
+# GridColumnCount15 = none ; サムネイル列数を15列にする
+# GridColumnCount16 = none ; サムネイル列数を16列にする
+# GridColumnCount17 = none ; サムネイル列数を17列にする
+# GridColumnCount18 = none ; サムネイル列数を18列にする
+# GridColumnCount19 = none ; サムネイル列数を19列にする
+# GridColumnCount20 = none ; サムネイル列数を20列にする
 # GridToggleDetailsView = Alt+- ; サムネイル一覧と詳細一覧を切り替える
 # GridOpenPreferences = none ; 環境設定を開く
 # GridOpenOperationCustomize = none ; 操作カスタマイズを開く
@@ -288,12 +351,16 @@
 # RatingItem4 = F4 ; 星4を付ける（アイテム）
 # RatingItem5 = F5 ; 星5を付ける（アイテム）
 # RatingItemClear = F6 ; レーティングを解除する（アイテム）
+# RatingItemStepUp = none ; 評価を1段階上げる（アイテム）
+# RatingItemStepDown = none ; 評価を1段階下げる（アイテム）
 # RatingContainer1 = Shift+F1 ; 星1を付ける（コンテナ）
 # RatingContainer2 = Shift+F2 ; 星2を付ける（コンテナ）
 # RatingContainer3 = Shift+F3 ; 星3を付ける（コンテナ）
 # RatingContainer4 = Shift+F4 ; 星4を付ける（コンテナ）
 # RatingContainer5 = Shift+F5 ; 星5を付ける（コンテナ）
 # RatingContainerClear = Shift+F6 ; レーティングを解除する（コンテナ）
+# RatingContainerStepUp = none ; 評価を1段階上げる（コンテナ）
+# RatingContainerStepDown = none ; 評価を1段階下げる（コンテナ）
 
 [FsImage] ; 画像フルスクリーン
 # FsClose = Enter ; 画像フルスクリーンを閉じる
@@ -311,11 +378,14 @@
 # FsSpreadShiftRight = Ctrl+Right ; 見開き表示を右方向へ1ページずらす
 # FsSpreadShiftPrev = none ; 見開き表示を前のページ方向へ1ページずらす
 # FsSpreadShiftNext = none ; 見開き表示を次のページ方向へ1ページずらす
+# FsTogglePageAfterCoverAlone = none ; 表紙の次のページを単独で表示
+# FsToggleLastPageAlone = none ; 最終ページを単独で表示
 # FsSlideshow = S ; スライドショーの再生または停止を切り替える
 # FsSeekStripToggle = Shift+S ; 画像フルスクリーンのサムネイル列表示を切り替える
 # FsSpaceCheck = Space ; 現在の画像のチェックを切り替える。スライドショー中は停止する
 # FsCapture = Ctrl+S ; 現在の表示画像をキャプチャ保存する
 # FsAddToActiveBook = Ctrl+B ; 現在のページを追加先の本へ追加する
+# FsAddToCollectionTarget = none ; 現在の実画像を追加先のコレクションへ追加する
 # FsExport = Ctrl+E ; 現在の表示結果を別ファイルへ書き出す
 # FsCompareToggle = X ; 現在の画像を比較スロットに固定または解除する
 # FsCompareCycle = C ; 比較スロットのピン画像と現在画像を切り替えて表示する
@@ -502,6 +572,7 @@
 # VideoBookmark = B ; 現在の再生位置にブックマークを追加する
 # VideoCapture = Ctrl+S ; 現在の動画フレームをキャプチャ保存する
 # VideoAddToActiveBook = Ctrl+B ; 現在の動画フレームを追加先の本へ追加する
+# VideoAddToCollectionTarget = none ; 現在の動画・音声ファイルを追加先のコレクションへ追加する
 # VideoAdjustSlot1.1 = Ctrl+1 ; 動画補正スロット1を読み込む
 # VideoAdjustSlot1.2 = Ctrl+Numpad1 ; 動画補正スロット1を読み込む
 # VideoAdjustSlot2.1 = Ctrl+2 ; 動画補正スロット2を読み込む
@@ -523,6 +594,7 @@
 # VideoAdjustSlot10.1 = Ctrl+0 ; 動画補正スロット10を読み込む
 # VideoAdjustSlot10.2 = Ctrl+Numpad0 ; 動画補正スロット10を読み込む
 # VideoToggleAudioMode = Z ; 映像を消して音声モード（音楽ビュー）で聴く。音声モード中は動画表示へ戻す
+# VideoNextAudioTrack = none ; 次の音声トラックへ切り替える
 
 [Erase] ; 消しゴムモード
 # EraseConfirm = E ; 消しゴム処理を実行して終了する
@@ -577,6 +649,7 @@
 # ConcealSpacePan = Space ; 押している間だけ画像をパン操作する
 
 [Crop] ; 切り取りモード
+# CropForceCreateHold = Ctrl ; 押している間、ドラッグで新しい切り取り枠を作る
 # CropSpacePan = Space ; 押している間だけ画像をパン操作する
 # CropExecute = Ctrl+E ; 切り取りを実行する
 

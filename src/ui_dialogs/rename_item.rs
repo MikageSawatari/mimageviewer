@@ -10,6 +10,10 @@ use crate::native_name_dialog::{NameInputRequest, NamePromptOutcome};
 
 pub(crate) type RenameResult = crate::shell_file_ops::ShellRenameResult;
 pub(crate) type RenameReceiver = mpsc::Receiver<RenameResult>;
+pub(crate) struct RenamePending {
+    pub(crate) rx: RenameReceiver,
+    pub(crate) collection_scope: crate::collection_store::CollectionSourceMigrationScope,
+}
 
 const DIALOG_TITLE: &str = "名前の変更";
 
@@ -21,18 +25,24 @@ impl App {
             return;
         }
         let target_index = self.checked.iter().next().copied().or(self.selected);
-        let Some(target) = target_index
+        let Some((target, target_is_file)) = target_index
             .and_then(|index| self.items.get(index))
-            .and_then(crate::grid_item::GridItem::drag_source_path)
-            .map(PathBuf::from)
+            .and_then(|item| {
+                item.drag_source_path().map(|path| {
+                    (
+                        PathBuf::from(path),
+                        !matches!(item, crate::grid_item::GridItem::Folder(_)),
+                    )
+                })
+            })
         else {
             self.show_feedback_toast("この項目は名前を変更できません".to_owned());
             return;
         };
-        self.request_rename_dialog(target);
+        self.request_rename_dialog(target, target_is_file);
     }
 
-    pub(crate) fn request_rename_dialog(&mut self, target: PathBuf) {
+    pub(crate) fn request_rename_dialog(&mut self, target: PathBuf, target_is_file: bool) {
         if self.rename_pending.is_some() {
             self.show_feedback_toast("名前の変更が完了するまでお待ちください".to_owned());
             return;
@@ -41,9 +51,9 @@ impl App {
             self.show_feedback_toast("この項目は名前を変更できません".to_owned());
             return;
         };
-        // The request is created from a context-menu closure. Only snapshot the
-        // item kind here; the synchronous native modal opens from App::update.
-        self.rename_target_is_file = target.is_file();
+        // The request producer already owns the typed GridItem. Capture that kind here instead of
+        // probing the filesystem on the UI thread; a missing file is still Exact, never Tree.
+        self.rename_target_is_file = target_is_file;
         self.rename_target = Some(target);
         self.show_rename_dialog = true;
     }
@@ -114,20 +124,42 @@ impl App {
                 }
             }
 
-            self.clear_rename_dialog_state();
-            self.rename_pending = Some(crate::shell_file_ops::rename_item_async(
-                owner, target, name,
-            ));
-            ctx.request_repaint();
+            self.start_rename_item_after_confirmation(ctx, owner, target, name, target_is_file);
             return;
         }
     }
 
+    /// The last boundary before the Shell worker can rename a real item.
+    pub(crate) fn start_rename_item_after_confirmation(
+        &mut self,
+        ctx: &egui::Context,
+        owner: Option<isize>,
+        target: PathBuf,
+        name: String,
+        target_is_file: bool,
+    ) {
+        if !self.admit_rename_migration_source_change(ctx) {
+            self.clear_rename_dialog_state();
+            return;
+        }
+        let collection_scope = if target_is_file {
+            crate::collection_store::CollectionSourceMigrationScope::Exact
+        } else {
+            crate::collection_store::CollectionSourceMigrationScope::Tree
+        };
+        self.clear_rename_dialog_state();
+        self.rename_pending = Some(RenamePending {
+            rx: crate::shell_file_ops::rename_item_async(owner, target, name),
+            collection_scope,
+        });
+        ctx.request_repaint();
+    }
+
     pub(crate) fn poll_rename_pending(&mut self, ctx: &egui::Context) {
-        let Some(rx) = self.rename_pending.take() else {
+        let Some(pending) = self.rename_pending.take() else {
             return;
         };
-        match rx.try_recv() {
+        match pending.rx.try_recv() {
             Ok(Ok(outcome)) => {
                 self.clear_rename_dialog_state();
                 if outcome.aborted {
@@ -149,7 +181,11 @@ impl App {
                 self.remove_paths_from_smart_folder_snapshots(std::slice::from_ref(
                     &outcome.target,
                 ));
-                self.spawn_rename_key_migration(outcome.target.clone(), outcome.new_path.clone());
+                self.spawn_rename_key_migration(
+                    outcome.target.clone(),
+                    outcome.new_path.clone(),
+                    pending.collection_scope,
+                );
                 let current_matches_parent = outcome.target.parent().is_some_and(|parent| {
                     self.current_folder
                         .as_ref()
@@ -170,21 +206,24 @@ impl App {
             }
             Ok(Err(message)) => {
                 self.clear_rename_dialog_state();
-                crate::native_name_dialog::show_warning(self.main_hwnd, DIALOG_TITLE, &message);
+                self.report_rename_worker_warning(&message);
             }
             Err(mpsc::TryRecvError::Empty) => {
-                self.rename_pending = Some(rx);
+                self.rename_pending = Some(pending);
                 ctx.request_repaint();
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.clear_rename_dialog_state();
-                crate::native_name_dialog::show_warning(
-                    self.main_hwnd,
-                    DIALOG_TITLE,
-                    "名前変更 worker が終了しました",
-                );
+                self.report_rename_worker_warning("名前変更 worker が終了しました");
             }
         }
+    }
+
+    fn report_rename_worker_warning(&mut self, message: &str) {
+        #[cfg(not(test))]
+        crate::native_name_dialog::show_warning(self.main_hwnd, DIALOG_TITLE, message);
+        #[cfg(test)]
+        self.show_feedback_toast(message.to_owned());
     }
 
     fn clear_rename_dialog_state(&mut self) {

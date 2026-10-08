@@ -1,5 +1,108 @@
 use super::*;
 
+/// Decode on the quality-dialog worker. A RAW failure stays typed here and
+/// cannot be retried through `image`'s TIFF reader.
+fn decode_thumb_quality_sample(
+    source: ThumbSampleSource,
+    sample_px: u32,
+    raw_executor: &crate::raw::RawDevelopExecutor,
+) -> Result<Option<(image::DynamicImage, u64)>, crate::raw::RawError> {
+    match source {
+        ThumbSampleSource::File(path) => {
+            let image = if crate::raw_format::is_raw_path(&path) {
+                Some(
+                    crate::thumb_loader::decode_raw_thumbnail_on_worker(
+                        crate::raw::RawOwnedSource::Path(path.clone()),
+                        sample_px,
+                        raw_executor,
+                    )?
+                    .image,
+                )
+            } else {
+                image::open(&path).ok()
+            };
+            Ok(image.map(|image| {
+                let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+                (image, size)
+            }))
+        }
+        ThumbSampleSource::ZipEntry {
+            zip_path,
+            entry_name,
+        } => {
+            let bytes = match crate::zip_loader::read_entry_bytes(&zip_path, &entry_name) {
+                Ok(bytes) => bytes,
+                Err(_) => return Ok(None),
+            };
+            let size = bytes.len() as u64;
+            let image = if crate::raw_format::is_raw_path(Path::new(&entry_name)) {
+                Some(
+                    crate::thumb_loader::decode_raw_thumbnail_on_worker(
+                        crate::raw::RawOwnedSource::Bytes(Arc::from(bytes)),
+                        sample_px,
+                        raw_executor,
+                    )?
+                    .image,
+                )
+            } else {
+                image::load_from_memory(&bytes).ok()
+            };
+            Ok(image.map(|image| (image, size)))
+        }
+    }
+}
+
+#[inline]
+fn batch_pdf_parent_present(
+    cache_map: &std::collections::HashMap<String, crate::catalog::CacheEntry>,
+    key: &str,
+    epub_read: Option<&crate::pdf_loader::ReadTarget>,
+    mtime: i64,
+    file_size: i64,
+) -> bool {
+    if epub_read.is_some() {
+        cache_map
+            .get(key)
+            .is_some_and(|entry| entry.mtime == mtime && entry.file_size == file_size)
+    } else {
+        cache_map.contains_key(key)
+    }
+}
+
+#[cfg(test)]
+mod epub_stamp_tests {
+    use super::*;
+
+    #[test]
+    fn epub_batch_parent_row_requires_generation_while_pdf_keeps_presence_check() {
+        let key = "book.epub".to_string();
+        let map = std::collections::HashMap::from([(
+            key.clone(),
+            crate::catalog::CacheEntry {
+                mtime: 17,
+                file_size: 4096,
+                jpeg_data: Vec::new(),
+                source_dims: None,
+                layout_dims: None,
+                folder_provenance: None,
+                selection_proof: None,
+            },
+        )]);
+        let first = crate::pdf_loader::generation_target_for_test(Path::new("book.epub"), 17, 4096);
+        let second =
+            crate::pdf_loader::generation_target_for_test(Path::new("book.epub"), 18, 4096);
+        assert!(batch_pdf_parent_present(&map, &key, Some(&first), 17, 4096));
+        assert!(!batch_pdf_parent_present(
+            &map,
+            &key,
+            Some(&second),
+            18,
+            4096
+        ));
+        assert!(batch_pdf_parent_present(&map, &key, None, 18, 4096));
+    }
+}
+
 impl App {
     // -------------------------------------------------------------------
     // サムネイル画質設定ダイアログ (A/B 比較)
@@ -34,23 +137,17 @@ impl App {
         // 数百ms〜秒単位止めるため同期実行しない。ダイアログは即座に「読み込み中」で開く。
         let (tx, rx) = mpsc::channel();
         let display_name = source.display_name();
+        let raw_executor = Arc::clone(&self.raw_develop_executor);
+        let sample_px = self.settings.thumb_px;
         std::thread::Builder::new()
             .name("thumb-quality-sample-decode".into())
             .spawn(move || {
-                let result = match source {
-                    ThumbSampleSource::File(path) => image::open(&path).ok().map(|img| {
-                        let orig = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                        (img, orig)
-                    }),
-                    ThumbSampleSource::ZipEntry {
-                        zip_path,
-                        entry_name,
-                    } => crate::zip_loader::read_entry_bytes(&zip_path, &entry_name)
-                        .ok()
-                        .and_then(|bytes| {
-                            let orig = bytes.len() as u64;
-                            image::load_from_memory(&bytes).ok().map(|img| (img, orig))
-                        }),
+                let result = match decode_thumb_quality_sample(source, sample_px, &raw_executor) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        crate::logger::log(format!("RAW quality sample decode failed: {error}"));
+                        None
+                    }
                 };
                 let _ = tx.send(result);
             })
@@ -277,10 +374,12 @@ impl App {
         let current = Arc::clone(&self.cc.current);
         let thumb_px = self.settings.thumb_px;
         let thumb_quality = self.settings.thumb_quality;
+        let raw_executor = Arc::clone(&self.raw_develop_executor);
         let threads = self.settings.parallelism.thread_count();
         let batch_zip = self.settings.batch_cache_zip_contents;
         let batch_pdf = self.settings.batch_cache_pdf_contents;
 
+        let catalog_work = crate::catalog::CatalogWork::default();
         std::thread::spawn(move || {
             // baseline: worker 冒頭で取得 (UI スレッドブロッキング回避)
             let cache_dir = crate::catalog::default_cache_dir();
@@ -367,10 +466,10 @@ impl App {
                             if let Some((mt, fs)) = meta() {
                                 zip_files.push((p, mt, fs));
                             }
-                        } else if ext_lower == "pdf" {
-                            if let Some((mt, fs)) = meta() {
-                                pdf_files.push((p, mt, fs));
-                            }
+                        } else if crate::folder_tree::is_paged_document_path(&p)
+                            && let Some((mt, fs)) = meta()
+                        {
+                            pdf_files.push((p, mt, fs));
                         }
                     }
                 }
@@ -381,7 +480,7 @@ impl App {
                 }
 
                 // カタログを開く（1フォルダ1DB）
-                let Ok(catalog) = crate::catalog::CatalogDb::open(&cache_dir, folder) else {
+                let Ok(catalog) = catalog_work.open(folder) else {
                     done.fetch_add(1, Ordering::Relaxed);
                     continue;
                 };
@@ -411,6 +510,7 @@ impl App {
                                 *file_size,
                                 thumb_px,
                                 thumb_quality,
+                                &raw_executor,
                             ) {
                                 size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
                             }
@@ -435,11 +535,10 @@ impl App {
                             Ok(e) => e,
                             Err(_) => continue,
                         };
-                        let zip_catalog =
-                            match crate::catalog::CatalogDb::open(&cache_dir, zip_path) {
-                                Ok(c) => c,
-                                Err(_) => continue,
-                            };
+                        let zip_catalog = match catalog_work.open(zip_path) {
+                            Ok(c) => c,
+                            Err(_) => continue,
+                        };
                         let zip_cache_map = zip_catalog.load_all().unwrap_or_default();
                         let entry_count = entries.len();
 
@@ -477,6 +576,27 @@ impl App {
                                     Ok(b) => b,
                                     Err(_) => return,
                                 };
+                                if crate::raw_format::is_raw_path(Path::new(&entry.entry_name)) {
+                                    let Ok(raster) = crate::thumb_loader::decode_raw_thumbnail_on_worker(
+                                        crate::raw::RawOwnedSource::Bytes(Arc::from(raw)),
+                                        thumb_px,
+                                        &raw_executor,
+                                    ) else { return };
+                                    let source_dims = Some(raster.developed_dims);
+                                    if i == 0 {
+                                        *first_webp.lock().unwrap() = Some((
+                                            raster.image.clone(), source_dims, entry.entry_name.clone(),
+                                        ));
+                                    }
+                                    if let Some(bytes) = encode_and_save_with_source_dims(
+                                        &raster.image, source_dims, &entry.entry_name,
+                                        &zip_catalog, entry.mtime, entry.uncompressed_size as i64,
+                                        thumb_px, thumb_quality,
+                                    ) {
+                                        size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
+                                    }
+                                    return;
+                                }
                                 let orientation = read_exif_orientation_from_bytes(&raw);
                                 // JPEG なら TurboJPEG DCT scale を試す
                                 let (img, dct_stats): (
@@ -557,6 +677,29 @@ impl App {
                             if let Ok(raw) =
                                 crate::zip_loader::read_entry_bytes(zip_path, &first_entry)
                             {
+                                if crate::raw_format::is_raw_path(Path::new(&first_entry)) {
+                                    if let Ok(raster) =
+                                        crate::thumb_loader::decode_raw_thumbnail_on_worker(
+                                            crate::raw::RawOwnedSource::Bytes(Arc::from(raw)),
+                                            thumb_px,
+                                            &raw_executor,
+                                        )
+                                    {
+                                        if let Some(bytes) = encode_and_save_with_source_dims(
+                                            &raster.image,
+                                            Some(raster.developed_dims),
+                                            &folder_key,
+                                            &catalog,
+                                            *zip_mtime,
+                                            *zip_file_size,
+                                            thumb_px,
+                                            thumb_quality,
+                                        ) {
+                                            size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
+                                        }
+                                    }
+                                    continue;
+                                }
                                 let orientation = read_exif_orientation_from_bytes(&raw);
                                 // JPEG なら DCT scale → source_dims override で保存
                                 let (img, source_dims): (
@@ -609,6 +752,28 @@ impl App {
                         if cancel.load(Ordering::Relaxed) {
                             break;
                         }
+                        let epub_read = if pdf_path
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+                        {
+                            match crate::pdf_loader::resolve_read_target(pdf_path) {
+                                Ok(read) => Some(read),
+                                Err(_) => continue,
+                            }
+                        } else {
+                            None
+                        };
+                        let (resolved_mtime, resolved_size) = if let Some(read) = epub_read.as_ref()
+                        {
+                            let Some(stamp) = read.stamp.generation_catalog_pair() else {
+                                continue;
+                            };
+                            stamp
+                        } else {
+                            (*pdf_mtime, *pdf_file_size)
+                        };
+                        let (pdf_mtime, pdf_file_size) = (&resolved_mtime, &resolved_size);
                         let pdf_fname = match pdf_path.file_name().and_then(|n| n.to_str()) {
                             Some(n) => n.to_string(),
                             None => continue,
@@ -621,15 +786,25 @@ impl App {
                         if batch_pdf {
                             // enumerate_pages がパスワード不正時に Err を返すので
                             // 事前のパスワード判定は不要
-                            let pages = match crate::pdf_loader::enumerate_pages(pdf_path, pw_ref) {
+                            let pages = match if let Some(read) = epub_read.as_ref() {
+                                crate::pdf_loader::enumerate_pages_with_read_target(
+                                    pdf_path,
+                                    read,
+                                    pw_ref,
+                                    None,
+                                    crate::pdf_loader::EnumerateOptions::default(),
+                                )
+                                .map(|result| result.pages)
+                            } else {
+                                crate::pdf_loader::enumerate_pages(pdf_path, pw_ref)
+                            } {
                                 Ok(p) => p,
                                 Err(_) => continue,
                             };
-                            let pdf_catalog =
-                                match crate::catalog::CatalogDb::open(&cache_dir, pdf_path) {
-                                    Ok(c) => c,
-                                    Err(_) => continue,
-                                };
+                            let pdf_catalog = match catalog_work.open(pdf_path) {
+                                Ok(c) => c,
+                                Err(_) => continue,
+                            };
                             let pdf_cache_map = pdf_catalog.load_all().unwrap_or_default();
                             let page_count = pages.len();
 
@@ -677,6 +852,7 @@ impl App {
                                 }
                                 if let Some(bytes) = crate::thumb_loader::build_and_save_one_pdf(
                                     pdf_path,
+                                    epub_read.as_ref(),
                                     page_num,
                                     pw_ref,
                                     &pdf_catalog,
@@ -690,20 +866,42 @@ impl App {
                             }
 
                             // 先頭1ページを親フォルダの DB にも保存
-                            if page_count > 0 && !cache_map.contains_key(&folder_key) {
+                            let parent_present = batch_pdf_parent_present(
+                                &cache_map,
+                                &folder_key,
+                                epub_read.as_ref(),
+                                *pdf_mtime,
+                                *pdf_file_size,
+                            );
+                            if page_count > 0 && !parent_present {
                                 // bulk cache creator は background なので epoch=0
                                 // + AbortOnCancel (cancel = ユーザ明示中断意図)
-                                if let Ok(res) = crate::pdf_loader::render_page(
-                                    pdf_path,
-                                    0,
-                                    thumb_px,
-                                    pw_ref,
-                                    None,
-                                    crate::pdf_loader::JobPriority::Normal,
-                                    0,
-                                    crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
-                                ) {
-                                    if let Some(bytes) = encode_and_save_with_source_dims(
+                                let rendered = if let Some(read) = epub_read.as_ref() {
+                                    crate::pdf_loader::render_page_with_read_target(
+                                        pdf_path,
+                                        read,
+                                        0,
+                                        thumb_px,
+                                        pw_ref,
+                                        None,
+                                        crate::pdf_loader::JobPriority::Normal,
+                                        0,
+                                        crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
+                                    )
+                                } else {
+                                    crate::pdf_loader::render_page(
+                                        pdf_path,
+                                        0,
+                                        thumb_px,
+                                        pw_ref,
+                                        None,
+                                        crate::pdf_loader::JobPriority::Normal,
+                                        0,
+                                        crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
+                                    )
+                                };
+                                if let Ok(res) = rendered
+                                    && let Some(bytes) = encode_and_save_with_source_dims(
                                         &res.image,
                                         res.page_size_points.catalog_layout_dims(),
                                         &folder_key,
@@ -712,9 +910,9 @@ impl App {
                                         *pdf_file_size,
                                         thumb_px,
                                         thumb_quality,
-                                    ) {
-                                        size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
-                                    }
+                                    )
+                                {
+                                    size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
                                 }
                             }
                         } else {
@@ -734,9 +932,18 @@ impl App {
                                     .flatten()
                                     .is_none();
                                 if meta_missing {
-                                    if let Ok(pages) =
+                                    if let Ok(pages) = if let Some(read) = epub_read.as_ref() {
+                                        crate::pdf_loader::enumerate_pages_with_read_target(
+                                            pdf_path,
+                                            read,
+                                            pw_ref,
+                                            None,
+                                            crate::pdf_loader::EnumerateOptions::default(),
+                                        )
+                                        .map(|result| result.pages)
+                                    } else {
                                         crate::pdf_loader::enumerate_pages(pdf_path, pw_ref)
-                                    {
+                                    } {
                                         let password_required = password.is_some();
                                         if let Err(e) = catalog.set_pdf_meta(
                                             filename,
@@ -752,21 +959,41 @@ impl App {
                                     }
                                 }
                             }
-                            if cache_map.contains_key(&folder_key) {
+                            if batch_pdf_parent_present(
+                                &cache_map,
+                                &folder_key,
+                                epub_read.as_ref(),
+                                *pdf_mtime,
+                                *pdf_file_size,
+                            ) {
                                 continue;
                             }
                             // render_page がパスワード不正時に Err を返すのでそのままスキップ
                             // bulk cache creator は background なので epoch=0 + AbortOnCancel
-                            if let Ok(res) = crate::pdf_loader::render_page(
-                                pdf_path,
-                                0,
-                                thumb_px,
-                                pw_ref,
-                                None,
-                                crate::pdf_loader::JobPriority::Normal,
-                                0,
-                                crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
-                            ) {
+                            if let Ok(res) = if let Some(read) = epub_read.as_ref() {
+                                crate::pdf_loader::render_page_with_read_target(
+                                    pdf_path,
+                                    read,
+                                    0,
+                                    thumb_px,
+                                    pw_ref,
+                                    None,
+                                    crate::pdf_loader::JobPriority::Normal,
+                                    0,
+                                    crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
+                                )
+                            } else {
+                                crate::pdf_loader::render_page(
+                                    pdf_path,
+                                    0,
+                                    thumb_px,
+                                    pw_ref,
+                                    None,
+                                    crate::pdf_loader::JobPriority::Normal,
+                                    0,
+                                    crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
+                                )
+                            } {
                                 // PDF メタキャッシュにも page_count を投入する
                                 // (Codex P3 対応)。`password_required` は確信できる場合
                                 // (= この PDF 固有の保存パスワードあり) のみ true。
@@ -808,5 +1035,60 @@ impl App {
 
             finished.store(true, Ordering::Relaxed);
         });
+    }
+}
+
+#[cfg(all(test, windows))]
+mod raw_quality_sample_tests {
+    use super::*;
+    use image::GenericImageView;
+    use std::io::Write;
+
+    #[test]
+    fn raw_quality_samples_use_libraw_for_file_and_zip_without_fallback() {
+        let cr2 = PathBuf::from("vendor/raw-samples/1018.cr2");
+        let dng = PathBuf::from("vendor/raw-samples/885.dng");
+        assert!(
+            cr2.is_file() && dng.is_file(),
+            "Run .\\scripts\\setup-raw-samples.ps1"
+        );
+        let executor = crate::raw::RawDevelopExecutor::new(1).unwrap();
+        let (half, size) =
+            decode_thumb_quality_sample(ThumbSampleSource::File(cr2), 2048, &executor)
+                .unwrap()
+                .unwrap();
+        assert_eq!(half.dimensions(), (1761, 1174));
+        assert!(size > 0);
+
+        let bytes = std::fs::read(dng).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("pages.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+        writer
+            .start_file("page.dng", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&bytes).unwrap();
+        writer.finish().unwrap();
+        let (preview, size) = decode_thumb_quality_sample(
+            ThumbSampleSource::ZipEntry {
+                zip_path,
+                entry_name: "page.dng".to_owned(),
+            },
+            512,
+            &executor,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(preview.dimensions(), (5796, 3870));
+        assert_eq!(size, bytes.len() as u64);
+
+        let misleading = temp.path().join("misleading.dng");
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(2, 2))
+            .save_with_format(&misleading, image::ImageFormat::Png)
+            .unwrap();
+        assert!(
+            decode_thumb_quality_sample(ThumbSampleSource::File(misleading), 512, &executor,)
+                .is_err()
+        );
     }
 }

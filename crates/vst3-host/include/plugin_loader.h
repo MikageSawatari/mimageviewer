@@ -10,11 +10,13 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 #include <windows.h>
 
+#include "gui_visibility.h"
 #include "host_app.h"  // PlugFrame, HostApplication, ComponentHandler の完全型
 #include "pluginterfaces/gui/iplugview.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
@@ -49,9 +51,13 @@ struct PluginProbeInfo {
 struct GuiWindowOptions {
     uint64_t slot_id = 0;
     void* owner_hwnd = nullptr;
+    bool unowned = false;
+    void* main_hwnd = nullptr; // DPI/minimize reference, never an owner
+    std::string gui_gate_name;
     uint32_t width = 0;
     uint32_t height = 0;
     bool resizable = true;
+    bool show_bypass_button = true;
     bool has_initial_pos = false;
     int32_t x = 0;
     int32_t y = 0;
@@ -146,6 +152,11 @@ public:
     /// Already-attached GUI surface visibility toggle. Keeps the VST3 view
     /// attached and only hides/shows the bridge-owned top-level surface.
     void set_gui_visible(bool visible);
+    void set_gui_visibility_checked(bool visible, GuiGateSnapshot permit,
+                                    std::function<void(const char*)> reply);
+    void sync_gui_main_visibility();
+    void set_gui_remote_session(bool active);
+    void activate_gui();
     /// Toggle topmost state for the bridge-owned plugin surface. The Rust side
     /// applies the same state to the host HWND so the two windows stay together.
     void set_gui_topmost(bool topmost);
@@ -164,6 +175,9 @@ public:
     bool editor_chrome_bypassed() const {
         return editor_bypassed_.load(std::memory_order_acquire);
     }
+    bool editor_chrome_show_bypass_button() const {
+        return editor_show_bypass_button_.load(std::memory_order_acquire);
+    }
     void invalidate_editor_chrome() const {
         if (auto* hwnd = static_cast<HWND>(view_container_hwnd_snapshot_.load(std::memory_order_acquire))) {
             InvalidateRect(hwnd, nullptr, FALSE);
@@ -171,6 +185,10 @@ public:
     }
     void set_editor_chrome_bypassed(bool bypassed) {
         editor_bypassed_.store(bypassed, std::memory_order_release);
+        invalidate_editor_chrome();
+    }
+    void set_editor_chrome_show_bypass_button(bool show) {
+        editor_show_bypass_button_.store(show, std::memory_order_release);
         invalidate_editor_chrome();
     }
     uint32_t editor_chrome_latency_samples() const {
@@ -211,6 +229,10 @@ public:
     /// 戻り値: true=成功 (= `out_bytes` に空でもないバイト列が入る)、false=失敗。
     bool query_state(std::vector<uint8_t>& out_bytes);
 
+    void query_state_concurrent(
+        std::function<bool()> begin,
+        std::function<void(bool, std::vector<uint8_t>)> complete);
+
     /// プラグイン内部状態をバイト列から復元する (`IComponent::setState`)。
     /// `IEditController::setComponentState` も同期で呼んで UI 表示を合わせる。
     /// 安全のため一時的に `setProcessing(false)` してから復元、終わったら再有効化する。
@@ -236,12 +258,16 @@ private:
     std::string plugin_name_;
     bool view_attached_ = false;
     void* view_host_hwnd_ = nullptr;
+    // Non-null only for the explicitly unowned EffeTune editor.
+    void* view_main_hwnd_ = nullptr;
     void* view_container_hwnd_ = nullptr;
     void* view_plugin_host_hwnd_ = nullptr;
     uint64_t editor_slot_id_ = 0;
     std::atomic<void*> view_container_hwnd_snapshot_{nullptr};
     std::atomic<bool> editor_bypassed_{false};
-    bool gui_surface_visible_ = false;
+    std::atomic<bool> editor_show_bypass_button_{true};
+    GuiVisibility gui_visibility_;
+    std::unique_ptr<GuiGateReader> gui_gate_;
     bool gui_app_active_ = true;
     uint32_t last_gui_width_ = 0;
     uint32_t last_gui_height_ = 0;

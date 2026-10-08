@@ -48,6 +48,17 @@ pub enum MaterializeSource {
 }
 
 impl MaterializeSource {
+    fn has_raw_page(&self) -> bool {
+        match self {
+            Self::File { path, image_page } => *image_page && crate::raw_format::is_raw_path(path),
+            Self::ZipEntry { entry_name, .. } => {
+                crate::raw_format::is_raw_path(Path::new(entry_name))
+            }
+            Self::MergedSpread { left, right, .. } => left.has_raw_page() || right.has_raw_page(),
+            Self::PdfPage { .. } | Self::VideoFrame { .. } => false,
+        }
+    }
+
     /// 失敗を利用者へ見せるときの名前。ZIP / PDF は「どのページか」まで出す。
     /// パスだけだと、複数ページを渡したときにどれが失敗したのか分からない。
     pub fn display_label(&self) -> String {
@@ -156,7 +167,7 @@ pub struct PageEditContext {
     pub conceal_preset: crate::conceal::ConcealPreset,
     pub erase_mono_tolerance: u8,
     pub comic_source_dims: Option<[usize; 2]>,
-    pub ai_runtime: Option<Arc<crate::ai::runtime::AiRuntime>>,
+    pub ai_runtime_init: Arc<crate::ai::runtime::AiRuntimeInitOwner>,
     pub ai_model_manager: Arc<crate::ai::model_manager::ModelManager>,
     /// AI 段を焼くための材料。`None` は「この経路では AI 段を焼かない」。
     pub ai_materials: Option<crate::books::BookAiMaterials>,
@@ -189,6 +200,8 @@ pub struct MaterializeRequest {
     pub policy: MaterializePolicy,
     pub page_edits: Option<MaterializePageEdits>,
     pub pdf_render_long_edge: u32,
+    /// Snapshot from the submitting UI; never read the materializer's startup choice.
+    pub raw_brightness: crate::raw::RawBrightness,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -271,6 +284,17 @@ struct FileStamp {
     size: u64,
 }
 
+fn generation_file_stamp(read: &crate::pdf_loader::ReadTarget) -> Result<FileStamp, String> {
+    let (id, size) = read
+        .stamp
+        .generation_catalog_pair()
+        .ok_or_else(|| "EPUB の世代を確認できません".to_string())?;
+    Ok(FileStamp {
+        modified_ns: Some(u128::try_from(id).map_err(|_| "EPUB の世代 ID が不正です")?),
+        size: size as u64,
+    })
+}
+
 fn file_stamp(path: &Path) -> Result<FileStamp, String> {
     let metadata = std::fs::metadata(path)
         .map_err(|error| format!("対象を確認できません: {}: {error}", path.display()))?;
@@ -294,6 +318,7 @@ struct CacheKey {
     policy: MaterializePolicy,
     pdf_render_long_edge: u32,
     edit_fingerprint: [u8; 32],
+    raw_brightness: Option<crate::raw::RawBrightness>,
 }
 
 #[derive(Clone)]
@@ -306,6 +331,7 @@ struct CacheRecord {
 #[derive(Default)]
 struct TempState {
     initialized: bool,
+    next_file_list_sequence: u64,
     cache: HashMap<CacheKey, CacheRecord>,
     reserved: HashSet<PathBuf>,
     keep_paths: HashSet<PathBuf>,
@@ -322,9 +348,16 @@ struct MaterializerInner {
 pub struct Materializer {
     inner: Arc<MaterializerInner>,
     startup_cleanup: Option<JoinHandle<()>>,
+    raw: Option<crate::raw::RawDecodeContext>,
 }
 
 impl Materializer {
+    pub fn new_with_raw(raw: crate::raw::RawDecodeContext) -> Self {
+        let mut materializer = Self::new();
+        materializer.raw = Some(raw);
+        materializer
+    }
+
     pub fn new() -> Self {
         #[cfg(test)]
         {
@@ -347,6 +380,11 @@ impl Materializer {
         {
             Self::new_at(temp_root, std::process::id(), true)
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_at_for_test(temp_root: PathBuf, pid: u32) -> Self {
+        Self::new_at(temp_root, pid, false)
     }
 
     fn new_at(temp_root: PathBuf, pid: u32, start_cleanup: bool) -> Self {
@@ -381,6 +419,7 @@ impl Materializer {
         Self {
             inner,
             startup_cleanup,
+            raw: None,
         }
     }
 
@@ -403,7 +442,7 @@ impl Materializer {
         MaterializeSession {
             inner: Arc::clone(&self.inner),
             databases: None,
-            worker_ai_runtime: None,
+            raw: self.raw.clone(),
         }
     }
 
@@ -472,7 +511,7 @@ impl EditDatabases {
 pub struct MaterializeSession {
     inner: Arc<MaterializerInner>,
     databases: Option<EditDatabases>,
-    worker_ai_runtime: Option<Arc<crate::ai::runtime::AiRuntime>>,
+    raw: Option<crate::raw::RawDecodeContext>,
 }
 
 struct LoadedPageEdits {
@@ -507,6 +546,26 @@ impl LoadedMaterializePageEdits {
 impl MaterializeSession {
     pub fn ensure_current(&self, cancel: &AtomicBool, generation: u64) -> Result<(), String> {
         check_current(&self.inner, cancel, generation)
+    }
+
+    /// 外部ツールの 1 起動へ渡す実パスを UTF-8 BOM なし・CRLF 固定で書く。
+    /// 相対パス解決を含む I/O は materialize / launch worker からだけ呼ぶ。
+    pub fn create_file_list(
+        &mut self,
+        paths: &[PathBuf],
+        cancel: &Arc<AtomicBool>,
+        generation: u64,
+    ) -> Result<PreparedFileList, String> {
+        check_current(&self.inner, cancel, generation)?;
+        // 元動画など DirectOriginal だけでも、この API 自身が初期化を完了する。
+        ensure_process_directory(&self.inner)?;
+        check_current(&self.inner, cancel, generation)?;
+        let mut lease = reserve_file_list_path(&self.inner)?;
+        write_file_list(paths, lease.file_mut()?, || {
+            check_current(&self.inner, cancel, generation)
+        })?;
+        lease.flush()?;
+        lease.finish_file_list(cancel, generation)
     }
 
     pub fn materialize(
@@ -553,9 +612,29 @@ impl MaterializeSession {
         // 常に miss させる** (`lookup_reusable` が `modified_ns.is_some()` を要求する)。
         // 左右 2 source の stamp を単一 source 用 cache key へ不完全に畳まず、見開きは
         // 当面つねに worker で decode・合成し直す。
-        let source_stamp = match request.source.source_path() {
-            Some(path) => file_stamp(path)?,
-            None => FileStamp::default(),
+        let epub_read = if let MaterializeSource::PdfPage { pdf_path, .. } = &request.source {
+            if pdf_path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+            {
+                Some(
+                    crate::pdf_loader::resolve_read_target(pdf_path)
+                        .map_err(|error| format!("EPUB を読み取れません: {error:?}"))?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let source_stamp = if let Some(read) = epub_read.as_ref() {
+            generation_file_stamp(read)?
+        } else {
+            match request.source.source_path() {
+                Some(path) => file_stamp(path)?,
+                None => FileStamp::default(),
+            }
         };
 
         let edit_fingerprint = loaded_edits
@@ -568,6 +647,10 @@ impl MaterializeSession {
             policy: request.policy,
             pdf_render_long_edge,
             edit_fingerprint,
+            raw_brightness: request
+                .source
+                .has_raw_page()
+                .then_some(request.raw_brightness),
         };
         ensure_process_directory(&self.inner)?;
         if let Some(record) = lookup_reusable(&self.inner, &key, source_stamp) {
@@ -607,11 +690,19 @@ impl MaterializeSession {
                     {
                         decode_video_frame(path, *target_millis)?
                     } else {
+                        let raw = self.raw.as_ref().map(|raw| {
+                            crate::raw::RawDecodeContext::new(
+                                Arc::clone(&raw.executor),
+                                request.raw_brightness,
+                            )
+                        });
                         render_materialize_source(
                             &request.source,
                             loaded_edits.as_ref(),
                             pdf_render_long_edge,
                             cancel,
+                            raw.as_ref(),
+                            epub_read.as_ref(),
                         )?
                     };
                     check_current(&self.inner, cancel, generation)?;
@@ -634,33 +725,6 @@ impl MaterializeSession {
         lease.flush()?;
         check_current(&self.inner, cancel, generation)?;
         lease.finish(key, source_stamp)
-    }
-
-    /// worker で使う AI runtime。UI が既に持っていればそれを、無ければ worker が 1 度だけ作る。
-    ///
-    /// 消しゴム (MI-GAN) と AI 段が同じ 1 つを共有する。別々に作ると同じ GPU 上に
-    /// 2 つの session が並ぶ。
-    fn resolve_worker_ai_runtime(
-        &mut self,
-        context: &PageEditContext,
-    ) -> Option<Arc<crate::ai::runtime::AiRuntime>> {
-        if let Some(runtime) = context.ai_runtime.clone() {
-            return Some(runtime);
-        }
-        if self.worker_ai_runtime.is_none() {
-            self.worker_ai_runtime = crate::ai::runtime::AiRuntime::new_with_backend(
-                crate::ai::AiBackend::DirectMl,
-            )
-            .map(Arc::new)
-            .map_err(|error| {
-                crate::logger::log(format!(
-                    "materializer: AI runtime init failed; using diffusion fallback: {error}"
-                ));
-                error
-            })
-            .ok();
-        }
-        self.worker_ai_runtime.clone()
     }
 
     fn load_page_edits(
@@ -765,22 +829,33 @@ impl MaterializeSession {
         // 通さないページまで書き出せなくなる (レビュー N03)。実際に通すと決まった時点で
         // runner が失敗にする (レビュー R14)。
         let ai = match ai_materials {
-            Some(materials) => {
-                let runtime = self.resolve_worker_ai_runtime(context);
-                Some(crate::books::book_ai_snapshot(
-                    materials,
-                    runtime,
-                    params.clone(),
-                ))
-            }
+            Some(materials) => Some(crate::books::book_ai_snapshot(
+                materials,
+                Arc::clone(&context.ai_runtime_init),
+                params.clone(),
+            )),
             None => None,
         };
         let erase = erase_raw.map(|(bitmap, shapes, size)| {
-            let runtime = self.resolve_worker_ai_runtime(context);
+            let runtime_init = Arc::clone(&context.ai_runtime_init);
             let manager = Arc::clone(&context.ai_model_manager);
             let mono_tolerance = context.erase_mono_tolerance;
             let run: crate::books::BookEraseRunner =
                 Box::new(move |base, bitmap, shapes, cancel| {
+                    let runtime = match runtime_init
+                        .wait_terminal_while(|| !cancel.load(Ordering::Acquire))
+                    {
+                        crate::ai::runtime::AiRuntimeInitWait::Ready(runtime) => Some(runtime),
+                        crate::ai::runtime::AiRuntimeInitWait::Failed(error) => {
+                            crate::logger::log(format!(
+                                "materializer: erase AI runtime unavailable; using diffusion fallback: {error}"
+                            ));
+                            None
+                        }
+                        crate::ai::runtime::AiRuntimeInitWait::Cancelled => {
+                            return Err("消しゴム処理をキャンセルしました".to_owned());
+                        }
+                    };
                     let result = crate::ui_erase::erase_from_saved_mask(
                         runtime.as_ref(),
                         &manager,
@@ -917,6 +992,8 @@ fn render_materialize_source(
     edits: Option<&LoadedMaterializePageEdits>,
     pdf_render_long_edge: u32,
     cancel: &Arc<AtomicBool>,
+    raw: Option<&crate::raw::RawDecodeContext>,
+    epub_read: Option<&crate::pdf_loader::ReadTarget>,
 ) -> Result<egui::ColorImage, String> {
     match source {
         MaterializeSource::MergedSpread { left, right, .. } => {
@@ -929,8 +1006,16 @@ fn render_materialize_source(
                 }
                 None => (None, None),
             };
-            let left = render_materialize_page(left, left_edits, pdf_render_long_edge, cancel)?;
-            let right = render_materialize_page(right, right_edits, pdf_render_long_edge, cancel)?;
+            let left =
+                render_materialize_page(left, left_edits, pdf_render_long_edge, cancel, raw, None)?;
+            let right = render_materialize_page(
+                right,
+                right_edits,
+                pdf_render_long_edge,
+                cancel,
+                raw,
+                None,
+            )?;
             crate::capture::combine_spread_color_images(&left, &right)
         }
         _ => {
@@ -941,7 +1026,7 @@ fn render_materialize_source(
                 }
                 None => None,
             };
-            render_materialize_page(source, edits, pdf_render_long_edge, cancel)
+            render_materialize_page(source, edits, pdf_render_long_edge, cancel, raw, epub_read)
         }
     }
 }
@@ -951,12 +1036,16 @@ fn render_materialize_page(
     edits: Option<&LoadedPageEdits>,
     pdf_render_long_edge: u32,
     cancel: &Arc<AtomicBool>,
+    raw: Option<&crate::raw::RawDecodeContext>,
+    epub_read: Option<&crate::pdf_loader::ReadTarget>,
 ) -> Result<egui::ColorImage, String> {
     let source = composite_source(source)?;
-    let image = crate::books::decode_composite_source_for_materialization(
+    let image = crate::books::decode_composite_source_for_materialization_with_target(
         &source,
         pdf_render_long_edge,
         Arc::clone(cancel),
+        raw,
+        epub_read,
     )?;
     match edits {
         Some(edits) if edits.requires_composite => {
@@ -1120,33 +1209,95 @@ fn reserve_collision_path(
             format!("{stem}-{sequence}")
         };
         let path = inner.process_dir.join(name);
-        if state.reserved.contains(&path) {
-            continue;
-        }
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(file) => {
-                state.reserved.insert(path.clone());
-                return Ok(PendingTempLease {
-                    path,
-                    inner: Arc::clone(inner),
-                    file: Some(file),
-                    active: true,
-                });
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(format!(
-                    "一時ファイルを予約できません: {}: {error}",
-                    path.display()
-                ));
-            }
+        if let Some(lease) = try_reserve_temp_path(inner, &mut state, path)? {
+            return Ok(lease);
         }
     }
     Err("一時ファイル名の連番が上限に達しました".to_string())
+}
+
+fn reserve_file_list_path(inner: &Arc<MaterializerInner>) -> Result<PendingTempLease, String> {
+    validate_real_directory(&inner.process_dir, "一時フォルダー")?;
+    let mut state = inner
+        .state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    for _ in 0..10_000 {
+        let sequence = state.next_file_list_sequence;
+        state.next_file_list_sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| "一時リストファイル名の連番が上限に達しました".to_string())?;
+        let path = inner.process_dir.join(format!("file-list-{sequence}.txt"));
+        if let Some(lease) = try_reserve_temp_path(inner, &mut state, path)? {
+            return Ok(lease);
+        }
+    }
+    Err("一時リストファイル名の連番が上限に達しました".to_string())
+}
+
+fn try_reserve_temp_path(
+    inner: &Arc<MaterializerInner>,
+    state: &mut TempState,
+    path: PathBuf,
+) -> Result<Option<PendingTempLease>, String> {
+    if state.reserved.contains(&path) {
+        return Ok(None);
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(file) => {
+            state.reserved.insert(path.clone());
+            Ok(Some(PendingTempLease {
+                path,
+                inner: Arc::clone(inner),
+                file: Some(file),
+                active: true,
+            }))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+        Err(error) => Err(format!(
+            "一時ファイルを予約できません: {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn write_file_list(
+    paths: &[PathBuf],
+    writer: &mut impl std::io::Write,
+    mut ensure_current: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    for path in paths {
+        ensure_current()?;
+        // 元の OsStr を先に厳密検査する。absolute も canonicalize / lossy 変換しない。
+        validate_file_list_path(path)?;
+        let absolute = if path.is_absolute() {
+            path.clone()
+        } else {
+            std::path::absolute(path)
+                .map_err(|error| format!("リストのパスを絶対パスにできません: {error}"))?
+        };
+        let text = validate_file_list_path(&absolute)?;
+        writer
+            .write_all(text.as_bytes())
+            .and_then(|()| writer.write_all(b"\r\n"))
+            .map_err(|error| format!("一時リストファイルを書き込めません: {error}"))?;
+        ensure_current()?;
+    }
+    ensure_current()
+}
+
+fn validate_file_list_path(path: &Path) -> Result<&str, String> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| "リストへ渡すパスは Unicode で表現できません".to_string())?;
+    if text.contains(['\r', '\n', '\0']) {
+        return Err("リストへ渡すパスに CR / LF / NUL が含まれています".to_string());
+    }
+    Ok(text)
 }
 
 fn delete_request_owned_file(inner: &MaterializerInner, path: &Path) {
@@ -1206,6 +1357,25 @@ impl PendingTempLease {
             output_stamp,
         ))
     }
+
+    fn finish_file_list(
+        mut self,
+        cancel: &AtomicBool,
+        generation: u64,
+    ) -> Result<PreparedFileList, String> {
+        drop(self.file.take());
+        check_current(&self.inner, cancel, generation)?;
+        self.active = false;
+        Ok(PreparedFileList {
+            file: PreparedMaterializedFile {
+                path: self.path.clone(),
+                original: false,
+                ownership: PreparedOwnership::RequestOwnedArtifact {
+                    inner: Arc::clone(&self.inner),
+                },
+            },
+        })
+    }
 }
 
 impl Drop for PendingTempLease {
@@ -1248,6 +1418,21 @@ pub struct PreparedMaterializedFile {
     ownership: PreparedOwnership,
 }
 
+/// 再利用 cache を持たない要求所有のリスト。spawn 成功時だけ process 所有へ移す。
+pub struct PreparedFileList {
+    file: PreparedMaterializedFile,
+}
+
+impl PreparedFileList {
+    pub fn path(&self) -> &Path {
+        self.file.path()
+    }
+
+    pub fn transfer_to_process_directory(&mut self, keep_temp: bool) {
+        self.file.transfer_to_process_directory(keep_temp);
+    }
+}
+
 enum PreparedOwnership {
     Direct,
     /// Cache hit は既に process directory ownership へ移ったファイルを借りる。
@@ -1259,6 +1444,10 @@ enum PreparedOwnership {
         cache_key: CacheKey,
         source_stamp: FileStamp,
         output_stamp: FileStamp,
+    },
+    /// リストなど 1 起動専用の成果物。画像 cache key / stamp を持たず、再利用しない。
+    RequestOwnedArtifact {
+        inner: Arc<MaterializerInner>,
     },
     Transferred,
 }
@@ -1304,7 +1493,9 @@ impl PreparedOwnership {
         match self {
             Self::Direct => TempOwnershipStage::Direct,
             Self::ProcessOwnedReuse { .. } => TempOwnershipStage::ProcessOwned,
-            Self::RequestOwned { .. } => TempOwnershipStage::RequestOwned,
+            Self::RequestOwned { .. } | Self::RequestOwnedArtifact { .. } => {
+                TempOwnershipStage::RequestOwned
+            }
             Self::Transferred => TempOwnershipStage::Transferred,
         }
     }
@@ -1398,6 +1589,16 @@ impl PreparedMaterializedFile {
                     state.keep_paths.insert(self.path.clone());
                 }
             }
+            PreparedOwnership::RequestOwnedArtifact { inner } => {
+                let mut state = inner
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                state.reserved.remove(&self.path);
+                if keep_temp {
+                    state.keep_paths.insert(self.path.clone());
+                }
+            }
         }
     }
 }
@@ -1406,7 +1607,8 @@ impl Drop for PreparedMaterializedFile {
     fn drop(&mut self) {
         if temp_ownership_transition(self.ownership.stage(), TempOwnershipEvent::RequestDropped)
             == TempOwnershipTransition::DeleteRequestFile
-            && let PreparedOwnership::RequestOwned { inner, .. } = &self.ownership
+            && let PreparedOwnership::RequestOwned { inner, .. }
+            | PreparedOwnership::RequestOwnedArtifact { inner } = &self.ownership
         {
             delete_request_owned_file(inner, &self.path);
         }
@@ -1511,8 +1713,35 @@ fn cleanup_own_process_directory(inner: &MaterializerInner) {
     let _ = std::fs::remove_dir(&inner.process_dir);
 }
 
-fn orphan_pid(name: &str) -> Option<u32> {
-    name.strip_prefix("ext-")?.parse().ok()
+fn orphan_pid(name: &str) -> Option<(u32, bool)> {
+    if let Some(id) = name.strip_prefix("ext-") {
+        return id.parse().ok().map(|pid| (pid, false));
+    }
+    let (pid, nonce) = name.strip_prefix("epub-")?.split_once('-')?;
+    if nonce.is_empty() {
+        return None;
+    }
+    pid.parse().ok().map(|pid| (pid, true))
+}
+
+/// Shared root for disposable EPUB conversions. Each conversion owns a distinct
+/// `epub-<pid>-<nonce>` child; startup cleanup recognizes dead owners.
+pub(crate) fn epub_temp_root() -> PathBuf {
+    if cfg!(feature = "portable") {
+        crate::data_dir::get().join("temp")
+    } else {
+        std::env::temp_dir().join("mimageviewer")
+    }
+}
+
+/// Remove work directories left by a crashed sibling-PDF save. The worker output
+/// lives in the data directory; only dead PID owners are eligible for cleanup.
+pub(crate) fn cleanup_epub_sibling_work_startup(data_dir: &Path) {
+    cleanup_startup_directories(
+        &data_dir.join("epub_sibling_work"),
+        std::process::id(),
+        pid_is_alive,
+    );
 }
 
 fn startup_cleanup_candidates<I, F>(entries: I, current_pid: u32, mut alive: F) -> Vec<PathBuf>
@@ -1526,7 +1755,13 @@ where
             path.file_name()
                 .and_then(|name| name.to_str())
                 .and_then(orphan_pid)
-                .is_some_and(|pid| pid == current_pid || !alive(pid))
+                .is_some_and(|(pid, epub)| {
+                    if epub {
+                        pid != current_pid && !alive(pid)
+                    } else {
+                        pid == current_pid || !alive(pid)
+                    }
+                })
         })
         .collect()
 }
@@ -1558,7 +1793,7 @@ fn cleanup_startup_directories(root: &Path, current_pid: u32, alive: impl FnMut(
     }
 }
 
-fn remove_tree_without_following_links(path: &Path) -> std::io::Result<()> {
+pub(crate) fn remove_tree_without_following_links(path: &Path) -> std::io::Result<()> {
     let metadata = std::fs::symlink_metadata(path)?;
     if metadata_is_link_or_reparse(&metadata) {
         return std::fs::remove_dir(path).or_else(|_| std::fs::remove_file(path));
@@ -1585,7 +1820,7 @@ fn metadata_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
     }
 }
 
-fn validate_real_directory(path: &Path, label: &str) -> Result<(), String> {
+pub(crate) fn validate_real_directory(path: &Path, label: &str) -> Result<(), String> {
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|error| format!("{label}を確認できません: {}: {error}", path.display()))?;
     if metadata_is_link_or_reparse(&metadata) {
@@ -1655,6 +1890,92 @@ fn baked_params_and_lut(
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn raw_materialization_uses_request_brightness_and_never_reuses_old_brightness() {
+        let raw = crate::raw::RawDecodeContext::new(
+            Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap()),
+            crate::raw::RawBrightness::None,
+        );
+        let manager = Materializer::new_with_raw(raw);
+        let generation = manager.begin_generation();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let path = PathBuf::from("vendor/raw-samples/1018.cr2");
+        assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let mut request = MaterializeRequest {
+            source: MaterializeSource::File {
+                path,
+                image_page: true,
+            },
+            policy: MaterializePolicy::TempEdited,
+            page_edits: None,
+            pdf_render_long_edge: 4096,
+            raw_brightness: crate::raw::RawBrightness::MatchPreview,
+        };
+        let mut session = manager.session();
+        let mut first = session.materialize(&request, &cancel, generation).unwrap();
+        first.transfer_to_process_directory(false);
+        request.raw_brightness = crate::raw::RawBrightness::None;
+        let second = session.materialize(&request, &cancel, generation).unwrap();
+        assert_ne!(first.path(), second.path());
+        assert_ne!(
+            std::fs::read(first.path()).unwrap(),
+            std::fs::read(second.path()).unwrap()
+        );
+        request.raw_brightness = crate::raw::RawBrightness::MatchPreview;
+        let old_request = session.materialize(&request, &cancel, generation).unwrap();
+        assert_eq!(old_request.path(), first.path());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn raw_external_tool_materialization_uses_full_libraw_for_file_and_zip() {
+        let executor = Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap());
+        let raw = crate::raw::RawDecodeContext::new(executor, crate::raw::RawBrightness::None);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cr2 = PathBuf::from("vendor/raw-samples/1018.cr2");
+        assert!(cr2.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let file = render_materialize_source(
+            &MaterializeSource::File {
+                path: cr2.clone(),
+                image_page: true,
+            },
+            None,
+            4096,
+            &cancel,
+            Some(&raw),
+            None,
+        )
+        .unwrap();
+        let dims = crate::raw::raw_decoder::info(crate::raw::RawSource::Path(&cr2))
+            .unwrap()
+            .developed_dims;
+        assert_eq!(file.size, [dims[0] as usize, dims[1] as usize]);
+
+        let dng = PathBuf::from("vendor/raw-samples/885.dng");
+        assert!(dng.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let bytes = std::fs::read(&dng).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("pages.zip");
+        write_test_zip(&zip_path, "page.dng", &bytes);
+        let zip = render_materialize_source(
+            &MaterializeSource::ZipEntry {
+                zip_path,
+                entry_name: "page.dng".to_owned(),
+            },
+            None,
+            4096,
+            &cancel,
+            Some(&raw),
+            None,
+        )
+        .unwrap();
+        let dims = crate::raw::raw_decoder::info(crate::raw::RawSource::Bytes(&bytes))
+            .unwrap()
+            .developed_dims;
+        assert_eq!(zip.size, [dims[0] as usize, dims[1] as usize]);
+    }
+
     fn write_test_zip(path: &Path, entry_name: &str, bytes: &[u8]) {
         use std::io::Write as _;
         let file = std::fs::File::create(path).unwrap();
@@ -1668,6 +1989,7 @@ mod tests {
 
     fn zip_request(path: &Path, entry_name: &str) -> MaterializeRequest {
         MaterializeRequest {
+            raw_brightness: crate::raw::RawBrightness::default(),
             source: MaterializeSource::ZipEntry {
                 zip_path: path.to_path_buf(),
                 entry_name: entry_name.to_string(),
@@ -1698,7 +2020,9 @@ mod tests {
             conceal_preset: crate::conceal::ConcealPreset::default(),
             erase_mono_tolerance: 0,
             comic_source_dims: None,
-            ai_runtime: None,
+            ai_runtime_init: crate::ai::runtime::AiRuntimeInitOwner::failed_for_test(
+                "materializer test runtime unavailable",
+            ),
             ai_model_manager: std::sync::Arc::new(crate::ai::model_manager::ModelManager::new()),
             ai_materials: None,
             load_page_params_from_db,
@@ -1943,6 +2267,7 @@ mod tests {
         let generation = manager.begin_generation();
         let cancel = Arc::new(AtomicBool::new(false));
         let request = MaterializeRequest {
+            raw_brightness: crate::raw::RawBrightness::default(),
             source: MaterializeSource::MergedSpread {
                 label: "page04_page05".to_string(),
                 left: Box::new(MaterializeSource::File {
@@ -2029,12 +2354,14 @@ mod tests {
             left: loaded_stage(crate::bake_stage::BakeStage::Edits),
             right: loaded_stage(crate::bake_stage::BakeStage::Edits),
         };
-        let plain = render_materialize_source(&source, Some(&edits), 4096, &cancel).unwrap();
+        let plain =
+            render_materialize_source(&source, Some(&edits), 4096, &cancel, None, None).unwrap();
         let display = LoadedMaterializePageEdits::Spread {
             left: loaded_stage(crate::bake_stage::BakeStage::DisplayAdjust),
             right: loaded_stage(crate::bake_stage::BakeStage::DisplayAdjust),
         };
-        let adjusted = render_materialize_source(&source, Some(&display), 4096, &cancel).unwrap();
+        let adjusted =
+            render_materialize_source(&source, Some(&display), 4096, &cancel, None, None).unwrap();
 
         assert_eq!(plain.size, adjusted.size);
         assert_ne!(plain.pixels, adjusted.pixels);
@@ -2095,6 +2422,20 @@ mod tests {
             vec![PathBuf::from("ext-99")],
             "the current PID directory predates this process and must be reclaimed before use"
         );
+        assert_eq!(
+            startup_cleanup_candidates(
+                vec![
+                    PathBuf::from("epub-10-1"),
+                    PathBuf::from("epub-20-2"),
+                    PathBuf::from("epub-99-3"),
+                    PathBuf::from("epub-invalid-4")
+                ],
+                99,
+                |pid| pid == 10,
+            ),
+            vec![PathBuf::from("epub-20-2")],
+            "a live conversion owned by this PID must survive asynchronous startup cleanup"
+        );
     }
 
     #[test]
@@ -2134,6 +2475,441 @@ mod tests {
                 .ensure_current(&AtomicBool::new(false), current)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn file_list_writes_exact_utf8_crlf_absolute_paths_without_quoting() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = Materializer::new_at(temp.path().join("materialized"), 100, false);
+        let generation = manager.begin_generation();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut paths = vec![
+            temp.path().join("日本語 空白 😀.jpg"),
+            PathBuf::from("relative folder").join("不存在.jpg"),
+        ];
+        #[cfg(windows)]
+        paths.push(PathBuf::from(r"\\server\共有\with space\😀.png"));
+        let expected: Vec<u8> = paths
+            .iter()
+            .flat_map(|path| {
+                let absolute = if path.is_absolute() {
+                    path.clone()
+                } else {
+                    std::env::current_dir().unwrap().join(path)
+                };
+                format!("{}\r\n", absolute.to_str().unwrap()).into_bytes()
+            })
+            .collect();
+        let list = manager
+            .session()
+            .create_file_list(&paths, &cancel, generation)
+            .unwrap();
+        assert_eq!(std::fs::read(list.path()).unwrap(), expected);
+        assert_eq!(list.path().file_name().unwrap(), "file-list-0.txt");
+        assert!(manager.inner.state.lock().unwrap().cache.is_empty());
+    }
+
+    #[test]
+    fn file_list_refuses_unrepresentable_paths_and_deletes_partial_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = Materializer::new_at(temp.path().join("materialized"), 101, false);
+        let generation = manager.begin_generation();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let invalid_paths = ["bad\rname.jpg", "bad\nname.jpg", "bad\0name.jpg"];
+        for invalid in invalid_paths {
+            let paths = [temp.path().join("valid.jpg"), PathBuf::from(invalid)];
+            let error = manager
+                .session()
+                .create_file_list(&paths, &cancel, generation)
+                .err()
+                .expect("an invalid line must reject the whole launch");
+            assert!(error.contains("CR / LF / NUL"));
+            assert_eq!(
+                std::fs::read_dir(&manager.inner.process_dir)
+                    .unwrap()
+                    .count(),
+                0
+            );
+            assert!(manager.inner.state.lock().unwrap().reserved.is_empty());
+        }
+        #[cfg(windows)]
+        let invalid_unicode = {
+            use std::os::windows::ffi::OsStringExt as _;
+            std::ffi::OsString::from_wide(&[b'a' as u16, 0xd800, b'b' as u16])
+        };
+        #[cfg(not(windows))]
+        let invalid_unicode = {
+            use std::os::unix::ffi::OsStringExt as _;
+            std::ffi::OsString::from_vec(vec![b'a', 0xff, b'b'])
+        };
+        let error = manager
+            .session()
+            .create_file_list(&[PathBuf::from(invalid_unicode)], &cancel, generation)
+            .err()
+            .expect("non-Unicode paths must not undergo lossy conversion");
+        assert!(error.contains("Unicode"));
+        assert_eq!(
+            std::fs::read_dir(&manager.inner.process_dir)
+                .unwrap()
+                .count(),
+            0
+        );
+        assert!(manager.inner.state.lock().unwrap().reserved.is_empty());
+    }
+
+    #[test]
+    fn file_list_never_reuses_names_or_overwrites_prior_or_foreign_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = Materializer::new_at(temp.path().join("materialized"), 102, false);
+        let generation = manager.begin_generation();
+        let cancel = Arc::new(AtomicBool::new(false));
+        ensure_process_directory(&manager.inner).unwrap();
+        let foreign = manager.inner.process_dir.join("file-list-0.txt");
+        std::fs::write(&foreign, b"foreign").unwrap();
+        let mut session = manager.session();
+        let paths = [temp.path().join("first.jpg")];
+        let mut first = session
+            .create_file_list(&paths, &cancel, generation)
+            .unwrap();
+        let first_path = first.path().to_path_buf();
+        let first_bytes = std::fs::read(&first_path).unwrap();
+        assert_eq!(first_path.file_name().unwrap(), "file-list-1.txt");
+        first.transfer_to_process_directory(false);
+        drop(first);
+        let second = session
+            .create_file_list(&[temp.path().join("second.jpg")], &cancel, generation)
+            .unwrap();
+        let second_path = second.path().to_path_buf();
+        assert_ne!(second_path, first_path);
+        assert_ne!(std::fs::read(&second_path).unwrap(), first_bytes);
+        drop(second);
+        let third = session
+            .create_file_list(&paths, &cancel, generation)
+            .unwrap();
+        assert_ne!(
+            third.path(),
+            second_path,
+            "deleted lists cannot be reused either"
+        );
+        assert_eq!(std::fs::read(&first_path).unwrap(), first_bytes);
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"foreign");
+        assert!(manager.inner.state.lock().unwrap().cache.is_empty());
+    }
+
+    #[test]
+    fn file_list_drop_transfer_and_keep_follow_media_lifetime() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manager = Materializer::new_at(temp.path().join("materialized"), 103, false);
+        let generation = manager.begin_generation();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let paths = [temp.path().join("page.jpg")];
+        let mut session = manager.session();
+        let dropped = session
+            .create_file_list(&paths, &cancel, generation)
+            .unwrap();
+        let dropped_path = dropped.path().to_path_buf();
+        drop(dropped);
+        assert!(!dropped_path.exists());
+        let mut normal = session
+            .create_file_list(&paths, &cancel, generation)
+            .unwrap();
+        let normal_path = normal.path().to_path_buf();
+        normal.transfer_to_process_directory(false);
+        drop(normal);
+        let mut kept = session
+            .create_file_list(&paths, &cancel, generation)
+            .unwrap();
+        let kept_path = kept.path().to_path_buf();
+        kept.transfer_to_process_directory(true);
+        kept.transfer_to_process_directory(true);
+        drop(kept);
+        assert!(normal_path.exists());
+        assert!(kept_path.exists());
+        assert!(manager.inner.state.lock().unwrap().reserved.is_empty());
+        manager.shutdown();
+        assert!(!normal_path.exists());
+        assert!(kept_path.exists());
+        assert!(manager.inner.state.lock().unwrap().cache.is_empty());
+    }
+
+    #[test]
+    fn file_list_cancel_and_supersession_reject_before_reserving_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = Materializer::new_at(temp.path().join("materialized"), 104, false);
+        let generation = manager.begin_generation();
+        let cancel = Arc::new(AtomicBool::new(true));
+        let paths = [temp.path().join("page.jpg")];
+        assert!(
+            manager
+                .session()
+                .create_file_list(&paths, &cancel, generation)
+                .is_err()
+        );
+        cancel.store(false, Ordering::Release);
+        manager.begin_generation();
+        assert!(
+            manager
+                .session()
+                .create_file_list(&paths, &cancel, generation)
+                .is_err()
+        );
+        assert!(!manager.inner.process_dir.exists());
+        assert!(manager.inner.state.lock().unwrap().reserved.is_empty());
+    }
+
+    #[test]
+    fn file_list_checks_cancel_during_writing_and_releases_the_partial_lease() {
+        struct CancellingWriter<'a> {
+            file: &'a mut std::fs::File,
+            cancel: &'a AtomicBool,
+        }
+        impl std::io::Write for CancellingWriter<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let written = self.file.write(bytes)?;
+                self.cancel.store(true, Ordering::Release);
+                Ok(written)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.file.flush()
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let manager = Materializer::new_at(temp.path().join("materialized"), 105, false);
+        let generation = manager.begin_generation();
+        let cancel = AtomicBool::new(false);
+        ensure_process_directory(&manager.inner).unwrap();
+        let mut lease = reserve_file_list_path(&manager.inner).unwrap();
+        let path = lease.path().to_path_buf();
+        let result = write_file_list(
+            &[
+                temp.path().join("first.jpg"),
+                temp.path().join("second.jpg"),
+            ],
+            &mut CancellingWriter {
+                file: lease.file_mut().unwrap(),
+                cancel: &cancel,
+            },
+            || check_current(&manager.inner, &cancel, generation),
+        );
+        assert!(result.is_err());
+        assert!(!std::fs::read(&path).unwrap().is_empty());
+        drop(lease);
+        assert!(!path.exists());
+        assert!(manager.inner.state.lock().unwrap().reserved.is_empty());
+    }
+
+    #[test]
+    fn file_list_write_failure_releases_reservation_without_caching_output() {
+        struct FailingWriter;
+        impl std::io::Write for FailingWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    "fake disk full",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let manager = Materializer::new_at(temp.path().join("materialized"), 106, false);
+        ensure_process_directory(&manager.inner).unwrap();
+        let lease = reserve_file_list_path(&manager.inner).unwrap();
+        let path = lease.path().to_path_buf();
+        let error = write_file_list(&[temp.path().join("page.jpg")], &mut FailingWriter, || {
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.contains("fake disk full"));
+        drop(lease);
+        assert!(!path.exists());
+        let state = manager.inner.state.lock().unwrap();
+        assert!(state.reserved.is_empty());
+        assert!(state.cache.is_empty());
+    }
+
+    #[test]
+    fn file_list_cancel_or_supersession_after_writing_deletes_the_closed_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = Materializer::new_at(temp.path().join("materialized"), 110, false);
+        ensure_process_directory(&manager.inner).unwrap();
+        for supersede in [false, true] {
+            let generation = manager.begin_generation();
+            let cancel = AtomicBool::new(false);
+            let mut lease = reserve_file_list_path(&manager.inner).unwrap();
+            let path = lease.path().to_path_buf();
+            write_file_list(
+                &[temp.path().join("page.jpg")],
+                lease.file_mut().unwrap(),
+                || check_current(&manager.inner, &cancel, generation),
+            )
+            .unwrap();
+            lease.flush().unwrap();
+            assert!(path.exists());
+            if supersede {
+                manager.begin_generation();
+            } else {
+                cancel.store(true, Ordering::Release);
+            }
+            assert!(lease.finish_file_list(&cancel, generation).is_err());
+            assert!(!path.exists());
+            assert!(manager.inner.state.lock().unwrap().reserved.is_empty());
+        }
+    }
+
+    #[test]
+    fn file_list_initializes_after_first_direct_original_video() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("first.mp4");
+        std::fs::write(&source, b"video path only, no decoder involved").unwrap();
+        let manager = Materializer::new_at(temp.path().join("materialized"), 107, false);
+        let generation = manager.begin_generation();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let request = MaterializeRequest {
+            source: MaterializeSource::File {
+                path: source.clone(),
+                image_page: false,
+            },
+            raw_brightness: crate::raw::RawBrightness::default(),
+            policy: MaterializePolicy::TempOriginal,
+            page_edits: None,
+            pdf_render_long_edge: 4096,
+        };
+        let mut session = manager.session();
+        let original = session.materialize(&request, &cancel, generation).unwrap();
+        assert!(original.is_original());
+        assert!(!manager.inner.process_dir.exists());
+        let list = session
+            .create_file_list(&[original.path().to_path_buf()], &cancel, generation)
+            .unwrap();
+        assert_eq!(
+            std::fs::read(list.path()).unwrap(),
+            format!("{}\r\n", source.to_str().unwrap()).as_bytes()
+        );
+        assert!(manager.inner.state.lock().unwrap().initialized);
+    }
+
+    #[test]
+    fn file_list_initialization_failure_never_reserves_or_writes_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let blocked_root = temp.path().join("not-a-directory");
+        std::fs::write(&blocked_root, b"keep").unwrap();
+        let manager = Materializer::new_at(blocked_root.clone(), 108, false);
+        let generation = manager.begin_generation();
+        let cancel = Arc::new(AtomicBool::new(false));
+        assert!(
+            manager
+                .session()
+                .create_file_list(&[temp.path().join("page.jpg")], &cancel, generation)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&blocked_root).unwrap(), b"keep");
+        let state = manager.inner.state.lock().unwrap();
+        assert!(!state.initialized);
+        assert!(state.reserved.is_empty());
+    }
+
+    #[test]
+    fn file_list_initialization_refuses_preexisting_process_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = Materializer::new_at(temp.path().join("materialized"), 111, false);
+        std::fs::create_dir_all(&manager.inner.process_dir).unwrap();
+        let sentinel = manager.inner.process_dir.join("file-list-0.txt");
+        std::fs::write(&sentinel, b"prior process output").unwrap();
+        let generation = manager.begin_generation();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let error = manager
+            .session()
+            .create_file_list(&[temp.path().join("page.jpg")], &cancel, generation)
+            .err()
+            .expect("a preexisting process directory is not safe to reuse");
+        assert!(error.contains("安全のため再利用しません"));
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"prior process output");
+        assert!(!manager.inner.state.lock().unwrap().initialized);
+        assert!(manager.inner.state.lock().unwrap().reserved.is_empty());
+    }
+
+    #[test]
+    fn file_list_uses_configured_normal_and_portable_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        for root in [
+            temp.path().join("normal-temp").join("mimageviewer"),
+            temp.path().join("portable-data").join("temp"),
+        ] {
+            let manager = Materializer::new_at(root.clone(), 109, false);
+            let generation = manager.begin_generation();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let list = manager
+                .session()
+                .create_file_list(&[temp.path().join("page.jpg")], &cancel, generation)
+                .unwrap();
+            assert_eq!(list.path().parent().unwrap(), root.join("ext-109"));
+            assert!(list.path().exists());
+        }
+    }
+
+    #[test]
+    fn epub_materializer_stamp_changes_with_generation_not_source_attributes() {
+        let path = Path::new("book.epub");
+        let first = crate::pdf_loader::generation_target_for_test(path, 17, 4096);
+        let second = crate::pdf_loader::generation_target_for_test(path, 18, 4096);
+        assert_eq!(
+            generation_file_stamp(&first).unwrap(),
+            FileStamp {
+                modified_ns: Some(17),
+                size: 4096,
+            }
+        );
+        assert_ne!(
+            generation_file_stamp(&first).unwrap(),
+            generation_file_stamp(&second).unwrap()
+        );
+    }
+
+    #[test]
+    fn reconverted_epub_materializer_reuses_only_current_generation_output() {
+        let fixture = crate::epub_cache::reconverted_for_worker_test();
+        let temp = tempfile::tempdir().unwrap();
+        let manager = Materializer::new_at(temp.path().join("materialized"), 93, false);
+        let generation = manager.begin_generation();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let request = MaterializeRequest {
+            raw_brightness: crate::raw::RawBrightness::default(),
+            source: MaterializeSource::PdfPage {
+                pdf_path: fixture.source.clone(),
+                page_num: 0,
+                password: None,
+            },
+            policy: MaterializePolicy::TempOriginal,
+            page_edits: None,
+            pdf_render_long_edge: 4096,
+        };
+        ensure_process_directory(&manager.inner).unwrap();
+        let output = manager.inner.process_dir.join("current.png");
+        std::fs::write(&output, b"already rendered in this run").unwrap();
+        let key = CacheKey {
+            raw_brightness: None,
+            source: request.source.clone(),
+            policy: request.policy,
+            pdf_render_long_edge: 4096,
+            edit_fingerprint: [0; 32],
+        };
+        let read = crate::pdf_loader::pinned_epub_target(&fixture.source).unwrap();
+        manager.inner.state.lock().unwrap().cache.insert(
+            key,
+            CacheRecord {
+                path: output.clone(),
+                source_stamp: generation_file_stamp(&read).unwrap(),
+                output_stamp: file_stamp(&output).unwrap(),
+            },
+        );
+        let prepared = manager
+            .session()
+            .materialize(&request, &cancel, generation)
+            .unwrap();
+        assert_eq!(prepared.path(), output);
+        assert_ne!(fixture.old.page_count, fixture.current.page_count);
     }
 
     #[test]
@@ -2227,6 +3003,7 @@ mod tests {
         let generation = manager.begin_generation();
         let cancel = Arc::new(AtomicBool::new(false));
         let request = MaterializeRequest {
+            raw_brightness: crate::raw::RawBrightness::default(),
             source: MaterializeSource::File {
                 path: source.clone(),
                 image_page: true,
@@ -2422,6 +3199,7 @@ mod tests {
         std::fs::write(&path, b"png").unwrap();
         let stamp = file_stamp(&path).unwrap();
         let key = CacheKey {
+            raw_brightness: None,
             source: MaterializeSource::File {
                 path: temp.path().join("source.png"),
                 image_page: true,
@@ -2451,6 +3229,7 @@ mod tests {
         std::fs::write(&path, b"png").unwrap();
         let stamp = file_stamp(&path).unwrap();
         let key = CacheKey {
+            raw_brightness: None,
             source: MaterializeSource::File {
                 path: temp.path().join("source.png"),
                 image_page: true,

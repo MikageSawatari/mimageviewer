@@ -537,6 +537,7 @@ impl RingDirection {
 pub enum RingActionId {
     None,
     AddToBook,
+    AddToCollection,
     PinRepresentativeThumb,
     ToggleDetachedViewer,
     ToggleWindowMode,
@@ -609,6 +610,7 @@ pub enum RingActionId {
     GridToggleSnapshotLock,
     GridToggleCheck,
     GridSelectAll,
+    GridOrganizeFiles,
     GridOpenSelectedAsPage,
     GridOpenSelectedAsList,
     GridScrollTop,
@@ -625,6 +627,16 @@ pub enum RingActionId {
     GridColumnCount8,
     GridColumnCount9,
     GridColumnCount10,
+    GridColumnCount11,
+    GridColumnCount12,
+    GridColumnCount13,
+    GridColumnCount14,
+    GridColumnCount15,
+    GridColumnCount16,
+    GridColumnCount17,
+    GridColumnCount18,
+    GridColumnCount19,
+    GridColumnCount20,
     GridHistoryBack,
     GridHistoryForward,
     GridParentFolder,
@@ -646,6 +658,7 @@ pub enum RingActionId {
     ImageZoomMode,
     ImagePixelGrid,
     ImageBackgroundCycle,
+    ImageFitModeCycle,
     ImageComparePin,
     ImageCopyToClipboard,
     ImageOpenFolder,
@@ -937,6 +950,7 @@ impl RingActionId {
         match self {
             Self::None => "none",
             Self::AddToBook => "add_to_book",
+            Self::AddToCollection => "add_to_collection",
             Self::PinRepresentativeThumb => "pin_representative_thumb",
             Self::ToggleDetachedViewer => "toggle_detached_viewer",
             Self::ToggleWindowMode => "toggle_window_mode",
@@ -1009,6 +1023,7 @@ impl RingActionId {
             Self::GridToggleSnapshotLock => "grid_toggle_snapshot_lock",
             Self::GridToggleCheck => "grid_toggle_check",
             Self::GridSelectAll => "grid_select_all",
+            Self::GridOrganizeFiles => "grid_organize_files",
             Self::GridOpenSelectedAsPage => "grid_open_selected_as_page",
             Self::GridOpenSelectedAsList => "grid_open_selected_as_list",
             Self::GridScrollTop => "grid_scroll_top",
@@ -1025,6 +1040,16 @@ impl RingActionId {
             Self::GridColumnCount8 => "grid_column_count_8",
             Self::GridColumnCount9 => "grid_column_count_9",
             Self::GridColumnCount10 => "grid_column_count_10",
+            Self::GridColumnCount11 => "grid_column_count_11",
+            Self::GridColumnCount12 => "grid_column_count_12",
+            Self::GridColumnCount13 => "grid_column_count_13",
+            Self::GridColumnCount14 => "grid_column_count_14",
+            Self::GridColumnCount15 => "grid_column_count_15",
+            Self::GridColumnCount16 => "grid_column_count_16",
+            Self::GridColumnCount17 => "grid_column_count_17",
+            Self::GridColumnCount18 => "grid_column_count_18",
+            Self::GridColumnCount19 => "grid_column_count_19",
+            Self::GridColumnCount20 => "grid_column_count_20",
             Self::GridHistoryBack => "grid_history_back",
             Self::GridHistoryForward => "grid_history_forward",
             Self::GridParentFolder => "grid_parent_folder",
@@ -1046,6 +1071,7 @@ impl RingActionId {
             Self::ImageZoomMode => "image_zoom_mode",
             Self::ImagePixelGrid => "image_pixel_grid",
             Self::ImageBackgroundCycle => "image_background_cycle",
+            Self::ImageFitModeCycle => "image_fit_mode_cycle",
             Self::ImageComparePin => "image_compare_pin",
             Self::ImageCopyToClipboard => "image_copy_to_clipboard",
             Self::ImageOpenFolder => "image_open_folder",
@@ -1086,6 +1112,7 @@ impl RingActionId {
         Some(match key.as_str() {
             "none" | "" => Self::None,
             "add_to_book" => Self::AddToBook,
+            "add_to_collection" => Self::AddToCollection,
             "pin_representative_thumb" => Self::PinRepresentativeThumb,
             "toggle_detached_viewer" => Self::ToggleDetachedViewer,
             "toggle_window_mode" => Self::ToggleWindowMode,
@@ -1114,6 +1141,7 @@ impl RingActionId {
             "grid_toggle_snapshot_lock" => Self::GridToggleSnapshotLock,
             "grid_toggle_check" => Self::GridToggleCheck,
             "grid_select_all" => Self::GridSelectAll,
+            "grid_organize_files" => Self::GridOrganizeFiles,
             "grid_open_selected_as_page" => Self::GridOpenSelectedAsPage,
             "grid_open_selected_as_list" => Self::GridOpenSelectedAsList,
             "grid_scroll_top" => Self::GridScrollTop,
@@ -1130,6 +1158,16 @@ impl RingActionId {
             "grid_column_count_8" => Self::GridColumnCount8,
             "grid_column_count_9" => Self::GridColumnCount9,
             "grid_column_count_10" => Self::GridColumnCount10,
+            "grid_column_count_11" => Self::GridColumnCount11,
+            "grid_column_count_12" => Self::GridColumnCount12,
+            "grid_column_count_13" => Self::GridColumnCount13,
+            "grid_column_count_14" => Self::GridColumnCount14,
+            "grid_column_count_15" => Self::GridColumnCount15,
+            "grid_column_count_16" => Self::GridColumnCount16,
+            "grid_column_count_17" => Self::GridColumnCount17,
+            "grid_column_count_18" => Self::GridColumnCount18,
+            "grid_column_count_19" => Self::GridColumnCount19,
+            "grid_column_count_20" => Self::GridColumnCount20,
             "grid_history_back" => Self::GridHistoryBack,
             "grid_history_forward" => Self::GridHistoryForward,
             "grid_parent_folder" => Self::GridParentFolder,
@@ -1151,6 +1189,7 @@ impl RingActionId {
             "image_zoom_mode" => Self::ImageZoomMode,
             "image_pixel_grid" => Self::ImagePixelGrid,
             "image_background_cycle" => Self::ImageBackgroundCycle,
+            "image_fit_mode_cycle" => Self::ImageFitModeCycle,
             "image_compare_pin" => Self::ImageComparePin,
             "image_copy_to_clipboard" => Self::ImageCopyToClipboard,
             "image_open_folder" => Self::ImageOpenFolder,
@@ -1197,6 +1236,7 @@ impl RingActionId {
                 RingShortcutContext::VideoFullscreen => "本棚に追加 (フレーム)",
                 _ => "本棚に追加",
             },
+            Self::AddToCollection => "追加先のコレクションに追加",
             Self::PinRepresentativeThumb => match context {
                 RingShortcutContext::VideoFullscreen => "代表フレームにピン留め",
                 _ => "代表サムネにピン留め",
@@ -1276,6 +1316,7 @@ impl RingActionId {
             Self::GridToggleSnapshotLock => "★固定",
             Self::GridToggleCheck => "チェック ON/OFF",
             Self::GridSelectAll => "表示中を全チェック",
+            Self::GridOrganizeFiles => "ファイル整理先…",
             Self::GridOpenSelectedAsPage => "ページを開く",
             Self::GridOpenSelectedAsList => "一覧を開く",
             Self::GridScrollTop => "一覧の先頭へスクロール",
@@ -1292,6 +1333,16 @@ impl RingActionId {
             Self::GridColumnCount8 => "サムネイル 8列",
             Self::GridColumnCount9 => "サムネイル 9列",
             Self::GridColumnCount10 => "サムネイル 10列",
+            Self::GridColumnCount11 => "サムネイル 11列",
+            Self::GridColumnCount12 => "サムネイル 12列",
+            Self::GridColumnCount13 => "サムネイル 13列",
+            Self::GridColumnCount14 => "サムネイル 14列",
+            Self::GridColumnCount15 => "サムネイル 15列",
+            Self::GridColumnCount16 => "サムネイル 16列",
+            Self::GridColumnCount17 => "サムネイル 17列",
+            Self::GridColumnCount18 => "サムネイル 18列",
+            Self::GridColumnCount19 => "サムネイル 19列",
+            Self::GridColumnCount20 => "サムネイル 20列",
             Self::GridHistoryBack => "フォルダ履歴 戻る",
             Self::GridHistoryForward => "フォルダ履歴 進む",
             Self::GridParentFolder => "親フォルダへ",
@@ -1313,6 +1364,7 @@ impl RingActionId {
             Self::ImageZoomMode => "全画面ズームモード",
             Self::ImagePixelGrid => "ピクセルグリッド",
             Self::ImageBackgroundCycle => "背景色サイクル",
+            Self::ImageFitModeCycle => "ズーム/フィット方式を切り替える",
             Self::ImageComparePin => "比較ピン",
             Self::ImageCopyToClipboard => "画像をクリップボードにコピー",
             Self::ImageOpenFolder => "フォルダを開く",
@@ -1353,12 +1405,14 @@ impl RingActionId {
                     | Self::ClearRecentFolders
                     | Self::ClearQuickFolderSlots
                     | Self::AddToBook
+                    | Self::AddToCollection
                     | Self::PinRepresentativeThumb
                     | Self::CycleFavorite
                     | Self::GridToggleDetails
                     | Self::GridToggleSnapshotLock
                     | Self::GridToggleCheck
                     | Self::GridSelectAll
+                    | Self::GridOrganizeFiles
                     | Self::GridOpenSelectedAsPage
                     | Self::GridOpenSelectedAsList
                     | Self::GridScrollTop
@@ -1375,6 +1429,16 @@ impl RingActionId {
                     | Self::GridColumnCount8
                     | Self::GridColumnCount9
                     | Self::GridColumnCount10
+                    | Self::GridColumnCount11
+                    | Self::GridColumnCount12
+                    | Self::GridColumnCount13
+                    | Self::GridColumnCount14
+                    | Self::GridColumnCount15
+                    | Self::GridColumnCount16
+                    | Self::GridColumnCount17
+                    | Self::GridColumnCount18
+                    | Self::GridColumnCount19
+                    | Self::GridColumnCount20
                     | Self::GridHistoryBack
                     | Self::GridHistoryForward
                     | Self::GridParentFolder
@@ -1387,6 +1451,7 @@ impl RingActionId {
                 self,
                 Self::None
                     | Self::AddToBook
+                    | Self::AddToCollection
                     | Self::PinRepresentativeThumb
                     | Self::ToggleDetachedViewer
                     | Self::ToggleWindowMode
@@ -1414,6 +1479,7 @@ impl RingActionId {
                     | Self::ImageZoomMode
                     | Self::ImagePixelGrid
                     | Self::ImageBackgroundCycle
+                    | Self::ImageFitModeCycle
                     | Self::ImageComparePin
                     | Self::ImageCopyToClipboard
                     | Self::ImageOpenFolder
@@ -1424,6 +1490,7 @@ impl RingActionId {
                 self,
                 Self::None
                     | Self::AddToBook
+                    | Self::AddToCollection
                     | Self::PinRepresentativeThumb
                     | Self::ToggleDetachedViewer
                     | Self::ToggleWindowMode
@@ -1462,33 +1529,20 @@ impl RingActionId {
 
     /// Whether this action may be selected for a physical Back / Forward / Middle button.
     ///
-    /// This is intentionally separate from [`Self::is_valid_for_mouse_button_context`]. The
-    /// latter is the serialized-data contract used by `MouseButtonProfile::sanitize`; keeping
-    /// the six video seek values valid lets a future version restore the feature without erasing
-    /// an existing user's choice. v3.7 does not offer or execute those choices because some mouse
-    /// drivers deliver one physical press through more than one browser-navigation producer.
+    /// Assignment and execution share the serialized context-validity contract. Video seek is
+    /// exposed for the next-version verification build while producer provenance remains opt-in;
+    /// this policy must not add route-specific filtering or erase an existing user's choice.
     pub fn is_available_for_mouse_button_assignment(&self, context: RingShortcutContext) -> bool {
         self.is_valid_for_mouse_button_context(context)
-            && !(context == RingShortcutContext::VideoFullscreen
-                && self.is_configurable_video_seek_action())
-    }
-
-    pub fn is_configurable_video_seek_action(&self) -> bool {
-        matches!(
-            self,
-            Self::VideoSeekBackSmall
-                | Self::VideoSeekForwardSmall
-                | Self::VideoSeekBackMedium
-                | Self::VideoSeekForwardMedium
-                | Self::VideoSeekBackLarge
-                | Self::VideoSeekForwardLarge
-        )
     }
 
     pub fn is_valid_for_right_drag_context(&self, context: RightDragContext) -> bool {
         self.is_valid_for_context(context.gesture_action_context())
             && !(context == RightDragContext::EditMode
-                && matches!(self, Self::CloseMainWindow | Self::QuitApplication))
+                && matches!(
+                    self,
+                    Self::CloseMainWindow | Self::QuitApplication | Self::ImageFitModeCycle
+                ))
     }
 
     pub fn available_for_context(context: RingShortcutContext) -> Vec<Self> {
@@ -1504,12 +1558,14 @@ impl RingActionId {
                 Self::ClearRecentFolders,
                 Self::ClearQuickFolderSlots,
                 Self::AddToBook,
+                Self::AddToCollection,
                 Self::PinRepresentativeThumb,
                 Self::CycleFavorite,
                 Self::GridToggleDetails,
                 Self::GridToggleSnapshotLock,
                 Self::GridToggleCheck,
                 Self::GridSelectAll,
+                Self::GridOrganizeFiles,
                 Self::GridOpenSelectedAsPage,
                 Self::GridOpenSelectedAsList,
                 Self::GridScrollTop,
@@ -1526,6 +1582,16 @@ impl RingActionId {
                 Self::GridColumnCount8,
                 Self::GridColumnCount9,
                 Self::GridColumnCount10,
+                Self::GridColumnCount11,
+                Self::GridColumnCount12,
+                Self::GridColumnCount13,
+                Self::GridColumnCount14,
+                Self::GridColumnCount15,
+                Self::GridColumnCount16,
+                Self::GridColumnCount17,
+                Self::GridColumnCount18,
+                Self::GridColumnCount19,
+                Self::GridColumnCount20,
                 Self::GridHistoryBack,
                 Self::GridHistoryForward,
                 Self::GridParentFolder,
@@ -1537,6 +1603,7 @@ impl RingActionId {
             RingShortcutContext::ImageFullscreen => vec![
                 Self::None,
                 Self::AddToBook,
+                Self::AddToCollection,
                 Self::PinRepresentativeThumb,
                 Self::ToggleWindowMode,
                 Self::ToggleDetachedViewer,
@@ -1564,6 +1631,7 @@ impl RingActionId {
                 Self::ImageZoomMode,
                 Self::ImagePixelGrid,
                 Self::ImageBackgroundCycle,
+                Self::ImageFitModeCycle,
                 Self::ImageComparePin,
                 Self::ImageCopyToClipboard,
                 Self::ImageOpenFolder,
@@ -1573,6 +1641,7 @@ impl RingActionId {
             RingShortcutContext::VideoFullscreen => vec![
                 Self::None,
                 Self::AddToBook,
+                Self::AddToCollection,
                 Self::PinRepresentativeThumb,
                 Self::ToggleWindowMode,
                 Self::ToggleDetachedViewer,
@@ -2538,6 +2607,14 @@ pub struct RingPickerOriginalState {
     pub video_continuous_mode: crate::video::VideoContinuousMode,
 }
 
+/// リングを開いた時点で固定する一覧ソートの所有先。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RingPickerGridSortTarget {
+    Global,
+    Collection(crate::app::collection_grid::CollectionGridOrderTarget),
+    Locked(crate::app::GridSortLockReason),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RingPickerState {
     pub context: RingShortcutContext,
@@ -2549,6 +2626,7 @@ pub struct RingPickerState {
     /// 保存先を識別子で持つのは評価行 ([`RingPickerContainerTarget`]) と同じ理由。
     pub owner: crate::app::ViewerContextId,
     pub anchor: RingPickerAnchor,
+    pub(crate) grid_sort_target: RingPickerGridSortTarget,
     pub original: RingPickerOriginalState,
     pub row: usize,
     pub dirty_rows: Vec<RingPickerRowId>,
@@ -2840,6 +2918,18 @@ impl RightDragRecognition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grid_column_actions_11_to_20_are_selectable_and_roundtrip() {
+        let available = RingActionId::available_for_context(RingShortcutContext::Grid);
+        for cols in 11..=20 {
+            let id = format!("grid_column_count_{cols}");
+            let action = RingActionId::from_str(&id).expect("registered grid column action");
+            assert_eq!(action.as_str(), id);
+            assert!(action.is_valid_for_context(RingShortcutContext::Grid));
+            assert!(available.contains(&action));
+        }
+    }
 
     #[test]
     fn default_profiles_match_design_slots() {
@@ -3185,6 +3275,25 @@ mod tests {
                 assert!(!action.is_valid_for_context(context));
                 assert!(!RingActionId::available_for_context(context).contains(&action));
             }
+        }
+    }
+
+    #[test]
+    fn collection_add_round_trips_in_all_ring_contexts() {
+        let action = RingActionId::AddToCollection;
+        assert_eq!(action.as_str(), "add_to_collection");
+        assert_eq!(
+            RingActionId::from_str("add_to_collection"),
+            Some(action.clone())
+        );
+        for context in [
+            RingShortcutContext::Grid,
+            RingShortcutContext::ImageFullscreen,
+            RingShortcutContext::VideoFullscreen,
+        ] {
+            assert!(action.is_valid_for_context(context));
+            assert!(RingActionId::available_for_context(context).contains(&action));
+            assert!(RingActionId::available_for_mouse_button_context(context).contains(&action));
         }
     }
 
@@ -3719,7 +3828,7 @@ mod tests {
             RingActionId::VideoSeekBackLarge,
             RingActionId::VideoSeekForwardLarge,
         ] {
-            assert!(!video.contains(&seek));
+            assert!(video.contains(&seek));
             assert!(seek.is_valid_for_context(RingShortcutContext::VideoFullscreen));
             assert!(
                 seek.is_valid_for_mouse_button_context(RingShortcutContext::VideoFullscreen),
@@ -3727,9 +3836,8 @@ mod tests {
                 seek.as_str()
             );
             assert!(
-                !seek
-                    .is_available_for_mouse_button_assignment(RingShortcutContext::VideoFullscreen),
-                "v3.7 must not offer video seek for a physical mouse button: {}",
+                seek.is_available_for_mouse_button_assignment(RingShortcutContext::VideoFullscreen),
+                "the next-version build must offer video seek for a physical mouse button: {}",
                 seek.as_str()
             );
             assert!(!seek.is_valid_for_context(RingShortcutContext::Grid));
@@ -3742,7 +3850,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_video_mouse_seek_values_survive_sanitize_and_serde_round_trip() {
+    fn video_mouse_seek_values_survive_sanitize_and_serde_round_trip() {
         for (slot, seek) in [
             (MouseButtonSlot::Back, RingActionId::VideoSeekBackSmall),
             (
@@ -3768,7 +3876,7 @@ mod tests {
                     .mouse_button_profile(RingShortcutContext::VideoFullscreen)
                     .action(slot),
                 seek,
-                "sanitize must preserve deferred value"
+                "sanitize must preserve the configured value"
             );
 
             let json = serde_json::to_string(&settings).unwrap();
@@ -3779,7 +3887,7 @@ mod tests {
                     .mouse_button_profile(RingShortcutContext::VideoFullscreen)
                     .action(slot),
                 seek,
-                "save/reopen must preserve deferred value"
+                "save/reopen must preserve the configured value"
             );
         }
     }
@@ -3934,6 +4042,80 @@ mod tests {
         assert_eq!(
             mouse_nav,
             MouseBackForwardActionId::Unknown("future_mouse_nav".to_string())
+        );
+    }
+}
+
+#[cfg(test)]
+mod next_input_tests {
+    use super::*;
+
+    #[test]
+    fn next_input_candidates_and_saved_assignments_keep_context_and_defaults() {
+        let defaults = RingShortcutSettings::default();
+        let mut settings = defaults.clone();
+        for (id, valid_context) in [
+            ("grid_organize_files", RingShortcutContext::Grid),
+            ("image_fit_mode_cycle", RingShortcutContext::ImageFullscreen),
+        ] {
+            let action: RingActionId = serde_json::from_value(serde_json::json!(id)).unwrap();
+            for &context in RingShortcutContext::all() {
+                let valid = context == valid_context;
+                assert_eq!(
+                    action.is_valid_for_context(context),
+                    valid,
+                    "{id}: {context:?}"
+                );
+                assert_eq!(action.is_valid_for_mouse_button_context(context), valid);
+                assert_eq!(
+                    RingActionId::available_for_context(context).contains(&action),
+                    valid
+                );
+                assert_eq!(
+                    RingActionId::available_for_mouse_button_context(context).contains(&action),
+                    valid
+                );
+                assert!(!defaults.profile(context).slots.contains(&action));
+                for slot in [
+                    MouseButtonSlot::Back,
+                    MouseButtonSlot::Forward,
+                    MouseButtonSlot::Middle,
+                ] {
+                    assert_ne!(defaults.mouse_button_profile(context).action(slot), action);
+                }
+            }
+            assert_eq!(
+                action.is_valid_for_right_drag_context(RightDragContext::EditMode),
+                false
+            );
+            assert!(
+                !RingActionId::available_for_right_drag_context(RightDragContext::EditMode)
+                    .contains(&action)
+            );
+            settings.mouse_button_profile_mut(valid_context).back = action.clone();
+            settings.mouse_button_profile_mut(valid_context).forward = action.clone();
+            settings.profile_mut(valid_context).slots[0] = action.clone();
+            settings.mouse_button_profile_mut(valid_context).middle = action.clone();
+            let drag = if valid_context == RingShortcutContext::Grid {
+                RightDragContext::Grid
+            } else {
+                RightDragContext::ImageFullscreen
+            };
+            assert!(RingActionId::available_for_right_drag_context(drag).contains(&action));
+            settings
+                .mouse_gesture_profile_mut(drag)
+                .bindings
+                .push(MouseGestureBinding::new(
+                    vec![MouseGestureDirection::Up],
+                    action,
+                ));
+        }
+        let mut loaded: RingShortcutSettings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        loaded.sanitize();
+        assert_eq!(
+            loaded, settings,
+            "sanitize must preserve new and existing assignments"
         );
     }
 }

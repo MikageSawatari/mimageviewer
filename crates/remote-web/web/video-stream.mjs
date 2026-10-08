@@ -1160,6 +1160,12 @@ export class VideoStreamMenu {
             qualityNoun,
             { quality: preset.id },
           ]),
+          ...(media.audioTracks?.length >= 2 ? media.audioTracks.map((track) => [
+            CommandName.MEDIA_AUDIO_TRACK,
+            track.label,
+            "音声トラック",
+            { streamIndex: track.stream_index },
+          ]) : []),
         ],
         shortcuts: [
           ["再生 / 一時停止", "Space"],
@@ -1232,6 +1238,7 @@ export class VideoStreamMenu {
     this.shortcuts.replaceChildren();
     this.keyboardElements = [this.shortcutTitle, this.shortcuts];
     this.qualityButtons = new Map();
+    this.audioTrackButtons = new Map();
     this.actionLabels = new Map();
     for (const [name, label, hint, payload = {}] of definition.actions) {
       const button = element("button", "command-menu-action");
@@ -1242,6 +1249,9 @@ export class VideoStreamMenu {
       if (!this.actionLabels.has(name)) this.actionLabels.set(name, actionLabel);
       if (name === CommandName.MEDIA_QUALITY) {
         this.qualityButtons.set(payload.quality, button);
+      }
+      if (name === CommandName.MEDIA_AUDIO_TRACK) {
+        this.audioTrackButtons.set(payload.streamIndex, button);
       }
       button.addEventListener("click", (event) => {
         if (name === "menu_back") return this.showPage("main");
@@ -1402,8 +1412,24 @@ export class VideoStreamMenu {
   }
 
   setMediaState(media = {}) {
+    if (this.page === "controls") {
+      const tracks = media.audioTracks?.length >= 2 ? media.audioTracks : [];
+      const buttons = this.audioTrackButtons ?? new Map();
+      if (buttons.size !== tracks.length || tracks.some((track) => {
+        const button = buttons.get(track.stream_index);
+        return !button || button.firstElementChild?.textContent !== track.label;
+      })) {
+        this.showPage("controls");
+        return;
+      }
+    }
     for (const [quality, button] of this.qualityButtons ?? []) {
       const selected = quality === media.quality;
+      button.classList.toggle("is-current", selected);
+      button.setAttribute("aria-pressed", String(selected));
+    }
+    for (const [streamIndex, button] of this.audioTrackButtons ?? []) {
+      const selected = streamIndex === media.audioTrack;
       button.classList.toggle("is-current", selected);
       button.setAttribute("aria-pressed", String(selected));
     }
@@ -1738,6 +1764,7 @@ export class VideoStreamViewer {
     keyboardAvailable = true,
     getPanelTab = () => "functions",
     setPanelTab = () => {},
+    reportProgress = () => {},
   }) {
     this.isVideoStreamViewer = true;
     this.entry = entry;
@@ -1746,16 +1773,22 @@ export class VideoStreamViewer {
     this.inputSource = inputSource;
     this.apiJson = apiJson;
     this.apiPostJson = apiPostJson;
+    this.reportProgress = reportProgress;
+    this.lastProgressReportAt = 0;
     this.reportPlaybackIssue = reportPlaybackIssue;
     this.publishVideoHealth = publishVideoHealth;
     this.getTelemetryDebugContext = getTelemetryDebugContext;
     this.quality = "standard";
+    this.audioTracks = [];
+    this.audioTrack = null;
+    this.audioTrackOperation = 0;
     this.hasVideo = entry.kind !== "audio";
     this.showIosVolumeNotice = iosOrIpadosDeviceFromNavigator();
     this.volume = 1;
     this.duration = 0;
     this.bufferTargetSecs = null;
     this.session = null;
+    this.progressRemoteSessionId = "";
     this.generation = null;
     this.encoder = "";
     this.codecs = "";
@@ -1770,7 +1803,7 @@ export class VideoStreamViewer {
     );
     this.barsVisible = true;
     this.destroyed = false;
-    this.restarting = false;
+    this.restartRequest = null;
     this.seekDragState = { kind: "idle" };
     this.hls = null;
     this.pollTimer = 0;
@@ -1941,7 +1974,11 @@ export class VideoStreamViewer {
       this.checkPlaybackStartupProgress();
       this.updateProgress();
       this.handlePlaybackBoundary(false);
+      if (!this.video.paused && performance.now() - this.lastProgressReportAt >= 5000) {
+        this.emitProgress();
+      }
     };
+    this.onPause = () => this.emitProgress();
     this.onPlaying = () => this.handleMediaPlaying();
     this.onCanPlay = () => {
       this.checkPlaybackStartupProgress();
@@ -1962,7 +1999,10 @@ export class VideoStreamViewer {
       this.captureVideoHealth("hud");
       this.beginWaiting("stalled");
     };
-    this.onEnded = () => this.handlePlaybackBoundary(true);
+    this.onEnded = () => {
+      this.emitProgress(true);
+      this.handlePlaybackBoundary(true);
+    };
     this.onMediaError = () => {
       if (
         this.destroyed ||
@@ -1990,6 +2030,7 @@ export class VideoStreamViewer {
       }
     };
     this.video.addEventListener("timeupdate", this.onTimeUpdate);
+    this.video.addEventListener("pause", this.onPause);
     this.video.addEventListener("playing", this.onPlaying);
     this.video.addEventListener("canplay", this.onCanPlay);
     this.video.addEventListener("loadeddata", this.onLoadedData);
@@ -2254,6 +2295,8 @@ export class VideoStreamViewer {
   menuState() {
     return {
       quality: this.quality,
+      audioTracks: this.audioTracks,
+      audioTrack: this.audioTrack,
       volume: this.volume,
       playing: !this.video.paused,
       barsVisible: this.barsVisible,
@@ -2274,7 +2317,7 @@ export class VideoStreamViewer {
     this.root.classList.toggle("viewer-bars-hidden", !visible);
   }
 
-  async start(positionSecs = null, restorePlaying = true) {
+  async start(positionSecs = null, restorePlaying = true, audioTrack = null) {
     this.seekDragState = { kind: "idle" };
     this.transitionPlaybackControl({
       type: "reset",
@@ -2297,6 +2340,7 @@ export class VideoStreamViewer {
         `/api/video/start?path=${encodeURIComponent(this.address.path)}`,
         {
           quality: this.quality,
+          audio_track: audioTrack,
         },
         this.abortController.signal
       );
@@ -2311,6 +2355,8 @@ export class VideoStreamViewer {
     if (typeof started.has_video === "boolean") this.setHasVideo(started.has_video);
     this.menu.setSession(this.session);
     this.generation = started.generation;
+    this.audioTracks = Array.isArray(started.audio_tracks) ? started.audio_tracks : [];
+    this.audioTrack = started.audio_track ?? null;
     let playlistUrl = started.playlist;
     this.duration = Math.max(0, Number(started.duration_secs) || 0);
     this.bufferTargetSecs = hlsBufferConfig(started.buffer_target_secs).maxBufferLength;
@@ -2327,6 +2373,7 @@ export class VideoStreamViewer {
     };
     this.timelineAnchorGeneration = this.generation;
     this.updateDiagnostics(started);
+    this.menu.setMediaState(this.menuState());
 
     const startSeekTarget = videoStartSeekTarget({
       requestedPositionSecs: positionSecs,
@@ -2357,6 +2404,10 @@ export class VideoStreamViewer {
       url: playlistUrl,
     });
     if (!attached || this.destroyed) return;
+    // This is the owner attested by the successful stream start, not the app's current
+    // session at report time. Keep the previous owner until the new stream is attached.
+    this.progressRemoteSessionId = typeof started.remote_session_id === "string"
+      ? started.remote_session_id : "";
     this.announceAudioProcessingWarning();
     if (!restorePlaying) {
       await this.setPlaying(false);
@@ -2736,6 +2787,12 @@ export class VideoStreamViewer {
       });
       return true;
     }
+    if (requested.name === CommandName.MEDIA_AUDIO_TRACK) {
+      this.setAudioTrack(requested.payload.streamIndex).catch((error) => {
+        this.showOperationalError(error, "音声トラックを変更できませんでした");
+      });
+      return true;
+    }
     return false;
   }
 
@@ -3065,6 +3122,7 @@ export class VideoStreamViewer {
       this.video.currentTime = plan.mediaTimeSecs;
       this.finishSeekPreview(previewRequest);
       this.updateProgress();
+      this.emitProgress();
       return;
     }
     const request = previewRequest ?? this.beginSeekPreview(
@@ -3102,6 +3160,7 @@ export class VideoStreamViewer {
         url: sought.playlist,
       });
       if (!attached) this.cancelSeekPreview(request);
+      else this.emitProgress();
     } catch (error) {
       this.cancelSeekPreview(request);
       throw error;
@@ -3127,6 +3186,7 @@ export class VideoStreamViewer {
     if (!this.session || this.destroyed || preset.id !== quality || quality === this.quality) return;
     this.showNotice(`${preset.label}${this.hasVideo === false ? "音質" : "画質"}へ切り替えています。`, "waiting");
     const positionSecs = this.currentPosition();
+    this.emitProgress?.();
     try {
       await this.apiPostJson(
         "/api/video/control",
@@ -3151,10 +3211,75 @@ export class VideoStreamViewer {
     await this.refreshGeneration();
   }
 
+  snapshotProgress(ended = false) {
+    if (this.destroyed || !this.session || !this.progressRemoteSessionId ||
+        !Number.isFinite(this.duration) || this.duration <= 0) {
+      return null;
+    }
+    const positionSecs = this.currentPosition();
+    if (!Number.isFinite(positionSecs) || positionSecs < 0 || positionSecs > this.duration + 1) {
+      return null;
+    }
+    return {
+      address: this.address,
+      remoteSessionId: this.progressRemoteSessionId,
+      positionSecs,
+      durationSecs: this.duration,
+      ended: ended || this.video.ended,
+    };
+  }
+
+  emitProgress(ended = false) {
+    const snapshot = this.snapshotProgress(ended);
+    if (snapshot) {
+      this.lastProgressReportAt = performance.now();
+      this.reportProgress(snapshot);
+    }
+  }
+
+  async setAudioTrack(streamIndex) {
+    if (this.destroyed ||
+        !this.audioTracks.some((track) => track.stream_index === streamIndex)) return;
+    const operation = ++this.audioTrackOperation;
+    if (this.restartRequest) {
+      this.restartRequest.audioTrack = streamIndex;
+      return;
+    }
+    if (!this.session) return;
+    this.emitProgress?.();
+    const session = this.session;
+    const expectedGeneration = this.generation;
+    this.showNotice("音声トラックを切り替えています。", "waiting");
+    try {
+      await this.apiPostJson(
+        "/api/video/control",
+        {
+          session,
+          action: "audio_track",
+          stream_index: streamIndex,
+          position_secs: this.currentPosition(),
+          expected_generation: expectedGeneration,
+        },
+        this.abortController.signal
+      );
+    } catch (error) {
+      if (operation !== this.audioTrackOperation || this.destroyed || this.session !== session) return;
+      if (error?.status === 409) {
+        await this.restartAt(this.currentPosition(), this.playRequested, streamIndex);
+        return;
+      }
+      throw error;
+    }
+    if (operation !== this.audioTrackOperation || this.destroyed || this.session !== session) return;
+    await this.refreshGeneration();
+  }
+
   applyServerState(mediaState) {
     this.lastState = mediaState;
     if (typeof mediaState.has_video === "boolean") this.setHasVideo(mediaState.has_video);
     this.generation = mediaState.generation;
+    this.audioTracks = Array.isArray(mediaState.audio_tracks) ? mediaState.audio_tracks : [];
+    this.audioTrack = mediaState.audio_track ?? null;
     this.duration = Math.max(0, Number(mediaState.duration_secs) || this.duration);
     this.bufferTargetSecs = Math.max(
       1,
@@ -3475,9 +3600,10 @@ export class VideoStreamViewer {
     }
   }
 
-  async restartAt(positionSecs, restorePlaying = this.playRequested) {
-    if (this.restarting || this.destroyed) return;
-    this.restarting = true;
+  async restartAt(positionSecs, restorePlaying = this.playRequested, audioTrack = null) {
+    if (this.restartRequest || this.destroyed) return;
+    const restartRequest = { audioTrack };
+    this.restartRequest = restartRequest;
     const oldSession = this.session;
     this.clearPoll();
     this.clearHealthTelemetry();
@@ -3494,9 +3620,12 @@ export class VideoStreamViewer {
       ).catch(() => {});
     }
     try {
-      await this.start(positionSecs, restorePlaying);
+      await this.start(positionSecs, restorePlaying, audioTrack);
     } finally {
-      this.restarting = false;
+      this.restartRequest = null;
+    }
+    if (this.session && restartRequest.audioTrack !== audioTrack) {
+      await this.setAudioTrack(restartRequest.audioTrack);
     }
   }
 
@@ -3961,6 +4090,7 @@ export class VideoStreamViewer {
     this.pendingTimers.clear();
     this.stopPlaylistPlayback();
     this.video.removeEventListener("timeupdate", this.onTimeUpdate);
+    this.video.removeEventListener("pause", this.onPause);
     this.video.removeEventListener("playing", this.onPlaying);
     this.video.removeEventListener("canplay", this.onCanPlay);
     this.video.removeEventListener("loadeddata", this.onLoadedData);

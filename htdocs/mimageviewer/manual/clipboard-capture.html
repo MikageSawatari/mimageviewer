@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>クリップボード取り込み — mImageViewer マニュアル</title>
+  <!-- meta:begin (generated) -->
+  <meta name="description" content="コピーした画像の自動保存と、コピーしたページから画像を選んで保存する方法。取り込みフォルダ、Ctrl+V、画像を取得できない場合を説明します。">
+  <link rel="canonical" href="https://mikage.to/mimageviewer/manual/clipboard-capture.html">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="mImageViewer">
+  <meta property="og:locale" content="ja_JP">
+  <meta property="og:url" content="https://mikage.to/mimageviewer/manual/clipboard-capture.html">
+  <meta property="og:title" content="クリップボード取り込み｜mImageViewer">
+  <meta property="og:description" content="コピーした画像の自動保存と、コピーしたページから画像を選んで保存する方法。取り込みフォルダ、Ctrl+V、画像を取得できない場合を説明します。">
+  <meta property="og:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="クリップボード取り込み｜mImageViewer">
+  <meta name="twitter:description" content="コピーした画像の自動保存と、コピーしたページから画像を選んで保存する方法。取り込みフォルダ、Ctrl+V、画像を取得できない場合を説明します。">
+  <meta name="twitter:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <!-- meta:end -->
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <span>クリップボード取り込み</span>
+  </nav>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">マニュアル</div>
+      <nav>
+        <a href="index.html">目次</a>
+        <a href="getting-started.html">はじめに</a>
+        <a href="tutorial.html">チュートリアル</a>
+        <a href="grid.html">グリッド表示</a>
+        <a href="stack.html">スタック表示</a>
+        <a href="fullscreen.html">フルスクリーン表示</a>
+        <a href="video.html">動画再生</a>
+        <a href="music.html">音楽再生</a>
+        <a href="effetune.html">音響調整 (EffeTune)</a>
+        <a href="effetune/index.html" class="sub">エフェクトの説明書</a>
+        <a href="adjustment.html">画像補正</a>
+        <a href="local-adjustment.html">補正レイヤー</a>
+        <a href="analysis.html">画像分析モード</a>
+        <a href="erase.html">消しゴムモード</a>
+        <a href="conceal.html">隠蔽加工</a>
+        <a href="annotation.html">テキスト注釈</a>
+        <a href="export.html">エクスポート</a>
+        <a href="clipboard-capture.html" class="active">クリップボード取り込み</a>
+        <a href="metadata-transfer.html">メタ情報の移行</a>
+        <a href="external-tools.html">外部ツール連携</a>
+        <a href="tags.html">タグ機能</a>
+        <a href="books.html">製本・本棚</a>
+        <a href="collections.html">コレクション</a>
+        <a href="search.html">検索機能</a>
+        <a href="remote.html">リモート閲覧</a>
+        <a href="shortcuts.html">キーボードショートカット</a>
+        <a href="gamepad.html">ゲームパッド操作</a>
+        <a href="settings.html">設定リファレンス</a>
+        <a href="formats.html">対応フォーマット</a>
+        <a href="faq.html">FAQ</a>
+        <a href="troubleshooting.html">トラブルシューティング</a>
+        <a href="known-issues.html">既知の問題</a>
+        <a href="changelog.html">更新履歴</a>
+      </nav>
+    </div>
+  </aside>
+
+  <main class="content">
+    <h1 class="page-title">クリップボード取り込み</h1>
+    <p class="page-desc">コピーした画像を保存したり、コピーしたページに含まれる画像を選んで保存したりできます。</p>
+    <nav class="page-toc">
+      <div class="page-toc-title">目次</div>
+      <ul>
+        <li><a href="#automatic">コピーしたときに取り込む</a></li>
+        <li><a href="#selection">ページの画像を選ぶ</a></li>
+        <li><a href="#destination">取り込みフォルダとファイル名</a></li>
+        <li><a href="#paste">Ctrl+V で今のフォルダへ保存する</a></li>
+        <li><a href="#limits">取り込まないもの・取得できない画像</a></li>
+        <li><a href="#origin">出どころの記録</a></li>
+      </ul>
+    </nav>
+
+    <h2 id="automatic">コピーしたときに取り込む</h2>
+    <p>「設定」→「環境設定…」→「起動と連携」→「クリップボード取り込み」で、使いたい取り込み方法にチェックを入れ、「OK」で確定します。クリップボードの取り込み監視は、チェックを ON にしたときだけ動きます。</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>チェック項目</th><th>動作</th></tr></thead>
+        <tbody>
+          <tr><td>画像がコピーされたら自動で保存する</td><td>コピーした画像を取り込みフォルダへ PNG で保存し、画面右下の小窓で知らせます。「開く」を押すと保存した画像へ移動します。</td></tr>
+          <tr><td>ページ (HTML) がコピーされたら、含まれる画像を選んで保存できるようにする</td><td>画像を含むページの内容がコピーされると、右下に「このページの画像 N 件」という小窓が出ます。「画像を選んで保存」を押すと選択ダイアログが開きます。</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>監視は mImageViewer の起動中だけ動きます。タスクトレイ常駐と組み合わせて使えます。小窓が出ても、作業中のアプリからフォーカスを奪いません。「×」で通知を閉じられます。</p>
+    <p>ページの画像を選ぶには、mImageViewer の一覧画面でほかのダイアログを閉じておきます。受付できないときは、小窓に「一覧画面で Ctrl+V を押すと開けます」と表示します。その場合の保存先は、下記の <a href="#paste">Ctrl+V</a> と同じく今のフォルダです。</p>
+    <!-- スクリーンショット追加候補: 環境設定「クリップボード取り込み」とページ検出時の右下の小窓。 -->
+
+    <h2 id="selection">ページの画像を選ぶ</h2>
+    <ol>
+      <li>ブラウザで、画像を含むページの内容を選んでコピーします。ページのアドレスだけをコピーした場合は対象になりません。</li>
+      <li>小窓の「画像を選んで保存」を押します。この時点でページに含まれる画像の取得が始まります。</li>
+      <li>表示された縮小画像のチェックを選び、「選んだ N 枚を保存」を押します。</li>
+    </ol>
+    <p>「最小サイズ (短辺 px)」で、小さな画像を一覧から除外できます。最初は 100 px で、変更した値を覚え、次にダイアログを開くときにも使います。「全選択」「全解除」も使えます。同じ内容の画像はひとつにまとめます。</p>
+    <p>取得できた画像はチェック済みで表示します。取得に失敗した画像には理由が表示され、選択できません。取得が終わると保存できるようになります。保存中は「閉じる」、<kbd>Esc</kbd>、タイトルバーの「×」で閉じられません。完了後はメイン画面で保存件数を知らせます。途中で保存に失敗した場合も、保存済みのファイルは残ります。</p>
+    <!-- スクリーンショット追加候補: 最小サイズ・チェック・取得失敗の理由が見える画像選択ダイアログ。 -->
+
+    <h2 id="destination">取り込みフォルダとファイル名</h2>
+    <p>自動取り込みの保存先は、Windows の「ピクチャ」内の <code>mimageviewer\clipboard</code> です。その中の <code>2026-10</code> のような月別フォルダへ保存します。別の場所に保存したいときは、環境設定の「保存先フォルダ」で「変更…」を押します。「実際の保存先」で場所を確認し、「フォルダを開く」からも開けます。</p>
+    <p>一覧画面の「場所▼」→「クリップボード取り込み」から、取り込みフォルダへ移動できます。この項目は、取り込みのチェックがどちらかひとつでも ON のときだけ表示します。</p>
+    <p>ファイル名は取り込んだ日時・出どころのドメイン（わかる場合）・連番で付きます。たとえば、同じコピーで保存した画像は <code>20261006-123456-789-example.com_01.jpg</code>、<code>20261006-123456-789-example.com_02.png</code> のようになります。ページから取り込んだ場合のドメインは、ページのものを使います。</p>
+    <p>同じコピーの画像は共通の名前に連番が付くので、<a href="stack.html">ファイル名スタック表示</a>で 1 コピーを 1 スタックとしてまとめられます。既存ファイルは上書きせず、名前が重なる場合は別の名前で保存します。ページから取得した画像は元の画像形式のまま保存します。</p>
+
+    <h2 id="paste">Ctrl+V で今のフォルダへ保存する</h2>
+    <p>一覧画面で <kbd>Ctrl</kbd>+<kbd>V</kbd> を押すと、画像なら PNG を今のフォルダへ保存し、ページの HTML なら画像の選択ダイアログを開きます。選んだ画像も今のフォルダへ保存します。自動取り込みのチェックが OFF でも使えます。</p>
+    <p>ファイル・フォルダをコピーしている場合は、従来どおり Windows 標準の貼り付けになります。ファイル・フォルダ、画像、ページの HTML の順に優先します。ZIP・PDF の中や検索結果など、ファイルを貼り付けられない一覧では使えません。</p>
+    <p>ページの HTML を取り込む場合、コピー内容にページの出どころが記録されていないときや、画像候補がないときは「取り込める画像がありません」と表示して終了します。</p>
+
+    <h2 id="limits">取り込まないもの・取得できない画像</h2>
+    <p>自動監視では、Office からのコピー、文章だけのコピー、直前と同じ画像の連続コピーを取り込みません。mImageViewer 自身がコピーした画像も自動では取り込みません。手動の <kbd>Ctrl</kbd>+<kbd>V</kbd> には、自動監視のこれらの除外を適用しません。</p>
+    <p>ページの画像をすべて取得できるとは限りません。ブラウザの Cookie やログイン情報を使わないため、ログインが必要な画像や、参照元を確かめるサイトの一部などは取得できないことがあります。コピー範囲に含まれない画像や SVG も対象外です。</p>
+    <p>社内ネットワークのページからコピーした画像も取り込めます。通信先はブラウザにならった規則で制限し、コピー元のページのアドレスの区分（公開・社内・この PC）より内側の宛先へは取りに行きません。ただし、この区分はアドレスで判断するため、社内のすべてのサービスへの通信を防げるわけではありません（社内でもグローバルな IPv6 アドレスを使うサービスは公開と同じ扱いになります）。ログインが必要な場合は、社内の画像でも取得できません。</p>
+
+    <h2 id="origin">出どころの記録</h2>
+    <p>出どころの URL がわかる画像には、Windows の Mark of the Web としてページや画像の URL を記録します。ファイルの内容とは別の記録で、Windows がインターネット由来のファイルとして扱うためのものです。コピー元が URL を渡さない画像では、出どころを記録できません。</p>
+    <p>通信とデータの扱いについては、<a href="../privacy.html">プライバシーポリシー</a>をご覧ください。</p>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+</body>
+</html>

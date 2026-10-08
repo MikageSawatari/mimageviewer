@@ -298,6 +298,38 @@ impl ZipNavState {
         }
     }
 
+    /// Reconstruct the same effective parent levels as ordinary ZipDir descent. Persisting
+    /// a stack would retain obsolete wrapper levels when the archive changes.
+    pub fn restore_prefix(tree: Arc<ZipTree>, prefix: &str) -> Option<Self> {
+        if prefix.starts_with('/') || prefix.contains('\\') {
+            return None;
+        }
+        let segments = split_prefix(prefix);
+        if segments
+            .iter()
+            .any(|segment| segment == "." || segment == "..")
+        {
+            return None;
+        }
+        tree.node_at(&segments)?;
+        let target = tree.collapse_redundant(&segments);
+        let mut nav = Self::new(tree);
+        while nav.current() != target {
+            let current = nav.current();
+            if !target.starts_with(current) || target.len() <= current.len() {
+                return None;
+            }
+            let child = &target[..current.len() + 1];
+            nav.tree.node_at(child)?;
+            let effective = nav.tree.collapse_redundant(child);
+            if effective.len() <= current.len() || !target.starts_with(&effective) {
+                return None;
+            }
+            nav.stack.push(effective);
+        }
+        Some(nav)
+    }
+
     /// 現在描画すべき実効 prefix。
     pub fn current(&self) -> &[String] {
         self.stack.last().expect("ZipNavState stack is never empty")
@@ -1059,6 +1091,51 @@ mod tests {
         // ルートで back は false (= ZIP を抜ける)。
         let mut n = n;
         assert!(!n.back());
+    }
+
+    #[test]
+    fn section1335_restore_prefix_rebuilds_effective_parent_stack() {
+        let tree = Arc::new(tree(&[
+            "wrapper/a.zip/first/p1.png",
+            "wrapper/a.zip/second/only/p2.png",
+            "wrapper/b.zip/p3.png",
+        ]));
+        let mut ordinary = ZipNavState::new(tree.clone());
+        ordinary.enter("wrapper/a.zip/");
+        ordinary.enter("wrapper/a.zip/second/");
+        let mut restored = ZipNavState::restore_prefix(tree, "wrapper/a.zip/second/only/").unwrap();
+        assert_eq!(restored.stack, ordinary.stack);
+        assert_eq!(
+            restored.current(),
+            s(&["wrapper", "a.zip", "second", "only"])
+        );
+        assert!(restored.back());
+        assert_eq!(restored.current(), s(&["wrapper", "a.zip"]));
+        assert!(restored.back());
+        assert_eq!(restored.current(), s(&["wrapper"]));
+        assert!(!restored.back());
+    }
+
+    #[test]
+    fn section1335_restore_prefix_uses_current_tree_and_rejects_missing_prefix() {
+        let tree = Arc::new(tree(&["wrapper/only/p1.png"]));
+        for prefix in ["", "wrapper/", "wrapper/only/"] {
+            let mut restored = ZipNavState::restore_prefix(tree.clone(), prefix).unwrap();
+            assert_eq!(restored.current(), s(&["wrapper", "only"]));
+            assert!(!restored.back());
+        }
+        for prefix in [
+            "gone/",
+            "/wrapper/",
+            "wrapper/../",
+            "./wrapper/",
+            "wrapper\\only",
+        ] {
+            assert!(
+                ZipNavState::restore_prefix(tree.clone(), prefix).is_none(),
+                "{prefix}"
+            );
+        }
     }
 
     #[test]

@@ -3,12 +3,13 @@ import assert from "node:assert/strict";
 import {
   FOREGROUND_ADMISSION_RETRY_LIMIT,
   ViewerGroupLoadOutcome,
+  remoteAddressIdentity,
 } from "./command-core.mjs";
 
 class FakeElement {
   constructor(tag = "div") {
     this.tagName = tag.toUpperCase();
-    this.style = {};
+    this.style = { setProperty(name, value) { this[name] = value; } };
     this.dataset = {};
     const classes = new Set();
     this.classList = {
@@ -47,10 +48,17 @@ class FakeElement {
     for (const listener of this.listeners.get(event.type) ?? []) listener(event);
   }
   setAttribute() {}
-  append(...nodes) { this.children.push(...nodes); }
-  replaceChildren(...nodes) { this.children = nodes; }
+  removeAttribute() {}
+  append(...nodes) { nodes.forEach((node) => { node.parent = this; this.children.push(node); }); }
+  prepend(...nodes) { nodes.forEach((node) => { node.parent = this; }); this.children.unshift(...nodes); }
+  replaceChildren(...nodes) { this.children = []; this.append(...nodes); }
   replaceWith(node) { this.replacedWith = node; }
-  remove() { this.removed = true; }
+  remove() { this.removed = true; if (this.parent) this.parent.children = this.parent.children.filter((child) => child !== this); }
+  querySelector(selector) {
+    if (!selector.startsWith(".")) return null;
+    return this.children.find((child) => child.classList.contains(selector.slice(1)) ||
+      String(child.className ?? "").split(/\s+/).includes(selector.slice(1))) ?? null;
+  }
   async decode() { return FakeElement.decodeHook?.(this); }
 }
 
@@ -66,6 +74,9 @@ globalThis.document = {
   },
   createElementNS(_namespace, tag) {
     return new FakeElement(tag);
+  },
+  createDocumentFragment() {
+    return new FakeElement("fragment");
   },
 };
 let reloadCalls = 0;
@@ -109,6 +120,7 @@ const imageFetch = async () => new Response(new Blob([new Uint8Array([1, 2, 3])]
     "X-mIV-Page-Identity": pageIdentityHeader(TEST_PAGE_ADDRESS),
   },
 });
+
 globalThis.fetch = imageFetch;
 
 const {
@@ -120,6 +132,11 @@ const {
   LatestPageLoadQueue,
   PageDemandAdapter,
   PageResourceCache,
+  fetchPageResource,
+  PersistentEofTerminalOwner,
+  PersistentCollectionNavigationQueue,
+  RemoteArchiveOpenController,
+  SavedCollectionCatalogRequestOwner,
   RemoteAiController,
   ViewerAdjustmentPanel,
   ViewerImageUpdateExitReason,
@@ -127,47 +144,94 @@ const {
   VIEWER_MENU_MAX_ACTIONS,
   VIEWER_PANEL_TABS,
   activateFolderContainerForImage,
+  applyContainerData,
   applyRemoteSessionId,
   browserDoubleTapTelemetryEvent,
   commandTelemetryEvent,
   collectionImageHash,
+  containerRuntimeStateForTest,
+  cleanupVideoViewerForTest,
+  retainVideoViewerForTest,
+  reportRetainedVideoProgressForTest,
+  enqueueVideoProgress,
+  reportVideoProgressBeforePageHide,
   containerInitialImageIndex,
   createRemoteHomeDataRefreshCoordinator,
   createFavoriteSearchForm,
   createGridTile,
+  bindThumbnail,
+  audioArtRuntimeForTest,
   createPinLoginInput,
   filterRemoteTags,
   favoriteSearchEmptyMessage,
   favoriteSearchHash,
   favoriteSearchResultTitle,
+  finalCoverSpreadWriteRequest,
+  pageAloneWriteRequest,
+  singletonSpreadPlacementWriteRequest,
   gridReturnItemIdentity,
+  historyStateWithoutPersistentCollectionSession,
   imageRequest,
+  immutableRemoteArchiveRouteState,
   invalidateViewerPendingLoad,
   isStreamMediaKind,
   loadFolder,
+  renderFolder,
+  setViewerRating,
   normalizeRemoteAdjustmentValues,
   normalizeRemoteBookBookmarkList,
   normalizeRemoteColorizeParams,
+  normalizeContainerPageGroups,
   normalizeRemoteGridSortState,
   normalizeRemotePostFilterState,
   normalizeRemoteViewTrimState,
+  normalizePagePresentationSlots,
+  openViewerPagePositionForTest,
+  viewerPagePresentationForTest,
+  pageGroupNavigationEntries,
+  pageGroupPresentationIdentity,
+  pageGroupPresentationSlots,
   pageGroupIndexIn,
+  pagePrefetchRequestKeys,
+  pagePrefetchResourceLimit,
+  pagePrefetchTargetGroups,
+  pageRenderContextForSlot,
   parentContainerAddress,
   parseRoute,
+  persistentCollectionIdentityKey,
+  persistentCollectionSortState,
+  persistentCollectionHistoryStateForSession,
+  persistentCollectionImagePosition,
+  persistentCollectionLandedPosition,
+  persistentCollectionOrdinalLocator,
+  persistentCollectionCatalogTruncationText,
+  persistentCollectionEntryIndexByIdentity,
+  persistentCollectionResponseIsCurrent,
+  persistentCollectionReturnSelection,
+  persistentCollectionRouteRequestIsCurrent,
+  persistentCollectionRouteOwnerTransition,
+  persistentCollectionTargetPosition,
+  persistentSparseViewerPresentation,
+  persistentSparseTargetMatchesRootBinding,
+  normalizePersistentCollectionEntry,
+  normalizePersistentCollectionPageGroups,
   reloadApplication,
   reportContainerSpreadRefreshError,
   renderResolvedMediaOpen,
   remoteArchiveProgressText,
+  remoteArchiveTerminalMessage,
   remoteAiCompletionMessage,
   remoteAiProgressText,
   remoteAiPollingDelay,
   remoteBookBookmarkDisplayPage,
   remoteBookBookmarkTargetEntryIndex,
   rootOpenReturnHash,
+  renderPlacesTab,
   resolveLegacyImageOpenRoute,
   resolveMediaOpenRoute,
   selectRecoverableRemoteAiJob,
   selectRecoverableRemoteArchiveJob,
+  savedCollectionHash,
   telemetryHudVisible,
   setViewTrimSpreadSeparate,
   setRuntimeTestErrorObserver,
@@ -185,6 +249,43 @@ const {
   viewerImageUpdateContextExitReason,
 } = await import("./app.js");
 
+test("organize destinations render in server order and use the usual folder route", () => {
+  const content = new FakeElement();
+  const navigations = [];
+  const entries = [
+    { kind: "folder", name: "未接続", path: "Z:/missing" },
+    { kind: "folder", name: "保管", path: "C:/archive" },
+  ];
+  renderPlacesTab(content, { places: [
+    { kind: "bookshelf", name: "本棚フォルダ" },
+    { kind: "file_organize_destinations", name: "整理先", entries },
+    { kind: "separator" },
+    { kind: "folder", entry: { name: "ピクチャ", path: "C:/Pictures" } },
+  ] }, (hash, options) => navigations.push({ hash, options }));
+  const list = content.children[0];
+  assert.equal(list.children[1].children[0].textContent, "整理先");
+  const buttons = list.children[1].children.slice(1);
+  assert.deepEqual(buttons.map((button) => button.title), entries.map((entry) => entry.path));
+  assert.deepEqual(buttons.map((button) => button.children[1].textContent), ["未接続", "保管"]);
+  buttons[0].dispatchEvent({ type: "click" });
+  buttons[1].dispatchEvent({ type: "click" });
+  list.children[3].dispatchEvent({ type: "click" });
+  assert.deepEqual(navigations, ["Z:/missing", "C:/archive", "C:/Pictures"].map((path) => ({
+    hash: `#folder/${encodeURIComponent(path)}`, options: { returnHash: "#home/places" },
+  })));
+  const hidden = new FakeElement();
+  renderPlacesTab(hidden, { places: [] });
+  assert.equal(hidden.children[0].children.some((child) => child.className === "organize-destinations"), false);
+});
+
+test("saved collection sort display distinguishes manual, standard, and shuffle", () => {
+  assert.equal(persistentCollectionSortState({ kind: "manual" }).selected, "manual");
+  assert.equal(persistentCollectionSortState({ kind: "shuffle" }).options[0].label, "シャッフル");
+  assert.deepEqual(persistentCollectionSortState({
+    kind: "standard", value: "file_name", label: "ファイル名", short_label: "名前",
+  }).options, [{ value: "file_name", label: "ファイル名", short_label: "名前" }]);
+});
+
 function deferred() {
   let resolve;
   let reject;
@@ -194,6 +295,518 @@ function deferred() {
   });
   return { promise, resolve, reject };
 }
+
+test("saved collection routes keep collection and stable entry identities out of URLs", () => {
+  const collectionId = "11111111-1111-4111-8111-111111111111";
+  const entryId = "22222222-2222-4222-8222-222222222222";
+  assert.deepEqual(parseRoute(savedCollectionHash(collectionId)), {
+    kind: "saved_collection",
+    collectionId,
+    entryId: "",
+  });
+  assert.deepEqual(parseRoute(savedCollectionHash(collectionId, entryId)), {
+    kind: "saved_collection",
+    collectionId,
+    entryId,
+  });
+  assert.equal(savedCollectionHash(collectionId, entryId).includes("C:"), false);
+  assert.equal(parseRoute("#saved-collection/not-a-uuid").kind, "home");
+});
+
+test("persistent collection mapping keeps unavailable entries address-free and spread identity stable", () => {
+  const identity = {
+    entry_id: "22222222-2222-4222-8222-222222222222",
+    source_identity: "a".repeat(64),
+  };
+  const available = normalizePersistentCollectionEntry({
+    ...identity,
+    name: "page.jpg",
+    state: { state: "available", kind: "image", address: TEST_PAGE_ADDRESS },
+  });
+  const blocked = normalizePersistentCollectionEntry({
+    entry_id: "33333333-3333-4333-8333-333333333333",
+    source_identity: "b".repeat(64),
+    name: "secret.jpg",
+    state: { state: "blocked_by_remote_policy", last_known_kind: "image" },
+  });
+  assert.equal(persistentCollectionIdentityKey(available.persistent_identity),
+    `saved:${identity.entry_id}:${identity.source_identity}`);
+  assert.equal(blocked.unavailable, true);
+  assert.equal("address" in blocked, false);
+  const groups = normalizePersistentCollectionPageGroups([{
+    anchor: identity,
+    pages: [{ ...identity, address: TEST_PAGE_ADDRESS, role: "navigation" }],
+    slice: "full",
+    singleton_placement: "center",
+  }], [available, blocked]);
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].anchor, available);
+  assert.equal(groups[0].presentationSlots[0].entry, available);
+});
+
+test("persistent collection route owner keeps marked children and deactivates sibling routes", () => {
+  const root = {
+    ownerKind: "root",
+    collectionId: "11111111-1111-4111-8111-111111111111",
+    routeSequence: 4,
+    rootBinding: { entries: ["root"] },
+  };
+  const child = persistentCollectionRouteOwnerTransition(
+    root,
+    { collectionId: root.collectionId, sourceRouteSequence: 4 },
+    "container",
+    5
+  );
+  assert.equal(child.ownerKind, "child");
+  assert.strictEqual(child.rootBinding, root.rootBinding);
+  assert.deepEqual(persistentCollectionRouteOwnerTransition(
+    { ...root, routeSequence: 5 },
+    { collectionId: root.collectionId, sourceRouteSequence: 4 },
+    "container",
+    6
+  ), { ownerKind: "inactive", routeSequence: 6 });
+  const sibling = persistentCollectionRouteOwnerTransition(
+    child,
+    null,
+    "search",
+    6
+  );
+  assert.deepEqual(sibling, { ownerKind: "inactive", routeSequence: 6 });
+});
+
+test("persistent collection return selection resolves entry ID before source identity", () => {
+  const old = {
+    entry_id: "22222222-2222-4222-8222-222222222222",
+    source_identity: "a".repeat(64),
+  };
+  const relinkedSameId = {
+    persistent_identity: { ...old, source_identity: "b".repeat(64) },
+  };
+  const sameOldSource = {
+    persistent_identity: {
+      entry_id: "33333333-3333-4333-8333-333333333333",
+      source_identity: old.source_identity,
+    },
+  };
+  assert.equal(
+    persistentCollectionEntryIndexByIdentity([sameOldSource, relinkedSameId], old),
+    1
+  );
+  assert.equal(
+    persistentCollectionEntryIndexByIdentity([sameOldSource], old),
+    0
+  );
+  assert.deepEqual(
+    persistentCollectionReturnSelection([relinkedSameId], sameOldSource.persistent_identity, true),
+    { index: -1, outsidePrefix: true }
+  );
+});
+
+test("archive jobs retain an immutable saved collection child return owner", () => {
+  const original = {
+    returnHash: "#saved-collection/11111111-1111-4111-8111-111111111111",
+    savedCollectionSessionEpoch: "epoch-a",
+    savedCollectionChild: {
+      collectionId: "11111111-1111-4111-8111-111111111111",
+      sourceRouteSequence: 7,
+      originIdentity: {
+        entry_id: "22222222-2222-4222-8222-222222222222",
+        source_identity: "a".repeat(64),
+      },
+    },
+  };
+  const captured = immutableRemoteArchiveRouteState(original);
+  original.returnHash = "#home";
+  original.savedCollectionChild.sourceRouteSequence = 8;
+  original.savedCollectionChild.originIdentity.source_identity = "b".repeat(64);
+  assert.deepEqual(captured, {
+    returnHash: "#saved-collection/11111111-1111-4111-8111-111111111111",
+    savedCollectionSessionEpoch: "epoch-a",
+    savedCollectionChild: {
+      collectionId: "11111111-1111-4111-8111-111111111111",
+      sourceRouteSequence: 7,
+      originIdentity: {
+        entry_id: "22222222-2222-4222-8222-222222222222",
+        source_identity: "a".repeat(64),
+      },
+    },
+  });
+  assert.deepEqual(immutableRemoteArchiveRouteState({}), {});
+});
+
+test("archive ready landing forwards the child owner captured when the job began", async () => {
+  const address = {
+    path: testPath("books/book.rar"),
+    subresource: { kind: "file" },
+  };
+  const routeState = {
+    returnHash: "#saved-collection/11111111-1111-4111-8111-111111111111",
+    savedCollectionSessionEpoch: "epoch-a",
+    savedCollectionChild: {
+      collectionId: "11111111-1111-4111-8111-111111111111",
+      sourceRouteSequence: 11,
+      originIdentity: {
+        entry_id: "22222222-2222-4222-8222-222222222222",
+        source_identity: "a".repeat(64),
+      },
+    },
+  };
+  const created = deferred();
+  const navigations = [];
+  const host = new FakeElement("main");
+  const controller = new RemoteArchiveOpenController(host, () => () => {}, {
+    createJob: () => created.promise,
+    loadResult: async () => ({ source: address }),
+    navigate: (hash, state) => navigations.push({ hash, state }),
+  });
+  const opened = controller.open(address, "book.rar", routeState);
+  routeState.returnHash = "#home";
+  routeState.savedCollectionChild.sourceRouteSequence = 99;
+  created.resolve({ job_id: "job-1", state: "ready" });
+  await opened;
+  assert.equal(navigations.length, 1);
+  assert.equal(navigations[0].hash.startsWith("#container/"), true);
+  assert.equal(navigations[0].state.returnHash.startsWith("#saved-collection/"), true);
+  assert.equal(navigations[0].state.savedCollectionChild.sourceRouteSequence, 11);
+});
+
+test("persistent EOF terminal stops only its current viewer and settles once", async () => {
+  let stopped = 0;
+  const viewer = {
+    setPlaying(value) {
+      assert.equal(value, false);
+      stopped += 1;
+      return Promise.resolve();
+    },
+  };
+  const failed = new PersistentEofTerminalOwner(viewer, 4);
+  assert.equal(failed.fail({
+    aborted: false,
+    currentViewer: viewer,
+    currentViewerSequence: 4,
+  }), true);
+  assert.equal(failed.fail({
+    aborted: false,
+    currentViewer: viewer,
+    currentViewerSequence: 4,
+  }), false);
+  assert.equal(failed.state, "failed");
+  assert.equal(stopped, 1);
+
+  for (const input of [
+    { aborted: true, currentViewer: viewer, currentViewerSequence: 4 },
+    { aborted: false, currentViewer: {}, currentViewerSequence: 4 },
+    { aborted: false, currentViewer: viewer, currentViewerSequence: 5 },
+  ]) {
+    const stale = new PersistentEofTerminalOwner(viewer, 4);
+    assert.equal(stale.fail(input), false);
+    assert.equal(stale.state, "stale");
+  }
+  const landed = new PersistentEofTerminalOwner(viewer, 4);
+  landed.complete();
+  assert.equal(landed.state, "landed");
+  assert.equal(landed.fail({
+    aborted: false,
+    currentViewer: viewer,
+    currentViewerSequence: 4,
+  }), false);
+  await Promise.resolve();
+  assert.equal(stopped, 1);
+});
+
+test("persistent target position keeps the full ordinal while sparse arrays stay local", () => {
+  assert.deepEqual(persistentCollectionTargetPosition(41, 100_000), {
+    kind: "still_image",
+    ordinal: 41,
+    count: 100_000,
+    label: "42 / 100000",
+  });
+  assert.deepEqual(persistentCollectionTargetPosition(99, 3), {
+    kind: "still_image",
+    ordinal: 2,
+    count: 3,
+    label: "3 / 3",
+  });
+  assert.deepEqual(persistentCollectionOrdinalLocator(41), {
+    direction: "current",
+    locate_entry_id: null,
+    locate_ordinal: 41,
+  });
+  assert.equal(persistentCollectionOrdinalLocator(-1), null);
+  assert.equal(persistentCollectionOrdinalLocator(1.5), null);
+});
+
+test("persistent landed positions use the actual media projection and reject invalid wire", () => {
+  const targets = [
+    ["direct_image_display_unit", "still_image"],
+    ["direct_video", "video"],
+    ["direct_audio", "audio"],
+  ];
+  for (const [targetKind, positionKind] of targets) {
+    assert.deepEqual(
+      persistentCollectionLandedPosition(
+        { kind: positionKind, ordinal: 2, count: 4 },
+        { kind: targetKind }
+      ),
+      { kind: positionKind, ordinal: 2, count: 4, label: "3 / 4" }
+    );
+    assert.equal(
+      persistentCollectionLandedPosition(
+        { kind: "navigable_media", ordinal: 2, count: 4 },
+        { kind: targetKind }
+      ),
+      null
+    );
+  }
+  const image = { kind: "direct_image_display_unit" };
+  for (const position of [
+    { kind: "video", ordinal: 1, count: 3 },
+    { kind: "still_image", ordinal: 3, count: 3 },
+    { kind: "still_image", ordinal: -1, count: 3 },
+    { kind: "still_image", ordinal: 0, count: 0 },
+    { kind: "still_image", ordinal: 0.5, count: 3 },
+    { kind: "still_image", ordinal: 0, count: Number.MAX_SAFE_INTEGER + 1 },
+  ]) {
+    assert.equal(persistentCollectionLandedPosition(position, image), null);
+  }
+});
+
+test("prefix-external image route keeps its core image ordinal for the next seek", () => {
+  const prefix = { entry_id: "prefix", source_identity: "a".repeat(64) };
+  const outside = { entry_id: "outside", source_identity: "b".repeat(64) };
+  const sparsePosition = persistentCollectionLandedPosition(
+    { kind: "still_image", ordinal: 41, count: 90 },
+    { kind: "direct_image_display_unit" }
+  );
+  const context = {
+    rootBinding: { images: [{ persistent_identity: prefix }] },
+    imageCount: 90,
+    sparsePosition,
+  };
+  assert.deepEqual(persistentCollectionImagePosition(context, outside), sparsePosition);
+  assert.deepEqual(persistentCollectionOrdinalLocator(sparsePosition.ordinal), {
+    direction: "current", locate_entry_id: null, locate_ordinal: 41,
+  });
+  context.sparsePosition = persistentCollectionLandedPosition(
+    { kind: "video", ordinal: 3, count: 8 },
+    { kind: "direct_video" }
+  );
+  assert.equal(persistentCollectionImagePosition(context, outside), null);
+});
+
+test("session replacement retires persistent collection history without changing the route", () => {
+  const previousHistory = globalThis.history;
+  const historyCalls = [];
+  const sessionAState = {
+    mivRoute: true,
+    navigatedInApp: true,
+    unrelated: "keep",
+    savedCollectionReturnIdentity: { entry_id: "old-return", source_identity: "a".repeat(64) },
+    savedCollectionIdentity: { entry_id: "old-viewer", source_identity: "b".repeat(64) },
+    savedCollectionChild: { collectionId: "old", sourceRouteSequence: 2 },
+  };
+  globalThis.history = {
+    state: sessionAState,
+    replaceState(next, title, url) {
+      historyCalls.push({ next, title, url });
+      this.state = next;
+    },
+  };
+  try {
+    const sessionA = "11111111111111111111111111111111";
+    const sessionB = "22222222222222222222222222222222";
+    applyRemoteSessionId(sessionA, () => {});
+    globalThis.history.state = sessionAState;
+    const routeBefore = globalThis.location.href;
+    applyRemoteSessionId(sessionB, () => {});
+    assert.deepEqual(globalThis.history.state, {
+      mivRoute: true,
+      navigatedInApp: true,
+      unrelated: "keep",
+    });
+    assert.equal(historyCalls.at(-1).url, routeBefore);
+  } finally {
+    globalThis.history = previousHistory;
+    applyRemoteSessionId("", () => {});
+  }
+  assert.deepEqual(historyStateWithoutPersistentCollectionSession(null), null);
+  const oldEntry = {
+    mivRoute: true,
+    savedCollectionSessionEpoch: "epoch-a",
+    savedCollectionReturnIdentity: { entry_id: "old", source_identity: "a".repeat(64) },
+    savedCollectionIdentity: { entry_id: "old", source_identity: "a".repeat(64) },
+    savedCollectionChild: { collectionId: "old", sourceRouteSequence: 1 },
+  };
+  assert.deepEqual(
+    persistentCollectionHistoryStateForSession(oldEntry, "epoch-b"),
+    { mivRoute: true }
+  );
+  assert.strictEqual(
+    persistentCollectionHistoryStateForSession(oldEntry, "epoch-a"),
+    oldEntry
+  );
+});
+
+test("saved collection request current gate rejects session route and controller ABA", () => {
+  const current = {
+    aborted: false,
+    controllerMatches: true,
+    cacheEpoch: "epoch-2",
+    expectedCacheEpoch: "epoch-2",
+    requestSequence: 8,
+    expectedRequestSequence: 8,
+    routeHash: "#saved-collection/11111111-1111-4111-8111-111111111111",
+    expectedRouteHash: "#saved-collection/11111111-1111-4111-8111-111111111111",
+  };
+  assert.equal(persistentCollectionRouteRequestIsCurrent(current), true);
+  assert.equal(persistentCollectionRouteRequestIsCurrent({ ...current, cacheEpoch: "epoch-3" }), false);
+  assert.equal(persistentCollectionRouteRequestIsCurrent({ ...current, requestSequence: 9 }), false);
+  assert.equal(persistentCollectionRouteRequestIsCurrent({ ...current, controllerMatches: false }), false);
+  assert.equal(persistentCollectionRouteRequestIsCurrent({ ...current, routeHash: "#home" }), false);
+});
+
+test("saved collection catalog owner drops an old session result and exposes truncation", async () => {
+  const appState = { remoteSessionCacheEpoch: "epoch-1" };
+  const requests = [];
+  const installed = [];
+  const owner = new SavedCollectionCatalogRequestOwner({
+    requestJson(_path, _params, signal) {
+      const request = deferred();
+      requests.push({ ...request, signal });
+      return request.promise;
+    },
+    appState,
+    install: (value) => installed.push(value),
+    fail: (error) => assert.fail(error),
+  });
+  const old = owner.refresh();
+  appState.remoteSessionCacheEpoch = "epoch-2";
+  const current = owner.refresh();
+  assert.equal(requests[0].signal.aborted, true);
+  requests[0].resolve({ catalog_revision: 1, collections: [{ name: "old" }] });
+  requests[1].resolve({ catalog_revision: 2, collections: [{ name: "new" }] });
+  await Promise.all([old, current]);
+  assert.deepEqual(installed, [{ catalog_revision: 2, collections: [{ name: "new" }] }]);
+  assert.equal(persistentCollectionCatalogTruncationText({
+    truncated: true,
+    limit: 37,
+    collections: Array(37),
+  }), "件数が多いため先頭 37 件を表示しています。");
+});
+
+test("persistent sparse viewer owns exactly one display unit and route sequence gates replies", () => {
+  const first = {
+    entry_id: "22222222-2222-4222-8222-222222222222",
+    source_identity: "a".repeat(64),
+    address: TEST_PAGE_ADDRESS,
+    role: "navigation",
+  };
+  const second = {
+    entry_id: "33333333-3333-4333-8333-333333333333",
+    source_identity: "b".repeat(64),
+    address: { path: testPath("second.jpg"), subresource: { kind: "file" } },
+    role: "navigation",
+  };
+  const presentation = persistentSparseViewerPresentation({
+    anchor: second,
+    pages: [first, second],
+    slice: "full",
+    singleton_placement: "center",
+  });
+  assert.equal(presentation.entries.length, 2);
+  assert.equal(presentation.group.navigationEntries.length, 2);
+  const gate = {
+    aborted: false,
+    viewerMatches: true,
+    viewerSequence: 7,
+    expectedViewerSequence: 7,
+    cacheEpoch: "epoch",
+    expectedCacheEpoch: "epoch",
+    collectionId: "collection",
+    expectedCollectionId: "collection",
+    routeSequence: 9,
+    expectedRouteSequence: 9,
+  };
+  assert.equal(persistentCollectionResponseIsCurrent(gate), true);
+  assert.equal(persistentCollectionResponseIsCurrent({ ...gate, routeSequence: 10 }), false);
+});
+
+test("persistent sparse targets must exactly match identities already present in the root prefix", () => {
+  const identity = {
+    entry_id: "22222222-2222-4222-8222-222222222222",
+    source_identity: "a".repeat(64),
+  };
+  const partner = {
+    entry_id: "33333333-3333-4333-8333-333333333333",
+    source_identity: "b".repeat(64),
+  };
+  const first = { path: testPath("first.jpg"), subresource: { kind: "file" } };
+  const second = { path: testPath("second.jpg"), subresource: { kind: "file" } };
+  const roots = [
+    { kind: "image", address: first, persistent_identity: identity },
+    { kind: "image", address: second, persistent_identity: partner },
+  ];
+  const group = {
+    kind: "direct_image_display_unit",
+    group: {
+      anchor: identity,
+      pages: [
+        { ...identity, address: first, role: "navigation" },
+        { ...partner, address: second, role: "navigation" },
+      ],
+    },
+  };
+  assert.equal(persistentSparseTargetMatchesRootBinding(group, roots), true);
+  assert.equal(persistentSparseTargetMatchesRootBinding({
+    ...group,
+    group: {
+      ...group.group,
+      pages: [group.group.pages[0], {
+        ...group.group.pages[1],
+        address: { path: testPath("wrong.jpg"), subresource: { kind: "file" } },
+      }],
+    },
+  }, roots), false);
+  assert.equal(persistentSparseTargetMatchesRootBinding({
+    kind: "direct_video",
+    identity,
+    address: first,
+  }, roots), false);
+  assert.equal(persistentSparseTargetMatchesRootBinding({
+    kind: "direct_audio",
+    identity: { entry_id: "outside", source_identity: "c".repeat(64) },
+    address: { path: testPath("outside.flac"), subresource: { kind: "file" } },
+  }, roots), true, "prefix-external sparse targets remain self-contained");
+});
+
+test("persistent navigation queues same-direction inputs one by one and replaces reverse intent", async () => {
+  const first = deferred();
+  const calls = [];
+  const queue = new PersistentCollectionNavigationQueue((step, intent, signal) => {
+    calls.push({ step, intent, signal });
+    return calls.length === 1 ? first.promise : Promise.resolve();
+  });
+  queue.enqueue(1, "same");
+  queue.enqueue(1, "same");
+  queue.enqueue(1, "same");
+  assert.equal(calls.length, 1);
+  first.resolve();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(calls.map(({ step }) => step), [1, 1, 1]);
+
+  const pending = deferred();
+  const reverseCalls = [];
+  const reverse = new PersistentCollectionNavigationQueue((step, intent, signal) => {
+    reverseCalls.push({ step, intent, signal });
+    return reverseCalls.length === 1 ? pending.promise : Promise.resolve();
+  });
+  reverse.enqueue(1, "viewer");
+  reverse.enqueue(-1, "viewer");
+  assert.equal(reverseCalls[0].signal.aborted, true);
+  assert.equal(reverseCalls[1].step, -1);
+  pending.resolve();
+});
 
 test("PIN login uses a text-capable mobile keyboard without text correction", () => {
   const pin = createPinLoginInput();
@@ -244,6 +857,15 @@ test("sort state accepts only server-provided options and keeps a visible lock r
   assert.equal(sort.options.length, 2);
   assert.equal(sort.locked_reason, "本として表示中は名前順固定です");
   assert.equal(normalizeRemoteGridSortState({ selected: "Numeric", options: [] }), null);
+  const rating = normalizeRemoteGridSortState({
+    selected: "RatingDesc",
+    options: [
+      { value: "FileName", label: "名前（昇順）", short_label: "名前↑" },
+      { value: "RatingDesc", label: "評価（高い順）", short_label: "評価↓" },
+    ],
+  });
+  assert.equal(rating.selected, "RatingDesc");
+  assert.equal(rating.options[1].label, "評価（高い順）");
 });
 
 test("session identity revocation tolerates a video viewer without page-load invalidation", () => {
@@ -1291,6 +1913,54 @@ function adapterPageRequest(cacheKey) {
   };
 }
 
+test("RAW skip requires session and generation attestation before returning typed skip", async () => {
+  const savedFetch = globalThis.fetch;
+  const headers = {
+    "X-mIV-Page-Skip": "raw-prefetch",
+    "X-mIV-Remote-Session": TEST_SESSION_ID,
+    "X-mIV-Remote-State-Generation": "test-1",
+  };
+  const request = adapterPageRequest("raw-skip");
+  try {
+    globalThis.fetch = async () => new Response(null, { status: 204, headers });
+    assert.deepEqual(await fetchPageResource(request, new AbortController().signal, true), {
+      kind: "skipped",
+    });
+    globalThis.fetch = async () => new Response(null, { status: 204, headers: {
+      ...headers, "X-mIV-Remote-Session": "other",
+    } });
+    await assert.rejects(fetchPageResource(request, new AbortController().signal, true),
+      (error) => error.code === "remote_session_unattested");
+    globalThis.fetch = async () => new Response(null, { status: 204, headers: {
+      "X-mIV-Page-Skip": "raw-prefetch",
+      "X-mIV-Remote-Session": TEST_SESSION_ID,
+    } });
+    await assert.rejects(fetchPageResource(request, new AbortController().signal, true),
+      (error) => error.code === "remote_state_generation_unattested");
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test("display congestion retries do not emit per-attempt fetch errors", async () => {
+  const savedFetch = globalThis.fetch;
+  const errors = [];
+  setRuntimeTestErrorObserver((event) => errors.push(event));
+  const request = adapterPageRequest("raw-busy");
+  try {
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      error: "raw_busy", message: "busy",
+    }), { status: 503, headers: { "Content-Type": "application/json" } });
+    await assert.rejects(fetchPageResource(request, new AbortController().signal, false, () => true));
+    assert.deepEqual(errors, []);
+    await assert.rejects(fetchPageResource(request, new AbortController().signal, false, () => false));
+    assert.equal(errors.filter((event) => event.category === "fetch_non_2xx").length, 1);
+  } finally {
+    globalThis.fetch = savedFetch;
+    setRuntimeTestErrorObserver(null);
+  }
+});
+
 function pendingPageFetch(started) {
   return (request, signal, prefetch) => {
     started.push({ request, signal, prefetch });
@@ -1393,6 +2063,61 @@ test("a planned prefetch promotes once and batches the display identity", async 
 
   adapter.releaseDisplay("reader-1");
   adapter.releaseDisplay("reader-2");
+  adapter.setPlan([]);
+});
+
+test("a skipped prefetch is not retried until display demand starts foreground", async () => {
+  const calls = [];
+  const events = [];
+  const adapter = new PageDemandAdapter({
+    cache: new PageResourceCache(8),
+    wirePrefix: "skip",
+    fetchResource: async (request, _signal, prefetch) => {
+      calls.push({ request, prefetch });
+      return prefetch ? { kind: "skipped" } : {
+        blob: new Blob(["image"]), requestId: "foreground", fetchMs: 1, info: null,
+      };
+    },
+    recordTelemetry: (event) => events.push(event),
+    postDemand: async () => ({}),
+  });
+  const request = adapterPageRequest("raw");
+  adapter.setPlan([request]);
+  await waitForAdapterIdle(adapter);
+  adapter.setPlan([request]);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(events.filter((event) => event.type === "page_prefetch"), [
+    { type: "page_prefetch", status: "skip" },
+  ]);
+  adapter.openDisplay({ requestId: "reader", groupKey: "raw", requests: [request] });
+  await adapter.waitForDisplay("reader");
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].prefetch, false);
+  adapter.releaseDisplay("reader");
+  adapter.setPlan([]);
+});
+
+test("a promoted job skipped by core starts a new foreground job", async () => {
+  const first = deferred();
+  const calls = [];
+  const adapter = new PageDemandAdapter({
+    cache: new PageResourceCache(8),
+    wirePrefix: "promoted-skip",
+    fetchResource: (request, _signal, prefetch) => {
+      calls.push({ request, prefetch });
+      return prefetch ? first.promise : Promise.resolve({
+        blob: new Blob(["image"]), requestId: "foreground", fetchMs: 1, info: null,
+      });
+    },
+    postDemand: async () => ({}),
+  });
+  const request = adapterPageRequest("raw-promoted");
+  adapter.setPlan([request]);
+  adapter.openDisplay({ requestId: "reader", groupKey: "raw", requests: [request] });
+  first.resolve({ kind: "skipped" });
+  await adapter.waitForDisplay("reader");
+  assert.deepEqual(calls.map((call) => call.prefetch), [true, false]);
+  adapter.releaseDisplay("reader");
   adapter.setPlan([]);
 });
 
@@ -1705,6 +2430,90 @@ test("a foreground admission retry stops when its own load is aborted", async ()
   await waitForAdapterIdle(adapter);
   assert.equal(attempts, 1);
   cache.clear();
+});
+
+test("display demand retries named congestion beyond three attempts and records one event", async () => {
+  let attempts = 0;
+  const events = [];
+  const adapter = new PageDemandAdapter({
+    cache: new PageResourceCache(4),
+    wirePrefix: "congestion",
+    fetchResource: async () => {
+      attempts += 1;
+      if (attempts <= 5) {
+        const error = new Error("busy");
+        error.status = 503;
+        error.code = attempts % 2 ? "ipc_busy" : "raw_busy";
+        error.retryAfterMs = 1;
+        throw error;
+      }
+      return { blob: new Blob(["image"]), requestId: "ok", fetchMs: 1, info: null };
+    },
+    recordTelemetry: (event) => events.push(event),
+    postDemand: async () => ({}),
+  });
+  adapter.openDisplay({ requestId: "reader", groupKey: "raw", requests: [adapterPageRequest("busy")] });
+  await adapter.waitForDisplay("reader");
+  assert.equal(attempts, 6);
+  assert.equal(events.filter((event) => event.type === "page_congestion").length, 1);
+  assert.equal(events.find((event) => event.type === "page_congestion").retry_count, 5);
+  adapter.releaseDisplay("reader");
+});
+
+test("other HTTP 503 remains bounded at three retries", async () => {
+  for (const code of ["miv_media_error", "ipc_timeout"]) {
+    let attempts = 0;
+    const adapter = new PageDemandAdapter({
+      cache: new PageResourceCache(4),
+      wirePrefix: "bounded",
+      fetchResource: async () => {
+        attempts += 1;
+        const error = new Error("busy");
+        error.status = 503;
+        error.code = code;
+        error.retryAfterMs = 1;
+        throw error;
+      },
+      postDemand: async () => ({}),
+    });
+    adapter.openDisplay({ requestId: code, groupKey: code, requests: [adapterPageRequest(code)] });
+    await assert.rejects(adapter.waitForDisplay(code));
+    assert.equal(attempts, FOREGROUND_ADMISSION_RETRY_LIMIT + 1);
+    adapter.releaseDisplay(code);
+  }
+});
+
+test("last display demand cancels promoted backoff and restarts bounded prefetch", async () => {
+  const firstAttempt = deferred();
+  const started = [];
+  const demandBodies = [];
+  const adapter = new PageDemandAdapter({
+    cache: new PageResourceCache(4),
+    wirePrefix: "restart",
+    fetchResource: (request, signal, prefetch) => {
+      started.push({ request, signal, prefetch });
+      if (started.length === 1) {
+        firstAttempt.resolve();
+        const error = new Error("busy");
+        error.status = 503;
+        error.code = "raw_busy";
+        error.retryAfterMs = 10_000;
+        return Promise.reject(error);
+      }
+      return pendingPageFetch([])(request, signal, prefetch);
+    },
+    postDemand: async (body) => { demandBodies.push(body); },
+  });
+  const request = adapterPageRequest("planned-raw");
+  adapter.setPlan([request]);
+  adapter.openDisplay({ requestId: "reader", groupKey: "raw", requests: [request] });
+  await firstAttempt.promise;
+  adapter.releaseDisplay("reader");
+  await Promise.resolve();
+  assert.equal(started[0].signal.aborted, true);
+  assert.equal(started[1].prefetch, true);
+  assert.deepEqual(demandBodies.at(-1)?.release, [{ job: "restart-j1", cause: "no_demand" }]);
+  adapter.setPlan([]);
 });
 
 test("page demand adapter reports HUD states and refreshes on start settle cancel and evict", async () => {
@@ -2038,8 +2847,8 @@ test("tapping an audio grid tile opens the shared media viewer route", () => {
 
   const preview = tile.children[0];
   assert.equal(preview.children.some((child) => child.tagName === "SVG"), true);
-  assert.equal(preview.children.some((child) => child.tagName === "IMG"), false);
-  assert.equal(tile._thumbnailBinding, undefined);
+  assert.equal(preview.children.some((child) => child.tagName === "IMG"), true);
+  assert.ok(tile._thumbnailBinding);
 
   tile.dispatchEvent({ type: "click", detail: 1, pointerType: "touch" });
 
@@ -2056,6 +2865,56 @@ test("tapping an audio grid tile opens the shared media viewer route", () => {
   assert.equal(showUnsupportedRemoteEntryNotice(notice, "audio"), false);
   assert.equal(notice.hidden, true);
   assert.equal(resolveMediaOpenRoute("audio", { kind: "audio", address }, -1), "audio");
+});
+
+test("EPUB source on the PDF wire route has an EPUB placeholder and opens as a book", () => {
+  const address = {
+    path: testPath("books/Book.EPUB"),
+    subresource: { kind: "file" },
+  };
+  const dispatched = [];
+  const tile = createGridTile(
+    { kind: "pdf", name: "Book", address },
+    5,
+    new Map(),
+    null,
+    180,
+    (requested, meta) => dispatched.push({ requested, meta })
+  );
+  const preview = tile.children[0];
+
+  assert.equal(
+    preview.children.find((child) => child.className === "file-glyph")?.textContent,
+    "▤"
+  );
+  assert.equal(
+    preview.children.find((child) => child.className === "type-badge")?.textContent,
+    "epub"
+  );
+  assert.equal(preview.children.some((child) => child.tagName === "IMG"), true);
+  assert.ok(tile._thumbnailBinding);
+
+  tile.dispatchEvent({ type: "click", detail: 1, pointerType: "touch" });
+  assert.equal(dispatched.length, 1);
+  assert.deepEqual(dispatched[0].requested.payload, {
+    kind: "container",
+    address,
+    entryIndex: 5,
+  });
+
+  const pdfTile = createGridTile(
+    { kind: "pdf", name: "Book", path: testPath("books/Book.pdf") },
+    6,
+    new Map(),
+    null,
+    180,
+    () => {}
+  );
+  assert.equal(
+    pdfTile.children[0].children.find((child) => child.className === "type-badge")?.textContent,
+    "pdf"
+  );
+  assert.ok(pdfTile._thumbnailBinding);
 });
 
 test("session acquisition refreshes favorites and home once without taking the viewer", async () => {
@@ -2092,7 +2951,7 @@ test("session acquisition refreshes favorites and home once without taking the v
 
   const firstRefresh = coordinator.refreshAfterSessionAcquire();
   const consecutiveRefresh = coordinator.refreshAfterSessionAcquire();
-  assert.deepEqual(requests, ["/api/favorites", "/api/home"]);
+  assert.deepEqual(requests, ["/api/favorites", "/api/home", "/api/saved-collections"]);
 
   const nextFavorites = [{ name: "更新後のお気に入り" }];
   const nextHome = {
@@ -2104,6 +2963,7 @@ test("session acquisition refreshes favorites and home once without taking the v
     favorites: nextFavorites,
   });
   pending.get("/api/home").resolve(nextHome);
+  pending.get("/api/saved-collections").resolve({ collections: [] });
   await Promise.all([firstRefresh, consecutiveRefresh]);
 
   assert.strictEqual(appState.favorites, nextFavorites);
@@ -2138,17 +2998,18 @@ test("initial loading consumes an already completed acquisition refresh without 
   });
 
   const acquisitionRefresh = coordinator.refreshAfterSessionAcquire();
-  assert.deepEqual(requests, ["/api/favorites", "/api/home"]);
+  assert.deepEqual(requests, ["/api/favorites", "/api/home", "/api/saved-collections"]);
 
   pending.get("/api/favorites").resolve({
     remote_state_generation: "generation-1",
     favorites: [],
   });
   pending.get("/api/home").resolve({ places: [], smart_folders: [] });
+  pending.get("/api/saved-collections").resolve({ collections: [] });
   await acquisitionRefresh;
   await coordinator.loadInitial();
 
-  assert.deepEqual(requests, ["/api/favorites", "/api/home"]);
+  assert.deepEqual(requests, ["/api/favorites", "/api/home", "/api/saved-collections"]);
 });
 
 test("successful session home refresh redraws only the visible home data tab", async () => {
@@ -2213,7 +3074,11 @@ test("failed session home refresh preserves the last good places and smart folde
 
   const results = await coordinator.refreshAfterSessionAcquire();
 
-  assert.deepEqual(results.map((result) => result.status), ["fulfilled", "rejected"]);
+  assert.deepEqual(results.map((result) => result.status), [
+    "fulfilled",
+    "rejected",
+    "fulfilled",
+  ]);
   assert.strictEqual(appState.home, previousHome);
   assert.deepEqual(appState.home.places, previousHome.places);
   assert.deepEqual(appState.home.smart_folders, previousHome.smart_folders);
@@ -3248,6 +4113,157 @@ test("spread waits for both pages and atomically replaces the page layer", async
   viewer.destroy();
 });
 
+test("archive settings recovery terminal keeps the retry instruction visible", () => {
+  const message = "設定の復元またはリセット中です。完了後にもう一度開いてください";
+  assert.equal(remoteArchiveTerminalMessage({
+    state: "failed",
+    terminal: {
+      code: "settings_recovery_in_progress",
+      message,
+    },
+  }), message);
+});
+
+test("AI settings recovery terminal tells the user to retry without hiding the typed message", async () => {
+  const controller = new RemoteAiController(
+    { root: new FakeElement("section") },
+    new FakeElement("div"),
+    () => () => {}
+  );
+  const message = "設定の復元またはリセット中です。完了後にもう一度 AI 処理を実行してください";
+
+  await controller.handleSnapshot({
+    job_id: "settings-recovery-job",
+    request_id: "settings-recovery-request",
+    state: "failed",
+    terminal: {
+      code: "settings_recovery_in_progress",
+      message,
+    },
+  }, controller.generation);
+
+  assert.equal(controller.root.classList.contains("is-error"), true);
+  assert.equal(controller.message.textContent, message);
+  assert.equal(controller.shortLabel.textContent, "AI 完了");
+  controller.destroy();
+});
+
+test("singleton spread keeps the real DOM page and a white decoration only when requested", async () => {
+  const stage = new FakeElement("div");
+  stage.clientWidth = 1600;
+  stage.clientHeight = 1000;
+  const pageLayer = new FakeElement("div");
+  const initialImage = new FakeElement("img");
+  pageLayer.append(initialImage);
+  const viewer = new ImageViewer({
+    root: new FakeElement("section"),
+    stage,
+    pageLayer,
+    image: initialImage,
+    title: new FakeElement("div"),
+    counter: new FakeElement("span"),
+    previous: new FakeElement("button"),
+    next: new FakeElement("button"),
+    loadingIndicator: new FakeElement("div"),
+  });
+  const page = (side) => ({
+    entry: { name: `${side} endpoint` },
+    info: { width: 1200, height: 1800 },
+    request: {
+      url: `/api/page?test=singleton-${side}`,
+      cacheKey: `singleton-${side}@1334`,
+      remoteStateGeneration: "test-1",
+      remoteSessionId: TEST_SESSION_ID,
+      address: TEST_PAGE_ADDRESS,
+      width: 1334,
+      cssWidth: 667,
+      dpr: 2,
+      layout: { cssWidth: 667 },
+      fitMode: "page",
+      dynamicInfo: true,
+      infoCacheKey: `singleton-${side}`,
+      containerInfoKey: "book-singleton",
+    },
+  });
+
+  for (const side of ["left", "right", "left_white", "right_white"]) {
+    const hasWhite = side.endsWith("_white");
+    const displayed = await viewer.loadGroup({
+      pages: [page(side)],
+      name: `${side} endpoint`,
+      fitMode: "page",
+      gap: 12,
+      singletonPlacement: side,
+      index: 0,
+      count: 1,
+      interactionStartedAt: performance.now(),
+    });
+    assert.deepEqual(displayed, { outcome: ViewerGroupLoadOutcome.APPLIED });
+    assert.equal(pageLayer.children.length, hasWhite ? 2 : 1);
+    assert.equal(viewer.images.length, 1);
+    assert.equal(Boolean(pageLayer.querySelector(".viewer-white-companion")), hasWhite);
+    assert.equal(pageLayer.dataset.singletonPlacement, side);
+    assert.equal(pageLayer.dataset.singletonGap, "12");
+    const assertVirtualExtent = () => {
+      const pageWidth = parseFloat(viewer.images[0].style.width);
+      const layerWidth = parseFloat(pageLayer.style.width);
+      assert.ok(Math.abs(layerWidth - (pageWidth * 2 + 12)) < 0.01);
+      assert.equal(pageLayer.children.length, hasWhite ? 2 : 1);
+      assert.equal(viewer.images.length, 1);
+      const white = pageLayer.querySelector(".viewer-white-companion");
+      assert.equal(Boolean(white), hasWhite);
+      if (white) {
+        assert.equal(white.style.width, viewer.images[0].style.width);
+        assert.equal(white.style.height, viewer.images[0].style.height);
+        assert.equal(pageLayer.children.indexOf(white), side === "left_white" ? 1 : 0);
+      }
+      assert.equal(pageLayer.dataset.singletonPlacement, side);
+      assert.equal(pageLayer.dataset.singletonGap, "12");
+    };
+    assertVirtualExtent();
+
+    for (const fitMode of ["width", "original", "page"]) {
+      assert.equal(viewer.refitVisibleContent(fitMode), true);
+      assertVirtualExtent();
+    }
+
+    const previous = viewer.images[0];
+    assert.equal(
+      await viewer.replacePageBlobs([
+        { pageIndex: 0, blob: new Blob([side]), alt: `${side} adjusted` },
+      ]),
+      true,
+    );
+    assert.notEqual(viewer.images[0], previous);
+    assert.equal(pageLayer.children.length, hasWhite ? 2 : 1);
+    assert.equal(pageLayer.dataset.singletonPlacement, side);
+    assert.equal(pageLayer.dataset.singletonGap, "12");
+    // The production DOM copies CSSStyleDeclaration.cssText during adjustment
+    // replacement; this lightweight fake models the typed dataset instead. A
+    // refit proves that the retained owner still reconstructs the same extent.
+    assert.equal(viewer.refitVisibleContent("page"), true);
+    assertVirtualExtent();
+  }
+
+  // A final-cover supplement replaces the decoration with a real second
+  // presentation slot while the navigation group still has one real target.
+  const assisted = await viewer.loadGroup({
+    pages: [page("cover-supplement"), page("forced-final")],
+    name: "assisted forced final",
+    fitMode: "page",
+    gap: 12,
+    singletonPlacement: "center",
+    index: 0,
+    count: 1,
+    interactionStartedAt: performance.now(),
+  });
+  assert.deepEqual(assisted, { outcome: ViewerGroupLoadOutcome.APPLIED });
+  assert.equal(pageLayer.children.length, 2);
+  assert.equal(viewer.images.length, 2);
+  assert.equal(pageLayer.querySelector(".viewer-white-companion"), null);
+  viewer.destroy();
+});
+
 test("spread rejects one mismatched page before replacing either side", async () => {
   const requested = (pageNumber) => ({
     path: testPath("books/spread.pdf"),
@@ -3601,4 +4617,1066 @@ test("asking for a half that no longer exists lands on the page itself", () => {
   // 分割をやめた直後。右半分はもう無いので、そのページの表示単位へ戻す。
   assert.equal(pageGroupIndexIn(groups, page, "right"), 1);
   assert.equal(pageGroupIndexIn(groups, { path: "C:/book/p9.jpg" }, "left"), -1);
+});
+
+test("a real container exposes the tri-state final-cover setting without adding it to collections", () => {
+  const container = viewerMenuDefinitions({
+    hasContainer: true,
+    barsVisible: true,
+    supportsFinalCoverSetting: true,
+    finalCoverPreference: "off",
+    finalCoverEnabled: false,
+  });
+  const finalCoverActions = container.final_cover.actions.filter(([name]) =>
+    name.startsWith("final_cover_")
+  );
+  assert.deepEqual(
+    finalCoverActions.map(([name]) => name),
+    ["final_cover_follow_global", "final_cover_on", "final_cover_off"]
+  );
+  assert.equal(finalCoverActions[0][2], "全体設定");
+  assert.match(finalCoverActions[2][1], /^✓ /);
+  assert.ok(container.spread.actions.length <= VIEWER_MENU_MAX_ACTIONS);
+
+  const collection = viewerMenuDefinitions({
+    hasContainer: true,
+    barsVisible: true,
+    supportsFinalCoverSetting: false,
+  });
+  assert.equal(
+    collection.spread.actions.some(([, , , payload]) => payload?.menuPage === "final_cover"),
+    false
+  );
+});
+
+test("final-cover writes keep the effective container address and typed preference", () => {
+  const address = {
+    path: "C:/book/book.zip",
+    subresource: { kind: "zip_directory", prefix: "chapter/" },
+  };
+  assert.deepEqual(finalCoverSpreadWriteRequest(address, "follow_global"), {
+    kind: "set_final_cover_spread_preference",
+    address,
+    preference: "follow_global",
+  });
+  assert.equal(finalCoverSpreadWriteRequest(address, "unknown"), null);
+});
+
+test("folder rating fallback notice is visible on the rendered grid", async () => {
+  const noticeText = "評価順を読み込めなかったため名前順で表示しました";
+  globalThis.fetch = async (input) => {
+    const url = new URL(input, testLocation.origin);
+    if (url.pathname === "/api/list") {
+      return Response.json({
+        path: testPath("rating-fallback"),
+        sort_notice: noticeText,
+        entries: [],
+      });
+    }
+    if (url.pathname === "/api/container") return new Promise(() => {});
+    throw new Error(`unexpected request: ${url.pathname}`);
+  };
+  try {
+    const loaded = await loadFolder(testPath("rating-fallback"));
+    renderFolder(null, loaded.requestController);
+    const findNotice = (node) => {
+      if (node.classList?.contains("grid-action-notice") ||
+          String(node.className ?? "").split(/\s+/).includes("grid-action-notice")) return node;
+      for (const child of node.children ?? []) {
+        const found = findNotice(child);
+        if (found) return found;
+      }
+      return null;
+    };
+    const notice = findNotice(app);
+    assert.ok(notice);
+    assert.equal(notice.hidden, false);
+    assert.equal(notice.textContent, noticeText);
+  } finally {
+    globalThis.fetch = imageFetch;
+  }
+});
+
+test("Remote rating write keeps rendered folder rows fixed until explicit reload", async () => {
+  const folder = testPath("rating-order");
+  const before = ["b.jpg", "a.jpg"];
+  const after = ["a.jpg", "b.jpg"];
+  let serverOrder = before;
+  const writes = [];
+  const previousResizeObserver = globalThis.ResizeObserver;
+  const previousHistory = globalThis.history;
+  globalThis.history = { state: {} };
+  globalThis.ResizeObserver = class {
+    observe() {}
+    disconnect() {}
+  };
+  globalThis.fetch = async (input, init = {}) => {
+    const url = new URL(input, testLocation.origin);
+    if (url.pathname === "/api/list") {
+      return Response.json({
+        path: folder,
+        entries: serverOrder.map((name) => ({
+          kind: "image",
+          name,
+          path: `${folder}/${name}`,
+        })),
+      });
+    }
+    if (url.pathname === "/api/container") return new Promise(() => {});
+    if (url.pathname === "/api/write") {
+      const body = JSON.parse(init.body);
+      writes.push(body);
+      if (body.kind === "set_rating") serverOrder = after;
+      return Response.json({ applied: true });
+    }
+    if (url.pathname === "/api/telemetry") return Response.json({});
+    return imageFetch(input, init);
+  };
+  const renderedOrder = () => {
+    const names = [];
+    const visit = (node) => {
+      if (node.classList?.contains("grid-tile") ||
+          String(node.className ?? "").split(/\s+/).includes("grid-tile")) names.push(node.title);
+      for (const child of node.children ?? []) visit(child);
+    };
+    visit(app);
+    return names;
+  };
+  try {
+    const first = await loadFolder(folder);
+    renderFolder(null, first.requestController);
+    assert.deepEqual(renderedOrder(), before);
+    const initialModelOrder = containerRuntimeStateForTest().entries;
+    assert.equal(openViewerPagePositionForTest({ destroy() {} }, 0), true);
+    await setViewerRating(5);
+    assert.equal(writes.filter((write) => write.kind === "set_rating").length, 1);
+    assert.deepEqual(containerRuntimeStateForTest().entries, initialModelOrder);
+    assert.deepEqual(renderedOrder(), before);
+
+    const reloaded = await loadFolder(folder);
+    renderFolder(null, reloaded.requestController);
+    assert.notDeepEqual(containerRuntimeStateForTest().entries, initialModelOrder);
+    assert.deepEqual(renderedOrder(), after);
+  } finally {
+    globalThis.ResizeObserver = previousResizeObserver;
+    globalThis.history = previousHistory;
+    globalThis.fetch = imageFetch;
+  }
+});
+
+test("endpoint placement menus and writes keep first and last independent", () => {
+  const address = { path: "C:/book/book.zip", subresource: { kind: "file" } };
+  const definitions = viewerMenuDefinitions({
+    hasContainer: true,
+    barsVisible: true,
+    supportsFinalCoverSetting: true,
+    supportsSingletonPlacementSetting: true,
+    singletonPlacementPreference: "place",
+    singletonPlacementEnabled: true,
+    singletonLastPreference: "center",
+    singletonLastEnabled: false,
+  });
+  assert.ok(definitions.spread.actions.some(([, label]) => label === "先頭の単ページ配置"));
+  assert.ok(definitions.spread.actions.some(([, label]) => label === "末尾の単ページ配置"));
+  assert.ok(definitions.spread.actions.length <= VIEWER_MENU_MAX_ACTIONS);
+  assert.match(definitions.singleton_placement.actions[2][1], /^✓ /);
+  assert.match(definitions.singleton_placement_last.actions[3][1], /^✓ /);
+  assert.deepEqual(singletonSpreadPlacementWriteRequest(address, "last", "center"), {
+    kind: "set_singleton_spread_endpoint_preference",
+    address,
+    endpoint: "last",
+    preference: "center",
+  });
+  assert.equal(singletonSpreadPlacementWriteRequest(address, "middle", "center"), null);
+});
+
+test("page-alone menu exposes two independent tri-state controls only for real books", () => {
+  const address = { path: "C:/book/book.zip", subresource: { kind: "zip_directory", prefix: "inner/" } };
+  const menu = viewerMenuDefinitions({
+    hasContainer: true,
+    barsVisible: true,
+    supportsPageAloneSetting: true,
+    pageAfterCoverPreference: "on",
+    lastPagePreference: "follow_global",
+    pageAfterCoverEnabled: true,
+    lastPageEnabled: false,
+  });
+  assert.ok(menu.spread.actions.some(([, label]) => label === "単独ページと白い相方"));
+  assert.ok(menu.spread.actions.length <= VIEWER_MENU_MAX_ACTIONS);
+  assert.match(menu.page_after_cover.actions[2][1], /^✓ /);
+  assert.match(menu.last_page_alone.actions[1][1], /^✓ /);
+  assert.deepEqual(pageAloneWriteRequest(address, "after_cover", "off"), {
+    kind: "set_page_alone_preference", address, endpoint: "after_cover", preference: "off",
+  });
+  assert.equal(pageAloneWriteRequest(address, "middle", "off"), null);
+  assert.equal(viewerMenuDefinitions({ hasContainer: true, barsVisible: true }).spread.actions
+    .some(([, label]) => label === "単独ページと白い相方"), false);
+});
+
+test("supplemental cover presentation stays outside navigation and has explicit slot context", () => {
+  const fileAddress = (name) => ({
+    path: `C:/book/${name}`,
+    subresource: { kind: "file" },
+  });
+  const cover = { name: "cover.jpg", address: fileAddress("cover.jpg") };
+  const last = { name: "last.jpg", address: fileAddress("last.jpg") };
+  const byAddress = new Map([
+    [remoteAddressIdentity(cover.address), cover],
+    [remoteAddressIdentity(last.address), last],
+  ]);
+  const lastGroup = {
+    anchor: last,
+    navigationEntries: [last],
+    presentationSlots: normalizePagePresentationSlots(
+      [
+        { address: last.address, role: "navigation" },
+        { address: cover.address, role: "front_cover_supplement" },
+      ],
+      [last],
+      byAddress
+    ),
+    slice: "full",
+  };
+  const firstGroup = {
+    anchor: cover,
+    navigationEntries: [cover],
+    presentationSlots: [{ entry: cover, role: "navigation" }],
+    slice: "full",
+  };
+
+  assert.deepEqual(pageGroupNavigationEntries(lastGroup), [last]);
+  assert.deepEqual(
+    pageGroupPresentationSlots(lastGroup).map(({ entry, role }) => [entry.name, role]),
+    [
+      ["last.jpg", "navigation"],
+      ["cover.jpg", "front_cover_supplement"],
+    ]
+  );
+  assert.equal(pageGroupIndexIn([firstGroup, lastGroup], cover), 0);
+  assert.notEqual(
+    pageGroupPresentationIdentity(firstGroup),
+    pageGroupPresentationIdentity(lastGroup)
+  );
+  const contextAddress = fileAddress("book");
+  assert.deepEqual(pageRenderContextForSlot(lastGroup, 0, contextAddress), {
+    context_address: contextAddress,
+    display_slot: "spread_left",
+    spread_partner: cover.address,
+  });
+  assert.deepEqual(pageRenderContextForSlot(lastGroup, 1, contextAddress), {
+    context_address: contextAddress,
+    display_slot: "spread_right",
+    spread_partner: last.address,
+  });
+
+  const forcedRight = {
+    ...lastGroup,
+    presentationSlots: normalizePagePresentationSlots(
+      [
+        { address: cover.address, role: "front_cover_supplement" },
+        { address: last.address, role: "navigation" },
+      ],
+      [last],
+      byAddress
+    ),
+  };
+  assert.deepEqual(pageGroupNavigationEntries(forcedRight), [last]);
+  assert.deepEqual(
+    pageGroupPresentationSlots(forcedRight).map(({ entry, role }) => [entry.name, role]),
+    [["cover.jpg", "front_cover_supplement"], ["last.jpg", "navigation"]]
+  );
+  assert.deepEqual(pageRenderContextForSlot(forcedRight, 0, contextAddress), {
+    context_address: contextAddress,
+    display_slot: "spread_left",
+    spread_partner: last.address,
+  });
+  assert.deepEqual(pageRenderContextForSlot(forcedRight, 1, contextAddress), {
+    context_address: contextAddress,
+    display_slot: "spread_right",
+    spread_partner: cover.address,
+  });
+});
+
+test("prefetch plans each Double group once and reserves its supplemental resources", () => {
+  const image = (name) => ({
+    kind: "image",
+    name,
+    address: {
+      path: `C:/book/${name}`,
+      subresource: { kind: "file" },
+    },
+  });
+  const images = [image("0.jpg"), image("1.jpg"), image("2.jpg"), image("3.jpg")];
+  const firstDouble = {
+    anchor: images[0],
+    navigationEntries: [images[0], images[1]],
+    presentationSlots: [
+      { entry: images[0], role: "navigation" },
+      { entry: images[1], role: "navigation" },
+    ],
+    slice: "full",
+  };
+  const secondDouble = {
+    anchor: images[2],
+    navigationEntries: [images[2], images[3]],
+    presentationSlots: [
+      { entry: images[2], role: "navigation" },
+      { entry: images[3], role: "navigation" },
+    ],
+    slice: "full",
+  };
+  const doubleTargets = pagePrefetchTargetGroups(
+    [2, 3],
+    images,
+    [firstDouble, secondDouble]
+  );
+  assert.equal(doubleTargets.length, 1);
+  assert.deepEqual(doubleTargets[0].navigationIndexes, [2, 3]);
+  assert.equal(pageGroupPresentationSlots(doubleTargets[0].targetGroup).length, 2);
+
+  const doublePlan = [{
+    ...doubleTargets[0],
+    requests: [{ cacheKey: "page-2" }, { cacheKey: "page-3" }],
+  }];
+  assert.deepEqual(pagePrefetchRequestKeys([2, 3], doublePlan), ["page-2", "page-3"]);
+  assert.deepEqual(pagePrefetchRequestKeys([2], doublePlan), ["page-2", "page-3"]);
+  assert.equal(
+    pagePrefetchResourceLimit(firstDouble, doublePlan, { ahead: 1, behind: 0 }),
+    4
+  );
+
+  const finalGroup = {
+    anchor: images[3],
+    navigationEntries: [images[3]],
+    presentationSlots: [
+      { entry: images[3], role: "navigation" },
+      { entry: images[0], role: "front_cover_supplement" },
+    ],
+    slice: "full",
+  };
+  const finalTargets = pagePrefetchTargetGroups([3], images, [firstDouble, finalGroup]);
+  assert.equal(finalTargets.length, 1);
+  assert.equal(pageGroupPresentationSlots(finalTargets[0].targetGroup).length, 2);
+  const finalPlan = [{
+    ...finalTargets[0],
+    requests: [{ cacheKey: "last-spread" }, { cacheKey: "cover-spread" }],
+  }];
+  assert.equal(
+    pagePrefetchResourceLimit(firstDouble, finalPlan, { ahead: 1, behind: 0 }),
+    4
+  );
+});
+
+test("missing presentation wire falls back while explicit invalid presentation is rejected", () => {
+  const entry = {
+    name: "page.jpg",
+    address: {
+      path: "C:/book/page.jpg",
+      subresource: { kind: "file" },
+    },
+  };
+  const byAddress = new Map([[remoteAddressIdentity(entry.address), entry]]);
+  assert.deepEqual(normalizePagePresentationSlots(undefined, [entry], byAddress), [
+    { entry, role: "navigation" },
+  ]);
+  assert.equal(
+    normalizePagePresentationSlots(
+      [{ address: entry.address, role: "future_role" }],
+      [entry],
+      byAddress
+    ),
+    null
+  );
+  assert.equal(
+    normalizePagePresentationSlots(
+      [{ address: entry.address, role: "front_cover_supplement" }],
+      [],
+      byAddress,
+      entry
+    ),
+    null
+  );
+  assert.equal(
+    normalizePagePresentationSlots(
+      [
+        { address: entry.address, role: "navigation" },
+        { address: entry.address, role: "front_cover_supplement" },
+      ],
+      [entry],
+      byAddress,
+      entry
+    ),
+    null
+  );
+
+  const cover = {
+    kind: "image",
+    name: "cover.jpg",
+    address: {
+      path: "C:/book/cover.jpg",
+      subresource: { kind: "file" },
+    },
+  };
+  const last = {
+    kind: "image",
+    name: "last.jpg",
+    address: {
+      path: "C:/book/last.jpg",
+      subresource: { kind: "file" },
+    },
+  };
+  const containerAddress = {
+    path: "C:/book",
+    subresource: { kind: "file" },
+  };
+  const validData = {
+    kind: "folder",
+    title: "previous",
+    effective_address: containerAddress,
+    entries: [cover, last],
+    page_groups: [
+      { anchor: cover.address, pages: [cover.address], slice: "full" },
+      { anchor: last.address, pages: [last.address], slice: "full" },
+    ],
+    image_count: 2,
+  };
+  assert.throws(
+    () => normalizeContainerPageGroups(
+      [{
+        anchor: cover.address,
+        pages: [last.address],
+        presentation: [
+          { address: last.address, role: "navigation" },
+          { address: cover.address, role: "front_cover_supplement" },
+        ],
+        slice: "full",
+      }],
+      [cover, last]
+    ),
+    /表示構成/
+  );
+  const previousHistory = globalThis.history;
+  const historyCalls = [];
+  globalThis.history = {
+    state: { mivRoute: true, viewerDepth: 4 },
+    pushState(...args) { historyCalls.push(["push", ...args]); },
+    replaceState(...args) { historyCalls.push(["replace", ...args]); },
+  };
+  try {
+    applyContainerData(containerAddress, validData, false);
+    assert.equal(openViewerPagePositionForTest({}, 1), true);
+    const snapshot = containerRuntimeStateForTest();
+    assert.throws(
+      () =>
+        applyContainerData(containerAddress, {
+          ...validData,
+          title: "invalid replacement",
+          entries: [cover, last],
+          page_groups: [{
+            anchor: last.address,
+            pages: [last.address],
+            presentation: [
+              { address: last.address, role: "navigation" },
+              { address: last.address, role: "front_cover_supplement" },
+            ],
+            slice: "full",
+          }],
+        }, false),
+      /表示構成/
+    );
+    assert.deepEqual(containerRuntimeStateForTest(), snapshot);
+    assert.deepEqual(historyCalls, []);
+  } finally {
+    globalThis.history = previousHistory;
+  }
+});
+
+test("video progress writer serializes ordinary snapshots with session-bound sequence", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  let releaseFirst;
+  globalThis.fetch = (url, options) => {
+    if (url === "/api/raw-prefetch-window") return Promise.resolve(new Response("{}", { status: 200 }));
+    calls.push({ url, options });
+    if (calls.length === 1) {
+      return new Promise((resolve) => {
+        releaseFirst = () => resolve(new Response("{}", { status: 200 }));
+      });
+    }
+    return Promise.resolve(new Response("{}", { status: 200 }));
+  };
+  try {
+    applyRemoteSessionId("progress-owner-a", () => {});
+    const address = { path: testPath("movie.mp4"), subresource: { kind: "file" } };
+    const first = enqueueVideoProgress({ address, remoteSessionId: "progress-owner-a", positionSecs: 12, durationSecs: 90, ended: false });
+    const second = enqueueVideoProgress({ address, remoteSessionId: "progress-owner-a", positionSecs: 18, durationSecs: 90, ended: false });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(calls.length, 1);
+    applyRemoteSessionId("progress-owner-b", () => {});
+    releaseFirst();
+    await Promise.all([first, second]);
+    assert.equal(calls.length, 2);
+    assert.deepEqual(calls.map(({ options }) => JSON.parse(options.body).position_secs), [12, 18]);
+    assert.deepEqual(calls.map(({ options }) => options.headers.get("X-mIV-Remote-Session")),
+      ["progress-owner-a", "progress-owner-a"]);
+    assert.deepEqual(calls.map(({ options }) => JSON.parse(options.body).sequence), [1, 2]);
+  } finally {
+    applyRemoteSessionId(TEST_SESSION_ID, () => {});
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("hidden final progress starts keepalive while an earlier report is stalled", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  let releaseFirst;
+  globalThis.fetch = (url, options) => {
+    if (url === "/api/raw-prefetch-window") return Promise.resolve(new Response("{}", { status: 200 }));
+    calls.push({ url, options });
+    if (calls.length === 1) {
+      return new Promise((resolve) => {
+        releaseFirst = () => resolve(new Response("{}", { status: 200 }));
+      });
+    }
+    return Promise.resolve(new Response("{}", { status: 200 }));
+  };
+  try {
+    applyRemoteSessionId("progress-hidden-owner", () => {});
+    const address = { path: testPath("movie.mp4"), subresource: { kind: "file" } };
+    const earlier = enqueueVideoProgress({ address, remoteSessionId: "progress-hidden-owner", positionSecs: 12, durationSecs: 90, ended: false });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const final = reportVideoProgressBeforePageHide({
+      snapshotProgress: () => ({ address, remoteSessionId: "progress-hidden-owner", positionSecs: 19, durationSecs: 90, ended: false }),
+    });
+    assert.equal(calls.length, 2, "hidden report must start before the stalled fetch settles");
+    assert.equal(calls[1].options.keepalive, true);
+    assert.deepEqual(calls.map(({ options }) => JSON.parse(options.body).sequence), [1, 2]);
+    await final;
+    releaseFirst();
+    await earlier;
+  } finally {
+    applyRemoteSessionId(TEST_SESSION_ID, () => {});
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("reconnected session sends immediately while retained viewer still reports under old owner", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  let releaseOld;
+  globalThis.fetch = (url, options) => {
+    if (url === "/api/raw-prefetch-window") return Promise.resolve(new Response("{}", { status: 200 }));
+    calls.push({ url, options });
+    if (calls.length === 1) {
+      return new Promise((resolve) => {
+        releaseOld = () => resolve(new Response("{}", { status: 200 }));
+      });
+    }
+    return Promise.resolve(new Response("{}", { status: 200 }));
+  };
+  const address = { path: testPath("movie.mp4"), subresource: { kind: "file" } };
+  const oldViewer = {
+    progressRemoteSessionId: "progress-old-owner",
+    snapshotProgress: () => ({
+      address, remoteSessionId: "progress-old-owner",
+      positionSecs: 22, durationSecs: 90, ended: false,
+    }),
+    destroy() { assert.equal(calls.length, 4); },
+  };
+  try {
+    applyRemoteSessionId("progress-old-owner", () => {});
+    retainVideoViewerForTest(oldViewer);
+    const stalled = enqueueVideoProgress({
+      address, remoteSessionId: "progress-old-owner",
+      positionSecs: 12, durationSecs: 90, ended: false,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    applyRemoteSessionId("progress-new-owner", () => {});
+    const oldFinal = reportRetainedVideoProgressForTest();
+    const newReport = enqueueVideoProgress({
+      address, remoteSessionId: "progress-new-owner",
+      positionSecs: 35, durationSecs: 90, ended: false,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(calls.length, 3, "new owner must not wait for the old owner's stalled fetch");
+    assert.deepEqual(calls.map(({ options }) => options.headers.get("X-mIV-Remote-Session")),
+      ["progress-old-owner", "progress-old-owner", "progress-new-owner"]);
+    assert.deepEqual(calls.map(({ options }) => JSON.parse(options.body).sequence), [1, 2, 1]);
+    assert.equal(calls[1].options.keepalive, true);
+    cleanupVideoViewerForTest(oldViewer);
+    assert.equal(calls[3].options.headers.get("X-mIV-Remote-Session"), "progress-old-owner");
+    assert.equal(JSON.parse(calls[3].options.body).sequence, 3);
+    await Promise.all([oldFinal, newReport]);
+    releaseOld();
+    await stalled;
+  } finally {
+    releaseOld?.();
+    retainVideoViewerForTest(null);
+    applyRemoteSessionId(TEST_SESSION_ID, () => {});
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("viewer cleanup starts final keepalive before destroy even when prior report is stalled", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  let releaseFirst;
+  globalThis.fetch = (url, options) => {
+    calls.push({ url, options });
+    if (calls.length === 1) {
+      return new Promise((resolve) => {
+        releaseFirst = () => resolve(new Response("{}", { status: 200 }));
+      });
+    }
+    return Promise.resolve(new Response("{}", { status: 200 }));
+  };
+  const events = [];
+  const address = { path: testPath("movie.mp4"), subresource: { kind: "file" } };
+  try {
+    applyRemoteSessionId("progress-cleanup-owner", () => {});
+    const earlier = enqueueVideoProgress({ address, remoteSessionId: "progress-cleanup-owner", positionSecs: 12, durationSecs: 90, ended: false });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    cleanupVideoViewerForTest({
+      isVideoStreamViewer: true,
+      snapshotProgress() {
+        events.push("snapshot");
+        return { address, remoteSessionId: "progress-cleanup-owner", positionSecs: 20, durationSecs: 90, ended: false };
+      },
+      destroy() {
+        assert.equal(calls.length, 2);
+        assert.equal(calls[1].options.keepalive, true);
+        events.push("destroy");
+      },
+    });
+    assert.deepEqual(events, ["snapshot", "destroy"]);
+    releaseFirst();
+    await earlier;
+  } finally {
+    applyRemoteSessionId(TEST_SESSION_ID, () => {});
+    globalThis.fetch = originalFetch;
+  }
+});
+
+const rawWindowTick = () => new Promise((resolve) => setImmediate(resolve));
+
+async function withRawWindowRuntime(run, send) {
+  const originalFetch = globalThis.fetch;
+  const originalHistory = globalThis.history;
+  cleanupVideoViewerForTest(null);
+  await rawWindowTick();
+  globalThis.history = { state: {}, replaceState() {}, pushState() {} };
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    if (url !== "/api/raw-prefetch-window") return new Response("{}", { status: 200 });
+    const call = { body: JSON.parse(options.body), session: options.headers.get("X-mIV-Remote-Session"), signal: options.signal };
+    calls.push(call);
+    if (send) return send(call, calls.length);
+    return new Response("{}", { status: 200, headers: { "X-mIV-Remote-Session": call.session } });
+  };
+  const viewer = { destroy() {}, syncPagePositionFeedback() {}, requestedPagePresentation: {} };
+  try {
+    applyRemoteSessionId("raw-window-owner", () => {});
+    const entries = Array.from({ length: 8 }, (_, index) => ({
+      name: `page${index}.dng`, kind: "image", address: { path: `C:/raw/page${index}.dng`, subresource: { kind: "file" } },
+    }));
+    const address = { path: "C:/raw", subresource: { kind: "file" } };
+    applyContainerData(address, {
+      kind: "folder", title: "RAW", effective_address: address, entries, image_count: entries.length,
+      page_groups: entries.filter((_, index) => index !== 4).map((entry) => ({ anchor: entry.address, pages: entry === entries[3] ? [entries[3].address, entries[4].address] : [entry.address], slice: "full" })),
+    }, false);
+    openViewerPagePositionForTest(viewer, 3);
+    await run({ viewer, entries, calls });
+  } finally {
+    cleanupVideoViewerForTest(viewer);
+    await rawWindowTick();
+    applyRemoteSessionId(TEST_SESSION_ID, () => {});
+    globalThis.fetch = originalFetch;
+    globalThis.history = originalHistory;
+  }
+}
+
+function commitRawWindowPresentation(viewer) {
+  ImageViewer.prototype.commitPagePresentation.call(viewer, viewerPagePresentationForTest());
+}
+
+test("RAW window emits at actual presentation commit once for cached spread and sends empty on exit", async () => {
+  await withRawWindowRuntime(async ({ viewer, entries, calls }) => {
+    assert.equal(calls.length, 0); // Opening the position is not a display commit.
+    commitRawWindowPresentation(viewer);
+    commitRawWindowPresentation(viewer);
+    await rawWindowTick();
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0].body.entries, [entries[5].address, entries[6].address, entries[2].address]);
+    cleanupVideoViewerForTest(viewer);
+    await rawWindowTick();
+    assert.deepEqual(calls[1].body.entries, []);
+    assert.equal(calls[1].body.window_generation, 2);
+    openViewerPagePositionForTest(viewer, 3);
+    commitRawWindowPresentation(viewer);
+    await rawWindowTick();
+    assert.equal(calls[2].body.window_generation, 3);
+  });
+});
+
+test("RAW reacquisition after position open waits for the first real presentation commit", async () => {
+  await withRawWindowRuntime(async ({ viewer, entries, calls }) => {
+    assert(containerRuntimeStateForTest().position.displayed); // open() initializes it.
+    applyRemoteSessionId("raw-window-owner-b", () => {});
+    await rawWindowTick();
+    assert.equal(calls.length, 0);
+    commitRawWindowPresentation(viewer);
+    commitRawWindowPresentation(viewer);
+    await rawWindowTick();
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].session, "raw-window-owner-b");
+    assert.equal(calls[0].body.window_generation, 1);
+    assert.deepEqual(calls[0].body.entries, [entries[5].address, entries[6].address, entries[2].address]);
+  });
+});
+
+for (const status of [409, 428]) {
+  for (const reacquire of [true, false]) {
+    test(`RAW stale ${status} body cannot revoke ${reacquire ? "reacquired session B" : "session A after its request was aborted"}`, async () => {
+      let releaseBody;
+      let bodyStarted;
+      const bodyEntered = new Promise((resolve) => { bodyStarted = resolve; });
+      const body = new Promise((resolve) => { releaseBody = resolve; });
+      try {
+        await withRawWindowRuntime(async ({ viewer, calls }) => {
+          commitRawWindowPresentation(viewer);
+          await bodyEntered;
+          if (reacquire) applyRemoteSessionId("raw-window-owner-b", () => {});
+          else {
+            openViewerPagePositionForTest(viewer, 4);
+            commitRawWindowPresentation(viewer);
+          }
+          assert(calls[0].signal.aborted);
+          releaseBody({ status: "expired", error: "session_required", message: "stale owner A" });
+          await rawWindowTick();
+          assert.equal(calls.length, 2);
+          assert.equal(calls[1].session, reacquire ? "raw-window-owner-b" : "raw-window-owner");
+          assert.equal(calls[1].body.window_generation, reacquire ? 1 : 2);
+        }, (call, count) => {
+          if (count !== 1) return new Response("{}", { status: 200, headers: { "X-mIV-Remote-Session": call.session } });
+          const response = new Response("{}", { status });
+          response.clone = () => ({ json: () => { bodyStarted(); return body; } });
+          return response;
+        });
+      } finally {
+        releaseBody({ status: "expired", error: "session_required" });
+      }
+    });
+  }
+}
+
+for (const indicator of ["music_note_icon", "bottom_left_badge", "hidden"]) {
+  test(`audio art indicator tile snapshot ${indicator}`, () => {
+    const entry = { kind: "audio", name: "song.mp3", path: testPath("Music/song.mp3") };
+    applyContainerData({path:testPath("Music"),subresource:{kind:"file"}}, { entries:[entry], page_groups:[], thumbnail_presentation:{audio_indicator:indicator} }, false);
+    const tile = createGridTile(entry, 0, new Map(), null, 180, () => {});
+    const preview = tile.children[0];
+    assert.equal(preview.children.filter((node) => node.tagName === "IMG").length, 1);
+    assert.equal(preview.children.filter((node) => node.classList.contains("audio-art-fallback")).length, 1);
+    const markers = preview.children.filter((node) => node.classList.contains("audio-art-indicator") || String(node.className ?? "").includes("audio-art-indicator"));
+    assert.equal(markers.length, indicator === "hidden" ? 0 : 1);
+    if (indicator === "bottom_left_badge") assert.equal(markers[0].textContent, "音声");
+    assert.equal(audioArtRuntimeForTest().indicator, indicator);
+  });
+}
+
+test("audio NoArt binding settles and remount avoids HTTP until explicit payload refresh", async () => {
+  const entry = {kind:"audio",name:"song.mp3",path:testPath("Music/song.mp3")};
+  const address = {path:testPath("Music"),subresource:{kind:"file"}};
+  const payload = {entries:[entry],page_groups:[]};
+  const oldFetch = globalThis.fetch;
+  let requests = 0;
+  const urls = [];
+  globalThis.fetch = async (url) => { requests += 1; urls.push(String(url)); return new Response(JSON.stringify({error:"no_thumbnail"}), {status:422,headers:{"Content-Type":"application/json"}}); };
+  try {
+    applyContainerData(address,payload,false);
+    const owner = audioArtRuntimeForTest().owner;
+    const image = new FakeElement("img");
+    bindThumbnail(image,entry,null,180);
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    assert.equal(owner.terminal(entry), "NoArt");
+    assert.equal(image._thumbnailSettled,true);
+    const remounted = new FakeElement("img");
+    bindThumbnail(remounted,{...entry},null,180);
+    assert.equal(remounted._thumbnailSettled,true);
+    assert.equal(requests,1);
+    applyContainerData(address,payload,false);
+    const refreshed = audioArtRuntimeForTest().owner;
+    assert.notEqual(refreshed.artEpoch,owner.artEpoch);
+    const newImage = new FakeElement("img");
+    bindThumbnail(newImage,entry,null,180);
+    await new Promise((resolve) => setTimeout(resolve,15));
+    assert.equal(requests,2);
+    assert.notEqual(new URL(urls[0],testLocation.origin).searchParams.get("artEpoch"),new URL(urls[1],testLocation.origin).searchParams.get("artEpoch"));
+  } finally { globalThis.fetch = oldFetch; }
+});
+
+
+test("old audio response cannot settle a refreshed listing", async () => {
+  const entry = {kind:"audio",name:"old.mp3",path:testPath("Music/old.mp3")};
+  const address = {path:testPath("Music"),subresource:{kind:"file"}};
+  const payload = {entries:[entry],page_groups:[]};
+  const oldFetch = globalThis.fetch;
+  const pending = deferred();
+  globalThis.fetch = () => pending.promise;
+  try {
+    applyContainerData(address,payload,false);
+    const oldOwner = audioArtRuntimeForTest().owner;
+    bindThumbnail(new FakeElement("img"),entry,null,180);
+    await new Promise((resolve) => setTimeout(resolve,5));
+    applyContainerData(address,payload,false);
+    const nextOwner = audioArtRuntimeForTest().owner;
+    pending.resolve(new Response(JSON.stringify({error:"no_thumbnail"}),{status:422}));
+    await new Promise((resolve) => setTimeout(resolve,15));
+    assert.equal(nextOwner.terminal(entry),undefined);
+    assert.equal(oldOwner.terminal(entry),undefined);
+  } finally { globalThis.fetch = oldFetch; }
+});
+
+test("received audio NoArt persists when its old DOM binding is evicted", async () => {
+  const entry = {kind:"audio",name:"evicted.mp3",path:testPath("Music/evicted.mp3")};
+  const address = {path:testPath("Music"),subresource:{kind:"file"}};
+  const oldFetch = globalThis.fetch;
+  const pending = deferred();
+  let requests = 0;
+  globalThis.fetch = () => { requests += 1; return pending.promise; };
+  try {
+    applyContainerData(address,{entries:[entry],page_groups:[]},false);
+    const owner = audioArtRuntimeForTest().owner;
+    const evicted = new FakeElement("img");
+    bindThumbnail(evicted,entry,null,180);
+    await new Promise((resolve) => setTimeout(resolve,5));
+    evicted._thumbnailGeneration += 1;
+    pending.resolve(new Response(JSON.stringify({error:"no_thumbnail"}),{status:422}));
+    await new Promise((resolve) => setTimeout(resolve,15));
+    assert.equal(owner.terminal(entry),"NoArt");
+    const remount = new FakeElement("img");
+    bindThumbnail(remount,entry,null,180);
+    assert.equal(remount._thumbnailSettled,true);
+    assert.equal(requests,1);
+  } finally { globalThis.fetch = oldFetch; }
+});
+
+for (const supersession of ["listing", "session"]) {
+  test(`old audio success cannot paint after ${supersession} replacement`, async () => {
+    const entry = {kind:"audio",name:"stale.mp3",path:testPath("Music/stale.mp3")};
+    const address = {path:testPath("Music"),subresource:{kind:"file"}};
+    const payload = {entries:[entry],page_groups:[]};
+    const oldFetch = globalThis.fetch;
+    const oldCreate = URL.createObjectURL;
+    const pending = deferred();
+    let objectUrls = 0;
+    globalThis.fetch = () => pending.promise;
+    URL.createObjectURL = () => { objectUrls += 1; return "blob:old-owner"; };
+    try {
+      applyContainerData(address,payload,false);
+      const image = new FakeElement("img");
+      bindThumbnail(image,entry,null,180);
+      await new Promise((resolve) => setTimeout(resolve,5));
+      if (supersession === "session") applyRemoteSessionId("audio-new-session", () => {});
+      else applyContainerData(address,payload,false);
+      pending.resolve(new Response(new Uint8Array([1,2,3]),{status:200}));
+      await new Promise((resolve) => setTimeout(resolve,15));
+      assert.equal(objectUrls,0,"obsolete audio owner cannot allocate or adopt an object URL");
+      assert.equal(image.src,undefined);
+      assert.equal(image.classList.contains("thumb-ready"),false);
+    } finally {
+      applyRemoteSessionId(TEST_SESSION_ID, () => {});
+      globalThis.fetch = oldFetch;
+      URL.createObjectURL = oldCreate;
+    }
+  });
+}
+
+test("normal audio NoArt does not emit error telemetry but generation failure does", async () => {
+  const entry = {kind:"audio",name:"empty.mp3",path:testPath("Music/empty.mp3")};
+  const address = {path:testPath("Music"),subresource:{kind:"file"}};
+  const oldFetch = globalThis.fetch;
+  const errors = [];
+  setRuntimeTestErrorObserver((error) => errors.push(error));
+  try {
+    for (const error of ["no_thumbnail", "miv_thumbnail_error"]) {
+      applyContainerData(address,{entries:[entry],page_groups:[]},false);
+      globalThis.fetch = async () => new Response(JSON.stringify({error}),{status:422});
+      bindThumbnail(new FakeElement("img"),entry,null,180);
+      await new Promise((resolve) => setTimeout(resolve,15));
+      assert.equal(audioArtRuntimeForTest().owner.terminal(entry),error === "no_thumbnail" ? "NoArt" : "Failed");
+      assert.equal(errors.length,error === "no_thumbnail" ? 0 : 1);
+    }
+    assert.equal(errors[0].category,"fetch_non_2xx");
+  } finally {
+    setRuntimeTestErrorObserver(null);
+    globalThis.fetch = oldFetch;
+  }
+});
+
+test("session admission renews retained audio listing so remounted tiles can paint", async () => {
+  const entry = {kind:"audio",name:"session.mp3",path:testPath("Music/session.mp3")};
+  const address = {path:testPath("Music"),subresource:{kind:"file"}};
+  const oldFetch = globalThis.fetch;
+  const oldCreate = URL.createObjectURL;
+  const pending = deferred();
+  let requests = 0;
+  globalThis.fetch = () => ++requests === 1 ? pending.promise : Promise.resolve(new Response(new Uint8Array([1]),{status:200}));
+  URL.createObjectURL = () => "blob:current-session";
+  try {
+    applyContainerData(address,{entries:[entry],page_groups:[]},false);
+    const oldOwner = audioArtRuntimeForTest().owner;
+    const oldImage = new FakeElement("img");
+    bindThumbnail(oldImage,entry,null,180);
+    await new Promise((resolve) => setTimeout(resolve,5));
+    applyRemoteSessionId("audio-renewed-session", () => {});
+    const owner = audioArtRuntimeForTest().owner;
+    assert(owner,"retained ordinary listing gets a current owner");
+    assert.notEqual(owner,oldOwner);
+    assert.notEqual(owner.artEpoch,oldOwner.artEpoch);
+    assert.equal(owner.sessionId,"audio-renewed-session");
+    const currentImage = new FakeElement("img");
+    bindThumbnail(currentImage,entry,null,180);
+    await new Promise((resolve) => setTimeout(resolve,15));
+    assert.equal(currentImage.classList.contains("thumb-ready"),true);
+    pending.resolve(new Response(JSON.stringify({error:"no_thumbnail"}),{status:422}));
+    await new Promise((resolve) => setTimeout(resolve,15));
+    assert.equal(owner.terminal(entry),undefined);
+    assert.equal(oldImage.classList.contains("thumb-ready"),false);
+  } finally {
+    pending.resolve(new Response("{}",{status:422}));
+    applyRemoteSessionId(TEST_SESSION_ID, () => {});
+    URL.createObjectURL = oldCreate;
+    globalThis.fetch = oldFetch;
+  }
+});
+
+for (const extension of ["mp3", "flac"]) {
+  test(`persistent ${extension} keeps logical audio address while forwarding sidecar`, () => {
+    const audio = {path:testPath(`Music/song.${extension}`),subresource:{kind:"file"}};
+    const source = {path:testPath("Music/song.jpg"),subresource:{kind:"file"}};
+    const entry = normalizePersistentCollectionEntry({entry_id:"entry-a",source_identity:"physical-a",name:`song.${extension}`,state:{state:"available",kind:"audio",address:audio,thumbnail_address:source}});
+    assert.equal(entry.kind,"audio");
+    assert.deepEqual(entry.address,audio);
+    assert.deepEqual(entry.thumbnail_address,source);
+    assert.deepEqual(thumbnailRequestQueryForEntry(entry,{w:180,artEpoch:"new-list"}),{path:audio.path,w:180,artEpoch:"new-list",thumbnail_source_path:source.path});
+    assert.equal(persistentCollectionIdentityKey(entry.persistent_identity),"saved:entry-a:physical-a");
+  });
+}
+
+for (const body of [JSON.stringify({error:"miv_thumbnail_error"}), "malformed JSON"]) {
+  test(`audio 422 ${body} settles Failed outside DOM and avoids remount HTTP`, async () => {
+    const entry = {kind:"audio",name:"failed.mp3",path:testPath("Music/failed.mp3")};
+    const oldFetch = globalThis.fetch;
+    let requests = 0;
+    globalThis.fetch = async () => {requests += 1; return new Response(body,{status:422});};
+    try {
+      applyContainerData({path:testPath("Music"),subresource:{kind:"file"}},{entries:[entry],page_groups:[]},false);
+      const image = new FakeElement("img");
+      bindThumbnail(image,entry,null,180);
+      await new Promise((resolve) => setTimeout(resolve,15));
+      assert.equal(audioArtRuntimeForTest().owner.terminal(entry),"Failed");
+      assert.equal(image._thumbnailSettled,true);
+      const remount = new FakeElement("img");
+      bindThumbnail(remount,entry,null,180);
+      assert.equal(remount._thumbnailSettled,true);
+      assert.equal(requests,1);
+    } finally {globalThis.fetch = oldFetch;}
+  });
+}
+
+test("intentional audio binding abort does not publish NoArt or Failed", async () => {
+  const entry = {kind:"audio",name:"aborted.mp3",path:testPath("Music/aborted.mp3")};
+  const oldFetch = globalThis.fetch;
+  globalThis.fetch = (_url,options) => new Promise((_resolve,reject) => options.signal.addEventListener("abort", () => reject(new DOMException("canceled","AbortError"))));
+  try {
+    applyContainerData({path:testPath("Music"),subresource:{kind:"file"}},{entries:[entry],page_groups:[]},false);
+    const image = new FakeElement("img");
+    bindThumbnail(image,entry,null,180);
+    await new Promise((resolve) => setTimeout(resolve,5));
+    image._thumbnailController.abort();
+    await new Promise((resolve) => setTimeout(resolve,5));
+    assert.equal(audioArtRuntimeForTest().owner.terminal(entry),undefined);
+  } finally {globalThis.fetch = oldFetch;}
+});
+
+for (const cancellation of ["eviction", "recycled binding", "aborted controller"]) {
+  test(`audio decode ${cancellation} does not persist a terminal failure`, async () => {
+    const entry = {kind:"audio",name:"decoding.mp3",path:testPath("Music/decoding.mp3")};
+    const replacement = {kind:"audio",name:"next.mp3",path:testPath("Music/next.mp3")};
+    const oldFetch = globalThis.fetch;
+    const pending = deferred();
+    const decodeStarted = deferred();
+    let requests = 0;
+    let decodes = 0;
+    globalThis.fetch = async () => {
+      requests += 1;
+      return new Response(new Uint8Array([1,2,3]),{status:200});
+    };
+    FakeElement.decodeHook = () => {
+      if (++decodes !== 1) return Promise.resolve();
+      decodeStarted.resolve();
+      return pending.promise;
+    };
+    const errors = [];
+    setRuntimeTestErrorObserver((error) => errors.push(error));
+    try {
+      applyContainerData({path:testPath("Music"),subresource:{kind:"file"}},
+        {entries:[entry,replacement],page_groups:[]},false);
+      const owner = audioArtRuntimeForTest().owner;
+      const image = new FakeElement("img");
+      bindThumbnail(image,entry,null,180);
+      await decodeStarted.promise;
+      if (cancellation === "recycled binding") {
+        bindThumbnail(image,replacement,null,180);
+      } else {
+        image._thumbnailController.abort();
+        if (cancellation === "eviction") {
+          image._thumbnailGeneration += 1;
+          image.removeAttribute("src");
+        }
+      }
+      pending.reject(new DOMException("source removed while decoding","EncodingError"));
+      await new Promise((resolve) => setTimeout(resolve,15));
+      assert.equal(owner.terminal(entry),undefined);
+      assert.equal(owner.terminal(replacement),undefined);
+      assert.equal(errors.length,0,"intentional cancellation is not a decode failure");
+      if (cancellation === "recycled binding") {
+        assert.equal(image.classList.contains("thumb-ready"),true);
+        assert.equal(image.classList.contains("thumb-missing"),false);
+      } else {
+        assert.equal(image._thumbnailSettled,false,"canceled binding remains eligible for revisit");
+      }
+      const revisit = new FakeElement("img");
+      bindThumbnail(revisit,entry,null,240);
+      await new Promise((resolve) => setTimeout(resolve,15));
+      assert.equal(revisit.classList.contains("thumb-ready"),true);
+      assert.equal(requests,cancellation === "recycled binding" ? 3 : 2);
+    } finally {
+      FakeElement.decodeHook = null;
+      setRuntimeTestErrorObserver(null);
+      globalThis.fetch = oldFetch;
+    }
+  });
+}
+
+test("current audio decode failure remains terminal for its listing", async () => {
+  const entry = {kind:"audio",name:"corrupt.mp3",path:testPath("Music/corrupt.mp3")};
+  const oldFetch = globalThis.fetch;
+  let requests = 0;
+  globalThis.fetch = async () => {requests += 1; return new Response(new Uint8Array([1]),{status:200});};
+  FakeElement.decodeHook = async () => {throw new DOMException("corrupt image","EncodingError");};
+  try {
+    applyContainerData({path:testPath("Music"),subresource:{kind:"file"}},{entries:[entry],page_groups:[]},false);
+    const image = new FakeElement("img");
+    bindThumbnail(image,entry,null,180);
+    await new Promise((resolve) => setTimeout(resolve,15));
+    assert.equal(audioArtRuntimeForTest().owner.terminal(entry),"Failed");
+    assert.equal(image._thumbnailSettled,true);
+    bindThumbnail(new FakeElement("img"),entry,null,180);
+    assert.equal(requests,1);
+  } finally {
+    FakeElement.decodeHook = null;
+    globalThis.fetch = oldFetch;
+  }
 });

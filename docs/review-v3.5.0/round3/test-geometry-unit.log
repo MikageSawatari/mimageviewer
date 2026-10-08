@@ -1,0 +1,141 @@
+warning: duplicated attribute
+     --> src\app\tests.rs:26463:5
+      |
+26463 |     #[test]
+      |     ^^^^^^^
+      |
+      = note: `#[warn(duplicate_macro_attributes)]` on by default
+
+warning: duplicated attribute
+    --> src\materializer.rs:2137:5
+     |
+2137 |     #[test]
+     |     ^^^^^^^
+
+warning: duplicated attribute
+    --> src\panorama.rs:1822:5
+     |
+1822 |     #[test]
+     |     ^^^^^^^
+
+warning: duplicated attribute
+     --> src\video\native_presenter\render_core.rs:13324:5
+      |
+13324 |     #[test]
+      |     ^^^^^^^
+
+warning: use of deprecated method `quick_xml::events::attributes::Attribute::<'a>::decode_and_unescape_value`: use `Self::decoded_and_normalized_value()`
+   --> src\xmp_reader.rs:461:45
+    |
+461 |                         if let Ok(v) = attr.decode_and_unescape_value(decoder) {
+    |                                             ^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated method `quick_xml::events::attributes::Attribute::<'a>::decode_and_unescape_value`: use `Self::decoded_and_normalized_value()`
+   --> src\xmp_reader.rs:465:45
+    |
+465 |                         if let Ok(v) = attr.decode_and_unescape_value(decoder) {
+    |                                             ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `quick_xml::events::attributes::Attribute::<'a>::unescape_value`: use `Self::normalized_value()`
+   --> src\xmp_reader.rs:868:33
+    |
+868 |             if let Ok(v) = attr.unescape_value() {
+    |                                 ^^^^^^^^^^^^^^
+
+warning: use of deprecated method `quick_xml::events::attributes::Attribute::<'a>::decode_and_unescape_value`: use `Self::decoded_and_normalized_value()`
+    --> src\xmp_reader.rs:1056:42
+     |
+1056 |                     let Ok(value) = attr.decode_and_unescape_value(decoder) else {
+     |                                          ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `ctx`
+     --> src\app\tests.rs:25759:13
+      |
+25759 |         let ctx = egui::Context::default();
+      |             ^^^ help: if this is intentional, prefix it with an underscore: `_ctx`
+      |
+      = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `ctx`
+     --> src\app\tests.rs:25941:13
+      |
+25941 |         let ctx = egui::Context::default();
+      |             ^^^ help: if this is intentional, prefix it with an underscore: `_ctx`
+
+warning: variable does not need to be mutable
+    --> src\remote_ipc\container.rs:7993:13
+     |
+7993 |         let mut png = |width: u32, height: u32| {
+     |             ----^^^
+     |             |
+     |             help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `seek_strip_wheel_is_consumed_and_becomes_one_range_step` is never used
+     --> src\video\native_presenter\render_core.rs:13354:8
+      |
+13354 |     fn seek_strip_wheel_is_consumed_and_becomes_one_range_step() {
+      |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `axis_diagnostics` is never read
+   --> src\video\seek_strip_thumbs.rs:297:16
+    |
+295 | pub(crate) struct StripThumbnailSnapshot {
+    |                   ---------------------- field in this struct
+296 |     pub(crate) axis: StripAxisResolution,
+297 |     pub(crate) axis_diagnostics: Option<StripAxisDiagnostics>,
+    |                ^^^^^^^^^^^^^^^^
+    |
+    = note: `StripThumbnailSnapshot` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: unused `std::result::Result` that must be used
+     --> src\app\tests.rs:26482:9
+      |
+26482 | /         app.with_viewer_context(original, |mounted| {
+26483 | |             assert!(
+26484 | |                 mounted.fs_info_panel.locked,
+26485 | |                 "他方の窓の操作でロックが落ちた"
+...     |
+26492 | |             assert!(!mounted.fs_info_panel.hover_active);
+26493 | |         });
+      | |__________^
+      |
+      = note: this `Result` may be an `Err` variant, which should be handled
+      = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default
+help: use `let _ = ...` to ignore the resulting value
+      |
+26482 |         let _ = app.with_viewer_context(original, |mounted| {
+      |         +++++++
+
+warning: unused return value of `egui::Context::run` that must be used
+     --> src\ui_main.rs:22244:13
+      |
+22244 | /             ctx.run(input.clone(), |ctx| {
+22245 | |                 egui::TopBottomPanel::top("t").show(ctx, |ui| {
+22246 | |                     let right = ui.max_rect().right();
+22247 | |                     ui.horizontal_wrapped(|ui| {
+...     |
+22251 | |                 });
+22252 | |             });
+      | |______________^
+      |
+help: use `let _ = ...` to ignore the resulting value
+      |
+22244 |             let _ = ctx.run(input.clone(), |ctx| {
+      |             +++++++
+
+warning: `mimageviewer` (lib test) generated 15 warnings (run `cargo fix --lib -p mimageviewer --tests` to apply 3 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.76s
+     Running unittests src\lib.rs (target\debug\deps\mimageviewer-fe3ca2e444d02a8b.exe)
+
+running 2 tests
+test ui_fullscreen::tests::continuous_reading_unit_gaps_survive_the_sign_change_at_the_origin ... ok
+test ui_fullscreen::tests::continuous_reading_unit_gaps_hold_when_odd_and_even_lengths_alternate ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 7274 filtered out; finished in 0.00s
+

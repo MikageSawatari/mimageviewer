@@ -37,7 +37,7 @@ use crate::indexer_manager::SearchHandle;
 /// 変更時は `reset_for_new_query` と同じ経路で検索を再実行する。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GlobalSearchFilters {
-    /// None = 登録済み全お気に入りを対象。Some(id) なら単一 favorite に限定。
+    /// None = 登録済み全お気に入りを対象。Some(id) なら当 favorite 配下に限定。
     pub favorite: Option<Uuid>,
     /// None = 全タイプ (画像/PDF/動画/音声)。Some(k) で単一種別に限定。
     pub kind: Option<IndexKind>,
@@ -58,13 +58,32 @@ impl Default for GlobalSearchFilters {
     }
 }
 
+fn resolve_favorite_filter(
+    selected: &mut Option<Uuid>,
+    favorites: &[crate::settings::FavoriteEntry],
+    ownership: &crate::metadata_ownership::MetadataOwnership,
+) -> Vec<Uuid> {
+    // 選択できるかは保存フラグで判定する。同 root の非所有者も ON なら選択を保つ。
+    if selected.is_some_and(|id| {
+        !favorites
+            .iter()
+            .any(|favorite| favorite.id == id && favorite.auto_index_metadata)
+    }) {
+        *selected = None;
+    }
+    match *selected {
+        Some(id) => ownership.filter_set(id),
+        None => ownership.effective_ids(),
+    }
+}
+
 /// ドロップダウン表示用ラベル (UI のみで使う)。
 pub fn kind_label(k: IndexKind) -> &'static str {
     match k {
         IndexKind::Folder => "フォルダ",
         IndexKind::Image => "画像",
         IndexKind::Zip => "ZIP ファイル",
-        IndexKind::Pdf => "PDF ファイル",
+        IndexKind::Pdf => "PDF / EPUB ファイル",
         IndexKind::Video => "動画ファイル",
         IndexKind::Audio => "音声ファイル",
     }
@@ -202,6 +221,149 @@ pub enum GlobalSearchView {
     },
 }
 
+#[derive(Clone)]
+struct SearchViewWish {
+    sequence: u64,
+    run_sequence: u64,
+    query: String,
+    filters: GlobalSearchFilters,
+    source_generation: u64,
+    context: crate::app::ViewerContextId,
+    through_batch: u64,
+    view: GlobalSearchView,
+    sort_mode: ContainerSortMode,
+    order_request: crate::rating_sort::ListingOrderRequest,
+    rating_write_generation: u64,
+    rating_filter: [bool; 6],
+    done: bool,
+    survivor_order: Option<Vec<String>>,
+}
+
+enum SearchPrepareCommand {
+    Batch(u64, Vec<GlobalHit>),
+    Mtime(MtimeLookupResult),
+    View(SearchViewWish),
+    RatingWrites(Vec<(String, u8)>),
+}
+
+enum SearchPrepareOutput {
+    RatedBatch(u64, Vec<GlobalHit>),
+    Ready(SearchViewWish, SearchPreparedItems),
+    Retry(SearchViewWish),
+    Failed(SearchViewWish, String),
+}
+
+struct SearchPreparedItems {
+    items: Vec<GridItem>,
+    image_metas: Vec<Option<(i64, i64)>>,
+    video_thumb_overrides: HashMap<String, std::path::PathBuf>,
+    drilled_counts: HashMap<String, [u32; 6]>,
+    page_edits: crate::app::page_edit_snapshot::StablePageEditProjection,
+    ratings: Option<(HashMap<usize, u8>, u64)>,
+    hit_rating_values: Option<HashMap<String, u8>>,
+    rating_sort_failed: bool,
+    #[cfg(test)]
+    lookup_passes: usize,
+    #[cfg(test)]
+    looked_up_keys: usize,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SearchPrepareTestMetrics {
+    pub(crate) rated_batches: u64,
+    pub(crate) lookup_passes: usize,
+    pub(crate) looked_up_keys: usize,
+    pub(crate) stale_rejections: usize,
+    pub(crate) ui_accept_ms: f64,
+}
+
+pub(crate) struct SearchPageEditPrepare {
+    tx: mpsc::Sender<SearchPrepareCommand>,
+    rx: mpsc::Receiver<SearchPrepareOutput>,
+    cancel: Arc<AtomicBool>,
+    next_sequence: u64,
+    raw_batch_sequence: u64,
+    rated_batch_sequence: u64,
+    in_flight: Option<u64>,
+    desired: Option<SearchViewWish>,
+    #[cfg(test)]
+    hold_ready_for_test: bool,
+    #[cfg(test)]
+    held_ready_for_test: Option<SearchPrepareOutput>,
+    #[cfg(test)]
+    metrics: SearchPrepareTestMetrics,
+}
+
+impl Drop for SearchPageEditPrepare {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+impl SearchPageEditPrepare {
+    fn spawn(
+        ctx: &egui::Context,
+        available: crate::app::page_edit_snapshot::PageEditAvailability,
+        settings: crate::settings::Settings,
+    ) -> Result<Self, String> {
+        let (tx, command_rx) = mpsc::channel();
+        let (output_tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let repaint = ctx.clone();
+        #[cfg(test)]
+        let test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::capture();
+        std::thread::Builder::new()
+            .name("search-page-edit-prepare".into())
+            .spawn(move || {
+                #[cfg(test)]
+                let _test_epoch_scope =
+                    test_epoch_scope.map(crate::page_edit_write_epoch::TestEpochScope::enter);
+                search_prepare_worker(
+                    command_rx,
+                    output_tx,
+                    worker_cancel,
+                    repaint,
+                    available,
+                    settings,
+                );
+            })
+            .map_err(|error| format!("検索結果の準備 worker を起動できません: {error}"))?;
+        Ok(Self {
+            tx,
+            rx,
+            cancel,
+            next_sequence: 0,
+            raw_batch_sequence: 0,
+            rated_batch_sequence: 0,
+            in_flight: None,
+            desired: None,
+            #[cfg(test)]
+            hold_ready_for_test: false,
+            #[cfg(test)]
+            held_ready_for_test: None,
+            #[cfg(test)]
+            metrics: SearchPrepareTestMetrics::default(),
+        })
+    }
+
+    fn send_next(&mut self) {
+        if self.in_flight.is_some() {
+            return;
+        }
+        if let Some(wish) = self.desired.clone() {
+            if self
+                .tx
+                .send(SearchPrepareCommand::View(wish.clone()))
+                .is_ok()
+            {
+                self.in_flight = Some(wish.sequence);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TagBridgeSuggestion {
     pub tag: String,
@@ -217,6 +379,8 @@ pub struct GlobalSearchState {
     pub query: String,
     /// 最後に実行したクエリ (変更検知用)
     pub last_executed: String,
+    /// Changes on every new search intent, including the debounce interval.
+    pub run_sequence: u64,
     /// 次フレームでフォーカス要求
     pub focus_request: bool,
     /// TextEdit がフォーカスを持っているか (他キーバインドが取らないようにするため)
@@ -227,6 +391,8 @@ pub struct GlobalSearchState {
     pub last_sort_at: Option<Instant>,
     /// 起動中の検索
     pub pending: Option<SearchHandle>,
+    /// One prepare owner per Ctrl+G run. Hit batches use a FIFO; view wishes coalesce.
+    pub(crate) page_edit_prepare: Option<SearchPageEditPrepare>,
     /// 親コンテナ path → 集約済みヒット (docs §10.4.2 ContainerHit)
     pub containers: HashMap<PathBuf, ContainerHit>,
     /// 生の全ヒット (drill-down 時に container でフィルタするため保持)
@@ -301,11 +467,13 @@ impl Default for GlobalSearchState {
             active: false,
             query: String::new(),
             last_executed: String::new(),
+            run_sequence: 0,
             focus_request: false,
             has_focus: false,
             last_change_at: None,
             last_sort_at: None,
             pending: None,
+            page_edit_prepare: None,
             containers: HashMap::new(),
             all_hits: Vec::new(),
             aggregate: false,
@@ -413,8 +581,10 @@ impl GlobalSearchState {
 
     /// 新規検索を開始する (既存 pending があれば cancel してから)。
     pub fn reset_for_new_query(&mut self) {
+        self.run_sequence = self.run_sequence.wrapping_add(1);
         // SearchHandle は Drop で cancel するので、take() だけで OK
         self.pending = None;
+        self.page_edit_prepare = None;
         self.containers.clear();
         self.all_hits.clear();
         // 新クエリは一覧から開始し、自動切替を再有効化、drill state もリセット (§4.3.2)。
@@ -533,7 +703,7 @@ fn image_representative_from_hit(hit_path: &str) -> Option<ContainerRepresentati
         .map(str::to_ascii_lowercase)?;
     // PDF は 1 ページ目をサムネに。ScanSnap 等 PDF だらけのフォルダでも
     // コンテナに画像アイコンだけでなく中身プレビューが出るようになる。
-    if ext == "pdf" {
+    if crate::folder_tree::is_paged_document_path(Path::new(file_part)) {
         return Some(ContainerRepresentative {
             path: PathBuf::from(file_part),
             zip_entry: None,
@@ -755,6 +925,12 @@ pub(crate) fn build_aggregated_items(
 ) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
     // Newer/Older ソートのとき mtime を遅延取得 (初回のみ fs::metadata 同期呼び出し)。
     ensure_container_mtime_populated(state);
+    build_aggregated_items_prepared(state)
+}
+
+fn build_aggregated_items_prepared(
+    state: &GlobalSearchState,
+) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
     let containers = sort_containers_with_mode(&state.containers, state.sort_mode);
     let items: Vec<GridItem> = containers
         .iter()
@@ -791,8 +967,9 @@ pub(crate) fn build_flat_items(
     rating_filter: &[bool; 6],
 ) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
     let rf_active = !rating_filter.iter().all(|&b| b);
-    // (GridItem, basename, mtime) を集めてからまとめてソートする。
-    let mut rows: Vec<(GridItem, String, i64)> = Vec::with_capacity(state.all_hits.len());
+    // (GridItem, basename, sort metadata) を集めてからまとめてソートする。
+    let mut rows: Vec<(GridItem, String, crate::settings::ListingSortMetadata)> =
+        Vec::with_capacity(state.all_hits.len());
     for h in &state.all_hits {
         // ZIP 内エントリはアイテム索引対象外 (§3.2)。stale index 対策で防御的にスキップ。
         if is_zip_hit_path(&h.path) {
@@ -818,7 +995,11 @@ pub(crate) fn build_flat_items(
             .and_then(|n| n.to_str())
             .unwrap_or("")
             .to_string();
-        rows.push((item, basename, h.mtime));
+        rows.push((
+            item,
+            basename,
+            crate::settings::ListingSortMetadata::new(h.mtime, h.file_size),
+        ));
     }
     let mut keyed_rows: Vec<_> = rows
         .into_iter()
@@ -827,7 +1008,7 @@ pub(crate) fn build_flat_items(
             (row, key)
         })
         .collect();
-    keyed_rows.sort_by(|(a, ak), (b, bk)| sort_order.compare_name_keys(ak, a.2, bk, b.2));
+    keyed_rows.sort_by(|(a, ak), (b, bk)| sort_order.compare_listing_keys(ak, a.2, bk, b.2));
     rows = keyed_rows.into_iter().map(|(row, _)| row).collect();
     let placeholder = Some((0_i64, 0_i64));
     let image_metas: Vec<Option<(i64, i64)>> = vec![placeholder; rows.len()];
@@ -841,14 +1022,13 @@ pub(crate) fn build_flat_items(
 /// 含む子フォルダ (Folder 枝、件数バッジ付き) だけを並べる。ヒットを含まない枝は
 /// 枝刈りされる。
 ///
-/// image_metas は UI スレッドでの `fs::metadata` 同期呼び出しで埋める。ヒット件数は
-/// 通常数 〜 数百件で、1 ディレクトリあたり 10ms オーダー以内に収まる想定。
-/// 大量ヒット環境でのボトルネック化が観測されたら、GlobalHit に mtime/file_size を
-/// 持たせて Tantivy の STORED フィールドから取り出す方式に切り替える (v0.8.x 課題)。
+/// image_metas は従来どおり placeholder。並べ替えには worker が STORED field から得た
+/// `GlobalHit::{mtime,file_size}` を使い、UI thread の `fs::metadata` は増やさない。
 pub(crate) fn build_drilled_items(
     state: &GlobalSearchState,
     current_path: &Path,
     is_zip: bool,
+    sort_order: crate::settings::SortOrder,
     rating_filter: &[bool; 6],
 ) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
     if is_zip {
@@ -859,7 +1039,7 @@ pub(crate) fn build_drilled_items(
     // App::rating_filter_active と同じ判定式を使う (固定 [bool; 6] へのアクセスなので
     // 自動ベクトル化された ~1ns、ヘルパー化するメリットなし)。
     let rf_active = !rating_filter.iter().all(|&b| b);
-    let mut direct_files: Vec<PathBuf> = Vec::new();
+    let mut direct_files: Vec<(PathBuf, crate::settings::ListingSortMetadata)> = Vec::new();
     // 直下子フォルダ → その配下のヒット件数 (rating_filter 通過後)
     let mut sub_counts: HashMap<PathBuf, usize> = HashMap::new();
 
@@ -882,7 +1062,10 @@ pub(crate) fn build_drilled_items(
             continue;
         }
         if hp_parent == current_path {
-            direct_files.push(hp);
+            direct_files.push((
+                hp,
+                crate::settings::ListingSortMetadata::new(h.mtime, h.file_size),
+            ));
         } else {
             // current_path の直下の子フォルダ名を拾う
             let rel = match hp_parent.strip_prefix(current_path) {
@@ -898,8 +1081,38 @@ pub(crate) fn build_drilled_items(
 
     // サブフォルダ (Folder) を名前昇順 → 続いて直下ファイル (Image) を名前昇順
     let mut sub_vec: Vec<(PathBuf, usize)> = sub_counts.into_iter().collect();
-    sub_vec.sort_by(|a, b| a.0.cmp(&b.0));
-    direct_files.sort();
+    if sort_order.is_size() {
+        sub_vec.sort_by(|a, b| {
+            let a_name = a.0.file_name().and_then(|name| name.to_str()).unwrap_or("");
+            let b_name = b.0.file_name().and_then(|name| name.to_str()).unwrap_or("");
+            let a_key = sort_order.name_key(a_name);
+            let b_key = sort_order.name_key(b_name);
+            sort_order
+                .compare_listing_keys(
+                    &a_key,
+                    crate::settings::ListingSortMetadata::new(0, None),
+                    &b_key,
+                    crate::settings::ListingSortMetadata::new(0, None),
+                )
+                .then_with(|| a.0.cmp(&b.0))
+        });
+    } else {
+        // 非サイズ順は従来のPathBuf順をexact維持する。
+        sub_vec.sort_by(|a, b| a.0.cmp(&b.0));
+    }
+    direct_files.sort_by(|(a_path, a_meta), (b_path, b_meta)| {
+        let a_name = a_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let b_name = b_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let a_key = sort_order.name_key(a_name);
+        let b_key = sort_order.name_key(b_name);
+        sort_order.compare_listing_keys(&a_key, *a_meta, &b_key, *b_meta)
+    });
 
     let mut items: Vec<GridItem> = Vec::with_capacity(sub_vec.len() + direct_files.len());
     let mut image_metas: Vec<Option<(i64, i64)>> = Vec::with_capacity(items.capacity());
@@ -912,7 +1125,7 @@ pub(crate) fn build_drilled_items(
         items.push(GridItem::Folder(sub_path.clone()));
         image_metas.push(placeholder);
     }
-    for f in &direct_files {
+    for (f, _) in &direct_files {
         // 拡張子で GridItem の種類を分岐する。旧実装は無条件に
         // `GridItem::Image` を入れていたため、ScanSnap のような PDF だらけの
         // favorite に drill-in すると全サムネが「画像フォーマット判定不可」で
@@ -960,6 +1173,123 @@ fn build_drilled_zip_items(
     (items, image_metas)
 }
 
+fn search_item_rating_key(item: &GridItem) -> Option<String> {
+    match item {
+        GridItem::ZipImage {
+            zip_path,
+            entry_name,
+        } => Some(crate::adjustment_db::zip_entry_key(zip_path, entry_name)),
+        _ => crate::rating_sort::physical_item_key(item),
+    }
+}
+
+fn retain_search_survivor_order_and_append_candidates(
+    items: &mut Vec<GridItem>,
+    image_metas: &mut Vec<Option<(i64, i64)>>,
+    survivors: &[String],
+) {
+    let candidates = std::mem::take(items)
+        .into_iter()
+        .zip(std::mem::take(image_metas))
+        .collect::<Vec<_>>();
+    let positions = survivors
+        .iter()
+        .enumerate()
+        .map(|(i, key)| (key.as_str(), i))
+        .collect::<HashMap<_, _>>();
+    let mut retained = Vec::new();
+    let mut added = Vec::new();
+    for (item, meta) in candidates {
+        if let Some(&position) = positions.get(item.perf_key().as_str()) {
+            retained.push((position, item, meta));
+        } else {
+            added.push((item, meta));
+        }
+    }
+    retained.sort_by_key(|(position, _, _)| *position);
+    for (_, item, meta) in retained {
+        items.push(item);
+        image_metas.push(meta);
+    }
+    for (item, meta) in added {
+        items.push(item);
+        image_metas.push(meta);
+    }
+}
+
+fn search_rating_keys_for_view(state: &GlobalSearchState, view: &GlobalSearchView) -> Vec<String> {
+    let mut keys = state
+        .all_hits
+        .iter()
+        .map(|hit| hit_rating_key(&hit.path))
+        .collect::<Vec<_>>();
+    if let GlobalSearchView::DrilledInto {
+        current_path,
+        is_zip: false,
+        ..
+    } = view
+    {
+        for hit in &state.all_hits {
+            if is_zip_hit_path(&hit.path) {
+                continue;
+            }
+            let path = Path::new(&hit.path);
+            let Some(parent) = path.parent() else {
+                continue;
+            };
+            if !path_is_under_or_eq(parent, current_path) || parent == current_path {
+                continue;
+            }
+            if let Ok(relative) = parent.strip_prefix(current_path)
+                && let Some(first) = relative.components().next()
+            {
+                keys.push(crate::adjustment_db::normalize_path(
+                    &current_path.join(first.as_os_str()),
+                ));
+            }
+        }
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
+fn sort_search_items_by_rating(
+    items: &mut Vec<GridItem>,
+    image_metas: &mut Vec<Option<(i64, i64)>>,
+    view: &GlobalSearchView,
+    spec: crate::rating_sort::RatingSortSpec,
+    facts: &crate::rating_db::CompleteRatingFacts,
+) {
+    let rows = std::mem::take(items)
+        .into_iter()
+        .zip(std::mem::take(image_metas))
+        .map(|(item, meta)| {
+            let key = search_item_rating_key(&item)
+                .map(|key| facts.key_for_requested(&key))
+                .unwrap_or(crate::rating_sort::RatingSortKey::Unsupported);
+            let name = crate::filename_sort::SortNameKey::file_name(item.name().as_ref());
+            let category = if matches!(view, GlobalSearchView::DrilledInto { is_zip: false, .. })
+                && matches!(item, GridItem::Folder(_))
+            {
+                0u8
+            } else {
+                1u8
+            };
+            (item, meta, key, name, category)
+        })
+        .collect::<Vec<_>>();
+    let mut rows = rows;
+    rows.sort_by(|a, b| {
+        a.4.cmp(&b.4)
+            .then_with(|| spec.compare(a.2, &a.3, b.2, &b.3))
+    });
+    for (item, meta, _, _, _) in rows {
+        items.push(item);
+        image_metas.push(meta);
+    }
+}
+
 /// `child` が `ancestor` と等しいか配下にあれば true。
 fn path_is_under_or_eq(child: &Path, ancestor: &Path) -> bool {
     child == ancestor || child.starts_with(ancestor)
@@ -976,7 +1306,9 @@ fn grid_item_from_fs_hit_path(path: &Path) -> Option<GridItem> {
         .unwrap_or("")
         .to_ascii_lowercase();
     match ext.as_str() {
-        "pdf" => Some(GridItem::PdfFile(path.to_path_buf())),
+        _ if crate::folder_tree::is_paged_document_path(path) => {
+            Some(GridItem::PdfFile(path.to_path_buf()))
+        }
         "zip" => Some(GridItem::ZipFile(path.to_path_buf())),
         _ if crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&ext.as_str()) => {
             Some(GridItem::Video(path.to_path_buf()))
@@ -1094,13 +1426,294 @@ pub(crate) fn thumb_reuse_key(item: &GridItem) -> Option<ThumbReuseKey> {
         // ZipDir / Stack は Ctrl+G 検索結果には出ない (通常フォルダ閲覧専用)。
         // 検索 rebuild の reuse 対象外 (スタックの drill/back は install_new_items 経由で
         // この関数を通らない)。
-        GridItem::ZipDir { .. } | GridItem::Stack { .. } => None,
+        GridItem::ZipDir { .. }
+        | GridItem::Stack { .. }
+        | GridItem::CollectionPlaceholder { .. } => None,
     }
 }
 
 // -----------------------------------------------------------------------
 // App 側との連携 (impl App 拡張)
 // -----------------------------------------------------------------------
+
+fn search_prepare_worker(
+    rx: mpsc::Receiver<SearchPrepareCommand>,
+    tx: mpsc::Sender<SearchPrepareOutput>,
+    cancel: Arc<AtomicBool>,
+    ctx: egui::Context,
+    available: crate::app::page_edit_snapshot::PageEditAvailability,
+    sidecar_settings: crate::settings::Settings,
+) {
+    let mut state = GlobalSearchState::default();
+    let rating_db =
+        crate::rating_db::RatingDb::open_readonly(&crate::rating_db::RatingDb::db_path()).ok();
+    let mut snapshot = crate::app::page_edit_snapshot::PageEditSnapshot::default();
+    let mut queried = HashSet::new();
+    #[cfg(test)]
+    let mut lookup_passes = 0usize;
+    #[cfg(test)]
+    let mut looked_up_keys = 0usize;
+    let mut cache_completion = crate::page_edit_write_epoch::PAGE_EDIT_WRITES
+        .sample()
+        .completed_writes;
+    while let Ok(command) = rx.recv() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        match command {
+            SearchPrepareCommand::RatingWrites(updates) => {
+                let values: HashMap<_, _> = updates.into_iter().collect();
+                for hit in &mut state.all_hits {
+                    if let Some(stars) = values.get(&hit_rating_key(&hit.path)) {
+                        hit.stars = *stars;
+                    }
+                }
+            }
+            SearchPrepareCommand::Batch(sequence, mut hits) => {
+                if let Some(db) = rating_db.as_ref() {
+                    let keys = hits
+                        .iter()
+                        .map(|hit| hit_rating_key(&hit.path))
+                        .collect::<Vec<_>>();
+                    match db.get_many_complete(&keys, 0) {
+                        Ok(facts) => {
+                            for (hit, key) in hits.iter_mut().zip(&keys) {
+                                hit.stars = facts.value_for_requested(key);
+                            }
+                        }
+                        Err(error) => {
+                            crate::logger::log(format!(
+                                "search: complete batch rating read failed: {error}"
+                            ));
+                            let ratings = db.get_many(&keys);
+                            for (hit, key) in hits.iter_mut().zip(&keys) {
+                                if let Some(&stars) = ratings.get(key) {
+                                    hit.stars = stars;
+                                }
+                            }
+                        }
+                    }
+                }
+                for hit in &hits {
+                    state.accumulate_hit(hit);
+                }
+                if tx
+                    .send(SearchPrepareOutput::RatedBatch(sequence, hits))
+                    .is_err()
+                {
+                    break;
+                }
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
+            }
+            SearchPrepareCommand::Mtime(result) => {
+                if let Some(container) = state.containers.get_mut(&result.path) {
+                    container.mtime = result.mtime;
+                }
+            }
+            SearchPrepareCommand::View(wish) => {
+                state.sort_mode = wish.sort_mode;
+                let rating_order_applies = matches!(
+                    wish.order_request,
+                    crate::rating_sort::ListingOrderRequest::Rating(_)
+                ) && !matches!(wish.view, GlobalSearchView::Aggregated);
+                let rating_facts = match wish.order_request {
+                    crate::rating_sort::ListingOrderRequest::Standard(_) => None,
+                    crate::rating_sort::ListingOrderRequest::Rating(_) if rating_order_applies => {
+                        let keys = search_rating_keys_for_view(&state, &wish.view);
+                        rating_db.as_ref().and_then(|db| {
+                            match db.get_many_complete(&keys, wish.rating_write_generation) {
+                                Ok(facts) => Some(facts),
+                                Err(error) => {
+                                    crate::logger::log(format!(
+                                        "search: rating order read failed: {error}"
+                                    ));
+                                    None
+                                }
+                            }
+                        })
+                    }
+                    crate::rating_sort::ListingOrderRequest::Rating(_) => None,
+                };
+                let rating_sort_failed = rating_order_applies && rating_facts.is_none();
+                if let Some(facts) = rating_facts.as_ref() {
+                    for hit in &mut state.all_hits {
+                        hit.stars = facts.value_for_requested(&hit_rating_key(&hit.path));
+                    }
+                }
+                let sort = wish.order_request.standard_fallback();
+                let (mut items, mut image_metas, drilled_counts) = match &wish.view {
+                    GlobalSearchView::Flat => {
+                        let (items, metas) = build_flat_items(&state, sort, &wish.rating_filter);
+                        (items, metas, HashMap::new())
+                    }
+                    GlobalSearchView::Aggregated => {
+                        let (items, metas) = build_aggregated_items_prepared(&state);
+                        (items, metas, HashMap::new())
+                    }
+                    GlobalSearchView::DrilledInto {
+                        current_path,
+                        is_zip,
+                        ..
+                    } => {
+                        let counts =
+                            compute_drilled_subfolder_counts(&state, current_path, *is_zip);
+                        let (items, metas) = build_drilled_items(
+                            &state,
+                            current_path,
+                            *is_zip,
+                            sort,
+                            &wish.rating_filter,
+                        );
+                        (items, metas, counts)
+                    }
+                };
+                if let (crate::rating_sort::ListingOrderRequest::Rating(spec), Some(facts)) =
+                    (wish.order_request, rating_facts.as_ref())
+                    && !matches!(wish.view, GlobalSearchView::Aggregated)
+                {
+                    sort_search_items_by_rating(
+                        &mut items,
+                        &mut image_metas,
+                        &wish.view,
+                        spec,
+                        facts,
+                    );
+                }
+                if let Some(survivors) = wish.survivor_order.as_ref() {
+                    retain_search_survivor_order_and_append_candidates(
+                        &mut items,
+                        &mut image_metas,
+                        survivors,
+                    );
+                }
+                let ratings = rating_facts.as_ref().map(|facts| {
+                    let cache = items
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, item)| {
+                            let key = search_item_rating_key(item)?;
+                            Some((idx, facts.value_for_requested(&key)))
+                        })
+                        .collect();
+                    (cache, facts.write_generation())
+                });
+                let hit_rating_values = rating_facts.as_ref().map(|facts| {
+                    state
+                        .all_hits
+                        .iter()
+                        .map(|hit| {
+                            let key = hit_rating_key(&hit.path);
+                            let stars = facts.value_for_requested(&key);
+                            (key, stars)
+                        })
+                        .collect()
+                });
+                let before = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.sample();
+                if cache_completion != before.completed_writes {
+                    snapshot = Default::default();
+                    queried.clear();
+                    cache_completion = before.completed_writes;
+                }
+                if before.active_writers != 0 {
+                    let _ = tx.send(SearchPrepareOutput::Retry(wish));
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    continue;
+                }
+                let mut new_items = Vec::new();
+                for item in &items {
+                    if let Some(key) = crate::edit_source::page_key_for_grid_item(item)
+                        && queried.insert(key)
+                    {
+                        new_items.push(item.clone());
+                    }
+                }
+                let loaded = crate::app::page_edit_snapshot::PageEditSnapshot::load_and_project(
+                    &new_items, available, &cancel,
+                );
+                #[cfg(test)]
+                if !new_items.is_empty() {
+                    lookup_passes += 1;
+                    looked_up_keys += new_items.len();
+                }
+                match loaded {
+                    Ok(Some((new_snapshot, _))) => snapshot.merge_from(new_snapshot),
+                    Ok(None) => break,
+                    Err(error) => {
+                        queried.clear();
+                        snapshot = Default::default();
+                        let _ = tx.send(SearchPrepareOutput::Failed(wish, error));
+                        ctx.request_repaint_of(egui::ViewportId::ROOT);
+                        continue;
+                    }
+                }
+                let projection = snapshot.project(&items);
+                let after = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.sample();
+                if let Some(page_edits) =
+                    crate::app::page_edit_snapshot::PageEditSnapshot::stable_projection(
+                        before,
+                        after,
+                        snapshot.clone(),
+                        projection,
+                    )
+                {
+                    let media_paths = items
+                        .iter()
+                        .filter_map(|item| match item {
+                            GridItem::Video(path) | GridItem::Audio(path) => Some(path.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    let Some(sidecars) =
+                        crate::app::folder_scan::discover_aggregate_video_sidecars_while(
+                            &sidecar_settings,
+                            &media_paths,
+                            64,
+                            || !cancel.load(Ordering::Relaxed),
+                        )
+                    else {
+                        break;
+                    };
+                    if sidecars.skipped_parents > 0 {
+                        crate::logger::log(format!(
+                            "search sidecar discovery capped: scanned={} skipped={}",
+                            sidecars.scanned_parents, sidecars.skipped_parents
+                        ));
+                    }
+                    for (parent, error) in &sidecars.scan_errors {
+                        crate::logger::log(format!(
+                            "search sidecar discovery failed {}: {error}",
+                            parent.display()
+                        ));
+                    }
+                    let video_thumb_overrides = sidecars.by_video_path;
+                    cache_completion = after.completed_writes;
+                    let _ = tx.send(SearchPrepareOutput::Ready(
+                        wish,
+                        SearchPreparedItems {
+                            items,
+                            image_metas,
+                            video_thumb_overrides,
+                            drilled_counts,
+                            page_edits,
+                            ratings,
+                            hit_rating_values,
+                            rating_sort_failed,
+                            #[cfg(test)]
+                            lookup_passes,
+                            #[cfg(test)]
+                            looked_up_keys,
+                        },
+                    ));
+                } else {
+                    queried.clear();
+                    snapshot = Default::default();
+                    let _ = tx.send(SearchPrepareOutput::Retry(wish));
+                }
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
+            }
+        }
+    }
+}
 
 impl App {
     /// Ctrl+G 検索結果ビュー専用の軽量 items 差し替え (Codex P2 指摘対応)。
@@ -1123,8 +1736,20 @@ impl App {
         items: Vec<GridItem>,
         image_metas: Vec<Option<(i64, i64)>>,
     ) {
+        self.replace_search_view_items_with_ratings(items, image_metas, None, false);
+    }
+
+    fn replace_search_view_items_with_ratings(
+        &mut self,
+        items: Vec<GridItem>,
+        image_metas: Vec<Option<(i64, i64)>>,
+        prepared_ratings: Option<(HashMap<usize, u8>, u64)>,
+        preserve_rating_details_order: bool,
+    ) {
         use std::sync::atomic::Ordering;
         debug_assert_eq!(items.len(), image_metas.len());
+        // The Rating grid can still be edited while the first search result is pending.
+        self.save_leaving_rating_grid_position();
         // 検索ビューに切り替えるのでネスト ZIP ツリーナビ状態を破棄する。
         // (zip_nav 維持の軽量経路 zip_nav_show_current_level は install_new_items を
         // 直接呼ぶのでここを通らない。)
@@ -1135,6 +1760,7 @@ impl App {
         // 復活してしまう (Codex P2)。
         self.stack_mode_requested = false;
         self.stack_view = None;
+        self.stack_return_state = None;
         self.stack_showing_flat = false;
         // 進行中のスタックスクリプトワーカーも明示破棄する。`poll_stack_script` の妥当性判定
         // (stack_mode_requested=false) でも次フレームに破棄されるが、他の解除経路
@@ -1202,6 +1828,15 @@ impl App {
             .iter()
             .filter_map(|&i| self.items.get(i).and_then(thumb_reuse_key))
             .collect();
+        let detail_keys = (preserve_rating_details_order
+            && self.settings.grid_view_mode == crate::settings::GridViewMode::Details
+            && self.settings.details_sort_key == crate::settings::DetailsSortKey::Rating)
+            .then(|| {
+                self.details_order
+                    .iter()
+                    .filter_map(|&index| self.items.get(index).map(GridItem::perf_key))
+                    .collect::<Vec<_>>()
+            });
         // PDF render pool に残っている旧 search 結果の render ジョブを stale prune
         // する。`bump_render_epoch_only` は cancel_token / catchup を touch しないので、
         // worker 再 spawn なしの replace 経路で worker を殺さない。
@@ -1219,6 +1854,10 @@ impl App {
         // reload_queue / heavy_io_queue / tag_prewarm_*) を一括破棄。
         // (`self.checked` も中で clear される。下で content-key から復元)
         self.invalidate_idx_state_and_queues();
+        if let Some((cache, generation)) = prepared_ratings {
+            self.rating_cache = cache;
+            self.overlay_rating_session_writes_since(generation);
+        }
         // 旧 thumbnails を新位置にマージ。Loaded のままなら upload backlog に乗らず、
         // 同一フレームで前回のテクスチャがそのまま見え続けるのでちらつかない。
         // 補正用 source pixels も同じ content-key で移し、補正済み tex は再生成させる。
@@ -1289,7 +1928,21 @@ impl App {
             self.scroll_to_selected = false;
         }
         self.scroll_hint.store(0, Ordering::Relaxed);
-        self.rebuild_visible_indices();
+        if let Some(keys) = detail_keys {
+            let positions = self
+                .items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| (item.perf_key(), index))
+                .collect::<HashMap<_, _>>();
+            self.details_order = keys
+                .iter()
+                .filter_map(|key| positions.get(key).copied())
+                .collect();
+            self.rebuild_visible_indices_after_rating_publication();
+        } else {
+            self.rebuild_visible_indices();
+        }
         // auto_aspect: invalidate で samples を全クリアしたが、Ctrl+G では preserved
         // で thumbnails が新 idx に復元されている。Auto モードならそれらから samples を
         // 再構築 (Codex P3 2026-05)。
@@ -1299,7 +1952,11 @@ impl App {
         }
         // tag_prewarm worker は invalidate_idx_state_and_queues で cancel されているので、
         // 検索結果向けに再起動 + fts_meta から tags_cache を再プリウォーム。
-        self.prewarm_grid_tags();
+        {
+            let _section =
+                crate::perf::stall::PollSection::start(crate::perf::stall::PollPart::TagPrewarm);
+            self.prewarm_grid_tags();
+        }
         // Ctrl+G 結果の動画サムネ抽出スレッドを (必要に応じて) 再 spawn する。
         // streaming 中は pin 持ち動画のみ、`done=true` 後は全動画を Shell API で展開する。
         self.respawn_search_video_thread();
@@ -1362,11 +2019,8 @@ impl App {
     ///    破棄されない。
     ///
     /// 2. **同名 stem の sidecar 画像 leak 回避**:
-    ///    `App::video_thumb_overrides` は前フォルダの sidecar を stem キーで保持する
-    ///    (src/app.rs:`hydrate_video_thumb_overrides_from_current_folder`)。Ctrl+G の
-    ///    結果は複数フォルダにまたがるため、これを渡すと別フォルダの同 stem 動画に
-    ///    sidecar 画像が誤って当たる。よって empty map を渡す (sidecar は Ctrl+G では
-    ///    使わない)。Codex P1 #2 指摘。
+    ///    The accepted prepared-list worker supplies a full-path source map shared by video/audio.
+    ///    Only that generation's map is passed; identical stems in unrelated parents cannot leak.
     ///
     /// 3. **重複 Shell 呼び出し抑制**:
     ///    既存の per-search cancel (`search_video_thread_cancel`) を毎回上書きする
@@ -1425,12 +2079,15 @@ impl App {
         // 周期で走り、検索結果に動画が数千〜数万件あると 1 件ずつ `db.lookup()` を
         // 呼ぶと UI スレッドで大量の SQLite I/O が発生する。`lookup_webps_many` で
         // `IN` 句に集約することで 500 件チャンク × N 回の prepared statement に圧縮。
+        let pin_fetch_section =
+            crate::perf::stall::PollSection::start(crate::perf::stall::PollPart::VideoPinFetch);
         let pin_blobs: std::collections::HashMap<std::path::PathBuf, Vec<u8>> =
             if let Some(db) = self.video_pin_db.as_ref() {
                 db.lookup_webps_many(&not_loaded_paths)
             } else {
                 std::collections::HashMap::new()
             };
+        drop(pin_fetch_section);
         let pin_paths: HashSet<std::path::PathBuf> = pin_blobs.keys().cloned().collect();
         let streaming = !self.global_search.done;
         let candidates = Self::compute_search_video_candidates(
@@ -1459,14 +2116,13 @@ impl App {
         // 新 cancel を作成して保存。
         let new_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.search_video_thread_cancel = Some(std::sync::Arc::clone(&new_cancel));
-        // empty thumb_overrides で sidecar leak を回避 (`respawn_search_video_thread`
-        // doc 内 #2 参照)。
+        // Full paths come from this accepted search-list preparation, not the previous physical folder.
         self.spawn_video_thread(
             self.tx.clone(),
             new_cancel,
             candidates,
-            std::collections::HashMap::new(),
-            pin_blobs,
+            self.video_thumb_overrides.clone(),
+            std::sync::Arc::new(pin_blobs),
         );
     }
 
@@ -1508,18 +2164,42 @@ impl App {
         if !self.global_search.active {
             return;
         }
+        if let Some(crate::app::top_level_grid_view::TopLevelGridRestore::SmartFolder(state)) =
+            self.top_level_grid_view.return_to().cloned()
+            && self.begin_smart_search_return_navigation(state)
+        {
+            return;
+        }
         let return_context = self.dismiss_global_search_without_restore();
         self.restore_view_return_context(return_context);
     }
 
     /// Ctrl+G を終了して戻り先だけを引き渡す。スマートフォルダ等へ直行する場合に、
     /// 元の合成ビューを一度prepareして直後にcancelする競合を避ける。
+    pub(crate) fn global_search_return_context_without_restore(
+        &self,
+        canonical_return_to: Option<&crate::app::top_level_grid_view::TopLevelGridRestore>,
+    ) -> crate::app::top_level_grid_view::TopLevelGridRestore {
+        self.view_return_context_from_canonical_or_fallback(
+            canonical_return_to.map(std::borrow::Cow::Borrowed),
+            || {
+                let path = self.global_search.saved_folder.clone();
+                let subfolder_restore =
+                    self.global_search_subfolder_restore.clone().or_else(|| {
+                        self.subfolder_expansion_restore_for_synthetic_path(path.as_deref())
+                    });
+                (path, subfolder_restore)
+            },
+        )
+    }
+
     pub(crate) fn dismiss_global_search_without_restore(
         &mut self,
     ) -> crate::app::top_level_grid_view::TopLevelGridRestore {
         self.cancel_pending_folder_nav();
         // pending があれば SearchHandle の Drop impl で cancel される
         self.global_search.pending = None;
+        self.global_search.page_edit_prepare = None;
         // Ctrl+G 結果の動画サムネ抽出スレッドを cancel。後続の load_folder で
         // cancel_token 自体も bump されるが、こちらは Shell call 中の worker に
         // 早めに「やめてよい」を伝える専用フラグ。
@@ -1558,16 +2238,15 @@ impl App {
             .global_search_subfolder_restore
             .take()
             .or_else(|| self.take_subfolder_expansion_restore_for_synthetic_path(path.as_deref()));
-        let rating_view_stars = self.view_return_rating_view_stars_for_path(path.as_deref());
-        let fallback =
-            self.view_return_context_from_parts(path, subfolder_restore, rating_view_stars);
-        self.top_level_grid_view
-            .take_return_to()
-            .unwrap_or(fallback)
+        let canonical = self.top_level_grid_view.take_return_to();
+        self.view_return_context_from_canonical_or_fallback(
+            canonical.map(std::borrow::Cow::Owned),
+            || (path, subfolder_restore),
+        )
     }
 
     /// debounce 経過チェック + 新クエリがあれば検索 spawn (App::update から毎フレーム呼ぶ)。
-    pub(crate) fn poll_global_search_debounce(&mut self) {
+    pub(crate) fn poll_global_search_debounce(&mut self, ctx: &egui::Context) {
         if !self.global_search.active {
             return;
         }
@@ -1579,15 +2258,57 @@ impl App {
         let Some(t) = self.global_search.last_change_at else {
             return;
         };
-        if t.elapsed() < Duration::from_millis(DEBOUNCE_MS) {
+        let debounce = Duration::from_millis(DEBOUNCE_MS);
+        let elapsed = t.elapsed();
+        if elapsed < debounce {
+            // request_repaint_after はこの pass だけの要求なので、期限に達するまで
+            // poll owner が毎 pass 再武装する。
+            ctx.request_repaint_after(debounce - elapsed);
             return;
         }
-        self.spawn_global_search();
+        let _section =
+            crate::perf::stall::PollSection::start(crate::perf::stall::PollPart::SearchDebounce);
+        self.spawn_global_search(ctx);
+    }
+
+    fn restart_search_page_edit_prepare(&mut self, ctx: &egui::Context) -> bool {
+        self.global_search.page_edit_prepare = None;
+        match SearchPageEditPrepare::spawn(
+            ctx,
+            crate::app::page_edit_snapshot::PageEditAvailability::for_app(self),
+            self.settings.thumbnail_source_discovery_snapshot(),
+        ) {
+            Ok(prepare) => self.global_search.page_edit_prepare = Some(prepare),
+            Err(error) => {
+                self.global_search.reject_message = Some(error);
+                self.global_search.done = true;
+                return false;
+            }
+        }
+        true
     }
 
     /// 現在のクエリで検索を spawn する。
-    pub(crate) fn spawn_global_search(&mut self) {
+    pub(crate) fn spawn_global_search(&mut self, ctx: &egui::Context) {
+        // Indexerのreadinessとは独立した、保存設定だけのフィルター健全化。
+        // 準備中も削除済み/対象外のfavoriteを解除し、表示と検索scopeを一致させる。
+        let ownership = crate::metadata_ownership::metadata_ownership(
+            &self.settings.favorites,
+            &[self.settings.books_root_path()],
+        );
+        let favs = resolve_favorite_filter(
+            &mut self.global_search.filters.favorite,
+            &self.settings.favorites,
+            &ownership,
+        );
+        if !self.indexer_init.is_terminal() {
+            self.global_search.reject_message = Some("検索の準備中".to_string());
+            return;
+        }
         self.global_search.reset_for_new_query();
+        if !self.restart_search_page_edit_prepare(ctx) {
+            return;
+        }
         self.global_search.last_executed = self.global_search.query.clone();
         if let Some(db) = self.tags_db.as_ref() {
             self.global_search.tag_bridge_suggestions = tag_bridge_suggestions_for_query(
@@ -1597,24 +2318,7 @@ impl App {
             );
         }
 
-        // Codex P2 #3: indexer_manager の有無とは独立に filter の健全化を先に行う。
-        // 選択中の favorite が削除された / auto_index_metadata を外された場合、UI ラベルと
-        // 検索スコープが食い違う (ラベル = 名前表示、スコープ = 全対象) のを避けるため
-        // フィルタ側を None に倒して UI も「すべて」に戻す。
-        let all_favs: Vec<uuid::Uuid> = self
-            .settings
-            .favorites
-            .iter()
-            .filter(|f| f.auto_index_metadata)
-            .map(|f| f.id)
-            .collect();
-        if let Some(id) = self.global_search.filters.favorite {
-            if !all_favs.contains(&id) {
-                self.global_search.filters.favorite = None;
-            }
-        }
-
-        let Some(mgr) = self.indexer_manager.as_ref() else {
+        let Some(mgr) = self.indexer_init.as_ref() else {
             self.global_search.reject_message =
                 Some("全文検索インデクサが利用できません".to_string());
             self.global_search.done = true;
@@ -1622,17 +2326,20 @@ impl App {
             return;
         };
 
-        let favs: Vec<uuid::Uuid> = match self.global_search.filters.favorite {
-            Some(id) => vec![id],
-            None => all_favs,
-        };
         let scope = crate::global_search::SearchScope {
             kinds: self.global_search.filters.kind.map(|k| vec![k]),
             target: self.global_search.filters.target.clone(),
             mode: self.global_search.filters.or_mode.into(),
+            ignore_epub: self.settings.epub_file_handling_ignores_epub(),
         };
 
-        let handle = mgr.spawn_search(self.global_search.query.clone(), favs, scope);
+        let repaint_ctx = ctx.clone();
+        let wake: crate::global_search::SearchWake = Arc::new(move || {
+            // Ctrl+G の owner は main/root grid。worker 完了時に別 viewport の pass が
+            // 進行中でも、current viewport ではなく ROOT を明示して起こす。
+            repaint_ctx.request_repaint_of(egui::ViewportId::ROOT);
+        });
+        let handle = mgr.spawn_search(self.global_search.query.clone(), favs, scope, Some(wake));
         self.global_search.pending = Some(handle);
         // items を空にして "検索中" 表示に切り替え
         self.rebuild_items_from_global_search();
@@ -1650,6 +2357,9 @@ impl App {
         loop {
             match pending.rx.try_recv() {
                 Ok(result) => {
+                    if let Some(prepare) = self.global_search.page_edit_prepare.as_ref() {
+                        let _ = prepare.tx.send(SearchPrepareCommand::Mtime(result.clone()));
+                    }
                     if let Some(container) = self.global_search.containers.get_mut(&result.path) {
                         if container.mtime.is_none() {
                             container.mtime = result.mtime;
@@ -1678,6 +2388,7 @@ impl App {
 
     /// SearchStreamEvent を try_recv で処理する (毎フレーム呼ぶ)。
     pub(crate) fn poll_global_search_events(&mut self, ctx: &egui::Context) {
+        self.poll_search_page_edit_prepare(ctx);
         if self.global_search.done {
             return;
         }
@@ -1699,63 +2410,34 @@ impl App {
         let mut events_processed = 0;
         let mut changed = false;
         let mut stats_changed = false;
+        let mut search_perf_section = None;
         while events_processed < MAX_EVENTS_PER_FRAME {
-            match rx.try_recv() {
+            let event = rx.try_recv();
+            if !matches!(event, Err(crossbeam_channel::TryRecvError::Empty)) {
+                crate::perf::stall::PollSection::ensure(
+                    &mut search_perf_section,
+                    crate::perf::stall::PollPart::SearchEvents,
+                );
+            }
+            match event {
                 Ok(SearchStreamEvent::Batch {
-                    mut hits,
+                    hits,
                     scanned_candidates,
                     valid_hits,
                 }) => {
-                    // drilled view のサブフォルダバッジ件数を rating_filter で
-                    // 絞り込めるよう、batch ごとに rating DB を bulk lookup して
-                    // hit.stars に詰める。1 batch = PAGE_SIZE (=500) 件で IN 句
-                    // 1 発、warm SQLite で 1-3ms 程度。
-                    // perf::event で span を取り、cold sqlite で重くなったら
-                    // analyze_perf.py で検知できるようにしておく。
-                    let did_rating_lookup = if let Some(db) = self.rating_db.as_ref() {
-                        let perf_enabled = crate::perf::is_enabled();
-                        let t0 = std::time::Instant::now();
-                        let keys: Vec<String> =
-                            hits.iter().map(|h| hit_rating_key(&h.path)).collect();
-                        let map = db.get_many(&keys);
-                        for (h, k) in hits.iter_mut().zip(keys.iter()) {
-                            if let Some(&v) = map.get(k) {
-                                h.stars = v;
-                            }
-                        }
-                        if perf_enabled {
-                            let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                            crate::perf::event(
-                                "search",
-                                "rating_bulk_lookup",
-                                None,
-                                0,
-                                &[
-                                    ("count", serde_json::Value::from(keys.len())),
-                                    ("ms", serde_json::Value::from(ms)),
-                                ],
-                            );
-                        }
-                        !keys.is_empty()
-                    } else {
-                        false
-                    };
-                    for h in &hits {
-                        self.global_search.accumulate_hit(h);
+                    // Accepted batches enter the worker FIFO in order. The worker does
+                    // the rating lookup before returning each rated batch to this owner.
+                    if let Some(prepare) = self.global_search.page_edit_prepare.as_mut() {
+                        prepare.raw_batch_sequence = prepare.raw_batch_sequence.wrapping_add(1);
+                        let _ = prepare.tx.send(SearchPrepareCommand::Batch(
+                            prepare.raw_batch_sequence,
+                            hits,
+                        ));
                     }
                     self.global_search.total_scanned = scanned_candidates;
                     self.global_search.total_valid = valid_hits;
                     stats_changed = true;
-                    if !hits.is_empty() {
-                        changed = true;
-                    }
                     events_processed += 1;
-                    // UI スレッド予算を守るため、rating bulk lookup を含む batch は
-                    // 1 フレーム 1 件に制限する (Codex P2)。8 batch 同時着 → ~24ms
-                    // を回避し、次フレームに残りを回す (request_repaint 済み)。
-                    if did_rating_lookup {
-                        break;
-                    }
                 }
                 Ok(SearchStreamEvent::Done { truncated, reason }) => {
                     self.global_search.done = true;
@@ -1790,6 +2472,7 @@ impl App {
         if stats_changed {
             self.update_global_search_address();
         }
+        self.poll_search_page_edit_prepare(ctx);
         if changed {
             // docs §10.4.3: 順序再評価は 1 秒毎で十分 (頻繁な入れ替えでチラつかない)
             let should_resort = match self.global_search.last_sort_at {
@@ -1808,8 +2491,346 @@ impl App {
             }
         }
         if !self.global_search.done {
-            // 次イベントを拾うため再描画を要求
-            ctx.request_repaint();
+            // worker event は callback が ROOT を起こす。即時 repaint は、この frame の
+            // drain 予算で channel に event が残った可能性がある場合だけ要求する。
+            if events_processed >= MAX_EVENTS_PER_FRAME {
+                ctx.request_repaint();
+            } else {
+                // callback 取りこぼし時の保険。delayed request は pass ごとに消えるため、
+                // pending 中は poll owner が毎 pass 再武装する。
+                ctx.request_repaint_after(Duration::from_millis(1000));
+            }
+        }
+    }
+
+    pub(crate) fn poll_search_page_edit_prepare(&mut self, ctx: &egui::Context) {
+        let Some(mut prepare) = self.global_search.page_edit_prepare.take() else {
+            return;
+        };
+        let mut rebuild = false;
+        let mut writes_after_read = Vec::new();
+        let mut search_perf_section = None;
+        for _ in 0..MAX_EVENTS_PER_FRAME {
+            #[cfg(test)]
+            if prepare.hold_ready_for_test && prepare.held_ready_for_test.is_some() {
+                break;
+            }
+            #[cfg(test)]
+            let received = prepare
+                .held_ready_for_test
+                .take()
+                .map(Ok)
+                .unwrap_or_else(|| prepare.rx.try_recv());
+            #[cfg(not(test))]
+            let received = prepare.rx.try_recv();
+            let output = match received {
+                Ok(output) => output,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    crate::perf::stall::PollSection::ensure(
+                        &mut search_perf_section,
+                        crate::perf::stall::PollPart::SearchEvents,
+                    );
+                    prepare.in_flight = None;
+                    prepare.desired = None;
+                    break;
+                }
+            };
+            crate::perf::stall::PollSection::ensure(
+                &mut search_perf_section,
+                crate::perf::stall::PollPart::SearchEvents,
+            );
+            match output {
+                SearchPrepareOutput::RatedBatch(sequence, hits) => {
+                    if sequence == prepare.rated_batch_sequence.wrapping_add(1) {
+                        prepare.rated_batch_sequence = sequence;
+                        #[cfg(test)]
+                        {
+                            prepare.metrics.rated_batches = sequence;
+                        }
+                        for hit in &hits {
+                            let mut hit = hit.clone();
+                            if let Some(stars) =
+                                self.rating_session_value_for_key(&hit_rating_key(&hit.path))
+                            {
+                                hit.stars = stars;
+                            }
+                            self.global_search.accumulate_hit(&hit);
+                        }
+                        let should_resort = self.global_search.last_sort_at.is_none_or(|at| {
+                            at.elapsed() >= Duration::from_millis(RESORT_INTERVAL_MS)
+                        });
+                        if should_resort || self.global_search.done {
+                            rebuild = self.items_are_global_search_view;
+                            self.global_search.last_sort_at = Some(Instant::now());
+                        }
+                    }
+                }
+                SearchPrepareOutput::Ready(wish, prepared) => {
+                    let _section = crate::perf::stall::PollSection::start(
+                        crate::perf::stall::PollPart::PreparedAdoption,
+                    );
+                    #[cfg(test)]
+                    if prepare.hold_ready_for_test {
+                        prepare.held_ready_for_test =
+                            Some(SearchPrepareOutput::Ready(wish, prepared));
+                        break;
+                    }
+                    if prepare.in_flight != Some(wish.sequence) {
+                        continue;
+                    }
+                    prepare.in_flight = None;
+                    let latest = prepare
+                        .desired
+                        .as_ref()
+                        .is_some_and(|desired| desired.sequence == wish.sequence);
+                    let same_surface = self.global_search.active
+                        && wish.run_sequence == self.global_search.run_sequence
+                        && wish.query == self.global_search.query
+                        && wish.filters == self.global_search.filters
+                        && wish.context == self.virtual_list_context_id()
+                        && wish.source_generation == self.items_generation
+                        && (self.items_are_global_search_view
+                            || !self.global_search.last_executed.is_empty())
+                        && wish.view == self.global_search.view()
+                        && wish.sort_mode == self.global_search.sort_mode
+                        && wish.order_request
+                            == crate::rating_sort::ListingOrderRequest::from_settings(
+                                &self.settings,
+                            )
+                        && wish.rating_filter == self.effective_rating_filter()
+                        && wish.done == self.global_search.done;
+                    if latest && same_surface {
+                        // replace_search_view_items clears the outgoing index maps. Publish any
+                        // dirty view-trim row before the stamp check, so that write cannot make
+                        // this prepared projection stale inside the accepted swap.
+                        self.persist_pending_view_trim_state();
+                    }
+                    if latest
+                        && same_surface
+                        && crate::page_edit_write_epoch::PAGE_EDIT_WRITES
+                            .accepts(prepared.page_edits.stamp)
+                    {
+                        #[cfg(test)]
+                        let accept_started = Instant::now();
+                        #[cfg(test)]
+                        {
+                            prepare.metrics.lookup_passes = prepared.lookup_passes;
+                            prepare.metrics.looked_up_keys = prepared.looked_up_keys;
+                        }
+                        if let Some(values) = prepared.hit_rating_values.as_ref() {
+                            for hit in &mut self.global_search.all_hits {
+                                if let Some(stars) = values.get(&hit_rating_key(&hit.path)) {
+                                    hit.stars = *stars;
+                                }
+                            }
+                        }
+                        writes_after_read =
+                            self.rating_session_writes_after(wish.rating_write_generation);
+                        // Source selection belongs to this accepted prepared list; unchanged contexts are untouched.
+                        for (idx, item) in self.items.iter().enumerate() {
+                            if let GridItem::Video(path) | GridItem::Audio(path) = item {
+                                let key = crate::path_key::normalize_keep_drive(path);
+                                if self.video_thumb_overrides.get(&key)
+                                    != prepared.video_thumb_overrides.get(&key)
+                                {
+                                    if let Some(thumbnail) = self.thumbnails.get_mut(idx) {
+                                        *thumbnail = ThumbnailState::Pending;
+                                    }
+                                }
+                            }
+                        }
+                        self.video_thumb_overrides = prepared.video_thumb_overrides;
+                        self.search_drilled_folder_counts = prepared.drilled_counts;
+                        self.replace_search_view_items_with_ratings(
+                            prepared.items,
+                            prepared.image_metas,
+                            prepared.ratings,
+                            wish.survivor_order.is_some(),
+                        );
+                        if prepared.rating_sort_failed {
+                            self.show_feedback_toast(
+                                "評価順を読み込めなかったため名前順で表示しました".into(),
+                            );
+                        }
+                        self.install_prepared_page_edits(prepared.page_edits);
+                        self.restore_search_selection_after_prepare();
+                        self.update_global_search_address();
+                        #[cfg(test)]
+                        {
+                            prepare.metrics.ui_accept_ms =
+                                accept_started.elapsed().as_secs_f64() * 1000.0;
+                        }
+                        prepare.desired = None;
+                    } else if !self.global_search.active
+                        || !self.items_are_global_search_view
+                            && wish.source_generation != self.items_generation
+                    {
+                        prepare.desired = None;
+                    } else {
+                        #[cfg(test)]
+                        {
+                            prepare.metrics.stale_rejections += 1;
+                        }
+                    }
+                }
+                SearchPrepareOutput::Retry(wish) => {
+                    if prepare.in_flight == Some(wish.sequence) {
+                        prepare.in_flight = None;
+                    }
+                }
+                SearchPrepareOutput::Failed(wish, error) => {
+                    if prepare.in_flight == Some(wish.sequence) {
+                        prepare.in_flight = None;
+                        if prepare
+                            .desired
+                            .as_ref()
+                            .is_some_and(|desired| desired.sequence == wish.sequence)
+                        {
+                            prepare.desired = None;
+                            crate::logger::log(format!("search-page-edit-prepare: {error}"));
+                            self.show_feedback_toast(
+                                "[検索結果を準備できませんでした]".to_string(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if self.global_search.active && prepare.in_flight.is_none() && !rebuild {
+            if let Some(wish) = prepare.desired.as_mut() {
+                crate::perf::stall::PollSection::ensure(
+                    &mut search_perf_section,
+                    crate::perf::stall::PollPart::SearchEvents,
+                );
+                prepare.next_sequence = prepare.next_sequence.wrapping_add(1);
+                wish.sequence = prepare.next_sequence;
+                wish.source_generation = self.items_generation;
+                wish.context = self.virtual_list_context_id();
+                wish.through_batch = prepare.raw_batch_sequence;
+                wish.done = self.global_search.done;
+                prepare.send_next();
+            }
+        }
+        self.global_search.page_edit_prepare = Some(prepare);
+        if !writes_after_read.is_empty() {
+            let values = writes_after_read
+                .iter()
+                .map(|(key, stars)| (key.as_str(), *stars))
+                .collect::<HashMap<_, _>>();
+            let changed_rows = (0..self.items.len())
+                .filter_map(|index| {
+                    let key = self.rating_path_key(index)?;
+                    values
+                        .get(key.as_str())
+                        .copied()
+                        .map(|stars| (index, stars))
+                })
+                .collect::<Vec<_>>();
+            for (index, stars) in changed_rows {
+                self.rating_cache.insert(index, stars);
+            }
+            self.publish_search_rating_writes(&writes_after_read);
+            self.rebuild_visible_indices_after_rating_publication();
+        }
+        if rebuild {
+            self.rebuild_items_from_global_search();
+        }
+        if self
+            .global_search
+            .page_edit_prepare
+            .as_ref()
+            .is_some_and(|p| p.in_flight.is_some())
+        {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_search_page_edit_prepare_for_test(&mut self, ctx: &egui::Context) {
+        self.global_search.active = true;
+        self.global_search.last_executed = "test".into();
+        self.global_search.page_edit_prepare = Some(
+            SearchPageEditPrepare::spawn(
+                ctx,
+                crate::app::page_edit_snapshot::PageEditAvailability::for_app(self),
+                self.settings.thumbnail_source_discovery_snapshot(),
+            )
+            .unwrap(),
+        );
+        self.rebuild_items_from_global_search();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_next_search_ready_for_test(&mut self) {
+        self.global_search
+            .page_edit_prepare
+            .as_mut()
+            .unwrap()
+            .hold_ready_for_test = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn search_ready_is_held_for_test(&self) -> bool {
+        self.global_search
+            .page_edit_prepare
+            .as_ref()
+            .unwrap()
+            .held_ready_for_test
+            .is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_search_ready_for_test(&mut self) {
+        self.global_search
+            .page_edit_prepare
+            .as_mut()
+            .unwrap()
+            .hold_ready_for_test = false;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn search_prepare_metrics_for_test(&self) -> SearchPrepareTestMetrics {
+        self.global_search
+            .page_edit_prepare
+            .as_ref()
+            .unwrap()
+            .metrics
+    }
+
+    #[cfg(test)]
+    pub(crate) fn search_prepare_cancel_for_test(&self) -> Arc<AtomicBool> {
+        Arc::clone(
+            &self
+                .global_search
+                .page_edit_prepare
+                .as_ref()
+                .unwrap()
+                .cancel,
+        )
+    }
+
+    fn restore_search_selection_after_prepare(&mut self) {
+        if let Some(target) = self.global_search.restore_select_path.take() {
+            let index = self
+                .items
+                .iter()
+                .position(|item| match item {
+                    GridItem::SearchContainer { path, .. } => path == &target,
+                    GridItem::Folder(path)
+                    | GridItem::Image(path)
+                    | GridItem::ZipFile(path)
+                    | GridItem::PdfFile(path) => path == &target,
+                    GridItem::ZipImage { zip_path, .. } => zip_path == &target,
+                    GridItem::PdfPage { pdf_path, .. } => pdf_path == &target,
+                    _ => false,
+                })
+                .filter(|&index| self.idx_visible(index))
+                .or_else(|| self.visible_indices.first().copied());
+            if let Some(index) = index {
+                self.selected = Some(index);
+                self.scroll_to_selected = true;
+            }
         }
     }
 
@@ -1820,6 +2841,78 @@ impl App {
     /// thumbnails / visible_indices と、Codex P2-1/P2-2 で指摘された
     /// search_filter / checked を整合させるだけに留める。
     pub(crate) fn rebuild_items_from_global_search(&mut self) {
+        self.request_search_view_build(None);
+    }
+
+    pub(crate) fn publish_search_rating_writes(&mut self, updates: &[(String, u8)]) {
+        if updates.is_empty() || !self.global_search.active {
+            return;
+        }
+        let values: HashMap<_, _> = updates
+            .iter()
+            .map(|(key, stars)| (key.as_str(), *stars))
+            .collect();
+        for hit in &mut self.global_search.all_hits {
+            if let Some(stars) = values.get(hit_rating_key(&hit.path).as_str()) {
+                hit.stars = *stars;
+            }
+        }
+        if let GlobalSearchView::DrilledInto {
+            current_path,
+            is_zip,
+            ..
+        } = self.global_search.view()
+        {
+            self.search_drilled_folder_counts =
+                compute_drilled_subfolder_counts(&self.global_search, &current_path, is_zip);
+        }
+        if let Some(prepare) = self.global_search.page_edit_prepare.as_ref() {
+            let _ = prepare
+                .tx
+                .send(SearchPrepareCommand::RatingWrites(updates.to_vec()));
+        }
+        if self.items_are_global_search_view
+            && self
+                .global_search
+                .page_edit_prepare
+                .as_ref()
+                .is_none_or(|prepare| prepare.in_flight.is_none())
+        {
+            let survivors = self.items.iter().map(GridItem::perf_key).collect();
+            self.request_search_view_build(Some(survivors));
+        }
+    }
+
+    fn request_search_view_build(&mut self, survivor_order: Option<Vec<String>>) {
+        if self.global_search.page_edit_prepare.is_some() {
+            self.global_search.maybe_auto_switch_aggregate();
+            ensure_container_mtime_populated(&mut self.global_search);
+            let context = self.virtual_list_context_id();
+            let rating_filter = self.effective_rating_filter();
+            let view = self.global_search.view();
+            let prepare = self.global_search.page_edit_prepare.as_mut().unwrap();
+            prepare.next_sequence = prepare.next_sequence.wrapping_add(1);
+            prepare.desired = Some(SearchViewWish {
+                sequence: prepare.next_sequence,
+                run_sequence: self.global_search.run_sequence,
+                query: self.global_search.query.clone(),
+                filters: self.global_search.filters.clone(),
+                source_generation: self.items_generation,
+                context,
+                through_batch: prepare.raw_batch_sequence,
+                view,
+                sort_mode: self.global_search.sort_mode,
+                order_request: crate::rating_sort::ListingOrderRequest::from_settings(
+                    &self.settings,
+                ),
+                rating_write_generation: self.rating_session_write_generation,
+                rating_filter,
+                done: self.global_search.done,
+                survivor_order,
+            });
+            prepare.send_next();
+            return;
+        }
         // Codex P3 対応: DrilledInto ビューで done=true rebuild を迎えたとき、
         // `build_drilled_items` は `ensure_container_mtime_populated` を呼ばないため
         // mtime が埋まらないまま残る。結果、その状態で `global_search_ctrl_nav`
@@ -1834,7 +2927,14 @@ impl App {
         // にも反映。旧版は settings.rating_filter を直接使っていたため、suppress 発動して
         // も drill 内で未評価 hits が build_drilled_items 側で落とされていた。
         let rating_filter = self.effective_rating_filter();
-        let sort_order = self.settings.sort_order;
+        let order_request = crate::rating_sort::ListingOrderRequest::from_settings(&self.settings);
+        let sort_order = order_request.standard_fallback();
+        if matches!(
+            order_request,
+            crate::rating_sort::ListingOrderRequest::Rating(_)
+        ) {
+            self.show_feedback_toast("評価順を準備できなかったため名前順で表示しました".into());
+        }
         let (items, image_metas) = match self.global_search.view() {
             GlobalSearchView::Flat => {
                 // 一覧ビューはサブフォルダバッジを使わない。残骸を破棄する。
@@ -1856,7 +2956,13 @@ impl App {
                 // バッジ件数表示には raw 集計が必要 (なし含む 6 バケット)。
                 self.search_drilled_folder_counts =
                     compute_drilled_subfolder_counts(&self.global_search, current_path, is_zip);
-                build_drilled_items(&self.global_search, current_path, is_zip, &rating_filter)
+                build_drilled_items(
+                    &self.global_search,
+                    current_path,
+                    is_zip,
+                    sort_order,
+                    &rating_filter,
+                )
             }
         };
         self.replace_search_view_items(items, image_metas);
@@ -2164,15 +3270,34 @@ impl App {
         match self.global_search.view() {
             GlobalSearchView::Flat | GlobalSearchView::Aggregated => {
                 // 集約時はコンテナ数、一覧時はヒット数を件数として表示する。
+                let searching = self.global_search.is_searching();
                 let n = if self.global_search.aggregate {
                     self.global_search.containers.len()
                 } else {
-                    self.global_search.all_hits.len()
+                    // Rated batches reach all_hits only after worker I/O. The stream count is
+                    // known on receipt and remains correct through Done while they catch up.
+                    self.global_search
+                        .all_hits
+                        .len()
+                        .max(self.global_search.total_valid)
                 };
+                let n = crate::ui_helpers::format_count(n as u64);
                 if query.is_empty() {
                     self.address = "🌐 アイテム検索".to_string();
-                } else if self.global_search.is_searching() {
-                    self.address = format!("🌐 アイテム検索: \"{query}\"  ({n} 件 / 検索中)");
+                } else if searching {
+                    let scanned =
+                        crate::ui_helpers::format_count(self.global_search.total_scanned as u64);
+                    if self.global_search.aggregate {
+                        let hits =
+                            crate::ui_helpers::format_count(self.global_search.total_valid as u64);
+                        self.address = format!(
+                            "🌐 アイテム検索: \"{query}\"  ({n} 件 / 検索中 · ヒット {hits} 件 · {scanned} 件を確認)"
+                        );
+                    } else {
+                        self.address = format!(
+                            "🌐 アイテム検索: \"{query}\"  ({n} 件 / 検索中 · {scanned} 件を確認)"
+                        );
+                    }
                 } else {
                     self.address = format!("🌐 アイテム検索: \"{query}\"  ({n} 件)");
                 }
@@ -2203,9 +3328,13 @@ impl App {
                 let mut segs = vec![root_name];
                 segs.extend(rel);
                 let suffix = if self.global_search.is_searching() {
-                    "  (検索中)"
+                    let hits =
+                        crate::ui_helpers::format_count(self.global_search.total_valid as u64);
+                    let scanned =
+                        crate::ui_helpers::format_count(self.global_search.total_scanned as u64);
+                    format!("  ({hits} 件 / 検索中 · {scanned} 件を確認)")
                 } else {
-                    ""
+                    String::new()
                 };
                 self.address = format!(
                     "🌐 アイテム検索: \"{query}\" > {}{suffix}",
@@ -2213,6 +3342,15 @@ impl App {
                 );
             }
         }
+    }
+
+    /// Ctrl+G の空グリッドに出す進捗文言。
+    pub(crate) fn global_search_progress_message(&self) -> String {
+        format!(
+            "検索中… {} 件を確認 (ヒット {} 件)",
+            crate::ui_helpers::format_count(self.global_search.total_scanned as u64),
+            crate::ui_helpers::format_count(self.global_search.total_valid as u64),
+        )
     }
 
     /// Ctrl+G トップパネルの描画 (既存 render_favsearch_bar と同パターン)。
@@ -2257,7 +3395,8 @@ impl App {
                     "Ctrl+G はお気に入りの「アイテム索引」を使い、画像 / PDF / 動画を\n\
                      ファイル名・EXIF・AI プロンプト等で横断検索します。\n\
                      アイテム索引が作成されていないお気に入りは対象になりません。\n\
-                     お気に入り編集で「アイテムを索引化する」を有効にしてください。",
+                     「お気に入り」→「編集」で、対象の行の「アイテム索引 (Ctrl+G)」に\n\
+                     チェックを入れてください。",
                 );
                 let mut output = crate::ime_focus::show_singleline(
                     ui,
@@ -2433,11 +3572,16 @@ impl App {
                     Some((msg.clone(), egui::Color32::from_rgb(200, 120, 40), None))
                 } else if self.global_search.is_searching() {
                     Some((
-                        format!("ヒット {} 件（検索中）", self.global_search.total_valid),
+                        format!(
+                            "ヒット {} 件（検索中）",
+                            crate::ui_helpers::format_count(self.global_search.total_valid as u64)
+                        ),
                         egui::Color32::from_rgb(180, 180, 80),
                         Some(format!(
                             "候補 {} 件を確認済み。アドレス欄の件数はヒットを含むコンテナ数です。",
-                            self.global_search.total_scanned
+                            crate::ui_helpers::format_count(
+                                self.global_search.total_scanned as u64
+                            )
                         )),
                     ))
                 } else if self.global_search.done {
@@ -2521,48 +3665,11 @@ impl App {
             // (ユーザーの操作は明示的なので待つ必要がない)
             if !self.global_search.query.trim().is_empty() {
                 self.global_search.last_executed.clear(); // 強制再実行
-                self.spawn_global_search();
+                self.spawn_global_search(ctx);
             }
         }
         if query_changed {
-            self.cancel_pending_folder_nav();
-            self.global_search.last_change_at = Some(Instant::now());
-            // Codex P3 対応: クエリが変わったら drill state を即リセットし、
-            // 旧検索の pending / containers / all_hits も直ちに破棄してから空の
-            // 一覧ビューとして rebuild する (debounce 完了までの間、旧結果で
-            // drill-back 判定が残ったり、旧クエリでの rebuild race が起きないように)。
-            // 新クエリなので自動ビュー切替も再有効化する (§4.3.2)。
-            self.global_search.drill = None;
-            self.global_search.aggregate = false;
-            self.global_search.aggregate_auto = true;
-            self.global_search.pending = None; // SearchHandle::Drop で cancel
-            // **Codex P3-1 対応**: 旧 containers 向けの mtime worker も即 drop。
-            // containers は直後に clear するので、worker が SMB 越しに走り続けても
-            // 結果適用先が存在しない。新クエリの `ensure_container_mtime_populated`
-            // が pending 検出で early-return しないよう、ここでも明示的に外す。
-            self.global_search.mtime_lookup_pending = None;
-            self.global_search.containers.clear();
-            self.global_search.all_hits.clear();
-            self.global_search.done = false;
-            self.global_search.truncated = false;
-            self.global_search.total_valid = 0;
-            self.global_search.total_scanned = 0;
-            self.global_search.tag_bridge_suggestions.clear();
-            // **review #5 対応**: 旧クエリ結果に対する self.selected / scroll_offset_y が
-            // 残っていると、poll_global_search_events の guard (selected.is_some()
-            // || scroll_offset_y > 0.5) が次フレームで aggregate_auto を false に
-            // 落としてしまい、新クエリで 1000+ hit 時の自動切替が発火しない。
-            // 旧クエリ結果から作った items は直後の rebuild で全て無効化されるので、
-            // selected / scroll もここで「ユーザー未操作」状態へ戻す。
-            self.selected = None;
-            self.scroll_offset_y = 0.0;
-            // query == last_executed でも debounce → spawn を必ず再走させる。
-            // そうしないと、Enter 2 連打で旧検索が cancel されたあと
-            // poll_global_search_debounce が「クエリが変わっていない」と判定して
-            // 新 spawn を skip し、結果 0 件のまま固着する。
-            self.global_search.last_executed.clear();
-            self.rebuild_items_from_global_search();
-            ctx.request_repaint_after(Duration::from_millis(DEBOUNCE_MS));
+            self.reset_global_search_for_query_change(ctx);
         }
         if sort_changed {
             // ソート変更はクエリ再実行不要 — items を並べ替えるだけ。
@@ -2572,6 +3679,49 @@ impl App {
             // 集約トグルの切替は items を作り直すだけ (クエリ再実行不要)。
             self.rebuild_items_from_global_search();
         }
+    }
+
+    pub(crate) fn reset_global_search_for_query_change(&mut self, ctx: &egui::Context) {
+        self.global_search.run_sequence = self.global_search.run_sequence.wrapping_add(1);
+        self.cancel_pending_folder_nav();
+        self.global_search.last_change_at = Some(Instant::now());
+        // Codex P3 対応: クエリが変わったら drill state を即リセットし、
+        // 旧検索の pending / containers / all_hits も直ちに破棄してから空の
+        // 一覧ビューとして rebuild する (debounce 完了までの間、旧結果で
+        // drill-back 判定が残ったり、旧クエリでの rebuild race が起きないように)。
+        // 新クエリなので自動ビュー切替も再有効化する (§4.3.2)。
+        self.global_search.drill = None;
+        self.global_search.aggregate = false;
+        self.global_search.aggregate_auto = true;
+        self.global_search.pending = None; // SearchHandle::Drop で cancel
+        // **Codex P3-1 対応**: 旧 containers 向けの mtime worker も即 drop。
+        // containers は直後に clear するので、worker が SMB 越しに走り続けても
+        // 結果適用先が存在しない。新クエリの `ensure_container_mtime_populated`
+        // が pending 検出で early-return しないよう、ここでも明示的に外す。
+        self.global_search.mtime_lookup_pending = None;
+        self.global_search.containers.clear();
+        self.global_search.all_hits.clear();
+        self.global_search.done = false;
+        self.global_search.truncated = false;
+        self.global_search.total_valid = 0;
+        self.global_search.total_scanned = 0;
+        self.global_search.tag_bridge_suggestions.clear();
+        // **review #5 対応**: 旧クエリ結果に対する self.selected / scroll_offset_y が
+        // 残っていると、poll_global_search_events の guard (selected.is_some()
+        // || scroll_offset_y > 0.5) が次フレームで aggregate_auto を false に
+        // 落としてしまい、新クエリで 1000+ hit 時の自動切替が発火しない。
+        // 旧クエリ結果から作った items は直後の rebuild で全て無効化されるので、
+        // selected / scroll もここで「ユーザー未操作」状態へ戻す。
+        self.selected = None;
+        self.scroll_offset_y = 0.0;
+        // query == last_executed でも debounce → spawn を必ず再走させる。
+        // そうしないと、Enter 2 連打で旧検索が cancel されたあと
+        // poll_global_search_debounce が「クエリが変わっていない」と判定して
+        // 新 spawn を skip し、結果 0 件のまま固着する。
+        self.global_search.last_executed.clear();
+        self.restart_search_page_edit_prepare(ctx);
+        self.rebuild_items_from_global_search();
+        ctx.request_repaint_after(Duration::from_millis(DEBOUNCE_MS));
     }
 }
 
@@ -2584,6 +3734,364 @@ mod tests {
     use super::*;
 
     const SEP: char = crate::search_norm::ZIP_ENTRY_SEP;
+
+    fn favorite_filter_fixture(id: u128, path: &str, on: bool) -> crate::settings::FavoriteEntry {
+        crate::settings::FavoriteEntry {
+            id: Uuid::from_u128(id),
+            name: String::new(),
+            path: path.into(),
+            auto_index_metadata: on,
+            auto_index_structure: false,
+            auto_index_thumbs: false,
+            auto_index_similar: false,
+        }
+    }
+
+    #[test]
+    fn favorite_filter_clears_off_outer_even_with_enabled_child() {
+        let favorites = vec![
+            favorite_filter_fixture(1, "c:/photos", false),
+            favorite_filter_fixture(2, "c:/photos/inner", true),
+            favorite_filter_fixture(3, "c:/other", true),
+        ];
+        let ownership = crate::metadata_ownership::metadata_ownership(&favorites, &[]);
+        let mut selected = Some(favorites[0].id);
+        assert_eq!(
+            resolve_favorite_filter(&mut selected, &favorites, &ownership),
+            vec![favorites[1].id, favorites[2].id]
+        );
+        assert_eq!(selected, None);
+        selected = Some(favorites[1].id);
+        assert_eq!(
+            resolve_favorite_filter(&mut selected, &favorites, &ownership),
+            vec![favorites[1].id]
+        );
+        assert_eq!(selected, Some(favorites[1].id));
+    }
+
+    #[test]
+    fn favorite_filter_keeps_on_non_owner_and_clears_deleted_selection() {
+        let favorites = vec![
+            favorite_filter_fixture(1, "c:/photos", true),
+            favorite_filter_fixture(2, "C:/PHOTOS", true),
+            favorite_filter_fixture(3, "c:/other", true),
+        ];
+        let ownership = crate::metadata_ownership::metadata_ownership(&favorites, &[]);
+        let mut selected = Some(favorites[1].id);
+        assert_eq!(
+            resolve_favorite_filter(&mut selected, &favorites, &ownership),
+            vec![favorites[0].id]
+        );
+        assert_eq!(selected, Some(favorites[1].id));
+        selected = Some(Uuid::from_u128(99));
+        assert_eq!(
+            resolve_favorite_filter(&mut selected, &favorites, &ownership),
+            vec![favorites[0].id, favorites[2].id]
+        );
+        assert_eq!(selected, None);
+    }
+
+    #[test]
+    fn search_membership_keeps_survivor_order_and_appends_candidates() {
+        let make = |name: &str| GridItem::Image(PathBuf::from(format!(r"C:\search\{name}.jpg")));
+        let mut items = vec![make("a"), make("c"), make("d")];
+        let mut metas = vec![Some((1, 1)), Some((2, 2)), Some((3, 3))];
+        retain_search_survivor_order_and_append_candidates(
+            &mut items,
+            &mut metas,
+            &[
+                make("b").perf_key(),
+                make("c").perf_key(),
+                make("a").perf_key(),
+            ],
+        );
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["c.jpg", "a.jpg", "d.jpg"]
+        );
+        assert_eq!(metas, [Some((2, 2)), Some((1, 1)), Some((3, 3))]);
+    }
+
+    #[test]
+    fn rating_search_complete_read_failure_after_first_chunk_uses_name_fallback() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let app = crate::app::setup_app_for_test();
+        let root = app.tmp.path().join("r3-search-read-failure");
+        let paths = (0..501)
+            .map(|index| root.join(format!("{index:03}.jpg")))
+            .collect::<Vec<_>>();
+        let rated_key = crate::adjustment_db::normalize_path(&paths[499]);
+        let bad_key = crate::adjustment_db::normalize_path(&paths[500]);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&rated_key, 5, None)
+            .unwrap();
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&bad_key, 2, None)
+            .unwrap();
+        let conn = rusqlite::Connection::open(crate::rating_db::RatingDb::db_path()).unwrap();
+        conn.execute(
+            "UPDATE ratings SET stars = 'broken' WHERE path = ?1",
+            [&bad_key],
+        )
+        .unwrap();
+        let hits = paths
+            .iter()
+            .map(|path| GlobalHit {
+                path: path.to_string_lossy().into_owned(),
+                score: 1.0,
+                stars: 0,
+                mtime: 0,
+                file_size: Some(0),
+            })
+            .collect::<Vec<_>>();
+        let spec = crate::rating_sort::RatingSortSpec {
+            direction: crate::rating_sort::RatingSortDirection::Desc,
+            unrated_position: crate::rating_sort::RatingSortUnratedPosition::BelowAll,
+        };
+        let wish = SearchViewWish {
+            sequence: 1,
+            run_sequence: 1,
+            query: "test".into(),
+            filters: GlobalSearchFilters::default(),
+            source_generation: 0,
+            context: app.virtual_list_context_id(),
+            through_batch: 1,
+            view: GlobalSearchView::Flat,
+            sort_mode: ContainerSortMode::HitCount,
+            order_request: crate::rating_sort::ListingOrderRequest::Rating(spec),
+            rating_write_generation: 0,
+            rating_filter: [true; 6],
+            done: true,
+            survivor_order: None,
+        };
+        let (command_tx, command_rx) = mpsc::channel();
+        let (output_tx, output_rx) = mpsc::channel();
+        let epoch = crate::page_edit_write_epoch::TestEpochScope::capture().unwrap();
+        let worker = std::thread::spawn(move || {
+            let _epoch = crate::page_edit_write_epoch::TestEpochScope::enter(epoch);
+            search_prepare_worker(
+                command_rx,
+                output_tx,
+                Arc::new(AtomicBool::new(false)),
+                egui::Context::default(),
+                crate::app::page_edit_snapshot::PageEditAvailability::default(),
+                crate::settings::Settings::default(),
+            );
+        });
+        command_tx
+            .send(SearchPrepareCommand::Batch(1, hits))
+            .unwrap();
+        command_tx
+            .send(SearchPrepareCommand::View(wish.clone()))
+            .unwrap();
+        let mut filtered = wish;
+        filtered.sequence = 2;
+        filtered.rating_filter = [false; 6];
+        filtered.rating_filter[5] = true;
+        command_tx
+            .send(SearchPrepareCommand::View(filtered))
+            .unwrap();
+        drop(command_tx);
+        worker.join().unwrap();
+        let mut rated_batch = None;
+        let mut ready = Vec::new();
+        for output in output_rx.try_iter() {
+            match output {
+                SearchPrepareOutput::RatedBatch(_, hits) => rated_batch = Some(hits),
+                SearchPrepareOutput::Ready(_, prepared) => ready.push(prepared),
+                SearchPrepareOutput::Retry(_) => panic!("unexpected retry"),
+                SearchPrepareOutput::Failed(_, message) => panic!("{message}"),
+            }
+        }
+        let rated_batch = rated_batch.unwrap();
+        assert_eq!(rated_batch[499].stars, 5);
+        assert_eq!(rated_batch[500].stars, 0);
+        assert_eq!(ready.len(), 2);
+        assert!(ready[0].rating_sort_failed);
+        assert_eq!(ready[0].items[0].name(), "000.jpg");
+        assert!(ready[0].ratings.is_none());
+        assert!(ready[0].hit_rating_values.is_none());
+        assert!(ready[1].rating_sort_failed);
+        assert_eq!(ready[1].items.len(), 1);
+        assert_eq!(ready[1].items[0].name(), "499.jpg");
+    }
+
+    #[test]
+    fn rating_sort_covers_flat_drilled_folders_and_zip_hits() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = crate::rating_db::RatingDb::open_at(tmp.path().join("ratings.db")).unwrap();
+        let root = tmp.path().join("search");
+        let a = GridItem::Image(root.join("a.jpg"));
+        let b = GridItem::Image(root.join("b.jpg"));
+        let folder = GridItem::Folder(root.join("folder"));
+        let zip = GridItem::ZipImage {
+            zip_path: root.join("book.zip"),
+            entry_name: "z.jpg".into(),
+        };
+        let keys = [&a, &b, &folder, &zip].map(|item| search_item_rating_key(item).unwrap());
+        db.set_user_rating(&keys[0], 1, None).unwrap();
+        db.set_user_rating(&keys[1], 5, None).unwrap();
+        db.set_user_rating(&keys[2], 4, None).unwrap();
+        db.set_user_rating(&keys[3], 3, None).unwrap();
+        let facts = db.get_many_complete(&keys.to_vec(), 4).unwrap();
+        let spec = crate::rating_sort::RatingSortSpec {
+            direction: crate::rating_sort::RatingSortDirection::Desc,
+            unrated_position: Default::default(),
+        };
+        let mut flat = vec![a.clone(), b.clone()];
+        let mut metas = vec![Some((1, 1)), Some((2, 2))];
+        sort_search_items_by_rating(&mut flat, &mut metas, &GlobalSearchView::Flat, spec, &facts);
+        assert!(matches!(&flat[0], GridItem::Image(path) if path.ends_with("b.jpg")));
+        assert_eq!(metas, [Some((2, 2)), Some((1, 1))]);
+
+        let mut drill = vec![a, folder.clone(), b];
+        let mut drill_metas = vec![None; 3];
+        let drill_view = GlobalSearchView::DrilledInto {
+            container_root: root.clone(),
+            current_path: root.clone(),
+            is_zip: false,
+        };
+        sort_search_items_by_rating(&mut drill, &mut drill_metas, &drill_view, spec, &facts);
+        assert!(matches!(&drill[0], GridItem::Folder(path) if path.ends_with("folder")));
+        assert!(matches!(&drill[1], GridItem::Image(path) if path.ends_with("b.jpg")));
+
+        let mut zip_rows = vec![
+            zip,
+            GridItem::ZipImage {
+                zip_path: root.join("book.zip"),
+                entry_name: "a.jpg".into(),
+            },
+        ];
+        let second_key = search_item_rating_key(&zip_rows[1]).unwrap();
+        let zip_facts = db
+            .get_many_complete(&[keys[3].clone(), second_key], 5)
+            .unwrap();
+        let mut zip_metas = vec![None; 2];
+        let zip_view = GlobalSearchView::DrilledInto {
+            container_root: root.clone(),
+            current_path: root.join("book.zip"),
+            is_zip: true,
+        };
+        sort_search_items_by_rating(&mut zip_rows, &mut zip_metas, &zip_view, spec, &zip_facts);
+        assert!(
+            matches!(&zip_rows[0], GridItem::ZipImage { entry_name, .. } if entry_name == "z.jpg")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ten_thousand_result_stream_prepare_acceptance_has_bounded_cost() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        app.begin_search_page_edit_prepare_for_test(&ctx);
+        app.global_search.aggregate_auto = false;
+        let (stream, rx) = crossbeam_channel::unbounded();
+        app.global_search.pending = Some(crate::indexer_manager::SearchHandle {
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx,
+        });
+        let started = Instant::now();
+        for batch in 0..20 {
+            let hits = (batch * 500..(batch + 1) * 500)
+                .map(|index| GlobalHit {
+                    path: format!("C:/search/{index:05}.png"),
+                    score: 1.0,
+                    stars: 0,
+                    mtime: 0,
+                    file_size: Some(0),
+                })
+                .collect();
+            stream
+                .send(SearchStreamEvent::Batch {
+                    hits,
+                    scanned_candidates: (batch + 1) * 500,
+                    valid_hits: (batch + 1) * 500,
+                })
+                .unwrap();
+        }
+        stream
+            .send(SearchStreamEvent::Done {
+                truncated: false,
+                reason: DoneReason::Complete,
+            })
+            .unwrap();
+        while app.items.len() != 10_000 && started.elapsed() < Duration::from_secs(30) {
+            app.poll_global_search_events(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let initial = app.search_prepare_metrics_for_test();
+        assert_eq!(app.items.len(), 10_000);
+        assert_eq!(initial.rated_batches, 20, "FIFO lost a stream batch");
+        assert_eq!(initial.looked_up_keys, 10_000);
+        assert!(initial.lookup_passes <= 21);
+        let accepted_generation = app.items_generation;
+        app.hold_next_search_ready_for_test();
+        app.settings.sort_order = crate::settings::SortOrder::FileNameDesc;
+        app.rebuild_items_from_global_search();
+        while !app.search_ready_is_held_for_test() && started.elapsed() < Duration::from_secs(30) {
+            app.poll_global_search_events(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(app.search_ready_is_held_for_test());
+        app.settings.sort_order = crate::settings::SortOrder::FileName;
+        app.rebuild_items_from_global_search();
+        app.release_search_ready_for_test();
+        while app.items_generation == accepted_generation
+            && started.elapsed() < Duration::from_secs(30)
+        {
+            app.poll_global_search_events(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let final_metrics = app.search_prepare_metrics_for_test();
+        eprintln!(
+            "10,000-hit stream: batches={}, lookup_passes={}, looked_up_keys={}, stale={}, ui_accept={:.1}ms, end_to_end={:.1}ms",
+            final_metrics.rated_batches,
+            final_metrics.lookup_passes,
+            final_metrics.looked_up_keys,
+            final_metrics.stale_rejections,
+            final_metrics.ui_accept_ms,
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
+        assert!(app.items_generation > accepted_generation);
+        assert_eq!(
+            final_metrics.looked_up_keys, 10_000,
+            "sort re-queried old keys"
+        );
+        assert_eq!(final_metrics.lookup_passes, initial.lookup_passes);
+        assert!(final_metrics.stale_rejections >= 1);
+        assert!(final_metrics.ui_accept_ms < 5_000.0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn audit_ten_thousand_result_stream_with_foreign_page_edit_writer() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let writer = std::thread::spawn(move || {
+            let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+            let _guard = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        entered_rx.recv().unwrap();
+        let result = std::panic::catch_unwind(
+            ten_thousand_result_stream_prepare_acceptance_has_bounded_cost,
+        );
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
 
     fn zip_hit(zip: &str, entry: &str) -> String {
         format!("{zip}{SEP}{entry}")
@@ -2686,18 +4194,21 @@ mod tests {
             path: "c:/a/b/1.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
             path: "c:/a/b/2.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
             path: "c:/a/c/1.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         assert_eq!(state.containers.len(), 2);
@@ -2814,6 +4325,7 @@ mod tests {
             path: "c:/a/1.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         state.drill = Some(DrillState {
@@ -2863,18 +4375,21 @@ mod tests {
             path: "c:/a/1.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
             path: "c:/a/2.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
             path: "c:/b/x.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         // containers は 2 つに集約されているが、all_hits は 3 つ保持
@@ -2889,18 +4404,21 @@ mod tests {
             path: zip_hit("c:/album.zip", "0001.jpg"),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
             path: zip_hit("c:/album.zip", "0002.jpg"),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
             path: "c:/photos/x.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         let zip = state
@@ -2923,18 +4441,21 @@ mod tests {
                 path: "C:/root/a.jpg".into(),
                 score: 1.0,
                 mtime: 0,
+                file_size: None,
                 stars: 0,
             },
             GlobalHit {
                 path: "C:/root/sub/b.jpg".into(),
                 score: 1.0,
                 mtime: 0,
+                file_size: None,
                 stars: 0,
             },
             GlobalHit {
                 path: "C:/root/sub/deeper/c.jpg".into(),
                 score: 1.0,
                 mtime: 0,
+                file_size: None,
                 stars: 0,
             },
         ];
@@ -2956,6 +4477,7 @@ mod tests {
             path: "C:/root/yes/found.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         }];
         let got = collect_hit_folders_dfs(&hits, &PathBuf::from("C:/root"));
@@ -2981,10 +4503,17 @@ mod tests {
                 path: p.into(),
                 score: 1.0,
                 mtime: 0,
+                file_size: None,
                 stars: 0,
             });
         }
-        let (items, metas) = build_drilled_items(&state, Path::new("C:/root"), false, &[true; 6]);
+        let (items, metas) = build_drilled_items(
+            &state,
+            Path::new("C:/root"),
+            false,
+            crate::settings::SortOrder::FileName,
+            &[true; 6],
+        );
         assert_eq!(items.len(), metas.len());
         // 期待: Folder("C:/root/sub") + Image("C:/root/a.jpg") + Image("C:/root/b.jpg")
         let paths: Vec<_> = items
@@ -3012,9 +4541,13 @@ mod tests {
     /// 全サムネ「画像フォーマット判定不可」で失敗していた。その回帰ガード。
     #[test]
     fn build_drilled_items_classifies_pdf_zip_and_image_by_extension() {
+        let representative = image_representative_from_hit("C:/mix/a.epub").unwrap();
+        assert_eq!(representative.pdf_page, Some(0));
+        assert_eq!(representative.path, PathBuf::from("C:/mix/a.epub"));
         let mut state = GlobalSearchState::default();
         for p in [
             "C:/mix/a.pdf",
+            "C:/mix/a2.epub",
             "C:/mix/b.zip",
             "C:/mix/c.png",
             "C:/mix/d.jpg",
@@ -3023,10 +4556,17 @@ mod tests {
                 path: p.into(),
                 score: 1.0,
                 mtime: 0,
+                file_size: None,
                 stars: 0,
             });
         }
-        let (items, _) = build_drilled_items(&state, Path::new("C:/mix"), false, &[true; 6]);
+        let (items, _) = build_drilled_items(
+            &state,
+            Path::new("C:/mix"),
+            false,
+            crate::settings::SortOrder::FileName,
+            &[true; 6],
+        );
         // 期待: 名前昇順で a.pdf → b.zip → c.png → d.jpg
         let kinds: Vec<&'static str> = items
             .iter()
@@ -3038,7 +4578,10 @@ mod tests {
                 _ => "Other",
             })
             .collect();
-        assert_eq!(kinds, vec!["PdfFile", "ZipFile", "Image", "Image"]);
+        assert_eq!(
+            kinds,
+            vec!["PdfFile", "PdfFile", "ZipFile", "Image", "Image"]
+        );
     }
 
     /// build_flat_items: 全ヒットを sort_order で一律ソートし、拡張子で
@@ -3046,11 +4589,18 @@ mod tests {
     #[test]
     fn build_flat_items_sorts_classifies_and_skips_zip() {
         let mut state = GlobalSearchState::default();
-        for p in ["c:/a/2.jpg", "c:/b/1.png", "c:/c/doc.pdf", "c:/d/clip.mp4"] {
+        for p in [
+            "c:/a/2.jpg",
+            "c:/b/1.png",
+            "c:/c/doc.pdf",
+            "c:/d/clip.mp4",
+            "c:/g/book.epub",
+        ] {
             state.accumulate_hit(&GlobalHit {
                 path: p.into(),
                 score: 1.0,
                 mtime: 0,
+                file_size: None,
                 stars: 0,
             });
         }
@@ -3059,17 +4609,19 @@ mod tests {
             path: zip_hit("c:/e/album.zip", "x.jpg"),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
             path: "c:/f/plain.zip".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         let (items, metas) =
             build_flat_items(&state, crate::settings::SortOrder::FileName, &[true; 6]);
-        assert_eq!(items.len(), 4, "ZIP 系 2 件は除外される");
+        assert_eq!(items.len(), 5, "ZIP 系 2 件は除外される");
         assert_eq!(items.len(), metas.len());
         // ファイル名順: 1.png → 2.jpg → clip.mp4 → doc.pdf
         let kinds: Vec<&str> = items
@@ -3081,7 +4633,38 @@ mod tests {
                 _ => "Other",
             })
             .collect();
-        assert_eq!(kinds, vec!["Image", "Image", "Video", "PdfFile"]);
+        assert_eq!(kinds, vec!["Image", "Image", "PdfFile", "Video", "PdfFile"]);
+    }
+
+    #[test]
+    fn flat_and_drilled_search_apply_name_and_numeric_desc() {
+        let mut state = GlobalSearchState::default();
+        for path in ["c:/results/page2.jpg", "c:/results/page10.jpg"] {
+            state.accumulate_hit(&GlobalHit {
+                path: path.into(),
+                score: 1.0,
+                mtime: 0,
+                file_size: Some(1),
+                stars: 0,
+            });
+        }
+        let names = |items: &[GridItem]| {
+            items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>()
+        };
+
+        for order in [
+            crate::settings::SortOrder::FileNameDesc,
+            crate::settings::SortOrder::NumericDesc,
+        ] {
+            let (flat, _) = build_flat_items(&state, order, &[true; 6]);
+            let (drilled, _) =
+                build_drilled_items(&state, Path::new("c:/results"), false, order, &[true; 6]);
+            assert_eq!(names(&flat), ["page10.jpg", "page2.jpg"], "{order:?}");
+            assert_eq!(names(&drilled), names(&flat), "{order:?}");
+        }
     }
 
     /// build_flat_items: rating_filter で個々のヒットを絞れる (一覧ビューでは★有効、§6)。
@@ -3092,12 +4675,14 @@ mod tests {
             path: "c:/a/keep.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 3,
         });
         state.accumulate_hit(&GlobalHit {
             path: "c:/a/drop.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 1,
         });
         let mut rf = [false; 6];
@@ -3116,18 +4701,21 @@ mod tests {
             path: "c:/a/mid.jpg".into(),
             score: 1.0,
             mtime: 200,
+            file_size: None,
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
             path: "c:/a/new.jpg".into(),
             score: 1.0,
             mtime: 300,
+            file_size: None,
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
             path: "c:/a/old.jpg".into(),
             score: 1.0,
             mtime: 100,
+            file_size: None,
             stars: 0,
         });
         let names = |items: &[GridItem]| -> Vec<String> {
@@ -3150,19 +4738,95 @@ mod tests {
     }
 
     #[test]
+    fn global_fs_hits_sort_real_zero_before_known_and_unknown_last_in_both_directions() {
+        let mut state = GlobalSearchState::default();
+        for (name, file_size) in [
+            ("unknown.jpg", None),
+            ("ten.jpg", Some(10)),
+            ("zero.jpg", Some(0)),
+        ] {
+            state.accumulate_hit(&GlobalHit {
+                path: format!("c:/sizes/{name}"),
+                score: 1.0,
+                mtime: 1,
+                file_size,
+                stars: 0,
+            });
+        }
+        let names = |items: &[GridItem]| {
+            items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>()
+        };
+
+        let (flat_asc, _) =
+            build_flat_items(&state, crate::settings::SortOrder::SizeAsc, &[true; 6]);
+        let (flat_desc, _) =
+            build_flat_items(&state, crate::settings::SortOrder::SizeDesc, &[true; 6]);
+        assert_eq!(names(&flat_asc), ["zero.jpg", "ten.jpg", "unknown.jpg"]);
+        assert_eq!(names(&flat_desc), ["ten.jpg", "zero.jpg", "unknown.jpg"]);
+
+        let (drill_asc, _) = build_drilled_items(
+            &state,
+            Path::new("c:/sizes"),
+            false,
+            crate::settings::SortOrder::SizeAsc,
+            &[true; 6],
+        );
+        let (drill_desc, _) = build_drilled_items(
+            &state,
+            Path::new("c:/sizes"),
+            false,
+            crate::settings::SortOrder::SizeDesc,
+            &[true; 6],
+        );
+        assert_eq!(names(&drill_asc), names(&flat_asc));
+        assert_eq!(names(&drill_desc), names(&flat_desc));
+
+        // Sizeでは合成Folderが全てUnknownなので、同値tieも一覧と同じWindows名比較にする。
+        // PathBufのordinal順なら大文字Zが先になる入力で差を直接固定する。
+        let mut folder_state = GlobalSearchState::default();
+        for path in ["c:/sizes/Zebra/z.jpg", "c:/sizes/alpha/a.jpg"] {
+            folder_state.accumulate_hit(&GlobalHit {
+                path: path.into(),
+                score: 1.0,
+                mtime: 1,
+                file_size: Some(1),
+                stars: 0,
+            });
+        }
+        let (folders, _) = build_drilled_items(
+            &folder_state,
+            Path::new("c:/sizes"),
+            false,
+            crate::settings::SortOrder::SizeAsc,
+            &[true; 6],
+        );
+        assert_eq!(names(&folders), ["alpha", "Zebra"]);
+    }
+
+    #[test]
     fn audio_hit_materializes_as_audio_in_flat_and_drilled_views() {
         let mut state = GlobalSearchState::default();
         state.accumulate_hit(&GlobalHit {
             path: "c:/music/MixedCase.FLAC".into(),
             score: 1.0,
             mtime: 100,
+            file_size: None,
             stars: 0,
         });
 
         let (flat, _) = build_flat_items(&state, crate::settings::SortOrder::FileName, &[true; 6]);
         assert!(matches!(&flat[..], [GridItem::Audio(p)] if p.ends_with("MixedCase.FLAC")));
 
-        let (drilled, _) = build_drilled_items(&state, Path::new("c:/music"), false, &[true; 6]);
+        let (drilled, _) = build_drilled_items(
+            &state,
+            Path::new("c:/music"),
+            false,
+            crate::settings::SortOrder::FileName,
+            &[true; 6],
+        );
         assert!(matches!(&drilled[..], [GridItem::Audio(p)] if p.ends_with("MixedCase.FLAC")));
         assert!(is_fullscreen_target(drilled.first()));
     }
@@ -3190,6 +4854,7 @@ mod tests {
             path: "C:/root/year2024/jan/matches/X.png".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         // 上記以外にもヒットを入れておく (別枝が干渉しないことを確認)
@@ -3197,24 +4862,42 @@ mod tests {
             path: "C:/root/year2024/jan/matches/Y.png".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
 
         // Level 1: /root でドリル → year2024 のみ
-        let (l1, _) = build_drilled_items(&state, Path::new("C:/root"), false, &[true; 6]);
+        let (l1, _) = build_drilled_items(
+            &state,
+            Path::new("C:/root"),
+            false,
+            crate::settings::SortOrder::FileName,
+            &[true; 6],
+        );
         assert_eq!(l1.len(), 1, "level1 item count");
         assert!(matches!(&l1[0], GridItem::Folder(p) if p == &PathBuf::from("C:/root/year2024")));
 
         // Level 2: /root/year2024 → jan のみ (feb は枝刈り)
-        let (l2, _) = build_drilled_items(&state, Path::new("C:/root/year2024"), false, &[true; 6]);
+        let (l2, _) = build_drilled_items(
+            &state,
+            Path::new("C:/root/year2024"),
+            false,
+            crate::settings::SortOrder::FileName,
+            &[true; 6],
+        );
         assert_eq!(l2.len(), 1, "level2 item count");
         assert!(
             matches!(&l2[0], GridItem::Folder(p) if p == &PathBuf::from("C:/root/year2024/jan"))
         );
 
         // Level 3: /root/year2024/jan → matches のみ
-        let (l3, _) =
-            build_drilled_items(&state, Path::new("C:/root/year2024/jan"), false, &[true; 6]);
+        let (l3, _) = build_drilled_items(
+            &state,
+            Path::new("C:/root/year2024/jan"),
+            false,
+            crate::settings::SortOrder::FileName,
+            &[true; 6],
+        );
         assert_eq!(l3.len(), 1, "level3 item count");
         assert!(matches!(&l3[0],
                 GridItem::Folder(p) if p == &PathBuf::from("C:/root/year2024/jan/matches")));
@@ -3224,6 +4907,7 @@ mod tests {
             &state,
             Path::new("C:/root/year2024/jan/matches"),
             false,
+            crate::settings::SortOrder::FileName,
             &[true; 6],
         );
         assert_eq!(l4.len(), 2, "level4 item count");
@@ -3251,6 +4935,7 @@ mod tests {
                 path: p,
                 score: 1.0,
                 mtime: 0,
+                file_size: None,
                 stars: 0,
             });
         }
@@ -3258,6 +4943,7 @@ mod tests {
             &state,
             Path::new("C:/archives/target.zip"),
             /*is_zip=*/ true,
+            crate::settings::SortOrder::FileName,
             &[true; 6],
         );
         assert_eq!(items.len(), 2, "target.zip のエントリ数");
@@ -3287,18 +4973,21 @@ mod tests {
             path: "C:/root/keep.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 3,
         });
         state.accumulate_hit(&GlobalHit {
             path: "C:/root/drop_low.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 1,
         });
         state.accumulate_hit(&GlobalHit {
             path: "C:/root/drop_unrated.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
         // sub_keep: ★3 が 1 件含まれる → バッジ 1
@@ -3306,12 +4995,14 @@ mod tests {
             path: "C:/root/sub_keep/a.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 3,
         });
         state.accumulate_hit(&GlobalHit {
             path: "C:/root/sub_keep/b.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 1,
         });
         // sub_drop: ★3 ヒットなし → 枝刈り
@@ -3319,6 +5010,7 @@ mod tests {
             path: "C:/root/sub_drop/a.jpg".into(),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 0,
         });
 
@@ -3326,7 +5018,13 @@ mod tests {
         let mut rf = [false; 6];
         rf[3] = true;
 
-        let (items, _) = build_drilled_items(&state, Path::new("C:/root"), false, &rf);
+        let (items, _) = build_drilled_items(
+            &state,
+            Path::new("C:/root"),
+            false,
+            crate::settings::SortOrder::FileName,
+            &rf,
+        );
         // 期待: Folder("sub_keep") + Image("keep.jpg") のみ
         assert_eq!(items.len(), 2, "items 数");
         assert!(
@@ -3344,11 +5042,17 @@ mod tests {
                 path: p.into(),
                 score: 1.0,
                 mtime: 0,
+                file_size: None,
                 stars: 0,
             });
         }
-        let (items_all_on, _) =
-            build_drilled_items(&state, Path::new("C:/root"), false, &[true; 6]);
+        let (items_all_on, _) = build_drilled_items(
+            &state,
+            Path::new("C:/root"),
+            false,
+            crate::settings::SortOrder::FileName,
+            &[true; 6],
+        );
         // sub フォルダ + 直下 2 件 = 3
         assert_eq!(items_all_on.len(), 3);
     }
@@ -3362,12 +5066,14 @@ mod tests {
             path: format!("c:/archives/target.zip{sep}keep.jpg"),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 3,
         });
         state.accumulate_hit(&GlobalHit {
             path: format!("c:/archives/target.zip{sep}drop.jpg"),
             score: 1.0,
             mtime: 0,
+            file_size: None,
             stars: 1,
         });
         let mut rf = [false; 6];
@@ -3376,6 +5082,7 @@ mod tests {
             &state,
             Path::new("C:/archives/target.zip"),
             /*is_zip=*/ true,
+            crate::settings::SortOrder::FileName,
             &rf,
         );
         assert_eq!(items.len(), 1);

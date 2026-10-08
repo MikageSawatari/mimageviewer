@@ -11,20 +11,27 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fmt::Write as _;
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HWND, POINT, RECT};
+use windows::Win32::Foundation::{FILETIME, HANDLE, HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
-use windows::Win32::System::Threading::GetCurrentProcessId;
+use windows::Win32::System::Pipes::GetNamedPipeServerProcessId;
+use windows::Win32::System::SystemInformation::GetTickCount64;
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, GetProcessTimes,
+};
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK,
-    MOUSEINPUT, SendInput,
+    INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+    MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT, SendInput,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GA_ROOT, GetAncestor, GetClientRect, GetForegroundWindow, GetMessageExtraInfo,
@@ -49,6 +56,10 @@ const STEP_TOKEN_SERIAL_EXHAUSTED: u32 = STEP_TOKEN_SERIAL_MAX + 1;
 
 static NEXT_OUTPUT_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_PUBLISHER_NONCE: AtomicU64 = AtomicU64::new(1);
+static NEXT_OVERLAY_OWNER_NONCE: AtomicU64 = AtomicU64::new(1);
+static NEXT_NAMED_TARGET_TOKEN: AtomicU64 = AtomicU64::new(1);
+static NEXT_INVENTORY_COMMIT_SERIAL: AtomicU64 = AtomicU64::new(1);
+static NEXT_GESTURE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_STEP_TOKEN_SERIAL: AtomicU32 = AtomicU32::new(STEP_TOKEN_SERIAL_MIN);
 static ACTIVE_STEP_TOKEN: AtomicUsize = AtomicUsize::new(0);
 // Process-lifetime count. It is intentionally not presented as belonging to any one step.
@@ -115,6 +126,335 @@ pub(crate) struct NativeUiSmokeOutputId(u64);
 
 pub(crate) fn allocate_output_id() -> NativeUiSmokeOutputId {
     NativeUiSmokeOutputId(NEXT_OUTPUT_ID.fetch_add(1, Ordering::Relaxed))
+}
+
+#[derive(Debug)]
+pub(crate) struct NativeUiSmokeOverlayOwner {
+    nonce: u64,
+}
+
+pub(crate) fn allocate_overlay_owner() -> Arc<NativeUiSmokeOverlayOwner> {
+    Arc::new(NativeUiSmokeOverlayOwner {
+        nonce: NEXT_OVERLAY_OWNER_NONCE.fetch_add(1, Ordering::Relaxed),
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct NativeUiSmokeTargetArea {
+    rect_points: egui::Rect,
+    pixels_per_point: f32,
+    client_width: u32,
+    client_height: u32,
+}
+
+impl NativeUiSmokeTargetArea {
+    pub(crate) fn new(
+        rect_points: egui::Rect,
+        pixels_per_point: f32,
+        client_width: u32,
+        client_height: u32,
+    ) -> Self {
+        Self {
+            rect_points,
+            pixels_per_point,
+            client_width,
+            client_height,
+        }
+    }
+
+    fn valid(self) -> bool {
+        let rect = self.rect_points;
+        rect.is_finite()
+            && rect.is_positive()
+            && self.pixels_per_point.is_finite()
+            && self.pixels_per_point > 0.0
+            && self.client_width > 1
+            && self.client_height > 1
+    }
+
+    fn client_point(self, normalized: [f32; 2]) -> Result<POINT, String> {
+        if !self.valid() {
+            return Err("native mouse target area is not usable".to_string());
+        }
+        if !normalized
+            .into_iter()
+            .all(|value| value.is_finite() && value > 0.0 && value < 1.0)
+        {
+            return Err("native mouse normalized coordinates must be between zero and one".into());
+        }
+        let point = egui::pos2(
+            self.rect_points.min.x + self.rect_points.width() * normalized[0],
+            self.rect_points.min.y + self.rect_points.height() * normalized[1],
+        );
+        let x = (point.x * self.pixels_per_point).round() as i32;
+        let y = (point.y * self.pixels_per_point).round() as i32;
+        if x < 0 || y < 0 || x >= self.client_width as i32 || y >= self.client_height as i32 {
+            return Err(format!(
+                "native mouse target ({x},{y}) falls outside the prepared {}x{} client",
+                self.client_width, self.client_height
+            ));
+        }
+        Ok(POINT { x, y })
+    }
+
+    fn contains_client_point(self, point: [i32; 2]) -> bool {
+        if !self.valid() {
+            return false;
+        }
+        let x = point[0] as f32 / self.pixels_per_point;
+        let y = point[1] as f32 / self.pixels_per_point;
+        self.rect_points.contains(egui::pos2(x, y))
+            && point[0] >= 0
+            && point[1] >= 0
+            && point[0] < self.client_width as i32
+            && point[1] < self.client_height as i32
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeUiSmokePanoramaClassification {
+    Unknown,
+    Panorama,
+    NonPanorama,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct NativeUiSmokeControlObservation {
+    pub(crate) rect: egui::Rect,
+    pub(crate) interact_rect: egui::Rect,
+    pub(crate) clip_rect: egui::Rect,
+    pub(crate) layer_id: egui::LayerId,
+    pub(crate) sense: egui::Sense,
+    pub(crate) enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeUiSmokeAudioControl {
+    Button,
+    Row(usize),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct NativeUiSmokeCommittedAudioControl {
+    name: NativeUiSmokeAudioControl,
+    observation: NativeUiSmokeControlObservation,
+    area: NativeUiSmokeTargetArea,
+    token: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NativeUiSmokeLogicalInventory {
+    owner: Weak<NativeUiSmokeOverlayOwner>,
+    owner_nonce: u64,
+    top_hover_activation: Option<NativeUiSmokeTargetArea>,
+    native_top_panorama: Option<NativeUiSmokeControlObservation>,
+    audio_controls: Vec<(NativeUiSmokeAudioControl, NativeUiSmokeControlObservation)>,
+    panorama_classification: NativeUiSmokePanoramaClassification,
+    panorama_pose_present: bool,
+    video_zoom_present: bool,
+    named_control_allowed: bool,
+    audio_control_allowed: bool,
+    pixels_per_point: f32,
+    client_width: u32,
+    client_height: u32,
+}
+
+impl NativeUiSmokeLogicalInventory {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        owner: &Arc<NativeUiSmokeOverlayOwner>,
+        top_hover_activation: Option<NativeUiSmokeTargetArea>,
+        native_top_panorama: Option<NativeUiSmokeControlObservation>,
+        panorama_classification: NativeUiSmokePanoramaClassification,
+        panorama_pose_present: bool,
+        video_zoom_present: bool,
+        named_control_allowed: bool,
+        pixels_per_point: f32,
+        client_width: u32,
+        client_height: u32,
+    ) -> Self {
+        Self {
+            owner: Arc::downgrade(owner),
+            owner_nonce: owner.nonce,
+            top_hover_activation,
+            native_top_panorama,
+            audio_controls: Vec::new(),
+            panorama_classification,
+            panorama_pose_present,
+            video_zoom_present,
+            named_control_allowed,
+            audio_control_allowed: false,
+            pixels_per_point,
+            client_width,
+            client_height,
+        }
+    }
+
+    pub(crate) fn with_audio_controls(
+        mut self,
+        controls: Vec<(NativeUiSmokeAudioControl, NativeUiSmokeControlObservation)>,
+        allowed: bool,
+    ) -> Self {
+        self.audio_controls = controls;
+        self.audio_control_allowed = allowed;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn top_hover_min_y(&self) -> Option<f32> {
+        self.top_hover_activation.map(|area| area.rect_points.min.y)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NativeUiSmokeCommittedNamedControl {
+    token: Option<u64>,
+    observation: NativeUiSmokeControlObservation,
+    classification: NativeUiSmokePanoramaClassification,
+    panorama_pose_present: bool,
+    video_zoom_present: bool,
+    area: NativeUiSmokeTargetArea,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NativeUiSmokeCommittedInventory {
+    owner: Weak<NativeUiSmokeOverlayOwner>,
+    owner_nonce: u64,
+    commit_serial: u64,
+    target_version: u64,
+    top_hover_activation: Option<NativeUiSmokeTargetArea>,
+    native_top_panorama: Option<NativeUiSmokeCommittedNamedControl>,
+    audio_controls: Vec<NativeUiSmokeCommittedAudioControl>,
+}
+
+impl NativeUiSmokeCommittedInventory {
+    pub(crate) fn commit(previous: Option<&Self>, logical: NativeUiSmokeLogicalInventory) -> Self {
+        let audio_controls = logical
+            .audio_controls
+            .iter()
+            .map(|(name, observation)| {
+                let area = NativeUiSmokeTargetArea::new(
+                    observation
+                        .rect
+                        .intersect(observation.interact_rect)
+                        .intersect(observation.clip_rect),
+                    logical.pixels_per_point,
+                    logical.client_width,
+                    logical.client_height,
+                );
+                let eligible = logical.audio_control_allowed
+                    && observation.enabled
+                    && observation.sense.senses_click()
+                    && area.valid()
+                    && area.client_point([0.5, 0.5]).is_ok();
+                let previous_token = previous
+                    .filter(|previous| previous.owner_nonce == logical.owner_nonce)
+                    .and_then(|previous| {
+                        previous.audio_controls.iter().find(|entry| {
+                            entry.name == *name
+                                && entry.observation == *observation
+                                && entry.area == area
+                        })
+                    })
+                    .and_then(|entry| entry.token);
+                NativeUiSmokeCommittedAudioControl {
+                    name: *name,
+                    observation: *observation,
+                    area,
+                    token: eligible.then(|| {
+                        previous_token.unwrap_or_else(|| {
+                            NEXT_NAMED_TARGET_TOKEN.fetch_add(1, Ordering::Relaxed)
+                        })
+                    }),
+                }
+            })
+            .collect::<Vec<_>>();
+        let named = logical.native_top_panorama.map(|observation| {
+            let area_rect = observation
+                .rect
+                .intersect(observation.interact_rect)
+                .intersect(observation.clip_rect);
+            let area = NativeUiSmokeTargetArea::new(
+                area_rect,
+                logical.pixels_per_point,
+                logical.client_width,
+                logical.client_height,
+            );
+            let eligible = logical.named_control_allowed
+                && observation.enabled
+                && observation.sense.senses_click()
+                && area.valid()
+                && area.client_point([0.5, 0.5]).is_ok();
+            let previous_named = previous
+                .filter(|previous| previous.owner_nonce == logical.owner_nonce)
+                .and_then(|previous| previous.native_top_panorama.as_ref());
+            let token = if eligible {
+                previous_named
+                    .filter(|previous| {
+                        previous.token.is_some()
+                            && previous.observation == observation
+                            && previous.classification == logical.panorama_classification
+                            && previous.panorama_pose_present == logical.panorama_pose_present
+                            && previous.video_zoom_present == logical.video_zoom_present
+                    })
+                    .and_then(|previous| previous.token)
+                    .or_else(|| Some(NEXT_NAMED_TARGET_TOKEN.fetch_add(1, Ordering::Relaxed)))
+            } else {
+                None
+            };
+            NativeUiSmokeCommittedNamedControl {
+                token,
+                observation,
+                classification: logical.panorama_classification,
+                panorama_pose_present: logical.panorama_pose_present,
+                video_zoom_present: logical.video_zoom_present,
+                area,
+            }
+        });
+        let same_targets = previous.is_some_and(|previous| {
+            previous.owner_nonce == logical.owner_nonce
+                && previous.top_hover_activation == logical.top_hover_activation
+                && previous.native_top_panorama.as_ref().map(|named| {
+                    (
+                        named.token,
+                        named.observation,
+                        named.classification,
+                        named.panorama_pose_present,
+                        named.video_zoom_present,
+                        named.area,
+                    )
+                }) == named.as_ref().map(|named| {
+                    (
+                        named.token,
+                        named.observation,
+                        named.classification,
+                        named.panorama_pose_present,
+                        named.video_zoom_present,
+                        named.area,
+                    )
+                })
+                && previous.audio_controls == audio_controls
+        });
+        Self {
+            owner: logical.owner,
+            owner_nonce: logical.owner_nonce,
+            commit_serial: NEXT_INVENTORY_COMMIT_SERIAL.fetch_add(1, Ordering::Relaxed),
+            target_version: previous.map_or(1, |previous| {
+                if same_targets {
+                    previous.target_version
+                } else {
+                    previous.target_version.saturating_add(1)
+                }
+            }),
+            top_hover_activation: logical.top_hover_activation,
+            native_top_panorama: named,
+            audio_controls,
+        }
+    }
+
+    fn owner_is_live(&self) -> bool {
+        self.owner.upgrade().is_some()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -266,13 +606,30 @@ struct RenderSnapshot {
     presenter_hwnd: u64,
     geometry: NativeUiSmokeCanvasGeometry,
     geometry_version: u64,
+    inventory: NativeUiSmokeCommittedInventory,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreparedTargetKind {
+    Canvas,
+    TopHoverActivation,
+    NamedTopPanorama,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreparedTargetValidationPhase {
+    BeforeInput,
+    ReceiptCompletion,
 }
 
 #[derive(Clone)]
 struct PreparedTarget {
     host: HostSnapshot,
     render: RenderSnapshot,
+    kind: PreparedTargetKind,
+    area: NativeUiSmokeTargetArea,
     client_point: POINT,
+    named_token: Option<u64>,
 }
 
 pub(crate) struct NativeUiSmokePreparedMove {
@@ -282,14 +639,14 @@ pub(crate) struct NativeUiSmokePreparedMove {
 }
 
 impl PreparedTarget {
-    fn still_matches(&self, state: &BrokerState) -> bool {
+    fn still_matches(&self, state: &BrokerState, phase: PreparedTargetValidationPhase) -> bool {
         let Some(host) = state.hosts.get(&self.host.publisher) else {
             return false;
         };
         let Some(render) = state.renders.get(&self.render.publisher) else {
             return false;
         };
-        host.request == self.host.request
+        let identity_matches = host.request == self.host.request
             && host.epoch == self.host.epoch
             && host.placement == self.host.placement
             && host.owner_hwnd == self.host.owner_hwnd
@@ -299,21 +656,83 @@ impl PreparedTarget {
             && render.placement == self.render.placement
             && render.owner_hwnd == self.render.owner_hwnd
             && render.presenter_hwnd == self.render.presenter_hwnd
-            && render.geometry == self.render.geometry
-            && render.geometry_version == self.render.geometry_version
+            && render.inventory.owner_nonce == self.render.inventory.owner_nonce
+            && render.inventory.owner_is_live()
             && render
                 .requested_source_epoch
                 .upgrade()
                 .is_some_and(|requested| {
                     requested.load(Ordering::Acquire) == self.render.actual_source_epoch
-                })
+                });
+        if !identity_matches {
+            return false;
+        }
+        match self.kind {
+            PreparedTargetKind::Canvas => {
+                render.geometry == self.render.geometry
+                    && render.geometry_version == self.render.geometry_version
+            }
+            PreparedTargetKind::TopHoverActivation => {
+                // The prepared state proves that this operation starts from a genuinely hidden
+                // top bar. The move is expected to publish a newer inventory containing the
+                // button before its render receipt is recorded, so that transition is valid only
+                // after input while the owner/source/host and activation area stay unchanged.
+                self.render.inventory.native_top_panorama.is_none()
+                    && render.inventory.top_hover_activation == Some(self.area)
+                    && match phase {
+                        PreparedTargetValidationPhase::BeforeInput => {
+                            render.inventory.target_version == self.render.inventory.target_version
+                                && render.inventory.native_top_panorama.is_none()
+                        }
+                        PreparedTargetValidationPhase::ReceiptCompletion => {
+                            render.inventory.target_version > self.render.inventory.target_version
+                                && render.inventory.native_top_panorama.is_some()
+                        }
+                    }
+            }
+            PreparedTargetKind::NamedTopPanorama => {
+                let Some(expected_token) = self.named_token else {
+                    return false;
+                };
+                let Some(named) = render.inventory.native_top_panorama.as_ref() else {
+                    return false;
+                };
+                named.token == Some(expected_token)
+                    && named.area == self.area
+                    && named.observation.enabled
+                    && named.observation.sense.senses_click()
+                    && named.classification == NativeUiSmokePanoramaClassification::NonPanorama
+                    && !named.panorama_pose_present
+                    && !named.video_zoom_present
+                    && render.inventory.target_version == self.render.inventory.target_version
+            }
+        }
     }
+
+    fn ready_for_initial_prepare(&self) -> bool {
+        match self.kind {
+            PreparedTargetKind::Canvas => true,
+            PreparedTargetKind::TopHoverActivation => {
+                self.render.inventory.native_top_panorama.is_none()
+            }
+            PreparedTargetKind::NamedTopPanorama => true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeUiSmokeInputKind {
+    MouseMove,
+    LeftButtonDown,
+    LeftButtonUp,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct NativeUiSmokeMessageMetadata {
     pub(crate) token: usize,
     pub(crate) receiver_hwnd: u64,
+    pub(crate) receiver_process_id: u32,
+    pub(crate) receiver_thread_id: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -326,6 +745,7 @@ pub(crate) struct NativeUiSmokePumpReceipt {
     pub(crate) source: NativeVideoWindowSource,
     pub(crate) event_x: i32,
     pub(crate) event_y: i32,
+    pub(crate) input_kind: NativeUiSmokeInputKind,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -339,10 +759,13 @@ pub(crate) struct NativeUiSmokeRenderReceipt {
     pub(crate) geometry: NativeUiSmokeCanvasGeometry,
     pub(crate) geometry_version: u64,
     pub(crate) raw_forwarded: bool,
-    pub(crate) command_count: usize,
     pub(crate) source: NativeVideoWindowSource,
     pub(crate) event_x: i32,
     pub(crate) event_y: i32,
+    pub(crate) input_kind: NativeUiSmokeInputKind,
+    pub(crate) event_count: usize,
+    pub(crate) pointer_released: bool,
+    pub(crate) drag_latches_released: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -356,6 +779,122 @@ pub(crate) struct NativeUiSmokeMoveReceipt {
     pub(crate) requested_client_y: i32,
     pub(crate) actual_client_x: i32,
     pub(crate) actual_client_y: i32,
+    host_publisher: PublisherKey,
+    render_publisher: PublisherKey,
+    overlay_owner_nonce: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct NativeUiSmokeNamedControlReceipt {
+    pub(crate) token: u64,
+    pub(crate) owner_hwnd: u64,
+    pub(crate) presenter_hwnd: u64,
+    pub(crate) source_epoch: u64,
+    pub(crate) generation: u64,
+    pub(crate) client_x: i32,
+    pub(crate) client_y: i32,
+    pub(crate) pixels_per_point: f32,
+    pub(crate) rect: egui::Rect,
+    pub(crate) interact_rect: egui::Rect,
+    pub(crate) clip_rect: egui::Rect,
+    pub(crate) layer_id: egui::LayerId,
+    pub(crate) senses_click: bool,
+    pub(crate) enabled: bool,
+    pub(crate) classification: NativeUiSmokePanoramaClassification,
+    pub(crate) panorama_pose_present: bool,
+    pub(crate) video_zoom_present: bool,
+    host_publisher: PublisherKey,
+    render_publisher: PublisherKey,
+    overlay_owner_nonce: u64,
+    inventory_target_version: u64,
+    area: NativeUiSmokeTargetArea,
+}
+
+#[derive(Clone)]
+pub(crate) struct NativeUiSmokePreparedButtonClick {
+    target: PreparedTarget,
+    coordinate_tolerance: [i32; 2],
+    host_incarnation: u64,
+    backend_token: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NativeUiSmokeButtonDelivery {
+    pub(crate) token: u64,
+    pub(crate) receiver_hwnd: u64,
+    pub(crate) receiver_process_id: u32,
+    pub(crate) receiver_thread_id: u32,
+    pub(crate) actual_client_x: i32,
+    pub(crate) actual_client_y: i32,
+    pub(crate) actual_screen_x: i32,
+    pub(crate) actual_screen_y: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct NativeUiSmokeTopPanoramaClickReceipt {
+    pub(crate) gesture_id: u64,
+    pub(crate) down: NativeUiSmokeButtonDelivery,
+    pub(crate) up: NativeUiSmokeButtonDelivery,
+    pub(crate) app_video_zoom_scale: f32,
+    pub(crate) app_panorama_active: bool,
+    pub(crate) pointer_released: bool,
+    pub(crate) drag_latches_released: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NativeUiSmokeButtonDispatchMetadata {
+    gesture_id: u64,
+    step_token: usize,
+    host_publisher: PublisherKey,
+    render_publisher: PublisherKey,
+    output: NativeUiSmokeOutputId,
+    source_epoch: u64,
+    generation: u64,
+    placement: NativeVideoPlacement,
+    owner_hwnd: u64,
+    presenter_hwnd: u64,
+    overlay_owner_nonce: u64,
+    named_token: u64,
+}
+
+#[cfg(test)]
+pub(crate) fn button_dispatch_metadata_for_test(
+    gesture_id: u64,
+    step_token: usize,
+) -> NativeUiSmokeButtonDispatchMetadata {
+    NativeUiSmokeButtonDispatchMetadata {
+        gesture_id,
+        step_token,
+        host_publisher: PublisherKey {
+            output: NativeUiSmokeOutputId(901),
+            nonce: 902,
+        },
+        render_publisher: PublisherKey {
+            output: NativeUiSmokeOutputId(901),
+            nonce: 903,
+        },
+        output: NativeUiSmokeOutputId(901),
+        source_epoch: 904,
+        generation: 905,
+        placement: NativeVideoPlacement::DetachedViewerChild,
+        owner_hwnd: 0x906,
+        presenter_hwnd: 0x907,
+        overlay_owner_nonce: 908,
+        named_token: 909,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct NativeUiSmokeAppEffect {
+    pub(crate) panorama_active: bool,
+    pub(crate) video_zoom_scale: Option<f32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingStepKind {
+    MouseMove,
+    ButtonDown { gesture_id: u64 },
+    ButtonUp { gesture_id: u64 },
 }
 
 struct PendingStep {
@@ -364,6 +903,13 @@ struct PendingStep {
     pump_actual_point: Option<[i32; 2]>,
     render_actual_point: Option<[i32; 2]>,
     coordinate_tolerance: [i32; 2],
+    kind: PendingStepKind,
+    wndproc_state_confirmed: bool,
+    button_dispatch_claimed: bool,
+    metadata: Option<NativeUiSmokeMessageMetadata>,
+    app_tail: Option<NativeUiSmokeAppEffect>,
+    pointer_released: bool,
+    drag_latches_released: bool,
     failure: Option<String>,
 }
 
@@ -460,6 +1006,7 @@ fn retire_host_publisher_in(broker: &Broker, key: PublisherKey) -> Result<(), St
 pub(crate) struct NativeUiSmokeRenderPublisher {
     key: PublisherKey,
     requested_source_epoch: Weak<AtomicU64>,
+    invalidated_commit_floor: AtomicU64,
 }
 
 impl NativeUiSmokeRenderPublisher {
@@ -473,6 +1020,7 @@ impl NativeUiSmokeRenderPublisher {
                 nonce: NEXT_PUBLISHER_NONCE.fetch_add(1, Ordering::Relaxed),
             },
             requested_source_epoch: Arc::downgrade(requested_source_epoch),
+            invalidated_commit_floor: AtomicU64::new(0),
         }
     }
 
@@ -484,9 +1032,19 @@ impl NativeUiSmokeRenderPublisher {
         owner_hwnd: u64,
         presenter_hwnd: u64,
         geometry: NativeUiSmokeCanvasGeometry,
+        inventory: NativeUiSmokeCommittedInventory,
     ) -> Result<u64, String> {
+        if !inventory.owner_is_live() {
+            return Err("native mouse overlay observation owner already retired".to_string());
+        }
         let broker = broker();
         let mut state = lock_broker_state(broker)?;
+        if inventory.commit_serial <= self.invalidated_commit_floor.load(Ordering::Acquire) {
+            return Err(
+                "native mouse overlay observation predates the last source invalidation"
+                    .to_string(),
+            );
+        }
         let geometry_version = state
             .renders
             .get(&self.key)
@@ -510,10 +1068,27 @@ impl NativeUiSmokeRenderPublisher {
                 presenter_hwnd,
                 geometry,
                 geometry_version,
+                inventory,
             },
         );
         broker.changed.notify_all();
         Ok(geometry_version)
+    }
+
+    pub(crate) fn invalidate(&self, reason: &str) -> Result<(), String> {
+        let broker = broker();
+        let mut state = lock_broker_state(broker)?;
+        if let Some(retired) = state.renders.remove(&self.key) {
+            self.invalidated_commit_floor
+                .fetch_max(retired.inventory.commit_serial, Ordering::AcqRel);
+        }
+        fail_pending_if(
+            &mut state,
+            |step| step.target.render.publisher == self.key,
+            reason,
+        );
+        broker.changed.notify_all();
+        Ok(())
     }
 
     pub(crate) fn output_id(&self) -> NativeUiSmokeOutputId {
@@ -559,13 +1134,29 @@ fn receipt_point_matches(
     point: [i32; 2],
 ) -> bool {
     if source != NativeVideoWindowSource::Presenter
-        || !step.target.render.geometry.contains_client_point(point)
+        || !step.target.area.contains_client_point(point)
     {
         return false;
     }
     let requested = [step.target.client_point.x, step.target.client_point.y];
     point[0].abs_diff(requested[0]) <= step.coordinate_tolerance[0] as u32
         && point[1].abs_diff(requested[1]) <= step.coordinate_tolerance[1] as u32
+}
+
+fn receipt_kind_matches(step: &PendingStep, actual: NativeUiSmokeInputKind) -> bool {
+    matches!(
+        (step.kind, actual),
+        (
+            PendingStepKind::MouseMove,
+            NativeUiSmokeInputKind::MouseMove
+        ) | (
+            PendingStepKind::ButtonDown { .. },
+            NativeUiSmokeInputKind::LeftButtonDown
+        ) | (
+            PendingStepKind::ButtonUp { .. },
+            NativeUiSmokeInputKind::LeftButtonUp
+        )
+    )
 }
 
 pub(crate) fn capture_message_entry() -> Option<NativeUiSmokeMessageEntry> {
@@ -611,7 +1202,97 @@ fn message_metadata_from_values(
     (active != 0 && observed == active).then_some(NativeUiSmokeMessageMetadata {
         token: observed,
         receiver_hwnd,
+        receiver_process_id: unsafe { GetCurrentProcessId() },
+        receiver_thread_id: unsafe { GetCurrentThreadId() },
     })
+}
+
+pub(crate) fn record_wndproc_button_state(
+    metadata: Option<NativeUiSmokeMessageMetadata>,
+    input_kind: NativeUiSmokeInputKind,
+    state_confirmed: bool,
+) {
+    record_wndproc_button_state_in(broker(), metadata, input_kind, state_confirmed);
+}
+
+pub(crate) fn record_wndproc_button_identity(
+    metadata: Option<NativeUiSmokeMessageMetadata>,
+    input_kind: NativeUiSmokeInputKind,
+) {
+    record_wndproc_button_identity_in(broker(), metadata, input_kind);
+}
+
+fn record_wndproc_button_identity_in(
+    broker: &Broker,
+    metadata: Option<NativeUiSmokeMessageMetadata>,
+    input_kind: NativeUiSmokeInputKind,
+) {
+    let Some(metadata) = metadata else {
+        return;
+    };
+    let Ok(mut state) = lock_broker_state(broker) else {
+        broker.changed.notify_all();
+        return;
+    };
+    let Some(step) = state.pending.as_mut() else {
+        return;
+    };
+    if step.token != metadata.token || !receipt_kind_matches(step, input_kind) {
+        return;
+    }
+    if metadata.receiver_hwnd != step.target.render.presenter_hwnd {
+        if step.failure.is_none() {
+            step.failure = Some("native mouse WndProc identity used the wrong presenter".into());
+        }
+    } else if step.metadata.is_some_and(|previous| previous != metadata) {
+        if step.failure.is_none() {
+            step.failure = Some("native mouse WndProc identity changed within one step".into());
+        }
+    } else {
+        step.metadata = Some(metadata);
+    }
+    broker.changed.notify_all();
+}
+
+fn record_wndproc_button_state_in(
+    broker: &Broker,
+    metadata: Option<NativeUiSmokeMessageMetadata>,
+    input_kind: NativeUiSmokeInputKind,
+    state_confirmed: bool,
+) {
+    let Some(metadata) = metadata else {
+        return;
+    };
+    let Ok(mut state) = lock_broker_state(broker) else {
+        broker.changed.notify_all();
+        return;
+    };
+    let Some(step) = state.pending.as_mut() else {
+        return;
+    };
+    if step.token != metadata.token || !receipt_kind_matches(step, input_kind) {
+        return;
+    }
+    if step.metadata != Some(metadata) || !state_confirmed {
+        if step.failure.is_none() {
+            step.failure = Some(match input_kind {
+                NativeUiSmokeInputKind::LeftButtonDown => {
+                    "native mouse WndProc did not confirm left-button capture after identity stamp"
+                        .to_string()
+                }
+                NativeUiSmokeInputKind::LeftButtonUp => {
+                    "native mouse WndProc did not confirm left-button capture release after identity stamp"
+                        .to_string()
+                }
+                NativeUiSmokeInputKind::MouseMove => {
+                    "native mouse WndProc state confirmation used the wrong event kind".to_string()
+                }
+            });
+        }
+    } else {
+        step.wndproc_state_confirmed = true;
+    }
+    broker.changed.notify_all();
 }
 
 fn begin_wndproc_trace(token: usize) {
@@ -730,6 +1411,7 @@ fn record_pump_receipt_in(
     let target = &step.target;
     let actual_windows = HostWindowSet::from_contract(receipt.windows);
     let mismatch = metadata.receiver_hwnd != target.render.presenter_hwnd
+        || !receipt_kind_matches(step, receipt.input_kind)
         || receipt.output != target.host.publisher.output
         || receipt.epoch != target.host.epoch
         || receipt.placement != target.host.placement
@@ -781,21 +1463,44 @@ fn record_render_receipt_in(
             .is_some_and(|requested| {
                 requested.load(Ordering::Acquire) == target.render.actual_source_epoch
             });
+    let target_geometry_matches = match target.kind {
+        PreparedTargetKind::Canvas => {
+            receipt.geometry == target.render.geometry
+                && receipt.geometry_version == target.render.geometry_version
+        }
+        PreparedTargetKind::TopHoverActivation | PreparedTargetKind::NamedTopPanorama => true,
+    };
     let mismatch = metadata.receiver_hwnd != target.render.presenter_hwnd
+        || !receipt_kind_matches(step, receipt.input_kind)
         || receipt.output != target.render.publisher.output
         || receipt.actual_source_epoch != target.render.actual_source_epoch
         || receipt.generation != target.render.generation
         || receipt.placement != target.render.placement
         || receipt.owner_hwnd != target.render.owner_hwnd
         || receipt.presenter_hwnd != target.render.presenter_hwnd
-        || receipt.geometry != target.render.geometry
-        || receipt.geometry_version != target.render.geometry_version
+        || !target_geometry_matches
         || !requested_matches
         || !receipt_point_matches(step, receipt.source, [receipt.event_x, receipt.event_y])
         || step
             .pump_actual_point
             .is_some_and(|point| point != [receipt.event_x, receipt.event_y]);
-    if mismatch {
+    let semantic_mismatch = match step.kind {
+        PendingStepKind::MouseMove => false,
+        PendingStepKind::ButtonDown { .. } => {
+            receipt.event_count != 1
+                || receipt.raw_forwarded
+                || receipt.pointer_released
+                || !receipt.drag_latches_released
+        }
+        PendingStepKind::ButtonUp { .. } => {
+            receipt.event_count != 1
+                || !step.button_dispatch_claimed
+                || receipt.raw_forwarded
+                || !receipt.pointer_released
+                || !receipt.drag_latches_released
+        }
+    };
+    if mismatch || semantic_mismatch {
         if step.failure.is_none() {
             step.failure = Some(
                 "native mouse render receipt did not match the prepared target or point".into(),
@@ -803,6 +1508,8 @@ fn record_render_receipt_in(
         }
     } else {
         step.render_actual_point = Some([receipt.event_x, receipt.event_y]);
+        step.pointer_released = receipt.pointer_released;
+        step.drag_latches_released = receipt.drag_latches_released;
     }
     broker.changed.notify_all();
 }
@@ -849,6 +1556,7 @@ pub(crate) fn prepare_real_mouse_in_canvas(
         broker,
         owner_hwnd,
         normalized,
+        PreparedTargetKind::Canvas,
         deadline,
         &mut validate_owner_and_interrupt,
     )?;
@@ -858,6 +1566,39 @@ pub(crate) fn prepare_real_mouse_in_canvas(
         "prepare_after_os_target_validation",
     )?;
     require_unexpired_deadline(deadline, "returning the prepared native mouse target")?;
+    Ok(NativeUiSmokePreparedMove {
+        target,
+        normalized,
+        coordinate_tolerance: virtual_desktop_coordinate_tolerance()?,
+    })
+}
+
+pub(crate) fn prepare_real_mouse_in_top_hover_activation(
+    owner_hwnd: u64,
+    deadline: Instant,
+    mut validate_owner_and_interrupt: impl FnMut() -> Result<(), String>,
+) -> Result<NativeUiSmokePreparedMove, String> {
+    validate_disposable_runtime()?;
+    require_unexpired_deadline(deadline, "preparing native top-hover input")?;
+    validate_owner_for_phase(
+        &mut validate_owner_and_interrupt,
+        "prepare_top_hover_before_target_wait",
+    )?;
+    let normalized = [0.5, 0.5];
+    let target = wait_for_target(
+        broker(),
+        owner_hwnd,
+        normalized,
+        PreparedTargetKind::TopHoverActivation,
+        deadline,
+        &mut validate_owner_and_interrupt,
+    )?;
+    validate_os_target(&target)?;
+    validate_owner_for_phase(
+        &mut validate_owner_and_interrupt,
+        "prepare_top_hover_after_os_target_validation",
+    )?;
+    require_unexpired_deadline(deadline, "returning the prepared native top-hover target")?;
     Ok(NativeUiSmokePreparedMove {
         target,
         normalized,
@@ -877,7 +1618,11 @@ pub(crate) fn send_prepared_real_mouse_move(
         "send_before_prepared_target_validation",
     )?;
     let broker = broker();
-    validate_prepared_target(broker, &prepared)?;
+    validate_prepared_target(
+        broker,
+        &prepared,
+        PreparedTargetValidationPhase::BeforeInput,
+    )?;
     validate_os_target(&prepared.target)?;
     validate_owner_for_phase(
         &mut validate_owner_and_interrupt,
@@ -892,7 +1637,10 @@ pub(crate) fn send_prepared_real_mouse_move(
         if state.pending.is_some() {
             return Err("another native mouse diagnostic receipt is pending".into());
         }
-        if !prepared.target.still_matches(&state) || !prepared_target_is_unique(&state, &prepared)?
+        if !prepared
+            .target
+            .still_matches(&state, PreparedTargetValidationPhase::BeforeInput)
+            || !prepared_target_is_unique(&state, &prepared)?
         {
             return Err("native mouse target changed before SendInput".into());
         }
@@ -902,6 +1650,13 @@ pub(crate) fn send_prepared_real_mouse_move(
             pump_actual_point: None,
             render_actual_point: None,
             coordinate_tolerance: prepared.coordinate_tolerance,
+            kind: PendingStepKind::MouseMove,
+            wndproc_state_confirmed: true,
+            button_dispatch_claimed: false,
+            metadata: None,
+            app_tail: None,
+            pointer_released: true,
+            drag_latches_released: true,
             failure: None,
         });
     }
@@ -911,13 +1666,21 @@ pub(crate) fn send_prepared_real_mouse_move(
             &mut validate_owner_and_interrupt,
             "send_pending_before_target_validation",
         )?;
-        validate_prepared_target(broker, &prepared)?;
+        validate_prepared_target(
+            broker,
+            &prepared,
+            PreparedTargetValidationPhase::BeforeInput,
+        )?;
         validate_os_target(&prepared.target)?;
         validate_owner_for_phase(
             &mut validate_owner_and_interrupt,
             "send_pending_immediately_before_send_input",
         )?;
-        validate_prepared_target(broker, &prepared)?;
+        validate_prepared_target(
+            broker,
+            &prepared,
+            PreparedTargetValidationPhase::BeforeInput,
+        )?;
         validate_os_target(&prepared.target)?;
         require_unexpired_deadline(deadline, "calling SendInput")?;
         send_absolute_mouse_move(&prepared.target, token)?;
@@ -938,8 +1701,889 @@ pub(crate) fn send_prepared_real_mouse_move(
             requested_client_y: prepared.target.client_point.y,
             actual_client_x: actual_point[0],
             actual_client_y: actual_point[1],
+            host_publisher: prepared.target.host.publisher,
+            render_publisher: prepared.target.render.publisher,
+            overlay_owner_nonce: prepared.target.render.inventory.owner_nonce,
         })
     })
+}
+
+pub(crate) fn wait_for_native_top_panorama_after_move(
+    move_receipt: &NativeUiSmokeMoveReceipt,
+    deadline: Instant,
+    mut validate_owner_and_interrupt: impl FnMut() -> Result<(), String>,
+) -> Result<NativeUiSmokeNamedControlReceipt, String> {
+    validate_disposable_runtime()?;
+    require_unexpired_deadline(deadline, "waiting for native_top_panorama")?;
+    loop {
+        validate_owner_for_phase(
+            &mut validate_owner_and_interrupt,
+            "named_target_before_snapshot",
+        )?;
+        let broker = broker();
+        let state = lock_broker_state(broker)?;
+        if let Some(named) = named_control_after_move(&state, move_receipt)? {
+            return Ok(named);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(
+                "timed out waiting for enabled native_top_panorama on the prepared owner/source/host"
+                    .to_string(),
+            );
+        }
+        let wait = TARGET_WAIT_POLL.min(deadline.saturating_duration_since(now));
+        let waited = broker.changed.wait_timeout(state, wait);
+        match waited {
+            Ok((state, _)) => drop(state),
+            Err(_) => {
+                broker.faulted.store(true, Ordering::Release);
+                return Err("native mouse diagnostic broker state is poisoned".into());
+            }
+        }
+        validate_owner_for_phase(
+            &mut validate_owner_and_interrupt,
+            "named_target_after_broker_wait",
+        )?;
+    }
+}
+
+/// Click a control from the committed native HUD inventory through the OS input
+/// route. The caller verifies the resulting menu/selection in the next App
+/// snapshot; a popup click intentionally retires the control inventory itself.
+pub(crate) fn click_native_audio_control(
+    owner_hwnd: u64,
+    name: NativeUiSmokeAudioControl,
+    deadline: Instant,
+    mut validate_owner_and_interrupt: impl FnMut() -> Result<(), String>,
+) -> Result<(u64, i32, i32), String> {
+    validate_disposable_runtime()?;
+    let (target, token) = loop {
+        validate_owner_for_phase(
+            &mut validate_owner_and_interrupt,
+            "audio_control_before_snapshot",
+        )?;
+        let broker = broker();
+        let state = lock_broker_state(broker)?;
+        let candidates = coherent_audio_control_targets(&state, owner_hwnd, name)?;
+        match candidates.as_slice() {
+            [(target, token)] => break (target.clone(), *token),
+            [] => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(format!(
+                        "timed out waiting for enabled native audio control {name:?}"
+                    ));
+                }
+                let wait = TARGET_WAIT_POLL.min(deadline.saturating_duration_since(now));
+                let waited = broker.changed.wait_timeout(state, wait);
+                match waited {
+                    Ok((state, _)) => drop(state),
+                    Err(_) => return Err("native audio control broker is poisoned".into()),
+                }
+            }
+            _ => return Err(format!("native audio control {name:?} is not unique")),
+        }
+    };
+    validate_owner_for_phase(
+        &mut validate_owner_and_interrupt,
+        "audio_control_before_os_input",
+    )?;
+    validate_os_target(&target)?;
+    {
+        let state = lock_broker_state(broker())?;
+        validate_audio_control_before_input(&state, owner_hwnd, name, &target, token)?;
+    }
+    require_unexpired_deadline(deadline, "clicking native audio control")?;
+    // Move, press and release are one ordered SendInput batch. The observed
+    // point comes from a committed egui Response, never a guessed coordinate.
+    let _dpi = ThreadDpiContext::enter()?;
+    let mut screen = target.client_point;
+    if !unsafe {
+        ClientToScreen(hwnd_from_value(target.render.presenter_hwnd), &mut screen).as_bool()
+    } {
+        return Err("ClientToScreen failed for native audio control".into());
+    }
+    let (dx, dy) = virtual_desktop_absolute(screen)?;
+    let mouse = |flags, x, y| INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: x,
+                dy: y,
+                mouseData: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    let inputs = [
+        mouse(
+            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            dx,
+            dy,
+        ),
+        mouse(MOUSEEVENTF_LEFTDOWN, 0, 0),
+        mouse(MOUSEEVENTF_LEFTUP, 0, 0),
+    ];
+    let inserted = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    if inserted != inputs.len() as u32 {
+        return Err(format!(
+            "SendInput inserted {inserted} of {} audio control events",
+            inputs.len()
+        ));
+    }
+    Ok((token, target.client_point.x, target.client_point.y))
+}
+
+fn validate_audio_control_before_input(
+    state: &BrokerState,
+    owner_hwnd: u64,
+    name: NativeUiSmokeAudioControl,
+    target: &PreparedTarget,
+    token: u64,
+) -> Result<(), String> {
+    let current = coherent_audio_control_targets(state, owner_hwnd, name)?;
+    // The control token already covers its complete Response and area, and is
+    // stable across identical commits. Keep it: comparing only name/center would
+    // accept a replaced or resized control. Canvas validation also binds the
+    // control to the original source, host, overlay owner and geometry lifetime.
+    if target.still_matches(state, PreparedTargetValidationPhase::BeforeInput)
+        && matches!(current.as_slice(), [(fresh, fresh_token)]
+            if *fresh_token == token
+                && fresh.host.publisher == target.host.publisher
+                && fresh.render.publisher == target.render.publisher
+                && fresh.area == target.area
+                && fresh.client_point.x == target.client_point.x
+                && fresh.client_point.y == target.client_point.y)
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "native audio control {name:?} changed before input: expected token={token}, area={:?}, current={:?}",
+            target.area,
+            current
+                .iter()
+                .map(|(fresh, token)| (*token, fresh.area))
+                .collect::<Vec<_>>()
+        ))
+    }
+}
+
+fn coherent_audio_control_targets(
+    state: &BrokerState,
+    owner_hwnd: u64,
+    name: NativeUiSmokeAudioControl,
+) -> Result<Vec<(PreparedTarget, u64)>, String> {
+    let mut candidates = Vec::new();
+    for host in state.hosts.values().filter(|host| {
+        host.owner_hwnd == owner_hwnd
+            && host.placement == NativeVideoPlacement::DetachedViewerChild
+            && host.windows.presenter_only()
+    }) {
+        for render in state.renders.values() {
+            let evaluation = evaluate_target_pair(host, render, owner_hwnd, [0.5, 0.5]);
+            if !evaluation.host_eligible()
+                || !evaluation.render_matches_host()
+                || !render.inventory.owner_is_live()
+                || render
+                    .requested_source_epoch
+                    .upgrade()
+                    .is_none_or(|source| {
+                        source.load(Ordering::Acquire) != render.actual_source_epoch
+                    })
+            {
+                continue;
+            }
+            for control in &render.inventory.audio_controls {
+                if control.name != name {
+                    continue;
+                }
+                let Some(token) = control.token else {
+                    continue;
+                };
+                candidates.push((
+                    PreparedTarget {
+                        host: host.clone(),
+                        render: render.clone(),
+                        kind: PreparedTargetKind::Canvas,
+                        area: control.area,
+                        client_point: control.area.client_point([0.5, 0.5])?,
+                        named_token: Some(token),
+                    },
+                    token,
+                ));
+            }
+        }
+    }
+    Ok(candidates)
+}
+
+fn named_control_after_move(
+    state: &BrokerState,
+    move_receipt: &NativeUiSmokeMoveReceipt,
+) -> Result<Option<NativeUiSmokeNamedControlReceipt>, String> {
+    let host = state
+        .hosts
+        .get(&move_receipt.host_publisher)
+        .ok_or_else(|| {
+            "native mouse host retired while waiting for native_top_panorama".to_string()
+        })?;
+    let render = state
+        .renders
+        .get(&move_receipt.render_publisher)
+        .ok_or_else(|| {
+            "native mouse render target retired while waiting for native_top_panorama".to_string()
+        })?;
+    let requested_source = render
+        .requested_source_epoch
+        .upgrade()
+        .map(|source| source.load(Ordering::Acquire));
+    let identity_matches = host.owner_hwnd == move_receipt.owner_hwnd
+        && host.placement == NativeVideoPlacement::DetachedViewerChild
+        && host.windows.presenter_only()
+        && host.windows.presenter().hwnd == move_receipt.presenter_hwnd
+        && render.publisher.output == host.publisher.output
+        && render.actual_source_epoch == move_receipt.source_epoch
+        && render.generation == move_receipt.generation
+        && render.placement == host.placement
+        && render.owner_hwnd == move_receipt.owner_hwnd
+        && render.presenter_hwnd == move_receipt.presenter_hwnd
+        && requested_source == Some(move_receipt.source_epoch)
+        && render.inventory.owner_nonce == move_receipt.overlay_owner_nonce
+        && render.inventory.owner_is_live();
+    if !identity_matches {
+        return Err(
+            "native mouse owner, source, host, or overlay changed while waiting for native_top_panorama"
+                .to_string(),
+        );
+    }
+    let Some(named) = render.inventory.native_top_panorama.as_ref() else {
+        return Ok(None);
+    };
+    let Some(token) = named.token else {
+        return Ok(None);
+    };
+    let point = named.area.client_point([0.5, 0.5])?;
+    Ok(Some(NativeUiSmokeNamedControlReceipt {
+        token,
+        owner_hwnd: render.owner_hwnd,
+        presenter_hwnd: render.presenter_hwnd,
+        source_epoch: render.actual_source_epoch,
+        generation: render.generation,
+        client_x: point.x,
+        client_y: point.y,
+        pixels_per_point: named.area.pixels_per_point,
+        rect: named.observation.rect,
+        interact_rect: named.observation.interact_rect,
+        clip_rect: named.observation.clip_rect,
+        layer_id: named.observation.layer_id,
+        senses_click: named.observation.sense.senses_click(),
+        enabled: named.observation.enabled,
+        classification: named.classification,
+        panorama_pose_present: named.panorama_pose_present,
+        video_zoom_present: named.video_zoom_present,
+        host_publisher: host.publisher,
+        render_publisher: render.publisher,
+        overlay_owner_nonce: render.inventory.owner_nonce,
+        inventory_target_version: render.inventory.target_version,
+        area: named.area,
+    }))
+}
+
+pub(crate) fn prepare_native_top_panorama_click(
+    observed: &NativeUiSmokeNamedControlReceipt,
+    host_incarnation: u64,
+    backend_token: u64,
+    deadline: Instant,
+    mut validate_owner_and_interrupt: impl FnMut() -> Result<(), String>,
+) -> Result<NativeUiSmokePreparedButtonClick, String> {
+    validate_disposable_runtime()?;
+    if host_incarnation == 0 || backend_token == 0 {
+        return Err("native button selected host/backend identity is incomplete".into());
+    }
+    require_unexpired_deadline(deadline, "preparing native_top_panorama click")?;
+    validate_owner_for_phase(
+        &mut validate_owner_and_interrupt,
+        "prepare_button_before_snapshot",
+    )?;
+    let broker = broker();
+    let state = lock_broker_state(broker)?;
+    let candidates =
+        coherent_named_top_panorama_targets(&state, observed.owner_hwnd, observed.token)?;
+    let [target] = candidates.as_slice() else {
+        return Err(format!(
+            "native_top_panorama target was not unique while preparing click (candidates={})",
+            candidates.len()
+        ));
+    };
+    let current_named = target
+        .render
+        .inventory
+        .native_top_panorama
+        .as_ref()
+        .ok_or_else(|| "native_top_panorama observation disappeared".to_string())?;
+    let receipt_matches = target.host.publisher == observed.host_publisher
+        && target.render.publisher == observed.render_publisher
+        && target.render.inventory.owner_nonce == observed.overlay_owner_nonce
+        && target.render.inventory.target_version == observed.inventory_target_version
+        && target.area == observed.area
+        && target.client_point.x == observed.client_x
+        && target.client_point.y == observed.client_y
+        && current_named.token == Some(observed.token)
+        && current_named.observation.rect == observed.rect
+        && current_named.observation.interact_rect == observed.interact_rect
+        && current_named.observation.clip_rect == observed.clip_rect
+        && current_named.observation.layer_id == observed.layer_id
+        && current_named.observation.enabled == observed.enabled
+        && current_named.observation.sense.senses_click() == observed.senses_click
+        && current_named.classification == observed.classification
+        && current_named.panorama_pose_present == observed.panorama_pose_present
+        && current_named.video_zoom_present == observed.video_zoom_present;
+    if !receipt_matches {
+        return Err("native_top_panorama observation changed before click preparation".into());
+    }
+    let prepared = NativeUiSmokePreparedButtonClick {
+        target: target.clone(),
+        coordinate_tolerance: virtual_desktop_coordinate_tolerance()?,
+        host_incarnation,
+        backend_token,
+    };
+    drop(state);
+    validate_os_target(&prepared.target)?;
+    validate_owner_for_phase(
+        &mut validate_owner_and_interrupt,
+        "prepare_button_after_os_target_validation",
+    )?;
+    validate_prepared_button_target(broker, &prepared)?;
+    Ok(prepared)
+}
+
+const BUTTON_WIRE_REQUEST_MAGIC: u32 = 0x4256_494d;
+const BUTTON_WIRE_REPLY_MAGIC: u32 = 0x5256_494d;
+const BUTTON_WIRE_VERSION: u16 = 2;
+const BUTTON_WIRE_REQUEST_LENGTH: usize = 176;
+const BUTTON_WIRE_REPLY_LENGTH: usize = 48;
+
+#[derive(Clone)]
+struct ButtonWireGesture {
+    session: [u8; 16],
+    gesture_id: u64,
+    deadline_tick: u64,
+    app_process_id: u32,
+    app_creation_identity: u64,
+    parent_hwnd: u64,
+    input_hwnd: u64,
+    screen_x: i32,
+    screen_y: i32,
+    down_tag: u64,
+    up_tag: u64,
+    source_epoch: u64,
+    placement_generation: u64,
+    host_incarnation: u64,
+    backend_token: u64,
+}
+
+struct ButtonPipeClient {
+    file: std::fs::File,
+    gesture: ButtonWireGesture,
+}
+
+impl ButtonPipeClient {
+    fn connect(
+        prepared: &NativeUiSmokePreparedButtonClick,
+        down_tag: usize,
+        up_tag: usize,
+        deadline: Instant,
+    ) -> Result<Self, String> {
+        let pipe_name = std::env::var("MIV_UI_SMOKE_BUTTON_PIPE")
+            .map_err(|_| "native button helper pipe environment is missing".to_string())?;
+        if pipe_name.is_empty()
+            || pipe_name.len() > 160
+            || pipe_name.contains('\\')
+            || pipe_name.contains('/')
+        {
+            return Err("native button helper pipe name is invalid".into());
+        }
+        let session = parse_guid_for_dotnet(
+            &std::env::var("MIV_UI_SMOKE_BUTTON_SESSION")
+                .map_err(|_| "native button helper session environment is missing".to_string())?,
+        )?;
+        let expected_server_pid = std::env::var("MIV_UI_SMOKE_BUTTON_SERVER_PID")
+            .map_err(|_| "native button helper server PID environment is missing".to_string())?
+            .parse::<u32>()
+            .map_err(|_| "native button helper server PID is invalid".to_string())?;
+        if expected_server_pid == 0 {
+            return Err("native button helper server PID is zero".into());
+        }
+        let path = format!(r"\\.\pipe\{pipe_name}");
+        let file = loop {
+            match OpenOptions::new().read(true).write(true).open(&path) {
+                Ok(file) => break file,
+                Err(error) if Instant::now() < deadline => {
+                    let _ = error;
+                    std::thread::sleep(TARGET_WAIT_POLL);
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "could not connect to native button helper: {error}"
+                    ));
+                }
+            }
+        };
+        let mut actual_server_pid = 0_u32;
+        unsafe {
+            GetNamedPipeServerProcessId(HANDLE(file.as_raw_handle()), &mut actual_server_pid)
+        }
+        .map_err(|error| format!("could not authenticate native button helper PID: {error}"))?;
+        if actual_server_pid != expected_server_pid {
+            return Err(format!(
+                "native button helper PID mismatch: expected {expected_server_pid}, got {actual_server_pid}"
+            ));
+        }
+        let mut screen = prepared.target.client_point;
+        let _dpi = ThreadDpiContext::enter()?;
+        if !unsafe {
+            ClientToScreen(
+                hwnd_from_value(prepared.target.render.presenter_hwnd),
+                &mut screen,
+            )
+            .as_bool()
+        } {
+            return Err("ClientToScreen failed for native button target".into());
+        }
+        let gesture_id = NEXT_GESTURE_ID.fetch_add(1, Ordering::Relaxed);
+        if gesture_id == 0 {
+            return Err("native button gesture id space is exhausted".into());
+        }
+        let now_tick = unsafe { GetTickCount64() };
+        let remaining_ms = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        let deadline_tick = now_tick.saturating_add(remaining_ms.max(1));
+        Ok(Self {
+            file,
+            gesture: ButtonWireGesture {
+                session,
+                gesture_id,
+                deadline_tick,
+                app_process_id: unsafe { GetCurrentProcessId() },
+                app_creation_identity: current_process_creation_identity()?,
+                parent_hwnd: prepared.target.host.owner_hwnd,
+                input_hwnd: prepared.target.render.presenter_hwnd,
+                screen_x: screen.x,
+                screen_y: screen.y,
+                down_tag: down_tag as u64,
+                up_tag: up_tag as u64,
+                source_epoch: prepared.target.render.actual_source_epoch,
+                placement_generation: prepared.target.render.generation,
+                host_incarnation: prepared.host_incarnation,
+                backend_token: prepared.backend_token,
+            },
+        })
+    }
+
+    fn transact(
+        &mut self,
+        kind: u16,
+        step: u32,
+        flags: u32,
+        delivery: Option<NativeUiSmokeButtonDelivery>,
+        terminal: bool,
+    ) -> Result<(), String> {
+        let payload = encode_button_request(&self.gesture, kind, step, flags, delivery);
+        write_button_frame(&mut self.file, &payload)?;
+        loop {
+            let reply = read_button_reply(&mut self.file)?;
+            if reply.session != self.gesture.session
+                || reply.gesture_id != self.gesture.gesture_id
+                || reply.step != step
+            {
+                return Err("native button helper reply identity did not match the request".into());
+            }
+            match reply.kind {
+                1 if !terminal => return Ok(()),
+                1 if terminal => continue,
+                2 if terminal => return Ok(()),
+                2 => {
+                    return Err("native button helper terminated before the final receipt".into());
+                }
+                3 | 4 => {
+                    return Err(format!(
+                        "native button helper rejected step {step} (kind={}, phase={}, detail={})",
+                        reply.kind, reply.phase, reply.detail
+                    ));
+                }
+                _ => return Err("native button helper reply kind was invalid".into()),
+            }
+        }
+    }
+}
+
+struct ButtonWireReply {
+    kind: u16,
+    session: [u8; 16],
+    gesture_id: u64,
+    step: u32,
+    phase: u32,
+    detail: u32,
+}
+
+pub(crate) fn click_prepared_native_top_panorama(
+    prepared: NativeUiSmokePreparedButtonClick,
+    deadline: Instant,
+    mut validate_owner_and_interrupt: impl FnMut() -> Result<(), String>,
+) -> Result<NativeUiSmokeTopPanoramaClickReceipt, String> {
+    validate_disposable_runtime()?;
+    validate_prepared_button_target(broker(), &prepared)?;
+    validate_os_target(&prepared.target)?;
+    validate_owner_for_phase(
+        &mut validate_owner_and_interrupt,
+        "button_before_pipe_connect",
+    )?;
+    let down_token = allocate_step_token_in(&NEXT_STEP_TOKEN_SERIAL)?;
+    let up_token = allocate_step_token_in(&NEXT_STEP_TOKEN_SERIAL)?;
+    let mut pipe = ButtonPipeClient::connect(&prepared, down_token, up_token, deadline)?;
+    let gesture_id = pipe.gesture.gesture_id;
+
+    let down = run_external_button_step(
+        &prepared,
+        PendingStepKind::ButtonDown { gesture_id },
+        down_token,
+        false,
+        deadline,
+        &mut validate_owner_and_interrupt,
+        || pipe.transact(1, 1, 0, None, false),
+    )?;
+    pipe.transact(2, 2, 3, Some(down.0), false)?;
+
+    let up = run_external_button_step(
+        &prepared,
+        PendingStepKind::ButtonUp { gesture_id },
+        up_token,
+        true,
+        deadline,
+        &mut validate_owner_and_interrupt,
+        || pipe.transact(3, 3, 0, None, false),
+    )?;
+    pipe.transact(4, 4, 3, Some(up.0), true)?;
+    let effect = up
+        .1
+        .ok_or_else(|| "native button App tail was absent after receipt completion".to_string())?;
+    Ok(NativeUiSmokeTopPanoramaClickReceipt {
+        gesture_id,
+        down: down.0,
+        up: up.0,
+        app_video_zoom_scale: effect
+            .video_zoom_scale
+            .ok_or_else(|| "native button App tail did not contain zoom state".to_string())?,
+        app_panorama_active: effect.panorama_active,
+        pointer_released: up.2,
+        drag_latches_released: up.3,
+    })
+}
+
+fn run_external_button_step(
+    prepared: &NativeUiSmokePreparedButtonClick,
+    kind: PendingStepKind,
+    token: usize,
+    require_app_tail: bool,
+    deadline: Instant,
+    validate_owner_and_interrupt: &mut impl FnMut() -> Result<(), String>,
+    request_input: impl FnOnce() -> Result<(), String>,
+) -> Result<
+    (
+        NativeUiSmokeButtonDelivery,
+        Option<NativeUiSmokeAppEffect>,
+        bool,
+        bool,
+    ),
+    String,
+> {
+    require_unexpired_deadline(deadline, "starting native button step")?;
+    validate_owner_for_phase(validate_owner_and_interrupt, "button_before_step")?;
+    validate_prepared_button_target(broker(), prepared)?;
+    validate_os_target(&prepared.target)?;
+    ACTIVE_STEP_TOKEN
+        .compare_exchange(0, token, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| "another native mouse diagnostic step is already active".to_string())?;
+    let _active = ActiveStepToken(token);
+    begin_wndproc_trace(token);
+    {
+        let mut state = lock_broker_state(broker())?;
+        if state.pending.is_some() {
+            return Err("another native mouse diagnostic receipt is pending".into());
+        }
+        if !prepared
+            .target
+            .still_matches(&state, PreparedTargetValidationPhase::BeforeInput)
+            || !prepared_button_target_is_unique(&state, prepared)?
+        {
+            return Err("native button target changed before helper input".into());
+        }
+        state.pending = Some(PendingStep {
+            token,
+            target: prepared.target.clone(),
+            pump_actual_point: None,
+            render_actual_point: None,
+            coordinate_tolerance: prepared.coordinate_tolerance,
+            kind,
+            wndproc_state_confirmed: false,
+            button_dispatch_claimed: false,
+            metadata: None,
+            app_tail: None,
+            pointer_released: false,
+            drag_latches_released: false,
+            failure: None,
+        });
+    }
+    run_pending_step(broker(), token, || {
+        validate_owner_for_phase(
+            validate_owner_and_interrupt,
+            "button_immediately_before_helper_request",
+        )?;
+        validate_prepared_button_target(broker(), prepared)?;
+        validate_os_target(&prepared.target)?;
+        request_input()?;
+        wait_for_button_receipts(
+            broker(),
+            token,
+            prepared,
+            require_app_tail,
+            deadline,
+            validate_owner_and_interrupt,
+        )
+    })
+}
+
+fn wait_for_button_receipts(
+    broker: &Broker,
+    token: usize,
+    prepared: &NativeUiSmokePreparedButtonClick,
+    require_app_tail: bool,
+    deadline: Instant,
+    validate_owner_and_interrupt: &mut impl FnMut() -> Result<(), String>,
+) -> Result<
+    (
+        NativeUiSmokeButtonDelivery,
+        Option<NativeUiSmokeAppEffect>,
+        bool,
+        bool,
+    ),
+    String,
+> {
+    loop {
+        let complete = {
+            let state = lock_broker_state(broker)?;
+            completed_button_delivery(&state, token, prepared, require_app_tail)?
+        };
+        validate_owner_for_phase(validate_owner_and_interrupt, "button_receipt_wait")?;
+        if let Some(receipt) = complete {
+            require_unexpired_deadline(deadline, "returning native button receipts")?;
+            validate_os_target(&prepared.target)?;
+            validate_prepared_button_target(broker, prepared)?;
+            return Ok(receipt);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err("native button WndProc/pump/render/App receipt deadline expired".into());
+        }
+        let wait = TARGET_WAIT_POLL.min(deadline.saturating_duration_since(now));
+        let state = lock_broker_state(broker)?;
+        match broker.changed.wait_timeout(state, wait) {
+            Ok((state, _)) => drop(state),
+            Err(_) => {
+                broker.faulted.store(true, Ordering::Release);
+                return Err("native mouse diagnostic broker state is poisoned".into());
+            }
+        }
+    }
+}
+
+fn current_process_creation_identity() -> Result<u64, String> {
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    }
+    .map_err(|error| format!("GetProcessTimes failed for native button client: {error}"))?;
+    let value = (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+    (value != 0)
+        .then_some(value)
+        .ok_or_else(|| "native button client process creation identity is zero".to_string())
+}
+
+fn parse_guid_for_dotnet(value: &str) -> Result<[u8; 16], String> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 36
+        || ![8, 13, 18, 23]
+            .into_iter()
+            .all(|index| bytes[index] == b'-')
+    {
+        return Err("native button helper session GUID is invalid".into());
+    }
+    let mut canonical = [0_u8; 16];
+    let mut high = None;
+    let mut output = 0;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if [8, 13, 18, 23].contains(&index) {
+            continue;
+        }
+        let nibble = match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
+            _ => return Err("native button helper session GUID is invalid".into()),
+        };
+        if let Some(first) = high.take() {
+            canonical[output] = (first << 4) | nibble;
+            output += 1;
+        } else {
+            high = Some(nibble);
+        }
+    }
+    if output != 16 || high.is_some() {
+        return Err("native button helper session GUID is invalid".into());
+    }
+    canonical[0..4].reverse();
+    canonical[4..6].reverse();
+    canonical[6..8].reverse();
+    Ok(canonical)
+}
+
+fn encode_button_request(
+    gesture: &ButtonWireGesture,
+    kind: u16,
+    step: u32,
+    flags: u32,
+    delivery: Option<NativeUiSmokeButtonDelivery>,
+) -> [u8; BUTTON_WIRE_REQUEST_LENGTH] {
+    let mut bytes = Vec::with_capacity(BUTTON_WIRE_REQUEST_LENGTH);
+    push_u32(&mut bytes, BUTTON_WIRE_REQUEST_MAGIC);
+    push_u16(&mut bytes, BUTTON_WIRE_VERSION);
+    push_u16(&mut bytes, kind);
+    bytes.extend_from_slice(&gesture.session);
+    push_u64(&mut bytes, gesture.gesture_id);
+    push_u32(&mut bytes, step);
+    push_u32(&mut bytes, flags);
+    push_u64(&mut bytes, gesture.deadline_tick);
+    push_u32(&mut bytes, gesture.app_process_id);
+    push_u32(&mut bytes, 0);
+    push_u64(&mut bytes, gesture.app_creation_identity);
+    push_u64(&mut bytes, gesture.parent_hwnd);
+    push_u64(&mut bytes, gesture.input_hwnd);
+    push_i32(&mut bytes, gesture.screen_x);
+    push_i32(&mut bytes, gesture.screen_y);
+    push_u64(&mut bytes, gesture.down_tag);
+    push_u64(&mut bytes, gesture.up_tag);
+    push_u64(&mut bytes, gesture.source_epoch);
+    push_u64(&mut bytes, gesture.placement_generation);
+    push_u64(&mut bytes, gesture.host_incarnation);
+    push_u64(&mut bytes, gesture.backend_token);
+    let delivery = delivery.unwrap_or(NativeUiSmokeButtonDelivery {
+        token: 0,
+        receiver_hwnd: 0,
+        receiver_process_id: 0,
+        receiver_thread_id: 0,
+        actual_client_x: 0,
+        actual_client_y: 0,
+        actual_screen_x: 0,
+        actual_screen_y: 0,
+    });
+    push_u64(&mut bytes, delivery.token);
+    push_u64(&mut bytes, delivery.receiver_hwnd);
+    push_u32(&mut bytes, delivery.receiver_process_id);
+    push_u32(&mut bytes, delivery.receiver_thread_id);
+    push_i32(&mut bytes, delivery.actual_client_x);
+    push_i32(&mut bytes, delivery.actual_client_y);
+    push_i32(&mut bytes, delivery.actual_screen_x);
+    push_i32(&mut bytes, delivery.actual_screen_y);
+    bytes.try_into().expect("button wire request length")
+}
+
+fn write_button_frame(file: &mut std::fs::File, payload: &[u8]) -> Result<(), String> {
+    file.write_all(&(payload.len() as u32).to_le_bytes())
+        .and_then(|_| file.write_all(payload))
+        .and_then(|_| file.flush())
+        .map_err(|error| format!("native button helper request write failed: {error}"))
+}
+
+fn read_button_reply(file: &mut std::fs::File) -> Result<ButtonWireReply, String> {
+    let mut length = [0_u8; 4];
+    file.read_exact(&mut length)
+        .map_err(|error| format!("native button helper reply frame failed: {error}"))?;
+    if u32::from_le_bytes(length) as usize != BUTTON_WIRE_REPLY_LENGTH {
+        return Err("native button helper reply length was invalid".into());
+    }
+    let mut payload = [0_u8; BUTTON_WIRE_REPLY_LENGTH];
+    file.read_exact(&mut payload)
+        .map_err(|error| format!("native button helper reply failed: {error}"))?;
+    let mut at = 0;
+    let magic = take_u32(&payload, &mut at);
+    let version = take_u16(&payload, &mut at);
+    let kind = take_u16(&payload, &mut at);
+    let mut session = [0_u8; 16];
+    session.copy_from_slice(&payload[at..at + 16]);
+    at += 16;
+    let gesture_id = take_u64(&payload, &mut at);
+    let step = take_u32(&payload, &mut at);
+    let phase = take_u32(&payload, &mut at);
+    let detail = take_u32(&payload, &mut at);
+    let reserved = take_u32(&payload, &mut at);
+    if magic != BUTTON_WIRE_REPLY_MAGIC
+        || version != BUTTON_WIRE_VERSION
+        || !matches!(kind, 1..=4)
+        || reserved != 0
+        || at != BUTTON_WIRE_REPLY_LENGTH
+    {
+        return Err("native button helper reply payload was invalid".into());
+    }
+    Ok(ButtonWireReply {
+        kind,
+        session,
+        gesture_id,
+        step,
+        phase,
+        detail,
+    })
+}
+
+fn push_u16(bytes: &mut Vec<u8>, value: u16) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+fn push_i32(bytes: &mut Vec<u8>, value: i32) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+fn push_u64(bytes: &mut Vec<u8>, value: u64) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+fn take_u16(bytes: &[u8], at: &mut usize) -> u16 {
+    let value = u16::from_le_bytes(bytes[*at..*at + 2].try_into().unwrap());
+    *at += 2;
+    value
+}
+fn take_u32(bytes: &[u8], at: &mut usize) -> u32 {
+    let value = u32::from_le_bytes(bytes[*at..*at + 4].try_into().unwrap());
+    *at += 4;
+    value
+}
+fn take_u64(bytes: &[u8], at: &mut usize) -> u64 {
+    let value = u64::from_le_bytes(bytes[*at..*at + 8].try_into().unwrap());
+    *at += 8;
+    value
 }
 
 fn require_unexpired_deadline(deadline: Instant, phase: &str) -> Result<(), String> {
@@ -996,6 +2640,7 @@ fn wait_for_target(
     broker: &Broker,
     owner_hwnd: u64,
     normalized: [f32; 2],
+    kind: PreparedTargetKind,
     deadline: Instant,
     validate_owner_and_interrupt: &mut impl FnMut() -> Result<(), String>,
 ) -> Result<PreparedTarget, String> {
@@ -1005,7 +2650,16 @@ fn wait_for_target(
     loop {
         let (candidate, candidate_count) = {
             let state = lock_broker_state(broker)?;
-            let mut candidates = coherent_targets(&state, owner_hwnd, normalized).map_err(|error| {
+            let candidate_result = match kind {
+                PreparedTargetKind::Canvas => coherent_targets(&state, owner_hwnd, normalized),
+                PreparedTargetKind::TopHoverActivation => {
+                    coherent_top_hover_targets(&state, owner_hwnd)
+                }
+                PreparedTargetKind::NamedTopPanorama => {
+                    return Err("named native controls are prepared from an observed token".into());
+                }
+            };
+            let mut candidates = candidate_result.map_err(|error| {
                 format!(
                     "{error}; phase=coherent_target_scan; scan_count={}; last_scan_candidate_count=unknown; owner_validation_attempts={owner_validation_attempts}; owner_validation_completed={owner_validation_completed}; failure_snapshot_current={}",
                     scan_count.saturating_add(1),
@@ -1015,7 +2669,13 @@ fn wait_for_target(
             scan_count = scan_count.saturating_add(1);
             match candidates.len() {
                 0 => (None, 0),
-                1 => (Some(candidates.remove(0)), 1),
+                1 => {
+                    let candidate = candidates.remove(0);
+                    (
+                        candidate.ready_for_initial_prepare().then_some(candidate),
+                        1,
+                    )
+                }
                 count => {
                     return Err(format!(
                         "native mouse target is ambiguous: {count} live presenters use owner 0x{owner_hwnd:x}; phase=coherent_target_scan; scan_count={scan_count}; last_scan_candidate_count={count}; owner_validation_attempts={owner_validation_attempts}; owner_validation_completed={owner_validation_completed}; failure_snapshot_current={}",
@@ -1194,7 +2854,7 @@ fn evaluate_target_pair(
             .requested_source_epoch
             .upgrade()
             .map(|value| value.load(Ordering::Acquire));
-        let geometry = render.geometry.valid();
+        let geometry = render.geometry.valid() && render.inventory.owner_is_live();
         evaluation.requested =
             requested.map_or(RequestedSourceState::Expired, RequestedSourceState::Value);
         evaluation.source = Some(requested == Some(render.actual_source_epoch));
@@ -1388,7 +3048,112 @@ fn coherent_targets(
             candidates.push(PreparedTarget {
                 host: host.clone(),
                 render: render.clone(),
+                kind: PreparedTargetKind::Canvas,
+                area: NativeUiSmokeTargetArea::new(
+                    egui::Rect::from_min_size(
+                        egui::pos2(
+                            render.geometry.region.origin_points[0],
+                            render.geometry.region.origin_points[1],
+                        ),
+                        egui::vec2(
+                            render.geometry.region.size_points[0],
+                            render.geometry.region.size_points[1],
+                        ),
+                    ),
+                    render.geometry.pixels_per_point,
+                    render.geometry.client_width,
+                    render.geometry.client_height,
+                ),
                 client_point: render.geometry.client_point(normalized)?,
+                named_token: None,
+            });
+        }
+    }
+    Ok(candidates)
+}
+
+fn coherent_top_hover_targets(
+    state: &BrokerState,
+    owner_hwnd: u64,
+) -> Result<Vec<PreparedTarget>, String> {
+    let normalized = [0.5, 0.5];
+    let mut candidates = Vec::new();
+    for host in state.hosts.values().filter(|host| {
+        host.owner_hwnd == owner_hwnd
+            && host.placement == NativeVideoPlacement::DetachedViewerChild
+            && host.windows.presenter_only()
+    }) {
+        for render in state.renders.values() {
+            let evaluation = evaluate_target_pair(host, render, owner_hwnd, normalized);
+            if !evaluation.host_eligible() || !evaluation.render_matches_host() {
+                continue;
+            }
+            let requested = render
+                .requested_source_epoch
+                .upgrade()
+                .map(|value| value.load(Ordering::Acquire));
+            if requested != Some(render.actual_source_epoch) || !render.inventory.owner_is_live() {
+                continue;
+            }
+            let Some(area) = render.inventory.top_hover_activation else {
+                continue;
+            };
+            candidates.push(PreparedTarget {
+                host: host.clone(),
+                render: render.clone(),
+                kind: PreparedTargetKind::TopHoverActivation,
+                area,
+                client_point: area.client_point(normalized)?,
+                named_token: None,
+            });
+        }
+    }
+    Ok(candidates)
+}
+
+fn coherent_named_top_panorama_targets(
+    state: &BrokerState,
+    owner_hwnd: u64,
+    named_token: u64,
+) -> Result<Vec<PreparedTarget>, String> {
+    let normalized = [0.5, 0.5];
+    let mut candidates = Vec::new();
+    for host in state.hosts.values().filter(|host| {
+        host.owner_hwnd == owner_hwnd
+            && host.placement == NativeVideoPlacement::DetachedViewerChild
+            && host.windows.presenter_only()
+    }) {
+        for render in state.renders.values() {
+            let evaluation = evaluate_target_pair(host, render, owner_hwnd, normalized);
+            if !evaluation.host_eligible() || !evaluation.render_matches_host() {
+                continue;
+            }
+            let requested = render
+                .requested_source_epoch
+                .upgrade()
+                .map(|value| value.load(Ordering::Acquire));
+            if requested != Some(render.actual_source_epoch) || !render.inventory.owner_is_live() {
+                continue;
+            }
+            let Some(named) = render.inventory.native_top_panorama.as_ref() else {
+                continue;
+            };
+            if named.token != Some(named_token)
+                || !named.observation.enabled
+                || !named.observation.sense.senses_click()
+                || named.classification != NativeUiSmokePanoramaClassification::NonPanorama
+                || named.panorama_pose_present
+                || named.video_zoom_present
+            {
+                continue;
+            }
+            candidates.push(PreparedTarget {
+                host: host.clone(),
+                render: render.clone(),
+                kind: PreparedTargetKind::NamedTopPanorama,
+                area: named.area,
+                client_point: named.area.client_point(normalized)?,
+                named_token: Some(named_token),
             });
         }
     }
@@ -1398,9 +3163,12 @@ fn coherent_targets(
 fn validate_prepared_target(
     broker: &Broker,
     prepared: &NativeUiSmokePreparedMove,
+    phase: PreparedTargetValidationPhase,
 ) -> Result<(), String> {
     let state = lock_broker_state(broker)?;
-    if !prepared.target.still_matches(&state) || !prepared_target_is_unique(&state, prepared)? {
+    if !prepared.target.still_matches(&state, phase)
+        || !prepared_target_is_unique(&state, prepared)?
+    {
         return Err("native mouse prepared target is no longer the unique current target".into());
     }
     Ok(())
@@ -1410,10 +3178,57 @@ fn prepared_target_is_unique(
     state: &BrokerState,
     prepared: &NativeUiSmokePreparedMove,
 ) -> Result<bool, String> {
-    let candidates = coherent_targets(state, prepared.target.host.owner_hwnd, prepared.normalized)?;
+    let candidates = match prepared.target.kind {
+        PreparedTargetKind::Canvas => {
+            coherent_targets(state, prepared.target.host.owner_hwnd, prepared.normalized)?
+        }
+        PreparedTargetKind::TopHoverActivation => {
+            coherent_top_hover_targets(state, prepared.target.host.owner_hwnd)?
+        }
+        PreparedTargetKind::NamedTopPanorama => coherent_named_top_panorama_targets(
+            state,
+            prepared.target.host.owner_hwnd,
+            prepared
+                .target
+                .named_token
+                .ok_or_else(|| "named native target has no token".to_string())?,
+        )?,
+    };
     Ok(matches!(candidates.as_slice(), [candidate]
         if candidate.host.publisher == prepared.target.host.publisher
             && candidate.render.publisher == prepared.target.render.publisher))
+}
+
+fn prepared_button_target_is_unique(
+    state: &BrokerState,
+    prepared: &NativeUiSmokePreparedButtonClick,
+) -> Result<bool, String> {
+    named_target_is_unique(state, &prepared.target)
+}
+
+fn named_target_is_unique(state: &BrokerState, target: &PreparedTarget) -> Result<bool, String> {
+    let token = target
+        .named_token
+        .ok_or_else(|| "named native target has no token".to_string())?;
+    let candidates = coherent_named_top_panorama_targets(state, target.host.owner_hwnd, token)?;
+    Ok(matches!(candidates.as_slice(), [candidate]
+        if candidate.host.publisher == target.host.publisher
+            && candidate.render.publisher == target.render.publisher))
+}
+
+fn validate_prepared_button_target(
+    broker: &Broker,
+    prepared: &NativeUiSmokePreparedButtonClick,
+) -> Result<(), String> {
+    let state = lock_broker_state(broker)?;
+    if !prepared
+        .target
+        .still_matches(&state, PreparedTargetValidationPhase::BeforeInput)
+        || !prepared_button_target_is_unique(&state, prepared)?
+    {
+        return Err("native button prepared target is no longer the unique current target".into());
+    }
+    Ok(())
 }
 
 fn wait_for_receipts(
@@ -1437,7 +3252,11 @@ fn wait_for_receipts(
         if complete {
             require_unexpired_deadline(deadline, "validating native mouse receipts")?;
             validate_os_target(&prepared.target)?;
-            validate_prepared_target(broker, prepared)?;
+            validate_prepared_target(
+                broker,
+                prepared,
+                PreparedTargetValidationPhase::ReceiptCompletion,
+            )?;
             if let Err(error) = validate_owner_for_phase(
                 validate_owner_and_interrupt,
                 "receipt_completion_after_target_validation",
@@ -1630,10 +3449,327 @@ fn completed_actual_point(
     if pump != render {
         return Err("native mouse pump and render receipts disagree on actual point".into());
     }
-    if !prepared.target.still_matches(state) || !prepared_target_is_unique(state, prepared)? {
+    if !prepared
+        .target
+        .still_matches(state, PreparedTargetValidationPhase::ReceiptCompletion)
+        || !prepared_target_is_unique(state, prepared)?
+    {
         return Err("native mouse target changed while completing receipts".into());
     }
     Ok(Some(pump))
+}
+
+fn completed_button_delivery(
+    state: &BrokerState,
+    token: usize,
+    prepared: &NativeUiSmokePreparedButtonClick,
+    require_app_tail: bool,
+) -> Result<
+    Option<(
+        NativeUiSmokeButtonDelivery,
+        Option<NativeUiSmokeAppEffect>,
+        bool,
+        bool,
+    )>,
+    String,
+> {
+    let Some(step) = state.pending.as_ref() else {
+        return Err("native button receipt state disappeared".into());
+    };
+    if step.token != token {
+        return Err("native button receipt token was replaced".into());
+    }
+    if let Some(failure) = step.failure.as_ref() {
+        return Err(failure.clone());
+    }
+    if !button_delivery_receipts_ready(step, require_app_tail) {
+        return Ok(None);
+    }
+    let (Some(pump), Some(render), Some(metadata)) = (
+        step.pump_actual_point,
+        step.render_actual_point,
+        step.metadata,
+    ) else {
+        return Ok(None);
+    };
+    debug_assert!(step.wndproc_state_confirmed && pump == render);
+    if !prepared
+        .target
+        .still_matches(state, PreparedTargetValidationPhase::ReceiptCompletion)
+        || !prepared_button_target_is_unique(state, prepared)?
+    {
+        return Err("native button target changed while completing receipts".into());
+    }
+    let mut screen = POINT {
+        x: pump[0],
+        y: pump[1],
+    };
+    let _dpi = ThreadDpiContext::enter()?;
+    if !unsafe {
+        ClientToScreen(
+            hwnd_from_value(prepared.target.render.presenter_hwnd),
+            &mut screen,
+        )
+        .as_bool()
+    } {
+        return Err("ClientToScreen failed while completing native button receipt".into());
+    }
+    Ok(Some((
+        NativeUiSmokeButtonDelivery {
+            token: token as u64,
+            receiver_hwnd: metadata.receiver_hwnd,
+            receiver_process_id: metadata.receiver_process_id,
+            receiver_thread_id: metadata.receiver_thread_id,
+            actual_client_x: pump[0],
+            actual_client_y: pump[1],
+            actual_screen_x: screen.x,
+            actual_screen_y: screen.y,
+        },
+        step.app_tail,
+        step.pointer_released,
+        step.drag_latches_released,
+    )))
+}
+
+fn button_delivery_receipts_ready(step: &PendingStep, require_app_tail: bool) -> bool {
+    matches!(
+        (
+            step.pump_actual_point,
+            step.render_actual_point,
+            step.metadata,
+        ),
+        (Some(pump), Some(render), Some(_)) if step.wndproc_state_confirmed
+            && pump == render
+            && (!require_app_tail || step.app_tail.is_some())
+    )
+}
+
+pub(crate) fn claim_presented_button_dispatch(
+    metadata: NativeUiSmokeMessageMetadata,
+) -> Option<NativeUiSmokeButtonDispatchMetadata> {
+    claim_presented_button_dispatch_in(broker(), metadata)
+}
+
+fn claim_presented_button_dispatch_in(
+    broker: &Broker,
+    metadata: NativeUiSmokeMessageMetadata,
+) -> Option<NativeUiSmokeButtonDispatchMetadata> {
+    let mut state = lock_broker_state(broker).ok()?;
+    let step = state.pending.as_ref()?;
+    let PendingStepKind::ButtonUp { gesture_id } = step.kind else {
+        return None;
+    };
+    if step.token != metadata.token || step.metadata != Some(metadata) {
+        return None;
+    }
+    let current_target_matches = step.failure.is_none()
+        && step
+            .target
+            .still_matches(&state, PreparedTargetValidationPhase::ReceiptCompletion)
+        && named_target_is_unique(&state, &step.target).unwrap_or(false);
+    if !current_target_matches {
+        if let Some(step) = state.pending.as_mut()
+            && step.failure.is_none()
+        {
+            step.failure = Some(
+                "native_top_panorama producer target changed before command attribution".into(),
+            );
+        }
+        broker.changed.notify_all();
+        return None;
+    }
+    let target = &step.target;
+    let dispatch = NativeUiSmokeButtonDispatchMetadata {
+        gesture_id,
+        step_token: step.token,
+        host_publisher: target.host.publisher,
+        render_publisher: target.render.publisher,
+        output: target.render.publisher.output,
+        source_epoch: target.render.actual_source_epoch,
+        generation: target.render.generation,
+        placement: target.render.placement,
+        owner_hwnd: target.render.owner_hwnd,
+        presenter_hwnd: target.render.presenter_hwnd,
+        overlay_owner_nonce: target.render.inventory.owner_nonce,
+        named_token: target.named_token?,
+    };
+    let Some(step) = state.pending.as_mut() else {
+        return None;
+    };
+    if step.button_dispatch_claimed {
+        if step.failure.is_none() {
+            step.failure =
+                Some("native_top_panorama command producer was attributed more than once".into());
+        }
+        broker.changed.notify_all();
+        return None;
+    }
+    step.button_dispatch_claimed = true;
+    Some(dispatch)
+}
+
+pub(crate) struct NativeUiSmokeAppDispatchGuard {
+    dispatch: Option<NativeUiSmokeButtonDispatchMetadata>,
+    actual_output: Option<NativeUiSmokeOutputId>,
+    actual_source_epoch: u64,
+    event_is_toggle_panorama: bool,
+    completed: bool,
+}
+
+impl NativeUiSmokeAppDispatchGuard {
+    pub(crate) fn new(
+        dispatch: Option<NativeUiSmokeButtonDispatchMetadata>,
+        actual_output: Option<NativeUiSmokeOutputId>,
+        actual_source_epoch: u64,
+        event_is_toggle_panorama: bool,
+    ) -> Self {
+        Self {
+            dispatch,
+            actual_output,
+            actual_source_epoch,
+            event_is_toggle_panorama,
+            completed: false,
+        }
+    }
+
+    pub(crate) fn complete(
+        &mut self,
+        before: NativeUiSmokeAppEffect,
+        after: NativeUiSmokeAppEffect,
+    ) {
+        let Some(dispatch) = self.dispatch else {
+            return;
+        };
+        record_button_app_dispatch(
+            dispatch,
+            self.actual_output,
+            self.actual_source_epoch,
+            self.event_is_toggle_panorama,
+            before,
+            after,
+        );
+        self.completed = true;
+    }
+}
+
+impl Drop for NativeUiSmokeAppDispatchGuard {
+    fn drop(&mut self) {
+        if self.dispatch.is_some() && !self.completed {
+            record_button_app_dispatch_rejected(
+                self.dispatch.expect("dispatch checked above"),
+                "tagged TogglePanorama was rejected before its normal App handler completed",
+            );
+        }
+    }
+}
+
+fn record_button_app_dispatch(
+    dispatch: NativeUiSmokeButtonDispatchMetadata,
+    actual_output: Option<NativeUiSmokeOutputId>,
+    actual_source_epoch: u64,
+    event_is_toggle_panorama: bool,
+    before: NativeUiSmokeAppEffect,
+    after: NativeUiSmokeAppEffect,
+) {
+    record_button_app_dispatch_in(
+        broker(),
+        dispatch,
+        actual_output,
+        actual_source_epoch,
+        event_is_toggle_panorama,
+        before,
+        after,
+    );
+}
+
+fn record_button_app_dispatch_in(
+    broker: &Broker,
+    dispatch: NativeUiSmokeButtonDispatchMetadata,
+    actual_output: Option<NativeUiSmokeOutputId>,
+    actual_source_epoch: u64,
+    event_is_toggle_panorama: bool,
+    before: NativeUiSmokeAppEffect,
+    after: NativeUiSmokeAppEffect,
+) {
+    let Ok(mut state) = lock_broker_state(broker) else {
+        broker.changed.notify_all();
+        return;
+    };
+    let Some(step) = state.pending.as_ref() else {
+        return;
+    };
+    let PendingStepKind::ButtonUp { gesture_id } = step.kind else {
+        return;
+    };
+    let target = &step.target;
+    let current_target_matches = target
+        .still_matches(&state, PreparedTargetValidationPhase::ReceiptCompletion)
+        && named_target_is_unique(&state, target).unwrap_or(false);
+    let identity_matches = gesture_id == dispatch.gesture_id
+        && step.token == dispatch.step_token
+        && target.host.publisher == dispatch.host_publisher
+        && target.render.publisher == dispatch.render_publisher
+        && target.render.publisher.output == dispatch.output
+        && actual_output == Some(dispatch.output)
+        && actual_source_epoch == dispatch.source_epoch
+        && target.render.actual_source_epoch == dispatch.source_epoch
+        && target.render.generation == dispatch.generation
+        && target.render.placement == dispatch.placement
+        && target.render.owner_hwnd == dispatch.owner_hwnd
+        && target.render.presenter_hwnd == dispatch.presenter_hwnd
+        && target.render.inventory.owner_nonce == dispatch.overlay_owner_nonce
+        && target.named_token == Some(dispatch.named_token)
+        && event_is_toggle_panorama
+        && current_target_matches;
+    let effect_matches = !before.panorama_active
+        && before.video_zoom_scale.is_none()
+        && !after.panorama_active
+        && after.video_zoom_scale == Some(1.0);
+    let Some(step) = state.pending.as_mut() else {
+        return;
+    };
+    if !identity_matches || !effect_matches {
+        if step.failure.is_none() {
+            step.failure = Some(
+                "native_top_panorama App dispatch did not match the exact click or zoom transition"
+                    .to_string(),
+            );
+        }
+    } else if step.app_tail.is_some() {
+        if step.failure.is_none() {
+            step.failure =
+                Some("native_top_panorama App dispatch was observed more than once".into());
+        }
+    } else {
+        step.app_tail = Some(after);
+    }
+    broker.changed.notify_all();
+}
+
+pub(crate) fn record_button_app_dispatch_rejected(
+    dispatch: NativeUiSmokeButtonDispatchMetadata,
+    reason: &str,
+) {
+    record_button_app_dispatch_rejected_in(broker(), dispatch, reason);
+}
+
+fn record_button_app_dispatch_rejected_in(
+    broker: &Broker,
+    dispatch: NativeUiSmokeButtonDispatchMetadata,
+    reason: &str,
+) {
+    let Ok(mut state) = lock_broker_state(broker) else {
+        broker.changed.notify_all();
+        return;
+    };
+    if let Some(step) = state.pending.as_mut()
+        && matches!(step.kind, PendingStepKind::ButtonUp { gesture_id } if gesture_id == dispatch.gesture_id)
+        && step.token == dispatch.step_token
+        && step.failure.is_none()
+    {
+        step.failure = Some(reason.to_string());
+    }
+    broker.changed.notify_all();
 }
 
 fn validate_disposable_runtime() -> Result<(), String> {
@@ -1901,9 +4037,735 @@ mod tests {
         BrokerState::default()
     }
 
+    fn test_inventory(owner: &Arc<NativeUiSmokeOverlayOwner>) -> NativeUiSmokeCommittedInventory {
+        NativeUiSmokeCommittedInventory::commit(
+            None,
+            NativeUiSmokeLogicalInventory::new(
+                owner,
+                Some(NativeUiSmokeTargetArea::new(
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 36.0)),
+                    2.0,
+                    400,
+                    240,
+                )),
+                None,
+                NativeUiSmokePanoramaClassification::Unknown,
+                false,
+                false,
+                false,
+                2.0,
+                400,
+                240,
+            ),
+        )
+    }
+
+    fn test_panorama_observation(enabled: bool) -> NativeUiSmokeControlObservation {
+        NativeUiSmokeControlObservation {
+            rect: egui::Rect::from_min_size(egui::pos2(280.0, 13.0), egui::vec2(28.0, 28.0)),
+            interact_rect: egui::Rect::from_min_size(
+                egui::pos2(280.0, 13.0),
+                egui::vec2(28.0, 28.0),
+            ),
+            clip_rect: egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(400.0, 64.0)),
+            layer_id: egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("native_video_top_bar"),
+            ),
+            sense: if enabled {
+                egui::Sense::click()
+            } else {
+                egui::Sense::hover()
+            },
+            enabled,
+        }
+    }
+
+    #[test]
+    fn audio_control_inventory_retains_named_targets_only_while_enabled() {
+        let owner = allocate_overlay_owner();
+        let observation = test_panorama_observation(true);
+        let logical = |audio_allowed| {
+            NativeUiSmokeLogicalInventory::new(
+                &owner,
+                None,
+                None,
+                NativeUiSmokePanoramaClassification::Unknown,
+                false,
+                false,
+                false,
+                1.0,
+                400,
+                240,
+            )
+            .with_audio_controls(
+                vec![(NativeUiSmokeAudioControl::Button, observation)],
+                audio_allowed,
+            )
+        };
+        let first = NativeUiSmokeCommittedInventory::commit(None, logical(true));
+        let token = first.audio_controls[0].token.expect("enabled button token");
+        let stable = NativeUiSmokeCommittedInventory::commit(Some(&first), logical(true));
+        assert_eq!(stable.audio_controls[0].token, Some(token));
+        let disabled = NativeUiSmokeCommittedInventory::commit(Some(&stable), logical(false));
+        assert_eq!(disabled.audio_controls[0].token, None);
+    }
+
+    fn test_fixture_panorama_observation(enabled: bool) -> NativeUiSmokeControlObservation {
+        NativeUiSmokeControlObservation {
+            rect: egui::Rect::from_min_size(egui::pos2(120.0, 4.0), egui::vec2(28.0, 28.0)),
+            interact_rect: egui::Rect::from_min_size(
+                egui::pos2(120.0, 4.0),
+                egui::vec2(28.0, 28.0),
+            ),
+            clip_rect: egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(200.0, 36.0)),
+            layer_id: egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("native_video_top_bar"),
+            ),
+            sense: if enabled {
+                egui::Sense::click()
+            } else {
+                egui::Sense::hover()
+            },
+            enabled,
+        }
+    }
+
+    fn test_fixture_panorama_logical(
+        owner: &Arc<NativeUiSmokeOverlayOwner>,
+        top_hover_activation: NativeUiSmokeTargetArea,
+        observation: Option<NativeUiSmokeControlObservation>,
+    ) -> NativeUiSmokeLogicalInventory {
+        NativeUiSmokeLogicalInventory::new(
+            owner,
+            Some(top_hover_activation),
+            observation,
+            NativeUiSmokePanoramaClassification::NonPanorama,
+            false,
+            false,
+            true,
+            top_hover_activation.pixels_per_point,
+            top_hover_activation.client_width,
+            top_hover_activation.client_height,
+        )
+    }
+
+    fn test_panorama_logical(
+        owner: &Arc<NativeUiSmokeOverlayOwner>,
+        observation: Option<NativeUiSmokeControlObservation>,
+        classification: NativeUiSmokePanoramaClassification,
+        allowed: bool,
+    ) -> NativeUiSmokeLogicalInventory {
+        NativeUiSmokeLogicalInventory::new(
+            owner,
+            Some(NativeUiSmokeTargetArea::new(
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 36.0)),
+                1.5,
+                600,
+                360,
+            )),
+            observation,
+            classification,
+            false,
+            false,
+            allowed,
+            1.5,
+            600,
+            360,
+        )
+    }
+
+    #[test]
+    fn top_hover_target_is_independent_of_letterboxed_canvas_at_non_unit_dpi() {
+        let canvas = geometry();
+        let canvas_point = canvas.client_point([0.5, 0.5]).unwrap();
+        let top = NativeUiSmokeTargetArea::new(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 36.0)),
+            2.0,
+            400,
+            240,
+        );
+        let top_point = top.client_point([0.5, 0.5]).unwrap();
+        assert_eq!([top_point.x, top_point.y], [200, 36]);
+        assert!(top.contains_client_point([top_point.x, top_point.y]));
+        assert!(!canvas.contains_client_point([top_point.x, top_point.y]));
+        assert!(canvas.contains_client_point([canvas_point.x, canvas_point.y]));
+    }
+
+    #[test]
+    fn top_hover_receipts_complete_outside_the_letterboxed_canvas() {
+        let mut fixture = ReceiptFixture::new();
+        let area = fixture
+            .prepared
+            .target
+            .render
+            .inventory
+            .top_hover_activation
+            .expect("top hover area");
+        let point = area.client_point([0.5, 0.5]).unwrap();
+        assert!(
+            !fixture
+                .prepared
+                .target
+                .render
+                .geometry
+                .contains_client_point([point.x, point.y])
+        );
+        fixture.prepared.target.kind = PreparedTargetKind::TopHoverActivation;
+        fixture.prepared.target.area = area;
+        fixture.prepared.target.client_point = point;
+        fixture.pump.event_x = point.x;
+        fixture.pump.event_y = point.y;
+        fixture.render.event_x = point.x;
+        fixture.render.event_y = point.y;
+
+        fixture.begin();
+        {
+            let mut state = lock_broker_state(&fixture.broker).unwrap();
+            let render = state
+                .renders
+                .get_mut(&fixture.prepared.target.render.publisher)
+                .unwrap();
+            render.inventory = NativeUiSmokeCommittedInventory::commit(
+                Some(&render.inventory),
+                test_fixture_panorama_logical(
+                    &fixture._ui_smoke_owner,
+                    area,
+                    Some(test_fixture_panorama_observation(true)),
+                ),
+            );
+        }
+        record_pump_receipt_in(&fixture.broker, fixture.metadata, fixture.pump);
+        record_render_receipt_in(&fixture.broker, fixture.metadata, fixture.render);
+        assert_eq!(fixture.completion().unwrap(), Some([point.x, point.y]));
+        validate_prepared_target(
+            &fixture.broker,
+            &fixture.prepared,
+            PreparedTargetValidationPhase::ReceiptCompletion,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn top_hover_hidden_to_shown_completes_receipts_and_observes_the_named_target() {
+        let mut fixture = ReceiptFixture::new();
+        let target = {
+            let state = lock_broker_state(&fixture.broker).unwrap();
+            coherent_top_hover_targets(&state, 0x100)
+                .unwrap()
+                .pop()
+                .expect("hidden top-hover target")
+        };
+        assert!(target.ready_for_initial_prepare());
+        assert!(target.render.inventory.native_top_panorama.is_none());
+        let baseline_version = target.render.inventory.target_version;
+        let area = target.area;
+        let point = target.client_point;
+        fixture.prepared = NativeUiSmokePreparedMove {
+            target,
+            normalized: [0.5, 0.5],
+            coordinate_tolerance: [1, 1],
+        };
+        fixture.pump.event_x = point.x;
+        fixture.pump.event_y = point.y;
+        fixture.render.event_x = point.x;
+        fixture.render.event_y = point.y;
+        fixture.begin();
+
+        // Match the production event tail: a successful present publishes the newly visible
+        // inventory before the tagged render receipt is recorded.
+        {
+            let mut state = lock_broker_state(&fixture.broker).unwrap();
+            let render = state
+                .renders
+                .get_mut(&fixture.prepared.target.render.publisher)
+                .unwrap();
+            render.inventory = NativeUiSmokeCommittedInventory::commit(
+                Some(&render.inventory),
+                test_fixture_panorama_logical(
+                    &fixture._ui_smoke_owner,
+                    area,
+                    Some(test_fixture_panorama_observation(true)),
+                ),
+            );
+            assert!(render.inventory.target_version > baseline_version);
+        }
+        record_render_receipt_in(&fixture.broker, fixture.metadata, fixture.render);
+        record_pump_receipt_in(&fixture.broker, fixture.metadata, fixture.pump);
+        assert_eq!(fixture.completion().unwrap(), Some([point.x, point.y]));
+        validate_prepared_target(
+            &fixture.broker,
+            &fixture.prepared,
+            PreparedTargetValidationPhase::ReceiptCompletion,
+        )
+        .unwrap();
+
+        let move_receipt = NativeUiSmokeMoveReceipt {
+            token: fixture.metadata.token as u64,
+            owner_hwnd: fixture.prepared.target.host.owner_hwnd,
+            presenter_hwnd: fixture.prepared.target.render.presenter_hwnd,
+            source_epoch: fixture.prepared.target.render.actual_source_epoch,
+            generation: fixture.prepared.target.render.generation,
+            requested_client_x: point.x,
+            requested_client_y: point.y,
+            actual_client_x: point.x,
+            actual_client_y: point.y,
+            host_publisher: fixture.prepared.target.host.publisher,
+            render_publisher: fixture.prepared.target.render.publisher,
+            overlay_owner_nonce: fixture.prepared.target.render.inventory.owner_nonce,
+        };
+        let state = lock_broker_state(&fixture.broker).unwrap();
+        let named = named_control_after_move(&state, &move_receipt)
+            .unwrap()
+            .expect("enabled native_top_panorama after hover");
+        assert!(named.enabled);
+        assert!(named.senses_click);
+        assert_eq!(named.owner_hwnd, move_receipt.owner_hwnd);
+        assert_eq!(named.presenter_hwnd, move_receipt.presenter_hwnd);
+        assert_eq!(named.source_epoch, move_receipt.source_epoch);
+        assert_eq!(named.generation, move_receipt.generation);
+    }
+
+    #[test]
+    fn top_hover_initial_prepare_waits_for_the_response_to_be_absent() {
+        let fixture = ReceiptFixture::new();
+        let area = fixture
+            .prepared
+            .target
+            .render
+            .inventory
+            .top_hover_activation
+            .unwrap();
+        {
+            let mut state = lock_broker_state(&fixture.broker).unwrap();
+            let render = state
+                .renders
+                .get_mut(&fixture.prepared.target.render.publisher)
+                .unwrap();
+            render.inventory = NativeUiSmokeCommittedInventory::commit(
+                Some(&render.inventory),
+                test_fixture_panorama_logical(
+                    &fixture._ui_smoke_owner,
+                    area,
+                    Some(test_fixture_panorama_observation(false)),
+                ),
+            );
+            let candidates = coherent_top_hover_targets(&state, 0x100).unwrap();
+            assert_eq!(candidates.len(), 1);
+            assert!(!candidates[0].ready_for_initial_prepare());
+        }
+        let error = match wait_for_target(
+            &fixture.broker,
+            0x100,
+            [0.5, 0.5],
+            PreparedTargetKind::TopHoverActivation,
+            Instant::now() + Duration::from_millis(5),
+            &mut || Ok(()),
+        ) {
+            Ok(_) => panic!("a visible disabled Response is not a hidden hover baseline"),
+            Err(error) => error,
+        };
+        assert!(error.contains("deadline expired"));
+        assert!(error.contains("last_scan_candidate_count=1"));
+
+        let second_output = NativeUiSmokeOutputId(194);
+        let second_host = PublisherKey {
+            output: second_output,
+            nonce: 195,
+        };
+        let second_render = PublisherKey {
+            output: second_output,
+            nonce: 196,
+        };
+        {
+            let mut state = lock_broker_state(&fixture.broker).unwrap();
+            state.hosts.insert(
+                second_host,
+                HostSnapshot {
+                    publisher: second_host,
+                    request: 5,
+                    epoch: 6,
+                    placement: NativeVideoPlacement::DetachedViewerChild,
+                    owner_hwnd: 0x100,
+                    windows: HostWindowSet::from_contract(presenter_only(0x300, 6)),
+                },
+            );
+            let hidden = test_inventory(&fixture._ui_smoke_owner);
+            let second_area = hidden.top_hover_activation.unwrap();
+            let visible = NativeUiSmokeCommittedInventory::commit(
+                Some(&hidden),
+                test_fixture_panorama_logical(
+                    &fixture._ui_smoke_owner,
+                    second_area,
+                    Some(test_fixture_panorama_observation(false)),
+                ),
+            );
+            state.renders.insert(
+                second_render,
+                RenderSnapshot {
+                    publisher: second_render,
+                    requested_source_epoch: Arc::downgrade(&fixture.requested),
+                    actual_source_epoch: 7,
+                    generation: 6,
+                    placement: NativeVideoPlacement::DetachedViewerChild,
+                    owner_hwnd: 0x100,
+                    presenter_hwnd: 0x300,
+                    geometry: geometry(),
+                    geometry_version: 1,
+                    inventory: visible,
+                },
+            );
+        }
+        let error = match wait_for_target(
+            &fixture.broker,
+            0x100,
+            [0.5, 0.5],
+            PreparedTargetKind::TopHoverActivation,
+            Instant::now() + Duration::from_secs(1),
+            &mut || panic!("ambiguous candidates must fail before owner validation"),
+        ) {
+            Ok(_) => panic!("multiple visible candidates must remain ambiguous"),
+            Err(error) => error,
+        };
+        assert!(error.contains("native mouse target is ambiguous: 2"));
+    }
+
+    #[test]
+    fn top_hover_before_input_rejects_a_show_hide_round_trip_to_the_same_area() {
+        let mut fixture = ReceiptFixture::new();
+        let target = {
+            let state = lock_broker_state(&fixture.broker).unwrap();
+            coherent_top_hover_targets(&state, 0x100)
+                .unwrap()
+                .pop()
+                .unwrap()
+        };
+        let baseline_version = target.render.inventory.target_version;
+        let area = target.area;
+        fixture.prepared = NativeUiSmokePreparedMove {
+            target,
+            normalized: [0.5, 0.5],
+            coordinate_tolerance: [1, 1],
+        };
+        {
+            let mut state = lock_broker_state(&fixture.broker).unwrap();
+            let render = state
+                .renders
+                .get_mut(&fixture.prepared.target.render.publisher)
+                .unwrap();
+            let shown = NativeUiSmokeCommittedInventory::commit(
+                Some(&render.inventory),
+                test_fixture_panorama_logical(
+                    &fixture._ui_smoke_owner,
+                    area,
+                    Some(test_fixture_panorama_observation(true)),
+                ),
+            );
+            render.inventory = NativeUiSmokeCommittedInventory::commit(
+                Some(&shown),
+                test_fixture_panorama_logical(&fixture._ui_smoke_owner, area, None),
+            );
+            assert!(render.inventory.native_top_panorama.is_none());
+            assert!(render.inventory.target_version > baseline_version);
+        }
+        let error = validate_prepared_target(
+            &fixture.broker,
+            &fixture.prepared,
+            PreparedTargetValidationPhase::BeforeInput,
+        )
+        .expect_err("an inventory round trip before SendInput must invalidate the preparation");
+        assert!(error.contains("no longer the unique current target"));
+    }
+
+    #[test]
+    fn top_hover_receipt_completion_rejects_a_hidden_inventory_without_advance() {
+        let mut fixture = ReceiptFixture::new();
+        let target = {
+            let state = lock_broker_state(&fixture.broker).unwrap();
+            coherent_top_hover_targets(&state, 0x100)
+                .unwrap()
+                .pop()
+                .unwrap()
+        };
+        let point = target.client_point;
+        fixture.prepared = NativeUiSmokePreparedMove {
+            target,
+            normalized: [0.5, 0.5],
+            coordinate_tolerance: [1, 1],
+        };
+        fixture.pump.event_x = point.x;
+        fixture.pump.event_y = point.y;
+        fixture.render.event_x = point.x;
+        fixture.render.event_y = point.y;
+        fixture.begin();
+        record_render_receipt_in(&fixture.broker, fixture.metadata, fixture.render);
+        record_pump_receipt_in(&fixture.broker, fixture.metadata, fixture.pump);
+        let error = fixture
+            .completion()
+            .expect_err("a later unrelated tick must not complete this tagged hover receipt");
+        assert!(error.contains("target changed while completing receipts"));
+        assert!(
+            validate_prepared_target(
+                &fixture.broker,
+                &fixture.prepared,
+                PreparedTargetValidationPhase::ReceiptCompletion,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn canvas_completion_ignores_named_chrome_version_changes() {
+        let fixture = ReceiptFixture::new();
+        let area = fixture
+            .prepared
+            .target
+            .render
+            .inventory
+            .top_hover_activation
+            .unwrap();
+        fixture.begin();
+        {
+            let mut state = lock_broker_state(&fixture.broker).unwrap();
+            let render = state
+                .renders
+                .get_mut(&fixture.prepared.target.render.publisher)
+                .unwrap();
+            let baseline_version = render.inventory.target_version;
+            render.inventory = NativeUiSmokeCommittedInventory::commit(
+                Some(&render.inventory),
+                test_fixture_panorama_logical(
+                    &fixture._ui_smoke_owner,
+                    area,
+                    Some(test_fixture_panorama_observation(true)),
+                ),
+            );
+            assert!(render.inventory.target_version > baseline_version);
+        }
+        record_render_receipt_in(&fixture.broker, fixture.metadata, fixture.render);
+        record_pump_receipt_in(&fixture.broker, fixture.metadata, fixture.pump);
+        assert_eq!(
+            fixture.completion().unwrap(),
+            Some([fixture.pump.event_x, fixture.pump.event_y])
+        );
+        validate_prepared_target(
+            &fixture.broker,
+            &fixture.prepared,
+            PreparedTargetValidationPhase::ReceiptCompletion,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn named_target_waits_for_enabled_click_response_and_rotates_after_hide() {
+        let owner = allocate_overlay_owner();
+        let disabled = NativeUiSmokeCommittedInventory::commit(
+            None,
+            test_panorama_logical(
+                &owner,
+                Some(test_panorama_observation(false)),
+                NativeUiSmokePanoramaClassification::Unknown,
+                true,
+            ),
+        );
+        assert_eq!(
+            disabled
+                .native_top_panorama
+                .as_ref()
+                .and_then(|named| named.token),
+            None
+        );
+
+        let enabled = NativeUiSmokeCommittedInventory::commit(
+            Some(&disabled),
+            test_panorama_logical(
+                &owner,
+                Some(test_panorama_observation(true)),
+                NativeUiSmokePanoramaClassification::NonPanorama,
+                true,
+            ),
+        );
+        let first_token = enabled
+            .native_top_panorama
+            .as_ref()
+            .and_then(|named| named.token)
+            .unwrap();
+        let named_area = enabled
+            .native_top_panorama
+            .as_ref()
+            .expect("enabled named target")
+            .area;
+        let named_point = named_area.client_point([0.5, 0.5]).unwrap();
+        assert_eq!([named_point.x, named_point.y], [441, 41]);
+        assert!(named_area.contains_client_point([named_point.x, named_point.y]));
+        let playback_tick = NativeUiSmokeCommittedInventory::commit(
+            Some(&enabled),
+            test_panorama_logical(
+                &owner,
+                Some(test_panorama_observation(true)),
+                NativeUiSmokePanoramaClassification::NonPanorama,
+                true,
+            ),
+        );
+        assert_eq!(
+            playback_tick
+                .native_top_panorama
+                .as_ref()
+                .and_then(|named| named.token),
+            Some(first_token)
+        );
+        assert_eq!(playback_tick.target_version, enabled.target_version);
+        assert!(playback_tick.commit_serial > enabled.commit_serial);
+
+        let hidden = NativeUiSmokeCommittedInventory::commit(
+            Some(&playback_tick),
+            test_panorama_logical(
+                &owner,
+                None,
+                NativeUiSmokePanoramaClassification::NonPanorama,
+                false,
+            ),
+        );
+        let reappeared = NativeUiSmokeCommittedInventory::commit(
+            Some(&hidden),
+            test_panorama_logical(
+                &owner,
+                Some(test_panorama_observation(true)),
+                NativeUiSmokePanoramaClassification::NonPanorama,
+                true,
+            ),
+        );
+        let second_token = reappeared
+            .native_top_panorama
+            .as_ref()
+            .and_then(|named| named.token)
+            .unwrap();
+        assert_ne!(first_token, second_token);
+        assert!(reappeared.target_version > playback_tick.target_version);
+    }
+
+    #[test]
+    fn disabled_or_blocked_named_control_never_gets_a_target_token() {
+        let owner = allocate_overlay_owner();
+        for (enabled, allowed, classification) in [
+            (false, true, NativeUiSmokePanoramaClassification::Unknown),
+            (true, false, NativeUiSmokePanoramaClassification::Panorama),
+            (
+                true,
+                false,
+                NativeUiSmokePanoramaClassification::NonPanorama,
+            ),
+        ] {
+            let committed = NativeUiSmokeCommittedInventory::commit(
+                None,
+                test_panorama_logical(
+                    &owner,
+                    Some(test_panorama_observation(enabled)),
+                    classification,
+                    allowed,
+                ),
+            );
+            assert_eq!(
+                committed
+                    .native_top_panorama
+                    .as_ref()
+                    .and_then(|named| named.token),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn overlay_attempts_have_distinct_weak_owners_and_retired_ones_reject() {
+        let failed_hud_owner = allocate_overlay_owner();
+        let failed_inventory = test_inventory(&failed_hud_owner);
+        let fallback_owner = allocate_overlay_owner();
+        let fallback_inventory = test_inventory(&fallback_owner);
+        assert_ne!(failed_inventory.owner_nonce, fallback_inventory.owner_nonce);
+        drop(failed_hud_owner);
+        assert!(!failed_inventory.owner_is_live());
+        assert!(fallback_inventory.owner_is_live());
+        let requested = Arc::new(AtomicU64::new(1));
+        let publisher = NativeUiSmokeRenderPublisher::new(allocate_output_id(), &requested);
+        assert!(
+            publisher
+                .publish(
+                    1,
+                    1,
+                    NativeVideoPlacement::DetachedViewerChild,
+                    0x100,
+                    0x200,
+                    geometry(),
+                    failed_inventory,
+                )
+                .unwrap_err()
+                .contains("owner already retired")
+        );
+    }
+
+    #[test]
+    fn source_switch_invalidation_removes_the_old_committed_join() {
+        let requested = Arc::new(AtomicU64::new(3));
+        let publisher = NativeUiSmokeRenderPublisher::new(allocate_output_id(), &requested);
+        let owner = allocate_overlay_owner();
+        let old_inventory = test_inventory(&owner);
+        publisher
+            .publish(
+                3,
+                9,
+                NativeVideoPlacement::DetachedViewerChild,
+                0x100,
+                0x200,
+                geometry(),
+                old_inventory.clone(),
+            )
+            .unwrap();
+        assert!(
+            lock_broker_state(broker())
+                .unwrap()
+                .renders
+                .contains_key(&publisher.key)
+        );
+        publisher.invalidate("source switched").unwrap();
+        requested.store(4, Ordering::Release);
+        assert!(
+            !lock_broker_state(broker())
+                .unwrap()
+                .renders
+                .contains_key(&publisher.key)
+        );
+        assert!(
+            publisher
+                .publish(
+                    4,
+                    9,
+                    NativeVideoPlacement::DetachedViewerChild,
+                    0x100,
+                    0x200,
+                    geometry(),
+                    old_inventory,
+                )
+                .unwrap_err()
+                .contains("predates the last source invalidation")
+        );
+        publisher
+            .publish(
+                4,
+                9,
+                NativeVideoPlacement::DetachedViewerChild,
+                0x100,
+                0x200,
+                geometry(),
+                test_inventory(&owner),
+            )
+            .unwrap();
+    }
+
     struct ReceiptFixture {
         broker: Broker,
         requested: Arc<AtomicU64>,
+        _ui_smoke_owner: Arc<NativeUiSmokeOverlayOwner>,
         prepared: NativeUiSmokePreparedMove,
         metadata: NativeUiSmokeMessageMetadata,
         pump: NativeUiSmokePumpReceipt,
@@ -1922,6 +4784,7 @@ mod tests {
             let host_key = PublisherKey { output, nonce: 92 };
             let render_key = PublisherKey { output, nonce: 93 };
             let windows = presenter_only(0x200, 4);
+            let ui_smoke_owner = allocate_overlay_owner();
             {
                 let mut state = lock_broker_state(&broker).unwrap();
                 state.hosts.insert(
@@ -1947,6 +4810,7 @@ mod tests {
                         presenter_hwnd: 0x200,
                         geometry: geometry(),
                         geometry_version: 1,
+                        inventory: test_inventory(&ui_smoke_owner),
                     },
                 );
             }
@@ -1961,6 +4825,7 @@ mod tests {
             Self {
                 broker,
                 requested,
+                _ui_smoke_owner: ui_smoke_owner,
                 prepared: NativeUiSmokePreparedMove {
                     target,
                     normalized: [0.5, 0.5],
@@ -1969,6 +4834,8 @@ mod tests {
                 metadata: NativeUiSmokeMessageMetadata {
                     token: 0x1234,
                     receiver_hwnd: 0x200,
+                    receiver_process_id: 1,
+                    receiver_thread_id: 2,
                 },
                 pump: NativeUiSmokePumpReceipt {
                     output,
@@ -1979,6 +4846,7 @@ mod tests {
                     source: NativeVideoWindowSource::Presenter,
                     event_x: point[0],
                     event_y: point[1],
+                    input_kind: NativeUiSmokeInputKind::MouseMove,
                 },
                 render: NativeUiSmokeRenderReceipt {
                     output,
@@ -1990,10 +4858,13 @@ mod tests {
                     geometry: geometry(),
                     geometry_version: 1,
                     raw_forwarded: true,
-                    command_count: 0,
                     source: NativeVideoWindowSource::Presenter,
                     event_x: point[0],
                     event_y: point[1],
+                    input_kind: NativeUiSmokeInputKind::MouseMove,
+                    event_count: 1,
+                    pointer_released: true,
+                    drag_latches_released: true,
                 },
             }
         }
@@ -2006,6 +4877,13 @@ mod tests {
                 pump_actual_point: None,
                 render_actual_point: None,
                 coordinate_tolerance: self.prepared.coordinate_tolerance,
+                kind: PendingStepKind::MouseMove,
+                wndproc_state_confirmed: true,
+                button_dispatch_claimed: false,
+                metadata: None,
+                app_tail: None,
+                pointer_released: true,
+                drag_latches_released: true,
                 failure: None,
             });
         }
@@ -2014,6 +4892,580 @@ mod tests {
             let state = lock_broker_state(&self.broker).unwrap();
             completed_actual_point(&state, self.metadata.token, &self.prepared)
         }
+    }
+
+    fn audio_test_logical(owner: &Arc<NativeUiSmokeOverlayOwner>) -> NativeUiSmokeLogicalInventory {
+        NativeUiSmokeLogicalInventory::new(
+            owner,
+            None,
+            None,
+            NativeUiSmokePanoramaClassification::Unknown,
+            false,
+            false,
+            false,
+            2.0,
+            400,
+            240,
+        )
+        .with_audio_controls(
+            vec![(
+                NativeUiSmokeAudioControl::Row(0),
+                test_fixture_panorama_observation(true),
+            )],
+            true,
+        )
+    }
+
+    #[test]
+    fn audio_control_recheck_accepts_identical_commits_and_unrelated_controls() {
+        let fixture = ReceiptFixture::new();
+        let mut state = lock_broker_state(&fixture.broker).unwrap();
+        let key = fixture.prepared.target.render.publisher;
+        state.renders.get_mut(&key).unwrap().inventory = NativeUiSmokeCommittedInventory::commit(
+            None,
+            audio_test_logical(&fixture._ui_smoke_owner),
+        );
+        let name = NativeUiSmokeAudioControl::Row(0);
+        let (target, token) = coherent_audio_control_targets(&state, 0x100, name)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let mut logical = audio_test_logical(&fixture._ui_smoke_owner);
+        logical.audio_controls.push((
+            NativeUiSmokeAudioControl::Button,
+            test_fixture_panorama_observation(true),
+        ));
+        let render = state.renders.get_mut(&key).unwrap();
+        let previous_serial = render.inventory.commit_serial;
+        render.inventory =
+            NativeUiSmokeCommittedInventory::commit(Some(&render.inventory), logical);
+        assert_ne!(render.inventory.commit_serial, previous_serial);
+        assert!(render.inventory.target_version > target.render.inventory.target_version);
+        assert!(validate_audio_control_before_input(&state, 0x100, name, &target, token).is_ok());
+    }
+
+    #[test]
+    fn audio_control_recheck_rejects_moved_replaced_or_ambiguous_targets() {
+        for change in [
+            "move",
+            "resize_same_center",
+            "clip",
+            "layer",
+            "sense",
+            "disabled",
+            "hidden_reappeared",
+            "disabled_reenabled",
+            "renamed",
+            "dpi",
+            "client_size",
+            "source",
+            "requested_source",
+            "generation",
+            "host_request",
+            "host_epoch",
+            "host_retired",
+            "render_retired",
+            "overlay_owner",
+            "geometry",
+            "geometry_version",
+            "ambiguous",
+        ] {
+            let fixture = ReceiptFixture::new();
+            let mut state = lock_broker_state(&fixture.broker).unwrap();
+            let key = fixture.prepared.target.render.publisher;
+            let host_key = fixture.prepared.target.host.publisher;
+            state.renders.get_mut(&key).unwrap().inventory =
+                NativeUiSmokeCommittedInventory::commit(
+                    None,
+                    audio_test_logical(&fixture._ui_smoke_owner),
+                );
+            let name = NativeUiSmokeAudioControl::Row(0);
+            let (target, token) = coherent_audio_control_targets(&state, 0x100, name)
+                .unwrap()
+                .pop()
+                .unwrap();
+            let replacement_owner = allocate_overlay_owner();
+            let mut logical = audio_test_logical(&fixture._ui_smoke_owner);
+            let observation = &mut logical.audio_controls[0].1;
+            match change {
+                "move" => {
+                    observation.rect = observation.rect.translate(egui::vec2(1.0, 0.0));
+                    observation.interact_rect = observation.rect;
+                }
+                "resize_same_center" => {
+                    observation.rect = observation.rect.shrink(1.0);
+                    observation.interact_rect = observation.rect;
+                }
+                "clip" => observation.clip_rect = observation.clip_rect.shrink(1.0),
+                "layer" => observation.layer_id.id = egui::Id::new("replacement_layer"),
+                "sense" => observation.sense = egui::Sense::hover(),
+                "disabled" | "disabled_reenabled" => observation.enabled = false,
+                "hidden_reappeared" => logical.audio_controls.clear(),
+                "renamed" => logical.audio_controls[0].0 = NativeUiSmokeAudioControl::Row(1),
+                "dpi" => logical.pixels_per_point = 1.5,
+                "client_size" => logical.client_width += 1,
+                "overlay_owner" => logical = audio_test_logical(&replacement_owner),
+                _ => {}
+            }
+            let render = state.renders.get_mut(&key).unwrap();
+            render.inventory =
+                NativeUiSmokeCommittedInventory::commit(Some(&render.inventory), logical);
+            if matches!(change, "hidden_reappeared" | "disabled_reenabled") {
+                render.inventory = NativeUiSmokeCommittedInventory::commit(
+                    Some(&render.inventory),
+                    audio_test_logical(&fixture._ui_smoke_owner),
+                );
+            }
+            match change {
+                "source" => {
+                    render.actual_source_epoch += 1;
+                    fixture
+                        .requested
+                        .store(render.actual_source_epoch, Ordering::Release);
+                }
+                "requested_source" => fixture.requested.store(8, Ordering::Release),
+                "generation" => render.generation += 1,
+                "geometry" => render.geometry.region.origin_points[0] += 1.0,
+                "geometry_version" => render.geometry_version += 1,
+                "host_request" => state.hosts.get_mut(&host_key).unwrap().request += 1,
+                "host_epoch" => state.hosts.get_mut(&host_key).unwrap().epoch += 1,
+                "host_retired" => {
+                    state.hosts.remove(&host_key);
+                }
+                "render_retired" => {
+                    state.renders.remove(&key);
+                }
+                "ambiguous" => {
+                    let mut duplicate = state.renders[&key].clone();
+                    duplicate.publisher.nonce += 100;
+                    state.renders.insert(duplicate.publisher, duplicate);
+                }
+                _ => {}
+            }
+            let error = validate_audio_control_before_input(&state, 0x100, name, &target, token)
+                .unwrap_err();
+            assert!(error.contains("changed before input"), "{change}: {error}");
+        }
+    }
+
+    struct ButtonReceiptFixture {
+        broker: Broker,
+        requested: Arc<AtomicU64>,
+        _ui_smoke_owner: Arc<NativeUiSmokeOverlayOwner>,
+        prepared: NativeUiSmokePreparedButtonClick,
+        metadata: NativeUiSmokeMessageMetadata,
+    }
+
+    impl ButtonReceiptFixture {
+        fn new() -> Self {
+            let broker = Broker::new();
+            let requested = Arc::new(AtomicU64::new(7));
+            let output = NativeUiSmokeOutputId(191);
+            let host_key = PublisherKey { output, nonce: 192 };
+            let render_key = PublisherKey { output, nonce: 193 };
+            let windows = presenter_only(0x2200, 14);
+            let ui_smoke_owner = allocate_overlay_owner();
+            let top = NativeUiSmokeTargetArea::new(
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 36.0)),
+                2.0,
+                400,
+                240,
+            );
+            let inventory = NativeUiSmokeCommittedInventory::commit(
+                None,
+                test_fixture_panorama_logical(
+                    &ui_smoke_owner,
+                    top,
+                    Some(test_fixture_panorama_observation(true)),
+                ),
+            );
+            let named_token = inventory
+                .native_top_panorama
+                .as_ref()
+                .and_then(|named| named.token)
+                .expect("enabled named target token");
+            {
+                let mut state = lock_broker_state(&broker).unwrap();
+                state.hosts.insert(
+                    host_key,
+                    HostSnapshot {
+                        publisher: host_key,
+                        request: 13,
+                        epoch: 14,
+                        placement: NativeVideoPlacement::DetachedViewerChild,
+                        owner_hwnd: 0x1100,
+                        windows: HostWindowSet::from_contract(windows),
+                    },
+                );
+                state.renders.insert(
+                    render_key,
+                    RenderSnapshot {
+                        publisher: render_key,
+                        requested_source_epoch: Arc::downgrade(&requested),
+                        actual_source_epoch: 7,
+                        generation: 14,
+                        placement: NativeVideoPlacement::DetachedViewerChild,
+                        owner_hwnd: 0x1100,
+                        presenter_hwnd: 0x2200,
+                        geometry: geometry(),
+                        geometry_version: 4,
+                        inventory,
+                    },
+                );
+            }
+            let target = {
+                let state = lock_broker_state(&broker).unwrap();
+                coherent_named_top_panorama_targets(&state, 0x1100, named_token)
+                    .unwrap()
+                    .pop()
+                    .unwrap()
+            };
+            Self {
+                broker,
+                requested,
+                _ui_smoke_owner: ui_smoke_owner,
+                prepared: NativeUiSmokePreparedButtonClick {
+                    target,
+                    coordinate_tolerance: [1, 1],
+                    host_incarnation: 5,
+                    backend_token: 6,
+                },
+                metadata: NativeUiSmokeMessageMetadata {
+                    token: 0x4234,
+                    receiver_hwnd: 0x2200,
+                    receiver_process_id: 71,
+                    receiver_thread_id: 72,
+                },
+            }
+        }
+
+        fn begin_up_before_wndproc(&self, gesture_id: u64) {
+            let mut state = lock_broker_state(&self.broker).unwrap();
+            state.pending = Some(PendingStep {
+                token: self.metadata.token,
+                target: self.prepared.target.clone(),
+                pump_actual_point: Some([
+                    self.prepared.target.client_point.x,
+                    self.prepared.target.client_point.y,
+                ]),
+                render_actual_point: None,
+                coordinate_tolerance: self.prepared.coordinate_tolerance,
+                kind: PendingStepKind::ButtonUp { gesture_id },
+                wndproc_state_confirmed: false,
+                button_dispatch_claimed: false,
+                metadata: None,
+                app_tail: None,
+                pointer_released: false,
+                drag_latches_released: false,
+                failure: None,
+            });
+        }
+
+        fn begin_up(&self, gesture_id: u64) {
+            self.begin_up_before_wndproc(gesture_id);
+            record_wndproc_button_identity_in(
+                &self.broker,
+                Some(self.metadata),
+                NativeUiSmokeInputKind::LeftButtonUp,
+            );
+            record_wndproc_button_state_in(
+                &self.broker,
+                Some(self.metadata),
+                NativeUiSmokeInputKind::LeftButtonUp,
+                true,
+            );
+        }
+
+        fn pending(&self) -> MutexGuard<'_, BrokerState> {
+            lock_broker_state(&self.broker).unwrap()
+        }
+    }
+
+    #[test]
+    fn button_identity_is_stamped_before_async_claim_but_semantic_state_gates_completion() {
+        let fixture = ButtonReceiptFixture::new();
+        fixture.begin_up_before_wndproc(30);
+        assert!(claim_presented_button_dispatch_in(&fixture.broker, fixture.metadata).is_none());
+
+        record_wndproc_button_identity_in(
+            &fixture.broker,
+            Some(fixture.metadata),
+            NativeUiSmokeInputKind::LeftButtonUp,
+        );
+        {
+            let state = fixture.pending();
+            let step = state.pending.as_ref().unwrap();
+            assert_eq!(step.metadata, Some(fixture.metadata));
+            assert!(!step.wndproc_state_confirmed);
+        }
+        assert!(claim_presented_button_dispatch_in(&fixture.broker, fixture.metadata).is_some());
+
+        let point = fixture.prepared.target.client_point;
+        record_render_receipt_in(
+            &fixture.broker,
+            fixture.metadata,
+            NativeUiSmokeRenderReceipt {
+                output: fixture.prepared.target.render.publisher.output,
+                actual_source_epoch: 7,
+                generation: 14,
+                placement: NativeVideoPlacement::DetachedViewerChild,
+                owner_hwnd: 0x1100,
+                presenter_hwnd: 0x2200,
+                geometry: geometry(),
+                geometry_version: 4,
+                raw_forwarded: false,
+                source: NativeVideoWindowSource::Presenter,
+                event_x: point.x,
+                event_y: point.y,
+                input_kind: NativeUiSmokeInputKind::LeftButtonUp,
+                event_count: 1,
+                pointer_released: true,
+                drag_latches_released: true,
+            },
+        );
+        {
+            let state = fixture.pending();
+            assert!(
+                !button_delivery_receipts_ready(state.pending.as_ref().unwrap(), false),
+                "an async render/App path cannot complete before WndProc confirms capture release"
+            );
+        }
+
+        record_wndproc_button_state_in(
+            &fixture.broker,
+            Some(fixture.metadata),
+            NativeUiSmokeInputKind::LeftButtonUp,
+            true,
+        );
+        let state = fixture.pending();
+        assert!(button_delivery_receipts_ready(
+            state.pending.as_ref().unwrap(),
+            false
+        ));
+    }
+
+    #[test]
+    fn button_up_requires_exact_wndproc_metadata_before_claiming_the_producer() {
+        let fixture = ButtonReceiptFixture::new();
+        fixture.begin_up(31);
+
+        let unrelated = NativeUiSmokeMessageMetadata {
+            token: fixture.metadata.token,
+            receiver_thread_id: fixture.metadata.receiver_thread_id + 1,
+            ..fixture.metadata
+        };
+        assert!(claim_presented_button_dispatch_in(&fixture.broker, unrelated).is_none());
+        assert!(
+            !fixture
+                .pending()
+                .pending
+                .as_ref()
+                .unwrap()
+                .button_dispatch_claimed
+        );
+
+        let dispatch = claim_presented_button_dispatch_in(&fixture.broker, fixture.metadata)
+            .expect("exact Response producer attribution");
+        assert_eq!(dispatch.gesture_id, 31);
+        assert_eq!(dispatch.step_token, fixture.metadata.token);
+        assert_eq!(dispatch.output, NativeUiSmokeOutputId(191));
+        assert_eq!(dispatch.source_epoch, 7);
+        assert!(
+            fixture
+                .pending()
+                .pending
+                .as_ref()
+                .unwrap()
+                .button_dispatch_claimed
+        );
+    }
+
+    #[test]
+    fn button_up_render_receipt_requires_the_exact_response_dispatch_claim() {
+        let fixture = ButtonReceiptFixture::new();
+        fixture.begin_up(32);
+        let point = fixture.prepared.target.client_point;
+        let receipt = NativeUiSmokeRenderReceipt {
+            output: fixture.prepared.target.render.publisher.output,
+            actual_source_epoch: 7,
+            generation: 14,
+            placement: NativeVideoPlacement::DetachedViewerChild,
+            owner_hwnd: 0x1100,
+            presenter_hwnd: 0x2200,
+            geometry: geometry(),
+            geometry_version: 4,
+            raw_forwarded: false,
+            source: NativeVideoWindowSource::Presenter,
+            event_x: point.x,
+            event_y: point.y,
+            input_kind: NativeUiSmokeInputKind::LeftButtonUp,
+            event_count: 1,
+            pointer_released: true,
+            drag_latches_released: true,
+        };
+        record_render_receipt_in(&fixture.broker, fixture.metadata, receipt);
+        assert!(
+            fixture
+                .pending()
+                .pending
+                .as_ref()
+                .unwrap()
+                .failure
+                .is_some(),
+            "an Up render must not complete from an unclaimed frame command"
+        );
+
+        let accepted = ButtonReceiptFixture::new();
+        accepted.begin_up(33);
+        assert!(claim_presented_button_dispatch_in(&accepted.broker, accepted.metadata).is_some());
+        record_render_receipt_in(&accepted.broker, accepted.metadata, receipt);
+        let state = accepted.pending();
+        let step = state.pending.as_ref().unwrap();
+        assert_eq!(step.failure, None);
+        assert_eq!(step.render_actual_point, Some([point.x, point.y]));
+        assert!(step.pointer_released);
+        assert!(step.drag_latches_released);
+    }
+
+    #[test]
+    fn app_dispatch_accepts_only_the_exact_none_to_one_zoom_transition() {
+        let fixture = ButtonReceiptFixture::new();
+        fixture.begin_up(34);
+        let dispatch =
+            claim_presented_button_dispatch_in(&fixture.broker, fixture.metadata).unwrap();
+        record_button_app_dispatch_in(
+            &fixture.broker,
+            dispatch,
+            Some(dispatch.output),
+            dispatch.source_epoch,
+            true,
+            NativeUiSmokeAppEffect {
+                panorama_active: false,
+                video_zoom_scale: None,
+            },
+            NativeUiSmokeAppEffect {
+                panorama_active: false,
+                video_zoom_scale: Some(1.0),
+            },
+        );
+        let state = fixture.pending();
+        assert_eq!(
+            state.pending.as_ref().unwrap().app_tail,
+            Some(NativeUiSmokeAppEffect {
+                panorama_active: false,
+                video_zoom_scale: Some(1.0),
+            })
+        );
+        assert_eq!(state.pending.as_ref().unwrap().failure, None);
+
+        let wrong_before = ButtonReceiptFixture::new();
+        wrong_before.begin_up(35);
+        let dispatch =
+            claim_presented_button_dispatch_in(&wrong_before.broker, wrong_before.metadata)
+                .unwrap();
+        record_button_app_dispatch_in(
+            &wrong_before.broker,
+            dispatch,
+            Some(dispatch.output),
+            dispatch.source_epoch,
+            true,
+            NativeUiSmokeAppEffect {
+                panorama_active: false,
+                video_zoom_scale: Some(1.0),
+            },
+            NativeUiSmokeAppEffect {
+                panorama_active: false,
+                video_zoom_scale: None,
+            },
+        );
+        let state = wrong_before.pending();
+        assert!(state.pending.as_ref().unwrap().app_tail.is_none());
+        assert!(state.pending.as_ref().unwrap().failure.is_some());
+    }
+
+    #[test]
+    fn app_dispatch_rejects_wrong_output_source_or_normal_handler_gate() {
+        let wrong_output = ButtonReceiptFixture::new();
+        wrong_output.begin_up(36);
+        let dispatch =
+            claim_presented_button_dispatch_in(&wrong_output.broker, wrong_output.metadata)
+                .unwrap();
+        record_button_app_dispatch_in(
+            &wrong_output.broker,
+            dispatch,
+            None,
+            dispatch.source_epoch,
+            true,
+            NativeUiSmokeAppEffect {
+                panorama_active: false,
+                video_zoom_scale: None,
+            },
+            NativeUiSmokeAppEffect {
+                panorama_active: false,
+                video_zoom_scale: Some(1.0),
+            },
+        );
+        assert!(
+            wrong_output
+                .pending()
+                .pending
+                .as_ref()
+                .unwrap()
+                .failure
+                .is_some()
+        );
+
+        let stale_source = ButtonReceiptFixture::new();
+        stale_source.begin_up(37);
+        let dispatch =
+            claim_presented_button_dispatch_in(&stale_source.broker, stale_source.metadata)
+                .unwrap();
+        stale_source.requested.store(8, Ordering::Release);
+        record_button_app_dispatch_in(
+            &stale_source.broker,
+            dispatch,
+            Some(dispatch.output),
+            dispatch.source_epoch,
+            true,
+            NativeUiSmokeAppEffect {
+                panorama_active: false,
+                video_zoom_scale: None,
+            },
+            NativeUiSmokeAppEffect {
+                panorama_active: false,
+                video_zoom_scale: Some(1.0),
+            },
+        );
+        assert!(
+            stale_source
+                .pending()
+                .pending
+                .as_ref()
+                .unwrap()
+                .failure
+                .is_some()
+        );
+
+        let gate_rejected = ButtonReceiptFixture::new();
+        gate_rejected.begin_up(38);
+        let dispatch =
+            claim_presented_button_dispatch_in(&gate_rejected.broker, gate_rejected.metadata)
+                .unwrap();
+        record_button_app_dispatch_rejected_in(
+            &gate_rejected.broker,
+            dispatch,
+            "normal handler gate rejected exact dispatch",
+        );
+        assert_eq!(
+            gate_rejected
+                .pending()
+                .pending
+                .as_ref()
+                .unwrap()
+                .failure
+                .as_deref(),
+            Some("normal handler gate rejected exact dispatch")
+        );
     }
 
     #[test]
@@ -2025,6 +5477,7 @@ mod tests {
     #[test]
     fn coherent_target_accepts_initial_zero_and_rejects_one_sided_advance() {
         let requested = Arc::new(AtomicU64::new(0));
+        let ui_smoke_owner = allocate_overlay_owner();
         let output = NativeUiSmokeOutputId(1);
         let host_key = PublisherKey { output, nonce: 1 };
         let render_key = PublisherKey { output, nonce: 2 };
@@ -2052,6 +5505,7 @@ mod tests {
                 presenter_hwnd: 0x200,
                 geometry: geometry(),
                 geometry_version: 1,
+                inventory: test_inventory(&ui_smoke_owner),
             },
         );
         assert_eq!(
@@ -2085,6 +5539,7 @@ mod tests {
             &fixture.broker,
             0x100,
             [0.5, 0.5],
+            PreparedTargetKind::Canvas,
             Instant::now() + Duration::from_secs(1),
             &mut || Err("fresh owner validation deadline".to_string()),
         ) {
@@ -2102,6 +5557,7 @@ mod tests {
             &fixture.broker,
             0x100,
             [0.5, 0.5],
+            PreparedTargetKind::Canvas,
             Instant::now() + Duration::from_secs(1),
             &mut || Err("fresh owner validation deadline".to_string()),
         ) {
@@ -2148,6 +5604,7 @@ mod tests {
     #[test]
     fn target_wait_diagnostic_bounds_host_render_and_pair_details() {
         let requested = Arc::new(AtomicU64::new(7));
+        let ui_smoke_owner = allocate_overlay_owner();
         let mut state = isolated_state();
         for index in 0..6_u64 {
             let output = NativeUiSmokeOutputId(index + 1);
@@ -2187,6 +5644,7 @@ mod tests {
                     presenter_hwnd,
                     geometry: geometry(),
                     geometry_version: 1,
+                    inventory: test_inventory(&ui_smoke_owner),
                 },
             );
         }
@@ -2204,6 +5662,7 @@ mod tests {
     #[test]
     fn old_publisher_does_not_replace_a_new_live_candidate() {
         let requested = Arc::new(AtomicU64::new(7));
+        let ui_smoke_owner = allocate_overlay_owner();
         let output_old = NativeUiSmokeOutputId(1);
         let output_new = NativeUiSmokeOutputId(2);
         let mut state = isolated_state();
@@ -2239,6 +5698,7 @@ mod tests {
                     presenter_hwnd: 0x200 + base,
                     geometry: geometry(),
                     geometry_version: 1,
+                    inventory: test_inventory(&ui_smoke_owner),
                 },
             );
         }
@@ -2258,6 +5718,8 @@ mod tests {
     #[test]
     fn same_geometry_keeps_version_while_a_resize_advances_it() {
         let requested = Arc::new(AtomicU64::new(3));
+        let ui_smoke_owner = allocate_overlay_owner();
+        let inventory = test_inventory(&ui_smoke_owner);
         let publisher = NativeUiSmokeRenderPublisher::new(
             NativeUiSmokeOutputId(NEXT_OUTPUT_ID.fetch_add(1, Ordering::Relaxed)),
             &requested,
@@ -2270,6 +5732,7 @@ mod tests {
                 1,
                 2,
                 geometry(),
+                inventory.clone(),
             )
             .unwrap();
         let same = publisher
@@ -2280,6 +5743,7 @@ mod tests {
                 1,
                 2,
                 geometry(),
+                inventory.clone(),
             )
             .unwrap();
         let mut resized = geometry();
@@ -2292,6 +5756,7 @@ mod tests {
                 1,
                 2,
                 resized,
+                inventory,
             )
             .unwrap();
         assert_eq!(first, same);
@@ -2348,9 +5813,10 @@ mod tests {
     }
 
     #[test]
-    fn completion_rejects_source_or_geometry_change_after_the_first_receipt() {
-        for changed in ["requested", "actual", "geometry"] {
+    fn completion_rejects_source_geometry_or_overlay_owner_change_after_the_first_receipt() {
+        for changed in ["requested", "actual", "geometry", "overlay_owner"] {
             let fixture = ReceiptFixture::new();
+            let replacement_owner = allocate_overlay_owner();
             fixture.begin();
             record_render_receipt_in(&fixture.broker, fixture.metadata, fixture.render);
             match changed {
@@ -2371,6 +5837,14 @@ mod tests {
                         .unwrap();
                     render.geometry.client_width += 1;
                     render.geometry_version += 1;
+                }
+                "overlay_owner" => {
+                    let mut state = lock_broker_state(&fixture.broker).unwrap();
+                    state
+                        .renders
+                        .get_mut(&fixture.prepared.target.render.publisher)
+                        .unwrap()
+                        .inventory = test_inventory(&replacement_owner);
                 }
                 _ => unreachable!(),
             }
@@ -2449,6 +5923,7 @@ mod tests {
                     presenter_hwnd: 0xb00,
                     geometry: geometry(),
                     geometry_version: 1,
+                    inventory: test_inventory(&ambiguous._ui_smoke_owner),
                 },
             );
         }
@@ -2552,6 +6027,7 @@ mod tests {
             &fixture.broker,
             0x100,
             [0.5, 0.5],
+            PreparedTargetKind::Canvas,
             Instant::now() + Duration::from_millis(20),
             &mut || {
                 let guard = fixture
@@ -2598,6 +6074,7 @@ mod tests {
             &fixture.broker,
             0x100,
             [0.5, 0.5],
+            PreparedTargetKind::Canvas,
             Instant::now() + Duration::from_millis(1),
             &mut || {
                 std::thread::sleep(Duration::from_millis(5));
@@ -2762,6 +6239,8 @@ mod tests {
         let old_metadata = NativeUiSmokeMessageMetadata {
             token: old_token,
             receiver_hwnd: fixture.metadata.receiver_hwnd,
+            receiver_process_id: fixture.metadata.receiver_process_id,
+            receiver_thread_id: fixture.metadata.receiver_thread_id,
         };
         record_pump_receipt_in(&fixture.broker, old_metadata, fixture.pump);
         record_render_receipt_in(&fixture.broker, old_metadata, fixture.render);

@@ -488,11 +488,14 @@ fn poke_open_path_listener() {
 fn spawn_open_path_listener(
     stop_event_raw: isize,
     egui_ctx: eframe::egui::Context,
-    open_path_tx: std::sync::mpsc::Sender<std::path::PathBuf>,
+    open_path_tx: std::sync::mpsc::Sender<ActivationOpenPath>,
+    remote_session: Option<crate::remote_ipc::session::SessionHandle>,
 ) -> Option<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name("mimv-open-path-listener".into())
-        .spawn(move || open_path_listener_loop(stop_event_raw, egui_ctx, open_path_tx))
+        .spawn(move || {
+            open_path_listener_loop(stop_event_raw, egui_ctx, open_path_tx, remote_session)
+        })
         .ok()
 }
 
@@ -500,7 +503,8 @@ fn spawn_open_path_listener(
 fn open_path_listener_loop(
     stop_event_raw: isize,
     egui_ctx: eframe::egui::Context,
-    open_path_tx: std::sync::mpsc::Sender<std::path::PathBuf>,
+    open_path_tx: std::sync::mpsc::Sender<ActivationOpenPath>,
+    remote_session: Option<crate::remote_ipc::session::SessionHandle>,
 ) {
     use windows::Win32::Foundation::{CloseHandle, ERROR_PIPE_CONNECTED, GetLastError, HANDLE};
     use windows::Win32::Storage::FileSystem::PIPE_ACCESS_INBOUND;
@@ -550,7 +554,10 @@ fn open_path_listener_loop(
             continue;
         }
 
-        let path = read_open_path_message(pipe);
+        // Classify immediately after the complete pipe message is read, before cleanup or UI
+        // scheduling can let a Remote return change the phase seen by this request.
+        let request = read_open_path_message(pipe)
+            .map(|path| ActivationOpenPath::received(path, remote_session.as_ref()));
         unsafe {
             let _ = DisconnectNamedPipe(pipe);
             let _ = CloseHandle(pipe);
@@ -559,14 +566,14 @@ fn open_path_listener_loop(
         if stop_event_is_set(stop_event) {
             break;
         }
-        let Some(path) = path else {
+        let Some(request) = request else {
             continue;
         };
         crate::logger::log(format!(
             "single_instance: received open path: {}",
-            path.display()
+            request.path.display()
         ));
-        if open_path_tx.send(path).is_err() {
+        if open_path_tx.send(request).is_err() {
             break;
         }
         egui_ctx.request_repaint();
@@ -618,6 +625,36 @@ fn read_pipe_exact(handle: windows::Win32::Foundation::HANDLE, len: usize) -> Op
     Some(buf)
 }
 
+/// Pipe request with the Remote owner observed when the path was received.
+pub(crate) struct ActivationOpenPath {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) remote_owned_at_receive: bool,
+    pub(crate) acquisition_sequence_at_receive: Option<u64>,
+    pub(crate) received_at: std::time::Instant,
+}
+
+impl ActivationOpenPath {
+    pub(crate) fn received(
+        path: std::path::PathBuf,
+        remote_session: Option<&crate::remote_ipc::session::SessionHandle>,
+    ) -> Self {
+        let snapshot = remote_session.map(crate::remote_ipc::session::SessionHandle::snapshot);
+        Self {
+            path,
+            remote_owned_at_receive: snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.phase.blocks_local_control()),
+            acquisition_sequence_at_receive: snapshot.map(|snapshot| snapshot.acquisition_sequence),
+            received_at: std::time::Instant::now(),
+        }
+    }
+
+    pub(crate) fn rejected_for_remote(&self, current_acquisition_sequence: Option<u64>) -> bool {
+        self.remote_owned_at_receive
+            || self.acquisition_sequence_at_receive != current_acquisition_sequence
+    }
+}
+
 /// アクティベーションリスナースレッドのハンドル。
 /// Drop でシャットダウン: `stop_event` を signal → waiter スレッドが抜ける。
 pub struct ActivationListener {
@@ -643,12 +680,13 @@ pub struct ActivationListener {
 ///
 /// activate / shutdown event は `SingleInstanceGuard::acquire` が OnceLock に既に登録
 /// しているのでここで作成は不要。
-pub fn spawn_activation_listener(
+pub(crate) fn spawn_activation_listener(
     hwnd_raw: isize,
     egui_ctx: eframe::egui::Context,
     placement_slot: crate::tray::PlacementSlot,
     shutdown_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    open_path_tx: std::sync::mpsc::Sender<std::path::PathBuf>,
+    open_path_tx: std::sync::mpsc::Sender<ActivationOpenPath>,
+    remote_session: Option<crate::remote_ipc::session::SessionHandle>,
 ) -> Option<ActivationListener> {
     #[cfg(windows)]
     {
@@ -658,7 +696,7 @@ pub fn spawn_activation_listener(
         use windows::Win32::Graphics::Dwm::{DWMWA_CLOAK, DwmSetWindowAttribute};
         use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForMultipleObjects};
         use windows::Win32::UI::WindowsAndMessaging::{
-            IsWindowVisible, PostMessageW, SW_SHOW, SW_SHOWNOACTIVATE, WM_CLOSE,
+            IsWindowVisible, PostMessageW, SW_SHOWNOACTIVATE, WM_CLOSE,
         };
         use windows::core::PCWSTR;
 
@@ -689,8 +727,12 @@ pub fn spawn_activation_listener(
             shutdown: shutdown_event_raw,
             stop: stop_event.0 as isize,
         };
-        let path_thread =
-            spawn_open_path_listener(stop_event.0 as isize, egui_ctx.clone(), open_path_tx);
+        let path_thread = spawn_open_path_listener(
+            stop_event.0 as isize,
+            egui_ctx.clone(),
+            open_path_tx,
+            remote_session,
+        );
 
         let thread = std::thread::Builder::new()
             .name("mimv-activate-listener".into())
@@ -713,38 +755,12 @@ pub fn spawn_activation_listener(
                         crate::logger::log(
                             "single_instance: activate event signaled — restoring window",
                         );
-                        // placement_slot に hide 時の WINDOWPLACEMENT があれば先に復元し、
-                        // DPI 丸めによるサイズ / 位置のズレを回避する (トレイ Open と同じ挙動)。
-                        // ⚠ ロックを握ったまま `SetWindowPlacement` を呼ばないこと。対象 HWND は
-                        // UI スレッド所有なので、この呼び出しは UI スレッドがメッセージを
-                        // 処理するまで戻らない。その間に UI スレッドがトレイ格納で同じ
-                        // `placement_slot` を書きに来ると相互待ちになる
-                        // (`tray_integration.rs` の hide 経路)。トレイスレッド側は同じ形で
-                        // 自己デッドロックしていた (2026-07-30 実害)。
-                        // 取り出しだけロック内で行い、guard を落としてから Win32 を呼ぶ。
-                        let saved = placement_slot.lock().unwrap().take();
-                        let used_placement = if let Some(p) = saved {
-                            crate::tray::restore_window_placement(hwnd_raw, &p);
-                            true
-                        } else {
-                            false
-                        };
-                        unsafe {
-                            if !used_placement {
-                                let _ = crate::presentation_observer::show_window(
-                                    hwnd,
-                                    SW_SHOW,
-                                    crate::presentation_observer::WindowRole::Main,
-                                    "single_instance::activate",
-                                );
-                            }
-                            let _ = crate::presentation_observer::set_foreground_window(
-                                hwnd,
-                                crate::presentation_observer::WindowRole::Main,
-                                "single_instance::activate",
-                            );
-                        }
-                        egui_ctx.request_repaint();
+                        crate::window_activation::activate_main_window(
+                            hwnd_raw,
+                            &placement_slot,
+                            &egui_ctx,
+                            "single_instance::activate",
+                        );
                     } else if r.0 == WAIT_OBJECT_0.0 + 1 && handles.shutdown != 0 {
                         crate::logger::log(
                             "single_instance: shutdown event signaled — requesting clean exit",
@@ -819,6 +835,7 @@ pub fn spawn_activation_listener(
             placement_slot,
             shutdown_requested,
             open_path_tx,
+            remote_session,
         );
         None
     }

@@ -24,7 +24,9 @@ pub const SIDECAR_FILENAME: &str = crate::fs_entry::PORTABLE_METADATA_BUNDLE_DIR
 pub(crate) const UI_ENABLED: bool = true;
 const FORMAT_NAME: &str = "mimageviewer-portable-metadata";
 const SHARD_FORMAT_NAME: &str = "mimageviewer-portable-metadata-shard";
-const FORMAT_VERSION: u32 = 7;
+const FORMAT_VERSION: u32 = 9;
+const PREVIOUS_FORMAT_VERSION: u32 = 8;
+const RELEASED_FORMAT_VERSION: u32 = 7;
 const BUNDLE_MANIFEST_FILENAME: &str = "manifest.json";
 const GENERATIONS_DIRNAME: &str = "generations";
 const SHARDS_DIRNAME: &str = "shards";
@@ -113,8 +115,17 @@ pub struct ImportSummary {
     /// それ以前にcommitしたbatchは保持される。
     pub incomplete_error: Option<String>,
     pub changed: ImportChangedSections,
+    /// Changes that were durably committed by the import writer.  This is kept
+    /// separate from `changed`, which describes sections present in the bundle.
+    pub committed: ImportCommittedChanges,
     #[cfg(test)]
     pub transaction_batches: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImportCommittedChanges {
+    pub video_pins: usize,
+    pub folder_pins: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -443,6 +454,14 @@ struct PortableContainerState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     spread: Option<PortableSpreadState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    final_cover_spread: Option<crate::settings::FinalCoverSpreadPreference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    singleton_spread_placement: Option<crate::settings::SingletonSpreadPlacementPreference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    singleton_spread_endpoints: Option<crate::settings::SingletonSpreadEndpointPreferences>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    page_alone_preferences: Option<crate::settings::PageAlonePreferences>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     view_trim: Option<crate::view_trim::ViewTrimBookState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     folder_thumb_pin: Option<PortableFolderThumbPin>,
@@ -450,11 +469,22 @@ struct PortableContainerState {
 
 impl PortableContainerState {
     fn is_empty(&self) -> bool {
-        self.spread.is_none() && self.view_trim.is_none() && self.folder_thumb_pin.is_none()
+        self.spread.is_none()
+            && self.final_cover_spread.is_none()
+            && self.singleton_spread_placement.is_none()
+            && self.singleton_spread_endpoints.is_none()
+            && self.page_alone_preferences.is_none()
+            && self.view_trim.is_none()
+            && self.folder_thumb_pin.is_none()
     }
 
     fn has_view_state(&self) -> bool {
-        self.spread.is_some() || self.view_trim.is_some()
+        self.spread.is_some()
+            || self.final_cover_spread.is_some()
+            || self.singleton_spread_placement.is_some()
+            || self.singleton_spread_endpoints.is_some()
+            || self.page_alone_preferences.is_some()
+            || self.view_trim.is_some()
     }
 }
 
@@ -749,6 +779,11 @@ where
 
     let database_open_started = std::time::Instant::now();
     ensure_database_schemas(data_dir)?;
+    // Declared before the connection so unwind drops SQLite first and only then
+    // publishes completion for any still-open batch.
+    let mut page_edit_write: Option<crate::page_edit_write_epoch::EditWriteGuard<'static>> = None;
+    let mut rating_write: Option<crate::page_edit_write_epoch::EditWriteGuard<'static>> = None;
+    let mut tag_write: Option<crate::page_edit_write_epoch::EditWriteGuard<'static>> = None;
     let conn = open_import_connection(data_dir)?;
     let database_open_ms = database_open_started.elapsed().as_secs_f64() * 1000.0;
     let mut summary = ImportSummary {
@@ -759,6 +794,8 @@ where
     let mut batch_entries = 0usize;
     let mut batch_bytes = 0usize;
     let mut batch_applied = 0usize;
+    let mut batch_video_pin_changes = 0usize;
+    let mut batch_folder_pin_changes = 0usize;
     let mut batch_started = std::time::Instant::now();
     let mut batch_active = false;
     let apply_started = std::time::Instant::now();
@@ -792,6 +829,14 @@ where
                 TargetState::Changed => summary.skipped_changed += 1,
                 TargetState::Ready => {
                     if !batch_active {
+                        page_edit_write =
+                            Some(crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin());
+                        if manifest.sections.ratings {
+                            rating_write = Some(crate::rating_db::RATING_WRITES.begin());
+                        }
+                        if manifest.sections.tags {
+                            tag_write = Some(crate::tags_db::TAG_WRITES.begin());
+                        }
                         begin_import_batch(&conn)?;
                         batch_active = true;
                         batch_started = std::time::Instant::now();
@@ -846,6 +891,8 @@ where
                         Ok(outcome) => {
                             conn.execute_batch("RELEASE metadata_import_item")
                                 .map_err(db_error)?;
+                            let video_pin_changed = outcome.video_pin_changed;
+                            let folder_pin_changed = outcome.folder_pin_changed;
                             for failure in outcome.skipped_folder_pins {
                                 crate::logger::log(format!(
                                     "metadata import: partially applied {}: {}",
@@ -868,6 +915,10 @@ where
                                 }
                             }
                             batch_applied = batch_applied.saturating_add(1);
+                            batch_video_pin_changes = batch_video_pin_changes
+                                .saturating_add(usize::from(video_pin_changed));
+                            batch_folder_pin_changes = batch_folder_pin_changes
+                                .saturating_add(usize::from(folder_pin_changed));
                         }
                         Err(error) => {
                             conn.execute_batch(
@@ -902,6 +953,9 @@ where
             {
                 let commit_started = std::time::Instant::now();
                 commit_import_batch(&conn)?;
+                drop(page_edit_write.take());
+                drop(rating_write.take());
+                drop(tag_write.take());
                 let current_commit_ms = commit_started.elapsed().as_secs_f64() * 1000.0;
                 commit_ms += current_commit_ms;
                 max_commit_ms = max_commit_ms.max(current_commit_ms);
@@ -922,6 +976,14 @@ where
                     );
                 }
                 summary.applied_entries = summary.applied_entries.saturating_add(batch_applied);
+                summary.committed.video_pins = summary
+                    .committed
+                    .video_pins
+                    .saturating_add(batch_video_pin_changes);
+                summary.committed.folder_pins = summary
+                    .committed
+                    .folder_pins
+                    .saturating_add(batch_folder_pin_changes);
                 #[cfg(test)]
                 {
                     summary.transaction_batches += 1;
@@ -930,6 +992,8 @@ where
                 batch_entries = 0;
                 batch_bytes = 0;
                 batch_applied = 0;
+                batch_video_pin_changes = 0;
+                batch_folder_pin_changes = 0;
                 batch_started = std::time::Instant::now();
             }
             progress(TransferProgress {
@@ -946,6 +1010,9 @@ where
     let commit_result = if batch_active {
         let commit_started = std::time::Instant::now();
         let result = commit_import_batch(&conn);
+        drop(page_edit_write.take());
+        drop(rating_write.take());
+        drop(tag_write.take());
         let current_commit_ms = commit_started.elapsed().as_secs_f64() * 1000.0;
         commit_ms += current_commit_ms;
         max_commit_ms = max_commit_ms.max(current_commit_ms);
@@ -973,6 +1040,14 @@ where
     };
     if commit_result.is_ok() {
         summary.applied_entries = summary.applied_entries.saturating_add(batch_applied);
+        summary.committed.video_pins = summary
+            .committed
+            .video_pins
+            .saturating_add(batch_video_pin_changes);
+        summary.committed.folder_pins = summary
+            .committed
+            .folder_pins
+            .saturating_add(batch_folder_pin_changes);
         #[cfg(test)]
         if batch_active {
             summary.transaction_batches += 1;
@@ -996,8 +1071,13 @@ where
         "metadata import: outcome={outcome} entries={} applied={} virtual={} bytes={} \
          manifest_ms={manifest_ms:.1} preflight_ms={preflight_ms:.1} db_open_ms={database_open_ms:.1} \
          apply_ms={apply_ms:.1} target_verify_ms={target_verify_ms:.1} sql_apply_ms={sql_apply_ms:.1} \
-         commits={transaction_batches} commit_ms={commit_ms:.1} max_commit_ms={max_commit_ms:.1}",
-        summary.total_entries, summary.applied_entries, applied_virtual_items, applied_record_bytes,
+         video_pin_changes={} commits={transaction_batches} commit_ms={commit_ms:.1} \
+         max_commit_ms={max_commit_ms:.1}",
+        summary.total_entries,
+        summary.applied_entries,
+        applied_virtual_items,
+        applied_record_bytes,
+        summary.committed.video_pins,
     ));
     if crate::perf::is_enabled() {
         crate::perf::event(
@@ -1049,7 +1129,10 @@ fn begin_import_batch(conn: &Connection) -> Result<(), TransferError> {
 }
 
 fn commit_import_batch(conn: &Connection) -> Result<(), TransferError> {
-    conn.execute_batch("COMMIT").map_err(db_error)
+    conn.execute_batch("COMMIT").map_err(|error| {
+        let _ = conn.execute_batch("ROLLBACK");
+        db_error(error)
+    })
 }
 
 /// 仮想項目のDB identity。ZIP member名は表示・manifestではcaseを保持するが、
@@ -1350,7 +1433,7 @@ fn portable_media_kind(path: &Path, kind: PortableEntryKind) -> PortableMediaKin
         PortableMediaKind::Audio
     } else if crate::folder_tree::is_zip_extension(&extension) {
         PortableMediaKind::Zip
-    } else if extension == "pdf" {
+    } else if crate::folder_tree::is_paged_document_path(path) {
         PortableMediaKind::Pdf
     } else if crate::archive_converter::ArchiveFormat::from_extension(&extension).is_some() {
         PortableMediaKind::ConvertibleArchive
@@ -2396,6 +2479,253 @@ where
                 }
             }
         }
+        let has_final_cover_table = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                     WHERE type = 'table' AND name = 'final_cover_spreads'
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(false);
+        if has_final_cover_table {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT p.path, p.preference
+                       FROM metadata_transfer_container_scope AS s
+                       CROSS JOIN final_cover_spreads AS p
+                      WHERE p.path = s.item_key
+                         OR (s.include_nested != 0
+                             AND p.path >= s.nested_lower AND p.path < s.nested_upper)",
+                )
+                .map_err(db_error)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let value = row.get::<_, i32>(1)?;
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        crate::settings::FinalCoverSpreadPreference::from_int(value),
+                    ))
+                })
+                .map_err(db_error)?;
+            for row in rows {
+                check_cancel(cancel)?;
+                let (key, preference) = row.map_err(db_error)?;
+                let Some(preference) = preference else {
+                    continue;
+                };
+                report_metadata_progress(metadata_rows, &key, progress);
+                if let Some((entry_index, member)) = locate_export_container_key(
+                    &key,
+                    &container_index,
+                    &mut container_origins,
+                    entries,
+                )? {
+                    if let Some(member) = member {
+                        get_nested_container(entries, &mut nested_index, entry_index, member)
+                            .final_cover_spread = Some(preference);
+                    } else {
+                        entries[entry_index]
+                            .portable
+                            .container_state
+                            .final_cover_spread = Some(preference);
+                    }
+                }
+            }
+        }
+        let has_singleton_placement_table = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                     WHERE type = 'table' AND name = 'singleton_spread_placements'
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(false);
+        let endpoint_table_exists = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'singleton_spread_endpoint_placements')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(db_error)?;
+        let marker_table_exists = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'spread_meta')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(db_error)?;
+        let has_singleton_endpoint_table = if marker_table_exists {
+            let completed = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM spread_meta WHERE key = 'singleton_endpoint_placements_v1' AND value = '1')",
+                [],
+                |row| row.get::<_, bool>(0),
+            ).map_err(db_error)?;
+            if completed && !endpoint_table_exists {
+                return Err(TransferError::Invalid(
+                    "見開き端の移行済み表がありません".into(),
+                ));
+            }
+            completed
+        } else {
+            false
+        };
+        if has_singleton_placement_table && !has_singleton_endpoint_table {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT p.path, p.preference
+                       FROM metadata_transfer_container_scope AS s
+                       CROSS JOIN singleton_spread_placements AS p
+                      WHERE p.path = s.item_key
+                         OR (s.include_nested != 0
+                             AND p.path >= s.nested_lower AND p.path < s.nested_upper)",
+                )
+                .map_err(db_error)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let value = row.get::<_, i32>(1)?;
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        crate::settings::SingletonSpreadPlacementPreference::from_int(value),
+                    ))
+                })
+                .map_err(db_error)?;
+            for row in rows {
+                check_cancel(cancel)?;
+                let (key, preference) = row.map_err(db_error)?;
+                let Some(preference) = preference else {
+                    continue;
+                };
+                report_metadata_progress(metadata_rows, &key, progress);
+                if let Some((entry_index, member)) = locate_export_container_key(
+                    &key,
+                    &container_index,
+                    &mut container_origins,
+                    entries,
+                )? {
+                    if let Some(member) = member {
+                        get_nested_container(entries, &mut nested_index, entry_index, member)
+                            .singleton_spread_endpoints = Some(preference.into());
+                    } else {
+                        entries[entry_index]
+                            .portable
+                            .container_state
+                            .singleton_spread_endpoints = Some(preference.into());
+                    }
+                }
+            }
+        }
+        if has_singleton_endpoint_table {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT p.path, p.first_preference, p.last_preference
+                   FROM metadata_transfer_container_scope AS s
+                   CROSS JOIN singleton_spread_endpoint_placements AS p
+                  WHERE p.path = s.item_key
+                     OR (s.include_nested != 0
+                         AND p.path >= s.nested_lower AND p.path < s.nested_upper)",
+                )
+                .map_err(db_error)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i32>(1)?,
+                        row.get::<_, i32>(2)?,
+                    ))
+                })
+                .map_err(db_error)?;
+            for row in rows {
+                check_cancel(cancel)?;
+                let (key, first, last) = row.map_err(db_error)?;
+                let preferences = crate::settings::SingletonSpreadEndpointPreferences {
+                    first: crate::settings::SingletonSpreadPlacementPreference::from_int(first)
+                        .ok_or_else(|| {
+                            TransferError::Invalid("先頭単ページ設定が不正です".into())
+                        })?,
+                    last: crate::settings::SingletonSpreadPlacementPreference::from_int(last)
+                        .ok_or_else(|| {
+                            TransferError::Invalid("末尾単ページ設定が不正です".into())
+                        })?,
+                };
+                report_metadata_progress(metadata_rows, &key, progress);
+                if let Some((entry_index, member)) = locate_export_container_key(
+                    &key,
+                    &container_index,
+                    &mut container_origins,
+                    entries,
+                )? {
+                    if let Some(member) = member {
+                        get_nested_container(entries, &mut nested_index, entry_index, member)
+                            .singleton_spread_endpoints = Some(preferences);
+                    } else {
+                        entries[entry_index]
+                            .portable
+                            .container_state
+                            .singleton_spread_endpoints = Some(preferences);
+                    }
+                }
+            }
+        }
+        let has_page_alone_table = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'page_alone_preferences')",
+            [],
+            |row| row.get::<_, bool>(0),
+        ).map_err(db_error)?;
+        if has_page_alone_table {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT p.path, p.after_cover_preference, p.last_preference
+                   FROM metadata_transfer_container_scope AS s
+                   CROSS JOIN page_alone_preferences AS p
+                  WHERE p.path = s.item_key
+                     OR (s.include_nested != 0
+                         AND p.path >= s.nested_lower AND p.path < s.nested_upper)",
+                )
+                .map_err(db_error)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i32>(1)?,
+                        row.get::<_, i32>(2)?,
+                    ))
+                })
+                .map_err(db_error)?;
+            for row in rows {
+                check_cancel(cancel)?;
+                let (key, after_cover, last) = row.map_err(db_error)?;
+                let preferences = crate::settings::PageAlonePreferences {
+                    after_cover: crate::settings::PageAlonePreference::from_int(after_cover)
+                        .ok_or_else(|| {
+                            TransferError::Invalid("表紙の次の単独設定が不正です".into())
+                        })?,
+                    last: crate::settings::PageAlonePreference::from_int(last).ok_or_else(
+                        || TransferError::Invalid("最終ページの単独設定が不正です".into()),
+                    )?,
+                };
+                report_metadata_progress(metadata_rows, &key, progress);
+                if let Some((entry_index, member)) = locate_export_container_key(
+                    &key,
+                    &container_index,
+                    &mut container_origins,
+                    entries,
+                )? {
+                    if let Some(member) = member {
+                        get_nested_container(entries, &mut nested_index, entry_index, member)
+                            .page_alone_preferences = Some(preferences);
+                    } else {
+                        entries[entry_index]
+                            .portable
+                            .container_state
+                            .page_alone_preferences = Some(preferences);
+                    }
+                }
+            }
+        }
     }
 
     let view_trim_path = data_dir.join("view_trim.db");
@@ -2869,10 +3199,16 @@ fn validate_bundle_manifest(manifest: &BundleManifest) -> Result<(), TransferErr
             "形式識別子が一致しません".to_string(),
         ));
     }
-    if manifest.version != FORMAT_VERSION {
+    if ![
+        RELEASED_FORMAT_VERSION,
+        PREVIOUS_FORMAT_VERSION,
+        FORMAT_VERSION,
+    ]
+    .contains(&manifest.version)
+    {
         return Err(TransferError::Invalid(format!(
-            "未対応のバージョンです: {}（v{}だけを受け入れます）",
-            manifest.version, FORMAT_VERSION
+            "未対応のバージョンです: {}（v{} / v{} / v{}を受け入れます）",
+            manifest.version, RELEASED_FORMAT_VERSION, PREVIOUS_FORMAT_VERSION, FORMAT_VERSION
         )));
     }
     validate_generation(&manifest.generation)?;
@@ -2896,7 +3232,7 @@ fn validate_shard_header(
     filename: &str,
 ) -> Result<(), TransferError> {
     if header.format != SHARD_FORMAT_NAME
-        || header.version != FORMAT_VERSION
+        || header.version != manifest.version
         || header.generation != manifest.generation
     {
         return Err(TransferError::Invalid(format!(
@@ -2941,10 +3277,16 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), TransferError> {
             "形式識別子が一致しません".to_string(),
         ));
     }
-    if manifest.version != FORMAT_VERSION {
+    if ![
+        RELEASED_FORMAT_VERSION,
+        PREVIOUS_FORMAT_VERSION,
+        FORMAT_VERSION,
+    ]
+    .contains(&manifest.version)
+    {
         return Err(TransferError::Invalid(format!(
-            "未対応のバージョンです: {}（v{}だけを受け入れます）",
-            manifest.version, FORMAT_VERSION
+            "未対応のバージョンです: {}（v{} / v{} / v{}を受け入れます）",
+            manifest.version, RELEASED_FORMAT_VERSION, PREVIOUS_FORMAT_VERSION, FORMAT_VERSION
         )));
     }
     let mut paths = HashSet::new();
@@ -4011,6 +4353,8 @@ fn open_import_connection(data_dir: &Path) -> Result<Connection, TransferError> 
 #[derive(Default)]
 struct ApplyEntryOutcome {
     skipped_folder_pins: Vec<ImportFailure>,
+    video_pin_changed: bool,
+    folder_pin_changed: bool,
 }
 
 fn apply_entry(
@@ -4310,6 +4654,38 @@ fn apply_entry(
         )?;
         delete_container_key_family(
             tx,
+            "spread.final_cover_spreads",
+            "path",
+            &container_source_key,
+            container_cache_key.as_deref(),
+            include_nested,
+        )?;
+        delete_container_key_family(
+            tx,
+            "spread.singleton_spread_placements",
+            "path",
+            &container_source_key,
+            container_cache_key.as_deref(),
+            include_nested,
+        )?;
+        delete_container_key_family(
+            tx,
+            "spread.singleton_spread_endpoint_placements",
+            "path",
+            &container_source_key,
+            container_cache_key.as_deref(),
+            include_nested,
+        )?;
+        delete_container_key_family(
+            tx,
+            "spread.page_alone_preferences",
+            "path",
+            &container_source_key,
+            container_cache_key.as_deref(),
+            include_nested,
+        )?;
+        delete_container_key_family(
+            tx,
             "view_trim.view_trim_books",
             "book_key",
             &container_source_key,
@@ -4327,6 +4703,16 @@ fn apply_entry(
     }
     if sections.thumbnail_pins {
         if supports_container {
+            // Trigger-owned revision observes deletions and nested pins as well as inserts.
+            // This remains item-local until its SAVEPOINT and outer batch commit succeed.
+            let pin_revision =
+                || {
+                    tx.query_row(
+                "SELECT revision FROM folder_pin.folder_thumb_pin_revision WHERE singleton = 1",
+                [], |row| row.get::<_, i64>(0),
+            ).map_err(db_error)
+                };
+            let previous_pin_revision = pin_revision()?;
             let include_nested = entry.kind == PortableEntryKind::File;
             // 未知 kind は「その pin 1 件を適用しない」扱いなので、取り込み先に同じ
             // container の既存 pin があれば保持する。family 一括 DELETE の巻き添えに
@@ -4380,12 +4766,15 @@ fn apply_entry(
                     });
                 }
             }
+            outcome.folder_pin_changed = previous_pin_revision != pin_revision()?;
         }
         if entry.media_kind == PortableMediaKind::Video {
-            tx.prepare_cached("DELETE FROM video_pin.video_pins WHERE path = ?1")
+            let deleted = tx
+                .prepare_cached("DELETE FROM video_pin.video_pins WHERE path = ?1")
                 .map_err(db_error)?
                 .execute([&base_key])
                 .map_err(db_error)?;
+            outcome.video_pin_changed |= deleted > 0;
         }
         if let Some(pin) = &entry.video_pin {
             let webp = pin
@@ -4407,6 +4796,7 @@ fn apply_entry(
                 pin.thumb_pts_secs
             ])
             .map_err(db_error)?;
+            outcome.video_pin_changed = true;
         }
     }
     Ok(outcome)
@@ -4574,6 +4964,37 @@ fn insert_container_state(
             spread.flow,
             spread.direction
         ])
+        .map_err(db_error)?;
+    }
+    if let Some(preference) = state.final_cover_spread {
+        tx.prepare_cached(
+            "INSERT INTO spread.final_cover_spreads (path, preference) VALUES (?1, ?2)",
+        )
+        .map_err(db_error)?
+        .execute(params![stripped_key, preference.to_int()])
+        .map_err(db_error)?;
+    }
+    let endpoint_preferences = state.singleton_spread_endpoints.or_else(|| {
+        state.singleton_spread_placement.map(|preference| {
+            crate::settings::SingletonSpreadEndpointPreferences {
+                first: preference,
+                last: preference,
+            }
+        })
+    });
+    if let Some(preferences) = endpoint_preferences {
+        tx.prepare_cached(
+            "INSERT INTO spread.singleton_spread_endpoint_placements (path, first_preference, last_preference) VALUES (?1, ?2, ?3)",
+        )
+        .map_err(db_error)?
+        .execute(params![stripped_key, preferences.first.to_int(), preferences.last.to_int()])
+        .map_err(db_error)?;
+    }
+    if let Some(preferences) = state.page_alone_preferences {
+        tx.prepare_cached(
+            "INSERT INTO spread.page_alone_preferences (path, after_cover_preference, last_preference) VALUES (?1, ?2, ?3)",
+        ).map_err(db_error)?
+        .execute(params![stripped_key, preferences.after_cover.to_int(), preferences.last.to_int()])
         .map_err(db_error)?;
     }
     if let Some(view_trim) = state.view_trim {
@@ -5499,6 +5920,18 @@ impl<W: Write> Write for CancelWriter<'_, W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn epub_transfer_uses_paged_book_metadata_kind() {
+        assert_eq!(
+            portable_media_kind(Path::new("book.EPUB"), PortableEntryKind::File),
+            PortableMediaKind::Pdf
+        );
+        assert_eq!(
+            portable_media_kind(Path::new("book.pdf"), PortableEntryKind::File),
+            PortableMediaKind::Pdf
+        );
+    }
 
     fn no_progress(_: TransferProgress) {}
 
@@ -6840,6 +7273,246 @@ mod tests {
     }
 
     #[test]
+    fn independent_spread_preferences_round_trip_without_materializing_spread_rows() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        let source_book = source.join("book.zip");
+        let destination_book = destination.join("book.zip");
+        fs::write(&source_book, b"same-book").unwrap();
+        fs::write(&destination_book, b"same-book").unwrap();
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+
+        let source_key = crate::path_key::normalize(&source_book);
+        let source_nested = join_container_key(&source_key, "nested");
+        let source_spread = Connection::open(source_data.join("spread.db")).unwrap();
+        source_spread
+            .execute(
+                "INSERT INTO final_cover_spreads (path, preference) VALUES (?1, 2), (?2, 0)",
+                params![&source_key, &source_nested],
+            )
+            .unwrap();
+        source_spread
+            .execute(
+                "INSERT INTO singleton_spread_endpoint_placements (path, first_preference, last_preference) VALUES (?1, 1, 2), (?2, 0, 0)",
+                params![&source_key, &source_nested],
+            )
+            .unwrap();
+        source_spread
+            .execute(
+                "INSERT INTO page_alone_preferences (path, after_cover_preference, last_preference) VALUES (?1, 2, 1), (?2, 0, 0)",
+                params![&source_key, &source_nested],
+            )
+            .unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let exported = export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        assert_eq!(exported.container_states, 2);
+        let manifest = read_manifest(&source, &cancel).unwrap();
+        let entry = manifest
+            .entries
+            .iter()
+            .find(|entry| entry.path == "book.zip")
+            .unwrap();
+        assert!(entry.container_state.spread.is_none());
+        assert_eq!(
+            entry.container_state.final_cover_spread,
+            Some(crate::settings::FinalCoverSpreadPreference::Off)
+        );
+        assert_eq!(
+            entry.nested_containers[0].state.final_cover_spread,
+            Some(crate::settings::FinalCoverSpreadPreference::FollowGlobal)
+        );
+        assert_eq!(
+            entry.container_state.singleton_spread_endpoints,
+            Some(crate::settings::SingletonSpreadEndpointPreferences {
+                first: crate::settings::SingletonSpreadPlacementPreference::Place,
+                last: crate::settings::SingletonSpreadPlacementPreference::Center,
+            })
+        );
+        assert_eq!(
+            entry.nested_containers[0].state.singleton_spread_endpoints,
+            Some(crate::settings::SingletonSpreadEndpointPreferences::default())
+        );
+        assert_eq!(
+            entry.container_state.page_alone_preferences,
+            Some(crate::settings::PageAlonePreferences {
+                after_cover: crate::settings::PageAlonePreference::Off,
+                last: crate::settings::PageAlonePreference::On,
+            })
+        );
+        assert_eq!(
+            entry.nested_containers[0].state.page_alone_preferences,
+            Some(crate::settings::PageAlonePreferences::default())
+        );
+
+        copy_sidecar_bundle(&source, &destination);
+        let imported = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert_eq!(imported.failed_entries, 0);
+        let destination_key = crate::path_key::normalize(&destination_book);
+        let destination_nested = PathBuf::from(join_container_key(&destination_key, "nested"));
+        let destination_absent = PathBuf::from(join_container_key(&destination_key, "absent"));
+        let spread =
+            crate::spread_db::SpreadDb::open_at(&destination_data.join("spread.db")).unwrap();
+        assert_eq!(spread.count(), 2);
+        assert!(spread.get(&destination_book).is_none());
+        assert_eq!(
+            Connection::open(destination_data.join("spread.db"))
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM spreads", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            spread.get_final_cover_spread_preference_with_fallback(
+                &destination_nested,
+                Some(&destination_book),
+            ),
+            crate::settings::FinalCoverSpreadPreference::FollowGlobal
+        );
+        assert_eq!(
+            spread.get_final_cover_spread_preference_with_fallback(
+                &destination_absent,
+                Some(&destination_book),
+            ),
+            crate::settings::FinalCoverSpreadPreference::Off
+        );
+        assert_eq!(
+            spread
+                .get_singleton_spread_endpoint_preferences_with_fallback(
+                    &destination_nested,
+                    Some(&destination_book),
+                )
+                .unwrap(),
+            crate::settings::SingletonSpreadEndpointPreferences::default()
+        );
+        assert_eq!(
+            spread
+                .get_singleton_spread_endpoint_preferences_with_fallback(
+                    &destination_absent,
+                    Some(&destination_book),
+                )
+                .unwrap(),
+            crate::settings::SingletonSpreadEndpointPreferences {
+                first: crate::settings::SingletonSpreadPlacementPreference::Place,
+                last: crate::settings::SingletonSpreadPlacementPreference::Center,
+            }
+        );
+        assert_eq!(
+            spread
+                .get_page_alone_preferences_with_fallback(
+                    &destination_nested,
+                    Some(&destination_book)
+                )
+                .unwrap(),
+            crate::settings::PageAlonePreferences::default()
+        );
+        assert_eq!(
+            spread
+                .get_page_alone_preferences_with_fallback(
+                    &destination_absent,
+                    Some(&destination_book)
+                )
+                .unwrap(),
+            crate::settings::PageAlonePreferences {
+                after_cover: crate::settings::PageAlonePreference::Off,
+                last: crate::settings::PageAlonePreference::On,
+            }
+        );
+    }
+
+    #[test]
+    fn released_v7_v8_bundle_import_preserves_root_and_nested_explicit_follow_global() {
+        for version in [RELEASED_FORMAT_VERSION, PREVIOUS_FORMAT_VERSION] {
+            let temp = tempfile::TempDir::new().unwrap();
+            let source = temp.path().join("source");
+            let destination = temp.path().join("destination");
+            let source_data = temp.path().join("source-data");
+            let destination_data = temp.path().join("destination-data");
+            fs::create_dir_all(&source).unwrap();
+            fs::create_dir_all(&destination).unwrap();
+            let source_book = source.join("book.zip");
+            let destination_book = destination.join("book.zip");
+            fs::write(&source_book, b"same-book").unwrap();
+            fs::write(&destination_book, b"same-book").unwrap();
+            init_data_dir(&source_data);
+            init_data_dir(&destination_data);
+            let source_key = crate::path_key::normalize(&source_book);
+            let source_nested = join_container_key(&source_key, "nested");
+            Connection::open(source_data.join("spread.db")).unwrap().execute(
+            "INSERT INTO singleton_spread_endpoint_placements(path, first_preference, last_preference) VALUES (?1, 0, 0), (?2, 0, 0)",
+            params![&source_key, &source_nested],
+        ).unwrap();
+            let cancel = AtomicBool::new(false);
+            export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+            copy_sidecar_bundle(&source, &destination);
+            rewrite_root_shard_entries(&destination, &cancel, |entry| {
+                let convert = |state: &mut PortableContainerState| {
+                    state.page_alone_preferences = None;
+                    if state.singleton_spread_endpoints.take().is_some() {
+                        state.singleton_spread_placement =
+                            Some(crate::settings::SingletonSpreadPlacementPreference::FollowGlobal);
+                    }
+                };
+                convert(&mut entry.container_state);
+                for nested in &mut entry.nested_containers {
+                    convert(&mut nested.state);
+                }
+            });
+            let bundle_dir = destination.join(SIDECAR_FILENAME);
+            let manifest_path = bundle_dir.join(BUNDLE_MANIFEST_FILENAME);
+            let mut manifest: BundleManifest =
+                serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+            manifest.version = version;
+            let shard_path = bundle_generation_dir(&bundle_dir, &manifest.generation)
+                .join(SHARDS_DIRNAME)
+                .join(shard_filename("."));
+            let contents = fs::read_to_string(&shard_path).unwrap();
+            let mut lines = contents.lines();
+            let mut header: ShardHeader = serde_json::from_str(lines.next().unwrap()).unwrap();
+            header.version = version;
+            let rewritten = std::iter::once(serde_json::to_string(&header).unwrap())
+                .chain(lines.map(str::to_owned))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
+            fs::write(&shard_path, rewritten).unwrap();
+            fs::write(
+                &manifest_path,
+                serde_json::to_vec_pretty(&manifest).unwrap(),
+            )
+            .unwrap();
+            let imported =
+                import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+            assert_eq!(imported.failed_entries, 0);
+            let dest_key = crate::path_key::normalize(&destination_book);
+            let dest_nested = join_container_key(&dest_key, "nested");
+            let conn = Connection::open(destination_data.join("spread.db")).unwrap();
+            for key in [dest_key, dest_nested] {
+                assert_eq!(conn.query_row(
+                "SELECT first_preference, last_preference FROM singleton_spread_endpoint_placements WHERE path = ?1",
+                [key],
+                |row| Ok((row.get::<_, i32>(0)?, row.get::<_, i32>(1)?)),
+            ).unwrap(), (0, 0));
+            }
+            let spread =
+                crate::spread_db::SpreadDb::open_at(&destination_data.join("spread.db")).unwrap();
+            assert_eq!(
+                spread
+                    .get_page_alone_preferences_with_fallback(&destination_book, None)
+                    .unwrap(),
+                crate::settings::PageAlonePreferences::default()
+            );
+        }
+    }
+
+    #[test]
     fn converted_archive_pages_survive_cache_prune_before_export() {
         let temp = tempfile::TempDir::new().unwrap();
         let source = temp.path().join("source");
@@ -7508,6 +8181,7 @@ mod tests {
         // fault-injected and must remain wholly at its previous state.
         assert_eq!(imported.applied_entries, 1);
         assert_eq!(imported.failed_entries, 1);
+        assert_eq!(imported.committed.video_pins, 0);
         assert_eq!(imported.failed_items.len(), 1);
         assert_eq!(imported.failed_items[0].path, "clip.mp4");
         assert!(
@@ -7891,6 +8565,7 @@ mod tests {
         copy_sidecar_bundle(&source, &destination);
         let imported = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
         assert_eq!(imported.failed_entries, 0);
+        assert_eq!(imported.committed.video_pins, 1);
 
         let destination_root = crate::path_key::normalize(&destination);
         let destination_root_keep = crate::path_key::normalize_keep_drive(&destination);
@@ -8282,7 +8957,7 @@ mod tests {
     }
 
     #[test]
-    fn v6_and_older_bundles_are_rejected_with_v7_only_message() {
+    fn v6_and_older_bundles_are_rejected_with_v7_v8_v9_message() {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path().join("root");
         let data = temp.path().join("data");
@@ -8303,7 +8978,7 @@ mod tests {
                 Err(TransferError::Invalid(message))
                     if message.contains("未対応のバージョン")
                         && message.contains(&version.to_string())
-                        && message.contains("v7だけを受け入れます")
+                        && message.contains("v7 / v8 / v9を受け入れます")
             ));
         }
     }
@@ -8950,6 +9625,134 @@ mod tests {
             rating(&destination_data, &destination.join(untouched)),
             Some(untouched_rating)
         );
+    }
+
+    #[test]
+    fn committed_video_pin_changes_survive_a_later_cancelled_batch_only_after_commit() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        for index in 0..IMPORT_TRANSACTION_BATCH_ENTRIES {
+            let name = format!("{index:04}.mp4");
+            fs::write(source.join(&name), b"video").unwrap();
+            fs::write(destination.join(&name), b"video").unwrap();
+        }
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+        let first = source.join("0000.mp4");
+        Connection::open(source_data.join("video_pins.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO video_pins (path, pin_pts_secs, thumb_webp, thumb_pts_secs)
+                 VALUES (?1, 1.0, ?2, 1.0)",
+                params![
+                    crate::path_key::normalize_keep_drive(&first),
+                    b"committed-thumb".as_slice()
+                ],
+            )
+            .unwrap();
+
+        let export_cancel = AtomicBool::new(false);
+        export_at(&source_data, &source, false, &export_cancel, no_progress).unwrap();
+        copy_sidecar_bundle(&source, &destination);
+        let import_cancel = AtomicBool::new(false);
+        let summary = import_at(
+            &destination_data,
+            &destination,
+            &import_cancel,
+            |progress| {
+                if progress.phase == TransferPhase::Importing
+                    && progress.processed == IMPORT_TRANSACTION_BATCH_ENTRIES
+                {
+                    import_cancel.store(true, Ordering::Relaxed);
+                }
+            },
+        )
+        .unwrap();
+
+        assert!(summary.cancelled);
+        assert_eq!(summary.transaction_batches, 1);
+        assert_eq!(summary.committed.video_pins, 1);
+    }
+
+    #[test]
+    fn import_without_an_existing_or_exported_video_pin_reports_no_committed_pin_change() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(source.join("clip.mp4"), b"video").unwrap();
+        fs::write(destination.join("clip.mp4"), b"video").unwrap();
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+        let cancel = AtomicBool::new(false);
+        export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        copy_sidecar_bundle(&source, &destination);
+
+        let summary = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+
+        assert!(summary.applied_entries > 0);
+        assert_eq!(summary.committed.video_pins, 0);
+    }
+
+    #[test]
+    fn committed_folder_pin_changes_cover_insert_removal_and_noop_import() {
+        use crate::folder_thumb_pins::{FileKind, FolderPinSource, FolderThumbPinDb};
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(source.join("album")).unwrap();
+        fs::create_dir_all(destination.join("album")).unwrap();
+        for root in [&source, &destination] {
+            fs::write(root.join("album/cover.jpg"), b"image").unwrap();
+        }
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+        let pins = FolderThumbPinDb::open_at(&source_data.join("folder_thumb_pins.db")).unwrap();
+        pins.set(
+            &source.join("album"),
+            &FolderPinSource::File {
+                rel: "cover.jpg".into(),
+                kind: FileKind::Image,
+            },
+        )
+        .unwrap();
+        let cancel = AtomicBool::new(false);
+        export_at(&source_data, &source, true, &cancel, no_progress).unwrap();
+        copy_sidecar_bundle(&source, &destination);
+        let inserted = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert_eq!(inserted.committed.folder_pins, 1);
+        assert_eq!(inserted.committed.video_pins, 0);
+        let destination_pins =
+            FolderThumbPinDb::open_at(&destination_data.join("folder_thumb_pins.db")).unwrap();
+        assert!(
+            destination_pins
+                .lookup(&destination.join("album"))
+                .is_some()
+        );
+        pins.remove(&source.join("album")).unwrap();
+        export_at(&source_data, &source, true, &cancel, no_progress).unwrap();
+        // The fixture copier creates a new bundle directory. Replace only this TempDir bundle.
+        fs::remove_dir_all(destination.join(SIDECAR_FILENAME)).unwrap();
+        copy_sidecar_bundle(&source, &destination);
+        let removed = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert_eq!(removed.committed.folder_pins, 1);
+        assert!(
+            destination_pins
+                .lookup(&destination.join("album"))
+                .is_none()
+        );
+        let unchanged = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert_eq!(unchanged.committed.folder_pins, 0);
     }
 
     #[test]

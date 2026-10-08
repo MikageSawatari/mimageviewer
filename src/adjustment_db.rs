@@ -150,6 +150,8 @@ impl AdjustmentDb {
         page_key: &str,
         params: &AdjustParams,
     ) -> Result<(), rusqlite::Error> {
+        let _page_edit_write =
+            crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin_for_key(page_key);
         let json = serde_json::to_string(params).unwrap_or_default();
         self.conn.execute(
             "INSERT INTO page_params (page_path, params_json) VALUES (?1, ?2)
@@ -161,6 +163,8 @@ impl AdjustmentDb {
 
     /// ページのパラメータ個別設定を削除する。
     pub fn remove_page_params(&self, page_key: &str) -> Result<(), rusqlite::Error> {
+        let _page_edit_write =
+            crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin_for_key(page_key);
         self.conn
             .execute("DELETE FROM page_params WHERE page_path = ?1", [page_key])?;
         Ok(())
@@ -171,6 +175,7 @@ impl AdjustmentDb {
         from_key: &str,
         to_key: &str,
     ) -> Result<(), rusqlite::Error> {
+        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
         if from_key == to_key {
             return Ok(());
         }
@@ -204,6 +209,7 @@ impl AdjustmentDb {
         page_keys: &[String],
         params: &AdjustParams,
     ) -> Result<(), rusqlite::Error> {
+        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
         let tx = self.conn.transaction()?;
         let json = serde_json::to_string(params).unwrap_or_default();
         let mut stmt = tx.prepare(
@@ -220,6 +226,7 @@ impl AdjustmentDb {
 
     /// 複数ページの個別パラメータを一括削除する (「全画像から削除」ボタン用)。
     pub fn remove_page_params_bulk(&mut self, page_keys: &[String]) -> Result<(), rusqlite::Error> {
+        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
         let tx = self.conn.transaction()?;
         let mut stmt = tx.prepare("DELETE FROM page_params WHERE page_path = ?1")?;
         for key in page_keys {
@@ -695,9 +702,9 @@ mod tests {
         let b = Uuid::new_v4();
         let mut a_state = FavoriteViewState::from_settings(&crate::settings::Settings::default());
         a_state.grid_cols = 4;
-        a_state.sort_order = crate::settings::SortOrder::DateDesc;
+        a_state.sort_order = crate::settings::SortOrder::SizeDesc;
         let mut b_state = a_state.clone();
-        b_state.grid_cols = 8;
+        b_state.grid_cols = 20;
 
         {
             let db = AdjustmentDb::open_at(&path).unwrap();

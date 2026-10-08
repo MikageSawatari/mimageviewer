@@ -7,6 +7,7 @@
 
 #![cfg_attr(all(test, not(feature = "test-script")), allow(dead_code))]
 
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
@@ -20,13 +21,64 @@ use crate::key_input::SyntheticKeyCommandKind;
 use crate::key_input::{
     SyntheticInputIssue, SyntheticKeyCommand, SyntheticModifiers, SyntheticNavigationKey,
 };
-use crate::keymap::{KeyAction, KeyTrigger};
+use crate::keymap::{CommandScope, KeyAction, KeyTrigger, command_catalog};
 
+mod capture;
+#[cfg(feature = "test-script")]
+mod clipboard_capture;
+#[cfg(feature = "test-script")]
+pub(crate) mod grid_observation;
+#[cfg(feature = "test-script")]
+mod history_input;
 pub(crate) mod pointer_input;
 
 const MAX_SCRIPT_BYTES: u64 = 1024 * 1024;
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const RUN_ACTION_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const MAX_ITEM_ROWS_IN_SNAPSHOT: usize = 16;
 const EXIT_NOT_SET: i32 = -1;
+
+/// Durable diagnostic event: a fast PDF adoption may be verified by its worker before the
+/// script's next snapshot. The sequence records that placeholders were visibly committed,
+/// independently of how long enumeration took.
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+pub(crate) enum PdfWarmAdoptionPhase {
+    #[default]
+    None,
+    CommittedPlaceholder,
+}
+
+impl PdfWarmAdoptionPhase {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::CommittedPlaceholder => "CommittedPlaceholder",
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct PdfWarmAdoptionCheckpoint {
+    pub(crate) sequence: i64,
+    pub(crate) path: String,
+    pub(crate) phase: PdfWarmAdoptionPhase,
+}
+
+fn pdf_warm_adoption_checkpoint_slot() -> &'static Mutex<PdfWarmAdoptionCheckpoint> {
+    static SLOT: OnceLock<Mutex<PdfWarmAdoptionCheckpoint>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(PdfWarmAdoptionCheckpoint::default()))
+}
+
+pub(crate) fn record_pdf_warm_adoption(path: &Path) {
+    let mut checkpoint = pdf_warm_adoption_checkpoint_slot().lock().unwrap();
+    checkpoint.sequence = checkpoint.sequence.saturating_add(1);
+    checkpoint.path = path.to_string_lossy().into_owned();
+    checkpoint.phase = PdfWarmAdoptionPhase::CommittedPlaceholder;
+}
+
+pub(crate) fn pdf_warm_adoption_checkpoint() -> PdfWarmAdoptionCheckpoint {
+    pdf_warm_adoption_checkpoint_slot().lock().unwrap().clone()
+}
 const EXIT_SCRIPT_FAILURE: i32 = 1;
 const EXIT_ENVIRONMENT_FAILURE: i32 = 2;
 // App-owned workers get two seconds to join during normal shutdown. Six
@@ -77,6 +129,107 @@ pub(crate) struct TestScriptContentProof {
     pub(crate) item_identity: String,
     pub(crate) source_texture_id: egui::TextureId,
     pub(crate) source_kind: TestScriptPaintSourceKind,
+    /// The selected source is an exact, complete final composite for this page.
+    pub(crate) final_composite_complete: bool,
+}
+
+/// One image mesh submitted during the latest callback for an exact window.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TestScriptPaintObservation {
+    pub(crate) owner: TestScriptWindowIdentity,
+    pub(crate) content: TestScriptContentProof,
+    pub(crate) texture: egui::TextureId,
+    pub(crate) vertices: Vec<([f32; 2], [f32; 2])>,
+    pub(crate) clip: [f32; 4],
+    pub(crate) viewport_size: [f32; 2],
+    pub(crate) pixels_per_point: f32,
+    pub(crate) placement: String,
+    pub(crate) revision: u64,
+}
+
+#[derive(Clone)]
+struct PendingPaintObservation {
+    content: TestScriptContentProof,
+    texture: egui::TextureId,
+    vertices: Vec<([f32; 2], [f32; 2])>,
+    clip: [f32; 4],
+    viewport_size: [f32; 2],
+    pixels_per_point: f32,
+    placement: String,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum TestScriptSidecarObservation {
+    Loaded,
+    Imported,
+}
+
+thread_local! {
+    static DRAWN_PAINT: std::cell::RefCell<std::collections::HashMap<egui::ViewportId, Vec<PendingPaintObservation>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Called immediately after the paint resource submits its mesh. Read the
+/// actual egui shape rather than recomputing geometry from a layout DTO.
+#[cfg(feature = "test-script")]
+pub(crate) fn record_drawn_paint(
+    painter: &egui::Painter,
+    resource: &crate::gpu_lanczos::FullscreenPaintResource,
+    placement: String,
+) {
+    let Some(content) = resource.test_script_content_proof().cloned() else {
+        return;
+    };
+    let shape = painter.ctx().graphics(|graphics| {
+        graphics
+            .get(painter.layer_id())
+            .and_then(|list| list.all_entries().last().cloned())
+    });
+    let Some(clipped) = shape else {
+        return;
+    };
+    let egui::Shape::Mesh(mesh) = clipped.shape else {
+        return;
+    };
+    let clip_rect = clipped.clip_rect;
+    if mesh.texture_id != resource.paint_texture_id() {
+        return;
+    }
+    let viewport = painter.ctx().viewport_id();
+    let size = painter.ctx().viewport_rect().size();
+    let pixels_per_point = painter.ctx().pixels_per_point();
+    DRAWN_PAINT.with(|drawn| {
+        drawn
+            .borrow_mut()
+            .entry(viewport)
+            .or_default()
+            .push(PendingPaintObservation {
+                content,
+                texture: mesh.texture_id,
+                vertices: mesh
+                    .vertices
+                    .iter()
+                    .map(|vertex| ([vertex.pos.x, vertex.pos.y], [vertex.uv.x, vertex.uv.y]))
+                    .collect(),
+                clip: [
+                    clip_rect.min.x,
+                    clip_rect.min.y,
+                    clip_rect.max.x,
+                    clip_rect.max.y,
+                ],
+                viewport_size: [size.x, size.y],
+                pixels_per_point,
+                placement,
+            });
+    });
+}
+
+fn take_drawn_paint(viewport: egui::ViewportId) -> Vec<PendingPaintObservation> {
+    DRAWN_PAINT.with(|drawn| drawn.borrow_mut().remove(&viewport).unwrap_or_default())
+}
+
+pub(crate) fn discard_drawn_paint(viewport: egui::ViewportId) {
+    let _ = take_drawn_paint(viewport);
 }
 
 /// Existing window lifetime owners represented without inventing a shared ID space.
@@ -210,6 +363,157 @@ struct TestScriptPaintEvidenceKey {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TestScriptSeekStripSnapshot {
+    pub(crate) state: String,
+    pub(crate) session_id: Option<u64>,
+    pub(crate) source_epoch: Option<u64>,
+    pub(crate) items_generation: Option<u64>,
+    pub(crate) owner_fs_idx: Option<usize>,
+    pub(crate) layout_revision: Option<u64>,
+    pub(crate) mode: String,
+    pub(crate) span: String,
+    pub(crate) visible_count: Option<usize>,
+    pub(crate) axis_cell_count: Option<usize>,
+    pub(crate) last_sent_request_id: Option<u64>,
+    pub(crate) last_finished_request_id: Option<u64>,
+    pub(crate) worker_instance_id: Option<u64>,
+    pub(crate) decoder_open_count: Option<u64>,
+    pub(crate) worker_status: String,
+    pub(crate) receipt_present: bool,
+    pub(crate) receipt_visible: bool,
+    pub(crate) receipt_source_epoch: Option<u64>,
+    pub(crate) receipt_session_id: Option<u64>,
+    pub(crate) receipt_generation: Option<u64>,
+    pub(crate) receipt_layout_revision: Option<u64>,
+    pub(crate) receipt_reported_count: Option<usize>,
+    pub(crate) receipt_window_applied: bool,
+}
+
+impl TestScriptSeekStripSnapshot {
+    pub(crate) fn closed() -> Self {
+        Self {
+            state: "closed".to_string(),
+            session_id: None,
+            source_epoch: None,
+            items_generation: None,
+            owner_fs_idx: None,
+            layout_revision: None,
+            mode: "none".to_string(),
+            span: "none".to_string(),
+            visible_count: None,
+            axis_cell_count: None,
+            last_sent_request_id: None,
+            last_finished_request_id: None,
+            worker_instance_id: None,
+            decoder_open_count: None,
+            worker_status: "none".to_string(),
+            receipt_present: false,
+            receipt_visible: false,
+            receipt_source_epoch: None,
+            receipt_session_id: None,
+            receipt_generation: None,
+            receipt_layout_revision: None,
+            receipt_reported_count: None,
+            receipt_window_applied: false,
+        }
+    }
+
+    fn to_rhai_map(&self) -> Map {
+        let mut map = Map::new();
+        map.insert("state".into(), self.state.clone().into());
+        map.insert("session_id".into(), optional_rhai_u64(self.session_id));
+        map.insert("source_epoch".into(), optional_rhai_u64(self.source_epoch));
+        map.insert(
+            "items_generation".into(),
+            optional_rhai_u64(self.items_generation),
+        );
+        map.insert(
+            "owner_fs_idx".into(),
+            optional_rhai_usize(self.owner_fs_idx),
+        );
+        map.insert(
+            "layout_revision".into(),
+            optional_rhai_u64(self.layout_revision),
+        );
+        map.insert("mode".into(), self.mode.clone().into());
+        map.insert("span".into(), self.span.clone().into());
+        map.insert(
+            "visible_count".into(),
+            optional_rhai_usize(self.visible_count),
+        );
+        map.insert(
+            "axis_cell_count".into(),
+            optional_rhai_usize(self.axis_cell_count),
+        );
+        map.insert(
+            "last_sent_request_id".into(),
+            optional_rhai_u64(self.last_sent_request_id),
+        );
+        map.insert(
+            "last_finished_request_id".into(),
+            optional_rhai_u64(self.last_finished_request_id),
+        );
+        map.insert(
+            "worker_instance_id".into(),
+            optional_rhai_u64(self.worker_instance_id),
+        );
+        map.insert(
+            "decoder_open_count".into(),
+            optional_rhai_u64(self.decoder_open_count),
+        );
+        map.insert("worker_status".into(), self.worker_status.clone().into());
+        map.insert("receipt_present".into(), self.receipt_present.into());
+        map.insert("receipt_visible".into(), self.receipt_visible.into());
+        map.insert(
+            "receipt_source_epoch".into(),
+            optional_rhai_u64(self.receipt_source_epoch),
+        );
+        map.insert(
+            "receipt_session_id".into(),
+            optional_rhai_u64(self.receipt_session_id),
+        );
+        map.insert(
+            "receipt_generation".into(),
+            optional_rhai_u64(self.receipt_generation),
+        );
+        map.insert(
+            "receipt_layout_revision".into(),
+            optional_rhai_u64(self.receipt_layout_revision),
+        );
+        map.insert(
+            "receipt_reported_count".into(),
+            optional_rhai_usize(self.receipt_reported_count),
+        );
+        map.insert(
+            "receipt_window_applied".into(),
+            self.receipt_window_applied.into(),
+        );
+        map
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TestScriptWindowPresentation {
+    Root,
+    ActiveImmediate,
+    ParkedLiveImmediate,
+    PassiveDeferredFrozen,
+    Other,
+}
+
+impl TestScriptWindowPresentation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Root => "root",
+            Self::ActiveImmediate => "active_immediate",
+            Self::ParkedLiveImmediate => "parked_live_immediate",
+            Self::PassiveDeferredFrozen => "passive_deferred_frozen",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TestScriptWindowSnapshot {
     pub(crate) identity: Option<TestScriptWindowIdentity>,
     pub(crate) role: String,
@@ -220,11 +524,14 @@ pub(crate) struct TestScriptWindowSnapshot {
     pub(crate) hwnd: Option<u64>,
     pub(crate) backend_token: Option<u64>,
     pub(crate) residence: String,
+    pub(crate) presentation: TestScriptWindowPresentation,
     pub(crate) media_kind: String,
     pub(crate) page_index: Option<usize>,
     pub(crate) items_generation: u64,
     pub(crate) item_identity: String,
+    pub(crate) selected_item_identity: String,
     pub(crate) page_ready: bool,
+    pub(crate) edit_ready: bool,
     pub(crate) viewport_rendered: bool,
     pub(crate) viewport_revision: u64,
     pub(crate) paint_matches_current_page: bool,
@@ -233,6 +540,83 @@ pub(crate) struct TestScriptWindowSnapshot {
     pub(crate) paint_source_texture: String,
     pub(crate) painted_page_index: Option<usize>,
     pub(crate) paint_revision: u64,
+    pub(crate) paints: Vec<TestScriptPaintObservation>,
+    pub(crate) sidecar_imported: bool,
+    pub(crate) sidecar_loaded: bool,
+    pub(crate) seek_strip: TestScriptSeekStripSnapshot,
+    pub(crate) audio_track: TestScriptAudioTrackSnapshot,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TestScriptAudioTrackSnapshot {
+    pub(crate) audio_tracks_len: i64,
+    pub(crate) desired_stream_index: i64,
+    pub(crate) desired_generation: i64,
+    pub(crate) applied_stream_index: i64,
+    pub(crate) applied_generation: i64,
+    pub(crate) state: String,
+    pub(crate) engine_state: String,
+    pub(crate) audio_mode: bool,
+    pub(crate) processed_frequency_hz: f64,
+}
+
+impl TestScriptAudioTrackSnapshot {
+    #[cfg(feature = "test-script")]
+    pub(crate) fn from_player(player: &crate::video::VideoPlayer, audio_mode: bool) -> Self {
+        let selection = player.audio_track_selection();
+        Self {
+            audio_tracks_len: player
+                .info()
+                .map_or(0, |info| info.audio_tracks.len() as i64),
+            desired_stream_index: selection.map_or(-1, |s| s.desired.stream_index as i64),
+            desired_generation: selection.map_or(-1, |s| s.desired.generation as i64),
+            applied_stream_index: selection.map_or(-1, |s| s.applied.stream_index as i64),
+            applied_generation: selection.map_or(-1, |s| s.applied.generation as i64),
+            state: selection
+                .map(|selection| selection.display_state(player.is_at_eof()))
+                .map_or_else(|| "none".to_string(), |state| format!("{state:?}")),
+            engine_state: player.engine_state_name().to_string(),
+            audio_mode,
+            processed_frequency_hz: player.test_script_processed_frequency_hz().unwrap_or(-1.0),
+        }
+    }
+
+    pub(crate) fn absent() -> Self {
+        Self {
+            audio_tracks_len: 0,
+            desired_stream_index: -1,
+            desired_generation: -1,
+            applied_stream_index: -1,
+            applied_generation: -1,
+            state: "none".to_string(),
+            engine_state: "none".to_string(),
+            audio_mode: false,
+            processed_frequency_hz: -1.0,
+        }
+    }
+
+    fn to_rhai_map(&self) -> Map {
+        let mut map = Map::new();
+        map.insert("audio_tracks_len".into(), self.audio_tracks_len.into());
+        map.insert(
+            "desired_stream_index".into(),
+            self.desired_stream_index.into(),
+        );
+        map.insert("desired_generation".into(), self.desired_generation.into());
+        map.insert(
+            "applied_stream_index".into(),
+            self.applied_stream_index.into(),
+        );
+        map.insert("applied_generation".into(), self.applied_generation.into());
+        map.insert("state".into(), self.state.clone().into());
+        map.insert("engine_state".into(), self.engine_state.clone().into());
+        map.insert("audio_mode".into(), self.audio_mode.into());
+        map.insert(
+            "processed_frequency_hz".into(),
+            self.processed_frequency_hz.into(),
+        );
+        map
+    }
 }
 
 impl TestScriptWindowSnapshot {
@@ -281,6 +665,7 @@ impl TestScriptWindowSnapshot {
         );
         map.insert("host_ready".into(), self.identity.is_some().into());
         map.insert("residence".into(), self.residence.clone().into());
+        map.insert("presentation".into(), self.presentation.as_str().into());
         map.insert("media_kind".into(), self.media_kind.clone().into());
         map.insert(
             "page_index".into(),
@@ -293,7 +678,12 @@ impl TestScriptWindowSnapshot {
             saturating_rhai_int(self.items_generation).into(),
         );
         map.insert("item_identity".into(), self.item_identity.clone().into());
+        map.insert(
+            "selected_item_identity".into(),
+            self.selected_item_identity.clone().into(),
+        );
         map.insert("page_ready".into(), self.page_ready.into());
+        map.insert("edit_ready".into(), self.edit_ready.into());
         map.insert("viewport_rendered".into(), self.viewport_rendered.into());
         map.insert(
             "viewport_revision".into(),
@@ -322,6 +712,108 @@ impl TestScriptWindowSnapshot {
             "paint_revision".into(),
             saturating_rhai_int(self.paint_revision).into(),
         );
+        map.insert(
+            "paints".into(),
+            self.paints
+                .iter()
+                .map(|paint| {
+                    let mut item = Map::new();
+                    item.insert(
+                        "window_id".into(),
+                        optional_rhai_u64(paint.owner.window_id()),
+                    );
+                    item.insert(
+                        "context_serial".into(),
+                        saturating_rhai_int(paint.owner.context_serial()).into(),
+                    );
+                    item.insert(
+                        "item_identity".into(),
+                        paint.content.item_identity.clone().into(),
+                    );
+                    item.insert(
+                        "page_index".into(),
+                        saturating_rhai_int(paint.content.page_index as u64).into(),
+                    );
+                    item.insert(
+                        "items_generation".into(),
+                        saturating_rhai_int(paint.content.items_generation).into(),
+                    );
+                    item.insert("source".into(), paint.content.source_kind.as_str().into());
+                    item.insert(
+                        "final_composite_complete".into(),
+                        paint.content.final_composite_complete.into(),
+                    );
+                    item.insert(
+                        "source_texture".into(),
+                        format!("{:?}", paint.content.source_texture_id).into(),
+                    );
+                    item.insert("texture".into(), format!("{:?}", paint.texture).into());
+                    item.insert(
+                        "vertices".into(),
+                        Dynamic::from_array(
+                            paint
+                                .vertices
+                                .iter()
+                                .map(|(pos, uv)| {
+                                    Dynamic::from_array(
+                                        [
+                                            pos[0] as rhai::FLOAT,
+                                            pos[1] as rhai::FLOAT,
+                                            uv[0] as rhai::FLOAT,
+                                            uv[1] as rhai::FLOAT,
+                                        ]
+                                        .into_iter()
+                                        .map(Dynamic::from)
+                                        .collect(),
+                                    )
+                                })
+                                .collect(),
+                        ),
+                    );
+                    item.insert(
+                        "clip".into(),
+                        Dynamic::from_array(
+                            paint
+                                .clip
+                                .into_iter()
+                                .map(|x| Dynamic::from(x as rhai::FLOAT))
+                                .collect(),
+                        ),
+                    );
+                    item.insert(
+                        "viewport_size".into(),
+                        Dynamic::from_array(
+                            paint
+                                .viewport_size
+                                .into_iter()
+                                .map(|x| Dynamic::from(x as rhai::FLOAT))
+                                .collect(),
+                        ),
+                    );
+                    item.insert(
+                        "pixels_per_point".into(),
+                        (paint.pixels_per_point as rhai::FLOAT).into(),
+                    );
+                    item.insert("placement".into(), paint.placement.clone().into());
+                    item.insert(
+                        "revision".into(),
+                        saturating_rhai_int(paint.revision).into(),
+                    );
+                    Dynamic::from_map(item)
+                })
+                .collect::<rhai::Array>()
+                .into(),
+        );
+        map.insert("sidecar_imported".into(), self.sidecar_imported.into());
+        map.insert("sidecar_loaded".into(), self.sidecar_loaded.into());
+        map.insert(
+            "seek_strip".into(),
+            Dynamic::from_map(self.seek_strip.to_rhai_map()),
+        );
+        map.insert(
+            "audio_track".into(),
+            Dynamic::from_map(self.audio_track.to_rhai_map()),
+        );
         map
     }
 }
@@ -330,11 +822,248 @@ fn saturating_rhai_int(value: u64) -> rhai::INT {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
+fn optional_rhai_u64(value: Option<u64>) -> Dynamic {
+    value
+        .map(|value| Dynamic::from(saturating_rhai_int(value)))
+        .unwrap_or_else(|| Dynamic::from(-1_i64))
+}
+
+fn optional_rhai_usize(value: Option<usize>) -> Dynamic {
+    value
+        .map(|value| Dynamic::from(i64::try_from(value).unwrap_or(i64::MAX)))
+        .unwrap_or_else(|| Dynamic::from(-1_i64))
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TestScriptSortPopupRow {
+    pub(crate) label: String,
+    pub(crate) disabled: bool,
+    pub(crate) visible: bool,
+    pub(crate) visible_x: bool,
+    pub(crate) visible_y: bool,
+    pub(crate) geometry: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TestScriptCollectionSortPopup {
+    pub(crate) open: bool,
+    pub(crate) needs_scrolling: bool,
+    pub(crate) within_screen: bool,
+    pub(crate) sort_control_locked: bool,
+    pub(crate) popup_ui_enabled: bool,
+    pub(crate) viewport: String,
+    pub(crate) rows: Vec<TestScriptSortPopupRow>,
+    pub(crate) rendered_tooltip: Option<String>,
+}
+
+impl TestScriptCollectionSortPopup {
+    fn to_rhai_map(&self) -> Map {
+        let mut map = Map::new();
+        map.insert("open".into(), self.open.into());
+        map.insert("needs_scrolling".into(), self.needs_scrolling.into());
+        map.insert("within_screen".into(), self.within_screen.into());
+        map.insert(
+            "sort_control_locked".into(),
+            self.sort_control_locked.into(),
+        );
+        map.insert("popup_ui_enabled".into(), self.popup_ui_enabled.into());
+        map.insert("viewport".into(), self.viewport.clone().into());
+        map.insert(
+            "tooltip_open".into(),
+            self.rendered_tooltip.is_some().into(),
+        );
+        map.insert(
+            "tooltip_text".into(),
+            Dynamic::from(self.rendered_tooltip.clone().unwrap_or_default()),
+        );
+        map.insert(
+            "rows".into(),
+            self.rows
+                .iter()
+                .map(|row| {
+                    let mut value = Map::new();
+                    value.insert("label".into(), Dynamic::from(row.label.clone()));
+                    value.insert("disabled".into(), row.disabled.into());
+                    value.insert("visible".into(), row.visible.into());
+                    value.insert("visible_x".into(), row.visible_x.into());
+                    value.insert("visible_y".into(), row.visible_y.into());
+                    value.insert("geometry".into(), row.geometry.clone().into());
+                    Dynamic::from_map(value)
+                })
+                .collect::<rhai::Array>()
+                .into(),
+        );
+        map
+    }
+}
+
+#[derive(Default)]
+struct CollectionSortPopupFrame {
+    frame_nr: u64,
+    snapshot: TestScriptCollectionSortPopup,
+}
+
+thread_local! {
+    static COLLECTION_SORT_POPUP_FRAME: RefCell<CollectionSortPopupFrame> =
+        RefCell::new(CollectionSortPopupFrame::default());
+}
+
+pub(crate) fn begin_collection_sort_popup(
+    ctx: &egui::Context,
+    sort_control_locked: bool,
+    popup_ui_enabled: bool,
+) {
+    if ctx.viewport_id() != egui::ViewportId::ROOT {
+        return;
+    }
+    COLLECTION_SORT_POPUP_FRAME.with(|observed| {
+        let mut observed = observed.borrow_mut();
+        observed.frame_nr = ctx.cumulative_frame_nr();
+        observed.snapshot = TestScriptCollectionSortPopup {
+            open: true,
+            within_screen: true,
+            sort_control_locked,
+            popup_ui_enabled,
+            viewport: format!(
+                "{:?} ppp={:.2}",
+                ctx.viewport_rect(),
+                ctx.pixels_per_point()
+            ),
+            ..Default::default()
+        };
+    });
+}
+
+pub(crate) fn record_collection_sort_popup_row(
+    label: &str,
+    response: &egui::Response,
+    clip: egui::Rect,
+) {
+    let ctx = &response.ctx;
+    if ctx.viewport_id() != egui::ViewportId::ROOT {
+        return;
+    }
+    let row = response.rect;
+    let visible_x = row.left() >= clip.left() - 1.0 && row.right() <= clip.right() + 1.0;
+    let visible_y = row.top() >= clip.top() - 1.0 && row.bottom() <= clip.bottom() + 1.0;
+    let visible = visible_x && visible_y;
+    let screen = ctx.viewport_rect();
+    let within_screen = row.left() >= screen.left() - 1.0
+        && row.right() <= screen.right() + 1.0
+        && row.top() >= screen.top() - 1.0
+        && row.bottom() <= screen.bottom() + 1.0;
+    COLLECTION_SORT_POPUP_FRAME.with(|observed| {
+        let mut observed = observed.borrow_mut();
+        if observed.frame_nr != ctx.cumulative_frame_nr() || observed.snapshot.rows.len() >= 16 {
+            return;
+        }
+        observed.snapshot.needs_scrolling |= !visible_y;
+        observed.snapshot.within_screen &= within_screen;
+        observed.snapshot.rows.push(TestScriptSortPopupRow {
+            label: label.to_owned(),
+            disabled: !response.enabled(),
+            visible,
+            visible_x,
+            visible_y,
+            geometry: format!("row={row:?} clip={clip:?} viewport={screen:?}"),
+        });
+    });
+    register_sort_popup_pointer_row(label, response, clip);
+}
+
+/// Called only from the real disabled tooltip's content closure, after its
+/// text label was laid out inside the open popup.
+pub(crate) fn record_collection_sort_tooltip_rendered(
+    ui: &egui::Ui,
+    label: &egui::Response,
+    text: &str,
+) {
+    let ctx = ui.ctx();
+    if ctx.viewport_id() != egui::ViewportId::ROOT
+        || !ui.is_rect_visible(label.rect)
+        || !label.rect.intersects(ctx.viewport_rect())
+    {
+        return;
+    }
+    COLLECTION_SORT_POPUP_FRAME.with(|observed| {
+        let mut observed = observed.borrow_mut();
+        if observed.snapshot.open && observed.frame_nr == ctx.cumulative_frame_nr() {
+            observed.snapshot.rendered_tooltip = Some(text.to_owned());
+        }
+    });
+}
+
+pub(crate) fn collection_sort_popup_snapshot(ctx: &egui::Context) -> TestScriptCollectionSortPopup {
+    COLLECTION_SORT_POPUP_FRAME.with(|observed| {
+        let observed = observed.borrow();
+        if observed.snapshot.open
+            && observed.frame_nr.saturating_add(1) >= ctx.cumulative_frame_nr()
+        {
+            observed.snapshot.clone()
+        } else {
+            TestScriptCollectionSortPopup::default()
+        }
+    })
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ClipboardCaptureSmokeSnapshot {
+    pub(crate) monitor_ready: bool,
+    pub(crate) image_enabled: bool,
+    pub(crate) html_enabled: bool,
+    pub(crate) dialog_open: bool,
+    pub(crate) fetch_complete: bool,
+    pub(crate) selected_count: i64,
+    pub(crate) dialog_destination: String,
+    pub(crate) minimum_short_side_px: i64,
+    pub(crate) popup_visible: bool,
+    pub(crate) popup_shows: i64,
+    pub(crate) popup_requests: i64,
+    pub(crate) save_requests: i64,
+    pub(crate) open_count: i64,
+    pub(crate) automatic_sequence: i64,
+    pub(crate) paste_count: i64,
+}
+
+impl ClipboardCaptureSmokeSnapshot {
+    fn to_rhai_map(&self) -> Map {
+        let mut map = Map::new();
+        macro_rules! insert {
+            ($field:ident) => {
+                map.insert(stringify!($field).into(), self.$field.clone().into());
+            };
+        }
+        insert!(image_enabled);
+        insert!(monitor_ready);
+        insert!(html_enabled);
+        insert!(dialog_open);
+        insert!(fetch_complete);
+        insert!(selected_count);
+        insert!(dialog_destination);
+        insert!(minimum_short_side_px);
+        insert!(popup_visible);
+        insert!(popup_shows);
+        insert!(popup_requests);
+        insert!(save_requests);
+        insert!(open_count);
+        insert!(automatic_sequence);
+        insert!(paste_count);
+        map
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TestScriptSnapshot {
+    pub(crate) clipboard_capture: ClipboardCaptureSmokeSnapshot,
     pub(crate) is_fullscreen: bool,
+    pub(crate) always_on_top: bool,
+    pub(crate) window_visible: bool,
     pub(crate) fs_idx: i64,
     pub(crate) items_generation: i64,
+    pub(crate) folder_load_requests: i64,
+    pub(crate) pdf_warm_adoption_sequence: i64,
+    pub(crate) pdf_warm_adoption_path: String,
+    pub(crate) pdf_warm_adoption_phase: String,
     pub(crate) focused: bool,
     pub(crate) target_viewport: String,
     pub(crate) target_registered: bool,
@@ -344,11 +1073,44 @@ pub(crate) struct TestScriptSnapshot {
     /// `pending_thumbs == 0` だけでは「全部終わった」と「まだ何も始まっていない」を
     /// 区別できない。落ち着いたことを待つ条件には `items_len > 0` を併せて使う。
     pub(crate) items_len: i64,
+    /// Root UI pass that published this snapshot. A selection barrier must observe a later
+    /// pass because the snapshot is captured before grid input is applied in that pass.
+    pub(crate) snapshot_frame: i64,
+    /// Read-only acquisition state from the publishing pass, not a handler acknowledgement.
+    pub(crate) action_wait_diagnostic: String,
+    /// Raw index in `item_names`/the mounted grid, or -1 when nothing is selected.
+    pub(crate) selected_index: i64,
+    #[cfg(feature = "test-script")]
+    pub(crate) grid_observation: grid_observation::GridObservation,
+    pub(crate) item_names: Vec<String>,
+    pub(crate) item_ratings: Vec<i64>,
+    pub(crate) sort_order: String,
+    pub(crate) collection_runtime_phase: String,
+    pub(crate) collection_runtime_error: String,
+    pub(crate) collection_seeded_id_present: bool,
+    pub(crate) grid_surface: String,
+    pub(crate) current_folder_path: String,
+    pub(crate) startup_open_pending: bool,
+    pub(crate) collection_root_visible: bool,
+    pub(crate) collection_id: String,
+    pub(crate) collection_order_mode: String,
+    pub(crate) collection_standard_sort: String,
+    pub(crate) collection_revision: i64,
+    pub(crate) collection_sort_popup: TestScriptCollectionSortPopup,
+    pub(crate) rating_sort_unrated_position: String,
+    pub(crate) preferences_open: bool,
+    pub(crate) preferences_page: String,
+    pub(crate) preferences_draft_unrated_position: String,
+    pub(crate) smart_folder_busy: bool,
+    pub(crate) smart_folder_name: String,
+    pub(crate) smart_folder_root_visible: bool,
+    pub(crate) smart_folder_session_phase: String,
     pub(crate) pending_thumbs: i64,
     pub(crate) spread_mode: String,
     pub(crate) continuous_reading: bool,
     pub(crate) current_is_still_image: bool,
     pub(crate) music_view_active: bool,
+    pub(crate) music_audio_track_popup_open: bool,
     pub(crate) modal_open: bool,
     pub(crate) context_menu_open: bool,
     pub(crate) popup_open: bool,
@@ -370,24 +1132,114 @@ pub(crate) struct TestScriptSnapshot {
     pub(crate) passthrough_unavailable: String,
     pub(crate) keymap_level_observations: Vec<KeymapLevelObservation>,
     pub(crate) windows: Vec<TestScriptWindowSnapshot>,
+    pub(crate) audio_track: TestScriptAudioTrackSnapshot,
+    pub(crate) host_styles: Vec<TestScriptHostStyle>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TestScriptHostStyle {
+    pub(crate) role: String,
+    pub(crate) window_id: Option<u64>,
+    pub(crate) presentation: TestScriptWindowPresentation,
+    pub(crate) viewport: String,
+    pub(crate) viewport_id: Option<egui::ViewportId>,
+    pub(crate) hwnd: u64,
+    pub(crate) backend_token: Option<u64>,
+    pub(crate) topmost: bool,
+    pub(crate) noactivate: bool,
+    pub(crate) minimized: bool,
+    pub(crate) visible: bool,
+    pub(crate) owner_hwnd: u64,
+    pub(crate) foreground_hwnd: u64,
+}
+
+impl TestScriptHostStyle {
+    fn to_rhai_map(&self) -> Map {
+        let mut map = Map::new();
+        map.insert("role".into(), self.role.clone().into());
+        map.insert(
+            "window_id".into(),
+            self.window_id
+                .map(|id| Dynamic::from(saturating_rhai_int(id)))
+                .unwrap_or(Dynamic::UNIT),
+        );
+        map.insert("presentation".into(), self.presentation.as_str().into());
+        map.insert("viewport".into(), self.viewport.clone().into());
+        map.insert("hwnd".into(), format!("0x{:x}", self.hwnd).into());
+        map.insert(
+            "backend_token".into(),
+            self.backend_token
+                .map(|token| Dynamic::from(saturating_rhai_int(token)))
+                .unwrap_or(Dynamic::UNIT),
+        );
+        map.insert("topmost".into(), self.topmost.into());
+        map.insert("noactivate".into(), self.noactivate.into());
+        map.insert("minimized".into(), self.minimized.into());
+        map.insert("visible".into(), self.visible.into());
+        map.insert(
+            "owner_hwnd".into(),
+            format!("0x{:x}", self.owner_hwnd).into(),
+        );
+        map.insert(
+            "foreground_hwnd".into(),
+            format!("0x{:x}", self.foreground_hwnd).into(),
+        );
+        map
+    }
 }
 
 impl Default for TestScriptSnapshot {
     fn default() -> Self {
         Self {
+            clipboard_capture: ClipboardCaptureSmokeSnapshot::default(),
             is_fullscreen: false,
+            always_on_top: false,
+            window_visible: true,
             fs_idx: -1,
             items_generation: 0,
+            folder_load_requests: 0,
+            pdf_warm_adoption_sequence: 0,
+            pdf_warm_adoption_path: String::new(),
+            pdf_warm_adoption_phase: "None".into(),
             focused: false,
             target_viewport: "unregistered".to_string(),
             target_registered: false,
             target_rendered: false,
             items_len: 0,
+            snapshot_frame: 0,
+            action_wait_diagnostic: String::new(),
+            selected_index: -1,
+            #[cfg(feature = "test-script")]
+            grid_observation: grid_observation::GridObservation::default(),
+            item_names: Vec::new(),
+            item_ratings: Vec::new(),
+            sort_order: String::new(),
+            collection_runtime_phase: String::new(),
+            collection_runtime_error: String::new(),
+            collection_seeded_id_present: false,
+            grid_surface: String::new(),
+            current_folder_path: String::new(),
+            startup_open_pending: false,
+            collection_root_visible: false,
+            collection_id: String::new(),
+            collection_order_mode: String::new(),
+            collection_standard_sort: String::new(),
+            collection_revision: -1,
+            collection_sort_popup: TestScriptCollectionSortPopup::default(),
+            rating_sort_unrated_position: String::new(),
+            preferences_open: false,
+            preferences_page: String::new(),
+            preferences_draft_unrated_position: String::new(),
+            smart_folder_busy: false,
+            smart_folder_name: String::new(),
+            smart_folder_root_visible: false,
+            smart_folder_session_phase: String::new(),
             pending_thumbs: 0,
             spread_mode: "Single".to_string(),
             continuous_reading: false,
             current_is_still_image: false,
             music_view_active: false,
+            music_audio_track_popup_open: false,
             modal_open: false,
             context_menu_open: false,
             popup_open: false,
@@ -403,6 +1255,8 @@ impl Default for TestScriptSnapshot {
             passthrough_unavailable: String::new(),
             keymap_level_observations: Vec::new(),
             windows: Vec::new(),
+            audio_track: TestScriptAudioTrackSnapshot::absent(),
+            host_styles: Vec::new(),
         }
     }
 }
@@ -410,6 +1264,10 @@ impl Default for TestScriptSnapshot {
 impl TestScriptSnapshot {
     fn to_rhai_map(&self) -> Map {
         let mut map = Map::new();
+        map.insert(
+            "clipboard_capture".into(),
+            self.clipboard_capture.to_rhai_map().into(),
+        );
         macro_rules! insert {
             ($field:ident) => {
                 map.insert(
@@ -419,18 +1277,71 @@ impl TestScriptSnapshot {
             };
         }
         insert!(is_fullscreen);
+        insert!(always_on_top);
+        insert!(window_visible);
         insert!(fs_idx);
         insert!(items_generation);
+        insert!(folder_load_requests);
+        insert!(pdf_warm_adoption_sequence);
+        insert!(pdf_warm_adoption_path);
+        insert!(pdf_warm_adoption_phase);
         insert!(focused);
         insert!(target_viewport);
         insert!(target_registered);
         insert!(target_rendered);
         insert!(items_len);
+        insert!(snapshot_frame);
+        insert!(selected_index);
+        #[cfg(feature = "test-script")]
+        map.insert("grid".into(), self.grid_observation.to_rhai_map().into());
+        map.insert(
+            "item_names".into(),
+            self.item_names
+                .iter()
+                .cloned()
+                .map(Dynamic::from)
+                .collect::<rhai::Array>()
+                .into(),
+        );
+        map.insert(
+            "item_ratings".into(),
+            self.item_ratings
+                .iter()
+                .copied()
+                .map(Dynamic::from)
+                .collect::<rhai::Array>()
+                .into(),
+        );
+        insert!(sort_order);
+        insert!(collection_runtime_phase);
+        insert!(collection_runtime_error);
+        insert!(collection_seeded_id_present);
+        insert!(grid_surface);
+        insert!(current_folder_path);
+        insert!(startup_open_pending);
+        insert!(collection_root_visible);
+        insert!(collection_id);
+        insert!(collection_order_mode);
+        insert!(collection_standard_sort);
+        insert!(collection_revision);
+        map.insert(
+            "collection_sort_popup".into(),
+            Dynamic::from_map(self.collection_sort_popup.to_rhai_map()),
+        );
+        insert!(rating_sort_unrated_position);
+        insert!(preferences_open);
+        insert!(preferences_page);
+        insert!(preferences_draft_unrated_position);
+        insert!(smart_folder_busy);
+        insert!(smart_folder_name);
+        insert!(smart_folder_root_visible);
+        insert!(smart_folder_session_phase);
         insert!(pending_thumbs);
         insert!(spread_mode);
         insert!(continuous_reading);
         insert!(current_is_still_image);
         insert!(music_view_active);
+        insert!(music_audio_track_popup_open);
         insert!(modal_open);
         insert!(context_menu_open);
         insert!(popup_open);
@@ -443,6 +1354,14 @@ impl TestScriptSnapshot {
         insert!(has_next_page);
         insert!(reading_flow);
         insert!(upload_deferral_streak);
+        map.insert(
+            "host_styles".into(),
+            self.host_styles
+                .iter()
+                .map(|style| Dynamic::from_map(style.to_rhai_map()))
+                .collect::<rhai::Array>()
+                .into(),
+        );
         insert!(passthrough_unavailable);
         map.insert(
             "windows".into(),
@@ -451,6 +1370,10 @@ impl TestScriptSnapshot {
                 .map(|window| Dynamic::from_map(window.to_rhai_map()))
                 .collect::<rhai::Array>()
                 .into(),
+        );
+        map.insert(
+            "audio_track".into(),
+            Dynamic::from_map(self.audio_track.to_rhai_map()),
         );
         map
     }
@@ -536,15 +1459,487 @@ enum UiCommand {
     RunAction {
         action: KeyAction,
         selection: TestScriptActionSelection,
-        applied: mpsc::SyncSender<Result<(), String>>,
+        request: Arc<ActionRequest>,
+    },
+    SmokeAction(UiSmokeAction),
+    ClickWidget {
+        label: String,
+        kind: WidgetClickKind,
+        reply: mpsc::SyncSender<Result<(), String>>,
+    },
+    SortPopupPointer {
+        label: String,
+        kind: SortPopupPointerKind,
+        reply: mpsc::SyncSender<Result<(), String>>,
+    },
+    DetailsPreviewPointer {
+        reply: mpsc::SyncSender<Result<(egui::Pos2, f32), String>>,
     },
     ValidateSelectedOwner {
         expected_identity: TestScriptWindowIdentity,
         reply: mpsc::SyncSender<Result<(), String>>,
     },
+    Capture {
+        label: String,
+        scope: CaptureScope,
+        selection: TestScriptActionSelection,
+        reply: mpsc::SyncSender<Result<(), String>>,
+    },
     Log(String),
     Precondition(PreconditionTrace),
     Finished(ScriptOutcome),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureScope {
+    Selected,
+    All,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UiSmokeAction {
+    ClipboardMonitorsOn,
+    ClipboardMonitorsOff,
+    OpenThumbnailPreferences,
+    OpenFirstSmartFolder,
+    OpenSeededCollection,
+    OpenRatingOne,
+    AlwaysOnTopOn,
+    AlwaysOnTopOff,
+    MinimizeRoot,
+    RestoreRoot,
+    HideToTray,
+    RestoreFromTray,
+    CloseFullscreen,
+    ToggleDetachedMode,
+    EnableIndependentWindows,
+}
+
+pub(crate) const SEEDED_COLLECTION_SMOKE_ID: &str = "80f58851-997b-4b80-90bc-f50bb1d2523e";
+
+pub(crate) fn seeded_collection_smoke_id() -> crate::collection_store::CollectionId {
+    crate::collection_store::CollectionId::from_uuid(
+        uuid::Uuid::parse_str(SEEDED_COLLECTION_SMOKE_ID).expect("fixed smoke Collection ID"),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum WidgetClickPhase {
+    Down,
+    Up,
+    DoubleDown,
+    DoubleUp,
+    Hover,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WidgetClickKind {
+    Single,
+    Double,
+    Hover,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SortPopupPointerKind {
+    Hover,
+    Click,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WidgetPointerRequestKind {
+    ClickEnabled(WidgetClickKind),
+    SortPopup(SortPopupPointerKind),
+}
+
+struct WidgetPointerRequest {
+    label: String,
+    kind: WidgetPointerRequestKind,
+    reply: mpsc::SyncSender<Result<(), String>>,
+}
+
+struct WidgetClick {
+    point: egui::Pos2,
+    phase: WidgetClickPhase,
+}
+
+#[derive(Default)]
+struct WidgetClickDriver {
+    requested: Option<WidgetPointerRequest>,
+    active: Option<WidgetClick>,
+    details_preview_move: Option<mpsc::SyncSender<Result<(egui::Pos2, f32), String>>>,
+}
+
+thread_local! {
+    static WIDGET_CLICK_DRIVER: RefCell<WidgetClickDriver> =
+        RefCell::new(WidgetClickDriver::default());
+}
+
+#[cfg(test)]
+fn request_widget_click(
+    label: String,
+    reply: mpsc::SyncSender<Result<(), String>>,
+) -> Result<(), String> {
+    request_widget_pointer(
+        label,
+        WidgetPointerRequestKind::ClickEnabled(WidgetClickKind::Single),
+        reply,
+    )
+}
+
+/// Generation-scoped pointer targets resolve only against the currently adopted list.
+/// Key targets keep the snapshot bounded and do not assume row ordering or selection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum GridRowPointerTarget {
+    IndexName {
+        generation: u64,
+        index: usize,
+        name: String,
+    },
+    ContainerKey {
+        generation: u64,
+        key: std::path::PathBuf,
+    },
+}
+
+impl GridRowPointerTarget {
+    fn parse(label: &str) -> Option<Self> {
+        if let Some(label) = label.strip_prefix("grid-key:") {
+            let (generation, key) = label.split_once(':')?;
+            if key.is_empty() {
+                return None;
+            }
+            return Some(Self::ContainerKey {
+                generation: generation.parse().ok()?,
+                key: key.into(),
+            });
+        }
+        let mut parts = label.strip_prefix("grid-row:")?.splitn(3, ':');
+        Some(Self::IndexName {
+            generation: parts.next()?.parse().ok()?,
+            index: parts.next()?.parse().ok()?,
+            name: parts.next()?.to_owned(),
+        })
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        generation: u64,
+        items: &[crate::grid_item::GridItem],
+    ) -> Option<usize> {
+        match self {
+            Self::IndexName {
+                generation: owner,
+                index,
+                name,
+            } => (*owner == generation
+                && items.get(*index).is_some_and(|item| item.name() == *name))
+            .then_some(*index),
+            Self::ContainerKey {
+                generation: owner,
+                key,
+            } if *owner == generation => {
+                let mut matches = items.iter().enumerate().filter(|(_, item)| {
+                    item.container_path()
+                        .is_some_and(|path| crate::folder_tree::path_eq(path, key))
+                });
+                let index = matches.next()?.0;
+                matches.next().is_none().then_some(index)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Only a current ROOT request can reveal its target. This never selects or opens an item.
+pub(crate) fn requested_grid_row(ctx: &egui::Context) -> Option<GridRowPointerTarget> {
+    if ctx.viewport_id() != egui::ViewportId::ROOT {
+        return None;
+    }
+    WIDGET_CLICK_DRIVER.with(|driver| {
+        let driver = driver.borrow();
+        let request = driver.requested.as_ref()?;
+        if !matches!(request.kind, WidgetPointerRequestKind::ClickEnabled(_)) {
+            return None;
+        }
+        GridRowPointerTarget::parse(&request.label)
+    })
+}
+
+/// The normal snapshot deliberately contains only a bounded prefix, even for large lists.
+pub(crate) fn item_names_for_snapshot(items: &[crate::grid_item::GridItem]) -> Vec<String> {
+    items
+        .iter()
+        .take(MAX_ITEM_ROWS_IN_SNAPSHOT)
+        .map(|item| item.name().into_owned())
+        .collect()
+}
+
+fn request_widget_pointer(
+    label: String,
+    kind: WidgetPointerRequestKind,
+    reply: mpsc::SyncSender<Result<(), String>>,
+) -> Result<(), String> {
+    WIDGET_CLICK_DRIVER.with(|driver| {
+        let mut driver = driver.borrow_mut();
+        if driver.requested.is_some() || driver.active.is_some() {
+            return Err("another widget click is still in progress".to_string());
+        }
+        driver.requested = Some(WidgetPointerRequest { label, kind, reply });
+        Ok(())
+    })
+}
+
+/// Register the actual interactive rectangle; a pending click scrolls its widget into view.
+/// The button/radio handler still sees an ordinary egui pointer press and release.
+pub(crate) fn register_clickable_widget(label: &str, response: &egui::Response) {
+    WIDGET_CLICK_DRIVER.with(|driver| {
+        let mut driver = driver.borrow_mut();
+        if !driver.requested.as_ref().is_some_and(|request| {
+            request.label == label
+                && matches!(request.kind, WidgetPointerRequestKind::ClickEnabled(_))
+        }) {
+            return;
+        }
+        if !response.interact_rect.contains(response.rect.center()) {
+            response.scroll_to_me(Some(egui::Align::Center));
+            return;
+        }
+        if !response.enabled() {
+            return;
+        }
+        let point = response.rect.center();
+        let request = driver.requested.take().expect("matching request exists");
+        let phase = match request.kind {
+            WidgetPointerRequestKind::ClickEnabled(WidgetClickKind::Single) => {
+                WidgetClickPhase::Down
+            }
+            WidgetPointerRequestKind::ClickEnabled(WidgetClickKind::Double) => {
+                WidgetClickPhase::DoubleDown
+            }
+            WidgetPointerRequestKind::ClickEnabled(WidgetClickKind::Hover) => {
+                WidgetClickPhase::Hover
+            }
+            _ => unreachable!("matched enabled widget pointer request"),
+        };
+        if request.reply.send(Ok(())).is_ok() {
+            driver.active = Some(WidgetClick { point, phase });
+        }
+    });
+}
+
+/// Sort rows may be disabled. This diagnostic pointer path still sends ordinary
+/// egui pointer events, leaving the production response to reject the click.
+fn register_sort_popup_pointer_row(label: &str, response: &egui::Response, clip: egui::Rect) {
+    WIDGET_CLICK_DRIVER.with(|driver| {
+        let mut driver = driver.borrow_mut();
+        let Some(request) = driver.requested.as_ref() else {
+            return;
+        };
+        if request.label != label {
+            return;
+        }
+        let WidgetPointerRequestKind::SortPopup(kind) = request.kind else {
+            return;
+        };
+        let point = response.rect.center();
+        if !clip.contains(point) {
+            return;
+        }
+        let request = driver.requested.take().expect("matching request exists");
+        if request.reply.send(Ok(())).is_ok() {
+            driver.active = Some(WidgetClick {
+                point,
+                phase: match kind {
+                    SortPopupPointerKind::Hover => WidgetClickPhase::Hover,
+                    SortPopupPointerKind::Click => WidgetClickPhase::Down,
+                },
+            });
+        }
+    });
+}
+
+/// Publish the actual visible preview cell, so the worker can move the OS pointer to it.
+/// No synthetic egui event is injected for this path.
+pub(crate) fn register_details_preview_pointer(response: &egui::Response, clip: egui::Rect) {
+    WIDGET_CLICK_DRIVER.with(|driver| {
+        let mut driver = driver.borrow_mut();
+        let Some(reply) = driver.details_preview_move.as_ref() else {
+            return;
+        };
+        let point = response.rect.center();
+        if !response.interact_rect.contains(point) || !clip.contains(point) {
+            return;
+        }
+        let _ = reply.send(Ok((point, response.ctx.pixels_per_point())));
+        driver.details_preview_move = None;
+    });
+}
+
+/// Called by the synthetic-input plugin before egui processes the root pass.
+pub(crate) fn append_widget_click_events(input: &mut egui::RawInput) {
+    if input.viewport_id != egui::ViewportId::ROOT
+        || input.events.iter().any(|event| {
+            matches!(
+                event,
+                egui::Event::PointerMoved(_)
+                    | egui::Event::PointerButton { .. }
+                    | egui::Event::PointerGone
+            )
+        })
+    {
+        return;
+    }
+    WIDGET_CLICK_DRIVER.with(|driver| {
+        let mut driver = driver.borrow_mut();
+        let Some(click) = driver.active.as_mut() else {
+            return;
+        };
+        let point = click.point;
+        let pressed = matches!(
+            click.phase,
+            WidgetClickPhase::Down | WidgetClickPhase::DoubleDown
+        );
+        input.events.push(egui::Event::PointerMoved(point));
+        if !matches!(click.phase, WidgetClickPhase::Hover) {
+            input.events.push(egui::Event::PointerButton {
+                pos: point,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        match click.phase {
+            WidgetClickPhase::Down => click.phase = WidgetClickPhase::Up,
+            WidgetClickPhase::DoubleDown => click.phase = WidgetClickPhase::DoubleUp,
+            WidgetClickPhase::DoubleUp => click.phase = WidgetClickPhase::Down,
+            WidgetClickPhase::Up | WidgetClickPhase::Hover => driver.active = None,
+        }
+    });
+}
+
+fn widget_click_in_progress() -> bool {
+    WIDGET_CLICK_DRIVER.with(|driver| {
+        let driver = driver.borrow();
+        driver.requested.is_some() || driver.active.is_some()
+    })
+}
+
+/// Move the real Windows pointer through SendInput to a rect reported by the Details widget.
+/// The runner worker performs the OS call; the UI thread only publishes geometry.
+#[cfg(all(any(feature = "test-script", test), windows))]
+fn send_real_pointer_move(hwnd_raw: u64, point: egui::Pos2, ppp: f32) -> Result<(), String> {
+    use windows::Win32::Foundation::{HWND, POINT, RECT};
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
+    use windows::Win32::UI::HiDpi::{
+        DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        SetThreadDpiAwarenessContext,
+    };
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE,
+        MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT, SendInput,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClientRect, GetSystemMetrics, IsWindowVisible, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+        SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    };
+
+    struct DpiGuard(DPI_AWARENESS_CONTEXT);
+    impl Drop for DpiGuard {
+        fn drop(&mut self) {
+            unsafe { SetThreadDpiAwarenessContext(self.0) };
+        }
+    }
+    if !point.x.is_finite() || !point.y.is_finite() || !ppp.is_finite() || ppp <= 0.0 {
+        return Err("Details preview pointer geometry is invalid".into());
+    }
+    let previous =
+        unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    if previous.0.is_null() {
+        return Err("SetThreadDpiAwarenessContext failed for Details pointer move".into());
+    }
+    let _dpi = DpiGuard(previous);
+    let hwnd = HWND(hwnd_raw as usize as *mut _);
+    if !unsafe { IsWindowVisible(hwnd).as_bool() } {
+        return Err("root host is hidden before Details pointer move".into());
+    }
+    let mut client = RECT::default();
+    unsafe { GetClientRect(hwnd, &mut client) }
+        .map_err(|error| format!("GetClientRect failed for Details pointer move: {error}"))?;
+    let mut target = POINT {
+        x: (point.x * ppp).round() as i32,
+        y: (point.y * ppp).round() as i32,
+    };
+    if target.x < client.left
+        || target.x >= client.right
+        || target.y < client.top
+        || target.y >= client.bottom
+    {
+        return Err("Details preview cell is outside the root client area".into());
+    }
+    if !unsafe { ClientToScreen(hwnd, &mut target).as_bool() } {
+        return Err("ClientToScreen failed for Details pointer move".into());
+    }
+    let left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+    let top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+    let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+    let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+    if width <= 1
+        || height <= 1
+        || target.x < left
+        || target.x >= left + width
+        || target.y < top
+        || target.y >= top + height
+    {
+        return Err("Details preview cell is outside the virtual desktop".into());
+    }
+    let scaled = |value: i32, origin: i32, extent: i32| -> i32 {
+        let numerator = i64::from(value - origin) * 65_535;
+        ((numerator + i64::from(extent - 1) / 2) / i64::from(extent - 1)) as i32
+    };
+    let input = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: scaled(target.x, left, width),
+                dy: scaled(target.y, top, height),
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    let inserted = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+    if inserted != 1 {
+        return Err(format!(
+            "SendInput inserted {inserted} of 1 Details pointer events"
+        ));
+    }
+    crate::logger::log(format!(
+        "[test-script] Details preview real pointer moved to screen=({}, {}) root=0x{hwnd_raw:x}",
+        target.x, target.y
+    ));
+    Ok(())
+}
+
+#[cfg(all(any(feature = "test-script", test), not(windows)))]
+fn send_real_pointer_move(_hwnd_raw: u64, _point: egui::Pos2, _ppp: f32) -> Result<(), String> {
+    Err("Details preview real pointer move requires Windows".into())
+}
+
+pub(crate) fn take_smoke_action(action: UiSmokeAction) -> bool {
+    let Ok(mut guard) = runtime().lock() else {
+        return false;
+    };
+    let Some(runtime) = guard.as_mut() else {
+        return false;
+    };
+    if runtime.smoke_actions.front() == Some(&action) {
+        runtime.smoke_actions.pop_front();
+        true
+    } else {
+        false
+    }
 }
 
 #[derive(Default)]
@@ -638,6 +2033,93 @@ impl RunnerBridge {
             .map_err(|_| "test-script snapshot is poisoned".to_string())
     }
 
+    fn wait_diagnostic(&self, selection: &TestScriptActionSelection) -> String {
+        let owner = match selection {
+            TestScriptActionSelection::LegacyImplicit => "legacy_implicit".to_string(),
+            TestScriptActionSelection::Targeted(owner) => owner.describe(),
+        };
+        // A timeout diagnostic must not wait on a UI snapshot writer.
+        match self.snapshot.try_read() {
+            Ok(s) => format!(
+                "owner={owner} snapshot_frame={} fullscreen={} fs_idx={} target_registered={} focused={} modal={} ime={} text={} popup={} acquisition=[{}]",
+                s.snapshot_frame,
+                s.is_fullscreen,
+                s.fs_idx,
+                s.target_registered,
+                s.focused,
+                s.modal_open,
+                s.ime_active,
+                s.text_input_or_pending_focus,
+                s.popup_open,
+                s.action_wait_diagnostic,
+            ),
+            Err(error) => format!("owner={owner} snapshot_unavailable={error}"),
+        }
+    }
+
+    fn run_action(&self, action: KeyAction, timeout: Duration) -> Result<(), String> {
+        if timeout.is_zero() {
+            return Err("run_action timeout_ms must be greater than zero".into());
+        }
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or("run_action timeout is too large")?;
+        let selection = self.action_selection()?;
+        let (applied, acknowledgement) = mpsc::sync_channel(1);
+        let request = ActionRequest::new(deadline, applied);
+        self.send(UiCommand::RunAction {
+            action,
+            selection: selection.clone(),
+            request: Arc::clone(&request),
+        })?;
+        self.await_action(&request, &acknowledgement, timeout, || {
+            format!(
+                "action={} {}",
+                action.ini_name(),
+                self.wait_diagnostic(&selection)
+            )
+        })
+    }
+
+    fn await_action(
+        &self,
+        request: &ActionRequest,
+        acknowledgement: &mpsc::Receiver<Result<(), String>>,
+        timeout: Duration,
+        diagnostic: impl FnOnce() -> String,
+    ) -> Result<(), String> {
+        loop {
+            self.interrupt.check()?;
+            // The request owns the decision. Expiry is committed before any
+            // diagnostic collection; an ACK is only a wake, never delivery proof.
+            match request.outcome() {
+                Some(Ok(at)) if at < request.deadline => return Ok(()),
+                Some(Ok(_)) => return Err("run_action has an invalid delivery timestamp".into()),
+                Some(Err(ActionRejection::Handler(message))) => return Err(message),
+                Some(Err(ActionRejection::Deadline)) => {
+                    let message = format!(
+                        "run_action timed out after {} ms awaiting consumer acknowledgement: {}",
+                        timeout.as_millis(),
+                        diagnostic(),
+                    );
+                    self.interrupt.fail(message.clone());
+                    return Err(message);
+                }
+                None => {}
+            }
+            let remaining = request.deadline.saturating_duration_since(Instant::now());
+            match acknowledgement.recv_timeout(remaining.min(WAIT_POLL_INTERVAL)) {
+                Ok(_) => {} // Re-check the shared outcome, including after a late ACK.
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    if request.outcome().is_none() {
+                        return Err("run_action apply acknowledgement disconnected".into());
+                    }
+                }
+            }
+        }
+    }
+
     fn require_key_target(&self) -> Result<(), String> {
         let snapshot = self.latest_snapshot()?;
         let satisfied = snapshot.target_registered && snapshot.focused;
@@ -675,6 +2157,34 @@ impl RunnerBridge {
             .map_err(|_| "test-script action selection is poisoned".to_string())
     }
 
+    fn capture(&self, label: &str, scope: CaptureScope) -> Result<(), String> {
+        let selection = self.action_selection()?;
+        let (reply, received) = mpsc::sync_channel(1);
+        self.send(UiCommand::Capture {
+            label: label.to_owned(),
+            scope,
+            selection,
+            reply,
+        })?;
+        let deadline = Instant::now() + capture::EXPLICIT_TIMEOUT + Duration::from_secs(1);
+        loop {
+            self.interrupt.check()?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(format!(
+                    "capture '{label}' timed out waiting for screenshot evidence"
+                ));
+            }
+            match received.recv_timeout(remaining.min(Duration::from_millis(100))) {
+                Ok(result) => return result,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("capture response channel disconnected".into());
+                }
+            }
+        }
+    }
+
     fn select_root(&self) -> Result<Map, String> {
         let snapshot = self.latest_snapshot()?;
         let window = snapshot
@@ -683,6 +2193,49 @@ impl RunnerBridge {
             .find(|window| window.role == "root")
             .ok_or_else(|| "select_root could not find the root window".to_string())?;
         self.select_window_snapshot(window)
+    }
+
+    #[cfg(any(feature = "test-script", test))]
+    fn move_details_preview_pointer(&self, timeout: Duration) -> Result<(), String> {
+        if timeout.is_zero() {
+            return Err("move_details_preview_pointer timeout_ms must be greater than zero".into());
+        }
+        let root = self
+            .latest_snapshot()?
+            .windows
+            .into_iter()
+            .find(|window| window.role == "root")
+            .and_then(|window| window.identity)
+            .ok_or("move_details_preview_pointer has no live root host")?;
+        let (reply, received) = mpsc::sync_channel(1);
+        self.send(UiCommand::DetailsPreviewPointer { reply })?;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or("move_details_preview_pointer timeout is too large")?;
+        let (point, pixels_per_point) = loop {
+            self.interrupt.check()?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("timed out waiting for a visible Details preview cell".into());
+            }
+            match received.recv_timeout(remaining.min(WAIT_POLL_INTERVAL)) {
+                Ok(result) => break result?,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("Details preview geometry channel disconnected".into());
+                }
+            }
+        };
+        if !eframe::miv_test_script_window_witness::is_current(
+            egui::ViewportId::ROOT,
+            root.hwnd(),
+            root.backend_token(),
+        )
+        .map_err(str::to_owned)?
+        {
+            return Err("root host changed before Details pointer move".into());
+        }
+        send_real_pointer_move(root.hwnd(), point, pixels_per_point)
     }
 
     fn select_window(&self, window_id: u64, context_serial: u64) -> Result<Map, String> {
@@ -887,6 +2440,151 @@ impl RunnerBridge {
         )?;
         Ok(native_mouse_receipt_to_rhai_map(receipt))
     }
+
+    #[cfg(feature = "test-script")]
+    fn reveal_native_top_panorama_receipts(
+        &self,
+        timeout: Duration,
+    ) -> Result<
+        (
+            crate::video::native_ui_smoke::NativeUiSmokeMoveReceipt,
+            crate::video::native_ui_smoke::NativeUiSmokeNamedControlReceipt,
+        ),
+        String,
+    > {
+        if timeout.is_zero() {
+            return Err(
+                "reveal_native_top_panorama timeout_ms must be greater than zero".to_string(),
+            );
+        }
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| "reveal_native_top_panorama timeout is too large".to_string())?;
+        let identity = self.selected_detached_identity()?;
+        let owner_hwnd = identity.hwnd();
+        let prepared = crate::video::native_ui_smoke::prepare_real_mouse_in_top_hover_activation(
+            owner_hwnd,
+            deadline,
+            || self.validate_selected_owner_fresh(&identity, deadline),
+        )?;
+        let move_receipt = crate::video::native_ui_smoke::send_prepared_real_mouse_move(
+            prepared,
+            deadline,
+            || self.validate_selected_owner_fresh(&identity, deadline),
+        )?;
+        let target_receipt =
+            crate::video::native_ui_smoke::wait_for_native_top_panorama_after_move(
+                &move_receipt,
+                deadline,
+                || self.validate_selected_owner_fresh(&identity, deadline),
+            )?;
+        Ok((move_receipt, target_receipt))
+    }
+
+    #[cfg(feature = "test-script")]
+    fn reveal_native_top_panorama(&self, timeout: Duration) -> Result<Map, String> {
+        let (move_receipt, target_receipt) = self.reveal_native_top_panorama_receipts(timeout)?;
+        let mut result = Map::new();
+        result.insert(
+            "mouse".into(),
+            Dynamic::from(native_mouse_receipt_to_rhai_map(move_receipt)),
+        );
+        result.insert(
+            "target".into(),
+            Dynamic::from(native_named_control_receipt_to_rhai_map(target_receipt)),
+        );
+        Ok(result)
+    }
+
+    #[cfg(feature = "test-script")]
+    fn click_native_top_panorama(&self, timeout: Duration) -> Result<Map, String> {
+        if timeout.is_zero() {
+            return Err(
+                "click_native_top_panorama timeout_ms must be greater than zero".to_string(),
+            );
+        }
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| "click_native_top_panorama timeout is too large".to_string())?;
+        let identity = self.selected_detached_identity()?;
+        let host_incarnation = identity
+            .host_incarnation()
+            .ok_or_else(|| "native button target has no detached host incarnation".to_string())?;
+        let backend_token = identity.backend_token();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let (move_receipt, target_receipt) = self.reveal_native_top_panorama_receipts(remaining)?;
+        self.validate_selected_owner_fresh(&identity, deadline)?;
+        let prepared = crate::video::native_ui_smoke::prepare_native_top_panorama_click(
+            &target_receipt,
+            host_incarnation,
+            backend_token,
+            deadline,
+            || self.validate_selected_owner_fresh(&identity, deadline),
+        )?;
+        let click_receipt = crate::video::native_ui_smoke::click_prepared_native_top_panorama(
+            prepared,
+            deadline,
+            || self.validate_selected_owner_fresh(&identity, deadline),
+        )?;
+        let mut result = Map::new();
+        result.insert(
+            "mouse".into(),
+            Dynamic::from(native_mouse_receipt_to_rhai_map(move_receipt)),
+        );
+        result.insert(
+            "target".into(),
+            Dynamic::from(native_named_control_receipt_to_rhai_map(target_receipt)),
+        );
+        result.insert(
+            "click".into(),
+            Dynamic::from(native_top_panorama_click_receipt_to_rhai_map(click_receipt)),
+        );
+        Ok(result)
+    }
+
+    #[cfg(feature = "test-script")]
+    fn click_native_audio_control(&self, name: &str, timeout: Duration) -> Result<Map, String> {
+        use crate::video::native_ui_smoke::NativeUiSmokeAudioControl;
+        if timeout.is_zero() {
+            return Err("click_native_audio_control timeout_ms must be greater than zero".into());
+        }
+        let control = if name == "native_audio_button" {
+            NativeUiSmokeAudioControl::Button
+        } else if let Some(ordinal) = name.strip_prefix("native_audio_row_") {
+            let ordinal = ordinal
+                .parse::<usize>()
+                .map_err(|_| format!("invalid native audio row name: {name}"))?;
+            if ordinal == 0 {
+                return Err("native audio row numbers start at 1".into());
+            }
+            NativeUiSmokeAudioControl::Row(ordinal - 1)
+        } else {
+            return Err(format!("unknown native audio control: {name}"));
+        };
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| "click_native_audio_control timeout is too large".to_string())?;
+        let identity = self.selected_detached_identity()?;
+        if matches!(control, NativeUiSmokeAudioControl::Button) {
+            self.move_native_canvas(
+                [0.5, 0.95],
+                deadline.saturating_duration_since(Instant::now()),
+            )?;
+        }
+        let (token, client_x, client_y) =
+            crate::video::native_ui_smoke::click_native_audio_control(
+                identity.hwnd(),
+                control,
+                deadline,
+                || self.validate_selected_owner_fresh(&identity, deadline),
+            )?;
+        let mut map = Map::new();
+        map.insert("name".into(), name.into());
+        map.insert("token".into(), saturating_rhai_int(token).into());
+        map.insert("client_x".into(), i64::from(client_x).into());
+        map.insert("client_y".into(), i64::from(client_y).into());
+        Ok(map)
+    }
 }
 
 #[cfg(feature = "test-script")]
@@ -932,6 +2630,152 @@ fn native_mouse_receipt_to_rhai_map(
     map.insert(
         "actual_client_y".into(),
         rhai::INT::from(receipt.actual_client_y).into(),
+    );
+    map
+}
+
+#[cfg(feature = "test-script")]
+fn native_named_control_receipt_to_rhai_map(
+    receipt: crate::video::native_ui_smoke::NativeUiSmokeNamedControlReceipt,
+) -> Map {
+    let mut map = Map::new();
+    map.insert("name".into(), Dynamic::from("native_top_panorama"));
+    map.insert("token".into(), saturating_rhai_int(receipt.token).into());
+    map.insert(
+        "owner_hwnd".into(),
+        Dynamic::from(format!("0x{:x}", receipt.owner_hwnd)),
+    );
+    map.insert(
+        "presenter_hwnd".into(),
+        Dynamic::from(format!("0x{:x}", receipt.presenter_hwnd)),
+    );
+    map.insert(
+        "source_epoch".into(),
+        saturating_rhai_int(receipt.source_epoch).into(),
+    );
+    map.insert(
+        "generation".into(),
+        saturating_rhai_int(receipt.generation).into(),
+    );
+    map.insert("client_x".into(), rhai::INT::from(receipt.client_x).into());
+    map.insert("client_y".into(), rhai::INT::from(receipt.client_y).into());
+    map.insert(
+        "pixels_per_point".into(),
+        rhai::FLOAT::from(receipt.pixels_per_point).into(),
+    );
+    for (prefix, rect) in [
+        ("rect", receipt.rect),
+        ("interact_rect", receipt.interact_rect),
+        ("clip_rect", receipt.clip_rect),
+    ] {
+        map.insert(
+            format!("{prefix}_min_x").into(),
+            rhai::FLOAT::from(rect.min.x).into(),
+        );
+        map.insert(
+            format!("{prefix}_min_y").into(),
+            rhai::FLOAT::from(rect.min.y).into(),
+        );
+        map.insert(
+            format!("{prefix}_max_x").into(),
+            rhai::FLOAT::from(rect.max.x).into(),
+        );
+        map.insert(
+            format!("{prefix}_max_y").into(),
+            rhai::FLOAT::from(rect.max.y).into(),
+        );
+    }
+    map.insert(
+        "layer_id".into(),
+        Dynamic::from(format!("{:?}", receipt.layer_id)),
+    );
+    map.insert("senses_click".into(), receipt.senses_click.into());
+    map.insert("enabled".into(), receipt.enabled.into());
+    map.insert(
+        "panorama_pose_present".into(),
+        receipt.panorama_pose_present.into(),
+    );
+    map.insert(
+        "video_zoom_present".into(),
+        receipt.video_zoom_present.into(),
+    );
+    let classification = match receipt.classification {
+        crate::video::native_ui_smoke::NativeUiSmokePanoramaClassification::Unknown => "unknown",
+        crate::video::native_ui_smoke::NativeUiSmokePanoramaClassification::Panorama => "panorama",
+        crate::video::native_ui_smoke::NativeUiSmokePanoramaClassification::NonPanorama => {
+            "non_panorama"
+        }
+    };
+    map.insert("classification".into(), Dynamic::from(classification));
+    map
+}
+
+#[cfg(feature = "test-script")]
+fn native_button_delivery_to_rhai_map(
+    delivery: crate::video::native_ui_smoke::NativeUiSmokeButtonDelivery,
+) -> Map {
+    let mut map = Map::new();
+    map.insert("token".into(), saturating_rhai_int(delivery.token).into());
+    map.insert(
+        "receiver_hwnd".into(),
+        Dynamic::from(format!("0x{:x}", delivery.receiver_hwnd)),
+    );
+    map.insert(
+        "receiver_process_id".into(),
+        saturating_rhai_int(u64::from(delivery.receiver_process_id)).into(),
+    );
+    map.insert(
+        "receiver_thread_id".into(),
+        saturating_rhai_int(u64::from(delivery.receiver_thread_id)).into(),
+    );
+    map.insert(
+        "actual_client_x".into(),
+        rhai::INT::from(delivery.actual_client_x).into(),
+    );
+    map.insert(
+        "actual_client_y".into(),
+        rhai::INT::from(delivery.actual_client_y).into(),
+    );
+    map.insert(
+        "actual_screen_x".into(),
+        rhai::INT::from(delivery.actual_screen_x).into(),
+    );
+    map.insert(
+        "actual_screen_y".into(),
+        rhai::INT::from(delivery.actual_screen_y).into(),
+    );
+    map
+}
+
+#[cfg(feature = "test-script")]
+fn native_top_panorama_click_receipt_to_rhai_map(
+    receipt: crate::video::native_ui_smoke::NativeUiSmokeTopPanoramaClickReceipt,
+) -> Map {
+    let mut map = Map::new();
+    map.insert(
+        "gesture_id".into(),
+        saturating_rhai_int(receipt.gesture_id).into(),
+    );
+    map.insert(
+        "down".into(),
+        Dynamic::from(native_button_delivery_to_rhai_map(receipt.down)),
+    );
+    map.insert(
+        "up".into(),
+        Dynamic::from(native_button_delivery_to_rhai_map(receipt.up)),
+    );
+    map.insert(
+        "app_video_zoom_scale".into(),
+        rhai::FLOAT::from(receipt.app_video_zoom_scale).into(),
+    );
+    map.insert(
+        "app_panorama_active".into(),
+        receipt.app_panorama_active.into(),
+    );
+    map.insert("pointer_released".into(), receipt.pointer_released.into());
+    map.insert(
+        "drag_latches_released".into(),
+        receipt.drag_latches_released.into(),
     );
     map
 }
@@ -1043,7 +2887,9 @@ fn parse_navigation_key(name: &str) -> Result<SyntheticNavigationKey, Box<EvalAl
         "home" => SyntheticNavigationKey::Home,
         "end" => SyntheticNavigationKey::End,
         "enter" => SyntheticNavigationKey::Enter,
+        "backspace" => SyntheticNavigationKey::Backspace,
         "escape" | "esc" => SyntheticNavigationKey::Escape,
+        "f12" => SyntheticNavigationKey::F12,
         _ => {
             return Err(rhai_error(format!(
                 "unsupported synthetic navigation key: {name}"
@@ -1147,6 +2993,176 @@ fn wait_interruptibly(
 }
 
 fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
+    #[cfg(feature = "test-script")]
+    history_input::register(engine, bridge.clone());
+    #[cfg(feature = "test-script")]
+    clipboard_capture::register(engine, bridge.clone());
+    let always_on_top_bridge = bridge.clone();
+    engine.register_fn(
+        "always_on_top_smoke",
+        move |name: ImmutableString| -> Result<(), Box<EvalAltResult>> {
+            let action = match name.as_str() {
+                "on" => UiSmokeAction::AlwaysOnTopOn,
+                "off" => UiSmokeAction::AlwaysOnTopOff,
+                "minimize_root" => UiSmokeAction::MinimizeRoot,
+                "restore_root" => UiSmokeAction::RestoreRoot,
+                "hide_to_tray" => UiSmokeAction::HideToTray,
+                "restore_from_tray" => UiSmokeAction::RestoreFromTray,
+                "close_fullscreen" => UiSmokeAction::CloseFullscreen,
+                "toggle_detached_mode" => UiSmokeAction::ToggleDetachedMode,
+                "enable_independent_windows" => UiSmokeAction::EnableIndependentWindows,
+                _ => {
+                    return Err(rhai_error(format!(
+                        "unknown always-on-top smoke action: {name}"
+                    )));
+                }
+            };
+            always_on_top_bridge
+                .send(UiCommand::SmokeAction(action))
+                .map_err(rhai_error)
+        },
+    );
+    let rating_sort_bridge = bridge.clone();
+    engine.register_fn(
+        "rating_sort_smoke",
+        move |name: ImmutableString| -> Result<(), Box<EvalAltResult>> {
+            let action = match name.as_str() {
+                "open_thumbnail_preferences" => UiSmokeAction::OpenThumbnailPreferences,
+                "open_first_smart_folder" => UiSmokeAction::OpenFirstSmartFolder,
+                _ => {
+                    return Err(rhai_error(format!(
+                        "unknown rating-sort smoke action: {name}"
+                    )));
+                }
+            };
+            rating_sort_bridge
+                .send(UiCommand::SmokeAction(action))
+                .map_err(rhai_error)
+        },
+    );
+    let collection_sort_bridge = bridge.clone();
+    engine.register_fn(
+        "collection_sort_smoke",
+        move |name: ImmutableString| -> Result<(), Box<EvalAltResult>> {
+            match name.as_str() {
+                "open_seeded_collection" => collection_sort_bridge
+                    .send(UiCommand::SmokeAction(UiSmokeAction::OpenSeededCollection))
+                    .map_err(rhai_error),
+                _ => Err(rhai_error(format!(
+                    "unknown Collection sort smoke action: {name}"
+                ))),
+            }
+        },
+    );
+    let folder_history_bridge = bridge.clone();
+    engine.register_fn(
+        "folder_history_smoke",
+        move |name: ImmutableString| -> Result<(), Box<EvalAltResult>> {
+            match name.as_str() {
+                "open_rating_one" => folder_history_bridge
+                    .send(UiCommand::SmokeAction(UiSmokeAction::OpenRatingOne))
+                    .map_err(rhai_error),
+                "open_seeded_collection" => folder_history_bridge
+                    .send(UiCommand::SmokeAction(UiSmokeAction::OpenSeededCollection))
+                    .map_err(rhai_error),
+                _ => Err(rhai_error(format!(
+                    "unknown folder-history smoke action: {name}"
+                ))),
+            }
+        },
+    );
+    for (name, kind) in [
+        ("click_widget", WidgetClickKind::Single),
+        ("double_click_widget", WidgetClickKind::Double),
+        ("hover_widget", WidgetClickKind::Hover),
+    ] {
+        let click_widget_bridge = bridge.clone();
+        engine.register_fn(
+            name,
+            move |label: ImmutableString| -> Result<(), Box<EvalAltResult>> {
+                let (reply, received) = mpsc::sync_channel(1);
+                click_widget_bridge
+                    .send(UiCommand::ClickWidget {
+                        label: label.to_string(),
+                        kind,
+                        reply,
+                    })
+                    .map_err(rhai_error)?;
+                let started = Instant::now();
+                loop {
+                    click_widget_bridge.interrupt.check().map_err(rhai_error)?;
+                    if started.elapsed() >= Duration::from_secs(30) {
+                        return Err(rhai_error(format!(
+                            "click_widget timed out waiting for visible widget: {label}"
+                        )));
+                    }
+                    match received.recv_timeout(WAIT_POLL_INTERVAL) {
+                        Ok(Ok(())) => return Ok(()),
+                        Ok(Err(message)) => return Err(rhai_error(message)),
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            return Err(rhai_error("widget click acknowledgement disconnected"));
+                        }
+                    }
+                }
+            },
+        );
+    }
+    for (name, kind) in [
+        ("hover_sort_row", SortPopupPointerKind::Hover),
+        ("click_sort_row", SortPopupPointerKind::Click),
+    ] {
+        let sort_pointer_bridge = bridge.clone();
+        engine.register_fn(
+            name,
+            move |label: ImmutableString| -> Result<(), Box<EvalAltResult>> {
+                let (reply, received) = mpsc::sync_channel(1);
+                sort_pointer_bridge
+                    .send(UiCommand::SortPopupPointer {
+                        label: label.to_string(),
+                        kind,
+                        reply,
+                    })
+                    .map_err(rhai_error)?;
+                let started = Instant::now();
+                loop {
+                    sort_pointer_bridge.interrupt.check().map_err(rhai_error)?;
+                    if started.elapsed() >= Duration::from_secs(10) {
+                        return Err(rhai_error(format!(
+                            "{name} timed out waiting for visible sort row: {label}"
+                        )));
+                    }
+                    match received.recv_timeout(WAIT_POLL_INTERVAL) {
+                        Ok(Ok(())) => return Ok(()),
+                        Ok(Err(message)) => return Err(rhai_error(message)),
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            return Err(rhai_error(
+                                "sort row pointer acknowledgement disconnected",
+                            ));
+                        }
+                    }
+                }
+            },
+        );
+    }
+    // Keep the opt-in production API available to unit tests as well, so the
+    // ordinary lib suite exercises its registration and missing-host error.
+    #[cfg(any(feature = "test-script", test))]
+    {
+        let preview_bridge = bridge.clone();
+        engine.register_fn(
+            "move_details_preview_pointer",
+            move |timeout_ms: rhai::INT| -> Result<(), Box<EvalAltResult>> {
+                preview_bridge
+                    .move_details_preview_pointer(checked_duration(
+                        timeout_ms,
+                        "move_details_preview_pointer timeout_ms",
+                    )?)
+                    .map_err(rhai_error)
+            },
+        );
+    }
     let select_root_bridge = bridge.clone();
     engine.register_fn("select_root", move || -> Result<Map, Box<EvalAltResult>> {
         select_root_bridge.select_root().map_err(rhai_error)
@@ -1203,6 +3219,59 @@ fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
                     .move_native_canvas([normalized_x as f32, normalized_y as f32], timeout)
                     .map_err(|message| {
                         native_mouse_environment_error(&native_mouse_bridge, message)
+                    })
+            },
+        );
+
+        let native_top_panorama_bridge = bridge.clone();
+        engine.register_fn(
+            "reveal_native_top_panorama",
+            move |timeout_ms: rhai::INT| -> Result<Map, Box<EvalAltResult>> {
+                let timeout =
+                    checked_duration(timeout_ms, "reveal_native_top_panorama timeout_ms")?;
+                if timeout.is_zero() {
+                    return Err(rhai_error(
+                        "reveal_native_top_panorama timeout_ms must be greater than zero",
+                    ));
+                }
+                native_top_panorama_bridge
+                    .reveal_native_top_panorama(timeout)
+                    .map_err(|message| {
+                        native_mouse_environment_error(&native_top_panorama_bridge, message)
+                    })
+            },
+        );
+
+        let native_top_panorama_click_bridge = bridge.clone();
+        engine.register_fn(
+            "click_native_top_panorama",
+            move |timeout_ms: rhai::INT| -> Result<Map, Box<EvalAltResult>> {
+                let timeout = checked_duration(timeout_ms, "click_native_top_panorama timeout_ms")?;
+                if timeout.is_zero() {
+                    return Err(rhai_error(
+                        "click_native_top_panorama timeout_ms must be greater than zero",
+                    ));
+                }
+                native_top_panorama_click_bridge
+                    .click_native_top_panorama(timeout)
+                    .map_err(|message| {
+                        native_mouse_environment_error(&native_top_panorama_click_bridge, message)
+                    })
+            },
+        );
+
+        let native_audio_control_bridge = bridge.clone();
+        engine.register_fn(
+            "click_native_audio_control",
+            move |name: ImmutableString,
+                  timeout_ms: rhai::INT|
+                  -> Result<Map, Box<EvalAltResult>> {
+                let timeout =
+                    checked_duration(timeout_ms, "click_native_audio_control timeout_ms")?;
+                native_audio_control_bridge
+                    .click_native_audio_control(&name, timeout)
+                    .map_err(|message| {
+                        native_mouse_environment_error(&native_audio_control_bridge, message)
                     })
             },
         );
@@ -1266,26 +3335,22 @@ fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
         "run_action",
         move |name: ImmutableString| -> Result<(), Box<EvalAltResult>> {
             let action = parse_action(&name)?;
-            let selection = action_bridge.action_selection().map_err(rhai_error)?;
-            let (applied_tx, applied_rx) = mpsc::sync_channel(1);
             action_bridge
-                .send(UiCommand::RunAction {
-                    action,
-                    selection,
-                    applied: applied_tx,
-                })
-                .map_err(rhai_error)?;
-            loop {
-                action_bridge.interrupt.check().map_err(rhai_error)?;
-                match applied_rx.recv_timeout(WAIT_POLL_INTERVAL) {
-                    Ok(Ok(())) => return Ok(()),
-                    Ok(Err(message)) => return Err(rhai_error(message)),
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        return Err(rhai_error("run_action apply acknowledgement disconnected"));
-                    }
-                }
-            }
+                .run_action(action, RUN_ACTION_TIMEOUT)
+                .map_err(rhai_error)
+        },
+    );
+
+    let action_bridge = bridge.clone();
+    engine.register_fn(
+        "run_action",
+        move |name: ImmutableString, timeout_ms: rhai::INT| -> Result<(), Box<EvalAltResult>> {
+            action_bridge
+                .run_action(
+                    parse_action(&name)?,
+                    checked_duration(timeout_ms, "run_action timeout_ms")?,
+                )
+                .map_err(rhai_error)
         },
     );
 
@@ -1309,7 +3374,11 @@ fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
             loop {
                 wait_bridge.interrupt.check().map_err(rhai_error)?;
                 let snapshot = wait_bridge.latest_snapshot().map_err(rhai_error)?;
-                if condition.call_within_context::<bool>(&ctx, (snapshot.to_rhai_map(),))? {
+                let satisfied =
+                    condition.call_within_context::<bool>(&ctx, (snapshot.to_rhai_map(),))?;
+                let elapsed = started.elapsed();
+                // Preserve timeout=0 as one immediate predicate evaluation.
+                if satisfied && (timeout.is_zero() || elapsed < timeout) {
                     wait_bridge
                         .send(UiCommand::Precondition(PreconditionTrace {
                             name: "wait_until",
@@ -1323,7 +3392,6 @@ fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
                         .map_err(rhai_error)?;
                     return Ok(());
                 }
-                let elapsed = started.elapsed();
                 if elapsed >= timeout {
                     let _ =
                         wait_bridge.send_unchecked(UiCommand::Precondition(PreconditionTrace {
@@ -1335,8 +3403,10 @@ fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
                             focused: Some(snapshot.focused),
                         }));
                     return Err(rhai_error(format!(
-                        "wait_until timed out after {} ms",
-                        timeout.as_millis()
+                        "wait_until timed out after {} ms: {}",
+                        timeout.as_millis(),
+                        wait_bridge
+                            .wait_diagnostic(&wait_bridge.action_selection().map_err(rhai_error)?)
                     )));
                 }
                 wait_interruptibly(
@@ -1394,6 +3464,30 @@ fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
         move |message: ImmutableString| -> Result<(), Box<EvalAltResult>> {
             log_bridge
                 .send(UiCommand::Log(message.to_string()))
+                .map_err(rhai_error)
+        },
+    );
+
+    let capture_bridge = bridge.clone();
+    engine.register_fn(
+        "capture",
+        move |label: ImmutableString| -> Result<(), Box<EvalAltResult>> {
+            capture_bridge
+                .capture(&label, CaptureScope::Selected)
+                .map_err(rhai_error)
+        },
+    );
+    let capture_all_bridge = bridge.clone();
+    engine.register_fn(
+        "capture",
+        move |label: ImmutableString, scope: ImmutableString| -> Result<(), Box<EvalAltResult>> {
+            let scope = match scope.as_str() {
+                "current" => CaptureScope::Selected,
+                "all" => CaptureScope::All,
+                _ => return Err(rhai_error("capture scope must be 'current' or 'all'")),
+            };
+            capture_all_bridge
+                .capture(&label, scope)
                 .map_err(rhai_error)
         },
     );
@@ -1500,13 +3594,146 @@ fn spawn_script_source(source: String, bridge: RunnerBridge) -> Result<(), Strin
         .map_err(|error| format!("failed to spawn test-script runner: {error}"))
 }
 
+#[derive(Clone, Debug)]
+enum ActionRejection {
+    Deadline,
+    Handler(String),
+}
+
+#[derive(Debug)]
+enum ActionRequestState {
+    Undelivered(mpsc::SyncSender<Result<(), String>>),
+    Delivered { at: Instant },
+    Rejected(ActionRejection),
+}
+
+enum ActionRequestAttempt {
+    Observe,
+    Deliver,
+    Reject(String),
+}
+
+#[derive(Debug)]
+struct ActionRequest {
+    deadline: Instant,
+    state: Mutex<ActionRequestState>,
+}
+
+impl ActionRequest {
+    fn new(deadline: Instant, applied: mpsc::SyncSender<Result<(), String>>) -> Arc<Self> {
+        Arc::new(Self {
+            deadline,
+            state: Mutex::new(ActionRequestState::Undelivered(applied)),
+        })
+    }
+
+    /// The clock read inside this request's lock is the delivery/rejection
+    /// linearization point. Only Undelivered may transition. No diagnostics,
+    /// channel sends, OS calls or application work run while holding this lock.
+    fn resolve(&self, attempt: ActionRequestAttempt) -> Option<Result<Instant, ActionRejection>> {
+        self.resolve_with_clock(attempt, Instant::now)
+    }
+
+    fn resolve_with_clock(
+        &self,
+        attempt: ActionRequestAttempt,
+        now: impl FnOnce() -> Instant,
+    ) -> Option<Result<Instant, ActionRejection>> {
+        let Ok(mut state) = self.state.lock() else {
+            return Some(Err(ActionRejection::Handler(
+                "run_action request is poisoned".into(),
+            )));
+        };
+        let at = now();
+        let outcome = match &*state {
+            ActionRequestState::Undelivered(_) if at >= self.deadline => {
+                Some(Err(ActionRejection::Deadline))
+            }
+            ActionRequestState::Undelivered(_) => match attempt {
+                ActionRequestAttempt::Observe => None,
+                ActionRequestAttempt::Deliver => Some(Ok(at)),
+                ActionRequestAttempt::Reject(message) => {
+                    Some(Err(ActionRejection::Handler(message)))
+                }
+            },
+            ActionRequestState::Delivered { at } => Some(Ok(*at)),
+            ActionRequestState::Rejected(reason) => Some(Err(reason.clone())),
+        };
+        let notify = if let Some(outcome) = &outcome
+            && matches!(*state, ActionRequestState::Undelivered(_))
+        {
+            let terminal = match outcome {
+                Ok(at) => ActionRequestState::Delivered { at: *at },
+                Err(reason) => ActionRequestState::Rejected(reason.clone()),
+            };
+            let ActionRequestState::Undelivered(applied) = std::mem::replace(&mut *state, terminal)
+            else {
+                unreachable!("transition was checked")
+            };
+            Some(applied)
+        } else {
+            None
+        };
+        drop(state);
+        if let Some(applied) = notify {
+            let result =
+                outcome
+                    .as_ref()
+                    .unwrap()
+                    .clone()
+                    .map(|_| ())
+                    .map_err(|reason| match reason {
+                        ActionRejection::Deadline => {
+                            "run_action deadline expired before delivery".into()
+                        }
+                        ActionRejection::Handler(message) => message,
+                    });
+            let _ = applied.send(result);
+        }
+        outcome
+    }
+
+    fn outcome(&self) -> Option<Result<Instant, ActionRejection>> {
+        self.resolve(ActionRequestAttempt::Observe)
+    }
+
+    fn is_pending(&self) -> bool {
+        self.outcome().is_none()
+    }
+
+    fn is_delivered(&self) -> bool {
+        matches!(self.outcome(), Some(Ok(_)))
+    }
+
+    fn try_deliver(&self) -> bool {
+        matches!(self.resolve(ActionRequestAttempt::Deliver), Some(Ok(_)))
+    }
+
+    fn reject(&self, message: impl Into<String>) {
+        let _ = self.resolve(ActionRequestAttempt::Reject(message.into()));
+    }
+}
+
+pub(crate) struct TargetedActionAcquisition {
+    pub(crate) owner: TestScriptWindowIdentity,
+    request: Arc<ActionRequest>,
+    interrupt: Arc<InterruptState>,
+}
+
+impl TargetedActionAcquisition {
+    /// Admit acquisition immediately before a focus/activation starts. An
+    /// admitted operation may finish later; it is not consumer delivery.
+    pub(crate) fn is_live(&self) -> bool {
+        self.interrupt.check().is_ok() && self.request.is_pending()
+    }
+}
+
 struct PendingAction {
     action: KeyAction,
     dispatch: PendingActionDispatch,
-    // `None` means a non-consuming pressed_action peek already acknowledged
-    // the command. Keep the entry until the frame ends so later peeks observe
-    // the same press, just like an egui input event.
-    applied: Option<mpsc::SyncSender<Result<(), String>>>,
+    // A delivered pressed_action peek stays until the frame ends so later
+    // peeks observe the same press, just like an egui input event.
+    request: Arc<ActionRequest>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1521,6 +3748,9 @@ enum PendingActionDispatch {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TargetedActionPhase {
     AwaitingDetachedOwner,
+    // Focus must be applied in an earlier backend pass than an action which may
+    // open another host. Otherwise a late source Focus steals that host's focus.
+    AwaitingFocus,
     AwaitingPass,
 }
 
@@ -1535,6 +3765,8 @@ fn joined_window_snapshots(
     authoritative: &[TestScriptWindowSnapshot],
     viewport_observations: &HashMap<TestScriptWindowIdentity, u64>,
     paint_observations: &HashMap<TestScriptPaintEvidenceKey, u64>,
+    frame_paints: &HashMap<TestScriptWindowIdentity, Vec<TestScriptPaintObservation>>,
+    sidecar_observations: &std::collections::HashSet<(u64, u64, TestScriptSidecarObservation)>,
 ) -> Vec<TestScriptWindowSnapshot> {
     authoritative
         .iter()
@@ -1563,6 +3795,19 @@ fn joined_window_snapshots(
                 window.painted_page_index = Some(key.content.page_index);
                 window.paint_revision = *revision;
             }
+            if let Some(identity) = &window.identity {
+                window.paints = frame_paints.get(identity).cloned().unwrap_or_default();
+            }
+            window.sidecar_imported = sidecar_observations.contains(&(
+                window.context_serial,
+                window.items_generation,
+                TestScriptSidecarObservation::Imported,
+            ));
+            window.sidecar_loaded = sidecar_observations.contains(&(
+                window.context_serial,
+                window.items_generation,
+                TestScriptSidecarObservation::Loaded,
+            ));
             window
         })
         .collect()
@@ -1579,14 +3824,20 @@ struct UiRuntime {
     snapshot: Arc<RwLock<TestScriptSnapshot>>,
     interrupt: Arc<InterruptState>,
     pending_actions: VecDeque<PendingAction>,
+    smoke_actions: VecDeque<UiSmokeAction>,
     last_frame: Option<u64>,
     finish: Option<FinishState>,
     cancel_requested: bool,
     authoritative_windows: Vec<TestScriptWindowSnapshot>,
     viewport_observations: HashMap<TestScriptWindowIdentity, u64>,
     paint_observations: HashMap<TestScriptPaintEvidenceKey, u64>,
+    frame_paints: HashMap<TestScriptWindowIdentity, Vec<TestScriptPaintObservation>>,
+    sidecar_observations: std::collections::HashSet<(u64, u64, TestScriptSidecarObservation)>,
     next_observation_revision: u64,
     pointer_regions: pointer_input::SharedRegionCatalog,
+    capture: Option<capture::Coordinator>,
+    failure_capture_requested: bool,
+    failure_capture_batch: Option<u64>,
 }
 
 impl UiRuntime {
@@ -1601,14 +3852,20 @@ impl UiRuntime {
             snapshot,
             interrupt,
             pending_actions: VecDeque::new(),
+            smoke_actions: VecDeque::new(),
             last_frame: None,
             finish: None,
             cancel_requested: false,
             authoritative_windows: Vec::new(),
             viewport_observations: HashMap::new(),
             paint_observations: HashMap::new(),
+            frame_paints: HashMap::new(),
+            sidecar_observations: std::collections::HashSet::new(),
             next_observation_revision: 0,
             pointer_regions,
+            capture: None,
+            failure_capture_requested: false,
+            failure_capture_batch: None,
         }
     }
 
@@ -1621,7 +3878,7 @@ impl UiRuntime {
                 .fail("test-script pointer region catalog is poisoned");
         }
         let mut retained_actions = VecDeque::with_capacity(self.pending_actions.len());
-        while let Some(mut pending) = self.pending_actions.pop_front() {
+        while let Some(pending) = self.pending_actions.pop_front() {
             let stale_owner = match &pending.dispatch {
                 PendingActionDispatch::LegacyImplicit => None,
                 PendingActionDispatch::Targeted { owner, .. } => (!self
@@ -1635,9 +3892,7 @@ impl UiRuntime {
                     "run_action target is no longer current: {}",
                     owner.describe()
                 );
-                if let Some(applied) = pending.applied.take() {
-                    let _ = applied.send(Err(message.clone()));
-                }
+                pending.request.reject(message.clone());
                 crate::logger::log(format!(
                     "[test-script] action rejected target_mode=targeted owner={} reason=stale",
                     owner.describe()
@@ -1657,6 +3912,177 @@ impl UiRuntime {
                 window.accepts_owner(&key.owner) && window.current_content_matches(&key.content)
             })
         });
+        self.frame_paints.retain(|identity, _| {
+            self.authoritative_windows
+                .iter()
+                .any(|window| window.accepts_owner(identity))
+        });
+    }
+
+    fn capture_targets(
+        &self,
+        scope: CaptureScope,
+        selection: &TestScriptActionSelection,
+        native_viewports: &std::collections::HashSet<egui::ViewportId>,
+    ) -> Result<Vec<capture::Target>, String> {
+        // eframe builds RawInput.viewports from the same native viewport table
+        // that its paint dispatcher uses. An App context/host identity alone
+        // can outlive that table during an active-to-passive handoff.
+        let availability = |id| {
+            if native_viewports.contains(&id) {
+                capture::Availability::Registered
+            } else {
+                capture::Availability::Absent
+            }
+        };
+        let root = capture::Target {
+            viewport_id: egui::ViewportId::ROOT,
+            role: "root".into(),
+            hwnd: self
+                .authoritative_windows
+                .iter()
+                .find(|window| window.role == "root")
+                .and_then(|window| window.identity.as_ref())
+                .map(TestScriptWindowIdentity::hwnd),
+            availability: availability(egui::ViewportId::ROOT),
+            presentation: TestScriptWindowPresentation::Root,
+        };
+        if scope == CaptureScope::Selected {
+            return match selection {
+                TestScriptActionSelection::LegacyImplicit => Ok(vec![root]),
+                TestScriptActionSelection::Targeted(identity) => {
+                    let target_window = self
+                        .authoritative_windows
+                        .iter()
+                        .find(|window| window.identity.as_ref() == Some(identity))
+                        .ok_or_else(|| {
+                            format!(
+                                "capture target is no longer current: {}",
+                                identity.describe()
+                            )
+                        })?;
+                    match identity {
+                        TestScriptWindowIdentity::Root { .. } => Ok(vec![root]),
+                        TestScriptWindowIdentity::Detached {
+                            window_id,
+                            context_serial,
+                            viewport_id,
+                            ..
+                        } => Ok(vec![capture::Target {
+                            viewport_id: *viewport_id,
+                            role: format!("detached-{window_id}-{context_serial}"),
+                            hwnd: Some(identity.hwnd()),
+                            availability: availability(*viewport_id),
+                            presentation: target_window.presentation,
+                        }]),
+                    }
+                }
+            };
+        }
+        let mut targets = vec![root];
+        let mut seen = std::collections::HashSet::from([egui::ViewportId::ROOT]);
+        for window in &self.authoritative_windows {
+            let Some(identity) = window.identity.as_ref() else {
+                continue;
+            };
+            if let TestScriptWindowIdentity::Detached {
+                window_id,
+                context_serial,
+                viewport_id,
+                ..
+            } = identity
+                && seen.insert(*viewport_id)
+            {
+                targets.push(capture::Target {
+                    viewport_id: *viewport_id,
+                    role: format!("detached-{window_id}-{context_serial}"),
+                    hwnd: Some(identity.hwnd()),
+                    availability: availability(*viewport_id),
+                    presentation: window.presentation,
+                });
+            }
+        }
+        if let Ok(snapshot) = self.snapshot.read() {
+            for style in &snapshot.host_styles {
+                if style.role == "detached"
+                    && let (Some(viewport_id), Some(window_id)) =
+                        (style.viewport_id, style.window_id)
+                    && seen.insert(viewport_id)
+                {
+                    targets.push(capture::Target {
+                        viewport_id,
+                        role: format!("detached-{window_id}"),
+                        hwnd: Some(style.hwnd),
+                        availability: availability(viewport_id),
+                        presentation: style.presentation,
+                    });
+                }
+                if style.role == "fullscreen"
+                    && let Some(viewport_id) = style.viewport_id
+                    && seen.insert(viewport_id)
+                {
+                    targets.push(capture::Target {
+                        viewport_id,
+                        role: "fullscreen".into(),
+                        hwnd: Some(style.hwnd),
+                        availability: availability(viewport_id),
+                        presentation: TestScriptWindowPresentation::ActiveImmediate,
+                    });
+                }
+                if style.role == "preview"
+                    && let Some(viewport_id) = style.viewport_id
+                    && seen.insert(viewport_id)
+                {
+                    targets.push(capture::Target {
+                        viewport_id,
+                        role: "preview".into(),
+                        hwnd: Some(style.hwnd),
+                        availability: availability(viewport_id),
+                        presentation: TestScriptWindowPresentation::ActiveImmediate,
+                    });
+                }
+            }
+        }
+        Ok(targets)
+    }
+
+    fn request_failure_capture(
+        &mut self,
+        ctx: &egui::Context,
+        arm_watchdog: impl FnOnce(&ScriptOutcome),
+    ) {
+        if self.finish.is_none() || self.failure_capture_requested {
+            return;
+        }
+        self.failure_capture_requested = true;
+        let Some(outcome) = self
+            .finish
+            .as_ref()
+            .map(|finish| &finish.outcome)
+            .filter(|outcome| outcome.kind != ScriptOutcomeKind::Success)
+            .cloned()
+        else {
+            return;
+        };
+
+        // A stalled renderer can prevent every later UI update, including the
+        // update that would expire the capture batch. Guard the original result
+        // before sending any screenshot command.
+        arm_watchdog(&outcome);
+        let native_viewports = ctx.input(|input| input.raw.viewports.keys().copied().collect());
+        let targets = self.capture_targets(
+            CaptureScope::All,
+            &TestScriptActionSelection::LegacyImplicit,
+            &native_viewports,
+        );
+        if let (Some(capture), Ok(targets)) = (self.capture.as_mut(), targets) {
+            match capture.request(ctx, "failure", targets, capture::FAILURE_TIMEOUT, None) {
+                Ok(batch) => self.failure_capture_batch = Some(batch),
+                Err(error) => crate::logger::log(format!(
+                    "[test-script] automatic failure screenshot unavailable: {error}"
+                )),
+            }
+        }
     }
 
     fn joined_windows(&self) -> Vec<TestScriptWindowSnapshot> {
@@ -1664,12 +4090,29 @@ impl UiRuntime {
             &self.authoritative_windows,
             &self.viewport_observations,
             &self.paint_observations,
+            &self.frame_paints,
+            &self.sidecar_observations,
         )
     }
 
     fn publish_snapshot(&mut self, mut snapshot: TestScriptSnapshot) -> Result<(), String> {
         self.replace_authoritative_windows(std::mem::take(&mut snapshot.windows));
         snapshot.windows = self.joined_windows();
+        let pending = self
+            .pending_actions
+            .iter()
+            .map(|pending| {
+                format!(
+                    "action={} dispatch={:?} awaiting_ack={}",
+                    pending.action.ini_name(),
+                    pending.dispatch,
+                    pending.request.is_pending()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        snapshot.action_wait_diagnostic =
+            format!("{} pending=[{pending}]", snapshot.action_wait_diagnostic);
         self.snapshot
             .write()
             .map(|mut published| *published = snapshot)
@@ -1721,6 +4164,7 @@ impl UiRuntime {
         owner: TestScriptWindowIdentity,
         content: Option<TestScriptContentProof>,
     ) -> Result<bool, String> {
+        let drawn = take_drawn_paint(owner.viewport_id());
         let owner_is_current = self
             .authoritative_windows
             .iter()
@@ -1731,6 +4175,22 @@ impl UiRuntime {
         self.next_observation_revision = self.next_observation_revision.wrapping_add(1).max(1);
         let revision = self.next_observation_revision;
         self.viewport_observations.insert(owner.clone(), revision);
+        let paints = drawn
+            .into_iter()
+            .filter(|paint| paint.content.context_serial == owner.context_serial())
+            .map(|paint| TestScriptPaintObservation {
+                owner: owner.clone(),
+                content: paint.content,
+                texture: paint.texture,
+                vertices: paint.vertices,
+                clip: paint.clip,
+                viewport_size: paint.viewport_size,
+                pixels_per_point: paint.pixels_per_point,
+                placement: paint.placement,
+                revision,
+            })
+            .collect();
+        self.frame_paints.insert(owner.clone(), paints);
         if let Some(content) = content
             && self.authoritative_windows.iter().any(|window| {
                 window.accepts_owner(&owner) && window.current_content_matches(&content)
@@ -1797,10 +4257,8 @@ impl UiRuntime {
     }
 
     fn release_pending_actions(&mut self, message: &str) {
-        for mut pending in self.pending_actions.drain(..) {
-            if let Some(applied) = pending.applied.take() {
-                let _ = applied.send(Err(message.to_string()));
-            }
+        for pending in self.pending_actions.drain(..) {
+            pending.request.reject(message);
         }
     }
 
@@ -1808,14 +4266,19 @@ impl UiRuntime {
         &mut self,
         action: KeyAction,
         selection: TestScriptActionSelection,
-        applied: mpsc::SyncSender<Result<(), String>>,
+        request: Arc<ActionRequest>,
+        target_focused: bool,
     ) -> Option<egui::ViewportId> {
+        if !self.actions_are_live() || !request.is_pending() {
+            request.reject("run_action is no longer live");
+            return None;
+        }
         match selection {
             TestScriptActionSelection::LegacyImplicit => {
                 self.pending_actions.push_back(PendingAction {
                     action,
                     dispatch: PendingActionDispatch::LegacyImplicit,
-                    applied: Some(applied),
+                    request,
                 });
                 crate::logger::log(format!(
                     "[test-script] run_action action={} target_mode=legacy_implicit",
@@ -1833,12 +4296,16 @@ impl UiRuntime {
                         "run_action target is no longer current: {}",
                         owner.describe()
                     );
-                    let _ = applied.send(Err(message));
+                    request.reject(message);
                     return None;
                 };
                 let phase = match (&owner, window.residence.as_str()) {
                     (TestScriptWindowIdentity::Root { .. }, "mounted" | "at_rest") => {
-                        TargetedActionPhase::AwaitingPass
+                        if target_focused {
+                            TargetedActionPhase::AwaitingPass
+                        } else {
+                            TargetedActionPhase::AwaitingFocus
+                        }
                     }
                     (TestScriptWindowIdentity::Detached { .. }, "mounted" | "at_rest") => {
                         TargetedActionPhase::AwaitingDetachedOwner
@@ -1849,12 +4316,12 @@ impl UiRuntime {
                             owner.describe(),
                             window.residence
                         );
-                        let _ = applied.send(Err(message));
+                        request.reject(message);
                         return None;
                     }
                 };
                 let focus =
-                    (phase == TargetedActionPhase::AwaitingPass).then(|| owner.viewport_id());
+                    (phase == TargetedActionPhase::AwaitingFocus).then(|| owner.viewport_id());
                 crate::logger::log(format!(
                     "[test-script] run_action action={} target_mode=targeted owner={} phase={phase:?}",
                     action.ini_name(),
@@ -1863,42 +4330,103 @@ impl UiRuntime {
                 self.pending_actions.push_back(PendingAction {
                     action,
                     dispatch: PendingActionDispatch::Targeted { owner, phase },
-                    applied: Some(applied),
+                    request,
                 });
                 focus
             }
         }
     }
 
-    fn pending_targeted_detached_owner(&self) -> Option<TestScriptWindowIdentity> {
+    fn actions_are_live(&self) -> bool {
+        self.finish.is_none() && !self.cancel_requested && self.interrupt.check().is_ok()
+    }
+
+    fn probe_targeted_action(
+        &self,
+        owner: &TestScriptWindowIdentity,
+        active_scopes: &[CommandScope],
+    ) -> Option<KeyAction> {
+        if !self.actions_are_live()
+            || !self
+                .authoritative_windows
+                .iter()
+                .any(|w| w.identity.as_ref() == Some(owner))
+        {
+            return None;
+        }
+        self.pending_actions.iter().find_map(|pending| {
+            (pending.request.is_pending()
+                && matches!(&pending.dispatch, PendingActionDispatch::Targeted { .. })
+                && action_matches_owner(&pending.dispatch, Some(owner))
+                && command_catalog().any(|spec| {
+                    spec.action == pending.action
+                        && spec.trigger == KeyTrigger::Press
+                        && active_scopes.contains(&spec.scope)
+                }))
+            .then_some(pending.action)
+        })
+    }
+
+    fn consume_action(
+        &mut self,
+        owner: Option<&TestScriptWindowIdentity>,
+        action: KeyAction,
+    ) -> bool {
+        self.actions_are_live()
+            && consume_pending_action_from(&mut self.pending_actions, owner, action)
+    }
+
+    fn peek_action(&mut self, owner: Option<&TestScriptWindowIdentity>, action: KeyAction) -> bool {
+        self.actions_are_live()
+            && peek_pending_action_from(&mut self.pending_actions, owner, action)
+    }
+
+    fn pending_targeted_detached_action(&self) -> Option<TargetedActionAcquisition> {
+        if !self.actions_are_live() {
+            return None;
+        }
         self.pending_actions
             .iter()
             .find_map(|pending| match &pending.dispatch {
                 PendingActionDispatch::Targeted {
                     owner,
                     phase: TargetedActionPhase::AwaitingDetachedOwner,
-                } => Some(owner.clone()),
-                PendingActionDispatch::LegacyImplicit
-                | PendingActionDispatch::Targeted {
-                    phase: TargetedActionPhase::AwaitingPass,
-                    ..
-                } => None,
+                } if pending.request.is_pending() => Some(TargetedActionAcquisition {
+                    owner: owner.clone(),
+                    request: Arc::clone(&pending.request),
+                    interrupt: Arc::clone(&self.interrupt),
+                }),
+                PendingActionDispatch::LegacyImplicit | PendingActionDispatch::Targeted { .. } => {
+                    None
+                }
             })
     }
 
-    fn finish_targeted_detached_owner(
+    #[cfg(test)]
+    fn pending_targeted_detached_owner(&self) -> Option<TestScriptWindowIdentity> {
+        self.pending_targeted_detached_action()
+            .map(|target| target.owner)
+    }
+
+    fn finish_targeted_detached_action(
         &mut self,
-        owner: &TestScriptWindowIdentity,
+        target: &TargetedActionAcquisition,
         result: Result<(), String>,
     ) {
+        let owner = &target.owner;
+        if !self.actions_are_live() {
+            return;
+        }
         let Some(index) = self.pending_actions.iter().position(|pending| {
-            matches!(
-                &pending.dispatch,
-                PendingActionDispatch::Targeted {
-                    owner: pending_owner,
-                    phase: TargetedActionPhase::AwaitingDetachedOwner,
-                } if pending_owner == owner
-            )
+            Arc::ptr_eq(&pending.request, &target.request)
+                && pending.request.is_pending()
+                && matches!(
+                    &pending.dispatch,
+                    PendingActionDispatch::Targeted {
+                        owner: pending_owner,
+                        phase: TargetedActionPhase::AwaitingDetachedOwner,
+                    } if pending_owner == owner
+                )
         }) else {
             return;
         };
@@ -1907,7 +4435,7 @@ impl UiRuntime {
                 if let PendingActionDispatch::Targeted { phase, .. } =
                     &mut self.pending_actions[index].dispatch
                 {
-                    *phase = TargetedActionPhase::AwaitingPass;
+                    *phase = TargetedActionPhase::AwaitingFocus;
                 }
                 crate::logger::log(format!(
                     "[test-script] action target ready owner={}",
@@ -1915,16 +4443,46 @@ impl UiRuntime {
                 ));
             }
             Err(message) => {
-                let mut pending = self.pending_actions.remove(index).expect("index exists");
-                if let Some(applied) = pending.applied.take() {
-                    let _ = applied.send(Err(message.clone()));
-                }
+                let pending = self.pending_actions.remove(index).expect("index exists");
+                pending.request.reject(message.clone());
                 crate::logger::log(format!(
                     "[test-script] action target resolution failed owner={} error={message}",
                     owner.describe()
                 ));
             }
         }
+    }
+
+    fn promote_focused_action_targets(
+        &mut self,
+        is_focused: impl Fn(&TestScriptWindowIdentity) -> bool,
+    ) -> Vec<egui::ViewportId> {
+        let mut ready = Vec::new();
+        if !self.actions_are_live() {
+            return ready;
+        }
+        for pending in &mut self.pending_actions {
+            let PendingActionDispatch::Targeted { owner, phase } = &mut pending.dispatch else {
+                continue;
+            };
+            if *phase == TargetedActionPhase::AwaitingFocus
+                && pending.request.is_pending()
+                && self
+                    .authoritative_windows
+                    .iter()
+                    .any(|window| window.identity.as_ref() == Some(owner))
+                && is_focused(owner)
+                && pending.request.is_pending()
+            {
+                *phase = TargetedActionPhase::AwaitingPass;
+                crate::logger::log(format!(
+                    "[test-script] run_action focus ready owner={}",
+                    owner.describe()
+                ));
+                ready.push(owner.viewport_id());
+            }
+        }
+        ready
     }
 
     fn expire_unconsumed_legacy_actions(&mut self, frame: u64) {
@@ -1936,7 +4494,7 @@ impl UiRuntime {
         while let Some(pending) = self.pending_actions.pop_front() {
             match pending.dispatch {
                 PendingActionDispatch::LegacyImplicit => {
-                    if pending.applied.is_some() {
+                    if pending.request.is_pending() {
                         unconsumed.push(pending);
                     }
                 }
@@ -1953,10 +4511,8 @@ impl UiRuntime {
             .collect::<Vec<_>>()
             .join(", ");
         let message = format!("run_action was not consumed in its UI frame: {names}");
-        for mut pending in unconsumed {
-            if let Some(applied) = pending.applied.take() {
-                let _ = applied.send(Err(message.clone()));
-            }
+        for pending in unconsumed {
+            pending.request.reject(message.clone());
         }
         self.fail_environment(message, frame);
     }
@@ -1972,8 +4528,8 @@ impl UiRuntime {
                     phase: TargetedActionPhase::AwaitingPass,
                 } if pending_owner == owner
             );
-            if belongs_to_pass && (eligible || pending.applied.is_none()) {
-                if eligible && pending.applied.is_some() {
+            if belongs_to_pass && (eligible || pending.request.is_delivered()) {
+                if eligible && pending.request.is_pending() {
                     unconsumed.push(pending);
                 }
             } else {
@@ -1993,10 +4549,8 @@ impl UiRuntime {
             "run_action was not consumed in its target UI pass: owner={} actions={names}",
             owner.describe()
         );
-        for mut pending in unconsumed {
-            if let Some(applied) = pending.applied.take() {
-                let _ = applied.send(Err(message.clone()));
-            }
+        for pending in unconsumed {
+            pending.request.reject(message.clone());
         }
         self.fail_environment(message, frame);
     }
@@ -2056,9 +4610,9 @@ fn describe_issue(issue: &SyntheticInputIssue) -> String {
     }
 }
 
-pub(crate) fn start(path: PathBuf, ctx: &egui::Context) -> Result<(), String> {
+pub(crate) fn start(path: PathBuf, run_dir: PathBuf, ctx: &egui::Context) -> Result<(), String> {
     PROCESS_EXIT_CODE.store(EXIT_NOT_SET, Ordering::Release);
-    let result = start_inner(path, ctx);
+    let result = start_inner(path, run_dir, ctx);
     if let Err(error) = &result {
         let outcome = ScriptOutcome::environment_failure(format!("runner start failed: {error}"));
         PROCESS_EXIT_CODE.store(EXIT_ENVIRONMENT_FAILURE, Ordering::Release);
@@ -2076,7 +4630,8 @@ pub(crate) fn start(path: PathBuf, ctx: &egui::Context) -> Result<(), String> {
     result
 }
 
-fn start_inner(path: PathBuf, ctx: &egui::Context) -> Result<(), String> {
+fn start_inner(path: PathBuf, run_dir: PathBuf, ctx: &egui::Context) -> Result<(), String> {
+    let capture = capture::Coordinator::new(&run_dir)?;
     if !crate::key_input::arm_synthetic_input() {
         return Err("failed to arm synthetic input timeline".to_string());
     }
@@ -2109,7 +4664,9 @@ fn start_inner(path: PathBuf, ctx: &egui::Context) -> Result<(), String> {
         crate::key_input::disarm_synthetic_input();
         return Err("a test-script runtime is already active".to_string());
     }
-    *guard = Some(UiRuntime::new(rx, snapshot, interrupt, pointer_regions));
+    let mut active = UiRuntime::new(rx, snapshot, interrupt, pointer_regions);
+    active.capture = Some(capture);
+    *guard = Some(active);
     drop(guard);
 
     if let Err(error) = spawn_script_path(path, bridge) {
@@ -2123,6 +4680,93 @@ fn start_inner(path: PathBuf, ctx: &egui::Context) -> Result<(), String> {
     Ok(())
 }
 
+fn request_action_target_focus_with(
+    owner: &TestScriptWindowIdentity,
+    current_owner: Option<&TestScriptWindowIdentity>,
+    backend_is_current: impl FnOnce(&TestScriptWindowIdentity) -> bool,
+    foreground_hwnd: u64,
+    claim_foreground: impl FnOnce(u64),
+    request_viewport_focus: impl FnOnce(egui::ViewportId),
+) -> bool {
+    if current_owner != Some(owner) || !backend_is_current(owner) {
+        return false;
+    }
+    // winit skips focus_window when this top-level HWND is already foreground.
+    // Its native presenter child can still own keyboard focus in that case.
+    if foreground_hwnd == owner.hwnd() {
+        claim_foreground(owner.hwnd());
+    }
+    request_viewport_focus(owner.viewport_id());
+    true
+}
+
+/// Acquire focus for a semantic action, after resolving its exact current owner.
+/// This request does not make the action eligible: actual viewport focus,
+/// foreground/backend identity, and the normal handler guards remain mandatory.
+pub(crate) fn request_action_target_focus(
+    ctx: &egui::Context,
+    owner: &TestScriptWindowIdentity,
+    current_owner: Option<&TestScriptWindowIdentity>,
+) -> bool {
+    #[cfg(windows)]
+    let foreground_hwnd = crate::video::native_window::foreground_hwnd();
+    #[cfg(not(windows))]
+    let foreground_hwnd = 0;
+    request_action_target_focus_with(
+        owner,
+        current_owner,
+        |owner| {
+            eframe::miv_test_script_window_witness::is_current(
+                owner.viewport_id(),
+                owner.hwnd(),
+                owner.backend_token(),
+            )
+            .unwrap_or(false)
+        },
+        foreground_hwnd,
+        |hwnd| {
+            #[cfg(windows)]
+            {
+                let report = crate::video::native_window::claim_foreground(hwnd);
+                crate::logger::log(format!(
+                    "[test-script] action target keyboard focus claim owner={} report={report:?}",
+                    owner.describe()
+                ));
+            }
+            #[cfg(not(windows))]
+            let _ = hwnd;
+        },
+        |viewport_id| ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus),
+    )
+}
+
+pub(crate) fn action_target_is_focused(
+    ctx: &egui::Context,
+    owner: &TestScriptWindowIdentity,
+) -> bool {
+    if ctx.input_for(owner.viewport_id(), |input| input.viewport().focused) != Some(true) {
+        return false;
+    }
+    if !eframe::miv_test_script_window_witness::is_current(
+        owner.viewport_id(),
+        owner.hwnd(),
+        owner.backend_token(),
+    )
+    .unwrap_or(false)
+    {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+        unsafe { GetForegroundWindow().0 as usize as u64 == owner.hwnd() }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 fn action_matches_owner(
     dispatch: &PendingActionDispatch,
     owner: Option<&TestScriptWindowIdentity>,
@@ -2134,7 +4778,7 @@ fn action_matches_owner(
             phase: TargetedActionPhase::AwaitingPass,
         } => owner == Some(target),
         PendingActionDispatch::Targeted {
-            phase: TargetedActionPhase::AwaitingDetachedOwner,
+            phase: TargetedActionPhase::AwaitingDetachedOwner | TargetedActionPhase::AwaitingFocus,
             ..
         } => false,
     }
@@ -2150,10 +4794,10 @@ fn consume_pending_action_from(
     }) else {
         return false;
     };
-    let mut pending = pending_actions.remove(index).expect("index exists");
-    if let Some(applied) = pending.applied.take() {
-        let _ = applied.send(Ok(()));
+    if !pending_actions[index].request.try_deliver() {
+        return false;
     }
+    pending_actions.remove(index);
     true
 }
 
@@ -2168,10 +4812,7 @@ fn peek_pending_action_from(
     else {
         return false;
     };
-    if let Some(applied) = pending.applied.take() {
-        let _ = applied.send(Ok(()));
-    }
-    true
+    pending.request.try_deliver()
 }
 
 fn action_pass_observation_id(viewport_id: egui::ViewportId) -> egui::Id {
@@ -2253,6 +4894,18 @@ pub(crate) fn finish_action_pass(ctx: &egui::Context) {
     runtime.finish_target_pass(&owner, observation.eligible, frame_key(ctx));
 }
 
+/// Read-only entry probe. A semantic action has no egui Key event to wake the
+/// root fullscreen router; only the ordinary handler may confirm successful
+/// delivery. Observing expiry may reject the request and notify its worker.
+pub(crate) fn probe_targeted_action(
+    ctx: &egui::Context,
+    active_scopes: &[CommandScope],
+) -> Option<KeyAction> {
+    let owner = action_pass_observation_for_active_backend(ctx)?.owner?;
+    let guard = runtime().lock().ok()?;
+    guard.as_ref()?.probe_targeted_action(&owner, active_scopes)
+}
+
 pub(crate) fn consume_pending_action(ctx: &egui::Context, action: KeyAction) -> bool {
     let owner =
         action_pass_observation_for_active_backend(ctx).and_then(|observation| observation.owner);
@@ -2262,7 +4915,7 @@ pub(crate) fn consume_pending_action(ctx: &egui::Context, action: KeyAction) -> 
     let Some(runtime) = guard.as_mut() else {
         return false;
     };
-    consume_pending_action_from(&mut runtime.pending_actions, owner.as_ref(), action)
+    runtime.consume_action(owner.as_ref(), action)
 }
 
 pub(crate) fn peek_pending_action(ctx: &egui::Context, action: KeyAction) -> bool {
@@ -2274,18 +4927,18 @@ pub(crate) fn peek_pending_action(ctx: &egui::Context, action: KeyAction) -> boo
     let Some(runtime) = guard.as_mut() else {
         return false;
     };
-    peek_pending_action_from(&mut runtime.pending_actions, owner.as_ref(), action)
+    runtime.peek_action(owner.as_ref(), action)
 }
 
-pub(crate) fn pending_targeted_detached_owner() -> Option<TestScriptWindowIdentity> {
+pub(crate) fn pending_targeted_detached_action() -> Option<TargetedActionAcquisition> {
     runtime()
         .lock()
         .ok()
-        .and_then(|guard| guard.as_ref()?.pending_targeted_detached_owner())
+        .and_then(|guard| guard.as_ref()?.pending_targeted_detached_action())
 }
 
-pub(crate) fn finish_targeted_detached_owner(
-    owner: &TestScriptWindowIdentity,
+pub(crate) fn finish_targeted_detached_action(
+    target: &TargetedActionAcquisition,
     result: Result<(), String>,
 ) {
     let Ok(mut guard) = runtime().lock() else {
@@ -2294,7 +4947,7 @@ pub(crate) fn finish_targeted_detached_owner(
     let Some(runtime) = guard.as_mut() else {
         return;
     };
-    runtime.finish_targeted_detached_owner(owner, result);
+    runtime.finish_targeted_detached_action(target, result);
 }
 
 fn flush_exit_logs() {
@@ -2339,7 +4992,31 @@ fn arm_shutdown_watchdog(exit_code: i32, trigger: &'static str) {
     }
 }
 
-pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bool {
+pub(crate) fn receive_screenshot_events(ctx: &egui::Context, kind: &'static str) {
+    let Ok(mut guard) = runtime().lock() else {
+        return;
+    };
+    if let Some(capture) = guard.as_mut().and_then(|runtime| runtime.capture.as_mut()) {
+        capture.note_pass(ctx.viewport_id(), kind);
+        capture.receive_events(ctx);
+        capture.poll();
+    }
+}
+
+pub(crate) fn capture_pending_for(viewport_id: egui::ViewportId) -> bool {
+    runtime()
+        .lock()
+        .ok()
+        .and_then(|guard| {
+            guard
+                .as_ref()
+                .and_then(|runtime| runtime.capture.as_ref())
+                .map(|capture| capture.pending_viewport(viewport_id))
+        })
+        .unwrap_or(false)
+}
+
+pub(crate) fn ui_update(ctx: &egui::Context, mut snapshot: TestScriptSnapshot) -> bool {
     let frame = frame_key(ctx);
     let issues = crate::key_input::take_synthetic_input_issues(ctx);
     let Ok(mut guard) = runtime().lock() else {
@@ -2359,6 +5036,13 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
     let Some(runtime) = guard.as_mut() else {
         return false;
     };
+    if let Err(error) = runtime.interrupt.check() {
+        runtime.fail_environment(error, frame);
+    }
+    if let Some(capture) = runtime.capture.as_mut() {
+        capture.receive_events(ctx);
+        capture.poll();
+    }
 
     let new_frame = runtime.last_frame != Some(frame);
     if new_frame {
@@ -2368,8 +5052,26 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
         runtime.last_frame = Some(frame);
     }
     emit_perf_level_reads(&snapshot.keymap_level_observations);
+    snapshot.action_wait_diagnostic = action_pass_observation_for_active_backend(ctx)
+        .map(|pass| {
+            format!(
+                "publishing_pass={} owner={:?} eligible={}",
+                pass.pass, pass.owner, pass.eligible
+            )
+        })
+        .unwrap_or_else(|| "publishing_pass_owner=unobserved".into());
     if let Err(error) = runtime.publish_snapshot(snapshot) {
         runtime.fail_environment(error, frame);
+    }
+    // A Focus command queued by RunAction reaches the backend only after this
+    // root pass. Promote requests from earlier passes before draining new ones.
+    for viewport_id in
+        runtime.promote_focused_action_targets(|owner| action_target_is_focused(ctx, owner))
+    {
+        ctx.request_repaint_of(viewport_id);
+    }
+    if let Some(capture) = runtime.capture.as_mut() {
+        capture.begin_root_frame(&runtime.authoritative_windows);
     }
 
     for issue in issues {
@@ -2421,15 +5123,91 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
             UiCommand::RunAction {
                 action,
                 selection,
-                applied,
+                request,
             } => {
                 if runtime.finish.is_some() {
-                    let _ = applied.send(Err("script is already finishing".to_string()));
+                    request.reject("script is already finishing");
                 } else {
-                    if let Some(viewport_id) = runtime.queue_action(action, selection, applied) {
-                        ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus);
+                    let focus_owner = match &selection {
+                        TestScriptActionSelection::Targeted(owner) => Some(owner.clone()),
+                        TestScriptActionSelection::LegacyImplicit => None,
+                    };
+                    let target_focused = match &selection {
+                        TestScriptActionSelection::Targeted(owner) => {
+                            action_target_is_focused(ctx, owner)
+                        }
+                        TestScriptActionSelection::LegacyImplicit => true,
+                    };
+                    if let Some(viewport_id) = runtime.queue_action(
+                        action,
+                        selection,
+                        Arc::clone(&request),
+                        target_focused,
+                    ) {
+                        if let Some(owner) = focus_owner.as_ref()
+                            && runtime.actions_are_live()
+                            && request.is_pending()
+                        {
+                            let current_owner = runtime
+                                .authoritative_windows
+                                .iter()
+                                .filter_map(|window| window.identity.as_ref())
+                                .find(|current| *current == owner);
+                            if request.is_pending() {
+                                request_action_target_focus(ctx, owner, current_owner);
+                            }
+                        }
                         ctx.request_repaint_of(viewport_id);
                     }
+                }
+            }
+            UiCommand::SmokeAction(action) => {
+                if runtime.finish.is_none() {
+                    runtime.smoke_actions.push_back(action);
+                }
+            }
+            UiCommand::ClickWidget { label, kind, reply } => {
+                if runtime.finish.is_some() {
+                    let _ = reply.send(Err("script is already finishing".to_string()));
+                } else if let Err(message) = request_widget_pointer(
+                    label,
+                    WidgetPointerRequestKind::ClickEnabled(kind),
+                    reply.clone(),
+                ) {
+                    let _ = reply.send(Err(message));
+                } else {
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                }
+            }
+            UiCommand::SortPopupPointer { label, kind, reply } => {
+                if runtime.finish.is_some() {
+                    let _ = reply.send(Err("script is already finishing".to_string()));
+                } else if let Err(message) = request_widget_pointer(
+                    label,
+                    WidgetPointerRequestKind::SortPopup(kind),
+                    reply.clone(),
+                ) {
+                    let _ = reply.send(Err(message));
+                } else {
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                }
+            }
+            UiCommand::DetailsPreviewPointer { reply } => {
+                if runtime.finish.is_some() {
+                    let _ = reply.send(Err("script is already finishing".to_string()));
+                } else {
+                    WIDGET_CLICK_DRIVER.with(|driver| {
+                        let mut driver = driver.borrow_mut();
+                        if driver.details_preview_move.is_some() {
+                            let _ =
+                                reply
+                                    .send(Err("another Details preview pointer move is pending"
+                                        .to_string()));
+                        } else {
+                            driver.details_preview_move = Some(reply);
+                        }
+                    });
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
                 }
             }
             UiCommand::ValidateSelectedOwner {
@@ -2441,6 +5219,60 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
                     runtime.fail_environment(message.clone(), frame);
                 }
                 let _ = reply.send(result);
+            }
+            UiCommand::Capture {
+                label,
+                scope,
+                selection,
+                reply,
+            } => {
+                let native_viewports =
+                    ctx.input(|input| input.raw.viewports.keys().copied().collect());
+                let result = if runtime.finish.is_some() {
+                    Err("script is already finishing".to_string())
+                } else {
+                    runtime
+                        .capture_targets(scope, &selection, &native_viewports)
+                        .and_then(|targets| {
+                            for target in targets.iter().take(16) {
+                                let window = runtime.authoritative_windows.iter().find(|window| window.viewport_id == target.viewport_id);
+                                crate::logger::log(format!(
+                                    "[capture-probe] batch_start label={label} role={} viewport={:?} expected={} residence={} presentation={:?} backend_token={:?} hwnd={:?} native_registered={}",
+                                    target.role,
+                                    target.viewport_id,
+                                    window.and_then(|window| window.identity.as_ref()).map(|identity| identity.describe()).unwrap_or_else(|| "missing".into()),
+                                    window.map(|window| window.residence.as_str()).unwrap_or("missing"),
+                                    target.presentation,
+                                    window.and_then(|window| window.backend_token),
+                                    window.and_then(|window| window.hwnd),
+                                    native_viewports.contains(&target.viewport_id)
+                                ));
+                            }
+                            if targets.len() > 16 {
+                                crate::logger::log(format!(
+                                    "[capture-probe] batch_start additional_targets_suppressed={}",
+                                    targets.len() - 16
+                                ));
+                            }
+                            runtime
+                                .capture
+                                .as_mut()
+                                .ok_or_else(|| {
+                                    "screenshot evidence output is unavailable".to_string()
+                                })?
+                                .request(
+                                    ctx,
+                                    &label,
+                                    targets,
+                                    capture::EXPLICIT_TIMEOUT,
+                                    Some(reply.clone()),
+                                )
+                                .map(|_| ())
+                        })
+                };
+                if let Err(error) = result {
+                    let _ = reply.send(Err(error));
+                }
             }
             UiCommand::Log(message) => {
                 crate::logger::log(format!("[test-script] {message}"));
@@ -2458,12 +5290,31 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
         );
     }
 
+    runtime.request_failure_capture(ctx, |outcome| {
+        let exit_code = outcome.kind.exit_code();
+        PROCESS_EXIT_CODE.store(exit_code, Ordering::Release);
+        crate::logger::log(format!(
+            "[test-script] failure capture guarded kind={:?} exit_code={exit_code} message={}",
+            outcome.kind, outcome.message
+        ));
+        arm_shutdown_watchdog(exit_code, "failure-capture");
+    });
+    if let Some(capture) = runtime.capture.as_mut() {
+        capture.poll();
+    }
+
     let mut close = false;
     if let Some(finish) = runtime.finish.as_mut() {
         if new_frame && frame != finish.started_frame {
             finish.newer_frames = finish.newer_frames.saturating_add(1);
         }
-        if finish.newer_frames >= 2 && crate::key_input::synthetic_input_is_idle() {
+        let capture_done = runtime.failure_capture_batch.is_none_or(|batch| {
+            runtime
+                .capture
+                .as_ref()
+                .is_none_or(|capture| !capture.is_pending(batch))
+        });
+        if finish.newer_frames >= 2 && crate::key_input::synthetic_input_is_idle() && capture_done {
             let outcome = finish.outcome.clone();
             PROCESS_EXIT_CODE.store(outcome.kind.exit_code(), Ordering::Release);
             crate::logger::log(format!(
@@ -2479,7 +5330,7 @@ pub(crate) fn ui_update(ctx: &egui::Context, snapshot: TestScriptSnapshot) -> bo
         } else {
             ctx.request_repaint_of(egui::ViewportId::ROOT);
         }
-    } else if !crate::key_input::synthetic_input_is_idle() {
+    } else if !crate::key_input::synthetic_input_is_idle() || widget_click_in_progress() {
         // A held key must keep advancing the deterministic repeat timeline even
         // while the application would otherwise sleep.
         ctx.request_repaint_of(egui::ViewportId::ROOT);
@@ -2510,13 +5361,54 @@ pub(crate) fn publish_window_frame(
     owner: TestScriptWindowIdentity,
     content: Option<TestScriptContentProof>,
 ) {
+    let viewport = owner.viewport_id();
+    let Ok(mut guard) = runtime().lock() else {
+        discard_drawn_paint(viewport);
+        return;
+    };
+    let Some(runtime) = guard.as_mut() else {
+        discard_drawn_paint(viewport);
+        return;
+    };
+    let _ = runtime.publish_window_frame(owner, content);
+}
+
+/// The restore worker applied at least one sidecar value to the central store.
+pub(crate) fn publish_sidecar_import(context_serial: u64, items_generation: u64) {
+    publish_sidecar_observation(
+        context_serial,
+        items_generation,
+        TestScriptSidecarObservation::Imported,
+    );
+}
+
+/// A nonempty, validated sidecar reached the terminal restore path for this context.
+pub(crate) fn publish_sidecar_load(context_serial: u64, items_generation: u64) {
+    publish_sidecar_observation(
+        context_serial,
+        items_generation,
+        TestScriptSidecarObservation::Loaded,
+    );
+}
+
+fn publish_sidecar_observation(
+    context_serial: u64,
+    items_generation: u64,
+    observation: TestScriptSidecarObservation,
+) {
     let Ok(mut guard) = runtime().lock() else {
         return;
     };
     let Some(runtime) = guard.as_mut() else {
         return;
     };
-    let _ = runtime.publish_window_frame(owner, content);
+    runtime
+        .sidecar_observations
+        .insert((context_serial, items_generation, observation));
+    let joined = runtime.joined_windows();
+    if let Ok(mut snapshot) = runtime.snapshot.write() {
+        snapshot.windows = joined;
+    }
 }
 
 pub(crate) fn publish_pointer_show(
@@ -2795,11 +5687,1052 @@ pub(crate) fn cli_script_path_from(args: &[std::ffi::OsString]) -> Result<Option
     Ok(script_path)
 }
 
+pub(crate) fn cli_capture_dir_from(args: &[std::ffi::OsString]) -> Result<Option<PathBuf>, String> {
+    let mut run_dir = None;
+    let mut index = 1usize;
+    while index < args.len() {
+        if args[index] == "--" {
+            break;
+        }
+        if args[index] == "--test-evidence-dir" {
+            if run_dir.is_some() {
+                return Err("--test-evidence-dir may only be specified once".into());
+            }
+            let value = args
+                .get(index + 1)
+                .ok_or("--test-evidence-dir requires a path value")?;
+            if value.is_empty() || value.to_string_lossy().starts_with("--") {
+                return Err("--test-evidence-dir requires a path value".into());
+            }
+            run_dir = Some(PathBuf::from(value));
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    let scripted = cli_script_path_from(args)?.is_some();
+    if scripted && run_dir.is_none() {
+        return Err("--test-script requires --test-evidence-dir".into());
+    }
+    if !scripted && run_dir.is_some() {
+        return Err("--test-evidence-dir requires --test-script".into());
+    }
+    Ok(run_dir)
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(all(windows, feature = "test-script"))]
+    #[test]
+    fn click_widget_reaches_an_egui_button_handler() {
+        let (reply, received) = std::sync::mpsc::sync_channel(1);
+        super::request_widget_click("Test button".to_string(), reply).unwrap();
+        let ctx = egui::Context::default();
+        let render = |mut input: egui::RawInput| {
+            input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 300.0),
+            ));
+            ctx.begin_pass(input);
+            let mut clicked = false;
+            egui::CentralPanel::default().show(&ctx, |ui| {
+                let response = ui.button("Test button");
+                super::register_clickable_widget("Test button", &response);
+                clicked = response.clicked();
+            });
+            let _ = ctx.end_pass();
+            clicked
+        };
+
+        assert!(!render(egui::RawInput {
+            time: Some(0.0),
+            focused: true,
+            ..Default::default()
+        }));
+        received
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        let mut down = egui::RawInput {
+            time: Some(0.01),
+            focused: true,
+            ..Default::default()
+        };
+        super::append_widget_click_events(&mut down);
+        assert!(!render(down));
+        let mut up = egui::RawInput {
+            time: Some(0.02),
+            focused: true,
+            ..Default::default()
+        };
+        super::append_widget_click_events(&mut up);
+        assert!(render(up));
+    }
+
+    #[test]
+    fn rating_sort_smoke_script_parses_without_launching_the_app() {
+        let script = include_str!("../scripts/ui-smoke/rating-sort.rhai");
+        let mut engine = rhai::Engine::new();
+        engine.set_max_expr_depths(64, 64);
+        engine.compile(script).unwrap();
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn widget_pointer_double_click_and_hover_work_without_focus() {
+        for kind in [
+            super::WidgetClickKind::Double,
+            super::WidgetClickKind::Hover,
+        ] {
+            let (reply, received) = std::sync::mpsc::sync_channel(1);
+            super::request_widget_pointer(
+                "row".into(),
+                super::WidgetPointerRequestKind::ClickEnabled(kind),
+                reply,
+            )
+            .unwrap();
+            let ctx = egui::Context::default();
+            let render = |time, inject| {
+                let mut input = egui::RawInput {
+                    time: Some(time),
+                    focused: false,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(400.0, 300.0),
+                    )),
+                    ..Default::default()
+                };
+                if inject {
+                    super::append_widget_click_events(&mut input);
+                }
+                ctx.begin_pass(input);
+                let mut result = (false, false);
+                egui::CentralPanel::default().show(&ctx, |ui| {
+                    let response = ui.button("row");
+                    super::register_clickable_widget("row", &response);
+                    result = (response.clicked(), response.double_clicked());
+                });
+                let _ = ctx.end_pass();
+                result
+            };
+            assert_eq!(render(0.0, false), (false, false));
+            received
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap()
+                .unwrap();
+            if kind == super::WidgetClickKind::Double {
+                assert_eq!(render(0.01, true), (false, false));
+                assert_eq!(render(0.02, true), (true, false));
+                assert_eq!(render(0.03, true), (false, false));
+                assert_eq!(render(0.04, true), (true, true));
+            } else {
+                assert_eq!(render(0.01, true), (false, false));
+            }
+            assert!(!super::widget_click_in_progress());
+        }
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn grid_pointer_request_identifies_generation_index_and_name() {
+        let ctx = egui::Context::default();
+        let (reply, _) = std::sync::mpsc::sync_channel(1);
+        super::request_widget_pointer(
+            "grid-row:42:11:12-folder".into(),
+            super::WidgetPointerRequestKind::ClickEnabled(super::WidgetClickKind::Hover),
+            reply,
+        )
+        .unwrap();
+        assert_eq!(
+            super::requested_grid_row(&ctx),
+            Some(super::GridRowPointerTarget::IndexName {
+                generation: 42,
+                index: 11,
+                name: "12-folder".into()
+            })
+        );
+        super::WIDGET_CLICK_DRIVER.with(|driver| *driver.borrow_mut() = Default::default());
+        let (reply, _) = std::sync::mpsc::sync_channel(1);
+        super::request_widget_pointer(
+            "places-menu".into(),
+            super::WidgetPointerRequestKind::ClickEnabled(super::WidgetClickKind::Single),
+            reply,
+        )
+        .unwrap();
+        assert_eq!(super::requested_grid_row(&ctx), None);
+        super::WIDGET_CLICK_DRIVER.with(|driver| *driver.borrow_mut() = Default::default());
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn rating_folder_back_adopts_large_rating_with_real_bounded_snapshot_prefix() {
+        let items: Vec<_> = (0..600)
+            .map(|index| {
+                crate::grid_item::GridItem::Image(std::path::PathBuf::from(format!(
+                    r"C:\fixture\{index:04}.png"
+                )))
+            })
+            .collect();
+        let mut snapshot = ready_snapshot();
+        snapshot.items_len = items.len() as i64;
+        snapshot.item_names = super::item_names_for_snapshot(&items);
+        snapshot.grid_surface = "Rating { stars: 3 }".into();
+        snapshot.current_folder_path = r"C:\fixture\__rating_view__".into();
+        snapshot.items_generation = 42;
+        snapshot.focused = false;
+        snapshot.target_registered = false;
+        assert_eq!(snapshot.item_names.len(), super::MAX_ITEM_ROWS_IN_SNAPSHOT);
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let engine = build_engine(bridge);
+        let helpers = engine
+            .compile(
+                include_str!("../scripts/ui-smoke/rating-folder-back.rhai")
+                    .split("// Scenario entry:")
+                    .next()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(
+            engine
+                .call_fn::<bool>(
+                    &mut rhai::Scope::new(),
+                    &helpers,
+                    "grid_adopted",
+                    (
+                        snapshot.to_rhai_map(),
+                        snapshot.grid_surface.clone(),
+                        snapshot.current_folder_path.clone(),
+                        600_i64,
+                        41_i64
+                    )
+                )
+                .unwrap()
+        );
+        snapshot.item_names.reverse(); // Order and projection prefix do not define adoption.
+        assert!(
+            engine
+                .call_fn::<bool>(
+                    &mut rhai::Scope::new(),
+                    &helpers,
+                    "grid_adopted",
+                    (
+                        snapshot.to_rhai_map(),
+                        snapshot.grid_surface.clone(),
+                        snapshot.current_folder_path.clone(),
+                        600_i64,
+                        41_i64
+                    )
+                )
+                .unwrap()
+        );
+    }
+
+    #[cfg(all(windows, feature = "test-script"))]
+    #[test]
+    fn rating_folder_back_key_pointer_reveals_and_double_clicks_actual_large_grid_without_focus() {
+        use crate::grid_item::GridItem;
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.grid_cols = 10;
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
+        app.settings.thumb_aspect_auto = false;
+        app.settings.thumb_aspect = crate::settings::ThumbAspect::Portrait3x4;
+        app.settings.auto_fullscreen_image_folders = false;
+        app.settings.grid_open_selected_item_on_click = false;
+        app.items = (0..600)
+            .map(|index| GridItem::Folder(app.tmp.path().join(format!("{index:04}-folder"))))
+            .collect();
+        app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending; 600];
+        app.visible_indices = (0..600).collect();
+        app.selected = Some(0);
+        app.scroll_to_selected = false;
+        let key = app.items[310].container_path().unwrap().to_path_buf();
+        std::fs::create_dir(&key).unwrap();
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let label = format!("grid-key:{}:{}", app.items_generation, key.display());
+        let mut time = 0.0;
+        let mut draw = |app: &mut crate::app::AppTestEnvForTest| {
+            time += 0.01;
+            let mut input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 1000.0),
+                )),
+                focused: false,
+                time: Some(time),
+                ..Default::default()
+            };
+            super::append_widget_click_events(&mut input);
+            let mut navigation = None;
+            let _ = ctx.run(input, |ctx| navigation = app.render_grid(ctx));
+            navigation
+        };
+        assert!(draw(&mut app).is_none());
+        let initial = app.test_script_snapshot(&ctx);
+        assert_eq!(initial.items_len, 600);
+        assert_eq!(initial.item_names.len(), super::MAX_ITEM_ROWS_IN_SNAPSHOT);
+        for kind in [
+            super::WidgetClickKind::Hover,
+            super::WidgetClickKind::Double,
+        ] {
+            let (reply, received) = std::sync::mpsc::sync_channel(1);
+            super::request_widget_pointer(
+                label.clone(),
+                super::WidgetPointerRequestKind::ClickEnabled(kind),
+                reply,
+            )
+            .unwrap();
+            let mut acked = false;
+            let mut navigation = None;
+            // Bound the fake-frame simulation to one second while draining reveal/readback
+            // and the normal pointer edges. This is not a real-time sleep.
+            for _ in 0..100 {
+                navigation = draw(&mut app).or(navigation);
+                if let Ok(result) = received.try_recv() {
+                    result.unwrap();
+                    acked = true;
+                }
+                if acked && !super::widget_click_in_progress() {
+                    break;
+                }
+            }
+            assert!(
+                acked,
+                "target key never reached its actual cell: offset={} geometry={:?}",
+                app.scroll_offset_y,
+                super::grid_observation::snapshot(&ctx)
+            );
+            assert!(!super::widget_click_in_progress());
+            if kind == super::WidgetClickKind::Hover {
+                assert!(navigation.is_none());
+                assert_eq!(app.selected, Some(0), "hover must not select or open");
+                assert!(app.scroll_offset_y > 20.0 * app.last_cell_h);
+            } else {
+                assert_eq!(app.selected, Some(310));
+                assert!(
+                    matches!(navigation, Some(crate::ui_main::AddressBarNav::Direct(path, _)) if path == key)
+                );
+                // Grid evidence is painted before the click handler, just like the suite's
+                // later-frame adoption barrier. Observe the next pass, without more input.
+                assert!(draw(&mut app).is_none());
+                let observed = super::grid_observation::snapshot(&ctx);
+                assert_eq!(observed.selected_name, "0310-folder");
+                assert_eq!(observed.selected_key, key.to_string_lossy());
+                assert!(observed.to_rhai_map()["visible"].clone().cast::<bool>());
+            }
+        }
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn grid_pointer_key_resolves_beyond_snapshot_prefix_and_rejects_stale_missing_duplicate() {
+        use super::GridRowPointerTarget;
+        use crate::grid_item::GridItem;
+        let mut items: Vec<_> = (0..600)
+            .map(|index| {
+                GridItem::Folder(std::path::PathBuf::from(format!(
+                    r"C:\fixture\{index:04}-folder"
+                )))
+            })
+            .collect();
+        let target = GridRowPointerTarget::parse(r"grid-key:42:C:\fixture\0310-folder").unwrap();
+        assert_eq!(target.resolve(42, &items), Some(310));
+        assert_eq!(target.resolve(41, &items), None);
+        assert_eq!(target.resolve(42, &items[..16]), None);
+        assert_eq!(GridRowPointerTarget::parse("grid-key:42:"), None);
+        items.swap(310, 590);
+        assert_eq!(target.resolve(42, &items), Some(590));
+        items.push(items[590].clone());
+        assert_eq!(target.resolve(42, &items), None);
+        let exact = GridRowPointerTarget::parse("grid-row:42:590:0310-folder").unwrap();
+        assert_eq!(exact.resolve(42, &items), Some(590));
+        assert_eq!(exact.resolve(41, &items), None);
+        assert_eq!(
+            GridRowPointerTarget::parse("grid-row:42:590:wrong")
+                .unwrap()
+                .resolve(42, &items),
+            None
+        );
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn rating_folder_back_scenario_compiles_with_the_registered_api() {
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        build_engine(bridge)
+            .compile(
+                &std::fs::read_to_string(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("scripts/ui-smoke/rating-folder-back.rhai"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn rating_folder_back_waits_allow_unfocused_but_reject_unadopted_snapshots() {
+        let script = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("scripts/ui-smoke/rating-folder-back.rhai"),
+        )
+        .unwrap();
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let engine = build_engine(bridge);
+        let helpers = engine
+            .compile(script.split("// Scenario entry:").next().unwrap())
+            .unwrap();
+        let mut scope = rhai::Scope::new();
+        let mut adopted = ready_snapshot();
+        adopted.grid_surface = "Folder".into();
+        adopted.current_folder_path = r"C:\fixture\12-folder".into();
+        adopted.item_names = vec!["page-04.png".into()];
+        adopted.items_len = 1;
+        adopted.items_generation = 10;
+        adopted.target_registered = false;
+        adopted.focused = false;
+        let arrival = |snapshot: TestScriptSnapshot| {
+            engine
+                .call_fn::<bool>(
+                    &mut rhai::Scope::new(),
+                    &helpers,
+                    "grid_adopted",
+                    (
+                        snapshot.to_rhai_map(),
+                        "Folder".to_string(),
+                        r"C:\fixture\12-folder".to_string(),
+                        1_i64,
+                        9_i64,
+                    ),
+                )
+                .unwrap()
+        };
+        assert!(arrival(adopted.clone()));
+        for field in [
+            "startup_open_pending",
+            "is_fullscreen",
+            "popup_open",
+            "modal_open",
+            "text_input_or_pending_focus",
+            "ime_active",
+            "grid_surface",
+            "current_folder_path",
+            "items_len",
+            "items_generation",
+        ] {
+            let mut stale = adopted.clone();
+            match field {
+                "startup_open_pending" => stale.startup_open_pending = true,
+                "is_fullscreen" => stale.is_fullscreen = true,
+                "popup_open" => stale.popup_open = true,
+                "modal_open" => stale.modal_open = true,
+                "text_input_or_pending_focus" => stale.text_input_or_pending_focus = true,
+                "ime_active" => stale.ime_active = true,
+                "grid_surface" => stale.grid_surface = "Rating { stars: 3 }".into(),
+                "current_folder_path" => {
+                    stale.current_folder_path = r"C:\fixture\other-folder".into()
+                }
+                "items_len" => stale.items_len = 0,
+                "items_generation" => stale.items_generation = 9,
+                _ => unreachable!(),
+            }
+            assert!(!arrival(stale), "accepted incomplete adoption: {field}");
+        }
+        let mut unregistered = ready_snapshot();
+        unregistered.target_registered = false;
+        assert!(
+            !engine
+                .call_fn::<bool>(
+                    &mut scope,
+                    &helpers,
+                    "input_ready",
+                    (unregistered.to_rhai_map(),)
+                )
+                .unwrap()
+        );
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn rating_folder_back_aspect_wait_rejects_square_incomplete_and_stale_grids() {
+        let script = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("scripts/ui-smoke/rating-folder-back.rhai"),
+        )
+        .unwrap();
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let engine = build_engine(bridge);
+        let helpers = engine
+            .compile(script.split("// Scenario entry:").next().unwrap())
+            .unwrap();
+        let mut settled = ready_snapshot();
+        settled.item_names = vec!["row".into(); 15];
+        settled.items_len = 15;
+        settled.items_generation = 10;
+        settled.grid_observation.generation = 10;
+        settled.grid_observation.aspect_auto = true;
+        settled.grid_observation.aspect_label = "3:4".into();
+        settled.grid_observation.aspect_sample_count = 15;
+        let ready = |snapshot: TestScriptSnapshot| {
+            engine
+                .call_fn::<bool>(
+                    &mut rhai::Scope::new(),
+                    &helpers,
+                    "tall_aspect_ready",
+                    (snapshot.to_rhai_map(),),
+                )
+                .unwrap()
+        };
+        assert!(ready(settled.clone()));
+        let mut large = settled.clone();
+        large.item_names = vec!["row".into(); super::MAX_ITEM_ROWS_IN_SNAPSHOT];
+        large.items_len = 600;
+        large.grid_observation.aspect_sample_count = 31;
+        assert!(ready(large.clone()));
+        large.grid_observation.aspect_sample_count = 30;
+        assert!(!ready(large));
+        for variation in 0..4 {
+            let mut incomplete = settled.clone();
+            match variation {
+                0 => incomplete.grid_observation.aspect_label = "1:1".into(),
+                1 => incomplete.grid_observation.aspect_sample_count = 14,
+                2 => incomplete.grid_observation.generation = 9,
+                _ => incomplete.grid_observation.aspect_auto = false,
+            }
+            assert!(!ready(incomplete));
+        }
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn rating_folder_back_entry_prepares_eight_pages_without_full_list_names() {
+        let script = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("scripts/ui-smoke/rating-folder-back.rhai"),
+        )
+        .unwrap();
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let engine = build_engine(bridge);
+        let entry = script
+            .split("// Scenario entry:")
+            .nth(1)
+            .unwrap()
+            .split_once('\n')
+            .unwrap()
+            .1;
+        let prefix = entry.split("wait_until(").next().unwrap();
+        let mut scope = rhai::Scope::new();
+        engine.eval_with_scope::<()>(&mut scope, prefix).unwrap();
+        assert!(!scope.contains("rating_names"));
+        let pages = scope.get_value::<rhai::Array>("pages").unwrap();
+        assert_eq!(pages.len(), 8);
+        assert_eq!(pages[3].clone().cast::<String>(), "page-04.png");
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn rating_folder_back_mid_list_geometry_executes_with_ten_columns_and_seventy_cells() {
+        let script = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("scripts/ui-smoke/rating-folder-back.rhai"),
+        )
+        .unwrap();
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let engine = build_engine(bridge);
+        let helpers = engine
+            .compile(script.split("// Scenario entry:").next().unwrap())
+            .unwrap();
+        let mut snapshot = ready_snapshot();
+        snapshot.item_names = vec!["row".into(); super::MAX_ITEM_ROWS_IN_SNAPSHOT];
+        snapshot.items_len = 600;
+        snapshot.grid_observation.columns = 10;
+        snapshot.grid_observation.cell_height = 120.0;
+        snapshot.grid_observation.viewport =
+            egui::Rect::from_min_size(egui::pos2(0.0, 100.0), egui::vec2(900.0, 840.0));
+        snapshot.grid_observation.scroll_offset = 25.0 * 120.0;
+        snapshot.grid_observation.content_height = 60.0 * 120.0;
+        snapshot.selected_index = 587; // Raw item order need not match display position 309.
+        snapshot.grid_observation.selected_index = 587;
+        snapshot.grid_observation.row_content_y = 30.0 * 120.0;
+        snapshot.grid_observation.row_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 100.0 + 5.0 * 120.0),
+            egui::vec2(90.0, 120.0),
+        ));
+        let check = |snapshot: TestScriptSnapshot| {
+            engine
+                .call_fn::<bool>(
+                    &mut rhai::Scope::new(),
+                    &helpers,
+                    "mid_list_geometry",
+                    (snapshot.to_rhai_map(),),
+                )
+                .unwrap()
+        };
+        assert!(check(snapshot.clone()));
+        snapshot.grid_observation.selected_name = "0310-folder".into();
+        snapshot.grid_observation.selected_key = r"C:\fixture\0310-folder".into();
+        let returned = |snapshot: TestScriptSnapshot| {
+            engine
+                .call_fn::<bool>(
+                    &mut rhai::Scope::new(),
+                    &helpers,
+                    "returned_row_matches",
+                    (
+                        snapshot.to_rhai_map(),
+                        r"C:\fixture\0310-folder".to_string(),
+                        "0310-folder".to_string(),
+                    ),
+                )
+                .unwrap()
+        };
+        assert!(returned(snapshot.clone()));
+        for variation in 0..4 {
+            let mut wrong = snapshot.clone();
+            match variation {
+                0 => wrong.grid_observation.selected_key = r"C:\fixture\other".into(),
+                1 => wrong.grid_observation.selected_name = "other".into(),
+                2 => wrong.grid_observation.selected_index = 3,
+                _ => wrong.grid_observation.row_rect = None,
+            }
+            assert!(!returned(wrong));
+        }
+        snapshot.grid_observation.row_content_y = 31.0 * 120.0;
+        assert!(check(snapshot.clone()));
+        for variation in 0..7 {
+            let mut invalid = snapshot.clone();
+            match variation {
+                0 => invalid.grid_observation.columns = 3,
+                1 => invalid.items_len = 30,
+                2 => invalid.grid_observation.scroll_offset = 55.0 * 120.0,
+                3 => invalid.grid_observation.scroll_offset = 0.0,
+                4 => invalid.grid_observation.viewport.max.y = 1100.0,
+                5 => invalid.grid_observation.row_content_y = 55.0 * 120.0,
+                _ => invalid.grid_observation.row_rect = None,
+            }
+            assert!(
+                !check(invalid),
+                "accepted invalid fixture geometry {variation}"
+            );
+        }
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn rating_folder_back_capture_names_and_budget_fit_the_harness() {
+        let script = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("scripts/ui-smoke/rating-folder-back.rhai"),
+        )
+        .unwrap();
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let engine = build_engine(bridge);
+        let helpers = engine
+            .compile(script.split("// Scenario entry:").next().unwrap())
+            .unwrap();
+        let mut cases = 0;
+        let mut return_captures = 0;
+        for target in ["12-folder", "23-book.zip"] {
+            for kind in [
+                "toolbar",
+                "alt",
+                "browser",
+                "appcommand",
+                "mouse",
+                "backspace",
+            ] {
+                for roundtrip in [false, true] {
+                    if kind == "backspace" && roundtrip {
+                        continue;
+                    }
+                    cases += 1;
+                    let label = engine
+                        .call_fn::<String>(
+                            &mut rhai::Scope::new(),
+                            &helpers,
+                            "case_label",
+                            (target.to_string(), kind.to_string(), roundtrip),
+                        )
+                        .unwrap();
+                    for suffix in [
+                        "-back",
+                        "-second-back",
+                        "-before-open",
+                        "-fourth-page",
+                        "-forward-fourth-page",
+                        "-error-22",
+                    ] {
+                        let checkpoint = format!("{label}{suffix}");
+                        assert!(
+                            !checkpoint.is_empty() && checkpoint.len() <= 48,
+                            "{checkpoint}"
+                        );
+                        assert!(
+                            checkpoint
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                        );
+                    }
+                    return_captures += if roundtrip { 2 } else { 1 };
+                }
+            }
+        }
+        assert_eq!((cases, return_captures), (22, 32));
+        assert!(
+            return_captures + cases <= 64,
+            "even one error capture per case must fit"
+        );
+    }
+
+    #[test]
+    fn collection_sort_smoke_script_parses_without_launching_the_app() {
+        let script = include_str!("../scripts/ui-smoke/rating-sort-collection.rhai");
+        let mut engine = rhai::Engine::new();
+        engine.set_max_expr_depths(64, 64);
+        engine.compile(script).unwrap();
+    }
+
+    #[test]
+    fn folder_history_smoke_script_parses_without_launching_the_app() {
+        let script = include_str!("../scripts/ui-smoke/folder-history.rhai");
+        let mut engine = rhai::Engine::new();
+        engine.set_max_expr_depths(64, 64);
+        engine.compile(script).unwrap();
+    }
+
+    #[test]
+    fn always_on_top_smoke_script_parses_without_launching_the_app() {
+        let mut engine = rhai::Engine::new();
+        engine.set_max_expr_depths(64, 64);
+        engine
+            .compile(include_str!("../scripts/ui-smoke/always-on-top.rhai"))
+            .unwrap();
+        engine
+            .compile(include_str!(
+                "../scripts/ui-smoke/always-on-top-restart.rhai"
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    fn always_on_top_literal_calls_execute_in_the_runner() {
+        let scenario = include_str!("../scripts/ui-smoke/always-on-top.rhai");
+        let call_lines = |name: &str| -> Vec<&str> {
+            let prefix = format!("{name}(\"");
+            scenario
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with(&prefix))
+                .collect()
+        };
+        let keys = call_lines("tap_key");
+        let actions = call_lines("run_action");
+        let smoke = call_lines("always_on_top_smoke");
+        let captures = call_lines("capture");
+        // The Right literal lives in a helper definition; source order is no longer the
+        // runtime call order, but every literal still needs to reach the runner API.
+        assert_eq!(keys.len(), 3);
+        assert_eq!(
+            keys.iter()
+                .filter(|line| **line == "tap_key(\"F12\");")
+                .count(),
+            2
+        );
+        assert_eq!(
+            keys.iter()
+                .filter(|line| **line == "tap_key(\"Right\");")
+                .count(),
+            1
+        );
+        assert!(!actions.is_empty() && !smoke.is_empty() && !captures.is_empty());
+
+        let source = keys
+            .iter()
+            .chain(actions.iter())
+            .chain(smoke.iter())
+            .chain(captures.iter())
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (bridge, rx, _) = runner_bridge(ready_snapshot());
+        spawn_script_source(source, bridge).unwrap();
+        let (mut key_downs, mut action_count, mut smoke_count, mut capture_count) = (0, 0, 0, 0);
+        loop {
+            match rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("runner command")
+            {
+                UiCommand::Key(SyntheticKeyCommand {
+                    kind: SyntheticKeyCommandKind::Down { .. },
+                    ..
+                }) => key_downs += 1,
+                UiCommand::RunAction { request, .. } => {
+                    action_count += 1;
+                    assert!(request.try_deliver());
+                }
+                UiCommand::SmokeAction(_) => smoke_count += 1,
+                UiCommand::Capture { reply, .. } => {
+                    capture_count += 1;
+                    reply.send(Ok(())).unwrap();
+                }
+                UiCommand::Finished(outcome) => {
+                    assert_eq!(
+                        outcome.kind,
+                        ScriptOutcomeKind::Success,
+                        "{}",
+                        outcome.message
+                    );
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(key_downs, keys.len());
+        assert_eq!(action_count, actions.len());
+        assert_eq!(smoke_count, smoke.len());
+        assert_eq!(capture_count, captures.len());
+    }
+
+    #[test]
+    fn details_preview_move_primitive_is_registered_with_the_runner() {
+        let (bridge, rx, _) = runner_bridge(ready_snapshot());
+        spawn_script_source("move_details_preview_pointer(1);".to_string(), bridge).unwrap();
+        let commands = receive_through_finished(&rx);
+        assert!(matches!(
+            commands.last(),
+            Some(UiCommand::Finished(ScriptOutcome {
+                kind: ScriptOutcomeKind::ScriptFailure,
+                message,
+            })) if message.contains("no live root host")
+        ));
+    }
+
+    #[test]
+    fn details_preview_pointer_uses_the_visible_widget_rect() {
+        let (reply, received) = mpsc::sync_channel(1);
+        WIDGET_CLICK_DRIVER.with(|driver| driver.borrow_mut().details_preview_move = Some(reply));
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 300.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let (rect, response) =
+                    ui.allocate_exact_size(egui::vec2(60.0, 24.0), egui::Sense::hover());
+                super::register_details_preview_pointer(
+                    &response,
+                    egui::Rect::from_min_max(
+                        rect.min,
+                        egui::pos2(rect.center().x - 1.0, rect.max.y),
+                    ),
+                );
+                assert!(
+                    received.try_recv().is_err(),
+                    "clipped preview must not be targeted"
+                );
+                super::register_details_preview_pointer(&response, ui.clip_rect());
+                let (point, ppp) = received.try_recv().unwrap().unwrap();
+                assert_eq!(point, rect.center());
+                assert_eq!(ppp, ctx.pixels_per_point());
+            });
+        });
+        WIDGET_CLICK_DRIVER.with(|driver| assert!(driver.borrow().details_preview_move.is_none()));
+    }
+
+    #[test]
+    fn multi_window_pdf_script_with_captures_parses() {
+        let mut engine = rhai::Engine::new();
+        engine.set_max_expr_depths(64, 64);
+        engine
+            .compile(include_str!("../scripts/ui-smoke/multi-window-pdf.rhai"))
+            .expect("PDF smoke script syntax");
+    }
+
+    #[test]
+    fn disabled_sort_row_receives_pointer_events_without_a_click() {
+        let (reply, received) = std::sync::mpsc::sync_channel(1);
+        super::request_widget_pointer(
+            "評価↑".to_string(),
+            super::WidgetPointerRequestKind::SortPopup(super::SortPopupPointerKind::Click),
+            reply,
+        )
+        .unwrap();
+        let ctx = egui::Context::default();
+        let render = |mut input: egui::RawInput| {
+            input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 300.0),
+            ));
+            ctx.begin_pass(input);
+            let mut clicked = false;
+            egui::CentralPanel::default().show(&ctx, |ui| {
+                let response = ui.add_enabled(false, egui::Button::new("評価↑"));
+                super::register_sort_popup_pointer_row("評価↑", &response, ui.clip_rect());
+                clicked = response.clicked();
+            });
+            let _ = ctx.end_pass();
+            clicked
+        };
+        assert!(!render(egui::RawInput {
+            time: Some(0.0),
+            focused: true,
+            ..Default::default()
+        }));
+        received
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        for time in [0.01, 0.02] {
+            let mut input = egui::RawInput {
+                time: Some(time),
+                focused: true,
+                ..Default::default()
+            };
+            super::append_widget_click_events(&mut input);
+            assert_eq!(input.events.len(), 2);
+            assert!(!render(input));
+        }
+    }
+
+    #[test]
+    fn disabled_sort_row_hover_uses_a_pointer_move_without_a_click() {
+        let (reply, received) = std::sync::mpsc::sync_channel(1);
+        super::request_widget_pointer(
+            "評価↑".to_string(),
+            super::WidgetPointerRequestKind::SortPopup(super::SortPopupPointerKind::Hover),
+            reply,
+        )
+        .unwrap();
+        let ctx = egui::Context::default();
+        let render = |mut input: egui::RawInput| {
+            input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 300.0),
+            ));
+            ctx.begin_pass(input);
+            let mut contains_pointer = false;
+            egui::CentralPanel::default().show(&ctx, |ui| {
+                let response = ui.add_enabled(false, egui::Button::new("評価↑"));
+                super::register_sort_popup_pointer_row("評価↑", &response, ui.clip_rect());
+                contains_pointer = response.contains_pointer();
+                assert!(!response.clicked());
+            });
+            let _ = ctx.end_pass();
+            contains_pointer
+        };
+        assert!(!render(egui::RawInput {
+            time: Some(0.0),
+            focused: true,
+            ..Default::default()
+        }));
+        received
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        let mut input = egui::RawInput {
+            time: Some(0.01),
+            focused: true,
+            ..Default::default()
+        };
+        super::append_widget_click_events(&mut input);
+        assert_eq!(input.events.len(), 1);
+        assert!(matches!(input.events[0], egui::Event::PointerMoved(_)));
+        assert!(render(input));
+    }
+
+    #[test]
+    fn collection_sort_popup_readback_tracks_visible_disabled_rows_and_expires() {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 300.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input.clone(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                super::begin_collection_sort_popup(ctx, false, ui.is_enabled());
+                let manual = ui.button("手動");
+                let rating = ui.add_enabled(false, egui::Button::new("評価↑"));
+                let clip = egui::Rect::from_min_max(
+                    manual.rect.min - egui::vec2(1.0, 1.0),
+                    manual.rect.max + egui::vec2(1.0, 1.0),
+                );
+                super::record_collection_sort_popup_row("手動", &manual, clip);
+                super::record_collection_sort_popup_row("評価↑", &rating, clip);
+            });
+        });
+        let observed = super::collection_sort_popup_snapshot(&ctx);
+        assert!(observed.open);
+        assert!(observed.needs_scrolling);
+        assert!(observed.within_screen);
+        assert_eq!(observed.rows.len(), 2);
+        assert!(observed.rows[0].visible);
+        assert!(observed.rows[0].visible_x && observed.rows[0].visible_y);
+        assert!(observed.popup_ui_enabled);
+        assert!(!observed.sort_control_locked);
+        assert!(!observed.rows[0].disabled);
+        assert!(!observed.rows[1].visible);
+        assert!(!observed.rows[1].visible_y);
+        assert!(observed.rows[1].disabled);
+        assert!(observed.rendered_tooltip.is_none());
+        for _ in 0..2 {
+            let _ = ctx.run(input.clone(), |_| {});
+        }
+        assert!(!super::collection_sort_popup_snapshot(&ctx).open);
+    }
+
+    #[test]
+    fn collection_sort_popup_horizontal_clip_is_not_scrolling() {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 300.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                super::begin_collection_sort_popup(ctx, false, ui.is_enabled());
+                let row = ui.button("シャッフル（再選択で並べ直す）");
+                let clip = egui::Rect::from_min_max(
+                    row.rect.min - egui::vec2(1.0, 1.0),
+                    egui::pos2(row.rect.center().x, row.rect.max.y + 1.0),
+                );
+                super::record_collection_sort_popup_row(
+                    "シャッフル（再選択で並べ直す）",
+                    &row,
+                    clip,
+                );
+            });
+        });
+        let popup = super::collection_sort_popup_snapshot(&ctx);
+        assert!(!popup.needs_scrolling);
+        assert!(!popup.rows[0].visible);
+        assert!(!popup.rows[0].visible_x);
+        assert!(popup.rows[0].visible_y);
+        assert!(!popup.rows[0].disabled);
+        assert!(popup.rows[0].geometry.contains("clip="));
+    }
+
     use super::InterruptState;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn multi_window_rar_nav_script_parses() {
+        rhai::Engine::new()
+            .compile(include_str!(
+                "../scripts/ui-smoke/multi-window-rar-nav.rhai"
+            ))
+            .expect("RAR navigation smoke script syntax");
+    }
 
     /// A hold must last as long as it was asked to, even when something wakes the condvar.
     ///
@@ -2899,6 +6832,15 @@ mod tests {
         }
     }
 
+    fn wait_for_runner_exit(rx: &mpsc::Receiver<UiCommand>) {
+        // Finished is sent before its wake callback. The last sender drops only
+        // after that callback returns, so disconnection fences wake assertions.
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+    }
+
     #[test]
     fn cli_requires_isolated_data_dir() {
         let parsed = cli_script_path_from(&args(&[
@@ -2920,6 +6862,133 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(parsed, Some(PathBuf::from("smoke.rhai")));
+    }
+
+    #[test]
+    fn cli_capture_dir_is_required_and_kept_with_the_script() {
+        let missing = cli_capture_dir_from(&args(&[
+            "mimageviewer-core.exe",
+            "--data-dir",
+            "sandbox",
+            "--test-script",
+            "smoke.rhai",
+        ]));
+        assert!(missing.unwrap_err().contains("--test-evidence-dir"));
+        let parsed = cli_capture_dir_from(&args(&[
+            "mimageviewer-core.exe",
+            "--data-dir",
+            "sandbox",
+            "--test-script",
+            "smoke.rhai",
+            "--test-evidence-dir",
+            "run-evidence",
+        ]))
+        .unwrap();
+        assert_eq!(parsed, Some(PathBuf::from("run-evidence")));
+        assert!(
+            cli_capture_dir_from(&args(&[
+                "mimageviewer-core.exe",
+                "--test-evidence-dir",
+                "run-evidence",
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn capture_script_call_waits_for_the_ui_reply() {
+        let (bridge, rx, _) = runner_bridge(ready_snapshot());
+        spawn_script_source("capture(\"checkpoint\");".into(), bridge).unwrap();
+        let command = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let UiCommand::Capture {
+            label,
+            scope,
+            selection,
+            reply,
+        } = command
+        else {
+            panic!("expected capture command");
+        };
+        assert_eq!(label, "checkpoint");
+        assert_eq!(scope, CaptureScope::Selected);
+        assert!(matches!(
+            selection,
+            TestScriptActionSelection::LegacyImplicit
+        ));
+        reply.send(Ok(())).unwrap();
+        let commands = receive_through_finished(&rx);
+        assert!(
+            matches!(commands.last(), Some(UiCommand::Finished(outcome)) if outcome.kind == ScriptOutcomeKind::Success)
+        );
+    }
+
+    #[test]
+    fn failure_capture_watchdog_exits_without_another_frame() {
+        const CHILD_ENV: &str = "MIV_TEST_FAILURE_CAPTURE_WATCHDOG_RUN";
+        const ORIGINAL_MESSAGE: &str = "original failure before screenshot";
+        if let Some(run_dir) = std::env::var_os(CHILD_ENV) {
+            let (_tx, rx) = mpsc::channel();
+            let mut runtime = UiRuntime::new(
+                rx,
+                Arc::new(RwLock::new(TestScriptSnapshot::default())),
+                Arc::new(InterruptState::default()),
+                Arc::new(RwLock::new(pointer_input::RegionCatalog::default())),
+            );
+            runtime.capture = Some(capture::Coordinator::new(Path::new(&run_dir)).unwrap());
+            runtime.begin_finish(ScriptOutcome::script_failure(ORIGINAL_MESSAGE), 1);
+            let ctx = egui::Context::default();
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                runtime.request_failure_capture(ctx, |outcome| {
+                    assert_eq!(outcome.message, ORIGINAL_MESSAGE);
+                    PROCESS_EXIT_CODE.store(outcome.kind.exit_code(), Ordering::Release);
+                    println!("failure-capture original message={}", outcome.message);
+                    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                    arm_shutdown_watchdog(outcome.kind.exit_code(), "failure-capture-test");
+                });
+            });
+            assert!(runtime.capture.as_ref().unwrap().is_pending(1));
+            // No second ctx.run or capture.poll: only the process watchdog can
+            // complete this child. The parent kills it if that guarantee fails.
+            std::thread::sleep(SHUTDOWN_WATCHDOG_GRACE + Duration::from_secs(3));
+            panic!("watchdog did not terminate a stalled capture");
+        }
+
+        let runs_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("ui-smoke-runs");
+        std::fs::create_dir_all(&runs_root).unwrap();
+        let run = tempfile::Builder::new()
+            .prefix("watchdog-capture-test-")
+            .tempdir_in(runs_root)
+            .unwrap();
+        let started = Instant::now();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("test_script::tests::failure_capture_watchdog_exits_without_another_frame")
+            .arg("--nocapture")
+            .env(CHILD_ENV, run.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = started + SHUTDOWN_WATCHDOG_GRACE + Duration::from_secs(2);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("failure capture did not exit within the watchdog budget");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(EXIT_SCRIPT_FAILURE));
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(ORIGINAL_MESSAGE),
+            "original failure message missing from child output"
+        );
     }
 
     #[test]
@@ -2989,6 +7058,7 @@ mod tests {
                 ..
             }))
         ));
+        wait_for_runner_exit(&rx);
         assert_eq!(wakes.load(AtomicOrdering::Relaxed), commands.len());
     }
 
@@ -3035,6 +7105,366 @@ mod tests {
     }
 
     #[test]
+    fn action_deadline_rejects_every_boundary_while_worker_diagnostics_are_pending() {
+        for (owner, phase) in [
+            (root_identity(0, 0x101), TargetedActionPhase::AwaitingPass),
+            (root_identity(0, 0x101), TargetedActionPhase::AwaitingFocus),
+            (
+                window_identity(7, 0, 1),
+                TargetedActionPhase::AwaitingDetachedOwner,
+            ),
+        ] {
+            let (bridge, _, _) = runner_bridge(ready_snapshot());
+            let (applied, acknowledgement) = mpsc::sync_channel(4);
+            let late_ack = applied.clone();
+            let request = ActionRequest::new(Instant::now(), applied);
+            let mut active = local_runtime();
+            active.interrupt = Arc::clone(&bridge.interrupt);
+            active
+                .publish_windows(vec![window_snapshot(owner.clone(), 1, 0, "video")])
+                .unwrap();
+            active.pending_actions.push_back(PendingAction {
+                action: KeyAction::ToggleDetachedViewerMode,
+                dispatch: PendingActionDispatch::Targeted {
+                    owner: owner.clone(),
+                    phase,
+                },
+                request: Arc::clone(&request),
+            });
+            let target = TargetedActionAcquisition {
+                owner: owner.clone(),
+                request: Arc::clone(&request),
+                interrupt: Arc::clone(&bridge.interrupt),
+            };
+            let (entered, at_diagnostic) = mpsc::sync_channel(1);
+            let (release, collect_diagnostic) = mpsc::sync_channel(1);
+            let worker = {
+                let request = Arc::clone(&request);
+                std::thread::spawn(move || {
+                    bridge.await_action(
+                        &request,
+                        &acknowledgement,
+                        Duration::from_millis(10),
+                        || {
+                            entered.send(()).unwrap();
+                            collect_diagnostic
+                                .recv_timeout(Duration::from_secs(2))
+                                .unwrap();
+                            "diagnostic gap".into()
+                        },
+                    )
+                })
+            };
+            at_diagnostic.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(
+                active.interrupt.check().is_ok(),
+                "Interrupt is intentionally not published yet"
+            );
+            assert!(!active.consume_action(Some(&owner), KeyAction::ToggleDetachedViewerMode));
+            assert!(!active.peek_action(Some(&owner), KeyAction::ToggleDetachedViewerMode));
+            assert!(
+                active
+                    .probe_targeted_action(&owner, &[CommandScope::Global])
+                    .is_none()
+            );
+            assert!(active.pending_targeted_detached_action().is_none());
+            assert!(!target.is_live());
+            assert!(active.promote_focused_action_targets(|_| true).is_empty());
+            active.finish_targeted_detached_action(&target, Ok(()));
+            assert!(matches!(&active.pending_actions[0].dispatch,
+                PendingActionDispatch::Targeted { phase: actual, .. } if *actual == phase));
+            late_ack.send(Ok(())).unwrap(); // An unproven late ACK cannot change rejection.
+            release.send(()).unwrap();
+            assert!(
+                worker
+                    .join()
+                    .unwrap()
+                    .unwrap_err()
+                    .contains("diagnostic gap")
+            );
+            assert!(matches!(
+                request.outcome(),
+                Some(Err(ActionRejection::Deadline))
+            ));
+        }
+    }
+
+    #[test]
+    fn action_deadline_is_checked_by_ui_even_when_worker_has_not_run() {
+        let owner = root_identity(0, 0x101);
+        for boundary in ["consume", "peek", "probe", "queue"] {
+            let (applied, acknowledgement) = mpsc::sync_channel(1);
+            let request = ActionRequest::new(Instant::now(), applied);
+            let mut active = local_runtime();
+            active
+                .publish_windows(vec![window_snapshot(owner.clone(), 1, 0, "video")])
+                .unwrap();
+            if boundary == "queue" {
+                assert!(
+                    active
+                        .queue_action(
+                            KeyAction::VideoSeekStart,
+                            TestScriptActionSelection::Targeted(owner.clone()),
+                            Arc::clone(&request),
+                            false
+                        )
+                        .is_none()
+                );
+                assert!(active.pending_actions.is_empty());
+            } else {
+                active.pending_actions.push_back(PendingAction {
+                    action: KeyAction::VideoSeekStart,
+                    dispatch: PendingActionDispatch::Targeted {
+                        owner: owner.clone(),
+                        phase: TargetedActionPhase::AwaitingPass,
+                    },
+                    request: Arc::clone(&request),
+                });
+                match boundary {
+                    "consume" => {
+                        assert!(!active.consume_action(Some(&owner), KeyAction::VideoSeekStart))
+                    }
+                    "peek" => assert!(!active.peek_action(Some(&owner), KeyAction::VideoSeekStart)),
+                    "probe" => assert!(
+                        active
+                            .probe_targeted_action(&owner, &[CommandScope::FsVideo])
+                            .is_none()
+                    ),
+                    _ => unreachable!(),
+                }
+            }
+            assert!(active.interrupt.check().is_ok());
+            assert!(acknowledgement.try_recv().unwrap().is_err());
+            assert!(matches!(
+                request.outcome(),
+                Some(Err(ActionRejection::Deadline))
+            ));
+        }
+    }
+
+    #[test]
+    fn action_delivery_reads_time_after_acquiring_its_request_lock() {
+        let (applied, acknowledgement) = mpsc::sync_channel(1);
+        let request = ActionRequest::new(Instant::now() + Duration::from_millis(5), applied);
+        let locked = request.state.lock().unwrap();
+        let (started, waiting) = mpsc::sync_channel(1);
+        let consumer = {
+            let request = Arc::clone(&request);
+            std::thread::spawn(move || {
+                started.send(()).unwrap();
+                request.try_deliver()
+            })
+        };
+        waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(Instant::now() >= request.deadline);
+        drop(locked);
+        assert!(!consumer.join().unwrap());
+        assert!(acknowledgement.try_recv().unwrap().is_err());
+    }
+
+    #[test]
+    fn action_delivery_before_deadline_survives_late_ack_observation_and_same_pass_peeks() {
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let (applied, acknowledgement) = mpsc::sync_channel(1);
+        let deadline = Instant::now();
+        let request = ActionRequest::new(deadline, applied);
+        // Model the earlier consumer clock at the same locked decision boundary.
+        // The real worker clock is already past this immutable deadline below.
+        assert!(
+            matches!(request.resolve_with_clock(ActionRequestAttempt::Deliver,
+            || deadline.checked_sub(Duration::from_millis(1)).unwrap()), Some(Ok(at)) if at < deadline)
+        );
+        let mut pending = VecDeque::from([PendingAction {
+            action: KeyAction::FsClose,
+            dispatch: PendingActionDispatch::LegacyImplicit,
+            request: Arc::clone(&request),
+        }]);
+        assert!(peek_pending_action_from(
+            &mut pending,
+            None,
+            KeyAction::FsClose
+        ));
+        // Deterministically observe a time past the same immutable deadline.
+        assert!(
+            matches!(request.resolve_with_clock(ActionRequestAttempt::Observe,
+            || request.deadline), Some(Ok(at)) if at < request.deadline)
+        );
+        assert!(peek_pending_action_from(
+            &mut pending,
+            None,
+            KeyAction::FsClose
+        ));
+        bridge
+            .await_action(&request, &acknowledgement, RUN_ACTION_TIMEOUT, || {
+                panic!("an in-time delivery must not collect a timeout diagnostic")
+            })
+            .unwrap();
+        assert_eq!(acknowledgement.try_recv(), Ok(Ok(())));
+        assert!(matches!(
+            acknowledgement.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        assert!(consume_pending_action_from(
+            &mut pending,
+            None,
+            KeyAction::FsClose
+        ));
+        assert!(pending.is_empty());
+        assert!(bridge.interrupt.check().is_ok());
+
+        // Conversely, a bare success notification after expiry is no delivery proof.
+        let (applied, acknowledgement) = mpsc::sync_channel(4);
+        let late_ack = applied.clone();
+        let request = ActionRequest::new(Instant::now(), applied);
+        late_ack.send(Ok(())).unwrap();
+        assert!(
+            bridge
+                .await_action(&request, &acknowledgement, Duration::from_millis(1), || {
+                    "late ACK".into()
+                })
+                .unwrap_err()
+                .contains("timed out")
+        );
+        assert!(!request.try_deliver());
+    }
+
+    #[test]
+    fn targeted_activation_completion_cannot_attach_to_a_replacement_request_for_the_same_owner() {
+        let owner = window_identity(7, 0, 1);
+        let mut active = local_runtime();
+        active
+            .publish_windows(vec![window_snapshot(owner.clone(), 1, 0, "video")])
+            .unwrap();
+        let (applied, _) = mpsc::sync_channel(1);
+        active.queue_action(
+            KeyAction::VideoSeekStart,
+            TestScriptActionSelection::Targeted(owner.clone()),
+            action_request_for_test(applied),
+            false,
+        );
+        let old = active.pending_targeted_detached_action().unwrap();
+        active.release_pending_actions("old request cancelled");
+        let (applied, _) = mpsc::sync_channel(1);
+        active.queue_action(
+            KeyAction::VideoSeekStart,
+            TestScriptActionSelection::Targeted(owner),
+            action_request_for_test(applied),
+            false,
+        );
+        let current = active.pending_targeted_detached_action().unwrap();
+        assert!(!old.is_live());
+        assert!(current.is_live());
+        active.finish_targeted_detached_action(&old, Ok(()));
+        assert!(active.pending_targeted_detached_action().is_some());
+        active.finish_targeted_detached_action(&current, Ok(()));
+        assert!(active.pending_targeted_detached_action().is_none());
+    }
+
+    #[test]
+    fn action_timeout_diagnostic_does_not_wait_for_the_snapshot_writer() {
+        let (bridge, rx, _) = runner_bridge(ready_snapshot());
+        let snapshot = Arc::clone(&bridge.snapshot);
+        let _writer = snapshot.write().unwrap();
+        spawn_script_source("run_action(\"VideoSeekStart\", 20);".into(), bridge).unwrap();
+        let commands = receive_through_finished(&rx);
+        assert!(
+            matches!(commands.last(), Some(UiCommand::Finished(ScriptOutcome {
+            kind: ScriptOutcomeKind::EnvironmentFailure, message,
+        })) if message.contains("snapshot_unavailable") && message.contains("VideoSeekStart"))
+        );
+    }
+
+    #[test]
+    fn run_action_deadline_reports_each_acquisition_phase_and_blocks_late_consumers() {
+        for (owner, focused, phase) in [
+            (root_identity(0, 0x101), false, "AwaitingFocus"),
+            (root_identity(0, 0x101), true, "AwaitingPass"),
+            (window_identity(7, 0, 1), false, "AwaitingDetachedOwner"),
+        ] {
+            let mut snapshot = ready_snapshot();
+            snapshot.is_fullscreen = true;
+            snapshot.fs_idx = 0;
+            snapshot.snapshot_frame = 17;
+            snapshot.windows = vec![window_snapshot(owner.clone(), 1, 0, "video")];
+            let (bridge, rx, _) = runner_bridge(snapshot.clone());
+            *bridge.action_selection.lock().unwrap() =
+                TestScriptActionSelection::Targeted(owner.clone());
+            let mut active = local_runtime();
+            active.snapshot = bridge.snapshot.clone();
+            active.interrupt = bridge.interrupt.clone();
+            active.publish_snapshot(snapshot.clone()).unwrap();
+            spawn_script_source(
+                "run_action(\"ToggleDetachedViewerMode\", 50); log(\"unreachable\");".into(),
+                bridge,
+            )
+            .unwrap();
+            let UiCommand::RunAction {
+                action,
+                selection,
+                request,
+            } = rx.recv_timeout(Duration::from_secs(2)).unwrap()
+            else {
+                panic!("expected action")
+            };
+            active.queue_action(action, selection, request, focused);
+            active.publish_snapshot(snapshot).unwrap();
+            let commands = receive_through_finished(&rx);
+            assert!(
+                matches!(commands.last(), Some(UiCommand::Finished(ScriptOutcome { kind: ScriptOutcomeKind::EnvironmentFailure, message }))
+                if message.contains("run_action timed out") && message.contains(phase) && message.contains("ToggleDetachedViewerMode") && message.contains("snapshot_frame=17") && message.contains(&owner.describe()))
+            );
+            assert!(!commands.iter().any(|c| matches!(c, UiCommand::Log(_))));
+            assert!(!active.consume_action(Some(&owner), action));
+            assert!(!active.peek_action(Some(&owner), action));
+            assert!(
+                active
+                    .probe_targeted_action(&owner, &[CommandScope::Global])
+                    .is_none()
+            );
+            assert!(active.pending_targeted_detached_owner().is_none());
+        }
+    }
+
+    #[test]
+    fn run_action_deadline_also_fails_when_ui_never_receives_the_command() {
+        let (bridge, rx, _) = runner_bridge(ready_snapshot());
+        spawn_script_source("run_action(\"VideoSeekStart\", 20);".into(), bridge).unwrap();
+        let commands = receive_through_finished(&rx); // Retain the sender, but do not acknowledge.
+        assert!(
+            matches!(commands.last(), Some(UiCommand::Finished(ScriptOutcome { kind: ScriptOutcomeKind::EnvironmentFailure, message }))
+            if message.contains("run_action timed out") && message.contains("awaiting consumer acknowledgement"))
+        );
+    }
+
+    #[test]
+    fn wait_until_reports_snapshot_state_and_rejects_late_true_but_keeps_zero_probe() {
+        for (source, succeeds) in [
+            ("wait_until(|s| true, 0);", true),
+            ("wait_until(|s| false, 0);", false),
+            ("wait_until(|s| { sleep(20); true }, 5);", false),
+        ] {
+            let mut snapshot = ready_snapshot();
+            snapshot.snapshot_frame = 31;
+            let (bridge, rx, _) = runner_bridge(snapshot);
+            spawn_script_source(source.into(), bridge).unwrap();
+            let commands = receive_through_finished(&rx);
+            match commands.last().unwrap() {
+                UiCommand::Finished(outcome) if succeeds => {
+                    assert_eq!(outcome.kind, ScriptOutcomeKind::Success)
+                }
+                UiCommand::Finished(outcome) => {
+                    assert_eq!(outcome.kind, ScriptOutcomeKind::ScriptFailure);
+                    assert!(outcome.message.contains("wait_until timed out"));
+                    assert!(outcome.message.contains("snapshot_frame=31"));
+                    assert!(outcome.message.contains("focused="));
+                }
+                _ => panic!("expected completion"),
+            }
+        }
+    }
+
+    #[test]
     fn run_action_translates_ini_name_and_waits_for_ui_acknowledgement() {
         let (bridge, rx, wakes) = runner_bridge(ready_snapshot());
         let action = KeyAction::FsClose;
@@ -3044,11 +7474,11 @@ mod tests {
             UiCommand::RunAction {
                 action: actual,
                 selection,
-                applied,
+                request,
             } => {
                 assert_eq!(actual, action);
                 assert_eq!(selection, TestScriptActionSelection::LegacyImplicit);
-                applied.send(Ok(())).unwrap();
+                assert!(request.try_deliver());
             }
             command => panic!("unexpected command before action acknowledgement: {command:?}"),
         }
@@ -3066,6 +7496,7 @@ mod tests {
                 ..
             }))
         ));
+        wait_for_runner_exit(&rx);
         assert_eq!(
             wakes.load(AtomicOrdering::Relaxed),
             commands.len() + 1,
@@ -3101,11 +7532,11 @@ mod tests {
                 UiCommand::RunAction {
                     action,
                     selection,
-                    applied,
+                    request,
                 } => {
                     assert_eq!(action, KeyAction::GridMoveFirst);
                     assert_eq!(selection, TestScriptActionSelection::Targeted(owner));
-                    applied.send(Ok(())).unwrap();
+                    assert!(request.try_deliver());
                     break;
                 }
                 UiCommand::Log(message) => assert!(message.contains("mode=targeted")),
@@ -3148,7 +7579,7 @@ mod tests {
         let mut pending = VecDeque::from([PendingAction {
             action,
             dispatch: PendingActionDispatch::LegacyImplicit,
-            applied: Some(applied),
+            request: action_request_for_test(applied),
         }]);
 
         assert!(peek_pending_action_from(&mut pending, None, action));
@@ -3198,6 +7629,341 @@ mod tests {
 
     #[cfg(feature = "test-script")]
     #[test]
+    fn native_top_panorama_rejects_a_zero_timeout_before_any_ui_input() {
+        let (bridge, rx, _) = runner_bridge(ready_snapshot());
+        spawn_script_source("reveal_native_top_panorama(0);".to_string(), bridge).unwrap();
+        let commands = receive_through_finished(&rx);
+        assert!(matches!(
+            commands.last(),
+            Some(UiCommand::Finished(ScriptOutcome {
+                kind: ScriptOutcomeKind::ScriptFailure,
+                message,
+            })) if message.contains("greater than zero")
+        ));
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, UiCommand::RunAction { .. } | UiCommand::Key(_)))
+        );
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn native_top_panorama_click_rejects_a_zero_timeout_before_any_ui_input() {
+        let (bridge, rx, _) = runner_bridge(ready_snapshot());
+        spawn_script_source("click_native_top_panorama(0);".to_string(), bridge).unwrap();
+        let commands = receive_through_finished(&rx);
+        assert!(matches!(
+            commands.last(),
+            Some(UiCommand::Finished(ScriptOutcome {
+                kind: ScriptOutcomeKind::ScriptFailure,
+                message,
+            })) if message.contains("greater than zero")
+        ));
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, UiCommand::RunAction { .. } | UiCommand::Key(_)))
+        );
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn native_top_panorama_hover_scenario_compiles_with_the_registered_api() {
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("scripts/ui-smoke/native-top-panorama-hover.rhai"),
+        )
+        .unwrap();
+        build_engine(bridge).compile(&source).unwrap();
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn multi_window_stills_scenario_compiles_with_the_registered_api() {
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("scripts/ui-smoke/multi-window-stills.rhai"),
+        )
+        .unwrap();
+        build_engine(bridge).compile(&source).unwrap();
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn drawn_paint_records_each_submitted_mesh_with_resource_provenance() {
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "paint-observation",
+            egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+            egui::TextureOptions::NEAREST,
+        );
+        let make = |item: &str| {
+            crate::gpu_lanczos::FullscreenPaintResource::direct(texture.clone())
+                .with_test_script_content_proof(TestScriptContentProof {
+                    context_serial: 7,
+                    items_generation: 3,
+                    page_index: 0,
+                    item_identity: item.into(),
+                    source_texture_id: texture.id(),
+                    source_kind: TestScriptPaintSourceKind::FullOrProcessed,
+                    final_composite_complete: false,
+                })
+        };
+        let first = make("folder");
+        let second = make("zip");
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            for (index, resource) in [&first, &second].into_iter().enumerate() {
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(index as f32 * 20.0, 0.0),
+                    egui::vec2(10.0, 15.0),
+                );
+                painter.image(
+                    resource.paint_texture_id(),
+                    rect,
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+                record_drawn_paint(&painter, resource, "normal".into());
+            }
+        });
+        let paints = take_drawn_paint(egui::ViewportId::ROOT);
+        assert_eq!(paints.len(), 2);
+        assert_eq!(paints[0].content.item_identity, "folder");
+        assert_eq!(paints[1].content.item_identity, "zip");
+        assert_ne!(paints[0].vertices[0].0, paints[1].vertices[0].0);
+        assert!(take_drawn_paint(egui::ViewportId::ROOT).is_empty());
+    }
+
+    #[test]
+    fn sidecar_import_evidence_is_tied_to_context_and_items_generation() {
+        let owner = window_identity(7, 11, 13);
+        let current = window_snapshot(owner, 17, 0, "folder::page");
+        let imports = std::collections::HashSet::from([
+            (11, 17, TestScriptSidecarObservation::Loaded),
+            (11, 17, TestScriptSidecarObservation::Imported),
+        ]);
+        let joined = joined_window_snapshots(
+            &[current.clone()],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &imports,
+        );
+        assert!(joined[0].sidecar_imported);
+        assert!(joined[0].sidecar_loaded);
+        let changed = window_snapshot(window_identity(7, 11, 13), 18, 0, "folder::page");
+        let joined = joined_window_snapshots(
+            &[changed],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &imports,
+        );
+        assert!(!joined[0].sidecar_imported);
+        assert!(!joined[0].sidecar_loaded);
+
+        let loaded_only =
+            std::collections::HashSet::from([(11, 17, TestScriptSidecarObservation::Loaded)]);
+        let joined = joined_window_snapshots(
+            &[current],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &loaded_only,
+        );
+        assert!(joined[0].sidecar_loaded);
+        assert!(!joined[0].sidecar_imported);
+    }
+
+    #[test]
+    fn frame_paints_publish_without_legacy_single_page_proof_and_clear_next_frame() {
+        let mut runtime = local_runtime();
+        let owner = window_identity(7, 11, 13);
+        runtime
+            .publish_windows(vec![window_snapshot(owner.clone(), 17, 0, "folder::page")])
+            .unwrap();
+        DRAWN_PAINT.with(|drawn| {
+            drawn.borrow_mut().insert(
+                owner.viewport_id(),
+                vec![PendingPaintObservation {
+                    content: content_proof(
+                        11,
+                        17,
+                        0,
+                        "folder::page",
+                        19,
+                        TestScriptPaintSourceKind::FullOrProcessed,
+                    ),
+                    texture: egui::TextureId::Managed(19),
+                    vertices: vec![([1.0, 2.0], [0.0, 0.0])],
+                    clip: [0.0, 0.0, 10.0, 10.0],
+                    viewport_size: [10.0, 10.0],
+                    pixels_per_point: 1.0,
+                    placement: "frozen".into(),
+                }],
+            );
+        });
+        runtime.publish_window_frame(owner.clone(), None).unwrap();
+        let first = runtime.joined_windows();
+        assert_eq!(first[0].paints.len(), 1);
+        assert!(!first[0].paint_matches_current_page);
+        runtime.publish_window_frame(owner, None).unwrap();
+        assert!(runtime.joined_windows()[0].paints.is_empty());
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn native_top_panorama_click_scenario_compiles_with_the_registered_api() {
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("scripts/ui-smoke/native-top-panorama-click.rhai"),
+        )
+        .unwrap();
+        build_engine(bridge).compile(&source).unwrap();
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn native_seek_strip_whole_lifecycle_scenario_compiles_with_the_registered_api() {
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("scripts/ui-smoke/native-seek-strip-whole-lifecycle.rhai"),
+        )
+        .unwrap();
+        build_engine(bridge).compile(&source).unwrap();
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn audio_tracks_scenario_compiles_with_the_registered_api() {
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let source = include_str!("../scripts/ui-smoke/audio-tracks.rhai");
+        build_engine(bridge).compile(source).unwrap();
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn clipboard_capture_scenario_compiles_with_the_registered_api() {
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        build_engine(bridge)
+            .compile(include_str!("../scripts/ui-smoke/clipboard-capture.rhai"))
+            .unwrap();
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn clipboard_capture_registered_api_rejects_unknown_actions_without_os_access() {
+        let (bridge, rx, _) = runner_bridge(ready_snapshot());
+        let error = build_engine(bridge)
+            .eval::<()>("clipboard_capture_smoke(\"unknown\");")
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown clipboard smoke action"));
+        assert!(rx.try_recv().is_err());
+        let snapshot = ClipboardCaptureSmokeSnapshot {
+            monitor_ready: true,
+            open_count: 17,
+            popup_requests: 23,
+            popup_shows: 29,
+            save_requests: 31,
+            automatic_sequence: 37,
+            paste_count: 41,
+            ..Default::default()
+        };
+        let map = snapshot.to_rhai_map();
+        assert!(map["monitor_ready"].as_bool().unwrap());
+        for (field, expected) in [
+            ("open_count", 17),
+            ("popup_requests", 23),
+            ("popup_shows", 29),
+            ("save_requests", 31),
+            ("automatic_sequence", 37),
+            ("paste_count", 41),
+        ] {
+            assert_eq!(map[field].as_int().unwrap(), expected);
+        }
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn audio_tracks_scenario_waits_for_an_active_detached_video() {
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let engine = build_engine(bridge);
+        // Execute the real scenario helper without running its UI actions.
+        let ast = engine
+            .compile(include_str!("../scripts/ui-smoke/audio-tracks.rhai"))
+            .unwrap()
+            .clone_functions_only();
+        let owner = window_identity_with_backend_token(3, 0, 3, 5);
+        let mut window = window_snapshot(owner.clone(), 1, 0, "multi.mkv");
+        window.residence = "mounted".into();
+        window.media_kind = "video".into();
+        let resolve = |window: TestScriptWindowSnapshot| {
+            let snapshot = TestScriptSnapshot {
+                windows: vec![window],
+                ..Default::default()
+            };
+            engine
+                .call_fn::<Dynamic>(
+                    &mut rhai::Scope::new(),
+                    &ast,
+                    "detached_video",
+                    (snapshot.to_rhai_map(),),
+                )
+                .unwrap()
+        };
+
+        // A registered, Mounted Opening destination is not an action-ready session.
+        // Other also represents Resuming/Closing; parked windows are not active either.
+        for presentation in [
+            TestScriptWindowPresentation::Other,
+            TestScriptWindowPresentation::ParkedLiveImmediate,
+            TestScriptWindowPresentation::PassiveDeferredFrozen,
+        ] {
+            window.presentation = presentation;
+            assert!(window.to_rhai_map()["host_ready"].clone_cast::<bool>());
+            assert!(resolve(window.clone()).is_unit(), "{presentation:?}");
+        }
+
+        // The same Mounted owner becomes eligible after the active viewport renders.
+        window.presentation = TestScriptWindowPresentation::ActiveImmediate;
+        let selected = resolve(window.clone()).cast::<Map>();
+        assert_eq!(selected["window_id"].clone_cast::<rhai::INT>(), 3);
+        assert_eq!(selected["context_serial"].clone_cast::<rhai::INT>(), 0);
+        assert_eq!(selected["backend_token"].clone_cast::<rhai::INT>(), 5);
+        assert_eq!(window.identity, Some(owner.clone()));
+
+        window.identity = None;
+        assert!(resolve(window.clone()).is_unit());
+        window.identity = Some(owner);
+        window.media_kind = "image".into();
+        assert!(resolve(window.clone()).is_unit());
+        window.media_kind = "video".into();
+        window.role = "root".into();
+        assert!(resolve(window).is_unit());
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn native_seek_strip_fixture_exceeds_the_nine_cell_fallback_at_a_bounded_width() {
+        let cell_height = crate::video::seek_strip_layout::SeekStripHeightValues::default()
+            .points(crate::video::seek_strip_layout::SeekStripHeight::Smallest)
+            - crate::video::seek_strip_layout::SEEK_STRIP_CELL_VERTICAL_INSET;
+        let count = crate::video::seek_strip_layout::whole_cell_count(
+            400.0,
+            cell_height,
+            Some(720.0 / 576.0),
+        );
+        assert!(count > 9, "the S4 fixture must distinguish the fallback");
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
     fn native_mouse_runtime_failures_are_environment_failures() {
         let (bridge, rx, _) = runner_bridge(ready_snapshot());
         spawn_script_source("move_native_canvas(0.5, 0.5, 1000);".to_string(), bridge).unwrap();
@@ -3226,6 +7992,43 @@ mod tests {
             published.is_fullscreen = true;
             published.focused = true;
         }
+        let commands = receive_through_finished(&rx);
+        assert!(matches!(
+            commands.last(),
+            Some(UiCommand::Finished(ScriptOutcome {
+                kind: ScriptOutcomeKind::Success,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn selection_barrier_requires_a_later_snapshot_even_when_index_already_matches() {
+        let mut stale = ready_snapshot();
+        stale.snapshot_frame = 12;
+        stale.selected_index = 0;
+        let (bridge, rx, _) = runner_bridge(stale.clone());
+        spawn_script_source(
+            "wait_until(|s| s.snapshot_frame > 12 && s.selected_index == 0, 50);".to_string(),
+            bridge,
+        )
+        .unwrap();
+        let commands = receive_through_finished(&rx);
+        assert!(matches!(
+            commands.last(),
+            Some(UiCommand::Finished(ScriptOutcome {
+                kind: ScriptOutcomeKind::ScriptFailure,
+                message,
+            })) if message.contains("wait_until timed out")
+        ));
+
+        stale.snapshot_frame = 13;
+        let (bridge, rx, _) = runner_bridge(stale);
+        spawn_script_source(
+            "wait_until(|s| s.snapshot_frame > 12 && s.selected_index == 0, 50);".to_string(),
+            bridge,
+        )
+        .unwrap();
         let commands = receive_through_finished(&rx);
         assert!(matches!(
             commands.last(),
@@ -3309,6 +8112,125 @@ mod tests {
             Arc::new(InterruptState::default()),
             pointer_input::new_shared_catalog(),
         )
+    }
+
+    fn action_request_for_test(
+        applied: mpsc::SyncSender<Result<(), String>>,
+    ) -> Arc<ActionRequest> {
+        ActionRequest::new(Instant::now() + RUN_ACTION_TIMEOUT, applied)
+    }
+
+    #[test]
+    fn capture_targets_preserve_frozen_presentation_and_native_registration() {
+        let root = root_identity(0, 0x100);
+        let first = window_identity(1, 1, 1);
+        let second = window_identity(2, 2, 2);
+        let mut runtime = local_runtime();
+        let mut frozen = window_snapshot(first.clone(), 1, 0, "pdf::first");
+        frozen.presentation = TestScriptWindowPresentation::PassiveDeferredFrozen;
+        runtime
+            .publish_windows(vec![
+                window_snapshot(root, 1, 0, "root::page"),
+                frozen,
+                window_snapshot(second.clone(), 1, 0, "pdf::second"),
+            ])
+            .unwrap();
+
+        // Native registration and App presentation are separate facts. A live
+        // native host can hold a frozen passive view with no egui pass.
+        let native_viewports = std::collections::HashSet::from([
+            egui::ViewportId::ROOT,
+            first.viewport_id(),
+            second.viewport_id(),
+        ]);
+        let targets = runtime
+            .capture_targets(
+                CaptureScope::All,
+                &TestScriptActionSelection::LegacyImplicit,
+                &native_viewports,
+            )
+            .unwrap();
+        assert_eq!(targets.len(), 3);
+        assert_eq!(targets[1].viewport_id, first.viewport_id());
+        assert_eq!(targets[1].availability, capture::Availability::Registered);
+        assert_eq!(
+            targets[1].presentation,
+            TestScriptWindowPresentation::PassiveDeferredFrozen
+        );
+        assert_eq!(
+            targets[2].presentation,
+            TestScriptWindowPresentation::ActiveImmediate
+        );
+
+        let selected = runtime
+            .capture_targets(
+                CaptureScope::Selected,
+                &TestScriptActionSelection::Targeted(first.clone()),
+                &native_viewports,
+            )
+            .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            selected[0].presentation,
+            TestScriptWindowPresentation::PassiveDeferredFrozen
+        );
+
+        // If eframe no longer owns that viewport, keep its identity in the
+        // manifest but mark it unavailable rather than waiting for a paint.
+        let native_viewports =
+            std::collections::HashSet::from([egui::ViewportId::ROOT, second.viewport_id()]);
+        let targets = runtime
+            .capture_targets(
+                CaptureScope::All,
+                &TestScriptActionSelection::LegacyImplicit,
+                &native_viewports,
+            )
+            .unwrap();
+        assert_eq!(targets[1].availability, capture::Availability::Absent);
+        assert_eq!(targets[2].availability, capture::Availability::Registered);
+
+        // A parked still host may outlive its context binding. The backend
+        // style witness keeps it in capture("all") even without a window snapshot.
+        let parked_id = egui::ViewportId::from_hash_of(("test-window", 3_u64));
+        runtime
+            .snapshot
+            .write()
+            .unwrap()
+            .host_styles
+            .push(TestScriptHostStyle {
+                role: "detached".into(),
+                window_id: Some(3),
+                presentation: TestScriptWindowPresentation::PassiveDeferredFrozen,
+                viewport: format!("{parked_id:?}"),
+                viewport_id: Some(parked_id),
+                hwnd: 0x3030,
+                backend_token: Some(3),
+                topmost: true,
+                noactivate: false,
+                minimized: false,
+                visible: true,
+                owner_hwnd: 0,
+                foreground_hwnd: 0,
+            });
+        let native_viewports = std::collections::HashSet::from([
+            egui::ViewportId::ROOT,
+            first.viewport_id(),
+            second.viewport_id(),
+            parked_id,
+        ]);
+        let targets = runtime
+            .capture_targets(
+                CaptureScope::All,
+                &TestScriptActionSelection::LegacyImplicit,
+                &native_viewports,
+            )
+            .unwrap();
+        assert_eq!(targets.len(), 4);
+        assert_eq!(targets[3].role, "detached-3");
+        assert_eq!(
+            targets[3].presentation,
+            TestScriptWindowPresentation::PassiveDeferredFrozen
+        );
     }
 
     #[test]
@@ -3468,6 +8390,344 @@ mod tests {
     }
 
     #[test]
+    fn targeted_semantic_probe_is_read_only_and_checks_owner_phase_and_scope() {
+        let owner = root_identity(0, 0x101);
+        let sibling = root_identity(1, 0x102);
+        let mut active = local_runtime();
+        active
+            .publish_windows(vec![window_snapshot(owner.clone(), 1, 0, "video")])
+            .unwrap();
+        let (applied, acknowledged) = mpsc::sync_channel(1);
+        active.queue_action(
+            KeyAction::ToggleDetachedViewerMode,
+            TestScriptActionSelection::Targeted(owner.clone()),
+            action_request_for_test(applied),
+            false,
+        );
+        assert!(
+            active
+                .probe_targeted_action(&owner, &[CommandScope::Global])
+                .is_none()
+        );
+        active.promote_focused_action_targets(|_| true);
+        assert!(
+            active
+                .probe_targeted_action(&sibling, &[CommandScope::Global])
+                .is_none()
+        );
+        assert!(
+            active
+                .probe_targeted_action(&owner, &[CommandScope::FsVideo])
+                .is_none()
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                active.probe_targeted_action(&owner, &[CommandScope::Global]),
+                Some(KeyAction::ToggleDetachedViewerMode)
+            );
+            assert!(matches!(
+                acknowledged.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+        }
+        assert!(active.consume_action(Some(&owner), KeyAction::ToggleDetachedViewerMode));
+        assert_eq!(acknowledged.try_recv().unwrap(), Ok(()));
+        assert!(
+            active
+                .probe_targeted_action(&owner, &[CommandScope::Global])
+                .is_none()
+        );
+        let (applied, _ack) = mpsc::sync_channel(1);
+        active.queue_action(
+            KeyAction::GridMoveFirst,
+            TestScriptActionSelection::Targeted(owner.clone()),
+            action_request_for_test(applied),
+            true,
+        );
+        assert!(
+            active
+                .probe_targeted_action(&owner, &[CommandScope::Global, CommandScope::FsVideo])
+                .is_none()
+        );
+        let (applied, _ack) = mpsc::sync_channel(1);
+        active.queue_action(
+            KeyAction::VideoSeekStart,
+            TestScriptActionSelection::LegacyImplicit,
+            action_request_for_test(applied),
+            true,
+        );
+        assert!(
+            active
+                .probe_targeted_action(&owner, &[CommandScope::Global, CommandScope::FsVideo])
+                .is_none()
+        );
+    }
+
+    #[cfg(all(windows, feature = "test-script"))]
+    #[test]
+    fn root_fullscreen_semantic_actions_reach_guarded_handlers_without_key_events() {
+        let _serial = crate::key_input::lock_test_input();
+        struct ResetRuntime;
+        impl Drop for ResetRuntime {
+            fn drop(&mut self) {
+                runtime().lock().unwrap().take();
+            }
+        }
+        for action in [
+            KeyAction::ToggleDetachedViewerMode,
+            KeyAction::VideoSeekStart,
+            KeyAction::VideoToggleAudioMode,
+        ] {
+            for guard in ["none", "focus", "modal", "text", "ime", "edit"] {
+                let ctx = egui::Context::default();
+                crate::ime_focus::install_ime_input_policy(&ctx);
+                let fixture = eframe::miv_test_script_window_witness::WindowWitnessFixture::new();
+                let _scope = fixture.enter(&ctx, egui::ViewportId::ROOT, 0x1234);
+                let owner = TestScriptWindowIdentity::Root {
+                    context_serial: 0,
+                    hwnd: 0x1234,
+                    backend_token: eframe::miv_test_script_window_witness::active()
+                        .unwrap()
+                        .token(),
+                };
+                let mut app = crate::app::setup_app_for_test();
+                app.main_hwnd = Some(0x1234);
+                let path = PathBuf::from(r"C:\clips\semantic-root.mkv");
+                app.items
+                    .push(crate::grid_item::GridItem::Video(path.clone()));
+                app.thumbnails
+                    .push(crate::grid_item::ThumbnailState::Pending);
+                app.fullscreen_idx = Some(0);
+                app.viewer_presentation = crate::app::ViewerPresentation::Fullscreen;
+                app.settings.detached_viewer_enabled = false;
+                app.settings.detached_viewer_open_images_in_window = false;
+                let player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(path);
+                player.set_position_for_test(100.0);
+                app.fs_cache.insert(
+                    0,
+                    crate::fs_animation::FsCacheEntry::Video {
+                        player: Box::new(player),
+                        load_seq: 0,
+                    },
+                );
+                let mut input = egui::RawInput {
+                    focused: guard != "focus",
+                    ..Default::default()
+                };
+                input
+                    .viewports
+                    .get_mut(&egui::ViewportId::ROOT)
+                    .unwrap()
+                    .focused = Some(guard != "focus");
+                if guard == "ime" {
+                    input.events.extend([
+                        egui::Event::Ime(egui::ImeEvent::Enabled),
+                        egui::Event::Ime(egui::ImeEvent::Preedit("未確定".into())),
+                    ]);
+                }
+                if guard == "modal" {
+                    app.show_about_dialog = true;
+                }
+                if guard == "edit" {
+                    app.erase_mode = true;
+                }
+                let field_id = egui::Id::new("semantic-action-text-owner");
+                let mut text = String::new();
+                let mut request_focus = true;
+                let draw_field = |ctx: &egui::Context,
+                                  text: &mut String,
+                                  request_focus: &mut bool| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        crate::ime_focus::add_singleline(ui, text, Some(request_focus), |edit| {
+                            edit.id(field_id)
+                        });
+                    });
+                };
+                if guard == "text" {
+                    ctx.begin_pass(Default::default());
+                    draw_field(&ctx, &mut text, &mut request_focus);
+                    let _ = ctx.end_pass();
+                    assert_eq!(ctx.memory(|m| m.focused()), Some(field_id));
+                }
+                ctx.begin_pass(input);
+                if guard == "text" {
+                    draw_field(&ctx, &mut text, &mut request_focus);
+                    assert!(ctx.wants_keyboard_input());
+                }
+                let mut active = local_runtime();
+                active
+                    .publish_windows(vec![window_snapshot(owner.clone(), 1, 0, "video")])
+                    .unwrap();
+                let (applied, acknowledged) = mpsc::sync_channel(1);
+                active.queue_action(
+                    action,
+                    TestScriptActionSelection::Targeted(owner.clone()),
+                    action_request_for_test(applied),
+                    true,
+                );
+                assert!(runtime().lock().unwrap().replace(active).is_none());
+                let _reset = ResetRuntime;
+                publish_action_pass_owner(&ctx, Some(owner.clone()));
+                assert!(ctx.input(|i| i.events.is_empty()) || guard == "ime");
+                app.handle_fullscreen_root_key_input(&ctx);
+                if guard == "none" {
+                    assert_eq!(
+                        acknowledged.try_recv(),
+                        Ok(Ok(())),
+                        "action={action:?} guard={guard}"
+                    );
+                    if action == KeyAction::ToggleDetachedViewerMode {
+                        assert!(app.settings.detached_viewer_enabled);
+                    }
+                    if action == KeyAction::VideoSeekStart {
+                        let crate::fs_animation::FsCacheEntry::Video { player, .. } =
+                            app.fs_cache.get(&0).unwrap()
+                        else {
+                            panic!("video")
+                        };
+                        assert_eq!(player.user_seek_base_secs_for_test(), 0.0);
+                    }
+                    assert!(!consume_pending_action(&ctx, action));
+                } else {
+                    assert!(
+                        matches!(acknowledged.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                        "guard={guard} action={action:?}"
+                    );
+                }
+                let _ = ctx.end_pass();
+            }
+        }
+    }
+
+    #[test]
+    fn targeted_focus_claims_keyboard_focus_on_the_already_foreground_parent() {
+        for owner in [root_identity(11, 0x503), window_identity(7, 11, 14)] {
+            let requests = RefCell::new(Vec::new());
+            assert!(request_action_target_focus_with(
+                &owner,
+                Some(&owner),
+                |candidate| candidate == &owner,
+                owner.hwnd(),
+                |hwnd| requests.borrow_mut().push(("keyboard", hwnd)),
+                |viewport| {
+                    assert_eq!(viewport, owner.viewport_id());
+                    requests.borrow_mut().push(("viewport", 0));
+                },
+            ));
+            assert_eq!(
+                requests.into_inner(),
+                vec![("keyboard", owner.hwnd()), ("viewport", 0)]
+            );
+        }
+    }
+
+    #[test]
+    fn targeted_focus_keeps_normal_activation_when_another_window_is_foreground() {
+        let owner = window_identity(7, 11, 14);
+        let requested = std::cell::Cell::new(false);
+        assert!(request_action_target_focus_with(
+            &owner,
+            Some(&owner),
+            |_| true,
+            owner.hwnd() + 1,
+            |_| panic!("do not force foreground across windows"),
+            |viewport| {
+                assert_eq!(viewport, owner.viewport_id());
+                requested.set(true);
+            },
+        ));
+        assert!(requested.get());
+    }
+
+    #[test]
+    fn targeted_focus_rejects_stale_owner_or_backend_before_any_input() {
+        let owner = window_identity_with_backend_token(7, 11, 14, 101);
+        let replacements = [
+            window_identity_with_backend_token(8, 11, 14, 101),
+            window_identity_with_backend_token(7, 12, 14, 101),
+            window_identity_with_backend_token(7, 11, 15, 101),
+            window_identity_with_backend_token(7, 11, 14, 102),
+            root_identity(11, owner.hwnd()),
+        ];
+        for current in std::iter::once(None).chain(replacements.iter().map(Some)) {
+            assert!(!request_action_target_focus_with(
+                &owner,
+                current,
+                |_| panic!("stale logical owner must stop before backend/input"),
+                owner.hwnd(),
+                |_| panic!("stale owner must not claim keyboard focus"),
+                |_| panic!("stale owner must not request viewport focus"),
+            ));
+        }
+        assert!(!request_action_target_focus_with(
+            &owner,
+            Some(&owner),
+            |_| false,
+            owner.hwnd(),
+            |_| panic!("replaced backend must not claim keyboard focus"),
+            |_| panic!("replaced backend must not request viewport focus"),
+        ));
+    }
+
+    #[test]
+    fn targeted_focus_request_still_waits_for_observed_focus_and_exact_handler() {
+        for owner in [root_identity(11, 0x503), window_identity(7, 11, 14)] {
+            let action = KeyAction::VideoSeekStart;
+            let mut runtime = local_runtime();
+            runtime
+                .publish_windows(vec![window_snapshot(owner.clone(), 17, 2, "video::owner")])
+                .unwrap();
+            let (applied, acknowledgement) = mpsc::sync_channel(1);
+            runtime.queue_action(
+                action,
+                TestScriptActionSelection::Targeted(owner.clone()),
+                action_request_for_test(applied),
+                false,
+            );
+            if matches!(owner, TestScriptWindowIdentity::Detached { .. }) {
+                let target = runtime.pending_targeted_detached_action().unwrap();
+                runtime.finish_targeted_detached_action(&target, Ok(()));
+            }
+            assert!(request_action_target_focus_with(
+                &owner,
+                Some(&owner),
+                |_| true,
+                owner.hwnd(),
+                |_| {}, // A successful request is not proof that focus changed.
+                |_| {},
+            ));
+            runtime.promote_focused_action_targets(|_| false);
+            assert!(!consume_pending_action_from(
+                &mut runtime.pending_actions,
+                Some(&owner),
+                action
+            ));
+            assert!(matches!(
+                acknowledgement.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            runtime.promote_focused_action_targets(|candidate| candidate == &owner);
+            let sibling = window_identity(8, 12, 15);
+            assert!(!consume_pending_action_from(
+                &mut runtime.pending_actions,
+                Some(&sibling),
+                action
+            ));
+            assert!(consume_pending_action_from(
+                &mut runtime.pending_actions,
+                Some(&owner),
+                action
+            ));
+            assert_eq!(acknowledgement.try_recv().unwrap(), Ok(()));
+            assert!(!consume_pending_action_from(
+                &mut runtime.pending_actions,
+                Some(&owner),
+                action
+            ));
+        }
+    }
+
+    #[test]
     fn targeted_action_waits_for_exact_owner_and_does_not_repeat_after_peek() {
         let owner = window_identity(7, 11, 14);
         let sibling = window_identity(8, 12, 15);
@@ -3485,7 +8745,8 @@ mod tests {
             runtime.queue_action(
                 action,
                 TestScriptActionSelection::Targeted(owner.clone()),
-                applied,
+                action_request_for_test(applied),
+                false,
             ),
             None,
             "detached owner is resolved by App before a pass is eligible"
@@ -3499,7 +8760,20 @@ mod tests {
             Some(&owner),
             action
         ));
-        runtime.finish_targeted_detached_owner(&owner, Ok(()));
+        let target = runtime.pending_targeted_detached_action().unwrap();
+        runtime.finish_targeted_detached_action(&target, Ok(()));
+        assert!(!peek_pending_action_from(
+            &mut runtime.pending_actions,
+            Some(&owner),
+            action
+        ));
+        runtime.promote_focused_action_targets(|candidate| candidate == &sibling);
+        assert!(!peek_pending_action_from(
+            &mut runtime.pending_actions,
+            Some(&owner),
+            action
+        ));
+        runtime.promote_focused_action_targets(|candidate| candidate == &owner);
         assert!(!peek_pending_action_from(
             &mut runtime.pending_actions,
             Some(&sibling),
@@ -3538,6 +8812,69 @@ mod tests {
     }
 
     #[test]
+    fn fullscreen_open_action_never_queues_source_focus_in_its_dispatch_pass() {
+        let owner = root_identity(11, 0x503);
+        let action = KeyAction::GridOpenSelected;
+        let mut runtime = local_runtime();
+        runtime
+            .publish_windows(vec![window_snapshot(
+                owner.clone(),
+                17,
+                0,
+                "still::selected",
+            )])
+            .unwrap();
+
+        // An already focused root dispatches immediately without a Focus command.
+        let (applied, acknowledged) = mpsc::sync_channel(1);
+        assert_eq!(
+            runtime.queue_action(
+                action,
+                TestScriptActionSelection::Targeted(owner.clone()),
+                action_request_for_test(applied),
+                true,
+            ),
+            None
+        );
+        assert!(consume_pending_action_from(
+            &mut runtime.pending_actions,
+            Some(&owner),
+            action
+        ));
+        assert_eq!(acknowledged.try_recv().unwrap(), Ok(()));
+
+        // If the root is unfocused, its Focus belongs to an earlier pass.
+        let (applied, acknowledged) = mpsc::sync_channel(1);
+        assert_eq!(
+            runtime.queue_action(
+                action,
+                TestScriptActionSelection::Targeted(owner.clone()),
+                action_request_for_test(applied),
+                false,
+            ),
+            Some(egui::ViewportId::ROOT)
+        );
+        assert!(!consume_pending_action_from(
+            &mut runtime.pending_actions,
+            Some(&owner),
+            action
+        ));
+        runtime.promote_focused_action_targets(|_| false);
+        assert!(!consume_pending_action_from(
+            &mut runtime.pending_actions,
+            Some(&owner),
+            action
+        ));
+        runtime.promote_focused_action_targets(|candidate| candidate == &owner);
+        assert!(consume_pending_action_from(
+            &mut runtime.pending_actions,
+            Some(&owner),
+            action
+        ));
+        assert_eq!(acknowledged.try_recv().unwrap(), Ok(()));
+    }
+
+    #[test]
     fn root_frame_expiry_does_not_expire_a_detached_target_before_its_pass() {
         let owner = window_identity(7, 11, 14);
         let action = KeyAction::FsClose;
@@ -3549,7 +8886,8 @@ mod tests {
         runtime.queue_action(
             action,
             TestScriptActionSelection::Targeted(owner.clone()),
-            applied,
+            action_request_for_test(applied),
+            false,
         );
 
         runtime.expire_unconsumed_legacy_actions(2);
@@ -3558,7 +8896,9 @@ mod tests {
             acknowledgement.try_recv(),
             Err(mpsc::TryRecvError::Empty)
         ));
-        runtime.finish_targeted_detached_owner(&owner, Ok(()));
+        let target = runtime.pending_targeted_detached_action().unwrap();
+        runtime.finish_targeted_detached_action(&target, Ok(()));
+        runtime.promote_focused_action_targets(|candidate| candidate == &owner);
         runtime.finish_target_pass(&owner, true, 2);
         let error = acknowledgement
             .recv_timeout(Duration::from_secs(1))
@@ -3580,7 +8920,8 @@ mod tests {
         runtime.queue_action(
             action,
             TestScriptActionSelection::Targeted(owner.clone()),
-            applied,
+            action_request_for_test(applied),
+            false,
         );
 
         runtime
@@ -3621,7 +8962,8 @@ mod tests {
         runtime.queue_action(
             action,
             TestScriptActionSelection::Targeted(old_owner),
-            applied,
+            action_request_for_test(applied),
+            false,
         );
 
         runtime
@@ -3647,7 +8989,12 @@ mod tests {
         let owner = window_identity(7, 11, 14);
         let mut runtime = local_runtime();
         let (applied, acknowledgement) = mpsc::sync_channel(1);
-        runtime.queue_action(action, TestScriptActionSelection::LegacyImplicit, applied);
+        runtime.queue_action(
+            action,
+            TestScriptActionSelection::LegacyImplicit,
+            action_request_for_test(applied),
+            true,
+        );
 
         assert!(consume_pending_action_from(
             &mut runtime.pending_actions,
@@ -3758,7 +9105,7 @@ mod tests {
                 owner: old_owner,
                 phase: TargetedActionPhase::AwaitingPass,
             },
-            applied: Some(applied),
+            request: action_request_for_test(applied),
         }]);
 
         assert_eq!(observed_owner, None);
@@ -3831,6 +9178,7 @@ mod tests {
             item_identity: item.to_string(),
             source_texture_id: egui::TextureId::Managed(texture),
             source_kind,
+            final_composite_complete: false,
         }
     }
 
@@ -3850,11 +9198,18 @@ mod tests {
             hwnd: Some(identity.hwnd()),
             backend_token: Some(identity.backend_token()),
             residence: "at_rest".to_string(),
+            presentation: if identity.window_id().is_some() {
+                TestScriptWindowPresentation::ActiveImmediate
+            } else {
+                TestScriptWindowPresentation::Root
+            },
             media_kind: "pdf".to_string(),
             page_index: Some(page_index),
             items_generation: generation,
             item_identity: item.to_string(),
+            selected_item_identity: String::new(),
             page_ready: true,
+            edit_ready: true,
             viewport_rendered: false,
             viewport_revision: 0,
             paint_matches_current_page: false,
@@ -3863,7 +9218,23 @@ mod tests {
             paint_source_texture: String::new(),
             painted_page_index: None,
             paint_revision: 0,
+            paints: Vec::new(),
+            sidecar_imported: false,
+            sidecar_loaded: false,
+            seek_strip: TestScriptSeekStripSnapshot::closed(),
+            audio_track: TestScriptAudioTrackSnapshot::absent(),
         }
+    }
+
+    #[test]
+    fn preview_readiness_and_developed_edit_readiness_are_distinct_in_script_snapshot() {
+        let mut snapshot = window_snapshot(window_identity(7, 11, 13), 17, 2, "camera.dng");
+        snapshot.edit_ready = false;
+        let map = snapshot.to_rhai_map();
+        assert!(map["page_ready"].as_bool().unwrap());
+        assert!(!map["edit_ready"].as_bool().unwrap());
+        snapshot.edit_ready = true;
+        assert!(snapshot.to_rhai_map()["edit_ready"].as_bool().unwrap());
     }
 
     #[test]
@@ -3887,8 +9258,14 @@ mod tests {
             1,
         );
         assert!(
-            joined_window_snapshots(&[current.clone()], &HashMap::new(), &observations)[0]
-                .paint_matches_current_page
+            joined_window_snapshots(
+                &[current.clone()],
+                &HashMap::new(),
+                &observations,
+                &HashMap::new(),
+                &Default::default()
+            )[0]
+            .paint_matches_current_page
         );
 
         let stale_cases = [
@@ -3950,6 +9327,8 @@ mod tests {
                 &[current.clone()],
                 &HashMap::new(),
                 &HashMap::from([(stale, 2)]),
+                &HashMap::new(),
+                &Default::default(),
             );
             assert!(!joined[0].paint_matches_current_page);
         }
@@ -4000,7 +9379,13 @@ mod tests {
             ),
         ]);
 
-        let joined = joined_window_snapshots(&[window], &HashMap::new(), &observations);
+        let joined = joined_window_snapshots(
+            &[window],
+            &HashMap::new(),
+            &observations,
+            &HashMap::new(),
+            &Default::default(),
+        );
         assert!(joined[0].full_texture_painted);
         assert_eq!(joined[0].paint_revision, 2);
         assert_eq!(joined[0].paint_source, "full_or_processed");
@@ -4145,11 +9530,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn poisoned_pointer_catalog_fails_the_actual_show_and_releases_its_exact_step() {
-        let _serial = crate::key_input::TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
-        crate::key_input::clear_test_synthetic_input();
+        let _serial = crate::key_input::lock_test_input();
 
         let ctx = egui::Context::default();
         let viewport = egui::ViewportId::from_hash_of("poisoned-pointer-catalog");
@@ -4323,11 +9704,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn pointer_terminal_ack_cannot_be_masked_by_same_frame_success() {
-        let _serial = crate::key_input::TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
-        crate::key_input::clear_test_synthetic_input();
+        let _serial = crate::key_input::lock_test_input();
         let handle = crate::key_input::SyntheticPointerCancelHandle {
             transaction_id: 73,
             step_id: 73_u64 << 32 | 1,

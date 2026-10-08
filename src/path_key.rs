@@ -6,7 +6,7 @@
 //! ドライブ文字を保持したい場合 (お気に入り検索のスコープ判定など) は
 //! この関数を使わず、呼び出し側で個別に正規化する。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// ドライブルート (`C:\` など) または共有ルートとして扱うパスか。
 ///
@@ -39,6 +39,24 @@ pub fn normalize_keep_drive(path: &Path) -> String {
 /// `normalize_keep_drive` と同じ規則で比較する。
 pub fn eq_keep_drive(a: &Path, b: &Path) -> bool {
     normalize_keep_drive(a) == normalize_keep_drive(b)
+}
+
+/// 実在するパスの表示用表記を取得する。保存キーの大小文字と区切りは変えてよいが、
+/// symlink 解決などで別の論理パスになった場合は採用しない。
+///
+/// Windows の `canonicalize` が返す verbatim prefix を通常の絶対パスへ戻す。
+/// ファイルシステム I/O を行うため、一覧構築 worker からだけ呼ぶ。
+pub(crate) fn restore_existing_path_casing(path: &Path) -> Option<PathBuf> {
+    let canonical = std::fs::canonicalize(path).ok()?;
+    let s = canonical.to_string_lossy();
+    let spelled = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        canonical
+    };
+    eq_keep_drive(&spelled, path).then_some(spelled)
 }
 
 #[cfg(test)]

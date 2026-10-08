@@ -8,6 +8,13 @@ use std::sync::OnceLock;
 
 use super::ModelKind;
 
+#[cfg(not(feature = "portable"))]
+fn extraction_span(stage: miv_startup::Stage) -> miv_startup::Span {
+    miv_startup::span(miv_startup::Lane::Core, stage).watched_optional(miv_startup::watch_handle(
+        miv_startup::WatchSlot::CoreStartup,
+    ))
+}
+
 /// 埋め込みモデルの定義。
 struct EmbeddedModel {
     kind: ModelKind,
@@ -79,24 +86,67 @@ pub fn ensure_models_extracted() {
     #[cfg(not(feature = "portable"))]
     {
         let dir = models_dir();
-        if let Err(e) = std::fs::create_dir_all(&dir) {
+        let mkdir = extraction_span(miv_startup::Stage::AssetWrite)
+            .detail(&format!("models-directory path={}", dir.display()));
+        let mkdir_result = std::fs::create_dir_all(&dir);
+        mkdir.finish(if mkdir_result.is_ok() {
+            miv_startup::Outcome::Ok
+        } else {
+            miv_startup::Outcome::Error
+        });
+        if let Err(e) = mkdir_result {
             crate::logger::log(format!("[AI] Failed to create models dir: {e}"));
             return;
         }
 
         for model in EMBEDDED_MODELS {
             let path = dir.join(model.filename);
+            let model_span = extraction_span(miv_startup::Stage::AiModel).detail(&format!(
+                "model={} bytes={} path={}",
+                model.filename,
+                model.bytes.len(),
+                path.display()
+            ));
             // 防御: 埋め込みバイト列が空 (vendor/models/ が未セットアップの worktree でビルドされた場合)
             // は既存の実体ファイルを 0 バイトで上書きしないようにスキップする
             if model.bytes.is_empty() {
+                model_span.finish(miv_startup::Outcome::Skipped);
                 continue;
             }
-            let needs_extract = match std::fs::metadata(&path) {
+            let verify = extraction_span(miv_startup::Stage::AssetVerify).detail(&format!(
+                "model={} size-compare bytes={} path={}",
+                model.filename,
+                model.bytes.len(),
+                path.display()
+            ));
+            let metadata = std::fs::metadata(&path);
+            let needs_extract = match &metadata {
                 Ok(meta) => meta.len() != model.bytes.len() as u64,
                 Err(_) => true,
             };
+            verify.finish(match &metadata {
+                Ok(_) => miv_startup::Outcome::Ok,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    miv_startup::Outcome::Skipped
+                }
+                Err(_) => miv_startup::Outcome::Error,
+            });
+            let mut outcome = miv_startup::Outcome::Skipped;
             if needs_extract {
-                match std::fs::write(&path, model.bytes) {
+                let write = extraction_span(miv_startup::Stage::AssetWrite).detail(&format!(
+                    "model={} bytes={} path={}",
+                    model.filename,
+                    model.bytes.len(),
+                    path.display()
+                ));
+                let result = std::fs::write(&path, model.bytes);
+                outcome = if result.is_ok() {
+                    miv_startup::Outcome::Ok
+                } else {
+                    miv_startup::Outcome::Error
+                };
+                write.finish(outcome);
+                match result {
                     Ok(()) => {
                         crate::logger::log(format!(
                             "[AI] Model extracted: {} ({} bytes)",
@@ -112,6 +162,13 @@ pub fn ensure_models_extracted() {
                     }
                 }
             }
+            model_span
+                .detail(if needs_extract {
+                    "extraction-attempted"
+                } else {
+                    "reused-size-match"
+                })
+                .finish(outcome);
         }
     }
 }

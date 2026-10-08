@@ -11,6 +11,11 @@ fn add_fs_cache_entry(
     entry: &FsCacheEntry,
 ) {
     match entry {
+        FsCacheEntry::RawPreview { preview, .. } => {
+            if let Some(preview) = preview {
+                accountant.add_texture(subsystem, &preview.tex, true);
+            }
+        }
         FsCacheEntry::Static { tex, .. } => accountant.add_texture(subsystem, tex, true),
         FsCacheEntry::Animated { frames, .. } => {
             for (texture, _) in frames {
@@ -39,13 +44,26 @@ fn add_lanczos_resource(
     }
 }
 
+fn add_similar_preview_source(
+    accountant: &mut VramAccountant,
+    panel: &crate::ui_metadata_panel::SimilarPanelState,
+) {
+    if let Some(texture) = panel.preview.cached_texture() {
+        accountant.add_texture(VramSubsystem::FsCache, texture, true);
+    }
+}
+
 fn add_lanczos_cache(
     accountant: &mut VramAccountant,
     cache: &crate::gpu_lanczos::GpuLanczosCache,
     indices: Option<&std::collections::HashSet<usize>>,
 ) {
-    for (idx, output) in cache.outputs() {
-        if includes_idx(indices, idx) {
+    for (source_id, output) in cache.outputs() {
+        let included = match source_id {
+            crate::gpu_lanczos::FullscreenPaintSourceId::Page(idx) => includes_idx(indices, idx),
+            crate::gpu_lanczos::FullscreenPaintSourceId::SimilarPreview(_) => indices.is_none(),
+        };
+        if included {
             accountant.add_texture_id(
                 VramSubsystem::LanczosOutputs,
                 output.texture_id(),
@@ -62,6 +80,7 @@ impl App {
         for id in self.other_viewer_context_ids() {
             let _ = self.with_viewer_context_ref(id, |context| {
                 add_lanczos_cache(accountant, context.fs_lanczos_cache(), None);
+                add_similar_preview_source(accountant, context.similar_panel());
             });
         }
         for window in &self.detached_image_windows {
@@ -86,6 +105,9 @@ impl App {
         indices: Option<&std::collections::HashSet<usize>>,
     ) {
         add_lanczos_cache(accountant, &self.fs_lanczos_cache, indices);
+        if indices.is_none() {
+            add_similar_preview_source(accountant, &self.similar_panel);
+        }
         for (&idx, entry) in &self.fs_cache {
             if includes_idx(indices, idx) {
                 add_fs_cache_entry(accountant, VramSubsystem::FsCache, entry);

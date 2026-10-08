@@ -90,6 +90,16 @@ pub struct WorkerResp {
     /// `ok=false` のときのエラーメッセージ。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// `ok=false` の原因分類。親は detail の文言ではなくこの型だけで retry を決める。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<WorkerFailureKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerFailureKind {
+    RuntimeInit,
+    CommandRejected,
 }
 
 impl WorkerResp {
@@ -100,6 +110,7 @@ impl WorkerResp {
             output_shape: None,
             breakdown: None,
             error: None,
+            failure_kind: None,
         }
     }
 
@@ -114,6 +125,7 @@ impl WorkerResp {
             output_shape: Some(output_shape),
             breakdown: Some(breakdown),
             error: None,
+            failure_kind: None,
         }
     }
 
@@ -124,6 +136,18 @@ impl WorkerResp {
             output_shape: None,
             breakdown: None,
             error: Some(msg.into()),
+            failure_kind: Some(WorkerFailureKind::CommandRejected),
+        }
+    }
+
+    pub fn runtime_init_err(msg: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            elapsed_ms: None,
+            output_shape: None,
+            breakdown: None,
+            error: Some(msg.into()),
+            failure_kind: Some(WorkerFailureKind::RuntimeInit),
         }
     }
 }

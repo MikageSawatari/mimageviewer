@@ -56,7 +56,9 @@ pub fn run_infer_worker() -> ! {
     let runtime = match super::runtime::AiRuntime::new_with_backend(AiBackend::TensorRt) {
         Ok(rt) => rt,
         Err(e) => {
-            emit_resp(&WorkerResp::err(format!("AiRuntime init failed: {e}")));
+            emit_resp(&WorkerResp::runtime_init_err(format!(
+                "AiRuntime init failed: {e}"
+            )));
             crate::logger::log(format!("[TRT-worker] AiRuntime init 失敗: {e}"));
             std::process::exit(1);
         }
@@ -64,7 +66,7 @@ pub fn run_infer_worker() -> ! {
 
     let active = runtime.active_backend();
     if active.effective != AiBackend::TensorRt {
-        emit_resp(&WorkerResp::err(format!(
+        emit_resp(&WorkerResp::runtime_init_err(format!(
             "TensorRT pack 未利用、effective={:?} (理由: {})",
             active.effective,
             active.fallback_reason.as_deref().unwrap_or("不明")

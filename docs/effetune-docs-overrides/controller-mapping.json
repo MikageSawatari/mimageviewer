@@ -1,0 +1,50 @@
+[
+  {
+    "operation": "insert_note",
+    "heading_id": "コントローラーマッピング",
+    "note": "以下は EffeTune の窓で使う操作です。mImageViewer の操作カスタマイズとは別の設定で、mImageViewer の再生やファイル移動は操作しません。MIDI の利用可否は実行環境とアクセス許可によります。利用できない場合も、キーボード・ゲームパッドの割り当てや自動化は使えます。",
+    "reason": "Bundled physical-control-section is exposed; mIV has no audioPlayer in this WebView and owns a separate keymap."
+  },
+  {
+    "operation": "replace_paragraph",
+    "anchor": "**全体操作**では、エフェクトではなくアプリと音楽プレイヤーを操作します。選べる操作は、**マスターバイパス**、**A/B切替**、**再生/一時停止**、**停止**、**次/前のトラック**、**10秒送り/戻し**、**再生速度**、**ピッチ固定**、**リピート**、**シャッフル**、**次/前のプリセット**です。",
+    "replacement": "**全体操作**では、EffeTune の **マスターバイパス**、**A/B切替**、**次/前のプリセット**を操作できます。再生/一時停止、停止、トラック移動、10秒送り/戻し、再生速度、ピッチ固定、リピート、シャッフルは独立版 EffeTune のプレーヤー用で、mImageViewer の再生には働きません。",
+    "reason": "app-targets.js playerAction requires uiManager.audioPlayer, absent in VST; master bypass, A/B and preset step operate without it."
+  },
+  {
+    "operation": "replace_paragraph",
+    "anchor": "音楽プレイヤーを開いていない間は、プレイヤーの操作を割り当てても何も起きません。ブラウザーが音声の開始を許可しない場合は、コントローラーから再生を始められません。そのときはプレイヤーの再生ボタンで開始してください。",
+    "replacement": "mImageViewer の再生操作は、mImageViewer 側のボタンや操作カスタマイズを使用してください。",
+    "reason": "Remove standalone browser autoplay/open-player instructions."
+  },
+  {
+    "operation": "replace_html",
+    "anchor": "<li><p><strong>再生速度</strong>はフェーダーやノブで連続して変わり、中央が1xです。ボタンやキーでは、方向に従って次の標準の速度へ1段ずつ移ります。</p></li>",
+    "replacement": "",
+    "reason": "Standalone player speed mapping does not operate mIV playback."
+  },
+  {
+    "operation": "replace_paragraph",
+    "anchor": "次/前のトラック、10秒送り/戻し、次/前のプリセットでは、**方向**で向きを決めます。**+**で先へ進み、**−**で戻ります。エンドレスエンコーダーやジョグホイールでは、回した向きに進みます。",
+    "replacement": "次/前のプリセットでは、**方向**で向きを決めます。**+**で先へ進み、**−**で戻ります。エンドレスエンコーダーやジョグホイールでは、回した向きに進みます。",
+    "reason": "Keep supported preset stepping without standalone transport claims."
+  },
+  {
+    "operation": "replace_paragraph",
+    "anchor": "Web MIDI経由でMIDI CC、ノート、ピッチベンドに対応します。汎用デバイスのCCは絶対値が初期設定です。エンドレスエンコーダーが相対値を送る場合は、対応する相対モードを選びます。MIDIの利用時はブラウザーまたはデスクトップアプリの権限が必要です。",
+    "replacement": "MIDI CC、ノート、ピッチベンドに対応します。汎用デバイスのCCは絶対値が初期設定です。エンドレスエンコーダーが相対値を送る場合は、対応する相対モードを選びます。MIDIの利用にはアクセス許可が必要です。",
+    "reason": "Keep controller capabilities and permission requirement; remove standalone browser/desktop wording."
+  },
+  {
+    "operation": "replace_paragraph",
+    "anchor": "Web MIDIはChromium系ブラウザーとFirefoxで利用できますが、Safariでは利用できません。BLE-MIDIやネットワークMIDIは、OSがMIDIポートとして提供していれば利用できます。",
+    "replacement": "BLE-MIDIやネットワークMIDIは、OSがMIDIポートとして提供していて、EffeTune から利用できる場合に使用できます。",
+    "reason": "mIV uses WebView; do not advertise unrelated browser support."
+  },
+  {
+    "operation": "replace_paragraph",
+    "anchor": "MIDIデバイスが表示されない場合は、EffeTuneへのMIDIアクセスを許可して**コントローラーマッピング...**を開き直してください。Safariでもキーボードとゲームパッドは利用できます。",
+    "replacement": "MIDIデバイスが表示されない場合は、MIDIアクセスの許可とOS上の接続を確認して **コントローラーマッピング...** を開き直してください。実行環境でMIDIを利用できない場合も、キーボードとゲームパッドの割り当ては使用できます。",
+    "reason": "Remove Safari guidance; retain local manager unsupported-MIDI behavior."
+  }
+]

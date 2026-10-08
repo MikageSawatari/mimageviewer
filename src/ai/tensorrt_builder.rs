@@ -52,7 +52,7 @@ pub fn run_worker_process() -> ! {
     };
 
     // pack v3 以降、`UpscaleRealEsrGeneralV3` は in-process DirectML 経路に固定で、
-    // 配布 pack には含めない方針 (`should_route_to_worker` / `REQUIRED_ENGINE_MODELS`)。
+    // 配布 pack には含めない方針 (`model_uses_trt_worker` / `TRT_WORKER_MODEL_KINDS`)。
     // ここでも build を拒否しておかないと、ユーザが `--tensorrt-build realesr_general_v3`
     // を打つと無意味な engine を生成し、`build_trt_pack` 検証で「想定外の engine が
     // 余分にある」状態を作ってしまう。
@@ -152,7 +152,7 @@ fn warmup_input_shape(kind: ModelKind) -> (usize, usize, usize, usize) {
     match kind {
         ModelKind::DenoiseRealplksr => (1, 3, 256, 256),
         ModelKind::InpaintMiGan => (1, 4, 512, 512),
-        // SubjectMatte (BiRefNet) は should_route_to_worker=false なので TRT engine は作らないが、
+        // SubjectMatte (BiRefNet) は model_uses_trt_worker=false なので TRT engine は作らないが、
         // match の網羅性のため shape を残す (= BiRefNet 入力 1024²)。
         ModelKind::SubjectMatte => (1, 3, 1024, 1024),
         ModelKind::UpscaleRealEsrGeneralV3 => (1, 3, 512, 512),

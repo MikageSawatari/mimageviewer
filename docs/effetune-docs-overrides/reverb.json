@@ -1,0 +1,8 @@
+[
+  {
+    "operation": "replace_paragraph",
+    "anchor": "取り込んだIRファイルは**インパルス応答ライブラリ**に保存され、元のファイル名で検索、読み込み、削除ができます。複数をまとめて削除するには、チェックボックスで選択するか、**Ctrl+A**（macOSでは**Command+A**）で現在表示されている項目をすべて選択してから、**選択項目を削除**を選びます。WAVデータを格納した拡張子`.irs`のファイルは、名前を変更せずそのまま取り込めます。Web版ではブラウザ内に保存され、サイトデータを削除したりブラウザが保存領域を整理したりすると失われることがあります。デスクトップ版ではアプリのデータとして保存されます。必要なIRは別途保管してください。",
+    "replacement": "取り込んだIRファイルは**インパルス応答ライブラリ**に保存され、元のファイル名で検索、読み込み、削除ができます。複数をまとめて削除するには、チェックボックスで選択するか、**Ctrl+A**で現在表示されている項目をすべて選択してから、**選択項目を削除**を選びます。WAVデータを格納した拡張子`.irs`のファイルは、名前を変更せずそのまま取り込めます。mImageViewer では、取り込んだIRも `%APPDATA%` 内の EffeTune 用の保存領域に置かれます。mImageViewer のデータフォルダーを変更しても移りません。[設定の保存先](https://mikage.to/mimageviewer/manual/effetune.html#storage)もご覧ください。必要なIRは別途保管してください。",
+    "reason": "Remove Web/desktop storage instructions; bundled ir-library-factory uses the WebView storage backend, not Electron."
+  }
+]

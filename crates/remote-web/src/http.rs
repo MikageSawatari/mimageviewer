@@ -11,15 +11,20 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use mimageviewer_ipc::{
     CollectionErrorCode, CollectionKind, FavoriteSearchIndexState, FavoriteSearchKind,
-    FavoriteSearchRequest, MediaErrorCode, PageDemandRequest, PagePriority, RemoteAddress,
-    RemoteAiJobError, RemoteAiJobErrorCode, RemoteAiStartRequest, RemoteArchiveConfirmRequest,
-    RemoteArchiveJobError, RemoteArchiveJobErrorCode, RemoteArchivePasswordRequest,
-    RemoteArchiveStartRequest, RemoteEntryKind, RemotePageRenderContext, RemoteReadingDirection,
-    RemoteSessionIdentity, RemoteSpreadMode, RemoteSubresource, RemoteWriteErrorCode,
-    RemoteWriteRequest, SessionResponse, SessionStatus, TagIndexState, TagItemKind,
-    TagItemsRequest, VideoStreamControlAction, VideoStreamErrorCode,
-    VideoStreamJumpThumbnailPayload, VideoStreamPlaylistKind, VideoStreamQuality,
-    VideoStreamSegmentIndex, VideoStreamSegmentPayload, VideoStreamThumbnailPayload,
+    FavoriteSearchRequest, MediaErrorCode, PageDemandRequest, PagePriority,
+    PersistentCollectionEntryState, PersistentCollectionErrorCode,
+    PersistentCollectionNavigatePayload, PersistentCollectionNavigateRequest,
+    PersistentCollectionPositionKind, PersistentCollectionSnapshotPayload,
+    PersistentCollectionSnapshotRequest, PersistentCollectionSparseTarget,
+    PersistentCollectionTargetPosition, RemoteAddress, RemoteAiJobError, RemoteAiJobErrorCode,
+    RemoteAiStartRequest, RemoteArchiveConfirmRequest, RemoteArchiveJobError,
+    RemoteArchiveJobErrorCode, RemoteArchivePasswordRequest, RemoteArchiveStartRequest,
+    RemoteEntryKind, RemotePageRenderContext, RemoteReadingDirection, RemoteSessionIdentity,
+    RemoteSpreadMode, RemoteSubresource, RemoteWriteErrorCode, RemoteWriteRequest, SessionResponse,
+    SessionStatus, TagIndexState, TagItemKind, TagItemsRequest, VideoStreamControlAction,
+    VideoStreamErrorCode, VideoStreamJumpThumbnailPayload, VideoStreamPlaylistKind,
+    VideoStreamQuality, VideoStreamSegmentIndex, VideoStreamSegmentPayload,
+    VideoStreamThumbnailPayload,
 };
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use serde::Deserialize;
@@ -226,6 +231,7 @@ enum IpcClass {
     Browse,
     Home,
     Heavy,
+    Thumbnail,
     Prefetch,
     Stream,
 }
@@ -291,7 +297,7 @@ impl IpcAdmission {
         };
         // 先読みは all/heavy の最終 1 枠を使用しない。表示要求が queue 待ちではなく
         // admission を即取得できる余地を remote-web 側でも固定する。
-        let all_limit = if matches!(class, IpcClass::Prefetch) {
+        let all_limit = if matches!(class, IpcClass::Prefetch | IpcClass::Thumbnail) {
             self.all.limit - 1
         } else {
             self.all.limit
@@ -303,8 +309,11 @@ impl IpcAdmission {
                 return Err(self.busy());
             }
         };
-        let heavy = if matches!(class, IpcClass::Heavy | IpcClass::Prefetch) {
-            let heavy_limit = if matches!(class, IpcClass::Prefetch) {
+        let heavy = if matches!(
+            class,
+            IpcClass::Heavy | IpcClass::Prefetch | IpcClass::Thumbnail
+        ) {
+            let heavy_limit = if matches!(class, IpcClass::Prefetch | IpcClass::Thumbnail) {
                 self.heavy.limit - 1
             } else {
                 self.heavy.limit
@@ -713,6 +722,19 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
             &query,
             remote_owner.expect("route guard checked session"),
         ),
+        (Method::Get, "/api/saved-collections") => {
+            api_saved_collection_catalog(state, remote_owner.expect("route guard checked session"))
+        }
+        (Method::Get, "/api/saved-collection") => api_saved_collection_snapshot(
+            state,
+            &query,
+            remote_owner.expect("route guard checked session"),
+        ),
+        (Method::Post, "/api/saved-collection/navigate") => api_saved_collection_navigate(
+            request,
+            state,
+            remote_owner.expect("route guard checked session"),
+        ),
         (Method::Get, "/api/search/favorites") => api_favorite_search(
             state,
             &query,
@@ -839,6 +861,11 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
             &query,
             remote_owner.expect("route guard checked session"),
         ),
+        (Method::Post, "/api/raw-prefetch-window") => api_raw_prefetch_window(
+            request,
+            state,
+            remote_owner.expect("route guard checked session"),
+        ),
         (Method::Post, "/api/page/demand") => api_page_demand(
             request,
             state,
@@ -868,6 +895,7 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
         (
             _,
             "/api/telemetry"
+            | "/api/raw-prefetch-window"
             | "/api/session/acquire"
             | "/api/session/ping"
             | "/api/write"
@@ -1472,6 +1500,8 @@ struct SessionPingBody {
 #[derive(Deserialize)]
 struct VideoStartBody {
     quality: VideoStreamQuality,
+    #[serde(default)]
+    audio_track: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -1507,6 +1537,14 @@ enum StreamRouteResource {
     Segment(VideoStreamSegmentIndex),
 }
 
+fn video_start_success_response(owner: &RemoteSessionIdentity, mut payload: Value) -> HttpResponse {
+    payload["remote_session_id"] = json!(owner.session_id);
+    HttpResponse::json(&payload)
+        .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
+        .with_header("Cache-Control", "no-store")
+        .with_sensitive_value(owner.session_id.clone())
+}
+
 fn api_video_start(
     request: &mut Request,
     state: &AppState,
@@ -1529,7 +1567,7 @@ fn api_video_start(
     let result = match state.ipc_admission.run(IpcClass::Stream, || {
         state
             .thumbnail_client
-            .video_stream_start(owner, address, body.quality)
+            .video_stream_start(owner, address, body.quality, body.audio_track)
     }) {
         Ok(result) => result,
         Err(busy) => return video_admission_busy_response(busy),
@@ -1537,22 +1575,25 @@ fn api_video_start(
     match result {
         Ok(success) => {
             let payload = success.value;
-            HttpResponse::json(&json!({
-                "session": payload.session,
-                "generation": payload.generation,
-                "playlist": video_playlist_url(payload.session, payload.generation),
-                "duration_secs": payload.duration_secs,
-                "source_origin_secs": payload.source_origin_secs,
-                "buffer_target_secs": payload.buffer_target_secs,
-                "has_video": payload.has_video,
-                "codec": payload.codecs,
-                "encoder": payload.encoder,
-                "video_size": payload.video_size,
-                "audio_processing": payload.audio_processing,
-                "end_behavior": payload.end_behavior,
-            }))
-            .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
-            .with_header("Cache-Control", "no-store")
+            video_start_success_response(
+                owner,
+                json!({
+                    "session": payload.session,
+                    "generation": payload.generation,
+                    "playlist": video_playlist_url(payload.session, payload.generation),
+                    "duration_secs": payload.duration_secs,
+                    "source_origin_secs": payload.source_origin_secs,
+                    "buffer_target_secs": payload.buffer_target_secs,
+                    "has_video": payload.has_video,
+                    "codec": payload.codecs,
+                    "encoder": payload.encoder,
+                    "video_size": payload.video_size,
+                    "audio_processing": payload.audio_processing,
+                    "audio_tracks": payload.audio_tracks,
+                    "audio_track": payload.audio_track,
+                    "end_behavior": payload.end_behavior,
+                }),
+            )
         }
         Err(failure) => video_ipc_error_response(failure),
     }
@@ -2169,6 +2210,7 @@ fn video_ipc_error_response(failure: crate::ipc_client::ClientFailure) -> HttpRe
         ),
         IpcClientError::Remote(_)
         | IpcClientError::CollectionRemote(_)
+        | IpcClientError::PersistentCollectionRemote(_)
         | IpcClientError::MediaRemote(_)
         | IpcClientError::WriteRemote(_)
         | IpcClientError::RemoteAi(_)
@@ -2346,6 +2388,7 @@ fn session_failure_response(
         }
         IpcClientError::Remote(_)
         | IpcClientError::CollectionRemote(_)
+        | IpcClientError::PersistentCollectionRemote(_)
         | IpcClientError::MediaRemote(_)
         | IpcClientError::WriteRemote(_)
         | IpcClientError::VideoStreamRemote(_)
@@ -2666,7 +2709,8 @@ fn api_collection(
     match result {
         Ok(result) => {
             let entry_count = result.value.entries.len();
-            HttpResponse::json(&result.value)
+            collection_payload_for_web(&result.value)
+                .and_then(|payload| HttpResponse::json(&payload))
                 .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
                 .with_header("Cache-Control", "no-store")
                 .with_log_details(json!({
@@ -2688,6 +2732,287 @@ fn api_collection(
         }
         Err(failure) => collection_ipc_error_response(failure, started.elapsed(), kind_name),
     }
+}
+
+fn api_saved_collection_catalog(state: &AppState, owner: &RemoteSessionIdentity) -> HttpResponse {
+    let started = Instant::now();
+    let result = match state.ipc_admission.run(IpcClass::Home, || {
+        state.thumbnail_client.persistent_collection_catalog(owner)
+    }) {
+        Ok(value) => value,
+        Err(busy) => return collection_admission_busy_response(busy, "saved_collection_catalog"),
+    };
+    match result {
+        Ok(success) => HttpResponse::json(&success.value)
+            .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
+            .with_header("Cache-Control", "no-store")
+            .with_log_details(json!({
+                "collection": {
+                    "kind": "saved_collection_catalog",
+                    "collection_count": success.value.collections.len(),
+                    "catalog_revision": success.value.catalog_revision,
+                    "ipc_status": "ok",
+                    "ipc_ms": crate::diagnostics::duration_ms(started.elapsed()),
+                }
+            })),
+        Err(failure) => persistent_collection_ipc_error_response(failure),
+    }
+}
+
+fn api_saved_collection_snapshot(
+    state: &AppState,
+    query: &[(String, String)],
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
+    let collection_id = match required_query_value(query, "id") {
+        Ok(value) if Uuid::parse_str(value).is_ok() => value.to_owned(),
+        _ => return HttpResponse::text(400, "Bad Request"),
+    };
+    let spread_mode = match parse_spread_mode(query) {
+        Ok(value) => value,
+        Err(()) => return HttpResponse::text(400, "Bad Request"),
+    };
+    let reading_direction = match parse_reading_direction(query) {
+        Ok(value) => value,
+        Err(()) => return HttpResponse::text(400, "Bad Request"),
+    };
+    let force_single_page = match parse_force_single_page(query) {
+        Ok(value) => value,
+        Err(()) => return HttpResponse::text(400, "Bad Request"),
+    };
+    let result = match state.ipc_admission.run(IpcClass::Heavy, || {
+        state.thumbnail_client.persistent_collection_snapshot(
+            owner,
+            PersistentCollectionSnapshotRequest {
+                collection_id: collection_id.clone(),
+                spread_mode,
+                reading_direction,
+                force_single_page,
+            },
+        )
+    }) {
+        Ok(value) => value,
+        Err(busy) => return collection_admission_busy_response(busy, "saved_collection_snapshot"),
+    };
+    match result {
+        Ok(mut success) => {
+            validate_persistent_snapshot_addresses(&state.library, &mut success.value);
+            HttpResponse::json(&success.value)
+                .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
+                .with_header("Cache-Control", "no-store")
+        }
+        Err(failure) => persistent_collection_ipc_error_response(failure),
+    }
+}
+
+fn api_saved_collection_navigate(
+    request: &mut Request,
+    state: &AppState,
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
+    let body = match read_body_limited(request, MAX_PAGE_DEMAND_BODY_BYTES) {
+        Ok(body) => body,
+        Err(BodyReadError::TooLarge) => return HttpResponse::text(413, "Payload Too Large"),
+        Err(BodyReadError::Read) => return HttpResponse::text(400, "Bad Request"),
+    };
+    let request: PersistentCollectionNavigateRequest =
+        match serde_json::from_slice::<PersistentCollectionNavigateRequest>(&body) {
+            Ok(value) if Uuid::parse_str(&value.collection_id).is_ok() => value,
+            _ => return HttpResponse::text(400, "Bad Request"),
+        };
+    let result = match state.ipc_admission.run(IpcClass::Heavy, || {
+        state
+            .thumbnail_client
+            .persistent_collection_navigate(owner, request)
+    }) {
+        Ok(value) => value,
+        Err(busy) => return collection_admission_busy_response(busy, "saved_collection_navigate"),
+    };
+    match result {
+        Ok(mut success) => {
+            if let PersistentCollectionNavigatePayload::Landed {
+                replacement,
+                target,
+                position,
+                ..
+            } = &mut success.value
+            {
+                if let Some(payload) = replacement {
+                    validate_persistent_snapshot_addresses(&state.library, payload);
+                }
+                if let Err(error) =
+                    validate_persistent_target_address(&state.library, target, position)
+                {
+                    return store_error_response(error).with_header("Cache-Control", "no-store");
+                }
+            }
+            HttpResponse::json(&success.value)
+                .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
+                .with_header("Cache-Control", "no-store")
+        }
+        Err(failure) => persistent_collection_ipc_error_response(failure),
+    }
+}
+
+fn validate_persistent_snapshot_addresses(
+    library: &Library,
+    payload: &mut PersistentCollectionSnapshotPayload,
+) {
+    let mut blocked = std::collections::HashSet::new();
+    for entry in &mut payload.entries {
+        let invalid = match &entry.state {
+            PersistentCollectionEntryState::Available { address, kind, .. } => {
+                library.validate_remote_file_kind(address, *kind).is_err()
+            }
+            _ => false,
+        };
+        if invalid {
+            blocked.insert(entry.identity.clone());
+            entry.state = PersistentCollectionEntryState::BlockedByRemotePolicy {
+                last_known_kind: None,
+            };
+        }
+    }
+    payload.page_groups.retain_mut(|group| {
+        group.pages.retain(|slot| {
+            !blocked.contains(&slot.identity)
+                && library
+                    .validate_remote_file_kind(&slot.address, RemoteEntryKind::Image)
+                    .is_ok()
+        });
+        if !group.pages.iter().any(|slot| slot.identity == group.anchor)
+            && let Some(survivor) = group.pages.first()
+        {
+            group.anchor = survivor.identity.clone();
+        }
+        !group.pages.is_empty()
+    });
+}
+
+fn validate_persistent_target_address(
+    library: &Library,
+    target: &mut PersistentCollectionSparseTarget,
+    position: &mut PersistentCollectionTargetPosition,
+) -> Result<(), StoreError> {
+    let expected_kind = match target {
+        PersistentCollectionSparseTarget::DirectImageDisplayUnit { .. } => {
+            PersistentCollectionPositionKind::StillImage
+        }
+        PersistentCollectionSparseTarget::DirectVideo { .. } => {
+            PersistentCollectionPositionKind::Video
+        }
+        PersistentCollectionSparseTarget::DirectAudio { .. } => {
+            PersistentCollectionPositionKind::Audio
+        }
+    };
+    if position.kind != expected_kind || position.count == 0 || position.ordinal >= position.count {
+        return Err(StoreError::BadRequest);
+    }
+    match target {
+        PersistentCollectionSparseTarget::DirectImageDisplayUnit { group } => {
+            if group.pages.is_empty() || group.pages.len() > 2 {
+                return Err(StoreError::BadRequest);
+            }
+            let original = group
+                .pages
+                .iter()
+                .map(|slot| slot.identity.clone())
+                .collect::<Vec<_>>();
+            let original_anchor_index = original
+                .iter()
+                .position(|identity| identity == &group.anchor)
+                .ok_or(StoreError::BadRequest)?;
+            group.pages.retain(|slot| {
+                library
+                    .validate_remote_file_kind(&slot.address, RemoteEntryKind::Image)
+                    .is_ok()
+            });
+            if group.pages.is_empty() {
+                return Err(StoreError::NotFound);
+            }
+            if !group.pages.iter().any(|slot| slot.identity == group.anchor) {
+                let survivor = &group.pages[0].identity;
+                let new = original
+                    .iter()
+                    .position(|identity| identity == survivor)
+                    .ok_or(StoreError::BadRequest)?;
+                let ordinal = if new >= original_anchor_index {
+                    position.ordinal.checked_add(new - original_anchor_index)
+                } else {
+                    position.ordinal.checked_sub(original_anchor_index - new)
+                };
+                let Some(ordinal) = ordinal.filter(|ordinal| *ordinal < position.count) else {
+                    return Err(StoreError::BadRequest);
+                };
+                position.ordinal = ordinal;
+                group.anchor = survivor.clone();
+            }
+            Ok(())
+        }
+        PersistentCollectionSparseTarget::DirectVideo { address, .. } => {
+            library.validate_remote_file_kind(address, RemoteEntryKind::Video)
+        }
+        PersistentCollectionSparseTarget::DirectAudio { address, .. } => {
+            library.validate_remote_file_kind(address, RemoteEntryKind::Audio)
+        }
+    }
+}
+
+fn persistent_collection_ipc_error_response(
+    failure: crate::ipc_client::ClientFailure,
+) -> HttpResponse {
+    let (status, code, message) = match failure.error {
+        IpcClientError::PersistentCollectionRemote(error) => {
+            let status = match error.code {
+                PersistentCollectionErrorCode::BadRequest => 400,
+                PersistentCollectionErrorCode::NotFound => 404,
+                PersistentCollectionErrorCode::Conflict => 409,
+                PersistentCollectionErrorCode::Incompatible
+                | PersistentCollectionErrorCode::PrepareFailed => 422,
+                PersistentCollectionErrorCode::Starting
+                | PersistentCollectionErrorCode::Busy
+                | PersistentCollectionErrorCode::Unavailable => 503,
+                PersistentCollectionErrorCode::Cancelled => 409,
+                PersistentCollectionErrorCode::Internal => 500,
+            };
+            (
+                status,
+                format!("{:?}", error.code).to_lowercase(),
+                error.message,
+            )
+        }
+        IpcClientError::Unavailable(_) => (
+            503,
+            "miv_not_running".to_owned(),
+            "mIV core is not available".to_owned(),
+        ),
+        IpcClientError::VersionMismatch { .. } => (
+            503,
+            "protocol_version_mismatch".to_owned(),
+            "IPC protocol versions do not match".to_owned(),
+        ),
+        IpcClientError::SessionRemote(response) => (
+            session_http_status(response.status),
+            "session_required".to_owned(),
+            response.message,
+        ),
+        IpcClientError::Protocol(_) => (
+            502,
+            "ipc_protocol_error".to_owned(),
+            "IPC request failed".to_owned(),
+        ),
+        other => (500, "ipc_error".to_owned(), other.to_string()),
+    };
+    let mut response = HttpResponse::bytes(
+        status,
+        "application/json; charset=utf-8",
+        serde_json::to_vec(&json!({ "error": code, "message": message })).unwrap_or_default(),
+    )
+    .with_header("Cache-Control", "no-store");
+    if status == 503 {
+        response = response.with_header("Retry-After", IPC_RETRY_AFTER_SECONDS.to_string());
+    }
+    response
 }
 
 fn api_favorite_search(
@@ -2738,7 +3063,8 @@ fn api_favorite_search(
                 FavoriteSearchIndexState::Disabled => "disabled",
                 FavoriteSearchIndexState::Unavailable => "unavailable",
             };
-            HttpResponse::json(&result.value)
+            listing_payload_for_web(&result.value, &result.value.listing.entries)
+                .and_then(|payload| HttpResponse::json(&payload))
                 .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
                 .with_header("Cache-Control", "no-store")
                 .with_log_details(json!({
@@ -2841,7 +3167,8 @@ fn api_tag_items(
         Ok(result) => {
             let entry_count = result.value.listing.entries.len();
             let index_state = tag_index_state_name(result.value.state);
-            HttpResponse::json(&result.value)
+            listing_payload_for_web(&result.value, &result.value.listing.entries)
+                .and_then(|payload| HttpResponse::json(&payload))
                 .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
                 .with_header("Cache-Control", "no-store")
                 .with_log_details(json!({
@@ -2948,6 +3275,9 @@ fn collection_ipc_error_response(
             };
             (status, "miv_collection_error", error.message)
         }
+        IpcClientError::PersistentCollectionRemote(error) => {
+            (500, "miv_collection_error", error.message)
+        }
         IpcClientError::MediaRemote(error) => (500, "miv_collection_error", error.message),
         IpcClientError::Remote(error) => (500, "miv_collection_error", error.message),
         IpcClientError::WriteRemote(error) => (500, "miv_collection_error", error.message),
@@ -3043,7 +3373,9 @@ fn api_list(
                 "path": payload.effective_address.path,
                 "root_name": payload.root_name,
                 "thumb_aspect_height_ratio": payload.thumb_aspect_height_ratio,
+                "thumbnail_presentation": payload.thumbnail_presentation,
                 "sort_state": payload.sort_state,
+                "sort_notice": payload.sort_notice,
                 "entries": entries,
             });
             match HttpResponse::json(&response) {
@@ -3241,7 +3573,17 @@ fn api_thumb(
     if let Some(source) = source_address.as_ref()
         && let Err(error) = state.library.validate_remote_address(source)
     {
-        return store_error_response(error);
+        // A discovered image can disappear after the listing was prepared. Keep
+        // syntax/network guards, and let the core's shared resolver validate the
+        // parent, stem and extension before falling back to embedded art/Shell.
+        // Other canonicalization failures (including access errors) stay rejected.
+        let missing_file_hint = matches!(error, StoreError::NotFound)
+            && matches!(source.subresource, RemoteSubresource::File)
+            && std::fs::metadata(&source.path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+        if !missing_file_hint {
+            return store_error_response(error);
+        }
     }
     let target_px = match requested_width(query) {
         Ok(width) => width,
@@ -3249,7 +3591,7 @@ fn api_thumb(
     };
     let source_kind = remote_source_kind(&address);
     let started = Instant::now();
-    let result = match state.ipc_admission.run(IpcClass::Heavy, || {
+    let result = match state.ipc_admission.run(IpcClass::Thumbnail, || {
         state.thumbnail_client.thumbnail_address(
             owner,
             address.clone(),
@@ -3445,10 +3787,130 @@ fn api_page(
                     }
                 }))
         }
-        Err(failure) => {
-            media_ipc_error_response(failure, started.elapsed(), "page", Some(target_px))
+        Err(failure) => page_ipc_error_response(
+            failure,
+            started.elapsed(),
+            &remote_state_generation,
+            owner,
+            target_px,
+        ),
+    }
+}
+
+fn collection_payload_for_web(
+    payload: &mimageviewer_ipc::CollectionPayload,
+) -> Result<Value, serde_json::Error> {
+    let mut value = serde_json::to_value(payload)?;
+    add_collection_entry_addresses(&mut value, &payload.entries);
+    Ok(value)
+}
+
+fn listing_payload_for_web<T: serde::Serialize>(
+    payload: &T,
+    entries: &[mimageviewer_ipc::RemoteEntry],
+) -> Result<Value, serde_json::Error> {
+    let mut value = serde_json::to_value(payload)?;
+    if let Some(listing) = value.get_mut("listing") {
+        add_collection_entry_addresses(listing, entries);
+    }
+    Ok(value)
+}
+
+fn add_collection_entry_addresses(
+    value: &mut Value,
+    source_entries: &[mimageviewer_ipc::RemoteEntry],
+) {
+    if let Some(entries) = value.get_mut("entries").and_then(Value::as_array_mut) {
+        for (entry, source) in entries.iter_mut().zip(source_entries) {
+            if source.kind == RemoteEntryKind::Image
+                && let Some(object) = entry.as_object_mut()
+            {
+                object.insert(
+                    "address".to_owned(),
+                    json!(RemoteAddress::file(source.path.clone())),
+                );
+            }
         }
     }
+}
+
+fn page_ipc_error_response(
+    failure: crate::ipc_client::ClientFailure,
+    elapsed: Duration,
+    generation: &str,
+    owner: &RemoteSessionIdentity,
+    target_px: u32,
+) -> HttpResponse {
+    if !matches!(&failure.error, IpcClientError::MediaRemote(error) if error.code == MediaErrorCode::RawPrefetchSkipped)
+    {
+        return media_ipc_error_response(failure, elapsed, "page", Some(target_px));
+    }
+    HttpResponse::bytes(204, "text/plain; charset=utf-8", Vec::new())
+        .with_header("X-mIV-Page-Skip", "raw-prefetch")
+        .with_header("X-mIV-Remote-State-Generation", generation)
+        .with_header("X-mIV-Remote-Session", owner.session_id.clone())
+        .with_header("Vary", "X-mIV-Remote-Session")
+        .with_header("Cache-Control", "no-store")
+        .with_log_details(json!({
+            "page": {
+                "ipc_status": "raw_prefetch_skipped",
+                "ipc_ms": crate::diagnostics::duration_ms(elapsed),
+                "ipc_retry_count": failure.retry_count,
+                "ipc_retry_statuses": failure.retry_statuses,
+            }
+        }))
+}
+
+fn api_raw_prefetch_window(
+    request: &mut Request,
+    state: &AppState,
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
+    let body = match read_body_limited(request, MAX_PAGE_DEMAND_BODY_BYTES) {
+        Ok(body) => body,
+        Err(BodyReadError::TooLarge) => return HttpResponse::text(413, "Payload Too Large"),
+        Err(BodyReadError::Read) => return HttpResponse::text(400, "Bad Request"),
+    };
+    let window: mimageviewer_ipc::RawPrefetchWindowRequest = match serde_json::from_slice(&body) {
+        Ok(window) => window,
+        Err(_) => return HttpResponse::text(400, "Bad Request"),
+    };
+    if window.entries.len() > mimageviewer_ipc::MAX_RAW_PREFETCH_WINDOW_ENTRIES {
+        return HttpResponse::text(400, "Bad Request");
+    }
+    for address in &window.entries {
+        if let Err(error) = validate_page_address(&state.library, address) {
+            return store_error_response(error);
+        }
+    }
+    let started = Instant::now();
+    let result = match state.ipc_admission.run(IpcClass::Home, || {
+        state.thumbnail_client.raw_prefetch_window(owner, window)
+    }) {
+        Ok(result) => result,
+        Err(busy) => return media_admission_busy_response(busy, "raw_prefetch_window"),
+    };
+    match result {
+        Ok(success) => raw_prefetch_ack_response(&success.value, owner),
+        Err(failure) => {
+            media_ipc_error_response(failure, started.elapsed(), "raw_prefetch_window", None)
+        }
+    }
+}
+
+fn raw_prefetch_ack_response(
+    ack: &mimageviewer_ipc::RawPrefetchWindowAck,
+    owner: &RemoteSessionIdentity,
+) -> HttpResponse {
+    let mut response = HttpResponse::json(ack)
+        .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"));
+    if ack.status == mimageviewer_ipc::RawPrefetchWindowStatus::Rejected {
+        response.status = 400;
+    }
+    response
+        .with_header("Cache-Control", "no-store")
+        .with_header("X-mIV-Remote-Session", owner.session_id.clone())
+        .with_header("Vary", "X-mIV-Remote-Session")
 }
 
 fn api_page_demand(
@@ -3611,6 +4073,7 @@ fn write_ipc_error_response(
         ),
         IpcClientError::Remote(_)
         | IpcClientError::CollectionRemote(_)
+        | IpcClientError::PersistentCollectionRemote(_)
         | IpcClientError::MediaRemote(_)
         | IpcClientError::VideoStreamRemote(_)
         | IpcClientError::RemoteAi(_)
@@ -3687,6 +4150,11 @@ fn media_ipc_error_response(
                 MediaErrorCode::PasswordRequired => 423,
                 MediaErrorCode::PageOutOfRange => 416,
                 MediaErrorCode::Cancelled => 409,
+                MediaErrorCode::RawPrefetchSkipped => 500,
+                MediaErrorCode::RawCapacity => {
+                    retryable = true;
+                    503
+                }
                 MediaErrorCode::Busy => {
                     retryable = true;
                     503
@@ -3694,10 +4162,21 @@ fn media_ipc_error_response(
                 MediaErrorCode::RenderFailed => 422,
                 MediaErrorCode::Internal => 500,
             };
-            (status, "miv_media_error", error.message)
+            (
+                status,
+                if error.code == MediaErrorCode::RawCapacity {
+                    "raw_busy"
+                } else {
+                    "miv_media_error"
+                },
+                error.message,
+            )
         }
         IpcClientError::Remote(error) => (500, "miv_media_error", error.message),
         IpcClientError::CollectionRemote(error) => (500, "miv_media_error", error.message),
+        IpcClientError::PersistentCollectionRemote(error) => {
+            (500, "miv_media_error", error.message)
+        }
         IpcClientError::WriteRemote(error) => (500, "miv_media_error", error.message),
         IpcClientError::VideoStreamRemote(error) => (500, "miv_media_error", error.message),
         IpcClientError::RemoteAi(error) => (500, "miv_media_error", error.message),
@@ -3827,11 +4306,14 @@ fn ipc_error_response(
                 ThumbnailErrorCode::NotReady => 503,
                 ThumbnailErrorCode::Busy => 503,
                 ThumbnailErrorCode::GenerationFailed => 422,
+                ThumbnailErrorCode::NoThumbnail => 422,
                 ThumbnailErrorCode::PasswordRequired => 423,
                 ThumbnailErrorCode::PageOutOfRange => 416,
                 ThumbnailErrorCode::Internal => 500,
             };
-            let code = if remote.code == ThumbnailErrorCode::NotReady {
+            let code = if remote.code == ThumbnailErrorCode::NoThumbnail {
+                "no_thumbnail"
+            } else if remote.code == ThumbnailErrorCode::NotReady {
                 "thumbnail_not_ready"
             } else {
                 "miv_thumbnail_error"
@@ -3839,6 +4321,9 @@ fn ipc_error_response(
             (status, code, remote.message)
         }
         IpcClientError::CollectionRemote(remote) => (500, "miv_thumbnail_error", remote.message),
+        IpcClientError::PersistentCollectionRemote(remote) => {
+            (500, "miv_thumbnail_error", remote.message)
+        }
         IpcClientError::MediaRemote(remote) => (500, "miv_thumbnail_error", remote.message),
         IpcClientError::WriteRemote(remote) => (500, "miv_thumbnail_error", remote.message),
         IpcClientError::VideoStreamRemote(remote) => (500, "miv_thumbnail_error", remote.message),
@@ -4220,7 +4705,12 @@ fn remote_source_kind(address: &RemoteAddress) -> &'static str {
             .and_then(|value| value.to_str())
         {
             Some(extension) if extension.eq_ignore_ascii_case("zip") => "zip",
-            Some(extension) if extension.eq_ignore_ascii_case("pdf") => "pdf",
+            Some(extension)
+                if extension.eq_ignore_ascii_case("pdf")
+                    || extension.eq_ignore_ascii_case("epub") =>
+            {
+                "pdf"
+            }
             _ => "file",
         },
     }
@@ -4531,9 +5021,57 @@ fn query_value<'a>(query: &'a [(String, String)], key: &str) -> Result<Option<&'
 mod tests {
     use super::*;
     use crate::auth::{AuthService, AuthToken, COOKIE_NAME};
+    use mimageviewer_ipc::{
+        PersistentCollectionEntry, PersistentCollectionIdentity, PersistentCollectionPageGroup,
+        PersistentCollectionPageSlot,
+    };
     use tiny_http::TestRequest;
 
     const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn video_start_response_attests_the_owner_that_created_the_stream() {
+        let owner = RemoteSessionIdentity {
+            client_id: "browser-client".to_owned(),
+            session_id: "0123456789abcdef0123456789abcdef".to_owned(),
+        };
+        let response = video_start_success_response(&owner, json!({ "session": 12 }));
+        assert_eq!(response.status, 200);
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["session"], 12);
+        assert_eq!(body["remote_session_id"], owner.session_id);
+        assert!(response.sensitive_values.contains(&owner.session_id));
+    }
+
+    #[test]
+    fn video_control_body_flattens_audio_track_action() {
+        let body: VideoControlBody = serde_json::from_value(serde_json::json!({
+            "session": 17,
+            "action": "audio_track",
+            "stream_index": 3,
+            "position_secs": 12.5,
+            "expected_generation": 9
+        }))
+        .unwrap();
+        assert_eq!(body.session, 17);
+        assert!(matches!(
+            body.action,
+            VideoStreamControlAction::AudioTrack {
+                stream_index: 3,
+                position_secs: 12.5,
+                expected_generation: 9,
+            }
+        ));
+        assert!(
+            serde_json::from_value::<VideoControlBody>(serde_json::json!({
+                "session": 17,
+                "action": "audio_track",
+                "stream_index": 3,
+                "position_secs": 12.5
+            }))
+            .is_err()
+        );
+    }
 
     fn test_state(temp: &tempfile::TempDir) -> AppState {
         let protected = temp.path().join("data");
@@ -4949,6 +5487,155 @@ mod tests {
     }
 
     #[test]
+    fn raw_window_success_acks_attest_session_and_terminal_is_not_an_error() {
+        use mimageviewer_ipc::{RawPrefetchWindowAck, RawPrefetchWindowStatus};
+        let owner = RemoteSessionIdentity {
+            client_id: "client".to_owned(),
+            session_id: "owner-session".to_owned(),
+        };
+        for status in [
+            RawPrefetchWindowStatus::Accepted,
+            RawPrefetchWindowStatus::Duplicate,
+            RawPrefetchWindowStatus::Stale,
+            RawPrefetchWindowStatus::Terminal,
+            RawPrefetchWindowStatus::Rejected,
+        ] {
+            let response = raw_prefetch_ack_response(
+                &RawPrefetchWindowAck {
+                    window_generation: 11,
+                    status,
+                },
+                &owner,
+            );
+            assert_eq!(
+                response.status,
+                if status == RawPrefetchWindowStatus::Rejected {
+                    400
+                } else {
+                    200
+                }
+            );
+            assert_eq!(
+                response_header_values(&response, "X-mIV-Remote-Session"),
+                ["owner-session"]
+            );
+            assert_eq!(
+                response_header_values(&response, "Cache-Control"),
+                ["no-store"]
+            );
+            assert_eq!(
+                serde_json::from_slice::<RawPrefetchWindowAck>(&response.body)
+                    .unwrap()
+                    .status,
+                status
+            );
+        }
+    }
+
+    #[test]
+    fn raw_window_body_entry_and_address_limits_reject_before_ipc() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let owner = RemoteSessionIdentity {
+            client_id: "client".to_owned(),
+            session_id: "owner".to_owned(),
+        };
+        let too_many = serde_json::to_string(&mimageviewer_ipc::RawPrefetchWindowRequest {
+            window_generation: 1,
+            entries: vec![RemoteAddress::file("C:/page.dng"); 9],
+        })
+        .unwrap();
+        for body in ["{}".to_owned(), too_many, r#"{"window_generation":1,"entries":[{"path":"../page.dng","subresource":{"kind":"file"}}]}"#.to_owned()] {
+            let mut request: Request = TestRequest::new().with_method(Method::Post).with_path("/api/raw-prefetch-window").with_body(Box::leak(body.into_boxed_str())).into();
+            assert_eq!(api_raw_prefetch_window(&mut request, &state, &owner).status, 400);
+        }
+        let mut request: Request = TestRequest::new()
+            .with_method(Method::Post)
+            .with_path("/api/raw-prefetch-window")
+            .with_body(Box::leak(
+                "x".repeat(MAX_PAGE_DEMAND_BODY_BYTES + 1).into_boxed_str(),
+            ))
+            .into();
+        assert_eq!(
+            api_raw_prefetch_window(&mut request, &state, &owner).status,
+            413
+        );
+        assert!(route_requires_remote_session("/api/raw-prefetch-window"));
+    }
+
+    #[test]
+    fn missing_audio_sidecar_reaches_core_admission_without_endpoint_rediscovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let audio = temp.path().join("song.mp3");
+        let sidecar = temp.path().join("song.jpg");
+        std::fs::write(&audio, b"MP3 source").unwrap();
+        std::fs::write(&sidecar, b"previously discovered sidecar").unwrap();
+        std::fs::remove_file(&sidecar).unwrap();
+        let query = vec![
+            ("path".to_owned(), audio.to_string_lossy().into_owned()),
+            ("w".to_owned(), "180".to_owned()),
+            (
+                "thumbnail_source_path".to_owned(),
+                sidecar.to_string_lossy().into_owned(),
+            ),
+        ];
+        // Stop before the transport: this handler regression never contacts a running core.
+        let _permits = (0..MAX_CONCURRENT_HEAVY_IPC - 1)
+            .map(|_| state.ipc_admission.try_enter(IpcClass::Thumbnail).unwrap())
+            .collect::<Vec<_>>();
+        let owner = RemoteSessionIdentity {
+            client_id: "sidecar-test".to_owned(),
+            session_id: "0123456789abcdef0123456789abcdef".to_owned(),
+        };
+        let response = api_thumb(&state, &query, &owner);
+        assert_eq!(
+            response.status, 503,
+            "the safe missing hint must reach core admission"
+        );
+        assert_eq!(
+            response.log_details.unwrap()["thumb"]["ipc_status"],
+            "admission_busy"
+        );
+        assert!(
+            !sidecar.exists(),
+            "the endpoint must not recreate or rediscover the source"
+        );
+    }
+
+    #[test]
+    fn missing_sidecar_does_not_relax_absolute_path_and_network_guards() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let audio = temp.path().join("song.mp3");
+        std::fs::write(&audio, b"MP3 source").unwrap();
+        let _permits = (0..MAX_CONCURRENT_HEAVY_IPC - 1)
+            .map(|_| state.ipc_admission.try_enter(IpcClass::Thumbnail).unwrap())
+            .collect::<Vec<_>>();
+        let owner = RemoteSessionIdentity {
+            client_id: "sidecar-test".to_owned(),
+            session_id: "0123456789abcdef0123456789abcdef".to_owned(),
+        };
+        for source in [
+            "song.jpg",
+            "bad\0image.jpg",
+            r"\\host-that-must-not-be-contacted\share\song.jpg",
+        ] {
+            let query = vec![
+                ("path".to_owned(), audio.to_string_lossy().into_owned()),
+                ("w".to_owned(), "180".to_owned()),
+                ("thumbnail_source_path".to_owned(), source.to_owned()),
+            ];
+            let response = api_thumb(&state, &query, &owner);
+            assert_ne!(
+                response.status, 503,
+                "unsafe source must not reach IPC admission: {source:?}"
+            );
+            assert!(matches!(response.status, 400 | 403));
+        }
+    }
+
+    #[test]
     fn thumbnail_sidecar_query_is_an_optional_file_address() {
         let query = parse_query(
             "path=C%3A%2FMovies%2Fclip.mp4&thumbnail_source_path=C%3A%2FMovies%2Fclip.jpg",
@@ -5314,6 +6001,218 @@ mod tests {
     }
 
     #[test]
+    fn persistent_post_validation_reanchors_a_spread_to_its_surviving_page() {
+        let temp = tempfile::tempdir().unwrap();
+        let survivor_path = temp.path().join("survivor.jpg");
+        std::fs::write(&survivor_path, b"image").unwrap();
+        let library = Library::empty_for_test(temp.path().join("cache"));
+        let blocked = PersistentCollectionIdentity {
+            entry_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+            source_identity: "a".repeat(64),
+        };
+        let survivor = PersistentCollectionIdentity {
+            entry_id: "22222222-2222-4222-8222-222222222222".to_owned(),
+            source_identity: "b".repeat(64),
+        };
+        let survivor_address = RemoteAddress::file(survivor_path.to_string_lossy().into_owned());
+        let mut payload = PersistentCollectionSnapshotPayload {
+            thumbnail_presentation: mimageviewer_ipc::ThumbnailPresentation::default(),
+            collection_id: "33333333-3333-4333-8333-333333333333".to_owned(),
+            collection_revision: 1,
+            view_token: "view".to_owned(),
+            title: "test".to_owned(),
+            order: mimageviewer_ipc::PersistentCollectionOrderSummary::Manual,
+            entries: vec![
+                PersistentCollectionEntry {
+                    identity: blocked.clone(),
+                    name: "blocked.jpg".to_owned(),
+                    state: PersistentCollectionEntryState::Available {
+                        address: RemoteAddress::file("../blocked.jpg"),
+                        kind: mimageviewer_ipc::RemoteEntryKind::Image,
+                        thumbnail_address: None,
+                        detail: None,
+                        rating: None,
+                    },
+                },
+                PersistentCollectionEntry {
+                    identity: survivor.clone(),
+                    name: "survivor.jpg".to_owned(),
+                    state: PersistentCollectionEntryState::Available {
+                        address: survivor_address.clone(),
+                        kind: mimageviewer_ipc::RemoteEntryKind::Image,
+                        thumbnail_address: None,
+                        detail: None,
+                        rating: None,
+                    },
+                },
+            ],
+            configured_spread_mode: RemoteSpreadMode::Ltr,
+            effective_spread_mode: RemoteSpreadMode::Ltr,
+            reading_direction: RemoteReadingDirection::Ltr,
+            image_count: 2,
+            page_groups: vec![PersistentCollectionPageGroup {
+                anchor: blocked.clone(),
+                pages: vec![
+                    PersistentCollectionPageSlot {
+                        identity: blocked,
+                        address: RemoteAddress::file("../blocked.jpg"),
+                        role: mimageviewer_ipc::RemotePagePresentationRole::Navigation,
+                    },
+                    PersistentCollectionPageSlot {
+                        identity: survivor.clone(),
+                        address: survivor_address,
+                        role: mimageviewer_ipc::RemotePagePresentationRole::Navigation,
+                    },
+                ],
+                slice: mimageviewer_ipc::RemotePageSlice::Full,
+                singleton_placement: mimageviewer_ipc::RemoteSingletonSpreadPlacement::Center,
+            }],
+            spread_page_gap_px: 0,
+            entry_limit: 2,
+            truncated: false,
+        };
+
+        validate_persistent_snapshot_addresses(&library, &mut payload);
+
+        assert!(matches!(
+            payload.entries[0].state,
+            PersistentCollectionEntryState::BlockedByRemotePolicy { .. }
+        ));
+        assert_eq!(payload.page_groups.len(), 1);
+        assert_eq!(payload.page_groups[0].pages.len(), 1);
+        assert_eq!(payload.page_groups[0].anchor, survivor);
+    }
+
+    #[test]
+    fn persistent_navigation_post_validation_shrinks_or_rejects_a_spread() {
+        let temp = tempfile::tempdir().unwrap();
+        let survivor_path = temp.path().join("survivor.jpg");
+        std::fs::write(&survivor_path, b"image").unwrap();
+        let library = Library::empty_for_test(temp.path().join("cache"));
+        let blocked = PersistentCollectionIdentity {
+            entry_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+            source_identity: "a".repeat(64),
+        };
+        let survivor = PersistentCollectionIdentity {
+            entry_id: "22222222-2222-4222-8222-222222222222".to_owned(),
+            source_identity: "b".repeat(64),
+        };
+        let survivor_address = RemoteAddress::file(survivor_path.to_string_lossy().into_owned());
+        let mut target = PersistentCollectionSparseTarget::DirectImageDisplayUnit {
+            group: PersistentCollectionPageGroup {
+                anchor: blocked.clone(),
+                pages: vec![
+                    PersistentCollectionPageSlot {
+                        identity: blocked,
+                        address: RemoteAddress::file("../blocked.jpg"),
+                        role: mimageviewer_ipc::RemotePagePresentationRole::Navigation,
+                    },
+                    PersistentCollectionPageSlot {
+                        identity: survivor.clone(),
+                        address: survivor_address,
+                        role: mimageviewer_ipc::RemotePagePresentationRole::Navigation,
+                    },
+                ],
+                slice: mimageviewer_ipc::RemotePageSlice::Full,
+                singleton_placement: mimageviewer_ipc::RemoteSingletonSpreadPlacement::Center,
+            },
+        };
+        let mut position = PersistentCollectionTargetPosition {
+            kind: PersistentCollectionPositionKind::StillImage,
+            ordinal: 7,
+            count: 10,
+        };
+        let original_target = target.clone();
+        validate_persistent_target_address(&library, &mut target, &mut position).unwrap();
+        let PersistentCollectionSparseTarget::DirectImageDisplayUnit { group } = target else {
+            unreachable!();
+        };
+        assert_eq!(group.pages.len(), 1);
+        assert_eq!(group.anchor, survivor);
+        assert_eq!(position.ordinal, 8);
+
+        let mut beyond = original_target.clone();
+        let mut last_position = PersistentCollectionTargetPosition {
+            kind: PersistentCollectionPositionKind::StillImage,
+            ordinal: 9,
+            count: 10,
+        };
+        assert!(matches!(
+            validate_persistent_target_address(&library, &mut beyond, &mut last_position),
+            Err(StoreError::BadRequest)
+        ));
+        let mut wrong_kind = original_target;
+        let mut video_position = PersistentCollectionTargetPosition {
+            kind: PersistentCollectionPositionKind::Video,
+            ordinal: 1,
+            count: 2,
+        };
+        assert!(matches!(
+            validate_persistent_target_address(&library, &mut wrong_kind, &mut video_position),
+            Err(StoreError::BadRequest)
+        ));
+
+        let reverse_survivor = PersistentCollectionIdentity {
+            entry_id: "22222222-2222-4222-8222-222222222222".to_owned(),
+            source_identity: "b".repeat(64),
+        };
+        let reverse_blocked = PersistentCollectionIdentity {
+            entry_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+            source_identity: "a".repeat(64),
+        };
+        let mut reverse = PersistentCollectionSparseTarget::DirectImageDisplayUnit {
+            group: PersistentCollectionPageGroup {
+                anchor: reverse_blocked.clone(),
+                pages: vec![
+                    PersistentCollectionPageSlot {
+                        identity: reverse_survivor.clone(),
+                        address: RemoteAddress::file(survivor_path.to_string_lossy().into_owned()),
+                        role: mimageviewer_ipc::RemotePagePresentationRole::Navigation,
+                    },
+                    PersistentCollectionPageSlot {
+                        identity: reverse_blocked,
+                        address: RemoteAddress::file("../blocked.jpg"),
+                        role: mimageviewer_ipc::RemotePagePresentationRole::Navigation,
+                    },
+                ],
+                slice: mimageviewer_ipc::RemotePageSlice::Full,
+                singleton_placement: mimageviewer_ipc::RemoteSingletonSpreadPlacement::Center,
+            },
+        };
+        let mut reverse_position = PersistentCollectionTargetPosition {
+            kind: PersistentCollectionPositionKind::StillImage,
+            ordinal: 8,
+            count: 10,
+        };
+        validate_persistent_target_address(&library, &mut reverse, &mut reverse_position).unwrap();
+        assert_eq!(reverse_position.ordinal, 7);
+        let PersistentCollectionSparseTarget::DirectImageDisplayUnit {
+            group: reverse_group,
+        } = reverse
+        else {
+            unreachable!();
+        };
+        assert_eq!(reverse_group.anchor, reverse_survivor);
+
+        let mut gone = PersistentCollectionSparseTarget::DirectImageDisplayUnit {
+            group: PersistentCollectionPageGroup {
+                anchor: group.anchor.clone(),
+                pages: vec![PersistentCollectionPageSlot {
+                    identity: group.anchor,
+                    address: RemoteAddress::file("../gone.jpg"),
+                    role: mimageviewer_ipc::RemotePagePresentationRole::Navigation,
+                }],
+                slice: mimageviewer_ipc::RemotePageSlice::Full,
+                singleton_placement: mimageviewer_ipc::RemoteSingletonSpreadPlacement::Center,
+            },
+        };
+        assert!(matches!(
+            validate_persistent_target_address(&library, &mut gone, &mut position),
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
     fn stream_entry_guard_accepts_absolute_video_and_audio_files() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("movie.mp4"), b"fixture").unwrap();
@@ -5521,10 +6420,22 @@ mod tests {
     }
 
     #[test]
-    fn every_video_stream_ai_and_archive_route_is_below_the_fail_closed_auth_guard() {
+    fn every_video_stream_ai_archive_and_saved_collection_route_is_below_the_fail_closed_auth_guard()
+     {
         let temp = tempfile::tempdir().unwrap();
         let state = test_state(&temp);
         let requests = [
+            (Method::Get, "/api/saved-collections", ""),
+            (
+                Method::Get,
+                "/api/saved-collection?id=11111111-1111-4111-8111-111111111111",
+                "",
+            ),
+            (
+                Method::Post,
+                "/api/saved-collection/navigate",
+                r#"{"collection_id":"11111111-1111-4111-8111-111111111111"}"#,
+            ),
             (
                 Method::Post,
                 "/api/video/start?path=C%3A%5CMedia%5Cmovie.mp4",
@@ -5598,6 +6509,60 @@ mod tests {
             let response = route(&mut request, &state);
             assert_eq!(response.status, 401, "{path}");
             assert_eq!(response.body, b"Unauthorized", "{path}");
+        }
+    }
+
+    #[test]
+    fn saved_collection_routes_require_a_session_and_finalize_as_no_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let cookie = cookie_header(&state);
+        let client = Header::from_bytes("X-mIV-Remote-Client", "saved-collection-test").unwrap();
+        let session =
+            Header::from_bytes("X-mIV-Remote-Session", "0123456789abcdef0123456789abcdef").unwrap();
+        let navigate: &'static str = Box::leak(
+            serde_json::to_string(&PersistentCollectionNavigateRequest {
+                collection_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+                presented_revision: 1,
+                presented_view_token: "view".to_owned(),
+                anchor: None,
+                locate_entry_id: None,
+                locate_ordinal: Some(0),
+                direction: mimageviewer_ipc::PersistentCollectionNavigationDirection::Current,
+                target_kind: mimageviewer_ipc::PersistentCollectionNavigationKind::StillImage,
+                tail: mimageviewer_ipc::PersistentCollectionNavigationTail::Stop,
+                viewer_sequence: 1,
+                spread_mode: Some(RemoteSpreadMode::Single),
+                reading_direction: Some(RemoteReadingDirection::Ltr),
+                force_single_page: false,
+            })
+            .unwrap()
+            .into_boxed_str(),
+        );
+        for (method, path, body) in [
+            (Method::Get, "/api/saved-collections", ""),
+            (
+                Method::Get,
+                "/api/saved-collection?id=11111111-1111-4111-8111-111111111111",
+                "",
+            ),
+            (Method::Post, "/api/saved-collection/navigate", navigate),
+        ] {
+            let mut request: Request = TestRequest::new()
+                .with_method(method)
+                .with_path(path)
+                .with_header(cookie.clone())
+                .with_header(client.clone())
+                .with_header(session.clone())
+                .with_body(body)
+                .into();
+            let response = finalized_route(&mut request, &state, 420);
+            assert_ne!(response.status, 401, "{path}");
+            assert_eq!(
+                response_header_values(&response, "Cache-Control"),
+                ["no-store"],
+                "{path}"
+            );
         }
     }
 
@@ -6113,11 +7078,160 @@ mod tests {
     }
 
     #[test]
+    fn raw_prefetch_skip_has_empty_attested_non_cacheable_response() {
+        let owner = RemoteSessionIdentity {
+            client_id: "client".to_owned(),
+            session_id: "0123456789abcdef0123456789abcdef".to_owned(),
+        };
+        let failure = crate::ipc_client::ClientFailure {
+            error: IpcClientError::MediaRemote(mimageviewer_ipc::MediaError::new(
+                MediaErrorCode::RawPrefetchSkipped,
+                "skipped",
+            )),
+            retry_count: 0,
+            retry_statuses: Vec::new(),
+        };
+        let response = page_ipc_error_response(
+            failure,
+            Duration::from_millis(5),
+            "generation-1",
+            &owner,
+            2048,
+        );
+        assert_eq!(response.status, 204);
+        assert!(response.body.is_empty());
+        for (name, value) in [
+            ("X-mIV-Page-Skip", "raw-prefetch"),
+            ("X-mIV-Remote-State-Generation", "generation-1"),
+            ("X-mIV-Remote-Session", "0123456789abcdef0123456789abcdef"),
+            ("Cache-Control", "no-store"),
+        ] {
+            assert!(
+                response
+                    .headers
+                    .iter()
+                    .any(|(header, found)| *header == name && found == value)
+            );
+        }
+        assert!(
+            !response
+                .headers
+                .iter()
+                .any(|(name, _)| *name == "Retry-After")
+        );
+    }
+
+    #[test]
+    fn raw_capacity_is_retryable_raw_busy_but_existing_busy_keeps_its_name() {
+        for (media_code, expected_code) in [
+            (MediaErrorCode::RawCapacity, "raw_busy"),
+            (MediaErrorCode::Busy, "miv_media_error"),
+        ] {
+            let response = media_ipc_error_response(
+                crate::ipc_client::ClientFailure {
+                    error: IpcClientError::MediaRemote(mimageviewer_ipc::MediaError::new(
+                        media_code, "busy",
+                    )),
+                    retry_count: 0,
+                    retry_statuses: Vec::new(),
+                },
+                Duration::from_millis(5),
+                "page",
+                Some(2048),
+            );
+            assert_eq!(response.status, 503);
+            let body: Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(body["error"], expected_code);
+            assert!(
+                response
+                    .headers
+                    .iter()
+                    .any(|(name, value)| *name == "Retry-After" && value == "1")
+            );
+        }
+    }
+
+    #[test]
+    fn generation_failure_422_is_not_normal_no_art() {
+        let response = ipc_error_response(
+            IpcClientError::Remote(mimageviewer_ipc::ThumbnailError::new(
+                mimageviewer_ipc::ThumbnailErrorCode::GenerationFailed,
+                "generation failed",
+            )),
+            0,
+            Vec::new(),
+            Duration::from_millis(5),
+            256,
+            "file",
+        );
+        assert_eq!(response.status, 422);
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["error"], "miv_thumbnail_error");
+        assert!(
+            response
+                .headers
+                .iter()
+                .any(|(name, value)| *name == "Cache-Control" && value == "no-store")
+        );
+    }
+
+    #[test]
+    fn no_raw_thumbnail_uses_existing_failure_response_with_distinct_log_status() {
+        let response = ipc_error_response(
+            IpcClientError::Remote(mimageviewer_ipc::ThumbnailError::new(
+                mimageviewer_ipc::ThumbnailErrorCode::NoThumbnail,
+                "no thumbnail",
+            )),
+            0,
+            Vec::new(),
+            Duration::from_millis(5),
+            256,
+            "file",
+        );
+        assert_eq!(response.status, 422);
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["error"], "no_thumbnail");
+        assert_eq!(
+            response.log_details.unwrap()["thumb"]["ipc_status"],
+            "miv_no_thumbnail"
+        );
+    }
+
+    #[test]
+    fn collection_image_entries_publish_addresses_for_raw_page_routing() {
+        let source = mimageviewer_ipc::RemoteEntry {
+            path: "C:/Photos/camera.cr3".to_owned(),
+            thumbnail_address: None,
+            name: "camera.cr3".to_owned(),
+            kind: RemoteEntryKind::Image,
+            detail: None,
+            progress_current: None,
+            progress_total: None,
+            rating: None,
+        };
+        let mut value = json!({ "entries": [source] });
+        add_collection_entry_addresses(&mut value, std::slice::from_ref(&source));
+        assert_eq!(
+            value["entries"][0]["address"],
+            json!(RemoteAddress::file("C:/Photos/camera.cr3")),
+        );
+        let nested =
+            listing_payload_for_web(&json!({ "listing": { "entries": [source] } }), &[source])
+                .unwrap();
+        assert_eq!(
+            nested["listing"]["entries"][0]["address"],
+            value["entries"][0]["address"]
+        );
+    }
+
+    #[test]
     fn thumbnail_diagnostics_distinguish_container_source_without_logging_a_path() {
         let zip = RemoteAddress::file("C:/Books/volume.ZIP");
         let pdf = RemoteAddress::file("C:/Books/volume.pdf");
+        let epub = RemoteAddress::file("C:/Books/volume.EPUB");
         assert_eq!(remote_source_kind(&zip), "zip");
         assert_eq!(remote_source_kind(&pdf), "pdf");
+        assert_eq!(remote_source_kind(&epub), "pdf");
         assert_eq!(remote_address_kind(&zip), "file");
     }
 
@@ -6221,6 +7335,35 @@ mod tests {
         drop(foreground);
         drop(prefetches);
         drop(existing);
+    }
+
+    #[test]
+    fn thumbnails_keep_the_last_heavy_slot_and_do_not_consume_prefetch_quota() {
+        let admission = IpcAdmission::new();
+        let thumbnails = (0..MAX_CONCURRENT_HEAVY_IPC - 1)
+            .map(|_| admission.try_enter(IpcClass::Thumbnail).unwrap())
+            .collect::<Vec<_>>();
+        assert!(admission.try_enter(IpcClass::Thumbnail).is_err());
+        assert_eq!(admission.prefetch.in_flight(), 0);
+        let foreground = admission.try_enter(IpcClass::Heavy).unwrap();
+        assert!(admission.try_enter(IpcClass::Heavy).is_err());
+        drop(foreground);
+        drop(thumbnails);
+
+        let prefetches = (0..MAX_CONCURRENT_PAGE_PREFETCH - 1)
+            .map(|_| admission.try_enter(IpcClass::Prefetch).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            admission.prefetch.in_flight(),
+            MAX_CONCURRENT_PAGE_PREFETCH - 1
+        );
+        let thumbnail = admission.try_enter(IpcClass::Thumbnail).unwrap();
+        assert_eq!(
+            admission.prefetch.in_flight(),
+            MAX_CONCURRENT_PAGE_PREFETCH - 1
+        );
+        let foreground = admission.try_enter(IpcClass::Heavy).unwrap();
+        drop((prefetches, thumbnail, foreground));
     }
 
     #[test]

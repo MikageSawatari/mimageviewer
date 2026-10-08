@@ -1,0 +1,5 @@
+outside: dims=[4096, 4] runtime=None success=true
+boundary: dims=[2048, 4] runtime=None success=true
+inside: dims=[16, 16] runtime=None success=false
+disabled: dims=[16, 16] runtime=None success=true
+no-model: dims=[16, 16] runtime=None success=true

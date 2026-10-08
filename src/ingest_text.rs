@@ -101,6 +101,23 @@ impl PerSourceText {
             && self.tags.is_empty()
             && self.sidecar.is_empty()
     }
+
+    /// Tantivy の STORED 原文へ投入する UTF-8 byte 数。
+    ///
+    /// `combined()` は検索互換用の一時文字列なので含めず、実際に個別保存する
+    /// 8 source field の総量だけを数える。
+    pub(crate) fn stored_text_byte_sizes(&self) -> (usize, usize) {
+        let png_prompt_bytes = self.png_prompt.len();
+        let total_bytes = self.name.len()
+            + self.exif.len()
+            + self.xmp_tweet.len()
+            + png_prompt_bytes
+            + self.pdf_meta.len()
+            + self.video_meta.len()
+            + self.tags.len()
+            + self.sidecar.len();
+        (total_bytes, png_prompt_bytes)
+    }
 }
 
 /// 旧 XMP タグ列を「空白区切り列に載せられる」安全な形に正規化する。
@@ -596,6 +613,37 @@ mod tests {
         assert_eq!(pst.get(SourceKind::VideoMeta), "v");
         assert_eq!(pst.get(SourceKind::Tags), "t");
         assert_eq!(pst.get(SourceKind::Sidecar), "s");
+    }
+
+    #[test]
+    fn stored_text_byte_sizes_count_utf8_source_fields_without_join_separators() {
+        let pst = PerSourceText {
+            name: "a.jpg".into(),
+            exif: "夕焼け".into(),
+            png_prompt: "prompt".into(),
+            ..Default::default()
+        };
+        assert_eq!(pst.stored_text_byte_sizes(), (5 + 9 + 6, 6));
+    }
+
+    #[test]
+    fn comfy_template_fixture_keeps_path_and_bytes_ingest_text_small_and_identical() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/ai_metadata/comfyui_linked_template_with_parameters.png");
+        let bytes = fs::read(&path).unwrap();
+        let from_path = build_per_source_for_file(&path);
+        let from_bytes =
+            build_per_source_from_bytes(path.file_name().unwrap().to_str().unwrap(), &bytes);
+
+        assert_eq!(from_path.png_prompt, from_bytes.png_prompt);
+        assert!(from_path.png_prompt.contains("resolved parameter positive"));
+        assert!(!from_path.png_prompt.contains("template-token"));
+        assert!(!from_path.png_prompt.contains("parameter-negative-leak"));
+        let (_, png_prompt_bytes) = from_path.stored_text_byte_sizes();
+        assert!(
+            png_prompt_bytes < 1024,
+            "template must not inflate STORED prompt text: {png_prompt_bytes} bytes"
+        );
     }
 
     #[test]

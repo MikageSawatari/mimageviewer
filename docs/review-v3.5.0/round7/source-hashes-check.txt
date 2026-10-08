@@ -1,0 +1,29 @@
+
+Algorithm : SHA256
+Hash      : 12E7A7FBBC2D9C0FCD95479E7FF2FA9FBABDE8F5031317FF31D3527415F70732
+Path      : C:\home\mimageviewer\src\app.rs
+
+Algorithm : SHA256
+Hash      : F083F943C0706CCCF2911277432D714C2E3FFFEF639972650DBD38598AE8D3F1
+Path      : C:\home\mimageviewer\src\app\gamepad_input.rs
+
+Algorithm : SHA256
+Hash      : ABC99AD80BC9C188932CD6C3A14BA9EDD6D905356A92843B1CAD95C77E3C2C7F
+Path      : C:\home\mimageviewer\src\app\native_video.rs
+
+Algorithm : SHA256
+Hash      : 8CA27435DEE5ED69DD81E1A64222297B0CC4E0770379A0A5A8289332E8A16A56
+Path      : C:\home\mimageviewer\src\app\tests.rs
+
+Algorithm : SHA256
+Hash      : 39AA798E1C44243C0A95BC10798A28F1DC5E54D4C81E53826716AC597B723336
+Path      : C:\home\mimageviewer\src\ui_adjustment_panel.rs
+
+Algorithm : SHA256
+Hash      : B77B43538348A296B977893C92B92289A8CF8E447343F1FD40BD2C0E99FEACD3
+Path      : C:\home\mimageviewer\src\undo_ops.rs
+
+Algorithm : SHA256
+Hash      : 224CF55041C50832C5A182C3DBB5A49D1AFB75B8F07C22A42A7A1B70A9DA5304
+Path      : C:\home\mimageviewer\src\undo_stack.rs
+

@@ -3,15 +3,15 @@
 //! 1 つのダイアログで:
 //! - 表示名 / 並べ替え / 削除
 //! - 名前索引 / メタ索引の ON/OFF
+//! - 別バージョン索引の ON/OFF
 //! - メタ索引の初期スキャン状態 (✅ 完了 / ⏳ スキャン中)
 //! - サムネイル一括作成ダイアログの起動
 //!
 //! を扱う。旧 2 つのダイアログを別にしていた頃は「フラグは A で切り替え、状態は B で
 //! 見る」という導線で分かりにくかったため 1 本化した。
 //!
-//! 索引メンテナンスは notify-rs + 起動時スキャンで自動同期される前提。
-//! 手動再構築・一括作成系の UI は v0.8.0 で外し、索引が壊れたときはプロセス再起動で
-//! 初期スキャンから作り直す運用にしている。
+//! 索引メンテナンスは変更監視と起動時の確認で自動同期する。
+//! 終了中の変更の確認を省く設定でも「今すぐ確認」で全索引へ手動確認を要求できる。
 
 use std::time::Duration;
 
@@ -43,7 +43,7 @@ pub(crate) struct IndexDiskSizes {
 /// `COUNT(*)` を走らせないため。close 時に破棄。
 ///
 /// - `name_counts[fav_id]`: search_index.db の当 favorite_root 配下のエントリ数
-/// - `meta_counts[fav_id]`: fts_meta.db の当 favorite_id × status=Ok の件数
+/// - `meta_counts[fav_id]`: 当 favorite 配下を所有する ID 集合の status=Ok 件数
 /// - `name_total` / `meta_total`: 上記の合計 (索引サイズ表示用の総件数)
 #[derive(Default, Clone)]
 pub(crate) struct IndexFileCounts {
@@ -51,6 +51,142 @@ pub(crate) struct IndexFileCounts {
     pub(crate) meta_counts: std::collections::HashMap<uuid::Uuid, u64>,
     pub(crate) name_total: u64,
     pub(crate) meta_total: u64,
+}
+
+#[cfg(test)]
+mod ownership_count_tests {
+    use super::*;
+
+    fn progress_favorite(id: u128, path: &str) -> crate::settings::FavoriteEntry {
+        crate::settings::FavoriteEntry {
+            id: uuid::Uuid::from_u128(id),
+            name: String::new(),
+            path: path.into(),
+            auto_index_metadata: true,
+            auto_index_structure: false,
+            auto_index_thumbs: false,
+            auto_index_similar: false,
+        }
+    }
+
+    #[test]
+    fn metadata_progress_non_owner_tracks_owner_scan_and_completion() {
+        let favorites = vec![
+            progress_favorite(1, "c:/photos"),
+            progress_favorite(2, "C:/PHOTOS"),
+        ];
+        let ownership = crate::metadata_ownership::metadata_ownership(&favorites, &[]);
+        let mut stats = std::collections::HashMap::new();
+        assert_eq!(
+            metadata_progress_flags(&ownership, favorites[1].id, &stats),
+            None
+        );
+        stats.insert(
+            favorites[0].id,
+            SupervisorStats {
+                in_full_scan: true,
+                ..SupervisorStats::default()
+            },
+        );
+        assert_eq!(
+            metadata_progress_flags(&ownership, favorites[1].id, &stats),
+            Some((true, false))
+        );
+        stats.insert(
+            favorites[0].id,
+            SupervisorStats {
+                initial_scan_done: true,
+                ..SupervisorStats::default()
+            },
+        );
+        assert_eq!(
+            metadata_progress_flags(&ownership, favorites[1].id, &stats),
+            Some((false, true))
+        );
+    }
+
+    #[test]
+    fn metadata_progress_outer_waits_for_all_owners_and_ignores_other_roots() {
+        let favorites = vec![
+            progress_favorite(1, "c:/photos"),
+            progress_favorite(2, "c:/photos/inner"),
+            progress_favorite(3, "c:/other"),
+        ];
+        let ownership = crate::metadata_ownership::metadata_ownership(&favorites, &[]);
+        let mut stats = std::collections::HashMap::from([
+            (
+                favorites[0].id,
+                SupervisorStats {
+                    initial_scan_done: true,
+                    ..SupervisorStats::default()
+                },
+            ),
+            (
+                favorites[2].id,
+                SupervisorStats {
+                    in_full_scan: true,
+                    ..SupervisorStats::default()
+                },
+            ),
+        ]);
+        assert_eq!(
+            metadata_progress_flags(&ownership, favorites[0].id, &stats),
+            None
+        );
+        stats.insert(favorites[1].id, SupervisorStats::default());
+        assert_eq!(
+            metadata_progress_flags(&ownership, favorites[0].id, &stats),
+            Some((false, false))
+        );
+        stats.get_mut(&favorites[1].id).unwrap().in_full_scan = true;
+        assert_eq!(
+            metadata_progress_flags(&ownership, favorites[0].id, &stats),
+            Some((true, false))
+        );
+        stats.insert(
+            favorites[1].id,
+            SupervisorStats {
+                initial_scan_done: true,
+                ..SupervisorStats::default()
+            },
+        );
+        assert_eq!(
+            metadata_progress_flags(&ownership, favorites[0].id, &stats),
+            Some((false, true))
+        );
+    }
+
+    #[test]
+    fn nested_and_duplicate_favorites_sum_filter_set_without_double_total() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::fts_meta::FtsMetaDb::open_at(&tmp.path().join("meta.db")).unwrap();
+        let favorite = |id, root: &str| crate::settings::FavoriteEntry {
+            id: uuid::Uuid::from_u128(id),
+            name: String::new(),
+            path: root.into(),
+            auto_index_metadata: true,
+            auto_index_structure: false,
+            auto_index_thumbs: false,
+            auto_index_similar: false,
+        };
+        let favorites = vec![
+            favorite(1, "c:/photos"),
+            favorite(2, "c:/photos/inner"),
+            favorite(3, "C:/PHOTOS/INNER"),
+        ];
+        for (p, f) in [
+            ("c:/photos/x.jpg", &favorites[0]),
+            ("c:/photos/inner/y.jpg", &favorites[1]),
+        ] {
+            db.upsert_meta_ok(p, f.id, &f.path, crate::fts_index::IndexKind::Image, 1, 1)
+                .unwrap();
+        }
+        let counts = collect_counts(None, Some(&db), &favorites, &[]);
+        assert_eq!(counts.meta_counts[&favorites[0].id], 2);
+        assert_eq!(counts.meta_counts[&favorites[1].id], 1);
+        assert_eq!(counts.meta_counts[&favorites[2].id], 1);
+        assert_eq!(counts.meta_total, 2);
+    }
 }
 
 /// 全 favorite 分の件数を集計する。
@@ -63,7 +199,8 @@ pub(crate) struct IndexFileCounts {
 pub(crate) fn collect_counts(
     name_db: Option<&crate::search_index_db::SearchIndexDb>,
     meta_db: Option<&crate::fts_meta::FtsMetaDb>,
-    favorites: &[(uuid::Uuid, std::path::PathBuf)],
+    favorites: &[crate::settings::FavoriteEntry],
+    common_excluded: &[std::path::PathBuf],
 ) -> IndexFileCounts {
     let mut out = IndexFileCounts::default();
     let name_map = name_db
@@ -72,16 +209,47 @@ pub(crate) fn collect_counts(
     let meta_map = meta_db
         .and_then(|db| db.count_ok_grouped_by_favorite().ok())
         .unwrap_or_default();
-    for (fav_id, fav_path) in favorites {
-        let key = crate::search_index_db::normalize_path(fav_path);
+    let ownership = crate::metadata_ownership::metadata_ownership(favorites, common_excluded);
+    let mut name_roots = std::collections::HashSet::new();
+    for f in favorites {
+        let key = crate::search_index_db::normalize_path(&f.path);
         let n = name_map.get(&key).copied().unwrap_or(0);
-        let m = meta_map.get(fav_id).copied().unwrap_or(0);
-        out.name_counts.insert(*fav_id, n);
-        out.meta_counts.insert(*fav_id, m);
-        out.name_total += n;
-        out.meta_total += m;
+        let m = ownership
+            .filter_set(f.id)
+            .iter()
+            .map(|id| meta_map.get(id).copied().unwrap_or(0))
+            .sum();
+        out.name_counts.insert(f.id, n);
+        out.meta_counts.insert(f.id, m);
+        if name_roots.insert(key) {
+            out.name_total += n;
+        }
     }
+    out.meta_total = meta_map.values().sum();
     out
+}
+
+/// 件数と同じ所有者集合で進捗を見る。同 root の非所有者は自分の supervisor を持たない。
+fn metadata_progress_flags(
+    ownership: &crate::metadata_ownership::MetadataOwnership,
+    favorite_id: uuid::Uuid,
+    stats: &std::collections::HashMap<uuid::Uuid, SupervisorStats>,
+) -> Option<(bool, bool)> {
+    let owners = ownership.filter_set(favorite_id);
+    if owners.is_empty() {
+        return None;
+    }
+    let in_full_scan = owners
+        .iter()
+        .any(|id| stats.get(id).is_some_and(|s| s.in_full_scan));
+    let initial_scan_done = owners
+        .iter()
+        .all(|id| stats.get(id).is_some_and(|s| s.initial_scan_done));
+    if in_full_scan || owners.iter().all(|id| stats.contains_key(id)) {
+        Some((in_full_scan, initial_scan_done))
+    } else {
+        None
+    }
 }
 
 pub(crate) fn compute_index_disk_sizes() -> IndexDiskSizes {
@@ -121,6 +289,60 @@ pub(crate) fn compute_index_disk_sizes() -> IndexDiskSizes {
     }
 }
 
+/// 進捗が動いている間の再描画間隔。進捗行・残り時間・件数は 100ms で流す。
+const FAVORITES_EDITOR_ACTIVE_REPAINT: Duration = Duration::from_millis(100);
+/// 何も動いていない間の再描画間隔。
+///
+/// トレードオフ: **バックグラウンド索引が動き出してから最初の行が出るまで最大 1 秒遅れる**。
+/// 利用者は起動後の索引作成が終わるのを見るためにこのダイアログを数分開いたままにするので、
+/// その間ずっと 10fps で起き続ける方 (ノート PC / タブレットの電池) が実害が大きい。
+/// この遅れは backlog §1.62 で許容と判断した。
+const FAVORITES_EDITOR_IDLE_REPAINT: Duration = Duration::from_secs(1);
+
+/// 「お気に入り」ダイアログの中で、いま動いている (= 秒未満で見た目が変わる) もの。
+///
+/// ここに挙がっているものだけが速い再描画を要求できる。判断材料を 1 つの値にまとめて
+/// おくことで、再描画間隔の決定者をこの module に 1 人だけにする。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FavoritesEditorActivity {
+    /// メタ / 名前索引 supervisor の進捗行、または全体の残り時間が出ている。
+    indexer_progress_visible: bool,
+    /// 別バージョン索引が進行中 (走査 / 一覧反映待ち / 監視準備待ち)。
+    similar_index_running: bool,
+    /// 別バージョン索引の要約を worker が読込中 (`Preparing`、spinner 表示)。
+    similar_summary_loading: bool,
+}
+
+impl FavoritesEditorActivity {
+    fn any(self) -> bool {
+        self.indexer_progress_visible || self.similar_index_running || self.similar_summary_loading
+    }
+}
+
+/// 「お気に入り」ダイアログを開いている間の再描画間隔を決める。
+fn favorites_editor_repaint_interval(activity: FavoritesEditorActivity) -> Duration {
+    if activity.any() {
+        FAVORITES_EDITOR_ACTIVE_REPAINT
+    } else {
+        FAVORITES_EDITOR_IDLE_REPAINT
+    }
+}
+
+/// 別バージョン索引が進行中か。
+///
+/// `Degraded` / `Failed` は活動行を出すが、次の走査が始まるまで文言が変わらない終端状態
+/// なので進行中には数えない (数えると、そのお気に入りがある限り速い再描画が止まらない)。
+/// `Idle` は「まだ動き出していない」であって進行中ではない。
+fn similar_index_is_running(progress: &crate::similar_index::IndexProgress) -> bool {
+    use crate::similar_index::IndexProgress;
+    matches!(
+        progress,
+        IndexProgress::Running(_)
+            | IndexProgress::AwaitingArray(_)
+            | IndexProgress::AwaitingWatch(_)
+    )
+}
+
 impl App {
     pub(crate) fn show_favorites_editor_dialog(&mut self, ctx: &egui::Context) {
         if !self.show_favorites_editor {
@@ -135,11 +357,13 @@ impl App {
         // (ループ中に self を再帰的に &mut 借りる回避)。
         let mut name_index_toggles: Vec<(uuid::Uuid, std::path::PathBuf, bool)> = Vec::new();
         let mut meta_index_toggles: Vec<(uuid::Uuid, bool)> = Vec::new();
+        let mut similar_index_toggles: Vec<(std::path::PathBuf, bool)> = Vec::new();
         let mut favorite_default_toggles: Vec<(uuid::Uuid, String, bool)> = Vec::new();
         let mut favorite_view_resets: Vec<uuid::Uuid> = Vec::new();
         let mut any_setting_dirty = false;
         let mut swap: Option<(usize, usize)> = None;
         let mut remove: Option<usize> = None;
+        let mut favorite_removed = false;
         let mut open_cache_creator = false;
         let has_favorites = !self.settings.favorites.is_empty();
         let (safe_rect, dialog_size, min_dialog_size) =
@@ -151,7 +375,7 @@ impl App {
         let old_pause_minimized = self.settings.pause_indexer_while_minimized;
 
         // 事前にインデクサ情報を取り出し (borrow 競合回避)
-        let startup_diag = self.indexer_manager.as_ref().map(|m| m.startup_diag());
+        let startup_diag = self.indexer_init.as_ref().map(|m| m.startup_diag());
         // インデックスサイズ + 件数キャッシュ。
         //
         // Codex 指摘 (2026-04): UI スレッドで `COUNT(*)` を N 回叩くと、毎回
@@ -184,18 +408,19 @@ impl App {
             .unwrap_or(true);
         if counts_stale && self.favorites_index_refresh_rx.is_none() {
             let name_db = self.search_index_db.as_ref().cloned();
-            let meta_db = self.indexer_manager.as_ref().map(|m| m.clone_fts_meta());
-            let fav_ids: Vec<(uuid::Uuid, std::path::PathBuf)> = self
-                .settings
-                .favorites
-                .iter()
-                .map(|f| (f.id, f.path.clone()))
-                .collect();
+            let meta_db = self.indexer_init.as_ref().map(|m| m.clone_fts_meta());
+            let favorites = self.settings.favorites.clone();
+            let common_excluded = vec![self.settings.books_root_path()];
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::Builder::new()
                 .name("fav-index-counts".into())
                 .spawn(move || {
-                    let counts = collect_counts(name_db.as_deref(), meta_db.as_deref(), &fav_ids);
+                    let counts = collect_counts(
+                        name_db.as_deref(),
+                        meta_db.as_deref(),
+                        &favorites,
+                        &common_excluded,
+                    );
                     let sizes = compute_index_disk_sizes();
                     let _ = tx.send((counts, sizes));
                 })
@@ -228,26 +453,44 @@ impl App {
                 .collect()
         };
         let reconciling = self
-            .indexer_manager
+            .indexer_init
             .as_ref()
             .is_some_and(|m| m.is_reconciling());
         let stats_by_id: std::collections::HashMap<uuid::Uuid, SupervisorStats> = self
-            .indexer_manager
+            .indexer_init
             .as_ref()
             .map(|m| m.all_stats())
             .unwrap_or_default()
             .into_iter()
             .map(|v| (v.favorite_id, v.stats))
             .collect();
+        let metadata_ownership = crate::metadata_ownership::metadata_ownership(
+            &self.settings.favorites,
+            &[self.settings.books_root_path()],
+        );
         // 名前索引側の stats も同様に集める (名前索引 supervisor は App 直下管理)
         let name_stats_by_id: std::collections::HashMap<
             uuid::Uuid,
             crate::name_index_supervisor::NameIndexStats,
-        > = self
-            .name_index_supervisors
-            .iter()
-            .map(|(id, h)| (*id, h.snapshot_stats()))
-            .collect();
+        > = self.name_index_stats_by_id();
+        let similar_feature_enabled =
+            favorites_editor_similar_controls_visible(self.similar_feature_capability());
+        let similar_progress = similar_feature_enabled.then(|| self.similar_index_progress());
+        let similar_summary = self
+            .similar_index
+            .as_ref()
+            .filter(|_| similar_feature_enabled)
+            .map(crate::similar_index::SimilarIndexManager::summary);
+        // このダイアログの再描画間隔は 1 箇所でだけ決める (`Window::show` の後で 1 回だけ
+        // `request_repaint_after` を呼ぶ)。ここで分かるのは「別バージョン索引の要約を
+        // worker が読込中か」だけなので、それを記録して残りは描画中に埋める。
+        let mut activity = FavoritesEditorActivity {
+            similar_summary_loading: matches!(
+                similar_summary,
+                Some(crate::similar_index::IndexSummaryStatus::Preparing)
+            ),
+            ..FavoritesEditorActivity::default()
+        };
 
         egui::Window::new("お気に入り")
             .open(&mut open)
@@ -273,7 +516,7 @@ impl App {
                     .auto_shrink([false, false])
                     .max_height(body_height)
                     .show(ui, |ui| {
-                        ui.set_min_width((safe_size.x - 40.0).clamp(1.0, 744.0));
+                        ui.set_min_width((safe_size.x - 40.0).clamp(1.0, 944.0));
 
                 // ── 起動時整合性チェック (インデクサが有効なら表示) ──
                 if reconciling {
@@ -365,8 +608,7 @@ impl App {
                 ui.group(|ui| {
                     ui.label(
                         egui::RichText::new(
-                            "💡 アプリケーションを終了すると、次回起動時に\
-                             インデックスの再スキャンが行われます。\
+                            "アプリケーションを終了するとファイルの変更監視も停止します。\
                              終了する代わりにタスクトレイに常駐すると、\
                              起動がスムーズになります。",
                         )
@@ -410,18 +652,33 @@ impl App {
                     }
                 });
                 ui.add_space(4.0);
+                if crate::ui_helpers::draw_offline_change_scan_setting(
+                    ui, &mut self.settings.skip_offline_change_scan,
+                ).changed() {
+                    any_setting_dirty = true;
+                }
+                if crate::ui_helpers::draw_index_full_check_button(ui).clicked() {
+                    self.request_index_full_check();
+                }
+                ui.add_space(4.0);
 
                 if self.settings.favorites.is_empty() {
                     ui.label("お気に入りはまだ登録されていません。");
                     ui.add_space(4.0);
                 } else {
+                    let indexing_description = if similar_feature_enabled {
+                        "お気に入りは以下を索引化して、コンテナ検索 (Ctrl+S) ・\
+                         アイテム検索 (Ctrl+G) と別バージョン検索ができます。\
+                         チェックを入れた項目はこの場で 1 回全走査し、以降は\
+                         ファイルの変更監視で自動更新します。起動時の確認は上の設定で選べます。"
+                    } else {
+                        "お気に入りは以下を索引化して、コンテナ検索 (Ctrl+S) ・\
+                         アイテム検索 (Ctrl+G) ができます。\
+                         チェックを入れた項目はこの場で 1 回全走査し、以降は\
+                         ファイルの変更監視で自動更新します。起動時の確認は上の設定で選べます。"
+                    };
                     ui.label(
-                        egui::RichText::new(
-                            "お気に入りは以下を索引化して、コンテナ検索 (Ctrl+S) ・\
-                             アイテム検索 (Ctrl+G) できます。\
-                             チェックを入れた項目はこの場で 1 回全走査し、以降は\
-                             ファイルの変更監視と起動時スキャンで自動更新します。",
-                        )
+                        egui::RichText::new(indexing_description)
                         .weak()
                         .size(11.0),
                     );
@@ -460,6 +717,16 @@ impl App {
                                          ✅ 監視中 = 初期スキャン完了 + ファイルの変更を追従\n\
                                          ⏳ スキャン中 = アクティブスキャン実行中",
                                         );
+                                    if similar_feature_enabled {
+                                        ui.label(
+                                            egui::RichText::new("別バージョン索引").strong(),
+                                        )
+                                        .on_hover_text(
+                                            "表示中の画像と同じ絵の別バージョンを検索\n\
+                                             ✅ 監視中 = 初回作成完了 + ファイルの変更を追従\n\
+                                             ⏳ 作成中 = バックグラウンドで画像を確認中",
+                                        );
+                                    }
                                     ui.label(egui::RichText::new("操作").strong());
                                     ui.end_row();
 
@@ -571,12 +838,41 @@ impl App {
                                             draw_state_inline(
                                                 ui,
                                                 meta_on,
-                                                stats_by_id
-                                                    .get(&fav_id)
-                                                    .map(|s| (s.in_full_scan, s.initial_scan_done)),
+                                                metadata_progress_flags(
+                                                    &metadata_ownership,
+                                                    fav_id,
+                                                    &stats_by_id,
+                                                ),
                                                 row_counts[i].1,
                                             );
                                         });
+
+                                        if similar_feature_enabled {
+                                            // 別バージョン索引: チェック + 全体 worker の状態。
+                                            ui.horizontal(|ui| {
+                                                let similar_resp = ui.checkbox(
+                                                    &mut self.settings.favorites[i]
+                                                        .auto_index_similar,
+                                                    "",
+                                                );
+                                                if similar_resp.changed() {
+                                                    similar_index_toggles.push((
+                                                        fav_path.clone(),
+                                                        self.settings.favorites[i]
+                                                            .auto_index_similar,
+                                                    ));
+                                                    any_setting_dirty = true;
+                                                }
+                                                draw_similar_state_inline(
+                                                    ui,
+                                                    self.settings.favorites[i]
+                                                        .auto_index_similar,
+                                                    similar_progress.as_ref().expect(
+                                                        "enabled similar feature has progress",
+                                                    ),
+                                                );
+                                            });
+                                        }
 
                                         // 操作 (↑ ↓ 削除)
                                         ui.horizontal(|ui| {
@@ -644,6 +940,26 @@ impl App {
                                 }
                             }
                         }
+                        if similar_feature_enabled {
+                            if ui.button("別バージョン 全ON").clicked() {
+                                for f in &mut self.settings.favorites {
+                                    if !f.auto_index_similar {
+                                        f.auto_index_similar = true;
+                                        similar_index_toggles.push((f.path.clone(), true));
+                                        any_setting_dirty = true;
+                                    }
+                                }
+                            }
+                            if ui.button("別バージョン 全OFF").clicked() {
+                                for f in &mut self.settings.favorites {
+                                    if f.auto_index_similar {
+                                        f.auto_index_similar = false;
+                                        similar_index_toggles.push((f.path.clone(), false));
+                                        any_setting_dirty = true;
+                                    }
+                                }
+                            }
+                        }
                     });
 
                     // ── サムネイル一括作成 (I/O が重いため手動バルクのみの位置付け) ──
@@ -692,6 +1008,20 @@ impl App {
                             if let Some(eta) = s.eta {
                                 all_etas.push(eta);
                             }
+                        }
+                    }
+                    // 進捗行または残り時間が出ている間は「動いている」とみなす。`eta` は
+                    // 削除 / 取込フェーズでだけ入るので、行が無くても進行中のことがある。
+                    activity.indexer_progress_visible = !active.is_empty() || !all_etas.is_empty();
+                    if let Some(similar_progress) = similar_progress.as_ref() {
+                        // 別バージョン索引は「進行中か」で判定する。行の有無では判定しない
+                        // (`Degraded` / `Failed` は文言が止まったまま残る終端状態なので、
+                        //  行の有無で見るとダイアログを開いている限り速い再描画が続く)。
+                        activity.similar_index_running = similar_index_is_running(similar_progress);
+                        if let Some(message) =
+                            similar_index_progress_presentation(true, similar_progress).activity
+                        {
+                            active.push(("別バージョン".to_owned(), message));
                         }
                     }
                     // 全体 ETA: 並列実行されているので「残り時間 = max(各 remaining_secs)」、
@@ -745,22 +1075,17 @@ impl App {
                         );
                     } else {
                         for (name, msg) in &active {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "  {}: {}",
-                                    name,
-                                    truncate_name(msg, 100),
-                                ))
-                                .size(11.0)
-                                .monospace()
-                                .color(ui.visuals().weak_text_color()),
-                            )
-                            .on_hover_text(format!("{name}: {msg}"));
+                            draw_background_indexer_activity_row(ui, name, msg);
                         }
                     }
-                    // ライブ更新: 100ms ごとに再描画を要求して進捗を流す。
-                    // active が空でも notify-rs が動き出した瞬間に拾えるよう常に呼ぶ。
-                    ctx.request_repaint_after(Duration::from_millis(100));
+                    if let (Some(summary), Some(progress)) =
+                        (similar_summary.as_ref(), similar_progress.as_ref())
+                    {
+                        draw_similar_index_summary(ui, summary, progress);
+                    }
+                    // ライブ更新の再描画要求はここでは出さない。間隔は
+                    // `favorites_editor_repaint_interval` が決め、`Window::show` の後で
+                    // 1 フレームに 1 回だけ要求する。
                 }
 
                 if escape_pressed && self.favorite_delete_confirm.is_none() {
@@ -777,6 +1102,12 @@ impl App {
                 });
                     });
             });
+
+        // ライブ更新: このダイアログが開いている間の再描画要求は、ここ 1 箇所だけで出す。
+        // 進捗が動いている間は従来どおり 100ms。何も動いていない間は 1 秒へ落とす。
+        // 「active が空でも notify-rs が動き出した瞬間に拾う」という元の意図は保つが、
+        // 動き出しに気付くまで最大 1 秒遅れることは許容する (backlog §1.62)。
+        ctx.request_repaint_after(favorites_editor_repaint_interval(activity));
 
         // お気に入り編集には「現在のページ」が無い。ON の種と OFF 後の比較先は
         // どちらも共通標準に固定する。
@@ -817,10 +1148,13 @@ impl App {
                                 .weak(),
                         );
                         ui.add_space(8.0);
+                        let removal_description = if similar_feature_enabled {
+                            "コンテナ索引・アイテム索引・別バージョン索引・お気に入り標準設定・記憶した表示状態も解除されます。"
+                        } else {
+                            "コンテナ索引・アイテム索引・お気に入り標準設定・記憶した表示状態も解除されます。"
+                        };
                         ui.label(
-                            egui::RichText::new(
-                                "コンテナ索引・アイテム索引・お気に入り標準設定・記憶した表示状態も解除されます。",
-                            )
+                            egui::RichText::new(removal_description)
                             .weak(),
                         );
                         ui.add_space(8.0);
@@ -862,11 +1196,17 @@ impl App {
             // 削除対象の favorite の索引データもクリーンアップする。
             // (フラグが OFF なら副作用なしなので害はない。ON→削除でも正しく掃除される。)
             let removed = self.settings.favorites.remove(i);
+            favorite_removed = true;
             if removed.auto_index_structure {
                 name_index_toggles.push((removed.id, removed.path.clone(), false));
             }
             if removed.auto_index_metadata {
                 meta_index_toggles.push((removed.id, false));
+            }
+            // 旧版で OFF 後に残った行も含め、favorite 自体の削除では常に掃除を要求する。
+            // 他の ON favorite と範囲が重なる行は SimilarDb 側が保持する。
+            if similar_feature_enabled {
+                similar_index_toggles.push((removed.path.clone(), false));
             }
             // 補正のお気に入り標準も即時に掃除する (次回起動時の prune_favorite_params
             // を待たない)。これで削除直後にフォルダを再訪したとき、残像の favorite 標準が
@@ -887,6 +1227,14 @@ impl App {
         // ループしてもコストは少ない (sync はほぼ idempotent)。
         for (fav_id, new_on) in &meta_index_toggles {
             self.apply_favorite_meta_index_change(*fav_id, *new_on);
+        }
+        for (path, new_on) in &similar_index_toggles {
+            self.apply_favorite_similar_index_change(path, *new_on);
+        }
+        if favorite_removed {
+            // A paused similar-only favorite has no toggle side effect, but the shared metadata
+            // manager still owns the canonical favorite snapshot.
+            self.sync_shared_favorite_indexers();
         }
 
         // 並び替え / 削除 / 名前編集のみだった場合も save を走らせる
@@ -930,6 +1278,245 @@ impl App {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SimilarIndexProgressTone {
+    Weak,
+    Pending,
+    Complete,
+    Error,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SimilarIndexProgressPresentation {
+    inline_label: &'static str,
+    inline_tone: SimilarIndexProgressTone,
+    activity: Option<String>,
+}
+
+fn similar_index_progress_presentation(
+    enabled: bool,
+    progress: &crate::similar_index::IndexProgress,
+) -> SimilarIndexProgressPresentation {
+    use crate::similar_index::{IndexProgress, IndexStage};
+
+    let activity = match progress {
+        IndexProgress::Running(progress) => {
+            let stage = match progress.stage {
+                IndexStage::Opening => "準備中",
+                IndexStage::Scanning => "画像を確認中",
+                IndexStage::Pruning => "更新内容を整理中",
+            };
+            let mut message = match progress.stage {
+                IndexStage::Opening => stage.to_owned(),
+                IndexStage::Scanning => format!(
+                    "{stage}  確認済み {} 件（発見済み {} 件・総数未確定）",
+                    format_count(progress.report.processed),
+                    format_count(progress.report.discovered)
+                ),
+                IndexStage::Pruning => format!(
+                    "{stage}  確認済み {} 件（発見済み {} 件）",
+                    format_count(progress.report.processed),
+                    format_count(progress.report.discovered)
+                ),
+            };
+            if let Some(path) = &progress.current_path {
+                message.push_str(&format!("  {}", path.display()));
+            }
+            Some(message)
+        }
+        IndexProgress::AwaitingArray(_) => Some("検索用一覧へ反映中".to_owned()),
+        IndexProgress::AwaitingWatch(_) => Some("フォルダー監視の準備待ち".to_owned()),
+        IndexProgress::Degraded { reason, .. } => {
+            Some(format!("更新未完了: {}", reason.user_message()))
+        }
+        IndexProgress::Failed(error) => Some(format!("失敗: {error}")),
+        IndexProgress::Idle | IndexProgress::Complete(_) | IndexProgress::Cancelled(_) => None,
+    };
+
+    let (inline_label, inline_tone) = if !enabled {
+        ("—", SimilarIndexProgressTone::Weak)
+    } else {
+        match progress {
+            IndexProgress::Running(_) | IndexProgress::AwaitingArray(_) => {
+                ("⏳ 作成中", SimilarIndexProgressTone::Pending)
+            }
+            IndexProgress::AwaitingWatch(_) => ("⏳ 監視準備中", SimilarIndexProgressTone::Pending),
+            IndexProgress::Failed(_) => ("⚠ 作成失敗", SimilarIndexProgressTone::Error),
+            IndexProgress::Degraded { .. } => ("⚠ 更新未完了", SimilarIndexProgressTone::Error),
+            IndexProgress::Idle => ("⏳ 起動中", SimilarIndexProgressTone::Pending),
+            IndexProgress::Complete(_) => ("✅ 監視中", SimilarIndexProgressTone::Complete),
+            IndexProgress::Cancelled(_) => ("⚠ 中断", SimilarIndexProgressTone::Pending),
+        }
+    };
+
+    SimilarIndexProgressPresentation {
+        inline_label,
+        inline_tone,
+        activity,
+    }
+}
+
+fn draw_background_indexer_activity_row(ui: &mut egui::Ui, name: &str, message: &str) {
+    ui.label(
+        egui::RichText::new(format!("  {}: {}", name, truncate_name(message, 100),))
+            .size(11.0)
+            .monospace()
+            .color(ui.visuals().weak_text_color()),
+    )
+    .on_hover_text(format!("{name}: {message}"));
+}
+
+fn favorites_editor_similar_controls_visible(
+    capability: crate::similar_index::SimilarFeatureCapability,
+) -> bool {
+    capability.is_enabled()
+}
+
+#[cfg(test)]
+mod similar_control_visibility_tests {
+    use super::favorites_editor_similar_controls_visible;
+    use crate::settings::FavoriteEntry;
+    use crate::similar_index::SimilarFeatureCapability;
+    use std::path::PathBuf;
+
+    #[test]
+    fn row_and_bulk_similar_controls_share_capability_without_mutating_saved_value() {
+        let mut favorite = FavoriteEntry::new("before".to_owned(), PathBuf::from(r"C:\saved"));
+        favorite.auto_index_similar = true;
+        let controls_visible =
+            favorites_editor_similar_controls_visible(SimilarFeatureCapability::Paused);
+
+        assert!(
+            !controls_visible,
+            "row and bulk controls are both suppressed"
+        );
+        favorite.name = "after".to_owned();
+        assert!(
+            favorite.auto_index_similar,
+            "editing another visible field preserves the hidden saved flag"
+        );
+        assert!(favorites_editor_similar_controls_visible(
+            SimilarFeatureCapability::Enabled
+        ));
+        assert!(favorites_editor_similar_controls_visible(
+            crate::similar_index::PRODUCT_SIMILAR_FEATURE_CAPABILITY
+        ));
+    }
+}
+
+fn draw_similar_index_summary(
+    ui: &mut egui::Ui,
+    status: &crate::similar_index::IndexSummaryStatus,
+    progress: &crate::similar_index::IndexProgress,
+) {
+    use crate::similar_index::IndexSummaryStatus;
+
+    match status {
+        IndexSummaryStatus::NoIndex => {
+            if !matches!(
+                progress,
+                crate::similar_index::IndexProgress::Running(_)
+                    | crate::similar_index::IndexProgress::AwaitingWatch(_)
+                    | crate::similar_index::IndexProgress::AwaitingArray(_)
+            ) {
+                ui.label(
+                    egui::RichText::new("  別バージョン: 索引なし")
+                        .size(11.0)
+                        .color(ui.visuals().weak_text_color()),
+                );
+            }
+        }
+        IndexSummaryStatus::Preparing => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(
+                    egui::RichText::new("別バージョン索引の情報を読込中")
+                        .size(11.0)
+                        .color(ui.visuals().weak_text_color()),
+                );
+            });
+        }
+        IndexSummaryStatus::Ready(summary) => {
+            let updated =
+                crate::app::format_details_timestamp(summary.completed_at_unix_secs, true);
+            let updated = if updated.is_empty() {
+                "不明"
+            } else {
+                &updated
+            };
+            ui.label(
+                egui::RichText::new(format!(
+                    "  別バージョン（前回完了）: {} 件 / 最終更新 {updated}",
+                    format_count(summary.registered_items),
+                ))
+                .size(11.0)
+                .monospace()
+                .color(ui.visuals().weak_text_color()),
+            );
+            draw_similar_failure_breakdown(
+                ui,
+                "前回完了時に",
+                summary.password_required_pdfs,
+                summary.corrupt_containers,
+                summary.zero_page_containers,
+                summary.decode_failures,
+                summary.io_failures,
+            );
+        }
+        IndexSummaryStatus::Failed(error) => {
+            ui.label(
+                egui::RichText::new(format!(
+                    "  別バージョン索引の情報を読み込めませんでした: {error}"
+                ))
+                .size(11.0)
+                .color(ui.visuals().error_fg_color),
+            );
+        }
+    }
+
+    let current_report = match progress {
+        crate::similar_index::IndexProgress::Running(running) => Some(&running.report),
+        crate::similar_index::IndexProgress::AwaitingWatch(report)
+        | crate::similar_index::IndexProgress::AwaitingArray(report)
+        | crate::similar_index::IndexProgress::Degraded { report, .. } => Some(report),
+        _ => None,
+    };
+    if let Some(report) = current_report {
+        draw_similar_failure_breakdown(
+            ui,
+            "今回",
+            report.password_required_pdfs,
+            report.corrupt_containers,
+            report.zero_page_containers,
+            report.decode_failures,
+            report.io_failures,
+        );
+    }
+}
+
+fn draw_similar_failure_breakdown(
+    ui: &mut egui::Ui,
+    run_label: &str,
+    password_required_pdfs: u64,
+    corrupt_containers: u64,
+    zero_page_containers: u64,
+    decode_failures: u64,
+    io_failures: u64,
+) {
+    ui.label(
+        egui::RichText::new(format!(
+            "    {run_label}確認できなかった項目: パスワード付き PDF {} / 破損した本 {} / 0 ページ {} / 画像の読込失敗 {} / ファイル操作の失敗 {}",
+            format_count(password_required_pdfs),
+            format_count(corrupt_containers),
+            format_count(zero_page_containers),
+            format_count(decode_failures),
+            format_count(io_failures),
+        ))
+        .size(11.0)
+        .color(ui.visuals().weak_text_color()),
+    );
+}
+
 fn favorites_editor_dialog_geometry(
     content_rect: egui::Rect,
     has_favorites: bool,
@@ -937,8 +1524,8 @@ fn favorites_editor_dialog_geometry(
     let safe_rect = content_rect.shrink2(egui::vec2(16.0, 16.0));
     let safe_size = safe_rect.size();
     let preferred_height = if has_favorites { 800.0 } else { 420.0 };
-    let dialog_size = egui::vec2(980.0, preferred_height).min(safe_size);
-    let min_dialog_size = egui::vec2(760.0, 420.0).min(safe_size);
+    let dialog_size = egui::vec2(1180.0, preferred_height).min(safe_size);
+    let min_dialog_size = egui::vec2(820.0, 420.0).min(safe_size);
     (safe_rect, dialog_size, min_dialog_size)
 }
 
@@ -996,9 +1583,34 @@ fn draw_state_inline(ui: &mut egui::Ui, on: bool, flags: Option<(bool, bool)>, f
     ui.label(egui::RichText::new(text).size(11.0).color(color));
 }
 
+fn draw_similar_state_inline(
+    ui: &mut egui::Ui,
+    on: bool,
+    progress: &crate::similar_index::IndexProgress,
+) {
+    const YELLOW: egui::Color32 = egui::Color32::from_rgb(200, 170, 60);
+    const GREEN: egui::Color32 = egui::Color32::from_rgb(100, 170, 100);
+    let presentation = similar_index_progress_presentation(on, progress);
+    let color = match presentation.inline_tone {
+        SimilarIndexProgressTone::Weak => ui.visuals().weak_text_color(),
+        SimilarIndexProgressTone::Pending => YELLOW,
+        SimilarIndexProgressTone::Complete => GREEN,
+        SimilarIndexProgressTone::Error => ui.visuals().error_fg_color,
+    };
+    ui.label(
+        egui::RichText::new(presentation.inline_label)
+            .size(11.0)
+            .color(color),
+    );
+}
+
 #[cfg(test)]
 mod tests {
-    use super::favorites_editor_dialog_geometry;
+    use super::{
+        SimilarIndexProgressPresentation, SimilarIndexProgressTone,
+        draw_background_indexer_activity_row, draw_similar_state_inline,
+        favorites_editor_dialog_geometry, similar_index_progress_presentation,
+    };
 
     #[test]
     fn favorites_editor_dialog_geometry_stays_inside_small_window() {
@@ -1018,7 +1630,326 @@ mod tests {
             favorites_editor_dialog_geometry(content_rect, true);
 
         assert_eq!(safe_rect.size(), egui::vec2(1248.0, 968.0));
-        assert_eq!(dialog_size, egui::vec2(980.0, 800.0));
-        assert_eq!(min_dialog_size, egui::vec2(760.0, 420.0));
+        assert_eq!(dialog_size, egui::vec2(1180.0, 800.0));
+        assert_eq!(min_dialog_size, egui::vec2(820.0, 420.0));
+    }
+
+    fn report() -> crate::similar_index::IndexReport {
+        crate::similar_index::IndexReport {
+            discovered: 1_500,
+            processed: 1_234,
+            ..Default::default()
+        }
+    }
+
+    fn running(
+        stage: crate::similar_index::IndexStage,
+        current_path: Option<&str>,
+    ) -> crate::similar_index::IndexProgress {
+        crate::similar_index::IndexProgress::Running(crate::similar_index::RunningProgress {
+            stage,
+            current_path: current_path.map(std::path::PathBuf::from),
+            report: report(),
+        })
+    }
+
+    #[test]
+    fn favorites_editor_repaint_interval_is_slow_only_when_nothing_progresses() {
+        use super::{
+            FAVORITES_EDITOR_ACTIVE_REPAINT, FAVORITES_EDITOR_IDLE_REPAINT,
+            FavoritesEditorActivity, favorites_editor_repaint_interval,
+        };
+        use std::time::Duration;
+
+        assert_eq!(FAVORITES_EDITOR_ACTIVE_REPAINT, Duration::from_millis(100));
+        assert_eq!(FAVORITES_EDITOR_IDLE_REPAINT, Duration::from_secs(1));
+        assert_eq!(
+            favorites_editor_repaint_interval(FavoritesEditorActivity::default()),
+            FAVORITES_EDITOR_IDLE_REPAINT,
+            "何も動いていなければ 1 秒まで落とす"
+        );
+
+        // 単独の理由 3 つと、その全組み合わせ。1 つでも立っていれば 100ms。
+        for indexer_progress_visible in [false, true] {
+            for similar_index_running in [false, true] {
+                for similar_summary_loading in [false, true] {
+                    let activity = FavoritesEditorActivity {
+                        indexer_progress_visible,
+                        similar_index_running,
+                        similar_summary_loading,
+                    };
+                    let expected = if indexer_progress_visible
+                        || similar_index_running
+                        || similar_summary_loading
+                    {
+                        FAVORITES_EDITOR_ACTIVE_REPAINT
+                    } else {
+                        FAVORITES_EDITOR_IDLE_REPAINT
+                    };
+                    assert_eq!(
+                        favorites_editor_repaint_interval(activity),
+                        expected,
+                        "{activity:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn similar_index_running_excludes_terminal_states() {
+        use super::similar_index_is_running;
+        use crate::similar_index::{IndexDegradedReason, IndexProgress, IndexStage};
+
+        for progress in [
+            running(IndexStage::Opening, None),
+            running(IndexStage::Scanning, Some("book.jpg")),
+            running(IndexStage::Pruning, None),
+            IndexProgress::AwaitingArray(report()),
+            IndexProgress::AwaitingWatch(report()),
+        ] {
+            assert!(similar_index_is_running(&progress), "{progress:?}");
+        }
+
+        // 終端状態。`Degraded` / `Failed` は活動行を出し続けるが文言は変わらない。
+        for progress in [
+            IndexProgress::Idle,
+            IndexProgress::Complete(report()),
+            IndexProgress::Cancelled(report()),
+            IndexProgress::Degraded {
+                report: report(),
+                reason: IndexDegradedReason::WatchUnavailable,
+            },
+            IndexProgress::Failed("DBを開けません".to_owned()),
+        ] {
+            assert!(!similar_index_is_running(&progress), "{progress:?}");
+        }
+    }
+
+    #[test]
+    fn similar_index_progress_presentation_covers_every_variant_stage_and_reason() {
+        use crate::similar_index::{IndexDegradedReason, IndexProgress, IndexStage};
+        use SimilarIndexProgressTone::{Complete, Error, Pending};
+
+        let cases = vec![
+            (
+                IndexProgress::Idle,
+                SimilarIndexProgressPresentation {
+                    inline_label: "⏳ 起動中",
+                    inline_tone: Pending,
+                    activity: None,
+                },
+            ),
+            (
+                running(IndexStage::Opening, None),
+                SimilarIndexProgressPresentation {
+                    inline_label: "⏳ 作成中",
+                    inline_tone: Pending,
+                    activity: Some("準備中".to_owned()),
+                },
+            ),
+            (
+                running(IndexStage::Scanning, Some("book.jpg")),
+                SimilarIndexProgressPresentation {
+                    inline_label: "⏳ 作成中",
+                    inline_tone: Pending,
+                    activity: Some(
+                        "画像を確認中  確認済み 1,234 件（発見済み 1,500 件・総数未確定）  book.jpg"
+                            .to_owned(),
+                    ),
+                },
+            ),
+            (
+                running(IndexStage::Pruning, None),
+                SimilarIndexProgressPresentation {
+                    inline_label: "⏳ 作成中",
+                    inline_tone: Pending,
+                    activity: Some(
+                        "更新内容を整理中  確認済み 1,234 件（発見済み 1,500 件）".to_owned(),
+                    ),
+                },
+            ),
+            (
+                IndexProgress::AwaitingWatch(report()),
+                SimilarIndexProgressPresentation {
+                    inline_label: "⏳ 監視準備中",
+                    inline_tone: Pending,
+                    activity: Some("フォルダー監視の準備待ち".to_owned()),
+                },
+            ),
+            (
+                IndexProgress::AwaitingArray(report()),
+                SimilarIndexProgressPresentation {
+                    inline_label: "⏳ 作成中",
+                    inline_tone: Pending,
+                    activity: Some("検索用一覧へ反映中".to_owned()),
+                },
+            ),
+            (
+                IndexProgress::Complete(report()),
+                SimilarIndexProgressPresentation {
+                    inline_label: "✅ 監視中",
+                    inline_tone: Complete,
+                    activity: None,
+                },
+            ),
+            (
+                IndexProgress::Cancelled(report()),
+                SimilarIndexProgressPresentation {
+                    inline_label: "⚠ 中断",
+                    inline_tone: Pending,
+                    activity: None,
+                },
+            ),
+            (
+                IndexProgress::Degraded {
+                    report: report(),
+                    reason: IndexDegradedReason::FilesystemObservationIncomplete,
+                },
+                SimilarIndexProgressPresentation {
+                    inline_label: "⚠ 更新未完了",
+                    inline_tone: Error,
+                    activity: Some(
+                        "更新未完了: ファイルの確認が完了しませんでした。既存の索引は保持されています"
+                            .to_owned(),
+                    ),
+                },
+            ),
+            (
+                IndexProgress::Degraded {
+                    report: report(),
+                    reason: IndexDegradedReason::ArrayPublication("接続が切れました".to_owned()),
+                },
+                SimilarIndexProgressPresentation {
+                    inline_label: "⚠ 更新未完了",
+                    inline_tone: Error,
+                    activity: Some(
+                        "更新未完了: 検索用一覧への反映を確認できませんでした: 接続が切れました"
+                            .to_owned(),
+                    ),
+                },
+            ),
+            (
+                IndexProgress::Degraded {
+                    report: report(),
+                    reason: IndexDegradedReason::WatchUnavailable,
+                },
+                SimilarIndexProgressPresentation {
+                    inline_label: "⚠ 更新未完了",
+                    inline_tone: Error,
+                    activity: Some(
+                        "更新未完了: 一部フォルダーの監視を確認できません。索引は作成済みです"
+                            .to_owned(),
+                    ),
+                },
+            ),
+            (
+                IndexProgress::Failed("DBを開けません".to_owned()),
+                SimilarIndexProgressPresentation {
+                    inline_label: "⚠ 作成失敗",
+                    inline_tone: Error,
+                    activity: Some("失敗: DBを開けません".to_owned()),
+                },
+            ),
+        ];
+
+        for (progress, expected) in cases {
+            assert_eq!(
+                similar_index_progress_presentation(true, &progress),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn similar_index_progress_presentation_disables_only_the_inline_status() {
+        let progress = running(crate::similar_index::IndexStage::Scanning, None);
+        let presentation = similar_index_progress_presentation(false, &progress);
+
+        assert_eq!(presentation.inline_label, "—");
+        assert_eq!(presentation.inline_tone, SimilarIndexProgressTone::Weak);
+        assert_eq!(
+            presentation.activity.as_deref(),
+            Some("画像を確認中  確認済み 1,234 件（発見済み 1,500 件・総数未確定）")
+        );
+    }
+
+    #[test]
+    fn similar_index_progress_snapshot_dark() {
+        use crate::similar_index::{IndexDegradedReason, IndexProgress, IndexStage};
+        use egui_kittest::Harness;
+
+        let fixtures = vec![
+            ("無効", false, IndexProgress::Complete(report())),
+            ("確認中", true, running(IndexStage::Scanning, None)),
+            ("整理中", true, running(IndexStage::Pruning, None)),
+            ("監視待ち", true, IndexProgress::AwaitingWatch(report())),
+            ("一覧反映", true, IndexProgress::AwaitingArray(report())),
+            (
+                "確認失敗",
+                true,
+                IndexProgress::Degraded {
+                    report: report(),
+                    reason: IndexDegradedReason::FilesystemObservationIncomplete,
+                },
+            ),
+            (
+                "反映失敗",
+                true,
+                IndexProgress::Degraded {
+                    report: report(),
+                    reason: IndexDegradedReason::ArrayPublication("接続が切れました".to_owned()),
+                },
+            ),
+            (
+                "監視不能",
+                true,
+                IndexProgress::Degraded {
+                    report: report(),
+                    reason: IndexDegradedReason::WatchUnavailable,
+                },
+            ),
+        ];
+        let mut fonts_ready = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(900.0, 270.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(egui::RichText::new("別バージョン索引の進行状態").strong());
+                    ui.separator();
+                    egui::Grid::new("similar_index_progress_snapshot")
+                        .num_columns(3)
+                        .spacing(egui::vec2(10.0, 5.0))
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for (fixture_label, enabled, progress) in &fixtures {
+                                ui.label(egui::RichText::new(*fixture_label).size(11.0));
+                                draw_similar_state_inline(ui, *enabled, progress);
+                                if let Some(activity) =
+                                    similar_index_progress_presentation(*enabled, progress).activity
+                                {
+                                    draw_background_indexer_activity_row(
+                                        ui,
+                                        "別バージョン",
+                                        &activity,
+                                    );
+                                } else {
+                                    ui.label("");
+                                }
+                                ui.end_row();
+                            }
+                        });
+                });
+            });
+        harness.run();
+        harness.snapshot("favorites_similar_index_progress_dark");
     }
 }

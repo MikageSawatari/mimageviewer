@@ -12,7 +12,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc, Mutex, OnceLock, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -80,6 +80,43 @@ struct ActiveWindow {
 
 static RECORDS: OnceLock<Mutex<Vec<WindowRecord>>> = OnceLock::new();
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+// Enabled only by the test-script capture coordinator while a batch is pending.
+static CAPTURE_PROBE: AtomicBool = AtomicBool::new(false);
+pub const CAPTURE_PROBE_DETAIL_LIMIT: u64 = 128;
+static CAPTURE_PROBE_DETAIL_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+
+pub fn set_capture_probe(active: bool) {
+    // A capture session normally contains one batch. Overlapping batches share
+    // the same budget, so they cannot multiply per-frame probe output.
+    if active && !CAPTURE_PROBE.load(Ordering::Relaxed) {
+        CAPTURE_PROBE_DETAIL_ATTEMPTS.store(0, Ordering::Relaxed);
+    }
+    CAPTURE_PROBE.store(active, Ordering::Relaxed);
+    #[cfg(feature = "wgpu")]
+    egui_wgpu::atlas_diag::set_capture_probe(active);
+}
+
+#[inline]
+pub fn capture_probe_active() -> bool {
+    CAPTURE_PROBE.load(Ordering::Relaxed)
+}
+
+/// Reserve one diagnostic detail line before formatting it. The coordinator
+/// emits an unbudgeted summary after the last capture batch completes.
+#[inline]
+pub fn capture_probe_detail_allowed() -> bool {
+    capture_probe_active()
+        && CAPTURE_PROBE_DETAIL_ATTEMPTS.fetch_add(1, Ordering::Relaxed)
+            < CAPTURE_PROBE_DETAIL_LIMIT
+}
+
+pub fn capture_probe_detail_counts() -> (u64, u64) {
+    let attempts = CAPTURE_PROBE_DETAIL_ATTEMPTS.load(Ordering::Relaxed);
+    (
+        attempts.min(CAPTURE_PROBE_DETAIL_LIMIT),
+        attempts.saturating_sub(CAPTURE_PROBE_DETAIL_LIMIT),
+    )
+}
 
 thread_local! {
     static ACTIVE_WINDOW: RefCell<Option<ActiveWindow>> = const { RefCell::new(None) };

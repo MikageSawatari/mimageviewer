@@ -34,10 +34,9 @@ enum CollectionSettingsSource {
 }
 
 impl CollectionSettingsSource {
-    fn load(&self) -> Result<Settings, String> {
+    fn load(&self) -> Result<Settings, crate::settings_db::SettingsDbError> {
         match self {
-            Self::Live => crate::settings_db::with_db_result(|db| db.load_into_settings())
-                .map_err(|error| error.to_string()),
+            Self::Live => crate::settings_db::with_db_result(|db| db.load_into_settings()),
             #[cfg(test)]
             Self::Snapshot(settings) => Ok(settings.clone()),
         }
@@ -126,9 +125,9 @@ impl CollectionEngine {
         let sort_order = match self.sort_settings.load() {
             Ok(sort_order) => sort_order,
             Err(error) => {
-                return CollectionResponse::Error(internal_error(
+                return CollectionResponse::Error(collection_settings_error(
                     "最新の並び順を読み込めませんでした",
-                    error,
+                    &error,
                 ));
             }
         };
@@ -158,9 +157,9 @@ impl CollectionEngine {
     }
 
     fn load_settings(&self) -> Result<Settings, CollectionError> {
-        self.settings
-            .load()
-            .map_err(|error| internal_error("最新の一覧設定を読み込めませんでした", error))
+        self.settings.load().map_err(|error| {
+            collection_settings_error("最新の一覧設定を読み込めませんでした", &error)
+        })
     }
 
     /// Favorite search stays in CollectionEngine because it shares the response bound,
@@ -189,15 +188,22 @@ impl CollectionEngine {
             ));
         }
         let settings = self.load_settings()?;
-        let sort_order = self
-            .sort_settings
-            .load()
-            .map_err(|error| internal_error("最新の並び順を読み込めませんでした", error))?;
+        let sort_order = self.sort_settings.load().map_err(|error| {
+            collection_settings_error("最新の並び順を読み込めませんでした", &error)
+        })?;
         let favorites = self.favorites.current().map_err(|error| {
             crate::logger::log(format!("remote_ipc: {error}"));
             CollectionError::new(
-                CollectionErrorCode::Internal,
-                "最新の閲覧起点を読み込めませんでした",
+                if error.is_busy() {
+                    CollectionErrorCode::Busy
+                } else {
+                    CollectionErrorCode::Internal
+                },
+                if error.is_busy() {
+                    "設定の復旧中です。少し待ってから再試行してください"
+                } else {
+                    "最新の閲覧起点を読み込めませんでした"
+                },
             )
         })?;
         if !favorites
@@ -234,11 +240,12 @@ impl CollectionEngine {
             FavoriteSearchKind::Zip => Some(IndexKind::ZipFile),
             FavoriteSearchKind::Pdf => Some(IndexKind::PdfFile),
         };
-        let index_entries = match db.search(
+        let index_entries = match db.search_with_epub(
             &request.query,
             &favorite_paths,
             kind,
             crate::search_query::MatchMode::And,
+            !settings.epub_file_handling_ignores_epub(),
         ) {
             Ok(entries) => entries,
             Err(error) => {
@@ -386,6 +393,7 @@ impl CollectionEngine {
             request.kind,
             key_scan_limit,
             !settings.archive_file_handling_ignores_convertible(),
+            !settings.epub_file_handling_ignores_epub(),
         );
         Ok(TagItemsPayload {
             listing: self.tag_items_listing(settings, sort_order, entries, truncated),
@@ -735,6 +743,7 @@ fn collection_payload(
 ) -> CollectionPayload {
     let spread = collection_spread_payload(&entries, spread_request);
     CollectionPayload {
+        thumbnail_presentation: super::thumbnail_presentation(settings),
         title: title.to_owned(),
         thumb_aspect_height_ratio: aggregate_thumb_aspect_height_ratio(settings),
         sort_state,
@@ -798,7 +807,9 @@ fn collection_spread_payload(
             Some(PageGroup {
                 anchor,
                 pages,
+                presentation: None,
                 slice: crate::ui_fullscreen::remote_page_slice(group.slice),
+                singleton_placement: mimageviewer_ipc::RemoteSingletonSpreadPlacement::Center,
             })
         })
         .collect();
@@ -827,7 +838,63 @@ fn remote_entry_grid_item(kind: RemoteEntryKind, path: PathBuf) -> GridItem {
     }
 }
 
-fn cached_collection_landscape_flags(entries: &[RemoteEntry]) -> Vec<bool> {
+pub(super) fn cached_collection_landscape_flags(entries: &[RemoteEntry]) -> Vec<bool> {
+    cached_image_landscape_flags(
+        entries.len(),
+        |index| {
+            let entry = entries.get(index)?;
+            (entry.kind == RemoteEntryKind::Image).then(|| Path::new(&entry.path))
+        },
+        || true,
+    )
+    .unwrap_or_else(|| vec![false; entries.len()])
+}
+
+pub(super) fn cached_grid_item_landscape_flags(items: &[GridItem]) -> Vec<bool> {
+    cached_image_landscape_flags(
+        items.len(),
+        |index| match items.get(index)? {
+            GridItem::Image(path) => Some(path.as_path()),
+            _ => None,
+        },
+        || true,
+    )
+    .unwrap_or_else(|| vec![false; items.len()])
+}
+
+pub(super) fn cached_prepared_collection_landscape_flags(
+    entries: &[crate::collection_store::PreparedCollectionEntry],
+) -> Vec<bool> {
+    cached_prepared_collection_landscape_flags_while(entries, || true)
+        .unwrap_or_else(|| vec![false; entries.len()])
+}
+
+pub(super) fn cached_prepared_collection_landscape_flags_while(
+    entries: &[crate::collection_store::PreparedCollectionEntry],
+    keep_running: impl FnMut() -> bool,
+) -> Option<Vec<bool>> {
+    cached_image_landscape_flags(
+        entries.len(),
+        |index| {
+            let entry = entries.get(index)?;
+            matches!(
+                entry.availability,
+                crate::collection_store::CollectionSourcePreparation::Available {
+                    kind: crate::collection_store::CollectionResolvedKind::Image,
+                    ..
+                }
+            )
+            .then_some(entry.source_path.as_path())
+        },
+        keep_running,
+    )
+}
+
+fn cached_image_landscape_flags<'a>(
+    len: usize,
+    path_at: impl Fn(usize) -> Option<&'a Path>,
+    mut keep_running: impl FnMut() -> bool,
+) -> Option<Vec<bool>> {
     struct ParentImages {
         path: PathBuf,
         images: Vec<(usize, String)>,
@@ -835,11 +902,13 @@ fn cached_collection_landscape_flags(entries: &[RemoteEntry]) -> Vec<bool> {
 
     let mut parents = Vec::<ParentImages>::new();
     let mut parent_indexes = HashMap::<String, usize>::new();
-    for (index, entry) in entries.iter().enumerate() {
-        if entry.kind != RemoteEntryKind::Image {
-            continue;
+    for index in 0..len {
+        if !keep_running() {
+            return None;
         }
-        let path = Path::new(&entry.path);
+        let Some(path) = path_at(index) else {
+            continue;
+        };
         let Some(parent) = path.parent() else {
             continue;
         };
@@ -861,16 +930,18 @@ fn cached_collection_landscape_flags(entries: &[RemoteEntry]) -> Vec<bool> {
     }
 
     let cache_dir = crate::catalog::default_cache_dir();
-    let mut landscape = vec![false; entries.len()];
-    let rotation_keys = entries
-        .iter()
-        .map(|entry| {
-            (entry.kind == RemoteEntryKind::Image)
-                .then(|| GridItem::Image(PathBuf::from(&entry.path)))
+    let mut landscape = vec![false; len];
+    let rotation_keys = (0..len)
+        .map(|index| {
+            path_at(index)
+                .map(|path| GridItem::Image(path.to_path_buf()))
                 .as_ref()
                 .and_then(crate::edit_source::page_key_for_grid_item)
         })
         .collect::<Vec<_>>();
+    if !keep_running() {
+        return None;
+    }
     let rotations = crate::rotation_db::RotationDb::open_readonly()
         .ok()
         .map(|db| db.get_many(rotation_keys.iter().filter_map(|key| key.as_deref())))
@@ -878,6 +949,9 @@ fn cached_collection_landscape_flags(entries: &[RemoteEntry]) -> Vec<bool> {
     // 親フォルダごとに一度だけ catalog を開き、寸法列だけを一括取得する。
     // フォルダを処理し終えたら DB と寸法 map を drop するので、全親の blob/map を保持しない。
     for parent in parents {
+        if !keep_running() {
+            return None;
+        }
         let catalog = crate::catalog::CatalogDb::open_existing_read_only(&cache_dir, &parent.path)
             .ok()
             .flatten();
@@ -893,21 +967,28 @@ fn cached_collection_landscape_flags(entries: &[RemoteEntry]) -> Vec<bool> {
             .images
             .iter()
             .filter(|(_, filename)| !cached.contains_key(filename))
-            .map(|(index, filename)| (filename.clone(), PathBuf::from(&entries[*index].path)))
+            .filter_map(|(index, filename)| {
+                Some((filename.clone(), path_at(*index)?.to_path_buf()))
+            })
             .collect::<Vec<_>>();
         // 位置ではなく名前で引く。位置で対応させると「2 つのループが同じ順に回る」ことが
         // 暗黙の前提になり、片方の絞り込みを変えた瞬間に**別のページの寸法**を返す。
-        let probed = super::container::file_image_dims_batch(
-            &uncataloged
+        let mut probed = HashMap::new();
+        for chunk in uncataloged.chunks(256) {
+            if !keep_running() {
+                return None;
+            }
+            let paths = chunk
                 .iter()
                 .map(|(_, path)| path.clone())
-                .collect::<Vec<_>>(),
-        );
-        let probed = uncataloged
-            .into_iter()
-            .map(|(filename, _)| filename)
-            .zip(probed)
-            .collect::<HashMap<_, _>>();
+                .collect::<Vec<_>>();
+            for ((filename, _), dims) in chunk
+                .iter()
+                .zip(super::container::file_image_dims_batch(&paths))
+            {
+                probed.insert(filename.clone(), dims);
+            }
+        }
         for (index, filename) in parent.images {
             let dims = match cached.get(&filename) {
                 Some(recorded) => recorded.or_else(|| {
@@ -928,7 +1009,7 @@ fn cached_collection_landscape_flags(entries: &[RemoteEntry]) -> Vec<bool> {
             });
         }
     }
-    landscape
+    Some(landscape)
 }
 
 fn empty_tag_browse_payload(state: TagIndexState) -> TagBrowsePayload {
@@ -1029,8 +1110,19 @@ fn candidate_from_tag_item_key(key: String, filter: TagItemKind) -> Option<Candi
 }
 
 fn include_collection_candidate(settings: &Settings, candidate: &CandidateEntry) -> bool {
-    candidate.kind != RemoteEntryKind::Archive
-        || !settings.archive_file_handling_ignores_convertible()
+    if candidate.kind == RemoteEntryKind::Archive {
+        return !settings.archive_file_handling_ignores_convertible();
+    }
+    if candidate.kind == RemoteEntryKind::Pdf
+        && candidate
+            .path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+    {
+        return !settings.epub_file_handling_ignores_epub();
+    }
+    true
 }
 
 fn map_tag_item_keys(
@@ -1038,12 +1130,14 @@ fn map_tag_item_keys(
     filter: TagItemKind,
     key_scan_limit: usize,
     include_archives: bool,
+    include_epub: bool,
 ) -> (Vec<RemoteEntry>, bool) {
     map_tag_item_keys_with_entry_limit(
         item_keys,
         filter,
         key_scan_limit,
         include_archives,
+        include_epub,
         MAX_REMOTE_COLLECTION_ENTRIES,
     )
 }
@@ -1053,6 +1147,7 @@ fn map_tag_item_keys_with_entry_limit(
     filter: TagItemKind,
     key_scan_limit: usize,
     include_archives: bool,
+    include_epub: bool,
     entry_limit: usize,
 ) -> (Vec<RemoteEntry>, bool) {
     let key_limit_reached = item_keys.len() > key_scan_limit;
@@ -1063,6 +1158,16 @@ fn map_tag_item_keys_with_entry_limit(
             continue;
         };
         if !include_archives && candidate.kind == RemoteEntryKind::Archive {
+            continue;
+        }
+        if !include_epub
+            && candidate.kind == RemoteEntryKind::Pdf
+            && candidate
+                .path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+        {
             continue;
         }
         candidates.push(candidate);
@@ -1181,6 +1286,24 @@ fn visible_places(settings: &Settings) -> Vec<PlaceSummary> {
             crate::known_folders::LocationMenuEntry::Bookshelf => PlaceSummary::Bookshelf {
                 name: "本棚フォルダ".to_owned(),
             },
+            crate::known_folders::LocationMenuEntry::FileOrganizeDestinations { destinations } => {
+                PlaceSummary::FileOrganizeDestinations {
+                    name: "整理先".to_owned(),
+                    entries: destinations
+                        .into_iter()
+                        .map(|destination| RemoteEntry {
+                            path: destination.path.to_string_lossy().into_owned(),
+                            name: destination.name,
+                            kind: RemoteEntryKind::Folder,
+                            thumbnail_address: None,
+                            detail: None,
+                            progress_current: None,
+                            progress_total: None,
+                            rating: None,
+                        })
+                        .collect(),
+                }
+            }
             crate::known_folders::LocationMenuEntry::Separator => PlaceSummary::Separator,
             crate::known_folders::LocationMenuEntry::QuickLocation(location) => {
                 remote_folder_place(location.label.to_owned(), location.path)
@@ -1194,16 +1317,20 @@ fn visible_places(settings: &Settings) -> Vec<PlaceSummary> {
 
 fn remote_folder_place(name: String, path: PathBuf) -> PlaceSummary {
     PlaceSummary::Folder {
-        entry: remote_entry_from_candidate(CandidateEntry {
-            path,
-            name,
-            kind: RemoteEntryKind::Folder,
-            detail: None,
-            progress_current: None,
-            progress_total: None,
-            rating: None,
-        }),
+        entry: remote_folder_entry(name, path),
     }
+}
+
+fn remote_folder_entry(name: String, path: PathBuf) -> RemoteEntry {
+    remote_entry_from_candidate(CandidateEntry {
+        path,
+        name,
+        kind: RemoteEntryKind::Folder,
+        detail: None,
+        progress_current: None,
+        progress_total: None,
+        rating: None,
+    })
 }
 
 #[cfg(test)]
@@ -1319,6 +1446,9 @@ fn candidate_from_grid_item(
                 crate::grid_item::SearchContainerKind::Zip => RemoteEntryKind::Zip,
             },
         ),
+        // Collection Grid is connected to Remote in Phase 5. Never expose an unavailable
+        // local placeholder through the existing folder aggregate in the meantime.
+        GridItem::CollectionPlaceholder { .. } => return None,
     };
     Some(CandidateEntry {
         path,
@@ -1429,10 +1559,39 @@ fn internal_error(context: &str, error: impl std::fmt::Display) -> CollectionErr
     CollectionError::new(CollectionErrorCode::Internal, context)
 }
 
+fn collection_settings_error(
+    context: &str,
+    error: &crate::settings_db::SettingsDbError,
+) -> CollectionError {
+    crate::logger::log(format!(
+        "remote_ipc: collection settings error context={context} error={error}"
+    ));
+    if matches!(
+        error,
+        crate::settings_db::SettingsDbError::SettingsFamilyQuiescing
+    ) {
+        CollectionError::new(
+            CollectionErrorCode::Busy,
+            "設定の復旧中です。少し待ってから再試行してください",
+        )
+    } else {
+        CollectionError::new(CollectionErrorCode::Internal, context)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::settings::FavoriteEntry;
+
+    #[test]
+    fn settings_family_quiescing_maps_to_collection_busy() {
+        let error = collection_settings_error(
+            "最新の一覧設定を読み込めませんでした",
+            &crate::settings_db::SettingsDbError::SettingsFamilyQuiescing,
+        );
+        assert_eq!(error.code, CollectionErrorCode::Busy);
+    }
 
     fn test_remote_entry(path: impl Into<String>, name: impl Into<String>) -> RemoteEntry {
         RemoteEntry {
@@ -1738,6 +1897,60 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn file_organize_destinations_places_keep_names_order_and_missing_paths() {
+        use crate::settings::FileOrganizeDestination;
+        let temp = tempfile::tempdir().unwrap();
+        let existing = temp.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        let missing = temp.path().join("missing");
+        let mut settings = Settings::default();
+        let group = |settings: &Settings| {
+            visible_places(settings)
+                .into_iter()
+                .find(|place| matches!(place, PlaceSummary::FileOrganizeDestinations { .. }))
+        };
+        assert!(group(&settings).is_none());
+        settings.file_organize_destinations = vec![
+            FileOrganizeDestination {
+                name: "未接続".into(),
+                path: missing.clone(),
+            },
+            FileOrganizeDestination {
+                name: "保管".into(),
+                path: existing.join("..").join("existing"),
+            },
+        ];
+        let PlaceSummary::FileOrganizeDestinations { name, entries } = group(&settings).unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(name, "整理先");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["未接続", "保管"]
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.kind == RemoteEntryKind::Folder)
+        );
+        assert_eq!(PathBuf::from(&entries[0].path), missing);
+        assert_eq!(
+            entries[1].path,
+            settings.file_organize_destinations[1]
+                .path
+                .to_string_lossy()
+        );
+        assert!(super::super::path_guard::resolve_existing(&entries[0].path).is_err());
+        assert!(super::super::path_guard::resolve_existing(&entries[1].path).is_ok());
+        settings.show_location_file_organize_destinations = false;
+        assert!(group(&settings).is_none());
     }
 
     #[test]
@@ -2433,6 +2646,7 @@ mod tests {
             TagItemKind::All,
             crate::tag_view::TAG_VIEW_RESULT_LIMIT,
             true,
+            true,
             test_limit,
         );
 
@@ -2452,17 +2666,41 @@ mod tests {
             TagItemKind::All,
             crate::tag_view::TAG_VIEW_RESULT_LIMIT,
             false,
+            true,
         );
         let (included, _) = map_tag_item_keys(
             vec![key],
             TagItemKind::All,
             crate::tag_view::TAG_VIEW_RESULT_LIMIT,
             true,
+            true,
         );
 
         assert!(ignored.is_empty());
         assert_eq!(included.len(), 1);
         assert_eq!(included[0].kind, RemoteEntryKind::Archive);
+    }
+
+    #[test]
+    fn tag_item_mapping_honors_epub_ignore_independently_of_archive() {
+        let temp = tempfile::tempdir().unwrap();
+        let epub = temp.path().join("tagged.epub");
+        let archive = temp.path().join("tagged.7z");
+        std::fs::write(&epub, b"epub").unwrap();
+        std::fs::write(&archive, b"archive").unwrap();
+        let keys = vec![
+            crate::tags_db::item_key_for_path(&epub),
+            crate::tags_db::item_key_for_path(&archive),
+        ];
+        let (entries, _) = map_tag_item_keys(
+            keys,
+            TagItemKind::All,
+            crate::tag_view::TAG_VIEW_RESULT_LIMIT,
+            true,
+            false,
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, RemoteEntryKind::Archive);
     }
 
     #[test]
@@ -2484,6 +2722,7 @@ mod tests {
             item_keys,
             TagItemKind::Image,
             crate::tag_view::TAG_VIEW_FILTERED_KEY_SCAN_LIMIT,
+            true,
             true,
             test_limit,
         );
@@ -2648,5 +2887,43 @@ mod tests {
 
         assert_eq!(entries.len(), test_limit);
         assert!(truncated);
+    }
+
+    #[test]
+    fn favorite_search_epub_ignore_filters_before_index_limit() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = data_dir.path().join("favorite");
+        std::fs::create_dir_all(&root).unwrap();
+        let pdf = root.join("zzz-book.pdf");
+        std::fs::write(&pdf, b"pdf").unwrap();
+        let mut indexed = (0..SEARCH_RESULT_LIMIT)
+            .map(|n| {
+                let path = root.join(format!("aaa-book-{n:04}.EPUB"));
+                IndexEntry {
+                    display_name: path.file_name().unwrap().to_string_lossy().into_owned(),
+                    path,
+                    kind: IndexKind::PdfFile,
+                    mtime: 0,
+                }
+            })
+            .collect::<Vec<_>>();
+        indexed.push(IndexEntry {
+            path: pdf.clone(),
+            display_name: "zzz-book.pdf".into(),
+            kind: IndexKind::PdfFile,
+            mtime: 0,
+        });
+        let db = SearchIndexDb::open_at(&SearchIndexDb::db_path()).unwrap();
+        db.upsert_children(&root, &root, &indexed).unwrap();
+        drop(db);
+        let settings = Settings {
+            favorites: vec![favorite_with_container_index(root, true)],
+            epub_file_handling: crate::settings::EpubFileHandling::Ignore,
+            ..Default::default()
+        };
+        let payload =
+            search_success(CollectionEngine::new(settings).favorite_search(search_request("book")));
+        assert_eq!(payload.listing.entries.len(), 1);
+        assert_eq!(payload.listing.entries[0].path, pdf.to_string_lossy());
     }
 }

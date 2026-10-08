@@ -85,7 +85,8 @@ impl App {
                         egui::RichText::new(
                             "索引化 (あとで編集可能):\n\
                              チェックした項目はこの場で 1 回全走査し、以降は\n\
-                             ファイルの変更監視と起動時スキャンで自動更新します。",
+                             ファイルの変更監視で自動更新します。\n\
+                             終了中の変更を起動時に確認するかは設定で選べます。",
                         )
                         .weak(),
                     );
@@ -98,6 +99,12 @@ impl App {
                         &mut self.fav_add_auto_index_metadata,
                         "アイテム索引 (画像・PDF・動画をファイル名 / タグ / EXIF 等で Ctrl+G 検索)",
                     );
+                    if favorite_add_similar_control_visible(self.similar_feature_capability()) {
+                        ui.checkbox(
+                            &mut self.fav_add_auto_index_similar,
+                            "別バージョン索引 (表示中の画像と同じ絵の別バージョンを検索)",
+                        );
+                    }
                     // サムネイルは I/O が重い (GB 規模) ため自動化から外し、手動バルクのみ
                     // (「お気に入り」ダイアログからサムネ一括作成ボタンで起動)
                 } else {
@@ -129,19 +136,33 @@ impl App {
                 match self.settings.try_add_favorite(name, target.clone()) {
                     Ok(()) => {
                         // 追加した最後のエントリに自動インデックスフラグを反映
-                        let (newly_on_structure, fav_id, fav_path) =
+                        let similar_feature_enabled =
+                            self.similar_feature_capability().is_enabled();
+                        let (newly_on_structure, newly_on_similar, fav_id, fav_path) =
                             if let Some(last) = self.settings.favorites.last_mut() {
                                 last.auto_index_structure = self.fav_add_auto_index_structure;
                                 last.auto_index_metadata = self.fav_add_auto_index_metadata;
                                 last.auto_index_thumbs = self.fav_add_auto_index_thumbs;
-                                (last.auto_index_structure, last.id, last.path.clone())
+                                if similar_feature_enabled {
+                                    last.auto_index_similar = self.fav_add_auto_index_similar;
+                                }
+                                (
+                                    last.auto_index_structure,
+                                    last.auto_index_similar,
+                                    last.id,
+                                    last.path.clone(),
+                                )
                             } else {
-                                (false, uuid::Uuid::nil(), std::path::PathBuf::new())
+                                (false, false, uuid::Uuid::nil(), std::path::PathBuf::new())
                             };
                         self.settings.save();
-                        // メタ索引: auto_index_metadata=true なら Supervisor を起動する
-                        if let Some(mgr) = self.indexer_manager.as_mut() {
-                            mgr.sync_with_favorites(&self.settings.favorites);
+                        // The ordinary metadata watcher remains live while the optional similar
+                        // service is paused.  Do not route the hidden saved flag through its
+                        // configure/purge path.
+                        if similar_feature_enabled {
+                            self.apply_favorite_similar_index_change(&fav_path, newly_on_similar);
+                        } else {
+                            self.sync_shared_favorite_indexers();
                         }
                         // 名前索引: 新規追加 + structure=true なら bulk を起動。
                         // apply_favorite_name_index_change に一本化して、cancel/progress
@@ -159,6 +180,7 @@ impl App {
                         self.fav_add_auto_index_structure = false;
                         self.fav_add_auto_index_metadata = false;
                         self.fav_add_auto_index_thumbs = false;
+                        self.fav_add_auto_index_similar = false;
                     }
                     Err(FavoriteAddError::Duplicate) => {
                         self.fav_add_error =
@@ -181,6 +203,32 @@ impl App {
             self.fav_add_auto_index_structure = false;
             self.fav_add_auto_index_metadata = false;
             self.fav_add_auto_index_thumbs = false;
+            self.fav_add_auto_index_similar = false;
         }
+    }
+}
+
+fn favorite_add_similar_control_visible(
+    capability: crate::similar_index::SimilarFeatureCapability,
+) -> bool {
+    capability.is_enabled()
+}
+
+#[cfg(test)]
+mod similar_control_visibility_tests {
+    use super::favorite_add_similar_control_visible;
+    use crate::similar_index::SimilarFeatureCapability;
+
+    #[test]
+    fn similar_control_visibility_follows_the_shared_capability() {
+        assert!(!favorite_add_similar_control_visible(
+            SimilarFeatureCapability::Paused
+        ));
+        assert!(favorite_add_similar_control_visible(
+            SimilarFeatureCapability::Enabled
+        ));
+        assert!(favorite_add_similar_control_visible(
+            crate::similar_index::PRODUCT_SIMILAR_FEATURE_CAPABILITY
+        ));
     }
 }

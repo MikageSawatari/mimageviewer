@@ -464,6 +464,7 @@ fn fullscreen_decode_entry_reaches_susie_for_a_plugin_only_extension() {
         },
         mimageviewer::canonical_image_loader::CanonicalDecodeOptions::fullscreen(
             mimageviewer::canonical_image_loader::AnimationPolicy::FullFrames,
+            mimageviewer::canonical_image_loader::RawStage::Full,
         ),
     )
     .expect("fullscreen decode entry must fall back to Susie");

@@ -1,0 +1,554 @@
+# 類似索引の増分照合と収束
+
+## 範囲と状態（2026-09-11）
+
+第一段階は `98dc41f4b`、第二段階の DB 読み取り削減は `aea120cf6`、進捗 UI の検証整備は `efa6f7ba2` に保存した。各独立レビュー、狭域回帰、合成 DB 4,627,166 行・キー長 80/120 UTF-8 bytes の AB/BA、進捗 snapshot、共有全体 gate、normal 確認 build は成功した。新方式の sampled peak Private Bytes は約 921/1,137 MiB。親は旧方式の peak より小さいことと「1 GB くらい」という目安を踏まえ、実アプリ全体の未測定という限界を残して現 inventory 表現の採用を承認した。追加 memory redesign/benchmark は行わない。アプリ起動・実機確認は未実施で、機能の再有効化や master 統合、リリース完了ではない。
+作業は `codex/similar-index-incremental-reconcile`、基点は `77a6f270e`。
+最初の検証までは master の休止版を取り込まず、その後の親の明示指示で確定済み `aa034d578`（休止版 `3f5481c14` を含む）の統合を開始した。master 作業ツリーの未コミット差分は取り込まない。master への逆方向の統合・再有効化・リリースは別判断とし、今回も `Option<SimilarIndexManager>` と製品 Paused capability を保持する。
+
+その後、`aa034d578` との統合を `1c3b5861f` に保存し、この統合 hash を対象とする独立検収・焦点回帰・全体 gate・normal build も完了した。そこまでの確認バイナリは Paused 維持版。続いて利用者が休止解除と動作確認を明示承認したため、`627e53a09` を基点に再有効化を開始した。親の別 build と競合させないため、まず設計・編集・静的検収に限定し、重い Cargo は枠調整後に行う。以前の確認 build を Enabled 検証済みとは扱わない。
+
+設計・進行は親、実装・テストは implement_resume、独立レビューは review_resume。
+実装とレビューは別の Sol / xhigh 担当。ソース・テストは実装担当だけが編集し、本書と README は親が編集する。
+旧資料の ClaudeCode 担当指定に代えて今回の利用者指定を適用する。detached 経路の変更は予定しない。
+
+## 根因と既存記録
+
+`SimilarIndexNotifier::request_reconcile` が通知の path/kind を持たず revision を進め、worker が pass 終了時の revision 差で全 root の `run_index_job` を再実行する。継続通知があると全件照合を反復する。既存 async-architecture の revision による再照合設計を改める。
+
+引継ぎ値は約 464 万署名、DB 約 2.07 GB、約 5000 件/秒、small read 約 18000 回/秒。今回の再測定ではない。本番 DB を開く・走査することで再現しない。
+configure が watcher 登録より先に走る欠落窓、登録失敗のログのみ処理、DB 更新後の検索 snapshot 公開前に Complete を出す境界も修正対象。
+
+## 採用する契約
+
+1. 単一 coordinator が desired config、watch health、job phase、pending work、array ack を型で所有する。これらは直交する状態であり、一つの排他的 phase に情報を落とさない。
+2. Full 開始時に lock 下で config/root/watch epoch と event watermark を固定する。成功かつ prune-safe な Full だけが baseline 以前の dirty を吸収する。開始後のイベントは Delta へ残す。失敗・cancel・不完全観測では dirty を失わない。
+3. 通常通知は Full を cancel/restart しない。file は親 directory、directory は parent と subtree、削除は parent と removed prefix を再照合する。祖先 scope の包含で重複をまとめ、現 filesystem を正とする。book/loose 分類・ページ順・表現の退役と scope prune を原子的に確定する。
+4. watcher は各 root の Ready/Unavailable が確定してから initial Full。Ready は登録直後、metadata 初期走査前に通知する。失敗しても初期照合は可能だが Degraded とし、有限 backoff で登録を再試行する。復旧 gap を覆う Full 後にのみ監視の整合を回復したと扱う。root 削除・shutdown は retry も退役させる。
+5. root 変更と purge は一つの Reconfigure 計画で所有する。purge、必要な Full、Delta の優先順とし、最終 keep-root union で重複 root を保護する。古い watcher/job は epoch で拒否する。overflow は gap ごとに coalesce し cancel storm を起こさない。
+6. DB の store identity と through change sequence を検索 snapshot の同 store/applied sequence が満たして公開されるまで caught-up/Complete としない。CAS 競合後の新しい snapshot は ack 可能。refresh 失敗・履歴欠落・store 交換は完了扱いにしない。UI/mutex 内で待たない。
+7. ZIP/PDF は本単位の staging/Complete 原子性と正規ページ順を維持する。decode/password/corrupt の失敗時は旧 Complete を保護する。未列挙の旧ページを終端 prune で消さない。削除 journal は同一 transaction。
+8. password 変更も必要な config epoch に含める。ActivityGate の既存所有・負荷制御を維持し、単なる稼働状態変化で Full を再投入しない。
+9. 進捗は発見済み件数と未知の残量を区別する。delta の局所失敗で全 corpus の結果を上書きしない。共有 watcher の変更は metadata/name の動作も維持する。
+
+## 段階と検証
+
+### 起動時の再利用 (`ReusedInitial`)
+
+`skip_offline_change_scan` ON、`scanned_once` の有効 root 集合全体の指紋一致、純粋な Initial、
+現在構成の全 watch が Ready、未修復 gap なしの場合だけ、既存 worker 内で `ReusedInitial` を
+選ぶ。UserCheck / Manual / Overflow / WatchRecovery / Reconfigure / SummaryRepair の合流は `ScannedFull`。
+再利用では Full inventory と FS 列挙に加え、有効 root 和集合の外のキーの purge も省く。
+指紋が root / 共通除外を含み、構成変更 purge の公開削除は同 transaction で印を失効させ、
+別指紋 Full も最初の書き込みより前に失効させるため、同一指紋での全キー整理は不要。
+クラッシュが変更前なら旧構成の公開データが保たれ、変更後なら旧印がない。
+非公開の prefill は残してよい。未完 build の掃除、page order 修復、メモリ読み込みは維持し、
+現在 store と array snapshot の ack が揃ってから既存の終端経路で Complete を出す。
+通常ログの `reused initial: skipped=true` に `cleanup_ms / page_order_ms / memory_ms / ack_ms`
+を出す。memory は実 loader の時間、ack は要求から受理までの時間で、非同期 load は cleanup
+や ack と重複するため4項目を合計しない。page order が現行版なら単一 metadata 行の確認だけ。
+dirty の `retain_after` と gap repair は `ScannedFull` だけに適用し、再利用中の dirty は MoreWork
+から Delta へ残す。印は完全な Full だけで立て、イベント・クラッシュでは消さない。
+
+「今すぐ確認」の全 root 要求は `UserCheck` (`reason=user_check`) とし、起動時と同じ
+`InitialMetadataTrust` を使う。Complete ZIP / PDF の kind・保存件数と公開 member 数・mtime・
+size・hash version が一致すれば開かずに既存署名を利用する。不一致・欠落・未完なら従来の
+open / decode / publish に戻る。FS と inventory の実 Full を行い、設定 ON・有効印があっても
+ReusedInitial は選ばない。prune-safe な走査と array ack 後の `ScannedFull` として、開始前の
+dirty を吸収し、Ready の gap を修復し、開始後の dirty は Delta へ残す。
+同一構成 epoch の併合は MustOpen > UserCheck > Initial とし、gap epoch は最大値を保持する。
+UserCheck 同士は1つにまとめ、MustOpen を大きい gap の軽い要求で弱めない。既存の登録単位
+`request_full` / supervisor FullRescan からの Manual は MustOpen を維持する。
+
+設定purgeで公開済み item / container を削除するときは、その transaction 内で印も消す。
+build / prefill だけの整理では公開索引を失わないため、削除件数が正でも印を保持する。
+別指紋 Full は既存の未完build掃除 transaction で旧印を失効させ、最初の走査書き込みより
+前に確定する。構成を元に戻し Full 完了前に正常終了しても再利用しない。同一指紋 Full の
+取消と no-op purge は旧印を保持する。OFF時 purge は既存どおり ActivityGate を迂回して
+無効化した範囲を検索から除くが、その後の索引作成は pause に従う。
+指紋は正規化・重複除去した有効 root 集合、整列・重複除去した共通除外、DB schema / hash /
+page order の版、走査拡張子集合を含む。構成 epoch と password revision は含めない。
+
+第一段階は上記 scheduler/増分処理/公開境界を一貫して実装し、狭域回帰と独立差分レビューを行う。
+Full 中の通知は `[Full, Delta]`、Delta 中の通知は次 Delta、overflow/root 変更だけが必要な repair Full を発生させることを決定的な barrier テストで確認する。
+baseline 前後・prune 中通知、watch 登録失敗/復旧、remove/readd/重複 root、旧 epoch、array CAS/store 交換/shutdown、rename、book↔loose、ZIP/PDF、I/O 不完全時の保護を含める。実 IndexerManager→supervisor→notifier 境界の回帰も必要。
+
+第二段階は Full 自体の DB 点 SELECT を compact inventory に置換する。scan 前の有限 read transaction で metadata のみを取得して閉じ、exact String key map と record/seen bitset を使う。全 SearchRow や署名は保持しない。既存 seen clone と prune 全 key 再読込を置換し、追加常駐にしない。snapshot 後の新規行や container→loose 所有変更を誤削除しない。全件 read を常に短時間とは約束せず、取消を確認しロード時間・mutex 占有時間を測る。
+約 464 万件で key 長 48/80/120 UTF-8 bytes の inventory の初期設計概算は 646/788/965 MiB、検索 array 等は別。これは実測ではなく、最新の capacity 段階増加を含む推計と実測で更新する。synthetic DB で点 SELECT と compact 方式の同値・時間・SQL 数・peak memory を比較し、容量が過大なら exact collision 検証を持つ arena 方式を評価する。
+
+master の Cargo 待機は 2026-09-11 完了通知で解除済み。jobs=1、狭域から実行記録を残す。最終共有変更 gate とユーザー向け build は未実施。本番 APPDATA/DB、実行中アプリ、master target は操作しない。実機起動は別途承認された検証枠のみ。
+
+## 第一段階の検証記録（途中）
+
+`target/similar-index-incremental-phase1-review-20260911/logs/` の保存ログと各 exit 記録を親が確認した。
+
+| フィルター | 結果 |
+| --- | --- |
+| incremental_reconcile（初回） | 14 passed / 0 failed |
+| incremental_reconcile（追加回帰後） | 16 passed / 0 failed |
+| search_watcher | 7 passed / 0 failed |
+| similar_db | 32 passed / 0 failed / 1 ignored |
+
+各 exit code は 0。これは第一段階の途中差分に対する狭域結果であり、未実装の compact inventory や最終リリース差分を保証しない。独立実装レビュー、必要な追加回帰、全体 gate、検証 build は未完了。
+追加回帰の証跡は同 logs の `incremental-reconcile-final.log` と `.exit.txt`。その後、通知の FS metadata 分類が scheduler mutex 内にあることを親が指摘し、lock 外への移動を依頼した。この後続差分は上記成功記録の対象外。master の CI check 用に Cargo 枠を返却し、次の Cargo は返却通知後とする。
+
+## 後の master 統合条件
+
+master の `docs/similar-feature-pause-v3.8.0.md` を読み取り照合した。休止版の実行時正本は App の manager Option 単独であり、別の runtime bool を加えない。
+今回追加する configure/password 更新/watch bootstrap 入口は、統合時も manager 不在なら実行しない。共有 watcher の metadata/name 処理と類似専用処理を区別し、Paused で similar 専用 supervisor を生成しない effective resolver を維持する。
+query/prefill/purge と DB 登録を休止したまま統合できることを確認し、再有効化の承認とコード統合を混同しない。保存済み true、DB、配列ファイルを削除・書換えない既存休止回帰を維持する。
+Enabled 側の新規回帰は capability 注入の既存手法へ合わせる。UI の類似表示を復帰させる判断は、性能改善の検証後に別途行う。
+
+## 第一段階の独立差分レビュー
+
+`freeze-current` の patch SHA256 は `7d46db2be5129cbaafdc20d1524f6be795ede9d067bc010b0c4d9c65540e340a`。親が現在の 8 source と保存 hash の一致を確認した。
+独立 Sol レビューで以下を検出し、全件修正を承認した。第一段階は未承認であり、下記修正後の差分を再検収する。
+
+| 優先度 | 問題と必要な契約 |
+| --- | --- |
+| P1 | ancestor scope が child を吸収するとき最新 event sequence を max で引き継ぐ。Full baseline 後の変更を消さない |
+| P1 | watch health 変更で別 root の新しい pending Full/gap を古い要求で上書きしない。共通の単調 merge を使う |
+| P1 | conditional purge の Skipped と Committed を区別し、未実行の削除義務を新 config epoch へ引き継ぐ |
+| P1 | 同 root の supervisor 再生成でも停止から再登録までの gap と repair を所有する |
+| P1 | watcher 復旧時に metadata の欠落も修復する。overflow/manual full の類似通知を長い metadata 処理の後まで遅らせない |
+| P1 | path 分類 Unknown を parent の非再帰観測だけで済ませない。配下再観測を残し、削除は断定しない |
+| P2 | watch Pending 中の purge だけの完了を全体 Complete と表示しない |
+| P2 | dirty scope の正規化・包含集約の lock 内計算量と容量を制限する。上限時も通知を失わず、通常通知で全 root Full を反復する構造へ戻さない |
+| P2 | watcher 終了の検出を最大 60 秒待ちにせず、bounded lifecycle 通知または適切な deadline で検知する |
+
+array store/sequence ack、Delta 原子的 publish/prune、Full conditional finalize、typed degraded reason にはこのレビューで追加 P1/P2 はなかった。これは上表を含む完成承認ではない。
+旧 freeze は保存し、修正は新しい r2 証跡へ記録する。master に Cargo 枠を返したため、修正中の新 Cargo は返却通知まで待つ。
+
+### r2 の途中結果
+
+master の CI check 完了通知後、Cargo 枠が返却され狭域確認を再開した。
+`target/similar-index-incremental-phase1-review-r2-20260911/logs/incremental-reconcile.log` は網羅性エラー 2 件によるコンパイル失敗で、テスト実行失敗ではない。
+修正後の `incremental-reconcile-r1.log` では 25 passed / 0 failed を親が確認した。関連 module、最終 source 固定、指摘対応の独立再レビューは引き続き未完了。
+その後、AwaitingArray 中の config/watch gap 取消が一般失敗として停止し、pending repair を起動しない追加 P1 を実装担当が確認した。Cancelled と Failed を型で区別し、shutdown 以外の取消は義務を復元して次 job を選ぶ修正を採用した。25 件の成功はこの後続修正を含まない。master の sidecar 段階検証へ Cargo 枠を再度返却し、その間は source/回帰修正とレビュー準備を進める。
+
+### 監視終了の検知時間の範囲
+
+P2-3 の health tick は event-loop 待機中の約 1 秒間隔を保証範囲とする。共有 supervisor は metadata initial/full/recovery scan を同期実行する既存構造のため、その間の watcher 終了は scan 完了後に検知して metadata と類似の両方を修復する。全期間 1 秒の検知は約束しない。
+overflow/manual 要求の類似 gap は metadata scan 前に記録し、scan 後の停止検知・復旧でも repair 義務を失わないことは必須。全期間の短時間検知が別途必要なら、health 所有を metadata scan から分離する変更が必要になる。親と独立レビュー担当がこの範囲を確認した。
+
+### r2 最終狭域検証と追加レビュー
+
+master から枠返却後、r2 固定差分（patch SHA `E334AA65C0FF82F875E1DD25108CBA078A1A2EE6FEBFD804989D95E6646BECDA`）を検証した。
+`target/similar-index-incremental-phase1-review-r2-20260911/validation-final.txt` に、増分 29、watcher 7、DB 33（1 ignored）、supervisor 11、manager 7 の成功と core check 成功を記録。親が manifest を確認した。
+独立再レビューでは以下 4 境界が未解決であり、r2 は完成承認ではない。r3 で一括修正する。
+
+- Unknown→Subtree の再観測時に NotFound となった場合、RemovedPrefix として配下の旧索引を削除する。実 DB 回帰を追加。
+- 既存 Subtree(root) が容量対策の RootRepair を吸収しないよう優先順位を定義し、多数の RemovedPrefix に対する容量上限を確認。
+- AwaitingArray 取消の回帰を enum 判定だけでなく、未完 job 復元から queued Full 再選択まで通す。
+- active worker 中の watch replacement 取消後は、Pending barrier に応じ AwaitingWatch を確定する。取消状態の表示だけで止めない。
+
+r1/r2 証跡は保持し、r3 の成功証拠に流用しない。未変更モジュールの再検証は必要性に応じて判断する。
+
+### r3 狭域検証
+
+`target/similar-index-incremental-phase1-review-r3-20260911/logs/incremental-reconcile.log` と `incremental-reconcile.exit.txt` を親が確認し、30 passed / 0 failed / exit 0。今回の 4 境界を修正した差分に対する結果。固定差分の独立再レビューはまだ未完了。
+
+その後、独立 r3 差分レビューは blocking P1/P2 なしで承認された。続けて既存 `similar_index::tests` 全体を確認し、66 passed / 1 failed / 5 ignored。
+失敗 `index_worker_open_also_starts_memory_load_without_a_panel_query` は、scheduler configure だけで watcher を Pending のままにした旧 fixture が eager worker 開始を期待していた。親も source を照合し、begin_watch→watch_ready を通す test-only 修正を承認した。製品差分の承認は維持し、修正後の exact/module/core/glyph 検証を行う。
+
+最終 UI 検証ではお気に入り索引の進捗・AwaitingWatch・Degraded を実描画 helper で確認する小 snapshot を追加する。既存 `tests/ui_snapshot.rs` は類似結果/状態パネルの coverage はあるが、お気に入り索引進捗は未収録。これは最終 handoff 前の未完了事項として扱い、第一段階の scheduler 修正と再レビューを広げない。
+
+### 第一段階の検証確定
+
+旧 fixture 修正後、exact 1、`similar_index::tests` 67 passed / 0 failed / 5 ignored、core check exit 0、glyph 0、owned-source fmt/diff check 0 を確認した。製品差分は独立 r3 承認後に変更していない。
+最終証跡は `target/similar-index-incremental-phase1-review-r3-20260911/fixture-validation/MANIFEST.txt`、SHA256 `7BA2EB9E97DF6F83B19B5C7660D66EBC28C3AEBC0861ED36EAB585EE67AB7207`。
+親も module/glyph のログ、manifest hash、現在の source 8 件と最終 hash の一致（不一致 0）を確認した。
+関連 watcher/DB/supervisor/manager の結果は r2 記録を参照。後続 r3 は similar_index の取消・scope 修正と回帰、最終差分は旧 fixture のみ。全体 gate は Phase 2 と最終 UI 検証後に実施する。
+
+## Phase 2 実装前の採用条件
+
+DB 調査担当の接続案 `target/similar-index-incremental-phase2-design-20260911.md` を独立レビューし、以下の補正を採用した。第一段階の検証区切り後に実装する。
+
+- Full だけが job-local の Clone 不可 inventory を所有する。Delta は全件 inventory をロードせず既存局所 publish を維持する。
+- exact String map、compact item/container metadata、ceil(N/64) word の AtomicU64 bitset を使う。Phase 1 の seen-container 保護により CSR member 列は不要。
+- inventory は scan 前の有限 read transaction で得て閉じる。4096 行程度ごとの取消を確認し、ロード時間と DB mutex 占有時間を測る。「常に短時間」とは約束しない。scoped worker が共有参照し、全 join 後に by-value finalizer へ渡す。
+- `current_and_published` は current hash かつ loose または snapshot container が Complete。orphan/Failed/Building は false。owner/page/mtime/size と container freshness の判定は旧実装と同値にする。旧実装が Stale とする不正な raw state/page count を、loader 全体失敗へ強化しない。
+- container の member_count は report 用であり、新たな freshness 条件を追加しない。ZIP/PDF canonical 列挙は維持する。
+- snapshot 後の新 member を bulk `DELETE WHERE container_key` で消さない。初期 item_id と初期 owner を候補とし、live の両方が一致する場合だけ削除と journal を同一 transaction に書く。container 行も snapshot identity/generation と整合し surviving live member がない場合だけ削除する。
+- new member、old member→loose、orphan→loose、loose→新 container、同 key container 更新、失敗 container 旧 Complete 保護を小 DB 回帰で確認する。
+- u32 index/member_count は checked overflow。summary の capacity hint は破損巨大値を無条件 reserve せず上限と fallible reserve を持つ。finalizer で全 key String clone/Vec を再生成しない。
+- `ScanPass` の共有 descriptor と per-work Delta seen owner は分ける。loader の取消は scheduler cancel/stale として扱い、FilesystemIncomplete へ混同しない。commit→watermark→array ack は Phase 1 のまま。
+- メモリ計測は map/record/bitset のほか、visited_dirs、work queue、SQL 一時 String、resize peak、検索 array を分けて記録する。まず標準 exact map、arena は測定で必要と判断した場合のみ。
+- 小 legacy/new 同値比較後、synthetic 4,627,166 件・K80・25% loose/75% contained・99% current を代表ケースとする。実データ分布とは主張しない。K48/K120 は accounting から推計し、誤差や容量の閾値を越える場合に追加実測する。
+- A/B の削除順は一致しなくてよい。最終 rows/container/summary、正規化した `(item_id, op)` の sorted multiset、単調 watermark/ack を比較し、重複 journal を集合化で隠さない。時間比較は最低 AB/BA の二順序とし、一回の実行順や OS cache の差を性能改善と断定しない。
+- SQL TEMP batching 案は小 batch では主 index の random probe が残り、全件版では二相処理・temp I/O・取消 lifecycle が増えるため初版では採用しない。大規模測定は master と資源調整してから実行する。
+
+測定の限界: synthetic A/B は DB 照合・prune の比較であり、本番の filesystem 列挙、画像 decode、ネットワーク、音声再生と競合する全体性能を直接保証しない。setup と結果照合の時間・メモリを測定本体から区別し、合成分布と測定順序を結果に添える。本番 5000 件/秒という引継ぎ値を比較対象の実測 baseline に置き換えて報告しない。
+
+### Phase 2 第一単位の検証
+
+Full inventory と scan/finalize の接続を 2 source に実装した。小 DB 回帰 8 passed / 0 failed、Delta loader 0 回の実経路 exact 回帰 1 passed / 0 failed、両 exit 0。
+証跡は `target/similar-index-incremental-phase2-r1-20260911/MANIFEST.txt`、SHA256 `EBCE39E81806D61F099776B4EF0BDC367D2F6C2F8BEEB9325A73133256A8C7CF`。
+親が stdout/exit と source 2 件の snapshot/current hash 一致を確認した。独立実装レビューへ渡して source を固定。大規模 harness はまだ未実装・未実行で、性能改善の検収は未完了。Cargo 枠は master の gate/build へ返却した。
+
+### Phase 2 r1 独立レビュー
+
+以下を採用し、同じ実装担当が 2 source を修正する。r1 の成功結果は後続差分の検証結果として扱わない。
+
+- P1: Full inventory の全件 read が既存 ActivityGate の最初の確認より前に始まり、明示 pause 中でも新規作業を開始する。DB mutex/read transaction 取得前に既存の pause 契約を通す。操作中の 1/1 と開始済み作業の完走は維持し、pause 開始時 loader 0・解除後開始・pause 中取消を回帰で確認する。
+- P2: 小 DB の legacy/new 同値比較に orphan、zero/extra members、旧 hash、不正 state/負 page count、stale metadata を含める。finalizer の取消だけでなく loader の定期取消も確認する。
+
+snapshot item-id/owner による削除、container identity/generation と surviving member 保護、scoped worker join 後の inventory 消費、Delta loader 0 の実経路について、このレビューで追加指摘はなかった。大規模性能の承認は含まない。
+修正中も master に貸出中の Cargo 枠は使用しない。後続 A/B harness は setup/legacy/inventory/verify の process を分離し、setup と照合の時間・peak memory を測定対象へ混ぜない。
+
+### Phase 2 r2 静的固定
+
+上記 P1/P2 の修正と回帰を追加し、独立差分レビューへ渡した。`target/similar-index-incremental-phase2-r2-20260911/MANIFEST.txt` の SHA256 は `61C63A87C38E6FAAA0B96139D0E7D1113D87F1093C3827CEBC7AB80D83CD0CD3`。親が manifest と現在の 2 source の hash 一致を確認した。
+この時点では Cargo 未実行であり、回帰成功・コンパイル成功は未確認。master の gate/build へ貸出中の枠返却後に追加回帰を実行する。
+
+独立 r2 差分レビューは P1/P2 解消・追加 P1/P2 なし。同じ固定差分の compile/test 成功を条件とする静的承認であり、性能承認は含まない。記録は同 artifact の `review-r2-static.md`、SHA256 `D09392BF5401C6479AB5E46126FF4F842D1DF7CB5AD16CB4BEB0EF7F2D1B07AD`。Cargo 枠返却時は `full_reconcile_inventory` filter から再開する。
+
+### Phase 2 r2 狭域検証確定
+
+master の portable 実機確認に合わせ、jobs=1 の `full_reconcile_inventory` filter だけを実行した。初回は追加テストの scoped Sender capture 2 箇所で E0373 となり、テスト未実行。明示参照と Sender の move だけを直した r2r1 で 11 passed / 0 failed / exit 0。旧方式との edge-case A/B、4097 行での loader 途中取消、pause/active/cancel の実経路を含む。
+親も r2→r2r1 差分が test-only であること、stdout、validation 記録、現在の source 2 件の hash 一致を照合した。独立静的承認後の製品コード変更はない。
+証跡は `target/similar-index-incremental-phase2-r2r1-20260911/validation/VALIDATION.txt`、SHA256 `AB9B232E50D3FEAF764B53A66674B0F6246289F149D9B5F9C44F11092A4B2786`。Cargo/rustc 終了を確認して枠を返却。大規模 harness、4.64M A/B、module 全体、全体 gate、最終 UI snapshot とビルドは引き続き未完了。
+
+### 大規模測定の準備枠
+
+master から harness 実装・測定設計・静的レビューまで承認された。master の portable 実機確認中は Cargo、大規模 DB 生成、benchmark を開始しない。通常 APPDATA と実 DB は使用せず、合成 DB・copy・SQLite temp/sort spill・照合成果物はこの worktree の target 内専用 run に限定する。canonical path と reparse point を検査し、既存成果物の上書きを拒否する。測定 process の TEMP/TMP も run 配下へ向ける。
+
+実装前の比較モデル照合で、legacy は実際の load_item/container_freshness/item_keys_for_container と seen/finalize、inventory は実 loader/observe/member_count/finalizer を使う方針を確認した。snapshot 後の new row/owner 変更は保護を強化した専用回帰を正本とし、旧 prune を誤った期待値にしないよう timed A/B から除く。
+代表条件は 4,627,166 rows・K80・25% loose/75% contained・256-page group・16 workers。1% の old-hash/stale/missing/new probe 配分と分母・実数を記録する。setup、legacy、inventory、verify は別 process とし、最低 AB/BA の両順序で測る。
+実行枠取得後は小規模 end-to-end を先行し、必要なら 10 万行 pilot で所要時間とメモリの見積を更新する。現時点で大規模所要時間は未測定。C ドライブ空きは準備時点で約 766 GiB、削除作業は行わない。
+
+その後 master の実機確認が環境要因で終了し、CPU/IO 枠が解放された。独立検収と測定条件・見込み時間/メモリ・指標の一括報告を先行し、各 process は有限 1 周と時間上限・取消を持たせる。大規模実行の終了期限は 2026-09-11 09:00 JST。性能結果だけでは master merge や類似機能の再有効化を行わない。
+
+### 測定の資源・実行条件（静的検収前の計画値）
+
+| 項目 | 条件 |
+| --- | --- |
+| 件数 | まず 4,096 行で 4 mode の一巡、その後 100,000 行 pilot、最後に 4,627,166 行。各件数は別 run directory |
+| 実行順 | setup → ab-legacy → ab-inventory → ba-inventory → ba-legacy → verify。各 mode は別 process、同時実行しない |
+| CPU | 比較処理は 16 worker と計測 sampler。コンパイルは jobs=1。CPU/I/O の占有は実行枠内だけ |
+| メモリ | K80 inventory 自体は従来設計で約 0.8 GiB の概算。SQLite、runtime、allocator、legacy seen の peak は未測定であり、pilot から更新する。検索 array 約 212 MiB は今回の DB-only 比較に常駐させず別項目とする |
+| ディスク | baseline と 4 trial の DB、WAL、SQLite temp、結果 JSON/log を専用 target/run 内へ保持。実データの 2.07 GB は合成 DB の実測サイズではない。pilot の bytes/row から必要容量を更新する |
+| 時間 | 所要時間は未測定。初期上限案は compile 15 分、小規模各 mode 2 分、pilot 各 mode 5 分、本測定各 mode 25 分。開始時の残時間と pilot 結果により縮小・延期を判断する |
+| 終了 | 全体打切りは 08:50 JST、所有子 process 回収と記録を 09:00 JST までに完了。timeout/取消/例外は当該測定 process だけ回収し、run を incomplete として後続停止。既存部分 run は再利用しない |
+
+比較指標は load/lookup/finalize/total wall time、logical SQL call 数、process 初期/終了と sampled WS/private peak・差分、inventory map/record/bitset accounting と growth、DB/WAL/temp 開始/peak/終了 bytes。内部一時 allocation と sampler 間の瞬間 peak は完全観測とは主張しない。process lifetime peak と測定区間の sampled peak は区別する。
+最終 rows/container、summary/report、sorted `(item_id, op)` multiset と watermark を照合し、結果照合の時間・メモリは測定本体から分ける。DB-only harness は scheduler/array ack の end-to-end 測定ではなく、既存回帰を参照する。実行前に独立レビューとこの条件の master への一括報告を必須とする。
+
+### Harness r1 静的レビュー
+
+source 3 件と manifest の hash 一致を親が確認し、測定条件を master へ報告した。master は独立検収後の 4,096→100,000 を承認。本規模は pilot の時間・容量・総 peak から再判断し、異常増大/同値不一致では進まない。
+独立レビューは比較 DB/probe/fingerprint、測定本体と照合の sampler 分離、logical SQL の実測/モデル表記を確認したが、外部 runner に 2 件の P1 があり未承認。
+
+- setup 時の immutable run identity（実行 exe SHA/rows）を create-new で固定し、全 step で照合する。先行 step の完了と実行順を検査し、途中 rebuild・順序違い・incomplete run の継続を拒否する。
+- wrapper の write/Start-Process より前に、drive root から target/run/temp/exe までの全 path component の reparse を検査する。child の Rust 側検査だけでは wrapper の先行書込みを保護できない。
+
+同じ実装担当が runner だけを修正し、再検収も対応差分に限定する。Cargo/合成 DB 生成/測定は引き続き未実行。
+
+### Harness r2 静的承認と実行開始
+
+runner 限定修正後、P1×2 解消・追加 P1/P2 なしで静的承認。記録は `target/similar-index-incremental-phase2-benchmark-harness-r2-20260911/review-static-approval.md`、SHA256 `EB34D9CF377D7BD8EF7840D3CBC5FA5DE71BAB75CC2657F0F7156D6FCABF4818`。製品/測定 source 3 件は r1 と同じ。
+親は条件を master へ報告済みで、jobs=1 compile→negative preflight→4,096 行の 6 mode を実装担当へ開始指示した。compile/実行の成功は、この開始指示だけでは未確認。4,096 の結果を確認してから 100,000 pilot へ進む。
+
+4,096 行は compile exit 0、negative preflight 2/2、6 mode と全同値判定が成功した。証跡は同 r2 artifact の `validation-4096/VALIDATION.txt`。親もログと verify JSON を確認。ただし最初の exe は unoptimized test profile だったため、これは harness 機能検証に限定し性能評価へ流用しない。
+性能比較は source 不変で release lib-test exe を jobs=1 で構築し、fresh 4,096 一巡→100,000 pilot を実行する。exe 変更後の同値確認は必要だが、変更していない runner の negative preflight は繰り返さない。compile 上限は release 用に 30 分へ変更、08:50 絶対打切りは維持。debug/release の値を同じ A/B へ混ぜない。
+
+release compile は 05:03:24 JST 開始後、約 26 分でも rustc 最適化中で link 未開始。master は進行中 compile を重複させないため、安全に監視を維持できる条件で開始から 60 分までの延長を承認した。担当が PID/StartTime を照合した同一所有 process の watchdog を設定し、06:03:24 JST を上限として継続した。監視結果は `validation-release-4096/compile-watchdog.txt` に保存する。時間切れは製品不具合と扱わず、同じ条件の再試行を繰り返さない。必要時の既存 dev-runtime profile による同条件 A/B は master 承認済みだが、release 実時間と区別し fresh 小規模から確認する。
+
+### Release pilot と本規模の開始判断
+
+release compile は 31 分 57 秒・exit 0 で完了し、watchdog も期限前正常終了を記録。最初の direct 起動 2 run は DLL 検索環境不足の `0xC0000135` でテスト開始前に終了し、incomplete として性能値から除外した。同一 exe に既存 vendor DLL と target/release の PATH を設定し、fresh 4,096→100,000 の各 6 mode は全照合に成功した。
+証跡は harness r2 の `PILOT-SUMMARY.txt` と `PILOT-FILES-SHA256.txt`、個別 JSON は `validation-release-4096/run-release-4096-r2` と `validation-pilot-100000/run-100000`。exe SHA256 は `27CBD0A007381F022EB7725F1987D88D8B2C1E1C4A5F5BBF8DB862128F1262F2`、PATH SHA256 は `1408041D128D9E18C9358D665E6F3F482DACE8F9E5AE3F473690AE5836E68EBD`。
+100,000 の旧方式 total は 1.24–1.50 秒、新方式 0.070–0.071 秒。総 sampled peak private は旧方式 180–196 MiB、新方式 62 MiB。parent が setup/verify JSON と集約記録を確認した。これは K80/16 workers の DB-only 予備値であり、アプリ全体の改善倍率ではない。
+本規模は map capacity の段階増加を考慮し、新方式の構造 subtotal 約 866 MiB、process 等を含む保守推計約 1.7 GiB、旧方式保守推計約 10 GiB。05:44 JST の GlobalMemoryStatusEx は総 RAM 127.27 GiB/空き 80.97 GiB。DB は 1 本約 1.87 GiB、5 本約 9.35 GiB と一時 WAL 等の見込み。時間の線形参考値は setup 13 秒、旧方式各 57–70 秒、新方式各 3.3 秒、verify 14 秒で、保証値ではない。
+同値成功と空き資源・残時間を根拠に、master へ更新条件を一括報告して 4,627,166 行の fresh K80 AB/BA を開始指示した。各 mode 25 分/08:50 絶対打切りを維持。K48/K120 の追加実測条件に達した場合は別途判断し、完了扱いへ省略しない。
+
+### 本規模起動前の runner 診断
+
+本規模最初の setup も `0xC0000135`、stdout/stderr 空でテスト開始前に停止した。DB 生成なし、incomplete run は保持して後続停止。固定 PATH の child 照合と小さな `--list` の切分けで、この環境の Start-Process における window 制御と標準 handle redirect の組合せを失敗境界として確認した。
+同一環境で direct 起動、redirect のみ、Hidden のみは exit 0、Hidden+redirect と NoNewWindow+redirect は失敗。ProcessStartInfo の UseShellExecute=false/CreateNoWindow=true/redirect pipes は exit 0。初回の DLL 検索環境だけで解決したとの判断は、この診断結果により訂正する。
+runner r2 を保持し、r3 で起動部だけを上記 ProcessStartInfo と非同期 stdout/stderr drain へ変更する。identity/order/timeout/取消/所有 PID 回収は維持。source/exe 不変で独立 runner 差分レビュー→fresh 4,096 一巡→本規模を行う。100,000 pilot の source/exe は変わらないため再測定しない。
+master の追加条件により、測定許可を製品のメモリ採用承認とは扱わない。実測後に peak と live inventory の保持量、アプリ常駐分、harness 特有の保持を区別して設計へ戻す。
+
+### メモリ帰属と測定補正
+
+独立限定レビューは harness r2 の `memory-attribution-review.md`、SHA256 `2297AE723763E9BB9366469F23689F26C77311C8B29178EE7E19090156428381`。LogicalCalls/ProbeSummary/Accounting は O(1)、fingerprint と journal の照合は trial sampler 停止後。legacy finalizer の全 key Vec は実製品の費用だが、harness の worker 集合の merge は旧製品 aggregate.snapshot の全 String clone＋元 aggregate の併存を再現しない。よって値は synthetic reconcile-process peak であり、旧製品の全 peak と同一視しない。
+final_sample は両方式とも strategy の drop/consume 後で、live inventory の steady は未観測だった。採用判断に必要なため、両方式の probe 後/finalizer 前の O(1) live memory sample を追加する。採用済み K48/K120 の追加実測条件へ対応できるよう key bytes を 48/80/120 指定にし、run identity に固定する。これを runner r3 の起動修正と合わせ r4 一括静的検収へ渡す。製品コードは変更しない。
+新 exe で fresh 小規模と pilot の同値を確認し、残時間と資源を再評価して本規模へ進む。旧 exe の結果・incomplete 証跡は保持し、新条件の A/B と混ぜない。
+
+r4 静的レビューの P2 は live delta の基準名（process start ではなく copy/open 後の sampler start）と、dispose 後の evidence 保存失敗時の catch guard だった。数行だけ直した r4r1 を独立承認。記録は `target/similar-index-incremental-phase2-benchmark-harness-r4r1-20260911/review-static-approval.md`、SHA256 `C5B179EFEC3340DD873096684674DF24C01B639B45C914304574764DD3004E0D`。
+親は同 release profile/jobs=1、最初から 60 分/08:50 の早い上限と所有 process watchdog を付けた compile、新 exe での key identity negative preflight→fresh K80/4,096→100,000 を開始指示した。harness SHA256 は `090D0D19D6F37B5FF92E7473D7207124FFCE99C870F0E1421AB0D63E4F9EEF3A`、製品 source は不変。master は今回 r4 の独立検収と有限実行を区切りとし、時間不足時の K48/K120 未測定を許容した。K80 の同値/live/peak を優先し、追加設計拡張で compile を反復しない。
+
+### r4r1 小規模・pilot の確定
+
+release compile は 32 分 29 秒/exit 0、新 exe SHA256 `10C0AB3458695F3F50F6F68D57B0F1D067EDE2EB787A746833BC9DC63375E7D2`。所有 compile process は期限前終了。key identity mismatch の起動前拒否と、fresh K80/4,096・100,000 の各 6 mode は成功した。新しい非表示起動方式で loader error は発生していない。
+親も r4r1 artifact `validation-k80-100000/run/verify.json` の AB/BA・反復・DB fingerprint 全 True と各 trial JSON を確認。100,000 の旧 total は 1.221–1.228 秒、新 total は 0.069–0.071 秒。probe 後の live Private Bytes は旧 178–185 MiB、新 61–63 MiB、sampled peak は旧 186–188 MiB、新約 62 MiB。これは source 不変の前 pilot と同じ規模の傾向であり、予測外の増大・同値不一致はない。
+更新条件を master へ報告して fresh K80/4,627,166 の開始を指示。各 25 分/08:50 打切りを維持し、K48/K120 は K80 の結果と残時間を確認してから判断する。Private Bytes と resident WS、live/peak/post-finalize residual を分けて記録する。
+
+### 本規模 K80/K120 の結果と今回の区切り
+
+同一 release exe・source・runner・PATH、16 workers で fresh 合成 DB 4,627,166 行を測定。K80 と、追加条件を満たした K120 は、それぞれ setup→AB→BA→verify の全 6 mode が成功し、最終行・container・summary・journal multiset・watermark の照合が一致した。K120 は先に fresh 4,096 行でも一巡成功。証跡は r4r1 artifact の `validation-k80-full-4627166/run/` と `validation-k120-full-4627166/run/`。root も verify と各 trial JSON を確認した。
+
+| キー長・方式 | total 秒（AB / BA） | live Private MiB（AB / BA） | sampled peak Private MiB（AB / BA） |
+| --- | --- | --- | --- |
+| 80 bytes・旧 | 67.557 / 69.112 | 900.64 / 771.87 | 1,235.91 / 1,295.95 |
+| 80 bytes・新 | 4.607 / 4.478 | 918.22 / 918.18 | 921.37 / 921.35 |
+| 120 bytes・旧 | 71.789 / 71.893 | 984.30 / 984.52 | 1,618.60 / 1,618.88 |
+| 120 bytes・新 | 5.210 / 5.189 | 1,134.32 / 1,134.29 | 1,137.33 / 1,137.36 |
+
+total は copy/open/setup/verify/fingerprint を除く synthetic reconcile core の時間。実ファイル走査・decode・scheduler/array 公開は含まず、製品全体や音声途切れの改善倍率とは扱わない。K は合成 ASCII key の UTF-8 bytes であり、本番の平均 path 長を主張しない。OS cache は強制制御していない。
+
+live は probe workers join 後・finalizer 前の process sample。新方式 live WS は K80 約 891 MiB、K120 約 1,105 MiB。finalizer 直後の Private は約 919/1,135 MiB だが、mimalloc の保持を含み恒久的なアプリ常駐量ではない。sampled peak は 50 ms 間隔で瞬間 peak を完全観測しない。旧方式 sampled peak は K80 約 1,236–1,296 MiB、K120 約 1,619 MiBだが、旧製品の aggregate.snapshot clone と元 aggregate の併存を再現しないため旧製品全体の peak の代用にはしない。
+
+item map capacity は 7,340,032、record capacity は 4,627,166、初期 reserve 後の item map/record growth は 0/0。container map/record growth は 4/5。key payload は K80 371,257,840 bytes、K120 556,886,760 bytes。map bucket の内部サイズは容量からのモデル値で、実 allocation の直接観測ではない。logical call は観測 API counter と deterministic finalizer model を分けており、SQLite VM steps や OS random read の実測ではない。
+
+K80 が 900 MiB、K120 が 1 GiB の追加検討目安を超えたが、これは hard cap や採用不可の判定ではない。利用者の「1 GB くらいなら許容」を踏まえて親が判断する。約 1,137 MiB は新方式の試験 process 全体の sampled peak であり、旧方式に上乗せする追加量ではない。同じ K120 旧方式の約 1,619 MiB より約 481 MiB 小さい一方、finalizer 前の live は旧方式より約 150 MiB 大きい。検索 array（既存記録約 212 MiB）や queues/UI/decode の共通常駐分は試験外で、単純加算も概算に留まる。旧製品 clone 非再現の限界も含め、現方式を採用するか exact key の arena 化などを別段階で検討するかが次の判断となる。今回は追加実装・compile を開始しない。
+
+K48 は推計のみで実測していない。K80 の accounting 差が小さく、短いキーの推計が追加測定目安を下回るため、今回の有限枠では省略した。snapshot 後の追加行・所有変更・container 再構築の安全性は旧 unsafe prune との速度比較から除外し、専用の既存回帰を根拠とする。全体 gate、進捗 UI snapshot、確認 build、実機確認、休止版との統合判断は引き続き未完了。master merge・再有効化・アプリ起動・本番 DB 操作は行っていない。
+
+同じ固定 release exe で `full_reconcile_inventory` 回帰を 1 回実行し、11 passed / 0 failed / 1 ignored（手動測定 harness）/ exit 0。ログは r4r1 の `validation-release/full-reconcile-inventory-tests.stdout.log`。`FINAL-PROCESS-STATUS.txt` は所有 measurement process と cargo/rustc/link が 0、source 不変、本番データ・アプリ未操作を記録する。今回の CPU/IO 枠は親へ返却済み。集約は `FINAL-BENCHMARK-SUMMARY.txt`（SHA256 `910CD25BB4031B2CB4B4DB4ED7B5D818F02861D65DF009F7F318525876D743B7`）。
+
+Sol / xhigh の独立限定検収も完了し、P1/P2・blocking 所見なし。`performance-validation-review.md` の SHA256 は `4685D649D3FABEB9784367E22563A1530A687E74D770E279729B93025FE14BE8`。K80 run-local 集約の倍率丸めだけ 14.67→14.66 へ訂正し、測定 JSON/DB/source/exe/runner は不変。最終 evidence manifest は `FINAL-EVIDENCE-SHA256-R1.txt`（SHA256 `C2C20338D04F0116479F832ECA35208A711E2367073AEDFA151B4CD6F0EE338B`）。
+
+### 次の小変更：進捗表示の検証境界
+
+親は現 inventory 表現を採用方向で受け入れた。K120 の約 1.11 GiB は旧方式への追加量ではなく、旧試験 process peak 約 1.58 GiB より小さい。probe 後 live と直後 residual は旧方式より大きく、App 全体 peak は未測定という制約は維持する。追加 memory redesign/benchmark は不要とし、検証と確認 build まで進める。焦点 commit は当該 branch のみに保存し、master merge/再有効化は引渡し後の別判断とする。
+
+所有契約は Full job 内に限定する。`run_index_job` がローカル変数として inventory を所有し、`thread::scope` 内の workers は `ScanPass::Full(&inventory)` で借用する。scope の join 完了後だけ by-value finalizer へ移し、取消・error・prune-unsafe return では通常の Rust drop により解放する。`ScanJobOutcome` は report/prune-safe だけを返し、coordinator・progress・Delta は inventory を保持しない。allocator による Private Bytes の残留と live owner の残留を混同しない。既存の独立レビューと有効な狭域回帰を根拠とし、記録のためだけに同じ測定を再実行しない。
+
+独立担当もこの所有契約を再実行なしで限定確認した。根拠は Clone 不可の `FullReconcileInventory`、値所有の `finalize_full_reconcile_inventory_if`、別経路の `run_delta_index_job`。有効な回帰は `full_reconcile_inventory_obeys_pause_before_loading_and_cancel`、`full_reconcile_inventory_loader_polls_cancellation_during_row_scan`、`full_reconcile_inventory_cancelled_finalize_rolls_back_everything`、`full_reconcile_inventory_matches_legacy_freshness_and_prune` と `...edge_case_matrix`。Delta の load 0 は `incremental_reconcile_missing_subtree_reobservation_prunes_nested_prefix` が確認する。destructor 回数を直接数える専用テストではなく、drop は Rust の所有構造、テストは取消 rollback・no-load・publish 結果をそれぞれ根拠とする。
+
+進捗の製品実装自体は完了済み。`IndexProgress` の Running/AwaitingWatch/AwaitingArray/Degraded 等を `src/ui_dialogs/favorites_editor.rs` が直接描画し、Scanning の確認済み・発見済み・総数未確定、監視準備待ち、検索用一覧への反映中、typed reason を区別する。未完なのはこの描画の snapshot coverage であり、scheduler の是正を最初から実装する必要はない。
+
+次の担当範囲は同ファイルの inline match を小さな実描画 helper へ切り出し、dialog と `tests/ui_snapshot.rs` の小 scene が同じ helper を呼ぶ境界だけとする。対応 snapshot asset も更新する。新 state・ETA・DB API・scheduler API は追加せず、`src/similar_index.rs` と `src/app.rs` は変更不要。docs の証跡追記は親が担当する。
+
+受入条件は、Scanning の未知総数を割合や残数にしないこと、AwaitingArray を Complete/監視中と表示しないこと、AwaitingWatch/Degraded を区別すること。全 `IndexProgress` variant と `FilesystemObservationIncomplete` / `ArrayPublication` / `WatchUnavailable` の reason mapping は純粋テストで確認し、snapshot はテスト側に文言を再実装しない。小さな headless snapshot と helper テストで確認する。Cancelled 詳細行非表示など既存の別仕様を変更せず、live UI 操作はこの小変更に含めない。これは次の設計整理であり、今回の有限測定後に実装・compile を開始していない。
+
+### 進捗表示の検証実装
+
+Phase 2 を `aea120cf6` に保存してから開始。`favorites_editor` は private module のため、snapshot policy に従い同 module の lib unit test から実描画 helper を呼ぶ方式とした。外部 integration test 向けの公開 API は追加しない。既存 inline/activity の presentation mapper と activity row helper を共用し、表示文言・色・順序・truncate/hover は維持した。scheduler/DB/enum に変更はない。
+
+全 variant/stage・3 Degraded reason・disabled を確認する純粋テスト 2 件、snapshot 生成 1 件と通常比較 1 件が成功。glyph 0、fmt/diff check 0。root は `tests/snapshots/favorites_similar_index_progress_dark.png` を目視し、8 行の無効/Scanning/Pruning/待機 2 種/未完了 3 理由が読め、欠け・tofu・意図外の折返しがないことを確認した。証跡は `target/similar-index-incremental-ui-20260911/freeze-r2/` と同親 directory の各 log/exit 記録。全体 gate と normal 確認 build は独立最終検収後に実施する。
+
+独立 Sol / xhigh の最終差分検収も P1/P2 なしで承認。`freeze-r2/review-approval.md` SHA256 は `F8AF863C36ABCB3A3BFCC37AB99F1A99746C0AD059D8711C47D45C0085194DCE`。既存表示契約・pure mapper・実描画経路・検証ログと目視結果を照合済み。
+
+### 共有全体 gate
+
+UI 検証を `efa6f7ba2` に保存し clean を確認後、`scripts/test-full.ps1 -SuppressCrashDialogs` を jobs=1 で実行した。2026-09-11 07:18:32–07:32:58 JST、native exit 0 / `[test-full] PASS`。本体 lib は 8,120 passed / 0 failed / 44 ignored（手動測定等）、UI integration snapshot は 48 passed。workspace・統合・doc・補助 bin と vendor egui/egui-wgpu/eframe まで全成功。process-local error mode も元の `0x00008001` に復元された。
+
+root もログを確認。証跡は `target/similar-index-incremental-final-gate-20260911/test-full.log`、SHA256 `90C5213BD21C15992D65CB91E76866FE1B39EA536D24BD7615E29CC5234BF721` と `test-full.exit.txt`。source は固定、アプリ起動・本番データ操作は行っていない。gate 後に staged core/remote resident と cargo/rustc/link が 0 と確認し、07:33:42 JST から通常 feature の `scripts/build-dev.ps1` を実行中。
+
+### 確認 build と最終引渡し
+
+`scripts/build-dev.ps1` は 07:33:42–07:45:17 JST、native exit 0 で完了。jobs=1、通常 feature（portable/test-script なし）で core と Remote を同じ source `efa6f7ba2` から構築した。以後の変更は本書の検証記録のみ。root は DONE ログと成果物の size/mtime を照合した。
+
+| 成果物 | bytes | 更新時刻 UTC | SHA256 |
+| --- | --- | --- | --- |
+| `target/dev-runtime/mimageviewer-core.exe` | 309,817,856 | 2026-09-10 22:44:06.7532279 | `F5DD19766E6264AAA1C52E08D9FA88E8B6E8DFCFBC8CB30B05A2662B0C83F2BD` |
+| `target/dev-runtime/mimageviewer-remote.exe` | 12,197,376 | 2026-09-10 22:45:16.8048088 | `4456A614C8D40E9DF08C3BEACF208ACA86743EAB812D2CEE3B02CE0C33A2C3AA` |
+
+同 final-gate artifact の `build-dev.preflight.txt` / `.stdout.log` / `.stderr.log` / `.exit.txt` / `.result.json` に実行条件と結果を保存した。終了後 staged core/remote resident と cargo/rustc/link は 0。エージェントはアプリを起動せず、本番 DB/APPDATA を操作していない。
+
+残件は実機での進捗・監視収束・取消・操作応答確認、実アプリ全体 peak の未測定という限界、および親での休止版との統合・再有効化判断。全体 gate と確認 build は完了しており、再有効化や実機確認の成功とは扱わない。利用者が通常 profile で確認する場合のコマンドは、repository root で `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。通常 `%APPDATA%\mimageviewer` の設定・データを更新し得るため、installed/tray 常駐版を先に終了する。今回このコマンドをエージェントは実行していない。
+
+## 確定 master との休止維持統合
+
+親から次の一まとまりとして、clean な `b7102a53a` へ master の確定済み `aa034d57847f7f859fb34e51823ea1d5d4be667b` だけを取り込む指示を受領した。merge-base は `77a6f270e`。master 作業ツリーを編集せず、未コミットの §1.208/§1.210 は対象外。実装と独立レビューは別の Sol / xhigh。既知の性能測定は再実行しない。
+
+採用契約は `PRODUCT_SIMILAR_FEATURE_CAPABILITY=Paused` と App の `Option<SimilarIndexManager>` を実行時の単一正本として維持すること。None では類似 configure・purge・password revision refresh・watch bootstrap・prefill・query を開始せず、保存設定・類似 DB/検索配列を休止のために変更しない。共有 IndexerManager は Option notifier から effective similar flag を導き、通常 metadata/名前索引と watcher は維持する。Enabled を明示したテスト経路は新しい Full/Delta と進捗 mapper を使う。
+
+`git merge --no-commit --no-ff aa034d578` の競合は `src/app.rs` と `src/ui_dialogs/favorites_editor.rs`。Option 内で新 configure/excluded roots と password refresh を接続し、起動・再同期・shared manager 生成失敗時の bootstrap を None で無操作にした。UI は Paused で類似 controls/summary/progress を隠し、Enabled の新表示は維持する。自動統合された shared watcher と capability 経路も検収対象とする。core check、fmt、glyph、diff check は成功し、統合後の焦点回帰と独立検収を進めている。統合 commit・全体 gate・normal build はその後に行う。アプリ起動・実データ操作・master への merge・再有効化は行わない。
+
+取り込んだ休止資料の公開担当「ClaudeCode」は当時の運用記録として保持する。今回の統合実装・検収の担当指定には利用者の Sol / xhigh 分担を優先し、公開資料の別作業は追加しない。
+
+### 統合時の失敗終端と焦点回帰
+
+独立検収で `poll_startup_init` の Disconnected 終端だけ Enabled manager の watch bootstrap を閉じない P2 を検出した。IndexerManager 生成 worker が結果送信前に異常終了した既存の失敗経路で、通常の None 返却時と同じ `finish_watch_bootstrap` を Some の場合に適用する。既存 Pending 登録を Unavailable へ移すだけで、新状態・再試行は追加しない。Paused/None は無操作を維持する。
+
+新しい App 回帰は、Pending 中の public progress は Idle が正常であることを踏まえ、disconnect 前の jobs=(0,0)、終端後の Full=1、password revision 更新後の Full=2 を有限待機で観測する。表示名をテスト都合で変更せず、下位実装だけでなく App 入口からの接続を確認した。Paused App の neutral 応答・保存 true/既存 store 保持・startup/password 無操作と合わせ 3 件成功。
+
+`target/similar-index-pause-integration-20260911/validation-r3/` には shared watcher Full/Delta、password reconfigure、notifier なしの通常 metadata 継続、paused capability、追加/編集 UI visibility、metadata panel、version highlights の成功も保存した。visibility の最初の filter は 0 件だったため検証とは数えず、修正 filter の各 1 件成功を使用する。
+
+中間競合解消版の関数列欠落と Option 呼出の後退は構文/差分検査で検出して修正し、その版は有効証拠に使わない。最終版は両 parent に対して意図外削除がないことを独立検収する。初期 App 回帰の即時進捗 assert 失敗も製品失敗とは混同せず、上記の実契約に沿う最終回帰を正本とする。
+
+最終 freeze は `target/similar-index-pause-integration-20260911/freeze-r1/MANIFEST.md`（SHA256 `C144B7F84B3035E9DB50752D0C5C75DD77C778258B3F6C66B4A56577BD6D96D3`）。39 staged paths / Rust 20 件の source が index と一致し、未解決競合は 0。独立最終承認は同 directory の `review-approval.md`（SHA256 `091FEA02DE65F4CB31271437A5A536296F2BEE8F1F8F2EF3F30C27D5FA21D424`）、統合範囲に残る P1/P2 なし。両 parent との照合で意図外削除がなく、Option 全入口・Paused 保存保護・Enabled 接続・失敗終端を確認した。本書の追記だけを freeze 後に追加し、コードを固定したまま merge commit と全体 gate/build へ進む。
+
+### 統合コミットの最終検証
+
+merge commit は `1c3b5861f73dc5760f3a3b673e409bda40628c41`、parents は `b7102a53ac086f9979ae7c8ba8eb2561fc817752` と指定どおり `aa034d57847f7f859fb34e51823ea1d5d4be667b`。親が後から追加した docs-only `e2d29dd85` や master の未コミット差分は取り込まず、全体 gate と build はこの統合 hash に固定した。以後は本書の結果追記のみ。
+
+`scripts/test-full.ps1 -SuppressCrashDialogs` は jobs=1、08:22:22–08:34:58 JST、native exit 0 / PASS。本体 8,148 passed / 0 failed / 44 ignored、UI snapshot 48 passed、workspace・統合/doc/補助 bin と vendor 3 crate まで成功。error mode を元の `0x00008001` に復元。証跡は `target/similar-index-pause-integration-20260911/fullgate-1c3b5861/`、stdout SHA256 `F454016CAD8D223DBB7CD846BD759AC2DB5F3247D1D814CF2F008A1A79684337`。root も run identity・native exit・集計・復元を確認した。
+
+その後 exact staged core/Remote resident が 0 と確認し、`scripts/build-dev.ps1` を通常 feature（portable/test-script なし）/jobs=1 で 08:35:26–08:44:29 JST に実行、native exit 0。core は更新、変更のない Remote は Cargo が前回成果物を再利用した。両方の最終 hash は root も実ファイルから計算して一致を確認した。
+
+| 成果物 | bytes | 更新時刻 JST | SHA256 |
+| --- | --- | --- | --- |
+| `target/dev-runtime/mimageviewer-core.exe` | 309,949,440 | 2026-09-11 08:44:27.8350397 | `94A30146DB515CDC86DA7D24A6F8087E2F1ABFC8FEC59C2945B6B67B22B8A1C7` |
+| `target/dev-runtime/mimageviewer-remote.exe` | 12,197,376 | 2026-09-11 07:45:16.8048088 | `4456A614C8D40E9DF08C3BEACF208ACA86743EAB812D2CEE3B02CE0C33A2C3AA` |
+
+build 証跡は同統合 artifact の `build-dev-1c3b5861/` にある `run.txt`、stdout/stderr、`artifacts.txt`、`validation-log-hashes.txt`、`final-state.txt`。終了時 clean、cargo/rustc 0、exact dev-runtime resident 0。アプリ起動・本番 DB/APPDATA 操作はなく、既知の大規模測定も再実行していない。
+
+Paused 維持の根拠は製品定数、App Option 単一所有、None での設定/store 保護回帰と入口検収。Enabled 側の根拠は App の初回 Full/password 更新 Full、共有 watcher の Full→Delta と復旧回帰。これらの成功は再有効化の承認とは別である。master への merge と製品再有効化は親へ引き渡す。実機の未確認項目は、類似 UI が非表示のままで通常の名前/metadata 索引と閲覧操作が動くこと。確認用コマンドは `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。通常 `%APPDATA%\mimageviewer` の設定・データを更新し得るため installed/tray 常駐版を先に終了する。エージェントは実行していない。
+
+## 利用者承認による再有効化
+
+利用者の「類似検索も速くなったのであれば休止状態を解除して動作確認したい」という明示承認を親から受領。基点 `627e53a09468c818de6950f08f309d28b9ff37f5` の clean な dupe branch で製品 capability を Enabled へ戻す。実装は Sol / xhigh、独立検収は別の Sol / xhigh。親の §1.208/§1.210 portable build と重い Cargo を重ねない。master 未コミット差分・実データ・稼働アプリに触れず、既知 benchmark は再実行しない。
+
+検索対象と類似判定基準、保存済み設定、DB を維持する。再有効化後も App の Option が実行時の正本であり、別の capability field を増やさない。Paused の明示テストは残し、製品定数への暗黙依存だけを取り除く。Enabled lifecycle は通知の収束、watch bootstrap/復旧、取消、favorite 無効化と purge、PDF password revision、進捗 UI を既有効証拠と変更後の焦点回帰で検収する。
+
+利用者向けの説明では、主に速くしたのは索引照合であり類似検索そのものの応答倍率を実測したわけではないと区別する。通常のファイル変更は全件反復から差分照合へ、必要な Full は job 内 inventory による照合へ変更した。初回照合や監視 gap の修復など必要な Full は残る。未知総数を完了率に見せず、監視準備待ち・配列反映中・未完了理由を区別する。検索精度の間引きやページ数制限は導入しない。
+
+Full の合成試験 process peak 約 921–1,137 MiB は旧方式への追加量ではなく、App 全体 peak は未測定。完了/取消後に inventory の live owner は残さないが、allocator の保持はあり得る。実機での音声途切れや実データでの収束確認は未実施で、再有効化のコード検証と区別する。
+
+### 再有効化の静的検収
+
+製品定数を Enabled にし、既存 App constructor は必ずその定数を渡す private な構築境界へ委譲した。テストだけは同境界へ explicit Enabled/Paused を渡す。Paused fixture では一度 Enabled owner を作ってから破棄する方式を避け、DB/worker 開始前から休止を選ぶ。runtime の正本は引き続き Option だけで、別 field は増やさない。製品 App Some/query demand、prefill resolver 到達、追加/編集/metadata UI、既存 v3.8 highlights の復帰を焦点回帰へ追加し、Paused sentinel/neutral 回帰も維持した。
+
+freeze は `target/similar-index-enabled-20260911/freeze-r1/MANIFEST.txt`（SHA256 `F8458BAE4C5923C470C845D1E1F7AB4E1549FB9CC17F40BD85FC7C2810F8C878`）、source 7 件、本書は除外。fmt/diff check 成功。独立静的検収は同 directory の `review-static.md`（SHA256 `EC65B40F30A6E975FFD7778EEBE7C4FEFC8E9C381B71744A985BA2FEA9AB088C`）、P1/P2 なし。Cargo は親の build 枠待ちで未実施であり、静的承認を実行成功とは扱わない。
+
+焦点実行は product/Paused App、prefill、UI/highlight、shared watcher Full→Delta/復旧、password revision、progress mapper/snapshot とし、取消は `incremental_reconcile_cancelled_full_keeps_the_newer_overflow_repair`、purge は `disabled_favorite_purge_preserves_enabled_overlap_and_prefix_sibling` を代表にする。新しい通知の repair と有効 root overlap/prefix sibling を保護する契約を確認し、未変更 scheduler 全体や既知 benchmark の再調査は行わない。
+
+### 再有効化の焦点検証
+
+親から Cargo 枠を受領後、列挙した焦点回帰はすべて exit 0。未使用の test helper/import だけを除いた r2 の core check、glyph、fmt、diff check も成功した。最終 freeze は `target/similar-index-enabled-20260911/freeze-r2`（manifest SHA256 `8153855A827845AA8001F0F351BCB2F7E099494EF3DCF56C64F60DD3943B85E0`）、検証 summary は `validation-r2/SUMMARY.txt`（SHA256 `B1AC74117F9201598B0135E36DA85E0DFF316A0B493CD5044988F9DAEDEAC542`）。独立担当は test-only 削除の意味変更なしを確認し承認を維持した。r2 test source の全体コンパイルは次の full gate で確認する。
+
+別 chunk として、親承認の `build-dev.ps1 -PreserveRuntime` を追加した。exact staged core/remote の実行を検出したら Stop-Process より前に throw し、未指定時の既定動作は維持する。production 関数を抽出して Get/Stop-Process を mock した回帰と独立レビューは成功。証跡は `target/build-dev-preserve-runtime-20260911/`、review SHA256 `EBD2AC543ADA4A17FAFAAE5924040107FD0EE37E464DDF317E3270CA6C8E54CE`。今回の確認 build は必ずこの switch を使い、実アプリを停止・起動しない。
+
+親 master の新しい `8e5e7ca7e` は現在の検証対象へ混ぜず、本 chunk 完了後の統合対象として留保する。全体 gate と確認 build はこの時点では未完了。
+
+### 再有効化の全体 gate
+
+ビルド安全性を `5290c47e8`、再有効化を `f79a382449872085f42be5419060610182fb0a56` に別 commit で保存した。r2 独立承認は `freeze-r2/review-approval.md`、SHA256 `6503F93B733F7F959AE2BCCB573296F099DE9FF2383FEF06D17D9F5D0CBAFB4B`。
+
+この HEAD を固定し、09:44:15–09:54:14 JST に `scripts/test-full.ps1 -SuppressCrashDialogs` を jobs=1 で実行して exit 0。本体 8,149 passed / 44 ignored、UI snapshot 48、workspace/integration/doc と vendor 3 件群も成功した。証跡は `target/similar-index-enabled-20260911/fullgate-f79a38244/`。`test-full.log` SHA256 `DC13B8213131E58581D0A71F583B4A7C02DC5DE7DD04341EB208C28BEF7FC740`、root も件数と exit を照合した。
+
+09:54:48 JST に exact dev-runtime core/remote resident 0 を確認して `scripts/build-dev.ps1 -PreserveRuntime` の通常 feature / jobs=1 build を開始した。この段落時点では build 中で、アプリ起動・停止・本番データ操作は行っていない。
+
+### 再有効化の確認 build 完了
+
+上記 build は 09:59:18 JST に成果物を生成し exit 0。`-PreserveRuntime` を使用し、前後とも exact staged core/remote resident 0、終了時 cargo/rustc 0。root も実成果物の SHA256 を再計算して照合した。
+
+- core: 309,949,440 bytes、mtime 09:59:18 JST、SHA256 `7F4ADF8E79EBC475EB1FA1311888CA4DA22CB912385375636E1613B7BB74A50A`
+- Remote: 12,197,376 bytes、mtime 07:45:16 JST、SHA256 `4456A614C8D40E9DF08C3BEACF208ACA86743EAB812D2CEE3B02CE0C33A2C3AA`。変更がなく Cargo が成果物を再利用した。
+
+集約証跡は `target/similar-index-enabled-20260911/FINAL-VALIDATION.txt`（SHA256 `B2543E9FD3829F2BD8D4EA6F2C017C9F81C35DF9041B28247D4D5E056F902F72`）。本 chunk の再有効化、独立レビュー、焦点・全体 gate、通常確認 build は完了。以後の変更は本書のみ。master `8e5e7ca7e` の取り込みと統合後検証は次 chunk に残す。master への逆方向 merge・公開は行っていない。
+
+実機の未確認項目は再有効化後の類似 UI と移動・比較・履歴、初回索引と変更通知後の収束・進捗、取消、音声再生と併用した応答である。通常確認 build の利用者用コマンドは repository root で `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。通常 `%APPDATA%\mimageviewer` の実設定・データを更新し得るため、installed/tray 常駐版を先に終了する。エージェントは起動・停止・実データ操作をしていない。
+
+## master 208/210 修正との結合検証
+
+親の明示依頼で、再有効化完了 `6f7bcd29c` に確定済み master `8e5e7ca7e` を `--no-commit --no-ff` で統合した。`src/app.rs` と `src/app/tests.rs` は自動統合、競合はない。208/210 の実装・独立レビュー・利用者実機確認は親の証拠を引き継ぎ、今回の担当は類似機能との交差と両親の変更保持を検収する。親の未コミット209設計文書は対象外、製品ファイルは dupe が唯一 writer。既知性能測定は繰り返さない。
+
+旧文書 `CLAUDE.md`「Detached viewer リワーク中のルール」と `docs/detached-rework-plan.md` §2/3 の ClaudeCode 検収指定は、利用者が明示した Sol/xhigh 実装・別 Sol/xhigh 独立レビューへ移行する。構造的修正の検収と症状パッチ禁止は維持し、担当名称の変更を品質要件の省略として扱わない。今回新たな detached 仕様変更は予定しない。
+
+統合後の焦点回帰、独立検収、結合 full gate、`build-dev.ps1 -PreserveRuntime` が必要。アプリ停止・起動・本番データ操作と master への逆方向 merge は行わず、完了 commit と検証対象を親へ渡す。
+
+### master 208/210 統合の焦点検収
+
+製品への追加修正なしで、Similar constructor/bootstrap/password 3、video_audio 36、secondary_press 9、Similar panel context ownership 1 の回帰が成功した。最後の項目の初回 short-name exact filter は 0 件だったため証拠に数えず、正しい filter の 1 件成功を採用した。fmt/glyph/diff check も成功。
+
+freeze は `target/similar-enabled-master-8e5e7-integration-20260911/freeze-r1`。両 parent は `6f7bcd29c` / `8e5e7ca7e`、source freeze 時の index tree は `2d85469033179e2a58d79367a0a0ba6302d4f73b`（本書の追加記録は未stage）。独立 Sol は交差する app.rs/tests.rs を両 parent と照合し、Enabled private constructor / Option / bootstrap / password / FullDelta と、typed VideoAudioModeRuntime / explicit-input handoff / FullscreenSecondaryPress / context lifecycle の共存を承認、P1/P2 なし。`review-approval.md` SHA256 `5A200B129331A54DC854DF6BF941BD509E11AEF24EBB404758EBE321C75378B2`。
+
+統合 source は freeze と一致し、次に merge commit と結合 full gate / 確認 build を行う。既知 master 修正の再設計や既知性能試験の再実行はない。
+
+### master 208/210 結合 full gate
+
+統合を `cf712806f8c85234f72dfa192c2c1fea0741d1ab`（parents `6f7bcd29c` / `8e5e7ca7e`）に保存し、この clean HEAD を対象に全体 gate を実行した。10:15:55–10:28:10 JST、`test-full.ps1 -SuppressCrashDialogs`、jobs=1、exit 0 / PASS。本体 8,171 passed / 44 ignored、UI snapshot 48、workspace/integration/doc、vendor 25/9/15 件も成功した。
+
+証跡は `target/similar-enabled-master-8e5e7-integration-20260911/fullgate-cf712806f/`。stdout SHA256 `95141EDC431D59CE8B3628FEB6B379D8B1A97E3FF8D5A3C053BF81FFA4B78B29`、stderr SHA256 `FB81A3592096D24E24E222D7C697911A3BDD88974B653C04C873489C5175A169`。root も PASS、件数、exit を照合した。source は固定し、続いて `build-dev.ps1 -PreserveRuntime` の通常確認 build を行う。
+
+### master 208/210 結合 build 完了・引渡し
+
+`cf712806f` の通常確認 build は 10:29:17–10:35:52 JST、`build-dev.ps1 -PreserveRuntime`、jobs=1、exit 0。root は実ファイルの hash を再計算して一致を確認した。
+
+- core: 309,925,888 bytes、mtime 10:35:47 JST、SHA256 `EF9E3F341ED00F063BCBBBA9E5B437583FC0D261CE41DFC8CB4E5D384B6A1135`
+- Remote: 12,197,376 bytes、mtime 07:45:16 JST、SHA256 `4456A614C8D40E9DF08C3BEACF208ACA86743EAB812D2CEE3B02CE0C33A2C3AA`。変更のない成果物を Cargo が再利用した。
+
+集約証跡は `target/similar-enabled-master-8e5e7-integration-20260911/FINAL-VALIDATION.txt`、SHA256 `5AD50576905A489B0691BD2CF1F0C704BA271A716F54055194990A7AA67B1AB8`。終了時 exact staged resident / cargo / rustc はすべて 0。以後の変更は本書の記録だけで、アプリ起動・停止・本番データ操作なし。結合に追加製品修正はなく、独立 review・焦点 gate・full gate・確認 build が完了した。master への取り込みは親に引き渡す。
+
+手動確認用は repository root で `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。通常 `%APPDATA%\mimageviewer` の実設定・データを更新し得るため、installed/tray 常駐版を先に終了する。再有効化後の索引進捗と通知収束、類似タブの移動・比較・履歴、動画再生との併用は統合版での利用者確認に残る。208/210 単体の利用者実機確認済みという証拠を、結合版の実機成功に読み替えない。
+
+## 起動時 Full の実ファイル走査短縮（利用者依頼）
+
+2026-09-11、利用者が結合版を起動し、約12分で確認済み1,632,738 / 発見済み1,635,312（総数未確定）、前回完了4,645,146という画面を提示した。起動時の処理時間解決を明示依頼。基点は `9462456f0`。ログ上の4,600,715行 base load 141.9 ms と array update 85.4 ms は実FS走査時間ではない。通常name/metadata索引は96.272秒でsettled。CPUは観測約54秒で約6.6 CPU秒、低使用率だけでは待ち原因を確定しない。Fullの段階・定期件数・終端時間の通常ログは現状ない。
+
+実装調査は Sol implement_resume、独立設計/差分レビューは別 Sol review_resume、設計判断・文書・gitはroot。起動ごとの停止中変更検出、ページ順、画像判定基準、失敗した旧Completeの保護、cancel/監視gap/DB・検索snapshotの収束を維持する。起動走査を黙って延期・省略したり対象を減らしたりしない。既知の合成DB照合benchmarkを再実行して実FS高速化の証拠に流用しない。
+
+現時点の有力仮説は、ZIPのunchanged判定前の全entry列挙と、PositionedFileReaderの非buffered readによるcentral directory/local headerの小読み取り。by_index_rawもfind_contentを通るため単なる置換でlocal header読みをなくせるとは仮定しない。ZIP共通機構を変える場合は閲覧/サムネ/ネスト/cache clone/cancelの影響と同等性を独立検収する。実装前に使い捨てfixtureで旧新の実I/O回数と結果同等性を確認する計画を固める。
+
+本番ファイル・DBを用いた追加走査、実アプリの起動・停止は行わない。稼働中のバイナリを上書きしない。親はsidecar209でapp.rs等を所有予定、similar/DB/indexerはdupe側、共通領域に届く場合は適用前に調整する。重いCargo/測定は親と枠を調整する。
+
+### 起動 Full 短縮の設計判断
+
+実装担当が依存 zip 2.4.2 の `ZipArchive::new` を確認し、central entry の fixed/name/extra/comment 読みの間に `find_data_start` で local header 30 bytes を読む交互 seek を確認した。単一連続 buffer のみでは central 側が追い出される可能性があるため、reader ごとの bounded small-read cache を2領域程度で評価する。clone は buffer を共有せず空で開始し、cache hit 前にも取消を確認、大readは直接読みへ流す。固定64KiBを全local headerで読み増す方式は採らず、使い捨てfixtureでサイズ候補を比較する。callsだけでなくOS read bytes/requested bytes/elapsedと結果同等性を記録する。
+
+独立Solも、再帰やZIP/PDF列挙省略は停止中変更・page count・failure検出を弱めるため不可と確認した。今回の承認範囲は reader buffering と Full/Delta の観測改善。既存RunningReconcileJobのidentityを使いstart/phase/terminal、約5秒ごとのprocessed/discovered/unchanged/indexed、主要work種別とread calls/bytesを観測する。loggerはscheduler/progress lock外、高頻度item/path logやUI同期I/Oを増やさない。
+
+上記2点は2026-09-11時点の既存 freshness と当該chunkの判断である。2026-09-12 の §1.228 では
+利用者の明示判断により、起動時 Initial Full だけ、Complete/kind/保存page count/同数member/
+mtime/size/all-members-current/hash-versionの全証拠が揃う場合に限りopen前再利用を認めた。
+post-open freshnessへ新条件は加えず、証拠不足なら従来列挙へ戻す。Delta、password/root
+Reconfigure、Manual、Overflow、WatchRecovery、SummaryRepairは列挙を維持する。詳細は
+[§1.228 計画](section228-similar-container-preopen-plan.md)を参照。
+
+真に起動Fullを不要にするには停止期間を覆う永続journal/checkpointなどの別設計が必要であり、このchunkへ混ぜない。まず既知ZIP small-readを改善して代表fixtureと利用者の実起動を分けて評価する。局所benchmark成功のみで起動時間の問題全体を解決済みとは扱わない。親からCargo枠を受領、実装担当はzip_loader/similar_indexと関連testだけを編集する。
+
+### ZIP small-read の最初の比較
+
+実zip 2.4.2 / 2,048 entries の使い捨てfixture（debug、warm）でentry metadata同等性を確認。buffer無しは6,147 OS reads / 194,586 bytes / 11.690 ms。256Bは2,562 / 657,430 / 8.294 ms、512Bは2,306 / 1,181,718 / 7.687 ms、1024Bは2,178 / 2,230,294 / 7.523 ms、4096Bは2,081 / 8,521,728 / 7.605 ms。
+
+1024B候補はfixtureの8倍byte上限assertに失敗（11.46倍）したため採用しない。速度差に比べread増幅が大きく、256B×2window（readerあたり512B）を採用方向とする。256Bはこのfixtureでread calls約58.3%減、bytes約3.38倍、elapsed約29%減。4倍という回帰閾値はこのfixtureの条件であって任意workloadの一般上限ではない。実ファイルの総起動時間やUNC上の速度は未測定。失敗候補も含め `target/similar-startup-full-hotpath-20260911/` に記録する。
+
+### ZIP 先行レビューによる前提訂正
+
+独立SolのP2指摘により、上記『ZipArchive::new内部でcentral/local header交互seek』という説明は未検証の誤前提として撤回する。依存zip 2.4.2のnewはcentral directoryを読む経路で、fixtureはその後の全by_indexを含んでいた。6,147→2,562はnew+全entry accessの結果であり、new単体や2window優位の証拠ではない。実装担当はphase別callsと1/2window比較で根拠を取り直し、差がなければ1windowに縮小する。
+
+もう一つのP2はclone時Vec::with_capacityとmissごとのbuffer allocationによる共通page loaderへの退行リスク。固定slot/clone時未確保、miss時capacity再利用へ直し、clone/large-read-onlyで不要確保0、反復missでallocationがboundedである回帰を追加する。最終非test checkの未使用importも修正する。指摘前のfreezeは未承認、旧性能数値は候補実験としてのみ残す。
+
+### ZIP 解析経路の実装・実測による確定
+
+上記P2-2の前提否定は独立担当が撤回した。依存zip 2.4.2の公開commentだけでは内部動作を説明し切れていなかった。実装はget_metadata→read_central_header→central_header_to_zip_file→find_data_startでlocal headerを読み、central_header_endへ戻る（依存read.rs:1259/1267）。最初の実装担当の交互seek観測は正しかった。レビュー自身の誤所見もこの内部call chainに基づき訂正する。
+
+r2 fixtureはnew完了時と後続by_index完了時を分け、全OS readがnew内、後段の追加readは0と確認した。256B 1窓は4,098 reads / 1,050,328 bytes、2窓は2,562 / 657,430。2窓は1窓比でcalls約37.5%減・bytes約37.4%減なので2窓を維持する。baselineは6,147 / 194,586。固定slot/lazy buffer再利用への修正もコンパイル済み、allocator P2の最終検収とcorrectness/telemetry回帰は後続。
+
+### A+B r2 検収と計装契約の確定
+
+ZIPのallocation P2は固定inline slots・lazy確保・miss時再利用で解消、独立承認済み。zip_loader40、incremental30、Full inventory11（benchmark1 ignored）、core/fmt/diff/glyphが成功した。r2 freezeは `target/similar-startup-full-hotpath-20260911/freeze-r2`。
+
+telemetryで不完全走査にもdatabase_published phaseを出すP2が見つかったため、実publish成功branchだけに移し、Full/Deltaのsafe/unsafe phase回帰を追加する。周期の正確な契約は『work完了境界で、前回から5秒以上空いていれば出力する』で、独立timerによる5秒定期出力ではない。長い単一ZIP/PDF列挙中は追加progress行が出ない。有限reporter threadの追加は行わず、この限界を明記する。
+
+また実行時ログにはZIP OS read calls/bytesを追加していない。これらはcfg(test) fixtureの指標であり、通常jobログとは別である。job elapsedの開始はDB open/page-order repair後で、アプリ起動からの時間・watcher barrier待ち・DB openを含まない。既存startup logと併せて読み、job elapsedだけを全起動時間と解釈しない。先行の計装案にあった『定期』『read calls/bytes』はこの確定契約へ置き換える。
+
+### A+B 最終焦点検収
+
+r3でFull/Deltaのdatabase_publishedを実publish成功branch内だけにし、不完全観測はscan_incompleteとした。productionのsafe/unsafe 4経路を通る回帰を含むtelemetry2件が成功、fmt/diff成功。ZIPは承認済みr2と同一。freezeは `target/similar-startup-full-hotpath-20260911/freeze-r3`、source patch SHA256 `E65ECBD80B6B1710125516FF5B2A8B8A45E244A2C0C57B7A0020C72502204639`。独立reviewはP1/P2なし、`review-approval.md` SHA256 `B8132A4F5CDF3583F5E5A6427CB4DE4892D3A8A65366F96B1FB2978ABBA85629`。全体gateと確認buildはこれから行い、実機の総時間改善は未検証。
+
+### 起動 Full 改善の全体 gate 初回
+
+A+Bを `51caf188ee9f8b4921bd6a4a5d3ccfc0d8a4feff` に保存。11:44:15–11:56:17 JST の全体gateは、本体8,177 passed / 44 ignored、UI48、workspace/doc、vendor egui25・egui-wgpu9成功後、vendor eframeの専用Windows process fixture `synchronous_damage_returns_before_outer_paint_gate` だけ失敗した（14 passed / 1 failed、exit101）。fixture内TCP readの5秒timeout（10060）であり、75分runner上限による中断ではない。初回log SHA256 `87D4B6128EC3A3EF45D209543C6EB52223F0D77F243DD3C6603350A122E369A7`。
+
+source不変・fixture変更なしで当該exact1件を1回再実行し、1 passed / 0 failed、0.81秒、exit0。log SHA256 `7A5A0A0B713FD4E26B437127D0CBD8B0F1D1EFEA8E8C6F157535B0D53D45A39F`。初回原因は未確定で、既知flakyと断定せず失敗記録を保持する。実アプリやDBに接続しない専用非対話fixtureで、mIVの起動・停止なし。最終全体gateを同じsourceで一度再確認する。
+
+### 起動 Full 改善の全体 gate 再確認完了
+
+source不変 `51caf188e` の再確認は11:58:23–12:05:30 JST、426.868秒、native exit0 / PASS。本体8,177 passed / 44 ignored、UI48、vendor eframe15を含む全段階が成功した。初回timeoutは保持し、期待・timeout・製品sourceを変えず再実行した。証跡 `target/similar-startup-full-hotpath-20260911/fullgate-r2-51caf188e`、log SHA256 `35FC1FD19A2ACC798E878C7D84599AA24640BD2387FBE997708EFFBC7ECB28FC`。rootも件数/PASSを照合した。
+
+終了時cargo/rustc0、親へCargo枠を返却。ユーザーのexact dev-runtimeが起動中のため、確認buildはまだ開始していない。実行中exeを上書き・停止せず、利用者の終了後に `build-dev.ps1 -PreserveRuntime` を実行する。実機の総起動時間短縮は未検証で、完了宣言の対象外。
+
+### 起動 Full 改善の確認 build 引渡し
+
+利用者のmIV終了通知を受け、親209のCargo終了後に枠を受領した。source `51caf188e` / build HEAD `cef1e68d9`、12:15:38頃–12:22:39 JST、`build-dev.ps1 -PreserveRuntime`、通常feature / dev-runtime profile / jobs=1、421.151秒、exit0。portable featureは無効。前後のexact staged resident0、終了時cargo/rustc0、アプリ起動・停止・本番データ操作なし。
+
+- core: 309,880,320 bytes、mtime12:22:37 JST、SHA256 `8A96BE34F74AC0B322EA970EF81118E65B63B2FE178188307875E3D32BA28512`
+- Remote: 12,197,376 bytes、mtime07:45:16 JST、SHA256 `4456A614C8D40E9DF08C3BEACF208ACA86743EAB812D2CEE3B02CE0C33A2C3AA`（変更なし、Cargo再利用）
+
+rootも実成果物hashを照合。証跡は `target/similar-startup-full-hotpath-20260911/build-dev-cef1e68d9/MANIFEST.txt`、build log SHA256 `C18678C0EFD1A5D4DA9C3FE6CC3C8350763521EC637EFE747046740C205BBAD5`。この後は本書の記録のみ。
+
+利用者用コマンドはrepository rootで `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。通常 `%APPDATA%\mimageviewer` の設定・データを更新し得るためinstalled/tray版を先に終了する。起動後の索引確認件数と段階ログを採り、実機総時間が短縮したか、残る律速がどこかを確認する。A+Bの実装・独立レビュー・全体gate・buildは完了したが、起動時Fullそのものは残り、実機の時間問題全体の解決は未確認である。
+
+### 利用者実機：起動 Full が約3分で完了
+
+修正版起動後、利用者が約241万件の画面を提示し、その後完了を報告した。rootは通常logをread-onlyで確認し、startup経過180.158秒でjob `1:0 kind=full reason=initial` の `terminal=complete` を確認。job経過179.266秒、inventory load4.901秒、scanning約172.387秒、終端prune/DB公開約1.975秒、array待ち約0.003秒。processed4,654,263 / discovered4,666,609 / unchanged4,646,102 / indexed0 / removed0 / io_failures0 / decode_failures142。既存464万件は再利用され、再登録はない。decode失敗142は前回画面にも出ていた件数と同数だが、同一対象の照合まではしていない。
+
+初回の約12分で163万件という画面より短い時間で全体が完了したことは今回の実機観測。OS cacheやアクセス順の条件を固定したAB比較ではないため、この差のすべてをbuffer修正の効果と断定しない。今回の観測では支配的な時間はFS scanningで、inventory/DB終端/array公開ではない。起動Fullそのものは残るが、今回の実機で約3分の収束と利用者の完了確認を得た。
+
+抽出証跡は `target/similar-startup-full-hotpath-20260911/live-20260911-1225/similar-events.txt`、SHA256 `FDC39659DFA3B6A59417C4CC452D58C68D8CC9523EEB5FA797CADE885E7AB40A`。エージェントは起動・停止・本番DB操作・追加FS走査を行っていない。

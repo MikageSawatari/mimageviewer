@@ -111,21 +111,9 @@ impl<'a> IngestSession<'a> {
         self
     }
 
-    /// Walker の結果を適用する。
-    ///
-    /// - `to_ingest` の各候補について、メタ抽出 → IndexDoc を `batch_upserts` に蓄積、
-    ///   `(path, kind, mtime, size)` を `pending_ok_meta` に蓄積
-    /// - `to_delete` の各 path について、Tantivy delete を `batch_deletes` に蓄積
-    /// - sub-batch が `BATCH_FLUSH_COUNT` に達するか `BATCH_FLUSH_INTERVAL` 経過したら
-    ///   `dispatcher.batch(upserts, deletes, commit_after=true)` で submit
-    /// - **Tantivy commit + reader reload が成功したフレームでのみ** `fts_meta` を更新:
-    ///   `pending_ok_meta` を `upsert_meta_ok` (status=Ok) で書き、`batch_deletes` を
-    ///   `delete_paths` で物理削除
-    /// - 各 sub-batch の境界で dispatcher が Interactive キュー (タグ書き込み等) を先に拾うため、
-    ///   indexer の長時間 ingest 中もタグ操作は ~1 sub-batch (1〜2s) 以内に応答できる。
-    ///
-    /// Tantivy commit と SQLite 書き込みの間にクラッシュした場合は起動時 reconciliation
-    /// (3-way diff: FS / Tantivy / SQLite) で復旧する。
+    /// Build bounded sub-batches, commit and reload Tantivy, then publish matching SQLite rows.
+    /// Cancellation can abandon an already submitted reply; its job stays in dispatcher order.
+    /// Writer, reader reload and SQLite errors are returned rather than logged as success.
     #[allow(clippy::too_many_arguments)]
     pub fn apply(
         &self,
@@ -188,21 +176,29 @@ impl<'a> IngestSession<'a> {
             // ここに来た時点で Tantivy commit + reader reload が完了している。
             // SQLite 側を Tantivy に合わせて更新する。
             for (key, kind, mtime, file_size) in &ok_meta {
-                if let Err(e) = self.meta_db.upsert_meta_ok(
-                    key,
-                    self.favorite_id,
-                    &self.favorite_root,
-                    *kind,
-                    *mtime,
-                    *file_size,
-                ) {
-                    crate::logger::log(format!("ingest: upsert_meta_ok({key}) failed: {e}"));
-                }
+                self.meta_db
+                    .upsert_meta_ok(
+                        key,
+                        self.favorite_id,
+                        &self.favorite_root,
+                        *kind,
+                        *mtime,
+                        *file_size,
+                    )
+                    .map_err(|e| {
+                        tantivy::TantivyError::SystemError(format!(
+                            "ingest: upsert_meta_ok({key}) failed: {e}"
+                        ))
+                    })?;
             }
             if !deletes_for_sqlite.is_empty() {
-                if let Err(e) = self.meta_db.delete_paths(&deletes_for_sqlite) {
-                    crate::logger::log(format!("ingest: delete_paths failed: {e}"));
-                }
+                self.meta_db
+                    .delete_paths(&deletes_for_sqlite)
+                    .map_err(|e| {
+                        tantivy::TantivyError::SystemError(format!(
+                            "ingest: delete_paths failed: {e}"
+                        ))
+                    })?;
             }
             Ok(true)
         };
@@ -343,8 +339,19 @@ impl<'a> IngestSession<'a> {
         self.build_doc(cand, Container::Fs, IndexKind::Audio, norms)
     }
 
-    /// PDF から IndexDoc を組み立てる (§16 step 17)。
+    /// PDF の Info 辞書、または EPUB のファイル名だけから IndexDoc を組み立てる。
     fn build_doc_for_pdf(&self, cand: &CandidateFile) -> Result<IndexDoc, String> {
+        // EPUB 内のタイトル・著者は今回の索引対象外。変換済みであっても
+        // 生成 PDF の Info 辞書を読まず、元ファイル名だけを登録する。
+        if cand
+            .abs_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("epub"))
+        {
+            let norms = crate::ingest_text::build_per_source_for_filename(&cand.abs_path);
+            return self.build_doc(cand, Container::Fs, IndexKind::Pdf, norms);
+        }
         let name = cand
             .abs_path
             .file_name()
@@ -375,6 +382,25 @@ impl<'a> IngestSession<'a> {
         kind: IndexKind,
         norms: crate::ingest_text::PerSourceText,
     ) -> Result<IndexDoc, String> {
+        if crate::perf::is_enabled() {
+            let (stored_total_bytes, png_prompt_bytes) = norms.stored_text_byte_sizes();
+            crate::perf::event(
+                "index",
+                "stored_text_bytes",
+                Some(&cand.key),
+                0,
+                &[
+                    (
+                        "stored_total_bytes",
+                        serde_json::Value::from(stored_total_bytes as u64),
+                    ),
+                    (
+                        "png_prompt_bytes",
+                        serde_json::Value::from(png_prompt_bytes as u64),
+                    ),
+                ],
+            );
+        }
         Ok(IndexDoc {
             path: cand.key.clone(),
             container,
@@ -456,6 +482,135 @@ mod tests {
     }
 
     #[test]
+    fn cancel_interrupts_submitted_reply_without_sqlite_publication() {
+        use crate::fts_writer_dispatcher::{FtsWriterDispatcher, WriterPriority};
+        let (tmp, meta, fts) = setup();
+        let meta = std::sync::Arc::new(meta);
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let writer = FtsWriterDispatcher::start(fts.writer().unwrap(), fts.clone());
+        let (blocked, release_writer, blocker_done) =
+            writer.submit_test_block(WriterPriority::Background);
+        blocked.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (submitted, release_submitter) = writer.test_gate_next_batch();
+        let cand = make_image_file(tmp.path(), "shutdown.jpg");
+        let key = cand.key.clone();
+        let root = tmp.path().to_path_buf();
+        let worker_meta = meta.clone();
+        let worker_cancel = cancel.clone();
+        let worker_writer = writer.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let session = IngestSession::new(Uuid::new_v4(), root, &worker_meta, &fts);
+            let stats = session
+                .apply(
+                    vec![cand],
+                    vec![],
+                    &worker_writer,
+                    &GlobalIoSemaphore::new(2),
+                    IoPriority::Low,
+                    &worker_cancel,
+                    None,
+                )
+                .unwrap();
+            done_tx.send(stats).unwrap();
+        });
+        submitted.recv_timeout(Duration::from_secs(10)).unwrap();
+        cancel.store(true, Ordering::SeqCst);
+        release_submitter.send(()).unwrap();
+        let stats = done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(stats.cancelled);
+        assert!(meta.get(&key).unwrap().is_none());
+        release_writer.send(()).unwrap();
+        blocker_done.recv_timeout(Duration::from_secs(10)).unwrap();
+        worker.join().unwrap();
+        writer.commit(true, WriterPriority::Background).unwrap();
+        assert!(meta.get(&key).unwrap().is_none());
+    }
+
+    #[test]
+    fn sqlite_failure_is_reported_and_allows_later_success() {
+        let (tmp, meta, fts) = setup();
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(
+            fts.writer().unwrap(),
+            fts.clone(),
+        );
+        let db = rusqlite::Connection::open(tmp.path().join("meta.db")).unwrap();
+        db.execute_batch("CREATE TRIGGER fail_ingest BEFORE INSERT ON files BEGIN SELECT RAISE(FAIL, 'injected SQLite failure'); END;").unwrap();
+        let cancel = AtomicBool::new(false);
+        let session = IngestSession::new(Uuid::new_v4(), tmp.path().to_path_buf(), &meta, &fts);
+        let sem = GlobalIoSemaphore::new(2);
+        let failed = make_image_file(tmp.path(), "first.jpg");
+        let failed_key = failed.key.clone();
+        assert!(
+            session
+                .apply(
+                    vec![failed],
+                    vec![],
+                    &writer,
+                    &sem,
+                    IoPriority::Low,
+                    &cancel,
+                    None
+                )
+                .is_err()
+        );
+        assert!(meta.get(&failed_key).unwrap().is_none());
+        db.execute_batch("DROP TRIGGER fail_ingest;").unwrap();
+        session
+            .apply(
+                vec![make_image_file(tmp.path(), "second.jpg")],
+                vec![],
+                &writer,
+                &sem,
+                IoPriority::Low,
+                &cancel,
+                None,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn reader_reload_failure_prevents_sqlite_publication() {
+        let (tmp, meta, fts) = setup();
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(
+            fts.writer().unwrap(),
+            fts.clone(),
+        );
+        let cancel = AtomicBool::new(false);
+        let session = IngestSession::new(Uuid::new_v4(), tmp.path().to_path_buf(), &meta, &fts);
+        let sem = GlobalIoSemaphore::new(2);
+        let cand = make_image_file(tmp.path(), "reload.jpg");
+        let key = cand.key.clone();
+        writer.test_set_reload_failure(true);
+        assert!(
+            session
+                .apply(
+                    vec![cand],
+                    vec![],
+                    &writer,
+                    &sem,
+                    IoPriority::Low,
+                    &cancel,
+                    None
+                )
+                .is_err()
+        );
+        assert!(meta.get(&key).unwrap().is_none());
+        writer.test_set_reload_failure(false);
+        session
+            .apply(
+                vec![make_image_file(tmp.path(), "recovered.jpg")],
+                vec![],
+                &writer,
+                &sem,
+                IoPriority::Low,
+                &cancel,
+                None,
+            )
+            .unwrap();
+    }
+
+    #[test]
     fn ingest_image_marks_ok_and_searchable() {
         let (tmp, meta, fts) = setup();
         let fav = Uuid::new_v4();
@@ -506,6 +661,70 @@ mod tests {
         let hits = fts_index::search_page(&searcher, fts.fields(), &q, 0, 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, key);
+    }
+
+    #[test]
+    fn ingest_converted_epub_uses_filename_without_generated_pdf_metadata() {
+        let (tmp, meta, fts) = setup();
+        let fav = Uuid::new_v4();
+        let session = IngestSession::new(fav, tmp.path().to_path_buf(), &meta, &fts);
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(
+            fts.writer().unwrap(),
+            std::sync::Arc::clone(&fts),
+        );
+        let sem = GlobalIoSemaphore::new(2);
+        let cancel = AtomicBool::new(false);
+        let logical = tmp.path().join("sunflower_book.epub");
+        fs::write(&logical, b"test epub source").unwrap();
+        let _pin = crate::pdf_loader::pin_epub_for_test(&logical, 1, 42);
+        let _info = crate::pdf_loader::pin_document_info_for_test(
+            &logical,
+            crate::pdf_loader::PdfDocumentInfo {
+                title: Some("SecretMetadataTitle".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            crate::pdf_loader::get_document_info(&logical, None)
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("SecretMetadataTitle"),
+            "fixture の生成 PDF に検索可能な Info タイトルがあること",
+        );
+        let mut cand = make_image_file(tmp.path(), "sunflower_book.epub");
+        cand.kind = CandidateKind::Pdf;
+        let key = cand.key.clone();
+        let stats = session
+            .apply(
+                vec![cand],
+                vec![],
+                &writer,
+                &sem,
+                IoPriority::Low,
+                &cancel,
+                None,
+            )
+            .unwrap();
+        assert_eq!(stats.ingested_ok, 1);
+        assert_eq!(stats.ingested_failed, 0);
+        assert_eq!(meta.get(&key).unwrap().unwrap().status, FileStatus::Ok);
+        fts.reload_reader().unwrap();
+        let favs = [fav];
+        let search = |word: &str| {
+            let q = fts_index::build_bigram_and_query(
+                fts.fields(),
+                &[word],
+                &crate::fts_index::QueryFilters {
+                    favorite_ids: Some(&favs),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            fts_index::search_page(&fts.searcher(), fts.fields(), &q, 0, 10).unwrap()
+        };
+        assert_eq!(search("sunflower_book")[0].0, key);
+        assert!(search("SecretMetadataTitle").is_empty());
     }
 
     #[test]

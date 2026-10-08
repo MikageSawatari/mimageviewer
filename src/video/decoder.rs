@@ -23,6 +23,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
+use crate::video::audio_track_selection::{
+    AudioTrackChoice, AudioTrackSelection, AudioTrackSwitchFailureReason,
+};
 use crossbeam_channel::{Receiver, SendTimeoutError, Sender, TryRecvError, bounded};
 
 use super::clock::AvClock;
@@ -223,6 +226,7 @@ enum DemuxPacketSend {
     Sent,
     Cancelled,
     SeekPending,
+    AudioDisconnected,
 }
 
 // Packet sends are back-pressure points, but seek/flush is control traffic.
@@ -323,7 +327,13 @@ fn send_audio_packet_with_video_drain(
             std::time::Duration::from_millis(DEMUX_PACKET_SEND_TIMEOUT_MS),
         ) {
             Ok(()) => return DemuxPacketSend::Sent,
-            Err(SendTimeoutError::Disconnected(_)) => return DemuxPacketSend::Cancelled,
+            Err(SendTimeoutError::Disconnected(_)) => {
+                return if cancel.load(Ordering::Acquire) {
+                    DemuxPacketSend::Cancelled
+                } else {
+                    DemuxPacketSend::AudioDisconnected
+                };
+            }
             Err(SendTimeoutError::Timeout(returned)) => {
                 msg = returned;
                 if !pending_video_packets.is_empty() {
@@ -542,6 +552,7 @@ fn abort_frame_step_output(clock: &AvClock, serial: u64, pts_secs: f64, reason: 
         "[video-decode] frame-step output failed: serial={serial} pts={pts_secs:.6} reason={reason}; clearing seek override"
     ));
     clock.set_paused_position(pts_secs);
+    clock.mark_seek_interrupted(serial);
     clock.clear_seek_target_override(serial);
     if crate::perf::is_enabled() {
         crate::perf::event(
@@ -1321,7 +1332,7 @@ enum AudioPacketMsg {
     /// EOF 到達通知。audio decode thread は内部 decoder を flush して残フレームを
     /// drain (= 末尾の音声を出し切る)、その後次の `Flush` か `Packet` か
     /// channel disconnect を待つ。
-    Eof,
+    Eof { serial: u64 },
 }
 
 /// seek Flush は packet queue とは別の control channel で送る。
@@ -1338,7 +1349,174 @@ enum AudioControlMsg {
         serial: u64,
         seek_target_secs: Option<f64>,
         trim_before_secs: Option<f64>,
+        replace_setup: Option<Box<AudioSetup>>,
     },
+}
+
+/// The serial of the last seek whose Flush was accepted by every existing
+/// decoder lane. A UI seek can advance the live clock serial before its request
+/// is published, so the live serial must never label packets read by demux.
+struct DemuxSerial(u64);
+
+#[derive(Debug, PartialEq, Eq)]
+enum SeekFlushResult {
+    Accepted,
+    AudioLost,
+    Terminated,
+}
+
+fn retry_audio_inactive(
+    pending: &mut Option<crate::video::engine::EngineEvent>,
+    engine_event_tx: &crate::video::EngineEventSender,
+) {
+    let Some(event) = pending.take() else {
+        return;
+    };
+    if let Err(crossbeam_channel::TrySendError::Full(event)) = engine_event_tx.try_send(event) {
+        *pending = Some(event);
+    }
+}
+
+pub(super) const AUDIO_ONLY_LANE_LOST_REASON: &str =
+    "音声デコード処理が終了したため再生を停止しました";
+
+/// Audio-only has no remaining decode lane. The demux exits immediately, so
+/// unlike AudioInactive this terminal event cannot be retried by its loop.
+fn send_audio_only_lane_failed(
+    cancel: &AtomicBool,
+    engine_event_tx: &crate::video::EngineEventSender,
+) {
+    let mut event = crate::video::engine::EngineEvent::Decoder(
+        crate::video::engine::state::DecoderEvent::Failed {
+            reason: AUDIO_ONLY_LANE_LOST_REASON.to_string(),
+        },
+    );
+    engine_event_tx.wake_ui();
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return;
+        }
+        match engine_event_tx.send_timeout(event, std::time::Duration::from_millis(10)) {
+            Ok(()) | Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => return,
+            Err(crossbeam_channel::SendTimeoutError::Timeout(pending)) => event = pending,
+        }
+    }
+}
+
+fn detach_audio_lane(
+    audio_stream_idx: &mut Option<usize>,
+    audio_time_base: &mut Option<(f64, f64)>,
+    clock: &AvClock,
+    selection: Option<&AudioTrackSelection>,
+    pending_audio_inactive: &mut Option<crate::video::engine::EngineEvent>,
+    engine_event_tx: &crate::video::EngineEventSender,
+    has_video: bool,
+    cancel: &AtomicBool,
+) {
+    if let Some(selection) = selection {
+        selection.close_lane();
+    }
+    *audio_stream_idx = None;
+    *audio_time_base = None;
+    let current_pts = clock.now_secs();
+    clock.mark_audio_lane_lost();
+    clock.set_fallback_anchor(current_pts);
+    clock.reset_audio_bookkeeping_only();
+    if !has_video {
+        send_audio_only_lane_failed(cancel, engine_event_tx);
+        return;
+    }
+    *pending_audio_inactive = Some(crate::video::engine::EngineEvent::Audio(
+        crate::video::engine::state::AudioEvent::AudioInactive,
+    ));
+    retry_audio_inactive(pending_audio_inactive, engine_event_tx);
+}
+
+struct AudioWorkerExitGuard(Arc<AvClock>);
+
+impl Drop for AudioWorkerExitGuard {
+    fn drop(&mut self) {
+        self.0.note_audio_worker_exit();
+    }
+}
+
+fn video_packet_msg(
+    packet: ffmpeg_the_third::Packet,
+    serial: &DemuxSerial,
+    clock: &AvClock,
+) -> VideoPacketMsg {
+    VideoPacketMsg::Packet {
+        serial: serial.packet_serial(clock),
+        packet,
+    }
+}
+
+fn audio_packet_msg(
+    packet: ffmpeg_the_third::Packet,
+    serial: &DemuxSerial,
+    clock: &AvClock,
+) -> AudioPacketMsg {
+    AudioPacketMsg::Packet {
+        serial: serial.packet_serial(clock),
+        packet,
+    }
+}
+
+fn packet_matches_seek(serial: u64, decoder_serial: u64, clock: &AvClock) -> bool {
+    serial == decoder_serial && serial == clock.current_seek_serial()
+}
+
+impl DemuxSerial {
+    fn packet_serial(&self, clock: &AvClock) -> u64 {
+        debug_assert!(self.0 <= clock.current_seek_serial());
+        self.0
+    }
+
+    fn send_seek_flushes(
+        &mut self,
+        serial: u64,
+        video: Option<(&Sender<VideoControlMsg>, VideoControlMsg)>,
+        audio: Option<(&Sender<AudioControlMsg>, AudioControlMsg)>,
+        cancel: &AtomicBool,
+        force_audio_disconnect: bool,
+    ) -> SeekFlushResult {
+        let has_video = video.is_some();
+        if let Some((tx, msg)) = video {
+            if !send_demux_msg_cancel_aware(
+                tx,
+                msg,
+                cancel,
+                "video",
+                "flush",
+                VIDEO_CONTROL_QUEUE_CAP,
+            ) {
+                return SeekFlushResult::Terminated;
+            }
+        }
+        if let Some((tx, msg)) = audio {
+            if force_audio_disconnect
+                || !send_demux_msg_cancel_aware(
+                    tx,
+                    msg,
+                    cancel,
+                    "audio",
+                    "flush",
+                    AUDIO_CONTROL_QUEUE_CAP,
+                )
+            {
+                if cancel.load(Ordering::Acquire) {
+                    return SeekFlushResult::Terminated;
+                }
+                if has_video {
+                    self.0 = serial;
+                }
+                return SeekFlushResult::AudioLost;
+            }
+        }
+        // This is independent of seek success and of SeekCompleted delivery.
+        self.0 = serial;
+        SeekFlushResult::Accepted
+    }
 }
 
 enum AudioDecodeInput {
@@ -1415,6 +1593,8 @@ pub struct AudioFrame {
     pub samples: Vec<f32>,
     pub pts_secs: f64,
     pub seek_serial: u64,
+    /// The setup that decoded this frame; S3 uses it for per-track Norm gain.
+    pub stream_index: usize,
     /// このフレーム分の元音声の再生時間 (source timeline 秒)。
     pub duration_secs: f64,
     /// decoder→pump 間の tx queue 会計に使う wall 秒。enqueue 時の playback speed で
@@ -1508,6 +1688,29 @@ impl DeinterlaceStatusSnapshot {
     }
 }
 
+/// Open 時に demux が列挙した、decoder のある音声 stream。
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioTrackInfo {
+    /// AVStream index。選択と packet routing の key。
+    pub stream_index: usize,
+    /// 音声 stream 中の 1 始まりの順番 (再生不可の stream も数える)。
+    pub ordinal: usize,
+    /// metadata の language。未指定、空、und は None。
+    pub language: Option<String>,
+    /// metadata の title。handler_name 等からは推測しない。
+    pub title: Option<String>,
+    /// decoder 名ではなく codec 名。
+    pub codec: String,
+    /// codecpar の値。0 は未知として None。
+    pub channels: Option<u32>,
+    pub sample_rate: Option<u32>,
+    /// AV_DISPOSITION_DEFAULT が立っているか。
+    pub disposition_default: bool,
+    /// Seconds from this stream's timestamps and stream metadata only.
+    pub start_secs: Option<f64>,
+    pub end_secs: Option<f64>,
+}
+
 /// デコード開始時に分かる動画情報。UI の HUD で利用。
 #[derive(Clone, Debug)]
 pub struct VideoInfo {
@@ -1527,6 +1730,14 @@ pub struct VideoInfo {
     /// 0 のときは未知 (Opus / FLAC や VBR 設定でコンテナに記録されていないケース)。
     pub audio_bit_rate_bps: i64,
     pub has_audio: bool,
+    /// decoder が見つかる音声 stream のみを stream 順に列挙。
+    pub audio_tracks: Vec<AudioTrackInfo>,
+    /// 常に best(Audio) の stream index。開けたかどうかとは独立。
+    pub default_audio_stream_index: Option<usize>,
+    /// demux が open 時に実際に開いた stream。音声出力 device の成否とは独立。
+    pub opened_audio_stream_index: Option<usize>,
+    /// 保存済みトラックの open 失敗。音声出力 device の成否とは独立して UI へ渡す。
+    pub open_notice: Option<crate::video::audio_track_selection::AudioTrackOpenNotice>,
     /// timed playable video stream を持つか。audio-only ファイル (映像トラック無し /
     /// 添付画像 = cover art のみ) では false。false のとき width/height/avg_fps は 0、
     /// video_codec/video_decoder は "none"。engine 側の readiness gate
@@ -1663,6 +1874,10 @@ pub struct DecodeHandles {
     pub audio_rx: crossbeam_channel::Receiver<AudioFrame>,
     /// 動画情報の単発通知 (open 完了時)。
     pub info_rx: crossbeam_channel::Receiver<Result<VideoInfo, String>>,
+    /// Present only when demux opened an audio decoder. The player discards it
+    /// if the output device could not be started.
+    pub(crate) audio_track_selection_rx:
+        crossbeam_channel::Receiver<Arc<crate::video::audio_track_selection::AudioTrackSelection>>,
     /// 動画オープン (avformat_open_input + find_stream_info) の進捗。UI スレッドが
     /// `tick` で読んで HUD に「メタデータ読込中... N MB / Y MB」を表示する。
     /// 共有 Arc なので VideoPlayer が clone を保持して使う。
@@ -1704,6 +1919,39 @@ pub(crate) fn spawn(
     skipped_frame_count: Arc<std::sync::atomic::AtomicU64>,
     dynamic: Arc<VideoDynamicState>,
 ) -> DecodeHandles {
+    spawn_with_initial_audio_track(
+        path,
+        clock,
+        cancel,
+        target_audio_sample_rate,
+        hw_decode,
+        deinterlace,
+        #[cfg(windows)]
+        gpu_video_device,
+        engine_state,
+        engine_event_tx,
+        skipped_frame_count,
+        dynamic,
+        None,
+    )
+}
+
+pub(crate) fn spawn_with_initial_audio_track(
+    path: PathBuf,
+    clock: Arc<AvClock>,
+    cancel: Arc<AtomicBool>,
+    target_audio_sample_rate: u32,
+    hw_decode: bool,
+    deinterlace: crate::settings::VideoDeinterlaceMode,
+    #[cfg(windows)] gpu_video_device: Option<
+        std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>,
+    >,
+    engine_state: Arc<std::sync::atomic::AtomicU8>,
+    engine_event_tx: crate::video::EngineEventSender,
+    skipped_frame_count: Arc<std::sync::atomic::AtomicU64>,
+    dynamic: Arc<VideoDynamicState>,
+    initial_audio_track: Option<crate::video::SavedAudioTrackChoice>,
+) -> DecodeHandles {
     // 60fps 1080p で 8 フレーム = 約 130ms のバッファ。decoder pacing の閾値
     // (100ms) と組み合わせて「pacing 直前に 1-2 フレーム余裕がある」状態を
     // 維持し、vsync 1 周期で取り損ねた分を次周期に displayable な状態で
@@ -1720,6 +1968,7 @@ pub(crate) fn spawn(
     let (video_tx, video_rx) = bounded::<VideoFrame>(8);
     let (audio_tx, audio_rx) = bounded::<AudioFrame>(32);
     let (info_tx, info_rx) = bounded::<Result<VideoInfo, String>>(1);
+    let (audio_track_selection_tx, audio_track_selection_rx) = bounded(1);
     let (video_tap, video_tap_producer) = video_tap_channel();
 
     // 動画 open 進捗 atomic 群。worker spawn 前に Arc を作っておき、worker thread に
@@ -1757,9 +2006,11 @@ pub(crate) fn spawn(
                     video_tap_producer,
                     audio_tx,
                     info_tx,
+                    audio_track_selection_tx,
                     skipped_frame_count,
                     dynamic,
                     prep_progress_for_worker,
+                    initial_audio_track,
                 );
             }));
             if outcome.is_err() {
@@ -1794,6 +2045,7 @@ pub(crate) fn spawn(
         video_rx,
         audio_rx,
         info_rx,
+        audio_track_selection_rx,
         prep_progress,
         video_tap,
     }
@@ -1807,6 +2059,106 @@ fn send_video_info(
     if info_tx.send(result).is_ok() {
         engine_event_tx.wake_ui();
     }
+}
+
+/// Input の stream metadata だけを読む。音声 setup / 出力 device には触れない。
+fn enumerate_audio_tracks(input: &ffmpeg_the_third::format::context::Input) -> Vec<AudioTrackInfo> {
+    use ffmpeg_the_third::codec::decoder;
+    enumerate_audio_tracks_with_decoder(input, |codec_id| decoder::find(codec_id).is_some())
+}
+
+fn enumerate_audio_tracks_with_decoder(
+    input: &ffmpeg_the_third::format::context::Input,
+    decoder_available: impl Fn(ffmpeg_the_third::codec::Id) -> bool,
+) -> Vec<AudioTrackInfo> {
+    use ffmpeg_the_third::format::stream::Disposition;
+    use ffmpeg_the_third::media::Type as MediaType;
+
+    let mut audio_ordinal = 0;
+    input
+        .streams()
+        .filter_map(|stream| {
+            let params = stream.parameters();
+            if params.medium() != MediaType::Audio {
+                return None;
+            }
+            audio_ordinal += 1;
+            let codec_id = params.id();
+            if !decoder_available(codec_id) {
+                return None;
+            }
+            let metadata = stream.metadata();
+            let language = metadata
+                .get("language")
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("und"))
+                .map(str::to_owned);
+            let title = metadata
+                .get("title")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+            let raw_start = stream.start_time();
+            let start_secs = stream_timestamp_secs(raw_start, stream.time_base(), true);
+            let stream_duration =
+                stream_timestamp_secs(stream.duration(), stream.time_base(), false);
+            let end_secs = if let Some(duration) = stream_duration {
+                let origin = if raw_start == ffmpeg_the_third::ffi::AV_NOPTS_VALUE {
+                    Some(0.0)
+                } else {
+                    start_secs
+                };
+                origin.and_then(|start| valid_stream_secs(start + duration))
+            } else if raw_start == 0 || raw_start == ffmpeg_the_third::ffi::AV_NOPTS_VALUE {
+                metadata.get("DURATION").and_then(parse_stream_duration_tag)
+            } else {
+                None
+            };
+            Some(AudioTrackInfo {
+                stream_index: stream.index(),
+                ordinal: audio_ordinal,
+                language,
+                title,
+                codec: codec_id.name().to_owned(),
+                channels: Some(params.ch_layout().channels()).filter(|&value| value != 0),
+                sample_rate: Some(params.sample_rate()).filter(|&value| value != 0),
+                disposition_default: stream.disposition().contains(Disposition::DEFAULT),
+                start_secs,
+                end_secs,
+            })
+        })
+        .collect()
+}
+
+fn valid_stream_secs(value: f64) -> Option<f64> {
+    (value.is_finite() && value >= 0.0).then_some(value)
+}
+
+fn stream_timestamp_secs(
+    value: i64,
+    time_base: ffmpeg_the_third::Rational,
+    allow_zero: bool,
+) -> Option<f64> {
+    if value < 0
+        || (!allow_zero && value == 0)
+        || time_base.numerator() <= 0
+        || time_base.denominator() <= 0
+    {
+        return None;
+    }
+    valid_stream_secs(value as f64 * time_base.numerator() as f64 / time_base.denominator() as f64)
+}
+
+/// Matroska's stream DURATION tag, accepted only for zero/unknown starts.
+fn parse_stream_duration_tag(value: &str) -> Option<f64> {
+    let mut parts = value.split(':');
+    let hours = parts.next()?.parse::<u64>().ok()?;
+    let minutes = parts.next()?.parse::<u32>().ok()?;
+    let seconds = parts.next()?.parse::<f64>().ok()?;
+    if parts.next().is_some() || minutes >= 60 || !(0.0..60.0).contains(&seconds) {
+        return None;
+    }
+    valid_stream_secs(hours as f64 * 3600.0 + minutes as f64 * 60.0 + seconds)
 }
 
 /// 動画オープン (= prepare) フェーズ中だけ demux thread の CPU 優先度を
@@ -1927,16 +2279,16 @@ fn run_decoder(
     video_tap: VideoTapProducer,
     audio_tx: Sender<AudioFrame>,
     info_tx: Sender<Result<VideoInfo, String>>,
+    audio_track_selection_tx: Sender<Arc<crate::video::audio_track_selection::AudioTrackSelection>>,
     skipped_frame_count: Arc<std::sync::atomic::AtomicU64>,
     dynamic: Arc<VideoDynamicState>,
     prep_progress: Arc<crate::video::avio_progress::PreparingProgress>,
+    initial_audio_track: Option<crate::video::SavedAudioTrackChoice>,
 ) {
     use ffmpeg_the_third as ffmpeg;
     // Phase B: Pixel / ScaleContext / ScaleFlags / Video は run_video_decode に移管。
     // run_decoder = demux thread はもう video frame を直接触らない。
-    use ffmpeg::format::sample::{Sample, Type as SampleType};
     use ffmpeg::media::Type as MediaType;
-    use ffmpeg::software::resampling::Context as ResampleContext;
 
     // ── FFmpeg ライブラリ初期化 ──
     // 2026-05-12「動画を準備中…」遅延解析: `VideoPlayer::open done` (main thread の
@@ -2004,6 +2356,8 @@ fn run_decoder(
         format_input_t0.elapsed().as_secs_f64() * 1000.0,
         open_phase_t0.elapsed().as_secs_f64() * 1000.0
     ));
+
+    let audio_tracks = enumerate_audio_tracks(&input);
 
     // ── 動画ストリーム選択 (任意) ──
     //
@@ -2189,122 +2543,52 @@ fn run_decoder(
     let has_video = video_setup.is_some();
 
     // ── 音声ストリーム選択 (任意) ──
-    let audio_setup = match input.streams().best(MediaType::Audio) {
-        Some(audio_stream) => {
-            let idx = audio_stream.index();
-            let tb = audio_stream.time_base();
-            let params = audio_stream.parameters();
-            // params は `from_parameters` で消費されるので、ビットレートはここで先に取る。
-            let audio_bit_rate_bps = params.bit_rate();
-            // 2026-05-12 crash 解析: audio decoder open 前後のネイティブ FFmpeg 呼出 (codec
-            // ctx alloc / avcodec_open2) で 0xc0000409 が出る可能性もあるので、各ステップを
-            // log で挟む。次回 crash 時の末尾切れ位置で犯人を絞り込む。
-            crate::logger::log(format!(
-                "audio setup: -> Context::from_parameters (stream_idx={idx})"
-            ));
-            match ffmpeg::codec::context::Context::from_parameters(params) {
-                Ok(mut ctx) => {
-                    let audio_codec_id = ctx.id();
-                    let audio_codec_name = audio_codec_id.name().to_string();
-                    let (container_channels, container_layout_desc) =
-                        audio_context_layout_summary(&ctx);
-                    let stereo_request_sent = request_stereo_audio_decoder_output(
-                        &mut ctx,
-                        &audio_codec_name,
-                        container_channels,
-                        &container_layout_desc,
-                    );
-                    crate::logger::log(format!(
-                        "audio setup: -> ctx.decoder().audio() (codec={audio_codec_name})"
-                    ));
-                    match ctx.decoder().audio() {
-                        Ok(mut dec) => {
-                            let in_fmt = dec.format();
-                            let in_rate = dec.rate();
-                            // FFmpeg 7.x API: channel_layout → ch_layout, get → get2
-                            let (in_layout, layout_substituted) = {
-                                let raw_in_layout = dec.ch_layout();
-                                normalize_audio_input_layout(raw_in_layout)
-                            };
-                            if layout_substituted {
-                                crate::logger::log(format!(
-                                    "audio channel layout unspecified ({} ch); substituting default layout \"{}\"",
-                                    in_layout.channels(),
-                                    in_layout.description(),
-                                ));
-                                dec.set_ch_layout(in_layout.clone());
-                            }
-                            // 出力は f32 packed stereo / target_audio_sample_rate
-                            let out_fmt = Sample::F32(SampleType::Packed);
-                            let out_rate = target_audio_sample_rate;
-                            let out_layout = ffmpeg::ChannelLayout::STEREO;
-                            let input_channels = in_layout.channels();
-                            let input_layout_desc = in_layout.description();
-                            let input_format = format!("{in_fmt:?}");
-                            let decoder_stereo_effective = input_channels <= 2;
-                            let fast_downmix =
-                                FastDownmixToStereo::new(in_fmt, &in_layout, in_rate, out_rate);
-                            let fast_downmix_enabled = fast_downmix.is_some();
-                            crate::logger::log(format!(
-                                "audio setup: codec={audio_codec_name} container_layout=\"{container_layout_desc}\" container_channels={container_channels} decoder_layout=\"{input_layout_desc}\" decoder_channels={input_channels} in_fmt={input_format} in_rate={in_rate} out_layout=stereo out_rate={out_rate} request_stereo={stereo_request_sent} request_effective={decoder_stereo_effective} fast_downmix={fast_downmix_enabled}"
-                            ));
-                            // 2026-05-12 crash 解析: `ucrtbase.dll` で 0xc0000409 (heap
-                            // corruption / fast fail) が出ているので、swresample のネイティブ
-                            // 呼出を 1 ステップずつ log で挟む。次回 crash で末尾切れが
-                            // どこまで進むかで「get2 直前 / get2 内部 / get2 直後」を切り分ける。
-                            crate::logger::log(format!(
-                                "audio setup: -> ResampleContext::get2 (in_fmt={input_format} in_rate={in_rate} out_rate={out_rate})"
-                            ));
-                            let rs_result = ResampleContext::get2(
-                                in_fmt, in_layout, in_rate, out_fmt, out_layout, out_rate,
-                            );
-                            crate::logger::log(format!(
-                                "audio setup: <- ResampleContext::get2 ok={}",
-                                rs_result.is_ok()
-                            ));
-                            match rs_result {
-                                Ok(rs) => Some(AudioSetup {
-                                    stream_idx: idx,
-                                    out_rate,
-                                    input_rate: in_rate,
-                                    input_channels,
-                                    input_layout_desc,
-                                    input_format,
-                                    output_channels: 2,
-                                    decoder_stereo_requested: stereo_request_sent,
-                                    decoder_stereo_effective,
-                                    fast_downmix,
-                                    time_base_num: tb.numerator() as f64,
-                                    time_base_den: tb.denominator() as f64,
-                                    decoder: dec,
-                                    resampler: rs,
-                                    codec_name: audio_codec_name,
-                                    bit_rate_bps: audio_bit_rate_bps,
-                                }),
-                                Err(e) => {
-                                    crate::logger::log(format!(
-                                        "audio resampler init failed: {e} (再生は映像のみ)"
-                                    ));
-                                    None
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            crate::logger::log(format!("audio decoder open failed: {e}"));
-                            None
-                        }
-                    }
-                }
-                Err(e) => {
-                    crate::logger::log(format!("audio codec context failed: {e}"));
-                    None
-                }
-            }
-        }
-        None => None,
-    };
+    let default_audio_stream_index = input.streams().best(MediaType::Audio).map(|s| s.index());
+    let initial_stream_index = crate::video::audio_track_selection::resolve_initial_audio_track(
+        &audio_tracks,
+        default_audio_stream_index,
+        initial_audio_track.as_ref(),
+    );
+    let saved_matched = initial_audio_track.as_ref().is_some_and(|choice| {
+        crate::video::audio_track_selection::resolve_initial_audio_track(
+            &audio_tracks,
+            None,
+            Some(choice),
+        ) == Some(choice.stream_index)
+    });
+    let selected_audio_stream = initial_stream_index.and_then(|index| input.stream(index));
+    #[cfg(test)]
+    let injected_open_setup_failure = clock.take_audio_setup_failure_for_test();
+    #[cfg(not(test))]
+    let injected_open_setup_failure = false;
+    let mut audio_setup = selected_audio_stream.and_then(|stream| {
+        (if injected_open_setup_failure {
+            Err("injected AudioSetup failure".to_string())
+        } else {
+            build_audio_setup(&input, stream.index(), target_audio_sample_rate)
+        })
+        .inspect_err(|error| crate::logger::log(format!("audio setup failed: {error}")))
+        .ok()
+    });
+    let saved_open_failed = saved_matched && audio_setup.is_none();
+    if saved_open_failed {
+        audio_setup = default_audio_stream_index.and_then(|index| {
+            build_audio_setup(&input, index, target_audio_sample_rate)
+                .inspect_err(|error| {
+                    crate::logger::log(format!("default audio setup failed: {error}"))
+                })
+                .ok()
+        });
+    }
+    let audio_track_selection = audio_setup.as_ref().map(|setup| {
+        Arc::new(crate::video::audio_track_selection::AudioTrackSelection::new(setup.stream_idx))
+    });
+    if let Some(selection) = audio_track_selection.as_ref() {
+        let _ = audio_track_selection_tx.try_send(Arc::clone(selection));
+    }
 
     let has_audio = audio_setup.is_some();
+    let opened_audio_stream_index = audio_setup.as_ref().map(|setup| setup.stream_idx);
     if !has_audio {
         // 音声無し動画: 最初から fallback wall clock を使う
         clock.mark_audio_inactive();
@@ -2459,6 +2743,12 @@ fn run_decoder(
         audio_codec: audio_setup.as_ref().map(|a| a.codec_name.clone()),
         audio_bit_rate_bps: audio_setup.as_ref().map(|a| a.bit_rate_bps).unwrap_or(0),
         has_audio,
+        audio_tracks: audio_tracks.clone(),
+        default_audio_stream_index,
+        opened_audio_stream_index,
+        open_notice: saved_open_failed.then_some(
+            crate::video::audio_track_selection::AudioTrackOpenNotice::SavedTrackUnavailable,
+        ),
         has_video,
         hw_decode_active: vi_hw_active,
         gpu_path_active,
@@ -2647,8 +2937,8 @@ fn run_decoder(
     // Keep this packet queue shallow. Audio prefill belongs in AudioBuffer
     // raw_pending; seek Flush is carried by audio_ctl_tx so it can cut ahead
     // of old compressed packets.
-    let audio_stream_idx_for_demux: Option<usize> = audio_setup.as_ref().map(|a| a.stream_idx);
-    let audio_time_base_for_demux: Option<(f64, f64)> = audio_setup
+    let mut audio_stream_idx_for_demux: Option<usize> = audio_setup.as_ref().map(|a| a.stream_idx);
+    let mut audio_time_base_for_demux: Option<(f64, f64)> = audio_setup
         .as_ref()
         .map(|a| (a.time_base_num, a.time_base_den));
     let (audio_pkt_tx, audio_pkt_rx) = bounded::<AudioPacketMsg>(AUDIO_PACKET_QUEUE_CAP);
@@ -2668,6 +2958,7 @@ fn run_decoder(
             std::thread::Builder::new()
                 .name("video-audio-decode".into())
                 .spawn(move || {
+                    let _exit_guard = AudioWorkerExitGuard(Arc::clone(&clock_a));
                     run_audio_decode(
                         setup,
                         audio_pkt_rx,
@@ -2824,15 +3115,39 @@ fn run_decoder(
     // (「シーク中」表示 + 無音のまま、次の seek まで回復しない)。native FirstFrameReady の
     // pending 再送と同じ考え方でループ先頭から再送する (review-v2.3.0 P2-7)。
     let mut pending_seek_completed: Option<(u64, f64)> = None;
+    // AudioInactive is a one-shot readiness change; a full engine event lane
+    // must not lose it, including while demux is idle at EOF.
+    let mut pending_audio_inactive: Option<crate::video::engine::EngineEvent> = None;
+    // Both decode workers start at open serial 0. Requests made while opening
+    // are still pending and must be handled before any packet gets their serial.
+    let mut demux_serial = DemuxSerial(0);
 
     'outer: loop {
         if cancel.load(Ordering::Acquire) {
             break;
         }
+        if audio_stream_idx_for_demux.is_some() && clock.audio_worker_exited() {
+            detach_audio_lane(
+                &mut audio_stream_idx_for_demux,
+                &mut audio_time_base_for_demux,
+                &clock,
+                audio_track_selection.as_deref(),
+                &mut pending_audio_inactive,
+                &engine_event_tx,
+                video_stream_idx.is_some(),
+                &cancel,
+            );
+            if video_stream_idx.is_none() {
+                break 'outer;
+            }
+        }
+        retry_audio_inactive(&mut pending_audio_inactive, &engine_event_tx);
         // 前回失敗した SeekCompleted を再送。新しい seek が始まっていたら (serial が進んで
         // いたら) demux はこの後その seek を処理して新しい SeekCompleted を送るので、stale な
         // pending は捨てる。
-        if let Some((pending_serial, pending_pts)) = pending_seek_completed {
+        if pending_audio_inactive.is_none()
+            && let Some((pending_serial, pending_pts)) = pending_seek_completed
+        {
             if pending_serial != clock.current_seek_serial() {
                 pending_seek_completed = None;
             } else if engine_event_tx
@@ -2885,6 +3200,100 @@ fn run_decoder(
                 serial,
                 kind,
             } = req;
+            // Audio is adopted at the trim lower bound, not necessarily at
+            // the demux seek start. Frame-step scans from before its base.
+            let audio_adoption_start_secs = match kind {
+                super::clock::SeekRequestKind::Precise => target_secs,
+                super::clock::SeekRequestKind::FrameStep { base_secs, .. } => base_secs,
+            };
+            // Snapshot desired only after taking the seek request. UI publishes
+            // desired before request_seek; this order preserves latest-wins.
+            let mut switch_candidate: Option<AudioTrackChoice> = audio_track_selection
+                .as_ref()
+                .and_then(|selection| selection.snapshot().switch_candidate());
+            if let Some(choice) = switch_candidate {
+                let available = audio_tracks
+                    .iter()
+                    .find(|track| track.stream_index == choice.stream_index)
+                    .is_some_and(|track| {
+                        super::audio_track_selection::audio_track_available_at(
+                            track,
+                            audio_adoption_start_secs,
+                        )
+                    });
+                if available {
+                    audio_track_selection
+                        .as_ref()
+                        .unwrap()
+                        .begin_attempt(choice);
+                } else {
+                    audio_track_selection
+                        .as_ref()
+                        .unwrap()
+                        .defer_if_current(choice);
+                    switch_candidate = None;
+                }
+            }
+            let mut replacement_setup: Option<Box<AudioSetup>> = None;
+            let mut replacement_route: Option<(usize, (f64, f64))> = None;
+            if let Some(choice) = switch_candidate {
+                if audio_stream_idx_for_demux.is_none() {
+                    audio_track_selection
+                        .as_ref()
+                        .unwrap()
+                        .fail(choice, AudioTrackSwitchFailureReason::WorkerGone);
+                    switch_candidate = None;
+                } else if audio_stream_idx_for_demux != Some(choice.stream_index) {
+                    let setup_started = std::time::Instant::now();
+                    #[cfg(test)]
+                    let injected_failure = clock.take_audio_setup_failure_for_test();
+                    #[cfg(not(test))]
+                    let injected_failure = false;
+                    let result = if injected_failure {
+                        Err("injected AudioSetup failure".to_string())
+                    } else {
+                        build_audio_setup(&input, choice.stream_index, target_audio_sample_rate)
+                    };
+                    if crate::perf::is_enabled() {
+                        crate::perf::event(
+                            "audio",
+                            "audio_setup_build",
+                            None,
+                            choice.generation,
+                            &[
+                                ("stream_index", serde_json::Value::from(choice.stream_index)),
+                                (
+                                    "ms",
+                                    serde_json::Value::from(
+                                        setup_started.elapsed().as_secs_f64() * 1000.0,
+                                    ),
+                                ),
+                                ("success", serde_json::Value::from(result.is_ok())),
+                            ],
+                        );
+                    }
+                    match result {
+                        Ok(setup) => {
+                            replacement_route = Some((
+                                setup.stream_idx,
+                                (setup.time_base_num, setup.time_base_den),
+                            ));
+                            replacement_setup = Some(Box::new(setup));
+                        }
+                        Err(error) => {
+                            crate::logger::log(format!(
+                                "audio track setup failed: stream={} generation={} error={error}",
+                                choice.stream_index, choice.generation
+                            ));
+                            audio_track_selection
+                                .as_ref()
+                                .unwrap()
+                                .fail(choice, AudioTrackSwitchFailureReason::SetupFailed);
+                            switch_candidate = None;
+                        }
+                    }
+                }
+            }
             let frame_step = match kind {
                 super::clock::SeekRequestKind::Precise => None,
                 super::clock::SeekRequestKind::FrameStep {
@@ -2895,7 +3304,6 @@ fn run_decoder(
                     direction,
                 }),
             };
-            let display_target_secs = frame_step.map(|spec| spec.base_secs).unwrap_or(target_secs);
             // Phase B: post_seek_frame_sent / drop_before_secs / current_seek_serial は
             // すべて video decode thread のローカル変数として所有される。demux thread は
             // 「seek 要求を受け取り → input.seek() を実行 → 両 decode thread に Flush
@@ -2940,21 +3348,38 @@ fn run_decoder(
             // `pts <= now + lead_tol` で処理できる。mIV はすべての seek で preroll
             // trim (= drop_before_secs) を行い、target 前の keyframe preview は表示しない。
             // これにより 1 秒 seek などで映像が「逆方向へ跳ねる」見え方を避ける。
-            let mut seek_result = backward(&mut input);
+            #[cfg(test)]
+            let injected_seek_failure = clock.take_demux_seek_failure_for_test();
+            #[cfg(not(test))]
+            let injected_seek_failure = false;
+            let mut seek_result = if injected_seek_failure {
+                Err(ffmpeg::Error::from(-22))
+            } else {
+                backward(&mut input)
+            };
             // backward が失敗したら forward を retry (= EOF 近傍など、target 以前に
             // keyframe が無い場合)。
-            if seek_result.is_err() {
+            if seek_result.is_err() && !injected_seek_failure {
                 crate::logger::log(format!(
                     "backward seek failed at {target_secs:.3}s, retry as forward"
                 ));
                 seek_result = input.seek(target_pts, target_pts..);
             }
             crate::logger::log(format!(
-                "seek: target={target_secs:.3}s display_target={display_target_secs:.3}s serial={serial} kind={kind:?} result={seek_result:?}"
+                "seek: target={target_secs:.3}s audio_adoption_start={audio_adoption_start_secs:.3}s serial={serial} kind={kind:?} result={seek_result:?}"
             ));
             if seek_result.is_err() {
+                if let Some(choice) = switch_candidate.take() {
+                    audio_track_selection
+                        .as_ref()
+                        .unwrap()
+                        .fail(choice, AudioTrackSwitchFailureReason::SeekFailed);
+                }
+                replacement_setup = None;
+                replacement_route = None;
                 // 完全失敗: override を明示解除しないと pace_now が target 固定で
                 // UI が hang する。clock 経由で wall extrapolation に切替える。
+                clock.mark_seek_interrupted(serial);
                 clock.clear_seek_target_override(serial);
                 if crate::perf::is_enabled() {
                     crate::perf::event(
@@ -2973,18 +3398,15 @@ fn run_decoder(
             // Flush は channel 経由で送る。順序保証 channel なので、Flush 後に enqueue
             // される packet は前世代として処理されない。
             //
-            // **video / audio とも同じ trim 下限を送る**:
+            // Audio の採用開始位置は可用性判定と同じ値を使う。video は
+            // frame-step 時に base 前後の候補を選ぶため trim を送らない:
             //
-            // - `seek_target_for_flush` (= ユーザー要求 seek 位置): 成功時は常に
-            //   `Some(target_secs)`。pump が BufferReady の audio_anchor pts に使う。
-            //   Buffering→Playing 入場時の anchor が target に維持され、timeline 表示が
-            //   target 固定になる。失敗時のみ `None`。
-            // - `trim_before` (= video/audio 共通の preroll trim 下限):
-            //   - 成功: Some(target) → keyframe → target を decode + drop し
-            //     target ぴったりに着地 (post_seek_frame_sent=false で 1 枚目を待機)
-            //   - 失敗: None → trim せず通常 pacing
+            // - `seek_target_for_flush`: 成功時は audio 採用開始位置。pump が
+            //   BufferReady の audio_anchor pts に使う。失敗時のみ `None`。
+            // - video trim: 通常 seek 成功時は target、frame-step と失敗時は None。
+            // - audio trim: 成功時は採用開始位置、失敗時は None。
             let seek_target_for_flush = if seek_result.is_ok() {
-                Some(display_target_secs)
+                Some(audio_adoption_start_secs)
             } else {
                 None
             };
@@ -2998,7 +3420,7 @@ fn run_decoder(
                 None
             };
             let audio_trim_before = if seek_result.is_ok() {
-                Some(display_target_secs)
+                Some(audio_adoption_start_secs)
             } else {
                 None
             };
@@ -3033,37 +3455,69 @@ fn run_decoder(
                 pending_video_packet_bytes = 0;
                 next_video_overflow_log_bytes = 0;
             }
-            // audio-only では video decode thread が無い (video_ctl_rx は drop 済み)。
-            // gate せずに送ると disconnect を cancel と誤解して demux が break してしまう。
-            if video_stream_idx.is_some()
-                && !send_demux_msg_cancel_aware(
-                    &video_ctl_tx,
-                    VideoControlMsg::Flush {
-                        serial,
-                        trim_before_secs: video_trim_before,
-                        frame_step,
-                    },
-                    &cancel,
-                    "video",
-                    "flush",
-                    VIDEO_CONTROL_QUEUE_CAP,
-                )
-            {
-                break 'outer;
-            }
-            if audio_stream_idx_for_demux.is_some() {
-                let _ = send_demux_msg_cancel_aware(
-                    &audio_ctl_tx,
-                    AudioControlMsg::Flush {
-                        serial,
-                        seek_target_secs: seek_target_for_flush,
-                        trim_before_secs: audio_trim_before,
-                    },
-                    &cancel,
-                    "audio",
-                    "flush",
-                    AUDIO_CONTROL_QUEUE_CAP,
-                );
+            // Only existing lanes participate (audio-only/video-only). An audio
+            // disconnect without cancel removes that lane after video Flush succeeds.
+            #[cfg(test)]
+            let force_audio_disconnect =
+                switch_candidate.is_some() && clock.take_audio_flush_failure_for_test();
+            #[cfg(not(test))]
+            let force_audio_disconnect = false;
+            let flush_result = demux_serial.send_seek_flushes(
+                serial,
+                video_stream_idx.map(|_| {
+                    (
+                        &video_ctl_tx,
+                        VideoControlMsg::Flush {
+                            serial,
+                            trim_before_secs: video_trim_before,
+                            frame_step,
+                        },
+                    )
+                }),
+                audio_stream_idx_for_demux.map(|_| {
+                    (
+                        &audio_ctl_tx,
+                        AudioControlMsg::Flush {
+                            serial,
+                            seek_target_secs: seek_target_for_flush,
+                            trim_before_secs: audio_trim_before,
+                            replace_setup: replacement_setup.take(),
+                        },
+                    )
+                }),
+                &cancel,
+                force_audio_disconnect,
+            );
+            match flush_result {
+                SeekFlushResult::Accepted => {
+                    if let Some(choice) = switch_candidate {
+                        if let Some((stream_idx, time_base)) = replacement_route {
+                            audio_stream_idx_for_demux = Some(stream_idx);
+                            audio_time_base_for_demux = Some(time_base);
+                        }
+                        audio_track_selection.as_ref().unwrap().apply(choice);
+                    }
+                }
+                SeekFlushResult::AudioLost => {
+                    if cancel.load(Ordering::Acquire) {
+                        break 'outer;
+                    }
+                    detach_audio_lane(
+                        &mut audio_stream_idx_for_demux,
+                        &mut audio_time_base_for_demux,
+                        &clock,
+                        audio_track_selection.as_deref(),
+                        &mut pending_audio_inactive,
+                        &engine_event_tx,
+                        video_stream_idx.is_some(),
+                        &cancel,
+                    );
+                    if video_stream_idx.is_none() {
+                        break 'outer;
+                    }
+                    crate::logger::log("[demux] audio lane lost during Flush; continuing video");
+                }
+                SeekFlushResult::Terminated => break 'outer,
             }
             // 成功時のみ anchor を target に進める。失敗時に target を anchor すると
             // demux 位置とクロックが食い違い、anchor < frame_pts な audio set_audio_pts
@@ -3072,7 +3526,7 @@ fn run_decoder(
             // frame / sample が set_audio_pts / set_fallback_anchor 経由で自然に
             // 現在位置にアンカーし直す。
             if seek_result.is_ok() {
-                clock.notify_seek_completed(display_target_secs);
+                clock.notify_seek_completed(audio_adoption_start_secs);
             } else {
                 clock.reset_audio_bookkeeping_only();
             }
@@ -3081,17 +3535,22 @@ fn run_decoder(
             // 解除されない。lane 満杯 (Full) で送れなかったら pending に退避して
             // ループ先頭から再送する (review-v2.3.0 P2-7)。Disconnected は engine 側の
             // teardown 中なので再送しない。
-            match engine_event_tx.try_send(crate::video::engine::EngineEvent::Decoder(
+            let completed = crate::video::engine::EngineEvent::Decoder(
                 crate::video::engine::state::DecoderEvent::SeekCompleted {
                     epoch: serial,
-                    actual_pts: display_target_secs,
+                    actual_pts: audio_adoption_start_secs,
                 },
-            )) {
-                Err(crossbeam_channel::TrySendError::Full(_)) => {
-                    pending_seek_completed = Some((serial, display_target_secs));
-                }
-                _ => {
-                    pending_seek_completed = None;
+            );
+            if pending_audio_inactive.is_some() {
+                pending_seek_completed = Some((serial, audio_adoption_start_secs));
+            } else {
+                match engine_event_tx.try_send(completed) {
+                    Err(crossbeam_channel::TrySendError::Full(_)) => {
+                        pending_seek_completed = Some((serial, audio_adoption_start_secs));
+                    }
+                    _ => {
+                        pending_seek_completed = None;
+                    }
                 }
             }
         }
@@ -3107,6 +3566,8 @@ fn run_decoder(
             break 'outer;
         }
 
+        #[cfg(test)]
+        clock.wait_at_demux_packet_gate_for_test();
         let packet_iter = input.packets();
         // ※ packets() は &mut input を取るので毎ループ作り直す形になる。
         //    ffmpeg-the-third 3.x では packets() のアイテムが Result<(Stream, Packet), Error>
@@ -3136,7 +3597,7 @@ fn run_decoder(
                 let packet_pts =
                     packet_timestamp(&packet).map(|pts| (pts as f64) * video_tb_num / video_tb_den);
                 let packet_size = packet.size();
-                let seek_serial = clock.current_seek_serial();
+                let seek_serial = demux_serial.packet_serial(&clock);
                 let queue_len_before = video_pkt_tx.len();
                 if !pending_video_packets.is_empty()
                     && !drain_pending_video_packets(
@@ -3178,6 +3639,7 @@ fn run_decoder(
                                     pending_video_packet_bytes.saturating_sub(size_bytes);
                                 continue 'outer;
                             }
+                            DemuxPacketSend::AudioDisconnected => unreachable!(),
                         }
                         pending_video_packet_bytes =
                             pending_video_packet_bytes.saturating_sub(size_bytes);
@@ -3225,10 +3687,7 @@ fn run_decoder(
                 let send_t0 = std::time::Instant::now();
                 match send_demux_packet_seek_aware(
                     &video_pkt_tx,
-                    VideoPacketMsg::Packet {
-                        serial: seek_serial,
-                        packet,
-                    },
+                    video_packet_msg(packet, &demux_serial, &clock),
                     &clock,
                     &cancel,
                     "video",
@@ -3238,6 +3697,7 @@ fn run_decoder(
                     // video decode thread が既に終了している → 自分も exit。
                     DemuxPacketSend::Cancelled => break 'outer,
                     DemuxPacketSend::SeekPending => continue 'outer,
+                    DemuxPacketSend::AudioDisconnected => unreachable!(),
                 }
                 let wait_ms = send_t0.elapsed().as_secs_f64() * 1000.0;
                 if wait_ms >= DEMUX_PACKET_SEND_WAIT_WARN_MS {
@@ -3269,15 +3729,12 @@ fn run_decoder(
                     let packet_pts = audio_time_base_for_demux.and_then(|(tb_num, tb_den)| {
                         packet_timestamp(&packet).map(|pts| (pts as f64) * tb_num / tb_den)
                     });
-                    let seek_serial = clock.current_seek_serial();
+                    let seek_serial = demux_serial.packet_serial(&clock);
                     let queue_len_before = audio_pkt_tx.len();
                     let send_t0 = std::time::Instant::now();
                     match send_audio_packet_with_video_drain(
                         &audio_pkt_tx,
-                        AudioPacketMsg::Packet {
-                            serial: seek_serial,
-                            packet,
-                        },
+                        audio_packet_msg(packet, &demux_serial, &clock),
                         &clock,
                         &cancel,
                         &mut pending_video_packets,
@@ -3285,11 +3742,34 @@ fn run_decoder(
                         &video_pkt_tx,
                     ) {
                         DemuxPacketSend::Sent => {}
-                        // audio decode thread が既に終了している (= disconnect)。
-                        // VideoPlayer の shutdown 経路 → 自分も exit。
+                        // cancel or video drain failure keeps the terminal path.
                         DemuxPacketSend::Cancelled => break 'outer,
                         DemuxPacketSend::SeekPending => continue 'outer,
+                        DemuxPacketSend::AudioDisconnected => {
+                            if cancel.load(Ordering::Acquire) {
+                                break 'outer;
+                            }
+                            detach_audio_lane(
+                                &mut audio_stream_idx_for_demux,
+                                &mut audio_time_base_for_demux,
+                                &clock,
+                                audio_track_selection.as_deref(),
+                                &mut pending_audio_inactive,
+                                &engine_event_tx,
+                                video_stream_idx.is_some(),
+                                &cancel,
+                            );
+                            if video_stream_idx.is_none() {
+                                break 'outer;
+                            }
+                            crate::logger::log(
+                                "[demux] audio lane lost during packet send; continuing video",
+                            );
+                            continue 'outer;
+                        }
                     }
+                    #[cfg(test)]
+                    clock.wait_after_audio_packet_for_test();
                     let wait_ms = send_t0.elapsed().as_secs_f64() * 1000.0;
                     if wait_ms >= DEMUX_PACKET_SEND_WAIT_WARN_MS {
                         emit_demux_packet_send_wait(
@@ -3318,14 +3798,16 @@ fn run_decoder(
             // EOF 確定。スレッドは終わらせず、cancel か新しい seek 要求が来るまで
             // idle ループで待つ。これで末尾停止後の re-seek / replay が
             // decoder 再生成なしで動作する。
-            clock.notify_eof_reached();
+            clock.notify_demux_exhausted();
             engine_event_tx.wake_ui();
             // Phase A: audio decode thread にも Eof を通知して残フレームを drain させる。
             // (= 末尾の音声を確実に出し切る。drain しないと数十 ms の音声が抜ける。)
             if audio_stream_idx_for_demux.is_some() {
                 let _ = send_demux_msg_cancel_aware(
                     &audio_pkt_tx,
-                    AudioPacketMsg::Eof,
+                    AudioPacketMsg::Eof {
+                        serial: demux_serial.packet_serial(&clock),
+                    },
                     &cancel,
                     "audio",
                     "eof",
@@ -3350,8 +3832,41 @@ fn run_decoder(
                     crate::logger::log(format!("video decoder finished: {}", path.display()));
                     break 'outer;
                 }
+                if audio_stream_idx_for_demux.is_some() && clock.audio_worker_exited() {
+                    detach_audio_lane(
+                        &mut audio_stream_idx_for_demux,
+                        &mut audio_time_base_for_demux,
+                        &clock,
+                        audio_track_selection.as_deref(),
+                        &mut pending_audio_inactive,
+                        &engine_event_tx,
+                        video_stream_idx.is_some(),
+                        &cancel,
+                    );
+                    if video_stream_idx.is_none() {
+                        break 'outer;
+                    }
+                }
+                retry_audio_inactive(&mut pending_audio_inactive, &engine_event_tx);
+                if pending_audio_inactive.is_none() {
+                    if let Some((pending_serial, pending_pts)) = pending_seek_completed {
+                        if pending_serial != clock.current_seek_serial() {
+                            pending_seek_completed = None;
+                        } else if engine_event_tx
+                            .try_send(crate::video::engine::EngineEvent::Decoder(
+                                crate::video::engine::state::DecoderEvent::SeekCompleted {
+                                    epoch: pending_serial,
+                                    actual_pts: pending_pts,
+                                },
+                            ))
+                            .is_ok()
+                        {
+                            pending_seek_completed = None;
+                        }
+                    }
+                }
                 if clock.peek_seek_request_pending() {
-                    clock.clear_eof_reached();
+                    clock.clear_demux_exhausted();
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
@@ -3704,7 +4219,7 @@ fn run_video_decode(
                 }
                 VideoDecodeInput::Packet(VideoPacketMsg::Packet { serial, packet }) => {
                     let live_seek_serial = clock.current_seek_serial();
-                    if serial != current_seek_serial || serial != live_seek_serial {
+                    if !packet_matches_seek(serial, current_seek_serial, &clock) {
                         stale_drop_burst_count = stale_drop_burst_count.saturating_add(1);
                         if crate::perf::is_enabled() {
                             let reason = if serial != live_seek_serial {
@@ -5464,9 +5979,10 @@ fn run_audio_decode(
     let mut current_seek_target_secs: Option<f64> = None;
     // Some codecs, notably WMA Pro in ASF/WMV, emit one correctly timestamped
     // frame followed by several decoded frames with pts/best_effort_timestamp
-    // reset to 0. Keep a monotonic synthetic cursor per seek generation so the
-    // audio clock and video pacing do not get pinned to zero.
-    let mut next_audio_pts_secs: Option<f64> = None;
+    // reset to 0. Track accepted input separately from emitted samples so swr
+    // delay cannot leak into a new seek or create gaps between output frames.
+    let mut resample_timeline = AudioResampleTimeline::default();
+    log_audio_resample_boundary("open", &setup, current_seek_serial, &resample_timeline, 0);
     let mut pause_park_last_log: Option<std::time::Instant> = None;
 
     'outer: loop {
@@ -5561,26 +6077,46 @@ fn run_audio_decode(
                 serial,
                 seek_target_secs,
                 trim_before_secs,
+                replace_setup,
             }) => {
+                log_audio_resample_boundary(
+                    "seek_flush_before",
+                    &setup,
+                    current_seek_serial,
+                    &resample_timeline,
+                    0,
+                );
+                if let Some(new_setup) = replace_setup {
+                    let old_setup = std::mem::replace(&mut setup, *new_setup);
+                    drop(old_setup);
+                }
                 setup.decoder.flush();
                 current_seek_serial = serial;
                 drop_before_secs = trim_before_secs;
                 current_seek_target_secs = seek_target_secs;
-                next_audio_pts_secs = None;
+                if let Err(error) = reset_audio_resampler(&mut setup) {
+                    crate::logger::log(format!(
+                        "[audio-decode] resampler seek reset failed: serial={serial} error={error}"
+                    ));
+                    break 'outer;
+                }
+                resample_timeline = AudioResampleTimeline::default();
+                log_audio_resample_boundary(
+                    "seek_reset_codec_swr",
+                    &setup,
+                    serial,
+                    &resample_timeline,
+                    0,
+                );
             }
-            AudioDecodeInput::Packet(AudioPacketMsg::Eof) => {
+            AudioDecodeInput::Packet(AudioPacketMsg::Eof { serial }) => {
+                if !packet_matches_seek(serial, current_seek_serial, &clock) {
+                    continue;
+                }
                 // 残フレーム drain: send_eof + receive_frame ループで decoder 内の
                 // 残サンプルを最後まで取り出して送る。これにより末尾の数十 ms が
                 // 抜けない。FFmpeg の API では NULL packet で EOF flush を伝える。
                 //
-                // ⚠️ resampler 側 (`setup.resampler.flush()`) はここでは呼ばない。
-                // emit_audio_frame の pre-alloc 修正により swr 内部 delay は
-                // SAFETY=32 sample (= 0.7ms @ 44.1kHz) 以下で安定するため、
-                // EOF 残留 sample も同オーダーで体感不可能。flush するには
-                // emit_audio_frame の送信処理 (preroll trim / serial check /
-                // AudioFrame 送出ループ) を helper に分離する大規模 refactor が
-                // 必要なので費用対効果が悪い。将来 emit パスを整理する機会が
-                // あれば併せて入れる。
                 use ffmpeg_the_third::ffi::avcodec_send_packet;
                 unsafe {
                     let _ = avcodec_send_packet(setup.decoder.as_mut_ptr(), std::ptr::null());
@@ -5597,20 +6133,37 @@ fn run_audio_decode(
                         current_seek_serial,
                         current_seek_target_secs,
                         None,
-                        &mut next_audio_pts_secs,
+                        &mut resample_timeline,
                         &clock,
                         &audio_tx,
                         &engine_state,
+                        &cancel,
                     ) {
                         break 'outer;
                     }
                 }
+                if !drain_audio_resampler(
+                    &mut setup,
+                    &mut resample_timeline,
+                    &mut drop_before_secs,
+                    current_seek_serial,
+                    current_seek_target_secs,
+                    &clock,
+                    &audio_tx,
+                    &engine_state,
+                    &cancel,
+                    "eos",
+                ) {
+                    break 'outer;
+                }
+                // Decoded EOS includes codec and resampler output committed to the pump channel.
+                clock.note_audio_decoded_eos(serial);
                 // EOF 後 decoder を flush して次回の Packet/Flush に備える。
                 setup.decoder.flush();
             }
             AudioDecodeInput::Packet(AudioPacketMsg::Packet { serial, packet }) => {
                 let live_seek_serial = clock.current_seek_serial();
-                if serial != current_seek_serial || serial != live_seek_serial {
+                if !packet_matches_seek(serial, current_seek_serial, &clock) {
                     if crate::perf::is_enabled() {
                         crate::perf::event(
                             "audio",
@@ -5701,10 +6254,11 @@ fn run_audio_decode(
                         current_seek_serial,
                         current_seek_target_secs,
                         Some(packet_decode_t0.elapsed().as_secs_f64() * 1000.0),
-                        &mut next_audio_pts_secs,
+                        &mut resample_timeline,
                         &clock,
                         &audio_tx,
                         &engine_state,
+                        &cancel,
                     ) {
                         break 'outer;
                     }
@@ -5743,6 +6297,240 @@ fn resample_output_buffer_samples(
     (rate_converted + delay_out_samples + safety) as usize
 }
 
+/// One worker-owned sample timeline. Input timestamps describe decoded input,
+/// while output timestamps describe samples already released by swr.
+#[derive(Default)]
+struct AudioResampleTimeline(Option<AudioResamplePosition>);
+
+struct AudioResamplePosition {
+    expected_input_end: f64,
+    next_output: f64,
+}
+
+#[derive(Clone, Copy)]
+struct AudioInputTiming {
+    pts_secs: f64,
+    synthesized: bool,
+    discontinuity: bool,
+}
+
+impl AudioResampleTimeline {
+    fn input_timing(&self, raw: Option<f64>, timestamp_quantum_secs: f64) -> AudioInputTiming {
+        let Some(position) = self.0.as_ref() else {
+            return AudioInputTiming {
+                pts_secs: raw.unwrap_or(0.0),
+                synthesized: raw.is_none(),
+                discontinuity: false,
+            };
+        };
+        // Container timestamps may round each frame to a declared time-base tick.
+        // This tolerance comes from that precision, not an arbitrary wall-time guard.
+        let quantum = timestamp_quantum_secs.abs();
+        let tolerance = quantum + f64::EPSILON * position.expected_input_end.abs().max(1.0) * 4.0;
+        match raw {
+            Some(pts) if pts > position.expected_input_end + tolerance => AudioInputTiming {
+                pts_secs: pts,
+                synthesized: false,
+                discontinuity: true,
+            },
+            Some(pts) if pts >= position.expected_input_end - tolerance => AudioInputTiming {
+                pts_secs: position.expected_input_end,
+                synthesized: false,
+                discontinuity: false,
+            },
+            // WMA Pro can repeat zero timestamps after its first valid frame.
+            _ => AudioInputTiming {
+                pts_secs: position.expected_input_end,
+                synthesized: true,
+                discontinuity: false,
+            },
+        }
+    }
+
+    fn accept_input(&mut self, timing: AudioInputTiming, frames: usize, input_rate: u32) {
+        let position = self.0.get_or_insert(AudioResamplePosition {
+            expected_input_end: timing.pts_secs,
+            next_output: timing.pts_secs,
+        });
+        position.expected_input_end = timing.pts_secs + frames as f64 / input_rate as f64;
+    }
+
+    fn output_pts(&self) -> Option<f64> {
+        self.0.as_ref().map(|position| position.next_output)
+    }
+
+    fn advance_output(&mut self, frames: usize, output_rate: u32) {
+        let position = self
+            .0
+            .as_mut()
+            .expect("output follows accepted audio input");
+        position.next_output += frames as f64 / output_rate as f64;
+    }
+}
+
+fn reset_audio_resampler(setup: &mut AudioSetup) -> Result<(), ffmpeg_the_third::Error> {
+    // The audio worker exclusively owns this initialized context. FFmpeg permits
+    // close/init with the same configured layouts/rates, discarding sample history.
+    let result = unsafe {
+        let context = setup.resampler.as_mut_ptr();
+        ffmpeg_the_third::ffi::swr_close(context);
+        ffmpeg_the_third::ffi::swr_init(context)
+    };
+    if result < 0 {
+        Err(ffmpeg_the_third::Error::from(result))
+    } else {
+        Ok(())
+    }
+}
+
+fn audio_resampler_delay_frames(setup: &AudioSetup, rate: u32) -> i64 {
+    // Context::delay() queries with base=1 and rounds a subsecond delay to zero.
+    // Read in sample units for allocation and diagnostics instead.
+    unsafe {
+        ffmpeg_the_third::ffi::swr_get_delay(setup.resampler.as_ptr() as *mut _, i64::from(rate))
+    }
+}
+
+fn log_audio_resample_boundary(
+    event: &'static str,
+    setup: &AudioSetup,
+    serial: u64,
+    timeline: &AudioResampleTimeline,
+    flushed_frames: usize,
+) {
+    let input_end = timeline
+        .0
+        .as_ref()
+        .map(|position| position.expected_input_end);
+    let output_end = timeline.output_pts();
+    let input_delay = audio_resampler_delay_frames(setup, setup.input_rate);
+    let output_delay = audio_resampler_delay_frames(setup, setup.out_rate);
+    crate::logger::log(format!(
+        "[audio-decode] resampler {event}: serial={serial} stream={} input_rate={} output_rate={} flushed_frames={flushed_frames} input_end={input_end:?} output_end={output_end:?} filter_delay_input_frames={input_delay} filter_delay_output_frames={output_delay}",
+        setup.stream_idx, setup.input_rate, setup.out_rate,
+    ));
+    if crate::perf::is_enabled() {
+        crate::perf::event(
+            "audio",
+            event,
+            None,
+            serial,
+            &[
+                ("serial", serde_json::Value::from(serial)),
+                ("stream_index", serde_json::Value::from(setup.stream_idx)),
+                ("input_rate", serde_json::Value::from(setup.input_rate)),
+                ("output_rate", serde_json::Value::from(setup.out_rate)),
+                ("flushed_frames", serde_json::Value::from(flushed_frames)),
+                (
+                    "input_end",
+                    input_end
+                        .map(serde_json::Value::from)
+                        .unwrap_or(serde_json::Value::Null),
+                ),
+                (
+                    "output_end",
+                    output_end
+                        .map(serde_json::Value::from)
+                        .unwrap_or(serde_json::Value::Null),
+                ),
+                (
+                    "filter_delay_input_frames",
+                    serde_json::Value::from(input_delay),
+                ),
+                (
+                    "filter_delay_output_frames",
+                    serde_json::Value::from(output_delay),
+                ),
+            ],
+        );
+    }
+}
+
+fn drain_audio_resampler(
+    setup: &mut AudioSetup,
+    timeline: &mut AudioResampleTimeline,
+    drop_before_secs: &mut Option<f64>,
+    serial: u64,
+    seek_target_secs: Option<f64>,
+    clock: &AvClock,
+    audio_tx: &Sender<AudioFrame>,
+    engine_state: &std::sync::atomic::AtomicU8,
+    cancel: &AtomicBool,
+    boundary: &'static str,
+) -> bool {
+    use ffmpeg_the_third::format::sample::{Sample, Type as SampleType};
+    use ffmpeg_the_third::util::frame::audio::Audio;
+    if cancel.load(Ordering::Acquire) {
+        return false;
+    }
+    let mut flushed_frames = 0;
+    // The same-rate multichannel fast path never sends input to swr.
+    if setup.fast_downmix.is_none() && timeline.output_pts().is_some() {
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                return false;
+            }
+            if clock.current_seek_serial() != serial {
+                return true;
+            }
+            let emit_t0 = std::time::Instant::now();
+            let capacity = audio_resampler_delay_frames(setup, setup.out_rate).max(0) as usize + 32;
+            let mut output = Audio::empty();
+            unsafe {
+                output.alloc(
+                    Sample::F32(SampleType::Packed),
+                    capacity,
+                    ffmpeg_the_third::ChannelLayoutMask::STEREO,
+                );
+                output.set_rate(setup.out_rate);
+            }
+            if let Err(error) = setup.resampler.flush(&mut output) {
+                crate::logger::log(format!(
+                    "[audio-decode] resampler {boundary} drain failed: serial={serial} error={error}"
+                ));
+                return false;
+            }
+            let frames = output.samples();
+            if frames == 0 {
+                break;
+            }
+            // Packed stereo f32 contains exactly frames*2 elements; omit alignment padding.
+            let samples = unsafe {
+                let data = (*output.as_ptr()).data[0] as *const f32;
+                std::slice::from_raw_parts(data, frames * 2).to_vec()
+            };
+            let pts_secs = timeline.output_pts().expect("resampler has accepted input");
+            timeline.advance_output(frames, setup.out_rate);
+            flushed_frames += frames;
+            let convert_ms = emit_t0.elapsed().as_secs_f64() * 1000.0;
+            if !emit_audio_samples(
+                setup,
+                ConvertedAudio {
+                    samples,
+                    pts_secs,
+                    raw_pts_secs: None,
+                    pts_synthesized: true,
+                    audio_path: "swr_flush",
+                    decode_wait_ms: None,
+                    convert_ms,
+                    emit_t0,
+                },
+                drop_before_secs,
+                serial,
+                seek_target_secs,
+                clock,
+                audio_tx,
+                engine_state,
+                cancel,
+            ) {
+                return false;
+            }
+        }
+    }
+    log_audio_resample_boundary(boundary, setup, serial, timeline, flushed_frames);
+    true
+}
+
 fn emit_audio_frame(
     setup: &mut AudioSetup,
     frame: &mut ffmpeg_the_third::util::frame::audio::Audio,
@@ -5750,147 +6538,221 @@ fn emit_audio_frame(
     current_seek_serial: u64,
     current_seek_target_secs: Option<f64>,
     decode_wait_ms: Option<f64>,
-    next_audio_pts_secs: &mut Option<f64>,
+    resample_timeline: &mut AudioResampleTimeline,
     clock: &AvClock,
     audio_tx: &Sender<AudioFrame>,
     engine_state: &std::sync::atomic::AtomicU8,
+    cancel: &AtomicBool,
 ) -> bool {
     use ffmpeg::format::sample::{Sample, Type as SampleType};
     use ffmpeg::util::frame::audio::Audio;
     use ffmpeg_the_third as ffmpeg;
 
+    if cancel.load(Ordering::Acquire) {
+        return false;
+    }
     let emit_t0 = std::time::Instant::now();
     let raw_pts_secs = audio_frame_timestamp(frame)
         .map(|pts| (pts as f64) * setup.time_base_num / setup.time_base_den);
-    let mut pts_synthesized = false;
-    let mut pts_secs = match (*next_audio_pts_secs, raw_pts_secs) {
-        (Some(next), Some(raw)) if raw + 0.001 >= next => raw,
-        (Some(next), _) => {
-            pts_synthesized = true;
-            next
+    let input_timing =
+        resample_timeline.input_timing(raw_pts_secs, setup.time_base_num / setup.time_base_den);
+    if input_timing.discontinuity {
+        // Old filter history belongs before the source gap. Emit it there, then
+        // start the new input segment with a clean converter and timeline.
+        if !drain_audio_resampler(
+            setup,
+            resample_timeline,
+            drop_before_secs,
+            current_seek_serial,
+            current_seek_target_secs,
+            clock,
+            audio_tx,
+            engine_state,
+            cancel,
+            "source_gap",
+        ) {
+            return false;
         }
-        (None, Some(raw)) => raw,
-        (None, None) => {
-            pts_synthesized = true;
-            0.0
+        if let Err(error) = reset_audio_resampler(setup) {
+            crate::logger::log(format!(
+                "[audio-decode] resampler source-gap reset failed: serial={current_seek_serial} error={error}"
+            ));
+            return false;
         }
-    };
+        *resample_timeline = AudioResampleTimeline::default();
+    }
     const CHANNELS: usize = 2;
     let convert_t0 = std::time::Instant::now();
-    let (mut samples, audio_path): (Vec<f32>, &'static str) =
-        if let Some(downmix) = &setup.fast_downmix {
-            match downmix.run(frame) {
-                Some(samples) => (samples, "fast_downmix"),
-                None => return true,
-            }
-        } else {
-            // resampler は `setup` 構築時に正規化済みレイアウトで作られている。
-            // 各 frame の `ch_layout` も未指定なら同じ正規化を適用し、resampler が
-            // 期待する入力レイアウトと一致させる (mono を stereo 扱いするとチャンネル
-            // 解釈ミス / swr_convert_frame エラーになる)。
-            let (frame_layout, frame_layout_substituted) =
-                normalize_audio_input_layout(frame.ch_layout());
-            if frame_layout_substituted {
-                frame.set_ch_layout(frame_layout);
-            }
-            // ⚠️ output frame を **正しいサイズ**で pre-allocate する。
-            //
-            // ffmpeg-the-third 3.0.2 の `Context::run()` は `output.is_empty()` の
-            // ときに `output.alloc(format, input.samples(), layout)` で確保するが、
-            // これは入力サンプル数を出力サンプル数として使っており、サンプル
-            // レート変換 (例: 32kHz AAC → 44.1kHz) で不足する。32k→44.1k の
-            // 場合、本来 1024 * 44100 / 32000 ≈ 1411 samples 必要だが 1024 しか
-            // 確保されず、約 27% (= 1 - in_rate/out_rate) のサンプルが swr
-            // 内部 delay に取り残される。これが累積し audio buffer が想定より
-            // 早く尽きて、動画末尾が無音になる。
-            //
-            // ここで標準 FFmpeg パターン (av_rescale_rnd 相当) で
-            //   out_samples = ceil(in_samples * out_rate / in_rate) + delay_output + safety
-            // を計算し、`av_frame_get_buffer` 済みの output を渡すことで
-            // `Context::run()` の誤った alloc 経路をスキップする。
-            //
-            // ⚠️ `Delay::output` は **既に出力サンプル単位** なので、レート換算
-            // (`* out_rate / in_rate`) を**かけずに**そのまま加算する。
-            // 過去の実装で `(in_samples + delay_output) * out_rate / in_rate` と
-            // していたが、これは delay を out_rate/in_rate 倍してしまう誤りで、
-            // upsample (32k→44.1k) では過大確保で偶然安全側、downsample
-            // (96k→44.1k) では過小見積もりとなり swr 内部 delay にサンプルが
-            // 残る危険があった (Codex 指摘)。
-            let in_samples = frame.samples();
-            if in_samples == 0 {
-                // 入力 0 サンプル frame は av_frame_get_buffer が失敗する。
-                // PTS 維持だけ next に伝えて即 return。
-                *next_audio_pts_secs = Some(pts_secs);
-                return true;
-            }
-            let delay_out_samples = setup
-                .resampler
-                .delay()
-                .map(|d| d.output.max(0) as u64)
-                .unwrap_or(0);
-            // SAFETY margin: swr 位相補間の丸め誤差吸収用。32 sample / 44.1kHz
-            // = 0.7ms 相当で十分なバッファ。
-            const SWR_OUTPUT_SAFETY_SAMPLES: u64 = 32;
-            let out_samples = resample_output_buffer_samples(
-                in_samples as u64,
-                setup.input_rate,
-                setup.out_rate,
-                delay_out_samples,
-                SWR_OUTPUT_SAFETY_SAMPLES,
+    let (samples, audio_path): (Vec<f32>, &'static str) = if let Some(downmix) = &setup.fast_downmix
+    {
+        match downmix.run(frame) {
+            Some(samples) => (samples, "fast_downmix"),
+            None => return true,
+        }
+    } else {
+        // resampler は `setup` 構築時に正規化済みレイアウトで作られている。
+        // 各 frame の `ch_layout` も未指定なら同じ正規化を適用し、resampler が
+        // 期待する入力レイアウトと一致させる (mono を stereo 扱いするとチャンネル
+        // 解釈ミス / swr_convert_frame エラーになる)。
+        let (frame_layout, frame_layout_substituted) =
+            normalize_audio_input_layout(frame.ch_layout());
+        if frame_layout_substituted {
+            frame.set_ch_layout(frame_layout);
+        }
+        // ⚠️ output frame を **正しいサイズ**で pre-allocate する。
+        //
+        // ffmpeg-the-third 3.0.2 の `Context::run()` は `output.is_empty()` の
+        // ときに `output.alloc(format, input.samples(), layout)` で確保するが、
+        // これは入力サンプル数を出力サンプル数として使っており、サンプル
+        // レート変換 (例: 32kHz AAC → 44.1kHz) で不足する。32k→44.1k の
+        // 場合、本来 1024 * 44100 / 32000 ≈ 1411 samples 必要だが 1024 しか
+        // 確保されず、約 27% (= 1 - in_rate/out_rate) のサンプルが swr
+        // 内部 delay に取り残される。これが累積し audio buffer が想定より
+        // 早く尽きて、動画末尾が無音になる。
+        //
+        // ここで標準 FFmpeg パターン (av_rescale_rnd 相当) で
+        //   out_samples = ceil(in_samples * out_rate / in_rate) + delay_output + safety
+        // を計算し、`av_frame_get_buffer` 済みの output を渡すことで
+        // `Context::run()` の誤った alloc 経路をスキップする。
+        //
+        // ⚠️ `Delay::output` は **既に出力サンプル単位** なので、レート換算
+        // (`* out_rate / in_rate`) を**かけずに**そのまま加算する。
+        // 過去の実装で `(in_samples + delay_output) * out_rate / in_rate` と
+        // していたが、これは delay を out_rate/in_rate 倍してしまう誤りで、
+        // upsample (32k→44.1k) では過大確保で偶然安全側、downsample
+        // (96k→44.1k) では過小見積もりとなり swr 内部 delay にサンプルが
+        // 残る危険があった (Codex 指摘)。
+        let in_samples = frame.samples();
+        if in_samples == 0 {
+            // No input is accepted by swr for an empty frame.
+            return true;
+        }
+        let delay_out_samples = audio_resampler_delay_frames(setup, setup.out_rate).max(0) as u64;
+        // SAFETY margin: swr 位相補間の丸め誤差吸収用。32 sample / 44.1kHz
+        // = 0.7ms 相当で十分なバッファ。
+        const SWR_OUTPUT_SAFETY_SAMPLES: u64 = 32;
+        let out_samples = resample_output_buffer_samples(
+            in_samples as u64,
+            setup.input_rate,
+            setup.out_rate,
+            delay_out_samples,
+            SWR_OUTPUT_SAFETY_SAMPLES,
+        );
+        let mut resampled = Audio::empty();
+        unsafe {
+            resampled.alloc(
+                Sample::F32(SampleType::Packed),
+                out_samples,
+                ffmpeg::ChannelLayoutMask::STEREO,
             );
-            let mut resampled = Audio::empty();
-            unsafe {
-                resampled.alloc(
-                    Sample::F32(SampleType::Packed),
-                    out_samples,
-                    ffmpeg::ChannelLayoutMask::STEREO,
-                );
-                resampled.set_rate(setup.out_rate);
-            }
-            if let Err(e) = setup.resampler.run(frame, &mut resampled) {
-                crate::logger::log(format!("swr resample: {e}"));
-                return true; // 1 frame 失敗は致命的でない
-            }
-            // 1 plane (packed) の f32 を取り出す。
-            //
-            // ⚠️ **`data(0)` は使わない**。`data(0)` が返すスライスは
-            // ffmpeg-the-third の `linesize[0]` ベースで、SIMD アラインメント
-            // のため **実サンプル数より大きいバイト列を返す**。
-            // `chunks_exact(4)` で f32 化すると末尾のパディング
-            // (未初期化メモリ or 0) も f32 として再生してしまい、
-            // 強い "ブチブチ" ノイズの原因になる。
-            //
-            // door_player と同じく `(*frame.as_ptr()).data[0]` を直接 `*const f32`
-            // としてキャストし、要素数 = `samples * channels` (= 実サンプル数)
-            // を指定して `from_raw_parts` でスライス化する。これにより
-            // FFmpeg の linesize パディングを完全にスキップできる。
-            //
-            // SAFETY:
-            //   - resampled は packed format (Sample::F32(Type::Packed))
-            //   - data[0] は frame の生存中有効
-            //   - samples * channels * sizeof(f32) バイトは確実にアロケート済み
-            //   - resampler.run() の出力なので i32 オーバーフローは起きない
-            let nb_samples = resampled.samples();
-            if nb_samples == 0 {
-                // 解像度の都合等で 0 サンプルが返ることがある (resample のラグ)。
-                // raw pointer dereference を避けて早期 return。
-                return true;
-            }
-            // ランタイム不変条件チェック (Codex P3): resampler の出力が
-            // 期待通り f32 packed であること。デバッグ時に format/layout
-            // を取り違えていれば即座に panic で気付ける。
-            debug_assert_eq!(resampled.format(), Sample::F32(SampleType::Packed));
-            debug_assert!(resampled.is_packed());
-            let element_count = nb_samples * CHANNELS;
-            let samples = unsafe {
-                let raw_ptr = (*resampled.as_ptr()).data[0] as *const f32;
-                debug_assert!(!raw_ptr.is_null());
-                std::slice::from_raw_parts(raw_ptr, element_count).to_vec()
-            };
-            (samples, "swr")
+            resampled.set_rate(setup.out_rate);
+        }
+        if let Err(e) = setup.resampler.run(frame, &mut resampled) {
+            crate::logger::log(format!("swr resample: {e}"));
+            return true; // 1 frame 失敗は致命的でない
+        }
+        // 1 plane (packed) の f32 を取り出す。
+        //
+        // ⚠️ **`data(0)` は使わない**。`data(0)` が返すスライスは
+        // ffmpeg-the-third の `linesize[0]` ベースで、SIMD アラインメント
+        // のため **実サンプル数より大きいバイト列を返す**。
+        // `chunks_exact(4)` で f32 化すると末尾のパディング
+        // (未初期化メモリ or 0) も f32 として再生してしまい、
+        // 強い "ブチブチ" ノイズの原因になる。
+        //
+        // door_player と同じく `(*frame.as_ptr()).data[0]` を直接 `*const f32`
+        // としてキャストし、要素数 = `samples * channels` (= 実サンプル数)
+        // を指定して `from_raw_parts` でスライス化する。これにより
+        // FFmpeg の linesize パディングを完全にスキップできる。
+        //
+        // SAFETY:
+        //   - resampled は packed format (Sample::F32(Type::Packed))
+        //   - data[0] は frame の生存中有効
+        //   - samples * channels * sizeof(f32) バイトは確実にアロケート済み
+        //   - resampler.run() の出力なので i32 オーバーフローは起きない
+        let nb_samples = resampled.samples();
+        if nb_samples == 0 {
+            resample_timeline.accept_input(input_timing, frame.samples(), setup.input_rate);
+            return true;
+        }
+        // ランタイム不変条件チェック (Codex P3): resampler の出力が
+        // 期待通り f32 packed であること。デバッグ時に format/layout
+        // を取り違えていれば即座に panic で気付ける。
+        debug_assert_eq!(resampled.format(), Sample::F32(SampleType::Packed));
+        debug_assert!(resampled.is_packed());
+        let element_count = nb_samples * CHANNELS;
+        let samples = unsafe {
+            let raw_ptr = (*resampled.as_ptr()).data[0] as *const f32;
+            debug_assert!(!raw_ptr.is_null());
+            std::slice::from_raw_parts(raw_ptr, element_count).to_vec()
         };
+        (samples, "swr")
+    };
     let convert_ms = convert_t0.elapsed().as_secs_f64() * 1000.0;
+    resample_timeline.accept_input(input_timing, frame.samples(), setup.input_rate);
+    let pts_secs = resample_timeline
+        .output_pts()
+        .expect("accepted audio input");
+    resample_timeline.advance_output(samples.len() / CHANNELS, setup.out_rate);
+    emit_audio_samples(
+        setup,
+        ConvertedAudio {
+            samples,
+            pts_secs,
+            raw_pts_secs,
+            pts_synthesized: input_timing.synthesized,
+            audio_path,
+            decode_wait_ms,
+            convert_ms,
+            emit_t0,
+        },
+        drop_before_secs,
+        current_seek_serial,
+        current_seek_target_secs,
+        clock,
+        audio_tx,
+        engine_state,
+        cancel,
+    )
+}
 
+struct ConvertedAudio {
+    samples: Vec<f32>,
+    pts_secs: f64,
+    raw_pts_secs: Option<f64>,
+    pts_synthesized: bool,
+    audio_path: &'static str,
+    decode_wait_ms: Option<f64>,
+    convert_ms: f64,
+    emit_t0: std::time::Instant,
+}
+
+/// Both ordinary conversion and EOS use the same trim, generation and channel accounting.
+fn emit_audio_samples(
+    setup: &AudioSetup,
+    converted: ConvertedAudio,
+    drop_before_secs: &mut Option<f64>,
+    current_seek_serial: u64,
+    current_seek_target_secs: Option<f64>,
+    clock: &AvClock,
+    audio_tx: &Sender<AudioFrame>,
+    engine_state: &std::sync::atomic::AtomicU8,
+    cancel: &AtomicBool,
+) -> bool {
+    if cancel.load(Ordering::Acquire) {
+        return false;
+    }
+    let ConvertedAudio {
+        mut samples,
+        mut pts_secs,
+        raw_pts_secs,
+        pts_synthesized,
+        audio_path,
+        decode_wait_ms,
+        convert_ms,
+        emit_t0,
+    } = converted;
+    const CHANNELS: usize = 2;
     // post-seek preroll の trim:
     // avformat_seek は keyframe に戻るので、target_secs 未満の
     // 音声フレームが届く。完全に target 前ならフレーム破棄、
@@ -5899,7 +6761,6 @@ fn emit_audio_frame(
         let frame_secs = (samples.len() / CHANNELS) as f64 / setup.out_rate as f64;
         if pts_secs + frame_secs <= min {
             // 完全に target 前 → 捨てる
-            *next_audio_pts_secs = Some(pts_secs + frame_secs);
             return true;
         }
         if pts_secs < min {
@@ -5919,7 +6780,9 @@ fn emit_audio_frame(
     // 1 stereo pair = 2 float (samples_per_sec stereo = setup.out_rate * 2)
     let frame_sample_pairs = samples.len() / CHANNELS;
     let duration_secs = frame_sample_pairs as f64 / setup.out_rate as f64;
-    *next_audio_pts_secs = Some(pts_secs + duration_secs);
+    if cancel.load(Ordering::Acquire) {
+        return false;
+    }
     if clock.current_seek_serial() != current_seek_serial {
         if crate::perf::is_enabled() {
             crate::perf::event(
@@ -5953,6 +6816,7 @@ fn emit_audio_frame(
         samples,
         pts_secs,
         seek_serial: current_seek_serial,
+        stream_index: setup.stream_idx,
         duration_secs,
         queued_wall_secs,
         audio_tx_accounting_epoch,
@@ -5965,6 +6829,10 @@ fn emit_audio_frame(
     let mut last_send_wait_log = send_t0;
     let mut pending_frame = Some(frame_out);
     loop {
+        if cancel.load(Ordering::Acquire) {
+            clock.add_audio_tx_queued_secs_for_epoch(-queued_wall_secs, audio_tx_accounting_epoch);
+            return false;
+        }
         if clock.current_seek_serial() != current_seek_serial {
             clock.add_audio_tx_queued_secs_for_epoch(-queued_wall_secs, audio_tx_accounting_epoch);
             if crate::perf::is_enabled() {
@@ -5993,44 +6861,18 @@ fn emit_audio_frame(
             return true;
         }
         let engine_st = engine_state.load(Ordering::Acquire);
-        if engine_state_parks_decode(engine_st) {
-            clock.add_audio_tx_queued_secs_for_epoch(-queued_wall_secs, audio_tx_accounting_epoch);
-            crate::logger::log(format!(
-                "[audio-decode] audio_tx send aborted for park: serial={current_seek_serial} pts={pts_secs:.3} audio_tx_len={} engine_state={} clock_playing={} clock_seeking={}",
-                audio_tx.len(),
-                engine_state_code_name(engine_st),
-                clock.is_playing(),
-                clock.is_seeking()
-            ));
-            if crate::perf::is_enabled() {
-                crate::perf::event(
-                    "audio",
-                    "frame_send_aborted_for_park",
-                    None,
-                    0,
-                    &[
-                        ("pts", serde_json::Value::from(pts_secs)),
-                        (
-                            "serial",
-                            serde_json::Value::from(current_seek_serial as i64),
-                        ),
-                        (
-                            "audio_tx_len",
-                            serde_json::Value::from(audio_tx.len() as i64),
-                        ),
-                        (
-                            "engine_state",
-                            serde_json::Value::from(engine_state_code_name(engine_st)),
-                        ),
-                    ],
-                );
-            }
-            return true;
-        }
+        // Pause/EOF parks future decode work, but this already converted frame
+        // still owns real PCM. Retain its single bounded pending send until the
+        // consumer resumes; only cancellation or a new seek discards it.
+        let send_wait = if engine_state_parks_decode(engine_st) {
+            std::time::Duration::from_millis(50)
+        } else {
+            std::time::Duration::from_millis(2)
+        };
         let frame = pending_frame
             .take()
             .expect("pending audio frame should exist before send_timeout");
-        match audio_tx.send_timeout(frame, std::time::Duration::from_millis(2)) {
+        match audio_tx.send_timeout(frame, send_wait) {
             Ok(()) => break,
             Err(crossbeam_channel::SendTimeoutError::Timeout(frame)) => {
                 pending_frame = Some(frame);
@@ -6495,6 +7337,100 @@ struct AudioSetup {
     resampler: ffmpeg_the_third::software::resampling::Context,
     codec_name: String,
     bit_rate_bps: i64,
+}
+
+/// Used at open and at track replacement. No routing state changes until the
+/// caller has also completed seek and delivered the replacement Flush.
+fn build_audio_setup(
+    input: &ffmpeg_the_third::format::context::Input,
+    stream_index: usize,
+    target_audio_sample_rate: u32,
+) -> Result<AudioSetup, String> {
+    use ffmpeg::format::sample::{Sample, Type as SampleType};
+    use ffmpeg::software::resampling::Context as ResampleContext;
+    use ffmpeg_the_third as ffmpeg;
+
+    let stream = input
+        .stream(stream_index)
+        .ok_or_else(|| format!("audio stream {stream_index} unavailable"))?;
+    let tb = stream.time_base();
+    let params = stream.parameters();
+    let bit_rate_bps = params.bit_rate();
+    crate::logger::log(format!(
+        "audio setup: -> Context::from_parameters (stream_idx={stream_index})"
+    ));
+    let mut ctx = ffmpeg::codec::context::Context::from_parameters(params)
+        .map_err(|e| format!("audio codec context failed: {e}"))?;
+    let codec_name = ctx.id().name().to_string();
+    let (container_channels, container_layout_desc) = audio_context_layout_summary(&ctx);
+    let stereo_requested = request_stereo_audio_decoder_output(
+        &mut ctx,
+        &codec_name,
+        container_channels,
+        &container_layout_desc,
+    );
+    crate::logger::log(format!(
+        "audio setup: -> ctx.decoder().audio() (codec={codec_name})"
+    ));
+    let mut decoder = ctx
+        .decoder()
+        .audio()
+        .map_err(|e| format!("audio decoder open failed: {e}"))?;
+    let in_fmt = decoder.format();
+    let input_rate = decoder.rate();
+    let (in_layout, layout_substituted) = normalize_audio_input_layout(decoder.ch_layout());
+    if layout_substituted {
+        crate::logger::log(format!(
+            "audio channel layout unspecified ({} ch); substituting default layout \"{}\"",
+            in_layout.channels(),
+            in_layout.description(),
+        ));
+        decoder.set_ch_layout(in_layout.clone());
+    }
+    let out_rate = target_audio_sample_rate;
+    let input_channels = in_layout.channels();
+    let input_layout_desc = in_layout.description();
+    let input_format = format!("{in_fmt:?}");
+    let stereo_effective = input_channels <= 2;
+    let fast_downmix = FastDownmixToStereo::new(in_fmt, &in_layout, input_rate, out_rate);
+    crate::logger::log(format!(
+        "audio setup: codec={codec_name} container_layout=\"{container_layout_desc}\" container_channels={container_channels} decoder_layout=\"{input_layout_desc}\" decoder_channels={input_channels} in_fmt={input_format} in_rate={input_rate} out_layout=stereo out_rate={out_rate} request_stereo={stereo_requested} request_effective={stereo_effective} fast_downmix={}",
+        fast_downmix.is_some()
+    ));
+    crate::logger::log(format!(
+        "audio setup: -> ResampleContext::get2 (in_fmt={input_format} in_rate={input_rate} out_rate={out_rate})"
+    ));
+    let result = ResampleContext::get2(
+        in_fmt,
+        in_layout,
+        input_rate,
+        Sample::F32(SampleType::Packed),
+        ffmpeg::ChannelLayout::STEREO,
+        out_rate,
+    );
+    crate::logger::log(format!(
+        "audio setup: <- ResampleContext::get2 ok={}",
+        result.is_ok()
+    ));
+    let resampler = result.map_err(|e| format!("audio resampler init failed: {e}"))?;
+    Ok(AudioSetup {
+        stream_idx: stream_index,
+        out_rate,
+        input_rate,
+        input_channels,
+        input_layout_desc,
+        input_format,
+        output_channels: 2,
+        decoder_stereo_requested: stereo_requested,
+        decoder_stereo_effective: stereo_effective,
+        fast_downmix,
+        time_base_num: tb.numerator() as f64,
+        time_base_den: tb.denominator() as f64,
+        decoder,
+        resampler,
+        codec_name,
+        bit_rate_bps,
+    })
 }
 
 /// FFmpeg の `get_format` callback が D3D11 を候補に出したかどうかを記録する。
@@ -8000,6 +8936,2298 @@ fn try_gpu_blit_path(
 }
 
 #[cfg(test)]
+mod audio_tail_seek_fixture_tests {
+    use super::{AudioResampleTimeline, DecodeHandles, VideoDynamicState, spawn};
+    use crate::video::clock::AvClock;
+    use crate::video::engine::actor::state_code;
+    use crate::video::{EngineEventSender, VideoUiWake};
+    use crossbeam_channel::{Receiver, bounded};
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    struct DecoderSession {
+        handles: DecodeHandles,
+        clock: Arc<AvClock>,
+        cancel: Arc<AtomicBool>,
+        events: Receiver<crate::video::engine::EngineEvent>,
+        output_rate: u32,
+    }
+
+    impl Drop for DecoderSession {
+        fn drop(&mut self) {
+            self.cancel.store(true, Ordering::Release);
+        }
+    }
+
+    impl DecoderSession {
+        fn open(name: &str, output_rate: u32) -> Self {
+            let clock = Arc::new(AvClock::new(1.0, Arc::new(AtomicU64::new(0))));
+            clock.set_playing(true);
+            let cancel = Arc::new(AtomicBool::new(false));
+            let (events_tx, events) = bounded(64);
+            let handles = spawn(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("testdata/audio-tail")
+                    .join(name),
+                clock.clone(),
+                cancel.clone(),
+                output_rate,
+                false,
+                crate::settings::VideoDeinterlaceMode::Off,
+                #[cfg(windows)]
+                None,
+                Arc::new(AtomicU8::new(state_code::PLAYING)),
+                EngineEventSender::new(events_tx, Arc::new(VideoUiWake::default())),
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(VideoDynamicState::default()),
+            );
+            let info = handles
+                .info_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("fixture metadata")
+                .expect("fixture open");
+            assert!(info.has_audio);
+            Self {
+                handles,
+                clock,
+                cancel,
+                events,
+                output_rate,
+            }
+        }
+
+        fn drain_generation(&self, serial: u64) -> Vec<f32> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut samples = Vec::new();
+            let mut expected_pts = 0.0;
+            loop {
+                for frame in self.handles.video_rx.try_iter() {
+                    self.clock.clear_seek_target_override(frame.seek_serial);
+                }
+                for _ in self.events.try_iter() {}
+                for frame in self.handles.audio_rx.try_iter() {
+                    self.clock.add_audio_tx_queued_secs_for_epoch(
+                        -frame.queued_wall_secs,
+                        frame.audio_tx_accounting_epoch,
+                    );
+                    assert_eq!(frame.seek_serial, serial, "stale decoded AudioFrame");
+                    assert!(
+                        (frame.pts_secs - expected_pts).abs() < 1e-9,
+                        "resampled output gap/overlap: serial={serial} pts={} expected={expected_pts}",
+                        frame.pts_secs,
+                    );
+                    expected_pts = frame.pts_secs + frame.duration_secs;
+                    self.clock.clear_seek_target_override(serial);
+                    // This test isolates decoder output. Its consumer acknowledges source
+                    // progress directly instead of opening an audio device or presenter.
+                    self.clock
+                        .set_audio_pts_jump(frame.pts_secs + frame.duration_secs);
+                    samples.extend(frame.samples);
+                }
+                if self.clock.audio_decoded_eos(serial) && self.handles.audio_rx.is_empty() {
+                    assert!(!samples.is_empty());
+                    assert_eq!(
+                        samples.len() / 2,
+                        self.output_rate as usize * 2,
+                        "complete two-second PCM"
+                    );
+                    assert!(
+                        (expected_pts - 2.0).abs() < 1e-9,
+                        "resampled end PTS={expected_pts}"
+                    );
+                    return samples;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "decoder EOS missing: serial={serial}"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    #[test]
+    fn audio_resample_timeline_uses_declared_timestamp_precision_and_output_counts() {
+        let mut timeline = AudioResampleTimeline::default();
+        // AAC-sized frames in a container with millisecond timestamps. The
+        // converter initially holds 16 output frames; input rounding must not
+        // create gaps in the output sample timeline.
+        for index in 0..8 {
+            let raw = (index as f64 * 1024.0 / 48_000.0 * 1000.0).round() / 1000.0;
+            let timing = timeline.input_timing(Some(raw), 0.001);
+            assert!(!timing.discontinuity);
+            assert!(!timing.synthesized);
+            timeline.accept_input(timing, 1024, 48_000);
+            let frames = if index == 0 { 925 } else { 941 };
+            let expected = if index == 0 {
+                0
+            } else {
+                925 + (index - 1) * 941
+            };
+            assert!((timeline.output_pts().unwrap() - expected as f64 / 44_100.0).abs() < 1e-12);
+            timeline.advance_output(frames, 44_100);
+        }
+        let gap = timeline.input_timing(Some(1.0), 0.001);
+        assert!(gap.discontinuity);
+        assert_eq!(gap.pts_secs, 1.0);
+        for raw in [None, Some(0.0)] {
+            let missing = timeline.input_timing(raw, 0.001);
+            assert!(!missing.discontinuity);
+            assert!(missing.synthesized);
+            assert!((missing.pts_secs - 8192.0 / 48_000.0).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn audio_resample_forward_gap_drains_old_tail_before_reanchoring() {
+        fn convert(chunks: &[(i64, Vec<i16>)]) -> Vec<super::AudioFrame> {
+            use ffmpeg_the_third::format::sample::{Sample, Type as SampleType};
+            use ffmpeg_the_third::util::frame::audio::Audio;
+            ffmpeg_the_third::init().unwrap();
+            let path =
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/audio-tail/tail4ms.wav");
+            let input = ffmpeg_the_third::format::input(&path).unwrap();
+            let mut setup = super::build_audio_setup(&input, 0, 44_100).unwrap();
+            let clock = AvClock::new(1.0, Arc::new(AtomicU64::new(0)));
+            clock.set_playing(true);
+            let state = AtomicU8::new(state_code::PLAYING);
+            let cancel = AtomicBool::new(false);
+            let (tx, rx) = bounded(32);
+            let mut timeline = AudioResampleTimeline::default();
+            let mut trim = None;
+            for (pts, samples) in chunks {
+                let mut frame = Audio::empty();
+                unsafe {
+                    frame.alloc(
+                        Sample::I16(SampleType::Packed),
+                        samples.len() / 2,
+                        ffmpeg_the_third::ChannelLayoutMask::STEREO,
+                    );
+                    frame.set_rate(48_000);
+                    (*frame.as_mut_ptr()).pts = *pts;
+                    let data = (*frame.as_mut_ptr()).data[0] as *mut i16;
+                    std::slice::from_raw_parts_mut(data, samples.len()).copy_from_slice(samples);
+                }
+                assert!(super::emit_audio_frame(
+                    &mut setup,
+                    &mut frame,
+                    &mut trim,
+                    0,
+                    None,
+                    None,
+                    &mut timeline,
+                    &clock,
+                    &tx,
+                    &state,
+                    &cancel
+                ));
+            }
+            assert!(super::drain_audio_resampler(
+                &mut setup,
+                &mut timeline,
+                &mut trim,
+                0,
+                None,
+                &clock,
+                &tx,
+                &state,
+                &cancel,
+                "test_eos"
+            ));
+            rx.try_iter().collect()
+        }
+        let burst: Vec<i16> = (0..192)
+            .flat_map(|index| {
+                let sample =
+                    ((index as f64 * std::f64::consts::TAU / 48.0).sin() * 20_000.0) as i16;
+                [sample, sample]
+            })
+            .collect();
+        let fresh = convert(&[(0, burst.clone())]);
+        let gapped = convert(&[(0, burst), (48_000, vec![0; 4800 * 2])]);
+        let reference: Vec<f32> = fresh
+            .iter()
+            .flat_map(|frame| frame.samples.iter().copied())
+            .collect();
+        let old_segment: Vec<f32> = gapped
+            .iter()
+            .filter(|frame| frame.pts_secs < 1.0)
+            .flat_map(|frame| frame.samples.iter().copied())
+            .collect();
+        assert_eq!(
+            old_segment, reference,
+            "old filter tail must remain at its original source position"
+        );
+        let mut old_end = 0.0;
+        let mut new_end = 1.0;
+        let mut new_frames = 0;
+        for frame in gapped {
+            let end = if frame.pts_secs < 1.0 {
+                &mut old_end
+            } else {
+                &mut new_end
+            };
+            assert!((frame.pts_secs - *end).abs() < 1e-12);
+            *end += frame.duration_secs;
+            if frame.pts_secs >= 1.0 {
+                assert!(
+                    frame.samples.iter().all(|sample| *sample == 0.0),
+                    "old filter history entered new segment"
+                );
+                new_frames += frame.samples.len() / 2;
+            }
+        }
+        assert_eq!(new_frames, 4410);
+        assert!((new_end - 1.1).abs() < 1e-12);
+    }
+
+    #[test]
+    fn audio_resample_cancel_discards_drain_and_releases_sender_backpressure() {
+        ffmpeg_the_third::init().unwrap();
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/audio-tail/tail4ms.wav");
+        let input = ffmpeg_the_third::format::input(&path).unwrap();
+        let mut setup = super::build_audio_setup(&input, 0, 44_100).unwrap();
+        let clock = Arc::new(AvClock::new(1.0, Arc::new(AtomicU64::new(0))));
+        clock.set_playing(true);
+        let state = Arc::new(AtomicU8::new(state_code::PLAYING));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = bounded(1);
+        let converted = |pts_secs| super::ConvertedAudio {
+            samples: vec![0.25; 882],
+            pts_secs,
+            raw_pts_secs: Some(pts_secs),
+            pts_synthesized: false,
+            audio_path: "test",
+            decode_wait_ms: None,
+            convert_ms: 0.0,
+            emit_t0: Instant::now(),
+        };
+        assert!(super::emit_audio_samples(
+            &setup,
+            converted(0.0),
+            &mut None,
+            0,
+            None,
+            &clock,
+            &tx,
+            &state,
+            &cancel
+        ));
+        let worker = {
+            let clock = clock.clone();
+            let state = state.clone();
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                let sent = super::emit_audio_samples(
+                    &setup,
+                    converted(0.01),
+                    &mut None,
+                    0,
+                    None,
+                    &clock,
+                    &tx,
+                    &state,
+                    &cancel,
+                );
+                let mut timeline = AudioResampleTimeline::default();
+                assert!(!super::drain_audio_resampler(
+                    &mut setup,
+                    &mut timeline,
+                    &mut None,
+                    0,
+                    None,
+                    &clock,
+                    &tx,
+                    &state,
+                    &cancel,
+                    "cancelled_eos"
+                ));
+                sent
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while clock.audio_tx_queued_secs() < 0.019 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let entered_send_wait = clock.audio_tx_queued_secs() > 0.019;
+        cancel.store(true, Ordering::Release);
+        assert!(!worker.join().unwrap());
+        assert!(entered_send_wait, "second frame did not enter send wait");
+        assert_eq!(rx.len(), 1);
+        assert!(
+            (clock.audio_tx_queued_secs() - 0.01).abs() < 1e-12,
+            "cancelled sender accounting must roll back"
+        );
+    }
+
+    #[test]
+    fn audio_resample_pause_preserves_tail_until_resume_seek_or_cancel() {
+        use ffmpeg_the_third::format::sample::{Sample, Type as SampleType};
+        use ffmpeg_the_third::util::frame::audio::Audio;
+        ffmpeg_the_third::init().unwrap();
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/audio-tail/tail4ms.wav");
+        let input = ffmpeg_the_third::format::input(&path).unwrap();
+        let make_frame = || {
+            let mut frame = Audio::empty();
+            unsafe {
+                frame.alloc(
+                    Sample::I16(SampleType::Packed),
+                    192,
+                    ffmpeg_the_third::ChannelLayoutMask::STEREO,
+                );
+                frame.set_rate(48_000);
+                (*frame.as_mut_ptr()).pts = 0;
+                let data = (*frame.as_mut_ptr()).data[0] as *mut i16;
+                let samples = std::slice::from_raw_parts_mut(data, 384);
+                for (index, pair) in samples.chunks_exact_mut(2).enumerate() {
+                    let sample =
+                        ((index as f64 * std::f64::consts::TAU / 48.0).sin() * 20_000.0) as i16;
+                    pair.fill(sample);
+                }
+            }
+            frame
+        };
+        let reference = {
+            let mut setup = super::build_audio_setup(&input, 0, 44_100).unwrap();
+            let clock = AvClock::new(1.0, Arc::new(AtomicU64::new(0)));
+            clock.set_playing(true);
+            let state = AtomicU8::new(state_code::PLAYING);
+            let cancel = AtomicBool::new(false);
+            let (tx, rx) = bounded(8);
+            let mut timeline = AudioResampleTimeline::default();
+            assert!(super::emit_audio_frame(
+                &mut setup,
+                &mut make_frame(),
+                &mut None,
+                0,
+                None,
+                None,
+                &mut timeline,
+                &clock,
+                &tx,
+                &state,
+                &cancel
+            ));
+            assert!(super::drain_audio_resampler(
+                &mut setup,
+                &mut timeline,
+                &mut None,
+                0,
+                None,
+                &clock,
+                &tx,
+                &state,
+                &cancel,
+                "pause_reference_eos"
+            ));
+            rx.try_iter()
+                .flat_map(|frame| frame.samples)
+                .collect::<Vec<_>>()
+        };
+        for action in ["resume", "seek", "cancel"] {
+            let mut setup = super::build_audio_setup(&input, 0, 44_100).unwrap();
+            let clock = Arc::new(AvClock::new(1.0, Arc::new(AtomicU64::new(0))));
+            clock.set_playing(true);
+            let state = Arc::new(AtomicU8::new(state_code::PLAYING));
+            let cancel = Arc::new(AtomicBool::new(false));
+            let (tx, rx) = bounded(1);
+            let mut timeline = AudioResampleTimeline::default();
+            assert!(super::emit_audio_frame(
+                &mut setup,
+                &mut make_frame(),
+                &mut None,
+                0,
+                None,
+                None,
+                &mut timeline,
+                &clock,
+                &tx,
+                &state,
+                &cancel
+            ));
+            let initial_queued = clock.audio_tx_queued_secs();
+            assert_eq!(rx.len(), 1, "initial PCM fills the decoder-to-pump channel");
+            state.store(state_code::PAUSED, Ordering::Release);
+            clock.set_playing(false);
+            let (started_tx, started_rx) = bounded(1);
+            let (done_tx, done_rx) = bounded(1);
+            let worker = {
+                let clock = clock.clone();
+                let state = state.clone();
+                let cancel = cancel.clone();
+                std::thread::spawn(move || {
+                    started_tx.send(()).unwrap();
+                    let result = super::drain_audio_resampler(
+                        &mut setup,
+                        &mut timeline,
+                        &mut None,
+                        0,
+                        None,
+                        &clock,
+                        &tx,
+                        &state,
+                        &cancel,
+                        "paused_eos",
+                    );
+                    done_tx.send(result).unwrap();
+                })
+            };
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            if let Ok(result) = done_rx.recv_timeout(Duration::from_millis(100)) {
+                cancel.store(true, Ordering::Release);
+                worker.join().unwrap();
+                panic!(
+                    "paused resampler drain discarded pending PCM before {action}: result={result}"
+                );
+            }
+            assert!(
+                clock.audio_tx_queued_secs() > initial_queued,
+                "paused pending tail retains its channel accounting"
+            );
+            match action {
+                "resume" => {
+                    state.store(state_code::PLAYING, Ordering::Release);
+                    clock.set_playing(true);
+                    let first = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                    clock.add_audio_tx_queued_secs_for_epoch(
+                        -first.queued_wall_secs,
+                        first.audio_tx_accounting_epoch,
+                    );
+                    let tail = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                    clock.add_audio_tx_queued_secs_for_epoch(
+                        -tail.queued_wall_secs,
+                        tail.audio_tx_accounting_epoch,
+                    );
+                    assert!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+                    let output: Vec<_> = first.samples.into_iter().chain(tail.samples).collect();
+                    assert_eq!(
+                        output, reference,
+                        "pause/resume lost or repeated the real swr tail"
+                    );
+                    assert!(clock.audio_tx_queued_secs().abs() < 1e-12);
+                }
+                "seek" => {
+                    clock.request_seek(0.0);
+                    assert!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+                    assert_eq!(rx.len(), 1, "old pending tail must not commit after seek");
+                    assert!((clock.audio_tx_queued_secs() - initial_queued).abs() < 1e-12);
+                    clock.note_audio_decoded_eos(0);
+                    assert!(
+                        !clock.audio_decoded_eos(1),
+                        "retired EOS cannot finish the new generation"
+                    );
+                }
+                "cancel" => {
+                    cancel.store(true, Ordering::Release);
+                    assert!(!done_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+                    assert_eq!(rx.len(), 1);
+                    assert!((clock.audio_tx_queued_secs() - initial_queued).abs() < 1e-12);
+                    assert!(!clock.audio_decoded_eos(0));
+                }
+                _ => unreachable!(),
+            }
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn audio_resample_successful_zero_output_retains_tiny_input_until_eos() {
+        fn convert(rate: u32, chunks: &[usize]) -> Vec<super::AudioFrame> {
+            use ffmpeg_the_third::format::sample::{Sample, Type as SampleType};
+            use ffmpeg_the_third::util::frame::audio::Audio;
+            let path =
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/audio-tail/tail4ms.wav");
+            let input = ffmpeg_the_third::format::input(&path).unwrap();
+            let mut setup = super::build_audio_setup(&input, 0, rate).unwrap();
+            let clock = AvClock::new(1.0, Arc::new(AtomicU64::new(0)));
+            clock.set_playing(true);
+            let state = AtomicU8::new(state_code::PLAYING);
+            let cancel = AtomicBool::new(false);
+            let (tx, rx) = bounded(8);
+            let mut timeline = AudioResampleTimeline::default();
+            let mut offset = 0;
+            for frames in chunks {
+                let mut frame = Audio::empty();
+                unsafe {
+                    frame.alloc(
+                        Sample::I16(SampleType::Packed),
+                        *frames,
+                        ffmpeg_the_third::ChannelLayoutMask::STEREO,
+                    );
+                    frame.set_rate(48_000);
+                    (*frame.as_mut_ptr()).pts = offset as i64;
+                    let data = (*frame.as_mut_ptr()).data[0] as *mut i16;
+                    std::slice::from_raw_parts_mut(data, frames * 2).fill(8192);
+                }
+                assert!(super::emit_audio_frame(
+                    &mut setup,
+                    &mut frame,
+                    &mut None,
+                    0,
+                    None,
+                    None,
+                    &mut timeline,
+                    &clock,
+                    &tx,
+                    &state,
+                    &cancel
+                ));
+                if rate == 44_100 && offset == 0 && *frames <= 3 {
+                    assert!(
+                        rx.is_empty(),
+                        "test must exercise accepted input with zero emitted output"
+                    );
+                }
+                offset += frames;
+                assert!(
+                    (timeline.0.as_ref().unwrap().expected_input_end - offset as f64 / 48_000.0)
+                        .abs()
+                        < 1e-12
+                );
+            }
+            assert!(super::drain_audio_resampler(
+                &mut setup,
+                &mut timeline,
+                &mut None,
+                0,
+                None,
+                &clock,
+                &tx,
+                &state,
+                &cancel,
+                "tiny_then_normal_eos"
+            ));
+            let output: Vec<_> = rx.try_iter().collect();
+            let output_frames: usize = output.iter().map(|frame| frame.samples.len() / 2).sum();
+            let expected = (offset * rate as usize).div_ceil(48_000);
+            assert_eq!(
+                output_frames, expected,
+                "accepted tiny input lost: input={offset} rate={rate}"
+            );
+            assert!((timeline.output_pts().unwrap() - expected as f64 / rate as f64).abs() < 1e-12);
+            cancel.store(true, Ordering::Release);
+            assert!(!super::drain_audio_resampler(
+                &mut setup,
+                &mut timeline,
+                &mut None,
+                0,
+                None,
+                &clock,
+                &tx,
+                &state,
+                &cancel,
+                "cancelled_tiny_eos"
+            ));
+            assert!(rx.is_empty());
+            assert!(!clock.audio_decoded_eos(0));
+            output
+        }
+        ffmpeg_the_third::init().unwrap();
+        for rate in [44_100, 48_000] {
+            for first in [1, 3] {
+                // Whole media shorter than swr's initial filter needs additional
+                // upstream support. Here tiny packets precede ordinary input.
+                let split = convert(rate, &[first, 256]);
+                let fresh = convert(rate, &[first + 256]);
+                let split_pcm: Vec<f32> = split
+                    .iter()
+                    .flat_map(|frame| frame.samples.iter().copied())
+                    .collect();
+                let fresh_pcm: Vec<f32> = fresh
+                    .iter()
+                    .flat_map(|frame| frame.samples.iter().copied())
+                    .collect();
+                assert_eq!(
+                    split_pcm, fresh_pcm,
+                    "tiny/normal packet split changed PCM: first={first} rate={rate}"
+                );
+                for output in [split, fresh] {
+                    let mut end = 0.0;
+                    for frame in output {
+                        assert!((frame.pts_secs - end).abs() < 1e-12);
+                        end += frame.duration_secs;
+                    }
+                    assert!(
+                        (end - ((first + 256) * rate as usize).div_ceil(48_000) as f64
+                            / rate as f64)
+                            .abs()
+                            < 1e-12
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn real_audio_tail_seek_matches_fresh_decode_without_loop_head_replay() {
+        for output_rate in [48_000, 44_100] {
+            for name in [
+                "tail4ms.wav",
+                "tail4ms.mkv",
+                "tail10ms.wav",
+                "tail10ms.mkv",
+                "mid4ms.wav",
+                "mid4ms.mkv",
+            ] {
+                let session = DecoderSession::open(name, output_rate);
+                let fresh = session.drain_generation(0);
+                assert!(fresh.iter().any(|sample| sample.abs() > 0.1));
+                let head_samples = output_rate as usize / 20 * 2;
+                assert!(
+                    fresh[..head_samples]
+                        .iter()
+                        .all(|sample| sample.abs() < 1e-6)
+                );
+                for pass in 1..=2 {
+                    session.clock.request_seek(0.0);
+                    let serial = session.clock.current_seek_serial();
+                    let replay = session.drain_generation(serial);
+                    let peak_at_head = replay[..head_samples]
+                        .iter()
+                        .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+                    assert!(
+                        peak_at_head < 1e-6,
+                        "previous tail replayed at loop head: {name} rate={output_rate} pass={pass} peak={peak_at_head}"
+                    );
+                    assert_eq!(
+                        replay.len(),
+                        fresh.len(),
+                        "resampler history changed decoded length: {name} rate={output_rate} pass={pass}"
+                    );
+                    let first_difference = replay
+                        .iter()
+                        .zip(&fresh)
+                        .position(|(actual, expected)| actual != expected);
+                    assert!(
+                        first_difference.is_none(),
+                        "fresh/seek PCM mismatch: {name} rate={output_rate} pass={pass} first_difference={first_difference:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod audio_track_fixture_tests {
+    use super::{
+        AudioTrackInfo, DecodeHandles, VideoInfo, enumerate_audio_tracks,
+        enumerate_audio_tracks_with_decoder, spawn, spawn_with_initial_audio_track,
+    };
+    use crate::video::audio_track_selection::{
+        AudioTrackRequestOutcome, AudioTrackSelection, AudioTrackSwitchFailureReason,
+    };
+    use crate::video::clock::AvClock;
+    use crate::video::engine::EngineEvent;
+    use crate::video::engine::actor::{EngineActor, OpenOptions, state_code};
+    use crate::video::engine::state::{AudioEvent, DecoderEvent};
+    use crate::video::{EngineEventSender, VideoUiWake};
+    use crossbeam_channel::bounded;
+    use ffmpeg_the_third::media::Type as MediaType;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+    use std::time::Duration;
+
+    fn fixture_path(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/audio-tracks")
+            .join(name)
+    }
+
+    fn spawn_headless(
+        name: &str,
+        clock: Arc<AvClock>,
+        cancel: Arc<AtomicBool>,
+        state: Arc<AtomicU8>,
+        event_tx: crossbeam_channel::Sender<EngineEvent>,
+    ) -> DecodeHandles {
+        spawn(
+            fixture_path(name),
+            clock,
+            cancel,
+            48_000,
+            false,
+            crate::settings::VideoDeinterlaceMode::Off,
+            #[cfg(windows)]
+            None,
+            state,
+            EngineEventSender::new(event_tx, Arc::new(VideoUiWake::default())),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(super::VideoDynamicState::default()),
+        )
+    }
+
+    fn spawn_with_saved_track(
+        name: &str,
+        clock: Arc<AvClock>,
+        cancel: Arc<AtomicBool>,
+        saved: crate::video::SavedAudioTrackChoice,
+    ) -> DecodeHandles {
+        let (event_tx, _event_rx) = bounded(64);
+        spawn_with_initial_audio_track(
+            fixture_path(name),
+            clock,
+            cancel,
+            48_000,
+            false,
+            crate::settings::VideoDeinterlaceMode::Off,
+            #[cfg(windows)]
+            None,
+            Arc::new(AtomicU8::new(state_code::LOADING)),
+            EngineEventSender::new(event_tx, Arc::new(VideoUiWake::default())),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(super::VideoDynamicState::default()),
+            Some(saved),
+        )
+    }
+
+    #[test]
+    fn saved_nondefault_opens_in_video_and_audio_only_files() {
+        for (name, index) in [("multi.mkv", 3), ("multi-audio.m4a", 0)] {
+            let input = ffmpeg_the_third::format::input(&fixture_path(name)).unwrap();
+            let tracks = enumerate_audio_tracks(&input);
+            let saved = crate::video::SavedAudioTrackChoice::from(
+                tracks
+                    .iter()
+                    .find(|track| track.stream_index == index)
+                    .unwrap(),
+            );
+            let cancel = Arc::new(AtomicBool::new(false));
+            let clock = Arc::new(AvClock::new(1.0, Arc::new(AtomicU64::new(0))));
+            let handles = spawn_with_saved_track(name, clock, Arc::clone(&cancel), saved);
+            let info = handles
+                .info_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
+            assert_eq!(info.opened_audio_stream_index, Some(index));
+            assert_ne!(
+                info.opened_audio_stream_index,
+                info.default_audio_stream_index
+            );
+            assert_eq!(info.has_video, name == "multi.mkv");
+            assert_eq!(
+                handles
+                    .audio_track_selection_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap()
+                    .snapshot()
+                    .applied
+                    .stream_index,
+                index
+            );
+            cancel.store(true, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn saved_setup_failure_reopens_default_and_notifies_once() {
+        let input = ffmpeg_the_third::format::input(&fixture_path("multi.mkv")).unwrap();
+        let tracks = enumerate_audio_tracks(&input);
+        let saved = crate::video::SavedAudioTrackChoice::from(&tracks[2]);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let clock = Arc::new(AvClock::new(1.0, Arc::new(AtomicU64::new(0))));
+        clock.fail_next_audio_setup_for_test();
+        let handles = spawn_with_saved_track("multi.mkv", clock, Arc::clone(&cancel), saved);
+        let info = handles
+            .info_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            info.opened_audio_stream_index,
+            info.default_audio_stream_index
+        );
+        let selection = handles
+            .audio_track_selection_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        let snapshot = selection.snapshot();
+        assert_eq!(snapshot.desired, snapshot.applied);
+        assert!(snapshot.last_failure.is_none());
+        assert_eq!(
+            info.open_notice,
+            Some(crate::video::audio_track_selection::AudioTrackOpenNotice::SavedTrackUnavailable)
+        );
+        cancel.store(true, Ordering::Release);
+    }
+
+    fn wait_video_frame(
+        video_rx: &crossbeam_channel::Receiver<super::VideoFrame>,
+        serial: u64,
+        min_pts: f64,
+    ) -> super::VideoFrame {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            match video_rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(frame) if frame.seek_serial == serial && frame.pts_secs >= min_pts => {
+                    return frame;
+                }
+                Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    panic!("video lane disconnected before serial={serial} pts={min_pts}")
+                }
+            }
+        }
+        panic!("video frame missing: serial={serial} pts={min_pts}");
+    }
+
+    fn start_actor_playing(actor: &mut EngineActor, info: &VideoInfo, handles: &DecodeHandles) {
+        actor.handle_decoder_event(DecoderEvent::InfoReceived {
+            epoch: 0,
+            duration_secs: info.duration_secs,
+            has_audio: info.has_audio,
+            has_video: info.has_video,
+        });
+        let video = wait_video_frame(&handles.video_rx, 0, 0.0);
+        let audio = handles
+            .audio_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("initial audio frame");
+        actor.handle_audio_event(AudioEvent::BufferReady {
+            epoch: 0,
+            pts: audio.pts_secs.max(0.0),
+            wall_now: std::time::Instant::now(),
+        });
+        actor.handle_decoder_event(DecoderEvent::FirstFrameReady {
+            epoch: 0,
+            pts: video.pts_secs,
+        });
+        assert_eq!(actor.published_state_code(), state_code::PLAYING);
+    }
+
+    struct SwitchSession {
+        handles: DecodeHandles,
+        selection: Arc<AudioTrackSelection>,
+        clock: Arc<AvClock>,
+        actor: EngineActor,
+        cancel: Arc<AtomicBool>,
+        event_rx: crossbeam_channel::Receiver<EngineEvent>,
+    }
+
+    impl SwitchSession {
+        fn new() -> Self {
+            Self::new_for("multi.mkv", 2)
+        }
+
+        fn new_for(name: &str, initial_stream: usize) -> Self {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let serial = Arc::new(AtomicU64::new(0));
+            let clock = Arc::new(AvClock::new(1.0, Arc::clone(&serial)));
+            let mut actor = EngineActor::new(OpenOptions::default(), serial, Arc::clone(&clock));
+            actor.begin_loading();
+            let (event_tx, event_rx) = bounded(64);
+            let handles = spawn_headless(
+                name,
+                Arc::clone(&clock),
+                Arc::clone(&cancel),
+                actor.published_state_handle(),
+                event_tx,
+            );
+            let info = handles
+                .info_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
+            assert_eq!(info.opened_audio_stream_index, Some(initial_stream));
+            let selection = handles
+                .audio_track_selection_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            start_actor_playing(&mut actor, &info, &handles);
+            Self {
+                handles,
+                selection,
+                clock,
+                actor,
+                cancel,
+                event_rx,
+            }
+        }
+
+        fn request(&self, stream_index: usize, target_secs: f64) {
+            assert_eq!(
+                self.selection.request(stream_index),
+                AudioTrackRequestOutcome::Accepted
+            );
+            self.clock.request_seek(target_secs);
+        }
+
+        fn wait_failure(&self, reason: AudioTrackSwitchFailureReason) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                let snapshot = self.selection.snapshot();
+                if let Some(failure) = snapshot.last_failure
+                    && failure.choice.generation == snapshot.desired.generation
+                {
+                    assert_eq!(failure.reason, reason);
+                    return;
+                }
+                while self.handles.video_rx.try_recv().is_ok() {}
+                let _ = self.handles.audio_rx.try_recv();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            panic!("switch failure missing: {reason:?}");
+        }
+
+        fn wait_display_state(
+            &self,
+            wanted: crate::video::audio_track_selection::AudioTrackSelectionDisplayState,
+        ) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                if self.selection.snapshot().display_state(false) == wanted {
+                    return;
+                }
+                while self.handles.video_rx.try_recv().is_ok() {}
+                while self.handles.audio_rx.try_recv().is_ok() {}
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            panic!(
+                "selection did not reach {wanted:?}: {:?}",
+                self.selection.snapshot()
+            );
+        }
+
+        fn wait_pcm(&self, serial: u64, stream_index: usize, hz: f64, count: usize) -> Vec<f64> {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut pts = Vec::new();
+            while std::time::Instant::now() < deadline && pts.len() < count {
+                while self.handles.video_rx.try_recv().is_ok() {}
+                let frame = match self
+                    .handles
+                    .audio_rx
+                    .recv_timeout(Duration::from_millis(100))
+                {
+                    Ok(frame) => frame,
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                    Err(error) => panic!("audio disconnected: {error}"),
+                };
+                if frame.seek_serial != serial {
+                    continue;
+                }
+                assert_eq!(frame.stream_index, stream_index);
+                if frame.duration_secs < 0.015
+                    || frame.samples.iter().all(|sample| sample.abs() < 0.02)
+                {
+                    continue;
+                }
+                let mut rising = 0usize;
+                let mut previous = frame.samples[0];
+                for sample in frame.samples.chunks_exact(2).skip(1).map(|pair| pair[0]) {
+                    if previous <= 0.0 && sample > 0.0 {
+                        rising += 1;
+                    }
+                    previous = sample;
+                }
+                let measured = rising as f64 / frame.duration_secs;
+                assert!(
+                    (measured - hz).abs() < 110.0,
+                    "stream={stream_index} serial={serial} measured={measured:.1}Hz expected={hz:.1}Hz pts={}",
+                    frame.pts_secs
+                );
+                pts.push(frame.pts_secs);
+            }
+            assert_eq!(
+                pts.len(),
+                count,
+                "PCM frames missing for stream={stream_index}"
+            );
+            pts
+        }
+    }
+
+    impl Drop for SwitchSession {
+        fn drop(&mut self) {
+            self.cancel.store(true, Ordering::Release);
+        }
+    }
+
+    fn open_fixture_info(name: &str) -> VideoInfo {
+        let path = fixture_path(name);
+        let input = ffmpeg_the_third::format::input(&path).expect("open committed fixture");
+        let tracks = enumerate_audio_tracks(&input);
+        let default_index = input.streams().best(MediaType::Audio).map(|s| s.index());
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let seek_serial = Arc::new(AtomicU64::new(0));
+        let clock = Arc::new(AvClock::new(1.0, seek_serial));
+        let (event_tx, _event_rx) = bounded(64);
+        let engine_event_tx = EngineEventSender::new(event_tx, Arc::new(VideoUiWake::default()));
+        let handles = spawn(
+            path,
+            clock,
+            Arc::clone(&cancel),
+            48_000,
+            false,
+            crate::settings::VideoDeinterlaceMode::Off,
+            #[cfg(windows)]
+            None,
+            Arc::new(AtomicU8::new(state_code::LOADING)),
+            engine_event_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(super::VideoDynamicState::default()),
+        );
+        let info = handles
+            .info_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("demux info timeout")
+            .expect("demux open failed");
+        cancel.store(true, Ordering::Release);
+        drop(handles);
+
+        // Both the isolated Input reader and demux's published VideoInfo must agree.
+        assert_eq!(info.audio_tracks, tracks);
+        assert_eq!(info.default_audio_stream_index, default_index);
+        info
+    }
+
+    #[test]
+    fn multi_mkv_lists_three_audio_tracks_and_opens_best() {
+        let info = open_fixture_info("multi.mkv");
+        assert_eq!(
+            info.audio_tracks,
+            vec![
+                AudioTrackInfo {
+                    stream_index: 1,
+                    ordinal: 1,
+                    language: Some("jpn".into()),
+                    title: Some("日本語 440Hz".into()),
+                    codec: "aac".into(),
+                    channels: Some(2),
+                    sample_rate: Some(48_000),
+                    disposition_default: false,
+                    start_secs: None,
+                    end_secs: None,
+                },
+                AudioTrackInfo {
+                    stream_index: 2,
+                    ordinal: 2,
+                    language: Some("eng".into()),
+                    title: Some("English 880Hz".into()),
+                    codec: "ac3".into(),
+                    channels: Some(6),
+                    sample_rate: Some(44_100),
+                    disposition_default: true,
+                    start_secs: None,
+                    end_secs: None,
+                },
+                AudioTrackInfo {
+                    stream_index: 3,
+                    ordinal: 3,
+                    language: None,
+                    title: None,
+                    codec: "flac".into(),
+                    channels: Some(1),
+                    sample_rate: Some(32_000),
+                    disposition_default: false,
+                    start_secs: Some(0.0),
+                    end_secs: Some(6.0),
+                },
+            ]
+        );
+        assert_eq!(info.default_audio_stream_index, Some(2));
+        assert_eq!(info.opened_audio_stream_index, Some(2));
+        assert_eq!(info.audio_codec.as_deref(), Some("ac3"));
+        assert!(info.has_audio);
+    }
+
+    #[test]
+    fn range_mp4_reads_each_stream_start_and_duration() {
+        let info = open_fixture_info("range-mp4.mp4");
+        assert_eq!(info.audio_tracks.len(), 2);
+        let a = &info.audio_tracks[0];
+        let b = &info.audio_tracks[1];
+        assert_eq!(a.start_secs, Some(0.0));
+        assert!((a.end_secs.unwrap() - 20.0).abs() < 0.01);
+        assert!((b.start_secs.unwrap() - 3.976).abs() < 0.01);
+        assert!((b.end_secs.unwrap() - 9.999).abs() < 0.01);
+    }
+
+    #[test]
+    fn range_mkv_uses_duration_tag_only_at_zero_start() {
+        let info = open_fixture_info("range-mkv.mkv");
+        assert_eq!(info.audio_tracks.len(), 3);
+        let b = &info.audio_tracks[1];
+        let late = &info.audio_tracks[2];
+        assert_eq!(b.start_secs, Some(0.0), "b={b:?} late={late:?}");
+        assert!((b.end_secs.unwrap() - 6.0).abs() < 0.01);
+        assert_eq!(late.start_secs, Some(4.0));
+        assert_eq!(late.end_secs, None);
+    }
+
+    #[test]
+    fn stream_duration_tag_rejects_invalid_values() {
+        use super::parse_stream_duration_tag;
+        assert_eq!(parse_stream_duration_tag("00:00:06.023000000"), Some(6.023));
+        for value in [
+            "",
+            "6",
+            "00:60:00",
+            "00:00:60",
+            "-1:00:00",
+            "00:00:NaN",
+            "00:00:inf",
+        ] {
+            assert_eq!(parse_stream_duration_tag(value), None, "{value}");
+        }
+    }
+
+    #[test]
+    fn unavailable_short_track_stays_on_long_audio_until_in_range_seek() {
+        use crate::video::audio_track_selection::AudioTrackSelectionDisplayState as Display;
+        for (name, target) in [
+            ("range-mp4.mp4", 3.0),
+            ("range-mp4.mp4", 9.7),
+            ("range-mp4.mp4", 11.0),
+            ("range-mkv.mkv", 5.7),
+            ("range-mkv.mkv", 8.0),
+        ] {
+            let session = SwitchSession::new_for(name, 1);
+            session.request(2, target);
+            session.wait_display_state(Display::Deferred);
+            let deferred = session.selection.snapshot();
+            assert_eq!(deferred.applied.stream_index, 1, "{name} at {target}");
+            assert_eq!(deferred.deferred_gen, Some(deferred.desired.generation));
+            assert!(deferred.last_failure.is_none());
+            session.wait_pcm(1, 1, 440.0, 1);
+            // This is a plain later seek, not a new selection. Demux must
+            // consume the pending choice when it reaches the short track.
+            session.clock.request_seek(5.0);
+            session.wait_pcm(2, 2, 880.0, 2);
+            session.wait_display_state(Display::Applied);
+        }
+    }
+
+    #[test]
+    fn frame_step_past_short_track_end_keeps_selection_deferred() {
+        use crate::video::audio_track_selection::AudioTrackSelectionDisplayState as Display;
+        let session = SwitchSession::new_for("range-mkv.mkv", 1);
+        session.request(2, 6.5);
+        session.wait_display_state(Display::Deferred);
+        session.wait_pcm(1, 1, 440.0, 1);
+
+        // Demux starts at 5.5 s, where B's end at 6.0 s looks available.
+        // Audio Flush trims before 6.5 s, where B has no samples.
+        session.clock.request_frame_step_seek(5.5, 6.5, 1);
+        let pts = session.wait_pcm(2, 1, 440.0, 2);
+        assert!(pts.into_iter().all(|pts| pts >= 6.5));
+        let snapshot = session.selection.snapshot();
+        assert_eq!(snapshot.applied.stream_index, 1);
+        assert_eq!(snapshot.display_state(false), Display::Deferred);
+        assert_eq!(snapshot.deferred_gen, Some(snapshot.desired.generation));
+    }
+
+    #[test]
+    fn frame_step_into_late_track_applies_at_audio_trim_base() {
+        use crate::video::audio_track_selection::AudioTrackSelectionDisplayState as Display;
+        let session = SwitchSession::new_for("range-mkv.mkv", 1);
+        session.request(3, 3.0);
+        session.wait_display_state(Display::Deferred);
+        session.wait_pcm(1, 1, 440.0, 1);
+
+        // C starts at 4.0 s. The demux seek start is before it, but audio
+        // begins at the frame-step base inside the stream's available range.
+        session.clock.request_frame_step_seek(3.5, 4.5, 1);
+        let pts = session.wait_pcm(2, 3, 1320.0, 2);
+        assert!(pts.into_iter().all(|pts| pts >= 4.5));
+        let snapshot = session.selection.snapshot();
+        assert_eq!(snapshot.applied, snapshot.desired);
+        assert_eq!(snapshot.display_state(false), Display::Applied);
+    }
+
+    #[test]
+    fn deferred_choice_survives_failed_ordinary_seek_and_retries_in_range() {
+        use crate::video::audio_track_selection::AudioTrackSelectionDisplayState as Display;
+        let session = SwitchSession::new_for("range-mp4.mp4", 1);
+        let (entered, release) = session.clock.gate_next_demux_packet_for_test();
+        session.clock.request_seek(1.0);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut blocked = false;
+        while std::time::Instant::now() < deadline {
+            if entered.try_recv().is_ok() {
+                blocked = true;
+                break;
+            }
+            while session.handles.video_rx.try_recv().is_ok() {}
+            while session.handles.audio_rx.try_recv().is_ok() {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(blocked, "demux did not reach packet gate");
+        // The gate is in the actual demux packet path, before its next seek
+        // request. Publish both requests while demux is held there.
+        assert_eq!(
+            session.selection.request(2),
+            AudioTrackRequestOutcome::Accepted
+        );
+        session.clock.request_seek(5.0); // choice's position
+        session.clock.fail_next_demux_seek_for_test();
+        session.clock.request_seek(11.0); // ordinary seek supersedes it
+        release.send(()).unwrap();
+        session.wait_display_state(Display::Deferred);
+        assert!(session.selection.snapshot().last_failure.is_none());
+        let serial = session.clock.current_seek_serial();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !session.clock.seek_was_interrupted(serial) && std::time::Instant::now() < deadline {
+            while session.handles.video_rx.try_recv().is_ok() {}
+            while session.handles.audio_rx.try_recv().is_ok() {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(session.clock.seek_was_interrupted(serial));
+        assert_eq!(
+            session.selection.snapshot().display_state(false),
+            Display::Deferred
+        );
+        session.clock.request_seek(5.0);
+        session.wait_pcm(serial + 1, 2, 880.0, 2);
+        session.wait_display_state(Display::Applied);
+    }
+
+    #[test]
+    fn deferred_choice_applies_once_on_loop_seek_after_audio_clears_override() {
+        use crate::video::audio_track_selection::AudioTrackSelectionDisplayState as Display;
+        let session = SwitchSession::new_for("range-mp4.mp4", 1);
+        session.request(2, 11.0);
+        session.wait_display_state(Display::Deferred);
+        let choice = session.selection.snapshot().desired;
+        // Simulate the loop target being published before its video frame and
+        // audio output clearing the override first.
+        session.clock.request_seek(5.0);
+        let loop_serial = session.clock.current_seek_serial();
+        session.clock.clear_seek_target_override(loop_serial);
+        session.wait_pcm(loop_serial, 2, 880.0, 2);
+        session.wait_display_state(Display::Applied);
+        assert_eq!(session.selection.snapshot().applied, choice);
+        session.clock.request_seek(5.0);
+        session.wait_pcm(loop_serial + 1, 2, 880.0, 1);
+        assert_eq!(session.selection.snapshot().applied, choice);
+    }
+
+    #[test]
+    fn deferred_choice_becomes_switching_then_failure_on_in_range_attempt() {
+        use crate::video::audio_track_selection::AudioTrackSelectionDisplayState as Display;
+        let session = SwitchSession::new_for("range-mp4.mp4", 1);
+        session.request(2, 11.0);
+        session.wait_display_state(Display::Deferred);
+        session.clock.fail_next_audio_setup_for_test();
+        session.clock.request_seek(5.0);
+        session.wait_failure(AudioTrackSwitchFailureReason::SetupFailed);
+        let snapshot = session.selection.snapshot();
+        assert_eq!(snapshot.deferred_gen, None);
+        assert_eq!(
+            snapshot.display_state(false),
+            Display::Failed(AudioTrackSwitchFailureReason::SetupFailed)
+        );
+        assert_eq!(snapshot.applied.stream_index, 1);
+        session.clock.request_seek(5.25);
+        session.wait_pcm(3, 1, 440.0, 1);
+        assert_eq!(session.selection.snapshot().applied.stream_index, 1);
+        session.request(2, 5.0);
+        session.wait_pcm(4, 2, 880.0, 1);
+        session.wait_display_state(Display::Applied);
+    }
+
+    #[test]
+    fn single_mp4_lists_and_opens_its_only_audio_track() {
+        let info = open_fixture_info("single.mp4");
+        assert_eq!(info.audio_tracks.len(), 1);
+        let track = &info.audio_tracks[0];
+        assert_eq!(track.stream_index, 1);
+        assert_eq!(track.ordinal, 1);
+        assert_eq!(track.language, None);
+        assert_eq!(track.title, None);
+        assert_eq!(track.codec, "aac");
+        assert_eq!(track.channels, Some(1));
+        assert_eq!(track.sample_rate, Some(48_000));
+        assert!(track.disposition_default);
+        assert_eq!(info.default_audio_stream_index, Some(1));
+        assert_eq!(info.opened_audio_stream_index, Some(1));
+        assert!(info.has_audio);
+    }
+
+    #[test]
+    fn multi_timebase_mp4_name_tags_are_not_inferred_as_titles() {
+        let input = ffmpeg_the_third::format::input(&fixture_path("multi-timebase.mp4")).unwrap();
+        let tracks = enumerate_audio_tracks(&input);
+        assert_eq!(tracks.len(), 3);
+        assert_eq!(tracks[0].language.as_deref(), Some("jpn"));
+        assert_eq!(tracks[1].language.as_deref(), Some("eng"));
+        assert!(tracks.iter().all(|track| track.title.is_none()));
+    }
+
+    #[test]
+    fn unavailable_decoder_keeps_audio_ordinal_gap() {
+        let input = ffmpeg_the_third::format::input(&fixture_path("multi.mkv")).unwrap();
+        let tracks = enumerate_audio_tracks_with_decoder(&input, |id| id.name() != "aac");
+        assert_eq!(tracks.len(), 2);
+        assert_eq!((tracks[0].stream_index, tracks[0].ordinal), (2, 2));
+        assert_eq!((tracks[1].stream_index, tracks[1].ordinal), (3, 3));
+    }
+
+    #[test]
+    fn failed_open_preserves_default_but_not_opened_audio_index() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let clock = Arc::new(AvClock::new(1.0, Arc::new(AtomicU64::new(0))));
+        clock.fail_next_audio_setup_for_test();
+        let (event_tx, _event_rx) = bounded(64);
+        let handles = spawn_headless(
+            "single.mp4",
+            Arc::clone(&clock),
+            Arc::clone(&cancel),
+            Arc::new(AtomicU8::new(state_code::LOADING)),
+            event_tx,
+        );
+        let info = handles
+            .info_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(info.default_audio_stream_index, Some(1));
+        assert_eq!(info.opened_audio_stream_index, None);
+        assert!(!info.has_audio);
+        assert!(handles.audio_track_selection_rx.try_recv().is_err());
+        cancel.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn track_switch_pcm_has_only_new_frequency_and_preserves_clock_controls() {
+        let session = SwitchSession::new();
+        session.clock.set_playback_speed(1.25);
+        session.clock.set_volume(0.6);
+        session.clock.set_muted(true);
+        session.request(1, 2.0);
+        let first = session.wait_pcm(1, 1, 440.0, 12);
+        assert!(first[0] >= 1.97 && first[0] < 2.2, "PTS={}", first[0]);
+        assert_eq!(session.selection.snapshot().applied.stream_index, 1);
+        assert!((session.clock.now_secs() - 2.0).abs() < 0.5);
+
+        session.request(3, 3.0);
+        let second = session.wait_pcm(2, 3, 1320.0, 12);
+        assert!(second[0] >= 2.97 && second[0] < 3.2, "PTS={}", second[0]);
+        assert_eq!(session.selection.snapshot().applied.stream_index, 3);
+        assert!((session.clock.now_secs() - 3.0).abs() < 0.5);
+        assert!((session.clock.playback_speed() - 1.25).abs() < 1e-9);
+        assert!((session.clock.volume() - 0.6).abs() < 1e-9);
+        assert!(session.clock.is_muted());
+
+        session.request(2, 4.0);
+        let third = session.wait_pcm(3, 2, 880.0, 12);
+        assert!(third[0] >= 3.97 && third[0] < 4.2, "PTS={}", third[0]);
+        assert_eq!(session.selection.snapshot().applied.stream_index, 2);
+    }
+
+    #[test]
+    fn paused_switch_decodes_new_track_and_returns_to_paused() {
+        use crate::video::engine::actor::TransportCommand;
+        let mut session = SwitchSession::new();
+        session.actor.apply_command(TransportCommand::Pause);
+        assert_eq!(session.actor.published_state_code(), state_code::PAUSED);
+        assert_eq!(
+            session.selection.request(1),
+            AudioTrackRequestOutcome::Accepted
+        );
+        session.actor.handle_seek_request(2.0);
+        session.actor.apply_command(TransportCommand::Pause);
+        let pts = session.wait_pcm(1, 1, 440.0, 5)[0];
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let completed_pts = loop {
+            assert!(std::time::Instant::now() < deadline);
+            match session.event_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(EngineEvent::Decoder(DecoderEvent::SeekCompleted {
+                    epoch: 1,
+                    actual_pts,
+                })) => break actual_pts,
+                Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(error) => panic!("event lane disconnected: {error}"),
+            }
+        };
+        session
+            .actor
+            .handle_decoder_event(DecoderEvent::SeekCompleted {
+                epoch: 1,
+                actual_pts: completed_pts,
+            });
+        session.actor.handle_audio_event(AudioEvent::BufferReady {
+            epoch: 1,
+            pts,
+            wall_now: std::time::Instant::now(),
+        });
+        session
+            .actor
+            .handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 1, pts });
+        assert_eq!(session.actor.published_state_code(), state_code::PAUSED);
+        assert!(!session.clock.is_playing());
+        assert_eq!(session.selection.snapshot().applied.stream_index, 1);
+    }
+
+    #[test]
+    fn most_recent_choice_wins_and_later_seek_kinds_keep_its_stream() {
+        let session = SwitchSession::new();
+        assert_eq!(
+            session.selection.request(1),
+            AudioTrackRequestOutcome::Accepted
+        );
+        assert_eq!(
+            session.selection.request(2),
+            AudioTrackRequestOutcome::Accepted
+        );
+        assert_eq!(
+            session.selection.request(3),
+            AudioTrackRequestOutcome::Accepted
+        );
+        session.clock.request_seek(2.0);
+        session.wait_pcm(1, 3, 1320.0, 8);
+        let snapshot = session.selection.snapshot();
+        assert_eq!(snapshot.desired.generation, 3);
+        assert_eq!(snapshot.applied, snapshot.desired);
+
+        session.clock.request_seek(3.0);
+        session.wait_pcm(2, 3, 1320.0, 5);
+        session.clock.request_frame_step_seek(3.5, 3.5, 1);
+        session.wait_pcm(3, 3, 1320.0, 5);
+        session.clock.request_seek(0.0); // loop head uses the ordinary seek path
+        session.wait_pcm(4, 3, 1320.0, 5);
+    }
+
+    #[test]
+    fn ordinary_seek_overwriting_switch_seek_still_applies_desired_track() {
+        let session = SwitchSession::new();
+        assert_eq!(
+            session.selection.request(1),
+            AudioTrackRequestOutcome::Accepted
+        );
+        session.clock.request_seek(2.0);
+        session.clock.request_seek(3.0);
+        let pts = session.wait_pcm(2, 1, 440.0, 5);
+        assert!(pts[0] >= 2.97 && pts[0] < 3.2);
+        assert_eq!(session.selection.snapshot().applied.stream_index, 1);
+    }
+
+    #[test]
+    fn failed_setup_is_not_retried_by_ordinary_seek_but_reselect_retries() {
+        let session = SwitchSession::new();
+        session.clock.fail_next_audio_setup_for_test();
+        session.request(1, 2.0);
+        session.wait_failure(AudioTrackSwitchFailureReason::SetupFailed);
+        assert_eq!(session.selection.snapshot().applied.stream_index, 2);
+        session.clock.request_seek(3.0);
+        session.wait_pcm(2, 2, 880.0, 5);
+        assert_eq!(session.selection.snapshot().applied.stream_index, 2);
+        session.request(1, 4.0);
+        session.wait_pcm(3, 1, 440.0, 5);
+        assert_eq!(session.selection.snapshot().applied.stream_index, 1);
+    }
+
+    #[test]
+    fn failed_seek_keeps_old_track_and_failure_generation() {
+        let session = SwitchSession::new();
+        session.clock.fail_next_demux_seek_for_test();
+        session.request(1, 2.0);
+        session.wait_failure(AudioTrackSwitchFailureReason::SeekFailed);
+        assert_eq!(session.selection.snapshot().applied.stream_index, 2);
+        session.clock.request_seek(2.5);
+        session.wait_pcm(2, 2, 880.0, 5);
+        assert_eq!(session.selection.snapshot().applied.stream_index, 2);
+    }
+
+    #[test]
+    fn failed_audio_flush_detaches_lane_and_records_worker_gone() {
+        let session = SwitchSession::new();
+        session.clock.fail_next_audio_flush_for_test();
+        session.request(1, 2.0);
+        session.wait_failure(AudioTrackSwitchFailureReason::WorkerGone);
+        assert!(session.clock.audio_lane_lost());
+        assert_eq!(session.selection.snapshot().applied.stream_index, 2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut inactive = false;
+        while std::time::Instant::now() < deadline {
+            if let Ok(EngineEvent::Audio(AudioEvent::AudioInactive)) =
+                session.event_rx.recv_timeout(Duration::from_millis(100))
+            {
+                inactive = true;
+                break;
+            }
+        }
+        assert!(inactive);
+        session.clock.request_seek(3.0);
+        wait_video_frame(&session.handles.video_rx, 2, 2.99);
+    }
+
+    #[test]
+    fn exited_audio_worker_rejects_pending_switch_and_keeps_video_seek_alive() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let clock = Arc::new(AvClock::new(1.0, Arc::new(AtomicU64::new(0))));
+        let (packet_sent, release) = clock.gate_after_audio_packet_for_test();
+        let (event_tx, _event_rx) = bounded(64);
+        let handles = spawn_headless(
+            "multi.mkv",
+            Arc::clone(&clock),
+            Arc::clone(&cancel),
+            Arc::new(AtomicU8::new(state_code::LOADING)),
+            event_tx,
+        );
+        let info = handles
+            .info_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(info.opened_audio_stream_index, Some(2));
+        let selection = handles
+            .audio_track_selection_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        drop(handles.audio_rx);
+        packet_sent.recv_timeout(Duration::from_secs(10)).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !clock.audio_worker_exited() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(clock.audio_worker_exited());
+        assert_eq!(selection.request(1), AudioTrackRequestOutcome::Accepted);
+        clock.request_seek(2.0);
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !clock.audio_lane_lost() && std::time::Instant::now() < deadline {
+            while handles.video_rx.try_recv().is_ok() {}
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(clock.audio_lane_lost());
+        let snapshot = selection.snapshot();
+        assert_eq!(snapshot.applied.stream_index, 2);
+        assert_eq!(
+            snapshot.last_failure.unwrap().reason,
+            AudioTrackSwitchFailureReason::WorkerGone
+        );
+        assert_eq!(selection.request(3), AudioTrackRequestOutcome::Rejected);
+        wait_video_frame(&handles.video_rx, 1, 1.99);
+        cancel.store(true, Ordering::Release);
+    }
+
+    /// Run separately with `--ignored --exact` to keep the global perf logger
+    /// isolated from the parallel full library suite.
+    #[test]
+    #[ignore]
+    fn measure_audio_setup_for_all_three_fixture_tracks() {
+        let log = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/audio-track-setup-perf.jsonl");
+        crate::perf::init_with_path(true, None, Some(log.clone()));
+        let session = SwitchSession::new();
+        for (serial, stream_index, hz, target) in
+            [(1, 1, 440.0, 1.0), (2, 3, 1320.0, 2.0), (3, 2, 880.0, 3.0)]
+        {
+            session.request(stream_index, target);
+            session.wait_pcm(serial, stream_index, hz, 5);
+        }
+        crate::perf::flush();
+        let lines = std::fs::read_to_string(log).unwrap();
+        let mut measured = std::collections::BTreeMap::new();
+        for line in lines.lines() {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            if value["cat"] == "audio" && value["kind"] == "audio_setup_build" {
+                measured.insert(
+                    value["stream_index"].as_u64().unwrap(),
+                    value["ms"].as_f64().unwrap(),
+                );
+            }
+        }
+        assert_eq!(measured.len(), 3);
+        for (stream_index, ms) in measured {
+            println!("AudioSetup stream={stream_index} ms={ms:.3}");
+        }
+    }
+
+    #[test]
+    fn silent_mp4_has_no_audio_tracks_or_opened_audio() {
+        let info = open_fixture_info("silent.mp4");
+        assert!(info.audio_tracks.is_empty());
+        assert_eq!(info.default_audio_stream_index, None);
+        assert_eq!(info.opened_audio_stream_index, None);
+        assert!(!info.has_audio);
+    }
+
+    #[test]
+    fn audio_only_decoder_seek_delivers_new_serial_pcm() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let clock = Arc::new(AvClock::new(1.0, Arc::new(AtomicU64::new(0))));
+        let (event_tx, _event_rx) = bounded(64);
+        let handles = spawn(
+            fixture_path("audio-only.flac"),
+            Arc::clone(&clock),
+            Arc::clone(&cancel),
+            48_000,
+            false,
+            crate::settings::VideoDeinterlaceMode::Off,
+            #[cfg(windows)]
+            None,
+            Arc::new(AtomicU8::new(state_code::LOADING)),
+            EngineEventSender::new(event_tx, Arc::new(VideoUiWake::default())),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(super::VideoDynamicState::default()),
+        );
+        let info = handles
+            .info_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert!(!info.has_video);
+        assert!(info.has_audio);
+        clock.request_seek(2.0);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut first_post_seek = None;
+        while std::time::Instant::now() < deadline {
+            let frame = match handles.audio_rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(frame) => frame,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    panic!("audio decoder disconnected during seek")
+                }
+            };
+            if frame.seek_serial == 1 {
+                first_post_seek = Some(frame);
+                break;
+            }
+        }
+        let frame = first_post_seek.expect("audio-only seek did not yield post-seek PCM");
+        assert!(frame.pts_secs >= 1.99, "unexpected PTS: {}", frame.pts_secs);
+        assert!(!frame.samples.is_empty());
+        cancel.store(true, Ordering::Release);
+        drop(handles);
+    }
+
+    #[test]
+    fn audio_loss_retries_inactive_on_full_lane_then_seek_returns_to_playing() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let seek_serial = Arc::new(AtomicU64::new(0));
+        let clock = Arc::new(AvClock::new(1.0, Arc::clone(&seek_serial)));
+        let mut actor = EngineActor::new(OpenOptions::default(), seek_serial, Arc::clone(&clock));
+        actor.begin_loading();
+        let (event_tx, event_rx) = bounded(1);
+        let handles = spawn_headless(
+            "single.mp4",
+            Arc::clone(&clock),
+            Arc::clone(&cancel),
+            actor.published_state_handle(),
+            event_tx.clone(),
+        );
+        let info = handles
+            .info_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert!(info.has_video && info.has_audio);
+        start_actor_playing(&mut actor, &info, &handles);
+        event_tx
+            .try_send(EngineEvent::Decoder(DecoderEvent::FirstFrameReady {
+                epoch: 0,
+                pts: 0.0,
+            }))
+            .unwrap();
+        drop(handles.audio_rx);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !clock.audio_lane_lost() && std::time::Instant::now() < deadline {
+            while handles.video_rx.try_recv().is_ok() {}
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(clock.audio_lane_lost(), "demux did not detach audio lane");
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            EngineEvent::Decoder(DecoderEvent::FirstFrameReady { epoch: 0, .. })
+        ));
+        let inactive = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(matches!(
+            inactive,
+            EngineEvent::Audio(AudioEvent::AudioInactive)
+        ));
+        actor.handle_audio_event(AudioEvent::AudioInactive);
+        assert!(!actor.readiness_snapshot().audio_required);
+        assert_eq!(actor.published_state_code(), state_code::PLAYING);
+
+        actor.handle_seek_request(2.0);
+        assert_eq!(actor.published_state_code(), state_code::SEEKING);
+        let completed = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let EngineEvent::Decoder(DecoderEvent::SeekCompleted {
+            epoch: 1,
+            actual_pts,
+        }) = completed
+        else {
+            panic!("expected actual seek completion");
+        };
+        actor.handle_decoder_event(DecoderEvent::SeekCompleted {
+            epoch: 1,
+            actual_pts,
+        });
+        assert_eq!(actor.published_state_code(), state_code::BUFFERING);
+        let frame = wait_video_frame(&handles.video_rx, 1, 1.99);
+        actor.handle_decoder_event(DecoderEvent::FirstFrameReady {
+            epoch: 1,
+            pts: frame.pts_secs,
+        });
+        assert_eq!(actor.published_state_code(), state_code::PLAYING);
+        cancel.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn audio_output_loss_with_short_audio_seeks_after_video_reaches_tail() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let seek_serial = Arc::new(AtomicU64::new(0));
+        let clock = Arc::new(AvClock::new(1.0, Arc::clone(&seek_serial)));
+        let mut actor = EngineActor::new(OpenOptions::default(), seek_serial, Arc::clone(&clock));
+        actor.begin_loading();
+        let (event_tx, event_rx) = bounded(64);
+        let handles = spawn_headless(
+            "short-audio.mp4",
+            Arc::clone(&clock),
+            Arc::clone(&cancel),
+            actor.published_state_handle(),
+            event_tx,
+        );
+        let info = handles
+            .info_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        start_actor_playing(&mut actor, &info, &handles);
+        drop(handles.audio_rx);
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            EngineEvent::Audio(AudioEvent::AudioInactive)
+        ));
+        actor.handle_audio_event(AudioEvent::AudioInactive);
+        wait_video_frame(&handles.video_rx, 0, 4.5);
+        actor.handle_seek_request(0.5);
+        let completed = event_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let EngineEvent::Decoder(DecoderEvent::SeekCompleted {
+            epoch: 1,
+            actual_pts,
+        }) = completed
+        else {
+            panic!("expected seek completion after short audio");
+        };
+        actor.handle_decoder_event(DecoderEvent::SeekCompleted {
+            epoch: 1,
+            actual_pts,
+        });
+        let frame = wait_video_frame(&handles.video_rx, 1, 0.49);
+        actor.handle_decoder_event(DecoderEvent::FirstFrameReady {
+            epoch: 1,
+            pts: frame.pts_secs,
+        });
+        assert_eq!(actor.published_state_code(), state_code::PLAYING);
+        cancel.store(true, Ordering::Release);
+    }
+
+    fn assert_audio_only_loss_fails_actor(seek_before_closure: bool, full_event_lane: bool) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let seek_serial = Arc::new(AtomicU64::new(0));
+        let clock = Arc::new(AvClock::new(1.0, Arc::clone(&seek_serial)));
+        let mut actor = EngineActor::new(OpenOptions::default(), seek_serial, Arc::clone(&clock));
+        actor.begin_loading();
+        let (packet_sent, release) = clock.gate_after_audio_packet_for_test();
+        let (event_tx, event_rx) = bounded(if full_event_lane { 1 } else { 64 });
+        let handles = spawn_headless(
+            "audio-only.flac",
+            Arc::clone(&clock),
+            Arc::clone(&cancel),
+            actor.published_state_handle(),
+            event_tx.clone(),
+        );
+        let info = handles
+            .info_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert!(!info.has_video && info.has_audio);
+        actor.handle_decoder_event(DecoderEvent::InfoReceived {
+            epoch: 0,
+            duration_secs: info.duration_secs,
+            has_audio: true,
+            has_video: false,
+        });
+        assert_eq!(actor.published_state_code(), state_code::BUFFERING);
+        let selection = handles
+            .audio_track_selection_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        packet_sent.recv_timeout(Duration::from_secs(10)).unwrap();
+        drop(handles.audio_rx);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !clock.audio_worker_exited() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(clock.audio_worker_exited());
+        assert_eq!(selection.request(1), AudioTrackRequestOutcome::Accepted);
+        let pending = selection.snapshot().desired;
+        if seek_before_closure {
+            actor.handle_seek_request(0.5);
+            assert_eq!(actor.published_state_code(), state_code::SEEKING);
+        }
+        if full_event_lane {
+            event_tx
+                .try_send(EngineEvent::Decoder(DecoderEvent::FirstFrameReady {
+                    epoch: 0,
+                    pts: 0.0,
+                }))
+                .unwrap();
+        }
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !clock.audio_lane_lost() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(clock.audio_lane_lost());
+        if !seek_before_closure {
+            // Demux has closed the selection and may have exited before the UI
+            // publishes the seek accepted above.
+            actor.handle_seek_request(0.5);
+            assert_eq!(actor.published_state_code(), state_code::SEEKING);
+        }
+        if full_event_lane {
+            // The terminal notification must hold demux alive until there is
+            // room; the one-shot AudioInactive retry would be lost at exit.
+            assert!(matches!(
+                handles.info_rx.recv_timeout(Duration::from_millis(50)),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout)
+            ));
+        }
+        let mut failed = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            let event = match event_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(event) => event,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    panic!("engine event lane disconnected before decoder Failed")
+                }
+            };
+            match event {
+                EngineEvent::Decoder(event @ DecoderEvent::Failed { .. }) => {
+                    actor.handle_decoder_event(event);
+                    failed = true;
+                    break;
+                }
+                EngineEvent::Decoder(event) => actor.handle_decoder_event(event),
+                EngineEvent::Audio(AudioEvent::AudioInactive) => {
+                    panic!("audio-only loss must send decoder Failed, not AudioInactive")
+                }
+                EngineEvent::Audio(event) => actor.handle_audio_event(event),
+            }
+        }
+        assert!(failed, "audio-only terminal decoder event was lost");
+        assert_eq!(actor.published_state_code(), state_code::IDLE);
+        assert!(matches!(
+            handles.info_rx.recv_timeout(Duration::from_secs(10)),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+        ));
+        assert_eq!(selection.snapshot().applied.stream_index, 0);
+        assert_eq!(
+            selection.snapshot().last_failure,
+            Some(
+                crate::video::audio_track_selection::AudioTrackSwitchFailure {
+                    choice: pending,
+                    reason: AudioTrackSwitchFailureReason::WorkerGone,
+                }
+            )
+        );
+        assert_eq!(selection.request(0), AudioTrackRequestOutcome::Rejected);
+        assert!(!cancel.load(Ordering::Acquire));
+        cancel.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn audio_only_selection_then_closure_then_seek_reaches_failed() {
+        assert_audio_only_loss_fails_actor(false, false);
+    }
+
+    #[test]
+    fn audio_only_selection_then_seek_then_closure_reaches_failed() {
+        assert_audio_only_loss_fails_actor(true, false);
+    }
+
+    #[test]
+    fn audio_only_failed_event_waits_for_full_engine_lane() {
+        assert_audio_only_loss_fails_actor(false, true);
+    }
+
+    #[test]
+    fn audio_only_terminal_send_stops_waiting_when_cancelled() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (event_tx, _event_rx) = bounded(1);
+        event_tx
+            .try_send(EngineEvent::Decoder(DecoderEvent::FirstFrameReady {
+                epoch: 0,
+                pts: 0.0,
+            }))
+            .unwrap();
+        let sender = EngineEventSender::new(event_tx, Arc::new(VideoUiWake::default()));
+        let worker_cancel = Arc::clone(&cancel);
+        let (started_tx, started_rx) = bounded(0);
+        let (done_tx, done_rx) = bounded(1);
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            super::send_audio_only_lane_failed(&worker_cancel, &sender);
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(50)),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout)
+        ));
+        cancel.store(true, Ordering::Release);
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn failed_seek_flush_packet_and_seek_completed_retry_use_real_demux() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let clock = Arc::new(AvClock::new(1.0, Arc::new(AtomicU64::new(0))));
+        let (entered, release) = clock.gate_next_demux_packet_for_test();
+        let (event_tx, event_rx) = bounded(1);
+        let handles = spawn_headless(
+            "audio-only.flac",
+            Arc::clone(&clock),
+            Arc::clone(&cancel),
+            Arc::new(AtomicU8::new(state_code::LOADING)),
+            event_tx.clone(),
+        );
+        handles
+            .info_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        entered.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (packet_sent, resume_demux) = clock.gate_after_audio_packet_for_test();
+        event_tx
+            .try_send(EngineEvent::Decoder(DecoderEvent::SeekCompleted {
+                epoch: 0,
+                actual_pts: 0.0,
+            }))
+            .unwrap();
+        clock.fail_next_demux_seek_for_test();
+        clock.request_seek(2.0);
+        release.send(()).unwrap();
+        packet_sent.recv_timeout(Duration::from_secs(10)).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let frame = loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "new-serial PCM missing after failed seek"
+            );
+            let frame = match handles.audio_rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(frame) => frame,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    panic!("audio decoder disconnected after failed seek")
+                }
+            };
+            if frame.seek_serial == 1 {
+                break frame;
+            }
+        };
+        assert!(
+            frame.pts_secs < 1.0,
+            "failed seek moved demux: {}",
+            frame.pts_secs
+        );
+        assert_eq!(frame.seek_target_secs, None);
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            EngineEvent::Decoder(DecoderEvent::SeekCompleted { epoch: 0, .. })
+        ));
+        resume_demux.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let retried = loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "SeekCompleted was not retried"
+            );
+            while handles.audio_rx.try_recv().is_ok() {}
+            match event_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(EngineEvent::Decoder(DecoderEvent::SeekCompleted { epoch: 1, .. })) => {
+                    break true;
+                }
+                Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break false,
+            }
+        };
+        assert!(retried);
+        cancel.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod demux_serial_tests {
+    use super::{
+        AudioControlMsg, AudioDecodeInput, AudioPacketMsg, DemuxSerial, SeekFlushResult,
+        VideoControlMsg, VideoDecodeInput, VideoPacketMsg, audio_packet_msg, packet_matches_seek,
+        recv_audio_decode_input, recv_video_decode_input_with_timeout, video_packet_msg,
+    };
+    use crate::video::clock::AvClock;
+    use crossbeam_channel::bounded;
+    use ffmpeg_the_third::media::Type as MediaType;
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::time::Duration;
+
+    fn clock() -> AvClock {
+        AvClock::new(1.0, Arc::new(AtomicU64::new(0)))
+    }
+
+    fn audio_flush(serial: u64, trim: Option<f64>) -> AudioControlMsg {
+        AudioControlMsg::Flush {
+            serial,
+            seek_target_secs: trim,
+            trim_before_secs: trim,
+            replace_setup: None,
+        }
+    }
+
+    #[test]
+    fn eos_packet_queued_before_prioritized_seek_flush_remains_stale() {
+        let clock = clock();
+        let (pkt_tx, pkt_rx) = bounded(1);
+        let (ctl_tx, ctl_rx) = bounded(1);
+        let demux_serial = DemuxSerial(0);
+        pkt_tx
+            .send(AudioPacketMsg::Eof {
+                serial: demux_serial.packet_serial(&clock),
+            })
+            .unwrap();
+        clock.request_seek(1.0);
+        ctl_tx.send(audio_flush(1, Some(1.0))).unwrap();
+        let input = recv_audio_decode_input(&ctl_rx, &pkt_rx).unwrap();
+        let AudioDecodeInput::Control(AudioControlMsg::Flush {
+            serial: decoder_serial,
+            ..
+        }) = input
+        else {
+            panic!("control must have priority")
+        };
+        let input = recv_audio_decode_input(&ctl_rx, &pkt_rx).unwrap();
+        let AudioDecodeInput::Packet(AudioPacketMsg::Eof { serial }) = input else {
+            panic!("queued EOS")
+        };
+        assert!(!packet_matches_seek(serial, decoder_serial, &clock));
+        clock.note_audio_decoded_eos(serial);
+        assert!(!clock.audio_decoded_eos(1));
+    }
+
+    #[test]
+    fn packet_read_between_live_serial_and_seek_publication_stays_stale() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/audio-tracks/multi.mkv");
+        let mut input = ffmpeg_the_third::format::input(&path).unwrap();
+        let clock = clock();
+        let cancel = AtomicBool::new(false);
+        let mut demux_serial = DemuxSerial(0);
+        let (video_pkt_tx, video_pkt_rx) = bounded(1);
+        let (audio_pkt_tx, audio_pkt_rx) = bounded(1);
+        let (video_ctl_tx, video_ctl_rx) = bounded(1);
+        let (audio_ctl_tx, audio_ctl_rx) = bounded(1);
+
+        // The hook fixes the actual interleaving: the live serial is 1, the
+        // request is still unpublished, and demux reads old-position packets.
+        clock.request_seek_before_publish_for_test(2.0, || {
+            assert_eq!(clock.current_seek_serial(), 1);
+            assert!(!clock.peek_seek_request_pending());
+            let mut saw_video = false;
+            let mut saw_audio = false;
+            for item in input.packets() {
+                let (stream, packet) = item.unwrap();
+                match stream.parameters().medium() {
+                    MediaType::Video if !saw_video => {
+                        video_pkt_tx
+                            .send(video_packet_msg(packet, &demux_serial, &clock))
+                            .unwrap();
+                        saw_video = true;
+                    }
+                    MediaType::Audio if !saw_audio => {
+                        audio_pkt_tx
+                            .send(audio_packet_msg(packet, &demux_serial, &clock))
+                            .unwrap();
+                        saw_audio = true;
+                    }
+                    _ => {}
+                }
+                if saw_video && saw_audio {
+                    break;
+                }
+            }
+            assert!(saw_video && saw_audio);
+        });
+        let req = clock.take_seek_request().unwrap();
+        assert_eq!(req.serial, 1);
+        assert_eq!(
+            demux_serial.send_seek_flushes(
+                req.serial,
+                Some((
+                    &video_ctl_tx,
+                    VideoControlMsg::Flush {
+                        serial: req.serial,
+                        trim_before_secs: Some(2.0),
+                        frame_step: None,
+                    },
+                )),
+                Some((&audio_ctl_tx, audio_flush(req.serial, Some(2.0)))),
+                &cancel,
+                false,
+            ),
+            SeekFlushResult::Accepted
+        );
+
+        assert!(matches!(
+            recv_video_decode_input_with_timeout(
+                &video_ctl_rx,
+                &video_pkt_rx,
+                Duration::from_millis(100)
+            )
+            .unwrap()
+            .unwrap(),
+            VideoDecodeInput::Control(VideoControlMsg::Flush { serial: 1, .. })
+        ));
+        assert!(matches!(
+            recv_audio_decode_input(&audio_ctl_rx, &audio_pkt_rx).unwrap(),
+            AudioDecodeInput::Control(AudioControlMsg::Flush { serial: 1, .. })
+        ));
+        let VideoPacketMsg::Packet {
+            serial: video_serial,
+            ..
+        } = video_pkt_rx.recv().unwrap()
+        else {
+            panic!("expected video packet");
+        };
+        let AudioPacketMsg::Packet {
+            serial: audio_serial,
+            ..
+        } = audio_pkt_rx.recv().unwrap()
+        else {
+            panic!("expected audio packet");
+        };
+        assert_eq!((video_serial, audio_serial), (0, 0));
+        assert!(!packet_matches_seek(video_serial, 1, &clock));
+        assert!(!packet_matches_seek(audio_serial, 1, &clock));
+        assert_eq!(demux_serial.packet_serial(&clock), 1);
+    }
+
+    #[test]
+    fn audio_only_seek_advances_after_audio_flush() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/audio-tracks/audio-only.flac");
+        let mut input = ffmpeg_the_third::format::input(&path).unwrap();
+        assert!(input.streams().best(MediaType::Video).is_none());
+        assert!(input.streams().best(MediaType::Audio).is_some());
+        let clock = clock();
+        let cancel = AtomicBool::new(false);
+        let mut demux_serial = DemuxSerial(0);
+        let (audio_ctl_tx, audio_ctl_rx) = bounded(2);
+
+        clock.request_seek(2.0);
+        let req = clock.take_seek_request().unwrap();
+        input.seek(2_000_000, 2_000_000..).unwrap();
+        assert_eq!(
+            demux_serial.send_seek_flushes(
+                req.serial,
+                None,
+                Some((&audio_ctl_tx, audio_flush(req.serial, Some(2.0)))),
+                &cancel,
+                false,
+            ),
+            SeekFlushResult::Accepted
+        );
+        assert_eq!(demux_serial.packet_serial(&clock), 1);
+        assert!(matches!(
+            audio_ctl_rx.recv().unwrap(),
+            AudioControlMsg::Flush { serial: 1, .. }
+        ));
+        let (stream, _) = input.packets().next().unwrap().unwrap();
+        assert_eq!(stream.parameters().medium(), MediaType::Audio);
+        assert!(packet_matches_seek(
+            demux_serial.packet_serial(&clock),
+            1,
+            &clock
+        ));
+    }
+
+    #[test]
+    fn audio_flush_disconnect_keeps_video_seek_and_advances_serial() {
+        let clock = clock();
+        let cancel = AtomicBool::new(false);
+        let mut demux_serial = DemuxSerial(0);
+        let (video_ctl_tx, video_ctl_rx) = bounded(1);
+        let (audio_ctl_tx, audio_ctl_rx) = bounded(1);
+        drop(audio_ctl_rx);
+        clock.request_seek(1.0);
+        let req = clock.take_seek_request().unwrap();
+        assert_eq!(
+            demux_serial.send_seek_flushes(
+                req.serial,
+                Some((
+                    &video_ctl_tx,
+                    VideoControlMsg::Flush {
+                        serial: req.serial,
+                        trim_before_secs: Some(1.0),
+                        frame_step: None,
+                    },
+                )),
+                Some((&audio_ctl_tx, audio_flush(req.serial, Some(1.0)))),
+                &cancel,
+                false,
+            ),
+            SeekFlushResult::AudioLost
+        );
+        assert!(matches!(
+            video_ctl_rx.recv().unwrap(),
+            VideoControlMsg::Flush { serial: 1, .. }
+        ));
+        assert_eq!(demux_serial.packet_serial(&clock), 1);
+    }
+
+    #[test]
+    fn audio_only_flush_disconnect_reports_lane_loss_but_cancel_still_terminates() {
+        let clock = clock();
+        let (audio_ctl_tx, audio_ctl_rx) = bounded(1);
+        drop(audio_ctl_rx);
+        let mut serial = DemuxSerial(0);
+        let cancel = AtomicBool::new(false);
+        assert_eq!(
+            serial.send_seek_flushes(
+                1,
+                None,
+                Some((&audio_ctl_tx, audio_flush(1, Some(1.0)))),
+                &cancel,
+                false,
+            ),
+            SeekFlushResult::AudioLost
+        );
+        assert_eq!(serial.packet_serial(&clock), 0);
+
+        let (video_ctl_tx, video_ctl_rx) = bounded(1);
+        cancel.store(true, std::sync::atomic::Ordering::Release);
+        assert_eq!(
+            serial.send_seek_flushes(
+                1,
+                Some((
+                    &video_ctl_tx,
+                    VideoControlMsg::Flush {
+                        serial: 1,
+                        trim_before_secs: Some(1.0),
+                        frame_step: None,
+                    },
+                )),
+                Some((&audio_ctl_tx, audio_flush(1, Some(1.0)))),
+                &cancel,
+                false,
+            ),
+            SeekFlushResult::Terminated
+        );
+        assert!(video_ctl_rx.is_empty());
+        assert_eq!(serial.packet_serial(&clock), 0);
+    }
+}
+
+#[cfg(test)]
 mod decoder_candidate_tests {
     use super::{
         AudioControlMsg, AudioDecodeInput, AudioPacketMsg, BwdifFilterKey, DecoderChoice,
@@ -8163,6 +11391,7 @@ mod decoder_candidate_tests {
                 serial: 9,
                 seek_target_secs: Some(9.0),
                 trim_before_secs: Some(9.0),
+                replace_setup: None,
             })
             .unwrap();
 

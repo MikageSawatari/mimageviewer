@@ -1,5 +1,5 @@
 ﻿================================================================
- mImageViewer (エムイメージビューワー) Version 3.7.0
+ mImageViewer (エムイメージビューワー) Version 4.4.0
 ================================================================
 
 Windows 向け 高速サムネイル画像ビューワー
@@ -49,7 +49,8 @@ GPU アクセラレーションによるサムネイルグリッド表示を特�
   - ZIP 内画像のブラウズ（展開不要）
   - RAR / CBR / 7z / LZH の ZIP 変換閲覧（RAR / CBR はパスワード付きにも対応）
   - PDF 表示（PDF 表示エンジン内蔵、パスワード付き対応）
-  - RAW / HEIC / AVIF / JPEG XL 表示（Windows WIC 経由）
+  - DRM のない EPUB を PDF に変換して閲覧（音声・動画は含まれません）
+  - RAW 表示・現像（内蔵）/ HEIC / AVIF / JPEG XL 表示（Windows の表示機能）
   - Susie 画像プラグイン（.spi、32bit）対応
   - 動画インライン再生（MP4 / MKV / MOV / AVI / WMV / MPG / HEVC / AV1 等、
     GPU ハードウェアデコード対応、シーク / 倍速再生 / タイル モード /
@@ -79,22 +80,33 @@ GPU アクセラレーションによるサムネイルグリッド表示を特�
   OS        : Windows 11
               （64bit 版のみ）
   CPU       : x86-64（Intel / AMD）
+              音響調整 (EffeTune) には AVX2 と FMA の両方に対応した CPU が必要です。
   メモリ    : 4 GB 以上（8 GB 以上推奨）
   GPU       : DirectX 12 対応 GPU
               （最新のグラフィックドライバを推奨）
-  ストレージ: インストール時 約 200 MB
+  ストレージ: インストール時 約 470 MB
+              初回起動時に %APPDATA% へ関連ファイルを展開するため、
+              追加で約 500 MB の空き容量が必要です。
+              キャッシュや利用中の保存データには別途空き容量が必要です。
 
-追加ソフト: 不要
+追加ソフト: EPUB の変換と音響調整 (EffeTune) の画面表示には
+          Microsoft Edge WebView2 Runtime が必要です。
+          Windows 11 には標準で含まれています。
 
 AI アップスケール / JPEG ノイズ除去 / 消しゴム (画像修復) 等の
 AI 機能は DirectML（Microsoft 公式）を利用します。
 DirectML.dll は Windows 11 に標準で同梱
 されているため、対応 OS ならば追加インストールは不要です。
 
-HEIC / AVIF / JPEG XL / RAW を表示するには Windows Imaging
+RAW は追加インストールなしで表示・現像できます。
+HEIC / AVIF / JPEG XL を表示するには Windows Imaging
 Component（WIC）が必要ですが、Windows 11 には標準で
-含まれています。一部フォーマットは Microsoft Store から
-コーデックの追加インストールが必要な場合があります。
+含まれています。追加が必要な場合は Microsoft Store から次を入れます:
+  - HEIC / HEIF: HEIF 画像表示オプション
+    HEIC は、HEVC に対応していない PC では HEVC ビデオ拡張機能も必要です。
+    HEVC ビデオ拡張機能は有料の場合があります。
+  - AVIF: AV1 ビデオ拡張機能
+  - JPEG XL: JPEG XL 画像表示オプション
 
 
 ----------------------------------------------------------------
@@ -126,10 +138,23 @@ Windows の「設定」→「アプリ」→「インストールされている
 アンインストール時に「設定ファイルとキャッシュを削除しますか？」
 と尋ねられます。
 
-  - 「はい」を選ぶと、%APPDATA%\mimageviewer\ が完全に削除され、
-    完全な状態でアンインストールされます。
+  - 「はい」を選ぶと、%APPDATA%\mimageviewer\ の設定・キャッシュ等が
+    削除されます。
   - 「いいえ」を選ぶと、設定とキャッシュは保持されます。
     再インストール時に同じ設定で使い始められます。
+
+次のフォルダは、どちらを選んでも残ります。不要になった場合は、
+mImageViewer と関連するアプリを終了してから手動で削除できます。
+
+  - %APPDATA%\effetune\ または %APPDATA%\Frieve\EffeTunePlugin\
+    音響調整 (EffeTune) のプリセット・設定です。他の EffeTune 製品と
+    共有するため、自動では削除しません。他の製品でも使わなくなった
+    ことを確認してから削除してください。
+  - %APPDATA%\mimageviewer-vst3-host.exe\
+    EffeTune に取り込んだ IR ファイル・測定データ、ビジュアライザーの
+    レイアウト・背景画像です。
+  - %APPDATA%\mimageviewer-remote\
+    リモート閲覧用サービスの動作記録等です。
 
 
 ----------------------------------------------------------------
@@ -148,6 +173,18 @@ Windows の「設定」→「アプリ」→「インストールされている
   - mimageviewer-susie32.exe
                      : Susie プラグイン用 32bit ワーカー
                       （初回展開）
+  - runtime\<version>\mimageviewer-epub-pdf.exe
+                     : EPUB 変換用プログラム（初回展開）
+  - epub_cache\      : EPUB から変換した PDF（管理画面で削除予約）
+  - runtime\<version>\effetune\<hash12>-<generation>\EffeTune Mixwright.vst3\
+                     : 音響調整用プラグインと関連ファイル（初回展開）
+  - effetune\        : 次回起動時に復元する音響調整の状態
+
+音響調整のプリセット・設定、取り込んだ IR ファイル・測定データ、
+ビジュアライザーのレイアウト・背景画像は、上記とは別のフォルダに
+保存されます。リモート閲覧用サービスも %APPDATA%\mimageviewer-remote\
+を利用します。これらの保存先と削除方法は「5. アンインストール方法」
+を参照してください。
 
 また、お気に入りに登録したフォルダの更新を検知するため、
 内部的に Windows API の ReadDirectoryChangesW による
@@ -179,7 +216,14 @@ https://mikage.to/mimageviewer/privacy.html
   - PDFium (BSD-3-Clause): Google Chrome の PDF エンジン
   - ONNX Runtime (MIT): Microsoft
   - DirectML (Microsoft 独自ライセンス): Microsoft
-  - libjpeg-turbo (BSD-3-Clause / zlib)
+  - LibRaw (CDDL-1.0): LibRaw LLC
+    ライセンス全文と著作権表記: LIBRAW-LICENSE.txt
+    対応ソース: https://mikage.to/mimageviewer/libraw-0.22.2-source.tar.gz
+  - zlib 1.3.1 (zlib): Jean-loup Gailly and Mark Adler
+    ライセンス全文: ZLIB-LICENSE.txt
+  - libjpeg-turbo (IJG / BSD-3-Clause / zlib)
+    ライセンス全文: LIBJPEG-TURBO-LICENSE.txt
+    This software is based in part on the work of the Independent JPEG Group.
   - eframe / egui (MIT OR Apache-2.0): Emil Ernerfeldt and contributors
     ライセンス全文はインストール先の egui-LICENSE-MIT.txt /
     egui-LICENSE-APACHE.txt を参照してください。
@@ -187,6 +231,12 @@ https://mikage.to/mimageviewer/privacy.html
     Source and license notes: https://mikage.to/mimageviewer/
   - UnRAR source code (UnRAR license): Alexander Roshal / RARLAB
     RAR 展開に使用します。ライセンス全文は UNRAR-LICENSE.txt を参照してください。
+  - EffeTune Mixwright (MIT): Copyright (c) 2025-2026 Yoshiyuki Kobayashi
+    同梱コンポーネント（VST3 SDK、JSZip と内包される lie / immediate /
+    setImmediate / pako (zlib)、CHOC、PFFFT、fdlibm、および通知に記載されたその他の
+    ライブラリ）には、それぞれのライセンスが適用されます。
+    ライセンス全文は、アプリの「ソフトウェア情報」（バージョン情報）の
+    EffeTune THIRD-PARTY-NOTICES / DSP NOTICE / 補足通知で確認できます。
   - Steinberg VST3 SDK (MIT): Steinberg Media Technologies GmbH
   - Twemoji 絵文字グラフィックス (CC-BY 4.0): Twitter, Inc. and other contributors
     （注釈機能のスタンプに使用）

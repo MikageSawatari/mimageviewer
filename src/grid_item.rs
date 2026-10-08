@@ -29,7 +29,7 @@ fn path_display_name(path: &Path) -> Cow<'_, str> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GridItem {
     Folder(PathBuf),
     Image(PathBuf),
@@ -111,6 +111,32 @@ pub enum GridItem {
         /// アイコンの代わりにサムネイルとして描画する。None ならアイコン表示のみ。
         representative: Option<ContainerRepresentative>,
     },
+    /// A physical source reference retained by a collection even though it cannot currently be
+    /// opened. The collection-owned aligned binding carries the stable entry identity and typed
+    /// reason; this value exists only so the ordinary Grid can paint the row without pretending
+    /// that the source is an Image/Folder and accidentally enabling physical operations.
+    CollectionPlaceholder {
+        path: PathBuf,
+        last_known_kind: crate::collection_store::CollectionResolvedKind,
+        reason: CollectionPlaceholderReason,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CollectionPlaceholderReason {
+    Missing,
+    Unsupported,
+    AccessError,
+}
+
+impl CollectionPlaceholderReason {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Missing => "見つかりません",
+            Self::Unsupported => "未対応の形式",
+            Self::AccessError => "読み取れません",
+        }
+    }
 }
 
 /// `GridItem::SearchContainer` のコンテナ種別 (v0.8.0)。
@@ -150,6 +176,8 @@ pub enum FileOperationRefusal {
     Stack,
     /// 検索結果の集約コンテナ。
     SearchContainer,
+    /// A collection reference whose physical source is currently missing or unavailable.
+    CollectionSourceUnavailable,
 }
 
 impl FileOperationRefusal {
@@ -165,6 +193,9 @@ impl FileOperationRefusal {
                 "スタックのセルは{action}できません。スタック表示をオフにすると個別に選べます"
             ),
             Self::SearchContainer => format!("検索結果のまとまりは{action}できません"),
+            Self::CollectionSourceUnavailable => {
+                format!("見つからないコレクション項目は{action}できません")
+            }
         }
     }
 }
@@ -232,6 +263,7 @@ impl GridItem {
         matches!(
             self,
             Self::Folder(_)
+                | Self::Audio(_)
                 | Self::ZipFile(_)
                 | Self::ConvertibleArchive { .. }
                 | Self::ZipDir { .. }
@@ -277,6 +309,7 @@ impl GridItem {
             GridItem::PdfPage { page_num, .. } => Cow::Owned(format!("Page {}", page_num + 1)),
             GridItem::SearchContainer { path, .. } => path_display_name(path),
             GridItem::Stack { key, .. } => Cow::Borrowed(key),
+            GridItem::CollectionPlaceholder { path, .. } => path_display_name(path),
         }
     }
 
@@ -308,6 +341,7 @@ impl GridItem {
                 ..
             } => format!("{}:{}", zip_path.display(), dir_prefix),
             GridItem::Stack { representative, .. } => representative.display().to_string(),
+            GridItem::CollectionPlaceholder { path, .. } => path.display().to_string(),
         }
     }
 
@@ -372,6 +406,9 @@ impl GridItem {
             Self::ZipDir { .. } => Some(FileOperationRefusal::ArchiveDirectory),
             Self::Stack { .. } => Some(FileOperationRefusal::Stack),
             Self::SearchContainer { .. } => Some(FileOperationRefusal::SearchContainer),
+            Self::CollectionPlaceholder { .. } => {
+                Some(FileOperationRefusal::CollectionSourceUnavailable)
+            }
         }
     }
 
@@ -424,6 +461,9 @@ impl GridItem {
             }
             GridItem::Stack { representative, .. } => {
                 format!("stack::{}", representative.display())
+            }
+            GridItem::CollectionPlaceholder { path, .. } => {
+                format!("collection-missing::{}", path.display())
             }
         }
     }
@@ -491,11 +531,22 @@ pub enum ThumbnailState {
         source_dims: Option<(u32, u32)>,
         layout_dims: Option<(u32, u32)>,
     },
+    /// 調査済みで表紙がない。再読込まで再要求しない。
+    NoArt,
     /// 読み込みに失敗した（再試行しない）
     Failed,
     /// 段階 B: 先読み範囲外に出て GPU テクスチャを破棄済み
     /// 再び範囲内に入ったら再ロードされる
     Evicted,
+}
+
+impl ThumbnailState {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Loaded { .. } | Self::NoArt | Self::Failed)
+    }
+    pub fn has_pixels(&self) -> bool {
+        matches!(self, Self::Loaded { .. })
+    }
 }
 
 /// グリッド上段のフォルダ系ブロック (Folder / ZipFile / PdfFile / ConvertibleArchive 等)
@@ -509,26 +560,74 @@ pub fn sort_folder_block(
     folder_metas: &mut Vec<Option<(i64, i64)>>,
     sort: crate::settings::SortOrder,
 ) {
+    debug_assert!(
+        !sort.is_size(),
+        "size list sort requires aligned ListingSortMetadata"
+    );
+    let mut listing_metas = folders
+        .iter()
+        .zip(folder_metas.iter())
+        .map(|(item, meta)| {
+            listing_sort_metadata_for_item(
+                item,
+                crate::settings::ListingSortMetadata::new(
+                    meta.map(|(mtime, _)| mtime).unwrap_or(0),
+                    None,
+                ),
+            )
+        })
+        .collect();
+    sort_folder_block_with_metadata(folders, folder_metas, &mut listing_metas, sort);
+}
+
+/// `sort_folder_block` のtyped正本。producerが渡したsize availabilityをitem kindで
+/// さらに狭めるが、display metadataの0やitem variantからKnownへ推測しない。
+pub(crate) fn sort_folder_block_with_metadata(
+    folders: &mut Vec<GridItem>,
+    folder_metas: &mut Vec<Option<(i64, i64)>>,
+    listing_metas: &mut Vec<crate::settings::ListingSortMetadata>,
+    sort: crate::settings::SortOrder,
+) {
     // pub fn の契約違反 (folders と folder_metas の長さ不一致) は release でも止める。
     // zip は短い方に合わせるので silently drop されると並びが壊れる。
     assert_eq!(folders.len(), folder_metas.len());
+    assert_eq!(folders.len(), listing_metas.len());
     let mut paired: Vec<_> = folders
         .drain(..)
         .zip(folder_metas.drain(..))
-        .map(|(item, meta)| {
+        .zip(listing_metas.drain(..))
+        .map(|((item, meta), listing_meta)| {
             let key = sort.name_key(&item.name());
-            (item, meta, key)
+            let listing_meta = listing_sort_metadata_for_item(&item, listing_meta);
+            (item, meta, listing_meta, key)
         })
         .collect();
-    paired.sort_by(|(_, ma, ak), (_, mb, bk)| {
-        let a_mt = ma.map(|(mt, _)| mt).unwrap_or(0);
-        let b_mt = mb.map(|(mt, _)| mt).unwrap_or(0);
-        sort.compare_name_keys(ak, a_mt, bk, b_mt)
-    });
-    for (f, m, _) in paired {
+    paired.sort_by(|(_, _, ma, ak), (_, _, mb, bk)| sort.compare_listing_keys(ak, *ma, bk, *mb));
+    for (f, m, listing_meta, _) in paired {
         folders.push(f);
         folder_metas.push(m);
+        listing_metas.push(listing_meta);
     }
+}
+
+/// producer由来のtyped metadataを `GridItem` の実体性で狭める。
+/// None→Someへの昇格は行わない。
+pub(crate) fn listing_sort_metadata_for_item(
+    item: &GridItem,
+    mut metadata: crate::settings::ListingSortMetadata,
+) -> crate::settings::ListingSortMetadata {
+    if !matches!(
+        item,
+        GridItem::Image(_)
+            | GridItem::Video(_)
+            | GridItem::Audio(_)
+            | GridItem::ZipFile(_)
+            | GridItem::PdfFile(_)
+            | GridItem::ConvertibleArchive { .. }
+    ) {
+        metadata.file_size = None;
+    }
+    metadata
 }
 
 /// 設定された 4 行のカテゴリ割り当てで items と同位置メタデータを並べ直す。
@@ -546,34 +645,128 @@ pub fn arrange_grid_items(
     display_order: &crate::settings::GridDisplayOrder,
     sort: Option<crate::settings::SortOrder>,
 ) {
+    debug_assert!(
+        !sort.is_some_and(crate::settings::SortOrder::is_size),
+        "size list sort requires aligned ListingSortMetadata"
+    );
+    let mut listing_metas = items
+        .iter()
+        .zip(image_metas.iter())
+        .map(|(item, meta)| {
+            listing_sort_metadata_for_item(
+                item,
+                crate::settings::ListingSortMetadata::new(
+                    meta.map(|(mtime, _)| mtime).unwrap_or(0),
+                    None,
+                ),
+            )
+        })
+        .collect();
+    arrange_grid_items_with_sort_metadata(
+        items,
+        image_metas,
+        &mut listing_metas,
+        display_order,
+        sort,
+    );
+}
+
+pub(crate) fn arrange_grid_items_with_sort_metadata(
+    items: &mut Vec<GridItem>,
+    image_metas: &mut Vec<Option<(i64, i64)>>,
+    listing_metas: &mut Vec<crate::settings::ListingSortMetadata>,
+    display_order: &crate::settings::GridDisplayOrder,
+    sort: Option<crate::settings::SortOrder>,
+) {
     assert_eq!(items.len(), image_metas.len());
+    assert_eq!(items.len(), listing_metas.len());
     let display_order = display_order.normalized();
     let mut row_items: [Vec<GridItem>; 4] = std::array::from_fn(|_| Vec::new());
     let mut row_metas: [Vec<Option<(i64, i64)>>; 4] = std::array::from_fn(|_| Vec::new());
+    let mut row_listing_metas: [Vec<crate::settings::ListingSortMetadata>; 4] =
+        std::array::from_fn(|_| Vec::new());
     let mut other_items = Vec::new();
     let mut other_metas = Vec::new();
+    let mut other_listing_metas = Vec::new();
 
-    for (item, meta) in items.drain(..).zip(image_metas.drain(..)) {
+    for ((item, meta), listing_meta) in items
+        .drain(..)
+        .zip(image_metas.drain(..))
+        .zip(listing_metas.drain(..))
+    {
+        let listing_meta = listing_sort_metadata_for_item(&item, listing_meta);
         if let Some(kind) = display_kind(&item) {
             let row = display_order.row_for(kind);
             row_items[row].push(item);
             row_metas[row].push(meta);
+            row_listing_metas[row].push(listing_meta);
         } else {
             other_items.push(item);
             other_metas.push(meta);
+            other_listing_metas.push(listing_meta);
         }
     }
 
     for row in 0..4 {
         if let Some(sort) = sort {
-            sort_folder_block(&mut row_items[row], &mut row_metas[row], sort);
+            sort_folder_block_with_metadata(
+                &mut row_items[row],
+                &mut row_metas[row],
+                &mut row_listing_metas[row],
+                sort,
+            );
         }
         items.append(&mut row_items[row]);
         image_metas.append(&mut row_metas[row]);
+        listing_metas.append(&mut row_listing_metas[row]);
     }
     // §1.6 の 4 カテゴリ外にある検索専用/レガシー疑似セルは、欠落させず末尾へ保つ。
     items.append(&mut other_items);
     image_metas.append(&mut other_metas);
+    listing_metas.append(&mut other_listing_metas);
+}
+
+/// Rating keys travel with rows through the display-row permutation. An
+/// unsupported row is distinct from a confirmed zero-star row.
+pub(crate) fn arrange_grid_items_with_rating_keys(
+    items: &mut Vec<GridItem>,
+    image_metas: &mut Vec<Option<(i64, i64)>>,
+    listing_metas: &mut Vec<crate::settings::ListingSortMetadata>,
+    rating_keys: &mut Vec<crate::rating_sort::RatingSortKey>,
+    display_order: &crate::settings::GridDisplayOrder,
+    spec: crate::rating_sort::RatingSortSpec,
+) {
+    assert_eq!(items.len(), image_metas.len());
+    assert_eq!(items.len(), listing_metas.len());
+    assert_eq!(items.len(), rating_keys.len());
+    let display_order = display_order.normalized();
+    let mut rows: [Vec<_>; 5] = std::array::from_fn(|_| Vec::new());
+    for (((item, meta), listing_meta), rating_key) in items
+        .drain(..)
+        .zip(image_metas.drain(..))
+        .zip(listing_metas.drain(..))
+        .zip(rating_keys.drain(..))
+    {
+        let row = display_kind(&item)
+            .map(|kind| display_order.row_for(kind))
+            .unwrap_or(4);
+        let name = crate::settings::SortOrder::FileName.name_key(&item.name());
+        rows[row].push((item, meta, listing_meta, rating_key, name));
+    }
+    for row in &mut rows[..4] {
+        row.sort_by(|a, b| spec.compare(a.3, &a.4, b.3, &b.4));
+    }
+    for row in rows {
+        for (item, meta, listing_meta, rating_key, _) in row {
+            items.push(item);
+            image_metas.push(meta);
+            listing_metas.push(listing_sort_metadata_for_item(
+                items.last().unwrap(),
+                listing_meta,
+            ));
+            rating_keys.push(rating_key);
+        }
+    }
 }
 
 /// ソート済みのビュー行から grid の items と同位置メタデータを作る。
@@ -632,7 +825,7 @@ fn display_kind(item: &GridItem) -> Option<crate::settings::GridItemDisplayKind>
         | GridItem::PdfPage { .. }
         | GridItem::Stack { .. } => Some(GridItemDisplayKind::Image),
         GridItem::Video(_) | GridItem::Audio(_) => Some(GridItemDisplayKind::VideoAudio),
-        GridItem::SearchContainer { .. } => None,
+        GridItem::SearchContainer { .. } | GridItem::CollectionPlaceholder { .. } => None,
     }
 }
 
@@ -679,7 +872,7 @@ mod tests {
         assert!(item.accepts_rating());
         assert!(!item.has_page_data());
         assert!(!item.is_container_ratable());
-        assert!(!item.is_heavy_io());
+        assert!(item.is_heavy_io());
         assert!(item.is_checkable());
         assert!(item.file_operation_path().is_some());
         assert!(item.drag_source_path().is_some());
@@ -1024,6 +1217,63 @@ mod tests {
         assert_eq!(
             arranged_names(mixed_outer_items(), order),
             ["z.jpg", "a.zip", "b-folder", "c.mp4"]
+        );
+    }
+
+    #[test]
+    fn size_arrange_keeps_categories_and_narrows_virtual_sizes_to_unknown() {
+        use crate::settings::GridItemDisplayKind::{Archive, Folder, Image, VideoAudio};
+        let mut items = vec![
+            GridItem::Folder(PathBuf::from(r"C:\grid\folder")),
+            GridItem::Video(PathBuf::from(r"C:\grid\ten.mp4")),
+            GridItem::PdfPage {
+                pdf_path: PathBuf::from(r"C:\grid\book.pdf"),
+                page_num: 1,
+                content_type: None,
+            },
+            GridItem::Image(PathBuf::from(r"C:\grid\zero.jpg")),
+            GridItem::Stack {
+                key: "stack".into(),
+                representative: PathBuf::from(r"C:\grid\stack.jpg"),
+                count: 2,
+            },
+        ];
+        let mut display_metas = vec![Some((1, 0)); items.len()];
+        // All producers claim a size here. The GridItem boundary must narrow Folder/PdfPage/Stack
+        // to Unknown rather than re-inferring availability from the display tuple.
+        let mut sort_metas = vec![
+            crate::settings::ListingSortMetadata::new(1, Some(3)),
+            crate::settings::ListingSortMetadata::new(1, Some(10)),
+            crate::settings::ListingSortMetadata::new(1, Some(2)),
+            crate::settings::ListingSortMetadata::new(1, Some(0)),
+            crate::settings::ListingSortMetadata::new(1, Some(1)),
+        ];
+        let one_row = crate::settings::GridDisplayOrder::from_rows([
+            vec![Folder, Archive, Image, VideoAudio],
+            vec![],
+            vec![],
+            vec![],
+        ]);
+        arrange_grid_items_with_sort_metadata(
+            &mut items,
+            &mut display_metas,
+            &mut sort_metas,
+            &one_row,
+            Some(crate::settings::SortOrder::SizeAsc),
+        );
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["zero.jpg", "ten.mp4", "folder", "Page 2", "stack"]
+        );
+        assert_eq!(
+            sort_metas
+                .iter()
+                .map(|metadata| metadata.file_size)
+                .collect::<Vec<_>>(),
+            [Some(0), Some(10), None, None, None]
         );
     }
 }

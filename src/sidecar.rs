@@ -34,12 +34,14 @@
 //! - 設定 OFF 時: 読み書き両方スキップ。既存ファイルは削除しない。
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::adjustment::AdjustParams;
 use crate::mask_db::Shape;
@@ -173,6 +175,327 @@ pub struct SidecarFile {
     dirty_since: Option<Instant>,
 }
 
+/// A disk snapshot used by the sidecar import path.
+///
+/// The digest identifies the bytes that were parsed.  The metadata values are
+/// captured both before and after the read; a file whose metadata identity
+/// changes during the read is not returned as [`SidecarImportLoad::Loaded`].
+/// The digest is checked again before commit, including changes that preserve
+/// length and mtime. `folder_key` prevents a token from one folder being reused
+/// for another folder with coincidentally identical bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SidecarDiskToken {
+    folder_key: String,
+    byte_len: u64,
+    modified_unix_nanos: i64,
+    sha256: [u8; 32],
+}
+
+impl SidecarDiskToken {
+    pub(crate) fn byte_len(&self) -> u64 {
+        self.byte_len
+    }
+
+    /// Stable identity stored in the existing INTEGER sync column.  It mixes
+    /// byte length, nanosecond timestamp, and the digest so changed bytes do not
+    /// look synchronized solely because their timestamps are equal. Old releases
+    /// stored whole seconds, so the first new comparison intentionally misses once.
+    pub(crate) fn sync_marker(&self) -> i64 {
+        let mut hasher = Sha256::new();
+        hasher.update(b"mimageviewer-sidecar-sync-v2");
+        hasher.update(self.byte_len.to_le_bytes());
+        hasher.update(self.modified_unix_nanos.to_le_bytes());
+        hasher.update(self.sha256);
+        let digest: [u8; 32] = hasher.finalize().into();
+        i64::from_le_bytes(digest[..8].try_into().expect("eight-byte marker slice"))
+    }
+
+    pub(crate) fn revalidate(&self, folder: &Path) -> Result<(), String> {
+        if crate::adjustment_db::normalize_path(folder) != self.folder_key {
+            return Err("sidecar token belongs to a different folder".to_string());
+        }
+        let path = folder.join(SIDECAR_FILENAME);
+        let before = std::fs::metadata(&path)
+            .map_err(|error| format!("cannot revalidate sidecar metadata: {error}"))
+            .and_then(|metadata| disk_metadata_identity(&metadata))?;
+        let data = std::fs::read(&path)
+            .map_err(|error| format!("cannot revalidate sidecar bytes: {error}"))?;
+        let after = std::fs::metadata(&path)
+            .map_err(|error| format!("cannot revalidate sidecar metadata: {error}"))
+            .and_then(|metadata| disk_metadata_identity(&metadata))?;
+        let digest: [u8; 32] = Sha256::digest(&data).into();
+        let expected = DiskMetadataIdentity {
+            byte_len: self.byte_len,
+            modified_unix_nanos: self.modified_unix_nanos,
+        };
+        if before != after
+            || after != expected
+            || data.len() as u64 != self.byte_len
+            || digest != self.sha256
+        {
+            return Err("sidecar changed after its import snapshot was loaded".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Identity of the immutable snapshot returned for import.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SidecarImportSource {
+    Disk(SidecarDiskToken),
+    /// A newer in-process writer snapshot.  Its sequence is meaningful only in
+    /// this process and must never be persisted as a disk sync marker.
+    PendingWriter {
+        folder_key: String,
+        sequence: u64,
+        kind: PendingWriterKind,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PendingWriterKind {
+    Write,
+    Remove,
+}
+
+/// One immutable sidecar snapshot bound to the identity it was loaded from.
+///
+/// Its fields have no public constructor.  Consumers can inspect the sidecar,
+/// but only [`crate::sidecar_import::prepare`] can split the snapshot from its
+/// source token.  This prevents a token from one read being combined with the
+/// bytes parsed by another read and then advancing the wrong sync marker.
+pub struct LoadedSidecarImport {
+    sidecar: SidecarFile,
+    source: SidecarImportSource,
+}
+
+impl LoadedSidecarImport {
+    pub fn sidecar(&self) -> &SidecarFile {
+        &self.sidecar
+    }
+
+    pub(crate) fn into_parts(self) -> (SidecarFile, SidecarImportSource) {
+        (self.sidecar, self.source)
+    }
+}
+
+/// Typed load result for the sidecar import engine.
+///
+/// `SidecarFile::load` deliberately remains the forgiving UI/mirror API.  This
+/// result exists so import code cannot confuse an empty valid sidecar with a
+/// missing, unreadable, corrupt, future-version, or concurrently changing file
+/// and then incorrectly advance a sync marker.
+pub enum SidecarImportLoad {
+    Missing { sidecar: SidecarFile },
+    Loaded(LoadedSidecarImport),
+    Unreadable { sidecar: SidecarFile, error: String },
+    Corrupt { sidecar: SidecarFile, error: String },
+    UnsupportedVersion { sidecar: SidecarFile, version: u32 },
+    WriterFailed { sidecar: SidecarFile },
+    ChangedDuringRead { sidecar: SidecarFile },
+}
+
+impl SidecarImportLoad {
+    /// Preserve the historical forgiving load contract for existing callers.
+    pub fn into_sidecar(self) -> SidecarFile {
+        match self {
+            Self::Loaded(loaded) => loaded.sidecar,
+            Self::Missing { sidecar }
+            | Self::Unreadable { sidecar, .. }
+            | Self::Corrupt { sidecar, .. }
+            | Self::UnsupportedVersion { sidecar, .. }
+            | Self::WriterFailed { sidecar }
+            | Self::ChangedDuringRead { sidecar } => sidecar,
+        }
+    }
+}
+
+pub(crate) fn revalidate_import_source(
+    sidecar: &SidecarFile,
+    source: &SidecarImportSource,
+) -> Result<(), String> {
+    revalidate_import_source_from(sidecar, source, &writer().state)
+}
+
+/// Why a retained disk parse cannot be reused for this restore check.
+///
+/// The reuse path keeps writer precedence observable instead of collapsing every
+/// failure into a generic source mismatch. The ordinary strict probe still runs
+/// after every rejection and remains the owner of the user-visible outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SidecarDiskReuseRevalidationError {
+    PendingWriter,
+    WriterFailed,
+    WriterStateUnavailable,
+    TokenMismatch,
+}
+
+pub(crate) fn revalidate_disk_import_source_for_reuse(
+    folder: &Path,
+    token: &SidecarDiskToken,
+) -> Result<(), SidecarDiskReuseRevalidationError> {
+    revalidate_disk_import_source_for_reuse_from(folder, token, &writer().state)
+}
+
+fn revalidate_disk_import_source_for_reuse_from(
+    folder: &Path,
+    token: &SidecarDiskToken,
+    writer_state: &WriterState,
+) -> Result<(), SidecarDiskReuseRevalidationError> {
+    revalidate_disk_import_source_for_reuse_from_with(
+        folder,
+        token,
+        writer_state,
+        |path| {
+            std::fs::metadata(path)
+                .map_err(|error| format!("cannot revalidate sidecar metadata: {error}"))
+                .and_then(|metadata| disk_metadata_identity(&metadata))
+        },
+        |folder, token| token.revalidate(folder),
+    )
+}
+
+fn revalidate_disk_import_source_for_reuse_from_with(
+    folder: &Path,
+    token: &SidecarDiskToken,
+    writer_state: &WriterState,
+    read_metadata: impl FnOnce(&Path) -> Result<DiskMetadataIdentity, String>,
+    revalidate_bytes: impl FnOnce(&Path, &SidecarDiskToken) -> Result<(), String>,
+) -> Result<(), SidecarDiskReuseRevalidationError> {
+    if writer_state
+        .pending_import_snapshot(folder)
+        .map_err(|_| SidecarDiskReuseRevalidationError::WriterStateUnavailable)?
+        .is_some()
+    {
+        return Err(SidecarDiskReuseRevalidationError::PendingWriter);
+    }
+    if writer_state
+        .is_failed_for_import(folder)
+        .map_err(|_| SidecarDiskReuseRevalidationError::WriterStateUnavailable)?
+    {
+        return Err(SidecarDiskReuseRevalidationError::WriterFailed);
+    }
+    if crate::adjustment_db::normalize_path(folder) != token.folder_key {
+        return Err(SidecarDiskReuseRevalidationError::TokenMismatch);
+    }
+    let current = read_metadata(&folder.join(SIDECAR_FILENAME))
+        .map_err(|_| SidecarDiskReuseRevalidationError::TokenMismatch)?;
+    let expected = DiskMetadataIdentity {
+        byte_len: token.byte_len,
+        modified_unix_nanos: token.modified_unix_nanos,
+    };
+    if current != expected {
+        return Err(SidecarDiskReuseRevalidationError::TokenMismatch);
+    }
+    // Equal len/mtime is only a cheap admission check. The full bytes digest and
+    // metadata-before/after linearization remain mandatory for a reuse hit.
+    revalidate_bytes(folder, token).map_err(|_| SidecarDiskReuseRevalidationError::TokenMismatch)
+}
+
+/// Confirm that the strict import source is still absent.
+///
+/// Missing has no byte identity to bind like [`SidecarDiskToken`].  Marker
+/// clearing therefore uses this fail-closed check immediately before opening a
+/// write transaction.  A pending in-process snapshot or a writer failure takes
+/// precedence over the disk path exactly as it does in [`SidecarFile::load_for_import`].
+pub(crate) fn revalidate_missing_import_source(folder: &Path) -> Result<(), String> {
+    revalidate_missing_import_source_from(folder, &writer().state)
+}
+
+fn revalidate_missing_import_source_from(
+    folder: &Path,
+    writer_state: &WriterState,
+) -> Result<(), String> {
+    if writer_state.pending_import_snapshot(folder)?.is_some() {
+        return Err("missing sidecar was superseded by a pending write".to_string());
+    }
+    if writer_state.is_failed_for_import(folder)? {
+        return Err("sidecar writer failed while validating a missing source".to_string());
+    }
+    match std::fs::metadata(folder.join(SIDECAR_FILENAME)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => return Err("missing sidecar source now exists".to_string()),
+        Err(error) => {
+            return Err(format!("cannot validate missing sidecar metadata: {error}"));
+        }
+    }
+    // Close the in-process window around the metadata check.  Stage 2 blocks
+    // new producers before this call; the second lookup also makes this helper
+    // fail closed when used independently in tests or future worker code.
+    if writer_state.pending_import_snapshot(folder)?.is_some() {
+        return Err("missing sidecar was superseded by a pending write".to_string());
+    }
+    if writer_state.is_failed_for_import(folder)? {
+        return Err("sidecar writer failed while validating a missing source".to_string());
+    }
+    Ok(())
+}
+
+fn revalidate_import_source_from(
+    sidecar: &SidecarFile,
+    source: &SidecarImportSource,
+    writer_state: &WriterState,
+) -> Result<(), String> {
+    let folder = sidecar.folder();
+    let folder_key = crate::adjustment_db::normalize_path(folder);
+    match source {
+        SidecarImportSource::Disk(token) => {
+            if writer_state.pending_import_snapshot(folder)?.is_some() {
+                return Err("disk sidecar snapshot was superseded by a pending write".to_string());
+            }
+            if writer_state.is_failed_for_import(folder)? {
+                return Err("sidecar writer failed after the disk snapshot was loaded".to_string());
+            }
+            token.revalidate(folder)
+        }
+        SidecarImportSource::PendingWriter {
+            folder_key: expected_folder_key,
+            sequence,
+            kind,
+        } => {
+            if &folder_key != expected_folder_key {
+                return Err("pending sidecar token belongs to a different folder".to_string());
+            }
+            let Some(current) = writer_state.pending_import_snapshot(folder)? else {
+                return Err("pending sidecar snapshot is no longer current".to_string());
+            };
+            let same_snapshot = match (kind, current.kind) {
+                (PendingWriterKind::Write, PendingWriterKind::Write) => {
+                    Arc::ptr_eq(&current.items, &sidecar.items)
+                }
+                (PendingWriterKind::Remove, PendingWriterKind::Remove) => sidecar.items.is_empty(),
+                _ => false,
+            };
+            if current.sequence != *sequence || !same_snapshot {
+                return Err("pending sidecar snapshot was superseded".to_string());
+            }
+            Ok(())
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DiskMetadataIdentity {
+    byte_len: u64,
+    modified_unix_nanos: i64,
+}
+
+fn disk_metadata_identity(metadata: &std::fs::Metadata) -> Result<DiskMetadataIdentity, String> {
+    let modified = metadata
+        .modified()
+        .map_err(|error| format!("sidecar modified time is unavailable: {error}"))?;
+    let nanos = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("sidecar modified time predates UNIX epoch: {error}"))?
+        .as_nanos();
+    let modified_unix_nanos = i64::try_from(nanos)
+        .map_err(|_| "sidecar modified time does not fit the sync marker".to_string())?;
+    Ok(DiskMetadataIdentity {
+        byte_len: metadata.len(),
+        modified_unix_nanos,
+    })
+}
+
 /// 実ファイル (フォルダ直下のメディア/コンテナ) のサイドカー相対キー。
 /// `App::sidecar_relative_key` の Image 系と `tag_write_worker` のタグバックアップが
 /// **同じ導出式を共有する** — 式が割れると同じ `.dat` 内でフィールドごとにキーが
@@ -193,6 +516,22 @@ impl SidecarFile {
         }
     }
 
+    /// A fail-closed cache value for a source that could not reach a stable
+    /// strict snapshot. It prevents a later UI-side forgiving load from doing
+    /// the same potentially large read while ensuring no future flush can
+    /// overwrite the changing or unreadable file.
+    pub(crate) fn disabled_placeholder(folder: PathBuf) -> Self {
+        let mut sidecar = Self::new(folder);
+        sidecar.disabled = true;
+        sidecar
+    }
+
+    /// Preserve a strict snapshot for display while preventing later edits from
+    /// overwriting a source whose item data failed import validation.
+    pub(crate) fn disable_writes_for_session(&mut self) {
+        self.disabled = true;
+    }
+
     /// 書き換え用の可変参照。writer がまだ前の snapshot を持っていれば、ここで
     /// **1 回だけ** 複製する (`Arc::make_mut`)。誰も持っていなければ複製しない。
     fn items_mut(&mut self) -> &mut BTreeMap<String, SidecarEntry> {
@@ -206,6 +545,143 @@ impl SidecarFile {
     /// そちらを返す**。これが無いと、フォルダを離れて戻るだけで直前の編集が消えて見える。
     pub fn load(folder: &Path) -> Self {
         Self::load_from(folder, &writer().state)
+    }
+
+    /// Load a sidecar for central-DB import without collapsing terminal states.
+    ///
+    /// Pending writer data wins over disk, exactly as it does for [`Self::load`].
+    /// A pending snapshot has no durable disk identity, so callers may import it
+    /// but must leave the disk sync marker unchanged.
+    pub fn load_for_import(folder: &Path) -> SidecarImportLoad {
+        Self::load_for_import_from(folder, &writer().state)
+    }
+
+    fn load_for_import_from(folder: &Path, writer: &WriterState) -> SidecarImportLoad {
+        let folder_key = crate::adjustment_db::normalize_path(folder);
+        let pending = match writer.pending_import_snapshot(folder) {
+            Ok(pending) => pending,
+            Err(error) => {
+                let mut sidecar = Self::new(folder.to_path_buf());
+                sidecar.disabled = true;
+                return SidecarImportLoad::Unreadable { sidecar, error };
+            }
+        };
+        if let Some(pending) = pending {
+            let mut sidecar = Self::new(folder.to_path_buf());
+            sidecar.items = pending.items;
+            return SidecarImportLoad::Loaded(LoadedSidecarImport {
+                sidecar,
+                source: SidecarImportSource::PendingWriter {
+                    folder_key,
+                    sequence: pending.sequence,
+                    kind: pending.kind,
+                },
+            });
+        }
+        match writer.is_failed_for_import(folder) {
+            Ok(false) => {}
+            Ok(true) => {
+                let mut sidecar = Self::new(folder.to_path_buf());
+                sidecar.disabled = true;
+                return SidecarImportLoad::WriterFailed { sidecar };
+            }
+            Err(error) => {
+                let mut sidecar = Self::new(folder.to_path_buf());
+                sidecar.disabled = true;
+                return SidecarImportLoad::Unreadable { sidecar, error };
+            }
+        }
+
+        let path = folder.join(SIDECAR_FILENAME);
+        let before = match std::fs::metadata(&path) {
+            Ok(metadata) => match disk_metadata_identity(&metadata) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    let mut sidecar = Self::new(folder.to_path_buf());
+                    sidecar.disabled = true;
+                    return SidecarImportLoad::Unreadable { sidecar, error };
+                }
+            },
+            Err(ref error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return SidecarImportLoad::Missing {
+                    sidecar: Self::new(folder.to_path_buf()),
+                };
+            }
+            Err(error) => {
+                let mut sidecar = Self::new(folder.to_path_buf());
+                sidecar.disabled = true;
+                return SidecarImportLoad::Unreadable {
+                    sidecar,
+                    error: error.to_string(),
+                };
+            }
+        };
+
+        let data = match std::fs::read(&path) {
+            Ok(data) => data,
+            Err(error) => {
+                let mut sidecar = Self::new(folder.to_path_buf());
+                sidecar.disabled = true;
+                return SidecarImportLoad::Unreadable {
+                    sidecar,
+                    error: error.to_string(),
+                };
+            }
+        };
+        let after = match std::fs::metadata(&path)
+            .map_err(|error| error.to_string())
+            .and_then(|metadata| disk_metadata_identity(&metadata))
+        {
+            Ok(identity) => identity,
+            Err(error) => {
+                let mut sidecar = Self::new(folder.to_path_buf());
+                sidecar.disabled = true;
+                return SidecarImportLoad::Unreadable { sidecar, error };
+            }
+        };
+        if before != after || after.byte_len != data.len() as u64 {
+            let mut sidecar = Self::new(folder.to_path_buf());
+            sidecar.disabled = true;
+            return SidecarImportLoad::ChangedDuringRead { sidecar };
+        }
+
+        let digest: [u8; 32] = Sha256::digest(&data).into();
+        let legacy_before = local_adjust_core::mask_codec::legacy_decode_count();
+        let _mask_budget = local_adjust_core::mask_codec::DocumentBudget::open();
+        let parsed: SidecarJson = match serde_json::from_slice(&data) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                let mut sidecar = Self::new(folder.to_path_buf());
+                sidecar.disabled = true;
+                return SidecarImportLoad::Corrupt {
+                    sidecar,
+                    error: error.to_string(),
+                };
+            }
+        };
+        if parsed.version > CURRENT_VERSION {
+            let mut sidecar = Self::new(folder.to_path_buf());
+            sidecar.disabled = true;
+            return SidecarImportLoad::UnsupportedVersion {
+                sidecar,
+                version: parsed.version,
+            };
+        }
+
+        let mut sidecar = Self::new(folder.to_path_buf());
+        sidecar.items = parsed.items;
+        if local_adjust_core::mask_codec::legacy_decode_count() != legacy_before {
+            sidecar.mark_dirty();
+        }
+        SidecarImportLoad::Loaded(LoadedSidecarImport {
+            sidecar,
+            source: SidecarImportSource::Disk(SidecarDiskToken {
+                folder_key,
+                byte_len: before.byte_len,
+                modified_unix_nanos: before.modified_unix_nanos,
+                sha256: digest,
+            }),
+        })
     }
 
     /// [`SidecarFile::load`] の実体。writer を明示的に渡すのはテストのためだけで、
@@ -281,6 +757,32 @@ impl SidecarFile {
 
     pub fn is_dirty(&self) -> bool {
         self.dirty
+    }
+
+    /// A read-only import proof may share the parsed tree, never a writable owner state.
+    pub(crate) fn clone_clean_import_snapshot(&self) -> Option<Self> {
+        if self.dirty || self.disabled {
+            return None;
+        }
+        Some(Self {
+            folder: self.folder.clone(),
+            items: Arc::clone(&self.items),
+            dirty: false,
+            disabled: false,
+            dirty_since: None,
+        })
+    }
+
+    /// Build a writable outer owner beside a retained read-only proof on a worker.
+    /// `SidecarEntry::Clone` keeps the large local-mask raster Arcs shared, while
+    /// the BTreeMap itself is unique before any later UI `items_mut` call.
+    pub(crate) fn detach_outer_items_for_writable_owner(&mut self) {
+        self.items = Arc::new((*self.items).clone());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn outer_items_unique_for_test(&self) -> bool {
+        Arc::strong_count(&self.items) == 1
     }
 
     /// clean → dirty になった時刻。定期フラッシュの判定に使う。
@@ -564,6 +1066,15 @@ impl SidecarFile {
         !self.dirty && !writer().is_failed(&self.folder)
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_dirty_since_for_test(&mut self, since: std::time::Instant) {
+        assert!(
+            self.dirty,
+            "only a dirty test owner may have its age overridden"
+        );
+        self.dirty_since = Some(since);
+    }
+
     /// 書き出しを積み、writer が捌き終わるまで待って結果を返す。
     /// 削除移行のように「書けたか」を報告する必要がある稀な経路だけが使う。
     /// UI スレッドからは呼ばない。
@@ -585,10 +1096,324 @@ enum WriteRequest {
     Remove,
 }
 
+/// UI-owned dirty sidecars retained while a worker flushes immutable snapshots.
+///
+/// Stage 2 keeps this owner outside the worker closure.  If thread spawn, queue,
+/// write, or idle-fence validation fails, [`SidecarFlushOwners::resolve`] returns
+/// the original dirty values so the App can put them back in its cache without
+/// reconstructing them from disk.
+pub(crate) struct SidecarFlushOwners {
+    identity: Arc<SidecarFlushIdentity>,
+    sidecars: Vec<SidecarFile>,
+    expected_flushes: usize,
+}
+
+/// Immutable snapshots reserved from cache owners that remain available to the UI.
+///
+/// Holding each items `Arc` makes a later mutation use copy-on-write. Resolution can
+/// therefore clear or evict only the exact owner that was written, while a sibling
+/// context may keep using the cache without falling back to a synchronous disk load.
+pub(crate) struct SidecarFlushReservations {
+    identity: Arc<SidecarFlushIdentity>,
+    owners: Vec<SidecarFlushReservation>,
+    expected_flushes: usize,
+}
+
+struct SidecarFlushReservation {
+    folder: PathBuf,
+    items: Arc<BTreeMap<String, SidecarEntry>>,
+    disabled: bool,
+    requested: bool,
+}
+
+impl SidecarFlushReservations {
+    /// Reconcile a worker result with cache owners that stayed in place.
+    ///
+    /// Errors leave every cache owner untouched. A successful request clears dirty
+    /// state only when the folder, item `Arc`, and writable state still match the
+    /// captured owner. Main-view cache eviction uses the same exact identity, so a
+    /// clean cache inserted or replaced while the worker ran is preserved.
+    pub(crate) fn resolve_in_place(
+        self,
+        sidecars: &mut HashMap<PathBuf, SidecarFile>,
+        result: Result<SidecarFlushReport, String>,
+        evict_verified_clean: bool,
+    ) -> Result<SidecarFlushReport, String> {
+        let report = validate_flush_result(&self.identity, self.expected_flushes, result)?;
+        let mut evict = Vec::new();
+        for reservation in self.owners {
+            let Some(current) = sidecars.get_mut(&reservation.folder) else {
+                continue;
+            };
+            let exact = Arc::ptr_eq(&current.items, &reservation.items)
+                && current.disabled == reservation.disabled;
+            if !exact {
+                continue;
+            }
+            if reservation.requested && !current.disabled {
+                current.dirty = false;
+                current.dirty_since = None;
+            }
+            if evict_verified_clean && !current.dirty {
+                evict.push(reservation.folder);
+            }
+        }
+        for folder in evict {
+            sidecars.remove(&folder);
+        }
+        Ok(report)
+    }
+}
+
+impl SidecarFlushOwners {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.sidecars.is_empty()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.sidecars.len()
+    }
+
+    /// Rejoin the UI-owned values with the worker result.
+    ///
+    /// Only a verified success clears `dirty`; every error returns the exact
+    /// original values unchanged so the App can restore their ownership.
+    pub(crate) fn resolve(
+        mut self,
+        result: Result<SidecarFlushReport, String>,
+    ) -> SidecarFlushCompletion {
+        match validate_flush_result(&self.identity, self.expected_flushes, result) {
+            Ok(report) => {
+                for sidecar in &mut self.sidecars {
+                    if !sidecar.disabled {
+                        sidecar.dirty = false;
+                        sidecar.dirty_since = None;
+                    }
+                }
+                SidecarFlushCompletion::Flushed {
+                    sidecars: self.sidecars,
+                    report,
+                }
+            }
+            Err(error) => SidecarFlushCompletion::Failed {
+                sidecars: self.sidecars,
+                error,
+            },
+        }
+    }
+}
+
+fn validate_flush_result(
+    identity: &Arc<SidecarFlushIdentity>,
+    expected_flushes: usize,
+    result: Result<SidecarFlushReport, String>,
+) -> Result<SidecarFlushReport, String> {
+    let report = result?;
+    if !Arc::ptr_eq(identity, &report.identity) {
+        return Err("sidecar flush result belongs to a different owner batch".to_string());
+    }
+    if report.flushed_folders != expected_flushes {
+        return Err(format!(
+            "sidecar flush reported {} folders for {} expected flushes",
+            report.flushed_folders, expected_flushes
+        ));
+    }
+    Ok(report)
+}
+
+#[derive(Clone)]
+struct SidecarFlushRequest {
+    folder: PathBuf,
+    request: WriteRequest,
+}
+
+#[derive(Debug)]
+struct SidecarFlushIdentity;
+
+/// Immutable flush work that may be moved to a worker while
+/// [`SidecarFlushOwners`] remains with the state owner.
+pub(crate) struct SidecarFlushBatch {
+    identity: Arc<SidecarFlushIdentity>,
+    requests: Vec<SidecarFlushRequest>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SidecarFlushReport {
+    identity: Arc<SidecarFlushIdentity>,
+    pub(crate) flushed_folders: usize,
+    pub(crate) elapsed: std::time::Duration,
+}
+
+pub(crate) enum SidecarFlushCompletion {
+    Flushed {
+        sidecars: Vec<SidecarFile>,
+        report: SidecarFlushReport,
+    },
+    Failed {
+        sidecars: Vec<SidecarFile>,
+        error: String,
+    },
+}
+
+/// Split sidecars into retained owners and an immutable dirty worker batch.
+///
+/// This function only moves `SidecarFile` values and clones their item `Arc`s;
+/// it does no serialization, filesystem access, channel wait, or SQLite work.
+/// Clean and write-disabled sidecars remain in the retained owner set, so a
+/// caller may safely move its complete cache into this boundary without
+/// silently dropping entries. A dirty disabled owner is deliberately omitted
+/// from the batch and remains dirty after successful resolution: it represents
+/// an edit that cannot safely replace the preserved source, not pending I/O
+/// that should block recovery for an unrelated folder.
+pub(crate) fn prepare_worker_flush(
+    sidecars: impl IntoIterator<Item = SidecarFile>,
+) -> (SidecarFlushOwners, SidecarFlushBatch) {
+    let identity = Arc::new(SidecarFlushIdentity);
+    let mut owners = Vec::new();
+    let mut requests = Vec::new();
+    for sidecar in sidecars {
+        if sidecar.dirty && !sidecar.disabled {
+            requests.push(SidecarFlushRequest {
+                folder: sidecar.folder.clone(),
+                request: sidecar.write_request(),
+            });
+        }
+        owners.push(sidecar);
+    }
+    let expected_flushes = requests.len();
+    (
+        SidecarFlushOwners {
+            identity: Arc::clone(&identity),
+            sidecars: owners,
+            expected_flushes,
+        },
+        SidecarFlushBatch { identity, requests },
+    )
+}
+
+/// Capture an immutable worker batch without removing cache owners from the App.
+///
+/// The captured item `Arc`s are reservations: any edit after this call receives a
+/// distinct `Arc` through `Arc::make_mut`, and resolution will leave that newer dirty
+/// owner untouched. The batch still excludes dirty write-disabled owners and still
+/// requires the process-global idle fence even when it is empty.
+pub(crate) fn prepare_worker_flush_in_place<'a>(
+    sidecars: impl IntoIterator<Item = &'a SidecarFile>,
+) -> (SidecarFlushReservations, SidecarFlushBatch) {
+    let identity = Arc::new(SidecarFlushIdentity);
+    let mut owners = Vec::new();
+    let mut requests = Vec::new();
+    for sidecar in sidecars {
+        let requested = sidecar.dirty && !sidecar.disabled;
+        if requested {
+            requests.push(SidecarFlushRequest {
+                folder: sidecar.folder.clone(),
+                request: sidecar.write_request(),
+            });
+        }
+        owners.push(SidecarFlushReservation {
+            folder: sidecar.folder.clone(),
+            items: Arc::clone(&sidecar.items),
+            disabled: sidecar.disabled,
+            requested,
+        });
+    }
+    let expected_flushes = requests.len();
+    (
+        SidecarFlushReservations {
+            identity: Arc::clone(&identity),
+            owners,
+            expected_flushes,
+        },
+        SidecarFlushBatch { identity, requests },
+    )
+}
+
+impl SidecarFlushBatch {
+    /// Whether this batch has no new writable dirty snapshots to queue.
+    ///
+    /// This says nothing about the process-global writer: an earlier ordinary
+    /// `queue_flush` may still be in flight after its cache owner became clean.
+    /// The Stage 2 worker must call `run_on_worker` even for an empty batch so
+    /// the strict global idle fence is not skipped.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.requests.is_empty()
+    }
+
+    /// Queue this batch and wait for the process-global sidecar writer.
+    ///
+    /// This is intentionally blocking and must only run on a worker.  Unlike
+    /// changing the ordinary `queue_flush` contract, it preserves the existing
+    /// coalescing queue and its synchronous channel-failure fallback while
+    /// moving every potentially blocking operation off the UI thread.
+    pub(crate) fn run_on_worker(
+        self,
+        timeout: std::time::Duration,
+    ) -> Result<SidecarFlushReport, String> {
+        self.run_with_writer(writer(), timeout)
+    }
+
+    fn run_with_writer(
+        self,
+        writer: &SidecarWriter,
+        timeout: std::time::Duration,
+    ) -> Result<SidecarFlushReport, String> {
+        let started = Instant::now();
+        for request in &self.requests {
+            if writer.state.is_failed_for_import(&request.folder)? {
+                return Err(format!(
+                    "sidecar writer previously failed for {}",
+                    request.folder.display()
+                ));
+            }
+        }
+        for request in &self.requests {
+            if let Err(error) =
+                writer.enqueue_for_worker_flush(request.folder.clone(), request.request.clone())
+            {
+                // Earlier requests may already be accepted.  Drain them when
+                // possible before returning the retained owners to the App.
+                let _ = writer.wait_until_idle_strict(timeout);
+                return Err(error);
+            }
+        }
+        writer.wait_until_idle_strict(timeout)?;
+        for request in &self.requests {
+            if writer
+                .state
+                .pending_import_snapshot(&request.folder)?
+                .is_some()
+            {
+                return Err(format!(
+                    "sidecar writer left pending data for {} after its idle fence",
+                    request.folder.display()
+                ));
+            }
+            if writer.state.is_failed_for_import(&request.folder)? {
+                return Err(format!(
+                    "sidecar writer failed for {}",
+                    request.folder.display()
+                ));
+            }
+        }
+        Ok(SidecarFlushReport {
+            identity: self.identity,
+            flushed_folders: self.requests.len(),
+            elapsed: started.elapsed(),
+        })
+    }
+}
+
 struct QueuedWrite {
     /// 積んだ順番。worker は書いた後、これが変わっていなければ pending から外す。
     seq: u64,
     request: WriteRequest,
+}
+
+struct PendingImportSnapshot {
+    sequence: u64,
+    items: Arc<BTreeMap<String, SidecarEntry>>,
+    kind: PendingWriterKind,
 }
 
 /// サイドカーの書き出しを 1 本のスレッドへ集約する。
@@ -624,6 +1449,15 @@ pub fn wait_for_pending_writes() {
     writer().wait_until_idle();
 }
 
+/// Strict, bounded idle fence for worker-owned recovery orchestration.
+///
+/// The historical exit path above deliberately keeps its forgiving contract.
+/// Sidecar import must instead distinguish timeout and poisoned state from a
+/// successful drain so it never reads stale disk bytes or advances a marker.
+pub(crate) fn wait_for_pending_writes_strict(timeout: std::time::Duration) -> Result<(), String> {
+    writer().wait_until_idle_strict(timeout)
+}
+
 impl SidecarWriter {
     fn spawn() -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
@@ -654,6 +1488,25 @@ impl SidecarWriter {
         }
     }
 
+    /// Strict queue admission used only by a worker-owned restore flush.
+    ///
+    /// The normal enqueue path remains unchanged.  This variant fails before
+    /// publishing anything if either queue mutex is poisoned.  A disconnected
+    /// writer still uses the established synchronous fallback, but the caller
+    /// is the recovery worker rather than the UI thread.
+    fn enqueue_for_worker_flush(
+        &self,
+        folder: PathBuf,
+        request: WriteRequest,
+    ) -> Result<(), String> {
+        self.state.queue_strict(folder.clone(), request)?;
+        if self.tx.send(folder.clone()).is_err() {
+            self.state.write_one(&folder);
+            self.state.finish_one();
+        }
+        Ok(())
+    }
+
     fn is_failed(&self, folder: &Path) -> bool {
         self.state.is_failed(folder)
     }
@@ -668,6 +1521,36 @@ impl SidecarWriter {
             };
             inflight = next;
         }
+    }
+
+    fn wait_until_idle_strict(&self, timeout: std::time::Duration) -> Result<(), String> {
+        let started = Instant::now();
+        let mut inflight = self
+            .state
+            .inflight
+            .lock()
+            .map_err(|_| "sidecar writer inflight state is unavailable".to_string())?;
+        while *inflight > 0 {
+            let remaining = timeout.checked_sub(started.elapsed()).ok_or_else(|| {
+                format!(
+                    "sidecar writer did not become idle within {} ms",
+                    timeout.as_millis()
+                )
+            })?;
+            let (next, wait) = self
+                .state
+                .idle
+                .wait_timeout(inflight, remaining)
+                .map_err(|_| "sidecar writer inflight state is unavailable".to_string())?;
+            inflight = next;
+            if wait.timed_out() && *inflight > 0 {
+                return Err(format!(
+                    "sidecar writer did not become idle within {} ms",
+                    timeout.as_millis()
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -686,6 +1569,30 @@ impl WriterState {
         }
     }
 
+    /// Queue one worker-owned flush without the forgiving poison fallbacks used
+    /// by the historical UI enqueue path.  Both mutexes are acquired before
+    /// either map or counter is changed, so a poison error cannot leave a
+    /// half-published request.
+    fn queue_strict(&self, folder: PathBuf, request: WriteRequest) -> Result<(), String> {
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| "sidecar writer pending state is unavailable".to_string())?;
+        let mut inflight = self
+            .inflight
+            .lock()
+            .map_err(|_| "sidecar writer inflight state is unavailable".to_string())?;
+        let next_inflight = inflight
+            .checked_add(1)
+            .ok_or_else(|| "sidecar writer inflight count overflowed".to_string())?;
+        let seq = self
+            .next_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        pending.insert(folder, QueuedWrite { seq, request });
+        *inflight = next_inflight;
+        Ok(())
+    }
+
     fn pending_items(&self, folder: &Path) -> Option<Arc<BTreeMap<String, SidecarEntry>>> {
         let pending = self.pending.lock().ok()?;
         match &pending.get(folder)?.request {
@@ -694,11 +1601,43 @@ impl WriterState {
         }
     }
 
+    /// Strict snapshot lookup for the import engine.  Unlike the forgiving UI
+    /// lookup, lock poisoning is a terminal error instead of being collapsed to
+    /// "nothing pending" and falling through to possibly stale disk bytes.
+    fn pending_import_snapshot(
+        &self,
+        folder: &Path,
+    ) -> Result<Option<PendingImportSnapshot>, String> {
+        let pending = self
+            .pending
+            .lock()
+            .map_err(|_| "sidecar writer pending state is unavailable".to_string())?;
+        let Some(queued) = pending.get(folder) else {
+            return Ok(None);
+        };
+        let (items, kind) = match &queued.request {
+            WriteRequest::Write(items) => (Arc::clone(items), PendingWriterKind::Write),
+            WriteRequest::Remove => (Arc::new(BTreeMap::new()), PendingWriterKind::Remove),
+        };
+        Ok(Some(PendingImportSnapshot {
+            sequence: queued.seq,
+            items,
+            kind,
+        }))
+    }
+
     fn is_failed(&self, folder: &Path) -> bool {
         self.failed
             .lock()
             .map(|failed| failed.contains(folder))
             .unwrap_or(false)
+    }
+
+    fn is_failed_for_import(&self, folder: &Path) -> Result<bool, String> {
+        self.failed
+            .lock()
+            .map(|failed| failed.contains(folder))
+            .map_err(|_| "sidecar writer failure state is unavailable".to_string())
     }
 
     fn write_one(&self, folder: &Path) {
@@ -1152,6 +2091,496 @@ mod tests {
     }
 
     #[test]
+    fn worker_flush_batch_runs_disconnected_writer_fallback_off_the_owner_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sidecar = SidecarFile::new(dir.path().to_path_buf());
+        sidecar.set_adjust("a.jpg", sample_params());
+        let (owners, batch) = prepare_worker_flush([sidecar]);
+        assert_eq!(owners.len(), 1);
+        assert!(!batch.is_empty());
+
+        let state = Arc::new(WriterState::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(rx);
+        let writer = SidecarWriter { tx, state };
+        let worker = std::thread::Builder::new()
+            .name("sidecar-flush-batch-test".to_string())
+            .spawn(move || {
+                let name = std::thread::current().name().map(str::to_owned);
+                (
+                    batch.run_with_writer(&writer, std::time::Duration::from_secs(1)),
+                    name,
+                )
+            })
+            .unwrap();
+        let (result, thread_name) = worker.join().unwrap();
+        let SidecarFlushCompletion::Flushed { sidecars, report } = owners.resolve(result) else {
+            panic!("worker flush did not resolve as success");
+        };
+        assert_eq!(report.flushed_folders, 1);
+        assert_eq!(sidecars.len(), 1);
+        assert!(!sidecars[0].is_dirty());
+        assert_eq!(thread_name.as_deref(), Some("sidecar-flush-batch-test"));
+        assert!(dir.path().join(SIDECAR_FILENAME).is_file());
+    }
+
+    #[test]
+    fn worker_flush_batch_failure_returns_the_original_dirty_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sidecar = SidecarFile::new(dir.path().to_path_buf());
+        sidecar.set_adjust("a.jpg", sample_params());
+        let (owners, batch) = prepare_worker_flush([sidecar]);
+
+        let state = Arc::new(WriterState::default());
+        state
+            .failed
+            .lock()
+            .unwrap()
+            .insert(dir.path().to_path_buf());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let writer = SidecarWriter { tx, state };
+        let result = batch.run_with_writer(&writer, std::time::Duration::from_secs(1));
+        assert!(result.as_ref().unwrap_err().contains("previously failed"));
+        let SidecarFlushCompletion::Failed {
+            sidecars: retained,
+            error,
+        } = owners.resolve(result)
+        else {
+            panic!("failed worker flush did not retain dirty owners");
+        };
+        assert!(error.contains("previously failed"));
+        assert_eq!(retained.len(), 1);
+        assert!(retained[0].is_dirty());
+        assert_eq!(retained[0].items().len(), 1);
+        assert!(!dir.path().join(SIDECAR_FILENAME).exists());
+    }
+
+    #[test]
+    fn worker_flush_write_failure_returns_the_original_dirty_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let missing_folder = root.path().join("removed-before-worker-flush");
+        let mut sidecar = SidecarFile::new(missing_folder.clone());
+        sidecar.set_adjust("a.jpg", sample_params());
+        let (owners, batch) = prepare_worker_flush([sidecar]);
+
+        let state = Arc::new(WriterState::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(rx);
+        let writer = SidecarWriter { tx, state };
+        let result = batch.run_with_writer(&writer, std::time::Duration::from_secs(1));
+        assert!(result.as_ref().unwrap_err().contains("failed for"));
+        let SidecarFlushCompletion::Failed {
+            sidecars: retained,
+            error,
+        } = owners.resolve(result)
+        else {
+            panic!("write failure did not retain dirty owners");
+        };
+        assert!(error.contains("failed for"));
+        assert_eq!(retained.len(), 1);
+        assert!(retained[0].is_dirty());
+        assert_eq!(retained[0].folder(), missing_folder);
+        assert!(!missing_folder.join(SIDECAR_FILENAME).exists());
+    }
+
+    #[test]
+    fn flush_owner_resolution_rejects_an_inconsistent_success_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sidecar = SidecarFile::new(dir.path().to_path_buf());
+        sidecar.set_adjust("a.jpg", sample_params());
+        let (owners, _batch) = prepare_worker_flush([sidecar]);
+        let identity = Arc::clone(&owners.identity);
+
+        let SidecarFlushCompletion::Failed { sidecars, error } =
+            owners.resolve(Ok(SidecarFlushReport {
+                identity,
+                flushed_folders: 0,
+                elapsed: std::time::Duration::ZERO,
+            }))
+        else {
+            panic!("inconsistent worker success must fail closed");
+        };
+        assert!(error.contains("0 folders for 1 expected flushes"));
+        assert_eq!(sidecars.len(), 1);
+        assert!(sidecars[0].is_dirty());
+    }
+
+    #[test]
+    fn flush_owner_resolution_rejects_a_foreign_batch_result() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let mut first_sidecar = SidecarFile::new(first.path().to_path_buf());
+        first_sidecar.set_adjust("a.jpg", sample_params());
+        let (first_owners, _first_batch) = prepare_worker_flush([first_sidecar]);
+        let mut second_sidecar = SidecarFile::new(second.path().to_path_buf());
+        second_sidecar.set_adjust("b.jpg", sample_params());
+        let (second_owners, _second_batch) = prepare_worker_flush([second_sidecar]);
+
+        let SidecarFlushCompletion::Failed { sidecars, error } =
+            first_owners.resolve(Ok(SidecarFlushReport {
+                identity: Arc::clone(&second_owners.identity),
+                flushed_folders: 1,
+                elapsed: std::time::Duration::ZERO,
+            }))
+        else {
+            panic!("a foreign worker result must not clean another batch's owners");
+        };
+        assert!(error.contains("different owner batch"));
+        assert_eq!(sidecars.len(), 1);
+        assert!(sidecars[0].is_dirty());
+    }
+
+    #[test]
+    fn worker_flush_keeps_clean_cache_owners_without_queueing_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let clean = SidecarFile::new(dir.path().to_path_buf());
+        let (owners, batch) = prepare_worker_flush([clean]);
+        assert_eq!(owners.len(), 1);
+        assert!(batch.is_empty());
+
+        let state = Arc::new(WriterState::default());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let writer = SidecarWriter { tx, state };
+        let result = batch.run_with_writer(&writer, std::time::Duration::from_secs(1));
+        let SidecarFlushCompletion::Flushed { sidecars, report } = owners.resolve(result) else {
+            panic!("empty worker batch must preserve its clean owners");
+        };
+        assert_eq!(report.flushed_folders, 0);
+        assert_eq!(sidecars.len(), 1);
+        assert!(!sidecars[0].is_dirty());
+    }
+
+    #[test]
+    fn dirty_disabled_owner_does_not_block_an_unrelated_valid_worker_flush() {
+        let root = tempfile::tempdir().unwrap();
+        let invalid_folder = root.path().join("invalid");
+        let valid_folder = root.path().join("valid");
+        std::fs::create_dir_all(&invalid_folder).unwrap();
+        std::fs::create_dir_all(&valid_folder).unwrap();
+        let invalid_path = invalid_folder.join(SIDECAR_FILENAME);
+        std::fs::write(&invalid_path, b"preserve-invalid-source").unwrap();
+
+        let mut invalid = SidecarFile::disabled_placeholder(invalid_folder.clone());
+        invalid.set_tags("page.jpg", ["unsaved"]);
+        let mut valid = SidecarFile::new(valid_folder.clone());
+        valid.set_adjust("page.jpg", sample_params());
+        let (owners, batch) = prepare_worker_flush([invalid, valid]);
+        assert_eq!(owners.len(), 2);
+        assert_eq!(batch.requests.len(), 1);
+
+        let state = Arc::new(WriterState::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(rx);
+        let writer = SidecarWriter { tx, state };
+        let result = batch.run_with_writer(&writer, std::time::Duration::from_secs(1));
+        let SidecarFlushCompletion::Flushed { sidecars, report } = owners.resolve(result) else {
+            panic!("a disabled owner must not fail the valid folder's worker batch");
+        };
+        assert_eq!(report.flushed_folders, 1);
+        let invalid = sidecars
+            .iter()
+            .find(|sidecar| sidecar.folder() == invalid_folder)
+            .unwrap();
+        let valid = sidecars
+            .iter()
+            .find(|sidecar| sidecar.folder() == valid_folder)
+            .unwrap();
+        assert!(invalid.is_dirty());
+        assert!(!valid.is_dirty());
+        assert_eq!(
+            std::fs::read(invalid_path).unwrap(),
+            b"preserve-invalid-source"
+        );
+        assert!(valid_folder.join(SIDECAR_FILENAME).is_file());
+    }
+
+    fn reservation_success(
+        reservations: &SidecarFlushReservations,
+    ) -> Result<SidecarFlushReport, String> {
+        Ok(SidecarFlushReport {
+            identity: Arc::clone(&reservations.identity),
+            flushed_folders: reservations.expected_flushes,
+            elapsed: std::time::Duration::ZERO,
+        })
+    }
+
+    #[test]
+    fn in_place_flush_clears_only_the_exact_writable_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("book");
+        let mut sidecar = SidecarFile::new(folder.clone());
+        sidecar.set_tags("page.jpg", ["before"]);
+        let mut cache = HashMap::from([(folder.clone(), sidecar)]);
+        let (reservations, _batch) = prepare_worker_flush_in_place(cache.values());
+
+        cache
+            .get_mut(&folder)
+            .unwrap()
+            .set_tags("page.jpg", ["after"]);
+        let result = reservation_success(&reservations);
+        reservations
+            .resolve_in_place(&mut cache, result, true)
+            .unwrap();
+
+        let current = cache.get(&folder).expect("newer dirty owner retained");
+        assert!(current.is_dirty());
+        assert_eq!(
+            current
+                .items()
+                .get("page.jpg")
+                .and_then(|entry| entry.tags.as_ref()),
+            Some(&vec!["#after".to_string()])
+        );
+    }
+
+    #[test]
+    fn in_place_flush_success_evicts_only_exact_clean_main_cache_owners() {
+        let root = tempfile::tempdir().unwrap();
+        let old_clean_folder = root.path().join("old-clean");
+        let flushed_folder = root.path().join("flushed");
+        let replaced_folder = root.path().join("replaced-clean");
+        let disabled_folder = root.path().join("disabled-dirty");
+        let mut flushed = SidecarFile::new(flushed_folder.clone());
+        flushed.set_tags("page.jpg", ["saved"]);
+        let mut disabled = SidecarFile::disabled_placeholder(disabled_folder.clone());
+        disabled.set_tags("page.jpg", ["unsaved"]);
+        let mut cache = HashMap::from([
+            (
+                old_clean_folder.clone(),
+                SidecarFile::new(old_clean_folder.clone()),
+            ),
+            (flushed_folder.clone(), flushed),
+            (
+                replaced_folder.clone(),
+                SidecarFile::new(replaced_folder.clone()),
+            ),
+            (disabled_folder.clone(), disabled),
+        ]);
+        let (reservations, _batch) = prepare_worker_flush_in_place(cache.values());
+        cache.insert(
+            replaced_folder.clone(),
+            SidecarFile::new(replaced_folder.clone()),
+        );
+
+        let result = reservation_success(&reservations);
+        reservations
+            .resolve_in_place(&mut cache, result, true)
+            .unwrap();
+
+        assert!(!cache.contains_key(&old_clean_folder));
+        assert!(!cache.contains_key(&flushed_folder));
+        assert!(cache.contains_key(&replaced_folder));
+        assert!(cache.get(&disabled_folder).unwrap().is_dirty());
+    }
+
+    #[test]
+    fn in_place_flush_failure_and_write_disable_leave_live_owner_untouched() {
+        let root = tempfile::tempdir().unwrap();
+        let failed_folder = root.path().join("failed");
+        let mut failed = SidecarFile::new(failed_folder.clone());
+        failed.set_tags("page.jpg", ["pending"]);
+        let mut cache = HashMap::from([(failed_folder.clone(), failed)]);
+        let (reservations, _batch) = prepare_worker_flush_in_place(cache.values());
+        assert_eq!(
+            reservations
+                .resolve_in_place(&mut cache, Err("injected".into()), true)
+                .unwrap_err(),
+            "injected"
+        );
+        assert!(cache.get(&failed_folder).unwrap().is_dirty());
+
+        let (reservations, _batch) = prepare_worker_flush_in_place(cache.values());
+        cache
+            .get_mut(&failed_folder)
+            .unwrap()
+            .disable_writes_for_session();
+        let result = reservation_success(&reservations);
+        reservations
+            .resolve_in_place(&mut cache, result, true)
+            .unwrap();
+        assert!(cache.get(&failed_folder).unwrap().is_dirty());
+    }
+
+    #[test]
+    fn empty_worker_flush_batch_still_requires_the_global_idle_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let clean = SidecarFile::new(dir.path().to_path_buf());
+        let (owners, batch) = prepare_worker_flush([clean]);
+        assert!(batch.is_empty());
+
+        let state = Arc::new(WriterState::default());
+        *state.inflight.lock().unwrap() = 1;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let writer = SidecarWriter { tx, state };
+        let result = batch.run_with_writer(&writer, std::time::Duration::from_millis(5));
+        assert!(result.as_ref().unwrap_err().contains("did not become idle"));
+        let SidecarFlushCompletion::Failed { sidecars, error } = owners.resolve(result) else {
+            panic!("empty batch must not report success while the global writer is busy");
+        };
+        assert!(error.contains("did not become idle"));
+        assert_eq!(sidecars.len(), 1);
+        assert!(!sidecars[0].is_dirty());
+    }
+
+    #[test]
+    fn strict_queue_poison_fails_before_publishing_partial_state() {
+        let state = Arc::new(WriterState::default());
+        let poisoned = Arc::clone(&state);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.pending.lock().unwrap();
+            panic!("poison pending state for strict admission test");
+        })
+        .join();
+
+        let error = state
+            .queue_strict(PathBuf::from("C:/strict-queue-test"), WriteRequest::Remove)
+            .unwrap_err();
+        assert!(error.contains("pending state is unavailable"));
+        assert_eq!(*state.inflight.lock().unwrap(), 0);
+        assert_eq!(state.next_seq.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn strict_idle_fence_reports_timeout_instead_of_success() {
+        let state = Arc::new(WriterState::default());
+        *state.inflight.lock().unwrap() = 1;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let writer = SidecarWriter { tx, state };
+        let error = writer
+            .wait_until_idle_strict(std::time::Duration::from_millis(5))
+            .unwrap_err();
+        assert!(error.contains("did not become idle"));
+    }
+
+    #[test]
+    fn missing_import_source_revalidation_rejects_a_pending_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = WriterState::default();
+        state.queue(dir.path().to_path_buf(), WriteRequest::Remove);
+        let error = revalidate_missing_import_source_from(dir.path(), &state).unwrap_err();
+        assert!(error.contains("pending write"));
+    }
+
+    #[test]
+    fn reusable_disk_revalidation_distinguishes_pending_and_failed_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sidecar = SidecarFile::new(dir.path().to_path_buf());
+        sidecar.set_tags("page.jpg", ["#saved"]);
+        assert!(sidecar.flush_blocking());
+        let SidecarImportLoad::Loaded(loaded) = SidecarFile::load_for_import(dir.path()) else {
+            panic!("fixture sidecar must load");
+        };
+        let (_, SidecarImportSource::Disk(token)) = loaded.into_parts() else {
+            panic!("fixture must have a disk token");
+        };
+
+        let pending = WriterState::default();
+        pending.queue(
+            dir.path().to_path_buf(),
+            WriteRequest::Write(Arc::new(BTreeMap::from([(
+                "new.jpg".to_string(),
+                SidecarEntry::default(),
+            )]))),
+        );
+        assert_eq!(
+            revalidate_disk_import_source_for_reuse_from(dir.path(), &token, &pending),
+            Err(SidecarDiskReuseRevalidationError::PendingWriter)
+        );
+        assert_eq!(
+            revalidate_disk_import_source_for_reuse_from_with(
+                dir.path(),
+                &token,
+                &pending,
+                |_| panic!("metadata must not outrank a pending writer"),
+                |_, _| panic!("bytes must not be read while a writer is pending"),
+            ),
+            Err(SidecarDiskReuseRevalidationError::PendingWriter)
+        );
+
+        let failed = WriterState::default();
+        failed
+            .failed
+            .lock()
+            .unwrap()
+            .insert(dir.path().to_path_buf());
+        assert_eq!(
+            revalidate_disk_import_source_for_reuse_from(dir.path(), &token, &failed),
+            Err(SidecarDiskReuseRevalidationError::WriterFailed)
+        );
+
+        let clean = WriterState::default();
+        let bytes_called = std::cell::Cell::new(false);
+        assert_eq!(
+            revalidate_disk_import_source_for_reuse_from_with(
+                dir.path(),
+                &token,
+                &clean,
+                |_| {
+                    Ok(DiskMetadataIdentity {
+                        byte_len: token.byte_len + 1,
+                        modified_unix_nanos: token.modified_unix_nanos,
+                    })
+                },
+                |_, _| {
+                    bytes_called.set(true);
+                    Ok(())
+                },
+            ),
+            Err(SidecarDiskReuseRevalidationError::TokenMismatch)
+        );
+        assert!(
+            !bytes_called.get(),
+            "len mismatch must avoid the full-byte hash"
+        );
+
+        assert_eq!(
+            revalidate_disk_import_source_for_reuse_from_with(
+                dir.path(),
+                &token,
+                &clean,
+                |_| {
+                    Ok(DiskMetadataIdentity {
+                        byte_len: token.byte_len,
+                        modified_unix_nanos: token.modified_unix_nanos.saturating_add(1),
+                    })
+                },
+                |_, _| {
+                    bytes_called.set(true);
+                    Ok(())
+                },
+            ),
+            Err(SidecarDiskReuseRevalidationError::TokenMismatch)
+        );
+        assert!(
+            !bytes_called.get(),
+            "mtime mismatch must avoid the full-byte hash"
+        );
+
+        assert_eq!(
+            revalidate_disk_import_source_for_reuse_from_with(
+                dir.path(),
+                &token,
+                &clean,
+                |_| {
+                    Ok(DiskMetadataIdentity {
+                        byte_len: token.byte_len,
+                        modified_unix_nanos: token.modified_unix_nanos,
+                    })
+                },
+                |_, _| {
+                    bytes_called.set(true);
+                    Ok(())
+                },
+            ),
+            Ok(())
+        );
+        assert!(
+            bytes_called.get(),
+            "equal metadata must still hash all bytes"
+        );
+    }
+
+    #[test]
     fn corrupt_sidecar_is_disabled_and_not_overwritten() {
         // DI-7: 現行版だが破損した sidecar を load → disabled になり、次の編集 + flush でも
         // 上書きされない (newer-version 経路と同じ防御。空 load → 上書き消去の回避)。
@@ -1171,6 +2600,178 @@ mod tests {
             original,
             "corrupt sidecar must not be overwritten while disabled"
         );
+    }
+
+    #[test]
+    fn sidecar_import_load_keeps_disk_identity_and_terminal_states_distinct() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = SidecarFile::load_for_import(dir.path());
+        assert!(matches!(missing, SidecarImportLoad::Missing { .. }));
+
+        let path = dir.path().join(SIDECAR_FILENAME);
+        let bytes = br#"{"version":1,"items":{}}"#;
+        std::fs::write(&path, bytes).unwrap();
+        let loaded = SidecarFile::load_for_import(dir.path());
+        let SidecarImportLoad::Loaded(loaded) = loaded else {
+            panic!("valid disk sidecar must produce a disk token");
+        };
+        let (sidecar, source) = loaded.into_parts();
+        let SidecarImportSource::Disk(token) = source else {
+            panic!("valid disk sidecar must produce a disk token");
+        };
+        assert!(sidecar.items().is_empty());
+        assert_eq!(token.byte_len, bytes.len() as u64);
+        assert_eq!(token.sha256, <[u8; 32]>::from(Sha256::digest(bytes)));
+        assert_eq!(
+            token.folder_key,
+            crate::adjustment_db::normalize_path(dir.path())
+        );
+
+        std::fs::write(&path, b"not json").unwrap();
+        let corrupt = SidecarFile::load_for_import(dir.path());
+        let SidecarImportLoad::Corrupt { sidecar, .. } = corrupt else {
+            panic!("invalid JSON must remain distinguishable");
+        };
+        assert!(sidecar.disabled);
+
+        std::fs::write(&path, br#"{"version":999,"items":{}}"#).unwrap();
+        let future = SidecarFile::load_for_import(dir.path());
+        let SidecarImportLoad::UnsupportedVersion { sidecar, version } = future else {
+            panic!("future schema must remain distinguishable");
+        };
+        assert_eq!(version, 999);
+        assert!(sidecar.disabled);
+    }
+
+    #[test]
+    fn sidecar_import_pending_snapshot_has_no_disk_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = WriterState::default();
+        let mut items = BTreeMap::new();
+        items.insert("a.jpg".to_string(), SidecarEntry::default());
+        state.queue(
+            dir.path().to_path_buf(),
+            WriteRequest::Write(Arc::new(items)),
+        );
+
+        let loaded = SidecarFile::load_for_import_from(dir.path(), &state);
+        let SidecarImportLoad::Loaded(loaded) = loaded else {
+            panic!("pending writer snapshot must win over disk");
+        };
+        let (sidecar, source) = loaded.into_parts();
+        let SidecarImportSource::PendingWriter {
+            folder_key,
+            sequence,
+            kind,
+        } = &source
+        else {
+            panic!("pending writer snapshot must produce a writer token");
+        };
+        assert_eq!(*sequence, 0);
+        assert_eq!(*kind, PendingWriterKind::Write);
+        assert_eq!(
+            folder_key,
+            &crate::adjustment_db::normalize_path(dir.path())
+        );
+        assert_eq!(sidecar.items().len(), 1);
+        assert!(revalidate_import_source_from(&sidecar, &source, &state).is_ok());
+
+        let mut replacement = BTreeMap::new();
+        replacement.insert("b.jpg".to_string(), SidecarEntry::default());
+        state.queue(
+            dir.path().to_path_buf(),
+            WriteRequest::Write(Arc::new(replacement)),
+        );
+        assert!(revalidate_import_source_from(&sidecar, &source, &state).is_err());
+    }
+
+    #[test]
+    fn sidecar_import_pending_remove_remains_current_until_superseded() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = WriterState::default();
+        state.queue(dir.path().to_path_buf(), WriteRequest::Remove);
+
+        let loaded = SidecarFile::load_for_import_from(dir.path(), &state);
+        let SidecarImportLoad::Loaded(loaded) = loaded else {
+            panic!("pending remove must be represented as a current empty snapshot");
+        };
+        let (sidecar, source) = loaded.into_parts();
+        assert!(sidecar.items().is_empty());
+        assert!(matches!(
+            &source,
+            SidecarImportSource::PendingWriter {
+                kind: PendingWriterKind::Remove,
+                ..
+            }
+        ));
+        assert!(revalidate_import_source_from(&sidecar, &source, &state).is_ok());
+
+        state.queue(
+            dir.path().to_path_buf(),
+            WriteRequest::Write(Arc::new(BTreeMap::new())),
+        );
+        assert!(revalidate_import_source_from(&sidecar, &source, &state).is_err());
+    }
+
+    #[test]
+    fn sidecar_import_failed_writer_blocks_stale_disk() {
+        let media = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let mut disk_sidecar = SidecarFile::new(media.path().to_path_buf());
+        disk_sidecar.set_adjust("old.jpg", sample_params());
+        assert!(disk_sidecar.flush_blocking());
+
+        let state = WriterState::default();
+        let mut replacement = BTreeMap::new();
+        replacement.insert("new.jpg".to_string(), SidecarEntry::default());
+        state.queue(
+            media.path().to_path_buf(),
+            WriteRequest::Write(Arc::new(replacement)),
+        );
+        state.finish_write(media.path(), 0, false);
+
+        let loaded = SidecarFile::load_for_import_from(media.path(), &state);
+        let SidecarImportLoad::WriterFailed { sidecar } = loaded else {
+            panic!("a failed writer must stop strict import before stale disk is read");
+        };
+        assert!(sidecar.disabled);
+
+        let db = crate::adjustment_db::AdjustmentDb::open_at(&data.path().join("adjustment.db"))
+            .unwrap();
+        let key = reconstruct_image_key(media.path(), "old.jpg");
+        assert!(db.get_page_params(&key).is_none());
+        assert_eq!(
+            db.sidecar_sync_get(&crate::adjustment_db::normalize_path(media.path())),
+            None
+        );
+    }
+
+    #[test]
+    fn sidecar_import_fails_closed_when_writer_state_is_poisoned() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending_state = WriterState::default();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = pending_state.pending.lock().unwrap();
+            panic!("poison pending state");
+        }));
+        let SidecarImportLoad::Unreadable { sidecar, .. } =
+            SidecarFile::load_for_import_from(dir.path(), &pending_state)
+        else {
+            panic!("poisoned pending state must fail closed");
+        };
+        assert!(sidecar.disabled);
+
+        let failed_state = WriterState::default();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = failed_state.failed.lock().unwrap();
+            panic!("poison failed state");
+        }));
+        let SidecarImportLoad::Unreadable { sidecar, .. } =
+            SidecarFile::load_for_import_from(dir.path(), &failed_state)
+        else {
+            panic!("poisoned failure state must fail closed");
+        };
+        assert!(sidecar.disabled);
     }
 
     #[test]

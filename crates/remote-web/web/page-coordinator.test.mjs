@@ -339,7 +339,7 @@ test("the history bound never rewrites the current job of a demanded key", () =>
   }), [{ type: "group_ready", requestId: "again" }]);
 });
 
-test("a prefetch job promotes once and never demotes", () => {
+test("a promoted prefetch is released when display ends and its plan starts new work", () => {
   const coordinator = new PageDisplayCoordinator();
   const job = startFor(coordinator.setPlan(["page"]), "page");
   assert.equal(job.priority, PageJobPriority.PREFETCH);
@@ -359,18 +359,56 @@ test("a prefetch job promotes once and never demotes", () => {
     keys: ["page"],
   }), []);
   assert.deepEqual(coordinator.releaseDisplay("first", "no_demand"), []);
-  assert.deepEqual(coordinator.releaseDisplay("second", "no_demand"), []);
+  assert.deepEqual(coordinator.releaseDisplay("second", "no_demand"), [{
+    type: "cancel", jobId: job.jobId, keyId: "page", cause: "no_demand",
+  }, {
+    type: "start", jobId: "2", keyId: "page", priority: "prefetch",
+  }]);
   assert.deepEqual(coordinator.jobFor("page"), {
-    jobId: job.jobId,
-    priority: "foreground",
+    jobId: "2",
+    priority: "prefetch",
     state: "running",
   });
   assert.deepEqual(coordinator.setPlan([]), [{
     type: "cancel",
-    jobId: job.jobId,
+    jobId: "2",
     keyId: "page",
     cause: "no_demand",
   }]);
+});
+
+test("skipped prefetch stays suppressed for its plan and later display starts foreground", () => {
+  const coordinator = new PageDisplayCoordinator();
+  const first = startFor(coordinator.setPlan(["raw"]), "raw");
+  assert.deepEqual(coordinator.settle(first.jobId, { status: PageJobState.SKIPPED }), []);
+  assert.deepEqual(coordinator.setPlan(["raw"]), []);
+  const display = coordinator.openDisplay({ requestId: "reader", groupKey: "raw", keys: ["raw"] });
+  const foreground = startFor(display, "raw");
+  assert.equal(foreground.priority, PageJobPriority.FOREGROUND);
+  assert.equal(coordinator.hasPendingDisplayDemand("raw"), true);
+  assert.deepEqual(coordinator.settle(foreground.jobId, { status: PageJobState.READY }), [
+    { type: "group_ready", requestId: "reader" },
+  ]);
+  assert.equal(coordinator.hasPendingDisplayDemand("raw"), false);
+  coordinator.releaseDisplay("reader", PageCancelCause.NO_DEMAND);
+  coordinator.setPlan([]);
+  assert.equal(startFor(coordinator.setPlan(["raw"]), "raw").priority, PageJobPriority.PREFETCH);
+});
+
+test("skip after prefetch promotion immediately starts foreground without failing the group", () => {
+  const coordinator = new PageDisplayCoordinator();
+  const first = startFor(coordinator.setPlan(["raw"]), "raw");
+  assert.equal(effectsOf(coordinator.openDisplay({
+    requestId: "reader", groupKey: "raw", keys: ["raw"],
+  }), PageCoordinatorEffectType.PROMOTE).length, 1);
+  const effects = coordinator.settle(first.jobId, { status: PageJobState.SKIPPED });
+  const foreground = startFor(effects, "raw");
+  assert.equal(foreground.priority, PageJobPriority.FOREGROUND);
+  assert.equal(effectsOf(effects, PageCoordinatorEffectType.GROUP_FAILED).length, 0);
+  assert.deepEqual(coordinator.setPlan(["raw"]), []);
+  assert.deepEqual(coordinator.settle(foreground.jobId, { status: PageJobState.READY }), [
+    { type: "group_ready", requestId: "reader" },
+  ]);
 });
 
 test("foreground jobs start at foreground priority and never promote", () => {
@@ -712,6 +750,7 @@ function sequenceIndexes(length, prefix = []) {
 function requestAttemptModel(coordinator, keys) {
   return {
     keys,
+    terminal: false,
     members: new Map(keys.map((keyId) => {
       const job = coordinator.jobFor(keyId);
       return [keyId, {
@@ -757,7 +796,9 @@ function assertCoordinatorInvariants({
     previousRank = rank;
     if (effect.type === "cancel") {
       assert.ok(
-        operation.name === "invalidate" || !demandKeys(model).has(effect.keyId),
+        operation.name === "invalidate" || !demandKeys(model).has(effect.keyId)
+          || (priorityByJob.get(effect.jobId) === PageJobPriority.FOREGROUND
+            && !coordinator.hasPendingDisplayDemand(effect.keyId)),
         `${scenario}: cancelled demanded key ${effect.keyId}`
       );
     }
@@ -771,6 +812,7 @@ function assertCoordinatorInvariants({
       terminalCounts.set(effect.requestId, count);
       assert.ok(count <= 1, `${scenario}: duplicate terminal result`);
       const request = model.open.get(effect.requestId);
+      if (request) request.terminal = true;
       if (effect.type === "group_ready") {
         assert.ok(request, `${scenario}: ready result for unopened request`);
         for (const member of request.members.values()) {
@@ -845,6 +887,7 @@ function assertCoordinatorInvariants({
   );
 
   for (const request of model.open.values()) {
+    if (request.terminal) continue;
     for (const [keyId, member] of request.members) {
       if (member.status !== "pending") continue;
       const job = coordinator.jobFor(keyId);

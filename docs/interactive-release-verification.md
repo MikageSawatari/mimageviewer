@@ -35,6 +35,32 @@ PC使用の了承を明確にする運用である。
 従来のpage-turn、perf smoke、idle-healthなども、実アプリの起動・操作を伴えば同じ確認が必要。
 既存logの解析だけでPCを操作しない処理は通常の開発中に実行してよい。
 
+`NativeTopPanoramaHover`は単独で約90秒を見込み、使い捨て640x360動画を別窓で開く間に
+前面ウィンドウとマウスを使用する。native側が送る入力は上端36ptへのMouseMove 1件だけで、
+実`native_top_panorama` Responseのenabled/位置/owner/source/hostを観測して終了する。
+click、wheel、key、panは送らない。この具体scenarioの実行了承が届くまでは
+`-InteractiveApproved`を付けず、portable artifactの準備と非対話検証までに留める。
+
+`NativeTopPanoramaClick`は単独で約2分を見込み、同じ使い捨て動画と別窓を使う。上端36ptへの
+MouseMove 1件で実`native_top_panorama` Responseを表示し、そのcontrol centerへLeft Down/Upを
+各1件送る。外部helperがUpの送信と解放確認を所有し、runnerはhelperをjoinしてからだけexact
+portable Appを終了できる。通常handlerの非360動画zoom `None -> Some(1.0)`までを確認するが、
+wheel/panやGPU scanoutの確認には読み替えない。このscenario名、所要時間、前面windowとmouseの
+使用、使い捨てdataを示した実行了承が届くまでは、buildと非対話検証だけに留める。
+
+## 常設の了承は取り下げ (2026-09-24 利用者決定)
+
+2026-09-23 に設けた「複数ウィンドウ・画面遷移のシナリオ自動テスト第 2 層のスイートに限り、実行ごとの了承を求めない」
+という常設の了承は、**2026-09-24 に利用者が取り下げた**。利用者が PC を使っている時間があるため。
+
+- 第 2 層のスイートを含め、実アプリを起動・操作する検証は**毎回、実行前に利用者の確認を取る**
+  (上の「リリース前の検証枠」の手順どおり)。
+- 必要になりそうなときは**あらかじめ知らせる**。利用者が PC を使わない時間帯 (夜間など) を指定した場合は、
+  その時間枠の中で、合意した範囲だけを実行する。
+- **配布ビルド (`build-dist`) とは重ねない**。配布ビルドは起動中の viewer を検出して止まり、内部の build は
+  repository の viewer process を停止し得る。
+- 隔離データ、exact PID/HWND、再試行上限、証跡保存、下記の入力デスクトップ確認はそのまま適用する。
+
 ## データ保護と記録
 
 実行了承は、通常profileの起動許可を兼ねない。エージェントは引き続き
@@ -44,3 +70,21 @@ PC使用の了承を明確にする運用である。
 
 リリース記録には、了承した検証範囲・実行日時・成果物とscenarioの証跡・各結果・
 未実施理由を残す。既存の必須テスト、実機確認、通常データ保護の条件は維持する。
+
+## Windowsの入力デスクトップを開始前に確認する
+
+同じWindows sessionでも、テストプロセスのdesktopと実入力desktopが異なる場合がある。
+2026-09-10のCodex実行では、通常のsandbox経路で起動したrunnerが
+`CodexSandboxDesktop-...`、実入力先が`Default`だった。ウィンドウ描画は進むが
+foregroundを得られず、複数窓の操作待ちやnative入力の環境失敗になった。
+これは製品機能の不合格とは分けて記録する。
+
+実機suiteの開始前に、読み取り専用でsession、thread desktop、input desktop、
+foregroundの取得を確認する。不一致ならアプリを起動して再試行を重ねず、
+正規の承認付き実行経路が利用可能かを確認する。同日の`exec_command`では
+`require_escalated`の承認付き読み取りが`Default`上で実行されることを確認した。
+この確認は個別実行の環境証拠であり、将来の実行先を無条件に保証しない。
+
+sandbox内からdesktopを切り替えたり、入力先の検証を外したりして成立させない。
+通常デスクトップで実行できる場合も、具体suiteの利用者了承、隔離データ、exact PID/HWND、
+再試行上限はそのまま適用する。環境不成立だったrunの証拠と回数も残す。

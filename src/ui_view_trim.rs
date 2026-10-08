@@ -969,6 +969,7 @@ impl App {
         for idx in indices {
             self.remove_view_trim_page_override(idx);
             self.view_trim_page_overrides.remove(&idx);
+            self.sync_prepared_page_edit_key_for_idx(idx);
             self.view_trim_dirty_page_overrides.remove(&idx);
         }
     }
@@ -1477,6 +1478,11 @@ impl App {
                     page_right,
                     page_spread_separate,
                 );
+                self.sync_prepared_page_edit_key_for_idx(fs_idx);
+                if let SpreadPair::Double { left, right } = spread_pair {
+                    self.sync_prepared_page_edit_key_for_idx(left);
+                    self.sync_prepared_page_edit_key_for_idx(right);
+                }
             }
         }
 

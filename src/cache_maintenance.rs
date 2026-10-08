@@ -53,12 +53,43 @@ pub enum TileThumbOutcome {
     Untouched,
 }
 
+/// UUID cache failure must not suppress the established folder/catalog/tile maintenance.
+/// When it fails, a combined Auto-aspect row count is unknown, not zero.
+pub(crate) enum CollectionAspectOutcome {
+    Applied(crate::auto_aspect_cache::CollectionAutoAspectMaintenanceStats),
+    Failed(String),
+}
+
+impl CollectionAspectOutcome {
+    pub(crate) fn combined_entries(&self, folder_entries: usize) -> Option<usize> {
+        match self {
+            Self::Applied(stats) => Some(folder_entries + stats.remaining),
+            Self::Failed(_) => None,
+        }
+    }
+
+    pub(crate) fn combined_deleted(&self, folder_deleted: usize) -> usize {
+        folder_deleted
+            + match self {
+                Self::Applied(stats) => stats.deleted,
+                Self::Failed(_) => 0,
+            }
+    }
+
+    pub(crate) fn error(&self) -> Option<&str> {
+        match self {
+            Self::Applied(_) => None,
+            Self::Failed(error) => Some(error),
+        }
+    }
+}
+
 /// ワーカーから UI に返す結果。
 ///
 /// `tile_thumb_*` フィールドは動画タイル モード キャッシュ
 /// (`video_tile_thumbs.db`) の削除/サイズ情報。`DeleteAll` / `DeleteFolder` 経路
 /// では catalog (静止画 + 動画グリッド) と一緒に削除する。
-pub enum CacheMaintResult {
+pub(crate) enum CacheMaintResult {
     Error(String),
     Stats {
         folders: usize,
@@ -67,6 +98,7 @@ pub enum CacheMaintResult {
         tile_thumb_bytes: u64,
         /// サムネイル比率 Auto モードのフォルダ別確定値キャッシュ件数。
         auto_aspect_entries: usize,
+        collection_aspect: CollectionAspectOutcome,
     },
     DeleteOldDone {
         deleted: usize,
@@ -75,6 +107,7 @@ pub enum CacheMaintResult {
         auto_aspect_deleted: usize,
         /// 削除後の Auto 比率キャッシュ行数。
         auto_aspect_entries: usize,
+        collection_aspect: CollectionAspectOutcome,
     },
     /// すべて削除完了。`tile_thumb` は動画タイル DB に対する処理結果。
     DeleteAllDone {
@@ -83,6 +116,7 @@ pub enum CacheMaintResult {
         auto_aspect_deleted: usize,
         /// 削除後の Auto 比率キャッシュ行数。
         auto_aspect_entries: usize,
+        collection_aspect: CollectionAspectOutcome,
     },
     DeleteFolderDone {
         existed: bool,
@@ -94,10 +128,11 @@ pub enum CacheMaintResult {
         auto_aspect_deleted: usize,
         /// 削除後の Auto 比率キャッシュ行数。
         auto_aspect_entries: usize,
+        collection_aspect: CollectionAspectOutcome,
     },
 }
 
-pub struct CacheMaintPending {
+pub(crate) struct CacheMaintPending {
     pub task: CacheMaintTask,
     pub rx: mpsc::Receiver<CacheMaintResult>,
     pub cancel: Arc<AtomicBool>,
@@ -141,6 +176,261 @@ pub enum ArchiveMaintResult {
 pub struct ArchiveMaintPending {
     pub task: ArchiveMaintTask,
     pub rx: mpsc::Receiver<ArchiveMaintResult>,
+}
+
+#[derive(Debug, Clone)]
+pub enum EpubMaintTask {
+    LoadRows,
+    DeleteSelected { generation_ids: Vec<i64> },
+    DeleteAll,
+    DeleteMissingSources,
+}
+
+pub struct EpubMaintResult {
+    pub entries: Vec<crate::epub_cache::CurrentGenerationEntry>,
+    pub deleted: usize,
+    /// Includes files unlinked before a failed database commit.
+    pub physically_removed: Vec<crate::epub_cache::GenerationRow>,
+    pub failures: Vec<(PathBuf, String)>,
+    pub error: Option<String>,
+    /// Keep the read/admission boundary until the UI has invalidated its memory caches.
+    pub(crate) barriers: Vec<(
+        crate::pdf_loader::EpubRangeLease,
+        crate::pdf_loader::EpubDocumentDeleteGuard,
+    )>,
+}
+
+pub struct EpubMaintPending {
+    pub task: EpubMaintTask,
+    pub rx: mpsc::Receiver<EpubMaintResult>,
+}
+
+pub fn spawn_epub(task: EpubMaintTask, data_dir: PathBuf) -> EpubMaintPending {
+    let (tx, rx) = mpsc::channel();
+    let fallback = tx.clone();
+    let pending_task = task.clone();
+    let spawn = std::thread::Builder::new()
+        .name("epub-cache-maint".into())
+        .spawn(move || {
+            let result = (|| -> Result<_, String> {
+                crate::pdf_loader::epub_conversion_guard().map_err(|error| format!("{error:?}"))?;
+                let mut cache = crate::epub_cache::EpubCache::open_at(&data_dir)
+                    .map_err(|error| format!("{error:?}"))?;
+                Ok(run_epub_task(
+                    &mut cache,
+                    &task,
+                    crate::pdf_loader::release_epub_document_for_delete,
+                    |cache, id| cache.delete_generation_now(id),
+                ))
+            })();
+            let message = match result {
+                Ok(result) => result,
+                Err(error) => EpubMaintResult {
+                    entries: Vec::new(),
+                    deleted: 0,
+                    physically_removed: Vec::new(),
+                    failures: Vec::new(),
+                    error: Some(error),
+                    barriers: Vec::new(),
+                },
+            };
+            let _ = tx.send(message);
+        });
+    if let Err(error) = spawn {
+        let _ = fallback.send(EpubMaintResult {
+            entries: Vec::new(),
+            deleted: 0,
+            physically_removed: Vec::new(),
+            failures: Vec::new(),
+            error: Some(format!("worker を開始できません: {error}")),
+            barriers: Vec::new(),
+        });
+    }
+    EpubMaintPending {
+        task: pending_task,
+        rx,
+    }
+}
+
+fn run_epub_task(
+    cache: &mut crate::epub_cache::EpubCache,
+    task: &EpubMaintTask,
+    release_document: impl Fn(
+        &std::path::Path,
+        std::time::Instant,
+    ) -> Result<crate::pdf_loader::EpubDocumentDeleteGuard, String>,
+    delete_generation: impl Fn(
+        &mut crate::epub_cache::EpubCache,
+        i64,
+    ) -> Result<
+        crate::epub_cache::ImmediateDeleteOutcome,
+        crate::epub_cache::CacheError,
+    >,
+) -> EpubMaintResult {
+    use crate::epub_cache::ImmediateDeleteOutcome;
+    let mut result = EpubMaintResult {
+        entries: Vec::new(),
+        deleted: 0,
+        physically_removed: Vec::new(),
+        failures: Vec::new(),
+        error: None,
+        barriers: Vec::new(),
+    };
+    let initial_rows = match cache.list_current() {
+        Ok(rows) => rows,
+        Err(error) => {
+            result.error = Some(format!("一覧を読み込めませんでした: {error:?}"));
+            return result;
+        }
+    };
+    let selected_ids = match task {
+        EpubMaintTask::DeleteSelected { generation_ids } => generation_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>(
+        ),
+        _ => std::collections::HashSet::new(),
+    };
+    for entry in &initial_rows {
+        let row = &entry.generation;
+        let selected = match task {
+            EpubMaintTask::LoadRows => false,
+            EpubMaintTask::DeleteSelected { .. } => selected_ids.contains(&row.generation_id),
+            EpubMaintTask::DeleteAll => true,
+            EpubMaintTask::DeleteMissingSources => match source_definitely_missing(&row.src_path) {
+                Ok(missing) => missing,
+                Err(error) => {
+                    result.failures.push((
+                        row.src_path.clone(),
+                        format!("元ファイルを確認できませんでした: {error}"),
+                    ));
+                    false
+                }
+            },
+        };
+        if !selected {
+            continue;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let _read_boundary = match crate::pdf_loader::acquire_epub_delete_coverage(&row.src_path) {
+            Ok(lease) => lease,
+            Err(reason) => {
+                result.failures.push((row.src_path.clone(), reason));
+                continue;
+            }
+        };
+        let mut worker_boundary = match release_document(&row.pdf_file, deadline) {
+            Ok(guard) => guard,
+            Err(reason) => {
+                result.failures.push((row.src_path.clone(), reason));
+                continue;
+            }
+        };
+        let removed_before = result.physically_removed.len();
+        match delete_generation(cache, row.generation_id) {
+            Ok(ImmediateDeleteOutcome::NotCurrent) => {}
+            Ok(ImmediateDeleteOutcome::Deleted(deleted)) => {
+                crate::pdf_loader::invalidate_epub_pin_under_delete(
+                    &deleted.src_path,
+                    deleted.generation_id,
+                );
+                result.deleted += 1;
+                result.physically_removed.push(deleted);
+            }
+            Ok(ImmediateDeleteOutcome::Failed {
+                generation,
+                file_removed,
+                error,
+            }) => {
+                crate::logger::log(format!(
+                    "epub cache delete failed source={} generation={} file_removed={file_removed} error={error:?}",
+                    generation.src_path.display(),
+                    generation.generation_id
+                ));
+                if file_removed {
+                    crate::pdf_loader::invalidate_epub_pin_under_delete(
+                        &generation.src_path,
+                        generation.generation_id,
+                    );
+                    result.physically_removed.push(generation.clone());
+                    result.failures.push((
+                        generation.src_path,
+                        "ファイルは削除されましたが、管理情報を更新できませんでした。再度開くときに確認します".into(),
+                    ));
+                } else {
+                    result
+                        .failures
+                        .push((generation.src_path, epub_delete_error_message(&error)));
+                }
+            }
+            Err(error) => {
+                crate::logger::log(format!(
+                    "epub cache delete could not start source={} generation={} error={error:?}",
+                    row.src_path.display(),
+                    row.generation_id
+                ));
+                result.failures.push((
+                    row.src_path.clone(),
+                    "管理情報を読み込めず、削除できませんでした".into(),
+                ));
+            }
+        }
+        if result.physically_removed.len() > removed_before {
+            worker_boundary.mark_file_removed();
+            result.barriers.push((_read_boundary, worker_boundary));
+        }
+    }
+    match cache.list_current() {
+        Ok(mut entries) => {
+            for entry in &mut entries {
+                entry.source_missing =
+                    source_definitely_missing(&entry.generation.src_path).unwrap_or(false);
+            }
+            result.entries = entries;
+        }
+        Err(error) => result.error = Some(format!("一覧を更新できませんでした: {error:?}")),
+    }
+    result
+}
+
+/// A missing file is safe to classify only after a containing directory can
+/// be reached. A disconnected network share can otherwise look like NotFound.
+fn source_definitely_missing(path: &std::path::Path) -> std::io::Result<bool> {
+    match std::fs::metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut parent = path.parent();
+            while let Some(directory) = parent {
+                match std::fs::metadata(directory) {
+                    Ok(meta) if meta.is_dir() => return Ok(true),
+                    Ok(_) => return Err(std::io::Error::other("parent is not a directory")),
+                    Err(parent_error) if parent_error.kind() == std::io::ErrorKind::NotFound => {
+                        parent = directory.parent();
+                    }
+                    Err(parent_error) => return Err(parent_error),
+                }
+            }
+            Err(error)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn epub_delete_error_message(error: &crate::epub_cache::CacheError) -> String {
+    match error {
+        crate::epub_cache::CacheError::Io(_) => {
+            "使用中またはアクセスできないため削除できませんでした".into()
+        }
+        crate::epub_cache::CacheError::Sql(_) => {
+            "管理情報を更新できず、削除できませんでした".into()
+        }
+        crate::epub_cache::CacheError::UnsafePath(_) => {
+            "保存先を安全に確認できず、削除できませんでした".into()
+        }
+        crate::epub_cache::CacheError::InvalidState(_) => {
+            "対象の状態が変わったため削除できませんでした".into()
+        }
+    }
 }
 
 pub fn spawn_archive(
@@ -199,18 +489,58 @@ pub fn spawn_archive(
 /// キャッシュ DB (`video_tile_thumbs.db`) も同時に削除する (= ユーザー UX で
 /// 「サムネ削除」と一括で動かす)。`DeleteOld` は tile cache に「最終アクセス時刻」が
 /// 無いため対象外。`Stats` 時は tile DB ファイル サイズも添えて返す。
-pub fn spawn(
+pub(crate) fn spawn(
     task: CacheMaintTask,
     cache_dir: PathBuf,
     video_tile_cache: Option<Arc<TileThumbCache>>,
+    collection_reply: Result<
+        crate::auto_aspect_cache::CollectionAutoAspectMaintenanceReply,
+        String,
+    >,
 ) -> CacheMaintPending {
     let cancel = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
+    let deletion = if matches!(task, CacheMaintTask::Stats) {
+        None
+    } else {
+        let operation = match &task {
+            CacheMaintTask::DeleteAll => crate::catalog::CatalogDeleteOperation::All,
+            CacheMaintTask::DeleteOld { days } => {
+                crate::catalog::CatalogDeleteOperation::OlderThan(*days)
+            }
+            CacheMaintTask::DeleteFolder { folder, .. } => {
+                crate::catalog::CatalogDeleteOperation::Folder(folder.clone())
+            }
+            CacheMaintTask::Stats => unreachable!(),
+        };
+        match crate::catalog::CatalogAccess::for_cache_dir(&cache_dir).begin_delete(operation) {
+            Ok(token) => Some(token),
+            Err(error) => {
+                let _ = tx.send(CacheMaintResult::Error(format!(
+                    "キャッシュを整理中です: {error}"
+                )));
+                return CacheMaintPending { task, rx, cancel };
+            }
+        }
+    };
     let tx_worker = tx.clone();
     let task_clone = task.clone();
     let spawn_result = std::thread::Builder::new()
         .name("cache-maint".into())
         .spawn(move || {
+            if let Some(deletion) = deletion.as_ref() {
+                deletion.retire_connections();
+            }
+            let mut catalog_error = None;
+            // Collection UUID cache work was admitted on the UI side. Wait here, not in UI,
+            // before reporting a successful combined clear. Failure leaves the other caches usable.
+            let collection_aspect = match collection_reply
+                .and_then(|reply| reply.recv().map_err(|_| "Collection Auto 比率 cache worker が停止しました".to_owned()))
+                .and_then(|result| result)
+            {
+                Ok(stats) => CollectionAspectOutcome::Applied(stats),
+                Err(error) => CollectionAspectOutcome::Failed(error),
+            };
             let result = match task_clone {
                 CacheMaintTask::Stats => {
                     let (folders, bytes) = crate::catalog::cache_stats(&cache_dir);
@@ -221,22 +551,26 @@ pub fn spawn(
                         bytes,
                         tile_thumb_bytes,
                         auto_aspect_entries,
+                        collection_aspect,
                     }
                 }
                 CacheMaintTask::DeleteOld { days } => {
-                    let deleted = crate::catalog::delete_old_cache(&cache_dir, days);
-                    let (auto_aspect_deleted, auto_aspect_entries) =
-                        auto_aspect_delete_old(days);
+                    let report = crate::catalog::delete_old_cache_under_delete(&cache_dir, days);
+                    catalog_error = report.error_message();
+                    let deleted = report.deleted;
+                    let (auto_aspect_deleted, auto_aspect_entries) = auto_aspect_delete_old(days);
                     let new_stats = crate::catalog::cache_stats(&cache_dir);
                     CacheMaintResult::DeleteOldDone {
                         deleted,
                         new_stats,
                         auto_aspect_deleted,
                         auto_aspect_entries,
+                        collection_aspect,
                     }
                 }
                 CacheMaintTask::DeleteAll => {
-                    crate::catalog::delete_all_cache(&cache_dir);
+                    let report = crate::catalog::delete_all_cache_under_delete(&cache_dir);
+                    catalog_error = report.error_message();
                     // 通常経路: open 済みインスタンスがあれば clear_all (DELETE + VACUUM)。
                     // 失敗 / インスタンス None なら fallback で DB ファイルを物理削除する
                     // (Codex P2: DB 壊れ / ロックで「全削除」しても残らないように)。
@@ -261,22 +595,26 @@ pub fn spawn(
                         tile_thumb,
                         auto_aspect_deleted,
                         auto_aspect_entries,
+                        collection_aspect,
                     }
                 }
                 CacheMaintTask::DeleteFolder {
                     folder,
                     auto_aspect_folder,
                 } => {
-                    let db_path = crate::catalog::db_path_for(&cache_dir, &folder);
                     let folder_name = folder
                         .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or("?")
                         .to_string();
-                    let existed = db_path.exists();
-                    if existed {
-                        let _ = std::fs::remove_file(&db_path);
-                    }
+                    let existed = match crate::catalog::delete_folder_cache_under_delete(&cache_dir, &folder) {
+                        Ok(existed) => existed,
+                        Err(error) => {
+                            crate::logger::log(format!("folder catalog delete failed: {}: {error}", folder.display()));
+                            catalog_error = Some(format!("フォルダのキャッシュを削除できませんでした: {error}"));
+                            false
+                        }
+                    };
                     // フォルダ単位削除は prefix DELETE が必要なので、open 失敗時の
                     // fallback は無い (= DB 全消しで対応すべきケースではない)。Untouched
                     // を返して UI 側でメッセージを区別する。
@@ -305,9 +643,14 @@ pub fn spawn(
                         tile_thumb,
                         auto_aspect_deleted,
                         auto_aspect_entries,
+                        collection_aspect,
                     }
                 }
             };
+            // Resume admission before waking the UI. Unwind/spawn failure drops
+            // the same token, so no stuck Deleting state or recovery journal exists.
+            drop(deletion);
+            let result = catalog_error.map(CacheMaintResult::Error).unwrap_or(result);
             let _ = tx_worker.send(result);
         });
     if let Err(e) = spawn_result {
@@ -317,6 +660,38 @@ pub fn spawn(
         )));
     }
     CacheMaintPending { task, rx, cancel }
+}
+
+/// One completed physical inventory job on the existing heavy queue. The caller
+/// owns the low-priority GlobalIoSemaphore permit and context cancellation token.
+/// No additional thread, connection LRU, idle gate, or UI result state is created.
+pub(crate) fn run_audio_art_prune(
+    cache_dir: &std::path::Path,
+    parent: &std::path::Path,
+    inventory: &std::collections::HashSet<String>,
+    admission: crate::catalog::CatalogAdmission,
+    cancel: &AtomicBool,
+) -> usize {
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        return 0;
+    }
+    let scope = crate::catalog::AudioArtCatalogScope::new(parent);
+    match crate::catalog::prune_audio_art_scope(cache_dir, &scope, inventory, admission, cancel) {
+        Ok(deleted) => deleted,
+        Err(error) => {
+            let access = crate::catalog::CatalogAccess::for_cache_dir(cache_dir);
+            if !access.is_admitted(admission) {
+                return 0;
+            }
+            access.record_audio_art_cache_error(format!("audio art scope prune: {error}"));
+            // Rebuildable cache failure: report once, no retry/recovery machinery.
+            crate::logger::log(format!(
+                "audio art catalog prune failed: {}: {error}",
+                parent.display()
+            ));
+            0
+        }
+    }
 }
 
 fn with_auto_aspect_db<T>(
@@ -357,6 +732,247 @@ fn auto_aspect_clear_all() -> (usize, usize) {
         (0, 0),
         "clear_all",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestSource(crate::epub_cache::SourceState);
+
+    impl crate::epub_cache::SourceGuard for TestSource {
+        fn state(&self) -> std::io::Result<crate::epub_cache::SourceState> {
+            Ok(self.0)
+        }
+    }
+
+    fn publish_test_epub(
+        cache: &mut crate::epub_cache::EpubCache,
+        source: &std::path::Path,
+    ) -> crate::epub_cache::GenerationRow {
+        use crate::epub_cache::{CONVERTER_OUTPUT_VERSION, GenerationRow};
+        std::fs::write(source, b"test epub").unwrap();
+        let state = crate::epub_cache::source_state(&std::fs::metadata(source).unwrap());
+        let reserved = cache.reserve_output(source).unwrap();
+        std::fs::create_dir_all(reserved.final_path().parent().unwrap()).unwrap();
+        std::fs::write(reserved.final_path(), b"%PDF-1.4\n").unwrap();
+        let row = GenerationRow {
+            generation_id: reserved.generation_id(),
+            src_path_key: crate::epub_cache::src_key(source),
+            src_path: source.to_owned(),
+            src_state: state,
+            src_sha256: "full".into(),
+            src_head_hash: "head".into(),
+            pdf_file: reserved.final_path().to_owned(),
+            pdf_size: 9,
+            page_count: 1,
+            direction: "rtl".into(),
+            profile: "test".into(),
+            created_at: 1,
+            output_version: CONVERTER_OUTPUT_VERSION,
+        };
+        cache.publish(&row, &TestSource(state)).unwrap();
+        row
+    }
+
+    #[test]
+    fn epub_manager_selected_all_and_missing_delete_immediately_with_partial_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cache = crate::epub_cache::EpubCache::open_at(temp.path()).unwrap();
+        let a = publish_test_epub(&mut cache, &temp.path().join("a.epub"));
+        let b = publish_test_epub(&mut cache, &temp.path().join("b.epub"));
+        let c = publish_test_epub(&mut cache, &temp.path().join("c.epub"));
+        let busy = crate::pdf_loader::try_acquire_epub_read_lease(&b.src_path).unwrap();
+        let selected = run_epub_task(
+            &mut cache,
+            &EpubMaintTask::DeleteSelected {
+                generation_ids: vec![a.generation_id, b.generation_id],
+            },
+            crate::pdf_loader::block_epub_document_for_test,
+            |cache, id| cache.delete_generation_now(id),
+        );
+        assert_eq!(selected.deleted, 1);
+        assert_eq!(selected.failures.len(), 1);
+        assert!(!a.pdf_file.exists());
+        assert!(b.pdf_file.exists());
+        assert!(c.pdf_file.exists());
+
+        std::fs::remove_file(&c.src_path).unwrap();
+        let missing = run_epub_task(
+            &mut cache,
+            &EpubMaintTask::DeleteMissingSources,
+            crate::pdf_loader::block_epub_document_for_test,
+            |cache, id| cache.delete_generation_now(id),
+        );
+        assert_eq!(missing.deleted, 1);
+        assert!(!c.pdf_file.exists());
+        drop(busy);
+        let all = run_epub_task(
+            &mut cache,
+            &EpubMaintTask::DeleteAll,
+            crate::pdf_loader::block_epub_document_for_test,
+            |cache, id| cache.delete_generation_now(id),
+        );
+        assert_eq!(all.deleted, 1);
+        assert!(!b.pdf_file.exists());
+        assert!(all.entries.is_empty());
+    }
+
+    #[test]
+    fn epub_manager_load_rows_marks_missing_sources_on_worker() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cache = crate::epub_cache::EpubCache::open_at(temp.path()).unwrap();
+        let present = publish_test_epub(&mut cache, &temp.path().join("present.epub"));
+        let missing = publish_test_epub(&mut cache, &temp.path().join("missing.epub"));
+        std::fs::remove_file(&missing.src_path).unwrap();
+        let result = run_epub_task(
+            &mut cache,
+            &EpubMaintTask::LoadRows,
+            crate::pdf_loader::block_epub_document_for_test,
+            |cache, id| cache.delete_generation_now(id),
+        );
+        assert!(result.error.is_none());
+        assert_eq!(result.entries.len(), 2);
+        assert!(
+            result
+                .entries
+                .iter()
+                .any(
+                    |entry| entry.generation.generation_id == present.generation_id
+                        && !entry.source_missing
+                )
+        );
+        assert!(
+            result
+                .entries
+                .iter()
+                .any(
+                    |entry| entry.generation.generation_id == missing.generation_id
+                        && entry.source_missing
+                )
+        );
+    }
+
+    #[test]
+    fn epub_manager_commit_failure_invalidates_fixed_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cache = crate::epub_cache::EpubCache::open_at(temp.path()).unwrap();
+        let row = publish_test_epub(&mut cache, &temp.path().join("book.epub"));
+        let _pin =
+            crate::pdf_loader::pin_epub_for_test(&row.src_path, row.generation_id, row.pdf_size);
+        assert!(crate::pdf_loader::pinned_epub_target(&row.src_path).is_some());
+        let result = run_epub_task(
+            &mut cache,
+            &EpubMaintTask::DeleteAll,
+            crate::pdf_loader::block_epub_document_for_test,
+            |cache, id| cache.delete_generation_with_commit_failure_for_test(id),
+        );
+        assert_eq!(result.deleted, 0);
+        assert_eq!(result.physically_removed.len(), 1);
+        assert_eq!(result.failures.len(), 1);
+        assert!(!row.pdf_file.exists());
+        let mut app = crate::app::setup_app_for_test();
+        let removed_key = format!("{}::page_0", crate::epub_cache::src_key(&row.src_path));
+        let unrelated_key = "c:/books/other.epub::page_0".to_owned();
+        let pixels = std::sync::Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]));
+        for item_key in [removed_key.clone(), unrelated_key.clone()] {
+            app.retained_final_ai_cache.insert(
+                crate::app::RetainedFinalAiKey {
+                    raw_source: None,
+                    item_key: item_key.clone(),
+                    edit_size: [1, 1],
+                    color_ai_hash: 1,
+                    bg: 0,
+                },
+                crate::app::RetainedFinalAiEntry {
+                    pixels: std::sync::Arc::clone(&pixels),
+                    used_upscale: false,
+                    bytes: 4,
+                    last_used: 0,
+                },
+            );
+            app.retained_pdf_page_cache.insert(
+                crate::app::RetainedPdfPageKey { item_key },
+                crate::app::RetainedPdfPageEntry {
+                    kind: crate::app::RetainedPdfPageCacheKind::Raster {
+                        pixels: std::sync::Arc::clone(&pixels),
+                        source_dims: [1, 1],
+                        render_long_edge: 1,
+                    },
+                    bytes: 4,
+                    last_used: 0,
+                },
+            );
+        }
+        app.invalidate_removed_epub_generations(&result.physically_removed);
+        assert!(
+            !app.retained_final_ai_cache
+                .keys()
+                .any(|key| key.item_key == removed_key)
+        );
+        assert!(
+            !app.retained_pdf_page_cache
+                .keys()
+                .any(|key| key.item_key == removed_key)
+        );
+        assert!(
+            app.retained_final_ai_cache
+                .keys()
+                .any(|key| key.item_key == unrelated_key)
+        );
+        assert!(
+            app.retained_pdf_page_cache
+                .keys()
+                .any(|key| key.item_key == unrelated_key)
+        );
+        drop(result);
+        assert!(crate::pdf_loader::pinned_epub_target(&row.src_path).is_none());
+    }
+
+    #[test]
+    fn collection_actor_failure_preserves_folder_maintenance_and_reports_unknown_total() {
+        let _app = crate::app::setup_app_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("book");
+        let db_path = crate::catalog::db_path_for(temp.path(), &folder);
+        let db = crate::catalog::CatalogDb::open(temp.path(), &folder).unwrap();
+        drop(db);
+        let pending = spawn(
+            CacheMaintTask::DeleteFolder {
+                folder,
+                auto_aspect_folder: None,
+            },
+            temp.path().to_path_buf(),
+            None,
+            Err("collection actor unavailable".into()),
+        );
+        let result = pending
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(!db_path.exists(), "folder cache deletion must still run");
+        assert!(matches!(
+            result,
+            CacheMaintResult::DeleteFolderDone {
+                existed: true,
+                collection_aspect: CollectionAspectOutcome::Failed(_),
+                ..
+            }
+        ));
+
+        let pending = spawn(
+            CacheMaintTask::DeleteAll,
+            temp.path().to_path_buf(),
+            None,
+            Err("collection actor unavailable".into()),
+        );
+        assert!(matches!(
+            pending.rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),
+            CacheMaintResult::DeleteAllDone {
+                collection_aspect: CollectionAspectOutcome::Failed(message), ..
+            } if message.contains("collection actor unavailable")
+        ));
+    }
 }
 
 fn auto_aspect_delete_folder(folder: &std::path::Path) -> (usize, usize) {

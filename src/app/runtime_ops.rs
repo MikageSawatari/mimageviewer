@@ -368,6 +368,7 @@ impl App {
     /// scroll_settle helper 群を inherent impl に逃がす都合上、本体を inherent
     /// メソッドに移して trait impl 側から委譲する。
     pub(super) fn on_exit_inner(&mut self) {
+        self.cut_clipboard.shutdown();
         // 最後の UI 差分と debounce 中の書き込みを、settings の終了保存より先に確定する。
         self.flush_favorite_view_writes_for_exit();
         // 一括編集が中央DBへcommit済みなら、成功 outcome をsidecarへ反映してから
@@ -387,20 +388,31 @@ impl App {
         #[cfg(windows)]
         {
             self.sync_native_video_main_cloak(false);
-            // T22: 終了経路は早く抜けたい (ユーザーが close ボタンを押した文脈) ので 2 秒
-            // で打ち切る。timeout した slot は前回保存の state を保持する
-            let states = self.snapshot_vst3_states_into_settings(std::time::Duration::from_secs(2));
-            let positions = self.snapshot_vst3_window_positions_into_settings();
-            if states > 0 || positions > 0 {
-                self.settings.save();
+            self.save_effetune_gui_rect();
+            self.cancel_remote_video_stream_state(
+                mimageviewer_ipc::VideoStreamErrorCode::Failed,
+                "アプリを終了しています",
+            );
+            let quiesced = self
+                .dsp_processing
+                .quiesce_for_exit(std::time::Instant::now() + std::time::Duration::from_secs(2));
+            if quiesced {
+                let effetune_exit = self.effetune.begin_exit_capture();
+                // T22: state snapshot has its own bounded host deadline.
+                let states =
+                    self.snapshot_vst3_states_into_settings(std::time::Duration::from_secs(2));
+                let positions = self.snapshot_vst3_window_positions_into_settings();
+                if states > 0 || positions > 0 {
+                    self.settings.save();
+                }
+                self.effetune.finish_for_exit(effetune_exit);
+            } else {
+                crate::logger::log(
+                    "DSP exit quiescence timed out; retaining previously saved plugin states",
+                );
             }
         }
         self.stop_video_upscale_queue_for_exit();
-        // legacy タグ worker は detach thread なので、終了時はキャンセルを立てて
-        // ファイル境界で止める (特に ImportAndRemove はユーザーファイルを書き換える)。
-        if let Some(pending) = self.tag_legacy_seed_pending.as_ref() {
-            pending.cancel();
-        }
         self.cancel_smart_folder_pending();
         // 再生中の動画 / 音声の現在位置を resume map に確定してから保存する
         // (角度⑤ Sol P2: `close_fullscreen` を経ない終了では最後の再生位置が
@@ -411,6 +423,10 @@ impl App {
         self.persist_window_state_and_flush(crate::app::PersistScope::ProcessIsStopping);
         // Normal frames only enqueue latest-value journal snapshots. Exit is the one boundary
         // that waits for the writer so the next startup can recover every unfinished rename.
-        self.flush_rename_migration_journal();
+        if let Err(error) = self.flush_rename_migration_journal() {
+            crate::logger::log(format!(
+                "[RENAME-MIG] exit journal flush remained unsaved: {error}"
+            ));
+        }
     }
 }

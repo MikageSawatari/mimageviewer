@@ -1,9 +1,12 @@
 [workspace]
 members = [
+    "crates/startup-diagnostics",
+    "crates/epub-pdf-worker",
     "crates/susie-worker",
     "crates/susie-crash-plugin",
     "crates/launcher",
     "crates/local-adjust-core",
+    "crates/libraw-sys",
     "crates/comic-core",
     "crates/music-core",
     "crates/musicvideo-core",
@@ -20,11 +23,19 @@ members = [
     "tools/seek_strip_probe",
     "tools/viewer_context_audit",
 ]
-exclude = ["crates/unrar-patched", "vendor/eframe", "vendor/egui-wgpu"]
+exclude = [
+    "crates/ort-patched",
+    "crates/unrar-patched",
+    "vendor/eframe",
+    "vendor/egui",
+    "vendor/egui-wgpu",
+]
 
 [patch.crates-io]
 eframe = { path = "vendor/eframe" }
+egui = { path = "vendor/egui" }
 egui-wgpu = { path = "vendor/egui-wgpu" }
+ort = { path = "crates/ort-patched" }
 
 # 配布バイナリ (本体 = `mimageviewer-core.exe` + remote service +
 # launcher = `mimageviewer.exe`) の
@@ -33,7 +44,7 @@ egui-wgpu = { path = "vendor/egui-wgpu" }
 # 旧バージョンの runtime dir に新しい実行ファイルを上書きしてしまう。susie-worker / vst3-host-tester
 # / png2mag は独立した内部ヘルパーなので workspace inherit せず個別管理。
 [workspace.package]
-version = "3.7.0"
+version = "4.4.0"
 edition = "2024"
 # let-chain (Rust 1.88 で安定化) を本体・サブクレート共通で使っているため明示。
 rust-version = "1.88"
@@ -78,6 +89,20 @@ bench = false
 [[bin]]
 name = "bench_ai"
 path = "src/bin/bench_ai.rs"
+test = false
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "bench_dupe"
+path = "src/bin/bench_dupe.rs"
+test = true # D11 RAW decode routing regression runs only with --features dev-tools --bin bench_dupe.
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "bench_raw"
+path = "src/bin/bench_raw.rs"
 test = false
 bench = false
 required-features = ["dev-tools"]
@@ -154,6 +179,20 @@ required-features = ["dev-tools"]
 name = "mvexport_cli"
 path = "src/bin/mvexport_cli.rs"
 test = false
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "similar_book_query_bench"
+path = "src/bin/similar_book_query_bench.rs"
+test = true
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "similar_book_query_verify"
+path = "src/bin/similar_book_query_verify.rs"
+test = true
 bench = false
 required-features = ["dev-tools"]
 
@@ -247,6 +286,18 @@ bench = false
 required-features = ["manual-e2e"]
 
 [target.'cfg(windows)'.dependencies]
+libraw-sys = { path = "crates/libraw-sys" }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_System_Performance",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Accessibility",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+] }
 windows-core = "0.61"
 # wgpu-hal 27 系が要求する windows 0.58。`windows_058` 別名でアプリ側にも
 # 公開し、wgpu の hal::Api::Device 経由で得る ID3D12Resource を OpenSharedHandle
@@ -263,6 +314,7 @@ windows = { version = "0.61", features = [
     "Win32_UI_Input_Ime",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Input_Pointer",
+    "Win32_UI_Input_Touch",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
     "Win32_UI_WindowsAndMessaging",
@@ -278,6 +330,7 @@ windows = { version = "0.61", features = [
     "Win32_System_Power",
     "Win32_System_Performance",
     "Win32_System_IO",
+    "Win32_System_JobObjects",
     "Win32_System_Pipes",
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
@@ -308,6 +361,7 @@ windows-numerics = "0.2"
 winreg = "0.52"
 
 [dependencies]
+miv-startup = { path = "crates/startup-diagnostics" }
 eframe = { version = "0.33", features = ["wgpu"] }
 egui = "0.33"
 egui-wgpu = "0.33"
@@ -348,8 +402,13 @@ resvg = "0.45"
 kamadak-exif = "0.6"
 rexif = "0.7"
 rayon = "1.10"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["bundled", "hooks"] }
 sha2 = "0.10"
+url = "2"
+# CF_HTML uses a browser-grade HTML parser; inline background-image values use
+# the same CSS tokenizer already required by scraper (ISC / MPL-2.0).
+scraper = { version = "0.27", default-features = false }
+cssparser = "0.37"
 # `rc`: サイドカーの items を `Arc` のまま直列化・復元する (deep clone を作らない)。
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
@@ -399,6 +458,8 @@ tray-icon = "0.20"
 # rustls-tls 指定で OpenSSL に依存しない (CRT 静的リンク方針との両立)。
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 semver = "1"
+# Same nonblocking publisher lock as the launcher runtime collector.
+fs4 = "0.13"
 # 動画インライン再生 (フルスクリーンで MP4/MKV/MOV/AVI/WMV/MPG/MPEG を再生)。
 # BtbN の FFmpeg LGPL shared build を vendor/ffmpeg/ に置き、FFMPEG_DIR で参照する
 # (.cargo/config.toml に env で指定済み)。本体 (`mimageviewer-core.exe`) は通常リンク
@@ -436,8 +497,11 @@ egui_kittest = { version = "0.33", features = ["snapshot", "wgpu"] }
 winresource = "0.1"
 naga = { version = "27", features = ["wgsl-in", "hlsl-out"] }
 
-# 通常テストでは行番号付きバックトレースを保ちつつ、型情報を含む巨大な PDB を避ける。
-[profile.test]
+# 行番号付きバックトレース (panic / cdb のスタック) を保ちつつ、型情報を含む巨大な PDB と
+# rlib を避ける。test profile は dev を継承するので、ここだけに書く。dev と test で設定が
+# 分かれると、依存クレートが target/debug に 2 通りビルドされて容量もビルド時間も倍になる。
+# 変数・型情報が要るときだけ、そのビルドで `$env:CARGO_PROFILE_DEV_DEBUG = "full"` を指定する。
+[profile.dev]
 debug = "line-tables-only"
 split-debuginfo = "packed"
 

@@ -222,6 +222,7 @@ pub(crate) struct TagViewResult {
     pub summaries: Vec<TagSummary>,
     pub entries: Vec<TagViewEntry>,
     pub truncated: bool,
+    pub(crate) video_thumb_overrides: std::collections::HashMap<String, PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -247,6 +248,7 @@ pub(crate) fn spawn_tag_view_search(
     data_dir: PathBuf,
     query: String,
     kind_filter: TagViewKindFilter,
+    settings: crate::settings::Settings,
 ) -> TagViewPending {
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_worker = Arc::clone(&cancel);
@@ -254,7 +256,39 @@ pub(crate) fn spawn_tag_view_search(
     std::thread::Builder::new()
         .name("tag-view-search".to_string())
         .spawn(move || {
-            let result = run_tag_view_search(&data_dir, &query, kind_filter, &cancel_worker);
+            let result = run_tag_view_search(&data_dir, &query, kind_filter, &cancel_worker)
+                .and_then(|mut result| {
+                    let media_paths = result
+                        .entries
+                        .iter()
+                        .filter(|entry| {
+                            matches!(entry.kind, TagViewItemKind::Video | TagViewItemKind::Audio)
+                        })
+                        .map(|entry| entry.path.clone())
+                        .collect::<Vec<_>>();
+                    let sidecars =
+                        crate::app::folder_scan::discover_aggregate_video_sidecars_while(
+                            &settings,
+                            &media_paths,
+                            64,
+                            || !cancel_worker.load(Ordering::Relaxed),
+                        )
+                        .ok_or_else(|| "cancelled".to_string())?;
+                    if sidecars.skipped_parents > 0 {
+                        crate::logger::log(format!(
+                            "tag sidecar discovery capped: scanned={} skipped={}",
+                            sidecars.scanned_parents, sidecars.skipped_parents
+                        ));
+                    }
+                    for (parent, error) in &sidecars.scan_errors {
+                        crate::logger::log(format!(
+                            "tag sidecar discovery failed {}: {error}",
+                            parent.display()
+                        ));
+                    }
+                    result.video_thumb_overrides = sidecars.by_video_path;
+                    Ok(result)
+                });
             if !cancel_worker.load(Ordering::Relaxed) {
                 let _ = tx.send(result);
             }
@@ -281,6 +315,7 @@ fn run_tag_view_search(
             summaries,
             entries: Vec::new(),
             truncated: false,
+            video_thumb_overrides: Default::default(),
         });
     }
 
@@ -301,6 +336,7 @@ fn run_tag_view_search(
                 summaries,
                 entries,
                 truncated,
+                video_thumb_overrides: Default::default(),
             });
         }
         let path = PathBuf::from(&key);
@@ -330,6 +366,7 @@ fn run_tag_view_search(
         summaries,
         entries,
         truncated,
+        video_thumb_overrides: Default::default(),
     })
 }
 
@@ -388,7 +425,10 @@ pub(crate) enum ClassifiedTagViewPath {
 
 pub(crate) fn classify_tag_view_path(path: PathBuf) -> ClassifiedTagViewPath {
     match std::fs::metadata(&path) {
-        Ok(meta) => existing_tag_view_entry(restore_real_casing(path), meta),
+        Ok(meta) => existing_tag_view_entry(
+            crate::path_key::restore_existing_path_casing(&path).unwrap_or(path),
+            meta,
+        ),
         Err(_) => {
             // 大文字小文字を区別するディレクトリ (DevDrive / WSL の case-sensitive
             // フラグ) では、小文字正規化された item_key の metadata が**実在ファイル
@@ -425,34 +465,6 @@ fn existing_tag_view_entry(path: PathBuf, meta: std::fs::Metadata) -> Classified
     })
 }
 
-/// 表示用に実ディスク上の casing を復元する。
-///
-/// tags.db の item_key は小文字正規化されているため、キーから直接 GridItem を作ると
-/// セル名・ツールチップ・クリップボードまで全小文字になる (Ctrl+G/S は実 casing)。
-/// `canonicalize` は Windows で実 casing を返すので、`\\?\` プレフィックスを剥がした
-/// 上で**大小・区切り以外が変わらない場合のみ**採用する (シンボリックリンク解決で
-/// 別パスになった場合は item_key とずれてタグ操作が空振りするため、元のキーを保つ)。
-fn restore_real_casing(path: PathBuf) -> PathBuf {
-    let Ok(canon) = std::fs::canonicalize(&path) else {
-        return path;
-    };
-    let s = canon.to_string_lossy();
-    let stripped: PathBuf = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-        PathBuf::from(format!(r"\\{rest}"))
-    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
-        PathBuf::from(rest)
-    } else {
-        canon
-    };
-    if crate::adjustment_db::normalize_path(&stripped)
-        == crate::adjustment_db::normalize_path(&path)
-    {
-        stripped
-    } else {
-        path
-    }
-}
-
 /// 親ディレクトリを走査して、ファイル名が大小無視で一致するエントリを探す。
 /// 祖先側も casing がずれている full case-sensitive 環境は対象外 (1 階層のみ)。
 fn find_case_insensitive_sibling(path: &Path) -> Option<PathBuf> {
@@ -485,7 +497,7 @@ fn classify_file_kind(path: &Path) -> TagViewItemKind {
         TagViewItemKind::Audio
     } else if crate::folder_tree::is_zip_extension(&ext) {
         TagViewItemKind::ZipFile
-    } else if ext == "pdf" {
+    } else if crate::folder_tree::is_paged_document_path(path) {
         TagViewItemKind::PdfFile
     } else if let Some(format) = ArchiveFormat::from_extension(&ext) {
         TagViewItemKind::Archive(format)
@@ -812,6 +824,10 @@ mod tests {
     #[test]
     fn tag_view_classifies_audio_without_folder_fallback() {
         assert_eq!(
+            classify_file_kind(Path::new("Book.EPUB")),
+            TagViewItemKind::PdfFile
+        );
+        assert_eq!(
             classify_file_kind(Path::new("MixedCase.FLAC")),
             TagViewItemKind::Audio
         );
@@ -821,5 +837,54 @@ mod tests {
         assert!(!TagViewKindFilter::Folder.matches(TagViewItemKind::Audio));
         assert!(TAG_VIEW_KIND_FILTER_CHOICES.contains(&TagViewKindFilter::Audio));
         assert_eq!(TagViewKindFilter::Audio.label(), "音声");
+    }
+    #[test]
+    fn audio_sidecar_is_prepared_by_tag_worker_without_omitting_explicit_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let audio = temp.path().join("song.flac");
+        let cover = temp.path().join("song.png");
+        std::fs::write(&audio, b"flac").unwrap();
+        std::fs::write(&cover, b"image").unwrap();
+        let mut db = crate::tags_db::TagsDb::open_at(&data_dir.join("tags.db")).unwrap();
+        db.set_item_tags(
+            &crate::tags_db::item_key_for_path(&audio),
+            ["music"],
+            "test",
+        )
+        .unwrap();
+        db.set_item_tags(
+            &crate::tags_db::item_key_for_path(&cover),
+            ["music"],
+            "test",
+        )
+        .unwrap();
+        drop(db);
+        for enabled in [true, false] {
+            let mut settings = crate::settings::Settings::default();
+            settings.video_thumb_use_sidecar_image = enabled;
+            let pending = spawn_tag_view_search(
+                data_dir.clone(),
+                "#music".into(),
+                TagViewKindFilter::All,
+                settings,
+            );
+            let result = pending
+                .rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                result.entries.len(),
+                2,
+                "aggregate source discovery must keep explicit image results"
+            );
+            let key = crate::path_key::normalize_keep_drive(&audio);
+            assert_eq!(
+                result.video_thumb_overrides.get(&key),
+                enabled.then_some(&cover)
+            );
+        }
     }
 }

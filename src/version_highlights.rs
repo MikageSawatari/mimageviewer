@@ -192,6 +192,115 @@ fn render_item(ui: &mut egui::Ui, marker: &str, item: &HighlightItem) {
     });
 }
 
+// v3.8.0 は別バージョン索引を休止したまま出荷したので、この版の告知は 2 件のまま固定する。
+// 機能そのものの告知は、実際に使えるようになった v3.9.0 のエントリが持つ。
+const V3_8_HIGHLIGHTS: &[HighlightItem] = &[
+    HighlightItem {
+        title: "画像・動画の余白色を選べます",
+        body: "静止画・本の画像の外側、静止画サムネイル列の空欄、動画の映像の外側に使う色を、黒 / 灰 / 白と任意の色から選べます (既定は黒のままです)。環境設定 → 表示 → 閲覧表示 にあります。",
+    },
+    HighlightItem {
+        title: "動画のマウスボタンへシークを割り当てられます",
+        body: "戻る / 進むボタンとホイールクリックへ、小・中・大のシークを割り当てられます。押し続けると繰り返します。操作カスタマイズから設定します。",
+    },
+];
+
+const V3_9_HIGHLIGHTS: &[HighlightItem] = &[HighlightItem {
+    title: "同じ絵の別バージョンを探せます",
+    body: "お気に入りごとに「別バージョン索引」を ON にすると (既定は OFF)、フルスクリーン右パネルの「類似」で、いま見ている画像と同じ絵を別の大きさ・形式から探せます。画像単位と本単位の両方で探せ、本単位ではどのページが一致しているかも表示します。",
+}];
+
+const V3_10_HIGHLIGHTS: &[HighlightItem] = &[
+    HighlightItem {
+        title: "切り取り中のファイルが半透明で分かります",
+        body: "Windows のファイル操作で切り取った実ファイル・実フォルダを、一覧で半透明にしてハサミの印を付けます。貼り付けが終わるか、コピーや別の切り取りでクリップボードが置き換わると元に戻ります。",
+    },
+    HighlightItem {
+        title: "見開きの端の 1 ページを本来の側に置けます",
+        body: "本の先頭・末尾で 1 ページだけになるページを、中央ではなく見開きの本来ある側へ置けます (既定は OFF)。環境設定 → 表示 → 閲覧表示 の「見開きの先頭・末尾の単ページを片側に配置」で切り替えられ、本ごとにはフルスクリーンの表示モードメニューから選べます。",
+    },
+    HighlightItem {
+        title: "切り取り枠は Ctrl+ドラッグで引き直せます",
+        body: "切り取りモードで Ctrl を押しながら左ドラッグすると、既存の枠やハンドルの上からでも新しい範囲を作れます。初めて範囲を決めるときに画像全体の枠を掴んでしまうことがなくなります。このキーは操作カスタマイズで変更・無効化できます。",
+    },
+];
+
+const V4_0_HIGHLIGHTS: &[HighlightItem] = &[
+    HighlightItem {
+        title: "離れた場所のファイルを名前を付けた一覧にまとめられます",
+        body: "上部の「コレクション」→「コレクションの管理…」で名前付きの一覧を作り、ツールバーの「コレクション:」で追加先を選んで「追加」を押すと、チェック済みの項目 (チェックがなければ選択中の項目) を登録します。登録しても元のファイルは移動もコピーもしません。並び順はドラッグで決める手動順・通常のソート・シャッフルから選べ、前後の移動やスライドショー、動画・音声の連続再生も同じ順番に従います。mIV Remote からは読み取り専用で見られます。",
+    },
+    HighlightItem {
+        title: "並べ替えにファイルサイズ順と降順が増えました",
+        body: "一覧の並べ替えでファイルサイズ順を選べるようになり、名前順・番号順では降順も選べます。フォルダツリーの並び順は一覧の並び順と別に指定できます。",
+    },
+    HighlightItem {
+        title: "「重なる本」が大きな本でも待てる時間で答えます",
+        body: "ページ数が非常に多い本で結果が出ないまま時間がかかっていました。3,000 ページを超える本は調べる側・調べられる側のどちらでも対象から外し、候補のページ数の合計が 10,000 ページを超えた時点で打ち切って、その理由を表示します。",
+    },
+];
+
+const V4_1_HIGHLIGHTS: &[HighlightItem] = &[
+    HighlightItem {
+        title: "表紙の次のページと最終ページを単独で表示できます",
+        body: "表紙ありの見開きで、表紙の次や最後のページが単独のページとして作られた本のずれを直せます。単独にしたページの空いた側は白で埋め、「末尾に表紙を添える」が有効なら最終ページには表紙を添えます。環境設定の「表示 → 閲覧表示」と、フルスクリーンの見開きメニューで本ごとに選べます。",
+    },
+    HighlightItem {
+        title: "★の評価を 1 段階ずつ上げ下げできます",
+        body: "操作カスタマイズの「評価を1段階上げる / 下げる」にキーを割り当てて使います。未評価の項目は★3 を基準に、上げると★4、下げると★2 になります。",
+    },
+    HighlightItem {
+        title: "シーク位置のプレビューの大きさを選べます",
+        body: "動画と静止画で別々に、最小〜最大の 5 段階から選べます。既定の「大」はこれまでと同じ大きさです。",
+    },
+];
+
+const V4_2_HIGHLIGHTS: &[HighlightItem] = &[
+    HighlightItem {
+        title: "一覧を★の評価順に並べられます",
+        body: "ツールバーの「ソート:」で「評価（高い順）」「評価（低い順）」を選べます。フォルダ、アイテム検索の結果、スマートフォルダ、mIV Remote のフォルダ一覧で使えます。表示中に★を変えても行は動かず、ソート横の「⟳」で並べ直します。",
+    },
+    HighlightItem {
+        title: "ウィンドウを常に最前面に表示できます",
+        body: "「設定」メニューの「常に最前面」にチェックを入れると、メインウィンドウと閲覧用のウィンドウを、ほかのアプリより前に表示します。",
+    },
+    HighlightItem {
+        title: "サムネイルの列数を 20 列まで増やせます",
+        body: "ツールバーの「列:」、Ctrl+マウスホイール、2 本指のピンチで 11〜20 列も選べます。",
+    },
+];
+
+const V4_3_HIGHLIGHTS: &[HighlightItem] = &[
+    HighlightItem {
+        title: "動画の音声トラックを選べます",
+        body: "複数の音声トラックがある動画では、下部 HUD の「音声 N」ボタンから聴くトラックを選べます。選んだトラックはファイルごとに記憶し、mIV Remote でも選べます。",
+    },
+    #[cfg(not(feature = "portable"))]
+    HighlightItem {
+        title: "音響調整 (EffeTune) で音を整えられます",
+        body: "ツールバーの「音響調整」ボタンから、イコライザーやエフェクトで動画・音声の音を整えられます。一度設定すると、次からは起動時に自動で有効になります。",
+    },
+    HighlightItem {
+        title: "動画・音声のサムネイルに長さを表示します",
+        body: "サムネイルの右下に「分:秒」で長さを表示します。環境設定の「表示 → サムネイル」でオフにできます。",
+    },
+];
+
+const V4_4_HIGHLIGHTS: &[HighlightItem] = &[
+    HighlightItem {
+        title: "RAW 画像を開けるようになりました",
+        body: "追加の拡張機能なしで、DNG と各社カメラの RAW を開けます。フルスクリーンではまず埋め込みプレビューを表示し、現像が終わると現像した画像に切り替わります。",
+    },
+    HighlightItem {
+        title: "クリップボードから画像を取り込めます",
+        body: "環境設定の「起動と連携 → クリップボード取り込み」でオンにすると、コピーした画像を自動で保存します（既定はオフ）。一覧画面の Ctrl+V でも今のフォルダへ保存できます。",
+    },
+    HighlightItem {
+        title: "よく使うコピー・移動先を「ファイル整理先」に登録できます",
+        body: "環境設定の「ライブラリ → フォルダ・ファイル → ファイル整理先」で登録し、項目を右クリックして「ファイル整理先…」から移動・コピーします。",
+    },
+];
+
 const TABLE: &[VersionHighlights] = &[
     VersionHighlights {
         version: "2.0.0",
@@ -649,7 +758,7 @@ const TABLE: &[VersionHighlights] = &[
         must_read: &[
             HighlightItem {
                 title: "フォルダの代表画像の選び方が変わります",
-                body: "フォルダタイルの代表画像を、一覧と同じファイル名順で選ぶように変更します。以前に番号順を選んでいた場合も、更新後に一度だけファイル名順へ変わります。番号順へ戻すには、環境設定 → フォルダ・ファイル → 「代表画像の選択基準」で「番号順（区切り無視）」を選んでください。",
+                body: "フォルダタイルの代表画像を、一覧と同じファイル名順で選ぶように変更します。以前に番号順を選んでいた場合も、更新後に一度だけファイル名順へ変わります。番号順へ戻すには、環境設定 → フォルダ・ファイル → 「代表画像の選択基準」で「番号（昇順）」を選んでください。",
             },
             HighlightItem {
                 title: "バケツで塗る範囲が既定で 1px 広がります",
@@ -798,6 +907,112 @@ const TABLE: &[VersionHighlights] = &[
             body: "次の見開きの両ページを準備できるよう、先読みの既定値を前方 3・後方 2 へ変更しました。旧既定の前方 2 は更新時に一度 3 へ変わります。保存済みの後方値は変更しません。前方 2 へ戻す場合は、環境設定 → パフォーマンス → 先読みで変更できます。",
         }],
         highlights: &[],
+    },
+    VersionHighlights {
+        version: "3.8.0",
+        // 末尾の表紙は既定 ON で、更新しただけで見開きの見え方が変わるため必読へ置く。
+        // 余白色の既定は従来どおり黒なので新機能側にまとめる。
+        must_read: &[HighlightItem {
+            title: "見開きの最後に表紙を添えるようになりました",
+            body: "「表紙あり」の見開きで先頭と末尾がどちらも単独ページになる本では、最後のページの隣へ先頭の表紙を並べます。表示だけの追加で、ページ数・ページ送り・シークバー・読書位置は変わりません。既定は ON です。環境設定 → 表示 → 閲覧表示 で全体を切り替えられ、本ごとにはフルスクリーンの表示モードメニューから選べます。",
+        }],
+        highlights: V3_8_HIGHLIGHTS,
+    },
+    VersionHighlights {
+        version: "3.9.0",
+        // 既定値も既存の操作の意味も変えていないので必読は無し。別バージョン索引は
+        // 既定 OFF の新機能なので新機能側だけで告知する。
+        must_read: &[],
+        highlights: V3_9_HIGHLIGHTS,
+    },
+    VersionHighlights {
+        version: "3.10.0",
+        // 右クリックメニューは設定の置き場所が変わるので必読へ置く (「メニュー構成」を
+        // 探しに行った人が見つけられなくなるため)。動画の拡大表示は、既存の V 操作中に
+        // 左右パネルが出なくなる = 既存操作の見え方が変わるので同じく必読。
+        must_read: &[
+            HighlightItem {
+                title: "右クリックメニューの項目を並べ替え・非表示にできます",
+                body: "一覧とフルスクリーンの右クリックメニューにある mImageViewer の項目を、環境設定 → 表示 →「右クリックメニュー」で並べ替えたり隠したりできます。項目の前の区切り線も指定でき、「確認する表示場面」で実際の見え方を確かめられます。これまでの「表示 → メニュー構成」は「表示 → 通常メニュー」へ名前が変わり、メニューバー側の設定はそちらにあります。Windows の項目・登録した外部ツール・関連付けアプリの並び順は変わりません。",
+            },
+            HighlightItem {
+                title: "動画の拡大表示中は左右のパネルを隠します",
+                body: "通常の動画で V を押している間は、画面の端まで動画を動かせるように左右のパネルと呼び出し部分を一時的に隠します。パネルの開閉・固定の設定は保たれ、V で終了すると元に戻ります。あわせて、画面に収まる大きさより小さく (10% まで) 縮小できるようになりました。",
+            },
+        ],
+        highlights: V3_10_HIGHLIGHTS,
+    },
+    VersionHighlights {
+        version: "4.0.0",
+        // 更新後の初回起動で索引を作り直す (= しばらく検索結果が揃わない) ことと、
+        // 検索に入る文言の範囲が変わって今までヒットしていた語で出なくなることは、
+        // どちらも既存の操作の結果が変わるので必読へ置く。
+        must_read: &[
+            HighlightItem {
+                title: "この版の初回起動でアイテム検索の索引を作り直します",
+                body: "アイテム検索 (Ctrl+G) が使う索引の形式が変わったため、更新後の最初の起動で作り直します。お気に入りで索引を有効にしている場所が大きいほど時間がかかり、その間はアイテム検索の結果が揃いません。タグ・★評価・閲覧履歴・サムネイルキャッシュはそのまま残ります。",
+            },
+            HighlightItem {
+                title: "アイテム検索は生成に使われた文言だけを探します",
+                body: "これまでは、差し替え前の候補をすべて並べたテンプレートのような、生成に使われたとは限らない文字列も検索の対象でした。そのため実際には使っていない語で画像が引っかかっていました。これからは生成に使われたと確かめられる文言だけを探すので、これまでヒットしていた語で出てこなくなる画像があります。生成情報の表示では、変換前の入力を「未解決の入力」として分けて見られます。",
+            },
+        ],
+        highlights: V4_0_HIGHLIGHTS,
+    },
+    VersionHighlights {
+        version: "4.1.0",
+        // フォルダのサムネイルに選ばれる画像が変わる (= 既存の一覧の見え方が変わる) ので必読へ置く。
+        must_read: &[HighlightItem {
+            title: "フォルダのサムネイルは直下の画像を優先します",
+            body: "これまでは、直下に画像があってもサブフォルダ内の画像をフォルダのサムネイルに選んでいました。これからは直下の画像を優先し、直下に画像が無いときだけサブフォルダの画像や、サムネイルを作成済みの ZIP・PDF を使います。そのため、この版で最初に表示したときにフォルダのサムネイルを 1 度だけ作り直し、今までと違う画像になるフォルダがあります。手動で選んだ画像や動画のコマはそのまま残ります。",
+        }],
+        highlights: V4_1_HIGHLIGHTS,
+    },
+    VersionHighlights {
+        version: "4.2.0",
+        // 既存のフォルダ一覧に EPUB が並び、ツールバーの候補が増える (= 見え方が変わる) ので必読へ置く。
+        must_read: &[
+            HighlightItem {
+                title: "EPUB が一覧に本として並びます",
+                body: "DRM のない EPUB を PDF に変換して読めるようになり、フォルダの一覧に EPUB が本として並ぶようになりました。既定では、まだ変換していない本を開くと確認画面が出て、「変換して開く」で変換してから開きます。同じフォルダに同じ名前の PDF があるときは PDF だけを表示します。EPUB を一覧に出したくない場合は、環境設定の「パフォーマンス → キャッシュ」にある「EPUB の処理」で「無視する」を選んでください。",
+            },
+            HighlightItem {
+                title: "ツールバーの列数とソートの候補が増えました",
+                body: "ツールバーの候補を変えていない場合、列数に 11〜20 列を、ソートに「評価（高い順）」「評価（低い順）」を、この版で 1 度だけ加えます。不要な候補は、ツールバーの項目を右クリックして外せます。",
+            },
+        ],
+        highlights: V4_2_HIGHLIGHTS,
+    },
+    VersionHighlights {
+        version: "4.3.0",
+        // リモート接続時の PC 側の動きを告知。通常版では音響調整ボタンの追加も必読へ置く。
+        must_read: &[
+            HighlightItem {
+                title: "リモート接続中は PC の閲覧ウィンドウを閉じます",
+                body: "mIV Remote の接続を受け付けると、フルスクリーンや別ウィンドウなど PC 側の閲覧ウィンドウを閉じ、「リモート接続中」の表示だけにします。切断すると一覧に戻ります。閉じた閲覧ウィンドウは元に戻りません。",
+            },
+            #[cfg(not(feature = "portable"))]
+            HighlightItem {
+                title: "ツールバーに「音響調整」ボタンが加わりました",
+                body: "同梱の音響調整 (EffeTune) を開くボタンです。不要な場合は、ツールバーの項目を右クリックして外せます。",
+            },
+        ],
+        highlights: V4_3_HIGHLIGHTS,
+    },
+    VersionHighlights {
+        version: "4.4.0",
+        // 既定オンで一覧の見た目が変わる位置バーと、起動時の戻り先の変更を必読へ置く。
+        must_read: &[
+            HighlightItem {
+                title: "サムネイルの下端に、前回の読書・再生位置を表示します",
+                body: "本は最後に記録したページ位置の割合を、動画・音声は前回の再生位置をバーで表示します。そのため、ファイル名などの表示が少し上へ移ります。環境設定の「表示 → サムネイル」にある「本・動画・音声のサムネイルに前回の位置を表示」でオフにできます。",
+            },
+            HighlightItem {
+                title: "本を直接ページ表示したまま終了したときの、次の起動時の戻り先を変えました",
+                body: "「起動時に開く場所」が「前回終了した場所」のとき、本を直接ページ表示で開いていた場合は、開く前の一覧に戻ります。タスクトレイから復帰したときも同じです。読んでいたページは、本を開き直すと続きから読めます。",
+            },
+        ],
+        highlights: V4_4_HIGHLIGHTS,
     },
 ];
 
@@ -978,6 +1193,54 @@ mod tests {
         assert!(notice.body.contains("前方 3・後方 2"));
         assert!(notice.body.contains("旧既定の前方 2"));
         assert!(notice.body.contains("保存済みの後方値は変更しません"));
+    }
+
+    #[test]
+    fn similar_search_is_announced_by_the_version_that_shipped_it() {
+        // v3.8.0 は休止したまま出荷したので、この版の告知に別バージョン索引は出ない。
+        // v3.8.0 から上げた利用者は v3.9.0 のエントリしか見ないため、告知はそちらが持つ。
+        let v3_8 = table()
+            .iter()
+            .find(|entry| entry.version == "3.8.0")
+            .expect("v3.8.0 entry");
+        assert_eq!(v3_8.highlights.len(), 2);
+        assert!(
+            v3_8.highlights
+                .iter()
+                .all(|item| !item.title.contains("別バージョン"))
+        );
+        assert!(
+            v3_8.highlights
+                .iter()
+                .any(|item| item.title.contains("余白色"))
+        );
+        assert!(
+            v3_8.highlights
+                .iter()
+                .any(|item| item.title.contains("マウスボタン"))
+        );
+
+        let v3_9 = table()
+            .iter()
+            .find(|entry| entry.version == "3.9.0")
+            .expect("v3.9.0 entry");
+        assert!(v3_9.must_read.is_empty());
+        assert!(
+            v3_9.highlights
+                .iter()
+                .any(|item| item.title.contains("別バージョン"))
+        );
+        assert!(
+            crate::similar_index::PRODUCT_SIMILAR_FEATURE_CAPABILITY.is_enabled(),
+            "v3.9.0 announces the feature, so the product build must actually have it"
+        );
+
+        let upgraded = highlights_to_show(Some("3.8.0"), "3.9.0", table());
+        assert_eq!(
+            versions(&upgraded),
+            ["3.9.0"],
+            "a v3.8.0 user must be told about the feature on the first v3.9.0 launch"
+        );
     }
 
     #[test]
@@ -1195,7 +1458,47 @@ mod tests {
                 .body
                 .contains("環境設定 → フォルダ・ファイル → 「代表画像の選択基準」")
         );
-        assert!(notice.body.contains("番号順（区切り無視）"));
+        assert!(notice.body.contains("番号（昇順）"));
+    }
+
+    #[test]
+    fn v4_3_notices_match_distribution_flavor() {
+        let entries = for_version("4.3.0", table());
+        assert_eq!(versions(&entries), ["4.3.0"]);
+        let entry = entries[0];
+        assert_eq!(
+            entry.must_read.len(),
+            if cfg!(feature = "portable") { 1 } else { 2 }
+        );
+        assert_eq!(
+            entry.highlights.len(),
+            if cfg!(feature = "portable") { 2 } else { 3 }
+        );
+        assert!(
+            entry
+                .must_read
+                .iter()
+                .any(|item| item.title.contains("リモート接続中"))
+        );
+        assert!(
+            entry
+                .highlights
+                .iter()
+                .any(|item| item.title.contains("音声トラック"))
+        );
+        assert!(
+            entry
+                .highlights
+                .iter()
+                .any(|item| item.title.contains("長さ"))
+        );
+
+        for items in [entry.must_read, entry.highlights] {
+            let announces_effetune = items
+                .iter()
+                .any(|item| item.title.contains("音響調整") || item.body.contains("EffeTune"));
+            assert_eq!(announces_effetune, !cfg!(feature = "portable"));
+        }
     }
 
     #[test]

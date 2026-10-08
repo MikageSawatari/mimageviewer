@@ -218,7 +218,10 @@ impl App {
     /// 「変換 > ZIP ファイルに変換」の実処理。選択 (またはカーソル) の
     /// `ConvertibleArchive` を同名 zip へ変換する。
     pub(crate) fn start_batch_convert_to_zip(&mut self) {
-        if self.batch_convert.is_some() || self.archive_convert.is_some() {
+        if self.batch_convert.is_some()
+            || self.archive_convert.is_some()
+            || self.epub_batch_convert.is_some()
+        {
             return;
         }
 
@@ -361,6 +364,8 @@ impl App {
         // 検索ビュー等から変換しても現フォルダへ強制復帰しない。閲覧履歴ビューは
         // `apply_sort_change_reload` が扱わない (合成パスへ load_folder してしまう) ので
         // 明示的に開き直す。
+        // Collection root は元アーカイブへの明示参照を維持し、生成した ZIP を自動登録しない。
+        // Collection 内の実フォルダへ入っている場合は通常フォルダと同じく再読込する。
         self.checked.clear();
         if converted > 0 {
             if self.items_are_reading_history_view {

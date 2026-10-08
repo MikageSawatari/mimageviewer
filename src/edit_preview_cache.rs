@@ -9,7 +9,7 @@
 //! [`EditPreviewCacheService`] へ command を送るだけでブロックしない。
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
 use rayon::prelude::*;
@@ -214,6 +214,10 @@ enum PreviewSourceValidation {
 pub struct EditPreviewCacheDb {
     conn: Mutex<Connection>,
     root: PathBuf,
+    /// Process-local generation of rows visible through this DB owner. Thumbnail workers echo the
+    /// sampled value so a result read before a successful whole-cache clear cannot materialize
+    /// after the clear acknowledgement.
+    epoch: AtomicU64,
 }
 
 impl EditPreviewCacheDb {
@@ -221,7 +225,7 @@ impl EditPreviewCacheDb {
         Self::open_at(&db_path())
     }
 
-    fn open_at(path: &Path) -> rusqlite::Result<Self> {
+    pub(crate) fn open_at(path: &Path) -> rusqlite::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
@@ -238,7 +242,12 @@ impl EditPreviewCacheDb {
         Ok(Self {
             conn: Mutex::new(conn),
             root,
+            epoch: AtomicU64::new(0),
         })
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
     }
 
     /// page source の mtime + size が一致する WebP を `display_px` へ縮小して返す。
@@ -622,20 +631,39 @@ impl EditPreviewCacheDb {
         }
     }
 
-    pub fn clear(&self) {
+    pub fn clear(&self) -> Result<(), String> {
         let paths = self.all_paths();
-        if let Ok(conn) = self.conn.lock() {
-            let _ = conn.execute("DELETE FROM edit_previews", []);
-        }
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "edit preview cache DB mutex is poisoned".to_string())?;
+        conn.execute("DELETE FROM edit_previews", [])
+            .map_err(|error| error.to_string())?;
+        // The DB DELETE is the cache-clear linearization point. Keep the bump under the same lock:
+        // a loader that read a row first returns the previous epoch, while one that samples the new
+        // epoch can only observe the post-clear DB contents.
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        drop(conn);
         for path in paths {
             remove_file_and_empty_parents(&self.root, Path::new(&path));
         }
-        let _ = std::fs::remove_dir_all(&self.root);
+        if let Err(error) = std::fs::remove_dir_all(&self.root)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            crate::logger::log(format!(
+                "edit_preview_cache: orphan file cleanup failed after DB clear: {error}"
+            ));
+        }
+        Ok(())
     }
 
     pub fn prune(&self, max_bytes: u64) {
         if max_bytes == 0 {
-            self.clear();
+            if let Err(error) = self.clear() {
+                crate::logger::log(format!(
+                    "edit_preview_cache: zero-budget clear failed: {error}"
+                ));
+            }
             return;
         }
         let mut rows: Vec<(String, Vec<String>, u64)> = {
@@ -1171,12 +1199,37 @@ enum EditPreviewCommand {
         max_bytes: u64,
     },
     Clear {
-        completed: Option<mpsc::SyncSender<()>>,
+        completed: Option<mpsc::SyncSender<Result<(), String>>>,
     },
 }
 
 fn publish_delete_invalidation(removed: bool, notify_if_missing: bool) -> bool {
     removed || notify_if_missing
+}
+
+fn preview_save_stamp(
+    source_mtime: i64,
+    source_size: i64,
+    container: Option<&Path>,
+    resolve_epub: impl FnOnce(&Path) -> Option<(i64, i64)>,
+) -> Option<(i64, i64, Option<i64>)> {
+    match container {
+        Some(path)
+            if path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("epub")) =>
+        {
+            let (generation_id, generation_size) = resolve_epub(path)?;
+            Some((generation_id, generation_size, Some(generation_size)))
+        }
+        other => Some((
+            source_mtime,
+            source_size,
+            other
+                .and_then(|path| std::fs::metadata(path).ok())
+                .map(|meta| meta.len() as i64),
+        )),
+    }
 }
 
 pub struct EditPreviewCacheService {
@@ -1224,10 +1277,26 @@ impl EditPreviewCacheService {
                                             "edit preview WebP encode failed".to_string()
                                         })
                                 });
-                            let source_container_size = source_container_path
-                                .as_deref()
-                                .and_then(|path| std::fs::metadata(path).ok())
-                                .map(|meta| meta.len() as i64);
+                            let epub_read = source_container_path.as_deref().and_then(|path| {
+                                path.extension()
+                                    .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+                                    .then(|| crate::pdf_loader::resolve_read_target(path).ok())
+                                    .flatten()
+                            });
+                            let Some((source_mtime, source_size, source_container_size)) =
+                                preview_save_stamp(
+                                    source_mtime,
+                                    source_size,
+                                    source_container_path.as_deref(),
+                                    |_| epub_read.as_ref()?.stamp.generation_catalog_pair(),
+                                )
+                            else {
+                                crate::logger::log(
+                                    "edit_preview_cache: EPUB generation unavailable",
+                                );
+                                worker_pending_commands.fetch_sub(1, Ordering::AcqRel);
+                                continue;
+                            };
                             match result.and_then(|(source_dims, base_webp, encoded_layers)| {
                                 worker_db.save_encoded(
                                     &item_key,
@@ -1262,10 +1331,16 @@ impl EditPreviewCacheService {
                         }
                         EditPreviewCommand::Prune { max_bytes } => worker_db.prune(max_bytes),
                         EditPreviewCommand::Clear { completed } => {
-                            worker_db.clear();
-                            let _ = event_tx.send(EditPreviewEvent::Cleared);
+                            let result = worker_db.clear();
+                            if result.is_ok() {
+                                let _ = event_tx.send(EditPreviewEvent::Cleared);
+                            } else if let Err(error) = &result {
+                                crate::logger::log(format!(
+                                    "edit_preview_cache: clear failed: {error}"
+                                ));
+                            }
                             if let Some(completed) = completed {
-                                let _ = completed.send(());
+                                let _ = completed.send(result);
                             }
                         }
                     }
@@ -1283,6 +1358,10 @@ impl EditPreviewCacheService {
 
     pub fn db(&self) -> Arc<EditPreviewCacheDb> {
         Arc::clone(&self.db)
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.db.epoch()
     }
 
     fn send_command(
@@ -1352,7 +1431,7 @@ impl EditPreviewCacheService {
 
     /// importのterminal refreshが旧previewを再利用しないよう、worker queue上で
     /// それ以前のsaveを着地させた後にclear完了を通知する。
-    pub fn clear_with_completion(&self) -> Result<mpsc::Receiver<()>, String> {
+    pub fn clear_with_completion(&self) -> Result<mpsc::Receiver<Result<(), String>>, String> {
         let (completed_tx, completed_rx) = mpsc::sync_channel(1);
         self.send_command(EditPreviewCommand::Clear {
             completed: Some(completed_tx),
@@ -1588,6 +1667,33 @@ mod tests {
     }
 
     #[test]
+    fn clear_reports_a_poisoned_db_lock_instead_of_publishing_success() {
+        let (_temp, db) = test_db();
+        let before = db.epoch();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = db.conn.lock().unwrap();
+            panic!("poison preview DB mutex");
+        }));
+
+        let error = db.clear().unwrap_err();
+        assert!(error.contains("poisoned"), "{error}");
+        assert_eq!(db.epoch(), before, "a failed DELETE must not advance epoch");
+    }
+
+    #[test]
+    fn successful_clear_advances_epoch_after_removing_rows() {
+        let (_temp, db) = test_db();
+        save_preview_with_one_layer(&db, "page-before-clear", 42);
+        let read_epoch = db.epoch();
+        assert!(db.load("page-before-clear", 10, 20, 2048).is_some());
+
+        db.clear().unwrap();
+
+        assert_eq!(db.epoch(), read_epoch.wrapping_add(1));
+        assert!(db.load("page-before-clear", 10, 20, 2048).is_none());
+    }
+
+    #[test]
     fn read_only_close_does_not_publish_missing_preview_invalidation() {
         assert!(!publish_delete_invalidation(false, false));
         assert!(publish_delete_invalidation(true, false));
@@ -1616,6 +1722,39 @@ mod tests {
             "a replaced archive must invalidate its edited representative preview"
         );
         assert_eq!(db.total_bytes(), 0);
+    }
+
+    #[test]
+    fn epub_preview_save_and_load_use_generation_in_existing_integer_columns() {
+        let (_temp, db) = test_db();
+        let webp = encode_preview(&egui::ColorImage::filled(
+            [8, 4],
+            egui::Color32::from_rgb(20, 80, 140),
+        ))
+        .unwrap();
+        let path = Path::new("book.epub");
+        let stamp = preview_save_stamp(123, 456, Some(path), |_| Some((17, 4096))).unwrap();
+        assert_eq!(stamp, (17, 4096, Some(4096)));
+        db.save_encoded(
+            "book.epub::page_0",
+            stamp.0,
+            stamp.1,
+            stamp.2,
+            (8, 4),
+            &webp,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            db.load_for_container("book.epub::page_0", 17, 4096, 2048)
+                .is_some()
+        );
+        assert!(
+            db.load_for_container("book.epub::page_0", 18, 4096, 2048)
+                .is_none()
+        );
+        let pdf = preview_save_stamp(123, 456, None, |_| panic!("PDF must not resolve EPUB"));
+        assert_eq!(pdf, Some((123, 456, None)));
     }
 
     #[test]

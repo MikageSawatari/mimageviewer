@@ -37,6 +37,7 @@ pub struct BatchExportRequest {
     pub template: String,
     pub scale: ExportScale,
     pub items: Vec<BatchExportItem>,
+    pub raw: Option<crate::raw::RawDecodeContext>,
     /// worker が終わるまで「ローカル AI を使い得る作業が走っている」ことを示す借用。
     ///
     /// 合成は消しゴム (MI-GAN) や AI 拡大を回し得るので、リモートへ操作権を渡す前の
@@ -109,6 +110,7 @@ pub fn spawn_batch_export_worker(request: BatchExportRequest) -> Result<ExportPe
         template,
         scale,
         items,
+        raw,
         local_ai_activity,
     } = request;
     let request = BatchExportPlan {
@@ -116,6 +118,7 @@ pub fn spawn_batch_export_worker(request: BatchExportRequest) -> Result<ExportPe
         template,
         scale,
         items,
+        raw,
     };
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -147,6 +150,7 @@ struct BatchExportPlan {
     template: String,
     scale: ExportScale,
     items: Vec<BatchExportItem>,
+    raw: Option<crate::raw::RawDecodeContext>,
 }
 
 fn run_batch_export(
@@ -192,7 +196,13 @@ fn run_batch_export(
                 continue;
             }
         };
-        match crate::books::write_composited_page(&item.source, &item.edits, &path, request.scale) {
+        match crate::books::write_composited_page(
+            &item.source,
+            &item.edits,
+            &path,
+            request.scale,
+            request.raw.as_ref(),
+        ) {
             Ok(_) => {
                 let _ = tx.send(ExportEvent::Completed(ExportSuccess { label, path }));
             }

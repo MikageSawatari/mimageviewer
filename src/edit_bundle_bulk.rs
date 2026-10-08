@@ -499,7 +499,7 @@ fn resolve_target_size(target: &BulkPageEditTarget) -> Result<[usize; 2], String
         } => {
             let bytes = crate::zip_loader::read_entry_bytes(zip_path, entry_name)
                 .map_err(|error| format!("ZIP内画像を読み込めませんでした: {error}"))?;
-            crate::app::probe_image_dims_from_bytes(&bytes)
+            crate::app::probe_image_dims_from_bytes(&bytes, entry_name)
                 .map(|(width, height)| [width as usize, height as usize])
         }
         GridItem::PdfPage {

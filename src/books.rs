@@ -77,11 +77,17 @@ pub enum BookOpResult {
     Renamed {
         old_name: String,
         new_name: String,
+        /// Exact filesystem roots captured by the worker before the rename. App must not rebuild
+        /// these from mutable settings when publishing the collection Tree migration.
+        source_folder: PathBuf,
+        target_folder: PathBuf,
         edit_moves: Vec<BookPathMapping>,
         bookmark_migration_journal_id: Option<String>,
     },
     Deleted {
         name: String,
+        /// Exact folder removed by this worker, independent of later settings changes.
+        path: PathBuf,
     },
     Reordered {
         folder: PathBuf,
@@ -196,6 +202,27 @@ impl Drop for PreparedBookmarkMigration {
 
 pub struct BookOpPending {
     pub rx: std::sync::mpsc::Receiver<Result<BookOpResult, String>>,
+    pub intent: BookOpIntent,
+}
+
+/// The physical operation owned by a pending book worker. A delete retains its
+/// exact requested root until the success result supplies the removed path.
+pub enum BookOpIntent {
+    Unrelated,
+    /// A manager refresh can also carry one read-only, cancelable grid-navigation request.
+    List {
+        navigation: Option<u64>,
+    },
+    SourceMutation,
+    Delete {
+        path: PathBuf,
+    },
+}
+
+impl BookOpIntent {
+    pub fn blocks_rename_migration(&self) -> bool {
+        matches!(self, Self::SourceMutation | Self::Delete { .. })
+    }
 }
 
 pub enum BookPageSource {
@@ -417,12 +444,12 @@ pub fn ai_runtime_unavailable_error() -> String {
 /// 入力をそのまま返す。**そこで失敗にしない** — 段は「ここまで焼く」であって「必ず AI を
 /// 通す」ではない。
 ///
-/// `runtime` が `None` = 用意できなかった。**その場でエラーにしない。** 実際にモデルが
-/// 選ばれるかは合成途中の画素の寸法に依るので、対象外の画像まで書き出せなくなる
-/// (v3.5.0 レビュー N03)。選ばれたときにだけ失敗にする。
+/// 実際にモデルが選ばれるかは合成途中の画素の寸法に依る。対象外なら runtime を待たず、
+/// 対象になったページだけ worker 上で process 共通 owner の Ready / Failed terminal を
+/// cancel-aware に待つ。
 pub fn book_ai_snapshot(
     materials: BookAiMaterials,
-    runtime: Option<Arc<crate::ai::runtime::AiRuntime>>,
+    runtime_init: Arc<crate::ai::runtime::AiRuntimeInitOwner>,
     params: crate::adjustment::AdjustParams,
 ) -> BookAiSnapshot {
     let run: BookAiRunner = Box::new(move |image, cancel| {
@@ -439,10 +466,16 @@ pub fn book_ai_snapshot(
                 used_upscale: false,
             });
         };
-        // ここまで来た = このページはこの寸法で本当に AI を通す。用意できていなければ
-        // 失敗にする (AI 抜きの絵は寸法から別物なので、黙って落とさない)。
-        let Some(runtime) = runtime.as_ref() else {
-            return Err(ai_runtime_unavailable_error());
+        // ここまで来た = このページはこの寸法で本当に AI を通す。worker 上で共通
+        // runtime owner の terminal を待ち、request cancel は待機中にも反映する。
+        let runtime = match runtime_init.wait_terminal_while(|| !cancel.load(Ordering::Acquire)) {
+            crate::ai::runtime::AiRuntimeInitWait::Ready(runtime) => runtime,
+            crate::ai::runtime::AiRuntimeInitWait::Failed(error) => {
+                return Err(format!("{}: {error}", ai_runtime_unavailable_error()));
+            }
+            crate::ai::runtime::AiRuntimeInitWait::Cancelled => {
+                return Err("AI 処理をキャンセルしました".to_owned());
+            }
         };
         let request = crate::ai::final_pipeline::FinalAiExecutionRequest {
             source: Arc::new(image.clone()),
@@ -453,7 +486,7 @@ pub fn book_ai_snapshot(
             background_mode: materials.policy.transparent_bg_mode,
         };
         match crate::ai::final_pipeline::execute_selected_final_ai(
-            runtime,
+            &runtime,
             &materials.manager,
             request,
             cancel,
@@ -674,9 +707,12 @@ pub fn rename_book(root: &Path, old_name: &str, new_name: &str) -> Result<BookOp
     let old_name = normalize_book_name(old_name);
     let new_name = normalize_book_name(new_name);
     if old_name == new_name {
+        let folder = book_folder(root, &old_name);
         return Ok(BookOpResult::Renamed {
             old_name,
             new_name,
+            source_folder: folder.clone(),
+            target_folder: folder,
             edit_moves: Vec::new(),
             bookmark_migration_journal_id: None,
         });
@@ -707,6 +743,8 @@ pub fn rename_book(root: &Path, old_name: &str, new_name: &str) -> Result<BookOp
     Ok(BookOpResult::Renamed {
         old_name,
         new_name,
+        source_folder: from,
+        target_folder: to,
         edit_moves,
         bookmark_migration_journal_id,
     })
@@ -718,15 +756,16 @@ pub fn delete_book(root: &Path, name: &str) -> Result<BookOpResult, String> {
     ensure_direct_book_target(root, &path)?;
     fs::remove_dir_all(&path)
         .map_err(|e| format!("本を削除できません: {}: {e}", path.display()))?;
-    Ok(BookOpResult::Deleted { name })
+    Ok(BookOpResult::Deleted { name, path })
 }
 
 pub fn append_pages(
     root: PathBuf,
     book_name: String,
     sources: Vec<BookPageSource>,
+    raw: &crate::raw::RawDecodeContext,
 ) -> Result<BookOpResult, String> {
-    append_pages_at(crate::data_dir::get(), root, book_name, sources)
+    append_pages_at_with_raw(crate::data_dir::get(), root, book_name, sources, Some(raw))
 }
 
 pub(crate) fn append_pages_at(
@@ -734,6 +773,16 @@ pub(crate) fn append_pages_at(
     root: PathBuf,
     book_name: String,
     sources: Vec<BookPageSource>,
+) -> Result<BookOpResult, String> {
+    append_pages_at_with_raw(data_dir, root, book_name, sources, None)
+}
+
+pub(crate) fn append_pages_at_with_raw(
+    data_dir: PathBuf,
+    root: PathBuf,
+    book_name: String,
+    sources: Vec<BookPageSource>,
+    raw: Option<&crate::raw::RawDecodeContext>,
 ) -> Result<BookOpResult, String> {
     if sources.is_empty() {
         return Err("追加するページがありません".to_string());
@@ -778,7 +827,7 @@ pub(crate) fn append_pages_at(
                 BookSourceCopy::Semantic(_) => semantic_copies.push(mapping),
             }
         }
-        if write_source(source, &dest)? {
+        if write_source(source, &dest, raw)? {
             erase_fallback_pages += 1;
         }
         if let Some(source_path) = byte_copy_source {
@@ -1142,7 +1191,11 @@ fn journal_transfer_staging_path(
     )))
 }
 
-fn write_source(source: BookPageSource, dest: &Path) -> Result<bool, String> {
+fn write_source(
+    source: BookPageSource,
+    dest: &Path,
+    raw: Option<&crate::raw::RawDecodeContext>,
+) -> Result<bool, String> {
     match source {
         BookPageSource::File { src, .. } => {
             copy_file_snapshot(&src, dest)?;
@@ -1165,6 +1218,7 @@ fn write_source(source: BookPageSource, dest: &Path) -> Result<bool, String> {
                 &edits,
                 dest,
                 crate::export_dialog::ExportScale::Full,
+                raw,
             )
         }
         BookPageSource::Rendered {
@@ -1239,7 +1293,21 @@ fn source_edit_copy_path<'a>(
     (!crate::folder_tree::path_eq(&source_book, dest_folder)).then_some(copy)
 }
 
-fn decode_file_color_image(path: &Path) -> Result<egui::ColorImage, String> {
+fn decode_file_color_image(
+    path: &Path,
+    raw: Option<&crate::raw::RawDecodeContext>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<egui::ColorImage, String> {
+    if crate::raw_format::is_raw_path(path) {
+        let raw = raw.ok_or("RAW decoder context unavailable")?;
+        let image = raw
+            .full(
+                crate::raw::RawOwnedSource::Path(path.to_path_buf()),
+                Some(Arc::clone(cancel)),
+            )
+            .map_err(|error| format!("RAW を現像できません: {}: {error}", path.display()))?;
+        return Ok(dynamic_image_to_color_image(&image));
+    }
     let image = image::open(path)
         .or_else(|_| {
             crate::wic_decoder::decode_to_dynamic_image(path).ok_or_else(|| {
@@ -1257,10 +1325,36 @@ fn decode_file_color_image(path: &Path) -> Result<egui::ColorImage, String> {
     Ok(dynamic_image_to_color_image(&image))
 }
 
-fn decode_bytes_color_image(hint: &str, bytes: &[u8]) -> Result<egui::ColorImage, String> {
+fn decode_bytes_color_image(
+    hint: &str,
+    bytes: &[u8],
+    raw: Option<&crate::raw::RawDecodeContext>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<egui::ColorImage, String> {
+    if Path::new(hint)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(crate::raw_format::is_raw_ext)
+    {
+        let raw = raw.ok_or("RAW decoder context unavailable")?;
+        let image = raw
+            .full(
+                crate::raw::RawOwnedSource::Bytes(bytes.to_vec().into()),
+                Some(Arc::clone(cancel)),
+            )
+            .map_err(|error| format!("ZIP RAW を現像できません: {hint}: {error}"))?;
+        return Ok(dynamic_image_to_color_image(&image));
+    }
     let image = image::load_from_memory(bytes)
         .or_else(|_| {
-            crate::wic_decoder::decode_to_dynamic_image_from_bytes(bytes).ok_or_else(|| {
+            crate::wic_decoder::decode_to_dynamic_image_from_bytes(
+                bytes,
+                Path::new(hint)
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .unwrap_or(""),
+            )
+            .ok_or_else(|| {
                 image::ImageError::IoError(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     "wic decode failed",
@@ -1276,8 +1370,11 @@ fn decode_bytes_color_image(hint: &str, bytes: &[u8]) -> Result<egui::ColorImage
     Ok(dynamic_image_to_color_image(&image))
 }
 
-fn decode_composite_source(source: &CompositeSource) -> Result<egui::ColorImage, String> {
-    decode_composite_source_for_materialization(source, 4096, Arc::new(AtomicBool::new(false)))
+fn decode_composite_source(
+    source: &CompositeSource,
+    raw: Option<&crate::raw::RawDecodeContext>,
+) -> Result<egui::ColorImage, String> {
+    decode_composite_source_for_materialization(source, 4096, Arc::new(AtomicBool::new(false)), raw)
 }
 
 /// Worker 側の外部ツール実体化用 decode。
@@ -1288,11 +1385,28 @@ pub(crate) fn decode_composite_source_for_materialization(
     source: &CompositeSource,
     pdf_long_edge: u32,
     cancel: Arc<AtomicBool>,
+    raw: Option<&crate::raw::RawDecodeContext>,
+) -> Result<egui::ColorImage, String> {
+    decode_composite_source_for_materialization_with_target(
+        source,
+        pdf_long_edge,
+        cancel,
+        raw,
+        None,
+    )
+}
+
+pub(crate) fn decode_composite_source_for_materialization_with_target(
+    source: &CompositeSource,
+    pdf_long_edge: u32,
+    cancel: Arc<AtomicBool>,
+    raw: Option<&crate::raw::RawDecodeContext>,
+    epub_read: Option<&crate::pdf_loader::ReadTarget>,
 ) -> Result<egui::ColorImage, String> {
     ensure_materialization_not_cancelled(cancel.as_ref())?;
     match source {
         CompositeSource::File { path } => {
-            let image = decode_file_color_image(path)?;
+            let image = decode_file_color_image(path, raw, &cancel)?;
             ensure_materialization_not_cancelled(cancel.as_ref())?;
             Ok(image)
         }
@@ -1303,7 +1417,7 @@ pub(crate) fn decode_composite_source_for_materialization(
             let bytes = crate::zip_loader::read_entry_bytes(zip_path, entry_name)
                 .map_err(|e| format!("ZIP 内画像を読み取れません: {entry_name}: {e}"))?;
             ensure_materialization_not_cancelled(cancel.as_ref())?;
-            let image = decode_bytes_color_image(entry_name, &bytes)?;
+            let image = decode_bytes_color_image(entry_name, &bytes, raw, &cancel)?;
             ensure_materialization_not_cancelled(cancel.as_ref())?;
             Ok(image)
         }
@@ -1312,16 +1426,30 @@ pub(crate) fn decode_composite_source_for_materialization(
             page_num,
             password,
         } => {
-            let result = crate::pdf_loader::render_page(
-                pdf_path,
-                *page_num,
-                pdf_long_edge,
-                password.as_deref(),
-                Some(Arc::clone(&cancel)),
-                crate::pdf_loader::JobPriority::Critical,
-                0,
-                crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
-            )
+            let result = if let Some(read) = epub_read {
+                crate::pdf_loader::render_page_with_read_target(
+                    pdf_path,
+                    read,
+                    *page_num,
+                    pdf_long_edge,
+                    password.as_deref(),
+                    Some(Arc::clone(&cancel)),
+                    crate::pdf_loader::JobPriority::Critical,
+                    0,
+                    crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
+                )
+            } else {
+                crate::pdf_loader::render_page(
+                    pdf_path,
+                    *page_num,
+                    pdf_long_edge,
+                    password.as_deref(),
+                    Some(Arc::clone(&cancel)),
+                    crate::pdf_loader::JobPriority::Critical,
+                    0,
+                    crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
+                )
+            }
             .map_err(|e| format!("PDF ページを描画できません: {}: {e}", pdf_path.display()))?;
             ensure_materialization_not_cancelled(cancel.as_ref())?;
             Ok(dynamic_image_to_color_image(&result.image))
@@ -1590,8 +1718,9 @@ pub fn write_composited_page(
     edits: &BakedEditSnapshot,
     dest: &Path,
     scale: crate::export_dialog::ExportScale,
+    raw: Option<&crate::raw::RawDecodeContext>,
 ) -> Result<bool, String> {
-    let image = decode_composite_source(source)?;
+    let image = decode_composite_source(source, raw)?;
     let result = compose_book_page(image, edits)?;
     let image = crate::export_dialog::scale_export_pixels(
         std::borrow::Cow::Borrowed(&result.image),
@@ -1880,7 +2009,9 @@ fn read_clipboard_rgba_image() -> Result<(u32, u32, Vec<u8>), String> {
     Err("この環境ではクリップボード画像を読み取れません".to_string())
 }
 
-fn decode_cf_dib_rgba(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
+/// Shared DIB interpretation. Capture-specific allocation limits belong at its
+/// entrance; books intentionally retains its existing accepted dimensions.
+pub(crate) fn decode_cf_dib_rgba(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
     const BI_RGB: u32 = 0;
     const BI_BITFIELDS: u32 = 3;
 
@@ -2259,6 +2390,9 @@ fn page_number_from_name(name: &str) -> Option<usize> {
 }
 
 fn is_supported_book_image_path(path: &Path) -> bool {
+    if crate::raw_format::is_raw_path(path) {
+        return true;
+    }
     let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
         return false;
     };
@@ -2335,6 +2469,54 @@ fn sanitize_filename(input: &str, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn unedited_raw_book_page_is_copied_and_counted() {
+        let source = Path::new("vendor/raw-samples/885.dng");
+        assert!(source.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("books");
+        let result = append_pages_at(
+            temp.path().join("data"),
+            root.clone(),
+            "raw".to_owned(),
+            vec![BookPageSource::File {
+                src: source.to_owned(),
+                original_name: "885.dng".to_owned(),
+            }],
+        )
+        .unwrap();
+        assert!(matches!(result, BookOpResult::Append(_)));
+        let pages = book_page_paths(&root.join("raw")).unwrap();
+        assert_eq!(pages.len(), 1);
+        assert_eq!(
+            pages[0].extension().and_then(|ext| ext.to_str()),
+            Some("dng")
+        );
+        assert_eq!(fs::read(&pages[0]).unwrap(), fs::read(source).unwrap());
+        for extension in crate::raw_format::RAW_EXTENSIONS {
+            assert!(is_supported_book_image_path(Path::new(&format!(
+                "0001_page.{extension}"
+            ))));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn edited_raw_book_decode_uses_full_libraw_dimensions() {
+        let source = Path::new("vendor/raw-samples/1018.cr2");
+        assert!(source.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let executor = Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap());
+        let context = crate::raw::RawDecodeContext::new(executor, crate::raw::RawBrightness::None);
+        let image =
+            decode_file_color_image(source, Some(&context), &Arc::new(AtomicBool::new(false)))
+                .unwrap();
+        let dims = crate::raw::raw_decoder::info(crate::raw::RawSource::Path(source))
+            .unwrap()
+            .developed_dims;
+        assert_eq!(image.size, [dims[0] as usize, dims[1] as usize]);
+    }
 
     #[test]
     fn default_books_root_is_the_capture_output_books_directory() {
@@ -2648,6 +2830,7 @@ mod tests {
             &source,
             2048,
             Arc::new(AtomicBool::new(true)),
+            None,
         )
         .unwrap_err();
 
@@ -2991,7 +3174,11 @@ mod tests {
                 transparent_bg_mode: 0,
             },
         };
-        let snapshot = book_ai_snapshot(materials, None, wants);
+        let snapshot = book_ai_snapshot(
+            materials,
+            crate::ai::runtime::AiRuntimeInitOwner::failed_for_test("AI unavailable"),
+            wants,
+        );
         let cancel = Arc::new(AtomicBool::new(false));
 
         // 上限外。AI を通さないので、runtime が無くてもそのまま返す。
@@ -3478,6 +3665,40 @@ mod tests {
 
         assert_eq!((width, height), (1, 1));
         assert_eq!(rgba, vec![0, 0, 255, 128]);
+    }
+
+    #[test]
+    fn clipboard_dib_shared_alpha_rule_and_books_dimension_range() {
+        for (alpha, expected) in [
+            ([0, 0], [255, 255]),
+            ([0, 128], [0, 128]),
+            ([255, 255], [255, 255]),
+        ] {
+            let mut dib = vec![0u8; 48];
+            dib[0..4].copy_from_slice(&40u32.to_le_bytes());
+            dib[4..8].copy_from_slice(&2i32.to_le_bytes());
+            dib[8..12].copy_from_slice(&1i32.to_le_bytes());
+            dib[12..14].copy_from_slice(&1u16.to_le_bytes());
+            dib[14..16].copy_from_slice(&32u16.to_le_bytes());
+            dib[40..48].copy_from_slice(&[3, 2, 1, alpha[0], 6, 5, 4, alpha[1]]);
+            let books = decode_cf_dib_rgba(&dib).unwrap();
+            let capture = crate::clipboard_capture::data::decode_capture_dib(&dib).unwrap();
+            assert_eq!(books, capture);
+            assert_eq!([books.2[3], books.2[7]], expected);
+        }
+
+        let mut wide = vec![0u8; 40 + 40000 * 3];
+        wide[0..4].copy_from_slice(&40u32.to_le_bytes());
+        wide[4..8].copy_from_slice(&40000i32.to_le_bytes());
+        wide[8..12].copy_from_slice(&1i32.to_le_bytes());
+        wide[12..14].copy_from_slice(&1u16.to_le_bytes());
+        wide[14..16].copy_from_slice(&24u16.to_le_bytes());
+        assert_eq!(decode_cf_dib_rgba(&wide).unwrap().0, 40000);
+        assert!(
+            crate::clipboard_capture::data::decode_capture_dib(&wide)
+                .unwrap_err()
+                .contains("大きすぎ")
+        );
     }
 
     #[test]

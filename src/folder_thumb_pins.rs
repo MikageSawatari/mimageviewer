@@ -26,11 +26,21 @@
 //! 検査を二重で行い、DB が手書きで汚染されていても解決パスがコンテナ外に
 //! 出ないようにする。
 
-use rusqlite::{Connection, Result as SqlResult, params};
+use rusqlite::{Connection, OptionalExtension, Result as SqlResult, params};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_FOLDER_PIN_DB_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
+/// UI-owned handle identity and successful writes, without reading SQLite on the UI thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FolderPinMutationStamp {
+    instance: u64,
+    revision: u64,
+}
 
 /// ピン対象のうち通常ファイル / フォルダ系の種別。
 /// (ZipImage / PdfPage は `FolderPinSource::ZipEntry` / `PdfPage` に分離している)
@@ -204,6 +214,7 @@ pub fn source_from_grid_item(
         GridItem::Audio(_)
         | GridItem::SearchContainer { .. }
         | GridItem::ZipDir { .. }
+        | GridItem::CollectionPlaceholder { .. }
         | GridItem::Stack { .. } => None,
     }
 }
@@ -285,41 +296,127 @@ impl From<rusqlite::Error> for FolderPinError {
 /// (= cascade lookups 数件程度 / フォルダロード)。
 pub struct FolderThumbPinDb {
     conn: Mutex<Connection>,
+    instance: u64,
+    mutation_revision: AtomicU64,
 }
 
 impl FolderThumbPinDb {
     /// DB を開く (なければ作成)。
     pub fn open() -> SqlResult<Self> {
-        let path = Self::db_path();
-        Self::open_at(&path)
+        Self::open_with_migration_info().map(|(db, _)| db)
+    }
+
+    /// Open the pin store and report whether its additive revision schema was installed.
+    pub fn open_with_migration_info() -> SqlResult<(Self, bool)> {
+        crate::startup_result(
+            miv_startup::Stage::AppDbMigrate,
+            "folder-thumb-pin-schema-migration",
+            || {
+                let path = Self::db_path();
+                Self::open_at_with_migration_info(&path)
+            },
+        )
     }
 
     /// 任意の data directory 配下で使うため、DB ファイルを明示して開く。
     pub fn open_at(path: &Path) -> SqlResult<Self> {
+        Self::open_at_with_migration_info(path).map(|(db, _)| db)
+    }
+
+    fn open_at_with_migration_info(path: &Path) -> SqlResult<(Self, bool)> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         let conn = Connection::open(path)?;
-        Self::init_schema(&conn)?;
-        Ok(Self {
-            conn: Mutex::new(conn),
-        })
+        conn.busy_timeout(std::time::Duration::from_secs(2))?;
+        let migration_ran = Self::init_schema(&conn)?;
+        Ok((Self::from_connection(conn), migration_ran))
     }
 
-    fn db_path() -> PathBuf {
+    pub(crate) fn db_path() -> PathBuf {
         crate::data_dir::get().join("folder_thumb_pins.db")
     }
 
-    fn init_schema(conn: &Connection) -> SqlResult<()> {
-        conn.execute_batch(
+    /// Prepare workers read an already initialized store; never create or migrate it here.
+    pub(crate) fn open_readonly(path: &Path) -> SqlResult<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_millis(750))?;
+        Ok(Self::from_connection(conn))
+    }
+
+    fn from_connection(conn: Connection) -> Self {
+        Self {
+            conn: Mutex::new(conn),
+            instance: NEXT_FOLDER_PIN_DB_INSTANCE.fetch_add(1, Ordering::Relaxed),
+            mutation_revision: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn mutation_stamp(&self) -> FolderPinMutationStamp {
+        FolderPinMutationStamp {
+            instance: self.instance,
+            revision: self.mutation_revision.load(Ordering::Acquire),
+        }
+    }
+
+    fn init_schema(conn: &Connection) -> SqlResult<bool> {
+        // Install the revision row and all triggers as one schema transaction.
+        // A concurrent writer cannot change a pin in a gap between them.
+        // Acquire the schema writer before no-op CREATEs read sqlite_master. Concurrent
+        // refresh workers must not deadlock while upgrading DEFERRED readers to writers.
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS folder_thumb_pins (
                 container_key TEXT PRIMARY KEY,
                 source_kind   TEXT NOT NULL,
                 source_rel    TEXT NOT NULL,
                 source_entry  TEXT,
                 source_page   INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS folder_thumb_pin_revision (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                instance_id TEXT NOT NULL,
+                revision INTEGER NOT NULL
+            );",
+        )?;
+        let revision_row_added = tx.execute(
+            "INSERT OR IGNORE INTO folder_thumb_pin_revision (singleton, instance_id, revision) VALUES (1, ?1, 0)",
+            [uuid::Uuid::new_v4().to_string()],
+        )?;
+        let installed_triggers: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name IN (
+                'folder_thumb_pin_revision_insert',
+                'folder_thumb_pin_revision_update',
+                'folder_thumb_pin_revision_delete'
             )",
-        )
+            [],
+            |row| row.get(0),
+        )?;
+        // Triggers own the revision, including cleanup/rename paths that mutate
+        // the table without going through set/remove. SQLite advances it in the
+        // same transaction as the changed pin row.
+        tx.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS folder_thumb_pin_revision_insert
+                 AFTER INSERT ON folder_thumb_pins BEGIN
+                 UPDATE folder_thumb_pin_revision SET revision = revision + 1 WHERE singleton = 1;
+             END;
+             CREATE TRIGGER IF NOT EXISTS folder_thumb_pin_revision_update
+                 AFTER UPDATE ON folder_thumb_pins BEGIN
+                 UPDATE folder_thumb_pin_revision SET revision = revision + 1 WHERE singleton = 1;
+             END;
+             CREATE TRIGGER IF NOT EXISTS folder_thumb_pin_revision_delete
+                 AFTER DELETE ON folder_thumb_pins BEGIN
+                 UPDATE folder_thumb_pin_revision SET revision = revision + 1 WHERE singleton = 1;
+             END;",
+        )?;
+        tx.commit()?;
+        Ok(revision_row_added != 0 || installed_triggers != 3)
     }
 
     fn container_key(container: &Path) -> String {
@@ -346,6 +443,70 @@ impl FolderThumbPinDb {
             })
             .ok()?;
         decode_row(&row.0, &row.1, row.2.as_deref(), row.3)
+    }
+
+    /// Worker-only lookup and store revision from one SQLite read snapshot.
+    /// Unlike `lookup`, errors remain visible so a representative proof fails
+    /// closed when the pin store cannot be read.
+    pub fn lookup_for_selection(
+        &self,
+        container: &Path,
+    ) -> SqlResult<(Option<FolderPinSource>, crate::catalog::CatalogRevision)> {
+        let key = Self::container_key(container);
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let tx = conn.unchecked_transaction()?;
+        let row = tx
+            .query_row(
+                "SELECT source_kind, source_rel, source_entry, source_page \
+                 FROM folder_thumb_pins WHERE container_key = ?1",
+                [&key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let revision = tx.query_row(
+            "SELECT instance_id, revision FROM folder_thumb_pin_revision WHERE singleton = 1",
+            [],
+            |row| {
+                Ok(crate::catalog::CatalogRevision {
+                    instance_id: row.get(0)?,
+                    revision: row.get(1)?,
+                })
+            },
+        )?;
+        tx.commit()?;
+        Ok((
+            row.and_then(|(kind, rel, entry, page)| {
+                decode_row(&kind, &rel, entry.as_deref(), page)
+            }),
+            revision,
+        ))
+    }
+
+    pub fn selection_revision(&self) -> SqlResult<crate::catalog::CatalogRevision> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        conn.query_row(
+            "SELECT instance_id, revision FROM folder_thumb_pin_revision WHERE singleton = 1",
+            [],
+            |row| {
+                Ok(crate::catalog::CatalogRevision {
+                    instance_id: row.get(0)?,
+                    revision: row.get(1)?,
+                })
+            },
+        )
     }
 
     /// 複数 container 分のピンをまとめて取得する。`load_folder` で子セル分を
@@ -450,6 +611,7 @@ impl FolderThumbPinDb {
                 source_page  = excluded.source_page",
             params![key, source.db_kind(), rel_norm, entry.as_deref(), page],
         )?;
+        self.mutation_revision.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
@@ -464,6 +626,7 @@ impl FolderThumbPinDb {
             "DELETE FROM folder_thumb_pins WHERE container_key = ?1",
             [&key],
         )?;
+        self.mutation_revision.fetch_add(1, Ordering::Release);
         Ok(())
     }
 }
@@ -592,7 +755,18 @@ where
         }
     };
 
-    let (mtime, file_size) = metadata(&abs_path)?;
+    // EPUB generation identity is resolved by the thumbnail worker. In
+    // particular, this function is also called while building UI requests.
+    let epub_pending = pdf_page.is_some()
+        && abs_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"));
+    let (mtime, file_size) = if epub_pending {
+        (0, 0)
+    } else {
+        metadata(&abs_path)?
+    };
     // 注: ZipEntry / PdfPage の場合、ここで取る mtime/file_size は **container 全体**
     // の値 (ZIP/PDF ファイル自身)。非ピン経路の ZipImage は entry の uncompressed size と
     // ZIP の mtime を使うのに対し、ピン経路は粒度が粗い (= container 全体が変わったとき
@@ -619,14 +793,24 @@ where
         _ => "-".to_string(),
     };
     let rel_part = source.rel();
+    // The UI cannot resolve an EPUB generation. Use a typed pending identity;
+    // the thumbnail worker appends the pinned generation stamp before lookup.
+    let (identity_mtime, identity_size) = if epub_pending {
+        (
+            "generation-pending".to_string(),
+            "generation-pending".to_string(),
+        )
+    } else {
+        (mtime.to_string(), file_size.to_string())
+    };
     let source_id = format!(
         "{kind}|{rel}|{entry}|{page}|{mtime}|{size}",
         kind = source.db_kind(),
         rel = rel_part,
         entry = entry_part,
         page = page_part,
-        mtime = mtime,
-        size = file_size,
+        mtime = identity_mtime,
+        size = identity_size,
     );
 
     Some(ResolvedPinTarget {
@@ -660,7 +844,7 @@ pub fn resolve_pin_target_cascaded_via<F>(
     max_depth: usize,
 ) -> Option<ResolvedPinTarget>
 where
-    F: Fn(&Path) -> Option<FolderPinSource>,
+    F: FnMut(&Path) -> Option<FolderPinSource>,
 {
     resolve_pin_target_cascaded_via_with_metadata(
         container,
@@ -680,12 +864,12 @@ where
 pub(crate) fn resolve_pin_target_cascaded_via_with_metadata<F, M>(
     container: &Path,
     immediate_source: &FolderPinSource,
-    lookup: F,
+    mut lookup: F,
     metadata: M,
     max_depth: usize,
 ) -> Option<ResolvedPinTarget>
 where
-    F: Fn(&Path) -> Option<FolderPinSource>,
+    F: FnMut(&Path) -> Option<FolderPinSource>,
     M: Fn(&Path) -> Option<(i64, i64)>,
 {
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1027,9 +1211,39 @@ mod tests {
     fn open_in_memory() -> FolderThumbPinDb {
         let conn = Connection::open_in_memory().expect("memory db");
         FolderThumbPinDb::init_schema(&conn).expect("schema");
-        FolderThumbPinDb {
-            conn: Mutex::new(conn),
-        }
+        FolderThumbPinDb::from_connection(conn)
+    }
+
+    #[test]
+    fn mutation_stamp_advances_only_for_successful_handle_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("pins.db");
+        let db = FolderThumbPinDb::open_at(&path).unwrap();
+        let initial = db.mutation_stamp();
+        let source = FolderPinSource::File {
+            rel: "cover.png".into(),
+            kind: FileKind::Image,
+        };
+        let folder = Path::new("C:/album");
+        let readonly = FolderThumbPinDb::open_readonly(&path).unwrap();
+        assert_eq!(db.mutation_stamp(), initial);
+        assert!(readonly.set(folder, &source).is_err());
+        assert_eq!(db.mutation_stamp(), initial);
+        let invalid = FolderPinSource::File {
+            rel: "../bad.png".into(),
+            kind: FileKind::Image,
+        };
+        assert!(db.set(folder, &invalid).is_err());
+        assert_eq!(db.mutation_stamp(), initial);
+        db.set(folder, &source).unwrap();
+        let written = db.mutation_stamp();
+        assert_ne!(written, initial);
+        assert_eq!(readonly.lookup(folder), Some(source));
+        db.remove(folder).unwrap();
+        assert_ne!(db.mutation_stamp(), written);
+        let missing = temp.path().join("missing.db");
+        assert!(FolderThumbPinDb::open_readonly(&missing).is_err());
+        assert!(!missing.exists());
     }
 
     #[test]
@@ -1544,6 +1758,32 @@ mod tests {
     }
 
     #[test]
+    fn epub_page_pin_source_id_waits_for_worker_generation() {
+        let folder = Path::new("C:/books");
+        let epub = FolderPinSource::PdfPage {
+            pdf_rel: "book.epub".into(),
+            page: 3,
+        };
+        let before = resolve_pin_target_via(folder, &epub, &|_| Some((1, 2))).unwrap();
+        let after = resolve_pin_target_via(folder, &epub, &|_| Some((7, 8))).unwrap();
+        let without_stat = resolve_pin_target_via(folder, &epub, &|_| {
+            panic!("EPUB pin must not stat on the UI thread")
+        })
+        .unwrap();
+        assert_eq!(before.source_id, after.source_id);
+        assert_eq!(before.source_id, without_stat.source_id);
+        assert_eq!((without_stat.mtime, without_stat.file_size), (0, 0));
+        assert!(before.source_id.contains("generation-pending"));
+        let pdf = FolderPinSource::PdfPage {
+            pdf_rel: "book.pdf".into(),
+            page: 3,
+        };
+        let pdf_before = resolve_pin_target_via(folder, &pdf, &|_| Some((1, 2))).unwrap();
+        let pdf_after = resolve_pin_target_via(folder, &pdf, &|_| Some((7, 8))).unwrap();
+        assert_ne!(pdf_before.source_id, pdf_after.source_id);
+    }
+
+    #[test]
     fn resolve_pin_target_missing_returns_none() {
         let tmp =
             std::env::temp_dir().join(format!("miv_pin_resolve_missing_{}", std::process::id()));
@@ -1962,5 +2202,164 @@ mod tests {
             assert_eq!(FileKind::from_db_str(k.as_db_str()), Some(k));
         }
         assert_eq!(FileKind::from_db_str("unknown"), None);
+    }
+
+    #[test]
+    fn pin_store_revision_tracks_mutations_and_recreation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pins.db");
+        let folder = tmp.path().join("folder");
+        let db = FolderThumbPinDb::open_at(&path).unwrap();
+        let initial = db.selection_revision().unwrap();
+        let source = FolderPinSource::File {
+            rel: "first.jpg".to_owned(),
+            kind: FileKind::Image,
+        };
+        db.set(&folder, &source).unwrap();
+        let (looked_up, after_insert) = db.lookup_for_selection(&folder).unwrap();
+        assert_eq!(looked_up, Some(source.clone()));
+        assert_eq!(after_insert.revision, initial.revision + 1);
+        db.set(
+            &folder,
+            &FolderPinSource::File {
+                rel: "second.jpg".to_owned(),
+                kind: FileKind::Image,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.selection_revision().unwrap().revision,
+            after_insert.revision + 1
+        );
+        db.remove(&folder).unwrap();
+        let after_delete = db.selection_revision().unwrap();
+        assert_eq!(after_delete.revision, after_insert.revision + 2);
+        assert_eq!(db.lookup_for_selection(&folder).unwrap().0, None);
+        drop(db);
+        std::fs::remove_file(&path).unwrap();
+        let recreated = FolderThumbPinDb::open_at(&path).unwrap();
+        assert_ne!(
+            recreated.selection_revision().unwrap().instance_id,
+            initial.instance_id
+        );
+    }
+
+    #[test]
+    fn concurrent_refresh_opens_preserve_pin_rows_and_store_revision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pins.db");
+        let pin = FolderPinSource::File {
+            rel: "cover.jpg".into(),
+            kind: FileKind::Image,
+        };
+        let mut original_revision = None;
+        for fresh in [true, false] {
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(9));
+            let revisions = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..8)
+                    .map(|_| {
+                        let barrier = barrier.clone();
+                        let path = &path;
+                        let pin = &pin;
+                        scope.spawn(move || {
+                            barrier.wait();
+                            let (db, migrated) =
+                                FolderThumbPinDb::open_at_with_migration_info(path)
+                                    .expect("concurrent refresh must acquire the schema writer");
+                            let revision = db.selection_revision().unwrap();
+                            if !fresh {
+                                assert_eq!(db.lookup(Path::new("C:/album")), Some(pin.clone()));
+                            }
+                            (revision, migrated)
+                        })
+                    })
+                    .collect();
+                barrier.wait();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(
+                revisions.iter().filter(|(_, migrated)| *migrated).count(),
+                usize::from(fresh)
+            );
+            let revision = revisions[0].0.clone();
+            assert!(revisions.iter().all(|(other, _)| *other == revision));
+            if fresh {
+                let db = FolderThumbPinDb::open_at(&path).unwrap();
+                db.set(Path::new("C:/album"), &pin).unwrap();
+                original_revision = Some(db.selection_revision().unwrap());
+            } else {
+                assert_eq!(Some(revision), original_revision);
+            }
+        }
+    }
+
+    #[test]
+    fn open_reports_additive_schema_install_only_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pins.db");
+        let (first, migrated) = FolderThumbPinDb::open_at_with_migration_info(&path).unwrap();
+        assert!(migrated);
+        drop(first);
+        let (second, migrated) = FolderThumbPinDb::open_at_with_migration_info(&path).unwrap();
+        assert!(!migrated);
+        drop(second);
+
+        let legacy_path = tmp.path().join("legacy.db");
+        let legacy = Connection::open(&legacy_path).unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE folder_thumb_pins (
+                    container_key TEXT PRIMARY KEY, source_kind TEXT NOT NULL,
+                    source_rel TEXT NOT NULL, source_entry TEXT, source_page INTEGER
+                );
+                INSERT INTO folder_thumb_pins VALUES ('c:/album', 'image', 'old.jpg', NULL, NULL);",
+            )
+            .unwrap();
+        drop(legacy);
+        let (migrated_db, migrated) =
+            FolderThumbPinDb::open_at_with_migration_info(&legacy_path).unwrap();
+        assert!(migrated);
+        assert!(migrated_db.lookup(Path::new("C:/album")).is_some());
+        drop(migrated_db);
+        assert!(
+            !FolderThumbPinDb::open_at_with_migration_info(&legacy_path)
+                .unwrap()
+                .1
+        );
+    }
+
+    #[test]
+    fn legacy_pin_rows_survive_revision_install_and_direct_sql_mutations_advance_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pins.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE folder_thumb_pins (
+                container_key TEXT PRIMARY KEY, source_kind TEXT NOT NULL,
+                source_rel TEXT NOT NULL, source_entry TEXT, source_page INTEGER
+            );
+            INSERT INTO folder_thumb_pins VALUES ('c:/album', 'image', 'old.jpg', NULL, NULL);",
+        )
+        .unwrap();
+        drop(conn);
+        let db = FolderThumbPinDb::open_at(&path).unwrap();
+        assert!(db.lookup(Path::new("C:/album")).is_some());
+        let initial = db.selection_revision().unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute("UPDATE folder_thumb_pins SET source_rel = 'new.jpg' WHERE container_key = 'c:/album'", []).unwrap();
+            conn.execute(
+                "DELETE FROM folder_thumb_pins WHERE container_key = 'c:/album'",
+                [],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            db.selection_revision().unwrap().revision,
+            initial.revision + 2
+        );
     }
 }

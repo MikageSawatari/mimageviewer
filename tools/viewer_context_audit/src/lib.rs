@@ -102,15 +102,21 @@ struct KnownFindingEntry {
 const ALLOWLIST_ENTRIES: &[AllowlistEntry] = &[
     AllowlistEntry {
         file: "src/app/smart_folder.rs",
-        function: "preserve_smart_folder_session_for_load",
+        function: "take_visible_smart_folder_grid",
         rule: Rule::A2b,
-        reason: "Moves the current grid surface into SmartFolderPreparedGrid, which remains nested under the same context-owned TopLevelGridView; it preserves an authorized smart-folder drill session and never transfers the viewer context to another window or owner.",
+        reason: "After the source lease and visible-adoption checks, the resident Smart Root moves its mounted main grid into the same TopLevelGridView session's Child.parked_root::Visible. Root return restores it to that same context; no viewer context or window ownership is transferred.",
     },
     AllowlistEntry {
         file: "src/app.rs",
         function: "start_loading_items_inner",
         rule: Rule::A2b,
         reason: "Consumes same-named fields from prepared loader metadata/results into the mounted projection; the mem::take receivers are metadata/prepared payloads, not App, so this installs a completed load rather than extracting or transferring an existing viewer context.",
+    },
+    AllowlistEntry {
+        file: "src/app.rs",
+        function: "resume_loading_items_after_sidecar",
+        rule: Rule::A2b,
+        reason: "Installs seven fields from the prepared payload owned by SidecarLoadContinuation into the current mounted projection. The async terminal takes this Live continuation only while target context, items generation, and source folder still match; a retired, replaced, or navigated-away target cancels and discards it, so these mem::take calls cannot transfer an existing viewer context or publish into a sibling.",
     },
     AllowlistEntry {
         file: "src/app.rs",
@@ -126,7 +132,9 @@ const ALLOWLIST_ENTRIES: &[AllowlistEntry] = &[
     },
 ];
 
-// A4 excludes cfg(test)-gated API and freezes only the production registry surface below.
+// A4 excludes cfg(test)-gated API and freezes the registry surface available to ordinary or
+// feature-selected builds below. That includes exact test-script feature hooks: they are absent
+// from distribution builds, but still cross the ContextRef ownership boundary when enabled.
 // The ownership design named a viewer_context_registry::test_access namespace that was never
 // implemented. A6 is therefore deliberately defined against the implementation that exists:
 // cfg(test)-gated App methods/functions ending in _for_test, plus their call sites.
@@ -159,6 +167,8 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn video_audio_vst (self) -> Option < & 'a VideoAudioVstState >",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn vst3_deferred_media_open (self) -> Option < usize >",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn fs_lanczos_cache (self) -> & 'a crate :: gpu_lanczos :: GpuLanczosCache",
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn similar_panel (self) -> & 'a crate :: ui_metadata_panel :: SimilarPanelState",
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > :: # [cfg (feature = \"test-script\")] pub (in crate :: app) fn video_seek_strip_test_script_snapshot (self ,) -> crate :: test_script :: TestScriptSeekStripSnapshot",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn selected (self) -> Option < usize >",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn bookmark_view_state (self) -> Option < & 'a BookmarkViewState >",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn archive_source_override (self) -> Option < & 'a Path >",
@@ -176,20 +186,39 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     "inherent fn    App :: # [cfg (windows)] pub (in crate :: app) fn split_current_context_preserving_main_grid (& mut self ,) -> Box < ViewerContextBundle >",
     "inherent fn    App :: # [cfg (windows)] pub (in crate :: app) fn split_materialized_physical_context_for_detached_scope (& mut self , physical_context : & Path , idx : usize , items_generation : u64 ,) -> Box < ViewerContextBundle >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn viewer_context_main (& self) -> ViewerContextId",
+    "inherent fn # [cfg (not (windows))]   App ::  pub (in crate :: app) fn viewer_context_main (& self) -> ViewerContextId",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn mounted_viewer_context_id (& self) -> Option < ViewerContextId >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn projected_viewer_context_id (& self) -> ViewerContextId",
+    "inherent fn # [cfg (not (windows))]   App ::  pub (in crate :: app) fn projected_viewer_context_id (& self) -> ViewerContextId",
     "inherent fn # [cfg (windows)]   App ::  pub (crate) fn detached_viewer_window_id (& self) -> Option < u64 >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn viewer_context_residence (& self , id : ViewerContextId) -> ContextResidence",
+    "inherent fn # [cfg (not (windows))]   App ::  pub (in crate :: app) fn viewer_context_residence (& self , id : ViewerContextId) -> ContextResidence",
     "inherent fn # [cfg (windows)]   App ::  pub (crate) fn locate_window_context (& self , window_id : u64 ,) -> Option < (ViewerContextId , ContextResidence) >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn viewer_context_window_binding_probe (& self , window_id : u64 ,) -> Option < (ViewerContextId , ContextResidence) >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn viewer_context_window (& self , id : ViewerContextId) -> Option < u64 >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn viewer_context_ids (& self) -> Vec < ViewerContextId >",
+    "inherent fn # [cfg (not (windows))]   App ::  pub (in crate :: app) fn viewer_context_ids (& self) -> Vec < ViewerContextId >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn other_viewer_context_ids (& self) -> Vec < ViewerContextId >",
+    "item enum # [cfg (windows)] pub (in crate :: app) enum ContextAsyncOwner { PathClassification , HistoryTransition , CollectionGrid , CollectionNavigation , RatingNavigation , BookmarkOpen , FolderNavigation , FolderPaneScan , PdfEnumeration , ZipEnumeration , EpubConversion , PdfPassword , FullscreenDecode , FinalAi , LocalAdjustment , ComicBake , EraseInpaint , SimilarPreview , }",
+    "item enum # [cfg (windows)] pub (in crate :: app) enum ContextAsyncServicePhase { Background , Dialog , }",
+    "inherent const # [cfg (windows)]   ContextAsyncOwner :: pub (in crate :: app) const ALL : [Self ; 18] = [Self :: EpubConversion , Self :: PdfPassword , Self :: PathClassification , Self :: HistoryTransition , Self :: CollectionGrid , Self :: CollectionNavigation , Self :: RatingNavigation , Self :: BookmarkOpen , Self :: FolderNavigation , Self :: FolderPaneScan , Self :: PdfEnumeration , Self :: ZipEnumeration , Self :: FullscreenDecode , Self :: FinalAi , Self :: LocalAdjustment , Self :: ComicBake , Self :: EraseInpaint , Self :: SimilarPreview ,] ;",
+    "inherent fn # [cfg (windows)]   ContextAsyncOwner ::  pub (in crate :: app) fn is_pending (self , context : ContextRef < '_ >) -> bool",
+    "inherent fn # [cfg (windows)]   ContextAsyncOwner ::  pub (in crate :: app) fn needs_mounted_service (self , context : ContextRef < '_ >) -> bool",
+    "inherent fn # [cfg (windows)]   ContextAsyncOwner ::  pub (in crate :: app) fn service (self , app : & mut App , ctx : & egui :: Context , phase : ContextAsyncServicePhase ,)",
+    "inherent fn # [cfg (windows)]   ContextAsyncOwner ::  pub (in crate :: app) fn terminate_on_park (self , app : & mut App)",
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn epub_convert (self ,) -> Option < & 'a crate :: ui_dialogs :: epub_convert :: EpubConvertState >",
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn pending_context_async_owners (self) -> Vec < ContextAsyncOwner >",
+    "inherent fn # [cfg (windows)]   App ::  pub (crate) fn invalidate_removed_epub_generations (& mut self , removed : & [crate :: epub_cache :: GenerationRow] ,)",
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn document_modal_owners_in_any_context (& self) -> (bool , bool)",
+    "inherent fn # [cfg (windows)]   App ::  pub (crate) fn invalidate_final_cover_spread_display_in_parked_contexts (& mut self)",
+    "inherent fn # [cfg (windows)]   App ::  pub (crate) fn invalidate_singleton_spread_placement_in_parked_contexts (& mut self , first_changed : bool , last_changed : bool ,)",
+    "inherent fn # [cfg (windows)]   App ::  pub (crate) fn invalidate_page_alone_in_parked_contexts (& mut self , after_cover_changed : bool , last_changed : bool ,)",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn with_viewer_context_ref < R > (& self , id : ViewerContextId , f : impl FnOnce (ContextRef < '_ >) -> R ,) -> Option < R >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn bind_window (& mut self , id : ViewerContextId , window_id : u64 ,) -> Result < () , BindError >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn unbind_window (& mut self , window_id : u64) -> Option < ViewerContextId >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn reserve_window_binding_for_build (& mut self , window_id : u64)",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn with_viewer_context < R > (& mut self , id : ViewerContextId , f : impl FnOnce (& mut Self) -> R ,) -> Result < R , MountError >",
+    "inherent fn # [cfg (not (windows))]   App ::  pub (in crate :: app) fn with_viewer_context < R > (& mut self , id : ViewerContextId , f : impl FnOnce (& mut Self) -> R ,) -> Result < R , MountError >",
     "inherent fn # [cfg (windows)]   App ::  pub (crate) fn with_window_viewer_context < R > (& mut self , window_id : u64 , f : impl FnOnce (& mut Self) -> R ,) -> Result < R , MountError >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn build_viewer_context (& mut self , reason : & 'static str , f : impl FnOnce (& mut Self , ViewerContextId) -> BuildOutcome ,) -> Option < ViewerContextId >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn fork_mounted_live_media_context (& mut self , window_id : u64 ,) -> ViewerContextId",
@@ -1143,9 +1172,10 @@ fn analyze_test_api(
 ) -> Result<Vec<Violation>, String> {
     let file =
         syn::parse_file(source).map_err(|error| format!("cannot parse {path} for A6: {error}"))?;
+    let file_is_test = test_module_file || file.attrs.iter().any(cfg_implies_test_attribute);
     let mut visitor = TestApiVisitor {
         path,
-        cfg_test_depth: usize::from(test_module_file),
+        cfg_test_depth: usize::from(file_is_test),
         functions: Vec::new(),
         violations: Vec::new(),
     };
@@ -1286,6 +1316,13 @@ impl<'ast> Visit<'ast> for TestApiVisitor<'_> {
         let is_test = node.attrs.iter().any(cfg_implies_test_attribute);
         self.cfg_test_depth += usize::from(is_test);
         visit::visit_expr_block(self, node);
+        self.cfg_test_depth -= usize::from(is_test);
+    }
+
+    fn visit_local(&mut self, node: &'ast syn::Local) {
+        let is_test = node.attrs.iter().any(cfg_implies_test_attribute);
+        self.cfg_test_depth += usize::from(is_test);
+        visit::visit_local(self, node);
         self.cfg_test_depth -= usize::from(is_test);
     }
 }
@@ -2033,6 +2070,30 @@ mod tests {
     }
 
     #[test]
+    fn a4_freezes_feature_gated_context_snapshot_visibility() {
+        let allowed = r#"
+            #[cfg(windows)]
+            pub(in crate::app) struct ContextRef<'a> { value: &'a () }
+            #[cfg(windows)]
+            impl<'a> ContextRef<'a> {
+                #[cfg(feature = "test-script")]
+                pub(in crate::app) fn snapshot(self) -> usize { 0 }
+            }
+        "#;
+        let allowlist = api_allowlist(allowed);
+        let refs = allowlist.iter().map(String::as_str).collect::<Vec<_>>();
+        assert!(audit_public_api(allowed, &refs).unwrap().is_empty());
+
+        for changed in [
+            allowed.replace("#[cfg(feature = \"test-script\")]", ""),
+            allowed.replace("pub(in crate::app) fn snapshot", "pub(crate) fn snapshot"),
+        ] {
+            let violations = audit_public_api(&changed, &refs).unwrap();
+            assert!(has_rule(&violations, Rule::A4), "{violations:#?}");
+        }
+    }
+
+    #[test]
     fn a6_rejects_unguarded_test_definitions_and_calls() {
         let source = r#"
             impl App {
@@ -2068,6 +2129,37 @@ mod tests {
         "#;
         let violations = analyze_test_api("src/fixture.rs", source, false).unwrap();
         assert!(!has_rule(&violations, Rule::A6), "{violations:#?}");
+    }
+
+    #[test]
+    fn a6_honors_cfg_test_on_a_local_binding_without_masking_the_next_call() {
+        let source = r#"
+            fn production(app: &mut App) {
+                #[cfg(test)]
+                let injected = app.helper_for_test();
+                let unexpected = app.helper_for_test();
+            }
+        "#;
+        let violations = analyze_test_api("src/fixture.rs", source, false).unwrap();
+        assert_eq!(violations.len(), 1, "{violations:#?}");
+        assert_eq!(violations[0].rule, Rule::A6);
+    }
+
+    #[test]
+    fn a6_honors_test_cfg_on_the_parsed_file_itself() {
+        let body = r#"
+            fn exercises_test_api(app: &mut App) {
+                app.helper_for_test();
+            }
+        "#;
+        for cfg in ["#![cfg(test)]", "#![cfg(all(test, windows))]"] {
+            let source = format!("{cfg}\n{body}");
+            let violations = analyze_test_api("src/fixture.rs", &source, false).unwrap();
+            assert!(!has_rule(&violations, Rule::A6), "{cfg}: {violations:#?}");
+        }
+
+        let violations = analyze_test_api("src/fixture.rs", body, false).unwrap();
+        assert!(has_rule(&violations, Rule::A6), "{violations:#?}");
     }
 
     #[test]

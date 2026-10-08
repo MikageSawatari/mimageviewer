@@ -20,8 +20,8 @@ use crate::ring_shortcut::{
     MouseButtonSlot, MouseFlickOutcome, MouseFlickState, MouseGestureDirection, MouseGestureState,
     PickerListMode, PickerListState, RightDragCommand, RightDragContext, RightDragMode,
     RightDragOwner, RightDragRecognition, RingActionId, RingDirection, RingPickerAnchor,
-    RingPickerOriginalState, RingPickerRatingTarget, RingPickerRowId, RingPickerState,
-    RingShortcutContext, format_mouse_gesture_pattern, mouse_flick_guide_delay,
+    RingPickerGridSortTarget, RingPickerOriginalState, RingPickerRatingTarget, RingPickerRowId,
+    RingPickerState, RingShortcutContext, format_mouse_gesture_pattern, mouse_flick_guide_delay,
     mouse_flick_menu_delay, mouse_gesture_direction_from_delta,
 };
 use crate::settings::{
@@ -99,7 +99,9 @@ const SHOULDER_REPEAT_INTERVAL: Duration = Duration::from_millis(260);
 const STICK_STEP_INTERVAL: Duration = Duration::from_millis(110);
 const TRIGGER_STEP_INTERVAL: Duration = Duration::from_millis(150);
 
-fn video_seek_ring_action(action: &RingActionId) -> Option<(crate::settings::VideoSeekStep, bool)> {
+pub(super) fn video_seek_ring_action(
+    action: &RingActionId,
+) -> Option<(crate::settings::VideoSeekStep, bool)> {
     use crate::settings::VideoSeekStep;
     match action {
         RingActionId::VideoSeekBackSmall => Some((VideoSeekStep::Small, false)),
@@ -120,6 +122,64 @@ const X_PICKER_HINT_TOAST_SECS: f32 = 4.0;
 const GAMEPAD_LIST_VISIBLE_ROWS: usize = 12;
 const RING_STICK_COMMIT_THRESHOLD: f32 = 0.50;
 const RING_STICK_HYSTERESIS_DEGREES: f32 = 8.0;
+
+// Grid ring, gesture, and mouse-button commands share the same item-input gate.
+// Keep commands that leave the view or control the window available during a
+// stale aggregate refresh. An unrecognized/new action is item-owned by default.
+fn grid_ring_action_allowed_during_refresh(action: &RingActionId) -> bool {
+    action.favorite_slot_number().is_some()
+        || action.drive_letter().is_some()
+        || action.location_rating_stars().is_some()
+        || matches!(
+            action,
+            RingActionId::None
+                | RingActionId::ToggleDetachedViewer
+                | RingActionId::ToggleWindowMode
+                | RingActionId::ToggleMaximize
+                | RingActionId::MinimizeWindow
+                | RingActionId::CloseMainWindow
+                | RingActionId::QuitApplication
+                | RingActionId::OpenPreferences
+                | RingActionId::OpenOperationCustomize
+                | RingActionId::ClearRecentFolders
+                | RingActionId::ClearQuickFolderSlots
+                | RingActionId::CycleFavorite
+                | RingActionId::OpenLocationDriveList
+                | RingActionId::OpenLocationReadingHistory
+                | RingActionId::OpenLocationBooksRoot
+                | RingActionId::OpenLocationDesktop
+                | RingActionId::OpenLocationPictures
+                | RingActionId::OpenLocationDownloads
+                | RingActionId::GridToggleDetails
+                | RingActionId::GridColumnCount1
+                | RingActionId::GridColumnCount2
+                | RingActionId::GridColumnCount3
+                | RingActionId::GridColumnCount4
+                | RingActionId::GridColumnCount5
+                | RingActionId::GridColumnCount6
+                | RingActionId::GridColumnCount7
+                | RingActionId::GridColumnCount8
+                | RingActionId::GridColumnCount9
+                | RingActionId::GridColumnCount10
+                | RingActionId::GridColumnCount11
+                | RingActionId::GridColumnCount12
+                | RingActionId::GridColumnCount13
+                | RingActionId::GridColumnCount14
+                | RingActionId::GridColumnCount15
+                | RingActionId::GridColumnCount16
+                | RingActionId::GridColumnCount17
+                | RingActionId::GridColumnCount18
+                | RingActionId::GridColumnCount19
+                | RingActionId::GridColumnCount20
+                | RingActionId::GridHistoryBack
+                | RingActionId::GridHistoryForward
+                | RingActionId::GridParentFolder
+                | RingActionId::TreeFolderPrev
+                | RingActionId::TreeFolderNext
+                | RingActionId::SiblingFolderPrev
+                | RingActionId::SiblingFolderNext
+        )
+}
 
 #[derive(Clone, Copy)]
 enum GridSelectionEdge {
@@ -323,7 +383,9 @@ fn mouse_button_action_blocked_by_edit_mode(edit_mode_active: bool, action: &Rin
     edit_mode_active
         && matches!(
             action,
-            RingActionId::CloseMainWindow | RingActionId::QuitApplication
+            RingActionId::CloseMainWindow
+                | RingActionId::QuitApplication
+                | RingActionId::ImageFitModeCycle
         )
 }
 
@@ -566,6 +628,12 @@ fn draw_mouse_gesture_guide_row(
         egui::FontId::proportional(14.5),
         egui::Color32::WHITE,
     );
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct MouseButtonDispatchResult {
+    pub(crate) navigation: Option<AddressBarNav>,
+    pub(crate) dispatched_action: Option<RingActionId>,
 }
 
 impl App {
@@ -2262,7 +2330,12 @@ impl App {
     fn picker_value_text(&self, picker: &RingPickerState, row: RingPickerRowId) -> String {
         match row {
             RingPickerRowId::GridColumns => format!("{} 列", picker.grid_cols),
-            RingPickerRowId::GridSortOrder => picker.sort_order.label().to_string(),
+            RingPickerRowId::GridSortOrder => match picker.grid_sort_target {
+                RingPickerGridSortTarget::Locked(reason) => reason.short_label().to_string(),
+                RingPickerGridSortTarget::Global | RingPickerGridSortTarget::Collection(_) => {
+                    picker.sort_order.label().to_string()
+                }
+            },
             RingPickerRowId::GridThumbAspect => {
                 if picker.thumb_aspect_auto {
                     if let Some(current) = self.auto_aspect.current {
@@ -2396,6 +2469,21 @@ impl App {
             saw_input_event,
             session_ended,
         } = batch;
+        // Sidecar restore is an App-global semantic-input barrier. End the physical session and
+        // resolve any live picker without replaying its current row: a picker preview may already
+        // have published a rating write, but calling the ordinary commit path here would submit
+        // that value again (and would apply commit-only rows after the modal began).
+        if self.sidecar_restore_active() {
+            self.finish_gamepad_input_for_sidecar_restore(ctx);
+            self.reset_gamepad_continuous_steps(now);
+            self.gamepad_state.suppress_pending_actions();
+            return GamepadDispatchOutcome {
+                nav: None,
+                dispatched: false,
+                dispatch_allowed: false,
+                saw_input_event,
+            };
+        }
         // **リングの確定は所有 context で。** ここは通常の配送と同じ場所で、別ウィンドウが
         // 活性なら mount 済み。評価行はプレビューの時点で DB へ書いており、開いたときの
         // before から Undo を組むのは確定処理だけなので、捨てると書いた評価が取り消せなく
@@ -2437,6 +2525,31 @@ impl App {
         }
     }
 
+    /// End App-owned gamepad semantics at the sidecar-restore modal boundary.
+    ///
+    /// Rating rows are live previews: successful writes before the modal are authoritative and
+    /// need an Undo record, but must not be written again. Other picker rows are either already
+    /// previewed or commit-only; dropping the picker keeps the former and does not synthesize the
+    /// latter. All physical holds and overlays become terminal, so nothing can replay on resume.
+    pub(crate) fn finish_gamepad_input_for_sidecar_restore(&mut self, ctx: &egui::Context) {
+        let picker = self.ring_picker.take();
+        if let Some(picker) = picker {
+            let (item_changes, container_record) =
+                self.published_live_picker_rating_changes(&picker);
+            self.commit_live_picker_undo(item_changes, container_record);
+            let owner = picker.owner;
+            let context = picker.context;
+            let _ = self.with_owner_viewer_context(owner, |app| {
+                if context == RingShortcutContext::VideoFullscreen {
+                    app.clear_native_video_picker_overlay(ctx);
+                }
+            });
+        }
+        self.release_gamepad_input_holds(ctx);
+        self.gamepad_state.clear();
+        self.gamepad_state.require_directional_neutral();
+    }
+
     /// frame 全体の後始末。activity gate と repaint は App-global なので、配り先に
     /// かかわらずここで 1 回だけ行う。
     pub(crate) fn finish_gamepad_frame(
@@ -2453,7 +2566,7 @@ impl App {
     }
 
     fn gamepad_dispatch_allowed(&self, ctx: &egui::Context) -> bool {
-        if self.remote_session_blocks_local_control() {
+        if self.sidecar_restore_active() || self.remote_session_blocks_local_control() {
             return false;
         }
         // gilrs はグローバル入力 (ウィンドウフォーカス非依存) なので、mIV が前面に
@@ -2701,6 +2814,10 @@ impl App {
     }
 
     fn dispatch_gamepad_grid_analog(&mut self, now: Instant) -> bool {
+        if !self.grid_item_input_allowed() {
+            self.reset_gamepad_continuous_steps(now);
+            return false;
+        }
         let mut changed = false;
         let stick = stick_pair(&self.gamepad_state, PadAxis::LeftX, PadAxis::LeftY);
         let stick_dir = dominant_stick_dir(stick);
@@ -2911,6 +3028,9 @@ impl App {
 
     fn open_gamepad_ring_picker(&mut self, ctx: &egui::Context) {
         let context = self.current_ring_shortcut_context();
+        if context == RingShortcutContext::Grid && !self.grid_item_input_allowed() {
+            return;
+        }
         let mut picker = self.build_ring_picker_state(context);
         picker.clamp_row(picker_rows_for_context(context).len());
         self.gamepad_favorite_picker = None;
@@ -2940,7 +3060,37 @@ impl App {
             crate::settings::MIN_GRID_COLS,
             crate::settings::MAX_GRID_COLS,
         );
-        let sort_order = self.settings.sort_order;
+        let grid_sort_target = if context == RingShortcutContext::Grid {
+            match self.collection_grid_root_order() {
+                Some(Ok(target)) => self
+                    .grid_sort_lock_reason()
+                    .map(RingPickerGridSortTarget::Locked)
+                    .unwrap_or(RingPickerGridSortTarget::Collection(target)),
+                Some(Err(reason)) => RingPickerGridSortTarget::Locked(reason),
+                None => self
+                    .grid_sort_lock_reason()
+                    .map(RingPickerGridSortTarget::Locked)
+                    .unwrap_or(RingPickerGridSortTarget::Global),
+            }
+        } else {
+            RingPickerGridSortTarget::Global
+        };
+        let sort_order = match grid_sort_target {
+            RingPickerGridSortTarget::Collection(target) => target.standard_sort,
+            RingPickerGridSortTarget::Global if self.items_are_bookmark_view => {
+                match self.bookmark_view_sort {
+                    crate::bookmark_browser::BookmarkViewSort::Normal(sort)
+                        if !sort.is_rating() =>
+                    {
+                        sort
+                    }
+                    _ => crate::settings::SortOrder::FileName,
+                }
+            }
+            RingPickerGridSortTarget::Global | RingPickerGridSortTarget::Locked(_) => {
+                self.settings.sort_order
+            }
+        };
         let thumb_aspect_auto = self.settings.thumb_aspect_auto;
         let thumb_aspect = self.settings.thumb_aspect;
         let spread_mode = self.spread_mode;
@@ -3007,6 +3157,7 @@ impl App {
             // 開いたまま前面の窓が変わったときに別ウィンドウのページへ書く (レビュー S01)。
             owner: self.edit_request_owner_context(),
             anchor: self.current_ring_picker_anchor(context),
+            grid_sort_target,
             original,
             row: 0,
             dirty_rows: Vec::new(),
@@ -3423,14 +3574,17 @@ impl App {
                 Some(&format!("path={}", target.display())),
             );
             ctx.request_repaint();
-            return Some(AddressBarNav::Direct(target));
+            return Some(AddressBarNav::Direct(
+                target,
+                crate::app::StartupListIntent::ExplicitList,
+            ));
         }
         if let Some(definition_id) = smart_folder_target {
             self.bump_input_seq(
                 "gamepad_smart_folder_nav",
                 Some(&format!("definition_id={definition_id}")),
             );
-            self.open_smart_folder(definition_id, false);
+            self.open_smart_folder_staged(definition_id, false);
             ctx.request_repaint();
         }
         None
@@ -3536,7 +3690,7 @@ impl App {
                     self.show_feedback_toast(format!("場所が見つかりません: {}", path.display()));
                     return None;
                 };
-                AddressBarNav::Direct(resolved)
+                AddressBarNav::Direct(resolved, crate::app::StartupListIntent::ExplicitList)
             }
         };
         self.bump_input_seq("gamepad_location_nav", Some(&format!("{nav:?}")));
@@ -3644,7 +3798,19 @@ impl App {
                 mark_picker_dirty(picker, row);
             }
             RingPickerRowId::GridSortOrder => {
-                picker.sort_order = cycle_value(SortOrder::all(), picker.sort_order, delta);
+                if matches!(picker.grid_sort_target, RingPickerGridSortTarget::Locked(_)) {
+                    return;
+                }
+                let options = if matches!(
+                    picker.grid_sort_target,
+                    RingPickerGridSortTarget::Collection(_)
+                ) || self.items_are_bookmark_view
+                {
+                    SortOrder::collection_options()
+                } else {
+                    SortOrder::all()
+                };
+                picker.sort_order = cycle_value(options, picker.sort_order, delta);
                 mark_picker_dirty(picker, row);
             }
             RingPickerRowId::GridThumbAspect => {
@@ -3759,6 +3925,9 @@ impl App {
     }
 
     fn preview_grid_picker_row(&mut self, picker: &RingPickerState, row: RingPickerRowId) {
+        if !self.grid_item_input_allowed() {
+            return;
+        }
         match row {
             RingPickerRowId::GridColumns if self.settings.grid_cols != picker.grid_cols => {
                 self.set_grid_view_mode(GridViewMode::Thumbnail);
@@ -3766,7 +3935,10 @@ impl App {
                 self.scroll_to_selected = true;
                 self.settings.save();
             }
-            RingPickerRowId::GridSortOrder if self.settings.sort_order != picker.sort_order => {
+            RingPickerRowId::GridSortOrder
+                if matches!(picker.grid_sort_target, RingPickerGridSortTarget::Global)
+                    && self.settings.sort_order != picker.sort_order =>
+            {
                 self.apply_grid_picker_sort_order(picker.sort_order);
             }
             RingPickerRowId::GridThumbAspect
@@ -3900,6 +4072,7 @@ impl App {
         picker: &RingPickerState,
         stars: u8,
     ) -> (Vec<usize>, Option<String>) {
+        self.sync_current_context_rating_session_writes();
         let target_keys = picker
             .original
             .item_rating_records
@@ -3924,7 +4097,7 @@ impl App {
                 });
                 continue;
             };
-            match self.set_rating_result(idx, stars) {
+            match self.set_rating_result_deferred(idx, stars) {
                 Ok(true) => touched.push(idx),
                 Ok(false) => {
                     first_error.get_or_insert_with(|| {
@@ -3939,6 +4112,9 @@ impl App {
                 }
             }
         }
+        if !touched.is_empty() {
+            self.publish_current_context_rating_writes();
+        }
         (touched, first_error)
     }
 
@@ -3946,17 +4122,9 @@ impl App {
         if picker.original.item_rating_records.is_empty() {
             return;
         }
-        let (touched, error) = self.apply_picker_item_rating_targets(picker, stars);
+        let (_, error) = self.apply_picker_item_rating_targets(picker, stars);
         if let Some(error) = error {
             self.report_rating_write_error(&error);
-        }
-        if self.global_search.active {
-            self.refresh_global_search_hit_stars(&touched);
-        }
-        if self.global_search.active && self.items_are_global_search_view {
-            self.rebuild_items_from_global_search();
-        } else {
-            self.rebuild_visible_indices();
         }
     }
 
@@ -4623,52 +4791,14 @@ impl App {
         Vec<RatingChange>,
         Option<(crate::ring_shortcut::RingPickerContainerTarget, u8, u8)>,
     ) {
-        let mut item_changes = Vec::new();
-        if picker.dirty_rows.contains(&RingPickerRowId::ItemRating) {
-            let (touched, error) =
-                self.apply_picker_item_rating_targets(picker, picker.item_rating);
+        let item_rating_dirty = picker.dirty_rows.contains(&RingPickerRowId::ItemRating);
+        if item_rating_dirty {
+            let (_, error) = self.apply_picker_item_rating_targets(picker, picker.item_rating);
             if let Some(error) = error {
                 self.report_rating_write_error(&error);
             }
-
-            for target in &picker.original.item_rating_records {
-                let actual = self
-                    .rating_session_writes
-                    .get(&target.path_key)
-                    .filter(|write| write.generation > target.session_generation)
-                    .map(|write| write.stars)
-                    .unwrap_or(target.before);
-                if target.before != actual {
-                    item_changes.push(RatingChange {
-                        path_key: target.path_key.clone(),
-                        source_path: target.source_path.clone(),
-                        meta: target.meta.clone(),
-                        xmp_target: target.xmp_target.clone(),
-                        before: target.before,
-                        after: actual,
-                    });
-                }
-            }
-            if self.global_search.active {
-                self.refresh_global_search_hit_stars(&touched);
-            }
-            if self.items_are_rating_view {
-                let changes = item_changes
-                    .iter()
-                    .map(|change| (change.path_key.clone(), change.after))
-                    .collect::<Vec<_>>();
-                self.refresh_rating_view_after_rating_changes(&changes);
-            } else if self.global_search.active && self.items_are_global_search_view {
-                self.rebuild_items_from_global_search();
-            } else {
-                self.rebuild_visible_indices();
-            }
-            if item_changes.len() > 1 {
-                self.checked.clear();
-            }
         }
 
-        let mut container_record = None;
         if picker
             .dirty_rows
             .contains(&RingPickerRowId::ContainerRating)
@@ -4676,20 +4806,73 @@ impl App {
             if let Err(error) = self.preview_ring_container_rating(picker) {
                 self.report_rating_write_error(&error);
             }
-            // **DB を正とする。** 表示キャッシュは「いまその container を見ている投影」しか
-            // 持たないので、リングを開いた窓が前面でなくなっていると読めない (レビュー Q01)。
-            let actual = picker
+        }
+        let (item_changes, container_record) = self.published_live_picker_rating_changes(picker);
+        if item_rating_dirty {
+            if item_changes.len() > 1 {
+                self.checked.clear();
+            }
+        }
+        (item_changes, container_record)
+    }
+
+    /// Describe only rating writes already published by live picker previews.
+    ///
+    /// The App-global publication ledger advances strictly after SQLite success. Reading it is
+    /// sufficient both when ordinary commit has just re-applied the final value and when a modal
+    /// preempts the picker and must avoid every new DB/sidecar/XMP submission.
+    fn published_live_picker_rating_changes(
+        &self,
+        picker: &RingPickerState,
+    ) -> (
+        Vec<RatingChange>,
+        Option<(crate::ring_shortcut::RingPickerContainerTarget, u8, u8)>,
+    ) {
+        let item_changes = if picker.dirty_rows.contains(&RingPickerRowId::ItemRating) {
+            picker
+                .original
+                .item_rating_records
+                .iter()
+                .filter_map(|target| {
+                    let actual = self
+                        .rating_session_writes
+                        .get(&target.path_key)
+                        .filter(|write| write.generation > target.session_generation)
+                        .map(|write| write.stars)
+                        .unwrap_or(target.before);
+                    (target.before != actual).then(|| RatingChange {
+                        path_key: target.path_key.clone(),
+                        source_path: target.source_path.clone(),
+                        meta: target.meta.clone(),
+                        xmp_target: target.xmp_target.clone(),
+                        before: target.before,
+                        after: actual,
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let container_record = if picker
+            .dirty_rows
+            .contains(&RingPickerRowId::ContainerRating)
+        {
+            picker
                 .original
                 .container_rating_target
                 .as_ref()
-                .and_then(|target| self.rating_db.as_ref().map(|db| db.get(&target.path_key)))
-                .unwrap_or(picker.original.container_rating);
-            if picker.original.container_rating != actual
-                && let Some(target) = picker.original.container_rating_target.clone()
-            {
-                container_record = Some((target, picker.original.container_rating, actual));
-            }
-        }
+                .and_then(|target| {
+                    let actual = self
+                        .rating_session_writes
+                        .get(&target.path_key)
+                        .map(|write| write.stars)
+                        .unwrap_or(picker.original.container_rating);
+                    (picker.original.container_rating != actual)
+                        .then(|| (target.clone(), picker.original.container_rating, actual))
+                })
+        } else {
+            None
+        };
         (item_changes, container_record)
     }
 
@@ -4768,7 +4951,14 @@ impl App {
             .then(|| self.clear_native_video_picker_overlay(ctx))
             .flatten();
         match picker.context {
-            RingShortcutContext::Grid => self.apply_grid_picker_state(picker),
+            RingShortcutContext::Grid
+                if self.grid_item_input_allowed()
+                    && self.current_ring_picker_anchor(RingShortcutContext::Grid)
+                        == picker.anchor =>
+            {
+                self.apply_grid_picker_state(picker)
+            }
+            RingShortcutContext::Grid => {}
             RingShortcutContext::ImageFullscreen => {
                 if let Some(fs_idx) = self.picker_owner_fullscreen_idx(&picker) {
                     self.apply_image_picker_state(ctx, fs_idx, picker);
@@ -4806,10 +4996,23 @@ impl App {
             );
             settings_changed = true;
         }
-        if picker.dirty_rows.contains(&RingPickerRowId::GridSortOrder)
-            && self.settings.sort_order != picker.sort_order
-        {
-            self.apply_grid_picker_sort_order(picker.sort_order);
+        if picker.dirty_rows.contains(&RingPickerRowId::GridSortOrder) {
+            match picker.grid_sort_target {
+                RingPickerGridSortTarget::Global
+                    if self.settings.sort_order != picker.sort_order =>
+                {
+                    self.apply_grid_picker_sort_order(picker.sort_order);
+                }
+                RingPickerGridSortTarget::Collection(target) => {
+                    self.request_collection_grid_set_order(
+                        target,
+                        crate::collection_store::CollectionOrderMode::Standard,
+                        picker.sort_order,
+                        crate::app::collection_grid::CollectionGridSetOrderRoute::StandardControl,
+                    );
+                }
+                RingPickerGridSortTarget::Global | RingPickerGridSortTarget::Locked(_) => {}
+            }
         }
         if picker
             .dirty_rows
@@ -5149,6 +5352,20 @@ impl App {
         surface: crate::app::ActionSurface,
         source: &'static str,
     ) -> Option<AddressBarNav> {
+        self.dispatch_mouse_button(ctx, slot, surface, source)
+            .navigation
+    }
+
+    /// Resolves and executes one mouse-slot press, returning the exact action that
+    /// passed all shared validity/edit-mode gates. Native XButton hold state may
+    /// arm only from this result, never from the configured slot alone.
+    pub(crate) fn dispatch_mouse_button(
+        &mut self,
+        ctx: &egui::Context,
+        slot: MouseButtonSlot,
+        surface: crate::app::ActionSurface,
+        source: &'static str,
+    ) -> MouseButtonDispatchResult {
         self.note_input_surface(surface);
         let context = self.ring_shortcut_context_for_surface(surface);
         let action = self
@@ -5161,31 +5378,28 @@ impl App {
                 "[input-nav] source={source} ignored invalid mouse button action={} context={context:?}",
                 action.as_str()
             ));
-            return None;
-        }
-        if !action.is_available_for_mouse_button_assignment(context) {
-            crate::logger::log(format!(
-                "[input-nav] source={source} ignored deferred mouse button action={} context={context:?}",
-                action.as_str()
-            ));
-            return None;
+            return MouseButtonDispatchResult::default();
         }
         if mouse_button_action_blocked_by_edit_mode(self.is_overlay_edit_mode_active(), &action) {
             crate::logger::log(format!(
                 "[input-nav] source={source} ignored mouse button action={} during edit mode",
                 action.as_str()
             ));
-            return None;
+            return MouseButtonDispatchResult::default();
         }
         if matches!(action, RingActionId::None | RingActionId::Unknown(_)) {
-            return None;
+            return MouseButtonDispatchResult::default();
         }
         crate::logger::log(format!(
             "[input-nav] source={source} mouse_button={} action={} context={context:?}",
             slot.log_name(),
             action.as_str()
         ));
-        self.apply_ring_action(ctx, context, action, source)
+        let dispatched_action = action.clone();
+        MouseButtonDispatchResult {
+            navigation: self.apply_ring_action(ctx, context, action, source),
+            dispatched_action: Some(dispatched_action),
+        }
     }
 
     fn apply_folder_history_nav(
@@ -5258,7 +5472,10 @@ impl App {
         }
         self.bump_input_seq(source, Some(&format!("favorite_slot={slot}")));
         ctx.request_repaint();
-        Some(AddressBarNav::Direct(target))
+        Some(AddressBarNav::Direct(
+            target,
+            crate::app::StartupListIntent::ExplicitList,
+        ))
     }
 
     fn apply_ring_drive_letter(
@@ -5278,7 +5495,10 @@ impl App {
             self.close_fullscreen();
         }
         self.bump_input_seq(source, Some(&format!("drive={}", path.display())));
-        Some(AddressBarNav::Direct(resolved))
+        Some(AddressBarNav::Direct(
+            resolved,
+            crate::app::StartupListIntent::ExplicitList,
+        ))
     }
 
     fn apply_current_drive_root(&mut self, source: &'static str) -> Option<AddressBarNav> {
@@ -5303,7 +5523,10 @@ impl App {
             source,
             Some(&format!("current_drive_root={}", path.display())),
         );
-        Some(AddressBarNav::Direct(resolved))
+        Some(AddressBarNav::Direct(
+            resolved,
+            crate::app::StartupListIntent::ExplicitList,
+        ))
     }
 
     fn apply_switch_drive_letter(
@@ -5349,7 +5572,10 @@ impl App {
                 target.display()
             )),
         );
-        Some(AddressBarNav::Direct(target))
+        Some(AddressBarNav::Direct(
+            target,
+            crate::app::StartupListIntent::ExplicitList,
+        ))
     }
 
     fn apply_ring_location_action(
@@ -5502,7 +5728,10 @@ impl App {
             self.show_feedback_toast(format!("場所が見つかりません: {}", path.display()));
             return None;
         };
-        Some(AddressBarNav::Direct(resolved))
+        Some(AddressBarNav::Direct(
+            resolved,
+            crate::app::StartupListIntent::ExplicitList,
+        ))
     }
 
     fn apply_tree_folder_nav(&mut self, ctx: &egui::Context, forward: bool, source: &'static str) {
@@ -5632,6 +5861,12 @@ impl App {
         action: RingActionId,
         source: &'static str,
     ) -> Option<AddressBarNav> {
+        if context == RingShortcutContext::Grid
+            && !self.grid_item_input_allowed()
+            && !grid_ring_action_allowed_during_refresh(&action)
+        {
+            return None;
+        }
         if let Some(slot) = action.favorite_slot_number() {
             return self.apply_ring_favorite_slot(ctx, slot, source);
         }
@@ -5692,8 +5927,16 @@ impl App {
                 self.apply_ring_add_to_book(ctx, context);
                 None
             }
+            RingActionId::AddToCollection => {
+                self.apply_ring_add_to_collection(context);
+                None
+            }
             RingActionId::PinRepresentativeThumb => {
                 self.apply_ring_pin_representative_thumb(ctx, context);
+                None
+            }
+            RingActionId::GridOrganizeFiles if context == RingShortcutContext::Grid => {
+                self.request_file_organize_dialog(None);
                 None
             }
             RingActionId::OpenPreferences if context == RingShortcutContext::Grid => {
@@ -5803,6 +6046,46 @@ impl App {
             }
             RingActionId::GridColumnCount10 if context == RingShortcutContext::Grid => {
                 self.apply_ring_grid_column_count(10);
+                None
+            }
+            RingActionId::GridColumnCount11 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(11);
+                None
+            }
+            RingActionId::GridColumnCount12 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(12);
+                None
+            }
+            RingActionId::GridColumnCount13 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(13);
+                None
+            }
+            RingActionId::GridColumnCount14 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(14);
+                None
+            }
+            RingActionId::GridColumnCount15 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(15);
+                None
+            }
+            RingActionId::GridColumnCount16 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(16);
+                None
+            }
+            RingActionId::GridColumnCount17 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(17);
+                None
+            }
+            RingActionId::GridColumnCount18 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(18);
+                None
+            }
+            RingActionId::GridColumnCount19 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(19);
+                None
+            }
+            RingActionId::GridColumnCount20 if context == RingShortcutContext::Grid => {
+                self.apply_ring_grid_column_count(20);
                 None
             }
             RingActionId::GridHistoryBack => self.apply_folder_history_nav(false, source),
@@ -5915,6 +6198,12 @@ impl App {
                 } else {
                     "[ピクセルグリッド OFF]".to_string()
                 });
+                None
+            }
+            RingActionId::ImageFitModeCycle if context == RingShortcutContext::ImageFullscreen => {
+                if let Some(fs_idx) = self.fullscreen_idx {
+                    self.cycle_fullscreen_fit_mode(ctx, fs_idx);
+                }
                 None
             }
             RingActionId::ImageBackgroundCycle
@@ -6135,7 +6424,7 @@ impl App {
                 ctx.request_repaint();
             }
             RingShortcutContext::VideoFullscreen => {
-                self.close_fullscreen();
+                self.close_fullscreen_to_page_list();
                 ctx.request_repaint();
             }
             RingShortcutContext::Grid => {}
@@ -6291,6 +6580,32 @@ impl App {
         }
     }
 
+    fn apply_ring_add_to_collection(&mut self, context: RingShortcutContext) {
+        match context {
+            RingShortcutContext::Grid if self.fullscreen_idx.is_none() => {
+                self.add_grid_shortcut_to_collection_target();
+            }
+            RingShortcutContext::ImageFullscreen => {
+                if let Some(fs_idx) = self.fullscreen_idx {
+                    self.add_fs_shortcut_to_collection_target(fs_idx);
+                }
+            }
+            RingShortcutContext::VideoFullscreen => {
+                if let Some(fs_idx) = self.fullscreen_idx {
+                    self.add_media_shortcut_to_collection_target(fs_idx);
+                }
+            }
+            RingShortcutContext::Grid => {
+                // A stale/misrouted Grid ring action must never reinterpret the fullscreen
+                // item as a grid selection or silently register a different source.
+                self.show_feedback_toast(
+                    "フルスクリーン表示中はグリッドの項目をコレクションに追加できません"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
     fn apply_ring_pin_representative_thumb(
         &mut self,
         ctx: &egui::Context,
@@ -6332,7 +6647,7 @@ impl App {
 
     fn current_fullscreen_spread_is_double(&mut self, fs_idx: usize) -> bool {
         matches!(
-            self.resolve_spread_pair(fs_idx),
+            self.resolve_visible_spread_pair(fs_idx),
             crate::ui_fullscreen::SpreadPair::Double { .. }
         )
     }
@@ -6358,7 +6673,7 @@ impl App {
     }
 
     fn cycle_ring_transparent_background(&mut self, fs_idx: usize) {
-        let idxs: Vec<usize> = match self.resolve_spread_pair(fs_idx) {
+        let idxs: Vec<usize> = match self.resolve_visible_spread_pair(fs_idx) {
             crate::ui_fullscreen::SpreadPair::Double { left, right } => vec![left, right],
             crate::ui_fullscreen::SpreadPair::Single => vec![fs_idx],
         };
@@ -6430,7 +6745,10 @@ impl App {
         }
         let next = self.spread_mode.next_in_spread_cycle();
         self.apply_fullscreen_spread_mode(ctx, fs_idx, next);
-        self.show_feedback_toast(format!("[Pad:{}]", next.label()));
+        // Report only the state actually applied: a rejected write keeps the old mode.
+        if self.spread_mode == next {
+            self.show_feedback_toast(format!("[Pad:{}]", next.label()));
+        }
         None
     }
 
@@ -6480,6 +6798,9 @@ impl App {
     }
 
     fn handle_gamepad_direction_for_grid(&mut self, dir: PadDir) {
+        if !self.grid_item_input_allowed() {
+            return;
+        }
         let display_order = self.current_grid_order().to_vec();
         let vi_len = display_order.len();
         if vi_len == 0 {
@@ -6526,9 +6847,7 @@ impl App {
             PadDir::Left => FolderPaneTreeKey::Left,
             PadDir::Right => FolderPaneTreeKey::Right,
         };
-        let _ = self
-            .folder_pane
-            .handle_tree_key(key, self.settings.sort_order);
+        let _ = self.folder_pane.handle_tree_key(key);
         true
     }
 
@@ -6947,9 +7266,8 @@ impl App {
         ctx: &egui::Context,
     ) -> Option<AddressBarNav> {
         if self.folder_pane_blocks_grid_keyboard() {
-            if let Some(FolderPaneCommand::Open(path)) = self
-                .folder_pane
-                .handle_tree_key(FolderPaneTreeKey::Enter, self.settings.sort_order)
+            if let Some(FolderPaneCommand::Open(path)) =
+                self.folder_pane.handle_tree_key(FolderPaneTreeKey::Enter)
             {
                 self.settings.folder_tree_pane_visible = false;
                 self.folder_pane.set_focus_grid();
@@ -6958,6 +7276,9 @@ impl App {
                 self.start_folder_pane_open(path);
                 return None;
             }
+            return None;
+        }
+        if !self.grid_item_input_allowed() {
             return None;
         }
         let idx = self.selected?;
@@ -6970,6 +7291,7 @@ impl App {
         if !self.guard_reading_history_open(idx) {
             return None;
         }
+        self.capture_main_list_restore_cursor();
         // ファイル名スタックの集約グリッドでメディアセルを開いたら、フラット読書フルスクリーンへ
         // (スタック/単独画像/動画を直接開く)。コンテナは false で通常ナビへ流れる。
         if self.stack_try_open_from_grid(ctx, idx, false) {
@@ -6982,14 +7304,29 @@ impl App {
         let item = self.items.get(idx).cloned();
         match item {
             Some(GridItem::Folder(p)) | Some(GridItem::ZipFile(p)) | Some(GridItem::PdfFile(p)) => {
-                self.note_reading_history_open(idx);
-                if self.should_auto_fullscreen_grid_container(idx) {
-                    self.pending_auto_fs_open = true;
+                let auto_fullscreen = self.should_auto_fullscreen_grid_container(idx);
+                if self.begin_smart_grid_container_navigation(
+                    idx,
+                    p.clone(),
+                    auto_fullscreen,
+                    crate::app::StartupListIntent::container_open(auto_fullscreen),
+                ) {
+                    return None;
                 }
-                self.maybe_suppress_rating_filter_for_opened_container(idx);
-                self.maybe_suppress_facet_filter_for_opened_container(idx);
-                self.begin_smart_folder_drill(&p);
-                Some(AddressBarNav::Direct(p))
+                if crate::folder_tree::is_virtual_folder(&p) {
+                    Some(self.grid_physical_navigation(idx, p, auto_fullscreen))
+                } else {
+                    self.note_reading_history_open(idx);
+                    if auto_fullscreen {
+                        self.pending_auto_fs_open = true;
+                    }
+                    self.maybe_suppress_rating_filter_for_opened_container(idx);
+                    self.maybe_suppress_facet_filter_for_opened_container(idx);
+                    Some(AddressBarNav::Direct(
+                        p,
+                        crate::app::StartupListIntent::container_open(auto_fullscreen),
+                    ))
+                }
             }
             Some(GridItem::Image(_))
             | Some(GridItem::ZipImage { .. })
@@ -7003,21 +7340,33 @@ impl App {
                     return None;
                 }
                 self.bump_input_seq_for_item("gamepad_grid_open", idx);
+
                 self.fs_open_intent_from_grid = true;
                 self.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
                 None
             }
-            Some(GridItem::ConvertibleArchive { path, format }) => {
-                let owner = self.main_grid_archive_open_owner(idx, &path);
+            Some(GridItem::CollectionPlaceholder { .. }) => None,
+            Some(GridItem::ConvertibleArchive { path, .. }) => {
                 let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();
                 if self.settings.archive_file_handling_ignores_convertible() {
                     self.show_feedback_toast(
                         "設定により RAR / 7z / LZH アーカイブを無視しています".into(),
                     );
-                } else if let Some(cached) = self.try_archive_cache_lookup(&path) {
-                    self.open_archive_via_cache_owned(path, cached, auto_fs, owner);
+                } else if self.begin_smart_grid_container_navigation(
+                    idx,
+                    path.clone(),
+                    auto_fs,
+                    crate::app::StartupListIntent::container_open(auto_fs),
+                ) {
+                    // The Smart request owns conversion and adopts its logical source once.
                 } else {
-                    self.request_archive_convert_owned(path, format, auto_fs, owner);
+                    let owner = self.main_grid_archive_open_owner(idx, &path);
+                    let _outcome = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                        path,
+                        auto_fs,
+                        owner,
+                        crate::app::StartupListIntent::container_open(auto_fs),
+                    );
                 }
                 None
             }
@@ -7078,11 +7427,25 @@ impl App {
     }
 
     fn scroll_gamepad_grid(&mut self, direction: f32) {
+        if !self.grid_item_input_allowed() {
+            return;
+        }
         let cell_h = self.last_cell_h.max(1.0);
         let prev_offset = self.scroll_offset_y;
         self.scroll_offset_y = (self.scroll_offset_y + direction * cell_h * 2.0).max(0.0);
         self.scroll_offset_y = (self.scroll_offset_y / cell_h).round() * cell_h;
         if (self.scroll_offset_y - prev_offset).abs() > 0.5 {
+            self.log_rating_grid_scroll(
+                &format!("gamepad direction={direction:.1}"),
+                prev_offset,
+                self.scroll_offset_y,
+                (
+                    self.last_grid_cols,
+                    self.last_cell_size,
+                    cell_h,
+                    self.last_viewport_h,
+                ),
+            );
             self.bump_input_seq(
                 "gamepad_grid_scroll",
                 Some(&format!("offset={:.0}", self.scroll_offset_y)),
@@ -7121,6 +7484,7 @@ impl App {
         repeat: bool,
     ) {
         let key = crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::gamepad_receipt(),
             virtual_key,
             scan_code: 0,
             extended: false,
@@ -7129,6 +7493,7 @@ impl App {
             alt: false,
             repeat,
         };
+        crate::mouse_seek_debug::log_gamepad_observation(key.receipt, key.virtual_key, key.repeat);
         self.handle_native_video_key_event(ctx, fs_idx, key);
     }
 
@@ -7937,10 +8302,37 @@ fn cycle_video_playback_speed(current: f64, delta: i32) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bookmark_picker_opens_on_its_supported_active_sort() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.sort_order = crate::settings::SortOrder::RatingDesc;
+        app.items_are_bookmark_view = true;
+        app.bookmark_view_sort =
+            crate::bookmark_browser::BookmarkViewSort::Normal(crate::settings::SortOrder::DateDesc);
+        let picker = app.build_ring_picker_state(crate::ring_shortcut::RingShortcutContext::Grid);
+        assert_eq!(picker.sort_order, crate::settings::SortOrder::DateDesc);
+        app.bookmark_view_sort = crate::bookmark_browser::BookmarkViewSort::CreatedAtDesc;
+        let picker = app.build_ring_picker_state(crate::ring_shortcut::RingShortcutContext::Grid);
+        assert_eq!(picker.sort_order, crate::settings::SortOrder::FileName);
+    }
+
+    #[test]
+    fn collection_picker_cycle_never_enters_rating_order() {
+        use crate::settings::SortOrder;
+        assert_eq!(
+            super::cycle_value(SortOrder::collection_options(), SortOrder::SizeDesc, 1),
+            SortOrder::FileName
+        );
+        assert_eq!(
+            super::cycle_value(SortOrder::all(), SortOrder::SizeDesc, 1),
+            SortOrder::RatingAsc
+        );
+    }
     use super::{
-        MouseMiddleInputSample, POST_FILTER_GROUPS, PadDir, continuous_reading_stick_axis,
-        cycle_rating, cycle_video_playback_speed, gamepad_grid_nav_target_pos,
-        gamepad_text_input_active, initial_gamepad_favorite_picker_tab,
+        GamepadFrameBatch, Instant, MouseMiddleInputSample, POST_FILTER_GROUPS, PadDir,
+        RingPickerRatingTarget, RingPickerRowId, continuous_reading_stick_axis, cycle_rating,
+        cycle_video_playback_speed, gamepad_grid_nav_target_pos, gamepad_text_input_active,
+        initial_gamepad_favorite_picker_tab, mark_picker_dirty,
         mouse_button_action_blocked_by_edit_mode, mouse_flick_direction, picker_rows_for_context,
         post_filter_group_index, post_filter_item_index_in_group, rating_label,
         right_drag_press_suppresses_context_menu, ring_direction_from_dpad_buttons,
@@ -7949,6 +8341,162 @@ mod tests {
         update_mouse_middle_click_state, video_seek_ring_action,
     };
     use crate::adjustment::PostFilter;
+
+    #[test]
+    fn multi_item_ring_rating_publishes_once() {
+        use crate::grid_item::GridItem;
+        use crate::ring_shortcut::RingShortcutContext;
+
+        let mut app = crate::app::setup_app_for_test();
+        let paths = [
+            app.tmp.path().join("ring-a.jpg"),
+            app.tmp.path().join("ring-b.jpg"),
+        ];
+        app.items = paths.iter().cloned().map(GridItem::Image).collect();
+        app.thumbnails = vec![
+            crate::app::ThumbnailState::Pending,
+            crate::app::ThumbnailState::Pending,
+        ];
+        app.image_metas = vec![None, None];
+        app.visible_indices = vec![0, 1];
+        app.selected = Some(0);
+        app.checked.extend([0, 1]);
+        let picker = app.build_ring_picker_state(RingShortcutContext::Grid);
+        assert_eq!(picker.original.item_rating_records.len(), 2);
+        let (touched, error) = app.apply_picker_item_rating_targets(&picker, 4);
+        assert_eq!(touched.len(), 2);
+        assert!(error.is_none());
+        assert_eq!(app.rating_publication_count, 1);
+    }
+
+    #[test]
+    fn stale_aggregate_gamepad_item_actions_wait_for_acceptance() {
+        use crate::filename_stack::StackView;
+        use crate::filename_stack_ui::StackReturnState;
+        use crate::grid_item::GridItem;
+        use crate::ring_shortcut::{RingActionId, RingShortcutContext};
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![
+            GridItem::Image(PathBuf::from("a.png")),
+            GridItem::Image(PathBuf::from("b.png")),
+        ];
+        app.visible_indices = vec![0, 1];
+        app.selected = Some(0);
+        app.settings.grid_cols = 2;
+        let view = Arc::new(StackView::build(
+            PathBuf::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            app.settings.stack_separator,
+            app.settings.sort_order,
+        ));
+        app.stack_view = Some(Arc::clone(&view));
+        app.stack_return_state = Some(StackReturnState::Refreshing { view });
+        app.handle_gamepad_direction_for_grid(PadDir::Right);
+        let _ = app.apply_ring_action(
+            &ctx,
+            RingShortcutContext::Grid,
+            RingActionId::GridToggleCheck,
+            "stale-grid-test",
+        );
+        assert_eq!(app.selected, Some(0));
+        assert!(app.checked.is_empty());
+
+        app.stack_return_state = None;
+        app.handle_gamepad_direction_for_grid(PadDir::Right);
+        let _ = app.apply_ring_action(
+            &ctx,
+            RingShortcutContext::Grid,
+            RingActionId::GridToggleCheck,
+            "accepted-grid-test",
+        );
+        assert_eq!(app.selected, Some(1));
+        assert!(app.checked.contains(&1));
+    }
+
+    #[test]
+    fn stale_aggregate_ring_actions_distinguish_navigation_from_items() {
+        use crate::ring_shortcut::RingActionId;
+        assert!(super::grid_ring_action_allowed_during_refresh(
+            &RingActionId::GridHistoryBack
+        ));
+        assert!(super::grid_ring_action_allowed_during_refresh(
+            &RingActionId::CloseMainWindow
+        ));
+        for item_action in [
+            RingActionId::GridToggleCheck,
+            RingActionId::GridOpenSelectedAsPage,
+            RingActionId::GridMoveFirst,
+            RingActionId::AddToCollection,
+        ] {
+            assert!(!super::grid_ring_action_allowed_during_refresh(
+                &item_action
+            ));
+        }
+    }
+
+    #[test]
+    fn epub_modal_blocks_ring_and_keyboard_history_dispatch() {
+        use crate::ring_shortcut::{RingActionId, RingShortcutContext};
+        let mut app = crate::app::setup_app_for_test();
+        let folder = app.tmp.path().join("ring-modal-source");
+        std::fs::create_dir(&folder).unwrap();
+        app.load_folder(folder.clone());
+        app.active_quick_folder_slot = None;
+        let back = app.tmp.path().join("ring-modal-back");
+        std::fs::create_dir(&back).unwrap();
+        app.folder_nav_back_stack
+            .push(super::super::FolderNavHistoryTarget::Path(back));
+        let before = app.folder_nav_back_stack.clone();
+        let epub = app.tmp.path().join("ring-modal.epub");
+        assert_eq!(
+            app.route_pdf_open_failure(
+                super::super::OpenRequestOwner::Navigation,
+                &epub,
+                super::super::PdfOpenFailure::NotConverted,
+                crate::app::StartupListIntent::ExplicitList,
+            ),
+            super::super::PdfOpenFailureRoute::ConversionDialogOpened
+        );
+        let ctx = egui::Context::default();
+        let ring = app.apply_ring_action(
+            &ctx,
+            RingShortcutContext::Grid,
+            RingActionId::GridHistoryBack,
+            "modal-ring-test",
+        );
+        if matches!(ring, Some(crate::ui_main::AddressBarNav::HistoryBack)) {
+            let mut rollback = None;
+            assert!(
+                app.dispatch_main_folder_history_input(
+                    super::super::FolderHistoryDirection::Back,
+                    &mut rollback,
+                )
+                .is_none()
+            );
+        }
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::ArrowLeft,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::ALT,
+            }],
+            ..Default::default()
+        });
+        let keyboard = app.handle_keyboard(&ctx);
+        let _ = ctx.end_pass();
+        assert!(keyboard.is_none());
+        assert_eq!(app.folder_nav_back_stack, before);
+        assert_eq!(app.current_folder.as_deref(), Some(folder.as_path()));
+        assert!(app.epub_convert.is_some());
+    }
 
     /// 「ゲームパッドの操作を受け付ける」を切ったら、本当に届かない。
     ///
@@ -7975,6 +8523,26 @@ mod tests {
             .push_for_test(PadEvent::ButtonPressed(PadButton::South));
         let batch = app.sample_gamepad_input(&ctx);
         assert!(!batch.actions.is_empty(), "有効に戻したら届く");
+    }
+
+    #[test]
+    fn grid_collection_ring_action_rejects_a_fullscreen_route_with_a_reason() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.fullscreen_idx = Some(0);
+
+        let navigation = app.apply_ring_action(
+            &ctx,
+            RingShortcutContext::Grid,
+            RingActionId::AddToCollection,
+            "test-grid-ring",
+        );
+
+        assert!(navigation.is_none());
+        assert!(app.fs_feedback_toast.as_ref().is_some_and(|(text, _, _)| {
+            text == "フルスクリーン表示中はグリッドの項目をコレクションに追加できません"
+        }));
+        assert_eq!(app.fullscreen_idx, Some(0));
     }
 
     /// 保持したまま OFF にしたら、**保持もそこで終わる**。
@@ -8042,6 +8610,279 @@ mod tests {
             "閉じる手段が消えた overlay を残さない"
         );
     }
+
+    #[test]
+    fn sidecar_restore_ends_gamepad_picker_without_replaying_its_live_write() {
+        use crate::gamepad::{PadAxis, PadEvent};
+
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        let key = "C:/fixture/page.jpg".to_string();
+        let mut picker = app.build_ring_picker_state(RingShortcutContext::Grid);
+        picker.dirty_rows.push(RingPickerRowId::ItemRating);
+        picker
+            .original
+            .item_rating_records
+            .push(RingPickerRatingTarget {
+                path_key: key.clone(),
+                source_path: std::path::PathBuf::from(&key),
+                meta: None,
+                xmp_target: None,
+                before: 1,
+                session_generation: 0,
+            });
+        picker.item_rating = 4;
+        app.record_rating_session_write(key, 4, true);
+        let published_generation = app.rating_session_write_generation;
+        app.ring_picker = Some(picker);
+        app.settings.gamepad_enabled = true;
+        app.gamepad
+            .push_for_test(PadEvent::ButtonPressed(PadButton::DPadRight));
+        app.gamepad
+            .push_for_test(PadEvent::AxisChanged(PadAxis::LeftX, 0.9));
+        let _ = app.sample_gamepad_input(&ctx);
+        app.activate_sidecar_restore_modal_for_test(std::path::PathBuf::from("sidecar-fixture"));
+
+        let outcome = app.dispatch_gamepad_batch(
+            &ctx,
+            GamepadFrameBatch {
+                now: Instant::now(),
+                actions: Vec::new(),
+                saw_input_event: true,
+                session_ended: true,
+            },
+        );
+
+        assert!(!outcome.dispatch_allowed);
+        assert!(!outcome.dispatched);
+        assert!(app.ring_picker.is_none(), "picker ownership must terminate");
+        assert!(!app.gamepad_state.button_down(PadButton::DPadRight));
+        assert_eq!(app.gamepad_state.axis(PadAxis::LeftX), 0.0);
+        assert!(!app.gamepad_state.repeat_active());
+        assert!(
+            app.gamepad_state.directional_neutral_required(),
+            "resume must start behind a fresh-neutral re-arm gate"
+        );
+        assert_eq!(
+            app.rating_session_write_generation, published_generation,
+            "modal termination must not submit the final rating again"
+        );
+        assert!(
+            app.meta_undo.can_undo(),
+            "the already-published live preview remains undoable"
+        );
+
+        app.sidecar_restore = None;
+        let resumed = app.dispatch_gamepad_batch(&ctx, GamepadFrameBatch::empty_for_test());
+        assert!(resumed.nav.is_none());
+        assert!(!resumed.dispatched, "no pre-modal action may replay");
+    }
+
+    #[test]
+    fn collection_ring_sort_is_local_until_commit_and_discards_its_captured_target() {
+        use crate::collection_store::{
+            CollectionOrderMode, CollectionRegistration, CollectionResolvedKind,
+            CollectionStoreRuntime,
+        };
+        use crate::ring_shortcut::RingPickerGridSortTarget;
+        use crate::settings::{DetailsSortKey, GridViewMode, SortOrder};
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("page.png");
+        std::fs::write(&source, b"page").unwrap();
+        let runtime = CollectionStoreRuntime::start_at(temp.path().join("collection.db")).unwrap();
+        let client = runtime.client();
+        let mut app = crate::app::setup_app_for_test();
+        app.install_collection_runtime(runtime);
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !matches!(app.collection_store_client_for_read(), Ok(Some(_))) {
+            assert!(
+                Instant::now() < deadline,
+                "collection runtime did not start"
+            );
+            app.poll_collection_ui(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let created = client
+            .create_collection("Ring target".into())
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        let added = client
+            .add_batch(
+                created.collection_id(),
+                created.revision(),
+                vec![
+                    CollectionRegistration::from_trusted_path(
+                        &source,
+                        CollectionResolvedKind::Image,
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+            .unwrap()
+            .snapshot;
+        app.settings.sort_order = SortOrder::DateDesc;
+        app.open_collection_grid(added.collection_id(), None);
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while app
+            .collection_grid_root_order()
+            .is_none_or(|order| order.is_err())
+        {
+            assert!(Instant::now() < deadline, "collection grid did not settle");
+            app.poll_collection_ui(&ctx);
+            app.poll_collection_grid(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        let mut picker = app.build_ring_picker_state(RingShortcutContext::Grid);
+        let captured = match picker.grid_sort_target {
+            RingPickerGridSortTarget::Collection(target) => target,
+            target => panic!("collection target was not captured: {target:?}"),
+        };
+        assert_eq!(picker.sort_order, captured.standard_sort);
+        picker.sort_order = SortOrder::SizeDesc;
+        mark_picker_dirty(&mut picker, RingPickerRowId::GridSortOrder);
+        app.preview_grid_picker_row(&picker, RingPickerRowId::GridSortOrder);
+        assert_eq!(app.settings.sort_order, SortOrder::DateDesc);
+        let preview_snapshot = client
+            .load_collection(added.collection_id())
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            preview_snapshot.revision(),
+            captured.content.expected_revision
+        );
+
+        app.ring_picker = Some(picker);
+        app.commit_ring_picker(&ctx);
+        assert!(app.ring_picker.is_none());
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !matches!(app.collection_grid_root_order(), Some(Ok(order))
+            if order.mode == CollectionOrderMode::Standard
+                && order.standard_sort == SortOrder::SizeDesc
+                && order.content.expected_revision == captured.content.expected_revision + 1)
+        {
+            assert!(Instant::now() < deadline, "ring sort did not install");
+            app.poll_collection_ui(&ctx);
+            app.poll_collection_grid(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(app.settings.sort_order, SortOrder::DateDesc);
+
+        app.settings.grid_view_mode = GridViewMode::Details;
+        app.settings.details_sort_key = DetailsSortKey::Name;
+        app.rebuild_details_order();
+        let locked = app.build_ring_picker_state(RingShortcutContext::Grid);
+        assert_eq!(
+            locked.grid_sort_target,
+            RingPickerGridSortTarget::Locked(crate::app::GridSortLockReason::DetailsHeaderSort)
+        );
+        let locked_sort = locked.sort_order;
+        app.ring_picker = Some(locked);
+        app.change_ring_picker_value(&ctx, RingPickerRowId::GridSortOrder, 1);
+        let locked = app.ring_picker.as_ref().unwrap();
+        assert_eq!(locked.sort_order, locked_sort);
+        assert!(!locked.dirty_rows.contains(&RingPickerRowId::GridSortOrder));
+        app.finish_gamepad_input_for_sidecar_restore(&ctx);
+        assert!(app.ring_picker.is_none());
+
+        app.settings.details_sort_key = DetailsSortKey::Toolbar;
+        let mut stale = app.build_ring_picker_state(RingShortcutContext::Grid);
+        stale.sort_order = SortOrder::FileName;
+        mark_picker_dirty(&mut stale, RingPickerRowId::GridSortOrder);
+        let external = client
+            .set_order(
+                added.collection_id(),
+                captured.content.expected_revision + 1,
+                CollectionOrderMode::Standard,
+                SortOrder::DateAsc,
+            )
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        app.ring_picker = Some(stale);
+        app.commit_ring_picker(&ctx);
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !app.collection_export_all_available() {
+            assert!(
+                Instant::now() < deadline,
+                "stale ring request did not settle"
+            );
+            app.poll_collection_ui(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let latest = client
+            .load_collection(added.collection_id())
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest, external);
+        assert_eq!(app.settings.sort_order, SortOrder::DateDesc);
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !matches!(app.collection_grid_root_order(), Some(Ok(order))
+            if order.content.expected_revision == external.revision())
+        {
+            assert!(Instant::now() < deadline, "external order did not install");
+            app.poll_collection_ui(&ctx);
+            app.poll_collection_grid(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let mut stale = app.build_ring_picker_state(RingShortcutContext::Grid);
+        stale.sort_order = SortOrder::FileName;
+        mark_picker_dirty(&mut stale, RingPickerRowId::GridSortOrder);
+        app.ring_picker = Some(stale);
+        let session = app.top_level_grid_view.collection_session_mut().unwrap();
+        let prepared = session.prepared().unwrap();
+        let first = prepared.entries[0].clone();
+        session.position =
+            crate::app::top_level_grid_view::CollectionGridPosition::PhysicalSource {
+                entry_id: first.entry_id,
+                source_key: first.source_key,
+                path: temp.path().join("physical-child"),
+            };
+        app.current_folder = Some(temp.path().join("physical-child"));
+        app.commit_ring_picker(&ctx);
+        assert!(app.ring_picker.is_none());
+        assert!(app.collection_export_all_available());
+        let unchanged = client
+            .load_collection(added.collection_id())
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.revision(), external.revision());
+        assert_eq!(unchanged.definition.standard_sort, SortOrder::DateAsc);
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn global_ring_sort_keeps_live_preview() {
+        use crate::ring_shortcut::RingPickerGridSortTarget;
+        use crate::settings::SortOrder;
+
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.sort_order = SortOrder::FileName;
+        let mut picker = app.build_ring_picker_state(RingShortcutContext::Grid);
+        assert_eq!(picker.grid_sort_target, RingPickerGridSortTarget::Global);
+        picker.sort_order = SortOrder::DateDesc;
+        mark_picker_dirty(&mut picker, RingPickerRowId::GridSortOrder);
+
+        app.preview_grid_picker_row(&picker, RingPickerRowId::GridSortOrder);
+
+        assert_eq!(app.settings.sort_order, SortOrder::DateDesc);
+    }
+
     use crate::app::ActionSurface;
     use crate::gamepad::{GamepadInputState, PadButton};
     use crate::ring_shortcut::{
@@ -8593,6 +9434,419 @@ mod tests {
             let group = post_filter_group_index(filter);
             let item = post_filter_item_index_in_group(filter, group);
             assert_eq!(POST_FILTER_GROUPS[group].filters[item], filter);
+        }
+    }
+}
+
+#[cfg(test)]
+mod next_input_tests {
+    use super::*;
+    use crate::grid_item::GridItem;
+    use crate::settings::{FullscreenFitMode, ReadingFlow};
+    use crate::ui_dialogs::file_organize::FileOrganizeRequest;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Route {
+        Ring,
+        Gesture,
+        Back,
+        Forward,
+        Middle,
+        PadRing,
+    }
+
+    const ROUTES: [Route; 6] = [
+        Route::Ring,
+        Route::Gesture,
+        Route::Back,
+        Route::Forward,
+        Route::Middle,
+        Route::PadRing,
+    ];
+
+    fn action(id: &str) -> RingActionId {
+        serde_json::from_value(serde_json::Value::String(id.to_owned())).unwrap()
+    }
+
+    fn dispatch(
+        app: &mut App,
+        ctx: &egui::Context,
+        context: RingShortcutContext,
+        route: Route,
+        action: RingActionId,
+    ) {
+        let direction = RingDirection::Up;
+        app.settings.ring_shortcuts.profile_mut(context).slots[direction.slot_index()] =
+            action.clone();
+        match route {
+            Route::Ring => {
+                app.trigger_ring_shortcut_action(ctx, context, direction, "mouse-ring");
+            }
+            Route::PadRing => {
+                let now = Instant::now();
+                app.gamepad_state
+                    .set_button_down(PadButton::West, true, now);
+                app.gamepad_state.mark_west_ring_direction(direction);
+                app.gamepad_state
+                    .set_button_down(PadButton::West, false, now);
+                app.finish_gamepad_west_release(ctx);
+            }
+            Route::Gesture => {
+                let drag_context = match context {
+                    RingShortcutContext::Grid => RightDragContext::Grid,
+                    RingShortcutContext::ImageFullscreen => RightDragContext::ImageFullscreen,
+                    RingShortcutContext::VideoFullscreen => RightDragContext::VideoFullscreen,
+                };
+                app.settings
+                    .ring_shortcuts
+                    .mouse_gesture_profile_mut(drag_context)
+                    .bindings = vec![crate::ring_shortcut::MouseGestureBinding::new(
+                    vec![crate::ring_shortcut::MouseGestureDirection::Up],
+                    action,
+                )];
+                app.trigger_mouse_gesture_action(
+                    ctx,
+                    drag_context,
+                    &[crate::ring_shortcut::MouseGestureDirection::Up],
+                );
+            }
+            Route::Back | Route::Forward | Route::Middle => {
+                let slot = match route {
+                    Route::Back => MouseButtonSlot::Back,
+                    Route::Forward => MouseButtonSlot::Forward,
+                    _ => MouseButtonSlot::Middle,
+                };
+                let profile = app
+                    .settings
+                    .ring_shortcuts
+                    .mouse_button_profile_mut(context);
+                match slot {
+                    MouseButtonSlot::Back => profile.back = action,
+                    MouseButtonSlot::Forward => profile.forward = action,
+                    MouseButtonSlot::Middle => profile.middle = action,
+                }
+                app.apply_mouse_button(
+                    ctx,
+                    slot,
+                    match context {
+                        RingShortcutContext::Grid => crate::app::ActionSurface::MainWindow,
+                        _ => crate::app::ActionSurface::Viewer,
+                    },
+                    "test-mouse-button",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn next_input_organize_routes_open_only_the_existing_picker() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let paths = [
+            app.tmp.path().join("first.jpg"),
+            app.tmp.path().join("second.jpg"),
+        ];
+        app.items = paths.iter().cloned().map(GridItem::Image).collect();
+        app.visible_indices = vec![1, 0];
+        app.selected = Some(0);
+        app.checked.extend([0, 1]);
+        for details in [false, true] {
+            app.settings.grid_view_mode = if details {
+                crate::settings::GridViewMode::Details
+            } else {
+                crate::settings::GridViewMode::Thumbnail
+            };
+            for route in ROUTES {
+                app.file_organize_request = FileOrganizeRequest::Hidden;
+                dispatch(
+                    &mut app,
+                    &ctx,
+                    RingShortcutContext::Grid,
+                    route,
+                    action("grid_organize_files"),
+                );
+                let FileOrganizeRequest::Selecting(selection) = &app.file_organize_request else {
+                    panic!("{route:?} must open the destination picker");
+                };
+                assert_eq!(selection.sources, vec![paths[1].clone(), paths[0].clone()]);
+                assert_eq!(selection.focus, None, "no move/copy operation is selected");
+                assert_eq!(app.selected, Some(0));
+                assert_eq!(app.checked.len(), 2);
+            }
+        }
+    }
+
+    fn dispatch_fit_cycle(app: &mut App, ctx: &egui::Context, route: Option<Route>) {
+        if let Some(route) = route {
+            dispatch(
+                app,
+                ctx,
+                RingShortcutContext::ImageFullscreen,
+                route,
+                action("image_fit_mode_cycle"),
+            );
+        } else {
+            #[cfg(windows)]
+            crate::key_input::set_test_frame(vec![crate::key_input::KeyEdge {
+                source_hwnd: 1,
+                source_viewport: egui::ViewportId::ROOT,
+                virtual_key: 0x30,
+                scan_code: 0x0b,
+                extended: false,
+                pressed: true,
+                repeat: false,
+                ctrl: false,
+                shift: false,
+                alt: false,
+            }]);
+            ctx.begin_pass(egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Num0,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            });
+            let _ = app.handle_fs_key_input(ctx, 0, false);
+            let _ = ctx.end_pass();
+            #[cfg(windows)]
+            crate::key_input::set_test_frame(Vec::new());
+        }
+    }
+
+    #[test]
+    fn fit_cycle_subset_all_input_routes_use_the_same_owner() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        app.items = vec![GridItem::Image(app.tmp.path().join("page.jpg"))];
+        app.fullscreen_idx = Some(0);
+        app.note_input_surface(crate::app::ActionSurface::Viewer);
+        for flow in [
+            ReadingFlow::Paged,
+            ReadingFlow::Vertical,
+            ReadingFlow::Horizontal,
+        ] {
+            app.reading_flow = flow;
+            for (excluded, start, expected) in [
+                (
+                    vec!["Width", "Height"],
+                    FullscreenFitMode::Page,
+                    vec![FullscreenFitMode::Original, FullscreenFitMode::Page],
+                ),
+                (
+                    vec!["Width", "Height"],
+                    FullscreenFitMode::Width,
+                    vec![FullscreenFitMode::Page, FullscreenFitMode::Original],
+                ),
+                (
+                    vec!["Page", "Width", "Height"],
+                    FullscreenFitMode::Page,
+                    vec![FullscreenFitMode::Original, FullscreenFitMode::Original],
+                ),
+                (
+                    vec!["Page", "Width", "Height"],
+                    FullscreenFitMode::Original,
+                    vec![FullscreenFitMode::Original, FullscreenFitMode::Original],
+                ),
+            ] {
+                for route in ROUTES.into_iter().map(Some).chain(std::iter::once(None)) {
+                    let mut saved = serde_json::to_value(&app.settings).unwrap();
+                    saved["fullscreen_fit_cycle_excluded"] = serde_json::json!(excluded);
+                    app.settings = serde_json::from_value(saved).unwrap();
+                    app.settings.fullscreen_fit_mode = start;
+                    for &mode in &expected {
+                        dispatch_fit_cycle(&mut app, &ctx, route);
+                        assert_eq!(
+                            app.settings.fullscreen_fit_mode, mode,
+                            "{route:?}, {flow:?}, {excluded:?}"
+                        );
+                    }
+                    // A direct picker choice must remain available even when excluded from cycling.
+                    app.set_fullscreen_fit_mode_for_current(&ctx, 0, FullscreenFitMode::Width);
+                    assert_eq!(app.settings.fullscreen_fit_mode, FullscreenFitMode::Width);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn next_input_fit_routes_share_the_key_cycle_for_all_reading_flows() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        app.items = vec![GridItem::Image(app.tmp.path().join("page.jpg"))];
+        app.fullscreen_idx = Some(0);
+        app.note_input_surface(crate::app::ActionSurface::Viewer);
+        for flow in [
+            ReadingFlow::Paged,
+            ReadingFlow::Vertical,
+            ReadingFlow::Horizontal,
+        ] {
+            app.reading_flow = flow;
+            for route in ROUTES {
+                app.settings.fullscreen_fit_mode = FullscreenFitMode::Page;
+                for expected in [
+                    FullscreenFitMode::Width,
+                    FullscreenFitMode::Height,
+                    FullscreenFitMode::Original,
+                    FullscreenFitMode::Page,
+                ] {
+                    dispatch(
+                        &mut app,
+                        &ctx,
+                        RingShortcutContext::ImageFullscreen,
+                        route,
+                        action("image_fit_mode_cycle"),
+                    );
+                    assert_eq!(
+                        app.settings.fullscreen_fit_mode, expected,
+                        "{route:?}, {flow:?}"
+                    );
+                    assert!(matches!(
+                        app.file_organize_request,
+                        FileOrganizeRequest::Hidden
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn next_input_fit_routes_preserve_edit_mode_ownership() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        app.items = vec![GridItem::Image(app.tmp.path().join("page.jpg"))];
+        app.fullscreen_idx = Some(0);
+        for enter in [
+            |app: &mut App| app.erase_mode = true,
+            |app: &mut App| app.conceal_mode = true,
+            |app: &mut App| app.local_adjust_mode = true,
+            |app: &mut App| app.export_crop_mode = true,
+            |app: &mut App| app.text_mode = true,
+            |app: &mut App| {
+                app.sns_split = Some(crate::sns_split::SnsSplitLayout::centered_max(
+                    crate::sns_split::SnsTarget::X,
+                    2,
+                    [2400, 1600],
+                ))
+            },
+        ] {
+            enter(&mut app);
+            app.settings.fullscreen_fit_mode = FullscreenFitMode::Page;
+            for route in ROUTES {
+                dispatch(
+                    &mut app,
+                    &ctx,
+                    RingShortcutContext::ImageFullscreen,
+                    route,
+                    action("image_fit_mode_cycle"),
+                );
+                assert_eq!(app.settings.fullscreen_fit_mode, FullscreenFitMode::Page);
+            }
+            app.execute_right_drag_command(
+                &ctx,
+                RightDragCommand::MouseGesture {
+                    context: RightDragContext::EditMode,
+                    action: action("image_fit_mode_cycle"),
+                    pattern_label: "↑".to_owned(),
+                    show_result_toast: false,
+                },
+            );
+            assert_eq!(app.settings.fullscreen_fit_mode, FullscreenFitMode::Page);
+            app.erase_mode = false;
+            app.conceal_mode = false;
+            app.local_adjust_mode = false;
+            app.export_crop_mode = false;
+            app.text_mode = false;
+            app.sns_split = None;
+        }
+    }
+
+    #[test]
+    fn next_input_fit_routes_support_zip_and_pdf_pages() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        for item in [
+            GridItem::ZipImage {
+                zip_path: app.tmp.path().join("book.zip"),
+                entry_name: "page.jpg".to_owned(),
+            },
+            GridItem::PdfPage {
+                pdf_path: app.tmp.path().join("book.pdf"),
+                page_num: 0,
+                content_type: None,
+            },
+        ] {
+            app.items = vec![item];
+            app.fullscreen_idx = Some(0);
+            for route in ROUTES {
+                app.settings.fullscreen_fit_mode = FullscreenFitMode::Page;
+                app.fs_zoom = 2.0;
+                app.fs_pan = egui::vec2(10.0, 20.0);
+                dispatch(
+                    &mut app,
+                    &ctx,
+                    RingShortcutContext::ImageFullscreen,
+                    route,
+                    action("image_fit_mode_cycle"),
+                );
+                assert_eq!(app.settings.fullscreen_fit_mode, FullscreenFitMode::Width);
+                assert_eq!(app.fs_zoom, 1.0);
+                assert_eq!(app.fs_pan, egui::Vec2::ZERO);
+                assert_eq!(app.fullscreen_idx, Some(0));
+            }
+        }
+    }
+
+    #[test]
+    fn next_input_routes_reject_wrong_context_and_video_audio_fit() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        for item in [
+            GridItem::Video(app.tmp.path().join("video.mp4")),
+            GridItem::Image(app.tmp.path().join("page.jpg")),
+        ] {
+            app.items = vec![item];
+            app.fullscreen_idx = Some(0);
+            app.note_input_surface(crate::app::ActionSurface::Viewer);
+            for route in ROUTES {
+                let context = app.current_ring_shortcut_context();
+                dispatch(
+                    &mut app,
+                    &ctx,
+                    context,
+                    route,
+                    action("grid_organize_files"),
+                );
+                assert!(matches!(
+                    app.file_organize_request,
+                    FileOrganizeRequest::Hidden
+                ));
+            }
+        }
+        app.items = vec![GridItem::Video(app.tmp.path().join("video.mp4"))];
+        for audio in [false, true] {
+            app.video_audio_mode = audio.then_some(0);
+            for route in ROUTES {
+                app.settings.fullscreen_fit_mode = FullscreenFitMode::Page;
+                dispatch(
+                    &mut app,
+                    &ctx,
+                    RingShortcutContext::VideoFullscreen,
+                    route,
+                    action("image_fit_mode_cycle"),
+                );
+                assert_eq!(app.settings.fullscreen_fit_mode, FullscreenFitMode::Page);
+                // Even a stale image-context command must never change video fit.
+                app.apply_ring_action(
+                    &ctx,
+                    RingShortcutContext::ImageFullscreen,
+                    action("image_fit_mode_cycle"),
+                    "test-stale-context",
+                );
+                assert_eq!(app.settings.fullscreen_fit_mode, FullscreenFitMode::Page);
+            }
         }
     }
 }

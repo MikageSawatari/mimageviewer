@@ -35,7 +35,7 @@ impl FsPageLoadScheduler {
         )
     }
 
-    fn with_limits(total: usize, high_reserved: usize) -> Self {
+    pub(crate) fn with_limits(total: usize, high_reserved: usize) -> Self {
         assert!(total >= 1, "page-load permits must be non-zero");
         assert!(
             high_reserved < total,
@@ -80,6 +80,27 @@ impl FsPageLoadScheduler {
         let (superseded, stats) = {
             let mut state = self.inner.state.lock().unwrap();
             let superseded = state.remove_waiting_superseded_by_seek(owner_context, None);
+            let stats = state.stats();
+            self.inner.changed.notify_all();
+            (superseded, stats)
+        };
+        for request in superseded {
+            emit_scheduler_event(
+                "scheduler_cancel_waiting",
+                &request.perf,
+                request.priority,
+                request.contract,
+                stats,
+                None,
+            );
+        }
+    }
+
+    /// RAW owns two source requests for one target page.
+    pub(crate) fn supersede_waiting_for_latest_seek_page(&self, owner_context: u64, idx: usize) {
+        let (superseded, stats) = {
+            let mut state = self.inner.state.lock().unwrap();
+            let superseded = state.remove_waiting_superseded(owner_context, SeekRetain::Page(idx));
             let stats = state.stats();
             self.inner.changed.notify_all();
             (superseded, stats)
@@ -206,6 +227,10 @@ impl FsPageLoadTicket {
     }
 
     pub(crate) fn cancel(&self) {
+        // The permit can finish before a RAW development job does. Its drop
+        // removes the scheduler record, but the ticket still owns the job's
+        // shared cancellation flag.
+        self.cancel.store(true, Ordering::Relaxed);
         cancel_request(&self.inner, self.request_id, "scheduler_cancel");
     }
 
@@ -574,12 +599,26 @@ impl SchedulerState {
         owner_context: u64,
         except_request_id: Option<u64>,
     ) -> Vec<RequestRecord> {
+        self.remove_waiting_superseded(
+            owner_context,
+            except_request_id.map_or(SeekRetain::Nothing, SeekRetain::Request),
+        )
+    }
+
+    fn remove_waiting_superseded(
+        &mut self,
+        owner_context: u64,
+        retain: SeekRetain,
+    ) -> Vec<RequestRecord> {
         let superseded = self
             .requests
             .iter()
             .filter_map(|(&id, request)| {
-                (Some(id) != except_request_id
-                    && request.perf.owner_context == owner_context
+                (!match retain {
+                    SeekRetain::Nothing => false,
+                    SeekRetain::Request(keep) => id == keep,
+                    SeekRetain::Page(idx) => request.perf.idx == idx,
+                } && request.perf.owner_context == owner_context
                     && request.phase == RequestPhase::Waiting)
                     .then_some(id)
             })
@@ -595,8 +634,57 @@ impl SchedulerState {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SeekRetain {
+    Nothing,
+    Request(u64),
+    Page(usize),
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn latest_seek_page_keeps_both_raw_requests_and_other_contexts() {
+        let scheduler = FsPageLoadScheduler::with_limits(1, 0);
+        let preview = scheduler.request(
+            11,
+            4,
+            FsPageLoadPriority::High,
+            FsPageLoadContract::Sequential,
+            None,
+            0,
+        );
+        let preparation = scheduler.request(
+            11,
+            4,
+            FsPageLoadPriority::Normal,
+            FsPageLoadContract::Sequential,
+            None,
+            0,
+        );
+        let old = scheduler.request(
+            11,
+            3,
+            FsPageLoadPriority::Normal,
+            FsPageLoadContract::Sequential,
+            None,
+            0,
+        );
+        let sibling = scheduler.request(
+            12,
+            3,
+            FsPageLoadPriority::Normal,
+            FsPageLoadContract::Sequential,
+            None,
+            0,
+        );
+        scheduler.supersede_waiting_for_latest_seek_page(11, 4);
+        assert!(old.cancel_token().load(Ordering::Relaxed));
+        for ticket in [&preview, &preparation, &sibling] {
+            assert!(!ticket.cancel_token().load(Ordering::Relaxed));
+        }
+        assert_eq!(scheduler.stats().waiting, 3);
+    }
     use super::*;
     use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc;
@@ -662,7 +750,9 @@ mod tests {
 
         wait_until(|| {
             let stats = scheduler.stats();
-            stats.running + stats.cancelling == 3
+            // Admission precedes the worker's active/peak accounting. Keep the
+            // gate closed until all three admitted workers have entered it.
+            stats.running + stats.cancelling == 3 && active.load(Ordering::SeqCst) == 3
         });
         let stats = scheduler.stats();
         assert_eq!(stats.running, 3);
@@ -831,6 +921,27 @@ mod tests {
         );
         assert!(next.waiter().acquire_cancellable().is_some());
         drop((failed, next));
+    }
+
+    #[test]
+    fn cancel_after_permit_drop_sets_flag_without_changing_accounting() {
+        let scheduler = FsPageLoadScheduler::with_limits(1, 0);
+        let ticket = test_ticket(
+            &scheduler,
+            1,
+            0,
+            FsPageLoadPriority::High,
+            FsPageLoadContract::Sequential,
+        );
+        let permit = ticket.waiter().acquire_cancellable().unwrap();
+        assert_eq!(scheduler.stats().running, 1);
+        drop(permit);
+        let before = scheduler.stats();
+        assert_eq!(before, FsPageLoadSchedulerStats::default());
+        assert!(!ticket.is_cancelled());
+        ticket.cancel();
+        assert!(ticket.is_cancelled());
+        assert_eq!(scheduler.stats(), before);
     }
 
     #[test]

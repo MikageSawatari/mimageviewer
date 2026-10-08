@@ -11,6 +11,8 @@
 > settings.db に保存し、`keymap.ini.imported*.bak` へ退避する。設定メニュー「操作カスタマイズ…」から
 > `Settings.keymap` を編集できる。`keymap.ini.default` は Action 名と既定キーの参照として引き続き生成する。
 
+> §1.250: `ToggleAlwaysOnTop` は Global / Press / 既定 `none`。main、egui fullscreen、native video の各入力経路へ配線し、native presenter 用の allowlist と chord snapshot にも含める。
+
 関連: [keymap-spec.md](keymap-spec.md) (現行キー仕様 = アクション洗い出しの元ネタ)、
 [archive/ui-input/key-customization-plan.md](archive/ui-input/key-customization-plan.md) §8 (簡易版の設計確定事項)。
 
@@ -386,8 +388,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 10. **OS/egui 由来の clipboard / D&D は固定**: `Event::Copy` / `Event::Cut`、
     Win32 クリップボード paste、ファイル D&D は keyboard keymap の範囲外。対象にするなら
     Grid の別フェーズで明示的に設計する。
-11. **レーティング F1-F6** は `[Rating]` コンテキストの `RatingItem1..5/Clear` と
-   `RatingContainer1..5/Clear` に集約する。グリッド / 画像フルスクリーン / native 動画の
+11. **レーティング F1-F6** は `[Rating]` コンテキストの `RatingItem1..5/Clear/StepUp/StepDown` と
+   `RatingContainer1..5/Clear/StepUp/StepDown` に集約する。StepUp/StepDown は既定キーなし。グリッド / 画像フルスクリーン / native 動画の
    入口は `Keymap::consume_rating_action` / `native_video_rating_action` を使い、保存処理は既存の
    `set_rating` / `set_current_folder_rating` 経路を共有する。
 12. **生 Event::Key / OS 状態参照経路** (pipeline debug=pipeline_debug.rs:104 など) は特殊。
@@ -439,6 +441,12 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 ---
 
 ## 10. 新しいキー操作を追加するとき (保守 runbook)
+
+2026-10-07 §1.349 / §1.343: 操作カスタマイズの対応表は
+`GridOrganizeFiles` → `RingActionId::GridOrganizeFiles` (Grid)、
+`FsFitModeCycle` → `RingActionId::ImageFitModeCycle` (ImageFullscreen)。
+リング／パッド、ジェスチャ、マウス3ボタンは既存の対応表・候補フィルタを共有し、
+既定割り当てや保存形式は変更しない。整理先は既存要求生成へ、fitはキーと同じ循環へ接続する。
 
 ユーザーから「keymap 対応も」と明示されなくても、キーボード操作を追加・変更する修正では
 毎回この手順を通す。
@@ -498,7 +506,7 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
     ツールの並べ替えでスロットとの対応が変わるため、設定 UI では番号を明示する。
 - GridSelectAll `Ctrl+A` (P) / GridDeselect `Ctrl+D`,`Ctrl+Shift+A` (P) /
   GridCopyFiles `Ctrl+C` (P) / GridCutFiles `Ctrl+X` (P)
-- GridColumnCount1..10 `Alt+1`..`Alt+0`、GridToggleDetailsView `Alt+-` (P)
+- GridColumnCount1..10 `Alt+1`..`Alt+0`、GridColumnCount11..20 は既定キーなし、GridToggleDetailsView `Alt+-` (P)
 
 ### Grid (Ph4)
 - GridCursorRight/Left/Up/Down `矢印` (P)(予約候補) / GridOpenSelected `Enter` (P) / GridOpenExternalPlayer `Shift+Enter` (P) /
@@ -511,7 +519,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
   GridPin `P` (P) / GridCompareX `X` (P)
 - GridApplyErase1/2 `F7/F8` / GridApplyConceal1/2 `F9/F10` /
   GridDeleteEraseMask `Shift+F7/F8` / GridDeleteConcealMask `Shift+F9/F10` (P)
-- RatingItem1..5/Clear `F1-F6` / RatingContainer1..5/Clear `Shift+F1-F6`
+- RatingItem1..5/Clear `F1-F6` / RatingContainer1..5/Clear `Shift+F1-F6`。
+  RatingItemStepUp/StepDown・RatingContainerStepUp/StepDown は `none`
   (専用 `[Rating]` グループ。グリッド / 画像フルスクリーン / 動画フルスクリーンで共有)
 - GridCopyFiles / GridCutFiles は Shell clipboard 実行経路を保ったまま keymap 化済み。
   Paste `Ctrl+V`、D&D、右クリック操作そのものは OS/clipboard/マウス経路を含むため固定。
@@ -612,7 +621,12 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - ConcealSpacePan `Space` (KH, Ph6) / ConcealNudge 矢印 (固定候補)
 
 ### Crop (Ph3) ★
-- CropExit `Esc`(予約) / CropExecute `Ctrl+E` / CropSpacePan `Space` (KH)
+- CropExit `Esc`(予約) / CropExecute `Ctrl+E` /
+  CropForceCreateHold `Ctrl` (MH) / CropSpacePan `Space` (KH)
+- Crop の pointer-down 分類だけは、実効 `CropSpacePan` と実効
+  `CropForceCreateHold` の組合せを解決し、両方が押されていれば Pan を優先する。
+  汎用 KeyHold の完全一致規則は変更せず、余分な modifier group は拒否する。
+  pointer-down 後は既存の Pan / Create / Edit owner に保持し、修飾キー変化で再分類しない。
 
 ### SnsSplit ★
 - FsSnsSplitMode (既定未割り当て) / SnsSplitExecute (既定未割り当て)

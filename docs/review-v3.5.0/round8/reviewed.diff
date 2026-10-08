@@ -1,0 +1,617 @@
+diff --git a/docs/detached-rework-plan.md b/docs/detached-rework-plan.md
+index 3143bf5c7..8f1431db7 100644
+--- a/docs/detached-rework-plan.md
++++ b/docs/detached-rework-plan.md
+@@ -1459,6 +1459,31 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作
+ §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
+ ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
+ 
++**2026-09-03 v3.5.0 レビュー U01 で、補正 Undo の復元先解決を Undo / Redo 1 回あたり
++1 パスへまとめた (Codex が findings.md round7 で「復元側で同じ一覧をページごとに走査しない
++構造にする」と修正境界を指定し、ClaudeCode が実装。T01 の識別子方針は維持したまま、
++解決の回数だけを直す性能修正で、§2 の禁止事項には該当しない):**
++
++**触った範囲**: [src/app.rs](../src/app.rs) の `PageAdjustmentTarget.idx_hint` を
++`Option<usize>` から 3 値の `PageIndexHint` (`Unresolved` / `At` / `Absent`) に変え、
++`page_adjustment_indices` を 3 分岐にした。`set_page_params_for_target` /
++`clear_page_params_for_target` の末尾の `record_content_identity_for_idx` は、hint ではなく
++**実際に書いた index** を使う。[src/undo_ops.rs](../src/undo_ops.rs) に
++`resolve_restore_scopes` を新設し、`apply_meta_undo` / `apply_meta_redo` が適用前に 1 回だけ
++呼ぶ。[src/remote_ipc/ui.rs](../src/remote_ipc/ui.rs) は構築時の値だけ。detached の
++viewport lifecycle、window binding、session 遷移、snapshot DTO には触れていない。
++
++**判断理由**: T01 で復元先を識別子にしたとき、`idx_hint` を落として毎回一覧から探すように
++した。`Option<usize>` の `None` が「まだ調べていない」と「調べたが居ない」の両方を意味して
++いたため、居ないページを触るたびに一覧を最後まで走査して全項目のキー文字列を作り直し、
++一括補正の Undo が対象件数 × 一覧件数になっていた (1 万件の一覧・5,000 ページで検索だけ
++約 14 秒)。2 つの意味を型で分け、Undo 1 回につき一覧を 1 回だけ走査して各ページの居場所を
++決める。index へ戻したわけではなく、正本は識別子のまま。**前に解決した居場所は使わない** —
++Undo と Redo の間に並べ替えや窓の切り替えが入り得るので、適用のたびに引き直す。
++
++**残っている穴**: 同じキーが複数の番号に居る一覧では `Unresolved` のまま残し、従来どおり
++走査へ回す。1 つの番号では全部の書き込み先を表せないため。通常の一覧では起きない。
++
+ **2026-09-03 v3.5.0 レビュー T01 / T02 で、補正 Undo の復元先をページの識別子にし、
+ リング HUD の後始末を開いた窓へ戻した (Codex が findings.md round6 で
+ 「復元先の page identity を確定まで保ち、Undo / Redo で現在の index に解釈し直さない」
+diff --git a/src/app.rs b/src/app.rs
+index 0c23f20ba..2c1dcf8f0 100644
+--- a/src/app.rs
++++ b/src/app.rs
+@@ -7543,6 +7543,23 @@ pub(crate) struct AdjustmentDragSession {
+     pub before: Option<crate::adjustment::AdjustParams>,
+ }
+ 
++/// そのページが **いま mount している一覧のどこに居るか**。
++///
++/// 「まだ調べていない」と「調べたが居ない」を 1 つの `Option` で表していたので、
++/// 居ないページを触るたびに一覧を最後まで走査してキー文字列を作り直していた。一括補正の
++/// Undo では対象件数 × 一覧件数になり、1 万件の一覧で UI が秒単位で止まる
++/// (v3.5.0 レビュー U01)。両者を分けて、解決済みなら探し直さない。
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
++pub enum PageIndexHint {
++    /// まだ調べていない。必要になったら一覧から探す。
++    #[default]
++    Unresolved,
++    /// この番号に居るはず。使う側がキー一致を確かめてから使う。
++    At(usize),
++    /// この一覧には居ないと分かっている。探し直さない。
++    Absent,
++}
++
+ /// ページ補正の永続 identity。idx が存在しない remote ページも同じ writer へ流す。
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct PageAdjustmentTarget {
+@@ -7551,9 +7568,9 @@ pub struct PageAdjustmentTarget {
+     pub location_path: Option<std::path::PathBuf>,
+     pub sidecar_coords: Option<(std::path::PathBuf, String)>,
+     pub compiled_book: bool,
+-    /// ローカル UI の既存 `set_page_params(idx, ...)` だけが設定する。
+-    /// remote は `None` とし、同じ key が mounted items にあればそこへ反映する。
+-    pub idx_hint: Option<usize>,
++    /// 一覧での居場所。remote と、記録してから使うまでに一覧が変わり得るもの
++    /// (補正 Undo など) は `Unresolved` で作り、使う直前に解決する。
++    pub idx_hint: PageIndexHint,
+ }
+ 
+ /// 画像補正パネルで選ばれている書き込み先。
+@@ -54277,7 +54294,7 @@ impl App {
+                 .flatten(),
+             sidecar_coords: (!compiled_book).then(|| self.sidecar_coords(idx)).flatten(),
+             compiled_book,
+-            idx_hint: Some(idx),
++            idx_hint: PageIndexHint::At(idx),
+         })
+     }
+ 
+@@ -61792,14 +61809,18 @@ impl App {
+     }
+ 
+     fn page_adjustment_indices(&self, target: &PageAdjustmentTarget) -> Vec<usize> {
+-        if let Some(idx) = target.idx_hint {
+-            return (self.page_path_key(idx).as_deref() == Some(target.page_key.as_str()))
+-                .then_some(vec![idx])
+-                .unwrap_or_default();
++        match target.idx_hint {
++            PageIndexHint::Absent => Vec::new(),
++            PageIndexHint::At(idx) => (self.page_path_key(idx).as_deref()
++                == Some(target.page_key.as_str()))
++            .then_some(vec![idx])
++            .unwrap_or_default(),
++            // 走査はページごとに全件のキーを作り直す。まとめて解決できる呼び出しは
++            // 先に解決してから来ること (レビュー U01)。
++            PageIndexHint::Unresolved => (0..self.items.len())
++                .filter(|idx| self.page_path_key(*idx).as_deref() == Some(target.page_key.as_str()))
++                .collect(),
+         }
+-        (0..self.items.len())
+-            .filter(|idx| self.page_path_key(*idx).as_deref() == Some(target.page_key.as_str()))
+-            .collect()
+     }
+ 
+     pub(crate) fn stored_page_params_for_target(
+@@ -61892,6 +61913,8 @@ impl App {
+         // 無い場合がある。親セルの refresh 判定は idx ではなく page key の実効値で行う。
+         let old_effective_for_key = self.effective_params_for_target(target);
+         let indices = self.page_adjustment_indices(target);
++        // 実際に書いた場所を使う。hint は解決前 (`Unresolved`) や古い番号のことがある。
++        let written_at = indices.first().copied();
+         let old_by_idx = indices
+             .iter()
+             .map(|idx| (*idx, self.effective_params(*idx).clone()))
+@@ -61954,7 +61977,7 @@ impl App {
+         self.schedule_current_smart_folder_metadata_refresh(
+             smart_folder::SmartFolderMetadataDependency::Edits,
+         );
+-        if let Some(idx) = target.idx_hint {
++        if let Some(idx) = written_at {
+             self.record_content_identity_for_idx(
+                 idx,
+                 crate::content_identity::ContentIdentityTrigger::Edit,
+@@ -61986,6 +62009,8 @@ impl App {
+         let fallback = self.adjustment_standard_params_for_target(target);
+         let thumb_color_changed = !old_effective_for_key.color_settings_eq(&fallback);
+         let indices = self.page_adjustment_indices(target);
++        // set 側と同じ理由で、実際に消した場所を使う。
++        let written_at = indices.first().copied();
+         let old_by_idx = indices
+             .iter()
+             .map(|idx| (*idx, self.effective_params(*idx).clone()))
+@@ -62031,7 +62056,7 @@ impl App {
+         self.schedule_current_smart_folder_metadata_refresh(
+             smart_folder::SmartFolderMetadataDependency::Edits,
+         );
+-        if let Some(idx) = target.idx_hint {
++        if let Some(idx) = written_at {
+             self.record_content_identity_for_idx(
+                 idx,
+                 crate::content_identity::ContentIdentityTrigger::Edit,
+diff --git a/src/app/tests.rs b/src/app/tests.rs
+index 2b3ee0404..5fb965282 100644
+--- a/src/app/tests.rs
++++ b/src/app/tests.rs
+@@ -15312,7 +15312,7 @@ mod favorite_adjustment_defaults_tests {
+         let path = PathBuf::from("C:/pics/remote-page.jpg");
+         let idx = push_image(&mut app, path.to_str().unwrap());
+         let mut target = app.page_adjustment_target_for_idx(idx).unwrap();
+-        target.idx_hint = None;
++        target.idx_hint = crate::app::PageIndexHint::Unresolved;
+         let mut params = AdjustParams::default();
+         params.brightness = 31.0;
+ 
+@@ -15363,7 +15363,7 @@ mod favorite_adjustment_defaults_tests {
+             location_path: path.parent().map(PathBuf::from),
+             sidecar_coords: None,
+             compiled_book: false,
+-            idx_hint: None,
++            idx_hint: crate::app::PageIndexHint::Unresolved,
+         };
+         let mut params = AdjustParams::default();
+         params.contrast = 22.0;
+@@ -15409,7 +15409,7 @@ mod favorite_adjustment_defaults_tests {
+             location_path: path.parent().map(PathBuf::from),
+             sidecar_coords: None,
+             compiled_book: false,
+-            idx_hint: None,
++            idx_hint: crate::app::PageIndexHint::Unresolved,
+         };
+         assert!(app.page_adjustment_indices(&target).is_empty());
+         let mut params = AdjustParams::default();
+@@ -15432,7 +15432,7 @@ mod favorite_adjustment_defaults_tests {
+             location_path: path.parent().map(PathBuf::from),
+             sidecar_coords: None,
+             compiled_book: false,
+-            idx_hint: None,
++            idx_hint: crate::app::PageIndexHint::Unresolved,
+         };
+         let mut params = AdjustParams::default();
+         params.colorize.mode = crate::colorize::ColorizeMode::AllImages;
+@@ -15461,7 +15461,7 @@ mod favorite_adjustment_defaults_tests {
+             location_path: path.parent().map(PathBuf::from),
+             sidecar_coords: None,
+             compiled_book: false,
+-            idx_hint: None,
++            idx_hint: crate::app::PageIndexHint::Unresolved,
+         };
+         assert!(app.page_adjustment_indices(&target).is_empty());
+         let mut params = AdjustParams::default();
+@@ -65885,6 +65885,239 @@ mod rating_write_failure_tests {
+     }
+ }
+ 
++/// 補正 Undo の復元先は、**適用の直前に一覧を 1 回だけ走査して**決める。
++///
++/// 復元先をページ識別子にしたとき (レビュー T01)、居場所を毎回探し直すようにしたので、
++/// 一括補正の Undo が「対象件数 × 一覧件数」になり、1 万件の一覧で UI が秒単位で止まる
++/// ようになっていた (レビュー U01)。
++mod adjustment_undo_target_tests {
++    use super::phase_c_support::setup_app;
++    use super::*;
++    use crate::adjustment::PostFilter;
++    use crate::app::PageIndexHint;
++    use crate::undo_stack::{AdjustUndoScope, UndoEntry};
++
++    fn page_params(post_filter: PostFilter) -> crate::adjustment::AdjustParams {
++        let mut params = crate::adjustment::AdjustParams::default();
++        params.post_filter = post_filter;
++        params
++    }
++
++    /// `count` 枚の実ファイルを持つ一覧を作る。
++    fn fill_items(app: &mut App, root: &std::path::Path, count: usize) -> Vec<PathBuf> {
++        let mut paths = Vec::new();
++        for i in 0..count {
++            let path = root.join(format!("page{i:03}.jpg"));
++            std::fs::write(&path, b"not decoded by this test").unwrap();
++            paths.push(path);
++        }
++        app.items = paths.iter().cloned().map(GridItem::Image).collect();
++        app.thumbnails = vec![ThumbnailState::Pending; count];
++        app.current_folder = Some(root.to_path_buf());
++        paths
++    }
++
++    fn page_scopes(entry: &UndoEntry) -> Vec<&AdjustUndoScope> {
++        let UndoEntry::Adjustment { changes, .. } = entry else {
++            panic!("補正の Undo エントリのはず");
++        };
++        changes
++            .iter()
++            .map(|change| &change.scope)
++            .filter(|scope| matches!(scope, AdjustUndoScope::PageKey(_)))
++            .collect()
++    }
++
++    /// 一括操作の Undo は、**ページごとに一覧を探し直さない**。
++    ///
++    /// 適用に入る前にすべての復元先が解決済み (`At` か `Absent`) になっていること。
++    /// `page_adjustment_indices` が全件走査するのは `Unresolved` のときだけなので、
++    /// ここが埋まっていれば 1 ページごとの走査は起きない。
++    #[test]
++    fn a_bulk_undo_resolves_every_page_before_it_starts_restoring() {
++        let mut app = setup_app();
++        let root = app.tmp.path().to_path_buf();
++        fill_items(&mut app, &root, 12);
++        app.fullscreen_idx = Some(0);
++
++        app.capture_adjust_full("一括補正".to_string(), |a| {
++            for idx in 0..12 {
++                a.set_page_params(idx, page_params(PostFilter::GameBoy));
++            }
++        });
++        let captured = app.meta_undo.peek_undo().expect("エントリが積まれる");
++        assert_eq!(page_scopes(captured).len(), 12, "12 ページぶん記録する");
++        assert!(
++            page_scopes(captured).iter().all(|scope| matches!(
++                scope,
++                AdjustUndoScope::PageKey(target)
++                    if target.idx_hint == PageIndexHint::Unresolved
++            )),
++            "記録時は居場所を焼き付けない (取り消すのは後なので)"
++        );
++
++        app.apply_meta_undo();
++
++        let applied = app.meta_undo.peek_redo().expect("Redo 側へ移る");
++        assert!(
++            page_scopes(applied).iter().all(|scope| matches!(
++                scope,
++                AdjustUndoScope::PageKey(target)
++                    if target.idx_hint != PageIndexHint::Unresolved
++            )),
++            "適用前に全件解決してある (= ページごとの全件走査が無い)"
++        );
++        for idx in 0..12 {
++            assert!(
++                !app.adjustment_page_params.contains_key(&idx),
++                "12 ページとも元に戻る"
++            );
++        }
++    }
++
++    /// 別の窓で一括 Undo しても、**その窓の一覧は 1 回しか走査しない**。
++    ///
++    /// 居ないと分かった時点で `Absent` を入れる。ここが `Unresolved` のままだと、
++    /// 見つからないページを 1 件ずつ最後まで探し直す。
++    #[test]
++    #[cfg(windows)]
++    fn a_bulk_undo_from_another_window_marks_every_page_absent_once() {
++        let mut app = setup_app();
++        let root = app.tmp.path().to_path_buf();
++        fill_items(&mut app, &root, 8);
++        app.fullscreen_idx = Some(0);
++        app.capture_adjust_full("一括補正".to_string(), |a| {
++            for idx in 0..8 {
++                a.set_page_params(idx, page_params(PostFilter::GameBoy));
++            }
++        });
++
++        let other = app.build_window_context_for_test(949, |c| {
++            c.items = vec![GridItem::Image(PathBuf::from("C:/other/b.jpg"))];
++            c.thumbnails = vec![ThumbnailState::Pending];
++            c.current_folder = Some(PathBuf::from("C:/other"));
++            c.adjustment_page_params
++                .insert(0, page_params(PostFilter::Famicom));
++        });
++
++        let other_filter = app
++            .with_owner_viewer_context(other, |a| {
++                a.apply_meta_undo();
++                a.adjustment_page_params.get(&0).map(|p| p.post_filter)
++            })
++            .expect("別 context を mount できる");
++
++        assert_eq!(
++            other_filter,
++            Some(PostFilter::Famicom),
++            "前面の窓の画像は書き換えない"
++        );
++        let applied = app.meta_undo.peek_redo().expect("Redo 側へ移る");
++        assert!(
++            page_scopes(applied).iter().all(|scope| matches!(
++                scope,
++                AdjustUndoScope::PageKey(target)
++                    if target.idx_hint == PageIndexHint::Absent
++            )),
++            "その一覧に居ないと 1 回で分かるので、以後は探さない"
++        );
++    }
++
++    /// Undo と Redo の間に一覧が並べ替わっても、Redo は**そのページ**へ戻す。
++    ///
++    /// 解決した居場所を記録に残して使い回すと、Redo が前回の番号を見に行く。エントリが
++    /// 持つ正本は識別子だけなので、適用のたびに解決し直す。
++    #[test]
++    fn a_redo_resolves_again_after_the_list_moved_under_it() {
++        let mut app = setup_app();
++        let root = app.tmp.path().to_path_buf();
++        let paths = fill_items(&mut app, &root, 2);
++        app.fullscreen_idx = Some(0);
++        app.set_page_params(0, page_params(PostFilter::GameBoy));
++        app.set_page_params(1, page_params(PostFilter::Famicom));
++
++        app.capture_adjust_full("テスト".to_string(), |a| {
++            a.set_page_params(0, page_params(PostFilter::Nearest));
++        });
++        app.apply_meta_undo();
++        assert_eq!(
++            app.adjustment_page_params.get(&0).map(|p| p.post_filter),
++            Some(PostFilter::GameBoy),
++            "前提: Undo は効く"
++        );
++
++        // Undo と Redo の間に並べ替える。
++        app.items = vec![
++            GridItem::Image(paths[1].clone()),
++            GridItem::Image(paths[0].clone()),
++        ];
++        app.adjustment_page_params
++            .insert(0, page_params(PostFilter::Famicom));
++        app.adjustment_page_params
++            .insert(1, page_params(PostFilter::GameBoy));
++
++        app.apply_meta_redo();
++
++        assert_eq!(
++            app.adjustment_page_params.get(&1).map(|p| p.post_filter),
++            Some(PostFilter::Nearest),
++            "動いた先のページへやり直す"
++        );
++        assert_eq!(
++            app.adjustment_page_params.get(&0).map(|p| p.post_filter),
++            Some(PostFilter::Famicom),
++            "同じ番号に来た別の画像は変えない"
++        );
++    }
++
++    /// 解決は、居る / 居ない / 同じキーが複数、を区別する。
++    #[test]
++    fn resolving_marks_present_absent_and_leaves_duplicates_to_the_scan() {
++        let mut app = setup_app();
++        let root = app.tmp.path().to_path_buf();
++        let paths = fill_items(&mut app, &root, 3);
++        // 同じページを 2 か所に置く一覧 (通常は起きないが、表示側の合成ビューで起こり得る)。
++        app.items.push(GridItem::Image(paths[2].clone()));
++        app.thumbnails.push(ThumbnailState::Pending);
++
++        let present = app.page_adjust_undo_scope(0);
++        let duplicated = app.page_adjust_undo_scope(2);
++        let missing = {
++            let AdjustUndoScope::PageKey(mut target) = app.page_adjust_undo_scope(1) else {
++                panic!("ページキーで記録される");
++            };
++            target.page_key = "not-in-this-list".to_string();
++            AdjustUndoScope::PageKey(target)
++        };
++
++        let changes: Vec<crate::undo_stack::AdjustmentChange> = [present, duplicated, missing]
++            .into_iter()
++            .map(|scope| crate::undo_stack::AdjustmentChange {
++                scope,
++                before: None,
++                after: Some(page_params(PostFilter::GameBoy)),
++            })
++            .collect();
++
++        let resolved = app.resolve_restore_scopes_for_test(&changes);
++        let hints: Vec<PageIndexHint> = resolved
++            .iter()
++            .map(|scope| match scope {
++                AdjustUndoScope::PageKey(target) => target.idx_hint,
++                other => panic!("ページ以外が混ざった: {other:?}"),
++            })
++            .collect();
++
++        assert_eq!(hints[0], PageIndexHint::At(0), "居る番号を焼き付ける");
++        assert_eq!(
++            hints[1],
++            PageIndexHint::Unresolved,
++            "複数に居るページは 1 つの番号で表せないので走査へ回す"
++        );
++        assert_eq!(hints[2], PageIndexHint::Absent, "この一覧に居ないと決まる");
++    }
++}
++
+ /// リングで変えた**画像の設定**は、リングを開いた窓のページへ入る。
+ ///
+ /// 評価行は保存先を識別子で固定したが (レビュー Q01)、画像行は確定時に
+diff --git a/src/remote_ipc/ui.rs b/src/remote_ipc/ui.rs
+index ea6ed3ed5..5643e9f3f 100644
+--- a/src/remote_ipc/ui.rs
++++ b/src/remote_ipc/ui.rs
+@@ -3512,7 +3512,7 @@ fn remote_adjustment_target(
+         location_path,
+         sidecar_coords,
+         compiled_book,
+-        idx_hint: None,
++        idx_hint: crate::app::PageIndexHint::Unresolved,
+     })
+ }
+ 
+diff --git a/src/undo_ops.rs b/src/undo_ops.rs
+index acb7e8b4c..9fd219df2 100644
+--- a/src/undo_ops.rs
++++ b/src/undo_ops.rs
+@@ -179,12 +179,12 @@ impl App {
+     /// Ctrl+Z ハンドラ。スタック先頭を取り出し、`before` 状態を再適用してから
+     /// Redo スタックへ移す。スタックが空なら no-op。
+     pub(crate) fn apply_meta_undo(&mut self) {
+-        let Some(entry) = self.meta_undo.pop_undo() else {
++        let Some(mut entry) = self.meta_undo.pop_undo() else {
+             return;
+         };
+         let summary = entry.summary().to_string();
+         crate::logger::log(format!("[UNDO] applying undo: {summary}"));
+-        match &entry {
++        match &mut entry {
+             UndoEntry::Rating { changes, .. } => {
+                 if let Err(error) =
+                     self.apply_rating_changes_to_app(changes, /* use_before */ true)
+@@ -210,6 +210,11 @@ impl App {
+                 self.submit_tag_restore_jobs(changes, /* use_before */ true);
+             }
+             UndoEntry::Adjustment { changes, .. } => {
++                // 復元先は、いまの一覧に対して 1 回だけ解決する (レビュー U01)。
++                let resolved = self.resolve_restore_scopes(changes);
++                for (change, scope) in changes.iter_mut().zip(resolved) {
++                    change.scope = scope;
++                }
+                 // カスケード復元順序: Global → Favorite → Page
+                 // (Page を先に書くと set_page_params の "matches default → prune" が
+                 //  古い Favorite 標準で発火して entry が消える事故が起きる。Codex P1)
+@@ -232,12 +237,12 @@ impl App {
+     /// Ctrl+Y / Ctrl+Shift+Z ハンドラ。Redo スタック先頭を取り出し、`after` 状態を
+     /// 再適用してから Undo スタックへ戻す。
+     pub(crate) fn apply_meta_redo(&mut self) {
+-        let Some(entry) = self.meta_undo.pop_redo() else {
++        let Some(mut entry) = self.meta_undo.pop_redo() else {
+             return;
+         };
+         let summary = entry.summary().to_string();
+         crate::logger::log(format!("[UNDO] applying redo: {summary}"));
+-        match &entry {
++        match &mut entry {
+             UndoEntry::Rating { changes, .. } => {
+                 if let Err(error) =
+                     self.apply_rating_changes_to_app(changes, /* use_before */ false)
+@@ -262,6 +267,11 @@ impl App {
+                 self.submit_tag_restore_jobs(changes, /* use_before */ false);
+             }
+             UndoEntry::Adjustment { changes, .. } => {
++                // Undo と同じく、復元先は 1 回だけ解決する (レビュー U01)。
++                let resolved = self.resolve_restore_scopes(changes);
++                for (change, scope) in changes.iter_mut().zip(resolved) {
++                    change.scope = scope;
++                }
+                 // Redo は元操作の自然順 (Page → Favorite → Global、つまり下層から上層)
+                 let mut order: Vec<usize> = (0..changes.len()).collect();
+                 order.sort_by_key(|&i| std::cmp::Reverse(adjust_scope_priority(&changes[i].scope)));
+@@ -438,27 +448,89 @@ impl App {
+         self.set_local_adjust_layers_for_idx(c.idx, target.clone());
+     }
+ 
+-    /// 単一スコープの単一変更を Undo スタックに積む共通ヘルパー。`before == after`
+-    /// は捨てられるので、呼び出し側で抑止判定を書かなくて済む。
+     /// 補正 Undo の **ページ側の復元先**。index ではなくページの識別子で持つ。
+     ///
+     /// `AdjustUndoScope::Page` は表示上の座標でしかない。`Page` のまま積むと、別の窓で
+     /// Ctrl+Z を押したときに **同じ index に居る別の画像**を、この窓の変更前値で上書きする
+-    /// (v3.5.0 レビュー T01)。`PageKey` は `idx_hint` をキー一致で検証してから使うので、
++    /// (v3.5.0 レビュー T01)。`PageKey` は取り消す直前に一覧から居場所を引き直すので、
+     /// 別の窓では runtime を触らず正本 (DB) だけを戻し、同じ窓では今までどおり動く。
+     /// ページキーを持たない項目 (画像でない等) だけ、従来の index 表現へ落ちる。
+     pub(crate) fn page_adjust_undo_scope(&self, idx: usize) -> AdjustUndoScope {
+         match self.page_adjustment_target_for_idx(idx) {
+             Some(mut target) => {
+-                // `idx_hint` も落とす。並べ替えでページが別の番号へ動いていたら、そこへ
+-                // 戻したい。キーで引き直せば、動いた先が見つかり、別の窓では何も見つからない。
+-                target.idx_hint = None;
++                // 居場所は焼き付けない。取り消すのは後なので、並べ替えで番号が動いていたり、
++                // 別の窓には最初から居なかったりする。適用の直前に
++                // [`Self::resolve_restore_scopes`] がまとめて解決する。
++                target.idx_hint = crate::app::PageIndexHint::Unresolved;
+                 AdjustUndoScope::PageKey(target)
+             }
+             None => AdjustUndoScope::Page(idx),
+         }
+     }
+ 
++    #[cfg(test)]
++    pub(crate) fn resolve_restore_scopes_for_test(
++        &self,
++        changes: &[AdjustmentChange],
++    ) -> Vec<AdjustUndoScope> {
++        self.resolve_restore_scopes(changes)
++    }
++
++    /// 復元先を、**適用のたびに、いまの一覧に対して 1 回だけ**解決する。
++    ///
++    /// `PageKey` は復元先をページ識別子で持つ (レビュー T01)。未解決のまま 1 件ずつ復元すると
++    /// `page_adjustment_indices` がページごとに一覧を最後まで走査し、全項目のキー文字列を
++    /// 作り直す。一括補正の Undo では対象件数 × 一覧件数になり、1 万件の一覧で UI が秒単位で
++    /// 止まる (v3.5.0 レビュー U01)。ここで一覧を 1 回だけ走査して各ページの居場所を決め、
++    /// 見つからなければ `Absent` を入れて後段に探し直させない。
++    ///
++    /// **前に解決した居場所は使わない。** それは前回適用したときの一覧での話で、Undo と Redo の
++    /// 間に並べ替えや窓の切り替えが入り得る。エントリが持つ正本は識別子だけ。
++    ///
++    /// 同じキーが複数の番号に居る一覧では `Unresolved` のまま残す。1 つの番号では表しきれず、
++    /// 全部へ書く必要があるため。通常の一覧では起きない。
++    fn resolve_restore_scopes(&self, changes: &[AdjustmentChange]) -> Vec<AdjustUndoScope> {
++        use crate::app::PageIndexHint;
++        let page_key = |scope: &AdjustUndoScope| match scope {
++            AdjustUndoScope::PageKey(target) => Some(target.page_key.clone()),
++            _ => None,
++        };
++        let wanted: std::collections::HashSet<String> = changes
++            .iter()
++            .filter_map(|change| page_key(&change.scope))
++            .collect();
++        if wanted.is_empty() {
++            return changes.iter().map(|change| change.scope.clone()).collect();
++        }
++        let mut found: std::collections::HashMap<String, Vec<usize>> =
++            std::collections::HashMap::new();
++        for idx in 0..self.items.len() {
++            let Some(key) = self.page_path_key(idx) else {
++                continue;
++            };
++            if wanted.contains(&key) {
++                found.entry(key).or_default().push(idx);
++            }
++        }
++        changes
++            .iter()
++            .map(|change| match &change.scope {
++                AdjustUndoScope::PageKey(target) => {
++                    let mut target = target.clone();
++                    target.idx_hint = match found.get(&target.page_key).map(Vec::as_slice) {
++                        Some([idx]) => PageIndexHint::At(*idx),
++                        Some(_) => PageIndexHint::Unresolved,
++                        None => PageIndexHint::Absent,
++                    };
++                    AdjustUndoScope::PageKey(target)
++                }
++                other => other.clone(),
++            })
++            .collect()
++    }
++
++    /// 単一スコープの単一変更を Undo スタックに積む共通ヘルパー。`before == after`
++    /// は捨てられるので、呼び出し側で抑止判定を書かなくて済む。
+     pub(crate) fn capture_adjustment_undo(
+         &mut self,
+         scope: AdjustUndoScope,
+diff --git a/src/undo_stack.rs b/src/undo_stack.rs
+index 9365b6c43..e2790483a 100644
+--- a/src/undo_stack.rs
++++ b/src/undo_stack.rs
+@@ -520,7 +520,7 @@ mod tests {
+                         location_path: None,
+                         sidecar_coords: None,
+                         compiled_book: false,
+-                        idx_hint: None,
++                        idx_hint: crate::app::PageIndexHint::Unresolved,
+                     }),
+                     before: None,
+                     after: Some(AdjustParams::default()),

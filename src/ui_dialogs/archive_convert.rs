@@ -49,6 +49,7 @@ pub(crate) enum ArchiveConvertCompletionPolicy {
     MainGridArchive(crate::app::MainGridArchiveTransitionIntent),
     Bookmark(crate::bookmark_browser::BookmarkOpenRequestOwner),
     DetachedGridArchive(crate::app::DetachedGridArchiveOpenRequestOwner),
+    StagedHistory(u64),
     SiblingZip,
 }
 
@@ -65,6 +66,7 @@ impl ArchiveConvertCompletionPolicy {
             Self::Navigation
             | Self::MainGridArchive(_)
             | Self::DetachedGridArchive(_)
+            | Self::StagedHistory(_)
             | Self::SiblingZip => None,
         }
     }
@@ -74,9 +76,11 @@ impl ArchiveConvertCompletionPolicy {
     ) -> Option<&crate::app::DetachedGridArchiveOpenRequestOwner> {
         match self {
             Self::DetachedGridArchive(owner) => Some(owner),
-            Self::Navigation | Self::MainGridArchive(_) | Self::Bookmark(_) | Self::SiblingZip => {
-                None
-            }
+            Self::Navigation
+            | Self::MainGridArchive(_)
+            | Self::Bookmark(_)
+            | Self::StagedHistory(_)
+            | Self::SiblingZip => None,
         }
     }
 
@@ -87,7 +91,7 @@ impl ArchiveConvertCompletionPolicy {
                 intent.clone(),
             )),
             Self::Bookmark(owner) => Some(crate::app::OpenRequestOwner::Bookmark(owner.clone())),
-            Self::DetachedGridArchive(_) | Self::SiblingZip => None,
+            Self::DetachedGridArchive(_) | Self::StagedHistory(_) | Self::SiblingZip => None,
         }
     }
 }
@@ -161,6 +165,8 @@ pub(crate) struct ArchiveConvertState {
     /// Existing conversion cache, used only when the direct-read probe rejects the RAR.
     pub fallback_cached_zip: Option<PathBuf>,
     pub completion: ArchiveConvertCompletionPolicy,
+    /// The original open's final presentation intent survives scan, password and conversion.
+    pub restore_intent: crate::app::StartupListIntent,
     pub pending_sibling_output: Option<PathBuf>,
     /// 履歴の戻る/進むから未変換アーカイブに入ろうとしてダイアログが出た場合、
     /// キャンセル時に戻る/進むスタックをクリック前へ戻すためのスナップショット。
@@ -297,12 +303,15 @@ impl App {
         src: PathBuf,
         cached_zip: PathBuf,
         auto_fullscreen: bool,
+
+        restore_intent: crate::app::StartupListIntent,
     ) -> bool {
         self.open_archive_via_cache_owned(
             src,
             cached_zip,
             auto_fullscreen,
             crate::app::OpenRequestOwner::Navigation,
+            restore_intent,
         )
     }
 
@@ -312,6 +321,8 @@ impl App {
         cached_zip: PathBuf,
         auto_fullscreen: bool,
         owner: crate::app::OpenRequestOwner,
+
+        restore_intent: crate::app::StartupListIntent,
     ) -> bool {
         if let crate::app::OpenRequestOwner::DetachedGridArchive(detached_owner) = &owner {
             crate::logger::log(format!(
@@ -326,6 +337,13 @@ impl App {
             && !self.bookmark_open_owner_is_current(bookmark_owner)
         {
             return false;
+        }
+        if matches!(
+            &owner,
+            crate::app::OpenRequestOwner::MainGridArchive(intent)
+                if matches!(intent.smart_folder_owner, crate::app::SmartGridArchiveOwner::Transition(_))
+        ) {
+            return self.supply_smart_archive_load_alias(&src, &cached_zip, &owner);
         }
         if auto_fullscreen {
             self.pending_auto_fs_open = true;
@@ -348,9 +366,18 @@ impl App {
             })
             .cloned();
         self.transition_favorite_view_for_path(Some(&src));
-        self.prepare_main_grid_archive_transition_for_load(&transition_owner, &cached_zip);
-        self.authorize_smart_folder_session_alias(&src, &cached_zip);
-        self.load_folder_with_scan_owned(cached_zip.clone(), None, owner);
+        let load_accepted = self.load_folder_with_scan_owned(
+            cached_zip.clone(),
+            None,
+            owner,
+            crate::app::StartupListIntent::InternalHydration(Box::new(restore_intent.clone())),
+        );
+        if !load_accepted {
+            self.abort_smart_archive_open_for_owner(&transition_owner);
+            let current = self.effective_folder();
+            self.transition_favorite_view_for_path(current.as_deref());
+            return false;
+        }
         // load が ★固定 (snapshot lock) の範囲外ガード等でブロックされると current_folder は
         // 変わらない (load_zip_as_folder が current_folder = cache_zip を同期セットする前に
         // return するため)。その場合は override / address / recent を更新しない
@@ -382,7 +409,70 @@ impl App {
         self.archive_source_override = Some(src.clone());
         self.transition_favorite_view_for_path(Some(&src));
         self.commit_main_grid_archive_transition(&transition_owner);
+        self.finish_converted_archive_list_open(&cached_zip, restore_intent);
         true
+    }
+
+    /// Cache hydration materializes the original ZIP prefix but cannot commit before the
+    /// logical source and surface owner are installed.
+    /// Move the original intent into the already-owned enumeration, or finish its synchronous
+    /// adoption after the source-facing tail. No independent pending restore state is created.
+    fn finish_converted_archive_list_open(
+        &mut self,
+        cached_zip: &std::path::Path,
+        restore_intent: crate::app::StartupListIntent,
+    ) {
+        if let Some(pending) = self.zip_enumerate_pending.as_mut()
+            && crate::folder_tree::path_eq(&pending.zip_path, cached_zip)
+        {
+            pending.restore_intent = restore_intent.for_book();
+        } else if self
+            .current_folder
+            .as_ref()
+            .is_some_and(|current| crate::folder_tree::path_eq(current, cached_zip))
+            && self
+                .zip_nav
+                .as_ref()
+                .is_some_and(|nav| crate::folder_tree::path_eq(&nav.tree.zip_path, cached_zip))
+        {
+            // A synchronous enumerate error installs an empty failure surface without a ZIP
+            // navigation tree. Only a proven materialization may finish a semantic adoption.
+            self.finish_main_list_open(restore_intent.for_book());
+        }
+    }
+
+    /// Complete only the source-facing half of a Smart Folder archive open. The common visible
+    /// install already set `current_folder` to the cache ZIP and the logical source override;
+    /// this request carries the effects that the async early return deliberately deferred.
+    pub(crate) fn commit_smart_folder_archive_source(
+        &mut self,
+        commit: crate::app::SmartFolderArchiveCommit,
+    ) {
+        if !self
+            .current_folder
+            .as_ref()
+            .is_some_and(|current| crate::folder_tree::path_eq(current, &commit.cache_path))
+            || !self
+                .archive_source_override
+                .as_ref()
+                .is_some_and(|source| crate::folder_tree::path_eq(source, &commit.source_path))
+        {
+            return;
+        }
+        let source = commit.source_path;
+        self.address = source.to_string_lossy().to_string();
+        if !(self.global_search.active || self.favsearch.active) {
+            self.forget_recent_folder(&commit.cache_path);
+            self.remember_recent_folder(&source);
+        }
+        self.update_active_quick_folder_target(&source);
+        if commit.restore_reading_history {
+            self.reading_history_return_from = Some(source.clone());
+        }
+        if let Some(state) = commit.restore_bookmark_view {
+            self.bookmark_view_state = Some(state);
+        }
+        self.commit_main_grid_archive_transition(&commit.owner);
     }
 
     /// 変換ダイアログを開始する (スキャン fase から)。
@@ -392,12 +482,14 @@ impl App {
         src: PathBuf,
         format: ArchiveFormat,
         auto_fullscreen: bool,
+        restore_intent: crate::app::StartupListIntent,
     ) -> bool {
         self.request_archive_convert_owned(
             src,
             format,
             auto_fullscreen,
             crate::app::OpenRequestOwner::Navigation,
+            restore_intent,
         )
     }
 
@@ -407,6 +499,7 @@ impl App {
         format: ArchiveFormat,
         auto_fullscreen: bool,
         owner: crate::app::OpenRequestOwner,
+        restore_intent: crate::app::StartupListIntent,
     ) -> bool {
         if self.settings.archive_file_handling_ignores_convertible() {
             return false;
@@ -441,6 +534,21 @@ impl App {
                 crate::app::OpenRequestOwner::Navigation => {
                     ArchiveConvertCompletionPolicy::Navigation
                 }
+                crate::app::OpenRequestOwner::CollectionGridPhysical(_) => {
+                    debug_assert!(
+                        false,
+                        "convertible collection items use MainGridArchive owner"
+                    );
+                    ArchiveConvertCompletionPolicy::Navigation
+                }
+                crate::app::OpenRequestOwner::RatingPhysical(_) => {
+                    debug_assert!(false, "convertible Rating items use MainGridArchive owner");
+                    ArchiveConvertCompletionPolicy::Navigation
+                }
+                crate::app::OpenRequestOwner::QuickFolderSwitch(_) => {
+                    debug_assert!(false, "quick-folder switch preflights convertible archives");
+                    ArchiveConvertCompletionPolicy::Navigation
+                }
                 crate::app::OpenRequestOwner::MainGridArchive(intent) => {
                     ArchiveConvertCompletionPolicy::MainGridArchive(intent)
                 }
@@ -452,6 +560,7 @@ impl App {
                 }
             },
             pending_sibling_output: None,
+            restore_intent,
             nav_history_rollback: None,
             auto_fullscreen,
             deferred_fullscreen: None,
@@ -469,6 +578,7 @@ impl App {
         auto_fullscreen: bool,
         fallback_cached_zip: Option<PathBuf>,
         owner: crate::app::OpenRequestOwner,
+        restore_intent: crate::app::StartupListIntent,
     ) -> bool {
         if self.settings.archive_file_handling_ignores_convertible()
             || self.archive_convert.is_some()
@@ -502,6 +612,21 @@ impl App {
                 crate::app::OpenRequestOwner::Navigation => {
                     ArchiveConvertCompletionPolicy::Navigation
                 }
+                crate::app::OpenRequestOwner::CollectionGridPhysical(_) => {
+                    debug_assert!(
+                        false,
+                        "convertible collection items use MainGridArchive owner"
+                    );
+                    ArchiveConvertCompletionPolicy::Navigation
+                }
+                crate::app::OpenRequestOwner::RatingPhysical(_) => {
+                    debug_assert!(false, "convertible Rating items use MainGridArchive owner");
+                    ArchiveConvertCompletionPolicy::Navigation
+                }
+                crate::app::OpenRequestOwner::QuickFolderSwitch(_) => {
+                    debug_assert!(false, "quick-folder switch preflights convertible archives");
+                    ArchiveConvertCompletionPolicy::Navigation
+                }
                 crate::app::OpenRequestOwner::MainGridArchive(intent) => {
                     ArchiveConvertCompletionPolicy::MainGridArchive(intent)
                 }
@@ -513,6 +638,7 @@ impl App {
                 }
             },
             pending_sibling_output: None,
+            restore_intent,
             nav_history_rollback: None,
             auto_fullscreen,
             deferred_fullscreen: None,
@@ -553,6 +679,7 @@ impl App {
             allow_direct_read: false,
             fallback_cached_zip: None,
             completion: ArchiveConvertCompletionPolicy::SiblingZip,
+            restore_intent: crate::app::StartupListIntent::PreservePresentation,
             pending_sibling_output: None,
             nav_history_rollback: None,
             auto_fullscreen: false,
@@ -657,6 +784,34 @@ impl App {
         true
     }
 
+    /// Cancel only the conversion/probe whose typed completion owns this detached loading
+    /// session.  A sibling detached reader (or a later request reusing neither lease nor owner)
+    /// is left untouched.
+    #[cfg(windows)]
+    pub(crate) fn cancel_archive_convert_for_detached_loading_lease(
+        &mut self,
+        lease: crate::app::DetachedSessionLease,
+        reason: &'static str,
+    ) -> bool {
+        let completion = self
+            .archive_convert
+            .as_ref()
+            .map(|state| state.completion.clone());
+        match completion {
+            Some(ArchiveConvertCompletionPolicy::Bookmark(owner))
+                if owner.detached_lease == Some(lease) =>
+            {
+                self.cancel_archive_convert_for_bookmark_request(owner.request_id)
+            }
+            Some(ArchiveConvertCompletionPolicy::DetachedGridArchive(owner))
+                if owner.lease == lease =>
+            {
+                self.cancel_archive_convert_for_navigation(reason)
+            }
+            _ => false,
+        }
+    }
+
     /// A new navigation owns the visible context and supersedes any archive dialog/worker.
     /// Same-folder refreshes are not navigation and intentionally keep the dialog alive.
     pub(crate) fn cancel_archive_convert_for_navigation_to(
@@ -686,14 +841,31 @@ impl App {
             "archive transition cancelled reason={reason} source={}",
             state.src_path.display()
         ));
+        let open_owner = state.completion.open_owner();
         drop(state);
+        if let Some(owner) = open_owner.as_ref() {
+            self.abort_smart_archive_open_for_owner(owner);
+        }
         if let Some(owner) = detached_owner.as_ref() {
-            self.invalidate_detached_grid_archive_open_owner(owner);
+            self.cancel_detached_grid_archive_open_owner(owner, reason);
         }
         if had_deferred {
             self.release_fs_nav_lock();
         }
         true
+    }
+
+    /// Remote acquisition retires requests that can later navigate a local viewer. A sibling
+    /// ZIP conversion only writes its output and does not own a local open.
+    pub(crate) fn cancel_archive_view_open_for_remote_session(&mut self) -> bool {
+        if !self
+            .archive_convert
+            .as_ref()
+            .is_some_and(|state| !state.completion.is_sibling_zip())
+        {
+            return false;
+        }
+        self.cancel_archive_convert_for_navigation("remote_session_acquired")
     }
 
     pub(crate) fn cancel_detached_grid_archive_open_for_replacement(
@@ -725,14 +897,42 @@ impl App {
         self.cancel_bookmark_open_request(owner.request_id, "archive_owner_stale")
     }
 
+    fn discard_stale_main_grid_archive_request(&mut self) -> bool {
+        let owner = self
+            .archive_convert
+            .as_ref()
+            .and_then(|state| state.completion.open_owner());
+        let Some(owner @ crate::app::OpenRequestOwner::MainGridArchive(_)) = owner else {
+            return false;
+        };
+        if self.main_grid_archive_transition_is_current(&owner) {
+            return false;
+        }
+        self.cancel_archive_convert_for_navigation("main_grid_archive_owner_stale")
+    }
+
     /// 毎フレーム呼ばれるダイアログ描画・メッセージ処理のエントリポイント。
     pub(crate) fn show_archive_convert_dialog(&mut self, ctx: &egui::Context) {
+        if self.remote_session_blocks_local_control()
+            && self.cancel_archive_view_open_for_remote_session()
+        {
+            return;
+        }
+        if self.discard_stale_staged_history_archive_conversion() {
+            return;
+        }
+        if self.discard_stale_main_grid_archive_request() {
+            return;
+        }
         if self.discard_stale_archive_bookmark_request() {
             return;
         }
         // 先にメッセージ処理 (ステート遷移)
         self.poll_archive_convert_messages();
 
+        if self.discard_stale_main_grid_archive_request() {
+            return;
+        }
         if self.discard_stale_archive_bookmark_request() {
             return;
         }
@@ -759,8 +959,14 @@ impl App {
             let auto_fs = state.auto_fullscreen;
             let deferred = state.deferred_fullscreen.take();
             let completion = state.completion.clone();
+            let restore_intent = state.restore_intent.clone();
             let nav_history_rollback = state.nav_history_rollback.clone();
             drop(state);
+            if let ArchiveConvertCompletionPolicy::StagedHistory(request_id) = &completion {
+                self.complete_staged_history_archive_conversion(*request_id, src);
+                ctx.request_repaint();
+                return;
+            }
             if crate::perf::is_enabled() {
                 let archive_key = crate::path_key::normalize_keep_drive(&src);
                 crate::perf::event(
@@ -838,13 +1044,24 @@ impl App {
                 }
                 return;
             }
+            if let Some(owner @ crate::app::OpenRequestOwner::MainGridArchive(intent)) =
+                open_owner.as_ref()
+                && matches!(
+                    intent.smart_folder_owner,
+                    crate::app::SmartGridArchiveOwner::Transition(_)
+                )
+            {
+                let _ = self.supply_smart_archive_load_alias(&src, &src, owner);
+                return;
+            }
             if auto_fs {
                 self.pending_auto_fs_open = true;
             }
-            if let Some(owner) = open_owner.as_ref() {
-                self.prepare_main_grid_archive_transition_for_load(owner, &src);
-            }
-            self.load_zip_as_folder_with_input_seq(src.clone(), input_seq);
+            self.load_zip_as_folder_with_input_seq(
+                src.clone(),
+                input_seq,
+                crate::app::StartupListIntent::InternalHydration(Box::new(restore_intent.clone())),
+            );
             let loaded = self
                 .current_folder
                 .as_ref()
@@ -882,6 +1099,9 @@ impl App {
             if self.tag_view.active {
                 self.update_tag_view_address();
             }
+            if loaded {
+                self.finish_converted_archive_list_open(&src, restore_intent);
+            }
             if let Some(deferred) = deferred {
                 let reason = self.reopen_fullscreen_after_folder_nav_load(
                     ctx,
@@ -917,7 +1137,12 @@ impl App {
                     .is_some_and(|current| crate::folder_tree::path_eq(current, &parent))
             {
                 self.select_after_load = Some(output_name);
-                self.load_folder(parent);
+                self.load_folder_with_scan_owned(
+                    parent,
+                    None,
+                    crate::app::OpenRequestOwner::Navigation,
+                    crate::app::StartupListIntent::PreservePresentation,
+                );
             }
             return;
         }
@@ -973,6 +1198,12 @@ impl App {
                     .as_ref()
                     .map(|s| s.completion.clone())
                     .unwrap_or(ArchiveConvertCompletionPolicy::Navigation);
+                let restore_intent = self
+                    .archive_convert
+                    .as_ref()
+                    .expect("pending archive navigation owns its conversion state")
+                    .restore_intent
+                    .clone();
                 if let ArchiveConvertCompletionPolicy::Bookmark(owner) = &completion
                     && !self.bookmark_open_owner_is_current(owner)
                 {
@@ -992,6 +1223,14 @@ impl App {
                     .as_ref()
                     .and_then(|s| s.nav_history_rollback.clone());
                 self.archive_convert = None;
+                if let ArchiveConvertCompletionPolicy::StagedHistory(request_id) = &completion {
+                    if let Some(source) = src {
+                        let _ = source;
+                        self.complete_staged_history_archive_conversion(*request_id, nav);
+                        ctx.request_repaint();
+                    }
+                    return;
+                }
                 if let ArchiveConvertCompletionPolicy::DetachedGridArchive(owner) = &completion {
                     #[cfg(windows)]
                     let outcome = self.open_converted_grid_archive_in_detached_context(
@@ -1053,30 +1292,50 @@ impl App {
                         ),
                         ArchiveConvertCompletionPolicy::Navigation
                         | ArchiveConvertCompletionPolicy::MainGridArchive(_)
-                        | ArchiveConvertCompletionPolicy::Bookmark(_) => {}
+                        | ArchiveConvertCompletionPolicy::Bookmark(_)
+                        | ArchiveConvertCompletionPolicy::StagedHistory(_) => {}
                     }
                     return;
                 };
+                if let Some(source) = src.as_deref()
+                    && matches!(
+                        &open_owner,
+                        crate::app::OpenRequestOwner::MainGridArchive(intent)
+                            if matches!(intent.smart_folder_owner, crate::app::SmartGridArchiveOwner::Transition(_))
+                    )
+                {
+                    let _ = self.supply_smart_archive_load_alias(source, &nav, &open_owner);
+                    return;
+                }
                 if auto_fs {
                     self.pending_auto_fs_open = true;
                 }
                 if let Some(source) = src.as_deref() {
-                    self.authorize_smart_folder_session_alias(source, &nav);
                     // cache ZIP は実装 alias。初回継承値も user-facing source へ入る直前の
                     // 有効状態から採る。
                     self.transition_favorite_view_for_path(Some(source));
                 }
-                self.prepare_main_grid_archive_transition_for_load(&open_owner, &nav);
                 let transition_owner = open_owner.clone();
-                self.load_folder_with_scan_owned(nav.clone(), None, open_owner);
+                let load_accepted = self.load_folder_with_scan_owned(
+                    nav.clone(),
+                    None,
+                    open_owner,
+                    crate::app::StartupListIntent::InternalHydration(Box::new(
+                        restore_intent.clone(),
+                    )),
+                );
+                if !load_accepted {
+                    self.abort_smart_archive_open_for_owner(&transition_owner);
+                }
                 // load が ★固定 (snapshot lock) の範囲外ガード等でブロックされると
                 // current_folder は変わらない。その場合は override / address / recent を
                 // 更新せず、変換ダイアログを開いたときに変えた履歴スタックも巻き戻す
                 // (override と current_folder の不整合・nav スタック残りを防ぐ、Codex P1/P2)。
-                let loaded = self
-                    .current_folder
-                    .as_ref()
-                    .is_some_and(|cur| crate::folder_tree::path_eq(cur, &nav));
+                let loaded = load_accepted
+                    && self
+                        .current_folder
+                        .as_ref()
+                        .is_some_and(|cur| crate::folder_tree::path_eq(cur, &nav));
                 if !loaded {
                     let current = self.effective_folder();
                     self.transition_favorite_view_for_path(current.as_deref());
@@ -1112,6 +1371,7 @@ impl App {
                     self.transition_favorite_view_for_path(Some(&src));
                 }
                 self.commit_main_grid_archive_transition(&transition_owner);
+                self.finish_converted_archive_list_open(&nav, restore_intent);
                 if let ArchiveConvertCompletionPolicy::Bookmark(owner) = &completion {
                     self.begin_bookmark_page_wait(owner);
                 }
@@ -1183,27 +1443,29 @@ impl App {
         };
 
         let mut open = true;
-        egui::Window::new(title)
+        let password_required =
+            matches!(&state.phase, ArchiveConvertPhase::PasswordRequired { .. });
+        let window = egui::Window::new(title)
             .id(egui::Id::new("archive_convert_dialog"))
             .open(&mut open)
             .resizable(false)
             .collapsible(false)
-            .default_pos(dialog_pos)
-            .show(ctx, |ui| {
-                ui.set_min_width(420.0);
+            .default_pos(dialog_pos);
+        let window = if password_required {
+            window
+        } else {
+            window.default_height((ctx.content_rect().height() - 80.0).max(1.0))
+        };
+        window.show(ctx, |ui| {
+                if password_required {
+                    ui.set_min_width(420.0);
+                } else {
+                    ui.set_width(420.0_f32.min((ctx.content_rect().width() - 48.0).max(1.0)));
+                }
 
                 match &state.phase {
                     ArchiveConvertPhase::Scanning => {
-                        ui.label(format!("入力: {src_name}"));
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label("画像エントリを列挙しています…");
-                        });
-                        ui.add_space(6.0);
-                        if ui.button("キャンセル").clicked() {
-                            should_close = true;
-                        }
+                        should_close = draw_archive_status_content(ui, &src_name, ArchiveStatus::Scanning);
                         ctx.request_repaint_after(std::time::Duration::from_millis(100));
                     }
                     ArchiveConvertPhase::PasswordRequired { message, .. } => {
@@ -1264,135 +1526,22 @@ impl App {
                         });
                     }
                     ArchiveConvertPhase::Confirm { summary } => {
-                        if is_sibling_zip {
-                            ui.label(format!(
-                                "{fmt_label} を同じフォルダの同名 ZIP ファイルに変換します。"
-                            ));
-                            ui.label("元ファイルはそのまま残ります。");
-                        } else if is_zip_expand {
-                            ui.label(
-                                "この ZIP には RAR / 7z / LZH などのアーカイブが\
-                                 入れ子になっています。",
-                            );
-                            ui.label(
-                                "中身の画像も表示できるように、入れ子を展開した\
-                                 閲覧用キャッシュを作成します。",
-                            );
-                        } else {
-                            ui.label(format!(
-                                "{fmt_label} を ZIP に変換して閲覧できるようにします。"
-                            ));
-                        }
-                        if !is_sibling_zip {
-                            ui.label(
-                                "元ファイルはそのまま残り、変換したファイルが\
-                                 キャッシュとして作成されます。",
-                            );
-                            ui.label("キャッシュ管理メニューから削除することができます。");
-                        }
-                        if state.password.is_some() {
-                            ui.add_space(4.0);
-                            ui.label(
-                                egui::RichText::new(
-                                    "この変換キャッシュはパスワードなしの ZIP として保存されます。",
-                                )
-                                .color(ui.visuals().warn_fg_color),
-                            );
-                        }
-                        ui.add_space(10.0);
-                        ui.separator();
-                        ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new(format!("ファイル: {src_name}"))
-                                .size(12.0)
-                                .color(ui.visuals().weak_text_color()),
-                        );
-                        let mut info = format!(
-                            "画像ファイル数: {} / 変換後 ZIP の目安: 約 {}",
-                            summary.image_count,
-                            crate::ui_helpers::format_bytes(summary.total_uncompressed_bytes)
-                        );
-                        if summary.nested_archive_count > 0 {
-                            info.push_str(&format!(
-                                " / 入れ子アーカイブ: {} 個 (変換時に展開され、画像数が増えます)",
-                                summary.nested_archive_count
-                            ));
-                        }
-                        ui.label(
-                            egui::RichText::new(info)
-                                .size(12.0)
-                                .color(ui.visuals().weak_text_color()),
-                        );
-                        ui.add_space(10.0);
-                        if !is_sibling_zip {
-                            ui.checkbox(
-                                &mut state.suppress_confirm_next_time,
-                                "次回から表示しない",
-                            );
-                            ui.add_space(6.0);
-                        }
-                        // 直下画像が 0 でも入れ子アーカイブがあれば変換する価値がある
-                        // (中身の画像は変換時に展開されて初めて数えられる)。
-                        let convertible =
-                            summary.image_count > 0 || summary.nested_archive_count > 0;
-                        ui.horizontal(|ui| {
-                            let action_label = if is_sibling_zip {
-                                "ZIP ファイルに変換"
-                            } else {
-                                "変換して開く"
-                            };
-                            if ui
-                                .add_enabled(convertible, egui::Button::new(action_label))
-                                .clicked()
-                            {
-                                start_convert = true;
-                            }
-                            if ui.button("キャンセル").clicked() {
-                                should_close = true;
-                            }
-                        });
-                        if !convertible {
-                            ui.add_space(4.0);
-                            ui.label(
-                                egui::RichText::new(
-                                    "このアーカイブには画像ファイルが含まれていません。",
-                                )
-                                .color(ui.visuals().error_fg_color),
-                            );
-                        }
+                        let action = draw_archive_confirm_content(ui, &src_name, fmt_label,
+                            is_sibling_zip, is_zip_expand, state.password.is_some(), summary,
+                            &mut state.suppress_confirm_next_time);
+                        start_convert = action.0;
+                        should_close = action.1;
                     }
                     ArchiveConvertPhase::Converting { progress, .. } => {
                         let done = progress.files_done.load(Ordering::Relaxed);
                         let total = progress.files_total.load(Ordering::Relaxed).max(1);
                         let bytes = progress.bytes_written.load(Ordering::Relaxed);
-                        let frac = (done as f32 / total as f32).clamp(0.0, 1.0);
-                        ui.label(format!("入力: {src_name}"));
-                        ui.add_space(6.0);
-                        ui.add(egui::ProgressBar::new(frac).show_percentage());
-                        ui.add_space(4.0);
-                        ui.label(format!(
-                            "{} / {} ファイル ({})",
-                            done,
-                            total,
-                            crate::ui_helpers::format_bytes(bytes)
-                        ));
-                        ui.add_space(6.0);
-                        if ui.button("キャンセル").clicked() {
-                            cancel_convert = true;
-                        }
+                        cancel_convert = draw_archive_status_content(ui, &src_name,
+                            ArchiveStatus::Converting { done, total, bytes });
                         ctx.request_repaint_after(std::time::Duration::from_millis(80));
                     }
                     ArchiveConvertPhase::Error { message } => {
-                        ui.label(format!("入力: {src_name}"));
-                        ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new(message.as_str())
-                                .color(ui.visuals().error_fg_color),
-                        );
-                        ui.add_space(6.0);
-                        if ui.button("閉じる").clicked() {
-                            should_close = true;
-                        }
+                        should_close = draw_archive_status_content(ui, &src_name, ArchiveStatus::Error(message));
                     }
                 }
             });
@@ -1430,6 +1579,10 @@ impl App {
                 .archive_convert
                 .as_ref()
                 .and_then(|state| state.nav_history_rollback.clone());
+            let smart_owner = self
+                .archive_convert
+                .as_ref()
+                .and_then(|state| state.completion.open_owner());
             let bookmark_owner = self
                 .archive_convert
                 .as_ref()
@@ -1446,6 +1599,9 @@ impl App {
                 .and_then(|state| state.deferred_fullscreen.take())
                 .is_some();
             self.archive_convert = None;
+            if let Some(owner) = smart_owner.as_ref() {
+                self.abort_smart_archive_open_for_owner(owner);
+            }
             if let Some(owner) = bookmark_owner {
                 self.cancel_bookmark_open_request(owner.request_id, "archive_dialog_closed");
             }
@@ -1535,10 +1691,14 @@ impl App {
                 | ArchiveConvertMsg::SiblingConvertDone(Err(ConvertError::Cancelled)) => {
                     // User cancellation closes every phase of the shared archive lifecycle.
                     let nav_history_rollback = state.nav_history_rollback.clone();
+                    let smart_owner = state.completion.open_owner();
                     let had_deferred = state.deferred_fullscreen.is_some();
                     let bookmark_owner = state.completion.bookmark_owner().cloned();
                     let detached_owner = state.completion.detached_grid_archive_owner().cloned();
                     self.archive_convert = None;
+                    if let Some(owner) = smart_owner.as_ref() {
+                        self.abort_smart_archive_open_for_owner(owner);
+                    }
                     if let Some(owner) = bookmark_owner {
                         self.cancel_bookmark_open_request(
                             owner.request_id,
@@ -1906,6 +2066,7 @@ mod tests {
             allow_direct_read: false,
             fallback_cached_zip: None,
             completion: ArchiveConvertCompletionPolicy::Navigation,
+            restore_intent: crate::app::StartupListIntent::PageContinuation,
             pending_sibling_output: None,
             nav_history_rollback: None,
             auto_fullscreen: false,
@@ -1924,17 +2085,153 @@ mod tests {
         assert_eq!(password, "mivtest2026");
         assert_eq!(state.password.as_deref(), Some("mivtest2026"));
         assert!(state.password_input.is_empty());
+        assert_eq!(
+            state.restore_intent,
+            crate::app::StartupListIntent::PageContinuation
+        );
     }
 
     #[test]
     fn prepare_password_retry_keeps_convert_resume() {
         let mut state = state_for_password_resume(ArchivePasswordResume::Convert);
+        state.restore_intent = crate::app::StartupListIntent::RestoreList {
+            target: crate::settings::StartupListTarget::PhysicalList {
+                logical_path: state.src_path.clone(),
+                zip_prefix: Some("chapter/".into()),
+            },
+            cursor: Some(crate::settings::ListCursorHint {
+                name: "003.jpg".into(),
+                rows_above: Some(2),
+            }),
+        };
+        let restore_intent = state.restore_intent.clone();
         let (resume, password) = prepare_archive_password_retry(&mut state).unwrap();
 
         assert_eq!(resume, ArchivePasswordResume::Convert);
         assert_eq!(password, "mivtest2026");
         assert_eq!(state.password.as_deref(), Some("mivtest2026"));
         assert!(state.password_input.is_empty());
+        assert_eq!(state.restore_intent, restore_intent);
+    }
+
+    #[test]
+    fn converted_archive_hands_intent_to_existing_enumeration_without_committing() {
+        let mut app = crate::app::setup_app_for_test();
+        let before = app.settings.startup_list_restore.clone();
+        let cached = PathBuf::from("C:/cache/converted.zip");
+        let (_tx, rx) = mpsc::channel();
+        app.zip_enumerate_pending = Some(crate::app::ZipEnumeratePending {
+            zip_path: cached.clone(),
+            restore_intent: crate::app::StartupListIntent::InternalInstall,
+            input_seq: 7,
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx,
+        });
+        let intent = crate::app::StartupListIntent::RestoreList {
+            target: crate::settings::StartupListTarget::PhysicalList {
+                logical_path: PathBuf::from("C:/books/source.rar"),
+                zip_prefix: Some("chapter/".into()),
+            },
+            cursor: None,
+        };
+        app.finish_converted_archive_list_open(&cached, intent.clone());
+        assert_eq!(
+            app.zip_enumerate_pending.as_ref().unwrap().restore_intent,
+            intent
+        );
+        assert_eq!(app.settings.startup_list_restore, before);
+    }
+
+    #[test]
+    fn synchronous_archive_hydration_materializes_restored_prefix_before_source_commit() {
+        use crate::app::StartupListIntent;
+        use crate::settings::{ListCursorHint, StartupListRestore, StartupListTarget};
+
+        for cached in [true, false] {
+            let mut app = crate::app::setup_app_for_test();
+            let tmp = tempfile::tempdir().unwrap();
+            let source = tmp.path().join("source.rar");
+            let backing = if cached {
+                tmp.path().join("cache.zip")
+            } else {
+                source.clone()
+            };
+            let before = app.settings.startup_list_restore.clone();
+            let target = StartupListTarget::PhysicalList {
+                logical_path: source.clone(),
+                zip_prefix: Some("chapter/".into()),
+            };
+            let cursor = ListCursorHint {
+                name: "003.jpg".into(),
+                rows_above: Some(0),
+            };
+            let intent = StartupListIntent::RestoreList {
+                target: target.clone(),
+                cursor: Some(cursor.clone()),
+            };
+            let enumeration = crate::zip_loader::ZipEnumeration {
+                entries: ["cover.jpg", "chapter/001.jpg", "chapter/003.jpg"]
+                    .into_iter()
+                    .map(|entry_name| crate::zip_loader::ZipImageEntry {
+                        entry_name: entry_name.into(),
+                        uncompressed_size: 1,
+                        mtime: 0,
+                    })
+                    .collect(),
+                has_foreign_archives: false,
+                legacy_renames: Vec::new(),
+            };
+
+            // Prepared enumeration exercises the production synchronous finalize path without
+            // spawning a RAR/ZIP scanner or relying on a rare OS thread-spawn failure.
+            app.load_zip_as_folder_prepared(
+                backing.clone(),
+                enumeration,
+                StartupListIntent::InternalHydration(Box::new(intent.clone())),
+            );
+            assert!(app.zip_enumerate_pending.is_none());
+            assert_eq!(
+                app.zip_nav.as_ref().unwrap().current(),
+                &["chapter".to_string()]
+            );
+            assert_eq!(
+                app.items.iter().map(|item| item.name()).collect::<Vec<_>>(),
+                ["001.jpg", "003.jpg"]
+            );
+            assert_eq!(
+                app.settings.startup_list_restore, before,
+                "hydration must not commit the backing alias"
+            );
+
+            if cached {
+                app.archive_source_override = Some(source.clone());
+            }
+            app.finish_converted_archive_list_open(&backing, intent);
+            assert_eq!(app.effective_folder().as_ref(), Some(&source));
+            assert_eq!(app.selected, Some(1));
+            assert_eq!(
+                app.settings.startup_list_restore,
+                Some(StartupListRestore::V1 {
+                    target,
+                    cursor: Some(cursor)
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn converted_archive_failed_materialization_keeps_restore_record() {
+        let mut app = crate::app::setup_app_for_test();
+        let before = app.settings.startup_list_restore.clone();
+        let cached = PathBuf::from("C:/cache/converted.zip");
+        app.current_folder = Some(cached.clone());
+        app.archive_source_override = Some(PathBuf::from("C:/books/source.rar"));
+        app.zip_nav = None;
+        app.finish_converted_archive_list_open(
+            &cached,
+            crate::app::StartupListIntent::ExplicitList,
+        );
+        assert_eq!(app.settings.startup_list_restore, before);
     }
 
     #[test]
@@ -1989,4 +2286,233 @@ mod tests {
             PathBuf::from(r"C:\books\set.zip")
         );
     }
+}
+
+// Drawing only: no archive I/O, cancellation, navigation or worker ownership.
+fn draw_archive_confirm_content(
+    ui: &mut egui::Ui,
+    src_name: &str,
+    fmt_label: &str,
+    is_sibling_zip: bool,
+    is_zip_expand: bool,
+    password_present: bool,
+    summary: &crate::archive_converter::ArchiveImageSummary,
+    suppress_confirm_next_time: &mut bool,
+) -> (bool, bool) {
+    let convertible = summary.image_count > 0 || summary.nested_archive_count > 0;
+    let action = if is_sibling_zip {
+        "ZIP ファイルに変換"
+    } else {
+        "変換して開く"
+    };
+    let footer = super::startup_dialog_footer_height(ui, &[action, "キャンセル"], 12.0);
+    super::startup_dialog_scroll_body(ui, "archive_confirm_body", footer, |ui| {
+        if is_sibling_zip {
+            ui.label(format!(
+                "{fmt_label} を同じフォルダの同名 ZIP ファイルに変換します。"
+            ));
+            ui.label("元ファイルはそのまま残ります。");
+        } else if is_zip_expand {
+            ui.label(
+                "この ZIP には RAR / 7z / LZH などのアーカイブが\
+                                 入れ子になっています。",
+            );
+            ui.label(
+                "中身の画像も表示できるように、入れ子を展開した\
+                                 閲覧用キャッシュを作成します。",
+            );
+        } else {
+            ui.label(format!(
+                "{fmt_label} を ZIP に変換して閲覧できるようにします。"
+            ));
+        }
+        if !is_sibling_zip {
+            ui.label(
+                "元ファイルはそのまま残り、変換したファイルが\
+                                 キャッシュとして作成されます。",
+            );
+            ui.label("キャッシュ管理メニューから削除することができます。");
+        }
+        if password_present {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "この変換キャッシュはパスワードなしの ZIP として保存されます。",
+                )
+                .color(ui.visuals().warn_fg_color),
+            );
+        }
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(format!("ファイル: {src_name}"))
+                .size(12.0)
+                .color(ui.visuals().weak_text_color()),
+        );
+        let mut info = format!(
+            "画像ファイル数: {} / 変換後 ZIP の目安: 約 {}",
+            summary.image_count,
+            crate::ui_helpers::format_bytes(summary.total_uncompressed_bytes)
+        );
+        if summary.nested_archive_count > 0 {
+            info.push_str(&format!(
+                " / 入れ子アーカイブ: {} 個 (変換時に展開され、画像数が増えます)",
+                summary.nested_archive_count
+            ));
+        }
+        ui.label(
+            egui::RichText::new(info)
+                .size(12.0)
+                .color(ui.visuals().weak_text_color()),
+        );
+        ui.add_space(10.0);
+        if !is_sibling_zip {
+            ui.checkbox(suppress_confirm_next_time, "次回から表示しない");
+            ui.add_space(6.0);
+        }
+
+        if !convertible {
+            ui.label(
+                egui::RichText::new("このアーカイブには画像ファイルが含まれていません。")
+                    .color(ui.visuals().error_fg_color),
+            );
+        }
+    });
+    ui.add_space(6.0);
+    ui.separator();
+    let mut start = false;
+    let mut close = false;
+    ui.horizontal_wrapped(|ui| {
+        let label = if is_sibling_zip {
+            "ZIP ファイルに変換"
+        } else {
+            "変換して開く"
+        };
+        start = ui
+            .add_enabled(convertible, egui::Button::new(label))
+            .clicked();
+        close = ui.button("キャンセル").clicked();
+    });
+    (start, close)
+}
+
+enum ArchiveStatus<'a> {
+    Scanning,
+    Converting { done: u64, total: u64, bytes: u64 },
+    Error(&'a str),
+}
+
+fn draw_archive_status_content(
+    ui: &mut egui::Ui,
+    src_name: &str,
+    status: ArchiveStatus<'_>,
+) -> bool {
+    let failed = matches!(status, ArchiveStatus::Error(_));
+    let footer = super::startup_dialog_footer_height(
+        ui,
+        &[if failed {
+            "閉じる"
+        } else {
+            "キャンセル"
+        }],
+        12.0,
+    );
+    super::startup_dialog_scroll_body(ui, "archive_status_body", footer, |ui| {
+        ui.label(format!("入力: {src_name}"));
+        ui.add_space(6.0);
+        match status {
+            ArchiveStatus::Scanning => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("画像エントリを列挙しています…");
+                });
+            }
+            ArchiveStatus::Converting { done, total, bytes } => {
+                ui.add(
+                    egui::ProgressBar::new((done as f32 / total as f32).clamp(0.0, 1.0))
+                        .show_percentage(),
+                );
+                ui.add_space(4.0);
+                ui.label(format!(
+                    "{} / {} ファイル ({})",
+                    done,
+                    total,
+                    crate::ui_helpers::format_bytes(bytes)
+                ));
+            }
+            ArchiveStatus::Error(message) => {
+                ui.label(egui::RichText::new(message).color(ui.visuals().error_fg_color));
+            }
+        }
+    });
+    ui.add_space(6.0);
+    ui.separator();
+    ui.button(if failed {
+        "閉じる"
+    } else {
+        "キャンセル"
+    })
+    .clicked()
+}
+
+pub(super) fn draw_archive_startup_snapshot_fixture(ctx: &egui::Context, kind: &str) {
+    let source = format!("{}.7z", "長い書庫のファイル名".repeat(80));
+    let title = match kind {
+        "archive_scanning" => "7z を読み込み中...",
+        "archive_converting" => "7z を ZIP に変換中",
+        "archive_error" => "変換エラー",
+        _ => "7z を ZIP に変換",
+    };
+    egui::Window::new(title)
+        .id(egui::Id::new("archive_convert_dialog"))
+        .open(&mut true)
+        .resizable(false)
+        .collapsible(false)
+        .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
+        .default_height((ctx.content_rect().height() - 80.0).max(1.0))
+        .show(ctx, |ui| {
+            ui.set_width(420.0_f32.min((ctx.content_rect().width() - 48.0).max(1.0)));
+            match kind {
+                "archive_confirm" | "archive_empty" | "archive_sibling" => {
+                    let summary = crate::archive_converter::ArchiveImageSummary {
+                        image_count: if kind == "archive_empty" { 0 } else { 40 },
+                        total_uncompressed_bytes: 10_000_000,
+                        nested_archive_count: 0,
+                    };
+                    draw_archive_confirm_content(
+                        ui,
+                        &source,
+                        "7z",
+                        kind == "archive_sibling",
+                        false,
+                        false,
+                        &summary,
+                        &mut false,
+                    );
+                }
+                "archive_scanning" => {
+                    draw_archive_status_content(ui, &source, ArchiveStatus::Scanning);
+                }
+                "archive_converting" => {
+                    draw_archive_status_content(
+                        ui,
+                        &source,
+                        ArchiveStatus::Converting {
+                            done: 10,
+                            total: 40,
+                            bytes: 2_000_000,
+                        },
+                    );
+                }
+                "archive_error" => {
+                    draw_archive_status_content(
+                        ui,
+                        &source,
+                        ArchiveStatus::Error(&"書庫の読み込みエラー。".repeat(160)),
+                    );
+                }
+                _ => unreachable!(),
+            }
+        });
 }

@@ -49,6 +49,8 @@
         <a href="fullscreen.html">フルスクリーン表示</a>
         <a href="video.html">動画再生</a>
         <a href="music.html">音楽再生</a>
+        <a href="effetune.html">音響調整 (EffeTune)</a>
+        <a href="effetune/index.html" class="sub">エフェクトの説明書</a>
         <a href="adjustment.html">画像補正</a>
         <a href="local-adjustment.html">補正レイヤー</a>
         <a href="analysis.html">画像分析モード</a>
@@ -60,6 +62,7 @@
         <a href="external-tools.html">外部ツール連携</a>
         <a href="tags.html">タグ機能</a>
         <a href="books.html">製本・本棚</a>
+        <a href="collections.html">コレクション</a>
         <a href="search.html" class="active">検索機能</a>
         <a href="remote.html">リモート閲覧</a>
         <a href="shortcuts.html">キーボードショートカット</a>
@@ -78,7 +81,7 @@
     <h1 class="page-title">検索機能</h1>
     <p class="page-desc">
       mImageViewer には 4 種類の検索モード (<kbd>Ctrl</kbd>+<kbd>S</kbd> / <kbd>Ctrl</kbd>+<kbd>F</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd> / <kbd>Ctrl</kbd>+<kbd>T</kbd>) があります。
-      「S はフォルダ・ZIP・PDF を探す / G は画像・PDF・動画・音声 1 件ずつを探す / F は今見ている場所を絞る / T はタグで探す」と覚えると使い分けが簡単です。
+      「S はフォルダ・ZIP・PDF・EPUB を探す / G は画像・PDF・EPUB・動画・音声 1 件ずつを探す / F は今見ている場所を絞る / T はタグで探す」と覚えると使い分けが簡単です。
     </p>
 
     <h2 id="overview">1. 4 つの検索モードの使い分け</h2>
@@ -98,7 +101,7 @@
           <tr>
             <td><kbd>Ctrl</kbd>+<kbd>S</kbd></td>
             <td><strong>コンテナ検索</strong></td>
-            <td>お気に入り配下の<strong>フォルダ / ZIP / PDF</strong></td>
+            <td>お気に入り配下の<strong>フォルダ / ZIP / PDF / EPUB</strong></td>
             <td>名前のみ</td>
             <td>「あのフォルダ、どこに置いたっけ?」をフォルダ名・ファイル名で呼び出す</td>
           </tr>
@@ -112,8 +115,8 @@
           <tr>
             <td><kbd>Ctrl</kbd>+<kbd>G</kbd></td>
             <td><strong>アイテム検索</strong></td>
-            <td>お気に入り全体の<strong>画像 / PDF / 動画 / 音声</strong></td>
-            <td>画像・PDF・動画はファイル名と各種メタ情報、音声はファイル名</td>
+            <td>お気に入り全体の<strong>画像 / PDF / EPUB / 動画 / 音声</strong></td>
+            <td>画像・PDF・動画はファイル名と各種メタ情報、EPUB・音声はファイル名</td>
             <td>お気に入り横断で画像やメディアを掘り出す</td>
           </tr>
           <tr>
@@ -132,7 +135,7 @@
       <div class="box-body">
         <strong>どれを使えばいい?</strong>
         <ul>
-          <li>フォルダ・ZIP・PDF を名前で探したい → <kbd>Ctrl</kbd>+<kbd>S</kbd> (コンテナ検索)</li>
+          <li>フォルダ・ZIP・PDF・EPUB を名前で探したい → <kbd>Ctrl</kbd>+<kbd>S</kbd> (コンテナ検索)</li>
           <li>今開いている場所の中で絞り込みたい → <kbd>Ctrl</kbd>+<kbd>F</kbd> (現在地フィルタ)</li>
           <li>お気に入り全体から画像・動画・音声 1 件を見つけたい → <kbd>Ctrl</kbd>+<kbd>G</kbd> (アイテム検索)</li>
           <li>タグで横断的に探したい → <kbd>Ctrl</kbd>+<kbd>T</kbd> (タグビュー)</li>
@@ -141,7 +144,7 @@
     </div>
 
     <h2 id="ctrl-s">2. Ctrl+S: コンテナ検索</h2>
-    <p>お気に入りに登録したルート配下の<strong>フォルダ / ZIP / PDF の名前</strong>を横断検索します。
+    <p>お気に入りに登録したルート配下の<strong>フォルダ / ZIP / PDF / EPUB の名前</strong>を横断検索します。
     動画はコンテナ (フォルダ・アーカイブ) ではないため対象外です。過去に訪れたフォルダや
     よく使うアーカイブを名前で素早く呼び出すのに向いています。</p>
 
@@ -165,7 +168,7 @@
     <h3>絞り込みフィルタ</h3>
     <ul>
       <li><strong>お気に入り</strong>: 「すべて」または単一のお気に入り配下に絞り込み。コンテナ索引 ON のお気に入りだけが候補に出ます。</li>
-      <li><strong>種別</strong>: <strong>すべて / フォルダ / ZIP / PDF</strong> から 1 つ選んで絞り込み。</li>
+      <li><strong>種別</strong>: <strong>すべて / フォルダ / ZIP / PDF・EPUB</strong> から 1 つ選んで絞り込み。</li>
       <li><strong>OR 検索</strong>: <a href="#or-mode">後述</a>の OR モードに切り替え。</li>
     </ul>
 
@@ -183,11 +186,12 @@
     <h3>アイテム種別ごとの絞り込みルール</h3>
     <p>現在地フィルタはグリッドに表示されているすべての種類のアイテムを対象にします:</p>
     <ul>
-      <li><strong>フォルダ / ZIP / PDF ファイル</strong>: ファイル名 (basename) でマッチ判定します。</li>
+      <li><strong>フォルダ / ZIP / PDF / EPUB ファイル</strong>: ファイル名でマッチ判定します。</li>
       <li><strong>画像 / 動画</strong>: 「検索対象」の設定に応じて、ファイル名・EXIF・XMP・AI プロンプト・PDF メタ・動画メタ・サイドカーを検索します。</li>
       <li><strong>PDF ファイル</strong>: ファイル名に加え、検索対象が「PDF メタ情報」または「すべて」のときはタイトル・著者・件名・キーワードも対象になります。</li>
+      <li><strong>EPUB ファイル</strong>: ファイル名のみが対象です。本の中のタイトル・著者は検索しません。</li>
     </ul>
-    <p>「検索対象」を EXIF など画像専用の次元に設定すると、その情報を持たないフォルダ・ZIP・PDF は
+    <p>「検索対象」を EXIF など画像専用の次元に設定すると、その情報を持たないフォルダ・ZIP・PDF・EPUB は
     すべて非表示になります。これは意図どおりの動作です (「EXIF で絞った場合は画像だけ残る」)。</p>
     <p>マッチ件数は検索バーに「<strong>X/Y 件</strong>」と表示されます。すべての可視マッチをカウントします。</p>
 
@@ -196,20 +200,21 @@
     ZIP 内の画像は AI プロンプト・EXIF などのメタ情報を逐次読み取る仕組みを持たないため、ファイル名で素早く絞り込む用途に特化しています。
     I/O なしで即座に動作するため、大きなアーカイブでも快適に使えます。</p>
 
-    <h3>PDF ページを表示中の場合</h3>
-    <p>PDF を開いてページ一覧を表示しているときは、<kbd>Ctrl</kbd>+<kbd>F</kbd> は<strong>無効</strong>になります (ショートカット無反応・検索バーは開きません)。
-    PDF のページは連番の名前しか持たないため、絞り込んでも得られる情報がほとんどないためです。</p>
+    <h3>PDF / EPUB のページを表示中の場合</h3>
+    <p>PDF / EPUB を開いてページ一覧を表示しているときは、<kbd>Ctrl</kbd>+<kbd>F</kbd> は<strong>無効</strong>になります (ショートカット無反応・検索バーは開きません)。
+    ページは連番の名前しか持たないため、絞り込んでも得られる情報がほとんどないためです。</p>
 
     <h2 id="ctrl-g">4. Ctrl+G: アイテム検索</h2>
     <p>メニュー「お気に入り」→「アイテム検索 (<kbd>Ctrl</kbd>+<kbd>G</kbd>)」でお気に入り全体を
     横断検索します。数万件規模でも全文索引による高速検索で、即座にヒット件数と候補が表示されます。
-    画像・PDF・動画・音声が対象で、ZIP は対象外です (ZIP を探すには Ctrl+S を使います)。
-    音声はファイル名で検索でき、曲名やアーティストなどの埋め込み情報は検索対象になりません。</p>
+    画像・PDF・EPUB・動画・音声が対象で、ZIP は対象外です (ZIP を探すには Ctrl+S を使います)。
+    EPUB と音声はファイル名で検索できます。EPUB 内のタイトル・著者や、音声の曲名・アーティストなどの埋め込み情報は検索対象になりません。</p>
 
     <ol>
       <li>任意のタイミングで <kbd>Ctrl</kbd>+<kbd>G</kbd> を押すと画面上部に検索バーが出ます。</li>
       <li>キーワードを入力すると 300ms のデバウンス後に自動実行されます。結果が確定するまでは、
-          検索バーのヒット件数に「検索中」と表示されます。</li>
+          検索バーのヒット件数に「検索中」と表示され、アドレス欄と空の結果画面には
+          確認済みの件数が表示されます。</li>
       <li>結果は「一覧」または「集約」で表示されます (<a href="#results">後述</a>)。</li>
       <li>× ボタンまたは <kbd>Esc</kbd> で閉じて元のフォルダに戻ります。</li>
     </ol>
@@ -319,8 +324,8 @@
         </thead>
         <tbody>
           <tr><td>お気に入り</td><td>◯</td><td>—</td><td>◯</td></tr>
-          <tr><td>種別 (フォルダ/ZIP/PDF)</td><td>◯</td><td>—</td><td>—</td></tr>
-          <tr><td>種別 (画像/PDF/動画/音声)</td><td>—</td><td>—</td><td>◯</td></tr>
+          <tr><td>種別 (フォルダ/ZIP/PDF・EPUB)</td><td>◯</td><td>—</td><td>—</td></tr>
+          <tr><td>種別 (画像/PDF・EPUB/動画/音声)</td><td>—</td><td>—</td><td>◯</td></tr>
           <tr><td>検索対象 (ファイル名/EXIF/XMP/…)</td><td>—</td><td>◯</td><td>◯</td></tr>
           <tr><td>集約トグル</td><td>—</td><td>—</td><td>◯</td></tr>
           <tr><td>OR 検索チェック</td><td>◯</td><td>◯</td><td>◯</td></tr>
@@ -334,11 +339,11 @@
     のお気に入りだけが候補に出ます。</p>
 
     <h3>種別 (Ctrl+S 専用)</h3>
-    <p><strong>すべて / フォルダ / ZIP ファイル / PDF ファイル</strong>から 1 つを選んで絞り込みます。
-    「PDF だけ探したい」「フォルダだけ一覧したい」といった場面で使います。</p>
+    <p><strong>すべて / フォルダ / ZIP ファイル / PDF・EPUB ファイル</strong>から 1 つを選んで絞り込みます。
+    「本だけ探したい」「フォルダだけ一覧したい」といった場面で使います。</p>
 
     <h3>種別 (Ctrl+G 専用)</h3>
-    <p><strong>画像 / PDF ファイル / 動画ファイル / 音声ファイル</strong>から 1 つを選んで絞り込みます。
+    <p><strong>画像 / PDF・EPUB ファイル / 動画ファイル / 音声ファイル</strong>から 1 つを選んで絞り込みます。
     「PDF のタイトルだけで検索したい」「音声ファイルだけに絞りたい」といった用途に使います。</p>
 
     <h3 id="target">検索対象 (Ctrl+F / Ctrl+G 共通)</h3>
@@ -348,7 +353,8 @@
       <li><strong>EXIF</strong>: カメラ本体の撮影情報 (メーカー・モデル・レンズ・絞り etc.)</li>
       <li><strong>XMP ツイート情報</strong>: ローカルファイルに埋め込まれたツイート本文・投稿者・URL</li>
       <li><strong>AI プロンプト (PNG)</strong>: Stable Diffusion などが PNG tEXt に埋め込んだプロンプト
-          (Negative Prompt は自動で除外)</li>
+          (Negative Prompt は自動で除外)。ComfyUI 画像では生成に使われたと確認できる文を優先し、
+          ワイルドカードの候補一覧など生成前のテンプレートは検索対象から除外します</li>
       <li><strong>PDF メタ情報</strong>: PDF のタイトル / 著者 / 件名 / キーワード</li>
       <li><strong>動画メタ情報</strong>: FFmpeg が読める動画のタイトル / 作者 / 説明 / URL / チャプター名</li>
       <li><strong>サイドカー</strong>: 画像と同じ場所に置かれた<strong>同名の JSON / テキストファイル</strong>
@@ -392,7 +398,7 @@
     </ul>
 
     <h2 id="search-index">9. 検索索引の作成と保守</h2>
-    <p>mImageViewer は 2 種類の索引を持ちます。どちらも<strong>既定では OFF</strong>で、
+    <p>mImageViewer は 3 種類の索引を持ちます。いずれも<strong>既定では OFF</strong>で、
     お気に入りダイアログで個別に ON にする必要があります。</p>
 
     <div class="scroll-x">
@@ -413,6 +419,12 @@
             <td>Ctrl+G (アイテム検索)</td>
             <td>OFF</td>
           </tr>
+          <tr>
+            <td><strong>別バージョン索引</strong></td>
+            <td>同じ絵を照合するための情報</td>
+            <td>フルスクリーン右パネルの「類似」</td>
+            <td>OFF</td>
+          </tr>
         </tbody>
       </table>
     </div>
@@ -420,8 +432,8 @@
     <h3>ON にする手順</h3>
     <ol>
       <li>メニュー「お気に入り」→「編集」でお気に入りダイアログを開く。</li>
-      <li>お気に入りごとに並んだ「コンテナ索引」「アイテム索引」のチェックボックスを ON にする
-          (追加直後の既定は両方 OFF)。</li>
+      <li>お気に入りごとに並んだ「コンテナ索引」「アイテム索引」「別バージョン索引」から、使うものを ON にする
+          (追加直後の既定はいずれも OFF)。</li>
       <li>ON にしたお気に入りは、その場で配下を再帰的に走査して索引を作成します。
           以降は自動監視でファイル追加/削除/変更を反映します。</li>
     </ol>
@@ -430,19 +442,21 @@
     <p>初期スキャン中は次の場所で進捗を確認できます:</p>
     <ul>
       <li><strong>ウィンドウタイトルバー</strong>: <code>(インデックス更新中)</code> がサフィックスに出ます
-          (コンテナ索引・アイテム索引のどちらかがスキャン実行中なら表示)。</li>
+          (いずれかの索引がスキャン実行中なら表示)。</li>
       <li><strong>お気に入りダイアログ</strong>: 各お気に入り行にインライン状態
-          (<code>⏳ 起動中</code> / <code>⏳ スキャン中</code> / <code>✅</code> 等) が出ます。</li>
+          (<code>⏳ 起動中</code> / <code>⏳ スキャン中</code> / <code>✅</code> 等) が出ます。
+          詳しい処理件数と確認中の場所に加え、別バージョン索引の登録件数、最終更新、
+          読み込めなかった項目の内訳は、同じ画面の「バックグラウンドインデクサ」に表示されます。</li>
     </ul>
-    <p>大容量お気に入り (数万枚) で初回は数分〜数十分かかる場合があります。スキャン中に
+    <p>最初の索引作成には長い時間がかかる場合があります。バックグラウンドで進み、途中で
     mImageViewer を終了しても、次回起動時に続きから再開されます。</p>
 
     <h3>索引の再構築</h3>
     <p>正常運用では自動監視で同期されるため、手動再構築は通常不要です。
     それでも索引が壊れた / 怪しいと感じる場合:</p>
     <ul>
-      <li><strong>チェックボックス OFF → ON</strong>: お気に入りダイアログでチェックを一度 OFF にして
-          ON に戻すと、配下を再度フル走査します (該当お気に入りだけ)。</li>
+      <li><strong>チェックボックス OFF → ON</strong>: お気に入りダイアログでチェックを OFF にすると、
+          該当お気に入りの索引データを削除します。ON に戻すと、配下を再度フル走査します。</li>
       <li><strong>索引ファイル削除 → 再起動</strong>: 以下のファイル / フォルダを削除して
           mImageViewer を再起動すると、ON にしている全お気に入りが初期スキャンからやり直します。
           <ul>

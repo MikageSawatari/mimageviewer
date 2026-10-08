@@ -1,0 +1,16 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.15s
+     Running unittests src\lib.rs (vendor\egui-wgpu\target\debug\deps\egui_wgpu-5552ce762e082ba3.exe)
+
+running 9 tests
+test mipmap::tests::mip_count_reaches_one_by_one ... ok
+test mipmap::tests::mip_texel_count_uses_exact_level_dimensions ... ok
+test renderer::renderer_impl_send_sync ... ok
+test wgpu_config_impl_send_sync ... ok
+test renderer::image_sampling_uniform_uses_base_renderer_layout ... ok
+test renderer::egui_shader_parses_and_validates ... ok
+test winit::tests::paint_and_update_textures_delivers_set_and_free_without_surface ... ok
+test winit::tests::skipped_outcome_finalizes_texture_free ... ok
+test winit::tests::surface_recreated_outcome_finalizes_texture_free ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.61s
+

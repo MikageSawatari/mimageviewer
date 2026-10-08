@@ -500,6 +500,59 @@ DB アクセスは行わない。
 現在フォルダ削除は該当 `folder_key`、古いキャッシュ削除は `updated_at` が指定日数より
 古い行、全削除は全行を削除する。
 
+#### レーティング一覧のsession位置と比率 (§1.328、2026-10-07)
+
+★一覧は内容依存のため、引き続き永続path cacheの対象にしない。一方、同じsession内の
+履歴復帰では、選択キー・pixel scroll・その座標を決めた確定比率を一緒に保持する。
+`TopLevelGridView` の★段別 `RatingGridPosition` (最大5件) が単一ownerで、既存の
+`ViewerContextBundle` の交換に伴って移動する。別contextへのcloneでは持ち出さず、
+「場所を忘れる」で消す。起動復元の `StartupListIntent` の運搬・採用とは独立する。
+
+保存は既存の `save_leaving_folder_grid_position` から同じRating保存helperへ接続する。
+Folder/PDFの採用とZIPの先出し表示が同じhelperを使い、ZIP列挙待ちの空の旧一覧で
+保存済み位置を上書きしない。★段変更では旧surfaceの★数、物理採用でsurfaceが先に
+Folderへ変わった場合は旧itemsのrows stampを使う。選択キーは置換前itemsから取り、
+新しく準備されたrows/indexを移動元として使わない。SLIを通らない明示Rating退出と
+ドライブ一覧への移動も、sourceを消す前に同じhelperを呼ぶ。
+
+prepared/legacy Rating installは `VisibleInstallAuthority::Rating { stars }` を渡す。
+その★段の確定比率とsample数だけを `SidecarLoadContinuation.auto_aspect_seed` に運び、
+`reset_and_seed_auto_aspect_with_seed` がreset後・catalog seed前に既存cacheと同じ
+`current` / `cached_sample_gate` を復元する。初回描画前に比率が揃い、install後に同じownerの
+scroll/選択キーを復元する。replay/Backspaceのopened-path選択は引き続き最後に優先する。
+Auto OFFではseedを使わず、利用者の手動比率を優先する。
+
+Smart Folderは元items/thumbs自体を戻すため `AutoAspectState` 全体を保持するが、Ratingは
+rowsを毎回再構築する。Ratingでは古いindex sample・streak・切替予算を復元しない。
+同じ行キーでも代表画像・pin・内容が変わり得るため、新世代の実測で前回比率を検証する。
+membership減少時のsample gateのclipも既存判定を使う。全stateのremapや新しい再試行・
+modalを追加する案は採らず、既存seed/ゲートと成功採用ownerへまとめて簡素化した。
+
+修正前の描画回帰では、cold catalogの復帰で一度可視化した下方の選択行が、後着sampleの
+Square→3:4切替と先頭行anchorによって画面外へ出た。toolbar ←相当のhandler、→後の←、
+Backspaceで3件ともvalid red。実機ログの十分なwarm seedによる初回切替は選択復元より前なので、
+そのログだけで実機報告の直接原因まで断定しない。縦長fixtureの実アプリ確認は別途必要。
+
+同型調査の範囲: bookmarksはstable synthetic pathの永続cache、Smart Folderはresident layout、
+CollectionはID別prepared seedを既に所有する。検索結果(Ctrl+S/G/★固定)とTagはcache対象外で、
+履歴←/→を拒否し、Backspaceでは結果を再構築する。検索由来Snapshotはpixel scroll/itemsを
+戻すが比率を保存しない。これらにはRatingの★段別ownerを流用せず、検索/Snapshotの
+戻りownerへlayoutをまとめる設計が残る。閲覧履歴・サブ展開もcache対象外で、既存の
+opened-row anchor不足と合わせて別の復帰owner整備が必要。今回その動作は変更しない。
+Driveもcache対象外で専用installを使う。通常はiconだがpin代表画像はAuto sampleになり得るため、
+比率/位置を組として保存するDrive復帰ownerの整備を別件に残す。A/Bの通常一覧はpath cache、
+Ratingは上記のcontext位置ownerで扱う。
+2026-10-07追補: SLIを通らない検索entry、検索結果の最初の採用、Rating→Collectionの
+accepted openでも、旧itemsを置き換える前に同じRating保存helperを呼ぶ。検索entry後も
+旧一覧は結果到着まで操作できるため、entry時だけでなく結果採用時にも最新位置を捕捉する。
+採用後はRating flagが落ち、後続の検索結果更新は保存しない。復帰のsaved-key優先順位は
+維持する。Collection側のentry anchor/比率の挙動は変更しない。
+prepared/legacy共通のRating採用ownerが表示rowsの★段stampを確定し、検索surfaceへ
+変わってもまだ表示中の旧Rating rowsの★段を保存helperが識別できるようにする。
+★段stampの公開はこの共通採用ownerだけが行う。worker結果の到着時には新★段へ
+上書きせず、旧itemsの保存完了まで旧★段を保持する。検索結果待ちの★3から★5へ
+移る場合も、待機中の最新選択/offsetは★3へ保存され、★5の位置へ混入しない。
+
 ### 5.4 描画側の置き換え
 
 `ui_main.rs:2005-2006` を含む全 `self.settings.thumb_aspect.height_ratio()`
@@ -518,26 +571,69 @@ rg 'settings\.thumb_aspect[^_]' src/
 画面外に飛ぶ。手動切替でも今ガクッと飛んでいるはず (= 既存バグ)。
 **今回の修正でついでに直す**。
 
-`App` には既に **`last_cell_size`** (= cell_w) と **`last_cell_h`** が
-あり、前フレーム描画時の値が入っている ([src/app.rs:1724-1726](../src/app.rs))。
-新セルの cols は変わらないので、`old_cell_h / new_cell_h = old_ratio /
-new_ratio` の関係で `scroll_offset_y` を比例補正できる:
+2026-10-07追補: `last_cell_size` / `last_cell_h` は描画の予測値にも使われ、一覧を
+置換しても前一覧の値が残る。これだけで補正すると、新一覧のoffsetを別一覧の行高で
+解釈してしまう。`App.grid_aspect_layout` を `UnlaidOut` / `Thumbnail` / `Details` の
+typedな描画記録とし、Thumbnailはcontext ID・items generation・列数・実セル幅/高を持つ。
+単一UI paneの記録であり、context bundleに転送する状態や新しいpending stateではない。
 
-```rust
-/// 比率変更時のスクロール補正だけを行う pure helper。
-/// auto / manual どちらの経路からも呼ぶ (state 書き換えは呼び出し側)。
-fn fixup_scroll_for_aspect_change(&mut self, new_aspect: ThumbAspect) {
-    let old_cell_h = self.last_cell_h.max(1.0);
-    let new_cell_h = (self.last_cell_size * new_aspect.height_ratio()).round().max(1.0);
-    if (new_cell_h - old_cell_h).abs() < 0.5 {
-        return; // 変化なし
-    }
-    // 画面先頭の row index を維持
-    let anchor_row = (self.scroll_offset_y / old_cell_h).floor();
-    self.scroll_offset_y = anchor_row * new_cell_h;
-    // (描画ループ側の clamp に任せる)
-}
-```
+thumbnail描画は寸法の変化有無にかかわらず毎回この記録を公開し、details描画はDetailsへ
+置き換える。fixupは同じcontext・世代・列数で、現在もThumbnailの場合だけ先頭行を
+`floor(offset / old_h) * new_h` へ補正する。補正後の記録高を即更新して同フレームの
+二重呼び出しを冪等にする。新一覧・別context・列数変更・Detailsには再anchorする
+自分自身のthumbnail layoutがないためoffsetを動かさず、既存の初回layout/clampと
+opened-pathのensure-visibleに任せる。互換の`last_cell_h`予測更新は続ける。
+
+新しい世代のinstallが旧描画記録を自然に不一致にするので、各installへのreset追加、
+待機・repaint・再ensure-visibleは不要。同世代のsmart appendや通常の比率変更は
+自分の描画記録で補正する。cache復元は比率の復元であり、描画記録を公開しない。
+
+実機のwarmログは、SLIのoffset reset後・Rating位置復元前のseedで切り替わる。
+offset 0への旧fixupだけでは観測された連続跳躍を説明できず、直接原因は断定しない。
+Collection installerの即時seedも、presentation/世代の公開前は母数0で切替判定を通らない。
+回帰は共通seed ownerで実cache entryによる即時Switchを起こす境界検査と、Ratingの
+実catalogを使ったsaved 3:4→Holdの往復検査を分けて行う。
+
+2026-10-07追加調査 (`983d68272`実機): 保存3:4の復元後にSwitchがない場合でも、
+選択は正しいまま可視範囲が中間から末尾へ移る報告が残った。
+追加のcode調査で、Rating採用時だけ宛先favorite表示の遷移を通らず、子のoverlayを使って
+初回描画した後、frame末尾のreconcileで共通表示へ戻る経路を確認した。
+共通10列・子favorite6列では、最初のensure-visibleは6列の大きいセル/行数でoffsetを計算し、
+次frameの10列ではそのpixel offsetが短いcontentの末尾へclampされる。比率Switchは不要。
+600項目・row30・Rating3:4/子2:3の回帰でこの表示設定の所有境界を検査する。
+これはコード上の再現経路であり、利用者の実設定がfavorite overlayを使うか、ログの各数値が
+この経路かは次の実機診断で確認する。実機ログだけで原因確定したとは扱わない。
+最初の`[queue] vis`は`settings.grid_cols`と互換の`last_cell_h` / `last_viewport_h`による
+先読み予測で、初描画前は旧一覧の寸法が残り得る。queue計算自体はoffsetを書き換えない。
+thumbnailの初描画ではそのframeの幅・比率・列数・viewportを公開してからensure-visibleし、
+行snapとmax-offset clampを行う。したがって初回ensureの前に、宛先の列数/表示設定を
+確定する必要がある。scroll ownerの遅延や再ensureでは設定採用の順序違反を直さない。
+main ScrollAreaは共有persistent IDを使い、offset注入はeguiの保持速度・animation targetを
+消さない。eguiの結果はhalf-row以上の差でAppへ読み戻される。またraw wheelのない後続frameにも
+private残量からsmooth deltaが届き得る。これらは移動可能な経路であり、実機原因だとは断定しない。
+通常thumbnailのscroll target発行は確認できず、test-scriptのrow revealは別の診断producer。
+旧touch glideは世代と行高で失効し、folder pane/musicのScrollAreaは別IDを持つ。
+
+`[grid-scroll]`はRatingの保存/復元、ensure-visible、行snap、clamp、touch、
+aspect fixup、wheel/gamepad、eguiの読み戻しをnormal loggerへ記録する。世代、保存/適用offset、
+選択index、行矩形、列数、セル幅/高、viewport高を記録し、ScrollArea直前の入力と前後のStateも
+採取する。パスや項目名は出さない。ログはこれらの境界/位置変更時のみで、待機や追加repaintを
+導入しない。State reset、ID変更、再ensure-visibleで症状を覆う変更は行わない。
+
+2026-10-07追補: touchの比較は描画offset（anchor+端数）ではなくcanonical anchor同士とし、
+anchor変更とglide開始/終了だけを記録する。20pxの端数が静止中に残る場合や、glide中の
+端数だけの進行では記録しない。egui viewport/Stateは一度だけ消費するensure-visible要求時に
+採取し、端数/丸め差分を理由に毎frame出力しない。wheel/gamepad/readbackも実offset変更時のみ。
+初layout前に繰り返され得るqueue予測の追加診断は削除した。logger用の選択位置探索は行わず、
+行矩形はensure-visible ownerが既に計算した表示位置を再利用する。他の診断には選択indexと
+geometryを残す。新しい重複除去stateや待機は不要で、既存ownerの境界だけで発火を決める。
+
+Rating workerは宛先favoriteの表示順を純粋に投影し、既存のnavigation requestに保持する。
+準備中の設定変更は既存のsort再準備経路で検証し、まだ表示中の子には適用しない。
+visible installの共通位置保存後、新しい可視contextで既存favorite遷移を確定してから
+seed/一覧を採用する。新規favoriteの継承値も退出元から渡す。legacy installも同じ投影を
+materializeへ使う。通常の同一覧rebuildは現在の設定を使い、表示mode等は既存installが更新する。
+これはSmart Folderの宛先投影/採用境界と同じ原則であり、新しい待機状態や非同期手順は作らない。
 
 呼び出し経路:
 
@@ -730,3 +826,86 @@ helper メソッド (例: `record_aspect_sample`, `maybe_apply_auto_aspect`) を
 - 新しい worker thread の追加 (既存 thumb 経路で十分量のデータが流れる)
 - `ThumbAspect` 候補の追加 (7 種で十分カバー)
 - 「ユーザーごとに学習したカスタム比率」のような ML 系拡張 (オーバーキル)
+
+## 13. Collection root の比率復元（2026-09-20）
+
+利用者は Collection を開き直すたび Auto 比率が 1:1 に戻ると報告し、再起動後も保持する
+非同期キャッシュを希望した。現行の root install は `current_folder=None` にしてから
+`reset_and_seed_auto_aspect` を呼ぶため、path 専用の `auto_aspect_cache_target_path` は
+`None` を返す。既存のフォルダ・ZIP/PDF・ブックマーク用 path key を Collection ID の
+代用品にしない。以下は §4.6 / §12 の既存機能に Collection root だけを追加する設計である。
+
+- 対象を `Path(path)` / `CollectionRoot(collection_id)` の局所 typed target として扱う。
+  root の保存だけは、現在の surface / session ID、`Root` 位置、`Ready`、installed items
+  generation、accepted revision と prepared revision / entry 数が一致する場合に限る。
+  初回空 install、`Failed`、`Deleted`、PhysicalSource 子、別 viewer context、Remote の
+  read-only 経路は Collection 保存対象にしない。通常 path target の規則は変えない。
+- `auto_aspect_cache.db` には UUID key 専用 table を追加し、既存 `folder_key` table と
+  path 正規化規則を変更しない。値は `aspect` / `sample_count` / `eligible_total` /
+  `updated_at` の既存形式と同じ。Collection ID は UUID raw/canonical 表現から決定し、
+  rename、order 変更、再起動で同じ key を使う。collection DB に cache 値を書かない。
+- App が process 全体の Collection cache owner（UUID→確定値の小さな map と順序付き
+  disk writer client）を持つ。`AutoAspectState` と samples は従来どおり viewer context ごと。
+  同一プロセスの reopen は map を空 install 時点で即復元する。初回起動で map に無い ID は
+  現行の空 install で item が 0 件かつ Auto ラベルが「自動」なので、別 Collection の比率を
+  流用しない。既存の Collection prepare worker が cache actor の `Get(collection_id)` へ
+  問い合わせ、応答を prepared install payload に載せる。actor が read / write / clear / prune
+  を単一 queue で処理するため、clear より後の Get は古い DB 行を読めない。accepted ID /
+  generation / revision の結果だけ、実 rows
+  install の `reset_and_seed_auto_aspect` より前に採用する。Get が予算内に成功した場合、
+  最初の実 item 描画は復元比率から始まる。起動時全件ロードと UI thread SQLite read は追加しない。
+  復元は optional cache なので prepare は Get を無期限に待たない。例えば 100 ms の
+  cache 専用予算で小刻みに cancel を確認し、期限・actor停止・DB error なら cache miss として
+  現行の Auto 判定を続ける。期限後の遅着応答は破棄する。これは optional cache 取得の
+  latency 上限であり、Collection snapshot / classify の再試行や表示内容の変更ではない。
+- 確定した結果は process map へ直ちに反映し、専用の単一 writer channel へ送る。
+  writer が別接続で upsert を順序通り処理し、App 終了では既存の DB writer と同じく
+  queued writes を drain する。worker 失敗は cache miss として扱い、folder/Collection の
+  item・order install を失敗にしない。通常の UI update / open / install には DB 操作や
+  join を追加しない。終了時の drain は既存 writer と同じ lifecycle として検証する。
+  UI で確定後に map を更新してから `Upsert` を enqueue するため、同一プロセスの再openは
+  disk への未反映より新しい map 値を優先する。これより前に開始した Get の遅着も
+  install 時の map 優先で上書きできない。write 失敗は記録し、次回起動で disk に残った
+  最後の確定値から復元する。
+- cache manager の Stats / DeleteOld / DeleteAll は専用 table を合算する。
+  Collection の clear / age-prune command を管理操作の admission 時点で writer queue に
+  入れ、それ以前の upsert の後、以後の upsert の前に並べる。管理 worker が返答を待ち、
+  既存 folder table 操作と件数を合算する。既存 `AutoAspectCacheDb` の folder 用
+  `count` / `clear_all` / `delete_older_than_days` は UUID table に触れず、Collection
+  table の read / write / cleanup はすべてこの actor owner だけが実行する。
+  clear command の enqueue または SQLite 実行に失敗した場合は manager に成功と表示せず、
+  folder table の操作が済んでいても部分失敗を報告する。enqueue 失敗なら map / epoch を
+  変えず、SQLite 失敗なら旧 DB 行が後続 Get で再び見える可能性を失敗結果として伝える。
+  enqueue 成功時には App map を失効させ、prepare 中の
+  Get 結果には cache epoch を添えて失効後の遅着採用を拒否する。clear admission の直後に
+  始まる Get も actor queue では clear の後ろへ並び、処理前の DB 行を新 epoch として
+  採用しない。個別 folder 削除は Collection ID に触れない。Collection の authoritative
+  catalog 採用で旧一覧から消えた UUID と、Delete 成功応答の exact UUID は、同じ送信 lock 内で
+  process-lifetime の retired 集合へ入れて `Forget` を enqueue する。先行 Get / Upsert の後ろへ
+  FIFO で並ぶため、削除後の遅い lookup / record は map に戻らず、対象 UUID の disk row も削除する。
+  UUID は再利用しない契約なので retired 集合は session 中保持し、別 UUID の値は維持する。
+  これは非同期 actor write であり UI thread から SQLite を呼ばない。age-prune は期限整理として残す。
+  cache manager の合算数は「件」と表示する。
+- Collection root の sample 可能母数は `CollectionPlaceholder` と、固定音楽アイコンで
+  thumbnail sample を出さない `Audio` を除外する同一純述語から prepare worker が一度だけ
+  immutable scalar を作る。install 途中の seed はこの新しい scalar を明示的に受け取り、公開後は
+  exact Collection ID / revision / items generation / item 件数が一致する root だけ O(1) で読む。
+  不一致は 0 とし、通常 folder / PhysicalSource 子は従来どおり `items.len()` を使う。cache の
+  前回 sample gate は現在の sample 可能母数で clip し、到達不能な待機を作らない。
+
+実装では `CollectionAutoAspectCache` が App 全体の UUID メモリ値を持ち、
+`CollectionAutoAspectDb` だけが専用 table に触れる。短い送信ロックで Get と
+maintenance admission / epoch 更新を直列化し、DB 待ちを UI に持ち込まない。
+prepare worker の Get は最大 100 ms、取消・期限切れ・DB 不調は cache miss とする。
+実 rows の accepted install 前に lookup の epoch を照合して復元し、同一プロセスの
+再訪はメモリ値を優先する。保存は root の exact Ready ID / generation / revision と
+item 件数が一致したときだけ行う。削除済み UUID は catalog / Delete 応答で retired にし、
+`Forget` と遅着拒否を同じ送信 mutex で直列化する。管理操作は Collection actor 応答と従来の
+folder table worker の結果を合算する。UUID 側が失敗しても従来の folder / catalog /
+tile 処理を続け、合算件数は不明、全件削除は部分失敗として明示する。個別 folder
+削除では UUID は件数照会だけなので、actor の不調で folder 削除を妨げない。
+
+focused 回帰は UUID の再起動相当 roundtrip、folder table 非干渉、
+clear/Get epoch 順序、期限・取消、root 初回実 rows 復元、Audio / Placeholder の母数除外、
+管理操作失敗を対象にする。検証結果と build / GUI 状態は
+`collection-implementation-plan.md` §23.2 / §23.3 へ記録する。

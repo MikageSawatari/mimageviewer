@@ -192,6 +192,49 @@ impl ModKind {
     }
 }
 
+/// Current physical modifier groups used by the crop-only Space-pan exception.
+///
+/// Broad Ctrl / Shift / Alt remain the group truth. Right-side fields refine a
+/// right-only binding without changing the generic ModifierHold contract.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ModifierLevelSnapshot {
+    ctrl: bool,
+    shift: bool,
+    alt: bool,
+    right_ctrl: bool,
+    right_shift: bool,
+    right_alt: bool,
+}
+
+impl ModifierLevelSnapshot {
+    const fn matches_only(self, kind: ModKind) -> bool {
+        match kind {
+            ModKind::Ctrl => self.ctrl && !self.shift && !self.alt,
+            ModKind::Shift => self.shift && !self.ctrl && !self.alt,
+            ModKind::Alt => self.alt && !self.ctrl && !self.shift,
+            ModKind::RightCtrl => self.right_ctrl && !self.shift && !self.alt,
+            ModKind::RightShift => self.right_shift && !self.ctrl && !self.alt,
+            ModKind::RightAlt => self.right_alt && !self.ctrl && !self.shift,
+        }
+    }
+}
+
+fn crop_pan_with_force_binding_held(
+    pan_chords: &[Chord],
+    force_chords: &[Chord],
+    modifiers: ModifierLevelSnapshot,
+    mut key_held: impl FnMut(KeyName) -> bool,
+) -> bool {
+    force_chords
+        .iter()
+        .filter_map(|chord| chord.modifier_kind())
+        .any(|kind| modifiers.matches_only(kind))
+        && pan_chords
+            .iter()
+            .filter_map(|chord| chord.key_name())
+            .any(&mut key_held)
+}
+
 // 左側限定は現在の利用要望がなく、右側だけを選べれば「よく触る側を避ける」用途を
 // 満たせるため追加しない。Ctrl / Shift / Alt は従来どおり左右不問を表す。
 
@@ -1366,9 +1409,19 @@ pub enum KeyAction {
     GlobalMetadataSearch,
     GlobalOpenFolder,
     ToggleDetachedViewerMode,
+    ToggleAlwaysOnTop,
     HelpShowContextShortcuts,
     GridFavoritePrev,
     GridFavoriteNext,
+    GridManageFavorites,
+    GridBookPrev,
+    GridBookNext,
+    GridOpenActiveBook,
+    GridManageBooks,
+    GridCollectionPrev,
+    GridCollectionNext,
+    GridOpenCollectionTarget,
+    GridManageCollections,
     GridOpenFavorite1,
     GridOpenFavorite2,
     GridOpenFavorite3,
@@ -1389,6 +1442,46 @@ pub enum KeyAction {
     GridOpenFavorite18,
     GridOpenFavorite19,
     GridOpenFavorite20,
+    GridOpenBook1,
+    GridOpenBook2,
+    GridOpenBook3,
+    GridOpenBook4,
+    GridOpenBook5,
+    GridOpenBook6,
+    GridOpenBook7,
+    GridOpenBook8,
+    GridOpenBook9,
+    GridOpenBook10,
+    GridOpenBook11,
+    GridOpenBook12,
+    GridOpenBook13,
+    GridOpenBook14,
+    GridOpenBook15,
+    GridOpenBook16,
+    GridOpenBook17,
+    GridOpenBook18,
+    GridOpenBook19,
+    GridOpenBook20,
+    GridOpenCollection1,
+    GridOpenCollection2,
+    GridOpenCollection3,
+    GridOpenCollection4,
+    GridOpenCollection5,
+    GridOpenCollection6,
+    GridOpenCollection7,
+    GridOpenCollection8,
+    GridOpenCollection9,
+    GridOpenCollection10,
+    GridOpenCollection11,
+    GridOpenCollection12,
+    GridOpenCollection13,
+    GridOpenCollection14,
+    GridOpenCollection15,
+    GridOpenCollection16,
+    GridOpenCollection17,
+    GridOpenCollection18,
+    GridOpenCollection19,
+    GridOpenCollection20,
     GridOpenDriveC,
     GridOpenDriveD,
     GridOpenDriveE,
@@ -1487,6 +1580,7 @@ pub enum KeyAction {
     GridDeselect,
     GridCutFiles,
     GridCopyFiles,
+    GridOrganizeFiles,
     GridToggleCheck,
     GridDelete,
     GridRename,
@@ -1509,6 +1603,7 @@ pub enum KeyAction {
     GridToggleMaximize,
     GridToggleFolderTreePane,
     GridToggleStackMode,
+    GridConvertEpubToPdf,
     GridTagApply,
     GridTagView,
     GridRotateCw,
@@ -1516,6 +1611,7 @@ pub enum KeyAction {
     GridPin,
     GridComparePin,
     GridAddToActiveBook,
+    GridAddToCollectionTarget,
     GridExportSelection,
     GridColumnCount1,
     GridColumnCount2,
@@ -1527,6 +1623,16 @@ pub enum KeyAction {
     GridColumnCount8,
     GridColumnCount9,
     GridColumnCount10,
+    GridColumnCount11,
+    GridColumnCount12,
+    GridColumnCount13,
+    GridColumnCount14,
+    GridColumnCount15,
+    GridColumnCount16,
+    GridColumnCount17,
+    GridColumnCount18,
+    GridColumnCount19,
+    GridColumnCount20,
     GridToggleDetailsView,
     GridOpenPreferences,
     GridOpenOperationCustomize,
@@ -1571,23 +1677,30 @@ pub enum KeyAction {
     RatingItem4,
     RatingItem5,
     RatingItemClear,
+    RatingItemStepUp,
+    RatingItemStepDown,
     RatingContainer1,
     RatingContainer2,
     RatingContainer3,
     RatingContainer4,
     RatingContainer5,
     RatingContainerClear,
+    RatingContainerStepUp,
+    RatingContainerStepDown,
     FsContinuousScrollForward,
     FsContinuousScrollBack,
     FsSpreadShiftLeft,
     FsSpreadShiftRight,
     FsSpreadShiftPrev,
     FsSpreadShiftNext,
+    FsTogglePageAfterCoverAlone,
+    FsToggleLastPageAlone,
     FsSlideshow,
     FsSeekStripToggle,
     FsSpaceCheck,
     FsCapture,
     FsAddToActiveBook,
+    FsAddToCollectionTarget,
     FsExport,
     FsCompareToggle,
     FsCompareCycle,
@@ -1739,6 +1852,7 @@ pub enum KeyAction {
     VideoBookmark,
     VideoCapture,
     VideoAddToActiveBook,
+    VideoAddToCollectionTarget,
     VideoCompareToggle,
     VideoCompareCycle,
     VideoCompareWipe,
@@ -1756,6 +1870,7 @@ pub enum KeyAction {
     /// 動画→音声モード (映像を消して音楽ビューで聴く、Inc 7) のトグル。動画では enter、
     /// 音声モード中は exit。音声ファイル単体では対象外 (映像が無いので no-op)。
     VideoToggleAudioMode,
+    VideoNextAudioTrack,
     EraseConfirm,
     EraseConfirmPolygon,
     EraseRedo,
@@ -1798,6 +1913,7 @@ pub enum KeyAction {
     ConcealToolRect,
     ConcealToolEllipse,
     ConcealSpacePan,
+    CropForceCreateHold,
     CropSpacePan,
     CropExecute,
     SnsSplitExecute,
@@ -1858,9 +1974,19 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GlobalMetadataSearch,
     KeyAction::GlobalOpenFolder,
     KeyAction::ToggleDetachedViewerMode,
+    KeyAction::ToggleAlwaysOnTop,
     KeyAction::HelpShowContextShortcuts,
     KeyAction::GridFavoritePrev,
     KeyAction::GridFavoriteNext,
+    KeyAction::GridManageFavorites,
+    KeyAction::GridBookPrev,
+    KeyAction::GridBookNext,
+    KeyAction::GridOpenActiveBook,
+    KeyAction::GridManageBooks,
+    KeyAction::GridCollectionPrev,
+    KeyAction::GridCollectionNext,
+    KeyAction::GridOpenCollectionTarget,
+    KeyAction::GridManageCollections,
     KeyAction::GridOpenFavorite1,
     KeyAction::GridOpenFavorite2,
     KeyAction::GridOpenFavorite3,
@@ -1881,6 +2007,46 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridOpenFavorite18,
     KeyAction::GridOpenFavorite19,
     KeyAction::GridOpenFavorite20,
+    KeyAction::GridOpenBook1,
+    KeyAction::GridOpenBook2,
+    KeyAction::GridOpenBook3,
+    KeyAction::GridOpenBook4,
+    KeyAction::GridOpenBook5,
+    KeyAction::GridOpenBook6,
+    KeyAction::GridOpenBook7,
+    KeyAction::GridOpenBook8,
+    KeyAction::GridOpenBook9,
+    KeyAction::GridOpenBook10,
+    KeyAction::GridOpenBook11,
+    KeyAction::GridOpenBook12,
+    KeyAction::GridOpenBook13,
+    KeyAction::GridOpenBook14,
+    KeyAction::GridOpenBook15,
+    KeyAction::GridOpenBook16,
+    KeyAction::GridOpenBook17,
+    KeyAction::GridOpenBook18,
+    KeyAction::GridOpenBook19,
+    KeyAction::GridOpenBook20,
+    KeyAction::GridOpenCollection1,
+    KeyAction::GridOpenCollection2,
+    KeyAction::GridOpenCollection3,
+    KeyAction::GridOpenCollection4,
+    KeyAction::GridOpenCollection5,
+    KeyAction::GridOpenCollection6,
+    KeyAction::GridOpenCollection7,
+    KeyAction::GridOpenCollection8,
+    KeyAction::GridOpenCollection9,
+    KeyAction::GridOpenCollection10,
+    KeyAction::GridOpenCollection11,
+    KeyAction::GridOpenCollection12,
+    KeyAction::GridOpenCollection13,
+    KeyAction::GridOpenCollection14,
+    KeyAction::GridOpenCollection15,
+    KeyAction::GridOpenCollection16,
+    KeyAction::GridOpenCollection17,
+    KeyAction::GridOpenCollection18,
+    KeyAction::GridOpenCollection19,
+    KeyAction::GridOpenCollection20,
     KeyAction::GridOpenDriveC,
     KeyAction::GridOpenDriveD,
     KeyAction::GridOpenDriveE,
@@ -1979,6 +2145,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridDeselect,
     KeyAction::GridCutFiles,
     KeyAction::GridCopyFiles,
+    KeyAction::GridOrganizeFiles,
     KeyAction::GridToggleCheck,
     KeyAction::GridDelete,
     KeyAction::GridRename,
@@ -2001,6 +2168,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridToggleMaximize,
     KeyAction::GridToggleFolderTreePane,
     KeyAction::GridToggleStackMode,
+    KeyAction::GridConvertEpubToPdf,
     KeyAction::GridTagApply,
     KeyAction::GridTagView,
     KeyAction::GridRotateCw,
@@ -2008,6 +2176,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridPin,
     KeyAction::GridComparePin,
     KeyAction::GridAddToActiveBook,
+    KeyAction::GridAddToCollectionTarget,
     KeyAction::GridExportSelection,
     KeyAction::GridColumnCount1,
     KeyAction::GridColumnCount2,
@@ -2019,6 +2188,16 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridColumnCount8,
     KeyAction::GridColumnCount9,
     KeyAction::GridColumnCount10,
+    KeyAction::GridColumnCount11,
+    KeyAction::GridColumnCount12,
+    KeyAction::GridColumnCount13,
+    KeyAction::GridColumnCount14,
+    KeyAction::GridColumnCount15,
+    KeyAction::GridColumnCount16,
+    KeyAction::GridColumnCount17,
+    KeyAction::GridColumnCount18,
+    KeyAction::GridColumnCount19,
+    KeyAction::GridColumnCount20,
     KeyAction::GridToggleDetailsView,
     KeyAction::GridOpenPreferences,
     KeyAction::GridOpenOperationCustomize,
@@ -2063,23 +2242,30 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::RatingItem4,
     KeyAction::RatingItem5,
     KeyAction::RatingItemClear,
+    KeyAction::RatingItemStepUp,
+    KeyAction::RatingItemStepDown,
     KeyAction::RatingContainer1,
     KeyAction::RatingContainer2,
     KeyAction::RatingContainer3,
     KeyAction::RatingContainer4,
     KeyAction::RatingContainer5,
     KeyAction::RatingContainerClear,
+    KeyAction::RatingContainerStepUp,
+    KeyAction::RatingContainerStepDown,
     KeyAction::FsContinuousScrollForward,
     KeyAction::FsContinuousScrollBack,
     KeyAction::FsSpreadShiftLeft,
     KeyAction::FsSpreadShiftRight,
     KeyAction::FsSpreadShiftPrev,
     KeyAction::FsSpreadShiftNext,
+    KeyAction::FsTogglePageAfterCoverAlone,
+    KeyAction::FsToggleLastPageAlone,
     KeyAction::FsSlideshow,
     KeyAction::FsSeekStripToggle,
     KeyAction::FsSpaceCheck,
     KeyAction::FsCapture,
     KeyAction::FsAddToActiveBook,
+    KeyAction::FsAddToCollectionTarget,
     KeyAction::FsExport,
     KeyAction::FsCompareToggle,
     KeyAction::FsCompareCycle,
@@ -2231,6 +2417,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::VideoBookmark,
     KeyAction::VideoCapture,
     KeyAction::VideoAddToActiveBook,
+    KeyAction::VideoAddToCollectionTarget,
     KeyAction::VideoCompareToggle,
     KeyAction::VideoCompareCycle,
     KeyAction::VideoCompareWipe,
@@ -2246,6 +2433,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::VideoAdjustSlot9,
     KeyAction::VideoAdjustSlot10,
     KeyAction::VideoToggleAudioMode,
+    KeyAction::VideoNextAudioTrack,
     KeyAction::EraseConfirm,
     KeyAction::EraseConfirmPolygon,
     KeyAction::EraseRedo,
@@ -2288,6 +2476,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::ConcealToolRect,
     KeyAction::ConcealToolEllipse,
     KeyAction::ConcealSpacePan,
+    KeyAction::CropForceCreateHold,
     KeyAction::CropSpacePan,
     KeyAction::CropExecute,
     KeyAction::SnsSplitExecute,
@@ -2358,6 +2547,7 @@ pub enum TopMenuId {
     Favorites,
     SmartFolders,
     Books,
+    Collections,
     Convert,
     Video,
     Tags,
@@ -2371,6 +2561,7 @@ impl TopMenuId {
         Self::Favorites,
         Self::SmartFolders,
         Self::Books,
+        Self::Collections,
         Self::Convert,
         Self::Video,
         Self::Tags,
@@ -2384,6 +2575,7 @@ impl TopMenuId {
             TopMenuId::Favorites => "お気に入り",
             TopMenuId::SmartFolders => "スマートフォルダ",
             TopMenuId::Books => "製本",
+            TopMenuId::Collections => "コレクション",
             TopMenuId::Convert => "変換",
             TopMenuId::Video => "動画",
             TopMenuId::Tags => "タグ",
@@ -2398,6 +2590,7 @@ impl TopMenuId {
             TopMenuId::Favorites => "Favorites",
             TopMenuId::SmartFolders => "SmartFolders",
             TopMenuId::Books => "Books",
+            TopMenuId::Collections => "Collections",
             TopMenuId::Convert => "Convert",
             TopMenuId::Video => "Video",
             TopMenuId::Tags => "Tags",
@@ -2412,6 +2605,7 @@ impl TopMenuId {
             "Favorites" => Some(TopMenuId::Favorites),
             "SmartFolders" => Some(TopMenuId::SmartFolders),
             "Books" => Some(TopMenuId::Books),
+            "Collections" => Some(TopMenuId::Collections),
             "Convert" => Some(TopMenuId::Convert),
             "Video" => Some(TopMenuId::Video),
             "Tags" => Some(TopMenuId::Tags),
@@ -2446,6 +2640,15 @@ pub enum MenuCommandId {
     BooksOpenActiveBook,
     BooksReorderCurrentBook,
     BooksManage,
+    CollectionsAddSelectionToTarget,
+    CollectionsOpenTarget,
+    CollectionsImportCurrent,
+    CollectionsExportCurrent,
+    CollectionsExportAll,
+    CollectionsSetOrderCurrent,
+    CollectionsRelinkCurrent,
+    CollectionsReorderCurrent,
+    CollectionsManage,
     ConvertToZip,
     VideoRegisterUpscale,
     VideoDeleteUpscale,
@@ -2453,7 +2656,9 @@ pub enum MenuCommandId {
     TagsManagePinned,
     TagsTagView,
     SettingsThumbnailCache,
+    SettingsAlwaysOnTop,
     SettingsArchiveCache,
+    SettingsEpubCache,
     SettingsThumbnailQuality,
     SettingsStats,
     SettingsResetRotation,
@@ -2491,6 +2696,15 @@ impl MenuCommandId {
         Self::BooksOpenActiveBook,
         Self::BooksReorderCurrentBook,
         Self::BooksManage,
+        Self::CollectionsAddSelectionToTarget,
+        Self::CollectionsOpenTarget,
+        Self::CollectionsImportCurrent,
+        Self::CollectionsExportCurrent,
+        Self::CollectionsExportAll,
+        Self::CollectionsSetOrderCurrent,
+        Self::CollectionsRelinkCurrent,
+        Self::CollectionsReorderCurrent,
+        Self::CollectionsManage,
         Self::ConvertToZip,
         Self::VideoRegisterUpscale,
         Self::VideoDeleteUpscale,
@@ -2498,7 +2712,9 @@ impl MenuCommandId {
         Self::TagsManagePinned,
         Self::TagsTagView,
         Self::SettingsThumbnailCache,
+        Self::SettingsAlwaysOnTop,
         Self::SettingsArchiveCache,
+        Self::SettingsEpubCache,
         Self::SettingsThumbnailQuality,
         Self::SettingsStats,
         Self::SettingsResetRotation,
@@ -2536,6 +2752,15 @@ impl MenuCommandId {
             MenuCommandId::BooksOpenActiveBook => "BooksOpenActiveBook",
             MenuCommandId::BooksReorderCurrentBook => "BooksReorderCurrentBook",
             MenuCommandId::BooksManage => "BooksManage",
+            MenuCommandId::CollectionsAddSelectionToTarget => "CollectionsAddSelectionToTarget",
+            MenuCommandId::CollectionsOpenTarget => "CollectionsOpenTarget",
+            MenuCommandId::CollectionsImportCurrent => "CollectionsImportCurrent",
+            MenuCommandId::CollectionsExportCurrent => "CollectionsExportCurrent",
+            MenuCommandId::CollectionsExportAll => "CollectionsExportAll",
+            MenuCommandId::CollectionsSetOrderCurrent => "CollectionsSetOrderCurrent",
+            MenuCommandId::CollectionsRelinkCurrent => "CollectionsRelinkCurrent",
+            MenuCommandId::CollectionsReorderCurrent => "CollectionsReorderCurrent",
+            MenuCommandId::CollectionsManage => "CollectionsManage",
             MenuCommandId::ConvertToZip => "ConvertToZip",
             MenuCommandId::VideoRegisterUpscale => "VideoRegisterUpscale",
             MenuCommandId::VideoDeleteUpscale => "VideoDeleteUpscale",
@@ -2543,7 +2768,9 @@ impl MenuCommandId {
             MenuCommandId::TagsManagePinned => "TagsManagePinned",
             MenuCommandId::TagsTagView => "TagsTagView",
             MenuCommandId::SettingsThumbnailCache => "SettingsThumbnailCache",
+            MenuCommandId::SettingsAlwaysOnTop => "SettingsAlwaysOnTop",
             MenuCommandId::SettingsArchiveCache => "SettingsArchiveCache",
+            MenuCommandId::SettingsEpubCache => "SettingsEpubCache",
             MenuCommandId::SettingsThumbnailQuality => "SettingsThumbnailQuality",
             MenuCommandId::SettingsStats => "SettingsStats",
             MenuCommandId::SettingsResetRotation => "SettingsResetRotation",
@@ -2647,7 +2874,7 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
         id: MenuCommandId::FavoritesEdit,
         parent: TopMenuId::Favorites,
         label: "編集",
-        action: None,
+        action: Some(KeyAction::GridManageFavorites),
     },
     MenuCommandSpec {
         id: MenuCommandId::FavoritesFavSearch,
@@ -2701,7 +2928,7 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
         id: MenuCommandId::BooksOpenActiveBook,
         parent: TopMenuId::Books,
         label: "追加先の本を開く",
-        action: None,
+        action: Some(KeyAction::GridOpenActiveBook),
     },
     MenuCommandSpec {
         id: MenuCommandId::BooksReorderCurrentBook,
@@ -2713,7 +2940,61 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
         id: MenuCommandId::BooksManage,
         parent: TopMenuId::Books,
         label: "製本の管理…",
+        action: Some(KeyAction::GridManageBooks),
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::CollectionsAddSelectionToTarget,
+        parent: TopMenuId::Collections,
+        label: "追加先のコレクションに追加",
         action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::CollectionsOpenTarget,
+        parent: TopMenuId::Collections,
+        label: "追加先のコレクションを開く",
+        action: Some(KeyAction::GridOpenCollectionTarget),
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::CollectionsImportCurrent,
+        parent: TopMenuId::Collections,
+        label: "現在のコレクションへインポート…",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::CollectionsExportCurrent,
+        parent: TopMenuId::Collections,
+        label: "現在のコレクションをエクスポート…",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::CollectionsExportAll,
+        parent: TopMenuId::Collections,
+        label: "すべてのコレクションをテキストで書き出す…（新規フォルダ）",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::CollectionsSetOrderCurrent,
+        parent: TopMenuId::Collections,
+        label: "現在のコレクションの並び順",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::CollectionsRelinkCurrent,
+        parent: TopMenuId::Collections,
+        label: "選択中の参照を再リンク",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::CollectionsReorderCurrent,
+        parent: TopMenuId::Collections,
+        label: "現在のコレクションを並べ替え…",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::CollectionsManage,
+        parent: TopMenuId::Collections,
+        label: "コレクションの管理…",
+        action: Some(KeyAction::GridManageCollections),
     },
     MenuCommandSpec {
         id: MenuCommandId::ConvertToZip,
@@ -2752,6 +3033,12 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
         action: Some(KeyAction::GridTagView),
     },
     MenuCommandSpec {
+        id: MenuCommandId::SettingsAlwaysOnTop,
+        parent: TopMenuId::Settings,
+        label: "常に最前面",
+        action: Some(KeyAction::ToggleAlwaysOnTop),
+    },
+    MenuCommandSpec {
         id: MenuCommandId::SettingsThumbnailCache,
         parent: TopMenuId::Settings,
         label: "サムネイルキャッシュ管理",
@@ -2760,7 +3047,13 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
     MenuCommandSpec {
         id: MenuCommandId::SettingsArchiveCache,
         parent: TopMenuId::Settings,
-        label: "変換済みアーカイブキャッシュ管理",
+        label: "変換済みアーカイブ管理",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::SettingsEpubCache,
+        parent: TopMenuId::Settings,
+        label: "EPUB 変換キャッシュ管理",
         action: None,
     },
     MenuCommandSpec {
@@ -2836,10 +3129,13 @@ pub fn menu_command_catalog() -> &'static [MenuCommandSpec] {
 }
 
 fn menu_command_is_available_in_build(id: MenuCommandId) -> bool {
-    !matches!(
-        id,
-        MenuCommandId::FileMetadataExport | MenuCommandId::FileMetadataImport
-    ) || crate::metadata_transfer::UI_ENABLED
+    match id {
+        MenuCommandId::CollectionsRelinkCurrent => false,
+        MenuCommandId::FileMetadataExport | MenuCommandId::FileMetadataImport => {
+            crate::metadata_transfer::UI_ENABLED
+        }
+        _ => true,
+    }
 }
 
 pub fn menu_commands_for_parent(parent: TopMenuId) -> impl Iterator<Item = MenuCommandSpec> {
@@ -2927,6 +3223,13 @@ pub fn resolve_menu_layout(settings: &MenuLayoutSettings) -> ResolvedMenuLayout 
             }
         }
     }
+    // Collections was added after Books. Keep that peer relationship for saved pre-Collections
+    // layouts instead of appending the new menu after Help.
+    if !parents.contains(&TopMenuId::Collections)
+        && let Some(books) = parents.iter().position(|id| *id == TopMenuId::Books)
+    {
+        parents.insert(books + 1, TopMenuId::Collections);
+    }
     for &parent in TopMenuId::ALL {
         if !parents.contains(&parent) {
             parents.push(parent);
@@ -2979,7 +3282,21 @@ fn resolve_menu_commands_for_parent(
         }
     }
 
+    pin_settings_always_on_top_command(parent, &mut out);
+
     out
+}
+
+/// The checked Settings item precedes the fixed controls, including for saved old menu orders.
+pub fn pin_settings_always_on_top_command(parent: TopMenuId, commands: &mut Vec<MenuCommandId>) {
+    if parent == TopMenuId::Settings
+        && let Some(index) = commands
+            .iter()
+            .position(|id| *id == MenuCommandId::SettingsAlwaysOnTop)
+    {
+        commands.remove(index);
+        commands.insert(0, MenuCommandId::SettingsAlwaysOnTop);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3006,6 +3323,45 @@ const RATING_CONTAINER_ACTIONS: &[(KeyAction, u8)] = &[
     (KeyAction::RatingContainerClear, 0),
 ];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RatingStepDirection {
+    Up,
+    Down,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RatingEdit {
+    Assign(u8),
+    Step(RatingStepDirection),
+}
+
+/// An unrated item uses 3 only as the starting point for one step.
+pub fn step_rating(current: u8, direction: RatingStepDirection) -> Option<u8> {
+    let base = if current == 0 { 3 } else { current.min(5) };
+    match direction {
+        RatingStepDirection::Up if base < 5 => Some(base + 1),
+        RatingStepDirection::Down if base > 1 => Some(base - 1),
+        _ => None,
+    }
+}
+
+fn rating_step_actions(container: bool) -> [(KeyAction, RatingStepDirection); 2] {
+    if container {
+        [
+            (KeyAction::RatingContainerStepUp, RatingStepDirection::Up),
+            (
+                KeyAction::RatingContainerStepDown,
+                RatingStepDirection::Down,
+            ),
+        ]
+    } else {
+        [
+            (KeyAction::RatingItemStepUp, RatingStepDirection::Up),
+            (KeyAction::RatingItemStepDown, RatingStepDirection::Down),
+        ]
+    }
+}
+
 const FAVORITE_LOCATION_ACTIONS: [KeyAction; 20] = [
     KeyAction::GridOpenFavorite1,
     KeyAction::GridOpenFavorite2,
@@ -3027,6 +3383,104 @@ const FAVORITE_LOCATION_ACTIONS: [KeyAction; 20] = [
     KeyAction::GridOpenFavorite18,
     KeyAction::GridOpenFavorite19,
     KeyAction::GridOpenFavorite20,
+];
+
+const BOOK_LOCATION_ACTIONS: [KeyAction; 20] = [
+    KeyAction::GridOpenBook1,
+    KeyAction::GridOpenBook2,
+    KeyAction::GridOpenBook3,
+    KeyAction::GridOpenBook4,
+    KeyAction::GridOpenBook5,
+    KeyAction::GridOpenBook6,
+    KeyAction::GridOpenBook7,
+    KeyAction::GridOpenBook8,
+    KeyAction::GridOpenBook9,
+    KeyAction::GridOpenBook10,
+    KeyAction::GridOpenBook11,
+    KeyAction::GridOpenBook12,
+    KeyAction::GridOpenBook13,
+    KeyAction::GridOpenBook14,
+    KeyAction::GridOpenBook15,
+    KeyAction::GridOpenBook16,
+    KeyAction::GridOpenBook17,
+    KeyAction::GridOpenBook18,
+    KeyAction::GridOpenBook19,
+    KeyAction::GridOpenBook20,
+];
+
+const COLLECTION_LOCATION_ACTIONS: [KeyAction; 20] = [
+    KeyAction::GridOpenCollection1,
+    KeyAction::GridOpenCollection2,
+    KeyAction::GridOpenCollection3,
+    KeyAction::GridOpenCollection4,
+    KeyAction::GridOpenCollection5,
+    KeyAction::GridOpenCollection6,
+    KeyAction::GridOpenCollection7,
+    KeyAction::GridOpenCollection8,
+    KeyAction::GridOpenCollection9,
+    KeyAction::GridOpenCollection10,
+    KeyAction::GridOpenCollection11,
+    KeyAction::GridOpenCollection12,
+    KeyAction::GridOpenCollection13,
+    KeyAction::GridOpenCollection14,
+    KeyAction::GridOpenCollection15,
+    KeyAction::GridOpenCollection16,
+    KeyAction::GridOpenCollection17,
+    KeyAction::GridOpenCollection18,
+    KeyAction::GridOpenCollection19,
+    KeyAction::GridOpenCollection20,
+];
+
+pub const SAVED_GROUP_ACTIONS: &[KeyAction] = &[
+    KeyAction::GridBookPrev,
+    KeyAction::GridBookNext,
+    KeyAction::GridOpenActiveBook,
+    KeyAction::GridManageFavorites,
+    KeyAction::GridManageBooks,
+    KeyAction::GridCollectionPrev,
+    KeyAction::GridCollectionNext,
+    KeyAction::GridOpenCollectionTarget,
+    KeyAction::GridManageCollections,
+    KeyAction::GridOpenBook1,
+    KeyAction::GridOpenBook2,
+    KeyAction::GridOpenBook3,
+    KeyAction::GridOpenBook4,
+    KeyAction::GridOpenBook5,
+    KeyAction::GridOpenBook6,
+    KeyAction::GridOpenBook7,
+    KeyAction::GridOpenBook8,
+    KeyAction::GridOpenBook9,
+    KeyAction::GridOpenBook10,
+    KeyAction::GridOpenBook11,
+    KeyAction::GridOpenBook12,
+    KeyAction::GridOpenBook13,
+    KeyAction::GridOpenBook14,
+    KeyAction::GridOpenBook15,
+    KeyAction::GridOpenBook16,
+    KeyAction::GridOpenBook17,
+    KeyAction::GridOpenBook18,
+    KeyAction::GridOpenBook19,
+    KeyAction::GridOpenBook20,
+    KeyAction::GridOpenCollection1,
+    KeyAction::GridOpenCollection2,
+    KeyAction::GridOpenCollection3,
+    KeyAction::GridOpenCollection4,
+    KeyAction::GridOpenCollection5,
+    KeyAction::GridOpenCollection6,
+    KeyAction::GridOpenCollection7,
+    KeyAction::GridOpenCollection8,
+    KeyAction::GridOpenCollection9,
+    KeyAction::GridOpenCollection10,
+    KeyAction::GridOpenCollection11,
+    KeyAction::GridOpenCollection12,
+    KeyAction::GridOpenCollection13,
+    KeyAction::GridOpenCollection14,
+    KeyAction::GridOpenCollection15,
+    KeyAction::GridOpenCollection16,
+    KeyAction::GridOpenCollection17,
+    KeyAction::GridOpenCollection18,
+    KeyAction::GridOpenCollection19,
+    KeyAction::GridOpenCollection20,
 ];
 
 const DRIVE_LOCATION_ACTIONS: [KeyAction; 24] = [
@@ -3249,6 +3703,20 @@ impl KeyAction {
             .map(|idx| idx + 1)
     }
 
+    pub fn book_slot_number(self) -> Option<usize> {
+        BOOK_LOCATION_ACTIONS
+            .iter()
+            .position(|action| *action == self)
+            .map(|idx| idx + 1)
+    }
+
+    pub fn collection_slot_number(self) -> Option<usize> {
+        COLLECTION_LOCATION_ACTIONS
+            .iter()
+            .position(|action| *action == self)
+            .map(|idx| idx + 1)
+    }
+
     pub fn drive_action(letter: char) -> Option<Self> {
         let upper = letter.to_ascii_uppercase();
         if !('C'..='Z').contains(&upper) {
@@ -3347,6 +3815,56 @@ impl KeyAction {
                 19 => "GridOpenFavorite19",
                 20 => "GridOpenFavorite20",
                 _ => unreachable!("favorite slot is constrained to 1..=20"),
+            };
+        }
+        if let Some(slot) = self.book_slot_number() {
+            return match slot {
+                1 => "GridOpenBook1",
+                2 => "GridOpenBook2",
+                3 => "GridOpenBook3",
+                4 => "GridOpenBook4",
+                5 => "GridOpenBook5",
+                6 => "GridOpenBook6",
+                7 => "GridOpenBook7",
+                8 => "GridOpenBook8",
+                9 => "GridOpenBook9",
+                10 => "GridOpenBook10",
+                11 => "GridOpenBook11",
+                12 => "GridOpenBook12",
+                13 => "GridOpenBook13",
+                14 => "GridOpenBook14",
+                15 => "GridOpenBook15",
+                16 => "GridOpenBook16",
+                17 => "GridOpenBook17",
+                18 => "GridOpenBook18",
+                19 => "GridOpenBook19",
+                20 => "GridOpenBook20",
+                _ => unreachable!("book slot is constrained to 1..=20"),
+            };
+        }
+        if let Some(slot) = self.collection_slot_number() {
+            return match slot {
+                1 => "GridOpenCollection1",
+                2 => "GridOpenCollection2",
+                3 => "GridOpenCollection3",
+                4 => "GridOpenCollection4",
+                5 => "GridOpenCollection5",
+                6 => "GridOpenCollection6",
+                7 => "GridOpenCollection7",
+                8 => "GridOpenCollection8",
+                9 => "GridOpenCollection9",
+                10 => "GridOpenCollection10",
+                11 => "GridOpenCollection11",
+                12 => "GridOpenCollection12",
+                13 => "GridOpenCollection13",
+                14 => "GridOpenCollection14",
+                15 => "GridOpenCollection15",
+                16 => "GridOpenCollection16",
+                17 => "GridOpenCollection17",
+                18 => "GridOpenCollection18",
+                19 => "GridOpenCollection19",
+                20 => "GridOpenCollection20",
+                _ => unreachable!("collection slot is constrained to 1..=20"),
             };
         }
         if let Some(letter) = self.drive_letter() {
@@ -3453,10 +3971,20 @@ impl KeyAction {
             GlobalMetadataSearch => "GlobalMetadataSearch",
             GlobalOpenFolder => "GlobalOpenFolder",
             ToggleDetachedViewerMode => "ToggleDetachedViewerMode",
+            ToggleAlwaysOnTop => "ToggleAlwaysOnTop",
             HelpShowContextShortcuts => "HelpShowContextShortcuts",
             GridOpenCurrentDriveRoot => "GridOpenCurrentDriveRoot",
             GridFavoritePrev => "GridFavoritePrev",
             GridFavoriteNext => "GridFavoriteNext",
+            GridManageFavorites => "GridManageFavorites",
+            GridBookPrev => "GridBookPrev",
+            GridBookNext => "GridBookNext",
+            GridOpenActiveBook => "GridOpenActiveBook",
+            GridManageBooks => "GridManageBooks",
+            GridCollectionPrev => "GridCollectionPrev",
+            GridCollectionNext => "GridCollectionNext",
+            GridOpenCollectionTarget => "GridOpenCollectionTarget",
+            GridManageCollections => "GridManageCollections",
             GridOpenFavorite1
             | GridOpenFavorite2
             | GridOpenFavorite3
@@ -3477,6 +4005,46 @@ impl KeyAction {
             | GridOpenFavorite18
             | GridOpenFavorite19
             | GridOpenFavorite20
+            | GridOpenBook1
+            | GridOpenBook2
+            | GridOpenBook3
+            | GridOpenBook4
+            | GridOpenBook5
+            | GridOpenBook6
+            | GridOpenBook7
+            | GridOpenBook8
+            | GridOpenBook9
+            | GridOpenBook10
+            | GridOpenBook11
+            | GridOpenBook12
+            | GridOpenBook13
+            | GridOpenBook14
+            | GridOpenBook15
+            | GridOpenBook16
+            | GridOpenBook17
+            | GridOpenBook18
+            | GridOpenBook19
+            | GridOpenBook20
+            | GridOpenCollection1
+            | GridOpenCollection2
+            | GridOpenCollection3
+            | GridOpenCollection4
+            | GridOpenCollection5
+            | GridOpenCollection6
+            | GridOpenCollection7
+            | GridOpenCollection8
+            | GridOpenCollection9
+            | GridOpenCollection10
+            | GridOpenCollection11
+            | GridOpenCollection12
+            | GridOpenCollection13
+            | GridOpenCollection14
+            | GridOpenCollection15
+            | GridOpenCollection16
+            | GridOpenCollection17
+            | GridOpenCollection18
+            | GridOpenCollection19
+            | GridOpenCollection20
             | GridOpenDriveC
             | GridOpenDriveD
             | GridOpenDriveE
@@ -3576,6 +4144,7 @@ impl KeyAction {
             GridDeselect => "GridDeselect",
             GridCutFiles => "GridCutFiles",
             GridCopyFiles => "GridCopyFiles",
+            GridOrganizeFiles => "GridOrganizeFiles",
             GridToggleCheck => "GridToggleCheck",
             GridDelete => "GridDelete",
             GridRename => "GridRename",
@@ -3598,6 +4167,7 @@ impl KeyAction {
             GridToggleMaximize => "GridToggleMaximize",
             GridToggleFolderTreePane => "GridToggleFolderTreePane",
             GridToggleStackMode => "GridToggleStackMode",
+            GridConvertEpubToPdf => "GridConvertEpubToPdf",
             GridTagApply => "GridTagApply",
             GridTagView => "GridTagView",
             GridRotateCw => "GridRotateCw",
@@ -3605,6 +4175,7 @@ impl KeyAction {
             GridPin => "GridPin",
             GridComparePin => "GridComparePin",
             GridAddToActiveBook => "GridAddToActiveBook",
+            GridAddToCollectionTarget => "GridAddToCollectionTarget",
             GridExportSelection => "GridExportSelection",
             GridColumnCount1 => "GridColumnCount1",
             GridColumnCount2 => "GridColumnCount2",
@@ -3616,6 +4187,16 @@ impl KeyAction {
             GridColumnCount8 => "GridColumnCount8",
             GridColumnCount9 => "GridColumnCount9",
             GridColumnCount10 => "GridColumnCount10",
+            GridColumnCount11 => "GridColumnCount11",
+            GridColumnCount12 => "GridColumnCount12",
+            GridColumnCount13 => "GridColumnCount13",
+            GridColumnCount14 => "GridColumnCount14",
+            GridColumnCount15 => "GridColumnCount15",
+            GridColumnCount16 => "GridColumnCount16",
+            GridColumnCount17 => "GridColumnCount17",
+            GridColumnCount18 => "GridColumnCount18",
+            GridColumnCount19 => "GridColumnCount19",
+            GridColumnCount20 => "GridColumnCount20",
             GridToggleDetailsView => "GridToggleDetailsView",
             GridOpenPreferences => "GridOpenPreferences",
             GridOpenOperationCustomize => "GridOpenOperationCustomize",
@@ -3660,23 +4241,30 @@ impl KeyAction {
             RatingItem4 => "RatingItem4",
             RatingItem5 => "RatingItem5",
             RatingItemClear => "RatingItemClear",
+            RatingItemStepUp => "RatingItemStepUp",
+            RatingItemStepDown => "RatingItemStepDown",
             RatingContainer1 => "RatingContainer1",
             RatingContainer2 => "RatingContainer2",
             RatingContainer3 => "RatingContainer3",
             RatingContainer4 => "RatingContainer4",
             RatingContainer5 => "RatingContainer5",
             RatingContainerClear => "RatingContainerClear",
+            RatingContainerStepUp => "RatingContainerStepUp",
+            RatingContainerStepDown => "RatingContainerStepDown",
             FsContinuousScrollForward => "FsContinuousScrollForward",
             FsContinuousScrollBack => "FsContinuousScrollBack",
             FsSpreadShiftLeft => "FsSpreadShiftLeft",
             FsSpreadShiftRight => "FsSpreadShiftRight",
             FsSpreadShiftPrev => "FsSpreadShiftPrev",
             FsSpreadShiftNext => "FsSpreadShiftNext",
+            FsTogglePageAfterCoverAlone => "FsTogglePageAfterCoverAlone",
+            FsToggleLastPageAlone => "FsToggleLastPageAlone",
             FsSlideshow => "FsSlideshow",
             FsSeekStripToggle => "FsSeekStripToggle",
             FsSpaceCheck => "FsSpaceCheck",
             FsCapture => "FsCapture",
             FsAddToActiveBook => "FsAddToActiveBook",
+            FsAddToCollectionTarget => "FsAddToCollectionTarget",
             FsExport => "FsExport",
             FsCompareToggle => "FsCompareToggle",
             FsCompareCycle => "FsCompareCycle",
@@ -3828,6 +4416,7 @@ impl KeyAction {
             VideoBookmark => "VideoBookmark",
             VideoCapture => "VideoCapture",
             VideoAddToActiveBook => "VideoAddToActiveBook",
+            VideoAddToCollectionTarget => "VideoAddToCollectionTarget",
             VideoCompareToggle => "VideoCompareToggle",
             VideoCompareCycle => "VideoCompareCycle",
             VideoCompareWipe => "VideoCompareWipe",
@@ -3843,6 +4432,7 @@ impl KeyAction {
             VideoAdjustSlot9 => "VideoAdjustSlot9",
             VideoAdjustSlot10 => "VideoAdjustSlot10",
             VideoToggleAudioMode => "VideoToggleAudioMode",
+            VideoNextAudioTrack => "VideoNextAudioTrack",
             EraseConfirm => "EraseConfirm",
             EraseConfirmPolygon => "EraseConfirmPolygon",
             EraseRedo => "EraseRedo",
@@ -3885,6 +4475,7 @@ impl KeyAction {
             ConcealToolRect => "ConcealToolRect",
             ConcealToolEllipse => "ConcealToolEllipse",
             ConcealSpacePan => "ConcealSpacePan",
+            CropForceCreateHold => "CropForceCreateHold",
             CropSpacePan => "CropSpacePan",
             CropExecute => "CropExecute",
             SnsSplitExecute => "SnsSplitExecute",
@@ -3946,6 +4537,56 @@ impl KeyAction {
                 19 => "お気に入り19を開く",
                 20 => "お気に入り20を開く",
                 _ => unreachable!("favorite slot is constrained to 1..=20"),
+            };
+        }
+        if let Some(slot) = self.book_slot_number() {
+            return match slot {
+                1 => "本1を開く",
+                2 => "本2を開く",
+                3 => "本3を開く",
+                4 => "本4を開く",
+                5 => "本5を開く",
+                6 => "本6を開く",
+                7 => "本7を開く",
+                8 => "本8を開く",
+                9 => "本9を開く",
+                10 => "本10を開く",
+                11 => "本11を開く",
+                12 => "本12を開く",
+                13 => "本13を開く",
+                14 => "本14を開く",
+                15 => "本15を開く",
+                16 => "本16を開く",
+                17 => "本17を開く",
+                18 => "本18を開く",
+                19 => "本19を開く",
+                20 => "本20を開く",
+                _ => unreachable!("book slot is constrained to 1..=20"),
+            };
+        }
+        if let Some(slot) = self.collection_slot_number() {
+            return match slot {
+                1 => "コレクション1を開く",
+                2 => "コレクション2を開く",
+                3 => "コレクション3を開く",
+                4 => "コレクション4を開く",
+                5 => "コレクション5を開く",
+                6 => "コレクション6を開く",
+                7 => "コレクション7を開く",
+                8 => "コレクション8を開く",
+                9 => "コレクション9を開く",
+                10 => "コレクション10を開く",
+                11 => "コレクション11を開く",
+                12 => "コレクション12を開く",
+                13 => "コレクション13を開く",
+                14 => "コレクション14を開く",
+                15 => "コレクション15を開く",
+                16 => "コレクション16を開く",
+                17 => "コレクション17を開く",
+                18 => "コレクション18を開く",
+                19 => "コレクション19を開く",
+                20 => "コレクション20を開く",
+                _ => unreachable!("collection slot is constrained to 1..=20"),
             };
         }
         if let Some(letter) = self.drive_letter() {
@@ -4052,9 +4693,19 @@ impl KeyAction {
             GlobalMetadataSearch => "全フォルダのメタデータを検索する",
             GlobalOpenFolder => "フォルダを開くダイアログを表示する",
             ToggleDetachedViewerMode => "画像・動画ビューアの別ウィンドウモードを切り替える",
+            ToggleAlwaysOnTop => "常に最前面を切り替える",
             HelpShowContextShortcuts => "現在のコンテキストで使えるショートカット一覧を表示する",
             GridFavoritePrev => "前のお気に入りへ移動する",
             GridFavoriteNext => "次のお気に入りへ移動する",
+            GridManageFavorites => "お気に入りの管理を開く",
+            GridBookPrev => "前の本を開く",
+            GridBookNext => "次の本を開く",
+            GridOpenActiveBook => "追加先の本を開く",
+            GridManageBooks => "製本の管理を開く",
+            GridCollectionPrev => "前のコレクションを開く",
+            GridCollectionNext => "次のコレクションを開く",
+            GridOpenCollectionTarget => "追加先のコレクションを開く",
+            GridManageCollections => "コレクションの管理を開く",
             GridOpenCurrentDriveRoot => "現在位置のルートディレクトリを開く",
             GridOpenFavorite1
             | GridOpenFavorite2
@@ -4076,6 +4727,46 @@ impl KeyAction {
             | GridOpenFavorite18
             | GridOpenFavorite19
             | GridOpenFavorite20
+            | GridOpenBook1
+            | GridOpenBook2
+            | GridOpenBook3
+            | GridOpenBook4
+            | GridOpenBook5
+            | GridOpenBook6
+            | GridOpenBook7
+            | GridOpenBook8
+            | GridOpenBook9
+            | GridOpenBook10
+            | GridOpenBook11
+            | GridOpenBook12
+            | GridOpenBook13
+            | GridOpenBook14
+            | GridOpenBook15
+            | GridOpenBook16
+            | GridOpenBook17
+            | GridOpenBook18
+            | GridOpenBook19
+            | GridOpenBook20
+            | GridOpenCollection1
+            | GridOpenCollection2
+            | GridOpenCollection3
+            | GridOpenCollection4
+            | GridOpenCollection5
+            | GridOpenCollection6
+            | GridOpenCollection7
+            | GridOpenCollection8
+            | GridOpenCollection9
+            | GridOpenCollection10
+            | GridOpenCollection11
+            | GridOpenCollection12
+            | GridOpenCollection13
+            | GridOpenCollection14
+            | GridOpenCollection15
+            | GridOpenCollection16
+            | GridOpenCollection17
+            | GridOpenCollection18
+            | GridOpenCollection19
+            | GridOpenCollection20
             | GridOpenDriveC
             | GridOpenDriveD
             | GridOpenDriveE
@@ -4175,8 +4866,11 @@ impl KeyAction {
             GridDeselect => "チェックをすべて解除する",
             GridCutFiles => "選択中またはチェック済みの実ファイル/実フォルダを切り取る",
             GridCopyFiles => "選択中またはチェック済みの実ファイル/実フォルダをコピーする",
+            GridOrganizeFiles => "選択中またはチェック済みの実ファイル/実フォルダの整理先を選ぶ",
             GridToggleCheck => "選択中の項目のチェックを切り替える",
-            GridDelete => "選択中またはチェック済みの実ファイル/実フォルダを削除する",
+            GridDelete => {
+                "通常一覧では実ファイル/実フォルダを削除し、コレクション直下では参照登録を外す"
+            }
             GridRename => "選択中の実ファイル/実フォルダの名前を変更する",
             GridReload => "現在の一覧を最新の情報に更新する",
             GridOpenSelected => "選択中の項目を開く",
@@ -4201,6 +4895,7 @@ impl KeyAction {
             GridToggleMaximize => "メインウィンドウを最大化/復元する",
             GridToggleFolderTreePane => "フォルダツリーペインの表示を切り替える",
             GridToggleStackMode => "スタック表示を切り替える",
+            GridConvertEpubToPdf => "選択中の EPUB を PDF ファイルに変換する",
             GridTagApply => "タグを付ける/外すダイアログを開く",
             GridTagView => "タグビューを開く",
             GridRotateCw => "選択中の画像を右に90度回転する",
@@ -4208,6 +4903,9 @@ impl KeyAction {
             GridPin => "選択中の項目を代表サムネイルに固定または解除する",
             GridComparePin => "選択中の画像を比較スロットに固定または解除する",
             GridAddToActiveBook => "選択中またはチェック済みのページを追加先の本へ追加する",
+            GridAddToCollectionTarget => {
+                "選択中またはチェック済みの実項目を追加先のコレクションへ追加する"
+            }
             GridExportSelection => "選択中またはチェック済みの画像をまとめて書き出す",
             GridColumnCount1 => "サムネイル列数を1列にする",
             GridColumnCount2 => "サムネイル列数を2列にする",
@@ -4219,6 +4917,16 @@ impl KeyAction {
             GridColumnCount8 => "サムネイル列数を8列にする",
             GridColumnCount9 => "サムネイル列数を9列にする",
             GridColumnCount10 => "サムネイル列数を10列にする",
+            GridColumnCount11 => "サムネイル列数を11列にする",
+            GridColumnCount12 => "サムネイル列数を12列にする",
+            GridColumnCount13 => "サムネイル列数を13列にする",
+            GridColumnCount14 => "サムネイル列数を14列にする",
+            GridColumnCount15 => "サムネイル列数を15列にする",
+            GridColumnCount16 => "サムネイル列数を16列にする",
+            GridColumnCount17 => "サムネイル列数を17列にする",
+            GridColumnCount18 => "サムネイル列数を18列にする",
+            GridColumnCount19 => "サムネイル列数を19列にする",
+            GridColumnCount20 => "サムネイル列数を20列にする",
             GridToggleDetailsView => "サムネイル一覧と詳細一覧を切り替える",
             GridOpenPreferences => "環境設定を開く",
             GridOpenOperationCustomize => "操作カスタマイズを開く",
@@ -4263,23 +4971,30 @@ impl KeyAction {
             RatingItem4 => "星4を付ける（アイテム）",
             RatingItem5 => "星5を付ける（アイテム）",
             RatingItemClear => "レーティングを解除する（アイテム）",
+            RatingItemStepUp => "評価を1段階上げる（アイテム）",
+            RatingItemStepDown => "評価を1段階下げる（アイテム）",
             RatingContainer1 => "星1を付ける（コンテナ）",
             RatingContainer2 => "星2を付ける（コンテナ）",
             RatingContainer3 => "星3を付ける（コンテナ）",
             RatingContainer4 => "星4を付ける（コンテナ）",
             RatingContainer5 => "星5を付ける（コンテナ）",
             RatingContainerClear => "レーティングを解除する（コンテナ）",
+            RatingContainerStepUp => "評価を1段階上げる（コンテナ）",
+            RatingContainerStepDown => "評価を1段階下げる（コンテナ）",
             FsContinuousScrollForward => "連結表示中に次の画面分へスクロールする",
             FsContinuousScrollBack => "連結表示中に前の画面分へスクロールする",
             FsSpreadShiftLeft => "見開き表示を左方向へ1ページずらす",
             FsSpreadShiftRight => "見開き表示を右方向へ1ページずらす",
             FsSpreadShiftPrev => "見開き表示を前のページ方向へ1ページずらす",
             FsSpreadShiftNext => "見開き表示を次のページ方向へ1ページずらす",
+            FsTogglePageAfterCoverAlone => "表紙の次のページを単独で表示",
+            FsToggleLastPageAlone => "最終ページを単独で表示",
             FsSlideshow => "スライドショーの再生または停止を切り替える",
             FsSeekStripToggle => "画像フルスクリーンのサムネイル列表示を切り替える",
             FsSpaceCheck => "現在の画像のチェックを切り替える。スライドショー中は停止する",
             FsCapture => "現在の表示画像をキャプチャ保存する",
             FsAddToActiveBook => "現在のページを追加先の本へ追加する",
+            FsAddToCollectionTarget => "現在の実画像を追加先のコレクションへ追加する",
             FsExport => "現在の表示結果を別ファイルへ書き出す",
             FsCompareToggle => "現在の画像を比較スロットに固定または解除する",
             FsCompareCycle => "比較スロットのピン画像と現在画像を切り替えて表示する",
@@ -4435,6 +5150,9 @@ impl KeyAction {
             VideoBookmark => "現在の再生位置にブックマークを追加する",
             VideoCapture => "現在の動画フレームをキャプチャ保存する",
             VideoAddToActiveBook => "現在の動画フレームを追加先の本へ追加する",
+            VideoAddToCollectionTarget => {
+                "現在の動画・音声ファイルを追加先のコレクションへ追加する"
+            }
             VideoCompareToggle => "動画では比較表示キーを何もしない操作として消費する",
             VideoCompareCycle => "動画では比較切り替えキーを何もしない操作として消費する",
             VideoCompareWipe => "動画ではワイプ比較キーを何もしない操作として消費する",
@@ -4452,6 +5170,7 @@ impl KeyAction {
             VideoToggleAudioMode => {
                 "映像を消して音声モード（音楽ビュー）で聴く。音声モード中は動画表示へ戻す"
             }
+            VideoNextAudioTrack => "次の音声トラックへ切り替える",
             EraseConfirm => "消しゴム処理を実行して終了する",
             EraseConfirmPolygon => "消しゴム多角形を確定する",
             EraseRedo => "消しゴム編集をやり直す",
@@ -4494,6 +5213,7 @@ impl KeyAction {
             ConcealToolRect => "矩形ツールに切り替える",
             ConcealToolEllipse => "楕円ツールに切り替える",
             ConcealSpacePan => "押している間だけ画像をパン操作する",
+            CropForceCreateHold => "押している間、ドラッグで新しい切り取り枠を作る",
             CropSpacePan => "押している間だけ画像をパン操作する",
             CropExecute => "切り取りを実行する",
             SnsSplitExecute => "SNS 分割を実行する",
@@ -4531,9 +5251,59 @@ impl KeyAction {
             | GlobalMetadataSearch
             | GlobalOpenFolder
             | ToggleDetachedViewerMode
+            | ToggleAlwaysOnTop
             | HelpShowContextShortcuts => KeyContext::Global,
             GridFavoritePrev
             | GridFavoriteNext
+            | GridManageFavorites
+            | GridBookPrev
+            | GridBookNext
+            | GridOpenActiveBook
+            | GridManageBooks
+            | GridCollectionPrev
+            | GridCollectionNext
+            | GridOpenCollectionTarget
+            | GridManageCollections
+            | GridOpenBook1
+            | GridOpenBook2
+            | GridOpenBook3
+            | GridOpenBook4
+            | GridOpenBook5
+            | GridOpenBook6
+            | GridOpenBook7
+            | GridOpenBook8
+            | GridOpenBook9
+            | GridOpenBook10
+            | GridOpenBook11
+            | GridOpenBook12
+            | GridOpenBook13
+            | GridOpenBook14
+            | GridOpenBook15
+            | GridOpenBook16
+            | GridOpenBook17
+            | GridOpenBook18
+            | GridOpenBook19
+            | GridOpenBook20
+            | GridOpenCollection1
+            | GridOpenCollection2
+            | GridOpenCollection3
+            | GridOpenCollection4
+            | GridOpenCollection5
+            | GridOpenCollection6
+            | GridOpenCollection7
+            | GridOpenCollection8
+            | GridOpenCollection9
+            | GridOpenCollection10
+            | GridOpenCollection11
+            | GridOpenCollection12
+            | GridOpenCollection13
+            | GridOpenCollection14
+            | GridOpenCollection15
+            | GridOpenCollection16
+            | GridOpenCollection17
+            | GridOpenCollection18
+            | GridOpenCollection19
+            | GridOpenCollection20
             | GridOpenFavorite1
             | GridOpenFavorite2
             | GridOpenFavorite3
@@ -4652,6 +5422,7 @@ impl KeyAction {
             | GridDeselect
             | GridCutFiles
             | GridCopyFiles
+            | GridOrganizeFiles
             | GridToggleCheck
             | GridDelete
             | GridRename
@@ -4674,6 +5445,7 @@ impl KeyAction {
             | GridToggleMaximize
             | GridToggleFolderTreePane
             | GridToggleStackMode
+            | GridConvertEpubToPdf
             | GridTagApply
             | GridTagView
             | GridRotateCw
@@ -4681,6 +5453,7 @@ impl KeyAction {
             | GridPin
             | GridComparePin
             | GridAddToActiveBook
+            | GridAddToCollectionTarget
             | GridExportSelection
             | GridColumnCount1
             | GridColumnCount2
@@ -4692,6 +5465,16 @@ impl KeyAction {
             | GridColumnCount8
             | GridColumnCount9
             | GridColumnCount10
+            | GridColumnCount11
+            | GridColumnCount12
+            | GridColumnCount13
+            | GridColumnCount14
+            | GridColumnCount15
+            | GridColumnCount16
+            | GridColumnCount17
+            | GridColumnCount18
+            | GridColumnCount19
+            | GridColumnCount20
             | GridToggleDetailsView
             | GridOpenPreferences
             | GridOpenOperationCustomize
@@ -4715,9 +5498,22 @@ impl KeyAction {
             FsToggleMetadata | FsToggleWindowMode | FsBackToList | FsJumpFirst | FsJumpLast
             | FsCtrlNavPrev | FsCtrlNavNext | FsSiblingPrev | FsSiblingNext | FsPanorama
             | FsPanoramaProjection => KeyContext::FsCommon,
-            RatingItem1 | RatingItem2 | RatingItem3 | RatingItem4 | RatingItem5
-            | RatingItemClear | RatingContainer1 | RatingContainer2 | RatingContainer3
-            | RatingContainer4 | RatingContainer5 | RatingContainerClear => KeyContext::Rating,
+            RatingItem1
+            | RatingItem2
+            | RatingItem3
+            | RatingItem4
+            | RatingItem5
+            | RatingItemClear
+            | RatingItemStepUp
+            | RatingItemStepDown
+            | RatingContainer1
+            | RatingContainer2
+            | RatingContainer3
+            | RatingContainer4
+            | RatingContainer5
+            | RatingContainerClear
+            | RatingContainerStepUp
+            | RatingContainerStepDown => KeyContext::Rating,
             FsContinuousScrollForward
             | FsContinuousScrollBack
             | FsClose
@@ -4725,6 +5521,8 @@ impl KeyAction {
             | FsSpreadShiftRight
             | FsSpreadShiftPrev
             | FsSpreadShiftNext
+            | FsTogglePageAfterCoverAlone
+            | FsToggleLastPageAlone
             | FsPagePrev
             | FsPageNext
             | FsFixedJumpPrev
@@ -4738,6 +5536,7 @@ impl KeyAction {
             | FsSpaceCheck
             | FsCapture
             | FsAddToActiveBook
+            | FsAddToCollectionTarget
             | FsExport
             | FsCompareToggle
             | FsCompareCycle
@@ -4887,6 +5686,7 @@ impl KeyAction {
             | VideoBookmark
             | VideoCapture
             | VideoAddToActiveBook
+            | VideoAddToCollectionTarget
             | VideoCompareToggle
             | VideoCompareCycle
             | VideoCompareWipe
@@ -4902,6 +5702,7 @@ impl KeyAction {
             | VideoAdjustSlot9
             | VideoAdjustSlot10
             | VideoToggleAudioMode => KeyContext::FsVideo,
+            VideoNextAudioTrack => KeyContext::FsVideo,
             EraseConfirm | EraseConfirmPolygon | EraseRedo | EraseUndo | EraseDeleteShape
             | EraseToolSelect | EraseToolBrush | EraseToolBucket | EraseToolLasso
             | EraseToolPolygon | EraseToolVLine | EraseToolHLine | EraseToolLine
@@ -4931,7 +5732,7 @@ impl KeyAction {
             | ConcealToolRect
             | ConcealToolEllipse
             | ConcealSpacePan => KeyContext::Conceal,
-            CropExecute | CropSpacePan => KeyContext::Crop,
+            CropExecute | CropForceCreateHold | CropSpacePan => KeyContext::Crop,
             SnsSplitExecute => KeyContext::SnsSplit,
             TextConfirm | TextRedo | TextUndo | TextSpacePan => KeyContext::Text,
             LaShowSource | LaShowMask | LaPaintAdd | LaPaintErase | LaToolBrush | LaToolBucket
@@ -4944,7 +5745,9 @@ impl KeyAction {
     pub fn trigger(self) -> KeyTrigger {
         use KeyAction::*;
         match self {
-            FsNavigatorHold | FsLoupeHold | FsOriginalPreviewHold => KeyTrigger::ModifierHold,
+            FsNavigatorHold | FsLoupeHold | FsOriginalPreviewHold | CropForceCreateHold => {
+                KeyTrigger::ModifierHold
+            }
             EraseSpacePan | ConcealSpacePan | CropSpacePan | TextSpacePan | LaSpacePan
             | FsZoomMode => KeyTrigger::KeyHold,
             GlobalLocalSearch
@@ -4952,9 +5755,59 @@ impl KeyAction {
             | GlobalMetadataSearch
             | GlobalOpenFolder
             | ToggleDetachedViewerMode
+            | ToggleAlwaysOnTop
             | HelpShowContextShortcuts
             | GridFavoritePrev
             | GridFavoriteNext
+            | GridManageFavorites
+            | GridBookPrev
+            | GridBookNext
+            | GridOpenActiveBook
+            | GridManageBooks
+            | GridCollectionPrev
+            | GridCollectionNext
+            | GridOpenCollectionTarget
+            | GridManageCollections
+            | GridOpenBook1
+            | GridOpenBook2
+            | GridOpenBook3
+            | GridOpenBook4
+            | GridOpenBook5
+            | GridOpenBook6
+            | GridOpenBook7
+            | GridOpenBook8
+            | GridOpenBook9
+            | GridOpenBook10
+            | GridOpenBook11
+            | GridOpenBook12
+            | GridOpenBook13
+            | GridOpenBook14
+            | GridOpenBook15
+            | GridOpenBook16
+            | GridOpenBook17
+            | GridOpenBook18
+            | GridOpenBook19
+            | GridOpenBook20
+            | GridOpenCollection1
+            | GridOpenCollection2
+            | GridOpenCollection3
+            | GridOpenCollection4
+            | GridOpenCollection5
+            | GridOpenCollection6
+            | GridOpenCollection7
+            | GridOpenCollection8
+            | GridOpenCollection9
+            | GridOpenCollection10
+            | GridOpenCollection11
+            | GridOpenCollection12
+            | GridOpenCollection13
+            | GridOpenCollection14
+            | GridOpenCollection15
+            | GridOpenCollection16
+            | GridOpenCollection17
+            | GridOpenCollection18
+            | GridOpenCollection19
+            | GridOpenCollection20
             | GridOpenFavorite1
             | GridOpenFavorite2
             | GridOpenFavorite3
@@ -5073,6 +5926,7 @@ impl KeyAction {
             | GridDeselect
             | GridCutFiles
             | GridCopyFiles
+            | GridOrganizeFiles
             | GridToggleCheck
             | GridDelete
             | GridRename
@@ -5095,6 +5949,7 @@ impl KeyAction {
             | GridToggleMaximize
             | GridToggleFolderTreePane
             | GridToggleStackMode
+            | GridConvertEpubToPdf
             | GridTagApply
             | GridTagView
             | GridRotateCw
@@ -5102,6 +5957,7 @@ impl KeyAction {
             | GridPin
             | GridComparePin
             | GridAddToActiveBook
+            | GridAddToCollectionTarget
             | GridExportSelection
             | GridColumnCount1
             | GridColumnCount2
@@ -5113,6 +5969,16 @@ impl KeyAction {
             | GridColumnCount8
             | GridColumnCount9
             | GridColumnCount10
+            | GridColumnCount11
+            | GridColumnCount12
+            | GridColumnCount13
+            | GridColumnCount14
+            | GridColumnCount15
+            | GridColumnCount16
+            | GridColumnCount17
+            | GridColumnCount18
+            | GridColumnCount19
+            | GridColumnCount20
             | GridToggleDetailsView
             | GridOpenPreferences
             | GridOpenOperationCustomize
@@ -5157,23 +6023,30 @@ impl KeyAction {
             | RatingItem4
             | RatingItem5
             | RatingItemClear
+            | RatingItemStepUp
+            | RatingItemStepDown
             | RatingContainer1
             | RatingContainer2
             | RatingContainer3
             | RatingContainer4
             | RatingContainer5
             | RatingContainerClear
+            | RatingContainerStepUp
+            | RatingContainerStepDown
             | FsContinuousScrollForward
             | FsContinuousScrollBack
             | FsSpreadShiftLeft
             | FsSpreadShiftRight
             | FsSpreadShiftPrev
             | FsSpreadShiftNext
+            | FsTogglePageAfterCoverAlone
+            | FsToggleLastPageAlone
             | FsSlideshow
             | FsSeekStripToggle
             | FsSpaceCheck
             | FsCapture
             | FsAddToActiveBook
+            | FsAddToCollectionTarget
             | FsExport
             | FsCompareToggle
             | FsCompareCycle
@@ -5321,6 +6194,7 @@ impl KeyAction {
             | VideoBookmark
             | VideoCapture
             | VideoAddToActiveBook
+            | VideoAddToCollectionTarget
             | VideoCompareToggle
             | VideoCompareCycle
             | VideoCompareWipe
@@ -5336,6 +6210,7 @@ impl KeyAction {
             | VideoAdjustSlot9
             | VideoAdjustSlot10
             | VideoToggleAudioMode
+            | VideoNextAudioTrack
             | EraseConfirm
             | EraseConfirmPolygon
             | EraseRedo
@@ -5424,9 +6299,59 @@ impl KeyAction {
             GlobalMetadataSearch => ChordList::one(Chord::ctrl(G)),
             GlobalOpenFolder => ChordList::one(Chord::ctrl(O)),
             ToggleDetachedViewerMode => ChordList::one(Chord::key(F12)),
+            ToggleAlwaysOnTop => ChordList::EMPTY,
             HelpShowContextShortcuts => ChordList::one(Chord::shift(Slash)),
             GridFavoritePrev
             | GridFavoriteNext
+            | GridManageFavorites
+            | GridBookPrev
+            | GridBookNext
+            | GridOpenActiveBook
+            | GridManageBooks
+            | GridCollectionPrev
+            | GridCollectionNext
+            | GridOpenCollectionTarget
+            | GridManageCollections
+            | GridOpenBook1
+            | GridOpenBook2
+            | GridOpenBook3
+            | GridOpenBook4
+            | GridOpenBook5
+            | GridOpenBook6
+            | GridOpenBook7
+            | GridOpenBook8
+            | GridOpenBook9
+            | GridOpenBook10
+            | GridOpenBook11
+            | GridOpenBook12
+            | GridOpenBook13
+            | GridOpenBook14
+            | GridOpenBook15
+            | GridOpenBook16
+            | GridOpenBook17
+            | GridOpenBook18
+            | GridOpenBook19
+            | GridOpenBook20
+            | GridOpenCollection1
+            | GridOpenCollection2
+            | GridOpenCollection3
+            | GridOpenCollection4
+            | GridOpenCollection5
+            | GridOpenCollection6
+            | GridOpenCollection7
+            | GridOpenCollection8
+            | GridOpenCollection9
+            | GridOpenCollection10
+            | GridOpenCollection11
+            | GridOpenCollection12
+            | GridOpenCollection13
+            | GridOpenCollection14
+            | GridOpenCollection15
+            | GridOpenCollection16
+            | GridOpenCollection17
+            | GridOpenCollection18
+            | GridOpenCollection19
+            | GridOpenCollection20
             | GridOpenFavorite1
             | GridOpenFavorite2
             | GridOpenFavorite3
@@ -5550,7 +6475,7 @@ impl KeyAction {
             GridCopyFiles => ChordList::one(Chord::ctrl(C)),
             GridToggleCheck => ChordList::one(Chord::key(Space)),
             GridDelete => ChordList::one(Chord::key(Delete)),
-            GridRename | GridReload => ChordList::EMPTY,
+            GridRename | GridReload | GridOrganizeFiles => ChordList::EMPTY,
             GridOpenSelected => ChordList::one(Chord::key(Enter)),
             GridOpenSelectedAsPage | GridOpenSelectedAsList => ChordList::EMPTY,
             GridOpenExternalPlayer => ChordList::one(Chord::shift(Enter)),
@@ -5568,6 +6493,7 @@ impl KeyAction {
             GridToggleMaximize => ChordList::one(Chord::key(F11)),
             GridToggleFolderTreePane => ChordList::one(Chord::key(F)),
             GridToggleStackMode => ChordList::EMPTY,
+            GridConvertEpubToPdf => ChordList::EMPTY,
             GridTagApply => ChordList::one(Chord::key(T)),
             GridTagView => ChordList::one(Chord::ctrl(T)),
             GridRotateCw => ChordList::one(Chord::key(R)),
@@ -5575,6 +6501,7 @@ impl KeyAction {
             GridPin => ChordList::one(Chord::key(P)),
             GridComparePin => ChordList::one(Chord::key(X)),
             GridAddToActiveBook => ChordList::one(Chord::ctrl(B)),
+            GridAddToCollectionTarget => ChordList::EMPTY,
             // フルスクリーンの `FsExport` と同じ既定キーだが、別 action として持つ。
             // 一方へまとめると、利用者が保存済みの上書き (action 名がキー) の意味が
             // 黙って変わる。
@@ -5589,6 +6516,9 @@ impl KeyAction {
             GridColumnCount8 => alt_digit_pair(Num8, Numpad8),
             GridColumnCount9 => alt_digit_pair(Num9, Numpad9),
             GridColumnCount10 => alt_digit_pair(Num0, Numpad0),
+            GridColumnCount11 | GridColumnCount12 | GridColumnCount13 | GridColumnCount14
+            | GridColumnCount15 | GridColumnCount16 | GridColumnCount17 | GridColumnCount18
+            | GridColumnCount19 | GridColumnCount20 => ChordList::EMPTY,
             GridToggleDetailsView => ChordList::one(Chord::alt(Minus)),
             GridOpenPreferences | GridOpenOperationCustomize => ChordList::EMPTY,
             GridAdjustSlot1 => ctrl_digit_pair(Num1, Numpad1),
@@ -5631,22 +6561,26 @@ impl KeyAction {
             RatingItem4 => ChordList::one(Chord::key(F4)),
             RatingItem5 => ChordList::one(Chord::key(F5)),
             RatingItemClear => ChordList::one(Chord::key(F6)),
+            RatingItemStepUp | RatingItemStepDown => ChordList::EMPTY,
             RatingContainer1 => ChordList::one(Chord::shift(F1)),
             RatingContainer2 => ChordList::one(Chord::shift(F2)),
             RatingContainer3 => ChordList::one(Chord::shift(F3)),
             RatingContainer4 => ChordList::one(Chord::shift(F4)),
             RatingContainer5 => ChordList::one(Chord::shift(F5)),
             RatingContainerClear => ChordList::one(Chord::shift(F6)),
+            RatingContainerStepUp | RatingContainerStepDown => ChordList::EMPTY,
             FsContinuousScrollForward => ChordList::one(Chord::key(PageDown)),
             FsContinuousScrollBack => ChordList::one(Chord::key(PageUp)),
             FsSpreadShiftLeft => ChordList::one(Chord::ctrl(Left)),
             FsSpreadShiftRight => ChordList::one(Chord::ctrl(Right)),
             FsSpreadShiftPrev | FsSpreadShiftNext => ChordList::EMPTY,
+            FsTogglePageAfterCoverAlone | FsToggleLastPageAlone => ChordList::EMPTY,
             FsSlideshow => ChordList::one(Chord::key(S)),
             FsSeekStripToggle => ChordList::one(Chord::shift(S)),
             FsSpaceCheck => ChordList::one(Chord::key(Space)),
             FsCapture => ChordList::one(Chord::ctrl(S)),
             FsAddToActiveBook => ChordList::one(Chord::ctrl(B)),
+            FsAddToCollectionTarget => ChordList::EMPTY,
             FsExport => ChordList::one(Chord::ctrl(E)),
             FsCompareToggle => ChordList::one(Chord::key(X)),
             FsCompareCycle => ChordList::one(Chord::key(C)),
@@ -5802,6 +6736,7 @@ impl KeyAction {
             VideoBookmark => ChordList::one(Chord::key(B)),
             VideoCapture => ChordList::one(Chord::ctrl(S)),
             VideoAddToActiveBook => ChordList::one(Chord::ctrl(B)),
+            VideoAddToCollectionTarget => ChordList::EMPTY,
             VideoCompareToggle => ChordList::one(Chord::key(X)),
             VideoCompareCycle => ChordList::one(Chord::key(C)),
             VideoCompareWipe => ChordList::one(Chord::shift(C)),
@@ -5818,6 +6753,7 @@ impl KeyAction {
             VideoAdjustSlot10 => ctrl_digit_pair(Num0, Numpad0),
             // Z: 動画→音声モードのトグル。画像の Z (FsZoomMode) とは別コンテキスト (FsVideo) なので競合しない。
             VideoToggleAudioMode => ChordList::one(Chord::key(Z)),
+            VideoNextAudioTrack => ChordList::EMPTY,
             EraseConfirm => ChordList::one(Chord::key(E)),
             EraseConfirmPolygon => ChordList::one(Chord::key(Enter)),
             EraseRedo => ChordList::two(Chord::ctrl(Y), Chord::ctrl_shift(Z)),
@@ -5860,6 +6796,7 @@ impl KeyAction {
             ConcealToolRect => ChordList::one(Chord::key(R)),
             ConcealToolEllipse => ChordList::one(Chord::key(O)),
             ConcealSpacePan => ChordList::one(Chord::key(Space)),
+            CropForceCreateHold => ChordList::one(Chord::modifier(ModKind::Ctrl)),
             CropSpacePan => ChordList::one(Chord::key(Space)),
             CropExecute => ChordList::one(Chord::ctrl(E)),
             SnsSplitExecute => ChordList::EMPTY,
@@ -6045,7 +6982,7 @@ enum IniTemplateKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RatingKey {
     pub container: bool,
-    pub stars: u8,
+    pub edit: RatingEdit,
 }
 
 pub const GRID_ACTIVE_SCOPES: &[CommandScope] =
@@ -6124,7 +7061,7 @@ pub struct BindingConflict {
     pub other_scope: CommandScope,
     pub trigger: KeyTrigger,
     pub other_trigger: KeyTrigger,
-    pub reserved_name: Option<&'static str>,
+    pub reserved_kind: Option<ReservedBindingKind>,
 }
 
 impl BindingConflict {
@@ -6135,7 +7072,8 @@ impl BindingConflict {
                 "binding warning: '{}' uses reserved shortcut {} ({}) in overlapping scope [{}]",
                 self.action.ini_name(),
                 chord,
-                self.reserved_name.unwrap_or("reserved input"),
+                self.reserved_kind
+                    .map_or("固定入力", ReservedBindingKind::label),
                 self.scope.ini_name()
             ),
             BindingConflictKind::Hard
@@ -6174,12 +7112,32 @@ struct EffectiveBinding {
     customized: bool,
 }
 
+/// 固定入力の種別。表示名の所有者はこの enum だけにし、判定は表示文字列ではなく種別で行う。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ReservedBindingKind {
+    EscapeNavigation,
+    PlainArrowNavigation,
+    GridRangeSelection,
+}
+
+impl ReservedBindingKind {
+    /// 操作カスタマイズ画面と警告ログに出す表示名。
+    /// 固定側は keymap から解除できないので、その事実を名前自体に含める。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::EscapeNavigation => "Esc の固定操作（戻る / キャンセル、解除不可）",
+            Self::PlainArrowNavigation => "修飾なし矢印の固定ナビゲーション（解除不可）",
+            Self::GridRangeSelection => "サムネイル一覧の Shift+矢印範囲選択（解除不可）",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct ReservedBinding {
     scope: CommandScope,
     trigger: KeyTrigger,
     chord: Chord,
-    name: &'static str,
+    kind: ReservedBindingKind,
 }
 
 const RESERVED_BINDINGS: &[ReservedBinding] = &[
@@ -6187,55 +7145,55 @@ const RESERVED_BINDINGS: &[ReservedBinding] = &[
         scope: KeyContext::Global,
         trigger: KeyTrigger::Press,
         chord: Chord::key(KeyName::Esc),
-        name: "Escape navigation / cancel",
+        kind: ReservedBindingKind::EscapeNavigation,
     },
     ReservedBinding {
         scope: KeyContext::Global,
         trigger: KeyTrigger::Press,
         chord: Chord::key(KeyName::Left),
-        name: "plain arrow navigation",
+        kind: ReservedBindingKind::PlainArrowNavigation,
     },
     ReservedBinding {
         scope: KeyContext::Global,
         trigger: KeyTrigger::Press,
         chord: Chord::key(KeyName::Right),
-        name: "plain arrow navigation",
+        kind: ReservedBindingKind::PlainArrowNavigation,
     },
     ReservedBinding {
         scope: KeyContext::Global,
         trigger: KeyTrigger::Press,
         chord: Chord::key(KeyName::Up),
-        name: "plain arrow navigation",
+        kind: ReservedBindingKind::PlainArrowNavigation,
     },
     ReservedBinding {
         scope: KeyContext::Global,
         trigger: KeyTrigger::Press,
         chord: Chord::key(KeyName::Down),
-        name: "plain arrow navigation",
+        kind: ReservedBindingKind::PlainArrowNavigation,
     },
     ReservedBinding {
         scope: KeyContext::Grid,
         trigger: KeyTrigger::Press,
         chord: Chord::shift(KeyName::Left),
-        name: "grid range selection",
+        kind: ReservedBindingKind::GridRangeSelection,
     },
     ReservedBinding {
         scope: KeyContext::Grid,
         trigger: KeyTrigger::Press,
         chord: Chord::shift(KeyName::Right),
-        name: "grid range selection",
+        kind: ReservedBindingKind::GridRangeSelection,
     },
     ReservedBinding {
         scope: KeyContext::Grid,
         trigger: KeyTrigger::Press,
         chord: Chord::shift(KeyName::Up),
-        name: "grid range selection",
+        kind: ReservedBindingKind::GridRangeSelection,
     },
     ReservedBinding {
         scope: KeyContext::Grid,
         trigger: KeyTrigger::Press,
         chord: Chord::shift(KeyName::Down),
-        name: "grid range selection",
+        kind: ReservedBindingKind::GridRangeSelection,
     },
 ];
 
@@ -6645,7 +7603,7 @@ impl Keymap {
                     other_scope: second.scope,
                     trigger: first.trigger,
                     other_trigger: second.trigger,
-                    reserved_name: None,
+                    reserved_kind: None,
                 });
             }
         }
@@ -6668,7 +7626,7 @@ impl Keymap {
                         other_scope: reserved.scope,
                         trigger: binding.trigger,
                         other_trigger: reserved.trigger,
-                        reserved_name: Some(reserved.name),
+                        reserved_kind: Some(reserved.kind),
                     });
                 }
             }
@@ -6768,11 +7726,26 @@ impl Keymap {
         )
     }
 
-    pub fn consume_rating_action(&self, ctx: &egui::Context, container: bool) -> Option<u8> {
+    pub fn consume_rating_action(
+        &self,
+        ctx: &egui::Context,
+        container: bool,
+    ) -> Option<RatingEdit> {
         rating_actions(container)
             .iter()
             .copied()
-            .find_map(|(action, stars)| self.consume_action(ctx, action).then_some(stars))
+            .find_map(|(action, stars)| {
+                self.consume_action(ctx, action)
+                    .then_some(RatingEdit::Assign(stars))
+            })
+            .or_else(|| {
+                rating_step_actions(container)
+                    .into_iter()
+                    .find_map(|(action, direction)| {
+                        self.consume_action(ctx, action)
+                            .then_some(RatingEdit::Step(direction))
+                    })
+            })
     }
 
     #[cfg(windows)]
@@ -6786,7 +7759,18 @@ impl Keymap {
         for container in [true, false] {
             for (action, stars) in rating_actions(container).iter().copied() {
                 if self.matches_vk_action(action, key) {
-                    return Some(RatingKey { container, stars });
+                    return Some(RatingKey {
+                        container,
+                        edit: RatingEdit::Assign(stars),
+                    });
+                }
+            }
+            for (action, direction) in rating_step_actions(container) {
+                if self.matches_vk_action(action, key) {
+                    return Some(RatingKey {
+                        container,
+                        edit: RatingEdit::Step(direction),
+                    });
                 }
             }
         }
@@ -7097,6 +8081,69 @@ impl Keymap {
             .any(|chord| self.key_held_chord(ctx, permit, chord))
     }
 
+    /// Resolve the crop mode's temporary pan without weakening the generic
+    /// `KeyHold` exact-modifier contract.
+    ///
+    /// A normal unmodified `CropSpacePan` remains valid even when force-create
+    /// is disabled. The only added combination is that same effective plain-key
+    /// binding plus the sole active modifier group selected by the effective
+    /// `CropForceCreateHold` binding. This lets Space-pan win at pointer-down
+    /// while keeping unrelated modifier groups and other contexts excluded.
+    pub(crate) fn crop_space_pan_held(
+        &self,
+        ctx: &egui::Context,
+        permit: crate::keyboard_input::FocusedKeyStatePermit,
+    ) -> bool {
+        if !permit.allows(ctx) || crate::keyboard_input::keymap_owner_blocks_shortcuts(ctx) {
+            return false;
+        }
+
+        let pan_chords = self.effective_chords(KeyAction::CropSpacePan);
+        if pan_chords
+            .iter()
+            .copied()
+            .any(|chord| self.key_held_chord(ctx, permit, chord))
+        {
+            return true;
+        }
+        let force_chords = self.effective_chords(KeyAction::CropForceCreateHold);
+        if pan_chords.is_empty() || force_chords.is_empty() {
+            return false;
+        }
+
+        #[cfg(windows)]
+        {
+            let modifiers = ModifierLevelSnapshot {
+                ctrl: modifier_held_via_os(permit, ModKind::Ctrl),
+                shift: modifier_held_via_os(permit, ModKind::Shift),
+                alt: modifier_held_via_os(permit, ModKind::Alt),
+                right_ctrl: modifier_held_via_os(permit, ModKind::RightCtrl),
+                right_shift: modifier_held_via_os(permit, ModKind::RightShift),
+                right_alt: modifier_held_via_os(permit, ModKind::RightAlt),
+            };
+            crop_pan_with_force_binding_held(&pan_chords, &force_chords, modifiers, |key| {
+                key_held_via_os(permit.viewport(), key)
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            let modifiers = ctx.input(|input| ModifierLevelSnapshot {
+                ctrl: input.modifiers.ctrl,
+                shift: input.modifiers.shift,
+                alt: input.modifiers.alt,
+                // The non-Windows keymap already projects right-only modifier
+                // bindings onto their broad egui group.
+                right_ctrl: input.modifiers.ctrl,
+                right_shift: input.modifiers.shift,
+                right_alt: input.modifiers.alt,
+            });
+            crop_pan_with_force_binding_held(&pan_chords, &force_chords, modifiers, |key| {
+                key.to_egui()
+                    .is_some_and(|key| ctx.input(|i| i.key_down(key)))
+            })
+        }
+    }
+
     /// KeyHold アクションに割り当てられたキーについて、このフレームの egui Key イベント
     /// (押下 / 離し) を取り出して消費する。戻り値 = (押下イベントあり, 離しイベントあり)。
     /// OS 直読みのエッジ (`key_held_action` のフレーム間差分) では取りこぼす高速タップ
@@ -7313,7 +8360,10 @@ impl Keymap {
             matches!(
                 action.context(),
                 KeyContext::FsCommon | KeyContext::FsVideo | KeyContext::Rating
-            ) || *action == KeyAction::ToggleDetachedViewerMode
+            ) || matches!(
+                action,
+                KeyAction::ToggleDetachedViewerMode | KeyAction::ToggleAlwaysOnTop
+            )
         }) {
             if let Some(override_chords) = self.overrides.get(&action) {
                 chords.extend(override_chords.iter().copied());
@@ -8388,7 +9438,10 @@ pub fn native_video_fullscreen_shortcut_key(
             matches!(
                 action.context(),
                 KeyContext::FsCommon | KeyContext::FsVideo | KeyContext::Rating
-            ) || *action == KeyAction::ToggleDetachedViewerMode
+            ) || matches!(
+                action,
+                KeyAction::ToggleDetachedViewerMode | KeyAction::ToggleAlwaysOnTop
+            )
         })
         .any(|action| fallback.matches_vk_action(action, key))
 }
@@ -8663,14 +9716,6 @@ mod tests {
         assert_eq!(KeyName::IntlYen.egui_key_for_hold_edges(), None);
     }
 
-    #[cfg(windows)]
-    fn native_video_shortcut_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        crate::key_input::TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("native video shortcut test lock poisoned")
-    }
-
     fn key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
         egui::Event::Key {
             key,
@@ -8693,11 +9738,9 @@ mod tests {
     #[test]
     fn mask_redo_ctrl_shift_z_is_consumed_before_undo() {
         #[cfg(windows)]
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         #[cfg(windows)]
         let _clear = ClearTestKeyFrame;
-        #[cfg(windows)]
-        crate::key_input::clear_test_frame();
 
         let keymap = Keymap::empty();
         let modifiers = egui::Modifiers {
@@ -8899,7 +9942,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn frame_active_viewport_without_the_edge_does_not_match_enter_from_egui() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
 
         let keymap = Keymap::from_settings(&KeymapSettings::default());
@@ -8946,7 +9989,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn numpad_enter_hold_claims_its_egui_twin_so_enter_close_does_not_fire() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
 
         let mut settings = KeymapSettings::default();
@@ -9010,10 +10053,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn enter_hold_stays_false_before_and_after_viewport_routing_without_owned_input() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let viewport = egui::ViewportId::from_hash_of(1_u64);
-        crate::key_input::clear_test_frame();
 
         let before_registration = key_held_from_os_sources(
             KeyName::Enter,
@@ -9035,7 +10077,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn key_hold_state_distinguishes_both_enter_directions() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let viewport = egui::ViewportId::from_hash_of(2_u64);
         crate::key_input::set_test_frame_for_viewport(viewport, Vec::new());
@@ -9173,7 +10215,10 @@ mod tests {
             .collect();
 
         let mut native_actions = directly_routed_video_actions(native_source, |name| {
-            vec![format!("matches_vk_action(KeyAction::{name},&key)")]
+            vec![
+                format!("matches_vk_action(KeyAction::{name},&key)"),
+                format!("resolved_action==Some(KeyAction::{name})"),
+            ]
         });
         let mut egui_actions = directly_routed_video_actions(egui_source, |name| {
             vec![
@@ -9182,9 +10227,12 @@ mod tests {
             ]
         });
 
-        let native_slot_route = "VIDEO_ADJUST_SLOT_ACTIONS.iter().position(|action|self.keymap.matches_vk_action(*action,&key))";
+        let native_slot_route =
+            "VIDEO_ADJUST_SLOT_ACTIONS.iter().position(|action|*action==resolved)";
         assert!(
-            native_compact.contains(native_slot_route),
+            native_compact.contains(native_slot_route)
+                && native_compact
+                    .contains("foractioninVIDEO_ADJUST_SLOT_ACTIONS{ifmatches(action)"),
             "native video adjustment-slot route changed; update this inventory test with it"
         );
         native_actions.extend(VIDEO_ADJUST_SLOT_ACTIONS);
@@ -9296,6 +10344,7 @@ mod tests {
     fn ring_actions_are_classified_for_key_action_parity() {
         let mut key_handled = std::collections::BTreeSet::from([
             "AddToBook".to_string(),
+            "AddToCollection".to_string(),
             "PinRepresentativeThumb".to_string(),
             "ToggleDetachedViewer".to_string(),
             "ToggleWindowMode".to_string(),
@@ -9309,6 +10358,7 @@ mod tests {
             "GridToggleDetails".to_string(),
             "GridToggleCheck".to_string(),
             "GridSelectAll".to_string(),
+            "GridOrganizeFiles".to_string(),
             "GridOpenSelectedAsPage".to_string(),
             "GridOpenSelectedAsList".to_string(),
             "GridMoveFirst".to_string(),
@@ -9326,6 +10376,7 @@ mod tests {
             "ImageZoomMode".to_string(),
             "ImagePixelGrid".to_string(),
             "ImageBackgroundCycle".to_string(),
+            "ImageFitModeCycle".to_string(),
             "ImageComparePin".to_string(),
             "ImageHome".to_string(),
             "ImageEnd".to_string(),
@@ -9361,7 +10412,7 @@ mod tests {
         ]);
         add_numbered_names(&mut key_handled, "OpenFavorite", 1..=20);
         add_drive_names(&mut key_handled, "OpenDrive");
-        add_numbered_names(&mut key_handled, "GridColumnCount", 1..=10);
+        add_numbered_names(&mut key_handled, "GridColumnCount", 1..=20);
 
         let fixed_or_ring_only = std::collections::BTreeSet::from([
             // Favorite picker / snapshot lock / Explorer open-folder are input-layer features.
@@ -9744,6 +10795,47 @@ mod tests {
     }
 
     #[test]
+    fn legacy_collection_relink_id_remains_readable_but_is_not_rendered() {
+        assert_eq!(
+            MenuCommandId::parse_stable_name("CollectionsRelinkCurrent"),
+            Some(MenuCommandId::CollectionsRelinkCurrent)
+        );
+        let visible = menu_commands_for_parent(TopMenuId::Collections)
+            .map(|spec| spec.id)
+            .collect::<Vec<_>>();
+        assert!(!visible.contains(&MenuCommandId::CollectionsRelinkCurrent));
+        assert!(visible.contains(&MenuCommandId::CollectionsReorderCurrent));
+        assert_eq!(
+            menu_command_spec(MenuCommandId::CollectionsReorderCurrent)
+                .unwrap()
+                .label,
+            "現在のコレクションを並べ替え…"
+        );
+
+        let saved = MenuLayoutSettings {
+            top_menu_order: vec!["Collections".into()],
+            command_order: vec![MenuCommandOrderSettings {
+                parent: "Collections".into(),
+                commands: vec![
+                    "CollectionsRelinkCurrent".into(),
+                    "CollectionsReorderCurrent".into(),
+                ],
+            }],
+            hidden_commands: Vec::new(),
+        };
+        let resolved = resolve_menu_layout(&saved);
+        let commands = resolved
+            .menus
+            .iter()
+            .find(|menu| menu.id == TopMenuId::Collections)
+            .unwrap()
+            .commands
+            .clone();
+        assert!(!commands.contains(&MenuCommandId::CollectionsRelinkCurrent));
+        assert!(commands.contains(&MenuCommandId::CollectionsReorderCurrent));
+    }
+
+    #[test]
     fn default_menu_layout_settings_resolves_to_catalog_order() {
         let resolved = resolve_menu_layout(&MenuLayoutSettings::default());
         let default_settings = default_menu_layout_settings();
@@ -9759,6 +10851,31 @@ mod tests {
                 .collect();
             assert_eq!(menu.commands, expected);
         }
+    }
+
+    #[test]
+    fn legacy_saved_menu_order_inserts_collections_directly_after_books() {
+        let settings = MenuLayoutSettings {
+            top_menu_order: vec![
+                "Help".to_owned(),
+                "Books".to_owned(),
+                "File".to_owned(),
+                "Settings".to_owned(),
+            ],
+            command_order: Vec::new(),
+            hidden_commands: Vec::new(),
+        };
+        let resolved = resolve_menu_layout(&settings);
+        let parents = resolved
+            .menus
+            .iter()
+            .map(|menu| menu.id)
+            .collect::<Vec<_>>();
+        let books = parents
+            .iter()
+            .position(|id| *id == TopMenuId::Books)
+            .unwrap();
+        assert_eq!(parents[books + 1], TopMenuId::Collections);
     }
 
     #[test]
@@ -9844,6 +10961,84 @@ mod tests {
             .position(|id| *id == MenuCommandId::SettingsRemoteConnection)
             .unwrap();
         assert!(remote > preferences);
+    }
+
+    #[test]
+    fn always_on_top_is_pinned_for_saved_settings_orders_and_can_be_hidden() {
+        let mut settings = MenuLayoutSettings {
+            command_order: vec![MenuCommandOrderSettings {
+                parent: "Settings".into(),
+                commands: vec![
+                    "SettingsPreferences".into(),
+                    "SettingsStats".into(),
+                    "SettingsAlwaysOnTop".into(),
+                ],
+            }],
+            ..MenuLayoutSettings::default()
+        };
+        let settings_commands = |settings: &MenuLayoutSettings| {
+            resolve_menu_layout(settings)
+                .menus
+                .into_iter()
+                .find(|menu| menu.id == TopMenuId::Settings)
+                .unwrap()
+                .commands
+        };
+        let commands = settings_commands(&settings);
+        assert_eq!(commands[0], MenuCommandId::SettingsAlwaysOnTop);
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|id| **id == MenuCommandId::SettingsAlwaysOnTop)
+                .count(),
+            1
+        );
+        settings.hidden_commands.push("SettingsAlwaysOnTop".into());
+        let hidden = settings_commands(&settings);
+        assert!(!hidden.contains(&MenuCommandId::SettingsAlwaysOnTop));
+        assert!(hidden.contains(&MenuCommandId::SettingsPreferences));
+        assert!(KeyAction::ToggleAlwaysOnTop.default_chords().is_empty());
+        assert_eq!(KeyAction::ToggleAlwaysOnTop.context(), KeyContext::Global);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn always_on_top_has_no_default_key_and_rebound_key_reaches_egui_and_native() {
+        let _guard = crate::key_input::lock_test_input();
+        let _clear = ClearTestKeyFrame;
+        let ctx = egui::Context::default();
+        let default = Keymap::empty();
+        begin_key_pass(&ctx, egui::Key::F16, egui::Modifiers::NONE);
+        assert!(!default.consume_action_no_repeat(&ctx, KeyAction::ToggleAlwaysOnTop));
+        let _ = ctx.end_pass();
+
+        let rebound = Keymap::from_ini_str("[Global]\nToggleAlwaysOnTop = F16\n");
+        assert!(rebound.warnings().is_empty());
+        assert_eq!(
+            rebound.effective_chords(KeyAction::ToggleAlwaysOnTop),
+            vec![Chord::key(KeyName::F16)]
+        );
+        let ctx = egui::Context::default();
+        begin_key_pass(&ctx, egui::Key::F16, egui::Modifiers::NONE);
+        assert!(rebound.consume_action_no_repeat(&ctx, KeyAction::ToggleAlwaysOnTop));
+        assert!(!rebound.consume_action_no_repeat(&ctx, KeyAction::ToggleAlwaysOnTop));
+        let _ = ctx.end_pass();
+
+        let key = crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
+            virtual_key: 0x7f,
+            scan_code: 0,
+            extended: false,
+            shift: false,
+            ctrl: false,
+            alt: false,
+            repeat: false,
+        };
+        assert!(rebound.matches_vk_action(KeyAction::ToggleAlwaysOnTop, &key));
+        Keymap::empty().install_global_native_video_shortcuts();
+        assert!(!native_video_fullscreen_shortcut_key(&key));
+        rebound.install_global_native_video_shortcuts();
+        assert!(native_video_fullscreen_shortcut_key(&key));
     }
 
     #[test]
@@ -10007,8 +11202,9 @@ mod tests {
             ),
             (
                 MenuCommandId::SettingsArchiveCache,
-                "変換済みアーカイブキャッシュ管理",
+                "変換済みアーカイブ管理",
             ),
+            (MenuCommandId::SettingsEpubCache, "EPUB 変換キャッシュ管理"),
             (MenuCommandId::SettingsThumbnailQuality, "サムネイル画質…"),
             (MenuCommandId::SettingsStats, "統計…"),
             (MenuCommandId::SettingsResetRotation, "回転情報をリセット…"),
@@ -10289,13 +11485,20 @@ mod tests {
     #[test]
     fn grid_toggle_stack_mode_is_default_unassigned() {
         assert!(KeyAction::GridToggleStackMode.default_chords().is_empty());
+        assert!(KeyAction::GridConvertEpubToPdf.default_chords().is_empty());
+        assert_eq!(KeyAction::GridConvertEpubToPdf.context(), KeyContext::Grid);
+        assert_eq!(KeyAction::GridConvertEpubToPdf.trigger(), KeyTrigger::Press);
         assert_eq!(KeyAction::GridToggleStackMode.context(), KeyContext::Grid);
         assert_eq!(KeyAction::GridToggleStackMode.trigger(), KeyTrigger::Press);
     }
 
     #[test]
     fn grid_rename_and_reload_are_default_unassigned() {
-        for action in [KeyAction::GridRename, KeyAction::GridReload] {
+        for action in [
+            KeyAction::GridRename,
+            KeyAction::GridReload,
+            KeyAction::GridOrganizeFiles,
+        ] {
             assert!(KeyAction::all().contains(&action));
             assert!(action.default_chords().is_empty());
             assert_eq!(action.context(), KeyContext::Grid);
@@ -10737,6 +11940,47 @@ mod tests {
     }
 
     #[test]
+    fn saved_group_actions_are_grid_press_commands_with_round_trippable_empty_defaults() {
+        let defaults = Keymap::default();
+        for action in SAVED_GROUP_ACTIONS.iter().copied() {
+            assert!(ALL_ACTIONS.contains(&action), "{action:?}");
+            assert_eq!(action.context(), KeyContext::Grid, "{action:?}");
+            assert_eq!(action.trigger(), KeyTrigger::Press, "{action:?}");
+            assert!(action.default_chords().is_empty(), "{action:?}");
+            assert!(defaults.effective_chords(action).is_empty(), "{action:?}");
+            assert!(action.is_user_facing(), "{action:?}");
+            assert_eq!(KeyAction::from_ini_name(action.ini_name()), Some(action));
+
+            let configured =
+                Keymap::from_ini_str(&format!("[Grid]\n{} = F13\n", action.ini_name()));
+            assert!(configured.warnings().is_empty(), "{action:?}");
+            assert_eq!(
+                configured.effective_chords(action),
+                vec![Chord::key(KeyName::F13)],
+                "{action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_book_and_collection_location_slot_maps_exactly_one_through_twenty() {
+        for (index, action) in BOOK_LOCATION_ACTIONS.iter().copied().enumerate() {
+            assert_eq!(action.book_slot_number(), Some(index + 1), "{action:?}");
+            assert_eq!(action.collection_slot_number(), None, "{action:?}");
+        }
+        for (index, action) in COLLECTION_LOCATION_ACTIONS.iter().copied().enumerate() {
+            assert_eq!(
+                action.collection_slot_number(),
+                Some(index + 1),
+                "{action:?}"
+            );
+            assert_eq!(action.book_slot_number(), None, "{action:?}");
+        }
+        assert_eq!(BOOK_LOCATION_ACTIONS.len(), 20);
+        assert_eq!(COLLECTION_LOCATION_ACTIONS.len(), 20);
+    }
+
+    #[test]
     fn grid_location_shortcuts_do_not_overlap_fullscreen_compare_defaults() {
         let keymap = Keymap::from_ini_str(
             r#"
@@ -11030,6 +12274,155 @@ mod tests {
     }
 
     #[test]
+    fn crop_force_create_is_a_customizable_ctrl_modifier_hold() {
+        let action = KeyAction::CropForceCreateHold;
+        assert!(KeyAction::all().contains(&action));
+        assert_eq!(KeyAction::parse_ini_name(action.ini_name()), Some(action));
+        assert_eq!(action.context(), KeyContext::Crop);
+        assert_eq!(action.trigger(), KeyTrigger::ModifierHold);
+        assert_eq!(
+            action.default_chords().iter().next(),
+            Some(Chord::modifier(ModKind::Ctrl))
+        );
+        assert_eq!(
+            BindingPolicy::for_trigger(action.trigger()),
+            BindingPolicy::SingleModifier
+        );
+
+        let keymap = Keymap::default();
+        let rows = keymap.command_display_rows_for_active_scopes(&[CommandScope::Crop], false);
+        let row = rows
+            .iter()
+            .find(|row| row.spec.action == action)
+            .expect("the crop shortcut help must include force-create");
+        assert_eq!(row.shortcut_labels, vec!["Ctrl".to_owned()]);
+        assert_eq!(row.spec.scope, CommandScope::Crop);
+
+        let customized = Keymap::from_ini_str("[Crop]\nCropForceCreateHold = RightCtrl\n");
+        assert!(customized.warnings().is_empty());
+        let customized_row = customized
+            .command_display_rows_for_active_scopes(&[CommandScope::Crop], false)
+            .into_iter()
+            .find(|row| row.spec.action == action)
+            .expect("a customized force-create remains visible in crop help");
+        assert_eq!(customized_row.shortcut_labels, vec!["右Ctrl".to_owned()]);
+
+        let disabled = Keymap::from_ini_str("[Crop]\nCropForceCreateHold = none\n");
+        assert!(
+            disabled
+                .command_display_rows_for_active_scopes(&[CommandScope::Crop], false)
+                .iter()
+                .all(|row| row.spec.action != action)
+        );
+        let disabled_row = disabled
+            .command_display_rows_for_active_scopes(&[CommandScope::Crop], true)
+            .into_iter()
+            .find(|row| row.spec.action == action)
+            .expect("settings inventory must retain a disabled force-create action");
+        assert!(disabled_row.shortcut_labels.is_empty());
+    }
+
+    #[test]
+    fn crop_pan_force_combination_uses_effective_bindings_and_rejects_extra_groups() {
+        let keymap =
+            Keymap::from_ini_str("[Crop]\nCropSpacePan = P\nCropForceCreateHold = Shift\n");
+        assert!(keymap.warnings().is_empty());
+        let pan = keymap.effective_chords(KeyAction::CropSpacePan);
+        let force = keymap.effective_chords(KeyAction::CropForceCreateHold);
+        let p_is_held = |key| key == KeyName::P;
+
+        assert!(crop_pan_with_force_binding_held(
+            pan.as_slice(),
+            force.as_slice(),
+            ModifierLevelSnapshot {
+                shift: true,
+                ..Default::default()
+            },
+            p_is_held,
+        ));
+        assert!(!crop_pan_with_force_binding_held(
+            pan.as_slice(),
+            force.as_slice(),
+            ModifierLevelSnapshot {
+                shift: true,
+                alt: true,
+                ..Default::default()
+            },
+            p_is_held,
+        ));
+        assert!(!crop_pan_with_force_binding_held(
+            pan.as_slice(),
+            &[],
+            ModifierLevelSnapshot {
+                shift: true,
+                ..Default::default()
+            },
+            p_is_held,
+        ));
+        assert!(!crop_pan_with_force_binding_held(
+            &[],
+            force.as_slice(),
+            ModifierLevelSnapshot {
+                shift: true,
+                ..Default::default()
+            },
+            p_is_held,
+        ));
+
+        let force_disabled = Keymap::from_ini_str("[Crop]\nCropForceCreateHold = none\n");
+        assert!(force_disabled.warnings().is_empty());
+        assert_eq!(
+            force_disabled.effective_chords(KeyAction::CropSpacePan),
+            vec![Chord::key(KeyName::Space)],
+            "disabling force-create must not disable ordinary unmodified Space-pan"
+        );
+        assert!(
+            force_disabled
+                .effective_chords(KeyAction::CropForceCreateHold)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn crop_pan_force_combination_respects_right_only_modifier_scope() {
+        let pan = [Chord::key(KeyName::Space)];
+        let force = [Chord::modifier(ModKind::RightCtrl)];
+        let space_is_held = |key| key == KeyName::Space;
+
+        assert!(!crop_pan_with_force_binding_held(
+            &pan,
+            &force,
+            ModifierLevelSnapshot {
+                ctrl: true,
+                right_ctrl: false,
+                ..Default::default()
+            },
+            space_is_held,
+        ));
+        assert!(crop_pan_with_force_binding_held(
+            &pan,
+            &force,
+            ModifierLevelSnapshot {
+                ctrl: true,
+                right_ctrl: true,
+                ..Default::default()
+            },
+            space_is_held,
+        ));
+        assert!(!crop_pan_with_force_binding_held(
+            &pan,
+            &force,
+            ModifierLevelSnapshot {
+                ctrl: true,
+                alt: true,
+                right_ctrl: true,
+                ..Default::default()
+            },
+            space_is_held,
+        ));
+    }
+
+    #[test]
     fn navigator_uses_free_alt_n_image_fullscreen_chord() {
         let navigator = KeyAction::FsNavigatorToggle;
         let chord = Chord::alt(KeyName::N);
@@ -11121,6 +12514,19 @@ mod tests {
     }
 
     #[test]
+    fn page_alone_actions_are_unbound_image_fullscreen_press_actions() {
+        for action in [
+            KeyAction::FsTogglePageAfterCoverAlone,
+            KeyAction::FsToggleLastPageAlone,
+        ] {
+            assert_eq!(action.context(), KeyContext::FsImage);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert_eq!(action.default_chords().iter().count(), 0);
+            assert!(ALL_ACTIONS.contains(&action));
+        }
+    }
+
+    #[test]
     fn press_multiplicity_selects_only_cumulative_fullscreen_folder_navigation() {
         for action in [
             KeyAction::FsCtrlNavPrev,
@@ -11152,7 +12558,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn counted_action_consumes_two_same_frame_physical_presses() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
@@ -11174,7 +12580,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn counted_action_consumes_three_same_frame_physical_presses() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
@@ -11196,7 +12602,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn counted_action_coalesces_same_frame_auto_repeats() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
@@ -11264,7 +12670,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn page_turn_initial_press_survives_focus_loss_after_routing() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let _clear_synthetic = ClearTestSyntheticInput;
         let keymap = page_turn_keymap_for_test();
@@ -11292,7 +12698,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn page_turn_auto_repeat_without_focused_level_permit_is_dropped() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let _clear_synthetic = ClearTestSyntheticInput;
         let keymap = page_turn_keymap_for_test();
@@ -11317,7 +12723,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn page_turn_edge_from_sibling_viewport_is_no_match() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let _clear_synthetic = ClearTestSyntheticInput;
         let keymap = page_turn_keymap_for_test();
@@ -11339,7 +12745,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn page_turn_consume_reports_first_press_with_owning_viewport() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let _clear_synthetic = ClearTestSyntheticInput;
         let keymap = page_turn_keymap_for_test();
@@ -11369,7 +12775,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn page_turn_consume_promotes_repeat_while_chord_is_held() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let _clear_synthetic = ClearTestSyntheticInput;
         let keymap = page_turn_keymap_for_test();
@@ -11399,7 +12805,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn page_turn_consume_drops_repeat_released_in_the_same_frame() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let _clear_synthetic = ClearTestSyntheticInput;
         let keymap = page_turn_keymap_for_test();
@@ -11430,7 +12836,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn page_turn_consume_keeps_same_frame_tap_as_one_navigation() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let _clear_synthetic = ClearTestSyntheticInput;
         let keymap = page_turn_keymap_for_test();
@@ -11460,7 +12866,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn no_repeat_action_does_not_retrigger_from_repeat_edges() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
@@ -11476,7 +12882,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn single_dispatch_action_stays_once_with_two_same_frame_presses() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
@@ -11525,11 +12931,9 @@ mod tests {
     #[test]
     fn consume_action_keeps_egui_event_when_keyboard_is_owned_without_win32_frame() {
         #[cfg(windows)]
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         #[cfg(windows)]
         let _clear = ClearTestKeyFrame;
-        #[cfg(windows)]
-        crate::key_input::clear_test_frame();
 
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
@@ -11552,7 +12956,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn consume_action_keeps_win32_and_egui_input_when_keyboard_is_owned() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
@@ -11581,7 +12985,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn diagnostic_snapshot_exposes_cross_viewport_z_without_consuming_it() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
@@ -11610,11 +13014,9 @@ mod tests {
     #[test]
     fn consume_action_still_consumes_egui_event_without_keyboard_owner() {
         #[cfg(windows)]
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         #[cfg(windows)]
         let _clear = ClearTestKeyFrame;
-        #[cfg(windows)]
-        crate::key_input::clear_test_frame();
 
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
@@ -11629,11 +13031,9 @@ mod tests {
     #[test]
     fn pressed_action_ignores_egui_event_when_keyboard_is_owned_without_win32_frame() {
         #[cfg(windows)]
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         #[cfg(windows)]
         let _clear = ClearTestKeyFrame;
-        #[cfg(windows)]
-        crate::key_input::clear_test_frame();
 
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
@@ -11656,11 +13056,9 @@ mod tests {
     #[test]
     fn key_hold_edges_keep_egui_event_when_keyboard_is_owned_without_win32_frame() {
         #[cfg(windows)]
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         #[cfg(windows)]
         let _clear = ClearTestKeyFrame;
-        #[cfg(windows)]
-        crate::key_input::clear_test_frame();
 
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
@@ -11685,7 +13083,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn no_repeat_tab_claims_win32_and_egui_events_without_focus_traversal_leak() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
@@ -11734,7 +13132,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn tab_does_not_block_following_metadata_rating_or_navigation_shortcuts() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
@@ -11754,7 +13152,10 @@ mod tests {
 
         begin_key_pass(&ctx, egui::Key::F2, egui::Modifiers::NONE);
         crate::key_input::set_test_frame(vec![plain_key_edge(0x71, 0x3c)]);
-        assert_eq!(keymap.consume_rating_action(&ctx, false), Some(2));
+        assert_eq!(
+            keymap.consume_rating_action(&ctx, false),
+            Some(RatingEdit::Assign(2))
+        );
         let _ = ctx.end_pass();
 
         begin_key_pass(&ctx, egui::Key::Home, egui::Modifiers::NONE);
@@ -11766,7 +13167,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn tab_reassigned_to_another_action_survives_focus_traversal_policy() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let keymap = Keymap::from_ini_str(
             r#"
@@ -11789,7 +13190,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn focused_text_edit_keeps_tab_from_keymap_and_focus_on_current_field() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
@@ -11830,7 +13231,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn focused_non_text_modal_widget_still_blocks_application_tab_shortcut() {
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         let _clear = ClearTestKeyFrame;
         let keymap = Keymap::empty();
         let ctx = egui::Context::default();
@@ -11853,13 +13254,41 @@ mod tests {
     }
 
     #[test]
+    fn rating_step_table_and_action_catalog() {
+        let expected_up = [Some(4), Some(2), Some(3), Some(4), Some(5), None];
+        let expected_down = [Some(2), None, Some(1), Some(2), Some(3), Some(4)];
+        for current in 0..=5 {
+            assert_eq!(
+                step_rating(current, RatingStepDirection::Up),
+                expected_up[current as usize]
+            );
+            assert_eq!(
+                step_rating(current, RatingStepDirection::Down),
+                expected_down[current as usize]
+            );
+        }
+        for action in [
+            KeyAction::RatingItemStepUp,
+            KeyAction::RatingItemStepDown,
+            KeyAction::RatingContainerStepUp,
+            KeyAction::RatingContainerStepDown,
+        ] {
+            assert!(KeyAction::all().contains(&action));
+            assert_eq!(action.context(), KeyContext::Rating);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert!(action.default_chords().is_empty());
+            assert_eq!(KeyAction::from_ini_name(action.ini_name()), Some(action));
+        }
+    }
+
+    #[test]
     fn rating_actions_are_exact_and_customizable() {
         // consume_action consults the process-global Win32 key frame on Windows;
         // serialize against the native-frame tests and clear the frame so a
         // concurrent test cannot divert our egui-only key events to the KeySlot
-        // path. Same idiom as the native_video_shortcut_test_guard tests above.
+        // path. Same idiom as the other lock_test_input tests above.
         #[cfg(windows)]
-        let _serial = native_video_shortcut_test_guard();
+        let _serial = crate::key_input::lock_test_input();
         #[cfg(windows)]
         let _clear = ClearTestKeyFrame;
         let keymap = Keymap::empty();
@@ -11867,7 +13296,10 @@ mod tests {
 
         begin_key_pass(&ctx, egui::Key::F2, egui::Modifiers::SHIFT);
         assert_eq!(keymap.consume_rating_action(&ctx, false), None);
-        assert_eq!(keymap.consume_rating_action(&ctx, true), Some(2));
+        assert_eq!(
+            keymap.consume_rating_action(&ctx, true),
+            Some(RatingEdit::Assign(2))
+        );
         assert_eq!(ctx.input(|i| i.events.len()), 0);
         let _ = ctx.end_pass();
 
@@ -11884,8 +13316,27 @@ mod tests {
         let _ = ctx.end_pass();
 
         begin_key_pass(&ctx, egui::Key::F1, egui::Modifiers::CTRL);
-        assert_eq!(keymap.consume_rating_action(&ctx, false), Some(1));
+        assert_eq!(
+            keymap.consume_rating_action(&ctx, false),
+            Some(RatingEdit::Assign(1))
+        );
         assert_eq!(ctx.input(|i| i.events.len()), 0);
+        let _ = ctx.end_pass();
+
+        let keymap = Keymap::from_ini_str(
+            "[Rating]\nRatingItemStepUp = Ctrl+F1\nRatingContainerStepDown = Alt+F2\n",
+        );
+        begin_key_pass(&ctx, egui::Key::F1, egui::Modifiers::CTRL);
+        assert_eq!(
+            keymap.consume_rating_action(&ctx, false),
+            Some(RatingEdit::Step(RatingStepDirection::Up))
+        );
+        let _ = ctx.end_pass();
+        begin_key_pass(&ctx, egui::Key::F2, egui::Modifiers::ALT);
+        assert_eq!(
+            keymap.consume_rating_action(&ctx, true),
+            Some(RatingEdit::Step(RatingStepDirection::Down))
+        );
         let _ = ctx.end_pass();
     }
 
@@ -12335,13 +13786,13 @@ mod tests {
             conflict.kind == BindingConflictKind::Reserved
                 && conflict.action == KeyAction::EraseToolBrush
                 && conflict.chord == Chord::key(KeyName::Left)
-                && conflict.reserved_name == Some("plain arrow navigation")
+                && conflict.reserved_kind == Some(ReservedBindingKind::PlainArrowNavigation)
         }));
         assert!(keymap.binding_conflicts().iter().any(|conflict| {
             conflict.kind == BindingConflictKind::Reserved
                 && conflict.action == KeyAction::TextConfirm
                 && conflict.chord == Chord::key(KeyName::Esc)
-                && conflict.reserved_name == Some("Escape navigation / cancel")
+                && conflict.reserved_kind == Some(ReservedBindingKind::EscapeNavigation)
         }));
     }
 
@@ -12357,12 +13808,12 @@ mod tests {
             conflict.kind == BindingConflictKind::Reserved
                 && conflict.action == KeyAction::GridToggleStackMode
                 && conflict.chord == Chord::shift(KeyName::Left)
-                && conflict.reserved_name == Some("grid range selection")
+                && conflict.reserved_kind == Some(ReservedBindingKind::GridRangeSelection)
         }));
         assert!(keymap.warnings().iter().any(|warning| {
             warning.contains("GridToggleStackMode")
                 && warning.contains("reserved shortcut Shift+Left")
-                && warning.contains("grid range selection")
+                && warning.contains(ReservedBindingKind::GridRangeSelection.label())
         }));
 
         let keymap = Keymap::from_ini_str(
@@ -12379,6 +13830,27 @@ mod tests {
             "grid-only Shift+arrow reservation must not warn in text context: {:?}",
             keymap.binding_conflicts()
         );
+    }
+
+    /// 固定入力の表示名は、利用者が「どこで解除できるか」を探さずに済む形でなければならない。
+    /// 新しい予約項目を追加したとき、説明のない名前のまま出荷されないようにする。
+    #[test]
+    fn every_reserved_binding_label_says_it_cannot_be_unbound() {
+        for reserved in RESERVED_BINDINGS {
+            let label = reserved.kind.label();
+            assert!(
+                label.contains("解除不可"),
+                "reserved label must state that the fixed side cannot be unbound: {:?} -> {:?}",
+                reserved.kind,
+                label
+            );
+            assert!(
+                !label.is_empty() && !label.is_ascii(),
+                "reserved label must be Japanese user-facing text: {:?} -> {:?}",
+                reserved.kind,
+                label
+            );
+        }
     }
 
     #[test]
@@ -12464,9 +13936,10 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn native_video_context_help_keydown_follows_keymap() {
-        let _guard = native_video_shortcut_test_guard();
+        let _guard = crate::key_input::lock_test_input();
         Keymap::empty().install_global_native_video_shortcuts();
         let mut event = crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
             virtual_key: 0xBF,
             scan_code: 0,
             extended: false,
@@ -12495,6 +13968,7 @@ mod tests {
         keymap.install_global_native_video_shortcuts();
 
         let shift_slash = crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(2),
             virtual_key: 0xBF,
             scan_code: 0,
             extended: false,
@@ -12506,6 +13980,7 @@ mod tests {
         assert!(!native_video_context_shortcuts_help_key_down(&shift_slash));
 
         let f1 = crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(3),
             virtual_key: 0x70,
             scan_code: 0,
             extended: false,
@@ -12530,8 +14005,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn native_video_window_mode_shortcut_follows_keymap() {
-        let _guard = native_video_shortcut_test_guard();
+        let _guard = crate::key_input::lock_test_input();
         let event = |virtual_key| crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
             virtual_key,
             scan_code: 0,
             extended: false,
@@ -12568,8 +14044,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn native_video_side_panel_shortcut_follows_effective_chords() {
-        let _guard = native_video_shortcut_test_guard();
+        let _guard = crate::key_input::lock_test_input();
         let event = |virtual_key| crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
             virtual_key,
             scan_code: 0,
             extended: false,
@@ -12591,8 +14068,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn native_video_fs_common_shortcuts_follow_keymap() {
-        let _guard = native_video_shortcut_test_guard();
+        let _guard = crate::key_input::lock_test_input();
         let event = |virtual_key| crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
             virtual_key,
             scan_code: 0,
             extended: false,
@@ -12602,6 +14080,7 @@ mod tests {
             repeat: false,
         };
         let alt_event = |virtual_key| crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(2),
             virtual_key,
             scan_code: 0,
             extended: false,
@@ -12647,8 +14126,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn native_video_close_fullscreen_shortcut_follows_keymap() {
-        let _guard = native_video_shortcut_test_guard();
+        let _guard = crate::key_input::lock_test_input();
         let event = |virtual_key| crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
             virtual_key,
             scan_code: 0,
             extended: false,
@@ -12681,6 +14161,7 @@ mod tests {
             "#,
         );
         let event = crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
             virtual_key: 0x51,
             scan_code: 0,
             extended: false,
@@ -12702,6 +14183,7 @@ mod tests {
             "#,
         );
         let event = crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
             virtual_key: 0x7F,
             scan_code: 0,
             extended: false,
@@ -12724,6 +14206,7 @@ mod tests {
             "#,
         );
         let numpad1 = crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
             virtual_key: 0x61,
             scan_code: 0x4f,
             extended: false,
@@ -12733,6 +14216,7 @@ mod tests {
             repeat: false,
         };
         let digit1 = crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(2),
             virtual_key: 0x31,
             scan_code: 0x02,
             extended: false,
@@ -12742,6 +14226,7 @@ mod tests {
             repeat: false,
         };
         let jis_at = crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(3),
             virtual_key: 0xC0,
             scan_code: KeyName::JIS_AT_SCAN,
             extended: false,
@@ -12831,6 +14316,51 @@ mod tests {
     }
 
     #[test]
+    fn collection_add_actions_have_empty_defaults_and_distinct_contexts() {
+        let actions = [
+            (KeyAction::GridAddToCollectionTarget, KeyContext::Grid),
+            (KeyAction::FsAddToCollectionTarget, KeyContext::FsImage),
+            (KeyAction::VideoAddToCollectionTarget, KeyContext::FsVideo),
+        ];
+        let default = Keymap::default();
+        for (action, context) in actions {
+            assert_eq!(action.context(), context);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert!(default.effective_chords(action).is_empty());
+            let configured = Keymap::from_ini_str(&format!(
+                "[{}]\n{} = F13\n",
+                context.ini_name(),
+                action.ini_name()
+            ));
+            assert!(configured.warnings().is_empty());
+            assert_eq!(
+                configured.effective_chords(action),
+                vec![Chord::key(KeyName::F13)]
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn configured_collection_add_actions_consume_one_egui_press() {
+        let _serial = crate::key_input::lock_test_input();
+        let _clear = ClearTestKeyFrame;
+        for (section, action) in [
+            ("Grid", KeyAction::GridAddToCollectionTarget),
+            ("FsImage", KeyAction::FsAddToCollectionTarget),
+            ("FsVideo", KeyAction::VideoAddToCollectionTarget),
+        ] {
+            let keymap =
+                Keymap::from_ini_str(&format!("[{section}]\n{} = F13\n", action.ini_name()));
+            let ctx = egui::Context::default();
+            begin_key_pass(&ctx, egui::Key::F13, egui::Modifiers::NONE);
+            assert!(keymap.consume_action_no_repeat(&ctx, action));
+            assert!(!keymap.consume_action_no_repeat(&ctx, action));
+            let _ = ctx.end_pass();
+        }
+    }
+
+    #[test]
     fn write_user_ini_if_missing_does_not_overwrite_existing_file() {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -12910,6 +14440,40 @@ mod tests {
             vec![Chord::ctrl_shift(KeyName::S)]
         );
         assert!(restored.effective_chords(KeyAction::FsSlideshow).is_empty());
+    }
+
+    #[test]
+    fn grid_column_actions_11_to_20_roundtrip_from_ini_through_settings() {
+        let mut ini = String::from("[Grid]\n");
+        for cols in 11..=20 {
+            ini.push_str(&format!("GridColumnCount{cols} = F{}\n", cols + 2));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keymap.ini");
+        std::fs::write(&path, ini).unwrap();
+        let parsed = Keymap::load_from_file(&path);
+        assert!(parsed.warnings().is_empty(), "{:?}", parsed.warnings());
+        let settings = KeymapSettings::from_keymap(&parsed);
+        let restored = Keymap::from_settings(&settings);
+        for cols in 11..=20 {
+            let name = format!("GridColumnCount{cols}");
+            let action = KeyAction::from_ini_name(&name).expect("registered action");
+            assert_eq!(action.context(), KeyContext::Grid);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert!(action.default_chords().is_empty());
+            assert_eq!(
+                parsed.effective_chords(action),
+                restored.effective_chords(action)
+            );
+            assert_eq!(
+                settings
+                    .overrides
+                    .iter()
+                    .filter(|row| row.action == name)
+                    .count(),
+                1
+            );
+        }
     }
 
     #[test]

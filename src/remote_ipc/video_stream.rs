@@ -196,6 +196,8 @@ impl VideoStreamEngine {
                     video_size,
                     codecs: ready.codecs,
                     audio_processing: audio_processing_payload(stream.generation.audio_status()),
+                    audio_tracks: stream.audio_tracks.as_ref().clone(),
+                    audio_track: ready.audio_stream_index,
                     end_behavior: stream.end_behavior,
                 })
             }
@@ -428,6 +430,8 @@ fn state_payload(
         video_size,
         codecs: ready.codecs,
         audio_processing: audio_processing_payload(stream.generation.audio_status()),
+        audio_tracks: stream.audio_tracks.as_ref().clone(),
+        audio_track: ready.audio_stream_index,
         play_intent: playback.play_intent,
         volume: playback.volume,
     }

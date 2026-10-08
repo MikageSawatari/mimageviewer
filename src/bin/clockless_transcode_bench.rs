@@ -82,7 +82,18 @@ fn parse_options() -> Result<ClocklessTranscodeOptions, String> {
         .next()
         .map(PathBuf::from)
         .ok_or_else(|| "missing <video>".to_owned())?;
-    let mut options = ClocklessTranscodeOptions::benchmark(path);
+    // This standalone diagnostic has no metadata player. Choose its default at the CLI edge;
+    // the shared transcode always receives the chosen stream explicitly.
+    let audio_stream_index = ffmpeg_the_third::format::input(&path)
+        .ok()
+        .and_then(|input| {
+            input
+                .streams()
+                .best(ffmpeg_the_third::media::Type::Audio)
+                .map(|stream| stream.index())
+        })
+        .unwrap_or(0);
+    let mut options = ClocklessTranscodeOptions::benchmark(path, audio_stream_index);
     while let Some(arg) = args.next() {
         match arg.to_string_lossy().as_ref() {
             "--seconds" => {
@@ -97,6 +108,15 @@ fn parse_options() -> Result<ClocklessTranscodeOptions, String> {
             }
             "--no-audio" => options.include_audio = false,
             "--audio" => options.include_audio = true,
+            "--audio-stream-index" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--audio-stream-index requires a value".to_owned())?;
+                options.audio_stream_index = value
+                    .to_string_lossy()
+                    .parse::<usize>()
+                    .map_err(|error| format!("--audio-stream-index: {error}"))?;
+            }
             "--sw-decode" => options.hw_decode = false,
             "--hw-decode" => options.hw_decode = true,
             "--profile-swscale" => options.profile_swscale = true,
@@ -172,6 +192,7 @@ fn process_cpu_seconds() -> Option<f64> {
 fn print_usage() {
     eprintln!(
         "Usage: clockless_transcode_bench <video> [--seconds N|0] [--audio|--no-audio] \
+         [--audio-stream-index N] \
          [--hw-decode|--sw-decode] [--quality minimum|low|standard|high] \
          [--segments N] [--profile-swscale]"
     );

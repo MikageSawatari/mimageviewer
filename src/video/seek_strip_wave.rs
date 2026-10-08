@@ -48,20 +48,27 @@ const COARSE_BUILD_MIN_SPAN_SECS: f64 = 600.0;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct WaveFileIdentity {
     normalized_path: String,
+    stream_index: Option<usize>,
     size: i64,
     mtime: i64,
 }
 
 impl WaveFileIdentity {
-    pub(crate) fn from_known_meta(path: &Path, mtime: i64, size: i64) -> Self {
+    pub(crate) fn from_known_meta(
+        path: &Path,
+        stream_index: Option<usize>,
+        mtime: i64,
+        size: i64,
+    ) -> Self {
         Self {
             normalized_path: crate::adjustment_db::normalize_path(path),
+            stream_index,
             size,
             mtime,
         }
     }
 
-    fn from_file(path: &Path) -> Self {
+    fn from_file(path: &Path, stream_index: Option<usize>) -> Self {
         let metadata = std::fs::metadata(path).ok();
         let size = metadata
             .as_ref()
@@ -71,7 +78,7 @@ impl WaveFileIdentity {
             .as_ref()
             .map(crate::ui_helpers::mtime_secs)
             .unwrap_or(0);
-        Self::from_known_meta(path, mtime, size)
+        Self::from_known_meta(path, stream_index, mtime, size)
     }
 
     fn size(&self) -> i64 {
@@ -1196,7 +1203,12 @@ pub(crate) struct SeekStripWaveWorker {
 }
 
 impl SeekStripWaveWorker {
-    pub(crate) fn spawn(path: PathBuf, cache: Option<Arc<TileThumbCache>>) -> Self {
+    pub(crate) fn spawn(
+        path: PathBuf,
+        stream_index: Option<usize>,
+        default_audio_stream_index: Option<usize>,
+        cache: Option<Arc<TileThumbCache>>,
+    ) -> Self {
         let (wake_tx, wake_rx) = bounded::<()>(1);
         let pending = Arc::new(Mutex::new(None));
         let state = Arc::new(Mutex::new(WaveSharedState {
@@ -1217,8 +1229,9 @@ impl SeekStripWaveWorker {
         let thread_result = std::thread::Builder::new()
             .name("video-seek-strip-wave".into())
             .spawn(move || {
-                let identity = WaveFileIdentity::from_file(&path);
-                let mut runtime = WaveWorkerRuntime::new(identity.clone(), cache);
+                let identity = WaveFileIdentity::from_file(&path, stream_index);
+                let mut runtime =
+                    WaveWorkerRuntime::new(identity.clone(), default_audio_stream_index, cache);
                 while !worker_cancel.load(Ordering::Acquire) {
                     let request = lock_recover(&worker_pending).take();
                     if let Some(request) = request {
@@ -1380,6 +1393,7 @@ struct ActiveWaveRequest {
 
 struct WaveWorkerRuntime {
     identity: WaveFileIdentity,
+    default_audio_stream_index: Option<usize>,
     cache: Option<Arc<TileThumbCache>>,
     decoder: Option<crate::audio_decode::AudioRangeDecoder>,
     decoder_open_error: Option<crate::audio_decode::AudioDecodeOpenError>,
@@ -1390,9 +1404,14 @@ struct WaveWorkerRuntime {
 }
 
 impl WaveWorkerRuntime {
-    fn new(identity: WaveFileIdentity, cache: Option<Arc<TileThumbCache>>) -> Self {
+    fn new(
+        identity: WaveFileIdentity,
+        default_audio_stream_index: Option<usize>,
+        cache: Option<Arc<TileThumbCache>>,
+    ) -> Self {
         Self {
             identity,
+            default_audio_stream_index,
             cache,
             decoder: None,
             decoder_open_error: None,
@@ -1421,10 +1440,13 @@ impl WaveWorkerRuntime {
                 let loaded_chunks = self
                     .cache
                     .as_ref()
-                    .map(|cache| {
+                    .zip(self.identity.stream_index)
+                    .map(|(cache, stream_index)| {
                         cache
                             .lookup_wave_chunks(
                                 path,
+                                stream_index,
+                                self.default_audio_stream_index,
                                 self.identity.mtime(),
                                 self.identity.size(),
                                 scale.bin_secs_millis(),
@@ -1534,7 +1556,10 @@ fn analyze_coarse_chunk(
     let analysis_range = waveform_analysis_range(window, duration_secs, scale.bin_secs)
         .ok_or_else(|| CoarseChunkError::Failed("invalid coarse chunk range".into()))?;
     if runtime.decoder.is_none() && runtime.decoder_open_error.is_none() {
-        match crate::audio_decode::AudioRangeDecoder::open(path) {
+        match runtime.identity.stream_index.map_or(
+            Err(crate::audio_decode::AudioDecodeOpenError::NoAudioTrack),
+            |stream| crate::audio_decode::AudioRangeDecoder::open(path, stream),
+        ) {
             Ok(decoder) => runtime.decoder = Some(decoder),
             Err(error) => runtime.decoder_open_error = Some(error),
         }
@@ -1694,6 +1719,10 @@ fn process_next_coarse_chunk(
         && let Some(persisted_bins) = persisted_bins.as_deref()
         && let Err(error) = cache.store_wave_chunk(
             path,
+            runtime
+                .identity
+                .stream_index
+                .expect("decoded chunk has audio"),
             runtime.identity.mtime(),
             runtime.identity.size(),
             bin_secs_millis,
@@ -1914,7 +1943,10 @@ fn process_wave_request(
     let route = decide_wave_render_route(availability, bin_secs, signature.visible_span_secs());
     if route == WaveRenderRoute::CoarseProgressive && runtime.decoder.is_none() {
         if runtime.decoder_open_error.is_none() {
-            match crate::audio_decode::AudioRangeDecoder::open(path) {
+            match runtime.identity.stream_index.map_or(
+                Err(crate::audio_decode::AudioDecodeOpenError::NoAudioTrack),
+                |stream| crate::audio_decode::AudioRangeDecoder::open(path, stream),
+            ) {
                 Ok(decoder) => runtime.decoder = Some(decoder),
                 Err(error) => runtime.decoder_open_error = Some(error),
             }
@@ -1997,7 +2029,10 @@ fn process_wave_request(
     {
         source = "range_decode";
         if runtime.decoder.is_none() && runtime.decoder_open_error.is_none() {
-            match crate::audio_decode::AudioRangeDecoder::open(path) {
+            match runtime.identity.stream_index.map_or(
+                Err(crate::audio_decode::AudioDecodeOpenError::NoAudioTrack),
+                |stream| crate::audio_decode::AudioRangeDecoder::open(path, stream),
+            ) {
                 Ok(decoder) => runtime.decoder = Some(decoder),
                 Err(error) => runtime.decoder_open_error = Some(error),
             }
@@ -2390,7 +2425,8 @@ mod tests {
 
     fn runtime_without_cache() -> WaveWorkerRuntime {
         WaveWorkerRuntime::new(
-            WaveFileIdentity::from_known_meta(Path::new(TEST_WAVE_PATH), 1, 1),
+            WaveFileIdentity::from_known_meta(Path::new(TEST_WAVE_PATH), Some(0), 1, 1),
+            Some(0),
             None,
         )
     }
@@ -2419,7 +2455,7 @@ mod tests {
         const PIXEL_HEIGHT: usize = 94;
         let center_time_secs = duration_secs * 0.5;
         for visible_span_secs in [60.0, 600.0, 1800.0, 3600.0, 7200.0, 10_800.0] {
-            let worker = SeekStripWaveWorker::spawn(path.clone(), None);
+            let worker = SeekStripWaveWorker::spawn(path.clone(), Some(0), Some(0), None);
             let signature = WaveRequestSignature::new(
                 center_time_secs,
                 duration_secs,
@@ -2563,6 +2599,7 @@ mod tests {
             assert!(source.apply_chunk(chunk_index, &analyzed_coarse_chunk(scale, chunk_index)));
             db.store_wave_chunk(
                 path,
+                1,
                 video_mtime,
                 video_size,
                 scale.bin_secs_millis(),
@@ -2578,6 +2615,8 @@ mod tests {
         let mut restored = CoarseWaveform::new(duration_secs, scale);
         let stored = db.lookup_wave_chunks(
             path,
+            1,
+            Some(1),
             video_mtime,
             video_size,
             scale.bin_secs_millis(),
@@ -3246,6 +3285,7 @@ mod tests {
         WaveRasterKey {
             identity: WaveFileIdentity {
                 normalized_path: name.to_string(),
+                stream_index: Some(0),
                 size: 1,
                 mtime: 1,
             },
@@ -3599,6 +3639,17 @@ mod tests {
         assert!(lru.get(&key("b")).is_none());
         assert!(lru.get(&key("a")).is_some());
         assert!(lru.get(&key("c")).is_some());
+    }
+
+    #[test]
+    fn raster_lru_never_reuses_another_audio_stream() {
+        let mut lru = WaveRasterLru::new(2);
+        let first = key("same.mkv");
+        lru.insert(first.clone(), raster(1));
+        let mut second = first.clone();
+        second.identity.stream_index = Some(2);
+        assert!(lru.get(&second).is_none());
+        assert!(lru.get(&first).is_some());
     }
 
     #[test]

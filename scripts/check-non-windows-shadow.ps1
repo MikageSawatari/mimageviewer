@@ -8,6 +8,9 @@ cfg(windows) predicates to permanently false predicates (so cfg(not(windows))
 becomes true), rewrites matching Cargo target dependency tables, and runs the
 same portable cargo check used by non-Windows CI.
 
+NOTE (2026-09-29): the non-Windows CI job was removed and this script is no
+longer part of any gate (backlog 1.302). mIV is Windows-only.
+
 This catches cfg leaks in this repository. It cannot make dependency crates
 compile as if rustc itself targeted Linux, so platform leaks inside dependencies
 (for example wgpu_hal::dx12) remain CI's responsibility. CI is the final word.

@@ -59,7 +59,7 @@ mimageviewer の検索システム (Ctrl+S / Ctrl+F / Ctrl+G + タグ機能) の
 
 [tag-catalog-redesign-plan.md](tag-catalog-redesign-plan.md) 参照。現行の mIV タグ正本は
 `tags.db` で、Ctrl+G/Ctrl+F の全文検索ソースには混ぜない。`SourceKind::Tags` と
-Tantivy `tags` STORED フィールドは旧 XMP `dc:subject` からの移行用として残すが、
+Tantivy `tags` STORED フィールドは旧schema互換用として残すが、旧タグ移行も撤去済みであり、
 `SourceKind::ALL` / `SearchTarget::includes(Tags)` / ingest / Ctrl+F fallback からは外す。
 
 「検索結果をタグで絞る」用途は、検索結果グリッドに対して facet タグフィルタを AND 合成する。
@@ -99,7 +99,7 @@ Ctrl+S / Ctrl+F の UI は [ui_main.rs](../src/ui_main.rs) の
 | [search_walker.rs](../src/search_walker.rs) | 起動時の再帰 walk + 3-way diff (FS / `fts_meta.db` の突き合わせ) |
 | [search_watcher.rs](../src/search_watcher.rs) | notify-rs `ReadDirectoryChangesW` ラッパ + 500ms debounce |
 | [ingest_worker.rs](../src/ingest_worker.rs) | メタ抽出 + Tantivy buffer + バッチ commit + fts_meta 状態遷移 |
-| [ingest_text.rs](../src/ingest_text.rs) | `PerSourceText` (filename / exif / xmp_tweet / png_prompt / pdf_meta / video_meta / sidecar、旧 tags は移行専用) ビルダー |
+| [ingest_text.rs](../src/ingest_text.rs) | `PerSourceText` (filename / exif / xmp_tweet / png_prompt / pdf_meta / video_meta / sidecar、旧 tags はschema互換用) ビルダー |
 | [external_metadata.rs](../src/external_metadata.rs) | 外部メタデータサイドカー (画像と同名 .json/.txt) の検出・値抽出・差分署名・逆引き (§4.10) |
 | [name_index_supervisor.rs](../src/name_index_supervisor.rs) | Ctrl+S 用 **名前索引 supervisor** (初期バルク + notify-rs 追従) |
 | [name_bulk_indexer.rs](../src/name_bulk_indexer.rs) | Ctrl+S 用 初期バルクスキャンの本体 |
@@ -120,8 +120,7 @@ Ctrl+S / Ctrl+F の UI は [ui_main.rs](../src/ui_main.rs) の
 | [tags_db.rs](../src/tags_db.rs) | mIV タグ正本。`item_tags` / `tag_item_state` / `tag_meta` と `tag_key` 正規化 helper |
 | [tag_ops.rs](../src/tag_ops.rs) | UI からのタグ操作ファサード。all-or-nothing 判定後に tags.db worker へ投入 |
 | [tag_write_worker.rs](../src/tag_write_worker.rs) | UI → tags.db 更新 worker。通常タグ操作では XMP/Tantivy を更新しない |
-| [tag_legacy_xmp_worker.rs](../src/tag_legacy_xmp_worker.rs) | 旧 XMP `dc:subject` / 動画 `.xmp` に残る `#` タグの明示取り込みと、取り込み後削除 |
-| [xmp_writer.rs](../src/xmp_writer.rs) | 既存 XMP 書換 helper。タグでは旧 `dc:subject` 移行・明示除去用の補助に縮退 |
+| [xmp_writer.rs](../src/xmp_writer.rs) | XMP ratingなど現役metadataの書換 helper。旧XMPタグ移行用の呼び出しは廃止済み |
 
 ---
 
@@ -133,9 +132,9 @@ Ctrl+S / Ctrl+F の UI は [ui_main.rs](../src/ui_main.rs) の
 | --- | --- | --- | --- |
 | `settings.json` | `FavoriteEntry { id, name, path, auto_index_{structure,metadata,thumbs} }` + `tags: Vec<TagDef>` | [settings.rs](../src/settings.rs) | UUID が欠けている行は起動時に発行し書き戻し |
 | `search_index.db` | Ctrl+S 用フォルダ/ZIP/PDF/動画名 index (SQLite LIKE で引く) | `search_index_db.rs` | `indexed_by_auto` 列で手動/自動エントリを区別 |
-| `fts_index/` | Tantivy index ディレクトリ (複数 segment ファイル + meta.json)。**INDEX_VERSION=5 以降は per-source `*_text` フィールドが STORED で原文を保持** | `fts_index.rs` → IngestSession | schema 変更は `schema_is_stale` (STORED 必須含む) で検出し全消去 + 再構築。`tags` フィールドは旧タグ移行専用で通常検索対象外 |
-| `fts_meta.db` | `files(path PK, favorite_id, kind, mtime, size, indexed_at, index_version, index_generation, status)` — INDEX_VERSION=5 で `*_norm` 列群を撤去し管理メタ専用に縮小 | `fts_meta.rs` | `INDEX_VERSION` を bump すると `needs_rebuild` が `*_norm` 残存も検出して全再構築を促す |
-| `tags.db` | `item_tags(item_key, tag, tag_key, applied_at)` / `tag_item_state` / `tag_meta`。mIV タグの正本 | `tags_db.rs` / `tag_write_worker.rs` | `tag_key` は NFKC + lowercase + `#` なし。旧 XMP/Tantivy タグの移行フラグと、任意のタグ sidecar backup import 同期状態もここに置く |
+| `fts_index/` | Tantivy index ディレクトリ (複数 segment ファイル + meta.json)。**INDEX_VERSION=5 以降は per-source `*_text` フィールドが STORED で原文を保持** | `fts_index.rs` → IngestSession | schema 変更は `schema_is_stale` (STORED 必須含む) で検出し全消去 + 再構築。semantic version 移行は `fts_meta.db` の durable marker に従い、旧 directory を消してから開く。`tags` フィールドはschema互換用で検索/移行対象外 |
+| `fts_meta.db` | `files(path PK, favorite_id, kind, mtime, size, indexed_at, index_version, index_generation, status)` + `index_state` — INDEX_VERSION=5 で `*_norm` 列群を撤去し管理メタ専用に縮小 | `fts_meta.rs` | v9→v10 では files 再作成・version bump・`tantivy_rebuild_pending=1` を同じ transaction で確定。新 Tantivy index の open 成功後だけ marker を消す |
+| `tags.db` | `item_tags(item_key, tag, tag_key, applied_at)` / `tag_item_state` / `tag_meta`。mIV タグの正本 | `tags_db.rs` / `tag_write_worker.rs` | `tag_key` は NFKC + lowercase + `#` なし。Tantivy/XMP移行の既存marker/source行は歴史値として保持。任意のタグsidecar backup import同期状態もここに置く |
 
 **パスキー正規化**: Windows の大文字小文字非区別と区切り文字混在に備え、
 fts_meta.db / Tantivy / 起動時 diff・Ctrl+F on-demand 判定の全経路で `normalize_path`
@@ -143,6 +142,32 @@ fts_meta.db / Tantivy / 起動時 diff・Ctrl+F on-demand 判定の全経路で 
 separator は `search_norm::ZIP_ENTRY_SEP` = U+001F Unit Separator) を通す。
 新しい lookup 経路を追加するときも同じ正規化を通すこと。
 `!` を separator に戻してはいけない (通常ファイル名と衝突する。INDEX_VERSION=4 で廃止)。
+
+### EPUB 行の互換性 (S3a)
+
+Ctrl+S の EPUB は既存の `search_index.db` の `PdfFile`、Ctrl+G の EPUB は既存の
+`fts_meta.db` / Tantivy の `Pdf` として追加する。既存行・列・kind 値・索引の schema は
+変えず、`fts_meta::INDEX_VERSION` は 10 のままにする。全利用者へ索引再構築を強制しない。
+前方互換では新しい EPUB 行だけが増え、移行は不要。
+「EPUB の処理」が「無視する」のとき、Ctrl+S は SQLite の `WHERE` で EPUB を除いてから
+5,000 件の上限を適用する。Ctrl+G は検索ワーカーが EPUB のパスを STORED 原文取得前に
+除き、残った結果だけを 10,000 件の上限に数える。EPUB は PDF と同じ kind で索引されるため、
+Ctrl+G の kind 条件だけでは区別できない。
+
+v4.1.0 へ戻すと、残っている Ctrl+G の `Pdf` 行は旧 `grid_item_from_fs_hit_path` で
+**画像タイル**に再分類される。クリックすると画像としての読込に失敗するが、その前に
+`open_fullscreen` が `record_book_resume` を呼ぶ。読書位置の記録が有効なら、検索元フォルダーの
+保存済み位置を `book_resume.db` で上書きし得る。これは表示だけの差ではない。
+Ctrl+S に `PdfFile` 行が残っている間は本タイルとして表示されるが、開くと旧版の `.pdf` 限定判定を
+通らず通常ディレクトリ走査のエラーになる。
+
+旧版の索引走査は通常 `.epub` を候補に含めないため、後続の差分処理で新しい EPUB 行を削除する
+(Susie プラグインが `.epub` を画像拡張子として申告する構成では画像候補として残り得る)。
+現行版へ戻した後は、`search_walker::walk_dir_recursive` が EPUB を `CandidateKind::Pdf` として集め、
+DB に行が無ければ `scan` が `to_ingest` に入れ、`IngestSession::apply` が同じ `Pdf` kind で再登録する。
+Ctrl+S も `name_bulk_indexer::classify_name_index_kind` が EPUB を `PdfFile` として次の走査で再登録する。
+`INDEX_VERSION` を上げなくても復旧する。索引の再登録は対象のお気に入りの次の走査時であり、
+利用者ごとの自動索引設定で走査が無効なら、その設定に従う。
 
 ---
 
@@ -154,14 +179,21 @@ separator は `search_norm::ZIP_ENTRY_SEP` = U+001F Unit Separator) を通す。
 ための索引。Ctrl+G が使う。Ctrl+F (現在地フィルタ) はこの索引を使わず、
 表示中アイテムを on-demand に判定する (§5.2)。
 
+EPUB は Ctrl+S / Ctrl+G とも元ファイル名を検索対象にし、検索結果と同定には元 EPUB の
+パスを保持する (`IndexDoc.path` 等)。パスの親ディレクトリ名は検索語にしない。
+`ingest_worker::build_doc_for_pdf` は EPUB を
+拡張子で明示的に分岐し、未変換・変換済みのどちらでも生成 PDF の Info 辞書を呼ばない。
+EPUB 内のタイトル・著者も索引しない。取込失敗として記録・ログ出力せず、通常の `Pdf` 行を
+登録する。Ctrl+F も EPUB はファイル名だけで判定し、生成 PDF の Info 辞書を読まない。
+
 ```
 App 起動
   └─ IndexerManager::new
        ├─ FtsMetaDb を open
-       ├─ 旧 Tantivy STORED tags を tags.db へ一度だけ移行 (fts_index wipe より前)
-       ├─ FtsIndex を open (schema 不一致なら全再構築)
-       ├─ 起動時 reconciliation (§4.3) を **同期** で実行
-       └─ auto_index_metadata=true のお気に入りごとに
+       ├─ durable rebuild pending なら旧 fts_index を wipe (失敗時は旧 index を開かない)
+       ├─ FtsIndex を openし、成功後だけ rebuild pending を clear
+       ├─ manager worker で起動時 reconciliation (§4.3) と所有範囲外 cleanup
+       └─ cleanup 完了後、実効 metadata / similar が有効なお気に入りごとに
             IndexerSupervisor::spawn  (1 お気に入り 1 本、以降ずっと常駐)
 
 IndexerSupervisor (スレッド 1 本):
@@ -169,7 +201,7 @@ IndexerSupervisor (スレッド 1 本):
   2. search_walker::scan  …… 初期スキャン (3-way diff)
          FS にあり DB になし → ingest queue
          DB にあり FS になし → delete queue
-         両方あり mtime/size 差 → 再 ingest queue
+         両方あり mtime/size 差、または UUID/root の所有者不一致 → 再 ingest queue
   3. IngestSession::run   …… Tantivy First 書き込み順序 (§4.2) で反映
   4. 以降 watcher イベント (DebouncedChange) を受け取り小刻みに 3 と同じ処理
   5. App drop で全員 cancel。join は全 supervisor 合計 4 秒まで、超過時は detach
@@ -179,7 +211,54 @@ IngestSession の writer は IndexerManager が保有する dispatcher 経由で
 Tantivy writer には触れない。
 ```
 
+アイテム索引の Full は `ScanResult::completeness` で FS の観測結果を
+`ObservationCompleteness::Complete / Incomplete` に分ける。read_dir 失敗、iterator の
+entry error、file_type / 特殊エントリ分類 / metadata 取得失敗、深さ制限のいずれかがあれば
+Incomplete とし、その走査では削除候補を生成しない。観測できた新規・変更ファイルの
+取り込みは継続する。存在しない root も read_dir 失敗なので、読めなかった既存行を保持する。
+診断には `entry_errors` と `classification_errors` も残し、supervisor のログに完全性を出す。
+取消は結果を成功として返さず、既存の取消経路で終了する。
+この型は観測の完全性だけを表し、書き込みの成功や Full 全体の成功を保証しない。
+Full 全体の `FullScanOutcome::Complete` でだけ起動省略の印を立てる
+(詳細・検証は [起動スキャン計画](startup-index-scan-plan.md) §11)。
+
+metadata の所有範囲は `metadata_ownership` が純関数で決める。最深 root が所有し、
+同じ正規化 root は UUID 文字列順の最小値で決着する。共通除外と内側の所有 root を
+差し引いた複数の SQL 区間だけを walker が取得する。Ctrl+G のお気に入り絞り込みと
+編集画面の件数も、選択 root 内の実効所有 UUID 集合を共有する。総件数は ID ごとの和。
+
+構成変更は `metadata_reconfiguration` worker が旧新 root の推移的な重複グループを
+cancel → join → cleanup → spawn の順に処理する。処理中 snapshot は固定し、
+後続要求は最新の1つに集約する。ID の OFF・削除・root 変更は Tantivy ID-term purge、
+それ以外は新所有範囲外の path cleanup を行う。共通除外の拡大は raw STRING `path` の
+範囲 query で Tantivy-only 文書も削除し、commit/reload の後に同じ SQLite 範囲を削除する。
+similar の構成も同じ固定 snapshot から worker が反映し、App の未確定要求を先行反映しない。
+cleanup は旧 ingest と同じ Background
+FIFO に置き、commit/reload 成功後に SQLite を削除する。失敗時は再試行せず既存
+rebuild pending を立てて通知し、次回起動で `files` と Tantivy の両方を作り直す。
+起動時 cleanup は S3 の印に関わらず Full が必要な現所有 root 集合を返す。
+起動時の owner 照会は `path, favorite_id` の2列だけを covering index で読む。
+行ごとに所有判定し、削除対象 path と現所有 root だけを保持する。perf には読取と判定の
+時間・走査件数・収集した削除対象 path の最大件数を出す（プロセス全体のメモリ量ではない）。
+
 #### 終了応答性と有界 shutdown
+
+`skip_offline_change_scan` (既定 false) は起動時の初回 Full だけを省く設定。
+お気に入り編集と、環境設定の「ライブラリ > 検索インデックス」で変更する。
+`fts_meta.db.scanned_once` の root ごとの印と指紋 (正規化 root・所有 UUID・入れ子を含む
+除外 root・INDEX_VERSION・Susie を含む走査拡張子) が一致し、起動 cleanup の must-scan 集合と
+rebuild pending の対象でない場合だけ省く。watcher は従来どおり動き、差分・overflow・回復・
+手動確認は省かない。完全な観測・書き込み・prune の typed 成功でだけ印を立てる。
+イベントや途中終了・クラッシュでは消さず、ストア再作成と Failed cleanup で消す。
+構成変更と起動補修の削除は、旧行のrootと現在の補修先rootの印を同じ transaction で失効させる。
+初回・手動・overflow・監視回復の共通Full入口も、保存指紋が異なる場合は管理行や全文文書を
+変更する前に旧rootの印をtransactionで失効させる。Susieの拡張子集合を含む全指紋入力が対象で、
+元の入力に戻して再起動しても途中の索引を省略しない。同一指紋Fullの取消では旧印を保持する。
+「お気に入り > 編集」の [今すぐ確認] は metadata-only Full、名前索引 Full、全 root の similar
+UserCheck 1回を非同期に要求する。similar は起動時と同じ metadata 照合で Complete の無変更
+ZIP / PDF を開かない実 Full で、起動時省略には入らない。MustOpen の修復要求と合流したときは
+そちらを優先する。初期化中は metadata/similar だけを1回分予約し、利用不能時は
+理由を通知して名前索引だけを確認する。一時停止中は再開後に実行する。
 
 大量削除では watcher overflow の full rescan、または debounce 済みイベント列が
 delete ingest を集中させる。walker / ingest のループcheckだけでは、共有I/O permit取得と
@@ -194,6 +273,7 @@ v2.3.0第12弾では次を不変条件とする。
   final commitとdispatcherの最終Dropはbackground finalizerがbest-effortで担当する。
 - submit済みbatchがcancel後にTantivyだけへ反映されても、SQLiteを先行更新しない
   Tantivy Firstを維持する。次回起動時のFS / Tantivy / fts_meta 3-way diffが再投入・再削除する。
+  `skip_offline_change_scan` ON で省略した起動ではこの補修を行わず、[今すぐ確認] で確認する。
 
 ### 4.2 書き込みプロトコル (Tantivy First, INDEX_VERSION=6)
 
@@ -234,17 +314,39 @@ v2.3.0第12弾では次を不変条件とする。
 削除済みファイルが結果に出るのと同じ "短い窓" として許容する (実害はサムネイル
 読み込み失敗で気付ける)。
 
+上記の「次回起動で補修」は初回 Full を実行する場合の説明である。
+`skip_offline_change_scan` ON で印を再利用した場合、クラッシュや書き込み途中終了で残った
+両ストアの不一致も自動では確認しない。これは設定の許容範囲で、[今すぐ確認] で照合する。
+
 ### 4.3 起動時 reconciliation
 
 `IndexerManager::new` が supervisor spawn 前に同期実行する:
 
 - `status=Failed` の行 → Tantivy delete_term + SQLite delete_paths
   (legacy v5 DB から migrate された Pending/Tombstone もここに集約される)
-- `index_version` 不一致 or `fts_index/` schema 不一致 → 全再構築
+- `index_version` 不一致 → SQLite transaction で `files` 再作成と durable rebuild marker を確定し、
+  旧 `fts_index/` を wipe してから新 index を開く。wipe / open / marker clear の失敗時は旧 index を
+  公開せず、marker を残して次回起動で再試行する
+- `fts_index/` schema 不一致 → Tantivy の既存 schema 判定で全再構築
 
-通常は数十〜数百行程度で 100ms 以下。大量なら supervisor 起動は待たされるが、
-writer 競合防止のため同期実行する方が安全 (非同期化すると supervisor と
-reconcile が `IndexWriter` を奪い合って失敗する)。
+所有範囲外の掃除も含め、manager worker 内で reconciliation の完了後に supervisor を
+起動する。UI は待たず、Tantivy の書き込みは単一 dispatcher が所有する。
+
+Failed 行の照会は `status != 0 AND +favorite_id IN (...)` とし、favorite の索引を
+候補から外して部分索引 `idx_files_status` を使う。`idx_files_fav_path` の追加後も、
+正常行まで読む広い favorite 検索に切り替わらないことを EXPLAIN 回帰で確認する。
+単一 favorite 版も同じ規則にする。UUID は TEXT として bind する。
+所有範囲外の照会は `idx_files_fav_path` の covering scan を行単位で読み、削除する path と
+現在の所有 root だけを保持する。全行の `(path, favorite_id)` 配列を作らない。
+読取完了・connection lock 解放後に既存の削除を実行し、途中の読取失敗では部分削除しない。
+`metadata_out_of_range_cleanup` の `owner_rows` は走査件数、`peak_collected_rows` は
+収集した削除対象 path の最大件数、`query_ms` は行読取と所有判定を合わせた時間。
+正常行だけなら収集件数は0となる。
+
+この整理は `skip_offline_change_scan` ON でも省かない。Failed 行を掃除した root の印を消し、
+所有者の付け替えが必要な root は、削除と同じ SQLite transaction で印を消したうえで
+must-scan 集合で初回 Full を強制する。変更が無い起動整理は印を保持する。Tantivy の新規作成・
+schema 再構築・rebuild pending でも全印を消し、同じ起動で古い印を再利用しない。
 
 VACUUM 等の housekeeping は起動経路から外し、全 supervisor が初期 scan を完了して
 idle になった最初のフレームで `spawn_housekeeping` から別スレッドで走らせる。
@@ -255,13 +357,32 @@ idle になった最初のフレームで `spawn_housekeeping` から別スレ�
 登録する:
 
 ```
-NameIndexSupervisor (1 お気に入り 1 本):
-  1. name_bulk_indexer::run_bulk_name_index  …… フォルダ / ZIP / PDF の再帰列挙
-  2. SearchIndexDb::upsert_children で差分反映 (INSERT OR REPLACE)
+NameIndexSupervisor (1 正規化 root 1 本):
+  1. name_bulk_indexer::run_bulk_name_index  …… 単一の深さ優先走査で各フォルダを read_dir 1 回
+  2. SearchIndexDb::upsert_children_if_changed で直下集合を比較し、変化したフォルダだけ置換
   3. FsWatcher でイベント受信 → name_index_supervisor::apply_single_change が
      try_exists() ベースで判定し、新規ディレクトリなら subtree 再帰 upsert、
      削除なら ancestor chain prune + delete_subtree を実行 (詳細は §4.5)
 ```
+
+フル走査では直下行の `path / display_path / display_name / kind / mtime` が同じなら
+トランザクションを開かず書き込みを省く。進捗の分母は前回の DB フォルダ行数 + root を
+目安とし、行が無いときは件数だけを表示する。完了時は同じ `favorite_root` のうち、
+今回一覧を完全に観測した親フォルダ集合に含まれず、かつ `updated_at < scan_start_stamp`
+の行だけを削除する。比較と削除は同じ DB lock 内で行い、不変の既存行と走査開始後の
+別書き手の行を保持する。訪問集合は DB と同じ列挙パスの正規化 key を使い、循環検出の
+canonical key とは分離する。除外・存在しない root は訪問集合に入らない。
+取消・不完全観測・DB 更新失敗の場合は prune せず、不完全なフォルダは置換もしない。
+watcher の部分走査は既存の `upsert_children` と stamp による subtree prune を維持する。
+
+`NameIndexManager` が起動・編集の共通経路を所有し、root ごとに停止・join・clear・起動を
+直列化する。同じ root を使う structure 有効のお気に入りが残る間は clear しない。
+UUID ごとの進捗は現在の root の monitor へ解決する。clear は名前行と `scanned_once` の印を
+同じ transaction で消す。印は root・共通除外・名前索引の版を含む指紋で照合し、設定 ON の
+一致時だけ watcher 起動後の初回 Full を省く。完全な Full だけが印を更新する。
+Ctrl+S の現行絞り込みは OFF の root も含み、集合が空なら全 root を検索するため、
+clear 失敗を放置すると古い結果が出る。失敗時は名前 DB の次回起動 rebuild 印を立て、
+次の writable open で名前行と印を同じ transaction で削除する。
 
 - アイテム索引側と違い書き込み先が SQLite 単独なので複数お気に入りの supervisor は
   真の並列で動ける (Tantivy writer 単一制約がない)。
@@ -314,7 +435,8 @@ NameIndexSupervisor (1 お気に入り 1 本):
      フォルダを fav の行として誤投入する事故になる)
    - **`Err(e)`** → アクセス拒否 / 一時ロック / NAS 切断などの曖昧状態。
      `crate::logger::log` に warn を残し、**破壊的 cleanup も再帰 upsert も
-     一切走らせない**。次回 watcher イベント / 次回起動時 walker 3-way diff が拾い直す
+     一切走らせない**。次回 watcher イベント / 次回起動時 walker 3-way diff が拾い直す。
+     `skip_offline_change_scan` ON で初回 Full を省略した起動は拾い直さず、[今すぐ確認] で確認する
 
 3. **subtree scan の不完全観測時は post-scan prune を skip**:
    `run_subtree_scan` は cancel / read_dir error / upsert error を `SubtreeScanOutcome::Cancelled`
@@ -365,7 +487,7 @@ SMB / NAS では `ReadDirectoryChangesW` が発火しないケースがあるの
 - 動画ファイル本体: ファイル名 + FFmpeg が読めるコンテナメタデータ (title /
   artist / URL / description / comment / chapter title 等) を `video_meta_text` へ。
 - 動画タグ: 現行の mIV タグは `tags.db` 正本。旧 `<video.ext>.xmp` の
-  `dc:subject` は移行元としてのみ扱い、Ctrl+F / Ctrl+G の検索ソースにはしない。
+  旧 `dc:subject` タグの取込経路は撤去済みで、Ctrl+F / Ctrl+G の検索ソースにも含めない。
 - フレーム内容 / 音声文字起こし / チャプター以外の本文抽出は対象外。動画再生や
   サムネイル抽出とは独立した低頻度のメタ読み取りだけを行う。
 
@@ -386,19 +508,17 @@ Clear 要求を serial に処理し、`tags.db` だけを更新する。通常�
 Tantivy / Ctrl+S 名前索引へ投影しないため、全文検索 commit 待ちや stale snapshot
 競合は発生しない。
 
-旧 `dc:subject` 由来の Tantivy STORED `tags` は、起動時に一度だけ
-`tags.db` へコピーする。挿入点は `IndexerManager::new` の `FtsMetaDb` open 後、
-`fts_index` wipe / `FtsIndex::open_at` より前。移行済みフラグは
-`tags.db.tag_meta.legacy_tantivy_imported` に置く。
+旧 `dc:subject` 由来の Tantivy STORED `tags` を起動時に `tags.db` へ一括コピーする
+処理は、2026-10-06の利用者決定で専用readerとともに撤去済み。v1.4.0以降で取り込み済みの
+catalogは保持し、v1.0〜v1.3から直接更新する旧タグは取り込まない。ファイルXMPも変更しない。
+既存の `tag_meta.legacy_tantivy_imported` / `tag_item_state.source='tantivy_migration'` は
+歴史値として保持し、markerの読取・書換・削除は行わない。
 
-Tantivy 移行に乗らない未索引ファイルは、フォルダ表示時の legacy seed worker が
-XMP `dc:subject` の `#` タグを一度だけ `tags.db` へ取り込む。自動 seed では
-大量ファイル処理時のディスク占有を避けるため、メディア本体の読み取りは先頭 2MiB
-までに制限する (動画の同名 `.xmp` sidecar は全体を読む)。ユーザーが明示的に
-「旧XMPタグを取り込む」「旧XMPタグを取り込んでファイルから削除」を実行した場合は、
-`tag_item_state` の有無に関係なく選択中の画像/動画を読み直し、既存 tags.db タグへ
-union する。削除モードでは DB 更新成功後に `#` 要素だけを除去し、非 `#` の外部タグは
-保持する。
+フォルダ表示時に未索引ファイルのXMP `dc:subject`を読む自動seedは、v1.0救済終了について
+2026-09-12に利用者了承を得て撤去した。手動の「旧XMPタグを取り込む／取り込んで削除」も
+2026-08-30に撤去済みであり、未移行のXMP `#` タグを新たに `tags.db` へ取り込む経路はない。
+既存の `item_tags` / `tag_item_state`（`source='xmp_legacy'`を含む）は走査・削除せず保持する。
+一般XMP metadata、rating、非`#`の `dc:subject` を扱う現役機能には影響しない。
 
 ### 4.10 外部メタデータサイドカー (画像のみ、INDEX_VERSION=8)
 
@@ -426,7 +546,7 @@ union する。削除モードでは DB 更新成功後に `#` 要素だけを�
   `purge_favorite_metadata` で `sidecar_text` ごと消える。
 - **動画 / ZIP 内 / PDF ページは対象外** (動画は既存 `.xmp` サイドカーの mIV タグ経路を維持)。
 
-### 4.11 AI 生成メタデータ (INDEX_VERSION=9)
+### 4.11 AI 生成メタデータ (INDEX_VERSION=10)
 
 PNG の tEXt/iTXt/zTXt と JPEG/JFIF の EXIF UserComment に埋め込まれた生成メタデータを
 `png_prompt_text` フィールドへ正規化して入れる。実装は
@@ -434,6 +554,16 @@ PNG の tEXt/iTXt/zTXt と JPEG/JFIF の EXIF UserComment に埋め込まれた�
 の 3 経路で同じ判別器を使う。
 
 - `prompt` が JSON object の場合は ComfyUI として扱う。
+- ComfyUI の KSampler topology は positive / negative を別々に辿る。CLIPTextEncode の直接 literal と、
+  fixture で契約を固定した `PrimitiveNode.value` / output 0 だけを解決済みプロンプトにする。
+  変換ノード経由の文字列は出所付きの未解決入力として保持し、メタデータパネルでは既定閉じの
+  「未解決の入力」に表示する。任意ノードの `populated_text` 等をキー名だけで解決済みにしない。
+- 検索本文は解決済み positive を優先する。無い場合は同居する A1111 形式 `parameters` の positive
+  だけを代替にし、それも無い場合だけ、8 KiB / 64 行以内でテンプレート構文を含まない未解決 positive
+  を検索へ採用する。`{word}` と `(word:1.2)` は強調表現として残し、`{a|b}` と `__name__` は除外する。
+  Negative は検索へ入れず、topology 外の link は収集しない。
+- ComfyUI と認識したファイルの `parameters` は parse 成否にかかわらず consumed とし、生チャンクや
+  Negative が後段から再混入しないようにする。未消費チャンクも 1 chunk 16 KiB を超えたら索引しない。
 - `parameters` が JSON object の場合は SwarmUI / Fooocus 系などの生成メタデータとして
   先に分岐し、未知の生成 JSON は生 JSON をプロンプト扱いしない。
 - NovelAI は `Description` 分岐より前に判別し、`Comment.uc` などの Negative を
@@ -443,6 +573,10 @@ PNG の tEXt/iTXt/zTXt と JPEG/JFIF の EXIF UserComment に埋め込まれた�
 - 検索テキスト構築は静的な AI キー一覧ではなく、判別器が実際に消費したキー
   (`consumed_keys`) を素通し除外に使う。新フォーマット追加時のキー追加漏れで
   Negative が混入する事故を防ぐため。
+- path / bytes / メタデータパネル / Ctrl+F / Ctrl+G は `detect_and_parse_outcome` を共通境界にする。
+  PNG の path scanner は IDAT payload を seek して後置 text chunk も読む。ingest の full read も維持する。
+- ingest は perf log 有効時、文書ごとの `stored_text_bytes` event に STORED 原文の総 byte 数と
+  `png_prompt_bytes` を記録する。巨大テンプレートが索引へ残っていないことを再索引後に確認できる。
 
 ---
 
@@ -453,7 +587,7 @@ PNG の tEXt/iTXt/zTXt と JPEG/JFIF の EXIF UserComment に埋め込まれた�
 ```
 UI (render_favsearch_bar)
   → execute_favsearch (spawn worker thread)
-    → SearchIndexDb::search(query, favorite_roots, kind, mode)
+    → SearchIndexDb::search_with_epub(query, favorite_roots, kind, mode, include_epub)
          SQL: SELECT ... FROM entries WHERE
               include 群を mode に応じて AND / OR 結合した LIKE
               AND exclude 群の NOT LIKE
@@ -461,6 +595,8 @@ UI (render_favsearch_bar)
               AND 種別フィルタ:
                   kind=Some(k) なら kind = ?
                   kind=None    なら kind <> VideoFile
+              AND EPUB を無視する場合は PdfFile の .epub パスを除外
+         ORDER BY display_name LIMIT 5000
   → poll_favsearch が結果を受け取り GridItem::Folder/ZipFile/PdfFile に展開
 ```
 
@@ -550,15 +686,18 @@ UI (global_search_ui::render_global_search_bar)
        重複・抜け防止: commit が走っても snapshot は古い seg を見続ける)
     3. TopDocs::with_limit(PAGE_SIZE=500).and_offset(offset) をループ:
        a. Tantivy 候補 (path, addr, score) を取得
-       b. doc_text_for_target で同じ Tantivy snapshot から STORED 原文を引く
+       b. EPUB を無視する場合は .epub パスを除外 (valid 件数には数えない)
+       c. doc_text_for_target で同じ Tantivy snapshot から STORED 原文を引く
           (target で取り出すフィールドを切り替え)
-       c. search_query::matches_with_mode で post-filter (phrase / NOT / AND/OR 判定)
-       d. Batch 送信 (path と hit 情報を streaming)
-       e. 累計 valid_hits が HARD_MAX=10_000 到達で TruncatedAtMax 終了
-       f. 候補使い切りで Complete、cancel で Cancelled
+       d. search_query::matches_with_mode で post-filter (phrase / NOT / AND/OR 判定)
+       e. 1 candidate page ごとに Batch 送信 (path と累計 scanned / valid を streaming)。
+          post-filter で全滅した page も空 Batch として進捗を送る
+       f. 累計 valid_hits が HARD_MAX=10_000 到達で TruncatedAtMax 終了
+       g. 候補使い切りで Complete、cancel で Cancelled
     4. Done 送信
 
   [UI] 毎フレーム:
+    → worker は Batch / Done / Error の送信成功後、egui 非依存 callback で ROOT viewport を起こす
     → poll_global_search が try_recv ループで Batch を受信
     → 検索中は ActivityGate を bump し続け、背景インデクサの walker/ingest を
       次の処理単位で待機させる
@@ -570,8 +709,14 @@ UI (global_search_ui::render_global_search_bar)
       ビューは GlobalSearchState の drill / aggregate / aggregate_auto から
       導出される。ヒット数が閾値を超えると一覧 → 集約へ自動切替する
       (ユーザーが結果を操作した後はロックして勝手に切り替えない)。
-    → pending が残っていれば ctx.request_repaint()
+    → 1 frame の drain 上限到達または rating lookup 後に event が残り得るときだけ即時 repaint。
+      通常の待機中は worker wake を主経路とし、1 秒 backstop を毎 pass 再武装する
 ```
+
+検索中はアドレス欄へヒット件数と累計確認件数を 3 桁区切りで表示し、結果が空の間は
+グリッド中央にも `検索中… 412,000 件を確認 (ヒット 3 件)` の形で表示する。完了後は
+確認件数を外し、従来どおり確定件数だけに戻す。候補総数の分母は実索引での事前 Count が
+200 ms 以内と確認できていないため持たず、索引再構築を伴わない累計値だけを使う。
 
 検索結果はフォルダバー履歴の ←/→ 復帰対象にしない。検索は透明な一時オーバーレイであり、
 検索中の移動は back/forward stack に記録せず、検索中は履歴ボタン自体を無効化する。
@@ -696,7 +841,7 @@ Mutex を横取りし、先に待ち始めたスレッドが秒単位で待た�
 | **`dc:subject` に `#xxx` (採用)** | 業界標準プロパティで他ソフトからも見える。`#` で mIV 管理タグを識別し他ソフト由来を保護 |
 
 現行仕様では通常タグは `tags.db` 正本で、`dc:subject` への書き込みや Ctrl+G
-検索投影は行わない。この節は v1.0 互換タグを移行元として読むための背景メモ。
+検索投影は行わない。旧タグの取込経路もすべて撤去済みで、この節はv1.0当時の背景メモ。
 
 詳細は [archive/search-metadata/tag-feature.md](archive/search-metadata/tag-feature.md) 参照。
 
@@ -774,6 +919,15 @@ Ctrl+Fだけは一覧内filterなので、移譲されたcontextを復元し、�
   (初期バルク + watcher による新規フォルダ / ZIP 追加 + 並列動作)
 - [tests/common/mod.rs](../tests/common/mod.rs) — `FixtureRoot` / `start_indexer_at` /
   `wait_for_search_hits` 等のハーネス
+  - native format の E2E は fixture 作成時に Susie を無効として一度だけ初期化する。
+    アプリの `susie-init` を実行しない統合テストでも、走査指紋 / 未知拡張子の判定が
+    本番用 `get_pool()` の 5 秒 fallback に依存しないようにする。各テストの DB、writer、
+    I/O semaphore、activity gate は引き続き独立で、テストを直列化しない。
+  - 初回待ちは `initial_scan_done` の terminal に加え typed な Full 成功を確認する。
+    ingest flush は commit + reader reload を同期完了するので、成功した初回走査の後に
+    reader の遅延 reload を待つ必要はない。watcher 更新は従来どおり非同期の反映を待つ。
+    timeout には supervisor の有無、before-walk / walk-or-ingest、進捗・結果・診断、
+    manager の再構成状態、Susie pool の有無、reader の可視件数を出す。
 - `src/app.rs::phase_c_key_tests` — 検索バーの相互排他 (Ctrl+F/S/G が常に ≤1 active)
 - `src/app/tests.rs::smart_folder_transition_tests` — 検索→検索、検索由来Snapshot→検索、
   pending smart→検索 / 別smartの`TopLevelGridRestore`移譲、Ctrl+F query再適用、ドライブ一覧・
@@ -809,7 +963,7 @@ Ctrl+Fだけは一覧内filterなので、移譲されたcontextを復元し、�
 4. **Tantivy First の書き込み順序を崩さない**: ingest の順序 (IndexDoc 構築 →
    Tantivy batch commit → SQLite upsert_meta_ok / delete_paths) は順番入替・
    削減しない。failure はキャッシュせず次回起動時の walker 3-way diff で補修
-   する前提。
+   する前提。`skip_offline_change_scan` ON で初回 Full を省略した起動では補修しない。
 5. **新しい SourceKind / IndexKind を追加するなら**: `fts_index::Fields` /
    `IndexDoc` / `fts_meta::files` テーブル / `PerSourceText` / UI の
    `TargetChoice` / `KIND_CHOICES` / `search_page` のすべてに反映する。

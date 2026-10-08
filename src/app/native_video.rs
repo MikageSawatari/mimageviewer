@@ -3,6 +3,15 @@ use crate::keymap::{
     CommandDisplayRow, CommandScope, FS_VIDEO_ACTIVE_SCOPES, KeyAction, VIDEO_ADJUST_SLOT_ACTIONS,
     VIDEO_SEEK_STRIP_ACTIONS,
 };
+
+#[cfg(windows)]
+pub(super) fn native_vst_video_compact(
+    vst_available: bool,
+    gui_visible: bool,
+    compact_pref: bool,
+) -> bool {
+    vst_available && gui_visible && compact_pref
+}
 #[cfg(windows)]
 use crate::video::seek_strip_thumbs::StripThumbnailRequestTrigger;
 
@@ -25,6 +34,177 @@ fn select_native_video_display_mode_toggle(
         NativeVideoDisplayModeToggle::VideoZoom
     } else {
         NativeVideoDisplayModeToggle::NoOp
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NativeMouseRepeatTiming {
+    initial_delay: std::time::Duration,
+    interval: std::time::Duration,
+}
+
+#[cfg(windows)]
+fn native_mouse_repeat_timing_from_system_values(
+    keyboard_delay: Option<u32>,
+    keyboard_speed: Option<u32>,
+) -> NativeMouseRepeatTiming {
+    let delay = keyboard_delay.unwrap_or(1).min(3);
+    let speed = keyboard_speed.unwrap_or(20).min(31);
+    let repeats_per_second = 2.5 + 27.5 * f64::from(speed) / 31.0;
+    NativeMouseRepeatTiming {
+        initial_delay: std::time::Duration::from_millis(u64::from(delay + 1) * 250),
+        interval: std::time::Duration::from_secs_f64(1.0 / repeats_per_second),
+    }
+}
+
+#[cfg(windows)]
+fn sample_native_mouse_repeat_timing() -> NativeMouseRepeatTiming {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SPI_GETKEYBOARDDELAY, SPI_GETKEYBOARDSPEED, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+        SystemParametersInfoW,
+    };
+
+    fn sample(
+        action: windows::Win32::UI::WindowsAndMessaging::SYSTEM_PARAMETERS_INFO_ACTION,
+    ) -> Option<u32> {
+        let mut value = 0_u32;
+        unsafe {
+            SystemParametersInfoW(
+                action,
+                0,
+                Some((&mut value as *mut u32).cast()),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            )
+            .ok()
+            .map(|_| value)
+        }
+    }
+
+    native_mouse_repeat_timing_from_system_values(
+        sample(SPI_GETKEYBOARDDELAY),
+        sample(SPI_GETKEYBOARDSPEED),
+    )
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct NativeVideoMouseSeekHold {
+    context_id: ViewerContextId,
+    fs_idx: usize,
+    slot: crate::ring_shortcut::MouseButtonSlot,
+    action: crate::ring_shortcut::RingActionId,
+    input_owner: crate::video::native_window::NativeVideoMouseInputOwner,
+    source_epoch: u64,
+    initial_receipt: crate::mouse_seek_debug::NativeVideoInputReceipt,
+    next_repeat_at: std::time::Instant,
+    repeat_interval: std::time::Duration,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Default)]
+pub(crate) struct NativeVideoMouseSeekHolds {
+    back: Option<NativeVideoMouseSeekHold>,
+    forward: Option<NativeVideoMouseSeekHold>,
+}
+
+#[cfg(windows)]
+impl NativeVideoMouseSeekHolds {
+    fn slot_mut(
+        &mut self,
+        slot: crate::ring_shortcut::MouseButtonSlot,
+    ) -> Option<&mut Option<NativeVideoMouseSeekHold>> {
+        match slot {
+            crate::ring_shortcut::MouseButtonSlot::Back => Some(&mut self.back),
+            crate::ring_shortcut::MouseButtonSlot::Forward => Some(&mut self.forward),
+            crate::ring_shortcut::MouseButtonSlot::Middle => None,
+        }
+    }
+
+    fn take(
+        &mut self,
+        slot: crate::ring_shortcut::MouseButtonSlot,
+    ) -> Option<NativeVideoMouseSeekHold> {
+        self.slot_mut(slot)?.take()
+    }
+
+    fn put(&mut self, hold: NativeVideoMouseSeekHold) {
+        if let Some(slot) = self.slot_mut(hold.slot) {
+            *slot = Some(hold);
+        }
+    }
+
+    pub(in crate::app) fn clear(&mut self) -> bool {
+        let had_any = self.back.take().is_some() | self.forward.take().is_some();
+        had_any
+    }
+
+    #[cfg(test)]
+    pub(in crate::app) fn seed_for_test(
+        &mut self,
+        context_id: ViewerContextId,
+        slot: crate::ring_shortcut::MouseButtonSlot,
+    ) {
+        let action = match slot {
+            crate::ring_shortcut::MouseButtonSlot::Back => {
+                crate::ring_shortcut::RingActionId::VideoSeekBackSmall
+            }
+            crate::ring_shortcut::MouseButtonSlot::Forward => {
+                crate::ring_shortcut::RingActionId::VideoSeekForwardSmall
+            }
+            crate::ring_shortcut::MouseButtonSlot::Middle => return,
+        };
+        self.put(NativeVideoMouseSeekHold {
+            context_id,
+            fs_idx: 7,
+            slot,
+            action,
+            input_owner: crate::video::native_window::test_mouse_input_owner(),
+            source_epoch: 1,
+            initial_receipt: crate::mouse_seek_debug::test_receipt(1),
+            next_repeat_at: std::time::Instant::now() + std::time::Duration::from_secs(1),
+            repeat_interval: std::time::Duration::from_millis(100),
+        });
+    }
+
+    #[cfg(test)]
+    pub(in crate::app) fn is_armed_for_test(
+        &self,
+        slot: crate::ring_shortcut::MouseButtonSlot,
+    ) -> bool {
+        match slot {
+            crate::ring_shortcut::MouseButtonSlot::Back => self.back.is_some(),
+            crate::ring_shortcut::MouseButtonSlot::Forward => self.forward.is_some(),
+            crate::ring_shortcut::MouseButtonSlot::Middle => false,
+        }
+    }
+
+    fn release(
+        &mut self,
+        fs_idx: usize,
+        source_epoch: u64,
+        event: &crate::video::native_window::NativeVideoMouseButtonEvent,
+    ) -> bool {
+        let slot = match event.button {
+            crate::video::native_window::NativeVideoMouseButton::Extra1 => {
+                crate::ring_shortcut::MouseButtonSlot::Back
+            }
+            crate::video::native_window::NativeVideoMouseButton::Extra2 => {
+                crate::ring_shortcut::MouseButtonSlot::Forward
+            }
+            _ => return false,
+        };
+        let matches = self.slot_mut(slot).is_some_and(|candidate| {
+            candidate.as_ref().is_some_and(|hold| {
+                hold.fs_idx == fs_idx
+                    && hold.source_epoch == source_epoch
+                    && hold.input_owner == event.owner
+            })
+        });
+        if matches {
+            let _ = self.take(slot);
+        }
+        matches
     }
 }
 
@@ -60,6 +240,8 @@ mod native_extra_button_press_tests {
         double_click: bool,
     ) -> NativeVideoMouseButtonEvent {
         NativeVideoMouseButtonEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
+            owner: crate::video::native_window::test_mouse_input_owner(),
             button,
             down,
             double_click,
@@ -67,6 +249,8 @@ mod native_extra_button_press_tests {
             y: 80,
             shift: false,
             ctrl: false,
+            #[cfg(feature = "test-script")]
+            smoke_metadata: None,
         }
     }
 
@@ -112,8 +296,15 @@ pub(super) enum VideoSeekStripAxisState {
 
 #[cfg(windows)]
 pub(super) struct VideoSeekStripSession {
+    session_id: crate::video::seek_strip::SeekStripSessionId,
+    layout_revision: crate::video::seek_strip::SeekStripLayoutRevision,
+    items_generation: u64,
+    source_epoch: u64,
+    presentation: VideoSeekStripPresentationState,
     owner_fs_idx: usize,
     video_path: std::path::PathBuf,
+    audio_stream_index: Option<usize>,
+    default_audio_stream_index: Option<usize>,
     duration_secs: f64,
     /// 帯が動画のどこを写しているか。
     ///
@@ -151,7 +342,8 @@ pub(super) struct VideoSeekStripSession {
     /// ホイールでレンジ設定を変えた時点の [`crate::settings::save_generation`]。
     /// 変えていなければ `None`。
     ///
-    /// ホイールは 1 ノッチ = 1 コマンドなので、その都度 `Settings::save` を呼ぶと
+    /// ホイールは同じnative input batchのノッチ列を1 typed commandとして順に適用する。そのたびに
+    /// `Settings::save` を呼ぶと
     /// 全設定の JSON 化 + SQLite transaction が UI スレッドで連続する。実測は既定設定で
     /// 1.3ms、VST3 プラグイン状態 1MB を持つ環境で 17ms (= 1 フレーム超)、さらに
     /// プロセス最初の保存には世代ローテ 7ms が付く。操作中はメモリ上の `settings` だけを
@@ -161,6 +353,28 @@ pub(super) struct VideoSeekStripSession {
     /// 一緒に入っているので書かない。「保存済みか」を各 save 呼び出し側で個別に
     /// 記録し直さずに済ませるための持ち方。
     range_edited_at_save_generation: Option<u64>,
+    #[cfg(feature = "test-script")]
+    last_presented_receipt: Option<VideoSeekStripTestScriptReceipt>,
+}
+
+#[cfg(all(windows, feature = "test-script"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VideoSeekStripTestScriptReceipt {
+    visible: bool,
+    source_epoch: u64,
+    session_id: crate::video::seek_strip::SeekStripSessionId,
+    generation: u64,
+    layout_revision: Option<crate::video::seek_strip::SeekStripLayoutRevision>,
+    reported_count: Option<usize>,
+    window_applied: bool,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VideoSeekStripPresentationState {
+    AwaitingFirstPresent,
+    Visible,
+    Suspended,
 }
 
 #[cfg(all(test, windows))]
@@ -172,8 +386,15 @@ impl VideoSeekStripSession {
         worker: crate::video::seek_strip_wave::SeekStripWaveWorker,
     ) -> Self {
         Self {
+            session_id: crate::video::seek_strip::SeekStripSessionId(1),
+            layout_revision: crate::video::seek_strip::SeekStripLayoutRevision(1),
+            items_generation: 0,
+            source_epoch: 0,
+            presentation: VideoSeekStripPresentationState::Visible,
             owner_fs_idx: 0,
             video_path,
+            audio_stream_index: Some(0),
+            default_audio_stream_index: Some(0),
             duration_secs: 600.0,
             span: crate::video::seek_strip_layout::SeekStripSpan::Window,
             center: crate::video::seek_strip::SeekStripCenter::Waveform {
@@ -199,12 +420,139 @@ impl VideoSeekStripSession {
             visible_pending_since: None,
             visible_pending_reported: false,
             range_edited_at_save_generation: None,
+            #[cfg(feature = "test-script")]
+            last_presented_receipt: None,
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+impl App {
+    pub(in crate::app) fn seed_video_seek_strip_context_for_test(
+        &mut self,
+        video_path: std::path::PathBuf,
+        worker: crate::video::seek_strip_wave::SeekStripWaveWorker,
+        session_id: u64,
+        visible_count: usize,
+        next_session_id: u64,
+    ) {
+        let mut session = VideoSeekStripSession::for_wave_holdover_test(video_path, worker);
+        session.session_id = crate::video::seek_strip::SeekStripSessionId(session_id);
+        session.owner_fs_idx = self.fullscreen_idx.unwrap_or(0);
+        session.items_generation = self.items_generation;
+        session.visible_count = visible_count;
+        self.video_seek_strip_runtime = VideoSeekStripRuntime::Open(Box::new(session));
+        self.video_seek_strip_next_session_id = next_session_id;
+    }
+
+    pub(in crate::app) fn video_seek_strip_context_owner_for_test(
+        &self,
+    ) -> Option<(crate::video::seek_strip::SeekStripSessionId, usize, usize)> {
+        self.video_seek_strip_runtime.context_owner_for_test()
+    }
+}
+
+#[cfg(all(test, windows))]
+impl VideoSeekStripRuntime {
+    pub(super) fn context_owner_for_test(
+        &self,
+    ) -> Option<(crate::video::seek_strip::SeekStripSessionId, usize, usize)> {
+        let VideoSeekStripRuntime::Open(session) = self else {
+            return None;
+        };
+        Some((
+            session.session_id,
+            session.visible_count,
+            session
+                .wave_worker
+                .as_ref()
+                .map(|worker| worker.identity_for_test())
+                .unwrap_or_default(),
+        ))
+    }
+}
+
+#[cfg(all(windows, feature = "test-script"))]
+impl VideoSeekStripRuntime {
+    pub(super) fn test_script_snapshot(&self) -> crate::test_script::TestScriptSeekStripSnapshot {
+        let Self::Open(session) = self else {
+            return crate::test_script::TestScriptSeekStripSnapshot::closed();
+        };
+        let worker = session
+            .thumbnail_worker
+            .as_ref()
+            .map(|worker| worker.test_script_observation());
+        let receipt = session.last_presented_receipt;
+        crate::test_script::TestScriptSeekStripSnapshot {
+            state: match session.presentation {
+                VideoSeekStripPresentationState::AwaitingFirstPresent => "awaiting",
+                VideoSeekStripPresentationState::Visible => "visible",
+                VideoSeekStripPresentationState::Suspended => "suspended",
+            }
+            .to_string(),
+            session_id: Some(session.session_id.0),
+            source_epoch: Some(session.source_epoch),
+            items_generation: Some(session.items_generation),
+            owner_fs_idx: Some(session.owner_fs_idx),
+            layout_revision: Some(session.layout_revision.0),
+            mode: match session.center.mode() {
+                crate::settings::VideoSeekStripMode::Thumbnails => "thumbnails",
+                crate::settings::VideoSeekStripMode::Waveform => "waveform",
+            }
+            .to_string(),
+            span: match session.span {
+                crate::video::seek_strip_layout::SeekStripSpan::Window => "window",
+                crate::video::seek_strip_layout::SeekStripSpan::Whole => "whole",
+            }
+            .to_string(),
+            visible_count: Some(session.visible_count),
+            axis_cell_count: match &session.axis {
+                VideoSeekStripAxisState::Resolving { .. } => None,
+                VideoSeekStripAxisState::Ready(axis) => Some(axis.cell_count()),
+            },
+            last_sent_request_id: session.last_sent_thumbnail_request_id,
+            last_finished_request_id: worker
+                .as_ref()
+                .and_then(|worker| worker.last_finished_request_id),
+            worker_instance_id: worker.as_ref().map(|worker| worker.instance_id),
+            decoder_open_count: worker.as_ref().map(|worker| worker.decoder_open_count),
+            worker_status: worker
+                .as_ref()
+                .map(|worker| worker.status)
+                .unwrap_or("none")
+                .to_string(),
+            receipt_present: receipt.is_some(),
+            receipt_visible: receipt.is_some_and(|receipt| receipt.visible),
+            receipt_source_epoch: receipt.map(|receipt| receipt.source_epoch),
+            receipt_session_id: receipt.map(|receipt| receipt.session_id.0),
+            receipt_generation: receipt.map(|receipt| receipt.generation),
+            receipt_layout_revision: receipt
+                .and_then(|receipt| receipt.layout_revision.map(|v| v.0)),
+            receipt_reported_count: receipt.and_then(|receipt| receipt.reported_count),
+            receipt_window_applied: receipt.is_some_and(|receipt| receipt.window_applied),
         }
     }
 }
 
 #[cfg(windows)]
 impl VideoSeekStripSession {
+    fn render_stamp(&self) -> crate::video::seek_strip::SeekStripRenderStamp {
+        crate::video::seek_strip::SeekStripRenderStamp {
+            session_id: self.session_id,
+            layout_revision: self.layout_revision,
+        }
+    }
+
+    fn advance_layout_revision(&mut self) {
+        self.layout_revision = crate::video::seek_strip::SeekStripLayoutRevision(
+            self.layout_revision.0.saturating_add(1),
+        );
+        // Presentation activity is independent from layout. In particular, a canonical settings
+        // edit while Suspended must not reopen polling/requests, and an edit while Visible does
+        // not make already-presented pixels disappear. AwaitingFirstPresent is assigned only when
+        // a resource session itself is created.
+    }
+
     /// 全体表示の軸を、帯が報告したセル数へ合わせる。
     ///
     /// セル数は帯の幅と高さで決まるので、ウィンドウのリサイズや高さの変更で変わる。
@@ -292,7 +640,11 @@ pub(super) enum VideoSeekStripRuntime {
 /// close cause は「同じ動画を見続けているか」しか答えられないので、拾う側で必ず照合する。
 #[cfg(windows)]
 pub(crate) struct HeldSeekStripWaveWorker {
+    pub(super) owner_fs_idx: usize,
     pub(super) path: std::path::PathBuf,
+    pub(super) audio_stream_index: Option<usize>,
+    pub(super) source_epoch: u64,
+    pub(super) items_generation: u64,
     pub(super) worker: crate::video::seek_strip_wave::SeekStripWaveWorker,
 }
 
@@ -306,11 +658,21 @@ pub(crate) struct HeldSeekStripWaveWorker {
 #[cfg(windows)]
 fn take_or_spawn_seek_strip_wave_worker(
     holdover: &mut Option<HeldSeekStripWaveWorker>,
+    owner_fs_idx: usize,
     path: &std::path::Path,
+    audio_stream_index: Option<usize>,
+    default_audio_stream_index: Option<usize>,
+    source_epoch: u64,
+    items_generation: u64,
     cache: Option<std::sync::Arc<crate::video::tile_thumb_cache::TileThumbCache>>,
 ) -> crate::video::seek_strip_wave::SeekStripWaveWorker {
     if let Some(held) = holdover.take() {
-        if crate::path_key::eq_keep_drive(&held.path, path) {
+        if held.owner_fs_idx == owner_fs_idx
+            && held.audio_stream_index == audio_stream_index
+            && held.source_epoch == source_epoch
+            && held.items_generation == items_generation
+            && crate::path_key::eq_keep_drive(&held.path, path)
+        {
             held.worker.set_background_paused(false);
             crate::logger::log(format!(
                 "[video-seek-strip] reused the held wave worker: {}",
@@ -319,7 +681,28 @@ fn take_or_spawn_seek_strip_wave_worker(
             return held.worker;
         }
     }
-    crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.to_path_buf(), cache)
+    crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+        path.to_path_buf(),
+        audio_stream_index,
+        default_audio_stream_index,
+        cache,
+    )
+}
+
+#[cfg(windows)]
+fn held_seek_strip_wave_worker_matches_current(
+    held: &HeldSeekStripWaveWorker,
+    current_fs_idx: usize,
+    current_path: Option<&std::path::Path>,
+    current_audio_stream_index: Option<usize>,
+    current_source_epoch: Option<u64>,
+    current_items_generation: u64,
+) -> bool {
+    held.owner_fs_idx == current_fs_idx
+        && held.audio_stream_index == current_audio_stream_index
+        && held.items_generation == current_items_generation
+        && current_source_epoch == Some(held.source_epoch)
+        && current_path.is_some_and(|path| crate::path_key::eq_keep_drive(&held.path, path))
 }
 
 /// 背景の全尺解析を走らせてよいのは、**波形を表示しているとき**だけ。
@@ -656,6 +1039,8 @@ enum NativeVideoFixedKeyAction {
     MouseForward,
     RatingItem(u8),
     RatingContainer(u8),
+    RatingItemStep(crate::keymap::RatingStepDirection),
+    RatingContainerStep(crate::keymap::RatingStepDirection),
     ComparisonUnsupported,
 }
 
@@ -678,6 +1063,8 @@ impl NativeVideoFixedKeyAction {
             Self::MouseForward => "mouse_forward".to_string(),
             Self::RatingItem(stars) => format!("rating_item_{stars}"),
             Self::RatingContainer(stars) => format!("rating_container_{stars}"),
+            Self::RatingItemStep(direction) => format!("rating_item_step_{direction:?}"),
+            Self::RatingContainerStep(direction) => format!("rating_container_step_{direction:?}"),
             Self::ComparisonUnsupported => "comparison_unsupported".to_string(),
         }
     }
@@ -978,6 +1365,7 @@ pub(crate) struct NativeVideoOpenPending {
     pub(crate) idx: usize,
     pub(crate) path: std::path::PathBuf,
     pub(crate) from_grid: bool,
+    pub(crate) playback_origin: crate::video::PlaybackStartOrigin,
     pub(crate) autoplay_override: Option<bool>,
     pub(crate) ignore_resume: bool,
     pub(crate) wait_for_detached_host: bool,
@@ -994,16 +1382,6 @@ pub(crate) struct NativeVideoOpenPending {
 
 #[cfg(windows)]
 const NATIVE_VIDEO_NAV_SWAP_DEBOUNCE_MS: u64 = 120;
-
-#[cfg(windows)]
-pub(crate) fn video_mtime_secs_for_resume_thumb(path: &std::path::Path) -> i64 {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
 
 #[cfg(windows)]
 pub(crate) struct NativeVideoSourceSwapPending {
@@ -1071,6 +1449,7 @@ const VIDEO_RESUME_PREVIEW_SESSION_CACHE_CAP: usize = 8;
 pub(super) fn apply_normalize_gain_with_perf(
     player: &crate::video::VideoPlayer,
     fs_idx: usize,
+    stream_index: usize,
     new_gain_linear: f64,
     new_gain_db: f32,
     reason: &'static str,
@@ -1083,6 +1462,18 @@ pub(super) fn apply_normalize_gain_with_perf(
             0,
             &[
                 ("fs_idx", serde_json::Value::from(fs_idx as i64)),
+                (
+                    "stream_id",
+                    player
+                        .audio_stream_id()
+                        .map_or(serde_json::Value::Null, serde_json::Value::from),
+                ),
+                (
+                    "source_epoch",
+                    player
+                        .native_source_epoch()
+                        .map_or(serde_json::Value::Null, serde_json::Value::from),
+                ),
                 ("gain_db", serde_json::Value::from(new_gain_db as f64)),
                 ("reason", serde_json::Value::from(reason)),
                 ("now", serde_json::Value::from(player.position())),
@@ -1097,7 +1488,7 @@ pub(super) fn apply_normalize_gain_with_perf(
     // set_normalize_gain は atomic store だけで buffer は触らないので、
     // 既存 processed (~100ms) は旧 gain で鳴り続け、その後 raw_pending 経由で
     // 新 gain に切り替わる。A/V offset は連続性を保つ。
-    player.set_normalize_gain(new_gain_linear);
+    player.set_normalize_gain_for_stream(stream_index, new_gain_linear);
     if crate::perf::is_enabled() {
         crate::perf::event(
             "video",
@@ -1106,6 +1497,18 @@ pub(super) fn apply_normalize_gain_with_perf(
             0,
             &[
                 ("fs_idx", serde_json::Value::from(fs_idx as i64)),
+                (
+                    "stream_id",
+                    player
+                        .audio_stream_id()
+                        .map_or(serde_json::Value::Null, serde_json::Value::from),
+                ),
+                (
+                    "source_epoch",
+                    player
+                        .native_source_epoch()
+                        .map_or(serde_json::Value::Null, serde_json::Value::from),
+                ),
                 ("now", serde_json::Value::from(player.position())),
             ],
         );
@@ -1113,6 +1516,680 @@ pub(super) fn apply_normalize_gain_with_perf(
 }
 
 impl App {
+    pub(crate) fn normalize_key_for_player(
+        &self,
+        fs_idx: usize,
+    ) -> Option<crate::app::normalize::NormalizeTargetKey> {
+        let FsCacheEntry::Video { player, .. } = self.fs_cache.get(&fs_idx)? else {
+            return None;
+        };
+        Some(crate::app::normalize::NormalizeTargetKey::new(
+            fs_idx,
+            player.path().clone(),
+            player.applied_audio_stream_index()?,
+        ))
+    }
+
+    pub(crate) fn normalize_ui_state_for_player(
+        &self,
+        fs_idx: usize,
+    ) -> crate::video::normalize_types::NormalizeUiState {
+        self.normalize_key_for_player(fs_idx)
+            .and_then(|key| self.normalize_ui_states.get(&key).copied())
+            .unwrap_or(crate::video::normalize_types::NormalizeUiState::Off)
+    }
+
+    pub(super) fn set_normalize_ui_state_for_player(
+        &mut self,
+        fs_idx: usize,
+        state: crate::video::normalize_types::NormalizeUiState,
+    ) {
+        if let Some(key) = self.normalize_key_for_player(fs_idx) {
+            self.normalize_ui_states.insert(key, state);
+        }
+    }
+
+    pub(super) fn start_normalize_lookup_for_stream(&mut self, fs_idx: usize, stream_index: usize) {
+        if !self.settings.audio_normalize_enabled {
+            return;
+        }
+        let target = self.settings.clamped_audio_normalize_target_lufs_milli();
+        let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
+            return;
+        };
+        let Some(info) = player.info() else { return };
+        let Some(request) = player.begin_normalize_lookup(stream_index, target) else {
+            return;
+        };
+        let key = crate::app::normalize::NormalizeTargetKey::new(
+            fs_idx,
+            player.path().clone(),
+            stream_index,
+        );
+        let owner_context_id = self.projected_viewer_context_id();
+        self.normalize_ui_states.insert(
+            key.clone(),
+            crate::video::normalize_types::NormalizeUiState::OnUnmeasured,
+        );
+        let default_stream_index = info.default_audio_stream_index;
+        let tx = self.normalize_lookup_tx.clone();
+        let wake = player.ui_wake_handle();
+        let db_path = crate::audio_normalize_db::AudioNormalizeDb::db_path();
+        let worker_key = key.clone();
+        let spawned = std::thread::Builder::new()
+            .name("normalize-lookup".to_owned())
+            .spawn(move || {
+                let result =
+                    crate::audio_normalize_db::AudioNormalizeDb::open_read_only_at(&db_path)
+                        .map_err(|error| error.to_string())
+                        .and_then(|db| {
+                            db.lookup_checked(
+                                &worker_key.file_path,
+                                target,
+                                stream_index,
+                                default_stream_index,
+                            )
+                        });
+                let _ = tx.send(crate::app::normalize::NormalizeLookupMessage {
+                    owner_context_id,
+                    key: worker_key,
+                    request,
+                    result,
+                });
+                wake.wake();
+            });
+        if let Err(error) = spawned {
+            crate::logger::log(format!("normalize lookup worker spawn failed: {error}"));
+            if player.resolve_normalize_lookup(request, 1.0) {
+                self.normalize_ui_states.insert(
+                    key,
+                    crate::video::normalize_types::NormalizeUiState::OnUnmeasured,
+                );
+            }
+        }
+    }
+
+    /// Resolve only tracks that can currently supply audio. A switch keeps the
+    /// applied track audible until demux commits the desired one, so both may
+    /// need a lookup after a global Norm reset.
+    pub(super) fn start_normalize_lookups_for_selected_tracks(&mut self, fs_idx: usize) {
+        use crate::video::normalize_gain::NormalizeTrackGain;
+        let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
+            return;
+        };
+        let applied = player.applied_audio_stream_index();
+        let desired = player
+            .audio_track_selection()
+            .and_then(|selection| selection.switch_candidate())
+            .map(|choice| choice.stream_index);
+        let unresolved =
+            [applied, desired.filter(|stream| Some(*stream) != applied)].map(|track| {
+                track.filter(|stream| {
+                    matches!(
+                        player.normalize_track_gain(*stream),
+                        NormalizeTrackGain::Pending(None)
+                    )
+                })
+            });
+        for stream in unresolved.into_iter().flatten() {
+            self.start_normalize_lookup_for_stream(fs_idx, stream);
+        }
+    }
+
+    pub(super) fn poll_normalize_lookups(&mut self) {
+        use crate::app::viewer_context_registry::ContextResidence;
+        use crate::video::normalize_types::NormalizeUiState;
+        while let Ok(message) = self.normalize_lookup_rx.try_recv() {
+            if matches!(
+                self.viewer_context_residence(message.owner_context_id),
+                ContextResidence::Mounted | ContextResidence::AtRest | ContextResidence::Building
+            ) {
+                self.normalize_lookup_pending
+                    .entry(message.owner_context_id)
+                    .or_default()
+                    .push(message);
+            }
+        }
+        // A worker may finish after its viewer was retired; never retain its result.
+        let live_ids = self.viewer_context_ids();
+        self.normalize_lookup_pending
+            .retain(|owner, _| live_ids.contains(owner));
+        let owner = self.projected_viewer_context_id();
+        for message in self
+            .normalize_lookup_pending
+            .remove(&owner)
+            .unwrap_or_default()
+        {
+            let mut key = message.key;
+            // Snapshot reorder can change fs_idx while the worker is running.
+            // The request epoch identifies the player table; locate it within
+            // the owning viewer before updating per-index UI state.
+            let Some(fs_idx) = self.fs_cache.iter().find_map(|(&idx, entry)| {
+                let FsCacheEntry::Video { player, .. } = entry else {
+                    return None;
+                };
+                (player.path() == key.file_path.as_path()
+                    && matches!(player.normalize_track_gain(key.stream_index),
+                        crate::video::normalize_gain::NormalizeTrackGain::Pending(Some(request))
+                            if request == message.request))
+                .then_some(idx)
+            }) else {
+                continue;
+            };
+            key.fs_idx = fs_idx;
+            let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
+                unreachable!("lookup owner disappeared during one UI poll")
+            };
+            #[cfg(windows)]
+            let applied = player.applied_audio_stream_index() == Some(key.stream_index);
+            match message.result {
+                Ok(Some(result)) => {
+                    let gain = 10.0_f64.powf(result.gain_db as f64 / 20.0);
+                    if player.resolve_normalize_lookup(message.request, gain) {
+                        self.normalize_ui_states.insert(
+                            key,
+                            NormalizeUiState::OnApplied {
+                                gain_db: result.gain_db,
+                            },
+                        );
+                    }
+                }
+                outcome => {
+                    let should_scan = matches!(outcome, Ok(None));
+                    let lookup_failed = outcome.is_err();
+                    if let Err(error) = outcome {
+                        crate::logger::log(format!("normalize lookup failed: {error}"));
+                    }
+                    // Establish scan suspension before exposing unity to the pump.
+                    let matches_request = matches!(
+                        player.normalize_track_gain(key.stream_index),
+                        crate::video::normalize_gain::NormalizeTrackGain::Pending(Some(request)) if request == message.request
+                    );
+                    if !matches_request {
+                        continue;
+                    }
+                    self.normalize_ui_states
+                        .insert(key.clone(), NormalizeUiState::OnUnmeasured);
+                    if lookup_failed {
+                        self.normalize_auto_scan_suppressed.insert(key.clone());
+                    }
+                    #[cfg(windows)]
+                    if should_scan
+                        && applied
+                        && self.normalize_auto_scan_policy_ready(key.fs_idx)
+                        && player.intent_playing()
+                    {
+                        self.start_normalize_scan(key.fs_idx);
+                    }
+                    if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&key.fs_idx)
+                    {
+                        player.resolve_normalize_lookup(message.request, 1.0);
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn select_video_audio_track(
+        &mut self,
+        fs_idx: usize,
+        stream_index: usize,
+    ) -> crate::video::AudioTrackSelectResult {
+        let result = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => player.select_audio_track(stream_index),
+            _ => {
+                return crate::video::AudioTrackSelectResult {
+                    outcome: crate::video::AudioTrackSelectOutcome::Rejected,
+                    normalize_unresolved: false,
+                };
+            }
+        };
+        if result.outcome == crate::video::AudioTrackSelectOutcome::Rejected {
+            return result;
+        }
+        if result.outcome == crate::video::AudioTrackSelectOutcome::Unchanged {
+            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                if let Some(choice) = player.explicit_unchanged_audio_track_choice() {
+                    self.settings
+                        .video_audio_track_choices
+                        .insert(crate::adjustment_db::normalize_path(player.path()), choice);
+                }
+            }
+        }
+        self.cancel_blocking_normalize_scan_for_other_track(fs_idx, stream_index);
+        if result.normalize_unresolved {
+            self.start_normalize_lookup_for_stream(fs_idx, stream_index);
+        }
+        result
+    }
+
+    pub(crate) fn cycle_video_audio_track(&mut self, fs_idx: usize) -> Option<String> {
+        let (stream_index, label) = {
+            let FsCacheEntry::Video { player, .. } = self.fs_cache.get(&fs_idx)? else {
+                return None;
+            };
+            let info = player.info()?;
+            if info.audio_tracks.len() < 2 {
+                return None;
+            }
+            let selection = player.audio_track_selection()?;
+            let current = info
+                .audio_tracks
+                .iter()
+                .position(|track| track.stream_index == selection.desired.stream_index)?;
+            let next = &info.audio_tracks[(current + 1) % info.audio_tracks.len()];
+            (
+                next.stream_index,
+                crate::video::audio_track_ui::audio_track_label(
+                    next,
+                    info.default_audio_stream_index,
+                    crate::video::AudioTrackSelectionDisplayState::Applied,
+                ),
+            )
+        };
+        let result = self.select_video_audio_track(fs_idx, stream_index);
+        (result.outcome != crate::video::AudioTrackSelectOutcome::Rejected).then_some(label)
+    }
+
+    pub(crate) fn take_audio_track_failure_toast(&self, fs_idx: usize) -> Option<&'static str> {
+        self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
+            FsCacheEntry::Video { player, .. }
+                if player.take_audio_track_failure_notification() =>
+            {
+                Some("音声トラックを切り替えられませんでした")
+            }
+            _ => None,
+        })
+    }
+
+    pub(crate) fn take_audio_track_open_notice_toast(&self, fs_idx: usize) -> Option<&'static str> {
+        self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
+            FsCacheEntry::Video { player, .. }
+                if player.take_audio_track_open_notice().is_some() =>
+            {
+                Some("保存した音声トラックを開けなかったため、既定のトラックで再生します")
+            }
+            _ => None,
+        })
+    }
+
+    pub(super) fn cancel_blocking_normalize_scan_for_other_track(
+        &mut self,
+        fs_idx: usize,
+        stream_index: usize,
+    ) {
+        let should_cancel = self.normalize_state.as_ref().is_some_and(|state| {
+            state.owner_context_id == self.projected_viewer_context_id()
+                && state.fs_idx == fs_idx
+                && state.stream_index != stream_index
+                && !state.provisional_applied
+                && matches!(
+                    self.fs_cache.get(&fs_idx),
+                    Some(FsCacheEntry::Video { player, .. }) if player.path() == state.file_path.as_path()
+                )
+        });
+        if !should_cancel {
+            return;
+        }
+        let state = self.normalize_state.take().unwrap();
+        state.cancel();
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            if state.was_playing {
+                player.set_playing_internal(true, crate::video::InternalContinuation::Normalize);
+            }
+            player.set_audio_preroll_suspended(false);
+        }
+        self.normalize_ui_states.insert(
+            crate::app::normalize::NormalizeTargetKey::new(
+                fs_idx,
+                state.file_path,
+                state.stream_index,
+            ),
+            crate::video::normalize_types::NormalizeUiState::OnUnmeasured,
+        );
+    }
+
+    #[cfg(windows)]
+    fn emit_audio_output_binding(
+        &self,
+        fs_idx: usize,
+        reason: &'static str,
+        presentation: ViewerPresentation,
+    ) {
+        if !crate::perf::is_enabled() {
+            return;
+        }
+        let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
+            return;
+        };
+        let Some(stream_id) = player.audio_stream_id() else {
+            return;
+        };
+        let source_key = crate::path_key::normalize_keep_drive(player.path());
+        let ui_state = self.normalize_ui_state_for_player(fs_idx);
+        let normalize_state = match ui_state {
+            crate::video::normalize_types::NormalizeUiState::Off => "off",
+            crate::video::normalize_types::NormalizeUiState::OnApplied { .. } => "applied",
+            crate::video::normalize_types::NormalizeUiState::ProvisionalApplied { .. } => {
+                "provisional"
+            }
+            crate::video::normalize_types::NormalizeUiState::OnUnmeasured => "unmeasured",
+            crate::video::normalize_types::NormalizeUiState::Scanning => "scanning",
+        };
+        let source_epoch = player.native_source_epoch();
+        let native_placement = source_epoch.map(|_| {
+            format!(
+                "{:?}",
+                Self::viewer_presentation_to_native_video_placement(presentation)
+            )
+        });
+        let scan_active = self.normalize_state.as_ref().is_some_and(|state| {
+            state.owner_context_id == self.projected_viewer_context_id()
+                && state.fs_idx == fs_idx
+                && crate::path_key::eq_keep_drive(&state.file_path, player.path())
+        });
+        crate::perf::event(
+            "audio_out",
+            "bind",
+            Some(&source_key),
+            self.input_seq,
+            &[
+                ("stream_id", serde_json::Value::from(stream_id)),
+                (
+                    "viewer_context_id",
+                    serde_json::Value::from(self.projected_viewer_context_id().serial()),
+                ),
+                (
+                    "window_id",
+                    self.detached_viewer_window_id()
+                        .map_or(serde_json::Value::Null, serde_json::Value::from),
+                ),
+                ("fs_idx", serde_json::Value::from(fs_idx as u64)),
+                ("reason", serde_json::Value::from(reason)),
+                (
+                    "presentation",
+                    serde_json::Value::from(format!("{presentation:?}")),
+                ),
+                (
+                    "native_placement",
+                    native_placement.map_or(serde_json::Value::Null, serde_json::Value::from),
+                ),
+                (
+                    "placement_generation",
+                    player
+                        .native_committed_generation()
+                        .map_or(serde_json::Value::Null, serde_json::Value::from),
+                ),
+                (
+                    "source_epoch",
+                    source_epoch.map_or(serde_json::Value::Null, serde_json::Value::from),
+                ),
+                (
+                    "seek_serial",
+                    serde_json::Value::from(player.current_seek_serial()),
+                ),
+                (
+                    "engine_state",
+                    serde_json::Value::from(player.engine_state_name()),
+                ),
+                (
+                    "intent_playing",
+                    serde_json::Value::from(player.intent_playing()),
+                ),
+                (
+                    "playback_speed",
+                    serde_json::Value::from(player.playback_speed()),
+                ),
+                (
+                    "normalize_enabled",
+                    serde_json::Value::from(self.settings.audio_normalize_enabled),
+                ),
+                ("normalize_state", serde_json::Value::from(normalize_state)),
+                (
+                    "normalize_scan_active",
+                    serde_json::Value::from(scan_active),
+                ),
+                (
+                    "normalize_target_lufs_milli",
+                    serde_json::Value::from(
+                        self.settings.clamped_audio_normalize_target_lufs_milli(),
+                    ),
+                ),
+                (
+                    "normalize_gain_linear",
+                    serde_json::Value::from(player.normalize_gain()),
+                ),
+                (
+                    "normalize_gain_db",
+                    serde_json::Value::from(ui_state.applied_gain_db() as f64),
+                ),
+                (
+                    "vst_configured",
+                    serde_json::Value::from(!self.settings.vst3_plugins.is_empty()),
+                ),
+                (
+                    "vst_enabled",
+                    serde_json::Value::from(self.settings.vst3_enabled),
+                ),
+                (
+                    "vst_bridge_enabled",
+                    serde_json::Value::from(self.dsp_bridge.is_enabled()),
+                ),
+                (
+                    "vst_active_slots",
+                    serde_json::Value::from(self.dsp_bridge.active_slot_count() as u64),
+                ),
+            ],
+        );
+    }
+
+    #[cfg(windows)]
+    fn emit_normalize_scan_diagnostic(
+        &self,
+        fs_idx: usize,
+        source_path: &std::path::Path,
+        event: &'static str,
+        status: &'static str,
+        gain_db: Option<f32>,
+    ) {
+        if !crate::perf::is_enabled() {
+            return;
+        }
+        let source_key = crate::path_key::normalize_keep_drive(source_path);
+        let current_player = self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
+            FsCacheEntry::Video { player, .. }
+                if crate::path_key::eq_keep_drive(player.path(), source_path) =>
+            {
+                Some(player.as_ref())
+            }
+            _ => None,
+        });
+        crate::perf::event(
+            "video",
+            event,
+            Some(&source_key),
+            self.input_seq,
+            &[
+                ("fs_idx", serde_json::Value::from(fs_idx as u64)),
+                ("status", serde_json::Value::from(status)),
+                (
+                    "stream_id",
+                    current_player
+                        .and_then(crate::video::VideoPlayer::audio_stream_id)
+                        .map_or(serde_json::Value::Null, serde_json::Value::from),
+                ),
+                (
+                    "source_epoch",
+                    current_player
+                        .and_then(crate::video::VideoPlayer::native_source_epoch)
+                        .map_or(serde_json::Value::Null, serde_json::Value::from),
+                ),
+                (
+                    "viewer_context_id",
+                    serde_json::Value::from(self.projected_viewer_context_id().serial()),
+                ),
+                (
+                    "gain_db",
+                    gain_db.map_or(serde_json::Value::Null, |gain| {
+                        serde_json::Value::from(gain as f64)
+                    }),
+                ),
+                (
+                    "target_lufs_milli",
+                    serde_json::Value::from(
+                        self.settings.clamped_audio_normalize_target_lufs_milli(),
+                    ),
+                ),
+            ],
+        );
+    }
+
+    pub(in crate::app) fn clear_native_video_mouse_seek_holds(&mut self, reason: &'static str) {
+        if self.native_video_mouse_seek_holds.clear() {
+            crate::logger::log(format!(
+                "[native-video] mouse seek hold cleared: reason={reason}"
+            ));
+        }
+    }
+
+    #[cfg(windows)]
+    fn native_video_mouse_seek_hold_valid(&self, hold: &NativeVideoMouseSeekHold) -> bool {
+        if self.projected_viewer_context_id() != hold.context_id
+            || self.fullscreen_idx != Some(hold.fs_idx)
+            || !self.native_video_view_input_available(hold.fs_idx)
+            || self.remote_session_blocks_local_control()
+            || self.native_video_parked_live_input_window_id.is_some()
+        {
+            return false;
+        }
+        let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&hold.fs_idx) else {
+            return false;
+        };
+        let committed_generation = player.native_committed_generation().unwrap_or(0);
+        if player.native_source_epoch() != Some(hold.source_epoch)
+            || !Self::native_video_close_generation_is_current(
+                hold.input_owner.window_generation,
+                committed_generation,
+            )
+            || player.native_presenter_hidden()
+        {
+            return false;
+        }
+        let current_hwnd = match hold.input_owner.window_source {
+            crate::video::native_window::NativeVideoWindowSource::Presenter => {
+                player.native_presenter_hwnd()
+            }
+            crate::video::native_window::NativeVideoWindowSource::Hud => player.native_hud_hwnd(),
+        };
+        if current_hwnd == 0 || current_hwnd != hold.input_owner.receiver_hwnd {
+            return false;
+        }
+        let routing = player.native_overlay_input_routing_snapshot();
+        if routing.modal_dialog_active || routing.text_input_active {
+            return false;
+        }
+        self.settings
+            .ring_shortcuts
+            .mouse_button_profile(crate::ring_shortcut::RingShortcutContext::VideoFullscreen)
+            .action(hold.slot)
+            == hold.action
+    }
+
+    #[cfg(windows)]
+    fn arm_native_video_mouse_seek_hold(
+        &mut self,
+        fs_idx: usize,
+        source_epoch: u64,
+        event: crate::video::native_window::NativeVideoMouseButtonEvent,
+        slot: crate::ring_shortcut::MouseButtonSlot,
+        action: crate::ring_shortcut::RingActionId,
+        timing: NativeMouseRepeatTiming,
+        now: std::time::Instant,
+    ) {
+        if crate::app::gamepad_input::video_seek_ring_action(&action).is_none() {
+            return;
+        }
+        let hold = NativeVideoMouseSeekHold {
+            context_id: self.projected_viewer_context_id(),
+            fs_idx,
+            slot,
+            action,
+            input_owner: event.owner,
+            source_epoch,
+            initial_receipt: event.receipt,
+            next_repeat_at: now + timing.initial_delay,
+            repeat_interval: timing.interval,
+        };
+        if self.native_video_mouse_seek_hold_valid(&hold) {
+            self.native_video_mouse_seek_holds.put(hold);
+        }
+    }
+
+    #[cfg(windows)]
+    fn release_native_video_mouse_seek_hold(
+        &mut self,
+        fs_idx: usize,
+        source_epoch: u64,
+        event: &crate::video::native_window::NativeVideoMouseButtonEvent,
+    ) -> bool {
+        self.native_video_mouse_seek_holds
+            .release(fs_idx, source_epoch, event)
+    }
+
+    #[cfg(windows)]
+    pub(in crate::app) fn tick_native_video_mouse_seek_holds(
+        &mut self,
+        ctx: &egui::Context,
+        now: std::time::Instant,
+    ) -> Option<std::time::Duration> {
+        let mut next_delay: Option<std::time::Duration> = None;
+        for slot in [
+            crate::ring_shortcut::MouseButtonSlot::Back,
+            crate::ring_shortcut::MouseButtonSlot::Forward,
+        ] {
+            let Some(mut hold) = self.native_video_mouse_seek_holds.take(slot) else {
+                continue;
+            };
+            if !self.native_video_mouse_seek_hold_valid(&hold) {
+                continue;
+            }
+            if now < hold.next_repeat_at {
+                let delay = hold.next_repeat_at.duration_since(now);
+                next_delay = Some(next_delay.map_or(delay, |current| current.min(delay)));
+                self.native_video_mouse_seek_holds.put(hold);
+                continue;
+            }
+            let result = self.dispatch_mouse_button(
+                ctx,
+                hold.slot,
+                crate::app::ActionSurface::Viewer,
+                "native-video-mouse-hold",
+            );
+            if result.dispatched_action.as_ref() != Some(&hold.action) {
+                continue;
+            }
+            if result.navigation.is_some() {
+                self.mouse_ring_nav = result.navigation;
+            }
+            // Never replay missed ticks as a burst. One frame performs at most one
+            // action per button and schedules the next deadline from this observation.
+            crate::mouse_seek_debug::log_app_mouse_hold_repeat(
+                hold.initial_receipt,
+                match hold.slot {
+                    crate::ring_shortcut::MouseButtonSlot::Back => "back",
+                    crate::ring_shortcut::MouseButtonSlot::Forward => "forward",
+                    crate::ring_shortcut::MouseButtonSlot::Middle => "middle",
+                },
+                hold.action.as_str(),
+            );
+            hold.next_repeat_at = now + hold.repeat_interval;
+            let delay = hold.repeat_interval;
+            next_delay = Some(next_delay.map_or(delay, |current| current.min(delay)));
+            self.native_video_mouse_seek_holds.put(hold);
+        }
+        next_delay
+    }
+
     #[cfg(windows)]
     pub(crate) fn sync_native_video_grade(&mut self) {
         let Some(fs_idx) = self.fullscreen_idx else {
@@ -1186,7 +2263,7 @@ impl App {
 
     #[cfg(windows)]
     fn video_mtime_secs(path: &std::path::Path) -> i64 {
-        video_mtime_secs_for_resume_thumb(path)
+        crate::video::tile_thumbnails::video_mtime_secs_for_resume_thumb(path)
     }
 
     #[cfg(windows)]
@@ -1305,6 +2382,7 @@ impl App {
             idx,
             path: path.to_path_buf(),
             from_grid,
+            playback_origin: crate::video::PlaybackStartOrigin::NewSource,
             autoplay_override,
             ignore_resume,
             wait_for_detached_host: false,
@@ -1353,6 +2431,7 @@ impl App {
             idx,
             path: path.to_path_buf(),
             from_grid,
+            playback_origin: crate::video::PlaybackStartOrigin::NewSource,
             autoplay_override,
             ignore_resume,
             wait_for_detached_host: true,
@@ -1436,6 +2515,7 @@ impl App {
         let idx = pending.idx;
         let path = pending.path.clone();
         let from_grid = pending.from_grid;
+        let playback_origin = pending.playback_origin;
         let autoplay_override = pending.autoplay_override;
         let ignore_resume = pending.ignore_resume;
         let wait_for_detached_host = pending.wait_for_detached_host;
@@ -1533,6 +2613,7 @@ impl App {
                 );
             }
             resume_open(self, idx);
+            self.register_media_playback_origin(idx, playback_origin);
             ctx.request_repaint();
             return;
         }
@@ -1625,6 +2706,7 @@ impl App {
             .flatten();
         let target_detached = target_detached_window_id
             .map(|window_id| self.detached_host_lease_for_window_id(window_id));
+        self.clear_native_video_mouse_seek_holds("placement_replace");
         let request_id = self.video_presentation_transition.request_transition(
             target_presentation,
             activate_on_show,
@@ -1778,6 +2860,7 @@ impl App {
                                 rect,
                                 request.activate
                                     && request.target != ViewerPresentation::DetachedWindow,
+                                host.map(|claim| self.native_chrome_host_for_claim(claim)),
                             );
                         } else if let Some(pending) = self.native_video_source_swap_pending.as_ref()
                         {
@@ -1788,6 +2871,7 @@ impl App {
                                 rect,
                                 request.activate
                                     && request.target != ViewerPresentation::DetachedWindow,
+                                host.map(|claim| self.native_chrome_host_for_claim(claim)),
                             );
                         } else {
                             self.video_presentation_transition.dispatch(
@@ -1935,10 +3019,14 @@ impl App {
                 request,
                 candidate_generation,
             } => {
-                if let Some(idx) = self.native_video_presentation_switch_source() {
+                let source_idx = self.native_video_presentation_switch_source();
+                if let Some(idx) = source_idx {
                     self.bump_native_video_committed_generation(idx, candidate_generation);
                 }
                 self.apply_video_presentation_switched(request.target);
+                if let Some(idx) = source_idx {
+                    self.emit_audio_output_binding(idx, "placement_switched", request.target);
+                }
                 if request.announce_main_hint
                     && request.target != ViewerPresentation::DetachedWindow
                 {
@@ -2147,6 +3235,7 @@ impl App {
                 return false;
             }
         };
+        self.clear_native_video_mouse_seek_holds("source_swap_deferred");
         let now = std::time::Instant::now();
         let parked_live_window_id = self.native_video_parked_live_input_window_id;
         // Inc 7: 音声モードの動画が連続再生 EOF で次動画へ送られた swap かどうか
@@ -2166,6 +3255,7 @@ impl App {
             if self.fullscreen_idx != Some(target_idx) {
                 self.reset_fs_side_panel_runtime_for_file_change();
             }
+            self.fullscreen_epub_source = None;
             self.fullscreen_idx = Some(target_idx);
             // Inc 7: 進行中の swap が既に音声モード維持 (audio_mode_after_swap=true) なら、
             // 通常ナビによる update でもその intent を維持する。keep_audio_mode(=この update の
@@ -2232,15 +3322,46 @@ impl App {
         if from_idx == target_idx {
             return true;
         }
-        if !matches!(self.items.get(from_idx), Some(GridItem::Video(_))) {
+        // Collection navigation can install a newer immutable root in which the playing entry was
+        // deleted before it delegates to this established landing. In that case the typed
+        // navigation owner keeps the old player under a transient, out-of-range index. The cache
+        // entry remains the authoritative source owner, so it is safe to source-swap even though
+        // the latest item list no longer has a row at `from_idx`.
+        if !matches!(self.items.get(from_idx), Some(GridItem::Video(_)))
+            && !matches!(
+                self.fs_cache.get(&from_idx),
+                Some(FsCacheEntry::Video { .. })
+            )
+        {
             return false;
         }
 
         self.save_all_video_resume_positions();
+        // Source replacement is a terminal boundary for the strip resource session.  Confirm
+        // that this player still owns a presenter before retiring the session, so a failed swap
+        // attempt cannot tear down an otherwise reusable same-source strip.  The App thread is
+        // the sole owner of `native_output`, so this availability check and the take below are a
+        // single ordered transition.  Retiring while the output is still attached also lets
+        // `stop_video_seek_strip_session` enqueue SetSeekStrip(None) ahead of any late output.
+        let source_output_available =
+            self.fs_cache
+                .get(&from_idx)
+                .is_some_and(|entry| match entry {
+                    FsCacheEntry::Video { player, .. } => {
+                        player.native_committed_generation().is_some()
+                    }
+                    _ => false,
+                });
+        if !source_output_available {
+            return false;
+        }
+        self.stop_video_seek_strip_session(
+            crate::video::seek_strip::SeekStripCloseCause::VideoChanged,
+        );
         let native_output = match self.fs_cache.get_mut(&from_idx) {
             Some(FsCacheEntry::Video { player, .. }) => {
                 player.pause_audio_output();
-                player.set_playing(false);
+                player.set_playing_with_origin(false, crate::video::PlaybackStartOrigin::UserPlay);
                 player.clear_audio_output_buffer();
                 player.take_native_output()
             }
@@ -2266,6 +3387,7 @@ impl App {
         if self.fullscreen_idx != Some(target_idx) {
             self.reset_fs_side_panel_runtime_for_file_change();
         }
+        self.fullscreen_epub_source = None;
         self.fullscreen_idx = Some(target_idx);
         // Inc 7: 音声モード維持 swap は fullscreen_idx を target へ進めた瞬間から
         // video_audio_mode も target に合わせて音楽ビューを継続表示する (Codex #5)。旧 idx の
@@ -2332,7 +3454,15 @@ impl App {
         else {
             return;
         };
-        for (_epoch, event) in events {
+        for envelope in events {
+            #[cfg(feature = "test-script")]
+            if let Some(dispatch) = envelope.ui_smoke_button_dispatch {
+                crate::video::native_ui_smoke::record_button_app_dispatch_rejected(
+                    dispatch,
+                    "tagged TogglePanorama reached the source-swap pending drain",
+                );
+            }
+            let event = envelope.event;
             match event {
                 // window close (× / Alt+F4) も退避中 committed で gate する。通常経路の
                 // `handle_native_video_window_event` は fs_cache committed を見るため
@@ -2359,7 +3489,7 @@ impl App {
                         ));
                         return;
                     }
-                    self.close_fullscreen();
+                    self.close_fullscreen_to_page_list();
                     return;
                 }
                 crate::video::NativeVideoOutputEvent::Window(event) => {
@@ -2386,7 +3516,7 @@ impl App {
                         ));
                         return;
                     }
-                    self.close_fullscreen();
+                    self.close_fullscreen_to_page_list();
                     return;
                 }
                 crate::video::NativeVideoOutputEvent::PlacementReady {
@@ -2843,7 +3973,7 @@ impl App {
         let source_epoch = self.next_native_video_source_epoch();
         let started_at = std::time::Instant::now();
         self.activity_gate.bump();
-        let (mut new_player, start_normalize_scan_before_play) = self.build_video_player_for_open(
+        let mut new_player = self.build_video_player_for_open(
             target_idx,
             target_path.clone(),
             false,
@@ -2857,6 +3987,10 @@ impl App {
         // hidden consume-and-hold だが、再生開始は FirstFrameReady に依存しない。
         if audio_mode_after_swap {
             new_player.set_media_visual_mode(music_core::MediaVisualMode::Music);
+        }
+        if matches!(history_trigger, crate::app::HistoryTrigger::AutoAdvance) {
+            new_player
+                .register_playback_start(crate::video::PlaybackStartOrigin::ContinuousAdvance);
         }
         new_player.attach_native_output(native_output);
         let payload = new_player.build_switch_source_payload(source_epoch, show_preparing_overlay);
@@ -2878,13 +4012,7 @@ impl App {
                 parked_live_window_id,
                 history_trigger,
             );
-        if start_normalize_scan_before_play {
-            if !self.start_normalize_scan_for_deferred_play_intent(target_idx) {
-                self.resume_deferred_normalize_playback_without_scan(target_idx);
-            }
-        } else {
-            self.maybe_start_normalize_scan_for_play_intent(target_idx);
-        }
+        self.maybe_start_normalize_scan_for_play_intent(target_idx);
 
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&target_idx) {
             crate::logger::log(format!(
@@ -2917,13 +4045,28 @@ impl App {
         // 通常 completion では `open_fullscreen(target_idx)` が video_audio_mode を一旦 None に
         // した後この 1 箇所で戻す。ParkedLive completion は `open_fullscreen` を呼ばず、
         // defer 開始時に video_audio_mode=Some(target) へ進めた bundle 内状態をそのまま保つ。
-        if audio_mode_after_swap && completed_via_open_fullscreen {
-            self.enter_video_audio_mode(ctx, target_idx, VideoAudioEnterSource::DeferredCompletion);
+        if audio_mode_after_swap {
+            if completed_via_open_fullscreen {
+                self.enter_video_audio_mode(
+                    ctx,
+                    target_idx,
+                    VideoAudioEnterSource::DeferredCompletion,
+                );
+            } else {
+                // ParkedLive completion does not call open_fullscreen, so rebuild the native
+                // resource owner explicitly from the new source epoch. Never carry the old
+                // source/HWND join across SwitchSource.
+                let entry_target = self
+                    .native_video_target_for_presentation(self.viewer_presentation)
+                    .map(super::VideoAudioPhysicalTarget::from_tuple);
+                self.video_audio_mode = Some(target_idx);
+                self.arm_video_audio_presenter_retirement(ctx, target_idx, entry_target);
+            }
         }
 
         if reason == "tile" {
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&target_idx) {
-                player.set_playing(false);
+                player.set_playing_with_origin(false, crate::video::PlaybackStartOrigin::UserPlay);
             }
             self.video_tile_mode_active = true;
             self.video_tile_swap_pending = Some(VideoTileSwapPending {
@@ -2987,6 +4130,7 @@ impl App {
             GridItem::PdfPage { .. } => "pdf-page",
             GridItem::Stack { .. } => "stack",
             GridItem::SearchContainer { .. } => "search-container",
+            GridItem::CollectionPlaceholder { .. } => "collection-placeholder",
         }
     }
 
@@ -3120,22 +4264,37 @@ impl App {
             // foreground 状態を観測したら presenter 所有スレッドへ依頼する。
             let now = std::time::Instant::now();
             let foreground_hwnd = crate::video::native_window::foreground_hwnd();
-            let foreground_is_ours =
-                crate::video::native_window::foreground_belongs_to_current_process_strict();
+            let editor_snapshot = self.dsp_bridge.editor_ui_snapshot();
+            let editors = crate::video::dsp::read_editor_ui_snapshot(&editor_snapshot);
+            let foreground_group = crate::video::native_window::ui_group_for_hwnd(
+                foreground_hwnd,
+                &editors.hwnd_pids,
+                &editors.bridge_pids,
+            );
             let foreground_is_presenter =
                 foreground_hwnd == hwnd || (hud_hwnd != 0 && foreground_hwnd == hud_hwnd);
-            let internal_foreground_needs_recover = foreground_is_ours && !foreground_is_presenter;
-            if !foreground_is_ours {
-                self.native_video_front_recover_after_external_foreground = true;
-            } else if internal_foreground_needs_recover {
-                self.native_video_front_recover_after_external_foreground = true;
+            let internal_foreground_needs_recover = foreground_group
+                == crate::video::native_window::ForegroundUiGroup::OwnProcess
+                && !foreground_is_presenter;
+            match foreground_group {
+                crate::video::native_window::ForegroundUiGroup::External => {
+                    self.native_video_front_recover_after_external_foreground = true;
+                }
+                crate::video::native_window::ForegroundUiGroup::OwnProcess
+                    if internal_foreground_needs_recover =>
+                {
+                    self.native_video_front_recover_after_external_foreground = true;
+                }
+                // An editor is owned by this presentation, so it neither arms
+                // recovery nor triggers a raise while its controls have focus.
+                _ => {}
             }
             let presenter_raise_due = self
                 .native_video_front_last_raise
                 .map(|last| now.duration_since(last) >= std::time::Duration::from_millis(250))
                 .unwrap_or(true);
             if presenter_raise_due
-                && foreground_is_ours
+                && foreground_group == crate::video::native_window::ForegroundUiGroup::OwnProcess
                 && self.native_video_front_recover_after_external_foreground
             {
                 let recover_reason = if internal_foreground_needs_recover {
@@ -3234,11 +4393,9 @@ impl App {
             IsWindowVisible, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
             WS_CHILD,
         };
-        let editor_arc = self.dsp_bridge.editor_hwnds_snapshot();
-        let raw_list: Vec<u64> = match editor_arc.read() {
-            Ok(set) => set.iter().copied().collect(),
-            Err(_) => return,
-        };
+        let editor_arc = self.dsp_bridge.editor_ui_snapshot();
+        let editors = crate::video::dsp::read_editor_ui_snapshot(&editor_arc);
+        let raw_list: Vec<u64> = editors.hwnds.iter().copied().collect();
 
         // HWND 正規化 (Codex 続編 P2 反映): 順序を「先に GA_ROOT で正規化 → 正規化後の root に
         // 対して IsWindow / IsWindowVisible / WS_CHILD を検査」に修正。
@@ -3433,15 +4590,24 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(super) fn native_video_presenter_hwnd_for_focus_guard(&self) -> bool {
-        // Inc 7 hidden presenter: 音声モード中は presenter が hide されていて egui 音楽ビューが
-        // main viewport / embedded で描かれる。presenter HWND は非 0 だが「アクティブな
-        // native presenter」ではないので false を返す (= 音声ファイル / 現行 detach 方式と
-        // 同じ挙動で、main focus guard が音楽ビューを誤って閉じない)。
-        // 7e: VST ホスト表示中は presenter を un-hide して前面 native presenter として扱うので、
-        // focus guard も通常動画と同じく presenter を保護する (early-return しない)。
+    pub(super) fn native_video_input_owner_blocks_main_focus(&self) -> bool {
+        // 音声モードへ入った直後は HWND がまだ可視でも、入力 owner は native presenter から
+        // egui music viewport へ移行中である。可視 HWND の有無ではなく、exact owner を持つ
+        // typed handoff が未完了かどうかで main-focus close を抑止する。hide が pump で commit
+        // した SettledHidden 以降は music viewport が owner なので false。
         if self.video_audio_mode.is_some() && self.video_audio_vst.is_none() {
-            return false;
+            return self
+                .video_audio_mode_runtime
+                .as_ref()
+                .is_some_and(|runtime| {
+                    runtime.fs_idx == self.video_audio_mode.unwrap()
+                        && self.video_audio_presenter_owner_matches(runtime.presenter_owner)
+                        && matches!(
+                            runtime.presenter_phase,
+                            super::VideoAudioPresenterPhase::ViewportHandoff { .. }
+                        )
+                        && self.viewer_presentation == ViewerPresentation::Fullscreen
+                });
         }
         self.fullscreen_idx.is_some_and(|idx| {
             self.pending_native_video_output_active_for_fs(idx)
@@ -3452,6 +4618,90 @@ impl App {
                     _ => false,
                 })
         })
+    }
+
+    #[cfg(windows)]
+    fn video_audio_presenter_owner_for(
+        &self,
+        fs_idx: usize,
+    ) -> Option<super::VideoAudioPresenterOwner> {
+        let player = match self.fs_cache.get(&fs_idx)? {
+            FsCacheEntry::Video { player, .. } => player,
+            _ => return None,
+        };
+        let presenter_hwnd = player.native_presenter_hwnd();
+        if presenter_hwnd == 0 {
+            return None;
+        }
+        Some(super::VideoAudioPresenterOwner {
+            context_id: self.projected_viewer_context_id(),
+            fs_idx,
+            source_epoch: player.native_source_epoch()?,
+            presenter_hwnd,
+            committed_generation_floor: player.native_committed_generation()?,
+        })
+    }
+
+    #[cfg(windows)]
+    fn video_audio_presenter_owner_matches(&self, owner: super::VideoAudioPresenterOwner) -> bool {
+        self.projected_viewer_context_id() == owner.context_id
+            && self.fullscreen_idx == Some(owner.fs_idx)
+            && self
+                .fs_cache
+                .get(&owner.fs_idx)
+                .is_some_and(|entry| match entry {
+                    FsCacheEntry::Video { player, .. } => {
+                        player.native_presenter_hwnd() == owner.presenter_hwnd
+                            && player.native_source_epoch() == Some(owner.source_epoch)
+                            && player.native_committed_generation()
+                                == Some(owner.committed_generation_floor)
+                    }
+                    _ => false,
+                })
+    }
+
+    #[cfg(windows)]
+    pub(super) fn video_audio_exit_pending_active(&self) -> bool {
+        self.video_audio_mode_runtime
+            .as_ref()
+            .is_some_and(|runtime| {
+                matches!(
+                    runtime.presenter_phase,
+                    super::VideoAudioPresenterPhase::Exiting(_)
+                        | super::VideoAudioPresenterPhase::HideRequested {
+                            after_hidden: super::VideoAudioAfterHidden::ExitToVideo { .. }
+                        }
+                )
+            })
+    }
+
+    #[cfg(windows)]
+    pub(super) fn cancel_video_audio_viewport_handoff(&mut self, reason: &'static str) {
+        let Some(runtime) = self.video_audio_mode_runtime.as_mut() else {
+            return;
+        };
+        if !matches!(
+            runtime.presenter_phase,
+            super::VideoAudioPresenterPhase::ViewportHandoff { .. }
+        ) {
+            return;
+        }
+        runtime.presenter_phase = super::VideoAudioPresenterPhase::HandoffCancelled;
+        crate::logger::log(format!(
+            "[video-audio] fullscreen viewport handoff cancelled fs_idx={} reason={reason}",
+            runtime.fs_idx
+        ));
+    }
+
+    #[cfg(windows)]
+    pub(super) fn cancel_video_audio_viewport_handoff_for_external_foreground(&mut self) {
+        let foreground = crate::video::native_window::foreground_hwnd();
+        if super::should_cancel_video_audio_handoff_for_external_foreground(
+            foreground,
+            crate::video::native_window::foreground_belongs_to_current_process_strict(),
+        ) {
+            self.cancel_video_audio_viewport_handoff("external_foreground");
+        }
     }
 
     #[cfg(windows)]
@@ -3850,13 +5100,27 @@ impl App {
         } else {
             ViewerPresentation::Fullscreen
         };
+        self.publish_effetune_auto_fullscreen();
+        if in_window
+            && self
+                .fullscreen_idx
+                .is_some_and(|fs_idx| self.video_audio_mode == Some(fs_idx))
+        {
+            // MainWindow itself is now the music input owner. A pending fullscreen viewport
+            // handoff is terminal, and the presenter can be retired without waiting for a
+            // separate viewport focus acknowledgement.
+            self.request_video_audio_presenter_hide_without_viewport_handoff();
+        }
         if in_window {
             self.still_fullscreen_viewport_enter_suppress_until = None;
         } else {
-            if let Some(fs_idx) = self.fullscreen_idx {
-                self.fs_holdover_tex = self
-                    .capture_fs_display_unit(fs_idx)
-                    .map(crate::app::FsHoldover::FolderNavigation);
+            if self.fs_holdover_tex.as_ref().is_none_or(|holdover| {
+                !holdover.continues_viewer_during_content_teardown()
+                    && holdover.navigation_sequence().is_none()
+            }) && let Some(fs_idx) = self.fullscreen_idx
+                && let Some(unit) = self.capture_fs_display_unit(fs_idx)
+            {
+                self.fs_holdover_tex = Some(crate::app::FsHoldover::PresentationSwitch(unit));
             }
             self.still_fullscreen_viewport_enter_suppress_until =
                 Some(now + std::time::Duration::from_millis(260));
@@ -3904,6 +5168,7 @@ impl App {
         let in_window = matches!(presentation, ViewerPresentation::MainWindow);
         self.native_video_in_window_active = in_window;
         self.viewer_presentation = presentation;
+        self.publish_effetune_auto_fullscreen();
         if matches!(presentation, ViewerPresentation::DetachedWindow) {
             let id = self.ensure_detached_viewer_window_id();
             self.ensure_mounted_detached_session_binding(id);
@@ -4019,7 +5284,8 @@ impl App {
             | Ev::PlacementCommitted { .. }
             | Ev::PlacementRetired { .. }
             | Ev::PlacementAborted { .. }
-            | Ev::PlacementSwitchFailed { .. } => true,
+            | Ev::PlacementSwitchFailed { .. }
+            | Ev::SeekStripPresentation(_) => true,
             // Baseline maintenance excludes user input. The narrow owner-scoped right-drag
             // exception is applied by native_video_output_event_allowed_while_parked_live below.
             Ev::Window(
@@ -4101,9 +5367,10 @@ impl App {
     /// The match is exhaustive on purpose. It used to end in `_ => true`, which made "an event we
     /// have not classified" mean "the user clicked a HUD button", so every event added anywhere in
     /// the video subsystem became an activation stealer by default. The seek strip added ten and
-    /// three were classified; `RequestSeekStripWindow`, which the renderer emits whenever the strip
-    /// layout changes, then pulled the video window in front of whatever the user had just
-    /// activated (backlog §1.131). Adding a variant must now cost a decision here.
+    /// three were classified; passive seek-strip layout feedback once pulled the video window in
+    /// front of whatever the user had just activated (backlog §1.131). It is now carried inside
+    /// `SeekStripPresentation`, which remains maintenance. Adding a variant must cost a decision
+    /// here.
     pub(crate) fn native_video_output_event_is_parked_live_hud_click_activation(
         event: &crate::video::NativeVideoOutputEvent,
     ) -> bool {
@@ -4125,7 +5392,7 @@ impl App {
             | Ev::PlacementSwitchFailed { .. }
             | Ev::RequestSeekThumbnail { .. }
             | Ev::ClearSeekThumbnail
-            | Ev::RequestSeekStripWindow { .. }
+            | Ev::SeekStripPresentation(_)
             | Ev::VideoScaleSettingsCommitted { .. }
             | Ev::PanoramaWheel { .. }
             | Ev::VideoZoomWheel { .. } => false,
@@ -4140,10 +5407,10 @@ impl App {
             // in the payload, which is a change this fix does not need; see backlog §1.131.
             Ev::TileColumnsDelta { .. } | Ev::NormalWheel { .. } => false,
             // Events that carry their own cause: ask the cause, not the variant. The presenter
-            // converts a plain wheel into `NavigateItem`, and closes the strip with `HudHidden`
-            // from the draw path whenever the HUD is not visible.
+            // converts a plain wheel into `NavigateItem`; an explicit strip close carries its
+            // own dismissal cause, while transient HUD visibility is classified above.
             Ev::NavigateItem { via_wheel, .. } => !*via_wheel,
-            Ev::CloseSeekStrip { cause } => cause.is_user_dismissal(),
+            Ev::CloseSeekStrip { cause, .. } => cause.is_user_dismissal(),
             // Native HUD commands the user issued. While ParkedLive the button function stays
             // inert; the click itself requests activation.
             Ev::Seek { .. }
@@ -4157,23 +5424,26 @@ impl App {
             | Ev::ResetPanorama
             | Ev::ResetVideoZoom
             | Ev::TileSeek { .. }
-            | Ev::OpenSeekStrip
+            | Ev::OpenSeekStrip { .. }
             | Ev::MoveSeekStrip { .. }
             | Ev::CommitSeekStrip { .. }
             | Ev::SetSeekStripView { .. }
             | Ev::SetSeekStripHeight { .. }
+            | Ev::SetSeekPreviewSize { .. }
             | Ev::StepSeekStripRange { .. }
             | Ev::ToggleTileMode
             | Ev::TogglePerfOverlay
             | Ev::ToggleSidePanelMode
             | Ev::ToggleBarLock { .. }
-            | Ev::ToggleSeekStripLock
+            | Ev::ToggleSeekStripLock { .. }
             | Ev::ToggleClickInfoOpen
+            | Ev::CloseInfoPanel
             | Ev::ToggleInfoPanelLock
             | Ev::OpenTouchInfoPanel
             | Ev::DismissTouchSidePanels
             | Ev::ToggleVst3Gui
             | Ev::ToggleAudioMode
+            | Ev::SelectAudioTrack { .. }
             | Ev::CloseFullscreen { .. }
             | Ev::ToggleWindowMode
             | Ev::SetVst3VideoCompact { .. }
@@ -4264,6 +5534,79 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn seek_strip_session_stamp_is_current(
+        &self,
+        fs_idx: usize,
+        stamp: crate::video::seek_strip::SeekStripSessionEventStamp,
+        allow_suspended: bool,
+    ) -> bool {
+        let VideoSeekStripRuntime::Open(session) = &self.video_seek_strip_runtime else {
+            return false;
+        };
+        if session.owner_fs_idx != fs_idx
+            || session.items_generation != self.items_generation
+            || session.session_id != stamp.session_id
+            || (!allow_suspended
+                && session.presentation == VideoSeekStripPresentationState::Suspended)
+        {
+            return false;
+        }
+        let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
+            return false;
+        };
+        let current_generation = player.native_committed_generation().unwrap_or(0).max(1);
+        player.native_source_epoch() == Some(session.source_epoch)
+            && current_generation == stamp.generation
+            && crate::path_key::eq_keep_drive(player.path(), &session.video_path)
+    }
+
+    fn seek_strip_event_stamp_is_current(
+        &self,
+        fs_idx: usize,
+        stamp: crate::video::seek_strip::SeekStripEventStamp,
+        allow_suspended: bool,
+    ) -> bool {
+        self.seek_strip_session_stamp_is_current(
+            fs_idx,
+            crate::video::seek_strip::SeekStripSessionEventStamp {
+                session_id: stamp.session_id,
+                generation: stamp.generation,
+            },
+            allow_suspended,
+        ) && matches!(
+            &self.video_seek_strip_runtime,
+            VideoSeekStripRuntime::Open(session)
+                if session.layout_revision == stamp.layout_revision
+        )
+    }
+
+    fn native_video_generation_is_exact_current(&self, fs_idx: usize, generation: u64) -> bool {
+        self.fs_cache.get(&fs_idx).is_some_and(|entry| match entry {
+            FsCacheEntry::Video { player, .. } => {
+                player.native_committed_generation().unwrap_or(0).max(1) == generation
+            }
+            _ => false,
+        })
+    }
+
+    fn seek_strip_expected_session_is_current(
+        &self,
+        fs_idx: usize,
+        generation: u64,
+        expected: Option<crate::video::seek_strip::SeekStripEventStamp>,
+    ) -> bool {
+        match expected {
+            Some(stamp) => {
+                stamp.generation == generation
+                    && self.seek_strip_event_stamp_is_current(fs_idx, stamp, false)
+            }
+            None => {
+                matches!(self.video_seek_strip_runtime, VideoSeekStripRuntime::Closed)
+                    && self.native_video_generation_is_exact_current(fs_idx, generation)
+            }
+        }
+    }
+
     pub(super) fn handle_native_video_output_event(
         &mut self,
         ctx: &egui::Context,
@@ -4271,6 +5614,52 @@ impl App {
         source_epoch: u64,
         event: crate::video::NativeVideoOutputEvent,
     ) {
+        self.handle_native_video_output_event_inner(
+            ctx,
+            fs_idx,
+            source_epoch,
+            event,
+            #[cfg(feature = "test-script")]
+            None,
+        );
+    }
+
+    #[cfg(all(windows, feature = "test-script"))]
+    pub(super) fn handle_native_video_output_event_with_ui_smoke_dispatch(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        source_epoch: u64,
+        event: crate::video::NativeVideoOutputEvent,
+        dispatch: Option<crate::video::native_ui_smoke::NativeUiSmokeButtonDispatchMetadata>,
+    ) {
+        self.handle_native_video_output_event_inner(ctx, fs_idx, source_epoch, event, dispatch);
+    }
+
+    #[cfg(windows)]
+    fn handle_native_video_output_event_inner(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        source_epoch: u64,
+        event: crate::video::NativeVideoOutputEvent,
+        #[cfg(feature = "test-script")] dispatch: Option<
+            crate::video::native_ui_smoke::NativeUiSmokeButtonDispatchMetadata,
+        >,
+    ) {
+        #[cfg(feature = "test-script")]
+        let actual_ui_smoke_output = self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
+            FsCacheEntry::Video { player, .. } => player.native_ui_smoke_output_id(),
+            _ => None,
+        });
+        #[cfg(feature = "test-script")]
+        let mut ui_smoke_dispatch_guard =
+            crate::video::native_ui_smoke::NativeUiSmokeAppDispatchGuard::new(
+                dispatch,
+                actual_ui_smoke_output,
+                source_epoch,
+                matches!(&event, crate::video::NativeVideoOutputEvent::TogglePanorama),
+            );
         // native video window は winit 管理外の独立 HWND / egui Context である。
         // raw key の text-input 抑止と IME 判定は `NativeOverlayInputRouting` が command / event
         // 発行前に所有する。ここから先で App viewport の `ime_input_active()` を再適用すると、
@@ -4281,6 +5670,33 @@ impl App {
                 "[native-video] stale overlay event ignored: event_idx={fs_idx} current={:?}",
                 self.fullscreen_idx
             ));
+            return;
+        }
+        if let crate::video::NativeVideoOutputEvent::Window(
+            crate::video::native_window::NativeVideoWindowEvent::MouseButton(mouse),
+        ) = &event
+            && !mouse.down
+            && matches!(
+                mouse.button,
+                crate::video::native_window::NativeVideoMouseButton::Extra1
+                    | crate::video::native_window::NativeVideoMouseButton::Extra2
+            )
+        {
+            // Render already accepted this HWND generation. Releases terminate an
+            // App-owned hold regardless of the overlay state that changed after DOWN.
+            crate::mouse_seek_debug::log_app_received(match &event {
+                crate::video::NativeVideoOutputEvent::Window(window) => window,
+                _ => unreachable!(),
+            });
+            let released = self.release_native_video_mouse_seek_hold(fs_idx, source_epoch, mouse);
+            crate::mouse_seek_debug::log_app_mouse(
+                mouse.receipt,
+                if released {
+                    "release_hold"
+                } else {
+                    "release_unmatched"
+                },
+            );
             return;
         }
         if self.remote_session_blocks_local_control()
@@ -4435,8 +5851,8 @@ impl App {
                 crate::video::NativeVideoOutputEvent::NavigateItem { .. }
                     | crate::video::NativeVideoOutputEvent::ToggleSidePanelMode
                     | crate::video::NativeVideoOutputEvent::ToggleBarLock { .. }
-                    | crate::video::NativeVideoOutputEvent::ToggleSeekStripLock
                     | crate::video::NativeVideoOutputEvent::ToggleClickInfoOpen
+                    | crate::video::NativeVideoOutputEvent::CloseInfoPanel
                     | crate::video::NativeVideoOutputEvent::ToggleInfoPanelLock
                     | crate::video::NativeVideoOutputEvent::OpenTouchInfoPanel
                     | crate::video::NativeVideoOutputEvent::DismissTouchSidePanels
@@ -4454,6 +5870,18 @@ impl App {
             }
         }
         match event {
+            crate::video::NativeVideoOutputEvent::SelectAudioTrack { stream_index } => {
+                let valid = self.fs_cache.get(&fs_idx).is_some_and(|entry| {
+                    matches!(entry,
+                    FsCacheEntry::Video { player, .. } if player.info().is_some_and(|info|
+                        info.audio_tracks.iter().any(|track| track.stream_index == stream_index)))
+                });
+                if valid {
+                    self.select_video_audio_track(fs_idx, stream_index);
+                    self.sync_native_video_metadata(fs_idx);
+                    self.request_native_video_hud_repaint(ctx);
+                }
+            }
             crate::video::NativeVideoOutputEvent::OverlayInputRouting(_) => {
                 debug_assert!(false, "routing snapshots are consumed by NativeVideoOutput");
             }
@@ -4610,11 +6038,20 @@ impl App {
                 self.apply_native_video_zoom_wheel(ctx, fs_idx, delta, pointer_points);
             }
             crate::video::NativeVideoOutputEvent::TogglePanorama => {
-                let target = select_native_video_display_mode_toggle(
-                    self.detect_panorama(fs_idx).is_some(),
-                    self.native_video_zoom_available(fs_idx),
+                #[cfg(feature = "test-script")]
+                let ui_smoke_before = crate::video::native_ui_smoke::NativeUiSmokeAppEffect {
+                    panorama_active: self.is_panorama_mode_active(fs_idx),
+                    video_zoom_scale: self.video_zoom_state.map(|state| state.scale()),
+                };
+                self.toggle_native_video_display_mode_for_input(ctx, fs_idx);
+                #[cfg(feature = "test-script")]
+                ui_smoke_dispatch_guard.complete(
+                    ui_smoke_before,
+                    crate::video::native_ui_smoke::NativeUiSmokeAppEffect {
+                        panorama_active: self.is_panorama_mode_active(fs_idx),
+                        video_zoom_scale: self.video_zoom_state.map(|state| state.scale()),
+                    },
                 );
-                self.apply_native_video_display_mode_toggle(ctx, fs_idx, target);
             }
             crate::video::NativeVideoOutputEvent::CyclePanoramaProjection => {
                 if self.native_video_panorama_input_active(fs_idx)
@@ -4650,6 +6087,9 @@ impl App {
                     delta,
                 )) => self.navigate_native_video_fullscreen(ctx, fs_idx, delta),
                 Some(crate::ring_shortcut::VideoNormalWheelResolvedAction::VolumeStep(step)) => {
+                    if self.normalize_scan_is_modal_for_current_player(fs_idx) {
+                        return;
+                    }
                     let new_volume = self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
                         FsCacheEntry::Video { player, .. } => {
                             let volume = crate::settings::step_video_volume_by_fader_key_step(
@@ -4689,17 +6129,26 @@ impl App {
                     player.clear_native_hover_thumbnail();
                 }
             }
-            crate::video::NativeVideoOutputEvent::OpenSeekStrip => {
+            crate::video::NativeVideoOutputEvent::OpenSeekStrip { generation } => {
+                if !self.native_video_generation_is_exact_current(fs_idx, generation) {
+                    return;
+                }
                 if self.open_video_seek_strip(fs_idx) {
                     self.mark_native_video_hud_activity(ctx);
                     self.sync_native_video_seek_strip(ctx, fs_idx);
                 }
             }
-            crate::video::NativeVideoOutputEvent::CloseSeekStrip { cause } => {
+            crate::video::NativeVideoOutputEvent::CloseSeekStrip { cause, stamp } => {
+                if !self.seek_strip_session_stamp_is_current(fs_idx, stamp, true) {
+                    return;
+                }
                 self.close_video_seek_strip(cause);
                 self.mark_native_video_hud_activity(ctx);
             }
-            crate::video::NativeVideoOutputEvent::MoveSeekStrip { center } => {
+            crate::video::NativeVideoOutputEvent::MoveSeekStrip { center, stamp } => {
+                if !self.seek_strip_event_stamp_is_current(fs_idx, stamp, false) {
+                    return;
+                }
                 // 全体表示の帯は動かない。表示範囲を切り替えた直後に届く 1 つ前の帯からの
                 // 移動を当てると、固定しているはずの中身が 1 フレームだけ流れる。
                 if let VideoSeekStripRuntime::Open(session) = &mut self.video_seek_strip_runtime
@@ -4723,7 +6172,10 @@ impl App {
                     self.sync_native_video_seek_strip(ctx, fs_idx);
                 }
             }
-            crate::video::NativeVideoOutputEvent::CommitSeekStrip { center } => {
+            crate::video::NativeVideoOutputEvent::CommitSeekStrip { center, stamp } => {
+                if !self.seek_strip_event_stamp_is_current(fs_idx, stamp, false) {
+                    return;
+                }
                 let target_secs = match &mut self.video_seek_strip_runtime {
                     VideoSeekStripRuntime::Open(session)
                         if center.mode() == session.center.mode() =>
@@ -4760,50 +6212,172 @@ impl App {
                 }
                 self.sync_native_video_seek_strip(ctx, fs_idx);
             }
-            crate::video::NativeVideoOutputEvent::RequestSeekStripWindow {
-                center,
-                visible_count,
-                pixel_width,
-                pixel_height,
+            crate::video::NativeVideoOutputEvent::SetSeekStripView {
+                view,
+                generation,
+                expected,
             } => {
-                if let VideoSeekStripRuntime::Open(session) = &mut self.video_seek_strip_runtime {
-                    if center.mode() == session.center.mode() {
-                        session.center = center;
-                    }
-                    session.visible_count = visible_count.max(1);
-                    let raster_size = (pixel_width.max(1), pixel_height.max(1));
-                    if session.wave_raster_size != Some(raster_size) {
-                        session.wave_raster_size = Some(raster_size);
-                        session.last_wave_request = None;
-                        session.pending_wave_span = None;
-                    }
-                    // 全体表示のセル数は帯が決める。届いた枚数で軸を作り直してから要求する。
-                    if session.span == crate::video::seek_strip_layout::SeekStripSpan::Whole {
-                        session.rebuild_whole_axis_if_needed();
-                        session.pin_whole_center();
-                    }
-                    Self::request_video_seek_strip_window(
-                        session,
-                        StripThumbnailRequestTrigger::WindowRecalculated,
-                    );
+                if !self.seek_strip_expected_session_is_current(fs_idx, generation, expected) {
+                    return;
                 }
-            }
-            crate::video::NativeVideoOutputEvent::SetSeekStripView { view } => {
                 if self.set_video_seek_strip_view(fs_idx, view) {
                     self.mark_native_video_hud_activity(ctx);
                     self.sync_native_video_seek_strip(ctx, fs_idx);
                 }
             }
-            crate::video::NativeVideoOutputEvent::SetSeekStripHeight { height } => {
+            crate::video::NativeVideoOutputEvent::SetSeekStripHeight {
+                height,
+                generation,
+                expected,
+            } => {
+                if !self.seek_strip_expected_session_is_current(fs_idx, generation, expected) {
+                    return;
+                }
                 if self.set_video_seek_strip_height(fs_idx, height) {
                     self.mark_native_video_hud_activity(ctx);
                     self.sync_native_video_seek_strip(ctx, fs_idx);
                 }
             }
-            crate::video::NativeVideoOutputEvent::StepSeekStripRange { step } => {
-                if self.step_video_seek_strip_range(fs_idx, step) {
+            crate::video::NativeVideoOutputEvent::SetSeekPreviewSize {
+                size,
+                generation,
+                expected,
+            } => {
+                if !self.seek_strip_expected_session_is_current(fs_idx, generation, expected) {
+                    return;
+                }
+                if self.set_video_seek_preview_size(fs_idx, size) {
+                    self.mark_native_video_hud_activity(ctx);
+                }
+            }
+            crate::video::NativeVideoOutputEvent::StepSeekStripRange { steps, stamp } => {
+                if !self.seek_strip_event_stamp_is_current(fs_idx, stamp, false) {
+                    return;
+                }
+                if self.step_video_seek_strip_ranges(fs_idx, &steps) {
                     self.mark_native_video_hud_activity(ctx);
                     self.sync_native_video_seek_strip(ctx, fs_idx);
+                }
+            }
+            crate::video::NativeVideoOutputEvent::SeekStripPresentation(presentation) => {
+                let (stamp, visible, window) = match presentation {
+                    crate::video::seek_strip::SeekStripPresentationEvent::Hidden(stamp) => {
+                        (stamp, false, None)
+                    }
+                    crate::video::seek_strip::SeekStripPresentationEvent::Visible {
+                        stamp,
+                        window,
+                    } => (stamp, true, window),
+                };
+                if !self.seek_strip_session_stamp_is_current(fs_idx, stamp, true) {
+                    crate::logger::log(format!(
+                        "[video-seek-strip] reject presented update: idx={fs_idx} session={} generation={} visible={visible}",
+                        stamp.session_id.0, stamp.generation
+                    ));
+                    return;
+                }
+                let mut window_applied = false;
+                let mut old_visible_count = 0;
+                let mut old_axis_count = None;
+                if let VideoSeekStripRuntime::Open(session) = &mut self.video_seek_strip_runtime {
+                    old_visible_count = session.visible_count;
+                    old_axis_count = match &session.axis {
+                        VideoSeekStripAxisState::Ready(axis) => Some(axis.cell_count()),
+                        VideoSeekStripAxisState::Resolving { .. } => None,
+                    };
+                    session.presentation = if visible {
+                        VideoSeekStripPresentationState::Visible
+                    } else {
+                        VideoSeekStripPresentationState::Suspended
+                    };
+                    session.drag_state = VideoSeekStripDragState::Idle;
+                    session.visible_pending_since = None;
+                    session.visible_pending_reported = false;
+                    if let Some(worker) = session.wave_worker.as_ref() {
+                        worker.set_background_paused(
+                            !visible || wave_background_paused_for_mode(session.center.mode()),
+                        );
+                    }
+                    if visible
+                        && let Some(window) = window
+                        && window.stamp.session_id == stamp.session_id
+                        && window.stamp.generation == stamp.generation
+                        && window.stamp.layout_revision == session.layout_revision
+                    {
+                        if window.center.mode() == session.center.mode() {
+                            session.center = window.center;
+                        }
+                        session.visible_count = window.visible_count.max(1);
+                        let raster_size = (window.pixel_width.max(1), window.pixel_height.max(1));
+                        if session.wave_raster_size != Some(raster_size) {
+                            session.wave_raster_size = Some(raster_size);
+                            session.last_wave_request = None;
+                            session.pending_wave_span = None;
+                        }
+                        // Whole-span geometry is committed by the same successful present as
+                        // Visible, so rebuild its axis before any redisplay request can use the
+                        // fallback count.
+                        if session.span == crate::video::seek_strip_layout::SeekStripSpan::Whole {
+                            session.rebuild_whole_axis_if_needed();
+                            session.pin_whole_center();
+                        }
+                        window_applied = true;
+                    }
+                    #[cfg(feature = "test-script")]
+                    {
+                        session.last_presented_receipt = Some(VideoSeekStripTestScriptReceipt {
+                            visible,
+                            source_epoch,
+                            session_id: stamp.session_id,
+                            generation: stamp.generation,
+                            layout_revision: window.map(|window| window.stamp.layout_revision),
+                            reported_count: window.map(|window| window.visible_count),
+                            window_applied,
+                        });
+                    }
+                }
+                if visible
+                    && let Some(window) = window
+                    && !window_applied
+                    && let VideoSeekStripRuntime::Open(session) = &self.video_seek_strip_runtime
+                {
+                    crate::logger::log(format!(
+                        "[video-seek-strip] reject presented window: idx={fs_idx} session={} generation={} expected_revision={} reported_revision={} reported_count={}",
+                        stamp.session_id.0,
+                        stamp.generation,
+                        session.layout_revision.0,
+                        window.stamp.layout_revision.0,
+                        window.visible_count
+                    ));
+                }
+                if visible {
+                    self.ensure_visible_video_seek_strip_workers(fs_idx);
+                    if let VideoSeekStripRuntime::Open(session) = &mut self.video_seek_strip_runtime
+                    {
+                        Self::request_video_seek_strip_window(
+                            session,
+                            if window_applied {
+                                StripThumbnailRequestTrigger::WindowRecalculated
+                            } else {
+                                StripThumbnailRequestTrigger::StripRedisplayed
+                            },
+                        );
+                    }
+                    self.sync_native_video_seek_strip(ctx, fs_idx);
+                }
+                if let VideoSeekStripRuntime::Open(session) = &self.video_seek_strip_runtime {
+                    let new_axis_count = match &session.axis {
+                        VideoSeekStripAxisState::Ready(axis) => Some(axis.cell_count()),
+                        VideoSeekStripAxisState::Resolving { .. } => None,
+                    };
+                    crate::logger::log(format!(
+                        "[video-seek-strip] apply presented update: idx={fs_idx} session={} generation={} revision={} visible={visible} window_applied={window_applied} visible_count={old_visible_count}->{} axis={old_axis_count:?}->{new_axis_count:?} request_id={:?}",
+                        stamp.session_id.0,
+                        stamp.generation,
+                        session.layout_revision.0,
+                        session.visible_count,
+                        session.last_sent_thumbnail_request_id
+                    ));
                 }
             }
             crate::video::NativeVideoOutputEvent::ToggleTileMode => {
@@ -4837,7 +6411,13 @@ impl App {
                 self.mark_native_video_hud_activity(ctx);
                 ctx.request_repaint();
             }
-            crate::video::NativeVideoOutputEvent::ToggleSeekStripLock => {
+            crate::video::NativeVideoOutputEvent::ToggleSeekStripLock {
+                generation,
+                expected,
+            } => {
+                if !self.seek_strip_expected_session_is_current(fs_idx, generation, expected) {
+                    return;
+                }
                 let locked = toggle_native_video_seek_strip_lock_setting(&mut self.settings);
                 self.settings.save();
                 self.sync_native_video_metadata(fs_idx);
@@ -4853,6 +6433,12 @@ impl App {
             }
             crate::video::NativeVideoOutputEvent::ToggleClickInfoOpen => {
                 self.toggle_fullscreen_click_info_open();
+                self.sync_native_video_metadata(fs_idx);
+                self.mark_native_video_hud_activity(ctx);
+            }
+            crate::video::NativeVideoOutputEvent::CloseInfoPanel => {
+                crate::ime_focus::record_side_panel_close(ctx, "native_video:explicit_info_close");
+                self.close_fullscreen_info_panel();
                 self.sync_native_video_metadata(fs_idx);
                 self.mark_native_video_hud_activity(ctx);
             }
@@ -4886,6 +6472,18 @@ impl App {
                     );
                     self.mark_native_video_hud_activity(ctx);
                     return;
+                }
+                let editor_snapshot = self.dsp_bridge.editor_ui_snapshot();
+                let editors = crate::video::dsp::read_editor_ui_snapshot(&editor_snapshot);
+                if !editors.hwnds.is_empty() {
+                    crate::video::native_window::log_vst_button_probe(
+                        "toggle-ran",
+                        &editors.hwnds,
+                        None,
+                        self.native_video_presenter_hwnd().unwrap_or(0),
+                        self.dsp_bridge.hud_hwnd(),
+                        true,
+                    );
                 }
                 self.toggle_native_video_vst3_gui();
                 self.mark_native_video_hud_activity(ctx);
@@ -5194,6 +6792,7 @@ impl App {
         fs_idx: usize,
         event: crate::video::native_window::NativeVideoWindowEvent,
     ) {
+        crate::mouse_seek_debug::log_app_received(&event);
         if self.fullscreen_idx != Some(fs_idx) {
             return;
         }
@@ -5227,7 +6826,11 @@ impl App {
             crate::video::native_window::NativeVideoWindowEvent::KeyDown(key) => {
                 self.handle_native_video_key_event(ctx, fs_idx, key);
             }
-            crate::video::native_window::NativeVideoWindowEvent::KeyUp(_) => {}
+            crate::video::native_window::NativeVideoWindowEvent::KeyUp(key) => {
+                if crate::mouse_seek_debug::is_comparison_key(key.virtual_key) {
+                    crate::mouse_seek_debug::log_app_key(key.receipt, "release_no_action");
+                }
+            }
             crate::video::native_window::NativeVideoWindowEvent::Text(_) => {}
             crate::video::native_window::NativeVideoWindowEvent::Ime(_) => {}
             crate::video::native_window::NativeVideoWindowEvent::MouseMove(mouse) => {
@@ -5338,6 +6941,13 @@ impl App {
             }
             crate::video::native_window::NativeVideoWindowEvent::MouseWheel(wheel) => {
                 self.mark_native_video_hud_activity(ctx);
+                if self.normalize_scan_is_modal_for_current_player(fs_idx) {
+                    if !wheel.ctrl {
+                        let delta = if wheel.delta < 0 { 1 } else { -1 };
+                        self.navigate_native_video_fullscreen(ctx, fs_idx, delta);
+                    }
+                    return;
+                }
                 if self.apply_native_video_panorama_wheel(ctx, fs_idx, i32::from(wheel.delta)) {
                     return;
                 }
@@ -5380,7 +6990,7 @@ impl App {
             crate::video::native_window::NativeVideoWindowEvent::GeometryChanged { .. } => {}
             crate::video::native_window::NativeVideoWindowEvent::DpiChanged { .. }
             | crate::video::native_window::NativeVideoWindowEvent::RequestRaiseHud
-            | crate::video::native_window::NativeVideoWindowEvent::RequestFocusClaim
+            | crate::video::native_window::NativeVideoWindowEvent::RequestFocusClaim { .. }
             | crate::video::native_window::NativeVideoWindowEvent::Touch(_)
             | crate::video::native_window::NativeVideoWindowEvent::CursorOwnership(_)
             | crate::video::native_window::NativeVideoWindowEvent::Destroyed => {}
@@ -5520,6 +7130,11 @@ impl App {
             Some(FsCacheEntry::Video { player, .. }) => !player.intent_playing(),
             _ => false,
         };
+        if will_request_play {
+            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                player.register_playback_start(crate::video::PlaybackStartOrigin::UserPlay);
+            }
+        }
         if will_request_play && self.start_normalize_scan_for_deferred_play_intent(fs_idx) {
             self.mark_native_video_hud_activity(ctx);
             return;
@@ -5549,7 +7164,7 @@ impl App {
             return;
         }
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-            player.set_playing(false);
+            player.set_playing_with_origin(false, crate::video::PlaybackStartOrigin::UserPlay);
         }
         crate::ui_helpers::open_url(&url);
         self.mark_native_video_hud_activity(ctx);
@@ -5825,20 +7440,15 @@ impl App {
         }
         // [Scanning] のモーダル段階だけクリック無効。仮 gain 適用後のバックグラウンド
         // scan 中は、クリック OFF で scan cancel + 全体 OFF にできる。
-        if self
-            .normalize_state
-            .as_ref()
-            .is_some_and(|state| !state.provisional_applied)
-        {
+        if self.normalize_state.as_ref().is_some_and(|state| {
+            state.owner_context_id == self.projected_viewer_context_id()
+                && !state.provisional_applied
+        }) {
             return;
         }
         use crate::video::normalize_types::NormalizeUiState;
         // ── snapshot phase: self の借用を短くする ──
-        let current_state = self
-            .normalize_ui_states
-            .get(&fs_idx)
-            .copied()
-            .unwrap_or(NormalizeUiState::Off);
+        let current_state = self.normalize_ui_state_for_player(fs_idx);
         let target_milli = self.settings.clamped_audio_normalize_target_lufs_milli();
         let current_path: Option<PathBuf> = match self.fs_cache.get(&fs_idx) {
             Some(FsCacheEntry::Video { player, .. }) => Some(player.path().to_path_buf()),
@@ -5862,13 +7472,24 @@ impl App {
                 // [Off] → [OnApplied] or [Scanning]: グローバル ON 化、現在動画 DB lookup
                 self.settings.audio_normalize_enabled = true;
                 self.settings.save();
-                let lookup = self
-                    .audio_normalize_db
-                    .as_ref()
-                    .and_then(|db| db.lookup(&current_path, target_milli));
+                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                    player.reset_normalize_gains(true);
+                }
+                let lookup = self.audio_normalize_db.as_ref().and_then(|db| {
+                    let FsCacheEntry::Video { player, .. } = self.fs_cache.get(&fs_idx)? else {
+                        return None;
+                    };
+                    let info = player.info()?;
+                    db.lookup(
+                        &current_path,
+                        target_milli,
+                        player.applied_audio_stream_index()?,
+                        info.default_audio_stream_index,
+                    )
+                });
                 if let Some(result) = lookup {
                     self.apply_normalize_gain_db_to_player(fs_idx, result.gain_db);
-                    self.normalize_ui_states.insert(
+                    self.set_normalize_ui_state_for_player(
                         fs_idx,
                         NormalizeUiState::OnApplied {
                             gain_db: result.gain_db,
@@ -5877,8 +7498,19 @@ impl App {
                 } else {
                     self.start_normalize_scan(fs_idx);
                 }
-                // 他の動画にも反映 (ヒットしたものから順に適用)
-                self.apply_normalize_to_all_videos_except(fs_idx, target_milli);
+                self.start_normalize_lookups_for_selected_tracks(fs_idx);
+                // Every viewer owns its own player tables. Resolve the other
+                // players through their owner's async lookup route.
+                let current_context = self.projected_viewer_context_id();
+                self.start_normalize_lookups_in_mounted_context_except(Some(fs_idx));
+                for context_id in self.viewer_context_ids() {
+                    if context_id != current_context {
+                        self.with_viewer_context(context_id, |context| {
+                            context.start_normalize_lookups_in_mounted_context_except(None);
+                        })
+                        .expect("live viewer context must mount for global Norm ON");
+                    }
+                }
             }
             NormalizeUiState::Scanning => {
                 // is_some() ガードで通常到達しない
@@ -5901,26 +7533,52 @@ impl App {
     /// take() で state を捨てて新規スキャン即開始可能にする。
     #[cfg(windows)]
     pub(crate) fn handle_cancel_normalize_scan(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        self.cancel_normalize_scan(ctx, fs_idx, "user_cancelled");
+    }
+
+    #[cfg(windows)]
+    fn cancel_normalize_scan(&mut self, ctx: &egui::Context, fs_idx: usize, reason: &'static str) {
         let should_drop = self
             .normalize_state
             .as_ref()
-            .map(|s| s.fs_idx == fs_idx)
+            .map(|s| s.owner_context_id == self.projected_viewer_context_id() && s.fs_idx == fs_idx)
             .unwrap_or(false);
         if !should_drop {
             return;
         }
         if let Some(state) = self.normalize_state.take() {
             state.cancel();
-            self.normalize_auto_scan_suppressed.insert(state.fs_idx);
+            self.emit_normalize_scan_diagnostic(
+                state.fs_idx,
+                &state.file_path,
+                "normalize_scan_terminal",
+                reason,
+                state.provisional_result.map(|result| result.gain_db),
+            );
+            self.normalize_auto_scan_suppressed.insert(
+                crate::app::normalize::NormalizeTargetKey::new(
+                    state.fs_idx,
+                    state.file_path.clone(),
+                    state.stream_index,
+                ),
+            );
             // 元再生状態に復帰
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&state.fs_idx) {
-                if state.was_playing {
-                    player.set_playing(true);
+                player.set_normalize_gain_for_stream(state.stream_index, 1.0);
+                if state.was_playing
+                    && player.applied_audio_stream_index() == Some(state.stream_index)
+                {
+                    player
+                        .set_playing_internal(true, crate::video::InternalContinuation::Normalize);
                     player.set_audio_preroll_suspended(false);
                 }
             }
             self.normalize_ui_states.insert(
-                state.fs_idx,
+                crate::app::normalize::NormalizeTargetKey::new(
+                    state.fs_idx,
+                    state.file_path,
+                    state.stream_index,
+                ),
                 crate::video::normalize_types::NormalizeUiState::OnUnmeasured,
             );
             // worker は cancel atomic を見て早期 return、_join + rx も drop で解放される
@@ -5928,31 +7586,86 @@ impl App {
         self.mark_native_video_hud_activity(ctx);
     }
 
-    /// 全 fs_cache の VideoPlayer に gain=1.0 を即時適用 + Settings 保存。
+    /// 全 viewer context の VideoPlayer に gain=1.0 を即時適用 + Settings 保存。
     /// DB エントリは残す (= 次回 ON 復帰で即適用できる)。
     #[cfg(windows)]
     pub(super) fn disable_normalize_globally(&mut self) {
-        use crate::video::normalize_types::NormalizeUiState;
         if let Some(state) = self.normalize_state.take() {
             state.cancel();
-            if state.was_playing {
-                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&state.fs_idx) {
-                    if player.path() == state.file_path.as_path() {
-                        player.set_playing(true);
-                        player.set_audio_preroll_suspended(false);
-                    }
-                }
-            }
+            self.emit_normalize_scan_diagnostic(
+                state.fs_idx,
+                &state.file_path,
+                "normalize_scan_terminal",
+                "normalize_disabled",
+                state.provisional_result.map(|result| result.gain_db),
+            );
+            self.resume_cancelled_normalize_scan_owner(&state);
         }
         self.settings.audio_normalize_enabled = false;
         self.settings.save();
+        self.disable_normalize_in_mounted_context();
+        let current_context = self.projected_viewer_context_id();
+        for context_id in self.viewer_context_ids() {
+            if context_id != current_context {
+                self.with_viewer_context(context_id, |context| {
+                    context.disable_normalize_in_mounted_context();
+                })
+                .expect("live viewer context must mount for global Norm OFF");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn disable_normalize_in_mounted_context(&mut self) {
+        use crate::video::normalize_types::NormalizeUiState;
         self.normalize_auto_scan_suppressed.clear();
+        self.normalize_ui_states.clear();
         let fs_idxs: Vec<usize> = self.fs_cache.keys().copied().collect();
         for idx in fs_idxs {
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
-                apply_normalize_gain_with_perf(player, idx, 1.0, 0.0, "toggle_off");
-                self.normalize_ui_states.insert(idx, NormalizeUiState::Off);
+                player.reset_normalize_gains(false);
+                if let Some(stream) = player.applied_audio_stream_index() {
+                    apply_normalize_gain_with_perf(player, idx, stream, 1.0, 0.0, "toggle_off");
+                }
+                self.set_normalize_ui_state_for_player(idx, NormalizeUiState::Off);
             }
+        }
+    }
+
+    #[cfg(windows)]
+    fn resume_cancelled_normalize_scan_owner(
+        &mut self,
+        state: &crate::app::normalize::NormalizeScanState,
+    ) {
+        let resume = |owner: &mut Self| {
+            if let Some(FsCacheEntry::Video { player, .. }) = owner.fs_cache.get(&state.fs_idx) {
+                if player.path() == state.file_path.as_path() {
+                    if state.was_playing {
+                        player.set_playing_internal(
+                            true,
+                            crate::video::InternalContinuation::Normalize,
+                        );
+                    }
+                    player.set_audio_preroll_suspended(false);
+                    owner.normalize_ui_states.insert(
+                        crate::app::normalize::NormalizeTargetKey::new(
+                            state.fs_idx,
+                            state.file_path.clone(),
+                            state.stream_index,
+                        ),
+                        crate::video::normalize_types::NormalizeUiState::OnUnmeasured,
+                    );
+                }
+            }
+        };
+        if state.owner_context_id == self.projected_viewer_context_id() {
+            resume(self);
+        } else if matches!(
+            self.viewer_context_residence(state.owner_context_id),
+            crate::app::viewer_context_registry::ContextResidence::AtRest
+        ) {
+            self.with_viewer_context(state.owner_context_id, resume)
+                .expect("scan owner must mount to release preroll");
         }
     }
 
@@ -5964,50 +7677,38 @@ impl App {
     pub(super) fn apply_normalize_gain_db_to_player(&mut self, fs_idx: usize, gain_db: f32) {
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             let linear = 10.0_f64.powf(gain_db as f64 / 20.0);
-            apply_normalize_gain_with_perf(player, fs_idx, linear, gain_db, "toggle_on");
+            if let Some(stream) = player.applied_audio_stream_index() {
+                apply_normalize_gain_with_perf(
+                    player,
+                    fs_idx,
+                    stream,
+                    linear,
+                    gain_db,
+                    "toggle_on",
+                );
+            }
         }
     }
 
-    /// 他の fs_cache entry (= except_fs_idx 以外) について DB lookup → ヒットなら適用、
-    /// ミスなら OnUnmeasured 設定。トグル ON 時の同期適用に使う。
+    /// Other players enter a new table epoch and resolve in their viewer context.
     #[cfg(windows)]
-    pub(super) fn apply_normalize_to_all_videos_except(
-        &mut self,
-        except_fs_idx: usize,
-        target_milli: i32,
-    ) {
-        use crate::video::normalize_types::NormalizeUiState;
+    fn start_normalize_lookups_in_mounted_context_except(&mut self, except_fs_idx: Option<usize>) {
+        self.normalize_auto_scan_suppressed.clear();
+        self.normalize_ui_states
+            .retain(|key, _| Some(key.fs_idx) == except_fs_idx);
         let other_idxs: Vec<usize> = self
             .fs_cache
-            .keys()
-            .copied()
-            .filter(|i| *i != except_fs_idx)
+            .iter()
+            .filter_map(|(idx, entry)| match entry {
+                FsCacheEntry::Video { .. } if Some(*idx) != except_fs_idx => Some(*idx),
+                _ => None,
+            })
             .collect();
         for idx in other_idxs {
-            let path = match self.fs_cache.get(&idx) {
-                Some(FsCacheEntry::Video { player, .. }) => Some(player.path().to_path_buf()),
-                _ => None,
-            };
-            let Some(path) = path else { continue };
-            let lookup = self
-                .audio_normalize_db
-                .as_ref()
-                .and_then(|db| db.lookup(&path, target_milli));
-            match lookup {
-                Some(result) => {
-                    self.apply_normalize_gain_db_to_player(idx, result.gain_db);
-                    self.normalize_ui_states.insert(
-                        idx,
-                        NormalizeUiState::OnApplied {
-                            gain_db: result.gain_db,
-                        },
-                    );
-                }
-                None => {
-                    self.normalize_ui_states
-                        .insert(idx, NormalizeUiState::OnUnmeasured);
-                }
+            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
+                player.reset_normalize_gains(true);
             }
+            self.start_normalize_lookups_for_selected_tracks(idx);
         }
     }
 
@@ -6056,20 +7757,41 @@ impl App {
                     "[native-video] deferred normalize scan not started; resume playback idx={fs_idx}"
                 ));
             }
-            player.set_playing(true);
+            player.set_playing_internal(true, crate::video::InternalContinuation::Normalize);
             player.set_audio_preroll_suspended(false);
         }
     }
 
     #[cfg(windows)]
-    fn normalize_auto_scan_target_ready(&self, fs_idx: usize) -> bool {
+    pub(super) fn normalize_auto_scan_target_ready(&self, fs_idx: usize) -> bool {
+        if !self.normalize_auto_scan_policy_ready(fs_idx) {
+            return false;
+        }
+        let Some(key) = self.normalize_key_for_player(fs_idx) else {
+            return false;
+        };
+        matches!(self.fs_cache.get(&fs_idx),
+            Some(FsCacheEntry::Video { player, .. }) if matches!(
+                player.normalize_track_gain(key.stream_index),
+                crate::video::normalize_gain::NormalizeTrackGain::Gain(_)))
+    }
+
+    #[cfg(windows)]
+    fn normalize_auto_scan_policy_ready(&self, fs_idx: usize) -> bool {
         use crate::video::normalize_types::NormalizeUiState;
+        let Some(key) = self.normalize_key_for_player(fs_idx) else {
+            return false;
+        };
         self.settings.audio_normalize_enabled
             && self.fullscreen_idx == Some(fs_idx)
-            && !self.normalize_auto_scan_suppressed.contains(&fs_idx)
-            && self.normalize_ui_states.get(&fs_idx).copied()
-                == Some(NormalizeUiState::OnUnmeasured)
-            && matches!(self.fs_cache.get(&fs_idx), Some(FsCacheEntry::Video { .. }))
+            && !self.normalize_auto_scan_suppressed.contains(&key)
+            && self.normalize_ui_states.get(&key).copied() == Some(NormalizeUiState::OnUnmeasured)
+            && matches!(self.fs_cache.get(&fs_idx), Some(FsCacheEntry::Video { player, .. })
+                if player.audio_track_selection().is_none_or(|selection|
+                    selection.desired == selection.applied
+                        && selection.applied.stream_index == key.stream_index
+                        && selection.display_state(false)
+                            == crate::video::AudioTrackSelectionDisplayState::Applied))
     }
 
     #[cfg(windows)]
@@ -6077,11 +7799,14 @@ impl App {
         let Some(state) = self.normalize_state.as_ref() else {
             return false;
         };
-        if state.fs_idx != fs_idx {
+        if state.owner_context_id != self.projected_viewer_context_id() || state.fs_idx != fs_idx {
             return false;
         }
         match self.fs_cache.get(&fs_idx) {
-            Some(FsCacheEntry::Video { player, .. }) => player.path() == state.file_path.as_path(),
+            Some(FsCacheEntry::Video { player, .. }) => {
+                player.path() == state.file_path.as_path()
+                    && player.applied_audio_stream_index() == Some(state.stream_index)
+            }
             _ => false,
         }
     }
@@ -6108,7 +7833,7 @@ impl App {
         }
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             player.set_audio_preroll_suspended(true);
-            player.set_playing(false);
+            player.set_playing_internal(false, crate::video::InternalContinuation::Normalize);
         }
         true
     }
@@ -6122,38 +7847,45 @@ impl App {
     #[cfg(windows)]
     fn start_normalize_scan_inner(&mut self, fs_idx: usize, was_playing_override: Option<bool>) {
         use crate::video::normalize_types::NormalizeUiState;
-        let (path, was_playing, ui_wake) = match self.fs_cache.get(&fs_idx) {
+        let (path, stream_index, was_playing, ui_wake) = match self.fs_cache.get(&fs_idx) {
             Some(FsCacheEntry::Video { player, .. }) => {
+                let Some(stream_index) = player.applied_audio_stream_index() else {
+                    return;
+                };
                 let was_playing = was_playing_override.unwrap_or_else(|| player.intent_playing());
                 (
                     player.path().to_path_buf(),
+                    stream_index,
                     was_playing,
                     player.ui_wake_handle(),
                 )
             }
             _ => return,
         };
-        self.normalize_auto_scan_suppressed.remove(&fs_idx);
+        let key =
+            crate::app::normalize::NormalizeTargetKey::new(fs_idx, path.clone(), stream_index);
+        self.normalize_auto_scan_suppressed.remove(&key);
         // 既存 state を捨てる (cancel を立てておく) — 通常は is_some() で弾かれているが defensive
         if let Some(prev) = self.normalize_state.take() {
             prev.cancel();
-            let prev_still_current = matches!(
-                self.fs_cache.get(&prev.fs_idx),
-                Some(FsCacheEntry::Video { player, .. }) if player.path() == prev.file_path.as_path()
+            self.resume_cancelled_normalize_scan_owner(&prev);
+            self.emit_normalize_scan_diagnostic(
+                prev.fs_idx,
+                &prev.file_path,
+                "normalize_scan_terminal",
+                "superseded",
+                prev.provisional_result.map(|result| result.gain_db),
             );
-            if prev_still_current {
-                self.normalize_ui_states
-                    .insert(prev.fs_idx, NormalizeUiState::OnUnmeasured);
-            } else {
-                self.normalize_ui_states.remove(&prev.fs_idx);
-            }
         }
         // 再生中なら一時停止し、測定前の raw→processed 先読みも止める。
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             if was_playing {
                 player.set_audio_preroll_suspended(true);
-                player.set_playing(false);
+                player.set_playing_internal(false, crate::video::InternalContinuation::Normalize);
             }
+            // A manual scan can supersede an in-flight lookup. Invalidate its exact request
+            // after suspension so a late cache result cannot replace this scan's gain.
+            player.set_normalize_gain_for_stream(stream_index, 1.0);
         }
         let target_milli = self.settings.clamped_audio_normalize_target_lufs_milli();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -6177,6 +7909,7 @@ impl App {
                     };
                 let result = crate::video::normalize_scanner::scan_audio_loudness_with_provisional(
                     &path_clone,
+                    stream_index,
                     target_milli,
                     cancel_clone,
                     progress_clone,
@@ -6193,21 +7926,40 @@ impl App {
             Ok(j) => j,
             Err(e) => {
                 crate::logger::log(format!("normalize-scan thread spawn failed: {e}"));
+                self.emit_normalize_scan_diagnostic(
+                    fs_idx,
+                    &path,
+                    "normalize_scan_terminal",
+                    "spawn_error",
+                    None,
+                );
                 // Codex P2: spawn 失敗時は元再生状態に戻し、UI 状態も OnUnmeasured に
                 if was_playing {
                     if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-                        player.set_playing(true);
+                        player.set_normalize_gain_for_stream(stream_index, 1.0);
+                        player.set_playing_internal(
+                            true,
+                            crate::video::InternalContinuation::Normalize,
+                        );
                         player.set_audio_preroll_suspended(false);
                     }
                 }
+                if !was_playing {
+                    if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                        player.set_normalize_gain_for_stream(stream_index, 1.0);
+                    }
+                }
                 self.normalize_ui_states
-                    .insert(fs_idx, NormalizeUiState::OnUnmeasured);
-                self.normalize_auto_scan_suppressed.insert(fs_idx);
+                    .insert(key.clone(), NormalizeUiState::OnUnmeasured);
+                self.normalize_auto_scan_suppressed.insert(key);
                 return;
             }
         };
+        self.emit_normalize_scan_diagnostic(fs_idx, &path, "normalize_scan_start", "running", None);
         self.normalize_state = Some(crate::app::normalize::NormalizeScanState {
+            owner_context_id: self.projected_viewer_context_id(),
             fs_idx,
+            stream_index,
             cancel,
             progress,
             rx,
@@ -6219,13 +7971,20 @@ impl App {
             _join: join,
         });
         self.normalize_ui_states
-            .insert(fs_idx, NormalizeUiState::Scanning);
+            .insert(key, NormalizeUiState::Scanning);
     }
 
     /// スキャン完了 / キャンセル / エラーを検知して後処理する。`App::update` から毎フレーム呼ぶ。
     #[cfg(windows)]
     pub(super) fn poll_normalize_scan(&mut self, _ctx: &egui::Context) {
         use crate::video::normalize_types::NormalizeUiState;
+        if self
+            .normalize_state
+            .as_ref()
+            .is_some_and(|state| state.owner_context_id != self.projected_viewer_context_id())
+        {
+            return;
+        }
         // 1. メッセージ peek (try_recv)
         let msg = match self.normalize_state.as_ref() {
             Some(state) => match state.rx.try_recv() {
@@ -6236,10 +7995,15 @@ impl App {
             None => return,
         };
         if let Some(Ok(crate::app::normalize::NormalizeMessage::Provisional(result))) = msg {
-            let Some((fs_idx, file_path, was_playing)) = self
-                .normalize_state
-                .as_ref()
-                .map(|state| (state.fs_idx, state.file_path.clone(), state.was_playing))
+            let Some((fs_idx, file_path, stream_index, was_playing)) =
+                self.normalize_state.as_ref().map(|state| {
+                    (
+                        state.fs_idx,
+                        state.file_path.clone(),
+                        state.stream_index,
+                        state.was_playing,
+                    )
+                })
             else {
                 return;
             };
@@ -6253,28 +8017,46 @@ impl App {
                     apply_normalize_gain_with_perf(
                         player,
                         fs_idx,
+                        stream_index,
                         linear,
                         result.gain_db,
                         "scan_provisional",
                     );
-                    if was_playing {
-                        player.set_playing(true);
+                    if was_playing && player.applied_audio_stream_index() == Some(stream_index) {
+                        player.set_playing_internal(
+                            true,
+                            crate::video::InternalContinuation::Normalize,
+                        );
                         player.set_audio_preroll_suspended(false);
                     }
                 }
                 self.normalize_ui_states.insert(
-                    fs_idx,
+                    crate::app::normalize::NormalizeTargetKey::new(
+                        fs_idx,
+                        file_path.clone(),
+                        stream_index,
+                    ),
                     NormalizeUiState::ProvisionalApplied {
                         gain_db: result.gain_db,
                     },
                 );
                 if let Some(state) = self.normalize_state.as_mut() {
-                    if state.fs_idx == fs_idx && state.file_path == file_path {
+                    if state.fs_idx == fs_idx
+                        && state.file_path == file_path
+                        && state.stream_index == stream_index
+                    {
                         state.provisional_applied = true;
                         state.provisional_result = Some(result);
                     }
                 }
             }
+            self.emit_normalize_scan_diagnostic(
+                fs_idx,
+                &file_path,
+                "normalize_scan_provisional",
+                if still_valid { "applied" } else { "stale" },
+                Some(result.gain_db),
+            );
             return;
         }
         // 2. 完了確定: state を所有してから後処理
@@ -6287,13 +8069,18 @@ impl App {
             Some(FsCacheEntry::Video { player, .. }) => player.path() == state.file_path.as_path(),
             _ => false,
         };
+        let key = crate::app::normalize::NormalizeTargetKey::new(
+            state.fs_idx,
+            state.file_path.clone(),
+            state.stream_index,
+        );
         match msg {
             Some(Ok(crate::app::normalize::NormalizeMessage::Done(result))) => {
-                // 測定値はファイル単位なので、stale でも DB に保存しておく (= 次回開いたとき即適用)
+                // A completed scan belongs to its exact stream, even after a later selection.
                 if let Some(db) = self.audio_normalize_db.as_ref() {
-                    let _ = db.upsert(&state.file_path, &result);
+                    let _ = db.upsert(&state.file_path, state.stream_index, &result);
                 }
-                self.normalize_auto_scan_suppressed.remove(&state.fs_idx);
+                self.normalize_auto_scan_suppressed.remove(&key);
                 if still_valid {
                     if let Some(FsCacheEntry::Video { player, .. }) =
                         self.fs_cache.get(&state.fs_idx)
@@ -6302,23 +8089,36 @@ impl App {
                         apply_normalize_gain_with_perf(
                             player,
                             state.fs_idx,
+                            state.stream_index,
                             linear,
                             result.gain_db,
                             "scan_done",
                         );
-                        if state.was_playing {
-                            player.set_playing(true);
+                        if state.was_playing
+                            && player.applied_audio_stream_index() == Some(state.stream_index)
+                        {
+                            player.set_playing_internal(
+                                true,
+                                crate::video::InternalContinuation::Normalize,
+                            );
                             player.set_audio_preroll_suspended(false);
                         }
                     }
                     self.normalize_ui_states.insert(
-                        state.fs_idx,
+                        key.clone(),
                         NormalizeUiState::OnApplied {
                             gain_db: result.gain_db,
                         },
                     );
                 }
                 let _ = target_milli; // suppress unused warning
+                self.emit_normalize_scan_diagnostic(
+                    state.fs_idx,
+                    &state.file_path,
+                    "normalize_scan_terminal",
+                    if still_valid { "done" } else { "done_stale" },
+                    Some(result.gain_db),
+                );
             }
             Some(Ok(crate::app::normalize::NormalizeMessage::Cancelled))
             | Some(Ok(crate::app::normalize::NormalizeMessage::Error(_)))
@@ -6326,12 +8126,18 @@ impl App {
                 if let Some(Ok(crate::app::normalize::NormalizeMessage::Error(ref m))) = msg {
                     crate::logger::log(format!("normalize-scan error: {m}"));
                 }
-                self.normalize_auto_scan_suppressed.insert(state.fs_idx);
+                let status = match &msg {
+                    Some(Ok(crate::app::normalize::NormalizeMessage::Cancelled)) => "cancelled",
+                    Some(Ok(crate::app::normalize::NormalizeMessage::Error(_))) => "error",
+                    Some(Err(())) => "disconnected",
+                    _ => "unknown",
+                };
+                self.normalize_auto_scan_suppressed.insert(key.clone());
                 // DB に書かない、グローバル ON は維持、UI 状態を OnUnmeasured に戻す
                 if still_valid {
                     if let Some(provisional) = state.provisional_result {
                         self.normalize_ui_states.insert(
-                            state.fs_idx,
+                            key.clone(),
                             NormalizeUiState::ProvisionalApplied {
                                 gain_db: provisional.gain_db,
                             },
@@ -6340,15 +8146,32 @@ impl App {
                         if let Some(FsCacheEntry::Video { player, .. }) =
                             self.fs_cache.get(&state.fs_idx)
                         {
-                            if state.was_playing {
-                                player.set_playing(true);
+                            player.set_normalize_gain_for_stream(state.stream_index, 1.0);
+                            if state.was_playing
+                                && player.applied_audio_stream_index() == Some(state.stream_index)
+                            {
+                                player.set_playing_internal(
+                                    true,
+                                    crate::video::InternalContinuation::Normalize,
+                                );
                                 player.set_audio_preroll_suspended(false);
                             }
                         }
                         self.normalize_ui_states
-                            .insert(state.fs_idx, NormalizeUiState::OnUnmeasured);
+                            .insert(key, NormalizeUiState::OnUnmeasured);
                     }
                 }
+                self.emit_normalize_scan_diagnostic(
+                    state.fs_idx,
+                    &state.file_path,
+                    "normalize_scan_terminal",
+                    if still_valid {
+                        status
+                    } else {
+                        "stale_terminal"
+                    },
+                    state.provisional_result.map(|result| result.gain_db),
+                );
             }
             Some(Ok(crate::app::normalize::NormalizeMessage::Provisional(_))) => {
                 // Provisional は上で state を残したまま処理済み。ここには通常到達しない。
@@ -6362,53 +8185,59 @@ impl App {
     /// fs_idx 単位の normalize state を cleanup (close_fullscreen / fs_cache evict 時に呼ぶ)。
     #[cfg(windows)]
     pub(super) fn cleanup_normalize_state_for_fs_idx(&mut self, fs_idx: usize) {
-        self.normalize_ui_states.remove(&fs_idx);
-        self.normalize_auto_scan_suppressed.remove(&fs_idx);
+        self.normalize_ui_states
+            .retain(|key, _| key.fs_idx != fs_idx);
+        self.normalize_auto_scan_suppressed
+            .retain(|key| key.fs_idx != fs_idx);
         // 同 fs_idx のスキャン中なら state を持ち去って捨てる (= 新規スキャン即開始可能に)
         let should_drop = self
             .normalize_state
             .as_ref()
-            .map(|s| s.fs_idx == fs_idx)
+            .map(|s| s.owner_context_id == self.projected_viewer_context_id() && s.fs_idx == fs_idx)
             .unwrap_or(false);
         if should_drop {
             if let Some(state) = self.normalize_state.take() {
                 state.cancel();
+                self.emit_normalize_scan_diagnostic(
+                    state.fs_idx,
+                    &state.file_path,
+                    "normalize_scan_terminal",
+                    "owner_cleanup",
+                    state.provisional_result.map(|result| result.gain_db),
+                );
             }
         }
     }
 
-    /// 動画 open 時の自動適用。Settings ON + DB ヒットなら gain を即適用、ミスなら
-    /// OnUnmeasured 表示。OFF なら Off 状態で初期化。
+    /// Open installs the Pending default; VideoInfo later starts the stream-specific lookup.
     #[cfg(windows)]
     pub(super) fn init_normalize_state_for_opened_video(&mut self, fs_idx: usize) {
         use crate::video::normalize_types::NormalizeUiState;
-        self.normalize_auto_scan_suppressed.remove(&fs_idx);
-        let path = match self.fs_cache.get(&fs_idx) {
-            Some(FsCacheEntry::Video { player, .. }) => player.path().to_path_buf(),
+        self.normalize_ui_states
+            .retain(|key, _| key.fs_idx != fs_idx);
+        self.normalize_auto_scan_suppressed
+            .retain(|key| key.fs_idx != fs_idx);
+        let stream = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => {
+                player.reset_normalize_gains(self.settings.audio_normalize_enabled);
+                player
+                    .info()
+                    .and_then(|info| info.opened_audio_stream_index)
+            }
             _ => return,
         };
-        let target_milli = self.settings.clamped_audio_normalize_target_lufs_milli();
-        let ui_state = if self.settings.audio_normalize_enabled {
-            let lookup = self
-                .audio_normalize_db
-                .as_ref()
-                .and_then(|db| db.lookup(&path, target_milli));
-            if let Some(result) = lookup {
-                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-                    let linear = 10.0_f64.powf(result.gain_db as f64 / 20.0);
-                    // 再生開始前なので flush 不要
-                    player.set_normalize_gain(linear);
-                }
-                NormalizeUiState::OnApplied {
-                    gain_db: result.gain_db,
-                }
+        if let Some(stream_index) = stream {
+            if self.settings.audio_normalize_enabled {
+                self.start_normalize_lookup_for_stream(fs_idx, stream_index);
             } else {
-                NormalizeUiState::OnUnmeasured
+                self.set_normalize_ui_state_for_player(fs_idx, NormalizeUiState::Off);
             }
-        } else {
-            NormalizeUiState::Off
-        };
-        self.normalize_ui_states.insert(fs_idx, ui_state);
+        }
+        self.emit_audio_output_binding(
+            fs_idx,
+            "normalize_state_initialized",
+            self.viewer_presentation,
+        );
     }
 
     /// native overlay にノーマライズ UI 状態 + 進捗 snapshot を配信する。
@@ -6421,15 +8250,15 @@ impl App {
         let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
             return;
         };
-        let ui_state = self
-            .normalize_ui_states
-            .get(&fs_idx)
-            .copied()
-            .unwrap_or(NormalizeUiState::Off);
+        let ui_state = self.normalize_ui_state_for_player(fs_idx);
         let progress = if matches!(ui_state, NormalizeUiState::Scanning) {
             self.normalize_state
                 .as_ref()
-                .filter(|s| s.fs_idx == fs_idx)
+                .filter(|s| {
+                    s.owner_context_id == self.projected_viewer_context_id()
+                        && s.fs_idx == fs_idx
+                        && player.applied_audio_stream_index() == Some(s.stream_index)
+                })
                 .map(|s| NormalizeProgressSnapshot {
                     pts_processed_ms: s
                         .progress
@@ -6960,7 +8789,8 @@ impl App {
     #[cfg(windows)]
     fn native_video_help_includes_row(row: &CommandDisplayRow) -> bool {
         match row.spec.action {
-            KeyAction::ToggleDetachedViewerMode
+            KeyAction::ToggleAlwaysOnTop
+            | KeyAction::ToggleDetachedViewerMode
             | KeyAction::FsToggleWindowMode
             | KeyAction::FsBackToList
             | KeyAction::FsCtrlNavPrev
@@ -7320,6 +9150,27 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(crate) fn toggle_native_video_display_mode_for_input(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+    ) {
+        // Native HWND, native overlay, and egui fullscreen fallback inputs all arrive here.
+        // Resolve the action only for the mounted visible video owner: `detect_panorama`
+        // intentionally wins over zoom in the selector, so the owner/audio gate must run first.
+        if !matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
+            || !self.native_video_view_input_available(fs_idx)
+        {
+            return;
+        }
+        let target = select_native_video_display_mode_toggle(
+            self.detect_panorama(fs_idx).is_some(),
+            self.native_video_zoom_available(fs_idx),
+        );
+        self.apply_native_video_display_mode_toggle(ctx, fs_idx, target);
+    }
+
+    #[cfg(windows)]
     fn apply_native_video_display_mode_toggle(
         &mut self,
         ctx: &egui::Context,
@@ -7353,7 +9204,7 @@ impl App {
 
     #[cfg(windows)]
     /// 上下バーの固定状態を設定から読む唯一の場所。presenter の生成時 (config) と
-    /// 生成後の同期 (`SetBarLockState`) が同じ値を見ることを、この 1 か所で保証する。
+    /// 生成後の同期 (`SetChromeSnapshot`) が同じ値を見ることを、この 1 か所で保証する。
     #[cfg(windows)]
     pub(crate) fn native_bar_lock_state(&self) -> crate::video::NativeBarLockState {
         crate::video::NativeBarLockState {
@@ -7362,8 +9213,99 @@ impl App {
             fixed_bar_gap_px: self.settings.fullscreen_fixed_bar_gap_px,
             seek_strip_height: self.settings.video_seek_strip_height,
             seek_strip_height_values: self.settings.video_seek_strip_height_values,
+            seek_preview_size: self.settings.video_seek_preview_size,
+            seek_preview_size_values: self.settings.video_seek_preview_size_values,
             seek_hover_preview_mode: self.settings.video_seek_hover_preview_mode,
             seek_bar_with_strip: self.settings.video_seek_bar_with_strip,
+        }
+    }
+
+    #[cfg(windows)]
+    fn native_chrome_host_for_claim(
+        &self,
+        claim: super::DetachedHostClaim,
+    ) -> crate::video::NativeDetachedChromeHost {
+        crate::video::NativeDetachedChromeHost {
+            window_id: claim.lease.window_id,
+            incarnation: claim.incarnation,
+            hwnd: claim.hwnd,
+            borderless_applied: self
+                .active_detached_session
+                .is_some_and(|session| session.window_id == claim.lease.window_id)
+                && self.detached_viewer_borderless_fullscreen,
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn native_chrome_snapshot(
+        &self,
+        fs_idx: usize,
+    ) -> crate::video::NativeChromeSnapshot {
+        let generation = self
+            .fs_cache
+            .get(&fs_idx)
+            .and_then(|entry| {
+                if let FsCacheEntry::Video { player, .. } = entry {
+                    player.native_committed_generation()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(1)
+            .max(1);
+        self.native_chrome_snapshot_for_generation(generation)
+    }
+
+    #[cfg(windows)]
+    fn native_chrome_snapshot_for_generation(
+        &self,
+        generation: u64,
+    ) -> crate::video::NativeChromeSnapshot {
+        let detached = self
+            .detached_viewer_window_id()
+            .and_then(|window_id| {
+                self.detached_host_claim_for_lease(super::DetachedSessionLease { window_id })
+            })
+            .map(|claim| crate::video::NativeDetachedChromeFact {
+                host: self.native_chrome_host_for_claim(claim),
+                generation,
+            });
+        crate::video::NativeChromeSnapshot {
+            policy: crate::video::NativeChromePolicy {
+                bars: self.native_bar_lock_state(),
+                side_panel_mode: self.settings.fullscreen_side_panel_mode,
+                info_open: self.fs_info_panel.open,
+                info_locked: self.fs_info_panel.locked,
+                suppression: self.settings.fullscreen_chrome_suppression,
+            },
+            detached,
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn sync_mounted_native_chrome_policy(&self) {
+        for (idx, entry) in &self.fs_cache {
+            if let FsCacheEntry::Video { player, .. } = entry {
+                player.set_native_chrome_snapshot(self.native_chrome_snapshot(*idx));
+            }
+        }
+        // A source swap temporarily owns the output outside fs_cache. Keep the same
+        // context policy and existing output generation during that ownership transfer.
+        if let Some(pending) = self.native_video_source_swap_pending.as_ref() {
+            pending
+                .native_output
+                .set_chrome_snapshot(self.native_chrome_snapshot_for_generation(
+                    pending.native_output.committed_generation().max(1),
+                ));
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn sync_all_native_chrome_policy(&mut self) {
+        for id in self.viewer_context_ids() {
+            let _ = self.with_viewer_context(id, |app| {
+                app.sync_mounted_native_chrome_policy();
+            });
         }
     }
 
@@ -7386,12 +9328,11 @@ impl App {
         let shortcut_tags = self.cached_native_overlay_shortcut_tags();
         let shortcuts = self.native_overlay_shortcut_labels();
         let shortcut_help = self.cached_native_overlay_shortcut_help();
-        let side_panel_mode = self.settings.fullscreen_side_panel_mode;
-        let info_panel_open = self.fs_info_panel.open;
+
         // 右パネルの固定は静止画と同じ状態を使う。動画でも「タグを付けながら前後へ送る」
         // ために出したままにできる必要がある (利用者要望 2026-09-02、backlog §1.158)。
-        let info_panel_locked = self.fs_info_panel.locked;
-        let bar_lock = self.native_bar_lock_state();
+
+        let chrome = self.native_chrome_snapshot(fs_idx);
         let touch_video_chrome_learned = self.settings.touch_video_chrome_learned;
         // ★ レーティング (右パネル先頭。get_rating は &mut self なので player 借用より前に取る)。
         let rating = self.get_rating(fs_idx);
@@ -7434,6 +9375,21 @@ impl App {
                 video_decoder: info.video_decoder.clone(),
                 audio_codec: info.audio_codec.clone(),
                 audio_bit_rate_bps: info.audio_bit_rate_bps,
+                audio_track_rows: {
+                    let selection = player.audio_track_selection();
+                    let deferred = selection.is_some_and(|snapshot| {
+                        matches!(
+                            snapshot.display_state(
+                                player.engine_state_code()
+                                    == crate::video::engine::actor::state_code::EOF,
+                            ),
+                            crate::video::AudioTrackSelectionDisplayState::Deferred
+                        )
+                    });
+                    crate::video::audio_track_ui::audio_track_rows(info, selection, deferred)
+                },
+                audio_track_count: info.audio_tracks.len(),
+                opened_audio_stream_index: info.opened_audio_stream_index,
                 avg_fps: info.avg_fps,
                 bit_rate_bps: info.bit_rate_bps,
                 chapter_count: info.chapters.len(),
@@ -7469,6 +9425,9 @@ impl App {
                 video_decoder: String::new(),
                 audio_codec: None,
                 audio_bit_rate_bps: 0,
+                audio_track_rows: Vec::new(),
+                audio_track_count: 0,
+                opened_audio_stream_index: None,
                 avg_fps: 0.0,
                 bit_rate_bps: 0,
                 chapter_count: 0,
@@ -7486,8 +9445,7 @@ impl App {
             }
         };
         player.set_native_metadata(Some(metadata));
-        player.set_native_side_panel_state(side_panel_mode, info_panel_open, info_panel_locked);
-        player.set_native_bar_lock_state(bar_lock);
+        player.set_native_chrome_snapshot(chrome);
     }
 
     #[cfg(windows)]
@@ -7499,9 +9457,11 @@ impl App {
         // 複数ウィンドウモード / F12 detached では音声チェーンだけを維持し、UI は出さない。
         let vst3_ok = self.native_video_vst3_controls_available();
         player.set_native_vst3_available(vst3_ok);
-        player.set_native_video_compact(
-            vst3_ok && self.settings.vst3_gui_visible && self.settings.vst3_video_compact,
-        );
+        player.set_native_video_compact(native_vst_video_compact(
+            vst3_ok,
+            self.settings.vst3_gui_visible,
+            self.settings.vst3_video_compact,
+        ));
     }
 
     #[cfg(windows)]
@@ -7921,21 +9881,6 @@ impl App {
     ) -> bool {
         const FALLBACK_MAX_CELLS: usize = 240;
         let mode = showing.mode;
-        if let VideoSeekStripRuntime::Open(session) = &self.video_seek_strip_runtime
-            && session.owner_fs_idx == fs_idx
-            && session.center.mode() == mode
-            && session.span == showing.span
-        {
-            return true;
-        }
-        if matches!(
-            self.video_seek_strip_runtime,
-            VideoSeekStripRuntime::Open(_)
-        ) {
-            self.stop_video_seek_strip_session(
-                crate::video::seek_strip::SeekStripCloseCause::VideoChanged,
-            );
-        }
         let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
             return false;
         };
@@ -7965,12 +9910,34 @@ impl App {
             return false;
         }
         let path = player.path().clone();
+        let audio_stream_index = player.applied_audio_stream_index();
+        let default_audio_stream_index = info.default_audio_stream_index;
         let initial_time_secs = player.position();
         let duration_secs = info.duration_secs;
+        let Some(source_epoch) = player.native_source_epoch() else {
+            return false;
+        };
+        if let VideoSeekStripRuntime::Open(session) = &self.video_seek_strip_runtime
+            && session.owner_fs_idx == fs_idx
+            && session.items_generation == self.items_generation
+            && session.source_epoch == source_epoch
+            && session.audio_stream_index == audio_stream_index
+            && crate::path_key::eq_keep_drive(&session.video_path, &path)
+        {
+            return true;
+        }
+        if matches!(
+            self.video_seek_strip_runtime,
+            VideoSeekStripRuntime::Open(_)
+        ) {
+            self.stop_video_seek_strip_session(
+                crate::video::seek_strip::SeekStripCloseCause::VideoChanged,
+            );
+        }
         let min_interval_secs = self.settings.video_seek_strip_min_interval_secs;
         let meta = self.image_metas.get(fs_idx).copied().flatten();
         let completed_analysis = if mode == crate::settings::VideoSeekStripMode::Waveform {
-            self.completed_music_analysis_for_seek_strip(&path, meta)
+            self.completed_music_analysis_for_seek_strip(fs_idx, &path, audio_stream_index, meta)
         } else {
             None
         };
@@ -8010,10 +9977,21 @@ impl App {
                 None,
             ),
         };
+        let session_id =
+            crate::video::seek_strip::SeekStripSessionId(self.video_seek_strip_next_session_id);
+        self.video_seek_strip_next_session_id =
+            self.video_seek_strip_next_session_id.saturating_add(1);
         self.video_seek_strip_runtime =
             VideoSeekStripRuntime::Open(Box::new(VideoSeekStripSession {
+                session_id,
+                layout_revision: crate::video::seek_strip::SeekStripLayoutRevision(1),
+                items_generation: self.items_generation,
+                source_epoch,
+                presentation: VideoSeekStripPresentationState::AwaitingFirstPresent,
                 owner_fs_idx: fs_idx,
                 video_path: path,
+                audio_stream_index,
+                default_audio_stream_index,
                 duration_secs,
                 span: showing.span,
                 center,
@@ -8035,6 +10013,8 @@ impl App {
                 visible_pending_since: None,
                 visible_pending_reported: false,
                 range_edited_at_save_generation: None,
+                #[cfg(feature = "test-script")]
+                last_presented_receipt: None,
             }));
         true
     }
@@ -8090,9 +10070,10 @@ impl App {
             return false;
         };
         // ホイールで動かしたレンジはここで 1 回だけ書く
-        // (`range_edited_at_save_generation` 参照)。セッションが死ぬ経路はこの関数だけ
-        // なので、開き直し・モード切替・動画切替・利用者の閉じるのどれでも同じ 1 箇所を
-        // 通る。世代が動いていれば別経路の save が既に書いている。
+        // (`range_edited_at_save_generation` 参照)。resource session が終端する動画切替・
+        // fullscreen 終了・利用者の close はこの 1 箇所を通る。mode/span 変更は同じ
+        // worker/decoder を保持して layout revision だけを進めるため、この close には入らない。
+        // 世代が動いていれば別経路の save が既に書いている。
         if session.range_edited_at_save_generation == Some(crate::settings::save_generation()) {
             self.settings.save();
         }
@@ -8105,7 +10086,11 @@ impl App {
                 // 見えていないあいだ背景の全尺解析だけ止め、解析済みの粗い波形は残す。
                 worker.set_background_paused(true);
                 self.video_seek_strip_wave_holdover = Some(HeldSeekStripWaveWorker {
+                    owner_fs_idx: session.owner_fs_idx,
                     path: session.video_path.clone(),
+                    audio_stream_index: session.audio_stream_index,
+                    source_epoch: session.source_epoch,
+                    items_generation: session.items_generation,
                     worker,
                 });
             } else {
@@ -8231,11 +10216,14 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn step_video_seek_strip_range(
+    fn step_video_seek_strip_ranges(
         &mut self,
         fs_idx: usize,
-        step: crate::video::seek_strip::SeekStripRangeStep,
+        steps: &[crate::video::seek_strip::SeekStripRangeStep],
     ) -> bool {
+        if steps.is_empty() {
+            return false;
+        }
         let VideoSeekStripRuntime::Open(session) = &self.video_seek_strip_runtime else {
             return false;
         };
@@ -8254,10 +10242,9 @@ impl App {
                 self.settings.video_seek_strip_waveform_span_secs
             }
         };
-        let Some(next) = crate::video::seek_strip::step_seek_strip_range(mode, current, step)
-        else {
-            return false;
-        };
+        let next = steps.iter().copied().fold(current, |value, step| {
+            crate::video::seek_strip::step_seek_strip_range(mode, value, step).unwrap_or(value)
+        });
         if next.to_bits() == current.to_bits() {
             return false;
         }
@@ -8322,12 +10309,18 @@ impl App {
             return false;
         };
         let path = session.video_path.clone();
+        let audio_stream_index = session.audio_stream_index;
+        let default_audio_stream_index = session.default_audio_stream_index;
+        let source_epoch = session.source_epoch;
+        let items_generation = session.items_generation;
         let duration_secs = session.duration_secs;
         let need_thumbnail_worker = mode == crate::settings::VideoSeekStripMode::Thumbnails
-            && session.thumbnail_worker.is_none();
+            && session.thumbnail_worker.is_none()
+            && session.presentation != VideoSeekStripPresentationState::Suspended;
         let need_wave_worker = mode == crate::settings::VideoSeekStripMode::Waveform
             && session.wave_worker.is_none()
-            && matches!(session.axis, VideoSeekStripAxisState::Ready(_));
+            && matches!(session.axis, VideoSeekStripAxisState::Ready(_))
+            && session.presentation != VideoSeekStripPresentationState::Suspended;
 
         let new_thumbnail_worker = need_thumbnail_worker.then(|| {
             let fallback_interval_secs =
@@ -8344,7 +10337,12 @@ impl App {
         let new_wave_worker = if need_wave_worker {
             Some(take_or_spawn_seek_strip_wave_worker(
                 &mut self.video_seek_strip_wave_holdover,
+                fs_idx,
                 &path,
+                audio_stream_index,
+                default_audio_stream_index,
+                source_epoch,
+                items_generation,
                 wave_cache,
             ))
         } else {
@@ -8352,7 +10350,7 @@ impl App {
         };
         let completed_analysis = if mode == crate::settings::VideoSeekStripMode::Waveform {
             let meta = self.image_metas.get(fs_idx).copied().flatten();
-            self.completed_music_analysis_for_seek_strip(&path, meta)
+            self.completed_music_analysis_for_seek_strip(fs_idx, &path, audio_stream_index, meta)
         } else {
             None
         };
@@ -8377,7 +10375,10 @@ impl App {
         // 作り直させない。サムネイル側は要求駆動で、要求が止まれば自分で寝るため
         // 対になる操作は要らない (両方の worker loop を読んで確認した)。
         if let Some(worker) = session.wave_worker.as_ref() {
-            worker.set_background_paused(wave_background_paused_for_mode(mode));
+            worker.set_background_paused(
+                session.presentation == VideoSeekStripPresentationState::Suspended
+                    || wave_background_paused_for_mode(mode),
+            );
         }
         match mode {
             crate::settings::VideoSeekStripMode::Thumbnails => match &mut session.axis {
@@ -8409,6 +10410,7 @@ impl App {
         session.last_wave_request = None;
         session.pending_wave_span = None;
         session.wave_holdover = None;
+        session.advance_layout_revision();
         Self::request_video_seek_strip_window(
             session,
             StripThumbnailRequestTrigger::StripRedisplayed,
@@ -8448,6 +10450,7 @@ impl App {
         }
         .unwrap_or(0.0);
         session.span = span;
+        session.advance_layout_revision();
         session.drag_state = VideoSeekStripDragState::Idle;
         match span {
             SeekStripSpan::Whole => {
@@ -8496,9 +10499,32 @@ impl App {
         }
         self.settings.video_seek_strip_height = height;
         self.settings.save();
-        let bar_lock = self.native_bar_lock_state();
+        let chrome = self.native_chrome_snapshot(fs_idx);
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-            player.set_native_bar_lock_state(bar_lock);
+            player.set_native_chrome_snapshot(chrome);
+        }
+        if let VideoSeekStripRuntime::Open(session) = &mut self.video_seek_strip_runtime
+            && session.owner_fs_idx == fs_idx
+        {
+            session.advance_layout_revision();
+        }
+        true
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn set_video_seek_preview_size(
+        &mut self,
+        fs_idx: usize,
+        size: crate::settings::VideoSeekPreviewSize,
+    ) -> bool {
+        if self.settings.video_seek_preview_size == size {
+            return false;
+        }
+        self.settings.video_seek_preview_size = size;
+        self.settings.save();
+        let chrome = self.native_chrome_snapshot(fs_idx);
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.set_native_chrome_snapshot(chrome);
         }
         true
     }
@@ -8529,6 +10555,67 @@ impl App {
             self.video_seek_strip_runtime,
             VideoSeekStripRuntime::Open(_)
         )
+    }
+
+    #[cfg(windows)]
+    pub(super) fn remap_video_seek_strip_for_snapshot(
+        &mut self,
+        old_to_new: &std::collections::HashMap<usize, usize>,
+        opened_media_path: Option<&std::path::Path>,
+    ) {
+        let exact_remap = |old_idx: usize, path: &std::path::Path, source_epoch: u64| {
+            old_to_new.get(&old_idx).copied().filter(|&new_idx| {
+                opened_media_path.is_some_and(|opened| {
+                    crate::path_key::eq_keep_drive(opened, path)
+                        && self
+                            .fs_cache
+                            .get(&new_idx)
+                            .is_some_and(|entry| match entry {
+                                FsCacheEntry::Video { player, .. } => {
+                                    player.native_source_epoch() == Some(source_epoch)
+                                        && crate::path_key::eq_keep_drive(player.path(), path)
+                                }
+                                _ => false,
+                            })
+                })
+            })
+        };
+
+        let session_survivor = match &self.video_seek_strip_runtime {
+            VideoSeekStripRuntime::Open(session) => exact_remap(
+                session.owner_fs_idx,
+                &session.video_path,
+                session.source_epoch,
+            ),
+            VideoSeekStripRuntime::Closed => None,
+        };
+        let holdover_survivor = self
+            .video_seek_strip_wave_holdover
+            .as_ref()
+            .and_then(|held| exact_remap(held.owner_fs_idx, &held.path, held.source_epoch));
+
+        if let Some(new_idx) = session_survivor {
+            if let VideoSeekStripRuntime::Open(session) = &mut self.video_seek_strip_runtime {
+                session.owner_fs_idx = new_idx;
+                session.items_generation = self.items_generation;
+            }
+        } else if matches!(
+            self.video_seek_strip_runtime,
+            VideoSeekStripRuntime::Open(_)
+        ) {
+            self.stop_video_seek_strip_session(
+                crate::video::seek_strip::SeekStripCloseCause::VideoChanged,
+            );
+        }
+
+        if let Some(new_idx) = holdover_survivor {
+            if let Some(held) = self.video_seek_strip_wave_holdover.as_mut() {
+                held.owner_fs_idx = new_idx;
+                held.items_generation = self.items_generation;
+            }
+        } else {
+            self.video_seek_strip_wave_holdover = None;
+        }
     }
 
     #[cfg(windows)]
@@ -8582,6 +10669,9 @@ impl App {
         session: &mut VideoSeekStripSession,
         request_trigger: crate::video::seek_strip_thumbs::StripThumbnailRequestTrigger,
     ) {
+        if session.presentation == VideoSeekStripPresentationState::Suspended {
+            return;
+        }
         match session.center {
             crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index } => {
                 let VideoSeekStripAxisState::Ready(axis) = &session.axis else {
@@ -8759,6 +10849,7 @@ impl App {
             session.center = crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index };
         }
         session.axis = VideoSeekStripAxisState::Ready(rebuilt);
+        session.advance_layout_revision();
         session.last_requested_center = None;
         session.last_sent_thumbnail_request_id = None;
         if matches!(
@@ -8774,7 +10865,6 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn rebuild_video_seek_strip_waveform_span(&mut self) {
-        let wave_cache = self.video_tile_cache.clone();
         let VideoSeekStripRuntime::Open(session) = &mut self.video_seek_strip_runtime else {
             return;
         };
@@ -8787,6 +10877,7 @@ impl App {
             return;
         }
         session.waveform_span_secs = new_span_secs;
+        session.advance_layout_revision();
         session.last_wave_request = None;
         session.pending_wave_span = None;
         if !matches!(
@@ -8796,21 +10887,10 @@ impl App {
             return;
         }
 
-        let previous_raster = session
-            .wave_worker
-            .as_ref()
-            .and_then(|worker| worker.snapshot().raster)
-            .or_else(|| session.wave_holdover.take());
-        if let Some(worker) = session.wave_worker.as_ref() {
-            worker.cancel();
-        }
-        // A fresh worker drops both the old retained raster and its in-memory LRU. The Arc copied
-        // above is display-only and cannot satisfy coverage for the new preference.
-        session.wave_worker = Some(crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
-            session.video_path.clone(),
-            wave_cache,
-        ));
-        session.wave_holdover = previous_raster;
+        // The worker owns the decoder and its coarse-analysis cache. A range preference changes
+        // only the request signature; replacing the worker here recreated the decoder on every
+        // wheel step. The old raster remains a display holdover until this worker publishes the
+        // first raster for the new signature.
         Self::request_video_seek_strip_window(
             session,
             StripThumbnailRequestTrigger::UserInteraction,
@@ -8951,6 +11031,107 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn ensure_visible_video_seek_strip_workers(&mut self, fs_idx: usize) {
+        const FALLBACK_MAX_CELLS: usize = 240;
+        let Some((
+            session_id,
+            mode,
+            path,
+            audio_stream_index,
+            default_audio_stream_index,
+            source_epoch,
+            items_generation,
+            duration_secs,
+            min_interval_secs,
+            need_thumbnail,
+            need_wave,
+        )) = (match &self.video_seek_strip_runtime {
+            VideoSeekStripRuntime::Open(session)
+                if session.owner_fs_idx == fs_idx
+                    && session.presentation != VideoSeekStripPresentationState::Suspended =>
+            {
+                Some((
+                    session.session_id,
+                    session.center.mode(),
+                    session.video_path.clone(),
+                    session.audio_stream_index,
+                    session.default_audio_stream_index,
+                    session.source_epoch,
+                    session.items_generation,
+                    session.duration_secs,
+                    session.min_interval_secs,
+                    session.thumbnail_worker.is_none(),
+                    session.wave_worker.is_none()
+                        && matches!(session.axis, VideoSeekStripAxisState::Ready(_))
+                        && session.center.mode() == crate::settings::VideoSeekStripMode::Waveform,
+                ))
+            }
+            _ => None,
+        })
+        else {
+            return;
+        };
+        let new_thumbnail = need_thumbnail.then(|| {
+            crate::video::seek_strip_thumbs::SeekStripThumbnailWorker::spawn(
+                path.clone(),
+                self.settings.video_hw_decode,
+                self.video_tile_cache.clone(),
+                duration_secs,
+                min_interval_secs,
+                crate::ui_video_tile::pick_interval(duration_secs, FALLBACK_MAX_CELLS),
+            )
+        });
+        let new_wave = if need_wave {
+            Some(take_or_spawn_seek_strip_wave_worker(
+                &mut self.video_seek_strip_wave_holdover,
+                fs_idx,
+                &path,
+                audio_stream_index,
+                default_audio_stream_index,
+                source_epoch,
+                items_generation,
+                self.video_tile_cache.clone(),
+            ))
+        } else {
+            None
+        };
+        if let VideoSeekStripRuntime::Open(session) = &mut self.video_seek_strip_runtime
+            && session.session_id == session_id
+            && session.presentation != VideoSeekStripPresentationState::Suspended
+        {
+            if let Some(worker) = new_thumbnail {
+                session.thumbnail_worker = Some(worker);
+            }
+            if let Some(worker) = new_wave {
+                worker.set_background_paused(wave_background_paused_for_mode(mode));
+                session.wave_worker = Some(worker);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn discard_stale_video_seek_strip_wave_holdover(
+        &mut self,
+        current_fs_idx: usize,
+        current_path: Option<&std::path::Path>,
+        current_audio_stream_index: Option<usize>,
+        current_source_epoch: Option<u64>,
+    ) {
+        if let Some(held) = self.video_seek_strip_wave_holdover.as_ref()
+            && !held_seek_strip_wave_worker_matches_current(
+                held,
+                current_fs_idx,
+                current_path,
+                current_audio_stream_index,
+                current_source_epoch,
+                self.items_generation,
+            )
+        {
+            self.video_seek_strip_wave_holdover = None;
+        }
+    }
+
+    #[cfg(windows)]
     pub(crate) fn sync_native_video_seek_strip(&mut self, ctx: &egui::Context, fs_idx: usize) {
         let wave_cache = self.video_tile_cache.clone();
         let current_path = self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
@@ -8959,15 +11140,22 @@ impl App {
             }
             _ => None,
         });
+        let current_source_epoch = self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
+            FsCacheEntry::Video { player, .. } => player.native_source_epoch(),
+            _ => None,
+        });
+        let current_audio_stream_index = self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
+            FsCacheEntry::Video { player, .. } => player.applied_audio_stream_index(),
+            _ => None,
+        });
         // 見ている動画が変わった / 動画を見ていない。close だけに任せると、ストリップを
         // 閉じたまま次の動画へ移った経路で持ち越しが残る。
-        if let Some(held) = self.video_seek_strip_wave_holdover.as_ref()
-            && !current_path
-                .as_ref()
-                .is_some_and(|path| crate::path_key::eq_keep_drive(&held.path, path))
-        {
-            self.video_seek_strip_wave_holdover = None;
-        }
+        self.discard_stale_video_seek_strip_wave_holdover(
+            fs_idx,
+            current_path.as_deref(),
+            current_audio_stream_index,
+            current_source_epoch,
+        );
         if self.video_tile_mode_active {
             self.close_video_seek_strip(
                 crate::video::seek_strip::SeekStripCloseCause::TileModeOpened,
@@ -8991,13 +11179,29 @@ impl App {
         let session_matches = matches!(
             (&self.video_seek_strip_runtime, current_path.as_ref()),
             (VideoSeekStripRuntime::Open(session), Some(path))
-                if &session.video_path == path
-                    && session.center.mode() == showing.mode
-                    && session.span == showing.span
+                if session.owner_fs_idx == fs_idx
+                    && session.items_generation == self.items_generation
+                    && session.source_epoch == current_source_epoch.unwrap_or(u64::MAX)
+                    && session.audio_stream_index == current_audio_stream_index
+                    && crate::path_key::eq_keep_drive(&session.video_path, path)
         );
         if !session_matches && !self.ensure_video_seek_strip_session(fs_idx, showing) {
             return;
         }
+        self.set_video_seek_strip_runtime_mode(fs_idx, showing.mode);
+        self.set_video_seek_strip_runtime_span(fs_idx, showing.span);
+
+        if matches!(
+            self.video_seek_strip_runtime,
+            VideoSeekStripRuntime::Open(ref session)
+                if session.presentation == VideoSeekStripPresentationState::Suspended
+        ) {
+            // Canonical settings above still update the retained resource, but hidden chrome does
+            // not advance requests, poll workers, clone snapshots or schedule repaint work.
+            return;
+        }
+
+        self.ensure_visible_video_seek_strip_workers(fs_idx);
 
         self.follow_video_seek_strip_playhead(fs_idx);
         self.rebuild_video_seek_strip_adopted_list();
@@ -9068,7 +11272,12 @@ impl App {
                             {
                                 session.wave_worker = Some(take_or_spawn_seek_strip_wave_worker(
                                     &mut self.video_seek_strip_wave_holdover,
+                                    session.owner_fs_idx,
                                     &session.video_path,
+                                    session.audio_stream_index,
+                                    session.default_audio_stream_index,
+                                    session.source_epoch,
+                                    session.items_generation,
                                     wave_cache.clone(),
                                 ));
                             }
@@ -9252,6 +11461,7 @@ impl App {
                         .map_or(0, |snapshot| snapshot.cells.len()),
                 );
                 Some(crate::video::native_presenter::NativeOverlaySeekStrip {
+                    stamp: session.render_stamp(),
                     center: session.center,
                     span: session.span,
                     cell_aspect: video_cell_aspect,
@@ -10100,6 +12310,22 @@ impl App {
             })
             .unwrap_or(0);
         let outcome = self.dispatch_native_video_key_event(ctx, fs_idx, key);
+        if crate::mouse_seek_debug::is_enabled()
+            && crate::mouse_seek_debug::is_comparison_key(key.virtual_key)
+        {
+            let route_outcome = match (key.virtual_key, outcome) {
+                (
+                    0xA6,
+                    NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::MouseBack),
+                ) => "press_mouse_back_routed".to_string(),
+                (
+                    0xA7,
+                    NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::MouseForward),
+                ) => "press_mouse_forward_routed".to_string(),
+                _ => outcome.format(),
+            };
+            crate::mouse_seek_debug::log_app_key(key.receipt, &route_outcome);
+        }
         log_native_video_key_diagnostic(NativeVideoKeyDiagnosticRecord {
             seq,
             fs_idx,
@@ -10111,6 +12337,127 @@ impl App {
             key,
             outcome,
         });
+    }
+
+    /// Resolve the prefix of native dispatch through every file/folder navigation action.
+    /// Later media commands cannot take precedence over those actions. Fixed-key branches in
+    /// this prefix return None, so the modal scan never admits a conflicting non-navigation key.
+    #[cfg(windows)]
+    fn resolve_native_video_key_action(
+        &self,
+        fs_idx: usize,
+        key: &crate::video::native_window::NativeVideoKeyEvent,
+        rating_key_matches: bool,
+        video_audio_vst_active: bool,
+    ) -> Option<KeyAction> {
+        if video_audio_vst_active {
+            if key.virtual_key == 0x1B && !key.repeat && !key.shift && !key.ctrl && !key.alt {
+                return None;
+            }
+            if !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::VideoToggleAudioMode, key)
+            {
+                return Some(KeyAction::VideoToggleAudioMode);
+            }
+        }
+        if self.viewer_session_is_detached()
+            && !key.repeat
+            && !key.shift
+            && !key.ctrl
+            && !key.alt
+            && matches!(key.virtual_key, 0x0D | 0x1B)
+        {
+            return None;
+        }
+        if rating_key_matches {
+            return None;
+        }
+        let matches = |action| self.keymap.matches_vk_action(action, key);
+        if !key.repeat && !self.video_audio_mode_hides_native_presenter_for(fs_idx) {
+            for action in VIDEO_ADJUST_SLOT_ACTIONS {
+                if matches(action) {
+                    return Some(action);
+                }
+            }
+        }
+        let native_side_panel = crate::ui_helpers::fs_side_panel_key_owner(
+            matches!(self.items.get(fs_idx), Some(GridItem::Video(_))),
+            self.fs_music_view_active(fs_idx),
+        ) == crate::ui_helpers::FsSidePanelKeyOwner::NativeVideo;
+        if native_side_panel && !key.repeat && matches(KeyAction::FsToggleMetadata) {
+            return Some(KeyAction::FsToggleMetadata);
+        }
+        for action in [
+            KeyAction::VideoCloseFullscreen,
+            KeyAction::VideoExternalPlayer,
+            KeyAction::VideoPlayPause,
+        ] {
+            if !key.repeat && matches(action) {
+                return Some(action);
+            }
+        }
+        if key.virtual_key == 0x1B && !key.repeat && !key.shift && !key.ctrl && !key.alt {
+            return None;
+        }
+        for action in [
+            KeyAction::FsBackToList,
+            KeyAction::VideoSeekStart,
+            KeyAction::ToggleAlwaysOnTop,
+            KeyAction::ToggleDetachedViewerMode,
+            KeyAction::FsToggleWindowMode,
+            KeyAction::FsPanoramaProjection,
+            KeyAction::FsPanorama,
+        ] {
+            if !key.repeat && matches(action) {
+                return Some(action);
+            }
+        }
+        if self.video_tile_mode_active && !key.alt && matches!(key.virtual_key, 0x25 | 0x27) {
+            return None;
+        }
+        for action in [
+            KeyAction::VideoFrameStepBack,
+            KeyAction::VideoFrameStepForward,
+            KeyAction::VideoSeekBackSmall,
+            KeyAction::VideoSeekForwardSmall,
+            KeyAction::VideoSeekBackMedium,
+            KeyAction::VideoSeekForwardMedium,
+            KeyAction::VideoSeekBackLarge,
+            KeyAction::VideoSeekForwardLarge,
+        ] {
+            if matches(action) {
+                return Some(action);
+            }
+        }
+        if matches!(key.virtual_key, 0x25 | 0x27) && !key.ctrl && !key.shift && !key.alt {
+            return None;
+        }
+        for action in [
+            KeyAction::FsCtrlNavPrev,
+            KeyAction::FsCtrlNavNext,
+            KeyAction::FsSiblingPrev,
+            KeyAction::FsSiblingNext,
+        ] {
+            if !key.repeat && matches(action) {
+                return Some(action);
+            }
+        }
+        if matches!(key.virtual_key, 0xA6 | 0xA7) {
+            return None;
+        }
+        for action in [KeyAction::VideoPrevFile, KeyAction::VideoNextFile] {
+            if matches(action) {
+                return Some(action);
+            }
+        }
+        for action in [KeyAction::FsJumpFirst, KeyAction::FsJumpLast] {
+            if !key.repeat && matches(action) {
+                return Some(action);
+            }
+        }
+        None
     }
 
     #[cfg(windows)]
@@ -10136,24 +12483,52 @@ impl App {
             }
             return NativeVideoKeyOutcome::Blocked(NativeVideoKeyBlockReason::MusicVstShell);
         }
-        // 7e: 「動画→音声モード」の VST ホスト表示中は Escape / Z (音声モードトグル) で VST ホストを
-        // 畳んで波形ビュー (音声モード) へ戻る。他キーは通常動画として処理する (presenter 前面で
-        // native focus のため)。native presenter (プラグイン GUI 非フォーカス) にキーが来たときの
-        // ゲート (music_vst_shell の Escape 離脱と対を成す)。
-        if self.video_audio_vst_active_for(fs_idx) {
-            let esc = key.virtual_key == 0x1B && !key.repeat && !key.shift && !key.ctrl && !key.alt;
-            let toggle = !key.repeat
-                && self
-                    .keymap
-                    .matches_vk_action(KeyAction::VideoToggleAudioMode, &key);
-            if esc {
+        // Resolve once in dispatch order. The modal gate and the branches below use this same
+        // Action, so an overlapping binding cannot admit a key that dispatches elsewhere.
+        let rating_key = self.keymap.native_video_rating_action(&key);
+        let video_audio_vst_active = self.video_audio_vst_active_for(fs_idx);
+        let resolved_action = self.resolve_native_video_key_action(
+            fs_idx,
+            &key,
+            rating_key.is_some(),
+            video_audio_vst_active,
+        );
+        let modal_escape_fixed =
+            key.virtual_key == 0x1B && !key.repeat && !key.shift && !key.ctrl && !key.alt;
+        // The VST host's audio-mode toggle exited to the music view before the scan gate.
+        // Its priority is resolved above, so a conflicting navigation binding still exits VST.
+        let modal_vst_exit =
+            video_audio_vst_active && resolved_action == Some(KeyAction::VideoToggleAudioMode);
+        if self.normalize_scan_is_modal_for_current_player(fs_idx)
+            && !modal_escape_fixed
+            && !modal_vst_exit
+            && !matches!(
+                resolved_action,
+                Some(
+                    KeyAction::VideoPrevFile
+                        | KeyAction::VideoNextFile
+                        | KeyAction::FsJumpFirst
+                        | KeyAction::FsJumpLast
+                        | KeyAction::FsCtrlNavPrev
+                        | KeyAction::FsCtrlNavNext
+                        | KeyAction::FsSiblingPrev
+                        | KeyAction::FsSiblingNext
+                )
+            )
+        {
+            return NativeVideoKeyOutcome::Blocked(NativeVideoKeyBlockReason::NormalizeModal);
+        }
+        // The VST host handles Escape and its audio-mode toggle before ordinary video keys.
+        // Both retain their pre-modal behavior through the gate above.
+        if video_audio_vst_active {
+            if modal_escape_fixed {
                 self.exit_video_audio_vst(ctx, fs_idx);
                 self.request_native_video_hud_repaint(ctx);
                 return NativeVideoKeyOutcome::FixedAction(
                     NativeVideoFixedKeyAction::ExitVideoAudioVst,
                 );
             }
-            if toggle {
+            if resolved_action == Some(KeyAction::VideoToggleAudioMode) {
                 let outcome =
                     self.toggle_video_audio_mode(ctx, fs_idx, VideoAudioEnterSource::NativeKey);
                 debug_assert_eq!(outcome, VideoAudioToggleOutcome::ExitedVst);
@@ -10162,14 +12537,6 @@ impl App {
                     NativeVideoFixedKeyAction::ExitVideoAudioVst,
                 );
             }
-        }
-        // 仮 gain 適用前のノーマライズスキャンはモーダル動作のため、ESC (cancel)
-        // 以外のキー入力 (Enter で再生再開、S で tile mode、B でブックマーク等) を
-        // 全て遮断する。ProvisionalApplied 後のバックグラウンド scan 中は通常操作を許す。
-        if self.normalize_scan_is_modal_for_current_player(fs_idx)
-            && !(key.virtual_key == 0x1B && !key.repeat && !key.shift && !key.ctrl && !key.alt)
-        {
-            return NativeVideoKeyOutcome::Blocked(NativeVideoKeyBlockReason::NormalizeModal);
         }
         if self.viewer_session_is_detached()
             && !key.repeat
@@ -10184,34 +12551,37 @@ impl App {
             );
         }
         let mut hud_activity = true;
-        if let Some(rating_key) = self.keymap.native_video_rating_action(&key) {
+        if let Some(rating_key) = rating_key {
             if rating_key.container {
-                match self.set_current_folder_rating(rating_key.stars) {
-                    Ok(true) => self.show_container_rating_toast(rating_key.stars),
-                    Ok(false) => hud_activity = false,
-                    Err(error) => {
-                        self.report_rating_write_error(&error);
-                        hud_activity = false;
-                    }
-                }
+                hud_activity = self.apply_rating_edit_to_current_container(rating_key.edit);
             } else {
-                self.apply_native_video_rating_key(fs_idx, rating_key.stars);
+                hud_activity = self.apply_rating_edit_to_fullscreen_item(fs_idx, rating_key.edit);
             }
             if hud_activity {
                 self.request_native_video_hud_repaint(ctx);
             }
-            let action = if rating_key.container {
-                NativeVideoFixedKeyAction::RatingContainer(rating_key.stars)
-            } else {
-                NativeVideoFixedKeyAction::RatingItem(rating_key.stars)
+            let action = match (rating_key.container, rating_key.edit) {
+                (true, crate::keymap::RatingEdit::Assign(stars)) => {
+                    NativeVideoFixedKeyAction::RatingContainer(stars)
+                }
+                (false, crate::keymap::RatingEdit::Assign(stars)) => {
+                    NativeVideoFixedKeyAction::RatingItem(stars)
+                }
+                (true, crate::keymap::RatingEdit::Step(direction)) => {
+                    NativeVideoFixedKeyAction::RatingContainerStep(direction)
+                }
+                (false, crate::keymap::RatingEdit::Step(direction)) => {
+                    NativeVideoFixedKeyAction::RatingItemStep(direction)
+                }
             };
             return NativeVideoKeyOutcome::FixedAction(action);
         }
         if !key.repeat && !self.video_audio_mode_hides_native_presenter_for(fs_idx) {
-            if let Some(slot_idx) = VIDEO_ADJUST_SLOT_ACTIONS
-                .iter()
-                .position(|action| self.keymap.matches_vk_action(*action, &key))
-            {
+            if let Some(slot_idx) = resolved_action.and_then(|resolved| {
+                VIDEO_ADJUST_SLOT_ACTIONS
+                    .iter()
+                    .position(|action| *action == resolved)
+            }) {
                 self.dispatch_video_adjust_slot_key(
                     ctx,
                     slot_idx,
@@ -10227,9 +12597,7 @@ impl App {
             == crate::ui_helpers::FsSidePanelKeyOwner::NativeVideo;
         if side_panel_key_owned_by_native
             && !key.repeat
-            && self
-                .keymap
-                .matches_vk_action(KeyAction::FsToggleMetadata, &key)
+            && resolved_action == Some(KeyAction::FsToggleMetadata)
         {
             self.cycle_fs_side_panel_mode();
             let label = self.settings.fullscreen_side_panel_mode.label();
@@ -10239,22 +12607,14 @@ impl App {
             return NativeVideoKeyOutcome::Action(KeyAction::FsToggleMetadata);
         }
         let outcome = match key.virtual_key {
-            _ if !key.repeat
-                && self
-                    .keymap
-                    .matches_vk_action(KeyAction::VideoCloseFullscreen, &key) =>
-            {
+            _ if !key.repeat && resolved_action == Some(KeyAction::VideoCloseFullscreen) => {
                 self.handle_fullscreen_close_request_immediate();
                 hud_activity = false;
                 NativeVideoKeyOutcome::Action(KeyAction::VideoCloseFullscreen)
             }
             // Shift+Enter: open in external player, matching the legacy egui
             // fullscreen video path.
-            _ if !key.repeat
-                && self
-                    .keymap
-                    .matches_vk_action(KeyAction::VideoExternalPlayer, &key) =>
-            {
+            _ if !key.repeat && resolved_action == Some(KeyAction::VideoExternalPlayer) => {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                     crate::ui_helpers::open_external_player(player.path());
                 }
@@ -10263,19 +12623,13 @@ impl App {
             // Enter in tile mode: start playback from the keyboard cursor.
             _ if !key.repeat
                 && self.video_tile_mode_active
-                && self
-                    .keymap
-                    .matches_vk_action(KeyAction::VideoPlayPause, &key) =>
+                && resolved_action == Some(KeyAction::VideoPlayPause) =>
             {
                 self.play_selected_video_tile(ctx, fs_idx);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoPlayPause)
             }
             // Enter: play / pause.
-            _ if !key.repeat
-                && self
-                    .keymap
-                    .matches_vk_action(KeyAction::VideoPlayPause, &key) =>
-            {
+            _ if !key.repeat && resolved_action == Some(KeyAction::VideoPlayPause) => {
                 self.handle_native_video_toggle_play_command(ctx, fs_idx);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoPlayPause)
             }
@@ -10306,17 +12660,13 @@ impl App {
                     NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::CloseFullscreen)
                 }
             }
-            _ if !key.repeat && self.keymap.matches_vk_action(KeyAction::FsBackToList, &key) => {
-                self.close_fullscreen();
+            _ if !key.repeat && resolved_action == Some(KeyAction::FsBackToList) => {
+                self.close_fullscreen_to_page_list();
                 hud_activity = false;
                 NativeVideoKeyOutcome::Action(KeyAction::FsBackToList)
             }
             // W: seek to start and play.
-            _ if !key.repeat
-                && self
-                    .keymap
-                    .matches_vk_action(KeyAction::VideoSeekStart, &key) =>
-            {
+            _ if !key.repeat && resolved_action == Some(KeyAction::VideoSeekStart) => {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                     // `seek(0.0)` 自体が `apply_command(Play)` 経由で autoplay intent
                     // を立てるので、追加 `toggle_play()` は不要 (Codex P2-1 2026-05-17)。
@@ -10325,13 +12675,14 @@ impl App {
                 self.maybe_start_normalize_scan_for_play_intent(fs_idx);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoSeekStart)
             }
+            _ if !key.repeat && resolved_action == Some(KeyAction::ToggleAlwaysOnTop) => {
+                self.toggle_always_on_top(ctx, crate::app::ActionSurface::Viewer);
+                hud_activity = false;
+                NativeVideoKeyOutcome::Action(KeyAction::ToggleAlwaysOnTop)
+            }
             // F12: detached viewer mode toggle. Keep this as a keymap action
             // so a future remap works when the native video HWND has focus.
-            _ if !key.repeat
-                && self
-                    .keymap
-                    .matches_vk_action(KeyAction::ToggleDetachedViewerMode, &key) =>
-            {
+            _ if !key.repeat && resolved_action == Some(KeyAction::ToggleDetachedViewerMode) => {
                 // ここへ来る `repeat=false` は、**現 HWND・現 epoch が生成した
                 // first-key-down** である。stale 判定を App 側でやり直さないこと:
                 //
@@ -10354,20 +12705,12 @@ impl App {
             // toggle_video_window_mode は presenter rebuild を伴うので
             // toggle_still_window_mode (設定 flip だけ) では代用できない。
             // normalize scan 中は上の `normalize_state` ガードで既に弾かれている。
-            _ if !key.repeat
-                && self
-                    .keymap
-                    .matches_vk_action(KeyAction::FsToggleWindowMode, &key) =>
-            {
+            _ if !key.repeat && resolved_action == Some(KeyAction::FsToggleWindowMode) => {
                 self.toggle_video_window_mode_for_input(ctx);
                 hud_activity = false;
                 NativeVideoKeyOutcome::Action(KeyAction::FsToggleWindowMode)
             }
-            _ if !key.repeat
-                && self
-                    .keymap
-                    .matches_vk_action(KeyAction::FsPanoramaProjection, &key) =>
-            {
+            _ if !key.repeat && resolved_action == Some(KeyAction::FsPanoramaProjection) => {
                 if self.native_video_panorama_input_active(fs_idx)
                     && self.cycle_panorama_projection().is_some()
                 {
@@ -10375,12 +12718,8 @@ impl App {
                 }
                 NativeVideoKeyOutcome::Action(KeyAction::FsPanoramaProjection)
             }
-            _ if !key.repeat && self.keymap.matches_vk_action(KeyAction::FsPanorama, &key) => {
-                let target = select_native_video_display_mode_toggle(
-                    self.detect_panorama(fs_idx).is_some(),
-                    self.native_video_zoom_available(fs_idx),
-                );
-                self.apply_native_video_display_mode_toggle(ctx, fs_idx, target);
+            _ if !key.repeat && resolved_action == Some(KeyAction::FsPanorama) => {
+                self.toggle_native_video_display_mode_for_input(ctx, fs_idx);
                 NativeVideoKeyOutcome::Action(KeyAction::FsPanorama)
             }
             // Tile mode: left/right move the keyboard cursor instead of seeking
@@ -10395,74 +12734,50 @@ impl App {
                 NativeVideoKeyOutcome::FixedAction(action)
             }
             // Ctrl+Shift+Left / Right by default: frame step and pause.
-            _ if self
-                .keymap
-                .matches_vk_action(KeyAction::VideoFrameStepBack, &key) =>
-            {
+            _ if resolved_action == Some(KeyAction::VideoFrameStepBack) => {
                 self.step_video_frame(ctx, fs_idx, -1);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoFrameStepBack)
             }
-            _ if self
-                .keymap
-                .matches_vk_action(KeyAction::VideoFrameStepForward, &key) =>
-            {
+            _ if resolved_action == Some(KeyAction::VideoFrameStepForward) => {
                 self.step_video_frame(ctx, fs_idx, 1);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoFrameStepForward)
             }
-            _ if self
-                .keymap
-                .matches_vk_action(KeyAction::VideoSeekBackSmall, &key) =>
-            {
+            _ if resolved_action == Some(KeyAction::VideoSeekBackSmall) => {
                 let seconds = self
                     .settings
                     .video_seek_seconds(crate::settings::VideoSeekStep::Small);
                 self.native_video_seek_relative_with_hint(fs_idx, -seconds);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoSeekBackSmall)
             }
-            _ if self
-                .keymap
-                .matches_vk_action(KeyAction::VideoSeekForwardSmall, &key) =>
-            {
+            _ if resolved_action == Some(KeyAction::VideoSeekForwardSmall) => {
                 let seconds = self
                     .settings
                     .video_seek_seconds(crate::settings::VideoSeekStep::Small);
                 self.native_video_seek_relative_with_hint(fs_idx, seconds);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoSeekForwardSmall)
             }
-            _ if self
-                .keymap
-                .matches_vk_action(KeyAction::VideoSeekBackMedium, &key) =>
-            {
+            _ if resolved_action == Some(KeyAction::VideoSeekBackMedium) => {
                 let seconds = self
                     .settings
                     .video_seek_seconds(crate::settings::VideoSeekStep::Medium);
                 self.native_video_seek_relative_with_hint(fs_idx, -seconds);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoSeekBackMedium)
             }
-            _ if self
-                .keymap
-                .matches_vk_action(KeyAction::VideoSeekForwardMedium, &key) =>
-            {
+            _ if resolved_action == Some(KeyAction::VideoSeekForwardMedium) => {
                 let seconds = self
                     .settings
                     .video_seek_seconds(crate::settings::VideoSeekStep::Medium);
                 self.native_video_seek_relative_with_hint(fs_idx, seconds);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoSeekForwardMedium)
             }
-            _ if self
-                .keymap
-                .matches_vk_action(KeyAction::VideoSeekBackLarge, &key) =>
-            {
+            _ if resolved_action == Some(KeyAction::VideoSeekBackLarge) => {
                 let seconds = self
                     .settings
                     .video_seek_seconds(crate::settings::VideoSeekStep::Large);
                 self.native_video_seek_relative_with_hint(fs_idx, -seconds);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoSeekBackLarge)
             }
-            _ if self
-                .keymap
-                .matches_vk_action(KeyAction::VideoSeekForwardLarge, &key) =>
-            {
+            _ if resolved_action == Some(KeyAction::VideoSeekForwardLarge) => {
                 let seconds = self
                     .settings
                     .video_seek_seconds(crate::settings::VideoSeekStep::Large);
@@ -10485,22 +12800,14 @@ impl App {
                 NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::SeekForwardMedium)
             }
             // Plain Up / Down: navigate files, matching the egui fullscreen path.
-            _ if !key.repeat
-                && self
-                    .keymap
-                    .matches_vk_action(KeyAction::FsCtrlNavPrev, &key) =>
-            {
+            _ if !key.repeat && resolved_action == Some(KeyAction::FsCtrlNavPrev) => {
                 crate::logger::log(format!(
                     "[input-nav] source=native-video-key action=ctrl_nav_back fs_idx={fs_idx} keymap=FsCtrlNavPrev"
                 ));
                 self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, false, true);
                 NativeVideoKeyOutcome::Action(KeyAction::FsCtrlNavPrev)
             }
-            _ if !key.repeat
-                && self
-                    .keymap
-                    .matches_vk_action(KeyAction::FsCtrlNavNext, &key) =>
-            {
+            _ if !key.repeat && resolved_action == Some(KeyAction::FsCtrlNavNext) => {
                 crate::logger::log(format!(
                     "[input-nav] source=native-video-key action=ctrl_nav_forward fs_idx={fs_idx} keymap=FsCtrlNavNext"
                 ));
@@ -10508,19 +12815,11 @@ impl App {
                 NativeVideoKeyOutcome::Action(KeyAction::FsCtrlNavNext)
             }
             // Ctrl+PageUp / PageDown: move to the previous / next sibling folder.
-            _ if !key.repeat
-                && self
-                    .keymap
-                    .matches_vk_action(KeyAction::FsSiblingPrev, &key) =>
-            {
+            _ if !key.repeat && resolved_action == Some(KeyAction::FsSiblingPrev) => {
                 self.handle_fullscreen_sibling_nav_context(ctx, fs_idx, false, true);
                 NativeVideoKeyOutcome::Action(KeyAction::FsSiblingPrev)
             }
-            _ if !key.repeat
-                && self
-                    .keymap
-                    .matches_vk_action(KeyAction::FsSiblingNext, &key) =>
-            {
+            _ if !key.repeat && resolved_action == Some(KeyAction::FsSiblingNext) => {
                 self.handle_fullscreen_sibling_nav_context(ctx, fs_idx, true, true);
                 NativeVideoKeyOutcome::Action(KeyAction::FsSiblingNext)
             }
@@ -10545,25 +12844,19 @@ impl App {
                 );
                 NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::MouseForward)
             }
-            _ if self
-                .keymap
-                .matches_vk_action(KeyAction::VideoPrevFile, &key) =>
-            {
+            _ if resolved_action == Some(KeyAction::VideoPrevFile) => {
                 self.navigate_native_video_fullscreen(ctx, fs_idx, -1);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoPrevFile)
             }
-            _ if self
-                .keymap
-                .matches_vk_action(KeyAction::VideoNextFile, &key) =>
-            {
+            _ if resolved_action == Some(KeyAction::VideoNextFile) => {
                 self.navigate_native_video_fullscreen(ctx, fs_idx, 1);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoNextFile)
             }
             // Home / End (keymap: FsJumpFirst/FsJumpLast): jump to the first / last visible navigable item.
             // Home: 先頭アイテムへ。既に先頭なら境界トーストを出す
             // (Phase 1: 画像と挙動を揃える、Codex 第 1 ラウンド P2 反映)。
-            _ if !key.repeat && self.keymap.matches_vk_action(KeyAction::FsJumpFirst, &key) => {
-                let display_order = self.current_grid_order().to_vec();
+            _ if !key.repeat && resolved_action == Some(KeyAction::FsJumpFirst) => {
+                let display_order = self.current_reader_order().to_vec();
                 let target =
                     crate::ui_helpers::boundary_navigable_idx(&self.items, &display_order, false);
                 match target {
@@ -10581,8 +12874,8 @@ impl App {
                 NativeVideoKeyOutcome::Action(KeyAction::FsJumpFirst)
             }
             // End: 末尾アイテムへ。既に末尾なら境界トーストを出す。
-            _ if !key.repeat && self.keymap.matches_vk_action(KeyAction::FsJumpLast, &key) => {
-                let display_order = self.current_grid_order().to_vec();
+            _ if !key.repeat && resolved_action == Some(KeyAction::FsJumpLast) => {
+                let display_order = self.current_reader_order().to_vec();
                 let target =
                     crate::ui_helpers::boundary_navigable_idx(&self.items, &display_order, true);
                 match target {
@@ -10718,6 +13011,15 @@ impl App {
                 self.add_current_video_frame_to_active_book(ctx, fs_idx);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoAddToActiveBook)
             }
+            _ if self.fullscreen_idx == Some(fs_idx)
+                && !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::VideoAddToCollectionTarget, &key) =>
+            {
+                self.add_media_shortcut_to_collection_target(fs_idx);
+                NativeVideoKeyOutcome::Action(KeyAction::VideoAddToCollectionTarget)
+            }
             // X / C: comparison view is static-image only. Consume as silent no-op.
             _ if !key.repeat
                 && (self
@@ -10843,6 +13145,17 @@ impl App {
             {
                 self.toggle_video_audio_mode(ctx, fs_idx, VideoAudioEnterSource::NativeKey);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoToggleAudioMode)
+            }
+            _ if !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::VideoNextAudioTrack, &key) =>
+            {
+                if let Some(label) = self.cycle_video_audio_track(fs_idx) {
+                    self.show_native_video_overlay_toast(label, false);
+                    self.sync_native_video_metadata(fs_idx);
+                }
+                NativeVideoKeyOutcome::Action(KeyAction::VideoNextAudioTrack)
             }
             _ => {
                 hud_activity = false;
@@ -11018,19 +13331,6 @@ impl App {
                     ("count", serde_json::Value::from(count)),
                 ],
             );
-        }
-    }
-
-    #[cfg(windows)]
-    fn apply_native_video_rating_key(&mut self, fs_idx: usize, stars: u8) {
-        if !self.set_rating(fs_idx, stars) {
-            return;
-        }
-        self.rebuild_visible_indices();
-        if stars == 0 {
-            self.show_feedback_toast("[★解除]".to_string());
-        } else {
-            self.show_feedback_toast(format!("[{}]", "★".repeat(stars as usize)));
         }
     }
 
@@ -11221,7 +13521,7 @@ impl App {
             self.settings.text_contrast,
             self.settings.ui_font.clone(),
             self.settings.fullscreen_cursor_hide_delay_secs,
-            Some(self.dsp_bridge.editor_hwnds_snapshot()),
+            Some(self.dsp_bridge.editor_ui_snapshot()),
             self.main_hwnd.unwrap_or(0) as u64,
             self.creative_lut_library.video_snapshot(
                 &self.settings.creative_luts,
@@ -11231,7 +13531,8 @@ impl App {
             self.settings.video_scale_filter,
             self.settings.video_downscale_smoothing_percent,
             self.settings.video_anime4k_budget,
-            self.native_bar_lock_state(),
+            self.settings.fullscreen_image_margin_color,
+            self.native_chrome_snapshot(fs_idx),
             true, // audio_only (frameless present、Inc 6 ②-1)
         ) else {
             return;
@@ -11380,10 +13681,12 @@ impl App {
                 // (Codex Medium)。
                 | Ev::SetVolume { .. }
                 | Ev::SetPlaybackSpeed { .. }
+                | Ev::SelectAudioTrack { .. }
                 | Ev::TogglePerfOverlay
                 | Ev::ToggleSidePanelMode
                 | Ev::ToggleBarLock { .. }
                 | Ev::ToggleClickInfoOpen
+                | Ev::CloseInfoPanel
                 | Ev::ToggleInfoPanelLock
                 | Ev::SetVst3PanelVisible { .. }
                 | Ev::SetVst3PanelPos { .. }
@@ -11399,8 +13702,9 @@ impl App {
     }
 
     /// 「動画→音声モード」に入る (Inc 7 hidden presenter、docs §5.7.0)。走行中の動画プレイヤーの
-    /// native presenter を **drop せず hide** し (`set_native_window_visible(false)`)、presenter は
-    /// consume-and-hold でデコードを続けたまま egui 音楽ビューを表示する。音声スレッド (pump / CPAL /
+    /// native presenter を **drop せず retire** する。Fullscreen では egui 音楽 viewport の
+    /// Focus acknowledgement 後に hide し、MainWindow / DetachedWindow では直ちに hide する。
+    /// presenter は consume-and-hold でデコードを続けたまま音楽ビューを表示する。音声スレッド (pump / CPAL /
     /// decoder の audio 経路 / `DspBridge` / normalize / 解析状態) には一切触れないので **音声は
     /// 無中断**。presenter を生かすので exit も show するだけで済み、seek せず音切れが起きない。
     /// owner/HUD/VST GUI の後始末は presenter HWND が生きているうちに `exit_music_vst_shell` と同じ
@@ -11438,6 +13742,175 @@ impl App {
             VideoAudioToggleOutcome::RequestedAudioModeEnter(
                 self.enter_video_audio_mode(ctx, fs_idx, source),
             )
+        }
+    }
+
+    #[cfg(windows)]
+    fn arm_video_audio_presenter_retirement(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        entry_target: Option<super::VideoAudioPhysicalTarget>,
+    ) -> bool {
+        let Some(owner) = self.video_audio_presenter_owner_for(fs_idx) else {
+            self.video_audio_mode_runtime = None;
+            return false;
+        };
+        let presenter_hidden = self.fs_cache.get(&fs_idx).is_some_and(|entry| match entry {
+            FsCacheEntry::Video { player, .. } => player.native_presenter_hidden(),
+            _ => false,
+        });
+        let phase = if presenter_hidden {
+            super::VideoAudioPresenterPhase::SettledHidden
+        } else if self.viewer_presentation == ViewerPresentation::Fullscreen {
+            super::VideoAudioPresenterPhase::ViewportHandoff {
+                stage: super::VideoAudioViewportHandoffStage::AwaitingPresentation,
+                viewport_generation: self.fs_viewport_generation,
+            }
+        } else {
+            super::VideoAudioPresenterPhase::HideRequested {
+                after_hidden: super::VideoAudioAfterHidden::ContinueAudio,
+            }
+        };
+        self.video_audio_mode_runtime = Some(super::VideoAudioModeRuntime {
+            fs_idx,
+            entry_target,
+            presenter_owner: owner,
+            presenter_phase: phase,
+        });
+
+        if presenter_hidden {
+            return true;
+        }
+        if self.viewer_presentation == ViewerPresentation::Fullscreen {
+            // A native-video backdrop or the egui music viewport left by a VST host must be
+            // retired so the next render takes the one-shot hidden builder -> paint ->
+            // Visible+Focus path. The presenter remains visible until that viewport reports
+            // exact Some(true) focus.
+            self.hide_native_video_black_backdrop_if_shown(ctx);
+        } else if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.set_native_window_visible(false);
+        }
+        true
+    }
+
+    #[cfg(windows)]
+    fn rearm_video_audio_presenter_retirement(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        let entry_target = self
+            .video_audio_mode_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.entry_target)
+            .or_else(|| {
+                self.native_video_target_for_presentation(self.viewer_presentation)
+                    .map(super::VideoAudioPhysicalTarget::from_tuple)
+            });
+        if !self.arm_video_audio_presenter_retirement(ctx, fs_idx, entry_target) {
+            crate::logger::log(format!(
+                "[video-audio] presenter retirement could not be re-armed fs_idx={fs_idx}"
+            ));
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn mark_video_audio_music_viewport_focus_requested(
+        &mut self,
+        viewport_id: egui::ViewportId,
+    ) {
+        let Some(runtime) = self.video_audio_mode_runtime else {
+            return;
+        };
+        let super::VideoAudioPresenterPhase::ViewportHandoff {
+            stage: super::VideoAudioViewportHandoffStage::AwaitingPresentation,
+            viewport_generation,
+        } = runtime.presenter_phase
+        else {
+            return;
+        };
+        if viewport_id != self.fullscreen_viewport_id()
+            || viewport_generation != self.fs_viewport_generation
+            || self.viewer_presentation != ViewerPresentation::Fullscreen
+            || self.video_audio_vst.is_some()
+            || !self.video_audio_presenter_owner_matches(runtime.presenter_owner)
+        {
+            self.cancel_video_audio_viewport_handoff("focus_request_identity_mismatch");
+            return;
+        }
+        if let Some(runtime) = self.video_audio_mode_runtime.as_mut() {
+            runtime.presenter_phase = super::VideoAudioPresenterPhase::ViewportHandoff {
+                stage: super::VideoAudioViewportHandoffStage::AwaitingFocus,
+                viewport_generation,
+            };
+        }
+        crate::logger::log(format!(
+            "[video-audio] fullscreen music viewport focus requested fs_idx={} generation={viewport_generation}",
+            runtime.fs_idx
+        ));
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn observe_video_audio_music_viewport_focus(
+        &mut self,
+        viewport_id: egui::ViewportId,
+        focused: Option<bool>,
+    ) {
+        let Some(runtime) = self.video_audio_mode_runtime else {
+            return;
+        };
+        let super::VideoAudioPresenterPhase::ViewportHandoff {
+            stage: super::VideoAudioViewportHandoffStage::AwaitingFocus,
+            viewport_generation,
+        } = runtime.presenter_phase
+        else {
+            return;
+        };
+        if viewport_id != self.fullscreen_viewport_id()
+            || viewport_generation != self.fs_viewport_generation
+            || self.viewer_presentation != ViewerPresentation::Fullscreen
+            || self.video_audio_vst.is_some()
+            || !self.video_audio_presenter_owner_matches(runtime.presenter_owner)
+        {
+            self.cancel_video_audio_viewport_handoff("focus_ack_identity_mismatch");
+            return;
+        }
+        // eframe may report Some(false) for several frames after ViewportCommand::Focus. There is
+        // no typed negative acknowledgement, so only exact Some(true) advances the handoff.
+        if focused != Some(true) {
+            return;
+        }
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&runtime.fs_idx) {
+            player.set_native_window_visible(false);
+        }
+        if let Some(current) = self.video_audio_mode_runtime.as_mut() {
+            current.presenter_phase = super::VideoAudioPresenterPhase::HideRequested {
+                after_hidden: super::VideoAudioAfterHidden::ContinueAudio,
+            };
+        }
+        crate::logger::log(format!(
+            "[video-audio] fullscreen music viewport focus acknowledged; requested presenter hide fs_idx={} generation={viewport_generation}",
+            runtime.fs_idx
+        ));
+    }
+
+    #[cfg(windows)]
+    fn request_video_audio_presenter_hide_without_viewport_handoff(&mut self) {
+        let Some(runtime) = self.video_audio_mode_runtime else {
+            return;
+        };
+        if matches!(
+            runtime.presenter_phase,
+            super::VideoAudioPresenterPhase::SettledHidden
+                | super::VideoAudioPresenterPhase::Exiting(_)
+                | super::VideoAudioPresenterPhase::HideRequested { .. }
+        ) {
+            return;
+        }
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&runtime.fs_idx) {
+            player.set_native_window_visible(false);
+        }
+        if let Some(current) = self.video_audio_mode_runtime.as_mut() {
+            current.presenter_phase = super::VideoAudioPresenterPhase::HideRequested {
+                after_hidden: super::VideoAudioAfterHidden::ContinueAudio,
+            };
         }
     }
 
@@ -11532,7 +14005,9 @@ impl App {
         // exit が fallback (detach+attach+seek = 短い音切れ) に劣化するので、detached では
         // target 確定を必須にして、取れなければ teardown 前に no-op で抜ける (Codex 7e 助言)。
         // Fullscreen / MainWindow は main_hwnd 前提なので通常 Some。
-        let entry_target = self.native_video_target_for_presentation(self.viewer_presentation);
+        let entry_target = self
+            .native_video_target_for_presentation(self.viewer_presentation)
+            .map(super::VideoAudioPhysicalTarget::from_tuple);
         if let Some(reason) =
             video_audio_enter_gate_rejection(VideoAudioEnterGate::DetachedEntryTarget {
                 detached: matches!(self.viewer_presentation, ViewerPresentation::DetachedWindow),
@@ -11575,9 +14050,8 @@ impl App {
         // 上で捕捉した enter 時点の物理ターゲットを保存する。音声モード中に全画面⇔ウィンドウ⇔
         // 別ウィンドウを切り替えてから戻ったとき、これと現在ターゲットを比較して「そのまま show」か
         // 「SwitchPlacement で作り直し」かを選ぶ (Codex 案D)。
-        self.video_audio_mode_entry_target = entry_target;
-        self.video_audio_exit_pending = None;
         self.reset_video_audio_side_panel_sessions(fs_idx);
+        self.clear_native_video_mouse_seek_holds("video_audio_mode_enter");
         self.video_audio_mode = Some(fs_idx);
         // 診断ログの session 境界だけを再 arm する。入力判定・presenter 遷移には使わない。
         crate::ui_fullscreen::reset_video_audio_exit_key_diagnostic_rate();
@@ -11587,14 +14061,21 @@ impl App {
         // キャッシュを保持したまま動画側で書き換えると stale になる。enter でロード済みフラグを
         // 落として、次の draw_fs_music_view で DB から再ロードさせる。
         self.music_bookmarks_loaded_for = None;
-        // presenter に hide コマンドを送る (drop しない)。presenter スレッドは以降
-        // consume-and-hold に入り、映像を present せず最新フレームだけ hold する。音声 routing は
-        // 無改変なので無中断。`video_audio_mode` を Some にした **後** に hide を送ることで、
-        // 次フレームには egui 音楽ビューが描かれ、presenter ウィンドウが隠れても穴が空かない
-        // (むしろ 1 フレーム映像が残るだけで視覚的に自然)。
+        // presenter は drop しない。Fullscreen では fresh music viewport の既存
+        // Visible+Focus が Some(true) を返すまで映像を残し、その後 hide を一度だけ要求する。
+        // MainWindow / DetachedWindow は既存 surface 自体が入力 owner なので直ちに hide する。
+        // pump が hidden を publish した後だけ SettledHidden とし、音声 routing は無改変で保つ。
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             player.set_media_visual_mode(music_core::MediaVisualMode::Music);
-            player.set_native_window_visible(false);
+        }
+        if !self.arm_video_audio_presenter_retirement(ctx, fs_idx, entry_target) {
+            self.video_audio_mode = None;
+            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                player.set_media_visual_mode(music_core::MediaVisualMode::Video);
+            }
+            return VideoAudioEnterOutcome::Rejected(
+                VideoAudioEnterRejectReason::PresenterUnavailable,
+            );
         }
         ctx.request_repaint();
         VideoAudioEnterOutcome::Entered
@@ -11603,7 +14084,7 @@ impl App {
     /// 「動画→音声モード」を抜けて動画表示へ戻る (Inc 7 hidden presenter、docs §5.7.0)。
     /// presenter は enter で drop せず hide しただけなので、基本は **show するだけ**で映像復帰でき、
     /// seek / audio を触らない = **音切れ無し**。exit は非同期 (presenter の再表示を confirm する
-    /// まで `video_audio_mode` を Some に保って音楽ビューを描き続け、`poll_video_audio_exit_pending`
+    /// まで `video_audio_mode` を Some に保って音楽ビューを描き続け、`poll_video_audio_mode_runtime`
     /// が None に落とす。逆順だと 1 フレーム映像が出ない穴が空く = Codex Q4)。
     ///
     /// 分岐 (Codex 案D): enter 時点の物理ターゲット (placement / owner_hwnd) と現在ターゲットを
@@ -11631,23 +14112,16 @@ impl App {
             return;
         }
         // 既に exit 進行中なら二重起動しない (ボタンが複数フレーム描かれる間の連打対策)。
-        if self.video_audio_exit_pending.is_some() {
-            if let Some(pending) = self.video_audio_exit_pending {
-                let now = std::time::Instant::now();
-                let deadline_remaining = pending.deadline.saturating_duration_since(now);
-                crate::logger::log(format!(
-                    "[video-audio] exit fs_idx={fs_idx} ignored reason=exit_pending pending_fs_idx={} deadline_remaining_ms={} deadline_expired={}",
-                    pending.fs_idx,
-                    deadline_remaining.as_millis(),
-                    pending.deadline <= now
-                ));
-            }
+        if self.video_audio_exit_pending_active() {
+            crate::logger::log(format!(
+                "[video-audio] exit fs_idx={fs_idx} ignored reason=exit_pending"
+            ));
             return;
         }
         // 音声モードの連続再生 EOF による source-swap 進行中は exit を受け付けない (Codex P2)。
         // この間は旧 player が既に外され新 player 未挿入で `fs_cache[fs_idx]` が無く、show /
         // SwitchPlacement の対象 presenter が pending 内に退避しているため、ここで exit すると
-        // `poll_video_audio_exit_pending` が player-gone で video_audio_mode を落としても、swap の
+        // `poll_video_audio_mode_runtime` が player-gone で video_audio_mode を落としても、swap の
         // `audio_mode_after_swap=true` で completion がまた音声モードに戻す = exit が失われる。
         // swap 完了 (= 数百 ms) 後に再度ボタンを押せば通常経路で正しく動画表示へ戻れる。enter 側も
         // 同じ理由で swap 中は entry をブロックしている (対称)。
@@ -11657,101 +14131,138 @@ impl App {
             ));
             return;
         }
-        // ここからは動画表示へ復帰する操作。再 Buffering が起きた場合も通常の動画と同じく
-        // FirstFrameReady を待つよう、presenter の show/re-place より先に要件を戻す。
+        let presenter_hidden = matches!(
+            self.fs_cache.get(&fs_idx),
+            Some(FsCacheEntry::Video { player, .. }) if player.native_presenter_hidden()
+        );
+        let phase = self
+            .video_audio_mode_runtime
+            .as_ref()
+            .map(|runtime| runtime.presenter_phase);
+        if !presenter_hidden
+            && matches!(
+                phase,
+                Some(super::VideoAudioPresenterPhase::ViewportHandoff { .. })
+                    | Some(super::VideoAudioPresenterPhase::HandoffCancelled)
+                    | None
+            )
+        {
+            // The fullscreen viewport never took ownership and no presenter hide was issued.
+            // Returning to video is synchronous; queuing a show here would create a false
+            // hidden->shown receipt and can race a hide that does not exist.
+            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                player.set_media_visual_mode(music_core::MediaVisualMode::Video);
+            }
+            self.reset_video_audio_side_panel_sessions(fs_idx);
+            self.video_audio_mode = None;
+            self.video_audio_mode_runtime = None;
+            ctx.request_repaint();
+            crate::logger::log(format!(
+                "[video-audio] exit fs_idx={fs_idx}: viewport handoff cancelled before presenter hide"
+            ));
+            return;
+        }
+        if !presenter_hidden
+            && matches!(
+                phase,
+                Some(super::VideoAudioPresenterPhase::HideRequested {
+                    after_hidden: super::VideoAudioAfterHidden::ContinueAudio
+                })
+            )
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+            if let Some(runtime) = self.video_audio_mode_runtime.as_mut() {
+                runtime.presenter_phase = super::VideoAudioPresenterPhase::HideRequested {
+                    after_hidden: super::VideoAudioAfterHidden::ExitToVideo { deadline },
+                };
+            }
+            ctx.request_repaint();
+            crate::logger::log(format!(
+                "[video-audio] exit fs_idx={fs_idx}: waiting for requested hide before show"
+            ));
+            return;
+        }
+        self.begin_video_audio_mode_exit_after_hidden(ctx, fs_idx);
+    }
+
+    #[cfg(windows)]
+    fn begin_video_audio_mode_exit_after_hidden(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        if self.video_audio_mode_runtime.is_none() {
+            self.exit_video_audio_mode_fallback(ctx, fs_idx);
+            return;
+        }
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             player.set_media_visual_mode(music_core::MediaVisualMode::Video);
         }
         self.reset_video_audio_side_panel_sessions(fs_idx);
-        // saw_hidden を「今 hidden か」でシードする (Codex P2 検証): 音声モードでは presenter は既に
-        // hide 済み (でないと音楽ビューが見えずこのボタンも押せない) なので通常 true になる。これで
-        // show / SwitchPlacement を送ったあと、次の poll より前に presenter が hidden→表示 を処理して
-        // しまっても (= UI が hidden==true を観測し損ねる race)、seed 済み saw_hidden により
-        // `!native_presenter_hidden()` で正しく完了できる。万一 hide 未処理 (= 今 false) なら seed も
-        // false で、その稀ケースは timeout フォールバックに委ねる。
-        let seed_saw_hidden = matches!(
-            self.fs_cache.get(&fs_idx),
-            Some(FsCacheEntry::Video { player, .. }) if player.native_presenter_hidden()
-        );
-        let cur_target = self.native_video_target_for_presentation(self.viewer_presentation);
-        // 物理ターゲット (placement, rect, owner) が完全一致するか。RECT の PartialEq に依存せず
-        // フィールド比較する。
-        let placement_matches = match (cur_target, self.video_audio_mode_entry_target) {
-            (Some((cur_pl, cur_rect, cur_owner)), Some((entry_pl, entry_rect, entry_owner))) => {
-                cur_pl == entry_pl
-                    && cur_owner == entry_owner
-                    && cur_rect.left == entry_rect.left
-                    && cur_rect.top == entry_rect.top
-                    && cur_rect.right == entry_rect.right
-                    && cur_rect.bottom == entry_rect.bottom
-            }
+        let entry_target = self
+            .video_audio_mode_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.entry_target);
+        let cur_target = self
+            .native_video_target_for_presentation(self.viewer_presentation)
+            .map(super::VideoAudioPhysicalTarget::from_tuple);
+        let placement_matches = match (cur_target, entry_target) {
+            (Some(current), Some(entry)) => current.same_target(entry),
             _ => false,
         };
-        if placement_matches {
-            // 高速 show (シームレス)。presenter が再表示 (`!native_presenter_hidden()`) を
-            // confirm するまで video_audio_mode は Some のまま保つ。
+        let pending = if placement_matches {
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                 player.set_native_window_visible(true);
             }
-            self.video_audio_exit_pending = Some(super::VideoAudioExitPending {
-                fs_idx,
-                deadline: std::time::Instant::now() + std::time::Duration::from_millis(400),
-                saw_hidden: seed_saw_hidden,
-            });
             crate::logger::log(format!(
                 "[video-audio] exit fs_idx={fs_idx}: fast show (placement unchanged)"
             ));
-            ctx.request_repaint();
-        } else if cur_target.is_some() {
-            // placement / rect 変更を伴う復帰: SwitchPlacement で presenter を作り直す / resize する
-            // (source 保持 = 音声無中断)。presenter は hidden なので、rebuild / same-placement resize
-            // が hold フレームで prime + show + presenter_hidden 解除する (video/mod.rs)。owner/HUD は
-            // switch 完了後の ensure_native_video_front が再登録する。
-            self.switch_native_video_viewer_presentation(self.viewer_presentation, true);
-            self.video_audio_exit_pending = Some(super::VideoAudioExitPending {
+            super::VideoAudioExitPending {
                 fs_idx,
-                // rebuild は show より時間がかかるので長めの保険。
-                deadline: std::time::Instant::now() + std::time::Duration::from_millis(1200),
-                saw_hidden: seed_saw_hidden,
-            });
+                deadline: std::time::Instant::now() + std::time::Duration::from_millis(400),
+                saw_hidden: true,
+            }
+        } else if cur_target.is_some() {
+            self.switch_native_video_viewer_presentation(self.viewer_presentation, true);
             crate::logger::log(format!(
                 "[video-audio] exit fs_idx={fs_idx}: placement changed, re-placing via SwitchPlacement"
             ));
-            ctx.request_repaint();
+            super::VideoAudioExitPending {
+                fs_idx,
+                deadline: std::time::Instant::now() + std::time::Duration::from_millis(1200),
+                saw_hidden: true,
+            }
         } else {
-            // ターゲット取得不可 (通常起きない): 同期フォールバック。
             crate::logger::log(format!(
                 "[video-audio] exit fs_idx={fs_idx}: target unavailable, fallback detach+attach+seek"
             ));
             self.exit_video_audio_mode_fallback(ctx, fs_idx);
-        }
-    }
-
-    /// hidden presenter からの exit 完了待ちをポーリングする (`poll_video` から毎フレーム)。
-    /// presenter が再表示された (`!native_presenter_hidden()`) ら `video_audio_mode` を None に
-    /// 落として音楽ビュー描画を止め、動画表示へ戻す。deadline 超過 (presenter 無応答 /
-    /// SwitchPlacement 失敗) は detach+attach+seek フォールバックへ回す。
-    #[cfg(windows)]
-    pub(crate) fn poll_video_audio_exit_pending(&mut self, ctx: &egui::Context) {
-        let Some(pending) = self.video_audio_exit_pending else {
             return;
         };
-        // モードが既に別経路 (close_fullscreen / open_fullscreen) でクリアされていたら pending も捨てる。
-        if self.video_audio_mode != Some(pending.fs_idx) {
-            self.video_audio_exit_pending = None;
+        if let Some(runtime) = self.video_audio_mode_runtime.as_mut() {
+            runtime.presenter_phase = super::VideoAudioPresenterPhase::Exiting(pending);
+        }
+        ctx.request_repaint();
+    }
+
+    /// fullscreen viewport focus handoff、presenter hide commit、動画復帰を 1 owner でポーリングする。
+    #[cfg(windows)]
+    pub(super) fn poll_video_audio_mode_runtime(&mut self, ctx: &egui::Context) {
+        let Some(runtime) = self.video_audio_mode_runtime else {
+            return;
+        };
+        // source swap は native output を pending owner へ移しており、completion が runtime を
+        // 新しい source identity で再構築する。途中の player-gone を terminal と誤認しない。
+        if self.native_video_source_swap_pending.is_some() {
             return;
         }
-        let (player_present, hidden) = match self.fs_cache.get(&pending.fs_idx) {
+        if self.video_audio_mode != Some(runtime.fs_idx) {
+            self.video_audio_mode_runtime = None;
+            return;
+        }
+        let (player_present, hidden) = match self.fs_cache.get(&runtime.fs_idx) {
             Some(FsCacheEntry::Video { player, .. }) => (true, player.native_presenter_hidden()),
             _ => (false, false),
         };
         if !player_present {
-            // player が消えた (evict 等): stuck を避けるため即完了扱いにしてモードを畳む。
-            // mismatch 経路で張った SwitchPlacement pending が居ても PlacementSwitched は届かない
-            // ので明示クリアする (Codex P3、fallback と同様)。
             self.video_audio_mode = None;
-            self.video_audio_mode_entry_target = None;
-            self.video_audio_exit_pending = None;
+            self.video_audio_mode_runtime = None;
             if let Some(request_id) = self.video_presentation_transition.request_id() {
                 self.video_presentation_transition
                     .dispatch(super::PresentationTransitionEvent::NativeFailed { request_id });
@@ -11759,37 +14270,79 @@ impl App {
             ctx.request_repaint();
             return;
         }
-        // hidden を一度でも観測してからでないと「再表示」を完了とみなさない (Codex P2)。
-        // 通常 exit は enter で hide 済み = 最初の poll で saw_hidden が立ち、その後 show /
-        // SwitchPlacement が処理されて hidden=false になった時点で完了する。
-        if hidden && !pending.saw_hidden {
-            if let Some(p) = self.video_audio_exit_pending.as_mut() {
-                p.saw_hidden = true;
+        match runtime.presenter_phase {
+            super::VideoAudioPresenterPhase::ViewportHandoff { .. } => {
+                if !self.video_audio_presenter_owner_matches(runtime.presenter_owner)
+                    || self.viewer_presentation != ViewerPresentation::Fullscreen
+                    || self.video_audio_vst.is_some()
+                {
+                    self.cancel_video_audio_viewport_handoff("poll_identity_or_lifecycle_mismatch");
+                }
             }
-        }
-        let saw_hidden = pending.saw_hidden || hidden;
-        if saw_hidden && !hidden {
-            // 再表示済み: 音楽ビューを畳んで動画表示へ (owner/HUD は次フレームの
-            // ensure_native_video_front が再登録)。
-            self.video_audio_mode = None;
-            self.video_audio_mode_entry_target = None;
-            self.video_audio_exit_pending = None;
-            ctx.request_repaint();
-            crate::logger::log(format!(
-                "[video-audio] exit fs_idx={} complete (presenter shown)",
-                pending.fs_idx
-            ));
-        } else if std::time::Instant::now() >= pending.deadline {
-            // presenter が無応答 / switch 失敗: フォールバックで確実に復帰させる。
-            self.video_audio_exit_pending = None;
-            crate::logger::log(format!(
-                "[video-audio] exit fs_idx={} timed out; falling back to detach+attach+seek",
-                pending.fs_idx
-            ));
-            self.exit_video_audio_mode_fallback(ctx, pending.fs_idx);
-        } else {
-            // まだ hidden: 再描画を回して次フレームで再判定。
-            ctx.request_repaint();
+            super::VideoAudioPresenterPhase::HideRequested { after_hidden } => {
+                if !self.video_audio_presenter_owner_matches(runtime.presenter_owner) {
+                    if matches!(
+                        after_hidden,
+                        super::VideoAudioAfterHidden::ExitToVideo { .. }
+                    ) {
+                        self.exit_video_audio_mode_fallback(ctx, runtime.fs_idx);
+                    } else if let Some(current) = self.video_audio_mode_runtime.as_mut() {
+                        current.presenter_phase = super::VideoAudioPresenterPhase::HandoffCancelled;
+                    }
+                    return;
+                }
+                if hidden {
+                    match after_hidden {
+                        super::VideoAudioAfterHidden::ContinueAudio => {
+                            if let Some(current) = self.video_audio_mode_runtime.as_mut() {
+                                current.presenter_phase =
+                                    super::VideoAudioPresenterPhase::SettledHidden;
+                            }
+                        }
+                        super::VideoAudioAfterHidden::ExitToVideo { .. } => {
+                            self.begin_video_audio_mode_exit_after_hidden(ctx, runtime.fs_idx);
+                        }
+                    }
+                } else if let super::VideoAudioAfterHidden::ExitToVideo { deadline } = after_hidden
+                {
+                    if std::time::Instant::now() >= deadline {
+                        crate::logger::log(format!(
+                            "[video-audio] exit fs_idx={} timed out waiting for hide; falling back",
+                            runtime.fs_idx
+                        ));
+                        self.exit_video_audio_mode_fallback(ctx, runtime.fs_idx);
+                    } else {
+                        ctx.request_repaint();
+                    }
+                }
+            }
+            super::VideoAudioPresenterPhase::Exiting(mut pending) => {
+                if hidden && !pending.saw_hidden {
+                    pending.saw_hidden = true;
+                    if let Some(current) = self.video_audio_mode_runtime.as_mut() {
+                        current.presenter_phase = super::VideoAudioPresenterPhase::Exiting(pending);
+                    }
+                }
+                if pending.saw_hidden && !hidden {
+                    self.video_audio_mode = None;
+                    self.video_audio_mode_runtime = None;
+                    ctx.request_repaint();
+                    crate::logger::log(format!(
+                        "[video-audio] exit fs_idx={} complete (presenter shown)",
+                        pending.fs_idx
+                    ));
+                } else if std::time::Instant::now() >= pending.deadline {
+                    crate::logger::log(format!(
+                        "[video-audio] exit fs_idx={} timed out; falling back to detach+attach+seek",
+                        pending.fs_idx
+                    ));
+                    self.exit_video_audio_mode_fallback(ctx, pending.fs_idx);
+                } else {
+                    ctx.request_repaint();
+                }
+            }
+            super::VideoAudioPresenterPhase::SettledHidden
+            | super::VideoAudioPresenterPhase::HandoffCancelled => {}
         }
     }
 
@@ -11800,8 +14353,7 @@ impl App {
     #[cfg(windows)]
     fn exit_video_audio_mode_fallback(&mut self, ctx: &egui::Context, fs_idx: usize) {
         self.video_audio_mode = None;
-        self.video_audio_mode_entry_target = None;
-        self.video_audio_exit_pending = None;
+        self.video_audio_mode_runtime = None;
         // フォールバックは presenter を drop → 新規 attach するので、進行中の SwitchPlacement
         // (exit-mismatch 経路が張った pending) が居ても PlacementSwitched は届かない。stale pending
         // を明示クリアして owner/availability 同期が固まらないようにする (Codex P2)。
@@ -11835,7 +14387,7 @@ impl App {
                 self.settings.text_contrast,
                 self.settings.ui_font.clone(),
                 self.settings.fullscreen_cursor_hide_delay_secs,
-                Some(self.dsp_bridge.editor_hwnds_snapshot()),
+                Some(self.dsp_bridge.editor_ui_snapshot()),
                 self.main_hwnd.unwrap_or(0) as u64,
                 self.creative_lut_library.video_snapshot(
                     &self.settings.creative_luts,
@@ -11845,7 +14397,8 @@ impl App {
                 self.settings.video_scale_filter,
                 self.settings.video_downscale_smoothing_percent,
                 self.settings.video_anime4k_budget,
-                self.native_bar_lock_state(),
+                self.settings.fullscreen_image_margin_color,
+                self.native_chrome_snapshot(fs_idx),
                 false,
             )
         });
@@ -11919,7 +14472,7 @@ impl App {
             return;
         }
         // 「動画に戻る」exit の非同期完了待ち中は presenter が show/SwitchPlacement 進行中なので拒否。
-        if self.video_audio_exit_pending.is_some() {
+        if self.video_audio_exit_pending_active() {
             return;
         }
         // VST owner/HUD 機構は OFF モードのメイン fullscreen 前提。detached / 複数
@@ -11951,6 +14504,9 @@ impl App {
         // 見える)。音声スレッドは無改変なので音切れなし。
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             player.set_native_window_visible(true);
+        }
+        if let Some(runtime) = self.video_audio_mode_runtime.as_mut() {
+            runtime.presenter_phase = super::VideoAudioPresenterPhase::HandoffCancelled;
         }
         self.video_audio_vst = Some(super::VideoAudioVstState {
             fs_idx,
@@ -12046,14 +14602,15 @@ impl App {
         }
         // GUI/owner/HUD を畳む (tick の mismatch フォールバックと共有)。
         self.teardown_video_audio_vst_gui();
-        // presenter を re-hide して音声モード (consume-and-hold) へ戻す。音声は無改変 = 音切れなし。
-        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-            player.set_native_window_visible(false);
-        }
         self.video_audio_vst = None;
+        // Fullscreen は VST GUI の re-owner/hide で foreground が一時的に main へ戻り得る。
+        // presenter をそこで隠さず、fresh music viewport の既存 Visible+Focus が exact
+        // Some(true) を返してから retire する。MainWindow/Detached は viewport handoff を
+        // 必要としないので helper 内で直ちに hide を要求する。
+        self.rearm_video_audio_presenter_retirement(ctx, fs_idx);
         ctx.request_repaint();
         crate::logger::log(format!(
-            "[video-audio-vst] exited VST host (re-hid presenter) for fs_idx={fs_idx}"
+            "[video-audio-vst] exited VST host (re-armed presenter retirement) for fs_idx={fs_idx}"
         ));
     }
 
@@ -12287,6 +14844,14 @@ impl App {
         // 最新 delta を deferred フィールドに格納し、swap 完了後の polling で drain する
         // (`maybe_apply_deferred_native_video_nav` 参照)。most-recent-wins。
         if self.video_tile_swap_pending.is_some() || self.native_video_fast_swap_pending.is_some() {
+            if self.start_collection_manual_navigation(
+                ctx,
+                fs_idx,
+                base_delta,
+                crate::app::ManualMediaNavigationLanding::NativeVideo,
+            ) {
+                return;
+            }
             self.native_video_deferred_nav_delta = Some(base_delta);
             return;
         }
@@ -12301,7 +14866,18 @@ impl App {
         if !self.video_tile_mode_active {
             self.cancel_stale_video_tile_reopen(Some(fs_idx), "wheel-navigation");
         }
-        let display_order = self.current_grid_order().to_vec();
+        // A collection root may have changed while the currently installed order still reports a
+        // boundary. Resolve every step from the actor's latest prepared order before consulting
+        // the old page-nav boundary.
+        if self.start_collection_manual_navigation(
+            ctx,
+            fs_idx,
+            base_delta,
+            crate::app::ManualMediaNavigationLanding::NativeVideo,
+        ) {
+            return;
+        }
+        let display_order = self.current_reader_order().to_vec();
         let page_nav = self.spread_page_nav(base_delta);
         let nav_delta = match page_nav {
             crate::ui_fullscreen::FsPageNav::None => return,
@@ -12463,15 +15039,34 @@ impl App {
             return None;
         }
 
+        self.clear_native_video_mouse_seek_holds("source_swap_fast");
         crate::logger::log(format!(
             "[native-video] fast source swap begin: reason={reason} from_idx={from_idx} -> target_idx={target_idx} target={}",
             target_path.display()
         ));
         self.save_all_video_resume_positions();
+        // See the deferred-swap path above: retire the source-bound strip only after proving
+        // that this player can actually yield the presenter, and while the old output is still
+        // attached so its payload is cleared before ownership moves.
+        let source_output_available =
+            self.fs_cache
+                .get(&from_idx)
+                .is_some_and(|entry| match entry {
+                    FsCacheEntry::Video { player, .. } => {
+                        player.native_committed_generation().is_some()
+                    }
+                    _ => false,
+                });
+        if !source_output_available {
+            return None;
+        }
+        self.stop_video_seek_strip_session(
+            crate::video::seek_strip::SeekStripCloseCause::VideoChanged,
+        );
         let native_output = match self.fs_cache.get_mut(&from_idx) {
             Some(FsCacheEntry::Video { player, .. }) => {
                 player.pause_audio_output();
-                player.set_playing(false);
+                player.set_playing_with_origin(false, crate::video::PlaybackStartOrigin::UserPlay);
                 player.clear_audio_output_buffer();
                 player.take_native_output()
             }
@@ -12502,7 +15097,7 @@ impl App {
         // demux thread の avformat_open_input より前に bump する必要がある
         // (Codex P2 第 16 ラウンド指摘)。
         self.activity_gate.bump();
-        let (mut new_player, start_normalize_scan_before_play) = self.build_video_player_for_open(
+        let mut new_player = self.build_video_player_for_open(
             target_idx,
             target_path.clone(),
             false,
@@ -12511,6 +15106,10 @@ impl App {
             crate::video::VideoOutputConsumer::Presentation,
             None,
         );
+        if matches!(history_trigger, crate::app::HistoryTrigger::AutoAdvance) {
+            new_player
+                .register_playback_start(crate::video::PlaybackStartOrigin::ContinuousAdvance);
+        }
         new_player.attach_native_output(native_output);
         self.video_zoom_state = None;
         new_player.set_native_video_zoom_state(None);
@@ -12529,18 +15128,12 @@ impl App {
         // `init_normalize_state_for_opened_video(target_idx)` を呼ぶが、fast-swap で
         // `fs_cache` に直接 insert した場合 `open_fullscreen` 内の cache-hit 分岐で
         // この初期化がスキップされ、ノーマライズ DB lookup + UI 状態セットが走らない。
-        // 初期 gain は `build_video_player_for_open` で open 前に渡し、ここでは UI 状態と
-        // 抑止状態を新しい動画に同期する。
+        // player の表は open 時から Pending。ここでは UI 状態と抑止状態を同期し、
+        // VideoInfo が届いていれば stream 別 lookup を起動する。
         self.init_normalize_state_for_opened_video(target_idx);
 
         self.open_fullscreen(target_idx, history_trigger);
-        if start_normalize_scan_before_play {
-            if !self.start_normalize_scan_for_deferred_play_intent(target_idx) {
-                self.resume_deferred_normalize_playback_without_scan(target_idx);
-            }
-        } else {
-            self.maybe_start_normalize_scan_for_play_intent(target_idx);
-        }
+        self.maybe_start_normalize_scan_for_play_intent(target_idx);
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&target_idx) {
             crate::logger::log(format!(
                 "[video-debug] post-swap state: idx={target_idx} engine_state={} seek_serial={} clock_is_playing={} pos={:.3} video_rx_len={} audio_rx_len={} pending_frames={}",
@@ -12685,7 +15278,7 @@ impl App {
         };
 
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&target_idx) {
-            player.set_playing(false);
+            player.set_playing_with_origin(false, crate::video::PlaybackStartOrigin::UserPlay);
         }
         self.video_tile_mode_active = true;
         self.video_tile_swap_pending = Some(VideoTileSwapPending {
@@ -12865,8 +15458,7 @@ impl App {
             self.teardown_video_audio_vst_gui();
             self.video_audio_vst = None;
             self.video_audio_mode = None;
-            self.video_audio_mode_entry_target = None;
-            self.video_audio_exit_pending = None;
+            self.video_audio_mode_runtime = None;
             crate::logger::log(format!(
                 "[video-audio-vst] left VST host for native video nav (presenter kept visible) fs_idx={cur}"
             ));
@@ -12948,6 +15540,13 @@ impl App {
         use crate::video::native_window::NativeVideoMouseButton;
 
         self.mark_native_video_hud_activity(ctx);
+        if matches!(
+            event.button,
+            NativeVideoMouseButton::Extra1 | NativeVideoMouseButton::Extra2
+        ) && !event.down
+        {
+            crate::mouse_seek_debug::log_app_mouse(event.receipt, "release_no_action");
+        }
         let right_drag_owner = self
             .native_video_parked_live_input_window_id
             .map(crate::ring_shortcut::RightDragOwner::DetachedWindow)
@@ -13082,11 +15681,44 @@ impl App {
         }
         if let Some(forward) = native_video_extra_button_press(event) {
             self.native_video_pointer_down = None;
-            self.mouse_ring_nav = self.apply_mouse_back_forward_button(
+            let slot = if forward {
+                crate::ring_shortcut::MouseButtonSlot::Forward
+            } else {
+                crate::ring_shortcut::MouseButtonSlot::Back
+            };
+            let result = self.dispatch_mouse_button(
                 ctx,
-                forward,
+                slot,
                 crate::app::ActionSurface::Viewer,
                 "native-video-mouse",
+            );
+            self.mouse_ring_nav = result.navigation;
+            if let Some(action) = result.dispatched_action
+                && crate::app::gamepad_input::video_seek_ring_action(&action).is_some()
+            {
+                self.arm_native_video_mouse_seek_hold(
+                    fs_idx,
+                    self.fs_cache
+                        .get(&fs_idx)
+                        .and_then(|entry| match entry {
+                            FsCacheEntry::Video { player, .. } => player.native_source_epoch(),
+                            _ => None,
+                        })
+                        .unwrap_or(0),
+                    event,
+                    slot,
+                    action,
+                    sample_native_mouse_repeat_timing(),
+                    std::time::Instant::now(),
+                );
+            }
+            crate::mouse_seek_debug::log_app_mouse(
+                event.receipt,
+                if forward {
+                    "press_mouse_forward_routed"
+                } else {
+                    "press_mouse_back_routed"
+                },
             );
             return;
         }
@@ -13373,6 +16005,69 @@ mod iconic_thumbnail_tests {
 mod native_video_display_mode_toggle_tests {
     use super::*;
 
+    #[test]
+    fn chrome_suppression_native_explicit_close_is_idempotent_and_keeps_context_lock() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        app.fullscreen_idx = Some(0);
+        app.fs_info_panel.locked = true;
+        app.fs_info_panel.open = crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle;
+        app.fs_info_panel.hover_active = true;
+        for _ in 0..2 {
+            app.handle_native_video_output_event(
+                &ctx,
+                0,
+                0,
+                crate::video::NativeVideoOutputEvent::CloseInfoPanel,
+            );
+            assert!(app.fs_info_panel.locked);
+            assert_eq!(
+                app.fs_info_panel.open,
+                crate::ui_helpers::MetadataPanelOpenState::Closed
+            );
+            assert!(!app.fs_info_panel.hover_active);
+        }
+    }
+
+    #[test]
+    fn chrome_suppression_music_vst_shell_close_info_reaches_handler_with_suppression_off_and_on() {
+        for suppressed in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let ctx = egui::Context::default();
+            app.fullscreen_idx = Some(0);
+            app.viewer_presentation = ViewerPresentation::Fullscreen;
+            app.music_vst_shell = Some(super::super::MusicVstShell {
+                fs_idx: 0,
+                activated: true,
+            });
+            app.show_vst3_manager = false;
+            app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
+            app.settings.fullscreen_chrome_suppression.info = suppressed;
+            app.fs_info_panel.locked = suppressed;
+            app.fs_info_panel.open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
+            app.fs_info_panel.hover_active = true;
+            app.fullscreen_tag_picker_open = true;
+            for _ in 0..2 {
+                app.handle_native_video_output_event(
+                    &ctx,
+                    0,
+                    0,
+                    crate::video::NativeVideoOutputEvent::CloseInfoPanel,
+                );
+                assert_eq!(app.fs_info_panel.locked, suppressed);
+                assert_eq!(
+                    app.fs_info_panel.open,
+                    crate::ui_helpers::MetadataPanelOpenState::Closed,
+                    "active music VST shell must route close even with suppression={suppressed}"
+                );
+                assert!(!app.fs_info_panel.hover_active);
+                assert!(!app.fullscreen_tag_picker_open);
+                assert!(!app.show_vst3_manager);
+                assert!(app.music_vst_shell.is_some_and(|shell| shell.activated));
+            }
+        }
+    }
+
     /// V キーと overlay イベントは同じ 1 つの規則を呼ぶ。ここで固定するのはその規則で、
     /// 「両方の入口が同じ関数を通る」ことは、選ぶ関数がこれ 1 つしかないことが保証する。
     #[test]
@@ -13396,12 +16091,82 @@ mod native_video_display_mode_toggle_tests {
 mod configurable_video_seek_dispatch_tests {
     use super::*;
 
+    #[test]
+    fn native_seek_start_window_event_works_without_egui_viewport_focus() {
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput {
+            focused: false,
+            ..Default::default()
+        };
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .focused = Some(false);
+        let _ = ctx.run(input, |_| {});
+        assert_eq!(ctx.input(|input| input.viewport().focused), Some(false));
+
+        for (bindings, virtual_key) in [
+            ("[FsVideo]\n", 0x57), // Default W, as in AudioTracks.
+            ("[FsVideo]\nVideoSeekStart = F15\n", 0x7E),
+        ] {
+            let (mut app, idx) = setup_seek_app();
+            app.keymap = crate::keymap::Keymap::from_ini_str(bindings);
+            let key = native_key(virtual_key, false, false);
+            app.handle_native_video_window_event(
+                &ctx,
+                idx,
+                crate::video::native_window::NativeVideoWindowEvent::KeyDown(key),
+            );
+            assert_eq!(player_seek_base(&app, idx), 0.0);
+            assert_eq!(ctx.input(|input| input.viewport().focused), Some(false));
+
+            reset_seek_player(&mut app, idx);
+            let repeat = crate::video::native_window::NativeVideoKeyEvent {
+                repeat: true,
+                ..key
+            };
+            app.handle_native_video_window_event(
+                &ctx,
+                idx,
+                crate::video::native_window::NativeVideoWindowEvent::KeyDown(repeat),
+            );
+            assert_eq!(player_seek_base(&app, idx), 100.0);
+        }
+    }
+
+    #[test]
+    fn rebound_always_on_top_native_key_toggles_once_per_press() {
+        let (mut app, idx) = setup_seek_app();
+        let ctx = egui::Context::default();
+        app.keymap = crate::keymap::Keymap::from_ini_str("[Global]\nToggleAlwaysOnTop = F16\n");
+        let first = native_key(0x7f, false, false);
+        assert!(matches!(
+            app.dispatch_native_video_key_event(&ctx, idx, first),
+            NativeVideoKeyOutcome::Action(KeyAction::ToggleAlwaysOnTop)
+        ));
+        assert!(app.settings.always_on_top);
+        let mut repeat = first;
+        repeat.repeat = true;
+        assert!(!matches!(
+            app.dispatch_native_video_key_event(&ctx, idx, repeat),
+            NativeVideoKeyOutcome::Action(KeyAction::ToggleAlwaysOnTop)
+        ));
+        assert!(app.settings.always_on_top);
+        assert!(matches!(
+            app.dispatch_native_video_key_event(&ctx, idx, first),
+            NativeVideoKeyOutcome::Action(KeyAction::ToggleAlwaysOnTop)
+        ));
+        assert!(!app.settings.always_on_top);
+    }
+
     fn native_key(
         virtual_key: u32,
         shift: bool,
         ctrl: bool,
     ) -> crate::video::native_window::NativeVideoKeyEvent {
         crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
             virtual_key,
             scan_code: 0,
             extended: matches!(virtual_key, 0x25 | 0x27),
@@ -13444,6 +16209,36 @@ mod configurable_video_seek_dispatch_tests {
         );
     }
 
+    #[test]
+    fn native_collection_shortcut_routes_video_and_audio_once_for_the_live_fs_index() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        app.keymap =
+            crate::keymap::Keymap::from_ini_str("[FsVideo]\nVideoAddToCollectionTarget = F13\n");
+        app.items = vec![
+            GridItem::Video(std::path::PathBuf::from(r"C:\clips\one.mp4")),
+            GridItem::Audio(std::path::PathBuf::from(r"C:\clips\two.mp3")),
+        ];
+        for idx in 0..2 {
+            app.fullscreen_idx = Some(idx);
+            assert!(matches!(
+                app.dispatch_native_video_key_event(&ctx, idx, native_key(0x7C, false, false)),
+                NativeVideoKeyOutcome::Action(KeyAction::VideoAddToCollectionTarget)
+            ));
+            let mut repeat = native_key(0x7C, false, false);
+            repeat.repeat = true;
+            assert!(!matches!(
+                app.dispatch_native_video_key_event(&ctx, idx, repeat),
+                NativeVideoKeyOutcome::Action(KeyAction::VideoAddToCollectionTarget)
+            ));
+        }
+        app.fullscreen_idx = Some(1);
+        assert!(!matches!(
+            app.dispatch_native_video_key_event(&ctx, 0, native_key(0x7C, false, false)),
+            NativeVideoKeyOutcome::Action(KeyAction::VideoAddToCollectionTarget)
+        ));
+    }
+
     fn player_position(app: &App, idx: usize) -> f64 {
         match app.fs_cache.get(&idx) {
             Some(FsCacheEntry::Video { player, .. }) => player.position(),
@@ -13456,6 +16251,543 @@ mod configurable_video_seek_dispatch_tests {
             Some(FsCacheEntry::Video { player, .. }) => player.volume(),
             _ => panic!("test video player missing"),
         }
+    }
+
+    fn player_seek_base(app: &App, idx: usize) -> f64 {
+        match app.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Video { player, .. }) => player.user_seek_base_secs_for_test(),
+            _ => panic!("test video player missing"),
+        }
+    }
+
+    fn setup_mouse_hold_app() -> (
+        crate::app::AppTestEnvForTest,
+        usize,
+        u64,
+        crate::video::native_window::NativeVideoMouseInputOwner,
+    ) {
+        let (mut app, idx) = setup_seek_app();
+        let player = match app.fs_cache.get_mut(&idx) {
+            Some(FsCacheEntry::Video { player, .. }) => player,
+            _ => panic!("test video player missing"),
+        };
+        player.configure_native_timing_for_test(100.0, 300.0, false, false);
+        let source_epoch = player.native_source_epoch().expect("native source epoch");
+        assert_eq!(
+            player.native_committed_generation(),
+            Some(0),
+            "the disconnected fixture models an initial presenter before any placement commit"
+        );
+        let owner = crate::video::native_window::NativeVideoMouseInputOwner {
+            window_source: crate::video::native_window::NativeVideoWindowSource::Presenter,
+            receiver_hwnd: player.native_presenter_hwnd(),
+            // The first real presenter window starts at generation 1 while the App-side
+            // committed generation is still the stale-close floor 0.
+            window_generation: 1,
+        };
+        assert_ne!(owner.receiver_hwnd, 0);
+        (app, idx, source_epoch, owner)
+    }
+
+    fn native_extra_mouse_event(
+        receipt_id: u64,
+        owner: crate::video::native_window::NativeVideoMouseInputOwner,
+        button: crate::video::native_window::NativeVideoMouseButton,
+        down: bool,
+        double_click: bool,
+    ) -> crate::video::native_window::NativeVideoMouseButtonEvent {
+        crate::video::native_window::NativeVideoMouseButtonEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(receipt_id),
+            owner,
+            button,
+            down,
+            double_click,
+            x: 120,
+            y: 80,
+            shift: false,
+            ctrl: false,
+            #[cfg(feature = "test-script")]
+            smoke_metadata: None,
+        }
+    }
+
+    fn route_native_mouse_button(
+        app: &mut App,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        source_epoch: u64,
+        event: crate::video::native_window::NativeVideoMouseButtonEvent,
+    ) {
+        app.handle_native_video_output_event(
+            ctx,
+            fs_idx,
+            source_epoch,
+            crate::video::NativeVideoOutputEvent::Window(
+                crate::video::native_window::NativeVideoWindowEvent::MouseButton(event),
+            ),
+        );
+    }
+
+    fn set_video_mouse_action(
+        app: &mut App,
+        slot: crate::ring_shortcut::MouseButtonSlot,
+        action: crate::ring_shortcut::RingActionId,
+    ) {
+        let profile = app
+            .settings
+            .ring_shortcuts
+            .mouse_button_profile_mut(crate::ring_shortcut::RingShortcutContext::VideoFullscreen);
+        match slot {
+            crate::ring_shortcut::MouseButtonSlot::Back => profile.back = action,
+            crate::ring_shortcut::MouseButtonSlot::Forward => profile.forward = action,
+            crate::ring_shortcut::MouseButtonSlot::Middle => profile.middle = action,
+        }
+    }
+
+    #[test]
+    fn native_mouse_repeat_timing_clamps_and_uses_documented_fallbacks() {
+        let slowest = native_mouse_repeat_timing_from_system_values(Some(0), Some(0));
+        assert_eq!(slowest.initial_delay, std::time::Duration::from_millis(250));
+        assert_eq!(slowest.interval, std::time::Duration::from_millis(400));
+
+        let fastest = native_mouse_repeat_timing_from_system_values(Some(3), Some(31));
+        assert_eq!(
+            fastest.initial_delay,
+            std::time::Duration::from_millis(1000)
+        );
+        assert_eq!(
+            fastest.interval,
+            std::time::Duration::from_secs_f64(1.0 / 30.0)
+        );
+        assert_eq!(
+            native_mouse_repeat_timing_from_system_values(Some(99), Some(99)),
+            fastest
+        );
+        assert_eq!(
+            native_mouse_repeat_timing_from_system_values(None, None),
+            native_mouse_repeat_timing_from_system_values(Some(1), Some(20))
+        );
+    }
+
+    #[test]
+    fn raw_xbutton_hold_generation_uses_the_committed_stale_floor() {
+        use crate::ring_shortcut::{MouseButtonSlot, RingActionId};
+        use crate::video::native_window::NativeVideoMouseButton;
+
+        let ctx = egui::Context::default();
+        let (mut app, idx, source_epoch, owner) = setup_mouse_hold_app();
+        set_video_mouse_action(
+            &mut app,
+            MouseButtonSlot::Back,
+            RingActionId::VideoSeekBackSmall,
+        );
+        assert_eq!(owner.window_generation, 1);
+        assert_eq!(app.native_video_committed_generation_for(idx), 0);
+
+        route_native_mouse_button(
+            &mut app,
+            &ctx,
+            idx,
+            source_epoch,
+            native_extra_mouse_event(90, owner, NativeVideoMouseButton::Extra1, true, false),
+        );
+        assert!(
+            app.native_video_mouse_seek_holds.back.is_some(),
+            "the initial generation 1 presenter is current above the committed floor 0"
+        );
+        app.native_video_mouse_seek_holds.clear();
+
+        app.bump_native_video_committed_generation(idx, 1);
+        route_native_mouse_button(
+            &mut app,
+            &ctx,
+            idx,
+            source_epoch,
+            native_extra_mouse_event(91, owner, NativeVideoMouseButton::Extra1, true, false),
+        );
+        assert!(
+            app.native_video_mouse_seek_holds.back.is_some(),
+            "the committed current generation remains valid"
+        );
+        app.native_video_mouse_seek_holds.clear();
+
+        app.bump_native_video_committed_generation(idx, 2);
+        route_native_mouse_button(
+            &mut app,
+            &ctx,
+            idx,
+            source_epoch,
+            native_extra_mouse_event(92, owner, NativeVideoMouseButton::Extra1, true, false),
+        );
+        assert!(
+            app.native_video_mouse_seek_holds.back.is_none(),
+            "an older generation is rejected even if Windows reuses the same HWND"
+        );
+    }
+
+    #[test]
+    fn all_six_video_seek_actions_arm_a_standard_raw_xbutton_hold() {
+        use crate::ring_shortcut::{MouseButtonSlot, RingActionId};
+        use crate::video::native_window::NativeVideoMouseButton;
+
+        let ctx = egui::Context::default();
+        let (mut app, idx, source_epoch, owner) = setup_mouse_hold_app();
+        let actions = [
+            RingActionId::VideoSeekBackSmall,
+            RingActionId::VideoSeekBackMedium,
+            RingActionId::VideoSeekBackLarge,
+            RingActionId::VideoSeekForwardSmall,
+            RingActionId::VideoSeekForwardMedium,
+            RingActionId::VideoSeekForwardLarge,
+        ];
+        for (offset, action) in actions.into_iter().enumerate() {
+            set_video_mouse_action(&mut app, MouseButtonSlot::Back, action.clone());
+            route_native_mouse_button(
+                &mut app,
+                &ctx,
+                idx,
+                source_epoch,
+                native_extra_mouse_event(
+                    100 + offset as u64,
+                    owner,
+                    NativeVideoMouseButton::Extra1,
+                    true,
+                    false,
+                ),
+            );
+            assert_eq!(
+                app.native_video_mouse_seek_holds
+                    .back
+                    .as_ref()
+                    .expect("seek action must arm the raw hold")
+                    .action,
+                action
+            );
+            assert!(app.native_video_mouse_seek_holds.clear());
+        }
+    }
+
+    #[test]
+    fn raw_xbutton_hold_validates_context_source_assignment_modal_and_parked_owners() {
+        use crate::ring_shortcut::{MouseButtonSlot, RingActionId};
+        use crate::video::native_window::NativeVideoMouseButton;
+
+        let ctx = egui::Context::default();
+        let (mut app, idx, source_epoch, owner) = setup_mouse_hold_app();
+        set_video_mouse_action(
+            &mut app,
+            MouseButtonSlot::Back,
+            RingActionId::VideoSeekBackSmall,
+        );
+        route_native_mouse_button(
+            &mut app,
+            &ctx,
+            idx,
+            source_epoch,
+            native_extra_mouse_event(120, owner, NativeVideoMouseButton::Extra1, true, false),
+        );
+        let hold = app
+            .native_video_mouse_seek_holds
+            .back
+            .as_ref()
+            .expect("valid raw hold")
+            .clone();
+        assert!(app.native_video_mouse_seek_hold_valid(&hold));
+
+        let mut wrong_context = hold.clone();
+        wrong_context.context_id = ViewerContextId::for_test(hold.context_id.serial() + 1000);
+        assert!(!app.native_video_mouse_seek_hold_valid(&wrong_context));
+
+        let mut wrong_fs = hold.clone();
+        wrong_fs.fs_idx += 1;
+        assert!(!app.native_video_mouse_seek_hold_valid(&wrong_fs));
+
+        let mut wrong_epoch = hold.clone();
+        wrong_epoch.source_epoch += 1;
+        assert!(!app.native_video_mouse_seek_hold_valid(&wrong_epoch));
+
+        set_video_mouse_action(&mut app, MouseButtonSlot::Back, RingActionId::VideoMute);
+        assert!(!app.native_video_mouse_seek_hold_valid(&hold));
+        set_video_mouse_action(
+            &mut app,
+            MouseButtonSlot::Back,
+            RingActionId::VideoSeekBackSmall,
+        );
+
+        if let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&idx) {
+            player.set_native_overlay_input_routing_for_test(
+                crate::video::native_presenter::NativeOverlayInputRouting {
+                    modal_dialog_active: true,
+                    ..Default::default()
+                },
+            );
+        }
+        assert!(!app.native_video_mouse_seek_hold_valid(&hold));
+        if let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&idx) {
+            player.set_native_overlay_input_routing_for_test(Default::default());
+        }
+
+        app.native_video_parked_live_input_window_id = Some(77);
+        assert!(!app.native_video_mouse_seek_hold_valid(&hold));
+    }
+
+    #[test]
+    fn raw_xbutton_hold_is_immediate_bounded_and_stops_on_lossless_up() {
+        use crate::ring_shortcut::{MouseButtonSlot, RingActionId};
+        use crate::video::native_window::NativeVideoMouseButton;
+
+        let ctx = egui::Context::default();
+        let (mut app, idx, source_epoch, owner) = setup_mouse_hold_app();
+        set_video_mouse_action(
+            &mut app,
+            MouseButtonSlot::Back,
+            RingActionId::VideoSeekBackSmall,
+        );
+
+        route_native_mouse_button(
+            &mut app,
+            &ctx,
+            idx,
+            source_epoch,
+            native_extra_mouse_event(10, owner, NativeVideoMouseButton::Extra1, true, false),
+        );
+        assert_eq!(
+            player_seek_base(&app, idx),
+            97.0,
+            "DOWN executes immediately once"
+        );
+        let first_due = app
+            .native_video_mouse_seek_holds
+            .back
+            .as_ref()
+            .expect("back hold armed")
+            .next_repeat_at;
+        let before_due = first_due - std::time::Duration::from_millis(1);
+        assert!(
+            app.tick_native_video_mouse_seek_holds(&ctx, before_due)
+                .is_some()
+        );
+        assert_eq!(player_seek_base(&app, idx), 97.0);
+
+        assert!(
+            app.tick_native_video_mouse_seek_holds(&ctx, first_due)
+                .is_some()
+        );
+        assert_eq!(player_seek_base(&app, idx), 94.0);
+        let hold = app
+            .native_video_mouse_seek_holds
+            .back
+            .as_ref()
+            .expect("hold remains armed after repeat");
+        let late = hold.next_repeat_at + hold.repeat_interval * 8;
+        assert!(app.tick_native_video_mouse_seek_holds(&ctx, late).is_some());
+        assert_eq!(
+            player_seek_base(&app, idx),
+            91.0,
+            "an overdue frame performs one repeat without catch-up burst"
+        );
+        assert!(
+            app.native_video_mouse_seek_holds
+                .back
+                .as_ref()
+                .expect("hold rescheduled")
+                .next_repeat_at
+                > late
+        );
+
+        route_native_mouse_button(
+            &mut app,
+            &ctx,
+            idx,
+            source_epoch,
+            native_extra_mouse_event(11, owner, NativeVideoMouseButton::Extra1, false, false),
+        );
+        assert!(app.native_video_mouse_seek_holds.back.is_none());
+        assert!(
+            app.tick_native_video_mouse_seek_holds(&ctx, late + std::time::Duration::from_secs(1))
+                .is_none()
+        );
+        assert_eq!(player_seek_base(&app, idx), 91.0);
+    }
+
+    #[test]
+    fn raw_xbutton_double_click_and_two_buttons_keep_independent_press_counts() {
+        use crate::ring_shortcut::{MouseButtonSlot, RingActionId};
+        use crate::video::native_window::NativeVideoMouseButton;
+
+        let ctx = egui::Context::default();
+        let (mut app, idx, source_epoch, owner) = setup_mouse_hold_app();
+        set_video_mouse_action(
+            &mut app,
+            MouseButtonSlot::Back,
+            RingActionId::VideoSeekBackSmall,
+        );
+        for event in [
+            native_extra_mouse_event(20, owner, NativeVideoMouseButton::Extra1, true, false),
+            native_extra_mouse_event(21, owner, NativeVideoMouseButton::Extra1, false, false),
+            native_extra_mouse_event(22, owner, NativeVideoMouseButton::Extra1, true, true),
+            native_extra_mouse_event(23, owner, NativeVideoMouseButton::Extra1, false, false),
+        ] {
+            route_native_mouse_button(&mut app, &ctx, idx, source_epoch, event);
+        }
+        assert_eq!(player_seek_base(&app, idx), 94.0);
+        assert!(app.native_video_mouse_seek_holds.back.is_none());
+        drop(app);
+
+        let (mut app, idx, source_epoch, owner) = setup_mouse_hold_app();
+        set_video_mouse_action(
+            &mut app,
+            MouseButtonSlot::Back,
+            RingActionId::VideoSeekBackSmall,
+        );
+        set_video_mouse_action(
+            &mut app,
+            MouseButtonSlot::Forward,
+            RingActionId::VideoSeekForwardLarge,
+        );
+        route_native_mouse_button(
+            &mut app,
+            &ctx,
+            idx,
+            source_epoch,
+            native_extra_mouse_event(24, owner, NativeVideoMouseButton::Extra1, true, false),
+        );
+        route_native_mouse_button(
+            &mut app,
+            &ctx,
+            idx,
+            source_epoch,
+            native_extra_mouse_event(25, owner, NativeVideoMouseButton::Extra2, true, false),
+        );
+        assert_eq!(player_seek_base(&app, idx), 140.0);
+        let due = app
+            .native_video_mouse_seek_holds
+            .back
+            .as_ref()
+            .unwrap()
+            .next_repeat_at
+            .max(
+                app.native_video_mouse_seek_holds
+                    .forward
+                    .as_ref()
+                    .unwrap()
+                    .next_repeat_at,
+            );
+        let _ = app.tick_native_video_mouse_seek_holds(&ctx, due);
+        assert_eq!(player_seek_base(&app, idx), 180.0);
+
+        route_native_mouse_button(
+            &mut app,
+            &ctx,
+            idx,
+            source_epoch,
+            native_extra_mouse_event(26, owner, NativeVideoMouseButton::Extra1, false, false),
+        );
+        assert!(app.native_video_mouse_seek_holds.back.is_none());
+        let forward_due = app
+            .native_video_mouse_seek_holds
+            .forward
+            .as_ref()
+            .expect("forward hold survives back release")
+            .next_repeat_at;
+        let _ = app.tick_native_video_mouse_seek_holds(&ctx, forward_due);
+        assert_eq!(player_seek_base(&app, idx), 223.0);
+        route_native_mouse_button(
+            &mut app,
+            &ctx,
+            idx,
+            source_epoch,
+            native_extra_mouse_event(27, owner, NativeVideoMouseButton::Extra2, false, false),
+        );
+        assert!(app.native_video_mouse_seek_holds.forward.is_none());
+    }
+
+    #[test]
+    fn raw_xbutton_hold_arms_only_seek_and_revalidates_owner_boundaries() {
+        use crate::ring_shortcut::{MouseButtonSlot, RingActionId};
+        use crate::video::native_window::NativeVideoMouseButton;
+
+        let ctx = egui::Context::default();
+        let (mut app, idx, source_epoch, owner) = setup_mouse_hold_app();
+        set_video_mouse_action(&mut app, MouseButtonSlot::Back, RingActionId::VideoMute);
+        route_native_mouse_button(
+            &mut app,
+            &ctx,
+            idx,
+            source_epoch,
+            native_extra_mouse_event(30, owner, NativeVideoMouseButton::Extra1, true, false),
+        );
+        assert!(
+            app.video_session_muted,
+            "non-seek action still executes once"
+        );
+        assert!(app.native_video_mouse_seek_holds.back.is_none());
+
+        set_video_mouse_action(
+            &mut app,
+            MouseButtonSlot::Back,
+            RingActionId::VideoSeekBackSmall,
+        );
+        route_native_mouse_button(
+            &mut app,
+            &ctx,
+            idx,
+            source_epoch,
+            native_extra_mouse_event(31, owner, NativeVideoMouseButton::Extra1, true, false),
+        );
+        assert!(app.native_video_mouse_seek_holds.back.is_some());
+        let wrong_owner = crate::video::native_window::NativeVideoMouseInputOwner {
+            receiver_hwnd: owner.receiver_hwnd + 1,
+            ..owner
+        };
+        route_native_mouse_button(
+            &mut app,
+            &ctx,
+            idx,
+            source_epoch,
+            native_extra_mouse_event(
+                32,
+                wrong_owner,
+                NativeVideoMouseButton::Extra1,
+                false,
+                false,
+            ),
+        );
+        assert!(
+            app.native_video_mouse_seek_holds.back.is_some(),
+            "a sibling HWND release cannot terminate this owner"
+        );
+
+        let due = app
+            .native_video_mouse_seek_holds
+            .back
+            .as_ref()
+            .unwrap()
+            .next_repeat_at;
+        if let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&idx) {
+            player.bump_native_committed_generation(owner.window_generation + 1);
+        }
+        let position = player_position(&app, idx);
+        assert!(app.tick_native_video_mouse_seek_holds(&ctx, due).is_none());
+        assert_eq!(player_position(&app, idx), position);
+        assert!(app.native_video_mouse_seek_holds.back.is_none());
+        drop(app);
+
+        let (mut audio_app, audio_idx, audio_epoch, audio_owner) = setup_mouse_hold_app();
+        set_video_mouse_action(
+            &mut audio_app,
+            MouseButtonSlot::Back,
+            RingActionId::VideoSeekBackSmall,
+        );
+        audio_app.video_audio_mode = Some(audio_idx);
+        route_native_mouse_button(
+            &mut audio_app,
+            &ctx,
+            audio_idx,
+            audio_epoch,
+            native_extra_mouse_event(33, audio_owner, NativeVideoMouseButton::Extra1, true, false),
+        );
+        assert!(audio_app.native_video_mouse_seek_holds.back.is_none());
     }
 
     #[test]
@@ -13576,7 +16908,7 @@ mod configurable_video_seek_dispatch_tests {
     }
 
     #[test]
-    fn physical_mouse_buttons_ignore_deferred_video_seek_but_keep_other_routes() {
+    fn physical_mouse_buttons_execute_configured_video_seek_and_keep_other_routes() {
         use crate::ring_shortcut::{MouseButtonSlot, RingActionId, RingShortcutContext};
 
         let ctx = egui::Context::default();
@@ -13624,21 +16956,23 @@ mod configurable_video_seek_dispatch_tests {
             }
             reset_seek_player(&mut app, idx);
 
-            let result = app.apply_mouse_button(
+            let result = app.dispatch_mouse_button(
                 &ctx,
                 slot,
                 crate::app::ActionSurface::Viewer,
-                "deferred-video-mouse-seek-test",
+                "video-mouse-seek-test",
             );
 
-            assert!(result.is_none());
+            assert!(result.navigation.is_none());
+            assert_eq!(result.dispatched_action.as_ref(), Some(&action));
             assert_eq!(
                 player_position(&app, idx),
-                100.0,
-                "physical {slot:?} must not execute {}",
+                ring_position,
+                "physical {slot:?} must execute configured {} exactly once",
                 action.as_str()
             );
 
+            reset_seek_player(&mut app, idx);
             let _ = app.apply_ring_action(
                 &ctx,
                 RingShortcutContext::VideoFullscreen,
@@ -13754,6 +17088,12 @@ mod configurable_video_seek_dispatch_tests {
 mod native_video_key_observation_tests {
     use super::*;
 
+    fn strip_player_with_audio_for_test(path: std::path::PathBuf) -> crate::video::VideoPlayer {
+        let mut player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(path);
+        player.set_opened_audio_stream_for_test(0, 0);
+        player
+    }
+
     fn diagnostic_record(
         seq: u64,
         repeat: bool,
@@ -13768,6 +17108,7 @@ mod native_video_key_observation_tests {
             foreground_hwnd: 0xA1,
             presenter_hwnd: 0xB2,
             key: crate::video::native_window::NativeVideoKeyEvent {
+                receipt: crate::mouse_seek_debug::test_receipt(1),
                 virtual_key: 0x5A,
                 scan_code: 0x2C,
                 extended: true,
@@ -13997,10 +17338,6 @@ mod native_video_key_observation_tests {
     #[test]
     fn folding_a_session_hands_the_wave_worker_over_instead_of_killing_it() {
         for (cause, handed_over) in [
-            (
-                crate::video::seek_strip::SeekStripCloseCause::HudHidden,
-                true,
-            ),
             (crate::video::seek_strip::SeekStripCloseCause::Toggle, true),
             (
                 crate::video::seek_strip::SeekStripCloseCause::FullscreenExit,
@@ -14014,8 +17351,12 @@ mod native_video_key_observation_tests {
             let mut app = crate::app::tests::phase_c_support::setup_app();
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join("clip.mp4");
-            let worker =
-                crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(path.clone(), None);
+            let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+                path.clone(),
+                Some(0),
+                Some(0),
+                None,
+            );
             let identity = worker.identity_for_test();
             app.video_seek_strip_runtime = VideoSeekStripRuntime::Open(Box::new(
                 VideoSeekStripSession::for_wave_holdover_test(path, worker),
@@ -14056,16 +17397,34 @@ mod native_video_key_observation_tests {
         let one = dir.path().join("one.mp4");
         let other = dir.path().join("other.mp4");
 
-        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(one.clone(), None);
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            one.clone(),
+            Some(0),
+            Some(0),
+            None,
+        );
         let held_identity = worker.identity_for_test();
         // 預けるときと同じ状態にしてから拾わせる。
         worker.set_background_paused(true);
         let mut holdover = Some(HeldSeekStripWaveWorker {
+            owner_fs_idx: 0,
             path: one.clone(),
+            audio_stream_index: Some(0),
+            source_epoch: 7,
+            items_generation: 11,
             worker,
         });
 
-        let reused = take_or_spawn_seek_strip_wave_worker(&mut holdover, &one, None);
+        let reused = take_or_spawn_seek_strip_wave_worker(
+            &mut holdover,
+            0,
+            &one,
+            Some(0),
+            Some(0),
+            7,
+            11,
+            None,
+        );
         assert_eq!(
             reused.identity_for_test(),
             held_identity,
@@ -14077,19 +17436,951 @@ mod native_video_key_observation_tests {
         );
         assert!(holdover.is_none(), "持ち越しは 1 本ぶんだけ");
 
-        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(one.clone(), None);
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            one.clone(),
+            Some(0),
+            Some(0),
+            None,
+        );
         let stale_identity = worker.identity_for_test();
         let mut holdover = Some(HeldSeekStripWaveWorker {
+            owner_fs_idx: 0,
             path: one.clone(),
+            audio_stream_index: Some(0),
+            source_epoch: 7,
+            items_generation: 11,
             worker,
         });
-        let fresh = take_or_spawn_seek_strip_wave_worker(&mut holdover, &other, None);
+        let fresh = take_or_spawn_seek_strip_wave_worker(
+            &mut holdover,
+            0,
+            &other,
+            Some(0),
+            Some(0),
+            7,
+            11,
+            None,
+        );
         assert_ne!(
             fresh.identity_for_test(),
             stale_identity,
             "別の動画に前のワーカーを使い回している"
         );
         assert!(holdover.is_none(), "別の動画のものを抱えたままになっている");
+
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            one.clone(),
+            Some(0),
+            Some(0),
+            None,
+        );
+        let stale_epoch_identity = worker.identity_for_test();
+        let mut holdover = Some(HeldSeekStripWaveWorker {
+            owner_fs_idx: 0,
+            path: one.clone(),
+            audio_stream_index: Some(0),
+            source_epoch: 7,
+            items_generation: 11,
+            worker,
+        });
+        let fresh_epoch = take_or_spawn_seek_strip_wave_worker(
+            &mut holdover,
+            0,
+            &one,
+            Some(0),
+            Some(0),
+            8,
+            11,
+            None,
+        );
+        assert_ne!(
+            fresh_epoch.identity_for_test(),
+            stale_epoch_identity,
+            "同じ path でも新しい source epoch に旧 worker を再利用している"
+        );
+
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            one.clone(),
+            Some(0),
+            Some(0),
+            None,
+        );
+        let old_track_worker = worker.identity_for_test();
+        let mut holdover = Some(HeldSeekStripWaveWorker {
+            owner_fs_idx: 0,
+            path: one.clone(),
+            audio_stream_index: Some(0),
+            source_epoch: 7,
+            items_generation: 11,
+            worker,
+        });
+        let other_track = take_or_spawn_seek_strip_wave_worker(
+            &mut holdover,
+            0,
+            &one,
+            Some(2),
+            Some(0),
+            7,
+            11,
+            None,
+        );
+        assert_ne!(other_track.identity_for_test(), old_track_worker);
+        assert!(holdover.is_none());
+    }
+
+    #[test]
+    fn closed_runtime_drops_a_held_worker_when_the_source_identity_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("clip.mp4");
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let generation = app.items_generation;
+        app.video_seek_strip_runtime = VideoSeekStripRuntime::Closed;
+        app.video_seek_strip_wave_holdover = Some(HeldSeekStripWaveWorker {
+            owner_fs_idx: 0,
+            path: path.clone(),
+            audio_stream_index: Some(0),
+            source_epoch: 7,
+            items_generation: generation,
+            worker: crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+                path.clone(),
+                Some(0),
+                Some(0),
+                None,
+            ),
+        });
+
+        assert!(held_seek_strip_wave_worker_matches_current(
+            app.video_seek_strip_wave_holdover.as_ref().unwrap(),
+            0,
+            Some(&path),
+            Some(0),
+            Some(7),
+            generation,
+        ));
+        assert!(!held_seek_strip_wave_worker_matches_current(
+            app.video_seek_strip_wave_holdover.as_ref().unwrap(),
+            0,
+            Some(&path),
+            Some(0),
+            Some(8),
+            generation,
+        ));
+
+        // The production sync calls this before inspecting whether a strip session is open.
+        app.discard_stale_video_seek_strip_wave_holdover(0, Some(&path), Some(0), Some(7));
+        assert!(
+            app.video_seek_strip_wave_holdover.is_some(),
+            "the exact source keeps the reusable worker"
+        );
+        app.discard_stale_video_seek_strip_wave_holdover(0, Some(&path), Some(0), Some(8));
+        assert!(app.video_seek_strip_wave_holdover.is_none());
+    }
+
+    #[test]
+    fn exact_snapshot_remap_moves_open_and_closed_strip_resources_without_cross_owner_reuse() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("clip.mp4");
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        app.items_generation = 12;
+        let load_seq = app.input_seq;
+        app.fs_cache.insert(
+            4,
+            crate::fs_animation::FsCacheEntry::Video {
+                player: Box::new(strip_player_with_audio_for_test(path.clone())),
+                load_seq,
+            },
+        );
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            path.clone(),
+            Some(0),
+            Some(0),
+            None,
+        );
+        let worker_id = worker.identity_for_test();
+        let mut session = VideoSeekStripSession::for_wave_holdover_test(path.clone(), worker);
+        session.owner_fs_idx = 2;
+        session.items_generation = 11;
+        session.source_epoch = 0;
+        app.video_seek_strip_runtime = VideoSeekStripRuntime::Open(Box::new(session));
+
+        app.remap_video_seek_strip_for_snapshot(
+            &std::collections::HashMap::from([(2, 4)]),
+            Some(&path),
+        );
+        let VideoSeekStripRuntime::Open(session) = &app.video_seek_strip_runtime else {
+            panic!("the exact snapshot survivor lost its strip session");
+        };
+        assert_eq!(session.owner_fs_idx, 4);
+        assert_eq!(session.items_generation, 12);
+        assert_eq!(
+            session.wave_worker.as_ref().unwrap().identity_for_test(),
+            worker_id
+        );
+
+        let held_worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            path.clone(),
+            Some(0),
+            Some(0),
+            None,
+        );
+        let held_id = held_worker.identity_for_test();
+        app.video_seek_strip_runtime = VideoSeekStripRuntime::Closed;
+        app.video_seek_strip_wave_holdover = Some(HeldSeekStripWaveWorker {
+            owner_fs_idx: 2,
+            path: path.clone(),
+            audio_stream_index: Some(0),
+            source_epoch: 0,
+            items_generation: 11,
+            worker: held_worker,
+        });
+        app.remap_video_seek_strip_for_snapshot(
+            &std::collections::HashMap::from([(2, 4)]),
+            Some(&path),
+        );
+        let held = app.video_seek_strip_wave_holdover.as_ref().unwrap();
+        assert_eq!(held.owner_fs_idx, 4);
+        assert_eq!(held.items_generation, 12);
+        assert_eq!(held.worker.identity_for_test(), held_id);
+
+        app.video_seek_strip_wave_holdover
+            .as_mut()
+            .unwrap()
+            .owner_fs_idx = 8;
+        app.remap_video_seek_strip_for_snapshot(
+            &std::collections::HashMap::from([(2, 4)]),
+            Some(&path),
+        );
+        assert!(
+            app.video_seek_strip_wave_holdover.is_none(),
+            "a sibling or missing SnapshotKey is terminal"
+        );
+    }
+
+    #[test]
+    fn unavailable_source_swap_output_preserves_the_open_strip_resource() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let from_path = dir.path().join("from.mp4");
+        let target_path = dir.path().join("target.mp4");
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        app.items.extend([
+            crate::app::GridItem::Video(from_path.clone()),
+            crate::app::GridItem::Video(target_path),
+        ]);
+        app.thumbnails.extend([
+            crate::app::ThumbnailState::Pending,
+            crate::app::ThumbnailState::Pending,
+        ]);
+        app.rebuild_visible_indices();
+        app.fullscreen_idx = Some(0);
+        let load_seq = app.input_seq;
+        app.fs_cache.insert(
+            0,
+            crate::fs_animation::FsCacheEntry::Video {
+                player: Box::new(
+                    crate::video::VideoPlayer::stream_ready_disconnected_for_test(
+                        from_path.clone(),
+                    ),
+                ),
+                load_seq,
+            },
+        );
+        let detached_output = match app.fs_cache.get_mut(&0) {
+            Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => player
+                .take_native_output()
+                .expect("fixture starts with an owned native output"),
+            _ => unreachable!(),
+        };
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            from_path.clone(),
+            Some(0),
+            Some(0),
+            None,
+        );
+        let worker_id = worker.identity_for_test();
+        let mut session = VideoSeekStripSession::for_wave_holdover_test(from_path, worker);
+        session.items_generation = app.items_generation;
+        session.source_epoch = 0;
+        app.video_seek_strip_runtime = VideoSeekStripRuntime::Open(Box::new(session));
+
+        let ctx = egui::Context::default();
+        assert!(
+            !app.defer_native_video_source_swap_until_decoder_free(
+                &ctx,
+                1,
+                None,
+                false,
+                false,
+                "test-unavailable",
+                crate::app::HistoryTrigger::UserChosen,
+            ),
+            "a swap that cannot take the source output must not begin"
+        );
+        let VideoSeekStripRuntime::Open(session) = &app.video_seek_strip_runtime else {
+            panic!("failed swap must preserve the open strip session");
+        };
+        assert_eq!(
+            session
+                .wave_worker
+                .as_ref()
+                .map(|worker| worker.identity_for_test()),
+            Some(worker_id)
+        );
+        assert!(
+            session
+                .wave_worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_cancelled_for_test())
+        );
+        assert!(app.video_seek_strip_wave_holdover.is_none());
+        assert!(app.native_video_source_swap_pending.is_none());
+        drop(detached_output);
+    }
+
+    #[test]
+    fn deferred_source_swap_retires_the_old_strip_only_after_output_is_available() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let from_path = dir.path().join("from.mp4");
+        let target_path = dir.path().join("target.mp4");
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        app.items.extend([
+            crate::app::GridItem::Video(from_path.clone()),
+            crate::app::GridItem::Video(target_path),
+        ]);
+        app.thumbnails.extend([
+            crate::app::ThumbnailState::Pending,
+            crate::app::ThumbnailState::Pending,
+        ]);
+        app.rebuild_visible_indices();
+        app.fullscreen_idx = Some(0);
+        let load_seq = app.input_seq;
+        app.fs_cache.insert(
+            0,
+            crate::fs_animation::FsCacheEntry::Video {
+                player: Box::new(
+                    crate::video::VideoPlayer::stream_ready_disconnected_for_test(
+                        from_path.clone(),
+                    ),
+                ),
+                load_seq,
+            },
+        );
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            from_path.clone(),
+            Some(0),
+            Some(0),
+            None,
+        );
+        let mut session = VideoSeekStripSession::for_wave_holdover_test(from_path, worker);
+        session.items_generation = app.items_generation;
+        session.source_epoch = 0;
+        let old_event_stamp = session.render_stamp().at_generation(1);
+        app.video_seek_strip_runtime = VideoSeekStripRuntime::Open(Box::new(session));
+
+        let ctx = egui::Context::default();
+        assert!(app.defer_native_video_source_swap_until_decoder_free(
+            &ctx,
+            1,
+            None,
+            false,
+            false,
+            "test",
+            crate::app::HistoryTrigger::UserChosen,
+        ));
+        assert!(matches!(
+            app.video_seek_strip_runtime,
+            VideoSeekStripRuntime::Closed
+        ));
+        assert!(app.video_seek_strip_wave_holdover.is_none());
+        assert!(app.native_video_source_swap_pending.is_some());
+        assert!(
+            !app.seek_strip_event_stamp_is_current(0, old_event_stamp, true),
+            "late RequestWindow from the terminal source must be rejected"
+        );
+        assert!(
+            !app.seek_strip_session_stamp_is_current(
+                0,
+                crate::video::seek_strip::SeekStripSessionEventStamp {
+                    session_id: old_event_stamp.session_id,
+                    generation: 1,
+                },
+                true,
+            ),
+            "late Visible from the terminal source must be rejected"
+        );
+
+        // Updating an already pending replacement cannot recreate an old-source strip.
+        assert!(app.defer_native_video_source_swap_until_decoder_free(
+            &ctx,
+            1,
+            None,
+            false,
+            false,
+            "test-update",
+            crate::app::HistoryTrigger::UserChosen,
+        ));
+        assert!(matches!(
+            app.video_seek_strip_runtime,
+            VideoSeekStripRuntime::Closed
+        ));
+
+        // Model deferred completion with a fresh player/resource session. The successor accepts
+        // its own first layout but cannot be confused with the old session even when a test
+        // output uses the same synthetic source epoch.
+        app.native_video_source_swap_pending = None;
+        let target_path = match app.items[1].clone() {
+            crate::app::GridItem::Video(path) => path,
+            _ => unreachable!(),
+        };
+        let load_seq = app.input_seq;
+        app.fs_cache.insert(
+            1,
+            crate::fs_animation::FsCacheEntry::Video {
+                player: Box::new(
+                    crate::video::VideoPlayer::stream_ready_disconnected_for_test(
+                        target_path.clone(),
+                    ),
+                ),
+                load_seq,
+            },
+        );
+        app.fullscreen_idx = Some(1);
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            target_path.clone(),
+            Some(0),
+            Some(0),
+            None,
+        );
+        let mut successor = VideoSeekStripSession::for_wave_holdover_test(target_path, worker);
+        successor.session_id = crate::video::seek_strip::SeekStripSessionId(2);
+        successor.owner_fs_idx = 1;
+        successor.items_generation = app.items_generation;
+        successor.source_epoch = 0;
+        successor.presentation = VideoSeekStripPresentationState::AwaitingFirstPresent;
+        let successor_stamp = successor.render_stamp().at_generation(1);
+        app.video_seek_strip_runtime = VideoSeekStripRuntime::Open(Box::new(successor));
+        assert!(app.seek_strip_event_stamp_is_current(1, successor_stamp, false));
+        assert!(!app.seek_strip_event_stamp_is_current(1, old_event_stamp, false));
+    }
+
+    #[test]
+    fn layout_revision_does_not_change_visible_or_suspended_activity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("clip.mp4");
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            path.clone(),
+            Some(0),
+            Some(0),
+            None,
+        );
+        let mut session = VideoSeekStripSession::for_wave_holdover_test(path, worker);
+
+        assert_eq!(
+            session.presentation,
+            VideoSeekStripPresentationState::Visible
+        );
+        session.advance_layout_revision();
+        assert_eq!(
+            session.layout_revision,
+            crate::video::seek_strip::SeekStripLayoutRevision(2)
+        );
+        assert_eq!(
+            session.presentation,
+            VideoSeekStripPresentationState::Visible
+        );
+
+        session.presentation = VideoSeekStripPresentationState::Suspended;
+        session.advance_layout_revision();
+        assert_eq!(
+            session.layout_revision,
+            crate::video::seek_strip::SeekStripLayoutRevision(3)
+        );
+        assert_eq!(
+            session.presentation,
+            VideoSeekStripPresentationState::Suspended
+        );
+        assert!(
+            session
+                .wave_worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_cancelled_for_test()),
+            "canonical layout changes keep the resource worker"
+        );
+    }
+
+    #[test]
+    fn hidden_presentation_retains_the_resource_and_first_layout_then_resumes_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("clip.mp4");
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        app.items.push(crate::app::GridItem::Video(path.clone()));
+        app.thumbnails.push(crate::app::ThumbnailState::Pending);
+        app.rebuild_visible_indices();
+        app.fullscreen_idx = Some(0);
+        let load_seq = app.input_seq;
+        app.fs_cache.insert(
+            0,
+            crate::fs_animation::FsCacheEntry::Video {
+                player: Box::new(strip_player_with_audio_for_test(path.clone())),
+                load_seq,
+            },
+        );
+        app.settings.video_seek_strip_state = crate::settings::VideoSeekStripState::Waveform;
+        app.settings.video_seek_strip_span = crate::video::seek_strip_layout::SeekStripSpan::Window;
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            path.clone(),
+            Some(0),
+            Some(0),
+            None,
+        );
+        let worker_id = worker.identity_for_test();
+        let mut session = VideoSeekStripSession::for_wave_holdover_test(path, worker);
+        session.items_generation = app.items_generation;
+        session.visible_count = 17;
+        session.axis = VideoSeekStripAxisState::Ready(std::sync::Arc::new(
+            crate::video::seek_strip::StripAxis::whole(session.duration_secs, 17)
+                .expect("seeded visible axis"),
+        ));
+        let first_render_stamp = session.render_stamp();
+        let first_event_stamp = first_render_stamp.at_generation(1);
+        let presentation_stamp = first_render_stamp.session_at_generation(1);
+        app.video_seek_strip_runtime = VideoSeekStripRuntime::Open(Box::new(session));
+        let ctx = egui::Context::default();
+
+        // Start from an already-presented waveform resource whose thumbnail worker has never been
+        // needed. Hiding the HUD retains that exact resource and canonical 17-cell geometry without
+        // spawning the missing worker.
+        app.handle_native_video_output_event(
+            &ctx,
+            0,
+            0,
+            crate::video::NativeVideoOutputEvent::SeekStripPresentation(
+                crate::video::seek_strip::SeekStripPresentationEvent::Hidden(presentation_stamp),
+            ),
+        );
+
+        let VideoSeekStripRuntime::Open(session) = &app.video_seek_strip_runtime else {
+            panic!("HUD hiding must not close the resource session");
+        };
+        assert_eq!(session.session_id, first_render_stamp.session_id);
+        assert_eq!(session.visible_count, 17);
+        assert_eq!(
+            session
+                .wave_worker
+                .as_ref()
+                .map(|worker| worker.identity_for_test()),
+            Some(worker_id)
+        );
+        assert!(
+            session
+                .wave_worker
+                .as_ref()
+                .is_some_and(|worker| worker.background_is_paused())
+        );
+        assert_eq!(
+            app.settings.video_seek_strip_state,
+            crate::settings::VideoSeekStripState::Waveform
+        );
+
+        assert!(app.set_video_seek_strip_view(
+            0,
+            crate::video::seek_strip_layout::SeekStripView::showing(
+                crate::settings::VideoSeekStripMode::Thumbnails,
+                crate::video::seek_strip_layout::SeekStripSpan::Whole,
+            ),
+        ));
+        let VideoSeekStripRuntime::Open(session) = &app.video_seek_strip_runtime else {
+            unreachable!();
+        };
+        assert_eq!(
+            session.presentation,
+            VideoSeekStripPresentationState::Suspended
+        );
+        assert!(session.thumbnail_worker.is_none());
+        assert_eq!(
+            session
+                .wave_worker
+                .as_ref()
+                .map(|worker| worker.identity_for_test()),
+            Some(worker_id)
+        );
+        assert!(matches!(
+            &session.axis,
+            VideoSeekStripAxisState::Ready(axis) if axis.cell_count() == 17
+        ));
+
+        // Presentation visibility is session-scoped, so the old-layout payload may reveal the
+        // same resource after canonical settings advanced its revision while hidden.
+        app.handle_native_video_output_event(
+            &ctx,
+            0,
+            0,
+            crate::video::NativeVideoOutputEvent::SeekStripPresentation(
+                crate::video::seek_strip::SeekStripPresentationEvent::Visible {
+                    stamp: presentation_stamp,
+                    window: Some(crate::video::seek_strip::SeekStripWindowEvent {
+                        center: crate::video::seek_strip::SeekStripCenter::Waveform {
+                            center_time_secs: 0.0,
+                        },
+                        visible_count: 99,
+                        pixel_width: 9_900,
+                        pixel_height: 999,
+                        stamp: first_event_stamp,
+                    }),
+                },
+            ),
+        );
+        let VideoSeekStripRuntime::Open(session) = &app.video_seek_strip_runtime else {
+            unreachable!();
+        };
+        assert_eq!(session.session_id, first_render_stamp.session_id);
+        assert_eq!(
+            session.presentation,
+            VideoSeekStripPresentationState::Visible
+        );
+        assert!(session.thumbnail_worker.is_some());
+        assert_eq!(session.visible_count, 17);
+        assert_eq!(
+            session
+                .wave_worker
+                .as_ref()
+                .map(|worker| worker.identity_for_test()),
+            Some(worker_id)
+        );
+        assert!(matches!(
+            &session.axis,
+            VideoSeekStripAxisState::Ready(axis) if axis.cell_count() == 17
+        ));
+
+        // The lifecycle stamp deliberately ignores layout revisions, but the embedded geometry
+        // does not. A current-layout present repairs the skipped stale geometry without reopening
+        // the session or replacing either worker.
+        let current_render_stamp = session.render_stamp();
+        let current_presentation_stamp = current_render_stamp.session_at_generation(1);
+        app.handle_native_video_output_event(
+            &ctx,
+            0,
+            0,
+            crate::video::NativeVideoOutputEvent::SeekStripPresentation(
+                crate::video::seek_strip::SeekStripPresentationEvent::Visible {
+                    stamp: current_presentation_stamp,
+                    window: Some(crate::video::seek_strip::SeekStripWindowEvent {
+                        center: crate::video::seek_strip::SeekStripCenter::Thumbnails {
+                            center_index: 8.5,
+                        },
+                        visible_count: 19,
+                        pixel_width: 1_900,
+                        pixel_height: 100,
+                        stamp: current_render_stamp.at_generation(1),
+                    }),
+                },
+            ),
+        );
+        let VideoSeekStripRuntime::Open(session) = &app.video_seek_strip_runtime else {
+            unreachable!();
+        };
+        assert_eq!(session.session_id, first_render_stamp.session_id);
+        assert_eq!(session.visible_count, 19);
+        assert_eq!(
+            session
+                .wave_worker
+                .as_ref()
+                .map(|worker| worker.identity_for_test()),
+            Some(worker_id)
+        );
+        assert!(matches!(
+            &session.axis,
+            VideoSeekStripAxisState::Ready(axis) if axis.cell_count() == 19
+        ));
+    }
+
+    #[test]
+    fn suspended_whole_strip_applies_compound_visible_geometry_before_requesting_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("whole.mp4");
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        app.items.push(crate::app::GridItem::Video(path.clone()));
+        app.thumbnails.push(crate::app::ThumbnailState::Pending);
+        app.rebuild_visible_indices();
+        app.fullscreen_idx = Some(0);
+        app.settings.video_seek_strip_state = crate::settings::VideoSeekStripState::Thumbnails;
+        app.settings.video_seek_strip_span = crate::video::seek_strip_layout::SeekStripSpan::Whole;
+        let load_seq = app.input_seq;
+        app.fs_cache.insert(
+            0,
+            crate::fs_animation::FsCacheEntry::Video {
+                player: Box::new(strip_player_with_audio_for_test(path.clone())),
+                load_seq,
+            },
+        );
+
+        let disposable_wave = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            path.clone(),
+            Some(0),
+            Some(0),
+            None,
+        );
+        let mut session =
+            VideoSeekStripSession::for_wave_holdover_test(path.clone(), disposable_wave);
+        session.wave_worker = None;
+        session.items_generation = app.items_generation;
+        session.span = crate::video::seek_strip_layout::SeekStripSpan::Whole;
+        session.center =
+            crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index: 4.5 };
+        session.axis = VideoSeekStripAxisState::Ready(std::sync::Arc::new(
+            crate::video::seek_strip::StripAxis::whole(session.duration_secs, 9)
+                .expect("nine-cell fallback axis"),
+        ));
+        session.thumbnail_worker = Some(
+            crate::video::seek_strip_thumbs::SeekStripThumbnailWorker::spawn(
+                path,
+                false,
+                None,
+                session.duration_secs,
+                session.min_interval_secs,
+                crate::ui_video_tile::pick_interval(session.duration_secs, 240),
+            ),
+        );
+        App::request_video_seek_strip_window(
+            &mut session,
+            StripThumbnailRequestTrigger::WindowRecalculated,
+        );
+        assert_eq!(session.last_sent_thumbnail_request_id, Some(1));
+        session.presentation = VideoSeekStripPresentationState::Suspended;
+        let render_stamp = session.render_stamp();
+        let presentation_stamp = render_stamp.session_at_generation(1);
+        app.video_seek_strip_runtime = VideoSeekStripRuntime::Open(Box::new(session));
+
+        let wrong_session = crate::video::seek_strip::SeekStripSessionEventStamp {
+            session_id: crate::video::seek_strip::SeekStripSessionId(
+                presentation_stamp.session_id.0 + 1,
+            ),
+            generation: presentation_stamp.generation,
+        };
+        app.handle_native_video_output_event(
+            &egui::Context::default(),
+            0,
+            0,
+            crate::video::NativeVideoOutputEvent::SeekStripPresentation(
+                crate::video::seek_strip::SeekStripPresentationEvent::Visible {
+                    stamp: wrong_session,
+                    window: None,
+                },
+            ),
+        );
+        assert!(matches!(
+            &app.video_seek_strip_runtime,
+            VideoSeekStripRuntime::Open(session)
+                if session.presentation == VideoSeekStripPresentationState::Suspended
+                    && session.visible_count == 9
+                    && session.last_sent_thumbnail_request_id == Some(1)
+        ));
+
+        app.handle_native_video_output_event(
+            &egui::Context::default(),
+            0,
+            0,
+            crate::video::NativeVideoOutputEvent::SeekStripPresentation(
+                crate::video::seek_strip::SeekStripPresentationEvent::Visible {
+                    stamp: presentation_stamp,
+                    window: Some(crate::video::seek_strip::SeekStripWindowEvent {
+                        center: crate::video::seek_strip::SeekStripCenter::Thumbnails {
+                            center_index: 4.5,
+                        },
+                        visible_count: 17,
+                        pixel_width: 1_700,
+                        pixel_height: 100,
+                        stamp: render_stamp.at_generation(1),
+                    }),
+                },
+            ),
+        );
+
+        let VideoSeekStripRuntime::Open(session) = &app.video_seek_strip_runtime else {
+            panic!("compound Visible must keep the resource session open");
+        };
+        assert_eq!(
+            session.presentation,
+            VideoSeekStripPresentationState::Visible
+        );
+        assert_eq!(session.visible_count, 17);
+        assert!(matches!(
+            &session.axis,
+            VideoSeekStripAxisState::Ready(axis) if axis.cell_count() == 17
+        ));
+        assert!(matches!(
+            session.center,
+            crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index }
+                if center_index.to_bits() == 8.5f64.to_bits()
+        ));
+        assert_eq!(session.last_sent_thumbnail_request_id, Some(2));
+        #[cfg(feature = "test-script")]
+        {
+            let diagnostic = app.video_seek_strip_runtime.test_script_snapshot();
+            assert_eq!(diagnostic.state, "visible");
+            assert_eq!(diagnostic.session_id, Some(presentation_stamp.session_id.0));
+            assert_eq!(diagnostic.source_epoch, Some(0));
+            assert_eq!(diagnostic.receipt_source_epoch, Some(0));
+            assert_eq!(
+                diagnostic.receipt_session_id,
+                Some(presentation_stamp.session_id.0)
+            );
+            assert_eq!(diagnostic.receipt_generation, Some(1));
+            assert_eq!(
+                diagnostic.receipt_layout_revision,
+                Some(render_stamp.layout_revision.0)
+            );
+            assert_eq!(diagnostic.receipt_reported_count, Some(17));
+            assert!(diagnostic.receipt_visible);
+            assert!(diagnostic.receipt_window_applied);
+            assert_eq!(diagnostic.visible_count, Some(17));
+            assert_eq!(diagnostic.axis_cell_count, Some(17));
+            assert_eq!(diagnostic.last_sent_request_id, Some(2));
+            assert!(diagnostic.worker_instance_id.is_some_and(|id| id != 0));
+        }
+    }
+
+    #[test]
+    fn native_config_events_require_the_current_layout_or_an_exact_closed_generation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("clip.mp4");
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        app.items.push(crate::app::GridItem::Video(path.clone()));
+        app.thumbnails.push(crate::app::ThumbnailState::Pending);
+        app.rebuild_visible_indices();
+        let fs_idx = 0;
+        app.fullscreen_idx = Some(fs_idx);
+        let load_seq = app.input_seq;
+        app.fs_cache.insert(
+            fs_idx,
+            crate::fs_animation::FsCacheEntry::Video {
+                player: Box::new(strip_player_with_audio_for_test(path.clone())),
+                load_seq,
+            },
+        );
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            path.clone(),
+            Some(0),
+            Some(0),
+            None,
+        );
+        let mut session = VideoSeekStripSession::for_wave_holdover_test(path, worker);
+        session.owner_fs_idx = fs_idx;
+        session.items_generation = app.items_generation;
+        session.source_epoch = 0;
+        let old = session.render_stamp().at_generation(1);
+        app.video_seek_strip_runtime = VideoSeekStripRuntime::Open(Box::new(session));
+
+        assert!(app.seek_strip_expected_session_is_current(fs_idx, 1, Some(old)));
+        let VideoSeekStripRuntime::Open(session) = &mut app.video_seek_strip_runtime else {
+            unreachable!();
+        };
+        session.advance_layout_revision();
+        let current = session.render_stamp().at_generation(1);
+        assert!(
+            !app.seek_strip_expected_session_is_current(fs_idx, 1, Some(old)),
+            "a menu/config command from the old native layout cannot overwrite canonical App settings"
+        );
+        assert!(app.seek_strip_expected_session_is_current(fs_idx, 1, Some(current)));
+        assert!(
+            !app.seek_strip_event_stamp_is_current(fs_idx, old, false),
+            "a range step from the old native layout cannot modify the new mode/range"
+        );
+        assert!(app.seek_strip_event_stamp_is_current(fs_idx, current, false));
+
+        let VideoSeekStripRuntime::Open(session) = &mut app.video_seek_strip_runtime else {
+            unreachable!();
+        };
+        session.presentation = VideoSeekStripPresentationState::Suspended;
+        assert!(
+            !app.seek_strip_expected_session_is_current(fs_idx, 1, Some(current)),
+            "hidden native chrome cannot mutate canonical settings"
+        );
+
+        app.video_seek_strip_runtime = VideoSeekStripRuntime::Closed;
+        assert!(app.seek_strip_expected_session_is_current(fs_idx, 1, None));
+        assert!(!app.seek_strip_expected_session_is_current(fs_idx, 2, None));
+        assert!(!app.seek_strip_expected_session_is_current(fs_idx, 1, Some(current)));
+    }
+
+    #[test]
+    fn same_native_batch_applies_every_range_step_after_one_exact_layout_check() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("clip.mp4");
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        app.items.push(crate::app::GridItem::Video(path.clone()));
+        app.thumbnails.push(crate::app::ThumbnailState::Pending);
+        app.rebuild_visible_indices();
+        let fs_idx = 0;
+        app.fullscreen_idx = Some(fs_idx);
+        let load_seq = app.input_seq;
+        app.fs_cache.insert(
+            fs_idx,
+            crate::fs_animation::FsCacheEntry::Video {
+                player: Box::new(strip_player_with_audio_for_test(path.clone())),
+                load_seq,
+            },
+        );
+        app.settings.video_seek_strip_state = crate::settings::VideoSeekStripState::Waveform;
+        app.settings.video_seek_strip_span = crate::video::seek_strip_layout::SeekStripSpan::Window;
+        app.settings.video_seek_strip_waveform_span_secs = 30.0;
+        let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            path.clone(),
+            Some(0),
+            Some(0),
+            None,
+        );
+        let mut session = VideoSeekStripSession::for_wave_holdover_test(path, worker);
+        session.owner_fs_idx = fs_idx;
+        session.items_generation = app.items_generation;
+        session.source_epoch = 0;
+        session.waveform_span_secs = 30.0;
+        let initial_revision = session.layout_revision;
+        let stamp = session.render_stamp().at_generation(1);
+        app.video_seek_strip_runtime = VideoSeekStripRuntime::Open(Box::new(session));
+
+        let steps = vec![
+            crate::video::seek_strip::SeekStripRangeStep::Narrower,
+            crate::video::seek_strip::SeekStripRangeStep::Narrower,
+        ];
+        let expected = steps.iter().copied().fold(30.0, |value, step| {
+            crate::video::seek_strip::step_seek_strip_range(
+                crate::settings::VideoSeekStripMode::Waveform,
+                value,
+                step,
+            )
+            .unwrap_or(value)
+        });
+        let ctx = egui::Context::default();
+        app.handle_native_video_output_event(
+            &ctx,
+            fs_idx,
+            0,
+            crate::video::NativeVideoOutputEvent::StepSeekStripRange {
+                steps: steps.clone(),
+                stamp,
+            },
+        );
+        assert_eq!(
+            app.settings.video_seek_strip_waveform_span_secs.to_bits(),
+            expected.to_bits(),
+            "both ordered wheel edges must be applied"
+        );
+        let VideoSeekStripRuntime::Open(session) = &app.video_seek_strip_runtime else {
+            panic!("session closed");
+        };
+        assert_eq!(session.layout_revision.0, initial_revision.0 + 1);
+
+        app.handle_native_video_output_event(
+            &ctx,
+            fs_idx,
+            0,
+            crate::video::NativeVideoOutputEvent::StepSeekStripRange { steps, stamp },
+        );
+        assert_eq!(
+            app.settings.video_seek_strip_waveform_span_secs.to_bits(),
+            expected.to_bits(),
+            "the old-layout batch must not be replayed after revision advance"
+        );
     }
 
     /// 一時停止は worker loop が読むのと**同じ場所**へ書く。
@@ -14103,6 +18394,8 @@ mod native_video_key_observation_tests {
         // 開けないパスでよい。ここで確かめたいのは旗の所在であって解析結果ではない。
         let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
             dir.path().join("none.mp4"),
+            Some(0),
+            Some(0),
             None,
         );
         assert!(!worker.background_is_paused(), "作った直後は動いている");
@@ -14247,7 +18540,7 @@ mod native_video_key_observation_tests {
 mod seek_strip_range_persist_audit {
     /// ホイールでレンジを変える関数は保存しない。書くのはセッションを閉じる 1 箇所だけ。
     ///
-    /// 欠陥は「1 ノッチ = 1 コマンド」なのに毎回 `Settings::save` を呼んでいたことで、
+    /// 欠陥はwheel batchの各ノッチ適用時に毎回 `Settings::save` を呼んでいたことで、
     /// 実測は既定設定 1.3ms / VST3 プラグイン状態 1MB を持つ環境で 17ms (= 1 フレーム超)。
     /// 保存 1 回分のコストを測るテストは環境で揺れるので、**どの関数の中で保存するか**を
     /// 見る (2026-08-29 レビュー R-06)。
@@ -14284,7 +18577,7 @@ mod seek_strip_range_persist_audit {
                 continue;
             }
             match current_fn {
-                "step_video_seek_strip_range" => {
+                "step_video_seek_strip_ranges" => {
                     if line.contains(save_call) {
                         wheel_saves.push(lineno + 1);
                     }

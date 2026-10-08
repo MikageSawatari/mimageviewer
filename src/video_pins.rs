@@ -34,6 +34,15 @@
 //! チェーン (pin > sidecar > shell) のコード上の意図を明示する。
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_VIDEO_PIN_DB_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VideoPinMutationStamp {
+    instance: u64,
+    revision: u64,
+}
 
 /// ピン留め情報 1 件分。
 #[derive(Clone, Debug)]
@@ -78,6 +87,8 @@ impl VideoPinMeta {
 pub struct VideoPinDb {
     #[allow(dead_code)]
     conn: rusqlite::Connection,
+    instance: u64,
+    mutation_revision: AtomicU64,
 }
 
 impl VideoPinDb {
@@ -105,7 +116,7 @@ impl VideoPinDb {
         // 無しで先に作られた行があるかもしれない) に備えて `ALTER TABLE ADD COLUMN`
         // も冪等に流す。失敗 (= 既に存在) は無視。リリース後は CREATE 一発で済む。
         let _ = conn.execute("ALTER TABLE video_pins ADD COLUMN thumb_pts_secs REAL", []);
-        Ok(Self { conn })
+        Ok(Self::from_connection(conn))
     }
 
     /// 起動時に schema 初期化済みの DB を一覧準備 worker から読み取り専用で開く。
@@ -117,7 +128,22 @@ impl VideoPinDb {
                 | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         conn.busy_timeout(std::time::Duration::from_millis(750))?;
-        Ok(Self { conn })
+        Ok(Self::from_connection(conn))
+    }
+
+    fn from_connection(conn: rusqlite::Connection) -> Self {
+        Self {
+            conn,
+            instance: NEXT_VIDEO_PIN_DB_INSTANCE.fetch_add(1, Ordering::Relaxed),
+            mutation_revision: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn mutation_stamp(&self) -> VideoPinMutationStamp {
+        VideoPinMutationStamp {
+            instance: self.instance,
+            revision: self.mutation_revision.load(Ordering::Acquire),
+        }
     }
 
     /// DB ファイルのパス
@@ -304,6 +330,7 @@ impl VideoPinDb {
                 END",
             rusqlite::params![key, pin_pts_secs, blob, thumb_pts_for_set],
         )?;
+        self.mutation_revision.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -313,6 +340,7 @@ impl VideoPinDb {
         let key = crate::path_key::normalize_keep_drive(video_path);
         self.conn
             .execute("DELETE FROM video_pins WHERE path = ?1", [&key])?;
+        self.mutation_revision.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 }
@@ -334,7 +362,32 @@ mod tests {
             )",
         )
         .expect("schema");
-        VideoPinDb { conn }
+        VideoPinDb::from_connection(conn)
+    }
+
+    #[test]
+    fn mutation_stamp_is_db_instance_scoped_and_advances_only_after_success() {
+        let first = open_in_memory();
+        let second = open_in_memory();
+        let before = first.mutation_stamp();
+        let unrelated = second.mutation_stamp();
+        assert_ne!(before, unrelated);
+        first
+            .set_pin(Path::new("C:/one.mp4"), 1.0, b"webp")
+            .unwrap();
+        assert_ne!(first.mutation_stamp(), before);
+        assert_eq!(second.mutation_stamp(), unrelated);
+        let set_stamp = first.mutation_stamp();
+        first.remove(Path::new("C:/one.mp4")).unwrap();
+        assert_ne!(first.mutation_stamp(), set_stamp);
+        first.conn.execute_batch("DROP TABLE video_pins").unwrap();
+        let failed_stamp = first.mutation_stamp();
+        assert!(
+            first
+                .set_pin(Path::new("C:/one.mp4"), 1.0, b"webp")
+                .is_err()
+        );
+        assert_eq!(first.mutation_stamp(), failed_stamp);
     }
 
     #[test]

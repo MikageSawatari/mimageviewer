@@ -10,7 +10,7 @@
 //! 引数で必要な情報をすべて受け取る純粋な関数として設計されている。
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 
 // -----------------------------------------------------------------------
@@ -33,6 +33,27 @@ pub fn worker_priority_key(
         (1, idx - vis_end + 1, 0)
     } else {
         (1, vis.saturating_sub(idx), 1)
+    }
+}
+
+/// Catalog work has no grid index and runs after visible and prefetch thumbnails.
+pub(crate) fn request_worker_priority_key(
+    req: &LoadRequest,
+    vis: usize,
+    vis_end: usize,
+) -> (usize, usize, usize) {
+    req.grid_index().map_or((2, 0, 0), |idx| {
+        worker_priority_key(req.priority, idx, vis, vis_end)
+    })
+}
+
+impl LoadRequest {
+    /// The source variant owns this distinction; idx is unused for catalog work.
+    pub(crate) fn grid_index(&self) -> Option<usize> {
+        match self.raw_source {
+            LoadRequestSource::AudioArtPrune { .. } => None,
+            _ => Some(self.idx),
+        }
     }
 }
 
@@ -79,7 +100,7 @@ pub const CACHE_KEY_FOLDER: &str = "folderthumb:";
 /// cache key に含めることで、番号順などの選定ロジックを変えたときだけ古い代表
 /// サムネを避けて再スキャンする。フォルダ内容の変更を毎回検査する目的ではない。
 /// 旧 `folderthumb:{dirname}` 形式を v1 相当とみなし、明示版は v2 から始める。
-pub const FOLDER_THUMB_AUTO_ALGO_VERSION: u32 = 2;
+pub const FOLDER_THUMB_AUTO_ALGO_VERSION: u32 = 3;
 
 /// 親コンテナ (フォルダ / ZIP / PDF) に手動ピンが付いているときに、cache key の
 /// 後ろに `#pin:` 区切りで pin の identity を埋め込む (docs/virtual-folders.md §3.1)。
@@ -110,8 +131,33 @@ pub enum ResolveStrategy {
 /// Drive-list thumbnails are cache-only: the UI thread checks the local pin DB
 /// and asks the worker to use an already-cataloged pinned thumbnail. Missing
 /// cache falls back to the fixed drive icon instead of touching the drive.
+#[derive(Clone)]
 pub struct PinnedOnlyRequest {
     pub cache_key_prefix: String,
+    pub seed_proof: Option<DriveListSeedProof>,
+    /// The typed root pin. Child pin lookups run in this worker.
+    pub source: crate::folder_thumb_pins::FolderPinSource,
+}
+
+#[derive(Clone)]
+pub enum DriveListSeedProof {
+    /// The parent catalog proof or direct root pin names an EPUB page.
+    EpubPath(std::path::PathBuf),
+}
+
+/// One key builder for folder-pin writes and cache-only child reads. The
+/// generation suffix is added only after the EPUB target has been resolved.
+pub(crate) fn pinned_folder_row_key(
+    base_key: &str,
+    source_id: &str,
+    generation: Option<(i64, i64)>,
+) -> String {
+    let key = format!("{base_key}{CACHE_KEY_PIN_SUFFIX}{source_id}");
+    generation.map_or(key.clone(), |pair| pin_key_with_generation(&key, pair))
+}
+
+fn pin_key_with_generation(key: &str, (mtime, size): (i64, i64)) -> String {
+    format!("{key}|generation:{mtime}:{size}")
 }
 /// Ctrl+G アグリゲートビューの「代表サムネ」用キャッシュキープレフィックス (v0.8.1)。
 /// filename 単体だと別コンテナ同士の同名画像 (例: `cover.jpg`) でキャッシュ衝突し、
@@ -158,15 +204,38 @@ pub fn folder_thumb_auto_cache_key(
     sort: crate::settings::SortOrder,
     depth: u32,
 ) -> String {
+    folder_thumb_cache_key(
+        identity,
+        sort,
+        depth,
+        crate::catalog::FolderThumbProvenance::AutoSelected,
+    )
+}
+
+pub fn folder_thumb_cache_key(
+    identity: &str,
+    sort: crate::settings::SortOrder,
+    depth: u32,
+    provenance: crate::catalog::FolderThumbProvenance,
+) -> String {
+    let sort = sort.sanitized_for_folder_thumb();
     let sort_token = match sort {
         crate::settings::SortOrder::FileName => "name",
         crate::settings::SortOrder::Numeric => "numeric",
         crate::settings::SortOrder::DateAsc => "date-asc",
         crate::settings::SortOrder::DateDesc => "date-desc",
+        crate::settings::SortOrder::FileNameDesc
+        | crate::settings::SortOrder::NumericDesc
+        | crate::settings::SortOrder::SizeAsc
+        | crate::settings::SortOrder::SizeDesc
+        | crate::settings::SortOrder::RatingAsc
+        | crate::settings::SortOrder::RatingDesc => "name",
     };
-    format!(
-        "{CACHE_KEY_FOLDER}auto-v{FOLDER_THUMB_AUTO_ALGO_VERSION}:{sort_token}:d{depth}:{identity}"
-    )
+    let version = match provenance {
+        crate::catalog::FolderThumbProvenance::AutoSelected => FOLDER_THUMB_AUTO_ALGO_VERSION,
+        crate::catalog::FolderThumbProvenance::Seeded => 2,
+    };
+    format!("{CACHE_KEY_FOLDER}auto-v{version}:{sort_token}:d{depth}:{identity}")
 }
 
 /// Folder item の自動代表 cache key を、通常一覧と再帰 cache-only 参照で同じ規則から作る。
@@ -180,12 +249,28 @@ pub fn folder_thumb_auto_cache_key_for_path(
     sort: crate::settings::SortOrder,
     depth: u32,
 ) -> Option<String> {
+    folder_thumb_cache_key_for_path(
+        path,
+        use_full_path,
+        sort,
+        depth,
+        crate::catalog::FolderThumbProvenance::AutoSelected,
+    )
+}
+
+pub fn folder_thumb_cache_key_for_path(
+    path: &Path,
+    use_full_path: bool,
+    sort: crate::settings::SortOrder,
+    depth: u32,
+    provenance: crate::catalog::FolderThumbProvenance,
+) -> Option<String> {
     let identity = if use_full_path {
         path.to_string_lossy().into_owned()
     } else {
         path.file_name().and_then(|name| name.to_str())?.to_owned()
     };
-    Some(folder_thumb_auto_cache_key(&identity, sort, depth))
+    Some(folder_thumb_cache_key(&identity, sort, depth, provenance))
 }
 
 // -----------------------------------------------------------------------
@@ -215,54 +300,149 @@ pub enum ThumbLoadOrigin {
     /// 編集 preview、drive-list、再帰 pin 伝播など、WebP 自体を完成ソースとして扱う画像。
     /// `from_cache()` は true を返すが、idle quality-upgrade へ再投入しない。
     FinalCache,
+    /// Drive-list child row shown while its current writer key is checked.
+    /// The request remains pending until validation finishes.
+    DriveListChildSeed,
+    /// No current child row exists; discard a provisional seed and show the drive icon.
+    DriveListChildMiss,
+    /// 永続 edit-preview cache から読んだ完成画像。`epoch` は DB row read の直前に
+    /// snapshot し、whole-cache clear 後に遅着した結果を UI 側で破棄する。
+    EditPreviewCache { epoch: u64 },
 }
 
 impl ThumbLoadOrigin {
     pub fn from_cache(self) -> bool {
-        matches!(self, Self::UpgradeableCache | Self::FinalCache)
+        matches!(
+            self,
+            Self::UpgradeableCache
+                | Self::FinalCache
+                | Self::DriveListChildSeed
+                | Self::EditPreviewCache { .. }
+        )
     }
 
     pub fn blocks_idle_upgrade(self) -> bool {
-        matches!(self, Self::SourceIntrinsic | Self::FinalCache)
+        matches!(
+            self,
+            Self::SourceIntrinsic
+                | Self::FinalCache
+                | Self::DriveListChildSeed
+                | Self::DriveListChildMiss
+                | Self::EditPreviewCache { .. }
+        )
+    }
+
+    /// Whether a thumbnail result may still be installed after an edit-preview whole-cache clear.
+    /// Other origins are independent of that cache generation.
+    pub fn matches_edit_preview_epoch(self, current: Option<u64>) -> bool {
+        match self {
+            Self::EditPreviewCache { epoch } => current == Some(epoch),
+            _ => true,
+        }
+    }
+
+    pub fn edit_preview_epoch(self) -> Option<u64> {
+        match self {
+            Self::EditPreviewCache { epoch } => Some(epoch),
+            _ => None,
+        }
     }
 }
 
-/// サムネイル読み込み結果メッセージ。
-///
-/// ワーカースレッドが UI スレッドに送る。フィールドを位置に頼らず名前で判別できる
-/// ように struct で保持している。
+/// One terminal/result owner; correlation stays outside the mutually exclusive payload.
 pub struct ThumbMsg {
     pub idx: usize,
-    /// デコード成功時のピクセル。キャンセル / 失敗時は None。
-    pub image: Option<egui::ColorImage>,
-    /// 元ソース / 高画質化可能 cache / 完成済み派生 cache の区別。
-    pub origin: ThumbLoadOrigin,
-    /// true: 非破壊編集結果のプレビューキャッシュから復元。
-    pub from_edit_preview: bool,
-    /// `from_edit_preview` のとき、色調補正を下地だけへ掛けてから注釈を戻すためのデータ。
-    pub edit_preview_adjustment: Option<ThumbEditPreviewAdjustment>,
-    /// 元画像のピクセル寸法 (幅, 高さ)。取得できなかった場合は None。
-    pub source_dims: Option<(u32, u32)>,
-    /// PDF page box の 1/1000 point 寸法。raster と独立したレイアウト専用値。
-    pub layout_dims: Option<(u32, u32)>,
-    /// ワーカーがロードを中断した場合 true (STALE: keep_range 外になった等)。
-    /// `image` は必ず `None`。UI 側は `thumbnails[idx]` を `Evicted` に戻し、
-    /// `requested` からも削除して **再試行可能** な状態にする (`Failed` にはしない)。
-    pub canceled: bool,
-    /// **第2シグナル**: デコード成功後にキャッシュ保存判定 (or 保存スキップ) が完了して
-    /// `requested` から idx を抜くだけの通知 (`canceled` と排他、両方 true にはしない)。
-    /// UI 側は `requested.remove(&idx)` のみ行い、**`thumbnails[idx]` の状態は変更しない**。
-    ///
-    /// 理由: 第1シグナル (image=Some) が `texture_backlog` に積まれて Pending のまま
-    /// アップロード待ちになっているケースで、第2シグナルが Pending を Evicted に
-    /// 書き換えると、次フレームに同じセルが再エンキュー → 重複デコード地獄になる。
-    pub finalized: bool,
-    /// エンキュー時の `LoadRequest::input_seq` を透過する。perf ログで enqueue /
-    /// decode / ready を相関付けるのに使う。計装無効時や未設定時は 0。
     pub input_seq: u64,
-    /// エンキュー時の `LoadRequest::items_gen` を透過する。UI 側は自分の
-    /// `items_generation` と一致しないメッセージを破棄する (世代分離)。
     pub items_gen: u64,
+    pub payload: ThumbMsgPayload,
+}
+
+pub enum ThumbMsgPayload {
+    Pixels(ThumbPixels),
+    NoArt,
+    Failed {
+        origin: ThumbLoadOrigin,
+    },
+    Canceled,
+    /// Source pixels were already sent; cache-save admission is now complete.
+    Finalized,
+}
+
+pub struct ThumbPixels {
+    pub image: egui::ColorImage,
+    pub origin: ThumbLoadOrigin,
+    pub from_edit_preview: bool,
+    pub edit_preview_adjustment: Option<ThumbEditPreviewAdjustment>,
+    pub source_dims: Option<(u32, u32)>,
+    pub layout_dims: Option<(u32, u32)>,
+}
+
+impl ThumbMsg {
+    /// Migration boundary for existing producers; invalid combinations never enter a queue.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_legacy_parts(
+        idx: usize,
+        image: Option<egui::ColorImage>,
+        origin: ThumbLoadOrigin,
+        from_edit_preview: bool,
+        edit_preview_adjustment: Option<ThumbEditPreviewAdjustment>,
+        source_dims: Option<(u32, u32)>,
+        layout_dims: Option<(u32, u32)>,
+        canceled: bool,
+        finalized: bool,
+        input_seq: u64,
+        items_gen: u64,
+    ) -> Self {
+        assert!(
+            !(canceled && finalized),
+            "thumbnail cancellation and finalization are exclusive"
+        );
+        assert!(
+            !(image.is_some() && (canceled || finalized)),
+            "thumbnail pixels cannot be a terminal-only signal"
+        );
+        let payload = if canceled {
+            ThumbMsgPayload::Canceled
+        } else if finalized {
+            ThumbMsgPayload::Finalized
+        } else if let Some(image) = image {
+            ThumbMsgPayload::Pixels(ThumbPixels {
+                image,
+                origin,
+                from_edit_preview,
+                edit_preview_adjustment,
+                source_dims,
+                layout_dims,
+            })
+        } else {
+            ThumbMsgPayload::Failed { origin }
+        };
+        Self {
+            idx,
+            input_seq,
+            items_gen,
+            payload,
+        }
+    }
+
+    pub fn pixels(&self) -> Option<&ThumbPixels> {
+        match &self.payload {
+            ThumbMsgPayload::Pixels(pixels) => Some(pixels),
+            _ => None,
+        }
+    }
+    pub fn into_pixels(self) -> Option<ThumbPixels> {
+        match self.payload {
+            ThumbMsgPayload::Pixels(pixels) => Some(pixels),
+            _ => None,
+        }
+    }
+    pub fn is_canceled(&self) -> bool {
+        matches!(self.payload, ThumbMsgPayload::Canceled)
+    }
+    pub fn is_finalized(&self) -> bool {
+        matches!(self.payload, ThumbMsgPayload::Finalized)
+    }
 }
 
 /// 段階 B: サムネイル読み込み要求。
@@ -295,7 +475,32 @@ impl LoadSourcePolicy {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum PdfStampPolicy {
+    #[default]
+    CallerFileAttributes,
+    ResolveInWorker,
+    /// The caller already pinned the target and stamped this request before queueing it.
+    Resolved(crate::pdf_loader::ReadTarget),
+}
+
+pub(crate) fn stamp_resolved_pdf_request(
+    req: &LoadRequest,
+    read: &crate::pdf_loader::ReadTarget,
+) -> Option<LoadRequest> {
+    let (mtime, file_size) = read.stamp.generation_catalog_pair()?;
+    let mut stamped = req.clone();
+    stamped.mtime = mtime;
+    stamped.file_size = file_size;
+    if let Some(key) = stamped.cache_key_override.as_mut()
+        && key.contains(CACHE_KEY_PIN_SUFFIX)
+    {
+        *key = pin_key_with_generation(key, (mtime, file_size));
+    }
+    Some(stamped)
+}
+
+#[derive(Clone, Default)]
 pub struct LoadRequest {
     pub idx: usize,
     /// 通常画像ならファイルパス、ZIP 画像なら ZIP ファイルのパス
@@ -305,6 +510,9 @@ pub struct LoadRequest {
     pub relative_page_provenance: Option<crate::book_bookmarks::RelativePageProvenance>,
     pub mtime: i64,
     pub file_size: i64,
+    /// EPUB requests carry no cache identity from `image_metas`; the caller either
+    /// resolves before queueing or asks the worker to resolve.
+    pub pdf_stamp_policy: PdfStampPolicy,
     /// 非破壊編集プレビューのページキー。編集済み画像系アイテムだけに設定する。
     pub edit_preview_key: Option<String>,
     /// ZIP/PDF 内ページを親コンテナの手動代表として読む要求。
@@ -337,6 +545,8 @@ pub struct LoadRequest {
     pub folder_thumb_sort: Option<crate::settings::SortOrder>,
     /// フォルダサムネイル用: サブフォルダを探索する最大階層数
     pub folder_thumb_depth: u32,
+    /// Content origin is explicit: only AutoSelected folder rows carry and validate a proof.
+    pub folder_thumb_provenance: Option<crate::catalog::FolderThumbProvenance>,
     /// pin 解決時の dispatch 上書き。`Some` のときは `cache_key_override` の prefix
     /// 判定 (is_folder_thumb / is_zip_thumb) を無視してここで指定された戦略で
     /// resolve する。`None` のときは従来通り prefix で判定する。
@@ -344,6 +554,10 @@ pub struct LoadRequest {
     /// 明示ピンだけを解決する特殊要求。未解決 / Folder leaf はアイコン fallback
     /// に倒し、通常フォルダ代表探索には進ませない。
     pub pinned_only: Option<PinnedOnlyRequest>,
+    /// The original automatic folder request. Only an EPUB page pin carries
+    /// this; a missing conversion/source is resolved on the worker and then
+    /// follows the same auto-representative path as an unresolved PDF pin.
+    pub epub_pin_fallback: Option<Box<LoadRequest>>,
     /// CachePolicy に関係なく、このリクエストの結果を catalog に保存する。
     /// ドライブ直下フォルダの明示ピン代表など、後段の cache-only 表示がユーザーの
     /// 明示操作に依存する場合だけ UI 側で true にする。
@@ -358,6 +572,318 @@ pub struct LoadRequest {
     /// `pdf_loader::current_render_context_epoch()` を焼き付ける (TOCTOU 防止)。
     /// 0 = epoch チェック対象外 (background 経路の sentinel)。`Default::default()` は 0。
     pub context_epoch: u64,
+    /// Typed source owner: the original source, a RAW development handoff, or an Audio thumbnail.
+    /// Only the thumbnail worker may resize, cache, count, and signal its result.
+    pub raw_source: LoadRequestSource,
+}
+
+fn raw_image_error(error: crate::raw::RawError) -> image::ImageError {
+    image::ImageError::IoError(std::io::Error::other(error))
+}
+
+pub(crate) struct RawThumbnailRaster {
+    pub image: image::DynamicImage,
+    pub developed_dims: (u32, u32),
+}
+
+/// Cache creator and other dedicated workers may wait for Background half
+/// development. The grid thumbnail pool uses `RawThumbHandoff` instead.
+pub(crate) fn decode_raw_thumbnail_on_worker(
+    source: crate::raw::RawOwnedSource,
+    display_px: u32,
+    executor: &crate::raw::RawDevelopExecutor,
+) -> Result<RawThumbnailRaster, crate::raw::RawError> {
+    decode_raw_thumbnail_on_cancellable_worker(source, display_px, executor, None)
+}
+
+fn decode_raw_thumbnail_on_cancellable_worker(
+    source: crate::raw::RawOwnedSource,
+    display_px: u32,
+    executor: &crate::raw::RawDevelopExecutor,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> Result<RawThumbnailRaster, crate::raw::RawError> {
+    let cancelled = || cancel.is_some_and(|flag| flag.load(Ordering::Acquire));
+    if cancelled() {
+        return Err(crate::raw::RawError::Cancelled);
+    }
+    let info = crate::raw::raw_decoder::info(source.as_source())?;
+    let dims = (info.developed_dims[0], info.developed_dims[1]);
+    let threshold = display_px.min(dims.0.max(dims.1));
+    match crate::raw::raw_decoder::preview(source.as_source()) {
+        Ok(preview) if preview.image.width().max(preview.image.height()) >= threshold => {
+            return Ok(RawThumbnailRaster {
+                image: preview.image,
+                developed_dims: dims,
+            });
+        }
+        Ok(_) | Err(crate::raw::RawError::NoUsablePreview(_)) => {}
+        Err(error) => return Err(error),
+    }
+    if let crate::raw::RawDevelopSupport::Unsupported(reason) = info.develop_support {
+        return Err(crate::raw::RawError::Unsupported(reason));
+    }
+    let (tx, rx) = mpsc::channel();
+    let ticket = executor.submit_thumbnail_half_with_cancel_flag(
+        source,
+        crate::raw::RawPriority::Background,
+        tx,
+        cancel.cloned(),
+    );
+    let output = if cancel.is_some() {
+        // A flag alone does not remove a queued executor job. Retire our ticket
+        // without waiting for Background admission, or joining running native work.
+        loop {
+            if cancelled() {
+                ticket.cancel();
+                return Err(crate::raw::RawError::Cancelled);
+            }
+            match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(output) => break output?,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(crate::raw::RawError::Cancelled);
+                }
+            }
+        }
+    } else {
+        rx.recv().map_err(|_| crate::raw::RawError::Cancelled)??
+    };
+    if cancelled() {
+        ticket.cancel();
+        return Err(crate::raw::RawError::Cancelled);
+    }
+    Ok(RawThumbnailRaster {
+        image: output.image,
+        developed_dims: dims,
+    })
+}
+
+/// Audio source discovery is performed during list preparation; extraction/stat/catalog work stays in this worker.
+#[derive(Clone)]
+pub struct AudioThumbnailRequest {
+    pub sidecar: Option<std::path::PathBuf>,
+    pub cache_dir: std::path::PathBuf,
+    pub admission: crate::catalog::CatalogAdmission,
+}
+
+#[derive(Clone, Default)]
+pub enum LoadRequestSource {
+    AudioArtPrune {
+        parent: std::path::PathBuf,
+        inventory: Arc<std::collections::HashSet<String>>,
+        cache_dir: std::path::PathBuf,
+        admission: crate::catalog::CatalogAdmission,
+    },
+    #[default]
+    Original,
+    AudioThumbnail(AudioThumbnailRequest),
+    RawHalfDeveloped {
+        image: image::DynamicImage,
+        developed_dims: [u32; 2],
+        /// Prior executor wait/develop time, retained for cache decisions and stats.
+        /// This is outside the re-enqueued thumbnail worker's diagnostic span.
+        decode_ms: f64,
+        folder_selection_proof: Option<crate::catalog::FolderSelectionProof>,
+    },
+}
+
+/// Shared handles are scoped to one viewer context and its thumbnail workers.
+#[derive(Clone)]
+pub struct RawThumbLocalHandoff {
+    pub(crate) executor: Arc<crate::raw::RawDevelopExecutor>,
+    pub(crate) queue: Arc<crate::app::NotifyQueue>,
+    pub(crate) tickets:
+        Arc<Mutex<crate::items_generation_cache::ItemsGenerationMap<RawThumbPending>>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawThumbUnavailable {
+    NeedsHalfDevelopment,
+}
+
+#[derive(Clone)]
+pub enum RawThumbHandoff {
+    Local(RawThumbLocalHandoff),
+    /// Only dedicated workers may wait here, with no thumbnail/I/O/PDF permit.
+    /// Uses the same App-owned executor and Background admission as cache creation.
+    DedicatedWorker(Arc<crate::raw::RawDevelopExecutor>),
+    RemotePreviewOnly(mpsc::Sender<RawThumbUnavailable>),
+}
+
+/// One outstanding half development owned by the same context as `requested`.
+pub(crate) struct RawThumbPending {
+    ticket: crate::raw::RawTicket,
+    submission_id: u64,
+    idx: usize,
+    input_seq: u64,
+    items_gen: u64,
+    tx: mpsc::Sender<ThumbMsg>,
+    gen_done: Arc<AtomicUsize>,
+}
+
+static NEXT_RAW_THUMB_SUBMISSION_ID: AtomicU64 = AtomicU64::new(1);
+
+fn take_matching_raw_thumb_pending(
+    map: &mut crate::items_generation_cache::ItemsGenerationMap<RawThumbPending>,
+    idx: usize,
+    submission_id: u64,
+) -> Option<RawThumbPending> {
+    if map
+        .get(&idx)
+        .is_some_and(|pending| pending.submission_id == submission_id)
+    {
+        map.remove(&idx)
+    } else {
+        None
+    }
+}
+
+impl RawThumbPending {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        ticket: crate::raw::RawTicket,
+        tx: mpsc::Sender<ThumbMsg>,
+        gen_done: Arc<AtomicUsize>,
+        items_gen: u64,
+    ) -> Self {
+        Self {
+            ticket,
+            submission_id: NEXT_RAW_THUMB_SUBMISSION_ID.fetch_add(1, Ordering::Relaxed),
+            idx: 0,
+            input_seq: 0,
+            items_gen,
+            tx,
+            gen_done,
+        }
+    }
+
+    pub(crate) fn cancel(self) {
+        self.ticket.cancel();
+        let _ = self.tx.send(ThumbMsg::from_legacy_parts(
+            self.idx,
+            None,
+            ThumbLoadOrigin::SourceIntrinsic,
+            false,
+            None,
+            None,
+            None,
+            true,
+            false,
+            self.input_seq,
+            self.items_gen,
+        ));
+        self.gen_done.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn cancel_raw_thumb_tickets(
+    tickets: &Arc<Mutex<crate::items_generation_cache::ItemsGenerationMap<RawThumbPending>>>,
+) {
+    let pending: Vec<_> = tickets.lock().unwrap().drain().map(|(_, p)| p).collect();
+    for job in pending {
+        job.cancel();
+    }
+}
+
+pub(crate) fn cancel_raw_thumb_tickets_outside_keep(
+    tickets: &Arc<Mutex<crate::items_generation_cache::ItemsGenerationMap<RawThumbPending>>>,
+    keep: &std::collections::HashSet<usize>,
+) {
+    let exited: Vec<_> = {
+        let mut tickets = tickets.lock().unwrap();
+        let indices: Vec<_> = tickets
+            .keys()
+            .copied()
+            .filter(|idx| !keep.contains(idx))
+            .collect();
+        indices
+            .into_iter()
+            .filter_map(|idx| tickets.remove(&idx))
+            .collect()
+    };
+    for pending in exited {
+        pending.cancel();
+    }
+}
+
+/// Remote decides this before consulting the catalog. It accepts any usable
+/// embedded preview, regardless of the PC thumbnail size threshold.
+pub(crate) enum RemoteRawThumbRequirement {
+    NotRaw,
+    PreviewAvailable,
+    CatalogOnly,
+}
+
+pub(crate) fn remote_raw_thumbnail_requirement(
+    req: &LoadRequest,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+) -> RemoteRawThumbRequirement {
+    let mut path = req.path.clone();
+    let mut cached_pin_source = false;
+    if let Some(sort) = req.folder_thumb_sort
+        && path.is_dir()
+    {
+        match resolve_folder_thumb_image(&path, sort, req.folder_thumb_depth, pin_db) {
+            Some(FolderThumbResolution::Image(selected)) => path = selected,
+            Some(FolderThumbResolution::CachedPinned(cached)) => {
+                path = cached.source_path;
+                cached_pin_source = true;
+            }
+            None => return RemoteRawThumbRequirement::NotRaw,
+        }
+    }
+
+    let selected_entry = if let Some(entry) = req.zip_entry.as_deref() {
+        Some(entry.to_owned())
+    } else if let Some(prefix) = req.zip_dir_prefix.as_deref() {
+        let Ok(entries) = crate::zip_loader::enumerate_image_entries(&path) else {
+            return RemoteRawThumbRequirement::NotRaw;
+        };
+        crate::zip_tree::ZipTree::build(path.clone(), entries)
+            .representative_for_prefix_str(
+                prefix,
+                req.folder_thumb_sort
+                    .unwrap_or(crate::settings::SortOrder::Numeric),
+            )
+            .map(|entry| entry.entry_name.clone())
+    } else if req
+        .cache_key_override
+        .as_deref()
+        .is_some_and(|key| key.starts_with(CACHE_KEY_ZIP))
+        || (cached_pin_source
+            && path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    crate::folder_tree::is_zip_extension(&extension.to_ascii_lowercase())
+                }))
+    {
+        crate::zip_loader::read_first_image_bytes(&path).map(|(entry, _)| entry)
+    } else {
+        None
+    };
+    let bytes = if let Some(entry) = selected_entry {
+        if !crate::raw_format::is_raw_path(Path::new(&entry)) {
+            return RemoteRawThumbRequirement::NotRaw;
+        }
+        match crate::zip_loader::read_entry_bytes(&path, &entry) {
+            Ok(bytes) => Some(bytes),
+            Err(_) => return RemoteRawThumbRequirement::CatalogOnly,
+        }
+    } else if crate::raw_format::is_raw_path(&path) {
+        None
+    } else {
+        return RemoteRawThumbRequirement::NotRaw;
+    };
+    let source = bytes.as_deref().map_or(
+        crate::raw::RawSource::Path(&path),
+        crate::raw::RawSource::Bytes,
+    );
+    if crate::raw::raw_decoder::preview(source).is_ok() {
+        RemoteRawThumbRequirement::PreviewAvailable
+    } else {
+        RemoteRawThumbRequirement::CatalogOnly
+    }
 }
 
 /// キャッシュ生成判定用のパラメータ（段階 C）。
@@ -432,7 +958,7 @@ impl CacheDecision {
                 if self.webp_always && ext == "webp" {
                     return true;
                 }
-                if self.pdf_always && ext == "pdf" {
+                if self.pdf_always && crate::folder_tree::is_paged_document_path(path) {
                     return true;
                 }
                 if self.zip_always && ext == "zip" {
@@ -479,7 +1005,32 @@ pub fn resize_to_display_color_image(
 
 /// 画像ファイルをデコードし、指定サイズにリサイズした ColorImage を返す。
 /// 動画の同名画像サムネイルオーバーライド用。
-pub fn decode_image_for_thumb(path: &std::path::Path, display_px: u32) -> Option<egui::ColorImage> {
+pub fn decode_image_for_thumb(
+    path: &std::path::Path,
+    display_px: u32,
+    raw_executor: &crate::raw::RawDevelopExecutor,
+) -> Result<Option<egui::ColorImage>, crate::raw::RawError> {
+    decode_image_for_thumb_with_dims(path, display_px, raw_executor)
+        .map(|result| result.map(|(image, _)| image))
+}
+
+/// The same image source decoder, retaining intrinsic dimensions and access errors for Audio.
+pub(crate) fn decode_image_for_thumb_with_dims(
+    path: &Path,
+    display_px: u32,
+    raw_executor: &crate::raw::RawDevelopExecutor,
+) -> Result<Option<(egui::ColorImage, (u32, u32))>, crate::raw::RawError> {
+    if crate::raw_format::is_raw_path(path) {
+        let raster = decode_raw_thumbnail_on_worker(
+            crate::raw::RawOwnedSource::Path(path.to_owned()),
+            display_px,
+            raw_executor,
+        )?;
+        return Ok(Some((
+            resize_to_display_color_image(&raster.image, display_px, Some(raster.developed_dims)),
+            raster.developed_dims,
+        )));
+    }
     // JPEG なら TurboJPEG で DCT scale 付き高速デコードを試す。
     // この関数は cache 用 thumb_px を持たないので target = display_px を使う。
     let (turbo_img, source_dims): (Option<image::DynamicImage>, Option<(u32, u32)>) =
@@ -492,17 +1043,39 @@ pub fn decode_image_for_thumb(path: &std::path::Path, display_px: u32) -> Option
                     crate::logger::log(format!(
                         "decode_image_for_thumb: DCT terminal rejection {path:?}: {msg}"
                     ));
-                    return None;
+                    return Ok(None);
                 }
                 Err(DctDecodeError::Fallback(_)) => (None, None),
             }
         } else {
             (None, None)
         };
-    let img = turbo_img
-        .or_else(|| image::open(path).ok())
-        .or_else(|| crate::wic_decoder::decode_to_dynamic_image(path))?;
-    Some(resize_to_display_color_image(&img, display_px, source_dims))
+    let img = if let Some(image) = turbo_img {
+        Some(image)
+    } else {
+        match image::open(path) {
+            Ok(image) => Some(image),
+            Err(image::ImageError::IoError(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::InvalidData
+                ) =>
+            {
+                return Err(crate::raw::RawError::Corrupt(error.to_string()));
+            }
+            Err(image::ImageError::IoError(error)) => {
+                return Err(crate::raw::RawError::Io(error.to_string()));
+            }
+            Err(_) => crate::wic_decoder::decode_to_dynamic_image(path),
+        }
+    };
+    Ok(img.map(|img| {
+        let dims = source_dims.unwrap_or((img.width(), img.height()));
+        (
+            resize_to_display_color_image(&img, display_px, Some(dims)),
+            dims,
+        )
+    }))
 }
 
 /// EXIF Orientation に基づいて画像を回転・反転する。
@@ -717,6 +1290,16 @@ pub(crate) fn pick_dct_scale_num(src_max_edge: u32, target_px: u32) -> u32 {
     m_raw.clamp(1, 8) as u32
 }
 
+#[inline]
+fn thumbnail_jpeg_decode_target(display_px: u32, thumb_px: u32) -> u32 {
+    display_px.max(thumb_px)
+}
+
+#[inline]
+fn thumbnail_pdf_render_target(display_px: u32) -> u32 {
+    display_px
+}
+
 /// バイト列から JPEG を TurboJPEG で DCT scale 付きデコードする。
 ///
 /// `target_px` は最終 thumbnail 表示の max-edge 目安。これに対して
@@ -856,6 +1439,9 @@ fn decode_zip_chain(
     cancel: Option<Arc<AtomicBool>>,
     decode_source: &mut crate::stats::DecodeSource,
 ) -> Result<image::DynamicImage, image::ImageError> {
+    if crate::raw_format::is_raw_path(Path::new(entry_name)) {
+        return Err(raw_image_error(crate::raw::RawError::Internal(-2)));
+    }
     // Susie 専用拡張子の高速パス (image / WIC で確実に失敗する分を省略)
     if is_susie_only_ext(&ext_lower_str(entry_name)) {
         return match crate::susie_loader::decode_bytes(entry_name, bytes, priority, cancel) {
@@ -868,7 +1454,10 @@ fn decode_zip_chain(
     }
     match image::load_from_memory(bytes) {
         Ok(img) => Ok(img),
-        Err(e) => match crate::wic_decoder::decode_to_dynamic_image_from_bytes(bytes) {
+        Err(e) => match crate::wic_decoder::decode_to_dynamic_image_from_bytes(
+            bytes,
+            &ext_lower_str(entry_name),
+        ) {
             Some(img) => {
                 *decode_source = crate::stats::DecodeSource::Wic;
                 Ok(img)
@@ -939,19 +1528,40 @@ pub fn compute_display_px(cell_w: f32, cell_h: f32, dpi: f32) -> u32 {
 // -----------------------------------------------------------------------
 
 fn send_thumb_failed(req: &LoadRequest, tx: &mpsc::Sender<ThumbMsg>, gen_done: &Arc<AtomicUsize>) {
-    let _ = tx.send(ThumbMsg {
-        idx: req.idx,
-        image: None,
-        origin: ThumbLoadOrigin::SourceIntrinsic,
-        from_edit_preview: false,
-        edit_preview_adjustment: None,
-        source_dims: None,
-        layout_dims: None,
-        canceled: false,
-        finalized: false,
-        input_seq: req.input_seq,
-        items_gen: req.items_gen,
-    });
+    let _ = tx.send(ThumbMsg::from_legacy_parts(
+        req.idx,
+        None,
+        ThumbLoadOrigin::SourceIntrinsic,
+        false,
+        None,
+        None,
+        None,
+        false,
+        false,
+        req.input_seq,
+        req.items_gen,
+    ));
+    gen_done.fetch_add(1, Ordering::Relaxed);
+}
+
+fn send_pinned_child_miss(
+    req: &LoadRequest,
+    tx: &mpsc::Sender<ThumbMsg>,
+    gen_done: &Arc<AtomicUsize>,
+) {
+    let _ = tx.send(ThumbMsg::from_legacy_parts(
+        req.idx,
+        None,
+        ThumbLoadOrigin::DriveListChildMiss,
+        false,
+        None,
+        None,
+        None,
+        false,
+        false,
+        req.input_seq,
+        req.items_gen,
+    ));
     gen_done.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -961,22 +1571,141 @@ fn send_pinned_only_cached(
     cache_map: &std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
     tx: &mpsc::Sender<ThumbMsg>,
     gen_done: &Arc<AtomicUsize>,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+    catalog: Option<&crate::catalog::CatalogDb>,
+    cancel: Option<&Arc<AtomicBool>>,
 ) -> bool {
-    let cached = cache_map.read().ok().and_then(|map| {
-        map.iter()
-            .filter(|(key, _)| key.starts_with(&pin.cache_key_prefix))
-            .max_by_key(|(_, entry)| (entry.mtime, entry.file_size))
+    let canceled = || cancel.is_some_and(|flag| flag.load(Ordering::Acquire));
+    if canceled() {
+        return false;
+    }
+    // A retired map cannot authorize a drive tile. One short successor keeps
+    // the original DB identity and grants read-only catalog access only.
+    let resumed = if let Some(original) = catalog.filter(|db| db.is_retired()) {
+        match original.resume_cache_only_catalog_after_maintenance(&canceled) {
+            Ok(Some(db)) => Some(db),
+            _ => return false,
+        }
+    } else {
+        None
+    };
+    if let crate::folder_thumb_pins::FolderPinSource::File {
+        rel,
+        kind: crate::folder_thumb_pins::FileKind::Folder,
+    } = &pin.source
+    {
+        // Keep the pre-EPUB first-frame seed: it can be shown before the
+        // child pin, PDF generation, and exact writer key are resolved. The
+        // following exact lookup is authoritative and replaces or rejects it.
+        let preview = if let Some(db) = resumed.as_ref() {
+            db.load_latest_with_prefix(&pin.cache_key_prefix)
+                .ok()
+                .flatten()
+                .map(|(_, entry)| entry)
+        } else {
+            cache_map.read().ok().and_then(|map| {
+                map.iter()
+                    .filter(|(key, _)| key.starts_with(&pin.cache_key_prefix))
+                    .max_by_key(|(_, entry)| (entry.mtime, entry.file_size))
+                    .map(|(_, entry)| entry.clone())
+            })
+        };
+        if canceled() {
+            return false;
+        }
+        let preview = preview.and_then(|entry| {
+            crate::catalog::decode_thumb_to_color_image(&entry.jpeg_data).map(|image| {
+                let _ = tx.send(ThumbMsg::from_legacy_parts(
+                    req.idx,
+                    Some(image),
+                    ThumbLoadOrigin::DriveListChildSeed,
+                    false,
+                    None,
+                    entry.source_dims,
+                    entry.layout_dims,
+                    false,
+                    false,
+                    req.input_seq,
+                    req.items_gen,
+                ));
+                entry
+            })
+        });
+        if !send_pinned_child_folder_cached(
+            req,
+            rel,
+            preview.as_ref(),
+            tx,
+            gen_done,
+            pin_db,
+            resumed.as_ref(),
+            cancel,
+        ) {
+            if canceled() {
+                return false;
+            }
+            send_pinned_child_miss(req, tx, gen_done);
+        }
+        return true;
+    }
+    let epub_source = pin
+        .seed_proof
+        .as_ref()
+        .map(|DriveListSeedProof::EpubPath(path)| path.clone());
+    let epub_read = if let Some(source) = epub_source.as_ref() {
+        let Ok(read) = crate::pdf_loader::resolve_read_target(source) else {
+            return false;
+        };
+        Some(read)
+    } else {
+        None
+    };
+    let epub_stamp = match epub_read.as_ref() {
+        Some(read) => Some(match read.stamp.generation_catalog_pair() {
+            Some(stamp) => stamp,
+            None => return false,
+        }),
+        None => None,
+    };
+    let cached = if let Some(db) = resumed.as_ref() {
+        db.load_latest_with_prefix_matching(&pin.cache_key_prefix, epub_stamp)
+            .ok()
+            .flatten()
             .map(|(key, entry)| {
                 (
-                    key.clone(),
-                    entry.jpeg_data.clone(),
+                    key,
+                    entry.jpeg_data,
                     entry.source_dims,
                     entry.layout_dims,
                     entry.mtime,
                     entry.file_size,
                 )
             })
-    });
+    } else {
+        cache_map.read().ok().and_then(|map| {
+            map.iter()
+                .filter(|(key, entry)| {
+                    key.starts_with(&pin.cache_key_prefix)
+                        && epub_stamp.is_none_or(|(mtime, size)| {
+                            entry.mtime == mtime && entry.file_size == size
+                        })
+                })
+                .max_by_key(|(_, entry)| (entry.mtime, entry.file_size))
+                .map(|(key, entry)| {
+                    (
+                        key.clone(),
+                        entry.jpeg_data.clone(),
+                        entry.source_dims,
+                        entry.layout_dims,
+                        entry.mtime,
+                        entry.file_size,
+                    )
+                })
+        })
+    };
+    if canceled() {
+        return false;
+    }
 
     let Some((filename, webp_data, source_dims, layout_dims, mtime, file_size)) = cached else {
         crate::logger::log(format!(
@@ -987,24 +1716,185 @@ fn send_pinned_only_cached(
     };
 
     let ci = crate::catalog::decode_thumb_to_color_image(&webp_data);
-    let _ = tx.send(ThumbMsg {
-        idx: req.idx,
-        image: ci,
-        origin: ThumbLoadOrigin::FinalCache,
-        from_edit_preview: false,
-        edit_preview_adjustment: None,
+    let _ = tx.send(ThumbMsg::from_legacy_parts(
+        req.idx,
+        ci,
+        ThumbLoadOrigin::FinalCache,
+        false,
+        None,
         source_dims,
         layout_dims,
-        canceled: false,
-        finalized: false,
-        input_seq: req.input_seq,
-        items_gen: req.items_gen,
-    });
+        false,
+        false,
+        req.input_seq,
+        req.items_gen,
+    ));
     gen_done.fetch_add(1, Ordering::Relaxed);
     crate::logger::log(format!(
         "    idx={:>4} drive_list_pin_cache_hit  {filename} ({mtime}/{file_size})",
         req.idx,
     ));
+    true
+}
+
+/// The child writer's exact catalog key is the authority for a drive-list
+/// child tile. Neither lexical newest-row order nor a stored key's text is a
+/// substitute for the current child pin route.
+fn send_pinned_child_folder_cached(
+    req: &LoadRequest,
+    rel: &str,
+    preview: Option<&crate::catalog::CacheEntry>,
+    tx: &mpsc::Sender<ThumbMsg>,
+    gen_done: &Arc<AtomicUsize>,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+    resumed: Option<&crate::catalog::CatalogDb>,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> bool {
+    let canceled = || cancel.is_some_and(|flag| flag.load(Ordering::Acquire));
+    if canceled() {
+        return false;
+    }
+    let child = req.path.join(rel);
+    let Some(sort) = req.folder_thumb_sort else {
+        return false;
+    };
+    let use_full_path = crate::path_key::is_drive_or_share_root(&req.path);
+    let source = pin_db.and_then(|db| db.lookup(&child));
+    let resolved = source.as_ref().and_then(|source| {
+        crate::folder_thumb_pins::resolve_pin_target_cascaded_via(
+            &child,
+            source,
+            |path| pin_db.and_then(|db| db.lookup(path)),
+            req.folder_thumb_depth as usize,
+        )
+    });
+    // The folder writer falls back to its automatic representative when a pin
+    // target disappears. Read that exact auto row in the cache-only path too.
+    let provenance = if resolved
+        .as_ref()
+        .is_some_and(|target| matches!(target.kind, crate::folder_thumb_pins::ResolvedKind::Folder))
+        || resolved.is_none()
+    {
+        crate::catalog::FolderThumbProvenance::AutoSelected
+    } else {
+        crate::catalog::FolderThumbProvenance::Seeded
+    };
+    let Some(base_key) = folder_thumb_cache_key_for_path(
+        &child,
+        use_full_path,
+        sort,
+        req.folder_thumb_depth,
+        provenance,
+    ) else {
+        return false;
+    };
+    let epub_read = if let Some(target) = resolved.as_ref()
+        && target.pdf_page.is_some()
+        && is_epub_path(&target.abs_path)
+    {
+        let Ok(read) = crate::pdf_loader::resolve_read_target(&target.abs_path) else {
+            return false;
+        };
+        Some(read)
+    } else {
+        None
+    };
+    let generation = match epub_read.as_ref() {
+        Some(read) => Some(match read.stamp.generation_catalog_pair() {
+            Some(pair) => pair,
+            None => return false,
+        }),
+        None => None,
+    };
+    let key = resolved.as_ref().map_or_else(
+        || base_key.clone(),
+        |target| pinned_folder_row_key(&base_key, &target.source_id, generation),
+    );
+    let local;
+    let catalog = if let Some(resumed) = resumed {
+        resumed
+    } else {
+        let cache_dir = crate::catalog::default_cache_dir();
+        let access = crate::catalog::CatalogAccess::for_cache_dir(&cache_dir);
+        let Some(admission) = access.wait_read_admission_with(&canceled) else {
+            return false;
+        };
+        let Ok(Some(db)) = crate::catalog::CatalogDb::open_existing_read_only_admitted(
+            &cache_dir, &req.path, admission,
+        ) else {
+            return false;
+        };
+        local = db;
+        &local
+    };
+    let Ok(Some(entry)) = catalog.load_one(&key) else {
+        return false;
+    };
+    if canceled() {
+        return false;
+    }
+    if provenance == crate::catalog::FolderThumbProvenance::AutoSelected {
+        // The ordinary child-folder read owns auto-row proof validation:
+        // winner state, pin revision, and every folder/catalog dependency.
+        let mut child_request = req.clone();
+        child_request.path = child;
+        child_request.cache_key_override = Some(key.clone());
+        child_request.folder_thumb_provenance = Some(provenance);
+        if !folder_cached_row_usable(&child_request, &entry, pin_db) {
+            return false;
+        }
+    }
+    if let Some(target) = resolved.as_ref() {
+        let (mtime, size) = generation.unwrap_or((target.mtime, target.file_size));
+        if entry.mtime != mtime || entry.file_size != size {
+            return false;
+        }
+    }
+    if canceled() {
+        return false;
+    }
+    if preview.is_some_and(|seed| {
+        seed.mtime == entry.mtime
+            && seed.file_size == entry.file_size
+            && seed.source_dims == entry.source_dims
+            && seed.layout_dims == entry.layout_dims
+            && seed.jpeg_data == entry.jpeg_data
+    }) {
+        // The UI may already have uploaded the seed. Complete the request
+        // without creating another texture for the identical current row.
+        let _ = tx.send(ThumbMsg::from_legacy_parts(
+            req.idx,
+            None,
+            ThumbLoadOrigin::DriveListChildSeed,
+            false,
+            None,
+            None,
+            None,
+            false,
+            true,
+            req.input_seq,
+            req.items_gen,
+        ));
+        gen_done.fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
+    let Some(image) = crate::catalog::decode_thumb_to_color_image(&entry.jpeg_data) else {
+        return false;
+    };
+    let _ = tx.send(ThumbMsg::from_legacy_parts(
+        req.idx,
+        Some(image),
+        ThumbLoadOrigin::FinalCache,
+        false,
+        None,
+        entry.source_dims,
+        entry.layout_dims,
+        false,
+        false,
+        req.input_seq,
+        req.items_gen,
+    ));
+    gen_done.fetch_add(1, Ordering::Relaxed);
     true
 }
 
@@ -1016,7 +1906,7 @@ fn send_pinned_only_cached(
 ///   (`ThumbLoadOrigin::SourceGenerated`、段階 E のアップグレード経路)
 #[allow(clippy::too_many_arguments)]
 pub fn process_load_request(
-    req: &LoadRequest,
+    req: &mut LoadRequest,
     cache_map: &std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
     tx: &mpsc::Sender<ThumbMsg>,
     // **v1.0.0**: `Arc` 経由で受け取る (= 内部の WebP cache hit catch-up worker が
@@ -1039,13 +1929,211 @@ pub fn process_load_request(
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
     edit_preview_db: Option<&Arc<crate::edit_preview_cache::EditPreviewCacheDb>>,
     adjustment_db: Option<&crate::adjustment_db::AdjustmentDb>,
+    raw_handoff: Option<&RawThumbHandoff>,
 ) {
+    if let LoadRequestSource::AudioThumbnail(audio) = &req.raw_source {
+        // Display/ordering stamps (notably bookmarks/history) never participate in Audio source identity.
+        let should_cancel = || {
+            cancel.is_some_and(|flag| flag.load(Ordering::Acquire))
+                || !thumbnail_request_in_current_keep(
+                    req,
+                    still_seek_thumbnail_pages.map(|pages| pages.as_ref()),
+                    keep_start.load(Ordering::Relaxed),
+                    keep_end.load(Ordering::Relaxed),
+                )
+        };
+        let raw_executor = match raw_handoff {
+            Some(RawThumbHandoff::Local(handoff)) => Some(Arc::clone(&handoff.executor)),
+            Some(RawThumbHandoff::DedicatedWorker(executor)) => Some(Arc::clone(executor)),
+            _ => None,
+        };
+        let options = crate::audio_thumbnail::AudioThumbnailOptions {
+            thumb_px,
+            thumb_quality: thumb_quality as f32,
+            cache_dir: audio.cache_dir.clone(),
+            cache_decision,
+            raw_executor,
+        };
+        let payload = match crate::audio_thumbnail::generate_with_options(
+            &req.path,
+            audio.sidecar.as_deref(),
+            &options,
+            req.source_policy,
+            audio.admission,
+            display_px,
+            &should_cancel,
+        ) {
+            Ok(Some(pixels)) => ThumbMsgPayload::Pixels(ThumbPixels {
+                image: pixels.image,
+                origin: pixels.origin,
+                from_edit_preview: false,
+                edit_preview_adjustment: None,
+                source_dims: Some(pixels.source_dims),
+                layout_dims: None,
+            }),
+            Ok(None) => ThumbMsgPayload::NoArt,
+            Err(crate::audio_thumbnail::AudioThumbnailError::Canceled) => ThumbMsgPayload::Canceled,
+            Err(crate::audio_thumbnail::AudioThumbnailError::Failed(error)) => {
+                crate::logger::log(format!(
+                    "audio thumbnail failed {}: {error}",
+                    req.path.display()
+                ));
+                ThumbMsgPayload::Failed {
+                    origin: ThumbLoadOrigin::SourceIntrinsic,
+                }
+            }
+        };
+        let _ = tx.send(ThumbMsg {
+            idx: req.idx,
+            input_seq: req.input_seq,
+            items_gen: req.items_gen,
+            payload,
+        });
+        // Unlike the generic source path, the shared generator has completed cache admission before returning.
+        gen_done.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    if matches!(req.raw_source, LoadRequestSource::RawHalfDeveloped { .. }) {
+        let raw_source = std::mem::take(&mut req.raw_source);
+        let proof = match &raw_source {
+            LoadRequestSource::RawHalfDeveloped {
+                folder_selection_proof,
+                ..
+            } => folder_selection_proof.clone(),
+            LoadRequestSource::Original
+            | LoadRequestSource::AudioThumbnail(_)
+            | LoadRequestSource::AudioArtPrune { .. } => unreachable!(),
+        };
+        let pinned_adjustment = req
+            .pinned_page_adjustment_key
+            .as_deref()
+            .and_then(|key| adjustment_db.and_then(|db| db.get_page_params(key)))
+            .filter(|params| !params.is_color_identity());
+        load_one_cached(
+            &req.path,
+            req.zip_entry.as_deref(),
+            None,
+            None,
+            req.pdf_page,
+            None,
+            req.pdf_password.as_deref(),
+            req.cache_key_override.as_deref(),
+            req.idx,
+            tx,
+            catalog.map(|arc| arc.as_ref()),
+            Some(cache_map),
+            req.mtime,
+            req.file_size,
+            gen_done,
+            thumb_px,
+            thumb_quality,
+            display_px,
+            cache_decision,
+            stats,
+            cancel,
+            req.priority,
+            req.input_seq,
+            req.items_gen,
+            req.context_epoch,
+            crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
+            req.force_cache,
+            true,
+            pinned_adjustment.as_ref(),
+            req.folder_thumb_provenance,
+            proof.as_ref(),
+            raw_source,
+            None,
+            None,
+        );
+        return;
+    }
     if let Some(pin) = req.pinned_only.as_ref() {
-        if !send_pinned_only_cached(req, pin, cache_map, tx, gen_done) {
-            send_thumb_failed(req, tx, gen_done);
+        if !send_pinned_only_cached(
+            req,
+            pin,
+            cache_map,
+            tx,
+            gen_done,
+            pin_db,
+            catalog.map(|db| db.as_ref()),
+            cancel,
+        ) {
+            if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                let _ = tx.send(ThumbMsg {
+                    idx: req.idx,
+                    input_seq: req.input_seq,
+                    items_gen: req.items_gen,
+                    payload: ThumbMsgPayload::Canceled,
+                });
+                gen_done.fetch_add(1, Ordering::Relaxed);
+            } else {
+                send_thumb_failed(req, tx, gen_done);
+            }
         }
         return;
     }
+
+    let fallback_or_fail = || {
+        if let Some(fallback) = req.epub_pin_fallback.as_deref() {
+            let mut fallback = fallback.clone();
+            process_load_request(
+                &mut fallback,
+                cache_map,
+                tx,
+                catalog,
+                thumb_px,
+                thumb_quality,
+                display_px,
+                cache_decision,
+                gen_done,
+                stats,
+                cancel,
+                keep_start,
+                keep_end,
+                still_seek_thumbnail_pages,
+                pin_db,
+                edit_preview_db,
+                adjustment_db,
+                raw_handoff,
+            );
+        } else {
+            send_thumb_failed(req, tx, gen_done);
+        }
+    };
+
+    let resolved_request = match &req.pdf_stamp_policy {
+        PdfStampPolicy::ResolveInWorker => {
+            match crate::pdf_loader::resolve_read_target(&req.path) {
+                Ok(read) => {
+                    let Some(stamped) = stamp_resolved_pdf_request(req, &read) else {
+                        fallback_or_fail();
+                        return;
+                    };
+                    Some((stamped, read))
+                }
+                Err(_) => {
+                    fallback_or_fail();
+                    return;
+                }
+            }
+        }
+        PdfStampPolicy::Resolved(read) => {
+            if read
+                .stamp
+                .generation_catalog_pair()
+                .is_some_and(|stamp| (req.mtime, req.file_size) != stamp)
+            {
+                fallback_or_fail();
+                return;
+            }
+            Some((req.clone(), read.clone()))
+        }
+        PdfStampPolicy::CallerFileAttributes => None,
+    };
+    let epub_read = resolved_request.as_ref().map(|(_, read)| read);
+    let req = resolved_request
+        .as_ref()
+        .map_or(&*req, |(stamped, _)| stamped);
 
     // 内部関数向けに `&CatalogDb` を取り出しておく (= 既存シグネチャ互換)
     let catalog_ref: Option<&crate::catalog::CatalogDb> = catalog.map(|a| a.as_ref());
@@ -1067,7 +2155,16 @@ pub fn process_load_request(
     let edit_preview = if req.source_policy.bypasses_cache() {
         None
     } else if let (Some(item_key), Some(db)) = (req.edit_preview_key.as_deref(), edit_preview_db) {
-        if req.edit_preview_validate_container {
+        // Sample immediately before the DB lookup. `EditPreviewCacheDb::clear` increments this
+        // epoch while holding the same connection mutex after DELETE succeeds, so a successful
+        // pre-clear read is always distinguishable when its message reaches the UI later.
+        let epoch = db.epoch();
+        let preview = if matches!(
+            req.pdf_stamp_policy,
+            PdfStampPolicy::ResolveInWorker | PdfStampPolicy::Resolved(_)
+        ) {
+            db.load_for_container(item_key, req.mtime, req.file_size, display_px)
+        } else if req.edit_preview_validate_container {
             std::fs::metadata(&req.path).ok().and_then(|meta| {
                 db.load_for_container(
                     item_key,
@@ -1078,11 +2175,12 @@ pub fn process_load_request(
             })
         } else {
             db.load(item_key, req.mtime, req.file_size, display_px)
-        }
+        };
+        preview.map(|preview| (preview, epoch))
     } else {
         None
     };
-    if let Some(preview) = edit_preview {
+    if let Some((preview, epoch)) = edit_preview {
         let image = if let Some(params) = pinned_page_adjustment.as_ref() {
             let adjusted =
                 crate::adjustment::apply_adjustments_fast(&preview.adjustment_base, params);
@@ -1093,22 +2191,22 @@ pub fn process_load_request(
         } else {
             preview.image
         };
-        let _ = tx.send(ThumbMsg {
-            idx: req.idx,
-            image: Some(image),
-            origin: ThumbLoadOrigin::FinalCache,
-            from_edit_preview: true,
-            edit_preview_adjustment: Some(ThumbEditPreviewAdjustment {
+        let _ = tx.send(ThumbMsg::from_legacy_parts(
+            req.idx,
+            Some(image),
+            ThumbLoadOrigin::EditPreviewCache { epoch },
+            true,
+            Some(ThumbEditPreviewAdjustment {
                 base: preview.adjustment_base,
                 annotation_layers: preview.annotation_layers,
             }),
-            source_dims: Some(preview.source_dims),
-            layout_dims: None,
-            canceled: false,
-            finalized: false,
-            input_seq: req.input_seq,
-            items_gen: req.items_gen,
-        });
+            Some(preview.source_dims),
+            None,
+            false,
+            false,
+            req.input_seq,
+            req.items_gen,
+        ));
         gen_done.fetch_add(1, Ordering::Relaxed);
         crate::logger::log(format!(
             "    idx={:>4} edit_preview_cache_hit  {filename}",
@@ -1141,20 +2239,31 @@ pub fn process_load_request(
         // read ロックは最短に保つ: エントリのデータだけ clone して即解放。
         // WebP デコード (2-3 ms) をロック外で実行することで、
         // 他ワーカーの write (キャッシュ保存) をブロックしない。
-        let cached = cache_map.read().ok().and_then(|map| {
-            let entry = map.get(filename)?;
-            if entry.mtime == req.mtime && entry.file_size == req.file_size {
-                Some((
-                    entry.jpeg_data.clone(),
-                    entry.source_dims,
-                    entry.layout_dims,
-                ))
-            } else {
-                None
-            }
-        });
-        if let Some((webp_data, source_dims, layout_dims)) = cached {
-            let ci = crate::catalog::decode_thumb_to_color_image(&webp_data).map(|image| {
+        let retired_cache_only = req.source_policy == LoadSourcePolicy::CacheOnly
+            && catalog.is_some_and(|catalog| catalog.is_retired());
+        let cached = if retired_cache_only {
+            catalog
+                .and_then(|catalog| {
+                    catalog
+                        .resume_cache_only_after_maintenance(filename, &|| {
+                            cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+                        })
+                        .ok()
+                        .flatten()
+                })
+                .filter(|entry| entry.mtime == req.mtime && entry.file_size == req.file_size)
+        } else {
+            cache_map.read().ok().and_then(|map| {
+                let entry = map.get(filename)?;
+                if entry.mtime == req.mtime && entry.file_size == req.file_size {
+                    Some(entry.clone())
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some(entry) = cached.filter(|entry| folder_cached_row_usable(req, entry, pin_db)) {
+            let ci = crate::catalog::decode_thumb_to_color_image(&entry.jpeg_data).map(|image| {
                 match pinned_page_adjustment.as_ref() {
                     Some(params) => crate::adjustment::apply_adjustments_fast(&image, params),
                     None => image,
@@ -1164,19 +2273,19 @@ pub fn process_load_request(
             // 通常 cache hit: 元ソースからの idle quality-upgrade 対象
             // source_dims はカタログ由来 (旧バージョンで作成された
             // エントリには None が入っている)
-            let _ = tx.send(ThumbMsg {
-                idx: req.idx,
-                image: ci,
-                origin: ThumbLoadOrigin::UpgradeableCache,
-                from_edit_preview: false,
-                edit_preview_adjustment: None,
-                source_dims,
-                layout_dims,
-                canceled: false,
-                finalized: false,
-                input_seq: req.input_seq,
-                items_gen: req.items_gen,
-            });
+            let _ = tx.send(ThumbMsg::from_legacy_parts(
+                req.idx,
+                ci,
+                ThumbLoadOrigin::UpgradeableCache,
+                false,
+                None,
+                entry.source_dims,
+                entry.layout_dims,
+                false,
+                false,
+                req.input_seq,
+                req.items_gen,
+            ));
             gen_done.fetch_add(1, Ordering::Relaxed);
             crate::logger::log(format!(
                 "    idx={:>4} cache_hit={cache_ms:>5.1}ms  {filename}",
@@ -1223,6 +2332,17 @@ pub fn process_load_request(
         return;
     }
 
+    if req.folder_thumb_provenance == Some(crate::catalog::FolderThumbProvenance::Seeded)
+        && req.resolve_override.is_none()
+        && req.zip_entry.is_none()
+        && req.pdf_page.is_none()
+    {
+        // A missing video-frame seed has no source decoder. Never fall through
+        // to folder auto-selection under its released pinned key.
+        send_thumb_failed(req, tx, gen_done);
+        return;
+    }
+
     // キャッシュミス or SourceOnly: フルデコード (+ 必要なら保存)
     // load_one_cached は Source origin を送信する
 
@@ -1261,47 +2381,50 @@ pub fn process_load_request(
     // フォルダサムネイル: フォルダ内の画像を探して代表画像のパスに差し替える。
     // pin-aware: 再帰中に見つけたサブフォルダに pin があれば cascade 解決して
     // leaf 画像、またはその子用に既に生成済みの pin WebP を採用する。
-    let (resolved_folder_image, cached_pinned_folder_thumb) = if is_folder_thumb {
-        let t_resolve = std::time::Instant::now();
-        let resolution = resolve_folder_thumb_image(
-            &req.path,
-            req.folder_thumb_sort
-                .unwrap_or(crate::settings::SortOrder::Numeric),
-            req.folder_thumb_depth,
-            pin_db,
-        );
-        let resolve_ms = t_resolve.elapsed().as_secs_f64() * 1000.0;
-        if resolve_ms > 10.0 {
-            crate::logger::log(format!(
-                "    idx={:>4} folder_resolve={resolve_ms:>6.1}ms  {}",
-                req.idx,
-                req.path.display(),
-            ));
-        }
-        match resolution {
-            Some(FolderThumbResolution::Image(path)) => (Some(path), None),
-            Some(FolderThumbResolution::CachedPinned(cached)) => (None, Some(cached)),
-            None => {
-                let _ = tx.send(ThumbMsg {
-                    idx: req.idx,
-                    image: None,
-                    origin: ThumbLoadOrigin::SourceIntrinsic,
-                    from_edit_preview: false,
-                    edit_preview_adjustment: None,
-                    source_dims: None,
-                    layout_dims: None,
-                    canceled: false,
-                    finalized: false,
-                    input_seq: req.input_seq,
-                    items_gen: req.items_gen,
-                });
-                gen_done.fetch_add(1, Ordering::Relaxed);
-                return;
+    let (resolved_folder_image, cached_pinned_folder_thumb, folder_selection_proof) =
+        if is_folder_thumb {
+            let t_resolve = std::time::Instant::now();
+            let (resolution, proof) = select_folder_thumb_image_with_cache_dir(
+                &req.path,
+                req.folder_thumb_sort
+                    .unwrap_or(crate::settings::SortOrder::Numeric),
+                req.folder_thumb_depth,
+                pin_db,
+                &crate::catalog::default_cache_dir(),
+                cancel,
+            );
+            let resolve_ms = t_resolve.elapsed().as_secs_f64() * 1000.0;
+            if resolve_ms > 10.0 {
+                crate::logger::log(format!(
+                    "    idx={:>4} folder_resolve={resolve_ms:>6.1}ms  {}",
+                    req.idx,
+                    req.path.display(),
+                ));
             }
-        }
-    } else {
-        (None, None)
-    };
+            match resolution {
+                Some(FolderThumbResolution::Image(path)) => (Some(path), None, proof),
+                Some(FolderThumbResolution::CachedPinned(cached)) => (None, Some(cached), proof),
+                None => {
+                    let _ = tx.send(ThumbMsg::from_legacy_parts(
+                        req.idx,
+                        None,
+                        ThumbLoadOrigin::SourceIntrinsic,
+                        false,
+                        None,
+                        None,
+                        None,
+                        cancel.is_some_and(|token| token.load(Ordering::Relaxed)),
+                        false,
+                        req.input_seq,
+                        req.items_gen,
+                    ));
+                    gen_done.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            }
+        } else {
+            (None, None, None)
+        };
     let load_path: &Path = resolved_folder_image.as_deref().unwrap_or(&req.path);
 
     // ZipFile (フォルダ一覧用サムネイル) の場合、UI スレッドでの ZIP I/O を避けるため
@@ -1361,19 +2484,19 @@ pub fn process_load_request(
                 resolved_zip_entry.as_deref()
             }
             None => {
-                let _ = tx.send(ThumbMsg {
-                    idx: req.idx,
-                    image: None,
-                    origin: ThumbLoadOrigin::SourceIntrinsic,
-                    from_edit_preview: false,
-                    edit_preview_adjustment: None,
-                    source_dims: None,
-                    layout_dims: None,
-                    canceled: false,
-                    finalized: false,
-                    input_seq: req.input_seq,
-                    items_gen: req.items_gen,
-                });
+                let _ = tx.send(ThumbMsg::from_legacy_parts(
+                    req.idx,
+                    None,
+                    ThumbLoadOrigin::SourceIntrinsic,
+                    false,
+                    None,
+                    None,
+                    None,
+                    false,
+                    false,
+                    req.input_seq,
+                    req.items_gen,
+                ));
                 gen_done.fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -1397,19 +2520,19 @@ pub fn process_load_request(
             }
             None => {
                 // ZIP 内に画像が無い場合は失敗として通知
-                let _ = tx.send(ThumbMsg {
-                    idx: req.idx,
-                    image: None,
-                    origin: ThumbLoadOrigin::SourceIntrinsic,
-                    from_edit_preview: false,
-                    edit_preview_adjustment: None,
-                    source_dims: None,
-                    layout_dims: None,
-                    canceled: false,
-                    finalized: false,
-                    input_seq: req.input_seq,
-                    items_gen: req.items_gen,
-                });
+                let _ = tx.send(ThumbMsg::from_legacy_parts(
+                    req.idx,
+                    None,
+                    ThumbLoadOrigin::SourceIntrinsic,
+                    false,
+                    None,
+                    None,
+                    None,
+                    false,
+                    false,
+                    req.input_seq,
+                    req.items_gen,
+                ));
                 gen_done.fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -1450,19 +2573,19 @@ pub fn process_load_request(
                     ],
                 );
             }
-            let _ = tx.send(ThumbMsg {
-                idx: req.idx,
-                image: None,
-                origin: ThumbLoadOrigin::SourceIntrinsic,
-                from_edit_preview: false,
-                edit_preview_adjustment: None,
-                source_dims: None,
-                layout_dims: None,
-                canceled: true,
-                finalized: false,
-                input_seq: req.input_seq,
-                items_gen: req.items_gen,
-            });
+            let _ = tx.send(ThumbMsg::from_legacy_parts(
+                req.idx,
+                None,
+                ThumbLoadOrigin::SourceIntrinsic,
+                false,
+                None,
+                None,
+                None,
+                true,
+                false,
+                req.input_seq,
+                req.items_gen,
+            ));
             gen_done.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -1478,13 +2601,14 @@ pub fn process_load_request(
         let mut mirrored = false;
         if should_save {
             let cat = catalog_ref.expect("should_save => catalog is Some");
-            match cat.save_thumb_bytes_with_layout_dims(
+            match cat.save_auto_folder_bytes(
                 filename,
                 req.mtime,
                 req.file_size,
                 cached.source_dims,
                 cached.layout_dims,
                 &cached.webp_data,
+                folder_selection_proof.as_ref(),
             ) {
                 Ok(true) => {
                     if let Ok(mut map) = cache_map.write() {
@@ -1496,6 +2620,10 @@ pub fn process_load_request(
                                 jpeg_data: cached.webp_data.clone(),
                                 source_dims: cached.source_dims,
                                 layout_dims: cached.layout_dims,
+                                folder_provenance: Some(
+                                    crate::catalog::FolderThumbProvenance::AutoSelected,
+                                ),
+                                selection_proof: folder_selection_proof.clone(),
                             },
                         );
                     }
@@ -1515,19 +2643,19 @@ pub fn process_load_request(
                 }
             }
         }
-        let _ = tx.send(ThumbMsg {
-            idx: req.idx,
-            image: Some(cached.image),
-            origin: ThumbLoadOrigin::FinalCache,
-            from_edit_preview: false,
-            edit_preview_adjustment: None,
-            source_dims: cached.source_dims,
-            layout_dims: cached.layout_dims,
-            canceled: false,
-            finalized: false,
-            input_seq: req.input_seq,
-            items_gen: req.items_gen,
-        });
+        let _ = tx.send(ThumbMsg::from_legacy_parts(
+            req.idx,
+            Some(cached.image),
+            ThumbLoadOrigin::FinalCache,
+            false,
+            None,
+            cached.source_dims,
+            cached.layout_dims,
+            false,
+            false,
+            req.input_seq,
+            req.items_gen,
+        ));
         gen_done.fetch_add(1, Ordering::Relaxed);
         crate::logger::log(format!(
             "    idx={:>4} recursive_pin_cache_hit mirrored={} source={}/{}  {}",
@@ -1583,19 +2711,19 @@ pub fn process_load_request(
                     ],
                 );
             }
-            let _ = tx.send(ThumbMsg {
-                idx: req.idx,
-                image: None,
-                origin: ThumbLoadOrigin::SourceIntrinsic,
-                from_edit_preview: false,
-                edit_preview_adjustment: None,
-                source_dims: None,
-                layout_dims: None,
-                canceled: true,
-                finalized: false,
-                input_seq: req.input_seq,
-                items_gen: req.items_gen,
-            });
+            let _ = tx.send(ThumbMsg::from_legacy_parts(
+                req.idx,
+                None,
+                ThumbLoadOrigin::SourceIntrinsic,
+                false,
+                None,
+                None,
+                None,
+                true,
+                false,
+                req.input_seq,
+                req.items_gen,
+            ));
             gen_done.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -1628,12 +2756,15 @@ pub fn process_load_request(
         None => None,
     };
 
+    let deferred_req = matches!(req.raw_source, LoadRequestSource::Original).then(|| req.clone());
+    let raw_source = req.raw_source.clone();
     load_one_cached(
         load_path,
         zip_entry_ref,
         preloaded_zip_bytes,
         verified_source_bytes,
         req.pdf_page,
+        epub_read,
         req.pdf_password.as_deref(),
         req.cache_key_override.as_deref(),
         req.idx,
@@ -1657,6 +2788,11 @@ pub fn process_load_request(
         req.force_cache,
         req.source_policy.bypasses_cache(),
         pinned_page_adjustment.as_ref(),
+        req.folder_thumb_provenance,
+        folder_selection_proof.as_ref(),
+        raw_source,
+        raw_handoff,
+        deferred_req,
     );
     if crate::perf::is_enabled() {
         let total_ms = req_t0.elapsed().as_secs_f64() * 1000.0;
@@ -1928,24 +3064,42 @@ fn panic_payload_to_string(payload: &Box<dyn std::any::Any + Send>) -> String {
 
 /// 実作業: cache hit 経由の pdf_meta catch-up (enumerate のみ、確信値 false で書き込み)
 fn process_meta_only(path: &Path, catalog: &crate::catalog::CatalogDb, cancel: &Arc<AtomicBool>) {
+    process_meta_only_with(path, catalog, cancel, |path, read, cancel| {
+        if let Some(read) = read {
+            crate::pdf_loader::enumerate_pages_with_read_target(
+                path,
+                read,
+                None,
+                Some(Arc::clone(cancel)),
+                crate::pdf_loader::EnumerateOptions::default(),
+            )
+            .map(|result| result.pages.len() as u32)
+        } else {
+            crate::pdf_loader::enumerate_pages_with_cancel(path, None, Some(Arc::clone(cancel)))
+                .map(|pages| pages.len() as u32)
+        }
+    });
+}
+
+fn process_meta_only_with(
+    path: &Path,
+    catalog: &crate::catalog::CatalogDb,
+    cancel: &Arc<AtomicBool>,
+    enumerate: impl FnOnce(
+        &Path,
+        Option<&crate::pdf_loader::ReadTarget>,
+        &Arc<AtomicBool>,
+    ) -> std::io::Result<u32>,
+) {
     if cancel.load(Ordering::Relaxed) {
         return;
     }
     let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
         return;
     };
-    let Ok(meta) = std::fs::metadata(path) else {
+    let Some((mtime, file_size, epub_read)) = pdf_derived_stamp(path) else {
         return;
     };
-    let Some(mtime) = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-    else {
-        return;
-    };
-    let file_size = meta.len() as i64;
 
     // pdf_meta が既に populate 済みなら skip (= enqueue から処理開始までの間に他経路が
     // 書き込んだケース)
@@ -1969,13 +3123,11 @@ fn process_meta_only(path: &Path, catalog: &crate::catalog::CatalogDb, cancel: &
     // `bump_catchup_epoch` によるフォルダ移動キャンセルが、走行中の MetaOnly enumerate も
     // Interrupted で抜けさせる (旧実装: cancel 非対応の `enumerate_pages` を呼んでいて
     // 走行中の MetaOnly は完走するまで PDF worker を占有していた)。
-    match crate::pdf_loader::enumerate_pages_with_cancel(path, None, Some(Arc::clone(cancel))) {
-        Ok(entries) => {
+    let result = enumerate(path, epub_read.as_ref(), cancel);
+    match result {
+        Ok(count) => {
             if let Err(e) = catalog.set_pdf_meta(
-                filename,
-                mtime,
-                file_size,
-                entries.len() as u32,
+                filename, mtime, file_size, count,
                 false, // password not required (enumerate succeeded without pw)
             ) {
                 crate::logger::log(format!(
@@ -2011,6 +3163,40 @@ fn is_password_required_error(msg: &str) -> bool {
     msg.contains("Password") || msg.contains("password")
 }
 
+/// Called on a background worker. EPUB uses one pinned generation for the whole
+/// derived-data operation; plain PDFs keep their existing file-stat behavior.
+fn pdf_derived_stamp(path: &Path) -> Option<(i64, i64, Option<crate::pdf_loader::ReadTarget>)> {
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+    {
+        let read = crate::pdf_loader::resolve_read_target(path).ok()?;
+        return resolved_epub_derived_stamp(read);
+    }
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    Some((mtime, meta.len() as i64, None))
+}
+
+fn resolved_epub_derived_stamp(
+    read: crate::pdf_loader::ReadTarget,
+) -> Option<(i64, i64, Option<crate::pdf_loader::ReadTarget>)> {
+    let (mtime, size) = read.stamp.generation_catalog_pair()?;
+    Some((mtime, size, Some(read)))
+}
+
+fn is_epub_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+}
+
 /// 実作業: neighbor prefetch (render page 0 + pdf_meta + WebP サムネ)
 fn process_neighbor_prefetch(
     path: &Path,
@@ -2022,18 +3208,9 @@ fn process_neighbor_prefetch(
     if cancel.load(Ordering::Relaxed) {
         return;
     }
-    let Ok(meta) = std::fs::metadata(path) else {
+    let Some((mtime, file_size, epub_read)) = pdf_derived_stamp(path) else {
         return;
     };
-    let Some(mtime) = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-    else {
-        return;
-    };
-    let file_size = meta.len() as i64;
     let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
         return;
     };
@@ -2071,16 +3248,31 @@ fn process_neighbor_prefetch(
     // 抜けて Normal 枠を即座に解放する。
     // neighbor prefetch は background なので epoch=0 (UI nav の bump で巻き込まれない)
     // + AbortOnCancel (background は cancel=フォルダ移動意図、harvest 不要)
-    let res = match crate::pdf_loader::render_page(
-        path,
-        0,
-        thumb_px,
-        None,
-        Some(Arc::clone(cancel)),
-        crate::pdf_loader::JobPriority::Normal,
-        0,
-        crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
-    ) {
+    let render = if let Some(read) = epub_read.as_ref() {
+        crate::pdf_loader::render_page_with_read_target(
+            path,
+            read,
+            0,
+            thumb_px,
+            None,
+            Some(Arc::clone(cancel)),
+            crate::pdf_loader::JobPriority::Normal,
+            0,
+            crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
+        )
+    } else {
+        crate::pdf_loader::render_page(
+            path,
+            0,
+            thumb_px,
+            None,
+            Some(Arc::clone(cancel)),
+            crate::pdf_loader::JobPriority::Normal,
+            0,
+            crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
+        )
+    };
+    let res = match render {
         Ok(r) => r,
         Err(e) => {
             let msg = format!("{e}");
@@ -2277,13 +3469,301 @@ struct CachedPinnedFolderThumb {
     cache_key: String,
 }
 
+#[cfg(test)]
+struct SelectionStampHook {
+    queries: std::sync::atomic::AtomicUsize,
+    cancel_after: usize,
+    token: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+fn selection_stamp_hooks()
+-> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Arc<SelectionStampHook>>>
+{
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Arc<SelectionStampHook>>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+struct FolderResolveContext<'a> {
+    cache_dir: &'a Path,
+    cancel: Option<&'a Arc<AtomicBool>>,
+    catalogs: std::collections::HashMap<std::path::PathBuf, Option<crate::catalog::CatalogDb>>,
+    dependencies: Vec<crate::catalog::CatalogProofDependency>,
+    pin_store: Option<crate::catalog::CatalogProofState>,
+}
+
+impl FolderResolveContext<'_> {
+    fn cancelled(&self) -> bool {
+        self.cancel
+            .is_some_and(|token| token.load(Ordering::Relaxed))
+    }
+
+    fn pin_lookup(
+        &mut self,
+        pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+        path: &Path,
+    ) -> Option<crate::folder_thumb_pins::FolderPinSource> {
+        use crate::catalog::CatalogProofState;
+        let Some(pin_db) = pin_db else {
+            self.pin_store = Some(CatalogProofState::Unverifiable);
+            return None;
+        };
+        match pin_db.lookup_for_selection(path) {
+            Ok((source, revision)) => {
+                let state = CatalogProofState::Present(revision);
+                match self.pin_store.as_ref() {
+                    None => self.pin_store = Some(state),
+                    Some(previous) if *previous != state => {
+                        self.pin_store = Some(CatalogProofState::Unverifiable)
+                    }
+                    _ => {}
+                }
+                source
+            }
+            Err(error) => {
+                crate::logger::log(format!(
+                    "folder selection pin lookup failed: {}: {error}",
+                    path.display()
+                ));
+                self.pin_store = Some(CatalogProofState::Unverifiable);
+                None
+            }
+        }
+    }
+
+    fn record_dependency(&mut self, directory: &Path, state: crate::catalog::CatalogProofState) {
+        if let Some(previous) = self
+            .dependencies
+            .iter_mut()
+            .find(|dependency| dependency.directory == directory)
+        {
+            if previous.state != state {
+                previous.state = crate::catalog::CatalogProofState::Unverifiable;
+            }
+            return;
+        }
+        self.dependencies
+            .push(crate::catalog::CatalogProofDependency {
+                directory: directory.to_path_buf(),
+                state,
+            });
+    }
+
+    fn ensure_catalog(&mut self, directory: &Path) {
+        if self.catalogs.contains_key(directory) {
+            return;
+        }
+        use crate::catalog::{CatalogDb, CatalogProofState};
+        let opened = CatalogDb::open_for_folder_selection(self.cache_dir, directory);
+        let catalog = match opened {
+            Ok(Some(catalog)) => Some(catalog),
+            Ok(None) => {
+                self.record_dependency(directory, CatalogProofState::Absent);
+                None
+            }
+            Err(error) => {
+                crate::logger::log(format!(
+                    "folder selection catalog open failed: {}: {error}",
+                    directory.display()
+                ));
+                self.record_dependency(directory, CatalogProofState::Unverifiable);
+                None
+            }
+        };
+        self.catalogs.insert(directory.to_path_buf(), catalog);
+    }
+
+    fn cached_candidate(
+        &mut self,
+        directory: &Path,
+        key: &str,
+        source_path: &Path,
+        expected_mtime: i64,
+        expected_size: i64,
+    ) -> Option<CachedPinnedFolderThumb> {
+        self.ensure_catalog(directory);
+        if self.cancelled() {
+            return None;
+        }
+        let snapshot = self
+            .catalogs
+            .get(directory)?
+            .as_ref()?
+            .load_stamp_snapshot(key);
+        #[cfg(test)]
+        if let Some(hook) = selection_stamp_hooks()
+            .lock()
+            .unwrap()
+            .get(directory)
+            .cloned()
+        {
+            let queries = hook.queries.fetch_add(1, Ordering::Relaxed) + 1;
+            if queries == hook.cancel_after {
+                hook.token.store(true, Ordering::Relaxed);
+            }
+        }
+        let (state, stamp) = match snapshot {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                crate::logger::log(format!(
+                    "folder selection stamp lookup failed: {}: {error}",
+                    directory.display()
+                ));
+                self.record_dependency(directory, crate::catalog::CatalogProofState::Unverifiable);
+                return None;
+            }
+        };
+        self.record_dependency(directory, state);
+        if self.cancelled() || stamp != Some((expected_mtime, expected_size)) {
+            return None;
+        }
+        let entry = self
+            .catalogs
+            .get(directory)?
+            .as_ref()?
+            .load_one(key)
+            .ok()??;
+        if (entry.mtime, entry.file_size) != (expected_mtime, expected_size) {
+            return None;
+        }
+        let image = crate::catalog::decode_thumb_to_color_image(&entry.jpeg_data)?;
+        Some(CachedPinnedFolderThumb {
+            image,
+            webp_data: entry.jpeg_data,
+            source_dims: entry.source_dims,
+            layout_dims: entry.layout_dims,
+            source_path: source_path.to_path_buf(),
+            source_mtime: expected_mtime,
+            source_file_size: expected_size,
+            cache_key: key.to_owned(),
+        })
+    }
+}
+
+fn folder_cached_row_usable(
+    req: &LoadRequest,
+    entry: &crate::catalog::CacheEntry,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+) -> bool {
+    folder_cached_row_usable_in_cache_dir_with_pins(
+        req,
+        entry,
+        &crate::catalog::default_cache_dir(),
+        pin_db,
+    )
+}
+
+#[cfg(test)]
+fn folder_cached_row_usable_in_cache_dir(
+    req: &LoadRequest,
+    entry: &crate::catalog::CacheEntry,
+    cache_dir: &Path,
+) -> bool {
+    folder_cached_row_usable_in_cache_dir_with_pins(req, entry, cache_dir, None)
+}
+
+fn folder_cached_row_usable_in_cache_dir_with_pins(
+    req: &LoadRequest,
+    entry: &crate::catalog::CacheEntry,
+    cache_dir: &Path,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+) -> bool {
+    use crate::catalog::{CatalogDb, CatalogProofState, FolderThumbProvenance};
+    match req.folder_thumb_provenance {
+        None => true,
+        Some(FolderThumbProvenance::Seeded) => {
+            // Released leaf-pin and video-frame rows have no provenance field.
+            entry.folder_provenance != Some(FolderThumbProvenance::AutoSelected)
+        }
+        Some(FolderThumbProvenance::AutoSelected) => {
+            let started = std::time::Instant::now();
+            let proof = entry.selection_proof.as_ref();
+            let valid = entry.folder_provenance == Some(FolderThumbProvenance::AutoSelected)
+                && proof.is_some_and(|proof| {
+                    let pins_valid = match &proof.pin_store {
+                        crate::catalog::PinStoreProof::NotConsulted => true,
+                        crate::catalog::PinStoreProof::Observed(CatalogProofState::Present(
+                            expected,
+                        )) => pin_db
+                            .and_then(|db| db.selection_revision().ok())
+                            .is_some_and(|current| current == *expected),
+                        crate::catalog::PinStoreProof::Observed(
+                            CatalogProofState::Absent | CatalogProofState::Unverifiable,
+                        ) => false,
+                    };
+                    let dependencies_valid = proof.directories.iter().all(|dependency| {
+                        if dependency.state == CatalogProofState::Unverifiable {
+                            return false;
+                        }
+                        let current = match CatalogDb::open_for_folder_selection(
+                            cache_dir,
+                            &dependency.directory,
+                        ) {
+                            Ok(Some(db)) => db.revision_state(),
+                            Ok(None) => CatalogProofState::Absent,
+                            Err(_) => CatalogProofState::Unverifiable,
+                        };
+                        current == dependency.state
+                    });
+                    let winner_valid = if is_epub_path(&proof.winner.path) {
+                        pdf_derived_stamp(&proof.winner.path).is_some_and(|(mtime, size, _)| {
+                            mtime == proof.winner.mtime && size == proof.winner.file_size
+                        })
+                    } else {
+                        std::fs::metadata(&proof.winner.path).is_ok_and(|metadata| {
+                            crate::ui_helpers::mtime_secs(&metadata) == proof.winner.mtime
+                                && (if metadata.is_dir() {
+                                    0
+                                } else {
+                                    metadata.len() as i64
+                                }) == proof.winner.file_size
+                        })
+                    };
+                    pins_valid && dependencies_valid && winner_valid
+                });
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "thumb",
+                    "folder_proof_validate",
+                    req.cache_key_override.as_deref(),
+                    req.input_seq,
+                    &[
+                        (
+                            "length",
+                            serde_json::Value::from(proof.map_or(0, |p| {
+                                p.directories.len()
+                                    + usize::from(matches!(
+                                        &p.pin_store,
+                                        crate::catalog::PinStoreProof::Observed(_)
+                                    ))
+                            })),
+                        ),
+                        (
+                            "ms",
+                            serde_json::Value::from(started.elapsed().as_secs_f64() * 1000.0),
+                        ),
+                        ("valid", serde_json::Value::from(valid)),
+                        (
+                            "outcome",
+                            serde_json::Value::from(if valid { "hit" } else { "reselect" }),
+                        ),
+                    ],
+                );
+            }
+            valid
+        }
+    }
+}
+
 /// `child_folder` が直上の一覧で表示されたときの pin WebP を完全一致キーで読む。
 ///
 /// この経路は cache-only。DB ファイルや行が無い、metadata が古い、WebP が壊れている
 /// 場合はいずれも `None` とし、呼び出し元が従来の自動選定へ戻る。PDF render / ZIP scan
 /// など元ソースの生成処理は一切呼ばない。
 fn load_cached_pinned_folder_thumb(
-    cache_dir: &Path,
+    context: &mut FolderResolveContext<'_>,
     parent_folder: &Path,
     child_folder: &Path,
     sort: crate::settings::SortOrder,
@@ -2291,60 +3771,27 @@ fn load_cached_pinned_folder_thumb(
     resolved: &crate::folder_thumb_pins::ResolvedPinTarget,
 ) -> Option<CachedPinnedFolderThumb> {
     let use_full_path = crate::path_key::is_drive_or_share_root(parent_folder);
-    let base_key =
-        folder_thumb_auto_cache_key_for_path(child_folder, use_full_path, sort, configured_depth)?;
-    let cache_key = format!("{base_key}{CACHE_KEY_PIN_SUFFIX}{}", resolved.source_id);
-    let catalog = match crate::catalog::CatalogDb::open_existing_read_only(cache_dir, parent_folder)
-    {
-        Ok(Some(catalog)) => catalog,
-        Ok(None) => return None,
-        Err(error) => {
-            crate::logger::log(format!(
-                "  recursive pin cache open failed: folder={} error={error}",
-                parent_folder.display()
-            ));
-            return None;
-        }
-    };
-    let entry = match catalog.load_one(&cache_key) {
-        Ok(Some(entry)) => entry,
-        Ok(None) => return None,
-        Err(error) => {
-            crate::logger::log(format!(
-                "  recursive pin cache lookup failed: key={cache_key} error={error}"
-            ));
-            return None;
-        }
-    };
-    if entry.mtime != resolved.mtime || entry.file_size != resolved.file_size {
-        crate::logger::log(format!(
-            "  recursive pin cache stale: key={cache_key} cached={}/{} source={}/{}",
-            entry.mtime, entry.file_size, resolved.mtime, resolved.file_size
-        ));
-        return None;
-    }
-    let Some(image) = crate::catalog::decode_thumb_to_color_image(&entry.jpeg_data) else {
-        crate::logger::log(format!(
-            "  recursive pin cache decode failed: key={cache_key}"
-        ));
-        return None;
-    };
-    crate::logger::log(format!("  recursive pin cache hit: key={cache_key}"));
-    Some(CachedPinnedFolderThumb {
-        image,
-        webp_data: entry.jpeg_data,
-        source_dims: entry.source_dims,
-        layout_dims: entry.layout_dims,
-        source_path: resolved.abs_path.clone(),
-        source_mtime: resolved.mtime,
-        source_file_size: resolved.file_size,
-        cache_key,
-    })
+    let base_key = folder_thumb_cache_key_for_path(
+        child_folder,
+        use_full_path,
+        sort,
+        configured_depth,
+        crate::catalog::FolderThumbProvenance::Seeded,
+    )?;
+    let (mtime, size, generation) =
+        if resolved.pdf_page.is_some() && is_epub_path(&resolved.abs_path) {
+            let (mtime, size, _) = pdf_derived_stamp(&resolved.abs_path)?;
+            (mtime, size, Some((mtime, size)))
+        } else {
+            (resolved.mtime, resolved.file_size, None)
+        };
+    let cache_key = pinned_folder_row_key(&base_key, &resolved.source_id, generation);
+    context.cached_candidate(parent_folder, &cache_key, &resolved.abs_path, mtime, size)
 }
 
 /// フォルダ内をスキャンして代表画像、または再利用可能な pin WebP を返す。
-/// `sort` で指定されたソート順でフォルダブロックと画像ブロックをそれぞれ並べ、
-/// サムネイル一覧に近い順序 (フォルダ → 画像) で最初に見つかった画像を選ぶ。
+/// 各階層で direct image を指定ソート順で優先し、その後に子フォルダと
+/// 既存 catalog WebP を持つ ZIP/PDF を同じソート列で調べる。
 /// サブフォルダ再帰は最大 `remaining_depth` 階層。
 ///
 /// `pin_db` が `Some` のとき、サブフォルダ再帰の各段で「そのサブフォルダ自身に
@@ -2373,13 +3820,35 @@ fn resolve_folder_thumb_image_with_cache_dir(
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
     cache_dir: &Path,
 ) -> Option<FolderThumbResolution> {
+    select_folder_thumb_image_with_cache_dir(folder, sort, remaining_depth, pin_db, cache_dir, None)
+        .0
+}
+
+fn select_folder_thumb_image_with_cache_dir(
+    folder: &Path,
+    sort: crate::settings::SortOrder,
+    remaining_depth: u32,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+    cache_dir: &Path,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> (
+    Option<FolderThumbResolution>,
+    Option<crate::catalog::FolderSelectionProof>,
+) {
+    let mut context = FolderResolveContext {
+        cache_dir,
+        cancel,
+        catalogs: std::collections::HashMap::new(),
+        dependencies: Vec::new(),
+        pin_store: None,
+    };
     let result = resolve_folder_thumb_image_inner(
         folder,
         sort,
         remaining_depth,
         remaining_depth,
         pin_db,
-        cache_dir,
+        &mut context,
     );
     // pin 経路の切り分け用診断ログ (= 最上位 entry 点のみ。再帰ステップ内側は出さない)
     let result_label = match result.as_ref() {
@@ -2397,7 +3866,71 @@ fn resolve_folder_thumb_image_with_cache_dir(
         pin_db.is_some(),
         result_label,
     ));
-    result
+    let proof = result.as_ref().and_then(|resolution| {
+        let (path, archive_row_key, epub_stamp) = match resolution {
+            FolderThumbResolution::Image(path) => (path.as_path(), None, None),
+            FolderThumbResolution::CachedPinned(cached) => (
+                cached.source_path.as_path(),
+                Some(cached.cache_key.clone()),
+                is_epub_path(&cached.source_path)
+                    .then_some((cached.source_mtime, cached.source_file_size)),
+            ),
+        };
+        let stamp = if let Some(stamp) = epub_stamp {
+            stamp
+        } else {
+            let metadata = std::fs::metadata(path).ok()?;
+            (
+                crate::ui_helpers::mtime_secs(&metadata),
+                if metadata.is_dir() {
+                    0
+                } else {
+                    metadata.len() as i64
+                },
+            )
+        };
+        Some(crate::catalog::FolderSelectionProof {
+            directories: context.dependencies,
+            pin_store: context.pin_store.map_or(
+                crate::catalog::PinStoreProof::NotConsulted,
+                crate::catalog::PinStoreProof::Observed,
+            ),
+            winner: crate::catalog::FolderSelectionWinner {
+                path: path.to_path_buf(),
+                mtime: stamp.0,
+                file_size: stamp.1,
+                archive_row_key,
+            },
+        })
+    });
+    (result, proof)
+}
+
+struct FolderCandidate {
+    path: std::path::PathBuf,
+    sort_mtime: i64,
+    is_dir: bool,
+    pin: Option<crate::folder_thumb_pins::ResolvedPinTarget>,
+    has_active_pin: bool,
+    cache_key: Option<String>,
+    expected_stamp: Option<(i64, i64)>,
+}
+
+fn archive_tile_key(path: &Path, parent: &Path) -> Option<String> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    let prefix = if crate::folder_tree::is_zip_extension(&ext) {
+        CACHE_KEY_ZIP
+    } else if crate::folder_tree::is_paged_document_path(path) {
+        CACHE_KEY_PDF
+    } else {
+        return None;
+    };
+    let identity = if crate::path_key::is_drive_or_share_root(parent) {
+        path.to_string_lossy().into_owned()
+    } else {
+        path.file_name()?.to_str()?.to_owned()
+    };
+    Some(format!("{prefix}{identity}"))
 }
 
 fn resolve_folder_thumb_image_inner(
@@ -2406,126 +3939,88 @@ fn resolve_folder_thumb_image_inner(
     remaining_depth: u32,
     configured_depth: u32,
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
-    cache_dir: &Path,
+    context: &mut FolderResolveContext<'_>,
 ) -> Option<FolderThumbResolution> {
+    if context.cancelled() {
+        return None;
+    }
+    let sort = sort.sanitized_for_folder_thumb();
     fn mtime_for_sort(entry: &std::fs::DirEntry, sort: crate::settings::SortOrder) -> i64 {
         match sort {
             crate::settings::SortOrder::DateAsc | crate::settings::SortOrder::DateDesc => entry
                 .metadata()
                 .ok()
                 .map_or(0, |m| crate::ui_helpers::mtime_secs(&m)),
-            crate::settings::SortOrder::FileName | crate::settings::SortOrder::Numeric => 0,
+            crate::settings::SortOrder::FileName
+            | crate::settings::SortOrder::FileNameDesc
+            | crate::settings::SortOrder::Numeric
+            | crate::settings::SortOrder::NumericDesc
+            | crate::settings::SortOrder::SizeAsc
+            | crate::settings::SortOrder::SizeDesc
+            | crate::settings::SortOrder::RatingAsc
+            | crate::settings::SortOrder::RatingDesc => 0,
         }
     }
 
     let entries = std::fs::read_dir(folder).ok()?;
     let mut images: Vec<(std::path::PathBuf, i64)> = Vec::new();
-    let mut subdirs: Vec<(std::path::PathBuf, i64)> = Vec::new();
+    let mut children: Vec<FolderCandidate> = Vec::new();
 
     for entry in entries.flatten() {
-        // entry.file_type() は FindFirstFile/FindNextFile の戻り値キャッシュを再利用するので
-        // per-entry GetFileAttributes syscall が走らない (docs/ui-responsiveness.md §4)。
-        // この関数は heavy I/O worker で動くが、大量フォルダで代表画像解決が詰まると
-        // 可視サムネ処理が連鎖遅延するので file_type ベースにしておく。
-        let Ok(ft) = entry.file_type() else {
-            continue;
-        };
-        let p = entry.path();
-        let kind = crate::fs_entry::classify_dir_entry(&entry, &ft);
-        if kind.is_directory() {
-            let mtime = mtime_for_sort(&entry, sort);
-            subdirs.push((p, mtime));
-        } else if kind.is_file() {
-            if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-                if crate::folder_tree::is_recognized_image_ext(&ext.to_ascii_lowercase()) {
-                    let mtime = mtime_for_sort(&entry, sort);
-                    images.push((p, mtime));
-                }
-            }
+        if context.cancelled() {
+            return None;
         }
-    }
-
-    // サムネイル一覧はフォルダブロックを画像より先に出すため、代表サムネも
-    // キャッシュミス時の自動選定ではサブフォルダを先に辿る。
-    if remaining_depth > 0 {
-        let mut keyed_subdirs: Vec<_> = subdirs
-            .into_iter()
-            .map(|(path, mtime)| {
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                let key = sort.name_key(name);
-                (path, mtime, key)
-            })
-            .collect();
-        keyed_subdirs
-            .sort_by(|(_, a_mt, ak), (_, b_mt, bk)| sort.compare_name_keys(ak, *a_mt, bk, *b_mt));
-        subdirs = keyed_subdirs
-            .into_iter()
-            .map(|(path, mtime, _)| (path, mtime))
-            .collect();
-        for (sub, _) in &subdirs {
-            // pin-aware: サブフォルダ自身に pin があれば cascade 解決して
-            // leaf 画像を優先採用する。`folder_thumb_depth` を cascade depth 上限と
-            // 兼用する (= 設定値が両方の動作上限になる)。
-            if let Some(db) = pin_db {
-                if let Some(source) = db.lookup(sub) {
-                    let lookup = |p: &std::path::Path| db.lookup(p);
-                    if let Some(resolved) =
-                        crate::folder_thumb_pins::resolve_pin_target_cascaded_via(
-                            sub,
-                            &source,
-                            lookup,
-                            configured_depth as usize,
+        // DirEntry::file_type/metadata use the enumeration data on Windows.
+        let Ok(ft) = entry.file_type() else { continue };
+        let path = entry.path();
+        let kind = crate::fs_entry::classify_dir_entry(&entry, &ft);
+        let sort_mtime = mtime_for_sort(&entry, sort);
+        if kind.is_directory() {
+            children.push(FolderCandidate {
+                path,
+                sort_mtime,
+                is_dir: true,
+                pin: None,
+                has_active_pin: false,
+                cache_key: None,
+                expected_stamp: None,
+            });
+        } else if kind.is_file() {
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_ascii_lowercase);
+            if ext
+                .as_deref()
+                .is_some_and(crate::folder_tree::is_recognized_image_ext)
+            {
+                images.push((path, sort_mtime));
+            } else if remaining_depth > 0
+                && ext.as_deref().is_some_and(|ext| {
+                    crate::folder_tree::is_zip_extension(ext)
+                        || crate::folder_tree::is_paged_document_path(&path)
+                })
+            {
+                let stamp = if is_epub_path(&path) {
+                    // Resolve only when this candidate reaches the cache lookup below.
+                    None
+                } else {
+                    entry.metadata().ok().map(|metadata| {
+                        (
+                            crate::ui_helpers::mtime_secs(&metadata),
+                            metadata.len() as i64,
                         )
-                    {
-                        use crate::folder_thumb_pins::ResolvedKind;
-                        match resolved.kind {
-                            ResolvedKind::Image => {
-                                return Some(FolderThumbResolution::Image(resolved.abs_path));
-                            }
-                            ResolvedKind::Folder => {
-                                // cascade が pin 無し Folder leaf に到達。
-                                // そのフォルダで通常の auto-pick を続ける (pin-aware で)。
-                                if let Some(img) = resolve_folder_thumb_image_inner(
-                                    &resolved.abs_path,
-                                    sort,
-                                    remaining_depth - 1,
-                                    configured_depth,
-                                    pin_db,
-                                    cache_dir,
-                                ) {
-                                    return Some(img);
-                                }
-                                // 見つからなければ次のサブフォルダへ
-                                continue;
-                            }
-                            // 非画像 pin は元ソースを生成せず、その子が直上一覧で既に
-                            // 生成した完全一致 WebP だけを使う。無ければ従来の標準再帰へ。
-                            _ => {
-                                if let Some(cached) = load_cached_pinned_folder_thumb(
-                                    cache_dir,
-                                    folder,
-                                    sub,
-                                    sort,
-                                    configured_depth,
-                                    &resolved,
-                                ) {
-                                    return Some(FolderThumbResolution::CachedPinned(cached));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            // 標準再帰 (pin 無し or 非 Image/Folder pin)
-            if let Some(img) = resolve_folder_thumb_image_inner(
-                sub,
-                sort,
-                remaining_depth - 1,
-                configured_depth,
-                pin_db,
-                cache_dir,
-            ) {
-                return Some(img);
+                    })
+                };
+                children.push(FolderCandidate {
+                    path,
+                    sort_mtime,
+                    is_dir: false,
+                    pin: None,
+                    has_active_pin: false,
+                    cache_key: None,
+                    expected_stamp: stamp,
+                });
             }
         }
     }
@@ -2535,21 +4030,160 @@ fn resolve_folder_thumb_image_inner(
             .into_iter()
             .map(|(path, mtime)| {
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                let key = sort.name_key(name);
-                (path, mtime, key)
+                let name_key = sort.name_key(name);
+                (path, mtime, name_key)
             })
             .collect();
         keyed_images
             .sort_by(|(_, a_mt, ak), (_, b_mt, bk)| sort.compare_name_keys(ak, *a_mt, bk, *b_mt));
-        images = keyed_images
-            .into_iter()
-            .map(|(path, mtime, _)| (path, mtime))
-            .collect();
-        return Some(FolderThumbResolution::Image(
-            images.into_iter().next().unwrap().0,
-        ));
+        return Some(FolderThumbResolution::Image(keyed_images.remove(0).0));
+    }
+    if remaining_depth == 0 {
+        return None;
     }
 
+    let mut keyed_children: Vec<_> = children
+        .into_iter()
+        .map(|candidate| {
+            let name = candidate
+                .path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            let key = sort.name_key(name);
+            (candidate, key)
+        })
+        .collect();
+    keyed_children
+        .sort_by(|(a, ak), (b, bk)| sort.compare_name_keys(ak, a.sort_mtime, bk, b.sort_mtime));
+    let children: Vec<FolderCandidate> = keyed_children
+        .into_iter()
+        .map(|(candidate, _)| candidate)
+        .collect();
+
+    // Resolve and query only the candidate currently under consideration.
+    // In particular, a winning first archive never queries later archive rows.
+    for mut candidate in children {
+        if context.cancelled() {
+            return None;
+        }
+        let active_source = context.pin_lookup(pin_db, &candidate.path);
+        candidate.has_active_pin = active_source.is_some();
+        candidate.pin = active_source.as_ref().and_then(|source| {
+            crate::folder_thumb_pins::resolve_pin_target_cascaded_via(
+                &candidate.path,
+                source,
+                |path| context.pin_lookup(pin_db, path),
+                configured_depth as usize,
+            )
+        });
+        if candidate.is_dir {
+            if let Some(pin) = candidate.pin.as_ref()
+                && !matches!(
+                    pin.kind,
+                    crate::folder_thumb_pins::ResolvedKind::Image
+                        | crate::folder_thumb_pins::ResolvedKind::Folder
+                )
+            {
+                let use_full_path = crate::path_key::is_drive_or_share_root(folder);
+                if let Some(base) = folder_thumb_cache_key_for_path(
+                    &candidate.path,
+                    use_full_path,
+                    sort,
+                    configured_depth,
+                    crate::catalog::FolderThumbProvenance::Seeded,
+                ) {
+                    candidate.cache_key =
+                        Some(format!("{base}{CACHE_KEY_PIN_SUFFIX}{}", pin.source_id));
+                    candidate.expected_stamp = Some((pin.mtime, pin.file_size));
+                }
+            }
+        } else if !candidate.has_active_pin || candidate.pin.is_some() {
+            let Some(base) = archive_tile_key(&candidate.path, folder) else {
+                continue;
+            };
+            candidate.cache_key = Some(match candidate.pin.as_ref() {
+                Some(pin) => format!("{base}{CACHE_KEY_PIN_SUFFIX}{}", pin.source_id),
+                None => base,
+            });
+            if let Some(pin) = candidate.pin.as_ref() {
+                candidate.expected_stamp = Some((pin.mtime, pin.file_size));
+            }
+        }
+        if !candidate.is_dir {
+            let target = candidate
+                .pin
+                .as_ref()
+                .map_or(candidate.path.as_path(), |pin| pin.abs_path.as_path());
+            if is_epub_path(target) {
+                let Some((mtime, size, _)) = pdf_derived_stamp(target) else {
+                    continue;
+                };
+                candidate.expected_stamp = Some((mtime, size));
+                if let Some(key) = candidate.cache_key.as_mut()
+                    && key.contains(CACHE_KEY_PIN_SUFFIX)
+                {
+                    key.push_str(&format!("|generation:{mtime}:{size}"));
+                }
+            }
+        }
+        if context.cancelled() {
+            return None;
+        }
+        if candidate.is_dir {
+            if let Some(pin) = candidate.pin.as_ref() {
+                use crate::folder_thumb_pins::ResolvedKind;
+                match pin.kind {
+                    ResolvedKind::Image => {
+                        return Some(FolderThumbResolution::Image(pin.abs_path.clone()));
+                    }
+                    ResolvedKind::Folder => {
+                        if let Some(result) = resolve_folder_thumb_image_inner(
+                            &pin.abs_path,
+                            sort,
+                            remaining_depth - 1,
+                            configured_depth,
+                            pin_db,
+                            context,
+                        ) {
+                            return Some(result);
+                        }
+                        continue;
+                    }
+                    _ => {
+                        if let Some(cached) = load_cached_pinned_folder_thumb(
+                            context,
+                            folder,
+                            &candidate.path,
+                            sort,
+                            configured_depth,
+                            pin,
+                        ) {
+                            return Some(FolderThumbResolution::CachedPinned(cached));
+                        }
+                    }
+                }
+            }
+            if let Some(result) = resolve_folder_thumb_image_inner(
+                &candidate.path,
+                sort,
+                remaining_depth - 1,
+                configured_depth,
+                pin_db,
+                context,
+            ) {
+                return Some(result);
+            }
+        } else if let (Some(key), Some((mtime, size))) =
+            (candidate.cache_key.as_deref(), candidate.expected_stamp)
+        {
+            if let Some(cached) =
+                context.cached_candidate(folder, key, &candidate.path, mtime, size)
+            {
+                return Some(FolderThumbResolution::CachedPinned(cached));
+            }
+        }
+    }
     None
 }
 
@@ -2559,13 +4193,22 @@ fn resolve_folder_thumb_image_inner(
 /// この計装が唯一守ろうとしている信号なので、足せない形にしておく。
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct ThumbLoadPhases {
-    /// デコード全体。PDF では render 往復と orientation を含む。
+    /// Decode within this worker span, including PDF render and orientation.
     decode_ms: f64,
+    /// Prior RAW executor wait/develop, outside this span and its thread cycles.
+    /// Diagnostic detail only; never add to or subtract from the worker total.
+    raw_async_decode_ms: Option<f64>,
     display_ms: f64,
     send_display_ms: f64,
     cache_encode_ms: f64,
     cache_save_ms: f64,
     cache_map_ms: f64,
+    offer_raster: crate::perf::stall::Timing,
+    stats: crate::perf::stall::Timing,
+    normal_log: crate::perf::stall::Timing,
+    perf_log: crate::perf::stall::Timing,
+    /// Nested in offer_raster; mutex acquisition plus similar prefill SQL.
+    prefill_db: crate::perf::stall::Timing,
     /// 以下は `decode_ms` の内訳。合計には入れない。
     render_ms: Option<f64>,
     orientation_ms: f64,
@@ -2580,11 +4223,26 @@ impl ThumbLoadPhases {
             + self.cache_encode_ms
             + self.cache_save_ms
             + self.cache_map_ms
+            + self.offer_raster.ms
+            + self.stats.ms
+            + self.normal_log.ms
+            + self.perf_log.ms
     }
 
     /// 名前の付いていない時間。負にはしない (計測誤差で負値を出さない)。
     fn unaccounted_ms(&self, total_ms: f64) -> f64 {
         (total_ms - self.disjoint_total_ms()).max(0.0)
+    }
+}
+
+#[track_caller]
+fn measured_thumbnail_log(message: String, total: &mut crate::perf::stall::Timing) {
+    let at = crate::perf::stall::Span::start();
+    crate::logger::log(message);
+    if let Some(at) = at {
+        let timing = at.finish();
+        total.ms += timing.ms;
+        total.cycles += timing.cycles;
     }
 }
 
@@ -2612,6 +4270,7 @@ pub fn load_one_cached(
     // Some のとき通常ファイル path を decoder へ渡してはならない。
     verified_source_bytes: Option<Vec<u8>>,
     pdf_page: Option<u32>,
+    epub_read: Option<&crate::pdf_loader::ReadTarget>,
     pdf_password: Option<&str>,
     cache_key_override: Option<&str>,
     idx: usize,
@@ -2651,8 +4310,14 @@ pub fn load_one_cached(
     // 手動固定した親代表へ伝播する、固定元ページの個別色調補正。
     // 通常ページは UI 側の `effective_params` で処理するため None。
     pinned_page_adjustment: Option<&crate::adjustment::AdjustParams>,
+    folder_provenance: Option<crate::catalog::FolderThumbProvenance>,
+    folder_selection_proof: Option<&crate::catalog::FolderSelectionProof>,
+    raw_source: LoadRequestSource,
+    raw_handoff: Option<&RawThumbHandoff>,
+    deferred_req: Option<LoadRequest>,
 ) {
     let total_started = std::time::Instant::now();
+    let total_cycles_started = crate::perf::stall::TotalCycles::start();
     // カタログキー (保存・参照で一致させる) と表示名 (ログ用) を分離。
     // process_load_request 側と同じキー形式を使うこと。
     // cache_key_override が Some のとき: フォルダ一覧の ZipFile/PdfFile 用キーを優先。
@@ -2678,7 +4343,8 @@ pub fn load_one_cached(
     // 1. ZIP エントリ:    ZIP を開いてエントリのバイト列を取り出してから image クレートで decode
     //                     失敗時は WIC (SHCreateMemStream + CreateDecoderFromStream) にフォールバック
     // 2. 通常ファイル:    image クレート (拡張子 → マジックバイトの二段構え)
-    //                     失敗時は WIC にフォールバック (HEIC / AVIF / JXL / RAW 等)
+    //                     失敗時は WIC にフォールバック (HEIC / AVIF / JXL 等)
+    // RAW は上記より先に LibRaw の preview または half 現像へ分岐する。
     //
     // どのデコーダ経路で成功したかを `decode_source` に記録し、後段の統計に渡す。
     // JPEG パスでは TurboJPEG DCT scale も試み、成功時は `dct_stats` を立てて
@@ -2691,7 +4357,188 @@ pub fn load_one_cached(
     let mut byte_orientation: u16 = 1;
     let mut render_ms: Option<f64> = None;
     let has_verified_source = verified_source_bytes.is_some();
-    let img_result = if let Some(page_num) = pdf_page {
+    let is_raw = zip_entry
+        .map(|entry| crate::raw_format::is_raw_path(Path::new(entry)))
+        .unwrap_or_else(|| crate::raw_format::is_raw_path(path));
+    let mut raw_developed_dims = None;
+    let mut raw_decode_ms = None;
+    enum RawHandoffControl {
+        Continue,
+        Deferred,
+    }
+    let mut raw_handoff_control = RawHandoffControl::Continue;
+    let img_result = if let LoadRequestSource::RawHalfDeveloped {
+        image,
+        developed_dims,
+        decode_ms,
+        ..
+    } = raw_source
+    {
+        decode_source = crate::stats::DecodeSource::Raw;
+        raw_developed_dims = Some((developed_dims[0], developed_dims[1]));
+        raw_decode_ms = Some(decode_ms);
+        Ok(image)
+    } else if is_raw {
+        decode_source = crate::stats::DecodeSource::Raw;
+        let source_result: Result<crate::raw::RawOwnedSource, image::ImageError> =
+            if let Some(bytes) = verified_source_bytes {
+                Ok(crate::raw::RawOwnedSource::Bytes(Arc::from(bytes)))
+            } else if let Some(entry_name) = zip_entry {
+                match preloaded_zip_bytes {
+                    Some(bytes) => Ok(bytes),
+                    None => crate::zip_loader::read_entry_bytes(path, entry_name)
+                        .map_err(image::ImageError::IoError),
+                }
+                .map(|bytes| crate::raw::RawOwnedSource::Bytes(Arc::from(bytes)))
+            } else {
+                Ok(crate::raw::RawOwnedSource::Path(path.to_owned()))
+            };
+        source_result.and_then(|source| {
+            if let Some(RawThumbHandoff::DedicatedWorker(executor)) = raw_handoff {
+                let raster = decode_raw_thumbnail_on_cancellable_worker(
+                    source, display_px, executor, cancel,
+                )
+                .map_err(raw_image_error)?;
+                raw_developed_dims = Some(raster.developed_dims);
+                return Ok(raster.image);
+            }
+            let info =
+                crate::raw::raw_decoder::info(source.as_source()).map_err(raw_image_error)?;
+            let developed_dims = info.developed_dims;
+            raw_developed_dims = Some((developed_dims[0], developed_dims[1]));
+            let preview = crate::raw::raw_decoder::preview(source.as_source());
+            let threshold = display_px.min(developed_dims[0].max(developed_dims[1]));
+            match preview {
+                Ok(preview)
+                    if matches!(raw_handoff, Some(RawThumbHandoff::RemotePreviewOnly(_)))
+                        || preview.image.width().max(preview.image.height()) >= threshold =>
+                {
+                    Ok(preview.image)
+                }
+                Ok(_) | Err(crate::raw::RawError::NoUsablePreview(_)) => {
+                    if let Some(RawThumbHandoff::RemotePreviewOnly(notify)) = raw_handoff {
+                        let _ = notify.send(RawThumbUnavailable::NeedsHalfDevelopment);
+                        return Err(raw_image_error(crate::raw::RawError::NoUsablePreview(
+                            crate::raw::RawPreviewUnavailableReason::NoSupportedCandidate,
+                        )));
+                    }
+                    if let crate::raw::RawDevelopSupport::Unsupported(reason) = info.develop_support
+                    {
+                        return Err(raw_image_error(crate::raw::RawError::Unsupported(reason)));
+                    }
+                    let handoff = match raw_handoff {
+                        Some(RawThumbHandoff::Local(handoff)) => handoff,
+                        Some(
+                            RawThumbHandoff::RemotePreviewOnly(_)
+                            | RawThumbHandoff::DedicatedWorker(_),
+                        ) => unreachable!(),
+                        None => return Err(raw_image_error(crate::raw::RawError::Internal(-1))),
+                    };
+                    let Some(mut next_req) = deferred_req else {
+                        return Err(raw_image_error(crate::raw::RawError::Internal(-1)));
+                    };
+                    if !priority {
+                        let _ = tx.send(ThumbMsg::from_legacy_parts(
+                            idx,
+                            None,
+                            ThumbLoadOrigin::SourceIntrinsic,
+                            false,
+                            None,
+                            None,
+                            None,
+                            true,
+                            false,
+                            input_seq,
+                            items_gen,
+                        ));
+                        gen_done.fetch_add(1, Ordering::Relaxed);
+                        raw_handoff_control = RawHandoffControl::Deferred;
+                        return Err(raw_image_error(crate::raw::RawError::Cancelled));
+                    }
+                    next_req.path = path.to_owned();
+                    next_req.zip_entry = zip_entry.map(str::to_owned);
+                    next_req.source_policy = LoadSourcePolicy::SourceOnly;
+                    let tickets = Arc::clone(&handoff.tickets);
+                    let callback_tickets = Arc::clone(&tickets);
+                    let queue = Arc::clone(&handoff.queue);
+                    let tx = tx.clone();
+                    let pending_tx = tx.clone();
+                    let gen_done = Arc::clone(gen_done);
+                    let pending_gen_done = Arc::clone(&gen_done);
+                    let start = std::time::Instant::now();
+                    let folder_selection_proof = folder_selection_proof.cloned();
+                    let mut map = tickets.lock().unwrap();
+                    if !map.accepts_generation(idx, items_gen) {
+                        return Err(raw_image_error(crate::raw::RawError::Cancelled));
+                    }
+                    let submission_id =
+                        NEXT_RAW_THUMB_SUBMISSION_ID.fetch_add(1, Ordering::Relaxed);
+                    let ticket = handoff
+                        .executor
+                        .submit_thumbnail_half_with_completion(
+                            source,
+                            crate::raw::RawPriority::Normal,
+                            move |result| {
+                                let mut map = callback_tickets.lock().unwrap();
+                                if take_matching_raw_thumb_pending(&mut map, idx, submission_id)
+                                    .is_none()
+                                {
+                                    return;
+                                }
+                                match result {
+                                    Ok(output) => {
+                                        next_req.raw_source = LoadRequestSource::RawHalfDeveloped {
+                                            image: output.image,
+                                            developed_dims,
+                                            decode_ms: start.elapsed().as_secs_f64() * 1000.0,
+                                            folder_selection_proof,
+                                        };
+                                        let (lock, wake) = &*queue;
+                                        lock.lock().unwrap().push(next_req);
+                                        wake.notify_one();
+                                    }
+                                    Err(error) => {
+                                        let _ = tx.send(ThumbMsg::from_legacy_parts(
+                                            idx,
+                                            None,
+                                            ThumbLoadOrigin::SourceIntrinsic,
+                                            false,
+                                            None,
+                                            None,
+                                            None,
+                                            error == crate::raw::RawError::Cancelled,
+                                            false,
+                                            input_seq,
+                                            items_gen,
+                                        ));
+                                        gen_done.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                            },
+                        )
+                        .map_err(raw_image_error)?;
+                    map.insert_for_generation(
+                        idx,
+                        items_gen,
+                        RawThumbPending {
+                            ticket,
+                            submission_id,
+                            idx,
+                            input_seq,
+                            items_gen,
+                            tx: pending_tx,
+                            gen_done: pending_gen_done,
+                        },
+                    );
+                    // A submitted half job produces no ThumbMsg here. Its completion
+                    // returns to the existing queue after the executor slot is free.
+                    raw_handoff_control = RawHandoffControl::Deferred;
+                    return Err(raw_image_error(crate::raw::RawError::Cancelled));
+                }
+                Err(error) => Err(raw_image_error(error)),
+            }
+        })
+    } else if let Some(page_num) = pdf_page {
         // サムネイル用 PDF レンダ: 可視セル (priority=true) は HighNormal、
         // 先読みは Normal。プールの予約ワーカーはフルスクリーン現在ページ
         // (Critical) 用に空けておく。cancel_policy は caller (process_load_request)
@@ -2702,16 +4549,30 @@ pub fn load_one_cached(
             crate::pdf_loader::JobPriority::Normal
         };
         let render_started = std::time::Instant::now();
-        let render_result = crate::pdf_loader::render_page(
-            path,
-            page_num,
-            display_px,
-            pdf_password,
-            cancel.map(Arc::clone),
-            pdf_priority,
-            context_epoch,
-            cancel_policy,
-        );
+        let render_result = if let Some(read) = epub_read {
+            crate::pdf_loader::render_page_with_read_target(
+                path,
+                read,
+                page_num,
+                thumbnail_pdf_render_target(display_px),
+                pdf_password,
+                cancel.map(Arc::clone),
+                pdf_priority,
+                context_epoch,
+                cancel_policy,
+            )
+        } else {
+            crate::pdf_loader::render_page(
+                path,
+                page_num,
+                thumbnail_pdf_render_target(display_px),
+                pdf_password,
+                cancel.map(Arc::clone),
+                pdf_priority,
+                context_epoch,
+                cancel_policy,
+            )
+        };
         render_ms = Some(render_started.elapsed().as_secs_f64() * 1000.0);
         render_result
             .map(|res| {
@@ -2757,7 +4618,7 @@ pub fn load_one_cached(
             .and_then(|name| name.to_str())
             .unwrap_or("");
         if is_jpeg_ext(path) {
-            let target_px = display_px.max(thumb_px);
+            let target_px = thumbnail_jpeg_decode_target(display_px, thumb_px);
             match decode_jpeg_turbo_scaled_from_bytes(&bytes, target_px) {
                 Ok((img, stats)) => {
                     dct_stats = Some(stats);
@@ -2791,12 +4652,12 @@ pub fn load_one_cached(
         match bytes_result {
             Err(e) => Err(e),
             Ok(bytes) => {
-                // ZIP 内 RAW/WIC 系の orientation は rexif で読めないため 1 扱いになる。
-                // JPEG 等、rexif が読める EXIF は通常ファイルと同じ向きに揃える。
+                // 非 RAW の ZIP entry は EXIF を読む。RAW は上の LibRaw 分岐で
+                // 向きが適用済みなので、ここには来ない。
                 byte_orientation = read_exif_orientation_from_bytes(&bytes);
                 // JPEG なら TurboJPEG DCT scale で高速デコードを試す
                 if is_jpeg_entry(entry_name) {
-                    let target_px = display_px.max(thumb_px);
+                    let target_px = thumbnail_jpeg_decode_target(display_px, thumb_px);
                     match decode_jpeg_turbo_scaled_from_bytes(&bytes, target_px) {
                         Ok((img, stats)) => {
                             dct_stats = Some(stats);
@@ -2846,7 +4707,7 @@ pub fn load_one_cached(
         // 通常ファイル: JPEG なら TurboJPEG DCT scale を最初に試す
         let turbo_img: Option<Result<image::DynamicImage, image::ImageError>> = if is_jpeg_ext(path)
         {
-            let target_px = display_px.max(thumb_px);
+            let target_px = thumbnail_jpeg_decode_target(display_px, thumb_px);
             match decode_jpeg_turbo_scaled_from_path(path, target_px) {
                 Ok((img, stats)) => {
                     dct_stats = Some(stats);
@@ -2878,7 +4739,7 @@ pub fn load_one_cached(
                     .decode()
             });
             // image クレートが失敗した場合に WIC → Susie プラグインの順にフォールバック
-            // (HEIC / AVIF / JPEG XL / RAW 等は image クレート非対応のため WIC、
+            // (HEIC / AVIF / JPEG XL 等は image クレート非対応のため WIC、
             //  PI / MAG / Q0 / PIC / MAKI 等のレトロ形式は Susie プラグインで対応)
             match primary {
                 Ok(img) => Ok(img),
@@ -2900,6 +4761,9 @@ pub fn load_one_cached(
         }
     };
 
+    if matches!(raw_handoff_control, RawHandoffControl::Deferred) {
+        return;
+    }
     let img = match img_result {
         Ok(i) => i,
         Err(e) => {
@@ -2914,7 +4778,15 @@ pub fn load_one_cached(
                     &e,
                     image::ImageError::IoError(io) if io.kind() == std::io::ErrorKind::Interrupted
                 );
-            let cancelled = cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
+            let raw_cancelled = is_raw
+                && matches!(
+                    &e,
+                    image::ImageError::IoError(io)
+                        if io.get_ref().and_then(|error| error.downcast_ref::<crate::raw::RawError>())
+                            == Some(&crate::raw::RawError::Cancelled)
+                );
+            let cancelled =
+                raw_cancelled || cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
 
             // **Codex P2 対応 (2026-05)**:
             // `pdf_interrupted` は cancel_token を flip せず epoch だけ進めた経路
@@ -2938,36 +4810,36 @@ pub fn load_one_cached(
                     "cancelled"
                 };
                 crate::logger::log(format!("    idx={idx:>4} {reason}  {display_name}"));
-                let _ = tx.send(ThumbMsg {
+                let _ = tx.send(ThumbMsg::from_legacy_parts(
                     idx,
-                    image: None,
-                    origin: ThumbLoadOrigin::SourceIntrinsic,
-                    from_edit_preview: false,
-                    edit_preview_adjustment: None,
-                    source_dims: None,
-                    layout_dims: None,
-                    canceled: true,
-                    finalized: false,
+                    None,
+                    ThumbLoadOrigin::SourceIntrinsic,
+                    false,
+                    None,
+                    None,
+                    None,
+                    true,
+                    false,
                     input_seq,
                     items_gen,
-                });
+                ));
                 gen_done.fetch_add(1, Ordering::Relaxed);
                 return;
             }
             crate::logger::log(format!("    idx={idx:>4} FAIL {e}  {display_name}"));
-            let _ = tx.send(ThumbMsg {
+            let _ = tx.send(ThumbMsg::from_legacy_parts(
                 idx,
-                image: None,
-                origin: ThumbLoadOrigin::SourceIntrinsic,
-                from_edit_preview: false,
-                edit_preview_adjustment: None,
-                source_dims: None,
-                layout_dims: None,
-                canceled: false,
-                finalized: false,
+                None,
+                ThumbLoadOrigin::SourceIntrinsic,
+                false,
+                None,
+                None,
+                None,
+                false,
+                false,
                 input_seq,
                 items_gen,
-            });
+            ));
             gen_done.fetch_add(1, Ordering::Relaxed);
             if let Ok(mut s) = stats.lock() {
                 s.record_failed();
@@ -2977,8 +4849,9 @@ pub fn load_one_cached(
     };
 
     // EXIF Orientation に基づいて自動回転。
-    // ZIP はエントリのバイト列から読み、PDF はレンダ済みページなので常に 1。
-    let orientation: u16 = if pdf_page.is_some() {
+    // ZIP の非 RAW はエントリのバイト列から読む。RAW は LibRaw が orientation
+    // をすでに適用しており、PDF もレンダ済みなので追加回転をしない。
+    let orientation: u16 = if is_raw || pdf_page.is_some() {
         1
     } else if zip_entry.is_some() || has_verified_source {
         byte_orientation
@@ -2989,7 +4862,14 @@ pub fn load_one_cached(
     let img = apply_orientation(img, orientation);
     let orientation_ms = orientation_started.elapsed().as_secs_f64() * 1000.0;
 
-    let decode_ms = t.elapsed().as_secs_f64() * 1000.0;
+    let decode_ms = raw_decode_ms.unwrap_or_else(|| t.elapsed().as_secs_f64() * 1000.0);
+    // Keep the existing cache/stat timing above. A RAW continuation's earlier
+    // executor wait/develop belongs outside this worker's wall/cycle window.
+    let diagnostic_decode_ms = if raw_decode_ms.is_some() && crate::perf::is_enabled() {
+        t.elapsed().as_secs_f64() * 1000.0
+    } else {
+        decode_ms
+    };
 
     // source_dims は常にピクセル座標系。PDF page box の正確な比率は layout_dims に
     // 分離し、リリース済みの source_* 契約を別の単位で上書きしない。
@@ -2997,15 +4877,33 @@ pub fn load_one_cached(
     // 使わず、`dct_stats.src_w/src_h` から EXIF 適用後寸法を算出する。
     // 非 DCT 経路 (image::open / WIC / Susie / ZIP image::load_from_memory)
     // は img の現寸法 = 元寸法 (EXIF 適用済み) なので従来通り。
-    let source_dims: Option<(u32, u32)> = if let Some(stats) = dct_stats {
+    let source_dims: Option<(u32, u32)> = if let Some(dims) = raw_developed_dims {
+        Some(dims)
+    } else if let Some(stats) = dct_stats {
         Some(stats.source_dims_after_exif(orientation))
     } else {
         Some((img.width(), img.height()))
     };
     let layout_dims = pdf_page.is_some().then_some(pdf_layout_dims).flatten();
 
+    // 保存済み thumbnail ではなく、この元 source decode buffer を prefill 候補にする。
+    // 索引側が実寸を見て正準サイズ未満の raster を拒否するため、ここで decode target を
+    // 引き上げてはならない。背景索引が全件を保証し、prefill は既存 decode の再利用だけ行う。
+    let offer_started = crate::perf::stall::Span::start();
+    let prefill_db = crate::similar_index::offer_thumbnail_raster(
+        path,
+        zip_entry,
+        pdf_page,
+        mtime,
+        file_size,
+        &img,
+        source_dims.unwrap_or((img.width(), img.height())),
+    );
+    let offer_raster = offer_started.map(|at| at.finish()).unwrap_or_default();
+
     // DCT スケール経由なら perf event を発火 (`thumb/dct_scale`)。
     // `decode_ms` を含めることで analyze_perf.py で scale_num 別の所要時間を集計可能。
+    let perf_log_started = crate::perf::stall::Span::start();
     if let Some(stats) = dct_stats {
         if crate::perf::is_enabled() {
             crate::perf::event(
@@ -3024,6 +4922,7 @@ pub fn load_one_cached(
             );
         }
     }
+    let perf_log = perf_log_started.map(|at| at.finish()).unwrap_or_default();
 
     // (A) 表示用パス: 元画像から直接セルサイズにリサイズして UI へ送信
     //     WebP 量子化を経由しないため画質劣化なし、かつ WebP encode を待たない
@@ -3041,24 +4940,25 @@ pub fn load_one_cached(
     // 完了するまで保持する → cache save 中に同じ idx が再エンキューされて
     // 二重レンダする事故を防ぐ)。
     let send_display_started = std::time::Instant::now();
-    let _ = tx.send(ThumbMsg {
+    let _ = tx.send(ThumbMsg::from_legacy_parts(
         idx,
-        image: Some(display_ci),
-        origin: ThumbLoadOrigin::SourceGenerated {
+        Some(display_ci),
+        ThumbLoadOrigin::SourceGenerated {
             evaluated_display_px: display_px,
         },
-        from_edit_preview: false,
-        edit_preview_adjustment: None,
+        false,
+        None,
         source_dims,
         layout_dims,
-        canceled: false,
-        finalized: false,
+        false,
+        false,
         input_seq,
         items_gen,
-    });
+    ));
     let send_display_ms = send_display_started.elapsed().as_secs_f64() * 1000.0;
 
     // 統計: 画像のフルデコード時間・サイズ・フォーマット・デコーダ経路を記録
+    let stats_started = crate::perf::stall::Span::start();
     {
         // 拡張子の取得元: PDF ページなら "pdf"、ZIP エントリならエントリ名、通常ならファイルパス
         let ext_source: &str = if pdf_page.is_some() {
@@ -3078,6 +4978,7 @@ pub fn load_one_cached(
             );
         }
     }
+    let stats_timing = stats_started.map(|at| at.finish()).unwrap_or_default();
 
     // (B) キャッシュ保存判定 (段階 C)
     //     catalog 未指定時は保存不可
@@ -3087,6 +4988,7 @@ pub fn load_one_cached(
     let mut cache_encode_ms = 0.0;
     let mut cache_save_ms = 0.0;
     let mut cache_map_ms = 0.0;
+    let mut normal_log = crate::perf::stall::Timing::default();
 
     if should_save {
         let cat = catalog.expect("should_save => catalog is Some");
@@ -3104,7 +5006,7 @@ pub fn load_one_cached(
             Some((webp_data, w, h)) => {
                 let encode_ms = cache_encode_ms;
                 let cache_save_started = std::time::Instant::now();
-                let save_result = cat.save_with_layout_dims(
+                let save_result = cat.save_with_folder_proof(
                     name,
                     mtime,
                     file_size,
@@ -3113,10 +5015,15 @@ pub fn load_one_cached(
                     source_dims,
                     layout_dims,
                     &webp_data,
+                    folder_provenance,
+                    folder_selection_proof,
                 );
                 cache_save_ms = cache_save_started.elapsed().as_secs_f64() * 1000.0;
                 if let Err(e) = save_result {
-                    crate::logger::log(format!("    idx={idx:>4} catalog save: {e}"));
+                    measured_thumbnail_log(
+                        format!("    idx={idx:>4} catalog save: {e}"),
+                        &mut normal_log,
+                    );
                 } else if let Some(cm) = cache_map {
                     // DB 保存成功 → in-memory cache_map にも反映する。
                     // Evicted → 再ロード時にキャッシュヒットさせるために必要。
@@ -3130,6 +5037,8 @@ pub fn load_one_cached(
                                 jpeg_data: webp_data,
                                 source_dims,
                                 layout_dims,
+                                folder_provenance,
+                                selection_proof: folder_selection_proof.cloned(),
                             },
                         );
                     }
@@ -3156,18 +5065,27 @@ pub fn load_one_cached(
                 } else {
                     ""
                 };
-                crate::logger::log(format!(
-                    "    idx={idx:>4} decode={decode_ms:>6.1}ms display={display_ms:>5.1}ms encode={encode_ms:>5.1}ms{force_note}  {display_name}  -> save_key=`{name}`"
-                ));
+                measured_thumbnail_log(
+                    format!(
+                        "    idx={idx:>4} decode={decode_ms:>6.1}ms display={display_ms:>5.1}ms encode={encode_ms:>5.1}ms{force_note}  {display_name}  -> save_key=`{name}`"
+                    ),
+                    &mut normal_log,
+                );
             }
             None => {
-                crate::logger::log(format!("    idx={idx:>4} WebP encode FAIL  {display_name}"));
+                measured_thumbnail_log(
+                    format!("    idx={idx:>4} WebP encode FAIL  {display_name}"),
+                    &mut normal_log,
+                );
             }
         }
     } else {
-        crate::logger::log(format!(
-            "    idx={idx:>4} decode={decode_ms:>6.1}ms display={display_ms:>5.1}ms (skip cache)  {display_name}"
-        ));
+        measured_thumbnail_log(
+            format!(
+                "    idx={idx:>4} decode={decode_ms:>6.1}ms display={display_ms:>5.1}ms (skip cache)  {display_name}"
+            ),
+            &mut normal_log,
+        );
     }
 
     // 成功・失敗を問わず完了としてカウント（タイトルバーの進捗に反映）
@@ -3176,29 +5094,37 @@ pub fn load_one_cached(
     // 第 2 シグナル: cache save (or skip) 完了を UI に通知し `requested` から抜く。
     // `finalized=true` を立てることで poll_thumbnails 側は **状態を変更せず** requested
     // からの削除のみ行う (texture_backlog で Pending アップロード待ちのケースを保護)。
-    let _ = tx.send(ThumbMsg {
+    let _ = tx.send(ThumbMsg::from_legacy_parts(
         idx,
-        image: None,
-        origin: ThumbLoadOrigin::SourceIntrinsic,
-        from_edit_preview: false,
-        edit_preview_adjustment: None,
-        source_dims: None,
-        layout_dims: None,
-        canceled: false,
-        finalized: true,
+        None,
+        ThumbLoadOrigin::SourceIntrinsic,
+        false,
+        None,
+        None,
+        None,
+        false,
+        true,
         input_seq,
         items_gen,
-    });
+    ));
 
     if crate::perf::is_enabled() {
-        let total_ms = total_started.elapsed().as_secs_f64() * 1000.0;
+        let total_ended = std::time::Instant::now();
+        let total_cycles = total_cycles_started.map(|start| start.finish());
+        let total_ms = total_ended.duration_since(total_started).as_secs_f64() * 1000.0;
         let phases = ThumbLoadPhases {
-            decode_ms,
+            decode_ms: diagnostic_decode_ms,
+            raw_async_decode_ms: raw_decode_ms,
             display_ms,
             send_display_ms,
             cache_encode_ms,
             cache_save_ms,
             cache_map_ms,
+            offer_raster,
+            stats: stats_timing,
+            normal_log,
+            perf_log,
+            prefill_db,
             render_ms,
             orientation_ms,
         };
@@ -3220,7 +5146,9 @@ pub fn load_one_cached(
         if let Some(render_ms) = phases.render_ms {
             decode_parts.insert("render_ms".into(), serde_json::Value::from(render_ms));
         }
-        let extras = vec![
+        let mut extras = vec![
+            ("start_t", crate::perf::stall::seconds(total_started).into()),
+            ("end_t", crate::perf::stall::seconds(total_ended).into()),
             ("total_ms", serde_json::Value::from(total_ms)),
             ("decode_ms", serde_json::Value::from(phases.decode_ms)),
             ("display_ms", serde_json::Value::from(phases.display_ms)),
@@ -3254,6 +5182,23 @@ pub fn load_one_cached(
             ("idx", serde_json::Value::from(idx)),
             ("input_seq", serde_json::Value::from(input_seq)),
         ];
+        // New disjoint intervals shrink unaccounted. prefill_db is a nested detail
+        // of offer_raster, and cache_save already includes catalog mutex + SQL.
+        for (ms_key, timing) in [
+            ("offer_raster_ms", phases.offer_raster),
+            ("stats_ms", phases.stats),
+            ("normal_log_ms", phases.normal_log),
+            ("perf_log_ms", phases.perf_log),
+            ("prefill_db_ms", phases.prefill_db),
+        ] {
+            extras.push((ms_key, timing.ms.into()));
+        }
+        if let Some(cycles) = total_cycles {
+            extras.push(("total_cycles", cycles.into()));
+        }
+        if let Some(ms) = phases.raw_async_decode_ms {
+            extras.push(("raw_async_decode_ms", ms.into()));
+        }
         crate::perf::event("thumb", "load_phases", Some(&key), input_seq, &extras);
     }
 }
@@ -3272,6 +5217,950 @@ mod tests {
     use crate::settings::{CachePolicy, Settings, SortOrder};
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    #[test]
+    fn drive_cache_only_pins_resume_retained_rows_after_expiry_without_old_map() {
+        use crate::catalog::{CatalogAccess, CatalogDeleteOperation};
+        use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+        for child_folder in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let fixture = prepare_pdf_pin_fixture(&temp, 3);
+            let bytes = fixture_webp();
+            let key = if child_folder {
+                save_pdf_pin_webp(&fixture, 3, &bytes)
+            } else {
+                "image#pin:current".to_owned()
+            };
+            let catalog = Arc::new(
+                crate::catalog::CatalogDb::open(&fixture.cache_dir, &fixture.root).unwrap(),
+            );
+            if !child_folder {
+                catalog
+                    .save_thumb_bytes(&key, 4, 5, Some((8, 8)), &bytes)
+                    .unwrap();
+            }
+            let mut stale = catalog.load_all().unwrap();
+            let old = stale.get_mut(&key).unwrap();
+            old.jpeg_data = b"stale invalid map bytes".to_vec();
+            old.mtime = 9999;
+            let map = std::sync::RwLock::new(stale);
+            let pin = PinnedOnlyRequest {
+                cache_key_prefix: key,
+                seed_proof: None,
+                source: FolderPinSource::File {
+                    rel: if child_folder {
+                        "01-child"
+                    } else {
+                        "never-decode.jpg"
+                    }
+                    .to_owned(),
+                    kind: if child_folder {
+                        FileKind::Folder
+                    } else {
+                        FileKind::Image
+                    },
+                },
+            };
+            let request = LoadRequest {
+                path: fixture.root.clone(),
+                folder_thumb_sort: Some(SortOrder::Numeric),
+                folder_thumb_depth: 3,
+                source_policy: LoadSourcePolicy::CacheOnly,
+                ..Default::default()
+            };
+            let deletion = CatalogAccess::for_cache_dir(&fixture.cache_dir)
+                .begin_delete(CatalogDeleteOperation::OlderThan(365))
+                .unwrap();
+            deletion.retire_connections();
+            assert_eq!(
+                crate::catalog::delete_old_cache_under_delete(&fixture.cache_dir, 365).deleted,
+                0
+            );
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let pins = fixture.pin_db;
+            let worker_catalog = Arc::clone(&catalog);
+            let handle = std::thread::spawn(move || {
+                let (tx, rx) = mpsc::channel();
+                let done = Arc::new(AtomicUsize::new(0));
+                ready_tx.send(()).unwrap();
+                let hit = send_pinned_only_cached(
+                    &request,
+                    &pin,
+                    &map,
+                    &tx,
+                    &done,
+                    Some(&pins),
+                    Some(&worker_catalog),
+                    None,
+                );
+                done_tx
+                    .send((
+                        hit,
+                        rx.try_iter().collect::<Vec<_>>(),
+                        done.load(Ordering::Relaxed),
+                    ))
+                    .unwrap();
+            });
+            ready_rx.recv().unwrap();
+            assert!(
+                done_rx
+                    .recv_timeout(std::time::Duration::from_millis(20))
+                    .is_err()
+            );
+            drop(deletion);
+            let (hit, messages, done) = done_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            handle.join().unwrap();
+            assert!(hit);
+            assert_eq!(done, 1);
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| matches!(message.payload, ThumbMsgPayload::Pixels(_)))
+            );
+            assert!(catalog.is_retired());
+        }
+    }
+
+    #[test]
+    fn drive_cache_only_pins_do_not_resurrect_old_map_after_clear_or_cancel() {
+        use crate::catalog::{CatalogAccess, CatalogDeleteOperation};
+        use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+        for child_folder in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let fixture = prepare_pdf_pin_fixture(&temp, 3);
+            let bytes = fixture_webp();
+            let key = if child_folder {
+                save_pdf_pin_webp(&fixture, 3, &bytes)
+            } else {
+                "image#pin:current".to_owned()
+            };
+            let catalog =
+                crate::catalog::CatalogDb::open(&fixture.cache_dir, &fixture.root).unwrap();
+            if !child_folder {
+                catalog
+                    .save_thumb_bytes(&key, 4, 5, Some((8, 8)), &bytes)
+                    .unwrap();
+            }
+            let map = std::sync::RwLock::new(catalog.load_all().unwrap());
+            let pin = PinnedOnlyRequest {
+                cache_key_prefix: key,
+                seed_proof: None,
+                source: FolderPinSource::File {
+                    rel: if child_folder {
+                        "01-child"
+                    } else {
+                        "never-decode.jpg"
+                    }
+                    .to_owned(),
+                    kind: if child_folder {
+                        FileKind::Folder
+                    } else {
+                        FileKind::Image
+                    },
+                },
+            };
+            let request = LoadRequest {
+                path: fixture.root.clone(),
+                folder_thumb_sort: Some(SortOrder::Numeric),
+                folder_thumb_depth: 3,
+                source_policy: LoadSourcePolicy::CacheOnly,
+                ..Default::default()
+            };
+            let deletion = CatalogAccess::for_cache_dir(&fixture.cache_dir)
+                .begin_delete(CatalogDeleteOperation::All)
+                .unwrap();
+            deletion.retire_connections();
+            let cancel = Arc::new(AtomicBool::new(true));
+            let (tx, rx) = mpsc::channel();
+            let done = Arc::new(AtomicUsize::new(0));
+            assert!(!send_pinned_only_cached(
+                &request,
+                &pin,
+                &map,
+                &tx,
+                &done,
+                Some(&fixture.pin_db),
+                Some(&catalog),
+                Some(&cancel)
+            ));
+            assert_eq!(
+                crate::catalog::delete_all_cache_under_delete(&fixture.cache_dir).deleted,
+                1
+            );
+            drop(deletion);
+            cancel.store(false, Ordering::Relaxed);
+            assert!(!send_pinned_only_cached(
+                &request,
+                &pin,
+                &map,
+                &tx,
+                &done,
+                Some(&fixture.pin_db),
+                Some(&catalog),
+                Some(&cancel)
+            ));
+            assert!(rx.try_recv().is_err());
+            assert_eq!(done.load(Ordering::Relaxed), 0);
+            assert!(!crate::catalog::db_path_for(&fixture.cache_dir, &fixture.root).exists());
+            // The user-created pin store remains intact after thumbnail cache deletion.
+            assert!(fixture.pin_db.lookup(&fixture.child).is_some());
+        }
+    }
+
+    #[test]
+    fn thumbnail_message_payload_preserves_drive_miss_and_correlation() {
+        let message = ThumbMsg::from_legacy_parts(
+            7,
+            None,
+            ThumbLoadOrigin::DriveListChildMiss,
+            false,
+            None,
+            None,
+            None,
+            false,
+            false,
+            12,
+            19,
+        );
+        assert_eq!(
+            (message.idx, message.input_seq, message.items_gen),
+            (7, 12, 19)
+        );
+        assert!(matches!(
+            message.payload,
+            ThumbMsgPayload::Failed {
+                origin: ThumbLoadOrigin::DriveListChildMiss
+            }
+        ));
+        for (canceled, finalized) in [(true, false), (false, true)] {
+            let message = ThumbMsg::from_legacy_parts(
+                7,
+                None,
+                ThumbLoadOrigin::SourceIntrinsic,
+                false,
+                None,
+                None,
+                None,
+                canceled,
+                finalized,
+                12,
+                19,
+            );
+            assert_eq!(message.is_canceled(), canceled);
+            assert_eq!(message.is_finalized(), finalized);
+            assert!(message.pixels().is_none());
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "cancellation and finalization are exclusive")]
+    fn thumbnail_message_payload_rejects_invalid_terminal_combination() {
+        let _ = ThumbMsg::from_legacy_parts(
+            0,
+            None,
+            ThumbLoadOrigin::SourceIntrinsic,
+            false,
+            None,
+            None,
+            None,
+            true,
+            true,
+            0,
+            0,
+        );
+    }
+
+    #[test]
+    fn audio_thumbnail_handler_reports_one_terminal_without_display_stamp_identity() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("song.mp3");
+        std::fs::write(&path, b"not an ID3 tag").unwrap();
+        let cache_dir = temp.path().join("cache");
+        let admission = crate::catalog::CatalogAccess::for_cache_dir(&cache_dir).admit();
+        for canceled in [false, true] {
+            let mut request = LoadRequest {
+                path: path.clone(),
+                // A bookmark creation date or unknown history stamp is unrelated to source metadata.
+                mtime: 123,
+                file_size: 0,
+                input_seq: 12,
+                items_gen: 19,
+                raw_source: LoadRequestSource::AudioThumbnail(AudioThumbnailRequest {
+                    sidecar: None,
+                    cache_dir: cache_dir.clone(),
+                    admission,
+                }),
+                ..Default::default()
+            };
+            let cache = std::sync::RwLock::new(std::collections::HashMap::new());
+            let (tx, rx) = mpsc::channel();
+            let done = Arc::new(AtomicUsize::new(0));
+            let cancel = Arc::new(AtomicBool::new(canceled));
+            let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
+            process_load_request(
+                &mut request,
+                &cache,
+                &tx,
+                None,
+                64,
+                75,
+                64,
+                make_decision(CachePolicy::Off, 25, 2_000_000),
+                &done,
+                &stats,
+                Some(&cancel),
+                &Arc::new(AtomicUsize::new(0)),
+                &Arc::new(AtomicUsize::new(1)),
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            let message = rx.try_recv().unwrap();
+            assert_eq!((message.input_seq, message.items_gen), (12, 19));
+            assert!(if canceled {
+                matches!(message.payload, ThumbMsgPayload::Canceled)
+            } else {
+                matches!(message.payload, ThumbMsgPayload::NoArt)
+            });
+            assert_eq!(done.load(Ordering::Relaxed), 1);
+            assert!(
+                rx.try_recv().is_err(),
+                "No duplicate finalized/canceled result"
+            );
+        }
+    }
+
+    #[test]
+    fn audio_thumbnail_handler_uses_fresh_source_for_bookmark_and_unknown_history_stamps() {
+        use image::ImageEncoder;
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("song.mp3");
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&[40, 90, 160], 1, 1, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        let mut picture = b"\x00image/png\x00\x03\x00".to_vec();
+        picture.extend(png);
+        let mut frame = b"APIC".to_vec();
+        frame.extend((picture.len() as u32).to_be_bytes());
+        frame.extend([0, 0]);
+        frame.extend(picture);
+        let size = frame.len() as u32;
+        let mut tag = b"ID3\x03\x00\x00".to_vec();
+        tag.extend([
+            (size >> 21) as u8 & 127,
+            (size >> 14) as u8 & 127,
+            (size >> 7) as u8 & 127,
+            size as u8 & 127,
+        ]);
+        tag.extend(frame);
+        std::fs::write(&path, tag).unwrap();
+        let cache_dir = temp.path().join("cache");
+        let admission = crate::catalog::CatalogAccess::for_cache_dir(&cache_dir).admit();
+        for (idx, display_stamp) in [(0, 1_234_567), (1, 2_345_678), (2, 0)] {
+            let mut request = LoadRequest {
+                idx,
+                path: path.clone(),
+                mtime: display_stamp,
+                file_size: 0,
+                input_seq: 12,
+                items_gen: 19,
+                raw_source: LoadRequestSource::AudioThumbnail(AudioThumbnailRequest {
+                    sidecar: None,
+                    cache_dir: cache_dir.clone(),
+                    admission,
+                }),
+                ..Default::default()
+            };
+            let cache = std::sync::RwLock::new(std::collections::HashMap::new());
+            let (tx, rx) = mpsc::channel();
+            let done = Arc::new(AtomicUsize::new(0));
+            let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
+            process_load_request(
+                &mut request,
+                &cache,
+                &tx,
+                None,
+                64,
+                75,
+                64,
+                make_decision(CachePolicy::Off, 25, 2_000_000),
+                &done,
+                &stats,
+                None,
+                &Arc::new(AtomicUsize::new(0)),
+                &Arc::new(AtomicUsize::new(3)),
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            let message = rx.try_recv().unwrap();
+            assert_eq!(message.idx, idx);
+            let pixels = message
+                .into_pixels()
+                .expect("the source art is independent of display/ordering metadata");
+            assert_eq!(pixels.source_dims, Some((1, 1)));
+            assert_eq!(done.load(Ordering::Relaxed), 1);
+            assert!(
+                rx.try_recv().is_err(),
+                "one completed result per bookmark/history request"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn late_old_raw_completion_cannot_remove_new_same_idx_submission() {
+        let executor = crate::raw::RawDevelopExecutor::new(1).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (old_ticket, old_result) =
+            executor.block_one_slot_with_result_for_test(started_tx, release_rx);
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let done = Arc::new(AtomicUsize::new(0));
+        let mut map = crate::items_generation_cache::ItemsGenerationMap::new("raw_overlap_test");
+        map.set_items_generation(1);
+        let old = RawThumbPending::for_test(old_ticket, tx.clone(), Arc::clone(&done), 1);
+        let old_id = old.submission_id;
+        map.insert(0, old);
+        map.set_items_generation(2);
+        let (result_tx, _result_rx) = mpsc::channel();
+        let new_ticket = executor.submit_thumbnail_half(
+            crate::raw::RawOwnedSource::Path(PathBuf::from("vendor/raw-samples/1018.cr2")),
+            crate::raw::RawPriority::Normal,
+            result_tx,
+        );
+        let new = RawThumbPending::for_test(new_ticket, tx, done, 2);
+        let new_id = new.submission_id;
+        map.insert(0, new);
+        release_tx.send(()).unwrap();
+        old_result
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        // This is the old completion callback after the newer submission exists.
+        assert!(take_matching_raw_thumb_pending(&mut map, 0, old_id).is_none());
+        assert_eq!(map.get(&0).unwrap().submission_id, new_id);
+        let current = take_matching_raw_thumb_pending(&mut map, 0, new_id).unwrap();
+        current.ticket.cancel();
+    }
+
+    #[cfg(windows)]
+    fn raw_thumb_request(
+        path: &Path,
+        zip_entry: Option<&str>,
+        cache_map: &std::sync::RwLock<
+            std::collections::HashMap<String, crate::catalog::CacheEntry>,
+        >,
+        tx: &mpsc::Sender<ThumbMsg>,
+        catalog: Option<&Arc<crate::catalog::CatalogDb>>,
+        gen_done: &Arc<AtomicUsize>,
+        stats: &Arc<Mutex<crate::stats::ThumbStats>>,
+        handoff: &RawThumbHandoff,
+    ) {
+        let metadata = std::fs::metadata(path).unwrap();
+        let mut request = LoadRequest {
+            idx: 0,
+            path: path.to_owned(),
+            zip_entry: zip_entry.map(str::to_owned),
+            mtime: 123,
+            file_size: metadata.len() as i64,
+            priority: true,
+            input_seq: 7,
+            items_gen: 1,
+            force_cache: catalog.is_some(),
+            source_policy: LoadSourcePolicy::SourceOnly,
+            ..Default::default()
+        };
+        process_load_request(
+            &mut request,
+            cache_map,
+            tx,
+            catalog,
+            512,
+            75,
+            2048,
+            make_decision(CachePolicy::Off, 25, 2_000_000),
+            gen_done,
+            stats,
+            None,
+            &Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(1)),
+            None,
+            None,
+            None,
+            None,
+            Some(handoff),
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn raw_half_handoff_releases_executor_slot_then_sends_both_signals_and_gen_done() {
+        let path = PathBuf::from("vendor/raw-samples/1018.cr2");
+        assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let tmp = TempDir::new().unwrap();
+        let catalog = Arc::new(crate::catalog::CatalogDb::open(tmp.path(), tmp.path()).unwrap());
+        let cache_map = std::sync::RwLock::new(std::collections::HashMap::new());
+        let (tx, rx) = mpsc::channel();
+        let gen_done = Arc::new(AtomicUsize::new(0));
+        let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
+        let executor = Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap());
+        let queue: Arc<crate::app::NotifyQueue> =
+            Arc::new((Mutex::new(Vec::new()), std::sync::Condvar::new()));
+        let tickets = Arc::new(Mutex::new(
+            crate::items_generation_cache::ItemsGenerationMap::new("raw_thumb_test"),
+        ));
+        tickets.lock().unwrap().set_items_generation(1);
+        let handoff = RawThumbHandoff::Local(RawThumbLocalHandoff {
+            executor: Arc::clone(&executor),
+            queue: Arc::clone(&queue),
+            tickets: Arc::clone(&tickets),
+        });
+        raw_thumb_request(
+            &path,
+            None,
+            &cache_map,
+            &tx,
+            Some(&catalog),
+            &gen_done,
+            &stats,
+            &handoff,
+        );
+        assert!(rx.try_recv().is_err(), "submit must send no ThumbMsg");
+        assert_eq!(gen_done.load(Ordering::Relaxed), 0);
+        let (lock, wake) = &*queue;
+        let mut queued = lock.lock().unwrap();
+        while queued.is_empty() {
+            let (next, timeout) = wake
+                .wait_timeout(queued, std::time::Duration::from_secs(180))
+                .unwrap();
+            assert!(
+                !timeout.timed_out(),
+                "RAW half completion did not enqueue follow-up"
+            );
+            queued = next;
+        }
+        let mut followup = queued.pop().unwrap();
+        drop(queued);
+        assert!(matches!(
+            followup.raw_source,
+            LoadRequestSource::RawHalfDeveloped { .. }
+        ));
+        assert_eq!(
+            executor.running_jobs_for_test(),
+            0,
+            "executor slot must be free before resize/cache"
+        );
+        assert!(!tickets.lock().unwrap().contains_key(&0));
+        process_load_request(
+            &mut followup,
+            &cache_map,
+            &tx,
+            Some(&catalog),
+            512,
+            75,
+            2048,
+            make_decision(CachePolicy::Off, 25, 2_000_000),
+            &gen_done,
+            &stats,
+            None,
+            &Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(1)),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let display = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let finalized = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(display.pixels().is_some() && !display.is_finalized() && !display.is_canceled());
+        assert!(
+            finalized.pixels().is_none() && finalized.is_finalized() && !finalized.is_canceled()
+        );
+        let developed = crate::raw::raw_decoder::info(crate::raw::RawSource::Path(&path))
+            .unwrap()
+            .developed_dims;
+        assert_eq!(
+            display.pixels().and_then(|pixels| pixels.source_dims),
+            Some((developed[0], developed[1]))
+        );
+        assert_eq!(gen_done.load(Ordering::Relaxed), 1);
+        assert!(catalog.load_one("1018.cr2").unwrap().is_some());
+        let stats = stats.lock().unwrap();
+        assert_eq!(stats.count_raw, 1);
+        assert_eq!(stats.count_wic, 0);
+        assert_eq!(stats.count_susie, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remote_cr2_preview_is_available_from_zip_bytes() {
+        use std::io::Write;
+
+        let path = Path::new("vendor/raw-samples/1018.cr2");
+        assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let bytes = std::fs::read(path).unwrap();
+        let path_preview = crate::raw::raw_decoder::preview(crate::raw::RawSource::Path(path))
+            .expect("path preview");
+        let bytes_preview = crate::raw::raw_decoder::preview(crate::raw::RawSource::Bytes(&bytes))
+            .expect("ZIP bytes preview");
+        assert_eq!(
+            (path_preview.image.width(), path_preview.image.height()),
+            (bytes_preview.image.width(), bytes_preview.image.height())
+        );
+        let temp = TempDir::new().unwrap();
+        let archive = temp.path().join("book.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        writer
+            .start_file("chapter/page.cr2", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&bytes).unwrap();
+        writer.finish().unwrap();
+        let first = crate::zip_loader::read_first_image_bytes(&archive).unwrap();
+        assert_eq!(first.0, "chapter/page.cr2");
+        assert_eq!(first.1, bytes);
+        let metadata = std::fs::metadata(&archive).unwrap();
+        let mut request = LoadRequest {
+            path: archive,
+            mtime: crate::ui_helpers::mtime_secs(&metadata),
+            file_size: metadata.len() as i64,
+            source_policy: LoadSourcePolicy::SourceOnly,
+            cache_key_override: Some("zipthumb:book.zip".to_owned()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            remote_raw_thumbnail_requirement(&request, None),
+            RemoteRawThumbRequirement::PreviewAvailable
+        ));
+        let cache_map = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        let (tx, rx) = mpsc::channel();
+        let (raw_unavailable_tx, raw_unavailable_rx) = mpsc::channel();
+        let raw_handoff = RawThumbHandoff::RemotePreviewOnly(raw_unavailable_tx);
+        let done = Arc::new(AtomicUsize::new(0));
+        let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
+        process_load_request(
+            &mut request,
+            &cache_map,
+            &tx,
+            None,
+            2048,
+            80,
+            2048,
+            CacheDecision::without_thumbnail(),
+            &done,
+            &stats,
+            None,
+            &Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(usize::MAX)),
+            None,
+            None,
+            None,
+            None,
+            Some(&raw_handoff),
+        );
+        assert!(raw_unavailable_rx.try_recv().is_err());
+        drop(tx);
+        assert!(rx.into_iter().any(|message| message.pixels().is_some()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn zip_raw_thumbnail_uses_libraw_preview_and_developed_dimensions() {
+        use std::io::Write;
+        let source = Path::new("vendor/raw-samples/885.dng");
+        assert!(source.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        let bytes = std::fs::read(source).unwrap();
+        let dims = crate::raw::raw_decoder::info(crate::raw::RawSource::Bytes(&bytes))
+            .unwrap()
+            .developed_dims;
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("pages.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        writer
+            .start_file("chapter/page.dng", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&bytes).unwrap();
+        let portrait = std::fs::read("vendor/raw-samples/1230.cr2").unwrap();
+        writer
+            .start_file(
+                "chapter/portrait.cr2",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        writer.write_all(&portrait).unwrap();
+        writer.finish().unwrap();
+        let executor = Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap());
+        let queue = Arc::new((Mutex::new(Vec::new()), std::sync::Condvar::new()));
+        let tickets = Arc::new(Mutex::new(
+            crate::items_generation_cache::ItemsGenerationMap::new("zip_raw_thumb_test"),
+        ));
+        tickets.lock().unwrap().set_items_generation(1);
+        let handoff = RawThumbHandoff::Local(RawThumbLocalHandoff {
+            executor,
+            queue: Arc::clone(&queue),
+            tickets,
+        });
+        let cache_map = std::sync::RwLock::new(std::collections::HashMap::new());
+        let (tx, rx) = mpsc::channel();
+        let gen_done = Arc::new(AtomicUsize::new(0));
+        let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
+        raw_thumb_request(
+            &path,
+            Some("chapter/page.dng"),
+            &cache_map,
+            &tx,
+            None,
+            &gen_done,
+            &stats,
+            &handoff,
+        );
+        let display = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(display.pixels().is_some() && !display.is_canceled());
+        assert_eq!(
+            display.pixels().and_then(|pixels| pixels.source_dims),
+            Some((dims[0], dims[1]))
+        );
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .is_finalized()
+        );
+        assert!(
+            queue.0.lock().unwrap().is_empty(),
+            "sufficient preview must not queue development"
+        );
+        assert_eq!(stats.lock().unwrap().count_raw, 1);
+        assert_eq!(gen_done.load(Ordering::Relaxed), 1);
+        for (idx, strategy, prefix) in [
+            (1, ResolveStrategy::ZipFirstImage, None),
+            (2, ResolveStrategy::ZipDirRepresentative, Some("chapter/")),
+        ] {
+            let mut request = LoadRequest {
+                idx,
+                path: path.clone(),
+                zip_dir_prefix: prefix.map(str::to_owned),
+                resolve_override: Some(strategy),
+                cache_key_override: Some(format!("zipthumb:{idx}")),
+                priority: true,
+                items_gen: 1,
+                source_policy: LoadSourcePolicy::SourceOnly,
+                ..Default::default()
+            };
+            process_load_request(
+                &mut request,
+                &cache_map,
+                &tx,
+                None,
+                512,
+                75,
+                2048,
+                make_decision(CachePolicy::Off, 25, 2_000_000),
+                &gen_done,
+                &stats,
+                None,
+                &Arc::new(AtomicUsize::new(0)),
+                &Arc::new(AtomicUsize::new(3)),
+                None,
+                None,
+                None,
+                None,
+                Some(&handoff),
+            );
+            let display = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            assert_eq!(display.idx, idx);
+            assert!(display.pixels().is_some() && !display.is_canceled());
+            assert_eq!(
+                display.pixels().and_then(|pixels| pixels.source_dims),
+                Some((dims[0], dims[1]))
+            );
+            assert!(
+                rx.recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap()
+                    .is_finalized()
+            );
+        }
+        assert_eq!(stats.lock().unwrap().count_raw, 3);
+        assert_eq!(gen_done.load(Ordering::Relaxed), 3);
+        let portrait_dims = crate::raw::raw_decoder::info(crate::raw::RawSource::Bytes(&portrait))
+            .unwrap()
+            .developed_dims;
+        let mut portrait_request = LoadRequest {
+            idx: 3,
+            path,
+            zip_entry: Some("chapter/portrait.cr2".to_owned()),
+            priority: true,
+            items_gen: 1,
+            source_policy: LoadSourcePolicy::SourceOnly,
+            ..Default::default()
+        };
+        process_load_request(
+            &mut portrait_request,
+            &cache_map,
+            &tx,
+            None,
+            512,
+            75,
+            512,
+            make_decision(CachePolicy::Off, 25, 2_000_000),
+            &gen_done,
+            &stats,
+            None,
+            &Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(4)),
+            None,
+            None,
+            None,
+            None,
+            Some(&handoff),
+        );
+        let display = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            display.pixels().and_then(|pixels| pixels.source_dims),
+            Some((portrait_dims[0], portrait_dims[1]))
+        );
+        let image = display.into_pixels().unwrap().image;
+        assert!(
+            image.size[1] > image.size[0],
+            "LibRaw flip 5 keeps portrait orientation"
+        );
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .is_finalized()
+        );
+        assert_eq!(stats.lock().unwrap().count_raw, 4);
+        assert_eq!(gen_done.load(Ordering::Relaxed), 4);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn raw_half_ticket_exiting_keep_or_context_cancels_and_clears_requested() {
+        let path = PathBuf::from("vendor/raw-samples/1018.cr2");
+        assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        for context_exit in [false, true] {
+            let executor = Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap());
+            let (started_tx, started_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let _blocker = executor.block_one_slot_for_test(started_tx, release_rx);
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let queue: Arc<crate::app::NotifyQueue> =
+                Arc::new((Mutex::new(Vec::new()), std::sync::Condvar::new()));
+            let tickets = Arc::new(Mutex::new(
+                crate::items_generation_cache::ItemsGenerationMap::new("raw_thumb_cancel_test"),
+            ));
+            tickets.lock().unwrap().set_items_generation(1);
+            let handoff = RawThumbHandoff::Local(RawThumbLocalHandoff {
+                executor: Arc::clone(&executor),
+                queue,
+                tickets: Arc::clone(&tickets),
+            });
+            let cache_map = std::sync::RwLock::new(std::collections::HashMap::new());
+            let (tx, rx) = mpsc::channel();
+            let gen_done = Arc::new(AtomicUsize::new(0));
+            let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
+            raw_thumb_request(
+                &path, None, &cache_map, &tx, None, &gen_done, &stats, &handoff,
+            );
+            executor.wait_for_queued_job_for_test();
+            assert!(tickets.lock().unwrap().contains_key(&0));
+            assert!(rx.try_recv().is_err());
+            if context_exit {
+                cancel_raw_thumb_tickets(&tickets);
+            } else {
+                cancel_raw_thumb_tickets_outside_keep(&tickets, &std::collections::HashSet::new());
+            }
+            let canceled = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            assert!(
+                canceled.is_canceled() && !canceled.is_finalized() && canceled.pixels().is_none()
+            );
+            assert_eq!(canceled.idx, 0);
+            assert_eq!(gen_done.load(Ordering::Relaxed), 1);
+            assert!(!tickets.lock().unwrap().contains_key(&0));
+            release_tx.send(()).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn raw_sidecar_and_cache_creator_use_libraw_for_path_and_zip() {
+        use std::io::Write;
+
+        let cr2 = PathBuf::from("vendor/raw-samples/1018.cr2");
+        let dng = PathBuf::from("vendor/raw-samples/885.dng");
+        assert!(
+            cr2.is_file() && dng.is_file(),
+            "Run .\\scripts\\setup-raw-samples.ps1"
+        );
+        let executor = crate::raw::RawDevelopExecutor::new(1).unwrap();
+        let cr2_info = crate::raw::raw_decoder::info(crate::raw::RawSource::Path(&cr2)).unwrap();
+        let expected_dims = (cr2_info.developed_dims[0], cr2_info.developed_dims[1]);
+        let sidecar = decode_image_for_thumb(&cr2, 2048, &executor)
+            .unwrap()
+            .unwrap();
+        assert!(sidecar.size[0].max(sidecar.size[1]) <= 2048);
+        assert!(
+            sidecar.size[0].max(sidecar.size[1]) > 1536,
+            "the small CR2 preview must not win"
+        );
+
+        let temp = TempDir::new().unwrap();
+        let misleading = temp.path().join("misleading.dng");
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(2, 2))
+            .save_with_format(&misleading, image::ImageFormat::Png)
+            .unwrap();
+        assert!(decode_image_for_thumb(&misleading, 512, &executor).is_err());
+        let catalog = crate::catalog::CatalogDb::open(temp.path(), temp.path()).unwrap();
+        assert!(build_and_save_one(&cr2, &catalog, 11, 12, 2048, 75, &executor).is_some());
+        assert_eq!(
+            catalog.load_one("1018.cr2").unwrap().unwrap().source_dims,
+            Some(expected_dims)
+        );
+
+        let zip_path = temp.path().join("pages.zip");
+        let bytes = std::fs::read(&dng).unwrap();
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+        writer
+            .start_file("page.dng", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&bytes).unwrap();
+        writer.finish().unwrap();
+        let dng_dims = crate::raw::raw_decoder::info(crate::raw::RawSource::Bytes(&bytes))
+            .unwrap()
+            .developed_dims;
+        assert!(
+            build_and_save_one_zip(&zip_path, "page.dng", &catalog, 13, 14, 512, 75, &executor,)
+                .is_some()
+        );
+        assert_eq!(
+            catalog.load_one("page.dng").unwrap().unwrap().source_dims,
+            Some((dng_dims[0], dng_dims[1])),
+        );
+    }
+
+    #[test]
+    fn edit_preview_origin_is_cache_final_and_requires_the_exact_epoch() {
+        let origin = ThumbLoadOrigin::EditPreviewCache { epoch: 7 };
+        assert!(origin.from_cache());
+        assert!(origin.blocks_idle_upgrade());
+        assert!(origin.matches_edit_preview_epoch(Some(7)));
+        assert!(!origin.matches_edit_preview_epoch(Some(8)));
+        assert!(!origin.matches_edit_preview_epoch(None));
+        assert!(ThumbLoadOrigin::FinalCache.matches_edit_preview_epoch(None));
+    }
 
     #[test]
     fn foreground_thumbnail_requests_do_not_need_a_widened_worker_bbox() {
@@ -3296,6 +6185,79 @@ mod tests {
         };
 
         assert_eq!(phases.unaccounted_ms(10.0), 4.0);
+    }
+
+    #[test]
+    fn raw_async_decode_is_outside_the_thumbnail_worker_span() {
+        let phases = ThumbLoadPhases {
+            decode_ms: 1.0,
+            raw_async_decode_ms: Some(500.0),
+            orientation_ms: 0.5,
+            display_ms: 5.0,
+            ..ThumbLoadPhases::default()
+        };
+        assert_eq!(phases.disjoint_total_ms(), 6.0);
+        assert_eq!(phases.unaccounted_ms(10.0), 4.0);
+        assert_eq!(
+            phases.unaccounted_ms(10.0),
+            ThumbLoadPhases {
+                raw_async_decode_ms: None,
+                ..phases
+            }
+            .unaccounted_ms(10.0)
+        );
+    }
+
+    #[test]
+    fn raw_async_decode_still_drives_cache_policy_and_load_statistics() {
+        let tmp = TempDir::new().unwrap();
+        let catalog = Arc::new(crate::catalog::CatalogDb::open(tmp.path(), tmp.path()).unwrap());
+        let cache_map = std::sync::RwLock::new(std::collections::HashMap::new());
+        let (tx, rx) = mpsc::channel();
+        let gen_done = Arc::new(AtomicUsize::new(0));
+        let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
+        let mut request = LoadRequest {
+            path: tmp.path().join("half.cr2"),
+            file_size: 1, // Below the size heuristic; only decode time should trigger cache.
+            priority: true,
+            source_policy: LoadSourcePolicy::SourceOnly,
+            raw_source: LoadRequestSource::RawHalfDeveloped {
+                image: image::DynamicImage::new_rgb8(8, 8),
+                developed_dims: [16, 16],
+                decode_ms: 500.0,
+                folder_selection_proof: None,
+            },
+            ..Default::default()
+        };
+        process_load_request(
+            &mut request,
+            &cache_map,
+            &tx,
+            Some(&catalog),
+            32,
+            75,
+            32,
+            make_decision(CachePolicy::Auto, 250, 2_000_000),
+            &gen_done,
+            &stats,
+            None,
+            &Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(1)),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let display = rx.try_recv().unwrap();
+        let finalized = rx.try_recv().unwrap();
+        assert!(display.pixels().is_some() && !display.is_finalized());
+        assert!(finalized.is_finalized() && !finalized.is_canceled());
+        assert_eq!(gen_done.load(Ordering::Relaxed), 1);
+        assert!(catalog.load_one("half.cr2").unwrap().is_some());
+        let stats = stats.lock().unwrap();
+        assert_eq!(stats.count_raw, 1);
+        assert!(stats.time_raw >= 500.0);
     }
 
     /// これが落ちたら、`decode_ms` の内側にある区間が合計へ入っている。
@@ -3329,6 +6291,22 @@ mod tests {
         };
 
         assert_eq!(phases.unaccounted_ms(5.0), 0.0);
+    }
+
+    #[test]
+    fn known_stall_candidates_shrink_unaccounted_without_double_counting_prefill() {
+        let timing = |ms| crate::perf::stall::Timing { ms, cycles: 10 };
+        let phases = ThumbLoadPhases {
+            decode_ms: 20.0,
+            offer_raster: timing(5.0),
+            prefill_db: timing(4.0),
+            stats: timing(1.0),
+            normal_log: timing(800.0),
+            perf_log: timing(2.0),
+            ..ThumbLoadPhases::default()
+        };
+        assert_eq!(phases.disjoint_total_ms(), 828.0);
+        assert_eq!(phases.unaccounted_ms(830.0), 2.0);
     }
 
     #[cfg(windows)]
@@ -3493,6 +6471,26 @@ mod tests {
     }
 
     // ── DCT スケール: 詳細は docs/dct-scale-plan.md ───────────────────────
+
+    #[test]
+    fn thumbnail_decode_targets_do_not_change_when_similar_store_is_open() {
+        let display_px = 300;
+        let thumb_px = 512;
+        let before = (
+            super::thumbnail_jpeg_decode_target(display_px, thumb_px),
+            super::thumbnail_pdf_render_target(display_px),
+        );
+
+        let store = Arc::new(crate::similar_db::SimilarDb::open_in_memory().unwrap());
+        crate::similar_index::register_prefill_db_for_test(&store);
+        let while_store_is_open = (
+            super::thumbnail_jpeg_decode_target(display_px, thumb_px),
+            super::thumbnail_pdf_render_target(display_px),
+        );
+
+        assert_eq!(before, (display_px.max(thumb_px), display_px));
+        assert_eq!(while_store_is_open, before);
+    }
 
     #[test]
     fn pick_dct_scale_num_clamps_low() {
@@ -3740,6 +6738,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             0,
             &tx,
             Some(&catalog),
@@ -3760,6 +6759,11 @@ mod tests {
             crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
             true,
             false,
+            None,
+            None,
+            None,
+            LoadRequestSource::Original,
+            None,
             None,
         );
 
@@ -3809,7 +6813,7 @@ mod tests {
                 ..Default::default()
             };
             process_load_request(
-                &req,
+                &mut req.clone(),
                 &cache_map,
                 &tx,
                 None,
@@ -3826,9 +6830,10 @@ mod tests {
                 None,
                 None,
                 Some(&adjustment_db),
+                None,
             );
             rx.try_iter()
-                .find_map(|msg| msg.image)
+                .find_map(|msg| msg.into_pixels().map(|pixels| pixels.image))
                 .expect("decoded thumbnail")
         };
 
@@ -3863,6 +6868,10 @@ mod tests {
 
     #[test]
     fn cache_decision_auto_webp_always_caches() {
+        let mut paged = make_decision(CachePolicy::Auto, 25, 100_000_000);
+        paged.pdf_always = true;
+        assert!(paged.should_cache(Path::new("book.EPUB"), 100, 0.0, 0.0));
+        assert!(paged.should_cache(Path::new("book.pdf"), 100, 0.0, 0.0));
         let d = make_decision(CachePolicy::Auto, 25, 100_000_000);
         let webp = PathBuf::from("img.webp");
         // .webp は常にキャッシュ (size/time 関係なし)
@@ -3887,9 +6896,21 @@ mod tests {
         let depth = folder_thumb_auto_cache_key("folder", SortOrder::Numeric, 4);
 
         assert!(numeric.starts_with(CACHE_KEY_FOLDER));
-        assert!(numeric.contains("auto-v2:numeric:d3:folder"));
+        assert!(numeric.contains("auto-v3:numeric:d3:folder"));
         assert_ne!(numeric, name);
         assert_ne!(numeric, depth);
+        assert_eq!(
+            folder_thumb_auto_cache_key("folder", SortOrder::SizeDesc, 3),
+            name,
+            "list-only size values are sanitized to the existing name policy"
+        );
+        for list_only in [SortOrder::FileNameDesc, SortOrder::NumericDesc] {
+            assert_eq!(
+                folder_thumb_auto_cache_key("folder", list_only, 3),
+                name,
+                "list-only descending values must not enter representative selection"
+            );
+        }
     }
 
     fn resolved_image_path(result: Option<FolderThumbResolution>) -> Option<PathBuf> {
@@ -3897,6 +6918,951 @@ mod tests {
             Some(FolderThumbResolution::Image(path)) => Some(path),
             Some(FolderThumbResolution::CachedPinned(_)) | None => None,
         }
+    }
+
+    fn fixture_webp() -> Vec<u8> {
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            8,
+            8,
+            image::Rgba([20, 80, 160, 255]),
+        ));
+        crate::catalog::encode_thumb_webp(&image, 8, 75.0)
+            .unwrap()
+            .0
+    }
+
+    #[test]
+    fn archive_tile_key_matches_aggregate_full_path_catalog_identity() {
+        let root = Path::new(r"C:\");
+        let pdf = Path::new(r"C:\book.pdf");
+        let cbz = Path::new(r"C:\book.cbz");
+        assert_eq!(
+            archive_tile_key(pdf, root).as_deref(),
+            Some(r"pdfthumb:C:\book.pdf")
+        );
+        assert_eq!(
+            archive_tile_key(cbz, root).as_deref(),
+            Some(r"zipthumb:C:\book.cbz")
+        );
+        assert_eq!(
+            archive_tile_key(pdf, Path::new(r"C:\library")).as_deref(),
+            Some("pdfthumb:book.pdf")
+        );
+    }
+
+    fn save_archive_tile(cache_dir: &Path, folder: &Path, archive: &Path, key: &str) {
+        let metadata = std::fs::metadata(archive).unwrap();
+        let catalog = crate::catalog::CatalogDb::open(cache_dir, folder).unwrap();
+        assert!(
+            catalog
+                .save_thumb_bytes(
+                    key,
+                    crate::ui_helpers::mtime_secs(&metadata),
+                    metadata.len() as i64,
+                    Some((8, 8)),
+                    &fixture_webp(),
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn automatic_folder_uses_sorted_valid_archive_tile_without_opening_archive() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("library");
+        let cache = tmp.path().join("cache");
+        let later = root.join("20-child");
+        std::fs::create_dir_all(&later).unwrap();
+        std::fs::write(later.join("image.jpg"), b"not decoded").unwrap();
+        let archive = root.join("10-broken.cbz");
+        std::fs::write(&archive, b"this is not an archive").unwrap();
+        save_archive_tile(&cache, &root, &archive, "zipthumb:10-broken.cbz");
+
+        let (result, proof) = select_folder_thumb_image_with_cache_dir(
+            &root,
+            SortOrder::Numeric,
+            2,
+            None,
+            &cache,
+            None,
+        );
+        match result {
+            Some(FolderThumbResolution::CachedPinned(value)) => {
+                assert_eq!(value.source_path, archive);
+                assert_eq!(value.cache_key, "zipthumb:10-broken.cbz");
+            }
+            _ => panic!("expected existing WebP without archive decode"),
+        }
+        assert_eq!(proof.unwrap().directories.len(), 1);
+    }
+
+    #[test]
+    fn direct_images_win_under_every_configured_folder_sort() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("library");
+        let child = root.join("00-child");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("cover.jpg"), b"child").unwrap();
+        let two = root.join("2.jpg");
+        let ten = root.join("10.jpg");
+        std::fs::write(&two, b"two").unwrap();
+        std::fs::write(&ten, b"ten").unwrap();
+        let older = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        let newer = older + std::time::Duration::from_secs(100);
+        std::fs::File::options()
+            .write(true)
+            .open(&two)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(older))
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&ten)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(newer))
+            .unwrap();
+        for (sort, expected) in [
+            // Windows filename collation places 2 before 10 here as well.
+            (SortOrder::FileName, &two),
+            (SortOrder::Numeric, &two),
+            (SortOrder::DateAsc, &two),
+            (SortOrder::DateDesc, &ten),
+        ] {
+            let (selected, proof) = select_folder_thumb_image_with_cache_dir(
+                &root,
+                sort,
+                3,
+                None,
+                &tmp.path().join("cache"),
+                None,
+            );
+            assert_eq!(
+                resolved_image_path(selected),
+                Some(expected.clone()),
+                "{sort:?}"
+            );
+            let proof = proof.unwrap();
+            assert!(proof.directories.is_empty());
+            assert_eq!(proof.pin_store, crate::catalog::PinStoreProof::NotConsulted);
+        }
+    }
+
+    #[test]
+    fn mixed_archive_and_folder_candidates_follow_one_sort_order() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("library");
+        let cache = tmp.path().join("cache");
+        let child = root.join("2-child");
+        std::fs::create_dir_all(&child).unwrap();
+        let image = child.join("cover.jpg");
+        std::fs::write(&image, b"image").unwrap();
+        let zip = root.join("10-book.cbz");
+        let pdf = root.join("3-book.pdf");
+        std::fs::write(&zip, b"invalid zip").unwrap();
+        std::fs::write(&pdf, b"invalid pdf").unwrap();
+        save_archive_tile(&cache, &root, &zip, "zipthumb:10-book.cbz");
+        save_archive_tile(&cache, &root, &pdf, "pdfthumb:3-book.pdf");
+        let pins = crate::folder_thumb_pins::FolderThumbPinDb::open_at(&tmp.path().join("pins.db"))
+            .unwrap();
+        assert_eq!(
+            resolved_image_path(
+                select_folder_thumb_image_with_cache_dir(
+                    &root,
+                    SortOrder::Numeric,
+                    2,
+                    Some(&pins),
+                    &cache,
+                    None,
+                )
+                .0
+            ),
+            Some(image.clone()),
+        );
+        let selected = select_folder_thumb_image_with_cache_dir(
+            &root,
+            SortOrder::FileName,
+            2,
+            Some(&pins),
+            &cache,
+            None,
+        )
+        .0;
+        assert_eq!(resolved_image_path(selected), Some(image.clone()));
+        std::fs::remove_file(&image).unwrap();
+        let selected = select_folder_thumb_image_with_cache_dir(
+            &root,
+            SortOrder::Numeric,
+            2,
+            Some(&pins),
+            &cache,
+            None,
+        )
+        .0;
+        assert!(
+            matches!(selected, Some(FolderThumbResolution::CachedPinned(value)) if value.source_path == pdf)
+        );
+        crate::catalog::CatalogDb::open(&cache, &root)
+            .unwrap()
+            .delete_one("pdfthumb:3-book.pdf")
+            .unwrap();
+        let selected = select_folder_thumb_image_with_cache_dir(
+            &root,
+            SortOrder::Numeric,
+            2,
+            Some(&pins),
+            &cache,
+            None,
+        )
+        .0;
+        assert!(
+            matches!(selected, Some(FolderThumbResolution::CachedPinned(value)) if value.source_path == zip)
+        );
+    }
+
+    #[test]
+    fn stale_and_corrupt_unpinned_archive_rows_are_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("library");
+        let cache = tmp.path().join("cache");
+        std::fs::create_dir_all(&root).unwrap();
+        let stale = root.join("01-stale.cbz");
+        let corrupt = root.join("02-corrupt.pdf");
+        let valid = root.join("03-valid.cbz");
+        for path in [&stale, &corrupt, &valid] {
+            std::fs::write(path, b"invalid archive bytes").unwrap();
+        }
+        let catalog = crate::catalog::CatalogDb::open(&cache, &root).unwrap();
+        catalog
+            .save_thumb_bytes(
+                "zipthumb:01-stale.cbz",
+                0,
+                -1,
+                Some((8, 8)),
+                &fixture_webp(),
+            )
+            .unwrap();
+        let meta = std::fs::metadata(&corrupt).unwrap();
+        catalog
+            .save(
+                "pdfthumb:02-corrupt.pdf",
+                crate::ui_helpers::mtime_secs(&meta),
+                meta.len() as i64,
+                8,
+                8,
+                Some((8, 8)),
+                b"not webp",
+            )
+            .unwrap();
+        assert!(
+            catalog
+                .load_one("pdfthumb:02-corrupt.pdf")
+                .unwrap()
+                .is_some(),
+            "the corrupt candidate must exist in the catalog"
+        );
+        save_archive_tile(&cache, &root, &valid, "zipthumb:03-valid.cbz");
+        let selected = select_folder_thumb_image_with_cache_dir(
+            &root,
+            SortOrder::Numeric,
+            1,
+            None,
+            &cache,
+            None,
+        )
+        .0;
+        assert!(
+            matches!(selected, Some(FolderThumbResolution::CachedPinned(value)) if value.source_path == valid)
+        );
+    }
+
+    #[test]
+    fn archive_stamp_queries_stop_on_cancel_and_first_winner() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("library");
+        let cache = tmp.path().join("cache");
+        std::fs::create_dir_all(&root).unwrap();
+        let first = root.join("000-book.cbz");
+        for index in 0..100 {
+            std::fs::write(
+                root.join(format!("{index:03}-book.cbz")),
+                b"invalid archive",
+            )
+            .unwrap();
+        }
+        let _catalog = crate::catalog::CatalogDb::open(&cache, &root).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let hook = Arc::new(SelectionStampHook {
+            queries: std::sync::atomic::AtomicUsize::new(0),
+            cancel_after: 3,
+            token: cancel.clone(),
+        });
+        selection_stamp_hooks()
+            .lock()
+            .unwrap()
+            .insert(root.clone(), hook.clone());
+        let selected = select_folder_thumb_image_with_cache_dir(
+            &root,
+            SortOrder::Numeric,
+            1,
+            None,
+            &cache,
+            Some(&cancel),
+        )
+        .0;
+        selection_stamp_hooks().lock().unwrap().remove(&root);
+        assert!(selected.is_none());
+        assert_eq!(hook.queries.load(Ordering::Relaxed), 3);
+
+        save_archive_tile(&cache, &root, &first, "zipthumb:000-book.cbz");
+        let hook = Arc::new(SelectionStampHook {
+            queries: std::sync::atomic::AtomicUsize::new(0),
+            cancel_after: usize::MAX,
+            token: Arc::new(AtomicBool::new(false)),
+        });
+        selection_stamp_hooks()
+            .lock()
+            .unwrap()
+            .insert(root.clone(), hook.clone());
+        let selected = select_folder_thumb_image_with_cache_dir(
+            &root,
+            SortOrder::Numeric,
+            1,
+            None,
+            &cache,
+            None,
+        )
+        .0;
+        selection_stamp_hooks().lock().unwrap().remove(&root);
+        assert!(
+            matches!(selected, Some(FolderThumbResolution::CachedPinned(value)) if value.source_path == first)
+        );
+        assert_eq!(hook.queries.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn archive_row_creation_deletion_and_instance_recreation_invalidate_proof() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("library");
+        let cache = tmp.path().join("cache");
+        let pin_db =
+            crate::folder_thumb_pins::FolderThumbPinDb::open_at(&tmp.path().join("pins.db"))
+                .unwrap();
+        let later = root.join("20-child");
+        std::fs::create_dir_all(&later).unwrap();
+        let image = later.join("image.jpg");
+        std::fs::write(&image, b"not decoded").unwrap();
+        let archive = root.join("10-book.pdf");
+        std::fs::write(&archive, b"invalid pdf").unwrap();
+        let (_, proof) = select_folder_thumb_image_with_cache_dir(
+            &root,
+            SortOrder::Numeric,
+            2,
+            Some(&pin_db),
+            &cache,
+            None,
+        );
+        let proof = proof.unwrap();
+        assert_eq!(
+            proof.directories[0].state,
+            crate::catalog::CatalogProofState::Absent
+        );
+        let request = LoadRequest {
+            folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::AutoSelected),
+            ..Default::default()
+        };
+        let entry = |proof: crate::catalog::FolderSelectionProof| crate::catalog::CacheEntry {
+            mtime: 0,
+            file_size: 0,
+            jpeg_data: fixture_webp(),
+            source_dims: None,
+            layout_dims: None,
+            folder_provenance: Some(crate::catalog::FolderThumbProvenance::AutoSelected),
+            selection_proof: Some(proof),
+        };
+        assert!(folder_cached_row_usable_in_cache_dir_with_pins(
+            &request,
+            &entry(proof.clone()),
+            &cache,
+            Some(&pin_db),
+        ));
+        save_archive_tile(&cache, &root, &archive, "pdfthumb:10-book.pdf");
+        assert!(!folder_cached_row_usable_in_cache_dir_with_pins(
+            &request,
+            &entry(proof),
+            &cache,
+            Some(&pin_db),
+        ));
+        let (_, proof) = select_folder_thumb_image_with_cache_dir(
+            &root,
+            SortOrder::Numeric,
+            2,
+            Some(&pin_db),
+            &cache,
+            None,
+        );
+        let proof = proof.unwrap();
+        assert!(folder_cached_row_usable_in_cache_dir_with_pins(
+            &request,
+            &entry(proof.clone()),
+            &cache,
+            Some(&pin_db),
+        ));
+        let catalog = crate::catalog::CatalogDb::open(&cache, &root).unwrap();
+        catalog.delete_one("pdfthumb:10-book.pdf").unwrap();
+        assert!(!folder_cached_row_usable_in_cache_dir_with_pins(
+            &request,
+            &entry(proof.clone()),
+            &cache,
+            Some(&pin_db),
+        ));
+        drop(catalog);
+        assert_eq!(crate::catalog::delete_all_cache(&cache), 1);
+        assert!(!folder_cached_row_usable_in_cache_dir_with_pins(
+            &request,
+            &entry(proof),
+            &cache,
+            Some(&pin_db),
+        ));
+        save_archive_tile(&cache, &root, &archive, "pdfthumb:10-book.pdf");
+        // Fresh catalog instance cannot accidentally validate a released revision pair.
+        let (_, new_proof) = select_folder_thumb_image_with_cache_dir(
+            &root,
+            SortOrder::Numeric,
+            2,
+            Some(&pin_db),
+            &cache,
+            None,
+        );
+        assert!(folder_cached_row_usable_in_cache_dir_with_pins(
+            &request,
+            &entry(new_proof.unwrap()),
+            &cache,
+            Some(&pin_db),
+        ));
+    }
+
+    #[test]
+    fn released_seeded_row_stays_usable_but_auto_requires_proof() {
+        let tmp = TempDir::new().unwrap();
+        let image = tmp.path().join("video.mp4");
+        std::fs::write(&image, b"video").unwrap();
+        let legacy = crate::catalog::CacheEntry {
+            mtime: 0,
+            file_size: 0,
+            jpeg_data: fixture_webp(),
+            source_dims: None,
+            layout_dims: None,
+            folder_provenance: None,
+            selection_proof: None,
+        };
+        let seeded = LoadRequest {
+            folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::Seeded),
+            ..Default::default()
+        };
+        let automatic = LoadRequest {
+            folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::AutoSelected),
+            ..Default::default()
+        };
+        assert!(folder_cached_row_usable_in_cache_dir(
+            &seeded,
+            &legacy,
+            tmp.path()
+        ));
+        assert!(!folder_cached_row_usable_in_cache_dir(
+            &automatic,
+            &legacy,
+            tmp.path()
+        ));
+        assert!(
+            folder_thumb_cache_key(
+                "folder",
+                SortOrder::Numeric,
+                3,
+                crate::catalog::FolderThumbProvenance::Seeded
+            )
+            .contains("auto-v2")
+        );
+    }
+
+    #[test]
+    fn archive_active_pin_requires_exact_pinned_row() {
+        use crate::folder_thumb_pins::FolderPinSource;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("library");
+        let cache = tmp.path().join("cache");
+        let later = root.join("20-child");
+        std::fs::create_dir_all(&later).unwrap();
+        let fallback = later.join("image.jpg");
+        std::fs::write(&fallback, b"not decoded").unwrap();
+        let archive = root.join("10-book.pdf");
+        std::fs::write(&archive, b"invalid pdf").unwrap();
+        save_archive_tile(&cache, &root, &archive, "pdfthumb:10-book.pdf");
+        let pin_db =
+            crate::folder_thumb_pins::FolderThumbPinDb::open_at(&tmp.path().join("pins.db"))
+                .unwrap();
+        let source = FolderPinSource::PdfPage {
+            pdf_rel: String::new(),
+            page: 3,
+        };
+        pin_db.set(&archive, &source).unwrap();
+        assert_eq!(
+            resolved_image_path(resolve_folder_thumb_image_with_cache_dir(
+                &root,
+                SortOrder::Numeric,
+                2,
+                Some(&pin_db),
+                &cache,
+            )),
+            Some(fallback)
+        );
+
+        let resolved = crate::folder_thumb_pins::resolve_pin_target_cascaded_via(
+            &archive,
+            &source,
+            |path| pin_db.lookup(path),
+            2,
+        )
+        .unwrap();
+        let key = format!(
+            "pdfthumb:10-book.pdf{CACHE_KEY_PIN_SUFFIX}{}",
+            resolved.source_id
+        );
+        let catalog = crate::catalog::CatalogDb::open(&cache, &root).unwrap();
+        catalog
+            .save_thumb_bytes(
+                &key,
+                resolved.mtime,
+                resolved.file_size,
+                Some((8, 8)),
+                &fixture_webp(),
+            )
+            .unwrap();
+        let result = resolve_folder_thumb_image_with_cache_dir(
+            &root,
+            SortOrder::Numeric,
+            2,
+            Some(&pin_db),
+            &cache,
+        );
+        assert!(
+            matches!(result, Some(FolderThumbResolution::CachedPinned(value)) if value.cache_key == key)
+        );
+    }
+
+    fn proof_entry(proof: crate::catalog::FolderSelectionProof) -> crate::catalog::CacheEntry {
+        crate::catalog::CacheEntry {
+            mtime: 0,
+            file_size: 0,
+            jpeg_data: fixture_webp(),
+            source_dims: None,
+            layout_dims: None,
+            folder_provenance: Some(crate::catalog::FolderThumbProvenance::AutoSelected),
+            selection_proof: Some(proof),
+        }
+    }
+
+    fn auto_request() -> LoadRequest {
+        LoadRequest {
+            folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::AutoSelected),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pinning_archive_without_new_tile_invalidates_parent_selection() {
+        use crate::folder_thumb_pins::FolderPinSource;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("library");
+        let cache = tmp.path().join("cache");
+        let child = root.join("20-child");
+        std::fs::create_dir_all(&child).unwrap();
+        let fallback = child.join("cover.jpg");
+        std::fs::write(&fallback, b"image").unwrap();
+        let archive = root.join("10-book.pdf");
+        std::fs::write(&archive, b"invalid pdf").unwrap();
+        save_archive_tile(&cache, &root, &archive, "pdfthumb:10-book.pdf");
+        let pins = crate::folder_thumb_pins::FolderThumbPinDb::open_at(&tmp.path().join("pins.db"))
+            .unwrap();
+        let (selected, proof) = select_folder_thumb_image_with_cache_dir(
+            &root,
+            SortOrder::Numeric,
+            2,
+            Some(&pins),
+            &cache,
+            None,
+        );
+        assert!(matches!(
+            selected,
+            Some(FolderThumbResolution::CachedPinned(_))
+        ));
+        let entry = proof_entry(proof.unwrap());
+        assert!(folder_cached_row_usable_in_cache_dir_with_pins(
+            &auto_request(),
+            &entry,
+            &cache,
+            Some(&pins),
+        ));
+        pins.set(
+            &archive,
+            &FolderPinSource::PdfPage {
+                pdf_rel: String::new(),
+                page: 2,
+            },
+        )
+        .unwrap();
+        assert!(!folder_cached_row_usable_in_cache_dir_with_pins(
+            &auto_request(),
+            &entry,
+            &cache,
+            Some(&pins),
+        ));
+        assert_eq!(
+            resolved_image_path(
+                select_folder_thumb_image_with_cache_dir(
+                    &root,
+                    SortOrder::Numeric,
+                    2,
+                    Some(&pins),
+                    &cache,
+                    None,
+                )
+                .0
+            ),
+            Some(fallback),
+        );
+    }
+
+    #[test]
+    fn changing_child_image_pin_invalidates_parent_selection() {
+        use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("library");
+        let child = root.join("child");
+        let cache = tmp.path().join("cache");
+        std::fs::create_dir_all(&child).unwrap();
+        let first = child.join("first.jpg");
+        let second = child.join("second.jpg");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let pins = crate::folder_thumb_pins::FolderThumbPinDb::open_at(&tmp.path().join("pins.db"))
+            .unwrap();
+        let pin = |name: &str| FolderPinSource::File {
+            rel: name.to_owned(),
+            kind: FileKind::Image,
+        };
+        pins.set(&child, &pin("first.jpg")).unwrap();
+        let (selected, proof) = select_folder_thumb_image_with_cache_dir(
+            &root,
+            SortOrder::Numeric,
+            2,
+            Some(&pins),
+            &cache,
+            None,
+        );
+        assert_eq!(resolved_image_path(selected), Some(first));
+        let entry = proof_entry(proof.unwrap());
+        assert!(folder_cached_row_usable_in_cache_dir_with_pins(
+            &auto_request(),
+            &entry,
+            &cache,
+            Some(&pins),
+        ));
+        pins.set(&child, &pin("second.jpg")).unwrap();
+        assert!(!folder_cached_row_usable_in_cache_dir_with_pins(
+            &auto_request(),
+            &entry,
+            &cache,
+            Some(&pins),
+        ));
+        assert_eq!(
+            resolved_image_path(
+                select_folder_thumb_image_with_cache_dir(
+                    &root,
+                    SortOrder::Numeric,
+                    2,
+                    Some(&pins),
+                    &cache,
+                    None,
+                )
+                .0
+            ),
+            Some(second),
+        );
+    }
+
+    #[test]
+    fn unavailable_pin_store_produces_unverifiable_proof() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("library");
+        let cache = tmp.path().join("cache");
+        std::fs::create_dir_all(&root).unwrap();
+        let archive = root.join("book.cbz");
+        std::fs::write(&archive, b"invalid archive").unwrap();
+        save_archive_tile(&cache, &root, &archive, "zipthumb:book.cbz");
+        let (selected, proof) = select_folder_thumb_image_with_cache_dir(
+            &root,
+            SortOrder::Numeric,
+            1,
+            None,
+            &cache,
+            None,
+        );
+        assert!(matches!(
+            selected,
+            Some(FolderThumbResolution::CachedPinned(_))
+        ));
+        let proof = proof.unwrap();
+        assert_eq!(
+            proof.pin_store,
+            crate::catalog::PinStoreProof::Observed(
+                crate::catalog::CatalogProofState::Unverifiable
+            )
+        );
+        assert!(!folder_cached_row_usable_in_cache_dir(
+            &auto_request(),
+            &proof_entry(proof),
+            &cache,
+        ));
+    }
+
+    #[test]
+    fn failed_legacy_catalog_initialization_selects_row_but_proof_fails_closed() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("library");
+        let cache = tmp.path().join("cache");
+        std::fs::create_dir_all(&root).unwrap();
+        let archive = root.join("book.pdf");
+        std::fs::write(&archive, b"invalid pdf bytes").unwrap();
+        let metadata = std::fs::metadata(&archive).unwrap();
+        let db_path = crate::catalog::db_path_for(&cache, &root);
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE thumbnails (
+            filename TEXT NOT NULL PRIMARY KEY, mtime INTEGER NOT NULL,
+            file_size INTEGER NOT NULL, width INTEGER NOT NULL, height INTEGER NOT NULL,
+            thumb_data BLOB NOT NULL, source_width INTEGER, source_height INTEGER
+        ); CREATE TABLE folder_selection_revision (wrong INTEGER);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO thumbnails VALUES (?1, ?2, ?3, 8, 8, ?4, 8, 8)",
+            rusqlite::params![
+                "pdfthumb:book.pdf",
+                crate::ui_helpers::mtime_secs(&metadata),
+                metadata.len() as i64,
+                fixture_webp()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        let (selected, proof) = select_folder_thumb_image_with_cache_dir(
+            &root,
+            SortOrder::Numeric,
+            1,
+            None,
+            &cache,
+            None,
+        );
+        assert!(matches!(
+            selected,
+            Some(FolderThumbResolution::CachedPinned(_))
+        ));
+        let proof = proof.unwrap();
+        assert_eq!(
+            proof.directories[0].state,
+            crate::catalog::CatalogProofState::Unverifiable
+        );
+        let request = LoadRequest {
+            folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::AutoSelected),
+            ..Default::default()
+        };
+        let entry = crate::catalog::CacheEntry {
+            mtime: 0,
+            file_size: 0,
+            jpeg_data: fixture_webp(),
+            source_dims: None,
+            layout_dims: None,
+            folder_provenance: Some(crate::catalog::FolderThumbProvenance::AutoSelected),
+            selection_proof: Some(proof),
+        };
+        assert!(!folder_cached_row_usable_in_cache_dir(
+            &request, &entry, &cache
+        ));
+    }
+
+    #[test]
+    fn folder_pin_to_deep_directory_records_archive_dependency() {
+        use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("library");
+        let child = root.join("01-child");
+        let deep = child.join("deep");
+        let cache = tmp.path().join("cache");
+        std::fs::create_dir_all(&deep).unwrap();
+        let archive = deep.join("book.cbz");
+        std::fs::write(&archive, b"invalid archive").unwrap();
+        save_archive_tile(&cache, &deep, &archive, "zipthumb:book.cbz");
+        let pin_db =
+            crate::folder_thumb_pins::FolderThumbPinDb::open_at(&tmp.path().join("pins.db"))
+                .unwrap();
+        pin_db
+            .set(
+                &child,
+                &FolderPinSource::File {
+                    rel: "deep".to_owned(),
+                    kind: FileKind::Folder,
+                },
+            )
+            .unwrap();
+        let (result, proof) = select_folder_thumb_image_with_cache_dir(
+            &root,
+            SortOrder::Numeric,
+            3,
+            Some(&pin_db),
+            &cache,
+            None,
+        );
+        assert!(matches!(
+            result,
+            Some(FolderThumbResolution::CachedPinned(_))
+        ));
+        let proof = proof.unwrap();
+        assert!(
+            proof
+                .directories
+                .iter()
+                .any(|entry| entry.directory == deep)
+        );
+        let request = LoadRequest {
+            folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::AutoSelected),
+            ..Default::default()
+        };
+        let entry = crate::catalog::CacheEntry {
+            mtime: 0,
+            file_size: 0,
+            jpeg_data: fixture_webp(),
+            source_dims: None,
+            layout_dims: None,
+            folder_provenance: Some(crate::catalog::FolderThumbProvenance::AutoSelected),
+            selection_proof: Some(proof),
+        };
+        assert!(folder_cached_row_usable_in_cache_dir_with_pins(
+            &request,
+            &entry,
+            &cache,
+            Some(&pin_db)
+        ));
+        crate::catalog::CatalogDb::open(&cache, &deep)
+            .unwrap()
+            .delete_one("zipthumb:book.cbz")
+            .unwrap();
+        assert!(!folder_cached_row_usable_in_cache_dir_with_pins(
+            &request,
+            &entry,
+            &cache,
+            Some(&pin_db)
+        ));
+    }
+
+    #[test]
+    fn archive_mutation_after_capture_rejects_later_saved_folder_row() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("library");
+        let child = root.join("20-child");
+        let cache = tmp.path().join("cache");
+        let pins = crate::folder_thumb_pins::FolderThumbPinDb::open_at(&tmp.path().join("pins.db"))
+            .unwrap();
+        std::fs::create_dir_all(&child).unwrap();
+        let image = child.join("image.jpg");
+        std::fs::write(&image, b"not decoded").unwrap();
+        let archive = root.join("00-book.cbz");
+        std::fs::write(&archive, b"invalid archive").unwrap();
+        let (_, proof) = select_folder_thumb_image_with_cache_dir(
+            &root,
+            SortOrder::Numeric,
+            2,
+            Some(&pins),
+            &cache,
+            None,
+        );
+        let proof = proof.unwrap();
+        assert!(folder_cached_row_usable_in_cache_dir_with_pins(
+            &auto_request(),
+            &proof_entry(proof.clone()),
+            &cache,
+            Some(&pins),
+        ));
+        save_archive_tile(&cache, &root, &archive, "zipthumb:00-book.cbz");
+        let parent = tmp.path();
+        let catalog = crate::catalog::CatalogDb::open(&cache, parent).unwrap();
+        let key = folder_thumb_auto_cache_key("library", SortOrder::Numeric, 2);
+        let metadata = std::fs::metadata(&root).unwrap();
+        catalog
+            .save_auto_folder_bytes(
+                &key,
+                crate::ui_helpers::mtime_secs(&metadata),
+                0,
+                None,
+                None,
+                &fixture_webp(),
+                Some(&proof),
+            )
+            .unwrap();
+        let stored = catalog.load_one(&key).unwrap().unwrap();
+        assert_eq!(stored.selection_proof.as_ref(), Some(&proof));
+        let request = LoadRequest {
+            folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::AutoSelected),
+            cache_key_override: Some(key),
+            ..Default::default()
+        };
+        assert!(!folder_cached_row_usable_in_cache_dir_with_pins(
+            &request,
+            &stored,
+            &cache,
+            Some(&pins)
+        ));
+    }
+
+    #[test]
+    fn winning_image_removal_rejects_empty_dependency_proof() {
+        let tmp = TempDir::new().unwrap();
+        let image = tmp.path().join("cover.jpg");
+        std::fs::write(&image, b"not decoded").unwrap();
+        let (_, proof) = select_folder_thumb_image_with_cache_dir(
+            tmp.path(),
+            SortOrder::Numeric,
+            3,
+            None,
+            tmp.path(),
+            None,
+        );
+        let proof = proof.unwrap();
+        assert!(proof.directories.is_empty());
+        let request = LoadRequest {
+            folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::AutoSelected),
+            ..Default::default()
+        };
+        let entry = crate::catalog::CacheEntry {
+            mtime: 0,
+            file_size: 0,
+            jpeg_data: fixture_webp(),
+            source_dims: None,
+            layout_dims: None,
+            folder_provenance: Some(crate::catalog::FolderThumbProvenance::AutoSelected),
+            selection_proof: Some(proof),
+        };
+        assert!(folder_cached_row_usable_in_cache_dir(
+            &request,
+            &entry,
+            tmp.path()
+        ));
+        std::fs::remove_file(image).unwrap();
+        assert!(!folder_cached_row_usable_in_cache_dir(
+            &request,
+            &entry,
+            tmp.path()
+        ));
     }
 
     struct PdfPinFixture {
@@ -3917,7 +7883,9 @@ mod tests {
         std::fs::create_dir_all(&child).unwrap();
         let pdf = child.join("book.pdf");
         std::fs::write(&pdf, b"fake pdf bytes").unwrap();
-        let fallback = root.join("99-fallback.jpg");
+        let fallback_dir = root.join("99-fallback");
+        std::fs::create_dir_all(&fallback_dir).unwrap();
+        let fallback = fallback_dir.join("fallback.jpg");
         std::fs::write(&fallback, b"not decoded").unwrap();
         let pin_db =
             crate::folder_thumb_pins::FolderThumbPinDb::open_at(&tmp.path().join("pins.db"))
@@ -3946,9 +7914,14 @@ mod tests {
     }
 
     fn save_pdf_pin_webp(fixture: &PdfPinFixture, depth: u32, bytes: &[u8]) -> String {
-        let base_key =
-            folder_thumb_auto_cache_key_for_path(&fixture.child, false, SortOrder::Numeric, depth)
-                .unwrap();
+        let base_key = folder_thumb_cache_key_for_path(
+            &fixture.child,
+            false,
+            SortOrder::Numeric,
+            depth,
+            crate::catalog::FolderThumbProvenance::Seeded,
+        )
+        .unwrap();
         let cache_key = format!(
             "{base_key}{CACHE_KEY_PIN_SUFFIX}{}",
             fixture.resolved.source_id
@@ -4004,6 +7977,52 @@ mod tests {
     }
 
     #[test]
+    fn late_child_pin_row_creation_and_deletion_change_parent_proof() {
+        let tmp = TempDir::new().unwrap();
+        let fixture = prepare_pdf_pin_fixture(&tmp, 3);
+        let (_, before) = select_folder_thumb_image_with_cache_dir(
+            &fixture.root,
+            SortOrder::Numeric,
+            3,
+            Some(&fixture.pin_db),
+            &fixture.cache_dir,
+            None,
+        );
+        let before = before.unwrap();
+        assert_eq!(
+            before.directories[0].state,
+            crate::catalog::CatalogProofState::Absent
+        );
+        let key = save_pdf_pin_webp(&fixture, 3, &fixture_webp());
+        let (selected, after) = select_folder_thumb_image_with_cache_dir(
+            &fixture.root,
+            SortOrder::Numeric,
+            3,
+            Some(&fixture.pin_db),
+            &fixture.cache_dir,
+            None,
+        );
+        assert!(
+            matches!(selected, Some(FolderThumbResolution::CachedPinned(value)) if value.cache_key == key)
+        );
+        let after = after.unwrap();
+        assert_ne!(before.directories[0].state, after.directories[0].state);
+        let catalog = crate::catalog::CatalogDb::open(&fixture.cache_dir, &fixture.root).unwrap();
+        catalog.delete_one(&key).unwrap();
+        let (selected, _) = select_folder_thumb_image_with_cache_dir(
+            &fixture.root,
+            SortOrder::Numeric,
+            3,
+            Some(&fixture.pin_db),
+            &fixture.cache_dir,
+            None,
+        );
+        assert_eq!(resolved_image_path(selected), Some(fixture.fallback));
+        let current = catalog.revision_state();
+        assert_ne!(after.directories[0].state, current);
+    }
+
+    #[test]
     fn resolve_folder_thumb_falls_back_after_pdf_pin_cache_is_deleted() {
         let tmp = TempDir::new().unwrap();
         let depth = 3;
@@ -4034,9 +8053,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let depth = 3;
         let fixture = prepare_pdf_pin_fixture(&tmp, depth);
-        let base_key =
-            folder_thumb_auto_cache_key_for_path(&fixture.child, false, SortOrder::Numeric, depth)
-                .unwrap();
+        let base_key = folder_thumb_cache_key_for_path(
+            &fixture.child,
+            false,
+            SortOrder::Numeric,
+            depth,
+            crate::catalog::FolderThumbProvenance::Seeded,
+        )
+        .unwrap();
         let cache_key = format!(
             "{base_key}{CACHE_KEY_PIN_SUFFIX}{}",
             fixture.resolved.source_id
@@ -4089,10 +8113,9 @@ mod tests {
         std::fs::write(&expected, b"not decoded").unwrap();
         std::fs::write(tmp.path().join("00表紙2.jpg"), b"not decoded").unwrap();
 
-        let picked = resolve_folder_thumb_image_inner(
+        let picked = resolve_folder_thumb_image_with_cache_dir(
             tmp.path(),
             Settings::default().folder_thumb_sort,
-            0,
             0,
             None,
             tmp.path(),
@@ -4122,13 +8145,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_folder_thumb_prefers_folder_block_before_direct_images() {
+    fn resolve_folder_thumb_prefers_direct_images_before_child_folders() {
         let tmp = TempDir::new().unwrap();
         let sub = tmp.path().join("01-sub");
         std::fs::create_dir_all(&sub).unwrap();
-        let expected = sub.join("09.jpg");
+        std::fs::write(sub.join("09.jpg"), b"not decoded").unwrap();
+        let expected = tmp.path().join("00.jpg");
         std::fs::write(&expected, b"not decoded").unwrap();
-        std::fs::write(tmp.path().join("00.jpg"), b"not decoded").unwrap();
 
         let picked = resolve_folder_thumb_image(tmp.path(), SortOrder::Numeric, 1, None);
 
@@ -4185,6 +8208,199 @@ mod tests {
             page_layout
         );
     }
+
+    #[test]
+    fn epub_thumb_request_replaces_display_metadata_with_generation_identity() {
+        let path = Path::new("book.epub");
+        let read = crate::pdf_loader::generation_target_for_test(path, 17, 4096);
+        let req = LoadRequest {
+            path: path.to_path_buf(),
+            pdf_page: Some(0),
+            mtime: 123,
+            file_size: 456,
+            pdf_stamp_policy: PdfStampPolicy::ResolveInWorker,
+            cache_key_override: Some("pdfthumb:book.epub#pin:pdfpage".into()),
+            ..Default::default()
+        };
+        let stamped = stamp_resolved_pdf_request(&req, &read).unwrap();
+        assert_eq!((stamped.mtime, stamped.file_size), (17, 4096));
+        assert_eq!(
+            stamped.cache_key_override.as_deref(),
+            Some("pdfthumb:book.epub#pin:pdfpage|generation:17:4096")
+        );
+        assert_eq!((req.mtime, req.file_size), (123, 456));
+        let new_generation = crate::pdf_loader::generation_target_for_test(path, 18, 4096);
+        let fresh = stamp_resolved_pdf_request(&req, &new_generation).unwrap();
+        assert_ne!(
+            (stamped.mtime, stamped.file_size),
+            (fresh.mtime, fresh.file_size)
+        );
+        assert_ne!(stamped.cache_key_override, fresh.cache_key_override);
+    }
+
+    #[test]
+    fn unconverted_epub_tile_uses_icon_fallback_without_recording_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("unconverted.epub");
+        std::fs::write(&source, b"epub without a conversion").unwrap();
+        let req = LoadRequest {
+            idx: 0,
+            path: source,
+            pdf_page: Some(0),
+            pdf_stamp_policy: PdfStampPolicy::ResolveInWorker,
+            ..Default::default()
+        };
+        let cache_map = std::sync::RwLock::new(std::collections::HashMap::new());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let gen_done = Arc::new(AtomicUsize::new(0));
+        let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
+        process_load_request(
+            &mut req.clone(),
+            &cache_map,
+            &tx,
+            None,
+            64,
+            75,
+            64,
+            make_decision(CachePolicy::Off, 25, 2_000_000),
+            &gen_done,
+            &stats,
+            None,
+            &Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(1)),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let message = rx.try_recv().expect("icon fallback result");
+        assert!(message.pixels().is_none());
+        assert!(!message.is_canceled());
+        assert_eq!(stats.lock().unwrap().count_failed, 0);
+    }
+
+    #[test]
+    fn reconverted_epub_thumbnail_worker_hits_current_generation_row() {
+        let fixture = crate::epub_cache::reconverted_for_worker_test();
+        let source_meta = std::fs::metadata(&fixture.source).unwrap();
+        let req = LoadRequest {
+            idx: 0,
+            path: fixture.source.clone(),
+            pdf_page: Some(0),
+            mtime: crate::ui_helpers::mtime_secs(&source_meta),
+            file_size: source_meta.len() as i64,
+            pdf_stamp_policy: PdfStampPolicy::ResolveInWorker,
+            ..Default::default()
+        };
+        let key = cache_key_for_request(&req).unwrap().into_owned();
+        let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([30, 80, 160, 255]));
+        let mut webp = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut webp),
+                image::ImageFormat::WebP,
+            )
+            .unwrap();
+        let cache_map = std::sync::RwLock::new(std::collections::HashMap::from([(
+            key,
+            crate::catalog::CacheEntry {
+                mtime: fixture.current.generation_id,
+                file_size: fixture.current.pdf_size as i64,
+                jpeg_data: webp,
+                source_dims: Some((4, 4)),
+                layout_dims: None,
+                folder_provenance: None,
+                selection_proof: None,
+            },
+        )]));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let gen_done = Arc::new(AtomicUsize::new(0));
+        let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
+        let keep_start = Arc::new(AtomicUsize::new(0));
+        let keep_end = Arc::new(AtomicUsize::new(1));
+        process_load_request(
+            &mut req.clone(),
+            &cache_map,
+            &tx,
+            None,
+            64,
+            75,
+            64,
+            make_decision(CachePolicy::Off, 25, 2_000_000),
+            &gen_done,
+            &stats,
+            None,
+            &keep_start,
+            &keep_end,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let message = rx.try_recv().unwrap();
+        assert!(
+            message.pixels().is_some(),
+            "worker must hit the current WebP row"
+        );
+        assert_ne!(fixture.old.page_count, fixture.current.page_count);
+    }
+
+    #[test]
+    fn reconverted_epub_catchup_worker_writes_current_generation_page_count() {
+        let fixture = crate::epub_cache::reconverted_for_worker_test();
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = crate::catalog::CatalogDb::open(tmp.path(), tmp.path()).unwrap();
+        let filename = fixture.source.file_name().unwrap().to_str().unwrap();
+        catalog
+            .set_pdf_meta(
+                filename,
+                fixture.old.generation_id,
+                fixture.old.pdf_size as i64,
+                fixture.old.page_count,
+                false,
+            )
+            .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut calls = 0;
+        process_meta_only_with(&fixture.source, &catalog, &cancel, |_, read, _| {
+            calls += 1;
+            assert_eq!(
+                read.unwrap().stamp.generation_catalog_pair(),
+                Some((
+                    fixture.current.generation_id,
+                    fixture.current.pdf_size as i64
+                ))
+            );
+            Ok(fixture.current.page_count)
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(
+            catalog
+                .get_pdf_meta(
+                    filename,
+                    fixture.current.generation_id,
+                    fixture.current.pdf_size as i64,
+                )
+                .unwrap()
+                .unwrap()
+                .0,
+            fixture.current.page_count
+        );
+    }
+
+    #[test]
+    fn epub_catchup_neighbor_and_folder_resolution_share_generation_stamp() {
+        let path = Path::new("book.epub");
+        let first = crate::pdf_loader::generation_target_for_test(path, 17, 4096);
+        let second = crate::pdf_loader::generation_target_for_test(path, 18, 4096);
+        let (mtime, size, read) = resolved_epub_derived_stamp(first.clone()).unwrap();
+        assert_eq!((mtime, size), (17, 4096));
+        assert_eq!(read, Some(first));
+        let (next_mtime, next_size, _) = resolved_epub_derived_stamp(second).unwrap();
+        assert_ne!((mtime, size), (next_mtime, next_size));
+    }
 }
 
 /// 画像1枚をデコード・エンコード・カタログ保存する。成功時は WebP バイト数を返す。
@@ -4196,7 +8412,27 @@ pub fn build_and_save_one(
     file_size: i64,
     thumb_px: u32,
     thumb_quality: u8,
+    raw_executor: &crate::raw::RawDevelopExecutor,
 ) -> Option<usize> {
+    if crate::raw_format::is_raw_path(path) {
+        let raster = decode_raw_thumbnail_on_worker(
+            crate::raw::RawOwnedSource::Path(path.to_owned()),
+            thumb_px,
+            raw_executor,
+        )
+        .ok()?;
+        let name = path.file_name()?.to_str()?;
+        return encode_and_save_with_source_dims(
+            &raster.image,
+            Some(raster.developed_dims),
+            name,
+            catalog,
+            mtime,
+            file_size,
+            thumb_px,
+            thumb_quality,
+        );
+    }
     // JPEG なら TurboJPEG DCT scale を先に試す (load_one_cached と同じ方針)。
     // cache creator は UI セルサイズに依存しない bulk worker なので target は thumb_px。
     let mut dct_stats: Option<ScaleStats> = None;
@@ -4358,8 +8594,27 @@ pub fn build_and_save_one_zip(
     file_size: i64,
     thumb_px: u32,
     thumb_quality: u8,
+    raw_executor: &crate::raw::RawDevelopExecutor,
 ) -> Option<usize> {
     let bytes = crate::zip_loader::read_entry_bytes(zip_path, entry_name).ok()?;
+    if crate::raw_format::is_raw_path(Path::new(entry_name)) {
+        let raster = decode_raw_thumbnail_on_worker(
+            crate::raw::RawOwnedSource::Bytes(Arc::from(bytes)),
+            thumb_px,
+            raw_executor,
+        )
+        .ok()?;
+        return encode_and_save_with_source_dims(
+            &raster.image,
+            Some(raster.developed_dims),
+            entry_name,
+            catalog,
+            mtime,
+            file_size,
+            thumb_px,
+            thumb_quality,
+        );
+    }
     // JPEG なら DCT scale を試す + 元寸法を source_dims に保存
     let orientation = read_exif_orientation_from_bytes(&bytes);
     let (img, source_dims) = if is_jpeg_entry(entry_name) {
@@ -4389,6 +8644,7 @@ pub fn build_and_save_one_zip(
 /// バッチキャッシュ作成用。
 pub fn build_and_save_one_pdf(
     pdf_path: &Path,
+    epub_read: Option<&crate::pdf_loader::ReadTarget>,
     page_num: u32,
     password: Option<&str>,
     catalog: &crate::catalog::CatalogDb,
@@ -4400,16 +8656,30 @@ pub fn build_and_save_one_pdf(
     // バッチキャッシュ作成は Normal 優先度 + 非 UI 経路なので epoch=0:
     // フルスクリーン操作より優先されない、かつ UI nav の bump で巻き込まれない
     // + AbortOnCancel (bulk は cancel=明示中断意図)
-    let res = crate::pdf_loader::render_page(
-        pdf_path,
-        page_num,
-        thumb_px,
-        password,
-        None,
-        crate::pdf_loader::JobPriority::Normal,
-        0,
-        crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
-    )
+    let res = if let Some(read) = epub_read {
+        crate::pdf_loader::render_page_with_read_target(
+            pdf_path,
+            read,
+            page_num,
+            thumb_px,
+            password,
+            None,
+            crate::pdf_loader::JobPriority::Normal,
+            0,
+            crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
+        )
+    } else {
+        crate::pdf_loader::render_page(
+            pdf_path,
+            page_num,
+            thumb_px,
+            password,
+            None,
+            crate::pdf_loader::JobPriority::Normal,
+            0,
+            crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
+        )
+    }
     .ok()?;
     let key = crate::grid_item::pdf_page_cache_key(page_num);
     encode_and_save_with_geometry(

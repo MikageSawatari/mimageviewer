@@ -1,3 +1,5 @@
+import { AudioArtListState, audioArtFailure, normalizedAudioIndicator } from "./audio-art-state.mjs";
+import { RawPrefetchWindowPublisher, rawPrefetchWindow } from "./raw-prefetch-window.mjs";
 import {
   CommandName,
   FitMode,
@@ -43,6 +45,7 @@ import {
   pageAdmissionRetryDelayMs,
   pageDecodeAheadUnitIndexes,
   pageRequestIsTransientlyBusy,
+  pageRequestIsDemandCongestion,
   pagePrefetchHudPlan,
   pagePrefetchIndicatorSummary,
   pagePrefetchPlan,
@@ -848,11 +851,13 @@ export class PageDemandAdapter {
     prefetchConcurrency = PAGE_PREFETCH_CONCURRENCY,
     wirePrefix = null,
     onStatusChange = () => {},
+    recordTelemetry = enqueueTelemetry,
   }) {
     this.cache = cache;
     this.fetchResource = fetchResource;
     this.postDemand = postDemand;
     this.onStatusChange = onStatusChange;
+    this.recordTelemetry = recordTelemetry;
     this.wirePrefix = wirePrefix ?? pageWirePrefix();
     this.requestsByKey = new Map();
     this.jobs = new Map();
@@ -1079,10 +1084,13 @@ export class PageDemandAdapter {
 
   async runJob(job) {
     let outcome = PageJobState.FAILED;
+    let congestionRetries = 0;
+    let congestionWaitMs = 0;
     try {
       let resource;
-      let foregroundBusyRetries = 0;
+      let boundedBusyRetries = 0;
       for (let attempt = 0; ; attempt += 1) {
+        if (job.controller.signal.aborted) throw abortError();
         const prefetch = job.priority === PageJobPriority.PREFETCH;
         const request = {
           ...job.request,
@@ -1097,26 +1105,42 @@ export class PageDemandAdapter {
           resource = await this.fetchResource(
             request,
             job.controller.signal,
-            prefetch
+            prefetch,
+            () => this.coordinator.hasPendingDisplayDemand(job.keyId)
           );
           break;
         } catch (error) {
+          const demandCongestion = pageRequestIsDemandCongestion(
+            error?.status,
+            error?.code
+          ) && this.coordinator.hasPendingDisplayDemand(job.keyId);
           if (
             job.controller.signal.aborted ||
             !pageRequestIsTransientlyBusy(error?.status) ||
-            (!prefetch &&
-              foregroundBusyRetries >= FOREGROUND_ADMISSION_RETRY_LIMIT)
+            (!demandCongestion &&
+              boundedBusyRetries >= FOREGROUND_ADMISSION_RETRY_LIMIT)
           ) {
             throw error;
           }
-          if (!prefetch) foregroundBusyRetries += 1;
-          await delayWithAbort(
-            pageAdmissionRetryDelayMs(error?.retryAfterMs, attempt),
-            job.controller.signal
-          );
+          if (demandCongestion) congestionRetries += 1;
+          else boundedBusyRetries += 1;
+          const waitStarted = performance.now();
+          try {
+            await delayWithAbort(
+              pageAdmissionRetryDelayMs(error?.retryAfterMs, attempt),
+              job.controller.signal
+            );
+          } finally {
+            if (demandCongestion) congestionWaitMs += performance.now() - waitStarted;
+          }
         }
       }
       if (job.controller.signal.aborted) throw abortError();
+      if (resource?.kind === "skipped") {
+        outcome = PageJobState.SKIPPED;
+        this.recordTelemetry({ type: "page_prefetch", status: "skip" });
+        return;
+      }
       const prefetchStatus =
         job.effectPriority === PageJobPriority.PREFETCH
           ? job.priority === PageJobPriority.FOREGROUND
@@ -1127,7 +1151,7 @@ export class PageDemandAdapter {
       this.cache.remember(job.keyId, resource);
       rememberMediaImageInfo(job.request, resource.info);
       if (job.priority === PageJobPriority.PREFETCH) {
-        enqueueTelemetry({
+        this.recordTelemetry({
           type: "page_prefetch",
           status: "ready",
           fetch_ms: roundMs(resource.fetchMs),
@@ -1141,13 +1165,21 @@ export class PageDemandAdapter {
         ? PageJobState.ABORTED
         : PageJobState.FAILED;
       if (error?.name !== "AbortError") {
-        enqueueTelemetry({
+        this.recordTelemetry({
           type: "page_prefetch",
           status: "failed",
           message: limitText(error instanceof Error ? error.message : error, 240),
         });
       }
     } finally {
+      if (congestionRetries > 0) {
+        this.recordTelemetry({
+          type: "page_congestion",
+          retry_count: congestionRetries,
+          wait_ms: roundMs(congestionWaitMs),
+          outcome,
+        });
+      }
       this.jobs.delete(job.jobId);
       this.applyEffects(this.coordinator.settle(job.jobId, { status: outcome }));
     }
@@ -1378,6 +1410,9 @@ const state = {
   tagBrowse: null,
   tagBrowseLoadError: "",
   tagBrowseFilter: { query: "", kind: "all" },
+  savedCollectionCatalog: null,
+  savedCollectionCatalogError: "",
+  savedCollection: { ownerKind: "inactive", routeSequence: 0 },
   collection: null,
   container: null,
   gridSortState: null,
@@ -1400,6 +1435,16 @@ const state = {
   effectiveSpreadMode: SpreadMode.SINGLE,
   readingDirection: ReadingDirection.LTR,
   spreadPageGapPx: 0,
+  finalCoverSpreadPreference: "follow_global",
+  finalCoverSpreadEnabled: true,
+  singletonSpreadPlacementPreference: "follow_global",
+  singletonSpreadPlacementEnabled: false,
+  singletonSpreadLastPreference: "follow_global",
+  singletonSpreadLastEnabled: false,
+  pageAfterCoverAlonePreference: "follow_global",
+  lastPageAlonePreference: "follow_global",
+  pageAfterCoverAloneEnabled: false,
+  lastPageAloneEnabled: false,
   forceSinglePage: false,
   localSettings: LOCAL_SETTINGS_LOAD.settings,
   localSettingsStorageAvailable: LOCAL_SETTINGS_LOAD.storageAvailable,
@@ -1424,6 +1469,7 @@ const state = {
   archiveOpenController: null,
   thumbnailNotice: null,
   gridActionNotice: null,
+  gridSortNotice: null,
   screenContext: "loading",
   gridIndex: 0,
   authCountdownTimer: 0,
@@ -1432,6 +1478,8 @@ const state = {
   remoteSessionId: "",
   remoteSessionCorrelation: "",
   remoteSessionCacheEpoch: "",
+  audioArtListState: null,
+  audioThumbnailIndicator: "music_note_icon",
   remoteSessionUserActive: false,
   remoteSessionTimer: 0,
   viewerItemState: null,
@@ -1446,58 +1494,190 @@ const state = {
   appVersionReportedPair: "",
 };
 
-let recentPointerSource = { source: "mouse", at: 0 };
-if (!RUNTIME_TEST_MODE) {
-  installDocumentDoubleTapOwner(document, {
-    onDecision: recordBrowserDoubleTapDecision,
-  });
-  if ("serviceWorker" in navigator) {
-    navigator.serviceWorker
-      .register("/service-worker.js", { scope: "/", updateViaCache: "none" })
-      .catch(() => {});
+export class PersistentCollectionNavigationQueue {
+  constructor(run, onError = () => {}) {
+    this.run = run;
+    this.onError = onError;
+    this.active = null;
+    this.activeStep = 0;
+    this.pendingDelta = 0;
+    this.intent = null;
+    this.sequence = 0;
   }
-  updateKeyboardAvailability();
-  window.addEventListener("popstate", () => {
-    if (remoteSessionControlOwner.snapshot.status === "active") {
-      dispatchRoute().catch(() => {});
-    }
-  });
-  window.addEventListener("keydown", onGlobalKeyDown);
-  window.addEventListener(
-    "pointerdown",
-    (event) => {
-      state.remoteSessionUserActive = true;
-      recentPointerSource = {
-        source: pointerInputSource(event.pointerType),
-        at: performance.now(),
-      };
-    },
-    true
-  );
 
-  if (TELEMETRY_ENABLED) {
-    installTelemetry();
-  } else {
-    updateHud();
-  }
-  document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState !== "visible") {
-      state.remoteSessionUserActive = false;
-      state.remoteAiController?.suspend();
-      state.archiveOpenController?.suspend();
-    } else if (state.authenticated) {
-      if (remoteSessionControlOwner.snapshot.status !== "active") return;
-      if (state.viewer?.isVideoStreamViewer) {
-        state.viewer.handleVisibilityResume().catch(() => {});
-      } else {
-        state.remoteAiController?.handleForegroundResume().catch(() => {});
-        state.archiveOpenController?.handleForegroundResume().catch(() => {});
-      }
+  enqueue(direction, intent) {
+    const step = direction < 0 ? -1 : 1;
+    const sameIntent = this.intent === intent ||
+      (this.intent?.key && this.intent.key === intent?.key);
+    if (this.active && (!sameIntent || this.activeStep !== step)) {
+      this.active.abort();
+      this.active = null;
+      this.activeStep = 0;
+      this.pendingDelta = 0;
     }
-  });
-  recordRestoredFocusOnLoad();
-  boot();
+    this.intent = intent;
+    this.pendingDelta = clamp(this.pendingDelta + step, -32, 32);
+    if (!this.active) this.startNext();
+  }
+
+  cancel() {
+    this.sequence += 1;
+    this.active?.abort();
+    this.active = null;
+    this.activeStep = 0;
+    this.pendingDelta = 0;
+    this.intent = null;
+  }
+
+  startNext() {
+    if (!this.pendingDelta || !this.intent) return;
+    const step = Math.sign(this.pendingDelta);
+    this.pendingDelta -= step;
+    const controller = new AbortController();
+    const ticket = ++this.sequence;
+    this.active = controller;
+    this.activeStep = step;
+    Promise.resolve(this.run(step, this.intent, controller.signal, ticket))
+      .catch((error) => {
+        if (error?.name !== "AbortError") this.onError(error);
+      })
+      .finally(() => {
+        if (this.active !== controller) return;
+        this.active = null;
+        this.activeStep = 0;
+        if (this.pendingDelta) this.startNext();
+        else this.intent = null;
+      });
+  }
 }
+
+const savedCollectionNavigationOwner = new PersistentCollectionNavigationQueue(
+  performPersistentCollectionNavigation,
+  (error) => state.viewer?.showBoundaryMessage(
+    error instanceof Error ? error.message : "次の項目を開けませんでした。"
+  )
+);
+let savedCollectionRouteSequence = 0;
+let savedCollectionRouteRequestSequence = 0;
+
+function savedCollectionRootContext() {
+  const context = state.savedCollection;
+  return context && context.ownerKind !== "inactive" ? context : null;
+}
+
+function deactivateSavedCollectionOwner() {
+  state.savedCollection = {
+    ownerKind: "inactive",
+    routeSequence: ++savedCollectionRouteSequence,
+  };
+}
+
+function savedCollectionChildRouteState() {
+  const context = savedCollectionRootContext();
+  const originIdentity = persistentIdentityOf(state.entries[state.gridIndex]);
+  if (context && originIdentity) {
+    context.returnIdentity = originIdentity;
+    history.replaceState({
+      ...(history.state ?? {}),
+      mivRoute: true,
+      savedCollectionSessionEpoch: state.remoteSessionCacheEpoch,
+      savedCollectionReturnIdentity: originIdentity,
+    }, "", location.href);
+  }
+  return context ? {
+    savedCollectionSessionEpoch: state.remoteSessionCacheEpoch,
+    savedCollectionChild: {
+      collectionId: context.collectionId,
+      sourceRouteSequence: context.routeSequence,
+      ...(originIdentity ? { originIdentity } : {}),
+    },
+  } : {};
+}
+
+export function immutableRemoteArchiveRouteState(routeState) {
+  const marker = routeState?.savedCollectionChild;
+  if (!marker || typeof marker.collectionId !== "string" ||
+      !Number.isInteger(marker.sourceRouteSequence)) {
+    return {};
+  }
+  const identity = marker.originIdentity;
+  const originIdentity = identity && typeof identity.entry_id === "string" &&
+      typeof identity.source_identity === "string"
+    ? {
+        entry_id: identity.entry_id,
+        source_identity: identity.source_identity,
+      }
+    : null;
+  return {
+    ...(typeof routeState.returnHash === "string"
+      ? { returnHash: routeState.returnHash }
+      : {}),
+    ...(typeof routeState.savedCollectionSessionEpoch === "string"
+      ? { savedCollectionSessionEpoch: routeState.savedCollectionSessionEpoch }
+      : {}),
+    savedCollectionChild: {
+      collectionId: marker.collectionId,
+      sourceRouteSequence: marker.sourceRouteSequence,
+      ...(originIdentity ? { originIdentity } : {}),
+    },
+  };
+}
+
+function prepareSavedCollectionRouteOwner(route) {
+  if (route.kind === "saved_collection") return;
+  const routeState = persistentCollectionHistoryStateForSession(
+    globalThis.history?.state,
+    state.remoteSessionCacheEpoch
+  );
+  state.savedCollection = persistentCollectionRouteOwnerTransition(
+    savedCollectionRootContext(),
+    routeState?.savedCollectionChild,
+    route.kind,
+    ++savedCollectionRouteSequence
+  );
+}
+
+export function persistentCollectionRouteOwnerTransition(
+  context,
+  marker,
+  routeKind,
+  routeSequence
+) {
+  const childRoute = ["folder", "container", "media", "image"].includes(routeKind);
+  if (
+    context && context.ownerKind !== "inactive" && childRoute && marker &&
+    marker.collectionId === context.collectionId &&
+    Number.isInteger(marker.sourceRouteSequence) &&
+    marker.sourceRouteSequence === context.routeSequence
+  ) {
+    return { ...context, ownerKind: "child", routeSequence };
+  }
+  return { ownerKind: "inactive", routeSequence };
+}
+
+let recentPointerSource = { source: "mouse", at: 0 };
+const rawPrefetchPublisher = new RawPrefetchWindowPublisher({
+  delay: abortableDelay,
+  send: async (body, session, signal) => {
+    const headers = remoteHeaders({ "Content-Type": "application/json" });
+    headers.set("X-mIV-Remote-Session", session);
+    const response = await fetch("/api/raw-prefetch-window", { method: "POST", headers, body: JSON.stringify(body), signal });
+    if (state.remoteSessionId !== session || signal.aborted) return response;
+    if (response.ok && response.headers.get("X-mIV-Remote-Session") !== session) {
+      const error = new Error("RAW 先読み窓のセッションが一致しません。");
+      error.retryable = false;
+      throw error;
+    }
+    if (response.status === 409 || response.status === 428) {
+      const detail = await response.clone().json().catch(() => ({}));
+      const status = remoteSessionFailureStatus({ sessionStatus: detail.status, httpStatus: response.status, errorCode: detail.error });
+      if (state.remoteSessionId !== session || signal.aborted) return response;
+      if (status) setRemoteSessionStatus(status, detail.message || "操作権がありません。再接続してください。", { observer: "api_request", observedStatus: detail.status, httpStatus: response.status });
+    }
+    return response;
+  },
+});
+
 
 /// 再読み込み直後のシークバーに青枠が出るという報告の切り分け用。
 /// 誰も focus を当てていないので、ブラウザが復元した focus が
@@ -1684,6 +1864,20 @@ async function acquireRemoteSession(reason = "operation", trigger = "user_operat
   return state.remoteSessionAcquirePromise;
 }
 
+function committedRawPrefetchPresentation(snapshot) {
+  if (!state.viewer || !snapshot || snapshot.viewer !== state.viewer || snapshot.pageGroups !== state.pageGroups) return null;
+  const visibleIndexes = pageGroupNavigationEntries(snapshot.group)
+    .map((entry) => state.images.findIndex((image) => entryIdentity(image) === entryIdentity(entry)))
+    .filter((index) => index >= 0);
+  return {
+    unit: [snapshot.contextIdentity, snapshot.groupIdentity],
+    direction: state.pageDirection,
+    entries: rawPrefetchWindow({ images: state.images, visibleIndexes, direction: state.pageDirection, addressOf: entryAddress }),
+  };
+}
+
+
+
 function newRemoteSessionCacheEpoch() {
   return (
     globalThis.crypto?.randomUUID?.().replaceAll("-", "") ??
@@ -1703,9 +1897,13 @@ export function applyRemoteSessionId(
 ) {
   const next = String(sessionId ?? "");
   if (state.remoteSessionId === next) return;
+  const retainedAudioListing = state.audioArtListState;
+  const sessionScopedListing = state.collection?.kind === "saved_collection" || Boolean(savedCollectionRootContext());
   // Identity is the admission boundary. Publish its revocation before invoking an optional
   // image-viewer hook; video owns no pending page fetch and intentionally has no such method.
   state.remoteSessionId = next;
+  rawPrefetchPublisher.setSession(next);
+  activateVideoProgressWriter(next, state.viewer?.progressRemoteSessionId);
   state.remoteSessionCorrelation = "";
   if (next) {
     telemetrySessionCorrelation(next).then((correlation) => {
@@ -1717,6 +1915,28 @@ export function applyRemoteSessionId(
   // session_id 自体は capability なので URL へ出さない。これに従属する非 secret nonce で
   // header を付けられない <img> などの HTTP cache だけを分離する。
   state.remoteSessionCacheEpoch = next ? newRemoteSessionCacheEpoch() : "";
+  state.audioArtListState = next && retainedAudioListing && !sessionScopedListing
+    ? new AudioArtListState(state.entries, retainedAudioListing.addressKey, newRemoteSessionCacheEpoch(), next)
+    : null;
+  const previousHistoryState = globalThis.history?.state;
+  if (previousHistoryState && typeof globalThis.history?.replaceState === "function") {
+    globalThis.history.replaceState(
+      historyStateWithoutPersistentCollectionSession(previousHistoryState),
+      "",
+      globalThis.location?.href ?? undefined
+    );
+  }
+  savedCollectionRouteRequestSequence += 1;
+  if (state.requestController) {
+    state.requestController.abort();
+    state.requestController = null;
+  }
+  state.folderContainerLoad = null;
+  savedCollectionNavigationOwner.cancel("session_changed");
+  remoteHomeDataRefreshCoordinator.retireSavedCollectionCatalog();
+  state.savedCollectionCatalog = null;
+  state.savedCollectionCatalogError = "";
+  deactivateSavedCollectionOwner();
   invalidateViewerPendingLoad(state.viewer);
   invalidatePageResources(PageCancelCause.SESSION_INVALIDATED);
   state.imageInfoCache.clear();
@@ -1727,6 +1947,21 @@ export function applyRemoteSessionId(
     // acquisition, making acquisition the complete home refresh signal. Per-page display DBs
     // that alter returned pixels remain covered separately by remoteStateGeneration.
     refreshHomeData();
+    if (state.screenContext === "grid" && state.virtualGrid) {
+      if (sessionScopedListing) {
+        // Collection identities and view tokens belong to the retired session. Reuse
+        // the route loader instead of issuing requests against its retained payload.
+        queueMicrotask(() => {
+          if (state.remoteSessionId === next && state.screenContext === "grid") {
+            dispatchRoute().catch(renderError);
+          }
+        });
+      } else if (state.audioArtListState?.addresses.size) {
+        // Recreate existing bindings with the admitted owner; the grid path preserves
+        // viewport/selection and cancels pending requests from the retired session.
+        renderFolder();
+      }
+    }
   }
 }
 
@@ -1953,6 +2188,80 @@ async function pingRemoteSession() {
   applyRemoteStateGeneration(result.remote_state_generation, { reloadViewer: true });
 }
 
+export class SavedCollectionCatalogRequestOwner {
+  constructor({ requestJson, appState, begin = () => {}, install, fail }) {
+    this.requestJson = requestJson;
+    this.appState = appState;
+    this.begin = begin;
+    this.install = install;
+    this.fail = fail;
+    this.sequence = 0;
+    this.pending = null;
+  }
+
+  sessionEpoch() {
+    return String(this.appState.remoteSessionCacheEpoch ?? "");
+  }
+
+  isCurrent(request) {
+    return this.pending === request && !request.controller.signal.aborted &&
+      this.sequence === request.sequence && this.sessionEpoch() === request.epoch;
+  }
+
+  refresh() {
+    const epoch = this.sessionEpoch();
+    if (this.pending?.epoch === epoch) return this.pending.promise;
+    this.retire();
+    const controller = new AbortController();
+    const request = {
+      epoch,
+      controller,
+      sequence: ++this.sequence,
+      promise: null,
+    };
+    this.begin();
+    request.promise = Promise.resolve(
+      this.requestJson("/api/saved-collections", {}, controller.signal)
+    ).then((data) => {
+      if (!this.isCurrent(request)) return null;
+      return this.install(data);
+    }).catch((error) => {
+      if (!this.isCurrent(request) || error?.name === "AbortError") return null;
+      this.fail(error);
+      return null;
+    }).finally(() => {
+      if (this.pending === request) this.pending = null;
+    });
+    this.pending = request;
+    return request.promise;
+  }
+
+  retire() {
+    this.sequence += 1;
+    this.pending?.controller.abort();
+    this.pending = null;
+  }
+}
+
+export function historyStateWithoutPersistentCollectionSession(historyState) {
+  if (!historyState || typeof historyState !== "object") return historyState ?? null;
+  const {
+    savedCollectionReturnIdentity: _returnIdentity,
+    savedCollectionIdentity: _viewerIdentity,
+    savedCollectionChild: _childOwner,
+    savedCollectionSessionEpoch: _sessionEpoch,
+    ...retained
+  } = historyState;
+  return retained;
+}
+
+export function persistentCollectionHistoryStateForSession(historyState, sessionEpoch) {
+  return typeof sessionEpoch === "string" && sessionEpoch &&
+      historyState?.savedCollectionSessionEpoch === sessionEpoch
+    ? historyState
+    : historyStateWithoutPersistentCollectionSession(historyState);
+}
+
 export function createRemoteHomeDataRefreshCoordinator({
   requestJson,
   appState,
@@ -2001,9 +2310,36 @@ export function createRemoteHomeDataRefreshCoordinator({
           error instanceof Error ? error.message : "mIV 本体から一覧を取得できませんでした。";
       },
     },
+    {
+      key: "saved_collections",
+      endpoint: "/api/saved-collections",
+      install(data) {
+        appState.savedCollectionCatalog = data;
+        appState.savedCollectionCatalogError = "";
+        if (appState.screenContext === "home" && appState.homeTab === "collections") {
+          renderHomeScreen("collections");
+        }
+        return data;
+      },
+      handleInitialFailure(error) {
+        appState.savedCollectionCatalogError =
+          error instanceof Error ? error.message : "コレクションを読み込めませんでした。";
+      },
+    },
   ]);
+  const catalogTarget = targets.find((target) => target.key === "saved_collections");
+  const savedCollectionCatalogOwner = new SavedCollectionCatalogRequestOwner({
+    requestJson,
+    appState,
+    begin: () => {
+      appState.savedCollectionCatalogError = "";
+    },
+    install: (data) => catalogTarget.install(data),
+    fail: (error) => catalogTarget.handleInitialFailure(error),
+  });
 
   function refresh(target) {
+    if (target === catalogTarget) return savedCollectionCatalogOwner.refresh();
     const existing = pendingByTarget.get(target.key);
     if (existing) return existing;
 
@@ -2039,6 +2375,12 @@ export function createRemoteHomeDataRefreshCoordinator({
       }
     },
     refreshAfterSessionAcquire,
+    refreshSavedCollectionCatalog() {
+      return savedCollectionCatalogOwner.refresh();
+    },
+    retireSavedCollectionCatalog() {
+      savedCollectionCatalogOwner.retire();
+    },
   };
 }
 
@@ -2315,7 +2657,9 @@ function renderPinLogin(initialRemainingSeconds = 0) {
 
 async function dispatchRoute() {
   if (!state.authenticated) return;
+  savedCollectionNavigationOwner.cancel("route_changed");
   const route = parseRoute(location.hash);
+  prepareSavedCollectionRouteOwner(route);
   if (
     state.screenContext === "viewer" &&
     route.kind !== "media" &&
@@ -2331,6 +2675,10 @@ async function dispatchRoute() {
     }
     if (route.kind === "collection") {
       await showCollection(route);
+      return;
+    }
+    if (route.kind === "saved_collection") {
+      await showSavedCollection(route);
       return;
     }
     if (route.kind === "search") {
@@ -2424,12 +2772,14 @@ export function parseRoute(hash) {
   if (hash === "#favorites") {
     return { kind: "home", tab: "favorites" };
   }
-  const home = hash.match(/^#home\/(favorites|smart|places|search|tags)$/);
+  const home = hash.match(/^#home\/(favorites|smart|places|search|tags|collections)$/);
   if (home) {
     return { kind: "home", tab: home[1] };
   }
   const collection = parseCollectionRoute(hash);
   if (collection) return collection;
+  const savedCollection = parseSavedCollectionRoute(hash);
+  if (savedCollection) return savedCollection;
   const search = hash.match(/^#search\/(all|folder|zip|pdf)\/(.*)$/);
   if (search) {
     try {
@@ -2766,6 +3116,8 @@ function dispatchCommand(requested, meta = {}) {
   ) {
     const tab = state.collection?.kind === "smart"
       ? "smart"
+      : state.collection?.kind === "saved_collection" || savedCollectionRootContext()
+        ? "collections"
       : state.collection?.kind === "favorite_search"
         ? "search"
       : state.collection?.kind === "tag_items"
@@ -2807,7 +3159,11 @@ function dispatchCommand(requested, meta = {}) {
     } else if (state.viewer?.isVideoStreamViewer) {
       if (requested.name === CommandName.NEXT_PAGE) {
         const endingViewer = state.viewer;
-        const result = changeVideoFile(1, Boolean(requested.payload.wrap));
+        const result = changeVideoFile(
+          1,
+          Boolean(requested.payload.wrap),
+          meta.detail === "video_ended"
+        );
         handled = result.handled;
         if (
           meta.detail === "video_ended" &&
@@ -2821,9 +3177,23 @@ function dispatchCommand(requested, meta = {}) {
       } else handled = state.viewer.execute(requested);
     } else if (requested.name === CommandName.NEXT_PAGE) handled = changeImage(1);
     else if (requested.name === CommandName.PREV_PAGE) handled = changeImage(-1);
-    else if (requested.name === CommandName.FIRST_PAGE) handled = changeImageTo(0);
+    else if (requested.name === CommandName.FIRST_PAGE) {
+      handled = enqueuePersistentCollectionNavigation(
+        -1,
+        "still_image",
+        "stop",
+        null,
+        "first"
+      ) || changeImageTo(0);
+    }
     else if (requested.name === CommandName.LAST_PAGE) {
-      handled = changeImageTo(state.pageGroups.length - 1);
+      handled = enqueuePersistentCollectionNavigation(
+        1,
+        "still_image",
+        "stop",
+        null,
+        "last"
+      ) || changeImageTo(state.pageGroups.length - 1);
     } else if (requested.name === CommandName.SPREAD_CYCLE) {
       handled = requestSpreadMode(nextSpreadMode(state.spreadMode));
     } else if (requested.name === CommandName.SET_RATING) {
@@ -2835,6 +3205,63 @@ function dispatchCommand(requested, meta = {}) {
     } else if (requested.name === CommandName.TOGGLE_BOOKMARK) {
       toggleViewerBookmark().catch(() => {});
       handled = true;
+    } else if (
+      [
+        CommandName.FINAL_COVER_FOLLOW_GLOBAL,
+        CommandName.FINAL_COVER_ON,
+        CommandName.FINAL_COVER_OFF,
+      ].includes(requested.name)
+    ) {
+      const preferences = {
+        [CommandName.FINAL_COVER_FOLLOW_GLOBAL]: "follow_global",
+        [CommandName.FINAL_COVER_ON]: "on",
+        [CommandName.FINAL_COVER_OFF]: "off",
+      };
+      handled = requestFinalCoverSpreadPreference(
+        preferences[requested.name]
+      );
+    } else if (
+      [
+        CommandName.SINGLETON_PLACEMENT_FOLLOW_GLOBAL,
+        CommandName.SINGLETON_PLACEMENT_PLACE,
+        CommandName.SINGLETON_PLACEMENT_CENTER,
+        CommandName.SINGLETON_LAST_FOLLOW_GLOBAL,
+        CommandName.SINGLETON_LAST_PLACE,
+        CommandName.SINGLETON_LAST_CENTER,
+      ].includes(requested.name)
+    ) {
+      const preferences = {
+        [CommandName.SINGLETON_PLACEMENT_FOLLOW_GLOBAL]: "follow_global",
+        [CommandName.SINGLETON_PLACEMENT_PLACE]: "place",
+        [CommandName.SINGLETON_PLACEMENT_CENTER]: "center",
+        [CommandName.SINGLETON_LAST_FOLLOW_GLOBAL]: "follow_global",
+        [CommandName.SINGLETON_LAST_PLACE]: "place",
+        [CommandName.SINGLETON_LAST_CENTER]: "center",
+      };
+      handled = requestSingletonSpreadPlacementPreference(
+        requested.name.startsWith("singleton_last_") ? "last" : "first",
+        preferences[requested.name]
+      );
+    } else if ([
+      CommandName.PAGE_AFTER_COVER_FOLLOW_GLOBAL,
+      CommandName.PAGE_AFTER_COVER_ON,
+      CommandName.PAGE_AFTER_COVER_OFF,
+      CommandName.LAST_PAGE_ALONE_FOLLOW_GLOBAL,
+      CommandName.LAST_PAGE_ALONE_ON,
+      CommandName.LAST_PAGE_ALONE_OFF,
+    ].includes(requested.name)) {
+      const preferences = {
+        [CommandName.PAGE_AFTER_COVER_FOLLOW_GLOBAL]: "follow_global",
+        [CommandName.PAGE_AFTER_COVER_ON]: "on",
+        [CommandName.PAGE_AFTER_COVER_OFF]: "off",
+        [CommandName.LAST_PAGE_ALONE_FOLLOW_GLOBAL]: "follow_global",
+        [CommandName.LAST_PAGE_ALONE_ON]: "on",
+        [CommandName.LAST_PAGE_ALONE_OFF]: "off",
+      };
+      handled = requestPageAlonePreference(
+        requested.name.startsWith("last_page_alone_") ? "last" : "after_cover",
+        preferences[requested.name]
+      );
     } else if (requested.name.startsWith("spread_")) {
       const spreadModes = {
         [CommandName.SPREAD_SINGLE]: SpreadMode.SINGLE,
@@ -2933,8 +3360,14 @@ function executeOpenCommand(payload, meta) {
     );
     state.archiveOpenController = controller;
     meta.openRoute = "archive_job";
+    const readyRouteState = savedCollectionRootContext()
+      ? immutableRemoteArchiveRouteState({
+          returnHash: state.gridHash,
+          ...savedCollectionChildRouteState(),
+        })
+      : {};
     controller
-      .open(payload.address, payload.name || "アーカイブ")
+      .open(payload.address, payload.name || "アーカイブ", readyRouteState)
       .catch((error) => controller.showRequestError(error));
     return true;
   }
@@ -2947,12 +3380,16 @@ function executeOpenCommand(payload, meta) {
   }
   if (payload.kind === "favorite" || payload.kind === "folder") {
     meta.openRoute = payload.kind;
-    navigate(folderHash(payload.path));
+    navigate(folderHash(payload.path), savedCollectionRootContext()
+      ? { returnHash: state.gridHash, ...savedCollectionChildRouteState() }
+      : {});
     return true;
   }
   if (payload.kind === "container" && payload.address) {
     meta.openRoute = "container";
-    navigate(containerHash(payload.address));
+    navigate(containerHash(payload.address), savedCollectionRootContext()
+      ? { returnHash: state.gridHash, ...savedCollectionChildRouteState() }
+      : {});
     return true;
   }
   const addressedMediaEntry = payload.kind === "media" && payload.address
@@ -2990,6 +3427,8 @@ function executeOpenCommand(payload, meta) {
     }
     meta.openRoute = `media_${mediaRoute}`;
     tryEnterBrowserFullscreen();
+    const savedEntryId = addressedEntry?.persistent_identity?.entry_id ?? "";
+    const persistentContext = savedCollectionRootContext();
     history.pushState(
       {
         mivRoute: true,
@@ -2997,9 +3436,15 @@ function executeOpenCommand(payload, meta) {
         viewerFromGrid: true,
         viewerDepth: 1,
         returnHash: state.gridHash,
+        ...(persistentContext ? savedCollectionChildRouteState() : {}),
+        ...(savedEntryId ? {
+          savedCollectionIdentity: addressedEntry.persistent_identity,
+        } : {}),
       },
       "",
-      mediaHash(payload.address)
+      savedEntryId && persistentContext
+        ? savedCollectionHash(persistentContext.collectionId, savedEntryId)
+        : mediaHash(payload.address)
     );
     const renderedViewer = renderResolvedMediaOpen(
       mediaRoute,
@@ -3010,6 +3455,11 @@ function executeOpenCommand(payload, meta) {
     if (renderedViewer === "rejected") {
       meta.openRoute = "video_viewer_entry_rejected";
       return false;
+    }
+    if (savedEntryId && persistentContext) {
+      persistentContext.ownerKind = "direct_viewer";
+      persistentContext.routeSequence = ++savedCollectionRouteSequence;
+      persistentContext.returnIdentity = addressedEntry.persistent_identity;
     }
     return true;
   }
@@ -3084,6 +3534,7 @@ function openFolderImageFromGrid(payload, meta) {
       viewerFromGrid: true,
       viewerDepth: 1,
       returnHash,
+      ...savedCollectionChildRouteState(),
     },
     "",
     pageAddress.subresource.kind === "file"
@@ -3140,7 +3591,7 @@ export async function activateFolderContainerForImage(pageAddress, gridIndex) {
 
 function openGridEntry(index, meta) {
   const entry = state.entries[index];
-  if (!entry) return false;
+  if (!entry || entry.unavailable) return false;
   const path = entryPath(entry);
   if (entryIsFolder(entry)) {
     return executeOpenCommand(
@@ -3325,7 +3776,7 @@ function rememberParentGridReturnTarget(targetHash) {
     ? containerParentHash(state.container.address)
     : targetHash;
   const targetKind = parseRoute(returnContext).kind;
-  if (!["folder", "container", "collection"].includes(targetKind)) return;
+  if (!["folder", "container", "collection", "saved_collection"].includes(targetKind)) return;
   const currentAddress = state.container?.address ?? (
     !state.collection && state.folderPath
       ? {
@@ -3349,6 +3800,7 @@ function menuCommand(event, name, payload = {}) {
 }
 
 function cleanupScreen(preserveRequestController = null) {
+  enqueueVideoProgress(state.viewer?.snapshotProgress?.(), { immediate: true, keepalive: true });
   rememberCurrentGridViewport();
   containerSpreadRefreshOwner.clear();
   clearInterval(state.authCountdownTimer);
@@ -3381,19 +3833,40 @@ function cleanupScreen(preserveRequestController = null) {
   state.remoteAiController = null;
   state.archiveOpenController?.destroy();
   state.archiveOpenController = null;
+  rawPrefetchPublisher.leave();
   state.viewer?.destroy();
   state.viewer = null;
   state.screenContext = "loading";
   app.replaceChildren();
 }
 
+export function cleanupVideoViewerForTest(viewer) {
+  if (!RUNTIME_TEST_MODE) return false;
+  state.viewer = viewer;
+  cleanupScreen();
+  return true;
+}
+
+export function retainVideoViewerForTest(viewer) {
+  if (!RUNTIME_TEST_MODE) return false;
+  state.viewer = viewer;
+  return true;
+}
+
+export function reportRetainedVideoProgressForTest() {
+  if (!RUNTIME_TEST_MODE) return null;
+  return reportVideoProgressBeforePageHide(state.viewer);
+}
+
 function renderHome(tab = "places") {
   cleanupScreen();
+  state.audioArtListState = null;
   state.screenContext = "home";
-  state.homeTab = ["favorites", "smart", "places", "search", "tags"].includes(tab)
+  state.homeTab = ["favorites", "smart", "places", "search", "tags", "collections"].includes(tab)
     ? tab
     : "places";
   state.collection = null;
+  deactivateSavedCollectionOwner();
   state.container = null;
   exitBrowserFullscreen();
   document.title = "mIV Remote";
@@ -3415,6 +3888,7 @@ function renderHome(tab = "places") {
   else if (state.homeTab === "smart") renderSmartFolderTab(content);
   else if (state.homeTab === "search") renderFavoriteSearchTab(content);
   else if (state.homeTab === "tags") renderTagBrowseTab(content);
+  else if (state.homeTab === "collections") renderSavedCollectionCatalogTab(content);
   else renderPlacesTab(content);
   screen.append(content);
   state.commandMenu = new CommandMenu(screen, "home");
@@ -3430,6 +3904,7 @@ function createHomeTabs(active) {
     ["places", "場所"],
     ["search", "検索"],
     ["tags", "タグ"],
+    ["collections", "コレクション"],
   ]) {
     const button = textElement("button", label, "home-tab");
     button.type = "button";
@@ -3726,13 +4201,22 @@ function renderSmartFolderTab(content) {
   content.append(list);
 }
 
-function renderPlacesTab(content) {
+export function renderPlacesTab(content, home = state.home, navigateTo = navigate) {
   if (state.homeLoadError) {
     content.append(ipcUnavailableMessage());
     return;
   }
   const list = element("div", "favorite-list place-list");
-  for (const place of state.home.places ?? []) {
+  const appendFolder = (parent, entry) => {
+    if (!entry || typeof entry.path !== "string" || !entry.path) return;
+    const button = homeCard("▣", entry.name ?? entry.path);
+    button.title = entry.path;
+    button.addEventListener("click", () =>
+      navigateTo(folderHash(entry.path), { returnHash: homeHash("places") })
+    );
+    parent.append(button);
+  };
+  for (const place of home.places ?? []) {
     if (place.kind === "separator") {
       list.append(element("hr", "place-separator"));
       continue;
@@ -3749,7 +4233,7 @@ function renderPlacesTab(content) {
         const button = textElement("button", `★${rating}`, "rating-star-button");
         button.type = "button";
         button.addEventListener("click", () =>
-          navigate(collectionHash("rating", String(rating)), {
+          navigateTo(collectionHash("rating", String(rating)), {
             returnHash: homeHash("places"),
           })
         );
@@ -3759,14 +4243,15 @@ function renderPlacesTab(content) {
       list.append(group);
       continue;
     }
+    if (place.kind === "file_organize_destinations") {
+      const group = element("section", "organize-destinations");
+      group.append(textElement("h3", place.name));
+      for (const entry of place.entries ?? []) appendFolder(group, entry);
+      list.append(group);
+      continue;
+    }
     if (place.kind === "folder") {
-      const entry = place.entry;
-      if (!entry || typeof entry.path !== "string" || !entry.path) continue;
-      const button = homeCard("▣", entry.name ?? entry.path);
-      button.addEventListener("click", () =>
-        navigate(folderHash(entry.path), { returnHash: homeHash("places") })
-      );
-      list.append(button);
+      appendFolder(list, place.entry);
       continue;
     }
     const icon = {
@@ -3777,7 +4262,7 @@ function renderPlacesTab(content) {
     }[place.kind] ?? "◇";
     const button = homeCard(icon, place.name);
     button.addEventListener("click", () =>
-      navigate(collectionHash(place.kind), { returnHash: homeHash("places") })
+      navigateTo(collectionHash(place.kind), { returnHash: homeHash("places") })
     );
     list.append(button);
   }
@@ -3887,6 +4372,7 @@ function applyCollectionData(route, data, forceSinglePage, options = {}) {
       ? Number(data.thumb_aspect_height_ratio)
       : 1;
   state.entries = data.entries ?? [];
+  adoptAudioArtListing(data);
   state.images = state.entries.filter((entry) => entry.kind === "image");
   applyCollectionSpreadData(data, forceSinglePage);
   state.gridIndex = options.preserveGridIndex
@@ -3927,6 +4413,7 @@ async function showFavoriteSearch(route) {
       ? Number(listing.thumb_aspect_height_ratio)
       : 1;
   state.entries = entries;
+  adoptAudioArtListing(listing);
   // 今のコンテナ索引は画像を返さないが、その前提をここにもう 1 つ置かない。集約ビューと
   // 同じ導出にしておけば、返るものが変わってもセルの開き方が食い違わない。
   state.images = state.entries.filter((entry) => entry.kind === "image");
@@ -3966,6 +4453,7 @@ async function showTagItems(route) {
       ? Number(listing.thumb_aspect_height_ratio)
       : 1;
   state.entries = entries;
+  adoptAudioArtListing(listing);
   state.images = state.entries.filter((entry) => entry.kind === "image");
   applyCollectionSpreadData(listing, false);
   state.gridIndex = 0;
@@ -4163,7 +4651,16 @@ function containerForceSinglePage(options = {}) {
   }).forceSinglePage;
 }
 
-function applyContainerData(address, data, forceSinglePage, options = {}) {
+export function applyContainerData(address, data, forceSinglePage, options = {}) {
+  // Validate the entire role-aware response before changing container, entries,
+  // navigation ownership, or the position/history owner. A malformed explicit
+  // presentation must leave the previously displayed book intact.
+  const nextEntries = data.entries ?? [];
+  const nextImages = nextEntries.filter((entry) => entry.kind === "image");
+  const nextPageGroups = normalizeContainerPageGroups(
+    data.page_groups ?? [],
+    nextImages
+  );
   const effectiveAddress = data.effective_address ?? address;
   const nextPrefetchContextIdentity = addressIdentity(effectiveAddress);
   if (state.pagePrefetchContextIdentity !== nextPrefetchContextIdentity) {
@@ -4187,6 +4684,24 @@ function applyContainerData(address, data, forceSinglePage, options = {}) {
     configuredSpreadMode: data.configured_spread_mode ?? SpreadMode.SINGLE,
     effectiveSpreadMode: data.effective_spread_mode ?? SpreadMode.SINGLE,
     readingDirection: data.reading_direction ?? ReadingDirection.LTR,
+    finalCoverSpreadPreference: normalizeFinalCoverSpreadPreference(
+      data.final_cover_spread_preference
+    ),
+    finalCoverSpreadEnabled: data.final_cover_spread_enabled !== false,
+    singletonSpreadPlacementPreference:
+      normalizeSingletonSpreadPlacementPreference(
+        data.singleton_spread_first_preference
+      ),
+    singletonSpreadPlacementEnabled:
+      data.singleton_spread_first_enabled === true,
+    singletonSpreadLastPreference: normalizeSingletonSpreadPlacementPreference(
+      data.singleton_spread_last_preference
+    ),
+    singletonSpreadLastEnabled: data.singleton_spread_last_enabled === true,
+    pageAfterCoverAlonePreference: normalizePageAlonePreference(data.page_after_cover_alone_preference),
+    lastPageAlonePreference: normalizePageAlonePreference(data.last_page_alone_preference),
+    pageAfterCoverAloneEnabled: data.page_after_cover_alone_enabled === true,
+    lastPageAloneEnabled: data.last_page_alone_enabled === true,
     imageCount: Math.max(0, Math.floor(Number(data.image_count) || 0)),
     videoCount: Math.max(0, Math.floor(Number(data.video_count) || 0)),
     otherCount: Math.max(0, Math.floor(Number(data.other_count) || 0)),
@@ -4201,8 +4716,9 @@ function applyContainerData(address, data, forceSinglePage, options = {}) {
     favoriteForPath(effectiveAddress.path)?.name ??
     "項目";
   state.folderPath = effectiveAddress.path;
-  state.entries = data.entries ?? [];
-  state.images = state.entries.filter((entry) => entry.kind === "image");
+  state.entries = nextEntries;
+  adoptAudioArtListing(data);
+  state.images = nextImages;
   state.thumbAspectHeightRatio =
     Number.isFinite(Number(data.thumb_aspect_height_ratio)) &&
     Number(data.thumb_aspect_height_ratio) > 0
@@ -4212,8 +4728,20 @@ function applyContainerData(address, data, forceSinglePage, options = {}) {
   state.effectiveSpreadMode = state.container.effectiveSpreadMode;
   state.readingDirection = state.container.readingDirection;
   state.spreadPageGapPx = Math.max(0, Number(data.spread_page_gap_px) || 0);
+  state.finalCoverSpreadPreference = state.container.finalCoverSpreadPreference;
+  state.finalCoverSpreadEnabled = state.container.finalCoverSpreadEnabled;
+  state.singletonSpreadPlacementPreference =
+    state.container.singletonSpreadPlacementPreference;
+  state.singletonSpreadPlacementEnabled =
+    state.container.singletonSpreadPlacementEnabled;
+  state.singletonSpreadLastPreference = state.container.singletonSpreadLastPreference;
+  state.singletonSpreadLastEnabled = state.container.singletonSpreadLastEnabled;
+  state.pageAfterCoverAlonePreference = state.container.pageAfterCoverAlonePreference;
+  state.lastPageAlonePreference = state.container.lastPageAlonePreference;
+  state.pageAfterCoverAloneEnabled = state.container.pageAfterCoverAloneEnabled;
+  state.lastPageAloneEnabled = state.container.lastPageAloneEnabled;
   state.forceSinglePage = forceSinglePage;
-  setContainerPageGroups(data.page_groups ?? []);
+  setContainerPageGroups(data.page_groups ?? [], nextPageGroups);
   const resumeEntryIndex = state.container.resumePage
     ? state.entries.findIndex(
         (entry) =>
@@ -4229,6 +4757,46 @@ function applyContainerData(address, data, forceSinglePage, options = {}) {
       ? folderHash(effectiveAddress.path)
       : containerHash(effectiveAddress);
   state.gridReturnHash = rootReturnHash;
+}
+
+export function containerRuntimeStateForTest() {
+  if (!RUNTIME_TEST_MODE) return null;
+  const position = viewerPositionOwner.current();
+  const positionIdentity = (snapshot) => snapshot
+    ? {
+        groupIndex: snapshot.groupIndex,
+        groupIdentity: snapshot.groupIdentity,
+        contextIdentity: snapshot.contextIdentity,
+      }
+    : null;
+  return {
+    container: state.container ? structuredClone(state.container) : null,
+    entries: state.entries.map(entryIdentity),
+    images: state.images.map(entryIdentity),
+    pageGroups: state.pageGroups.map((group) => ({
+      anchor: entryIdentity(group.anchor),
+      navigation: pageGroupNavigationEntries(group).map(entryIdentity),
+      presentation: pageGroupPresentationSlots(group).map(({ entry, role }) => ({
+        entry: entryIdentity(entry),
+        role,
+      })),
+      slice: group.slice,
+    })),
+    seekPageGroups: state.seekPageGroups.map((group) => [...group]),
+    pageGroupIndex: state.pageGroupIndex,
+    imageIndex: state.imageIndex,
+    position: {
+      requested: positionIdentity(position.requested),
+      displayed: positionIdentity(position.displayed),
+    },
+    history: {
+      state: globalThis.history?.state
+        ? structuredClone(globalThis.history.state)
+        : null,
+      href: String(globalThis.location?.href ?? ""),
+      hash: String(globalThis.location?.hash ?? ""),
+    },
+  };
 }
 
 export function containerInitialImageIndex({ openMode, resumePage, images }) {
@@ -4256,8 +4824,10 @@ function setSinglePageGroups() {
   const previousPosition = viewerPositionOwner.current();
   state.pageGroups = state.images.map((entry) => ({
     anchor: entry,
-    entries: [entry],
+    navigationEntries: [entry],
+    presentationSlots: [{ entry, role: "navigation" }],
     slice: PageSlice.FULL,
+    singletonPlacement: "center",
   }));
   state.seekPageGroups = state.images.map((_, index) => [index]);
   reanchorViewerPageGroups(previousPosition);
@@ -4265,6 +4835,16 @@ function setSinglePageGroups() {
   state.effectiveSpreadMode = SpreadMode.SINGLE;
   state.readingDirection = ReadingDirection.LTR;
   state.spreadPageGapPx = 0;
+  state.finalCoverSpreadPreference = "follow_global";
+  state.finalCoverSpreadEnabled = true;
+  state.singletonSpreadPlacementPreference = "follow_global";
+  state.singletonSpreadPlacementEnabled = false;
+  state.singletonSpreadLastPreference = "follow_global";
+  state.pageAfterCoverAlonePreference = "follow_global";
+  state.lastPageAlonePreference = "follow_global";
+  state.pageAfterCoverAloneEnabled = false;
+  state.lastPageAloneEnabled = false;
+  state.singletonSpreadLastEnabled = false;
   state.forceSinglePage = false;
 }
 
@@ -4277,42 +4857,600 @@ function applyCollectionSpreadData(data, forceSinglePage) {
   setContainerPageGroups(data.page_groups ?? []);
 }
 
-function setContainerPageGroups(groups) {
+function setContainerPageGroups(groups, preparedGroups = null) {
   const previousPosition = viewerPositionOwner.current();
-  const byAddress = new Map(
-    state.images.map((entry) => [addressIdentity(entryAddress(entry)), entry])
+  state.pageGroups = preparedGroups ?? normalizeContainerPageGroups(groups, state.images);
+  const imageIndexes = new Map(
+    state.images.map((entry, index) => [entryIdentity(entry), index])
   );
-  state.pageGroups = groups
+  state.seekPageGroups = state.pageGroups.map((group) =>
+    pageGroupNavigationEntries(group)
+      .map((entry) => imageIndexes.get(entryIdentity(entry)))
+      .filter((index) => Number.isInteger(index))
+  );
+  reanchorViewerPageGroups(previousPosition);
+}
+
+export function normalizeContainerPageGroups(groups, images) {
+  const byAddress = new Map(
+    images.map((entry) => [addressIdentity(entryAddress(entry)), entry])
+  );
+  const normalized = groups
     .map((group) => {
-      const entries = (group.pages ?? [])
+      const explicitPresentation =
+        group.presentation !== undefined && group.presentation !== null;
+      const navigationEntries = (group.pages ?? [])
         .map((address) => byAddress.get(addressIdentity(address)))
         .filter(Boolean);
       const anchor = byAddress.get(addressIdentity(group.anchor));
-      if (!anchor || entries.length !== (group.pages ?? []).length) return null;
+      if (
+        !anchor ||
+        navigationEntries.length !== (group.pages ?? []).length ||
+        !navigationEntries.length ||
+        !navigationEntries.some(
+          (entry) => entryIdentity(entry) === entryIdentity(anchor)
+        )
+      ) {
+        if (explicitPresentation) {
+          throw new TypeError("ページの表示構成が不正です。");
+        }
+        return null;
+      }
       // 分割中は同じ entries を持つ group が 2 つ並ぶ。左右はここから先、表示と位置
       // 復元の両方が読む。知らない値が来たら分割なしとして扱う。
       const slice = Object.values(PageSlice).includes(group.slice)
         ? group.slice
         : PageSlice.FULL;
-      return { anchor, entries, slice };
+      const presentationSlots = normalizePagePresentationSlots(
+        group.presentation,
+        navigationEntries,
+        byAddress,
+        anchor
+      );
+      if (presentationSlots === null) {
+        throw new TypeError("ページの表示構成が不正です。");
+      }
+      const singletonPlacement = ["left", "right", "left_white", "right_white"].includes(group.singleton_placement)
+        ? group.singleton_placement
+        : "center";
+      return { anchor, navigationEntries, presentationSlots, slice, singletonPlacement };
     })
     .filter(Boolean);
-  if (!state.pageGroups.length && state.images.length) {
-    state.pageGroups = state.images.map((entry) => ({
+  if (!normalized.length && images.length) {
+    return images.map((entry) => ({
       anchor: entry,
-      entries: [entry],
+      navigationEntries: [entry],
+      presentationSlots: [{ entry, role: "navigation" }],
       slice: PageSlice.FULL,
+      singletonPlacement: "center",
     }));
   }
-  const imageIndexes = new Map(
-    state.images.map((entry, index) => [entryIdentity(entry), index])
+  return normalized;
+}
+
+const PAGE_PRESENTATION_ROLES = new Set([
+  "navigation",
+  "front_cover_supplement",
+]);
+
+export function normalizeFinalCoverSpreadPreference(value) {
+  return ["follow_global", "on", "off"].includes(value)
+    ? value
+    : "follow_global";
+}
+
+export function persistentCollectionIdentityKey(identity) {
+  if (!identity || typeof identity.entry_id !== "string" ||
+      typeof identity.source_identity !== "string") return "";
+  return `saved:${identity.entry_id}:${identity.source_identity}`;
+}
+
+export function normalizePersistentCollectionEntry(entry) {
+  const identity = {
+    entry_id: String(entry?.entry_id ?? ""),
+    source_identity: String(entry?.source_identity ?? ""),
+  };
+  const stateName = String(entry?.state?.state ?? "");
+  const base = {
+    name: String(entry?.name ?? ""),
+    persistent_identity: identity,
+    persistent_state: stateName,
+  };
+  if (stateName === "available" && entry.state.address && entry.state.kind) {
+    return {
+      ...base,
+      kind: entry.state.kind,
+      address: entry.state.address,
+      ...(entry.state.thumbnail_address
+        ? { thumbnail_address: entry.state.thumbnail_address }
+        : {}),
+      ...(entry.state.detail ? { detail: entry.state.detail } : {}),
+      ...(Number.isInteger(entry.state.rating) ? { rating: entry.state.rating } : {}),
+    };
+  }
+  return {
+    ...base,
+    kind: "persistent_unavailable",
+    unavailable: true,
+    unavailable_reason: stateName,
+    last_known_kind: entry?.state?.last_known_kind ?? null,
+  };
+}
+
+export function normalizePersistentCollectionPageGroups(groups, entries) {
+  const byIdentity = new Map(
+    entries.map((entry) => [persistentCollectionIdentityKey(entry.persistent_identity), entry])
   );
-  state.seekPageGroups = state.pageGroups.map((group) =>
-    group.entries
-      .map((entry) => imageIndexes.get(entryIdentity(entry)))
-      .filter((index) => Number.isInteger(index))
+  return (groups ?? []).map((group) => {
+    const pages = (group.pages ?? []).map((slot) => {
+      const key = persistentCollectionIdentityKey(slot);
+      const entry = byIdentity.get(key) ?? {
+        name: "コレクション項目",
+        kind: "image",
+        address: slot.address,
+        persistent_identity: {
+          entry_id: slot.entry_id,
+          source_identity: slot.source_identity,
+        },
+      };
+      return { entry, role: slot.role ?? "navigation" };
+    });
+    const anchor = byIdentity.get(persistentCollectionIdentityKey(group.anchor)) ??
+      pages[0]?.entry;
+    if (!anchor || !pages.length) return null;
+    return {
+      anchor,
+      navigationEntries: pages.map(({ entry }) => entry),
+      presentationSlots: pages,
+      slice: Object.values(PageSlice).includes(group.slice) ? group.slice : PageSlice.FULL,
+      singletonPlacement: ["left", "right", "left_white", "right_white"].includes(group.singleton_placement)
+        ? group.singleton_placement
+        : "center",
+    };
+  }).filter(Boolean);
+}
+
+export function persistentCollectionSortState(order) {
+  if (order?.kind === "standard") {
+    return {
+      selected: order.value,
+      options: [{
+        value: order.value,
+        label: order.label,
+        short_label: order.short_label,
+      }],
+      locked_reason: "並べ替えは mIV 本体のコレクション設定で変更できます",
+    };
+  }
+  if (order?.kind === "shuffle") {
+    return {
+      selected: "shuffle",
+      options: [{ value: "shuffle", label: "シャッフル", short_label: "シャッフル" }],
+      locked_reason: "並べ替えは mIV 本体のコレクション設定で変更できます",
+    };
+  }
+  return {
+    selected: "manual",
+    options: [{ value: "manual", label: "手動順", short_label: "手動" }],
+    locked_reason: "並べ替えは mIV 本体のコレクション設定で変更できます",
+  };
+}
+
+async function showSavedCollection(route) {
+  const previousContext = savedCollectionRootContext();
+  const carriedReturnIdentity = previousContext?.collectionId === route.collectionId
+    ? previousContext.returnIdentity
+    : null;
+  renderLoading("コレクションを読み込んでいます");
+  const forceSinglePage = containerForceSinglePage();
+  state.requestController?.abort();
+  const controller = new AbortController();
+  const requestSequence = ++savedCollectionRouteRequestSequence;
+  const cacheEpoch = state.remoteSessionCacheEpoch;
+  const expectedHash = savedCollectionHash(route.collectionId, route.entryId);
+  state.requestController = controller;
+  const data = await apiJson("/api/saved-collection", {
+    id: route.collectionId,
+    spread: state.spreadMode,
+    direction: state.readingDirection,
+    single: forceSinglePage ? 1 : 0,
+  }, controller.signal);
+  if (!persistentCollectionRouteRequestIsCurrent({
+    aborted: controller.signal.aborted,
+    controllerMatches: state.requestController === controller,
+    cacheEpoch: state.remoteSessionCacheEpoch,
+    expectedCacheEpoch: cacheEpoch,
+    requestSequence: savedCollectionRouteRequestSequence,
+    expectedRequestSequence: requestSequence,
+    routeHash: location.hash,
+    expectedRouteHash: expectedHash,
+  })) return;
+  applyPersistentCollectionSnapshot(data, forceSinglePage);
+  const routeHistory = persistentCollectionHistoryStateForSession(
+    globalThis.history?.state,
+    state.remoteSessionCacheEpoch
   );
-  reanchorViewerPageGroups(previousPosition);
+  const returnIdentity = carriedReturnIdentity ?? routeHistory?.savedCollectionReturnIdentity;
+  const returnSelection = persistentCollectionReturnSelection(
+    state.entries,
+    returnIdentity,
+    Boolean(state.collection?.truncated)
+  );
+  const returnIndex = returnSelection.index;
+  const returnOutsidePrefix = returnSelection.outsidePrefix;
+  if (returnIndex >= 0) state.gridIndex = returnIndex;
+  else if (returnIdentity) state.gridIndex = -1;
+  if (route.entryId) {
+    const index = state.entries.findIndex(
+      (entry) => entry.persistent_identity?.entry_id === route.entryId && !entry.unavailable
+    );
+    if (index >= 0 && openGridEntry(index, { at: performance.now() })) return;
+    const historicalIdentity = routeHistory?.savedCollectionIdentity;
+    if (await locatePersistentCollectionRouteTarget(
+      route,
+      persistentCollectionIdentityKey(historicalIdentity) &&
+        historicalIdentity.entry_id === route.entryId
+        ? historicalIdentity
+        : null,
+      {
+        controller,
+        cacheEpoch,
+        requestSequence,
+        expectedHash,
+      }
+    )) return;
+    history.replaceState({ mivRoute: true }, "", state.gridHash);
+  }
+  renderFolder();
+  if (returnOutsidePrefix && state.gridActionNotice) {
+    state.gridActionNotice.textContent = "一覧上限外の項目です。";
+    state.gridActionNotice.hidden = false;
+  }
+}
+
+export function persistentCollectionRouteRequestIsCurrent({
+  aborted,
+  controllerMatches,
+  cacheEpoch,
+  expectedCacheEpoch,
+  requestSequence,
+  expectedRequestSequence,
+  routeHash,
+  expectedRouteHash,
+}) {
+  return !aborted && controllerMatches && cacheEpoch === expectedCacheEpoch &&
+    requestSequence === expectedRequestSequence && routeHash === expectedRouteHash;
+}
+
+export function persistentCollectionEntryIndexByIdentity(entries, identity) {
+  if (!persistentCollectionIdentityKey(identity)) return -1;
+  const byId = entries.findIndex(
+    (entry) => entry?.persistent_identity?.entry_id === identity.entry_id
+  );
+  if (byId >= 0) return byId;
+  return entries.findIndex(
+    (entry) => entry?.persistent_identity?.source_identity === identity.source_identity
+  );
+}
+
+export function persistentCollectionReturnSelection(entries, identity, truncated) {
+  if (!identity) return { index: -1, outsidePrefix: false };
+  const index = persistentCollectionEntryIndexByIdentity(entries, identity);
+  return {
+    index,
+    outsidePrefix: index < 0 && Boolean(truncated),
+  };
+}
+
+async function locatePersistentCollectionRouteTarget(route, identity, requestOwner) {
+  const context = savedCollectionRootContext();
+  if (!context || context.collectionId !== route.collectionId) return false;
+  const { controller, cacheEpoch, requestSequence, expectedHash } = requestOwner;
+  const signal = controller.signal;
+  const routeSequence = context.routeSequence;
+  const response = await apiPostJson("/api/saved-collection/navigate", {
+    collection_id: context.collectionId,
+    presented_revision: context.collectionRevision,
+    presented_view_token: context.viewToken,
+    anchor: identity ? { primary: identity } : null,
+    locate_entry_id: route.entryId,
+    locate_ordinal: null,
+    direction: "current",
+    target_kind: "navigable_media",
+    tail: "stop",
+    viewer_sequence: state.viewerItemStateSequence,
+    spread_mode: state.spreadMode,
+    reading_direction: state.readingDirection,
+    force_single_page: state.forceSinglePage,
+  }, signal);
+  if (!persistentCollectionRouteRequestIsCurrent({
+    aborted: signal.aborted,
+    controllerMatches: state.requestController === controller,
+    cacheEpoch: state.remoteSessionCacheEpoch,
+    expectedCacheEpoch: cacheEpoch,
+    requestSequence: savedCollectionRouteRequestSequence,
+    expectedRequestSequence: requestSequence,
+    routeHash: location.hash,
+    expectedRouteHash: expectedHash,
+  }) || savedCollectionRootContext()?.routeSequence !== routeSequence) return false;
+  if (response.result !== "landed" || !response.target) return false;
+  const targetPosition = persistentCollectionLandedPosition(response.position, response.target);
+  if (!targetPosition) return false;
+  if (response.replacement) {
+    applyPersistentCollectionSnapshot(response.replacement, state.forceSinglePage);
+  }
+  const current = savedCollectionRootContext();
+  if (!current || current.collectionId !== route.collectionId) return false;
+  current.collectionRevision = Number(response.exact_revision) || current.collectionRevision;
+  current.viewToken = String(response.exact_view_token ?? current.viewToken);
+  const target = response.target;
+  if (!persistentSparseTargetMatchesRootBinding(target, current.rootBinding?.entries ?? [])) {
+    return false;
+  }
+  let identityForHistory;
+  if (target.kind === "direct_image_display_unit") {
+    const index = installPersistentSparseImageTarget(target.group, targetPosition);
+    if (index < 0) return false;
+    identityForHistory = state.images[index].persistent_identity;
+    current.returnIdentity = identityForHistory;
+    history.replaceState({
+      ...(history.state ?? {}),
+      mivRoute: true,
+      savedCollectionSessionEpoch: state.remoteSessionCacheEpoch,
+      savedCollectionIdentity: identityForHistory,
+      returnHash: savedCollectionHash(current.collectionId),
+    }, "", savedCollectionHash(current.collectionId, identityForHistory.entry_id));
+    renderImageViewer(index, performance.now());
+    return true;
+  }
+  identityForHistory = target.identity;
+  current.ownerKind = "direct_viewer";
+  current.routeSequence = ++savedCollectionRouteSequence;
+  current.sparsePosition = targetPosition;
+  current.returnIdentity = identityForHistory;
+  history.replaceState({
+    ...(history.state ?? {}),
+    mivRoute: true,
+    savedCollectionSessionEpoch: state.remoteSessionCacheEpoch,
+    savedCollectionIdentity: identityForHistory,
+    returnHash: savedCollectionHash(current.collectionId),
+  }, "", savedCollectionHash(current.collectionId, identityForHistory.entry_id));
+  renderVideoViewer({
+    name: `${persistentAddressDisplayName(target.address)} · ${targetPosition.label}`,
+    kind: target.kind === "direct_audio" ? "audio" : "video",
+    address: target.address,
+    persistent_identity: identityForHistory,
+  });
+  return true;
+}
+
+function applyPersistentCollectionSnapshot(data, forceSinglePage, options = {}) {
+  const baseHash = savedCollectionHash(data.collection_id);
+  const entries = (data.entries ?? []).map(normalizePersistentCollectionEntry);
+  state.savedCollection = {
+    ownerKind: options.ownerKind ?? "root",
+    collectionId: data.collection_id,
+    collectionRevision: Number(data.collection_revision) || 0,
+    viewToken: String(data.view_token ?? ""),
+    imageCount: Math.max(0, Number(data.image_count) || 0),
+    routeSequence: ++savedCollectionRouteSequence,
+  };
+  state.collection = {
+    kind: "saved_collection",
+    value: data.collection_id,
+    title: data.title ?? "コレクション",
+    truncated: Boolean(data.truncated),
+    entryLimit: Number(data.entry_limit) || 0,
+    emptyMessage: "このコレクションには表示できる項目がありません。",
+  };
+  state.container = null;
+  state.gridSortState = persistentCollectionSortState(data.order);
+  state.gridSortScope = null;
+  state.gridReturnHash = homeHash("collections");
+  state.gridHash = baseHash;
+  state.favoriteName = data.title ?? "コレクション";
+  state.folderPath = "";
+  state.thumbAspectHeightRatio = 1;
+  state.entries = entries;
+  adoptAudioArtListing(data);
+  state.images = entries.filter((entry) => entry.kind === "image");
+  state.spreadMode = data.configured_spread_mode ?? SpreadMode.SINGLE;
+  state.effectiveSpreadMode = data.effective_spread_mode ?? SpreadMode.SINGLE;
+  state.readingDirection = data.reading_direction ?? ReadingDirection.LTR;
+  state.spreadPageGapPx = Math.max(0, Number(data.spread_page_gap_px) || 0);
+  state.forceSinglePage = Boolean(forceSinglePage);
+  setContainerPageGroups([], normalizePersistentCollectionPageGroups(data.page_groups, entries));
+  state.savedCollection.rootBinding = {
+    entries,
+    images: state.images,
+    pageGroups: state.pageGroups,
+  };
+  state.gridIndex = options.preserveGridIndex
+    ? clamp(state.gridIndex, 0, Math.max(0, entries.length - 1))
+    : 0;
+}
+
+function renderSavedCollectionCatalogTab(content) {
+  const catalog = state.savedCollectionCatalog;
+  if (!catalog && !state.savedCollectionCatalogError) {
+    content.append(textElement("p", "コレクションを読み込んでいます…", "empty-state"));
+    loadSavedCollectionCatalog().catch(() => {});
+    return;
+  }
+  if (state.savedCollectionCatalogError) {
+    content.append(textElement("p", state.savedCollectionCatalogError, "empty-state"));
+    const retry = textElement("button", "再読み込み", "icon-button");
+    retry.type = "button";
+    retry.addEventListener("click", () => {
+      state.savedCollectionCatalogError = "";
+      state.savedCollectionCatalog = null;
+      renderHome("collections");
+      remoteHomeDataRefreshCoordinator.refreshSavedCollectionCatalog().catch(() => {});
+    });
+    content.append(retry);
+    return;
+  }
+  const rows = catalog?.collections ?? [];
+  if (catalog?.truncated) {
+    content.append(textElement(
+      "p",
+      persistentCollectionCatalogTruncationText(catalog),
+      "thumbnail-service-notice"
+    ));
+  }
+  if (!rows.length) {
+    content.append(
+      textElement(
+        "p",
+        "コレクションはまだありません。mIV 本体で作成・編集できます。",
+        "empty-state"
+      )
+    );
+    return;
+  }
+  const list = element("div", "favorite-list");
+  for (const row of rows) {
+    const button = homeCard("▤", row.name || "コレクション");
+    button.addEventListener("click", () =>
+      navigate(savedCollectionHash(row.collection_id), {
+        returnHash: homeHash("collections"),
+      })
+    );
+    list.append(button);
+  }
+  content.append(list);
+}
+
+export function persistentCollectionCatalogTruncationText(catalog) {
+  if (!catalog?.truncated) return "";
+  const count = Math.max(0, Number(catalog.limit) || (catalog.collections ?? []).length);
+  return `件数が多いため先頭 ${count} 件を表示しています。`;
+}
+
+async function loadSavedCollectionCatalog() {
+  await remoteHomeDataRefreshCoordinator.refreshSavedCollectionCatalog();
+  if (state.screenContext === "home" && state.homeTab === "collections") {
+    renderHome("collections");
+  }
+}
+
+export function savedCollectionHash(collectionId, entryId = "") {
+  const root = `#saved-collection/${encodeURIComponent(collectionId)}`;
+  return entryId ? `${root}/entry/${encodeURIComponent(entryId)}` : root;
+}
+
+function parseSavedCollectionRoute(hash) {
+  const match = hash.match(/^#saved-collection\/([^/]+)(?:\/entry\/([^/]+))?$/);
+  if (!match) return null;
+  try {
+    const collectionId = decodeURIComponent(match[1]);
+    const entryId = match[2] ? decodeURIComponent(match[2]) : "";
+    if (!/^[0-9a-fA-F-]{36}$/.test(collectionId)) return null;
+    if (entryId && !/^[0-9a-fA-F-]{36}$/.test(entryId)) return null;
+    return { kind: "saved_collection", collectionId, entryId };
+  } catch {
+    return null;
+  }
+}
+
+export function normalizeSingletonSpreadPlacementPreference(value) {
+  return ["follow_global", "place", "center"].includes(value)
+    ? value
+    : "follow_global";
+}
+
+export function normalizePageAlonePreference(value) {
+  return ["follow_global", "on", "off"].includes(value) ? value : "follow_global";
+}
+
+export function pageAloneWriteRequest(address, endpoint, preference) {
+  const normalized = normalizePageAlonePreference(preference);
+  if (!remoteAddressLooksValid(address) || normalized !== preference ||
+      !["after_cover", "last"].includes(endpoint)) return null;
+  return { kind: "set_page_alone_preference", address, endpoint, preference: normalized };
+}
+
+export function finalCoverSpreadWriteRequest(address, preference) {
+  const normalized = normalizeFinalCoverSpreadPreference(preference);
+  if (!remoteAddressLooksValid(address) || normalized !== preference) return null;
+  return {
+    kind: "set_final_cover_spread_preference",
+    address,
+    preference: normalized,
+  };
+}
+
+export function singletonSpreadPlacementWriteRequest(address, endpoint, preference) {
+  const normalized = normalizeSingletonSpreadPlacementPreference(preference);
+  if (!remoteAddressLooksValid(address) || normalized !== preference || !["first", "last"].includes(endpoint)) return null;
+  return {
+    kind: "set_singleton_spread_endpoint_preference",
+    address,
+    endpoint,
+    preference: normalized,
+  };
+}
+
+export function pageGroupNavigationEntries(group) {
+  return group?.navigationEntries ?? group?.entries ?? [];
+}
+
+export function pageGroupPresentationSlots(group) {
+  const slots = group?.presentationSlots;
+  if (Array.isArray(slots) && slots.length) return slots;
+  return pageGroupNavigationEntries(group).map((entry) => ({
+    entry,
+    role: "navigation",
+  }));
+}
+
+export function normalizePagePresentationSlots(
+  presentation,
+  navigationEntries,
+  byAddress,
+  anchor = null
+) {
+  const fallback = (navigationEntries ?? []).map((entry) => ({
+    entry,
+    role: "navigation",
+  }));
+  const anchorInNavigation =
+    anchor === null ||
+    fallback.some(
+      ({ entry }) => entryIdentity(entry) === entryIdentity(anchor)
+    );
+  if (presentation === undefined || presentation === null) return fallback;
+  if (
+    !Array.isArray(presentation) ||
+    !presentation.length ||
+    presentation.length > MAX_VIEWER_VISIBLE_PAGES ||
+    !fallback.length ||
+    !anchorInNavigation
+  ) return null;
+  const slots = presentation.map((slot) => ({
+    entry: byAddress.get(addressIdentity(slot?.address)),
+    role: slot?.role,
+  }));
+  if (
+    slots.some(({ entry, role }) => !entry || !PAGE_PRESENTATION_ROLES.has(role))
+  ) return null;
+  const slotIdentities = slots.map(({ entry }) =>
+    addressIdentity(entryAddress(entry))
+  );
+  if (new Set(slotIdentities).size !== slotIdentities.length) return null;
+  if (
+    slots.filter(({ role }) => role === "front_cover_supplement").length !== 1
+  ) return null;
+  const navigationIdentities = slots
+    .filter(({ role }) => role === "navigation")
+    .map(({ entry }) => entryIdentity(entry));
+  if (
+    navigationIdentities.length !== fallback.length ||
+    navigationIdentities.some(
+      (identity, index) => identity !== entryIdentity(fallback[index].entry)
+    )
+  ) return null;
+  return slots;
 }
 
 /// このページを含む表示単位を探す規則。
@@ -4326,7 +5464,9 @@ function setContainerPageGroups(groups) {
 export function pageGroupIndexIn(groups, entry, slice = null) {
   const identity = entryIdentity(entry);
   const contains = (group) =>
-    (group?.entries ?? []).some((page) => entryIdentity(page) === identity);
+    pageGroupNavigationEntries(group).some(
+      (page) => entryIdentity(page) === identity
+    );
   if (slice !== null) {
     const exact = (groups ?? []).findIndex(
       (group) => contains(group) && (group.slice ?? PageSlice.FULL) === slice
@@ -4340,24 +5480,35 @@ function pageGroupIndexForEntry(entry, slice = null) {
   return pageGroupIndexIn(state.pageGroups, entry, slice);
 }
 
-function pageRenderContextForEntry(entry) {
-  const contextAddress = state.container?.address;
-  const groupIndex = pageGroupIndexForEntry(entry);
-  const group = state.pageGroups[groupIndex];
+export function pageRenderContextForSlot(
+  group,
+  pageIndex,
+  contextAddress = state.container?.address
+) {
   if (!contextAddress || !group) return null;
-  const pageIndex = group.entries.findIndex(
-    (page) => entryIdentity(page) === entryIdentity(entry)
-  );
-  if (pageIndex < 0) return null;
-  const partnerIndex = viewerSpreadPartnerIndex(group.entries.length, pageIndex);
+  const slots = pageGroupPresentationSlots(group);
+  if (!Number.isInteger(pageIndex) || pageIndex < 0 || pageIndex >= slots.length) {
+    return null;
+  }
+  const partnerIndex = viewerSpreadPartnerIndex(slots.length, pageIndex);
   const spreadPartner = partnerIndex === null
     ? null
-    : entryAddress(group.entries[partnerIndex]);
+    : entryAddress(slots[partnerIndex].entry);
   return {
     context_address: contextAddress,
-    display_slot: viewerPageDisplaySlot(group.entries.length, pageIndex),
+    display_slot: viewerPageDisplaySlot(slots.length, pageIndex),
     spread_partner: spreadPartner,
   };
+}
+
+export function pageGroupPresentationIdentity(group) {
+  if (!group) return "";
+  return [
+    group.slice ?? PageSlice.FULL,
+    ...pageGroupPresentationSlots(group).map(
+      ({ entry, role }) => `${role}:${entryIdentity(entry)}`
+    ),
+  ].join("\n");
 }
 
 function currentPageGroup() {
@@ -4387,13 +5538,47 @@ function captureViewerPageGroupRequest(
     pageGroups: state.pageGroups,
     group,
     groupIndex,
-    groupIdentity: [group.slice ?? PageSlice.FULL, ...group.entries.map(entryIdentity)]
-      .join("\n"),
+    groupIdentity: pageGroupPresentationIdentity(group),
     contextIdentity: viewerPageContextIdentity(),
   };
 }
 
-function viewerSeekSnapshot(groupIndex = state.pageGroupIndex) {
+function currentPersistentImagePosition() {
+  const context = persistentDirectViewerContext();
+  return persistentCollectionImagePosition(
+    context,
+    persistentIdentityOf(currentPageGroup()?.anchor)
+  );
+}
+
+export function persistentCollectionImagePosition(context, anchorIdentity) {
+  if (!context) return null;
+  if (context.sparsePosition) {
+    return context.sparsePosition.kind === "still_image" ? context.sparsePosition : null;
+  }
+  const prefixImages = context.rootBinding?.images ?? [];
+  const ordinal = persistentCollectionEntryIndexByIdentity(prefixImages, anchorIdentity);
+  return ordinal >= 0
+    ? persistentCollectionTargetPosition(ordinal, context.imageCount)
+    : null;
+}
+
+function viewerSeekSnapshot(groupIndex = state.pageGroupIndex, persistentOrdinal = null) {
+  const currentPersistentPosition = currentPersistentImagePosition();
+  const persistentPosition = currentPersistentPosition && persistentOrdinal !== null
+    ? persistentCollectionTargetPosition(persistentOrdinal, currentPersistentPosition.count)
+    : currentPersistentPosition;
+  if (persistentPosition) {
+    return {
+      visible: persistentPosition.count > 1,
+      min: 0,
+      max: Math.max(0, persistentPosition.count - 1),
+      value: persistentPosition.ordinal,
+      groupIndex: persistentPosition.ordinal,
+      direction: state.readingDirection,
+      label: persistentPosition.label,
+    };
+  }
   const seekState = viewerSeekState({
     groupPageIndexes: state.seekPageGroups,
     currentGroupIndex: groupIndex,
@@ -4421,7 +5606,9 @@ function viewerPagePresentation(
   const group = state.pageGroups[groupIndex];
   if (!group) return null;
   return {
-    name: group.entries.map((entry) => entry.name).join(" / "),
+    name: pageGroupPresentationSlots(group)
+      .map(({ entry }) => entry.name)
+      .join(" / "),
     seekState: viewerSeekSnapshot(groupIndex),
     positionSnapshot,
   };
@@ -4483,6 +5670,16 @@ function openViewerPagePosition(viewer, groupIndex) {
   })) return snapshot;
   reanchorViewerPageGroups();
   return null;
+}
+
+export function viewerPagePresentationForTest() {
+  return RUNTIME_TEST_MODE ? viewerPagePresentation() : null;
+}
+
+export function openViewerPagePositionForTest(viewer, groupIndex) {
+  if (!RUNTIME_TEST_MODE) return false;
+  state.viewer = viewer;
+  return Boolean(openViewerPagePosition(viewer, groupIndex));
 }
 
 function resolveReanchoredViewerPosition(snapshot, viewer = state.viewer) {
@@ -4629,6 +5826,63 @@ let readingProgressBatch = createReadingProgressBatch();
 let readingProgressContextIdentity = "";
 let readingProgressTimer = 0;
 let readingProgressWriteTail = Promise.resolve();
+const videoProgressWriters = new Map();
+
+function activateVideoProgressWriter(sessionId, viewerSessionId = "") {
+  // In-flight old requests retain their promise chain. Only the still-open viewer may create
+  // further reports for the old owner after a session switch.
+  for (const oldSessionId of videoProgressWriters.keys()) {
+    if (oldSessionId !== viewerSessionId) videoProgressWriters.delete(oldSessionId);
+  }
+  if (sessionId) {
+    videoProgressWriters.set(sessionId, { tail: Promise.resolve(), sequence: 0 });
+  }
+}
+
+export function reportVideoProgressBeforePageHide(viewer) {
+  return enqueueVideoProgress(viewer?.snapshotProgress?.(), { immediate: true, keepalive: true });
+}
+
+export function enqueueVideoProgress(snapshot, { keepalive = false, immediate = false } = {}) {
+  if (!snapshot) return videoProgressWriters.get(state.remoteSessionId)?.tail ?? Promise.resolve();
+  const sessionId = snapshot.remoteSessionId;
+  if (!sessionId) return Promise.resolve();
+  let writer = videoProgressWriters.get(sessionId);
+  if (!writer) {
+    writer = { tail: Promise.resolve(), sequence: 0 };
+    videoProgressWriters.set(sessionId, writer);
+  }
+  const request = addressedPostRequest("/api/write", {
+    kind: "record_video_progress",
+    address: snapshot.address,
+    sequence: ++writer.sequence,
+    position_secs: snapshot.positionSecs,
+    duration_secs: snapshot.durationSecs,
+    ended: snapshot.ended,
+  });
+  const headers = remoteHeaders({ Accept: "application/json", "Content-Type": "application/json" });
+  headers.set("X-mIV-Remote-Session", sessionId);
+  const send = async () => {
+    const response = await fetch(request.url, {
+      method: "POST",
+      credentials: "same-origin",
+      keepalive,
+      headers,
+      body: JSON.stringify(request.body),
+    });
+    if (!response.ok) throw new Error(`再生位置の保存に失敗しました (HTTP ${response.status})`);
+  };
+  // Page teardown cannot wait for a stalled earlier fetch. Core rejects an older sequence
+  // arriving after this keepalive report for the same session and path.
+  if (immediate) {
+    return send().catch((error) => recordClientError("video_progress_write_error", error));
+  }
+  writer.tail = writer.tail
+    .catch(() => {})
+    .then(send)
+    .catch((error) => recordClientError("video_progress_write_error", error));
+  return writer.tail;
+}
 
 function currentRemotePageTarget() {
   const group = currentPageGroup();
@@ -4776,7 +6030,7 @@ async function refreshViewerItemState() {
   }
 }
 
-async function setViewerRating(stars) {
+export async function setViewerRating(stars) {
   const target = currentRemotePageTarget();
   if (!target) return;
   state.commandMenu?.setItemState(null, true);
@@ -4926,8 +6180,9 @@ function shouldForceSinglePageForViewport() {
 
 function requestSpreadMode(mode) {
   const collectionRoute = refreshableCollectionRoute();
+  const persistentContext = persistentDirectViewerContext();
   if (
-    (!state.container && !collectionRoute) ||
+    (!state.container && !collectionRoute && !persistentContext) ||
     !Object.values(SpreadMode).includes(mode)
   ) return false;
   // **書き込み先は、こちらが要求した場所ではなく本体が実際に開いた場所。**
@@ -4945,18 +6200,20 @@ function requestSpreadMode(mode) {
     viewportHeight: window.innerHeight,
   });
   const writeRequest = spreadIntent.writeRequest;
-  if (!writeRequest) return false;
-  const readingDirection = writeRequest.reading_direction;
+  if (!writeRequest && !persistentContext) return false;
+  const readingDirection = writeRequest?.reading_direction ?? spreadIntent.readingDirection;
   // 一方、文脈の同一性は要求側で見る (`activeSpreadContextIdentity` と揃える)。
   const identity = collectionRoute
     ? collectionHash(collectionRoute.collectionKind, collectionRoute.value)
+    : persistentContext
+      ? savedCollectionHash(persistentContext.collectionId)
     : activeSpreadContextIdentity();
   const sequence = ++spreadWriteSequence;
   state.spreadMode = mode;
   state.readingDirection = readingDirection;
   spreadWriteTail = spreadWriteTail.then(async () => {
     let writeError = null;
-    if (!collectionRoute) {
+    if (!collectionRoute && !persistentContext) {
       try {
         await apiAddressPostJson("/api/write", writeRequest);
       } catch (error) {
@@ -4986,11 +6243,143 @@ function requestSpreadMode(mode) {
   return true;
 }
 
+function requestFinalCoverSpreadPreference(preference) {
+  const normalized = normalizeFinalCoverSpreadPreference(preference);
+  if (!state.container || normalized !== preference) return false;
+  const address = state.container.address;
+  const writeRequest = finalCoverSpreadWriteRequest(address, normalized);
+  if (!writeRequest) return false;
+  const identity = activeSpreadContextIdentity();
+  const sequence = ++spreadWriteSequence;
+  state.finalCoverSpreadPreference = normalized;
+  state.container.finalCoverSpreadPreference = normalized;
+  spreadWriteTail = spreadWriteTail.catch(() => {}).then(async () => {
+    let writeError = null;
+    try {
+      await apiAddressPostJson("/api/write", writeRequest);
+    } catch (error) {
+      writeError = error;
+    }
+    if (
+      sequence === spreadWriteSequence &&
+      activeSpreadContextIdentity() === identity
+    ) {
+      const refresh = await refreshContainerSpread(
+        shouldForceSinglePageForViewport(),
+        "final_cover_spread_refresh"
+      );
+      if (writeError) {
+        state.viewer?.showBoundaryMessage(
+          writeError instanceof Error
+            ? writeError.message
+            : "末尾の表紙見開き設定を保存できませんでした。"
+        );
+      } else if (refresh.outcome === ViewerGroupLoadOutcome.FAILED) {
+        state.viewer?.showBoundaryMessage(refresh.message);
+      }
+    }
+  });
+  return true;
+}
+
+function requestSingletonSpreadPlacementPreference(endpoint, preference) {
+  const normalized = normalizeSingletonSpreadPlacementPreference(preference);
+  if (!state.container || normalized !== preference) return false;
+  const address = state.container.address;
+  const writeRequest = singletonSpreadPlacementWriteRequest(address, endpoint, normalized);
+  if (!writeRequest) return false;
+  const identity = activeSpreadContextIdentity();
+  const sequence = ++spreadWriteSequence;
+  if (endpoint === "last") {
+    state.singletonSpreadLastPreference = normalized;
+    state.container.singletonSpreadLastPreference = normalized;
+  } else {
+    state.singletonSpreadPlacementPreference = normalized;
+    state.container.singletonSpreadPlacementPreference = normalized;
+  }
+  spreadWriteTail = spreadWriteTail.catch(() => {}).then(async () => {
+    let writeError = null;
+    try {
+      await apiAddressPostJson("/api/write", writeRequest);
+    } catch (error) {
+      writeError = error;
+    }
+    if (
+      sequence === spreadWriteSequence &&
+      activeSpreadContextIdentity() === identity
+    ) {
+      const refresh = await refreshContainerSpread(
+        shouldForceSinglePageForViewport(),
+        "singleton_spread_placement_refresh"
+      );
+      if (writeError) {
+        state.viewer?.showBoundaryMessage(
+          writeError instanceof Error
+            ? writeError.message
+            : "端の単ページ配置を保存できませんでした。"
+        );
+      } else if (refresh.outcome === ViewerGroupLoadOutcome.FAILED) {
+        state.viewer?.showBoundaryMessage(refresh.message);
+      }
+    }
+  });
+  return true;
+}
+
+function requestPageAlonePreference(endpoint, preference) {
+  const normalized = normalizePageAlonePreference(preference);
+  if (!state.container || normalized !== preference) return false;
+  const writeRequest = pageAloneWriteRequest(state.container.address, endpoint, normalized);
+  if (!writeRequest) return false;
+  const identity = activeSpreadContextIdentity();
+  const sequence = ++spreadWriteSequence;
+  if (endpoint === "last") {
+    state.lastPageAlonePreference = normalized;
+    state.container.lastPageAlonePreference = normalized;
+  } else {
+    state.pageAfterCoverAlonePreference = normalized;
+    state.container.pageAfterCoverAlonePreference = normalized;
+  }
+  spreadWriteTail = spreadWriteTail.catch(() => {}).then(async () => {
+    let writeError = null;
+    try { await apiAddressPostJson("/api/write", writeRequest); }
+    catch (error) { writeError = error; }
+    if (sequence === spreadWriteSequence && activeSpreadContextIdentity() === identity) {
+      const refresh = await refreshContainerSpread(
+        shouldForceSinglePageForViewport(), "page_alone_refresh"
+      );
+      if (writeError) {
+        state.viewer?.showBoundaryMessage(writeError instanceof Error
+          ? writeError.message : "単独ページ設定を保存できませんでした。");
+      } else if (refresh.outcome === ViewerGroupLoadOutcome.FAILED) {
+        state.viewer?.showBoundaryMessage(refresh.message);
+      }
+    }
+  });
+  return true;
+}
+
 function refreshContainerSpread(
   forceSinglePage = shouldForceSinglePageForViewport(),
   renderTrigger = "spread_refresh",
   requested = {}
 ) {
+  if (persistentDirectViewerContext()) {
+    state.forceSinglePage = Boolean(forceSinglePage);
+    if (requested.spreadMode) state.spreadMode = requested.spreadMode;
+    if (requested.readingDirection) state.readingDirection = requested.readingDirection;
+    const accepted = enqueuePersistentCollectionNavigation(
+      1,
+      "still_image",
+      "stop",
+      null,
+      "current"
+    );
+    return Promise.resolve(accepted ? {
+      outcome: ViewerGroupLoadOutcome.DISPLAYED,
+      reason: renderTrigger,
+    } : VIEWER_GROUP_LOAD_SUPERSEDED);
+  }
   const collectionRoute = refreshableCollectionRoute();
   if (!state.container && !collectionRoute) {
     return Promise.resolve(VIEWER_GROUP_LOAD_SUPERSEDED);
@@ -5037,6 +6426,10 @@ function refreshableCollectionRoute() {
 }
 
 function activeSpreadContextIdentity() {
+  const persistentContext = persistentDirectViewerContext();
+  if (persistentContext) {
+    return savedCollectionHash(persistentContext.collectionId);
+  }
   const collectionRoute = refreshableCollectionRoute();
   if (collectionRoute) {
     return collectionHash(collectionRoute.collectionKind, collectionRoute.value);
@@ -5304,6 +6697,7 @@ export async function loadFolder(
       subresource: { kind: "file" },
     },
   };
+  state.gridSortNotice = typeof data.sort_notice === "string" ? data.sort_notice : null;
   state.gridReturnHash = rootReturnHash;
   state.favoriteName =
     data.root_name ??
@@ -5326,6 +6720,7 @@ export async function loadFolder(
       entry.kind === "pdf" ||
       entry.kind === "archive"
   );
+  adoptAudioArtListing(data);
   state.images = state.entries.filter((entry) => entry.kind === "image");
   setSinglePageGroups();
   state.gridIndex = sameFolder
@@ -5345,7 +6740,7 @@ export async function loadFolder(
   };
 }
 
-function renderFolder(listMetrics = null, preserveRequestController = null) {
+export function renderFolder(listMetrics = null, preserveRequestController = null) {
   const renderStartedAt = performance.now();
   cleanupScreen(preserveRequestController);
   state.screenContext = "grid";
@@ -5407,6 +6802,10 @@ function renderFolder(listMetrics = null, preserveRequestController = null) {
   gridActionNotice.hidden = true;
   gridActionNotice.setAttribute("role", "status");
   gridActionNotice.setAttribute("aria-live", "polite");
+  if (!state.collection && !state.container && state.gridSortNotice) {
+    gridActionNotice.textContent = state.gridSortNotice;
+    gridActionNotice.hidden = false;
+  }
   state.gridActionNotice = gridActionNotice;
   const collectionLimitNotice = textElement(
     "p",
@@ -5684,6 +7083,8 @@ export function createGridTile(
   cellWidth,
   commandDispatcher = dispatchCommand
 ) {
+  const isEpubBook =
+    entry.kind === "pdf" && /\.epub$/i.test(entryAddress(entry).path);
   const tile = element("button", "grid-tile");
   tile.type = "button";
   tile.title = entry.name;
@@ -5691,6 +7092,11 @@ export function createGridTile(
   tile.classList.toggle("page-tile", Boolean(state.container) && entry.kind === "image");
   tile.classList.toggle("image-tile", entry.kind === "image");
   tile.classList.toggle("grid-active", entryIndex === state.gridIndex);
+  if (entry.unavailable) {
+    tile.disabled = true;
+    tile.classList.add("grid-unavailable");
+    tile.setAttribute("aria-disabled", "true");
+  }
   tile.addEventListener("focus", () => {
     commandDispatcher(command(CommandName.GRID_SELECT, { index: entryIndex }), {
       source: "keyboard",
@@ -5705,7 +7111,12 @@ export function createGridTile(
   image.decoding = "async";
   image.dataset.telemetryObserved = "true";
 
-  if (entryIsFolder(entry)) {
+  if (entry.unavailable) {
+    preview.append(textElement("span", "!", "file-glyph"));
+    preview.append(
+      textElement("span", persistentUnavailableLabel(entry.unavailable_reason), "type-badge")
+    );
+  } else if (entryIsFolder(entry)) {
     preview.append(textElement("span", "◆", "folder-glyph"));
     preview.append(image);
     preview.append(textElement("span", "folder", "type-badge"));
@@ -5721,13 +7132,24 @@ export function createGridTile(
     });
   } else {
     if (entry.kind === "audio") {
-      preview.append(createAudioThumbnailIcon());
+      const fallback = createAudioThumbnailIcon();
+      fallback.classList.add("audio-art-fallback");
+      preview.append(fallback, image);
+      if (state.audioThumbnailIndicator === "music_note_icon") {
+        const marker = createAudioThumbnailIcon();
+        marker.classList.add("audio-art-indicator");
+        preview.append(marker);
+      } else if (state.audioThumbnailIndicator === "bottom_left_badge") {
+        preview.append(textElement("span", "音声", "type-badge audio-art-indicator"));
+      }
     } else {
-      preview.append(textElement("span", "◇", "file-glyph"));
+      preview.append(textElement("span", isEpubBook ? "▤" : "◇", "file-glyph"));
       preview.append(image);
     }
-    if (entry.kind !== "image") {
-      preview.append(textElement("span", entryTypeLabel(entry.kind), "type-badge"));
+    if (entry.kind !== "image" && entry.kind !== "audio") {
+      preview.append(
+        textElement("span", isEpubBook ? "epub" : entryTypeLabel(entry.kind), "type-badge")
+      );
     }
     if (entry.kind === "image") {
       tile.addEventListener("click", (event) => {
@@ -5822,12 +7244,20 @@ export function createGridTile(
   }
   if (detail) label.title = entry.name + " — " + detail;
   tile.append(preview, label);
-  // Audio and unopened convertible archives have no thumbnail source. Keeping
-  // them out of the binding avoids guaranteed-to-fail /api/thumb requests.
-  if (entry.kind !== "audio" && entry.kind !== "archive") {
+  // Audio has the same image binding, while terminal results survive DOM eviction.
+  if (!entry.unavailable && entry.kind !== "archive") {
     tile._thumbnailBinding = { image, entry, tracker: thumbnailTracker, cellWidth };
   }
   return tile;
+}
+
+function persistentUnavailableLabel(reason) {
+  return {
+    missing: "見つかりません",
+    unsupported: "未対応",
+    access_error: "アクセス不可",
+    blocked_by_remote_policy: "Remote非公開",
+  }[reason] ?? "利用不可";
 }
 
 function createAudioThumbnailIcon() {
@@ -5887,12 +7317,16 @@ function addressIdentity(address) {
 }
 
 function entryIdentity(entry) {
+  const persistent = persistentCollectionIdentityKey(entry.persistent_identity);
+  if (persistent) return persistent;
   return entry.address
     ? addressIdentity(entry.address)
     : entryPath(entry);
 }
 
 export function gridReturnItemIdentity(entry) {
+  const persistent = persistentCollectionIdentityKey(entry.persistent_identity);
+  if (persistent) return persistent;
   return addressIdentity(entryAddress(entry));
 }
 
@@ -6019,6 +7453,7 @@ function renderVideoViewer(entry) {
     }),
     getPanelTab: () => state.videoPanelTab,
     setPanelTab: (tabId) => { state.videoPanelTab = tabId; },
+    reportProgress: enqueueVideoProgress,
   });
   if (!state.viewerBarsVisible) viewer.setBarsVisible(false);
   state.viewer = viewer;
@@ -6061,10 +7496,394 @@ export function videoFileTargetIndex(currentIndex, count, delta, wrap = false) {
   return target < 0 ? length - 1 : 0;
 }
 
-function changeVideoFile(delta, wrap = false) {
+function persistentDirectViewerContext() {
+  if (
+    state.screenContext !== "viewer" ||
+    state.container ||
+    state.collection?.kind !== "saved_collection" ||
+    state.savedCollection?.ownerKind !== "direct_viewer"
+  ) return null;
+  return state.savedCollection;
+}
+
+function persistentIdentityOf(entry) {
+  const identity = entry?.persistent_identity;
+  return persistentCollectionIdentityKey(identity) ? { ...identity } : null;
+}
+
+function currentPersistentNavigationAnchor(targetKind) {
+  if (targetKind === "still_image") {
+    const group = currentPageGroup();
+    const primary = persistentIdentityOf(group?.anchor);
+    if (!primary) return null;
+    const partner = pageGroupNavigationEntries(group)
+      .map(persistentIdentityOf)
+      .find((identity) => identity && persistentCollectionIdentityKey(identity) !==
+        persistentCollectionIdentityKey(primary));
+    return { primary, ...(partner ? { partner } : {}) };
+  }
+  const primary = persistentIdentityOf(state.viewer?.entry);
+  return primary ? { primary } : null;
+}
+
+function persistentNavigationIntent(
+  targetKind,
+  tail = "stop",
+  eofTerminal = null,
+  navigationDirection = null,
+  locateOrdinal = null
+) {
+  const context = persistentDirectViewerContext();
+  if (!context) return null;
+  const ordinalLocator = locateOrdinal === null
+    ? null
+    : persistentCollectionOrdinalLocator(locateOrdinal);
+  if (locateOrdinal !== null && !ordinalLocator) return null;
+  return {
+    key: `${context.collectionId}:${context.routeSequence}:${targetKind}:${tail}:${navigationDirection ?? "step"}:${locateOrdinal ?? "anchor"}`,
+    targetKind,
+    tail,
+    eofTerminal,
+    navigationDirection,
+    locateOrdinal: ordinalLocator?.locate_ordinal ?? null,
+  };
+}
+
+export function persistentCollectionOrdinalLocator(ordinal) {
+  const value = Number(ordinal);
+  if (!Number.isSafeInteger(value) || value < 0) return null;
+  return {
+    direction: "current",
+    locate_entry_id: null,
+    locate_ordinal: value,
+  };
+}
+
+function enqueuePersistentCollectionNavigation(
+  delta,
+  targetKind,
+  tail = "stop",
+  eofTerminal = null,
+  navigationDirection = null,
+  locateOrdinal = null
+) {
+  const intent = persistentNavigationIntent(
+    targetKind,
+    tail,
+    eofTerminal,
+    navigationDirection,
+    locateOrdinal
+  );
+  if (!intent) return false;
+  savedCollectionNavigationOwner.enqueue(delta, intent);
+  return true;
+}
+
+function sparseImageEntries(group) {
+  return (group?.pages ?? []).map((slot) => ({
+    name: persistentAddressDisplayName(slot.address),
+    kind: "image",
+    address: slot.address,
+    persistent_identity: {
+      entry_id: slot.entry_id,
+      source_identity: slot.source_identity,
+    },
+  }));
+}
+
+function persistentAddressDisplayName(address) {
+  const path = String(address?.path ?? "");
+  const subresource = address?.subresource ?? {};
+  const value = subresource.entry_name ?? subresource.prefix ?? path;
+  const parts = String(value).replaceAll("\\", "/").split("/").filter(Boolean);
+  return parts.at(-1) ?? "コレクション項目";
+}
+
+export function persistentCollectionTargetPosition(ordinal, count) {
+  const safeCount = Math.max(1, Number(count) || 1);
+  const safeOrdinal = clamp(Number(ordinal) || 0, 0, safeCount - 1);
+  return {
+    kind: "still_image",
+    ordinal: safeOrdinal,
+    count: safeCount,
+    label: `${safeOrdinal + 1} / ${safeCount}`,
+  };
+}
+
+export function persistentCollectionLandedPosition(position, target) {
+  const expectedKind = {
+    direct_image_display_unit: "still_image",
+    direct_video: "video",
+    direct_audio: "audio",
+  }[target?.kind];
+  const ordinal = position?.ordinal;
+  const count = position?.count;
+  if (!expectedKind || position?.kind !== expectedKind ||
+      !Number.isSafeInteger(ordinal) || !Number.isSafeInteger(count) ||
+      count < 1 || ordinal < 0 || ordinal >= count) return null;
+  return {
+    kind: expectedKind,
+    ordinal,
+    count,
+    label: `${ordinal + 1} / ${count}`,
+  };
+}
+
+function installPersistentSparseImageTarget(group, position = null) {
+  const presentation = persistentSparseViewerPresentation(group);
+  const { entries: sparseEntries, group: normalized } = presentation ?? {};
+  if (!normalized) return -1;
+  state.images = sparseEntries;
+  setContainerPageGroups([], [normalized]);
+  const context = savedCollectionRootContext();
+  if (context) {
+    context.ownerKind = "direct_viewer";
+    context.routeSequence = ++savedCollectionRouteSequence;
+    context.sparseDisplayUnit = normalized;
+    context.sparsePosition = position;
+  }
+  const targetIdentity = entryIdentity(normalized.anchor);
+  return state.images.findIndex((entry) => entryIdentity(entry) === targetIdentity);
+}
+
+export function persistentSparseViewerPresentation(group) {
+  const entries = sparseImageEntries(group);
+  const normalized = normalizePersistentCollectionPageGroups([group], entries)[0];
+  return normalized ? { entries, group: normalized } : null;
+}
+
+export function persistentSparseTargetMatchesRootBinding(target, rootEntries) {
+  const entries = Array.isArray(rootEntries) ? rootEntries : [];
+  const matchesPrefix = (identity, address, kind) => {
+    const key = persistentCollectionIdentityKey(identity);
+    if (!key || !remoteAddressIdentity(address)) return false;
+    const root = entries.find(
+      (entry) => persistentCollectionIdentityKey(entry?.persistent_identity) === key
+    );
+    if (!root) return true;
+    return root.kind === kind &&
+      remoteAddressIdentity(root.address) === remoteAddressIdentity(address);
+  };
+  if (target?.kind === "direct_image_display_unit") {
+    const pages = target.group?.pages;
+    return Array.isArray(pages) && pages.length > 0 && pages.every(
+      (slot) => matchesPrefix(slot, slot.address, "image")
+    );
+  }
+  if (target?.kind === "direct_video") {
+    return matchesPrefix(target.identity, target.address, "video");
+  }
+  if (target?.kind === "direct_audio") {
+    return matchesPrefix(target.identity, target.address, "audio");
+  }
+  return false;
+}
+
+export function persistentCollectionResponseIsCurrent({
+  aborted,
+  viewerMatches,
+  viewerSequence,
+  expectedViewerSequence,
+  cacheEpoch,
+  expectedCacheEpoch,
+  collectionId,
+  expectedCollectionId,
+  routeSequence,
+  expectedRouteSequence,
+}) {
+  return !aborted && viewerMatches && viewerSequence === expectedViewerSequence &&
+    cacheEpoch === expectedCacheEpoch && collectionId === expectedCollectionId &&
+    routeSequence === expectedRouteSequence;
+}
+
+async function performPersistentCollectionNavigation(step, intent, signal) {
+  const context = persistentDirectViewerContext();
+  const { targetKind, tail } = intent;
+  const anchor = currentPersistentNavigationAnchor(targetKind);
+  const viewer = state.viewer;
+  const viewerSequence = state.viewerItemStateSequence;
+  const routeSequence = context?.routeSequence;
+  const cacheEpoch = state.remoteSessionCacheEpoch;
+  if (!context || !anchor || !viewer) return;
+  let response;
+  try {
+    response = await apiPostJson("/api/saved-collection/navigate", {
+      collection_id: context.collectionId,
+      presented_revision: context.collectionRevision,
+      presented_view_token: context.viewToken,
+      anchor,
+      locate_entry_id: null,
+      locate_ordinal: intent.locateOrdinal,
+      direction: intent.navigationDirection ?? (step < 0 ? "backward" : "forward"),
+      target_kind: targetKind,
+      tail,
+      viewer_sequence: viewerSequence,
+      spread_mode: state.spreadMode,
+      reading_direction: state.readingDirection,
+      force_single_page: state.forceSinglePage,
+    }, signal);
+  } catch (error) {
+    settlePersistentEofFailure(intent, signal);
+    throw error;
+  }
+  const landedContext = persistentDirectViewerContext();
+  if (!persistentCollectionResponseIsCurrent({
+    aborted: signal.aborted,
+    viewerMatches: state.viewer === viewer,
+    viewerSequence: state.viewerItemStateSequence,
+    expectedViewerSequence: viewerSequence,
+    cacheEpoch: state.remoteSessionCacheEpoch,
+    expectedCacheEpoch: cacheEpoch,
+    collectionId: landedContext?.collectionId,
+    expectedCollectionId: context.collectionId,
+    routeSequence: landedContext?.routeSequence,
+    expectedRouteSequence: routeSequence,
+  })) {
+    settlePersistentEofStale(intent);
+    return;
+  }
+  if (response.result === "boundary") {
+    savedCollectionNavigationOwner.pendingDelta = 0;
+    const labels = { start: "先頭の項目です", end: "最後の項目です", empty: "表示できる項目がありません", target_unavailable: "次の項目を開けませんでした" };
+    viewer.showBoundaryMessage(labels[response.reason] ?? "次の項目はありません");
+    settlePersistentEofFailure(intent, signal);
+    return;
+  }
+  if (response.result !== "landed" || !response.target) {
+    settlePersistentEofFailure(intent, signal);
+    throw new Error("次の項目の応答が不正です。");
+  }
+  const targetPosition = persistentCollectionLandedPosition(response.position, response.target);
+  if (!targetPosition) {
+    settlePersistentEofFailure(intent, signal);
+    throw new Error("次の項目の応答が不正です。");
+  }
+  try {
+    if (response.replacement) {
+      applyPersistentCollectionSnapshot(response.replacement, state.forceSinglePage, {
+        preserveGridIndex: true,
+        ownerKind: "direct_viewer",
+      });
+    }
+  } catch (error) {
+    settlePersistentEofFailure(intent, signal);
+    throw error;
+  }
+  const current = persistentDirectViewerContext();
+  if (!current || current.collectionId !== context.collectionId) {
+    settlePersistentEofFailure(intent, signal);
+    return;
+  }
+  current.collectionRevision = Number(response.exact_revision) || current.collectionRevision;
+  current.viewToken = String(response.exact_view_token ?? current.viewToken);
+  const target = response.target;
+  if (!persistentSparseTargetMatchesRootBinding(target, current.rootBinding?.entries ?? [])) {
+    settlePersistentEofFailure(intent, signal);
+    throw new Error("次の項目の応答が不正です。");
+  }
+  let entry;
+  try {
+    if (target.kind === "direct_image_display_unit") {
+      const imageIndex = installPersistentSparseImageTarget(target.group, targetPosition);
+      if (imageIndex < 0) throw new Error("次の画像を構成できませんでした。");
+      entry = state.images[imageIndex];
+      pushPersistentViewerHistory(current.collectionId, entry.persistent_identity);
+      renderImageViewer(imageIndex, performance.now());
+    } else if (target.kind === "direct_audio" || target.kind === "direct_video") {
+      const mediaKind = target.kind === "direct_audio" ? "audio" : "video";
+      entry = {
+        name: persistentAddressDisplayName(target.address),
+        kind: mediaKind,
+        address: target.address,
+        persistent_identity: target.identity,
+      };
+      current.ownerKind = "direct_viewer";
+      current.routeSequence = ++savedCollectionRouteSequence;
+      current.sparsePosition = targetPosition;
+      pushPersistentViewerHistory(current.collectionId, target.identity);
+      renderVideoViewer({ ...entry, name: `${entry.name} · ${targetPosition.label}` });
+    } else {
+      throw new Error("次の項目の応答が不正です。");
+    }
+  } catch (error) {
+    settlePersistentEofFailure(intent, signal);
+    throw error;
+  }
+  completePersistentEofTerminal(intent);
+}
+
+export class PersistentEofTerminalOwner {
+  constructor(viewer, viewerSequence) {
+    this.viewer = viewer;
+    this.viewerSequence = viewerSequence;
+    this.state = "pending";
+  }
+
+  fail({ aborted, currentViewer, currentViewerSequence }) {
+    if (this.state !== "pending") return false;
+    if (aborted || currentViewer !== this.viewer ||
+        currentViewerSequence !== this.viewerSequence) {
+      this.state = "stale";
+      return false;
+    }
+    this.state = "failed";
+    this.viewer.setPlaying(false).catch(() => {});
+    return true;
+  }
+
+  complete() {
+    if (this.state === "pending") this.state = "landed";
+  }
+
+  stale() {
+    if (this.state === "pending") this.state = "stale";
+  }
+}
+
+function settlePersistentEofFailure(intent, signal = null) {
+  const terminal = intent?.eofTerminal;
+  return terminal?.fail({
+    aborted: Boolean(signal?.aborted),
+    currentViewer: state.viewer,
+    currentViewerSequence: state.viewerItemStateSequence,
+  }) ?? false;
+}
+
+function completePersistentEofTerminal(intent) {
+  intent?.eofTerminal?.complete();
+}
+
+function settlePersistentEofStale(intent) {
+  intent?.eofTerminal?.stale();
+}
+
+function pushPersistentViewerHistory(collectionId, identity) {
+  const context = savedCollectionRootContext();
+  if (context?.collectionId === collectionId) context.returnIdentity = identity;
+  history.pushState({
+    ...(history.state ?? {}),
+    mivRoute: true,
+    navigatedInApp: true,
+    viewerFromGrid: true,
+    viewerDepth: (Number(history.state?.viewerDepth) || 0) + 1,
+    returnHash: savedCollectionHash(collectionId),
+    savedCollectionSessionEpoch: state.remoteSessionCacheEpoch,
+    savedCollectionIdentity: identity,
+  }, "", savedCollectionHash(collectionId, identity.entry_id));
+}
+
+function changeVideoFile(delta, wrap = false, eof = false) {
   const viewer = state.viewer;
   if (!viewer?.isVideoStreamViewer) return { handled: false, advanced: false };
   const mediaKind = viewer.entry?.kind ?? "video";
+  if (enqueuePersistentCollectionNavigation(
+    delta,
+    mediaKind === "audio" ? "audio" : "video",
+    wrap ? "loop" : "stop",
+    eof ? new PersistentEofTerminalOwner(viewer, state.viewerItemStateSequence) : null
+  )) {
+    return { handled: true, advanced: true };
+  }
   const mediaEntries = state.entries.filter((entry) => entry.kind === mediaKind);
   const current = mediaEntries.findIndex(
     (entry) => addressIdentity(entryAddress(entry)) === addressIdentity(viewer.address)
@@ -6219,6 +8038,12 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
   let seekPointerDrag = null;
   let seekCommitSequence = 0;
   const previewSeekGroup = (rawGroupIndex) => {
+    const persistentPosition = currentPersistentImagePosition();
+    if (persistentPosition) {
+      const ordinal = clamp(Number(rawGroupIndex) || 0, 0, persistentPosition.count - 1);
+      state.viewer?.setSeekState(viewerSeekSnapshot(state.pageGroupIndex, ordinal));
+      return ordinal;
+    }
     const groupIndex = viewerSeekGroupIndex(rawGroupIndex, state.pageGroups.length);
     state.viewer?.setSeekState(viewerSeekSnapshot(groupIndex));
     return groupIndex;
@@ -6226,6 +8051,17 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
   const commitSeekGroup = (groupIndex, reason) => {
     const viewer = state.viewer;
     if (!viewer) return;
+    if (currentPersistentImagePosition()) {
+      enqueuePersistentCollectionNavigation(
+        1,
+        "still_image",
+        "stop",
+        null,
+        "current",
+        groupIndex
+      );
+      return;
+    }
     const request = requestPageGroup(groupIndex, { reason, deferDisplay: true });
     if (!request.moved || !request.request) return;
     const sequence = ++seekCommitSequence;
@@ -6261,7 +8097,9 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
     event.stopPropagation();
     if (seekPointerDrag) return;
     commitSeekGroup(
-      viewerSeekGroupIndex(seekInput.value, state.pageGroups.length),
+      currentPersistentImagePosition()
+        ? clamp(Number(seekInput.value) || 0, 0, currentPersistentImagePosition().count - 1)
+        : viewerSeekGroupIndex(seekInput.value, state.pageGroups.length),
       "viewer_seek_native"
     );
   });
@@ -6278,7 +8116,7 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
       startClientY: event.clientY,
       startGroupIndex: seekState.groupIndex,
       groupIndex: seekState.groupIndex,
-      groupCount: state.pageGroups.length,
+      groupCount: currentPersistentImagePosition()?.count ?? state.pageGroups.length,
       trackLeft: trackRect.left,
       trackWidth: trackRect.width,
       direction: seekState.direction,
@@ -6389,6 +8227,7 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
 }
 
 function changeImage(delta) {
+  if (enqueuePersistentCollectionNavigation(delta, "still_image")) return true;
   const message = viewerBoundaryMessage({
     currentIndex: state.pageGroupIndex,
     count: state.pageGroups.length,
@@ -6451,7 +8290,12 @@ function viewerImageFailureForDisplay(
 ) {
   if (
     result?.outcome === ViewerGroupLoadOutcome.FAILED &&
-    (renderTrigger === "spread_refresh" || renderTrigger === "viewport_resize")
+    (
+      renderTrigger === "spread_refresh" ||
+      renderTrigger === "final_cover_spread_refresh" ||
+      renderTrigger === "singleton_spread_placement_refresh" ||
+      renderTrigger === "viewport_resize"
+    )
   ) {
     const originalMessage = typeof result.message === "string"
       ? result.message.trim()
@@ -6493,12 +8337,14 @@ async function updateViewerImage(
   }
   updateDecodedPageUnitWindow(state.pageGroupIndex);
   const loadRequest = captureViewerPageGroupRequest(viewer, state.pageGroupIndex);
-  const identity = group.entries.map(entryIdentity).join("\n");
+  const presentationSlots = pageGroupPresentationSlots(group);
+  const presentationEntries = presentationSlots.map(({ entry }) => entry);
+  const identity = pageGroupPresentationIdentity(group);
   const remoteSessionIdSnapshot = state.remoteSessionId;
   const remoteSessionCacheEpochSnapshot = state.remoteSessionCacheEpoch;
   const generationSnapshot = viewerPageGroupGenerationSnapshot(
     state.remoteStateGeneration,
-    group.entries.length
+    presentationEntries.length
   );
   // 例外も 3 outcome の境界の内側で受ける。ここを抜けると呼び出し側の
   // .catch(renderError) まで飛び、位置を戻す判断が一度も行われない。
@@ -6508,14 +8354,14 @@ async function updateViewerImage(
   let loadGroupReached = false;
   let displayRequestId = null;
   try {
-    const infos = await Promise.all(group.entries.map(imageInfo));
+    const infos = await Promise.all(presentationEntries.map(imageInfo));
     const contextExit = viewerImageUpdateContextExitReason({
       viewerMatches: state.viewer === viewer,
       sessionMatches: state.remoteSessionId === remoteSessionIdSnapshot,
       cacheEpochMatches:
         state.remoteSessionCacheEpoch === remoteSessionCacheEpochSnapshot,
       groupMatches:
-        currentPageGroup()?.entries.map(entryIdentity).join("\n") === identity,
+        pageGroupPresentationIdentity(currentPageGroup()) === identity,
     });
     if (contextExit) {
       return supersedeViewerImageUpdate(
@@ -6532,13 +8378,18 @@ async function updateViewerImage(
       viewportWidth: viewer.stage.clientWidth || window.innerWidth,
       viewportHeight: viewer.stage.clientHeight || window.innerHeight,
       devicePixelRatio: window.devicePixelRatio || 1,
-      gap: group.entries.length > 1 ? state.spreadPageGapPx : 0,
+      gap: presentationEntries.length > 1 || group.singletonPlacement !== "center"
+        ? state.spreadPageGapPx
+        : 0,
+      singletonPlacement: group.singletonPlacement,
     });
-    pages = group.entries.map((entry, pageIndex) => ({
+    pages = presentationSlots.map(({ entry, role }, pageIndex) => ({
       entry,
+      role,
       info: infos[pageIndex],
       request: imageRequest(entry, infos[pageIndex], viewer.stage, {
         layout: layout.pages[pageIndex],
+        renderContext: pageRenderContextForSlot(group, pageIndex),
         remoteStateGeneration: generationSnapshot.pages[pageIndex],
         remoteSessionId: remoteSessionIdSnapshot,
         remoteSessionCacheEpoch: remoteSessionCacheEpochSnapshot,
@@ -6557,7 +8408,7 @@ async function updateViewerImage(
     loadGroupReached = true;
     result = await viewer.loadGroup({
       pages,
-      name: group.entries.map((entry) => entry.name).join(" / "),
+      name: presentationEntries.map((entry) => entry.name).join(" / "),
       fitMode: state.fitMode,
       gap: layout.gap,
       index: state.pageGroupIndex,
@@ -6571,6 +8422,7 @@ async function updateViewerImage(
       decodedUnitKey: identity,
       positionSnapshot: loadRequest,
       slice: group.slice,
+      singletonPlacement: group.singletonPlacement,
     });
     if (result?.outcome !== ViewerGroupLoadOutcome.APPLIED) {
       pageDemandAdapter.releaseDisplay(displayRequestId);
@@ -6658,7 +8510,7 @@ async function updateViewerImage(
   if (refreshPlan.bookmarks) state.commandMenu?.refreshBookmarks();
   state.commandMenu?.refreshViewTrim();
   observeReadingProgress();
-  if (group.entries.every((entry) => entry.address)) {
+  if (presentationEntries.every((entry) => entry.address)) {
     schedulePagePrefetch(viewer).catch(() => {});
     queuePageDecodeAhead();
     return VIEWER_GROUP_LOAD_APPLIED;
@@ -6676,7 +8528,7 @@ async function updateViewerImage(
 }
 
 function decodedPageUnitKey(group) {
-  return group?.entries?.map(entryIdentity).join("\n") ?? "";
+  return pageGroupPresentationIdentity(group);
 }
 function viewerHasCommittedDecodedUnit(viewer) {
   const currentKey = decodedPageUnitKey(currentPageGroup());
@@ -6692,7 +8544,8 @@ function updateDecodedPageUnitWindow(currentIndex = state.pageGroupIndex) {
   const units = indexes
     .map((index) => ({ index, group: state.pageGroups[index] }))
     .filter(({ group }) =>
-      group?.entries?.length && group.entries.every((entry) => entry.address)
+      pageGroupPresentationSlots(group).length &&
+      pageGroupPresentationSlots(group).every(({ entry }) => entry.address)
     )
     .map(({ index, group }) => ({
       index,
@@ -6751,7 +8604,10 @@ async function schedulePageDecodeAhead(viewer) {
   const renderRevisionSnapshot = state.pageRenderRevision;
   const units = updateDecodedPageUnitWindow(groupIndexSnapshot);
   const plans = await Promise.all(units.map(async ({ group, key }) => {
-    const infos = await Promise.all(group.entries.map(imageInfo));
+    const presentationSlots = pageGroupPresentationSlots(group);
+    const infos = await Promise.all(
+      presentationSlots.map(({ entry }) => imageInfo(entry))
+    );
     const layout = viewerSlicedSpreadLayout({
       mode: fitModeSnapshot,
       pages: infos,
@@ -6759,20 +8615,25 @@ async function schedulePageDecodeAhead(viewer) {
       viewportWidth: viewer.stage.clientWidth || window.innerWidth,
       viewportHeight: viewer.stage.clientHeight || window.innerHeight,
       devicePixelRatio: window.devicePixelRatio || 1,
-      gap: group.entries.length > 1 ? state.spreadPageGapPx : 0,
+      gap: presentationSlots.length > 1 || group.singletonPlacement !== "center"
+        ? state.spreadPageGapPx
+        : 0,
+      singletonPlacement: group.singletonPlacement,
     });
     const pageGenerations = viewerPageGroupGenerationSnapshot(
       generationSnapshot,
-      group.entries.length
+      presentationSlots.length
     );
     return {
       key,
-      pages: group.entries.map((entry, pageIndex) => ({
+      pages: presentationSlots.map(({ entry, role }, pageIndex) => ({
         entry,
+        role,
         info: infos[pageIndex],
         request: imageRequest(entry, infos[pageIndex], viewer.stage, {
           prefetch: true,
           layout: layout.pages[pageIndex],
+          renderContext: pageRenderContextForSlot(group, pageIndex),
           previewRevision: renderRevisionSnapshot,
           remoteStateGeneration: pageGenerations.pages[pageIndex],
           remoteSessionId: sessionSnapshot,
@@ -6815,9 +8676,70 @@ async function schedulePageDecodeAhead(viewer) {
   }
 }
 
+export function pagePrefetchTargetGroups(indexes, images, groups) {
+  const targets = new Map();
+  for (const index of indexes ?? []) {
+    const entry = images?.[index];
+    if (!entry?.address) continue;
+    const groupIndex = pageGroupIndexIn(groups, entry);
+    const targetGroup = groups?.[groupIndex];
+    if (!targetGroup) continue;
+    const groupKey = pageGroupPresentationIdentity(targetGroup);
+    const existing = targets.get(groupKey);
+    if (existing) {
+      if (!existing.navigationIndexes.includes(index)) {
+        existing.navigationIndexes.push(index);
+      }
+      continue;
+    }
+    targets.set(groupKey, {
+      groupKey,
+      targetGroup,
+      navigationIndexes: [index],
+    });
+  }
+  return [...targets.values()];
+}
+
+export function pagePrefetchRequestKeys(indexes, requestPlans) {
+  const selectedIndexes = new Set(indexes ?? []);
+  return [
+    ...new Set(
+      (requestPlans ?? [])
+        .filter((plan) =>
+          plan.navigationIndexes?.some((index) => selectedIndexes.has(index))
+        )
+        .flatMap((plan) => plan.requests ?? [])
+        .map((request) => request.cacheKey)
+        .filter(Boolean)
+    ),
+  ];
+}
+
+export function pagePrefetchResourceLimit(
+  currentGroup,
+  requestPlans,
+  effectiveWindow
+) {
+  const plannedResourceCount = new Set(
+    (requestPlans ?? [])
+      .flatMap((plan) => plan.requests ?? [])
+      .map((request) => request.cacheKey)
+      .filter(Boolean)
+  ).size;
+  const presentationResourceCount = pageGroupPresentationSlots(currentGroup).length;
+  return Math.max(
+    pageResourceCacheLimit({
+      visiblePages: MAX_VIEWER_VISIBLE_PAGES,
+      ...effectiveWindow,
+    }),
+    Math.max(1, presentationResourceCount + plannedResourceCount)
+  );
+}
+
 async function schedulePagePrefetch(viewer) {
   const group = currentPageGroup();
-  const currentIdentity = group?.entries.map(entryIdentity).join("\n") ?? "";
+  const currentIdentity = pageGroupPresentationIdentity(group);
   const effectiveWindow = pagePrefetchWindow({
     configuredAhead: state.localSettings.prefetchAhead,
     configuredBehind: state.localSettings.prefetchBehind,
@@ -6825,7 +8747,7 @@ async function schedulePagePrefetch(viewer) {
   });
   hudState.pagePrefetch = null;
   updateHud();
-  const visibleIndexes = (group?.entries ?? [])
+  const visibleIndexes = pageGroupNavigationEntries(group)
     .map((entry) => state.images.findIndex((image) => entryIdentity(image) === entryIdentity(entry)))
     .filter((index) => index >= 0);
   const indexes = pagePrefetchPlan({
@@ -6841,14 +8763,17 @@ async function schedulePagePrefetch(viewer) {
     ahead: effectiveWindow.ahead,
     behind: effectiveWindow.behind,
   });
-  const requests = await Promise.all(
-    indexes.map(async (index) => {
-      const entry = state.images[index];
-      if (!entry?.address) return null;
-      const groupIndex = pageGroupIndexForEntry(entry);
-      const targetGroup = state.pageGroups[groupIndex];
-      if (!targetGroup) return null;
-      const infos = await Promise.all(targetGroup.entries.map(imageInfo));
+  const targetGroups = pagePrefetchTargetGroups(
+    indexes,
+    state.images,
+    state.pageGroups
+  );
+  const requestPlans = await Promise.all(
+    targetGroups.map(async ({ groupKey, targetGroup, navigationIndexes }) => {
+      const presentationSlots = pageGroupPresentationSlots(targetGroup);
+      const infos = await Promise.all(
+        presentationSlots.map(({ entry: page }) => imageInfo(page))
+      );
       const layout = viewerSlicedSpreadLayout({
         mode: state.fitMode,
         pages: infos,
@@ -6856,15 +8781,22 @@ async function schedulePagePrefetch(viewer) {
         viewportWidth: viewer.stage.clientWidth || window.innerWidth,
         viewportHeight: viewer.stage.clientHeight || window.innerHeight,
         devicePixelRatio: window.devicePixelRatio || 1,
-        gap: targetGroup.entries.length > 1 ? state.spreadPageGapPx : 0,
+        gap: presentationSlots.length > 1 || targetGroup.singletonPlacement !== "center"
+          ? state.spreadPageGapPx
+          : 0,
+        singletonPlacement: targetGroup.singletonPlacement,
       });
-      const pageIndex = targetGroup.entries.findIndex(
-        (page) => entryIdentity(page) === entryIdentity(entry)
-      );
-      return imageRequest(entry, infos[pageIndex], viewer.stage, {
-        prefetch: true,
-        layout: layout.pages[pageIndex],
-      });
+      return {
+        groupKey,
+        navigationIndexes,
+        requests: presentationSlots.map(({ entry: page }, pageIndex) =>
+          imageRequest(page, infos[pageIndex], viewer.stage, {
+            prefetch: true,
+            layout: layout.pages[pageIndex],
+            renderContext: pageRenderContextForSlot(targetGroup, pageIndex),
+          })
+        ),
+      };
     })
   );
   const latestEffectiveWindow = pagePrefetchWindow({
@@ -6874,28 +8806,28 @@ async function schedulePagePrefetch(viewer) {
   });
   if (
     state.viewer !== viewer ||
-    currentPageGroup()?.entries.map(entryIdentity).join("\n") !== currentIdentity ||
+    pageGroupPresentationIdentity(currentPageGroup()) !== currentIdentity ||
     latestEffectiveWindow.ahead !== effectiveWindow.ahead ||
     latestEffectiveWindow.behind !== effectiveWindow.behind
   ) {
     return;
   }
-  const requestsByIndex = new Map(
-    indexes.map((index, requestIndex) => [index, requests[requestIndex]])
-  );
   hudState.pagePrefetch = {
-    behindKeys: hudPlan.behindIndexes
-      .map((index) => requestsByIndex.get(index)?.cacheKey)
-      .filter(Boolean),
-    aheadKeys: hudPlan.aheadIndexes
-      .map((index) => requestsByIndex.get(index)?.cacheKey)
-      .filter(Boolean),
+    behindKeys: pagePrefetchRequestKeys(hudPlan.behindIndexes, requestPlans),
+    aheadKeys: pagePrefetchRequestKeys(hudPlan.aheadIndexes, requestPlans),
   };
-  pageResourceCache.setLimit(pageResourceCacheLimit({
-    visiblePages: MAX_VIEWER_VISIBLE_PAGES,
-    ...effectiveWindow,
-  }));
-  pageDemandAdapter.setPlan(requests.filter(Boolean));
+  pageResourceCache.setLimit(
+    pagePrefetchResourceLimit(group, requestPlans, effectiveWindow)
+  );
+  pageDemandAdapter.setPlan(
+    [
+      ...new Map(
+        requestPlans
+          .flatMap((plan) => plan.requests)
+          .map((request) => [request.cacheKey, request])
+      ).values(),
+    ]
+  );
   pageResourceCache.trimUnprotected("window_out");
   updateHud();
 }
@@ -6910,6 +8842,7 @@ export function imageRequest(
     targetPxOverride = null,
     adjustmentPreview = null,
     previewRevision = null,
+    renderContext = null,
     remoteStateGeneration = state.remoteStateGeneration,
     remoteSessionId = state.remoteSessionId,
     remoteSessionCacheEpoch = state.remoteSessionCacheEpoch,
@@ -6917,7 +8850,6 @@ export function imageRequest(
 ) {
   const dpr = window.devicePixelRatio || 1;
   if (entry.address) {
-    const renderContext = pageRenderContextForEntry(entry);
     const resolvedLayout = layout ?? viewerImageLayout({
         mode: state.fitMode,
         sourceWidth: info.width,
@@ -7050,7 +8982,27 @@ function rememberMediaImageInfo(request, info) {
   }
 }
 
-function bindThumbnail(image, entry, tracker, cellWidth) {
+export function audioArtRuntimeForTest() {
+  return RUNTIME_TEST_MODE ? { owner: state.audioArtListState, indicator: state.audioThumbnailIndicator } : null;
+}
+
+export function adoptAudioArtListing(data) {
+  state.audioThumbnailIndicator = normalizedAudioIndicator(data.thumbnail_presentation?.audio_indicator);
+  state.audioArtListState = new AudioArtListState(
+    state.entries, (entry) => addressIdentity(entryAddress(entry)).replace(/\\/g, "/").toLowerCase(), newRemoteSessionCacheEpoch(), state.remoteSessionId,
+  );
+}
+
+function audioArtOwnerIsCurrent(owner) {
+  return Boolean(owner && owner === state.audioArtListState && owner.sessionId === state.remoteSessionId);
+}
+
+function rememberAudioArtTerminal(owner, entry, result) {
+  if (!result || !audioArtOwnerIsCurrent(owner)) return;
+  owner.settle(entry, result);
+}
+
+export function bindThumbnail(image, entry, tracker, cellWidth) {
   disposeThumbnailBinding(image);
   const generation = (Number(image._thumbnailGeneration) || 0) + 1;
   image._thumbnailGeneration = generation;
@@ -7060,6 +9012,12 @@ function bindThumbnail(image, entry, tracker, cellWidth) {
   image.parentElement?.classList.remove("thumb-loaded");
   image.parentElement?.removeAttribute("data-retry-exhausted");
   image.parentElement?.removeAttribute("data-unavailable");
+  if (entry.kind === "audio" && state.audioArtListState?.terminal(entry)) {
+    image._thumbnailSettled = true;
+    image.classList.add("thumb-missing");
+    tracker?.settled(thumbnailBindingKey(entry));
+    return;
+  }
   const controller = new AbortController();
   image._thumbnailController = controller;
   const targetPx = clamp(
@@ -7139,17 +9097,22 @@ function clearThumbnailServiceNotice() {
 
 async function loadThumbnail(image, entry, tracker, generation, targetPx, signal) {
   const bindingKey = thumbnailBindingKey(entry);
+  const audioOwner = entry.kind === "audio" ? state.audioArtListState : null;
+  const responseIsCurrent = () => !signal.aborted && thumbnailResponseIsCurrent(image, generation, bindingKey) &&
+    (entry.kind !== "audio" || audioArtOwnerIsCurrent(audioOwner));
   const url = apiUrl(
     "/api/thumb",
     thumbnailRequestQueryForEntry(entry, {
       w: targetPx,
       epoch: state.remoteSessionCacheEpoch,
+      ...(audioOwner ? { artEpoch: audioOwner.artEpoch } : {}),
     })
   );
   try {
     const result = await fetchThumbnailWithRetry(url, signal);
     const { response, detail, exhausted } = result;
     if (!response.ok) {
+      rememberAudioArtTerminal(audioOwner, entry, audioArtFailure(response.status, detail.error));
       if (
         response.status === 503 &&
         ["miv_not_running", "protocol_version_mismatch"].includes(detail.error)
@@ -7158,7 +9121,7 @@ async function loadThumbnail(image, entry, tracker, generation, targetPx, signal
           detail.message || "mIV 本体が起動していません。"
         );
       }
-      if (!thumbnailResponseIsCurrent(image, generation, bindingKey)) return;
+      if (!responseIsCurrent()) return;
       if (response.status === 423) {
         image.parentElement?.setAttribute("data-unavailable", "パスワード保護");
       }
@@ -7172,8 +9135,9 @@ async function loadThumbnail(image, entry, tracker, generation, targetPx, signal
       return;
     }
     const blob = await response.blob();
+    if (!responseIsCurrent()) return;
     const objectUrl = URL.createObjectURL(blob);
-    if (!thumbnailResponseIsCurrent(image, generation, bindingKey)) {
+    if (!responseIsCurrent()) {
       URL.revokeObjectURL(objectUrl);
       return;
     }
@@ -7182,7 +9146,7 @@ async function loadThumbnail(image, entry, tracker, generation, targetPx, signal
     image.src = objectUrl;
     await image.decode();
     await nextFrame();
-    if (!thumbnailResponseIsCurrent(image, generation, bindingKey)) {
+    if (!responseIsCurrent()) {
       URL.revokeObjectURL(objectUrl);
       if (image._thumbnailObjectUrl === objectUrl) image._thumbnailObjectUrl = null;
       return;
@@ -7195,8 +9159,10 @@ async function loadThumbnail(image, entry, tracker, generation, targetPx, signal
     clearThumbnailServiceNotice();
     tracker?.settled(bindingKey);
   } catch (error) {
-    if (error?.name === "AbortError") return;
-    if (!thumbnailResponseIsCurrent(image, generation, bindingKey)) return;
+    // Removing src while image.decode() is pending rejects with EncodingError,
+    // not AbortError. Only the still-current binding owns a terminal failure.
+    if (error?.name === "AbortError" || !responseIsCurrent()) return;
+    rememberAudioArtTerminal(audioOwner, entry, "Failed");
     image.classList.remove("thumb-ready");
     image.classList.add("thumb-missing");
     image.classList.toggle("thumb-retry-exhausted", Boolean(error?.retryExhausted));
@@ -7210,7 +9176,7 @@ async function loadThumbnail(image, entry, tracker, generation, targetPx, signal
     });
   } finally {
     if (
-      thumbnailResponseIsCurrent(image, generation, bindingKey) &&
+      responseIsCurrent() &&
       image._thumbnailController?.signal === signal
     ) {
       image._thumbnailController = null;
@@ -7231,6 +9197,8 @@ async function fetchThumbnailWithRetry(url, signal) {
             credentials: "same-origin",
             cache: "force-cache",
             signal,
+            suppressErrorTelemetryFor: (response, detail) =>
+              response.status === 422 && detail.error === "no_thumbnail",
           }),
         signal
       );
@@ -8044,6 +10012,12 @@ const MenuPageAction = Object.freeze({
   RATING: "menu_page_rating",
   DISPLAY: "menu_page_display",
   SPREAD: "menu_page_spread",
+  SINGLETON_PLACEMENT: "menu_page_singleton_placement",
+  SINGLETON_PLACEMENT_LAST: "menu_page_singleton_placement_last",
+  PAGE_ALONE: "menu_page_page_alone",
+  PAGE_AFTER_COVER: "menu_page_page_after_cover",
+  LAST_PAGE_ALONE: "menu_page_last_page_alone",
+  FINAL_COVER: "menu_page_final_cover",
   POSITION: "menu_page_position",
 });
 
@@ -8114,7 +10088,23 @@ function remoteBookContainerIdentity(address) {
   return address?.path ?? "";
 }
 
-export function viewerMenuDefinitions({ hasContainer, barsVisible }) {
+export function viewerMenuDefinitions({
+  hasContainer,
+  barsVisible,
+  supportsFinalCoverSetting = false,
+  finalCoverPreference = "follow_global",
+  finalCoverEnabled = true,
+  supportsSingletonPlacementSetting = false,
+  singletonPlacementPreference = "follow_global",
+  singletonPlacementEnabled = false,
+  singletonLastPreference = "follow_global",
+  singletonLastEnabled = false,
+  supportsPageAloneSetting = false,
+  pageAfterCoverPreference = "follow_global",
+  lastPagePreference = "follow_global",
+  pageAfterCoverEnabled = false,
+  lastPageEnabled = false,
+}) {
   const back = [MenuPageAction.BACK, "操作メニューへ戻る", "戻る"];
   const mainActions = [
     [CommandName.TOGGLE_BOOKMARK, "ブックマークを読み込み中…", "現在のページ"],
@@ -8186,6 +10176,144 @@ export function viewerMenuDefinitions({ hasContainer, barsVisible }) {
         [CommandName.SPREAD_RTL_COVER, "見開き 右→左 (表紙あり)", "5"],
         [CommandName.SPREAD_SPLIT_LTR, "横長分割 左→右", "6"],
         [CommandName.SPREAD_SPLIT_RTL, "横長分割 右→左", "7"],
+        ...(supportsFinalCoverSetting
+          ? [[
+              MenuPageAction.FINAL_COVER,
+              "末尾に表紙を添える",
+              finalCoverPreference === "follow_global"
+                ? finalCoverEnabled ? "全体設定: ON" : "全体設定: OFF"
+                : finalCoverPreference === "on" ? "この本: ON" : "この本: OFF",
+              { menuPage: "final_cover" },
+            ]]
+          : []),
+        ...(supportsSingletonPlacementSetting
+          ? [[
+              MenuPageAction.SINGLETON_PLACEMENT,
+              "先頭の単ページ配置",
+              singletonPlacementPreference === "follow_global"
+                ? singletonPlacementEnabled
+                  ? "全体設定: 配置する"
+                  : "全体設定: 中央"
+                : singletonPlacementPreference === "place"
+                  ? "この本: 配置する"
+                  : "この本: 中央",
+              { menuPage: "singleton_placement" },
+            ], [
+              MenuPageAction.SINGLETON_PLACEMENT_LAST,
+              "末尾の単ページ配置",
+              singletonLastPreference === "follow_global"
+                ? singletonLastEnabled ? "全体設定: 配置する" : "全体設定: 中央"
+                : singletonLastPreference === "place" ? "この本: 配置する" : "この本: 中央",
+              { menuPage: "singleton_placement_last" },
+            ]]
+          : []),
+        ...(supportsPageAloneSetting ? [[
+          MenuPageAction.PAGE_ALONE,
+          "単独ページと白い相方",
+          "表紙あり見開き",
+          { menuPage: "page_alone" },
+        ]] : []),
+      ],
+    },
+    final_cover: {
+      title: "末尾に表紙を添える",
+      actions: [
+        back,
+              [
+                CommandName.FINAL_COVER_FOLLOW_GLOBAL,
+                `${finalCoverPreference === "follow_global" ? "✓ " : ""}末尾に表紙: 全体設定に従う`,
+                finalCoverPreference === "follow_global"
+                  ? finalCoverEnabled
+                    ? "現在 ON"
+                    : "現在 OFF"
+                  : "全体設定",
+              ],
+              [
+                CommandName.FINAL_COVER_ON,
+                `${finalCoverPreference === "on" ? "✓ " : ""}末尾に表紙: ON`,
+                "この本",
+              ],
+              [
+                CommandName.FINAL_COVER_OFF,
+                `${finalCoverPreference === "off" ? "✓ " : ""}末尾に表紙: OFF`,
+                "この本",
+              ],
+      ],
+    },
+    singleton_placement: {
+      title: "先頭の単ページ配置",
+      actions: [
+        back,
+        [
+          CommandName.SINGLETON_PLACEMENT_FOLLOW_GLOBAL,
+          `${singletonPlacementPreference === "follow_global" ? "✓ " : ""}全体設定に従う`,
+          singletonPlacementEnabled ? "現在: 配置する" : "現在: 中央",
+        ],
+        [
+          CommandName.SINGLETON_PLACEMENT_PLACE,
+          `${singletonPlacementPreference === "place" ? "✓ " : ""}本来の側へ配置`,
+          "この本",
+        ],
+        [
+          CommandName.SINGLETON_PLACEMENT_CENTER,
+          `${singletonPlacementPreference === "center" ? "✓ " : ""}中央に表示`,
+          "この本",
+        ],
+      ],
+    },
+    singleton_placement_last: {
+      title: "末尾の単ページ配置",
+      actions: [
+        back,
+        [CommandName.SINGLETON_LAST_FOLLOW_GLOBAL,
+          `${singletonLastPreference === "follow_global" ? "✓ " : ""}全体設定に従う`,
+          singletonLastEnabled ? "現在: 配置する" : "現在: 中央"],
+        [CommandName.SINGLETON_LAST_PLACE,
+          `${singletonLastPreference === "place" ? "✓ " : ""}本来の側へ配置`, "この本"],
+        [CommandName.SINGLETON_LAST_CENTER,
+          `${singletonLastPreference === "center" ? "✓ " : ""}中央に表示`, "この本"],
+      ],
+    },
+    page_alone: {
+      title: "単独ページと白い相方",
+      actions: [
+        back,
+        [MenuPageAction.PAGE_AFTER_COVER, "表紙の次のページを単独で表示",
+          pageAfterCoverPreference === "follow_global"
+            ? `全体設定: ${pageAfterCoverEnabled ? "ON" : "OFF"}`
+            : `この本: ${pageAfterCoverPreference.toUpperCase()}`,
+          { menuPage: "page_after_cover" }],
+        [MenuPageAction.LAST_PAGE_ALONE, "最終ページを単独で表示",
+          lastPagePreference === "follow_global"
+            ? `全体設定: ${lastPageEnabled ? "ON" : "OFF"}`
+            : `この本: ${lastPagePreference.toUpperCase()}`,
+          { menuPage: "last_page_alone" }],
+      ],
+    },
+    page_after_cover: {
+      title: "表紙の次のページを単独で表示",
+      actions: [
+        back,
+        [CommandName.PAGE_AFTER_COVER_FOLLOW_GLOBAL,
+          `${pageAfterCoverPreference === "follow_global" ? "✓ " : ""}全体設定に従う`,
+          `現在: ${pageAfterCoverEnabled ? "ON" : "OFF"}`],
+        [CommandName.PAGE_AFTER_COVER_ON,
+          `${pageAfterCoverPreference === "on" ? "✓ " : ""}ON`, "この本"],
+        [CommandName.PAGE_AFTER_COVER_OFF,
+          `${pageAfterCoverPreference === "off" ? "✓ " : ""}OFF`, "この本"],
+      ],
+    },
+    last_page_alone: {
+      title: "最終ページを単独で表示",
+      actions: [
+        back,
+        [CommandName.LAST_PAGE_ALONE_FOLLOW_GLOBAL,
+          `${lastPagePreference === "follow_global" ? "✓ " : ""}全体設定に従う`,
+          `現在: ${lastPageEnabled ? "ON" : "OFF"}`],
+        [CommandName.LAST_PAGE_ALONE_ON,
+          `${lastPagePreference === "on" ? "✓ " : ""}ON`, "この本"],
+        [CommandName.LAST_PAGE_ALONE_OFF,
+          `${lastPagePreference === "off" ? "✓ " : ""}OFF`, "この本"],
       ],
     },
     position: {
@@ -8204,6 +10332,19 @@ function menuDefinition(context, page = "main") {
     const definitions = viewerMenuDefinitions({
       hasContainer: Boolean(state.container || refreshableCollectionRoute()),
       barsVisible: state.viewerBarsVisible,
+      supportsFinalCoverSetting: Boolean(state.container),
+      finalCoverPreference: state.finalCoverSpreadPreference,
+      finalCoverEnabled: state.finalCoverSpreadEnabled,
+      supportsSingletonPlacementSetting: Boolean(state.container),
+      supportsPageAloneSetting: Boolean(state.container),
+      singletonPlacementPreference: state.singletonSpreadPlacementPreference,
+      singletonPlacementEnabled: state.singletonSpreadPlacementEnabled,
+      singletonLastPreference: state.singletonSpreadLastPreference,
+      singletonLastEnabled: state.singletonSpreadLastEnabled,
+      pageAfterCoverPreference: state.pageAfterCoverAlonePreference,
+      lastPagePreference: state.lastPageAlonePreference,
+      pageAfterCoverEnabled: state.pageAfterCoverAloneEnabled,
+      lastPageEnabled: state.lastPageAloneEnabled,
     });
     return definitions[page] ?? definitions.main;
   }
@@ -8554,7 +10695,7 @@ export class ViewerViewTrimPanel {
   renderState() {
     const value = this.serverState;
     if (!value) return;
-    const isSpread = (currentPageGroup()?.entries.length ?? 0) === 2;
+    const isSpread = pageGroupPresentationSlots(currentPageGroup()).length === 2;
     const manual = value.apply_mode === "book";
     this.modeSelect.value = value.apply_mode;
     this.enabledInput.checked = value.book_settings.enabled;
@@ -9721,29 +11862,29 @@ export class ViewerAdjustmentPanel {
 
   currentTarget() {
     const group = currentPageGroup();
-    const entry = group?.entries[this.targetIndex];
+    const slot = pageGroupPresentationSlots(group)[this.targetIndex];
+    const entry = slot?.entry;
     const address = entry ? entryAddress(entry) : null;
     if (!entry || !address?.path) return null;
     return {
       entry,
       address,
       pageIndex: this.targetIndex,
-      identity: `${state.pageGroupIndex}\n${addressIdentity(address)}`,
+      renderContext: pageRenderContextForSlot(group, this.targetIndex),
+      identity: `${state.pageGroupIndex}\n${pageGroupPresentationIdentity(group)}\n${this.targetIndex}`,
     };
   }
 
   async refresh() {
     const group = currentPageGroup();
-    const nextGroupIdentity = `${state.pageGroupIndex}\n${(group?.entries ?? [])
-      .map(entryIdentity)
-      .join("\n")}`;
+    const nextGroupIdentity = `${state.pageGroupIndex}\n${pageGroupPresentationIdentity(group)}`;
     if (this.groupIdentity !== nextGroupIdentity) {
       this.groupIdentity = nextGroupIdentity;
       this.targetIndex = 0;
       this.previewEpoch += 1;
       this.previewQueue.clear();
     }
-    this.targetRow.hidden = (group?.entries.length ?? 0) !== 2;
+    this.targetRow.hidden = pageGroupPresentationSlots(group).length !== 2;
     this.syncTargetButtons();
     const target = this.currentTarget();
     if (!target) {
@@ -9827,6 +11968,7 @@ export class ViewerAdjustmentPanel {
       targetPxOverride: 768,
       adjustmentPreview: { scope: job.scope, values: job.values },
       previewRevision: `preview-${state.pageRenderRevision}-${job.sequence}`,
+      renderContext: job.renderContext,
     });
     if (job.cancelled) return;
     job.controller = new AbortController();
@@ -11271,6 +13413,14 @@ export function remoteArchiveProgressText(snapshot) {
   return parts.join(" · ");
 }
 
+export function remoteArchiveTerminalMessage(snapshot) {
+  return snapshot?.terminal?.message || (
+    snapshot?.state === "declined_by_user"
+      ? "変換しませんでした。"
+      : "アーカイブ操作を完了できませんでした。"
+  );
+}
+
 export function selectRecoverableRemoteArchiveJob(jobs, requestId) {
   if (!requestId) return null;
   return (Array.isArray(jobs) ? jobs : [])
@@ -11297,7 +13447,7 @@ function createRemoteArchiveRequestId(address) {
 }
 
 export class RemoteArchiveOpenController {
-  constructor(host, subscribeRemoteSessionState = () => () => {}) {
+  constructor(host, subscribeRemoteSessionState = () => () => {}, testHooks = {}) {
     this.host = host;
     this.address = null;
     this.requestId = null;
@@ -11305,6 +13455,12 @@ export class RemoteArchiveOpenController {
     this.pollTimer = 0;
     this.destroyed = false;
     this.cancelOnDestroy = true;
+    this.readyRouteState = {};
+    this.createJob = testHooks.createJob ?? ((source, requestId) =>
+      apiAddressPostJson("/api/archive/jobs", { request_id: requestId, source }));
+    this.loadResult = testHooks.loadResult ?? ((jobId) =>
+      apiJson(`/api/archive/jobs/${encodeURIComponent(jobId)}/result`));
+    this.navigateTo = testHooks.navigate ?? navigate;
     this.remoteSessionState = { blocksInteraction: false };
     this.previousFocus = document.activeElement;
 
@@ -11355,17 +13511,18 @@ export class RemoteArchiveOpenController {
     queueMicrotask(() => this.panel.focus?.());
   }
 
-  async open(address, name) {
+  async open(address, name, readyRouteState = {}) {
     if (this.destroyed) return;
     this.address = address;
+    // Capture the originating collection root when the job starts. Conversion and password
+    // prompts may outlive later root edits or route changes, but a successful landing must still
+    // carry the immutable Back target for this exact job.
+    this.readyRouteState = immutableRemoteArchiveRouteState(readyRouteState);
     this.requestId = createRemoteArchiveRequestId(address);
     this.sourceName.textContent = name;
     this.showWorking("アーカイブを準備しています");
     try {
-      const snapshot = await apiAddressPostJson("/api/archive/jobs", {
-        request_id: this.requestId,
-        source: address,
-      });
+      const snapshot = await this.createJob(address, this.requestId);
       await this.handleSnapshot(snapshot);
     } catch (error) {
       const recovered = await this.recover().catch(() => null);
@@ -11550,9 +13707,7 @@ export class RemoteArchiveOpenController {
   async openReady(snapshot) {
     this.showWorking("アーカイブを開いています");
     this.actions.replaceChildren();
-    const result = await apiJson(
-      `/api/archive/jobs/${encodeURIComponent(snapshot.job_id)}/result`
-    );
+    const result = await this.loadResult(snapshot.job_id);
     if (this.destroyed) return;
     if (
       !result?.source ||
@@ -11562,7 +13717,7 @@ export class RemoteArchiveOpenController {
     }
     this.cancelOnDestroy = false;
     this.close(false);
-    navigate(containerHash(result.source));
+    this.navigateTo(containerHash(result.source), this.readyRouteState);
   }
 
   showWorking(message, progress = null) {
@@ -11591,11 +13746,7 @@ export class RemoteArchiveOpenController {
   showTerminal(snapshot) {
     this.cancelOnDestroy = false;
     this.progress.hidden = true;
-    this.message.textContent = snapshot.terminal?.message || (
-      snapshot.state === "declined_by_user"
-        ? "変換しませんでした。"
-        : "アーカイブ操作を完了できませんでした。"
-    );
+    this.message.textContent = remoteArchiveTerminalMessage(snapshot);
     this.detail.textContent = "";
     this.root.classList.toggle("is-error", snapshot.state === "failed");
     const close = textElement("button", "閉じる", "archive-open-primary");
@@ -12227,7 +14378,8 @@ export class ImageViewer {
           job.renderTrigger,
           job.displayRequestId,
           job.decodedUnitKey,
-          job.slice
+          job.slice,
+          job.singletonPlacement
         )
         : this.loadMeasuredImage(
           job.request,
@@ -12238,7 +14390,9 @@ export class ImageViewer {
           job.renderTrigger,
           job.displayRequestId,
           job.decodedUnitKey,
-          job.slice
+          job.slice,
+          job.singletonPlacement,
+          job.gap
         ),
       (job) => {
         pageDemandAdapter.releaseDisplay(job?.displayRequestId);
@@ -12318,6 +14472,8 @@ export class ImageViewer {
     decodedUnitKey = null,
     positionSnapshot = null,
     slice = PageSlice.FULL,
+    singletonPlacement = "center",
+    gap = 0,
   }) {
     const resolvedSeekState = seekState ?? {
       visible: count > 1,
@@ -12346,6 +14502,8 @@ export class ImageViewer {
       displayRequestId,
       decodedUnitKey,
       slice,
+      singletonPlacement,
+      gap,
     });
   }
 
@@ -12380,6 +14538,7 @@ export class ImageViewer {
     decodedUnitKey = null,
     positionSnapshot = null,
     slice = PageSlice.FULL,
+    singletonPlacement = "center",
   }) {
     if (pages.length === 1) {
       return this.load({
@@ -12397,6 +14556,8 @@ export class ImageViewer {
         decodedUnitKey,
         positionSnapshot,
         slice,
+        singletonPlacement,
+        gap,
       });
     }
     const resolvedSeekState = seekState ?? {
@@ -12426,6 +14587,7 @@ export class ImageViewer {
       displayRequestId,
       decodedUnitKey,
       slice,
+      singletonPlacement,
     });
   }
 
@@ -12500,6 +14662,7 @@ export class ImageViewer {
     if (livePositionSnapshot) {
       viewerPositionOwner.display(livePositionSnapshot);
     }
+    if (livePositionSnapshot && state.viewer === this) rawPrefetchPublisher.commit(committedRawPrefetchPresentation(livePositionSnapshot));
     this.displayedSeekState = { ...seekState };
     if (!this.requestedPagePresentation) {
       this.initializePagePresentation({
@@ -12578,12 +14741,28 @@ export class ImageViewer {
     return Object.values(PageSlice).includes(slice) ? slice : PageSlice.FULL;
   }
 
-  setLayout(fitMode, layout, info, image = this.image, slice = PageSlice.FULL) {
+  setLayout(
+    fitMode,
+    layout,
+    info,
+    image = this.image,
+    slice = PageSlice.FULL,
+    singletonPlacement = "center",
+    singletonGap = 0
+  ) {
     this.fitMode = fitMode;
     this.stage.dataset.fitMode = fitMode;
-    this.pageLayer.style.gap = "0px";
+    this.pageLayer.style.gap = singletonPlacement.endsWith("_white")
+      ? `${Math.max(0, Number(singletonGap) || 0)}px` : "0px";
+    this.pageLayer.dataset.singletonPlacement = singletonPlacement;
+    this.pageLayer.dataset.singletonGap = String(
+      singletonPlacement === "center" ? 0 : Math.max(0, Number(singletonGap) || 0)
+    );
     this.applyImageBox(image, layout, info, slice);
-    this.setPageLayerSize(layout.cssWidth, layout.cssHeight);
+    const layerWidth = singletonPlacement === "center"
+      ? layout.cssWidth
+      : layout.cssWidth * 2 + Math.max(0, Number(singletonGap) || 0);
+    this.setPageLayerSize(layerWidth, layout.cssHeight);
     // 始点を決めるのは placeInitialStageScroll の役目。ここで 0 に戻すと、原寸の
     // 中央寄せを毎回打ち消す。
     this.placeInitialStageScroll();
@@ -12592,6 +14771,20 @@ export class ImageViewer {
   setPageLayerSize(width, height) {
     this.pageLayer.style.width = `${Math.max(1, Number(width) || 1)}px`;
     this.pageLayer.style.height = `${Math.max(1, Number(height) || 1)}px`;
+  }
+
+  syncWhiteCompanion() {
+    this.pageLayer.querySelector(".viewer-white-companion")?.remove();
+    const placement = this.pageLayer.dataset.singletonPlacement;
+    const image = this.images[0];
+    if (!image || this.images.length !== 1 ||
+        !["left_white", "right_white"].includes(placement)) return;
+    const white = element("div", "viewer-white-companion");
+    white.setAttribute("aria-hidden", "true");
+    white.style.width = image.style.width;
+    white.style.height = image.style.height;
+    if (placement === "left_white") this.pageLayer.append(white);
+    else this.pageLayer.prepend(white);
   }
 
   /// 新しい配置を入れた直後に、どこから見せ始めるか。
@@ -12631,6 +14824,9 @@ export class ImageViewer {
     }));
     if (sources.some((source) => !(source.width > 0 && source.height > 0))) return false;
     const slice = this.imagePageSlice();
+    const singletonPlacement = ["left", "right", "left_white", "right_white"].includes(
+      this.pageLayer.dataset.singletonPlacement
+    ) ? this.pageLayer.dataset.singletonPlacement : "center";
     const layout = viewerSlicedSpreadLayout({
       mode: fitMode,
       pages: sources,
@@ -12638,15 +14834,23 @@ export class ImageViewer {
       viewportWidth: this.stage.clientWidth || window.innerWidth,
       viewportHeight: this.stage.clientHeight || window.innerHeight,
       devicePixelRatio: window.devicePixelRatio || 1,
-      gap: this.images.length > 1 ? Number.parseFloat(this.pageLayer.style.gap) || 0 : 0,
+      gap: this.images.length > 1
+        ? Number.parseFloat(this.pageLayer.style.gap) || 0
+        : Number.parseFloat(this.pageLayer.dataset.singletonGap) || 0,
+      singletonPlacement,
     });
     this.fitMode = fitMode;
     this.stage.dataset.fitMode = fitMode;
     this.pageLayer.style.gap = `${layout.gap}px`;
+    this.pageLayer.dataset.singletonPlacement = layout.singletonPlacement ?? "center";
+    this.pageLayer.dataset.singletonGap = String(
+      layout.singletonPlacement === "center" ? 0 : Math.max(0, Number(layout.gap) || 0)
+    );
     this.setPageLayerSize(layout.cssWidth, layout.cssHeight);
     this.images.forEach((image, index) => {
       this.applyImageBox(image, layout.pages[index], null, slice);
     });
+    this.syncWhiteCompanion();
     this.placeInitialStageScroll();
     if (resetTransform) {
       this.scale = 1;
@@ -12723,6 +14927,7 @@ export class ImageViewer {
     }
     this.pageLayer.replaceChildren(...nextImages);
     this.images = nextImages;
+    this.syncWhiteCompanion();
     this.image = nextImages[0];
     this.objectUrls = nextUrls;
     this.objectUrl = nextImages.length === 1 ? nextUrls[0] : null;
@@ -12739,7 +14944,9 @@ export class ImageViewer {
     renderTrigger,
     displayRequestId,
     decodedUnitKey,
-    slice = PageSlice.FULL
+    slice = PageSlice.FULL,
+    singletonPlacement = "center",
+    singletonGap = 0
   ) {
     const sequence = ++this.loadSequence;
     const requestKeys = request.cacheKey ? [request.cacheKey] : [];
@@ -12832,6 +15039,8 @@ export class ImageViewer {
           viewportHeight: this.stage.clientHeight || window.innerHeight,
           devicePixelRatio: request.dpr,
           maxRequestWidth: 8192,
+          gap: singletonPlacement === "center" ? 0 : singletonGap,
+          singletonPlacement,
         }).pages[0];
         resolvedInfo = actualInfo;
         request.cssWidth = resolvedLayout.cssWidth;
@@ -12851,11 +15060,21 @@ export class ImageViewer {
       }
       phase = "apply";
       this.resetTransform();
-      this.setLayout(request.fitMode, resolvedLayout, resolvedInfo, decodedImage, slice);
+      this.setLayout(
+        request.fitMode,
+        resolvedLayout,
+        resolvedInfo,
+        decodedImage,
+        slice,
+        singletonPlacement,
+        singletonGap
+      );
       decodedImage.style.transform = "none";
       const previousUrls = this.objectUrls.slice();
       this.pageLayer.replaceChildren(decodedImage);
       this.image = decodedImage;
+      this.images = [decodedImage];
+      this.syncWhiteCompanion();
       if (!nextLease && pendingObjectUrl) {
         nextLease = this.decodedUnitCache.adoptAndAcquire({
           unitKey: decodedUnitKey,
@@ -12973,7 +15192,8 @@ export class ImageViewer {
     renderTrigger,
     displayRequestId,
     decodedUnitKey,
-    slice = PageSlice.FULL
+    slice = PageSlice.FULL,
+    singletonPlacement = "center"
   ) {
     const sequence = ++this.loadSequence;
     const requestKeys = pages.map(({ request }) => request.cacheKey).filter(Boolean);
@@ -13087,6 +15307,8 @@ export class ImageViewer {
       this.fitMode = fitMode;
       this.stage.dataset.fitMode = fitMode;
       this.pageLayer.style.gap = `${resolvedLayout.gap}px`;
+      this.pageLayer.dataset.singletonPlacement = "center";
+      this.pageLayer.dataset.singletonGap = "0";
       this.setPageLayerSize(resolvedLayout.cssWidth, resolvedLayout.cssHeight);
       decodedImages.forEach((decoded, index) => {
         const layout = resolvedLayout.pages[index];
@@ -13113,6 +15335,7 @@ export class ImageViewer {
         if (nextLease) pendingUrls.length = 0;
       }
       this.images = decodedImages.map((decoded) => decoded.image);
+      this.syncWhiteCompanion();
       this.image = this.images[0];
       pageDemandAdapter.commitDisplay(displayRequestId);
       this.recordPageDisplay(
@@ -13955,7 +16178,11 @@ function currentVisualViewportScale() {
 }
 
 async function observedFetch(url, options = {}, sessionRecoveryAttempted = false) {
-  const { sessionEpochBound = false, ...requestOptions } = options;
+  const {
+    sessionEpochBound = false,
+    suppressErrorTelemetryFor = null,
+    ...requestOptions
+  } = options;
   const fetchOptions = {
     ...requestOptions,
     headers: remoteHeaders(requestOptions.headers),
@@ -14019,19 +16246,26 @@ async function observedFetch(url, options = {}, sessionRecoveryAttempted = false
         }
       }
     }
-    recordClientError(
-      "fetch_non_2xx",
-      new Error(`HTTP ${response.status} ${response.statusText}`),
-      {
-        resource: safeResourcePath(url),
-        status: response.status,
-      }
-    );
+    if (!suppressErrorTelemetryFor?.(response, detail)) {
+      recordClientError(
+        "fetch_non_2xx",
+        new Error(`HTTP ${response.status} ${response.statusText}`),
+        {
+          resource: safeResourcePath(url),
+          status: response.status,
+        }
+      );
+    }
   }
   return response;
 }
 
-async function fetchPageResource(request, signal, prefetch) {
+export async function fetchPageResource(
+  request,
+  signal,
+  prefetch,
+  hasPendingDisplayDemand = () => false
+) {
   const startedAt = performance.now();
   const options = {
     signal,
@@ -14041,7 +16275,13 @@ async function fetchPageResource(request, signal, prefetch) {
   };
   const response = prefetch
     ? await fetch(request.url, options)
-    : await observedFetch(request.url, { ...options, sessionEpochBound: true });
+    : await observedFetch(request.url, {
+      ...options,
+      sessionEpochBound: true,
+      suppressErrorTelemetryFor: (response, detail) =>
+        hasPendingDisplayDemand() &&
+        pageRequestIsDemandCongestion(response.status, detail.error),
+    });
   if (!response.ok) {
     throw await pageResourceResponseError(response);
   }
@@ -14052,8 +16292,12 @@ async function fetchPageResource(request, signal, prefetch) {
     error.code = "remote_session_unattested";
     throw error;
   }
-  requirePageResponseIdentity(request.address, response);
   requirePageResponseGeneration(request, response);
+  if (response.status === 204 &&
+      response.headers.get("X-mIV-Page-Skip") === "raw-prefetch") {
+    return { kind: "skipped" };
+  }
+  requirePageResponseIdentity(request.address, response);
   const width = Number(response.headers.get("X-mIV-Image-Width"));
   const height = Number(response.headers.get("X-mIV-Image-Height"));
   const pageRenderHeader = response.headers.get("X-mIV-Page-Render-Ms");
@@ -14530,4 +16774,61 @@ function median(values) {
   return sorted.length % 2
     ? sorted[middle]
     : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+// Entry point. Keep this block the last top-level statement of the module: boot() runs
+// screen cleanup synchronously, which reads module-level `const` / `let` bindings declared
+// throughout this file. Running it earlier hits their temporal dead zone (ReferenceError)
+// before any request or telemetry is sent, and the page stays blank.
+if (!RUNTIME_TEST_MODE) {
+  installDocumentDoubleTapOwner(document, {
+    onDecision: recordBrowserDoubleTapDecision,
+  });
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker
+      .register("/service-worker.js", { scope: "/", updateViaCache: "none" })
+      .catch(() => {});
+  }
+  updateKeyboardAvailability();
+  window.addEventListener("popstate", () => {
+    if (remoteSessionControlOwner.snapshot.status === "active") {
+      dispatchRoute().catch(() => {});
+    }
+  });
+  window.addEventListener("keydown", onGlobalKeyDown);
+  window.addEventListener(
+    "pointerdown",
+    (event) => {
+      state.remoteSessionUserActive = true;
+      recentPointerSource = {
+        source: pointerInputSource(event.pointerType),
+        at: performance.now(),
+      };
+    },
+    true
+  );
+
+  if (TELEMETRY_ENABLED) {
+    installTelemetry();
+  } else {
+    updateHud();
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible") {
+      reportVideoProgressBeforePageHide(state.viewer);
+      state.remoteSessionUserActive = false;
+      state.remoteAiController?.suspend();
+      state.archiveOpenController?.suspend();
+    } else if (state.authenticated) {
+      if (remoteSessionControlOwner.snapshot.status !== "active") return;
+      if (state.viewer?.isVideoStreamViewer) {
+        state.viewer.handleVisibilityResume().catch(() => {});
+      } else {
+        state.remoteAiController?.handleForegroundResume().catch(() => {});
+        state.archiveOpenController?.handleForegroundResume().catch(() => {});
+      }
+    }
+  });
+  recordRestoredFocusOnLoad();
+  boot();
 }

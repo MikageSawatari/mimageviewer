@@ -723,7 +723,11 @@ impl Drop for TmpCleanup<'_> {
 /// `no_clobber` が `true` のときは既存 `dst` を上書きしない (MoveFileExW から
 /// `MOVEFILE_REPLACE_EXISTING` を外し、dst が在れば失敗させる = atomic な no-clobber)。
 #[cfg(windows)]
-fn replace_file_atomic(tmp_path: &Path, dst: &Path, no_clobber: bool) -> std::io::Result<()> {
+pub(crate) fn replace_file_atomic(
+    tmp_path: &Path,
+    dst: &Path,
+    no_clobber: bool,
+) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
@@ -742,7 +746,11 @@ fn replace_file_atomic(tmp_path: &Path, dst: &Path, no_clobber: bool) -> std::io
 }
 
 #[cfg(not(windows))]
-fn replace_file_atomic(tmp_path: &Path, dst: &Path, no_clobber: bool) -> std::io::Result<()> {
+pub(crate) fn replace_file_atomic(
+    tmp_path: &Path,
+    dst: &Path,
+    no_clobber: bool,
+) -> std::io::Result<()> {
     if no_clobber {
         // atomic no-clobber: hard_link は dst が既存なら EEXIST で失敗する (POSIX link(2))。
         // link 成功時点で dst は変換結果を指す (publish 済み)。tmp の除去は best-effort に

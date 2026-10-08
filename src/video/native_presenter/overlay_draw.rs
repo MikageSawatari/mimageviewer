@@ -2319,7 +2319,24 @@ pub(super) fn draw_native_top_button(
     commands: &mut Vec<NativeOverlayCommand>,
 ) -> egui::Rect {
     draw_native_top_button_enabled(
-        ui, painter, x, y, width, height, gap, id, glyph, active, true, tooltip, command, commands,
+        ui,
+        painter,
+        x,
+        y,
+        width,
+        height,
+        gap,
+        id,
+        glyph,
+        active,
+        true,
+        tooltip,
+        command,
+        commands,
+        #[cfg(feature = "test-script")]
+        None,
+        #[cfg(feature = "test-script")]
+        None,
     )
 }
 
@@ -2339,6 +2356,13 @@ fn draw_native_top_button_enabled(
     tooltip: &str,
     command: NativeOverlayCommand,
     commands: &mut Vec<NativeOverlayCommand>,
+    #[cfg(feature = "test-script")] observation_out: Option<
+        &mut Option<crate::video::native_ui_smoke::NativeUiSmokeControlObservation>,
+    >,
+    #[cfg(feature = "test-script")] command_attribution_out: Option<(
+        crate::video::native_ui_smoke::NativeUiSmokeMessageMetadata,
+        &mut Option<crate::video::native_presenter::NativeUiSmokeCommandAttribution>,
+    )>,
 ) -> egui::Rect {
     let rect = egui::Rect::from_min_size(egui::pos2(*x, y), egui::vec2(width, height));
     let sense = if enabled {
@@ -2347,6 +2371,19 @@ fn draw_native_top_button_enabled(
         egui::Sense::hover()
     };
     let resp = ui.interact(rect, egui::Id::new(id), sense);
+    #[cfg(feature = "test-script")]
+    if let Some(observation_out) = observation_out {
+        *observation_out = Some(
+            crate::video::native_ui_smoke::NativeUiSmokeControlObservation {
+                rect: resp.rect,
+                interact_rect: resp.interact_rect,
+                clip_rect: ui.clip_rect(),
+                layer_id: resp.layer_id,
+                sense: resp.sense,
+                enabled: enabled && resp.enabled(),
+            },
+        );
+    }
     draw_overlay_button_bg(painter, rect, enabled && resp.hovered(), active);
     match glyph {
         NativeTopButtonGlyph::TileGrid => draw_overlay_tile_grid_icon(painter, rect),
@@ -2381,6 +2418,15 @@ fn draw_native_top_button_enabled(
     }
     let resp = resp.hover_tip_dark(tooltip);
     if enabled && resp.clicked() {
+        #[cfg(feature = "test-script")]
+        if let Some((metadata, attribution_out)) = command_attribution_out {
+            *attribution_out = Some(
+                crate::video::native_presenter::NativeUiSmokeCommandAttribution {
+                    command_index: commands.len(),
+                    metadata,
+                },
+            );
+        }
         commands.push(command);
     }
     *x -= width + gap;
@@ -2438,7 +2484,7 @@ pub(super) fn draw_native_bar_lock_button(
     rect: egui::Rect,
     id: &'static str,
     locked: bool,
-    tooltip: &'static str,
+    tooltip: &str,
     bar: crate::video::NativeVideoBar,
     commands: &mut Vec<NativeOverlayCommand>,
 ) -> egui::Rect {
@@ -3925,6 +3971,7 @@ pub(super) fn draw_native_normalize_progress(
     overlay_width_points: f32,
     overlay_height_points: f32,
     progress: &crate::video::normalize_types::NormalizeProgressSnapshot,
+    file_nav_rects: Option<[egui::Rect; 2]>,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
     egui::Area::new(egui::Id::new("native_video_normalize_progress"))
@@ -3952,7 +3999,11 @@ pub(super) fn draw_native_normalize_progress(
             );
             // 中央パネル
             let panel_w = 420.0_f32;
-            let panel_h = 110.0_f32;
+            let panel_h = if file_nav_rects.is_some() {
+                110.0
+            } else {
+                150.0
+            };
             let panel_rect =
                 egui::Rect::from_center_size(full_rect.center(), egui::vec2(panel_w, panel_h));
             painter.rect_filled(
@@ -4034,6 +4085,48 @@ pub(super) fn draw_native_normalize_progress(
             if cancel_resp.clicked() || ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
                 commands.push(NativeOverlayCommand::CancelNormalizeScan);
             }
+            // The modal owns pointer input. Recreate only the two file-navigation controls above
+            // its blocker, at the HUD positions when available and inside the panel otherwise.
+            // Both positions emit the ordinary NavigateItem command.
+            let nav_rects = file_nav_rects.unwrap_or_else(|| {
+                let size = egui::vec2(104.0, 28.0);
+                let y = panel_rect.max.y - size.y - 9.0;
+                [
+                    egui::Rect::from_min_size(
+                        egui::pos2(panel_rect.center().x - size.x - 6.0, y),
+                        size,
+                    ),
+                    egui::Rect::from_min_size(egui::pos2(panel_rect.center().x + 6.0, y), size),
+                ]
+            });
+            for (direction, rect, label) in [
+                (-1, nav_rects[0], "前の項目"),
+                (1, nav_rects[1], "次の項目"),
+            ] {
+                let response = ui.interact(
+                    rect,
+                    egui::Id::new(("native_video_normalize_file_nav", direction)),
+                    egui::Sense::click(),
+                );
+                draw_overlay_button_bg(&painter, rect, response.hovered(), false);
+                if file_nav_rects.is_some() {
+                    draw_overlay_arrow_icon(&painter, rect, direction);
+                } else {
+                    painter.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        label,
+                        egui::FontId::proportional(13.0),
+                        egui::Color32::WHITE,
+                    );
+                }
+                if response.hover_tip_dark(label).clicked() {
+                    commands.push(NativeOverlayCommand::NavigateItem {
+                        delta: direction,
+                        via_wheel: false,
+                    });
+                }
+            }
         });
 }
 
@@ -4065,6 +4158,7 @@ const NATIVE_TOP_BAR_RIGHT_PAD: f32 = 12.0;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct NativeTopBarLayout {
     pub(super) controls_rect: Option<egui::Rect>,
+    pub(super) vst_button_rect: Option<egui::Rect>,
     pub(super) text_rect: egui::Rect,
     pub(super) title_rect: Option<egui::Rect>,
     pub(super) subtitle_rect: Option<egui::Rect>,
@@ -4144,6 +4238,7 @@ pub(super) fn draw_top_bar_text_lines(
 
     NativeTopBarLayout {
         controls_rect,
+        vst_button_rect: None,
         text_rect,
         title_rect: title.as_ref().map(|(rect, _)| *rect),
         subtitle_rect: subtitle.as_ref().map(|(rect, _)| *rect),
@@ -4289,14 +4384,25 @@ pub(super) fn draw_native_top_bar(
     audio_only: bool,
     side_panel_mode: crate::settings::FsSidePanelMode,
     top_bar_locked: bool,
+    lock_suppressed: bool,
     dimmed: bool,
     commands: &mut Vec<NativeOverlayCommand>,
+    #[cfg(feature = "test-script")] native_top_panorama_observation_out: &mut Option<
+        crate::video::native_ui_smoke::NativeUiSmokeControlObservation,
+    >,
+    #[cfg(feature = "test-script")] native_top_panorama_button_up_metadata: Option<
+        crate::video::native_ui_smoke::NativeUiSmokeMessageMetadata,
+    >,
+    #[cfg(feature = "test-script")] native_top_panorama_command_attribution_out: &mut Option<
+        crate::video::native_presenter::NativeUiSmokeCommandAttribution,
+    >,
 ) -> NativeTopBarLayout {
     *panorama_projection_popup_rect_out = None;
     if panorama_pose.is_none() || audio_only {
         *panorama_projection_popup_open = false;
     }
     let mut panorama_projection_button_rect = None;
+    let mut vst_button_rect = None;
     let layout = egui::Area::new(egui::Id::new("native_video_top_bar"))
         .order(egui::Order::Foreground)
         .fixed_pos(egui::Pos2::ZERO)
@@ -4380,11 +4486,14 @@ pub(super) fn draw_native_top_bar(
                 lock_rect,
                 "native_top_bar_lock",
                 top_bar_locked,
-                if top_bar_locked {
-                    "上部情報バー固定を解除"
-                } else {
-                    "上部情報バーを固定表示"
-                },
+                &crate::ui_helpers::chrome_lock_hint(
+                    if top_bar_locked {
+                        "上部情報バー固定を解除"
+                    } else {
+                        "上部情報バーを固定表示"
+                    },
+                    lock_suppressed,
+                ),
                 crate::video::NativeVideoBar::Top,
                 commands,
             );
@@ -4455,6 +4564,11 @@ pub(super) fn draw_native_top_bar(
                 &display_mode_tooltip,
                 NativeOverlayCommand::TogglePanorama,
                 commands,
+                #[cfg(feature = "test-script")]
+                Some(native_top_panorama_observation_out),
+                #[cfg(feature = "test-script")]
+                native_top_panorama_button_up_metadata
+                    .map(|metadata| (metadata, native_top_panorama_command_attribution_out)),
             );
             include_native_top_bar_control(&mut controls_rect, panorama_rect);
             if let Some(pose) = panorama_pose.filter(|_| panorama_active) {
@@ -4520,6 +4634,10 @@ pub(super) fn draw_native_top_bar(
                     },
                     NativeOverlayCommand::ResetPanorama,
                     commands,
+                    #[cfg(feature = "test-script")]
+                    None,
+                    #[cfg(feature = "test-script")]
+                    None,
                 );
                 include_native_top_bar_control(&mut controls_rect, reset_rect);
             }
@@ -4539,6 +4657,10 @@ pub(super) fn draw_native_top_bar(
                     "表示位置と倍率をリセット",
                     NativeOverlayCommand::ResetVideoZoom,
                     commands,
+                    #[cfg(feature = "test-script")]
+                    None,
+                    #[cfg(feature = "test-script")]
+                    None,
                 );
                 include_native_top_bar_control(&mut controls_rect, reset_rect);
                 let scale_width = 48.0;
@@ -4625,6 +4747,10 @@ pub(super) fn draw_native_top_bar(
                     .as_str(),
                     NativeOverlayCommand::ToggleTileMode,
                     commands,
+                    #[cfg(feature = "test-script")]
+                    None,
+                    #[cfg(feature = "test-script")]
+                    None,
                 );
                 include_native_top_bar_control(&mut controls_rect, tile_rect);
                 let perf_rect = draw_native_top_button(
@@ -4663,6 +4789,7 @@ pub(super) fn draw_native_top_bar(
                     NativeOverlayCommand::ToggleVst3Gui,
                     commands,
                 );
+                vst_button_rect = Some(vst3_rect);
                 include_native_top_bar_control(&mut controls_rect, vst3_rect);
             }
             let layout = draw_top_bar_text_lines(
@@ -4696,7 +4823,9 @@ pub(super) fn draw_native_top_bar(
     } else {
         *panorama_projection_popup_open = false;
     }
-    layout.inner
+    let mut layout = layout.inner;
+    layout.vst_button_rect = vst_button_rect;
+    layout
 }
 
 pub(super) fn draw_native_top_bar_tile(
@@ -5747,6 +5876,7 @@ pub(super) fn draw_native_metadata_panel(
     commands: &mut Vec<NativeOverlayCommand>,
     click_to_show: bool,
     info_panel_locked: bool,
+    effective_info_panel_locked: bool,
 ) {
     let rect = native_metadata_panel_rect(
         overlay_width_points,
@@ -5812,10 +5942,16 @@ pub(super) fn draw_native_metadata_panel(
             } else {
                 "パネルを固定 (映像に重ねず、前後へ移動しても表示したまま)"
             };
-            if lock_response.on_hover_text(lock_hint).clicked() {
+            if lock_response
+                .on_hover_text(crate::ui_helpers::chrome_lock_hint(
+                    lock_hint,
+                    info_panel_locked && !effective_info_panel_locked,
+                ))
+                .clicked()
+            {
                 commands.push(NativeOverlayCommand::ToggleInfoPanelLock);
             }
-            if click_to_show && !info_panel_locked {
+            if click_to_show && !effective_info_panel_locked {
                 let close_rect = egui::Rect::from_min_size(
                     rect.right_top() + egui::vec2(-58.0, 6.0),
                     egui::vec2(24.0, 24.0),
@@ -5829,7 +5965,7 @@ pub(super) fn draw_native_metadata_panel(
                 draw_overlay_close_icon(painter, close_rect);
                 if response.on_hover_text("情報パネルを閉じる").clicked() {
                     *tag_picker_open = false;
-                    commands.push(NativeOverlayCommand::ToggleClickInfoOpen);
+                    commands.push(NativeOverlayCommand::CloseInfoPanel);
                 }
             }
 
@@ -5870,17 +6006,33 @@ pub(super) fn draw_native_metadata_panel(
                 metadata.deinterlace_status,
                 metadata.interlace_detected,
             );
-            let audio_label = match metadata.audio_codec.as_deref() {
-                Some(codec) if metadata.audio_bit_rate_bps > 0 => {
-                    format!(
-                        "{} ({})",
-                        codec,
-                        format_bitrate(metadata.audio_bit_rate_bps)
-                    )
-                }
-                Some(codec) => codec.to_string(),
-                None => "なし".to_string(),
-            };
+            let audio_label = metadata
+                .audio_track_rows
+                .iter()
+                .find(|row| row.is_current)
+                .map_or_else(
+                    || match metadata.audio_codec.as_deref() {
+                        Some(codec) if metadata.audio_bit_rate_bps > 0 => format!(
+                            "{} ({})",
+                            codec,
+                            format_bitrate(metadata.audio_bit_rate_bps)
+                        ),
+                        Some(codec) => codec.to_owned(),
+                        None => "なし".to_owned(),
+                    },
+                    |row| {
+                        let mut label = row.label.clone();
+                        if metadata.opened_audio_stream_index == Some(row.stream_index)
+                            && metadata.audio_bit_rate_bps > 0
+                        {
+                            label.push_str(&format!(
+                                " ({})",
+                                format_bitrate(metadata.audio_bit_rate_bps)
+                            ));
+                        }
+                        label
+                    },
+                );
             let mut rows = vec![
                 ("ファイル", metadata.file_name.clone()),
                 ("タイトル", title.to_string()),
@@ -5912,6 +6064,14 @@ pub(super) fn draw_native_metadata_panel(
                     "音声",
                     if metadata.probe_info_available {
                         audio_label
+                    } else {
+                        String::new()
+                    },
+                ),
+                (
+                    "音声トラック",
+                    if metadata.audio_track_count >= 2 {
+                        format!("{} 本", metadata.audio_track_count)
                     } else {
                         String::new()
                     },
@@ -7512,8 +7672,158 @@ pub(super) fn layout_truncated_to_width(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    #[test]
+    fn chrome_suppression_native_info_close_draws_hit_and_emits_explicit_close() {
+        use std::sync::{Arc, Mutex};
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_for_ui = Arc::clone(&captured);
+        let metadata = test_overlay_metadata(
+            String::new(),
+            Ok(crate::video::spherical_metadata::VideoPanoramaTrigger::Auto),
+        );
+        let mut picker_open = false;
+        let mut fonts_ready = false;
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1280.0, 720.0))
+            .build(move |ctx| {
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |_| {});
+                let mut commands = Vec::new();
+                draw_native_metadata_panel(
+                    ctx,
+                    1280.0,
+                    720.0,
+                    0.0,
+                    &metadata,
+                    &mut picker_open,
+                    &mut String::new(),
+                    &mut false,
+                    &mut None,
+                    &mut Vec::new(),
+                    &mut false,
+                    false,
+                    false,
+                    &mut commands,
+                    true,
+                    true,
+                    false,
+                );
+                captured_for_ui.lock().unwrap().extend(commands);
+            });
+        harness.run();
+        let close = harness
+            .ctx
+            .read_response(egui::Id::new("native_metadata_close"))
+            .expect("raw locked/effective unlocked must expose the close hit")
+            .rect
+            .center();
+        harness.hover_at(close);
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos: close,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        harness.run();
+        let commands = captured.lock().unwrap();
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, NativeOverlayCommand::CloseInfoPanel))
+                .count(),
+            1
+        );
+        assert!(!commands.iter().any(|command| matches!(
+            command,
+            NativeOverlayCommand::ToggleInfoPanelLock | NativeOverlayCommand::ToggleClickInfoOpen
+        )));
+    }
     use super::*;
+
+    #[test]
+    fn vst_button_pointer_down_up_emits_one_toggle_command() {
+        let commands = vst_button_pointer_commands_for_test();
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(commands[0], NativeOverlayCommand::ToggleVst3Gui));
+    }
+
+    pub(crate) fn vst_button_pointer_commands_for_test() -> Vec<NativeOverlayCommand> {
+        use std::sync::{Arc, Mutex};
+
+        {
+            let captured = Arc::new(Mutex::new((None::<egui::Rect>, Vec::new())));
+            let captured_for_ui = Arc::clone(&captured);
+            let mut fonts_ready = false;
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(1_200.0, 80.0))
+                .build(move |ctx| {
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    let mut commands = Vec::new();
+                    let mut popup_open = false;
+                    let mut popup_rect = None;
+                    let layout = draw_native_top_bar(
+                        ctx,
+                        1_200.0,
+                        80.0,
+                        0.0,
+                        100.0,
+                        None,
+                        None,
+                        None,
+                        &mut popup_open,
+                        &mut popup_rect,
+                        "test-video.mp4",
+                        false,
+                        true,
+                        true,
+                        false,
+                        crate::settings::FsSidePanelMode::Hover,
+                        false,
+                        false,
+                        false,
+                        &mut commands,
+                        #[cfg(feature = "test-script")]
+                        &mut None,
+                        #[cfg(feature = "test-script")]
+                        None,
+                        #[cfg(feature = "test-script")]
+                        &mut None,
+                    );
+                    *captured_for_ui.lock().unwrap() = (layout.vst_button_rect, commands);
+                });
+            harness.step();
+            let center = captured
+                .lock()
+                .unwrap()
+                .0
+                .expect("VST response rect")
+                .center();
+            harness.hover_at(center);
+            for pressed in [true, false] {
+                harness.event(egui::Event::PointerButton {
+                    pos: center,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            harness.step();
+            captured.lock().unwrap().1.clone()
+        }
+    }
 
     fn test_normal_top_bar_layout(
         width_points: f32,
@@ -7563,8 +7873,15 @@ mod tests {
                 audio_only,
                 crate::settings::FsSidePanelMode::Hover,
                 top_bar_locked,
+                false,
                 dimmed,
                 &mut commands,
+                #[cfg(feature = "test-script")]
+                &mut None,
+                #[cfg(feature = "test-script")]
+                None,
+                #[cfg(feature = "test-script")]
+                &mut None,
             ));
         });
         layout.expect("the native top bar must publish its drawn layout")
@@ -7596,6 +7913,9 @@ mod tests {
             video_decoder: "test".to_owned(),
             audio_codec: Some("aac".to_owned()),
             audio_bit_rate_bps: 192_000,
+            audio_track_rows: Vec::new(),
+            audio_track_count: 0,
+            opened_audio_stream_index: None,
             avg_fps: 23.976,
             bit_rate_bps: 4_000_000,
             chapter_count: 0,
@@ -7611,6 +7931,231 @@ mod tests {
             shortcuts: NativeOverlayShortcutLabels::default(),
             shortcut_help: Arc::new(NativeOverlayShortcutHelp::default()),
         }
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn native_top_panorama_observer_captures_the_actual_response_immediately() {
+        fn observe(
+            metadata: Option<&NativeOverlayMetadata>,
+        ) -> crate::video::native_ui_smoke::NativeUiSmokeControlObservation {
+            let ctx = egui::Context::default();
+            crate::ui_fonts::configure_fonts(&ctx);
+            let mut input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1_200.0, 80.0),
+                )),
+                ..Default::default()
+            };
+            input
+                .viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .unwrap()
+                .native_pixels_per_point = Some(1.5);
+            let mut observation = None;
+            let mut popup_open = false;
+            let mut popup_rect = None;
+            let mut commands = Vec::new();
+            for frame in 0..2 {
+                let _ = ctx.run(input.clone(), |ctx| {
+                    let _ = draw_native_top_bar(
+                        ctx,
+                        1_200.0,
+                        80.0,
+                        0.0,
+                        100.0,
+                        metadata,
+                        None,
+                        None,
+                        &mut popup_open,
+                        &mut popup_rect,
+                        "test-video.mp4",
+                        false,
+                        false,
+                        false,
+                        false,
+                        crate::settings::FsSidePanelMode::Hover,
+                        false,
+                        false,
+                        false,
+                        &mut commands,
+                        &mut observation,
+                        None,
+                        &mut None,
+                    );
+                });
+                if frame == 0 {
+                    assert!(
+                        !observation.as_ref().unwrap().enabled,
+                        "sizing pass is not interactive"
+                    );
+                }
+            }
+            observation.expect("native_top_panorama response observation")
+        }
+
+        let disabled = observe(None);
+        assert!(!disabled.enabled);
+        assert!(!disabled.sense.senses_click());
+        assert_eq!(disabled.rect, disabled.interact_rect);
+        assert!(disabled.clip_rect.contains(disabled.rect.center()));
+        assert_eq!(disabled.layer_id.order, egui::Order::Foreground);
+
+        let metadata = test_overlay_metadata(
+            "test".to_string(),
+            Err(crate::video::spherical_metadata::VideoPanoramaRejection::NotPanoramic),
+        );
+        let enabled = observe(Some(&metadata));
+        assert!(enabled.enabled);
+        assert!(enabled.sense.senses_click());
+        assert_eq!(enabled.rect.size(), egui::vec2(28.0, 28.0));
+        assert_eq!(enabled.rect, enabled.interact_rect);
+        assert!(enabled.clip_rect.contains(enabled.rect.center()));
+        assert_eq!(enabled.layer_id.order, egui::Order::Foreground);
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn native_top_panorama_click_attributes_only_its_exact_response_command_index() {
+        use egui_kittest::Harness;
+        use std::sync::{Arc, Mutex};
+
+        let metadata = test_overlay_metadata(
+            "test".to_string(),
+            Err(crate::video::spherical_metadata::VideoPanoramaRejection::NotPanoramic),
+        );
+        let metadata_state = Arc::new(Mutex::new(Some(metadata)));
+        let message_metadata = crate::video::native_ui_smoke::NativeUiSmokeMessageMetadata {
+            token: 0x4455,
+            receiver_hwnd: 0x200,
+            receiver_process_id: 17,
+            receiver_thread_id: 18,
+        };
+        let captured = Arc::new(Mutex::new((
+            Vec::<NativeOverlayCommand>::new(),
+            None::<crate::video::native_presenter::NativeUiSmokeCommandAttribution>,
+            None::<crate::video::native_ui_smoke::NativeUiSmokeControlObservation>,
+        )));
+        let captured_for_ui = Arc::clone(&captured);
+        let metadata_for_ui = Arc::clone(&metadata_state);
+        let mut fonts_ready = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1_200.0, 80.0))
+            .build(move |ctx| {
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                let mut commands = vec![NativeOverlayCommand::TogglePanorama];
+                let mut observation = None;
+                let mut attribution = None;
+                let mut popup_open = false;
+                let mut popup_rect = None;
+                let metadata = metadata_for_ui.lock().unwrap().clone();
+                let _ = draw_native_top_bar(
+                    ctx,
+                    1_200.0,
+                    80.0,
+                    0.0,
+                    100.0,
+                    metadata.as_ref(),
+                    None,
+                    None,
+                    &mut popup_open,
+                    &mut popup_rect,
+                    "test-video.mp4",
+                    false,
+                    false,
+                    false,
+                    false,
+                    crate::settings::FsSidePanelMode::Hover,
+                    false,
+                    false,
+                    false,
+                    &mut commands,
+                    &mut observation,
+                    Some(message_metadata),
+                    &mut attribution,
+                );
+                *captured_for_ui.lock().unwrap() = (commands, attribution, observation);
+            });
+        harness.step();
+        let center = captured
+            .lock()
+            .unwrap()
+            .2
+            .expect("actual native_top_panorama Response")
+            .rect
+            .center();
+        harness.hover_at(center);
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos: center,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        harness.step();
+        {
+            let captured = captured.lock().unwrap();
+            assert_eq!(captured.0.len(), 2);
+            assert!(
+                captured
+                    .0
+                    .iter()
+                    .all(|command| matches!(command, NativeOverlayCommand::TogglePanorama))
+            );
+            assert_eq!(
+                captured.1,
+                Some(
+                    crate::video::native_presenter::NativeUiSmokeCommandAttribution {
+                        command_index: 1,
+                        metadata: message_metadata,
+                    }
+                )
+            );
+        }
+
+        harness.run();
+        assert_eq!(
+            captured.lock().unwrap().1,
+            None,
+            "tag metadata must not attach to an unrelated later frame without Response.clicked()"
+        );
+
+        *metadata_state.lock().unwrap() = None;
+        harness.step();
+        let center = captured
+            .lock()
+            .unwrap()
+            .2
+            .expect("disabled native_top_panorama Response")
+            .rect
+            .center();
+        harness.hover_at(center);
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos: center,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        harness.step();
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.0.len(), 1);
+        assert!(matches!(
+            captured.0.first(),
+            Some(NativeOverlayCommand::TogglePanorama)
+        ));
+        assert_eq!(
+            captured.1, None,
+            "a disabled Response must not produce or inherit button attribution"
+        );
     }
 
     fn test_conditional_top_bar_layout(
@@ -7652,7 +8197,14 @@ mod tests {
                     crate::settings::FsSidePanelMode::Hover,
                     false,
                     false,
+                    false,
                     &mut commands,
+                    #[cfg(feature = "test-script")]
+                    &mut None,
+                    #[cfg(feature = "test-script")]
+                    None,
+                    #[cfg(feature = "test-script")]
+                    &mut None,
                 ));
             },
         );
@@ -7958,7 +8510,14 @@ mod tests {
                     crate::settings::FsSidePanelMode::Hover,
                     false,
                     false,
+                    false,
                     &mut commands,
+                    #[cfg(feature = "test-script")]
+                    &mut None,
+                    #[cfg(feature = "test-script")]
+                    None,
+                    #[cfg(feature = "test-script")]
+                    &mut None,
                 );
             });
         harness.run();

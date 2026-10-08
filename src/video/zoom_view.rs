@@ -5,7 +5,8 @@
 
 use super::display_metadata::VideoOrientation;
 
-pub const VIDEO_ZOOM_MIN_SCALE: f32 = 1.0;
+pub const VIDEO_ZOOM_MIN_SCALE: f32 = 0.1;
+pub const VIDEO_ZOOM_FIT_SCALE: f32 = 1.0;
 pub const VIDEO_ZOOM_MAX_SCALE: f32 = 16.0;
 
 const WHEEL_DELTA_PER_NOTCH: f32 = 120.0;
@@ -87,7 +88,7 @@ pub struct VideoZoomState {
 impl Default for VideoZoomState {
     fn default() -> Self {
         Self {
-            scale: VIDEO_ZOOM_MIN_SCALE,
+            scale: VIDEO_ZOOM_FIT_SCALE,
             center_normalized: [0.5, 0.5],
         }
     }
@@ -131,8 +132,7 @@ impl VideoZoomState {
     /// Apply a wheel delta while keeping the source coordinate under the pointer fixed.
     ///
     /// `pointer_in_region` is relative to the top-left of the actual video display region, not the
-    /// whole HWND. Clamp can intentionally break the fixed-point invariant at a pan boundary or on
-    /// an axis where the image fits and therefore must remain centered.
+    /// whole HWND. Clamp can intentionally break the fixed-point invariant at a pan boundary.
     pub fn apply_wheel(
         &mut self,
         delta: f32,
@@ -185,11 +185,14 @@ impl VideoZoomState {
         let Some(rect) = self.source_rect(region_size, source) else {
             return false;
         };
-        let previous = self.center_normalized;
+        let previous = [
+            (rect.origin[0] + rect.extent[0] * 0.5) / source.oriented_size[0],
+            (rect.origin[1] + rect.extent[1] * 0.5) / source.oriented_size[1],
+        ];
         let center = [
-            self.center_normalized[0] * source.oriented_size[0]
+            rect.origin[0] + rect.extent[0] * 0.5
                 - delta_points[0] * rect.extent[0] / region_size[0],
-            self.center_normalized[1] * source.oriented_size[1]
+            rect.origin[1] + rect.extent[1] * 0.5
                 - delta_points[1] * rect.extent[1] / region_size[1],
         ];
         self.set_center_source_pixels_clamped(center, region_size, source);
@@ -223,10 +226,14 @@ fn clamped_source_center(
 ) -> [f32; 2] {
     for axis in 0..2 {
         let source_axis = source.oriented_size[axis];
+        let half_extent = extent[axis] * 0.5;
         if extent[axis] >= source_axis {
-            center[axis] = source_axis * 0.5;
+            // Keep the whole source visible while allowing it to move through the letterbox space.
+            // At exact fit both bounds meet at the source center.
+            let min_center = source_axis - half_extent;
+            let max_center = half_extent;
+            center[axis] = center[axis].clamp(min_center, max_center);
         } else {
-            let half_extent = extent[axis] * 0.5;
             let min_center = MIN_VISIBLE_SOURCE_PIXELS - half_extent;
             let max_center = source_axis - MIN_VISIBLE_SOURCE_PIXELS + half_extent;
             center[axis] = center[axis].clamp(min_center, max_center);
@@ -298,6 +305,13 @@ mod tests {
             && rect.origin[1] + rect.extent[1] > 0.0
     }
 
+    fn rect_contains_source(rect: VideoZoomSourceRect, source: VideoZoomSourceGeometry) -> bool {
+        (0..2).all(|axis| {
+            rect.origin[axis] <= EPSILON
+                && rect.origin[axis] + rect.extent[axis] >= source.oriented_size[axis] - EPSILON
+        })
+    }
+
     #[test]
     fn wheel_keeps_the_source_coordinate_under_the_pointer_fixed() {
         let source = square_source(1000);
@@ -364,7 +378,7 @@ mod tests {
     #[test]
     fn source_rect_intersects_source_for_varied_regions_scales_and_stored_centers() {
         let source = VideoZoomSourceGeometry::new(1920, 1080, 1, 1, VideoOrientation::IDENTITY);
-        for scale in [1.0, 1.5, 4.0, 16.0] {
+        for scale in [0.1, 0.5, 1.0, 1.5, 4.0, 16.0] {
             for region in [[1920.0, 1080.0], [3840.0, 1080.0], [900.0, 1600.0]] {
                 for center_normalized in
                     [[-2.0, -2.0], [0.0, 1.0], [0.5, 0.5], [1.0, 0.0], [3.0, 3.0]]
@@ -378,6 +392,16 @@ mod tests {
                         rect_intersects_source(rect, source),
                         "scale={scale} region={region:?} center={center_normalized:?} rect={rect:?}"
                     );
+                    for axis in 0..2 {
+                        if rect.extent[axis] >= source.oriented_size[axis] {
+                            assert!(
+                                rect.origin[axis] <= EPSILON
+                                    && rect.origin[axis] + rect.extent[axis]
+                                        >= source.oriented_size[axis] - EPSILON,
+                                "a fit/sub-fit axis must contain the whole source: scale={scale} region={region:?} center={center_normalized:?} rect={rect:?}"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -438,31 +462,152 @@ mod tests {
     }
 
     #[test]
-    fn scale_is_clamped_to_fit_and_sixteen_times_fit() {
+    fn scale_is_clamped_to_one_tenth_and_sixteen_times_fit() {
         let source = square_source(1000);
         let region = [1000.0, 1000.0];
         let mut state = VideoZoomState::new();
 
-        assert!(!state.apply_wheel(-120.0, [500.0, 500.0], region, source));
+        assert_close(state.scale(), VIDEO_ZOOM_FIT_SCALE);
+        assert!(state.apply_wheel(-120.0, [500.0, 500.0], region, source));
+        assert_close(state.scale(), VIDEO_ZOOM_FIT_SCALE / WHEEL_SCALE_PER_NOTCH);
+        assert!(state.apply_wheel(-120.0 * 100.0, [500.0, 500.0], region, source));
         assert_close(state.scale(), VIDEO_ZOOM_MIN_SCALE);
+        assert!(!state.apply_wheel(-120.0, [500.0, 500.0], region, source));
         assert!(state.apply_wheel(120.0 * 100.0, [500.0, 500.0], region, source));
         assert_close(state.scale(), VIDEO_ZOOM_MAX_SCALE);
         assert!(!state.apply_wheel(120.0, [500.0, 500.0], region, source));
     }
 
     #[test]
-    fn fitting_axis_recenters_when_zooming_back_to_minimum() {
+    fn sub_fit_drag_moves_the_source_but_keeps_it_fully_visible() {
         let source = square_source(1000);
         let region = [1000.0, 1000.0];
         let mut state = VideoZoomState::new();
-        state.apply_wheel(480.0, [500.0, 500.0], region, source);
-        state.apply_drag([300.0, -200.0], region, source);
-        assert_ne!(state.center_normalized(), [0.5, 0.5]);
-
-        state.apply_wheel(-12_000.0, [500.0, 500.0], region, source);
+        assert!(state.apply_wheel(-12_000.0, [500.0, 500.0], region, source));
 
         assert_close(state.scale(), VIDEO_ZOOM_MIN_SCALE);
         assert_eq!(state.center_normalized(), [0.5, 0.5]);
+        assert!(state.apply_drag([400.0, -300.0], region, source));
+        assert_ne!(state.center_normalized(), [0.5, 0.5]);
+        assert!(rect_contains_source(
+            state.source_rect(region, source).unwrap(),
+            source
+        ));
+
+        assert!(state.apply_drag([100_000.0, 100_000.0], region, source));
+        let first = state.source_rect(region, source).unwrap();
+        assert_close(first.origin[0] + first.extent[0], source.oriented_size[0]);
+        assert_close(first.origin[1] + first.extent[1], source.oriented_size[1]);
+        assert!(rect_contains_source(first, source));
+
+        assert!(state.apply_drag([-200_000.0, -200_000.0], region, source));
+        let last = state.source_rect(region, source).unwrap();
+        assert_close(last.origin[0], 0.0);
+        assert_close(last.origin[1], 0.0);
+        assert!(rect_contains_source(last, source));
+
+        let resized = state.source_rect([1600.0, 900.0], source).unwrap();
+        assert!(rect_contains_source(resized, source));
+    }
+
+    #[test]
+    fn fit_letterbox_axis_can_pan_while_exact_fit_axis_stays_centered() {
+        let source = VideoZoomSourceGeometry::new(1920, 1080, 1, 1, VideoOrientation::IDENTITY);
+        let region = [1000.0, 1000.0];
+        let mut state = VideoZoomState::new();
+
+        assert!(state.apply_drag([500.0, 500.0], region, source));
+        let rect = state.source_rect(region, source).unwrap();
+        assert_close(rect.origin[0], 0.0);
+        assert_close(rect.origin[1] + rect.extent[1], source.oriented_size[1]);
+        assert!(rect_contains_source(rect, source));
+    }
+
+    #[test]
+    fn sub_fit_wheel_keeps_the_pointer_anchor_until_the_containment_boundary() {
+        let source = square_source(1000);
+        let region = [1000.0, 1000.0];
+        let pointer = [250.0, 750.0];
+        let fraction = [0.25, 0.75];
+        let mut state = VideoZoomState {
+            scale: 0.5,
+            center_normalized: [0.4, 0.6],
+        };
+        let before = state
+            .source_rect(region, source)
+            .unwrap()
+            .source_at_region_fraction(fraction);
+
+        assert!(state.apply_wheel(-120.0, pointer, region, source));
+
+        let after_rect = state.source_rect(region, source).unwrap();
+        let after = after_rect.source_at_region_fraction(fraction);
+        assert_close(after[0], before[0]);
+        assert_close(after[1], before[1]);
+        assert!(rect_contains_source(after_rect, source));
+    }
+
+    #[test]
+    fn resized_sub_fit_pan_starts_from_the_currently_drawn_center() {
+        let source = VideoZoomSourceGeometry::new(1920, 1080, 1, 1, VideoOrientation::IDENTITY);
+        let wide_region = [3840.0, 1080.0];
+        let resized_region = [1920.0, 1080.0];
+        let mut state = VideoZoomState {
+            scale: 0.5,
+            center_normalized: [0.5, 0.5],
+        };
+        assert!(state.apply_drag([-100_000.0, 0.0], wide_region, source));
+        assert_close(state.center_normalized()[0], 2.0);
+
+        let before = state.source_rect(resized_region, source).unwrap();
+        assert_close(before.origin[0], 0.0);
+        assert!(state.apply_drag([100.0, 0.0], resized_region, source));
+        let after = state.source_rect(resized_region, source).unwrap();
+
+        assert!(after.origin[0] < before.origin[0]);
+        assert!(rect_contains_source(after, source));
+        assert_close(state.center_normalized()[0], 1720.0 / 1920.0);
+    }
+
+    #[test]
+    fn zooming_from_an_expanded_edge_into_sub_fit_is_finite_and_deterministic() {
+        let source = square_source(1000);
+        let region = [1000.0, 1000.0];
+        let mut state = VideoZoomState::new();
+        assert!(state.apply_wheel(120.0 * 8.0, [500.0, 500.0], region, source));
+        assert!(state.apply_drag([-100_000.0, 100_000.0], region, source));
+
+        assert!(state.apply_wheel(-12_000.0, [900.0, 100.0], region, source));
+
+        let first = state.source_rect(region, source).unwrap();
+        let second = state.source_rect(region, source).unwrap();
+        assert_eq!(first, second);
+        assert!(rect_contains_source(first, source));
+        assert!(state.center_normalized().into_iter().all(f32::is_finite));
+    }
+
+    #[test]
+    fn sub_fit_rotated_sar_rect_is_finite_movable_and_contained() {
+        let source = VideoZoomSourceGeometry::new(720, 480, 4, 3, VideoOrientation::new(90, false));
+        let region = [1280.0, 720.0];
+        let mut state = VideoZoomState::new();
+        assert!(state.apply_wheel(-12_000.0, [900.0, 200.0], region, source));
+        let before_drag = state.center_normalized();
+        assert!(state.apply_drag([240.0, -160.0], region, source));
+        assert_ne!(state.center_normalized(), before_drag);
+
+        let rect = state.source_rect(region, source).unwrap();
+        assert!(
+            rect.origin
+                .into_iter()
+                .chain(rect.extent)
+                .all(f32::is_finite)
+        );
+        assert!(rect_contains_source(rect, source));
+        assert!(rect_contains_source(
+            state.source_rect([720.0, 1280.0], source).unwrap(),
+            source
+        ));
     }
 
     #[test]
@@ -476,5 +621,7 @@ mod tests {
         state.reset();
 
         assert_eq!(state, VideoZoomState::new());
+        assert_close(state.scale(), VIDEO_ZOOM_FIT_SCALE);
+        assert_eq!(state.center_normalized(), [0.5, 0.5]);
     }
 }

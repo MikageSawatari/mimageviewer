@@ -169,6 +169,9 @@ pub use epi::*;
 
 pub(crate) mod stopwatch;
 
+#[doc(hidden)]
+pub mod startup_window_observer;
+
 // ----------------------------------------------------------------------------
 // When compiling for web
 

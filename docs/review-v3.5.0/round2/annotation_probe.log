@@ -1,0 +1,2 @@
+comic_source_dims=None: output=32x32 red_bounds=(6, 6, 10, 9) at_expected_center=[0, 0, 0, 255] at_original_center=[255, 0, 0, 255]
+comic_source_dims=Some([16, 16]): output=32x32 red_bounds=(12, 12, 20, 19) at_expected_center=[255, 0, 0, 255] at_original_center=[0, 0, 0, 255]

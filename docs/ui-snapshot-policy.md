@@ -27,6 +27,18 @@ UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot
 更新後は `tests/snapshots/*.png` の差分を必ず目視確認してからコミットする。
 git diff のバイナリ比較では変化の意図 (改善なのか回帰なのか) は判断できない。
 
+詳細一覧の名前色 (§1.346) は `details_name_colors_*` と `details_name_color_settings_*` の
+Light／Dark × 標準／強い、計8枚を保持する。前者は六分類・長い日本語名・hover・選択・チェック・
+切り取り・選択情報バー・カスタム・OFF、後者は本体と共通の環境設定表・比・警告・強い固定色を描く。
+`cut_item_appearance_light/dark` は名前が不透明、他列とプレビューが薄い境界を合わせて確認する。
+名前色の追加8枚は合計1,157,523 bytes (約1.10 MiB)。一覧620×580、設定表760×800で全項目を収める。
+`preferences_favorite_view_state_dark` は同じページ全体を縦スクロールするため、名前色表を追加すると
+スクロールバーのつまみが短くなる。既存本文が変わらないことを差分画像で確認して期待画像を更新する。
+
+外部ツールの `{file_list}` (§1.329) は `external_tool_file_list_help_light/dark` と
+`external_tool_preparing_light/dark` の4枚を追加する。本体と同じ記法説明・準備中の件数・
+キャンセルボタンを描き、アプリの起動や外部プロセスの実起動は行わない。
+
 ## ディレクトリ構成
 
 ```
@@ -86,6 +98,31 @@ point へ換算して描画する。同じ snapshot の「動画・音声 HUD」
 - 小さすぎるとラベルが折り返しで消えて検出不能になる
 - 大きすぎると PNG が肥大化してリポジトリが重くなる
 
+起動時ダイアログの小画面回帰は例外として **1093×614 / 1366×728 logical points** を使う。
+`startup_dialogs_small_viewport` は App を構築せず、本体と共有する Modal/Window 描画関数を
+固定フィクスチャで呼び、本体のUI倍率100%/200%を固定画面へ適用する。
+27状態×2サイズ×2倍率の108ケースすべてで、固定操作行の全ボタンとタイトル×を、
+viewport/clip内の矩形・hover・mouse clickで検査する。到達性はこのgeometry検査で保証する。
+Remote reader再接続、起動時書庫変換の各phase、disabled変換も含む。
+共通本文の別の回帰検査で、小/大画面の100%/200%における長文の本文高（viewport高の45%以上）と
+短文の自然高への縮小も確認する。操作ボタンだけ可視でも、本文が不必要に小さければ失敗する。
+幅200ptへ縮めたWindowの長い操作ボタンと復元一覧の説明の折り返しも、100%/200%で
+固定操作のviewport/clipを検査する。本文高は縮小後の実割当高を測り、操作行を含めない。
+PNGは初回設定/書庫変換確認の1093×614・100%/200%の代表4枚と、
+意図的に更新した変更点の100%・2サイズの2枚だけを保持する。
+ほかの状態/サイズ/倍率にはsnapshot呼び出しもbaselineも増やさず、geometry検査を維持する。
+対象と除外を [起動時画面の監査](startup-dialog-small-screen.md) に列挙する。
+長いエラー文・ネットワークパス・全バージョンの累積告知を含める。
+初回設定のクリック到達性と IME-safe Enter / Esc は `--lib first_setup` の回帰テストで検査する。
+表示後の縮小/拡大は、同じContextを1920×1440→1093×614→1920×1440→1093×614と変更し、
+全27状態の固定操作とタイトル×を最大2frame後に検査する。初回設定は本体フォントで見出しも
+検査し、最終layout pass内でResponseを採取する。Context::run終了後のread_responseはdiscard
+されたpassのwidgetを優先し得るため、過去passの矩形を現在の描画として検査しない。
+通常の2passでは縮小したframe内に収まり、pass予算1の検査は強制frameを足さずrepaint scheduler
+だけで再配置/hover/clickへ到達することを確認する。追加PNGは作らず代表6枚の比較を維持する。
+実アプリや認定端末での観測とは区別する。ダイアログの設計要件は CLAUDE.md の
+「ダイアログ (egui::Window)」節を参照。
+
 ### 4. 文字列や色のリテラルはフィクスチャに集約
 
 複数テストで共通するプラグイン情報などは `*_fixture()` ヘルパー関数に切り出す。
@@ -102,7 +139,9 @@ point へ換算して描画する。同じ snapshot の「動画・音声 HUD」
 
 ## リポジトリサイズ管理
 
-PNG は現状 1 ファイル 5〜10 KB 程度。100 ファイル程度までは許容する想定。
+PNG の容量は画面サイズや文字量によって変わるため、追加時に枚数と合計容量を確認する。
+画面サイズ・倍率・状態の組合せはgeometry/操作の検査を中心にし、PNGは見た目を確認する
+少数の代表画面へ絞る。起動時ダイアログは上記6枚を保持し、108条件へPNGを増やさない。
 肥大化してきた場合:
 
 - サイズを縮小 (例: 480×240 に変更)
@@ -122,18 +161,21 @@ CJK フォントを自前で vendored するか `Noto Sans CJK` をインスト�
   スナップショットは現状対応外。メインビューポートと別管理のためハーネスで
   扱いづらい。必要になったら `Harness` の `run_steps` を複数サイクル回す方式で
   試す。
-- **画像コンテンツ**を描画する UI (グリッドセル等) は、画像パスが通らないため
-  スナップショット対象外。モックテクスチャを渡すテストは将来的に検討。
+- **実ファイルの読み込みを伴う画像 UI** (グリッドセル等) は、この純描画 harness の対象外。
+  読み込みを行わず固定の生成 texture を渡す純描画は検証できる。別バージョンの一時表示は
+  `src/ui_fullscreen.rs::tests::similar_preview_navigator_snapshot_dark` で geometry と navigator
+  paint を共有し、本文の clip と可視範囲枠を確認する。App・worker・native GPU の検証とは区別する。
 
-## lib (`tests/`) vs bin (`src/` 内 `#[cfg(test)]`) の使い分け
+## integration test と lib unit test の使い分け
 
-`tests/ui_snapshot.rs` は **lib crate** から見えるもの (`mimageviewer::*` の pub API)
-だけテストできる。`src/lib.rs` には bin 専属の `app` module を **stub だけ** 置いて
-あり、`App::draw_local_adjust_*` のような `pub(crate)` panel render 関数には届かない。
+`tests/ui_snapshot.rs` は外部の integration test なので、lib crate が公開する
+`mimageviewer::*` の pub API だけを利用できる。現在の `src/lib.rs` は実際の `app`
+module を含み、実行ファイルは薄い入口である。ただし `app` module は非公開で、
+`App::draw_local_adjust_*` のような `pub(crate)` 関数は integration test から直接呼べない。
 
-このため、bin (= App や `pub(crate) fn`) に閉じた UI のスナップショットを撮りたい
-ときは、**bin test (`src/<module>.rs` 内 `#[cfg(test)] mod`) の中で直接
-`egui_kittest::Harness` を使う**:
+crate 内部の純粋な UI 描画をスナップショットしたいときは、**lib unit test
+(`src/<module>.rs` 内 `#[cfg(test)] mod`) の中で直接 `egui_kittest::Harness` を使う**。
+これは App 全体を構築する snapshot を許可するものではなく、対象は上記の純粋な描画関数とする:
 
 ```rust
 // src/ui_adjustment_panel.rs::local_adjust_segmentation_tests 内
@@ -160,11 +202,11 @@ fn local_adjust_panel_snapshot_empty_layer_list() {
 }
 ```
 
-スナップショットは **同じ `tests/snapshots/<name>.png`** に保存される (lib テストと
-bin テストでディレクトリ共有)。**`UPDATE_SNAPSHOTS=1`** も同じ:
+スナップショットは **同じ `tests/snapshots/<name>.png`** に保存される (integration test と
+lib unit test でディレクトリ共有)。**`UPDATE_SNAPSHOTS=1`** も同じ:
 
 ```bash
-UPDATE_SNAPSHOTS=1 cargo test --bin mimageviewer-core local_adjust_panel_snapshot
+UPDATE_SNAPSHOTS=1 cargo test -p mimageviewer --lib local_adjust_panel_snapshot
 ```
 
 実例: `src/ui_adjustment_panel.rs::local_adjust_segmentation_tests::local_adjust_panel_snapshot_*`

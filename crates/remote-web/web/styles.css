@@ -653,6 +653,17 @@ select {
   padding-bottom: 18px;
 }
 
+.organize-destinations {
+  display: grid;
+  gap: 12px;
+}
+
+.organize-destinations h3 {
+  margin: 4px 0 0;
+  font-size: 1rem;
+  color: var(--muted);
+}
+
 .place-separator {
   width: 100%;
   height: 1px;
@@ -1317,6 +1328,29 @@ select {
   justify-content: center;
   transform-origin: center;
   will-change: transform;
+}
+
+.viewer-pages[data-singleton-placement="left"] {
+  justify-content: flex-start;
+}
+
+.viewer-pages[data-singleton-placement="left_white"] {
+  justify-content: flex-start;
+}
+
+.viewer-pages[data-singleton-placement="right_white"] {
+  justify-content: flex-end;
+}
+
+.viewer-white-companion {
+  flex: 0 0 auto;
+  align-self: center;
+  background: #fff;
+  pointer-events: none;
+}
+
+.viewer-pages[data-singleton-placement="right"] {
+  justify-content: flex-end;
 }
 
 .viewer-boundary-message {
@@ -3024,3 +3058,12 @@ button:not(.grid-tile):focus-visible {
   background: transparent;
   color: #a1a1aa;
 }
+
+/* The fallback is independent of the optional mark painted over loaded audio art. */
+.audio-art-fallback { position: absolute; z-index: 1; }
+.tile-preview.thumb-loaded .audio-art-fallback { visibility: hidden; }
+.audio-art-indicator { visibility: hidden; position: absolute; z-index: 2; }
+.tile-preview.thumb-loaded .audio-art-indicator { visibility: visible; }
+svg.audio-art-indicator { width: 32px; height: 32px; right: 8px; bottom: 8px; }
+
+.audio-art-indicator.type-badge { left: 8px; right: auto; bottom: 8px; }

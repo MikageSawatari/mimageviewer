@@ -18,6 +18,21 @@ export const CommandName = Object.freeze({
   SPREAD_RTL_COVER: "spread_rtl_cover",
   SPREAD_SPLIT_LTR: "spread_split_ltr",
   SPREAD_SPLIT_RTL: "spread_split_rtl",
+  FINAL_COVER_FOLLOW_GLOBAL: "final_cover_follow_global",
+  FINAL_COVER_ON: "final_cover_on",
+  FINAL_COVER_OFF: "final_cover_off",
+  SINGLETON_PLACEMENT_FOLLOW_GLOBAL: "singleton_placement_follow_global",
+  SINGLETON_LAST_FOLLOW_GLOBAL: "singleton_last_follow_global",
+  SINGLETON_LAST_PLACE: "singleton_last_place",
+  SINGLETON_LAST_CENTER: "singleton_last_center",
+  SINGLETON_PLACEMENT_PLACE: "singleton_placement_place",
+  SINGLETON_PLACEMENT_CENTER: "singleton_placement_center",
+  PAGE_AFTER_COVER_FOLLOW_GLOBAL: "page_after_cover_follow_global",
+  PAGE_AFTER_COVER_ON: "page_after_cover_on",
+  PAGE_AFTER_COVER_OFF: "page_after_cover_off",
+  LAST_PAGE_ALONE_FOLLOW_GLOBAL: "last_page_alone_follow_global",
+  LAST_PAGE_ALONE_ON: "last_page_alone_on",
+  LAST_PAGE_ALONE_OFF: "last_page_alone_off",
   SET_TRANSFORM: "set_transform",
   PAN_BY: "pan_by",
   TOGGLE_MENU: "toggle_menu",
@@ -49,6 +64,7 @@ export const CommandName = Object.freeze({
   MEDIA_SEEK_RELATIVE: "media_seek_relative",
   MEDIA_VOLUME: "media_volume",
   MEDIA_QUALITY: "media_quality",
+  MEDIA_AUDIO_TRACK: "media_audio_track",
 });
 
 export const FitMode = Object.freeze({
@@ -1203,6 +1219,7 @@ export function viewerSpreadLayout({
   viewportHeight,
   devicePixelRatio,
   gap = 0,
+  singletonPlacement = "center",
   maxRequestWidth = 8192,
 }) {
   const sources = (pages ?? []).map((page) => ({
@@ -1211,19 +1228,36 @@ export function viewerSpreadLayout({
   }));
   if (!sources.length) return { pages: [], gap: 0 };
   if (sources.length === 1) {
-    const page = viewerImageLayout({
-      mode,
-      sourceWidth: sources[0].width,
-      sourceHeight: sources[0].height,
-      viewportWidth,
-      viewportHeight,
-      devicePixelRatio,
-      maxRequestWidth,
-    });
+    const whiteCompanion = ["left_white", "right_white"].includes(singletonPlacement);
+    const placement = ["left", "right"].includes(singletonPlacement)
+      ? singletonPlacement
+      : whiteCompanion ? singletonPlacement.replace("_white", "")
+      : "center";
+    const resolvedGap = placement === "center" ? 0 : Math.max(0, Number(gap) || 0);
+    const availableWidth = Math.max(1, Number(viewportWidth) || 1);
+    const availableHeight = Math.max(1, Number(viewportHeight) || 1);
+    const source = sources[0];
+    const virtualSourceWidth = placement === "center" ? source.width : source.width * 2;
+    const contentWidth = Math.max(1, availableWidth - resolvedGap);
+    const scale = mode === FitMode.ORIGINAL
+      ? 1
+      : mode === FitMode.WIDTH
+        ? contentWidth / virtualSourceWidth
+        : Math.min(contentWidth / virtualSourceWidth, availableHeight / source.height);
+    const dpr = Math.max(0.25, Number(devicePixelRatio) || 1);
+    const page = {
+      cssWidth: source.width * scale,
+      cssHeight: source.height * scale,
+      requestWidth: Math.max(
+        1,
+        Math.min(maxRequestWidth, Math.ceil(source.width * scale * (mode === FitMode.ORIGINAL ? 1 : dpr)))
+      ),
+    };
     return {
       pages: [page],
-      gap: 0,
-      cssWidth: page.cssWidth,
+      gap: resolvedGap,
+      singletonPlacement: whiteCompanion ? singletonPlacement : placement,
+      cssWidth: placement === "center" ? page.cssWidth : page.cssWidth * 2 + resolvedGap,
       cssHeight: page.cssHeight,
     };
   }
@@ -1259,6 +1293,7 @@ export function viewerSpreadLayout({
     gap: resolvedGap,
     cssWidth: pageLayouts.reduce((sum, page) => sum + page.cssWidth, 0) + resolvedGap,
     cssHeight,
+    singletonPlacement: "center",
   };
 }
 
@@ -2620,12 +2655,15 @@ export function pageResourceAdmissionPlan({
 
 export const FOREGROUND_ADMISSION_RETRY_LIMIT = 3;
 
-/// 503 は「いま容量が無い」であって、その要求が無効だという返事ではない。
-/// remote-web の admission は `ipc_busy`、本体側の混雑は `miv_media_error` として
-/// 届く。コード名で絞ると本体由来の混雑を終端失敗として扱い、そのページを計画から
-/// 落としてしまう (実機で「次の 1 枚だけ穴が空く」形で観測)。
+/// All 503 responses retain the legacy bounded retry behavior. Named admission
+/// congestion gets additional retries only while a display member still needs it.
 export function pageRequestIsTransientlyBusy(status) {
   return Number(status) === 503;
+}
+
+export function pageRequestIsDemandCongestion(status, errorCode) {
+  return Number(status) === 503 &&
+    ["ipc_busy", "admission_busy", "raw_busy"].includes(errorCode);
 }
 
 /// A displayed page must not fail because the server was momentarily full. Honour

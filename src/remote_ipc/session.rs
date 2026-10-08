@@ -143,7 +143,53 @@ impl ReleaseReason {
 struct OperationState {
     description: String,
     started: bool,
-    cancel: Arc<AtomicBool>,
+    cancel: RemoteOperationCancelSource,
+}
+
+#[derive(Clone, Debug)]
+struct RemoteOperationCancelSource {
+    flag: Arc<AtomicBool>,
+    wake_tx: crossbeam_channel::Sender<()>,
+}
+
+impl RemoteOperationCancelSource {
+    fn cancel(&self) {
+        self.flag.store(true, Ordering::Release);
+        let _ = self.wake_tx.try_send(());
+    }
+}
+
+/// Operation cancellation with both a cheap polling predicate and an immediate blocking wake.
+#[derive(Clone, Debug)]
+pub(crate) struct RemoteOperationCancellation {
+    flag: Arc<AtomicBool>,
+    wake_rx: crossbeam_channel::Receiver<()>,
+}
+
+impl RemoteOperationCancellation {
+    #[cfg(test)]
+    pub(crate) fn for_test() -> (Self, crossbeam_channel::Sender<()>) {
+        let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
+        (
+            Self {
+                flag: Arc::new(AtomicBool::new(false)),
+                wake_rx,
+            },
+            wake_tx,
+        )
+    }
+
+    pub(crate) fn flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.flag)
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn wake_receiver(&self) -> crossbeam_channel::Receiver<()> {
+        self.wake_rx.clone()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -195,6 +241,7 @@ impl RemoteStreamingControlError {
 
 #[derive(Debug)]
 struct SessionStateMachine {
+    raw_prefetch: Weak<super::raw_prefetch::RemoteRawPrefetchRegistry>,
     lifecycle: RemoteControlLifecycle,
     active: Option<ActiveSession>,
     last_owner: Option<String>,
@@ -203,16 +250,22 @@ struct SessionStateMachine {
     next_operation: u64,
     next_streaming_registration: u64,
     acquisition_sequence: u64,
+    #[cfg(windows)]
+    gui_gate: Option<Weak<crate::effetune::gui_gate::GuiGate>>,
     control_return_sequence: u64,
     drain_reason: Option<ReleaseReason>,
     drain_started_at: Option<Duration>,
     next_drain_log_at: Duration,
     app_drain_complete: bool,
+    /// Process-final absorbing gate. Once set, no later acquire may create an
+    /// owner after the App has relinquished its UI resources.
+    app_retired: bool,
 }
 
 impl Default for SessionStateMachine {
     fn default() -> Self {
         Self {
+            raw_prefetch: Weak::new(),
             lifecycle: RemoteControlLifecycle::default(),
             active: None,
             last_owner: None,
@@ -221,22 +274,47 @@ impl Default for SessionStateMachine {
             next_operation: 1,
             next_streaming_registration: 1,
             acquisition_sequence: 0,
+            #[cfg(windows)]
+            gui_gate: None,
             control_return_sequence: 0,
             drain_reason: None,
             drain_started_at: None,
             next_drain_log_at: Duration::from_secs(3),
             app_drain_complete: false,
+            app_retired: false,
         }
     }
 }
 
 impl SessionStateMachine {
+    fn transition_lifecycle(
+        &mut self,
+        transition: RemoteControlTransition,
+    ) -> Result<(), RemoteControlTransitionError> {
+        self.lifecycle.transition(transition)?;
+        if transition == RemoteControlTransition::BeginAcquire {
+            self.acquisition_sequence = self.acquisition_sequence.wrapping_add(1);
+        }
+        #[cfg(windows)]
+        if let Some(gate) = self.gui_gate.as_ref().and_then(Weak::upgrade) {
+            gate.publish_remote_with_revision(
+                Some(self.acquisition_sequence),
+                self.lifecycle.phase.blocks_local_control(),
+                transition == RemoteControlTransition::BeginAcquire,
+            );
+        }
+        Ok(())
+    }
+
     fn acquire(
         &mut self,
         now: Duration,
         connected_unix_ms: u64,
         request: SessionAcquireRequest,
     ) -> SessionResponse {
+        if self.app_retired {
+            return session_closing_response();
+        }
         match self.lifecycle.phase {
             // The previous owner's resources still belong to that drain. A new acquire is a
             // waiter, not a second BeginDrain transition, and must not replace its reason.
@@ -255,14 +333,12 @@ impl SessionStateMachine {
             return session_closing_response();
         }
         if self
-            .lifecycle
-            .transition(RemoteControlTransition::BeginAcquire)
+            .transition_lifecycle(RemoteControlTransition::BeginAcquire)
             .is_err()
         {
             return session_closing_response();
         }
         self.generation = self.generation.wrapping_add(1);
-        self.acquisition_sequence = self.acquisition_sequence.wrapping_add(1);
         self.last_owner = Some(request.client_id.clone());
         self.last_release_reason = None;
         self.drain_reason = None;
@@ -286,6 +362,15 @@ impl SessionStateMachine {
             failed_count: 0,
             operations: BTreeMap::new(),
         });
+        if let Some(registry) = self.raw_prefetch.upgrade() {
+            registry.acquire(
+                &self
+                    .active
+                    .as_ref()
+                    .expect("acquired session exists")
+                    .session_id,
+            );
+        }
         SessionResponse::active(
             self.active
                 .as_ref()
@@ -299,8 +384,7 @@ impl SessionStateMachine {
         generation == self.generation
             && self.active.is_some()
             && self
-                .lifecycle
-                .transition(RemoteControlTransition::FinishAcquire)
+                .transition_lifecycle(RemoteControlTransition::FinishAcquire)
                 .is_ok()
     }
 
@@ -380,7 +464,7 @@ impl SessionStateMachine {
         now: Duration,
         owner: &RemoteSessionIdentity,
         description: String,
-    ) -> Result<(u64, u64, Arc<AtomicBool>), SessionResponse> {
+    ) -> Result<(u64, u64, RemoteOperationCancellation), SessionResponse> {
         self.expire(now);
         let Some(active) = self.active.as_ref() else {
             return Err(self.inactive_response(&owner.client_id));
@@ -404,16 +488,25 @@ impl SessionStateMachine {
         active.request_count = active.request_count.saturating_add(1);
         let token = self.next_operation;
         self.next_operation = self.next_operation.wrapping_add(1).max(1);
-        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = Arc::new(AtomicBool::new(false));
+        let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
+        let cancel = RemoteOperationCancelSource {
+            flag: Arc::clone(&flag),
+            wake_tx,
+        };
         active.operations.insert(
             token,
             OperationState {
                 description,
                 started: false,
-                cancel: Arc::clone(&cancel),
+                cancel: cancel.clone(),
             },
         );
-        Ok((self.generation, token, cancel))
+        Ok((
+            self.generation,
+            token,
+            RemoteOperationCancellation { flag, wake_rx },
+        ))
     }
 
     fn streaming_owner(
@@ -638,11 +731,13 @@ impl SessionStateMachine {
 
     fn begin_drain(&mut self, reason: ReleaseReason, now: Duration) -> bool {
         if self
-            .lifecycle
-            .transition(RemoteControlTransition::BeginDrain)
+            .transition_lifecycle(RemoteControlTransition::BeginDrain)
             .is_err()
         {
             return false;
+        }
+        if let Some(registry) = self.raw_prefetch.upgrade() {
+            registry.terminate();
         }
         self.drain_reason = Some(reason);
         self.drain_started_at = Some(now);
@@ -651,10 +746,22 @@ impl SessionStateMachine {
         if let Some(active) = self.active.as_mut() {
             active.cancel_streaming();
             for operation in active.operations.values() {
-                operation.cancel.store(true, Ordering::Release);
+                operation.cancel.cancel();
             }
         }
         true
+    }
+
+    fn retire_app(&mut self, now: Duration) -> bool {
+        let newly_retired = !self.app_retired;
+        self.app_retired = true;
+        if matches!(
+            self.lifecycle.phase,
+            RemoteControlPhase::AcquiringRemote | RemoteControlPhase::RemoteActive
+        ) {
+            self.begin_drain(ReleaseReason::Local, now);
+        }
+        newly_retired
     }
 
     fn drain_wait_diagnostic(
@@ -717,8 +824,7 @@ impl SessionStateMachine {
     fn release(&mut self, reason: ReleaseReason) -> Result<(), RemoteControlTransitionError> {
         // Final release is owned by the typed phase transition. `active` is session payload,
         // not a sentinel for whether control may return to the PC.
-        self.lifecycle
-            .transition(RemoteControlTransition::FinishDrain)?;
+        self.transition_lifecycle(RemoteControlTransition::FinishDrain)?;
 
         if let Some(mut active) = self.active.take() {
             active.cancel_streaming();
@@ -917,6 +1023,7 @@ pub(crate) struct VideoStreamPlaybackSnapshot {
 pub(crate) struct PublishedVideoStream {
     pub(crate) session: StreamingSessionId,
     pub(crate) generation: StreamingGenerationAccess,
+    pub(crate) audio_tracks: Arc<Vec<mimageviewer_ipc::RemoteAudioTrack>>,
     pub(crate) playback: Arc<VideoStreamPlaybackState>,
     pub(crate) buffer_target_secs: f64,
     pub(crate) end_behavior: mimageviewer_ipc::VideoStreamEndBehavior,
@@ -935,6 +1042,7 @@ pub(crate) enum VideoStreamUiRequest {
         owner: RemoteSessionIdentity,
         path: PathBuf,
         quality: VideoStreamQuality,
+        audio_track: Option<usize>,
         budget: VideoStreamStartBudget,
     },
     Control {
@@ -966,6 +1074,7 @@ impl VideoStreamUiRequest {
             owner,
             path,
             quality,
+            audio_track: None,
             budget: VideoStreamStartBudget::from_enqueued_at(Instant::now()),
         }
     }
@@ -1045,21 +1154,9 @@ pub(crate) enum UiReadError {
 /// App が所有し、remote worker へ許可した AI 資源だけを公開する bridge。
 #[derive(Clone)]
 pub(crate) struct RemoteAiExecutionBridge {
-    runtime: Arc<(Mutex<RemoteAiRuntimeState>, Condvar)>,
+    runtime: Arc<crate::ai::runtime::AiRuntimeInitOwner>,
     manager: Arc<crate::ai::model_manager::ModelManager>,
     background_mode: Arc<AtomicU8>,
-}
-
-enum RemoteAiRuntimeState {
-    Empty,
-    Initializing,
-    Ready(Arc<crate::ai::runtime::AiRuntime>),
-}
-
-pub(crate) enum RemoteLocalRuntimeClaim {
-    Initialize,
-    WaitingForRemote,
-    Ready(Arc<crate::ai::runtime::AiRuntime>),
 }
 
 pub(crate) struct RemoteAiResources {
@@ -1070,13 +1167,12 @@ pub(crate) struct RemoteAiResources {
 
 impl RemoteAiExecutionBridge {
     pub(crate) fn new(
-        runtime: Option<Arc<crate::ai::runtime::AiRuntime>>,
+        runtime: Arc<crate::ai::runtime::AiRuntimeInitOwner>,
         manager: Arc<crate::ai::model_manager::ModelManager>,
         background_mode: u8,
     ) -> Self {
-        let state = runtime.map_or(RemoteAiRuntimeState::Empty, RemoteAiRuntimeState::Ready);
         Self {
-            runtime: Arc::new((Mutex::new(state), Condvar::new())),
+            runtime,
             manager,
             background_mode: Arc::new(AtomicU8::new(background_mode.min(2))),
         }
@@ -1086,107 +1182,34 @@ impl RemoteAiExecutionBridge {
         self.background_mode.store(mode.min(2), Ordering::Release);
     }
 
+    #[cfg(test)]
     pub(crate) fn ready_runtime(&self) -> Option<Arc<crate::ai::runtime::AiRuntime>> {
-        let (state, _) = &*self.runtime;
-        match &*state.lock().unwrap_or_else(|error| error.into_inner()) {
-            RemoteAiRuntimeState::Ready(runtime) => Some(Arc::clone(runtime)),
-            RemoteAiRuntimeState::Empty | RemoteAiRuntimeState::Initializing => None,
-        }
+        self.runtime.ready_runtime()
     }
 
-    /// Runtime constructor を実行してよい owner を一つに限定する。
-    ///
-    /// remote worker が初期化中なら App は UI thread で待たず、後続 frame の
-    /// ready_runtime poll に委ねる。逆に App が claim 済みなら remote worker は
-    /// Condvar で待つため、起動直後の acquire と初回 App update が競合しても
-    /// Runtime を二重生成しない。
-    pub(crate) fn claim_local_runtime_init(&self) -> RemoteLocalRuntimeClaim {
-        let (state, wake) = &*self.runtime;
-        let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
-        match &*state {
-            RemoteAiRuntimeState::Ready(existing) => {
-                RemoteLocalRuntimeClaim::Ready(Arc::clone(existing))
-            }
-            RemoteAiRuntimeState::Initializing => RemoteLocalRuntimeClaim::WaitingForRemote,
-            RemoteAiRuntimeState::Empty => {
-                *state = RemoteAiRuntimeState::Initializing;
-                // No waiter exists yet, but keep all state changes paired with the same
-                // Condvar owner.
-                wake.notify_all();
-                RemoteLocalRuntimeClaim::Initialize
-            }
-        }
-    }
-
-    pub(crate) fn complete_claimed_runtime_init(
-        &self,
-        created: Result<crate::ai::runtime::AiRuntime, crate::ai::AiError>,
-    ) -> Result<Arc<crate::ai::runtime::AiRuntime>, crate::ai::AiError> {
-        let (runtime_state, wake) = &*self.runtime;
-        let mut state = runtime_state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        match created {
-            Ok(runtime) => {
-                let runtime = Arc::new(runtime);
-                debug_assert!(matches!(*state, RemoteAiRuntimeState::Initializing));
-                *state = RemoteAiRuntimeState::Ready(Arc::clone(&runtime));
-                wake.notify_all();
-                Ok(runtime)
-            }
-            Err(error) => {
-                if matches!(*state, RemoteAiRuntimeState::Initializing) {
-                    *state = RemoteAiRuntimeState::Empty;
-                }
-                wake.notify_all();
-                Err(error)
-            }
-        }
-    }
-
-    /// shared runtime が未生成なら、この呼び出し元 remote worker 上で生成する。
-    pub(crate) fn resources_for_remote(&self) -> Option<RemoteAiResources> {
-        self.resources_for_remote_inner()
+    pub(crate) fn resources_for_remote(&self, cancel: &AtomicBool) -> Option<RemoteAiResources> {
+        self.resources_for_remote_inner(cancel)
     }
 }
 
 impl RemoteAiExecutionBridge {
-    fn resources_for_remote_inner(&self) -> Option<RemoteAiResources> {
-        let (runtime_state, wake) = &*self.runtime;
-        let mut state = runtime_state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        loop {
-            match &*state {
-                RemoteAiRuntimeState::Ready(runtime) => {
-                    return Some(RemoteAiResources {
-                        runtime: Arc::clone(runtime),
-                        manager: Arc::clone(&self.manager),
-                        background_mode: self.background_mode.load(Ordering::Acquire),
-                    });
-                }
-                RemoteAiRuntimeState::Initializing => {
-                    state = wake.wait(state).unwrap_or_else(|error| error.into_inner());
-                }
-                RemoteAiRuntimeState::Empty => break,
-            }
-        }
-        *state = RemoteAiRuntimeState::Initializing;
-        drop(state);
-        let created =
-            crate::ai::runtime::AiRuntime::new_with_backend(crate::ai::AiBackend::DirectMl);
-        match self.complete_claimed_runtime_init(created) {
-            Ok(runtime) => Some(RemoteAiResources {
+    fn resources_for_remote_inner(&self, cancel: &AtomicBool) -> Option<RemoteAiResources> {
+        match self
+            .runtime
+            .wait_terminal_while(|| !cancel.load(Ordering::Acquire))
+        {
+            crate::ai::runtime::AiRuntimeInitWait::Ready(runtime) => Some(RemoteAiResources {
                 runtime,
                 manager: Arc::clone(&self.manager),
                 background_mode: self.background_mode.load(Ordering::Acquire),
             }),
-            Err(error) => {
+            crate::ai::runtime::AiRuntimeInitWait::Failed(error) => {
                 crate::logger::log(format!(
                     "remote_ipc: shared AI runtime init failed; using diffusion fallback: {error}"
                 ));
                 None
             }
+            crate::ai::runtime::AiRuntimeInitWait::Cancelled => None,
         }
     }
 }
@@ -1199,6 +1222,7 @@ pub(crate) struct SessionHandle {
     remote_web_connections: Arc<Mutex<BTreeMap<u64, Option<RemoteWebConnectionInfo>>>>,
     ui_request_tx: mpsc::SyncSender<QueuedRemoteUiRequest>,
     ui_request_rx: Arc<Mutex<mpsc::Receiver<QueuedRemoteUiRequest>>>,
+    ui_request_admission: Arc<Mutex<UiRequestAdmission>>,
     published_video_stream: Arc<Mutex<Option<PublishedVideoStream>>>,
     phase_wake: Arc<(Mutex<u64>, Condvar)>,
     ai_bridge: Arc<Mutex<Option<RemoteAiExecutionBridge>>>,
@@ -1206,6 +1230,21 @@ pub(crate) struct SessionHandle {
     archive_jobs: Arc<Mutex<Weak<super::archive_job::RemoteArchiveJobRegistry>>>,
     page_jobs: Arc<Mutex<Weak<super::page_jobs::PageJobRegistry>>>,
     archive_cache_db: Arc<Mutex<Option<Arc<crate::archive_cache::ArchiveCacheDb>>>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct UiRequestAdmission {
+    /// `Some` only while the matching Remote owner may enqueue App-owned work.
+    /// The mutex stays held through the non-blocking send so closing admission
+    /// and draining the receiver form one linearized boundary.
+    open_generation: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UiRequestEnqueueError {
+    Closed,
+    Full,
+    Disconnected,
 }
 
 impl UiRequestDispatch {
@@ -1243,6 +1282,10 @@ impl ClaimedRemoteWrite {
         &self.request
     }
 
+    pub(crate) fn generation(&self) -> u64 {
+        self.operation.generation()
+    }
+
     pub(crate) fn ownership_response(&self) -> SessionResponse {
         self.operation.ownership_response()
     }
@@ -1255,6 +1298,23 @@ impl ClaimedRemoteWrite {
         self.operation.finish(success);
         let _ = self.reply.send(outcome);
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        operation: SessionOperation,
+        request: RemoteWriteRequest,
+    ) -> (Self, mpsc::Receiver<UiWriteOutcome>) {
+        operation.started();
+        let (reply, receiver) = mpsc::sync_channel(1);
+        (
+            Self {
+                request,
+                operation,
+                reply,
+            },
+            receiver,
+        )
+    }
 }
 
 impl ClaimedBookResumeRead {
@@ -1264,6 +1324,12 @@ impl ClaimedBookResumeRead {
 
     pub(crate) fn complete(self, page: Option<usize>) {
         let _ = self.reply.send(page);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(path: std::path::PathBuf) -> (Self, mpsc::Receiver<Option<usize>>) {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        (Self { path, reply }, receiver)
     }
 }
 
@@ -1287,9 +1353,43 @@ impl ClaimedVideoStreamUiRequest {
         self.operation.finish(success);
         let _ = self.reply.send(outcome);
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        operation: SessionOperation,
+        request: VideoStreamUiRequest,
+    ) -> (Self, mpsc::Receiver<VideoStreamUiOutcome>) {
+        operation.started();
+        let (reply, receiver) = mpsc::sync_channel(1);
+        (
+            Self {
+                request,
+                operation,
+                reply,
+            },
+            receiver,
+        )
+    }
 }
 
 impl SessionHandle {
+    #[cfg(windows)]
+    pub(crate) fn set_gui_gate(&self, gate: Option<Arc<crate::effetune::gui_gate::GuiGate>>) {
+        let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(previous) = state.gui_gate.take().and_then(|gate| gate.upgrade()) {
+            previous.invalidate_auto();
+            previous.publish_remote(None, false);
+        }
+        if let Some(gate) = &gate {
+            gate.invalidate_auto();
+            gate.publish_remote(
+                Some(state.acquisition_sequence),
+                state.lifecycle.phase.blocks_local_control(),
+            );
+        }
+        state.gui_gate = gate.map(|gate| Arc::downgrade(&gate));
+    }
+
     pub(crate) fn new() -> Self {
         let (ui_request_tx, ui_request_rx) = mpsc::sync_channel(UI_REQUEST_QUEUE_CAPACITY);
         Self {
@@ -1299,6 +1399,7 @@ impl SessionHandle {
             remote_web_connections: Arc::new(Mutex::new(BTreeMap::new())),
             ui_request_tx,
             ui_request_rx: Arc::new(Mutex::new(ui_request_rx)),
+            ui_request_admission: Arc::new(Mutex::new(UiRequestAdmission::default())),
             published_video_stream: Arc::new(Mutex::new(None)),
             phase_wake: Arc::new((Mutex::new(0), Condvar::new())),
             ai_bridge: Arc::new(Mutex::new(None)),
@@ -1307,6 +1408,26 @@ impl SessionHandle {
             page_jobs: Arc::new(Mutex::new(Weak::new())),
             archive_cache_db: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub(super) fn install_raw_prefetch(
+        &self,
+        registry: &Arc<super::raw_prefetch::RemoteRawPrefetchRegistry>,
+    ) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .raw_prefetch = Arc::downgrade(registry);
+    }
+
+    pub(super) fn raw_prefetch_registry(
+        &self,
+    ) -> Option<Arc<super::raw_prefetch::RemoteRawPrefetchRegistry>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .raw_prefetch
+            .upgrade()
     }
 
     pub(crate) fn install_ai_jobs(&self, jobs: &Arc<super::ai_job::RemoteAiJobRegistry>) {
@@ -1420,6 +1541,11 @@ impl SessionHandle {
             )
         };
         if phase_changed || generation_changed {
+            if generation_changed && response.status == SessionStatus::Active {
+                self.open_ui_request_admission(self.snapshot().generation);
+            } else {
+                self.close_ui_request_admission();
+            }
             self.clear_video_stream(None);
             self.notify_phase_changed();
         }
@@ -1452,6 +1578,7 @@ impl SessionHandle {
             (response, state.lifecycle.phase != phase)
         };
         if phase_changed {
+            self.close_ui_request_admission();
             self.notify_page_job_drain();
             self.clear_video_stream(None);
             self.notify_phase_changed();
@@ -1468,6 +1595,7 @@ impl SessionHandle {
             (response, state.lifecycle.phase != phase)
         };
         if phase_changed {
+            self.close_ui_request_admission();
             self.notify_long_job_drain(ReleaseReason::Logout);
             self.clear_video_stream(None);
             self.notify_phase_changed();
@@ -1493,18 +1621,19 @@ impl SessionHandle {
             (result, state.lifecycle.phase != phase)
         };
         if phase_changed {
+            self.close_ui_request_admission();
             self.notify_page_job_drain();
             self.clear_video_stream(None);
             self.notify_phase_changed();
             self.notify_ui();
         }
-        let (generation, token, cancel) = result?;
+        let (generation, token, cancellation) = result?;
         Ok(SessionOperation {
             handle: self.clone(),
             generation,
             token,
             owner: owner.clone(),
-            cancel,
+            cancellation,
             finished: false,
         })
     }
@@ -1516,6 +1645,7 @@ impl SessionHandle {
             .unwrap_or_else(|error| error.into_inner())
             .finish_acquire(generation);
         if changed {
+            self.open_ui_request_admission(generation);
             self.notify_phase_changed();
             self.notify_ui();
         }
@@ -1529,6 +1659,7 @@ impl SessionHandle {
             .unwrap_or_else(|error| error.into_inner())
             .abort_acquire_barrier(generation, self.now());
         if changed {
+            self.close_ui_request_admission();
             self.notify_long_job_drain(ReleaseReason::AcquireBarrierTimeout);
             self.clear_video_stream(None);
             self.notify_phase_changed();
@@ -1621,8 +1752,8 @@ impl SessionHandle {
             .clone()
     }
 
-    pub(crate) fn remote_ai_resources(&self) -> Option<RemoteAiResources> {
-        self.ai_bridge()?.resources_for_remote()
+    pub(crate) fn remote_ai_resources(&self, cancel: &AtomicBool) -> Option<RemoteAiResources> {
+        self.ai_bridge()?.resources_for_remote(cancel)
     }
 
     pub(crate) fn remote_web_connected(&self, connection_id: u64) {
@@ -1673,6 +1804,9 @@ impl SessionHandle {
     }
 
     pub(crate) fn local_disconnect(&self) {
+        // A sender either completes its non-blocking enqueue before this lock,
+        // or observes closed admission. Final drain can then take the queue once.
+        self.close_ui_request_admission();
         let phase_changed = self
             .inner
             .lock()
@@ -1685,6 +1819,43 @@ impl SessionHandle {
             crate::logger::log("remote_ipc: session_drain_started reason=local".to_owned());
             self.notify_ui();
         }
+    }
+
+    /// Irreversibly retires Remote ownership for process exit. Unlike an ordinary
+    /// local disconnect, reaching Local again does not reopen SessionAcquire.
+    pub(crate) fn retire_app_admission(&self) -> u64 {
+        self.close_ui_request_admission();
+        let (generation, began_drain, newly_retired) = {
+            let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+            let before = state.lifecycle.phase;
+            let newly_retired = state.retire_app(self.now());
+            (
+                state.generation,
+                before != state.lifecycle.phase
+                    && state.lifecycle.phase == RemoteControlPhase::DrainingRemote,
+                newly_retired,
+            )
+        };
+        if began_drain {
+            self.notify_long_job_drain(ReleaseReason::Local);
+            self.clear_video_stream(None);
+        }
+        if began_drain || newly_retired {
+            self.notify_phase_changed();
+            self.notify_ui();
+        }
+        generation
+    }
+
+    /// Outer-process fallback for creator failure before an App can own the UI
+    /// bundle. It gives every queued request a typed terminal result before ACK.
+    pub(crate) fn retire_app_without_ui_owner(&self) {
+        let generation = self.retire_app_admission();
+        complete_remote_ui_requests_for_app_exit(
+            self.close_ui_request_admission_and_take_pending(),
+        );
+        self.clear_video_stream(None);
+        let _ = self.complete_app_drain(generation);
     }
 
     pub(crate) fn note_long_job_client_seen(&self, owner: &RemoteSessionIdentity) {
@@ -1731,6 +1902,7 @@ impl SessionHandle {
         operation: SessionOperation,
         timeout: Duration,
     ) -> UiWriteOutcome {
+        let generation = operation.generation();
         let dispatch = Arc::new(UiRequestDispatch::pending());
         let (reply, receiver) = mpsc::sync_channel(1);
         let queued = QueuedRemoteUiRequest::Write(QueuedRemoteWrite {
@@ -1739,10 +1911,12 @@ impl SessionHandle {
             reply,
             dispatch: Arc::clone(&dispatch),
         });
-        match self.ui_request_tx.try_send(queued) {
+        match self.try_enqueue_ui_request(queued, Some(generation)) {
             Ok(()) => self.notify_ui(),
-            Err(mpsc::TrySendError::Full(_)) => return write_busy_outcome(),
-            Err(mpsc::TrySendError::Disconnected(_)) => return write_stopped_outcome(),
+            Err(UiRequestEnqueueError::Full) => return write_busy_outcome(),
+            Err(UiRequestEnqueueError::Closed | UiRequestEnqueueError::Disconnected) => {
+                return write_stopped_outcome();
+            }
         }
         match receiver.recv_timeout(timeout) {
             Ok(outcome) => outcome,
@@ -1778,10 +1952,12 @@ impl SessionHandle {
             reply,
             dispatch: Arc::clone(&dispatch),
         });
-        match self.ui_request_tx.try_send(queued) {
+        match self.try_enqueue_ui_request(queued, None) {
             Ok(()) => self.notify_ui(),
-            Err(mpsc::TrySendError::Full(_)) => return Err(UiReadError::Busy),
-            Err(mpsc::TrySendError::Disconnected(_)) => return Err(UiReadError::Stopped),
+            Err(UiRequestEnqueueError::Full) => return Err(UiReadError::Busy),
+            Err(UiRequestEnqueueError::Closed | UiRequestEnqueueError::Disconnected) => {
+                return Err(UiReadError::Stopped);
+            }
         }
         match receiver.recv_timeout(timeout) {
             Ok(page) => Ok(page),
@@ -1800,6 +1976,7 @@ impl SessionHandle {
         request: VideoStreamUiRequest,
         operation: SessionOperation,
     ) -> VideoStreamUiOutcome {
+        let generation = operation.generation();
         let start_budget = match &request {
             VideoStreamUiRequest::Start { budget, .. } => Some(*budget),
             _ => None,
@@ -1815,15 +1992,15 @@ impl SessionHandle {
             reply,
             dispatch: Arc::clone(&dispatch),
         });
-        match self.ui_request_tx.try_send(queued) {
+        match self.try_enqueue_ui_request(queued, Some(generation)) {
             Ok(()) => self.notify_ui(),
-            Err(mpsc::TrySendError::Full(_)) => {
+            Err(UiRequestEnqueueError::Full) => {
                 return video_stream_ui_error(
                     VideoStreamErrorCode::Busy,
                     "本体 UI の動画操作 queue が混み合っています",
                 );
             }
-            Err(mpsc::TrySendError::Disconnected(_)) => {
+            Err(UiRequestEnqueueError::Closed | UiRequestEnqueueError::Disconnected) => {
                 return video_stream_ui_error(
                     VideoStreamErrorCode::Internal,
                     "本体 UI の動画操作受付が停止しています",
@@ -1895,6 +2072,23 @@ impl SessionHandle {
     }
 
     pub(crate) fn take_pending_ui_requests(&self) -> Vec<ClaimedRemoteUiRequest> {
+        self.take_pending_ui_requests_inner()
+    }
+
+    /// Stops future App-owned queue producers and atomically takes every request
+    /// that won the admission race. Final App drain uses this before publishing ACK.
+    pub(crate) fn close_ui_request_admission_and_take_pending(
+        &self,
+    ) -> Vec<ClaimedRemoteUiRequest> {
+        let mut admission = self
+            .ui_request_admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        admission.open_generation = None;
+        self.take_pending_ui_requests_inner()
+    }
+
+    fn take_pending_ui_requests_inner(&self) -> Vec<ClaimedRemoteUiRequest> {
         let receiver = self
             .ui_request_rx
             .lock()
@@ -1934,6 +2128,42 @@ impl SessionHandle {
             }
         }
         claimed
+    }
+
+    fn open_ui_request_admission(&self, generation: u64) {
+        self.ui_request_admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .open_generation = Some(generation);
+    }
+
+    fn close_ui_request_admission(&self) {
+        self.ui_request_admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .open_generation = None;
+    }
+
+    fn try_enqueue_ui_request(
+        &self,
+        request: QueuedRemoteUiRequest,
+        expected_generation: Option<u64>,
+    ) -> Result<(), UiRequestEnqueueError> {
+        let admission = self
+            .ui_request_admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(open_generation) = admission.open_generation else {
+            return Err(UiRequestEnqueueError::Closed);
+        };
+        if expected_generation.is_some_and(|generation| generation != open_generation) {
+            return Err(UiRequestEnqueueError::Closed);
+        }
+        match self.ui_request_tx.try_send(request) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => Err(UiRequestEnqueueError::Full),
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(UiRequestEnqueueError::Disconnected),
+        }
     }
 
     #[cfg(test)]
@@ -2007,10 +2237,26 @@ impl SessionHandle {
             self.notify_long_job_drain(reason);
         }
         if phase_changed {
+            self.close_ui_request_admission();
             self.notify_phase_changed();
             self.notify_ui();
         }
         reason
+    }
+}
+
+pub(crate) fn complete_remote_ui_requests_for_app_exit(pending_ui: Vec<ClaimedRemoteUiRequest>) {
+    for pending in pending_ui {
+        match pending {
+            ClaimedRemoteUiRequest::Write(pending) => pending.complete(write_stopped_outcome()),
+            ClaimedRemoteUiRequest::BookResumeRead(pending) => pending.complete(None),
+            ClaimedRemoteUiRequest::VideoStream(pending) => {
+                pending.complete(VideoStreamUiOutcome::Error(VideoStreamError::new(
+                    VideoStreamErrorCode::SessionMismatch,
+                    "アプリを終了しています",
+                )))
+            }
+        }
     }
 }
 
@@ -2212,7 +2458,7 @@ pub(crate) struct SessionOperation {
     generation: u64,
     token: u64,
     owner: RemoteSessionIdentity,
-    cancel: Arc<AtomicBool>,
+    cancellation: RemoteOperationCancellation,
     finished: bool,
 }
 
@@ -2300,7 +2546,11 @@ impl SessionOperation {
     }
 
     pub(crate) fn cancel_flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.cancel)
+        self.cancellation.flag()
+    }
+
+    pub(crate) fn cancellation(&self) -> RemoteOperationCancellation {
+        self.cancellation.clone()
     }
 
     pub(crate) fn long_job_drain_cause(&self) -> Option<RemoteLongJobDrainCause> {
@@ -2491,6 +2741,10 @@ mod tests {
         };
         vec![
             write_request(),
+            RemoteWriteRequest::SetFinalCoverSpreadPreference {
+                address: container.clone(),
+                preference: mimageviewer_ipc::RemoteFinalCoverSpreadPreference::On,
+            },
             RemoteWriteRequest::RecordReadingProgress {
                 address: page.clone(),
                 context_address: container.clone(),
@@ -2499,6 +2753,13 @@ mod tests {
                 page_count: 10,
                 record_resume: true,
                 record_history: true,
+            },
+            RemoteWriteRequest::RecordVideoProgress {
+                address: mimageviewer_ipc::RemoteAddress::file("C:/media/movie.mp4"),
+                sequence: 1,
+                position_secs: 19.5,
+                duration_secs: 120.0,
+                ended: false,
             },
             RemoteWriteRequest::SetRating {
                 address: page.clone(),
@@ -2579,6 +2840,123 @@ mod tests {
         }
     }
 
+    #[test]
+    fn raw_window_terminal_at_shared_drain_logout_supersede_liveness_idle_and_retire() {
+        use super::super::raw_flights::tests::FakeSubmitter;
+        use mimageviewer_ipc::{RawPrefetchWindowRequest, RawPrefetchWindowStatus};
+        for reason in [
+            ReleaseReason::Logout,
+            ReleaseReason::Superseded,
+            ReleaseReason::LivenessTimeout,
+            ReleaseReason::IdleTimeout,
+            ReleaseReason::Local,
+            ReleaseReason::AcquireBarrierTimeout,
+        ] {
+            let registry = super::super::raw_prefetch::RemoteRawPrefetchRegistry::new(
+                Arc::new(FakeSubmitter::default()).s2c(),
+            );
+            let mut state = SessionStateMachine {
+                raw_prefetch: Arc::downgrade(&registry),
+                ..Default::default()
+            };
+            acquire(&mut state, Duration::ZERO);
+            let owner = state_owner(&state, "client");
+            let request = |generation| RawPrefetchWindowRequest {
+                window_generation: generation,
+                entries: vec![],
+            };
+            assert_eq!(
+                registry.declare(&owner.session_id, request(1)).status,
+                RawPrefetchWindowStatus::Accepted
+            );
+            match reason {
+                ReleaseReason::Logout => {
+                    state.logout(Duration::from_secs(1), &owner);
+                }
+                ReleaseReason::Superseded => {
+                    state.acquire(
+                        Duration::from_secs(1),
+                        0,
+                        SessionAcquireRequest {
+                            client_id: "new-client".to_owned(),
+                            peer: peer(),
+                        },
+                    );
+                }
+                ReleaseReason::LivenessTimeout => {
+                    assert_eq!(state.expire(LIVENESS_TIMEOUT), Some(reason));
+                }
+                ReleaseReason::IdleTimeout => {
+                    state.active.as_mut().unwrap().last_ping = IDLE_TIMEOUT;
+                    assert_eq!(state.expire(IDLE_TIMEOUT), Some(reason));
+                }
+                ReleaseReason::Local => {
+                    state.retire_app(Duration::from_secs(1));
+                }
+                ReleaseReason::AcquireBarrierTimeout => {
+                    state.begin_drain(reason, Duration::from_secs(1));
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                registry.declare(&owner.session_id, request(2)).status,
+                RawPrefetchWindowStatus::Terminal,
+                "{reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_window_connection_loss_preserves_session_generation_and_mailbox() {
+        use super::super::raw_flights::tests::FakeSubmitter;
+        use mimageviewer_ipc::{RawPrefetchWindowRequest, RawPrefetchWindowStatus};
+        let registry = super::super::raw_prefetch::RemoteRawPrefetchRegistry::new(
+            Arc::new(FakeSubmitter::default()).s2c(),
+        );
+        let handle = SessionHandle::new();
+        handle.install_raw_prefetch(&registry);
+        let response = handle.acquire(SessionAcquireRequest {
+            client_id: "client".to_owned(),
+            peer: peer(),
+        });
+        let session = response.session_id.unwrap();
+        handle.remote_web_connected(1);
+        handle.remote_web_connected(2);
+        registry.declare(
+            &session,
+            RawPrefetchWindowRequest {
+                window_generation: 11,
+                entries: vec![],
+            },
+        );
+        handle.remote_web_disconnected(1);
+        handle.remote_web_disconnected(2);
+        assert_eq!(
+            registry
+                .declare(
+                    &session,
+                    RawPrefetchWindowRequest {
+                        window_generation: 11,
+                        entries: vec![]
+                    }
+                )
+                .status,
+            RawPrefetchWindowStatus::Duplicate
+        );
+        assert_eq!(
+            registry
+                .declare(
+                    &session,
+                    RawPrefetchWindowRequest {
+                        window_generation: 12,
+                        entries: vec![]
+                    }
+                )
+                .status,
+            RawPrefetchWindowStatus::Accepted
+        );
+    }
+
     fn state_owner(state: &SessionStateMachine, client_id: &str) -> RemoteSessionIdentity {
         let active = state
             .active
@@ -2645,6 +3023,68 @@ mod tests {
                 .drain_wait_diagnostic(Duration::from_secs(13))
                 .is_some()
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn effetune_auto_remote_round_trip_publishes_at_each_canonical_transition() {
+        let controller = crate::effetune::EffetuneController::new();
+        let gate = controller.gui_gate().unwrap();
+        gate.set_auto_factor(
+            crate::effetune::gui_gate::AutoSuppression::SettingOff,
+            false,
+        );
+        gate.set_auto_factor(
+            crate::effetune::gui_gate::AutoSuppression::RootHidden,
+            false,
+        );
+        let mut state = SessionStateMachine::default();
+        state.gui_gate = Some(Arc::downgrade(&gate));
+        let success = gate.auto_snapshot();
+        assert!(success.allowed);
+        state
+            .transition_lifecycle(RemoteControlTransition::BeginAcquire)
+            .unwrap();
+        assert!(!gate.auto_snapshot().allowed);
+        let acquisition_revision = gate.auto_snapshot().revision;
+        state
+            .transition_lifecycle(RemoteControlTransition::FinishAcquire)
+            .unwrap();
+        state
+            .transition_lifecycle(RemoteControlTransition::BeginDrain)
+            .unwrap();
+        assert!(!gate.auto_snapshot().allowed);
+        state
+            .transition_lifecycle(RemoteControlTransition::FinishDrain)
+            .unwrap();
+        assert!(gate.auto_snapshot().allowed);
+        assert!(gate.auto_snapshot().revision > acquisition_revision);
+        assert_ne!(gate.auto_snapshot(), success);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn effetune_auto_remote_gate_registration_and_detach_revoke_old_facts() {
+        let controller = crate::effetune::EffetuneController::new();
+        let gate = controller.gui_gate().unwrap();
+        gate.set_auto_factor(
+            crate::effetune::gui_gate::AutoSuppression::SettingOff,
+            false,
+        );
+        gate.set_auto_factor(
+            crate::effetune::gui_gate::AutoSuppression::RootHidden,
+            false,
+        );
+        let handle = SessionHandle::new();
+        let before = gate.auto_snapshot();
+        handle.set_gui_gate(Some(gate.clone()));
+        assert_ne!(gate.auto_snapshot(), before);
+        let attached = gate.auto_snapshot();
+        handle.set_gui_gate(None);
+        assert_ne!(gate.auto_snapshot(), attached);
+        assert!(gate.auto_snapshot().allowed);
+        handle.set_gui_gate(Some(gate.clone()));
+        assert_ne!(gate.auto_snapshot(), attached);
     }
 
     #[test]
@@ -2803,21 +3243,31 @@ mod tests {
     }
 
     #[test]
-    fn shared_runtime_initialization_has_exactly_one_claimant() {
+    fn remote_bridge_uses_the_shared_runtime_owner() {
+        let runtime = crate::ai::runtime::AiRuntimeInitOwner::new();
         let bridge = RemoteAiExecutionBridge::new(
-            None,
+            Arc::clone(&runtime),
             Arc::new(crate::ai::model_manager::ModelManager::new()),
             0,
         );
-        assert!(matches!(
-            bridge.claim_local_runtime_init(),
-            RemoteLocalRuntimeClaim::Initialize
-        ));
-        assert!(matches!(
-            bridge.claim_local_runtime_init(),
-            RemoteLocalRuntimeClaim::WaitingForRemote
-        ));
+        assert!(Arc::ptr_eq(&bridge.runtime, &runtime));
         assert!(bridge.ready_runtime().is_none());
+    }
+
+    #[test]
+    fn remote_runtime_wait_stops_on_request_cancel_without_mutating_owner() {
+        let runtime = crate::ai::runtime::AiRuntimeInitOwner::new();
+        let bridge = RemoteAiExecutionBridge::new(
+            Arc::clone(&runtime),
+            Arc::new(crate::ai::model_manager::ModelManager::new()),
+            0,
+        );
+        let cancel = AtomicBool::new(true);
+        assert!(bridge.resources_for_remote(&cancel).is_none());
+        assert!(matches!(
+            runtime.snapshot(),
+            crate::ai::runtime::AiRuntimeInitSnapshot::Dormant
+        ));
     }
 
     #[test]
@@ -3445,6 +3895,159 @@ mod tests {
         assert_eq!(released.phase, RemoteControlPhase::Local);
         assert!(released.active.is_none());
         assert_eq!(released.control_return_sequence, 1);
+    }
+
+    #[test]
+    fn final_drain_closes_ui_enqueue_before_one_time_queue_take() {
+        let handle = SessionHandle::new();
+        handle.acquire(SessionAcquireRequest {
+            client_id: "client".to_owned(),
+            peer: peer(),
+        });
+        let generation = handle.snapshot().generation;
+        let owner = handle.owner_for_test("client");
+        let operation = handle
+            .begin_operation(&owner, "late write".to_owned())
+            .unwrap();
+        let worker_handle = handle.clone();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+            worker_handle.submit_write(write_request(), operation)
+        });
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        handle.local_disconnect();
+        assert!(
+            handle
+                .close_ui_request_admission_and_take_pending()
+                .is_empty()
+        );
+        assert!(!handle.complete_app_drain(generation));
+        resume_tx.send(()).unwrap();
+
+        assert!(matches!(
+            worker.join().unwrap(),
+            UiWriteOutcome::Write(RemoteWriteResponse::Error(RemoteWriteError {
+                code: RemoteWriteErrorCode::Internal,
+                ..
+            }))
+        ));
+        assert!(handle.take_pending_ui_requests().is_empty());
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::Local);
+    }
+
+    #[test]
+    fn app_retire_is_absorbing_after_old_generation_drains() {
+        let handle = SessionHandle::new();
+        handle.acquire(SessionAcquireRequest {
+            client_id: "old".to_owned(),
+            peer: peer(),
+        });
+        let generation = handle.snapshot().generation;
+        let old_owner = handle.owner_for_test("old");
+        let operation = handle
+            .begin_operation(&old_owner, "old request".to_owned())
+            .unwrap();
+
+        assert_eq!(handle.retire_app_admission(), generation);
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::DrainingRemote);
+        assert!(!handle.complete_app_drain(generation));
+        operation.finish(false);
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::Local);
+
+        let response = handle.acquire(SessionAcquireRequest {
+            client_id: "late".to_owned(),
+            peer: peer(),
+        });
+        assert_ne!(response.status, SessionStatus::Active);
+        assert_eq!(handle.snapshot().generation, generation.wrapping_add(1));
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::Local);
+    }
+
+    #[test]
+    fn app_drop_fallback_terminals_pending_write_read_and_video_before_ack() {
+        let handle = SessionHandle::new();
+        handle.acquire(SessionAcquireRequest {
+            client_id: "client".to_owned(),
+            peer: peer(),
+        });
+        let generation = handle.snapshot().generation;
+        let owner = handle.owner_for_test("client");
+
+        let write_operation = handle.begin_operation(&owner, "write".to_owned()).unwrap();
+        let write_dispatch = Arc::new(UiRequestDispatch::pending());
+        let (write_tx, write_rx) = mpsc::sync_channel(1);
+        handle
+            .try_enqueue_ui_request(
+                QueuedRemoteUiRequest::Write(QueuedRemoteWrite {
+                    request: write_request(),
+                    operation: write_operation,
+                    reply: write_tx,
+                    dispatch: write_dispatch,
+                }),
+                Some(generation),
+            )
+            .unwrap();
+
+        let read_dispatch = Arc::new(UiRequestDispatch::pending());
+        let (read_tx, read_rx) = mpsc::sync_channel(1);
+        handle
+            .try_enqueue_ui_request(
+                QueuedRemoteUiRequest::BookResumeRead(QueuedBookResumeRead {
+                    path: std::path::PathBuf::from(r"C:\books\book.zip"),
+                    reply: read_tx,
+                    dispatch: read_dispatch,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let video_operation = handle.begin_operation(&owner, "video".to_owned()).unwrap();
+        let video_dispatch = Arc::new(UiRequestDispatch::pending());
+        let (video_tx, video_rx) = mpsc::sync_channel(1);
+        handle
+            .try_enqueue_ui_request(
+                QueuedRemoteUiRequest::VideoStream(QueuedVideoStreamUiRequest {
+                    request: VideoStreamUiRequest::Control {
+                        session: 7,
+                        action: VideoStreamControlAction::Pause,
+                    },
+                    operation: video_operation,
+                    reply: video_tx,
+                    dispatch: video_dispatch,
+                }),
+                Some(generation),
+            )
+            .unwrap();
+
+        handle.retire_app_without_ui_owner();
+
+        assert!(matches!(
+            write_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            UiWriteOutcome::Write(RemoteWriteResponse::Error(_))
+        ));
+        assert_eq!(read_rx.recv_timeout(Duration::from_secs(1)).unwrap(), None);
+        assert!(matches!(
+            video_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            VideoStreamUiOutcome::Error(VideoStreamError {
+                code: VideoStreamErrorCode::SessionMismatch,
+                ..
+            })
+        ));
+        assert_eq!(handle.snapshot().phase, RemoteControlPhase::Local);
+        assert!(handle.snapshot().active.is_none());
+        assert!(
+            handle
+                .acquire(SessionAcquireRequest {
+                    client_id: "late".to_owned(),
+                    peer: peer(),
+                })
+                .status
+                != SessionStatus::Active
+        );
     }
 
     #[test]

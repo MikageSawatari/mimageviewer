@@ -1,0 +1,181 @@
+   Compiling mimageviewer v3.5.0 (C:\home\mimageviewer)
+warning: duplicated attribute
+     --> src\app\tests.rs:26562:5
+      |
+26562 |     #[test]
+      |     ^^^^^^^
+      |
+      = note: `#[warn(duplicate_macro_attributes)]` on by default
+
+warning: duplicated attribute
+    --> src\materializer.rs:2136:5
+     |
+2136 |     #[test]
+     |     ^^^^^^^
+
+warning: duplicated attribute
+    --> src\panorama.rs:1822:5
+     |
+1822 |     #[test]
+     |     ^^^^^^^
+
+warning: duplicated attribute
+     --> src\video\native_presenter\render_core.rs:13324:5
+      |
+13324 |     #[test]
+      |     ^^^^^^^
+
+warning: use of deprecated method `quick_xml::events::attributes::Attribute::<'a>::decode_and_unescape_value`: use `Self::decoded_and_normalized_value()`
+   --> src\xmp_reader.rs:461:45
+    |
+461 |                         if let Ok(v) = attr.decode_and_unescape_value(decoder) {
+    |                                             ^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated method `quick_xml::events::attributes::Attribute::<'a>::decode_and_unescape_value`: use `Self::decoded_and_normalized_value()`
+   --> src\xmp_reader.rs:465:45
+    |
+465 |                         if let Ok(v) = attr.decode_and_unescape_value(decoder) {
+    |                                             ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `quick_xml::events::attributes::Attribute::<'a>::unescape_value`: use `Self::normalized_value()`
+   --> src\xmp_reader.rs:868:33
+    |
+868 |             if let Ok(v) = attr.unescape_value() {
+    |                                 ^^^^^^^^^^^^^^
+
+warning: use of deprecated method `quick_xml::events::attributes::Attribute::<'a>::decode_and_unescape_value`: use `Self::decoded_and_normalized_value()`
+    --> src\xmp_reader.rs:1056:42
+     |
+1056 |                     let Ok(value) = attr.decode_and_unescape_value(decoder) else {
+     |                                          ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `ctx`
+     --> src\app\tests.rs:25759:13
+      |
+25759 |         let ctx = egui::Context::default();
+      |             ^^^ help: if this is intentional, prefix it with an underscore: `_ctx`
+      |
+      = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `ctx`
+     --> src\app\tests.rs:26040:13
+      |
+26040 |         let ctx = egui::Context::default();
+      |             ^^^ help: if this is intentional, prefix it with an underscore: `_ctx`
+
+warning: variable does not need to be mutable
+    --> src\remote_ipc\container.rs:7993:13
+     |
+7993 |         let mut png = |width: u32, height: u32| {
+     |             ----^^^
+     |             |
+     |             help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: type `viewer_context_registry::ViewerContextId` is more private than the item `RingPickerState::owner`
+    --> src\ring_shortcut.rs:2435:5
+     |
+2435 |     pub owner: crate::app::ViewerContextId,
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ field `RingPickerState::owner` is reachable at visibility `pub`
+     |
+note: but type `viewer_context_registry::ViewerContextId` is only usable at visibility `pub(crate)`
+    --> src\app\viewer_context_registry.rs:6:1
+     |
+   6 | pub(crate) struct ViewerContextId(u64);
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = note: `#[warn(private_interfaces)]` on by default
+
+warning: method `preview_current_folder_rating` is never used
+     --> src\app.rs:49444:19
+      |
+14994 | impl App {
+      | -------- method in this implementation
+...
+49444 |     pub(crate) fn preview_current_folder_rating(&mut self, stars: u8) -> Result<bool, String> {
+      |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `drawn_visible_len` is never used
+    --> src\ui_fullscreen.rs:4210:8
+     |
+4150 | impl ContinuousReadingPageSize {
+     | ------------------------------ method in this implementation
+...
+4210 |     fn drawn_visible_len(&self, axis: ContinuousAxis, pixels_per_point: f32) -> f32 {
+     |        ^^^^^^^^^^^^^^^^^
+
+warning: method `capture_container_rating_undo` is never used
+   --> src\undo_ops.rs:796:19
+    |
+770 | impl App {
+    | -------- method in this implementation
+...
+796 |     pub(crate) fn capture_container_rating_undo(&mut self, before: u8, after: u8) {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `seek_strip_wheel_is_consumed_and_becomes_one_range_step` is never used
+     --> src\video\native_presenter\render_core.rs:13354:8
+      |
+13354 |     fn seek_strip_wheel_is_consumed_and_becomes_one_range_step() {
+      |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `axis_diagnostics` is never read
+   --> src\video\seek_strip_thumbs.rs:297:16
+    |
+295 | pub(crate) struct StripThumbnailSnapshot {
+    |                   ---------------------- field in this struct
+296 |     pub(crate) axis: StripAxisResolution,
+297 |     pub(crate) axis_diagnostics: Option<StripAxisDiagnostics>,
+    |                ^^^^^^^^^^^^^^^^
+    |
+    = note: `StripThumbnailSnapshot` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: unused `std::result::Result` that must be used
+     --> src\app\tests.rs:26581:9
+      |
+26581 | /         app.with_viewer_context(original, |mounted| {
+26582 | |             assert!(
+26583 | |                 mounted.fs_info_panel.locked,
+26584 | |                 "他方の窓の操作でロックが落ちた"
+...     |
+26591 | |             assert!(!mounted.fs_info_panel.hover_active);
+26592 | |         });
+      | |__________^
+      |
+      = note: this `Result` may be an `Err` variant, which should be handled
+      = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default
+help: use `let _ = ...` to ignore the resulting value
+      |
+26581 |         let _ = app.with_viewer_context(original, |mounted| {
+      |         +++++++
+
+warning: unused return value of `egui::Context::run` that must be used
+     --> src\ui_main.rs:22244:13
+      |
+22244 | /             ctx.run(input.clone(), |ctx| {
+22245 | |                 egui::TopBottomPanel::top("t").show(ctx, |ui| {
+22246 | |                     let right = ui.max_rect().right();
+22247 | |                     ui.horizontal_wrapped(|ui| {
+...     |
+22251 | |                 });
+22252 | |             });
+      | |______________^
+      |
+help: use `let _ = ...` to ignore the resulting value
+      |
+22244 |             let _ = ctx.run(input.clone(), |ctx| {
+      |             +++++++
+
+error: linking with `rust-lld.exe` failed: exit code: 1
+  |
+  = note: "rust-lld.exe" "-flavor" "link" "/NOLOGO" "C:\\home\\mimageviewer\\target\\debug\\deps\\rustcVGbjLf\\symbols.o" "<257 object files omitted>" "user32.lib" "shcore.lib" "C:\\home\\mimageviewer\\target\\debug\\deps/{libencoding_rs-40d3de6840943e60,libsignalsmith_stretch-1a6f30350b685f45,librfd-00e27754a52498f1,libsemver-5f430a25847ef75c,libopener-828c6590afe23537,libnormpath-6fe441309d3a32da,libresvg-0f1ee5af8c503761,libgif-e17f5269002584b2,libzune_jpeg-6cce6202c3837efb,libzune_core-909a96196a3362c5,libusvg-638b6d41c828b01c,libunicode_bidi-7d17cc52eab1236c,libunicode_vo-999c64ec1d2123d2,libimagesize-a940ccd747bc5080,libdata_url-bfc5a007c10fc05a,libxmlwriter-33b9892409fad782,libsimplecss-9b1badc0d9a8abb1,libroxmltree-1f6a49db99724426,libsvgtypes-5ddc8d4b068f77b7,libkurbo-28a7244c119f9672,libsiphasher-07a435f2280c78e7,libfontdb-cac9b5a9b2e3983b,libslotmap-a1348ada775b4d3b,libtiny_skia-1e4ec3fbb1d822b7,libpng-c62a07b3a6142007,libbitflags-e2bc2120033e2d21,libtiny_skia_path-6a366bbbd5681ae1,libstrict_num-e2197f151f598aae,libfloat_cmp-3520ffaf89de5a26,libarrayref-c089e634f3f78f3a,libdelharc-8993146022886b39,libsevenz_rust2-45873581a2de8592,libcbc-458b59d1bda23865,libbzip2-d6c2828f7489b71f,liblibbz2_rs_sys-014e1c209405bb1f,libaes-c578730eafb29709,libcipher-6ded20f1b647735f,libinout-ed8bfb3b5a7175cd,libblock_padding-ff829b0d9ea0adfb,libppmd_rust-3378b978236b3431,liblzma_rust2-de1286b215d87319,libunrar-dc2d22d1256e01af,libwidestring-077b9dcb37770133,libunrar_sys-16e7593546c4d45b,libwebp-fcf29af2546dd4b5,liblibwebp_sys-0457602e7e02416f,libzip-e243f875c705181d,libzopfli-65813cbd130cff7c,libbumpalo-c8b156c9ee629adf,libureq-55a143a18ee3f74d,libwebpki_roots-31c0e1faa93893ad,libwebpki_roots-b505bb1091a56437,librustls-9f44602ac548c4a0,libwebpki-2f329a16f1f90f17,libring-1646b1a19f4d0c79,libgetrandom-f57121138d6353ff,libuntrusted-e5df4d850b6ffb06,librustls_pki_types-21f1efe85590920a,libzeroize-01e03c797f7430e4}.rlib" "<sysroot>\\lib\\rustlib\\x86_64-pc-windows-msvc\\lib/{libtest-*,libgetopts-*,librustc_std_workspace_std-*}.rlib" "C:\\home\\mimageviewer\\target\\debug\\deps/{libquick_xml-b9cd7595acc9a354,libcpal-2c191ce37af7f54f,libdasp_sample-90372c26ecaed62a,libwindows-7bf07c6798cd0923,libwindows_core-fdc11adbd4ad2563,libwindows_result-13c2393bb4f4a40a,libegui_kittest-099623578e35508e,libopen-4aea0ccc528700df,libdify-e900f58837a63b59,libgetopts-3dea5c3f50feb04b,libcolored-41174da2b3b90670,liblazy_static-035f2e3fd73f0098,libkittest-9ea72dcc4640f08a,libaccesskit_consumer-23d4021c75322fa1,libtray_icon-02943c6294b999f9,libmuda-a89f389c20b15046,libkeyboard_types-2f3cb16689cb6845,libturbojpeg-f881a6d2a5de6d1f,libgcd-b6a85bc109ae4bb5,libturbojpeg_sys-4f8888c6838548cc,libunicode_normalization-683ea7cb215f7476,libtinyvec-aca68d4904ee0eb1,libtinyvec_macros-ac5519166260fa08,libqrcode-4be54190362752ac,libmimageviewer_ipc-469ad7bc881180de,libargon2-094c2026f1ba98ef,libblake2-26fb6c30b8087f0e,libpassword_hash-c10690d69acaf198,libbase64ct-3393249ccb7d0fa2,librand_core-9443ec55296e0029,libwindows_dpapi-47984cf1e42cb2e8,libwinapi-f3bc19ba2bb942fd,libpdfium_render-5e32575ef9cd13df,libutf16string-116c2dd649202d39,libitertools-137d0861a09b4599,libvecmath-1d99237aa1111483,libfloat-735ee1b4b74b4728,libchrono-85f0189075522ba2,libtantivy-664162dd4b12a239,libsketches_ddsketch-7789a6b58c209cc5,liboneshot-96acc657937526b3,libtypetag-15ae9b8e9ccae8e8,libinventory-384ec415393103eb,liberased_serde-911ac4f9a9e0db0b,libtypeid-bcb55bdaf1637f7a,libbon-ff73bfb1a8573973,libcensus-a5647219c8e61780,libhtmlescape-3e1d0c00e0685941,libarc_swap-2787826a254cd4e3,liblz4_flex-236ecfb2436761a2,liblru-b2c2f1a001767743,liblevenshtein_automata-aa5df9ee0954294b,libmemmap2-84c65899282fd209,libfs4-d1850c1598bf03c8,libwindows_sys-5260d62115676acf,libdatasketches-3f890bd3578de018,libtantivy_tokenizer_api-e9831ecf27c9a0b1,libmeasure_time-8de2f7b3abd6dfff,libtantivy_query_grammar-65b027061cbcd29b,libfnv-69f8e8d1aef3c73a,libnom-d2b584e0f0959ad2,libtantivy_columnar-cab3595af352eb9a,libtantivy_stacker-d5c8dc4205d3f103,libmurmurhash32-0b28d70b1a8b4638,libfastdivide-8cec937b85ddb2d6,libdowncast_rs-7c25478909a9053d,libtantivy_sstable-6abaf97333e66ff2,libtantivy_bitpacker-837373512ca78117,libbitpacking-0da8f4376409211a,libfutures_util-8b456ccc31d83d16,libslab-60b4f644b3353600,libfutures_task-0cf9024011488025,libfutures_core-5096ff5149f82a78,libtantivy_common-c1734e03d685f186,libtime-0658e9f8a9214dbc,libpowerfmt-a9283e991af0b0b9,libnum_conv-8d2202f8197ff682,libderanged-89db568a3f5f62d8,libtime_core-c10bf06a1cdbad32,libownedbytes-3cfea00fcc443c3f,libtantivy_fst-f23944e4d114030f,libbyteorder-c00e6e17816b046b,libutf8_ranges-5fa5e3574fc27cdb,libwinreg-162eb41941b343a8,libwindows_sys-c205a4d9d05c634e,libwindows_targets-1161e9b1aac5ff3d,librhai-764bf508d527899e,libsmartstring-2fdb9fbd4bc78d60,libthin_vec-689e0f79d0ce2763,libregex-9a72d01898b9d0dc,libregex_automata-30bfc714d8ea8036,libaho_corasick-9c80b2d28ceee081,libregex_syntax-91509eb9508cb8c8,libfast_image_resize-f5c01dc0d98797d4,librexif-e47ed11ec602acf6,libserde_json-9f6dbb572dd4b694,libitoa-9c571169a504d2cc,libzmij-de0b4aaa8e7df418,liblocal_adjust_core-e83a9ed045bfb808,libbase64-cb34b0fa03124f93,libmusic_core-23e363dc59249424,librustfft-eb9af3e937891cd9,libprimal_check-4a08b5fb360290e0,libtranspose-cc95eeddd881dccd,libstrength_reduce-8f00299c8cfc36d8,librusqlite-58749f15c8a78bf1,libfallible_streaming_iterator-474cb73cc6ac00d8,libfallible_iterator-85645853ecb609d2,libhashlink-8a51bb89177daee4,libhashbrown-66b677bc97a422fa,liblibsqlite3_sys-e8fdb91a3477abe7,libtempfile-b1c4cef92815582a,libfastrand-1d835f25f66e9423,libcomic_core-4b5ec836dc085d4b,libself_cell-0da489531f432d26,librustybuzz-f5b1ebe113c4c5a2,libunicode_bidi_mirroring-c31e161d4024268e,libunicode_script-46f2e38a78cfa61a,libunicode_properties-175c08834ebcc402,libunicode_ccc-04eb7eb1756da768,libnotify-d5813f6100f231f9,libcrossbeam_channel-ede8723eae7de871,libwalkdir-571e3174e6c8cecc,libsame_file-343e085ec21937bb,libwinapi_util-d71b7818c140c2b0,libnotify_types-531b25e30101960c,libffmpeg_the_third-6f267100ababfa16,libffmpeg_sys_the_third-42e5825df2f17a68,liblibc-09d541506680e6f4,libeframe-907a2830b4e71daa,libpollster-380b26dd9f468832,libglutin_winit-77f9954aa4375588,libglutin-ba1bb8ff90003db6,libglutin_egl_sys-d1e066c497e1838f,libegui_winit-9bbfade0ce05161b,libwebbrowser-b9bb165a4f474235,liburl-b92ab6afbc5b4c6a,libidna-cac8a4df8bbe494f,libidna_adapter-511396ce82da1953,libicu_properties-32536fc52e31fe71,libicu_properties_data-1e24eb3649247356,libicu_normalizer-adf130768266133e,libicu_normalizer_data-d883d82215813ea2,libicu_collections-35ec7c22a152505b,libutf8_iter-9598b47492293497,libpotential_utf-1f3d8773f0e6174f,libicu_provider-49b8ffba7e6b87d0,libicu_locale_core-d1ad4ee5748d55b2,libtinystr-0aa8b9734ba21002,liblitemap-13d412c2a022ff65,libwriteable-3368304acae8f687,libzerovec-917bc1dcacc27e22,libzerotrie-f7ae217c477d8762,libyoke-3d4addc6d8a1fa57,libzerofrom-73e8397d4c2cce78,libform_urlencoded-0fe7d4d96b7baab0,libpercent_encoding-eb053ebd6baf4b2c,libarboard-7f50e8f05f952385,libclipboard_win-4e7cda4a03953ec0,liberror_code-7583de1bef50621d,libimage-7399c784e728d47a,libqoi-15cf3d2e6e6d0abf,libmoxcms-79ec107b8c97bf81,libpxfm-dfce996a0e0995d0,libimage_webp-735966d9328dda25,libtiff-42a50903b7a62f9a,libfax-1ac564df604e47b6,libpng-209450d31f2b8264,libflate2-fd7523c24af11a77,libfdeflate-e1bb4c87b8a41a61,libcrc32fast-3a755835e5ac036c,libexr-73e600436240e5b4,libminiz_oxide-ea62e039bd4ba2b1,libzune_inflate-35f7d2c4848e7797,libsimd_adler32-6639fac69285ed9f,libbit_field-c2e204e8127b875a,libpulp-5d2011d47087fb2e,liblebe-cda9fab51f0a0529,libzune_jpeg-aa9cdbf469c64694,libzune_core-4b3547bbe9f487a2,libgif-d14d6b1f5cb6a561,libcolor_quant-0ff4be0000f7d628,libweezl-2d719ed593311dcd,libbyteorder_lite-55f3a4804e0f241f,libravif-111945014bf04756,libloop9-c4a00a0ec6eb6ac7,libavif_serialize-1030d579a12cd757,libquick_error-c464e94da0a7fcc4,librgb-08e4379f6e16c156,librav1e-191c9a8974ada629,libav_scenechange-eb7f18435e600398,liby4m-f9621dc462840ac8,libaligned-3ca8724e8fb37b86,libas_slice-18471e0d29fffabd,libstable_deref_trait-a5c4d3793b59dce1,libav1_grain-2c4f81de6e5909fd,libnom-315007e5154f88c5,libmemchr-1017d0cd83c93ccb,libnum_rational-6cff95b2ed2fb234,libnum_bigint-357cbcb9a2419aa4,libanyhow-39021d36cfaddc92,libmaybe_rayon-1108aab0e1de9e98,libv_frame-a056ef76752d5cd1,libaligned_vec-8d062d7f7d23df5f,libequator-c5390382cecea97e,libbitstream_io-6cacfb81265e6afa,libitertools-319016f129d9e538,libimgref-ca486efdda6e8165,libwindows_sys-96b8fb7c0353e076,libwindows_targets-03e5ef5e4df9f482,libaccesskit_winit-ca6f8ec11688f92b,libaccesskit_windows-f47f1af77fdbc31b,libaccesskit_consumer-8026c54cf5137846,libwindows_sys-047ddb3cd52e4814,libegui_wgpu-d64db05e30f7b11c,libweb_time-ed64b49aa92f69c1,libwinit-966d976c0978dc3d,libwindows_sys-76815ea9cf164b39,libsmol_str-ff0c6e44cb253ea7,libcursor_icon-7ff7bfdd4d333728,libdpi-a80fe268e09dd522,libtype_map-be93d30dcb395464,librustc_hash-51709ae4190cbb3d,libwgpu-b64c07ed7159b1ef,libstatic_assertions-162d3d0dcb5710de,libwgpu_core-fd16366119e9ef87,libwgpu_hal-c0c4e2dc0a142f31,librenderdoc_sys-9ea0df7ca61fb058,libgpu_descriptor-8bcfc25660c957a2,libhashbrown-6cbc7baab2a4b810,libfoldhash-c8bc9fcceb01df21,libgpu_descriptor_types-5beb00659dd5b2b6,libgpu_alloc-b9998fdc9b361ae9,libgpu_alloc_types-da9ecba9c6b11dc8,libash-0db240178c6b0624,liblibloading-9888e5a7fc8e7c34,libraw_window_handle-0b7dfe02270b51b5,libglutin_wgl_sys-25434638df07527e,libgpu_allocator-5e3427081e799427,libthiserror-323a8aa0151821fc,libordered_float-516a45dc2b24fa6f,libnaga-014d8725e33ddbcb,librustc_hash-57e665080f82092e,liblibm-00ebd7f7818b70f3,libhexf_parse-72514416d621bf80,libunicode_ident-e14ecedd80731b69,libhalf-964fe08a394e3d90,libcodespan_reporting-657b41293d3dd11f,libunicode_width-44246e23e9fc6f85,libindexmap-6598c651b614d3c4,libhashbrown-4e743cc378fc8fd4,libspirv-94ab7365d2509b68,libarrayvec-66ea4c4f4f7fa3e7,libhashbrown-62116f3097b366eb,libequivalent-f42dda3bdc01c57b,liballocator_api2-8dc406a3b653be24,libfoldhash-b1ada77617249066,librange_alloc-8f177ec650b19030,libbit_set-299154ca8c7db678,libbit_vec-67a466ca1b5dd7d5,libwindows-f1e2c9ed5d3a20d0,libwindows_core-67322c4ccad7a93c,libwindows_strings-6bd28500240a01ce,libwindows_result-b009c6cae6a7ce0b,libwindows_targets-d50eabe1f7962579,libwgpu_types-ac994fc3094a47b8,libthiserror-d6902c9be4fc1e91,libegui_glow-3933adf610f8a4e4,libmemoffset-6acc731a9bd4d9f5,libglow-3d3dca31c5c58647,libegui-72f45b939b4dbf59,libbitflags-8cf3671fa7a5937b,libunicode_segmentation-07c663d53824b175,libaccesskit-5fede71c85f7f168,libepaint-32ad069dc9f68ab1,libnohash_hasher-95e087e338f2759a,liblog-36d41660ee4ee887,libprofiling-53476823fe318c95,libahash-49d648660b712c7b,libgetrandom-2a2b8aae8eed9515,libzerocopy-f4861c240a457502,libepaint_default_fonts-ce5036d9bf9c7680,libab_glyph-80412f40645c3217,libowned_ttf_parser-8252a97e1ece3f17,libttf_parser-06c7c8b797586930,libab_glyph_rasterizer-07676c85e44d62b4,libparking_lot-8aadfc286d186b3b,libparking_lot_core-37967ca72134922d,liblock_api-d2428f9b815bb5f3,libscopeguard-445afb6b6a6d29f2,libecolor-e3e673eaeb6f24e1,libemath-a75b1082e55aa5af,librayon-165c0d43b026e4fb,librayon_core-b6e2d7d89e6494b6,libcrossbeam_deque-af45d7f410bcf1c9,libcrossbeam_epoch-34d79a30ed1db4b9,libcrossbeam_utils-5c00fd19362818d7,libeither-332e819325f0f42f,libsha2-cb0d255a66345488,libcpufeatures-ade18f584ff7b9cf,libdigest-1914ac17ea9827a8,libsubtle-f76329e2a7b30008,libblock_buffer-3a1ac500e44ec4b0,libcrypto_common-34319ba94d40a799,libgeneric_array-6ab3e4300ac6cba5,libtypenum-632c4349cbd931e0,libwindows-3500fecd1d76b60a,libwindows_numerics-bfba7c54e0d18d15,libwindows_core-3f0ded511488617f,libwindows_strings-f94bcb02b23804bc,libwindows_result-5d0f6f4380b5cfb1,libwindows_link-040991fa4d2d803e,libort-a240067287011971,liblibloading-6ce2e9d1a9a70c22,libwindows_link-848d70ec9460347f,libtracing-0a68ea5133a0c8e1,libpin_project_lite-47ccce2f3c6bd9a7,libtracing_core-2252c2dc69c83716,libonce_cell-3d0a59eacfc4d94b,libportable_atomic-a360baac66f32f64,libort_sys-22e59214ded8b07a,libndarray-34acd1fc3356a193,libmatrixmultiply-5f72ff4e35a14ae4,libnum_complex-5857dc973b784d64,libbytemuck-7dbdb1a1a57780f6,libnum_integer-03b9e85165f1358d,libnum_traits-632fae1568482f31,librawpointer-21184cb2b040e483,libsmallvec-f72719e2e9b24ae0,libuuid-dcc48f9fe78d4065,libgetrandom-e43856f01f58b36f,libcfg_if-34fc4191cbab56c5,libserde-26a6e37bdcc7c34e,libserde_core-198a81b62c4092f6}.rlib" "<sysroot>\\lib\\rustlib\\x86_64-pc-windows-msvc\\lib/{libstd-*,libpanic_unwind-*,libcfg_if-*,libwindows_targets-*,librustc_demangle-*,libstd_detect-*,libhashbrown-*,librustc_std_workspace_alloc-*,libunwind-*,librustc_std_workspace_core-*,liballoc-*,libcore-*,libcompiler_builtins-*}.rlib" "powrprof.lib" "shell32.lib" "bcrypt.lib" "advapi32.lib" "kernel32.lib" "C:\\Users\\mikag\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\windows_x86_64_msvc-0.52.6\\lib\\windows.0.52.0.lib" "C:\\Users\\mikag\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\windows_x86_64_msvc-0.52.6\\lib\\windows.0.52.0.lib" "C:\\Users\\mikag\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\windows_x86_64_msvc-0.52.6\\lib\\windows.0.52.0.lib" "advapi32.lib" "advapi32.lib" "bcrypt.lib" "cfgmgr32.lib" "crypt32.lib" "cryptnet.lib" "kernel32.lib" "ncrypt.lib" "user32.lib" "C:\\Users\\mikag\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\windows_x86_64_msvc-0.52.6\\lib\\windows.0.52.0.lib" "C:\\Users\\mikag\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\windows_x86_64_msvc-0.48.5\\lib\\windows.0.48.5.lib" "C:\\home\\mimageviewer\\vendor/ffmpeg\\lib\\avutil.lib" "C:\\home\\mimageviewer\\vendor/ffmpeg\\lib\\avcodec.lib" "C:\\home\\mimageviewer\\vendor/ffmpeg\\lib\\avformat.lib" "C:\\home\\mimageviewer\\vendor/ffmpeg\\lib\\avfilter.lib" "C:\\home\\mimageviewer\\vendor/ffmpeg\\lib\\swscale.lib" "C:\\home\\mimageviewer\\vendor/ffmpeg\\lib\\swresample.lib" "legacy_stdio_definitions.lib" "shlwapi.lib" "kernel32.lib" "user32.lib" "shell32.lib" "gdi32.lib" "advapi32.lib" "C:\\Users\\mikag\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\windows_x86_64_msvc-0.53.1\\lib\\windows.0.53.0.lib" "C:\\Users\\mikag\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\windows_x86_64_msvc-0.52.6\\lib\\windows.0.52.0.lib" "opengl32.lib" "C:\\Users\\mikag\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\windows_x86_64_msvc-0.52.6\\lib\\windows.0.52.0.lib" "C:\\Users\\mikag\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\windows_x86_64_msvc-0.52.6\\lib\\windows.0.52.0.lib" "C:\\Users\\mikag\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\windows_x86_64_msvc-0.52.6\\lib\\windows.0.52.0.lib" "C:\\Users\\mikag\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\windows_x86_64_msvc-0.52.6\\lib\\windows.0.52.0.lib" "kernel32.lib" "kernel32.lib" "kernel32.lib" "ntdll.lib" "userenv.lib" "ws2_32.lib" "dbghelp.lib" "/defaultlib:libcmt" "/NXCOMPAT" "/LIBPATH:C:\\home\\mimageviewer\\target\\debug\\build\\libsqlite3-sys-40d79e3ea8805664\\out" "/LIBPATH:C:\\home\\mimageviewer\\target\\debug\\build\\signalsmith-stretch-c72d82861fe72297\\out" "/LIBPATH:C:\\home\\mimageviewer\\target\\debug\\build\\turbojpeg-sys-cad6a8c8af5fe67a\\out\\lib" "/LIBPATH:C:\\home\\mimageviewer\\target\\debug\\build\\unrar_sys-4688e906840c107e\\out" "/LIBPATH:C:\\home\\mimageviewer\\target\\debug\\build\\ring-29013c53d89bfe11\\out" "/LIBPATH:C:\\home\\mimageviewer\\target\\debug\\build\\libwebp-sys-505b364a3b1a94d7\\out" "/LIBPATH:C:\\Users\\mikag\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\windows_x86_64_msvc-0.52.6\\lib" "/LIBPATH:C:\\Users\\mikag\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\windows_x86_64_msvc-0.53.1\\lib" "/LIBPATH:C:\\home\\mimageviewer\\vendor/ffmpeg\\lib" "/LIBPATH:C:\\Users\\mikag\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\windows_x86_64_msvc-0.48.5\\lib" "/OUT:C:\\home\\mimageviewer\\target\\debug\\deps\\mimageviewer-fe3ca2e444d02a8b.exe" "/OPT:REF,NOICF" "/DEBUG" "/PDBALTPATH:%_PDB%" "/NATVIS:<sysroot>\\lib\\rustlib\\etc\\intrinsic.natvis" "/NATVIS:<sysroot>\\lib\\rustlib\\etc\\liballoc.natvis" "/NATVIS:<sysroot>\\lib\\rustlib\\etc\\libcore.natvis" "/NATVIS:<sysroot>\\lib\\rustlib\\etc\\libstd.natvis" "/NATVIS:C:\\home\\mimageviewer\\target\\debug\\deps\\rustcVGbjLf\\mimageviewer-0.natvis" "/NATVIS:C:\\home\\mimageviewer\\target\\debug\\deps\\rustcVGbjLf\\mimageviewer-1.natvis" "/NATVIS:C:\\home\\mimageviewer\\target\\debug\\deps\\rustcVGbjLf\\mimageviewer-2.natvis" "C:\\home\\mimageviewer\\target\\debug\\build\\mimageviewer-9e311978caf5a300\\out\\resource.res"
+  = note: some arguments are omitted. use `--verbose` to show all linker arguments
+  = note: rust-lld: error: failed to write output 'C:\home\mimageviewer\target\debug\deps\mimageviewer-fe3ca2e444d02a8b.exe': permission denied
+          
+
+warning: `mimageviewer` (lib test) generated 19 warnings
+error: could not compile `mimageviewer` (lib test) due to 1 previous error; 19 warnings emitted

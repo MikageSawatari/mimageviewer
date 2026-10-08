@@ -4,18 +4,19 @@
 # Output:
 #   target\dev-runtime\mimageviewer-core.exe
 #   target\dev-runtime\mimageviewer-remote.exe
+#   target\dev-runtime\mimageviewer-epub-pdf.exe
 #   FFmpeg DLLs are staged beside it so the core can run without the release
-#   launcher. Other native assets, workers, and models use the same embedded
+#   launcher. Other native assets and models use the same embedded
 #   extraction path as the regular application.
 #
-# Both executables are built together on purpose: the core spawns the remote
-# service from its own directory, and the two share PROTOCOL_VERSION.
+# The core, remote service, and EPUB converter are built together: the core
+# spawns each companion from its own directory. Core and remote share PROTOCOL_VERSION.
 #
 # The dev-runtime Cargo profile only changes optimization/build-time settings.
 # The portable feature is intentionally NOT enabled, so an ordinary launch uses
 # %APPDATA%\mimageviewer just like the installed/release application.
 #
-# This script builds only the application core. It does not run the result or
+# This script builds the application core and its companions. It does not run them or
 # touch the normal application data.
 #
 # When another worktree is building native code, this waits for it rather than
@@ -24,11 +25,15 @@
 # Usage:
 #   .\scripts\build-dev.ps1
 #   .\scripts\build-dev.ps1 -TestScript
+#   .\scripts\build-dev.ps1 -PreserveRuntime
 #   .\scripts\build-dev.ps1 -WaitForOtherBuildsMinutes 0
 
 [CmdletBinding()]
 param(
     [switch] $TestScript,
+    # Fail when an exact staged development executable is running instead of
+    # stopping it. This keeps a live verification runtime intact.
+    [switch] $PreserveRuntime,
     # Wait this long for another worktree's native build to finish before
     # starting. 0 disables the wait. See Wait-ForOtherNativeBuilds.
     [int] $WaitForOtherBuildsMinutes = 30
@@ -39,6 +44,7 @@ $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $outputDir = Join-Path $repoRoot 'target\dev-runtime'
 $coreExe = Join-Path $outputDir 'mimageviewer-core.exe'
 $remoteExe = Join-Path $outputDir 'mimageviewer-remote.exe'
+$epubWorkerExe = Join-Path $outputDir 'mimageviewer-epub-pdf.exe'
 $normalDataDir = if ($env:APPDATA) {
     Join-Path $env:APPDATA 'mimageviewer'
 } else {
@@ -72,7 +78,8 @@ function Stop-StagedProcess {
         [Parameter(Mandatory = $true)]
         [string] $ExePath,
         [Parameter(Mandatory = $true)]
-        [string] $Label
+        [string] $Label,
+        [switch] $PreserveRuntime
     )
 
     if (-not (Test-Path $ExePath -PathType Leaf)) { return }
@@ -83,6 +90,10 @@ function Stop-StagedProcess {
             try { $processPath = $_.Path } catch { $processPath = $null }
             if ($processPath -and
                 [System.IO.Path]::GetFullPath($processPath) -eq $fullPath) {
+                if ($PreserveRuntime) {
+                    throw ("[build-dev] development {0} is running (PID={1}): {2}. -PreserveRuntime refuses to stop it; close it and retry." -f
+                        $Label, $_.Id, $fullPath)
+                }
                 Write-Host ("[build-dev] stopping development {0} (PID={1})" -f $Label, $_.Id)
                 Stop-Process -Id $_.Id -Force -ErrorAction Stop
             }
@@ -122,6 +133,57 @@ function Copy-IfChanged {
     }
 }
 
+function Copy-EffetuneBundleIfChanged {
+    $source = Join-Path $repoRoot 'vendor\effetune-mixwright\EffeTune Mixwright.vst3'
+    $destination = Join-Path $outputDir 'effetune\EffeTune Mixwright.vst3'
+    if (-not (Test-Path -LiteralPath $source -PathType Container)) {
+        throw "[build-dev] required EffeTune bundle is missing: $source"
+    }
+    $sourceFiles = @(Get-ChildItem -LiteralPath $source -Recurse -File)
+    $destinationFiles = @()
+    if (Test-Path -LiteralPath $destination -PathType Container) {
+        $destinationItem = Get-Item -LiteralPath $destination
+        if (($destinationItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "[build-dev] EffeTune destination is a reparse point: $destination"
+        }
+        $destinationFiles = @(Get-ChildItem -LiteralPath $destination -Recurse -File)
+    }
+    $changed = $sourceFiles.Count -ne $destinationFiles.Count
+    if (-not $changed) {
+        foreach ($file in $sourceFiles) {
+            $relative = $file.FullName.Substring($source.Length).TrimStart('\')
+            $target = Join-Path $destination $relative
+            if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
+                $changed = $true
+                break
+            }
+            $targetInfo = Get-Item -LiteralPath $target
+            if ($file.Length -ne $targetInfo.Length -or
+                $file.LastWriteTimeUtc -ne $targetInfo.LastWriteTimeUtc) {
+                $changed = $true
+                break
+            }
+        }
+    }
+    if (-not $changed) { return }
+
+    $resolvedOutput = [IO.Path]::GetFullPath($outputDir).TrimEnd('\')
+    $resolvedDestination = [IO.Path]::GetFullPath($destination)
+    if (-not $resolvedDestination.StartsWith($resolvedOutput + '\',
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw "[build-dev] EffeTune destination is outside dev runtime: $resolvedDestination"
+    }
+    if (Test-Path -LiteralPath $destination) {
+        Remove-Item -LiteralPath $destination -Recurse -Force
+    }
+    $parent = Split-Path -Parent $destination
+    if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+        New-Item -ItemType Directory -Path $parent | Out-Null
+    }
+    Copy-Item -LiteralPath $source -Destination $destination -Recurse
+    Write-Host '[build-dev] staged EffeTune Mixwright bundle'
+}
+
 function Wait-ForOtherNativeBuilds {
     # turbojpeg-sys drives cmake/MSBuild from the shared cargo registry copy of
     # libjpeg-turbo. Two worktrees building it at once fail with MSB3191
@@ -152,13 +214,19 @@ function Wait-ForOtherNativeBuilds {
 
 Push-Location $repoRoot
 try {
+    & (Join-Path $repoRoot 'scripts\check-vcrt-pe-dependencies.ps1')
+
     if ($WaitForOtherBuildsMinutes -gt 0) {
         Wait-ForOtherNativeBuilds
     }
 
     # Stop only the development-profile executables when they lock the output.
-    Stop-StagedProcess -ExeName 'mimageviewer-core' -ExePath $coreExe -Label 'core'
-    Stop-StagedProcess -ExeName 'mimageviewer-remote' -ExePath $remoteExe -Label 'remote service'
+    Stop-StagedProcess -ExeName 'mimageviewer-core' -ExePath $coreExe -Label 'core' `
+        -PreserveRuntime:$PreserveRuntime
+    Stop-StagedProcess -ExeName 'mimageviewer-remote' -ExePath $remoteExe -Label 'remote service' `
+        -PreserveRuntime:$PreserveRuntime
+    Stop-StagedProcess -ExeName 'mimageviewer-epub-pdf' -ExePath $epubWorkerExe -Label 'EPUB converter' `
+        -PreserveRuntime:$PreserveRuntime
 
     Ensure-LibclangPath
     $featureArgs = @()
@@ -189,6 +257,15 @@ try {
         throw "[build-dev] remote service was not produced: $remoteExe"
     }
 
+    Write-Host '[build-dev] building EPUB PDF worker with Cargo profile dev-runtime'
+    & cargo build --profile dev-runtime -p epub-pdf-worker --bin mimageviewer-epub-pdf
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
+    if (-not (Test-Path $epubWorkerExe -PathType Leaf)) {
+        throw "[build-dev] EPUB PDF worker was not produced: $epubWorkerExe"
+    }
+
     $copies = @(
         @{ src = 'vendor\ffmpeg\bin\avcodec-61.dll'; dst = 'avcodec-61.dll' }
         @{ src = 'vendor\ffmpeg\bin\avformat-61.dll'; dst = 'avformat-61.dll' }
@@ -196,6 +273,10 @@ try {
         @{ src = 'vendor\ffmpeg\bin\avfilter-10.dll'; dst = 'avfilter-10.dll' }
         @{ src = 'vendor\ffmpeg\bin\swscale-8.dll'; dst = 'swscale-8.dll' }
         @{ src = 'vendor\ffmpeg\bin\swresample-5.dll'; dst = 'swresample-5.dll' }
+        @{ src = 'vendor\vcrt\msvcp140.dll'; dst = 'msvcp140.dll' }
+        @{ src = 'vendor\vcrt\msvcp140_1.dll'; dst = 'msvcp140_1.dll' }
+        @{ src = 'vendor\vcrt\vcruntime140.dll'; dst = 'vcruntime140.dll' }
+        @{ src = 'vendor\vcrt\vcruntime140_1.dll'; dst = 'vcruntime140_1.dll' }
     )
 
     foreach ($copy in $copies) {
@@ -204,10 +285,17 @@ try {
             -Destination (Join-Path $outputDir $copy.dst)
     }
 
+    Copy-EffetuneBundleIfChanged
+
+    & (Join-Path $repoRoot 'scripts\check-vcrt-pe-dependencies.ps1') `
+        -InputPaths @($coreExe, $remoteExe, $epubWorkerExe) -RequireCompanionRuntime `
+        -ReportPath 'target\vcrt-pe-reports\dev-runtime.json'
+
     Write-Host ''
     Write-Host '[build-dev] DONE'
     Write-Host ("  core: {0}" -f $coreExe)
     Write-Host ("  remote service: {0}" -f $remoteExe)
+    Write-Host ("  EPUB PDF worker: {0}" -f $epubWorkerExe)
     Write-Host ("  data (default): {0}" -f $normalDataDir)
     Write-Host ("  isolated override: --data-dir `"{0}`"" -f
         (Join-Path $outputDir 'data'))

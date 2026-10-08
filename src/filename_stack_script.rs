@@ -283,7 +283,9 @@ fn run_group_function(
             map.insert("stem".into(), Dynamic::from(stem_of(&m.path).to_string()));
             map.insert("ext".into(), Dynamic::from(ext_of(&m.path)));
             map.insert("mtime".into(), Dynamic::from(m.mtime));
-            map.insert("size".into(), Dynamic::from(m.size));
+            // 旧 script API は整数値。metadata 不明は従来 placeholder と同じ 0 を渡すが、
+            // 一覧ソート側の Unknown/real-zero 判定にはこの値を逆輸入しない。
+            map.insert("size".into(), Dynamic::from(m.size.unwrap_or(0)));
             Dynamic::from(map)
         })
         .collect();
@@ -350,7 +352,7 @@ mod tests {
         StackMember {
             path: PathBuf::from(format!(r"C:\dl\{name}")),
             mtime,
-            size: 0,
+            size: Some(0),
             is_video,
         }
     }

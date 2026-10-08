@@ -32,7 +32,7 @@ enum Stage {
     ImportConfirm(ImportPreview),
     WaitingForWriters,
     Running,
-    WaitingForEditPreviewClear(Receiver<()>),
+    WaitingForEditPreviewClear(Receiver<Result<(), String>>),
     RefreshPreparing,
     Refreshing,
     Result(ResultState),
@@ -74,6 +74,25 @@ enum WorkerMessage {
         view_trim_saved: bool,
     },
     Refresh(crate::app::metadata_import_refresh::RefreshResult),
+}
+
+impl WorkerMessage {
+    fn committed_thumbnail_pin_changes(&self) -> usize {
+        match self {
+            Self::Import {
+                result: Ok(summary),
+                ..
+            } => summary
+                .committed
+                .video_pins
+                .saturating_add(summary.committed.folder_pins),
+            Self::Progress(_)
+            | Self::Preview(_)
+            | Self::Export { .. }
+            | Self::Import { result: Err(_), .. }
+            | Self::Refresh(_) => 0,
+        }
+    }
 }
 
 struct ImportWorkerResources {
@@ -128,6 +147,18 @@ pub(crate) struct MetadataTransferState {
 }
 
 impl MetadataTransferState {
+    fn has_active_worker_or_refresh(&self) -> bool {
+        matches!(
+            &self.stage,
+            Stage::LoadingPreview
+                | Stage::WaitingForWriters
+                | Stage::Running
+                | Stage::WaitingForEditPreviewClear(_)
+                | Stage::RefreshPreparing
+                | Stage::Refreshing
+        )
+    }
+
     fn export(root: PathBuf, settings: &crate::settings::Settings) -> Self {
         Self {
             root,
@@ -196,7 +227,27 @@ enum DialogAction {
     Close,
 }
 
+fn should_resume_transfer_context_readers(
+    sidecar_restore_active: bool,
+    state: Option<&MetadataTransferState>,
+) -> bool {
+    !sidecar_restore_active
+        && (state.is_none()
+            || state.is_some_and(|state| {
+                matches!(
+                    state.stage,
+                    Stage::ExportOptions | Stage::ImportConfirm(_) | Stage::Result(_)
+                )
+            }))
+}
+
 impl App {
+    pub(crate) fn metadata_transfer_active_for_sidecar_restore(&self) -> bool {
+        self.metadata_transfer
+            .as_ref()
+            .is_some_and(MetadataTransferState::has_active_worker_or_refresh)
+    }
+
     /// 明示メタ情報転送の対象。ZIP/PDF/合成ビューではなく、現在表示中の実フォルダだけ。
     pub(crate) fn metadata_transfer_target(&self) -> Option<PathBuf> {
         if self.archive_source_override.is_some()
@@ -214,8 +265,7 @@ impl App {
             || self.current_folder_last_mtime.is_none()
             || self.pdf_enumerate_pending.is_some()
             || self.zip_enumerate_pending.is_some()
-            || self.show_pdf_password_dialog
-            || self.pdf_password_request_pending_in_any_context()
+            || self.pdf_password_dialog_path().is_some()
         {
             return None;
         }
@@ -243,7 +293,7 @@ impl App {
     /// 転送 worker と同じ DB を書き換え得る既存処理が完全に着地したか。
     /// モーダルはユーザー入力を止めるが、開始前から走っていた worker までは止めないため、
     /// この drain 待ちを必ず通してから export/import を開始する。
-    fn metadata_transfer_writers_busy(
+    pub(crate) fn metadata_transfer_writers_busy_for_sidecar_restore(
         &mut self,
         release_tag_db_for_import: bool,
     ) -> Result<bool, String> {
@@ -266,6 +316,13 @@ impl App {
             || self.capture_pending.is_some()
             || self.export_pending.is_some()
             || self.batch_convert.is_some())
+    }
+
+    fn metadata_transfer_writers_busy(
+        &mut self,
+        release_tag_db_for_import: bool,
+    ) -> Result<bool, String> {
+        self.metadata_transfer_writers_busy_for_sidecar_restore(release_tag_db_for_import)
     }
 
     pub(crate) fn show_metadata_transfer_dialog(&mut self, ctx: &egui::Context) {
@@ -347,23 +404,21 @@ impl App {
             }
         }
         let refresh_target = self.metadata_transfer.as_ref().and_then(|state| {
-            matches!(state.stage, Stage::RefreshPreparing).then(|| {
-                let changed_tags = state
-                    .pending_import_result
-                    .as_ref()
-                    .and_then(|result| result.as_ref().ok())
-                    .is_some_and(|summary| summary.changed.tags);
-                (state.root.clone(), state.recursive, changed_tags)
-            })
+            matches!(state.stage, Stage::RefreshPreparing)
+                .then(|| (state.root.clone(), state.recursive))
         });
-        let refresh_ready =
-            refresh_target
-                .as_ref()
-                .is_some_and(|(root, recursive, changed_tags)| {
-                    self.advance_metadata_import_terminal_refresh(root, *recursive, *changed_tags)
-                });
+        let refresh_ready = refresh_target.as_ref().is_some_and(|(root, recursive)| {
+            self.advance_metadata_import_terminal_refresh(root, *recursive)
+        });
         if refresh_ready {
-            let requests = self.take_metadata_import_refresh_requests();
+            let changed = self
+                .metadata_transfer
+                .as_ref()
+                .and_then(|state| state.pending_import_result.as_ref())
+                .and_then(|result| result.as_ref().ok())
+                .map(|summary| summary.changed)
+                .unwrap_or_default();
+            let requests = self.take_metadata_import_refresh_requests(changed);
             if let Some(state) = self.metadata_transfer.as_mut() {
                 start_metadata_import_refresh_worker(state, requests);
             }
@@ -418,13 +473,10 @@ impl App {
         // WaitingForWritersで止めたcontext所有XMP readerとtag write workerは、転送の
         // 結果表示・開始失敗・待機キャンセルでmodalを離れる時に再開する。
         // Running/Refreshing中はDB writerを新たに生成しない。
-        let resume_context_readers = self.metadata_transfer.is_none()
-            || self.metadata_transfer.as_ref().is_some_and(|state| {
-                matches!(
-                    state.stage,
-                    Stage::ExportOptions | Stage::ImportConfirm(_) | Stage::Result(_)
-                )
-            });
+        let resume_context_readers = should_resume_transfer_context_readers(
+            self.sidecar_restore_active(),
+            self.metadata_transfer.as_ref(),
+        );
         if resume_context_readers {
             self.resume_metadata_transfer_context_readers();
         }
@@ -468,12 +520,13 @@ impl App {
         let mut begin_terminal_refresh = false;
         let mut request_edit_preview_clear = false;
         let mut restart_terminal_refresh = false;
+        let mut committed_thumbnail_pin_changes = 0usize;
         let clear_status = self.metadata_transfer.as_ref().and_then(|state| {
             let Stage::WaitingForEditPreviewClear(completed) = &state.stage else {
                 return None;
             };
             match completed.try_recv() {
-                Ok(()) => Some(Ok(())),
+                Ok(result) => Some(result),
                 Err(mpsc::TryRecvError::Empty) => None,
                 Err(mpsc::TryRecvError::Disconnected) => Some(Err(
                     "編集プレビューキャッシュの消去完了を確認できませんでした".to_string(),
@@ -490,6 +543,8 @@ impl App {
             begin_terminal_refresh = true;
         }
         for message in messages {
+            committed_thumbnail_pin_changes = committed_thumbnail_pin_changes
+                .saturating_add(message.committed_thumbnail_pin_changes());
             let Some(state) = self.metadata_transfer.as_mut() else {
                 break;
             };
@@ -560,6 +615,10 @@ impl App {
                 }
             }
         }
+        self.advance_collection_thumbnail_source_epoch_for_pin_commit(
+            committed_thumbnail_pin_changes,
+            "metadata_import",
+        );
         if disconnected
             && self.metadata_transfer.as_ref().is_some_and(|state| {
                 state.rx.is_some()
@@ -1442,5 +1501,69 @@ mod tests {
 
         assert!(import_cancel.load(Ordering::Relaxed));
         assert!(refresh_cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn committed_video_pin_epoch_signal_belongs_only_to_the_import_result() {
+        let mut summary = ImportSummary::default();
+        summary.committed.video_pins = 3;
+        summary.committed.folder_pins = 2;
+        let import = WorkerMessage::Import {
+            result: Ok(summary),
+            resource_error: None,
+            view_trim_saved: true,
+        };
+        let refresh = WorkerMessage::Refresh(crate::app::metadata_import_refresh::RefreshResult {
+            contexts: Vec::new(),
+            page_snapshot: None,
+            errors: vec!["retryable refresh detail".into()],
+        });
+
+        assert_eq!(import.committed_thumbnail_pin_changes(), 5);
+        assert_eq!(refresh.committed_thumbnail_pin_changes(), 0);
+        assert_eq!(
+            WorkerMessage::Import {
+                result: Err("import failed".into()),
+                resource_error: None,
+                view_trim_saved: false,
+            }
+            .committed_thumbnail_pin_changes(),
+            0
+        );
+    }
+
+    #[test]
+    fn sidecar_restore_waits_only_for_transfer_stages_with_active_work() {
+        let settings = crate::settings::Settings::default();
+        let mut state = MetadataTransferState::export(PathBuf::from("C:/Pictures"), &settings);
+        assert!(!state.has_active_worker_or_refresh());
+
+        state.stage = Stage::LoadingPreview;
+        assert!(state.has_active_worker_or_refresh());
+        state.stage = Stage::WaitingForWriters;
+        assert!(state.has_active_worker_or_refresh());
+        state.stage = Stage::Running;
+        assert!(state.has_active_worker_or_refresh());
+        state.stage = Stage::RefreshPreparing;
+        assert!(state.has_active_worker_or_refresh());
+        state.stage = Stage::Refreshing;
+        assert!(state.has_active_worker_or_refresh());
+
+        state.stage = Stage::Result(ResultState::Export(Err("done".into())));
+        assert!(!state.has_active_worker_or_refresh());
+    }
+
+    #[test]
+    fn transfer_dialog_cannot_resume_released_readers_during_sidecar_restore() {
+        let settings = crate::settings::Settings::default();
+        let mut state = MetadataTransferState::export(PathBuf::from("C:/Pictures"), &settings);
+
+        assert!(!should_resume_transfer_context_readers(true, Some(&state)));
+        state.stage = Stage::Result(ResultState::Export(Err("done".into())));
+        assert!(!should_resume_transfer_context_readers(true, Some(&state)));
+        assert!(!should_resume_transfer_context_readers(true, None));
+
+        assert!(should_resume_transfer_context_readers(false, Some(&state)));
+        assert!(should_resume_transfer_context_readers(false, None));
     }
 }

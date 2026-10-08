@@ -9,7 +9,31 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 
-use crate::settings::SortOrder;
+use crate::settings::{FolderTreeSortOrder, Settings};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FolderPaneListingOptions {
+    pub(crate) sort_order: FolderTreeSortOrder,
+    pub(crate) show_hidden_files: bool,
+}
+
+impl FolderPaneListingOptions {
+    pub(crate) fn from_settings(settings: &Settings) -> Self {
+        Self {
+            sort_order: settings.folder_tree_sort_order,
+            show_hidden_files: settings.show_hidden_files,
+        }
+    }
+}
+
+impl Default for FolderPaneListingOptions {
+    fn default() -> Self {
+        Self {
+            sort_order: FolderTreeSortOrder::default(),
+            show_hidden_files: false,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FolderPaneTreeKey {
@@ -42,6 +66,12 @@ pub(crate) struct FolderPaneNode {
     pub path: PathBuf,
     pub children: Vec<PathBuf>,
     pub loaded: bool,
+    /// The latest listing options for which this node reached a terminal scan result.
+    ///
+    /// A failed refresh deliberately keeps the previous children, but still records the
+    /// attempted options so an expanded node does not start an automatic retry every frame.
+    /// Another option change or an explicit reload provides the next retry boundary.
+    resolved_options: Option<FolderPaneListingOptions>,
     pub loading: bool,
     pub error: Option<String>,
 }
@@ -52,6 +82,7 @@ impl FolderPaneNode {
             path,
             children: Vec::new(),
             loaded: false,
+            resolved_options: None,
             loading: false,
             error: None,
         }
@@ -62,6 +93,14 @@ pub(crate) struct FolderPaneScanPending {
     key: String,
     cancel: Arc<AtomicBool>,
     rx: mpsc::Receiver<Result<Vec<PathBuf>, String>>,
+    apply: FolderPaneScanApply,
+    listing_options: FolderPaneListingOptions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FolderPaneScanApply {
+    Populate,
+    RefreshPreservingChildren,
 }
 
 impl Drop for FolderPaneScanPending {
@@ -84,8 +123,7 @@ pub(crate) struct FolderPaneState {
     auto_expanded: HashSet<String>,
     user_collapsed: HashSet<String>,
     pending: Vec<FolderPaneScanPending>,
-    last_sort_order: SortOrder,
-    show_hidden_files: bool,
+    listing_options: FolderPaneListingOptions,
     /// `refresh_drives` の throttle 用。ペイン表示中は `sync_to_active` から毎フレーム
     /// 呼ばれるので、`GetLogicalDrives` + 最大 26 回 `GetDriveTypeW` を間引く。
     last_drive_refresh: Option<std::time::Instant>,
@@ -108,8 +146,7 @@ impl Default for FolderPaneState {
             auto_expanded: HashSet::new(),
             user_collapsed: HashSet::new(),
             pending: Vec::new(),
-            last_sort_order: SortOrder::default(),
-            show_hidden_files: false,
+            listing_options: FolderPaneListingOptions::default(),
             last_drive_refresh: None,
         }
     }
@@ -205,7 +242,7 @@ impl FolderPaneState {
         self.selected_drive = self.drives.first().cloned();
     }
 
-    pub(crate) fn select_drive(&mut self, drive: PathBuf, sort_order: SortOrder) {
+    pub(crate) fn select_drive(&mut self, drive: PathBuf) {
         self.has_focus = true;
         if self
             .selected_drive
@@ -215,21 +252,20 @@ impl FolderPaneState {
             self.cursor_path = Some(drive.clone());
             self.scroll_to_cursor = true;
             self.ensure_node(drive.clone());
-            self.ensure_scan(&drive, sort_order);
+            self.ensure_scan(&drive, FolderPaneScanApply::Populate);
             return;
         }
         self.selected_drive = Some(drive.clone());
         self.cursor_path = Some(drive.clone());
         self.scroll_to_cursor = true;
         self.ensure_node(drive.clone());
-        self.ensure_scan(&drive, sort_order);
+        self.ensure_scan(&drive, FolderPaneScanApply::Populate);
     }
 
     pub(crate) fn reload_for_active(
         &mut self,
         active: Option<&Path>,
-        sort_order: SortOrder,
-        show_hidden_files: bool,
+        listing_options: FolderPaneListingOptions,
     ) {
         self.cancel_pending();
         self.nodes.clear();
@@ -237,7 +273,8 @@ impl FolderPaneState {
         self.auto_expanded.clear();
         self.user_collapsed.clear();
         self.active_key = None;
-        self.sync_to_active(active, sort_order, show_hidden_files);
+        self.listing_options = listing_options;
+        self.sync_to_active(active, listing_options);
         self.cursor_path = self
             .active_path
             .clone()
@@ -248,25 +285,15 @@ impl FolderPaneState {
     pub(crate) fn sync_to_active(
         &mut self,
         active: Option<&Path>,
-        sort_order: SortOrder,
-        show_hidden_files: bool,
+        listing_options: FolderPaneListingOptions,
     ) {
         self.refresh_drives();
-        let sort_changed = self.last_sort_order != sort_order;
-        let visibility_changed = self.show_hidden_files != show_hidden_files;
-        let listing_options_changed = sort_changed || visibility_changed;
+        let listing_options_changed = self.listing_options != listing_options;
         if listing_options_changed {
-            // 列挙設定変更でツリーを作り直す。展開状態 (user_expanded / auto_expanded) も
-            // クリアして「nodes は消えたが展開キーだけ残る」orphan (= 展開表示なのに子を
-            // ロードできない行) を防ぐ。現在のフォルダまでの祖先チェーンは下で
-            // auto_expanded に再構築されるので、現在地までの展開は維持される。
+            // Receiver ごと古い scan を破棄する。node / 展開 / cursor は新結果が届くまで
+            // 現表示を保ち、同じ path の現 request だけが差し替える。
             self.cancel_pending();
-            self.nodes.clear();
-            self.user_expanded.clear();
-            self.auto_expanded.clear();
-            self.user_collapsed.clear();
-            self.last_sort_order = sort_order;
-            self.show_hidden_files = show_hidden_files;
+            self.listing_options = listing_options;
         }
 
         let active_folder = active.and_then(active_filesystem_folder);
@@ -307,16 +334,11 @@ impl FolderPaneState {
             self.ensure_node(drive);
         }
 
-        // 列挙設定変更直後は、作り直したツリーで現在のフォルダまでスクロールし直す
-        // (= ESC でグリッド→ツリーへ抜けたときの `set_focus_tree_at_active` と同じ
-        //  「現在地へ追従」挙動)。フォーカスは奪わない (グリッド操作中のソート変更で
-        //  ツリーに focus が飛ばないように、scroll だけ要求する)。
-        if listing_options_changed && let Some(active) = self.active_path.clone() {
-            self.cursor_path = Some(active);
-            self.scroll_to_cursor = true;
+        if listing_options_changed {
+            self.refresh_scans_for_materialized_expansions();
+        } else {
+            self.ensure_scans_for_expanded();
         }
-
-        self.ensure_scans_for_expanded(sort_order);
     }
 
     pub(crate) fn poll_pending(&mut self) -> bool {
@@ -326,19 +348,30 @@ impl FolderPaneState {
             match self.pending[idx].rx.try_recv() {
                 Ok(result) => {
                     let pending = self.pending.swap_remove(idx);
+                    let mut successful_children = None;
                     if let Some(node) = self.nodes.get_mut(&pending.key) {
                         node.loading = false;
-                        node.loaded = result.is_ok();
+                        node.resolved_options = Some(pending.listing_options);
                         match result {
                             Ok(children) => {
+                                node.loaded = true;
+                                successful_children = Some((node.path.clone(), children.clone()));
                                 node.children = children;
                                 node.error = None;
                             }
                             Err(err) => {
-                                node.children.clear();
+                                if pending.apply == FolderPaneScanApply::Populate {
+                                    node.loaded = false;
+                                    node.children.clear();
+                                }
                                 node.error = Some(err);
                             }
                         }
+                    }
+                    if pending.apply == FolderPaneScanApply::RefreshPreservingChildren
+                        && let Some((parent, children)) = successful_children
+                    {
+                        self.repair_cursor_after_successful_refresh(&parent, &children);
                     }
                     changed = true;
                 }
@@ -349,8 +382,11 @@ impl FolderPaneState {
                     let pending = self.pending.swap_remove(idx);
                     if let Some(node) = self.nodes.get_mut(&pending.key) {
                         node.loading = false;
-                        node.loaded = false;
-                        node.children.clear();
+                        node.resolved_options = Some(pending.listing_options);
+                        if pending.apply == FolderPaneScanApply::Populate {
+                            node.loaded = false;
+                            node.children.clear();
+                        }
                         node.error = Some("列挙に失敗しました".to_string());
                     }
                     changed = true;
@@ -375,11 +411,7 @@ impl FolderPaneState {
         self.scroll_to_cursor = true;
     }
 
-    pub(crate) fn handle_tree_key(
-        &mut self,
-        key: FolderPaneTreeKey,
-        sort_order: SortOrder,
-    ) -> Option<FolderPaneCommand> {
+    pub(crate) fn handle_tree_key(&mut self, key: FolderPaneTreeKey) -> Option<FolderPaneCommand> {
         match key {
             FolderPaneTreeKey::Up => {
                 self.move_cursor(-1);
@@ -394,7 +426,7 @@ impl FolderPaneState {
                 None
             }
             FolderPaneTreeKey::Right => {
-                self.expand_cursor(sort_order);
+                self.expand_cursor();
                 None
             }
             FolderPaneTreeKey::Enter => self.cursor_path.clone().map(FolderPaneCommand::Open),
@@ -452,7 +484,7 @@ impl FolderPaneState {
         }
     }
 
-    fn expand_cursor(&mut self, sort_order: SortOrder) {
+    fn expand_cursor(&mut self) {
         let Some(cursor) = self.cursor_path.clone() else {
             return;
         };
@@ -461,7 +493,7 @@ impl FolderPaneState {
             self.user_expanded.insert(key.clone());
             self.user_collapsed.remove(&key);
             self.ensure_node(cursor.clone());
-            self.ensure_scan(&cursor, sort_order);
+            self.ensure_scan(&cursor, FolderPaneScanApply::Populate);
             self.scroll_to_cursor = true;
             return;
         }
@@ -530,7 +562,7 @@ impl FolderPaneState {
         }
     }
 
-    fn ensure_scans_for_expanded(&mut self, sort_order: SortOrder) {
+    fn expanded_materialized_paths(&self) -> Vec<PathBuf> {
         let mut paths = Vec::new();
         for key in self
             .user_expanded
@@ -548,8 +580,22 @@ impl FolderPaneState {
         if let Some(root) = self.selected_drive.clone() {
             paths.push(root);
         }
+        let mut seen = HashSet::new();
+        paths.retain(|path| seen.insert(key_for(path)));
+        paths
+    }
+
+    fn ensure_scans_for_expanded(&mut self) {
+        let paths = self.expanded_materialized_paths();
         for path in paths {
-            self.ensure_scan(&path, sort_order);
+            self.ensure_scan(&path, FolderPaneScanApply::Populate);
+        }
+    }
+
+    fn refresh_scans_for_materialized_expansions(&mut self) {
+        let paths = self.expanded_materialized_paths();
+        for path in paths {
+            self.ensure_scan(&path, FolderPaneScanApply::RefreshPreservingChildren);
         }
     }
 
@@ -560,15 +606,26 @@ impl FolderPaneState {
             .or_insert_with(|| FolderPaneNode::placeholder(path));
     }
 
-    fn ensure_scan(&mut self, path: &Path, sort_order: SortOrder) {
+    fn ensure_scan(&mut self, path: &Path, apply: FolderPaneScanApply) {
         let key = key_for(path);
         self.ensure_node(path.to_path_buf());
         let Some(node) = self.nodes.get_mut(&key) else {
             return;
         };
-        if node.loaded || node.loading {
+        if node.loading {
             return;
         }
+        let apply = if apply == FolderPaneScanApply::Populate && node.loaded {
+            if node.resolved_options == Some(self.listing_options) {
+                return;
+            }
+            // A loaded branch may have been collapsed while the pane options changed. Keep its
+            // existing children visible, but refresh them before treating the re-expanded node
+            // as current.
+            FolderPaneScanApply::RefreshPreservingChildren
+        } else {
+            apply
+        };
         node.loading = true;
         node.error = None;
 
@@ -576,14 +633,14 @@ impl FolderPaneState {
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_w = Arc::clone(&cancel);
-        let show_hidden_files = self.show_hidden_files;
+        let listing_options = self.listing_options;
         let spawn_result = std::thread::Builder::new()
             .name("folder-pane-scan".to_string())
             .spawn(move || {
                 let result = scan_real_subfolders(
                     &scan_path,
-                    sort_order,
-                    show_hidden_files,
+                    listing_options.sort_order,
+                    listing_options.show_hidden_files,
                     Some(&cancel_w),
                 )
                 .map_err(|err| err.to_string());
@@ -594,11 +651,23 @@ impl FolderPaneState {
         if let Err(err) = spawn_result {
             if let Some(node) = self.nodes.get_mut(&key) {
                 node.loading = false;
+                if apply == FolderPaneScanApply::Populate {
+                    node.loaded = false;
+                    node.children.clear();
+                } else {
+                    node.resolved_options = Some(listing_options);
+                }
                 node.error = Some(format!("列挙スレッドを開始できません: {err}"));
             }
             return;
         }
-        self.pending.push(FolderPaneScanPending { key, cancel, rx });
+        self.pending.push(FolderPaneScanPending {
+            key,
+            cancel,
+            rx,
+            apply,
+            listing_options,
+        });
     }
 
     fn is_expanded_key(&self, key: &str) -> bool {
@@ -607,16 +676,51 @@ impl FolderPaneState {
     }
 
     fn cancel_pending(&mut self) {
-        for pending in &self.pending {
+        for pending in std::mem::take(&mut self.pending) {
             pending.cancel.store(true, Ordering::Relaxed);
+            if let Some(node) = self.nodes.get_mut(&pending.key) {
+                node.loading = false;
+            }
         }
-        self.pending.clear();
     }
+
+    fn repair_cursor_after_successful_refresh(&mut self, parent: &Path, children: &[PathBuf]) {
+        let Some(cursor) = self.cursor_path.as_ref() else {
+            return;
+        };
+        if crate::folder_tree::path_eq(cursor, parent)
+            || !path_is_same_or_descendant(cursor, parent)
+        {
+            return;
+        }
+        if children.iter().any(|child| {
+            crate::folder_tree::path_eq(cursor, child) || path_is_same_or_descendant(cursor, child)
+        }) {
+            return;
+        }
+
+        let active_visible = self.active_path.as_ref().is_some_and(|active| {
+            self.visible_rows()
+                .iter()
+                .any(|row| crate::folder_tree::path_eq(&row.path, active))
+        });
+        self.cursor_path = if active_visible {
+            self.active_path.clone()
+        } else {
+            self.selected_drive.clone()
+        };
+        self.scroll_to_cursor = true;
+    }
+}
+
+fn path_is_same_or_descendant(path: &Path, ancestor: &Path) -> bool {
+    path.ancestors()
+        .any(|candidate| crate::folder_tree::path_eq(candidate, ancestor))
 }
 
 pub(crate) fn scan_real_subfolders(
     path: &Path,
-    sort_order: SortOrder,
+    sort_order: FolderTreeSortOrder,
     show_hidden_files: bool,
     cancel: Option<&AtomicBool>,
 ) -> std::io::Result<Vec<PathBuf>> {
@@ -642,14 +746,14 @@ struct FolderPaneScanStats {
 
 fn scan_real_subfolders_inner(
     path: &Path,
-    sort_order: SortOrder,
+    sort_order: FolderTreeSortOrder,
     show_hidden_files: bool,
     cancel: Option<&AtomicBool>,
     stats: &mut FolderPaneScanStats,
 ) -> std::io::Result<Vec<PathBuf>> {
     let mut dirs: Vec<(PathBuf, i64)> = Vec::new();
     let entries = std::fs::read_dir(path)?;
-    let use_mtime = matches!(sort_order, SortOrder::DateAsc | SortOrder::DateDesc);
+    let use_mtime = sort_order.uses_mtime();
     for entry in entries {
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             stats.canceled = true;
@@ -714,13 +818,13 @@ fn scan_real_subfolders_inner(
 
 fn emit_folder_pane_scan_perf(
     path: &Path,
-    sort_order: SortOrder,
+    sort_order: FolderTreeSortOrder,
     start: std::time::Instant,
     stats: &FolderPaneScanStats,
     result: &std::io::Result<Vec<PathBuf>>,
 ) {
     let ms = start.elapsed().as_secs_f64() * 1000.0;
-    let use_mtime = matches!(sort_order, SortOrder::DateAsc | SortOrder::DateDesc);
+    let use_mtime = sort_order.uses_mtime();
     let mut fields = vec![
         ("ms", serde_json::Value::from(ms)),
         ("entries_seen", serde_json::Value::from(stats.entries_seen)),
@@ -847,6 +951,16 @@ mod tests {
         PathBuf::from(s)
     }
 
+    fn options(
+        sort_order: FolderTreeSortOrder,
+        show_hidden_files: bool,
+    ) -> FolderPaneListingOptions {
+        FolderPaneListingOptions {
+            sort_order,
+            show_hidden_files,
+        }
+    }
+
     #[test]
     fn active_virtual_folder_maps_to_parent() {
         assert_eq!(
@@ -862,7 +976,10 @@ mod tests {
     #[test]
     fn sync_to_active_expands_minimum_ancestor_chain() {
         let mut state = FolderPaneState::default();
-        state.sync_to_active(Some(Path::new(r"C:\a\b\c")), SortOrder::FileName, false);
+        state.sync_to_active(
+            Some(Path::new(r"C:\a\b\c")),
+            options(FolderTreeSortOrder::NameAsc, false),
+        );
         let root_key = key_for(Path::new(r"C:\"));
         let a_key = key_for(Path::new(r"C:\a"));
         let b_key = key_for(Path::new(r"C:\a\b"));
@@ -877,10 +994,16 @@ mod tests {
     #[test]
     fn auto_branch_is_replaced_but_user_expansion_persists() {
         let mut state = FolderPaneState::default();
-        state.sync_to_active(Some(Path::new(r"C:\a\b")), SortOrder::FileName, false);
+        state.sync_to_active(
+            Some(Path::new(r"C:\a\b")),
+            options(FolderTreeSortOrder::NameAsc, false),
+        );
         state.user_expanded.insert(key_for(Path::new(r"C:\manual")));
         state.ensure_node(p(r"C:\manual"));
-        state.sync_to_active(Some(Path::new(r"C:\x\y")), SortOrder::FileName, false);
+        state.sync_to_active(
+            Some(Path::new(r"C:\x\y")),
+            options(FolderTreeSortOrder::NameAsc, false),
+        );
         assert!(!state.auto_expanded.contains(&key_for(Path::new(r"C:\a"))));
         assert!(state.auto_expanded.contains(&key_for(Path::new(r"C:\x"))));
         assert!(
@@ -893,7 +1016,10 @@ mod tests {
     #[test]
     fn cursor_nav_target_only_when_cursor_moved_off_active() {
         let mut state = FolderPaneState::default();
-        state.sync_to_active(Some(Path::new(r"C:\a\b")), SortOrder::FileName, false);
+        state.sync_to_active(
+            Some(Path::new(r"C:\a\b")),
+            options(FolderTreeSortOrder::NameAsc, false),
+        );
         // 開いた直後はカーソル = アクティブなので移動先なし (= 単に閉じる)。
         assert_eq!(state.cursor_nav_target_if_moved(), None);
         // カーソルを別フォルダへ動かすと、その移動先を返す (= Enter 相当で移動)。
@@ -902,61 +1028,336 @@ mod tests {
     }
 
     #[test]
-    fn sort_change_resets_expansion_and_scrolls_to_active() {
+    fn sort_change_preserves_expansion_cursor_and_visible_children_until_refresh() {
         let mut state = FolderPaneState::default();
-        state.sync_to_active(Some(Path::new(r"C:\a\b")), SortOrder::FileName, false);
+        state.sync_to_active(
+            Some(Path::new(r"C:\a\b")),
+            options(FolderTreeSortOrder::NameAsc, false),
+        );
         // ユーザーが現在地と無関係な枝を手動展開している状態を作る。
         state.user_expanded.insert(key_for(Path::new(r"C:\manual")));
         state.ensure_node(p(r"C:\manual"));
+        state.cursor_path = Some(p(r"C:\manual"));
         state.scroll_to_cursor = false;
+        let manual_key = key_for(Path::new(r"C:\manual"));
+        state.nodes.get_mut(&manual_key).unwrap().children = vec![p(r"C:\manual\old")];
+        state.nodes.get_mut(&manual_key).unwrap().loaded = true;
 
         // ソート順を変更すると作り直しが走る (active は同じ C:\a\b)。
-        state.sync_to_active(Some(Path::new(r"C:\a\b")), SortOrder::DateDesc, false);
+        state.sync_to_active(
+            Some(Path::new(r"C:\a\b")),
+            options(FolderTreeSortOrder::DateDesc, false),
+        );
 
-        // 手動展開は捨てられ orphan 行を残さない。
-        assert!(
-            !state
-                .user_expanded
-                .contains(&key_for(Path::new(r"C:\manual")))
+        assert!(state.user_expanded.contains(&manual_key));
+        assert_eq!(state.cursor_path.as_deref(), Some(Path::new(r"C:\manual")));
+        assert_eq!(
+            state.nodes.get(&manual_key).unwrap().children,
+            vec![p(r"C:\manual\old")]
         );
         // 現在地までの祖先チェーンは再構築される。
         assert!(state.auto_expanded.contains(&key_for(Path::new(r"C:\a"))));
-        // そして現在のフォルダへスクロールし直す (= 現在地を見失わない)。
-        assert!(state.scroll_to_cursor);
-        assert_eq!(state.cursor_path.as_deref(), Some(Path::new(r"C:\a\b")));
+        assert!(!state.scroll_to_cursor);
+        assert!(state.pending.iter().any(|pending| {
+            pending.key == manual_key
+                && pending.apply == FolderPaneScanApply::RefreshPreservingChildren
+        }));
     }
 
     #[test]
     fn collapse_auto_expanded_branch_hides_it_until_active_changes() {
         let mut state = FolderPaneState::default();
-        state.sync_to_active(Some(Path::new(r"C:\a\b")), SortOrder::FileName, false);
+        state.sync_to_active(
+            Some(Path::new(r"C:\a\b")),
+            options(FolderTreeSortOrder::NameAsc, false),
+        );
         state.cursor_path = Some(p(r"C:\a"));
         state.collapse_cursor();
         assert!(state.user_collapsed.contains(&key_for(Path::new(r"C:\a"))));
         assert!(!state.is_expanded_key(&key_for(Path::new(r"C:\a"))));
-        state.sync_to_active(Some(Path::new(r"C:\a\c")), SortOrder::FileName, false);
+        state.sync_to_active(
+            Some(Path::new(r"C:\a\c")),
+            options(FolderTreeSortOrder::NameAsc, false),
+        );
         assert!(!state.user_collapsed.contains(&key_for(Path::new(r"C:\a"))));
         assert!(state.is_expanded_key(&key_for(Path::new(r"C:\a"))));
     }
 
     #[test]
-    fn hidden_visibility_change_rebuilds_tree_cache() {
+    fn hidden_visibility_change_preserves_manual_expansion_and_cursor() {
         let mut state = FolderPaneState::default();
-        state.sync_to_active(Some(Path::new(r"C:\a\b")), SortOrder::FileName, false);
+        state.sync_to_active(
+            Some(Path::new(r"C:\a\b")),
+            options(FolderTreeSortOrder::NameAsc, false),
+        );
         state.user_expanded.insert(key_for(Path::new(r"C:\manual")));
         state.ensure_node(p(r"C:\manual"));
+        state.cursor_path = Some(p(r"C:\manual"));
         state.scroll_to_cursor = false;
 
-        state.sync_to_active(Some(Path::new(r"C:\a\b")), SortOrder::FileName, true);
+        state.sync_to_active(
+            Some(Path::new(r"C:\a\b")),
+            options(FolderTreeSortOrder::NameAsc, true),
+        );
 
-        assert!(state.show_hidden_files);
+        assert!(state.listing_options.show_hidden_files);
         assert!(
-            !state
+            state
                 .user_expanded
                 .contains(&key_for(Path::new(r"C:\manual")))
         );
         assert!(state.auto_expanded.contains(&key_for(Path::new(r"C:\a"))));
+        assert!(!state.scroll_to_cursor);
+        assert_eq!(state.cursor_path.as_deref(), Some(Path::new(r"C:\manual")));
+    }
+
+    #[test]
+    fn refresh_failure_keeps_previous_children_and_marks_error() {
+        let mut state = FolderPaneState::default();
+        state.cancel_pending();
+        state.listing_options = options(FolderTreeSortOrder::DateDesc, false);
+        let root = p(r"C:\library");
+        let old = p(r"C:\library\old");
+        let key = key_for(&root);
+        state.selected_drive = Some(root.clone());
+        state.nodes.insert(
+            key.clone(),
+            FolderPaneNode {
+                path: root,
+                children: vec![old.clone()],
+                loaded: true,
+                resolved_options: Some(options(FolderTreeSortOrder::NameAsc, false)),
+                loading: true,
+                error: None,
+            },
+        );
+        let (tx, rx) = mpsc::channel();
+        tx.send(Err("refresh failed".to_string())).unwrap();
+        state.pending.push(FolderPaneScanPending {
+            key: key.clone(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx,
+            apply: FolderPaneScanApply::RefreshPreservingChildren,
+            listing_options: options(FolderTreeSortOrder::DateDesc, false),
+        });
+
+        assert!(state.poll_pending());
+        let node = state.nodes.get(&key).unwrap();
+        assert_eq!(node.children, vec![old]);
+        assert!(node.loaded);
+        assert!(!node.loading);
+        assert_eq!(node.error.as_deref(), Some("refresh failed"));
+        assert_eq!(
+            node.resolved_options,
+            Some(options(FolderTreeSortOrder::DateDesc, false))
+        );
+        state.ensure_scan(Path::new(r"C:\library"), FolderPaneScanApply::Populate);
+        assert!(
+            state.pending.is_empty(),
+            "a terminal refresh failure must not trigger an automatic per-frame retry"
+        );
+    }
+
+    #[test]
+    fn collapsed_loaded_branch_refreshes_with_current_options_when_reexpanded() {
+        let mut state = FolderPaneState::default();
+        state.cancel_pending();
+        let root = p(r"C:\library");
+        let old = root.join("old");
+        let current = root.join("current");
+        let key = key_for(&root);
+        let previous = options(FolderTreeSortOrder::NameAsc, false);
+        let next = options(FolderTreeSortOrder::NumericDesc, true);
+        state.selected_drive = Some(p(r"C:\"));
+        state.cursor_path = Some(root.clone());
+        state.user_expanded.insert(key.clone());
+        state.nodes.insert(
+            key.clone(),
+            FolderPaneNode {
+                path: root.clone(),
+                children: vec![old.clone()],
+                loaded: true,
+                resolved_options: Some(previous),
+                loading: false,
+                error: None,
+            },
+        );
+
+        state.collapse_cursor();
+        state.sync_to_active(None, next);
+        assert!(state.pending.iter().all(|pending| pending.key != key));
+        assert_eq!(state.nodes.get(&key).unwrap().children, vec![old]);
+
+        state.expand_cursor();
+        let pending = state
+            .pending
+            .iter()
+            .find(|pending| pending.key == key)
+            .expect("re-expanded branch must request its current listing options");
+        assert_eq!(
+            pending.apply,
+            FolderPaneScanApply::RefreshPreservingChildren
+        );
+        assert_eq!(pending.listing_options, next);
+        assert_eq!(
+            state.nodes.get(&key).unwrap().children,
+            vec![root.join("old")]
+        );
+
+        state.cancel_pending();
+        state.nodes.get_mut(&key).unwrap().loading = true;
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(vec![current.clone()])).unwrap();
+        state.pending.push(FolderPaneScanPending {
+            key: key.clone(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx,
+            apply: FolderPaneScanApply::RefreshPreservingChildren,
+            listing_options: next,
+        });
+
+        assert!(state.poll_pending());
+        let node = state.nodes.get(&key).unwrap();
+        assert_eq!(node.children, vec![current]);
+        assert_eq!(node.resolved_options, Some(next));
+        assert!(node.error.is_none());
+    }
+
+    #[test]
+    fn only_latest_private_receiver_can_replace_children_after_rapid_option_changes() {
+        let mut state = FolderPaneState::default();
+        state.cancel_pending();
+        let root = state.selected_drive.clone().expect("test drive");
+        let key = key_for(&root);
+        let old = root.join("old");
+        state.nodes.insert(
+            key.clone(),
+            FolderPaneNode {
+                path: root.clone(),
+                children: vec![old.clone()],
+                loaded: true,
+                resolved_options: Some(options(FolderTreeSortOrder::NameAsc, false)),
+                loading: true,
+                error: None,
+            },
+        );
+        state.user_expanded.insert(key.clone());
+
+        let (tx_a, rx_a) = mpsc::channel();
+        state.pending.push(FolderPaneScanPending {
+            key: key.clone(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx: rx_a,
+            apply: FolderPaneScanApply::RefreshPreservingChildren,
+            listing_options: options(FolderTreeSortOrder::NameAsc, false),
+        });
+        state.sync_to_active(None, options(FolderTreeSortOrder::NameDesc, false));
+        assert!(tx_a.send(Ok(vec![root.join("stale-a")])).is_err());
+
+        state.cancel_pending();
+        let (tx_b, rx_b) = mpsc::channel();
+        state.nodes.get_mut(&key).unwrap().loading = true;
+        state.pending.push(FolderPaneScanPending {
+            key: key.clone(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx: rx_b,
+            apply: FolderPaneScanApply::RefreshPreservingChildren,
+            listing_options: options(FolderTreeSortOrder::NameDesc, false),
+        });
+        state.sync_to_active(None, options(FolderTreeSortOrder::NumericDesc, false));
+        assert!(tx_b.send(Ok(vec![root.join("stale-b")])).is_err());
+
+        state.cancel_pending();
+        let (tx_c, rx_c) = mpsc::channel();
+        state.nodes.get_mut(&key).unwrap().loading = true;
+        state.pending.push(FolderPaneScanPending {
+            key: key.clone(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx: rx_c,
+            apply: FolderPaneScanApply::RefreshPreservingChildren,
+            listing_options: options(FolderTreeSortOrder::NumericDesc, false),
+        });
+        let latest = root.join("latest-c");
+        tx_c.send(Ok(vec![latest.clone()])).unwrap();
+
+        assert!(state.poll_pending());
+        assert_eq!(state.nodes.get(&key).unwrap().children, vec![latest]);
+        assert!(!state.has_pending());
+    }
+
+    #[test]
+    fn successful_refresh_repairs_a_disappeared_cursor_without_opening_a_folder() {
+        let mut state = FolderPaneState::default();
+        state.cancel_pending();
+        let root = p(r"C:\Library");
+        let active = p(r"c:\library\active");
+        let cursor = p(r"c:\LIBRARY\removed\deep");
+        let key = key_for(&root);
+        state.selected_drive = Some(root.clone());
+        state.active_path = Some(active.clone());
+        state.cursor_path = Some(cursor);
+        state.user_expanded.insert(key.clone());
+        state.nodes.insert(
+            key.clone(),
+            FolderPaneNode {
+                path: root,
+                children: vec![active.clone()],
+                loaded: true,
+                resolved_options: Some(options(FolderTreeSortOrder::NameAsc, false)),
+                loading: true,
+                error: None,
+            },
+        );
+        state.nodes.insert(
+            key_for(&active),
+            FolderPaneNode::placeholder(active.clone()),
+        );
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(vec![active.clone()])).unwrap();
+        state.pending.push(FolderPaneScanPending {
+            key: key.clone(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx,
+            apply: FolderPaneScanApply::RefreshPreservingChildren,
+            listing_options: options(FolderTreeSortOrder::NameAsc, false),
+        });
+
+        assert!(state.poll_pending());
+        assert_eq!(state.cursor_path.as_deref(), Some(active.as_path()));
         assert!(state.scroll_to_cursor);
+        assert_eq!(state.cursor_nav_target_if_moved(), None);
+    }
+
+    #[test]
+    fn explicit_reload_still_resets_expansion_before_rebuilding_active_chain() {
+        let mut state = FolderPaneState::default();
+        state.sync_to_active(
+            Some(Path::new(r"C:\active\child")),
+            options(FolderTreeSortOrder::NameAsc, false),
+        );
+        state.user_expanded.insert(key_for(Path::new(r"C:\manual")));
+        state.ensure_node(p(r"C:\manual"));
+
+        state.reload_for_active(
+            Some(Path::new(r"C:\active\child")),
+            options(FolderTreeSortOrder::DateAsc, true),
+        );
+
+        assert!(state.user_expanded.is_empty());
+        assert!(state.user_collapsed.is_empty());
+        assert!(
+            state
+                .auto_expanded
+                .contains(&key_for(Path::new(r"C:\active")))
+        );
+        assert_eq!(
+            state.cursor_path.as_deref(),
+            Some(Path::new(r"C:\active\child"))
+        );
+        assert_eq!(
+            state.listing_options,
+            options(FolderTreeSortOrder::DateAsc, true)
+        );
     }
 
     #[test]
@@ -972,6 +1373,7 @@ mod tests {
                 path: root.clone(),
                 children: vec![a.clone(), b.clone()],
                 loaded: true,
+                resolved_options: Some(options(FolderTreeSortOrder::NameAsc, false)),
                 loading: false,
                 error: None,
             },
@@ -984,9 +1386,9 @@ mod tests {
             .insert(key_for(&b), FolderPaneNode::placeholder(b.clone()));
         state.user_expanded.insert(key_for(&root));
         state.cursor_path = Some(root);
-        state.handle_tree_key(FolderPaneTreeKey::Down, SortOrder::FileName);
+        state.handle_tree_key(FolderPaneTreeKey::Down);
         assert_eq!(state.cursor_path.as_deref(), Some(a.as_path()));
-        let command = state.handle_tree_key(FolderPaneTreeKey::Enter, SortOrder::FileName);
+        let command = state.handle_tree_key(FolderPaneTreeKey::Enter);
         assert_eq!(command, Some(FolderPaneCommand::Open(a)));
     }
 
@@ -997,7 +1399,8 @@ mod tests {
         std::fs::create_dir(tmp.path().join("a")).unwrap();
         std::fs::write(tmp.path().join("book.zip"), b"not a real tree folder").unwrap();
         std::fs::write(tmp.path().join("doc.pdf"), b"pdf").unwrap();
-        let dirs = scan_real_subfolders(tmp.path(), SortOrder::FileName, false, None).unwrap();
+        let dirs =
+            scan_real_subfolders(tmp.path(), FolderTreeSortOrder::NameAsc, false, None).unwrap();
         let labels: Vec<_> = dirs.iter().map(|path| folder_label(path)).collect();
         assert_eq!(labels, vec!["a", "b"]);
     }
@@ -1011,7 +1414,8 @@ mod tests {
                 .join(crate::fs_entry::PORTABLE_METADATA_BUNDLE_DIRNAME),
         )
         .unwrap();
-        let dirs = scan_real_subfolders(tmp.path(), SortOrder::FileName, true, None).unwrap();
+        let dirs =
+            scan_real_subfolders(tmp.path(), FolderTreeSortOrder::NameAsc, true, None).unwrap();
         let labels: Vec<_> = dirs.iter().map(|path| folder_label(path)).collect();
         assert_eq!(labels, vec!["visible"]);
     }
@@ -1027,7 +1431,8 @@ mod tests {
             return;
         }
 
-        let dirs = scan_real_subfolders(tmp.path(), SortOrder::FileName, false, None).unwrap();
+        let dirs =
+            scan_real_subfolders(tmp.path(), FolderTreeSortOrder::NameAsc, false, None).unwrap();
         let labels: Vec<_> = dirs.iter().map(|path| folder_label(path)).collect();
         assert_eq!(labels, vec!["link", "target"]);
     }

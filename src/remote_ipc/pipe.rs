@@ -48,9 +48,10 @@ use super::page_jobs::{
     DisplayRequestId, PageJobCancelCause, PageJobId, PageJobPriority, PageJobRegistry,
     PromotePageJobResult, RegisterPageJobError, ReleasePageJobResult,
 };
+use super::persistent_collections::PersistentCollectionEngine;
 use super::session::{
-    SessionHandle, SessionOperation, SessionRuntime, UiWriteOutcome, VideoStreamUiOutcome,
-    VideoStreamUiRequest,
+    RemoteOperationCancellation, SessionHandle, SessionOperation, SessionRuntime, UiWriteOutcome,
+    VideoStreamUiOutcome, VideoStreamUiRequest,
 };
 use super::thumbnail::{ThumbnailEngine, WorkerContext};
 use super::video_stream::{VideoStreamEngine, VideoStreamStartBudget, VideoStreamStartStage};
@@ -596,12 +597,137 @@ pub(super) struct ServerGuard {
     write_work_tx: mpsc::SyncSender<Work>,
     stream_work_tx: mpsc::SyncSender<Work>,
     session_runtime: SessionRuntime,
+    settings_reader_control: super::live_favorites::RemoteSettingsReaderControl,
+    raw_flights: Arc<super::raw_flights::RemoteRawFlights>,
+    raw_prefetch: Option<super::raw_prefetch::RawPrefetchService>,
     _ai_jobs: Arc<super::ai_job::RemoteAiJobRegistry>,
     _archive_jobs: Arc<super::archive_job::RemoteArchiveJobRegistry>,
 }
 
+#[derive(Clone)]
+pub(super) struct ServerControl {
+    stop: Arc<AtomicBool>,
+    session: SessionHandle,
+}
+
+impl ServerControl {
+    pub(super) fn begin_app_exit(&self) {
+        if !self.stop.swap(true, Ordering::AcqRel) {
+            for _ in 0..ACCEPTOR_COUNT {
+                poke_listener();
+            }
+        }
+        self.session.retire_app_admission();
+    }
+}
+
+/// Owns every worker started after the persistent settings reader is created. Any early return
+/// runs the same ordered shutdown as `ServerGuard::drop`, so `RemoteIpcServer::start(Err)` proves
+/// that no detached worker can retain a `CollectionEngine`/`LiveFavorites` clone.
+struct ServerStartupWorkers {
+    armed: bool,
+    stop: Arc<AtomicBool>,
+    raw_flights: Arc<super::raw_flights::RemoteRawFlights>,
+    raw_prefetch: Option<super::raw_prefetch::RawPrefetchService>,
+    listeners: Vec<std::thread::JoinHandle<()>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+    stream_workers: Vec<std::thread::JoinHandle<()>>,
+    home_worker: Option<std::thread::JoinHandle<()>>,
+    write_worker: Option<std::thread::JoinHandle<()>>,
+    heavy_queue: Arc<HeavyQueueWiring>,
+    home_work_tx: mpsc::SyncSender<Work>,
+    write_work_tx: mpsc::SyncSender<Work>,
+    stream_work_tx: mpsc::SyncSender<Work>,
+}
+
+struct StartedWorkers {
+    stop: Arc<AtomicBool>,
+    raw_flights: Arc<super::raw_flights::RemoteRawFlights>,
+    raw_prefetch: Option<super::raw_prefetch::RawPrefetchService>,
+    listeners: Vec<std::thread::JoinHandle<()>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+    stream_workers: Vec<std::thread::JoinHandle<()>>,
+    home_worker: Option<std::thread::JoinHandle<()>>,
+    write_worker: Option<std::thread::JoinHandle<()>>,
+    heavy_queue: Arc<HeavyQueueWiring>,
+    home_work_tx: mpsc::SyncSender<Work>,
+    write_work_tx: mpsc::SyncSender<Work>,
+    stream_work_tx: mpsc::SyncSender<Work>,
+}
+
+impl ServerStartupWorkers {
+    fn finish(mut self) -> StartedWorkers {
+        self.armed = false;
+        StartedWorkers {
+            stop: Arc::clone(&self.stop),
+            raw_flights: Arc::clone(&self.raw_flights),
+            raw_prefetch: self.raw_prefetch.take(),
+            listeners: std::mem::take(&mut self.listeners),
+            workers: std::mem::take(&mut self.workers),
+            stream_workers: std::mem::take(&mut self.stream_workers),
+            home_worker: self.home_worker.take(),
+            write_worker: self.write_worker.take(),
+            heavy_queue: Arc::clone(&self.heavy_queue),
+            home_work_tx: self.home_work_tx.clone(),
+            write_work_tx: self.write_work_tx.clone(),
+            stream_work_tx: self.stream_work_tx.clone(),
+        }
+    }
+
+    fn shutdown(&mut self, reason: &'static str) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        respond_stopped_works(self.heavy_queue.stop(), reason);
+        drop(self.raw_prefetch.take());
+        self.raw_flights.stop();
+        self.stop.store(true, Ordering::Release);
+        for _ in 0..self.listeners.len() {
+            poke_listener();
+        }
+        for listener in self.listeners.drain(..) {
+            let _ = listener.join();
+        }
+        if self.home_worker.is_some() {
+            let _ = self.home_work_tx.send(Work::Stop);
+        }
+        if self.write_worker.is_some() {
+            let _ = self.write_work_tx.send(Work::Stop);
+        }
+        for _ in 0..self.stream_workers.len() {
+            let _ = self.stream_work_tx.send(Work::Stop);
+        }
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+        if let Some(worker) = self.home_worker.take() {
+            let _ = worker.join();
+        }
+        if let Some(worker) = self.write_worker.take() {
+            let _ = worker.join();
+        }
+        for worker in self.stream_workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for ServerStartupWorkers {
+    fn drop(&mut self) {
+        self.shutdown("startup_rollback");
+    }
+}
+
 impl ServerGuard {
-    pub(super) fn start(settings: crate::settings::Settings) -> Result<Self, String> {
+    pub(super) fn start(
+        settings: crate::settings::Settings,
+        persistent_collection_producer: Option<
+            crate::collection_store::CollectionRemoteProducerControl,
+        >,
+        raw_develop_executor: Arc<crate::raw::RawDevelopExecutor>,
+        io_sem: Arc<crate::io_semaphore::GlobalIoSemaphore>,
+    ) -> Result<Self, String> {
         // 最初の instance は同名サーバの二重起動検出も兼ねる。他の instance も
         // listener 開始前に作り、起動完了時点で複数本が必ず待機できる形にする。
         let mut initial_pipes = Vec::with_capacity(ACCEPTOR_COUNT);
@@ -625,11 +751,14 @@ impl ServerGuard {
         let configured_worker_count = settings.parallelism.thread_count();
         let worker_count = remote_heavy_worker_count(configured_worker_count);
         let favorites = super::live_favorites::LiveFavorites::live(settings.favorites.clone())?;
-        let thumbnail_engine = Arc::new(ThumbnailEngine::new(settings.clone()));
-        let container_engine = Arc::new(ContainerEngine::new_with_session(
+        let settings_reader_control = favorites.control();
+        let thumbnail_engine = Arc::new(ThumbnailEngine::new_with_io_sem(settings.clone(), io_sem));
+        let container_engine = Arc::new(ContainerEngine::new_with_session_and_raw_executor(
             settings.clone(),
             session_handle.clone(),
+            raw_develop_executor,
         ));
+        let raw_flights = container_engine.raw_flights();
         let ai_executor = Arc::new(super::ai_job::ContainerRemoteAiExecutor::new(Arc::clone(
             &container_engine,
         )));
@@ -645,6 +774,9 @@ impl ServerGuard {
         let collection_engine = Arc::new(CollectionEngine::new_with_live_favorites(
             settings, favorites,
         ));
+        let persistent_collection_engine = persistent_collection_producer
+            .map(PersistentCollectionEngine::new)
+            .map(Arc::new);
         let heavy_queue = Arc::new(HeavyQueueWiring::new(worker_count, Arc::clone(&page_jobs)));
         let (home_work_tx, home_work_rx) = mpsc::sync_channel::<Work>(HOME_WORK_QUEUE_CAPACITY);
         let (write_work_tx, write_work_rx) = mpsc::sync_channel::<Work>(WRITE_WORK_QUEUE_CAPACITY);
@@ -654,7 +786,9 @@ impl ServerGuard {
         let home_metrics = Arc::new(QueueMetrics::new("home"));
         let write_metrics = Arc::new(QueueMetrics::new("write"));
         let stream_metrics = Arc::new(QueueMetrics::new("stream"));
+        let stop = Arc::new(AtomicBool::new(false));
         let home_collection_engine = Arc::clone(&collection_engine);
+        let home_persistent_collection_engine = persistent_collection_engine.clone();
         let home_container_engine = Arc::clone(&container_engine);
         let home_worker_metrics = Arc::clone(&home_metrics);
         let home_worker = std::thread::Builder::new()
@@ -663,33 +797,58 @@ impl ServerGuard {
                 home_worker_loop(
                     home_work_rx,
                     &home_collection_engine,
+                    home_persistent_collection_engine.as_deref(),
                     &home_container_engine,
                     &home_worker_metrics,
                 )
             })
             .map_err(|error| format!("remote IPC home worker を開始できません: {error}"))?;
+        let mut startup = ServerStartupWorkers {
+            armed: true,
+            stop: Arc::clone(&stop),
+            raw_flights,
+            raw_prefetch: None,
+            listeners: Vec::with_capacity(ACCEPTOR_COUNT),
+            workers: Vec::with_capacity(worker_count),
+            stream_workers: Vec::with_capacity(STREAM_WORKER_COUNT),
+            home_worker: Some(home_worker),
+            write_worker: None,
+            heavy_queue: Arc::clone(&heavy_queue),
+            home_work_tx: home_work_tx.clone(),
+            write_work_tx: write_work_tx.clone(),
+            stream_work_tx: stream_work_tx.clone(),
+        };
+        let raw_prefetch = super::raw_prefetch::RawPrefetchService::start(
+            container_engine.raw_flights(),
+            Arc::clone(&container_engine) as Arc<dyn super::raw_prefetch::PrefetchIdentifier>,
+        )?;
+        session_handle.install_raw_prefetch(&raw_prefetch.registry);
+        startup.raw_prefetch = Some(raw_prefetch);
+
         let write_container_engine = Arc::clone(&container_engine);
         let write_session = session_handle.clone();
         let write_worker_metrics = Arc::clone(&write_metrics);
-        let write_worker = std::thread::Builder::new()
-            .name("remote-write".to_owned())
-            .spawn(move || {
-                write_worker_loop(
-                    write_work_rx,
-                    &write_container_engine,
-                    &write_session,
-                    &write_worker_metrics,
-                )
-            })
-            .map_err(|error| format!("remote IPC write worker を開始できません: {error}"))?;
-        let mut workers = Vec::with_capacity(worker_count);
+        startup.write_worker = Some(
+            std::thread::Builder::new()
+                .name("remote-write".to_owned())
+                .spawn(move || {
+                    write_worker_loop(
+                        write_work_rx,
+                        &write_container_engine,
+                        &write_session,
+                        &write_worker_metrics,
+                    )
+                })
+                .map_err(|error| format!("remote IPC write worker を開始できません: {error}"))?,
+        );
         for index in 0..worker_count {
             let worker_queue = Arc::clone(&heavy_queue);
             let thumbnail_engine = Arc::clone(&thumbnail_engine);
             let container_engine = Arc::clone(&container_engine);
             let collection_engine = Arc::clone(&collection_engine);
+            let persistent_collection_engine = persistent_collection_engine.clone();
             let session = session_handle.clone();
-            workers.push(
+            startup.workers.push(
                 std::thread::Builder::new()
                     .name(format!("remote-thumb-{index}"))
                     .spawn(move || {
@@ -698,6 +857,7 @@ impl ServerGuard {
                             &thumbnail_engine,
                             &container_engine,
                             &collection_engine,
+                            persistent_collection_engine.as_deref(),
                             &session,
                             index,
                         )
@@ -705,13 +865,12 @@ impl ServerGuard {
                     .map_err(|error| format!("remote IPC worker を開始できません: {error}"))?,
             );
         }
-        let mut stream_workers = Vec::with_capacity(STREAM_WORKER_COUNT);
         for index in 0..STREAM_WORKER_COUNT {
             let work_rx = Arc::clone(&stream_work_rx);
             let engine = Arc::clone(&video_stream_engine);
             let session = session_handle.clone();
             let worker_metrics = Arc::clone(&stream_metrics);
-            stream_workers.push(
+            startup.stream_workers.push(
                 std::thread::Builder::new()
                     .name(format!("remote-stream-ipc-{index}"))
                     .spawn(move || {
@@ -723,9 +882,7 @@ impl ServerGuard {
             );
         }
 
-        let stop = Arc::new(AtomicBool::new(false));
         let next_connection_id = Arc::new(AtomicU64::new(1));
-        let mut listeners = Vec::with_capacity(ACCEPTOR_COUNT);
         for (index, initial_pipe) in initial_pipes.into_iter().enumerate() {
             let listener_stop = Arc::clone(&stop);
             let listener_heavy_queue = Arc::clone(&heavy_queue);
@@ -738,51 +895,28 @@ impl ServerGuard {
             let listener_next_connection_id = Arc::clone(&next_connection_id);
             let listener_session = session_handle.clone();
             let listener_page_jobs = Arc::clone(&page_jobs);
-            match std::thread::Builder::new()
-                .name(format!("remote-ipc-listener-{index}"))
-                .spawn(move || {
-                    acceptor_loop(
-                        listener_stop,
-                        listener_heavy_queue,
-                        listener_home_tx,
-                        listener_write_tx,
-                        listener_stream_tx,
-                        listener_home_metrics,
-                        listener_write_metrics,
-                        listener_stream_metrics,
-                        listener_next_connection_id,
-                        listener_session,
-                        listener_page_jobs,
-                        initial_pipe,
-                        index,
-                    )
-                }) {
-                Ok(listener) => listeners.push(listener),
-                Err(error) => {
-                    stop.store(true, Ordering::Release);
-                    for _ in 0..listeners.len() {
-                        poke_listener();
-                    }
-                    for listener in listeners {
-                        let _ = listener.join();
-                    }
-                    respond_stopped_works(heavy_queue.stop(), "listener_start_failed");
-                    let _ = home_work_tx.send(Work::Stop);
-                    let _ = write_work_tx.send(Work::Stop);
-                    for _ in 0..STREAM_WORKER_COUNT {
-                        let _ = stream_work_tx.send(Work::Stop);
-                    }
-                    for worker in workers {
-                        let _ = worker.join();
-                    }
-                    let _ = home_worker.join();
-                    let _ = write_worker.join();
-                    for worker in stream_workers {
-                        let _ = worker.join();
-                    }
-                    return Err(format!("remote IPC listener を開始できません: {error}"));
-                }
-            }
+            startup.listeners.push(
+                std::thread::Builder::new()
+                    .name(format!("remote-ipc-listener-{index}"))
+                    .spawn(move || {
+                        acceptor_loop(
+                            listener_stop,
+                            listener_heavy_queue,
+                            listener_home_tx,
+                            listener_write_tx,
+                            listener_stream_tx,
+                            listener_home_metrics,
+                            listener_write_metrics,
+                            listener_stream_metrics,
+                            listener_next_connection_id,
+                            listener_session,
+                            listener_page_jobs,
+                            initial_pipe,
+                            index,
+                        )
+                    })
+                    .map_err(|error| format!("remote IPC listener を開始できません: {error}"))?,
+            );
         }
 
         crate::logger::log(format!(
@@ -791,18 +925,22 @@ impl ServerGuard {
             HEAVY_WORK_QUEUE_CAPACITIES.interactive,
             HEAVY_WORK_QUEUE_CAPACITIES.prefetch,
         ));
+        let started = startup.finish();
         Ok(Self {
-            stop,
-            listeners,
-            workers,
-            stream_workers,
-            home_worker: Some(home_worker),
-            write_worker: Some(write_worker),
-            heavy_queue,
-            home_work_tx,
-            write_work_tx,
-            stream_work_tx,
+            stop: started.stop,
+            raw_flights: started.raw_flights,
+            raw_prefetch: started.raw_prefetch,
+            listeners: started.listeners,
+            workers: started.workers,
+            stream_workers: started.stream_workers,
+            home_worker: started.home_worker,
+            write_worker: started.write_worker,
+            heavy_queue: started.heavy_queue,
+            home_work_tx: started.home_work_tx,
+            write_work_tx: started.write_work_tx,
+            stream_work_tx: started.stream_work_tx,
             session_runtime,
+            settings_reader_control,
             _ai_jobs: ai_jobs,
             _archive_jobs: archive_jobs,
         })
@@ -811,11 +949,26 @@ impl ServerGuard {
     pub(super) fn session_handle(&self) -> SessionHandle {
         self.session_runtime.handle()
     }
+
+    pub(super) fn control(&self) -> ServerControl {
+        ServerControl {
+            stop: Arc::clone(&self.stop),
+            session: self.session_runtime.handle(),
+        }
+    }
+
+    pub(super) fn settings_reader_control(
+        &self,
+    ) -> super::live_favorites::RemoteSettingsReaderControl {
+        self.settings_reader_control.clone()
+    }
 }
 
 impl Drop for ServerGuard {
     fn drop(&mut self) {
         respond_stopped_works(self.heavy_queue.stop(), "service_stopping");
+        drop(self.raw_prefetch.take());
+        self.raw_flights.stop();
         self.stop.store(true, Ordering::Release);
         for _ in 0..self.listeners.len() {
             poke_listener();
@@ -862,6 +1015,7 @@ fn worker_loop(
     thumbnail_engine: &ThumbnailEngine,
     container_engine: &ContainerEngine,
     collection_engine: &CollectionEngine,
+    persistent_collection_engine: Option<&PersistentCollectionEngine>,
     session: &SessionHandle,
     worker_index: usize,
 ) {
@@ -883,23 +1037,25 @@ fn worker_loop(
                 enqueued_at,
                 session_operation,
                 page_job,
-            } => execute_work(
-                message,
-                reply,
-                enqueued_at,
-                ExecutionQueue::Heavy(HeavyCompletionGuard::new(
-                    work_queue,
-                    key,
-                    lane,
-                    page_job_key(page_job.as_ref()),
-                )),
-                &format!("heavy-{worker_index}"),
-                session_operation,
-                page_job,
-                |message, _session_cancel, page_job| match message {
-                    ClientMessage::Thumbnail { id, request, .. } => ServerMessage::Thumbnail {
+            } => {
+                execute_work(
+                    message,
+                    reply,
+                    enqueued_at,
+                    ExecutionQueue::Heavy(HeavyCompletionGuard::new(
+                        work_queue,
+                        key,
+                        lane,
+                        page_job_key(page_job.as_ref()),
+                    )),
+                    &format!("heavy-{worker_index}"),
+                    session_operation,
+                    page_job,
+                    |message, session_cancel, page_job| {
+                        match message {
+                    ClientMessage::Thumbnail { id, request, owner } => ServerMessage::Thumbnail {
                         id,
-                        response: thumbnail_engine.handle(request, &context, container_engine),
+                        response: thumbnail_engine.handle(request, &context, container_engine, &owner, &session_cancel),
                     },
                     ClientMessage::Home { id, .. } => ServerMessage::Home {
                         id,
@@ -909,6 +1065,51 @@ fn worker_loop(
                         id,
                         response: collection_engine.collection(request),
                     },
+                    ClientMessage::PersistentCollectionCatalog { id, .. } => {
+                        match persistent_collection_engine {
+                            Some(engine) => ServerMessage::PersistentCollectionCatalog {
+                                id,
+                                response: engine.catalog(id, &session_cancel),
+                            },
+                            None => ServerMessage::PersistentCollectionCatalog {
+                                id,
+                                response:
+                                    mimageviewer_ipc::PersistentCollectionCatalogResponse::Error(
+                                        persistent_collection_unavailable_error(),
+                                    ),
+                            },
+                        }
+                    }
+                    ClientMessage::PersistentCollectionSnapshot { id, request, owner } => {
+                        match persistent_collection_engine {
+                            Some(engine) => ServerMessage::PersistentCollectionSnapshot {
+                                id,
+                                response: engine.snapshot(id, request, &owner, &session_cancel),
+                            },
+                            None => ServerMessage::PersistentCollectionSnapshot {
+                                id,
+                                response:
+                                    mimageviewer_ipc::PersistentCollectionSnapshotResponse::Error(
+                                        persistent_collection_unavailable_error(),
+                                    ),
+                            },
+                        }
+                    }
+                    ClientMessage::PersistentCollectionNavigate { id, request, owner } => {
+                        match persistent_collection_engine {
+                            Some(engine) => ServerMessage::PersistentCollectionNavigate {
+                                id,
+                                response: engine.navigate(id, request, &owner, &session_cancel),
+                            },
+                            None => ServerMessage::PersistentCollectionNavigate {
+                                id,
+                                response:
+                                    mimageviewer_ipc::PersistentCollectionNavigateResponse::Error(
+                                        persistent_collection_unavailable_error(),
+                                    ),
+                            },
+                        }
+                    }
                     ClientMessage::FavoriteSearch { id, request, .. } => {
                         ServerMessage::FavoriteSearch {
                             id,
@@ -938,10 +1139,11 @@ fn worker_loop(
                         request.priority = effective_page_priority(page_job);
                         ServerMessage::Page {
                             id,
-                            response: container_engine.page_with_job_cancel(
+                            response: container_engine.page_with_job_cancel_and_priority(
                                 request,
                                 &context,
                                 Arc::clone(&page_job.cancel),
+                                &|| effective_page_priority(page_job),
                             ),
                         }
                     }
@@ -1003,6 +1205,7 @@ fn worker_loop(
                     },
                     other @ (ClientMessage::VideoStreamStart { .. }
                     | ClientMessage::PageDemand { .. }
+                    | ClientMessage::RawPrefetchWindow { .. }
                     | ClientMessage::VideoStreamControl { .. }
                     | ClientMessage::VideoStreamSeek { .. }
                     | ClientMessage::VideoStreamThumbnail { .. }
@@ -1024,8 +1227,10 @@ fn worker_loop(
                     | ClientMessage::RemoteArchiveResult { .. }) => {
                         service_stopped_response(&other)
                     }
-                },
-            ),
+                }
+                    },
+                )
+            }
             Work::Stop => unreachable!(),
         }
     }
@@ -1037,6 +1242,7 @@ fn worker_loop(
 fn home_worker_loop(
     work_rx: mpsc::Receiver<Work>,
     collection_engine: &CollectionEngine,
+    persistent_collection_engine: Option<&PersistentCollectionEngine>,
     container_engine: &ContainerEngine,
     metrics: &QueueMetrics,
 ) {
@@ -1057,7 +1263,7 @@ fn home_worker_loop(
                 "home-0",
                 session_operation,
                 page_job,
-                |message, _cancel, _page_job| match message {
+                |message, cancel, _page_job| match message {
                     ClientMessage::Home { id, .. } => ServerMessage::Home {
                         id,
                         response: collection_engine.home(),
@@ -1066,6 +1272,21 @@ fn home_worker_loop(
                         id,
                         response: container_engine.folder_list(request),
                     },
+                    ClientMessage::PersistentCollectionCatalog { id, .. } => {
+                        match persistent_collection_engine {
+                            Some(engine) => ServerMessage::PersistentCollectionCatalog {
+                                id,
+                                response: engine.catalog(id, &cancel),
+                            },
+                            None => ServerMessage::PersistentCollectionCatalog {
+                                id,
+                                response:
+                                    mimageviewer_ipc::PersistentCollectionCatalogResponse::Error(
+                                        persistent_collection_unavailable_error(),
+                                    ),
+                            },
+                        }
+                    }
                     other => service_stopped_response(&other),
                 },
             ),
@@ -1259,6 +1480,7 @@ fn execute_video_stream_request(
             owner,
             address,
             quality,
+            audio_track,
         } => {
             let budget = VideoStreamStartBudget::from_enqueued_at(enqueued_at);
             if let Some(error) = budget.expired_error(VideoStreamStartStage::Queue) {
@@ -1274,6 +1496,7 @@ fn execute_video_stream_request(
                         owner,
                         path,
                         quality,
+                        audio_track,
                         budget,
                     },
                     operation,
@@ -1527,7 +1750,11 @@ fn execute_work(
     worker: &str,
     session_operation: SessionOperation,
     page_job: Option<PageJobWork>,
-    handler: impl FnOnce(ClientMessage, Arc<AtomicBool>, Option<&PageJobWork>) -> ServerMessage,
+    handler: impl FnOnce(
+        ClientMessage,
+        RemoteOperationCancellation,
+        Option<&PageJobWork>,
+    ) -> ServerMessage,
 ) {
     let request_id = message.id();
     let request_kind = match (&message, page_job.as_ref()) {
@@ -1567,7 +1794,7 @@ fn execute_work(
         }
     } else {
         session_operation.started();
-        handler(message, session_operation.cancel_flag(), page_job.as_ref())
+        handler(message, session_operation.cancellation(), page_job.as_ref())
     };
     let ownership = session_operation.ownership_response();
     let response =
@@ -1655,6 +1882,9 @@ fn request_kind(message: &ClientMessage) -> &'static str {
         ClientMessage::Thumbnail { .. } => "thumbnail",
         ClientMessage::Home { .. } => "home",
         ClientMessage::Collection { .. } => "collection",
+        ClientMessage::PersistentCollectionCatalog { .. } => "persistent_collection_catalog",
+        ClientMessage::PersistentCollectionSnapshot { .. } => "persistent_collection_snapshot",
+        ClientMessage::PersistentCollectionNavigate { .. } => "persistent_collection_navigate",
         ClientMessage::FavoriteSearch { .. } => "favorite_search",
         ClientMessage::TagBrowse { .. } => "tag_browse",
         ClientMessage::TagItems { .. } => "tag_items",
@@ -1665,6 +1895,7 @@ fn request_kind(message: &ClientMessage) -> &'static str {
             PagePriority::Prefetch => "page_prefetch",
         },
         ClientMessage::PageDemand { .. } => "page_demand",
+        ClientMessage::RawPrefetchWindow { .. } => "raw_prefetch_window",
         ClientMessage::RemoteAiStart { .. } => "remote_ai_start",
         ClientMessage::RemoteAiState { .. } => "remote_ai_state",
         ClientMessage::RemoteAiRecoverable { .. } => "remote_ai_recoverable",
@@ -1693,7 +1924,9 @@ fn request_kind(message: &ClientMessage) -> &'static str {
 
 fn work_lane(message: &ClientMessage) -> WorkLane {
     match message {
-        ClientMessage::Home { .. } | ClientMessage::FolderList { .. } => WorkLane::Home,
+        ClientMessage::Home { .. }
+        | ClientMessage::FolderList { .. }
+        | ClientMessage::PersistentCollectionCatalog { .. } => WorkLane::Home,
         ClientMessage::Write { .. } => WorkLane::Write,
         ClientMessage::VideoStreamStart { .. }
         | ClientMessage::VideoStreamControl { .. }
@@ -1724,6 +1957,9 @@ fn message_owner(message: &ClientMessage) -> Option<&RemoteSessionIdentity> {
         ClientMessage::Thumbnail { owner, .. }
         | ClientMessage::Home { owner, .. }
         | ClientMessage::Collection { owner, .. }
+        | ClientMessage::PersistentCollectionCatalog { owner, .. }
+        | ClientMessage::PersistentCollectionSnapshot { owner, .. }
+        | ClientMessage::PersistentCollectionNavigate { owner, .. }
         | ClientMessage::FavoriteSearch { owner, .. }
         | ClientMessage::TagBrowse { owner, .. }
         | ClientMessage::TagItems { owner, .. }
@@ -1731,6 +1967,7 @@ fn message_owner(message: &ClientMessage) -> Option<&RemoteSessionIdentity> {
         | ClientMessage::FolderList { owner, .. }
         | ClientMessage::Page { owner, .. }
         | ClientMessage::PageDemand { owner, .. }
+        | ClientMessage::RawPrefetchWindow { owner, .. }
         | ClientMessage::RemoteAiStart { owner, .. }
         | ClientMessage::RemoteAiState { owner, .. }
         | ClientMessage::RemoteAiRecoverable { owner, .. }
@@ -1772,6 +2009,15 @@ fn operation_description(message: &ClientMessage) -> String {
         },
         ClientMessage::Home { .. } => "ホームを読み込み中".to_owned(),
         ClientMessage::Collection { .. } => "集約ビューを読み込み中".to_owned(),
+        ClientMessage::PersistentCollectionCatalog { .. } => {
+            "コレクション一覧を読み込み中".to_owned()
+        }
+        ClientMessage::PersistentCollectionSnapshot { .. } => {
+            "コレクション内容を読み込み中".to_owned()
+        }
+        ClientMessage::PersistentCollectionNavigate { .. } => {
+            "コレクションの次の項目を確認中".to_owned()
+        }
         ClientMessage::FavoriteSearch { .. } => "お気に入りを検索中".to_owned(),
         ClientMessage::TagBrowse { .. } => "タグ一覧を読み込み中".to_owned(),
         ClientMessage::TagItems { .. } => "タグの項目を検索中".to_owned(),
@@ -1787,6 +2033,7 @@ fn operation_description(message: &ClientMessage) -> String {
             _ => "ページをレンダリング中".to_owned(),
         },
         ClientMessage::PageDemand { .. } => "ページ表示の需要を更新中".to_owned(),
+        ClientMessage::RawPrefetchWindow { .. } => "RAW prefetch window".to_owned(),
         ClientMessage::RemoteAiStart { .. } => "remote AI job を開始中".to_owned(),
         ClientMessage::RemoteAiState { .. } => "remote AI job の状態を確認中".to_owned(),
         ClientMessage::RemoteAiRecoverable { .. } => "復帰可能な remote AI job を確認中".to_owned(),
@@ -1803,7 +2050,16 @@ fn operation_description(message: &ClientMessage) -> String {
         ClientMessage::RemoteArchiveResult { .. } => "アーカイブ準備結果を取得中".to_owned(),
         ClientMessage::Write { request, .. } => match request {
             RemoteWriteRequest::SetSpread { .. } => "見開き設定を書き込み中",
+            RemoteWriteRequest::SetFinalCoverSpreadPreference { .. } => {
+                "末尾の表紙見開き設定を書き込み中"
+            }
+            RemoteWriteRequest::SetSingletonSpreadPlacementPreference { .. }
+            | RemoteWriteRequest::SetSingletonSpreadEndpointPreference { .. } => {
+                "端の単ページ配置を書き込み中"
+            }
+            RemoteWriteRequest::SetPageAlonePreference { .. } => "単独ページ設定を書き込み中",
             RemoteWriteRequest::RecordReadingProgress { .. } => "読書位置を記録中",
+            RemoteWriteRequest::RecordVideoProgress { .. } => "再生位置を記録中",
             RemoteWriteRequest::SetRating { .. } => "レーティングを書き込み中",
             RemoteWriteRequest::SetBookmark { .. } => "ブックマークを書き込み中",
             RemoteWriteRequest::GetItemState { .. } => "ページ情報を確認中",
@@ -1944,6 +2200,18 @@ fn response_outcome(response: &ServerMessage) -> &'static str {
             response: CollectionResponse::Success(_),
             ..
         }
+        | ServerMessage::PersistentCollectionCatalog {
+            response: mimageviewer_ipc::PersistentCollectionCatalogResponse::Success(_),
+            ..
+        }
+        | ServerMessage::PersistentCollectionSnapshot {
+            response: mimageviewer_ipc::PersistentCollectionSnapshotResponse::Success(_),
+            ..
+        }
+        | ServerMessage::PersistentCollectionNavigate {
+            response: mimageviewer_ipc::PersistentCollectionNavigateResponse::Success(_),
+            ..
+        }
         | ServerMessage::FavoriteSearch {
             response: FavoriteSearchResponse::Success(_),
             ..
@@ -1969,6 +2237,7 @@ fn response_outcome(response: &ServerMessage) -> &'static str {
             ..
         }
         | ServerMessage::PageDemand { .. }
+        | ServerMessage::RawPrefetchWindow { .. }
         | ServerMessage::RemoteAiStart {
             response: mimageviewer_ipc::RemoteAiStartResponse::Accepted(_),
             ..
@@ -2073,6 +2342,18 @@ fn response_outcome(response: &ServerMessage) -> &'static str {
         }
         | ServerMessage::Collection {
             response: CollectionResponse::Error(_),
+            ..
+        }
+        | ServerMessage::PersistentCollectionCatalog {
+            response: mimageviewer_ipc::PersistentCollectionCatalogResponse::Error(_),
+            ..
+        }
+        | ServerMessage::PersistentCollectionSnapshot {
+            response: mimageviewer_ipc::PersistentCollectionSnapshotResponse::Error(_),
+            ..
+        }
+        | ServerMessage::PersistentCollectionNavigate {
+            response: mimageviewer_ipc::PersistentCollectionNavigateResponse::Error(_),
             ..
         }
         | ServerMessage::FavoriteSearch {
@@ -2431,6 +2712,46 @@ fn handle_connection(
                     Err(response) => response,
                 };
                 let _ = reply_tx.send(ServerMessage::Session { id: *id, response });
+                continue;
+            }
+            ClientMessage::RawPrefetchWindow { id, owner, request } => {
+                let response = if request.entries.len()
+                    > mimageviewer_ipc::MAX_RAW_PREFETCH_WINDOW_ENTRIES
+                    || request
+                        .entries
+                        .iter()
+                        .any(|address| address.validate_syntax().is_err())
+                {
+                    ServerMessage::RawPrefetchWindow {
+                        id: *id,
+                        response: mimageviewer_ipc::RawPrefetchWindowAck {
+                            window_generation: request.window_generation,
+                            status: mimageviewer_ipc::RawPrefetchWindowStatus::Rejected,
+                        },
+                    }
+                } else {
+                    match session.begin_operation(owner, "RAW prefetch window".to_owned()) {
+                        Ok(operation) => match operation.wait_until_active() {
+                            Ok(()) => {
+                                operation.started();
+                                let response = session
+                                    .raw_prefetch_registry()
+                                    .map(|registry| {
+                                        registry.declare(&owner.session_id, request.clone())
+                                    })
+                                    .unwrap_or(mimageviewer_ipc::RawPrefetchWindowAck {
+                                        window_generation: request.window_generation,
+                                        status: mimageviewer_ipc::RawPrefetchWindowStatus::Terminal,
+                                    });
+                                operation.finish(true);
+                                ServerMessage::RawPrefetchWindow { id: *id, response }
+                            }
+                            Err(response) => ServerMessage::Session { id: *id, response },
+                        },
+                        Err(response) => ServerMessage::Session { id: *id, response },
+                    }
+                };
+                let _ = reply_tx.send(response);
                 continue;
             }
             ClientMessage::PageDemand { id, owner, request } => {
@@ -3140,7 +3461,8 @@ fn service_stopped_response(message: &ClientMessage) -> ServerMessage {
         | ClientMessage::SessionPing { id, .. }
         | ClientMessage::SessionRelease { id, .. }
         | ClientMessage::SessionActivity { id, .. }
-        | ClientMessage::PageDemand { id, .. } => ServerMessage::Session {
+        | ClientMessage::PageDemand { id, .. }
+        | ClientMessage::RawPrefetchWindow { id, .. } => ServerMessage::Session {
             id: *id,
             response: session_response(
                 SessionStatus::NotAcquired,
@@ -3168,6 +3490,30 @@ fn service_stopped_response(message: &ClientMessage) -> ServerMessage {
                 "mIV 本体の集約ビューワーカーが停止しています",
             )),
         },
+        ClientMessage::PersistentCollectionCatalog { id, .. } => {
+            ServerMessage::PersistentCollectionCatalog {
+                id: *id,
+                response: mimageviewer_ipc::PersistentCollectionCatalogResponse::Error(
+                    persistent_collection_unavailable_error(),
+                ),
+            }
+        }
+        ClientMessage::PersistentCollectionSnapshot { id, .. } => {
+            ServerMessage::PersistentCollectionSnapshot {
+                id: *id,
+                response: mimageviewer_ipc::PersistentCollectionSnapshotResponse::Error(
+                    persistent_collection_unavailable_error(),
+                ),
+            }
+        }
+        ClientMessage::PersistentCollectionNavigate { id, .. } => {
+            ServerMessage::PersistentCollectionNavigate {
+                id: *id,
+                response: mimageviewer_ipc::PersistentCollectionNavigateResponse::Error(
+                    persistent_collection_unavailable_error(),
+                ),
+            }
+        }
         ClientMessage::FavoriteSearch { id, .. } => ServerMessage::FavoriteSearch {
             id: *id,
             response: FavoriteSearchResponse::Error(CollectionError::new(
@@ -3326,6 +3672,20 @@ fn duplicate_collection_error() -> CollectionError {
     )
 }
 
+fn persistent_collection_unavailable_error() -> mimageviewer_ipc::PersistentCollectionError {
+    persistent_collection_error(
+        mimageviewer_ipc::PersistentCollectionErrorCode::Unavailable,
+        "mIV 本体の永続コレクション機能を利用できません",
+    )
+}
+
+fn persistent_collection_error(
+    code: mimageviewer_ipc::PersistentCollectionErrorCode,
+    message: &'static str,
+) -> mimageviewer_ipc::PersistentCollectionError {
+    mimageviewer_ipc::PersistentCollectionError::new(code, message)
+}
+
 fn duplicate_request_response(message: &ClientMessage) -> ServerMessage {
     match message {
         ClientMessage::Thumbnail { id, .. } => ServerMessage::Thumbnail {
@@ -3339,6 +3699,39 @@ fn duplicate_request_response(message: &ClientMessage) -> ServerMessage {
             id: *id,
             response: CollectionResponse::Error(duplicate_collection_error()),
         },
+        ClientMessage::PersistentCollectionCatalog { id, .. } => {
+            ServerMessage::PersistentCollectionCatalog {
+                id: *id,
+                response: mimageviewer_ipc::PersistentCollectionCatalogResponse::Error(
+                    persistent_collection_error(
+                        mimageviewer_ipc::PersistentCollectionErrorCode::BadRequest,
+                        "同じ接続内で request ID が重複しています",
+                    ),
+                ),
+            }
+        }
+        ClientMessage::PersistentCollectionSnapshot { id, .. } => {
+            ServerMessage::PersistentCollectionSnapshot {
+                id: *id,
+                response: mimageviewer_ipc::PersistentCollectionSnapshotResponse::Error(
+                    persistent_collection_error(
+                        mimageviewer_ipc::PersistentCollectionErrorCode::BadRequest,
+                        "同じ接続内で request ID が重複しています",
+                    ),
+                ),
+            }
+        }
+        ClientMessage::PersistentCollectionNavigate { id, .. } => {
+            ServerMessage::PersistentCollectionNavigate {
+                id: *id,
+                response: mimageviewer_ipc::PersistentCollectionNavigateResponse::Error(
+                    persistent_collection_error(
+                        mimageviewer_ipc::PersistentCollectionErrorCode::BadRequest,
+                        "同じ接続内で request ID が重複しています",
+                    ),
+                ),
+            }
+        }
         ClientMessage::FavoriteSearch { id, .. } => ServerMessage::FavoriteSearch {
             id: *id,
             response: FavoriteSearchResponse::Error(duplicate_collection_error()),
@@ -3399,7 +3792,8 @@ fn queue_busy_response(message: &ClientMessage) -> ServerMessage {
         | ClientMessage::SessionPing { id, .. }
         | ClientMessage::SessionRelease { id, .. }
         | ClientMessage::SessionActivity { id, .. }
-        | ClientMessage::PageDemand { id, .. } => ServerMessage::Session {
+        | ClientMessage::PageDemand { id, .. }
+        | ClientMessage::RawPrefetchWindow { id, .. } => ServerMessage::Session {
             id: *id,
             response: session_response(
                 SessionStatus::NotAcquired,
@@ -3427,6 +3821,39 @@ fn queue_busy_response(message: &ClientMessage) -> ServerMessage {
                 "mIV 本体のリモート集約ビュー queue が混み合っています",
             )),
         },
+        ClientMessage::PersistentCollectionCatalog { id, .. } => {
+            ServerMessage::PersistentCollectionCatalog {
+                id: *id,
+                response: mimageviewer_ipc::PersistentCollectionCatalogResponse::Error(
+                    persistent_collection_error(
+                        mimageviewer_ipc::PersistentCollectionErrorCode::Busy,
+                        "mIV 本体のコレクション一覧 queue が混み合っています",
+                    ),
+                ),
+            }
+        }
+        ClientMessage::PersistentCollectionSnapshot { id, .. } => {
+            ServerMessage::PersistentCollectionSnapshot {
+                id: *id,
+                response: mimageviewer_ipc::PersistentCollectionSnapshotResponse::Error(
+                    persistent_collection_error(
+                        mimageviewer_ipc::PersistentCollectionErrorCode::Busy,
+                        "mIV 本体のコレクション queue が混み合っています",
+                    ),
+                ),
+            }
+        }
+        ClientMessage::PersistentCollectionNavigate { id, .. } => {
+            ServerMessage::PersistentCollectionNavigate {
+                id: *id,
+                response: mimageviewer_ipc::PersistentCollectionNavigateResponse::Error(
+                    persistent_collection_error(
+                        mimageviewer_ipc::PersistentCollectionErrorCode::Busy,
+                        "mIV 本体のコレクション移動 queue が混み合っています",
+                    ),
+                ),
+            }
+        }
         ClientMessage::FavoriteSearch { id, .. } => ServerMessage::FavoriteSearch {
             id: *id,
             response: FavoriteSearchResponse::Error(CollectionError::new(
@@ -3886,6 +4313,46 @@ fn wide_nul(value: &str) -> Vec<u16> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn startup_rollback_joins_worker_before_releasing_remote_reader_owner() {
+        let page_jobs = Arc::new(PageJobRegistry::new());
+        let heavy_queue = Arc::new(HeavyQueueWiring::new(1, page_jobs));
+        let (home_work_tx, home_work_rx) = mpsc::sync_channel::<Work>(1);
+        let (write_work_tx, _write_work_rx) = mpsc::sync_channel::<Work>(1);
+        let (stream_work_tx, _stream_work_rx) = mpsc::sync_channel::<Work>(1);
+        let favorites = super::super::live_favorites::LiveFavorites::snapshot(Vec::new());
+        let worker_favorites = Arc::clone(&favorites);
+        let home_worker = std::thread::spawn(move || {
+            let _reader_owner = worker_favorites;
+            assert!(matches!(home_work_rx.recv(), Ok(Work::Stop)));
+        });
+        let startup = ServerStartupWorkers {
+            armed: true,
+            stop: Arc::new(AtomicBool::new(false)),
+            raw_prefetch: None,
+            raw_flights: super::super::raw_flights::RemoteRawFlights::new(
+                Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap()),
+                super::super::raw_flights::RemoteRawFlightPolicy::s2b(),
+            ),
+            listeners: Vec::new(),
+            workers: Vec::new(),
+            stream_workers: Vec::new(),
+            home_worker: Some(home_worker),
+            write_worker: None,
+            heavy_queue,
+            home_work_tx,
+            write_work_tx,
+            stream_work_tx,
+        };
+        assert_eq!(Arc::strong_count(&favorites), 2);
+        drop(startup);
+        assert_eq!(
+            Arc::strong_count(&favorites),
+            1,
+            "startup Err must not detach a worker that owns LiveFavorites"
+        );
+    }
+
     fn test_owner() -> RemoteSessionIdentity {
         RemoteSessionIdentity {
             client_id: "test-client".to_owned(),
@@ -4013,6 +4480,7 @@ mod tests {
             home_worker_loop(
                 work_rx,
                 &collection_engine,
+                None,
                 &container_engine,
                 &worker_metrics,
             )

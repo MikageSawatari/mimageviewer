@@ -118,6 +118,8 @@ impl LocalAdjustDb {
         page_key: &str,
         layers: &[LocalAdjustmentLayer],
     ) -> Result<(), rusqlite::Error> {
+        let _page_edit_write =
+            crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin_for_key(page_key);
         if layers.is_empty() {
             return self.remove_layers(page_key);
         }
@@ -135,6 +137,8 @@ impl LocalAdjustDb {
 
     /// ページの補正レイヤーを削除する。
     pub fn remove_layers(&self, page_key: &str) -> Result<(), rusqlite::Error> {
+        let _page_edit_write =
+            crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin_for_key(page_key);
         self.conn.execute(
             "DELETE FROM local_adjust_pages WHERE page_path = ?1",
             [page_key],
@@ -143,6 +147,7 @@ impl LocalAdjustDb {
     }
 
     pub fn copy_entry_key(&self, from_key: &str, to_key: &str) -> Result<(), rusqlite::Error> {
+        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
         if from_key == to_key {
             return Ok(());
         }
@@ -363,6 +368,7 @@ pub fn repack_legacy_masks(path: &Path) -> RepackReport {
         };
 
         // `layers_json = ?3` が楽観ロック。0 行なら誰かが先に書いている。
+        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
         match conn.execute(
             "UPDATE local_adjust_pages SET layers_json = ?2
              WHERE page_path = ?1 AND layers_json = ?3",

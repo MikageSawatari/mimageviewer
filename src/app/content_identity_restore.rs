@@ -152,12 +152,72 @@ impl ContentIdentityRestorePending {
             .name("content-identity-restore".into())
             .spawn(move || {
                 let started = std::time::Instant::now();
-                let report = crate::content_identity::restore_candidates_at(
+                crate::logger::log(format!(
+                    "content_identity: restore started restores={} declines={}",
+                    selected.len(),
+                    declined.len()
+                ));
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "content_identity",
+                        "restore_begin",
+                        None,
+                        input_seq,
+                        &[
+                            ("restores", serde_json::Value::from(selected.len())),
+                            ("declines", serde_json::Value::from(declined.len())),
+                        ],
+                    );
+                }
+                let mut last_stage = "";
+                let mut last_reported = 0usize;
+                let report = crate::content_identity::restore_candidates_at_with_progress(
                     &data_dir,
                     &selected,
                     &declined,
                     load_sidecar_bases,
+                    |stage, processed, total| {
+                        if processed == 0 {
+                            return;
+                        }
+                        if stage != last_stage {
+                            last_reported = 0;
+                        }
+                        if processed != last_reported
+                            && (stage != last_stage
+                                || processed == total
+                                || processed >= last_reported.saturating_add(1_000))
+                        {
+                            let ms = started.elapsed().as_secs_f64() * 1000.0;
+                            crate::logger::log(format!(
+                                "content_identity: restore progress stage={stage} processed={processed} total={total} elapsed_ms={ms:.0}"
+                            ));
+                            if crate::perf::is_enabled() {
+                                crate::perf::event(
+                                    "content_identity",
+                                    "restore_progress",
+                                    None,
+                                    input_seq,
+                                    &[
+                                        ("stage", serde_json::Value::from(stage)),
+                                        ("processed", serde_json::Value::from(processed)),
+                                        ("total", serde_json::Value::from(total)),
+                                        ("ms", serde_json::Value::from(ms)),
+                                    ],
+                                );
+                            }
+                            last_stage = stage;
+                            last_reported = processed;
+                        }
+                    },
                 );
+                crate::logger::log(format!(
+                    "content_identity: restore worker completed restores={} declines={} errors={} elapsed_ms={:.0}",
+                    report.requested_restores,
+                    report.requested_declines,
+                    report.errors.len(),
+                    started.elapsed().as_secs_f64() * 1000.0,
+                ));
                 if crate::perf::is_enabled() {
                     crate::perf::event(
                         "content_identity",
@@ -328,6 +388,10 @@ impl App {
         };
         self.content_identity_restore_pending = None;
 
+        self.advance_collection_thumbnail_source_epoch_for_pin_commit(
+            report.committed_thumbnail_pins,
+            "content_identity_restore",
+        );
         let restored = report.ledger_entries.len();
         let failures = report.errors.len();
         crate::logger::log(format!(
@@ -348,6 +412,9 @@ impl App {
             );
         }
         self.apply_content_identity_ledger_updates(report.ledger_entries);
+        if report.requested_restores > 0 {
+            self.reload_book_resume_meters();
+        }
         self.apply_content_restore_sidecar_mirrors(report.sidecar_mirrors, report.sidecar_bases);
         self.apply_content_restore_presence(report.presence);
         if report.requested_restores > 0 {
@@ -443,8 +510,14 @@ impl App {
             && let Some(folder) = self.current_folder.clone()
         {
             self.rehydrate_page_edit_state_for_current_items(&folder);
+        } else if self.page_edit_snapshot.is_some() {
+            // The restore worker's page-edit write guard wakes the keyed owner. Keep the
+            // accepted projection until its scoped notification is reconciled; an unrelated
+            // restore must not clear this virtual listing.
+            if let Some(ctx) = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.repaint_context() {
+                self.poll_page_edit_reconciliation(&ctx);
+            }
         } else {
-            // 合成 view はページ編集 overlay を出さない既存契約を維持する。
             self.clear_page_edit_state();
         }
         self.finish_book_page_edit_mapping_after_idx_refresh("restore", errors);
@@ -507,6 +580,7 @@ mod tests {
     fn candidate(name: &str) -> crate::content_identity::RestoreCandidate {
         let target_path = PathBuf::from(format!("C:/copied/{name}.png"));
         crate::content_identity::RestoreCandidate {
+            epub_source_state: None,
             target_key: crate::path_key::normalize_keep_drive(&target_path),
             target_path,
             target_kind: crate::content_identity::ContentKind::Image,
@@ -666,6 +740,36 @@ mod tests {
             entry.tags.as_deref(),
             Some(["#current".to_string()].as_slice())
         );
+    }
+
+    #[test]
+    fn restore_pin_commit_report_advances_collection_epoch_without_touching_maps() {
+        let mut app = crate::app::setup_app_for_test();
+        let pin_key = "c:/books/unrelated.zip".to_string();
+        let pin = crate::folder_thumb_pins::FolderPinSource::ZipEntry {
+            zip_rel: String::new(),
+            entry: "cover.jpg".to_string(),
+        };
+        app.folder_pin_map.insert(pin_key.clone(), pin.clone());
+        let ctx = egui::Context::default();
+        let epoch = app.collection_thumbnail_source_epoch;
+        for (changes, expected_epoch) in [(0, epoch), (2, epoch.wrapping_add(1))] {
+            let (tx, rx) = mpsc::channel();
+            tx.send(crate::content_identity::ContentRestoreReport {
+                committed_thumbnail_pins: changes,
+                // Partial restore failures must still publish successful pin commits.
+                errors: (changes != 0)
+                    .then(|| "later store failed".to_string())
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            })
+            .unwrap();
+            app.content_identity_restore_pending = Some(ContentIdentityRestorePending { rx });
+            app.poll_content_identity_restore(&ctx);
+            assert_eq!(app.collection_thumbnail_source_epoch, expected_epoch);
+            assert_eq!(app.folder_pin_map.get(&pin_key), Some(&pin));
+        }
     }
 
     /// `edit_preview_close` の実ログで観測された退行: restore worker が DB へコピーした

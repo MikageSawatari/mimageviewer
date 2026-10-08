@@ -1552,6 +1552,35 @@ fn render_immediate_viewport(
         &textures_delta,
     );
 
+    // Immediate viewports have their own queued viewport actions. Read the
+    // just-painted child surface and return the screenshot to that child's
+    // input queue, as the root render path does.
+    let mut screenshot_commands = Vec::new();
+    viewport.actions_requested.retain(|action| {
+        if let ActionRequested::Screenshot(data) = action {
+            screenshot_commands.push(data.clone());
+            false
+        } else {
+            true
+        }
+    });
+    if !screenshot_commands.is_empty() {
+        let image: Arc<egui::ColorImage> = painter
+            .borrow()
+            .read_screen_rgba(screen_size_in_pixels)
+            .into();
+        for user_data in screenshot_commands {
+            egui_winit
+                .egui_input_mut()
+                .events
+                .push(egui::Event::Screenshot {
+                    viewport_id,
+                    user_data,
+                    image: Arc::clone(&image),
+                });
+        }
+    }
+
     {
         profiling::scope!("swap_buffers");
         if let Err(err) = gl_surface.swap_buffers(current_gl_context) {

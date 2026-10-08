@@ -261,6 +261,9 @@ impl App {
         // 見開きから入った場合は左ページへピボット。Single 起動 / 片側のみのページ
         // (表紙・末尾奇数・横長画像) ではピボットは要らない。
         let (target_idx, pivot) = self.plan_page_edit_pivot(fs_idx);
+        if !self.raw_edit_target_entry_allowed(target_idx) {
+            return;
+        }
         // 消しゴム入力取得は state mutation より前にやる。ここで取れないと erase は始められず、
         // 取れる前に spread_mode / fullscreen_idx を弄ると見開きが解除されたまま
         // 編集も開始しない不整合状態になる (Codex P2 指摘)。
@@ -427,10 +430,7 @@ impl App {
 
     /// 単一ページ表示用に状態を初期化する ([`App::enter_page_edit_single_view`] の別名)。
     fn set_single_page_view(&mut self, idx: usize) {
-        self.spread_mode = crate::settings::SpreadMode::Single;
-        self.fullscreen_idx = Some(idx);
-        self.fs_zoom = 1.0;
-        self.fs_pan = egui::Vec2::ZERO;
+        self.enter_page_edit_single_view(idx);
     }
 
     /// 見開き消しゴム中に「左ページ」「右ページ」ボタンで編集対象を切り替える。
@@ -438,6 +438,9 @@ impl App {
     /// 移動して新たに編集モードへ入る ([E] 適用 → 移動 → [E] 開始 と等価)。Undo は
     /// ページごとに独立 (= 切替時にスタックは捨てる)、ズーム/パンは初期化する。
     pub(crate) fn switch_erase_target_in_spread(&mut self, ctx: &egui::Context, new_idx: usize) {
+        if !self.raw_edit_target_entry_allowed(new_idx) {
+            return;
+        }
         // 同ページなら no-op
         if self.fullscreen_idx == Some(new_idx) {
             return;
@@ -601,6 +604,7 @@ impl App {
             sibling_nav: None,
             mouse_nav: None,
             jump_to: None,
+            music_ctrl_wheel_gate_reached: false,
         };
 
         if !self.ime_input_active(ctx) && self.consume_context_shortcuts_help_key(ctx) {
@@ -2374,13 +2378,13 @@ impl App {
                                 ui.spacing_mut().item_spacing.x = 4.0;
                                 for &(label, target_idx) in pages.iter() {
                                     let is_active = self.fullscreen_idx == Some(target_idx);
-                                    if panel_toggle_button(
+                                    if ui.add_enabled_ui(self.raw_edit_target_gate(target_idx), |ui| panel_toggle_button(
                                         ui,
                                         label,
                                         is_active,
                                         Some(btn_size),
                                         None,
-                                    )
+                                    )).inner
                                     .clicked()
                                         && !is_active
                                     {
@@ -3112,7 +3116,7 @@ impl App {
             return;
         }
         self.ensure_ai_runtime();
-        let runtime = self.ai_runtime.clone();
+        let runtime_init = Arc::clone(&self.ai_runtime_init);
         let manager = self.ai_model_manager.clone();
         let kind = if is_preview {
             EraseInpaintKind::Preview
@@ -3142,6 +3146,18 @@ impl App {
             .name("erase-inpaint".to_string())
             .spawn(move || {
                 let _local_ai_activity = local_ai_activity;
+                let runtime = match runtime_init
+                    .wait_terminal_while(|| !cancel_for_thread.load(Ordering::Acquire))
+                {
+                    crate::ai::runtime::AiRuntimeInitWait::Ready(runtime) => Some(runtime),
+                    crate::ai::runtime::AiRuntimeInitWait::Failed(error) => {
+                        crate::logger::log(format!(
+                            "erase: AI runtime unavailable; using diffusion fallback: {error}"
+                        ));
+                        None
+                    }
+                    crate::ai::runtime::AiRuntimeInitWait::Cancelled => return,
+                };
                 let result = crate::edit_source::run_inpaint_pure(
                     runtime.as_ref(),
                     &manager,

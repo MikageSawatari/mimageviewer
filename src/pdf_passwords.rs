@@ -36,6 +36,12 @@ pub struct PdfPasswordStore {
     /// in-memory consumers discard an authentication result after this process saves or removes
     /// a credential for the same PDF.
     credential_revisions: HashMap<String, u64>,
+    /// Process-local revision for consumers whose work spans every configured PDF.
+    ///
+    /// Unlike the per-path revision above this is deliberately coarse: a similar-index
+    /// reconcile snapshots the whole credential set, so any successful mutation must retire
+    /// that snapshot without exposing password-derived material.
+    configuration_revision: u64,
 }
 
 impl PdfPasswordStore {
@@ -52,6 +58,7 @@ impl PdfPasswordStore {
         Self {
             entries,
             credential_revisions: HashMap::new(),
+            configuration_revision: 0,
         }
     }
 
@@ -140,6 +147,10 @@ impl PdfPasswordStore {
             .unwrap_or(0)
     }
 
+    pub(crate) fn configuration_revision(&self) -> u64 {
+        self.configuration_revision
+    }
+
     // ── 内部 ────────────────────────────────────────────────
 
     fn store_path() -> PathBuf {
@@ -159,6 +170,7 @@ impl PdfPasswordStore {
             .entry(path_hash.to_owned())
             .or_default();
         *revision = revision.wrapping_add(1);
+        self.configuration_revision = self.configuration_revision.wrapping_add(1);
     }
 
     /// delete worker 用。削除前に列挙した PDF path のハッシュ行だけを hard purge する。
@@ -191,10 +203,28 @@ impl PdfPasswordStore {
         Self {
             entries: HashMap::new(),
             credential_revisions: HashMap::new(),
+            configuration_revision: 0,
         }
     }
 
     pub(crate) fn bump_credential_revision_for_test(&mut self, pdf_path: &Path) {
         self.bump_credential_revision(&Self::path_hash(pdf_path));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credential_changes_advance_the_global_configuration_revision() {
+        let mut store = PdfPasswordStore::empty_for_test();
+        let path = Path::new("c:/books/protected.pdf");
+        assert_eq!(store.configuration_revision(), 0);
+        store.bump_credential_revision_for_test(path);
+        assert_eq!(store.credential_revision(path), 1);
+        assert_eq!(store.configuration_revision(), 1);
+        store.bump_credential_revision_for_test(path);
+        assert_eq!(store.configuration_revision(), 2);
     }
 }

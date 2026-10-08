@@ -46,6 +46,14 @@ Phase 1 として、場所横断の ★1〜★5 レーティング一覧ビュ�
   `count_by_stars()` 実行は避ける。
 - `RatingViewSort` は view-local のままにし、通常フォルダの `SortOrder` へ
   `rated_at` を混ぜない。時刻ソート項目はレーティング一覧表示中だけソート UI に出す。
+- **v4.3.0 §1.299**: `rating.db` の key と、コピー・移動後に key から作られる
+  `source_path` は小文字・`/` の保存形になることがある。`try_exists()` が成功しても
+  Windows では実際の綴りを確認したことにならない。一覧構築 worker の
+  `rating_row_to_view_row` で実パスを `canonicalize` し、保存キーと大小・区切り以外が
+  同じ場合だけ通常の Windows パスへ戻して `GridItem` に入れる。これにより一覧名と
+  開く先のパスが一致し、同関数を使う Remote のレーティング一覧にも反映される。
+  DB の保存キーと schema は変更しない。既存の worker の復元時点に揃えることで、
+  UI 採用時や履歴復帰時に新しい I/O・専用再構築状態を足さずに済む。
 - レーティング一覧は ★N が固定条件の仮想ビューとして扱い、ツールバーの★フィルタと
   facet の★条件は無効化する。
 - `search_results_synthetic_path` / `reading_history_synthetic_path` と同じ分類で扱う

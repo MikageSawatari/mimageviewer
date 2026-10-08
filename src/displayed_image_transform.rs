@@ -84,13 +84,56 @@ pub(crate) enum ResolvedDisplayPlacement {
         active: bool,
         factor: f32,
         zoom_pan: Option<(f32, egui::Vec2)>,
+        singleton_side: SingletonSpreadPlacement,
+        singleton_gap: f32,
     },
+    SingletonSpread {
+        side: SingletonSpreadPlacement,
+        gap: f32,
+        zoom_pan: Option<(f32, egui::Vec2)>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum SingletonSpreadPlacement {
+    #[default]
+    Center,
+    Left,
+    Right,
+    /// A forced real singleton occupies the left slot; its right slot paints white.
+    LeftWhite,
+    /// A forced real singleton occupies the right slot; its left slot paints white.
+    RightWhite,
+}
+
+impl SingletonSpreadPlacement {
+    pub(crate) const fn side(self) -> Self {
+        match self {
+            Self::LeftWhite => Self::Left,
+            Self::RightWhite => Self::Right,
+            other => other,
+        }
+    }
+
+    pub(crate) const fn has_white_companion(self) -> bool {
+        matches!(self, Self::LeftWhite | Self::RightWhite)
+    }
+
+    pub(crate) const fn with_white_companion(self) -> Self {
+        match self.side() {
+            Self::Left => Self::LeftWhite,
+            Self::Right => Self::RightWhite,
+            _ => Self::Center,
+        }
+    }
 }
 
 impl ResolvedDisplayPlacement {
     fn zoom_pan(self) -> Option<(f32, egui::Vec2)> {
         match self {
-            Self::Normal { zoom_pan } | Self::Z { zoom_pan, .. } => zoom_pan,
+            Self::Normal { zoom_pan }
+            | Self::Z { zoom_pan, .. }
+            | Self::SingletonSpread { zoom_pan, .. } => zoom_pan,
         }
     }
 }
@@ -112,10 +155,42 @@ pub(crate) struct DisplayedImageTransformInput {
     pub(crate) pixel_fit: RectPixelFit,
 }
 
+impl DisplayedImageTransformInput {
+    pub(crate) fn without_page(self) -> DisplayedImageGeometryInput {
+        DisplayedImageGeometryInput {
+            viewport_rect: self.viewport_rect,
+            source_size: self.source_size,
+            texture_size: self.texture_size,
+            rotation: self.rotation,
+            free_rotation_rad: self.free_rotation_rad,
+            content_bbox: self.content_bbox,
+            fit_mode: self.fit_mode,
+            fit_scale_limits: self.fit_scale_limits,
+            pixels_per_point: self.pixels_per_point,
+            placement: self.placement,
+            pixel_fit: self.pixel_fit,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DisplayedImageGeometryInput {
+    pub(crate) viewport_rect: egui::Rect,
+    pub(crate) source_size: egui::Vec2,
+    pub(crate) texture_size: egui::Vec2,
+    pub(crate) rotation: Rotation,
+    pub(crate) free_rotation_rad: f32,
+    pub(crate) content_bbox: Option<egui::Rect>,
+    pub(crate) fit_mode: FullscreenFitMode,
+    pub(crate) fit_scale_limits: FullscreenFitScaleLimits,
+    pub(crate) pixels_per_point: f32,
+    pub(crate) placement: ResolvedDisplayPlacement,
+    pub(crate) pixel_fit: RectPixelFit,
+}
+
 #[derive(Clone, Copy, Debug)]
 #[allow(dead_code)]
-pub(crate) struct DisplayedImageTransform {
-    pub(crate) page_idx: usize,
+pub(crate) struct DisplayedImageGeometry {
     pub(crate) source_size: egui::Vec2,
     pub(crate) texture_size: egui::Vec2,
     pub(crate) viewport_rect: egui::Rect,
@@ -143,8 +218,56 @@ pub(crate) struct DisplayedImageTransform {
     pub(crate) pixel_fit: RectPixelFit,
 }
 
-impl DisplayedImageTransform {
-    pub(crate) fn resolve(input: DisplayedImageTransformInput) -> Option<Self> {
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
+pub(crate) struct DisplayedImageTransform {
+    pub(crate) page_idx: usize,
+    geometry: DisplayedImageGeometry,
+}
+
+impl std::ops::Deref for DisplayedImageTransform {
+    type Target = DisplayedImageGeometry;
+
+    fn deref(&self) -> &Self::Target {
+        &self.geometry
+    }
+}
+
+/// The final screen-space quad occupied by the painted image.
+///
+/// `local_size` stays in the unrotated page coordinate system. Repeating image
+/// underlays use it for page-local UVs while the four positions rotate together
+/// with the image.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ImagePaintQuad {
+    pub(crate) positions: [egui::Pos2; 4],
+    pub(crate) local_size: egui::Vec2,
+}
+
+impl ImagePaintQuad {
+    pub(crate) fn from_rect(
+        rect: egui::Rect,
+        rotation_center: egui::Pos2,
+        free_rotation_rad: f32,
+    ) -> Self {
+        let mut positions = [
+            rect.left_top(),
+            rect.right_top(),
+            rect.right_bottom(),
+            rect.left_bottom(),
+        ];
+        for position in &mut positions {
+            *position = rotate_about(*position, rotation_center, free_rotation_rad);
+        }
+        Self {
+            positions,
+            local_size: rect.size(),
+        }
+    }
+}
+
+impl DisplayedImageGeometry {
+    pub(crate) fn resolve(input: DisplayedImageGeometryInput) -> Option<Self> {
         if !rect_is_valid(input.viewport_rect)
             || !size_is_valid(input.source_size)
             || !size_is_valid(input.texture_size)
@@ -163,37 +286,81 @@ impl DisplayedImageTransform {
             );
             (width, height, center)
         });
-        let page_fit = || {
-            (input.viewport_rect.width() / display_size.x)
-                .min(input.viewport_rect.height() / display_size.y)
+        let singleton = match input.placement {
+            ResolvedDisplayPlacement::SingletonSpread { side, gap, .. }
+                if side != SingletonSpreadPlacement::Center =>
+            {
+                Some((side, gap.max(0.0), false))
+            }
+            ResolvedDisplayPlacement::Z {
+                singleton_side,
+                singleton_gap,
+                ..
+            } if singleton_side != SingletonSpreadPlacement::Center => {
+                Some((singleton_side, singleton_gap.max(0.0), true))
+            }
+            _ => None,
         };
-        let (fit_scale, content_center) = match (input.fit_mode, bbox_fit) {
+        let (fit_scale, content_center, visible_width) = match (input.fit_mode, bbox_fit) {
             (FullscreenFitMode::Width, Some((width, _, center))) => {
-                (input.viewport_rect.width() / width, center)
+                let scale = singleton.map_or(input.viewport_rect.width() / width, |(_, gap, _)| {
+                    (input.viewport_rect.width() - gap).max(1.0) / (width * 2.0)
+                });
+                (scale, center, width)
             }
-            (FullscreenFitMode::Width, None) => (
-                input.viewport_rect.width() / display_size.x,
-                egui::Vec2::ZERO,
+            (FullscreenFitMode::Width, None) => {
+                let scale = singleton.map_or(
+                    input.viewport_rect.width() / display_size.x,
+                    |(_, gap, _)| {
+                        (input.viewport_rect.width() - gap).max(1.0) / (display_size.x * 2.0)
+                    },
+                );
+                (scale, egui::Vec2::ZERO, display_size.x)
+            }
+            (FullscreenFitMode::Height, Some((_, height, center))) => (
+                input.viewport_rect.height() / height,
+                center,
+                bbox_fit.map_or(display_size.x, |(width, _, _)| width),
             ),
-            (FullscreenFitMode::Height, Some((_, height, center))) => {
-                (input.viewport_rect.height() / height, center)
-            }
             (FullscreenFitMode::Height, None) => (
                 input.viewport_rect.height() / display_size.y,
                 egui::Vec2::ZERO,
+                display_size.x,
             ),
-            (FullscreenFitMode::Original, Some((_, _, center))) => {
-                (physical_pixel_scale(input.pixels_per_point), center)
-            }
+            (FullscreenFitMode::Original, Some((_, _, center))) => (
+                physical_pixel_scale(input.pixels_per_point),
+                center,
+                bbox_fit.map_or(display_size.x, |(width, _, _)| width),
+            ),
             (FullscreenFitMode::Original, None) => (
                 physical_pixel_scale(input.pixels_per_point),
                 egui::Vec2::ZERO,
+                display_size.x,
             ),
-            (_, Some((width, height, center))) => (
-                (input.viewport_rect.width() / width).min(input.viewport_rect.height() / height),
-                center,
-            ),
-            (_, None) => (page_fit(), egui::Vec2::ZERO),
+            (_, Some((width, height, center))) => {
+                let width_fit = singleton
+                    .map_or(input.viewport_rect.width() / width, |(_, gap, _)| {
+                        (input.viewport_rect.width() - gap).max(1.0) / (width * 2.0)
+                    });
+                (
+                    width_fit.min(input.viewport_rect.height() / height),
+                    center,
+                    width,
+                )
+            }
+            (_, None) => {
+                let width_fit = singleton.map_or(
+                    input.viewport_rect.width() / display_size.x,
+                    |(_, gap, _)| {
+                        (input.viewport_rect.width() - gap).max(1.0) / (display_size.x * 2.0)
+                    },
+                );
+                (
+                    width_fit.min(input.viewport_rect.height() / display_size.y),
+                    egui::Vec2::ZERO,
+                    display_size.x,
+                )
+            }
         };
         let fit_scale = input.fit_scale_limits.apply(fit_scale);
         let (total_scale, base_center) = match input.placement.zoom_pan() {
@@ -203,14 +370,30 @@ impl DisplayedImageTransform {
         if !total_scale.is_finite() || total_scale <= 0.0 {
             return None;
         }
-        let center = base_center - content_center * total_scale;
+        let slot_offset = singleton.map_or(0.0, |(side, gap, scale_gap_with_zoom)| {
+            let gap = if scale_gap_with_zoom {
+                input
+                    .placement
+                    .zoom_pan()
+                    .map_or(gap, |(zoom, _)| gap * zoom)
+            } else {
+                gap
+            };
+            let magnitude = (visible_width * total_scale + gap) * 0.5;
+            match side.side() {
+                SingletonSpreadPlacement::Left | SingletonSpreadPlacement::LeftWhite => -magnitude,
+                SingletonSpreadPlacement::Right | SingletonSpreadPlacement::RightWhite => magnitude,
+                SingletonSpreadPlacement::Center => 0.0,
+            }
+        });
+        let center = base_center + egui::vec2(slot_offset, 0.0) - content_center * total_scale;
         let full_image_rect = egui::Rect::from_center_size(center, display_size * total_scale);
         Self::from_resolved_rect(input, full_image_rect)
     }
 
     /// 見開き・連結読みのレイアウトが先に確定させた画像全体矩形から transform を構築する。
     pub(crate) fn from_resolved_rect(
-        input: DisplayedImageTransformInput,
+        input: DisplayedImageGeometryInput,
         full_image_rect: egui::Rect,
     ) -> Option<Self> {
         if !rect_is_valid(input.viewport_rect)
@@ -264,7 +447,6 @@ impl DisplayedImageTransform {
         )
         .intersect(input.viewport_rect);
         Some(Self {
-            page_idx: input.page_idx,
             source_size: input.source_size,
             texture_size: input.texture_size,
             viewport_rect: input.viewport_rect,
@@ -473,19 +655,7 @@ impl DisplayedImageTransform {
         tint: egui::Color32,
     ) {
         let display_uvs = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
-        let mut positions = [
-            self.paint_rect.left_top(),
-            self.paint_rect.right_top(),
-            self.paint_rect.right_bottom(),
-            self.paint_rect.left_bottom(),
-        ];
-        for position in &mut positions {
-            *position = rotate_about(
-                *position,
-                self.full_image_rect.center(),
-                self.free_rotation_rad,
-            );
-        }
+        let positions = self.paint_quad().positions;
         let mut mesh = egui::Mesh::with_texture(texture_id);
         for (index, (u, v)) in display_uvs.into_iter().enumerate() {
             let (source_u, source_v) = inverse_uv(self.rotation, u, v);
@@ -500,6 +670,16 @@ impl DisplayedImageTransform {
         }
         mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
         painter.add(egui::Shape::mesh(mesh));
+    }
+
+    /// Return the same final quad used by [`Self::paint_texture`]. Image-local
+    /// underlays must use this instead of the axis-aligned hit rectangle.
+    pub(crate) fn paint_quad(&self) -> ImagePaintQuad {
+        ImagePaintQuad::from_rect(
+            self.paint_rect,
+            self.full_image_rect.center(),
+            self.free_rotation_rad,
+        )
     }
 
     /// Paint a texture representing only `source_uv_rect` at the matching place
@@ -522,6 +702,39 @@ impl DisplayedImageTransform {
             full_uv_rect(),
             tint,
         );
+    }
+}
+
+impl DisplayedImageTransform {
+    pub(crate) fn from_geometry(page_idx: usize, geometry: DisplayedImageGeometry) -> Self {
+        Self { page_idx, geometry }
+    }
+
+    pub(crate) fn resolve(input: DisplayedImageTransformInput) -> Option<Self> {
+        let page_idx = input.page_idx;
+        DisplayedImageGeometry::resolve(input.without_page())
+            .map(|geometry| Self { page_idx, geometry })
+    }
+
+    pub(crate) fn from_resolved_rect(
+        input: DisplayedImageTransformInput,
+        full_image_rect: egui::Rect,
+    ) -> Option<Self> {
+        let page_idx = input.page_idx;
+        DisplayedImageGeometry::from_resolved_rect(input.without_page(), full_image_rect)
+            .map(|geometry| Self { page_idx, geometry })
+    }
+
+    pub(crate) fn translated_by(self, offset: egui::Vec2) -> Self {
+        Self {
+            page_idx: self.page_idx,
+            geometry: self.geometry.translated_by(offset),
+        }
+    }
+
+    pub(crate) fn with_coordinate_source_size(mut self, source_size: egui::Vec2) -> Self {
+        self.geometry.source_size = source_size;
+        self
     }
 }
 
@@ -599,15 +812,43 @@ pub(crate) fn paint_source_region_texture(
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DisplayedPage {
     pub(crate) transform: DisplayedImageTransform,
+    occurrence: crate::ui_fullscreen::SpreadPageOccurrence,
 }
 
 impl DisplayedPage {
     pub(crate) fn new(transform: DisplayedImageTransform) -> Self {
-        Self { transform }
+        let page_idx = transform.page_idx;
+        Self {
+            transform,
+            occurrence: crate::ui_fullscreen::SpreadPageOccurrence {
+                idx: page_idx,
+                role: crate::ui_fullscreen::SpreadPageRole::Navigation,
+                navigation_anchor_idx: page_idx,
+            },
+        }
+    }
+
+    pub(crate) fn with_occurrence(
+        transform: DisplayedImageTransform,
+        occurrence: crate::ui_fullscreen::SpreadPageOccurrence,
+    ) -> Self {
+        debug_assert_eq!(transform.page_idx, occurrence.idx);
+        Self {
+            transform,
+            occurrence,
+        }
     }
 
     pub(crate) fn page_idx(self) -> usize {
         self.transform.page_idx
+    }
+
+    pub(crate) fn occurrence(self) -> crate::ui_fullscreen::SpreadPageOccurrence {
+        self.occurrence
+    }
+
+    pub(crate) fn navigation_anchor_idx(self) -> usize {
+        self.occurrence.navigation_anchor_idx
     }
 }
 
@@ -642,6 +883,36 @@ impl FullscreenPageLayout {
 
     pub(crate) fn push(&mut self, transform: DisplayedImageTransform) {
         self.pages.push(DisplayedPage::new(transform));
+    }
+
+    pub(crate) fn push_occurrence(
+        &mut self,
+        transform: DisplayedImageTransform,
+        occurrence: crate::ui_fullscreen::SpreadPageOccurrence,
+    ) {
+        self.pages
+            .push(DisplayedPage::with_occurrence(transform, occurrence));
+    }
+
+    /// Rebind a paged layout to the role-aware composition that produced it.
+    /// Index and screen order must already match; this method never changes geometry.
+    pub(crate) fn rebind_occurrences(
+        &mut self,
+        occurrences: &[crate::ui_fullscreen::SpreadPageOccurrence],
+    ) -> bool {
+        if self.pages.len() != occurrences.len()
+            || self
+                .pages
+                .iter()
+                .zip(occurrences)
+                .any(|(page, occurrence)| page.page_idx() != occurrence.idx)
+        {
+            return false;
+        }
+        for (page, occurrence) in self.pages.iter_mut().zip(occurrences) {
+            page.occurrence = *occurrence;
+        }
+        true
     }
 
     pub(crate) fn hit_test(&self, pos: egui::Pos2) -> Option<&DisplayedPage> {
@@ -688,8 +959,36 @@ impl FullscreenPageLayout {
         self.pages.iter().map(|page| page.transform.page_idx)
     }
 
+    pub(crate) fn navigation_page_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.pages.iter().filter_map(|page| {
+            (page.occurrence.role == crate::ui_fullscreen::SpreadPageRole::Navigation)
+                .then_some(page.transform.page_idx)
+        })
+    }
+
     pub(crate) fn page_by_idx(&self, page_idx: usize) -> Option<&DisplayedPage> {
         self.pages.iter().find(|page| page.page_idx() == page_idx)
+    }
+
+    pub(crate) fn page_by_occurrence(
+        &self,
+        occurrence: crate::ui_fullscreen::SpreadPageOccurrence,
+    ) -> Option<&DisplayedPage> {
+        self.pages.iter().find(|page| page.occurrence == occurrence)
+    }
+
+    /// Find a displayed source within one navigation unit. Continuous final-cover display can
+    /// show source index 0 twice at once (the first unit and the last unit's supplement), so the
+    /// source index alone is not enough to select the geometry that belongs to the current unit.
+    pub(crate) fn page_by_idx_for_navigation_anchor(
+        &self,
+        page_idx: usize,
+        navigation_anchor_idx: usize,
+    ) -> Option<&DisplayedPage> {
+        self.pages.iter().find(|page| {
+            page.page_idx() == page_idx
+                && page.occurrence.navigation_anchor_idx == navigation_anchor_idx
+        })
     }
 
     pub(crate) fn kind(&self) -> FullscreenPageLayoutKind {
@@ -708,6 +1007,23 @@ impl FullscreenPageLayout {
             return None;
         }
         Some((self.pages[0].page_idx(), self.pages[1].page_idx()))
+    }
+
+    pub(crate) fn spread_occurrences(
+        &self,
+    ) -> Option<[crate::ui_fullscreen::SpreadPageOccurrence; 2]> {
+        if self.kind != FullscreenPageLayoutKind::Spread || self.pages.len() != 2 {
+            return None;
+        }
+        Some([self.pages[0].occurrence(), self.pages[1].occurrence()])
+    }
+
+    pub(crate) fn navigation_spread_pair(&self) -> Option<(usize, usize)> {
+        if self.kind != FullscreenPageLayoutKind::Spread {
+            return None;
+        }
+        let pages = self.navigation_page_indices().collect::<Vec<_>>();
+        (pages.len() == 2).then(|| (pages[0], pages[1]))
     }
 }
 
@@ -800,6 +1116,14 @@ pub(crate) struct ResolvedZTransform {
 
 impl ResolvedZTransform {
     pub(crate) fn resolve(mut input: ZTransformInput) -> Option<Self> {
+        let (singleton_side, singleton_gap) = match input.image.placement {
+            ResolvedDisplayPlacement::Z {
+                singleton_side,
+                singleton_gap,
+                ..
+            } => (singleton_side, singleton_gap.max(0.0)),
+            _ => (SingletonSpreadPlacement::Center, 0.0),
+        };
         input.image.fit_mode = FullscreenFitMode::Page;
         input.image.fit_scale_limits = FullscreenFitScaleLimits::default();
         input.image.free_rotation_rad = 0.0;
@@ -826,6 +1150,16 @@ impl ResolvedZTransform {
             })
             .unwrap_or((egui::Vec2::ZERO, display_size));
         let view = input.image.viewport_rect.size();
+        if singleton_side != SingletonSpreadPlacement::Center {
+            return Self::resolve_singleton_spread(
+                input,
+                singleton_side,
+                singleton_gap,
+                display_size,
+                content_size,
+                view,
+            );
+        }
         let cover = (view.x / content_size.x).max(view.y / content_size.y);
         let contain = (view.x / content_size.x).min(view.y / content_size.y);
         let factor_min = if cover > 0.0 {
@@ -880,6 +1214,95 @@ impl ResolvedZTransform {
             active: input.active,
             factor,
             zoom_pan,
+            singleton_side: SingletonSpreadPlacement::Center,
+            singleton_gap: 0.0,
+        };
+        Some(Self {
+            transform: DisplayedImageTransform::resolve(input.image)?,
+            factor,
+            aim_frame,
+            full_image_zoom,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_singleton_spread(
+        mut input: ZTransformInput,
+        singleton_side: SingletonSpreadPlacement,
+        singleton_gap: f32,
+        display_size: egui::Vec2,
+        content_size: egui::Vec2,
+        view: egui::Vec2,
+    ) -> Option<Self> {
+        if !size_is_valid(view) || !size_is_valid(display_size) || !size_is_valid(content_size) {
+            return None;
+        }
+        let contain = ((view.x - singleton_gap).max(1.0) / (content_size.x * 2.0))
+            .min(view.y / content_size.y)
+            .max(f32::EPSILON);
+        let gap_in_content = singleton_gap / contain;
+        let composite = egui::vec2(content_size.x * 2.0 + gap_in_content, content_size.y);
+        let single_page_w = content_size.x;
+        let factor_min = if view.x > 0.0 {
+            (1.2 * single_page_w * contain / view.x).min(1.0)
+        } else {
+            1.0
+        };
+        let factor = input.factor.clamp(factor_min, 16.0);
+        let aim_basis = ZAimBasis::resolve(
+            input.image.viewport_rect,
+            input.pan_band,
+            composite,
+            contain,
+        );
+        let cursor_comp = z_cursor_image_px(&aim_basis, egui::Vec2::ZERO, composite, input.cursor);
+        let target_visible_width =
+            (1.2 * single_page_w.max(1.0) / factor.max(f32::EPSILON)).max(1.0);
+        let total = (view.x / target_visible_width).max(contain);
+        let visible = egui::vec2(
+            (view.x / total).min(composite.x),
+            (view.y / total).min(composite.y),
+        );
+        let center_comp = egui::vec2(
+            cursor_comp.x.clamp(
+                visible.x * 0.5,
+                (composite.x - visible.x * 0.5).max(visible.x * 0.5),
+            ),
+            cursor_comp.y.clamp(
+                visible.y * 0.5,
+                (composite.y - visible.y * 0.5).max(visible.y * 0.5),
+            ),
+        );
+        let zoom = total / contain;
+        let pan = (composite * 0.5 - center_comp) * total;
+        let (zoom_pan, aim_frame) = if input.active {
+            (Some((zoom, pan)), None)
+        } else {
+            let frame_min = aim_basis.content_rect().min
+                + egui::vec2(
+                    center_comp.x - visible.x * 0.5,
+                    center_comp.y - visible.y * 0.5,
+                ) * aim_basis.content_fit();
+            (
+                None,
+                Some(egui::Rect::from_min_size(
+                    frame_min,
+                    visible * aim_basis.content_fit(),
+                )),
+            )
+        };
+        input.image.placement = ResolvedDisplayPlacement::Z {
+            active: input.active,
+            factor,
+            zoom_pan,
+            singleton_side,
+            singleton_gap,
+        };
+        let page_fit = (view.x / display_size.x).min(view.y / display_size.y);
+        let full_image_zoom = if page_fit > 0.0 {
+            total / page_fit
+        } else {
+            1.0
         };
         Some(Self {
             transform: DisplayedImageTransform::resolve(input.image)?,
@@ -1491,6 +1914,11 @@ mod tests {
         close(a.bottom(), b.bottom());
     }
 
+    fn pos_close(a: egui::Pos2, b: egui::Pos2) {
+        close(a.x, b.x);
+        close(a.y, b.y);
+    }
+
     fn page_transform(page_idx: usize, rect: egui::Rect) -> DisplayedImageTransform {
         DisplayedImageTransform::from_resolved_rect(
             DisplayedImageTransformInput {
@@ -1652,6 +2080,41 @@ mod tests {
     }
 
     #[test]
+    fn repeated_cover_source_is_addressed_by_navigation_occurrence() {
+        let first_rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(80.0, 100.0));
+        let final_rect = egui::Rect::from_min_max(egui::pos2(0.0, 220.0), egui::pos2(80.0, 320.0));
+        let mut layout = FullscreenPageLayout::default();
+        layout.begin(FullscreenPageLayoutKind::Continuous);
+        layout.push_occurrence(
+            page_transform(0, first_rect),
+            crate::ui_fullscreen::SpreadPageOccurrence::navigation(0, 0),
+        );
+        layout.push_occurrence(
+            page_transform(0, final_rect),
+            crate::ui_fullscreen::SpreadPageOccurrence::final_cover_supplement(0, 3),
+        );
+
+        assert_eq!(
+            layout
+                .page_by_idx_for_navigation_anchor(0, 0)
+                .map(|page| page.transform.paint_rect),
+            Some(first_rect)
+        );
+        assert_eq!(
+            layout
+                .page_by_idx_for_navigation_anchor(0, 3)
+                .map(|page| page.transform.paint_rect),
+            Some(final_rect)
+        );
+        assert_eq!(
+            layout
+                .hit_test(final_rect.center())
+                .map(|page| page.occurrence()),
+            Some(crate::ui_fullscreen::SpreadPageOccurrence::final_cover_supplement(0, 3))
+        );
+    }
+
+    #[test]
     fn spread_layout_hits_physical_left_and_right_pages_for_ltr_and_rtl() {
         let left = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(95.0, 100.0));
         let right = egui::Rect::from_min_max(egui::pos2(105.0, 0.0), egui::pos2(200.0, 100.0));
@@ -1718,6 +2181,64 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn image_paint_quad_uses_the_trimmed_rect_for_every_saved_rotation() {
+        let trim = egui::Rect::from_min_max(egui::pos2(0.15, 0.20), egui::pos2(0.85, 0.75));
+        for rotation in [
+            Rotation::None,
+            Rotation::Cw90,
+            Rotation::Cw180,
+            Rotation::Cw270,
+        ] {
+            let transform = DisplayedImageTransform::resolve(input(
+                FullscreenFitMode::Page,
+                rotation,
+                Some(trim),
+            ))
+            .unwrap();
+            let quad = transform.paint_quad();
+            assert_eq!(quad.local_size, transform.paint_rect.size());
+            for (actual, expected) in quad.positions.into_iter().zip([
+                transform.paint_rect.left_top(),
+                transform.paint_rect.right_top(),
+                transform.paint_rect.right_bottom(),
+                transform.paint_rect.left_bottom(),
+            ]) {
+                pos_close(actual, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn image_paint_quad_rotates_page_local_corners_instead_of_using_the_aabb() {
+        let mut value = input(FullscreenFitMode::Page, Rotation::None, None);
+        value.free_rotation_rad = 0.37;
+        let transform = DisplayedImageTransform::resolve(value).unwrap();
+        let quad = transform.paint_quad();
+        let expected = [
+            transform.paint_rect.left_top(),
+            transform.paint_rect.right_top(),
+            transform.paint_rect.right_bottom(),
+            transform.paint_rect.left_bottom(),
+        ]
+        .map(|position| {
+            rotate_about(
+                position,
+                transform.full_image_rect.center(),
+                transform.free_rotation_rad,
+            )
+        });
+        for (actual, expected) in quad.positions.into_iter().zip(expected) {
+            pos_close(actual, expected);
+        }
+        assert!(
+            quad.positions
+                .into_iter()
+                .all(|position| position != transform.hit_rect.left_top())
+        );
+        assert_eq!(quad.local_size, transform.paint_rect.size());
     }
 
     #[test]
@@ -1992,6 +2513,179 @@ mod tests {
         let loupe_source = transform.screen_to_source(screen);
         close(source.x, loupe_source.x);
         close(source.y, loupe_source.y);
+    }
+
+    #[test]
+    fn z_singleton_spread_uses_the_combined_virtual_canvas_and_scales_its_gap() {
+        for singleton_side in [
+            SingletonSpreadPlacement::Left,
+            SingletonSpreadPlacement::Right,
+        ] {
+            for active in [false, true] {
+                let mut base = input(FullscreenFitMode::Page, Rotation::None, None);
+                base.viewport_rect =
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 600.0));
+                base.source_size = egui::vec2(400.0, 600.0);
+                base.texture_size = base.source_size;
+                base.placement = ResolvedDisplayPlacement::Z {
+                    active,
+                    factor: 2.0,
+                    zoom_pan: None,
+                    singleton_side,
+                    singleton_gap: 20.0,
+                };
+                let resolved = ResolvedZTransform::resolve(ZTransformInput {
+                    pan_band: base.viewport_rect,
+                    cursor: base.viewport_rect.center(),
+                    factor: 2.0,
+                    active,
+                    image: base,
+                })
+                .unwrap();
+                let transform = resolved.transform;
+                let ResolvedDisplayPlacement::Z {
+                    zoom_pan,
+                    singleton_side: resolved_side,
+                    singleton_gap,
+                    ..
+                } = transform.placement
+                else {
+                    panic!("placed singleton Z transform must retain its virtual-canvas owner");
+                };
+                assert_eq!(resolved_side, singleton_side);
+                close(singleton_gap, 20.0);
+                if active {
+                    let (zoom, pan) = zoom_pan.expect("active Z owns zoom/pan");
+                    assert_eq!(pan, egui::Vec2::ZERO);
+                    assert!(zoom > 1.0);
+                    let inner_edge =
+                        match singleton_side.side() {
+                            SingletonSpreadPlacement::Left
+                            | SingletonSpreadPlacement::LeftWhite => transform.paint_rect.right(),
+                            SingletonSpreadPlacement::Right
+                            | SingletonSpreadPlacement::RightWhite => transform.paint_rect.left(),
+                            SingletonSpreadPlacement::Center => unreachable!(),
+                        };
+                    let expected = base.viewport_rect.center().x
+                        + match singleton_side.side() {
+                            SingletonSpreadPlacement::Left
+                            | SingletonSpreadPlacement::LeftWhite => -singleton_gap * zoom * 0.5,
+                            SingletonSpreadPlacement::Right
+                            | SingletonSpreadPlacement::RightWhite => singleton_gap * zoom * 0.5,
+                            SingletonSpreadPlacement::Center => 0.0,
+                        };
+                    close(inner_edge, expected);
+                    assert!(
+                        transform.paint_rect.width() > base.viewport_rect.width() * 0.5,
+                        "active Z must zoom the combined canvas rather than retain the endpoint fit"
+                    );
+                    assert!(resolved.aim_frame.is_none());
+                } else {
+                    assert!(zoom_pan.is_none());
+                    assert!(resolved.aim_frame.is_some());
+                    let inner_edge =
+                        match singleton_side.side() {
+                            SingletonSpreadPlacement::Left
+                            | SingletonSpreadPlacement::LeftWhite => transform.paint_rect.right(),
+                            SingletonSpreadPlacement::Right
+                            | SingletonSpreadPlacement::RightWhite => transform.paint_rect.left(),
+                            SingletonSpreadPlacement::Center => unreachable!(),
+                        };
+                    let expected = base.viewport_rect.center().x
+                        + match singleton_side.side() {
+                            SingletonSpreadPlacement::Left
+                            | SingletonSpreadPlacement::LeftWhite => -singleton_gap * 0.5,
+                            SingletonSpreadPlacement::Right
+                            | SingletonSpreadPlacement::RightWhite => singleton_gap * 0.5,
+                            SingletonSpreadPlacement::Center => 0.0,
+                        };
+                    close(inner_edge, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn z_singleton_spread_round_trips_rotated_trimmed_source_coordinates() {
+        let trim = egui::Rect::from_min_max(egui::pos2(0.12, 0.18), egui::pos2(0.88, 0.91));
+        for singleton_side in [
+            SingletonSpreadPlacement::Left,
+            SingletonSpreadPlacement::Right,
+        ] {
+            for active in [false, true] {
+                let mut base = input(FullscreenFitMode::Page, Rotation::Cw90, Some(trim));
+                base.viewport_rect =
+                    egui::Rect::from_min_size(egui::pos2(20.0, 30.0), egui::vec2(1100.0, 700.0));
+                base.placement = ResolvedDisplayPlacement::Z {
+                    active,
+                    factor: 2.4,
+                    zoom_pan: None,
+                    singleton_side,
+                    singleton_gap: 24.0,
+                };
+                let resolved = ResolvedZTransform::resolve(ZTransformInput {
+                    pan_band: base.viewport_rect.shrink2(egui::vec2(30.0, 50.0)),
+                    cursor: base.viewport_rect.center() + egui::vec2(80.0, -45.0),
+                    factor: 2.4,
+                    active,
+                    image: base,
+                })
+                .unwrap();
+                let transform = resolved.transform;
+                for source in [
+                    egui::pos2(300.0, 240.0),
+                    egui::pos2(760.0, 540.0),
+                    egui::pos2(1040.0, 700.0),
+                ] {
+                    let screen = transform.source_to_screen(source);
+                    let restored = transform.screen_to_source(screen);
+                    close(source.x, restored.x);
+                    close(source.y, restored.y);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn singleton_spread_fit_modes_share_a_centered_two_slot_canvas() {
+        for pixels_per_point in [1.0, 1.5, 2.0] {
+            for fit_mode in [
+                FullscreenFitMode::Page,
+                FullscreenFitMode::Width,
+                FullscreenFitMode::Height,
+                FullscreenFitMode::Original,
+            ] {
+                let mut base = input(fit_mode, Rotation::None, None);
+                base.viewport_rect =
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 600.0));
+                base.source_size = egui::vec2(400.0, 600.0);
+                base.texture_size = base.source_size;
+                base.pixels_per_point = pixels_per_point;
+                let resolve = |side| {
+                    let mut placed = base;
+                    placed.placement = ResolvedDisplayPlacement::SingletonSpread {
+                        side,
+                        gap: 20.0,
+                        zoom_pan: None,
+                    };
+                    DisplayedImageTransform::resolve(placed).unwrap()
+                };
+                let left = resolve(SingletonSpreadPlacement::Left);
+                let right = resolve(SingletonSpreadPlacement::Right);
+
+                close(left.paint_rect.width(), right.paint_rect.width());
+                close(left.paint_rect.height(), right.paint_rect.height());
+                close(
+                    left.paint_rect.right(),
+                    base.viewport_rect.center().x - 10.0,
+                );
+                close(
+                    right.paint_rect.left(),
+                    base.viewport_rect.center().x + 10.0,
+                );
+                assert_eq!(left.page_idx, right.page_idx);
+            }
+        }
     }
 
     #[test]
@@ -2339,5 +3033,39 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         );
+    }
+
+    #[test]
+    fn page_wrapper_and_identity_free_geometry_resolve_to_the_same_result() {
+        let page_input = input(
+            FullscreenFitMode::Width,
+            Rotation::Cw90,
+            Some(egui::Rect::from_min_max(
+                egui::pos2(0.1, 0.2),
+                egui::pos2(0.85, 0.9),
+            )),
+        );
+        let page = DisplayedImageTransform::resolve(page_input).unwrap();
+        let geometry = DisplayedImageGeometry::resolve(page_input.without_page()).unwrap();
+
+        assert_eq!(page.page_idx, 7);
+        assert_eq!(format!("{:?}", page.geometry), format!("{:?}", geometry));
+        let offset = egui::vec2(11.0, -6.0);
+        let translated_page = page.translated_by(offset);
+        let translated_geometry = geometry.translated_by(offset);
+        assert_eq!(translated_page.page_idx, 7);
+        assert_eq!(
+            format!("{:?}", translated_page.geometry),
+            format!("{:?}", translated_geometry)
+        );
+
+        let coordinate_size = egui::vec2(4096.0, 3072.0);
+        let coordinate_override = page.with_coordinate_source_size(coordinate_size);
+        assert_eq!(coordinate_override.page_idx, 7);
+        assert_eq!(coordinate_override.source_size, coordinate_size);
+        assert_eq!(coordinate_override.full_image_rect, page.full_image_rect);
+        assert_eq!(coordinate_override.paint_rect, page.paint_rect);
+        assert_eq!(coordinate_override.uv_rect, page.uv_rect);
+        assert_eq!(coordinate_override.total_scale, page.total_scale);
     }
 }

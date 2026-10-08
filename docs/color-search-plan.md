@@ -139,7 +139,8 @@ Codex がレビューで挙げた問題が、オンデマンド化でどうな�
   ↓
 ② 色スキャン worker（missing/stale のみ・キャンセル可能 + 進捗）
     - 各アイテムについて画素を入手 → パレット抽出（§3, §4）→ 候補キャッシュへ
-    - 画素入手の優先順位: in-memory cache_map(WebP) → catalog(WebP) → 必要時デコード後に縮小
+    - 通常画像: cache_map(WebP) → 必要時デコード後に縮小
+    - ZIP/PDF 親代表: cache_map(WebP) → catalog(WebP、正しい代表キーの個別読取) → 必要時生成
       （JPEG のみ DCT 縮小 decode 可、PNG/WebP/WIC はフル decode になり得る §3.1）
     - 「スキャン中… 320/1000」を表示。Esc / ✕ でキャンセル
   ↓
@@ -161,21 +162,28 @@ Codex がレビューで挙げた問題が、オンデマンド化でどうな�
 
 ### 3.1 画素の入手（既存資産の再利用、UI スレッドを止めない）
 
-各アイテムについて、安い順に画素を得る:
+通常画像・ZIP画像・PDFページ・Stack は `cache_map → デコード`、ZIP/PDF の親代表だけは `cache_map → catalog → 生成` の順に画素を得る。通常画像の取得経路は変更しない:
 
 1. **in-memory `cache_map`**: `Arc<RwLock<HashMap<String, CacheEntry>>>`。`CacheEntry.jpeg_data` は
    実体 WebP バイト（[src/thumb_loader.rs](../src/thumb_loader.rs) 参照）。あれば WebP デコード。
    - **ロック保持を最小化（Codex P2）**: read ロック下では**必要な WebP バイトだけ clone（or Arc
      共有）して即座にロックを離す**。デコードはロックの外で行う。ロックを持ったまま decode しない。
-2. **catalog の WebP**: cache_map に無いものだけ catalog から引く。**`CatalogDb::load_all()` で
+2. **ZIP/PDF 親代表だけ catalog の WebP**: cache_map に fresh な行が無い場合、worker が pin 解決後の正しい `#pin:` を含むキーで `CatalogDb::load_one` を呼ぶ。mtime・size 不一致は拒否する。**`CatalogDb::load_all()` で
    フォルダ全 BLOB を再ロードしない（Codex P2）**。cache_map が既に持っているなら二重ロードで
-   数百 MB を一時的に重複させてしまう。必要キーだけ個別 SELECT する。
-3. **どちらも無い**: 元画像を**デコードし、縮小/サンプリング**する。
+   数百 MB を一時的に重複させてしまう。必要キーだけ個別 SELECT する。取得した行はworkerの1行だけの私有mapで既存サムネイル処理へ渡し、遅いDB読取で共有mapの新しい行を上書きしない。
+3. **再利用できるキャッシュが無い**: 元画像を**デコードし、縮小/サンプリング**する。ZIP/PDF 親代表は既存の先頭画像デコード / ページ0レンダ、または手動pin代表の生成へ進む。
    - **JPEG**: turbojpeg の DCT スケール（1/8 等）で**入口から縮小デコード**でき軽い。
-   - **PNG / WebP / WIC（HEIC/AVIF/JXL/TIFF/RAW）**: ほとんどの経路は**いったんフル解像度
+   - **RAW**: 通常画像・ZIP 内画像・ZIP 自動/pin 代表とも、既存のサムネイル処理に
+     `RawThumbHandoff::DedicatedWorker` を渡す。画質サンプル/キャッシュ作成と同じ
+     `decode_raw_thumbnail_on_worker` の判定を再利用し、十分な埋め込みプレビューが無ければ
+     App 共通 `RawDevelopExecutor` の Background admission で half 現像する。
+     待機は専有色 worker 上だけで行い、サムネイル/I/O/PDF の permit は保持しない。
+     scan の cancel flag を共有し、待機中は 50 ms ごとの channel wait で取消を観測して
+     自分の ticket を cancel する。実行中の現像は native 終了まで executor 枠を保持する。
+   - **PNG / WebP / WIC（HEIC/AVIF/JXL/TIFF）**: ほとんどの経路は**いったんフル解像度
      デコードしてから縮小**する（Codex P2）。つまり「低解像度指定」でも decode コスト自体は
      フル decode のことが多い。→ §3.2 の上限/進捗/キャンセル/大量時の確認が重要。
-   - ZIP/PDF/動画アイテムはサムネ（1 枚目 / 1 ページ目 / 代表フレーム）を画素源にする。
+   - ZIP/PDF の親一覧項目は既存の代表サムネ（先頭画像 / ページ0、または手動 pin）を画素源にする。動画は対象外。
 
 > パレットは**色分布**さえ取れればよく解像度は不要。画素入手後は長辺 **64–128px 相当**まで縮小
 > （or 間引きサンプリング）してから量子化する。JPEG は DCT で入口から軽くできるが、それ以外の
@@ -220,6 +228,32 @@ raw `rayon` でフォルダ全件を一気にデコードすると、**サムネ
   `color/filter_apply` に `perf::event`。スキャン総時間・1 枚あたり時間を後で解析できるように。
 
 ---
+
+### 3.4 ZIP / PDF の親一覧代表 (§1.290、実装済み・未レビュー)
+
+> 設計担当決定 (2026-10-04): catalog 個別読取は ZIP/PDF 代表だけに追加する。通常画像は従来の `cache_map → デコード` を維持する。
+
+- 対象に `ZipFile` (ZIP/CBZ) と PDF の `PdfFile` を追加する。通常画像・ZIP画像・PDFページ・Stack は維持する。`PdfFile` に共用される EPUB、変換書庫、実フォルダ、動画、音声、ZipDir は追加しない。
+- 先頭画像 / ページ0、または手動 pin の代表だけを既存の一覧サムネイルで判定し、全ページを走査しない。要求は `make_load_request`、画素取得は色 worker 内の `process_load_request` を再利用する。pin の stat / cascade DB lookup も色 worker で行う。
+- PDF 代表の `pdfthumb:` / `pdfthumb:...#pin:` 要求は一覧と同じキャッシュ設定で読み書きする。直接 `PdfPage` の色スキャンは従来どおり保存 Off。Off は既存サムネイルの読取まで禁止するものではない。PDF は UI enqueue 時の context epoch と Normal 優先度を使い、epoch を worker で読み直さない。
+- スキャン中は ZIP/PDF を先に除外せず、従来の完了時一括反映・進捗・取消・2,000件以上の missing 確認を共有する。**実際のデコード失敗は通常画像と同じく空パレットで、不一致として扱う**。RAW の現像待ちは完了まで worker が待ち、取消・executor 終了・PDF epoch 失効の `canceled` 通知は scan の取消へ伝えて Item を公開しない。一時的な画素未取得を空パレットで確定しない。新しい失敗状態や自動再試行は作らない。
+- 色キーと scope signature には item の `perf_key` に加え、代表 storage base、`#pin:` 相当の root pin 指定、pin DB の変更 stamp (cascade の子 pin 変更を含む)、探索深度、per-item サムネイル更新世代を含める。canonical `#pin:` storage suffix の解決は既存 worker 経路へ委譲する。pin stamp はメモリ上の atomic 読取だけで、UI に stat / DB lookup を追加しない。
+- `fresh_entry` は従来どおり親ファイルの mtime・size も照合する。pin変更・解除 / cascade変更 / 更新世代変更でキーとscopeが変わるため、旧workerの遅着結果は現在項目には採用されない。pin DB の stamp は pinned 代表だけに含め、無関係なpin変更で未固定代表のキーを変更しない。
+- 一覧サムネイルの source decode 完了通知 (cache保存 / skip 完了) と明示 reload eviction で、そのZIP/PDF項目だけ更新世代を進め、色scopeをdirtyにする。cache hit・通常のGPU evictionは世代を進めない。フォルダ再ロード / items交換で色状態と世代を破棄する。色worker自身のcache保存はUIサムネイル通知を出さないため自己失効ループを作らない。
+- 色状態は main grid の所有物で、viewer payload の交換対象ではない。更新世代を進めるのは既存の projected context ID が main と一致するときだけとし、別ウィンドウの代表更新で main の色スキャンを失効させない。
+- 簡素化: pin変更は既存の一覧reload経路を使い、専用のlive rebuildや失敗復旧状態を作らない。色スキャンは既存の取消・scope照合を再利用できるため、新しいモーダルは追加しない。
+- RAW 統合修正 (2026-10-05): 通常 RAW も従来は handoff 無しで half 現像不可だったため、
+  通常/代表を同じ既存 worker 用デコードへ揃えた。サムネイル完了後の再スキャンだけで待つ案は、
+  cache Off で共有画素が残らず、通常 RAW に代表更新トリガも無いので採用しない。
+  独立設計レビューで共有 executor/Background と ticket 取消の構造を合意した。
+  PDF 代表の pin は内部 PdfPage のみで RAW へ解決されない。EPUB/変換書庫/実フォルダ等の
+  親代表は従来どおり対象外。ZIP 内画像と Stack の RAW は同じ修正経路を使う。
+
+### 3.5 候補色 (§1.291、実装済み・未レビュー)
+
+- 肌色相当 `#F4CAB1` (244,202,177)、濃い赤 `#801828` (128,24,40) を追加する。表示は従来どおり色のみ、tooltipはHEXのみ。
+- CIELAB ΔE76: `#F4CAB1` 対 赤 `#FF4F4F` 63.79 / 橙 `#FFB56A` 31.80、`#801828` 対 赤 43.60 / 橙 64.45。肌色相当の既存候補最短距離は `#B99A76` との20.07、濃い赤は `#FF4F4F` との43.60。
+- プリセットは24px角の既存 `horizontal_wrapped` を維持する。
 
 ## 4. パレット抽出（在メモリ）
 
@@ -267,11 +301,11 @@ struct ScanPalettes {
 フルパス / ファイル名スタック / 将来の多フォルダビューが絡むと衝突するため、
 **`GridItem` 由来の安定キーから `ColorPaletteKey` を導出する**:
 
-- 全 variant 統一の per-item 安定キーは **`GridItem::perf_key()`**（[src/grid_item.rs:321](../src/grid_item.rs)）。
+- per-item 安定キーの基底は **`GridItem::perf_key()`**（[src/grid_item.rs:321](../src/grid_item.rs)）。ZIP/PDF 親代表は§3.4の代表identityを追加する。
   実際の prefix は `dir::` / `zipfile::` / `pdffile::` / `zip::{path}#{entry}` / `zipdir::{path}#{prefix}` /
   `archive::` / `searchdir::` / `searchzip::` / `pdf_page_perf_key(...)` / **`stack::{representative}`**
   （スタック代表、[src/grid_item.rs:356](../src/grid_item.rs)）/ 通常画像はフルパス。これを
-  `ColorPaletteKey` に使えば、混在しても 1:1 で取り違えない。
+  `ColorPaletteKey` の基底に使えば、混在しても 1:1 で取り違えない。
   - 注: 当初プラン文書で挙げた `stackthumb:` prefix は**実コードに存在しない**（スタック代表は
     通常サムネを再利用し、安定キーは `stack::...`）。`GridItem::perf_key()` を正とする。
   - 画素を `cache_map` / catalog から引く時のキー（= サムネ保存キー）は別概念で、
@@ -335,12 +369,12 @@ struct ScanPalettes {
 ファイル追加後）を取り逃がす。そこで `ScanPalettes` を「済/未済」フラグではなく
 **候補キャッシュ**として扱う:
 
-- フィルタ起動（や items 変化）のたびに、**現在の `items` の各 `GridItem::perf_key()` を引いて
+- フィルタ起動（や items 変化）のたびに、**現在の `items` の各色identity (§3.4 / §4.2) を引いて
   missing / stale（mtime/file_size 不一致）なものだけを抽出 → ② でそれだけスキャン → 完了後に
   一括反映**（§2 ①②、§7 の「完了時一括反映」）。
 - これで「いつ・どの単位で再スキャンするか」を folder 世代の粗い判定に頼らず、**アイテム単位の
   missing/stale 判定**で正確に決められる。スタック畳み・ファセット併用・ファイル追加でも安全。
-- 補助的に `ScanScopeSignature`（view kind + item count + Σ(perf_key, mtime, file_size) のハッシュ等）を
+- 補助的に `ScanScopeSignature`（view kind + item count + Σ(色identity, mtime, file_size) のハッシュ等）を
   持って「前回スキャンと同一スコープか」を O(1) で先判定し、変化時だけ差分計算に入ってもよい。
 - **保持/破棄**: フォルダ移動・フィルタ解除でクリア。**任意**で直近 1–2 フォルダ分を LRU 保持
   （メモリは 1 万枚 × ~数十バイトで <1MB、安い）。LRU 再利用時も §4.2 の mtime/file_size 検証は必須。
@@ -411,8 +445,7 @@ Eagle はサムネ/プレビュー下に**抽出済みパレットをスウォ�
 ## 10. テスト方針
 
 - **抽出の決定性**: 既知の小画像（単色 / 2 色 / グラデーション / 透過縁）で期待パレットと `ratio`
-  を unit test。`App` 構造体に紐づくテスト（`src/app/tests.rs`）は `--lib` では走らないので
-  `cargo test --bin mimageviewer-core` で実行する（純ロジックは通常の `cargo test` でよい）。
+  を unit test。`App` の状態遷移を含め `cargo test -p mimageviewer --lib color` と関連 filter で検証し、UI は `cargo test --test ui_snapshot` で確認する。
 - **知覚マージ**: グラデーション画像で主色がビン割れせず 1 色にまとまり ratio が閾値を超えること。
 - **ΔE / マッチ**: 既知 sRGB ペアで ΔE 検証。tolerance / ratio_floor のゲート境界。
 - **スキャン worker**: キャンセルで即停止、進捗カウントの単調増加。
@@ -422,8 +455,7 @@ Eagle はサムネ/プレビュー下に**抽出済みパレットをスウォ�
   - ただし **`scan_id` / `ScanScopeSignature` が起動時と不一致なら visible 一括反映しない**こと。
     具体的には: スキャン中にスタック切替/ファセット変更/ファイル追加で items を変えると、古い
     スキャンの完了でグリッドが確定せず、現在 items で missing/stale を再判定して再スキャンが走る。
-- **画素入手フォールバック**: cache_map ヒット / catalog ヒット / どちらも無し（必要時デコード→縮小）の
-  3 経路で同等のパレットが得られること。
+- **画素入手フォールバック**: ZIP/PDF 親代表は cache_map ヒット / catalog ヒット / どちらも無し（必要時生成）の3経路を検証する。通常画像は catalog に別の色の行があっても、cache_map miss 時に従来どおり元画像をデコードすることを検証する。
 - **鮮度検証（必須仕様・Codex 再々レビュー P2）**:
   - 同じ `ColorPaletteKey`（perf_key）でも **`mtime`/`file_size` が変わったら在メモリ palette を
     再利用しない**（同名差し替え / LRU 再訪のシナリオ）。
@@ -441,7 +473,7 @@ Eagle はサムネ/プレビュー下に**抽出済みパレットをスウォ�
 
 1. **Phase 1 — 抽出ロジック（UI なし）** 初期実装済み
    - `extract_palette`（量子化 + 知覚マージ + 再割当）+ sRGB→LAB + ΔE76 + マッチ関数。純ロジック。
-   - 画素入手ヘルパー（cache_map / catalog / 必要時デコード→縮小 のフォールバック）。unit test。
+   - 画素入手ヘルパー（通常画像は cache_map → デコード、ZIP/PDF 親代表は cache_map → catalog → 生成）。unit test。
 2. **Phase 2 — 色スキャン worker + 最小 UI** 初期実装済み
    - キャンセル/進捗付きスキャン（`execute_search` パターン）。候補キャッシュ `ScanPalettes` +
      差分スキャン（missing/stale のみ）+ `scan_id` / `ScanScopeSignature` による結果適用整合（§3.2, §6）。

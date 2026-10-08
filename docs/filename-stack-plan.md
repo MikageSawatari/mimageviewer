@@ -27,6 +27,16 @@
   返されたキーに親フォルダスコープを付ける。これにより同名 prefix / 先頭連番が別フォルダ間で
   誤結合しない。OFF 時は保持済み `SubfolderExpansionSnapshot` を再インストールして元の
   フラットなサブ展開一覧へ戻す。
+- **v4.1.0 A2 の切替**: 10 万件級の入力は UI で 2,048 件ずつ複製し、スクリプト・既定への
+  fallback・grouping・集約/flat の materialize・ページ編集の exact-key snapshot と投影を worker で
+  行う。UI は context / items generation / subfolder snapshot / request sequence とページ編集・★・タグ
+  write stamp を確認してから install する。flat の実ページは synthetic folder prefix で再照会しない。
+  `Stack` セルは引き続きコンテナであり編集キーを持たない。サムネとバッジの意味は変えない。
+  flat 受理時に aggregate の順と投影を同じ bundle に保持し、fullscreen を閉じたら即座に戻す。
+  保持 stamp が古い場合は aggregate の入力を抑止して worker で再読込する。読込再試行では
+  grouping を再実行せず候補順を使い、書込中は guard の repaint を待つ。失敗時の wake は
+  100 ms–4 s の bounded backoff とする。separator・script・sort・カテゴリ表示順の変更は
+  grouping 結果の受理前に照合し、変わっていれば現在の設定で再準備する。
 - **カテゴリ表示順**: 集約 / フラットの materialize は通常グリッドと同じ 4 カテゴリ表示順を
   `grid_item::arrange_grid_items` で適用する。スタックセルは画像カテゴリ、動画と音声は
   動画・音声カテゴリとして扱う。
@@ -191,3 +201,16 @@ ZIP エントリの間接層も DB も無いぶん、ZIP ツリーよりむし�
 - [spec.md](spec.md) (設定項目: スタック区切り文字) / [virtual-folders.md](virtual-folders.md)
   (仮想グループの分岐) / [architecture-overview.md](architecture-overview.md) (新しい仮想
   アイテム種別を足した場合) / htdocs マニュアル・製品ページ (内部用語を出さない方針)。
+
+## A2 編集情報の再読込中
+
+フルスクリーンの flat 表示を閉じると、保持した集約順とページ編集の投影をその場で復帰する。
+保存情報がその後に変わっていた場合は、集約画面を表示したまま worker で再読込する。
+その間は bundle 所有の `grid_item_input_allowed` でアイテム入力を一括判定する。セルと背景の
+ポインタ操作（右ドラッグのリング、ダブルクリック、ドラッグ、タッチを含む）、ゲームパッドの
+選択・決定・リング、キーボード・メニュー・ツールバーの削除・名前変更・★/タグ・編集・
+外部ツール・export は受けない。Esc、別画面への移動、アイテムに依存しないメニュー・
+ツールバー・設定・window 操作は続けられる。
+連続 8 回の読込失敗（4 秒上限で 2 回失敗）後は、最後に受理した集約表示で操作を再開し、
+日本語の非 modal 通知を一度表示する。候補順を再計算せず、4 秒間隔を上限に編集・★・タグ情報を
+裏側で再読込し、成功時に差し替える。遷移で旧 request は破棄する。

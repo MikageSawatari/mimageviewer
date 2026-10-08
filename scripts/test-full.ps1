@@ -12,6 +12,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+. (Join-Path $PSScriptRoot 'vst3-host-vcrt.ps1')
+# Handler tests start the vendor host directly, before distribution CMake runs.
+# Fail with recovery instructions rather than importing/copying runtime caches.
+Assert-MivVst3HostVcrt -RepoRoot $repoRoot
 $restoreErrorMode = $false
 $modeBefore = [uint32]0
 $gateExit = 1
@@ -47,6 +51,14 @@ public static class MivTestErrorMode
         Write-Host '[test-full] cargo test --workspace --features pack-build-tools --no-fail-fast'
         & cargo test --workspace --features pack-build-tools --no-fail-fast
         $gateExit = $LASTEXITCODE
+
+        if ($gateExit -eq 0) {
+            # vendor/egui is workspace-excluded, so exercise the locally patched input API
+            # explicitly and keep this unfiltered as new regressions are added.
+            Write-Host '[test-full] cargo test --manifest-path vendor/egui/Cargo.toml --lib'
+            & cargo test --manifest-path vendor/egui/Cargo.toml --lib
+            $gateExit = $LASTEXITCODE
+        }
 
         if ($gateExit -eq 0) {
             # vendor/egui-wgpu is workspace-excluded, so the line above never reaches it. Run its

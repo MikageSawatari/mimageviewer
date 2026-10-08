@@ -49,6 +49,8 @@
         <a href="fullscreen.html">フルスクリーン表示</a>
         <a href="video.html">動画再生</a>
         <a href="music.html">音楽再生</a>
+        <a href="effetune.html">音響調整 (EffeTune)</a>
+        <a href="effetune/index.html" class="sub">エフェクトの説明書</a>
         <a href="adjustment.html">画像補正</a>
         <a href="local-adjustment.html">補正レイヤー</a>
         <a href="analysis.html">画像分析モード</a>
@@ -60,6 +62,7 @@
         <a href="external-tools.html">外部ツール連携</a>
         <a href="tags.html">タグ機能</a>
         <a href="books.html">製本・本棚</a>
+        <a href="collections.html">コレクション</a>
         <a href="search.html">検索機能</a>
         <a href="remote.html">リモート閲覧</a>
         <a href="shortcuts.html">キーボードショートカット</a>
@@ -95,8 +98,38 @@
       </table>
     </div>
 
-    <h2>静止画（WIC 経由）</h2>
-    <p>Windows イメージング コンポーネント（WIC）を使用して表示します。
+    <h2 id="raw">RAW（内蔵）</h2>
+    <p>カメラの RAW ファイルを追加インストールなしで表示・現像できます。対応する拡張子は次の 23 種類です。</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>拡張子</th><th>フォーマット</th></tr></thead>
+        <tbody>
+          <tr><td><code>.dng</code></td><td>DNG</td></tr>
+          <tr><td><code>.cr2</code> / <code>.cr3</code> / <code>.crw</code></td><td>Canon RAW</td></tr>
+          <tr><td><code>.nef</code> / <code>.nrw</code></td><td>Nikon RAW</td></tr>
+          <tr><td><code>.arw</code> / <code>.srf</code> / <code>.sr2</code></td><td>Sony RAW</td></tr>
+          <tr><td><code>.raf</code></td><td>Fujifilm RAW</td></tr>
+          <tr><td><code>.orf</code></td><td>Olympus RAW</td></tr>
+          <tr><td><code>.rw2</code></td><td>Panasonic RAW</td></tr>
+          <tr><td><code>.pef</code> / <code>.ptx</code></td><td>Pentax RAW</td></tr>
+          <tr><td><code>.rwl</code></td><td>Leica RAW</td></tr>
+          <tr><td><code>.iiq</code></td><td>Phase One RAW</td></tr>
+          <tr><td><code>.srw</code></td><td>Samsung RAW</td></tr>
+          <tr><td><code>.3fr</code></td><td>Hasselblad RAW</td></tr>
+          <tr><td><code>.erf</code></td><td>Epson RAW</td></tr>
+          <tr><td><code>.kdc</code> / <code>.dcr</code></td><td>Kodak RAW</td></tr>
+          <tr><td><code>.mrw</code></td><td>Minolta RAW</td></tr>
+          <tr><td><code>.mos</code></td><td>Leaf RAW</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>一覧のサムネイルにはファイル内の埋め込みプレビューを使います。使えるプレビューがない場合は、現像してサムネイルを作ります。フルスクリーンではまず埋め込みプレビューを表示し、現像が終わると現像した画像に切り替わります。使えるプレビューがない場合は、現像した画像を待ちます。補正・AI 処理などの編集は、現像が終わってから使えます。</p>
+    <p>Nikon の高効率 RAW（HE / HE*）と JPEG XL 圧縮の DNG は現像に対応していません。現像できない形式でも、使える埋め込みプレビューがあればその画像を表示します。プレビューだけの画像は編集できません。拡張子が同じでも、カメラや圧縮方式によって現像できない場合があります。</p>
+    <p>製本では、編集していない RAW は元の RAW ファイルのまま本に入れます。編集した画像は編集結果を書き込みます。リモート閲覧では PC 側で現像した画像を表示します。</p>
+    <p>同時に現像する数と明るさは、<a href="settings.html#raw-develop">環境設定 → ファイル処理 → RAW 現像</a>で変更できます。</p>
+
+    <h2>静止画（Windows の表示機能）</h2>
+    <p>Windows の表示機能を使用して表示します。
     Windows 11 では標準で利用できますが、一部フォーマットは
     Microsoft Store からコーデックの追加が必要です。</p>
     <div class="table-wrap">
@@ -105,20 +138,10 @@
           <tr><th>拡張子</th><th>フォーマット</th><th>コーデック</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>.heic</code> / <code>.heif</code></td><td>HEIC / HEIF</td><td>HEIF 画像拡張機能（Microsoft Store）</td></tr>
-          <tr><td><code>.avif</code></td><td>AVIF</td><td>AV1 ビデオ拡張機能（Microsoft Store）</td></tr>
-          <tr><td><code>.jxl</code></td><td>JPEG XL</td><td>JPEG XL Image Extensions（Microsoft Store）</td></tr>
+          <tr><td><code>.heic</code> / <code>.heif</code></td><td>HEIC / HEIF</td><td><a href="https://apps.microsoft.com/detail/9pmmsr1cgpwg">HEIF 画像表示オプション</a>（Microsoft Store）。HEIC は HEVC に対応していない PC では <a href="https://apps.microsoft.com/detail/9nmzlz57r3t7">HEVC ビデオ拡張機能</a> も必要</td></tr>
+          <tr><td><code>.avif</code></td><td>AVIF</td><td><a href="https://apps.microsoft.com/detail/9mvzqvxjbq9v">AV1 ビデオ拡張機能</a>（Microsoft Store）</td></tr>
+          <tr><td><code>.jxl</code></td><td>JPEG XL</td><td><a href="https://apps.microsoft.com/detail/9mzprth5c0tb">JPEG XL 画像表示オプション</a>（Microsoft Store）</td></tr>
           <tr><td><code>.tif</code> / <code>.tiff</code></td><td>TIFF</td><td>標準搭載</td></tr>
-          <tr><td><code>.dng</code></td><td>Adobe DNG（RAW）</td><td>標準搭載（Windows 11）</td></tr>
-          <tr><td><code>.cr2</code> / <code>.cr3</code></td><td>Canon RAW</td><td>Microsoft Raw 画像拡張機能（Microsoft Store）</td></tr>
-          <tr><td><code>.nef</code> / <code>.nrw</code></td><td>Nikon RAW</td><td>Microsoft Raw 画像拡張機能（Microsoft Store）</td></tr>
-          <tr><td><code>.arw</code> / <code>.srf</code> / <code>.sr2</code></td><td>Sony RAW</td><td>Microsoft Raw 画像拡張機能（Microsoft Store）</td></tr>
-          <tr><td><code>.raf</code></td><td>Fujifilm RAW</td><td>Microsoft Raw 画像拡張機能（Microsoft Store）</td></tr>
-          <tr><td><code>.orf</code></td><td>Olympus RAW</td><td>Microsoft Raw 画像拡張機能（Microsoft Store）</td></tr>
-          <tr><td><code>.rw2</code></td><td>Panasonic RAW</td><td>Microsoft Raw 画像拡張機能（Microsoft Store）</td></tr>
-          <tr><td><code>.pef</code> / <code>.ptx</code></td><td>Pentax RAW</td><td>Microsoft Raw 画像拡張機能（Microsoft Store）</td></tr>
-          <tr><td><code>.rwl</code></td><td>Leica RAW</td><td>Microsoft Raw 画像拡張機能（Microsoft Store）</td></tr>
-          <tr><td><code>.iiq</code></td><td>Phase One RAW</td><td>Microsoft Raw 画像拡張機能（Microsoft Store）</td></tr>
         </tbody>
       </table>
     </div>
@@ -127,8 +150,9 @@
       <span class="box-icon">ℹ️</span>
       <div class="box-body">
         <strong>Microsoft Store コーデックのインストール：</strong>
-        Microsoft Store で「HEIF 画像拡張機能」「Microsoft Raw 画像拡張機能」などを検索してインストールしてください。
-        無料で入手できます。インストール後、mImageViewer の再起動は不要です。
+        HEIC / HEIF 用には <a href="https://apps.microsoft.com/detail/9pmmsr1cgpwg">HEIF 画像表示オプション</a>、AVIF 用には <a href="https://apps.microsoft.com/detail/9mvzqvxjbq9v">AV1 ビデオ拡張機能</a>、JPEG XL 用には <a href="https://apps.microsoft.com/detail/9mzprth5c0tb">JPEG XL 画像表示オプション</a> をインストールしてください。
+        HEIC は、HEVC に対応していない PC では <a href="https://apps.microsoft.com/detail/9nmzlz57r3t7">HEVC ビデオ拡張機能</a> も必要です。HEVC ビデオ拡張機能は有料の場合があります。
+        インストール後、mImageViewer の再起動は不要です。
       </div>
     </div>
 
@@ -171,9 +195,18 @@
         </thead>
         <tbody>
           <tr><td><code>.pdf</code></td><td>PDF</td><td>PDF 表示エンジン内蔵。ページごとにサムネイル表示・フルスクリーン閲覧が可能。パスワード付き PDF にも対応（パスワードは Windows の機能で暗号化してローカル保存可能）</td></tr>
+          <tr><td><code>.epub</code></td><td>EPUB</td><td>DRM のない EPUB を固定レイアウトの PDF に変換して閲覧。変換後は先頭ページのサムネイルを表示します。文字サイズの変更・テキスト選択はできず、朗読音声・動画は変換結果に含まれません</td></tr>
         </tbody>
       </table>
     </div>
+    <p>未変換の EPUB を開くと、既定では変換の確認画面が表示されます。環境設定の「EPUB の処理」で確認なしの変換や無視を選べます。RAR / 7z / LZH の設定とは別です。
+    同名の PDF がある場合は、環境設定で EPUB を一覧から隠すか選べます。
+    EPUB はファイル名で検索できます。「EPUB の処理」で「無視する」を選んだ場合は検索結果に表示されません。本の中のタイトルや著者は検索対象になりません。
+    詳しくは <a href="faq.html#format-epub">EPUB の閲覧方法</a>をご覧ください。</p>
+    <p>変換中は確認画面に進捗が表示され、「キャンセル」で中止できます。中止すると、開く前の表示に戻ります。変換が終わるまでは、ほかの本やフォルダを開く操作と、mImageViewer の別ウィンドウへの切り替えを受け付けません。一度変換した本は、次からは変換を待たずに開けます。</p>
+    <p>変換には Microsoft Edge WebView2 Runtime が必要です。Windows 11 には標準で含まれています。変換結果はアプリのデータフォルダに保存され、「設定 → EPUB 変換キャッシュ管理」でその場で削除できます。表示中など使用中の本は削除できず、理由が表示されます。</p>
+    <p>確認画面の「PDF ファイルとして保存して開く」を選ぶと、元の EPUB と同じフォルダに同名の PDF を作って開きます。一覧の EPUB を右クリックして「変換 &gt; PDF ファイルに変換」も選べます。複数選択では 1 冊ずつ変換し、進捗と結果を表示します。同名の PDF は上書きしません。保存できない場合は「変換して開く」で閲覧できます。</p>
+    <p>レーティングやページの補正などは PDF に引き継がれます。しおりとコレクションは元の EPUB に残ります。元の EPUB は削除されません。保存した PDF には EPUB の書名と、著者情報があれば最初の著者が記録されます。書名がない場合は EPUB のファイル名が使われます。</p>
 
     <h2>アーカイブ</h2>
     <div class="table-wrap">
@@ -202,7 +235,7 @@
     <div class="box info">
       <span class="box-icon">ℹ️</span>
       <div class="box-body">
-        変換済み ZIP のキャッシュは「設定 → 変換済みアーカイブキャッシュ管理…」から一覧・削除できます。
+        変換済み ZIP のキャッシュは「設定 → 変換済みアーカイブ管理」から一覧・削除できます。
         容量上限は「環境設定 → パフォーマンス → キャッシュ」で設定できます（既定は無制限）。
         変換前に確認する、自動変換する、RAR / 7z / LZH を無視する設定も同じページにあります。変換中の進捗は表示されます。
         RAR 展開には RARLAB UnRAR を使用します。詳しくは <a href="faq.html#archive-rar">FAQ</a> を参照してください。
@@ -219,7 +252,7 @@
       <li><strong>ZIP の中に RAR / 7z / LZH：</strong>設定が確認または自動変換の場合は、開いたときに「ZIP 内のアーカイブを展開」の確認または変換が行われます。変換すると入れ子の中身も見えるようになります。キャンセルしても、その ZIP 自体（入れ子以外の部分）は今までどおり閲覧できます。無視する設定ではこの提案は表示されません。</li>
     </ul>
     <p>
-      展開されたキャッシュは通常の変換キャッシュと同じく「変換済みアーカイブキャッシュ管理…」に並びます。
+      展開されたキャッシュは通常の変換キャッシュと同じく「変換済みアーカイブ管理」に並びます。
       入れ子が極端に深い場合（8 段超）やパスワード付き・破損した入れ子は飛ばして、読める部分だけを展開します。
     </p>
 
@@ -257,7 +290,7 @@
         <tbody>
           <tr><td>PNG</td><td><code>tEXt</code> / <code>iTXt</code> / <code>zTXt</code> の生成パラメータ、ワークフロー JSON、説明チャンク</td></tr>
           <tr><td>JPEG</td><td>EXIF <code>UserComment</code> に保存された生成パラメータ</td></tr>
-          <tr><td>検索</td><td>Negative Prompt は表示用に保持しつつ、メタデータ検索の対象からは除外します</td></tr>
+          <tr><td>検索</td><td>Negative Prompt は表示用に保持しつつ、メタデータ検索の対象からは除外します。ComfyUI のワイルドカード候補など、生成前のテンプレートも検索には使いません</td></tr>
         </tbody>
       </table>
     </div>

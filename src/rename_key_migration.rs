@@ -11,6 +11,10 @@
 //!   busy_timeout 付きなので本体側の接続と共存できる。
 //! - **worker スレッドで実行する** (UI スレッド禁止 — cold open は 1 DB で 100ms を
 //!   超えることがある)。呼び出しは `App::spawn_rename_key_migration` 経由。
+//! - **永続 2 段階 commit**: 通常の path-keyed store と collection actor を同じ journal entry が
+//!   追跡する。generic store が完了しても collection actor の exact batch ACK 前には journal を
+//!   消さず、Busy / unavailable / crash は次回起動へ残す。複数 mapping は collection 側の一つの
+//!   SQLite transaction で移行する。
 //! - **冪等 + 新キー優先**: 一意キー列は `UPDATE OR IGNORE` → 旧行 `DELETE`。新キー側に
 //!   既に行がある (= リネーム後に先へ操作した) 場合は新データを優先して旧行を捨てる。
 //! - **exact + prefix の 3 面**: リネーム対象そのもの (`old` = `new`)、フォルダ配下
@@ -34,27 +38,79 @@
 //!   成功ハンドラからしか呼ばれない (外部リネームの検知は将来課題)。
 
 use std::collections::BTreeSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PathMigrationMapping {
+    pub(crate) old_path: PathBuf,
+    pub(crate) new_path: PathBuf,
+    pub(crate) tree: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PathMigrationJob {
+    /// The legacy path-keyed stores have not completed yet. Collection-only book moves start
+    /// with this false; normal Shell rename starts true.
+    pub(crate) generic_pending: bool,
+    pub(crate) mappings: Vec<PathMigrationMapping>,
+}
+
+impl PathMigrationJob {
+    pub(crate) fn shell_rename(old_path: PathBuf, new_path: PathBuf, tree: bool) -> Self {
+        Self {
+            generic_pending: true,
+            mappings: vec![PathMigrationMapping {
+                old_path,
+                new_path,
+                tree,
+            }],
+        }
+    }
+
+    pub(crate) fn collection_only(mappings: Vec<PathMigrationMapping>) -> Option<Self> {
+        (!mappings.is_empty()).then_some(Self {
+            generic_pending: false,
+            mappings,
+        })
+    }
+
+    pub(crate) fn generic_pair(&self) -> Option<(&Path, &Path)> {
+        if !self.generic_pending || self.mappings.len() != 1 {
+            return None;
+        }
+        let mapping = &self.mappings[0];
+        Some((&mapping.old_path, &mapping.new_path))
+    }
+}
 
 #[derive(Debug)]
 struct JournalWriteSnapshot {
     revision: u64,
     data_dir: PathBuf,
-    entries: Vec<(PathBuf, PathBuf)>,
+    entries: Vec<PathMigrationJob>,
 }
 
 #[derive(Default)]
 struct JournalWriteState {
     next_revision: u64,
     latest: Option<JournalWriteSnapshot>,
-    completed_revision: u64,
+    /// Exact full snapshot whose last persistence attempt failed. It remains owned until a
+    /// newer App snapshot supersedes it, so a failed write is never mistaken for completion.
+    failed: Option<JournalWriteSnapshot>,
+    saved_revision: u64,
+    attempted_revision: u64,
+    last_error: Option<(u64, String)>,
     shutdown: bool,
     worker_stopped: bool,
 }
 
 impl JournalWriteState {
-    fn enqueue(&mut self, data_dir: PathBuf, entries: Vec<(PathBuf, PathBuf)>) -> u64 {
+    fn enqueue(&mut self, data_dir: PathBuf, entries: Vec<PathMigrationJob>) -> u64 {
         self.next_revision = self.next_revision.wrapping_add(1).max(1);
         let revision = self.next_revision;
         // App owns the contents. Keep only the newest waiting snapshot while an older write runs.
@@ -63,6 +119,7 @@ impl JournalWriteState {
             data_dir,
             entries,
         });
+        self.failed = None;
         revision
     }
 
@@ -70,19 +127,95 @@ impl JournalWriteState {
         self.latest.take()
     }
 
-    fn complete(&mut self, revision: u64) {
-        self.completed_revision = self.completed_revision.max(revision);
+    fn complete_saved(&mut self, revision: u64) {
+        self.attempted_revision = self.attempted_revision.max(revision);
+        self.saved_revision = self.saved_revision.max(revision);
+        if self
+            .last_error
+            .as_ref()
+            .is_some_and(|(failed, _)| *failed <= revision)
+        {
+            self.last_error = None;
+        }
     }
 
-    fn is_flushed(&self, revision: u64) -> bool {
-        self.completed_revision >= revision
+    fn complete_failed(&mut self, snapshot: JournalWriteSnapshot, error: String) {
+        let revision = snapshot.revision;
+        self.attempted_revision = self.attempted_revision.max(revision);
+        self.failed = Some(snapshot);
+        self.last_error = Some((revision, error));
+    }
+
+    fn status(&self, revision: u64) -> JournalPersistStatus {
+        if self.saved_revision >= revision {
+            JournalPersistStatus::Saved
+        } else if let Some((failed_revision, error)) = &self.last_error
+            && *failed_revision >= revision
+        {
+            JournalPersistStatus::Failed(error.clone())
+        } else if self.worker_stopped {
+            JournalPersistStatus::Failed("journal writer stopped".into())
+        } else {
+            JournalPersistStatus::Pending
+        }
     }
 }
 
 type JournalWriterShared = Arc<(Mutex<JournalWriteState>, Condvar)>;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum JournalPersistStatus {
+    Pending,
+    Saved,
+    Failed(String),
+}
+
 /// SQLite の既定可変長 parameter 上限 (999) を十分下回る exact purge の batch 幅。
 const PURGE_EXACT_BATCH_SIZE: usize = 500;
+
+fn with_identity_epub_coverage<T>(
+    descriptor: &StoreDescriptor,
+    coverage: &[(PathBuf, IdentityCoverageShape)],
+    action: impl FnOnce() -> T,
+) -> T {
+    if descriptor.file == "content_identity.db"
+        && descriptor.table == "edit_origin"
+        && descriptor.column == "file_key"
+    {
+        let ranges = coverage
+            .iter()
+            .filter_map(|(path, shape)| match shape {
+                IdentityCoverageShape::Exact
+                    if !path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("epub")) =>
+                {
+                    None
+                }
+                IdentityCoverageShape::Exact => {
+                    Some(crate::pdf_loader::EpubPinCoverage::Exact(path.clone()))
+                }
+                IdentityCoverageShape::PathAndDescendants => Some(
+                    crate::pdf_loader::EpubPinCoverage::PathAndDescendants(path.clone()),
+                ),
+                IdentityCoverageShape::VirtualDescendants => Some(
+                    crate::pdf_loader::EpubPinCoverage::VirtualDescendants(path.clone()),
+                ),
+            })
+            .collect::<Vec<_>>();
+        crate::pdf_loader::with_epub_pin_ranges(&ranges, action)
+    } else {
+        action()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum IdentityCoverageShape {
+    Exact,
+    PathAndDescendants,
+    VirtualDescendants,
+}
 
 /// 移行結果。`rows` = 書き換えた行数合計 (sidecar / パスワードは 1 件 = 1)。
 pub struct RenameMigrationReport {
@@ -143,39 +276,457 @@ impl StoreMutationEffects {
 /// per-store エラーの再試行はしない (通常経路と同じ best-effort)。
 pub const JOURNAL_FILE: &str = "rename_migration_journal.json";
 
-/// ジャーナルを読み込む (無い / 壊れている場合は空)。
-pub fn journal_load(data_dir: &Path) -> Vec<(PathBuf, PathBuf)> {
-    let path = data_dir.join(JOURNAL_FILE);
-    let Ok(bytes) = std::fs::read(&path) else {
-        return Vec::new();
-    };
-    match serde_json::from_slice::<Vec<(PathBuf, PathBuf)>>(&bytes) {
-        Ok(entries) => entries,
-        Err(e) => {
-            crate::logger::log(format!("[RENAME-MIG] journal parse failed (discard): {e}"));
-            Vec::new()
+#[derive(Debug)]
+pub(crate) enum JournalLoadError {
+    Read(std::io::Error),
+    Parse {
+        error: serde_json::Error,
+        /// Exact bytes that failed both the current and legacy parsers. The explicit quarantine
+        /// action must prove that the same file object still contains these bytes before moving it.
+        bytes: Arc<[u8]>,
+    },
+}
+
+impl std::fmt::Display for JournalLoadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read(error) => write!(formatter, "read failed: {error}"),
+            Self::Parse { error, .. } => write!(formatter, "parse failed: {error}"),
         }
     }
 }
 
-/// ジャーナルを書き出す (temp + rename の atomic 置換、空なら削除)。best-effort:
-/// 失敗はログのみ (移行自体は続行する。ジャーナルはクラッシュ回復の追加保険)。
-pub fn journal_save(data_dir: &Path, entries: &[(PathBuf, PathBuf)]) {
+impl JournalLoadError {
+    pub(crate) fn parse_bytes(&self) -> Option<Arc<[u8]>> {
+        match self {
+            Self::Parse { bytes, .. } => Some(Arc::clone(bytes)),
+            Self::Read(_) => None,
+        }
+    }
+}
+
+fn parse_journal_bytes(bytes: &[u8]) -> Result<Vec<PathMigrationJob>, serde_json::Error> {
+    if let Ok(entries) = serde_json::from_slice::<Vec<PathMigrationJob>>(bytes) {
+        return Ok(entries);
+    }
+    // v3.10 and earlier stored a bare list of pairs. A recovered legacy entry is treated as Tree:
+    // exact sources still match, while a folder rename cannot strand collection descendants.
+    serde_json::from_slice::<Vec<(PathBuf, PathBuf)>>(bytes).map(|entries| {
+        entries
+            .into_iter()
+            .map(|(old_path, new_path)| PathMigrationJob::shell_rename(old_path, new_path, true))
+            .collect()
+    })
+}
+
+/// A missing file means no recovery work. Any other read or format error must
+/// reach the App admission owner; treating it as empty would erase old bytes.
+pub(crate) fn journal_load(data_dir: &Path) -> Result<Vec<PathMigrationJob>, JournalLoadError> {
+    let path = data_dir.join(JOURNAL_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(JournalLoadError::Read(error)),
+    };
+    let bytes: Arc<[u8]> = bytes.into();
+    parse_journal_bytes(&bytes).map_err(|error| JournalLoadError::Parse { error, bytes })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum JournalQuarantineOutcome {
+    /// The exact invalid source object was moved aside. `path` is the non-overwriting destination.
+    Quarantined { path: PathBuf },
+    /// The source no longer matches the exact invalid bytes that the user confirmed. Only a
+    /// separate explicit reload may adopt missing, newly valid, or differently invalid content.
+    Changed(JournalQuarantineChange),
+    /// Cancellation won before the handle-based rename linearized.
+    Cancelled,
+    /// Opening, reading, or renaming failed. The original pathname remains protected.
+    Failed(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JournalQuarantineChange {
+    Missing,
+    ValidCurrentOrLegacy,
+    DifferentInvalidBytes,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JournalQuarantinePhase {
+    Running = 0,
+    Cancelled = 1,
+    Renaming = 2,
+}
+
+#[derive(Debug)]
+struct JournalQuarantineControl {
+    phase: AtomicU8,
+}
+
+impl JournalQuarantineControl {
+    fn new() -> Self {
+        Self {
+            phase: AtomicU8::new(JournalQuarantinePhase::Running as u8),
+        }
+    }
+
+    fn cancel(&self) {
+        let _ = self.phase.compare_exchange(
+            JournalQuarantinePhase::Running as u8,
+            JournalQuarantinePhase::Cancelled as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn cancelled(&self) -> bool {
+        self.phase.load(Ordering::Acquire) == JournalQuarantinePhase::Cancelled as u8
+    }
+
+    /// Claims the irreversible namespace-operation phase. Cancellation and this transition race
+    /// through one CAS, so a cancellation that wins guarantees the handle rename is never called.
+    fn begin_rename(&self) -> bool {
+        self.phase
+            .compare_exchange(
+                JournalQuarantinePhase::Running as u8,
+                JournalQuarantinePhase::Renaming as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+pub(crate) struct JournalQuarantineTask {
+    control: Arc<JournalQuarantineControl>,
+    rx: std::sync::mpsc::Receiver<JournalQuarantineOutcome>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for JournalQuarantineTask {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("JournalQuarantineTask")
+            .field("phase", &self.control.phase.load(Ordering::Acquire))
+            .field("worker_running", &self.handle.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl JournalQuarantineTask {
+    pub(crate) fn spawn(data_dir: PathBuf, expected: Arc<[u8]>) -> Result<Self, String> {
+        let control = Arc::new(JournalQuarantineControl::new());
+        let worker_control = Arc::clone(&control);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::Builder::new()
+            .name("rename-migration-quarantine".into())
+            .spawn(move || {
+                let outcome = quarantine_invalid_journal(&data_dir, &expected, &worker_control);
+                let _ = tx.send(outcome);
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            control,
+            rx,
+            handle: Some(handle),
+        })
+    }
+
+    pub(crate) fn try_recv(
+        &mut self,
+    ) -> Result<JournalQuarantineOutcome, std::sync::mpsc::TryRecvError> {
+        self.rx.try_recv()
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.control.cancel();
+    }
+
+    /// The worker sends only after all filesystem work has ended, so joining a terminal task does
+    /// not put filesystem latency on an ordinary UI frame.
+    pub(crate) fn join_terminal(&mut self) {
+        if let Some(handle) = self.handle.take()
+            && handle.join().is_err()
+        {
+            crate::logger::log("[RENAME-MIG] quarantine worker panicked after terminal result");
+        }
+    }
+
+    /// Final-exit fence. Cancellation is observed before rename; if the handle rename already
+    /// succeeded, that success remains the linearization point and is returned as such.
+    pub(crate) fn cancel_and_wait(mut self) -> JournalQuarantineOutcome {
+        self.cancel();
+        let outcome = self.rx.recv().unwrap_or_else(|_| {
+            JournalQuarantineOutcome::Failed("quarantine worker disconnected".into())
+        });
+        self.join_terminal();
+        outcome
+    }
+}
+
+static QUARANTINE_NONCE: AtomicU64 = AtomicU64::new(0);
+
+fn quarantine_token() -> u128 {
+    let time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    (time << 32)
+        ^ u128::from(std::process::id())
+        ^ u128::from(QUARANTINE_NONCE.fetch_add(1, Ordering::Relaxed))
+}
+
+fn quarantine_destination(source: &Path, token: u128, attempt: u32) -> PathBuf {
+    let file_name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(JOURNAL_FILE);
+    source.with_file_name(format!("{file_name}.invalid-{token:032x}-{attempt:02}"))
+}
+
+enum HandleRenameError {
+    Collision,
+    Failed(String),
+}
+
+fn quarantine_invalid_journal(
+    data_dir: &Path,
+    expected: &[u8],
+    control: &JournalQuarantineControl,
+) -> JournalQuarantineOutcome {
+    quarantine_invalid_journal_with(
+        data_dir,
+        expected,
+        control,
+        quarantine_token(),
+        rename_open_journal_handle,
+        || {},
+        || {},
+    )
+}
+
+fn quarantine_invalid_journal_with(
+    data_dir: &Path,
+    expected: &[u8],
+    control: &JournalQuarantineControl,
+    token: u128,
+    mut rename_handle: impl FnMut(&std::fs::File, &Path) -> Result<(), HandleRenameError>,
+    before_rename_claim: impl FnOnce(),
+    after_rename: impl FnOnce(),
+) -> JournalQuarantineOutcome {
+    if control.cancelled() {
+        return JournalQuarantineOutcome::Cancelled;
+    }
+    let source = data_dir.join(JOURNAL_FILE);
+    let mut file = match open_journal_for_quarantine(&source) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return JournalQuarantineOutcome::Changed(JournalQuarantineChange::Missing);
+        }
+        Err(error) => {
+            return JournalQuarantineOutcome::Failed(format!(
+                "open failed for {}: {error}",
+                source.display()
+            ));
+        }
+    };
+    let mut actual = Vec::new();
+    if let Err(error) = file.read_to_end(&mut actual) {
+        return JournalQuarantineOutcome::Failed(format!(
+            "read failed for {}: {error}",
+            source.display()
+        ));
+    }
+    match parse_journal_bytes(&actual) {
+        Ok(_) => {
+            return JournalQuarantineOutcome::Changed(
+                JournalQuarantineChange::ValidCurrentOrLegacy,
+            );
+        }
+        Err(_) if actual.as_slice() != expected => {
+            return JournalQuarantineOutcome::Changed(
+                JournalQuarantineChange::DifferentInvalidBytes,
+            );
+        }
+        Err(_) => {}
+    }
+    before_rename_claim();
+    if !control.begin_rename() {
+        return JournalQuarantineOutcome::Cancelled;
+    }
+    for attempt in 0..100 {
+        let destination = quarantine_destination(&source, token, attempt);
+        match rename_handle(&file, &destination) {
+            Ok(()) => {
+                // SetFileInformationByHandle success is the namespace linearization point. A
+                // cancellation arriving here must not turn a completed quarantine into failure.
+                after_rename();
+                return JournalQuarantineOutcome::Quarantined { path: destination };
+            }
+            Err(HandleRenameError::Collision) => continue,
+            Err(HandleRenameError::Failed(error)) => {
+                return JournalQuarantineOutcome::Failed(error);
+            }
+        }
+    }
+    JournalQuarantineOutcome::Failed(
+        "could not choose a non-existing quarantine destination".into(),
+    )
+}
+
+#[cfg(windows)]
+fn open_journal_for_quarantine(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH, FILE_GENERIC_READ,
+    };
+
+    std::fs::OpenOptions::new()
+        .access_mode(FILE_GENERIC_READ.0 | DELETE.0)
+        .share_mode(0)
+        .custom_flags((FILE_FLAG_WRITE_THROUGH | FILE_FLAG_OPEN_REPARSE_POINT).0)
+        .open(path)
+}
+
+#[cfg(not(windows))]
+fn open_journal_for_quarantine(_path: &Path) -> std::io::Result<std::fs::File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "secure journal quarantine is available only on Windows",
+    ))
+}
+
+#[cfg(windows)]
+fn rename_open_journal_handle(
+    file: &std::fs::File,
+    destination: &Path,
+) -> Result<(), HandleRenameError> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{
+        ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, GetLastError, HANDLE,
+    };
+    use windows::Win32::Storage::FileSystem::{
+        FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle,
+    };
+
+    let absolute = if destination.is_absolute() {
+        destination.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| HandleRenameError::Failed(error.to_string()))?
+            .join(destination)
+    };
+    let mut name: Vec<u16> = absolute.as_os_str().encode_wide().collect();
+    if name.is_empty() || name.contains(&0) {
+        return Err(HandleRenameError::Failed(
+            "quarantine destination is not a valid absolute Windows path".into(),
+        ));
+    }
+    let name_bytes = name
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .and_then(|bytes| u32::try_from(bytes).ok())
+        .ok_or_else(|| HandleRenameError::Failed("quarantine path is too long".into()))?;
+    name.push(0);
+    let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+    let buffer_bytes = (offset + name.len() * std::mem::size_of::<u16>())
+        .max(std::mem::size_of::<FILE_RENAME_INFO>());
+    let words = buffer_bytes.div_ceil(std::mem::size_of::<usize>());
+    let mut buffer = vec![0usize; words];
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    unsafe {
+        (*info).Anonymous.ReplaceIfExists = false;
+        (*info).RootDirectory = HANDLE::default();
+        (*info).FileNameLength = name_bytes;
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+            name.len(),
+        );
+    }
+    let result = unsafe {
+        SetFileInformationByHandle(
+            HANDLE(file.as_raw_handle()),
+            FileRenameInfo,
+            info.cast(),
+            buffer_bytes as u32,
+        )
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let last = unsafe { GetLastError() };
+            if last == ERROR_ALREADY_EXISTS || last == ERROR_FILE_EXISTS {
+                Err(HandleRenameError::Collision)
+            } else {
+                Err(HandleRenameError::Failed(format!(
+                    "handle rename failed for {}: {error}",
+                    destination.display()
+                )))
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn rename_open_journal_handle(
+    _file: &std::fs::File,
+    _destination: &Path,
+) -> Result<(), HandleRenameError> {
+    Err(HandleRenameError::Failed(
+        "secure journal quarantine is available only on Windows".into(),
+    ))
+}
+
+/// ジャーナルを書き出す (temp + rename の atomic 置換、空なら削除)。
+///
+/// 呼び出し側の writer は結果を ownership gate へ返す。該当 snapshot の保存成功 ACK
+/// より前に path-key / collection migration を始めてはならない。
+pub(crate) fn journal_save(data_dir: &Path, entries: &[PathMigrationJob]) -> std::io::Result<()> {
     let path = data_dir.join(JOURNAL_FILE);
     if entries.is_empty() {
-        let _ = std::fs::remove_file(&path);
-        return;
+        return match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        };
     }
-    let result = (|| -> std::io::Result<()> {
-        let json = serde_json::to_vec(entries)?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, &json)?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
-    })();
-    if let Err(e) = result {
-        crate::logger::log(format!("[RENAME-MIG] journal save failed: {e}"));
+    std::fs::create_dir_all(data_dir)?;
+    let json = serde_json::to_vec(entries)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &json)?;
+    replace_journal_file_atomic(&tmp, &path).or_else(|error| {
+        let _ = std::fs::remove_file(&tmp);
+        Err(error)
+    })
+}
+
+#[cfg(windows)]
+fn replace_journal_file_atomic(temp: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    use windows::core::PCWSTR;
+
+    let temp: Vec<u16> = temp.as_os_str().encode_wide().chain([0]).collect();
+    let destination: Vec<u16> = destination.as_os_str().encode_wide().chain([0]).collect();
+    unsafe {
+        MoveFileExW(
+            PCWSTR(temp.as_ptr()),
+            PCWSTR(destination.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
     }
+    .map_err(|error| std::io::Error::other(error.to_string()))
+}
+
+#[cfg(not(windows))]
+fn replace_journal_file_atomic(temp: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::rename(temp, destination)
 }
 
 /// Single background owner for rename-migration journal writes. The UI publishes complete
@@ -201,35 +752,45 @@ impl RenameMigrationJournalWriter {
         Self { shared, handle }
     }
 
-    pub(crate) fn enqueue(&self, data_dir: PathBuf, entries: Vec<(PathBuf, PathBuf)>) {
+    pub(crate) fn enqueue(
+        &self,
+        data_dir: PathBuf,
+        entries: Vec<PathMigrationJob>,
+    ) -> Result<u64, String> {
         let (state, cv) = self.shared.as_ref();
         let mut state = state.lock().unwrap();
         if state.worker_stopped || state.shutdown {
-            crate::logger::log("[RENAME-MIG] journal writer unavailable; snapshot not saved");
-            return;
+            return Err("journal writer unavailable; snapshot not saved".into());
         }
-        state.enqueue(data_dir, entries);
+        let revision = state.enqueue(data_dir, entries);
         cv.notify_one();
+        Ok(revision)
     }
 
-    pub(crate) fn flush(&self) {
+    pub(crate) fn status(&self, revision: u64) -> JournalPersistStatus {
+        self.shared.as_ref().0.lock().unwrap().status(revision)
+    }
+
+    pub(crate) fn flush(&self) -> Result<(), String> {
         let (state, cv) = self.shared.as_ref();
         let mut state = state.lock().unwrap();
         let target = state.next_revision;
-        while !state.is_flushed(target) && !state.worker_stopped {
+        while matches!(state.status(target), JournalPersistStatus::Pending) {
             state = cv.wait(state).unwrap();
         }
-        if !state.is_flushed(target) {
-            crate::logger::log(format!(
-                "[RENAME-MIG] journal writer stopped before flush revision {target}"
-            ));
+        match state.status(target) {
+            JournalPersistStatus::Saved => Ok(()),
+            JournalPersistStatus::Failed(error) => Err(error),
+            JournalPersistStatus::Pending => unreachable!("flush loop exits only at terminal"),
         }
     }
 }
 
 impl Drop for RenameMigrationJournalWriter {
     fn drop(&mut self) {
-        self.flush();
+        if let Err(error) = self.flush() {
+            crate::logger::log(format!("[RENAME-MIG] final journal flush failed: {error}"));
+        }
         {
             let (state, cv) = self.shared.as_ref();
             state.lock().unwrap().shutdown = true;
@@ -270,9 +831,20 @@ fn run_journal_writer(shared: JournalWriterShared) {
                 None => continue,
             }
         };
-        journal_save(&snapshot.data_dir, &snapshot.entries);
         let (state, cv) = shared.as_ref();
-        state.lock().unwrap().complete(snapshot.revision);
+        match journal_save(&snapshot.data_dir, &snapshot.entries) {
+            Ok(()) => state.lock().unwrap().complete_saved(snapshot.revision),
+            Err(error) => {
+                crate::logger::log(format!(
+                    "[RENAME-MIG] journal save failed revision={}: {error}",
+                    snapshot.revision
+                ));
+                state
+                    .lock()
+                    .unwrap()
+                    .complete_failed(snapshot, error.to_string());
+            }
+        }
         cv.notify_all();
     }
 }
@@ -284,6 +856,14 @@ pub(crate) enum StoreKeyNormalization {
     KeepDrive,
     /// [`crate::path_key::normalize`]。USB 等のドライブレターを除去する軽量設定用。
     DriveStripped,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StoreTableAvailability {
+    Required,
+    /// The database can predate this table. A missing table is an empty store, while an
+    /// existing table with the wrong schema remains an error.
+    OptionalInLegacySchema,
 }
 
 /// リネームと mIV 内削除成功時 hard purge が共有する path-keyed SQLite 記述子。
@@ -301,6 +881,7 @@ pub(crate) struct StoreDescriptor {
     pub(crate) unique: bool,
     pub(crate) normalization: StoreKeyNormalization,
     pub(crate) rename_generic: bool,
+    table_availability: StoreTableAvailability,
 }
 
 impl StoreDescriptor {
@@ -328,6 +909,25 @@ const fn store(
         unique,
         normalization,
         rename_generic: true,
+        table_availability: StoreTableAvailability::Required,
+    }
+}
+
+const fn optional_legacy_store(
+    file: &'static str,
+    table: &'static str,
+    column: &'static str,
+    unique: bool,
+    normalization: StoreKeyNormalization,
+) -> StoreDescriptor {
+    StoreDescriptor {
+        file,
+        table,
+        column,
+        unique,
+        normalization,
+        rename_generic: true,
+        table_availability: StoreTableAvailability::OptionalInLegacySchema,
     }
 }
 
@@ -337,6 +937,14 @@ const fn store(
 /// hard purge も走査するため、rename と purge の対象が将来ずれない。PDF パスワードだけは
 /// JSON の SHA-256 キーなので、この表と並ぶ専用処理を両経路が共有する。
 pub(crate) const STORES: &[StoreDescriptor] = &[
+    // Added after the original settings schema; an unopened legacy DB has no watched table yet.
+    optional_legacy_store(
+        "settings.db",
+        "video_watched_to_end",
+        "path_normalized",
+        true,
+        StoreKeyNormalization::KeepDrive,
+    ),
     store(
         "rating.db",
         "ratings",
@@ -478,6 +1086,34 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         true,
         StoreKeyNormalization::DriveStripped,
     ),
+    optional_legacy_store(
+        "spread.db",
+        "final_cover_spreads",
+        "path",
+        true,
+        StoreKeyNormalization::DriveStripped,
+    ),
+    optional_legacy_store(
+        "spread.db",
+        "singleton_spread_placements",
+        "path",
+        true,
+        StoreKeyNormalization::DriveStripped,
+    ),
+    optional_legacy_store(
+        "spread.db",
+        "singleton_spread_endpoint_placements",
+        "path",
+        true,
+        StoreKeyNormalization::DriveStripped,
+    ),
+    optional_legacy_store(
+        "spread.db",
+        "page_alone_preferences",
+        "path",
+        true,
+        StoreKeyNormalization::DriveStripped,
+    ),
     store(
         "view_trim.db",
         "view_trim_books",
@@ -492,6 +1128,7 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         unique: true,
         normalization: StoreKeyNormalization::KeepDrive,
         rename_generic: false,
+        table_availability: StoreTableAvailability::Required,
     },
 ];
 
@@ -533,6 +1170,8 @@ impl StoreCopyPathMapping {
 #[derive(Debug, Default)]
 pub(crate) struct StoreCopyReport {
     pub(crate) rows: usize,
+    /// Only rows from successfully committed pin-store transactions.
+    pub(crate) committed_thumbnail_pins: usize,
     pub(crate) database_opens: usize,
     pub(crate) errors: Vec<String>,
 }
@@ -555,12 +1194,61 @@ enum NormalizedStoreCopyMapping {
 ///
 /// `unique=false` は path 以外の PK 再採番が必要なストアを表すため v1 では対象外。
 /// DB 行は `INSERT OR IGNORE` で複製し、コピー先にある行を常に優先する。
+#[cfg(test)]
 pub(crate) fn copy_stores_at(
     data_dir: &Path,
     mappings: &[StoreCopyPathMapping],
 ) -> StoreCopyReport {
+    copy_stores_at_with_progress(data_dir, mappings, |_, _| {})
+}
+
+pub(crate) fn copy_stores_at_with_progress(
+    data_dir: &Path,
+    mappings: &[StoreCopyPathMapping],
+    on_progress: impl FnMut(usize, usize),
+) -> StoreCopyReport {
+    copy_stores_impl(data_dir, mappings, true, on_progress)
+}
+
+/// EPUB restore promotes its ledger row under the book guard after copying.
+/// Copying edit_origin here would recursively enter the EPUB range guard.
+pub(crate) fn copy_restore_stores_without_identity_at(
+    data_dir: &Path,
+    mappings: &[StoreCopyPathMapping],
+) -> StoreCopyReport {
+    copy_restore_stores_without_identity_at_with_progress(data_dir, mappings, |_, _| {})
+}
+
+pub(crate) fn copy_restore_stores_without_identity_at_with_progress(
+    data_dir: &Path,
+    mappings: &[StoreCopyPathMapping],
+    on_progress: impl FnMut(usize, usize),
+) -> StoreCopyReport {
+    copy_stores_impl(data_dir, mappings, false, on_progress)
+}
+
+fn copy_stores_impl(
+    data_dir: &Path,
+    mappings: &[StoreCopyPathMapping],
+    include_identity: bool,
+    mut on_progress: impl FnMut(usize, usize),
+) -> StoreCopyReport {
     let mut report = StoreCopyReport::default();
-    for descriptor in STORES.iter().copied().filter(|store| store.unique) {
+    let total = STORES
+        .iter()
+        .filter(|store| store.unique && (include_identity || store.file != "content_identity.db"))
+        .count()
+        * mappings.len();
+    let mut processed = 0;
+    // A prepared virtual list must not observe a mixture of copied stores.
+    let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+    let _rating_write = crate::rating_db::RATING_WRITES.begin();
+    let _tag_write = crate::tags_db::TAG_WRITES.begin();
+    for descriptor in STORES
+        .iter()
+        .copied()
+        .filter(|store| store.unique && (include_identity || store.file != "content_identity.db"))
+    {
         let normalized = mappings
             .iter()
             .filter_map(|mapping| match mapping {
@@ -583,15 +1271,25 @@ pub(crate) fn copy_stores_at(
                 }
             })
             .collect::<Vec<_>>();
+        processed += mappings.len() - normalized.len();
+        on_progress(processed, total);
         if normalized.is_empty() {
             continue;
         }
+        let descriptor_start = processed;
         copy_store(
             &data_dir.join(descriptor.file),
             descriptor,
             &normalized,
             &mut report,
+            &mut || {
+                processed += 1;
+                on_progress(processed, total);
+            },
         );
+        // Missing databases and failed transactions still finish this descriptor's work.
+        processed = descriptor_start + normalized.len();
+        on_progress(processed, total);
     }
     report
 }
@@ -652,11 +1350,21 @@ fn store_keys_with_rows(
     descriptor: StoreDescriptor,
     file_keys: &[String],
 ) -> Result<Vec<String>, String> {
-    let mut conn = rusqlite::Connection::open(db_path).map_err(|error| error.to_string())?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))
-        .map_err(|error| error.to_string())?;
+    let mut conn = if descriptor.file == crate::content_identity::LEDGER_DB_FILE {
+        crate::content_identity::open_ledger_connection_at(db_path)?
+    } else {
+        let conn = rusqlite::Connection::open(db_path).map_err(|error| error.to_string())?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|error| error.to_string())?;
+        conn
+    };
     let conn = conn.transaction().map_err(|error| error.to_string())?;
     let columns = table_columns(&conn, descriptor.table).map_err(|error| error.to_string())?;
+    if columns.is_empty()
+        && descriptor.table_availability == StoreTableAvailability::OptionalInLegacySchema
+    {
+        return Ok(Vec::new());
+    }
     if !columns.iter().any(|column| column == descriptor.column) {
         return Err(rusqlite::Error::InvalidColumnName(descriptor.column.to_string()).to_string());
     }
@@ -685,6 +1393,23 @@ fn store_keys_with_rows(
     Ok(found)
 }
 
+/// Rename, copy, and purge can run while the recorder is opening a fresh
+/// ledger. Route their ledger connections through the same schema validation;
+/// other stores keep their existing open policy.
+fn open_store_for_write(
+    db_path: &Path,
+    descriptor: &StoreDescriptor,
+) -> Result<rusqlite::Connection, String> {
+    if descriptor.file == crate::content_identity::LEDGER_DB_FILE {
+        crate::content_identity::open_ledger_connection_at(db_path)
+    } else {
+        let conn = rusqlite::Connection::open(db_path).map_err(|error| error.to_string())?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|error| error.to_string())?;
+        Ok(conn)
+    }
+}
+
 /// リネーム移行の本体 (worker スレッドで呼ぶ)。`old_path` は改名前 (もう存在しない)、
 /// `new_path` は改名後の実 path。
 pub fn run(old_path: &Path, new_path: &Path) -> RenameMigrationReport {
@@ -693,6 +1418,17 @@ pub fn run(old_path: &Path, new_path: &Path) -> RenameMigrationReport {
 
 /// data_dir を差し替え可能にしたテスト用エントリポイント。
 pub fn run_at(data_dir: &Path, old_path: &Path, new_path: &Path) -> RenameMigrationReport {
+    run_at_with_shape(data_dir, old_path, new_path, false)
+}
+
+/// The queued operation retains its source shape, but generic store SQL
+/// migrates exact, slash descendants and virtual entries for either shape.
+pub(crate) fn run_at_with_shape(
+    data_dir: &Path,
+    old_path: &Path,
+    new_path: &Path,
+    _tree: bool,
+) -> RenameMigrationReport {
     let mut report = RenameMigrationReport {
         rows: 0,
         errors: Vec::new(),
@@ -714,6 +1450,9 @@ pub fn run_at(data_dir: &Path, old_path: &Path, new_path: &Path) -> RenameMigrat
     let new_k = crate::adjustment_db::normalize_path(new_path);
     let old_s = crate::path_key::normalize(old_path);
     let new_s = crate::path_key::normalize(new_path);
+    let page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+    let rating_write = crate::rating_db::RATING_WRITES.begin();
+    let tag_write = crate::tags_db::TAG_WRITES.begin();
     for descriptor in STORES.iter().filter(|store| store.rename_generic) {
         let (old_key, new_key) = match descriptor.normalization {
             StoreKeyNormalization::KeepDrive => (&old_k, &new_k),
@@ -730,6 +1469,9 @@ pub fn run_at(data_dir: &Path, old_path: &Path, new_path: &Path) -> RenameMigrat
             &mut report,
         );
     }
+    drop(rating_write);
+    drop(tag_write);
+    drop(page_edit_write);
 
     // 本ページブックマークは container_key だけでなく raw container_path と、画像本では
     // container 相対 page identity も同時更新する必要があるため generic STORES へは載せない。
@@ -781,32 +1523,121 @@ pub(crate) struct PurgeReport {
 /// [`STORES`] を走査し、exact + `<key>/` + `<key>::` を素の `DELETE` にする。
 /// `pdf_paths` は SHA-256 キーの逆引きができない PDF password 用に、worker が削除前に
 /// 列挙した実 path 群。
+#[cfg(test)]
 pub(crate) fn purge_removed_paths_at(
     data_dir: &Path,
     removed: &[PathBuf],
     pdf_paths: &[PathBuf],
 ) -> PurgeReport {
+    let scopes = removed
+        .iter()
+        .cloned()
+        .map(crate::delete_worker::DeleteSourceScope::Tree)
+        .collect::<Vec<_>>();
+    purge_removed_scopes_at(data_dir, &scopes, pdf_paths)
+}
+
+/// The retry journal has no source shape; its paths conservatively cover trees.
+pub(crate) fn purge_removed_paths_guarded_at(
+    data_dir: &Path,
+    removed: &[PathBuf],
+    pdf_paths: &[PathBuf],
+    guard: &crate::pdf_loader::EpubRangeLease,
+) -> PurgeReport {
+    let scopes = removed
+        .iter()
+        .cloned()
+        .map(crate::delete_worker::DeleteSourceScope::Tree)
+        .collect::<Vec<_>>();
+    purge_removed_scopes_guarded_at(data_dir, &scopes, pdf_paths, guard)
+}
+
+/// Acquire once before Shell, then pass this guard through every purge attempt.
+pub(crate) fn acquire_delete_epub_guard(
+    scopes: &[crate::delete_worker::DeleteSourceScope],
+) -> crate::pdf_loader::EpubRangeLease {
+    let paths = scopes
+        .iter()
+        .map(|scope| match scope {
+            crate::delete_worker::DeleteSourceScope::Exact(path)
+            | crate::delete_worker::DeleteSourceScope::Tree(path) => path.clone(),
+        })
+        .collect::<Vec<_>>();
+    crate::pdf_loader::acquire_epub_pin_coverage(&paths)
+}
+
+/// The SQL uses exact, slash-descendant and virtual-descendant keys for both
+/// source shapes, even if a deleted file or folder no longer exists on disk.
+#[cfg(test)]
+pub(crate) fn purge_removed_scopes_at(
+    data_dir: &Path,
+    scopes: &[crate::delete_worker::DeleteSourceScope],
+    pdf_paths: &[PathBuf],
+) -> PurgeReport {
+    purge_removed_scopes_impl(data_dir, scopes, pdf_paths, None)
+}
+
+pub(crate) fn purge_removed_scopes_guarded_at(
+    data_dir: &Path,
+    scopes: &[crate::delete_worker::DeleteSourceScope],
+    pdf_paths: &[PathBuf],
+    guard: &crate::pdf_loader::EpubRangeLease,
+) -> PurgeReport {
+    purge_removed_scopes_impl(data_dir, scopes, pdf_paths, Some(guard))
+}
+
+fn purge_removed_scopes_impl(
+    data_dir: &Path,
+    scopes: &[crate::delete_worker::DeleteSourceScope],
+    pdf_paths: &[PathBuf],
+    guard: Option<&crate::pdf_loader::EpubRangeLease>,
+) -> PurgeReport {
     let mut report = PurgeReport::default();
-    if removed.is_empty() {
+    if scopes.is_empty() {
         return report;
     }
 
-    let keep_drive_keys = normalized_removed_keys(removed, StoreKeyNormalization::KeepDrive);
+    let removed = scopes
+        .iter()
+        .map(|scope| match scope {
+            crate::delete_worker::DeleteSourceScope::Exact(path)
+            | crate::delete_worker::DeleteSourceScope::Tree(path) => path.clone(),
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        guard.is_none_or(|guard| guard.covers_paths_and_descendants(&removed)),
+        "delete purge must keep the Shell range guard"
+    );
+
+    let keep_drive_keys = normalized_removed_keys(&removed, StoreKeyNormalization::KeepDrive);
     let drive_stripped_keys =
-        normalized_removed_keys(removed, StoreKeyNormalization::DriveStripped);
+        normalized_removed_keys(&removed, StoreKeyNormalization::DriveStripped);
+    let keep_drive_coverage = normalized_removed_coverage(scopes, StoreKeyNormalization::KeepDrive);
+    let drive_stripped_coverage =
+        normalized_removed_coverage(scopes, StoreKeyNormalization::DriveStripped);
+    let page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+    let rating_write = crate::rating_db::RATING_WRITES.begin();
+    let tag_write = crate::tags_db::TAG_WRITES.begin();
     for descriptor in STORES {
         let keys = match descriptor.normalization {
             StoreKeyNormalization::KeepDrive => &keep_drive_keys,
             StoreKeyNormalization::DriveStripped => &drive_stripped_keys,
         };
-        purge_store(data_dir, descriptor, keys, &mut report);
+        let coverage = match descriptor.normalization {
+            StoreKeyNormalization::KeepDrive => &keep_drive_coverage,
+            StoreKeyNormalization::DriveStripped => &drive_stripped_coverage,
+        };
+        purge_store(data_dir, descriptor, keys, coverage, guard, &mut report);
     }
+    drop(rating_write);
+    drop(tag_write);
+    drop(page_edit_write);
 
     match crate::pdf_passwords::PdfPasswordStore::purge_paths_at(data_dir, pdf_paths) {
         Ok(rows) => report.rows += rows,
         Err(error) => report.errors.push(format!("pdf_passwords.json: {error}")),
     }
-    purge_sidecar_backups(removed, &mut report);
+    purge_sidecar_backups(&removed, &mut report);
     report
 }
 
@@ -872,14 +1703,43 @@ fn normalized_removed_keys(
     keys
 }
 
+fn normalized_removed_coverage(
+    scopes: &[crate::delete_worker::DeleteSourceScope],
+    normalization: StoreKeyNormalization,
+) -> Vec<(PathBuf, IdentityCoverageShape)> {
+    scopes
+        .iter()
+        .filter_map(|scope| {
+            let path = match scope {
+                crate::delete_worker::DeleteSourceScope::Exact(path)
+                | crate::delete_worker::DeleteSourceScope::Tree(path) => path,
+            };
+            let key = match normalization {
+                StoreKeyNormalization::KeepDrive => crate::adjustment_db::normalize_path(path),
+                StoreKeyNormalization::DriveStripped => crate::path_key::normalize(path),
+            };
+            // Both source shapes use exact + `key/` + `key::` SQL deletes.
+            (!key.is_empty()).then(|| {
+                (
+                    PathBuf::from(key),
+                    IdentityCoverageShape::PathAndDescendants,
+                )
+            })
+        })
+        .collect()
+}
+
 /// BINARY collation で `prefix` から始まる文字列の排他的 upper bound を返す。
 ///
 /// UTF-8 の辞書順は Unicode code point 順を保つため、最後の scalar value を次へ進めれば
-/// `value >= prefix AND value < upper` が prefix 一致と同じ集合になる。最後が `char::MAX`
+/// `value >= prefix AND value < upper` が prefix 一致と同じ集合になる。ただし旧 SQL の
+/// `substr` との等価性は、保存済み path key と prefix に NUL が含まれないことが前提。
+/// Windows の実 path は NUL を含められず、この store の key は実 path 由来である。
+/// 最後が `char::MAX`
 /// または次が surrogate で scalar value にできない場合は `None` とし、呼び出し側で従来の
 /// `substr` 条件へ安全に fallback する。hard purge が渡す prefix は `/` / `:` 終端なので
 /// 通常は必ず index range 条件を使える。
-fn prefix_upper_bound(prefix: &str) -> Option<String> {
+pub(crate) fn prefix_upper_bound(prefix: &str) -> Option<String> {
     let (last_index, last) = prefix.char_indices().next_back()?;
     let next = char::from_u32((last as u32).checked_add(1)?)?;
     let mut upper = prefix[..last_index].to_owned();
@@ -891,65 +1751,102 @@ fn purge_store(
     data_dir: &Path,
     descriptor: &StoreDescriptor,
     removed_keys: &[String],
+    coverage: &[(PathBuf, IdentityCoverageShape)],
+    guard: Option<&crate::pdf_loader::EpubRangeLease>,
     report: &mut PurgeReport,
+) {
+    purge_store_with_before_sql(
+        data_dir,
+        descriptor,
+        removed_keys,
+        coverage,
+        guard,
+        report,
+        || {},
+    );
+}
+
+fn purge_store_with_before_sql(
+    data_dir: &Path,
+    descriptor: &StoreDescriptor,
+    removed_keys: &[String],
+    coverage: &[(PathBuf, IdentityCoverageShape)],
+    guard: Option<&crate::pdf_loader::EpubRangeLease>,
+    report: &mut PurgeReport,
+    before_sql: impl FnOnce(),
 ) {
     let db_path = data_dir.join(descriptor.file);
     if removed_keys.is_empty() || !db_path.exists() {
         return;
     }
     report.db_open_count += 1;
-    let result = (|| -> Result<usize, rusqlite::Error> {
-        let mut conn = rusqlite::Connection::open(&db_path)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        let table_exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
-            [descriptor.table],
-            |row| row.get(0),
-        )?;
-        if !table_exists {
-            return Ok(0);
-        }
-        let tx = conn.transaction()?;
-        let mut changed = 0usize;
+    let action = || {
+        before_sql();
+        (|| -> Result<usize, Box<dyn std::error::Error>> {
+            let mut conn =
+                open_store_for_write(&db_path, descriptor).map_err(std::io::Error::other)?;
+            let table_exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                [descriptor.table],
+                |row| row.get(0),
+            )?;
+            if !table_exists {
+                return Ok(0);
+            }
+            let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+            let _rating_write =
+                (descriptor.table == "ratings").then(|| crate::rating_db::RATING_WRITES.begin());
+            let _tag_write =
+                (descriptor.file == "tags.db").then(|| crate::tags_db::TAG_WRITES.begin());
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let mut changed = 0usize;
 
-        // exact は PK / index を使う IN へまとめる。batch 幅は SQLite の既定 parameter
-        // 上限 999 より小さくし、削除数に比例した statement 数を抑える。
-        for keys in removed_keys.chunks(PURGE_EXACT_BATCH_SIZE) {
-            let placeholders = (0..keys.len()).map(|_| "?").collect::<Vec<_>>().join(",");
-            let sql = format!(
-                "DELETE FROM {} WHERE {} IN ({placeholders})",
+            // exact は PK / index を使う IN へまとめる。batch 幅は SQLite の既定 parameter
+            // 上限 999 より小さくし、削除数に比例した statement 数を抑える。
+            for keys in removed_keys.chunks(PURGE_EXACT_BATCH_SIZE) {
+                let placeholders = (0..keys.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+                let sql = format!(
+                    "DELETE FROM {} WHERE {} IN ({placeholders})",
+                    descriptor.table, descriptor.column
+                );
+                changed += tx.execute(&sql, rusqlite::params_from_iter(keys.iter()))?;
+            }
+
+            // 全 STORES のキー列は既定 BINARY collation で、PK または path index を持つ。
+            // substr(col, ...) を列へ適用せず、同じ collation 上の range scan にする。
+            let range_sql = format!(
+                "DELETE FROM {} WHERE {} >= ?1 AND {} < ?2",
+                descriptor.table, descriptor.column, descriptor.column
+            );
+            let fallback_sql = format!(
+                "DELETE FROM {} WHERE substr({}, 1, ?1) = ?2",
                 descriptor.table, descriptor.column
             );
-            changed += tx.execute(&sql, rusqlite::params_from_iter(keys.iter()))?;
-        }
-
-        // 全 STORES のキー列は既定 BINARY collation で、PK または path index を持つ。
-        // substr(col, ...) を列へ適用せず、同じ collation 上の range scan にする。
-        let range_sql = format!(
-            "DELETE FROM {} WHERE {} >= ?1 AND {} < ?2",
-            descriptor.table, descriptor.column, descriptor.column
-        );
-        let fallback_sql = format!(
-            "DELETE FROM {} WHERE substr({}, 1, ?1) = ?2",
-            descriptor.table, descriptor.column
-        );
-        {
-            let mut range_statement = tx.prepare(&range_sql)?;
-            let mut fallback_statement = tx.prepare(&fallback_sql)?;
-            for key in removed_keys {
-                for prefix in [format!("{key}/"), format!("{key}::")] {
-                    if let Some(upper) = prefix_upper_bound(&prefix) {
-                        changed += range_statement.execute(rusqlite::params![prefix, upper])?;
-                    } else {
-                        changed += fallback_statement
-                            .execute(rusqlite::params![prefix.chars().count() as i64, prefix,])?;
+            {
+                let mut range_statement = tx.prepare(&range_sql)?;
+                let mut fallback_statement = tx.prepare(&fallback_sql)?;
+                for key in removed_keys {
+                    for prefix in [format!("{key}/"), format!("{key}::")] {
+                        if let Some(upper) = prefix_upper_bound(&prefix) {
+                            changed += range_statement.execute(rusqlite::params![prefix, upper])?;
+                        } else {
+                            changed += fallback_statement.execute(rusqlite::params![
+                                prefix.chars().count() as i64,
+                                prefix,
+                            ])?;
+                        }
                     }
                 }
             }
-        }
-        tx.commit()?;
-        Ok(changed)
-    })();
+            tx.commit()?;
+            Ok(changed)
+        })()
+    };
+    let result = if guard.is_some() {
+        action()
+    } else {
+        with_identity_epub_coverage(descriptor, coverage, action)
+    };
     match result {
         Ok(rows) => {
             report.rows += rows;
@@ -960,6 +1857,34 @@ fn purge_store(
             descriptor.file, descriptor.table, descriptor.column
         )),
     }
+}
+
+#[cfg(test)]
+pub(crate) fn purge_exact_identity_with_before_sql_for_test(
+    data_dir: &Path,
+    removed: &Path,
+    before_sql: impl FnOnce(),
+) -> PurgeReport {
+    let descriptor = STORES
+        .iter()
+        .find(|store| store.file == "content_identity.db" && store.table == "edit_origin")
+        .unwrap();
+    let scopes = [crate::delete_worker::DeleteSourceScope::Exact(
+        removed.to_path_buf(),
+    )];
+    let keys = normalized_removed_keys(&[removed.to_path_buf()], descriptor.normalization);
+    let coverage = normalized_removed_coverage(&scopes, descriptor.normalization);
+    let mut report = PurgeReport::default();
+    purge_store_with_before_sql(
+        data_dir,
+        descriptor,
+        &keys,
+        &coverage,
+        None,
+        &mut report,
+        before_sql,
+    );
+    report
 }
 
 /// 1 ストア分の移行: exact + `<old>/` prefix + `<old>::` prefix。
@@ -973,59 +1898,75 @@ fn migrate_store(
     if !db_path.exists() {
         return;
     }
-    let result = (|| -> Result<usize, rusqlite::Error> {
-        let mut conn = rusqlite::Connection::open(db_path)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        let tx = conn.transaction()?;
-        let mut changed = 0usize;
-        changed += move_exact(
-            &tx,
-            descriptor.table,
-            descriptor.column,
-            descriptor.unique,
-            old_key,
-            new_key,
-        )?;
-        changed += move_prefix(
-            &tx,
-            descriptor.table,
-            descriptor.column,
-            descriptor.unique,
-            &format!("{old_key}/"),
-            &format!("{new_key}/"),
-        )?;
-        changed += move_prefix(
-            &tx,
-            descriptor.table,
-            descriptor.column,
-            descriptor.unique,
-            &format!("{old_key}::"),
-            &format!("{new_key}::"),
-        )?;
-        // rating.db はキーから導出される source_path 列 (一覧ビューがコンテナを開くのに
-        // 使う) も新キーに合わせる (`RatingDb::copy_entry_key` と同じ導出規則 =
-        // "::" より前、無ければキー自身)。
-        if descriptor.table == "ratings" && changed > 0 {
-            tx.execute(
-                "UPDATE ratings SET source_path = CASE
-                     WHEN instr(path, '::') > 0 THEN substr(path, 1, instr(path, '::') - 1)
-                     ELSE path
-                 END
-                 WHERE path = ?1
-                    OR substr(path, 1, ?2) = ?3
-                    OR substr(path, 1, ?4) = ?5",
-                rusqlite::params![
-                    new_key,
-                    format!("{new_key}/").chars().count() as i64,
-                    format!("{new_key}/"),
-                    format!("{new_key}::").chars().count() as i64,
-                    format!("{new_key}::"),
-                ],
+    // The SQL below migrates exact, slash descendants and virtual entries for
+    // both files and folders, so the guard must cover those same key families.
+    let shape = IdentityCoverageShape::PathAndDescendants;
+    let coverage = [
+        (PathBuf::from(old_key), shape),
+        (PathBuf::from(new_key), shape),
+    ];
+    let result = with_identity_epub_coverage(descriptor, &coverage, || {
+        (|| -> Result<usize, Box<dyn std::error::Error>> {
+            let mut conn =
+                open_store_for_write(db_path, descriptor).map_err(std::io::Error::other)?;
+            let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+            let _rating_write =
+                (descriptor.table == "ratings").then(|| crate::rating_db::RATING_WRITES.begin());
+            let _tag_write =
+                (descriptor.file == "tags.db").then(|| crate::tags_db::TAG_WRITES.begin());
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let columns = table_columns(&tx, descriptor.table)?;
+            if columns.is_empty()
+                && descriptor.table_availability == StoreTableAvailability::OptionalInLegacySchema
+            {
+                return Ok(0);
+            }
+            if !columns.iter().any(|column| column == descriptor.column) {
+                return Err(
+                    rusqlite::Error::InvalidColumnName(descriptor.column.to_string()).into(),
+                );
+            }
+            let mut changed = 0usize;
+            changed += move_exact(
+                &tx,
+                descriptor.table,
+                descriptor.column,
+                descriptor.unique,
+                old_key,
+                new_key,
             )?;
-        }
-        tx.commit()?;
-        Ok(changed)
-    })();
+            changed += move_prefix(
+                &tx,
+                descriptor.table,
+                descriptor.column,
+                descriptor.unique,
+                &format!("{old_key}/"),
+                &format!("{new_key}/"),
+            )?;
+            changed += move_prefix(
+                &tx,
+                descriptor.table,
+                descriptor.column,
+                descriptor.unique,
+                &format!("{old_key}::"),
+                &format!("{new_key}::"),
+            )?;
+            // rating.db はキーから導出される source_path 列 (一覧ビューがコンテナを開くのに
+            // 使う) も新キーに合わせる (`RatingDb::copy_entry_key` と同じ導出規則 =
+            // "::" より前、無ければキー自身)。
+            if descriptor.table == "ratings" && changed > 0 {
+                tx.execute(
+                    &format!("{RATING_SOURCE_PATH_UPDATE} WHERE path = ?1"),
+                    [new_key],
+                )?;
+                update_rating_source_paths_for_prefix(&tx, &format!("{new_key}/"))?;
+                update_rating_source_paths_for_prefix(&tx, &format!("{new_key}::"))?;
+            }
+            tx.commit()?;
+            Ok(changed)
+        })()
+    });
+
     match result {
         Ok(n) => {
             report.rows += n;
@@ -1050,6 +1991,12 @@ fn move_exact(
     old_key: &str,
     new_key: &str,
 ) -> Result<usize, rusqlite::Error> {
+    // Resume and watched together own the destination's saved viewing state. A resume-only
+    // destination must not acquire the source's watched marker while keys are migrated.
+    if watched_destination_has_resume(tx, table, col, new_key)? {
+        tx.execute(&format!("DELETE FROM {table} WHERE {col} = ?1"), [old_key])?;
+        return Ok(0);
+    }
     let changed = if unique {
         let n = tx.execute(
             &format!("UPDATE OR IGNORE {table} SET {col} = ?1 WHERE {col} = ?2"),
@@ -1066,9 +2013,33 @@ fn move_exact(
     Ok(changed)
 }
 
-/// prefix キーの移動。対象キーを `substr` 等値で列挙してから 1 行ずつ付け替える
-/// (LIKE を使わないのは path 中の `%` / `_` をワイルドカード扱いさせないため。
-/// substr の長さ引数は SQLite では文字数なので `chars().count()` を渡す)。
+/// Only the watched descriptor consults its sibling table. The same transaction sees the
+/// destination ownership before changing keys; legacy databases may not have a resume table.
+fn watched_destination_has_resume(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    col: &str,
+    new_key: &str,
+) -> Result<bool, rusqlite::Error> {
+    if table != "video_watched_to_end" || col != "path_normalized" {
+        return Ok(false);
+    }
+    let has_resume_table: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'video_resume_positions')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_resume_table {
+        return Ok(false);
+    }
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM video_resume_positions WHERE path_normalized = ?1)",
+        [new_key],
+        |row| row.get(0),
+    )
+}
+
+/// prefix キーの移動。BINARY key index の範囲で列挙してから 1 行ずつ付け替える。
 fn move_prefix(
     tx: &rusqlite::Transaction<'_>,
     table: &str,
@@ -1077,16 +2048,7 @@ fn move_prefix(
     old_prefix: &str,
     new_prefix: &str,
 ) -> Result<usize, rusqlite::Error> {
-    let keys: Vec<String> = {
-        let mut stmt = tx.prepare(&format!(
-            "SELECT DISTINCT {col} FROM {table} WHERE substr({col}, 1, ?1) = ?2"
-        ))?;
-        let rows = stmt.query_map(
-            rusqlite::params![old_prefix.chars().count() as i64, old_prefix],
-            |r| r.get::<_, String>(0),
-        )?;
-        rows.collect::<Result<Vec<_>, _>>()?
-    };
+    let keys = indexed_prefix_keys(tx, table, col, old_prefix)?;
     let mut changed = 0usize;
     for key in keys {
         let Some(suffix) = key.strip_prefix(old_prefix) else {
@@ -1103,14 +2065,50 @@ fn copy_store(
     descriptor: StoreDescriptor,
     mappings: &[NormalizedStoreCopyMapping],
     report: &mut StoreCopyReport,
+    on_mapping: &mut impl FnMut(),
 ) {
     if !db_path.exists() {
+        for _ in mappings {
+            on_mapping();
+        }
         return;
     }
     report.database_opens += 1;
-    let result = copy_store_transaction(db_path, descriptor, mappings);
+    let coverage = mappings
+        .iter()
+        .flat_map(|mapping| match mapping {
+            NormalizedStoreCopyMapping::Exact {
+                old_key, new_key, ..
+            } => [
+                (PathBuf::from(old_key), IdentityCoverageShape::Exact),
+                (PathBuf::from(new_key), IdentityCoverageShape::Exact),
+            ],
+            NormalizedStoreCopyMapping::Prefix {
+                old_prefix,
+                new_prefix,
+            } => [
+                (
+                    PathBuf::from(old_prefix.trim_end_matches("::")),
+                    IdentityCoverageShape::VirtualDescendants,
+                ),
+                (
+                    PathBuf::from(new_prefix.trim_end_matches("::")),
+                    IdentityCoverageShape::VirtualDescendants,
+                ),
+            ],
+        })
+        .collect::<Vec<_>>();
+    let result = with_identity_epub_coverage(&descriptor, &coverage, || {
+        copy_store_transaction(db_path, descriptor, mappings, on_mapping)
+    });
+
     match result {
-        Ok(rows) => report.rows += rows,
+        Ok(rows) => {
+            report.rows += rows;
+            if matches!(descriptor.table, "folder_thumb_pins" | "video_pins") {
+                report.committed_thumbnail_pins += rows;
+            }
+        }
         Err(error) => report.errors.push(format!(
             "{}: {}.{}: {error}",
             descriptor.file, descriptor.table, descriptor.column
@@ -1122,6 +2120,7 @@ fn copy_store_transaction(
     db_path: &Path,
     descriptor: StoreDescriptor,
     mappings: &[NormalizedStoreCopyMapping],
+    on_mapping: &mut impl FnMut(),
 ) -> Result<usize, String> {
     let cache_root = db_path
         .parent()
@@ -1129,11 +2128,20 @@ fn copy_store_transaction(
         .join("edit_preview_cache");
     let mut destination_files = Vec::new();
     let result = (|| -> Result<usize, String> {
-        let mut conn = rusqlite::Connection::open(db_path).map_err(|error| error.to_string())?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))
+        let mut conn = open_store_for_write(db_path, &descriptor)?;
+        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+        let _rating_write =
+            (descriptor.table == "ratings").then(|| crate::rating_db::RATING_WRITES.begin());
+        let _tag_write = (descriptor.file == "tags.db").then(|| crate::tags_db::TAG_WRITES.begin());
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        let tx = conn.transaction().map_err(|error| error.to_string())?;
         let columns = table_columns(&tx, descriptor.table).map_err(|error| error.to_string())?;
+        if columns.is_empty()
+            && descriptor.table_availability == StoreTableAvailability::OptionalInLegacySchema
+        {
+            return Ok(0);
+        }
         if !columns.iter().any(|column| column == descriptor.column) {
             return Err(
                 rusqlite::Error::InvalidColumnName(descriptor.column.to_string()).to_string(),
@@ -1149,6 +2157,7 @@ fn copy_store_transaction(
                 &cache_root,
                 &mut destination_files,
             )?;
+            on_mapping();
         }
         tx.commit().map_err(|error| error.to_string())?;
         Ok(changed)
@@ -1272,6 +2281,9 @@ fn copy_exact(
     if old_key == new_key {
         return Ok(0);
     }
+    if watched_destination_has_resume(tx, table, col, new_key)? {
+        return Ok(0);
+    }
     let insert_columns = columns.join(", ");
     let select_columns = columns
         .iter()
@@ -1293,8 +2305,7 @@ fn copy_exact(
     )
 }
 
-/// prefix キーを `substr` 等値で列挙し、suffix を保って 1 キーずつ複製する。
-/// SQLite の `substr` length は文字数なので byte length ではなく `chars().count()` を渡す。
+/// BINARY key index の範囲で prefix キーを列挙し、suffix を保って複製する。
 fn copy_prefix(
     tx: &rusqlite::Transaction<'_>,
     table: &str,
@@ -1306,16 +2317,7 @@ fn copy_prefix(
     if old_prefix == new_prefix {
         return Ok(GenericCopyOutcome::default());
     }
-    let keys = {
-        let mut statement = tx.prepare(&format!(
-            "SELECT DISTINCT {col} FROM {table} WHERE substr({col}, 1, ?1) = ?2"
-        ))?;
-        let rows = statement.query_map(
-            rusqlite::params![old_prefix.chars().count() as i64, old_prefix],
-            |row| row.get::<_, String>(0),
-        )?;
-        rows.collect::<Result<Vec<_>, _>>()?
-    };
+    let keys = indexed_prefix_keys(tx, table, col, old_prefix)?;
     let mut outcome = GenericCopyOutcome::default();
     for key in keys {
         let Some(suffix) = key.strip_prefix(old_prefix) else {
@@ -1331,6 +2333,36 @@ fn copy_prefix(
     Ok(outcome)
 }
 
+/// All store keys use BINARY collation and have a leading-key index. Equivalence
+/// with the old SQLite `substr` predicate assumes path keys and prefixes have no NUL;
+/// Windows paths cannot contain NUL. Keep a lower bound even for Unicode prefixes
+/// without a representable exclusive upper bound.
+fn indexed_prefix_keys(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    col: &str,
+    prefix: &str,
+) -> Result<Vec<String>, rusqlite::Error> {
+    if let Some(upper) = prefix_upper_bound(prefix) {
+        let mut statement = tx.prepare(&format!(
+            "SELECT DISTINCT {col} FROM {table} WHERE {col} >= ?1 AND {col} < ?2"
+        ))?;
+        statement
+            .query_map(rusqlite::params![prefix, upper], |row| row.get(0))?
+            .collect()
+    } else {
+        let mut statement = tx.prepare(&format!(
+            "SELECT DISTINCT {col} FROM {table} WHERE {col} >= ?1 AND substr({col}, 1, ?2) = ?1"
+        ))?;
+        statement
+            .query_map(
+                rusqlite::params![prefix, prefix.chars().count() as i64],
+                |row| row.get(0),
+            )?
+            .collect()
+    }
+}
+
 fn update_copied_rating_source_paths(
     tx: &rusqlite::Transaction<'_>,
     mapping: &NormalizedStoreCopyMapping,
@@ -1338,24 +2370,35 @@ fn update_copied_rating_source_paths(
     match mapping {
         NormalizedStoreCopyMapping::Exact { new_key, .. } => {
             tx.execute(
-                "UPDATE ratings SET source_path = CASE
-                     WHEN instr(path, '::') > 0 THEN substr(path, 1, instr(path, '::') - 1)
-                     ELSE path
-                 END
-                 WHERE path = ?1",
+                &format!("{RATING_SOURCE_PATH_UPDATE} WHERE path = ?1"),
                 [new_key],
             )?;
         }
         NormalizedStoreCopyMapping::Prefix { new_prefix, .. } => {
-            tx.execute(
-                "UPDATE ratings SET source_path = CASE
-                     WHEN instr(path, '::') > 0 THEN substr(path, 1, instr(path, '::') - 1)
-                     ELSE path
-                 END
-                 WHERE substr(path, 1, ?1) = ?2",
-                rusqlite::params![new_prefix.chars().count() as i64, new_prefix],
-            )?;
+            update_rating_source_paths_for_prefix(tx, new_prefix)?;
         }
+    }
+    Ok(())
+}
+
+const RATING_SOURCE_PATH_UPDATE: &str = "UPDATE ratings SET source_path = CASE
+    WHEN instr(path, '::') > 0 THEN substr(path, 1, instr(path, '::') - 1)
+    ELSE path END";
+
+fn update_rating_source_paths_for_prefix(
+    tx: &rusqlite::Transaction<'_>,
+    prefix: &str,
+) -> Result<(), rusqlite::Error> {
+    if let Some(upper) = prefix_upper_bound(prefix) {
+        tx.execute(
+            &format!("{RATING_SOURCE_PATH_UPDATE} WHERE path >= ?1 AND path < ?2"),
+            rusqlite::params![prefix, upper],
+        )?;
+    } else {
+        tx.execute(
+            &format!("{RATING_SOURCE_PATH_UPDATE} WHERE path >= ?1 AND substr(path, 1, ?2) = ?1"),
+            rusqlite::params![prefix, prefix.chars().count() as i64],
+        )?;
     }
     Ok(())
 }
@@ -1433,11 +2476,317 @@ fn migrate_reading_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::OptionalExtension;
     use sha2::{Digest, Sha256};
     use std::path::PathBuf;
 
+    #[test]
+    fn pdf_and_image_store_copy_does_not_wait_for_nonoverlapping_epub_range() {
+        let data = tempfile::tempdir().unwrap();
+        let db = crate::content_identity::open_ledger_connection_at(
+            &data.path().join("content_identity.db"),
+        )
+        .unwrap();
+        db.execute_batch("ALTER TABLE edit_origin ADD COLUMN payload TEXT")
+            .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let range = data.path().join("unrelated-shelf");
+        let holder = std::thread::spawn(move || {
+            crate::pdf_loader::with_epub_pin_coverage(&[range], || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        entered_rx.recv().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let data_path = data.path().to_path_buf();
+        let worker = std::thread::spawn(move || {
+            let mut errors = Vec::new();
+            for extension in ["pdf", "png"] {
+                let old = data_path.join(format!("old.{extension}"));
+                let new = data_path.join(format!("new.{extension}"));
+                let migrated = run_at(&data_path, &old, &new);
+                errors.extend(migrated.errors);
+                let report = copy_stores_at(&data_path, &[StoreCopyPathMapping::exact(old, new)]);
+                errors.extend(report.errors);
+            }
+            done_tx.send(errors).unwrap();
+        });
+        let completed = done_rx.recv_timeout(std::time::Duration::from_millis(500));
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        worker.join().unwrap();
+        assert!(
+            completed.is_ok(),
+            "PDF store copy waited for an EPUB range operation"
+        );
+        assert!(completed.unwrap().is_empty());
+    }
+
+    #[test]
+    fn exact_purge_keeps_slash_and_virtual_descendant_deletion() {
+        let data = tempfile::tempdir().unwrap();
+        let db = crate::content_identity::open_ledger_connection_at(
+            &data.path().join("content_identity.db"),
+        )
+        .unwrap();
+        let removed = data.path().join("cover.png");
+        let key = crate::adjustment_db::normalize_path(&removed);
+        let nearby = format!("{key}x/book.epub");
+        for row in [
+            key.clone(),
+            format!("{key}/book.epub"),
+            format!("{key}::page_0"),
+            nearby.clone(),
+        ] {
+            db.execute(
+                "INSERT INTO edit_origin
+                    (file_key, size, head_hash, hashed_mtime, kind, last_edit_at)
+                 VALUES (?1, 0, '', 0, 'image', 0)",
+                [&row],
+            )
+            .unwrap();
+        }
+        drop(db);
+        let report = purge_removed_scopes_at(
+            data.path(),
+            &[crate::delete_worker::DeleteSourceScope::Exact(removed)],
+            &[],
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let db = rusqlite::Connection::open(data.path().join("content_identity.db")).unwrap();
+        let rows = db
+            .prepare("SELECT file_key FROM edit_origin ORDER BY file_key")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows, vec![nearby]);
+    }
+
     fn open(dir: &Path, file: &str) -> rusqlite::Connection {
         rusqlite::Connection::open(dir.join(file)).unwrap()
+    }
+
+    #[test]
+    fn video_watched_to_end_generic_rename_copy_and_purge_use_full_key_scopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = PathBuf::from(r"C:\Media\Old%_");
+        let renamed = PathBuf::from(r"D:\Media\Renamed");
+        let copied = PathBuf::from(r"E:\Media\Copied");
+        let descriptor = STORES
+            .iter()
+            .find(|store| store.table == "video_watched_to_end")
+            .unwrap();
+        assert_eq!(descriptor.normalization, StoreKeyNormalization::KeepDrive);
+        assert!(descriptor.unique && descriptor.rename_generic);
+        let old_key = descriptor.normalize_path(&old);
+        let new_key = descriptor.normalize_path(&renamed);
+        let copy_key = descriptor.normalize_path(&copied);
+        let adjacent = format!("{old_key}-adjacent.mp4");
+        let other_drive = descriptor.normalize_path(Path::new(r"Z:\Media\Old%_"));
+        let conn = open(dir.path(), "settings.db");
+        conn.execute_batch("CREATE TABLE video_watched_to_end (path_normalized TEXT PRIMARY KEY, updated_at INTEGER NOT NULL)").unwrap();
+        for (key, timestamp) in [
+            (old_key.clone(), 11),
+            (format!("{old_key}/clip.mp4"), 22),
+            (format!("{old_key}::track.flac"), 33),
+            (adjacent.clone(), 44),
+            (other_drive.clone(), 55),
+            (new_key.clone(), 99),
+            (copy_key.clone(), 777),
+        ] {
+            conn.execute(
+                "INSERT INTO video_watched_to_end VALUES (?1, ?2)",
+                rusqlite::params![key, timestamp],
+            )
+            .unwrap();
+        }
+        let timestamp = |key: &str| {
+            conn.query_row(
+                "SELECT updated_at FROM video_watched_to_end WHERE path_normalized = ?1",
+                [key],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .unwrap()
+        };
+        let report = run_at(dir.path(), &old, &renamed);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(timestamp(&old_key), None);
+        assert_eq!(timestamp(&format!("{old_key}/clip.mp4")), None);
+        assert_eq!(timestamp(&format!("{old_key}::track.flac")), None);
+        assert_eq!(timestamp(&new_key), Some(99), "destination wins");
+        assert_eq!(timestamp(&format!("{new_key}/clip.mp4")), Some(22));
+        assert_eq!(timestamp(&format!("{new_key}::track.flac")), Some(33));
+
+        let report = copy_stores_at(
+            dir.path(),
+            &[
+                StoreCopyPathMapping::exact(&renamed, &copied),
+                StoreCopyPathMapping::virtual_prefix(&renamed, &copied),
+            ],
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.rows, 1);
+        assert_eq!(
+            timestamp(&copy_key),
+            Some(777),
+            "copy retains existing destination"
+        );
+        assert_eq!(timestamp(&format!("{copy_key}::track.flac")), Some(33));
+        assert_eq!(timestamp(&new_key), Some(99), "copy preserves source");
+
+        let copied_purge = purge_removed_paths_at(dir.path(), &[copied], &[]);
+        assert!(copied_purge.errors.is_empty(), "{:?}", copied_purge.errors);
+        assert_eq!(copied_purge.rows, 2);
+        let renamed_purge = purge_removed_paths_at(dir.path(), &[renamed], &[]);
+        assert!(
+            renamed_purge.errors.is_empty(),
+            "{:?}",
+            renamed_purge.errors
+        );
+        assert_eq!(renamed_purge.rows, 3);
+        let count: usize = conn
+            .query_row("SELECT COUNT(*) FROM video_watched_to_end", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(timestamp(&adjacent), Some(44));
+        assert_eq!(timestamp(&other_drive), Some(55));
+    }
+
+    #[test]
+    fn video_watched_to_end_generic_operations_allow_missing_legacy_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(dir.path(), "settings.db");
+        conn.execute_batch("CREATE TABLE settings_kv (key TEXT PRIMARY KEY, value TEXT); INSERT INTO settings_kv VALUES ('preserved', 'true')").unwrap();
+        let old = PathBuf::from(r"C:\Media\Old.mp4");
+        let new = PathBuf::from(r"D:\Media\New.mp4");
+        assert!(run_at(dir.path(), &old, &new).errors.is_empty());
+        assert!(
+            copy_stores_at(dir.path(), &[StoreCopyPathMapping::exact(&old, &new)])
+                .errors
+                .is_empty()
+        );
+        assert!(
+            purge_removed_paths_at(dir.path(), &[old], &[])
+                .errors
+                .is_empty()
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM settings_kv WHERE key = 'preserved'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "true"
+        );
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'video_watched_to_end'", [], |row| row.get::<_, usize>(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn video_watched_to_end_migration_keeps_composite_destination_state_for_exact_and_prefixes() {
+        for copy in [false, true] {
+            for (destination_resume, destination_watched, destination_position) in [
+                (false, false, 0.0),
+                (true, false, 0.0),
+                (true, false, 34.5),
+                (false, true, 0.0),
+                (true, true, 34.5),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let old = PathBuf::from(r"C:\Media\Old");
+                let new = PathBuf::from(r"D:\Media\New");
+                let old_key = crate::path_key::normalize_keep_drive(&old);
+                let new_key = crate::path_key::normalize_keep_drive(&new);
+                let conn = open(dir.path(), "settings.db");
+                conn.execute_batch(
+                    "CREATE TABLE video_watched_to_end (path_normalized TEXT PRIMARY KEY, updated_at INTEGER NOT NULL);
+                     CREATE TABLE video_resume_positions (path_normalized TEXT PRIMARY KEY, position_secs REAL NOT NULL, updated_at INTEGER NOT NULL)"
+                ).unwrap();
+                let faces = [("", 11), ("/clip.mp4", 22), ("::track.flac", 33)];
+                for (suffix, timestamp) in faces {
+                    let source = format!("{old_key}{suffix}");
+                    let destination = format!("{new_key}{suffix}");
+                    conn.execute(
+                        "INSERT INTO video_watched_to_end VALUES (?1, ?2)",
+                        rusqlite::params![source, timestamp],
+                    )
+                    .unwrap();
+                    conn.execute(
+                        "INSERT INTO video_resume_positions VALUES (?1, 12.5, 111)",
+                        [&source],
+                    )
+                    .unwrap();
+                    if destination_resume {
+                        conn.execute(
+                            "INSERT INTO video_resume_positions VALUES (?1, ?2, 222)",
+                            rusqlite::params![destination, destination_position],
+                        )
+                        .unwrap();
+                    }
+                    if destination_watched {
+                        conn.execute(
+                            "INSERT INTO video_watched_to_end VALUES (?1, 999)",
+                            [&destination],
+                        )
+                        .unwrap();
+                    }
+                }
+                if copy {
+                    let report = copy_stores_at(
+                        dir.path(),
+                        &[
+                            StoreCopyPathMapping::exact(&old, &new),
+                            StoreCopyPathMapping::exact(old.join("clip.mp4"), new.join("clip.mp4")),
+                            StoreCopyPathMapping::virtual_prefix(&old, &new),
+                        ],
+                    );
+                    assert!(report.errors.is_empty(), "{:?}", report.errors);
+                } else {
+                    let report = run_at(dir.path(), &old, &new);
+                    assert!(report.errors.is_empty(), "{:?}", report.errors);
+                }
+                for (suffix, timestamp) in faces {
+                    let source = format!("{old_key}{suffix}");
+                    let destination = format!("{new_key}{suffix}");
+                    let watched = |key: &str| {
+                        conn.query_row("SELECT updated_at FROM video_watched_to_end WHERE path_normalized = ?1", [key], |row| row.get::<_, i64>(0)).optional().unwrap()
+                    };
+                    let resume = |key: &str| {
+                        conn.query_row("SELECT position_secs, updated_at FROM video_resume_positions WHERE path_normalized = ?1", [key], |row| Ok((row.get::<_, f64>(0)?, row.get::<_, i64>(1)?))).optional().unwrap()
+                    };
+                    let expected = if destination_watched {
+                        Some(999)
+                    } else if destination_resume {
+                        None
+                    } else {
+                        Some(timestamp)
+                    };
+                    assert_eq!(
+                        watched(&destination),
+                        expected,
+                        "copy={copy} resume={destination_resume} watched={destination_watched} suffix={suffix}"
+                    );
+                    assert_eq!(watched(&source), copy.then_some(timestamp));
+                    assert_eq!(
+                        resume(&source),
+                        Some((12.5, 111)),
+                        "source resume remains untouched"
+                    );
+                    assert_eq!(
+                        resume(&destination),
+                        destination_resume.then_some((destination_position, 222)),
+                        "destination resume remains untouched"
+                    );
+                }
+            }
+        }
     }
 
     fn sorted_keys(connection: &rusqlite::Connection, table: &str) -> Vec<String> {
@@ -1478,6 +2827,29 @@ mod tests {
 
     fn setup_copy_store_rows(dir: &Path, old: &Path) {
         for descriptor in STORES {
+            if descriptor.file == crate::content_identity::LEDGER_DB_FILE {
+                let connection =
+                    crate::content_identity::open_ledger_connection_at(&dir.join(descriptor.file))
+                        .unwrap();
+                connection
+                    .execute_batch("ALTER TABLE edit_origin ADD COLUMN payload TEXT")
+                    .unwrap();
+                let old_key = descriptor.normalize_path(old);
+                for (key, payload) in [
+                    (old_key.clone(), "exact"),
+                    (format!("{old_key}::ページ/001.jpg"), "prefix"),
+                ] {
+                    connection
+                        .execute(
+                            "INSERT INTO edit_origin
+                                (file_key, size, head_hash, hashed_mtime, kind, last_edit_at, payload)
+                             VALUES (?1, 0, '', 0, 'image', 0, ?2)",
+                            rusqlite::params![key, payload],
+                        )
+                        .unwrap();
+                }
+                continue;
+            }
             let connection = open(dir, descriptor.file);
             if descriptor.unique {
                 if descriptor.table == "edit_previews" {
@@ -1579,9 +2951,14 @@ mod tests {
         );
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         let covered = STORES.iter().filter(|descriptor| descriptor.unique).count();
-        assert_eq!(STORES.len(), 22, "A1 ledger を含む現行 descriptor 数");
-        assert_eq!(covered, 21);
+        assert_eq!(
+            STORES.len(),
+            27,
+            "watched と endpoint / page-alone preference を含む現行 descriptor 数"
+        );
+        assert_eq!(covered, 26);
         assert_eq!(report.rows, covered * 2);
+        assert_eq!(report.committed_thumbnail_pins, 4);
 
         for descriptor in STORES {
             let connection = open(dir.path(), descriptor.file);
@@ -1642,6 +3019,68 @@ mod tests {
                     .unwrap();
                 assert_eq!(destination_rows, 0, "unique=false は v1 copy 対象外");
             }
+        }
+    }
+
+    #[test]
+    fn copy_thumbnail_pin_counts_require_committed_rows() {
+        for table in ["folder_thumb_pins", "video_pins"] {
+            let dir = tempfile::tempdir().unwrap();
+            let descriptor = STORES.iter().find(|store| store.table == table).unwrap();
+            let column = descriptor.column;
+            let old = Path::new("C:/books/source.zip");
+            let new = Path::new("C:/books/copied.zip");
+            let failed = Path::new("C:/books/failed.zip");
+            let conn = open(dir.path(), descriptor.file);
+            conn.execute_batch(&format!(
+                "CREATE TABLE {table} ({column} TEXT PRIMARY KEY, payload TEXT)"
+            ))
+            .unwrap();
+            let old_key = descriptor.normalize_path(old);
+            for key in [old_key.clone(), format!("{old_key}::001.jpg")] {
+                conn.execute(
+                    &format!("INSERT INTO {table}({column}, payload) VALUES (?1, 'pin')"),
+                    [key],
+                )
+                .unwrap();
+            }
+            let mappings = [
+                StoreCopyPathMapping::exact(old, new),
+                StoreCopyPathMapping::virtual_prefix(old, new),
+            ];
+            let copied = copy_stores_at(dir.path(), &mappings);
+            assert!(copied.errors.is_empty(), "{:?}", copied.errors);
+            assert_eq!(copied.committed_thumbnail_pins, 2);
+            let unchanged = copy_stores_at(dir.path(), &mappings);
+            assert!(unchanged.errors.is_empty(), "{:?}", unchanged.errors);
+            assert_eq!(unchanged.committed_thumbnail_pins, 0);
+
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER reject_page BEFORE INSERT ON {table}
+                 WHEN NEW.{column} = 'c:/books/failed.zip::001.jpg'
+                 BEGIN SELECT RAISE(ABORT, 'rollback pin copy'); END;"
+            ))
+            .unwrap();
+            let rolled_back = copy_stores_at(
+                dir.path(),
+                &[
+                    StoreCopyPathMapping::exact(old, failed),
+                    StoreCopyPathMapping::virtual_prefix(old, failed),
+                ],
+            );
+            assert_eq!(rolled_back.errors.len(), 1);
+            assert_eq!(rolled_back.committed_thumbnail_pins, 0);
+            let rows: usize = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1"),
+                    [descriptor.normalize_path(failed)],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                rows, 0,
+                "the first insert must roll back with the page insert"
+            );
         }
     }
 
@@ -1752,6 +3191,416 @@ mod tests {
     }
 
     #[test]
+    fn indexed_prefix_matches_legacy_substr_for_unicode_case_and_no_upper_bound() {
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("CREATE TABLE entries (path TEXT PRIMARY KEY)")
+            .unwrap();
+        for key in [
+            "c:/日本/本::一.jpg",
+            "c:/日本/本::二.jpg",
+            "c:/日本/本:;outside",
+            "c:/A::upper",
+            "c:/a::lower",
+            "c:/100%_本::page",
+            "c:/100x_本::outside",
+            "c:/\u{d7ff}::page",
+            "c:/\u{e000}::outside",
+            "c:/\u{10ffff}::page",
+            "d:/unrelated",
+        ] {
+            connection
+                .execute("INSERT INTO entries VALUES (?1)", [key])
+                .unwrap();
+        }
+        let tx = connection.transaction().unwrap();
+        for prefix in [
+            "c:/日本/本::",
+            "c:/A::",
+            "c:/a::",
+            "c:/100%_本::",
+            "c:/\u{d7ff}",
+            "c:/\u{10ffff}",
+            "",
+        ] {
+            let mut legacy = tx
+                .prepare("SELECT path FROM entries WHERE substr(path, 1, ?1) = ?2 ORDER BY path")
+                .unwrap();
+            let old = legacy
+                .query_map(
+                    rusqlite::params![prefix.chars().count() as i64, prefix],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let mut new = indexed_prefix_keys(&tx, "entries", "path", prefix).unwrap();
+            new.sort();
+            assert_eq!(new, old, "prefix={prefix:?}");
+
+            let (sql, parameters): (&str, Vec<rusqlite::types::Value>) = if let Some(upper) =
+                prefix_upper_bound(prefix)
+            {
+                (
+                    "EXPLAIN QUERY PLAN SELECT DISTINCT path FROM entries WHERE path >= ?1 AND path < ?2",
+                    vec![prefix.to_owned().into(), upper.into()],
+                )
+            } else {
+                (
+                    "EXPLAIN QUERY PLAN SELECT DISTINCT path FROM entries WHERE path >= ?1 AND substr(path, 1, ?2) = ?1",
+                    vec![
+                        prefix.to_owned().into(),
+                        (prefix.chars().count() as i64).into(),
+                    ],
+                )
+            };
+            let plan: String = tx
+                .query_row(sql, rusqlite::params_from_iter(parameters), |row| {
+                    row.get(3)
+                })
+                .unwrap();
+            assert!(
+                plan.contains("SEARCH") && !plan.contains("SCAN"),
+                "{prefix:?}: {plan}"
+            );
+        }
+    }
+
+    #[test]
+    fn copy_image_container_and_move_match_legacy_database_rows() {
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE old_copy (path TEXT PRIMARY KEY, payload TEXT);
+             CREATE TABLE new_copy (path TEXT PRIMARY KEY, payload TEXT);
+             CREATE TABLE old_move (path TEXT PRIMARY KEY, payload TEXT);
+             CREATE TABLE new_move (path TEXT PRIMARY KEY, payload TEXT);",
+            )
+            .unwrap();
+        let keys = [
+            ("c:/日本/old.png", "image"),
+            ("c:/日本/book.zip", "container"),
+            ("c:/日本/book.zip::一.jpg", "page1"),
+            ("c:/日本/book.zip::二.jpg", "page2"),
+            ("c:/日本/book.zip:;outside", "outside"),
+            ("c:/日本/book.zip::三.jpg", "page3"),
+            ("d:/日本/book.zip::二.jpg", "unrelated"),
+        ];
+        for table in ["old_copy", "new_copy", "old_move", "new_move"] {
+            for (key, payload) in keys {
+                connection
+                    .execute(
+                        &format!("INSERT INTO {table} VALUES (?1, ?2)"),
+                        rusqlite::params![key, payload],
+                    )
+                    .unwrap();
+            }
+        }
+        let tx = connection.transaction().unwrap();
+        let columns = vec!["path".to_owned(), "payload".to_owned()];
+        // An image has only the exact face. A container has exact and virtual faces.
+        for (old, new) in [
+            ("c:/日本/old.png", "d:/日本/new.png"),
+            ("c:/日本/book.zip", "d:/日本/new.zip"),
+        ] {
+            for table in ["old_copy", "new_copy"] {
+                copy_exact(&tx, table, "path", &columns, old, new).unwrap();
+            }
+        }
+        let old_prefix = "c:/日本/book.zip::";
+        let new_prefix = "d:/日本/new.zip::";
+        let old_keys = tx
+            .prepare("SELECT path FROM old_copy WHERE substr(path, 1, ?1) = ?2")
+            .unwrap()
+            .query_map(
+                rusqlite::params![old_prefix.chars().count() as i64, old_prefix],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for key in old_keys {
+            copy_exact(
+                &tx,
+                "old_copy",
+                "path",
+                &columns,
+                &key,
+                &format!("{new_prefix}{}", key.strip_prefix(old_prefix).unwrap()),
+            )
+            .unwrap();
+        }
+        copy_prefix(&tx, "new_copy", "path", &columns, old_prefix, new_prefix).unwrap();
+
+        let move_old = "c:/日本/book.zip::";
+        let move_new = "d:/日本/moved.zip::";
+        let move_keys = tx
+            .prepare("SELECT path FROM old_move WHERE substr(path, 1, ?1) = ?2")
+            .unwrap()
+            .query_map(
+                rusqlite::params![move_old.chars().count() as i64, move_old],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for key in move_keys {
+            move_exact(
+                &tx,
+                "old_move",
+                "path",
+                true,
+                &key,
+                &format!("{move_new}{}", key.strip_prefix(move_old).unwrap()),
+            )
+            .unwrap();
+        }
+        move_prefix(&tx, "new_move", "path", true, move_old, move_new).unwrap();
+        for (old, new) in [("old_copy", "new_copy"), ("old_move", "new_move")] {
+            let rows = |table: &str| {
+                tx.prepare(&format!("SELECT path, payload FROM {table} ORDER BY path"))
+                    .unwrap()
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+            };
+            assert_eq!(rows(old), rows(new), "{old} vs {new}");
+        }
+    }
+
+    #[test]
+    fn every_store_copy_and_move_rows_match_legacy_prefix_scan() {
+        for descriptor in STORES {
+            let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+            let col = descriptor.column;
+            for table in ["legacy_copy", "indexed_copy", "legacy_move", "indexed_move"] {
+                connection
+                    .execute_batch(&format!(
+                        "CREATE TABLE {table} ({col} TEXT PRIMARY KEY, payload TEXT)"
+                    ))
+                    .unwrap();
+            }
+            let image_old = descriptor.normalize_path(Path::new(r"C:\日本\old.png"));
+            let image_new = descriptor.normalize_path(Path::new(r"D:\日本\new.png"));
+            let container_old = descriptor.normalize_path(Path::new(r"C:\日本\book.zip"));
+            let container_new = descriptor.normalize_path(Path::new(r"D:\日本\new.zip"));
+            let moved = descriptor.normalize_path(Path::new(r"D:\日本\moved.zip"));
+            let keys = [
+                (image_old.as_str(), "image"),
+                (container_old.as_str(), "container"),
+                (&format!("{container_old}::一.jpg"), "page1"),
+                (&format!("{container_old}::二.jpg"), "page2"),
+                (&format!("{container_old}:;outside"), "outside"),
+            ];
+            for table in ["legacy_copy", "indexed_copy", "legacy_move", "indexed_move"] {
+                for (key, payload) in keys {
+                    connection
+                        .execute(
+                            &format!("INSERT INTO {table} ({col}, payload) VALUES (?1, ?2)"),
+                            rusqlite::params![key, payload],
+                        )
+                        .unwrap();
+                }
+            }
+            let tx = connection.transaction().unwrap();
+            let columns = vec![col.to_owned(), "payload".to_owned()];
+            if descriptor.unique {
+                for table in ["legacy_copy", "indexed_copy"] {
+                    copy_exact(&tx, table, col, &columns, &image_old, &image_new).unwrap();
+                    copy_exact(&tx, table, col, &columns, &container_old, &container_new).unwrap();
+                }
+                let old_prefix = format!("{container_old}::");
+                let new_prefix = format!("{container_new}::");
+                let old_keys = tx
+                    .prepare(&format!(
+                        "SELECT {col} FROM legacy_copy WHERE substr({col}, 1, ?1) = ?2"
+                    ))
+                    .unwrap()
+                    .query_map(
+                        rusqlite::params![old_prefix.chars().count() as i64, old_prefix],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                for key in old_keys {
+                    copy_exact(
+                        &tx,
+                        "legacy_copy",
+                        col,
+                        &columns,
+                        &key,
+                        &format!("{new_prefix}{}", key.strip_prefix(&old_prefix).unwrap()),
+                    )
+                    .unwrap();
+                }
+                copy_prefix(&tx, "indexed_copy", col, &columns, &old_prefix, &new_prefix).unwrap();
+            }
+            let old_prefix = format!("{container_old}::");
+            let new_prefix = format!("{moved}::");
+            let old_keys = tx
+                .prepare(&format!(
+                    "SELECT {col} FROM legacy_move WHERE substr({col}, 1, ?1) = ?2"
+                ))
+                .unwrap()
+                .query_map(
+                    rusqlite::params![old_prefix.chars().count() as i64, old_prefix],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            for key in old_keys {
+                move_exact(
+                    &tx,
+                    "legacy_move",
+                    col,
+                    descriptor.unique,
+                    &key,
+                    &format!("{new_prefix}{}", key.strip_prefix(&old_prefix).unwrap()),
+                )
+                .unwrap();
+            }
+            move_prefix(
+                &tx,
+                "indexed_move",
+                col,
+                descriptor.unique,
+                &old_prefix,
+                &new_prefix,
+            )
+            .unwrap();
+            let rows = |table: &str| {
+                tx.prepare(&format!(
+                    "SELECT {col}, payload FROM {table} ORDER BY {col}"
+                ))
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+            };
+            assert_eq!(
+                rows("legacy_copy"),
+                rows("indexed_copy"),
+                "copy {}.{}",
+                descriptor.file,
+                descriptor.table
+            );
+            assert_eq!(
+                rows("legacy_move"),
+                rows("indexed_move"),
+                "move {}.{}",
+                descriptor.file,
+                descriptor.table
+            );
+        }
+    }
+
+    /// One representative indexed store: 100k existing rows, 1k container restores.
+    /// Measures the old/new copy query and the old/new runtime family query together.
+    #[test]
+    #[ignore]
+    fn measure_thousand_restores_against_hundred_thousand_rows() {
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE old_rows (path TEXT PRIMARY KEY, payload TEXT);
+             CREATE TABLE new_rows (path TEXT PRIMARY KEY, payload TEXT);",
+            )
+            .unwrap();
+        let tx = connection.transaction().unwrap();
+        for index in 0..100_000 {
+            let key = format!("c:/本/{index:06}.zip::page.jpg");
+            for table in ["old_rows", "new_rows"] {
+                tx.execute(&format!("INSERT INTO {table} VALUES (?1, 'state')"), [&key])
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        let tx = connection.transaction().unwrap();
+        let columns = vec!["path".to_owned(), "payload".to_owned()];
+        let mut old_hits = 0usize;
+        let old_started = std::time::Instant::now();
+        for index in 0..1_000 {
+            let old_base = format!("c:/本/{index:06}.zip");
+            let new_base = format!("d:/本/{index:06}.zip");
+            let old_prefix = format!("{old_base}::");
+            let new_prefix = format!("{new_base}::");
+            let mut statement = tx
+                .prepare("SELECT path FROM old_rows WHERE substr(path, 1, ?1) = ?2")
+                .unwrap();
+            let keys = statement
+                .query_map(
+                    rusqlite::params![old_prefix.chars().count() as i64, old_prefix],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            drop(statement);
+            for key in keys {
+                old_hits += copy_exact(
+                    &tx,
+                    "old_rows",
+                    "path",
+                    &columns,
+                    &key,
+                    &format!("{new_prefix}{}", key.strip_prefix(&old_prefix).unwrap()),
+                )
+                .unwrap();
+            }
+            let mut statement = tx
+                .prepare(
+                    "SELECT COUNT(*) FROM old_rows WHERE path = ?1 OR substr(path, 1, ?2) = ?3",
+                )
+                .unwrap();
+            let _: i64 = statement
+                .query_row(
+                    rusqlite::params![new_base, new_prefix.chars().count() as i64, new_prefix],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        }
+        let old_elapsed = old_started.elapsed();
+        let mut new_hits = 0usize;
+        let new_started = std::time::Instant::now();
+        for index in 0..1_000 {
+            let old_base = format!("c:/本/{index:06}.zip");
+            let new_base = format!("d:/本/{index:06}.zip");
+            let old_prefix = format!("{old_base}::");
+            let new_prefix = format!("{new_base}::");
+            new_hits += copy_prefix(&tx, "new_rows", "path", &columns, &old_prefix, &new_prefix)
+                .unwrap()
+                .rows;
+            let _: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM new_rows WHERE path = ?1",
+                    [&new_base],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let _: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM new_rows WHERE path >= ?1 AND path < ?2",
+                    rusqlite::params![new_prefix, prefix_upper_bound(&new_prefix).unwrap()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        }
+        let new_elapsed = new_started.elapsed();
+        assert_eq!((old_hits, new_hits), (1_000, 1_000));
+        eprintln!(
+            "100000 rows x 1000 restores, one store copy+family: old={old_elapsed:?} new={new_elapsed:?}"
+        );
+    }
+
+    #[test]
     fn exact_and_prefix_query_plans_use_the_binary_primary_key_index() {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
         connection
@@ -1849,9 +3698,17 @@ mod tests {
             unique: true,
             normalization: StoreKeyNormalization::KeepDrive,
             rename_generic: true,
+            table_availability: StoreTableAvailability::Required,
         };
         let mut report = PurgeReport::default();
-        purge_store(dir.path(), &descriptor, &removed_keys, &mut report);
+        purge_store(
+            dir.path(),
+            &descriptor,
+            &removed_keys,
+            &[],
+            None,
+            &mut report,
+        );
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(report.rows, legacy_changed);
         assert_eq!(
@@ -1912,10 +3769,18 @@ mod tests {
             unique: true,
             normalization: StoreKeyNormalization::KeepDrive,
             rename_generic: true,
+            table_availability: StoreTableAvailability::Required,
         };
         let started = std::time::Instant::now();
         let mut report = PurgeReport::default();
-        purge_store(dir.path(), &descriptor, &removed_keys, &mut report);
+        purge_store(
+            dir.path(),
+            &descriptor,
+            &removed_keys,
+            &[],
+            None,
+            &mut report,
+        );
         let elapsed = started.elapsed();
 
         assert!(report.errors.is_empty(), "{:?}", report.errors);
@@ -1940,12 +3805,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let removed = PathBuf::from(r"C:\Root\Gone");
         for descriptor in STORES {
-            let conn = open(dir.path(), descriptor.file);
-            conn.execute_batch(&format!(
-                "CREATE TABLE IF NOT EXISTS {} ({} TEXT)",
-                descriptor.table, descriptor.column
-            ))
-            .unwrap();
+            let identity = descriptor.file == crate::content_identity::LEDGER_DB_FILE;
+            let conn = if identity {
+                crate::content_identity::open_ledger_connection_at(
+                    &dir.path().join(descriptor.file),
+                )
+                .unwrap()
+            } else {
+                let conn = open(dir.path(), descriptor.file);
+                conn.execute_batch(&format!(
+                    "CREATE TABLE IF NOT EXISTS {} ({} TEXT)",
+                    descriptor.table, descriptor.column
+                ))
+                .unwrap();
+                conn
+            };
             let base = match descriptor.normalization {
                 StoreKeyNormalization::KeepDrive => crate::adjustment_db::normalize_path(&removed),
                 StoreKeyNormalization::DriveStripped => crate::path_key::normalize(&removed),
@@ -1956,14 +3830,24 @@ mod tests {
                 format!("{base}::page_1"),
                 format!("{base}2/keep.jpg"),
             ] {
-                conn.execute(
-                    &format!(
-                        "INSERT INTO {} ({}) VALUES (?1)",
-                        descriptor.table, descriptor.column
-                    ),
-                    [key],
-                )
-                .unwrap();
+                if identity {
+                    conn.execute(
+                        "INSERT INTO edit_origin
+                            (file_key, size, head_hash, hashed_mtime, kind, last_edit_at)
+                         VALUES (?1, 0, '', 0, 'image', 0)",
+                        [key],
+                    )
+                    .unwrap();
+                } else {
+                    conn.execute(
+                        &format!(
+                            "INSERT INTO {} ({}) VALUES (?1)",
+                            descriptor.table, descriptor.column
+                        ),
+                        [key],
+                    )
+                    .unwrap();
+                }
             }
         }
 
@@ -2060,52 +3944,481 @@ mod tests {
     fn journal_writer_state_keeps_only_newest_waiting_snapshot() {
         let mut state = JournalWriteState::default();
         let dir = PathBuf::from("data");
-        let rev1 = state.enqueue(dir.clone(), vec![("a".into(), "b".into())]);
+        let job = |old: &str, new: &str| {
+            PathMigrationJob::shell_rename(PathBuf::from(old), PathBuf::from(new), false)
+        };
+        let rev1 = state.enqueue(dir.clone(), vec![job("a", "b")]);
         let first = state.take_latest().unwrap();
-        let _rev2 = state.enqueue(dir.clone(), vec![("b".into(), "c".into())]);
-        let rev3 = state.enqueue(dir, vec![("c".into(), "d".into())]);
+        let _rev2 = state.enqueue(dir.clone(), vec![job("b", "c")]);
+        let rev3 = state.enqueue(dir, vec![job("c", "d")]);
 
-        state.complete(first.revision);
+        state.complete_saved(first.revision);
         assert_eq!(first.revision, rev1);
-        assert!(!state.is_flushed(rev3));
+        assert_eq!(state.status(rev3), JournalPersistStatus::Pending);
         let newest = state.take_latest().unwrap();
         assert_eq!(newest.revision, rev3);
-        assert_eq!(newest.entries, vec![("c".into(), "d".into())]);
-        state.complete(newest.revision);
-        assert!(state.is_flushed(rev3));
+        assert_eq!(newest.entries, vec![job("c", "d")]);
+        state.complete_saved(newest.revision);
+        assert_eq!(state.status(rev3), JournalPersistStatus::Saved);
     }
 
     #[test]
     fn journal_writer_drop_flushes_latest_snapshot() {
         let dir = tempfile::tempdir().unwrap();
-        let entries = vec![(PathBuf::from("old"), PathBuf::from("new"))];
+        let entries = vec![PathMigrationJob::shell_rename(
+            PathBuf::from("old"),
+            PathBuf::from("new"),
+            false,
+        )];
         let writer = RenameMigrationJournalWriter::spawn();
-        writer.enqueue(dir.path().to_path_buf(), entries.clone());
+        writer
+            .enqueue(dir.path().to_path_buf(), entries.clone())
+            .unwrap();
         drop(writer);
-        assert_eq!(journal_load(dir.path()), entries);
+        assert_eq!(journal_load(dir.path()).unwrap(), entries);
     }
 
-    /// ジャーナルの往復と消し込み (空で削除・無ければ空・壊れていたら破棄)。
+    /// ジャーナルの往復と消し込み。壊れた記録は旧 bytes を保持する。
     #[test]
     fn journal_roundtrip_and_cleanup() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(journal_load(dir.path()).is_empty(), "無ければ空");
+        assert!(journal_load(dir.path()).unwrap().is_empty(), "無ければ空");
         let entries = vec![
-            (PathBuf::from(r"D:\a.jpg"), PathBuf::from(r"D:\b.jpg")),
-            (
+            PathMigrationJob::shell_rename(
+                PathBuf::from(r"D:\a.jpg"),
+                PathBuf::from(r"D:\b.jpg"),
+                false,
+            ),
+            PathMigrationJob::shell_rename(
                 PathBuf::from(r"D:\フォルダ"),
                 PathBuf::from(r"D:\新フォルダ"),
+                true,
             ),
         ];
-        journal_save(dir.path(), &entries);
-        assert_eq!(journal_load(dir.path()), entries, "往復で一致");
-        journal_save(dir.path(), &[]);
+        journal_save(dir.path(), &entries).unwrap();
+        assert_eq!(journal_load(dir.path()).unwrap(), entries, "往復で一致");
+        journal_save(dir.path(), &[]).unwrap();
         assert!(
             !dir.path().join(JOURNAL_FILE).exists(),
             "空になったらファイルごと削除"
         );
         std::fs::write(dir.path().join(JOURNAL_FILE), b"broken json").unwrap();
-        assert!(journal_load(dir.path()).is_empty(), "壊れていたら空で続行");
+        assert!(matches!(
+            journal_load(dir.path()),
+            Err(JournalLoadError::Parse { .. })
+        ));
+        assert_eq!(
+            std::fs::read(dir.path().join(JOURNAL_FILE)).unwrap(),
+            b"broken json"
+        );
+    }
+
+    #[test]
+    fn journal_load_distinguishes_read_error_and_legacy_pairs() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join(JOURNAL_FILE);
+        std::fs::create_dir(&journal).unwrap();
+        assert!(matches!(
+            journal_load(dir.path()),
+            Err(JournalLoadError::Read(_))
+        ));
+        std::fs::remove_dir(&journal).unwrap();
+        let pairs = vec![(PathBuf::from("old"), PathBuf::from("new"))];
+        std::fs::write(&journal, serde_json::to_vec(&pairs).unwrap()).unwrap();
+        assert_eq!(
+            journal_load(dir.path()).unwrap(),
+            vec![PathMigrationJob::shell_rename(
+                PathBuf::from("old"),
+                PathBuf::from("new"),
+                true,
+            )]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn invalid_journal_quarantine_moves_exact_bytes_and_restart_sees_empty_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join(JOURNAL_FILE);
+        let original = b"invalid recovery bytes";
+        std::fs::write(&source, original).unwrap();
+        let control = JournalQuarantineControl::new();
+
+        let outcome = quarantine_invalid_journal_with(
+            dir.path(),
+            original,
+            &control,
+            0x1111,
+            rename_open_journal_handle,
+            || {},
+            || {},
+        );
+        let JournalQuarantineOutcome::Quarantined { path } = outcome else {
+            panic!("expected exact quarantine success");
+        };
+        let listing = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            std::fs::read(&path).unwrap_or_else(|error| panic!(
+                "returned destination missing: {} ({error}); source_exists={} listing={listing:?}",
+                path.display(),
+                source.exists()
+            )),
+            original
+        );
+        assert!(!source.exists());
+        assert!(
+            journal_load(dir.path()).unwrap().is_empty(),
+            "a restart sees no prior journal after the invalid object was moved aside"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn quarantine_detects_changed_bytes_without_trusting_length_or_mtime() {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::{FILETIME, HANDLE};
+        use windows::Win32::Storage::FileSystem::{GetFileTime, SetFileTime};
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join(JOURNAL_FILE);
+        let expected = b"bad-aaaa";
+        let changed = b"bad-bbbb";
+        std::fs::write(&source, expected).unwrap();
+        let input = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&source)
+            .unwrap();
+        let mut written = FILETIME::default();
+        unsafe {
+            GetFileTime(
+                HANDLE(input.as_raw_handle()),
+                None,
+                None,
+                Some(std::ptr::from_mut(&mut written)),
+            )
+        }
+        .unwrap();
+        std::fs::write(&source, changed).unwrap();
+        unsafe {
+            SetFileTime(
+                HANDLE(input.as_raw_handle()),
+                None,
+                None,
+                Some(std::ptr::from_ref(&written)),
+            )
+        }
+        .unwrap();
+        drop(input);
+
+        let outcome = quarantine_invalid_journal_with(
+            dir.path(),
+            expected,
+            &JournalQuarantineControl::new(),
+            0x2222,
+            rename_open_journal_handle,
+            || {},
+            || {},
+        );
+        assert_eq!(
+            outcome,
+            JournalQuarantineOutcome::Changed(JournalQuarantineChange::DifferentInvalidBytes)
+        );
+        assert_eq!(std::fs::read(source).unwrap(), changed);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn quarantine_requires_explicit_reload_for_missing_current_and_legacy_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join(JOURNAL_FILE);
+        let old_confirmation = b"old invalid bytes";
+        let current = vec![PathMigrationJob::shell_rename(
+            PathBuf::from("old-current"),
+            PathBuf::from("new-current"),
+            false,
+        )];
+        std::fs::write(&source, serde_json::to_vec(&current).unwrap()).unwrap();
+        let outcome = quarantine_invalid_journal_with(
+            dir.path(),
+            old_confirmation,
+            &JournalQuarantineControl::new(),
+            0x3333,
+            rename_open_journal_handle,
+            || {},
+            || {},
+        );
+        assert_eq!(
+            outcome,
+            JournalQuarantineOutcome::Changed(JournalQuarantineChange::ValidCurrentOrLegacy)
+        );
+        assert!(source.exists());
+
+        let legacy = vec![(PathBuf::from("old-legacy"), PathBuf::from("new-legacy"))];
+        std::fs::write(&source, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let outcome = quarantine_invalid_journal_with(
+            dir.path(),
+            old_confirmation,
+            &JournalQuarantineControl::new(),
+            0x4444,
+            rename_open_journal_handle,
+            || {},
+            || {},
+        );
+        assert_eq!(
+            outcome,
+            JournalQuarantineOutcome::Changed(JournalQuarantineChange::ValidCurrentOrLegacy)
+        );
+        assert!(source.exists());
+
+        std::fs::remove_file(&source).unwrap();
+        let outcome = quarantine_invalid_journal_with(
+            dir.path(),
+            old_confirmation,
+            &JournalQuarantineControl::new(),
+            0x4545,
+            rename_open_journal_handle,
+            || {},
+            || {},
+        );
+        assert_eq!(
+            outcome,
+            JournalQuarantineOutcome::Changed(JournalQuarantineChange::Missing)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn quarantine_never_overwrites_collision_and_retries_same_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join(JOURNAL_FILE);
+        let original = b"broken";
+        std::fs::write(&source, original).unwrap();
+        let collision = quarantine_destination(&source, 0x5555, 0);
+        std::fs::write(&collision, b"keep collision").unwrap();
+
+        let outcome = quarantine_invalid_journal_with(
+            dir.path(),
+            original,
+            &JournalQuarantineControl::new(),
+            0x5555,
+            rename_open_journal_handle,
+            || {},
+            || {},
+        );
+        let JournalQuarantineOutcome::Quarantined { path } = outcome else {
+            panic!("second unique candidate should succeed");
+        };
+        assert_ne!(path, collision);
+        assert_eq!(std::fs::read(collision).unwrap(), b"keep collision");
+        assert_eq!(std::fs::read(path).unwrap(), original);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn quarantine_read_rename_and_cancel_failures_preserve_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join(JOURNAL_FILE);
+        std::fs::create_dir(&source).unwrap();
+        assert!(matches!(
+            quarantine_invalid_journal(dir.path(), b"broken", &JournalQuarantineControl::new()),
+            JournalQuarantineOutcome::Failed(_)
+        ));
+        std::fs::remove_dir(&source).unwrap();
+        std::fs::write(&source, b"broken").unwrap();
+
+        let cancelled = JournalQuarantineControl::new();
+        cancelled.cancel();
+        assert!(matches!(
+            quarantine_invalid_journal(dir.path(), b"broken", &cancelled),
+            JournalQuarantineOutcome::Cancelled
+        ));
+        assert_eq!(std::fs::read(&source).unwrap(), b"broken");
+
+        let outcome = quarantine_invalid_journal_with(
+            dir.path(),
+            b"broken",
+            &JournalQuarantineControl::new(),
+            0x6666,
+            |_file, _destination| Err(HandleRenameError::Failed("injected rename failure".into())),
+            || {},
+            || {},
+        );
+        assert!(matches!(outcome, JournalQuarantineOutcome::Failed(_)));
+        assert_eq!(std::fs::read(&source).unwrap(), b"broken");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cancellation_before_rename_claim_prevents_the_handle_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join(JOURNAL_FILE);
+        let original = b"broken";
+        std::fs::write(&source, original).unwrap();
+        let control = JournalQuarantineControl::new();
+        let rename_called = std::cell::Cell::new(false);
+
+        let outcome = quarantine_invalid_journal_with(
+            dir.path(),
+            original,
+            &control,
+            0x7777,
+            |_file, _destination| {
+                rename_called.set(true);
+                Err(HandleRenameError::Failed("must not run".into()))
+            },
+            || control.cancel(),
+            || {},
+        );
+        assert!(matches!(outcome, JournalQuarantineOutcome::Cancelled));
+        assert!(!rename_called.get());
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cancellation_after_rename_claim_keeps_success_or_failure_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join(JOURNAL_FILE);
+        let original = b"broken";
+        std::fs::write(&source, original).unwrap();
+        let success_control = JournalQuarantineControl::new();
+
+        let outcome = quarantine_invalid_journal_with(
+            dir.path(),
+            original,
+            &success_control,
+            0x8888,
+            |file, destination| {
+                success_control.cancel();
+                rename_open_journal_handle(file, destination)
+            },
+            || {},
+            || success_control.cancel(),
+        );
+        assert!(matches!(
+            outcome,
+            JournalQuarantineOutcome::Quarantined { .. }
+        ));
+        assert!(!source.exists());
+
+        std::fs::write(&source, original).unwrap();
+        let failure_control = JournalQuarantineControl::new();
+        let outcome = quarantine_invalid_journal_with(
+            dir.path(),
+            original,
+            &failure_control,
+            0x9999,
+            |_file, _destination| {
+                failure_control.cancel();
+                Err(HandleRenameError::Failed("injected after claim".into()))
+            },
+            || {},
+            || {},
+        );
+        assert!(matches!(outcome, JournalQuarantineOutcome::Failed(_)));
+        assert_eq!(std::fs::read(source).unwrap(), original);
+    }
+
+    #[test]
+    fn journal_save_failure_is_reported_without_claiming_durable_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_directory = dir.path().join("blocked-parent");
+        std::fs::write(&not_a_directory, b"file").unwrap();
+        let entries = vec![PathMigrationJob::shell_rename(
+            PathBuf::from("old"),
+            PathBuf::from("new"),
+            false,
+        )];
+
+        assert!(journal_save(&not_a_directory, &entries).is_err());
+        assert!(
+            !not_a_directory.join(JOURNAL_FILE).exists(),
+            "a failed write must not be represented as a durable journal"
+        );
+    }
+
+    #[test]
+    fn journal_writer_failure_is_a_terminal_unsaved_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_directory = dir.path().join("blocked-parent");
+        std::fs::write(&not_a_directory, b"file").unwrap();
+        let writer = RenameMigrationJournalWriter::spawn();
+        let revision = writer
+            .enqueue(
+                not_a_directory,
+                vec![PathMigrationJob::shell_rename(
+                    PathBuf::from("old"),
+                    PathBuf::from("new"),
+                    false,
+                )],
+            )
+            .unwrap();
+
+        assert!(writer.flush().is_err());
+        assert!(matches!(
+            writer.status(revision),
+            JournalPersistStatus::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn journal_writer_retry_supersedes_the_exact_failed_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("blocked-parent");
+        std::fs::write(&blocked, b"file").unwrap();
+        let failed_entries = vec![PathMigrationJob::shell_rename(
+            PathBuf::from("old"),
+            PathBuf::from("new"),
+            false,
+        )];
+        let writer = RenameMigrationJournalWriter::spawn();
+        let failed_revision = writer.enqueue(blocked.clone(), failed_entries).unwrap();
+        assert!(writer.flush().is_err());
+        assert!(matches!(
+            writer.status(failed_revision),
+            JournalPersistStatus::Failed(_)
+        ));
+
+        std::fs::remove_file(&blocked).unwrap();
+        std::fs::create_dir(&blocked).unwrap();
+        let latest_entries = vec![PathMigrationJob::shell_rename(
+            PathBuf::from("newer-old"),
+            PathBuf::from("newer-new"),
+            true,
+        )];
+        let retry_revision = writer
+            .enqueue(blocked.clone(), latest_entries.clone())
+            .unwrap();
+        writer.flush().unwrap();
+
+        assert_eq!(writer.status(retry_revision), JournalPersistStatus::Saved);
+        assert_eq!(
+            journal_load(&blocked).unwrap(),
+            latest_entries,
+            "retry writes the App's newest full snapshot, not the retained older failure"
+        );
+    }
+
+    #[test]
+    fn journal_atomic_replacement_overwrites_an_existing_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = vec![PathMigrationJob::shell_rename(
+            PathBuf::from("a"),
+            PathBuf::from("b"),
+            false,
+        )];
+        let second = vec![PathMigrationJob::shell_rename(
+            PathBuf::from("b"),
+            PathBuf::from("c"),
+            false,
+        )];
+        journal_save(dir.path(), &first).unwrap();
+        journal_save(dir.path(), &second).unwrap();
+        assert_eq!(journal_load(dir.path()).unwrap(), second);
     }
 
     /// 連続リネーム A→B→C は **実行順どおり**なら C に集約される。逆順で実行すると
@@ -2527,6 +4840,82 @@ mod tests {
         assert_eq!(mode, 2, "drive 除去キーの見開き設定も移る");
     }
 
+    #[test]
+    fn final_cover_spread_override_migrates_without_a_legacy_spread_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = PathBuf::from(r"D:\Books\Old.zip");
+        let new = PathBuf::from(r"D:\Books\New.zip");
+        let old_key = crate::path_key::normalize(&old);
+        let new_key = crate::path_key::normalize(&new);
+        let conn = open(dir.path(), "spread.db");
+        conn.execute_batch(
+            "CREATE TABLE spreads (path TEXT PRIMARY KEY, mode INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE final_cover_spreads (
+                 path TEXT PRIMARY KEY,
+                 preference INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO final_cover_spreads (path, preference) VALUES (?1, 2)",
+            [&old_key],
+        )
+        .unwrap();
+        drop(conn);
+
+        let report = run_at(dir.path(), &old, &new);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let conn = open(dir.path(), "spread.db");
+        assert_eq!(
+            conn.query_row(
+                "SELECT preference FROM final_cover_spreads WHERE path = ?1",
+                [&new_key],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM spreads", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn legacy_spread_schema_copies_the_existing_store_without_requiring_the_new_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = PathBuf::from(r"D:\Books\Old.zip");
+        let new = PathBuf::from(r"D:\Books\New.zip");
+        let old_key = crate::path_key::normalize(&old);
+        let new_key = crate::path_key::normalize(&new);
+        let conn = open(dir.path(), "spread.db");
+        conn.execute_batch(
+            "CREATE TABLE spreads (path TEXT PRIMARY KEY, mode INTEGER NOT NULL DEFAULT 0)",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO spreads (path, mode) VALUES (?1, 2)",
+            [&old_key],
+        )
+        .unwrap();
+        drop(conn);
+
+        let report = copy_stores_at(dir.path(), &[StoreCopyPathMapping::exact(&old, &new)]);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let conn = open(dir.path(), "spread.db");
+        assert_eq!(
+            conn.query_row(
+                "SELECT mode FROM spreads WHERE path = ?1",
+                [&new_key],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2
+        );
+    }
+
     /// ZIP コンテナ改名: `::` 合成キー (アーカイブ内ページの★等) が prefix 書換され、
     /// 新キー側の既存行が優先される。path 中の `%` / `_` も誤爆しない。
     #[test]
@@ -2766,7 +5155,17 @@ mod tests {
         let untouched = "c:/pictures/untouched.png".to_string();
         let keys = vec![edited.clone(), untouched.clone()];
 
-        // store が 1 つも無ければ、運ぶ行も無い。
+        // An upgraded data directory can have the legacy spread table without the optional
+        // final-cover table. Its absence is an empty store, not an unreadable-store signal.
+        let spread = open(data_dir, "spread.db");
+        spread
+            .execute_batch(
+                "CREATE TABLE spreads (path TEXT PRIMARY KEY, mode INTEGER NOT NULL DEFAULT 0)",
+            )
+            .unwrap();
+        drop(spread);
+
+        // store に対象行が 1 つも無ければ、運ぶ行も無い。
         assert!(ledger_keys_with_restorable_rows_at(data_dir, &keys).is_empty());
 
         let rating = crate::rating_db::RatingDb::open_at(data_dir.join("rating.db")).unwrap();

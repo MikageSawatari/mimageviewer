@@ -13,6 +13,228 @@ use eframe::egui;
 
 use crate::grid_item::GridItem;
 
+/// The actual drawing destination, never a saved preference or requested placement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewerChromeSurface {
+    MainEmbedded,
+    Fullscreen,
+    Detached {
+        window_id: u64,
+        borderless_applied: bool,
+    },
+}
+
+impl ViewerChromeSurface {
+    pub fn is_f11_fullscreen(self) -> bool {
+        matches!(
+            self,
+            Self::Fullscreen
+                | Self::Detached {
+                    borderless_applied: true,
+                    ..
+                }
+        )
+    }
+}
+
+/// A read-only projection: the source locks remain owned by settings/the viewer context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolvedViewerChrome {
+    pub top_locked: bool,
+    pub bottom_lock: crate::settings::BottomBarLock,
+    pub info_locked: bool,
+    pub navigator_fixed: bool,
+}
+
+impl ResolvedViewerChrome {
+    pub fn resolve(
+        surface: ViewerChromeSurface,
+        targets: crate::settings::FullscreenChromeSuppression,
+        top_locked: bool,
+        bottom_lock: crate::settings::BottomBarLock,
+        info_locked: bool,
+        navigator_fixed: bool,
+    ) -> Self {
+        let fullscreen = surface.is_f11_fullscreen();
+        Self {
+            top_locked: top_locked && !(fullscreen && targets.top),
+            bottom_lock: if fullscreen && targets.bottom {
+                crate::settings::BottomBarLock::None
+            } else {
+                bottom_lock
+            },
+            info_locked: info_locked && !(fullscreen && targets.info),
+            navigator_fixed: navigator_fixed && !(fullscreen && targets.navigator),
+        }
+    }
+}
+
+/// The glyph and action still describe the saved lock; only the explanation is contextual.
+pub fn chrome_lock_hint(hint: &str, suppressed: bool) -> String {
+    if suppressed {
+        format!("{hint}\n全画面中は固定設定を保持して自動表示にします")
+    } else {
+        hint.to_owned()
+    }
+}
+
+pub const FULLSCREEN_CHROME_SUPPRESSION_SETTING_LABEL: &str =
+    "全画面中は固定表示を一時的に自動表示にする";
+
+pub fn draw_fullscreen_chrome_suppression_setting(
+    ui: &mut egui::Ui,
+    targets: &mut crate::settings::FullscreenChromeSuppression,
+) {
+    ui.label(FULLSCREEN_CHROME_SUPPRESSION_SETTING_LABEL);
+    ui.horizontal_wrapped(|ui| {
+        ui.checkbox(&mut targets.top, "上部バー");
+        ui.checkbox(&mut targets.bottom, "下部バーとストリップ");
+        ui.checkbox(&mut targets.info, "右情報パネル");
+        ui.checkbox(&mut targets.navigator, "ナビゲータ");
+    });
+    ui.label(egui::RichText::new("固定設定は保持します。バーやパネルは通常の端操作で呼び出せます。ナビゲータは保持キーで表示します。").weak());
+}
+
+#[cfg(test)]
+mod chrome_suppression_tests {
+    use super::*;
+    use crate::settings::{BottomBarLock, FullscreenChromeSuppression, Settings};
+
+    #[test]
+    fn chrome_suppression_resolves_every_target_without_mutating_raw_locks() {
+        let surfaces = [
+            ViewerChromeSurface::MainEmbedded,
+            ViewerChromeSurface::Fullscreen,
+            ViewerChromeSurface::Detached {
+                window_id: 7,
+                borderless_applied: false,
+            },
+            ViewerChromeSurface::Detached {
+                window_id: 7,
+                borderless_applied: true,
+            },
+        ];
+        for mask in 0..16 {
+            let targets = FullscreenChromeSuppression {
+                top: mask & 1 != 0,
+                bottom: mask & 2 != 0,
+                info: mask & 4 != 0,
+                navigator: mask & 8 != 0,
+            };
+            for surface in surfaces {
+                for raw in [false, true] {
+                    for bottom in [
+                        BottomBarLock::None,
+                        BottomBarLock::BarOnly,
+                        BottomBarLock::BarAndStrip,
+                    ] {
+                        let resolved =
+                            ResolvedViewerChrome::resolve(surface, targets, raw, bottom, raw, raw);
+                        let fullscreen = surface.is_f11_fullscreen();
+                        assert_eq!(resolved.top_locked, raw && !(fullscreen && targets.top));
+                        assert_eq!(
+                            resolved.bottom_lock,
+                            if fullscreen && targets.bottom {
+                                BottomBarLock::None
+                            } else {
+                                bottom
+                            }
+                        );
+                        assert_eq!(resolved.info_locked, raw && !(fullscreen && targets.info));
+                        assert_eq!(
+                            resolved.navigator_fixed,
+                            raw && !(fullscreen && targets.navigator)
+                        );
+                        assert_eq!(
+                            ResolvedViewerChrome::resolve(
+                                ViewerChromeSurface::MainEmbedded,
+                                targets,
+                                raw,
+                                bottom,
+                                raw,
+                                raw
+                            ),
+                            ResolvedViewerChrome {
+                                top_locked: raw,
+                                bottom_lock: bottom,
+                                info_locked: raw,
+                                navigator_fixed: raw
+                            }
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chrome_suppression_legacy_settings_and_roundtrip_preserve_saved_values() {
+        let mut settings: Settings = serde_json::from_str(r#"{"fullscreen_top_bar_locked":true,"fullscreen_seek_bar_locked":true,"still_seek_strip_locked":true,"video_top_bar_locked":true,"video_seek_bar_locked":true,"video_seek_strip_locked":true}"#).unwrap();
+        assert_eq!(
+            settings.fullscreen_chrome_suppression,
+            FullscreenChromeSuppression::default()
+        );
+        settings.fullscreen_chrome_suppression = FullscreenChromeSuppression {
+            top: true,
+            bottom: true,
+            info: true,
+            navigator: true,
+        };
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(
+            restored.fullscreen_chrome_suppression,
+            settings.fullscreen_chrome_suppression
+        );
+        assert!(restored.fullscreen_top_bar_locked && restored.video_top_bar_locked);
+        assert_eq!(restored.still_bottom_lock(), BottomBarLock::BarAndStrip);
+        assert_eq!(restored.video_bottom_lock(), BottomBarLock::BarAndStrip);
+    }
+
+    #[test]
+    fn chrome_suppression_retains_explicit_open_on_target_change_and_closes_without_unlocking() {
+        let mut panel = FullscreenInfoPanelState {
+            locked: true,
+            open: MetadataPanelOpenState::ByPointer,
+            hover_active: false,
+        };
+        panel.on_display_target_changed();
+        assert_eq!(panel.open, MetadataPanelOpenState::ByPointer);
+        let transient = FullscreenInfoPanelState {
+            locked: false,
+            ..panel
+        };
+        assert!(transient.visible(crate::settings::FsSidePanelMode::ClickToShow, false));
+        panel.open = MetadataPanelOpenState::Closed;
+        assert!(panel.locked);
+        assert!(
+            !FullscreenInfoPanelState {
+                locked: false,
+                ..panel
+            }
+            .visible(crate::settings::FsSidePanelMode::ClickToShow, false)
+        );
+    }
+}
+
+/// お気に入り編集と環境設定で共有する起動時の索引確認設定。
+pub const OFFLINE_CHANGE_SCAN_SETTING_LABEL: &str =
+    "起動時に、mIV を終了していた間の変更を確認しない";
+
+pub fn draw_offline_change_scan_setting(ui: &mut egui::Ui, skip: &mut bool) -> egui::Response {
+    let response = ui.checkbox(skip, OFFLINE_CHANGE_SCAN_SETTING_LABEL);
+    ui.label(egui::RichText::new(
+        "常駐して使っている場合に起動を速くします。終了中に追加・削除・移動したファイルは、検索結果に反映されないことがあります。その場合は [今すぐ確認] を押してください。"
+    ).weak().size(11.0));
+    response.on_hover_text("変更は次回起動から有効です。初めて索引を作る場合は確認を行います。")
+}
+
+/// 全索引の手動確認。呼出元が非同期の要求を提出する。
+pub fn draw_index_full_check_button(ui: &mut egui::Ui) -> egui::Response {
+    ui.button("今すぐ確認")
+        .on_hover_text("索引を有効にしたお気に入りを確認し、終了中の変更も検索結果に反映します。")
+}
+
 /// エラー表示の標準テキスト色。
 #[allow(dead_code)]
 pub(crate) const ERROR_TEXT_COLOR: eframe::egui::Color32 =
@@ -21,6 +243,35 @@ pub(crate) const ERROR_TEXT_COLOR: eframe::egui::Color32 =
 #[allow(dead_code)]
 pub(crate) const ERROR_TEXT_SIZE: f32 = 13.0;
 const BRUSH_WHEEL_POINT_PER_NOTCH: f32 = 40.0;
+
+/// フルスクリーン左右パネルで共有するタブの外観。
+///
+/// 各パネルは配置だけを決め、選択色・hover 色・文字組みはここへ集約する。
+pub(crate) fn draw_panel_tab_button(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    id: impl std::hash::Hash,
+    label: &str,
+    selected: bool,
+) -> egui::Response {
+    let response = ui.interact(rect, egui::Id::new(id), egui::Sense::click());
+    let background = if selected {
+        egui::Color32::from_rgba_unmultiplied(80, 140, 220, 220)
+    } else if response.hovered() {
+        egui::Color32::from_rgba_unmultiplied(95, 95, 95, 210)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(55, 55, 55, 180)
+    };
+    ui.painter().rect_filled(rect, 5.0, background);
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(13.0),
+        egui::Color32::WHITE,
+    );
+    response
+}
 
 fn shift_wheel_notches(events: &[egui::Event]) -> f32 {
     events
@@ -575,6 +826,18 @@ fn show_offset_tooltip(
     anchor: Option<egui::Rect>,
     text: impl Into<egui::WidgetText>,
 ) {
+    show_offset_tooltip_with_observer(ctx, tip, dark, anchor, text, |_, _| {});
+}
+
+#[allow(dead_code)]
+fn show_offset_tooltip_with_observer(
+    ctx: &egui::Context,
+    tip: egui::Tooltip<'_>,
+    dark: bool,
+    anchor: Option<egui::Rect>,
+    text: impl Into<egui::WidgetText>,
+    on_render: impl FnOnce(&egui::Ui, &egui::Response),
+) {
     let mut tip = tip.gap(TOOLTIP_GAP);
     match anchor {
         Some(rect) => tip.popup = tip.popup.anchor(rect),
@@ -592,8 +855,29 @@ fn show_offset_tooltip(
         if dark {
             crate::os_theme::apply_dark_ui(ui);
         }
-        ui.add(egui::Label::new(text));
+        let label = ui.add(egui::Label::new(text));
+        on_render(ui, &label);
     });
+}
+
+/// Test-script readback runs from the actual tooltip content closure. A hovered
+/// disabled row alone is not evidence that its tooltip was shown.
+#[cfg(all(windows, feature = "test-script"))]
+pub(crate) fn hover_tip_disabled_observed(
+    response: egui::Response,
+    text: &'static str,
+    on_render: impl FnOnce(&egui::Ui, &egui::Response, &'static str),
+) -> egui::Response {
+    let anchor = anchor_for(&response);
+    show_offset_tooltip_with_observer(
+        &response.ctx,
+        egui::Tooltip::for_disabled(&response),
+        false,
+        anchor,
+        text,
+        |ui, label| on_render(ui, label, text),
+    );
+    response
 }
 
 /// `egui::Response` にカーソルと重ならないツールチップを足す拡張トレイト。
@@ -1205,6 +1489,7 @@ pub fn format_badge_background(
         FormatBadgeKind::Zip => egui::Color32::from_rgba_unmultiplied(30, 80, 160, 200),
         FormatBadgeKind::Pdf => egui::Color32::from_rgba_unmultiplied(180, 30, 30, 200),
         FormatBadgeKind::Archive => egui::Color32::from_rgba_unmultiplied(200, 110, 20, 200),
+        FormatBadgeKind::Audio => egui::Color32::from_rgba_unmultiplied(95, 75, 160, 200),
         FormatBadgeKind::Video => egui::Color32::from_rgba_unmultiplied(20, 135, 145, 200),
     }
 }
@@ -1274,6 +1559,15 @@ pub fn draw_overlay_edit_badge(
     draw_badge_text(painter, placement, fg);
 }
 
+/// Count of additional edit markers that cannot fit in the cell's top lane.
+pub fn draw_overlay_edit_overflow_badge(
+    painter: &egui::Painter,
+    placement: &crate::thumb_overlay_layout::BadgePlacement,
+) {
+    painter.rect_filled(placement.rect, 3.0, egui::Color32::from_rgb(80, 90, 100));
+    draw_badge_text(painter, placement, egui::Color32::WHITE);
+}
+
 pub fn draw_overlay_tag_badge(
     painter: &egui::Painter,
     placement: &crate::thumb_overlay_layout::BadgePlacement,
@@ -1296,6 +1590,15 @@ pub fn draw_overlay_upscaled_video_badge(
         3.0,
         egui::Color32::from_rgba_unmultiplied(20, 120, 130, 215),
     );
+    draw_badge_text(painter, placement, egui::Color32::WHITE);
+}
+
+/// Media length stays legible over bright and dark thumbnail content in either theme.
+pub fn draw_overlay_media_duration_badge(
+    painter: &egui::Painter,
+    placement: &crate::thumb_overlay_layout::BadgePlacement,
+) {
+    painter.rect_filled(placement.rect, 3.0, egui::Color32::from_black_alpha(190));
     draw_badge_text(painter, placement, egui::Color32::WHITE);
 }
 
@@ -1814,7 +2117,7 @@ pub fn draw_path_hierarchy(
 
 /// `draw_path_hierarchy` のレイアウト部分だけを返す (位置決め / 描画は呼び出し側)。
 /// 単体テストしやすいように分離してある。
-fn layout_path_hierarchy(
+pub(crate) fn layout_path_hierarchy(
     painter: &egui::Painter,
     components: &[&str],
     color: egui::Color32,

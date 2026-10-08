@@ -9,6 +9,7 @@ use std::time::Instant;
 
 static START: OnceLock<Instant> = OnceLock::new();
 static FILE: OnceLock<Mutex<LogFile>> = OnceLock::new();
+static HOLDER: crate::perf::stall::Holder = crate::perf::stall::Holder::new();
 const DEFAULT_MAX_LOG_BYTES: u64 = 16 * 1024 * 1024;
 const DEBUG_MAX_LOG_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_ROTATED_GENERATIONS: usize = 1;
@@ -224,6 +225,7 @@ fn allow_live_log_reading(opts: &mut std::fs::OpenOptions) {
     let _ = opts;
 }
 
+#[track_caller]
 pub fn log(msg: impl AsRef<str>) {
     let elapsed = START
         .get()
@@ -235,13 +237,26 @@ pub fn log(msg: impl AsRef<str>) {
         .unwrap_or_else(|| "?".to_owned());
 
     if let Some(file) = FILE.get() {
+        use crate::perf::stall;
+        let mut probe = stall::IoProbe::start("normal", "log", &HOLDER);
         if let Ok(mut log_file) = file.lock() {
+            if let Some(p) = probe.as_mut() {
+                p.acquired(&HOLDER);
+            }
             let line = format!("[{elapsed:>8.3}s][t{tid_num:>3}] {}\n", msg.as_ref());
+            let at = stall::timer(&probe);
             log_file.rotate_if_needed(line.len());
+            let rotation_ms = stall::elapsed(at);
+            let mut write_ms = 0.0;
+            let mut flush_ms = 0.0;
             let wrote = if let Some(f) = log_file.file.as_mut() {
+                let at = stall::timer(&probe);
                 let ok = f.write_all(line.as_bytes()).is_ok();
+                write_ms = stall::elapsed(at);
                 if ok {
+                    let at = stall::timer(&probe);
                     let _ = f.flush();
+                    flush_ms = stall::elapsed(at);
                 }
                 ok
             } else {
@@ -249,6 +264,11 @@ pub fn log(msg: impl AsRef<str>) {
             };
             if wrote {
                 log_file.bytes_written += line.len() as u64;
+            }
+            let ended = stall::retire(&HOLDER, &probe);
+            drop(log_file);
+            if let (Some(p), Some(ended)) = (probe, ended) {
+                p.finish(ended, write_ms, flush_ms, rotation_ms);
             }
         }
     }
@@ -266,12 +286,26 @@ pub(crate) fn elapsed_micros() -> u64 {
 /// Buffered log data is normally flushed by [`log`] after every line. Keep an
 /// explicit flush operation for shutdown paths that may terminate the process
 /// without running Rust destructors.
+#[track_caller]
 pub fn flush() {
-    if let Some(file) = FILE.get()
-        && let Ok(mut log_file) = file.lock()
-        && let Some(f) = log_file.file.as_mut()
-    {
-        let _ = f.flush();
+    if let Some(file) = FILE.get() {
+        use crate::perf::stall;
+        let mut probe = stall::IoProbe::start("normal", "flush", &HOLDER);
+        if let Ok(mut log_file) = file.lock() {
+            if let Some(p) = probe.as_mut() {
+                p.acquired(&HOLDER);
+            }
+            let at = stall::timer(&probe);
+            if let Some(f) = log_file.file.as_mut() {
+                let _ = f.flush();
+            }
+            let flush_ms = stall::elapsed(at);
+            let ended = stall::retire(&HOLDER, &probe);
+            drop(log_file);
+            if let (Some(p), Some(ended)) = (probe, ended) {
+                p.finish(ended, 0.0, flush_ms, 0.0);
+            }
+        }
     }
 }
 

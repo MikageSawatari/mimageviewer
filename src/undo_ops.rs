@@ -119,8 +119,10 @@ impl App {
         // Undo エントリは積まない (= boundary を跨ぐ操作は redo 不可) — Undo スタック自体を
         // クリアする処理の最中なので一貫性が取れる。
         let mut interrupted_adjustment_drag = false;
+        let mut interrupted_page_idx = None;
         if let Some(session) = self.adjustment_drag_session.take() {
             interrupted_adjustment_drag = true;
+            interrupted_page_idx = Some(session.fs_idx);
             if let Some(p) = self.adjustment_page_params.get(&session.fs_idx).cloned() {
                 if Some(&p) != session.before.as_ref() {
                     self.set_page_params(session.fs_idx, p);
@@ -153,11 +155,12 @@ impl App {
             }
         }
         if interrupted_adjustment_drag {
-            // 中断したドラッグの色調 dirty を清算する。色調が動いていたなら
-            // 旧コンテキストのサムネ補正を作り直し、シャープ化だけなら温存する
-            // (release 遷移を経由しないのでここで明示的に処理する)。
+            // 中断したページドラッグだけ、同じキーを使うセルを失効させる。
+            // 標準ドラッグは通常の永続化 API が必要な範囲を失効させる。
             if self.thumb_adjust_drag_color_dirty {
-                self.thumb_adjust_tex.clear();
+                if let Some(idx) = interrupted_page_idx {
+                    self.invalidate_thumb_adjust_for_dragged_page(idx);
+                }
             }
             self.thumb_adjust_drag_color_dirty = false;
         }
@@ -195,15 +198,6 @@ impl App {
                     // the same side; Redo must remain untouched.
                     self.meta_undo.push_undo_from_redo(entry);
                     return;
-                }
-                if self.items_are_rating_view {
-                    let view_changes: Vec<(String, u8)> = changes
-                        .iter()
-                        .map(|c| (c.path_key.clone(), c.before))
-                        .collect();
-                    self.refresh_rating_view_after_rating_changes(&view_changes);
-                } else {
-                    self.rebuild_visible_indices();
                 }
             }
             UndoEntry::Tag { changes, .. } => {
@@ -252,15 +246,6 @@ impl App {
                     // Keep the failed operation retryable on the Redo side.
                     self.meta_undo.push_redo(entry);
                     return;
-                }
-                if self.items_are_rating_view {
-                    let view_changes: Vec<(String, u8)> = changes
-                        .iter()
-                        .map(|c| (c.path_key.clone(), c.after))
-                        .collect();
-                    self.refresh_rating_view_after_rating_changes(&view_changes);
-                } else {
-                    self.rebuild_visible_indices();
                 }
             }
             UndoEntry::Tag { changes, .. } => {

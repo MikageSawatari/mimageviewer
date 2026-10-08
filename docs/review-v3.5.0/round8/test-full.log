@@ -1,0 +1,22 @@
+[test-full] cargo test --workspace --features pack-build-tools --no-fail-fast
+   Compiling mimageviewer v3.5.0 (C:\home\mimageviewer)
+   Compiling mimageviewer-launcher v3.5.0 (C:\home\mimageviewer\crates\launcher)
+error: failed to run custom build command for `mimageviewer-launcher v3.5.0 (C:\home\mimageviewer\crates\launcher)`
+
+Caused by:
+  process didn't exit successfully: `C:\home\mimageviewer\target\debug\build\mimageviewer-launcher-0947e0b9633f810c\build-script-build` (exit code: 1)
+  --- stderr
+
+  ================================================================
+   Launcher input executable(s) not found:
+     mimageviewer-core.exe: C:\home\mimageviewer\target\release\mimageviewer-core.exe
+       build with: cargo build --release --bin mimageviewer-core
+     mimageviewer-remote.exe: C:\home\mimageviewer\target\release\mimageviewer-remote.exe
+       build with: cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets
+
+   Build core and remote before the launcher, or use the wrapper:
+     bash scripts/build-release.sh        (Git Bash)
+     .\scripts\build-release.ps1         (PowerShell)
+  ================================================================
+
+warning: build failed, waiting for other jobs to finish...

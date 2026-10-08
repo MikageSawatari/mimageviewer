@@ -44,9 +44,15 @@ fn ensure_ffmpeg_init() {
 /// 保つ。`cancel` は decode 中・解析直前に加え、解析の内側 (bin / FFT 窓単位) でも確認する。
 pub fn analyze_audio_file(
     path: &Path,
+    stream_index: usize,
     cancel: &AtomicBool,
 ) -> Result<music_core::TimelineAnalysis, String> {
-    analyze_audio_file_with_config(path, cancel, music_core::AnalysisConfig::default())
+    analyze_audio_file_with_config(
+        path,
+        stream_index,
+        cancel,
+        music_core::AnalysisConfig::default(),
+    )
 }
 
 /// `analyze_audio_file` の解析 config を明示する版。音楽ビュー (Inc 3) はラボと同じ
@@ -54,10 +60,11 @@ pub fn analyze_audio_file(
 /// config を渡す。decode → `analyze_stereo_timeline` の合成は共通。
 pub fn analyze_audio_file_with_config(
     path: &Path,
+    stream_index: usize,
     cancel: &AtomicBool,
     config: music_core::AnalysisConfig,
 ) -> Result<music_core::TimelineAnalysis, String> {
-    let decoded = decode_audio_file_to_stereo_f32(path, cancel)?;
+    let decoded = decode_audio_file_to_stereo_f32(path, stream_index, cancel)?;
     if cancel.load(Ordering::Relaxed) {
         return Err("cancelled".to_string());
     }
@@ -177,21 +184,24 @@ impl std::fmt::Display for AudioDecodeOpenError {
     }
 }
 
-/// 音声ファイルを開き、最良の音声ストリーム向けに decoder と 48kHz stereo f32 packed への
+/// 音声ファイルを開き、指定された音声ストリーム向けに decoder と 48kHz stereo f32 packed への
 /// resampler を構築する。レイアウト未指定 (古い WMA 等) は `normalize_layout` で差し替える。
-fn open_audio_decode(path: &Path) -> Result<AudioDecodeCtx, AudioDecodeOpenError> {
+fn open_audio_decode(
+    path: &Path,
+    stream_index: usize,
+) -> Result<AudioDecodeCtx, AudioDecodeOpenError> {
     ensure_ffmpeg_init();
 
     let pb = path.to_path_buf();
     let ictx = ffmpeg::format::input(&pb)
         .map_err(|e| AudioDecodeOpenError::Failed(format!("format::input: {e}")))?;
 
-    // 最良の音声ストリームを選ぶ。`stream.parameters()` は stream を借用するので、
+    // 再生 player が確定した stream を開く。`stream.parameters()` は stream を借用するので、
     // codec context の構築まで stream スコープ内で済ませてから owned な context を取り出す。
     let (stream_index, stream_time_base, codec_ctx) = {
         let stream = ictx
-            .streams()
-            .best(ffmpeg::media::Type::Audio)
+            .stream(stream_index)
+            .filter(|stream| stream.parameters().medium() == ffmpeg::media::Type::Audio)
             .ok_or(AudioDecodeOpenError::NoAudioTrack)?;
         let idx = stream.index();
         let time_base = stream.time_base();
@@ -231,8 +241,8 @@ fn open_audio_decode(path: &Path) -> Result<AudioDecodeCtx, AudioDecodeOpenError
 }
 
 impl AudioRangeDecoder {
-    pub(crate) fn open(path: &Path) -> Result<Self, AudioDecodeOpenError> {
-        let mut inner = open_audio_decode(path)?;
+    pub(crate) fn open(path: &Path, stream_index: usize) -> Result<Self, AudioDecodeOpenError> {
+        let mut inner = open_audio_decode(path, stream_index)?;
         let discarded_non_audio_streams =
             discard_unselected_streams(&mut inner.ictx, inner.stream_index);
         Ok(Self {
@@ -438,9 +448,10 @@ fn analysis_resampler(decoder: &ffmpeg::decoder::Audio) -> Result<ResampleContex
 /// `cancel` が立ったら途中で `Err` を返して打ち切る (呼び出し側ワーカーが結果を破棄する)。
 pub fn decode_audio_file_to_stereo_f32(
     path: &Path,
+    stream_index: usize,
     cancel: &AtomicBool,
 ) -> Result<DecodedAudio, String> {
-    decode_audio_file_to_stereo_f32_streaming(path, cancel, 0.0, |_, _| {})
+    decode_audio_file_to_stereo_f32_streaming(path, stream_index, cancel, 0.0, |_, _| {})
 }
 
 /// `decode_audio_file_to_stereo_f32` の progressive 版。デコードが進むたびに、蓄積した
@@ -458,6 +469,7 @@ pub fn decode_audio_file_to_stereo_f32(
 /// 呼び出し側はここで解析して即 send し、借用を跨いで保持しない。
 pub fn decode_audio_file_to_stereo_f32_streaming(
     path: &Path,
+    stream_index: usize,
     cancel: &AtomicBool,
     total_duration_secs: f64,
     mut on_partial: impl FnMut(&[f32], u32),
@@ -469,7 +481,7 @@ pub fn decode_audio_file_to_stereo_f32_streaming(
         mut decoder,
         mut resampler,
         in_rate,
-    } = open_audio_decode(path).map_err(|error| error.to_string())?;
+    } = open_audio_decode(path, stream_index).map_err(|error| error.to_string())?;
 
     let mut out: Vec<f32> = Vec::new();
     let mut frame = AudioFrame::empty();
@@ -533,6 +545,7 @@ pub fn decode_audio_file_to_stereo_f32_streaming(
 /// 返り値 (`Ok`) は `AudioStreamInfo` (実サンプル数から算出した長さ等)。
 pub fn decode_audio_file_progressive(
     path: &Path,
+    stream_index: usize,
     cancel: &AtomicBool,
     mut on_delta: impl FnMut(&[f32], u32) -> Result<(), String>,
 ) -> Result<AudioStreamInfo, String> {
@@ -543,7 +556,7 @@ pub fn decode_audio_file_progressive(
         mut decoder,
         mut resampler,
         in_rate,
-    } = open_audio_decode(path).map_err(|error| error.to_string())?;
+    } = open_audio_decode(path, stream_index).map_err(|error| error.to_string())?;
 
     let mut frame = AudioFrame::empty();
     // drain した差分だけを載せる再利用スクラッチ (差分を on_delta へ渡すたび clear)。
@@ -662,7 +675,7 @@ const AUDIO_PROBE_TAG_KEYS: &[(&str, &str)] = &[
 ///
 /// UI スレッドから直接呼ばず、解析ワーカー (`run_music_analysis`) の背景スレッドで実行する
 /// こと (avformat の open + ヘッダ読みはブロッキング I/O)。
-pub fn probe_audio_file(path: &Path) -> Result<AudioProbe, String> {
+pub fn probe_audio_file(path: &Path, stream_index: usize) -> Result<AudioProbe, String> {
     ensure_ffmpeg_init();
 
     let pb = path.to_path_buf();
@@ -689,8 +702,8 @@ pub fn probe_audio_file(path: &Path) -> Result<AudioProbe, String> {
     // 音声ストリームから codec / sample rate / channels / stream bitrate を取る。
     let (codec_name, sample_rate, channels, stream_bit_rate) = {
         let stream = ictx
-            .streams()
-            .best(ffmpeg::media::Type::Audio)
+            .stream(stream_index)
+            .filter(|stream| stream.parameters().medium() == ffmpeg::media::Type::Audio)
             .ok_or_else(|| "音声ストリームが見つかりません".to_string())?;
         for (k, v) in stream.metadata().iter() {
             push_meta(k, v);
@@ -899,6 +912,26 @@ fn append_resampled(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn range_decoder_opens_the_requested_audio_stream() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/audio-tracks/multi.mkv");
+        let decode = |stream_index| {
+            AudioRangeDecoder::open(&path, stream_index)
+                .unwrap()
+                .decode_range_to_stereo_f32(0.0, 0.25, &|| false)
+                .unwrap()
+                .stereo_samples
+        };
+        let first = decode(1);
+        let second = decode(2);
+        assert!(first.len() > 1_000 && second.len() > 1_000);
+        assert_ne!(&first[..1_000], &second[..1_000]);
+        assert_eq!(
+            AudioRangeDecoder::open(&path, 0).err(),
+            Some(AudioDecodeOpenError::NoAudioTrack)
+        );
+    }
 
     struct TestFormatContext(*mut ffmpeg::ffi::AVFormatContext);
 

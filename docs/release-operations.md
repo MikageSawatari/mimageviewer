@@ -3,7 +3,7 @@
 このドキュメントは **CLAUDE.md「リリース手順チェックリスト」の補助資料**。
 チェックリスト本体 (Phase 0〜5) が「何を順にやるか」の正本で、ここは過去リリースで
 実際に踏んだ **落とし穴・判断基準・復旧手順** を恒久メモとして 1 か所に集めたもの。
-リリースを別セッション / Codex に引き継ぐときの「地雷マップ」として使う。
+開発担当からClaudeCode Opusの公開タスクへ引き継ぐときの「地雷マップ」として使う。
 
 - 正本 (手順そのもの): [CLAUDE.md](../CLAUDE.md) の「## リリース手順チェックリスト」。
 - 具体の確定値 (MS Store の Installer parameters・年齢区分・確定 URL 等) は
@@ -13,14 +13,36 @@
 
 ---
 
+## 開発と公開の担当・引き継ぎ
+
+公開準備・公開作業はClaudeCode Opusが主導する (担当範囲は2026-09-09決定を継続)。
+2026-09-23のモデル更新後は **ClaudeCode Opus 5.5 / high** が管理・設計・検収と公開を担当する。
+開発の実装・テストは **GPT-6.1 Sol / high**、独立レビューは別担当の **GPT-6.1 Sol / xhigh** とし (2026-09-30 更新)、
+難しい設計・原因調査の追加確認に限り **GPT-6 Astra / medium** を使う。
+モデル分担の正本は [AGENTS.md](../AGENTS.md#model-roles-and-coordination)。
+
+- 公開担当の範囲はCLAUDE.mdのPhase 0〜5。更新履歴・版番号・告知用データの更新、
+  リリースゲート、配布ビルド・署名、GitHub Release、サイト反映、配布チャネル申請を担当する。
+  定型作業はOpusがチェックリストに沿って進め、Codexの親役や自動レビューは必須にしない。
+- 開発側は対象branch/worktree・commit、含める変更、既知の問題、実施済み検証のログと
+  適用条件、未実施の確認、成果物の所在をまとめて渡す。既存の検証台帳を参照し、
+  担当変更だけを理由に再レビュー・再テスト・再ビルドしない。配布用の必須build/gateは実施する。
+- 公開中に製品コードの不具合、依存更新、build・署名・配布スクリプトのロジック変更が
+  必要になったら、Opusの設計・指示とSolの実装・独立レビューによる開発作業へ切り分ける。
+  修正commitと必要なレビュー・検証結果を受け取って公開を再開する。
+  版番号・更新履歴・告知用テーブル等の定型更新は公開担当の範囲。
+- 既存のユーザー承認、署名・成果物確認、実アプリ検証の明示了承、実データ保護は維持する。
+  対象差分・環境が変わった場合は [検証結果の再利用条件](development-build-and-test.md#検証の担当と結果の再利用)
+  に従って必要な検証をやり直す。公開手順にない追加レビューを慣例で増やさない。
+
 ## 1. 全体の位置づけ
 
 - **配布ビルドは `scripts/build-dist.ps1` 一発**。Rust 全体テスト → idle-health 解析テスト
-  → clean → core → remote → launcher → ISCC (installer) → portable を 1 コマンドで実行し、
+  → clean → core → remote → EPUB worker → launcher → ISCC (installer) → portable を 1 コマンドで実行し、
   テスト通過後に**ワークスペースパッケージを `cargo clean --release`**
   してから実コンパイルするので stale 出荷が構造的に起きない。署名は既定 ON。
 - **通常の開発反復とcore内Windows native挙動の実機確認は
-  `scripts/build-dev.ps1`** (core + remote、軽量Cargo profile、通常のAPPDATA profile、
+  `scripts/build-dev.ps1`** (core + remote + EPUB worker、軽量Cargo profile、通常のAPPDATA profile、
   launcher省略用FFmpeg DLLだけloose配置)。launcher／release最適化／埋め込みasset／
   変更したVST3 bridgeなどrelease構成依存の確認だけ `scripts/build-release.ps1` 単体を使う
   (cleanなし・署名は `-Sign` 指定時のみ)。**どちらも配布物の生成には使わない**。
@@ -54,15 +76,15 @@
   portable core は専用 `target-portable` dir に分離済みで、非 portable core を上書きしない。
 - **診断用の手動復旧** (`build-release.ps1` が stale に見える原因を切り分ける場合のみ):
   - 「Compiling 行なしの数秒完了」を見たら疑う。**正常な full recompile は core で 3〜4 分**。
-  - `cargo clean --release -p mimageviewer -p mimageviewer-remote -p mimageviewer-launcher`
-    してから 3 段ビルドし、
+  - `cargo clean --release -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-launcher`
+    してから 4 段ビルドし、
     現行ソースから再コンパイルできることを確認する。
   - **文字列 grep で stale 判定しない** (消えたはずの UI 文字列が別箇所に正規に残っていて
     誤判定する。過去に実際に踏んだ)。
-  - launcher の mtime > core / remote の mtime はビルド順の参考にしかならず、内包物が現行ソース由来で
+  - launcher の mtime > core / remote / EPUB worker の mtime はビルド順の参考にしかならず、内包物が現行ソース由来で
     あることの証明には使わない。
   - **この診断ビルドは出荷しない**。原因解消後、最終成果物は必ず `build-dist.ps1` を先頭から
-    実行して clean → core → remote → launcher → installer → portable を作り直す。
+    実行して clean → core → remote → EPUB worker → launcher → installer → portable を作り直す。
 
 ### 2.2 stderr trap — ビルドスクリプトに `*>&1` を付けない
 
@@ -71,9 +93,9 @@
   stderr に書く最初の行が NativeCommandError として terminating 化し、**ビルドが即 exit 1
   で死ぬ**。
 - **回避**: (A) スクリプトを素で `& scripts\build-release.ps1` (パイプ/マージなし) で呼ぶ、
-  または (B) cargo 3 段を直接実行する。どちらも stderr をリダイレクトしない。
+  または (B) cargo 4 段を直接実行する。どちらも stderr をリダイレクトしない。
 
-### 2.3 3 段ビルドの正しいコマンド (順序不変: core → remote → launcher)
+### 2.3 4 段ビルドの正しいコマンド (順序不変: core → remote → EPUB worker → launcher)
 
 署名時の補足: SimplySignログイン済みでも、制限された実行環境のsigntoolが
 `No certificates were found that met all the given criteria`で失敗する場合がある。
@@ -86,6 +108,8 @@ v3.7.0では証明書一覧が見えていても非昇格の署名は失敗し�
 cargo build --release --bin mimageviewer-core
 # リモートサービス (同じ remote-ipc protocol source + 配布用 Web UI 資産内包)
 cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets
+# EPUB 変換器 (launcher が内包)
+cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf
 # ランチャー (bin "mimageviewer" は package "mimageviewer-launcher" 側にある)
 cargo build --release -p mimageviewer-launcher --bin mimageviewer
 ```
@@ -131,6 +155,35 @@ perf/idle検証および実アプリsmokeの実行前に適用する。必須検
   シナリオを測り、`target/idle-health/` の統合 report が全て PASS であることを確認する。
   手順と閾値は [idle-health-check.md](idle-health-check.md) を正とする。
 
+### 3.1 全 PE と app-local VC runtime gate
+
+`build-dist.ps1` は installer と portable の生成後、DONE 表示前に
+`scripts/check-vcrt-pe-dependencies.ps1` を実行する。release の launcher / core / remote / EPUB worker、
+installer wrapper、portable directory 配下、および埋め込み元 PDFium / DirectML ORT / FFmpeg /
+Susie / VST host / EffeTune plugin PE (`.vst3` を含む) を検査対象にする。各 input の SHA-256、machine、linker version、direct imports は
+`target/vcrt-pe-reports/` の JSON に残る。
+
+Microsoft VC/Redist 由来の `msvcp140.dll` / `msvcp140_1.dll` / `vcruntime140.dll` /
+`vcruntime140_1.dll` は `vendor/vcrt/provenance.json` が正本で、全4本同一版、最低14.44、x64、
+manifest exact hash、Microsoft Authenticode Valid を必須とする。package 内コピーも canonical と
+exact 一致させ、各配布 exe の隣に4本揃わなければ fail する。
+EffeTune pluginの依存は `data_dir/vst3/hosts/<host+CRT SHA256>/mimageviewer-vst3-host.exe` の
+processで解決する。同梱CRT4本は非検索subdir `vcrt/`。System32の全4本が存在・版数読取可能で
+各DLLのfile versionが同梱版以上なら全4本System32、他は全4本同梱を選ぶ。選択元と両版数をlogへ記録し、
+依存順に絶対pathからpreloadする。途中で混在させず、load不能なら理由を記録して停止する。
+旧host／CRTの上書きはせず、同一bytesは再抽出しない。
+直接起動テスト用にもCMakeが `vendor/vst3-host/vcrt/` へ公式CRT4本を配置する。
+`build-dist.ps1` のfull gateはrelease buildより前なので、事前にCMake buildまたは
+現ソース一致のhost＋CRTセットの復元を済ませる。exeだけを復元してfull gateへ進まない。
+両scriptのテスト前preflightはhostを起動せず、CRT4本と公式正本の完全一致を検査する。
+同梱CRTはWindows Updateで更新されないため、native dependency更新時に正本と実体を一体で更新する。
+
+`onnxruntime*.dll` も Microsoft Authenticode Valid を必須にする。既知4名以外の `msvcp*` /
+`vcruntime*` / `concrt*` import は依存 closure の再設計が必要なので fail とする。artifact の machine
+条件は一律ではなく、通常 x64、Susie worker と Inno Setup bootstrapper は x86 を許容する。
+Microsoft 署名済み CRT / ORT は mIV の署名処理へ渡さず、元署名を保持する。TensorRT pack は
+setup、build、upload の各入口でも同じ gate を通し、`INSTALL_OK` 作成や公開より先に失敗させる。
+
 ---
 
 ## 4. コード署名 (v2.3.0 以降・全配布 PE)
@@ -163,10 +216,23 @@ perf/idle検証および実アプリsmokeの実行前に適用する。必須検
   - 準備完了の判定はトレイ通知「SimplySign connected / Amount of cards available: 1」、
     または `certutil -scinfo` に Reader Name が出ること。
   - 毎回避けたければ `Set-Service SCardSvr -StartupType Automatic` (管理者)。
+- **R2 host identity gate (2026-10-02)**: CMakeのsourcehash markerを現CMakeLists／include／src／testsと照合する。
+  計算は `scripts/vst3-host-identity.ps1` をCMake／validatorで共有し、CRLFだけをLFへbyte正規化する。
+  他byteは保持する。core.autocrlfによるcheckout差を無視し、実ソースの変更は検知する。
+  `build-release`／`build-dist`の署名前・core埋込前・最終gateと非portable coreのbare cargo releaseでも必須。
+  `-SkipVst3Bridge`／SDK欠落時は一致するvendor hostのみ再利用できる。APPDATA等からのcopy fallbackはない。
+  一致しなければCMakeで再buildしSHA256／sizeを記録する。実host確認は承認済み手動検証へ分ける。
 - **署名順序 (include_bytes! のため「埋め込み前」に内側から署名)**:
-  vendor 埋め込み対象 (pdfium / susie32 / vst3-host / FFmpeg 6 DLL) → core + remote → launcher →
+  vendor 埋め込み対象 (pdfium / susie32 / vst3-host / FFmpeg 6 DLL / staging の EffeTune plugin PE) → core + remote + EPUB worker → launcher →
   setup.exe → portable の loose PE。この順を崩すと APPDATA 展開後のコピーが未署名になる。
-- **`onnxruntime*.dll` は Microsoft 署名済みなので再署名しない**。`*.onnx` は PE でないので対象外。
+  EffeTune は `vendor/effetune-mixwright/` を target staging にコピーしてから全 PE を署名する
+  (plugin binary の `.vst3` も PE)。vendor 原本を変更せず、`MIMV_EFFETUNE_DIR` を staging に向け、
+  `build-release.ps1` の launcher build と dependency gate が同じ署名済み実体を使う。
+  署名前にtracked manifestの全425ファイル名・SHA256を照合し、署名後stageは有効な指定発行元署名と
+  PEのchecksum／証明書以外の一致を検査する。VERSIONと3通知原文も照合し、更新時は
+  `third_party/effetune-mixwright/<version>/` と about の include_str! を一体で更新する。
+- **`onnxruntime*.dll` と app-local VC runtime 4本は Microsoft 署名済みなので再署名しない**。
+  `*.onnx` は PE でないので対象外。
 - `build-dist.ps1` は**署名を既定 ON** (`-NoSign` で回避)。実装は `scripts/sign-files.ps1`
   (証明書 subject は既定値、拇印固定は `$env:MIV_SIGN_SHA1`、TS 変更は `$env:MIV_SIGN_TS`)。
 - **検証**: 最終成果物 (単体exe / setup.exe / portable の mimageviewer.exe) に
@@ -218,7 +284,7 @@ perf/idle検証および実アプリsmokeの実行前に適用する。必須検
     で **現在の tagName** を特定し、immutable でないことを確認してから
     `gh release edit <current-tagName> --tag vX.Y.Z --draft=false --latest` で再関連付けし、再度全項目を照合する。
 - **アプリ内更新通知は body 先頭 8KB (UTF-8 バイト) で切られる** (`update_check.rs` の `BODY_CAP`)。
-  README の該当セクションが 8KB を超える版は、**`docs/release-body-<version>.md` に 8KB 以内の
+  CHANGELOG.md の該当セクションが 8KB を超える版は、**`docs/release-body-<version>.md` に 8KB 以内の
   短縮版を別途作り、それを Release body に使う** (目玉→主な改善→主なバグ修正の順で前方に重要
   項目を寄せる)。8KB 上限は受信側 (旧バイナリ) に焼かれているので、今版で `BODY_CAP` を
   上げても今回の通知には効かない (効くのは次版以降)。
@@ -239,7 +305,16 @@ perf/idle検証および実アプリsmokeの実行前に適用する。必須検
   ただし VST3 ブリッジは**署名対応後も当面 portable へ非同梱**とする。再同梱は別タスクの
   ユーザー承認が必要な機能変更であり、`build-portable.ps1` / portable 文書の同時更新、署名検証、
   Chrome での実ダウンロード確認を通してから行う。単体exe / インストーラ版は埋め込みなので
-  VST3 は従来通り動く。
+  VST3 は従来通り動く。EffeTune も portable には同梱しない (利用者決定、
+  [effetune-integration-plan.md](effetune-integration-plan.md) §10.1)。単体exe／インストーラでは
+  launcher が VERSION を記録した全 bundle (v0.12.0 は424ファイル、VERSION込み入力425ファイル) を
+  `runtime/<version>/effetune/<hash12>-<generation>/` へ全hash検証して公開し、
+  atomic更新するのは小さなcurrent pointerだけ。既存・使用中treeは移動／削除／修復せず残す。
+  hash12はcontent SHA256先頭12桁でstampにはfull hashを使う。最深fileのUTF-16長260以上は理由付きで拒否する。
+  publisher busyは最大60秒待ってpointerを再確認する。coreには成功generationを渡して固定し、
+  修復失敗／timeoutは理由と拒否世代を渡して起動継続。音響調整ボタンで別公開世代を再確認できる。
+  正常時はstamp一覧・サイズ・更新時刻・作成時刻の一致を確認し、全量再hashとwrite lockを避ける。
+  メタデータを保持した内容改変は既存asset shortcutと同様に検出範囲外。
 - **検証**: ビルド後、**Chrome で実際に zip をダウンロード**してブロックされないことを確認する
   (VirusTotal のスコアはキャッシュラグがあるので最終確認は実 DL)。
 - **運用知見** (AV ベンダーへの誤検知申請が必要になった場合):

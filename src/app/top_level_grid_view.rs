@@ -20,41 +20,73 @@ pub(crate) enum TopLevelSearchView {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SmartFolderPosition {
     Root,
+    /// A root row opened as a virtual book. Ctrl traversal uses its exact root entry.
+    Container {
+        root_entry: PathBuf,
+        current: PathBuf,
+    },
     Scoped {
         entry_index: usize,
         entry_root: PathBuf,
         current: PathBuf,
+        /// The adopted physical item at `current`. History restoration cannot infer a nested
+        /// PDF/ZIP from a row after the source session has been left.
+        current_kind: super::smart_folder::SmartChildKind,
         back_stack: Vec<PathBuf>,
     },
+}
+
+/// One navigable row in the prepared Smart root's effective display order.
+/// Images, videos, and presentation-only rows never enter this list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SmartRootNavEntry {
+    pub(crate) logical_path: PathBuf,
+    pub(crate) kind: super::smart_folder::SmartChildKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SmartFolderViewState {
     pub(crate) definition_id: uuid::Uuid,
-    /// prepare 済み root grid に現れた実フォルダの表示順。
-    pub(crate) folder_entries: Arc<Vec<PathBuf>>,
+    /// The single navigation order, derived from the final prepared root rows.
+    pub(crate) navigation_entries: Arc<Vec<SmartRootNavEntry>>,
     pub(crate) position: SmartFolderPosition,
 }
 
 impl SmartFolderViewState {
     pub(crate) fn root(definition_id: uuid::Uuid, folder_entries: Vec<PathBuf>) -> Self {
+        Self::root_with_navigation_entries(
+            definition_id,
+            folder_entries
+                .into_iter()
+                .map(|logical_path| SmartRootNavEntry {
+                    logical_path,
+                    kind: super::smart_folder::SmartChildKind::Folder,
+                })
+                .collect(),
+        )
+    }
+
+    pub(crate) fn root_with_navigation_entries(
+        definition_id: uuid::Uuid,
+        navigation_entries: Vec<SmartRootNavEntry>,
+    ) -> Self {
         Self {
             definition_id,
-            folder_entries: Arc::new(folder_entries),
+            navigation_entries: Arc::new(navigation_entries),
             position: SmartFolderPosition::Root,
         }
     }
 
     pub(crate) fn scoped_current(&self) -> Option<&Path> {
         match &self.position {
-            SmartFolderPosition::Root => None,
+            SmartFolderPosition::Root | SmartFolderPosition::Container { .. } => None,
             SmartFolderPosition::Scoped { current, .. } => Some(current),
         }
     }
 
     pub(crate) fn scoped_entry_root(&self) -> Option<&Path> {
         match &self.position {
-            SmartFolderPosition::Root => None,
+            SmartFolderPosition::Root | SmartFolderPosition::Container { .. } => None,
             SmartFolderPosition::Scoped { entry_root, .. } => Some(entry_root),
         }
     }
@@ -62,21 +94,24 @@ impl SmartFolderViewState {
     #[cfg(test)]
     pub(crate) fn entry_index(&self) -> Option<usize> {
         match self.position {
-            SmartFolderPosition::Root => None,
+            SmartFolderPosition::Root | SmartFolderPosition::Container { .. } => None,
             SmartFolderPosition::Scoped { entry_index, .. } => Some(entry_index),
         }
     }
 
     fn containing_entry_index(&self, path: &Path) -> Option<usize> {
-        self.folder_entries
+        self.navigation_entries
             .iter()
-            .position(|entry| crate::folder_tree::path_eq(entry, path))
+            .position(|entry| crate::folder_tree::path_eq(&entry.logical_path, path))
             .or_else(|| {
-                self.folder_entries
+                self.navigation_entries
                     .iter()
                     .enumerate()
-                    .filter(|(_, entry)| crate::search_index_db::is_under(path, entry))
-                    .max_by_key(|(_, entry)| entry.components().count())
+                    .filter(|(_, entry)| {
+                        entry.kind == super::smart_folder::SmartChildKind::Folder
+                            && crate::search_index_db::is_under(path, &entry.logical_path)
+                    })
+                    .max_by_key(|(_, entry)| entry.logical_path.components().count())
                     .map(|(index, _)| index)
             })
     }
@@ -85,8 +120,8 @@ impl SmartFolderViewState {
     /// 通常フォルダの親復帰でいう「戻り先直下の子」に相当する entry root を解決する。
     pub(crate) fn containing_entry(&self, path: &Path) -> Option<&Path> {
         self.containing_entry_index(path)
-            .and_then(|index| self.folder_entries.get(index))
-            .map(PathBuf::as_path)
+            .and_then(|index| self.navigation_entries.get(index))
+            .map(|entry| entry.logical_path.as_path())
     }
 
     /// `path` 自体が root entry、またはその子孫なら、その entry の scoped drill を開始する。
@@ -95,11 +130,20 @@ impl SmartFolderViewState {
         let Some(entry_index) = self.containing_entry_index(path) else {
             return false;
         };
-        let entry_root = self.folder_entries[entry_index].clone();
+        let entry = &self.navigation_entries[entry_index];
+        let entry_root = entry.logical_path.clone();
+        if entry.kind != super::smart_folder::SmartChildKind::Folder {
+            self.position = SmartFolderPosition::Container {
+                root_entry: entry_root.clone(),
+                current: entry_root,
+            };
+            return true;
+        }
         self.position = SmartFolderPosition::Scoped {
             entry_index,
             entry_root: entry_root.clone(),
             current: entry_root,
+            current_kind: super::smart_folder::SmartChildKind::Folder,
             back_stack: Vec::new(),
         };
         self.move_to(path)
@@ -119,6 +163,7 @@ impl SmartFolderViewState {
         let SmartFolderPosition::Scoped {
             entry_root,
             current,
+            current_kind,
             back_stack,
             ..
         } = &mut self.position
@@ -136,6 +181,7 @@ impl SmartFolderViewState {
             .is_some_and(|parent| crate::folder_tree::path_eq(parent, path))
         {
             *current = path.to_path_buf();
+            *current_kind = super::smart_folder::SmartChildKind::Folder;
             back_stack.pop();
             return true;
         }
@@ -145,6 +191,7 @@ impl SmartFolderViewState {
         {
             back_stack.push(current.clone());
             *current = path.to_path_buf();
+            *current_kind = super::smart_folder::SmartChildKind::Folder;
             return true;
         }
         let mut lineage = Vec::new();
@@ -168,10 +215,14 @@ impl SmartFolderViewState {
         lineage.reverse();
         *back_stack = lineage;
         *current = path.to_path_buf();
+        *current_kind = super::smart_folder::SmartChildKind::Folder;
         true
     }
 
     pub(crate) fn parent_target(&self) -> Option<SmartFolderParentTarget> {
+        if matches!(self.position, SmartFolderPosition::Container { .. }) {
+            return Some(SmartFolderParentTarget::Root);
+        }
         let SmartFolderPosition::Scoped {
             entry_root,
             current,
@@ -192,29 +243,72 @@ impl SmartFolderViewState {
         }
     }
 
-    pub(crate) fn entry_at_offset(&self, forward: bool) -> Option<&Path> {
-        let index = match self.position {
+    pub(crate) fn navigation_start_index(&self, forward: bool) -> Option<usize> {
+        Some(match self.position {
             SmartFolderPosition::Root if forward => 0,
-            SmartFolderPosition::Root => self.folder_entries.len().checked_sub(1)?,
+            SmartFolderPosition::Root => self.navigation_entries.len().checked_sub(1)?,
+            SmartFolderPosition::Container { ref root_entry, .. } => {
+                let current = self.navigation_entries.iter().position(|entry| {
+                    crate::folder_tree::path_eq(&entry.logical_path, root_entry)
+                })?;
+                if forward {
+                    current.checked_add(1)?
+                } else {
+                    current.checked_sub(1)?
+                }
+            }
             SmartFolderPosition::Scoped { entry_index, .. } if forward => {
                 entry_index.checked_add(1)?
             }
             SmartFolderPosition::Scoped { entry_index, .. } => entry_index.checked_sub(1)?,
-        };
-        self.folder_entries.get(index).map(PathBuf::as_path)
+        })
+    }
+
+    pub(crate) fn navigation_entry_at_offset(&self, forward: bool) -> Option<&SmartRootNavEntry> {
+        let index = self.navigation_start_index(forward)?;
+        self.navigation_entries.get(index)
+    }
+
+    pub(crate) fn entry_at_offset(&self, forward: bool) -> Option<&Path> {
+        self.navigation_entry_at_offset(forward)
+            .map(|entry| entry.logical_path.as_path())
     }
 
     /// root 再準備後の表示順を取り込む。現在 entry が同じ path として残っていれば
     /// scope と現在地を維持し、削除・リネームで見つからなければ安全に root へ戻す。
-    pub(crate) fn refresh_folder_entries(&mut self, folder_entries: Vec<PathBuf>) -> bool {
+    pub(crate) fn refresh_navigation_entries(
+        &mut self,
+        navigation_entries: Vec<SmartRootNavEntry>,
+    ) -> bool {
         let retained_index = self.scoped_entry_root().and_then(|entry_root| {
-            folder_entries
-                .iter()
-                .position(|entry| crate::folder_tree::path_eq(entry, entry_root))
+            navigation_entries.iter().position(|entry| {
+                entry.kind == super::smart_folder::SmartChildKind::Folder
+                    && crate::folder_tree::path_eq(&entry.logical_path, entry_root)
+            })
         });
-        self.folder_entries = Arc::new(folder_entries);
+        let container_retained = match &self.position {
+            SmartFolderPosition::Container { root_entry, .. } => {
+                let old_kind = self
+                    .navigation_entries
+                    .iter()
+                    .find(|entry| crate::folder_tree::path_eq(&entry.logical_path, root_entry))
+                    .map(|entry| entry.kind);
+                navigation_entries.iter().any(|entry| {
+                    Some(entry.kind) == old_kind
+                        && entry.kind != super::smart_folder::SmartChildKind::Folder
+                        && crate::folder_tree::path_eq(&entry.logical_path, root_entry)
+                })
+            }
+            _ => false,
+        };
+        self.navigation_entries = Arc::new(navigation_entries);
         match (&mut self.position, retained_index) {
             (SmartFolderPosition::Root, _) => true,
+            (SmartFolderPosition::Container { .. }, _) if container_retained => true,
+            (SmartFolderPosition::Container { .. }, _) => {
+                self.position = SmartFolderPosition::Root;
+                false
+            }
             (SmartFolderPosition::Scoped { entry_index, .. }, Some(index)) => {
                 *entry_index = index;
                 true
@@ -224,6 +318,18 @@ impl SmartFolderViewState {
                 false
             }
         }
+    }
+
+    pub(crate) fn refresh_folder_entries(&mut self, folder_entries: Vec<PathBuf>) -> bool {
+        self.refresh_navigation_entries(
+            folder_entries
+                .into_iter()
+                .map(|logical_path| SmartRootNavEntry {
+                    logical_path,
+                    kind: super::smart_folder::SmartChildKind::Folder,
+                })
+                .collect(),
+        )
     }
 }
 
@@ -241,8 +347,824 @@ pub(crate) enum TopLevelGridRestore {
     ReadingHistory,
     Bookmarks,
     Rating { stars: u8 },
+    RatingPhysical(RatingPhysicalRestore),
     SubfolderExpansion(SubfolderExpansionRestoreState),
     SmartFolder(SmartFolderViewState),
+    Collection(CollectionGridRestore),
+    CollectionPhysical(CollectionGridPhysicalRestore),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RatingPhysicalRestore {
+    pub(crate) visible_path: PathBuf,
+    pub(crate) stars: u8,
+    pub(crate) nav_chain: Vec<PathBuf>,
+    pub(crate) saved_folder: Option<PathBuf>,
+    pub(crate) subfolder_restore: Option<SubfolderExpansionRestoreState>,
+}
+
+/// Session-only Rating position. Pixel offsets and their aspect dependency travel together.
+/// Rating rows are rebuilt, so retain the confirmed decision, not old index-keyed samples.
+#[derive(Clone, Debug)]
+pub(crate) struct RatingGridPosition {
+    pub(crate) scroll_offset_y: f32,
+    pub(crate) selected_key: Option<String>,
+    pub(crate) aspect_seed: Option<crate::auto_aspect_cache::AutoAspectCacheEntry>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CollectionGridIdentity {
+    pub(crate) collection_id: crate::collection_store::CollectionId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CollectionGridViewportAnchor {
+    pub(crate) entry_id: crate::collection_store::CollectionEntryId,
+    pub(crate) source_key: crate::collection_store::CollectionSourcePathKey,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CollectionGridRestore {
+    pub(crate) identity: CollectionGridIdentity,
+    /// Minimum revision hint. The actor may return any newer revision.
+    pub(crate) revision_at_open: u64,
+    pub(crate) viewport_anchor: Option<CollectionGridViewportAnchor>,
+}
+
+/// A visible physical child of a Collection root. The root restore keeps the stable collection
+/// and entry anchor for BS; the visible path is the independent Back/Forward location.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CollectionGridPhysicalRestore {
+    pub(crate) root: CollectionGridRestore,
+    pub(crate) root_source_path: PathBuf,
+    pub(crate) visible_path: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CollectionGridPosition {
+    Root,
+    PhysicalSource {
+        entry_id: crate::collection_store::CollectionEntryId,
+        source_key: crate::collection_store::CollectionSourcePathKey,
+        path: PathBuf,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CollectionGridRequestStamp {
+    pub(crate) context_id: super::viewer_context_registry::ViewerContextId,
+    pub(crate) surface_generation: u64,
+    pub(crate) collection_id: crate::collection_store::CollectionId,
+}
+
+/// Exact collection-grid owner captured before an asynchronous physical source open starts.
+///
+/// The surface stamp prevents a completion from crossing viewer contexts or collection
+/// replacements. Both revisions are kept because a notice may advance `wanted_revision` while
+/// the currently installed immutable binding still has `accepted_revision`.
+#[derive(Clone)]
+pub(crate) struct CollectionGridSourceOpenOwner {
+    pub(crate) stamp: CollectionGridRequestStamp,
+    pub(crate) accepted_revision: u64,
+    pub(crate) wanted_revision: u64,
+    pub(crate) anchor: CollectionGridViewportAnchor,
+    /// Exact immutable root selected by collection playback navigation. Ordinary grid opens leave
+    /// this empty; delayed archive conversion carries it until the physical-source commit.
+    pub(crate) navigation_prepared:
+        Option<std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>>,
+    pub(crate) navigation_origin: Option<CollectionGridViewportAnchor>,
+    /// Full intent and revision watch transferred from collection navigation into a delayed
+    /// archive conversion. They keep close/replacement/revision races observable after the
+    /// preflight request itself has left `collection_navigation_pending`.
+    pub(in crate::app) navigation_request:
+        Option<super::collection_navigation::CollectionNavigationRequest>,
+    pub(in crate::app) navigation_watch: Option<crate::collection_store::CollectionRevisionWatch>,
+}
+
+/// Exact authorization for one physical load that remains owned by a mounted collection.
+///
+/// `Root` opens the selected collection entry. `PhysicalSource` covers a descendant open or an
+/// in-place reload after that entry has already become the mounted physical source. An ordinary
+/// address/history/favourite navigation never receives this value, even when it targets the same
+/// path, so the common load boundary can retire the collection session deterministically.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CollectionGridPhysicalLoadOwner {
+    pub(crate) stamp: CollectionGridRequestStamp,
+    pub(crate) accepted_revision: u64,
+    pub(crate) wanted_revision: u64,
+    pub(crate) anchor: CollectionGridViewportAnchor,
+    pub(crate) root_source_path: PathBuf,
+    pub(crate) target_path: PathBuf,
+    pub(crate) origin: CollectionGridPhysicalLoadOrigin,
+    pub(crate) intent: CollectionGridPhysicalLoadIntent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CollectionGridPhysicalLoadIntent {
+    Refresh,
+    Explicit,
+    Playback,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CollectionGridPhysicalLoadOrigin {
+    Root { items_generation: u64 },
+    PhysicalSource { current_path: PathBuf },
+}
+
+impl CollectionGridPhysicalLoadOwner {
+    pub(crate) fn restore(&self, wanted_revision: u64) -> CollectionGridRestore {
+        CollectionGridRestore {
+            identity: CollectionGridIdentity {
+                collection_id: self.stamp.collection_id,
+            },
+            revision_at_open: self.accepted_revision.max(wanted_revision),
+            viewport_anchor: Some(self.anchor.clone()),
+        }
+    }
+}
+
+impl std::fmt::Debug for CollectionGridSourceOpenOwner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CollectionGridSourceOpenOwner")
+            .field("stamp", &self.stamp)
+            .field("accepted_revision", &self.accepted_revision)
+            .field("wanted_revision", &self.wanted_revision)
+            .field("anchor", &self.anchor)
+            .field(
+                "navigation_revision",
+                &self
+                    .navigation_prepared
+                    .as_ref()
+                    .map(|prepared| prepared.collection_revision),
+            )
+            .field("navigation_origin", &self.navigation_origin)
+            .field("navigation_request", &self.navigation_request)
+            .field("navigation_watch", &self.navigation_watch.is_some())
+            .finish()
+    }
+}
+
+impl PartialEq for CollectionGridSourceOpenOwner {
+    fn eq(&self, other: &Self) -> bool {
+        self.stamp == other.stamp
+            && self.accepted_revision == other.accepted_revision
+            && self.wanted_revision == other.wanted_revision
+            && self.anchor == other.anchor
+            && self.navigation_origin == other.navigation_origin
+            && self.navigation_request == other.navigation_request
+            && self.navigation_watch.is_some() == other.navigation_watch.is_some()
+            && self
+                .navigation_prepared
+                .as_ref()
+                .map(|prepared| (prepared.collection_id, prepared.collection_revision))
+                == other
+                    .navigation_prepared
+                    .as_ref()
+                    .map(|prepared| (prepared.collection_id, prepared.collection_revision))
+    }
+}
+
+impl Eq for CollectionGridSourceOpenOwner {}
+
+pub(crate) enum CollectionGridLoadState {
+    RequestNeeded {
+        installed: Option<std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>>,
+        lease: crate::collection_store::CollectionReadLease,
+    },
+    Snapshot {
+        stamp: CollectionGridRequestStamp,
+        minimum_revision: u64,
+        lease: crate::collection_store::CollectionReadLease,
+        /// Perf-only enqueue time; no effect on request ownership or scheduling.
+        queued_at: Option<std::time::Instant>,
+        installed: Option<std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>>,
+        receiver: crossbeam_channel::Receiver<
+            Result<
+                crate::collection_store::CollectionSnapshot,
+                crate::collection_store::CollectionStoreError,
+            >,
+        >,
+    },
+    Preparing {
+        stamp: CollectionGridRequestStamp,
+        exact_revision: u64,
+        lease: crate::collection_store::CollectionReadLease,
+        installed: Option<std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>>,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        receiver: std::sync::mpsc::Receiver<
+            Result<CollectionGridPreparedInstall, crate::collection_store::CollectionPrepareError>,
+        >,
+    },
+    Ready(std::sync::Arc<CollectionGridInstalledPresentation>),
+    Empty(std::sync::Arc<CollectionGridInstalledPresentation>),
+    Failed {
+        message: String,
+        installed: Option<std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>>,
+    },
+    Deleted {
+        /// Keep the displayed root identity while a fullscreen leaf still owns its indices.
+        installed: Option<std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>>,
+    },
+}
+
+pub(crate) struct CollectionGridPreparedInstall {
+    pub(crate) prepared: crate::collection_store::CollectionPreparedSnapshot,
+    pub(crate) page_edits: Option<(
+        super::page_edit_snapshot::PageEditSnapshot,
+        super::page_edit_snapshot::PageEditProjection,
+    )>,
+    pub(crate) retained_page_edits:
+        Option<std::sync::Arc<super::page_edit_snapshot::PageEditSnapshot>>,
+    pub(crate) page_edit_revision: u64,
+    pub(crate) thumbnail_sources: CollectionGridPreparedThumbnailDelivery,
+    pub(crate) auto_aspect_lookup: Option<crate::auto_aspect_cache::CollectionAutoAspectLookup>,
+    pub(crate) reuse_key: CollectionGridPrepareReuseKey,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CollectionGridThumbnailSources {
+    pub(crate) video_sidecars: std::collections::HashMap<String, PathBuf>,
+    pub(crate) video_pin_blobs: std::sync::Arc<std::collections::HashMap<PathBuf, Vec<u8>>>,
+    pub(crate) folder_pin_map:
+        std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    pub(crate) video_folder_pin_seeds: std::sync::Arc<
+        Vec<(
+            super::smart_folder::PreparedVideoFolderPinSeed,
+            Option<Vec<u8>>,
+        )>,
+    >,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CollectionGridThumbnailSourceIdentity(pub(crate) [u8; 32]);
+
+#[derive(Clone, Debug)]
+pub(crate) struct CollectionGridPreparedThumbnailSources {
+    pub(crate) identity: CollectionGridThumbnailSourceIdentity,
+    pub(crate) payload: CollectionGridThumbnailSources,
+}
+
+#[derive(Debug)]
+pub(crate) struct CollectionGridPreparedThumbnailDelivery {
+    pub(crate) presentation: CollectionGridPresentationSources,
+    pub(crate) live: CollectionGridLiveThumbnailSources,
+}
+
+#[derive(Default)]
+pub(crate) struct CollectionGridLiveThumbnailSources {
+    pub(crate) sources: CollectionGridThumbnailSources,
+    pub(crate) folder_pin_cache: std::collections::HashMap<String, crate::catalog::CacheEntry>,
+}
+
+impl std::fmt::Debug for CollectionGridLiveThumbnailSources {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CollectionGridLiveThumbnailSources")
+            .field("sources", &self.sources)
+            .field("folder_pin_cache_entries", &self.folder_pin_cache.len())
+            .finish()
+    }
+}
+
+pub(crate) const MAX_RETAINED_COLLECTION_PIN_BLOB_BYTES: usize = 64 * 1024 * 1024;
+
+pub(crate) fn collection_pin_blob_sizes_fit_retention_budget(
+    lengths: impl IntoIterator<Item = usize>,
+) -> bool {
+    lengths
+        .into_iter()
+        .try_fold(0usize, |sum, length| sum.checked_add(length))
+        .is_some_and(|total| total <= MAX_RETAINED_COLLECTION_PIN_BLOB_BYTES)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CollectionGridPrepareReuseKey {
+    pub(crate) order: crate::collection_store::CollectionPrepareReuseKey,
+    pub(crate) sidecar_scan_fingerprint: i64,
+    pub(crate) skip_image_if_video_exists: bool,
+    pub(crate) video_thumb_use_sidecar_image: bool,
+    pub(crate) pin_stamp: Option<crate::video_pins::VideoPinMutationStamp>,
+    pub(crate) folder_pin_stamp: Option<crate::folder_thumb_pins::FolderPinMutationStamp>,
+    pub(crate) folder_thumb_sort: crate::settings::SortOrder,
+    pub(crate) folder_thumb_depth: u32,
+    pub(crate) thumbnail_source_epoch: u64,
+}
+
+impl CollectionGridPrepareReuseKey {
+    pub(crate) fn new(
+        collection_id: crate::collection_store::CollectionId,
+        revision: u64,
+        settings: &crate::settings::Settings,
+        pin_stamp: Option<crate::video_pins::VideoPinMutationStamp>,
+        folder_pin_stamp: Option<crate::folder_thumb_pins::FolderPinMutationStamp>,
+        thumbnail_source_epoch: u64,
+    ) -> Self {
+        Self {
+            order: crate::collection_store::CollectionPrepareReuseKey::new(
+                collection_id,
+                revision,
+                &settings.grid_display_order,
+            ),
+            sidecar_scan_fingerprint: super::folder_scan::image_page_recognition_fingerprint(
+                settings,
+            ),
+            skip_image_if_video_exists: settings.skip_image_if_video_exists,
+            video_thumb_use_sidecar_image: settings.video_thumb_use_sidecar_image,
+            pin_stamp,
+            folder_pin_stamp,
+            folder_thumb_sort: settings.folder_thumb_sort,
+            folder_thumb_depth: settings.folder_thumb_depth,
+            thumbnail_source_epoch,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CollectionGridPresentationSources {
+    Retained(std::sync::Arc<CollectionGridPreparedThumbnailSources>),
+    Oversized(CollectionGridThumbnailSourceIdentity),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CollectionGridNavigationSources {
+    pub(crate) reuse_key: CollectionGridPrepareReuseKey,
+    pub(crate) page_edit_revision: u64,
+    pub(crate) presentation: CollectionGridPresentationSources,
+    live: std::sync::Arc<std::sync::Mutex<Option<CollectionGridLiveThumbnailSources>>>,
+    pub(crate) retained_edit_snapshot:
+        Option<std::sync::Arc<super::page_edit_snapshot::PageEditSnapshot>>,
+    page_edits: std::sync::Arc<
+        std::sync::Mutex<
+            Option<(
+                super::page_edit_snapshot::PageEditSnapshot,
+                super::page_edit_snapshot::PageEditProjection,
+            )>,
+        >,
+    >,
+}
+
+impl CollectionGridNavigationSources {
+    pub(crate) fn page_edit_stamp_is_current(&self) -> bool {
+        self.retained_edit_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.stamp)
+            .is_some_and(|stamp| crate::page_edit_write_epoch::PAGE_EDIT_WRITES.accepts(stamp))
+    }
+}
+
+impl CollectionGridNavigationSources {
+    pub(crate) fn new(
+        reuse_key: CollectionGridPrepareReuseKey,
+        page_edit_revision: u64,
+        presentation: CollectionGridPresentationSources,
+        live: Option<CollectionGridLiveThumbnailSources>,
+    ) -> Self {
+        Self {
+            reuse_key,
+            page_edit_revision,
+            presentation,
+            live: std::sync::Arc::new(std::sync::Mutex::new(live)),
+            retained_edit_snapshot: None,
+            page_edits: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    pub(crate) fn publish_page_edits(
+        &self,
+        page_edits: Option<(
+            super::page_edit_snapshot::PageEditSnapshot,
+            super::page_edit_snapshot::PageEditProjection,
+        )>,
+    ) {
+        if let Ok(mut slot) = self.page_edits.lock() {
+            *slot = page_edits;
+        }
+    }
+
+    pub(crate) fn take_page_edits(
+        &self,
+    ) -> Option<(
+        super::page_edit_snapshot::PageEditSnapshot,
+        super::page_edit_snapshot::PageEditProjection,
+    )> {
+        self.page_edits.lock().ok()?.take()
+    }
+
+    pub(crate) fn identity(&self) -> CollectionGridThumbnailSourceIdentity {
+        self.presentation.identity()
+    }
+
+    pub(crate) fn retained(
+        &self,
+    ) -> Option<&std::sync::Arc<CollectionGridPreparedThumbnailSources>> {
+        self.presentation.retained()
+    }
+
+    pub(crate) fn needs_live_delivery(&self) -> bool {
+        self.live.lock().is_ok_and(|live| live.is_none())
+    }
+
+    pub(crate) fn publish_live(&self, sources: CollectionGridLiveThumbnailSources) {
+        if let Ok(mut live) = self.live.lock()
+            && live.is_none()
+        {
+            *live = Some(sources);
+        }
+    }
+
+    pub(crate) fn take_delivery(&self) -> CollectionGridPreparedThumbnailDelivery {
+        CollectionGridPreparedThumbnailDelivery {
+            presentation: self.presentation.clone(),
+            live: self
+                .live
+                .lock()
+                .ok()
+                .and_then(|mut live| live.take())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+impl PartialEq for CollectionGridNavigationSources {
+    fn eq(&self, other: &Self) -> bool {
+        self.reuse_key == other.reuse_key && self.presentation == other.presentation
+    }
+}
+
+impl Eq for CollectionGridNavigationSources {}
+
+impl CollectionGridPresentationSources {
+    pub(crate) fn identity(&self) -> CollectionGridThumbnailSourceIdentity {
+        match self {
+            Self::Retained(sources) => sources.identity,
+            Self::Oversized(identity) => *identity,
+        }
+    }
+
+    pub(crate) fn retained(
+        &self,
+    ) -> Option<&std::sync::Arc<CollectionGridPreparedThumbnailSources>> {
+        match self {
+            Self::Retained(sources) => Some(sources),
+            Self::Oversized(_) => None,
+        }
+    }
+}
+
+impl PartialEq for CollectionGridPreparedThumbnailSources {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
+    }
+}
+
+impl Eq for CollectionGridPreparedThumbnailSources {}
+
+impl Default for CollectionGridPreparedThumbnailSources {
+    fn default() -> Self {
+        Self {
+            identity: CollectionGridThumbnailSourceIdentity::default(),
+            payload: CollectionGridThumbnailSources::default(),
+        }
+    }
+}
+
+impl Default for CollectionGridPreparedThumbnailDelivery {
+    fn default() -> Self {
+        let retained = std::sync::Arc::new(CollectionGridPreparedThumbnailSources::default());
+        Self {
+            presentation: CollectionGridPresentationSources::Retained(retained),
+            live: CollectionGridLiveThumbnailSources::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CollectionGridInstalledPresentation {
+    pub(crate) prepared: std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>,
+    pub(crate) sources: CollectionGridPresentationSources,
+    pub(crate) reuse_key: CollectionGridPrepareReuseKey,
+    pub(crate) page_edit_snapshot:
+        Option<std::sync::Arc<super::page_edit_snapshot::PageEditSnapshot>>,
+    pub(crate) page_edit_revision: u64,
+}
+
+impl PartialEq for CollectionGridInstalledPresentation {
+    fn eq(&self, other: &Self) -> bool {
+        self.prepared == other.prepared
+            && self.sources == other.sources
+            && self.reuse_key == other.reuse_key
+    }
+}
+
+impl Eq for CollectionGridInstalledPresentation {}
+
+impl CollectionGridInstalledPresentation {
+    pub(crate) fn new(
+        prepared: std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>,
+        sources: CollectionGridPresentationSources,
+        reuse_key: CollectionGridPrepareReuseKey,
+    ) -> Self {
+        Self {
+            prepared,
+            sources,
+            reuse_key,
+            page_edit_snapshot: None,
+            page_edit_revision: 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn without_thumbnail_sources(
+        prepared: std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>,
+    ) -> std::sync::Arc<Self> {
+        let settings = crate::settings::Settings::default();
+        std::sync::Arc::new(Self::new(
+            std::sync::Arc::clone(&prepared),
+            CollectionGridPresentationSources::Oversized(
+                CollectionGridThumbnailSourceIdentity::default(),
+            ),
+            CollectionGridPrepareReuseKey::new(
+                prepared.collection_id,
+                prepared.collection_revision,
+                &settings,
+                None,
+                None,
+                0,
+            ),
+        ))
+    }
+}
+
+impl CollectionGridLoadState {
+    pub(crate) fn installed(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>> {
+        match self {
+            Self::RequestNeeded { installed, .. }
+            | Self::Snapshot { installed, .. }
+            | Self::Preparing { installed, .. }
+            | Self::Failed { installed, .. } => installed.as_ref(),
+            Self::Ready(presentation) | Self::Empty(presentation) => Some(&presentation.prepared),
+            Self::Deleted { installed } => installed.as_ref(),
+        }
+    }
+
+    pub(crate) fn installed_presentation(
+        &self,
+    ) -> Option<&std::sync::Arc<CollectionGridInstalledPresentation>> {
+        match self {
+            Self::Ready(presentation) | Self::Empty(presentation) => Some(presentation),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) struct CollectionGridSession {
+    pub(crate) identity: CollectionGridIdentity,
+    pub(crate) position: CollectionGridPosition,
+    pub(crate) accepted_revision: u64,
+    pub(crate) wanted_revision: u64,
+    pub(crate) observed_catalog_revision: u64,
+    pub(crate) load: CollectionGridLoadState,
+    pub(crate) watch: Option<crate::collection_store::CollectionRevisionWatch>,
+    pub(crate) restore_anchor: Option<CollectionGridViewportAnchor>,
+    pub(crate) installed_items_generation: Option<u64>,
+    /// Collection video extraction has no queue shared with the bundle thumbnail pool. Keep its
+    /// cancellation lifetime with the collection session; image/container workers remain owned by
+    /// `ViewerContextBundle` and may be reused by another synthetic surface.
+    pub(crate) video_worker_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl CollectionGridSession {
+    fn new(identity: CollectionGridIdentity) -> Self {
+        Self {
+            identity,
+            position: CollectionGridPosition::Root,
+            accepted_revision: 0,
+            wanted_revision: 0,
+            observed_catalog_revision: 0,
+            load: CollectionGridLoadState::RequestNeeded {
+                installed: None,
+                lease: crate::collection_store::CollectionReadLease::dormant(
+                    crate::collection_store::CollectionReadScope::app_global("grid"),
+                ),
+            },
+            watch: None,
+            restore_anchor: None,
+            installed_items_generation: None,
+            video_worker_cancel: None,
+        }
+    }
+
+    pub(crate) fn cancel_pending(&mut self) {
+        let previous = std::mem::replace(
+            &mut self.load,
+            CollectionGridLoadState::RequestNeeded {
+                installed: None,
+                lease: crate::collection_store::CollectionReadLease::dormant(
+                    crate::collection_store::CollectionReadScope::app_global("grid"),
+                ),
+            },
+        );
+        log_collection_grid_pending_cancel(&previous);
+        let (installed, lease) = match previous {
+            CollectionGridLoadState::RequestNeeded {
+                installed, lease, ..
+            }
+            | CollectionGridLoadState::Snapshot {
+                installed, lease, ..
+            } => (installed, lease),
+            CollectionGridLoadState::Preparing {
+                installed,
+                lease,
+                cancel,
+                ..
+            } => {
+                cancel.store(true, std::sync::atomic::Ordering::Release);
+                (installed, lease)
+            }
+            CollectionGridLoadState::Ready(presentation)
+            | CollectionGridLoadState::Empty(presentation) => (
+                Some(std::sync::Arc::clone(&presentation.prepared)),
+                crate::collection_store::CollectionReadLease::new(
+                    crate::collection_store::CollectionReadScope::app_global("grid"),
+                    std::time::Instant::now(),
+                    "revision",
+                ),
+            ),
+            CollectionGridLoadState::Failed { installed, .. } => (
+                installed,
+                crate::collection_store::CollectionReadLease::new(
+                    crate::collection_store::CollectionReadScope::app_global("grid"),
+                    std::time::Instant::now(),
+                    "retry",
+                ),
+            ),
+            CollectionGridLoadState::Deleted { installed } => (
+                installed,
+                crate::collection_store::CollectionReadLease::new(
+                    crate::collection_store::CollectionReadScope::app_global("grid"),
+                    std::time::Instant::now(),
+                    "retry",
+                ),
+            ),
+        };
+        self.load = CollectionGridLoadState::RequestNeeded { installed, lease };
+    }
+
+    /// Invalidates only work that captured the old thumbnail-source epoch.  A
+    /// pending actor snapshot has not captured that epoch yet and keeps its
+    /// receiver/lease; terminal read states remain terminal until a real demand.
+    pub(crate) fn invalidate_thumbnail_presentation(
+        &mut self,
+    ) -> Option<std::sync::Arc<CollectionGridInstalledPresentation>> {
+        if let Some(cancel) = self.video_worker_cancel.take() {
+            cancel.store(true, std::sync::atomic::Ordering::Release);
+        }
+        let previous = std::mem::replace(
+            &mut self.load,
+            CollectionGridLoadState::Deleted { installed: None },
+        );
+        match previous {
+            CollectionGridLoadState::Ready(presentation)
+            | CollectionGridLoadState::Empty(presentation) => {
+                let installed = Some(std::sync::Arc::clone(&presentation.prepared));
+                self.load = CollectionGridLoadState::RequestNeeded {
+                    installed,
+                    lease: crate::collection_store::CollectionReadLease::new(
+                        crate::collection_store::CollectionReadScope::app_global("grid"),
+                        std::time::Instant::now(),
+                        "metadata_import",
+                    ),
+                };
+                Some(presentation)
+            }
+            CollectionGridLoadState::Preparing {
+                installed,
+                lease,
+                cancel,
+                ..
+            } => {
+                cancel.store(true, std::sync::atomic::Ordering::Release);
+                self.load = CollectionGridLoadState::RequestNeeded { installed, lease };
+                None
+            }
+            other => {
+                self.load = other;
+                None
+            }
+        }
+    }
+
+    pub(crate) fn prepared(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>> {
+        self.load.installed()
+    }
+
+    pub(crate) fn installed_presentation(
+        &self,
+    ) -> Option<&std::sync::Arc<CollectionGridInstalledPresentation>> {
+        self.load.installed_presentation()
+    }
+}
+
+impl Drop for CollectionGridSession {
+    fn drop(&mut self) {
+        log_collection_grid_pending_cancel(&self.load);
+        if let CollectionGridLoadState::Preparing { cancel, .. } = &self.load {
+            cancel.store(true, std::sync::atomic::Ordering::Release);
+        }
+        if let Some(cancel) = self.video_worker_cancel.take() {
+            cancel.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+fn log_collection_grid_pending_cancel(load: &CollectionGridLoadState) {
+    if !crate::perf::is_enabled() {
+        return;
+    }
+    match load {
+        CollectionGridLoadState::Snapshot {
+            stamp,
+            queued_at: Some(start),
+            ..
+        } => {
+            crate::perf::event(
+                "collection",
+                "actor_rtt",
+                None,
+                0,
+                &[
+                    ("operation", serde_json::Value::from("load_collection")),
+                    (
+                        "collection_id",
+                        serde_json::Value::from(stamp.collection_id.as_uuid().to_string()),
+                    ),
+                    (
+                        "request_generation",
+                        serde_json::Value::from(stamp.surface_generation),
+                    ),
+                    (
+                        "ms",
+                        serde_json::Value::from(start.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                    ("outcome", serde_json::Value::from("cancelled")),
+                ],
+            );
+        }
+        CollectionGridLoadState::Preparing {
+            stamp,
+            exact_revision,
+            ..
+        } => {
+            crate::perf::event(
+                "collection",
+                "prepare_result",
+                None,
+                0,
+                &[
+                    (
+                        "collection_id",
+                        serde_json::Value::from(stamp.collection_id.as_uuid().to_string()),
+                    ),
+                    (
+                        "request_generation",
+                        serde_json::Value::from(stamp.surface_generation),
+                    ),
+                    ("revision", serde_json::Value::from(*exact_revision)),
+                    ("outcome", serde_json::Value::from("cancelled")),
+                ],
+            );
+        }
+        _ => {}
+    }
+}
+
+impl Clone for CollectionGridSession {
+    fn clone(&self) -> Self {
+        Self {
+            identity: self.identity,
+            position: self.position.clone(),
+            accepted_revision: self.accepted_revision,
+            wanted_revision: self.wanted_revision,
+            observed_catalog_revision: self.observed_catalog_revision,
+            load: CollectionGridLoadState::RequestNeeded {
+                installed: self.load.installed().cloned(),
+                lease: crate::collection_store::CollectionReadLease::new(
+                    crate::collection_store::CollectionReadScope::app_global("grid"),
+                    std::time::Instant::now(),
+                    "context_clone",
+                ),
+            },
+            watch: None,
+            restore_anchor: self.restore_anchor.clone(),
+            installed_items_generation: self.installed_items_generation,
+            video_worker_cancel: None,
+        }
+    }
 }
 
 impl TopLevelGridRestore {
@@ -289,10 +1211,13 @@ impl TopLevelGridRestore {
             Self::ReadingHistory => Some(super::reading_history_synthetic_path()),
             Self::Bookmarks => Some(super::bookmark_view_synthetic_path()),
             Self::Rating { .. } => Some(super::rating_view_synthetic_path()),
+            Self::RatingPhysical(restore) => Some(restore.visible_path.clone()),
             Self::SubfolderExpansion(_) => Some(super::subfolder_expansion_synthetic_path()),
             Self::SmartFolder(state) => Some(super::smart_folder::smart_folder_synthetic_path(
                 state.definition_id,
             )),
+            Self::Collection(_) => None,
+            Self::CollectionPhysical(restore) => Some(restore.visible_path.clone()),
         }
     }
 
@@ -322,6 +1247,7 @@ pub(crate) enum TopLevelGridSurface {
     ReadingHistory,
     Bookmarks,
     Rating { stars: u8 },
+    Collection(CollectionGridIdentity),
 }
 
 impl super::App {
@@ -344,7 +1270,7 @@ impl super::App {
                 if self.smart_folder_busy() {
                     return;
                 }
-                self.open_smart_folder(state.definition_id, true);
+                let _ = self.refresh_smart_folder_staged(state.definition_id);
             }
             TopLevelGridSurface::SubfolderExpansion => {
                 if self.subfolder_expansion_busy() {
@@ -358,7 +1284,7 @@ impl super::App {
                 }
             }
             TopLevelGridSurface::Search(TopLevelSearchView::Global) => {
-                self.spawn_global_search();
+                self.spawn_global_search(ctx);
             }
             TopLevelGridSurface::Search(TopLevelSearchView::Favorite) => {
                 self.execute_favsearch();
@@ -366,7 +1292,7 @@ impl super::App {
             TopLevelGridSurface::Search(TopLevelSearchView::Tag) => {
                 self.open_tag_view_with_query(Some(self.tag_view.query.clone()), false);
             }
-            TopLevelGridSurface::Rating { stars } => self.enter_rating_view(stars),
+            TopLevelGridSurface::Rating { .. } => self.reload_current_rating_view_preserving_sort(),
             TopLevelGridSurface::ReadingHistory => self.enter_reading_history(),
             TopLevelGridSurface::Bookmarks => self.enter_bookmark_view(),
             TopLevelGridSurface::DriveList => {
@@ -377,13 +1303,15 @@ impl super::App {
                 self.enter_drive_list(origin);
             }
             TopLevelGridSurface::Snapshot => {}
+            TopLevelGridSurface::Collection(identity) => {
+                self.open_collection_grid(identity.collection_id, None);
+            }
         }
 
         if self.settings.folder_tree_pane_visible {
             self.folder_pane.reload_for_active(
                 folder_pane_active.as_deref(),
-                self.settings.sort_order,
-                self.settings.show_hidden_files,
+                crate::folder_pane::FolderPaneListingOptions::from_settings(&self.settings),
             );
         }
     }
@@ -393,11 +1321,33 @@ pub(crate) struct TopLevelGridView {
     surface: TopLevelGridSurface,
     return_to: Option<TopLevelGridRestore>,
     generation: u64,
+    /// At most five star lists, owned by this viewer context's navigation session.
+    rating_grid_positions: std::collections::HashMap<u8, RatingGridPosition>,
     /// The completed smart-folder result has exactly the same lifetime as this surface plus
     /// descendants opened from it. `begin` is an explicit top-level transition and always drops
     /// the old session; `replace_surface` preserves it only while the same smart-folder surface
     /// owns the navigation scope.
     smart_folder_session: Option<super::smart_folder::SmartFolderSession>,
+    collection_session: Option<CollectionGridSession>,
+    /// Playback/navigation work belongs to this exact viewer context. It is deliberately not
+    /// cloned into duplicated contexts; dropping/replacing a surface cancels its workers.
+    collection_navigation_pending:
+        Option<super::collection_navigation::CollectionNavigationPending>,
+    /// History replay preparation travels with its viewer bundle during park/mount and is never
+    /// copied into a sibling context. The transition owns its cancellation and old-view intent.
+    history_navigation_transition: Option<Box<super::HistoryNavigationTransition>>,
+    /// Classification is a cancellable candidate, separate from the accepted history owner.
+    /// Its worker may finish while an earlier owner remains active.
+    open_path_classification: Option<Box<super::OpenPathClassification>>,
+    /// Monotonic intent identity for collection playback requests in this viewer context.
+    /// Navigation producers and terminal actions advance it so an index ABA cannot make an old
+    /// asynchronous result current again.
+    collection_navigation_sequence: u64,
+    /// A surface transition can retire a pending fullscreen request while `TopLevelGridView` is
+    /// mutably borrowed on its own. App consumes this bit at the next poll and releases the shared
+    /// fullscreen-navigation lock through the normal terminal path.
+    collection_navigation_retired_fs_lock: bool,
+    collection_navigation_retired_pdf_password: bool,
 }
 
 impl Clone for TopLevelGridView {
@@ -406,10 +1356,29 @@ impl Clone for TopLevelGridView {
             surface: self.surface.clone(),
             return_to: self.return_to.clone(),
             generation: self.generation,
+            // A duplicated viewer does not inherit another context's navigation positions.
+            rating_grid_positions: Default::default(),
             // Context duplication may copy the visible grid identity for an independent viewer,
             // but the main smart-folder result remains owned by the main top-level surface.
             smart_folder_session: None,
+            collection_session: self.collection_session.clone(),
+            collection_navigation_pending: None,
+            history_navigation_transition: None,
+            open_path_classification: None,
+            collection_navigation_sequence: self.collection_navigation_sequence,
+            collection_navigation_retired_fs_lock: false,
+            collection_navigation_retired_pdf_password: false,
         }
+    }
+}
+
+impl Drop for TopLevelGridView {
+    fn drop(&mut self) {
+        if let Some(pending) = self.collection_navigation_pending.as_ref() {
+            pending.cancel();
+        }
+        self.history_navigation_transition.take();
+        self.open_path_classification.take();
     }
 }
 
@@ -434,14 +1403,91 @@ impl Default for TopLevelGridView {
             surface: TopLevelGridSurface::Folder,
             return_to: None,
             generation: 0,
+            rating_grid_positions: Default::default(),
             smart_folder_session: None,
+            collection_session: None,
+            collection_navigation_pending: None,
+            history_navigation_transition: None,
+            open_path_classification: None,
+            collection_navigation_sequence: 0,
+            collection_navigation_retired_fs_lock: false,
+            collection_navigation_retired_pdf_password: false,
         }
     }
 }
 
 impl TopLevelGridView {
+    pub(crate) fn save_rating_grid_position(&mut self, stars: u8, position: RatingGridPosition) {
+        self.rating_grid_positions
+            .insert(stars.clamp(1, 5), position);
+    }
+
+    pub(crate) fn rating_grid_position(&self, stars: u8) -> Option<&RatingGridPosition> {
+        self.rating_grid_positions.get(&stars)
+    }
+
+    pub(crate) fn clear_rating_grid_positions(&mut self) {
+        self.rating_grid_positions.clear();
+    }
+
     pub(crate) fn surface(&self) -> &TopLevelGridSurface {
         &self.surface
+    }
+
+    pub(crate) fn history_navigation_transition(
+        &self,
+    ) -> Option<&super::HistoryNavigationTransition> {
+        self.history_navigation_transition.as_deref()
+    }
+
+    pub(crate) fn history_navigation_transition_mut(
+        &mut self,
+    ) -> Option<&mut super::HistoryNavigationTransition> {
+        self.history_navigation_transition.as_deref_mut()
+    }
+
+    pub(crate) fn take_history_navigation_transition(
+        &mut self,
+    ) -> Option<super::HistoryNavigationTransition> {
+        self.history_navigation_transition
+            .take()
+            .map(|transition| *transition)
+    }
+
+    pub(crate) fn set_history_navigation_transition(
+        &mut self,
+        transition: Option<super::HistoryNavigationTransition>,
+    ) {
+        self.history_navigation_transition = transition.map(Box::new);
+    }
+
+    pub(crate) fn set_open_path_classification(
+        &mut self,
+        candidate: Option<super::OpenPathClassification>,
+    ) {
+        self.open_path_classification = candidate.map(Box::new);
+    }
+
+    pub(crate) fn take_open_path_classification(
+        &mut self,
+    ) -> Option<super::OpenPathClassification> {
+        self.open_path_classification
+            .take()
+            .map(|candidate| *candidate)
+    }
+
+    pub(crate) fn open_path_classification(&self) -> Option<&super::OpenPathClassification> {
+        self.open_path_classification.as_deref()
+    }
+
+    pub(crate) fn open_path_classification_mut(
+        &mut self,
+    ) -> Option<&mut super::OpenPathClassification> {
+        self.open_path_classification.as_deref_mut()
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub(crate) fn begin(
@@ -450,7 +1496,16 @@ impl TopLevelGridView {
         return_to: Option<TopLevelGridRestore>,
     ) -> u64 {
         self.generation = self.generation.wrapping_add(1);
+        self.advance_collection_navigation_sequence();
         self.smart_folder_session = None;
+        self.set_collection_navigation_pending(None);
+        self.history_navigation_transition.take();
+        self.collection_session = match &surface {
+            TopLevelGridSurface::Collection(identity) => {
+                Some(CollectionGridSession::new(*identity))
+            }
+            _ => None,
+        };
         self.surface = surface;
         self.return_to = return_to;
         self.generation
@@ -465,9 +1520,18 @@ impl TopLevelGridView {
             ) if session.definition_id() == state.definition_id
         );
         self.generation = self.generation.wrapping_add(1);
+        self.advance_collection_navigation_sequence();
         if !keeps_smart_folder_session {
             self.smart_folder_session = None;
         }
+        self.set_collection_navigation_pending(None);
+        self.history_navigation_transition.take();
+        self.collection_session = match &surface {
+            TopLevelGridSurface::Collection(identity) => {
+                Some(CollectionGridSession::new(*identity))
+            }
+            _ => None,
+        };
         self.surface = surface;
         self.return_to = None;
         self.generation
@@ -475,13 +1539,128 @@ impl TopLevelGridView {
 
     pub(crate) fn take_return_to(&mut self) -> Option<TopLevelGridRestore> {
         self.generation = self.generation.wrapping_add(1);
+        self.advance_collection_navigation_sequence();
         self.smart_folder_session = None;
+        self.set_collection_navigation_pending(None);
+        self.history_navigation_transition.take();
+        self.collection_session = None;
         self.surface = TopLevelGridSurface::Folder;
         self.return_to.take()
     }
 
     pub(crate) fn return_to(&self) -> Option<&TopLevelGridRestore> {
         self.return_to.as_ref()
+    }
+
+    /// Installs a return owner captured by the source context into a newly-built physical viewer.
+    /// This does not change the new context's current surface or generation.
+    pub(crate) fn install_return_to(&mut self, return_to: TopLevelGridRestore) {
+        self.return_to = Some(return_to);
+    }
+
+    pub(crate) fn collection_session(&self) -> Option<&CollectionGridSession> {
+        self.collection_session.as_ref()
+    }
+
+    pub(crate) fn collection_session_mut(&mut self) -> Option<&mut CollectionGridSession> {
+        self.collection_session.as_mut()
+    }
+
+    pub(crate) fn collection_navigation_pending(&self) -> bool {
+        self.collection_navigation_pending.is_some()
+    }
+
+    #[cfg(test)]
+    pub(in crate::app) fn collection_navigation_pending_for_test(
+        &self,
+    ) -> Option<&super::collection_navigation::CollectionNavigationPending> {
+        self.collection_navigation_pending.as_ref()
+    }
+
+    pub(in crate::app) fn collection_navigation_owns_fs_lock(&self) -> bool {
+        self.collection_navigation_pending
+            .as_ref()
+            .is_some_and(|pending| pending.owns_fs_navigation_lock())
+    }
+
+    pub(in crate::app) fn collection_navigation_owns_pdf_password(&self) -> bool {
+        self.collection_navigation_pending
+            .as_ref()
+            .is_some_and(|pending| pending.is_pdf_password())
+    }
+
+    pub(in crate::app) fn advance_collection_navigation_sequence(&mut self) -> u64 {
+        self.collection_navigation_sequence = self.collection_navigation_sequence.wrapping_add(1);
+        if self.collection_navigation_sequence == 0 {
+            self.collection_navigation_sequence = 1;
+        }
+        self.collection_navigation_sequence
+    }
+
+    pub(in crate::app) fn collection_navigation_sequence(&self) -> u64 {
+        self.collection_navigation_sequence
+    }
+
+    pub(in crate::app) fn collection_navigation_poll_delay(&self) -> Option<std::time::Duration> {
+        self.collection_navigation_pending
+            .as_ref()
+            .and_then(|pending| pending.poll_delay())
+    }
+
+    pub(in crate::app) fn take_collection_navigation_retired_fs_lock(&mut self) -> bool {
+        std::mem::take(&mut self.collection_navigation_retired_fs_lock)
+    }
+
+    pub(in crate::app) fn take_collection_navigation_retired_pdf_password(&mut self) -> bool {
+        std::mem::take(&mut self.collection_navigation_retired_pdf_password)
+    }
+
+    pub(crate) fn accumulate_collection_outer_navigation(
+        &mut self,
+        fullscreen: bool,
+        forward: bool,
+    ) -> bool {
+        self.collection_navigation_pending
+            .as_mut()
+            .is_some_and(|pending| pending.accumulate_outer(fullscreen, forward))
+    }
+
+    pub(in crate::app) fn accumulate_collection_manual_navigation(
+        &mut self,
+        delta: i32,
+        landing: super::ManualMediaNavigationLanding,
+        still_only: bool,
+        display_unit_step: bool,
+    ) -> bool {
+        self.collection_navigation_pending
+            .as_mut()
+            .is_some_and(|pending| {
+                pending.accumulate_manual(delta, landing, still_only, display_unit_step)
+            })
+    }
+
+    pub(crate) fn set_collection_outer_queued_steps(&mut self, steps: i32) {
+        if let Some(pending) = self.collection_navigation_pending.as_mut() {
+            pending.set_outer_queued_steps(steps);
+        }
+    }
+
+    pub(in crate::app) fn set_collection_navigation_pending(
+        &mut self,
+        pending: Option<super::collection_navigation::CollectionNavigationPending>,
+    ) {
+        if let Some(previous) = std::mem::replace(&mut self.collection_navigation_pending, pending)
+        {
+            self.collection_navigation_retired_fs_lock |= previous.owns_fs_navigation_lock();
+            self.collection_navigation_retired_pdf_password |= previous.is_pdf_password();
+            previous.cancel();
+        }
+    }
+
+    pub(in crate::app) fn take_collection_navigation_pending(
+        &mut self,
+    ) -> Option<super::collection_navigation::CollectionNavigationPending> {
+        self.collection_navigation_pending.take()
     }
 
     pub(crate) fn smart_folder(&self) -> Option<&SmartFolderViewState> {
@@ -543,6 +1722,7 @@ mod tests {
 
     #[test]
     fn smart_folder_scope_never_accepts_sibling_escape() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let id = uuid::Uuid::new_v4();
         let root = PathBuf::from(r"C:\books\entry");
         let mut state = SmartFolderViewState::root(id, vec![root.clone()]);
@@ -554,6 +1734,7 @@ mod tests {
 
     #[test]
     fn smart_folder_parent_returns_root_without_filesystem_escape() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let id = uuid::Uuid::new_v4();
         let root = PathBuf::from(r"C:\books\entry");
         let mut state = SmartFolderViewState::root(id, vec![root.clone()]);
@@ -568,6 +1749,7 @@ mod tests {
 
     #[test]
     fn smart_folder_entry_order_moves_between_root_entries() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let id = uuid::Uuid::new_v4();
         let first = PathBuf::from(r"C:\books\first");
         let second = PathBuf::from(r"D:\library\second");
@@ -584,7 +1766,72 @@ mod tests {
     }
 
     #[test]
+    fn smart_root_navigation_uses_one_display_order_for_folders_and_books() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        use super::super::smart_folder::SmartChildKind;
+        let id = uuid::Uuid::new_v4();
+        let folder = PathBuf::from(r"C:\books\folder");
+        let nested_pdf = folder.join("nested.pdf");
+        let pdf = PathBuf::from(r"C:\books\book.pdf");
+        let zip = PathBuf::from(r"C:\books\book.zip");
+        let archive = PathBuf::from(r"C:\books\book.7z");
+        let entries = vec![
+            SmartRootNavEntry {
+                logical_path: folder.clone(),
+                kind: SmartChildKind::Folder,
+            },
+            SmartRootNavEntry {
+                logical_path: nested_pdf.clone(),
+                kind: SmartChildKind::Pdf,
+            },
+            SmartRootNavEntry {
+                logical_path: pdf.clone(),
+                kind: SmartChildKind::Pdf,
+            },
+            SmartRootNavEntry {
+                logical_path: zip.clone(),
+                kind: SmartChildKind::Zip,
+            },
+            SmartRootNavEntry {
+                logical_path: archive.clone(),
+                kind: SmartChildKind::ConvertibleArchive,
+            },
+        ];
+        let mut state = SmartFolderViewState::root_with_navigation_entries(id, entries.clone());
+        assert_eq!(state.entry_at_offset(true), Some(folder.as_path()));
+        assert_eq!(state.entry_at_offset(false), Some(archive.as_path()));
+        assert!(state.enter_containing_path(&nested_pdf));
+        assert!(
+            matches!(state.position, SmartFolderPosition::Container { .. }),
+            "an exact root book must win over its ancestor Folder"
+        );
+        assert_eq!(state.entry_at_offset(true), Some(pdf.as_path()));
+        assert_eq!(state.entry_at_offset(false), Some(folder.as_path()));
+        assert!(state.enter_containing_path(&folder.join("chapter")));
+        assert_eq!(state.entry_at_offset(true), Some(nested_pdf.as_path()));
+        // A nested book may also have its own root row. The two entries are distinct
+        // navigation contexts; re-entering it as a root row advances the index and is finite.
+        assert!(state.move_to(&nested_pdf));
+        assert_eq!(state.entry_at_offset(true), Some(nested_pdf.as_path()));
+        assert!(state.enter_containing_path(&nested_pdf));
+        assert_eq!(state.entry_at_offset(true), Some(pdf.as_path()));
+
+        assert!(state.enter_containing_path(&folder.join("chapter")));
+
+        let mut reordered = entries;
+        reordered.swap(1, 2);
+        assert!(state.refresh_navigation_entries(reordered));
+        assert_eq!(state.entry_at_offset(true), Some(pdf.as_path()));
+        assert!(!state.refresh_navigation_entries(vec![SmartRootNavEntry {
+            logical_path: zip,
+            kind: SmartChildKind::Zip,
+        }]));
+        assert!(matches!(state.position, SmartFolderPosition::Root));
+    }
+
+    #[test]
     fn smart_folder_refresh_reorders_retained_scope_and_drops_deleted_or_renamed_scope() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let id = uuid::Uuid::new_v4();
         let first = PathBuf::from(r"C:\books\first");
         let second = PathBuf::from(r"D:\library\second");
@@ -601,6 +1848,7 @@ mod tests {
 
     #[test]
     fn smart_folder_enters_most_specific_root_for_a_descendant() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let id = uuid::Uuid::new_v4();
         let parent = PathBuf::from(r"C:\books");
         let entry = parent.join("series");
@@ -614,6 +1862,7 @@ mod tests {
 
     #[test]
     fn direct_top_level_transition_transfers_one_return_owner() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let origin = TopLevelGridRestore::Folder(PathBuf::from(r"D:\origin"));
         let mut view = TopLevelGridView::default();
         let first = view.begin(
@@ -633,7 +1882,204 @@ mod tests {
     }
 
     #[test]
+    fn physical_restore_variants_keep_visible_path_and_distinct_origin() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let root = CollectionGridRestore {
+            identity: CollectionGridIdentity {
+                collection_id: crate::collection_store::CollectionId::new(),
+            },
+            revision_at_open: 7,
+            viewport_anchor: None,
+        };
+        let child = PathBuf::from(r"C:\books\child");
+        let collection = TopLevelGridRestore::CollectionPhysical(CollectionGridPhysicalRestore {
+            root,
+            root_source_path: child.clone(),
+            visible_path: child.clone(),
+        });
+        assert_eq!(collection.legacy_path().as_deref(), Some(child.as_path()));
+
+        let rating = TopLevelGridRestore::RatingPhysical(RatingPhysicalRestore {
+            visible_path: child.clone(),
+            stars: 3,
+            nav_chain: vec![child.clone()],
+            saved_folder: Some(PathBuf::from(r"C:\prior")),
+            subfolder_restore: None,
+        });
+        assert_eq!(rating.legacy_path().as_deref(), Some(child.as_path()));
+        assert_eq!(rating.rating_stars(), None);
+    }
+
+    #[test]
+    fn retiring_collection_surface_cancels_only_its_preparing_worker() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let first_id = crate::collection_store::CollectionId::new();
+        let sibling_id = crate::collection_store::CollectionId::new();
+        let first_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sibling_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_first_tx, first_rx) = std::sync::mpsc::sync_channel(1);
+        let (_sibling_tx, sibling_rx) = std::sync::mpsc::sync_channel(1);
+        let stamp = |collection_id| CollectionGridRequestStamp {
+            context_id: super::super::viewer_context_registry::ViewerContextId::for_test(1),
+            surface_generation: 1,
+            collection_id,
+        };
+
+        let mut first = TopLevelGridView::default();
+        first.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: first_id,
+            }),
+            None,
+        );
+        first.collection_session_mut().unwrap().load = CollectionGridLoadState::Preparing {
+            stamp: stamp(first_id),
+            exact_revision: 1,
+            lease: crate::collection_store::CollectionReadLease::new(
+                crate::collection_store::CollectionReadScope::app_global("grid-test"),
+                std::time::Instant::now(),
+                "prepare",
+            ),
+            installed: None,
+            cancel: Arc::clone(&first_cancel),
+            receiver: first_rx,
+        };
+
+        let mut sibling = TopLevelGridView::default();
+        sibling.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: sibling_id,
+            }),
+            None,
+        );
+        sibling.collection_session_mut().unwrap().load = CollectionGridLoadState::Preparing {
+            stamp: stamp(sibling_id),
+            exact_revision: 1,
+            lease: crate::collection_store::CollectionReadLease::new(
+                crate::collection_store::CollectionReadScope::app_global("grid-test"),
+                std::time::Instant::now(),
+                "prepare",
+            ),
+            installed: None,
+            cancel: Arc::clone(&sibling_cancel),
+            receiver: sibling_rx,
+        };
+
+        first.replace_surface(TopLevelGridSurface::Folder);
+        assert!(first_cancel.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!sibling_cancel.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn thumbnail_epoch_invalidation_preserves_unstarted_reads_and_terminal_states() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let collection_id = crate::collection_store::CollectionId::new();
+        let identity = CollectionGridIdentity { collection_id };
+        let mut session = CollectionGridSession::new(identity);
+        let request_lease = crate::collection_store::CollectionReadLease::new(
+            crate::collection_store::CollectionReadScope::app_global("grid-test"),
+            std::time::Instant::now(),
+            "snapshot",
+        );
+        let request_id = request_lease.request_id();
+        session.load = CollectionGridLoadState::RequestNeeded {
+            installed: None,
+            lease: request_lease,
+        };
+        assert!(session.invalidate_thumbnail_presentation().is_none());
+        assert!(matches!(
+            &session.load,
+            CollectionGridLoadState::RequestNeeded { lease, .. }
+                if lease.request_id() == request_id
+        ));
+
+        let snapshot_lease = crate::collection_store::CollectionReadLease::new(
+            crate::collection_store::CollectionReadScope::app_global("grid-test"),
+            std::time::Instant::now(),
+            "snapshot",
+        );
+        let snapshot_request_id = snapshot_lease.request_id();
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        session.load = CollectionGridLoadState::Snapshot {
+            stamp: CollectionGridRequestStamp {
+                context_id: super::super::viewer_context_registry::ViewerContextId::for_test(1),
+                surface_generation: 1,
+                collection_id,
+            },
+            minimum_revision: 1,
+            lease: snapshot_lease,
+            queued_at: None,
+            installed: None,
+            receiver,
+        };
+        assert!(session.invalidate_thumbnail_presentation().is_none());
+        sender
+            .send(Err(crate::collection_store::CollectionStoreError::Busy))
+            .unwrap();
+        assert!(matches!(
+            &session.load,
+            CollectionGridLoadState::Snapshot {
+                lease, receiver, ..
+            } if lease.request_id() == snapshot_request_id
+                && matches!(receiver.try_recv(), Ok(Err(crate::collection_store::CollectionStoreError::Busy)))
+        ));
+
+        session.load = CollectionGridLoadState::Failed {
+            message: "terminal".into(),
+            installed: None,
+        };
+        assert!(session.invalidate_thumbnail_presentation().is_none());
+        assert!(matches!(
+            &session.load,
+            CollectionGridLoadState::Failed { message, .. } if message == "terminal"
+        ));
+        session.load = CollectionGridLoadState::Deleted { installed: None };
+        assert!(session.invalidate_thumbnail_presentation().is_none());
+        assert!(matches!(
+            session.load,
+            CollectionGridLoadState::Deleted { .. }
+        ));
+    }
+
+    #[test]
+    fn thumbnail_epoch_invalidation_cancels_only_an_already_preparing_payload() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let collection_id = crate::collection_store::CollectionId::new();
+        let mut session = CollectionGridSession::new(CollectionGridIdentity { collection_id });
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let lease = crate::collection_store::CollectionReadLease::new(
+            crate::collection_store::CollectionReadScope::app_global("grid-test"),
+            std::time::Instant::now(),
+            "prepare",
+        );
+        let request_id = lease.request_id();
+        session.load = CollectionGridLoadState::Preparing {
+            stamp: CollectionGridRequestStamp {
+                context_id: super::super::viewer_context_registry::ViewerContextId::for_test(1),
+                surface_generation: 1,
+                collection_id,
+            },
+            exact_revision: 1,
+            lease,
+            installed: None,
+            cancel: Arc::clone(&cancel),
+            receiver,
+        };
+
+        assert!(session.invalidate_thumbnail_presentation().is_none());
+
+        assert!(cancel.load(std::sync::atomic::Ordering::Acquire));
+        assert!(matches!(
+            &session.load,
+            CollectionGridLoadState::RequestNeeded { lease, .. }
+                if lease.request_id() == request_id
+        ));
+    }
+
+    #[test]
     fn bookmark_synthetic_path_restores_bookmark_surface() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         // `bookmark_view_synthetic_path` reads the process-global data dir, and this test
         // reads it twice -- once to build the restore and once to compare. Another test
         // swapping `set_test_override` in between makes the two disagree, so take the

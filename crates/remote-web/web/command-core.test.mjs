@@ -65,6 +65,7 @@ import {
   nextFitMode,
   pagePrefetchFailurePlan,
   pageAdmissionRetryDelayMs,
+  pageRequestIsDemandCongestion,
   pageDecodeAheadUnitIndexes,
   pagePrefetchHudPlan,
   pagePrefetchIndicatorSummary,
@@ -1437,6 +1438,65 @@ test("spread layout fits the combined pages and preserves the configured gap", (
     spreadNearSquareRequest.pages[0].requestWidth <
       singleNearSquareRequest.pages[0].requestWidth * 0.51
   );
+});
+
+test("singleton spread layout reserves one empty peer slot without requesting another page", () => {
+  const page = { width: 1200, height: 1800 };
+  for (const singletonPlacement of ["left", "right"]) {
+    const fitted = viewerSpreadLayout({
+      mode: FitMode.PAGE,
+      pages: [page],
+      viewportWidth: 1600,
+      viewportHeight: 1000,
+      devicePixelRatio: 2,
+      gap: 20,
+      singletonPlacement,
+    });
+    assert.equal(fitted.pages.length, 1);
+    assert.equal(fitted.singletonPlacement, singletonPlacement);
+    assert.equal(fitted.gap, 20);
+    assert.equal(Math.round(fitted.pages[0].cssWidth), 667);
+    assert.equal(Math.round(fitted.pages[0].cssHeight), 1000);
+    assert.equal(Math.round(fitted.cssWidth), 1353);
+    assert.equal(fitted.pages[0].requestWidth, 1334);
+
+    const width = viewerSpreadLayout({
+      mode: FitMode.WIDTH,
+      pages: [page],
+      viewportWidth: 1600,
+      viewportHeight: 1000,
+      devicePixelRatio: 2,
+      gap: 20,
+      singletonPlacement,
+    });
+    assert.equal(Math.round(width.cssWidth), 1600);
+    assert.ok(width.pages[0].cssHeight > 1000);
+
+    const original = viewerSpreadLayout({
+      mode: FitMode.ORIGINAL,
+      pages: [page],
+      viewportWidth: 1600,
+      viewportHeight: 1000,
+      devicePixelRatio: 2,
+      gap: 20,
+      singletonPlacement,
+    });
+    assert.equal(original.pages[0].cssWidth, 1200);
+    assert.equal(original.pages[0].requestWidth, 1200);
+    assert.equal(original.cssWidth, 2420);
+  }
+
+  const invalid = viewerSpreadLayout({
+    mode: FitMode.PAGE,
+    pages: [page],
+    viewportWidth: 1600,
+    viewportHeight: 1000,
+    devicePixelRatio: 2,
+    gap: 20,
+    singletonPlacement: "unknown",
+  });
+  assert.equal(invalid.singletonPlacement, "center");
+  assert.equal(invalid.gap, 0);
 });
 
 test("page display slots follow the physical left-to-right group order", () => {
@@ -3035,6 +3095,16 @@ test("admission retry honours Retry-After and stays within a usable range", () =
   assert.equal(pageAdmissionRetryDelayMs(60_000, 0), 2000);
   assert.equal(pageAdmissionRetryDelayMs(1, 0), 100);
   assert.equal(pageAdmissionRetryDelayMs("bad", 0), 250);
+});
+
+test("only named admission and RAW capacity errors allow demand-scoped retry", () => {
+  for (const code of ["ipc_busy", "admission_busy", "raw_busy"]) {
+    assert.equal(pageRequestIsDemandCongestion(503, code), true);
+  }
+  for (const code of ["miv_media_error", "ipc_timeout", "other"]) {
+    assert.equal(pageRequestIsDemandCongestion(503, code), false);
+  }
+  assert.equal(pageRequestIsDemandCongestion(409, "raw_busy"), false);
 });
 
 test("a drifted visual viewport is pulled back and recorded", () => {

@@ -55,7 +55,7 @@ pub(super) fn format_details_duration(secs: f64) -> String {
 }
 
 #[cfg(windows)]
-pub(super) fn format_details_timestamp(secs: i64, show_seconds: bool) -> String {
+pub(crate) fn format_details_timestamp(secs: i64, show_seconds: bool) -> String {
     if secs <= 0 {
         return String::new();
     }
@@ -96,7 +96,7 @@ pub(super) fn format_details_timestamp(secs: i64, show_seconds: bool) -> String 
 }
 
 #[cfg(not(windows))]
-pub(super) fn format_details_timestamp(secs: i64, _show_seconds: bool) -> String {
+pub(crate) fn format_details_timestamp(secs: i64, _show_seconds: bool) -> String {
     if secs <= 0 {
         String::new()
     } else {
@@ -152,6 +152,20 @@ pub(super) fn facet_kind_for_item(item: &GridItem) -> crate::settings::FacetItem
         GridItem::ZipDir { .. } => FacetItemKind::Folder,
         // ファイル名スタックの集約セルは画像の集まりなので Image バケツ (= 画像絞り込みで残る)。
         GridItem::Stack { .. } => FacetItemKind::Image,
+        GridItem::CollectionPlaceholder {
+            last_known_kind, ..
+        } => match last_known_kind {
+            crate::collection_store::CollectionResolvedKind::Folder => FacetItemKind::Folder,
+            crate::collection_store::CollectionResolvedKind::Image
+            | crate::collection_store::CollectionResolvedKind::Unresolved => FacetItemKind::Image,
+            crate::collection_store::CollectionResolvedKind::Video => FacetItemKind::Video,
+            crate::collection_store::CollectionResolvedKind::Audio => FacetItemKind::Audio,
+            crate::collection_store::CollectionResolvedKind::Zip => FacetItemKind::Zip,
+            crate::collection_store::CollectionResolvedKind::Pdf => FacetItemKind::Pdf,
+            crate::collection_store::CollectionResolvedKind::ConvertibleArchive => {
+                FacetItemKind::Archive
+            }
+        },
     }
 }
 
@@ -173,10 +187,11 @@ pub(super) fn facet_ext_for_item(item: &GridItem) -> String {
             .unwrap_or("")
             .to_ascii_lowercase(),
         GridItem::PdfPage { .. } => "pdf".to_string(),
+        GridItem::CollectionPlaceholder { path, .. } => path_extension_lower(path),
     }
 }
 
-pub(super) fn tag_item_path(item: &GridItem) -> Option<&Path> {
+pub(crate) fn tag_item_path(item: &GridItem) -> Option<&Path> {
     match item {
         GridItem::Folder(p)
         | GridItem::Image(p)
@@ -385,6 +400,9 @@ enum DetailsMetaIoStage {
     ImageDimensionsArchive,
     VideoProbe,
     AudioProbe,
+    MediaCatalogRead,
+    MediaCatalogWrite,
+    MediaSourceStamp,
     ContainerCatalogOpen,
     ZipCatalogRead,
     ZipEnumerate,
@@ -435,6 +453,17 @@ impl From<()> for DetailsPageCountError {
     }
 }
 
+fn details_pdf_catalog_stamp(
+    read: Option<&crate::pdf_loader::ReadTarget>,
+    source_mtime: i64,
+    source_size: i64,
+) -> Result<(i64, i64), DetailsPageCountError> {
+    match read {
+        Some(read) => read.stamp.generation_catalog_pair().ok_or(().into()),
+        None => Ok((source_mtime, source_size)),
+    }
+}
+
 fn record_details_meta_worker_exit(generation: u64, exit: DetailsMetaWorkerExit) {
     match exit {
         DetailsMetaWorkerExit::Completed => {}
@@ -470,6 +499,7 @@ pub(super) fn run_details_meta_load(
     initial_failed: usize,
     total: usize,
     cache_dir: PathBuf,
+    catalog_admission: crate::catalog::CatalogAdmission,
     io_sem: Arc<crate::io_semaphore::GlobalIoSemaphore>,
     cancel: Arc<AtomicBool>,
     tx: mpsc::Sender<DetailsMetaEvent>,
@@ -484,6 +514,7 @@ pub(super) fn run_details_meta_load(
         initial_failed,
         total,
         cache_dir,
+        catalog_admission,
         io_sem,
         cancel,
         tx,
@@ -502,6 +533,7 @@ fn run_details_meta_load_inner(
     initial_failed: usize,
     total: usize,
     cache_dir: PathBuf,
+    catalog_admission: crate::catalog::CatalogAdmission,
     io_sem: Arc<crate::io_semaphore::GlobalIoSemaphore>,
     cancel: Arc<AtomicBool>,
     tx: mpsc::Sender<DetailsMetaEvent>,
@@ -548,7 +580,7 @@ fn run_details_meta_load_inner(
         PathBuf,
         Option<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
     > = std::collections::HashMap::new();
-    let mut container_catalogs = ContainerCatalogCache::new(8);
+    let mut container_catalogs = ContainerCatalogCache::new_admitted(8, catalog_admission);
 
     loop {
         if cancel.load(Ordering::Relaxed) {
@@ -603,7 +635,7 @@ fn run_details_meta_load_inner(
         } else {
             None
         };
-        let mut video_probe: Option<DetailsVideoProbe> = None;
+        let mut video_probe = DetailsMediaProbeOutcome::Unreadable;
         if target.load_page_count {
             match load_details_page_count(
                 &target,
@@ -765,7 +797,7 @@ fn run_details_meta_load_inner(
                             ("extract_ms", serde_json::Value::from(item_extract_ms)),
                             ("source", serde_json::Value::from(ai_source)),
                             ("ext", serde_json::Value::from(ai_ext.as_str())),
-                            ("source_size", serde_json::Value::from(target.source_size)),
+                            ("source_size", serde_json::Value::from(target.source_size())),
                             ("priority", serde_json::Value::from(target.priority as u8)),
                         ],
                     );
@@ -800,7 +832,7 @@ fn run_details_meta_load_inner(
                             ),
                         );
                     };
-                    crate::catalog::CatalogDb::open(&cache_dir, folder)
+                    crate::catalog::CatalogDb::open_admitted(&cache_dir, folder, catalog_admission)
                         .and_then(|db| db.load_all())
                         .ok()
                 };
@@ -811,7 +843,7 @@ fn run_details_meta_load_inner(
                 .and_then(|m| m.as_ref())
                 .and_then(|m| m.get(key))
                 .filter(|entry| {
-                    entry.mtime == target.source_mtime && entry.file_size == target.source_size
+                    entry.mtime == target.source_mtime() && entry.file_size == target.source_size()
                 })
                 .and_then(|entry| entry.source_dims);
         }
@@ -830,9 +862,12 @@ fn run_details_meta_load_inner(
                     if !relative_page_bytes_loaded {
                         relative_page_bytes = provenance.read_verified().ok();
                     }
-                    relative_page_bytes
-                        .as_deref()
-                        .and_then(crate::fast_resize::probe_dims_from_bytes)
+                    relative_page_bytes.as_deref().and_then(|bytes| {
+                        crate::fast_resize::probe_dims_from_bytes(
+                            bytes,
+                            path.extension().and_then(|ext| ext.to_str()).unwrap_or(""),
+                        )
+                    })
                 } else {
                     crate::fast_resize::probe_dims(path)
                 }
@@ -862,7 +897,7 @@ fn run_details_meta_load_inner(
             }
             dims = zip_entry_bytes
                 .as_deref()
-                .and_then(probe_image_dims_from_bytes);
+                .and_then(|bytes| probe_image_dims_from_bytes(bytes, entry_name));
         }
 
         if target.load_image_dims
@@ -878,31 +913,37 @@ fn run_details_meta_load_inner(
         }
 
         if target.load_video_meta {
-            if let GridItem::Video(path) = &target.item {
-                video_probe = {
-                    let Some(_permit) = io_sem.acquire_cancellable(target.priority, &cancel) else {
-                        return DetailsMetaWorkerExit::Cancelled(
-                            DetailsMetaCancelReason::PermitWait(DetailsMetaIoStage::VideoProbe),
-                        );
-                    };
-                    probe_video_details(path, &cancel)
-                };
-            } else if let GridItem::Audio(path) = &target.item {
-                // 音声は長さ / コーデックだけを cancel・deadline 対応の probe で取る
-                // (解像度は無い)。DetailsVideoProbe の dims=None で流用する。
-                video_probe = {
-                    let Some(_permit) = io_sem.acquire_cancellable(target.priority, &cancel) else {
-                        return DetailsMetaWorkerExit::Cancelled(
-                            DetailsMetaCancelReason::PermitWait(DetailsMetaIoStage::AudioProbe),
-                        );
-                    };
-                    probe_audio_details(path, &cancel)
-                };
+            match load_details_video_meta_with_probe(
+                &target,
+                &cache_dir,
+                &mut container_catalogs,
+                &io_sem,
+                &cancel,
+                |path, audio, cancel| {
+                    if audio {
+                        probe_audio_details(path, cancel)
+                    } else {
+                        probe_video_details(path, cancel)
+                    }
+                },
+            ) {
+                Ok(outcome) => video_probe = outcome,
+                Err(reason) => return DetailsMetaWorkerExit::Cancelled(reason),
             }
         }
 
         if cancel.load(Ordering::Relaxed) {
             return DetailsMetaWorkerExit::Cancelled(DetailsMetaCancelReason::BeforePublish);
+        }
+        // Media values belong to the captured source identity, including cache
+        // hits. Revalidate at the event publication boundary as well as in the
+        // loader, after any catalog writer wait.
+        if target.load_video_meta {
+            match details_media_source_is_current(&target, &io_sem, &cancel) {
+                Ok(false) => video_probe = DetailsMediaProbeOutcome::Interrupted,
+                Ok(true) => {}
+                Err(reason) => return DetailsMetaWorkerExit::Cancelled(reason),
+            }
         }
         let image_dims_failed = matches!(
             &target.item,
@@ -911,7 +952,7 @@ fn run_details_meta_load_inner(
             && dims.is_none();
         let video_meta_failed = target.load_video_meta
             && matches!(target.item, GridItem::Video(_) | GridItem::Audio(_))
-            && video_probe.is_none();
+            && !matches!(video_probe, DetailsMediaProbeOutcome::Read(_));
         let created_at_failed = target.load_created_at && created_at.is_none();
         let item_failed =
             page_count_failed || image_dims_failed || video_meta_failed || created_at_failed;
@@ -919,12 +960,9 @@ fn run_details_meta_load_inner(
             failed += 1;
             failed_indices[target.idx] = true;
         }
-        let (video_duration_secs, video_dims, video_codec) = video_probe
-            .map(|probe| (probe.duration_secs, probe.dims, probe.codec))
-            .unwrap_or((None, None, None));
         let mut meta = DetailsLazyMeta {
-            source_mtime: target.source_mtime,
-            source_size: target.source_size,
+            source_mtime: target.source_mtime(),
+            source_size: target.source_size(),
             ..Default::default()
         };
         if target.load_created_at {
@@ -947,10 +985,13 @@ fn run_details_meta_load_inner(
             meta.image_dims_failed = image_dims_failed;
         }
         if target.load_video_meta {
-            meta.video_duration_secs = video_duration_secs;
-            meta.video_dims = video_dims;
-            meta.video_codec = video_codec;
-            meta.video_meta_failed = video_meta_failed;
+            meta.media = match video_probe {
+                DetailsMediaProbeOutcome::Read(probe) => DetailsMediaMeta::Read(probe),
+                DetailsMediaProbeOutcome::Unreadable => DetailsMediaMeta::Unreadable,
+                DetailsMediaProbeOutcome::Interrupted => {
+                    DetailsMediaMeta::RetryLater { generation }
+                }
+            };
         }
         if tx
             .send(DetailsMetaEvent::Item {
@@ -1145,8 +1186,7 @@ mod relative_page_tests {
             key: "relative-page".to_string(),
             item,
             relative_page_provenance: Some(provenance),
-            source_mtime: 1,
-            source_size: 1,
+            source_identity: Some((1, 1)),
             catalog_folder: None,
             catalog_key: None,
             warm_image_dims: None,
@@ -1168,6 +1208,7 @@ mod relative_page_tests {
             0,
             1,
             temp.path().join("cache"),
+            crate::catalog::CatalogAccess::for_cache_dir(&temp.path().join("cache")).admit(),
             Arc::new(crate::io_semaphore::GlobalIoSemaphore::new(1)),
             Arc::new(AtomicBool::new(false)),
             tx,
@@ -1198,6 +1239,51 @@ fn load_details_page_count(
     cancel: &Arc<AtomicBool>,
     config: &DetailsPageCountConfig,
 ) -> Result<Option<u32>, DetailsPageCountError> {
+    load_details_page_count_with_pdf_enumerator(
+        target,
+        cache_dir,
+        catalogs,
+        io_sem,
+        cancel,
+        config,
+        |path, read, password, cancel| {
+            let pages = if let Some(read) = read {
+                crate::pdf_loader::enumerate_pages_with_read_target(
+                    path,
+                    read,
+                    password,
+                    Some(Arc::clone(cancel)),
+                    crate::pdf_loader::EnumerateOptions::default(),
+                )
+                .map(|result| result.pages)
+            } else {
+                crate::pdf_loader::enumerate_pages_with_cancel(
+                    path,
+                    password,
+                    Some(Arc::clone(cancel)),
+                )
+            }
+            .map_err(|_| ())?;
+            u32::try_from(pages.len()).map_err(|_| ())
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_details_page_count_with_pdf_enumerator(
+    target: &DetailsMetaTarget,
+    cache_dir: &Path,
+    catalogs: &mut ContainerCatalogCache,
+    io_sem: &crate::io_semaphore::GlobalIoSemaphore,
+    cancel: &Arc<AtomicBool>,
+    config: &DetailsPageCountConfig,
+    enumerate_pdf: impl FnOnce(
+        &Path,
+        Option<&crate::pdf_loader::ReadTarget>,
+        Option<&str>,
+        &Arc<AtomicBool>,
+    ) -> Result<u32, ()>,
+) -> Result<Option<u32>, DetailsPageCountError> {
     if cancel.load(Ordering::Relaxed) {
         return Err(DetailsPageCountError::Cancelled(
             DetailsMetaCancelReason::BeforeTarget,
@@ -1211,11 +1297,11 @@ fn load_details_page_count(
     // Metadata acquisition can fail during directory enumeration.  In that case
     // a zero identity is not safe for persistent reuse, so compute the value but
     // deliberately skip both lookup and writeback.
-    let identity_is_cacheable = target.source_mtime > 0
+    let identity_is_cacheable = target.source_mtime() > 0
         && match &target.item {
-            GridItem::ZipFile(_) | GridItem::PdfFile(_) => target.source_size > 0,
+            GridItem::ZipFile(_) | GridItem::PdfFile(_) => target.source_size() > 0,
             GridItem::Folder(_) => true,
-            GridItem::ConvertibleArchive { .. } => target.source_size > 0,
+            GridItem::ConvertibleArchive { .. } => target.source_size() > 0,
             _ => false,
         };
     // The catalog is only an optimization.  A corrupt/unwritable cache must not
@@ -1240,8 +1326,8 @@ fn load_details_page_count(
                     catalog.get_container_page_meta(
                         key,
                         crate::catalog::ContainerPageKind::Zip,
-                        target.source_mtime,
-                        target.source_size,
+                        target.source_mtime(),
+                        target.source_size(),
                         config.fingerprint,
                     )
                 };
@@ -1272,8 +1358,8 @@ fn load_details_page_count(
                 let _ = catalog.set_container_page_meta(
                     key,
                     crate::catalog::ContainerPageKind::Zip,
-                    target.source_mtime,
-                    target.source_size,
+                    target.source_mtime(),
+                    target.source_size(),
                     config.fingerprint,
                     Some(count),
                 );
@@ -1294,8 +1380,8 @@ fn load_details_page_count(
                     catalog.get_container_page_meta(
                         key,
                         crate::catalog::ContainerPageKind::Folder,
-                        target.source_mtime,
-                        target.source_size,
+                        target.source_mtime(),
+                        target.source_size(),
                         options.fingerprint,
                     )
                 };
@@ -1325,8 +1411,8 @@ fn load_details_page_count(
                 let _ = catalog.set_container_page_meta(
                     key,
                     crate::catalog::ContainerPageKind::Folder,
-                    target.source_mtime,
-                    target.source_size,
+                    target.source_mtime(),
+                    target.source_size(),
                     options.fingerprint,
                     count,
                 );
@@ -1347,8 +1433,8 @@ fn load_details_page_count(
                     catalog.get_container_page_meta(
                         key,
                         crate::catalog::ContainerPageKind::Archive,
-                        target.source_mtime,
-                        target.source_size,
+                        target.source_mtime(),
+                        target.source_size(),
                         config.fingerprint,
                     )
                 };
@@ -1380,8 +1466,8 @@ fn load_details_page_count(
                 let _ = catalog.set_container_page_meta(
                     key,
                     crate::catalog::ContainerPageKind::Archive,
-                    target.source_mtime,
-                    target.source_size,
+                    target.source_mtime(),
+                    target.source_size(),
                     config.fingerprint,
                     count,
                 );
@@ -1392,6 +1478,20 @@ fn load_details_page_count(
             // DPAPI 復号は metadata worker 上で行う。UI thread は暗号化ストアと
             // credential revision の snapshot だけを渡す。
             let pdf_password = config.pdf_passwords.get(path);
+            let epub_read = if path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+            {
+                Some(crate::pdf_loader::resolve_read_target(path).map_err(|_| ())?)
+            } else {
+                None
+            };
+            let (stamp_mtime, stamp_size) = details_pdf_catalog_stamp(
+                epub_read.as_ref(),
+                target.source_mtime(),
+                target.source_size(),
+            )?;
             if let Some(catalog) = catalog {
                 let cached = {
                     let Some(_permit) = io_sem.acquire_cancellable(target.priority, cancel) else {
@@ -1399,7 +1499,7 @@ fn load_details_page_count(
                             DetailsMetaCancelReason::PermitWait(DetailsMetaIoStage::PdfCatalogRead),
                         ));
                     };
-                    catalog.get_pdf_meta(key, target.source_mtime, target.source_size)
+                    catalog.get_pdf_meta(key, stamp_mtime, stamp_size)
                 };
                 if let Ok(Some((count, password_required))) = cached {
                     if password_required && pdf_password.is_none() {
@@ -1410,25 +1510,19 @@ fn load_details_page_count(
                     }
                 }
             }
-            let pages = {
+            let count = {
                 let Some(_permit) = io_sem.acquire_cancellable(target.priority, cancel) else {
                     return Err(DetailsPageCountError::Cancelled(
                         DetailsMetaCancelReason::PermitWait(DetailsMetaIoStage::PdfEnumerate),
                     ));
                 };
-                crate::pdf_loader::enumerate_pages_with_cancel(
-                    path,
-                    pdf_password.as_deref(),
-                    Some(Arc::clone(cancel)),
-                )
-                .map_err(|_| ())?
+                enumerate_pdf(path, epub_read.as_ref(), pdf_password.as_deref(), cancel)?
             };
             if cancel.load(Ordering::Relaxed) {
                 return Err(DetailsPageCountError::Cancelled(
                     DetailsMetaCancelReason::AfterIo(DetailsMetaIoStage::PdfEnumerate),
                 ));
             }
-            let count = u32::try_from(pages.len()).map_err(|_| ())?;
             if count == 0 {
                 return Ok(None);
             }
@@ -1440,8 +1534,8 @@ fn load_details_page_count(
                 };
                 let _ = catalog.set_pdf_meta(
                     key,
-                    target.source_mtime,
-                    target.source_size,
+                    stamp_mtime,
+                    stamp_size,
                     count,
                     pdf_password.is_some(),
                 );
@@ -1457,14 +1551,24 @@ fn load_details_page_count(
 /// parent folder until the entire metadata job finishes.
 struct ContainerCatalogCache {
     capacity: usize,
+    admission: crate::catalog::CatalogAdmission,
     entries: std::collections::HashMap<PathBuf, Option<crate::catalog::CatalogDb>>,
     lru: std::collections::VecDeque<PathBuf>,
 }
 
 impl ContainerCatalogCache {
-    fn new(capacity: usize) -> Self {
+    #[cfg(test)]
+    fn new(capacity: usize, cache_dir: &Path) -> Self {
+        Self::new_admitted(
+            capacity,
+            crate::catalog::CatalogAccess::for_cache_dir(cache_dir).admit(),
+        )
+    }
+
+    fn new_admitted(capacity: usize, admission: crate::catalog::CatalogAdmission) -> Self {
         Self {
             capacity: capacity.max(1),
+            admission,
             entries: std::collections::HashMap::new(),
             lru: std::collections::VecDeque::new(),
         }
@@ -1488,7 +1592,7 @@ impl ContainerCatalogCache {
                         DetailsMetaIoStage::ContainerCatalogOpen,
                     ));
                 };
-                crate::catalog::CatalogDb::open(cache_dir, folder).ok()
+                crate::catalog::CatalogDb::open_admitted(cache_dir, folder, self.admission).ok()
             };
             self.entries.insert(folder.to_path_buf(), opened);
         }
@@ -1503,7 +1607,13 @@ impl ContainerCatalogCache {
     }
 }
 
-pub(crate) fn probe_image_dims_from_bytes(bytes: &[u8]) -> Option<(u32, u32)> {
+pub(crate) fn probe_image_dims_from_bytes(bytes: &[u8], hint: &str) -> Option<(u32, u32)> {
+    if crate::raw_format::is_raw_path(std::path::Path::new(hint)) {
+        let dims = crate::raw::raw_decoder::info(crate::raw::RawSource::Bytes(bytes))
+            .ok()?
+            .developed_dims;
+        return Some((dims[0], dims[1]));
+    }
     let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .ok()?;
@@ -1542,79 +1652,313 @@ pub(super) fn details_created_time_path(item: &GridItem) -> Option<&Path> {
         }
         // ファイル名スタック: 代表画像の作成日時を使う (実ファイル)。
         GridItem::Stack { representative, .. } => Some(representative.as_path()),
-        GridItem::ZipImage { .. } | GridItem::ZipDir { .. } | GridItem::PdfPage { .. } => None,
+        GridItem::ZipImage { .. }
+        | GridItem::ZipDir { .. }
+        | GridItem::PdfPage { .. }
+        | GridItem::CollectionPlaceholder { .. } => None,
     }
 }
 
-pub(super) fn probe_video_details(path: &Path, cancel: &AtomicBool) -> Option<DetailsVideoProbe> {
-    use ffmpeg::media::Type as MediaType;
-    use ffmpeg_the_third as ffmpeg;
+pub(super) enum DetailsMediaProbeOutcome {
+    Read(DetailsVideoProbe),
+    Unreadable,
+    /// Cancellation, deadline expiry, transient I/O and obsolete identities do
+    /// not establish a persistent failure.
+    Interrupted,
+}
 
-    ffmpeg::init().ok()?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let input = ffmpeg::format::input_with_interrupt(path, move || {
-        cancel.load(Ordering::Relaxed) || std::time::Instant::now() >= deadline
-    })
-    .ok()?;
-    if cancel.load(Ordering::Relaxed) {
-        return None;
-    }
-    let duration_secs = details_duration_to_secs(input.duration());
-    let video_stream = input.streams().best(MediaType::Video)?;
-    let params = video_stream.parameters();
-    let codec = params.id().name().to_string();
-    let ctx = ffmpeg::codec::context::Context::from_parameters(params).ok()?;
-    if cancel.load(Ordering::Relaxed) {
-        return None;
-    }
-    let decoder = ctx.decoder().video().ok()?;
-    let dims = match (decoder.width(), decoder.height()) {
-        (w, h) if w > 0 && h > 0 => Some((w, h)),
-        _ => None,
+fn details_media_source_is_current(
+    target: &DetailsMetaTarget,
+    io_sem: &crate::io_semaphore::GlobalIoSemaphore,
+    cancel: &AtomicBool,
+) -> Result<bool, DetailsMetaCancelReason> {
+    let Some(identity) = target.source_identity else {
+        return Ok(true);
     };
-    Some(DetailsVideoProbe {
-        duration_secs,
-        dims,
-        codec: (!codec.is_empty()).then_some(codec),
-    })
+    let path = match &target.item {
+        GridItem::Video(path) | GridItem::Audio(path) => path,
+        _ => return Ok(true),
+    };
+    let Some(_permit) = io_sem.acquire_cancellable(target.priority, cancel) else {
+        return Err(DetailsMetaCancelReason::PermitWait(
+            DetailsMetaIoStage::MediaSourceStamp,
+        ));
+    };
+    let current = crate::catalog::media_source_identity(path) == Some(identity);
+    if cancel.load(Ordering::Relaxed) {
+        return Err(DetailsMetaCancelReason::AfterIo(
+            DetailsMetaIoStage::MediaSourceStamp,
+        ));
+    }
+    Ok(current)
 }
 
-/// 詳細ビューの遅延メタ用に音声ファイルの長さ / コーデックだけを probe する
-/// (`probe_video_details` の音声版)。`probe_audio_file` と違い cancel トークン +
-/// 10 秒 deadline を持つ (`input_with_interrupt`) ので、詳細ワーカーがフォルダ移動で
-/// cancel された際に stale なワーカー + I/O セマフォ permit を掴んだままにならない
-/// (Codex P2)。解像度は音声に無いので `dims = None`。長さもコーデックも取れなければ
-/// 表示できる値が無いので `None` を返し、呼び出し側で `video_meta_failed` が立って
-/// "-" に落ちる (Codex P3、"..." で固着しない)。
-pub(super) fn probe_audio_details(path: &Path, cancel: &AtomicBool) -> Option<DetailsVideoProbe> {
+fn load_details_video_meta_with_probe(
+    target: &DetailsMetaTarget,
+    cache_dir: &Path,
+    catalogs: &mut ContainerCatalogCache,
+    io_sem: &crate::io_semaphore::GlobalIoSemaphore,
+    cancel: &AtomicBool,
+    probe: impl FnOnce(&Path, bool, &AtomicBool) -> DetailsMediaProbeOutcome,
+) -> Result<DetailsMediaProbeOutcome, DetailsMetaCancelReason> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(DetailsMetaCancelReason::BeforeTarget);
+    }
+    let (path, audio, stage) = match &target.item {
+        GridItem::Video(path) => (path, false, DetailsMetaIoStage::VideoProbe),
+        GridItem::Audio(path) => (path, true, DetailsMetaIoStage::AudioProbe),
+        _ => return Ok(DetailsMediaProbeOutcome::Unreadable),
+    };
+    // Unavailable enumeration stamps must not become reusable zero identities.
+    // Missing keys or an unavailable DB leave the original probe path intact.
+    let catalog_identity = target
+        .catalog_folder
+        .as_ref()
+        .zip(target.catalog_key.as_deref())
+        .filter(|_| target.source_identity.is_some());
+    let catalog = if let Some((folder, _)) = catalog_identity {
+        catalogs.get_or_open(cache_dir, folder, io_sem, target.priority, cancel)?
+    } else {
+        None
+    };
+    if let (Some(catalog), Some((_, key))) = (catalog, catalog_identity) {
+        let cached = {
+            let Some(_permit) = io_sem.acquire_cancellable(target.priority, cancel) else {
+                return Err(DetailsMetaCancelReason::PermitWait(
+                    DetailsMetaIoStage::MediaCatalogRead,
+                ));
+            };
+            catalog.get_video_meta(key, target.source_mtime(), target.source_size())
+        };
+        if cancel.load(Ordering::Relaxed) {
+            return Err(DetailsMetaCancelReason::AfterIo(
+                DetailsMetaIoStage::MediaCatalogRead,
+            ));
+        }
+        if let Ok(Some(cached)) = cached {
+            if !details_media_source_is_current(target, io_sem, cancel)? {
+                return Ok(DetailsMediaProbeOutcome::Interrupted);
+            }
+            let outcome = match cached {
+                crate::catalog::VideoMeta::Read {
+                    duration_secs,
+                    dims,
+                    codec,
+                } => DetailsMediaProbeOutcome::Read(DetailsVideoProbe {
+                    duration_secs,
+                    dims,
+                    codec,
+                }),
+                crate::catalog::VideoMeta::Unreadable => DetailsMediaProbeOutcome::Unreadable,
+            };
+            media_metadata_perf(target, "media_cache_hit", &outcome, None);
+            return Ok(outcome);
+        }
+    }
+    let started = crate::perf::is_enabled().then(std::time::Instant::now);
+    let outcome = {
+        let Some(_permit) = io_sem.acquire_cancellable(target.priority, cancel) else {
+            return Err(DetailsMetaCancelReason::PermitWait(stage));
+        };
+        probe(path, audio, cancel)
+    };
+    media_metadata_perf(target, "media_probe", &outcome, started);
+    if cancel.load(Ordering::Relaxed) {
+        return Err(DetailsMetaCancelReason::AfterIo(stage));
+    }
+    if !details_media_source_is_current(target, io_sem, cancel)? {
+        return Ok(DetailsMediaProbeOutcome::Interrupted);
+    }
+    if let (Some(catalog), Some((_, key))) = (catalog, catalog_identity) {
+        let persisted = match &outcome {
+            DetailsMediaProbeOutcome::Read(probe) => Some(crate::catalog::VideoMeta::Read {
+                duration_secs: probe.duration_secs,
+                dims: probe.dims,
+                codec: probe.codec.clone(),
+            }),
+            DetailsMediaProbeOutcome::Unreadable => Some(crate::catalog::VideoMeta::Unreadable),
+            DetailsMediaProbeOutcome::Interrupted => None,
+        };
+        if let Some(persisted) = persisted {
+            let Some(_permit) = io_sem.acquire_cancellable(target.priority, cancel) else {
+                return Err(DetailsMetaCancelReason::PermitWait(
+                    DetailsMetaIoStage::MediaCatalogWrite,
+                ));
+            };
+            let saved = catalog.set_video_meta(
+                path,
+                key,
+                target.source_mtime(),
+                target.source_size(),
+                &persisted,
+                cancel,
+            );
+            if cancel.load(Ordering::Relaxed) {
+                return Err(DetailsMetaCancelReason::AfterIo(
+                    DetailsMetaIoStage::MediaCatalogWrite,
+                ));
+            }
+            if matches!(saved, Ok(false)) {
+                return Ok(DetailsMediaProbeOutcome::Interrupted);
+            }
+        }
+    }
+    Ok(
+        if details_media_source_is_current(target, io_sem, cancel)? {
+            outcome
+        } else {
+            DetailsMediaProbeOutcome::Interrupted
+        },
+    )
+}
+
+fn media_metadata_perf(
+    target: &DetailsMetaTarget,
+    event: &str,
+    outcome: &DetailsMediaProbeOutcome,
+    started: Option<std::time::Instant>,
+) {
+    if crate::perf::is_enabled() {
+        crate::perf::event(
+            "details_meta",
+            event,
+            Some(&target.key),
+            0,
+            &[
+                (
+                    "outcome",
+                    serde_json::Value::from(match outcome {
+                        DetailsMediaProbeOutcome::Read(_) => "read",
+                        DetailsMediaProbeOutcome::Unreadable => "unreadable",
+                        DetailsMediaProbeOutcome::Interrupted => "interrupted",
+                    }),
+                ),
+                (
+                    "ms",
+                    serde_json::Value::from(
+                        started.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                ),
+                (
+                    "audio",
+                    serde_json::Value::from(matches!(target.item, GridItem::Audio(_))),
+                ),
+            ],
+        );
+    }
+}
+
+/// Owns interruption classification across the FFmpeg callback and final result.
+/// The latch preserves a callback interruption even if FFmpeg later returns success.
+struct DetailsProbeInterrupt<'a> {
+    cancel: &'a AtomicBool,
+    deadline: std::time::Instant,
+    interrupted: std::cell::Cell<bool>,
+}
+
+impl DetailsProbeInterrupt<'_> {
+    fn should_interrupt(&self) -> bool {
+        if self.cancel.load(Ordering::Relaxed) || std::time::Instant::now() >= self.deadline {
+            self.interrupted.set(true);
+        }
+        self.interrupted.get()
+    }
+
+    fn finish(
+        &self,
+        result: Result<DetailsVideoProbe, ffmpeg_the_third::Error>,
+    ) -> DetailsMediaProbeOutcome {
+        if self.should_interrupt() {
+            DetailsMediaProbeOutcome::Interrupted
+        } else {
+            match result {
+                Ok(result) => DetailsMediaProbeOutcome::Read(result),
+                Err(
+                    ffmpeg_the_third::Error::InvalidData
+                    | ffmpeg_the_third::Error::DecoderNotFound
+                    | ffmpeg_the_third::Error::DemuxerNotFound
+                    | ffmpeg_the_third::Error::StreamNotFound,
+                ) => DetailsMediaProbeOutcome::Unreadable,
+                // Only file-content errors are eligible for the negative cache.
+                // In particular errno, access, missing files, and unknown errors
+                // remain retryable even when FFmpeg did not invoke the callback.
+                Err(_) => DetailsMediaProbeOutcome::Interrupted,
+            }
+        }
+    }
+}
+
+pub(super) fn probe_video_details(path: &Path, cancel: &AtomicBool) -> DetailsMediaProbeOutcome {
+    probe_media_details(path, cancel, false)
+}
+
+/// Audio retains the same duration/codec semantics and stores NULL dimensions.
+pub(super) fn probe_audio_details(path: &Path, cancel: &AtomicBool) -> DetailsMediaProbeOutcome {
+    probe_media_details(path, cancel, true)
+}
+
+fn probe_media_details(path: &Path, cancel: &AtomicBool, audio: bool) -> DetailsMediaProbeOutcome {
     use ffmpeg::media::Type as MediaType;
     use ffmpeg_the_third as ffmpeg;
 
-    ffmpeg::init().ok()?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let input = ffmpeg::format::input_with_interrupt(path, move || {
-        cancel.load(Ordering::Relaxed) || std::time::Instant::now() >= deadline
-    })
-    .ok()?;
-    if cancel.load(Ordering::Relaxed) {
-        return None;
+    let interrupt = DetailsProbeInterrupt {
+        cancel,
+        deadline: std::time::Instant::now() + std::time::Duration::from_secs(10),
+        interrupted: std::cell::Cell::new(false),
+    };
+    if interrupt.should_interrupt() {
+        return DetailsMediaProbeOutcome::Interrupted;
     }
-    let duration_secs = details_duration_to_secs(input.duration());
-    let audio_stream = input.streams().best(MediaType::Audio)?;
-    let codec = audio_stream.parameters().id().name().to_string();
-    let codec = (!codec.is_empty()).then_some(codec);
-    if duration_secs.is_none() && codec.is_none() {
-        return None;
+    // Initialization failure says nothing definitive about this file.
+    if ffmpeg::init().is_err() {
+        return DetailsMediaProbeOutcome::Interrupted;
     }
-    Some(DetailsVideoProbe {
-        duration_secs,
-        dims: None,
-        codec,
-    })
+    let result = (|| {
+        let input = ffmpeg::format::input_with_interrupt(path, || interrupt.should_interrupt())?;
+        if interrupt.should_interrupt() {
+            return Err(ffmpeg::Error::Exit);
+        }
+        let duration_secs = details_duration_to_secs(input.duration());
+        let stream = input
+            .streams()
+            .best(if audio {
+                MediaType::Audio
+            } else {
+                MediaType::Video
+            })
+            .ok_or(ffmpeg::Error::StreamNotFound)?;
+        let params = stream.parameters();
+        let codec = params.id().name().to_string();
+        let codec = (!codec.is_empty()).then_some(codec);
+        let dims = if audio {
+            if duration_secs.is_none() && codec.is_none() {
+                return Err(ffmpeg::Error::InvalidData);
+            }
+            None
+        } else {
+            let ctx = ffmpeg::codec::context::Context::from_parameters(params)?;
+            if interrupt.should_interrupt() {
+                return Err(ffmpeg::Error::Exit);
+            }
+            let decoder = ctx.decoder().video()?;
+            match (decoder.width(), decoder.height()) {
+                (w, h) if w > 0 && h > 0 => Some((w, h)),
+                _ => None,
+            }
+        };
+        Ok(DetailsVideoProbe {
+            duration_secs,
+            dims,
+            codec,
+        })
+    })();
+    interrupt.finish(result)
 }
 
-pub(super) fn ctrl_f_progress_total(items: &[GridItem]) -> usize {
-    items.len()
+pub(super) fn ctrl_f_progress_total(items: &[GridItem], eligible: Option<&[bool]>) -> usize {
+    eligible
+        .map(|flags| flags.iter().take(items.len()).filter(|&&flag| flag).count())
+        .unwrap_or(items.len())
 }
 
 pub(super) fn mark_ctrl_f_progress(progress: Option<&SearchProgressShared>, matched: bool) {
@@ -1813,6 +2157,7 @@ impl MetadataSearchPass2<'_> {
 pub(super) fn run_metadata_search(
     tokens: &[crate::search_query::Token],
     items: &[GridItem],
+    eligible: Option<&[bool]>,
     xmp_snapshot: &std::collections::HashMap<String, Option<crate::xmp_reader::XmpTweetInfo>>,
     _fts_meta: Option<&std::sync::Arc<crate::fts_meta::FtsMetaDb>>,
     pdf_passwords: &crate::pdf_passwords::PdfPasswordStore,
@@ -1829,6 +2174,7 @@ pub(super) fn run_metadata_search(
     let pass1_started = total_started;
     let mut matches: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut scanned_items = 0_usize;
+    let eligible_total = ctrl_f_progress_total(items, eligible);
 
     // §19 target フィルタ: target が含むソースだけを判定対象にする。
     let use_name = target.includes(crate::fts_index::SourceKind::Filename);
@@ -1854,6 +2200,9 @@ pub(super) fn run_metadata_search(
         if cancel.load(Ordering::Relaxed) {
             break;
         }
+        if eligible.is_some_and(|flags| !flags.get(idx).copied().unwrap_or(false)) {
+            continue;
+        }
         let processed_in_pass1 = match item {
             GridItem::Folder(_)
             | GridItem::ZipFile(_)
@@ -1868,39 +2217,61 @@ pub(super) fn run_metadata_search(
                 }
                 true
             }
+            GridItem::CollectionPlaceholder { .. } => {
+                if use_name && crate::search_query::matches_with_mode(tokens, &item.name(), mode) {
+                    matches.insert(idx);
+                }
+                true
+            }
             GridItem::PdfFile(path) => {
-                // PDF: ファイル名 + PDF document info を 1 つの hay にまとめて判定する
-                // (§4.1.1)。filename と title をまたぐクエリや exclude トークンを
-                // 正しく扱うため、Image/Video と同じ combined-hay 方式にする
-                // (2 つの hay を別々に matches すると "scan invoice" や
-                // "scan -draft" を取りこぼす — Codex P2)。まずファイル名だけで
-                // 部分判定し、結論が出れば document info の IPC を省く。
-                let name = item.name();
-                let name_hay: &str = if use_name { &name } else { "" };
-                if use_pdf_meta {
-                    match crate::search_query::decide_partial_with_mode(tokens, name_hay, mode) {
-                        crate::search_query::PartialResult::Decided(true) => {
-                            matches.insert(idx);
-                        }
-                        crate::search_query::PartialResult::Decided(false) => {}
-                        crate::search_query::PartialResult::NeedsMore => {
-                            // 保護 PDF でパスワード未保存なら get_document_info は
-                            // 失敗 → doc_text 空 = ファイル名のみで判定 (= 非マッチ)。
-                            let password = pdf_passwords.get(path);
-                            let doc_text =
-                                crate::pdf_loader::get_document_info(path, password.as_deref())
-                                    .map(|info| info.as_search_text())
-                                    .unwrap_or_default();
-                            let hay = hay_of(&doc_text, name_hay, None);
-                            if crate::search_query::matches_with_mode(tokens, &hay, mode) {
+                // EPUB は変換済みでも内部タイトル・著者を検索しない。
+                // 元ファイル名だけを対象にし、PDF Info の worker 要求も出さない。
+                if path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("epub"))
+                {
+                    if use_name
+                        && crate::search_query::matches_with_mode(tokens, &item.name(), mode)
+                    {
+                        matches.insert(idx);
+                    }
+                } else {
+                    // PDF: ファイル名 + PDF document info を 1 つの hay にまとめて判定する
+                    // (§4.1.1)。filename と title をまたぐクエリや exclude トークンを
+                    // 正しく扱うため、Image/Video と同じ combined-hay 方式にする
+                    // (2 つの hay を別々に matches すると "scan invoice" や
+                    // "scan -draft" を取りこぼす — Codex P2)。まずファイル名だけで
+                    // 部分判定し、結論が出れば document info の IPC を省く。
+                    let name = item.name();
+                    let name_hay: &str = if use_name { &name } else { "" };
+                    if use_pdf_meta {
+                        match crate::search_query::decide_partial_with_mode(tokens, name_hay, mode)
+                        {
+                            crate::search_query::PartialResult::Decided(true) => {
                                 matches.insert(idx);
                             }
+                            crate::search_query::PartialResult::Decided(false) => {}
+                            crate::search_query::PartialResult::NeedsMore => {
+                                // 保護 PDF でパスワード未保存なら get_document_info は
+                                // 失敗 → doc_text 空 = ファイル名のみで判定 (= 非マッチ)。
+                                let password = pdf_passwords.get(path);
+                                let doc_text =
+                                    crate::pdf_loader::get_document_info(path, password.as_deref())
+                                        .map(|info| info.as_search_text())
+                                        .unwrap_or_default();
+                                let hay = hay_of(&doc_text, name_hay, None);
+                                if crate::search_query::matches_with_mode(tokens, &hay, mode) {
+                                    matches.insert(idx);
+                                }
+                            }
                         }
+                    } else if use_name
+                        && crate::search_query::matches_with_mode(tokens, name_hay, mode)
+                    {
+                        // PDF メタが検索対象外 → ファイル名のみで照合。
+                        matches.insert(idx);
                     }
-                } else if use_name && crate::search_query::matches_with_mode(tokens, name_hay, mode)
-                {
-                    // PDF メタが検索対象外 → ファイル名のみで照合。
-                    matches.insert(idx);
                 }
                 true
             }
@@ -1979,6 +2350,9 @@ pub(super) fn run_metadata_search(
                     items
                         .par_iter()
                         .enumerate()
+                        .filter(|(idx, _)| {
+                            eligible.is_none_or(|flags| flags.get(*idx).copied().unwrap_or(false))
+                        })
                         .filter_map(|(idx, item)| pass2.process(idx, item))
                         .collect()
                 })
@@ -1990,6 +2364,9 @@ pub(super) fn run_metadata_search(
                 items
                     .iter()
                     .enumerate()
+                    .filter(|(idx, _)| {
+                        eligible.is_none_or(|flags| flags.get(*idx).copied().unwrap_or(false))
+                    })
                     .filter_map(|(idx, item)| pass2.process(idx, item))
                     .collect()
             }
@@ -2045,7 +2422,7 @@ pub(super) fn run_metadata_search(
                     "total_ms",
                     serde_json::Value::from(total_started.elapsed().as_secs_f64() * 1000.0),
                 ),
-                ("items_total", serde_json::Value::from(items.len())),
+                ("items_total", serde_json::Value::from(eligible_total)),
                 ("items_scanned", serde_json::Value::from(scanned_items)),
                 ("pass2_items", serde_json::Value::from(pass2_items)),
                 ("pass2_file_reads", serde_json::Value::from(read_keys.len())),
@@ -2132,14 +2509,132 @@ pub(super) fn exif_hay(info: &crate::exif_reader::ExifInfo, skip_user_comment: b
 mod tests {
     use super::*;
 
+    #[test]
+    fn current_folder_filter_searches_epub_name_but_not_generated_pdf_info() {
+        let tmp = tempfile::tempdir().unwrap();
+        let logical = tmp.path().join("sunflower_book.epub");
+        std::fs::write(&logical, b"epub source").unwrap();
+        let _pin = crate::pdf_loader::pin_epub_for_test(&logical, 1, 42);
+        let _info = crate::pdf_loader::pin_document_info_for_test(
+            &logical,
+            crate::pdf_loader::PdfDocumentInfo {
+                title: Some("SecretMetadataTitle".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            crate::pdf_loader::get_document_info(&logical, None)
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("SecretMetadataTitle"),
+        );
+        let items = [GridItem::PdfFile(logical)];
+        let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+        let run = |query: &str| {
+            let result = run_metadata_search(
+                &crate::search_query::parse(query),
+                &items,
+                None,
+                &std::collections::HashMap::new(),
+                None,
+                &passwords,
+                &crate::fts_index::SearchTarget::All,
+                crate::search_query::MatchMode::And,
+                &AtomicBool::new(false),
+                None,
+            );
+            let SearchThreadResult::Done { matches, .. } = result;
+            matches
+        };
+        assert!(run("sunflower_book").contains(&0));
+        assert!(run("SecretMetadataTitle").is_empty());
+    }
+
+    #[test]
+    fn epub_details_page_count_uses_generation_and_pdf_keeps_source_stamp() {
+        let read = crate::pdf_loader::generation_target_for_test(Path::new("book.epub"), 17, 4096);
+        assert_eq!(
+            details_pdf_catalog_stamp(Some(&read), 123, 456).unwrap(),
+            (17, 4096)
+        );
+        assert_eq!(
+            details_pdf_catalog_stamp(None, 123, 456).unwrap(),
+            (123, 456)
+        );
+    }
+
+    #[test]
+    fn reconverted_epub_details_worker_reads_current_generation_page_count() {
+        let fixture = crate::epub_cache::reconverted_for_worker_test();
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path().join("catalog");
+        let folder = fixture.source.parent().unwrap();
+        let key = fixture.source.file_name().unwrap().to_str().unwrap();
+        let catalog = crate::catalog::CatalogDb::open(&cache_dir, folder).unwrap();
+        catalog
+            .set_pdf_meta(
+                key,
+                fixture.old.generation_id,
+                fixture.old.pdf_size as i64,
+                fixture.old.page_count,
+                false,
+            )
+            .unwrap();
+        catalog
+            .set_pdf_meta(
+                key,
+                fixture.current.generation_id,
+                fixture.current.pdf_size as i64,
+                fixture.current.page_count,
+                false,
+            )
+            .unwrap();
+        let source_meta = std::fs::metadata(&fixture.source).unwrap();
+        let target = DetailsMetaTarget {
+            idx: 0,
+            key: crate::adjustment_db::normalize_path(&fixture.source),
+            item: GridItem::PdfFile(fixture.source.clone()),
+            relative_page_provenance: None,
+            source_identity: crate::catalog::media_source_identity_from_metadata(&source_meta),
+            catalog_folder: Some(folder.to_path_buf()),
+            catalog_key: Some(key.into()),
+            warm_image_dims: None,
+            warm_page_count: None,
+            pdf_password_revision: None,
+            load_page_count: true,
+            load_created_at: false,
+            load_ai_metadata: false,
+            load_image_dims: false,
+            load_video_meta: false,
+            priority: crate::io_semaphore::IoPriority::Normal,
+        };
+        let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(2);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut catalogs = ContainerCatalogCache::new(8, &cache_dir);
+        let config = DetailsPageCountConfig {
+            fingerprint: 0,
+            image_folder_options: None,
+            pdf_passwords: crate::pdf_passwords::PdfPasswordStore::empty_for_test(),
+        };
+        let count = load_details_page_count_with_pdf_enumerator(
+            &target,
+            &cache_dir,
+            &mut catalogs,
+            &io_sem,
+            &cancel,
+            &config,
+            |_, _, _, _| panic!("current generation must hit pdf_meta before PDFium"),
+        )
+        .unwrap();
+        assert_eq!(count, Some(fixture.current.page_count));
+    }
+
     /// pass 2 は 1 項目のうちに複数の file を読む。取消を見ずに読みを続けると、
     /// 取り消した検索の worker が残り、次の検索の pool と並んで走ってしまう。
     /// 「どの読みの直前にも、その読みより後に評価される取消の観測がある」ことを
     /// 本文から固定する。
-    #[test]
-    fn every_pass2_read_is_preceded_by_a_cancel_check() {
-        const SOURCE: &str = include_str!("metadata_ops.rs");
-        let source = SOURCE.replace("\r\n", "\n");
+    fn assert_every_pass2_read_is_preceded_by_a_cancel_check(source: &str) {
         const READS: [&str; 5] = [
             "build_searchable_from_path_counted",
             "read_tweet_info_counted",
@@ -2149,6 +2644,7 @@ mod tests {
         ];
         const CANCEL: &str = "self.cancel.load(";
 
+        let source = source.replace("\r\n", "\n");
         let start = source
             .find("    fn process(&self, idx: usize, item: &GridItem)")
             .expect("pass 2 item entry point");
@@ -2190,6 +2686,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn every_pass2_read_is_preceded_by_a_cancel_check() {
+        const SOURCE: &str = include_str!("metadata_ops.rs");
+
+        let lf_source = SOURCE.replace("\r\n", "\n");
+        let crlf_source = lf_source.replace('\n', "\r\n");
+        assert_every_pass2_read_is_preceded_by_a_cancel_check(&lf_source);
+        assert_every_pass2_read_is_preceded_by_a_cancel_check(&crlf_source);
+    }
+
     fn write_zip_with_nested_images(path: &Path) {
         use std::io::Write as _;
 
@@ -2221,8 +2727,7 @@ mod tests {
             key: crate::adjustment_db::normalize_path(&path),
             item: GridItem::ZipFile(path.clone()),
             relative_page_provenance: None,
-            source_mtime: 123,
-            source_size,
+            source_identity: Some((123, source_size)),
             catalog_folder: Some(temp.path().to_path_buf()),
             catalog_key: Some("book.zip".to_owned()),
             warm_image_dims: None,
@@ -2238,7 +2743,7 @@ mod tests {
         let cache_dir = temp.path().join("cache");
         let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(2);
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut catalogs = ContainerCatalogCache::new(8);
+        let mut catalogs = ContainerCatalogCache::new(8, &cache_dir);
         let mut config = DetailsPageCountConfig {
             fingerprint: 77,
             image_folder_options: None,
@@ -2315,8 +2820,7 @@ mod tests {
                 format: crate::archive_converter::ArchiveFormat::Rar,
             },
             relative_page_provenance: None,
-            source_mtime: 456,
-            source_size,
+            source_identity: Some((456, source_size)),
             catalog_folder: Some(temp.path().to_path_buf()),
             catalog_key: Some("real-split-control.part1.rar".to_owned()),
             warm_image_dims: None,
@@ -2332,7 +2836,7 @@ mod tests {
         let cache_dir = temp.path().join("cache");
         let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(2);
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut catalogs = ContainerCatalogCache::new(8);
+        let mut catalogs = ContainerCatalogCache::new(8, &cache_dir);
         let config = DetailsPageCountConfig {
             fingerprint: 88,
             image_folder_options: None,
@@ -2372,8 +2876,7 @@ mod tests {
             key: format!("target-{idx}"),
             item: GridItem::Folder(PathBuf::from(format!(r"C:\Smart\folder-{idx}"))),
             relative_page_provenance: None,
-            source_mtime: 1,
-            source_size: 1,
+            source_identity: Some((1, 1)),
             catalog_folder: None,
             catalog_key: None,
             warm_image_dims: None,
@@ -2397,7 +2900,7 @@ mod tests {
         let mut target = no_io_details_target(0);
         target.key = crate::adjustment_db::normalize_path(&path);
         target.item = GridItem::Image(path);
-        target.source_size = 24;
+        target.source_identity = Some((target.source_mtime(), 24));
         target.load_ai_metadata = false;
         target.load_created_at = true;
         target.priority = crate::io_semaphore::IoPriority::Normal;
@@ -2410,6 +2913,7 @@ mod tests {
         let worker_sem = Arc::clone(&io_sem);
         let worker_cancel = Arc::clone(&cancel);
         let cache_dir = temp.path().join("cache");
+        let catalog_admission = crate::catalog::CatalogAccess::for_cache_dir(&cache_dir).admit();
         let worker = std::thread::spawn(move || {
             run_details_meta_load(
                 23,
@@ -2419,6 +2923,7 @@ mod tests {
                 0,
                 1,
                 cache_dir,
+                catalog_admission,
                 worker_sem,
                 worker_cancel,
                 tx,
@@ -2484,6 +2989,7 @@ mod tests {
             0,
             3,
             temp.path().join("cache"),
+            crate::catalog::CatalogAccess::for_cache_dir(&temp.path().join("cache")).admit(),
             Arc::new(crate::io_semaphore::GlobalIoSemaphore::new(1)),
             Arc::new(AtomicBool::new(false)),
             tx,
@@ -2528,8 +3034,7 @@ mod tests {
             key: crate::adjustment_db::normalize_path(&path),
             item: GridItem::ZipFile(path),
             relative_page_provenance: None,
-            source_mtime: 123,
-            source_size: 13,
+            source_identity: Some((123, 13)),
             catalog_folder: None,
             catalog_key: None,
             warm_image_dims: None,
@@ -2551,6 +3056,7 @@ mod tests {
             0,
             1,
             temp.path().join("cache"),
+            crate::catalog::CatalogAccess::for_cache_dir(&temp.path().join("cache")).admit(),
             Arc::new(crate::io_semaphore::GlobalIoSemaphore::new(1)),
             Arc::new(AtomicBool::new(false)),
             tx,
@@ -2581,12 +3087,561 @@ mod tests {
     }
 
     #[test]
+    fn media_metadata_cache_reuses_all_values_after_reopen_and_invalidates_stamps() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache_dir = temp.path().join("cache");
+        let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
+        let cancel = AtomicBool::new(false);
+        for audio in [false, true] {
+            let mut target = media_test_target(temp.path(), audio);
+            let mut cache = ContainerCatalogCache::new(8, &cache_dir);
+            let first = load_details_video_meta_with_probe(
+                &target,
+                &cache_dir,
+                &mut cache,
+                &io_sem,
+                &cancel,
+                |_, actual_audio, _| {
+                    assert_eq!(actual_audio, audio);
+                    media_test_read(audio)
+                },
+            )
+            .unwrap();
+            assert_media_test_read(first, audio);
+            // A new job/revisit has no connection or in-memory metadata to reuse.
+            drop(cache);
+            let mut cache = ContainerCatalogCache::new(8, &cache_dir);
+            let cached = load_details_video_meta_with_probe(
+                &target,
+                &cache_dir,
+                &mut cache,
+                &io_sem,
+                &cancel,
+                |_, _, _| panic!("warm persistent metadata must skip probe"),
+            )
+            .unwrap();
+            assert_media_test_read(cached, audio);
+            for changed_size in [false, true] {
+                if changed_size {
+                    let (mtime, size) = target.source_identity.unwrap();
+                    write_media_test_source(
+                        target.item.file_operation_path().unwrap(),
+                        mtime,
+                        size + 1,
+                    );
+                    target.source_identity = crate::catalog::media_source_identity(
+                        target.item.file_operation_path().unwrap(),
+                    );
+                } else {
+                    let (mtime, size) = target.source_identity.unwrap();
+                    write_media_test_source(
+                        target.item.file_operation_path().unwrap(),
+                        mtime + 1,
+                        size,
+                    );
+                    target.source_identity = crate::catalog::media_source_identity(
+                        target.item.file_operation_path().unwrap(),
+                    );
+                }
+                let calls = std::cell::Cell::new(0);
+                load_details_video_meta_with_probe(
+                    &target,
+                    &cache_dir,
+                    &mut cache,
+                    &io_sem,
+                    &cancel,
+                    |_, _, _| {
+                        calls.set(calls.get() + 1);
+                        media_test_read(audio)
+                    },
+                )
+                .unwrap();
+                assert_eq!(calls.get(), 1, "changed identity must probe again");
+            }
+        }
+    }
+
+    #[test]
+    fn media_metadata_only_definitive_failure_is_persisted() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache_dir = temp.path().join("cache");
+        let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
+        let cancel = AtomicBool::new(false);
+        let target = media_test_target(temp.path(), false);
+        let mut cache = ContainerCatalogCache::new(8, &cache_dir);
+        let interrupted = load_details_video_meta_with_probe(
+            &target,
+            &cache_dir,
+            &mut cache,
+            &io_sem,
+            &cancel,
+            |_, _, _| DetailsMediaProbeOutcome::Interrupted,
+        )
+        .unwrap();
+        assert!(matches!(interrupted, DetailsMediaProbeOutcome::Interrupted));
+        let db = crate::catalog::CatalogDb::open(&cache_dir, temp.path()).unwrap();
+        assert_eq!(db.get_video_meta("movie.mp4", 123, 1024).unwrap(), None);
+        let failed = load_details_video_meta_with_probe(
+            &target,
+            &cache_dir,
+            &mut cache,
+            &io_sem,
+            &cancel,
+            |_, _, _| DetailsMediaProbeOutcome::Unreadable,
+        )
+        .unwrap();
+        assert!(matches!(failed, DetailsMediaProbeOutcome::Unreadable));
+        drop(cache);
+        let cached = load_details_video_meta_with_probe(
+            &target,
+            &cache_dir,
+            &mut ContainerCatalogCache::new(8, &cache_dir),
+            &io_sem,
+            &cancel,
+            |_, _, _| panic!("definitive failure must be cached"),
+        )
+        .unwrap();
+        assert!(matches!(cached, DetailsMediaProbeOutcome::Unreadable));
+        assert_eq!(
+            db.get_video_meta("movie.mp4", 123, 1024).unwrap(),
+            Some(crate::catalog::VideoMeta::Unreadable)
+        );
+    }
+
+    #[test]
+    fn media_metadata_cache_unavailable_or_identity_unknown_preserves_probe() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache_dir = temp.path().join("cache");
+        let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
+        let cancel = AtomicBool::new(false);
+        let mut target = media_test_target(temp.path(), false);
+        let mut cache = ContainerCatalogCache::new(8, &cache_dir);
+        for mode in 0..3 {
+            target.source_identity = if mode == 0 { None } else { Some((123, 1024)) };
+            target.catalog_key = if mode == 1 {
+                None
+            } else {
+                Some("movie.mp4".into())
+            };
+            target.catalog_folder = if mode == 2 {
+                None
+            } else {
+                Some(temp.path().to_path_buf())
+            };
+            assert_media_test_read(
+                load_details_video_meta_with_probe(
+                    &target,
+                    &cache_dir,
+                    &mut cache,
+                    &io_sem,
+                    &cancel,
+                    |_, _, _| media_test_read(false),
+                )
+                .unwrap(),
+                false,
+            );
+            assert!(
+                cache.entries.is_empty(),
+                "invalid identity must skip DB open"
+            );
+        }
+        // A file at the cache directory prevents opening any catalog DB.
+        std::fs::write(&cache_dir, b"not a directory").unwrap();
+        target = media_test_target(temp.path(), false);
+        assert_media_test_read(
+            load_details_video_meta_with_probe(
+                &target,
+                &cache_dir,
+                &mut cache,
+                &io_sem,
+                &cancel,
+                |_, _, _| media_test_read(false),
+            )
+            .unwrap(),
+            false,
+        );
+    }
+
+    #[test]
+    fn media_metadata_catalog_read_and_write_errors_preserve_probe_result() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache_dir = temp.path().join("cache");
+        let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
+        let cancel = AtomicBool::new(false);
+        let target = media_test_target(temp.path(), false);
+        let mut cache = ContainerCatalogCache::new(8, &cache_dir);
+        cache
+            .get_or_open(&cache_dir, temp.path(), &io_sem, target.priority, &cancel)
+            .unwrap();
+        let connection =
+            rusqlite::Connection::open(crate::catalog::db_path_for(&cache_dir, temp.path()))
+                .unwrap();
+        connection.execute("DROP TABLE video_meta", []).unwrap();
+        for _ in 0..2 {
+            let calls = std::cell::Cell::new(0);
+            assert_media_test_read(
+                load_details_video_meta_with_probe(
+                    &target,
+                    &cache_dir,
+                    &mut cache,
+                    &io_sem,
+                    &cancel,
+                    |_, _, _| {
+                        calls.set(calls.get() + 1);
+                        media_test_read(false)
+                    },
+                )
+                .unwrap(),
+                false,
+            );
+            assert_eq!(calls.get(), 1, "unavailable cache must continue probing");
+        }
+    }
+
+    #[test]
+    fn media_metadata_cancel_during_probe_never_writes_or_publishes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache_dir = temp.path().join("cache");
+        let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
+        let cancel = AtomicBool::new(false);
+        let target = media_test_target(temp.path(), false);
+        let result = load_details_video_meta_with_probe(
+            &target,
+            &cache_dir,
+            &mut ContainerCatalogCache::new(8, &cache_dir),
+            &io_sem,
+            &cancel,
+            |_, _, cancel| {
+                cancel.store(true, Ordering::Relaxed);
+                media_test_read(false)
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(DetailsMetaCancelReason::AfterIo(
+                DetailsMetaIoStage::VideoProbe
+            ))
+        ));
+        let db = crate::catalog::CatalogDb::open(&cache_dir, temp.path()).unwrap();
+        assert_eq!(db.get_video_meta("movie.mp4", 123, 1024).unwrap(), None);
+    }
+
+    #[test]
+    fn media_probe_interruption_latches_and_classifies_deadline() {
+        let cancel = AtomicBool::new(false);
+        let expired = DetailsProbeInterrupt {
+            cancel: &cancel,
+            deadline: std::time::Instant::now(),
+            interrupted: std::cell::Cell::new(false),
+        };
+        assert!(matches!(
+            expired.finish(Err(ffmpeg_the_third::Error::InvalidData)),
+            DetailsMediaProbeOutcome::Interrupted
+        ));
+        let active = DetailsProbeInterrupt {
+            cancel: &cancel,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(10),
+            interrupted: std::cell::Cell::new(false),
+        };
+        assert!(matches!(
+            active.finish(Err(ffmpeg_the_third::Error::InvalidData)),
+            DetailsMediaProbeOutcome::Unreadable
+        ));
+        cancel.store(true, Ordering::Relaxed);
+        assert!(active.should_interrupt());
+        cancel.store(false, Ordering::Relaxed);
+        let DetailsMediaProbeOutcome::Read(read) = media_test_read(false) else {
+            unreachable!()
+        };
+        assert!(matches!(
+            active.finish(Ok(read)),
+            DetailsMediaProbeOutcome::Interrupted
+        ));
+    }
+
+    #[test]
+    fn media_probe_real_ffmpeg_error_codes_only_persist_content_failures() {
+        use ffmpeg_the_third::{Error, ffi};
+        let cancel = AtomicBool::new(false);
+        // FFmpeg AVERROR values, not preclassified mocked probe outcomes.
+        for (code, definitive) in [
+            (ffi::AVERROR_INVALIDDATA, true),
+            (ffi::AVERROR_DECODER_NOT_FOUND, true),
+            (ffi::AVERROR_DEMUXER_NOT_FOUND, true),
+            (ffi::AVERROR_STREAM_NOT_FOUND, true),
+            (ffi::AVERROR(13), false), // EACCES: access denied / CRT sharing failure
+            (ffi::AVERROR(1), false),  // EPERM
+            (ffi::AVERROR(2), false),  // ENOENT
+            (ffi::AVERROR(5), false),  // EIO
+            (ffi::AVERROR(11), false), // EAGAIN
+            (ffi::AVERROR(32), false), // unrecognized OS/sharing error remains retryable
+            (ffi::AVERROR(22), false), // EINVAL is not a content diagnosis
+            (ffi::AVERROR_EXIT, false),
+            (ffi::AVERROR_UNKNOWN, false),
+        ] {
+            let temp = tempfile::TempDir::new().unwrap();
+            let target = media_test_target(temp.path(), false);
+            let cache_dir = temp.path().join("cache");
+            let outcome = load_details_video_meta_with_probe(
+                &target,
+                &cache_dir,
+                &mut ContainerCatalogCache::new(8, &cache_dir),
+                &crate::io_semaphore::GlobalIoSemaphore::new(1),
+                &cancel,
+                |_, _, _| {
+                    DetailsProbeInterrupt {
+                        cancel: &cancel,
+                        deadline: std::time::Instant::now() + std::time::Duration::from_secs(10),
+                        interrupted: std::cell::Cell::new(false),
+                    }
+                    .finish(Err(Error::from(code)))
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                matches!(outcome, DetailsMediaProbeOutcome::Unreadable),
+                definitive,
+                "FFmpeg error {code}"
+            );
+            assert_eq!(
+                matches!(outcome, DetailsMediaProbeOutcome::Interrupted),
+                !definitive,
+                "FFmpeg error {code}"
+            );
+            let db = crate::catalog::CatalogDb::open(&cache_dir, temp.path()).unwrap();
+            assert_eq!(
+                db.get_video_meta("movie.mp4", 123, 1024).unwrap(),
+                definitive.then_some(crate::catalog::VideoMeta::Unreadable)
+            );
+        }
+    }
+
+    #[test]
+    fn media_metadata_real_empty_files_are_negatively_cached_after_reopen() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache_dir = temp.path().join("cache");
+        let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
+        let cancel = AtomicBool::new(false);
+        for audio in [false, true] {
+            let mut target = media_test_target(temp.path(), audio);
+            let path = target.item.file_operation_path().unwrap().to_path_buf();
+            write_media_test_source(&path, 123, 0);
+            target.source_identity = crate::catalog::media_source_identity(&path);
+            let result = load_details_video_meta_with_probe(
+                &target,
+                &cache_dir,
+                &mut ContainerCatalogCache::new(8, &cache_dir),
+                &io_sem,
+                &cancel,
+                |path, audio, cancel| {
+                    if audio {
+                        probe_audio_details(path, cancel)
+                    } else {
+                        probe_video_details(path, cancel)
+                    }
+                },
+            )
+            .unwrap();
+            assert!(matches!(result, DetailsMediaProbeOutcome::Unreadable));
+            let cached = load_details_video_meta_with_probe(
+                &target,
+                &cache_dir,
+                &mut ContainerCatalogCache::new(8, &cache_dir),
+                &io_sem,
+                &cancel,
+                |_, _, _| panic!("known empty file failure must survive reopen"),
+            )
+            .unwrap();
+            assert!(matches!(cached, DetailsMediaProbeOutcome::Unreadable));
+        }
+    }
+
+    #[test]
+    fn media_metadata_obsolete_probe_cannot_publish_or_replace_newer_connection_result() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache_dir = temp.path().join("cache");
+        let target = media_test_target(temp.path(), false);
+        let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
+        let cancel = AtomicBool::new(false);
+        let mut cache = ContainerCatalogCache::new(8, &cache_dir);
+        let result = load_details_video_meta_with_probe(
+            &target,
+            &cache_dir,
+            &mut cache,
+            &io_sem,
+            &cancel,
+            |path, _, _| {
+                write_media_test_source(path, 122, 2048);
+                let newer = crate::catalog::CatalogDb::open(&cache_dir, temp.path()).unwrap();
+                assert!(
+                    newer
+                        .set_video_meta(
+                            path,
+                            "movie.mp4",
+                            122,
+                            2048,
+                            &crate::catalog::VideoMeta::Unreadable,
+                            &cancel,
+                        )
+                        .unwrap()
+                );
+                media_test_read(false)
+            },
+        )
+        .unwrap();
+        assert!(matches!(result, DetailsMediaProbeOutcome::Interrupted));
+        let db = crate::catalog::CatalogDb::open(&cache_dir, temp.path()).unwrap();
+        assert_eq!(
+            db.get_video_meta("movie.mp4", 122, 2048).unwrap(),
+            Some(crate::catalog::VideoMeta::Unreadable)
+        );
+        assert_eq!(db.get_video_meta("movie.mp4", 123, 1024).unwrap(), None);
+    }
+
+    #[test]
+    fn media_metadata_obsolete_cache_hit_is_not_published() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache_dir = temp.path().join("cache");
+        let target = media_test_target(temp.path(), false);
+        let path = target.item.file_operation_path().unwrap();
+        let db = crate::catalog::CatalogDb::open(&cache_dir, temp.path()).unwrap();
+        assert!(
+            db.set_video_meta(
+                path,
+                "movie.mp4",
+                123,
+                1024,
+                &crate::catalog::VideoMeta::Unreadable,
+                &AtomicBool::new(false),
+            )
+            .unwrap()
+        );
+        write_media_test_source(path, 124, 1024);
+        let result = load_details_video_meta_with_probe(
+            &target,
+            &cache_dir,
+            &mut ContainerCatalogCache::new(8, &cache_dir),
+            &crate::io_semaphore::GlobalIoSemaphore::new(1),
+            &AtomicBool::new(false),
+            |_, _, _| panic!("obsolete cache hit should be discarded before probing"),
+        )
+        .unwrap();
+        assert!(matches!(result, DetailsMediaProbeOutcome::Interrupted));
+    }
+
+    fn write_media_test_source(path: &Path, mtime: i64, size: i64) {
+        std::fs::write(path, vec![0; size as usize]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new().set_modified(
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime as u64),
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            crate::catalog::media_source_identity(path),
+            Some((mtime, size))
+        );
+    }
+
+    fn media_test_target(folder: &Path, audio: bool) -> DetailsMetaTarget {
+        let name = if audio { "music.flac" } else { "movie.mp4" };
+        let path = folder.join(name);
+        if !path.exists() {
+            write_media_test_source(&path, 123, 1024);
+        }
+        let source_identity = crate::catalog::media_source_identity(&path);
+        DetailsMetaTarget {
+            idx: 0,
+            key: crate::adjustment_db::normalize_path(&path),
+            item: if audio {
+                GridItem::Audio(path)
+            } else {
+                GridItem::Video(path)
+            },
+            relative_page_provenance: None,
+            source_identity,
+            catalog_folder: Some(folder.to_path_buf()),
+            catalog_key: Some(name.into()),
+            warm_image_dims: None,
+            warm_page_count: None,
+            pdf_password_revision: None,
+            load_page_count: false,
+            load_created_at: false,
+            load_ai_metadata: false,
+            load_image_dims: false,
+            load_video_meta: true,
+            priority: crate::io_semaphore::IoPriority::Normal,
+        }
+    }
+
+    fn media_test_read(audio: bool) -> DetailsMediaProbeOutcome {
+        DetailsMediaProbeOutcome::Read(DetailsVideoProbe {
+            duration_secs: Some(123.456789),
+            dims: (!audio).then_some((1920, 1080)),
+            codec: Some(if audio { "flac" } else { "h264" }.into()),
+        })
+    }
+
+    fn assert_media_test_read(outcome: DetailsMediaProbeOutcome, audio: bool) {
+        let DetailsMediaProbeOutcome::Read(read) = outcome else {
+            panic!("expected readable media")
+        };
+        assert_eq!(read.duration_secs, Some(123.456789));
+        assert_eq!(read.dims, (!audio).then_some((1920, 1080)));
+        assert_eq!(
+            read.codec.as_deref(),
+            Some(if audio { "flac" } else { "h264" })
+        );
+    }
+
+    #[test]
+    fn details_catalog_admission_does_not_recreate_unvisited_folder_after_delete() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path().join("cache");
+        let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
+        let cancel = AtomicBool::new(false);
+        let mut cache = ContainerCatalogCache::new(2, &cache_dir);
+        let first = temp.path().join("first");
+        assert!(
+            cache
+                .get_or_open(
+                    &cache_dir,
+                    &first,
+                    &io_sem,
+                    crate::io_semaphore::IoPriority::Normal,
+                    &cancel
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(crate::catalog::delete_all_cache(&cache_dir), 1);
+        let later = temp.path().join("unvisited");
+        assert!(
+            cache
+                .get_or_open(
+                    &cache_dir,
+                    &later,
+                    &io_sem,
+                    crate::io_semaphore::IoPriority::Normal,
+                    &cancel
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(!crate::catalog::db_path_for(&cache_dir, &later).exists());
+    }
+
+    #[test]
     fn container_catalog_cache_bounds_open_connections() {
         let temp = tempfile::TempDir::new().unwrap();
         let cache_dir = temp.path().join("cache");
         let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
         let cancel = AtomicBool::new(false);
-        let mut cache = ContainerCatalogCache::new(2);
+        let mut cache = ContainerCatalogCache::new(2, &cache_dir);
         for name in ["one", "two", "three"] {
             let folder = temp.path().join(name);
             std::fs::create_dir_all(&folder).unwrap();
@@ -2617,14 +3672,34 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            probe_image_dims_from_bytes(&cursor.into_inner()),
+            probe_image_dims_from_bytes(&cursor.into_inner(), "sample.png"),
             Some((13, 7))
         );
     }
 
     #[test]
     fn probe_image_dims_from_bytes_rejects_invalid_data() {
-        assert_eq!(probe_image_dims_from_bytes(b"not an image"), None);
+        assert_eq!(
+            probe_image_dims_from_bytes(b"not an image", "bad.png"),
+            None
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn raw_metadata_probe_uses_libraw_developed_dimensions() {
+        for name in ["885.dng", "1018.cr2"] {
+            let path = std::path::Path::new("vendor/raw-samples").join(name);
+            assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+            let bytes = std::fs::read(path).unwrap();
+            let dims = crate::raw::raw_decoder::info(crate::raw::RawSource::Bytes(&bytes))
+                .unwrap()
+                .developed_dims;
+            assert_eq!(
+                probe_image_dims_from_bytes(&bytes, name),
+                Some((dims[0], dims[1]))
+            );
+        }
     }
 
     #[test]

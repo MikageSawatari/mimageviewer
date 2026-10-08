@@ -1,0 +1,21 @@
+
+Algorithm : SHA256
+Hash      : C41221D8C669CE5CEDD307D9BA43546D6824E4DF58E77C494B3CDEAB78465770
+Path      : C:\home\mimageviewer\src\app.rs
+
+Algorithm : SHA256
+Hash      : 8A29F5E768FC4005864B43A349288745C719346186233F280EAD5AC02522F772
+Path      : C:\home\mimageviewer\src\app\tests.rs
+
+Algorithm : SHA256
+Hash      : 6ECDC251F497F2E0B55E167306A1786C843574EE19B0FA4523C819EE8F8CE0E9
+Path      : C:\home\mimageviewer\src\remote_ipc\ui.rs
+
+Algorithm : SHA256
+Hash      : 69F814A08B4FF160C07A5361E78BC8324A2ADFAAE4CA654C379602D040994CEF
+Path      : C:\home\mimageviewer\src\undo_ops.rs
+
+Algorithm : SHA256
+Hash      : CF8A8C37D2F0362A3B30E30C6CE46010AC9FCCE2442165377E86CA7B2C9C594D
+Path      : C:\home\mimageviewer\src\undo_stack.rs
+

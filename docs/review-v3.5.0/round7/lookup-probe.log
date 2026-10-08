@@ -1,0 +1,5 @@
+items=1000, changed=1, indexed_lookup_ms=0.002, key_scan_ms=0.234, scanned_keys=3000
+items=10000, changed=1, indexed_lookup_ms=0.002, key_scan_ms=2.396, scanned_keys=30000
+items=10000, changed=100, indexed_lookup_ms=0.032, key_scan_ms=299.178, scanned_keys=3000000
+items=10000, changed=1000, indexed_lookup_ms=0.361, key_scan_ms=3126.309, scanned_keys=30000000
+items=10000, changed=5000, indexed_lookup_ms=2.186, key_scan_ms=14219.076, scanned_keys=150000000

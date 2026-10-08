@@ -224,6 +224,7 @@ pub(crate) struct SubfolderExpansionOptions {
     video_thumb_use_sidecar_image: bool,
     image_folder_books: bool,
     include_convertible_archives: bool,
+    include_epub: bool,
     show_hidden_files: bool,
     image_ext_priority: Vec<String>,
     scan_filter: SubfolderExpansionScanFilter,
@@ -238,6 +239,7 @@ impl From<&crate::settings::Settings> for SubfolderExpansionOptions {
             video_thumb_use_sidecar_image: settings.video_thumb_use_sidecar_image,
             image_folder_books: settings.auto_fullscreen_image_folders_enabled(),
             include_convertible_archives: !settings.archive_file_handling_ignores_convertible(),
+            include_epub: !settings.epub_file_handling_ignores_epub(),
             show_hidden_files: settings.show_hidden_files,
             image_ext_priority: settings.image_ext_priority.clone(),
             scan_filter: SubfolderExpansionScanFilter::from_settings(settings),
@@ -345,6 +347,48 @@ pub(crate) struct SubfolderExpansionSnapshot {
     pub(crate) entries: Arc<Vec<SubfolderExpansionEntry>>,
     pub(crate) video_thumb_overrides: HashMap<String, PathBuf>,
     pub(crate) diag: SubfolderExpansionDiag,
+    /// Immutable rating keys captured with the currently installed order, for a later stack toggle.
+    pub(crate) stack_rating_source: crate::filename_stack_ui::StackRatingSource,
+    /// Effective order installed with these entries; later global settings changes do not
+    /// reinterpret the existing snapshot when stacks are toggled on.
+    pub(crate) stack_order_request: crate::rating_sort::ListingOrderRequest,
+}
+
+/// 現在 materialize 済みのサブ展開 items と、走査時に確定した size availability を
+/// path で再結合する。スタック表示を後から有効化する経路専用で、filesystem I/O は行わない。
+pub(crate) fn listing_sort_metas_for_items(
+    snapshot: &SubfolderExpansionSnapshot,
+    items: &[GridItem],
+) -> Vec<crate::settings::ListingSortMetadata> {
+    listing_sort_metas_for_entries(&snapshot.entries, items)
+}
+
+pub(crate) fn listing_sort_metas_for_entries(
+    entries: &[SubfolderExpansionEntry],
+    items: &[GridItem],
+) -> Vec<crate::settings::ListingSortMetadata> {
+    let by_path: HashMap<String, crate::settings::ListingSortMetadata> = entries
+        .iter()
+        .map(|entry| {
+            (
+                crate::adjustment_db::normalize_path(&entry.path),
+                crate::settings::ListingSortMetadata::new(
+                    entry.mtime,
+                    (entry.kind != SubfolderExpansionEntryKind::Folder).then_some(entry.file_size),
+                ),
+            )
+        })
+        .collect();
+    items
+        .iter()
+        .map(|item| {
+            item.drag_source_path()
+                .and_then(|path| by_path.get(&crate::adjustment_db::normalize_path(path)))
+                .copied()
+                .map(|metadata| crate::grid_item::listing_sort_metadata_for_item(item, metadata))
+                .unwrap_or_else(|| crate::settings::ListingSortMetadata::new(0, None))
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -403,8 +447,11 @@ pub(crate) struct PreparedSubfolderMetadata {
     pub(crate) rating_cache: HashMap<usize, u8>,
     pub(crate) tags_cache: HashMap<String, Vec<String>>,
     pub(crate) local_adjust_pages: HashSet<usize>,
+    pub(crate) page_edits: Option<(
+        super::page_edit_snapshot::PageEditSnapshot,
+        super::page_edit_snapshot::PageEditProjection,
+    )>,
     pub(crate) video_pin_blobs: HashMap<PathBuf, Vec<u8>>,
-    pub(crate) legacy_paths: Vec<PathBuf>,
     /// サブ展開は synthetic path のため、通常フォルダの同期 lookup を使わず prepare
     /// worker でコンテナ項目だけを一括照会する。スマートフォルダは aggregate 側に持つ。
     pub(crate) folder_pin_map: Option<HashMap<String, crate::folder_thumb_pins::FolderPinSource>>,
@@ -452,6 +499,8 @@ pub(crate) struct PreparedSubfolderExpansion {
     pub(crate) image_metas: Vec<Option<(i64, i64)>>,
     pub(crate) video_items: Vec<(usize, PathBuf, u64)>,
     pub(crate) metadata: PreparedSubfolderMetadata,
+    page_edit_revision: u64,
+    rating_write_generation: Option<u64>,
 }
 
 pub(crate) enum SubfolderExpansionPrepareEvent {
@@ -632,7 +681,7 @@ fn scan_one_directory(
     result: &mut SubfolderExpansionResult,
     subdirs: &mut Vec<PathBuf>,
 ) {
-    let mut media: Vec<(PathBuf, super::folder_scan::ScanMediaKind, i64, i64)> = Vec::new();
+    let mut media: Vec<super::folder_scan::ScannedMediaEntry> = Vec::new();
     let mut containers: Vec<SubfolderExpansionEntry> = Vec::new();
     let mut real_folder_names = HashSet::new();
     let mut has_book_container = false;
@@ -697,7 +746,9 @@ fn scan_one_directory(
 
         let entry_kind = if crate::folder_tree::is_zip_extension(&ext_lower) {
             Some(SubfolderExpansionEntryKind::Zip)
-        } else if ext_lower == "pdf" {
+        } else if crate::folder_tree::is_paged_document_path(&path)
+            && (options.include_epub || ext_lower != "epub")
+        {
             Some(SubfolderExpansionEntryKind::Pdf)
         } else {
             None
@@ -722,7 +773,13 @@ fn scan_one_directory(
         let mtime = crate::ui_helpers::mtime_secs(&metadata);
         let file_size = metadata.len() as i64;
         if let Some(kind) = media_kind {
-            media.push((path, kind, mtime, file_size));
+            media.push(super::folder_scan::ScannedMediaEntry {
+                path,
+                kind,
+                mtime,
+                file_size,
+                sort_meta: crate::settings::ListingSortMetadata::new(mtime, Some(file_size)),
+            });
         } else if let Some(kind) = entry_kind {
             containers.push(SubfolderExpansionEntry {
                 path,
@@ -767,46 +824,39 @@ fn scan_one_directory(
             .scan_filter
             .entry_matches(entry.kind, entry.mtime, entry.file_size, filter_now)
     });
+    // Audio is absent from this view, so it must not suppress an otherwise visible image.
+    media.retain(|entry| entry.kind != super::folder_scan::ScanMediaKind::Audio);
     apply_duplicate_filters_to_media(&mut media, options, &mut result.video_thumb_overrides);
-    media.retain(|(_, kind, _, _)| *kind != super::folder_scan::ScanMediaKind::Audio);
-    media.retain(|(_, kind, mtime, file_size)| {
-        let entry_kind = match kind {
+    media.retain(|entry| {
+        let entry_kind = match entry.kind {
             super::folder_scan::ScanMediaKind::Image => SubfolderExpansionEntryKind::Image,
             super::folder_scan::ScanMediaKind::Video => SubfolderExpansionEntryKind::Video,
             super::folder_scan::ScanMediaKind::Audio => return false,
         };
         options
             .scan_filter
-            .entry_matches(entry_kind, *mtime, *file_size, filter_now)
+            .entry_matches(entry_kind, entry.mtime, entry.file_size, filter_now)
     });
     result.diag.items_found += media.len() + containers.len();
     result.entries.extend(containers);
     result
         .entries
-        .extend(
-            media
-                .into_iter()
-                .map(|(path, kind, mtime, file_size)| SubfolderExpansionEntry {
-                    path,
-                    kind: match kind {
-                        super::folder_scan::ScanMediaKind::Image => {
-                            SubfolderExpansionEntryKind::Image
-                        }
-                        super::folder_scan::ScanMediaKind::Video => {
-                            SubfolderExpansionEntryKind::Video
-                        }
-                        super::folder_scan::ScanMediaKind::Audio => unreachable!(
-                            "audio entries are excluded from subfolder expansion output"
-                        ),
-                    },
-                    mtime,
-                    file_size,
-                }),
-        );
+        .extend(media.into_iter().map(|entry| SubfolderExpansionEntry {
+            path: entry.path,
+            kind: match entry.kind {
+                super::folder_scan::ScanMediaKind::Image => SubfolderExpansionEntryKind::Image,
+                super::folder_scan::ScanMediaKind::Video => SubfolderExpansionEntryKind::Video,
+                super::folder_scan::ScanMediaKind::Audio => {
+                    unreachable!("audio entries are excluded from subfolder expansion output")
+                }
+            },
+            mtime: entry.mtime,
+            file_size: entry.file_size,
+        }));
 }
 
 fn apply_duplicate_filters_to_media(
-    media: &mut Vec<(PathBuf, super::folder_scan::ScanMediaKind, i64, i64)>,
+    media: &mut Vec<super::folder_scan::ScannedMediaEntry>,
     options: &SubfolderExpansionOptions,
     video_thumb_overrides: &mut HashMap<String, PathBuf>,
 ) {
@@ -828,6 +878,7 @@ struct SubfolderEntrySortKey {
     name: crate::filename_sort::SortNameKey,
     parent: crate::filename_sort::SortNameKey,
     row: usize,
+    rating: Option<crate::rating_sort::RatingSortKey>,
 }
 
 fn compare_subfolder_entry_indices(
@@ -835,7 +886,7 @@ fn compare_subfolder_entry_indices(
     bi: usize,
     entries: &[SubfolderExpansionEntry],
     keys: &[SubfolderEntrySortKey],
-    sort: crate::settings::SortOrder,
+    request: crate::rating_sort::ListingOrderRequest,
     order: crate::settings::SubfolderExpansionOrder,
 ) -> std::cmp::Ordering {
     use crate::settings::SubfolderExpansionOrder;
@@ -845,9 +896,27 @@ fn compare_subfolder_entry_indices(
     let ak = &keys[ai];
     let bk = &keys[bi];
     let within_folder = || {
+        let a_meta = crate::settings::ListingSortMetadata::new(
+            a.mtime,
+            (a.kind != SubfolderExpansionEntryKind::Folder).then_some(a.file_size),
+        );
+        let b_meta = crate::settings::ListingSortMetadata::new(
+            b.mtime,
+            (b.kind != SubfolderExpansionEntryKind::Folder).then_some(b.file_size),
+        );
         ak.row
             .cmp(&bk.row)
-            .then_with(|| sort.compare_name_keys(&ak.name, a.mtime, &bk.name, b.mtime))
+            .then_with(|| match request {
+                crate::rating_sort::ListingOrderRequest::Standard(sort) => {
+                    sort.compare_listing_keys(&ak.name, a_meta, &bk.name, b_meta)
+                }
+                crate::rating_sort::ListingOrderRequest::Rating(spec) => spec.compare(
+                    ak.rating.expect("complete rating facts for subfolder row"),
+                    &ak.name,
+                    bk.rating.expect("complete rating facts for subfolder row"),
+                    &bk.name,
+                ),
+            })
             .then_with(|| a.path.cmp(&b.path))
     };
     match order {
@@ -942,6 +1011,31 @@ fn sorted_entry_indices_for_view(
     mut progress: Option<&mut dyn FnMut(usize)>,
     chunk_size: usize,
 ) -> Option<Vec<usize>> {
+    sorted_entry_indices_for_request(
+        entries,
+        crate::rating_sort::ListingOrderRequest::Standard(sort),
+        None,
+        order,
+        display_order,
+        root,
+        cancel,
+        progress,
+        chunk_size,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sorted_entry_indices_for_request(
+    entries: &[SubfolderExpansionEntry],
+    request: crate::rating_sort::ListingOrderRequest,
+    facts: Option<&crate::rating_db::CompleteRatingFacts>,
+    order: crate::settings::SubfolderExpansionOrder,
+    display_order: &crate::settings::GridDisplayOrder,
+    root: &Path,
+    cancel: Option<&AtomicBool>,
+    mut progress: Option<&mut dyn FnMut(usize)>,
+    chunk_size: usize,
+) -> Option<Vec<usize>> {
     let total = entries.len();
     if total == 0 {
         report_subfolder_sort_progress(&mut progress, 0);
@@ -973,10 +1067,22 @@ fn sorted_entry_indices_for_view(
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
         let kind = entry.kind.display_kind();
+        let rating = match request {
+            crate::rating_sort::ListingOrderRequest::Standard(_) => None,
+            crate::rating_sort::ListingOrderRequest::Rating(_) => {
+                let key = crate::adjustment_db::normalize_path(&entry.path);
+                Some(
+                    facts
+                        .expect("rating request needs complete facts")
+                        .key_for_requested(&key),
+                )
+            }
+        };
         keys.push(SubfolderEntrySortKey {
-            name: sort.name_key(name),
+            name: request.standard_fallback().name_key(name),
             parent: crate::filename_sort::SortNameKey::file_name(&parent),
             row: display_order.row_for(kind),
+            rating,
         });
     }
     report_subfolder_sort_progress(&mut progress, key_stage_end);
@@ -987,7 +1093,7 @@ fn sorted_entry_indices_for_view(
     let chunk_size = chunk_size.max(1);
     let chunk_count = total.div_ceil(chunk_size);
     let mut indices: Vec<usize> = (0..total).collect();
-    let compare = |ai, bi| compare_subfolder_entry_indices(ai, bi, entries, &keys, sort, order);
+    let compare = |ai, bi| compare_subfolder_entry_indices(ai, bi, entries, &keys, request, order);
     for (chunk_index, chunk) in indices.chunks_mut(chunk_size).enumerate() {
         if cancel.is_some_and(cancelled) {
             return None;
@@ -1096,12 +1202,15 @@ pub(crate) fn sort_entries_for_view(
 
 #[derive(Clone)]
 struct SubfolderExpansionPrepareOptions {
-    sort: crate::settings::SortOrder,
+    request: crate::rating_sort::ListingOrderRequest,
+    rating_write_generation: u64,
     order: crate::settings::SubfolderExpansionOrder,
     display_order: crate::settings::GridDisplayOrder,
     load_ratings: bool,
     load_tags: bool,
     load_local_adjust: bool,
+    page_edit_availability: super::page_edit_snapshot::PageEditAvailability,
+    page_edit_revision: u64,
     load_video_pins: bool,
     folder_pin_db: Option<Arc<crate::folder_thumb_pins::FolderThumbPinDb>>,
     removed_paths: HashSet<String>,
@@ -1130,7 +1239,7 @@ fn cancelled(cancel: &AtomicBool) -> bool {
 }
 
 fn prepare_subfolder_expansion(
-    snapshot: SubfolderExpansionSnapshot,
+    mut snapshot: SubfolderExpansionSnapshot,
     show_toast: bool,
     options: SubfolderExpansionPrepareOptions,
     cancel: &AtomicBool,
@@ -1138,6 +1247,66 @@ fn prepare_subfolder_expansion(
 ) -> Result<Option<PreparedSubfolderExpansion>, String> {
     let reused_metadata = options.reused_metadata.as_ref();
     let total = snapshot.entries.len();
+    let rating_order = matches!(
+        options.request,
+        crate::rating_sort::ListingOrderRequest::Rating(_)
+    );
+    let needs_fresh_ratings = rating_order;
+    let rating_keys = needs_fresh_ratings
+        .then(|| {
+            snapshot
+                .entries
+                .iter()
+                .map(|entry| crate::adjustment_db::normalize_path(&entry.path))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let rating_db = (needs_fresh_ratings && options.load_ratings)
+        .then(|| crate::rating_db::RatingDb::open_readonly(crate::rating_db::RatingDb::db_path()))
+        .transpose();
+    let rating_facts = rating_db
+        .as_ref()
+        .ok()
+        .and_then(|db| db.as_ref())
+        .and_then(|db| {
+            db.get_many_complete(&rating_keys, options.rating_write_generation)
+                .ok()
+        });
+    let rating_sort_failed = matches!(
+        options.request,
+        crate::rating_sort::ListingOrderRequest::Rating(_)
+    ) && rating_facts.is_none();
+    snapshot.stack_rating_source = match (rating_order, rating_facts.as_ref()) {
+        (false, _) => crate::filename_stack_ui::StackRatingSource::Standard,
+        (true, None) => crate::filename_stack_ui::StackRatingSource::ReadFailed,
+        (true, Some(facts)) => crate::filename_stack_ui::StackRatingSource::Prepared(Arc::new(
+            facts
+                .iter_requested_ratings()
+                .map(|(key, stars)| {
+                    (
+                        key.to_owned(),
+                        crate::rating_sort::RatingSortKey::supported(stars)
+                            .expect("database ratings are clamped to 0..=5"),
+                    )
+                })
+                .collect(),
+        )),
+    };
+    let effective_request = if rating_sort_failed {
+        crate::rating_sort::ListingOrderRequest::Standard(crate::settings::SortOrder::FileName)
+    } else {
+        options.request
+    };
+    snapshot.stack_order_request = effective_request;
+    let fallback_ratings = if rating_order && rating_facts.is_none() {
+        rating_db
+            .ok()
+            .flatten()
+            .map(|db| db.get_many(&rating_keys))
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
     prepare_progress(tx, SubfolderExpansionPreparePhase::Sorting, 0, total);
     let mut report_sort_progress = |completed| {
         prepare_progress(
@@ -1147,9 +1316,10 @@ fn prepare_subfolder_expansion(
             total,
         );
     };
-    let Some(indices) = sorted_entry_indices_for_view(
+    let Some(indices) = sorted_entry_indices_for_request(
         snapshot.entries.as_slice(),
-        options.sort,
+        effective_request,
+        rating_facts.as_ref(),
         options.order,
         &options.display_order,
         &snapshot.root,
@@ -1193,10 +1363,23 @@ fn prepare_subfolder_expansion(
         let item = entry.kind.to_grid_item(entry.path.clone());
         items.push(item);
         image_metas.push(Some((entry.mtime, entry.file_size)));
-        if let Some(reused) = reused_metadata {
+        if let Some(facts) = rating_facts.as_ref() {
+            let stars = facts.value_for_requested(&path_key);
+            if stars > 0 {
+                rating_cache.insert(display_idx, stars);
+            }
+        } else if let Some(reused) = reused_metadata {
             if let Some(stars) = reused.ratings_by_path.get(&path_key) {
                 rating_cache.insert(display_idx, *stars);
             }
+        } else if let Some(stars) = fallback_ratings
+            .get(&path_key)
+            .copied()
+            .filter(|stars| *stars > 0)
+        {
+            rating_cache.insert(display_idx, stars);
+        }
+        if let Some(reused) = reused_metadata {
             if reused.local_adjust_paths.contains(&path_key) {
                 local_adjust_pages.insert(display_idx);
             }
@@ -1206,7 +1389,9 @@ fn prepare_subfolder_expansion(
     }
     let video_items = crate::filename_stack_ui::stack_video_items(&items, &image_metas);
 
-    if reused_metadata.is_none() && options.load_ratings {
+    // Ordinary opens keep the previous bounded read, cancellation, progress,
+    // and DB-open failure behavior. Complete facts are needed only by Rating order.
+    if reused_metadata.is_none() && options.load_ratings && !rating_order {
         prepare_progress(tx, SubfolderExpansionPreparePhase::Ratings, 0, total);
         let db = crate::rating_db::RatingDb::open_readonly(crate::rating_db::RatingDb::db_path())
             .map_err(|e| format!("レーティング DB を読み込めませんでした: {e}"))?;
@@ -1256,7 +1441,10 @@ fn prepare_subfolder_expansion(
         }
     }
 
-    if reused_metadata.is_none() && options.load_local_adjust {
+    if reused_metadata.is_none()
+        && options.load_local_adjust
+        && !options.page_edit_availability.local_adjust
+    {
         prepare_progress(tx, SubfolderExpansionPreparePhase::Adjustments, 0, total);
         let db = crate::local_adjust_db::LocalAdjustDb::open_readonly(
             &crate::local_adjust_db::LocalAdjustDb::db_path(),
@@ -1280,6 +1468,21 @@ fn prepare_subfolder_expansion(
                 total,
             );
         }
+    }
+
+    // A resort replaces the projection in its worker as well. Reading exact keys again avoids
+    // cloning a potentially million-entry keyed snapshot on the UI thread.
+    let page_edits = super::page_edit_snapshot::PageEditSnapshot::load_and_project_stable(
+        &items,
+        options.page_edit_availability,
+        cancel,
+    )?;
+    let Some(page_edits) = page_edits else {
+        return Ok(None);
+    };
+    let page_edits = (page_edits.snapshot, page_edits.projection);
+    if options.page_edit_availability.local_adjust {
+        local_adjust_pages = page_edits.1.local_adjust.clone();
     }
 
     let mut video_pin_blobs = HashMap::new();
@@ -1308,16 +1511,7 @@ fn prepare_subfolder_expansion(
         return Ok(None);
     }
 
-    // 数百万件では正規化キー文字列だけでも大きい。legacy seed 用 path snapshot を
-    // 作る前に DB lookup 用バッファを明示的に解放して peak memory を抑える。
     drop(key_by_idx);
-    let legacy_paths = items
-        .iter()
-        .filter_map(|item| match item {
-            GridItem::Image(path) | GridItem::Video(path) => Some(path.clone()),
-            _ => None,
-        })
-        .collect();
     Ok(Some(PreparedSubfolderExpansion {
         snapshot,
         show_toast,
@@ -1328,11 +1522,13 @@ fn prepare_subfolder_expansion(
             rating_cache,
             tags_cache,
             local_adjust_pages,
+            page_edits: Some(page_edits),
             video_pin_blobs,
-            legacy_paths,
             folder_pin_map: Some(folder_pin_map),
             aggregate: None,
         },
+        page_edit_revision: options.page_edit_revision,
+        rating_write_generation: Some(options.rating_write_generation),
     }))
 }
 
@@ -1345,9 +1541,14 @@ fn spawn_subfolder_expansion_prepare(
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_w = Arc::clone(&cancel);
     let (tx, rx) = mpsc::channel();
+    #[cfg(test)]
+    let test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::capture();
     std::thread::Builder::new()
         .name("subfolder-view-prepare".into())
         .spawn(move || {
+            #[cfg(test)]
+            let _test_epoch_scope =
+                test_epoch_scope.map(crate::page_edit_write_epoch::TestEpochScope::enter);
             let event =
                 match prepare_subfolder_expansion(snapshot, show_toast, options, &cancel_w, &tx) {
                     Ok(Some(prepared)) => SubfolderExpansionPrepareEvent::Done(Box::new(prepared)),
@@ -1568,6 +1769,7 @@ impl App {
         self.cancel_stack_script_pending();
         self.stack_mode_requested = false;
         self.stack_view = None;
+        self.stack_return_state = None;
         self.stack_showing_flat = false;
         self.subfolder_expansion_root = Some(root.clone());
         self.subfolder_expansion_roots = roots.clone();
@@ -1583,7 +1785,7 @@ impl App {
             subfolder_expansion_view_label("サブ展開中", &root, &roots, Some(&options.scan_filter));
 
         let io_sem = self
-            .indexer_manager
+            .indexer_init
             .as_ref()
             .map(|manager| manager.io_sem())
             .unwrap_or_else(|| {
@@ -1691,10 +1893,18 @@ impl App {
         self.subfolder_expansion_saved_folder
             .clone()
             .or_else(|| self.subfolder_expansion_root.clone())
-            .map(crate::ui_main::AddressBarNav::Direct)
+            .map(|path| {
+                crate::ui_main::AddressBarNav::Direct(path, super::StartupListIntent::ExplicitList)
+            })
     }
 
     pub(crate) fn poll_subfolder_expansion(&mut self, ctx: &egui::Context) {
+        // The scan/prepare was accepted before the sidecar modal. Keep its receiver, prepared
+        // payload, and install tail intact until restore terminal instead of replacing the owned
+        // item generation underneath the restore coordinator.
+        if self.sidecar_restore_active() {
+            return;
+        }
         if self.poll_subfolder_expansion_install(ctx) {
             return;
         }
@@ -1806,6 +2016,10 @@ impl App {
             entries: Arc::new(entries),
             video_thumb_overrides,
             diag,
+            stack_rating_source: Default::default(),
+            stack_order_request: crate::rating_sort::ListingOrderRequest::Standard(
+                crate::settings::SortOrder::FileName,
+            ),
         };
         self.queue_or_install_subfolder_expansion_snapshot(snapshot, true, ctx);
     }
@@ -1863,12 +2077,21 @@ impl App {
             Some(&snapshot.scan_filter),
         );
         let options = SubfolderExpansionPrepareOptions {
-            sort: self.book_sort_order_for_path(&snapshot.root),
+            request: if self.book_sort_order_for_path(&snapshot.root) != self.settings.sort_order {
+                crate::rating_sort::ListingOrderRequest::Standard(
+                    self.book_sort_order_for_path(&snapshot.root),
+                )
+            } else {
+                crate::rating_sort::ListingOrderRequest::from_settings(&self.settings)
+            },
+            rating_write_generation: self.rating_session_write_generation,
             order: self.settings.subfolder_expansion_order,
             display_order: self.settings.grid_display_order.clone(),
             load_ratings: self.rating_db.is_some(),
             load_tags: self.tags_db.is_some(),
             load_local_adjust: self.local_adjust_db.is_some(),
+            page_edit_availability: super::page_edit_snapshot::PageEditAvailability::for_app(self),
+            page_edit_revision: self.page_edit_revision,
             load_video_pins: self.video_pin_db.is_some(),
             folder_pin_db: self.folder_thumb_pin_db.clone(),
             removed_paths: self.subfolder_expansion_removed_paths.clone(),
@@ -1975,20 +2198,39 @@ impl App {
         }
     }
 
+    fn has_subfolder_expansion_restore_for_synthetic_path(&self, path: Option<&Path>) -> bool {
+        let Some(path) = path else {
+            return false;
+        };
+        if !crate::folder_tree::path_eq(path, &subfolder_expansion_synthetic_path()) {
+            return false;
+        }
+        self.subfolder_expansion_snapshot.is_some()
+            || self.subfolder_expansion_root.is_some()
+            || self.subfolder_expansion_saved_folder.is_some()
+    }
+
+    pub(crate) fn subfolder_expansion_restore_for_synthetic_path(
+        &self,
+        path: Option<&Path>,
+    ) -> Option<SubfolderExpansionRestoreState> {
+        if !self.has_subfolder_expansion_restore_for_synthetic_path(path) {
+            return None;
+        }
+        Some(SubfolderExpansionRestoreState {
+            root: self.subfolder_expansion_root.clone(),
+            roots: self.subfolder_expansion_roots.clone(),
+            saved_folder: self.subfolder_expansion_saved_folder.clone(),
+            snapshot: self.subfolder_expansion_snapshot.clone(),
+            removed_paths: self.subfolder_expansion_removed_paths.clone(),
+        })
+    }
+
     pub(crate) fn take_subfolder_expansion_restore_for_synthetic_path(
         &mut self,
         path: Option<&Path>,
     ) -> Option<SubfolderExpansionRestoreState> {
-        let Some(path) = path else {
-            return None;
-        };
-        if !crate::folder_tree::path_eq(path, &subfolder_expansion_synthetic_path()) {
-            return None;
-        }
-        if self.subfolder_expansion_snapshot.is_none()
-            && self.subfolder_expansion_root.is_none()
-            && self.subfolder_expansion_saved_folder.is_none()
-        {
+        if !self.has_subfolder_expansion_restore_for_synthetic_path(path) {
             return None;
         }
         Some(SubfolderExpansionRestoreState {
@@ -2056,6 +2298,18 @@ impl App {
         prepared: PreparedSubfolderExpansion,
         ctx: Option<&egui::Context>,
     ) {
+        if prepared.page_edit_revision != self.page_edit_revision
+            || prepared
+                .metadata
+                .page_edits
+                .as_ref()
+                .and_then(|(snapshot, _)| snapshot.stamp)
+                .is_none_or(|stamp| !crate::page_edit_write_epoch::PAGE_EDIT_WRITES.accepts(stamp))
+        {
+            self.start_subfolder_expansion_prepare(prepared.snapshot, prepared.show_toast);
+            return;
+        }
+        self.capture_main_list_restore_cursor();
         let install_t0 = Instant::now();
         let perf_on = crate::perf::is_enabled();
         let seq = self.input_seq;
@@ -2066,6 +2320,8 @@ impl App {
             image_metas,
             video_items,
             metadata,
+            page_edit_revision: _,
+            rating_write_generation,
         } = prepared;
         let entry_count = items.len();
         if perf_on {
@@ -2100,6 +2356,16 @@ impl App {
             video_items,
             metadata,
         );
+        if let Some(generation) = rating_write_generation {
+            self.overlay_rating_session_writes_since(generation);
+            self.rebuild_visible_indices_after_rating_publication();
+        }
+        if matches!(
+            snapshot.stack_rating_source,
+            crate::filename_stack_ui::StackRatingSource::ReadFailed
+        ) {
+            self.show_feedback_toast("評価順を読み込めなかったため名前順で表示しました".into());
+        }
         if perf_on {
             crate::perf::event(
                 "subfolder",
@@ -2409,7 +2675,125 @@ mod tests {
     use super::*;
 
     #[test]
+    fn audit_subfolder_readers_with_foreign_writers() {
+        crate::page_edit_write_epoch::with_foreign_scoped_writers(|| {
+            phase_a_subfolder_mask_is_projected_after_accepted_prepare();
+            phase_a2_subfolder_external_write_rejects_stale_projection_and_reprepares();
+            prepare_materializes_folder_zip_pdf_image_and_video_grid_items();
+            prepare_excludes_removed_path_without_mutating_shared_snapshot();
+            resort_reuses_loaded_metadata_and_remaps_indexed_caches();
+        });
+    }
+
+    #[test]
+    fn phase_a_subfolder_mask_is_projected_after_accepted_prepare() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let root = app.tmp.path().join("subfolder-root");
+        let child = root.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let image = child.join("masked.png");
+        std::fs::write(&image, b"image").unwrap();
+        let key = crate::adjustment_db::normalize_path(&image);
+        app.mask_db
+            .as_ref()
+            .unwrap()
+            .set(&key, &[true], &[], 1, 1)
+            .unwrap();
+        let snapshot = SubfolderExpansionSnapshot {
+            root: root.clone(),
+            roots: vec![root],
+            scan_filter: SubfolderExpansionScanFilter::default(),
+            entries: Arc::new(vec![SubfolderExpansionEntry {
+                path: image.clone(),
+                kind: SubfolderExpansionEntryKind::Image,
+                mtime: 1,
+                file_size: 5,
+            }]),
+            video_thumb_overrides: HashMap::new(),
+            diag: SubfolderExpansionDiag::default(),
+            stack_rating_source: Default::default(),
+            stack_order_request: crate::rating_sort::ListingOrderRequest::Standard(
+                crate::settings::SortOrder::FileName,
+            ),
+        };
+        app.start_subfolder_expansion_prepare(snapshot, false);
+        app.finish_subfolder_expansion_prepare_for_test();
+        assert_eq!(app.page_path_key(0).as_deref(), Some(key.as_str()));
+        assert!(
+            app.mask_pages.contains(&0),
+            "paint path must apply the saved mask"
+        );
+    }
+
+    #[test]
+    fn phase_a2_subfolder_external_write_rejects_stale_projection_and_reprepares() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let root = app.tmp.path().join("stale-subfolder-root");
+        let image = root.join("masked.png");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&image, b"image").unwrap();
+        let key = crate::adjustment_db::normalize_path(&image);
+        app.mask_db
+            .as_ref()
+            .unwrap()
+            .set(&key, &[true], &[], 1, 1)
+            .unwrap();
+        let snapshot = SubfolderExpansionSnapshot {
+            root: root.clone(),
+            roots: vec![root],
+            scan_filter: SubfolderExpansionScanFilter::default(),
+            entries: Arc::new(vec![SubfolderExpansionEntry {
+                path: image,
+                kind: SubfolderExpansionEntryKind::Image,
+                mtime: 1,
+                file_size: 5,
+            }]),
+            video_thumb_overrides: HashMap::new(),
+            diag: SubfolderExpansionDiag::default(),
+            stack_rating_source: Default::default(),
+            stack_order_request: crate::rating_sort::ListingOrderRequest::Standard(
+                crate::settings::SortOrder::FileName,
+            ),
+        };
+        app.start_subfolder_expansion_prepare(snapshot, false);
+        let pending = app.subfolder_expansion_install_pending.take().unwrap();
+        let prepared = loop {
+            match pending.rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                SubfolderExpansionPrepareEvent::Progress(_) => {}
+                SubfolderExpansionPrepareEvent::Done(prepared) => break *prepared,
+                SubfolderExpansionPrepareEvent::Cancelled => panic!("prepare was cancelled"),
+                SubfolderExpansionPrepareEvent::Error(message) => panic!("{message}"),
+            }
+        };
+        assert!(
+            prepared
+                .metadata
+                .page_edits
+                .as_ref()
+                .unwrap()
+                .1
+                .mask
+                .contains(&0)
+        );
+        app.mask_db.as_ref().unwrap().delete(&key).unwrap();
+
+        let generation_before_rejection = app.items_generation;
+        app.install_prepared_subfolder_expansion(prepared, None);
+        assert_eq!(app.items_generation, generation_before_rejection);
+        assert!(app.subfolder_expansion_install_pending.is_some());
+        app.finish_subfolder_expansion_prepare_for_test();
+        assert_eq!(app.page_path_key(0).as_deref(), Some(key.as_str()));
+        assert!(
+            !app.mask_pages.contains(&0),
+            "stale mask must not be installed"
+        );
+    }
+
+    #[test]
     fn relative_place_labels_use_the_pressed_root() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let root = PathBuf::from(r"C:\library");
         assert_eq!(
             relative_place_label(&root, &root).as_deref(),
@@ -2439,6 +2823,7 @@ mod tests {
             video_thumb_use_sidecar_image: true,
             image_folder_books,
             include_convertible_archives: false,
+            include_epub: true,
             show_hidden_files: true,
             image_ext_priority: Vec::new(),
             scan_filter: SubfolderExpansionScanFilter::default(),
@@ -2474,11 +2859,13 @@ mod tests {
 
     #[test]
     fn synthetic_path_is_registered_as_synthetic_view() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         assert!(is_synthetic_view_path(&subfolder_expansion_synthetic_path()));
     }
 
     #[test]
     fn depth_choice_maps_root_only_and_unlimited_to_walker_max_depth() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         assert_eq!(SubfolderExpansionDepthChoice::RootOnly.max_depth(), 0);
         assert_eq!(
             SubfolderExpansionDepthChoice::Unlimited.max_depth(),
@@ -2508,6 +2895,7 @@ mod tests {
 
     #[test]
     fn subfolder_expansion_button_action_matches_off_on_and_busy_states() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         assert_eq!(
             SubfolderExpansionButtonAction::for_state(false, false),
             SubfolderExpansionButtonAction::OpenDialog
@@ -2528,6 +2916,7 @@ mod tests {
 
     #[test]
     fn subfolder_expansion_view_label_shows_the_applied_scan_filter() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut filter = SubfolderExpansionScanFilter::default();
         filter.kinds.insert(crate::settings::FacetItemKind::Image);
         filter.size_preset = Some(crate::settings::FacetSizePreset::Range {
@@ -2565,6 +2954,7 @@ mod tests {
 
     #[test]
     fn scan_depth_limit_changes_how_many_tree_levels_are_collected() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let root = tmp.path().join("root");
         let child = root.join("child");
@@ -2589,6 +2979,7 @@ mod tests {
 
     #[test]
     fn scan_kind_filter_excludes_non_matching_entries() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let root = tmp.path().join("root");
         std::fs::create_dir_all(&root).unwrap();
@@ -2620,6 +3011,7 @@ mod tests {
 
     #[test]
     fn scan_size_filter_excludes_non_matching_files() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let root = tmp.path().join("root");
         std::fs::create_dir_all(&root).unwrap();
@@ -2642,6 +3034,7 @@ mod tests {
 
     #[test]
     fn scan_size_range_filter_excludes_files_outside_the_range() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let root = tmp.path().join("root");
         std::fs::create_dir_all(&root).unwrap();
@@ -2674,6 +3067,7 @@ mod tests {
 
     #[test]
     fn scan_date_filter_excludes_non_matching_files() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let root = tmp.path().join("root");
         std::fs::create_dir_all(&root).unwrap();
@@ -2698,6 +3092,7 @@ mod tests {
 
     #[test]
     fn image_folder_book_ignores_size_and_date_filters() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let filter = SubfolderExpansionScanFilter {
             kinds: BTreeSet::new(),
             date_preset: Some(crate::settings::FacetDatePreset::Today),
@@ -2722,6 +3117,7 @@ mod tests {
 
     #[test]
     fn no_scan_filter_keeps_the_previous_entry_set() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let root = tmp.path().join("root");
         std::fs::create_dir_all(&root).unwrap();
@@ -2751,6 +3147,7 @@ mod tests {
 
     #[test]
     fn scan_option_uses_the_existing_effective_image_folder_book_setting() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut settings = crate::settings::Settings::default();
         settings.detached_viewer_open_images_in_window = false;
         settings.auto_fullscreen_zip_pdf = true;
@@ -2766,6 +3163,7 @@ mod tests {
 
     #[test]
     fn scan_never_descends_into_portable_metadata_bundle() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let root = tmp.path().join("root");
         let bundle = root.join(crate::fs_entry::PORTABLE_METADATA_BUNDLE_DIRNAME);
@@ -2787,6 +3185,7 @@ mod tests {
 
     #[test]
     fn scan_uses_checked_roots_only_when_multiple_roots_are_supplied() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let root = tmp.path().join("root");
         let a = root.join("a");
@@ -2812,6 +3211,7 @@ mod tests {
                 video_thumb_use_sidecar_image: true,
                 image_folder_books: false,
                 include_convertible_archives: false,
+                include_epub: true,
                 show_hidden_files: true,
                 image_ext_priority: Vec::new(),
                 scan_filter: SubfolderExpansionScanFilter::default(),
@@ -2837,6 +3237,7 @@ mod tests {
 
     #[test]
     fn image_only_folder_is_expanded_to_individual_images_when_setting_is_off() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let root = tmp.path().join("root");
         let book = root.join("book");
@@ -2857,6 +3258,7 @@ mod tests {
 
     #[test]
     fn image_only_folder_is_one_book_item_when_setting_is_on() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let root = tmp.path().join("root");
         let book = root.join("book");
@@ -2873,12 +3275,14 @@ mod tests {
 
     #[test]
     fn zip_and_pdf_are_each_listed_once_without_enumerating_their_contents() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let root = tmp.path().join("root");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("book.zip"), b"not opened by scan").unwrap();
         std::fs::write(root.join("comic.cbz"), b"not opened by scan").unwrap();
         std::fs::write(root.join("document.pdf"), b"not opened by scan").unwrap();
+        std::fs::write(root.join("book.epub"), b"not opened by scan").unwrap();
 
         let result = scan_test_root(&root, test_scan_options(true));
         let kinds = result
@@ -2887,7 +3291,7 @@ mod tests {
             .map(|entry| entry.kind)
             .collect::<Vec<_>>();
 
-        assert_eq!(result.entries.len(), 3);
+        assert_eq!(result.entries.len(), 4);
         assert_eq!(
             kinds
                 .iter()
@@ -2900,12 +3304,24 @@ mod tests {
                 .iter()
                 .filter(|kind| **kind == SubfolderExpansionEntryKind::Pdf)
                 .count(),
+            2
+        );
+        let mut ignored = test_scan_options(true);
+        ignored.include_epub = false;
+        let result = scan_test_root(&root, ignored);
+        assert_eq!(
+            result
+                .entries
+                .iter()
+                .filter(|entry| entry.kind == SubfolderExpansionEntryKind::Pdf)
+                .count(),
             1
         );
     }
 
     #[test]
     fn prepare_materializes_folder_zip_pdf_image_and_video_grid_items() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let root = PathBuf::from(r"C:\root");
         let entries = [
             (SubfolderExpansionEntryKind::Folder, "folder"),
@@ -2929,14 +3345,23 @@ mod tests {
             entries: Arc::new(entries),
             video_thumb_overrides: HashMap::new(),
             diag: SubfolderExpansionDiag::default(),
+            stack_rating_source: Default::default(),
+            stack_order_request: crate::rating_sort::ListingOrderRequest::Standard(
+                crate::settings::SortOrder::FileName,
+            ),
         };
         let options = SubfolderExpansionPrepareOptions {
-            sort: crate::settings::SortOrder::FileName,
+            request: crate::rating_sort::ListingOrderRequest::Standard(
+                crate::settings::SortOrder::FileName,
+            ),
+            rating_write_generation: 0,
             order: crate::settings::SubfolderExpansionOrder::Flat,
             display_order: crate::settings::GridDisplayOrder::default(),
             load_ratings: false,
             load_tags: false,
             load_local_adjust: false,
+            page_edit_availability: Default::default(),
+            page_edit_revision: 0,
             load_video_pins: false,
             folder_pin_db: None,
             removed_paths: HashSet::new(),
@@ -2983,6 +3408,7 @@ mod tests {
 
     #[test]
     fn image_folder_with_video_or_container_is_not_collapsed_as_a_book() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let root = tmp.path().join("root");
         let mixed = root.join("mixed");
@@ -3019,6 +3445,7 @@ mod tests {
 
     #[test]
     fn same_name_zip_is_hidden_in_favor_of_image_folder_book_when_configured() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let root = tmp.path().join("root");
         let book = root.join("volume");
@@ -3036,14 +3463,80 @@ mod tests {
     }
 
     #[test]
+    fn audio_sidecar_images_remain_in_subfolder_expansion_while_video_sidecars_stay_suppressed() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let audio = root.join("song.mp3");
+        let audio_image = root.join("song.jpg");
+        let video = root.join("movie.mp4");
+        let video_image = root.join("movie.jpg");
+        let mut mp3 = crate::audio_album_art::tests::tag(&[], 4, 0);
+        mp3.extend([0xff, 0xfb, 0x90, 0x00]);
+        std::fs::write(&audio, mp3).unwrap();
+        std::fs::write(&video, b"video").unwrap();
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            2,
+            2,
+            image::Rgb([30, 120, 200]),
+        ))
+        .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+        .unwrap();
+        for path in [&audio_image, &video_image] {
+            std::fs::write(path, jpeg.get_ref()).unwrap();
+        }
+        for use_sidecar in [false, true] {
+            let mut options = test_scan_options(false);
+            options.skip_image_if_video_exists = true;
+            options.video_thumb_use_sidecar_image = use_sidecar;
+            let result = scan_test_root(&root, options);
+            assert_eq!(result.entries.len(), 2);
+            assert!(
+                result
+                    .entries
+                    .iter()
+                    .any(|entry| entry.kind == SubfolderExpansionEntryKind::Image
+                        && entry.path == audio_image)
+            );
+            assert!(result.entries.iter().any(|entry| entry.kind
+                == SubfolderExpansionEntryKind::Video
+                && entry.path == video));
+            assert!(
+                !result
+                    .entries
+                    .iter()
+                    .any(|entry| entry.path == audio || entry.path == video_image)
+            );
+            assert!(
+                !result
+                    .video_thumb_overrides
+                    .contains_key(&crate::path_key::normalize_keep_drive(&audio))
+            );
+            assert_eq!(
+                result
+                    .video_thumb_overrides
+                    .get(&crate::path_key::normalize_keep_drive(&video)),
+                use_sidecar.then_some(&video_image),
+            );
+        }
+    }
+    #[test]
     fn duplicate_filter_is_scoped_to_one_parent() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         use crate::app::folder_scan::ScanMediaKind;
         let a = PathBuf::from(r"C:\root\a\same.jpg");
         let b = PathBuf::from(r"C:\root\b\same.png");
-        let mut media = vec![
-            (a.clone(), ScanMediaKind::Image, 1, 10),
-            (b.clone(), ScanMediaKind::Image, 2, 20),
-        ];
+        let entry =
+            |path: PathBuf, mtime: i64, file_size: i64| super::folder_scan::ScannedMediaEntry {
+                path,
+                kind: ScanMediaKind::Image,
+                mtime,
+                file_size,
+                sort_meta: crate::settings::ListingSortMetadata::new(mtime, Some(file_size)),
+            };
+        let mut media = vec![entry(a.clone(), 1, 10), entry(b.clone(), 2, 20)];
         let options = SubfolderExpansionOptions {
             skip_image_if_video_exists: false,
             skip_duplicate_images: true,
@@ -3051,6 +3544,7 @@ mod tests {
             video_thumb_use_sidecar_image: true,
             image_folder_books: false,
             include_convertible_archives: false,
+            include_epub: true,
             show_hidden_files: true,
             image_ext_priority: vec!["jpg".into(), "png".into()],
             scan_filter: SubfolderExpansionScanFilter::default(),
@@ -3059,18 +3553,19 @@ mod tests {
         apply_duplicate_filters_to_media(&mut media, &options, &mut overrides);
 
         assert_eq!(media.len(), 1);
-        assert_eq!(media[0].0, a);
+        assert_eq!(media[0].path, a);
 
-        let mut parent_a = vec![(a.clone(), ScanMediaKind::Image, 1, 10)];
-        let mut parent_b = vec![(b.clone(), ScanMediaKind::Image, 2, 20)];
+        let mut parent_a = vec![entry(a.clone(), 1, 10)];
+        let mut parent_b = vec![entry(b.clone(), 2, 20)];
         apply_duplicate_filters_to_media(&mut parent_a, &options, &mut overrides);
         apply_duplicate_filters_to_media(&mut parent_b, &options, &mut overrides);
-        assert_eq!(parent_a[0].0, a);
-        assert_eq!(parent_b[0].0, b);
+        assert_eq!(parent_a[0].path, a);
+        assert_eq!(parent_b[0].path, b);
     }
 
     #[test]
     fn sort_entries_tiebreaks_same_name_by_relative_parent() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let root = PathBuf::from(r"C:\root");
         let entries = vec![
             SubfolderExpansionEntry {
@@ -3092,7 +3587,88 @@ mod tests {
     }
 
     #[test]
+    fn subfolder_size_sort_uses_physical_sizes_and_keeps_synthetic_folders_separate() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let root = PathBuf::from(r"C:\root");
+        let entries = vec![
+            SubfolderExpansionEntry {
+                path: root.join("unknown-container"),
+                kind: SubfolderExpansionEntryKind::Folder,
+                mtime: 1,
+                file_size: 0,
+            },
+            SubfolderExpansionEntry {
+                path: root.join("ten.jpg"),
+                kind: SubfolderExpansionEntryKind::Image,
+                mtime: 1,
+                file_size: 10,
+            },
+            SubfolderExpansionEntry {
+                path: root.join("zero.jpg"),
+                kind: SubfolderExpansionEntryKind::Image,
+                mtime: 1,
+                file_size: 0,
+            },
+        ];
+        let sorted = sort_entries_for_view(entries, crate::settings::SortOrder::SizeAsc, &root);
+        let media = sorted
+            .iter()
+            .filter(|entry| entry.kind == SubfolderExpansionEntryKind::Image)
+            .map(|entry| {
+                entry
+                    .path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(media, ["zero.jpg", "ten.jpg"]);
+        assert_eq!(
+            sorted
+                .iter()
+                .find(|entry| entry.kind == SubfolderExpansionEntryKind::Folder)
+                .unwrap()
+                .file_size,
+            0,
+            "synthetic folder keeps its display placeholder; its sort size is Unknown"
+        );
+    }
+
+    #[test]
+    fn subfolder_sort_applies_name_and_numeric_desc() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let root = PathBuf::from(r"C:\root");
+        let entries = vec![
+            SubfolderExpansionEntry {
+                path: root.join("page2.jpg"),
+                kind: SubfolderExpansionEntryKind::Image,
+                mtime: 1,
+                file_size: 1,
+            },
+            SubfolderExpansionEntry {
+                path: root.join("page10.jpg"),
+                kind: SubfolderExpansionEntryKind::Image,
+                mtime: 1,
+                file_size: 1,
+            },
+        ];
+        for order in [
+            crate::settings::SortOrder::FileNameDesc,
+            crate::settings::SortOrder::NumericDesc,
+        ] {
+            let sorted = sort_entries_for_view(entries.clone(), order, &root);
+            let names = sorted
+                .iter()
+                .map(|entry| entry.path.file_name().unwrap().to_string_lossy())
+                .collect::<Vec<_>>();
+            assert_eq!(names, ["page10.jpg", "page2.jpg"], "{order:?}");
+        }
+    }
+
+    #[test]
     fn folder_grouped_order_keeps_each_relative_folder_together() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let root = PathBuf::from(r"C:\root");
         let entries = vec![
             SubfolderExpansionEntry {
@@ -3141,6 +3717,7 @@ mod tests {
 
     #[test]
     fn flat_order_preserves_legacy_cross_folder_name_sort() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let root = PathBuf::from(r"C:\root");
         let entries = vec![
             SubfolderExpansionEntry {
@@ -3189,6 +3766,7 @@ mod tests {
 
     #[test]
     fn prepare_excludes_removed_path_without_mutating_shared_snapshot() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let root = PathBuf::from(r"C:\root");
         let removed_path = root.join("a").join("removed.png");
         let kept_path = root.join("a").join("kept.png");
@@ -3213,14 +3791,23 @@ mod tests {
             entries: Arc::clone(&entries),
             video_thumb_overrides: HashMap::new(),
             diag: SubfolderExpansionDiag::default(),
+            stack_rating_source: Default::default(),
+            stack_order_request: crate::rating_sort::ListingOrderRequest::Standard(
+                crate::settings::SortOrder::FileName,
+            ),
         };
         let options = SubfolderExpansionPrepareOptions {
-            sort: crate::settings::SortOrder::FileName,
+            request: crate::rating_sort::ListingOrderRequest::Standard(
+                crate::settings::SortOrder::FileName,
+            ),
+            rating_write_generation: 0,
             order: crate::settings::SubfolderExpansionOrder::FolderGrouped,
             display_order: crate::settings::GridDisplayOrder::default(),
             load_ratings: false,
             load_tags: false,
             load_local_adjust: false,
+            page_edit_availability: Default::default(),
+            page_edit_revision: 0,
             load_video_pins: false,
             folder_pin_db: None,
             removed_paths: HashSet::from([crate::adjustment_db::normalize_path(&removed_path)]),
@@ -3246,6 +3833,7 @@ mod tests {
 
     #[test]
     fn resort_reuses_loaded_metadata_and_remaps_indexed_caches() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let root = PathBuf::from(r"C:\root");
         let a1 = root.join("a").join("1.png");
         let a2 = root.join("a").join("2.png");
@@ -3280,15 +3868,24 @@ mod tests {
             entries,
             video_thumb_overrides: HashMap::new(),
             diag: SubfolderExpansionDiag::default(),
+            stack_rating_source: Default::default(),
+            stack_order_request: crate::rating_sort::ListingOrderRequest::Standard(
+                crate::settings::SortOrder::FileName,
+            ),
         };
         let options = SubfolderExpansionPrepareOptions {
-            sort: crate::settings::SortOrder::FileName,
+            request: crate::rating_sort::ListingOrderRequest::Standard(
+                crate::settings::SortOrder::FileName,
+            ),
+            rating_write_generation: 0,
             order: crate::settings::SubfolderExpansionOrder::FolderGrouped,
             display_order: crate::settings::GridDisplayOrder::default(),
             // reuse が効いていれば DB を open せずに完了する。
             load_ratings: true,
             load_tags: true,
             load_local_adjust: true,
+            page_edit_availability: Default::default(),
+            page_edit_revision: 0,
             load_video_pins: false,
             folder_pin_db: None,
             removed_paths: HashSet::new(),
@@ -3329,6 +3926,7 @@ mod tests {
 
     #[test]
     fn sort_stops_when_prepare_is_cancelled() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let root = PathBuf::from(r"C:\root");
         let entries = vec![SubfolderExpansionEntry {
             path: root.join("a").join("1.png"),
@@ -3349,6 +3947,204 @@ mod tests {
                 SUBFOLDER_SORT_CHUNK_SIZE,
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn rating_sort_uses_complete_facts_before_subfolder_ordering() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = crate::rating_db::RatingDb::open_at(tmp.path().join("ratings.db")).unwrap();
+        let root = tmp.path().join("root");
+        let entries = ["a.jpg", "b.jpg", "c.jpg"].map(|name| SubfolderExpansionEntry {
+            path: root.join(name),
+            kind: SubfolderExpansionEntryKind::Image,
+            mtime: 0,
+            file_size: 0,
+        });
+        let keys = entries
+            .iter()
+            .map(|entry| crate::adjustment_db::normalize_path(&entry.path))
+            .collect::<Vec<_>>();
+        db.set_user_rating(&keys[0], 1, None).unwrap();
+        db.set_user_rating(&keys[1], 5, None).unwrap();
+        let facts = db.get_many_complete(&keys, 7).unwrap();
+        let spec = crate::rating_sort::RatingSortSpec {
+            direction: crate::rating_sort::RatingSortDirection::Desc,
+            unrated_position: Default::default(),
+        };
+        let indices = sorted_entry_indices_for_request(
+            &entries,
+            crate::rating_sort::ListingOrderRequest::Rating(spec),
+            Some(&facts),
+            crate::settings::SubfolderExpansionOrder::Flat,
+            &crate::settings::GridDisplayOrder::default(),
+            &root,
+            None,
+            None,
+            SUBFOLDER_SORT_CHUNK_SIZE,
+        )
+        .unwrap();
+        assert_eq!(indices, [1, 2, 0]);
+        assert_eq!(facts.write_generation(), 7);
+    }
+
+    #[test]
+    fn rating_subfolder_prepare_overlays_batch_write_after_read_without_reordering() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let root = app.tmp.path().join("r3-subfolder-race");
+        std::fs::create_dir_all(&root).unwrap();
+        let a = root.join("a.jpg");
+        let b = root.join("b.jpg");
+        for path in [&a, &b] {
+            std::fs::write(path, b"image").unwrap();
+        }
+        let a_key = crate::adjustment_db::normalize_path(&a);
+        let b_key = crate::adjustment_db::normalize_path(&b);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&a_key, 1, None)
+            .unwrap();
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&b_key, 5, None)
+            .unwrap();
+        let snapshot = SubfolderExpansionSnapshot {
+            root: root.clone(),
+            roots: vec![root],
+            scan_filter: SubfolderExpansionScanFilter::default(),
+            entries: Arc::new(
+                vec![a, b]
+                    .into_iter()
+                    .map(|path| SubfolderExpansionEntry {
+                        path,
+                        kind: SubfolderExpansionEntryKind::Image,
+                        mtime: 1,
+                        file_size: 5,
+                    })
+                    .collect(),
+            ),
+            video_thumb_overrides: HashMap::new(),
+            diag: SubfolderExpansionDiag::default(),
+            stack_rating_source: Default::default(),
+            stack_order_request: crate::rating_sort::ListingOrderRequest::Standard(
+                crate::settings::SortOrder::FileName,
+            ),
+        };
+        let spec = crate::rating_sort::RatingSortSpec {
+            direction: crate::rating_sort::RatingSortDirection::Desc,
+            unrated_position: crate::rating_sort::RatingSortUnratedPosition::BelowAll,
+        };
+        crate::rating_sort::with_test_rating_order(spec, || {
+            app.start_subfolder_expansion_prepare(snapshot, false);
+        });
+        let pending = app.subfolder_expansion_install_pending.take().unwrap();
+        let prepared = loop {
+            match pending.rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                SubfolderExpansionPrepareEvent::Progress(_) => {}
+                SubfolderExpansionPrepareEvent::Done(prepared) => break *prepared,
+                SubfolderExpansionPrepareEvent::Cancelled => panic!("prepare cancelled"),
+                SubfolderExpansionPrepareEvent::Error(message) => panic!("{message}"),
+            }
+        };
+        assert_eq!(
+            prepared
+                .items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["b.jpg", "a.jpg"]
+        );
+        app.write_user_ratings_shared(&[(a_key, 5, None), (b_key, 4, None)])
+            .unwrap();
+        let generation = app.items_generation;
+        app.install_prepared_subfolder_expansion(prepared, None);
+        assert!(app.items_generation > generation);
+        assert_eq!(
+            app.items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["b.jpg", "a.jpg"]
+        );
+        assert_eq!(app.rating_cache.get(&0), Some(&4));
+        assert_eq!(app.rating_cache.get(&1), Some(&5));
+    }
+
+    #[test]
+    fn rating_subfolder_complete_read_failure_after_first_chunk_uses_name_fallback() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let root = app.tmp.path().join("r3-subfolder-read-failure");
+        let entries = (0..501)
+            .map(|index| SubfolderExpansionEntry {
+                path: root.join(format!("{index:03}.jpg")),
+                kind: SubfolderExpansionEntryKind::Image,
+                mtime: 0,
+                file_size: 0,
+            })
+            .collect::<Vec<_>>();
+        let rated_key = crate::adjustment_db::normalize_path(&entries[499].path);
+        let bad_key = crate::adjustment_db::normalize_path(&entries[500].path);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&rated_key, 5, None)
+            .unwrap();
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&bad_key, 2, None)
+            .unwrap();
+        let conn = rusqlite::Connection::open(crate::rating_db::RatingDb::db_path()).unwrap();
+        conn.execute(
+            "UPDATE ratings SET stars = 'broken' WHERE path = ?1",
+            [&bad_key],
+        )
+        .unwrap();
+        let snapshot = SubfolderExpansionSnapshot {
+            root: root.clone(),
+            roots: vec![root],
+            scan_filter: SubfolderExpansionScanFilter::default(),
+            entries: Arc::new(entries),
+            video_thumb_overrides: HashMap::new(),
+            diag: SubfolderExpansionDiag::default(),
+            stack_rating_source: Default::default(),
+            stack_order_request: crate::rating_sort::ListingOrderRequest::Standard(
+                crate::settings::SortOrder::FileName,
+            ),
+        };
+        let spec = crate::rating_sort::RatingSortSpec {
+            direction: crate::rating_sort::RatingSortDirection::Desc,
+            unrated_position: crate::rating_sort::RatingSortUnratedPosition::BelowAll,
+        };
+        crate::rating_sort::with_test_rating_order(spec, || {
+            app.start_subfolder_expansion_prepare(snapshot, false);
+        });
+        let pending = app.subfolder_expansion_install_pending.take().unwrap();
+        let prepared = loop {
+            match pending.rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                SubfolderExpansionPrepareEvent::Progress(_) => {}
+                SubfolderExpansionPrepareEvent::Done(prepared) => break *prepared,
+                SubfolderExpansionPrepareEvent::Cancelled => panic!("prepare cancelled"),
+                SubfolderExpansionPrepareEvent::Error(message) => panic!("{message}"),
+            }
+        };
+        assert!(matches!(
+            prepared.snapshot.stack_rating_source,
+            crate::filename_stack_ui::StackRatingSource::ReadFailed
+        ));
+        assert_eq!(prepared.items[0].name(), "000.jpg");
+        assert_eq!(prepared.metadata.rating_cache.get(&499), Some(&5));
+        assert!(!prepared.metadata.rating_cache.contains_key(&500));
+        app.install_prepared_subfolder_expansion(prepared, None);
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|(message, _, _)| message.contains("名前順"))
         );
     }
 
@@ -3395,6 +4191,7 @@ mod tests {
                     name: sort.name_key(name),
                     parent: crate::filename_sort::SortNameKey::file_name(&parent),
                     row: display_order.row_for(kind),
+                    rating: None,
                 }
             })
             .collect()
@@ -3402,6 +4199,7 @@ mod tests {
 
     #[test]
     fn chunked_sort_matches_single_total_order_sort_and_reports_monotonic_progress() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let root = PathBuf::from(r"C:\root");
         let entries = chunked_sort_test_entries(&root, 257);
         let display_order = crate::settings::GridDisplayOrder::default();
@@ -3432,7 +4230,14 @@ mod tests {
             let keys = sort_keys_for_test(&entries, sort, &display_order, &root);
             let mut expected: Vec<usize> = (0..entries.len()).collect();
             expected.sort_unstable_by(|ai, bi| {
-                compare_subfolder_entry_indices(*ai, *bi, &entries, &keys, sort, order)
+                compare_subfolder_entry_indices(
+                    *ai,
+                    *bi,
+                    &entries,
+                    &keys,
+                    crate::rating_sort::ListingOrderRequest::Standard(sort),
+                    order,
+                )
             });
             assert_eq!(actual, expected);
             assert_eq!(progress.last(), Some(&entries.len()));
@@ -3442,6 +4247,7 @@ mod tests {
 
     #[test]
     fn chunked_sort_cancels_between_chunks_without_changing_comparator() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let root = PathBuf::from(r"C:\root");
         let entries = chunked_sort_test_entries(&root, 96);
         let cancel = AtomicBool::new(false);
@@ -3469,6 +4275,7 @@ mod tests {
 
     #[test]
     fn chunked_sort_cancels_during_merge_without_panicking() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let root = PathBuf::from(r"C:\root");
         let entries = chunked_sort_test_entries(&root, 96);
         let cancel = AtomicBool::new(false);
@@ -3501,6 +4308,7 @@ mod tests {
 
     #[test]
     fn snapshot_removal_drops_deleted_entries_and_video_overrides() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let root = PathBuf::from(r"C:\root");
         let kept_video = root.join("kept.mp4");
         let removed_video = root.join("removed.mp4");
@@ -3544,6 +4352,10 @@ mod tests {
                 items_found: 3,
                 ..Default::default()
             },
+            stack_rating_source: Default::default(),
+            stack_order_request: crate::rating_sort::ListingOrderRequest::Standard(
+                crate::settings::SortOrder::FileName,
+            ),
         };
         let removed = HashSet::from([crate::path_key::normalize_keep_drive(&removed_video)]);
 

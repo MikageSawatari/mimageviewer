@@ -9,7 +9,7 @@ pub(super) enum ResolveError {
     Unavailable,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(super) struct ResolvedPath {
     /// 実ファイルを開くための canonical path。
     pub canonical: PathBuf,
@@ -19,7 +19,19 @@ pub(super) struct ResolvedPath {
     /// 変換済みアーカイブや直接読み RAR の、Core 内だけで使う読み込み実体。
     /// identity / DB key / 公開住所には `logical` と `canonical` を使い続ける。
     archive_backing: Option<ResolvedArchiveBacking>,
+    /// Retained until the Remote request has finished using this EPUB address.
+    epub_read_lease: Option<crate::pdf_loader::EpubReadLease>,
 }
+
+impl PartialEq for ResolvedPath {
+    fn eq(&self, other: &Self) -> bool {
+        self.canonical == other.canonical
+            && self.logical == other.logical
+            && self.archive_backing == other.archive_backing
+    }
+}
+
+impl Eq for ResolvedPath {}
 
 #[derive(Debug, PartialEq, Eq)]
 struct ResolvedArchiveBacking {
@@ -45,7 +57,13 @@ impl ResolvedPath {
                 logical: logical_path_from_canonical(&backing_canonical),
                 canonical: backing_canonical,
             }),
+            epub_read_lease: None,
         })
+    }
+
+    pub(super) fn with_epub_read_lease(mut self, lease: crate::pdf_loader::EpubReadLease) -> Self {
+        self.epub_read_lease = Some(lease);
+        self
     }
 
     pub(super) fn has_archive_backing(&self) -> bool {
@@ -85,6 +103,7 @@ fn resolve_existing_with(
         logical,
         canonical,
         archive_backing: None,
+        epub_read_lease: None,
     })
 }
 

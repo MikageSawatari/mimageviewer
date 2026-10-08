@@ -1,0 +1,17 @@
+cf4a3ca50 Name the waveform cache where we list what is stored
+2eac62930 Document the bake stage, and stop the manual claiming it cannot happen
+8632af6a9 Let a caller outside the crate hold the export lease
+57fc2bc36 Give the owner-context helpers a non-Windows arm
+3fadb8e04 Drop the merged spread's pixel hash entirely
+22002e451 Hash the merged spread's pixels in blocks
+cd808f5a5 Record the bulk-edit ownership fix in the detached rework log
+a1318ea6b Actually run the AI bake stage the settings page offers
+28a092119 Prepare the association list before the right-click, not during it
+e029407e7 Stop reading every page's edits before the export dialog appears
+da4a90610 Move the external-change rescan off the UI thread
+04c754247 Name the viewer context a bulk edit belongs to
+6a71564b9 Count the output workers in the remote handover barrier
+1a283ad50 Resolve the LUT from the params the worker actually bakes
+85ee11d04 Count association launches per file instead of per batch
+15b7dcdf6 Give the pad's off switch a terminal state, and the menu real key labels
+b90714328 Fix four ownership slips the release review found

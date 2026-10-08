@@ -363,7 +363,7 @@ fn params_uniform(
     })
 }
 
-const PARAMS_UNIFORM_SIZE: usize = 96;
+const PARAMS_UNIFORM_SIZE: usize = 112;
 
 fn pack_params_uniform(
     plan: Anime4kPlan,
@@ -371,7 +371,7 @@ fn pack_params_uniform(
     input_size: [u32; 2],
     input_origin: [i32; 2],
 ) -> [u8; PARAMS_UNIFORM_SIZE] {
-    let mut bytes = [0_u8; 96];
+    let mut bytes = [0_u8; PARAMS_UNIFORM_SIZE];
     for (index, value) in output_size.into_iter().enumerate() {
         bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_ne_bytes());
     }
@@ -405,6 +405,10 @@ fn pack_params_uniform(
         (72, [0.0_f32, 1.0]),
         (80, [0.0_f32, 0.0]),
         (88, [0.0_f32, 0.0]),
+        // Shared native/still resolve shaders use this slot for source-exterior pixels.
+        // Still-image resampling keeps its historical opaque-black contract.
+        (96, [0.0_f32, 0.0]),
+        (104, [0.0_f32, 1.0]),
     ] {
         for (index, value) in values.into_iter().enumerate() {
             let offset = base + index * 4;
@@ -605,8 +609,8 @@ mod tests {
         };
         let bytes = pack_params_uniform(plan, [301, 401], [87, 143], [-2, 3]);
 
-        assert_eq!(PARAMS_UNIFORM_SIZE, 96);
-        assert_eq!(bytes.len(), 96);
+        assert_eq!(PARAMS_UNIFORM_SIZE, 112);
+        assert_eq!(bytes.len(), 112);
         for (offset, expected) in [
             (0, 301_u32.to_ne_bytes()),
             (4, 401_u32.to_ne_bytes()),
@@ -632,6 +636,10 @@ mod tests {
             (84, 0.0_f32.to_ne_bytes()),
             (88, 0.0_f32.to_ne_bytes()),
             (92, 0.0_f32.to_ne_bytes()),
+            (96, 0.0_f32.to_ne_bytes()),
+            (100, 0.0_f32.to_ne_bytes()),
+            (104, 0.0_f32.to_ne_bytes()),
+            (108, 1.0_f32.to_ne_bytes()),
         ] {
             assert_word(&bytes, offset, expected);
         }

@@ -38,6 +38,8 @@ struct NisParams {
     inverse_x: vec2<f32>,
     inverse_y: vec2<f32>,
     inverse_offset: vec2<f32>,
+    _padding: vec2<f32>,
+    outside_color: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -591,7 +593,7 @@ fn fs_nis(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     );
     if any(source_position < vec2<f32>(-0.5))
         || any(source_position >= oriented_size - vec2<f32>(0.5)) {
-        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        return params.outside_color;
     }
     let source_floor = vec2<i32>(floor(source_position));
     let fraction = source_position - floor(source_position);

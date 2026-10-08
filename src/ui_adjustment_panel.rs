@@ -16,6 +16,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use eframe::egui;
 use rayon::prelude::*;
@@ -9223,23 +9224,8 @@ fn draw_left_panel_tab_button(
     tab: crate::settings::FullscreenLeftPanelTab,
     selected: &mut crate::settings::FullscreenLeftPanelTab,
 ) -> bool {
-    let resp = ui.interact(rect, egui::Id::new(id), egui::Sense::click());
     let active = *selected == tab;
-    let bg = if active {
-        egui::Color32::from_rgba_unmultiplied(80, 140, 220, 220)
-    } else if resp.hovered() {
-        egui::Color32::from_rgba_unmultiplied(95, 95, 95, 210)
-    } else {
-        egui::Color32::from_rgba_unmultiplied(55, 55, 55, 180)
-    };
-    ui.painter().rect_filled(rect, 5.0, bg);
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        tab.label(),
-        egui::FontId::proportional(13.0),
-        egui::Color32::WHITE,
-    );
+    let resp = crate::ui_helpers::draw_panel_tab_button(ui, rect, id, tab.label(), active);
     if resp.clicked() && !active {
         *selected = tab;
         true
@@ -10936,6 +10922,9 @@ impl App {
         // 切り替えも一切効かないモード**になる (2026-08-26 の利用者報告)。
         if let Some(fs_idx) = self.fullscreen_idx {
             let (target_idx, pivot) = self.plan_page_edit_pivot(fs_idx);
+            if !self.raw_edit_target_entry_allowed(target_idx) {
+                return;
+            }
             if let Some(pivot) = pivot {
                 self.local_adjust_spread_ctx = Some(pivot);
                 self.enter_page_edit_single_view(target_idx);
@@ -10981,7 +10970,7 @@ impl App {
 
     fn current_local_adjust_edit_idx(&mut self) -> Option<usize> {
         let fs_root_idx = self.fullscreen_idx?;
-        let (fs_idx, _) = match self.resolve_spread_pair(fs_root_idx) {
+        let (fs_idx, _) = match self.resolve_visible_spread_pair(fs_root_idx) {
             SpreadPair::Double { left, right } => {
                 let target = match self.adjust_spread_target {
                     AdjustSpreadTarget::Left => left,
@@ -14040,10 +14029,8 @@ impl App {
             self.show_feedback_toast("被写体マスクのレイヤーを選択してください".to_string());
             return;
         }
-        let Some(runtime) = self.ai_runtime.clone() else {
-            self.show_feedback_toast("AI ランタイムが初期化されていません".to_string());
-            return;
-        };
+        self.ensure_ai_runtime();
+        let runtime_init = Arc::clone(&self.ai_runtime_init);
         // 被写体マットモデル (BiRefNet) は編集用追加パックから供給される。
         // App 構造体に毎フレーム I/O を避けてキャッシュしてあるパスを使う。
         let Some(model_path) = self.subject_matte_path.clone() else {
@@ -14062,13 +14049,27 @@ impl App {
             .copied()
             .unwrap_or(0);
         let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_worker = Arc::clone(&cancel);
         let local_ai_activity = self.local_ai_activity_lease();
         let spawn_result = std::thread::Builder::new()
             .name("local-adjust-subject-segmentation".to_string())
             .spawn(move || {
                 let _local_ai_activity = local_ai_activity;
-                let result = run_local_adjust_subject_segmentation(runtime, model_path, source)
-                    .map(LocalAdjustGeneratedMask::Subject);
+                let result = match runtime_init
+                    .wait_terminal_while(|| !cancel_worker.load(Ordering::Acquire))
+                {
+                    crate::ai::runtime::AiRuntimeInitWait::Ready(runtime) => {
+                        run_local_adjust_subject_segmentation(runtime, model_path, source)
+                            .map(LocalAdjustGeneratedMask::Subject)
+                    }
+                    crate::ai::runtime::AiRuntimeInitWait::Failed(error) => {
+                        Err(format!("AI ランタイム初期化失敗: {error}"))
+                    }
+                    crate::ai::runtime::AiRuntimeInitWait::Cancelled => {
+                        Err("被写体マスク生成をキャンセルしました".to_owned())
+                    }
+                };
                 let _ = tx.send(result);
             });
         match spawn_result {
@@ -14078,6 +14079,7 @@ impl App {
                         fs_idx,
                         layer_idx,
                         generation,
+                        cancel,
                         rx,
                     });
                 self.show_feedback_toast("被写体マスク生成中...".to_string());
@@ -14133,6 +14135,7 @@ impl App {
             .copied()
             .unwrap_or(0);
         let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
         let spawn_result = std::thread::Builder::new()
             .name("local-adjust-region-segmentation".to_string())
             .spawn(move || {
@@ -14156,6 +14159,7 @@ impl App {
                         fs_idx,
                         layer_idx,
                         generation,
+                        cancel,
                         rx,
                     });
                 self.show_feedback_toast(scope.pending_label().to_string());
@@ -14574,7 +14578,7 @@ impl App {
         let spread_lr_from_pivot = self.page_edit_spread_pair();
         // クロージャから `self` を触れないので、押されたページを持ち帰って後で適用する。
         let mut switch_target_to: Option<usize> = None;
-        let spread_pair = self.resolve_spread_pair(fs_root_idx);
+        let spread_pair = self.resolve_visible_spread_pair(fs_root_idx);
         let (fs_idx, spread_lr): (usize, Option<(usize, usize)>) = match spread_pair {
             SpreadPair::Double { left, right } => {
                 let target = match self.adjust_spread_target {
@@ -14791,13 +14795,25 @@ impl App {
                                                 // 倒す前の見開き用の値が残ることがある)。
                                                 let is_left = fs_idx == left;
                                                 if ui
-                                                    .selectable_label(is_left, "左ページ")
+                                                    .add_enabled(
+                                                        self.raw_edit_target_gate(left),
+                                                        egui::Button::selectable(
+                                                            is_left,
+                                                            "左ページ",
+                                                        ),
+                                                    )
                                                     .clicked()
                                                 {
                                                     switch_target_to = Some(left);
                                                 }
                                                 if ui
-                                                    .selectable_label(!is_left, "右ページ")
+                                                    .add_enabled(
+                                                        self.raw_edit_target_gate(right),
+                                                        egui::Button::selectable(
+                                                            !is_left,
+                                                            "右ページ",
+                                                        ),
+                                                    )
                                                     .clicked()
                                                 {
                                                     switch_target_to = Some(right);
@@ -15044,6 +15060,9 @@ impl App {
     /// `local_adjust_edge_preview_cache` は `source_key` で keyed なので消さない。
     /// `local_adjust_selected_layers` はページごとの `HashMap` なので消さない。
     pub(crate) fn switch_local_adjust_target_in_spread(&mut self, new_idx: usize) {
+        if !self.raw_edit_target_entry_allowed(new_idx) {
+            return;
+        }
         if self.fullscreen_idx == Some(new_idx) {
             return;
         }
@@ -15503,7 +15522,7 @@ impl App {
         // 見開き Double 表示中は adjust_spread_target に応じて左/右ページを編集対象に。
         // Single では fs_root_idx をそのまま使う。以降の `fs_idx` は編集対象 idx を指し、
         // 補正値読み書きパスは単ページ経路と同一。
-        let spread_pair = self.resolve_spread_pair(fs_root_idx);
+        let spread_pair = self.resolve_visible_spread_pair(fs_root_idx);
         let (fs_idx, spread_lr): (usize, Option<(usize, usize)>) = match spread_pair {
             SpreadPair::Double { left, right } => {
                 let target = match self.adjust_spread_target {
@@ -15646,6 +15665,11 @@ impl App {
                 self.detached_viewer_image_edit_tools_disabled_reason(),
                 continuous_reading,
             );
+            let (raw_edit_target, _) = self.plan_page_edit_pivot(fs_root_idx);
+            let edit_tool_disabled_reason = edit_tool_disabled_reason.or_else(|| {
+                (!self.raw_edit_target_gate(raw_edit_target))
+                    .then_some("RAW の現像が終わると編集できます")
+            });
             let can_start_edit_tool = can_overlay_edit && edit_tool_disabled_reason.is_none();
             let sns_split_rotation = if can_overlay_edit {
                 let (sns_split_target_idx, _) = self.plan_page_edit_pivot(fs_root_idx);
@@ -15815,6 +15839,9 @@ impl App {
             // と整合させるためにも必要)。`enter_*_mode` 自身が必要なキャッシュ初期化と
             // post_filter バイパスを行うので、ここでは owner を閉じるだけで十分。
             if activate_local_adjust {
+                if !self.raw_edit_target_entry_allowed(raw_edit_target) {
+                    return;
+                }
                 crate::ime_focus::record_side_panel_close(
                     child.ctx(),
                     "ui_adjustment_panel::draw_adjustment_panel:enter_local_adjust",
@@ -15823,6 +15850,9 @@ impl App {
                 return;
             }
             if activate_erase {
+                if !self.raw_edit_target_entry_allowed(raw_edit_target) {
+                    return;
+                }
                 crate::ime_focus::record_side_panel_close(
                     child.ctx(),
                     "ui_adjustment_panel::draw_adjustment_panel:enter_erase",
@@ -15832,6 +15862,9 @@ impl App {
                 return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
             }
             if activate_conceal {
+                if !self.raw_edit_target_entry_allowed(raw_edit_target) {
+                    return;
+                }
                 crate::ime_focus::record_side_panel_close(
                     child.ctx(),
                     "ui_adjustment_panel::draw_adjustment_panel:enter_conceal",
@@ -15841,6 +15874,9 @@ impl App {
                 return;
             }
             if activate_crop {
+                if !self.raw_edit_target_entry_allowed(raw_edit_target) {
+                    return;
+                }
                 crate::ime_focus::record_side_panel_close(
                     child.ctx(),
                     "ui_adjustment_panel::draw_adjustment_panel:enter_crop",
@@ -15850,6 +15886,9 @@ impl App {
                 return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
             }
             if activate_text {
+                if !self.raw_edit_target_entry_allowed(raw_edit_target) {
+                    return;
+                }
                 crate::ime_focus::record_side_panel_close(
                     child.ctx(),
                     "ui_adjustment_panel::draw_adjustment_panel:enter_text",
@@ -15859,6 +15898,9 @@ impl App {
                 return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
             }
             if activate_sns_split {
+                if !self.raw_edit_target_entry_allowed(raw_edit_target) {
+                    return;
+                }
                 match self.enter_sns_split_mode(fs_root_idx) {
                     Ok(()) => {
                         crate::ime_focus::record_side_panel_close(
@@ -16031,7 +16073,7 @@ impl App {
                             let same = self.effective_params(left) == self.effective_params(right);
                             ui.horizontal(|ui| {
                                 let is_left = self.adjust_spread_target == AdjustSpreadTarget::Left;
-                                if ui.selectable_label(is_left, "左ページ").clicked() {
+                                if ui.add_enabled(self.raw_edit_target_gate(left), egui::Button::selectable(is_left, "左ページ")).clicked() {
                                     self.adjust_spread_target = AdjustSpreadTarget::Left;
                                 }
                                 let copy_l = ui
@@ -16054,7 +16096,7 @@ impl App {
                                 if copy_r.clicked() {
                                     self.copy_spread_adjust(left, right);
                                 }
-                                if ui.selectable_label(!is_left, "右ページ").clicked() {
+                                if ui.add_enabled(self.raw_edit_target_gate(right), egui::Button::selectable(!is_left, "右ページ")).clicked() {
                                     self.adjust_spread_target = AdjustSpreadTarget::Right;
                                 }
                             });
@@ -16389,8 +16431,7 @@ impl App {
             }
             // 差分内容で clear を振り分け (AI 変更 / シャープ化のみ / 色調・post_filter)。
             self.clear_caches_for_param_change(fs_idx, &original, &edit_params);
-            // ドラッグ中に色調が動いたら、release 時のサムネ補正テクスチャ全クリアを
-            // 予約する (シャープ化だけのドラッグではサムネを無駄に再生成しない)。
+            // ドラッグ中に色調が動いたら、release 時の対象ページの失効を予約する。
             if (is_dragging || was_dragging) && !original.color_settings_eq(&edit_params) {
                 self.thumb_adjust_drag_color_dirty = true;
             }
@@ -16414,6 +16455,9 @@ impl App {
                 }
             } else if let Some(session) = self.adjustment_drag_session.take() {
                 let in_memory = self.adjustment_page_params.get(&fs_idx).cloned();
+                if self.thumb_adjust_drag_color_dirty {
+                    self.invalidate_thumb_adjust_for_dragged_page(session.fs_idx);
+                }
                 if session.before != in_memory {
                     // in-memory に書いた最終値を `set_page_params` で永続化
                     // (matches_default の正規化もここで走る)
