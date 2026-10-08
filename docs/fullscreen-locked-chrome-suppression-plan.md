@@ -577,3 +577,66 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
    strip表示選択とscene / waveform sessionが隠すだけで閉じられないことを確認する。
 coordinatorは実装diffとこの証拠を独立reviewerへ渡し、実機結果とともに受理・統合を判断する。
 commit / `.git`書込は行わず、英語メッセージを `target/E-1344-msg.txt` に置く。
+
+## 13. 実装レビュー追補（2026-10-08）
+
+対象はHEAD `c2ce085d6`に対する未commit差分。利用者提示の独立実装レビューのP2 2件をコードで確認し、両方を受け入れた。
+決定済みQ1–Q7・構造方針は変更せず、新規の利用者質問はない。
+
+- **音声VST shellの右×:** `native_event_allowed_in_music_shell`に`CloseInfoPanel`がなく、
+  active shellのhandler前段で棄却されていた。既存のcontext-owned closeへ通す許可リストを更新する。
+  回帰はshell activated・VST管理パネルclosed・ClickToShowの明示openで実handlerを呼び、
+  抑制OFF/raw OFFと抑制ON/raw ON、冪等close、open / hover / picker終了、raw lock・shell保持を検証する。
+- **同core操作継続の証拠:** 初版のbool-only helperテストは§10の必須入力/lifecycle回帰の証拠として不十分だったため撤去する。
+  mandatory GPU資源とCPU側overlay状態を分離し、製品とテストで同じ初期状態constructor、native入力変換、
+  `hud_visible`、resizeのdimension更新、最終bar visibility、egui描画・非表示cleanupを共用する。
+  GPU資源をoptional化せず、実描画を省くテスト専用分岐・別のowner・可視性cacheは設けない。
+  DComp detachは同じ描画前境界のcallbackへ移し、製品側のconfigure / submission / attach / detachと失敗順序を維持する。
+  native mouse / HUD touch入力でseek / strip ownerを作り、exact F12 hostのF11適用またはfullscreen中の設定ONと
+  同coreの拡大を経て、viewport外release / native touch cancelで終端する。
+  終端後の非表示とcommand非再実行、navigation previewが最終可視性を覆す場合の実cleanup、
+  実ボタンから開いたspeed popupのresize後の描画 / HUD regionと外クリックcloseも検証する。
+  CPU側の回帰は実HWND / GPU surface configure自体を実行しない。その実機確認は引き続き利用者が担当する。
+
+検証対象は上記HEADに対するこの追補差分。redは以下のとおりで、fixture不備によるcompile / hit失敗はred証拠に含めない。
+
+| 負の確認 | 結果 / ログ |
+| --- | --- |
+| shell allow-list修正前の実handler | 抑制OFFで明示openがClosedにならず1件失敗、exit 101。`target/E-1344-fix-shell-red.log` |
+| 同core可視維持の接続を一時切断 | native入力からowner生成後のresizeで3件すべてが実`hud_visible`検査に失敗、exit 101。`target/E-1344-fix-interaction-disconnected-red.log`。復元前後のソースbyte一致を確認し、切断差分を残していない |
+| 実経路の操作回帰（接続あり） | 3件通過。seek / strip × mouse release / HUD touch cancel × F11適用 / 設定ONの8通り、navigation previewによるhidden cleanup 2通り、speed popupの実入力open / close。`target/E-1344-fix-interaction.log` |
+
+Areaのサイズ・位置の初期passを完了してから描画済みhit rectを読み、resize後の各layout passでも可視性を検査する。
+この有限passのfixtureは製品の待機・時間窓を追加するものではない。
+最終ソースに対するgate結果（すべて実exit 0、snapshotのgolden変更なし）:
+
+| 検証 | 結果 / ログ |
+| --- | --- |
+| `cargo fmt` / `cargo fmt --check` | 整形済み・check通過。既存CRLFを維持。 `target/E-1344-fix-fmt.log` |
+| `cargo test -p mimageviewer --lib chrome_suppression` | 16件通過。 `target/E-1344-fix-focused.log` |
+| `cargo test -p mimageviewer --lib video::native_presenter::render_core::tests` | 113件通過。 `target/E-1344-fix-render-core.log` |
+| `cargo test -p mimageviewer --lib chrome_suppression --features test-script` | 17件通過。 `target/E-1344-fix-focused-test-script.log` |
+| `cargo test -p mimageviewer --lib` | 10,952件通過 / 52 ignored / 失敗0、1247.68秒。pipelineなし。 `target/E-1344-fix-full-lib.log` |
+| 通常core / portable core check | 両方通過。 `target/E-1344-fix-check-normal.log` / `target/E-1344-fix-check-portable.log` |
+| `cargo test -p mimageviewer --test ui_snapshot` | 106件通過。 `target/E-1344-fix-ui-snapshot.log` |
+| `python scripts/check_ui_glyphs.py` | dangerous glyph 0。 `target/E-1344-fix-glyphs.log` |
+
+core checkおよびbuild-devでは、このworktree内の既存dependencyを使用し、`CARGO_BUILD_JOBS=1`で実行した。
+`.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` はexit 0で完了。
+通常機能セットのcore（13分02秒）・remote・EPUB workerを生成し、runtime 4件 / PE 3件の検査を通過した。
+ログは `target/E-1344-fix-build-dev.log`（PowerShell transcript。native compilerのstderrはtool出力で確認）。
+製品起動・commit・build-dist・test-fullは行っていない。
+
+今回の実機確認（未実施）:
+
+1. 音声VST shellを有効にし、VST管理パネルを閉じる。右パネルをクリック表示にして開き、
+   抑制OFFで×が一回で閉じることを確認する。右の抑制ON / raw lock ON / F11中でも繰り返し、
+   鍵の保持・音声再生とshellの継続を確認する。
+2. native動画のF12窓で下部とstripを固定し、下部抑制ONにする。seek / stripをdragしたままF11で拡大し、
+   旧下端が新下端帯外でも操作が続き、領域外でreleaseした後は終了して自動表示へ戻ることを確認する。
+   速度popupも開いたままF11またはfullscreen中の抑制設定ONを試し、描画位置に追従し外クリックで閉じることを確認する。
+3. インストール版 / tray常駐を終了してから `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe` で起動する。
+   通常の `%APPDATA%\mimageviewer` を使用し、実設定・データを更新し得る。single-instance mutexはインストール版と共有する。
+
+coordinatorは今回の未commit差分とgateログを独立reviewerへ渡し、上記実機結果と合わせて受理を判断する。
+英語commit messageは `target/E-1344-fix-msg.txt`。新しい利用者質問はない。

@@ -13654,6 +13654,7 @@ impl App {
                 | Ev::ToggleSidePanelMode
                 | Ev::ToggleBarLock { .. }
                 | Ev::ToggleClickInfoOpen
+                | Ev::CloseInfoPanel
                 | Ev::ToggleInfoPanelLock
                 | Ev::SetVst3PanelVisible { .. }
                 | Ev::SetVst3PanelPos { .. }
@@ -15989,6 +15990,45 @@ mod native_video_display_mode_toggle_tests {
                 crate::ui_helpers::MetadataPanelOpenState::Closed
             );
             assert!(!app.fs_info_panel.hover_active);
+        }
+    }
+
+    #[test]
+    fn chrome_suppression_music_vst_shell_close_info_reaches_handler_with_suppression_off_and_on() {
+        for suppressed in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let ctx = egui::Context::default();
+            app.fullscreen_idx = Some(0);
+            app.viewer_presentation = ViewerPresentation::Fullscreen;
+            app.music_vst_shell = Some(super::super::MusicVstShell {
+                fs_idx: 0,
+                activated: true,
+            });
+            app.show_vst3_manager = false;
+            app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
+            app.settings.fullscreen_chrome_suppression.info = suppressed;
+            app.fs_info_panel.locked = suppressed;
+            app.fs_info_panel.open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
+            app.fs_info_panel.hover_active = true;
+            app.fullscreen_tag_picker_open = true;
+            for _ in 0..2 {
+                app.handle_native_video_output_event(
+                    &ctx,
+                    0,
+                    0,
+                    crate::video::NativeVideoOutputEvent::CloseInfoPanel,
+                );
+                assert_eq!(app.fs_info_panel.locked, suppressed);
+                assert_eq!(
+                    app.fs_info_panel.open,
+                    crate::ui_helpers::MetadataPanelOpenState::Closed,
+                    "active music VST shell must route close even with suppression={suppressed}"
+                );
+                assert!(!app.fs_info_panel.hover_active);
+                assert!(!app.fullscreen_tag_picker_open);
+                assert!(!app.show_vst3_manager);
+                assert!(app.music_vst_shell.is_some_and(|shell| shell.activated));
+            }
         }
     }
 

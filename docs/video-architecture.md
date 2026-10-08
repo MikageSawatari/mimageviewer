@@ -9,6 +9,13 @@ NVIDIA RTX VSR 関連の Phase 2 (DComp overlay) を撤回した後の **最終�
 > HUD 描画コードは旧版の残骸 (v0.9.0 で native presenter に移行)。新規 UI 機能を追加する際は
 > `native_presenter` 側に書くこと。詳細は本書「採用アーキテクチャ」節と「ファイル責務」節を参照。
 
+native overlayは必須のGPU資源 `NativeEguiOverlayGpu` とCPU側の入力・描画状態
+`NativeEguiOverlayState` を分けて保持する。native presenterとheadless回帰は同じ
+`hud_visible`・resize寸法更新・egui描画・最終可視性・hidden cleanupを使用し、
+テスト用のboolだけで同core操作継続を判定しない。DCompのattach / detachとGPU
+configure / submissionは製品rendererの既存境界に残る。検証範囲は
+[locked chrome抑制の実装追補](fullscreen-locked-chrome-suppression-plan.md#13-実装レビュー追補2026-10-08)を参照。
+
 ## 設計目標
 
 | 優先順位 | 目標 |
