@@ -720,7 +720,6 @@ enum RatingPhysicalLoadIntent {
 pub(crate) struct QuickFolderSwitchLoadOwner {
     source_context: ViewerContextId,
     source_surface_generation: u64,
-    source_items_generation: u64,
     source_slot: Option<QuickFolderSlotId>,
     source_slot_switch_sequence: u64,
     target_slot: QuickFolderSlotId,
@@ -23340,11 +23339,17 @@ impl App {
         self.main_folder_history_available()
             && self.projected_viewer_context_id() == owner.source_context
             && self.top_level_grid_view.generation() == owner.source_surface_generation
-            && self.items_generation == owner.source_items_generation
+            // Typed restores consume copied state plus the destination load. Explicit
+            // activation and refresh owners also authorize source-row/order snapshots.
+            && (owner.intent == RatingPhysicalLoadIntent::Restore
+                || self.items_generation == owner.source_items_generation)
             && self.active_quick_folder_slot == owner.source_slot
             && self.quick_folder_switch_sequence == owner.source_slot_switch_sequence
             && crate::folder_tree::path_eq(path, &owner.target_path)
-            && self.folder_nav_current_target().as_ref() == Some(&owner.source_location)
+            // Restore source identity belongs to the original common Surface proof;
+            // source presentation hints (for example collection revision) may refresh.
+            && (owner.intent == RatingPhysicalLoadIntent::Restore
+                || self.folder_nav_current_target().as_ref() == Some(&owner.source_location))
     }
 
     fn quick_folder_switch_owner_is_current(
@@ -23355,7 +23360,6 @@ impl App {
         self.main_folder_history_available()
             && self.projected_viewer_context_id() == owner.source_context
             && self.top_level_grid_view.generation() == owner.source_surface_generation
-            && self.items_generation == owner.source_items_generation
             && self.active_quick_folder_slot == owner.source_slot
             && self.quick_folder_switch_sequence == owner.source_slot_switch_sequence
             && crate::folder_tree::path_eq(path, &owner.target_path)
@@ -27291,6 +27295,11 @@ impl App {
                 self.copied_destination_source_proof()
             }
             OpenRequestOwner::Bookmark(owner) => MainListSourceProof::Bookmark(owner.clone()),
+            OpenRequestOwner::RatingPhysical(owner)
+                if owner.intent == RatingPhysicalLoadIntent::Restore =>
+            {
+                self.copied_destination_source_proof()
+            }
             // Requests with native row/snapshot owners retain their strict validators.
             // Their items/revision/index checks must remain strict, regardless of file suffix.
             OpenRequestOwner::RatingPhysical(_)
@@ -30784,9 +30793,10 @@ impl App {
             PhysicalHistoryIntent::Bookmark { owner, .. } => {
                 MainListSourceProof::Bookmark(owner.clone())
             }
-            PhysicalHistoryIntent::Rating { .. } | PhysicalHistoryIntent::CollectionGrid { .. } => {
-                MainListSourceProof::Row
+            PhysicalHistoryIntent::Rating { owner, .. } => {
+                self.copied_open_source_proof(&OpenRequestOwner::RatingPhysical(owner.clone()))
             }
+            PhysicalHistoryIntent::CollectionGrid { .. } => MainListSourceProof::Row,
             PhysicalHistoryIntent::Navigation { .. }
             | PhysicalHistoryIntent::RequiredFullscreen { .. }
             | PhysicalHistoryIntent::CollectionNavigation { .. }
@@ -32147,7 +32157,6 @@ impl App {
                 OpenRequestOwner::QuickFolderSwitch(QuickFolderSwitchLoadOwner {
                     source_context: request.source_context,
                     source_surface_generation: request.source_surface_generation,
-                    source_items_generation: request.source_items_generation,
                     source_slot: request.source_slot,
                     source_slot_switch_sequence: request.source_slot_switch_sequence,
                     target_slot: *slot,
@@ -32879,7 +32888,9 @@ impl App {
             saved_folder: self.rating_view_saved_folder.clone(),
             subfolder_restore: self.rating_view_subfolder_restore.clone(),
         };
-        self.start_rating_physical_restore(restore, None, RatingPhysicalLoadIntent::Explicit);
+        // BS restores a copied parent chain, rather than activating a current source row.
+        // The common Direct operation still records this move only after successful adoption.
+        self.start_rating_physical_restore(restore, None, RatingPhysicalLoadIntent::Restore);
     }
 
     fn select_rating_view_row_for_opened_path(&mut self, path: &Path) {

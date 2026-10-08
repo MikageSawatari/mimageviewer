@@ -510,8 +510,19 @@ context/request、main採用資格、slot等の検証も、その要求が既存
 既存`quick_folder_switch_sequence`をすべての証明が照合する共通switch epochとして使い、
 Quick Folderの同slot再選択／同target A→B→Aと検索owner/query/drill切替で進める。
 同queryの結果追加、PDF verification、Collection revisionでは進めず、Surfaceを無通知で取消さない。
-新しいepoch fieldやSmart lease fieldを増やす案と、待ち中のrow更新を凍結する案を比較し、
-既存sequence＋切替受理時の既存取消終端を選んだ。追加pending/rollbackや閲覧制限は不要である。
+新しいepoch fieldやSmart lease fieldを増やす案と、すべてのrow更新を待ち中に凍結する案を比較し、
+既存sequence＋切替受理時の既存取消終端を選んだ。追加pending/rollbackは不要である。
+2026-10-08 coordinator決定: committed warm PDF verificationの既存保留は維持する。
+履歴／分類要求がpending、またはdocument-open modal中は補正をpollせず、採用／取消後に既存ownerで
+処理する（2026-09-28導入、3729208d7 / 4640930d2）。この限定した保留で状態の組み合わせを減らし、
+並行処理を拡張しない。Surface証明は、その他の到達可能な同owner行更新を理由に要求を取消さない。
+RatingPhysicalの既存intentも同じ規則に従い、Explicit／行順snapshotにも使うRefreshの行依存と、コピー済みRestoreを区別する。
+Restoreのsource意味identityは元の共通Surface証明が検証する。native validatorではsource items世代や
+source地点のCollection revision／viewport hint等の表示snapshotを再照合せず、context／surface／slot／
+switch epoch／target pathを維持する。Explicit／Refreshのsource行世代・地点snapshotの一致は維持する。
+BSのコピー済み親chainはRestoreとして受け付け、外側の履歴操作は従来どおりDirectで成功後に記録する。
+QuickFolderSwitchはコピー済みtarget slot/pathだけを使うためnative items世代条件と不要な保存fieldを除く。
+context／surface／slot／switch sequence／path条件は維持する。
 全producer/consumerと退役境界のcode監査は [async-architecture.md](async-architecture.md#source-proof選択箇所の監査2026-10-08) に記録する。
 
 | sourceの証明 | 保持・再検証するもの | 許容しない共通化 |
@@ -676,14 +687,14 @@ facet修正のためにratingの意味や永続値を変更せず、同じ採用
 
 | lifecycle | history / facetへの効果 |
 | --- | --- |
-| open受理・分類・scan・列挙pending | source proofとtyped targetを一つの要求へcapture。要求自体はsourceの表示owner/current/active facet/stash/committed stackを書き換えない。同ownerの既存verification/revisionによるrow更新を凍結する意味ではなく、継続可否はSourceProofで判断。address/loading表示は要求からのpreviewで、採用した現在地と混同しない |
+| open受理・分類・scan・列挙pending | source proofとtyped targetを一つの要求へcapture。要求自体はsourceの表示owner/current/active facet/stash/committed stackを書き換えない。committed warm PDF verificationは既存どおり履歴／分類pendingまたはdocument-open modal中は保留し、他の同owner行更新はSourceProofで継続可否を判断。address/loading表示は要求からのpreviewで、採用した現在地と混同しない |
 | 成功 | §9.3.3を一回実行。同じZIPへの初回・history再入場・BS、Direct/CachedZip、warm/coldで結果が一致する |
 | 別open/連続Replay・A/B切替 | 通常pendingは取消・置換できる。Replay連打は同じplanをmove、別intentは表示中sourceから作り直す。slot切替の成功時だけtarget slot/routeを採用。切替受理時に旧要求を退役させ、遅延replyは全SourceProofの共通switch epochとnative ownerで棄却。slot別stashは作らない |
 | conversion/password待ち | 未採用の同じ要求phaseとして既存モーダルの操作受付規則を維持。成功payloadまでfacet/履歴を変更しない |
 | sourceのsidecar待ち / destinationのsidecar hydration | sourceの既存hydration中は現行admission/input gateを維持。宛先ではstep 4までに移動・facet・履歴を採用してからsidecarを開始し、既存の待機表示/first-display/deferred fullscreenを仕上げる。sidecar結果で移動をrollbackしない |
 | 採用前のcancel・scan/列挙エラー・worker disconnect・refusal・stale | 要求とそのworker/cancel/leaseだけを退役し、表示中owner・facet・committed cursorを保つ。同ownerの既存metadata更新をundoしない。既存toast等の通知を使い、履歴snapshotの書戻し、retry、delayによる救済をしない |
 | reload・通知・ソート・fullscreenから同じ本のページ一覧 | SameLocationとしてroute/cursor不変、二重stashなし。表示位置や本内部prefixの既存復帰を維持 |
-| sourceのPDF verification / Collection revision更新 | surface依存要求は安定した意味が同じなら継続する。row/snapshot依存要求はその既存generation/revision proofで再検証。どちらも同ID再open等の別ownerへは継続させない |
+| sourceのPDF verification / Collection revision更新 | committed warm PDF verificationは履歴／分類pendingまたはdocument-open modal中は既存poll gateで保留する。保留対象外のSmart移動などで補正が進む場合、またはその他の同owner行更新では、surface依存要求は安定した意味が同じなら継続する。row/snapshot依存要求は既存generation/revision proofで再検証。同ID再open等の別ownerへは継続させない |
 | Main context退役・park・detached fork/mount/swap/close | 要求がsource contextと共に移る場合もmain採用資格を満たす時だけcommit。一時mount/read-only swapは採用ではない。sourceが退役した要求はdropし、sibling/global ownerのrollbackをしない。既存detached predicate/viewportは変更しない |
 | Collection削除prune | authoritative Ready catalogで既存どおりentryをprune。旧baselineの要求は失効。表示中childのPathへの既存投影を保ち、消えたCollectionへ復帰・再記録しない。次の実navigationでfacet frameを通常の退出規則で消費する |
 
@@ -744,7 +755,15 @@ SourceProofのnative validatorを再利用し、共通のitems/revision guardで
   復元済みmetadataで計算されること、warning/resumeや完了で再push/popしないことを検証する。
   タグ/補正反映で可視性が変わる例、親選択/scroll、StartupListIntent、deferred fullscreen/旧表示unit保持を
   既存sidecar回帰と併用。late reply/context退役でも別contextのhistory/facetを戻さない。
-- **証明の交差**: PDF placeholderのverification完了でitems世代が進む間にSmart移動をpendingにし、
+- **証明の交差**: ★一覧→ZIP→cached PDF→Backでは、準備中の実PDF pollが補正を保留し、
+  ForwardでBackを取消した後に補正が再開することを検査する。guardを外して交差を捏造しない。
+  ★一覧→ZIP→別ZIP→Back／BSでは、毎frameの実pin通知consumerがZIPの同階層を再構築して
+  items世代を進めてもtyped restoreが一回だけ採用され、同じ更新で明示openは失効する対照を入れる。
+  ★一覧→ZIP→Collection→Backでは、実Collection actorの登録追加→revision publish→grid再installを
+  ZIP準備待ちに交差させる。source items世代と地点のrevision／viewport hintが変わっても、同一ownerの
+  typed Rating restoreは採用される。元共通Surface証明による意味identity／epoch検証は維持する。
+  QuickFolderSwitch native証明でも同じ行更新を許し、switch epoch／宛先変更は拒否する。
+  PDF placeholderのverification完了でitems世代が進む間に保留対象外のSmart移動をpendingにし、
   同じsurfaceなら有効で、別path/surfaceへのopenなら失効することを採用handlerで検査する。
   `staged_smart_folder_collection_lease_survives_revision_refresh`（`tests.rs:87301`）と
   `staged_smart_folder_collection_lease_rejects_same_id_reopen`を維持し、pending中にCollectionの行/revisionが

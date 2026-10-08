@@ -22860,6 +22860,245 @@ mod phase_c_folder_nav_history_tests {
     }
 
     #[test]
+    fn section1339_rating_restore_survives_live_zip_pin_refresh_but_explicit_open_expires() {
+        for action in ["history", "bs", "explicit"] {
+            let mut app = setup_app();
+            app.active_quick_folder_slot = None;
+            app.settings.sidecar_backup_enabled = false;
+            app.settings.auto_fullscreen_zip_pdf = false;
+            let parent = app.tmp.path().join("rating-native-proof");
+            std::fs::create_dir_all(&parent).unwrap();
+            let first = parent.join("first.zip");
+            let second = parent.join("second.zip");
+            for book in [&first, &second] {
+                write_1328_zip(book);
+                let key = crate::adjustment_db::normalize_path(book);
+                let meta =
+                    crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::ZipFile)
+                        .with_source_path(book);
+                app.rating_db
+                    .as_ref()
+                    .unwrap()
+                    .set_user_rating(&key, 3, Some(&meta))
+                    .unwrap();
+            }
+            app.current_folder = Some(parent.clone());
+            app.enter_rating_view(3);
+            finish_rating_navigation_for_test(&mut app);
+            for book in [&first, &second] {
+                let owner = app.rating_view_physical_load_owner(book).unwrap();
+                assert!(app.start_rating_physical_open(
+                    owner,
+                    crate::app::StartupListIntent::ExplicitList,
+                ));
+                finish_staged_physical_history_for_test(&mut app);
+            }
+            let source = app.folder_nav_current_target().unwrap();
+            let history = app.folder_nav_history_snapshot();
+            let facet = app.facet_navigation.clone();
+            match action {
+                "history" => {
+                    app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
+                }
+                "bs" => app.rating_view_back(),
+                "explicit" => {
+                    let owner = app.rating_view_physical_load_owner(&first).unwrap();
+                    assert!(app.start_rating_physical_open(
+                        owner,
+                        crate::app::StartupListIntent::ExplicitList,
+                    ));
+                }
+                _ => unreachable!(),
+            }
+            app.settle_open_path_classification_for_test();
+            assert!(
+                app.top_level_grid_view
+                    .history_navigation_transition()
+                    .is_some()
+            );
+            let generation = app.items_generation;
+            // A committed pin notification (including one published by another window) is
+            // consumed every frame. Its real ZIP refresh reinstalls rows at the same level;
+            // do not fabricate an items_generation change or remove the pending request.
+            assert!(app.set_folder_thumb_pin(
+                &second,
+                crate::folder_thumb_pins::FolderPinSource::ZipEntry {
+                    zip_rel: String::new(),
+                    entry: "page-0.jpg".into(),
+                },
+            ));
+            app.consume_folder_thumb_pin_dirty();
+            assert!(app.items_generation > generation);
+            assert_eq!(app.folder_nav_current_target(), Some(source.clone()));
+            assert_eq!(app.folder_nav_back_stack, history.back_stack);
+            assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+            assert_eq!(app.facet_navigation, facet);
+            assert!(
+                app.top_level_grid_view
+                    .history_navigation_transition()
+                    .is_some()
+            );
+            finish_staged_physical_history_for_test(&mut app);
+            if action == "explicit" {
+                assert_eq!(app.current_folder.as_ref(), Some(&second));
+                assert_eq!(app.folder_nav_back_stack, history.back_stack);
+                assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+            } else {
+                assert_eq!(app.current_folder.as_ref(), Some(&first), "{action}");
+                assert_eq!(app.rating_view_nav_stack, vec![first.clone()]);
+                if action == "history" {
+                    assert_eq!(app.folder_history_forward_target(), Some(&source));
+                    assert_eq!(
+                        app.folder_nav_back_stack.len() + 1,
+                        history.back_stack.len()
+                    );
+                } else {
+                    assert_eq!(app.folder_history_back_target(), Some(&source));
+                    assert_eq!(
+                        app.folder_nav_back_stack.len(),
+                        history.back_stack.len() + 1
+                    );
+                }
+            }
+            let adopted = app.folder_nav_history_snapshot();
+            app.poll_collection_history_transition(&egui::Context::default());
+            assert_eq!(app.folder_nav_back_stack, adopted.back_stack);
+            assert_eq!(app.folder_nav_forward_stack, adopted.forward_stack);
+        }
+    }
+
+    #[test]
+    fn section1339_quick_native_proof_survives_rows_but_rejects_switch_epoch() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let parent = app.tmp.path().join("quick-native-proof");
+        std::fs::create_dir_all(&parent).unwrap();
+        let book = parent.join("book.zip");
+        write_1328_zip(&book);
+        app.load_folder(book.clone());
+        finish_staged_physical_history_for_test(&mut app);
+        let owner = crate::app::QuickFolderSwitchLoadOwner {
+            source_context: app.projected_viewer_context_id(),
+            source_surface_generation: app.top_level_grid_view.generation(),
+            source_slot: app.active_quick_folder_slot,
+            source_slot_switch_sequence: app.quick_folder_switch_sequence,
+            target_slot: QuickFolderSlotId::A,
+            target_path: parent.clone(),
+        };
+        assert!(app.quick_folder_switch_owner_is_current(&owner, &parent));
+        assert!(app.set_folder_thumb_pin(
+            &book,
+            crate::folder_thumb_pins::FolderPinSource::ZipEntry {
+                zip_rel: String::new(),
+                entry: "page-0.jpg".into(),
+            },
+        ));
+        app.consume_folder_thumb_pin_dirty();
+        assert!(app.quick_folder_switch_owner_is_current(&owner, &parent));
+        assert!(!app.quick_folder_switch_owner_is_current(&owner, &book));
+        app.retire_main_list_requests_for_surface_switch();
+        assert!(!app.quick_folder_switch_owner_is_current(&owner, &parent));
+    }
+
+    #[test]
+    fn section1339_rating_cached_pdf_verification_defers_during_back_then_resumes_on_cancel() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        let parent = app.tmp.path().join("rating-pdf-deferral");
+        std::fs::create_dir_all(&parent).unwrap();
+        let book = parent.join("book.zip");
+        write_1328_zip(&book);
+        let key = crate::adjustment_db::normalize_path(&book);
+        let meta = crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::ZipFile)
+            .with_source_path(&book);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&key, 3, Some(&meta))
+            .unwrap();
+        let pdf = parent.join("warm.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        let stamp = std::fs::metadata(&pdf).unwrap();
+        app.get_or_open_catalog(&parent)
+            .unwrap()
+            .set_pdf_meta(
+                "warm.pdf",
+                crate::ui_helpers::mtime_secs(&stamp),
+                stamp.len() as i64,
+                2,
+                false,
+            )
+            .unwrap();
+        app.current_folder = Some(parent);
+        app.enter_rating_view(3);
+        finish_rating_navigation_for_test(&mut app);
+        let owner = app.rating_view_physical_load_owner(&book).unwrap();
+        assert!(app.start_rating_physical_open(owner, crate::app::StartupListIntent::ExplicitList));
+        finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(
+            app.load_pdf_as_folder_owned(
+                pdf.clone(),
+                crate::app::OpenRequestOwner::Navigation,
+                crate::app::StartupListIntent::ExplicitList,
+            ),
+            FolderOpenOutcome::Loaded
+        );
+        assert_eq!(app.items.len(), 2);
+        app.pdf_enumerate_pending.as_mut().unwrap().2 =
+            crate::pdf_loader::completed_enumerate_result_handle(
+                &pdf,
+                Ok(crate::pdf_loader::PdfEnumerateResult {
+                    pages: (0..3)
+                        .map(|page_num| crate::pdf_loader::PdfPageEntry {
+                            page_num,
+                            mtime: crate::ui_helpers::mtime_secs(&stamp),
+                            file_size: stamp.len(),
+                        })
+                        .collect(),
+                    direction: None,
+                    stamp: None,
+                }),
+            );
+        let generation = app.items_generation;
+        let history = app.folder_nav_history_snapshot();
+        let facet = app.facet_navigation.clone();
+        app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+        );
+        app.poll_pdf_enumerate();
+        assert_eq!(
+            app.items.len(),
+            2,
+            "released warm verification waits during Back"
+        );
+        assert_eq!(app.items_generation, generation);
+        assert!(app.pdf_enumerate_pending.is_some());
+        // Forward cancels the provisional Back through the real history dispatcher.
+        app.dispatch_main_folder_history_input(FolderHistoryDirection::Forward);
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_none()
+        );
+        app.poll_pdf_enumerate();
+        assert_eq!(
+            app.items.len(),
+            3,
+            "the retained verifier resumes after cancellation"
+        );
+        assert!(app.items_generation > generation);
+        assert_eq!(app.current_folder.as_ref(), Some(&pdf));
+        assert_eq!(app.folder_nav_back_stack, history.back_stack);
+        assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+        assert_eq!(app.facet_navigation, facet);
+    }
+
+    #[test]
     fn section1339_rating_zip_backspace_back_forward_restashes_live_parent() {
         let mut app = setup_app();
         app.active_quick_folder_slot = None;

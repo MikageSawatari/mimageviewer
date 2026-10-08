@@ -4375,6 +4375,110 @@ mod tests {
         app.shutdown_collection_runtime_for_exit();
     }
 
+    #[test]
+    fn section1339_rating_restore_crosses_real_collection_revision_without_source_hint_proof() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let book = temp.path().join("rated.zip");
+        write_single_page_zip(&book);
+        let (mut app, client) = start_ready_app(&temp.path().join("collections.db"));
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        let key = crate::adjustment_db::normalize_path(&book);
+        let meta = crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::ZipFile)
+            .with_source_path(&book);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&key, 3, Some(&meta))
+            .unwrap();
+        app.current_folder = Some(temp.path().to_path_buf());
+        app.enter_rating_view(3);
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.rating_view_pending.is_some() {
+            assert!(Instant::now() < deadline, "Rating source did not settle");
+            app.poll_rating_view();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let owner = app.rating_view_physical_load_owner(&book).unwrap();
+        assert!(
+            app.start_rating_physical_open(owner, super::super::StartupListIntent::ExplicitList)
+        );
+        poll_real_history_load(&mut app, Some(&book), None);
+        let destination = app.folder_nav_current_target().unwrap();
+        let created = recv(client.create_collection("Restore source".into()).unwrap());
+        let id = created.collection_id();
+        app.open_collection_grid_from_navigation(id);
+        wait_for_grid(&mut app, id);
+        let source = app.folder_nav_current_target().unwrap();
+        let generation = app.items_generation;
+        let history = app.folder_nav_history_snapshot();
+        let facet = app.facet_navigation.clone();
+        app.dispatch_main_folder_history_input(super::super::FolderHistoryDirection::Back);
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+        );
+        let child = temp.path().join("new-child");
+        std::fs::create_dir_all(&child).unwrap();
+        let changed = recv(
+            client
+                .add_batch(
+                    id,
+                    created.revision(),
+                    vec![
+                        CollectionRegistration::from_trusted_path(
+                            &child,
+                            CollectionResolvedKind::Folder,
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+        );
+        let revision = changed.snapshot.revision();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            // Only poll the real source actor/prepare owners here; the destination ZIP reply
+            // may already be buffered. Do not replace/remove its navigation request.
+            app.poll_collection_ui(&ctx);
+            app.poll_collection_grid(&ctx);
+            if app
+                .top_level_grid_view
+                .collection_session()
+                .is_some_and(|session| {
+                    session.accepted_revision >= revision
+                        && session.installed_items_generation == Some(app.items_generation)
+                })
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "source collection revision did not settle"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(app.items_generation > generation);
+        assert_ne!(app.folder_nav_current_target(), Some(source));
+        assert_eq!(app.folder_nav_back_stack, history.back_stack);
+        assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+        assert_eq!(app.facet_navigation, facet);
+        poll_real_history_load(&mut app, Some(&book), None);
+        assert_eq!(app.folder_nav_current_target(), Some(destination));
+        assert!(matches!(app.folder_history_forward_target(),
+            Some(super::super::FolderNavHistoryTarget::Collection(root))
+                if root.identity.collection_id == id));
+        assert_eq!(
+            app.folder_nav_back_stack.len() + 1,
+            history.back_stack.len()
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
     #[cfg(windows)]
     #[test]
     fn rating_child_backspace_back_forward_round_trip_uses_keyboard_history() {
