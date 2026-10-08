@@ -1,8 +1,8 @@
 # 指定サイズのフルスクリーンfit計画（§1.342）
 
-作成: 2026-10-08 / 改訂: 2026-10-09（r2）/ ラインE。
-状態: **独立設計レビューREVISEの3件を反映した案・再レビューと利用者判断待ち**。
-コード照合基準: 初版 `6078f6595`、本改訂 `2d327da31`。本ラウンドは文書のみ。製品コード・保存データを変更しない。
+作成: 2026-10-08 / 改訂: 2026-10-09（r3）/ ラインE。
+状態: **r2の3件と再レビューのPDF自己増幅1件を反映した案・再レビューと利用者判断待ち**。
+コード照合基準: 初版 `6078f6595`、r2 `2d327da31`、r3 `ab99c0a6b`（レビュー対象文書 `d648a5d54`）。本ラウンドは文書のみ。製品コード・保存データを変更しない。
 
 ## 1. 要求と境界
 
@@ -34,6 +34,7 @@ file:lineは上記HEAD時点。既存の状態・入口を拡張できる根拠�
 | 対象媒体 | [ui_fullscreen.rs:37376](../src/ui_fullscreen.rs#L37376)はImage / ZipImage / PdfPageを対象とし、通常の画像フォルダでも使える。動画・音楽は循環対象外 |
 | 凍結描画 | [ui_fullscreen.rs:2921](../src/ui_fullscreen.rs#L2921)はcapturedのfit mode・limits・placementを渡す。:3159等もcapture値を使う。指定値を現在のSettingsから後読みする入口を作らない |
 | PDF要求 | [ui_fullscreen.rs:23574](../src/ui_fullscreen.rs#L23574)と:37089が初回targetを構築。[pdf_loader.rs:4974](../src/pdf_loader.rs#L4974)は物理pxと既存4種のfit、:6547は必要raster長辺を導出。[app.rs:69828](../src/app.rs#L69828)は同じtargetをズーム再レンダへ使う |
+| PDF再レンダの循環 | [app.rs:69974](../src/app.rs#L69974)は結果のpage boxを捨て、:69988でraster寸法をsource_dimsへ採用。:78199のsource_dims_for_idxもその画素寸法を返す。原寸制限後に手動zoomを掛ける:365の幾何から次の需要を作ると、原寸・需要が自己増幅し得る。PDF page boxは[pdf_loader.rs:5118](../src/pdf_loader.rs#L5118)の1/1000 point、content typeは:5017、Original最低長辺4096とnative capは:5010 / :6556〜:6563で確認。新方式だけPDF原寸をraster出力から分離する |
 | 単ページZ / 見開きZ | [displayed_image_transform.rs:1127](../src/displayed_image_transform.rs#L1127)はPage・制限なし・自由回転なしを強制。:1815のfull_image_zoomはPage基準。一方[ui_fullscreen.rs:40978](../src/ui_fullscreen.rs#L40978)と:13169の見開きZは選択fit / limitsから得たfit_scale・gapを照準の基準にする。[display-pipeline.md:1662](display-pipeline.md#L1662)にこの違いと見開きPDFのZ再レンダなしという現行制限がある |
 | 寸法の単位と原寸制限 | [display-pipeline.md:34](display-pipeline.md#L34)はsource_dims＝画素、PDF layout_dims＝1/1000 point。[ui_fullscreen.rs:8746](../src/ui_fullscreen.rs#L8746)はcanonical aspectをpixel sourceの長辺へ正規化。[同:36428](../src/ui_fullscreen.rs#L36428)と[display-pipeline.md:1705](display-pipeline.md#L1705)の単ページ / 見開きは現在の描画textureを原寸基準にできるため、AI到着で制限の結果も変わる。連結は:37481と:8944の既存raw/source優先規則が異なる |
 | 回転＋trimの経路差 | [ui_fullscreen.rs:24028](../src/ui_fullscreen.rs#L24028)の通常単ページは保存回転でもtrimを渡すが、見開き:40758、連結:37562、capture生成:10465、PDF要求:37103は回転ページのtrimを落とす。:17114はこの差をcallerの責務として明記。fit式だけの共通化では同じ入力にならない |
@@ -116,26 +117,44 @@ canonical寸法を「原寸の画素数」として渡さない。共通resolver
 | 入力 | 単位・役割 |
 | --- | --- |
 | アスペクト基準 `A` | ページの縦横比と構成を決める寸法。取得済みcanonical layoutを優先。PDFはpage boxの1/1000 pointであり、長さを物理pxやpppへ直接変換しない |
-| 物理原寸基準 `O` | そのconsumerが現在採用するpixel基準のfull-page寸法。自動fitの拡大 / 縮小制限とOriginalに用いる。アスペクトの単位とは別に、必ず画素数で渡す |
+| 物理原寸基準 `O` | 自動fitの拡大 / 縮小制限に用いるfull-pageの画素基準。通常画像はconsumerの既存pixel基準、新方式のPDFは下記の固定原寸方針から求める。アスペクトの単位とは別で、現在のPDF raster寸法を渡さない |
 | content bbox・rotation | §5.1で解決したsource座標の正規化bboxと保存回転。分割・trimの優先を解決してから渡し、回転とbbox変換を一度だけ行う |
 | 表示先・構成 | 実image rect（point）、そのContextのeffective ppp、ページのlogical scale・slot・実効gap。frozenはcapture時の入力を使う |
 
 `O`の選択も現在のconsumerの責務を維持する。通常画像の単ページ / 見開きは現在の
-描画texture・final compositeを基準にする経路がある。RAW / PDF / pass-throughでは
-既存で利用可能なpixel coordinate source / rasterを使い、canonical page boxを画素とみなさない。
+描画texture・final compositeを基準にする経路がある。RAW / pass-throughでは
+既存で利用可能なpixel coordinate sourceを使う。新方式のPDFだけは、以下の固定原寸方針を使う。
 見開きの:40879はcanonical layoutをそのまま基準寸法へ採る枝もあるため、新方式へ
-その単位を物理原寸として持ち込まない。新方式adapterは別途Oをpixel寸法から取得して正規化し、
+その単位を物理原寸として持ち込まない。新方式adapterは媒体ごとのOを画素基準へ解決して正規化し、
 既存4方式のその枝は変更しない。
 連結は同じアスペクトのprocessedが来てもraw/sourceを優先し、処理でアスペクトが変わった
 場合はprocessedを採る既存規則を維持する。すべてをraw基準またはAI texture基準へ統一しない。
 根拠は上の§2、[raw_page_store.rs:2291](../src/app/raw_page_store.rs#L2291)、
 [ui_fullscreen.rs:27000](../src/ui_fullscreen.rs#L27000)・:40879。
 
+**新方式のPDF原寸は再レンダ出力から独立させる（Q3補足）。** PDFのpage boxによるAと、
+ページ固有のcontent type / raster native寸法から、次の固定原寸長辺`L0`を求める。
+
+- Vector: `L0 = 4096px`。既存Original最低長辺定数を原寸基準にも再利用する。
+- Raster: `L0 = min(4096px, native_long_edge)`（正のnative寸法）。既存native capを優先する。
+- `O = A × L0 / max(Aw, Ah)`。全ページ・非回転・trim前の寸法で、bbox / rotationは後で一度だけ適用する。
+  1/1000 pointを画素数とみなさず、72dpiなどの新しい固定DPIも導入しない。
+  page boxから見た実効DPIはこのL0とページのpoint寸法から導けるが、raster結果や表示先から逆算しない。
+
+4096は**要求の最低値だけでなく、新方式の原寸制限用の固定参照長辺**にする推奨案。
+この基準はviewport / ppp / 指定値 / manual zoom / Z / 現在のraster target / AI textureに依存しない。
+ページのcontent typeとnative寸法はPDF自体のmetadataであり、再レンダ画像のwidth / heightで更新しない。
+同じsource identityの同じmetadataであれば、thumbnail→初回raster→再レンダ→AI差替えでもA / Oは同じ。
+ページ内容・page box・content typeの真正な変更は既存source更新境界で再評価する。
+既存4方式のrasterを原寸にする動作は変更しない。注釈などのsource座標に使う
+`source_dims_for_idx` / `FsLoadResult::Static.source_dims`も現行契約のまま保持し、
+**新方式のPDF fit adapterはその値をOとして読まない**。
+
 単ページの正規化は既存:8746と同じく `N = A × max(Ow, Oh) / max(Aw, Ah)`。
 これでアスペクトはA、長辺のpixel基準はOになる。Nへrotation / bboxを適用し、見開きは
 各ページの既存高さ合わせを合成した後に§4.2を解く。pixel基準上のscaleへ
 `FullscreenFitScaleLimits::apply`（物理原寸は`1/P`）を適用する。
-canonicalの1/1000 pointをそのまま`1/P`と比較したり、PDFの72dpiを新しい原寸規則にしたりしない。
+canonicalの1/1000 pointをそのまま`1/P`と比較しない。
 一時textureのアスペクトがAと違えば、既存のcontain処理で歪ませず描く。
 
 **到着時の不変保証を限定する。** アスペクト・bbox・構成・rect / ppp・指定値が変わらず、
@@ -144,6 +163,8 @@ layout枠は変わらない。paintのcontain差・既存pixel丸めまで寸法
 no_upscale / no_downscaleが効く場合、Oが変わればlayout寸法が変わり得る。
 例: trim後の原寸400px・高さ800px・拡大禁止では400px表示。4倍AI到着でその経路の
 原寸基準が1600pxになると800px表示になる。これは現在の原寸制限を維持する結果（Q3）。
+これは通常画像の保証であり、新方式のPDFには当てはめない。PDFは上記のA / Oを保つので、
+入力・metadataが同じなら原寸制限ONでも、自身の再レンダ / AI結果の採用だけでgeometryは変わらない。
 連結のraw/source安定規則やfrozen captureの入力はそれぞれ維持し、差替えを抑止する追加stateは作らない。
 
 ### 4.4 Zの表示基準（Q11新規）
@@ -232,6 +253,39 @@ clip後に見えている小片の長辺だけを要求しない。full-page ras
 ページ全体を描くための物理長辺が必要。trim効果を含んだfull-image extentへもう一度bboxを
 掛けたり、保存回転で軸を二度交換したりしない。
 
+#### PDFの原寸・需要・結果採用の一方向契約（r3）
+
+依存は **ページmetadata → 固定A / O → 表示geometry → 絶対需要 → raster結果** とする。
+raster結果はsampling / texture / source座標へ採用するが、A / Oへ戻さない。
+headroomや最小 / 最大 / native capを適用した要求値を、次frameの原寸にもしない。
+手動zoomは原寸制限の後に掛ける現行順を維持するため、zoomによる需要増加は正当だが、
+その結果を原寸へ採用して再びzoom / headroomを掛ける循環は禁止する。
+retained rasterが需要より大きい場合も、既存cache許容・再利用の判断だけに使う。
+AI用native再レンダとfinal保持の優先は既存のまま、どちらの画素寸法も新方式PDFのOへ戻さない。
+
+初回loadは現在page boxを捨てている（app.rs:69401）。既存PDF結果に含まれる
+`page_size_points`と`content_type`を、同じload completionのcontext / source / generation検証を
+通して採用できるようにする。Aは既存page layout owner（ui_fullscreen.rs:16702）、
+content type / native寸法はそのページの既存metadata ownerへ渡す。別の原寸cache・DPI設定・
+待機flag・UI同期metadata読込・新しいworker / IPCは作らない。PDF結果の既存payloadに必要な
+metadataを保持する型境界も実装範囲に含め、表示用pixel source_dimsと混同しない。
+再レンダcompletionが同じmetadataを持ってもA / Oを変えず、描画画像だけを差し替える。
+古いsource / 別contextの結果でページmetadataや原寸を更新しない。
+
+寸法 / content type未判明の初回要求は既存loaderの暫定targetで行い、raster寸法をOの代用品にしない。
+通常の完成PDF表示へ採用する時点でpage boxとcontent typeを揃え、指定fit / 原寸制限から
+最終需要を一度解く。暫定画像から完成表示への変化と、同じmetadataでの再レンダ採用を区別する。
+既存page metadataを正しいcontextへ採用できないと判明した場合は、第二のmetadata所有者を
+足して迂回せず、止めて設計担当へ報告する。
+
+例: 正方形vector PDF、P=1、指定高さ100px、縮小禁止、手動zoom=1.2。
+現在のrasterが4096 / 5407 / 7138 / 8192pxのいずれでも、固定Oは4096×4096px。
+原寸制限後は4096px、zoom後の表示長辺は4915.2px、headroom込み要求は5407pxになる。
+5407pxの結果をsource_dimsへ採用した次frameも表示4915.2px・需要5407px。
+要求が5407→7138→8192pxへ増幅したり、表示枠まで拡大したりしない。
+丸めによるrasterの縦横比差は既存containで扱い、Aや原寸をrasterへ追従させない。
+この収束は§9の結果採用を通す回帰で保証する。要求値の比較だけで循環を隠す案は採らない。
+
 #### Z中の要求基準と通常復帰
 
 現行:12539は単ページZの`full_image_zoom`を送り、:69762 / :69867は通常
@@ -293,6 +347,7 @@ Remoteブラウザのfit操作や数値UIは対象外。本体SettingsをRemote�
 見開きfit式、similar preview、連結unit layout、PDF target。
 paintから倍率を逆算せず、確定したscale / rect / hit / UVを使う。
 captureされたgeometry / 表示単位には同じfit descriptorの指定値を保持し、factory / replayも揃える。
+PDFはcapture時のpage metadata / 固定A・Oも同じ入力として保持し、replay時のraster寸法から再算出しない。
 既存geometry / layout cache keyがfit条件を含む場合は指定値も含める。
 常にPageを使う縮図・overviewへ指定値を誤適用しない。
 
@@ -358,7 +413,9 @@ TextEditが必要ならime_focus helperを使用。Enter / Escは既存dialog he
   source generationやplacementをfitのproxyにしない。
 - OFF値の別記憶、画面を読んでの単位換算、未設定時の自動cycle除外を採らず組合せを減らす。
 - 原寸をrawで固定して到着時の全寸法を不変にする案は、現在のAI後の原寸制限を変えるため採らない（Q3）。
-  アスペクトと原寸を区別し、到着時の不変保証を条件付きにする。
+  これは通常画像の方針。PDFの再レンダは元データの高解像度化ではないので、新方式では
+  ページmetadataと既存Original最低解像度 / native capからOを純粋計算する。
+  最初のraster寸法を保存する案や、要求後にOを更新・復元する案を採らず、自己増幅する状態の組合せをなくす。
 - rotation＋trimの旧例外を新方式にも複製する案は、capture / PDFとの食い違いを残すため採らない（Q7）。
   新方式だけ表示単位の入力を一度準備し、既存4方式の挙動は今回の統一対象にしない。
 - Z専用の保存target・別pendingを増やす案は採らない。§5.2の絶対px需要と既存request gateの
@@ -373,6 +430,7 @@ viewport / detached経路へ触れる実装前に、**ClaudeCodeと独立reviewe
 本案がレビュー済みだとは記録しない。合意後、実装時にdetached §11へ実際の変更範囲だけを記録する。
 記録案は§1.342、shared fit resolver / transform、ui_fullscreenの各consumer・capture・PDF要求、
 新方式だけのrotation＋trim入力準備、app.rsの絶対PDF要求adapterと既存比較cacheの型置換、
+PDF load completionのpage metadata採用と固定原寸入力、既存page layout / content typeへの接続、
 viewer_context_registryの同じcontext-local fieldの型・移送境界、必要なsnapshot型境界、
 設定 / prefs / transfer、回帰。既存4方式はlegacyの表示・trim / Z / request判定を維持する。
 理由は上の所有境界共通化、
@@ -384,8 +442,9 @@ viewer_context_registryの同じcontext-local fieldの型・移送境界、必�
    no_up / no_downの4通り、manual zoom、P=1 / 1.25 / 1.5 / 2とUI倍率。既存4方式の幾何不変。
 2. **表示単位**: 高さ違い見開き、左右読み、指定幅とgap境界、virtual slot / 中央単独表紙、
    trim / 分割・90° / 270°・RAW preview→full / AI差替え。paint / hit / UV / navigator / Zとscaleの一致。
-   アスペクト基準Aとpixel原寸Oを別入力で検証。PDF page box（1/1000 point）と同アスペクトの
-   pixel寸法を別々に変え、原寸判定へpage boxの大きさが漏れないことを固定する。
+   アスペクト基準Aとpixel原寸Oを別入力で検証。PDF page box（1/1000 point）の倍率を変えても
+   同じ比率とcontent typeなら固定Oが同じこと、比率変更ならOの比率だけが追従することを確認。
+   Vectorの長辺4096、Rasterのnative cap優先、任意の現在raster寸法がOへ混入しないことを固定する。
    no_upなしの同アスペクトAI差替えは同じlayout枠、no_upありのtrim後400px→4倍AI・高さ800pxは
    400px→800pxになることを確認する。no_down / 両ON、連結raw/source優先、texture aspect差のcontainも別途確認。
 3. **連結**: 縦 / 横で各unitへ適用。pixel丸め・gap・描画長・scroll範囲、resize / fit / flow切替。
@@ -414,6 +473,18 @@ viewer_context_registryの同じcontext-local fieldの型・移送境界、必�
    live単ページ / 見開き / unit、capture生成→replay、PDF需要が同じ解決済みbboxと画面軸を使い、
    回転・trimを二重適用しないこと、未回転の相方も正しいことを検証する。
    legacy4方式は§5.1の経路別例外を明示的に固定し、今回の共通helper接続で無意識に統一しない。
+10. **PDF需要の収束（結果採用を通す回帰）**: 実fit / draw geometry・需要adapter・request比較owner・
+    load completionの結果採用を通し、**要求→FsLoadResult採用→次frame**を連続して検証する。
+    正方形Vector・指定高さ100px・P=1・no_down ON・manual zoom=1.2・現在raster4096pxから、
+    表示4915.2px / 要求5407px→結果source_dims=5407px→同じ表示 / 需要となることを確認。
+    初期rasterを7138 / 8192pxにした場合も同じ幾何 / 需要へ解き、保持画像の再利用判断と分ける。
+    複数frame後も5407→7138→8192pxの増幅、再送、job cancelが起きないことを確認する。
+    純粋helperの同一要求比較だけでは証拠にしない。旧rasterをOへ接続すれば失敗する回帰にする。
+    no_up / no_downの4通り、片軸 / 両軸、raster native cap（256px未満も含む）、丸め / 最大8192、
+    単ページ / 見開き / 連結・rotation＋trim・単独slot・P=1 / 2も対象。
+    Z進入 / 解除、resize / DPI / zoom変更では需要が正当に変わり、各結果採用後は再び安定する。
+    初回metadataの採用前後、thumbnail不在、AI native / final差替え、source変更 / close / context swapを通し、
+    metadataの真正な変更以外でA / Oが変わらず、別contextの結果が混ざらないことを確認する。
 
 snapshotは純粋な設定描画helperをtests/ui_snapshotへ渡す（App全体のsnapshotにしない）。
 循環5checkbox、指定2行、mixed / None、ライト / ダーク、通常 / 狭幅、説明折返し、限界値を撮る。
@@ -439,11 +510,15 @@ backlog、prefs検索、manual fullscreen / settings、detached §11。実装・
    **推奨: 画像表示領域。** 固定バー・右パネルの予約を除き、小窓・F11・F12で同じ意味にします。
 2. **Q2 pxの意味** — pxはWindowsの拡大率に関係なく、実際の画面のピクセル数でよいですか？
    **推奨: 物理ピクセル。** 高さ800pxは別DPIの窓でも800px。UIの論理サイズにはしません。
-3. **Q3 拡大・縮小の制限（変更）** — AIの高解像度画像が届くと表示サイズが変わる場合も含め、今の「拡大しない」「縮小しない」を指定方式にも適用しますか？
-   **推奨: 今の制限を維持する。** 単ページ・見開きでは、描画する画像が高解像度になると原寸の基準も大きくなる経路があります。
+3. **Q3 拡大・縮小の制限（r3説明追加）** — 通常画像には今の「拡大しない」「縮小しない」を適用し、PDFだけは下記の固定原寸を使ってよいですか？
+   **推奨: 通常画像は今の原寸、PDFは固定原寸に同じ制限を適用する。** 単ページ・見開きでは、描画する画像が高解像度になると原寸の基準も大きくなる経路があります。
    例えばトリム後400pxの画像を高さ800px・拡大禁止で見ると、最初は400px、4倍AI到着後は800pxになり得ます。
    「縮小しない」は指定上限を超え得て、両方ONなら原寸を優先します。連結の今の原寸基準も維持し、
    「AI到着でも必ず同じ寸法」は保証しません。
+   **PDFの原寸についてはr3で説明を追加:** 新方式では、PDF自身の再描画で原寸まで大きくならないよう、
+   ページの縦横比と固定の基準から原寸を求めることを推奨します。通常のPDFは長辺4096px、
+   スキャンPDFはそれと元画像の長辺の小さい方です。再描画やAI処理の結果の大きさは原寸に使わず、
+   同じ設定・操作のままなら表示サイズと次の要求解像度を保ちます。既存4方式の原寸は変えません。
 4. **Q4 初期値・指定なし（説明補足）** — 初期値は幅100％・高さ100％、両方OFFならページ全体と同じ大きさ合わせでよいですか？
    **推奨: その動作。** 回転＋トリムの扱いは、両方OFFでもQ7の新方式のルールを使います。
    未指定だから自動で循環から外さず、外したい場合は既存循環設定を使います。
@@ -481,3 +556,21 @@ backlog、prefs検索、manual fullscreen / settings、detached §11。実装・
 Q1 / Q2 / Q5 / Q6 / Q8〜Q10は推奨を維持。Q3 / Q7は変更、Q4は同じfit式とQ7の入力ルールを区別する説明補足、
 Q11は新規で、すべて利用者判断待ち。
 再レビューが必要。文書のdiff / EOLを確認するだけで、cargo / snapshot / buildや製品起動は行わない。
+
+## 12. 独立設計再レビューへの対応（r3、2026-10-09）
+
+P2「PDF再レンダ結果から要求解像度が自己増幅する」に同意する。HEAD `ab99c0a6b`で
+app.rs:69974 / :69988 / :78199、displayed_image_transform.rs:365、
+pdf_loader.rs:5010 / :5017 / :5118 / :6556〜:6563を確認した。
+r2の「PDFのOに現在rasterを使い、そのgeometryから需要を作る」案を撤回する。
+要求比較は増幅したtargetの再送を防げないため、それだけで直るとは扱わない。
+
+§4.3で新方式のPDFだけpage boxと固定Original参照長辺 / native capからA / Oを解く契約へ改訂。
+§5.2でmetadata→geometry→需要→結果の一方向依存、初回metadata採用の型境界とcontext検証、
+既存pixel source座標を変更しない境界、4915.2px表示 / 5407px需要の収束例を追加した。
+§6 / §8へcapture入力・実装接続点と簡素化を反映し、§9項目10へ実completion採用を通す
+要求→結果→次frameの回帰を追加した。自己増幅を再送guardで隠す案、最初のrasterを保存する案は採らない。
+
+Q1〜Q11の番号・件数を維持する。Q3だけPDF固定原寸の推奨と通常画像との違いを説明追加した。
+他の質問と推奨は維持、全11問は利用者判断待ち。独立再レビューも未完了。
+製品コード・保存データを変更せず、文書のdiff / EOLのみ確認する。
