@@ -266,6 +266,27 @@ gate と同一制約のため据え置き。実機検証 (音が鳴る / seek / 
   row version → row `ColorImage`。ラボの raster worker をそのまま移植（`docs/async-architecture.md`
   テンプレ）。古い key / generation / row version の結果は UI 採用側で捨てる（最終防衛線）。
 
+#### §1.352: 上下HUDと中央コンテンツの幅（利用者決定2026-10-08）
+
+- 上部情報バーと下部HUDは、右情報パネルの固定・F11抑制にかかわらず、描画対象viewportの全幅を使う。
+  描画・mouse click / drag・touch由来pointer入力は同じHUD矩形から導出する。
+- 波形timeline / spectrumは右パネル予約後のコンテンツ矩形を使う。固定パネルは実際に空けた帯へ置き、
+  上下HUDの間だけを占める。右パネル中央の入力をHUDへ渡さない。狭幅の予約は既存の `min(430pt, 全幅/2)`。
+- 音楽の背景と既存bookmark / normalizeモーダルの外枠も全viewportへ揃える。半透明HUDの下地を右予約帯で変えず、モーダル中の入力遮断を広がったHUDまで保つ。
+- F11で右lockを抑制すると右予約は0へ戻り、中央だけが全幅へ広がる。上下HUDは常時全幅、raw lockは保持する。
+- 原因は§1.344以前からの、縮小済みの中央矩形をHUDにも渡す責務の混同だった。
+  簡素化: 入力されたviewport矩形とコンテンツ矩形、および毎frame導出するHUD矩形だけで解き、
+  新しいlock・予約cache・表示状態・再生成経路は作らない。既存のright-band helperが予約とパネル幅を一致させる。
+- 音声VST shellのnative HUDとParkedLive描画、detached predicate / placement / lifecycle ownerは変更しない。
+  新規の利用者質問はない。§1.351のノーマライズ操作変更は別commitで扱う。
+- 検証記録（2026-10-08）: 修正前の実描画経路で最初の回帰2件が失敗（終了101、HUD右端の矩形と×のクリック）する有効なredを確認。
+  修正後の `--lib music_full_width_hud` は3件通過。実 `draw_fs_music_view` の描画・mouse / touch由来pointer入力を1280 / 640 / 360ptで通し、
+  F11と設定ON/OFFでの予約・当該frameのパネル描画・raw lock保持を確認した。
+  App全体のsnapshotは作らず、共通HUD / right-band矩形を使う視覚fixtureの通常幅・狭幅PNGを2枚追加して目視確認。
+  `cargo test -p mimageviewer --lib` は10,965件通過・52件ignored（終了0）、`--test ui_snapshot` は109件通過（終了0）。
+  通常 / portable core check・`cargo fmt --check`・glyph lintは終了0。変更ファイルのCRLFと `git diff --check` を確認。
+  利用者指示に従いbuild-dev・製品起動・commitは行わず、実機確認は未実施。
+
 ### 5.5 右パネル / 左パネル
 - **右パネル**（D4）: `src/ui_metadata_panel.rs` の `draw_metadata_panel(...)`（:60）の item-kind
   分岐（:529）に **`GridItem::Audio` アーム**を追加。動画の タグ/★/設定 経路をミラー（実装時に

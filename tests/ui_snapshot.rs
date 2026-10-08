@@ -1710,6 +1710,28 @@ fn still_seek_strip_and_hover_preview_dark() {
 }
 
 #[test]
+fn music_locked_panel_full_width_huds_dark() {
+    snapshot_with_theme_at_size(
+        "music_locked_panel_full_width_huds_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(960.0, 540.0),
+        None,
+        mimageviewer::draw_music_locked_panel_snapshot_fixture,
+    );
+}
+
+#[test]
+fn music_locked_panel_full_width_huds_narrow_dark() {
+    snapshot_with_theme_at_size(
+        "music_locked_panel_full_width_huds_narrow_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(360.0, 320.0),
+        None,
+        mimageviewer::draw_music_locked_panel_snapshot_fixture,
+    );
+}
+
+#[test]
 fn music_touch_panel_handles_observed_dark() {
     snapshot_with_theme(
         "music_touch_panel_handles_observed_dark",

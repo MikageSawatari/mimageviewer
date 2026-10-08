@@ -6882,6 +6882,24 @@ fn music_panel_open_state_after_reach(
     }
 }
 
+// HUD drawing and widget hit areas share the original viewport, never the
+// right-panel-reserved music content rectangle. These are per-frame values.
+fn music_hud_rects(full_rect: egui::Rect) -> [egui::Rect; 2] {
+    [
+        egui::Rect::from_min_size(
+            full_rect.min,
+            egui::vec2(full_rect.width(), MUSIC_TOP_BAR_HEIGHT),
+        ),
+        egui::Rect::from_min_max(
+            egui::pos2(
+                full_rect.left(),
+                full_rect.bottom() - crate::ui_music_panels::MUSIC_HUD_HEIGHT,
+            ),
+            full_rect.max,
+        ),
+    ]
+}
+
 /// 音楽ビューの右パネルが占める帯 — `(確保幅, 右端, パネル幅)`。
 ///
 /// `reserved` は `fullscreen_media_rect` が `rect` から**実際に引いた**幅で、ロックして
@@ -16513,27 +16531,46 @@ pub fn draw_music_panel_reach_snapshot_fixture(
     left_panel_open: bool,
     right_panel_open: bool,
 ) {
+    draw_music_layout_snapshot_fixture(
+        ui,
+        touch_observed,
+        left_panel_open,
+        right_panel_open,
+        false,
+    );
+}
+
+/// Visual-only music layout fixture sharing production HUD and reserved-band geometry.
+#[doc(hidden)]
+pub fn draw_music_locked_panel_snapshot_fixture(ui: &mut egui::Ui) {
+    draw_music_layout_snapshot_fixture(ui, false, false, true, true);
+}
+
+fn draw_music_layout_snapshot_fixture(
+    ui: &mut egui::Ui,
+    touch_observed: bool,
+    left_panel_open: bool,
+    right_panel_open: bool,
+    right_panel_locked: bool,
+) {
     let full_rect = ui.max_rect();
+    let reserved = if right_panel_locked {
+        crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH.min(full_rect.width() * 0.5)
+    } else {
+        0.0
+    };
+    let content_rect =
+        egui::Rect::from_min_max(full_rect.min, full_rect.max - egui::vec2(reserved, 0.0));
     let painter = ui.painter();
     painter.rect_filled(full_rect, 0.0, crate::ui_music_timeline::MUSIC_VIEW_BG);
-    let top_rect = egui::Rect::from_min_size(
-        full_rect.min,
-        egui::vec2(full_rect.width(), MUSIC_TOP_BAR_HEIGHT),
-    );
-    let hud_rect = egui::Rect::from_min_max(
-        egui::pos2(
-            full_rect.left(),
-            full_rect.bottom() - crate::ui_music_panels::MUSIC_HUD_HEIGHT,
-        ),
-        full_rect.max,
-    );
+    let [top_rect, hud_rect] = music_hud_rects(full_rect);
     painter.rect_filled(top_rect, 0.0, egui::Color32::from_rgb(22, 25, 31));
     painter.rect_filled(hud_rect, 0.0, egui::Color32::from_rgb(22, 25, 31));
 
-    let margin = music_visualization_side_margin(full_rect.width());
+    let margin = music_visualization_side_margin(content_rect.width());
     let waveform_rect = egui::Rect::from_min_max(
-        egui::pos2(full_rect.left() + margin, top_rect.bottom() + 16.0),
-        egui::pos2(full_rect.right() - margin, hud_rect.top() - 16.0),
+        egui::pos2(content_rect.left() + margin, top_rect.bottom() + 16.0),
+        egui::pos2(content_rect.right() - margin, hud_rect.top() - 16.0),
     );
     painter.rect_filled(waveform_rect, 4.0, egui::Color32::from_rgb(8, 10, 14));
     let center_y = waveform_rect.center().y;
@@ -16558,6 +16595,21 @@ pub fn draw_music_panel_reach_snapshot_fixture(
             panel_rect.left_top() + egui::vec2(16.0, 16.0),
             egui::Align2::LEFT_TOP,
             "ブックマーク",
+            egui::FontId::proportional(18.0),
+            egui::Color32::WHITE,
+        );
+    }
+    if right_panel_locked {
+        let (_, right, width) = music_right_panel_band(content_rect, reserved);
+        let panel = egui::Rect::from_min_max(
+            egui::pos2(right - width, top_rect.bottom()),
+            egui::pos2(right, hud_rect.top()),
+        );
+        painter.rect_filled(panel, 0.0, egui::Color32::from_rgb(28, 28, 32));
+        painter.text(
+            panel.left_top() + egui::vec2(16.0, 16.0),
+            egui::Align2::LEFT_TOP,
+            "音楽情報",
             egui::FontId::proportional(18.0),
             egui::Color32::WHITE,
         );
@@ -23875,6 +23927,7 @@ impl App {
                                         music_view_frame_ui = self.draw_fs_music_view(
                                             ui,
                                             ctx,
+                                            full_rect,
                                             image_rect,
                                             reserved_panel_width,
                                             fs_idx,
@@ -47967,13 +48020,15 @@ impl App {
     /// headless `VideoPlayer` が音声を再生し、ここでは egui で「音楽アイコン + ファイル名 +
     /// 再生位置/長さ + シークバー + 再生/一時停止ボタン」を描く。タイムライン波形 /
     /// スペクトラム / 左右パネルの作り込みは Inc 3b / Inc 5。native presenter は使わない (D3)。
-    /// `reserved_info_panel_w` は `fullscreen_media_rect` が `rect` から**実際に引いた**
-    /// 右情報パネルの帯幅。ロックしていなければ 0。縮んだ `rect` から逆算しないこと (F11)。
+    /// `full_rect` owns HUD drawing and input; `content_rect` owns the reserved central content.
+    /// `reserved_info_panel_w` is the width actually removed by `fullscreen_media_rect`.
+    /// It is zero when the effective info lock is off; never infer it from the shrunken content.
     pub(crate) fn draw_fs_music_view(
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
-        rect: egui::Rect,
+        full_rect: egui::Rect,
+        content_rect: egui::Rect,
         reserved_info_panel_w: f32,
         fs_idx: usize,
         music_ctrl_wheel_key_gate_reached: bool,
@@ -47982,10 +48037,12 @@ impl App {
         // ここは常にダーク配色にする (CLAUDE.md「フルスクリーン内は黒背景ベース統一」、実機 FB:
         // 上下バーが Light 基調で中央のダーク波形と食い違っていた)。
         let dark = true;
-        let painter = ui.painter_at(rect);
+        let [top_rect, hud_rect] = music_hud_rects(full_rect);
+        let painter = ui.painter_at(content_rect);
         // 背景色はタイムラインのラベル列 / 左右隙間と共有 (実機 FB 2026-07、色の不揃い解消)。
         let bg = crate::ui_music_timeline::MUSIC_VIEW_BG;
-        painter.rect_filled(rect, 0.0, bg);
+        // The translucent HUDs need the same underlay across the reserved right band.
+        ui.painter_at(full_rect).rect_filled(full_rect, 0.0, bg);
         let touch_observed = observe_music_touch_for_panel_handles(
             ctx,
             crate::touch_correlation::touch_gestures_disabled(),
@@ -48049,7 +48106,7 @@ impl App {
                 self.handle_cancel_normalize_scan(ctx, fs_idx);
             }
             painter.text(
-                rect.center(),
+                content_rect.center(),
                 egui::Align2::CENTER_CENTER,
                 format!("音声を再生できません: {e}"),
                 egui::FontId::proportional(20.0),
@@ -48059,15 +48116,12 @@ impl App {
         }
 
         // ── レイアウト (Inc 5 FB: 動画に合わせる) ──
-        // 上バー (常時) / 中央 (timeline + spectrum、全幅・縮小しない) / 下 HUD (常時、
-        // seek 行 + コントロール行)。左右パネルは表示モードに従ってオーバーレイ表示し、
-        // **中央は縮小しない** (動画のジャンプ/メタパネルと同じ)。
+        // Top and bottom HUDs always span the viewport. Only central timeline/spectrum
+        // shrink for a locked right panel; unlocked side panels overlay the middle band.
         // 上バー高さは動画 native 上バー (draw_top_bar_background = 54px) に合わせる。これで
         // 音楽ビューと VST 画面 (native シェル) でボタン / タイトルの縦位置が揃う (ユーザー要望)。
-        let top_h = MUSIC_TOP_BAR_HEIGHT;
-        let hud_h = crate::ui_music_panels::MUSIC_HUD_HEIGHT;
-        let hud_top = rect.bottom() - hud_h;
-        let panel_band_top = rect.top() + top_h;
+        let hud_top = hud_rect.top();
+        let panel_band_top = top_rect.bottom();
         let panel_band_bottom = hud_top;
 
         // 中央コンテンツ (波形 timeline + spectrum) は左右にトリガ幅ぶんの gutter を空ける
@@ -48080,7 +48134,7 @@ impl App {
         // 接し、グラフ端をクリックしようとして僅かにはみ出すとパネルが出てしまう。3% の隙間を挟む
         // ことでその誤爆を防ぐ (トリガ自体は 5% のまま = パネルの開けやすさをウィンドウモードでも
         // 維持)。gutter (= 5%+3% = 8%) は最低 8px。
-        let content_gutter = music_visualization_side_margin(rect.width());
+        let content_gutter = music_visualization_side_margin(content_rect.width());
 
         // 中央領域の下端に MIDI 半音 spectrum + ピッチ鍵盤 (Inc 4) の帯を確保する。残りが
         // タイムライン (or 解析中アイコン) の領域。縦窓が短いときに spectrum が timeline を
@@ -48090,7 +48144,7 @@ impl App {
         const MUSIC_SPECTRUM_MIN_H: f32 = 60.0;
         const MUSIC_TIMELINE_MIN_H: f32 = 120.0;
         const MUSIC_SPECTRUM_GAP: f32 = 8.0;
-        let band_top = rect.top() + top_h;
+        let band_top = top_rect.bottom();
         let band_bottom = hud_top - 4.0;
         let band_h = (band_bottom - band_top).max(0.0);
         let spectrum_h =
@@ -48103,8 +48157,11 @@ impl App {
         let music_shell_active = false;
         let show_spectrum = spectrum_h >= MUSIC_SPECTRUM_MIN_H && !music_shell_active;
         let spectrum_rect = egui::Rect::from_min_max(
-            egui::pos2(rect.left() + content_gutter, band_bottom - spectrum_h),
-            egui::pos2(rect.right() - content_gutter, band_bottom),
+            egui::pos2(
+                content_rect.left() + content_gutter,
+                band_bottom - spectrum_h,
+            ),
+            egui::pos2(content_rect.right() - content_gutter, band_bottom),
         );
         let central_bottom = if show_spectrum {
             (band_bottom - spectrum_h - MUSIC_SPECTRUM_GAP).max(band_top + 1.0)
@@ -48112,8 +48169,8 @@ impl App {
             hud_top.max(band_top + 1.0)
         };
         let central_rect = egui::Rect::from_min_max(
-            egui::pos2(rect.left() + content_gutter, band_top),
-            egui::pos2(rect.right() - content_gutter, central_bottom),
+            egui::pos2(content_rect.left() + content_gutter, band_top),
+            egui::pos2(content_rect.right() - content_gutter, central_bottom),
         );
 
         // ── 左右パネル (端ホバー) の判定を timeline より先に確定する ──
@@ -48125,10 +48182,10 @@ impl App {
         // ビュー幅の半分でクランプする (Inc 7 ④ / Codex P3)。狭幅ウィンドウで右パネルが
         // timeline の半分超を覆わないようにする。
         // 固定中は `fullscreen_media_rect` が既に右を空けている。パネルはその**空けた帯**へ
-        // 置くので、右端は縮める前の位置に戻す。縮んだ `rect` の右端に置くと、確保した帯が
+        // 置くので、右端は縮める前の位置に戻す。縮んだ `content_rect` の右端に置くと、確保した帯が
         // そのまま空白として残る (backlog §1.158)。
         let (panel_reserved_w, panel_right_edge, right_w) =
-            music_right_panel_band(rect, reserved_info_panel_w);
+            music_right_panel_band(content_rect, reserved_info_panel_w);
         // 改名 / 一括登録の中央モーダル、または再生前ノーマライズスキャンのモーダルを開いて
         // いる間は端ホバーのパネルを出さず、timeline seek も抑止し、HUD も非操作にする
         // (背後クリック漏れ防止 + モーダルへ集中、Inc 5c-A / Norm系)。
@@ -48150,12 +48207,12 @@ impl App {
         //  ラッチ state は music_left/right_panel_active。ClickToShow / モーダル中は両方 OFF。
         // ClickToShow の実効表示は左右とも current-file runtime state から解決する。
         let in_band = |p: egui::Pos2| p.y >= panel_band_top && p.y <= panel_band_bottom;
-        let trigger_w =
-            crate::ui_helpers::panel_edge_trigger_px(rect.width()).min(rect.width().max(0.0));
-        let sustain_margin = crate::ui_helpers::panel_hover_sustain_px(rect.width());
+        let trigger_w = crate::ui_helpers::panel_edge_trigger_px(content_rect.width())
+            .min(content_rect.width().max(0.0));
+        let sustain_margin = crate::ui_helpers::panel_hover_sustain_px(content_rect.width());
         let left_panel_rect = egui::Rect::from_min_max(
-            egui::pos2(rect.left(), panel_band_top),
-            egui::pos2(rect.left() + left_w, panel_band_bottom),
+            egui::pos2(content_rect.left(), panel_band_top),
+            egui::pos2(content_rect.left() + left_w, panel_band_bottom),
         );
         let right_panel_rect = egui::Rect::from_min_max(
             egui::pos2(panel_right_edge - right_w, panel_band_top),
@@ -48163,7 +48220,8 @@ impl App {
         );
         let side_panel_mode = self.settings.fullscreen_side_panel_mode.normalized();
         if side_panel_mode == crate::settings::FsSidePanelMode::Hover && !music_modal_open {
-            let left_open = hover_pos.is_some_and(|p| p.x <= rect.left() + trigger_w && in_band(p));
+            let left_open =
+                hover_pos.is_some_and(|p| p.x <= content_rect.left() + trigger_w && in_band(p));
             let right_open =
                 hover_pos.is_some_and(|p| p.x >= panel_right_edge - trigger_w && in_band(p));
             let left_sustain = self.music_left_panel_active
@@ -48239,7 +48297,7 @@ impl App {
             // label_w=content_gutter を渡すと波形左端が central_rect.left に揃い (spectrum と同じ)、
             // 旧 56px ラベル列ぶん波形が広がる (実機 FB 2026-07)。
             let timeline_rect = egui::Rect::from_min_max(
-                egui::pos2(rect.left(), central_rect.top()),
+                egui::pos2(content_rect.left(), central_rect.top()),
                 egui::pos2(central_rect.right(), central_rect.bottom()),
             );
             // ▲▼ 縦スクロールボタン (ユーザー確定 2026-07-03「動画統一 + ▲▼追加」)。↓↑ を
@@ -48378,7 +48436,7 @@ impl App {
             }
         } else {
             // 中央: 音楽アイコン + ファイル名 + 状態 (解析中 / エラー)。
-            let icon_side = rect.width().min(rect.height()) * 0.3;
+            let icon_side = content_rect.width().min(content_rect.height()) * 0.3;
             let icon_rect = egui::Rect::from_center_size(
                 central_rect.center() - egui::vec2(0.0, central_rect.height() * 0.06),
                 egui::vec2(icon_side, icon_side),
@@ -48440,19 +48498,20 @@ impl App {
         }
 
         // ── 左右パネル (Inc 5 FB / §1.15) ── 表示モードに従ってオーバーレイ表示する。
-        // 中央は縮小せず timeline/spectrum の上に重ねる。左=ブックマーク、右=情報/タグ/★。
+        // The locked right panel owns its reserved band; unlocked panels overlay content.
+        // Left = bookmarks, right = information / tags / rating.
         // ホバー判定 (left_hover / right_hover) は timeline seek 抑止のため上で計算済み。
         // 左ブックマーク UI: 一覧パネル本体は左端ホバー時のみ、中央モーダル (改名 / 一括登録)
         // は開いている間常に描く (draw_music_bookmark_ui 内で分岐)。動画のジャンプ/ブックマーク
         // パネルと同一コードを共有 (Inc 5c-A)。
         // パネル矩形は上のホバー判定で使ったものを再利用する (発火/維持と描画のずれ防止)。
-        self.draw_music_bookmark_ui(ctx, left_panel_rect, rect, fs_idx, left_hover);
+        self.draw_music_bookmark_ui(ctx, left_panel_rect, full_rect, fs_idx, left_hover);
         if right_hover {
             self.draw_fs_music_right_panel(ui, ctx, right_panel_rect, fs_idx);
         }
         self.draw_music_panel_callouts(
             ctx,
-            rect,
+            content_rect,
             panel_band_top,
             panel_band_bottom,
             fs_idx,
@@ -48464,7 +48523,6 @@ impl App {
 
         // 上情報バー (常時): ファイル名 (左) + Row ステッパー (中央、timeline 時) +
         // 左右パネル表示モード i。位置/長さ・音量・再生などは下 HUD に集約する。
-        let top_rect = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), top_h));
         let top_response =
             self.draw_music_top_chrome(ui, top_rect, fs_idx, &active_chrome, fg, accent, true);
         if top_response.close_clicked {
@@ -48499,7 +48557,6 @@ impl App {
             }
         }
 
-        let hud_rect = egui::Rect::from_min_max(egui::pos2(rect.left(), hud_top), rect.max);
         // 中央モーダル (改名 / 一括登録) 表示中は HUD 操作を止める (Codex 5c-A P2)。
         self.draw_music_bottom_hud(
             ui,
@@ -48519,7 +48576,7 @@ impl App {
         // 上の music_modal_open で背後操作は抑止済み。
         #[cfg(windows)]
         if self.music_normalize_modal_active(fs_idx) {
-            self.draw_music_normalize_modal(ui, ctx, rect, fs_idx);
+            self.draw_music_normalize_modal(ui, ctx, full_rect, fs_idx);
         }
 
         // 再生中は毎フレーム再描画して位置/シークバーを更新する。
@@ -48527,6 +48584,265 @@ impl App {
             ctx.request_repaint();
         }
         frame_ui
+    }
+}
+
+#[cfg(all(test, windows))]
+mod music_full_width_hud_tests {
+    use super::*;
+
+    fn fixture() -> (crate::app::AppTestEnvForTest, egui::Context) {
+        let mut app = crate::app::setup_app_for_test();
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = ViewerPresentation::MainWindow;
+        app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
+        app.fs_info_panel.locked = true;
+        let mut player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(
+            PathBuf::from("music-hud-layout.flac"),
+        );
+        player.set_position_for_test(30.0);
+        player.set_duration_for_test(120.0);
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        // No item/source: the real draw runs without analysis, decoder, or file I/O.
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        (app, ctx)
+    }
+
+    struct Probe {
+        close: egui::Rect,
+        seek: egui::Rect,
+        panel: Option<egui::Rect>,
+        panel_clicked: bool,
+        content_clip: egui::Rect,
+        painted_background: egui::Rect,
+        painted_top: egui::Rect,
+        painted_hud: egui::Rect,
+    }
+
+    fn frame(
+        app: &mut App,
+        ctx: &egui::Context,
+        size: egui::Vec2,
+        events: Vec<egui::Event>,
+    ) -> Probe {
+        let mut probe = None;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        let full = ui.max_rect();
+                        let reserved = if app.resolved_still_chrome().info_locked {
+                            crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH.min(full.width() * 0.5)
+                        } else {
+                            0.0
+                        };
+                        let content = egui::Rect::from_min_max(
+                            full.min,
+                            full.max - egui::vec2(reserved, 0.0),
+                        );
+                        app.draw_fs_music_view(ui, ctx, full, content, reserved, 0, false);
+                        let response = |name| ctx.read_response(ui.id().with((name, 0usize)));
+                        let panel = response("music_right_bg");
+                        probe = Some(Probe {
+                            close: response("music_top_close")
+                                .expect("actual close button")
+                                .rect,
+                            seek: response("music_hud_seek").expect("actual seek widget").rect,
+                            panel: panel.as_ref().map(|r| r.rect),
+                            panel_clicked: panel.is_some_and(|r| r.clicked()),
+                            content_clip: egui::Rect::NOTHING,
+                            painted_background: egui::Rect::NOTHING,
+                            painted_top: egui::Rect::NOTHING,
+                            painted_hud: egui::Rect::NOTHING,
+                        });
+                    });
+            },
+        );
+        let mut probe = probe.unwrap();
+        let painted = |fill| {
+            output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Rect(rect) if rect.fill == fill => Some(rect.rect),
+                _ => None,
+            })
+        };
+        probe.content_clip = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text)
+                    if text.galley.text() == "波形を解析しています…" =>
+                {
+                    Some(shape.clip_rect)
+                }
+                _ => None,
+            })
+            .expect("actual central content paint clip");
+        probe.painted_background = painted(crate::ui_music_timeline::MUSIC_VIEW_BG).unwrap();
+        probe.painted_top = painted(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 90)).unwrap();
+        probe.painted_hud = painted(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150)).unwrap();
+        // read_response can retain a hidden widget from an earlier frame: visibility
+        // comes from this frame's actual paint, not the retained response.
+        probe.panel = painted(egui::Color32::from_rgba_premultiplied(16, 16, 20, 235));
+        probe
+    }
+
+    fn button(pos: egui::Pos2, down: bool, touch: bool) -> Vec<egui::Event> {
+        let mut events = vec![egui::Event::PointerMoved(pos)];
+        if touch {
+            events.push(egui::Event::Touch {
+                device_id: egui::TouchDeviceId(1352),
+                id: egui::TouchId(1),
+                phase: if down {
+                    egui::TouchPhase::Start
+                } else {
+                    egui::TouchPhase::End
+                },
+                pos,
+                force: None,
+            });
+        }
+        events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: down,
+            modifiers: egui::Modifiers::NONE,
+        });
+        events
+    }
+
+    #[test]
+    fn music_full_width_hud_real_draw_reaches_the_viewport_right_edge() {
+        let (mut app, ctx) = fixture();
+        for width in [1280.0, 640.0, 360.0] {
+            let size = egui::vec2(width, 540.0);
+            let probe = frame(&mut app, &ctx, size, vec![]);
+            assert!(
+                probe.close.center().x > width - 60.0,
+                "top controls must use viewport width, not reserved content width: {width}"
+            );
+            assert!(
+                probe.seek.right() > width - 20.0,
+                "actual seek hit area must span viewport width: {width}"
+            );
+            let panel = probe.panel.expect("locked panel is drawn");
+            assert_eq!(panel.right(), width);
+            assert!(panel.top() >= probe.close.bottom());
+            assert!(panel.bottom() <= probe.seek.top());
+        }
+    }
+
+    #[test]
+    fn music_full_width_hud_f11_suppression_only_changes_central_reservation() {
+        let (mut app, ctx) = fixture();
+        for width in [1280.0, 640.0, 360.0] {
+            for (presentation, suppress, locked, reserved) in [
+                (ViewerPresentation::MainWindow, false, true, true),
+                (ViewerPresentation::MainWindow, true, true, true),
+                (ViewerPresentation::Fullscreen, true, true, false),
+                (ViewerPresentation::Fullscreen, false, true, true),
+                (ViewerPresentation::MainWindow, false, false, false),
+            ] {
+                app.viewer_presentation = presentation;
+                app.settings.fullscreen_chrome_suppression.info = suppress;
+                app.fs_info_panel.locked = locked;
+                app.fs_info_panel.open = crate::ui_helpers::MetadataPanelOpenState::Closed;
+                let probe = frame(&mut app, &ctx, egui::vec2(width, 540.0), vec![]);
+                let expected_reserved = if reserved {
+                    crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH.min(width * 0.5)
+                } else {
+                    0.0
+                };
+                assert_eq!(probe.content_clip.width(), width - expected_reserved);
+                assert_eq!(probe.painted_background.width(), width);
+                assert_eq!(probe.painted_top.width(), width);
+                assert_eq!(probe.painted_hud.width(), width);
+                assert_eq!(probe.panel.is_some(), reserved);
+                assert_eq!(
+                    app.fs_info_panel.locked, locked,
+                    "layout preserves raw lock"
+                );
+                assert!(probe.painted_top.contains_rect(probe.close));
+                assert!(probe.painted_hud.contains_rect(probe.seek));
+                if let Some(panel) = probe.panel {
+                    assert!(!panel.intersect(probe.close).is_positive());
+                    assert!(!panel.intersect(probe.seek).is_positive());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn music_full_width_hud_mouse_touch_and_panel_keep_separate_input_areas() {
+        for width in [1280.0, 640.0, 360.0] {
+            for touch in [false, true] {
+                let (mut app, ctx) = fixture();
+                let size = egui::vec2(width, 540.0);
+                for _ in 0..3 {
+                    frame(&mut app, &ctx, size, vec![]);
+                }
+                // Formerly reserved right band: actual top close must be reachable here.
+                let close = egui::pos2(width - 27.0, MUSIC_TOP_BAR_HEIGHT * 0.5);
+                frame(&mut app, &ctx, size, button(close, true, touch));
+                frame(&mut app, &ctx, size, button(close, false, touch));
+                assert!(
+                    app.music_view_close_requested,
+                    "viewport-right close, touch={touch}"
+                );
+                app.music_view_close_requested = false;
+                let probe = frame(&mut app, &ctx, size, vec![]);
+                let panel = probe.panel.unwrap();
+                let panel_pos = panel.center();
+                let before = app
+                    .fs_cache
+                    .get(&0)
+                    .and_then(|e| match e {
+                        FsCacheEntry::Video { player, .. } => {
+                            Some(player.user_seek_base_secs_for_test())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                frame(&mut app, &ctx, size, button(panel_pos, true, touch));
+                let clicked = frame(&mut app, &ctx, size, button(panel_pos, false, touch));
+                assert!(
+                    clicked.panel_clicked,
+                    "right panel owns its actual middle band"
+                );
+                assert!(!app.music_view_close_requested);
+                let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    player.user_seek_base_secs_for_test().to_bits(),
+                    before.to_bits(),
+                    "panel cannot seek"
+                );
+                let seek_pos = egui::pos2(width - 40.0, probe.seek.center().y);
+                frame(&mut app, &ctx, size, button(seek_pos, true, touch));
+                frame(&mut app, &ctx, size, button(seek_pos, false, touch));
+                let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+                    unreachable!()
+                };
+                assert!(
+                    player.user_seek_base_secs_for_test() > 100.0,
+                    "actual HUD seek owns the bottom band"
+                );
+                assert!(app.fs_info_panel.locked);
+            }
+        }
     }
 }
 
