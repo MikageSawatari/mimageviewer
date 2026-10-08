@@ -7309,7 +7309,6 @@ impl App {
                         self.pending_auto_fs_open = true;
                     }
                     self.maybe_suppress_rating_filter_for_opened_container(idx);
-                    self.maybe_suppress_facet_filter_for_opened_container(idx);
                     Some(AddressBarNav::Direct(
                         p,
                         crate::app::StartupListIntent::container_open(auto_fullscreen),
@@ -7361,7 +7360,6 @@ impl App {
             Some(GridItem::SearchContainer { path, kind, .. }) => {
                 let is_zip = matches!(kind, crate::grid_item::SearchContainerKind::Zip);
                 self.maybe_suppress_rating_filter_for_opened_container_path(&path);
-                self.maybe_suppress_facet_filter_for_opened_container_path(&path);
                 self.drill_into_container(path, is_zip);
                 None
             }
@@ -7377,7 +7375,6 @@ impl App {
             Some(GridItem::ZipDir { dir_prefix, .. }) => {
                 // ★付きの本を絞り込み中に開くと中身が空表示になるのを防ぐ (Codex P2)。
                 self.maybe_suppress_rating_filter_for_opened_zip_book(idx);
-                self.maybe_suppress_facet_filter_for_opened_zip_book(idx);
                 self.zip_nav_enter(&dir_prefix);
                 None
             }
@@ -8439,7 +8436,7 @@ mod tests {
         let back = app.tmp.path().join("ring-modal-back");
         std::fs::create_dir(&back).unwrap();
         app.folder_nav_back_stack
-            .push(super::super::FolderNavHistoryTarget::Path(back));
+            .push(super::super::FolderNavHistoryTarget::Path(back).into());
         let before = app.folder_nav_back_stack.clone();
         let epub = app.tmp.path().join("ring-modal.epub");
         assert_eq!(
@@ -8459,13 +8456,9 @@ mod tests {
             "modal-ring-test",
         );
         if matches!(ring, Some(crate::ui_main::AddressBarNav::HistoryBack)) {
-            let mut rollback = None;
             assert!(
-                app.dispatch_main_folder_history_input(
-                    super::super::FolderHistoryDirection::Back,
-                    &mut rollback,
-                )
-                .is_none()
+                app.dispatch_main_folder_history_input(super::super::FolderHistoryDirection::Back,)
+                    .is_none()
             );
         }
         ctx.begin_pass(egui::RawInput {

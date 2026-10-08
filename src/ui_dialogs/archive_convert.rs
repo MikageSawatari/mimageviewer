@@ -168,9 +168,6 @@ pub(crate) struct ArchiveConvertState {
     /// The original open's final presentation intent survives scan, password and conversion.
     pub restore_intent: crate::app::StartupListIntent,
     pub pending_sibling_output: Option<PathBuf>,
-    /// 履歴の戻る/進むから未変換アーカイブに入ろうとしてダイアログが出た場合、
-    /// キャンセル時に戻る/進むスタックをクリック前へ戻すためのスナップショット。
-    pub nav_history_rollback: Option<crate::app::FolderNavHistorySnapshot>,
     /// この変換完了後に 1 ページ目を自動フルスクリーン表示するか。明示的なオープン
     /// (グリッド Enter / ダブルクリック / ゲームパッド × 設定 ON) のときだけ true。
     /// キャンセル時は state ごと drop されるので stale フラグが残らない。
@@ -561,7 +558,6 @@ impl App {
             },
             pending_sibling_output: None,
             restore_intent,
-            nav_history_rollback: None,
             auto_fullscreen,
             deferred_fullscreen: None,
             suppress_confirm,
@@ -639,7 +635,6 @@ impl App {
             },
             pending_sibling_output: None,
             restore_intent,
-            nav_history_rollback: None,
             auto_fullscreen,
             deferred_fullscreen: None,
             suppress_confirm: self.settings.archive_convert_suppresses_confirm(),
@@ -681,7 +676,6 @@ impl App {
             completion: ArchiveConvertCompletionPolicy::SiblingZip,
             restore_intent: crate::app::StartupListIntent::PreservePresentation,
             pending_sibling_output: None,
-            nav_history_rollback: None,
             auto_fullscreen: false,
             deferred_fullscreen: None,
             suppress_confirm: false,
@@ -960,7 +954,6 @@ impl App {
             let deferred = state.deferred_fullscreen.take();
             let completion = state.completion.clone();
             let restore_intent = state.restore_intent.clone();
-            let nav_history_rollback = state.nav_history_rollback.clone();
             drop(state);
             if let ArchiveConvertCompletionPolicy::StagedHistory(request_id) = &completion {
                 self.complete_staged_history_archive_conversion(*request_id, src);
@@ -1035,9 +1028,6 @@ impl App {
                         owner.request_id,
                         "archive_direct_navigation_outside_snapshot_scope",
                     );
-                }
-                if let Some(snapshot) = nav_history_rollback {
-                    self.restore_folder_nav_history(snapshot);
                 }
                 if deferred.is_some() {
                     self.release_fs_nav_lock();
@@ -1217,11 +1207,6 @@ impl App {
                     .archive_convert
                     .as_mut()
                     .and_then(|s| s.deferred_fullscreen.take());
-                // ブロック時に履歴スタックを巻き戻せるよう、state を drop する前に退避する。
-                let nav_history_rollback = self
-                    .archive_convert
-                    .as_ref()
-                    .and_then(|s| s.nav_history_rollback.clone());
                 self.archive_convert = None;
                 if let ArchiveConvertCompletionPolicy::StagedHistory(request_id) = &completion {
                     if let Some(source) = src {
@@ -1329,7 +1314,6 @@ impl App {
                 }
                 // load が ★固定 (snapshot lock) の範囲外ガード等でブロックされると
                 // current_folder は変わらない。その場合は override / address / recent を
-                // 更新せず、変換ダイアログを開いたときに変えた履歴スタックも巻き戻す
                 // (override と current_folder の不整合・nav スタック残りを防ぐ、Codex P1/P2)。
                 let loaded = load_accepted
                     && self
@@ -1344,9 +1328,6 @@ impl App {
                             owner.request_id,
                             "archive_cache_navigation_blocked",
                         );
-                    }
-                    if let Some(snapshot) = nav_history_rollback {
-                        self.restore_folder_nav_history(snapshot);
                     }
                     if deferred_fullscreen.is_some() {
                         self.release_fs_nav_lock();
@@ -1575,10 +1556,6 @@ impl App {
             if let Some(state) = self.archive_convert.as_ref() {
                 state.cancel.store(true, Ordering::Relaxed);
             }
-            let nav_history_rollback = self
-                .archive_convert
-                .as_ref()
-                .and_then(|state| state.nav_history_rollback.clone());
             let smart_owner = self
                 .archive_convert
                 .as_ref()
@@ -1607,9 +1584,6 @@ impl App {
             }
             if let Some(owner) = detached_owner.as_ref() {
                 self.cancel_detached_grid_archive_open_owner(owner, "archive_dialog_closed");
-            }
-            if let Some(snapshot) = nav_history_rollback {
-                self.restore_folder_nav_history(snapshot);
             }
             if had_deferred_fullscreen {
                 self.release_fs_nav_lock();
@@ -1690,7 +1664,6 @@ impl App {
                 | ArchiveConvertMsg::ConvertDone(Err(ConvertError::Cancelled))
                 | ArchiveConvertMsg::SiblingConvertDone(Err(ConvertError::Cancelled)) => {
                     // User cancellation closes every phase of the shared archive lifecycle.
-                    let nav_history_rollback = state.nav_history_rollback.clone();
                     let smart_owner = state.completion.open_owner();
                     let had_deferred = state.deferred_fullscreen.is_some();
                     let bookmark_owner = state.completion.bookmark_owner().cloned();
@@ -1710,9 +1683,6 @@ impl App {
                             owner,
                             "archive_conversion_cancelled",
                         );
-                    }
-                    if let Some(snapshot) = nav_history_rollback {
-                        self.restore_folder_nav_history(snapshot);
                     }
                     if had_deferred {
                         self.release_fs_nav_lock();
@@ -2068,7 +2038,6 @@ mod tests {
             completion: ArchiveConvertCompletionPolicy::Navigation,
             restore_intent: crate::app::StartupListIntent::PageContinuation,
             pending_sibling_output: None,
-            nav_history_rollback: None,
             auto_fullscreen: false,
             deferred_fullscreen: None,
             suppress_confirm: false,

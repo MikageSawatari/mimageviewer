@@ -20,6 +20,34 @@ spawn/disconnectはUnavailable通知と既存Similar終端処理へ渡し、同�
 初期フォルダの同期loaderはPhase Bまで現状維持。詳しくは
 [startup-diagnostics-plan.md](startup-diagnostics-plan.md) §10を参照。
 
+## 主一覧の移動採用と採用後の復元（§1.339）
+
+`MainListNavigation` がtyped宛先、帰路、要求別source proofと履歴操作を既存の
+classification / Physical / Rating / Collection / Smartの要求owner間で引き継ぐ。
+履歴entryは場所と`FacetRoute`だけを持ち、地点別filter値は保存しない。
+待機中の←←/←→は同じ`FolderHistoryPlan`の仮cursorを進め、確定stackは変更しない。
+取消・失敗・staleは未採用要求を破棄するだけで、移動のrollback snapshotを復元しない。
+独立したmain移動の受理時には、同じownerの旧分類・仮履歴・Rating要求等を退役させる。
+要求を取り消しても旧replyへ採用権限を戻さず、別windowの読取要求にはこの退役を及ぼさない。
+
+既存のsnapshot、catalog、source admission、EPUB leaseの検証を準備段階で完了し、
+`adopt_main_list_navigation`でfacet route、location/items、履歴を同じUI呼出し中に一回採用する。
+`FacetNavigationState`はAppのmain専用ownerで、context bundleには移さない。
+rebuild/paint、detachedのread-only mount/swapは退避条件を変更しない。
+active値は従来の`settings.facet_filter`で、設定・履歴DBのschema/keyは変えない。
+
+採用後に既存sidecar continuationを開始し、復元後にselection、startup intent、folder/ZIPの
+first-displayとdeferred fullscreenを仕上げる。sidecarのwarning/resumeでも履歴/facetを再採用しない。
+新items世代を検証するhydration ownerと、採用前のsource proofは目的が異なる。
+row依存要求は既存items世代・revision証明を維持し、Smartのsurface leaseは同じownerの
+PDF verification/Collection revision更新を許す。別context/path/同ID再openは許さない。
+ブックマークのresolver/書庫要求はnative request IDとreturn targetを証明に使い、同じ要求中の
+行再読込をitems世代だけで失効させない。要求を置換した旧取消は新requestに届かない。
+Collectionの自動再生・本をまたぐページ継続はRestoreとして同じ採用境界へ渡し、
+外側の履歴cursorを進めない。payloadと元要求の準備後にだけroot/physical表示を交換する。
+既存のinput gate・holdoverとwarm PDFの即時placeholder表示は維持する。
+詳細と回帰一覧は[file-type-visibility-plan.md §9](file-type-visibility-plan.md#9-1339--履歴再入場のfacet退避を採用境界へ集約する)。
+
 ## 1. ワーカー一覧
 
 クリップボードの既定保存先は、App 起動後に `clipboard-capture-destination` thread が

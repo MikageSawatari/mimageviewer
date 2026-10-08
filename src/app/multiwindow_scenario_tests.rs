@@ -1690,7 +1690,7 @@ fn run_multiwindow_rar_tree_nav(
             completion:
                 crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
             pending_sibling_output: None,
-            nav_history_rollback: None,
+
             auto_fullscreen: false,
             deferred_fullscreen: None,
             suppress_confirm: false,

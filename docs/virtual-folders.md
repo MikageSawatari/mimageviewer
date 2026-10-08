@@ -1,5 +1,24 @@
 # 仮想フォルダ (ZIP / RAR / PDF / EPUB) 処理
 
+## 本への再入場とfacetの帰路（§1.339）
+
+通常open、履歴←/→、親移動/BSはtyped場所と`FacetRoute`を保持した要求を成功時だけ採用する。
+ZIP/PDF/EPUB/変換書庫の帰路は元のarchive aliasとtyped親を使い、★一覧やCollectionなどの
+合成pathを実パスの親子比較へ変換しない。ZIP内部のprefix移動はrouteだけを採用し、外側履歴を進めない。
+Search rootは元の帰路を保つ一時表示で、drillした子scopeと終了時のRestoreを同じ採用境界へ渡す。
+外側履歴からZIPへ戻る際の表示階層は、従来のルート／自動collapse結果を維持する。
+保存routeの内部prefixを実際の準備済み階層へ合わせ、表示していない階層の退避frameを残さない。
+ZIP内の他形式書庫を変換する提案も、同じ論理ZIPのSameLocation要求を既存dialogへ引き継ぐ。
+EPUBのSave PDFは元要求の帰路を保持したDirect移動に切り替え、未採用のReplay cursorを確定しない。
+
+親から子へ入るとlive親facetを退避して子を無条件にし、親へ戻ると退避値を戻す。
+履歴から同じ子へ再入場しても、その時点の親条件を退避する。履歴entryにfilter値は保存しない。
+手動復元はframeを消費し、同じrouteのreload/rebuildはframeを作り直さない。
+場所条件は移動時にactive/frame双方から除く。folder/PDF/ZIPのinstall後は履歴とfacetを確定してから
+sidecar hydrationへ進み、metadata復元後のfirst-displayを既存continuationが担当する。
+failed/cancel/staleの未採用移動は表示、履歴、退避状態を変更しない。
+設定項目や保存・読書位置keyは変えず、§1.345のファイル種類除外は実装しない。
+
 ## EPUB → PDF 読み取り境界とオープン導線 (S2b / S2c-1)
 
 S2b は `pdf_loader` の読み取り経路を用意した。S2c-1 では、アドレスバー・起動引数・復元先に指定された

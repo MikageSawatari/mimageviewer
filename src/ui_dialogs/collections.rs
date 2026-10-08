@@ -1807,7 +1807,7 @@ impl App {
             .iter()
             .map(|definition| definition.id)
             .collect();
-        let retain = |target: &crate::app::FolderNavHistoryTarget| {
+        let retain = |target: &crate::app::FolderNavHistoryEntry| {
             target
                 .collection_id()
                 .is_none_or(|collection_id| available.contains(&collection_id))
@@ -6137,10 +6137,13 @@ mod tests {
                 viewport_anchor: None,
             },
         );
-        app.folder_nav_back_stack = vec![deleted_target.clone(), retained_target.clone()];
-        app.folder_nav_forward_stack = vec![deleted_target.clone()];
-        app.quick_folder_workspaces[0].history.back_stack = vec![deleted_target.clone()];
-        app.quick_folder_workspaces[1].history.forward_stack = vec![deleted_target.clone()];
+        app.folder_nav_back_stack = vec![
+            deleted_target.clone().into(),
+            retained_target.clone().into(),
+        ];
+        app.folder_nav_forward_stack = vec![deleted_target.clone().into()];
+        app.quick_folder_workspaces[0].history.back_stack = vec![deleted_target.clone().into()];
+        app.quick_folder_workspaces[1].history.forward_stack = vec![deleted_target.clone().into()];
         let rollback = app.folder_nav_history_snapshot();
 
         client
@@ -6193,7 +6196,7 @@ mod tests {
         assert_eq!(app.current_folder, held_folder);
 
         app.collection_ui.phase = CollectionRuntimePhase::Starting;
-        app.folder_nav_back_stack.push(deleted_target);
+        app.folder_nav_back_stack.push(deleted_target.into());
         app.prune_collection_folder_history_from_ready_catalog();
         assert!(
             app.folder_nav_back_stack

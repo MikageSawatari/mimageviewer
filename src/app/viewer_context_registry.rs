@@ -4364,6 +4364,7 @@ mod tests {
         let (_tx, rx) = mpsc::channel();
         (
             FolderPaneOpenPending {
+                navigation: None,
                 epub_restore: None,
                 path: PathBuf::from("c:/trace/pending"),
                 cancel,
@@ -4947,7 +4948,7 @@ mod tests {
         app.current_folder = Some(main.clone());
         let main_back = app.tmp.path().join("main-back");
         app.folder_nav_back_stack
-            .push(super::super::FolderNavHistoryTarget::Path(main_back));
+            .push(super::super::FolderNavHistoryTarget::Path(main_back).into());
         let history = app.folder_nav_history_snapshot();
         let epub = app.tmp.path().join("detached.epub");
         let detached = app.build_window_context_for_test(981, |mounted| {

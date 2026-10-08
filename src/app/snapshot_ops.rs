@@ -810,10 +810,23 @@ impl App {
             list_view_image_metas,
             pre_snapshot_search_origin,
         });
-        self.top_level_grid_view.begin(
+        let return_origin = top_level_return.map(|restore| {
+            let route = self
+                .top_level_grid_view
+                .return_origin()
+                .filter(|origin| {
+                    super::FolderNavHistoryTarget::from_restore(&origin.restore)
+                        == super::FolderNavHistoryTarget::from_restore(&restore)
+                })
+                .map(|origin| origin.route.clone())
+                .unwrap_or_else(|| self.facet_navigation.route().clone());
+            super::top_level_grid_view::TopLevelGridOrigin { restore, route }
+        });
+        self.top_level_grid_view.begin_with_origin(
             super::top_level_grid_view::TopLevelGridSurface::Snapshot,
-            top_level_return,
+            return_origin,
         );
+
         // ★items_generation bump + invalidate_idx_state_and_queues (= Codex P1-1):
         // items を差し替えたので、旧 ThumbMsg / pending / keep_set / idx-keyed cache が
         // 新 idx に着地して「サムネが化ける/消える」事故を防ぐ。`invalidate_idx_state_and_queues`
@@ -933,11 +946,22 @@ impl App {
     pub(crate) fn dismiss_snapshot_without_restore(
         &mut self,
     ) -> Option<super::top_level_grid_view::TopLevelGridRestore> {
+        self.dismiss_snapshot_with_origin()
+            .map(|origin| origin.restore)
+    }
+
+    pub(crate) fn dismiss_snapshot_with_origin(
+        &mut self,
+    ) -> Option<super::top_level_grid_view::TopLevelGridOrigin> {
         let snap = self.snapshot.take()?;
         let _ = self.restore_rating_filter_suppression();
         // Canonical return_to がある間は fallback slot を consume しない。検索由来 snapshot
         // を fork した sibling が、それぞれ自分の restore payload を保持できるようにする。
-        let canonical = self.top_level_grid_view.take_return_to();
+        let canonical = self.top_level_grid_view.take_return_origin();
+        let route = canonical
+            .as_ref()
+            .map(|origin| origin.route.clone())
+            .unwrap_or_default();
         let (path, subfolder_restore) = if canonical.is_none() {
             let path = self.snapshot_fallback_path(&snap);
             let subfolder_restore =
@@ -958,11 +982,14 @@ impl App {
             (None, None)
         };
         let return_context = self.view_return_context_from_canonical_or_fallback(
-            canonical.map(std::borrow::Cow::Owned),
+            canonical.map(|origin| std::borrow::Cow::Owned(origin.restore)),
             || (path, subfolder_restore),
         );
         self.show_feedback_toast("★固定を解除しました".into());
-        Some(return_context)
+        Some(super::top_level_grid_view::TopLevelGridOrigin {
+            restore: return_context,
+            route,
+        })
     }
 
     /// snapshot を deactivate する (= 退避していた items 等を復元)。
@@ -977,7 +1004,10 @@ impl App {
         let Some(snap) = self.snapshot.take() else {
             return;
         };
-        let top_level_return = self.top_level_grid_view.take_return_to();
+        let top_level_origin = self.top_level_grid_view.take_return_origin();
+        let top_level_return = top_level_origin
+            .as_ref()
+            .map(|origin| origin.restore.clone());
         // filter suppress も解除 (= snapshot 内 folder enter で発動していた可能性がある)
         let _ = self.restore_rating_filter_suppression();
         // current_folder が snapshot origin と一致するか
@@ -1000,9 +1030,15 @@ impl App {
                 }
             });
             if at_origin || current_in_scope {
-                self.restore_view_return_context(
-                    super::top_level_grid_view::TopLevelGridRestore::SmartFolder(state),
-                );
+                let route = if at_origin {
+                    top_level_origin.as_ref().unwrap().route.clone()
+                } else {
+                    self.facet_navigation.route().clone()
+                };
+                self.restore_view_return_origin(super::top_level_grid_view::TopLevelGridOrigin {
+                    restore: super::top_level_grid_view::TopLevelGridRestore::SmartFolder(state),
+                    route,
+                });
                 self.show_feedback_toast("★固定を解除しました".into());
                 return;
             }
@@ -1014,7 +1050,10 @@ impl App {
                 super::top_level_grid_view::TopLevelGridRestore::Folder(_)
             )
         {
-            self.restore_view_return_context(return_context);
+            self.restore_view_return_origin(super::top_level_grid_view::TopLevelGridOrigin {
+                restore: return_context,
+                route: top_level_origin.as_ref().unwrap().route.clone(),
+            });
             self.show_feedback_toast("★固定を解除しました".into());
             return;
         }
@@ -1055,7 +1094,13 @@ impl App {
                     subfolder_restore,
                     rating_view_stars,
                 );
-                self.restore_view_return_context(return_context);
+                self.restore_view_return_origin(super::top_level_grid_view::TopLevelGridOrigin {
+                    restore: return_context,
+                    route: top_level_origin
+                        .as_ref()
+                        .map(|origin| origin.route.clone())
+                        .unwrap_or_else(|| self.facet_navigation.route().clone()),
+                });
                 self.show_feedback_toast("★固定を解除しました".into());
                 return;
             }
@@ -2949,6 +2994,31 @@ mod tests {
         // 重要な不変条件: snapshot は解除された
         assert!(app.snapshot.is_none());
         // current_folder は実在する restore_to の load 成功後に更新される。
+        assert_eq!(
+            app.current_folder, before_cf,
+            "restore prepare keeps the source mounted"
+        );
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+        );
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app
+            .top_level_grid_view
+            .history_navigation_transition()
+            .is_some()
+            || app.sidecar_restore_active()
+        {
+            app.poll_collection_history_transition(&ctx);
+            app.poll_sidecar_restore(&ctx);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "typed snapshot return did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         let after_cf = app.current_folder.clone();
         assert_ne!(after_cf, before_cf);
         assert_eq!(after_cf, Some(before_search));

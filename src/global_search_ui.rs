@@ -223,6 +223,7 @@ pub enum GlobalSearchView {
 
 #[derive(Clone)]
 struct SearchViewWish {
+    adoption: SearchViewAdoption,
     sequence: u64,
     run_sequence: u64,
     query: String,
@@ -237,6 +238,17 @@ struct SearchViewWish {
     rating_filter: [bool; 6],
     done: bool,
     survivor_order: Option<Vec<String>>,
+}
+
+/// A prepared Search projection either adopts a main route or reprojects a mounted
+/// read-only context. It never infers navigation from painting or item generations.
+#[derive(Clone)]
+enum SearchViewAdoption {
+    Main {
+        navigation: crate::app::MainListNavigation,
+        destination: crate::app::FolderNavHistoryEntry,
+    },
+    Reprojection,
 }
 
 enum SearchPrepareCommand {
@@ -2107,8 +2119,8 @@ impl App {
         self.global_search.active = true;
         self.global_search.focus_request = true;
         if let Some(origin) = transferred_origin {
-            self.global_search.saved_folder = origin.legacy_path().or(fallback_origin);
-            self.global_search_subfolder_restore = origin.subfolder_restore();
+            self.global_search.saved_folder = origin.restore.legacy_path().or(fallback_origin);
+            self.global_search_subfolder_restore = origin.restore.subfolder_restore();
         } else {
             self.global_search.saved_folder = fallback_origin;
             self.global_search_subfolder_restore = None;
@@ -2133,8 +2145,8 @@ impl App {
         {
             return;
         }
-        let return_context = self.dismiss_global_search_without_restore();
-        self.restore_view_return_context(return_context);
+        let return_origin = self.dismiss_global_search_with_origin();
+        self.restore_view_return_origin(return_origin);
     }
 
     /// Ctrl+G を終了して戻り先だけを引き渡す。スマートフォルダ等へ直行する場合に、
@@ -2159,6 +2171,12 @@ impl App {
     pub(crate) fn dismiss_global_search_without_restore(
         &mut self,
     ) -> crate::app::top_level_grid_view::TopLevelGridRestore {
+        self.dismiss_global_search_with_origin().restore
+    }
+
+    pub(crate) fn dismiss_global_search_with_origin(
+        &mut self,
+    ) -> crate::app::top_level_grid_view::TopLevelGridOrigin {
         self.cancel_pending_folder_nav();
         // pending があれば SearchHandle の Drop impl で cancel される
         self.global_search.pending = None;
@@ -2201,11 +2219,16 @@ impl App {
             .global_search_subfolder_restore
             .take()
             .or_else(|| self.take_subfolder_expansion_restore_for_synthetic_path(path.as_deref()));
-        let canonical = self.top_level_grid_view.take_return_to();
-        self.view_return_context_from_canonical_or_fallback(
-            canonical.map(std::borrow::Cow::Owned),
+        let canonical = self.top_level_grid_view.take_return_origin();
+        let route = canonical
+            .as_ref()
+            .map(|origin| origin.route.clone())
+            .unwrap_or_default();
+        let restore = self.view_return_context_from_canonical_or_fallback(
+            canonical.map(|origin| std::borrow::Cow::Owned(origin.restore)),
             || (path, subfolder_restore),
-        )
+        );
+        crate::app::top_level_grid_view::TopLevelGridOrigin { restore, route }
     }
 
     /// debounce 経過チェック + 新クエリがあれば検索 spawn (App::update から毎フレーム呼ぶ)。
@@ -2590,12 +2613,17 @@ impl App {
                         writes_after_read =
                             self.rating_session_writes_after(wish.rating_write_generation);
                         self.search_drilled_folder_counts = prepared.drilled_counts;
-                        self.replace_search_view_items_with_ratings(
-                            prepared.items,
-                            prepared.image_metas,
-                            prepared.ratings,
-                            wish.survivor_order.is_some(),
-                        );
+                        if !self.adopt_prepared_search_view(wish.adoption, |app| {
+                            app.replace_search_view_items_with_ratings(
+                                prepared.items,
+                                prepared.image_metas,
+                                prepared.ratings,
+                                wish.survivor_order.is_some(),
+                            );
+                        }) {
+                            prepare.desired = None;
+                            continue;
+                        }
                         if prepared.rating_sort_failed {
                             self.show_feedback_toast(
                                 "評価順を読み込めなかったため名前順で表示しました".into(),
@@ -2830,6 +2858,103 @@ impl App {
         }
     }
 
+    fn capture_search_view_adoption(&mut self, view: &GlobalSearchView) -> SearchViewAdoption {
+        use crate::app::{FacetRoute, FacetScope};
+        use crate::app::{
+            FolderNavHistoryEntry, FolderNavHistoryTarget, MainHistoryOperation,
+            MainListSourceProof,
+        };
+        if !self.main_folder_history_available() {
+            return SearchViewAdoption::Reprojection;
+        }
+        let navigation = self.capture_main_list_navigation(
+            MainHistoryOperation::Restore { route: None },
+            MainListSourceProof::Row,
+        );
+        // Search's root is a transparent overlay, not an entered child edge (?9.2.2).
+        let origin = self
+            .top_level_grid_view
+            .return_origin()
+            .map(|origin| origin.route.clone())
+            .filter(|route| !route.0.is_empty())
+            .or_else(|| {
+                navigation
+                    .source_location
+                    .as_ref()
+                    .map(|entry| entry.route.clone())
+            })
+            .unwrap_or_else(|| {
+                FacetRoute::root(FacetScope::path(
+                    &crate::app::search_results_synthetic_path(),
+                ))
+            });
+        let mut route = origin;
+        if let GlobalSearchView::DrilledInto {
+            container_root,
+            current_path,
+            is_zip,
+        } = view
+        {
+            let root = if *is_zip {
+                FacetScope::book(container_root, "")
+            } else {
+                FacetScope::path(container_root)
+            };
+            route = route.child(root);
+            if current_path != container_root {
+                if *is_zip {
+                    if let Ok(prefix) = current_path.strip_prefix(container_root) {
+                        route = route
+                            .child(FacetScope::book(container_root, &prefix.to_string_lossy()));
+                    }
+                } else if let Ok(relative) = current_path.strip_prefix(container_root) {
+                    let mut path = container_root.clone();
+                    for component in relative.components() {
+                        path.push(component);
+                        route = route.child(FacetScope::path(&path));
+                    }
+                }
+            }
+        }
+        let location = navigation
+            .source_location
+            .as_ref()
+            .map(|entry| entry.location.clone())
+            .unwrap_or_else(|| {
+                FolderNavHistoryTarget::Path(crate::app::search_results_synthetic_path())
+            });
+        SearchViewAdoption::Main {
+            navigation,
+            destination: FolderNavHistoryEntry::new(location, route),
+        }
+    }
+
+    fn adopt_prepared_search_view(
+        &mut self,
+        adoption: SearchViewAdoption,
+        install: impl FnOnce(&mut Self),
+    ) -> bool {
+        match adoption {
+            SearchViewAdoption::Main {
+                navigation,
+                destination,
+            } => {
+                let Some(adoption) = self.prepare_main_list_adoption(navigation, destination)
+                else {
+                    return false;
+                };
+                self.adopt_main_list_navigation(adoption, |app| {
+                    install(app);
+                    None
+                })
+            }
+            SearchViewAdoption::Reprojection => {
+                install(self);
+                true
+            }
+        }
+    }
+
     fn request_search_view_build(&mut self, survivor_order: Option<Vec<String>>) {
         if self.global_search.page_edit_prepare.is_some() {
             self.global_search.maybe_auto_switch_aggregate();
@@ -2837,9 +2962,11 @@ impl App {
             let context = self.virtual_list_context_id();
             let rating_filter = self.effective_rating_filter();
             let view = self.global_search.view();
+            let adoption = self.capture_search_view_adoption(&view);
             let prepare = self.global_search.page_edit_prepare.as_mut().unwrap();
             prepare.next_sequence = prepare.next_sequence.wrapping_add(1);
             prepare.desired = Some(SearchViewWish {
+                adoption,
                 sequence: prepare.next_sequence,
                 run_sequence: self.global_search.run_sequence,
                 query: self.global_search.query.clone(),
@@ -2873,6 +3000,7 @@ impl App {
         // Codex 3rd P1 fix: ★一時解除中 (= effective filter [true;6]) を Ctrl+G drill view
         // にも反映。旧版は settings.rating_filter を直接使っていたため、suppress 発動して
         // も drill 内で未評価 hits が build_drilled_items 側で落とされていた。
+        let adoption = self.capture_search_view_adoption(&self.global_search.view());
         let rating_filter = self.effective_rating_filter();
         let order_request = crate::rating_sort::ListingOrderRequest::from_settings(&self.settings);
         let sort_order = order_request.standard_fallback();
@@ -2912,7 +3040,11 @@ impl App {
                 )
             }
         };
-        self.replace_search_view_items(items, image_metas);
+        if !self.adopt_prepared_search_view(adoption, |app| {
+            app.replace_search_view_items(items, image_metas);
+        }) {
+            return;
+        }
         // BS 戻りのカーソル位置復帰。target が見つからない・非表示のときは
         // 「先頭の表示中アイテム」にフォールバックする (selected=None のままだと
         // 次の方向キーで idx 0 に飛んでしまうため)。
@@ -2944,7 +3076,6 @@ impl App {
     /// を表示する。
     pub(crate) fn drill_into_container(&mut self, container: PathBuf, is_zip: bool) {
         self.cancel_pending_folder_nav();
-        self.maybe_suppress_facet_filter_for_opened_container_path(&container);
         // ドリルインはユーザーの明示操作 → 自動ビュー切替を止める (§4.3.2 (c))。
         self.global_search.aggregate_auto = false;
         self.global_search.drill = Some(DrillState {
@@ -2960,7 +3091,6 @@ impl App {
     pub(crate) fn drill_into_subfolder(&mut self, sub_path: PathBuf) {
         if let Some(d) = self.global_search.drill.clone() {
             self.cancel_pending_folder_nav();
-            self.maybe_suppress_facet_filter_for_opened_container_path(&sub_path);
             self.global_search.drill = Some(DrillState {
                 current_path: sub_path,
                 ..d
@@ -3029,7 +3159,6 @@ impl App {
         // Ctrl+G drill-back は load_folder を経由しないため、suppression の subtree
         // 外判定が走らない。ユーザー視点では「本から出た」ので復元する (Codex High 指摘)。
         self.restore_rating_filter_suppression();
-        while self.restore_facet_filter_suppression() {}
         // 戻った先で当該 SearchContainer にカーソルを再選択する。
         if let Some(d) = &self.global_search.drill {
             self.global_search.restore_select_path = Some(d.container_root.clone());
@@ -3059,7 +3188,6 @@ impl App {
                 // 戻った先 (parent) で「直前に居たサブフォルダ」にカーソル復帰
                 self.global_search.restore_select_path = Some(d.current_path.clone());
                 self.cancel_pending_folder_nav();
-                self.restore_facet_filter_suppression_for_path(Some(&parent_pb));
                 self.global_search.drill = Some(DrillState {
                     current_path: parent_pb,
                     ..d
@@ -3803,6 +3931,7 @@ mod tests {
             unrated_position: crate::rating_sort::RatingSortUnratedPosition::BelowAll,
         };
         let wish = SearchViewWish {
+            adoption: SearchViewAdoption::Reprojection,
             sequence: 1,
             run_sequence: 1,
             query: "test".into(),
