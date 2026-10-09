@@ -32,7 +32,6 @@ impl PreviewFrame<'_> {
 
 /// Draws only editor decorations over an already-composited texture.
 pub fn draw_preview(ui: &mut egui::Ui, frame: Option<PreviewFrame<'_>>, state: &mut EditorState) {
-    ui.checkbox(&mut state.show_selection_bounds, "選択レイヤーの枠");
     if let Some(frame) = frame {
         let source = frame.texture.size_vec2();
         let available = ui.available_size().max(Vec2::ZERO);

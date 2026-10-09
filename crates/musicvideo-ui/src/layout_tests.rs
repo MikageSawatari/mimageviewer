@@ -13,6 +13,7 @@ struct Harness {
     panels: [Rect; 3],
     timeline_entry: Project,
     properties_entry: Project,
+    project_path: Option<PathBuf>,
 }
 
 impl Harness {
@@ -30,6 +31,7 @@ impl Harness {
             output: FullOutput::default(),
             response: EditorResponse::default(),
             panels: [Rect::NOTHING; 3],
+            project_path: None,
         };
         harness.frame(vec![]);
         harness.frame(vec![]);
@@ -64,7 +66,15 @@ impl Harness {
                     .rect;
                 self.panels[2] = egui::SidePanel::right("inspector")
                     .default_width(360.0)
-                    .show(ctx, |ui| frame.inspector(ui, 0.0, &[], &[]))
+                    .show(ctx, |ui| {
+                        frame.inspector_with_project_path(
+                            ui,
+                            0.0,
+                            &[],
+                            &[],
+                            self.project_path.as_deref(),
+                        )
+                    })
                     .response
                     .rect;
                 self.response = frame.finish();
@@ -219,6 +229,41 @@ impl Harness {
             self.frame(vec![]);
         }
     }
+}
+
+#[test]
+fn project_tab_paths_are_read_only_and_stay_in_the_scrollable_inspector() {
+    let mut h = Harness::new();
+    h.state.set_inspector_tab(InspectorTab::Project);
+    h.project_path = Some(PathBuf::from("saved.mivmv.json"));
+    h.project.audio = Some(musicvideo_core::AudioRef {
+        path: "sound.wav".into(),
+    });
+    h.project.images = (0..40)
+        .map(|index| musicvideo_core::ImageRef {
+            id: ImageId::new(format!("image-{index}")),
+            path: PathBuf::from(format!("image-{index}.png")),
+        })
+        .collect();
+    let project = h.project.clone();
+    h.frame(vec![]);
+    h.frame(vec![]);
+    for text in [
+        "プロジェクト: saved.mivmv.json",
+        "音声: sound.wav",
+        "画像 image-0: image-0.png",
+    ] {
+        assert!(
+            h.output.shapes.iter().any(
+                |s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text() == text)
+                    && h.panels[2].contains(s.clip_rect.center())
+            ),
+            "missing inspector path: {text}"
+        );
+    }
+    assert_eq!(h.project, project);
+    assert!(!h.response.project_changed);
+    assert!(!h.state.can_undo());
 }
 
 #[test]

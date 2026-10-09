@@ -1,3 +1,9 @@
+mod chrome;
+#[cfg(test)]
+mod chrome_tests;
+
+use chrome::{ChromeAction, ToolbarState};
+
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -458,6 +464,8 @@ pub struct MusicVideoLabApp {
     document: DocumentSession,
     image_errors: HashMap<ImageId, String>,
     status: String,
+    show_missing_resources: bool,
+    show_diagnostics: bool,
     audio_pending: Option<AudioPending>,
     image_pending: Option<ImagePending>,
     preview_pending: Option<PreviewPending>,
@@ -516,6 +524,8 @@ impl MusicVideoLabApp {
             document: DocumentSession::default(),
             image_errors: HashMap::new(),
             status,
+            show_missing_resources: false,
+            show_diagnostics: false,
             audio_pending: None,
             image_pending: None,
             preview_pending: None,
@@ -1093,8 +1103,15 @@ impl MusicVideoLabApp {
 
     /// Shared production frame boundary: all input and note_edit calls must
     /// precede completion admission. Headless input tests use this same entry.
-    fn process_editor_frame(&mut self, ctx: &egui::Context) {
-        let response = self.draw_editing_panels(ctx);
+    fn process_editor_frame(&mut self, ctx: &egui::Context) -> bool {
+        let input_enabled = !self.load_choice_open();
+        let mut actions = Vec::new();
+        self.draw_status_bar(ctx, input_enabled, &mut actions);
+        let (response, toolbar_actions) = self.draw_editing_panels(ctx, input_enabled);
+        actions.extend(toolbar_actions);
+        self.draw_tool_windows(ctx, input_enabled, &mut actions);
+        actions.extend(self.draw_load_choice(ctx));
+        let reset_preview_perf = self.apply_chrome_actions(ctx, actions);
         let add_image_layer_requested = response.add_image_layer_requested;
         let import_lrc_requested = response.import_lrc_requested;
         let export_lrc_requested = response.export_lrc_requested;
@@ -1129,20 +1146,55 @@ impl MusicVideoLabApp {
         self.poll_projects(ctx);
         self.poll_lrc(ctx);
         self.sync_runtime_resources(ctx);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
+            "{} - mIV 音楽ビデオ",
+            self.project_caption()
+        )));
+        reset_preview_perf
     }
 
     /// All editor input and generation updates precede asynchronous completion admission.
-    fn draw_editing_panels(&mut self, ctx: &egui::Context) -> EditorResponse {
-        let mut prepared = self.editor_state.begin_frame(ctx, &mut self.project);
-        egui::TopBottomPanel::top("musicvideo-history").show(ctx, |ui| {
-            prepared.history_controls(ui);
+    fn draw_editing_panels(
+        &mut self,
+        ctx: &egui::Context,
+        input_enabled: bool,
+    ) -> (EditorResponse, Vec<ChromeAction>) {
+        let toolbar = ToolbarState::from_app(self);
+        let mut actions = Vec::new();
+        let mut prepared =
+            self.editor_state
+                .begin_frame_with_input_enabled(ctx, &mut self.project, input_enabled);
+        egui::TopBottomPanel::top("musicvideo-controls").show(ctx, |ui| {
+            ui.add_enabled_ui(input_enabled, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    toolbar.draw(ui, &mut actions);
+                    prepared.preview_controls(ui);
+                    prepared.history_controls(ui);
+                });
+            });
         });
+        // Toolbar seek input used to run before the timeline. Pass its requested
+        // position to both editor regions, and admit any later timeline seek last.
+        let input_position_secs = actions
+            .iter()
+            .rev()
+            .find_map(|action| {
+                if let ChromeAction::Seek(position) = action {
+                    Some(*position)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(self.position_secs);
         let timeline_response = egui::TopBottomPanel::bottom("musicvideo-timeline")
             .resizable(true)
             .default_height(320.0)
             .min_height(150.0)
             .show(ctx, |ui| {
-                prepared.timeline(ui, self.position_secs, self.waveform.as_ref())
+                ui.add_enabled_ui(input_enabled, |ui| {
+                    prepared.timeline(ui, input_position_secs, self.waveform.as_ref())
+                })
+                .inner
             })
             .inner;
         let mut frame = prepared.properties();
@@ -1150,20 +1202,25 @@ impl MusicVideoLabApp {
             .resizable(true)
             .default_width(220.0)
             .min_width(180.0)
-            .show(ctx, |ui| frame.layer_list(ui));
+            .show(ctx, |ui| {
+                ui.add_enabled_ui(input_enabled, |ui| frame.layer_list(ui));
+            });
         egui::SidePanel::right("musicvideo-properties")
             .resizable(true)
             .default_width(360.0)
             .min_width(300.0)
             .show(ctx, |ui| {
-                frame.inspector(
-                    ui,
-                    self.position_secs,
-                    self.displayed_preview
-                        .as_ref()
-                        .map_or(&[], |preview| preview.modulator_values.as_slice()),
-                    &self.modulator_calibrations,
-                );
+                ui.add_enabled_ui(input_enabled, |ui| {
+                    frame.inspector_with_project_path(
+                        ui,
+                        input_position_secs,
+                        self.displayed_preview
+                            .as_ref()
+                            .map_or(&[], |preview| preview.modulator_values.as_slice()),
+                        &self.modulator_calibrations,
+                        self.document.path(),
+                    )
+                });
             });
         let response = frame.finish();
         self.handle_editor_response(response);
@@ -1171,12 +1228,12 @@ impl MusicVideoLabApp {
             self.document.note_edit();
         }
         if let Some(position_secs) = timeline_response.seek_to {
-            self.seek_to(position_secs);
+            actions.push(ChromeAction::Seek(position_secs));
         } else if timeline_response.project_changed {
             self.schedule_project_edit_preview();
         }
 
-        response
+        (response, actions)
     }
 
     fn handle_editor_response(&mut self, response: EditorResponse) {
@@ -2263,331 +2320,8 @@ impl eframe::App for MusicVideoLabApp {
             self.schedule_playback_preview();
         }
         let audio_sync_ms = audio_sync_started.elapsed().as_secs_f64() * 1000.0;
-        let mut replacement_request = None;
-        let mut reset_preview_perf = false;
-        let mut apply_ready_project = false;
-        let mut discard_ready_project = false;
-        let mut apply_ready_lrc = false;
-        let mut discard_ready_lrc = false;
-        let mut retry_resource_restore = false;
-
         let egui_layout_started = Instant::now();
-        egui::TopBottomPanel::top("musicvideo-controls").show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                if ui
-                    .add_enabled(
-                        self.export_pending.is_none() && self.lrc_save_pending.is_none(),
-                        egui::Button::new("プロジェクトを開く"),
-                    )
-                    .clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("mIV 音楽ビデオ", &["json"])
-                        .pick_file()
-                {
-                    self.start_project_load(path, ctx);
-                }
-                if ui
-                    .add_enabled(
-                        self.project_save_pending.is_none(),
-                        egui::Button::new("プロジェクトを保存"),
-                    )
-                    .clicked()
-                {
-                    let path = self.document.path().map(PathBuf::from).or_else(|| {
-                        rfd::FileDialog::new()
-                            .add_filter("mIV 音楽ビデオ", &["json"])
-                            .set_file_name("project.mivmv.json")
-                            .save_file()
-                    });
-                    if let Some(path) = path {
-                        self.start_project_save(ensure_project_extension(path), ctx);
-                    }
-                }
-                if ui
-                    .add_enabled(
-                        self.project_save_pending.is_none(),
-                        egui::Button::new("名前を付けて保存"),
-                    )
-                    .clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("mIV 音楽ビデオ", &["json"])
-                        .set_file_name("project.mivmv.json")
-                        .save_file()
-                {
-                    self.start_project_save(ensure_project_extension(path), ctx);
-                }
-                if ui
-                    .add_enabled(
-                        self.export_pending.is_none(),
-                        egui::Button::new("音声を開く"),
-                    )
-                    .clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .add_filter(
-                            "音声",
-                            &["mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "alac"],
-                        )
-                        .pick_file()
-                {
-                    self.start_audio_load(path, ctx);
-                }
-                if ui
-                    .add_enabled(
-                        self.export_pending.is_none(),
-                        egui::Button::new("背景画像を開く"),
-                    )
-                    .clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("画像", &["png", "jpg", "jpeg", "webp", "bmp"])
-                        .pick_file()
-                {
-                    self.start_image_load(ImageId::new(BACKGROUND_ID), path, ctx);
-                }
-
-                let ready_to_export = self.audio.is_some()
-                    && self.assets.has_image(&ImageId::new(BACKGROUND_ID))
-                    && self.runtime_resources_ready()
-                    && self.export_pending.is_none();
-                if ui
-                    .add_enabled(ready_to_export, egui::Button::new("連番 PNG を書き出す"))
-                    .clicked()
-                    && let Some(folder) = rfd::FileDialog::new().pick_folder()
-                {
-                    self.start_export(folder, ctx);
-                }
-                if let Some(pending) = &self.export_pending
-                    && ui.button("書き出しをキャンセル").clicked()
-                {
-                    pending.cancel.store(true, Ordering::Relaxed);
-                    self.status = "キャンセルを要求しました".to_owned();
-                }
-                if self.pending_project_edit_in_progress()
-                    && ui.button("素材読込をキャンセル").clicked()
-                {
-                    self.cancel_pending_resource_loads();
-                    self.document.note_edit();
-                    self.status = "素材の読込をキャンセルしました".to_owned();
-                }
-            });
-
-            if matches!(self.project_load, ProjectLoadState::Ready(_)) {
-                ui.separator();
-                ui.colored_label(
-                    egui::Color32::YELLOW,
-                    "プロジェクト読込中に現在の編集内容が変わりました。",
-                );
-                ui.horizontal(|ui| {
-                    apply_ready_project |= ui
-                        .button("読込結果へ切り替える（現在の変更を破棄）")
-                        .clicked();
-                    discard_ready_project |= ui.button("現在の編集を続ける").clicked();
-                });
-            }
-            if matches!(self.lrc_load, LrcLoadState::Ready { .. }) {
-                ui.separator();
-                ui.colored_label(
-                    egui::Color32::YELLOW,
-                    "LRC 読込中に対象の歌詞が変更されました。",
-                );
-                ui.horizontal(|ui| {
-                    apply_ready_lrc |= ui
-                        .button("LRC の内容へ置換（現在の歌詞変更を破棄）")
-                        .clicked();
-                    discard_ready_lrc |= ui.button("現在の歌詞を保持").clicked();
-                });
-            }
-            match &self.runtime_resources {
-                RuntimeResourceState::Restoring { .. } => {
-                    ui.label("履歴の素材を復元しています…");
-                }
-                RuntimeResourceState::Unresolved { error, .. } => {
-                    ui.colored_label(
-                        egui::Color32::LIGHT_RED,
-                        format!("履歴の素材が未解決です: {error}"),
-                    );
-                    retry_resource_restore |= ui.button("素材の復元を再試行").clicked();
-                }
-                RuntimeResourceState::Ready(_) => {}
-            }
-
-            ui.separator();
-            ui.label(&self.status);
-            if !self.preview_report.unresolved_assets.is_empty() {
-                let notices = unresolved_image_notices(
-                    &self.project,
-                    &self.preview_report,
-                    &self.image_errors,
-                );
-                replacement_request = draw_missing_images(ui, &notices);
-                for asset in &self.preview_report.unresolved_assets {
-                    if let UnresolvedAsset::Font(key) = asset {
-                        ui.colored_label(
-                            egui::Color32::LIGHT_RED,
-                            format!("未解決素材: フォント {key}"),
-                        );
-                    }
-                }
-            }
-            let dirty_suffix = if self.document.is_dirty(&self.project) {
-                "（未保存）"
-            } else {
-                ""
-            };
-            if let Some(path) = self.document.path() {
-                ui.label(format!("プロジェクト: {}{dirty_suffix}", path.display()));
-            } else {
-                ui.label(format!("プロジェクト: 新規{dirty_suffix}"));
-            }
-            if let Some(audio) = &self.project.audio {
-                ui.label(format!("音声: {}", audio.path.display()));
-            }
-            if let Some(error) = &self.audio_error {
-                ui.colored_label(
-                    egui::Color32::LIGHT_RED,
-                    format!("未解決の音声素材: {error}"),
-                );
-            }
-            for image in &self.project.images {
-                ui.label(format!("画像 {}: {}", image.id.0, image.path.display()));
-            }
-            if let Some(pending) = &self.export_pending {
-                let completed = pending.progress.load(Ordering::Relaxed);
-                let fraction = completed as f32 / pending.total_frames.max(1) as f32;
-                ui.add(
-                    egui::ProgressBar::new(fraction)
-                        .show_percentage()
-                        .text(format!("{completed} / {} フレーム", pending.total_frames)),
-                );
-            }
-            if let Some(outcome) = &self.last_export {
-                match outcome {
-                    ExportOutcome::Completed { stats, .. } => {
-                        ui.label(format!(
-                            "解析: 平均 {:.3} ms / p95 {:.3} ms",
-                            stats.analysis.mean_ms, stats.analysis.p95_ms
-                        ));
-                        ui.label(format!(
-                            "合成: 平均 {:.3} ms / p95 {:.3} ms",
-                            stats.composition.mean_ms, stats.composition.p95_ms
-                        ));
-                        ui.label(format!(
-                            "合計: 平均 {:.3} ms / p95 {:.3} ms / 実時間比 {:.3}x",
-                            stats.total.mean_ms, stats.total.p95_ms, stats.realtime_ratio
-                        ));
-                    }
-                    ExportOutcome::Cancelled {
-                        completed_frames, ..
-                    } => {
-                        ui.label(format!("完了済み: {completed_frames} フレーム"));
-                    }
-                }
-            }
-
-            ui.separator();
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(
-                        self.audio_transport_ready(),
-                        egui::Button::new(if playback.playing { "一時停止" } else { "再生" }),
-                    )
-                    .clicked()
-                    && let Some(player) = &self.audio_player
-                {
-                    let snapshot = player.toggle();
-                    self.position_secs = snapshot.position_secs;
-                    reset_preview_perf = true;
-                    self.schedule_playback_preview();
-                }
-                ui.label(format!(
-                    "{} / {}",
-                    format_clock(self.position_secs),
-                    format_clock(self.project.duration_secs)
-                ));
-                let changed = ui
-                    .add(
-                        egui::Slider::new(
-                            &mut self.position_secs,
-                            0.0..=self.project.duration_secs.max(0.001),
-                        )
-                        .text("時刻 (秒)"),
-                    )
-                    .changed();
-                if changed {
-                    self.seek_to(self.position_secs);
-                }
-                ui.label(format!("合成 {:.2} ms", self.preview_render_ms));
-                if ui.small_button("計測をリセット").clicked() {
-                    reset_preview_perf = true;
-                }
-            });
-            ui.small(
-                "シーク時はスペクトラムの履歴をリセットします。連続再生中は書き出しと同じ解析順です。",
-            );
-            if let Some(perf) = self.preview_perf.summary() {
-                ui.small(format!(
-                    "プレビュー実測 (直近 {}): {:.1} fps / 表示間隔 {:.2} ms",
-                    perf.samples, perf.fps, perf.display_interval_ms
-                ));
-                ui.small(format!(
-                    "worker: 解析 {:.2} / シーン評価+合成 {:.2} / RGBA→egui {:.2} / その他 {:.2} ms",
-                    perf.analysis_ms,
-                    perf.scene_composition_ms,
-                    perf.rgba_to_egui_ms,
-                    perf.worker_other_ms
-                ));
-                ui.small(format!(
-                    "UI: texture.set {:.2} / egui layout+draw {:.2} / 音声同期 {:.3} / その他 {:.2} ms",
-                    perf.texture_update_ms,
-                    perf.egui_layout_ms,
-                    perf.audio_sync_ms,
-                    perf.ui_other_ms
-                ));
-                ui.small(format!(
-                    "表示間隔−worker (eframe描画/GPU upload/待機、並行区間を含む): {:.2} ms",
-                    perf.outside_worker_ms
-                ));
-            }
-        });
-
-        if apply_ready_project
-            && let ProjectLoadState::Ready(loaded) = std::mem::take(&mut self.project_load)
-        {
-            self.apply_loaded_project(loaded);
-        } else if discard_ready_project
-            && let ProjectLoadState::Ready(loaded) = std::mem::take(&mut self.project_load)
-        {
-            self.defer_loaded_project(loaded);
-            self.status = "読込結果を破棄し、現在の編集を続けます".to_owned();
-        }
-        if retry_resource_restore {
-            self.retry_runtime_restore(ctx);
-        }
-        if apply_ready_lrc
-            && let LrcLoadState::Ready {
-                owner,
-                path,
-                report,
-            } = std::mem::take(&mut self.lrc_load)
-        {
-            self.apply_lrc_result(owner, path, report, ctx);
-        } else if discard_ready_lrc
-            && matches!(
-                std::mem::take(&mut self.lrc_load),
-                LrcLoadState::Ready { .. }
-            )
-        {
-            self.status = "LRC の読込結果を破棄し、現在の歌詞を保持しました".to_owned();
-        }
-
-        if let Some(id) = replacement_request
-            && let Some(path) = rfd::FileDialog::new()
-                .add_filter("画像", &["png", "jpg", "jpeg", "webp", "bmp"])
-                .pick_file()
-        {
-            self.start_image_load(id, path, ctx);
-        }
-
-        self.process_editor_frame(ctx);
+        let reset_preview_perf = self.process_editor_frame(ctx);
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
@@ -3011,6 +2745,8 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
+                    egui::TopBottomPanel::top("preview-controls")
+                        .show(ctx, |ui| app.editor_state.preview_controls(ui));
                     egui::CentralPanel::default().show(ctx, |ui| app.draw_preview(ui));
                 },
             );

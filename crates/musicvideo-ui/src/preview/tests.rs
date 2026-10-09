@@ -111,6 +111,8 @@ fn render(state: &mut EditorState, project: &Project, ready: bool) -> egui::Full
                 ..Default::default()
             },
             |ctx| {
+                egui::TopBottomPanel::top("preview-controls")
+                    .show(ctx, |ui| state.preview_controls(ui));
                 egui::CentralPanel::default().show(ctx, |ui| {
                     draw_preview(
                         ui,

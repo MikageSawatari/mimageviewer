@@ -3,7 +3,7 @@
 //! ウィンドウ、ファイル I/O、音声再生、書き出しは呼び出し側が所有する。
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 mod document;
 mod history;
@@ -761,6 +761,10 @@ pub enum InspectorTab {
 }
 
 impl EditorState {
+    pub fn preview_controls(&mut self, ui: &mut egui::Ui) {
+        ui.checkbox(&mut self.show_selection_bounds, "選択レイヤーの枠");
+    }
+
     pub fn inspector_tab(&self) -> InspectorTab {
         self.inspector_tab
     }
@@ -775,14 +779,27 @@ impl EditorState {
         context: &egui::Context,
         project: &'a mut Project,
     ) -> PreparedEditorFrame<'a> {
+        self.begin_frame_with_input_enabled(context, project, true)
+    }
+
+    /// Hosts render the regions in disabled Uis while presenting a decision modal.
+    /// This flag also blocks context-level shortcuts and deletion confirmation.
+    /// Reconciliation and history observation still run.
+    pub fn begin_frame_with_input_enabled<'a>(
+        &'a mut self,
+        context: &egui::Context,
+        project: &'a mut Project,
+        input_enabled: bool,
+    ) -> PreparedEditorFrame<'a> {
         self.restore_pending_text_edit_states(context);
         self.reconcile_preserving_native_reachability(project);
-        let history_changed = apply_history_shortcut(context, project, self);
+        let history_changed = input_enabled && apply_history_shortcut(context, project, self);
         PreparedEditorFrame {
             context: context.clone(),
             project,
             state: self,
             history_changed,
+            input_enabled,
         }
     }
 }
@@ -795,9 +812,14 @@ pub struct PreparedEditorFrame<'a> {
     project: &'a mut Project,
     state: &'a mut EditorState,
     history_changed: bool,
+    input_enabled: bool,
 }
 
 impl<'a> PreparedEditorFrame<'a> {
+    pub fn preview_controls(&mut self, ui: &mut egui::Ui) {
+        self.state.preview_controls(ui);
+    }
+
     pub fn history_controls(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if ui
@@ -832,6 +854,7 @@ impl<'a> PreparedEditorFrame<'a> {
             project: self.project,
             state: self.state,
             checkpoint,
+            input_enabled: self.input_enabled,
             response: EditorResponse {
                 history_changed: self.history_changed,
                 ..Default::default()
@@ -848,6 +871,7 @@ pub struct EditorFrame<'a> {
     project: &'a mut Project,
     state: &'a mut EditorState,
     checkpoint: EditCheckpoint,
+    input_enabled: bool,
     response: EditorResponse,
 }
 
@@ -973,6 +997,23 @@ impl EditorFrame<'_> {
         modulator_values: &[ModulatorValue],
         calibrations: &[ModulatorCalibration],
     ) {
+        self.inspector_with_project_path(
+            ui,
+            current_time_secs,
+            modulator_values,
+            calibrations,
+            None,
+        );
+    }
+
+    pub fn inspector_with_project_path(
+        &mut self,
+        ui: &mut egui::Ui,
+        current_time_secs: f64,
+        modulator_values: &[ModulatorValue],
+        calibrations: &[ModulatorCalibration],
+        project_path: Option<&Path>,
+    ) {
         ui.horizontal(|ui| {
             ui.selectable_value(
                 &mut self.state.inspector_tab,
@@ -1048,13 +1089,15 @@ impl EditorFrame<'_> {
                         )
                         .on_hover_text("鍵盤の点灯強度だけを調整します。音声の音量は変わりません")
                         .changed();
+                    draw_project_paths(ui, project, project_path);
                 }
             }
         });
     }
     pub fn finish(mut self) -> EditorResponse {
-        if let Some(command) =
-            draw_layer_delete_confirmation(&self.context, self.project, self.state)
+        if self.input_enabled
+            && let Some(command) =
+                draw_layer_delete_confirmation(&self.context, self.project, self.state)
         {
             self.response.project_changed |= self.state.apply_command(self.project, &command);
         }
@@ -1221,6 +1264,21 @@ fn draw_layer_delete_confirmation(
             state.pending_layer_delete = None;
         }
         None
+    }
+}
+
+/// Read-only project/material paths belong to the scrollable project inspector.
+pub fn draw_project_paths(ui: &mut egui::Ui, project: &Project, project_path: Option<&Path>) {
+    ui.separator();
+    ui.label(format!(
+        "プロジェクト: {}",
+        project_path.map_or_else(|| "新規".to_owned(), |p| p.display().to_string())
+    ));
+    if let Some(audio) = &project.audio {
+        ui.label(format!("音声: {}", audio.path.display()));
+    }
+    for image in &project.images {
+        ui.label(format!("画像 {}: {}", image.id.0, image.path.display()));
     }
 }
 
