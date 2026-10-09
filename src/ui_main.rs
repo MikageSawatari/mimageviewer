@@ -12550,7 +12550,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     if ui.small_button("全解除").clicked() {
                         if self.facet_filter_active() {
                             facet_name_changed |= self.clear_facet_name_filter_state();
-                            self.settings.facet_filter.clear();
+                            self.active_facet_filter_mut().clear();
                             facet_changed = true;
                         }
                         if rating_filter_visible {
@@ -12792,7 +12792,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 if self.settings.facet_filter.kinds.is_empty() {
                     ui.label("すべて");
                 } else if ui.small_button("種類フィルタを解除").clicked() {
-                    self.settings.facet_filter.kinds.clear();
+                    self.active_facet_filter_mut().kinds.clear();
                     changed = true;
                     ui.close();
                 }
@@ -12805,9 +12805,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     let text = format!("{} ({count})", kind.label());
                     if ui.checkbox(&mut selected, text).changed() {
                         if selected {
-                            self.settings.facet_filter.kinds.insert(kind);
+                            self.active_facet_filter_mut().kinds.insert(kind);
                         } else {
-                            self.settings.facet_filter.kinds.remove(&kind);
+                            self.active_facet_filter_mut().kinds.remove(&kind);
                         }
                         changed = true;
                     }
@@ -12831,7 +12831,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 if self.settings.facet_filter.exts.is_empty() {
                     ui.label("すべて");
                 } else if ui.small_button("拡張子フィルタを解除").clicked() {
-                    self.settings.facet_filter.exts.clear();
+                    self.active_facet_filter_mut().exts.clear();
                     changed = true;
                     ui.close();
                 }
@@ -12844,9 +12844,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     let text = format!(".{} ({count})", ext);
                     if ui.checkbox(&mut selected, text).changed() {
                         if selected {
-                            self.settings.facet_filter.exts.insert(ext);
+                            self.active_facet_filter_mut().exts.insert(ext);
                         } else {
-                            self.settings.facet_filter.exts.remove(&ext);
+                            self.active_facet_filter_mut().exts.remove(&ext);
                         }
                         changed = true;
                     }
@@ -12873,7 +12873,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 if self.settings.facet_filter.place_keys.is_empty() {
                     ui.label("すべて");
                 } else if ui.small_button("場所フィルタを解除").clicked() {
-                    self.settings.facet_filter.place_keys.clear();
+                    self.active_facet_filter_mut().place_keys.clear();
                     changed = true;
                     ui.close();
                 }
@@ -12895,9 +12895,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             let text = format!("{place_label} ({count})");
                             if draw_facet_checkbox_choice(ui, &mut selected, text, key.as_str()) {
                                 if selected {
-                                    self.settings.facet_filter.place_keys.insert(key.clone());
+                                    self.active_facet_filter_mut()
+                                        .place_keys
+                                        .insert(key.clone());
                                 } else {
-                                    self.settings.facet_filter.place_keys.remove(key);
+                                    self.active_facet_filter_mut().place_keys.remove(key);
                                 }
                                 changed = true;
                             }
@@ -12945,7 +12947,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 if self.settings.facet_filter.ai_models.is_empty() {
                     ui.label("すべて");
                 } else if ui.small_button("AIモデルフィルタを解除").clicked() {
-                    self.settings.facet_filter.ai_models.clear();
+                    self.active_facet_filter_mut().ai_models.clear();
                     changed = true;
                     ui.close();
                 }
@@ -12960,9 +12962,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             let text = format!("{model} ({count})");
                             if ui.checkbox(&mut selected, text).changed() {
                                 if selected {
-                                    self.settings.facet_filter.ai_models.insert(model);
+                                    self.active_facet_filter_mut().ai_models.insert(model);
                                 } else {
-                                    self.settings.facet_filter.ai_models.remove(&model);
+                                    self.active_facet_filter_mut().ai_models.remove(&model);
                                 }
                                 changed = true;
                             }
@@ -12994,7 +12996,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 if self.settings.facet_filter.ai_tools.is_empty() {
                     ui.label("すべて");
                 } else if ui.small_button("生成ツールフィルタを解除").clicked() {
-                    self.settings.facet_filter.ai_tools.clear();
+                    self.active_facet_filter_mut().ai_tools.clear();
                     changed = true;
                     ui.close();
                 }
@@ -13008,9 +13010,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             let text = format!("{tool} ({count})");
                             if ui.checkbox(&mut selected, text).changed() {
                                 if selected {
-                                    self.settings.facet_filter.ai_tools.insert(tool);
+                                    self.active_facet_filter_mut().ai_tools.insert(tool);
                                 } else {
-                                    self.settings.facet_filter.ai_tools.remove(&tool);
+                                    self.active_facet_filter_mut().ai_tools.remove(&tool);
                                 }
                                 changed = true;
                             }
@@ -13167,7 +13169,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             )
                             .changed()
                         {
-                            self.settings.facet_filter.tag_mode = mode;
+                            self.active_facet_filter_mut().tag_mode = mode;
                             changed = true;
                         }
                         if ui
@@ -13178,7 +13180,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             )
                             .changed()
                         {
-                            self.settings.facet_filter.tag_mode = mode;
+                            self.active_facet_filter_mut().tag_mode = mode;
                             changed = true;
                         }
                     });
@@ -13187,8 +13189,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     {
                         ui.label("すべて");
                     } else if ui.small_button("タグフィルタを解除").clicked() {
-                        self.settings.facet_filter.tags.clear();
-                        self.settings.facet_filter.include_untagged = false;
+                        self.active_facet_filter_mut().tags.clear();
+                        self.active_facet_filter_mut().include_untagged = false;
                         changed = true;
                         ui.close();
                     }
@@ -13201,7 +13203,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         )
                         .changed()
                     {
-                        self.settings.facet_filter.include_untagged = include_untagged;
+                        self.active_facet_filter_mut().include_untagged = include_untagged;
                         changed = true;
                     }
                     ui.separator();
@@ -13244,9 +13246,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         &format!("#{display}"),
                                     ) {
                                         if selected {
-                                            self.settings.facet_filter.tags.insert(tag_key);
+                                            self.active_facet_filter_mut().tags.insert(tag_key);
                                         } else {
-                                            self.settings.facet_filter.tags.remove(&tag_key);
+                                            self.active_facet_filter_mut().tags.remove(&tag_key);
                                         }
                                         changed = true;
                                     }
@@ -13269,7 +13271,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     prepare_facet_menu_popup(ui);
                     let current = self.settings.facet_filter.date_preset;
                     if ui.selectable_label(current.is_none(), "すべて").clicked() {
-                        self.settings.facet_filter.date_preset = None;
+                        self.active_facet_filter_mut().date_preset = None;
                         changed = true;
                         ui.close();
                     }
@@ -13279,7 +13281,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             .selectable_label(current == Some(preset), preset.label())
                             .clicked()
                         {
-                            self.settings.facet_filter.date_preset = Some(preset);
+                            self.active_facet_filter_mut().date_preset = Some(preset);
                             changed = true;
                             ui.close();
                         }
@@ -13296,7 +13298,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             Some(FacetDatePreset::CustomDays(_))
                         );
                         if ui.selectable_label(selected, "日数を指定").clicked() {
-                            self.settings.facet_filter.date_preset =
+                            self.active_facet_filter_mut().date_preset =
                                 Some(FacetDatePreset::CustomDays(custom_days));
                             changed = true;
                         }
@@ -13308,7 +13310,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             )
                             .changed()
                         {
-                            self.settings.facet_filter.date_preset =
+                            self.active_facet_filter_mut().date_preset =
                                 Some(FacetDatePreset::CustomDays(custom_days));
                             changed = true;
                         }
@@ -13326,7 +13328,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         let today = FacetCalendarDate::today_local();
                         start = Some(today);
                         end = Some(today);
-                        self.settings.facet_filter.date_preset =
+                        self.active_facet_filter_mut().date_preset =
                             Some(FacetDatePreset::Range { start, end });
                         changed = true;
                     }
@@ -13337,7 +13339,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         if start.zip(end).is_some_and(|(start, end)| start > end) {
                             std::mem::swap(&mut start, &mut end);
                         }
-                        self.settings.facet_filter.date_preset =
+                        self.active_facet_filter_mut().date_preset =
                             Some(FacetDatePreset::Range { start, end });
                         changed = true;
                     }
@@ -13356,7 +13358,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     prepare_facet_menu_popup(ui);
                     let current = self.settings.facet_filter.size_preset;
                     if ui.selectable_label(current.is_none(), "すべて").clicked() {
-                        self.settings.facet_filter.size_preset = None;
+                        self.active_facet_filter_mut().size_preset = None;
                         changed = true;
                         ui.close();
                     }
@@ -13366,7 +13368,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             .selectable_label(current == Some(preset), preset.label())
                             .clicked()
                         {
-                            self.settings.facet_filter.size_preset = Some(preset);
+                            self.active_facet_filter_mut().size_preset = Some(preset);
                             changed = true;
                             ui.close();
                         }
@@ -13380,10 +13382,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         if !range_selected {
                             // 両端ともチェックを外した状態から始める。片方に既定値を入れて
                             // おくと、範囲指定を選んだだけで意図しない絞り込みが掛かる。
-                            self.settings.facet_filter.size_preset = Some(FacetSizePreset::Range {
-                                min: None,
-                                max: None,
-                            });
+                            self.active_facet_filter_mut().size_preset =
+                                Some(FacetSizePreset::Range {
+                                    min: None,
+                                    max: None,
+                                });
                         }
                         changed = true;
                     }
@@ -13408,7 +13411,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             FacetSizeValue::new(1, FacetSizeUnit::MB),
                         );
                         if range_changed {
-                            self.settings.facet_filter.size_preset =
+                            self.active_facet_filter_mut().size_preset =
                                 Some(FacetSizePreset::Range { min, max }.sanitized());
                             changed = true;
                         }
@@ -13428,7 +13431,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             if self.settings.facet_filter.edits.is_empty() {
                 ui.label("すべて");
             } else if ui.small_button("状態フィルタを解除").clicked() {
-                self.settings.facet_filter.edits.clear();
+                self.active_facet_filter_mut().edits.clear();
                 changed = true;
                 ui.close();
             }
@@ -13443,9 +13446,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 let mut selected = self.settings.facet_filter.edits.contains(&flag);
                 if ui.checkbox(&mut selected, flag.menu_label()).changed() {
                     if selected {
-                        self.settings.facet_filter.edits.insert(flag);
+                        self.active_facet_filter_mut().edits.insert(flag);
                     } else {
-                        self.settings.facet_filter.edits.remove(&flag);
+                        self.active_facet_filter_mut().edits.remove(&flag);
                     }
                     changed = true;
                 }
@@ -13462,7 +13465,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     )
                     .changed()
                 {
-                    self.settings.facet_filter.edit_include_descendants = include_descendants;
+                    self.active_facet_filter_mut().edit_include_descendants = include_descendants;
                     changed = true;
                 }
             });
@@ -16407,7 +16410,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         }
                         self.note_reading_history_open(idx);
                         self.maybe_suppress_rating_filter_for_opened_container(idx);
-                        self.maybe_suppress_facet_filter_for_opened_container(idx);
                         if auto_fs {
                             self.pending_auto_fs_open = true;
                         }
@@ -16483,21 +16485,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     let owner = self.main_grid_archive_open_owner(idx, &pf);
                     let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();
                     let staged = self.will_stage_archive_navigation(&pf, &owner);
-                    let search_rollback = if !staged
-                        && (self.favsearch.active
-                            || self.tag_view.active
-                            || self.rating_view_nav_context_active())
-                    {
-                        Some(self.folder_nav_history_snapshot())
-                    } else {
-                        None
-                    };
-                    if !staged && self.favsearch.active {
-                        self.favsearch.nav_stack.push(pf.clone());
-                    }
-                    if !staged && self.tag_view.active {
-                        self.record_tag_view_nav_open(&pf);
-                    }
                     let open_outcome = self
                         .load_folder_or_convert_archive_with_auto_fullscreen_owned(
                             pf,
@@ -16505,19 +16492,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             owner,
                             crate::app::StartupListIntent::container_open(auto_fs),
                         );
-                    match (open_outcome, search_rollback) {
-                        (crate::app::FolderOpenOutcome::ConversionDialogOpened, Some(snapshot)) => {
-                            self.attach_archive_convert_nav_history_rollback(snapshot);
-                        }
-                        (
-                            crate::app::FolderOpenOutcome::Ignored
-                            | crate::app::FolderOpenOutcome::Refused(_),
-                            Some(snapshot),
-                        ) => {
-                            self.restore_folder_nav_history(snapshot);
-                        }
-                        _ => {}
-                    }
                     if !staged
                         && self.favsearch.active
                         && matches!(open_outcome, crate::app::FolderOpenOutcome::Loaded)
@@ -16538,7 +16512,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     let is_zip = matches!(kind, crate::grid_item::SearchContainerKind::Zip);
                     // ★コンテナを開いた時の中身空表示対策 (Codex P2)
                     self.maybe_suppress_rating_filter_for_opened_container_path(&p);
-                    self.maybe_suppress_facet_filter_for_opened_container_path(&p);
                     self.drill_into_container(p, is_zip);
                 }
                 // レーティング一覧に復元された ZipDir は zip_nav を持たないので、
@@ -16556,7 +16529,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     // ★付きの本を絞り込み中に開くと中身が空表示になるのを防ぐ
                     // (Codex P2)。enter 前に抑制を仕込む。
                     self.maybe_suppress_rating_filter_for_opened_zip_book(idx);
-                    self.maybe_suppress_facet_filter_for_opened_zip_book(idx);
                     self.zip_nav_enter(&dp);
                 }
                 // ファイル名スタック (v2.0.0): 集約グリッドのセルは上の stack_try_open_from_grid
@@ -26674,7 +26646,7 @@ mod grid_reclick_open_tests {
                     harness.state_mut().app.items_are_bookmark_view = true;
                     let path = harness.state().app.tmp.path().to_path_buf();
                     harness.state_mut().app.folder_nav_back_stack =
-                        vec![crate::app::FolderNavHistoryTarget::Path(path)];
+                        vec![crate::app::FolderNavHistoryTarget::Path(path).into()];
                 }
                 _ => {
                     harness.state_mut().app.bookmark_view_state =
@@ -28883,6 +28855,129 @@ mod section207_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn section1339_toolbar_projects_pending_cursor_and_allows_reverse_cancel() {
+        use crate::app::{FolderHistoryDirection, FolderNavHistoryTarget};
+        let mut env = crate::app::setup_app_for_test();
+        only_folder_and_tree(&mut env);
+        env.settings.show_address_bar_history_nav = true;
+        env.active_quick_folder_slot = None;
+        env.settings.sidecar_backup_enabled = false;
+        let source = env.tmp.path().join("toolbar-source");
+        let middle = env.tmp.path().join("toolbar-middle");
+        let oldest = env.tmp.path().join("toolbar-oldest");
+        for path in [&source, &middle, &oldest] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        env.load_folder(source.clone());
+        env.folder_nav_back_stack = vec![
+            FolderNavHistoryTarget::Path(oldest.clone()).into(),
+            FolderNavHistoryTarget::Path(middle.clone()).into(),
+        ];
+        env.folder_nav_forward_stack.clear();
+        let baseline = env.folder_nav_back_stack.clone();
+        let app = Rc::new(RefCell::new(env));
+        let render = Rc::clone(&app);
+        let fonts = Cell::new(false);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1200.0, 280.0))
+            .build(move |ctx| {
+                if !fonts.replace(true) {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    ctx.request_repaint();
+                    return;
+                }
+                let mut app = render.borrow_mut();
+                match app.render_toolbar(ctx).1 {
+                    Some(AddressBarNav::HistoryBack) => {
+                        app.dispatch_folder_history_input_for_test(FolderHistoryDirection::Back)
+                    }
+                    Some(AddressBarNav::HistoryForward) => {
+                        app.dispatch_folder_history_input_for_test(FolderHistoryDirection::Forward)
+                    }
+                    _ => {}
+                }
+            });
+        harness.run();
+        assert!(
+            harness
+                .get_by_label("\u{2192}")
+                .accesskit_node()
+                .is_disabled()
+        );
+        harness.get_by_label("\u{2190}").click();
+        harness.run();
+        assert_eq!(app.borrow().current_folder.as_ref(), Some(&source));
+        assert_eq!(app.borrow().folder_nav_back_stack, baseline);
+        assert!(app.borrow().folder_nav_forward_stack.is_empty());
+        assert!(
+            !harness
+                .get_by_label("\u{2192}")
+                .accesskit_node()
+                .is_disabled(),
+            "the pending Back must expose Forward through the actual toolbar gate"
+        );
+        assert_eq!(
+            app.borrow().folder_history_back_target(),
+            Some(&FolderNavHistoryTarget::Path(oldest.clone()))
+        );
+        assert_eq!(
+            app.borrow().folder_history_forward_target(),
+            Some(&FolderNavHistoryTarget::Path(source.clone()))
+        );
+        harness.get_by_label("\u{2190}").click();
+        harness.run();
+        assert!(
+            harness
+                .get_by_label("\u{2190}")
+                .accesskit_node()
+                .is_disabled()
+        );
+        assert_eq!(
+            app.borrow().folder_history_forward_target(),
+            Some(&FolderNavHistoryTarget::Path(middle.clone()))
+        );
+        harness.get_by_label("\u{2192}").click();
+        harness.run();
+        assert!(
+            !harness
+                .get_by_label("\u{2190}")
+                .accesskit_node()
+                .is_disabled()
+        );
+        assert_eq!(
+            app.borrow().folder_history_forward_target(),
+            Some(&FolderNavHistoryTarget::Path(source.clone()))
+        );
+        harness.get_by_label("\u{2192}").click();
+        harness.run();
+        assert!(
+            app.borrow()
+                .top_level_grid_view
+                .open_path_classification()
+                .is_none()
+        );
+        assert!(
+            app.borrow()
+                .top_level_grid_view
+                .history_navigation_transition()
+                .is_none()
+        );
+        assert_eq!(app.borrow().current_folder.as_ref(), Some(&source));
+        assert_eq!(app.borrow().folder_nav_back_stack, baseline);
+        assert!(app.borrow().folder_nav_forward_stack.is_empty());
+        assert_eq!(
+            app.borrow().folder_history_back_target(),
+            Some(&FolderNavHistoryTarget::Path(middle))
+        );
+        assert!(
+            harness
+                .get_by_label("\u{2192}")
+                .accesskit_node()
+                .is_disabled()
+        );
     }
 
     #[test]

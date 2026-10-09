@@ -234,10 +234,47 @@ impl App {
         {
             return None;
         }
+        let converted_key;
         let path = match self.items.get(idx)? {
             crate::grid_item::GridItem::Folder(path)
             | crate::grid_item::GridItem::ZipFile(path)
             | crate::grid_item::GridItem::PdfFile(path) => path,
+            crate::grid_item::GridItem::ConvertibleArchive { path, .. } => {
+                let source = self
+                    .converted_archive_cache_paths
+                    .get(&crate::path_key::normalize_keep_drive(path))?;
+                // Header-confirmed later volumes retain thumbnail resolution, but cannot open.
+                // Use only the worker's existing source proof; no paint-time I/O/name inference.
+                if matches!(
+                    source.rar_volume_proof(),
+                    Some(crate::rar_loader::RarVolumeProof::Subsequent { .. })
+                ) {
+                    return None;
+                }
+                match source.read_source() {
+                    super::ConvertedArchiveSourceState::Direct(path)
+                    | super::ConvertedArchiveSourceState::CachedZip { path, .. } => path,
+                    super::ConvertedArchiveSourceState::Unavailable {
+                        logical_source: Some(logical_source),
+                    } => {
+                        // Missing cache: compute the next conversion key without I/O.
+                        // Existing CachedZip paths remain the open/save/restore key,
+                        // including valid absolute paths retained after a data-dir copy.
+                        converted_key = crate::archive_cache::cache_zip_path_for_data_dir(
+                            &crate::data_dir::get(),
+                            logical_source,
+                        );
+                        &converted_key
+                    }
+                    super::ConvertedArchiveSourceState::Rar { .. } => {
+                        unreachable!("read_source unwraps RAR evidence")
+                    }
+                    super::ConvertedArchiveSourceState::Pending
+                    | super::ConvertedArchiveSourceState::Unavailable {
+                        logical_source: None,
+                    } => return None,
+                }
+            }
             _ => return None,
         };
         self.book_resume_meters.get(path)

@@ -878,7 +878,7 @@ pub(in crate::app) struct ViewerContextBundle {
     folder_pane_open_pending: Option<FolderPaneOpenPending>,
     pending_folder_nav_steps: i32,
     pending_folder_nav_mode: FolderNavMode,
-    search_filter: Option<std::collections::HashSet<usize>>,
+    search_filter: Option<super::LocalSearchFilter>,
     search_filter_origin_folder: Option<PathBuf>,
     checked: std::collections::HashSet<usize>,
     rotation_cache: crate::rotation_cache::RotationCache,
@@ -3596,6 +3596,21 @@ impl App {
         self.viewer_contexts.table.ids()
     }
 
+    /// A deletion mutates the shared archive ZIP store. Apply the same source-owner transition
+    /// to parked/retiring payloads without mounting them or resetting their viewer state.
+    pub(in crate::app) fn invalidate_converted_archive_sources_in_parked_contexts(&mut self) {
+        for slot in self.viewer_contexts.table.slots.values_mut() {
+            let bundle = match slot {
+                Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
+            };
+            Self::invalidate_converted_archive_source_owner(
+                &mut bundle.converted_archive_cache_paths,
+                &mut bundle.converted_archive_cache_paths_pending,
+                &mut bundle.top_level_grid_view,
+            );
+        }
+    }
+
     pub(crate) fn invalidate_removed_epub_generations(
         &mut self,
         removed: &[crate::epub_cache::GenerationRow],
@@ -4605,6 +4620,7 @@ mod tests {
         let (_tx, rx) = mpsc::channel();
         (
             FolderPaneOpenPending {
+                navigation: None,
                 epub_restore: None,
                 path: PathBuf::from("c:/trace/pending"),
                 cancel,
@@ -5188,7 +5204,7 @@ mod tests {
         app.current_folder = Some(main.clone());
         let main_back = app.tmp.path().join("main-back");
         app.folder_nav_back_stack
-            .push(super::super::FolderNavHistoryTarget::Path(main_back));
+            .push(super::super::FolderNavHistoryTarget::Path(main_back).into());
         let history = app.folder_nav_history_snapshot();
         let epub = app.tmp.path().join("detached.epub");
         let detached = app.build_window_context_for_test(981, |mounted| {

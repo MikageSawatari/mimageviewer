@@ -120,6 +120,9 @@ const STARTUP_DIALOG_CASES: &[(&str, &[&str])] = &[
     ("archive_sibling", &["ZIP ファイルに変換", "キャンセル"]),
     ("archive_converting", &["キャンセル"]),
     ("archive_error", &["閉じる"]),
+    ("archive_publish_error", &["閉じる"]),
+    ("archive_later_volume_error", &["閉じる"]),
+    ("archive_no_images_error", &["閉じる"]),
 ];
 
 #[test]
@@ -310,9 +313,16 @@ fn startup_dialogs_small_viewport() {
                 harness.hover_at(egui::Pos2::ZERO);
                 harness.run_steps(3);
                 // Geometry and pointer assertions cover every case. Keep PNGs
-                // only for four representative views and two settled highlights.
+                // for representative views, archive errors, and settled highlights.
                 let snapshot = ((width, height) == (1093, 614)
-                    && matches!(kind, "first_setup" | "archive_confirm"))
+                    && matches!(
+                        kind,
+                        "first_setup"
+                            | "archive_confirm"
+                            | "archive_publish_error"
+                            | "archive_later_volume_error"
+                            | "archive_no_images_error"
+                    ))
                     || (kind == "whats_new" && scale == 1.0);
                 if snapshot {
                     let suffix = if scale == 1.0 { "" } else { "_ui200" };
@@ -1816,6 +1826,28 @@ fn still_seek_strip_and_hover_preview_dark() {
 }
 
 #[test]
+fn music_locked_panel_full_width_huds_dark() {
+    snapshot_with_theme_at_size(
+        "music_locked_panel_full_width_huds_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(960.0, 540.0),
+        None,
+        mimageviewer::draw_music_locked_panel_snapshot_fixture,
+    );
+}
+
+#[test]
+fn music_locked_panel_full_width_huds_narrow_dark() {
+    snapshot_with_theme_at_size(
+        "music_locked_panel_full_width_huds_narrow_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(360.0, 320.0),
+        None,
+        mimageviewer::draw_music_locked_panel_snapshot_fixture,
+    );
+}
+
+#[test]
 fn music_touch_panel_handles_observed_dark() {
     snapshot_with_theme(
         "music_touch_panel_handles_observed_dark",
@@ -2951,6 +2983,193 @@ fn content_restore_prompt_light() {
         });
     harness.run();
     harness.snapshot("content_restore_prompt_light");
+}
+
+#[test]
+#[cfg(windows)]
+fn normalize_hud_navigation_native_narrow_dark() {
+    snapshot_with_theme_at_size(
+        "normalize_hud_navigation_native_narrow_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(640.0, 360.0),
+        None,
+        mimageviewer::video::native_presenter::draw_native_normalize_snapshot_fixture,
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn tracks_hud_native_543pt_dark() {
+    snapshot_with_theme_at_size(
+        "tracks_hud_native_543pt_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(543.0, 360.0),
+        None,
+        mimageviewer::video::native_presenter::draw_native_multitrack_bottom_snapshot_fixture,
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn tracks_hud_native_360pt_dark() {
+    snapshot_with_theme_at_size(
+        "tracks_hud_native_360pt_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(360.0, 360.0),
+        None,
+        mimageviewer::video::native_presenter::draw_native_multitrack_bottom_snapshot_fixture,
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn tracks_hud_music_543pt_dark() {
+    snapshot_with_theme_at_size(
+        "tracks_hud_music_543pt_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(543.0, 360.0),
+        None,
+        mimageviewer::ui_music_panels::draw_music_multitrack_snapshot_fixture,
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn tracks_hud_music_360pt_dark() {
+    snapshot_with_theme_at_size(
+        "tracks_hud_music_360pt_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(360.0, 360.0),
+        None,
+        mimageviewer::ui_music_panels::draw_music_multitrack_snapshot_fixture,
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn normalize_hud_navigation_music_narrow_dark() {
+    snapshot_with_theme_options(
+        "normalize_hud_navigation_music_narrow_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(640.0, 360.0),
+        Some(4),
+        mimageviewer::ui_music_panels::draw_music_normalize_snapshot_fixture,
+        |_| {},
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn music_hud_layout_playback_575pt_dark() {
+    snapshot_with_theme_options(
+        "music_hud_layout_playback_575pt_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(591.0, 140.0),
+        None,
+        mimageviewer::ui_music_panels::draw_music_playback_snapshot_fixture,
+        |_| {},
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn music_hud_layout_playback_860pt_dark() {
+    snapshot_with_theme_options(
+        "music_hud_layout_playback_860pt_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(876.0, 140.0),
+        None,
+        mimageviewer::ui_music_panels::draw_music_playback_snapshot_fixture,
+        |_| {},
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn music_hud_layout_playback_870pt_dark() {
+    snapshot_with_theme_options(
+        "music_hud_layout_playback_870pt_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(886.0, 140.0),
+        None,
+        mimageviewer::ui_music_panels::draw_music_playback_snapshot_fixture,
+        |_| {},
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn normalize_hud_navigation_music_870pt_same_layout_dark() {
+    snapshot_with_theme_options(
+        "normalize_hud_navigation_music_870pt_same_layout_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(886.0, 360.0),
+        Some(4),
+        mimageviewer::ui_music_panels::draw_music_normalize_snapshot_fixture,
+        |_| {},
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn normalize_hud_navigation_music_10pt_icons_dark() {
+    snapshot_with_theme_options(
+        "normalize_hud_navigation_music_10pt_icons_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::default(),
+        // The snapshot frame has 8pt outer margins: the real HUD is 10pt wide.
+        egui::vec2(26.0, 360.0),
+        Some(4),
+        mimageviewer::ui_music_panels::draw_music_normalize_snapshot_fixture,
+        |_| {},
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn normalize_hud_navigation_music_360pt_overlap_dark() {
+    snapshot_with_theme_options(
+        "normalize_hud_navigation_music_360pt_overlap_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(360.0, 360.0),
+        Some(4),
+        mimageviewer::ui_music_panels::draw_music_normalize_snapshot_fixture,
+        |_| {},
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn normalize_hud_navigation_music_1000pt_time_dark() {
+    snapshot_with_theme_options(
+        "normalize_hud_navigation_music_1000pt_time_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(1000.0, 360.0),
+        Some(4),
+        mimageviewer::ui_music_panels::draw_music_normalize_snapshot_fixture,
+        |_| {},
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn normalize_hud_navigation_music_400pt_time_dark() {
+    snapshot_with_theme_options(
+        "normalize_hud_navigation_music_400pt_time_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(400.0, 360.0),
+        Some(4),
+        mimageviewer::ui_music_panels::draw_music_normalize_snapshot_fixture,
+        |_| {},
+    );
 }
 
 #[test]

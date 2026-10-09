@@ -12,6 +12,27 @@
 
 ---
 
+## v4.5.0 (2026-10-09)
+
+- **対象**: 配布ビルドは master `16524e981`。その後のコミットはバックログ (§1.360) とこの記録だけで、コードは配布ビルドと同一。
+- **依存**: PDFium `chromium/8086`・LibRaw 0.22.2 とも最新。FFmpeg は `setup-ffmpeg.sh check` が `n7.1.5-12` を「新版」と出すが、同梱の `n7.1.5-16` の方が新しく更新なし (従来と同じ誤検知)。
+- **自動テスト**: `test-full.ps1 -SuppressCrashDialogs` で **12,636 passed / 0 failed** (64 suites)。配布ビルドは同一ソースのため `build-dist.ps1 -SkipRustTests`。
+  VST3 host はソース変更があったため再ビルドし、identity `a5bd01e9…` を確認。ツリー外バックアップも差し替え (旧は `.before-v450.exe`)。全 PE / VC runtime gate 通過。
+  開発中の lib 全体実行で、負荷時だけ落ちて単独再実行で通る動画 EOF ループ試験を観測。全体ゲートでは発生せず。
+- **署名**: 単体exe / setup.exe / portable の mimageviewer.exe を `signtool verify /pa` で確認 (Taku Sano 名義、RFC3161)。
+- **portable smoke**: `D:\miv-portable-smoke-v450` に展開して起動。応答・`data\` 生成・APPDATA 非接触・終了を確認 (ClaudeCode が実施)。
+- **panic.log**: 52 件 15 種すべて disposition あり (`check-panic-log.ps1` exit 0)。CI は 10/07 から viewer context 監査で赤、修正 `a03777b0f` は公開時の push で反映。
+- **idle health (配布ビルドの core、利用者が実施)**: `static-foreground` / `static-background` / `video-pin-background` (`c:\home\youtube\movie`) とも **PASS**。
+  測定区間の perf event 0 件 (完全 sleep)、CPU 1 コア比 0.0062 / 0.0104 / 0.0094。video-pin は準備中に `idle_upgrade_ineligible` 2 件で条件成立。
+  `tray-residency` は **FAIL** (`G:\home\comfyui`、CPU 0.44、フォルダのタイルを再投入し続ける)。v4.4.0 から入った退行ではなく既存の欠陥 (Codex 調査) で、
+  v4.4.0 は別フォルダ (キャッシュ済み) で測っていたため出なかったと見ている。利用者判断で出荷し、次の版で優先して直す (backlog §1.360)。
+- **perf smoke (利用者が操作)**: 2,642 フレーム。直前が `request_repaint` の描画フレーム 1,271 件中 **98.0% が 16ms 未満** (v4.4.0 は 98.4%)。
+  `ui.pre_grid_breakdown` total p50 0.04ms / p95 0.12ms / max 7.4ms。100ms 超の間隔 21 件のうち 19 件は `none` / `request_repaint_after_idle_upgrade` (正常)。
+  残る 2 件: (1) 起動直後 t=2.3s の 591ms は初期フォルダの同期読み込み (`lf_scan` 572ms、522 フォルダ、`pre_scanned=false`)。tail は `none` だが update 自体が 578ms。
+  起動時の初期フォルダ読み込みは従来から UI スレッドで行っている (v4.4.0 の「起動直後 1 件」と同じ種類)。(2) t=10.4s の 518ms は `request_repaint_after_ai_upscale` で
+  `fullscreen_viewport` 500ms。v4.4.0 の初回 AI アップスケール開始時の 529ms と同じ形 (GPU 競合と推定、未確認)。
+- **検索 bench**: 全文索引に触れていないため未実施。
+
 ## v4.4.0 (2026-10-07)
 
 - **対象**: master `7f922b612` (配布ビルド後の追加コミットは docs / htdocs のみ。コードは配布ビルドと同一)。

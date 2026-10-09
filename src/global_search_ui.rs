@@ -223,6 +223,7 @@ pub enum GlobalSearchView {
 
 #[derive(Clone)]
 struct SearchViewWish {
+    adoption: SearchViewAdoption,
     sequence: u64,
     run_sequence: u64,
     query: String,
@@ -237,6 +238,17 @@ struct SearchViewWish {
     rating_filter: [bool; 6],
     done: bool,
     survivor_order: Option<Vec<String>>,
+}
+
+/// A prepared Search projection either adopts a main route or reprojects a mounted
+/// read-only context. It never infers navigation from painting or item generations.
+#[derive(Clone)]
+enum SearchViewAdoption {
+    Main {
+        navigation: crate::app::MainListNavigation,
+        destination: crate::app::FolderNavHistoryEntry,
+    },
+    Reprojection,
 }
 
 enum SearchPrepareCommand {
@@ -2144,8 +2156,8 @@ impl App {
         self.global_search.active = true;
         self.global_search.focus_request = true;
         if let Some(origin) = transferred_origin {
-            self.global_search.saved_folder = origin.legacy_path().or(fallback_origin);
-            self.global_search_subfolder_restore = origin.subfolder_restore();
+            self.global_search.saved_folder = origin.restore.legacy_path().or(fallback_origin);
+            self.global_search_subfolder_restore = origin.restore.subfolder_restore();
         } else {
             self.global_search.saved_folder = fallback_origin;
             self.global_search_subfolder_restore = None;
@@ -2170,8 +2182,8 @@ impl App {
         {
             return;
         }
-        let return_context = self.dismiss_global_search_without_restore();
-        self.restore_view_return_context(return_context);
+        let return_origin = self.dismiss_global_search_with_origin();
+        self.restore_view_return_origin(return_origin);
     }
 
     /// Ctrl+G を終了して戻り先だけを引き渡す。スマートフォルダ等へ直行する場合に、
@@ -2196,6 +2208,12 @@ impl App {
     pub(crate) fn dismiss_global_search_without_restore(
         &mut self,
     ) -> crate::app::top_level_grid_view::TopLevelGridRestore {
+        self.dismiss_global_search_with_origin().restore
+    }
+
+    pub(crate) fn dismiss_global_search_with_origin(
+        &mut self,
+    ) -> crate::app::top_level_grid_view::TopLevelGridOrigin {
         self.cancel_pending_folder_nav();
         // pending があれば SearchHandle の Drop impl で cancel される
         self.global_search.pending = None;
@@ -2238,11 +2256,16 @@ impl App {
             .global_search_subfolder_restore
             .take()
             .or_else(|| self.take_subfolder_expansion_restore_for_synthetic_path(path.as_deref()));
-        let canonical = self.top_level_grid_view.take_return_to();
-        self.view_return_context_from_canonical_or_fallback(
-            canonical.map(std::borrow::Cow::Owned),
+        let canonical = self.top_level_grid_view.take_return_origin();
+        let route = canonical
+            .as_ref()
+            .map(|origin| origin.route.clone())
+            .unwrap_or_default();
+        let restore = self.view_return_context_from_canonical_or_fallback(
+            canonical.map(|origin| std::borrow::Cow::Owned(origin.restore)),
             || (path, subfolder_restore),
-        )
+        );
+        crate::app::top_level_grid_view::TopLevelGridOrigin { restore, route }
     }
 
     /// debounce 経過チェック + 新クエリがあれば検索 spawn (App::update から毎フレーム呼ぶ)。
@@ -2304,6 +2327,9 @@ impl App {
         if !self.indexer_init.is_terminal() {
             self.global_search.reject_message = Some("検索の準備中".to_string());
             return;
+        }
+        if self.global_search.query != self.global_search.last_executed {
+            self.retire_main_list_requests_for_surface_switch();
         }
         self.global_search.reset_for_new_query();
         if !self.restart_search_page_edit_prepare(ctx) {
@@ -2618,36 +2644,41 @@ impl App {
                             prepare.metrics.lookup_passes = prepared.lookup_passes;
                             prepare.metrics.looked_up_keys = prepared.looked_up_keys;
                         }
-                        if let Some(values) = prepared.hit_rating_values.as_ref() {
-                            for hit in &mut self.global_search.all_hits {
-                                if let Some(stars) = values.get(&hit_rating_key(&hit.path)) {
-                                    hit.stars = *stars;
-                                }
-                            }
-                        }
-                        writes_after_read =
-                            self.rating_session_writes_after(wish.rating_write_generation);
-                        // Source selection belongs to this accepted prepared list; unchanged contexts are untouched.
-                        for (idx, item) in self.items.iter().enumerate() {
-                            if let GridItem::Video(path) | GridItem::Audio(path) = item {
-                                let key = crate::path_key::normalize_keep_drive(path);
-                                if self.video_thumb_overrides.get(&key)
-                                    != prepared.video_thumb_overrides.get(&key)
-                                {
-                                    if let Some(thumbnail) = self.thumbnails.get_mut(idx) {
-                                        *thumbnail = ThumbnailState::Pending;
+                        if !self.adopt_prepared_search_view(wish.adoption, |app| {
+                            if let Some(values) = prepared.hit_rating_values.as_ref() {
+                                for hit in &mut app.global_search.all_hits {
+                                    if let Some(stars) = values.get(&hit_rating_key(&hit.path)) {
+                                        hit.stars = *stars;
                                     }
                                 }
                             }
+                            writes_after_read =
+                                app.rating_session_writes_after(wish.rating_write_generation);
+                            // Source selection belongs to this accepted prepared list; unchanged contexts are untouched.
+                            for (idx, item) in app.items.iter().enumerate() {
+                                if let GridItem::Video(path) | GridItem::Audio(path) = item {
+                                    let key = crate::path_key::normalize_keep_drive(path);
+                                    if app.video_thumb_overrides.get(&key)
+                                        != prepared.video_thumb_overrides.get(&key)
+                                    {
+                                        if let Some(thumbnail) = app.thumbnails.get_mut(idx) {
+                                            *thumbnail = ThumbnailState::Pending;
+                                        }
+                                    }
+                                }
+                            }
+                            app.video_thumb_overrides = prepared.video_thumb_overrides;
+                            app.search_drilled_folder_counts = prepared.drilled_counts;
+                            app.replace_search_view_items_with_ratings(
+                                prepared.items,
+                                prepared.image_metas,
+                                prepared.ratings,
+                                wish.survivor_order.is_some(),
+                            );
+                        }) {
+                            prepare.desired = None;
+                            continue;
                         }
-                        self.video_thumb_overrides = prepared.video_thumb_overrides;
-                        self.search_drilled_folder_counts = prepared.drilled_counts;
-                        self.replace_search_view_items_with_ratings(
-                            prepared.items,
-                            prepared.image_metas,
-                            prepared.ratings,
-                            wish.survivor_order.is_some(),
-                        );
                         if prepared.rating_sort_failed {
                             self.show_feedback_toast(
                                 "評価順を読み込めなかったため名前順で表示しました".into(),
@@ -2883,6 +2914,103 @@ impl App {
         }
     }
 
+    fn capture_search_view_adoption(&mut self, view: &GlobalSearchView) -> SearchViewAdoption {
+        use crate::app::{FacetRoute, FacetScope};
+        use crate::app::{
+            FolderNavHistoryEntry, FolderNavHistoryTarget, MainHistoryOperation,
+            MainListSourceProof,
+        };
+        if !self.main_folder_history_available() {
+            return SearchViewAdoption::Reprojection;
+        }
+        let navigation = self.capture_main_list_navigation(
+            MainHistoryOperation::Restore { route: None },
+            MainListSourceProof::Row,
+        );
+        // Search's root is a transparent overlay, not an entered child edge (?9.2.2).
+        let origin = self
+            .top_level_grid_view
+            .return_origin()
+            .map(|origin| origin.route.clone())
+            .filter(|route| !route.0.is_empty())
+            .or_else(|| {
+                navigation
+                    .source_location
+                    .as_ref()
+                    .map(|entry| entry.route.clone())
+            })
+            .unwrap_or_else(|| {
+                FacetRoute::root(FacetScope::path(
+                    &crate::app::search_results_synthetic_path(),
+                ))
+            });
+        let mut route = origin;
+        if let GlobalSearchView::DrilledInto {
+            container_root,
+            current_path,
+            is_zip,
+        } = view
+        {
+            let root = if *is_zip {
+                FacetScope::book(container_root, "")
+            } else {
+                FacetScope::path(container_root)
+            };
+            route = route.child(root);
+            if current_path != container_root {
+                if *is_zip {
+                    if let Ok(prefix) = current_path.strip_prefix(container_root) {
+                        route = route
+                            .child(FacetScope::book(container_root, &prefix.to_string_lossy()));
+                    }
+                } else if let Ok(relative) = current_path.strip_prefix(container_root) {
+                    let mut path = container_root.clone();
+                    for component in relative.components() {
+                        path.push(component);
+                        route = route.child(FacetScope::path(&path));
+                    }
+                }
+            }
+        }
+        let location = navigation
+            .source_location
+            .as_ref()
+            .map(|entry| entry.location.clone())
+            .unwrap_or_else(|| {
+                FolderNavHistoryTarget::Path(crate::app::search_results_synthetic_path())
+            });
+        SearchViewAdoption::Main {
+            navigation,
+            destination: FolderNavHistoryEntry::new(location, route),
+        }
+    }
+
+    fn adopt_prepared_search_view(
+        &mut self,
+        adoption: SearchViewAdoption,
+        install: impl FnOnce(&mut Self),
+    ) -> bool {
+        match adoption {
+            SearchViewAdoption::Main {
+                navigation,
+                destination,
+            } => {
+                let Some(adoption) = self.prepare_main_list_adoption(navigation, destination)
+                else {
+                    return false;
+                };
+                self.adopt_main_list_navigation(adoption, |app| {
+                    install(app);
+                    None
+                })
+            }
+            SearchViewAdoption::Reprojection => {
+                install(self);
+                true
+            }
+        }
+    }
+
     fn request_search_view_build(&mut self, survivor_order: Option<Vec<String>>) {
         if self.global_search.page_edit_prepare.is_some() {
             self.global_search.maybe_auto_switch_aggregate();
@@ -2890,9 +3018,11 @@ impl App {
             let context = self.virtual_list_context_id();
             let rating_filter = self.effective_rating_filter();
             let view = self.global_search.view();
+            let adoption = self.capture_search_view_adoption(&view);
             let prepare = self.global_search.page_edit_prepare.as_mut().unwrap();
             prepare.next_sequence = prepare.next_sequence.wrapping_add(1);
             prepare.desired = Some(SearchViewWish {
+                adoption,
                 sequence: prepare.next_sequence,
                 run_sequence: self.global_search.run_sequence,
                 query: self.global_search.query.clone(),
@@ -2926,6 +3056,7 @@ impl App {
         // Codex 3rd P1 fix: ★一時解除中 (= effective filter [true;6]) を Ctrl+G drill view
         // にも反映。旧版は settings.rating_filter を直接使っていたため、suppress 発動して
         // も drill 内で未評価 hits が build_drilled_items 側で落とされていた。
+        let adoption = self.capture_search_view_adoption(&self.global_search.view());
         let rating_filter = self.effective_rating_filter();
         let order_request = crate::rating_sort::ListingOrderRequest::from_settings(&self.settings);
         let sort_order = order_request.standard_fallback();
@@ -2935,37 +3066,38 @@ impl App {
         ) {
             self.show_feedback_toast("評価順を準備できなかったため名前順で表示しました".into());
         }
-        let (items, image_metas) = match self.global_search.view() {
-            GlobalSearchView::Flat => {
-                // 一覧ビューはサブフォルダバッジを使わない。残骸を破棄する。
-                self.search_drilled_folder_counts.clear();
-                build_flat_items(&self.global_search, sort_order, &rating_filter)
-            }
-            GlobalSearchView::Aggregated => {
-                // Aggregated ではサブフォルダのバッジ計算なし。残骸を破棄する。
-                self.search_drilled_folder_counts.clear();
-                build_aggregated_items(&mut self.global_search)
-            }
+        // Badge counts and rows belong to one accepted projection, including the fallback path.
+        let drilled_counts = match self.global_search.view() {
             GlobalSearchView::DrilledInto {
                 ref current_path,
                 is_zip,
                 ..
-            } => {
-                // サブフォルダごとの per-★ 件数を all_hits から集計し直す。
-                // build_drilled_items が rating_filter で表示アイテムを絞る一方、
-                // バッジ件数表示には raw 集計が必要 (なし含む 6 バケット)。
-                self.search_drilled_folder_counts =
-                    compute_drilled_subfolder_counts(&self.global_search, current_path, is_zip);
-                build_drilled_items(
-                    &self.global_search,
-                    current_path,
-                    is_zip,
-                    sort_order,
-                    &rating_filter,
-                )
-            }
+            } => compute_drilled_subfolder_counts(&self.global_search, current_path, is_zip),
+            _ => HashMap::new(),
         };
-        self.replace_search_view_items(items, image_metas);
+        let (items, image_metas) = match self.global_search.view() {
+            GlobalSearchView::Flat => {
+                build_flat_items(&self.global_search, sort_order, &rating_filter)
+            }
+            GlobalSearchView::Aggregated => build_aggregated_items(&mut self.global_search),
+            GlobalSearchView::DrilledInto {
+                ref current_path,
+                is_zip,
+                ..
+            } => build_drilled_items(
+                &self.global_search,
+                current_path,
+                is_zip,
+                sort_order,
+                &rating_filter,
+            ),
+        };
+        if !self.adopt_prepared_search_view(adoption, |app| {
+            app.search_drilled_folder_counts = drilled_counts;
+            app.replace_search_view_items(items, image_metas);
+        }) {
+            return;
+        }
         // BS 戻りのカーソル位置復帰。target が見つからない・非表示のときは
         // 「先頭の表示中アイテム」にフォールバックする (selected=None のままだと
         // 次の方向キーで idx 0 に飛んでしまうため)。
@@ -2996,8 +3128,7 @@ impl App {
     /// 実フォルダ全体ではなく「検索にヒットしたものだけ (+ ヒットを含む子フォルダ)」
     /// を表示する。
     pub(crate) fn drill_into_container(&mut self, container: PathBuf, is_zip: bool) {
-        self.cancel_pending_folder_nav();
-        self.maybe_suppress_facet_filter_for_opened_container_path(&container);
+        self.retire_main_list_requests_for_surface_switch();
         // ドリルインはユーザーの明示操作 → 自動ビュー切替を止める (§4.3.2 (c))。
         self.global_search.aggregate_auto = false;
         self.global_search.drill = Some(DrillState {
@@ -3012,8 +3143,7 @@ impl App {
     /// container_root と is_zip は不変、current_path だけ更新する。
     pub(crate) fn drill_into_subfolder(&mut self, sub_path: PathBuf) {
         if let Some(d) = self.global_search.drill.clone() {
-            self.cancel_pending_folder_nav();
-            self.maybe_suppress_facet_filter_for_opened_container_path(&sub_path);
+            self.retire_main_list_requests_for_surface_switch();
             self.global_search.drill = Some(DrillState {
                 current_path: sub_path,
                 ..d
@@ -3078,11 +3208,10 @@ impl App {
     /// トップレベル (一覧 or 集約) に戻る (drill-down 状態から)。
     /// 戻り先は `aggregate` の値で決まる (§4.3.2 の導出モデル)。
     pub(crate) fn drill_back_to_top(&mut self) {
-        self.cancel_pending_folder_nav();
+        self.retire_main_list_requests_for_surface_switch();
         // Ctrl+G drill-back は load_folder を経由しないため、suppression の subtree
         // 外判定が走らない。ユーザー視点では「本から出た」ので復元する (Codex High 指摘)。
         self.restore_rating_filter_suppression();
-        while self.restore_facet_filter_suppression() {}
         // 戻った先で当該 SearchContainer にカーソルを再選択する。
         if let Some(d) = &self.global_search.drill {
             self.global_search.restore_select_path = Some(d.container_root.clone());
@@ -3111,8 +3240,7 @@ impl App {
                 // 経路でだけ復元する。
                 // 戻った先 (parent) で「直前に居たサブフォルダ」にカーソル復帰
                 self.global_search.restore_select_path = Some(d.current_path.clone());
-                self.cancel_pending_folder_nav();
-                self.restore_facet_filter_suppression_for_path(Some(&parent_pb));
+                self.retire_main_list_requests_for_surface_switch();
                 self.global_search.drill = Some(DrillState {
                     current_path: parent_pb,
                     ..d
@@ -3223,7 +3351,7 @@ impl App {
                 None
             };
             if let Some(next_path) = within {
-                self.cancel_pending_folder_nav();
+                self.retire_main_list_requests_for_surface_switch();
                 self.global_search.drill = Some(DrillState {
                     container_root: container_root.clone(),
                     current_path: next_path,
@@ -3251,7 +3379,7 @@ impl App {
             current_path: next.path.clone(),
             is_zip: matches!(next.kind, SearchContainerKind::Zip),
         });
-        self.cancel_pending_folder_nav();
+        self.retire_main_list_requests_for_surface_switch();
         self.rebuild_items_from_global_search();
     }
 
@@ -3683,7 +3811,7 @@ impl App {
 
     pub(crate) fn reset_global_search_for_query_change(&mut self, ctx: &egui::Context) {
         self.global_search.run_sequence = self.global_search.run_sequence.wrapping_add(1);
-        self.cancel_pending_folder_nav();
+        self.retire_main_list_requests_for_surface_switch();
         self.global_search.last_change_at = Some(Instant::now());
         // Codex P3 対応: クエリが変わったら drill state を即リセットし、
         // 旧検索の pending / containers / all_hits も直ちに破棄してから空の
@@ -3856,6 +3984,7 @@ mod tests {
             unrated_position: crate::rating_sort::RatingSortUnratedPosition::BelowAll,
         };
         let wish = SearchViewWish {
+            adoption: SearchViewAdoption::Reprojection,
             sequence: 1,
             run_sequence: 1,
             query: "test".into(),
@@ -3984,6 +4113,113 @@ mod tests {
         assert!(
             matches!(&zip_rows[0], GridItem::ZipImage { entry_name, .. } if entry_name == "z.jpg")
         );
+    }
+
+    #[test]
+    fn search_ready_after_clear_quick_slots_preserves_media_sources_and_loaded_thumbnail() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let parent = app.tmp.path().join("search-source-adoption");
+        std::fs::create_dir(&parent).unwrap();
+        let audio = parent.join("song.flac");
+        let old_cover = parent.join("song.png");
+        let new_cover = parent.join("song.jpg");
+        std::fs::write(&audio, b"audio").unwrap();
+        std::fs::write(&old_cover, b"old cover").unwrap();
+        app.settings.skip_image_if_video_exists = true;
+        app.settings.video_thumb_use_sidecar_image = true;
+        app.global_search.aggregate_auto = false;
+        let ctx = egui::Context::default();
+        app.begin_search_page_edit_prepare_for_test(&ctx);
+        let (stream, rx) = crossbeam_channel::unbounded();
+        app.global_search.pending = Some(crate::indexer_manager::SearchHandle {
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx,
+        });
+        stream
+            .send(SearchStreamEvent::Batch {
+                hits: vec![GlobalHit {
+                    path: audio.to_string_lossy().into_owned(),
+                    score: 1.0,
+                    stars: 0,
+                    mtime: 0,
+                    file_size: Some(0),
+                }],
+                scanned_candidates: 1,
+                valid_hits: 1,
+            })
+            .unwrap();
+        stream
+            .send(SearchStreamEvent::Done {
+                truncated: false,
+                reason: DoneReason::Complete,
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            app.poll_global_search_events(&ctx);
+            let prepare = app.global_search.page_edit_prepare.as_ref().unwrap();
+            if app.items.len() == 1 && prepare.in_flight.is_none() && prepare.desired.is_none() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "initial search projection never settled"
+            );
+            std::thread::yield_now();
+        }
+        assert!(matches!(&app.items[0], GridItem::Audio(path) if path == &audio));
+        let key = crate::path_key::normalize_keep_drive(&audio);
+        assert_eq!(app.video_thumb_overrides.get(&key), Some(&old_cover));
+        app.thumbnails[0] = make_loaded_state();
+        let texture = match &app.thumbnails[0] {
+            ThumbnailState::Loaded { tex, .. } => tex.id(),
+            _ => unreachable!(),
+        };
+        let counts = HashMap::from([("unchanged-counts".to_owned(), [1, 2, 3, 4, 5, 6])]);
+        app.search_drilled_folder_counts = counts.clone();
+        std::fs::remove_file(&old_cover).unwrap();
+        std::fs::write(&new_cover, b"new cover").unwrap();
+        app.hold_next_search_ready_for_test();
+        app.rebuild_items_from_global_search();
+        while !app.search_ready_is_held_for_test() {
+            app.poll_global_search_events(&ctx);
+            assert!(
+                Instant::now() < deadline,
+                "changed-source projection was not held"
+            );
+            std::thread::yield_now();
+        }
+        let prepare = app.global_search.page_edit_prepare.as_ref().unwrap();
+        let Some(SearchPrepareOutput::Ready(wish, prepared)) = &prepare.held_ready_for_test else {
+            panic!("real worker did not publish Ready");
+        };
+        assert_eq!(prepared.video_thumb_overrides.get(&key), Some(&new_cover));
+        assert!(matches!(wish.adoption, SearchViewAdoption::Main { .. }));
+        let generation = app.items_generation;
+        let cancel = app.cancel_token.clone();
+        // The production clear preserves the visible list but retires the captured switch epoch.
+        app.execute_clear_quick_folder_slots();
+        app.release_search_ready_for_test();
+        app.poll_global_search_events(&ctx);
+        assert_eq!(app.items_generation, generation);
+        assert!(Arc::ptr_eq(&app.cancel_token, &cancel));
+        assert_eq!(app.video_thumb_overrides.get(&key), Some(&old_cover));
+        assert!(matches!(
+            &app.thumbnails[0],
+            ThumbnailState::Loaded { tex, .. } if tex.id() == texture
+        ));
+        assert_eq!(app.search_drilled_folder_counts, counts);
+        // A new request captures the cleared slot's owner and must still adopt the changed source.
+        app.rebuild_items_from_global_search();
+        while app.items_generation == generation {
+            app.poll_global_search_events(&ctx);
+            assert!(Instant::now() < deadline, "fresh projection did not adopt");
+            std::thread::yield_now();
+        }
+        assert_eq!(app.video_thumb_overrides.get(&key), Some(&new_cover));
+        assert!(matches!(app.thumbnails[0], ThumbnailState::Pending));
+        assert!(app.search_drilled_folder_counts.is_empty());
     }
 
     #[cfg(windows)]

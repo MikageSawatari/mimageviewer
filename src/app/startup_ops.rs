@@ -171,6 +171,16 @@ impl App {
         source: StartupOpenPathSource,
         ctx: &egui::Context,
     ) {
+        self.start_startup_open_path_resolution_owned_with_navigation(requested, source, ctx, None);
+    }
+
+    pub(crate) fn start_startup_open_path_resolution_owned_with_navigation(
+        &mut self,
+        requested: PathBuf,
+        source: StartupOpenPathSource,
+        ctx: &egui::Context,
+        navigation: Option<MainListNavigation>,
+    ) {
         if self.remote_session_blocks_local_control() {
             if matches!(source, StartupOpenPathSource::InitialStartup) {
                 self.startup_open_path = Some(requested);
@@ -214,6 +224,21 @@ impl App {
             ));
             return;
         };
+        let navigation = navigation.or_else(|| match &owner {
+            StartupOpenPathOwner::Bookmark(bookmark) if self.main_folder_history_available() => {
+                Some(self.capture_main_list_navigation(
+                    MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation),
+                    MainListSourceProof::Bookmark(bookmark.clone()),
+                ))
+            }
+            _ => None,
+        });
+        if navigation
+            .as_ref()
+            .is_some_and(|navigation| !self.main_list_navigation_is_current(navigation))
+        {
+            return;
+        }
         // The suffix is known before the filesystem resolver runs. A directory ending in
         // `.epub` holds this provisional lease only until classification returns Directory.
         let requested_owner = match crate::pdf_loader::LeasedEpubPath::try_new(requested.clone()) {
@@ -318,7 +343,7 @@ impl App {
                     .watched_optional(trace_watch)
             });
             let result =
-                resolve_startup_open_path(worker_requested, source, worker_bookmark.as_ref());
+                resolve_startup_open_path(worker_requested, source, worker_bookmark.as_ref(), true);
             if let Some(resolve_span) = resolve_span {
                 resolve_span.finish(if cancel_w.load(Ordering::Relaxed) {
                     Outcome::Cancelled
@@ -360,6 +385,7 @@ impl App {
                     toast_shown: false,
                     held_resolve_for_activation_admission,
                     diagnostic,
+                    navigation,
                 });
             }
             Err(e) => {
@@ -371,7 +397,7 @@ impl App {
                     event_span(Lane::Navigation, Stage::InitialTargetResolve, id)
                         .watched_optional(trace_watch)
                 });
-                let result = resolve_startup_open_path(requested, source, bookmark.as_ref());
+                let result = resolve_startup_open_path(requested, source, bookmark.as_ref(), false);
                 if let Some(resolve_span) = resolve_span {
                     resolve_span.finish(if result.resolved.is_some() {
                         Outcome::Ok
@@ -387,6 +413,7 @@ impl App {
                     held_duration,
                     Some(requested_owner),
                     diagnostic,
+                    navigation,
                     ctx,
                 );
             }
@@ -433,6 +460,7 @@ impl App {
                 let held_duration = pending.elapsed();
                 let requested_owner = pending.requested.clone();
                 let diagnostic = pending.diagnostic.take();
+                let navigation = pending.navigation.take();
                 drop(pending);
                 self.finish_startup_open_path_resolve_with_held(
                     owner,
@@ -441,6 +469,7 @@ impl App {
                     held_duration,
                     Some(requested_owner),
                     diagnostic,
+                    navigation,
                     ctx,
                 );
                 ctx.request_repaint();
@@ -507,6 +536,7 @@ impl App {
             std::time::Duration::ZERO,
             None,
             None,
+            None,
             ctx,
         );
     }
@@ -519,6 +549,7 @@ impl App {
         held_duration: std::time::Duration,
         requested_owner: Option<crate::pdf_loader::LeasedEpubPath>,
         diagnostic: Option<InitialNavigationTrace>,
+        navigation: Option<MainListNavigation>,
         ctx: &egui::Context,
     ) {
         if !self.startup_open_path_owner_is_current(&owner) {
@@ -548,6 +579,7 @@ impl App {
                     held_duration,
                     requested_owner,
                     diagnostic,
+                    navigation,
                     ctx,
                 );
             });
@@ -560,6 +592,30 @@ impl App {
             return;
         }
         let source = owner.source();
+        if let Some(message) = result
+            .rar_volume_proof
+            .as_ref()
+            .and_then(crate::rar_loader::RarVolumeProof::rejection_message)
+        {
+            // A volume refusal has no admission authority over a held first-volume request.
+            if matches!(source, StartupOpenPathSource::Activation) {
+                self.resume_activation_held_open(held, held_duration);
+            }
+            if let StartupOpenPathOwner::Bookmark(bookmark_owner) = &owner {
+                self.cancel_bookmark_open_request(
+                    bookmark_owner.request_id,
+                    "rar_subsequent_volume",
+                );
+            }
+            if let Some(diagnostic) = diagnostic {
+                diagnostic.finish(Outcome::Error);
+            }
+            if matches!(source, StartupOpenPathSource::InitialStartup) {
+                self.open_default_startup_target();
+            }
+            self.show_feedback_toast(message);
+            return;
+        }
         if matches!(source, StartupOpenPathSource::Activation) {
             match result.resolved.as_ref() {
                 None => self.resume_activation_held_open(held, held_duration),
@@ -604,8 +660,14 @@ impl App {
                 .watched_optional(watch)
                 .detail("resolver-result-ui-admission")
         });
-        let outcome =
-            self.apply_startup_open_path_resolve_result(&owner, result, ctx, correlation, watch);
+        let outcome = self.apply_startup_open_path_resolve_result(
+            &owner,
+            result,
+            ctx,
+            correlation,
+            watch,
+            navigation,
+        );
         let trace_outcome = if matches!(outcome, StartupOpenApplyOutcome::Opened) {
             Outcome::Ok
         } else {
@@ -712,7 +774,7 @@ impl App {
         }
     }
 
-    fn startup_open_path_owner(
+    pub(super) fn startup_open_path_owner(
         &self,
         source: StartupOpenPathSource,
     ) -> Option<StartupOpenPathOwner> {
@@ -859,6 +921,39 @@ impl App {
         self.finish_replaced_startup_open_pending(pending, reason);
     }
 
+    /// A main surface switch owns only its mounted bookmark request, never a reader lease.
+    pub(super) fn retire_main_bookmark_open_for_surface_switch(&mut self) {
+        let request_id = match self
+            .startup_open_path_resolve_pending
+            .as_ref()
+            .map(|pending| &pending.owner)
+        {
+            Some(StartupOpenPathOwner::Bookmark(owner)) => {
+                #[cfg(windows)]
+                if owner.detached_lease.is_some() {
+                    return;
+                }
+                Some(owner.request_id)
+            }
+            // AwaitingPage and media waits belong to the already mounted viewer. A Current
+            // reselect keeps that reader and its return target, just like sidecar hydration.
+            _ => self
+                .bookmark_open_pending
+                .as_ref()
+                .and_then(crate::bookmark_browser::PendingBookmarkOpen::book)
+                .filter(|pending| {
+                    matches!(
+                        pending.stage,
+                        crate::bookmark_browser::PendingBookOpenStage::Resolving
+                    )
+                })
+                .map(|pending| pending.request_id),
+        };
+        if let Some(request_id) = request_id {
+            self.cancel_bookmark_open_request(request_id, "main_surface_switch");
+        }
+    }
+
     /// Once resolution has completed, page enumeration/player setup may still be pending. A
     /// navigation to another container supersedes that remainder of the request as well.
     pub(crate) fn cancel_conflicting_bookmark_open_for_navigation(&mut self, path: &Path) {
@@ -875,6 +970,42 @@ impl App {
         if conflicts {
             self.cancel_bookmark_open_request(request_id, "conflicting_navigation");
         }
+    }
+
+    fn cancel_staged_bookmark_navigation(
+        &mut self,
+        bookmark_id: crate::bookmark_browser::BookmarkOpenRequestId,
+        reason: &'static str,
+    ) -> bool {
+        let request_id = match self.top_level_grid_view.history_navigation_transition() {
+            Some(HistoryNavigationTransition::Physical(request))
+                if matches!(&request.intent, PhysicalHistoryIntent::Bookmark { owner, .. }
+                    if owner.request_id == bookmark_id) =>
+            {
+                Some(request.request_id)
+            }
+            _ => None,
+        };
+        let Some(request_id) = request_id else {
+            return false;
+        };
+        if self.staged_archive_conversion_is_current(request_id) {
+            self.cancel_archive_convert_for_navigation(reason);
+        }
+        if self.pdf_password_request.as_ref().is_some_and(|request| {
+            matches!(request.owner, PdfPasswordRequestOwner::StagedHistory(id)
+                if id == request_id)
+        }) {
+            self.pdf_password_request = None;
+            self.pdf_password_input.clear();
+            self.pdf_password_error = None;
+        }
+        if matches!(self.top_level_grid_view.history_navigation_transition(),
+            Some(HistoryNavigationTransition::Physical(request)) if request.request_id == request_id)
+        {
+            self.replace_history_navigation_transition(None);
+        }
+        true
     }
 
     /// End every current lifecycle component belonging to exactly one bookmark request.
@@ -966,12 +1097,17 @@ impl App {
                     .and_then(|pending| pending.held_resolve_for_activation_admission.take()),
             );
         }
+        let staged_matches = self.cancel_staged_bookmark_navigation(request_id, reason);
         let archive_matches = self.cancel_archive_convert_for_bookmark_request(request_id);
         let pending_matches = self
             .bookmark_open_pending
             .as_ref()
             .is_some_and(|pending| pending.request_id() == request_id);
-        let owned = resolver_matches || held_resolver_matches || archive_matches || pending_matches;
+        let owned = resolver_matches
+            || held_resolver_matches
+            || staged_matches
+            || archive_matches
+            || pending_matches;
         if pending_matches {
             crate::logger::log(format!(
                 "[bookmark-open] finish request id={} reason={reason}",
@@ -1014,7 +1150,14 @@ impl App {
         ctx: &egui::Context,
         trace_correlation: Option<u64>,
         trace_watch: Option<WatchHandle>,
+        navigation: Option<MainListNavigation>,
     ) -> StartupOpenApplyOutcome {
+        if navigation
+            .as_ref()
+            .is_some_and(|navigation| !self.main_list_navigation_is_current(navigation))
+        {
+            return StartupOpenApplyOutcome::NotOpenable;
+        }
         let source = owner.source();
         let Some(resolution) = result.resolved else {
             crate::logger::log(format!(
@@ -1031,6 +1174,36 @@ impl App {
         {
             self.show_pdf_open_refusal(reason);
             return StartupOpenApplyOutcome::Refused(reason);
+        }
+        if matches!(resolution.kind, crate::folder_tree::OpenablePathKind::File)
+            && crate::rar_loader::is_rar_path(&openable)
+            && result.rar_volume_proof.is_none()
+        {
+            // The resolver's UI-side spawn-failure fallback never probes a RAR header. Keep
+            // the same request owner and let existing classification prove it asynchronously
+            // before any cache or detached descriptor can adopt it.
+            let auto_fullscreen = matches!(source, StartupOpenPathSource::Bookmark)
+                || startup_openable_should_auto_fullscreen(
+                    &self.settings,
+                    &openable,
+                    resolution.kind,
+                );
+            return match self
+                .load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation(
+                    openable,
+                    auto_fullscreen,
+                    owner.open_request_owner(),
+                    None,
+                    None,
+                    super::StartupListIntent::container_open(auto_fullscreen),
+                    navigation,
+                ) {
+                FolderOpenOutcome::Loaded
+                | FolderOpenOutcome::Classifying
+                | FolderOpenOutcome::ConversionDialogOpened => StartupOpenApplyOutcome::Opened,
+                FolderOpenOutcome::Ignored => StartupOpenApplyOutcome::NotOpenable,
+                FolderOpenOutcome::Refused(reason) => StartupOpenApplyOutcome::Refused(reason),
+            };
         }
         crate::logger::log(format!(
             "startup open: requested={} resolved={} resolve_ms={:.1}",
@@ -1075,7 +1248,11 @@ impl App {
                     FolderOpenOutcome::Refused(reason) => StartupOpenApplyOutcome::Refused(reason),
                 };
             }
-            match self.bookmark_detached_descriptor(&openable, resolution.kind) {
+            match self.bookmark_detached_descriptor(
+                &openable,
+                resolution.kind,
+                result.rar_volume_proof.as_ref(),
+            ) {
                 DetachedBuild::Built(descriptor) => {
                     return if self.continue_active_detached_book_context_from_descriptor(descriptor)
                     {
@@ -1124,10 +1301,11 @@ impl App {
         if matches!(source, StartupOpenPathSource::Bookmark)
             && self.settings.detached_viewer_open_images_in_window
         {
-            match self.open_bookmark_book_in_detached_context(
+            match self.open_bookmark_book_in_detached_context_classified(
                 ctx,
                 openable.clone(),
                 resolution.kind,
+                result.rar_volume_proof.as_ref(),
             ) {
                 DetachedBuild::Built(true) => return StartupOpenApplyOutcome::Opened,
                 DetachedBuild::Built(false) => return StartupOpenApplyOutcome::NotOpenable,
@@ -1156,16 +1334,24 @@ impl App {
                 .watched_optional(trace_watch)
                 .detail("existing-loader-call-return")
         });
-        let outcome = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
-            openable,
-            auto_fullscreen,
-            owner.open_request_owner(),
-            if select_requested_file {
-                super::StartupListIntent::PageContinuation
-            } else {
-                super::StartupListIntent::container_open(auto_fullscreen)
-            },
-        );
+        let classified_kind = Some(match resolution.kind {
+            crate::folder_tree::OpenablePathKind::Directory => OpenPathKind::Directory,
+            crate::folder_tree::OpenablePathKind::File => OpenPathKind::File,
+        });
+        let outcome = self
+            .load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation(
+                openable,
+                auto_fullscreen,
+                owner.open_request_owner(),
+                classified_kind,
+                None,
+                if select_requested_file {
+                    super::StartupListIntent::PageContinuation
+                } else {
+                    super::StartupListIntent::container_open(auto_fullscreen)
+                },
+                navigation,
+            );
         if let Some(scan) = scan {
             scan.finish(
                 if matches!(
@@ -1188,6 +1374,7 @@ impl App {
             | FolderOpenOutcome::ConversionDialogOpened => {}
         }
         if matches!(source, StartupOpenPathSource::Bookmark)
+            && !self.main_folder_history_available()
             && matches!(outcome, FolderOpenOutcome::Loaded)
             && let StartupOpenPathOwner::Bookmark(bookmark_owner) = owner
         {
@@ -1207,6 +1394,7 @@ impl App {
         &mut self,
         openable: &Path,
         kind: crate::folder_tree::OpenablePathKind,
+        rar_volume_proof: Option<&crate::rar_loader::RarVolumeProof>,
     ) -> DetachedBuild<ViewerContextDescriptor> {
         let Some(pending) = self
             .bookmark_open_pending
@@ -1240,6 +1428,13 @@ impl App {
             }
             crate::book_bookmarks::BookContainerKind::OtherArchive => {
                 let source = pending.bookmark.container_path.clone();
+                if crate::rar_loader::is_rar_path(&source)
+                    && (rar_volume_proof.is_none()
+                        || rar_volume_proof
+                            .is_some_and(|proof| proof.rejection_message().is_some()))
+                {
+                    return DetachedBuild::NotApplicable;
+                }
                 let Some(cached) = self.try_archive_cache_lookup(&source) else {
                     return DetachedBuild::NotApplicable;
                 };
@@ -1260,6 +1455,17 @@ impl App {
         openable: PathBuf,
         kind: crate::folder_tree::OpenablePathKind,
     ) -> DetachedBuild<bool> {
+        self.open_bookmark_book_in_detached_context_classified(ctx, openable, kind, None)
+    }
+
+    #[cfg(windows)]
+    fn open_bookmark_book_in_detached_context_classified(
+        &mut self,
+        ctx: &egui::Context,
+        openable: PathBuf,
+        kind: crate::folder_tree::OpenablePathKind,
+        rar_volume_proof: Option<&crate::rar_loader::RarVolumeProof>,
+    ) -> DetachedBuild<bool> {
         let Some(pending) = self
             .bookmark_open_pending
             .as_ref()
@@ -1279,7 +1485,8 @@ impl App {
         }
 
         let request_id = pending.request_id;
-        let descriptor = match self.bookmark_detached_descriptor(&openable, kind) {
+        let descriptor = match self.bookmark_detached_descriptor(&openable, kind, rar_volume_proof)
+        {
             DetachedBuild::Built(descriptor) => descriptor,
             DetachedBuild::NotApplicable => return DetachedBuild::NotApplicable,
             DetachedBuild::Refused(reason) => return DetachedBuild::Refused(reason),
@@ -1652,6 +1859,7 @@ fn resolve_startup_open_path(
     requested: PathBuf,
     source: StartupOpenPathSource,
     bookmark: Option<&crate::book_bookmarks::BookBookmark>,
+    probe_rar: bool,
 ) -> StartupOpenPathResolveResult {
     let t0 = std::time::Instant::now();
     let bookmark_relative_page_openable = bookmark.and_then(|bookmark| {
@@ -1665,6 +1873,16 @@ fn resolve_startup_open_path(
         ))
     });
     let resolved = crate::folder_tree::resolve_openable_path_detailed(&requested);
+    let rar_volume_proof = probe_rar
+        .then(|| {
+            resolved.as_ref().and_then(|resolution| {
+                (matches!(resolution.kind, crate::folder_tree::OpenablePathKind::File)
+                    && crate::rar_loader::is_rar_path(&resolution.path))
+                .then(|| crate::rar_loader::volume_proof(&resolution.path).ok())
+                .flatten()
+            })
+        })
+        .flatten();
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
     if crate::perf::is_enabled() {
         crate::perf::event(
@@ -1683,6 +1901,7 @@ fn resolve_startup_open_path(
         requested,
         resolved,
         bookmark_relative_page_openable,
+        rar_volume_proof,
         elapsed_ms,
     }
 }
@@ -1718,6 +1937,265 @@ mod tests {
         );
     }
 
+    fn arm_section1339_bookmark(
+        app: &mut App,
+        id: u64,
+        path: &Path,
+    ) -> crate::bookmark_browser::BookmarkOpenRequestOwner {
+        let request_id = crate::bookmark_browser::BookmarkOpenRequestId(id);
+        let target = crate::bookmark_browser::BookmarkViewReturnTarget::Book(path.to_path_buf());
+        app.bookmark_view_state = Some(BookmarkViewState::Opening {
+            target: target.clone(),
+            grid: BookmarkViewReturnGridState {
+                row_keys: vec![(0, 1)],
+                selected_key: Some((0, 1)),
+                opened_key: (0, 1),
+                scroll_offset_y: 0.0,
+            },
+        });
+        app.bookmark_open_pending = Some(crate::bookmark_browser::PendingBookmarkOpen::Book(
+            crate::bookmark_browser::PendingBookOpen {
+                request_id,
+                bookmark_source: crate::pdf_loader::LeasedEpubPath::try_new(path.to_path_buf())
+                    .unwrap(),
+                bookmark: crate::book_bookmarks::BookBookmark {
+                    id: 1,
+                    container_key: crate::book_bookmarks::container_key(path),
+                    container_path: path.to_path_buf(),
+                    container_kind: crate::book_bookmarks::BookContainerKind::Zip,
+                    page_identity: crate::book_bookmarks::PageIdentity::ArchiveEntry(
+                        "1.jpg".into(),
+                    ),
+                    page_index_hint: 0,
+                    created_at_ms: 1,
+                    title: None,
+                },
+                relative_page_provenance: None,
+                started_at: std::time::Instant::now(),
+                stage: crate::bookmark_browser::PendingBookOpenStage::Resolving,
+            },
+        ));
+        crate::bookmark_browser::BookmarkOpenRequestOwner {
+            request_id,
+            target,
+            #[cfg(windows)]
+            detached_lease: None,
+        }
+    }
+
+    fn write_section1339_bookmark_zip(path: &Path) {
+        use std::io::Write;
+        let mut archive = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        archive
+            .start_file("1.jpg", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        archive.write_all(b"image metadata fixture").unwrap();
+        archive.finish().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn detached_bookmark_cache_only_rejects_later_rar_with_valid_legacy_cache() {
+        let mut app = setup_app_for_test();
+        app.settings.detached_viewer_open_images_in_window = true;
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/archives/rar-multipart-filename-regression/real-split-control");
+        let source = app.tmp.path().join("bookmark.part2.rar");
+        std::fs::copy(fixture.join("real-split-control.part2.rar"), &source).unwrap();
+        std::fs::copy(
+            fixture.join("real-split-control.part1.rar"),
+            app.tmp.path().join("bookmark.part1.rar"),
+        )
+        .unwrap();
+        let cached = app.tmp.path().join("bookmark-cache.zip");
+        write_section1339_bookmark_zip(&cached);
+        let metadata = std::fs::metadata(&source).unwrap();
+        app.archive_cache_db
+            .as_ref()
+            .unwrap()
+            .record(
+                &source,
+                crate::ui_helpers::mtime_secs(&metadata),
+                metadata.len() as i64,
+                crate::archive_converter::ArchiveFormat::Rar,
+                &cached,
+                std::fs::metadata(&cached).unwrap().len() as i64,
+                1,
+                false,
+            )
+            .unwrap();
+        assert_eq!(app.try_archive_cache_lookup(&source), Some(cached));
+        arm_section1339_bookmark(&mut app, 404, &source);
+        app.bookmark_open_pending
+            .as_mut()
+            .unwrap()
+            .book_mut()
+            .unwrap()
+            .bookmark
+            .container_kind = crate::book_bookmarks::BookContainerKind::OtherArchive;
+        let origin = app.current_folder.clone();
+        let generation = app.items_generation;
+        let ctx = egui::Context::default();
+        app.start_startup_open_path_resolve(source, StartupOpenPathSource::Bookmark, &ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.startup_open_path_resolve_pending.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "bookmark resolver timed out"
+            );
+            app.poll_startup_open_path_resolve(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(app.current_folder, origin);
+        assert_eq!(app.items_generation, generation);
+        assert!(app.active_viewer_context_id().is_none());
+        assert!(app.detached_window_manager.is_empty());
+        assert!(app.zip_enumerate_pending.is_none());
+        assert!(app.archive_convert.is_none());
+        assert!(app.fs_feedback_toast.as_ref().unwrap().0.contains("part1"));
+    }
+
+    #[test]
+    fn section1339_quick_reselect_retires_unadopted_bookmark_but_keeps_adopted_hydration() {
+        for adopted in [false, true] {
+            let mut app = setup_app_for_test();
+            let path = app.tmp.path().join("reader.zip");
+            write_section1339_bookmark_zip(&path);
+            app.current_folder = Some(path.clone());
+            app.set_quick_folder_slot_target(super::super::QuickFolderSlotId::A, path.clone());
+            let owner = arm_section1339_bookmark(&mut app, 303, &path);
+            if adopted {
+                assert!(app.begin_bookmark_page_wait(&owner));
+            }
+            assert_eq!(
+                app.activate_quick_folder_slot(super::super::QuickFolderSlotId::A),
+                super::super::QuickFolderSwitchTarget::Current
+            );
+            assert_eq!(
+                app.bookmark_open_pending.is_some(),
+                adopted,
+                "same visible reader retains post-adoption hydration and its return target"
+            );
+            assert_eq!(app.bookmark_view_target().is_some(), adopted);
+        }
+    }
+
+    #[test]
+    fn section1339_bookmark_resolver_moves_original_navigation_through_row_refresh() {
+        let mut app = setup_app_for_test();
+        app.active_quick_folder_slot = None;
+        app.settings.detached_viewer_open_images_in_window = false;
+        let origin = app.tmp.path().join("origin");
+        let target = app.tmp.path().join("book.zip");
+        std::fs::create_dir(&origin).unwrap();
+        write_section1339_bookmark_zip(&target);
+        app.current_folder = Some(origin.clone());
+        let owner = arm_section1339_bookmark(&mut app, 101, &target);
+        let navigation = app.capture_main_list_navigation(
+            MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation),
+            MainListSourceProof::Bookmark(owner),
+        );
+        let original_route = navigation.source_location.as_ref().unwrap().route.clone();
+        let ctx = egui::Context::default();
+        app.start_startup_open_path_resolution_owned_with_navigation(
+            target.clone(),
+            StartupOpenPathSource::Bookmark,
+            &ctx,
+            Some(navigation),
+        );
+        assert!(
+            app.startup_open_path_resolve_pending
+                .as_ref()
+                .unwrap()
+                .navigation
+                .is_some()
+        );
+        app.items_generation += 1;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.startup_open_path_resolve_pending.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "bookmark resolver did not complete"
+            );
+            app.poll_startup_open_path_resolve(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let Some(HistoryNavigationTransition::Physical(request)) =
+            app.top_level_grid_view.history_navigation_transition()
+        else {
+            panic!("bookmark ZIP must retain the staged physical request");
+        };
+        assert!(
+            matches!(&request.intent, PhysicalHistoryIntent::Bookmark { owner, .. } if owner.request_id.0 == 101)
+        );
+        assert_eq!(
+            request.navigation.source_location.as_ref().unwrap().route,
+            original_route
+        );
+        assert_eq!(
+            request
+                .navigation
+                .source_location
+                .as_ref()
+                .unwrap()
+                .location,
+            FolderNavHistoryTarget::Path(origin)
+        );
+        assert!(app.physical_history_source_is_current(request));
+        assert!(app.folder_nav_back_stack.is_empty());
+        assert!(matches!(
+            app.bookmark_open_pending
+                .as_ref()
+                .unwrap()
+                .book()
+                .unwrap()
+                .stage,
+            crate::bookmark_browser::PendingBookOpenStage::Resolving
+        ));
+    }
+
+    #[test]
+    fn section1339_stale_bookmark_cancel_cannot_remove_new_staged_owner() {
+        let mut app = setup_app_for_test();
+        app.active_quick_folder_slot = None;
+        let target = app.tmp.path().join("book.zip");
+        write_section1339_bookmark_zip(&target);
+        let owner = arm_section1339_bookmark(&mut app, 202, &target);
+        let navigation = app.capture_main_list_navigation(
+            MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation),
+            MainListSourceProof::Bookmark(owner.clone()),
+        );
+        assert!(app.start_physical_history_transition_classified(
+            PhysicalHistoryIntent::Bookmark {
+                owner,
+                auto_fullscreen: true
+            },
+            target,
+            None,
+            Some(OpenPathKind::File),
+            StartupListIntent::ExplicitList,
+            navigation,
+            None,
+        ));
+        assert!(!app.cancel_bookmark_open_request(
+            crate::bookmark_browser::BookmarkOpenRequestId(201),
+            "stale_test"
+        ));
+        assert!(
+            matches!(app.top_level_grid_view.history_navigation_transition(), Some(HistoryNavigationTransition::Physical(request)) if matches!(&request.intent, PhysicalHistoryIntent::Bookmark {owner, ..} if owner.request_id.0 == 202))
+        );
+        assert!(app.cancel_bookmark_open_request(
+            crate::bookmark_browser::BookmarkOpenRequestId(202),
+            "current_test"
+        ));
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_none()
+        );
+        assert!(app.bookmark_open_pending.is_none());
+    }
+
     #[test]
     fn bookmark_open_resolver_rechecks_relative_page_containment() {
         let temp = tempfile::tempdir().unwrap();
@@ -1742,8 +2220,12 @@ mod tests {
             title: None,
         };
 
-        let result =
-            resolve_startup_open_path(album, StartupOpenPathSource::Bookmark, Some(&bookmark));
+        let result = resolve_startup_open_path(
+            album,
+            StartupOpenPathSource::Bookmark,
+            Some(&bookmark),
+            true,
+        );
         assert!(result.resolved.is_some());
         assert_eq!(result.bookmark_relative_page_openable, Some(false));
     }

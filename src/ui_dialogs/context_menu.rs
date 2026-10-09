@@ -1998,52 +1998,6 @@ impl crate::app::App {
         })
     }
 
-    /// `ContextMenuAction::JumpToFolder` の source surface 終了を適用する。検索終了
-    /// (Ctrl+G / Ctrl+S / タグ) と canonical return owner の消費を同じ境界で行い、
-    /// 検索前の実フォルダだけを back stack に積む。
-    ///
-    /// **呼び出しは context_nav が優先度判定で実際に勝ったあとに限る** (Codex P3): 副作用を
-    /// show_context_menu 内で発火すると、同フレームに別 nav 源 (キーボード等) が勝った
-    /// ときに、別ナビが意図せず検索終了済み・suppress 立て済みの状態を引き継いでしまう。
-    pub(crate) fn dismiss_source_for_jump_to_folder(&mut self, request: &JumpToFolderRequest) {
-        // `dismiss_*_without_restore` が canonical `return_to` を consume する。ここで
-        // `close_*` / `restore_view_return_context` を呼ぶと origin load と destination
-        // load が競合するため、戻り先は履歴用途にだけ使う。
-        let mut return_context = None;
-        if self.global_search.active {
-            return_context = Some(self.dismiss_global_search_without_restore());
-        }
-        if self.favsearch.active {
-            let dismissed = self.dismiss_favsearch_without_restore();
-            return_context.get_or_insert(dismissed);
-        }
-        if self.tag_view.active {
-            let dismissed = self.dismiss_tag_view_without_restore();
-            return_context.get_or_insert(dismissed);
-        }
-
-        // active flag が stale でも typed surface が Search なら canonical owner を
-        // consume する。閲覧履歴の JumpToBookFolder には return owner がない。
-        if return_context.is_none()
-            && matches!(
-                self.top_level_grid_view.surface(),
-                crate::app::top_level_grid_view::TopLevelGridSurface::Search(_)
-            )
-        {
-            return_context = self.top_level_grid_view.take_return_to();
-        }
-
-        // synthetic origin を実フォルダ履歴へ平坦化しない。物理 Folder origin だけが
-        // 「移動先で戻る」を構成できる。
-        if let Some(crate::app::top_level_grid_view::TopLevelGridRestore::Folder(c)) =
-            return_context
-        {
-            if !crate::folder_tree::path_eq(&c, request.destination.path()) {
-                self.push_nav_history_entry(c);
-            }
-        }
-    }
-
     /// フルスクリーン表示中のコンテキストメニューを表示する。
     /// 移動なし右クリックでトリガーされる。
     /// アプリケーション起動によりフルスクリーンを閉じるべき場合は true を返す。

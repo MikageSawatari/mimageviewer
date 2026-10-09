@@ -1236,6 +1236,13 @@ impl TopLevelGridRestore {
     }
 }
 
+/// Runtime return provenance; the route carries no historical filter values.
+#[derive(Clone, Debug)]
+pub(crate) struct TopLevelGridOrigin {
+    pub(crate) restore: TopLevelGridRestore,
+    pub(crate) route: super::facet_navigation::FacetRoute,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TopLevelGridSurface {
     Folder,
@@ -1319,7 +1326,7 @@ impl super::App {
 
 pub(crate) struct TopLevelGridView {
     surface: TopLevelGridSurface,
-    return_to: Option<TopLevelGridRestore>,
+    return_to: Option<TopLevelGridOrigin>,
     generation: u64,
     /// At most five star lists, owned by this viewer context's navigation session.
     rating_grid_positions: std::collections::HashMap<u8, RatingGridPosition>,
@@ -1332,7 +1339,7 @@ pub(crate) struct TopLevelGridView {
     /// Playback/navigation work belongs to this exact viewer context. It is deliberately not
     /// cloned into duplicated contexts; dropping/replacing a surface cancels its workers.
     collection_navigation_pending:
-        Option<super::collection_navigation::CollectionNavigationPending>,
+        Option<Box<super::collection_navigation::CollectionNavigationPending>>,
     /// History replay preparation travels with its viewer bundle during park/mount and is never
     /// copied into a sibling context. The transition owns its cancellation and old-view intent.
     history_navigation_transition: Option<Box<super::HistoryNavigationTransition>>,
@@ -1507,7 +1514,10 @@ impl TopLevelGridView {
             _ => None,
         };
         self.surface = surface;
-        self.return_to = return_to;
+        self.return_to = return_to.map(|restore| TopLevelGridOrigin {
+            restore,
+            route: Default::default(),
+        });
         self.generation
     }
 
@@ -1545,17 +1555,44 @@ impl TopLevelGridView {
         self.history_navigation_transition.take();
         self.collection_session = None;
         self.surface = TopLevelGridSurface::Folder;
-        self.return_to.take()
+        self.return_to.take().map(|origin| origin.restore)
     }
 
     pub(crate) fn return_to(&self) -> Option<&TopLevelGridRestore> {
-        self.return_to.as_ref()
+        self.return_to.as_ref().map(|origin| &origin.restore)
     }
 
     /// Installs a return owner captured by the source context into a newly-built physical viewer.
     /// This does not change the new context's current surface or generation.
     pub(crate) fn install_return_to(&mut self, return_to: TopLevelGridRestore) {
-        self.return_to = Some(return_to);
+        self.return_to = Some(TopLevelGridOrigin {
+            restore: return_to,
+            route: Default::default(),
+        });
+    }
+
+    pub(crate) fn begin_with_origin(
+        &mut self,
+        surface: TopLevelGridSurface,
+        origin: Option<TopLevelGridOrigin>,
+    ) -> u64 {
+        let generation = self.begin(surface, None);
+        self.return_to = origin;
+        generation
+    }
+
+    pub(crate) fn return_origin(&self) -> Option<&TopLevelGridOrigin> {
+        self.return_to.as_ref()
+    }
+
+    pub(crate) fn take_return_origin(&mut self) -> Option<TopLevelGridOrigin> {
+        let origin = self.return_to.take();
+        let _ = self.take_return_to();
+        origin
+    }
+
+    pub(crate) fn install_return_origin(&mut self, origin: TopLevelGridOrigin) {
+        self.return_to = Some(origin);
     }
 
     pub(crate) fn collection_session(&self) -> Option<&CollectionGridSession> {
@@ -1574,7 +1611,7 @@ impl TopLevelGridView {
     pub(in crate::app) fn collection_navigation_pending_for_test(
         &self,
     ) -> Option<&super::collection_navigation::CollectionNavigationPending> {
-        self.collection_navigation_pending.as_ref()
+        self.collection_navigation_pending.as_deref()
     }
 
     pub(in crate::app) fn collection_navigation_owns_fs_lock(&self) -> bool {
@@ -1649,8 +1686,10 @@ impl TopLevelGridView {
         &mut self,
         pending: Option<super::collection_navigation::CollectionNavigationPending>,
     ) {
-        if let Some(previous) = std::mem::replace(&mut self.collection_navigation_pending, pending)
-        {
+        if let Some(previous) = std::mem::replace(
+            &mut self.collection_navigation_pending,
+            pending.map(Box::new),
+        ) {
             self.collection_navigation_retired_fs_lock |= previous.owns_fs_navigation_lock();
             self.collection_navigation_retired_pdf_password |= previous.is_pdf_password();
             previous.cancel();
@@ -1660,7 +1699,9 @@ impl TopLevelGridView {
     pub(in crate::app) fn take_collection_navigation_pending(
         &mut self,
     ) -> Option<super::collection_navigation::CollectionNavigationPending> {
-        self.collection_navigation_pending.take()
+        self.collection_navigation_pending
+            .take()
+            .map(|pending| *pending)
     }
 
     pub(crate) fn smart_folder(&self) -> Option<&SmartFolderViewState> {

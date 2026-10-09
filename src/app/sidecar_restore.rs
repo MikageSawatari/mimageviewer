@@ -87,7 +87,26 @@ impl SidecarProbeReuseCache {
     }
 }
 
-pub(super) struct SidecarLoadContinuation {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum FirstDisplayAction {
+    None,
+    AutoFullscreenFolder,
+    Zip {
+        has_foreign_archives: bool,
+    },
+    WarmPdf,
+    Pdf {
+        pages: crate::pdf_loader::PdfEnumerateResult,
+        password: Option<String>,
+    },
+}
+
+pub(crate) struct SidecarLoadContinuation {
+    pub(super) navigation_after_hydration: Option<super::MainListAfterHydration>,
+    /// Accepted folder maintenance travels with this continuation to its new worker queue.
+    /// Dropping a superseded continuation also drops the work and its catalog admission.
+    pub(super) audio_art_prune: Option<crate::thumb_loader::LoadRequest>,
+    pub(super) first_display_action: FirstDisplayAction,
     pub(super) restore_intent: super::StartupListIntent,
     /// Initial geometry seed captured from the accepted list's session position.
     /// Travels with this exact hydration continuation; StartupListIntent remains independent.
@@ -744,6 +763,9 @@ impl App {
                 tag_item_keys: Vec::new(),
                 source_path: folder.clone(),
                 continuation: ContinuationOwner::Live(SidecarLoadContinuation {
+                    first_display_action: FirstDisplayAction::None,
+                    navigation_after_hydration: None,
+                    audio_art_prune: None,
                     auto_aspect_seed: None,
                     source_path: folder.clone(),
                     source_is_directory: true,
@@ -2649,6 +2671,112 @@ mod tests {
     }
 
     #[test]
+    fn section1339_adoption_precedes_real_sidecar_hydration_and_commits_once() {
+        for malformed_sidecar in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            app.active_quick_folder_slot = None;
+            app.settings.sidecar_backup_enabled = true;
+            app.settings.tag_sidecar_backup_enabled = false;
+            app.settings.auto_fullscreen_image_folders = false;
+            let parent = app.tmp.path().join("hydration-parent");
+            let child = parent.join("child");
+            std::fs::create_dir_all(&child).unwrap();
+            std::fs::write(child.join("page.jpg"), b"fixture").unwrap();
+            if malformed_sidecar {
+                std::fs::write(child.join(crate::sidecar::SIDECAR_FILENAME), b"not-json").unwrap();
+            }
+            app.current_folder = Some(parent.clone());
+            app.items = vec![crate::grid_item::GridItem::Folder(child.clone())];
+            app.adopt_main_facet_route(super::super::FacetRoute::root(
+                super::super::FacetScope::path(&parent),
+            ));
+            app.settings.facet_filter.exts.insert("jpg".into());
+            let navigation = app.capture_main_list_navigation(
+                super::super::MainHistoryOperation::Direct(
+                    crate::app::DirectNavigationPurpose::Navigation,
+                ),
+                super::super::MainListSourceProof::Row,
+            );
+            let destination = app.main_list_destination_entry(
+                super::super::FolderNavHistoryTarget::Path(child.clone()),
+                navigation.source_location.as_ref(),
+                None,
+            );
+            let now = std::time::Instant::now();
+            let scan = super::super::folder_scan::scan_directory_with_convertible_archives(
+                &child, true, true, true,
+            )
+            .unwrap();
+            let prepared = app.prepare_scanned_folder_listing(
+                child.clone(),
+                scan,
+                super::super::FolderListingMetrics {
+                    seq: 0,
+                    started: now,
+                    scan_started: now,
+                    pre_scanned: true,
+                    path_display: child.display().to_string(),
+                },
+                super::super::StartupListIntent::ExplicitList,
+            );
+            let visible = app
+                .prepare_visible_install(&child, &prepared.items, None)
+                .unwrap();
+            let adoption = app
+                .prepare_main_list_adoption(navigation, destination.clone())
+                .unwrap();
+            assert!(app.adopt_main_list_navigation(adoption, |app| {
+                app.install_prepared_scanned_folder_listing(
+                    prepared,
+                    super::super::VisibleInstallAuthority::Ordinary,
+                    visible,
+                )
+            }));
+            assert_eq!(app.current_folder.as_ref(), Some(&child));
+            assert_eq!(app.facet_navigation.route(), &destination.route);
+            assert!(!app.settings.facet_filter.is_active());
+            assert_eq!(app.facet_navigation.saved_frame_count(), 1);
+            assert_eq!(
+                app.folder_history_back_target(),
+                Some(&super::super::FolderNavHistoryTarget::Path(parent))
+            );
+            assert!(app.sidecar_restore_blocks_projected_context());
+            let history = app.folder_nav_history_snapshot();
+            let facet = app.facet_navigation.clone();
+            let relay = SidecarCheckingRelay::new();
+            app.sidecar_restore.as_mut().unwrap().checking_relay = Some(relay.clone());
+            let ctx = egui::Context::default();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !relay.captured() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "real hydration worker did not finish"
+                );
+                app.poll_sidecar_restore(&ctx);
+                std::thread::yield_now();
+            }
+            assert!(app.sidecar_restore_blocks_projected_context());
+            assert_eq!(app.facet_navigation, facet);
+            assert_eq!(app.folder_nav_back_stack, history.back_stack);
+            relay.release();
+            while app.sidecar_restore.is_some() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "hydration did not resume"
+                );
+                app.poll_sidecar_restore(&ctx);
+                std::thread::yield_now();
+            }
+            assert_eq!(app.facet_navigation, facet);
+            assert_eq!(app.folder_nav_back_stack, history.back_stack);
+            assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+            assert_eq!(app.settings.last_folder.as_ref(), Some(&child));
+            assert_eq!(app.items.len(), 1);
+            assert_eq!(app.visible_indices, vec![0]);
+        }
+    }
+
+    #[test]
     fn fast_current_terminal_finishes_inside_the_modal_grace_and_runs_the_tail_once() {
         let mut app = crate::app::setup_app_for_test();
         app.settings.sidecar_backup_enabled = true;
@@ -2659,6 +2787,9 @@ mod tests {
         let (thumb_tx, _thumb_rx) = mpsc::channel::<ThumbMsg>();
         let started_at = std::time::Instant::now();
         let continuation = SidecarLoadContinuation {
+            first_display_action: FirstDisplayAction::None,
+            navigation_after_hydration: None,
+            audio_art_prune: None,
             auto_aspect_seed: None,
             source_path: folder.clone(),
             source_is_directory: true,
@@ -2745,6 +2876,9 @@ mod tests {
         assert!(
             app.begin_sidecar_restore(
                 SidecarLoadContinuation {
+                    first_display_action: FirstDisplayAction::None,
+                    navigation_after_hydration: None,
+                    audio_art_prune: None,
                     auto_aspect_seed: None,
                     source_path: folder.clone(),
                     source_is_directory: true,
@@ -3258,6 +3392,9 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<ThumbMsg>();
         let cancel = Arc::new(AtomicBool::new(false));
         let mut owner = ContinuationOwner::Live(SidecarLoadContinuation {
+            first_display_action: FirstDisplayAction::None,
+            navigation_after_hydration: None,
+            audio_art_prune: None,
             auto_aspect_seed: None,
             source_path: PathBuf::from("C:/book"),
             source_is_directory: true,
