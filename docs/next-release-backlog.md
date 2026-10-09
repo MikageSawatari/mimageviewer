@@ -32,6 +32,13 @@
 
 ## 1. 優先候補
 
+### 1.361 リリース前の idle health と perf smoke を自動化する — 利用者の要望 (2026-10-09)
+- 経緯: v4.5.0 の出荷前確認で、`check-idle-health.ps1` の 4 シナリオと `perf_smoke.ps1` を利用者が手で実施した。各シナリオの準備 (前面 / 背面の切り替え、トレイへ格納、動画を代表画像に固定したフォルダ、Enter 待ち、測定中は触らない) と、perf smoke の操作 (フォルダを開く・Ctrl+↓ ×5・Ctrl+G 検索・終了) が手作業。perf smoke の判定 (100ms 超の間隔ごとの直前 `ui.tail_repaint.action`、`request_repaint` 直後の描画フレームの 16ms 未満率、`ui.pre_grid_breakdown` p95) も、その都度エージェントが perf ログをスクリプトで読み直している。tray-residency の「読み込み中に閉じる」は手では合わせにくい (利用者)。
+- 現状の道具 (コードの参照): 隔離データの使い捨てコピー `scripts/prepare-portable-smoke.ps1` (エージェントが操作してよい唯一の起動形態)、画面操作の台本 `scripts/ui-smoke.ps1` / `scripts/ui-smoke/`、`--settings-override` (test-script 限定)、判定 `scripts/analyze_perf.py idle-health` / `hitches`、閾値 `scripts/idle_health_thresholds.json`。
+- 検討すること: (1) 隔離データ + 台本でシナリオを準備し、測定・判定まで 1 コマンドで回す (利用者の実データ・常駐版に触れない形)。(2) 前提のフォルダを fixture で作る (キャッシュ済み / キャッシュ無し、サブフォルダの多いフォルダ、動画を代表画像に固定したフォルダ)。§1.360 の再現条件 (キャッシュ無しのフォルダを読み込み中 / 完了後にトレイへ格納) も含める。(3) perf smoke の判定を `analyze_perf.py` に入れ、合否と 100ms 超の内訳 (起動直後の初期フォルダ読み込み、初回 AI 開始などの既知の形) を自動で分類し、`docs/release-verification-records.md` に書く値を出力する。(4) 実データでしか見えない傾向 (よく使うフォルダの規模) を、利用者の手動実施として残すか。
+- 注意: 前面 / 背面・トレイ格納は OS の窓の状態に依存し、Computer Use からは前面を取れないことがある (ui-smoke のキー系は SKIPPED の実績あり、v4.4.0 の記録)。台本からの窓の隠し方が実際の [×] での格納と同じ経路を通るかを確かめる。
+- 規模 / 優先度: Medium / P2 (次の版以降)。
+
 ### 1.360 トレイ常駐中に、キャッシュの無いフォルダのサムネイルを作り直し続け CPU を使う — v4.5.0 の idle health で検出 (2026-10-09)
 - **次の版の決定 (利用者 2026-10-09)**: v4.4.0 から入った退行ではないため、v4.5.0 はこのまま出荷し、次の版で優先して直す。
 - 観測 (利用者が配布ビルドの core で `check-idle-health.ps1 -Scenario tray-residency` を実施、`G:\home\comfyui`): 窓を全部隠した 15 秒間で CPU 1 コア比 0.44、描画 9.5 回/秒、`requested_nonempty` / `texture_backlog_nonempty` が 14.7 秒継続。フォルダのタイル idx 138 / 139 を heavy queue へ各 116 回 enqueue (decode_end は毎回 from_cache=false、保存省略)、他のタイルも idle_upgrade_enqueue 13 回。利用者の見立て: よく開かないフォルダで、サブフォルダ内の画像から作るフォルダサムネイルのキャッシュが無かった。v4.4.0 の同シナリオは別フォルダ (`H:\home\mimageviewer_old\testimage` が多い) で PASS。perf ログの写し: worktree mimageviewer-nextview の `target/trayloop/`。
