@@ -408,7 +408,23 @@ fn normalize(bytes: &[u8], extension: &str, cancel: &AtomicBool) -> Result<Encod
                     .map_err(|e| e.to_string())?;
                 decoder.set_limits(limits).map_err(|e| e.to_string())?;
                 check(cancel)?;
-                DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?
+                match DynamicImage::from_decoder(decoder) {
+                    Ok(decoded) => decoded,
+                    Err(error @ image::ImageError::Unsupported(_)) => {
+                        // Some TIFF compression modes are recognized at construction
+                        // but unsupported by the pixel decoder. Preserve the prior
+                        // raster admission and delegate once to the bounded WIC path.
+                        check(cancel)?;
+                        wic_orientation_applied = true;
+                        crate::wic_decoder::decode_to_dynamic_image_from_bytes_bounded(
+                            input,
+                            extension,
+                            metadata::DECODE_BUDGET,
+                        )
+                        .ok_or_else(|| error.to_string())?
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
             }
             Err(error) => {
                 wic_orientation_applied = true;
@@ -493,6 +509,85 @@ fn finish(bytes: Vec<u8>, mime: &'static str, cancel: &AtomicBool) -> Result<Enc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    fn ccitt3_tiff_fixture() -> Vec<u8> {
+        // Pillow/libtiff-generated 16x8 bilevel checkerboard, compression=Group 3.
+        // Embedded bytes keep the regression independent of external image tools.
+        base64::engine::general_purpose::STANDARD
+            .decode("SUkqACYAAAAAG3bABt2wATV27ABNXbsAG3bABt2wATV27ABNXbsJAAABAwABAAAAEAAAAAEBAwABAAAACAAAAAIBAwABAAAAAQAAAAMBAwABAAAAAwAAAAYBAwABAAAAAQAAABEBBAABAAAACAAAABYBAwABAAAACAAAABcBBAABAAAAHgAAABwBAwABAAAAAQAAAAAAAAA=")
+            .unwrap()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn now_playing_ccitt3_pixel_unsupported_uses_bounded_wic_once() {
+        let bytes = ccitt3_tiff_fixture();
+        let decoder = image::ImageReader::with_format(Cursor::new(&bytes), ImageFormat::Tiff)
+            .into_decoder()
+            .expect("CCITT3 TIFF construction must succeed");
+        assert_eq!(decoder.dimensions(), (16, 8));
+        assert!(matches!(
+            DynamicImage::from_decoder(decoder),
+            Err(image::ImageError::Unsupported(_))
+        ));
+        let wic = crate::wic_decoder::decode_to_dynamic_image_from_bytes_bounded(
+            &bytes,
+            "tiff",
+            metadata::DECODE_BUDGET,
+        )
+        .expect("Windows WIC must support this small CCITT3 TIFF");
+        assert_eq!((wic.width(), wic.height()), (16, 8));
+        let art = normalize(&bytes, "tiff", &AtomicBool::new(false)).unwrap();
+        let decoded = image::load_from_memory(
+            &base64::engine::general_purpose::STANDARD
+                .decode(&*art.base64)
+                .unwrap(),
+        )
+        .unwrap()
+        .to_rgba8();
+        assert_eq!((decoded.width(), decoded.height()), (16, 8));
+        assert_eq!(decoded.get_pixel(0, 0).0, [0, 0, 0, 255]);
+        assert_eq!(decoded.get_pixel(4, 0).0, [255, 255, 255, 255]);
+        assert_eq!(decoded, wic.to_rgba8());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn now_playing_ccitt3_raster_over_budget_rejects_before_pixel_fallback() {
+        let mut bytes = ccitt3_tiff_fixture();
+        let ifd = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        let count = u16::from_le_bytes(bytes[ifd..ifd + 2].try_into().unwrap()) as usize;
+        for entry in bytes[ifd + 2..ifd + 2 + count * 12].chunks_exact_mut(12) {
+            let tag = u16::from_le_bytes(entry[..2].try_into().unwrap());
+            let dimension = match tag {
+                256 => 8193u16,
+                257 | 278 => 5120u16,
+                _ => continue,
+            };
+            entry[8..10].copy_from_slice(&dimension.to_le_bytes());
+        }
+        let decoder = image::ImageReader::with_format(Cursor::new(&bytes), ImageFormat::Tiff)
+            .into_decoder()
+            .expect("budget test must reach raster admission after construction");
+        assert_eq!(decoder.dimensions(), (8193, 5120));
+        assert!(!raster_within_budget(8193, 5120, decoder.total_bytes()));
+        assert_eq!(
+            normalize(&bytes, "tiff", &AtomicBool::new(false))
+                .err()
+                .as_deref(),
+            Some("raster exceeds decode budget"),
+        );
+        assert!(
+            crate::wic_decoder::decode_to_dynamic_image_from_bytes_bounded(
+                &ccitt3_tiff_fixture(),
+                "tiff",
+                16 * 8 * 4 - 1,
+            )
+            .is_none()
+        );
+    }
+
     fn png(w: u32, h: u32) -> Vec<u8> {
         let image = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
             w,

@@ -779,9 +779,20 @@ mod windows {
         cancel: &RawCancellation,
         progress: &AtomicU8,
     ) -> Result<(), RawError> {
+        process_bounded(handle, scale, bright_mode, cancel, progress, u64::MAX)
+    }
+
+    fn process_bounded(
+        handle: &Handle<'_>,
+        scale: RawDevelopScale,
+        bright_mode: i32,
+        cancel: &RawCancellation,
+        progress: &AtomicU8,
+        max_alloc: u64,
+    ) -> Result<(), RawError> {
         let callback_state = CallbackState { cancel, progress };
         let code = unsafe {
-            ffi::miv_raw_develop(
+            ffi::miv_raw_develop_bounded(
                 handle.raw,
                 i32::from(scale == RawDevelopScale::Half),
                 bright_mode,
@@ -789,6 +800,7 @@ mod windows {
                 (&callback_state as *const CallbackState<'_>)
                     .cast_mut()
                     .cast(),
+                max_alloc,
             )
         };
         if cancel.flag.load(Ordering::Acquire) {
@@ -938,7 +950,14 @@ mod windows {
         }
         let handle = Handle::open(source)?;
         let _binding = cancel.bind(handle.raw);
-        process(&handle, RawDevelopScale::Half, 1, cancel, progress)?;
+        process_bounded(
+            &handle,
+            RawDevelopScale::Half,
+            1,
+            cancel,
+            progress,
+            max_alloc,
+        )?;
         let (width, height, length) = dimensions(&handle)?;
         if length as u64 > max_alloc {
             return Err(RawError::TooLarge);
@@ -1096,6 +1115,43 @@ mod windows {
                 assert!(layout.width.max(layout.height) >= 1024);
             }
         }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn bounded_thumbnail_native_unpack_rejects_oversized_bayer_before_output() {
+        let mut bytes = std::fs::read("vendor/raw-samples/2756.dng")
+            .expect("Run .\\scripts\\setup-raw-samples.ps1");
+        // Ricoh GXR's RAW SubIFD is big endian, with LONG width/height tags.
+        // Preserve its small DefaultCrop so the half-output raster guard passes.
+        for (tag, old, oversized) in [(256u16, 3672u32, 12000u32), (257, 2748, 9000)] {
+            let mut entry = Vec::new();
+            entry.extend_from_slice(&tag.to_be_bytes());
+            entry.extend_from_slice(&4u16.to_be_bytes());
+            entry.extend_from_slice(&1u32.to_be_bytes());
+            entry.extend_from_slice(&old.to_be_bytes());
+            let offset = bytes
+                .windows(entry.len())
+                .position(|part| part == entry)
+                .expect("sample RAW dimension tag");
+            bytes[offset + 8..offset + 12].copy_from_slice(&oversized.to_be_bytes());
+        }
+        let max_alloc = 160 * 1024 * 1024;
+        let source = RawSource::Bytes(&bytes);
+        let info = info_bounded(source, max_alloc).expect("patched DNG should still open");
+        super::bounded_thumbnail_raster(info.developed_dims, max_alloc)
+            .expect("half-output dimensions must not reject this native allocation regression");
+        let cancel = RawCancellation::new();
+        let progress = AtomicU8::new(0);
+        assert!(matches!(
+            develop_thumbnail_half_bounded(source, &cancel, &progress, max_alloc),
+            Err(RawError::TooLarge)
+        ));
+        assert_eq!(
+            progress.load(Ordering::Acquire),
+            5,
+            "LOAD_RAW began but native unpack must reject before its completion callback"
+        );
     }
 
     #[cfg(test)]

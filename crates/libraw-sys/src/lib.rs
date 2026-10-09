@@ -58,6 +58,14 @@ mod windows {
             callback: Option<ProgressCallback>,
             user: *mut c_void,
         ) -> c_int;
+        pub fn miv_raw_develop_bounded(
+            handle: *mut c_void,
+            half: c_int,
+            bright_mode: c_int,
+            callback: Option<ProgressCallback>,
+            user: *mut c_void,
+            max_alloc_bytes: u64,
+        ) -> c_int;
         pub fn miv_raw_image_info(handle: *mut c_void, width: *mut u32, height: *mut u32) -> c_int;
         pub fn miv_raw_copy_rgb(handle: *mut c_void, data: *mut u8, stride: usize) -> c_int;
         pub fn miv_raw_copy_rgb_adjusted(
@@ -206,6 +214,85 @@ mod tests {
         );
         assert!(output.data.is_null());
         assert_eq!(output.length, 0);
+    }
+
+    #[test]
+    fn bounded_develop_native_memory_guard_precedes_unpack_completion() {
+        #[derive(Default)]
+        struct Progress {
+            entered_unpack: bool,
+            completed_unpack: bool,
+            cancel_after_unpack: bool,
+        }
+        unsafe extern "C" fn observe_unpack(
+            user: *mut c_void,
+            stage: i32,
+            iteration: i32,
+            _expected: i32,
+        ) -> i32 {
+            let progress = unsafe { &mut *user.cast::<Progress>() };
+            if stage == 1 << 3 {
+                if iteration == 0 {
+                    progress.entered_unpack = true;
+                } else {
+                    progress.completed_unpack = true;
+                    return i32::from(progress.cancel_after_unpack);
+                }
+            }
+            0
+        }
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vendor/raw-samples/2756.dng");
+        // A >20 MiB RAW store, even with half output, must fail the native 1 MiB limit.
+        // The second sub-MiB case also verifies conservative rounding, not rounding up.
+        for max_alloc in [1024 * 1024, 1024 * 1024 - 1] {
+            let handle = Handle::open(&path).expect("Run scripts/setup-raw-samples.ps1");
+            let mut progress = Progress::default();
+            let code = unsafe {
+                miv_raw_develop_bounded(
+                    handle.0,
+                    1,
+                    1,
+                    Some(observe_unpack),
+                    (&mut progress as *mut Progress).cast(),
+                    max_alloc,
+                )
+            };
+            assert_eq!(code, -100012, "native memory guard returns LIBRAW_TOO_BIG");
+            assert!(progress.entered_unpack);
+            assert!(!progress.completed_unpack);
+            let (mut width, mut height) = (0, 0);
+            assert_ne!(
+                unsafe { miv_raw_image_info(handle.0, &mut width, &mut height) },
+                0
+            );
+            assert_eq!((width, height), (0, 0));
+        }
+        // Both the ordinary API and a sufficient bounded budget still unpack this RAW.
+        // Stop immediately afterwards to avoid making this a rendering/quality test.
+        for bounded in [false, true] {
+            let handle = Handle::open(&path).unwrap();
+            let mut progress = Progress {
+                cancel_after_unpack: true,
+                ..Default::default()
+            };
+            let user = (&mut progress as *mut Progress).cast();
+            let code = unsafe {
+                if bounded {
+                    miv_raw_develop_bounded(
+                        handle.0,
+                        1,
+                        1,
+                        Some(observe_unpack),
+                        user,
+                        160 * 1024 * 1024,
+                    )
+                } else {
+                    miv_raw_develop(handle.0, 1, 1, Some(observe_unpack), user)
+                }
+            };
+            assert_eq!(code, -100010, "callback cancels after successful unpack");
+            assert!(progress.entered_unpack && progress.completed_unpack);
+        }
     }
 
     #[test]

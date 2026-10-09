@@ -275,6 +275,20 @@ class GenerationTests(unittest.TestCase):
         self.assertIn('次/前のプリセット', controller)
         self.assertNotIn('Safari', controller)
 
+    def test_bundled_prediction_and_rhythm_exclude_standalone_requirements(self):
+        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.13.0').items() if name.endswith('.html')}
+        prediction = output['resonator-adaptive-prediction.html']
+        self.assertIn('native 音声処理を使います', prediction)
+        self.assertIn('WebAssembly の有効化操作は不要', prediction)
+        for name, text in output.items():
+            with self.subTest(page=name):
+                self.assertNotIn('WebAssembly 音声処理を使用する', text)
+        rhythm = output['analyzer-rhythm-analyzer.html']
+        self.assertIn('自動再解析は独立版 EffeTune のプレーヤー向け', rhythm)
+        self.assertIn('mImageViewer の同梱版では、曲を切り替えて解析をやり直したいときに <strong>Reset</strong> ボタンを押してください', rhythm)
+        self.assertNotIn('曲の頭から解析が自動でやり直されます', rhythm)
+        self.assertNotIn('ほかのアプリで曲を切り替えたときなどに使います', rhythm)
+
     def test_entry_redirect(self):
         text = docs.entry_page('v0.12.0').decode()
         self.assertIn('<meta name="robots" content="noindex">', text)

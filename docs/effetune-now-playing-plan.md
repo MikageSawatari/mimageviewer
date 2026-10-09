@@ -1,6 +1,6 @@
 # §1.359 EffeTune Mixwright v0.13.0 更新と Now Playing 連携
 
-状態: **実装・自動検証・確認用build完了、実機／公開前gate待ち**。2026-10-09。§7は全項目回答済み。
+状態: **実装レビューのP2×4／P3×1を修正・自動再検証・確認build完了、実機／公開前gate待ち**。2026-10-10。§7は全項目回答済み。
 対象は **v4.5.0 の次のリリース**。Coordinator は ClaudeCode、実装担当は Codex。
 調査基準は `next-effetune` / `33a018417e13a271be2da2c109fa571f64079684`。
 初稿の引き継ぎは `target/F-design-msg.txt`、R2は `target/F-design-r2-msg.txt`。
@@ -541,6 +541,11 @@ decode割当前予算は既存bounded音声経路の160 MiB
 これはencoded fileの上限ではない。設計案としてsidecar／cacheのencoded読取は64 MiBまでとし、
 metadataで長さを検査した後もbounded readerで上限を守る。APICは既存16 MiB上限を維持。
 RAWは全fileをこのbufferへ読まず既存executorにpathとcancelを渡し、取得したpreviewにもdecode予算を適用する。
+preview無しのbounded half現像では、出力寸法だけでなくnative LibRawの
+`rawparams.max_raw_memory_mb` にも予算を渡し、unpackの元RAW buffer割当前に制限する。
+MiB単位へ切り下げて既定native上限以下に保ち、通常の現像経路の予算は変更しない。
+image decoderが構築できてもpixel decodeで未対応codecを返す場合は、寸法／割当予算を
+検査した後、同じ予算のWICへ一度だけ委譲する。予算超過や他のpixel errorは再試行しない。
 sidecarの全file無制限read、EXIF全展開は新経路へ持ち込まない。
 既存のEXIF展開問題はbacklog §1.354にあるので、Now Playingに必要なorientationは
 §1.347の有界方式を共有する。既存全画像metadataの全面改修はこのchunkの範囲外。
@@ -732,7 +737,13 @@ bundleを足して今回のnative受入れの代わりにはしない。新版pl
    保存されるファイル、元ファイルへの参照、削除の範囲を確かめ、説明はmIVから実際に使える機能に限る。
    独立版EffeTuneのLANリモート操作は、mIVでも使えるとは案内しない。
    必要ならprivacy.html／製品ページ「安心して使えます」／manualを実測に合わせて更新する。
-   通信・保存動作を理由に新版同梱を保留する方針は撤回する。実機確認自体は公開前に残る。
+  通信・保存動作を理由に新版同梱を保留する方針は撤回する。実機確認自体は公開前に残る。
+   **2026-10-10実装レビューの補足:** この実機gateまで、製品ページ・privacy（日英）・FAQでは
+   確認済みのmImageViewer本体の通信範囲だけを説明し、新版SFZ／Adaptive Predictionの
+   実使用中も含めた「これ以外通信しない」という断定をしない。最終の公開文面は
+   SFZの選択／load／reloadと予測のLearn／処理中のhost・WebView子processのlisten／外向き通信、
+   SFZの保存／参照保持／削除範囲を実測する公開前gateの後に確定する。
+   この留保は追加通信が存在するという確認結果ではない。
 6. **通常の受け渡し失敗では音響調整を続け、プラグインが固まったときは音響調整を停止して知らせる扱いでよいですか。**
    **決定: 推奨案を採用。** 画像を読み込めなければ画像無しで曲情報を送る。読込失敗はログと一度の案内で知らせる。
    アプリからの送信に失敗した場合はログと一度の案内で知らせるが、前の曲名や画像が残る場合がある。
@@ -806,3 +817,43 @@ release leadへ引き継ぐ。unsigned原本を署名済みstageのhashで上書
 再buildしたhost＋CRTの実ファイルは `target/D359-vst3-host-current` にも保存した。
 これはツリー外backupの代わりではない。release leadは `CLAUDE.md` の
 `C:/home/mimageviewer_vendor_backup/vst3-host` を現host＋CRTで更新し、新EffeTune原本もツリー外へ保存する。
+
+## 9. 実装レビュー修正 (2026-10-10)
+
+利用者がAを `de586bf80`、Bを `56bf4f593` としてcommitした後の独立実装レビューは
+REVISE（P1無し、P2×4／P3×1）。以下の5件を修正した。§8は当時の検証記録として保持する。
+
+| 指摘 | 修正と回帰 |
+| --- | --- |
+| P2 RAW native予算 | `miv_raw_develop_bounded` へbyte予算を渡し、LibRawのRAW-store割当前上限をunpack前に設定。通常経路は既定を維持。実DNGのRAW寸法を12000×9000へ変え、half出力検査通過後にnative `TooLarge` で拒否する回帰。native APIの1 MiB／sub-MiB拒否と通常／160 MiB unpack通過も確認 |
+| P2 pixel decode未対応 | 事前寸法／割当検査を維持し、pixel `Unsupported` のみ同予算のWICへ一度委譲。CCITT3 TIFFのdecoder構築成功→pixel未対応→WIC／Now Playing画像取得と、予算超過拒否を実画像で検査 |
+| P2 Adaptive Prediction説明 | `resonator.json` overrideで独立版のWebAssembly設定条件を除去。同梱native処理と設定操作不要を案内し、全生成ページへの条件再流入を検査 |
+| P2 未検証範囲の通信断定 | 製品ページ、privacy（日英）、同じ断定があったFAQ本文／JSON-LDを確認済み本体範囲へ限定。新版新機能の通信／保存は実機gate待ちと明記し、最終公開文面は§7.5のgate後に確定 |
+| P3 Rhythm Analyzer説明 | 独立版プレーヤーの自動再解析と区別し、同梱版はResetで表示消去／再解析を案内。converter overrideと生成ページの回帰を追加 |
+
+追加の独立レビューは5件と影響経路を確認し、新規／未解消P指摘無し。
+署名済み最終artifactとSFZ／Adaptive Predictionの実機通信・保存は引き続き未実施。
+今回の引き継ぎは `target/D359-fix-msg.txt`。アプリ起動・commitは行わない。
+
+今回の自動検証（未commit差分、base `56bf4f593`）:
+
+| 検証 | 結果／ログ |
+| --- | --- |
+| Now Playing focused | 50/50、`target/D359-fix-focused.log`。CCITT3の2回帰を含む |
+| native RAW focused | Rustの変更DNG拒否1/1、`target/D359-fix-raw-native.log`。native APIの低予算拒否／通常経路保持1/1、`target/D359-fix-libraw-native.log` |
+| full gate | `test-full.ps1 -SuppressCrashDialogs` PASS／exit 0、`target/D359-fix-full-gate.log`。lib11460成功／52 ignored、LibRaw native4/4、UI snapshot140/140、Remote service137成功／1 ignored、IPC65/65、launcher39/39、viewer-context36/36、vendor egui25/25・egui-wgpu11/11・eframe18/18。集計は `target/D359-fix-full-results.json` |
+| Remote JS | Nodeのsame-process test isolationで518/518、`target/D359-fix-remote-node.log` |
+| normal／portable／viewer audit | 全exit 0、`target/D359-fix-normal-check.log`／`target/D359-fix-portable-check.log`／`target/D359-fix-viewer-audit.log`。command／所要時間は `target/D359-fix-verification.json` |
+| 文書・配布 | converter23/23、生成137ファイル＋入口一致、sitemap343 URL一致。distribution test PASS、raw source manifest449一致、`target/D359-fix-effetune-distribution.log` |
+| fmt／glyph／diff | 全成功、危険glyphゼロ。`target/D359-fix-fmt.log`／`target/D359-fix-glyph.log` |
+| VST3 native | host source／binaryは今回無変更。§8のCMake／CTest3/3を再利用（LibRaw shimはCargoで再buildし、上記native回帰を実行） |
+| 確認build | `build-dev.ps1 -PreserveRuntime` exit 0／DONE、`target/D359-fix-dev-build.log`。core8分46秒、remote／EPUBも成功。CRT4／PE3成功、配置EffeTune448/448原本hash一致。3 exeのhashは `target/D359-fix-artifacts.json` |
+
+Rust検証と確認buildのprocess-local環境は `CARGO_BUILD_JOBS=1`、
+`LIBCLANG_PATH=C:/Program Files (x86)/Microsoft Visual Studio/18/BuildTools/VC/Tools/Llvm/x64/bin`。
+通常configやprofileの設定は変更していない。
+最新版coreは323,378,688 bytes、SHA-256
+`cfcee0abe1cd503492f19dddac4a7664785d9c36735abf4b56bfe7a05863458b`。
+利用者による起動は `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。
+通常 `%APPDATA%\mimageviewer` の実settings／dataを更新し得るため、installed／tray常駐版を先に閉じる。
+今回もエージェントによる起動は行っていない。

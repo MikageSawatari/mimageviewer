@@ -4,6 +4,15 @@
 生成 HTML は編集せず、`scripts/gen-effetune-docs.py` またはこのフォルダーの
 訂正ルールを変更する。
 
+2026-10-10 の v0.13.0 実装レビュー訂正:
+
+- `resonator.json`: Adaptive Prediction は同梱 VST の native 処理を使うため、
+  独立版の WebAssembly 音声設定を有効にする条件を除去する。
+- `analyzer.json`: Rhythm Analyzer の曲変更による自動再解析は独立版プレーヤーの
+  説明と区別し、同梱版では Reset 操作を案内する。
+- `test_bundled_prediction_and_rhythm_exclude_standalone_requirements` は生成結果を検査し、
+  新版の更新時にも独立版の操作条件が再流入しないことを確認する。
+
 ```powershell
 python scripts/gen-effetune-docs.py --version v0.13.0
 python scripts/test_gen_effetune_docs.py
