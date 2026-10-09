@@ -13,6 +13,36 @@ use eframe::egui;
 
 use crate::grid_item::GridItem;
 
+/// Partition a modal input shield around the exact controls drawn in this frame.
+/// No persistent hit-area state; both renderers pass their HUD drawing rectangles.
+pub(crate) fn modal_shield_rects(full: egui::Rect, allowed: &[egui::Rect]) -> Vec<egui::Rect> {
+    let mut parts = vec![full];
+    for hole in allowed {
+        parts = parts
+            .into_iter()
+            .flat_map(|part| {
+                let cut = part.intersect(*hole);
+                if !cut.is_positive() {
+                    return vec![part];
+                }
+                [
+                    egui::Rect::from_min_max(part.min, egui::pos2(part.right(), cut.top())),
+                    egui::Rect::from_min_max(egui::pos2(part.left(), cut.bottom()), part.max),
+                    egui::Rect::from_min_max(egui::pos2(part.left(), cut.top()), cut.left_bottom()),
+                    egui::Rect::from_min_max(
+                        cut.right_top(),
+                        egui::pos2(part.right(), cut.bottom()),
+                    ),
+                ]
+                .into_iter()
+                .filter(egui::Rect::is_positive)
+                .collect()
+            })
+            .collect();
+    }
+    parts
+}
+
 /// The actual drawing destination, never a saved preference or requested placement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ViewerChromeSurface {
