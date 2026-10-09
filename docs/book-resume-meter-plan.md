@@ -3,6 +3,7 @@
 現行の配置方針は、共有設定ONで全セルに固定下端帯を予約し、下端ラベルを一律13 logical pt上へ移す方式 (§5.1 / §14)。代表画像なし・未ロードの検索セルの多行階層パスは上端を元位置に保ち、下端だけ13pt縮めて末端名を優先する。代表画像ありは背景/パスの全体を13pt移動する方式を維持する (§14.4)。帯はセルの左右4pt内側の幅・高さ9 logical ptで、位置記録の有無や媒体種別によって位置・厚さを変えない。通常コピー/移動は既存再生位置と同じく対象外とする利用者決定を維持する。§10〜§13と§14.3の実装・検証記録は各修正時点の履歴として保持し、後続修正の成功証跡には流用しない。
 
 作成・改訂: 2026-10-04。コード調査基準: `next-file-ops` / `e804db069`。
+2026-10-07追記: §1.350のRAR/CBR/7z/CB7/LZH/LHAセル対応は§15。初版の除外契約を§2で更新した。当時の検証・レビュー記録は履歴として保持する。2026-10-08の実機確認後の決定（キャッシュ削除後もバーを保持）は§18。同日の実機確認で見つかった公開済み分割RAR開封経路の不具合（§1.355）は§19。
 状態: **固定下端予約帯への改訂は検証・確認用ビルド済み。後続P2の検索セル名消失も修正済み (§14.4)、修正後gate・独立レビュー・確認用ビルドは完了。利用者の実機確認待ち。§12/§13と§14.3の成功記録は各修正時点の結果。** 保存・watched・常に左→右の仕様は維持する。独立設計レビュー (`gpt-6.1-sol` / `xhigh`) のP2 2件と2026-10-04の設計担当決定を反映済み。後続独立レビューの内容identity復元P2も、既存延期機構がないため利用者指定の割り切りで対応 (§4.2 / §7 / §9)。通常削除の競合も利用者合意済み。commit・アプリ起動は行っていない。
 要件: [next-release-backlog.md §1.256](next-release-backlog.md#1256-一覧の本サムネイルに前回読んだ位置のメーターを表示する--438-2026-09-19)。本書の仕様判断は、2026-10-04の利用者合意によって以前の厳密な内容照合案を置き換える。file:line は調査基準時点のコード事実、追加する型・列・APIは提案である。
 
@@ -88,7 +89,7 @@ raw `page` と復元処理は変更しない。補助値は実際の読書時点
 
 見開きは記録されるanchorで数える。2–3ページでanchor=2なら2/N。最終見開きでもanchor=N−1なら(N−1)/N、anchor=Nなら100%。相手ページを推測して+1しない。添えた表紙・白slot・Splitの左右半面を増分として数えない。1ページ本の有効記録は1/1。
 
-| 一覧セル/閲覧種別 | 初版の扱い |
+| 一覧セル/閲覧種別 | 現行の扱い（§1.350の対象拡張を含む） |
 | --- | --- |
 | 通常一覧のFolder | 対象。本扱いON/OFFを問わない。画像だけでも、動画・子フォルダ・非画像が混ざっていても、記録時HUDの読めるページだけで数える |
 | 製本フォルダのFolder | 同じmap参照で対象。製本の実際の読み順で記録する。追加・並べ替え後も再記録までは保存値を表示 |
@@ -96,9 +97,9 @@ raw `page` と復元処理は変更しない。補助値は実際の読書時点
 | ZIPのroot / 単一wrapper root | 現状記録する範囲を維持。rootにZipDirが混じっていても、記録時に送り得るZipImageだけで数える |
 | 入れ子ZIP内側 | 現状 `record_book_resume` が記録しないため対象外。その閲覧で外側rootの過去記録を消す処理も足さない |
 | Stackセル / Image / ZipImage / PdfPage / ZipDir個別セル | メーターを描かない。flat stack閲覧が従来記録する値はHUDの読み順で補助値も記録でき、後の通常Folderセルに表示される。stack専用keyを新設しない |
-| ConvertibleArchive (直接閲覧RARを含む) | 初版の対象セルに含めない。変換cache ZIPと元書庫のkeyを解く処理も作らない。既存の位置記録・復元は維持 |
+| ConvertibleArchive (直接閲覧RARを含む) | 既存の非同期`converted_archive_cache_paths`を使う。Directは元書庫key、CachedZipは実読込path、論理sourceが確定したUnavailableだけは論理sourceから純粋計算した決定的な変換ZIP keyで同じmapを参照。キャッシュ削除後もバーを表示する。Pending / 未登録 / 論理source未確定では描かない。分割RARはheader確認済み後続volumeのバーを隠す。開封可能な先頭巻／単巻だけ表示し、ファイル名による巻種別推測や描画中I/Oはしない。保存・復元keyは維持（§18） |
 | PdfFile扱いのEPUB | resume保存keyと当該cell pathが一致して行があれば同じmap参照で表示。変換generation/内容を解き直さず、異なるkeyを推測で結ばない |
-| 詳細行・seek strip・Remote Web一覧・合成ビュー専用表示 | メーター描画は対象外。通常物理一覧のFolder/ZipFile/PdfFileセルに限定。Tag/Smart/Collection等から入った物理子フォルダも入口を問わず対象、合成rootはメーター非対象 (既存surface/positionとinstalled itemflagsを参照)。PCのgridセルの帯予約と下端caption移動は§5.1の全セル規則に従う |
+| 詳細行・seek strip・Remote Web一覧・合成ビュー専用表示 | メーター描画は対象外。通常物理一覧のFolder/ZipFile/PdfFile/ConvertibleArchiveセルに限定。Tag/Smart/Collection等から入った物理子フォルダも入口を問わず対象、合成rootはメーター非対象 (既存surface/positionとinstalled itemflagsを参照)。PCのgridセルの帯予約と下端caption移動は§5.1の全セル規則に従う |
 
 行無し、追加列が1つでもNULL、total==0、不正値 (ordinal<=0 / ordinal>total) ではtrackも含め描かない。0%への代用やclampはしない。既に保存された有効値は、内容の変更・外部削除・password状態・認識規則変更等と再照合しない。通常の一覧更新によりcellが消えると描画も消えるだけで、本ごとの監視は不要。
 
@@ -714,3 +715,388 @@ captionの13pt移動後を計測すると、高さ94ptのSearchContainerの深�
 今回の証跡は `target/meter-path-label-*.log`。coreは `target/dev-runtime/mimageviewer-core.exe` に配置済み（2026-10-06 10:35:53）。最初の検証で代表画像ありの文字サイズ変更を既存テストが検出したため、根因のないloaded経路を元の配置へ戻し、再検証した。最終ソースで上表の成功結果を確認した。HEADは `570587339` / `next-file-ops`、commit・製品バイナリ起動なし。今回追加の変更は `src/app/grid_paint.rs`、本計画・display-pipeline・specとreserved 4PNG。前段の未コミット差分は保持した。
 
 利用者の実機確認では180×94pt程度の検索セルをLight/Darkと100/150/200% DPIで並べ、代表画像なし/読込前でも末端名が残ること、記録あり/なしで帯・アイコン・文字の位置が一致すること、設定OFFで元の配置になることを確認する。確認用coreは通常の `%APPDATA%\mimageviewer` を使い実データを更新し得るため、インストール済み/トレイ常駐のmIVを閉じてから利用者が起動する。
+
+## 15. §1.350 変換対象書庫の一覧セル（2026-10-07、ラインA）
+
+以下は当時の仕様・検証記録。キャッシュ削除後のメーター非表示は§18、後続RARセルの表示・開封は§19の利用者決定が優先する。サムネイル／pinの共有source失効は維持する。
+
+利用者とmIVスレ>>529の報告では、v4.4.0のRARサムネイルにバーが出ない。
+コード上の根因は`thumbnail_book_resume_meter`の対象kindから`ConvertibleArchive`を除いていたこと。
+保存失敗の観測とは扱わない。初版の対象外という§2と既存テストの仕様を今回拡張する。
+
+セルの元pathを`path_key::normalize_keep_drive`で既存`converted_archive_cache_paths`へ照合し、
+`ConvertedArchiveSourceState::load_path`が返す実読込元を既存`BookResumeMeters::get`へ渡す。
+Directは解決済みの元RAR/CBR（分割RARなら先頭part）、CachedZipは変換結果のZIP。
+二つのDB保存keyを統合・移行せず、未登録 / Pending / Unavailable / 解決先の行無しは非表示。
+元書庫の行へのfallback、セル描画中のstat・書庫検査・DB照会、保存/復元方式の変更はない。
+
+前提のコード照合: `resolve_converted_archive_candidate_with`は分割先頭partを解決して
+cache DBのstamp/実体照合をworkerで行い、直読みなら解決済みRAR pathを返す。
+`poll_converted_archive_cache_paths`は既存世代/cancel検査でmapを採用し、変更時にrepaintする。
+`initialize_converted_archive_cache_paths`は一覧再読込時にmapを初期化する。
+この既存鮮度契約を使い、本件専用worker・監視・pending・第二のalias mapを作らない。
+メーターの配置・共有ON/OFF・合成root/詳細/Remote非対象も維持する。
+
+簡素化: 解決済みread sourceと既存全行mapを接続するだけにし、
+保存key移行や元書庫/変換結果の二重記録による状態の組み合わせを増やさない。
+既存barの純粋描画とsnapshotをそのまま使うので、期待PNGの更新は不要。
+
+回帰は既存tile-kindテストのConvertibleArchive非表示期待を解決済みDirectの表示へ更新し、
+元pathとcache pathへ異なる値を記録した6拡張子、未解決/失効状態、一覧再初期化、設定OFF、
+解決先の行無し、分割RARのDirect/CachedZipを追加した。fake pathへのmap参照で検査し、
+実RAR展開/外部変換の実行結果とは区別する。
+修正前コードで関連41件は38成功・3失敗、実exit101（`target/A-1350-red.log`）。
+初回の依存build失敗と追加testのborrow errorはvalid redに含めない。
+修正後の結果は下表。検証担当はラインAの実装担当、HEADは
+`d29bcfbec9e1bb0213ae1c4de37e5fa149fec18e` / `next-nav`に本節の未コミット差分を加えた状態。
+依存buildは`CARGO_BUILD_JOBS=1`、testは`RUST_TEST_THREADS=4`。
+独立レビュー・実機確認はcoordinatorへ引き継ぎ、本節の結果で代替しない。
+
+| 検証 | 結果 / 証跡 |
+| --- | --- |
+| `cargo test -p mimageviewer --lib book_resume_meter_` | exit 0、41 passed / 0 failed、4.14s。`target/A-1350-green.log` |
+| `cargo test -p mimageviewer --lib`（pipeなし） | exit 0、10,938 passed / 52 ignored / 0 failed、1046.83s。`target/A-1350-full-lib.log` |
+| `cargo fmt` / `cargo fmt --check` | exit 0 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0、15m20s。`target/A-1350-check-normal.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core --features portable` | exit 0、1m02s。`target/A-1350-check-portable.log` |
+| `python scripts/check_ui_glyphs.py` | exit 0、dangerous glyphsなし |
+| `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | exit 0、normal feature set。core 33m24s / Remote 3m07s / EPUB worker 2m15s、runtime=4 / PE=3検査成功。`target/A-1350-build-dev.log` |
+| 独立レビュー / 利用者の実機確認 | 未実施 |
+
+確認用coreは`target/dev-runtime/mimageviewer-core.exe`（2026-10-07 22:48:22）へ配置済み。
+通常の`%APPDATA%\mimageviewer`を使い、実設定/データを更新し得る。
+共有mutexのためインストール済み/トレイ常駐のmIVを閉じ、利用者が
+`Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`で起動する。
+
+利用者の実機確認候補: 直読みRAR/CBRと変換済みRAR/CBR/7z/CB7/LZH/LHAを途中まで読み、
+親一覧のバーが記録位置を示すこと、分割RARの後続partが同じ本の位置を示すこと、
+未変換/変換結果失効でバーを作らないこと、一覧再読込・設定ON/OFF、既存ZIP/PDF/フォルダの対照。
+実アプリはこの実装担当が起動しない。
+
+## 16. §1.350 独立レビューr3 — cache削除完了の失効（2026-10-08）
+
+以下は当時の仕様・検証記録。キャッシュ削除後のメーター非表示は§18、後続RARセルの表示・開封は§19の利用者決定が優先する。サムネイル／pinの共有source失効は維持する。
+
+利用者提示の独立レビューP2をコードで照合し、採用した。反対意見はない。
+`poll_archive_cache_maint_pending`はDeletedSelected / DeletedMissing / DeletedAllで管理画面の
+行を再読込するだけだった。一方、read source workerはPendingだけを再投入するため、
+削除済みZIPをCachedZipとして保持していた。描画でexists/DBを追加する修正は採らない。
+
+完了pollから既存read source ownerの`invalidate_converted_archive_cached_sources`へ接続する。
+削除前のbatchはcancel/receiver破棄し、CachedZipだけをPendingへ戻す。
+既存rangeとprefetch admissionで再判定し、cacheが消えていればUnavailableへ移る。
+削除結果は件数のみなので全CachedZipを再検証する。新しい削除key記憶やalias/pending fieldを
+増やすよりこの既存ownerの鮮度境界を使う。Direct / Unavailable / pin rootの来歴、
+BookResumeMeters、DB保存・復元key、既に表示したtextureは変更しない。Rows/Errorは失効しない。
+
+追加回帰は実ArchiveCacheDbへcacheを記録し、実spawn_archive削除worker→完了pollを通す。
+選択 / 元ファイル消失 / 全削除の全経路でバーが消え、非同期再判定でUnavailableになること、
+削除前のqueued replyを採用しないこと、Directと保存recordが残ることを検査する。
+管理画面Rows/Errorは失効させない対照も追加した。
+修正前の実選択削除経路は1件失敗・exit101（`target/A-r3-red.log`）。
+修正後gateは下表。HEAD `c0ce50272fcfea5e9aa406ef59899479bd45756f`へ今回の未コミット差分を
+加えた状態で実装担当が実行し、CARGO_BUILD_JOBS=1 / RUST_TEST_THREADS=4を使用した。
+独立再レビュー・製品の実機確認は未実施。
+
+| 検証 | 結果 / 証跡 |
+| --- | --- |
+| `cargo test -p mimageviewer --lib book_resume_meter_` | exit 0、43 passed / 0 failed、6.03s。`target/A-r3-meter.log` |
+| `cargo test -p mimageviewer --lib archive_pin_root` | exit 0、8 passed / 0 failed、1.30s。`target/A-r3-pin.log` |
+| `cargo test -p mimageviewer --lib incremental_archive_result` | exit 0、2 passed / 0 failed、0.43s。`target/A-r3-batch.log` |
+| `cargo fmt` / `cargo fmt --check` | exit 0 |
+| 通常core check / portable core check | 両方exit 0、18.79s / 19.30s。`target/A-r3-check-normal.log` / `target/A-r3-check-portable.log` |
+
+利用者指示に従い、今回はfocused test・fmt・通常/portable core checkだけを実行する。
+全lib・glyph・build-devは再実行せず、製品バイナリを起動しない。
+§15の2026-10-07確認用バイナリには、このr3失効修正は含まれない。
+
+## 17. r4 — 退避した解決元ownerへのキャッシュ失効（2026-10-08）
+
+以下は当時の仕様・検証記録。キャッシュ削除後のメーター非表示は§18、後続RARセルの表示・開封は§19の利用者決定が優先する。サムネイル／pinの共有source失効は維持する。
+
+指摘の根因は一致した。r3はmounted mapのみ失効させ、SmartFolderPreparedGridの親mapや
+parked ViewerContextBundleを残したため、親→子→cache削除→BSで古いCachedZipが戻る。
+ただし「Smart合成rootに古いバーが復活する」という表現には反対する。
+thumbnail_book_resume_meterはSmartFolderPosition::Rootを対象外としており、この仕様は維持する。
+退避mapはサムネイルの解決元としても使うため、失効漏れ自体は実在し、修正対象である。
+
+削除完了から一つのsource-owner失効helperへ渡し、mountedと全AtRest/Retiring bundleの
+map/解決batch/Smart session親payloadを同型で失効させる。Visible親のmapとOffscreen親の
+prepared aggregateのCachedZipだけをPendingにする。contextをmountしない。
+Direct/Unavailable、pin来歴、BookResumeMeters、保存/復元key、items/画像/viewportを維持する。
+共有sort用ReusedSmartFolderMetadataや進行中prepare結果のmapも、prepared aggregateの
+採用境界でCachedZipをPendingへ戻して既存の非同期解決workerへ接続する。
+prepare結果を終端解決の正本としないため、cache削除より前に作られた結果を後から採用しても
+削除済みZIPを再公開しない。paintのI/O、専用worker/pending/epochは追加しない。
+
+| 退避・復元経路の照合 | 対応 |
+| --- | --- |
+| Smart親→子→BS、履歴←/→のresident親復帰 | Smart sessionのVisible/Offscreen payloadへ削除時に失効。共通restoreでそのmapを戻す |
+| Smartのsort-only再prepare・no-resident履歴準備、進行中prepare・評価条件による行追加 | aggregate採用/merge時にCachedZip再判定。共有metadataをclone/resetせず再利用 |
+| 通常folder/Rating/Collectionの履歴←/→、A/Bの地点復帰 | FolderNavHistoryTarget/QuickFolderWorkspaceは地点と履歴だけでmapを保持しない。既存load/initializeでPendingから再解決 |
+| detachedのpark/mount/fork/drop | source mapとbatchをbundleが所有。AtRest/Retiringにも変異時だけ失効を渡す。forkの空初期化、swap/dropは変更しない |
+| Rows/Error・read-only親復帰/履歴/context切替 | 共有ストアへの変異通知を出さず、Directや別contextの読書表示をresetしない |
+
+簡素化: 退避root全体のreloadやmetadata再読込、contextごとの別epochを検討した。
+前者は大規模Smartの移動済みgrid・選択/scroll再利用を失い、後者は新しい状態組み合わせが増える。
+既存payload所有者への同じ失効と、既存aggregate採用/非同期解決へ集約する案を採用した。
+初回/再prepareのCachedZipも既存range workerで確認する。UIでDB/ファイルを調べない。
+detached述語/viewport/窓の切替処理は変更しない。共有ストア変異のbundle所有境界だけを扱う。
+
+回帰は実Smart scan/prepare→実child採用→実cache削除worker/完了poll→BSのparent handler→
+移動した親grid復元→実解決workerの経路で、CachedZip復活を検査する（初期化の直接呼出しなし）。
+合成rootのバーは非表示のまま、sourceがPending→Unavailableになることを検査する。
+さらに実sort-only prepare/adoptionで削除前の共有metadataを再利用してもCachedZipが復活しないことを検査する。
+もう一件は実削除完了からparked source batchのcancel/旧reply破棄、Direct維持、
+mounted context/generationとparked pan不変を確認する。
+有効red: 修正前の実往復でCachedZipが復元され、Pending期待と不一致。0 passed / 1 failed、
+実exit 101、0.32s（target/A-r4-red.log）。初回fixtureのrootバー表示期待で止まった実行は
+仕様照合の誤りであり、有効redには数えない。
+
+最終差分の検証（HEAD d098693403fdacf85b8c68093b5876ab40a1645c＋未コミットr4差分、
+CARGO_BUILD_JOBS=1 / RUST_TEST_THREADS=4）。各filterは重複を含むため合算件数とは扱わない。
+独立再レビューと実機確認は未実施。
+
+| 検証 | 結果 / 証跡 |
+| --- | --- |
+| `cargo test -p mimageviewer --lib book_resume_meter_` | exit 0、45 passed / 0 failed、5.30s。target/A-r4-meter.log |
+| `cargo test -p mimageviewer --lib smart_folder_transition_tests` | exit 0、103 passed / 0 failed、36.49s。target/A-r4-smart.log |
+| `cargo test -p mimageviewer --lib rating_smart_` | exit 0、10 passed / 0 failed、2.19s。target/A-r4-rating-smart.log |
+| `cargo test -p mimageviewer --lib archive_pin_root` | exit 0、8 passed / 0 failed、1.69s。target/A-r4-pin.log |
+| `cargo test -p mimageviewer --lib incremental_archive_result` | exit 0、2 passed / 0 failed、0.34s。target/A-r4-batch.log |
+| `cargo fmt` / `cargo fmt --check` | exit 0 |
+| 通常core check / portable core check | 両方exit 0、14.39s / 14.06s。target/A-r4-check-normal.log / target/A-r4-check-portable.log |
+
+利用者の指定範囲に従い、全lib/full gate・glyph・確認用buildは再実行しない。
+製品バイナリを起動せず、Git commitは作らない。英語messageはtarget/A-r4-msg.txt。
+§15の確認用バイナリにはr3/r4の失効修正が含まれない。
+coordinatorはsource-ownerの退避/採用境界とPageIdentity契約を独立再レビューへ渡し、
+[残る利用者質問](file-type-visibility-plan.md#82-残る利用者質問未回答具体例と推奨)への判断を集める。
+
+## 18. キャッシュ削除後のバー保持（利用者決定 2026-10-08）
+
+以下は2026-10-08時点の仕様と検証記録。後続RARセルの表示・開封は2026-10-09の§19が優先する。
+
+実機確認を受け、solid RAR / 7z / LZH等の変換書庫は、変換キャッシュを削除しても保存済みの読書位置バーを表示する。同じdata-dirでは次回openで再変換し、同じkeyから再開する。Direct RARは従来どおり元書庫のkeyを使う。表示設定OFFでも記録を維持する。
+
+### 保存データ・source owner
+
+`record_book_resume`は変換後の`current_folder`（キャッシュZIP）へ保存する。`cache_zip_path_for_data_dir`は論理sourceの正規化pathからhashとbasenameを計算するだけで、mtime / sizeを含めない。同じdata-dir・sourceでは削除後の再変換もsource変更後も同じkeyになる。元書庫とZIPのkeyを移行・統合しない。
+
+調査では、管理画面の単体・元ファイル消失・全削除、stamp不一致の掃除、容量上限のLRU整理は`converted_archives`とZIPだけを削除し、`book_resume`行を削除しない。metadata孤立掃除もDriveStrippedのbook_resumeを対象外としている。キャッシュ削除を読書位置クリアへ接続しない。利用者による明示的な位置クリア／実ファイル削除の既存規則は変更しない。
+
+既存の`ConvertedArchiveSourceState`だけを拡張する。CachedZipは論理sourceと実読込pathを保持し、Unavailableはworkerが確認した論理sourceを保持する。metadata欠落・worker起動失敗・RARのheader確認失敗では論理source未確定（None）を明示し、推測しない。RARのheader probeで先頭volumeが確定した後、詳細inspectionが失敗してもその確定結果は残す。Smartのprepared sourceにも同じ来歴を運ぶ。
+
+### 表示と共有失効
+
+ConvertibleArchiveのバーはDirectならそのpath、CachedZipなら保持された実読込path（open／保存／復元と同じkey）、source確定済みUnavailableだけは現在のdata-dirと論理sourceから計算した変換ZIP pathで既存BookResumeMetersを引く。キャッシュ存在確認・stat・書庫検査・DB照会はセル描画へ追加しない。行無しやPendingは非表示。削除後の再判定中に一時的にバーが消えることは利用者が許容した。
+
+状態削減として、別のmeter専用source mapやalias、cache削除履歴は作らない。キャッシュが存在しなければ表示しないという条件だけを外し、有効なCachedZipの実読込pathは維持する。管理画面完了poll→既存source owner失効、Smart親一覧のstash／再利用prepared payload、parked contextへの伝播、旧worker replyの取消はすべて維持する。これらはサムネイル・pinが削除済みZIPを使わないためにも必要で、メーター専用の失効経路は存在しなかった。Directやtexture、BookResumeMeters自体の失効は追加しない。
+
+### data-dir移動時の有効cache（調整判断 2026-10-08）
+
+profileをコピーして旧profileを残すと、cache DBのpeek／lookupは旧cacheの有効な絶対pathを返す。CachedZipではそのpathが採用・保存・復元keyであり、メーターも同じpathを使う。現在のdata-dirから再計算して別keyへ置き換えない。
+
+移動後に旧cacheを削除すると、非同期再判定でUnavailableへ移り、現在の新data-dirから計算したpathを使う。旧keyの読書位置行は削除しないが新keyには対応付けないため、このまれなケースではバーが消え、再変換時も旧keyの位置は復元されない。状態削減としてalias／key移行／削除履歴は追加しない。同じdata-dir内の削除・再変換は従来の保持契約を維持する。
+
+回帰は旧App／DBを閉じてarchive_cache.db・book_resume.dbを新profileへコピーし、旧ZIPを保持する。実peek／lookup・source解決・ZIP採用・位置保存／復元が旧pathを共用することと、旧cache削除後も旧保存行は残るが新keyにバーがないことを確認する。
+
+### 回帰確認
+
+実削除worker→完了poll→非同期source再判定で、単体／消失／全削除後も保存行とバーが残ることを確認する。header-confirmedの後続RARから先頭volumeのkeyへ解決するケース、Directとのkey分離、Pending／未登録／未知source／設定OFFの非表示も対象。実7z変換→位置記録→削除→再変換→ZIP採用／位置復元、およびsource stamp変更でcacheが失効しても同じkey／保存位置が残ることを確認する。共有sourceのSmart parent→child→削除→BS、parked context、pinの回帰も維持する。
+
+### 実装担当の検証（2026-10-08）
+
+| 検証 | 結果 / 証跡 |
+| --- | --- |
+| 修正前の実cache削除回帰 | exit 101、1 failed。削除完了・worker再判定後にNoneとなり、期待した3/5が消える。`target/A-1350-keep-red.log` |
+| `cargo fmt` / `cargo fmt --check` | exit 0 / 0。変更ファイルは既存どおりUTF-8・CRLF、`git diff --numstat` / `--check`も確認 |
+| `--lib book_resume_meter` | exit 0、47 passed。`target/A-1350-keep-focused-green.log` |
+| `--lib archive_decision_scope` / `archive_rollup_edit_filter` / `archive_pin_root` | 各exit 0、4 / 1 / 8 passed。`target/A-1350-keep-<filter>.log` |
+| `--lib convertible_archive` / `converted_rar` / `stale_incremental_archive_result_is_rejected_per_message` | 各exit 0、32 / 1 / 1 passed。`target/A-1350-keep-convertible_archive.log` / `converted_rar.log` / `stale.log`（後2件も同じA-1350-keep-接頭辞） |
+| `cargo test -p mimageviewer --lib` | exit 0、10998 passed / 52 ignored / 0 failed、1255.97s。`target/A-1350-keep-lib-final.log` |
+| 通常 / portable core check | 各exit 0。`target/A-1350-keep-check.log` / `target/A-1350-keep-portable.log` |
+| `python scripts/check_ui_glyphs.py` | exit 0、dangerous glyph 0 |
+
+対象filterは重複なし計94件。初回full libは今回更新した旧reply fixtureが空の現itemsを参照する誤りを検出し、途中中断した。replyが所有するsourceを渡すようテストを訂正し、その対象1件と上記full libを完走した。初回の未完了runは成功証跡に数えない。
+
+分割RAR回帰は実volume fixtureの局所コピーでRAR5 main headerのsolid宣言とCRCを変更し、native DLLでSolid判定・先頭volume解決・実変換を検証した。外部packerやfilename推測は使っていない。7z回帰は実writer・converter・ZIP採用・resume取得を通る。描画layoutは変更せず、既存lib内のメーターsnapshotも上記filterとfull libで成功した。
+
+利用者の指示どおりbuild-dev・製品起動・commitは行っていない。現在利用者が試しているbinaryは再作成していない。ClaudeCodeによる再ビルド後、solid RAR / 7z / LZHを途中まで読み、変換cacheを削除→一覧でバー保持（再判定中だけ一時非表示）→再openで再変換・前回位置へ復帰、後続RAR volume、設定OFFを実機確認する。コミットメッセージは`target/A-1350-keep-msg.txt`。
+
+### data-dir移動回帰の修正・検証（2026-10-08、46e120c6b後）
+
+CachedZipのメーターkeyを実読込pathへ揃えた。追加のコピー回帰は修正前に2/3のバーがNoneとなって失敗（exit 101、0 passed / 1 failed）し、修正後に成功した。旧Appを閉じた後の実DBコピー、peek／lookup、非同期source解決、ZIP採用、位置保存／復元、実削除完了経路を通す。初回実装の削除・再変換・source変更・後続RAR volume等の回帰も維持した。
+
+| 検証 | 結果 / 証跡 |
+| --- | --- |
+| 有効red | exit 101、1 failed。`target/A-1350-keep-fix-red.log` |
+| `cargo fmt` / `cargo fmt --check` | 各exit 0。変更ファイルのUTF-8・CRLF維持、numstat／diff check確認 |
+| `cargo test -p mimageviewer --lib book_resume_meter` | exit 0、48 passed / 0 failed。`target/A-1350-keep-fix-focused.log` |
+| `cargo test -p mimageviewer --lib` | exit 0、10999 passed / 52 ignored / 0 failed、1222.74s。`target/A-1350-keep-fix-lib.log` |
+| 通常 / portable core check | 各exit 0。`target/A-1350-keep-fix-check.log` / `target/A-1350-keep-fix-portable.log` |
+| `python scripts/check_ui_glyphs.py` | exit 0、dangerous glyph 0 |
+
+
+今回は利用者の新しい指示に従い`.\scripts\build-dev.ps1 -PreserveRuntime`を実行し、exit 0でcore／Remote／EPUB workerを作成した（通常feature、core 2m46s、PE検査runtime=4 / pe=3成功）。証跡は`target/A-1350-keep-fix-build-dev.log`。上記初回実装時のビルド禁止記録は当時の指示として残す。製品起動・コミットは行っていない。英語コミットメッセージは`target/A-1350-keep-fix-msg.txt`。
+
+実機確認は旧profileを残したコピー先を`--data-dir`で開き、変換書庫のバー表示と前回位置への復帰、位置更新後も同じバーを確認する。旧cacheを後で削除するまれなケースの制約は上記の仕様どおりで、保存行の破棄やkey対応付けは追加していない。
+
+## 19. §1.355 分割RARは最初のファイルから開く（2026-10-09、利用者決定）
+
+### 原因と決定
+
+§1.350の実機確認で、後続巻が有効な先頭巻cacheを見落として再変換し、readerが使用中の
+ZIPへのpublishがアクセス拒否になる公開済み不具合を確認した。879802c44は後続巻を先頭巻へ
+解決してcacheを再利用したが、ヘッダー暗号化RARではvolume情報をpassword前に読めない。
+実RAR5 fixtureで後続巻のpassword後scanが画像0件、直接変換がCRCエラーになることも確認した。
+
+**2026-10-09利用者決定は以前のidentity／互換参照案を置き換える。後続巻の開封はサポートしない。**
+workerの入口で、secretなしのnative volume headerがクリック巻をSubsequentと示した場合、
+画像scan・Direct採用・cache照会・変換に進まず、以下の通知で終了する。
+
+> 分割RARの2つ目以降のファイルです。最初のファイル（分割RAR本.part1.rar）を開いてください。
+
+括弧内はheader確認後のresolutionが返した最初のファイル名を表示する。
+既存unrarの名前解決を大文字.RARと.cbr／.CBRにも対応させ、拡張子の表記を保つ。
+案内先は確認済みSubsequentから解決し、名前を巻種別の根拠にはしない。
+サムネイル用の既存先頭巻source解決も同じresolverを使う。
+名前のsuffixだけで後続巻と判断しない。既存の単巻`*.part2.rar`等もheaderが単巻なら開ける。
+ヘッダー暗号化等でvolume番号を確認できない場合は、ファイル名から先頭巻を推測しない。
+既存password flowを通し、password後のscanで画像も変換対象の入れ子も無ければ、次を通知・logする。
+
+> 画像が見つかりません。分割RARの場合は最初のファイルを開いてください。
+
+画像が直下に無くても入れ子の展開対象がある本は、既存の変換確認を維持する。
+暗号化part1のpassword入力・変換、part1／単巻のDirect → 有効cache → 変換は維持する。
+CachedZipはDBが保持する実ZIP pathを使い、data-dir移動前から残る有効cacheを読み替えない。
+header暗号化で番号未確認のまま既存cacheがhitした場合は、従来どおりpassword scanを経ずに採用する。
+その場合は後続巻かを判別できない。今回のheader拒否・password後0画像hintは各判定が得られた場合に適用し、
+cache hitへ新たなpassword検証やfilename判定は追加しない。
+
+### 所有境界・終了と状態削減
+
+RAR scan workerの単一決定点で拒否し、既存typed scan outcomeのRejectedをUIの既存Error phaseへ
+渡す。新しいpending／rollback／retry／移行状態は作らない。モーダルscan／password／変換、
+取消token、owner証明、古いreply破棄、Errorの閉じる処理・historyの成功時採用境界を維持する。
+拒否前後のcancel確認も既存worker境界に置く。UIスレッドのheader／DB照会は追加しない。
+通常physical historyのpreflightはRARをtyped RarOpenとして渡し、先行content scanを行わない。
+Collectionの順次候補選択もheaderで後続巻と分かればRarOpenで共通workerへ渡す。
+先頭巻・単巻の空候補を飛ばす既存Collection policyは維持し、拒否の決定・通知は共通workerが所有する。
+
+879802c44の開封用「後続巻→先頭巻へsourceを変更してDirect／cache／変換」経路と、password後の
+開封source再解決を撤去する。公開済み後続巻cacheの互換peek・DB探索・aliasは追加しない。
+passwordは既存scan／展開に渡す。converter内部の読込・明示batch変換は今回の開封決定とは別で、
+そのreaderを改修して暗号化後続巻を読めるようにする範囲へは広げない。
+
+### 保存データ・サムネイル・読書位置バー
+
+v4.4.0が後続巻cache keyへ記録した位置・ページ編集は、後続巻の開封拒否により参照できなくなる
+場合がある。利用者はこのまれな制約を受容した。既存ZIP・DB行・位置・編集は削除せず、移行しない。
+
+一覧サムネイルの後続巻→先頭巻解決と共有source mapは公開済み動作として維持する。
+thumbnail／pinのload、cache削除時の失効、Smart stash／parked contextの通知を変更しない。
+メーターだけ、非同期source ownerが保持するRarVolumeProof::Subsequent { first }で後続巻セルを非表示にする。
+巻種別をパス差で代用しない。Firstは単巻を含み、ヘッダー暗号化はUnknownEncryptedとする。
+thumbnail用Direct／CachedZip／Unavailableと証明を同じtyped source stateで保持し、stash／parkedも同じ所有境界で運ぶ。
+新しいeligibility bool、別map／pending／epoch、描画中I/O、ファイル名による巻種別推測は足さない。
+固定snapshotの有効cacheも、元RAR sourceとcached ZIP backingを既存のMainGridArchive intent／
+ArchivePreflightingに渡す。現在のitemsに元RAR行が無い本内部からの移動にも同じ契約を使う。
+既存snapshot generation + key/kind/targetを共通要求のSnapshot証明に保持し、分類から成功採用まで検証する。
+元表示の画像metadata世代には依存しない。fullscreen／slideshowの再開は既存の0-step reading continuationを使い、
+一時的なinternal-nav flag延長、別pending owner、変換へのfallbackを追加しない。
+part1／単巻はDirect／実CachedZip／cacheなしの決定的keyを使い、削除後のバー・再変換時の復元を維持する。
+Pending・source未確定・設定OFFは従来どおり非表示。
+
+### 入口と採用前の共通証明
+
+| 入口 | 接続／契約 | 回帰対象 |
+| --- | --- | --- |
+| 通常open／アドレス指定 | classified open → request_rar_open_owned → 共通scan | 実handlerで後続巻を拒否、先頭巻cache再利用 |
+| 履歴の戻る／進む・BS | typed history → staged archive conversion → 共通scan | 旧後続巻targetを拒否し、成功採用しない |
+| Smartの子open | smart archive conversion → 共通scan | 行・帰路を保ったまま拒否、先頭巻採用を維持 |
+| Rating／Collection | owner付きMainGridArchive → 共通scan | 各実handlerで拒否、先頭巻のcache採用 |
+| 通常ブックマーク／閲覧履歴／起動復元 | owner付きclassified open → 共通scan | 旧後続巻entryも同じ通知 |
+| 別ウィンドウの通常RAR open | DetachedGridArchive owner → 共通scan | 拒否時にcontextを採用しない |
+| scanのpassword再入力 | apply_archive_password → 同じscan purpose | 暗号化後続巻の0画像hint、暗号化part1の変換成功 |
+| 共通閲覧変換要求／通常Ctrl+↑↓ | owner付きOpen scan purpose | 同じ決定を共有。DFSの後続巻skipも維持 |
+| 別ウィンドウの本ブックマークcache hit | startup path resolve workerの巻種別証明 → descriptor | 有効な旧後続巻cacheでも採用前に拒否。missは通常openへ戻る |
+| ★固定範囲のentry／grid移動 | 既存OpenPathClassificationで証明取得 → Snapshot row証明 → cache-only照会 → 既存ArchivePreflightingで採用 | 有効な旧後続巻cacheでも拒否。hitだけ採用、missで変換dialogを出さない契約は維持 |
+| 別ウィンドウDFS | workerで共通証明確認 → 既存Direct／cache-only policy | 大文字RAR／CBRを含め後続巻をheaderでskip。名前による前段の絞り込みを撤去 |
+| Remote archive job | 共通header証明 → fingerprint／cache／Direct／変換 | 旧後続巻cacheでも拒否。閲覧sourceの先頭巻への書換えを撤去 |
+| 明示sibling ZIP作成 | 同じRAR scan worker | headerで後続巻と分かればscan／変換前に拒否 |
+| 明示batch ZIP作成 | converterへ直接 | 閲覧openではなく、今回のscan入口変更対象外 |
+
+### 保存失敗の診断は維持
+
+§1.355で追加した既存loggerへの操作・src／tmp／dst・元OSエラー・native codeの記録を維持する。
+Windows wrapperは捕捉済みHRESULTからWin32 codeを保持し、後からGetLastErrorを再読しない。
+通知「変換したZIPを保存できませんでした。保存先が使用中か、読み取り専用か、書き込みが許可されていません。」、
+既存保存先の保持、中間ZIP掃除、no-clobberの専用通知も維持する。reader待ち・publish再試行を追加しない。
+
+### 検証
+
+実分割RARで通常／履歴／Smart／Rating／Collection／ブックマーク／起動／別ウィンドウの入口、
+password retry、後続巻拒否前にDirect・cache・convertを採用しないことを確認する。
+実RAR5暗号化fixtureで0画像hintとpart1変換を検証する。実一覧workerのDirect／CachedZip／
+cache削除後Unavailableで後続巻のバーを隠し、thumbnail読込元・保存行を維持する。
+part1／単巻のDirect優先、実cache path、cache削除・再変換・位置復元・設定OFFを再検証する。
+新しい通知は100%／200%のsnapshotで折返しと閉じる操作を確認する。
+以前のidentity検討の準備assert失敗や旧仕様のgateは、新仕様の成功証跡に流用しない。
+
+### 実装と検証（2026-10-09、ラインA）
+
+後続巻拒否の実Normal handler回帰は修正前にfirst cacheを採用して失敗（exit 101、0 passed / 1 failed、
+`target/A-1355-spec-red.log`）。新仕様へ修正後、同じhandlerを含むRAR回帰25件が成功した。
+旧仕様の後続巻バー期待が残った初回対象実行（24 passed / 1 failed）は、先頭巻の削除・再変換・復元を
+検証する形へ訂正して再実行した。fixture準備の失敗は有効redに数えない。
+
+| 検証 | 結果 / 証跡 |
+| --- | --- |
+| RAR handler／native worker／password／保存行 | exit 0、25 passed。`target/A-1355-spec-focused-rar.log` |
+| 読書位置meter・source owner・削除／再変換 | exit 0、49 passed。`target/A-1355-spec-focused-meter.log` |
+| dialog採用・hydration | exit 0、8 passed。`target/A-1355-spec-focused-dialog.log` |
+| preflight | exit 0、34 passed。`target/A-1355-spec-focused-preflight.log` |
+| 全lib（pipeなし、実exit確認） | exit 0、11,026 passed / 0 failed / 52 ignored、1185.75s。`target/A-1355-spec-full-lib.log` |
+| UI snapshot全体 | exit 0、103 passed。`target/A-1355-spec-ui-snapshot.log`。新通知4PNGを目視確認 |
+| 通常／portable core check | 両方exit 0。`target/A-1355-spec-check-normal.log`／`target/A-1355-spec-check-portable.log` |
+| cargo fmt／fmt --check、glyph lint、diff --check | すべてexit 0、UI危険glyphなし。`target/A-1355-spec-fmt.log`／`target/A-1355-spec-glyph.log` |
+| build-dev -PreserveRuntime | exit 0、core 9m31s、Remote／EPUB worker配置、VCRT PE check runtime=4 / pe=3成功。`target/A-1355-spec-build-dev.log` |
+
+後続巻の8入口に加え、Direct可能な後続巻、明示sibling、実暗号化password retryを検証した。
+単巻をpart2風の名前に変えても開けること、後続巻の旧cache・読書位置・ページ回転が残ることも確認した。
+暗号化fixtureは公開passwordと人工PNGのみを含み、testsは一時ディレクトリへコピーする。
+新fixtureの`testdata/archives/rar-header-encrypted-multipart-legacy-cache`は既存ignore対象のため、
+coordinatorがcommitする際は2巻とREADMEを明示的にforce-addする。実行にWinRARは不要。
+
+確認用binaryは`target/dev-runtime/mimageviewer-core.exe`。製品起動・commitは行っていない。
+英語messageは`target/A-1355-spec-msg.txt`。独立再レビューと利用者の実機確認は未実施。
+利用者はインストール済み／トレイ常駐mIVを閉じ、通常profileの確認用coreで、後続巻の最初のファイル案内、
+暗号化巻のpassword後0画像hint、先頭巻のcache再利用・削除後バー保持・再変換／復元を確認する。
+
+
+### 追加レビュー修正と検証（2026-10-09、ラインA）
+
+上の表は8b327fa02時点の記録。今回の修正ではRarVolumeProofを全閲覧入口へ運び、旧後続巻cacheが
+有効でも別窓ブックマーク、snapshot entry/grid、Remote、DFSで採用しないことを実経路で確認した。
+大文字RAR／CBRはnative headerで後続巻を判定し、その後にだけ先頭名を解決する。
+単巻のpart2風ファイル名は拒否しない。source ownerの証明でバーだけを隠し、thumbnail・保存行を維持する。
+
+修正前のRAR対象実行は92 passed / 9 failed、exit 101（target/A-1355-spec-fix-red-rar.log）。
+fixture準備・コンパイルの失敗はredに数えない。追加の先頭巻snapshot回帰では、実ZIP採用までpollすると
+旧internal-nav flag経路のscope拒否を再現した。元RAR sourceとcache backingを既存typed要求へ渡して修正し、
+本内部からの移動、fullscreen／slideshow、分類・準備中のsnapshot交換も実採用境界まで検証した。
+
+| 検証 | 結果 / 証跡 |
+| --- | --- |
+| 対象lib（RAR 103、meter 51、snapshot 48、startup 6、DFS 61、Remote 418） | 687実行、重複除外656件、すべてexit 0。target/A-1355-spec-fix-focused-*.log |
+| 全lib（pipeなし、実exit確認） | exit 0、11,047 passed / 0 failed / 52 ignored、985.01s。target/A-1355-spec-fix-full-lib.log |
+| IPC／Remote別package | exit 0、64 + 134 passed / 1 ignored。target/A-1355-spec-fix-remote-packages.log |
+| patched unrar lib | exit 0、6 passed（uppercase／CBR先頭名解決を含む）。target/A-1355-spec-fix-unrar.log |
+| UI snapshot全体 | exit 0、103 passed。target/A-1355-spec-fix-ui-snapshot.log |
+| 通常／portable core check | 両方exit 0。target/A-1355-spec-fix-check-normal.log／target/A-1355-spec-fix-check-portable.log |
+| cargo fmt／fmt --check、patched crate rustfmt、glyph lint、diff --check | すべてexit 0、危険glyphなし。変更ファイルはCRLFを維持 |
+| build-dev -PreserveRuntime | exit 0、core 9m43s、Remote／EPUB worker配置、VCRT PE check runtime=4 / pe=3成功。target/A-1355-spec-fix-build-dev.log |
+
+対象テスト後のproduct source hashを固定し、全lib／check／snapshotは同じsourceで実施した。
+製品起動・commitは行わない。英語messageはtarget/A-1355-spec-fix-msg.txt。

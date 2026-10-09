@@ -7,6 +7,7 @@ const EGUI_LICENSE_MIT: &str = include_str!("../../vendor/egui-wgpu/LICENSE-MIT"
 const EGUI_LICENSE_APACHE: &str = include_str!("../../vendor/egui-wgpu/LICENSE-APACHE");
 const LIBRAW_LICENSE: &str = include_str!("../../LIBRAW-LICENSE.txt");
 const ZLIB_LICENSE: &str = include_str!("../../ZLIB-LICENSE.txt");
+const RUST_DEFLATE_NOTICES: &str = include_str!("../../RUST-DEFLATE-NOTICES.txt");
 const LIBJPEG_TURBO_LICENSE: &str = include_str!("../../LIBJPEG-TURBO-LICENSE.txt");
 const IJG_ATTRIBUTION: &str =
     "This software is based in part on the work of the Independent JPEG Group.";
@@ -239,6 +240,13 @@ impl App {
                     "egui Apache License 2.0 全文",
                     "about_egui_apache_license",
                     EGUI_LICENSE_APACHE,
+                );
+
+                draw_license_text(
+                    ui,
+                    "Rust DEFLATE (MIT) licenses / copyright notices",
+                    "about_rust_deflate_notices",
+                    RUST_DEFLATE_NOTICES,
                 );
 
                 #[cfg(not(feature = "portable"))]

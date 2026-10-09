@@ -192,6 +192,181 @@ pub(in crate::app) struct CollectionNavigationRequest {
     lease: crate::collection_store::CollectionReadLease,
     /// Chosen physical book, acquired by the preflight worker before it resolves a generation.
     book_owner: Option<crate::pdf_loader::LeasedEpubPath>,
+    navigation: Option<super::MainListNavigation>,
+}
+
+/// Native Collection request transferred intact into the ordinary physical/EPUB phases.
+/// A transparent return-origin has the same native proof even before a Collection session exists.
+pub(in crate::app) struct PreparedCollectionPhysicalNavigation {
+    request: CollectionNavigationRequest,
+    watch: CollectionRevisionWatch,
+    root: Arc<CollectionPreparedSnapshot>,
+    target: CollectionPreparedNavigationTarget,
+    restore_video_tile: bool,
+}
+
+impl PreparedCollectionPhysicalNavigation {
+    pub(in crate::app) fn path(&self) -> &std::path::Path {
+        &self.target.source_path
+    }
+
+    pub(in crate::app) fn is_current(&self, app: &App) -> bool {
+        app.collection_navigation_exact_target_is_current(&self.request, &self.root, &self.target)
+            && match observe_revision(&self.watch, self.request.origin.collection_id) {
+                RevisionObservation::Unchanged => true,
+                RevisionObservation::Revision(revision) => {
+                    revision <= self.root.collection_revision
+                }
+                RevisionObservation::Deleted => false,
+            }
+            && self
+                .request
+                .root_thumbnail_sources
+                .as_ref()
+                .is_none_or(|sources| {
+                    sources.page_edit_revision == app.page_edit_revision
+                        && sources.reuse_key
+                            == app.collection_grid_prepare_reuse_key(
+                                self.request.origin.collection_id,
+                                self.root.collection_revision,
+                            )
+                        && (sources.retained_edit_snapshot.is_none()
+                            || sources.page_edit_stamp_is_current())
+                })
+    }
+
+    pub(in crate::app) fn destination(
+        &self,
+    ) -> super::top_level_grid_view::CollectionGridPhysicalRestore {
+        super::top_level_grid_view::CollectionGridPhysicalRestore {
+            root: super::top_level_grid_view::CollectionGridRestore {
+                identity: CollectionGridIdentity {
+                    collection_id: self.request.origin.collection_id,
+                },
+                revision_at_open: self.root.collection_revision,
+                viewport_anchor: Some(CollectionGridViewportAnchor {
+                    entry_id: self.target.entry_id,
+                    source_key: self.target.source_key.clone(),
+                }),
+            },
+            root_source_path: self.target.source_path.clone(),
+            visible_path: self.target.source_path.clone(),
+        }
+    }
+
+    pub(in crate::app) fn install(&mut self, app: &mut App) {
+        if !matches!(
+            self.request.action,
+            CollectionNavigationAction::OuterGrid { .. }
+        ) {
+            app.close_fullscreen_for_folder_nav_reopen();
+        }
+        app.install_collection_navigation_root(
+            &mut self.request,
+            Arc::clone(&self.root),
+            &self.target,
+            false,
+        )
+        .expect("prepared immutable physical target cannot reject at install");
+        app.commit_collection_grid_source_open(
+            CollectionGridViewportAnchor {
+                entry_id: self.target.entry_id,
+                source_key: self.target.source_key.clone(),
+            },
+            self.target.source_path.clone(),
+        );
+        if self.deferred_pdf() {
+            app.fs_nav_after_pdf_enumerate = Some(super::DeferredFsReopen {
+                history_trigger: self.request.action.history_trigger(),
+                resume_slideshow: self.resume_slideshow(),
+                target: self
+                    .continuation()
+                    .map(super::DeferredFsTarget::CollectionNavigation)
+                    .unwrap_or(super::DeferredFsTarget::None),
+                resume_to_last_page: app.settings.book_nav_resume.resumes(),
+                from_explicit_open: false,
+                preserve_after_password_prompt: false,
+            });
+        }
+    }
+
+    pub(in crate::app) fn finish(&self, app: &mut App, ctx: &egui::Context) {
+        match &self.request.action {
+            CollectionNavigationAction::OuterGrid { .. } => {}
+            CollectionNavigationAction::OuterFullscreen { .. }
+            | CollectionNavigationAction::Slideshow { .. }
+                if !self.deferred_pdf() =>
+            {
+                let restore_video_tile = self.restore_video_tile;
+                let _ = app.reopen_fullscreen_after_folder_nav_load(
+                    ctx,
+                    restore_video_tile,
+                    self.resume_slideshow(),
+                    self.request.action.history_trigger(),
+                );
+            }
+            CollectionNavigationAction::OuterFullscreen { .. }
+            | CollectionNavigationAction::Slideshow { .. } => app.release_fs_nav_lock(),
+            _ => {}
+        }
+        if !self.deferred_pdf()
+            && let Some(continuation) = self.continuation()
+        {
+            app.resume_collection_archive_navigation(continuation);
+        }
+        ctx.request_repaint();
+    }
+
+    fn deferred_pdf(&self) -> bool {
+        self.target.resolved_kind == CollectionResolvedKind::Pdf
+            && matches!(
+                self.request.action,
+                CollectionNavigationAction::OuterFullscreen { .. }
+                    | CollectionNavigationAction::Slideshow { .. }
+            )
+    }
+
+    fn resume_slideshow(&self) -> bool {
+        matches!(
+            self.request.action,
+            CollectionNavigationAction::Slideshow { .. }
+                | CollectionNavigationAction::OuterFullscreen {
+                    resume_slideshow: true,
+                    ..
+                }
+        )
+    }
+
+    fn continuation(&self) -> Option<super::CollectionArchiveNavigationContinuation> {
+        match &self.request.action {
+            CollectionNavigationAction::OuterGrid { queued_steps, .. } if *queued_steps != 0 => {
+                Some(super::CollectionArchiveNavigationContinuation {
+                    steps: *queued_steps,
+                    fullscreen: false,
+                    resume_slideshow: false,
+                    native_toast: false,
+                })
+            }
+            CollectionNavigationAction::OuterFullscreen {
+                queued_steps,
+                resume_slideshow,
+                native_toast,
+                ..
+            } if *queued_steps != 0 => Some(super::CollectionArchiveNavigationContinuation {
+                steps: *queued_steps,
+                fullscreen: true,
+                resume_slideshow: *resume_slideshow,
+                native_toast: *native_toast,
+            }),
+            _ => None,
+        }
+    }
+}
+
+struct PreparedCollectionOuterAdoption {
+    listing: super::PreparedPhysicalListing,
+    token: super::PreparedVisibleInstall,
+    adoption: super::MainListAdoption,
 }
 
 enum CollectionNavigationPreflightPayload {
@@ -203,6 +378,7 @@ enum CollectionNavigationPreflightPayload {
     PdfOpenFailure(super::PdfOpenFailure),
     ConvertibleArchive(crate::archive_converter::ArchiveImageSummary),
     ConvertiblePasswordRequired,
+    RarOpen,
 }
 
 /// Offscreen physical destination probe shared by Collection child replay, Rating child replay,
@@ -219,6 +395,7 @@ pub(crate) enum PhysicalHistoryPreflightPayload {
     PdfOpenFailure(super::PdfOpenFailure),
     ConvertibleArchive(crate::archive_converter::ArchiveImageSummary),
     ConvertiblePasswordRequired,
+    RarOpen,
 }
 
 pub(crate) enum PhysicalHistoryPreflightPoll {
@@ -233,14 +410,19 @@ pub(crate) struct PhysicalHistoryPreflight {
 }
 
 impl PhysicalHistoryPreflight {
-    #[cfg(test)]
-    pub(crate) fn ready_for_test(payload: PhysicalHistoryPreflightPayload) -> Self {
+    /// A classification worker can transfer its completed scan without scanning twice.
+    pub(crate) fn prepared(payload: PhysicalHistoryPreflightPayload) -> Self {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         sender.send(Ok(payload)).expect("seed physical preflight");
         Self {
             cancel: Arc::new(AtomicBool::new(false)),
             receiver,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ready_for_test(payload: PhysicalHistoryPreflightPayload) -> Self {
+        Self::prepared(payload)
     }
 
     pub(crate) fn poll(&mut self) -> PhysicalHistoryPreflightPoll {
@@ -820,6 +1002,15 @@ fn preflight_candidates(
                         .and_then(|extension| extension.to_str())
                         .and_then(crate::archive_converter::ArchiveFormat::from_extension);
                     format.and_then(|format| {
+                        // Keep empty/invalid candidate skipping for first/single archives, but
+                        // leave later-volume refusal to the shared scan without reading entries.
+                        if format == crate::archive_converter::ArchiveFormat::Rar
+                            && crate::rar_loader::resolved_volume_path(path).is_ok_and(
+                                |(_, kind)| kind == crate::rar_loader::RarVolumeKind::Subsequent,
+                            )
+                        {
+                            return Some(CollectionNavigationPreflightPayload::RarOpen);
+                        }
                         match crate::archive_converter::scan_summary_with_password_cancelable(
                             path, format, None, cancel,
                         ) {
@@ -999,8 +1190,10 @@ impl App {
                         CollectionResolvedKind::Zip => {
                             // A ZIP with converted nested archives can have a cached ZIP backing.
                             // Keep DB and filesystem work off the UI thread; if the cache became
-                            // unreadable, the original ZIP remains a valid destination.
+                            // unreadable, the original ZIP remains a valid destination. A native
+                            // RAR backing already passed the shared Direct/cache decision.
                             if use_archive_cache
+                                && !crate::rar_loader::is_rar_path(&path)
                                 && let Some(db) = archive_cache_db.as_ref()
                                 && let Ok(metadata) = std::fs::metadata(&path)
                                 && let Some(backing_path) = db.lookup(
@@ -1055,6 +1248,8 @@ impl App {
                             }
                         }
                         CollectionResolvedKind::ConvertibleArchive => {
+                            // RAR source selection belongs to the shared scan worker, including
+                            // a first-volume cache hit. Preparation must not bypass Direct-first.
                             let extension = path
                                 .extension()
                                 .and_then(|value| value.to_str())
@@ -1063,6 +1258,11 @@ impl App {
                             let format =
                                 crate::archive_converter::ArchiveFormat::from_extension(&extension)
                                     .ok_or_else(|| "対応していない書庫です".to_string())?;
+                            // RAR content/cache decisions (including later-volume refusal) have
+                            // one owner. Do not scan entries during physical preparation.
+                            if format == crate::archive_converter::ArchiveFormat::Rar {
+                                return Ok(PhysicalHistoryPreflightPayload::RarOpen);
+                            }
                             // A valid converted backing is already the prepared destination.
                             // Check it on this worker before probing the original archive; a
                             // source may no longer be readable even though its stamped cache is.
@@ -1335,6 +1535,16 @@ impl App {
             origin.context_id.serial(),
             origin.surface_generation,
         );
+        let navigation = self.main_folder_history_available().then(|| {
+            let proof = self
+                .smart_folder_source_lease()
+                .map(super::MainListSourceProof::Surface)
+                .unwrap_or(super::MainListSourceProof::Row);
+            self.capture_main_list_navigation(
+                super::MainHistoryOperation::Restore { route: None },
+                proof,
+            )
+        });
         let request = CollectionNavigationRequest {
             origin,
             action,
@@ -1346,7 +1556,11 @@ impl App {
                 "admission",
             ),
             book_owner: None,
+            navigation,
         };
+        if request.navigation.is_some() {
+            self.retire_replaced_main_list_requests(Some(super::MainListRequestOwner::Collection));
+        }
         self.top_level_grid_view
             .set_collection_navigation_pending(None);
         self.start_or_defer_collection_navigation(ctx, request, None);
@@ -2355,7 +2569,9 @@ impl App {
                         );
                     }
                     Ok(Ok(_)) => self.restart_collection_navigation(ctx, request),
-                    Ok(Err(CollectionPrepareError::Cancelled)) => {}
+                    Ok(Err(CollectionPrepareError::Cancelled)) => {
+                        self.finish_collection_navigation_without_target_no_context(&request.action)
+                    }
                     Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         self.finish_collection_navigation_without_target(ctx, &request.action)
                     }
@@ -2462,7 +2678,9 @@ impl App {
                             self.finish_collection_navigation_without_target(ctx, &request.action)
                         }
                     }
-                    Ok(Err(CollectionPrepareError::Cancelled)) => {}
+                    Ok(Err(CollectionPrepareError::Cancelled)) => {
+                        self.finish_collection_navigation_without_target_no_context(&request.action)
+                    }
                     Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         self.finish_collection_navigation_without_target(ctx, &request.action)
                     }
@@ -3266,6 +3484,8 @@ impl App {
         if session.identity.collection_id != request.origin.collection_id {
             return None;
         }
+        let mut native_request = request.clone();
+        native_request.navigation = None;
         Some(super::top_level_grid_view::CollectionGridSourceOpenOwner {
             stamp: super::top_level_grid_view::CollectionGridRequestStamp {
                 context_id: request.origin.context_id,
@@ -3285,7 +3505,7 @@ impl App {
                     source_key: anchor.primary.source_key.clone(),
                 }
             }),
-            navigation_request: Some(request.clone()),
+            navigation_request: Some(native_request),
             navigation_watch: Some(watch.clone()),
         })
     }
@@ -3308,15 +3528,137 @@ impl App {
             ));
     }
 
+    fn prepare_collection_outer_physical_adoption(
+        &mut self,
+        request: &mut CollectionNavigationRequest,
+        root: &Arc<CollectionPreparedSnapshot>,
+        target: &CollectionPreparedNavigationTarget,
+        payload: PhysicalHistoryPreflightPayload,
+        restore_intent: super::StartupListIntent,
+    ) -> Option<PreparedCollectionOuterAdoption> {
+        // This immutable membership also proves every target lookup in the outer root installer.
+        // Its preserved-player/EPUB admission branch is excluded by preserve_active_media=false.
+        if !root
+            .entries
+            .iter()
+            .any(|entry| entry.entry_id == target.entry_id && entry.source_key == target.source_key)
+        {
+            return None;
+        }
+        let listing = self.prepare_physical_listing(
+            target.source_path.clone(),
+            payload,
+            None,
+            None,
+            restore_intent,
+            false,
+            true,
+        )?;
+        let token = match self.prepare_visible_install(
+            listing.source_path(),
+            listing.items(),
+            Some(&target.source_path),
+        ) {
+            Ok(token) => token,
+            Err(reason) => {
+                self.show_open_admission_refusal(reason);
+                return None;
+            }
+        };
+        let navigation = request.navigation.take()?;
+        let root_restore = super::top_level_grid_view::CollectionGridRestore {
+            identity: CollectionGridIdentity {
+                collection_id: request.origin.collection_id,
+            },
+            revision_at_open: root.collection_revision,
+            viewport_anchor: Some(CollectionGridViewportAnchor {
+                entry_id: target.entry_id,
+                source_key: target.source_key.clone(),
+            }),
+        };
+        let location = super::FolderNavHistoryTarget::CollectionPhysical(
+            super::top_level_grid_view::CollectionGridPhysicalRestore {
+                root: root_restore.clone(),
+                root_source_path: target.source_path.clone(),
+                visible_path: target.source_path.clone(),
+            },
+        );
+        let root_scope = Self::facet_scope_for_location(
+            &super::FolderNavHistoryTarget::Collection(root_restore),
+        );
+        let route = navigation
+            .source_location
+            .as_ref()
+            .and_then(|source| {
+                source
+                    .route
+                    .0
+                    .iter()
+                    .rposition(|scope| scope == &root_scope)
+                    .map(|index| super::FacetRoute(source.route.0[..=index].to_vec()))
+            })
+            .unwrap_or_else(|| super::FacetRoute::root(root_scope));
+        let destination = super::FolderNavHistoryEntry::new(
+            location.clone(),
+            route.child(Self::facet_scope_for_location(&location)),
+        );
+        let adoption = self.prepare_main_list_adoption(navigation, destination)?;
+        Some(PreparedCollectionOuterAdoption {
+            listing,
+            token,
+            adoption,
+        })
+    }
+
+    fn install_collection_outer_physical_adoption(
+        &mut self,
+        request: &mut CollectionNavigationRequest,
+        root: Arc<CollectionPreparedSnapshot>,
+        target: &CollectionPreparedNavigationTarget,
+        prepared: PreparedCollectionOuterAdoption,
+        restore_intent: super::StartupListIntent,
+        deferred: Option<super::DeferredFsReopen>,
+    ) {
+        self.adopt_main_list_navigation(prepared.adoption, |app| {
+            if !matches!(request.action, CollectionNavigationAction::OuterGrid { .. }) {
+                app.close_fullscreen_for_folder_nav_reopen();
+            }
+            app.install_collection_navigation_root(request, root, target, false)
+                .expect("prepared immutable outer target cannot reject at install");
+            app.commit_collection_grid_source_open(
+                CollectionGridViewportAnchor {
+                    entry_id: target.entry_id,
+                    source_key: target.source_key.clone(),
+                },
+                target.source_path.clone(),
+            );
+            app.fs_nav_after_pdf_enumerate = deferred;
+            app.install_prepared_physical_listing(
+                prepared.listing,
+                super::VisibleInstallAuthority::Ordinary,
+                restore_intent,
+                prepared.token,
+            )
+        });
+    }
+
     fn commit_collection_navigation(
         &mut self,
         ctx: &egui::Context,
         mut request: CollectionNavigationRequest,
         watch: CollectionRevisionWatch,
         prepared: Arc<CollectionPreparedSnapshot>,
-        ready: CollectionNavigationPreflightReady,
+        mut ready: CollectionNavigationPreflightReady,
     ) {
         let restore_intent = request.action.startup_list_intent();
+        if request
+            .navigation
+            .as_ref()
+            .is_some_and(|navigation| !self.main_list_navigation_is_current(navigation))
+        {
+            self.finish_collection_navigation_without_target(ctx, &request.action);
+            return;
+        }
 
         match observe_revision(&watch, request.origin.collection_id) {
             RevisionObservation::Deleted => {
@@ -3346,6 +3688,7 @@ impl App {
             return;
         }
         if !self.collection_navigation_exact_target_is_current(&request, &prepared, &ready.target) {
+            self.finish_collection_navigation_without_target(ctx, &request.action);
             return;
         }
         let loops_current_media = request
@@ -3359,7 +3702,7 @@ impl App {
                 && let Some(super::FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
             {
                 player.seek(0.0);
-                player.set_playing(true);
+                player.set_playing_internal(true, crate::video::InternalContinuation::Loop);
             }
             return;
         }
@@ -3373,6 +3716,7 @@ impl App {
                     Ok(request) => request,
                     Err(reason) => {
                         self.show_open_admission_refusal(reason);
+                        self.finish_collection_navigation_without_target(ctx, &request.action);
                         return;
                     }
                 };
@@ -3398,6 +3742,7 @@ impl App {
             ));
         }
         let payload_description = match &ready.payload {
+            CollectionNavigationPreflightPayload::RarOpen => "rar-open".into(),
             CollectionNavigationPreflightPayload::Media => "media".to_string(),
             CollectionNavigationPreflightPayload::Folder(scan) => format!(
                 "folder:{}",
@@ -3477,6 +3822,53 @@ impl App {
         #[cfg(not(windows))]
         let restore_video_tile = false;
 
+        if request.navigation.is_some()
+            && matches!(
+                ready.payload,
+                CollectionNavigationPreflightPayload::PdfOpenFailure(_)
+                    | CollectionNavigationPreflightPayload::ConvertibleArchive(_)
+                    | CollectionNavigationPreflightPayload::RarOpen
+            )
+        {
+            let payload = match std::mem::replace(
+                &mut ready.payload,
+                CollectionNavigationPreflightPayload::Media,
+            ) {
+                CollectionNavigationPreflightPayload::PdfOpenFailure(failure) => {
+                    PhysicalHistoryPreflightPayload::PdfOpenFailure(failure)
+                }
+                CollectionNavigationPreflightPayload::ConvertibleArchive(summary) => {
+                    PhysicalHistoryPreflightPayload::ConvertibleArchive(summary)
+                }
+                CollectionNavigationPreflightPayload::RarOpen => {
+                    PhysicalHistoryPreflightPayload::RarOpen
+                }
+                _ => unreachable!("typed failure/conversion transfer was checked"),
+            };
+            let navigation = request
+                .navigation
+                .take()
+                .expect("main request retains original navigation");
+            request.book_owner = Some(ready.owner.clone());
+            let owner = Box::new(PreparedCollectionPhysicalNavigation {
+                request,
+                watch,
+                root: prepared,
+                target: ready.target,
+                restore_video_tile,
+            });
+            if !self.start_prepared_collection_physical_navigation(
+                owner,
+                navigation,
+                payload,
+                restore_intent,
+                ctx,
+            ) {
+                self.finish_collection_navigation_without_target(ctx, &action);
+            }
+            return;
+        }
+
         if ready.target.resolved_kind == CollectionResolvedKind::ConvertibleArchive {
             let Some(collection_owner) = self.collection_navigation_source_open_owner(
                 &request,
@@ -3501,12 +3893,16 @@ impl App {
                 collection_owner,
                 continuation,
             );
-            let outcome = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
-                ready.target.source_path,
-                false,
-                owner,
-                restore_intent.clone(),
-            );
+            let outcome = self
+                .load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation(
+                    ready.target.source_path,
+                    false,
+                    owner,
+                    Some(super::OpenPathKind::File),
+                    None,
+                    restore_intent.clone(),
+                    request.navigation.take(),
+                );
             match action {
                 CollectionNavigationAction::OuterFullscreen {
                     resume_slideshow, ..
@@ -3557,14 +3953,12 @@ impl App {
             return;
         }
 
-        if is_outer_target && !matches!(action, CollectionNavigationAction::OuterGrid { .. }) {
+        if is_outer_target
+            && request.navigation.is_none()
+            && !matches!(action, CollectionNavigationAction::OuterGrid { .. })
+        {
             self.close_fullscreen_for_folder_nav_reopen();
         }
-        let epub_history_snapshot = matches!(
-            &ready.payload,
-            CollectionNavigationPreflightPayload::PdfOpenFailure(_)
-        )
-        .then(|| self.folder_nav_history_snapshot());
         if self.settings.epub_file_handling_ignores_epub()
             && matches!(ready.target.resolved_kind, CollectionResolvedKind::Pdf)
             && ready
@@ -3577,107 +3971,187 @@ impl App {
             self.finish_collection_navigation_without_target(ctx, &action);
             return;
         }
-        let Some(landing) = self.install_collection_navigation_root(
-            &mut request,
-            Arc::clone(&prepared),
-            &ready.target,
-            !is_outer_target,
-        ) else {
-            self.finish_collection_navigation_without_target(ctx, &action);
-            return;
+        let common_outer = is_outer_target
+            && request.navigation.is_some()
+            && matches!(
+                ready.payload,
+                CollectionNavigationPreflightPayload::Folder(_)
+                    | CollectionNavigationPreflightPayload::Zip(_)
+                    | CollectionNavigationPreflightPayload::PdfPages(_)
+            );
+        let prepared_outer = if common_outer {
+            let payload = std::mem::replace(
+                &mut ready.payload,
+                CollectionNavigationPreflightPayload::Media,
+            );
+            let payload = match payload {
+                CollectionNavigationPreflightPayload::Folder(scan) => {
+                    PhysicalHistoryPreflightPayload::Folder(scan)
+                }
+                CollectionNavigationPreflightPayload::Zip(enumeration) => {
+                    PhysicalHistoryPreflightPayload::Zip(enumeration)
+                }
+                CollectionNavigationPreflightPayload::PdfPages(pages) => {
+                    PhysicalHistoryPreflightPayload::PdfPages(pages)
+                }
+                _ => unreachable!("only prepared physical payloads enter the outer adopter"),
+            };
+            let Some(prepared_outer) = self.prepare_collection_outer_physical_adoption(
+                &mut request,
+                &prepared,
+                &ready.target,
+                payload,
+                restore_intent.clone(),
+            ) else {
+                self.finish_collection_navigation_without_target(ctx, &action);
+                return;
+            };
+            Some(prepared_outer)
+        } else {
+            None
         };
-        let target_idx = landing.target_idx;
+        let landing = if common_outer {
+            None
+        } else {
+            let Some(landing) = self.install_collection_navigation_root(
+                &mut request,
+                Arc::clone(&prepared),
+                &ready.target,
+                !is_outer_target,
+            ) else {
+                self.finish_collection_navigation_without_target(ctx, &action);
+                return;
+            };
+            Some(landing)
+        };
+        let target_idx = landing.as_ref().map_or(0, |landing| landing.target_idx);
 
         if is_outer_target {
             let anchor = CollectionGridViewportAnchor {
                 entry_id: ready.target.entry_id,
                 source_key: ready.target.source_key.clone(),
             };
-            let outcome = match ready.payload {
-                CollectionNavigationPreflightPayload::Folder(scan) => {
-                    let path = ready.target.source_path.clone();
-                    let owner = self
-                        .collection_grid_playback_physical_load_owner(target_idx, &path)
-                        .map(super::OpenRequestOwner::CollectionGridPhysical);
-                    if let Some(owner) = owner {
-                        if self.load_folder_with_scan_owned(
-                            path,
-                            Some(scan),
-                            owner,
-                            super::StartupListIntent::InternalHydration(Box::new(
-                                restore_intent.clone(),
-                            )),
-                        ) {
-                            FolderOpenOutcome::Loaded
+            let outcome = if let Some(prepared_outer) = prepared_outer {
+                let deferred_pdf = ready.target.resolved_kind == CollectionResolvedKind::Pdf
+                    && matches!(
+                        action,
+                        CollectionNavigationAction::OuterFullscreen { .. }
+                            | CollectionNavigationAction::Slideshow { .. }
+                    );
+                let deferred = deferred_pdf.then(|| super::DeferredFsReopen {
+                    history_trigger,
+                    resume_slideshow: matches!(
+                        action,
+                        CollectionNavigationAction::Slideshow { .. }
+                            | CollectionNavigationAction::OuterFullscreen {
+                                resume_slideshow: true,
+                                ..
+                            }
+                    ),
+                    target: outer_continuation
+                        .map(|(steps, fullscreen, resume_slideshow, native_toast)| {
+                            super::DeferredFsTarget::CollectionNavigation(
+                                super::CollectionArchiveNavigationContinuation {
+                                    steps,
+                                    fullscreen,
+                                    resume_slideshow,
+                                    native_toast,
+                                },
+                            )
+                        })
+                        .unwrap_or(super::DeferredFsTarget::None),
+                    resume_to_last_page: self.settings.book_nav_resume.resumes(),
+                    from_explicit_open: false,
+                    preserve_after_password_prompt: false,
+                });
+                self.install_collection_outer_physical_adoption(
+                    &mut request,
+                    Arc::clone(&prepared),
+                    &ready.target,
+                    prepared_outer,
+                    restore_intent.clone(),
+                    deferred,
+                );
+                FolderOpenOutcome::Loaded
+            } else {
+                match ready.payload {
+                    CollectionNavigationPreflightPayload::Folder(scan) => {
+                        let path = ready.target.source_path.clone();
+                        let owner = self
+                            .collection_grid_playback_physical_load_owner(target_idx, &path)
+                            .map(super::OpenRequestOwner::CollectionGridPhysical);
+                        if let Some(owner) = owner {
+                            if self.load_folder_with_scan_owned(
+                                path,
+                                Some(scan),
+                                owner,
+                                super::StartupListIntent::InternalHydration(Box::new(
+                                    restore_intent.clone(),
+                                )),
+                            ) {
+                                FolderOpenOutcome::Loaded
+                            } else {
+                                FolderOpenOutcome::Ignored
+                            }
                         } else {
                             FolderOpenOutcome::Ignored
                         }
-                    } else {
-                        FolderOpenOutcome::Ignored
                     }
-                }
-                CollectionNavigationPreflightPayload::Zip(enumeration) => {
-                    self.load_zip_as_folder_prepared(
-                        ready.target.source_path.clone(),
-                        enumeration,
-                        super::StartupListIntent::InternalHydration(Box::new(
-                            restore_intent.clone(),
-                        )),
-                    );
-                    FolderOpenOutcome::Loaded
-                }
-                CollectionNavigationPreflightPayload::PdfPages(pages) => {
-                    let path = ready.target.source_path.clone();
-                    let owner = self
-                        .collection_grid_physical_load_owner(target_idx, &path)
-                        .map(super::OpenRequestOwner::CollectionGridPhysical);
-                    if let Some(owner) = owner {
-                        // The completed typed handle keeps direction and pages together.
-                        self.load_pdf_as_folder_prepared(
-                            path,
-                            pages,
-                            owner,
+                    CollectionNavigationPreflightPayload::Zip(enumeration) => {
+                        self.load_zip_as_folder_prepared(
+                            ready.target.source_path.clone(),
+                            enumeration,
                             super::StartupListIntent::InternalHydration(Box::new(
                                 restore_intent.clone(),
                             )),
-                        )
-                    } else {
-                        FolderOpenOutcome::Ignored
+                        );
+                        FolderOpenOutcome::Loaded
                     }
-                }
-                CollectionNavigationPreflightPayload::PdfOpenFailure(failure) => {
-                    let path = ready.target.source_path.clone();
-                    let owner = self
-                        .collection_grid_physical_load_owner(target_idx, &path)
-                        .map(super::OpenRequestOwner::CollectionGridPhysical);
-                    if let Some(owner) = owner {
-                        match self.route_pdf_open_failure(
-                            owner,
-                            &path,
-                            failure,
-                            restore_intent.clone(),
-                        ) {
-                            super::PdfOpenFailureRoute::ConversionDialogOpened => {
-                                if let Some(state) = self.epub_convert.as_mut() {
-                                    state.open_restore.history = epub_history_snapshot;
-                                }
-                                FolderOpenOutcome::ConversionDialogOpened
-                            }
-                            super::PdfOpenFailureRoute::Handled => {
-                                if let Some(snapshot) = epub_history_snapshot {
-                                    self.restore_folder_nav_history(snapshot);
-                                }
-                                FolderOpenOutcome::Ignored
-                            }
-                            super::PdfOpenFailureRoute::Unhandled => FolderOpenOutcome::Ignored,
+                    CollectionNavigationPreflightPayload::PdfPages(pages) => {
+                        let path = ready.target.source_path.clone();
+                        let owner = self
+                            .collection_grid_physical_load_owner(target_idx, &path)
+                            .map(super::OpenRequestOwner::CollectionGridPhysical);
+                        if let Some(owner) = owner {
+                            // The completed typed handle keeps direction and pages together.
+                            self.load_pdf_as_folder_prepared(
+                                path,
+                                pages,
+                                owner,
+                                super::StartupListIntent::InternalHydration(Box::new(
+                                    restore_intent.clone(),
+                                )),
+                            )
+                        } else {
+                            FolderOpenOutcome::Ignored
                         }
-                    } else {
-                        FolderOpenOutcome::Ignored
                     }
+                    CollectionNavigationPreflightPayload::PdfOpenFailure(failure) => {
+                        let path = ready.target.source_path.clone();
+                        let owner = self
+                            .collection_grid_physical_load_owner(target_idx, &path)
+                            .map(super::OpenRequestOwner::CollectionGridPhysical);
+                        if let Some(owner) = owner {
+                            match self.route_pdf_open_failure(
+                                owner,
+                                &path,
+                                failure,
+                                restore_intent.clone(),
+                            ) {
+                                super::PdfOpenFailureRoute::ConversionDialogOpened => {
+                                    FolderOpenOutcome::ConversionDialogOpened
+                                }
+                                super::PdfOpenFailureRoute::Handled => FolderOpenOutcome::Ignored,
+                                super::PdfOpenFailureRoute::Unhandled => FolderOpenOutcome::Ignored,
+                            }
+                        } else {
+                            FolderOpenOutcome::Ignored
+                        }
+                    }
+                    _ => FolderOpenOutcome::Ignored,
                 }
-                _ => FolderOpenOutcome::Ignored,
             };
-            if matches!(outcome, FolderOpenOutcome::Loaded) {
+            if !common_outer && matches!(outcome, FolderOpenOutcome::Loaded) {
                 self.commit_collection_grid_source_open(anchor, ready.target.source_path);
                 // The physical child, rather than its internally hydrated rows, owns adoption.
                 self.finish_main_list_open(restore_intent.clone());
@@ -3688,7 +4162,8 @@ impl App {
                     CollectionNavigationAction::OuterFullscreen { .. }
                         | CollectionNavigationAction::Slideshow { .. }
                 );
-            if deferred_pdf
+            if !common_outer
+                && deferred_pdf
                 && matches!(
                     outcome,
                     FolderOpenOutcome::Loaded | FolderOpenOutcome::ConversionDialogOpened
@@ -3795,6 +4270,7 @@ impl App {
             return;
         }
 
+        let landing = landing.expect("media navigation retains its native root landing");
         match action {
             CollectionNavigationAction::Manual {
                 landing,
@@ -4073,6 +4549,337 @@ mod tests {
                 PhysicalHistoryPreflightPoll::Failed(error) => panic!("{error}"),
             }
         }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn section1339_collection_history_prune_rejects_fullscreen_move_and_releases_only_its_owner() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("source.jpg");
+        let next = temp.path().join("next-book");
+        std::fs::write(&image, b"source").unwrap();
+        std::fs::create_dir(&next).unwrap();
+        std::fs::write(next.join("page.jpg"), b"next").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("pruned-fullscreen.db"));
+        app.active_quick_folder_slot = None;
+        let created = recv(
+            client
+                .create_collection("source collection".into())
+                .unwrap(),
+        );
+        let added = recv(
+            client
+                .add_batch(
+                    created.collection_id(),
+                    created.revision(),
+                    vec![
+                        crate::collection_store::CollectionRegistration::from_trusted_path(
+                            &image,
+                            CollectionResolvedKind::Image,
+                        )
+                        .unwrap(),
+                        crate::collection_store::CollectionRegistration::from_trusted_path(
+                            &next,
+                            CollectionResolvedKind::Folder,
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+        );
+        let unrelated = recv(
+            client
+                .create_collection("history-only collection".into())
+                .unwrap(),
+        );
+        let prepared = prepare_snapshot(&added.snapshot);
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.collection_catalog_contains(prepared.collection_id)
+            || !app.collection_catalog_contains(unrelated.collection_id())
+        {
+            assert!(
+                Instant::now() < deadline,
+                "created collections must reach the native catalogue"
+            );
+            app.poll_collection_ui(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: prepared.collection_id,
+            }),
+            None,
+        );
+        app.apply_collection_grid_prepared(Arc::clone(&prepared), None);
+        app.adopt_main_facet_route(super::super::FacetRoute::root(
+            super::super::FacetScope::Collection {
+                id: prepared.collection_id.to_string(),
+                entry: None,
+            },
+        ));
+        app.settings.facet_filter.exts.insert("jpg".into());
+        app.folder_nav_back_stack.push(
+            super::super::FolderNavHistoryTarget::Collection(
+                super::super::top_level_grid_view::CollectionGridRestore {
+                    identity: CollectionGridIdentity {
+                        collection_id: unrelated.collection_id(),
+                    },
+                    revision_at_open: unrelated.revision(),
+                    viewport_anchor: None,
+                },
+            )
+            .into(),
+        );
+        let sibling = app.push_window_context_for_test(&ctx, 133902, |owner| {
+            owner.fs_nav_locked_gen = Some(owner.items_generation);
+            owner.fs_holdover_tex = Some(super::super::FsHoldover::FolderNavigation(None));
+        });
+        let sibling_before = app
+            .with_viewer_context(sibling, |owner| {
+                (
+                    owner.items_generation,
+                    owner.fs_nav_locked_gen,
+                    owner.fs_holdover_tex.is_some(),
+                )
+            })
+            .unwrap();
+        let pixels = egui::ColorImage::new([2, 1], vec![egui::Color32::WHITE; 2]);
+        let tex = ctx.load_texture(
+            "collection-prune-source",
+            pixels.clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            0,
+            super::super::FsCacheEntry::Static {
+                tex,
+                pixels: Arc::new(pixels),
+                source_dims: Some([2, 1]),
+                load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
+            },
+        );
+        app.selected = Some(0);
+        app.fullscreen_idx = Some(0);
+        let source_items = app.items.clone();
+        let source_folder = app.current_folder.clone();
+        let source_generation = app.items_generation;
+        let source_facet = app.facet_navigation.clone();
+        let source_filter = app.settings.facet_filter.clone();
+        assert!(app.start_collection_outer_fullscreen_navigation(&ctx, 0, true, false, false));
+        assert!(app.fs_nav_is_locked());
+        assert!(app.fs_holdover_tex.is_some());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (request, watch, prepared, target_kind, cancel, ready) = loop {
+            assert!(
+                Instant::now() < deadline,
+                "fullscreen move must reach its real preflight worker"
+            );
+            let pending = app
+                .top_level_grid_view
+                .take_collection_navigation_pending()
+                .expect("unadopted fullscreen request retains its native owner");
+            if let CollectionNavigationPending::Preflighting {
+                request,
+                watch,
+                prepared,
+                target_kind,
+                cancel,
+                receiver,
+            } = pending
+            {
+                let ready = receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("physical preflight worker reply")
+                    .expect("physical preflight succeeds")
+                    .expect("the next folder is a real eligible container");
+                assert_eq!(ready.target.source_path, next);
+                assert!(matches!(
+                    ready.payload,
+                    CollectionNavigationPreflightPayload::Folder(_)
+                ));
+                break (request, watch, prepared, target_kind, cancel, ready);
+            }
+            app.top_level_grid_view
+                .set_collection_navigation_pending(Some(pending));
+            app.poll_collection_navigation(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert!(app.collection_navigation_request_is_current(&request));
+        assert!(app.main_list_navigation_is_current(request.navigation.as_ref().unwrap()));
+        recv(
+            client
+                .delete_collection(unrelated.collection_id(), unrelated.revision())
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.collection_catalog_contains(unrelated.collection_id()) {
+            assert!(
+                Instant::now() < deadline,
+                "delete notice must prune the real history owner"
+            );
+            app.poll_collection_ui(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            app.folder_nav_back_stack.is_empty(),
+            "real catalogue deletion prunes Back"
+        );
+        assert!(
+            app.collection_navigation_request_is_current(&request),
+            "the source Collection remains the same native surface owner"
+        );
+        assert!(
+            !app.main_list_navigation_is_current(request.navigation.as_ref().unwrap()),
+            "history prune invalidates only the captured cursor baseline"
+        );
+        assert!(app.fs_nav_is_locked());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(Ok(Some(ready))).unwrap();
+        app.top_level_grid_view
+            .set_collection_navigation_pending(Some(CollectionNavigationPending::Preflighting {
+                request,
+                watch,
+                prepared,
+                target_kind,
+                cancel,
+                receiver,
+            }));
+        app.poll_collection_navigation(&ctx);
+        assert!(!app.top_level_grid_view.collection_navigation_pending());
+        assert!(
+            !app.fs_nav_is_locked(),
+            "rejected adoption terminates its fullscreen navigation"
+        );
+        assert!(
+            app.fs_holdover_tex.is_none(),
+            "the rejected request releases its display holdover"
+        );
+        assert!(
+            matches!(
+                app.fs_boundary_hint,
+                Some(crate::ui_fullscreen::FsBoundaryHint::NoImageFolder { forward: true, .. })
+            ),
+            "the request follows the existing terminal notification"
+        );
+        assert_eq!(app.items, source_items);
+        assert_eq!(app.current_folder, source_folder);
+        assert_eq!(app.items_generation, source_generation);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert_eq!(app.facet_navigation, source_facet);
+        assert_eq!(app.settings.facet_filter, source_filter);
+        assert!(app.folder_nav_back_stack.is_empty());
+        assert_eq!(
+            app.with_viewer_context(sibling, |owner| (
+                owner.items_generation,
+                owner.fs_nav_locked_gen,
+                owner.fs_holdover_tex.is_some(),
+            ))
+            .unwrap(),
+            sibling_before,
+            "main rejection does not release a parked sibling's lock"
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn section1339_collection_outer_zip_adopts_facet_before_hydration_without_history() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let book = temp.path().join("book.zip");
+        write_single_page_zip(&book, "page.jpg");
+        let (mut app, client) = start_ready_app(&temp.path().join("outer-facet.db"));
+        app.active_quick_folder_slot = None;
+        let created = recv(client.create_collection("outer facet".into()).unwrap());
+        let added = recv(
+            client
+                .add_batch(
+                    created.collection_id(),
+                    created.revision(),
+                    vec![
+                        crate::collection_store::CollectionRegistration::from_trusted_path(
+                            &book,
+                            CollectionResolvedKind::Zip,
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+        );
+        let catalog_deadline = Instant::now() + Duration::from_secs(5);
+        while !app.collection_catalog_contains(added.snapshot.collection_id()) {
+            assert!(
+                Instant::now() < catalog_deadline,
+                "catalog must admit the source identity"
+            );
+            app.poll_collection_ui(&egui::Context::default());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let prepared = prepare_snapshot(&added.snapshot);
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: prepared.collection_id,
+            }),
+            None,
+        );
+        app.apply_collection_grid_prepared(Arc::clone(&prepared), None);
+        app.selected = None;
+        let root_scope = super::super::FacetScope::Collection {
+            id: prepared.collection_id.to_string(),
+            entry: None,
+        };
+        let root_route = super::super::FacetRoute::root(root_scope);
+        app.adopt_main_facet_route(root_route.clone());
+        app.settings.facet_filter.exts.insert("zip".into());
+        let history = app.folder_nav_history_snapshot();
+        let ctx = egui::Context::default();
+        assert!(app.start_collection_outer_grid_navigation(&ctx, true));
+        assert!(
+            app.facet_filter_active(),
+            "unadopted worker leaves the root filter live"
+        );
+        app.items_generation += 1; // Native OuterGrid allows a newly installed row refresh.
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .installed_items_generation = Some(app.items_generation);
+        let pending = app
+            .top_level_grid_view
+            .take_collection_navigation_pending()
+            .expect("the native actor request must remain pending before its first poll");
+        assert!(
+            app.collection_navigation_request_is_current(pending.request().unwrap()),
+            "an installed row refresh preserves the native OuterGrid owner"
+        );
+        assert!(pending.request().unwrap().navigation.is_some());
+        app.top_level_grid_view
+            .set_collection_navigation_pending(Some(pending));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.top_level_grid_view.collection_navigation_pending() {
+            assert!(Instant::now() < deadline, "outer ZIP request did not adopt");
+            app.poll_collection_navigation(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(app.current_folder.as_ref(), Some(&book));
+        assert!(app.items.iter().any(|item| matches!(item, crate::grid_item::GridItem::ZipImage { entry_name, .. } if entry_name == "page.jpg")));
+        assert!(!app.facet_filter_active());
+        assert_eq!(app.facet_navigation.saved_frame_count(), 1);
+        assert_eq!(app.facet_navigation.route().0.first(), root_route.0.first());
+        assert_eq!(
+            app.folder_nav_history_snapshot(),
+            history,
+            "outer continuation keeps the folder cursor unchanged"
+        );
+        assert!(matches!(
+            app.top_level_grid_view
+                .collection_session()
+                .unwrap()
+                .position,
+            CollectionGridPosition::PhysicalSource { .. }
+        ));
+        app.shutdown_collection_runtime_for_exit();
     }
 
     #[test]
@@ -4905,6 +5712,7 @@ mod tests {
             perf_started_at: None,
             lease: navigation_test_lease(),
             book_owner: None,
+            navigation: None,
         };
         let target = prepared_target(&prepared.entries[0], CollectionResolvedKind::Folder);
         let owner = app
@@ -4955,6 +5763,7 @@ mod tests {
             perf_started_at: None,
             lease: navigation_test_lease(),
             book_owner: None,
+            navigation: None,
         };
         app.spawn_collection_navigation_prepare(
             &egui::Context::default(),
@@ -5101,6 +5910,7 @@ mod tests {
             perf_started_at: None,
             lease: navigation_test_lease(),
             book_owner: None,
+            navigation: None,
         }
     }
 
@@ -5123,6 +5933,7 @@ mod tests {
                 crate::grid_item::ThumbnailState::Pending => "pending",
                 crate::grid_item::ThumbnailState::Loaded { .. } => "loaded",
                 crate::grid_item::ThumbnailState::Failed => "failed",
+                crate::grid_item::ThumbnailState::NoArt => "no-art",
                 crate::grid_item::ThumbnailState::Evicted => "evicted",
             })
             .collect()
@@ -5187,6 +5998,7 @@ mod tests {
             perf_started_at: None,
             lease: navigation_test_lease(),
             book_owner: None,
+            navigation: None,
         };
         app.collection_ui.set_read_phase_for_test(false);
         let (barrier_reply, entered, release) = client.test_barrier().unwrap();
@@ -5332,6 +6144,7 @@ mod tests {
                 perf_started_at: None,
                 lease: navigation_test_lease(),
                 book_owner: None,
+                navigation: None,
             },
             watch: None,
         };
@@ -5486,6 +6299,7 @@ mod tests {
             perf_started_at: None,
             lease: navigation_test_lease(),
             book_owner: None,
+            navigation: None,
         };
         request.root_thumbnail_sources = Some(navigation_sources(
             &app,
@@ -6077,6 +6891,152 @@ mod tests {
     }
 
     #[test]
+    fn section1339_collection_epub_failure_keeps_root_and_original_navigation_until_conversion() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let book = temp.path().join("book.epub");
+        std::fs::write(&book, b"unconverted EPUB fixture").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("epub-facet.db"));
+        app.active_quick_folder_slot = None;
+        let created = recv(client.create_collection("EPUB facet".into()).unwrap());
+        let added = recv(
+            client
+                .add_batch(
+                    created.collection_id(),
+                    created.revision(),
+                    vec![
+                        crate::collection_store::CollectionRegistration::from_trusted_path(
+                            &book,
+                            CollectionResolvedKind::Pdf,
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+        );
+        let catalog_deadline = Instant::now() + Duration::from_secs(5);
+        while !app.collection_catalog_contains(added.snapshot.collection_id()) {
+            assert!(
+                Instant::now() < catalog_deadline,
+                "catalog must admit the source identity"
+            );
+            app.poll_collection_ui(&egui::Context::default());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let prepared = prepare_snapshot(&added.snapshot);
+        app.top_level_grid_view.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: prepared.collection_id,
+            }),
+            None,
+        );
+        app.apply_collection_grid_prepared(Arc::clone(&prepared), None);
+        app.selected = None;
+        let route = super::super::FacetRoute::root(super::super::FacetScope::Collection {
+            id: prepared.collection_id.to_string(),
+            entry: None,
+        });
+        app.adopt_main_facet_route(route.clone());
+        app.settings.facet_filter.exts.insert("epub".into());
+        let history = app.folder_nav_history_snapshot();
+        let generation = app.items_generation;
+        let ctx = egui::Context::default();
+        assert!(app.start_collection_outer_grid_navigation(&ctx, true));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "EPUB actor request did not reach its native preflight worker"
+            );
+            let pending = app
+                .top_level_grid_view
+                .take_collection_navigation_pending()
+                .expect("the native EPUB request must not finish before its preflight");
+            if let CollectionNavigationPending::Preflighting {
+                request,
+                watch,
+                prepared,
+                target_kind,
+                cancel,
+                receiver,
+            } = pending
+            {
+                assert!(app.collection_navigation_request_is_current(&request));
+                assert!(request.navigation.is_some());
+                let mut ready = receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("EPUB preflight worker reply")
+                    .expect("EPUB preflight worker succeeds")
+                    .expect("unconverted EPUB remains an eligible native target");
+                assert_eq!(ready.target.source_path, book);
+                assert!(matches!(
+                    ready.payload,
+                    CollectionNavigationPreflightPayload::PdfOpenFailure(
+                        crate::app::PdfOpenFailure::NotConverted
+                            | crate::app::PdfOpenFailure::EpubUnavailable(_)
+                    )
+                ));
+                // A lib test has no process-lifetime EPUB startup gate. Its real worker may
+                // report EpubUnavailable, whose released handler correctly ends the request.
+                // Select the NotConverted reply at this native worker boundary to exercise
+                // conversion ownership without installing or changing the global startup gate.
+                ready.payload = CollectionNavigationPreflightPayload::PdfOpenFailure(
+                    crate::app::PdfOpenFailure::NotConverted,
+                );
+                let (sender, receiver) = std::sync::mpsc::channel();
+                sender.send(Ok(Some(ready))).unwrap();
+                app.top_level_grid_view
+                    .set_collection_navigation_pending(Some(
+                        CollectionNavigationPending::Preflighting {
+                            request,
+                            watch,
+                            prepared,
+                            target_kind,
+                            cancel,
+                            receiver,
+                        },
+                    ));
+                app.poll_collection_navigation(&ctx);
+                break;
+            }
+            app.top_level_grid_view
+                .set_collection_navigation_pending(Some(pending));
+            app.poll_collection_navigation(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(app.epub_convert_dialog_visible());
+        let Some(super::super::HistoryNavigationTransition::Physical(request)) =
+            app.top_level_grid_view.history_navigation_transition()
+        else {
+            panic!("EPUB failure must move to the native typed physical owner");
+        };
+        assert!(matches!(
+            request.intent,
+            super::super::PhysicalHistoryIntent::CollectionNavigation { .. }
+        ));
+        assert_eq!(
+            request.navigation.source_location.as_ref().unwrap().route,
+            route
+        );
+        assert!(app.physical_history_source_is_current(request));
+        assert_eq!(
+            app.items_generation, generation,
+            "unconverted target must not reinstall the root"
+        );
+        assert_eq!(app.folder_nav_history_snapshot(), history);
+        assert!(app.facet_filter_active());
+        assert_eq!(app.facet_navigation.saved_frame_count(), 0);
+        assert!(matches!(
+            app.top_level_grid_view
+                .collection_session()
+                .unwrap()
+                .position,
+            CollectionGridPosition::Root
+        ));
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
     fn epub_pdf_preflight_keeps_typed_open_failure_for_the_request_owner() {
         let temp = tempfile::TempDir::new().unwrap();
         let source = temp.path().join("book.epub");
@@ -6238,6 +7198,7 @@ mod tests {
                 "preflight",
             ),
             book_owner: None,
+            navigation: None,
         };
         let lease_id = request.lease.request_id();
         request.lease.pause(
@@ -6351,6 +7312,7 @@ mod tests {
                 "preflight",
             ),
             book_owner: None,
+            navigation: None,
         };
         let request_id = request.lease.request_id();
         let target = prepared_target(&prepared.entries[0], CollectionResolvedKind::Image);
@@ -6463,6 +7425,7 @@ mod tests {
             perf_started_at: None,
             lease: navigation_test_lease(),
             book_owner: None,
+            navigation: None,
         };
         let lease_id = request.lease.request_id();
         request.lease.pause(Instant::now(), "pdf_password_input");
@@ -6765,6 +7728,7 @@ mod tests {
             perf_started_at: None,
             lease: navigation_test_lease(),
             book_owner: None,
+            navigation: None,
         };
         let request_id = request.lease.request_id();
         let expected_action = request.action.clone();
@@ -6902,6 +7866,7 @@ mod tests {
             perf_started_at: None,
             lease: navigation_test_lease(),
             book_owner: None,
+            navigation: None,
         };
         assert!(app.collection_navigation_request_is_current(&request));
 
@@ -6967,6 +7932,7 @@ mod tests {
             perf_started_at: None,
             lease: navigation_test_lease(),
             book_owner: None,
+            navigation: None,
         };
         assert!(app.collection_navigation_request_is_current(&request));
 
@@ -7050,6 +8016,7 @@ mod tests {
             perf_started_at: None,
             lease: navigation_test_lease(),
             book_owner: None,
+            navigation: None,
         };
         let watch = client.subscribe().unwrap();
         let target_entry = &prepared.entries[1];
@@ -7134,6 +8101,7 @@ mod tests {
             perf_started_at: None,
             lease: navigation_test_lease(),
             book_owner: None,
+            navigation: None,
         };
         let target_entry = &prepared.entries[1];
         let target = CollectionPreparedNavigationTarget {
@@ -7200,6 +8168,16 @@ mod tests {
                 .unwrap(),
         );
         let prepared = prepare_snapshot(&added.snapshot);
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.collection_catalog_contains(prepared.collection_id) {
+            assert!(
+                Instant::now() < deadline,
+                "the created Collection must reach the native catalogue"
+            );
+            app.poll_collection_ui(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
         app.top_level_grid_view.begin(
             TopLevelGridSurface::Collection(CollectionGridIdentity {
                 collection_id: prepared.collection_id,
@@ -7227,13 +8205,24 @@ mod tests {
         app.zip_nav = Some(crate::zip_tree::ZipNavState::new(Arc::new(
             crate::zip_tree::ZipTree::build(zip_path.clone(), entries),
         )));
+        assert!(
+            app.folder_nav_current_entry().is_some(),
+            "the accepted Collection source must own a current typed history entry"
+        );
         app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
+        assert!(
+            app.items.iter().any(|item| matches!(item,
+            crate::grid_item::GridItem::ZipImage { entry_name, .. } if entry_name == "root.jpg")),
+            "the native root ZIP level must materialize before child DFS: {:?}",
+            app.items
+        );
         app.fullscreen_idx = app
             .items
             .iter()
             .position(|item| matches!(item, crate::grid_item::GridItem::ZipImage { entry_name, .. } if entry_name == "root.jpg"));
-        let fs_idx = app.fullscreen_idx.unwrap();
-        let ctx = egui::Context::default();
+        let fs_idx = app
+            .fullscreen_idx
+            .expect("the root ZIP page is the fullscreen source");
 
         app.handle_fullscreen_ctrl_nav_context(&ctx, fs_idx, true, false);
 
@@ -7287,6 +8276,16 @@ mod tests {
                 .unwrap(),
         );
         let prepared = prepare_snapshot(&added.snapshot);
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.collection_catalog_contains(prepared.collection_id) {
+            assert!(
+                Instant::now() < deadline,
+                "the created Collection must reach the native catalogue"
+            );
+            app.poll_collection_ui(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
         let first = &prepared.entries[0];
         app.top_level_grid_view.begin(
             TopLevelGridSurface::Folder,
@@ -7315,13 +8314,24 @@ mod tests {
         app.zip_nav = Some(crate::zip_tree::ZipNavState::new(Arc::new(
             crate::zip_tree::ZipTree::build(zip_path, entries),
         )));
+        assert!(
+            app.folder_nav_current_entry().is_some(),
+            "the accepted Collection source must own a current typed history entry"
+        );
         app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
+        assert!(
+            app.items.iter().any(|item| matches!(item,
+            crate::grid_item::GridItem::ZipImage { entry_name, .. } if entry_name == "root.jpg")),
+            "the native root ZIP level must materialize before child DFS: {:?}",
+            app.items
+        );
         app.fullscreen_idx = app
             .items
             .iter()
             .position(|item| matches!(item, crate::grid_item::GridItem::ZipImage { entry_name, .. } if entry_name == "root.jpg"));
-        let fs_idx = app.fullscreen_idx.unwrap();
-        let ctx = egui::Context::default();
+        let fs_idx = app
+            .fullscreen_idx
+            .expect("the root ZIP page is the fullscreen source");
 
         app.handle_fullscreen_ctrl_nav_context(&ctx, fs_idx, true, false);
 

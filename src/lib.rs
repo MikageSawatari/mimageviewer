@@ -33,6 +33,7 @@ pub(crate) mod raw;
 pub mod raw_format;
 /// 一括書き出しの要求が必ず伴う借用。`app` module 自体は非公開なのでここで出す。
 pub use app::LocalAiActivityLease;
+pub use app::draw_audio_thumbnail_indicator_snapshot_fixture;
 pub use app::draw_collection_placeholder_snapshot_fixture;
 #[doc(hidden)]
 pub use app::draw_video_thumbnail_indicator_snapshot_fixture;
@@ -41,14 +42,17 @@ pub use ui_dialogs::preferences::draw_book_resume_meter_settings_snapshot_fixtur
 pub use ui_dialogs::preferences::draw_file_organize_destinations_settings_snapshot_fixture;
 #[doc(hidden)]
 pub use ui_dialogs::preferences::draw_fullscreen_fit_cycle_settings_snapshot_fixture;
+pub use ui_dialogs::preferences::draw_grid_background_double_click_settings_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_preferences_transfer_explanation_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_preferences_transfer_settings_snapshot_fixture;
 pub use ui_dialogs::settings_restore::draw_preferences_transfer_disabled_entry_snapshot_fixture;
 pub use ui_dialogs::settings_restore::draw_preferences_transfer_entry_snapshot_fixture;
 pub mod archive_cache;
 pub mod archive_converter;
+pub(crate) mod audio_album_art;
 pub mod audio_decode;
 pub mod audio_normalize_db;
+pub(crate) mod audio_thumbnail;
 pub mod auto_aspect;
 pub mod auto_aspect_cache;
 pub mod bake_stage;
@@ -83,6 +87,7 @@ pub mod data_dir;
 #[cfg(windows)]
 mod dcomp_presenter_test;
 pub mod delete_worker;
+pub mod details_name_colors;
 pub mod diagnostics;
 mod displayed_image_transform;
 mod double_click_time;
@@ -202,6 +207,7 @@ pub mod panorama;
 pub mod panorama_wgpu;
 pub mod path_key;
 pub mod reading_history_db;
+pub(crate) mod reading_history_thumbnail_sources;
 #[cfg(any(test, feature = "test-script"))]
 mod settings_override;
 #[cfg(all(windows, any(test, feature = "test-script")))]
@@ -333,10 +339,14 @@ pub mod ui_helpers;
 mod ui_main;
 pub mod ui_toolbar_layout;
 #[doc(hidden)]
+pub use ui_dialogs::preferences::draw_details_name_color_settings_snapshot_fixture;
+#[doc(hidden)]
 pub use ui_main::draw_color_presets_snapshot_fixture;
 #[doc(hidden)]
 pub use ui_main::draw_cut_item_appearance_snapshot_fixture;
 pub use ui_main::draw_details_icons_snapshot_fixture;
+#[doc(hidden)]
+pub use ui_main::draw_details_name_colors_snapshot_fixture;
 mod ui_metadata_panel;
 #[doc(hidden)]
 pub use ui_metadata_panel::{
@@ -1596,6 +1606,9 @@ pub fn run() -> eframe::Result {
                 saved.clone(),
                 collection_remote_producer.clone(),
                 Arc::clone(&raw_develop_executor),
+                io_semaphore::GlobalIoSemaphore::process_shared(
+                    saved.indexer_speed_profile.io_permits(),
+                ),
             )
         },
     ) {

@@ -33,7 +33,7 @@ mod file_organize_tests {
         let after = app.folder_nav_history_snapshot();
         assert_eq!(after.back_stack.len(), history.back_stack.len() + 1);
         assert_eq!(
-            after.back_stack.last(),
+            after.back_stack.last().map(|entry| &entry.location),
             Some(&FolderNavHistoryTarget::Path(origin))
         );
         assert!(after.forward_stack.is_empty());
@@ -584,7 +584,7 @@ fn keep_projection_prunes_queued_raw_followups_and_counts_both_completions() {
     assert_eq!(app.cache_gen_done.load(Ordering::Relaxed), 2);
     assert!(!app.requested.contains_key(&0) && !app.requested.contains_key(&1));
     let mut canceled = [app.rx.try_recv().unwrap(), app.rx.try_recv().unwrap()].map(|msg| {
-        assert!(msg.canceled && !msg.finalized);
+        assert!(msg.is_canceled() && !msg.is_finalized());
         assert_eq!((msg.input_seq, msg.items_gen), (42, 7));
         msg.idx
     });
@@ -613,7 +613,7 @@ fn grid_queue_prune_counts_queued_raw_followup() {
     assert!(!app.requested.contains_key(&1));
     let msg = app.rx.try_recv().unwrap();
     assert_eq!((msg.idx, msg.input_seq, msg.items_gen), (1, 42, 7));
-    assert!(msg.canceled && !msg.finalized);
+    assert!(msg.is_canceled() && !msg.is_finalized());
 }
 
 #[cfg(windows)]
@@ -759,6 +759,7 @@ fn mutation_refresh_synthetic_worker_prepares_cascade_and_video_seed_before_ui_a
         .rx
         .recv_timeout(std::time::Duration::from_secs(10))
         .unwrap()
+        .0
         .unwrap();
     assert!(terminal.errors.is_empty(), "{:?}", terminal.errors);
     let mut result = terminal.contexts.into_iter().next().unwrap();
@@ -982,6 +983,7 @@ fn mutation_refresh_synthetic_worker_seed_failure_purges_same_key_old_frame() {
         .rx
         .recv_timeout(std::time::Duration::from_secs(10))
         .unwrap()
+        .0
         .unwrap();
     assert!(terminal.errors.is_empty(), "{:?}", terminal.errors);
     let result = terminal.contexts.into_iter().next().unwrap();
@@ -1243,21 +1245,21 @@ fn mutation_refresh_global_video_cancels_old_producer_and_keeps_streaming_policy
     // The prior producer's receiver is retired, even in a lightweight search grid.
     assert!(
         old_tx
-            .send(crate::thumb_loader::ThumbMsg {
-                idx: 0,
-                image: None,
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+            .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                0,
+                None,
+                crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                     evaluated_display_px: 320
                 },
-                from_edit_preview: false,
-                edit_preview_adjustment: None,
-                source_dims: None,
-                layout_dims: None,
-                canceled: true,
-                finalized: false,
-                input_seq: app.input_seq,
-                items_gen: app.items_generation
-            })
+                false,
+                None,
+                None,
+                None,
+                true,
+                false,
+                app.input_seq,
+                app.items_generation
+            ))
             .is_err()
     );
     assert!(matches!(app.thumbnails[0], ThumbnailState::Evicted));
@@ -1612,7 +1614,7 @@ fn mutation_refresh_rating_sort_fixture() -> AppTestEnvForTest {
         ));
     }
     let future = app.tmp.path().join("future");
-    app.folder_nav_forward_stack = vec![FolderNavHistoryTarget::Path(future)];
+    app.folder_nav_forward_stack = vec![FolderNavHistoryTarget::Path(future).into()];
     assert_eq!(app.rating_view_nav_stack.len(), 2);
     assert_eq!(app.items[0].name(), "a.png");
     app
@@ -1711,16 +1713,24 @@ fn mutation_refresh_assert_rating_sort(physical_mode: PhysicalFolderSortReload) 
         history.forward_stack
     );
     assert_eq!(
-        app.navigate_folder_history_back(),
-        history.back_stack.last().cloned()
+        app.folder_history_back_entry()
+            .map(|entry| entry.location.clone()),
+        history
+            .back_stack
+            .last()
+            .map(|entry| entry.location.clone())
     );
     app.restore_folder_nav_history(history.clone());
     // History rollback defaults a legacy no-slot snapshot to A; this fixture uses the
     // legacy stacks so both navigation directions must read those same stacks.
     app.active_quick_folder_slot = None;
     assert_eq!(
-        app.navigate_folder_history_forward(),
-        history.forward_stack.last().cloned()
+        app.folder_history_forward_entry()
+            .map(|entry| entry.location.clone()),
+        history
+            .forward_stack
+            .last()
+            .map(|entry| entry.location.clone())
     );
     app.restore_folder_nav_history(history);
     app.active_quick_folder_slot = None;
@@ -1834,7 +1844,7 @@ fn mutation_refresh_synthetic_parked_request_is_owned_by_its_context() {
             .rx
             .recv_timeout(std::time::Duration::from_secs(10))
             .unwrap();
-        let terminal = result.as_ref().expect("pin worker was cancelled");
+        let terminal = result.0.as_ref().expect("pin worker was cancelled");
         assert!(
             terminal.errors.is_empty(),
             "pin worker errors: {:?}",
@@ -2339,7 +2349,7 @@ fn epub_d10_off_pdf_open_policy_skips_spread_lookup() {
 }
 
 #[test]
-fn epub_modal_rejects_second_direct_open_and_cancel_restores_history() {
+fn epub_modal_rejects_second_direct_open_and_cancel_preserves_history() {
     use crate::settings::ArchiveFileHandling;
     let mut app = setup_app_for_test();
     app.settings
@@ -2352,7 +2362,7 @@ fn epub_modal_rejects_second_direct_open_and_cancel_restores_history() {
     app.quick_folder_workspaces[QuickFolderSlotId::A.index()]
         .history
         .back_stack
-        .push(FolderNavHistoryTarget::Path(before.clone()));
+        .push(FolderNavHistoryTarget::Path(before.clone()).into());
     app.address = old.to_string_lossy().into_owned();
     let snapshot = app.folder_nav_history_snapshot();
     assert_eq!(
@@ -2364,7 +2374,6 @@ fn epub_modal_rejects_second_direct_open_and_cancel_restores_history() {
         ),
         PdfOpenFailureRoute::ConversionDialogOpened
     );
-    app.epub_convert.as_mut().unwrap().open_restore.history = Some(snapshot);
     app.epub_convert.as_mut().unwrap().deferred_fullscreen = Some(DeferredFsReopen {
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
@@ -2398,10 +2407,19 @@ fn epub_modal_rejects_second_direct_open_and_cancel_restores_history() {
     };
     let _ = ctx.run(input, |ctx| app.show_epub_convert_dialog(ctx));
     assert!(app.epub_convert.is_none());
+    assert_eq!(
+        app.folder_nav_history_snapshot().back_stack,
+        snapshot.back_stack
+    );
+    assert_eq!(
+        app.folder_nav_history_snapshot().forward_stack,
+        snapshot.forward_stack
+    );
     assert_eq!(app.fs_nav_locked_gen, None);
     assert_eq!(app.address, previous.to_string_lossy());
     assert_eq!(
-        app.navigate_folder_history_back(),
+        app.folder_history_back_entry()
+            .map(|entry| entry.location.clone()),
         Some(FolderNavHistoryTarget::Path(before))
     );
 }
@@ -2504,7 +2522,6 @@ fn epub_modal_blocks_collection_navigation_and_preserves_back_history() {
         PdfOpenFailureRoute::ConversionDialogOpened,
     );
     let rollback = app.folder_nav_history_snapshot();
-    app.epub_convert.as_mut().unwrap().open_restore.history = Some(rollback.clone());
     let collection_id = crate::collection_store::CollectionId::new();
     app.open_collection_grid_from_navigation(collection_id);
     assert!(app.epub_convert.is_some());
@@ -2588,7 +2605,6 @@ fn epub_modal_blocks_pane_scan_until_cancel() {
     let rollback = app.folder_nav_history_snapshot();
     app.address = epub.to_string_lossy().into_owned();
     let state = app.epub_convert.as_mut().unwrap();
-    state.open_restore.history = Some(rollback);
     state.deferred_fullscreen = Some(DeferredFsReopen {
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
@@ -2605,6 +2621,10 @@ fn epub_modal_blocks_pane_scan_until_cancel() {
     publish();
     app.finish_epub_convert(crate::ui_dialogs::epub_convert::EpubConvertExit::Abort);
     assert_eq!(app.fs_nav_locked_gen, None);
+    assert_eq!(
+        app.folder_nav_history_snapshot().back_stack,
+        rollback.back_stack
+    );
     app.start_folder_pane_open(destination.clone());
     let ctx = egui::Context::default();
     assert!(app.pdf_enumerate_pending.is_none());
@@ -2637,7 +2657,7 @@ fn epub_modal_blocks_failed_pane_scan_and_cancel_restores_source() {
     app.current_folder = Some(previous.clone());
     app.address = previous.to_string_lossy().into_owned();
     app.folder_nav_back_stack
-        .push(FolderNavHistoryTarget::Path(previous.clone()));
+        .push(FolderNavHistoryTarget::Path(previous.clone()).into());
     let history = app.folder_nav_history_snapshot();
     let epub = temp.path().join("old.epub");
     std::fs::write(&epub, b"test").unwrap();
@@ -2653,7 +2673,6 @@ fn epub_modal_blocks_failed_pane_scan_and_cancel_restores_source() {
         PdfOpenFailureRoute::ConversionDialogOpened,
     );
     let state = app.epub_convert.as_mut().unwrap();
-    state.open_restore.history = Some(history);
     state.deferred_fullscreen = Some(DeferredFsReopen {
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
@@ -2662,9 +2681,11 @@ fn epub_modal_blocks_failed_pane_scan_and_cancel_restores_source() {
         from_explicit_open: false,
         preserve_after_password_prompt: false,
     });
-    app.folder_nav_back_stack
-        .push(FolderNavHistoryTarget::Path(epub.clone()));
-    assert_eq!(app.folder_nav_back_stack.len(), 2);
+    assert_eq!(
+        app.folder_nav_history_snapshot().back_stack,
+        history.back_stack
+    );
+    assert_eq!(app.folder_nav_back_stack.len(), 1);
     app.address = epub.to_string_lossy().into_owned();
     app.fs_nav_locked_gen = Some(app.items_generation);
     let deleted = temp.path().join("deleted");
@@ -2710,7 +2731,7 @@ fn epub_ready_pane_replacement_scenario(c_succeeds: bool) {
     app.quick_folder_workspaces[QuickFolderSlotId::A.index()]
         .history
         .back_stack
-        .push(FolderNavHistoryTarget::Path(before.clone()));
+        .push(FolderNavHistoryTarget::Path(before.clone()).into());
     let history = app.folder_nav_history_snapshot();
     let epub = temp.path().join("a.epub");
     std::fs::write(&epub, b"test").unwrap();
@@ -2726,7 +2747,6 @@ fn epub_ready_pane_replacement_scenario(c_succeeds: bool) {
         PdfOpenFailureRoute::ConversionDialogOpened,
     );
     let state = app.epub_convert.as_mut().unwrap();
-    state.open_restore.history = Some(history);
     state.deferred_fullscreen = Some(DeferredFsReopen {
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
@@ -2735,10 +2755,10 @@ fn epub_ready_pane_replacement_scenario(c_succeeds: bool) {
         from_explicit_open: false,
         preserve_after_password_prompt: false,
     });
-    app.quick_folder_workspaces[QuickFolderSlotId::A.index()]
-        .history
-        .back_stack
-        .push(FolderNavHistoryTarget::Path(epub.clone()));
+    assert_eq!(
+        app.folder_nav_history_snapshot().back_stack,
+        history.back_stack
+    );
     app.address = epub.to_string_lossy().into_owned();
     app.fs_nav_locked_gen = Some(app.items_generation);
 
@@ -2786,7 +2806,8 @@ fn epub_ready_pane_replacement_scenario(c_succeeds: bool) {
         assert_eq!(app.current_folder.as_deref(), Some(c.as_path()));
         assert_eq!(app.address, c.to_string_lossy());
         assert_ne!(
-            app.navigate_folder_history_back(),
+            app.folder_history_back_entry()
+                .map(|entry| entry.location.clone()),
             Some(FolderNavHistoryTarget::Path(before))
         );
     } else {
@@ -2794,7 +2815,8 @@ fn epub_ready_pane_replacement_scenario(c_succeeds: bool) {
         assert_eq!(app.current_folder.as_deref(), Some(previous.as_path()));
         assert_eq!(app.address, previous.to_string_lossy());
         assert_eq!(
-            app.navigate_folder_history_back(),
+            app.folder_history_back_entry()
+                .map(|entry| entry.location.clone()),
             Some(FolderNavHistoryTarget::Path(before)),
         );
     }
@@ -2818,6 +2840,7 @@ fn epub_published_stale_collection_reopen_preserves_other_pending_attachments() 
         CollectionGridRequestStamp, CollectionGridViewportAnchor,
     };
     let mut app = setup_app_for_test();
+    let baseline = app.folder_nav_history_snapshot();
     let other = PathBuf::from("C:/books/current.pdf");
     assert_eq!(
         app.load_pdf_as_folder_owned(
@@ -2859,7 +2882,6 @@ fn epub_published_stale_collection_reopen_preserves_other_pending_attachments() 
         app.smart_folder_transition_sequence,
         crate::app::StartupListIntent::ExplicitList,
     );
-    state.open_restore.history = Some(app.folder_nav_history_snapshot());
     state.deferred_fullscreen = Some(DeferredFsReopen {
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
@@ -2874,7 +2896,15 @@ fn epub_published_stale_collection_reopen_preserves_other_pending_attachments() 
     let pending = app.pdf_enumerate_pending.as_ref().unwrap();
     assert_eq!(pending.0, other);
     assert_eq!(pending.4.as_ref().unwrap().logical, other);
-    assert!(pending.4.as_ref().unwrap().history.is_some());
+    assert!(pending.4.as_ref().unwrap().adoption.is_some());
+    assert_eq!(
+        app.folder_nav_history_snapshot().back_stack,
+        baseline.back_stack
+    );
+    assert_eq!(
+        app.folder_nav_history_snapshot().forward_stack,
+        baseline.forward_stack
+    );
     assert!(app.fs_nav_after_pdf_enumerate.is_none());
 }
 
@@ -3004,7 +3034,7 @@ fn ignored_epub_in_stale_search_view_does_not_advance_normal_navigation() {
     });
     app.current_folder = Some(crate::app::search_results_synthetic_path());
     app.address = "検索結果".into();
-    app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(folder.clone())];
+    app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(folder.clone()).into()];
     app.recent_folders = vec![folder.clone()];
     app.settings.epub_file_handling = crate::settings::EpubFileHandling::Ignore;
 
@@ -3556,9 +3586,11 @@ fn epub_pdf_meta_worker_replaces_page_count_with_new_generation_stamp() {
     for (id, pages) in [(17, 3), (18, 8)] {
         let catalog = std::sync::Arc::clone(&catalog);
         let folder = tmp.path().to_path_buf();
+        let catalog_work = crate::catalog::CatalogWork::capture(&tmp.path().join("thumbs"));
         std::thread::spawn(move || {
             write_epub_pdf_meta_row(
                 &folder,
+                &catalog_work,
                 Some(catalog),
                 "book.epub",
                 id,
@@ -3628,7 +3660,7 @@ fn epub_auto_aspect_seed_ignores_source_metadata_cache_hit() {
 }
 
 #[test]
-fn epub_enumeration_failure_transfers_history_and_owner_to_conversion() {
+fn epub_enumeration_failure_preserves_history_and_transfers_owner_to_conversion() {
     let mut app = setup_app_for_test();
     app.settings
         .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ask);
@@ -3649,7 +3681,6 @@ fn epub_enumeration_failure_transfers_history_and_owner_to_conversion() {
         Box::new(OpenRequestOwner::Navigation),
         Some(crate::ui_dialogs::epub_convert::EpubOpenRestore {
             logical: source.clone(),
-            history: Some(snapshot),
             address_before: Some(previous.to_string_lossy().into_owned()),
             adoption: None,
         }),
@@ -3670,7 +3701,18 @@ fn epub_enumeration_failure_transfers_history_and_owner_to_conversion() {
             ..
         }
     ));
-    assert!(state.open_restore.history.is_some());
+    assert_eq!(
+        state.open_restore.address_before.as_deref(),
+        Some(previous.to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        app.folder_nav_history_snapshot().back_stack,
+        snapshot.back_stack
+    );
+    assert_eq!(
+        app.folder_nav_history_snapshot().forward_stack,
+        snapshot.forward_stack
+    );
     let ctx = egui::Context::default();
     let input = egui::RawInput {
         events: vec![egui::Event::Key {
@@ -4332,7 +4374,7 @@ fn navigation_cache_rebuilds_after_filter_change() {
 
     crate::ui_helpers::reset_still_image_display_indices_build_count_for_test();
     let _ = app.collect_image_indices();
-    app.search_filter = Some(std::collections::HashSet::from([0, 2]));
+    app.search_filter = Some(std::collections::HashSet::from([0, 2]).into());
     app.rebuild_visible_indices();
     assert_eq!(app.collect_image_indices().as_ref(), &[0, 2]);
     assert_eq!(
@@ -7776,6 +7818,7 @@ fn forked_search_snapshots_each_restore_their_own_synthetic_subfolder_fallback()
     let mut app = phase_c_support::setup_app();
     let root = app.tmp.path().join("forked-search-restore");
     std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("restored.jpg"), b"restored row").unwrap();
     let search_path = crate::app::search_results_synthetic_path();
     seed_snapshot_context(
         &mut app,
@@ -7793,6 +7836,8 @@ fn forked_search_snapshots_each_restore_their_own_synthetic_subfolder_fallback()
     let first = app.fork_mounted_live_media_context(906);
     app.bind_mounted_context_for_test(907);
     let second = app.fork_mounted_live_media_context(907);
+    let main_facet = app.facet_navigation.clone();
+    let main_history = app.folder_nav_history_snapshot();
     for (position, context_id) in [first, second].into_iter().enumerate() {
         if position != 0 {
             // Eliminate the first restore's legacy App-global runtime as an accidental fallback.
@@ -7801,10 +7846,40 @@ fn forked_search_snapshots_each_restore_their_own_synthetic_subfolder_fallback()
         let mounted = app.with_viewer_context(context_id, |ctx| {
             assert!(ctx.global_search_subfolder_restore.is_some());
             assert!(ctx.top_level_grid_view.take_return_to().is_some());
+            let source_items = ctx.items.clone();
             ctx.deactivate_snapshot();
+            assert_eq!(ctx.items, source_items);
+            assert!(ctx.subfolder_expansion_pending.is_some());
+            let ui = egui::Context::default();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while ctx.subfolder_expansion_pending.is_some()
+                || ctx.subfolder_expansion_install_pending.is_some()
+                || ctx.subfolder_expansion_confirm_pending.is_some()
+                || ctx.sidecar_restore_active()
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "owned subfolder restore did not finish"
+                );
+                ctx.poll_subfolder_expansion(&ui);
+                ctx.poll_sidecar_restore(&ui);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
             assert_eq!(ctx.subfolder_expansion_root.as_ref(), Some(&root));
+            assert!(ctx.items.iter().any(
+                |item| matches!(item, GridItem::Image(path) if path == &root.join("restored.jpg"))
+            ));
         });
         assert!(mounted.is_ok());
+        assert_eq!(app.facet_navigation, main_facet);
+        assert_eq!(
+            app.folder_nav_history_snapshot().back_stack,
+            main_history.back_stack
+        );
+        assert_eq!(
+            app.folder_nav_history_snapshot().forward_stack,
+            main_history.forward_stack
+        );
     }
 }
 
@@ -9825,7 +9900,9 @@ fn metadata_import_terminal_refresh_keeps_untagged_loaded_and_restarts_rating_re
     ];
     let main_scope = PathBuf::from(r"C:\Pictures");
     app.current_folder = Some(main_scope.clone());
-    app.facet_filter_scope = Some(main_scope.clone());
+    app.adopt_main_facet_route(crate::app::FacetRoute::root(crate::app::FacetScope::path(
+        &main_scope,
+    )));
     app.items = items.clone();
     app.image_metas = vec![None; items.len()];
     app.thumbnails = vec![ThumbnailState::Pending; items.len()];
@@ -9889,12 +9966,12 @@ fn metadata_import_terminal_refresh_keeps_untagged_loaded_and_restarts_rating_re
     assert!(errors.is_empty());
     assert!(!stale);
     assert_eq!(
-        app.facet_filter_scope,
-        Some(main_scope),
+        app.facet_navigation.route().current(),
+        Some(&crate::app::FacetScope::path(&main_scope)),
         "terminal refresh must not replace the App-global main facet scope"
     );
     assert!(
-        app.facet_filter_suppression_stack.is_empty(),
+        !app.facet_navigation.suppressed(),
         "temporary detached mounts must not create facet suppression"
     );
     assert!(
@@ -9952,7 +10029,9 @@ fn bookmark_presence_rebuilds_main_active_and_paused_contexts() {
     let items = vec![GridItem::Video(saved.clone()), GridItem::Audio(plain)];
     let main_scope = PathBuf::from(r"C:\Media");
     app.current_folder = Some(main_scope.clone());
-    app.facet_filter_scope = Some(main_scope.clone());
+    app.adopt_main_facet_route(crate::app::FacetRoute::root(crate::app::FacetScope::path(
+        &main_scope,
+    )));
     app.items = items.clone();
     app.image_metas = vec![None; items.len()];
     app.thumbnails = vec![ThumbnailState::Pending; items.len()];
@@ -9992,11 +10071,11 @@ fn bookmark_presence_rebuilds_main_active_and_paused_contexts() {
     })
     .unwrap();
     assert_eq!(
-        app.facet_filter_scope,
-        Some(main_scope),
+        app.facet_navigation.route().current(),
+        Some(&crate::app::FacetScope::path(&main_scope)),
         "bookmark snapshot refresh must preserve the main facet scope"
     );
-    assert!(app.facet_filter_suppression_stack.is_empty());
+    assert!(!app.facet_navigation.suppressed());
     assert!(
         app.settings
             .facet_filter
@@ -10017,7 +10096,9 @@ fn metadata_transfer_quiesces_and_resumes_all_context_writer_handles() {
     let items = vec![GridItem::Image(image_path)];
     let main_scope = PathBuf::from(r"C:\Pictures");
     app.current_folder = Some(main_scope.clone());
-    app.facet_filter_scope = Some(main_scope.clone());
+    app.adopt_main_facet_route(crate::app::FacetRoute::root(crate::app::FacetScope::path(
+        &main_scope,
+    )));
     app.settings
         .facet_filter
         .edits
@@ -10088,12 +10169,12 @@ fn metadata_transfer_quiesces_and_resumes_all_context_writer_handles() {
     })
     .unwrap();
     assert_eq!(
-        app.facet_filter_scope,
-        Some(main_scope),
+        app.facet_navigation.route().current(),
+        Some(&crate::app::FacetScope::path(&main_scope)),
         "rating同期を伴う一時mountでもmainのfacet scopeを保持する"
     );
     assert!(
-        app.facet_filter_suppression_stack.is_empty(),
+        !app.facet_navigation.suppressed(),
         "一時mountを子フォルダnavigationとしてsuppressionへ積んではならない"
     );
     assert!(
@@ -12123,7 +12204,7 @@ fn omitted_entries_are_exposed_only_for_the_normal_folder_surface() {
 
     app.top_level_grid_view
         .replace_surface(TopLevelGridSurface::Folder);
-    app.search_filter = Some(std::collections::HashSet::new());
+    app.search_filter = Some(std::collections::HashSet::new().into());
     assert_eq!(app.current_normal_folder_omitted_counts(), None);
     app.search_filter = None;
     app.stack_mode_requested = true;
@@ -13374,15 +13455,13 @@ mod startup_open_path_resolve_tests {
                 if conversion_started {
                     // The lib executable has no PDF worker child. Deliver its typed NotConverted
                     // result through the real direct-open pending handle and poll/adoption route.
-                    let pending = app.pdf_enumerate_pending.as_mut().unwrap();
-                    pending.2 = crate::pdf_loader::completed_enumerate_result_handle(
-                        &epub,
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            crate::pdf_loader::PdfReadError::NotConverted,
-                        )),
+                    super::phase_c_folder_nav_history_tests::replace_physical_history_preflight_for_test(
+                        &mut app,
+                        crate::app::collection_navigation::PhysicalHistoryPreflightPayload::PdfOpenFailure(
+                            super::PdfOpenFailure::NotConverted,
+                        ),
                     );
-                    app.poll_pdf_enumerate();
+                    app.poll_collection_history_transition(&egui::Context::default());
                     assert!(
                         app.epub_convert.is_some(),
                         "direct EPUB did not reach NotConverted"
@@ -13400,8 +13479,12 @@ mod startup_open_path_resolve_tests {
                         crate::ui_dialogs::epub_convert::EpubConvertExit::Abort,
                     );
                 } else {
-                    assert!(app.pdf_enumerate_pending.is_some());
-                    assert_ne!(app.address, address);
+                    assert!(matches!(
+                        app.top_level_grid_view.history_navigation_transition(),
+                        Some(super::HistoryNavigationTransition::Physical(request))
+                            if matches!(request.phase, super::PhysicalHistoryPhase::Preflighting { .. })
+                    ));
+                    assert_eq!(app.address, address);
                 }
                 assert!(app.start_physical_history_transition(
                     super::PhysicalHistoryIntent::Navigation {
@@ -14346,15 +14429,17 @@ mod startup_open_path_resolve_tests {
             crate::app::StartupListIntent::ExplicitList,
         ));
         app.settle_open_path_classification_for_test();
-        app.pdf_enumerate_pending.as_mut().unwrap().2 =
-            crate::pdf_loader::completed_enumerate_result_handle(
-                &epub,
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    crate::pdf_loader::PdfReadError::NotConverted,
-                )),
-            );
-        app.poll_pdf_enumerate();
+        let request_id = match app.top_level_grid_view.history_navigation_transition() {
+            Some(super::HistoryNavigationTransition::Physical(request)) => request.request_id,
+            _ => panic!("direct EPUB must retain its typed physical request"),
+        };
+        super::phase_c_folder_nav_history_tests::replace_physical_history_preflight_for_test(
+            &mut app,
+            crate::app::collection_navigation::PhysicalHistoryPreflightPayload::PdfOpenFailure(
+                super::PdfOpenFailure::NotConverted,
+            ),
+        );
+        app.poll_collection_history_transition(&egui::Context::default());
         assert!(app.epub_convert.is_some());
         assert_eq!(app.items, rows);
         assert!(matches!(
@@ -14367,17 +14452,21 @@ mod startup_open_path_resolve_tests {
             .fake_published_sender_for_test()();
         let ctx = egui::Context::default();
         let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
-        assert!(
-            app.pdf_enumerate_pending
-                .as_ref()
-                .and_then(|pending| pending.4.as_ref())
-                .and_then(|restore| restore.adoption.as_ref())
-                .is_some()
-        );
-        app.pdf_enumerate_pending.as_mut().unwrap().2 =
-            crate::pdf_loader::completed_enumerate_result_handle(
-                &epub,
-                Ok(crate::pdf_loader::PdfEnumerateResult {
+        assert!(matches!(
+            app.top_level_grid_view.history_navigation_transition(),
+            Some(super::HistoryNavigationTransition::Physical(request))
+                if request.request_id == request_id
+                    && matches!(request.phase, super::PhysicalHistoryPhase::Preflighting { .. })
+        ));
+        assert_eq!(app.items, rows);
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            super::top_level_grid_view::TopLevelGridSurface::DriveList
+        ));
+        super::phase_c_folder_nav_history_tests::replace_physical_history_preflight_for_test(
+            &mut app,
+            crate::app::collection_navigation::PhysicalHistoryPreflightPayload::PdfPages(
+                crate::pdf_loader::PdfEnumerateResult {
                     pages: vec![crate::pdf_loader::PdfPageEntry {
                         page_num: 0,
                         mtime: 1,
@@ -14388,9 +14477,10 @@ mod startup_open_path_resolve_tests {
                         id: 29,
                         pdf_size: 1,
                     }),
-                }),
-            );
-        app.poll_pdf_enumerate();
+                },
+            ),
+        );
+        app.poll_collection_history_transition(&ctx);
         assert_eq!(app.current_folder.as_deref(), Some(epub.as_path()));
         assert!(matches!(
             app.top_level_grid_view.surface(),
@@ -14633,17 +14723,25 @@ mod startup_open_path_resolve_tests {
     ) -> (mpsc::Sender<StartupOpenPathResolveResult>, Arc<AtomicBool>) {
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
+        let owner = crate::bookmark_browser::BookmarkOpenRequestOwner {
+            request_id,
+            target,
+            #[cfg(windows)]
+            detached_lease: None,
+        };
+        let navigation = app.main_folder_history_available().then(|| {
+            app.capture_main_list_navigation(
+                super::MainHistoryOperation::Direct(
+                    crate::app::DirectNavigationPurpose::Navigation,
+                ),
+                super::MainListSourceProof::Bookmark(owner.clone()),
+            )
+        });
         app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
+            navigation,
             diagnostic: None,
             requested: crate::pdf_loader::LeasedEpubPath::try_new(requested).unwrap(),
-            owner: StartupOpenPathOwner::Bookmark(
-                crate::bookmark_browser::BookmarkOpenRequestOwner {
-                    request_id,
-                    target,
-                    #[cfg(windows)]
-                    detached_lease: None,
-                },
-            ),
+            owner: StartupOpenPathOwner::Bookmark(owner),
             cancel: Arc::clone(&cancel),
             rx,
             started_at: std::time::Instant::now(),
@@ -14815,16 +14913,80 @@ mod startup_open_path_resolve_tests {
             pending_nav: None,
             pending_direct_nav: None,
             allow_direct_read: false,
-            fallback_cached_zip: None,
             completion:
                 crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Bookmark(owner),
             pending_sibling_output: None,
-            nav_history_rollback: None,
             auto_fullscreen: true,
             deferred_fullscreen: None,
             suppress_confirm: false,
             suppress_confirm_next_time: false,
         });
+        (tx, cancel)
+    }
+
+    fn install_main_bookmark_archive_transition(
+        app: &mut App,
+        source: PathBuf,
+        format: ArchiveFormat,
+        owner: crate::bookmark_browser::BookmarkOpenRequestOwner,
+        phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase,
+    ) -> (
+        mpsc::Sender<crate::ui_dialogs::archive_convert::ArchiveConvertMsg>,
+        Arc<AtomicBool>,
+    ) {
+        let bookmark_id = owner.request_id;
+        assert!(matches!(
+            app.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                source.clone(),
+                false,
+                super::OpenRequestOwner::Bookmark(owner),
+                crate::app::StartupListIntent::ExplicitList,
+            ),
+            super::FolderOpenOutcome::Classifying
+        ));
+        app.settle_open_path_classification_for_test();
+        let physical_id = match app.top_level_grid_view.history_navigation_transition() {
+            Some(super::HistoryNavigationTransition::Physical(request)) => {
+                assert!(matches!(&request.intent,
+                    super::PhysicalHistoryIntent::Bookmark { owner, .. }
+                        if owner.request_id == bookmark_id));
+                assert_eq!(request.path, source);
+                request.request_id
+            }
+            _ => panic!("main Bookmark conversion must start with a typed physical owner"),
+        };
+        super::phase_c_folder_nav_history_tests::replace_physical_history_preflight_for_test(
+            app,
+            crate::app::collection_navigation::PhysicalHistoryPreflightPayload::ConvertibleArchive(
+                crate::archive_converter::ArchiveImageSummary {
+                    image_count: 1,
+                    total_uncompressed_bytes: 1,
+                    nested_archive_count: 0,
+                },
+            ),
+        );
+        app.poll_collection_history_transition(&egui::Context::default());
+        assert!(
+            matches!(app.top_level_grid_view.history_navigation_transition(),
+            Some(super::HistoryNavigationTransition::Physical(request))
+                if request.request_id == physical_id
+                    && matches!(request.phase, super::PhysicalHistoryPhase::ArchiveConverting))
+        );
+        let state = app
+            .archive_convert
+            .as_mut()
+            .expect("typed archive conversion dialog");
+        assert_eq!(state.format, format);
+        assert_eq!(state.src_path, source);
+        assert!(matches!(state.completion,
+            crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::StagedHistory(id)
+                if id == physical_id));
+        state.cancel.store(true, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        state.cancel = Arc::clone(&cancel);
+        state.rx = rx;
+        state.phase = phase;
         (tx, cancel)
     }
 
@@ -14851,17 +15013,47 @@ mod startup_open_path_resolve_tests {
             pending_nav: None,
             pending_direct_nav: None,
             allow_direct_read: false,
-            fallback_cached_zip: None,
             completion:
                 crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
             pending_sibling_output: None,
-            nav_history_rollback: None,
             auto_fullscreen: false,
             deferred_fullscreen: None,
             suppress_confirm: false,
             suppress_confirm_next_time: false,
         });
         (tx, cancel)
+    }
+
+    fn write_bookmark_completion_zip(path: &Path) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("page-001.jpg", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut zip, b"page").unwrap();
+        zip.finish().unwrap();
+    }
+
+    fn finish_bookmark_cache_adoption(app: &mut App) {
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.top_level_grid_view.open_path_classification().is_some()
+            || app
+                .top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+            || app.zip_enumerate_pending.is_some()
+            || app.sidecar_restore_active()
+        {
+            app.settle_open_path_classification_for_test();
+            app.poll_collection_history_transition(&ctx);
+            app.poll_zip_enumerate();
+            app.poll_sidecar_restore(&ctx);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "bookmark cached adoption did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     fn assert_bookmark_is_awaiting_page(app: &App) {
@@ -14989,6 +15181,7 @@ mod startup_open_path_resolve_tests {
         let (_resolve_tx, resolve_rx) = mpsc::channel::<StartupOpenPathResolveResult>();
         let cancel = Arc::new(AtomicBool::new(false));
         app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
+            navigation: None,
             diagnostic: None,
             requested: crate::pdf_loader::LeasedEpubPath::try_new(
                 app.tmp.path().join("unresolved-startup-target"),
@@ -15109,15 +15302,16 @@ mod startup_open_path_resolve_tests {
         ));
         assert!(
             tx.send(
-                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Ok((
-                    crate::archive_converter::ArchiveImageSummary {
-                        image_count: 1,
-                        total_uncompressed_bytes: 1,
-                        nested_archive_count: 0,
-                    },
-                    false,
-                    PathBuf::from("late.7z"),
-                )))
+                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Ok(
+                    crate::ui_dialogs::archive_convert::ArchiveScanOutcome::NeedsConversion {
+                        source: PathBuf::from("late.7z"),
+                        summary: crate::archive_converter::ArchiveImageSummary {
+                            image_count: 1,
+                            total_uncompressed_bytes: 1,
+                            nested_archive_count: 0,
+                        }
+                    }
+                ))
             )
             .is_err(),
             "late scan result must not recreate the cancelled dialog"
@@ -15152,15 +15346,16 @@ mod startup_open_path_resolve_tests {
         ));
         assert!(
             tx_a.send(
-                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Ok((
-                    crate::archive_converter::ArchiveImageSummary {
-                        image_count: 1,
-                        total_uncompressed_bytes: 1,
-                        nested_archive_count: 0,
-                    },
-                    false,
-                    archive_a,
-                )))
+                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Ok(
+                    crate::ui_dialogs::archive_convert::ArchiveScanOutcome::NeedsConversion {
+                        source: archive_a,
+                        summary: crate::archive_converter::ArchiveImageSummary {
+                            image_count: 1,
+                            total_uncompressed_bytes: 1,
+                            nested_archive_count: 0,
+                        }
+                    }
+                ))
             )
             .is_err(),
             "archive A receiver must be dropped before its late completion"
@@ -15267,7 +15462,7 @@ mod startup_open_path_resolve_tests {
         let cached = app.tmp.path().join("activation-refused-book.zip");
         let outside = app.tmp.path().join("activation-refused-outside");
         std::fs::write(&source, b"7z").unwrap();
-        std::fs::write(&cached, []).unwrap();
+        write_bookmark_completion_zip(&cached);
         std::fs::create_dir_all(&outside).unwrap();
         activate_single_archive_snapshot(&mut app, &source);
         let before = app.current_folder.clone();
@@ -15278,9 +15473,9 @@ mod startup_open_path_resolve_tests {
             source.clone(),
             std::time::Instant::now(),
         );
-        let (tx, cancel) = install_bookmark_archive_transition(
+        let (tx, cancel) = install_main_bookmark_archive_transition(
             &mut app,
-            source,
+            source.clone(),
             ArchiveFormat::SevenZ,
             owner,
             crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Converting {
@@ -15332,10 +15527,21 @@ mod startup_open_path_resolve_tests {
 
         assert!(cancel.load(Ordering::Relaxed));
         assert!(app.archive_convert.is_none());
+        finish_bookmark_cache_adoption(&mut app);
         assert!(crate::folder_tree::path_eq(
             app.current_folder.as_deref().unwrap(),
             &cached
         ));
+        assert_eq!(
+            app.archive_source_override.as_deref(),
+            Some(source.as_path())
+        );
+        assert_eq!(
+            app.bookmark_open_pending
+                .as_ref()
+                .map(crate::bookmark_browser::PendingBookmarkOpen::request_id),
+            Some(request_id)
+        );
         assert_bookmark_is_awaiting_page(&app);
         assert!(app.bookmark_view_state.is_some());
         // Mutation: change the defer predicate to false. Activation immediately drops both
@@ -15378,6 +15584,7 @@ mod startup_open_path_resolve_tests {
 
         assert!(!cancel.load(Ordering::Relaxed));
         tx.send(StartupOpenPathResolveResult {
+            rar_volume_proof: None,
             requested: source.clone(),
             resolved: Some(crate::folder_tree::OpenablePathResolution {
                 path: source.clone(),
@@ -15409,11 +15616,38 @@ mod startup_open_path_resolve_tests {
 
         assert!(cancel.load(Ordering::Relaxed));
         assert!(app.startup_open_path_resolve_pending.is_none());
-        assert!(
-            app.pdf_enumerate_pending
-                .as_ref()
-                .is_some_and(|(path, _, _, _, _, _, _)| crate::folder_tree::path_eq(path, &source))
+        let pending = app
+            .pdf_enumerate_pending
+            .as_mut()
+            .expect("native PDF owner");
+        assert!(crate::folder_tree::path_eq(&pending.0, &source));
+        assert!(matches!(
+            pending.3.as_ref(),
+            OpenRequestOwner::Bookmark(owner) if owner.request_id == request_id
+        ));
+        assert!(matches!(
+            pending.4.as_ref().and_then(|restore| restore.adoption.as_ref()),
+            Some(adoption) if matches!(
+                &adoption.navigation.source_proof,
+                super::MainListSourceProof::Bookmark(owner) if owner.request_id == request_id
+            )
+        ));
+        pending.2 = crate::pdf_loader::completed_enumerate_result_handle(
+            &source,
+            Ok(crate::pdf_loader::PdfEnumerateResult {
+                pages: vec![crate::pdf_loader::PdfPageEntry {
+                    page_num: 0,
+                    mtime: 1,
+                    file_size: 1,
+                }],
+                direction: None,
+                stamp: None,
+            }),
         );
+        assert!(app.is_snapshot_active());
+        assert!(matches!(app.items.first(), Some(GridItem::PdfFile(_))));
+        app.poll_pdf_enumerate();
+        assert_eq!(app.current_folder.as_deref(), Some(source.as_path()));
         assert_bookmark_is_awaiting_page(&app);
         // Mutation: replace Some(Box::new(pending)) with None in Activation adoption. The
         // resolver token is cancelled and the completion send fails.
@@ -15510,15 +15744,16 @@ mod startup_open_path_resolve_tests {
         assert!(app.archive_convert.is_none());
         assert!(
             tx.send(
-                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Ok((
-                    crate::archive_converter::ArchiveImageSummary {
-                        image_count: 1,
-                        total_uncompressed_bytes: 1,
-                        nested_archive_count: 0,
-                    },
-                    false,
-                    PathBuf::from("late.7z"),
-                )))
+                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Ok(
+                    crate::ui_dialogs::archive_convert::ArchiveScanOutcome::NeedsConversion {
+                        source: PathBuf::from("late.7z"),
+                        summary: crate::archive_converter::ArchiveImageSummary {
+                            image_count: 1,
+                            total_uncompressed_bytes: 1,
+                            nested_archive_count: 0,
+                        }
+                    }
+                ))
             )
             .is_err()
         );
@@ -15549,15 +15784,16 @@ mod startup_open_path_resolve_tests {
         assert!(app.borrow().archive_convert.is_none());
         assert!(
             tx.send(
-                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Ok((
-                    crate::archive_converter::ArchiveImageSummary {
-                        image_count: 1,
-                        total_uncompressed_bytes: 1,
-                        nested_archive_count: 0,
-                    },
-                    false,
-                    PathBuf::from("late.7z"),
-                )))
+                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Ok(
+                    crate::ui_dialogs::archive_convert::ArchiveScanOutcome::NeedsConversion {
+                        source: PathBuf::from("late.7z"),
+                        summary: crate::archive_converter::ArchiveImageSummary {
+                            image_count: 1,
+                            total_uncompressed_bytes: 1,
+                            nested_archive_count: 0,
+                        }
+                    }
+                ))
             )
             .is_err()
         );
@@ -15571,7 +15807,7 @@ mod startup_open_path_resolve_tests {
         let source = app.tmp.path().join("cached-book.7z");
         let cached = app.tmp.path().join("cached-book.zip");
         std::fs::write(&source, b"7z").unwrap();
-        std::fs::write(&cached, []).unwrap();
+        write_bookmark_completion_zip(&cached);
         let owner = arm_archive_bookmark(
             &mut app,
             request_id,
@@ -15588,7 +15824,7 @@ mod startup_open_path_resolve_tests {
                 metadata.len() as i64,
                 ArchiveFormat::SevenZ,
                 &cached,
-                0,
+                std::fs::metadata(&cached).unwrap().len() as i64,
                 1,
                 false,
             )
@@ -15597,6 +15833,7 @@ mod startup_open_path_resolve_tests {
         app.finish_startup_open_path_resolve(
             StartupOpenPathOwner::Bookmark(owner),
             StartupOpenPathResolveResult {
+                rar_volume_proof: None,
                 requested: source.clone(),
                 resolved: Some(crate::folder_tree::OpenablePathResolution {
                     path: source.clone(),
@@ -15610,6 +15847,7 @@ mod startup_open_path_resolve_tests {
         );
         app.settle_open_path_classification_for_test();
 
+        finish_bookmark_cache_adoption(&mut app);
         assert!(crate::folder_tree::path_eq(
             app.current_folder.as_deref().unwrap(),
             &cached
@@ -15664,14 +15902,14 @@ mod startup_open_path_resolve_tests {
         let source = app.tmp.path().join("converted-book.7z");
         let cached = app.tmp.path().join("converted-book.zip");
         std::fs::write(&source, b"7z").unwrap();
-        std::fs::write(&cached, []).unwrap();
+        write_bookmark_completion_zip(&cached);
         let owner = arm_archive_bookmark(
             &mut app,
             request_id,
             source.clone(),
             std::time::Instant::now(),
         );
-        let (_tx, _cancel) = install_bookmark_archive_transition(
+        let (_tx, _cancel) = install_main_bookmark_archive_transition(
             &mut app,
             source.clone(),
             ArchiveFormat::SevenZ,
@@ -15686,6 +15924,7 @@ mod startup_open_path_resolve_tests {
         });
 
         assert!(app.archive_convert.is_none());
+        finish_bookmark_cache_adoption(&mut app);
         assert!(crate::folder_tree::path_eq(
             app.current_folder.as_deref().unwrap(),
             &cached
@@ -15693,6 +15932,16 @@ mod startup_open_path_resolve_tests {
         assert_eq!(
             app.archive_source_override.as_deref(),
             Some(source.as_path())
+        );
+        assert_eq!(
+            app.archive_source_override.as_deref(),
+            Some(source.as_path())
+        );
+        assert_eq!(
+            app.bookmark_open_pending
+                .as_ref()
+                .map(crate::bookmark_browser::PendingBookmarkOpen::request_id),
+            Some(request_id)
         );
         assert_bookmark_is_awaiting_page(&app);
     }
@@ -15865,6 +16114,7 @@ mod startup_open_path_resolve_tests {
         let mut app = setup_app();
         let (_tx, rx) = mpsc::channel();
         app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
+            navigation: None,
             diagnostic: None,
             requested: crate::pdf_loader::LeasedEpubPath::try_new(PathBuf::from(
                 r"\\server\offline\book.zip",
@@ -15899,6 +16149,7 @@ mod startup_open_path_resolve_tests {
         let (_tx, rx) = mpsc::channel();
         let old_cancel = Arc::new(AtomicBool::new(false));
         app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
+            navigation: None,
             diagnostic: None,
             requested: crate::pdf_loader::LeasedEpubPath::try_new(PathBuf::from(
                 r"\\server\slow\old.zip",
@@ -15952,6 +16203,7 @@ mod startup_open_path_resolve_tests {
         ));
         assert!(
             tx.send(StartupOpenPathResolveResult {
+                rar_volume_proof: None,
                 requested: PathBuf::from("old.mp4"),
                 resolved: None,
                 bookmark_relative_page_openable: None,
@@ -16000,6 +16252,7 @@ mod startup_open_path_resolve_tests {
         assert!(app.bookmark_view_state.is_none());
         assert!(
             tx.send(StartupOpenPathResolveResult {
+                rar_volume_proof: None,
                 requested: PathBuf::from("bookmark.7z"),
                 resolved: None,
                 bookmark_relative_page_openable: None,
@@ -16112,6 +16365,7 @@ mod startup_open_path_resolve_tests {
                 detached_lease: None,
             }),
             StartupOpenPathResolveResult {
+                rar_volume_proof: None,
                 requested: target_a,
                 resolved: Some(crate::folder_tree::OpenablePathResolution {
                     path: stale_resolved_folder,
@@ -16796,7 +17050,7 @@ mod phase_c_key_tests {
         let origin = PathBuf::from("C:/pics/origin");
         app.current_folder = Some(origin.clone());
         app.show_search_bar = true;
-        app.search_filter = Some(std::collections::HashSet::new());
+        app.search_filter = Some(std::collections::HashSet::new().into());
         app.search_filter_origin_folder = Some(origin);
 
         let nav = grid_key_nav(&mut app, egui::Modifiers::NONE, egui::Key::Backspace);
@@ -16816,7 +17070,7 @@ mod phase_c_key_tests {
         let child = origin.join("child");
         app.current_folder = Some(child);
         app.show_search_bar = true;
-        app.search_filter = Some(std::collections::HashSet::new());
+        app.search_filter = Some(std::collections::HashSet::new().into());
         app.search_filter_origin_folder = Some(origin.clone());
 
         let nav = grid_key_nav(&mut app, egui::Modifiers::NONE, egui::Key::Backspace);
@@ -16841,6 +17095,121 @@ mod phase_c_key_tests {
             }
             other => panic!("ドライブルートの BS は DriveList nav を返すこと: {other:?}"),
         }
+    }
+
+    fn section1339_start_parent_from_backspace(app: &mut App) -> PathBuf {
+        let nav = grid_key_nav(app, egui::Modifiers::NONE, egui::Key::Backspace);
+        let Some(crate::ui_main::AddressBarNav::Direct(parent, intent)) = nav else {
+            panic!("normal Backspace must dispatch the typed parent request");
+        };
+        assert!(app.start_physical_history_transition(
+            PhysicalHistoryIntent::Navigation {
+                replay: None,
+                auto_fullscreen: false
+            },
+            parent.clone(),
+            intent,
+        ));
+        parent
+    }
+
+    #[test]
+    fn section1339_parent_failure_and_supersession_do_not_leak_child_selection_hint() {
+        for fail in [true, false] {
+            let mut app = setup_app();
+            app.active_quick_folder_slot = None;
+            app.settings.sidecar_backup_enabled = false;
+            let parent = app.tmp.path().join("old-parent");
+            let child = parent.join("child");
+            let later = app.tmp.path().join("later");
+            std::fs::create_dir_all(&child).unwrap();
+            std::fs::create_dir_all(later.join("a-first")).unwrap();
+            std::fs::create_dir_all(later.join("child")).unwrap();
+            std::fs::write(child.join("page.jpg"), b"fixture").unwrap();
+            app.load_folder(child.clone());
+            app.selected = Some(0);
+            let source_rows = app.items.clone();
+            let source_selected = app.selected;
+            let history = app.folder_nav_history_snapshot();
+            if fail {
+                // External deletion while the source grid is mounted makes the real parent
+                // worker fail; its displayed rows and selection still belong to the source.
+                std::fs::remove_dir_all(&parent).unwrap();
+            }
+            assert_eq!(section1339_start_parent_from_backspace(&mut app), parent);
+            assert!(
+                app.select_after_load.is_none(),
+                "the request owns the hint while pending"
+            );
+            assert_eq!(app.current_folder.as_ref(), Some(&child));
+            assert_eq!(app.items, source_rows);
+            assert_eq!(app.selected, source_selected);
+            if fail {
+                super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(
+                    &mut app,
+                );
+                assert_eq!(app.current_folder.as_ref(), Some(&child));
+                assert_eq!(app.items, source_rows);
+                assert_eq!(app.selected, source_selected);
+                assert_eq!(app.folder_nav_back_stack, history.back_stack);
+                assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+                assert!(app.select_after_load.is_none());
+            }
+            // In the other branch this independent successful open supersedes the pending
+            // parent request. Neither terminal may select its old child name in this folder.
+            app.folder_history.insert(later.clone(), (0.0, Some(0)));
+            let scan = crate::app::scan_directory(&later);
+            app.load_folder_with_scan(later.clone(), Some(scan));
+            assert_eq!(app.current_folder.as_ref(), Some(&later));
+            let selected = app
+                .selected
+                .and_then(|index| app.items.get(index))
+                .and_then(GridItem::drag_source_path);
+            assert_eq!(selected, Some(later.join("a-first").as_path()));
+            assert!(app.select_after_load.is_none());
+            app.poll_collection_history_transition(&egui::Context::default());
+            assert_eq!(app.current_folder.as_ref(), Some(&later));
+            assert_eq!(
+                app.selected
+                    .and_then(|index| app.items.get(index))
+                    .and_then(GridItem::drag_source_path),
+                Some(later.join("a-first").as_path())
+            );
+        }
+    }
+
+    #[test]
+    fn section1339_successful_parent_backspace_selects_the_exact_departed_child() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = false;
+        let parent = app.tmp.path().join("parent-selection");
+        let child = parent.join("child");
+        std::fs::create_dir_all(parent.join("a-first")).unwrap();
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("page.jpg"), b"fixture").unwrap();
+        app.load_folder(child.clone());
+        app.selected = Some(0);
+        let rows = app.items.clone();
+        let history = app.folder_nav_history_snapshot();
+        assert_eq!(section1339_start_parent_from_backspace(&mut app), parent);
+        assert_eq!(app.current_folder.as_ref(), Some(&child));
+        assert_eq!(app.items, rows);
+        assert_eq!(app.selected, Some(0));
+        assert!(app.select_after_load.is_none());
+        super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(app.current_folder.as_ref(), Some(&parent));
+        assert_eq!(
+            app.selected
+                .and_then(|index| app.items.get(index))
+                .and_then(GridItem::drag_source_path),
+            Some(child.as_path())
+        );
+        assert_eq!(
+            app.folder_nav_back_stack.len(),
+            history.back_stack.len() + 1
+        );
+        assert!(app.select_after_load.is_none());
     }
 
     #[test]
@@ -16906,7 +17275,7 @@ mod phase_c_key_tests {
         let origin = PathBuf::from("C:/pics/origin");
         app.current_folder = Some(origin.clone());
         app.show_search_bar = true;
-        app.search_filter = Some(std::collections::HashSet::new());
+        app.search_filter = Some(std::collections::HashSet::new().into());
         app.search_filter_origin_folder = Some(origin);
 
         let nav = app.handle_gamepad_grid_back();
@@ -17183,16 +17552,19 @@ mod phase_c_key_tests {
         let validated = events.next().unwrap();
         assert!(events.next().is_none());
         assert_eq!(
-            seed.origin,
+            seed.pixels().unwrap().origin,
             crate::thumb_loader::ThumbLoadOrigin::DriveListChildSeed
         );
-        assert!(seed.image.is_some());
-        assert_eq!(seed.source_dims, Some((80, 60)));
+        assert!(seed.pixels().is_some());
+        assert_eq!(
+            seed.pixels().and_then(|pixels| pixels.source_dims),
+            Some((80, 60))
+        );
         assert!(
-            validated.finalized,
+            validated.is_finalized(),
             "identical current row needs no second image"
         );
-        assert!(validated.image.is_none());
+        assert!(validated.pixels().is_none());
 
         app.thumbnails = vec![ThumbnailState::Pending];
         app.keep_set.insert(0);
@@ -17342,7 +17714,10 @@ mod phase_c_key_tests {
             None,
             None,
         );
-        assert_eq!(rx.try_recv().unwrap().image.unwrap().pixels[0].r(), 32);
+        assert_eq!(
+            rx.try_recv().unwrap().into_pixels().unwrap().image.pixels[0].r(),
+            32
+        );
     }
 
     #[test]
@@ -17409,7 +17784,7 @@ mod phase_c_key_tests {
             None,
             None,
         );
-        assert!(writer_rx.try_iter().any(|msg| msg.image.is_some()));
+        assert!(writer_rx.try_iter().any(|msg| msg.pixels().is_some()));
         let row = parent.load_one(&base_key).unwrap().unwrap();
         assert_eq!(
             row.folder_provenance,
@@ -17457,15 +17832,18 @@ mod phase_c_key_tests {
             );
             rx.try_iter().collect::<Vec<_>>()
         };
-        assert!(load()[0].image.is_some(), "valid auto row must be shown");
+        assert!(load()[0].pixels().is_some(), "valid auto row must be shown");
         std::fs::remove_file(&winner).unwrap();
         let stale = load();
-        assert!(stale.iter().all(|msg| msg.image.is_none()));
-        assert!(
-            stale.iter().any(|msg| {
-                msg.origin == crate::thumb_loader::ThumbLoadOrigin::DriveListChildMiss
-            })
-        );
+        assert!(stale.iter().all(|msg| msg.pixels().is_none()));
+        assert!(stale.iter().any(|msg| {
+            matches!(
+                msg.payload,
+                crate::thumb_loader::ThumbMsgPayload::Failed {
+                    origin: crate::thumb_loader::ThumbLoadOrigin::DriveListChildMiss
+                }
+            )
+        }));
     }
 
     #[test]
@@ -17478,18 +17856,20 @@ mod phase_c_key_tests {
         app.keep_set = (0..9).collect();
         app.keep_range = (0, 9);
         app.requested.insert(8, false);
-        let message = |idx, image, origin| crate::thumb_loader::ThumbMsg {
-            idx,
-            image,
-            origin,
-            from_edit_preview: false,
-            edit_preview_adjustment: None,
-            source_dims: None,
-            layout_dims: None,
-            canceled: false,
-            finalized: false,
-            input_seq: 0,
-            items_gen: app.items_generation,
+        let message = |idx, image, origin| {
+            crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                idx,
+                image,
+                origin,
+                false,
+                None,
+                None,
+                None,
+                false,
+                false,
+                0,
+                app.items_generation,
+            )
         };
         for idx in 0..8 {
             app.tx
@@ -17683,12 +18063,17 @@ mod phase_c_key_tests {
             let mut finalized = false;
             let messages = rx.try_iter().collect::<Vec<_>>();
             for msg in &messages {
-                if msg.finalized {
+                if msg.is_finalized() {
                     finalized = true;
                     continue;
                 }
-                let red = msg.image.as_ref().map(|image| image.pixels[0].r());
-                if msg.origin == crate::thumb_loader::ThumbLoadOrigin::DriveListChildSeed {
+                let red = msg
+                    .pixels()
+                    .map(|pixels| &pixels.image)
+                    .map(|image| image.pixels[0].r());
+                if msg.pixels().is_some_and(|pixels| {
+                    pixels.origin == crate::thumb_loader::ThumbLoadOrigin::DriveListChildSeed
+                }) {
                     seed = red;
                 }
                 displayed = Some(red);
@@ -18157,7 +18542,10 @@ mod phase_c_key_tests {
             None,
             None,
         );
-        assert_eq!(rx.try_recv().unwrap().image.unwrap().pixels[0].r(), 40);
+        assert_eq!(
+            rx.try_recv().unwrap().into_pixels().unwrap().image.pixels[0].r(),
+            40
+        );
     }
 
     #[test]
@@ -18225,7 +18613,7 @@ mod phase_c_key_tests {
             None,
             None,
         );
-        assert!(rx.try_recv().unwrap().image.is_some());
+        assert!(rx.try_recv().unwrap().pixels().is_some());
     }
 
     #[test]
@@ -18328,8 +18716,11 @@ mod phase_c_key_tests {
             None,
         );
         let shown = rx.try_recv().unwrap();
-        assert!(shown.image.is_some());
-        assert_eq!(shown.source_dims, Some((100, 50)));
+        assert!(shown.pixels().is_some());
+        assert_eq!(
+            shown.pixels().and_then(|pixels| pixels.source_dims),
+            Some((100, 50))
+        );
     }
 
     #[test]
@@ -18480,6 +18871,7 @@ mod folder_pane_open_nav_tests {
 
     fn empty_scan() -> ScannedDir {
         ScannedDir {
+            complete_audio_inventory: None,
             folders: Vec::new(),
             all_media: Vec::new(),
             omitted: crate::app::folder_scan::OmittedFolderEntryCounts::default(),
@@ -18497,6 +18889,7 @@ mod folder_pane_open_nav_tests {
         let (tx, rx) = mpsc::channel();
         tx.send(Ok(empty_scan())).expect("send scan");
         app.folder_pane_open_pending = Some(FolderPaneOpenPending {
+            navigation: None,
             epub_restore: None,
             path: target.clone(),
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -18533,6 +18926,7 @@ mod folder_pane_open_nav_tests {
         let cancel = Arc::new(AtomicBool::new(false));
 
         app.folder_pane_open_pending = Some(FolderPaneOpenPending {
+            navigation: None,
             epub_restore: None,
             path: target,
             cancel: Arc::clone(&cancel),
@@ -18562,6 +18956,7 @@ mod folder_pane_open_nav_tests {
         let (pane_tx, pane_rx) = mpsc::channel();
         let pane_cancel = Arc::new(AtomicBool::new(false));
         app.folder_pane_open_pending = Some(FolderPaneOpenPending {
+            navigation: None,
             epub_restore: None,
             path: app.tmp.path().join("exact-pane-target"),
             cancel: Arc::clone(&pane_cancel),
@@ -18748,11 +19143,11 @@ mod quick_folder_restart_tests {
 #[cfg(test)]
 mod phase_c_folder_nav_history_tests {
     use crate::app::{
-        App, FolderHistoryDirection, FolderNavHistoryState, FolderNavHistoryTarget,
-        FolderOpenOutcome, FolderPaneOpenReady, GridClickSelectionAnchor, GridScrollIntent,
-        QuickFolderSlotId, QuickFolderSwitchTarget, RatingPhysicalLoadIntent, ScannedDir,
-        drive_current_key_for_letter, drive_current_key_for_path, drive_root_path_for_letter,
-        location_root_for_path, scan_directory,
+        App, FolderHistoryDirection, FolderHistoryPlan, FolderNavHistoryState,
+        FolderNavHistoryTarget, FolderOpenOutcome, FolderPaneOpenReady, GridClickSelectionAnchor,
+        GridScrollIntent, QuickFolderSlotId, QuickFolderSwitchTarget, RatingPhysicalLoadIntent,
+        ScannedDir, drive_current_key_for_letter, drive_current_key_for_path,
+        drive_root_path_for_letter, location_root_for_path, scan_directory,
     };
     use crate::archive_converter::ArchiveFormat;
     use crate::grid_item::GridItem;
@@ -18803,9 +19198,10 @@ mod phase_c_folder_nav_history_tests {
                 std::fs::create_dir_all(&origin).unwrap();
                 app.current_folder = Some(origin.clone());
                 app.active_quick_folder_slot = None;
-                app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(origin.join("back"))];
+                app.folder_nav_back_stack =
+                    vec![FolderNavHistoryTarget::Path(origin.join("back")).into()];
                 app.folder_nav_forward_stack =
-                    vec![FolderNavHistoryTarget::Path(origin.join("forward"))];
+                    vec![FolderNavHistoryTarget::Path(origin.join("forward")).into()];
                 match mode {
                     0 => app.open_global_search(),
                     1 => app.open_favsearch(),
@@ -18828,10 +19224,8 @@ mod phase_c_folder_nav_history_tests {
                         crate::ui_main::AddressBarNav::HistoryForward
                     )
                 ));
-                let mut rollback = None;
-                let result = app.dispatch_main_folder_history_input(direction, &mut rollback);
+                let result = app.dispatch_main_folder_history_input(direction);
                 assert!(result.is_none(), "search mode {mode}");
-                assert!(rollback.is_none());
                 assert_eq!(app.folder_nav_back_stack, before.back_stack);
                 assert_eq!(app.folder_nav_forward_stack, before.forward_stack);
             }
@@ -18858,9 +19252,10 @@ mod phase_c_folder_nav_history_tests {
                 std::fs::create_dir_all(&origin).unwrap();
                 app.current_folder = Some(origin.clone());
                 app.active_quick_folder_slot = None;
-                app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(origin.join("back"))];
+                app.folder_nav_back_stack =
+                    vec![FolderNavHistoryTarget::Path(origin.join("back")).into()];
                 app.folder_nav_forward_stack =
-                    vec![FolderNavHistoryTarget::Path(origin.join("forward"))];
+                    vec![FolderNavHistoryTarget::Path(origin.join("forward")).into()];
                 assert!(matches!(
                     (history_key_nav(&mut app, key), expected),
                     (
@@ -18877,10 +19272,8 @@ mod phase_c_folder_nav_history_tests {
                     _ => app.open_tag_view(),
                 }
                 let before = app.folder_nav_history_snapshot();
-                let mut rollback = None;
-                let result = app.dispatch_main_folder_history_input(direction, &mut rollback);
+                let result = app.dispatch_main_folder_history_input(direction);
                 assert!(result.is_none(), "search mode {mode}");
-                assert!(rollback.is_none());
                 assert!(history_key_nav(&mut app, key).is_none());
                 assert_eq!(app.folder_nav_back_stack, before.back_stack);
                 assert_eq!(app.folder_nav_forward_stack, before.forward_stack);
@@ -19004,11 +19397,19 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.settings.quick_folder_slots[0], Some(b.clone()));
 
         assert_eq!(
-            app.navigate_folder_history_back(),
+            app.folder_history_back_entry()
+                .map(|entry| entry.location.clone()),
             Some(FolderNavHistoryTarget::Path(a.clone()))
         );
-        app.record_folder_nav_transition(&a);
+        let plan = FolderHistoryPlan::capture(
+            &app,
+            FolderHistoryDirection::Back,
+            app.folder_history_back_entry().unwrap().clone(),
+        )
+        .unwrap();
+        plan.commit(&mut app);
         app.current_folder = Some(a.clone());
+        app.remember_recent_folder(&a);
 
         assert_eq!(
             app.quick_folder_workspaces[QuickFolderSlotId::A.index()]
@@ -19025,11 +19426,19 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.recent_folder_entries().first(), Some(&a));
 
         assert_eq!(
-            app.navigate_folder_history_forward(),
+            app.folder_history_forward_entry()
+                .map(|entry| entry.location.clone()),
             Some(FolderNavHistoryTarget::Path(b.clone()))
         );
-        app.record_folder_nav_transition(&b);
+        let plan = FolderHistoryPlan::capture(
+            &app,
+            FolderHistoryDirection::Forward,
+            app.folder_history_forward_entry().unwrap().clone(),
+        )
+        .unwrap();
+        plan.commit(&mut app);
         app.current_folder = Some(b.clone());
+        app.remember_recent_folder(&b);
 
         assert_eq!(
             app.quick_folder_workspaces[QuickFolderSlotId::A.index()]
@@ -19152,12 +19561,18 @@ mod phase_c_folder_nav_history_tests {
         app.active_quick_folder_slot = Some(QuickFolderSlotId::B);
         app.remember_recent_folder(&PathBuf::from(r"D:\miv-test\recent-b"));
         for (index, workspace) in app.quick_folder_workspaces.iter_mut().enumerate() {
-            workspace.history.back_stack = vec![FolderNavHistoryTarget::Path(PathBuf::from(
-                format!(r"C:\miv-test\slot-{index}-back"),
-            ))];
-            workspace.history.forward_stack = vec![FolderNavHistoryTarget::Path(PathBuf::from(
-                format!(r"C:\miv-test\slot-{index}-forward"),
-            ))];
+            workspace.history.back_stack = vec![
+                FolderNavHistoryTarget::Path(PathBuf::from(format!(
+                    r"C:\miv-test\slot-{index}-back"
+                )))
+                .into(),
+            ];
+            workspace.history.forward_stack = vec![
+                FolderNavHistoryTarget::Path(PathBuf::from(format!(
+                    r"C:\miv-test\slot-{index}-forward"
+                )))
+                .into(),
+            ];
             workspace.history.suppress_record_once = true;
         }
         app.folder_history.insert(current.clone(), (420.0, Some(3)));
@@ -19452,7 +19867,7 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.current_quick_folder_target(), None);
 
         app.show_search_bar = false;
-        app.search_filter = Some(std::collections::HashSet::new());
+        app.search_filter = Some(std::collections::HashSet::new().into());
         assert_eq!(app.current_quick_folder_target(), None);
     }
 
@@ -19518,9 +19933,17 @@ mod phase_c_folder_nav_history_tests {
         app.active_quick_folder_slot = Some(QuickFolderSlotId::A);
         app.current_folder = Some(a_child.clone());
         assert_eq!(
-            app.navigate_folder_history_back(),
+            app.folder_history_back_entry()
+                .map(|entry| entry.location.clone()),
             Some(FolderNavHistoryTarget::Path(a.clone()))
         );
+        let plan = FolderHistoryPlan::capture(
+            &app,
+            FolderHistoryDirection::Back,
+            app.folder_history_back_entry().unwrap().clone(),
+        )
+        .unwrap();
+        plan.commit(&mut app);
         assert!(
             app.quick_folder_workspaces[QuickFolderSlotId::B.index()]
                 .history
@@ -19552,7 +19975,7 @@ mod phase_c_folder_nav_history_tests {
         panic!("physical history preflight did not settle");
     }
 
-    fn replace_physical_history_preflight_for_test(
+    pub(super) fn replace_physical_history_preflight_for_test(
         app: &mut App,
         payload: crate::app::collection_navigation::PhysicalHistoryPreflightPayload,
     ) {
@@ -19863,7 +20286,7 @@ mod phase_c_folder_nav_history_tests {
         app.settings
             .set_archive_file_handling(ArchiveFileHandling::Ask);
         let epub_target = FolderNavHistoryTarget::Path(epub.clone());
-        app.folder_nav_back_stack.push(epub_target.clone());
+        app.folder_nav_back_stack.push(epub_target.clone().into());
         let before_rows = app.items.clone();
         let before_address = app.address.clone();
         let before_back = app.folder_nav_back_stack.clone();
@@ -19928,7 +20351,11 @@ mod phase_c_folder_nav_history_tests {
         );
         app.poll_collection_history_transition(&ctx);
         assert_eq!(app.current_folder.as_deref(), Some(pdf.as_path()));
-        assert!(app.folder_nav_back_stack.contains(&epub_target));
+        assert!(
+            app.folder_nav_back_stack
+                .iter()
+                .any(|entry| entry.location == epub_target)
+        );
         assert!(app.folder_nav_forward_stack.is_empty());
         assert!(app.pdf_enumerate_pending.is_none());
     }
@@ -20098,7 +20525,7 @@ mod phase_c_folder_nav_history_tests {
         assert!(app.favsearch.nav_stack.is_empty());
         assert_eq!(app.reading_history_return_from, Some(prior_reading.clone()));
         assert!(app.rating_filter_suppressed_at.is_none());
-        assert!(app.facet_filter_suppression_stack.is_empty());
+        assert!(!app.facet_navigation.suppressed());
         assert_eq!(
             app.settings.rating_filter,
             [false, false, false, false, false, true]
@@ -20117,7 +20544,7 @@ mod phase_c_folder_nav_history_tests {
         assert!(app.favsearch.nav_stack.is_empty());
         assert_eq!(app.reading_history_return_from, Some(prior_reading));
         assert!(app.rating_filter_suppressed_at.is_none());
-        assert!(app.facet_filter_suppression_stack.is_empty());
+        assert!(!app.facet_navigation.suppressed());
         assert_eq!(
             app.settings.rating_filter,
             [false, false, false, false, false, true]
@@ -20172,7 +20599,7 @@ mod phase_c_folder_nav_history_tests {
         assert!(app.favsearch.nav_stack.is_empty());
         assert_eq!(app.reading_history_return_from, Some(prior_reading.clone()));
         assert!(app.rating_filter_suppressed_at.is_none());
-        assert!(app.facet_filter_suppression_stack.is_empty());
+        assert!(!app.facet_navigation.suppressed());
         assert_eq!(
             app.settings.rating_filter,
             [false, false, false, false, false, true]
@@ -20191,7 +20618,7 @@ mod phase_c_folder_nav_history_tests {
         assert!(app.favsearch.nav_stack.is_empty());
         assert_eq!(app.reading_history_return_from, Some(prior_reading));
         assert!(app.rating_filter_suppressed_at.is_none());
-        assert!(app.facet_filter_suppression_stack.is_empty());
+        assert!(!app.facet_navigation.suppressed());
         assert_eq!(
             app.settings.rating_filter,
             [false, false, false, false, false, true]
@@ -20319,7 +20746,7 @@ mod phase_c_folder_nav_history_tests {
             ));
             assert_eq!(app.reading_history_return_from, Some(source));
             assert!(app.rating_filter_suppressed_at.is_none());
-            assert!(app.facet_filter_suppression_stack.is_empty());
+            assert!(!app.facet_navigation.suppressed());
             assert_eq!(app.settings.facet_filter, facet_before);
             assert!(!app.pending_auto_fs_open);
             assert_eq!(app.folder_nav_back_stack, history.back_stack);
@@ -20347,7 +20774,7 @@ mod phase_c_folder_nav_history_tests {
             ));
             assert_eq!(app.reading_history_return_from, Some(path.clone()));
             assert!(app.rating_filter_suppressed_at.is_some());
-            assert_eq!(app.facet_filter_suppression_stack.len(), 1);
+            assert_eq!(app.facet_navigation.saved_frame_count(), 1);
             assert!(app.settings.facet_filter.kinds.is_empty());
             assert!(!app.visible_indices.is_empty());
             assert!(app.fullscreen_idx.is_some() || app.fs_nav_after_pdf_enumerate.is_some());
@@ -20390,7 +20817,7 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.current_folder.as_deref(), Some(target.as_path()));
         assert_eq!(app.reading_history_return_from, Some(target));
         assert!(app.rating_filter_suppressed_at.is_some());
-        assert_eq!(app.facet_filter_suppression_stack.len(), 1);
+        assert_eq!(app.facet_navigation.saved_frame_count(), 1);
         assert_eq!(app.visible_indices, vec![0]);
         assert_eq!(app.fullscreen_idx, Some(0));
     }
@@ -20816,13 +21243,12 @@ mod phase_c_folder_nav_history_tests {
         let normal_prev = PathBuf::from(r"C:\miv-test\normal-prev");
         let a = PathBuf::from(r"C:\miv-test\a");
         let b = PathBuf::from(r"C:\miv-test\b");
-        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(normal_prev.clone())];
+        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(normal_prev.clone()).into()];
         app.set_quick_folder_slot_target(QuickFolderSlotId::A, a.clone());
         app.quick_folder_workspaces[QuickFolderSlotId::A.index()]
             .history
-            .back_stack = vec![FolderNavHistoryTarget::Path(PathBuf::from(
-            r"C:\miv-test\a-prev",
-        ))];
+            .back_stack =
+            vec![FolderNavHistoryTarget::Path(PathBuf::from(r"C:\miv-test\a-prev")).into()];
         app.set_quick_folder_slot_target(QuickFolderSlotId::B, b.clone());
         app.active_quick_folder_slot = Some(QuickFolderSlotId::A);
 
@@ -20959,8 +21385,8 @@ mod phase_c_folder_nav_history_tests {
 
         app.current_folder = Some(cached_zip.clone());
         app.archive_source_override = Some(source);
-        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(previous.clone())];
-        app.folder_nav_forward_stack = vec![FolderNavHistoryTarget::Path(forward.clone())];
+        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(previous.clone()).into()];
+        app.folder_nav_forward_stack = vec![FolderNavHistoryTarget::Path(forward.clone()).into()];
         app.recent_folders = vec![recent.clone()];
 
         app.record_folder_nav_transition(&cached_zip);
@@ -20971,7 +21397,7 @@ mod phase_c_folder_nav_history_tests {
     }
 
     #[test]
-    fn cancelled_history_navigation_to_unconverted_archive_restores_stacks() {
+    fn cancelled_history_navigation_to_unconverted_archive_preserves_stacks() {
         let mut app = setup_app();
         let a = PathBuf::from(r"C:\miv-test\a");
         let current = PathBuf::from(r"C:\miv-test\current");
@@ -20981,8 +21407,8 @@ mod phase_c_folder_nav_history_tests {
 
         app.current_folder = Some(current.clone());
         app.quick_folder_workspaces[slot.index()].history.back_stack = vec![
-            FolderNavHistoryTarget::Path(a.clone()),
-            FolderNavHistoryTarget::Path(archive.clone()),
+            FolderNavHistoryTarget::Path(a.clone()).into(),
+            FolderNavHistoryTarget::Path(archive.clone()).into(),
         ];
         app.quick_folder_workspaces[slot.index()]
             .history
@@ -20991,58 +21417,65 @@ mod phase_c_folder_nav_history_tests {
 
         let snapshot = app.folder_nav_history_snapshot();
         assert_eq!(
-            app.navigate_folder_history_back(),
+            app.folder_history_back_entry()
+                .map(|entry| entry.location.clone()),
             Some(FolderNavHistoryTarget::Path(archive.clone()))
         );
-        assert_eq!(
-            app.quick_folder_workspaces[slot.index()].history.back_stack,
-            vec![a.clone()]
-        );
-        assert_eq!(
-            app.quick_folder_workspaces[slot.index()]
-                .history
-                .forward_stack,
-            vec![current.clone()]
-        );
-        assert!(
-            app.quick_folder_workspaces[slot.index()]
-                .history
-                .suppress_record_once
-        );
-
-        let (_tx, rx) = mpsc::channel();
+        app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
+        app.settle_open_path_classification_for_test();
+        let mut transition = app
+            .top_level_grid_view
+            .take_history_navigation_transition()
+            .unwrap();
+        let crate::app::HistoryNavigationTransition::Physical(request) = &mut transition else {
+            panic!("expected archive history request");
+        };
+        request.phase = crate::app::PhysicalHistoryPhase::ArchiveConverting;
+        let request_id = request.request_id;
+        app.replace_history_navigation_transition(Some(transition));
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
             restore_intent: crate::app::StartupListIntent::ExplicitList,
-
             src_path: archive.clone(),
-            input_seq: 0,
+            input_seq: app.input_seq,
             format: ArchiveFormat::Lzh,
             password: None,
             password_input: String::new(),
             phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
-            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cancel: std::sync::Arc::clone(&cancel),
             rx,
             pending_nav: None,
             pending_direct_nav: None,
             allow_direct_read: false,
-            fallback_cached_zip: None,
             completion:
-                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
+                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::StagedHistory(
+                    request_id,
+                ),
             pending_sibling_output: None,
-            nav_history_rollback: None,
             auto_fullscreen: false,
             deferred_fullscreen: None,
             suppress_confirm: false,
             suppress_confirm_next_time: false,
         });
-        app.attach_archive_convert_nav_history_rollback(snapshot);
-        let rollback = app
-            .archive_convert
-            .as_ref()
-            .and_then(|state| state.nav_history_rollback.clone())
-            .expect("history rollback snapshot should be attached to the convert dialog");
-        app.archive_convert = None;
-        app.restore_folder_nav_history(rollback);
+        assert_eq!(
+            app.folder_nav_history_snapshot().back_stack,
+            snapshot.back_stack
+        );
+        assert_eq!(
+            app.folder_nav_history_snapshot().forward_stack,
+            snapshot.forward_stack
+        );
+        assert!(app.cancel_archive_convert_for_navigation("test_history_dialog_cancel"));
+        app.poll_collection_history_transition(&egui::Context::default());
+        assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(app.archive_convert.is_none());
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_none()
+        );
+        assert_eq!(app.current_folder.as_deref(), Some(current.as_path()));
 
         assert_eq!(
             app.quick_folder_workspaces[slot.index()].history.back_stack,
@@ -21063,7 +21496,7 @@ mod phase_c_folder_nav_history_tests {
     }
 
     #[test]
-    fn cancelled_conversion_restores_favsearch_nav_stack() {
+    fn cancelled_conversion_preserves_favsearch_nav_stack() {
         let mut app = setup_app();
         let root = PathBuf::from(r"C:\miv-test\search-root");
         let current = PathBuf::from(r"C:\miv-test\search-root\current");
@@ -21073,7 +21506,6 @@ mod phase_c_folder_nav_history_tests {
         app.favsearch.active = true;
         app.favsearch.nav_stack = vec![root.clone(), current.clone()];
         let snapshot = app.folder_nav_history_snapshot();
-        app.favsearch.nav_stack.push(archive.clone());
 
         let (_tx, rx) = mpsc::channel();
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
@@ -21090,33 +21522,32 @@ mod phase_c_folder_nav_history_tests {
             pending_nav: None,
             pending_direct_nav: None,
             allow_direct_read: false,
-            fallback_cached_zip: None,
             completion:
                 crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
             pending_sibling_output: None,
-            nav_history_rollback: None,
             auto_fullscreen: false,
             deferred_fullscreen: None,
             suppress_confirm: false,
             suppress_confirm_next_time: false,
         });
-        app.attach_archive_convert_nav_history_rollback(snapshot);
-        let rollback = app
-            .archive_convert
-            .as_ref()
-            .and_then(|state| state.nav_history_rollback.clone())
-            .expect("history rollback snapshot should be attached to the convert dialog");
-        app.archive_convert = None;
-        app.restore_folder_nav_history(rollback);
+        assert!(app.cancel_archive_convert_for_navigation("test_search_conversion_cancel"));
+        assert_eq!(
+            app.folder_nav_history_snapshot().back_stack,
+            snapshot.back_stack
+        );
+        assert_eq!(
+            app.folder_nav_history_snapshot().forward_stack,
+            snapshot.forward_stack
+        );
 
         assert_eq!(app.favsearch.nav_stack, vec![root, current]);
     }
 
     #[test]
-    fn successful_navigation_clears_stale_archive_convert_rollback() {
+    fn archive_cancellation_cannot_overwrite_later_committed_history() {
         let mut app = setup_app();
         let previous = PathBuf::from(r"C:\miv-test\previous");
-        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(previous)];
+        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(previous).into()];
         let snapshot = app.folder_nav_history_snapshot();
         let (_tx, rx) = mpsc::channel();
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
@@ -21133,40 +21564,31 @@ mod phase_c_folder_nav_history_tests {
             pending_nav: None,
             pending_direct_nav: None,
             allow_direct_read: false,
-            fallback_cached_zip: None,
             completion:
                 crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
             pending_sibling_output: None,
-            nav_history_rollback: Some(snapshot),
             auto_fullscreen: false,
             deferred_fullscreen: None,
             suppress_confirm: false,
             suppress_confirm_next_time: false,
         });
 
-        let target = app.tmp.path().join("loaded");
-        std::fs::create_dir_all(&target).unwrap();
-        app.load_folder(target);
-
-        assert!(
-            app.archive_convert
-                .as_ref()
-                .map(|state| state.nav_history_rollback.is_none())
-                .unwrap_or(true),
-            "successful navigation should make an old conversion-dialog rollback inert"
-        );
+        let later = app.tmp.path().join("later-history");
+        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(later.clone()).into()];
+        assert!(app.cancel_archive_convert_for_navigation("test_changed_history_cancel"));
+        assert_eq!(app.folder_nav_back_stack, vec![later]);
+        assert_eq!(app.folder_nav_forward_stack, snapshot.forward_stack);
     }
 
     #[test]
-    fn same_folder_reload_keeps_archive_convert_rollback() {
+    fn same_folder_reload_preserves_history_with_archive_dialog() {
         let mut app = setup_app();
         let current = app.tmp.path().join("current");
         std::fs::create_dir_all(&current).unwrap();
 
         app.current_folder = Some(current.clone());
-        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(PathBuf::from(
-            r"C:\miv-test\previous",
-        ))];
+        app.folder_nav_back_stack =
+            vec![FolderNavHistoryTarget::Path(PathBuf::from(r"C:\miv-test\previous")).into()];
         let snapshot = app.folder_nav_history_snapshot();
         let (_tx, rx) = mpsc::channel();
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
@@ -21183,11 +21605,9 @@ mod phase_c_folder_nav_history_tests {
             pending_nav: None,
             pending_direct_nav: None,
             allow_direct_read: false,
-            fallback_cached_zip: None,
             completion:
                 crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
             pending_sibling_output: None,
-            nav_history_rollback: Some(snapshot),
             auto_fullscreen: false,
             deferred_fullscreen: None,
             suppress_confirm: false,
@@ -21196,12 +21616,13 @@ mod phase_c_folder_nav_history_tests {
 
         app.load_folder(current);
 
-        assert!(
-            app.archive_convert
-                .as_ref()
-                .and_then(|state| state.nav_history_rollback.as_ref())
-                .is_some(),
-            "same-folder reload should not discard conversion-dialog rollback"
+        assert_eq!(
+            app.folder_nav_history_snapshot().back_stack,
+            snapshot.back_stack
+        );
+        assert_eq!(
+            app.folder_nav_history_snapshot().forward_stack,
+            snapshot.forward_stack
         );
     }
 
@@ -21250,7 +21671,7 @@ mod phase_c_folder_nav_history_tests {
         let b = PathBuf::from(r"C:\miv-test\b");
         let recent0 = PathBuf::from(r"C:\miv-test\recent0");
         app.current_folder = Some(a.clone());
-        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(a.clone())];
+        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(a.clone()).into()];
         app.folder_nav_forward_stack = Vec::new();
         app.recent_folders = vec![recent0.clone()];
         app.global_search.active = true;
@@ -21269,7 +21690,7 @@ mod phase_c_folder_nav_history_tests {
         let b = PathBuf::from(r"C:\miv-test\b");
         let recent0 = PathBuf::from(r"C:\miv-test\recent0");
         app.current_folder = Some(a.clone());
-        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(a.clone())];
+        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(a.clone()).into()];
         app.folder_nav_forward_stack = Vec::new();
         app.recent_folders = vec![recent0.clone()];
         app.favsearch.active = true;
@@ -21323,15 +21744,15 @@ mod phase_c_folder_nav_history_tests {
         finish_rating_navigation_for_test(&mut app);
 
         // 一覧を離れ、別フォルダで列ヘッダ並べ替えをしている状態を作る。
-        app.navigate_folder_history_back();
+        app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
+        finish_staged_physical_history_for_test(&mut app);
         app.items_are_rating_view = false;
         app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
         app.settings.details_show_video_dimensions = true;
         app.settings.details_sort_key = crate::settings::DetailsSortKey::VideoDimensions;
         app.settings.details_sort_ascending = true;
 
-        let target = FolderNavHistoryTarget::Rating { stars: 2 };
-        app.dispatch_synthetic_folder_history_target(&target);
+        app.dispatch_main_folder_history_input(FolderHistoryDirection::Forward);
         finish_rating_navigation_for_test(&mut app);
 
         assert_eq!(
@@ -21537,6 +21958,368 @@ mod phase_c_folder_nav_history_tests {
         assert!(app.rating_view_pending.is_none());
     }
 
+    #[test]
+    fn section1339_main_pane_admission_retires_classification_even_if_pane_is_cancelled() {
+        for reply_ready in [false, true] {
+            let mut app = setup_app();
+            app.active_quick_folder_slot = None;
+            app.settings.sidecar_backup_enabled = false;
+            let source = app.tmp.path().join("classification-source");
+            let old_destination = app.tmp.path().join("old-directory.epub");
+            let pane_destination = app.tmp.path().join("pane-destination");
+            for path in [&source, &old_destination, &pane_destination] {
+                std::fs::create_dir_all(path).unwrap();
+            }
+            std::fs::write(source.join("source.jpg"), b"source").unwrap();
+            std::fs::write(old_destination.join("old.jpg"), b"old").unwrap();
+            app.load_folder(source.clone());
+            app.selected = Some(0);
+            app.settings.facet_filter.exts.insert("jpg".into());
+            let rows = app.items.clone();
+            let facet = app.facet_navigation.clone();
+            let history = app.folder_nav_history_snapshot();
+            assert_eq!(
+                app.load_folder_or_convert_archive(old_destination.clone()),
+                FolderOpenOutcome::Classifying
+            );
+            let mut candidate = app
+                .top_level_grid_view
+                .take_open_path_classification()
+                .expect("real typed classification candidate");
+            assert!(candidate.navigation.is_some());
+            let cancel = std::sync::Arc::clone(&candidate.cancel);
+            let (tx, rx) = std::sync::mpsc::channel();
+            candidate.rx = rx;
+            app.top_level_grid_view
+                .set_open_path_classification(Some(candidate));
+            let mut reply = Some(Ok(super::ClassifiedOpenPath {
+                rar_volume_proof: None,
+                kind: super::OpenPathKind::Directory,
+                folder_scan: Some(scan_directory(&old_destination)),
+            }));
+            if reply_ready {
+                assert!(tx.send(reply.take().unwrap()).is_ok());
+            }
+
+            app.start_folder_pane_open(pane_destination);
+            assert!(app.top_level_grid_view.open_path_classification().is_none());
+            assert!(cancel.load(std::sync::atomic::Ordering::Acquire));
+            assert_eq!(app.items, rows);
+            assert_eq!(app.current_folder.as_ref(), Some(&source));
+            app.cancel_folder_pane_open(crate::app::PaneOpenRestoreExit::Abandoned);
+            if let Some(reply) = reply {
+                assert!(
+                    tx.send(reply).is_err(),
+                    "retired candidate cannot receive a late result"
+                );
+            }
+            app.poll_open_path_classification(&egui::Context::default());
+            app.poll_collection_history_transition(&egui::Context::default());
+            assert!(app.top_level_grid_view.open_path_classification().is_none());
+            assert!(
+                app.top_level_grid_view
+                    .history_navigation_transition()
+                    .is_none()
+            );
+            assert_eq!(app.current_folder.as_ref(), Some(&source));
+            assert_eq!(app.items, rows);
+            assert_eq!(app.selected, Some(0));
+            assert_eq!(app.facet_navigation, facet);
+            assert!(app.settings.facet_filter.exts.contains("jpg"));
+            assert_eq!(app.folder_nav_back_stack, history.back_stack);
+            assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+        }
+    }
+
+    #[test]
+    fn section1339_main_pane_admission_retires_rating_navigation_even_if_pane_is_cancelled() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        for reply_ready in [false, true] {
+            let mut app = setup_app();
+            app.active_quick_folder_slot = None;
+            app.settings.sidecar_backup_enabled = false;
+            let source = app.tmp.path().join("rating-source");
+            let pane_destination = app.tmp.path().join("pane-destination");
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::create_dir_all(&pane_destination).unwrap();
+            let image = source.join("rated.jpg");
+            std::fs::write(&image, b"source").unwrap();
+            let key = crate::adjustment_db::normalize_path(&image);
+            let meta = crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::Image)
+                .with_source_path(&image);
+            app.rating_db
+                .as_ref()
+                .unwrap()
+                .set_user_rating(&key, 3, Some(&meta))
+                .unwrap();
+            app.load_folder(source.clone());
+            app.selected = Some(0);
+            app.settings.facet_filter.exts.insert("jpg".into());
+            let rows = app.items.clone();
+            let facet = app.facet_navigation.clone();
+            let history = app.folder_nav_history_snapshot();
+            app.enter_rating_view_from_menu(3);
+            let pending = app
+                .rating_view_pending
+                .take()
+                .expect("real typed rating request");
+            assert!(pending.navigation.is_some());
+            // Hold the real usable prepared rows behind a controlled receiver, so either
+            // ready-at-admission or late completion would be able to adopt without retirement.
+            let mut reply = Some(
+                pending
+                    .rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("real rating prepare reply"),
+            );
+            assert!(reply.as_ref().unwrap().is_ok());
+            let cancel = std::sync::Arc::clone(&pending.cancel);
+            let (tx, rx) = std::sync::mpsc::channel();
+            app.rating_view_pending = Some(crate::rating_view::RatingViewPending { rx, ..pending });
+            if reply_ready {
+                assert!(tx.send(reply.take().unwrap()).is_ok());
+            }
+
+            app.start_folder_pane_open(pane_destination);
+            assert!(app.rating_view_pending.is_none());
+            assert!(cancel.load(std::sync::atomic::Ordering::Acquire));
+            assert!(!app.items_are_rating_view);
+            assert_eq!(app.items, rows);
+            app.cancel_folder_pane_open(crate::app::PaneOpenRestoreExit::Abandoned);
+            if let Some(reply) = reply {
+                assert!(
+                    tx.send(reply).is_err(),
+                    "retired rating request cannot receive a late result"
+                );
+            }
+            app.poll_rating_view();
+            app.poll_sidecar_restore(&egui::Context::default());
+            assert!(app.rating_view_pending.is_none());
+            assert!(!app.items_are_rating_view);
+            assert!(matches!(
+                app.top_level_grid_view.surface(),
+                super::top_level_grid_view::TopLevelGridSurface::Folder
+            ));
+            assert_eq!(app.current_folder.as_ref(), Some(&source));
+            assert_eq!(app.items, rows);
+            assert_eq!(app.selected, Some(0));
+            assert_eq!(app.facet_navigation, facet);
+            assert!(app.settings.facet_filter.exts.contains("jpg"));
+            assert_eq!(app.folder_nav_back_stack, history.back_stack);
+            assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+        }
+    }
+
+    #[test]
+    fn section1339_new_rating_admission_retires_old_classification_before_new_request_cancel() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = false;
+        let source = app.tmp.path().join("rating-replaces-classification-source");
+        let old_destination = app.tmp.path().join("old-directory.epub");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&old_destination).unwrap();
+        std::fs::write(source.join("source.jpg"), b"source").unwrap();
+        app.load_folder(source.clone());
+        app.selected = Some(0);
+        app.settings.facet_filter.exts.insert("jpg".into());
+        let rows = app.items.clone();
+        let facet = app.facet_navigation.clone();
+        let history = app.folder_nav_history_snapshot();
+        assert_eq!(
+            app.load_folder_or_convert_archive(old_destination.clone()),
+            FolderOpenOutcome::Classifying
+        );
+        let mut candidate = app
+            .top_level_grid_view
+            .take_open_path_classification()
+            .unwrap();
+        let cancel = std::sync::Arc::clone(&candidate.cancel);
+        let (tx, rx) = std::sync::mpsc::channel();
+        candidate.rx = rx;
+        app.top_level_grid_view
+            .set_open_path_classification(Some(candidate));
+        assert!(
+            tx.send(Ok(super::ClassifiedOpenPath {
+                rar_volume_proof: None,
+                kind: super::OpenPathKind::Directory,
+                folder_scan: Some(scan_directory(&old_destination)),
+            }))
+            .is_ok()
+        );
+
+        app.enter_rating_view_from_menu(3);
+        assert!(
+            app.rating_view_pending
+                .as_ref()
+                .is_some_and(|pending| pending.navigation.is_some())
+        );
+        assert!(app.top_level_grid_view.open_path_classification().is_none());
+        assert!(cancel.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(app.items, rows);
+        app.close_rating_view();
+        app.poll_open_path_classification(&egui::Context::default());
+        app.poll_rating_view();
+        app.poll_collection_history_transition(&egui::Context::default());
+        assert!(app.rating_view_pending.is_none());
+        assert!(app.top_level_grid_view.open_path_classification().is_none());
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_none()
+        );
+        assert_eq!(app.current_folder.as_ref(), Some(&source));
+        assert_eq!(app.items, rows);
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.facet_navigation, facet);
+        assert!(app.settings.facet_filter.exts.contains("jpg"));
+        assert_eq!(app.folder_nav_back_stack, history.back_stack);
+        assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+    }
+
+    #[test]
+    fn section1339_new_smart_admission_retires_each_old_typed_request_before_smart_cancel() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        for prior in ["classification", "rating", "physical"] {
+            let mut app = setup_app();
+            app.active_quick_folder_slot = None;
+            app.settings.sidecar_backup_enabled = false;
+            let source = app
+                .tmp
+                .path()
+                .join(format!("smart-replaces-{prior}-source"));
+            let old_destination = app.tmp.path().join("old-directory.epub");
+            let smart_destination = app.tmp.path().join("smart-destination");
+            for path in [&source, &old_destination, &smart_destination] {
+                std::fs::create_dir_all(path).unwrap();
+            }
+            let image = source.join("source.jpg");
+            std::fs::write(&image, b"source").unwrap();
+            app.load_folder(source.clone());
+            app.selected = Some(0);
+            app.settings.facet_filter.exts.insert("jpg".into());
+            let rows = app.items.clone();
+            let facet = app.facet_navigation.clone();
+            let history = app.folder_nav_history_snapshot();
+            let mut old_cancel = None;
+            match prior {
+                "classification" => {
+                    assert_eq!(
+                        app.load_folder_or_convert_archive(old_destination.clone()),
+                        FolderOpenOutcome::Classifying
+                    );
+                    let mut candidate = app
+                        .top_level_grid_view
+                        .take_open_path_classification()
+                        .unwrap();
+                    old_cancel = Some(std::sync::Arc::clone(&candidate.cancel));
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    candidate.rx = rx;
+                    app.top_level_grid_view
+                        .set_open_path_classification(Some(candidate));
+                    assert!(
+                        tx.send(Ok(super::ClassifiedOpenPath {
+                            rar_volume_proof: None,
+                            kind: super::OpenPathKind::Directory,
+                            folder_scan: Some(scan_directory(&old_destination)),
+                        }))
+                        .is_ok()
+                    );
+                }
+                "rating" => {
+                    let key = crate::adjustment_db::normalize_path(&image);
+                    let meta =
+                        crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::Image)
+                            .with_source_path(&image);
+                    app.rating_db
+                        .as_ref()
+                        .unwrap()
+                        .set_user_rating(&key, 3, Some(&meta))
+                        .unwrap();
+                    app.enter_rating_view_from_menu(3);
+                    let pending = app.rating_view_pending.take().unwrap();
+                    assert!(pending.navigation.is_some());
+                    let result = pending
+                        .rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .expect("real rating prepare reply");
+                    assert!(result.is_ok());
+                    old_cancel = Some(std::sync::Arc::clone(&pending.cancel));
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    app.rating_view_pending =
+                        Some(crate::rating_view::RatingViewPending { rx, ..pending });
+                    assert!(tx.send(result).is_ok());
+                }
+                "physical" => {
+                    assert!(app.start_physical_history_transition(
+                        super::PhysicalHistoryIntent::Navigation {
+                            replay: None,
+                            auto_fullscreen: false
+                        },
+                        old_destination.clone(),
+                        crate::app::StartupListIntent::ExplicitList
+                    ));
+                    replace_physical_history_preflight_for_test(
+                        &mut app,
+                        crate::app::collection_navigation::PhysicalHistoryPreflightPayload::Folder(
+                            scan_directory(&old_destination),
+                        ),
+                    );
+                    assert!(
+                        app.top_level_grid_view
+                            .history_navigation_transition()
+                            .is_some()
+                    );
+                }
+                _ => unreachable!(),
+            }
+            let mut definition = crate::settings::SmartFolderDefinition::new("Replacement Smart");
+            definition.rules.push(crate::settings::SmartFolderRule::new(
+                smart_destination,
+                true,
+                Default::default(),
+            ));
+            let id = definition.id;
+            app.settings.smart_folders = vec![definition];
+            app.open_smart_folder_staged(id, false);
+            assert!(app.smart_folder_transition.is_some());
+            assert!(app.top_level_grid_view.open_path_classification().is_none());
+            assert!(app.rating_view_pending.is_none());
+            assert!(
+                app.top_level_grid_view
+                    .history_navigation_transition()
+                    .is_none()
+            );
+            if let Some(cancel) = old_cancel {
+                assert!(cancel.load(std::sync::atomic::Ordering::Acquire));
+            }
+            assert_eq!(app.current_folder.as_ref(), Some(&source));
+            assert_eq!(app.items, rows);
+            app.cancel_smart_folder_pending_and_restore_origin();
+            let ctx = egui::Context::default();
+            app.poll_open_path_classification(&ctx);
+            app.poll_rating_view();
+            app.poll_collection_history_transition(&ctx);
+            app.poll_smart_folder(&ctx);
+            assert!(app.smart_folder_transition.is_none());
+            assert!(app.top_level_grid_view.open_path_classification().is_none());
+            assert!(app.rating_view_pending.is_none());
+            assert!(
+                app.top_level_grid_view
+                    .history_navigation_transition()
+                    .is_none()
+            );
+            assert_eq!(app.current_folder.as_ref(), Some(&source));
+            assert_eq!(app.items, rows);
+            assert_eq!(app.selected, Some(0));
+            assert_eq!(app.facet_navigation, facet);
+            assert!(app.settings.facet_filter.exts.contains("jpg"));
+            assert_eq!(app.folder_nav_back_stack, history.back_stack);
+            assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+        }
+    }
+
     fn finish_rating_navigation_for_test(app: &mut App) {
         let ctx = egui::Context::default();
         for _ in 0..1000 {
@@ -21565,6 +22348,52 @@ mod phase_c_folder_nav_history_tests {
     }
 
     fn install_1328_parent(app: &mut App, parent: &std::path::Path, items: Vec<GridItem>) {
+        app.settle_open_path_classification_for_test();
+        if let Some(mut transition) = app.top_level_grid_view.take_history_navigation_transition() {
+            let crate::app::HistoryNavigationTransition::Physical(request) = &mut transition else {
+                panic!("fixture expected typed physical history");
+            };
+            let crate::app::PhysicalHistoryPhase::Preflighting { preflight, .. } =
+                &mut request.phase
+            else {
+                panic!("fixture expected folder preflight");
+            };
+            let mut scan = crate::app::folder_scan::ScannedDir {
+                folders: Vec::new(),
+                all_media: Vec::new(),
+                complete_audio_inventory: None,
+                omitted: Default::default(),
+            };
+            for item in items {
+                if let GridItem::Image(path) = item {
+                    scan.all_media
+                        .push(crate::app::folder_scan::ScannedMediaEntry {
+                            path,
+                            kind: crate::app::folder_scan::ScanMediaKind::Image,
+                            mtime: 0,
+                            file_size: 0,
+                            sort_meta: crate::settings::ListingSortMetadata::new(0, Some(0)),
+                        });
+                } else {
+                    scan.folders
+                        .push(crate::app::folder_scan::ScannedFolderEntry {
+                            item,
+                            display_meta: None,
+                            sort_meta: crate::settings::ListingSortMetadata::new(0, Some(0)),
+                        });
+                }
+            }
+            *preflight =
+                crate::app::collection_navigation::PhysicalHistoryPreflight::ready_for_test(
+                    crate::app::collection_navigation::PhysicalHistoryPreflightPayload::Folder(
+                        scan,
+                    ),
+                );
+            app.replace_history_navigation_transition(Some(transition));
+            app.poll_collection_history_transition(&egui::Context::default());
+            assert_eq!(app.current_folder.as_deref(), Some(parent));
+            return;
+        }
         let metas = vec![None; items.len()];
         app.start_loading_items(
             parent.to_path_buf(),
@@ -21600,10 +22429,11 @@ mod phase_c_folder_nav_history_tests {
             );
             app.selected = Some(3);
             app.scroll_offset_y = 96.0;
-            let mut rollback = None;
-            let target = app
-                .dispatch_main_folder_history_input(FolderHistoryDirection::Back, &mut rollback)
-                .unwrap();
+            assert!(
+                app.dispatch_main_folder_history_input(FolderHistoryDirection::Back)
+                    .is_none()
+            );
+            let target = parent.clone();
             assert_eq!(target, parent);
             install_1328_parent(&mut app, &target, items);
             assert_eq!(app.selected, Some(20), "workspace {slot:?}");
@@ -21632,7 +22462,7 @@ mod phase_c_folder_nav_history_tests {
         );
         app.selected = Some(3);
         let Some(crate::ui_main::AddressBarNav::Direct(target, restore_intent)) =
-            app.resolve_grid_parent_nav()
+            app.handle_grid_parent_folder_action()
         else {
             panic!("Backspace must return to the parent folder");
         };
@@ -21678,9 +22508,11 @@ mod phase_c_folder_nav_history_tests {
             app.adopt_staged_archive_source_alias(&source, &backing);
             app.finish_main_list_open(crate::app::StartupListIntent::ExplicitList);
             app.selected = Some(3);
-            let target = app
-                .dispatch_main_folder_history_input(FolderHistoryDirection::Back, &mut None)
-                .unwrap();
+            assert!(
+                app.dispatch_main_folder_history_input(FolderHistoryDirection::Back)
+                    .is_none()
+            );
+            let target = parent.clone();
             install_1328_parent(&mut app, &target, items);
             assert_eq!(app.selected, Some(1));
             assert_eq!(app.scroll_offset_y, 320.0);
@@ -21720,13 +22552,711 @@ mod phase_c_folder_nav_history_tests {
             FolderOpenOutcome::Loaded
         ));
         app.selected = Some(3);
-        let target = app
-            .dispatch_main_folder_history_input(FolderHistoryDirection::Back, &mut None)
-            .unwrap();
+        assert!(
+            app.dispatch_main_folder_history_input(FolderHistoryDirection::Back)
+                .is_none()
+        );
+        let target = parent.clone();
         install_1328_parent(&mut app, &target, items);
         assert_eq!(app.selected, Some(1));
         assert_eq!(app.scroll_offset_y, 320.0);
         assert!(app.scroll_to_selected);
+    }
+
+    #[test]
+    fn section1339_normal_history_rapid_replay_and_failure_never_precommit() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = false;
+        let source = app.tmp.path().join("source");
+        let middle = app.tmp.path().join("middle");
+        let oldest = app.tmp.path().join("oldest");
+        for path in [&source, &middle, &oldest] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        app.current_folder = Some(source.clone());
+        app.items = vec![GridItem::Image(source.join("visible.jpg"))];
+        app.adopt_main_facet_route(crate::app::FacetRoute::root(crate::app::FacetScope::path(
+            &source,
+        )));
+        app.settings.facet_filter.exts.insert("jpg".into());
+        app.folder_nav_back_stack = vec![
+            FolderNavHistoryTarget::Path(oldest.clone()).into(),
+            FolderNavHistoryTarget::Path(middle.clone()).into(),
+        ];
+        let history = app.folder_nav_history_snapshot();
+        let facet = app.facet_navigation.clone();
+        assert!(
+            app.dispatch_main_folder_history_input(FolderHistoryDirection::Back)
+                .is_none()
+        );
+        app.settle_open_path_classification_for_test();
+        assert_eq!(app.current_folder.as_ref(), Some(&source));
+        assert_eq!(app.folder_nav_back_stack, history.back_stack);
+        assert_eq!(app.facet_navigation, facet);
+        assert!(
+            app.dispatch_main_folder_history_input(FolderHistoryDirection::Forward)
+                .is_none()
+        );
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_none()
+        );
+        assert_eq!(app.folder_nav_back_stack, history.back_stack);
+        assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+        assert_eq!(app.facet_navigation, facet);
+        app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
+        app.settle_open_path_classification_for_test();
+        app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
+        app.settle_open_path_classification_for_test();
+        assert_eq!(app.current_folder.as_ref(), Some(&source));
+        assert_eq!(app.folder_nav_back_stack, history.back_stack);
+        install_1328_parent(
+            &mut app,
+            &oldest,
+            vec![GridItem::Image(oldest.join("page.jpg"))],
+        );
+        assert!(app.folder_nav_back_stack.is_empty());
+        assert_eq!(
+            app.folder_nav_forward_stack
+                .iter()
+                .map(|entry| &entry.location)
+                .collect::<Vec<_>>(),
+            vec![
+                &FolderNavHistoryTarget::Path(source),
+                &FolderNavHistoryTarget::Path(middle)
+            ]
+        );
+        let adopted = app.folder_nav_history_snapshot();
+        let adopted_facet = app.facet_navigation.clone();
+        app.poll_collection_history_transition(&egui::Context::default());
+        assert_eq!(app.folder_nav_back_stack, adopted.back_stack);
+        assert_eq!(app.folder_nav_forward_stack, adopted.forward_stack);
+        assert_eq!(app.facet_navigation, adopted_facet);
+        let missing = app.tmp.path().join("missing");
+        app.folder_nav_back_stack
+            .push(FolderNavHistoryTarget::Path(missing).into());
+        let history = app.folder_nav_history_snapshot();
+        app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
+        finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(app.current_folder.as_ref(), Some(&oldest));
+        assert_eq!(app.folder_nav_back_stack, history.back_stack);
+        assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+        assert_eq!(app.facet_navigation, adopted_facet);
+    }
+
+    #[test]
+    fn section1339_plain_zip_grid_handler_adopts_only_usable_rows_and_reload_keeps_manual_restore()
+    {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        let parent = app.tmp.path().join("plain-zip-parent");
+        let other = app.tmp.path().join("plain-zip-other");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let book = parent.join("book.zip");
+        write_1328_zip(&book);
+        app.load_folder(parent.clone());
+        app.settings.facet_filter.exts.insert("zip".into());
+        app.rebuild_visible_indices();
+        let rows = app.items.clone();
+        let filter = app.settings.facet_filter.clone();
+        let facet = app.facet_navigation.clone();
+        let history = app.folder_nav_history_snapshot();
+        let open = |path: PathBuf| crate::app::GridVirtualOpenIntent {
+            path,
+            source: crate::app::GridVirtualOpenSource::Direct,
+            effects: crate::app::GridVirtualOpenEffects {
+                auto_fullscreen: false,
+                suppress_rating_filter: false,
+                suppress_facet_filter: true,
+                reading_history_return_from: None,
+            },
+        };
+        assert!(app.start_grid_virtual_open(open(book.clone())));
+        app.settle_open_path_classification_for_test();
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+        );
+        assert_eq!(app.current_folder.as_ref(), Some(&parent));
+        assert_eq!(app.items, rows);
+        assert_eq!(app.settings.facet_filter, filter);
+        assert_eq!(app.facet_navigation, facet);
+        assert_eq!(app.folder_nav_back_stack, history.back_stack);
+        app.start_folder_pane_open(other);
+        app.cancel_folder_pane_open(crate::app::PaneOpenRestoreExit::Abandoned);
+        app.poll_collection_history_transition(&egui::Context::default());
+        assert_eq!(app.current_folder.as_ref(), Some(&parent));
+        assert_eq!(app.items, rows);
+        assert_eq!(app.settings.facet_filter, filter);
+        assert_eq!(app.facet_navigation, facet);
+        assert_eq!(app.folder_nav_back_stack, history.back_stack);
+        assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+        assert!(app.start_grid_virtual_open(open(book.clone())));
+        finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(app.current_folder.as_ref(), Some(&book));
+        assert_eq!(app.items.len(), 4);
+        assert_eq!(app.visible_indices.len(), 4);
+        assert!(!app.settings.facet_filter.is_active());
+        assert_eq!(app.facet_navigation.saved_frame_count(), 1);
+        assert_eq!(
+            app.folder_nav_back_stack.len(),
+            history.back_stack.len() + 1
+        );
+        assert!(app.restore_facet_filter_suppression());
+        let restored = app.settings.facet_filter.clone();
+        assert_eq!(restored, filter);
+        let adopted = app.folder_nav_history_snapshot();
+        assert!(matches!(
+            app.load_folder_or_convert_archive(book.clone()),
+            FolderOpenOutcome::Loaded | FolderOpenOutcome::Classifying
+        ));
+        finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(app.current_folder.as_ref(), Some(&book));
+        assert_eq!(app.settings.facet_filter, restored);
+        assert_eq!(app.facet_navigation.saved_frame_count(), 0);
+        assert_eq!(app.folder_nav_back_stack, adopted.back_stack);
+        assert_eq!(app.folder_nav_forward_stack, adopted.forward_stack);
+    }
+
+    #[test]
+    fn section1339_zip_same_location_reload_reconciles_prepared_prefix_and_manual_restore() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        let parent = app.tmp.path().join("nested-reload-parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        let book = parent.join("book.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&book).unwrap());
+        for entry in ["A/1.jpg", "B/2.jpg"] {
+            zip.start_file(entry, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut zip, b"page").unwrap();
+        }
+        zip.finish().unwrap();
+        app.load_folder(parent);
+        app.settings.facet_filter.exts.insert("zip".into());
+        assert!(
+            app.start_grid_virtual_open(crate::app::GridVirtualOpenIntent {
+                path: book.clone(),
+                source: crate::app::GridVirtualOpenSource::Direct,
+                effects: crate::app::GridVirtualOpenEffects {
+                    auto_fullscreen: false,
+                    suppress_rating_filter: false,
+                    suppress_facet_filter: true,
+                    reading_history_return_from: None,
+                },
+            })
+        );
+        finish_staged_physical_history_for_test(&mut app);
+        let root = app.facet_navigation.route().clone();
+        app.settings
+            .facet_filter
+            .kinds
+            .insert(crate::settings::FacetItemKind::Folder);
+        let root_filter = app.settings.facet_filter.clone();
+        app.zip_nav_enter("A/");
+        app.settings.facet_filter.exts.insert("jpg".into());
+        let back = app.folder_nav_back_stack.clone();
+        let forward = app.folder_nav_forward_stack.clone();
+        // F5 / "Update to latest information" uses the real full-refresh handler.
+        app.reload_current_folder_preserving_override();
+        finish_staged_physical_history_for_test(&mut app);
+        assert!(app.zip_nav.as_ref().unwrap().current().is_empty());
+        assert_eq!(
+            app.facet_navigation.route(),
+            &root,
+            "SameLocation must still describe the actually prepared ZIP level"
+        );
+        assert_eq!(app.settings.facet_filter, root_filter);
+        assert_eq!(
+            app.visible_indices.len(),
+            2,
+            "both root folder rows remain visible"
+        );
+        assert_eq!(app.facet_navigation.saved_frame_count(), 1);
+        assert_eq!(app.folder_nav_back_stack, back);
+        assert_eq!(app.folder_nav_forward_stack, forward);
+        // Consuming the remaining root frame manually, then reloading the same level,
+        // must preserve its value and must not invent another frame.
+        assert!(app.restore_facet_filter_suppression());
+        let manual = app.settings.facet_filter.clone();
+        assert_eq!(app.facet_navigation.saved_frame_count(), 0);
+        app.reload_current_folder_preserving_override();
+        finish_staged_physical_history_for_test(&mut app);
+        assert!(app.zip_nav.as_ref().unwrap().current().is_empty());
+        assert_eq!(app.facet_navigation.route(), &root);
+        assert_eq!(app.settings.facet_filter, manual);
+        assert_eq!(app.facet_navigation.saved_frame_count(), 0);
+        assert_eq!(app.folder_nav_back_stack, back);
+        assert_eq!(app.folder_nav_forward_stack, forward);
+    }
+
+    #[test]
+    fn section1339_zip_nested_level_history_reentry_uses_the_prepared_fresh_root_route() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        let parent = app.tmp.path().join("nested-reentry-parent");
+        let other = app.tmp.path().join("nested-reentry-other");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let book = parent.join("book.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&book).unwrap());
+        for entry in ["A/1.jpg", "B/2.jpg"] {
+            zip.start_file(entry, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut zip, b"page").unwrap();
+        }
+        zip.finish().unwrap();
+        app.load_folder(parent.clone());
+        app.settings.facet_filter.exts.insert("zip".into());
+        assert!(
+            app.start_grid_virtual_open(crate::app::GridVirtualOpenIntent {
+                path: book.clone(),
+                source: crate::app::GridVirtualOpenSource::Direct,
+                effects: crate::app::GridVirtualOpenEffects {
+                    auto_fullscreen: false,
+                    suppress_rating_filter: false,
+                    suppress_facet_filter: true,
+                    reading_history_return_from: None,
+                },
+            })
+        );
+        finish_staged_physical_history_for_test(&mut app);
+        assert!(app.zip_nav.as_ref().unwrap().current().is_empty());
+        let root_route = app.facet_navigation.route().clone();
+        app.settings
+            .facet_filter
+            .kinds
+            .insert(crate::settings::FacetItemKind::Folder);
+        app.zip_nav_enter("A/");
+        assert_eq!(app.zip_nav.as_ref().unwrap().current(), &["A".to_string()]);
+        assert_eq!(
+            app.facet_navigation.route().current(),
+            Some(&crate::app::FacetScope::book(&book, "A/"))
+        );
+        assert_eq!(app.facet_navigation.saved_frame_count(), 2);
+        assert!(app.start_physical_history_transition(
+            crate::app::PhysicalHistoryIntent::Navigation {
+                replay: None,
+                auto_fullscreen: false
+            },
+            other.clone(),
+            crate::app::StartupListIntent::ExplicitList,
+        ));
+        finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(app.current_folder.as_ref(), Some(&other));
+        assert!(app.settings.facet_filter.exts.contains("zip"));
+        assert!(app.settings.facet_filter.kinds.is_empty());
+        assert_eq!(app.facet_navigation.saved_frame_count(), 0);
+        // History holds a nested route, but released ZIP re-entry enumerates a fresh root.
+        assert_eq!(
+            app.folder_history_back_entry().unwrap().route.current(),
+            Some(&crate::app::FacetScope::book(&book, "A/"))
+        );
+        app.settings.facet_filter.exts.insert("cbz".into());
+        let live_parent = app.settings.facet_filter.clone();
+        let before = app.folder_nav_history_snapshot();
+        app.dispatch_main_folder_history_input(FolderHistoryDirection::Back); // toolbar Back
+        assert_eq!(app.current_folder.as_ref(), Some(&other));
+        assert_eq!(app.folder_nav_back_stack, before.back_stack);
+        assert_eq!(app.settings.facet_filter, live_parent);
+        finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(app.current_folder.as_ref(), Some(&book));
+        assert!(app.zip_nav.as_ref().unwrap().current().is_empty());
+        assert_eq!(
+            app.facet_navigation.route().current(),
+            Some(&crate::app::FacetScope::book(&book, ""))
+        );
+        assert_eq!(app.facet_navigation.route(), &root_route);
+        assert_eq!(
+            app.facet_navigation.saved_frame_count(),
+            1,
+            "no phantom nested frame is installed"
+        );
+        assert!(!app.settings.facet_filter.is_active());
+        assert!(
+            !app.zip_nav_back(),
+            "the actual fresh root has no nested parent"
+        );
+        assert!(app.restore_facet_filter_suppression());
+        assert_eq!(app.settings.facet_filter, live_parent);
+        assert!(app.settings.facet_filter.kinds.is_empty());
+        assert_eq!(app.facet_navigation.saved_frame_count(), 0);
+    }
+
+    #[test]
+    fn section1339_rating_restore_survives_live_zip_pin_refresh_but_explicit_open_expires() {
+        for action in ["history", "bs", "explicit"] {
+            let mut app = setup_app();
+            app.active_quick_folder_slot = None;
+            app.settings.sidecar_backup_enabled = false;
+            app.settings.auto_fullscreen_zip_pdf = false;
+            let parent = app.tmp.path().join("rating-native-proof");
+            std::fs::create_dir_all(&parent).unwrap();
+            let first = parent.join("first.zip");
+            let second = parent.join("second.zip");
+            for book in [&first, &second] {
+                write_1328_zip(book);
+                let key = crate::adjustment_db::normalize_path(book);
+                let meta =
+                    crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::ZipFile)
+                        .with_source_path(book);
+                app.rating_db
+                    .as_ref()
+                    .unwrap()
+                    .set_user_rating(&key, 3, Some(&meta))
+                    .unwrap();
+            }
+            app.current_folder = Some(parent.clone());
+            app.enter_rating_view(3);
+            finish_rating_navigation_for_test(&mut app);
+            for book in [&first, &second] {
+                let owner = app.rating_view_physical_load_owner(book).unwrap();
+                assert!(app.start_rating_physical_open(
+                    owner,
+                    crate::app::StartupListIntent::ExplicitList,
+                ));
+                finish_staged_physical_history_for_test(&mut app);
+            }
+            let source = app.folder_nav_current_target().unwrap();
+            let history = app.folder_nav_history_snapshot();
+            let facet = app.facet_navigation.clone();
+            match action {
+                "history" => {
+                    app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
+                }
+                "bs" => app.rating_view_back(),
+                "explicit" => {
+                    let owner = app.rating_view_physical_load_owner(&first).unwrap();
+                    assert!(app.start_rating_physical_open(
+                        owner,
+                        crate::app::StartupListIntent::ExplicitList,
+                    ));
+                }
+                _ => unreachable!(),
+            }
+            app.settle_open_path_classification_for_test();
+            assert!(
+                app.top_level_grid_view
+                    .history_navigation_transition()
+                    .is_some()
+            );
+            let generation = app.items_generation;
+            // A committed pin notification (including one published by another window) is
+            // consumed every frame. Its real ZIP refresh reinstalls rows at the same level;
+            // do not fabricate an items_generation change or remove the pending request.
+            assert!(app.set_folder_thumb_pin(
+                &second,
+                crate::folder_thumb_pins::FolderPinSource::ZipEntry {
+                    zip_rel: String::new(),
+                    entry: "page-0.jpg".into(),
+                },
+            ));
+            app.consume_folder_thumb_pin_dirty();
+            assert!(app.items_generation > generation);
+            assert_eq!(app.folder_nav_current_target(), Some(source.clone()));
+            assert_eq!(app.folder_nav_back_stack, history.back_stack);
+            assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+            assert_eq!(app.facet_navigation, facet);
+            assert!(
+                app.top_level_grid_view
+                    .history_navigation_transition()
+                    .is_some()
+            );
+            finish_staged_physical_history_for_test(&mut app);
+            if action == "explicit" {
+                assert_eq!(app.current_folder.as_ref(), Some(&second));
+                assert_eq!(app.folder_nav_back_stack, history.back_stack);
+                assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+            } else {
+                assert_eq!(app.current_folder.as_ref(), Some(&first), "{action}");
+                assert_eq!(app.rating_view_nav_stack, vec![first.clone()]);
+                if action == "history" {
+                    assert_eq!(app.folder_history_forward_target(), Some(&source));
+                    assert_eq!(
+                        app.folder_nav_back_stack.len() + 1,
+                        history.back_stack.len()
+                    );
+                } else {
+                    assert_eq!(app.folder_history_back_target(), Some(&source));
+                    assert_eq!(
+                        app.folder_nav_back_stack.len(),
+                        history.back_stack.len() + 1
+                    );
+                }
+            }
+            let adopted = app.folder_nav_history_snapshot();
+            app.poll_collection_history_transition(&egui::Context::default());
+            assert_eq!(app.folder_nav_back_stack, adopted.back_stack);
+            assert_eq!(app.folder_nav_forward_stack, adopted.forward_stack);
+        }
+    }
+
+    #[test]
+    fn section1339_quick_native_proof_survives_rows_but_rejects_switch_epoch() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let parent = app.tmp.path().join("quick-native-proof");
+        std::fs::create_dir_all(&parent).unwrap();
+        let book = parent.join("book.zip");
+        write_1328_zip(&book);
+        app.load_folder(book.clone());
+        finish_staged_physical_history_for_test(&mut app);
+        let owner = crate::app::QuickFolderSwitchLoadOwner {
+            source_context: app.projected_viewer_context_id(),
+            source_surface_generation: app.top_level_grid_view.generation(),
+            source_slot: app.active_quick_folder_slot,
+            source_slot_switch_sequence: app.quick_folder_switch_sequence,
+            target_slot: QuickFolderSlotId::A,
+            target_path: parent.clone(),
+        };
+        assert!(app.quick_folder_switch_owner_is_current(&owner, &parent));
+        assert!(app.set_folder_thumb_pin(
+            &book,
+            crate::folder_thumb_pins::FolderPinSource::ZipEntry {
+                zip_rel: String::new(),
+                entry: "page-0.jpg".into(),
+            },
+        ));
+        app.consume_folder_thumb_pin_dirty();
+        assert!(app.quick_folder_switch_owner_is_current(&owner, &parent));
+        assert!(!app.quick_folder_switch_owner_is_current(&owner, &book));
+        app.retire_main_list_requests_for_surface_switch();
+        assert!(!app.quick_folder_switch_owner_is_current(&owner, &parent));
+    }
+
+    #[test]
+    fn section1339_rating_cached_pdf_verification_defers_during_back_then_resumes_on_cancel() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        let parent = app.tmp.path().join("rating-pdf-deferral");
+        std::fs::create_dir_all(&parent).unwrap();
+        let book = parent.join("book.zip");
+        write_1328_zip(&book);
+        let key = crate::adjustment_db::normalize_path(&book);
+        let meta = crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::ZipFile)
+            .with_source_path(&book);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&key, 3, Some(&meta))
+            .unwrap();
+        let pdf = parent.join("warm.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        let stamp = std::fs::metadata(&pdf).unwrap();
+        app.get_or_open_catalog(&parent)
+            .unwrap()
+            .set_pdf_meta(
+                "warm.pdf",
+                crate::ui_helpers::mtime_secs(&stamp),
+                stamp.len() as i64,
+                2,
+                false,
+            )
+            .unwrap();
+        app.current_folder = Some(parent);
+        app.enter_rating_view(3);
+        finish_rating_navigation_for_test(&mut app);
+        let owner = app.rating_view_physical_load_owner(&book).unwrap();
+        assert!(app.start_rating_physical_open(owner, crate::app::StartupListIntent::ExplicitList));
+        finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(
+            app.load_pdf_as_folder_owned(
+                pdf.clone(),
+                crate::app::OpenRequestOwner::Navigation,
+                crate::app::StartupListIntent::ExplicitList,
+            ),
+            FolderOpenOutcome::Loaded
+        );
+        assert_eq!(app.items.len(), 2);
+        app.pdf_enumerate_pending.as_mut().unwrap().2 =
+            crate::pdf_loader::completed_enumerate_result_handle(
+                &pdf,
+                Ok(crate::pdf_loader::PdfEnumerateResult {
+                    pages: (0..3)
+                        .map(|page_num| crate::pdf_loader::PdfPageEntry {
+                            page_num,
+                            mtime: crate::ui_helpers::mtime_secs(&stamp),
+                            file_size: stamp.len(),
+                        })
+                        .collect(),
+                    direction: None,
+                    stamp: None,
+                }),
+            );
+        let generation = app.items_generation;
+        let history = app.folder_nav_history_snapshot();
+        let facet = app.facet_navigation.clone();
+        app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+        );
+        app.poll_pdf_enumerate();
+        assert_eq!(
+            app.items.len(),
+            2,
+            "released warm verification waits during Back"
+        );
+        assert_eq!(app.items_generation, generation);
+        assert!(app.pdf_enumerate_pending.is_some());
+        // Forward cancels the provisional Back through the real history dispatcher.
+        app.dispatch_main_folder_history_input(FolderHistoryDirection::Forward);
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_none()
+        );
+        app.poll_pdf_enumerate();
+        assert_eq!(
+            app.items.len(),
+            3,
+            "the retained verifier resumes after cancellation"
+        );
+        assert!(app.items_generation > generation);
+        assert_eq!(app.current_folder.as_ref(), Some(&pdf));
+        assert_eq!(app.folder_nav_back_stack, history.back_stack);
+        assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+        assert_eq!(app.facet_navigation, facet);
+    }
+
+    #[test]
+    fn section1339_rating_zip_backspace_back_forward_restashes_live_parent() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let parent = app.tmp.path().join("facet-rated");
+        std::fs::create_dir_all(&parent).unwrap();
+        let book = parent.join("vol.zip");
+        write_1328_zip(&book);
+        let key = crate::adjustment_db::normalize_path(&book);
+        let meta = crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::ZipFile)
+            .with_source_path(&book);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&key, 3, Some(&meta))
+            .unwrap();
+        app.current_folder = Some(parent);
+        app.enter_rating_view(3);
+        finish_rating_navigation_for_test(&mut app);
+        app.settings.facet_filter.exts.insert("zip".into());
+        app.rebuild_visible_indices();
+        let owner = app.rating_view_physical_load_owner(&book).unwrap();
+        let intent = crate::app::GridVirtualOpenIntent {
+            path: book.clone(),
+            source: crate::app::GridVirtualOpenSource::Rating(owner),
+            effects: crate::app::GridVirtualOpenEffects {
+                auto_fullscreen: false,
+                suppress_rating_filter: false,
+                suppress_facet_filter: true,
+                reading_history_return_from: None,
+            },
+        };
+        assert!(app.start_grid_virtual_open(intent));
+        finish_staged_physical_history_for_test(&mut app);
+        assert!(!app.facet_filter_active());
+        assert_eq!(app.visible_indices.len(), 4);
+        app.rating_view_back(); // BS uses the same parent owner as the main key handler.
+        finish_rating_navigation_for_test(&mut app);
+        assert!(app.items_are_rating_view);
+        assert!(app.settings.facet_filter.exts.contains("zip"));
+        for _ in 0..3 {
+            app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
+            finish_staged_physical_history_for_test(&mut app);
+            assert!(!app.items_are_rating_view);
+            assert!(
+                !app.facet_filter_active(),
+                "history re-entry must stash the live parent"
+            );
+            assert_eq!(app.visible_indices.len(), 4);
+            app.dispatch_main_folder_history_input(FolderHistoryDirection::Forward);
+            finish_rating_navigation_for_test(&mut app);
+            assert!(app.items_are_rating_view);
+            assert!(app.settings.facet_filter.exts.contains("zip"));
+        }
+    }
+
+    #[test]
+    fn section1339_reported_rating_zip_fullscreen_bs_toolbar_back_forward() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let parent = app.tmp.path().join("facet-rated");
+        std::fs::create_dir_all(&parent).unwrap();
+        let book = parent.join("vol.zip");
+        write_1328_zip(&book);
+        let key = crate::adjustment_db::normalize_path(&book);
+        let meta = crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::ZipFile)
+            .with_source_path(&book);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&key, 3, Some(&meta))
+            .unwrap();
+        app.current_folder = Some(parent);
+        app.enter_rating_view(3);
+        finish_rating_navigation_for_test(&mut app);
+        app.settings.facet_filter.exts.insert("zip".into());
+        app.rebuild_visible_indices();
+        let owner = app.rating_view_physical_load_owner(&book).unwrap();
+        let intent = crate::app::GridVirtualOpenIntent {
+            path: book.clone(),
+            source: crate::app::GridVirtualOpenSource::Rating(owner),
+            effects: crate::app::GridVirtualOpenEffects {
+                auto_fullscreen: false,
+                suppress_rating_filter: false,
+                suppress_facet_filter: true,
+                reading_history_return_from: None,
+            },
+        };
+        assert!(app.start_grid_virtual_open(intent));
+        finish_staged_physical_history_for_test(&mut app);
+        assert!(!app.facet_filter_active());
+        assert_eq!(app.visible_indices.len(), 4);
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.fullscreen_idx = Some(0);
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput::default());
+        ctx.input_mut(|input| {
+            input.events.push(egui::Event::Key {
+                key: egui::Key::Backspace,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            })
+        });
+        assert!(app.handle_fullscreen_root_key_input(&ctx));
+        let _ = ctx.end_pass();
+        assert!(app.fullscreen_idx.is_none());
+        assert!(!app.pending_return_to_parent);
+        assert_eq!(app.visible_indices.len(), 4);
+        for _ in 0..3 {
+            // Toolbar arrows feed this same dispatcher after input merge.
+            app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
+            finish_rating_navigation_for_test(&mut app);
+            assert!(app.items_are_rating_view);
+            assert!(app.settings.facet_filter.exts.contains("zip"));
+            app.dispatch_main_folder_history_input(FolderHistoryDirection::Forward);
+            finish_staged_physical_history_for_test(&mut app);
+            assert!(!app.items_are_rating_view);
+            assert!(
+                !app.facet_filter_active(),
+                "forward must stash the live parent"
+            );
+            assert_eq!(app.visible_indices.len(), 4);
+        }
     }
 
     fn rating_1328_zip_return(backspace: bool, direction: FolderHistoryDirection, auto: bool) {
@@ -21774,7 +23304,7 @@ mod phase_c_folder_nav_history_tests {
                 let rating = app.folder_nav_back_stack.pop().unwrap();
                 app.folder_nav_forward_stack.push(rating);
             }
-            app.dispatch_main_folder_history_input(direction, &mut None);
+            app.dispatch_main_folder_history_input(direction);
         }
         finish_rating_navigation_for_test(&mut app);
         assert!(app.items_are_rating_view);
@@ -21903,7 +23433,7 @@ mod phase_c_folder_nav_history_tests {
             if backspace {
                 app.rating_view_back();
             } else {
-                app.dispatch_main_folder_history_input(FolderHistoryDirection::Back, &mut None);
+                app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
             }
             assert_eq!(
                 app.rating_view_pending
@@ -21921,7 +23451,7 @@ mod phase_c_folder_nav_history_tests {
             assert_eq!(app.items[4].container_path(), Some(opened.as_path()));
             assert!(app.scroll_to_selected);
             if replay_forward {
-                app.dispatch_main_folder_history_input(FolderHistoryDirection::Forward, &mut None);
+                app.dispatch_main_folder_history_input(FolderHistoryDirection::Forward);
                 if pdf {
                     replace_physical_history_preflight_for_test(
                     &mut app,
@@ -21943,7 +23473,7 @@ mod phase_c_folder_nav_history_tests {
                 assert!(!app.sidecar_restore_active());
                 assert_eq!(app.effective_folder(), Some(opened.clone()));
                 app.selected = Some(3);
-                app.dispatch_main_folder_history_input(FolderHistoryDirection::Back, &mut None);
+                app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
                 finish_rating_navigation_for_test(&mut app);
                 assert!(app.items_are_rating_view);
                 assert_eq!(app.selected, Some(4));
@@ -22156,7 +23686,7 @@ mod phase_c_folder_nav_history_tests {
             if backspace {
                 app.rating_view_back();
             } else {
-                app.dispatch_main_folder_history_input(FolderHistoryDirection::Back, &mut None);
+                app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
             }
             finish_rating_navigation_for_test(&mut app);
             app.cancel_token.store(true, Ordering::Relaxed);
@@ -22180,7 +23710,7 @@ mod phase_c_folder_nav_history_tests {
                 "mid-list position walked toward the end"
             );
             if roundtrip && attempt == 0 {
-                app.dispatch_main_folder_history_input(FolderHistoryDirection::Forward, &mut None);
+                app.dispatch_main_folder_history_input(FolderHistoryDirection::Forward);
                 finish_staged_physical_history_for_test(&mut app);
             }
         }
@@ -22466,7 +23996,7 @@ mod phase_c_folder_nav_history_tests {
             if backspace {
                 app.rating_view_back();
             } else {
-                app.dispatch_main_folder_history_input(FolderHistoryDirection::Back, &mut None);
+                app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
             }
             finish_rating_navigation_for_test(&mut app);
             app.cancel_token.store(true, Ordering::Relaxed);
@@ -22506,7 +24036,7 @@ mod phase_c_folder_nav_history_tests {
                 "position and aspect belong together"
             );
             if roundtrip && attempt == 0 {
-                app.dispatch_main_folder_history_input(FolderHistoryDirection::Forward, &mut None);
+                app.dispatch_main_folder_history_input(FolderHistoryDirection::Forward);
                 finish_staged_physical_history_for_test(&mut app);
             }
         }
@@ -23380,26 +24910,24 @@ mod phase_c_folder_nav_history_tests {
             Some(&super::drive_list_synthetic_path())
         );
 
-        let target = app.navigate_folder_history_back().unwrap();
-        assert_eq!(target, real);
         assert_eq!(
-            app.dispatch_synthetic_folder_history_target(&target),
-            super::SyntheticFolderHistoryDispatch::NotSynthetic
+            app.folder_history_back_target(),
+            Some(&FolderNavHistoryTarget::Path(real.clone()))
         );
-        let target_path = target.clone().into_path().expect("real folder target");
-        app.load_folder(target_path.clone());
-        assert_eq!(app.current_folder.as_ref(), Some(&target_path));
+        let before = app.folder_nav_history_snapshot();
+        app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
+        assert_eq!(
+            app.folder_nav_history_snapshot().back_stack,
+            before.back_stack
+        );
+        finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(app.current_folder.as_ref(), Some(&real));
         assert_eq!(
             app.folder_nav_forward_stack,
             vec![super::drive_list_synthetic_path()]
         );
 
-        let target = app.navigate_folder_history_forward().unwrap();
-        assert_eq!(target, super::drive_list_synthetic_path());
-        assert_eq!(
-            app.dispatch_synthetic_folder_history_target(&target),
-            super::SyntheticFolderHistoryDispatch::Restored
-        );
+        app.dispatch_main_folder_history_input(FolderHistoryDirection::Forward);
         assert!(app.items_are_drive_list);
         assert_eq!(
             app.current_folder.as_ref(),
@@ -23416,12 +24944,13 @@ mod phase_c_folder_nav_history_tests {
                 super::drive_list_synthetic_path()
             ))
         );
-        let target = app.navigate_folder_history_back().unwrap();
-        assert_eq!(target, super::drive_list_synthetic_path());
         assert_eq!(
-            app.dispatch_synthetic_folder_history_target(&target),
-            super::SyntheticFolderHistoryDispatch::Restored
+            app.folder_history_back_target(),
+            Some(&FolderNavHistoryTarget::Path(
+                super::drive_list_synthetic_path()
+            ))
         );
+        app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
         assert!(app.items_are_drive_list);
     }
 
@@ -23432,14 +24961,27 @@ mod phase_c_folder_nav_history_tests {
         // 通常アドレスバー (quick folder A/B スロット非アクティブ) の ←/→ 経路。
         app.active_quick_folder_slot = None;
         app.current_folder = Some(super::reading_history_synthetic_path());
-        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(real.clone())];
+        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(real.clone()).into()];
         app.folder_nav_forward_stack = Vec::new();
 
         // 戻るで実フォルダへは戻れる。
         assert_eq!(
-            app.navigate_folder_history_back(),
+            app.folder_history_back_entry()
+                .map(|entry| entry.location.clone()),
             Some(FolderNavHistoryTarget::Path(real))
         );
+        let before = app.folder_nav_history_snapshot();
+        let target = app.folder_history_back_entry().unwrap().clone();
+        let plan = FolderHistoryPlan::capture(&app, FolderHistoryDirection::Back, target).unwrap();
+        assert_eq!(
+            app.folder_nav_history_snapshot().back_stack,
+            before.back_stack
+        );
+        assert_eq!(
+            app.folder_nav_history_snapshot().forward_stack,
+            before.forward_stack
+        );
+        plan.commit(&mut app);
         // 現在地だった合成パスを forward に残し、ビューへ戻せる。
         assert_eq!(
             app.folder_nav_forward_stack,
@@ -23459,13 +25001,27 @@ mod phase_c_folder_nav_history_tests {
             super::top_level_grid_view::TopLevelGridSurface::Rating { stars: 4 },
             None,
         );
-        app.folder_nav_forward_stack = vec![FolderNavHistoryTarget::Path(real.clone())];
+        app.folder_nav_forward_stack = vec![FolderNavHistoryTarget::Path(real.clone()).into()];
         app.folder_nav_back_stack = Vec::new();
 
         assert_eq!(
-            app.navigate_folder_history_forward(),
+            app.folder_history_forward_entry()
+                .map(|entry| entry.location.clone()),
             Some(FolderNavHistoryTarget::Path(real))
         );
+        let before = app.folder_nav_history_snapshot();
+        let target = app.folder_history_forward_entry().unwrap().clone();
+        let plan =
+            FolderHistoryPlan::capture(&app, FolderHistoryDirection::Forward, target).unwrap();
+        assert_eq!(
+            app.folder_nav_history_snapshot().back_stack,
+            before.back_stack
+        );
+        assert_eq!(
+            app.folder_nav_history_snapshot().forward_stack,
+            before.forward_stack
+        );
+        plan.commit(&mut app);
         assert_eq!(
             app.folder_nav_back_stack,
             vec![FolderNavHistoryTarget::Rating { stars: 4 }]
@@ -23491,43 +25047,48 @@ mod phase_c_folder_nav_history_tests {
 
         app.load_folder(after.clone());
         assert_eq!(
-            app.folder_nav_back_stack.last(),
+            app.folder_nav_back_stack
+                .last()
+                .map(|entry| &entry.location),
             Some(&FolderNavHistoryTarget::Path(
                 super::reading_history_synthetic_path()
             ))
         );
 
-        let target = app.navigate_folder_history_back().unwrap();
-        assert_eq!(target, super::reading_history_synthetic_path());
         assert_eq!(
-            app.dispatch_synthetic_folder_history_target(&target),
-            super::SyntheticFolderHistoryDispatch::Restored
+            app.folder_history_back_target(),
+            Some(&FolderNavHistoryTarget::Path(
+                super::reading_history_synthetic_path()
+            ))
         );
+        app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
         assert!(app.items_are_reading_history_view);
         assert_eq!(
             app.current_folder.as_ref(),
             Some(&super::reading_history_synthetic_path())
         );
         assert_eq!(
-            app.folder_nav_forward_stack.last(),
+            app.folder_nav_forward_stack
+                .last()
+                .map(|entry| &entry.location),
             Some(&FolderNavHistoryTarget::Path(after.clone()))
         );
         assert!(!app.suppress_folder_nav_record_once);
 
-        let target = app.navigate_folder_history_forward().unwrap();
-        assert_eq!(target, after);
         assert_eq!(
-            app.dispatch_synthetic_folder_history_target(&target),
-            super::SyntheticFolderHistoryDispatch::NotSynthetic
+            app.folder_history_forward_target(),
+            Some(&FolderNavHistoryTarget::Path(after.clone()))
         );
-        app.load_folder(target.into_path().expect("real folder target"));
+        app.dispatch_main_folder_history_input(FolderHistoryDirection::Forward);
+        finish_staged_physical_history_for_test(&mut app);
 
-        let target = app.navigate_folder_history_back().unwrap();
-        assert_eq!(target, super::reading_history_synthetic_path());
         assert_eq!(
-            app.dispatch_synthetic_folder_history_target(&target),
-            super::SyntheticFolderHistoryDispatch::Restored
+            app.folder_history_back_target(),
+            Some(&FolderNavHistoryTarget::Path(
+                super::reading_history_synthetic_path()
+            ))
         );
+        app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
         assert!(app.items_are_reading_history_view);
     }
 
@@ -23540,7 +25101,7 @@ mod phase_c_folder_nav_history_tests {
         rating_app.rating_view_rows_stars = Some(4);
         let prior = rating_app.tmp.path().join("before-rating-history");
         rating_app.current_folder = Some(prior.clone());
-        rating_app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(prior.clone())];
+        rating_app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(prior.clone()).into()];
         rating_app.set_active_folder_nav_suppress_record_once(true);
         assert_eq!(
             rating_app.dispatch_synthetic_folder_history_target(&FolderNavHistoryTarget::Rating {
@@ -23555,7 +25116,10 @@ mod phase_c_folder_nav_history_tests {
             Some(FolderNavHistoryTarget::Path(prior.clone()))
         );
         assert_eq!(
-            rating_app.folder_nav_back_stack.last(),
+            rating_app
+                .folder_nav_back_stack
+                .last()
+                .map(|entry| &entry.location),
             Some(&FolderNavHistoryTarget::Path(prior))
         );
         assert!(rating_app.suppress_folder_nav_record_once);
@@ -23580,9 +25144,15 @@ mod phase_c_folder_nav_history_tests {
             Some(FolderNavHistoryTarget::Rating { stars: 4 })
         );
         assert!(
-            rating_app.suppress_folder_nav_record_once,
-            "transient restore keeps the one-shot history cursor unchanged"
+            !rating_app.suppress_folder_nav_record_once,
+            "successful Restore consumes its one-shot without recording a navigation"
         );
+        assert_eq!(rating_app.folder_nav_back_stack.len(), 1);
+        assert_eq!(
+            rating_app.folder_nav_back_stack[0].location,
+            FolderNavHistoryTarget::Path(rating_app.tmp.path().join("before-rating-history"))
+        );
+        assert!(rating_app.folder_nav_forward_stack.is_empty());
     }
 
     #[test]
@@ -23625,12 +25195,13 @@ mod phase_c_folder_nav_history_tests {
         assert!(app.subfolder_expansion_snapshot.is_none());
         assert!(app.folder_nav_subfolder_restore.is_some());
 
-        let target = app.navigate_folder_history_back().unwrap();
-        assert_eq!(target, super::subfolder_expansion_synthetic_path());
         assert_eq!(
-            app.dispatch_synthetic_folder_history_target(&target),
-            super::SyntheticFolderHistoryDispatch::Restored
+            app.folder_history_back_target(),
+            Some(&FolderNavHistoryTarget::Path(
+                super::subfolder_expansion_synthetic_path()
+            ))
         );
+        app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
         app.finish_subfolder_expansion_prepare_for_test();
         assert!(app.items_are_subfolder_expansion_view);
         assert_eq!(
@@ -23652,15 +25223,13 @@ mod phase_c_folder_nav_history_tests {
         app.current_folder = Some(real.clone());
         let slot = QuickFolderSlotId::A;
         app.quick_folder_workspaces[slot.index()].history.back_stack =
-            vec![FolderNavHistoryTarget::Rating { stars: 0 }];
+            vec![FolderNavHistoryTarget::Rating { stars: 0 }.into()];
         let snapshot = app.folder_nav_history_snapshot();
-
-        let target = app.navigate_folder_history_back().unwrap();
+        app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
         assert_eq!(
-            app.dispatch_synthetic_folder_history_target(&target),
-            super::SyntheticFolderHistoryDispatch::Unavailable
+            app.folder_nav_history_snapshot().back_stack,
+            snapshot.back_stack
         );
-        app.restore_folder_nav_history(snapshot);
 
         assert_eq!(app.current_folder.as_ref(), Some(&real));
         assert_eq!(
@@ -23686,14 +25255,25 @@ mod phase_c_folder_nav_history_tests {
         let saved = app.tmp.path().join("saved");
         std::fs::create_dir_all(&saved).unwrap();
         let prev = PathBuf::from(r"C:\miv-test\prev");
-        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(prev.clone())];
+        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(prev.clone()).into()];
         app.folder_nav_forward_stack = Vec::new();
         // 検索中に ZIP を開いて current_folder が saved とずれている状態を模擬。
         app.current_folder = Some(PathBuf::from(r"C:\miv-test\opened-in-search.zip"));
         app.global_search.active = true;
         app.global_search.saved_folder = Some(saved.clone());
 
+        let mounted_before = app.current_folder.clone();
         app.close_global_search();
+        assert_eq!(
+            app.current_folder, mounted_before,
+            "return preparation preserves the mounted source"
+        );
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+        );
+        finish_staged_physical_history_for_test(&mut app);
 
         // 検索クローズによる saved への復帰は履歴に積まれない。
         assert_eq!(app.folder_nav_back_stack, vec![prev]);
@@ -23708,13 +25288,24 @@ mod phase_c_folder_nav_history_tests {
         let saved = app.tmp.path().join("fav-saved");
         std::fs::create_dir_all(&saved).unwrap();
         let prev = PathBuf::from(r"C:\miv-test\prev");
-        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(prev.clone())];
+        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(prev.clone()).into()];
         // favsearch 結果一覧中は current_folder が合成パス。
         app.current_folder = Some(crate::app::search_results_synthetic_path());
         app.favsearch.active = true;
         app.favsearch.saved_folder = Some(saved.clone());
 
+        let mounted_before = app.current_folder.clone();
         app.close_favsearch();
+        assert_eq!(
+            app.current_folder, mounted_before,
+            "return preparation preserves the mounted source"
+        );
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+        );
+        finish_staged_physical_history_for_test(&mut app);
 
         assert_eq!(app.folder_nav_back_stack, vec![prev]);
         assert!(!app.suppress_nav_record_for_search_restore);
@@ -23876,10 +25467,10 @@ mod phase_c_folder_nav_history_tests {
         let c = PathBuf::from(r"C:\miv-test\pre-search");
         let slot = QuickFolderSlotId::A;
         app.quick_folder_workspaces[slot.index()].history.back_stack =
-            vec![FolderNavHistoryTarget::Path(older.clone())];
+            vec![FolderNavHistoryTarget::Path(older.clone()).into()];
         app.quick_folder_workspaces[slot.index()]
             .history
-            .forward_stack = vec![FolderNavHistoryTarget::Path(forward)];
+            .forward_stack = vec![FolderNavHistoryTarget::Path(forward).into()];
 
         app.push_nav_history_entry(c.clone());
 
@@ -23940,11 +25531,25 @@ mod phase_c_folder_nav_history_tests {
             .cancel
             .store(true, std::sync::atomic::Ordering::Relaxed);
         FolderPaneOpenReady {
+            navigation: pending.navigation,
             epub_restore: None,
             path: pending.path,
             scan,
             purpose: pending.purpose,
         }
+    }
+
+    #[cfg(windows)]
+    fn finish_context_jump_hydration(app: &mut App) {
+        let ctx = egui::Context::default();
+        for _ in 0..1000 {
+            if !app.sidecar_restore_active() {
+                return;
+            }
+            app.poll_sidecar_restore(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("context jump hydration did not settle");
     }
 
     #[cfg(windows)]
@@ -23964,7 +25569,7 @@ mod phase_c_folder_nav_history_tests {
         let older = PathBuf::from(r"C:\miv-test\older");
         let slot = QuickFolderSlotId::A;
         app.quick_folder_workspaces[slot.index()].history.back_stack =
-            vec![FolderNavHistoryTarget::Path(older.clone())];
+            vec![FolderNavHistoryTarget::Path(older.clone()).into()];
         arm_context_jump_source(
             &mut app,
             TopLevelSearchView::Tag,
@@ -23979,6 +25584,34 @@ mod phase_c_folder_nav_history_tests {
         };
         assert!(app.begin_context_jump_to_folder(request).is_none());
 
+        assert!(app.tag_view.active);
+        assert!(app.items_are_tag_view);
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            TopLevelGridSurface::Search(TopLevelSearchView::Tag)
+        ));
+        assert!(app.top_level_grid_view.return_to().is_some());
+        assert_eq!(
+            app.items.len(),
+            1,
+            "source stays mounted during preparation"
+        );
+        assert_eq!(
+            app.current_folder,
+            Some(crate::app::search_results_synthetic_path())
+        );
+        assert!(app.context_folder_jump_pending());
+        assert!(app.select_after_load.is_none());
+        assert_eq!(
+            app.quick_folder_workspaces[slot.index()].history.back_stack,
+            vec![older.clone()]
+        );
+
+        let ready = take_context_jump_ready(&mut app, Ok(scan_directory(&destination)));
+        let ctx = egui::Context::default();
+        assert!(app.resolve_main_folder_open_ready(&ctx, ready).is_none());
+
+        finish_context_jump_hydration(&mut app);
         assert!(!app.tag_view.active);
         assert!(!app.items_are_tag_view);
         assert!(matches!(
@@ -23986,19 +25619,6 @@ mod phase_c_folder_nav_history_tests {
             TopLevelGridSurface::Folder
         ));
         assert!(app.top_level_grid_view.return_to().is_none());
-        assert!(app.items.is_empty(), "search rows leave with their surface");
-        assert!(app.current_folder.is_none());
-        assert!(app.context_folder_jump_pending());
-        assert!(app.select_after_load.is_none());
-        assert_eq!(
-            app.quick_folder_workspaces[slot.index()].history.back_stack,
-            vec![older.clone(), origin.clone()]
-        );
-
-        let ready = take_context_jump_ready(&mut app, Ok(scan_directory(&destination)));
-        let ctx = egui::Context::default();
-        assert!(app.resolve_main_folder_open_ready(&ctx, ready).is_none());
-
         assert!(!app.context_folder_jump_pending());
         assert_eq!(app.current_folder.as_ref(), Some(&destination));
         let selected = app.selected.expect("exact target selected");
@@ -24047,14 +25667,16 @@ mod phase_c_folder_nav_history_tests {
             })
             .is_none()
         );
-        assert!(!app.items_are_reading_history_view);
-        assert!(app.items.is_empty());
+        assert!(app.items_are_reading_history_view);
+        assert_eq!(app.items.len(), 1);
 
         let ready = take_context_jump_ready(&mut app, Ok(scan_directory(&destination)));
         assert!(
             app.resolve_main_folder_open_ready(&egui::Context::default(), ready)
                 .is_none()
         );
+        finish_context_jump_hydration(&mut app);
+        assert!(!app.items_are_reading_history_view);
         assert_eq!(app.current_folder.as_ref(), Some(&destination));
         assert!(app.selected.is_some_and(|index| {
             app.items.get(index).is_some_and(|item| {
@@ -24067,7 +25689,622 @@ mod phase_c_folder_nav_history_tests {
 
     #[cfg(windows)]
     #[test]
-    fn all_search_surfaces_dismiss_without_restoring_their_canonical_origin() {
+    fn section1339_search_refresh_crossing_pending_folder_scan_keeps_copied_destination() {
+        use crate::app::top_level_grid_view::TopLevelSearchView;
+        use crate::ui_dialogs::context_menu::{
+            JumpToFolderDestination, JumpToFolderRequest, JumpToFolderSelection,
+        };
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = false;
+        let origin = app.tmp.path().join("search-origin");
+        let destination = app.tmp.path().join("search-destination");
+        std::fs::create_dir_all(&destination).unwrap();
+        let exact = destination.join("z-book.zip");
+        std::fs::write(&exact, b"target").unwrap();
+        let addition = destination.join("a-book.zip");
+        std::fs::write(&addition, b"addition").unwrap();
+        arm_context_jump_source(
+            &mut app,
+            TopLevelSearchView::Favorite,
+            origin.clone(),
+            GridItem::ZipFile(exact.clone()),
+        );
+        app.favsearch.query = "book".into();
+        app.favsearch.last_executed = "book".into();
+        assert!(
+            app.begin_context_jump_to_folder(JumpToFolderRequest {
+                destination: JumpToFolderDestination::PhysicalDirectory(destination.clone()),
+                selection: JumpToFolderSelection::ExactPath(exact.clone()),
+                origin: None,
+            })
+            .is_none()
+        );
+        // Hold the actual pane completion channel, preserving its admitted owner/purpose.
+        let (scan_tx, scan_rx) = mpsc::channel();
+        let pending = app.folder_pane_open_pending.as_mut().unwrap();
+        pending
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        pending.rx = scan_rx;
+        let generation = app.items_generation;
+        // Refresh through the actual SQLite search worker and result-install poll.
+        let db = crate::search_index_db::SearchIndexDb::open_at(
+            &app.tmp.path().join("refresh-index.db"),
+        )
+        .unwrap();
+        let indexed = [addition, exact.clone()]
+            .into_iter()
+            .map(|path| crate::search_index_db::IndexEntry {
+                display_name: path.file_name().unwrap().to_string_lossy().into_owned(),
+                path,
+                kind: crate::search_index_db::IndexKind::ZipFile,
+                mtime: 0,
+            })
+            .collect::<Vec<_>>();
+        db.upsert_children(&destination, &destination, &indexed)
+            .unwrap();
+        app.search_index_db = Some(std::sync::Arc::new(db));
+        let mut favorite = crate::settings::FavoriteEntry::new("books".into(), destination.clone());
+        favorite.auto_index_structure = true;
+        app.settings.favorites.push(favorite);
+        app.execute_favsearch();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.favsearch_pending.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "search refresh worker must finish"
+            );
+            app.poll_favsearch();
+            std::thread::yield_now();
+        }
+        assert!(app.items_generation > generation);
+        assert_eq!(app.items.len(), 2);
+        assert!(app.favsearch.active);
+        let ctx = egui::Context::default();
+        assert!(app.poll_folder_pane_open(&ctx).is_none());
+        assert!(
+            app.context_folder_jump_pending(),
+            "a same-query result refresh cannot cancel a path-based jump"
+        );
+        scan_tx.send(Ok(scan_directory(&destination))).unwrap();
+        let ready = app
+            .poll_folder_pane_open(&ctx)
+            .expect("the original scan still owns adoption");
+        app.resolve_main_folder_open_ready(&ctx, ready);
+        finish_context_jump_hydration(&mut app);
+        assert_eq!(app.current_folder.as_ref(), Some(&destination));
+        assert!(!app.favsearch.active);
+        assert!(
+            app.selected
+                .is_some_and(|index| app.items[index].drag_source_path() == Some(exact.as_path()))
+        );
+        assert_eq!(
+            app.folder_nav_back_stack,
+            vec![crate::app::FolderNavHistoryEntry::from(
+                FolderNavHistoryTarget::Path(origin)
+            )]
+        );
+    }
+
+    #[cfg(windows)]
+    fn refresh_favorite_zip_search_for_test(
+        app: &mut App,
+        directory: &std::path::Path,
+        book: &std::path::Path,
+    ) {
+        let addition = directory.join("a-book.zip");
+        std::fs::write(&addition, b"addition").unwrap();
+        let db = crate::search_index_db::SearchIndexDb::open_at(
+            &directory.join("zip-open-refresh-index.db"),
+        )
+        .unwrap();
+        let indexed = [addition, book.to_path_buf()]
+            .into_iter()
+            .map(|path| crate::search_index_db::IndexEntry {
+                display_name: path.file_name().unwrap().to_string_lossy().into_owned(),
+                path,
+                kind: crate::search_index_db::IndexKind::ZipFile,
+                mtime: 0,
+            })
+            .collect::<Vec<_>>();
+        db.upsert_children(directory, directory, &indexed).unwrap();
+        app.search_index_db = Some(std::sync::Arc::new(db));
+        let mut favorite =
+            crate::settings::FavoriteEntry::new("books".into(), directory.to_path_buf());
+        favorite.auto_index_structure = true;
+        app.settings.favorites.push(favorite);
+        let generation = app.items_generation;
+        app.execute_favsearch();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.favsearch_pending.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "search refresh worker must finish"
+            );
+            app.poll_favsearch();
+            std::thread::yield_now();
+        }
+        assert!(app.items_generation > generation);
+        assert_eq!(app.items.len(), 2);
+        assert!(app.favsearch.active);
+        assert_ne!(
+            app.items[0].drag_source_path(),
+            Some(book),
+            "the copied path must survive row reordering"
+        );
+    }
+
+    #[test]
+    fn section1339_quick_folder_reselect_roundtrip_and_forget_retire_classification() {
+        for switch in [0, 1, 2] {
+            let mut app = setup_app();
+            let folder = app.tmp.path().to_path_buf();
+            let archive = folder.join("pending.7z");
+            std::fs::write(
+                &archive,
+                b"classification must not open conversion after switch",
+            )
+            .unwrap();
+            app.current_folder = Some(folder.clone());
+            app.set_quick_folder_slot_target(QuickFolderSlotId::B, folder.clone());
+            app.set_quick_folder_slot_target(QuickFolderSlotId::A, folder.clone());
+            app.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                archive,
+                false,
+                super::OpenRequestOwner::Navigation,
+                crate::app::StartupListIntent::ExplicitList,
+            );
+            let pending = app.top_level_grid_view.open_path_classification().unwrap();
+            let navigation = pending.navigation.as_ref().unwrap().clone();
+            let cancel = pending.cancel.clone();
+            let history = app.folder_nav_history_snapshot();
+            // The real classification worker can reply, but completion polling is held until
+            // the actual quick-folder switch boundary has run, including its Current branch.
+            if switch == 1 {
+                assert_eq!(
+                    app.activate_quick_folder_slot(QuickFolderSlotId::B),
+                    QuickFolderSwitchTarget::Current
+                );
+            }
+            if switch == 2 {
+                app.execute_clear_quick_folder_slots();
+            } else {
+                assert_eq!(
+                    app.activate_quick_folder_slot(QuickFolderSlotId::A),
+                    QuickFolderSwitchTarget::Current
+                );
+            }
+            assert!(
+                !app.main_list_navigation_is_current(&navigation),
+                "same semantic path cannot resurrect an older switch epoch"
+            );
+            assert!(
+                app.top_level_grid_view.open_path_classification().is_none(),
+                "switch admission must retire its worker owner"
+            );
+            assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+            app.settle_open_path_classification_for_test();
+            assert!(app.archive_convert.is_none());
+            assert_eq!(app.current_folder.as_ref(), Some(&folder));
+            assert_eq!(
+                app.folder_nav_history_snapshot().back_stack,
+                history.back_stack
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn section1339_pane_enter_scan_crosses_real_search_refresh() {
+        use crate::app::top_level_grid_view::TopLevelSearchView;
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = false;
+        let origin = app.tmp.path().join("pane-search-origin");
+        let directory = app.tmp.path().join("pane-search-destination");
+        std::fs::create_dir_all(&directory).unwrap();
+        let book = directory.join("z-book.zip");
+        write_1328_zip(&book);
+        arm_context_jump_source(
+            &mut app,
+            TopLevelSearchView::Favorite,
+            origin,
+            GridItem::ZipFile(book.clone()),
+        );
+        app.favsearch.query = "book".into();
+        app.favsearch.last_executed = "book".into();
+        let ctx = egui::Context::default();
+        app.settings.folder_tree_pane_visible = true;
+        app.sync_folder_pane_state(&ctx);
+        app.folder_pane.set_cursor(directory.clone());
+        app.folder_pane.set_focus_tree();
+        // Real pane keyboard gate consumes Enter and starts the real directory scan.
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                assert!(app.handle_folder_pane_keyboard(ctx).is_none());
+            },
+        );
+        assert!(app.folder_pane_open_pending.is_some());
+        refresh_favorite_zip_search_for_test(&mut app, &directory, &book);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let ready = loop {
+            if let Some(ready) = app.poll_folder_pane_open(&ctx) {
+                break ready;
+            }
+            assert!(
+                app.folder_pane_open_pending.is_some(),
+                "same-query result publication cannot cancel pane navigation"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pane scan must complete"
+            );
+            std::thread::yield_now();
+        };
+        let ready = app.resolve_main_folder_open_ready(&ctx, ready).unwrap();
+        app.load_folder_with_scan_owned_outcome_and_effects_classified_with_navigation(
+            ready.path,
+            Some(ready.scan),
+            super::OpenRequestOwner::Navigation,
+            None,
+            None,
+            ready.restore_intent,
+            ready.navigation,
+        );
+        assert_eq!(app.current_folder.as_ref(), Some(&directory));
+        assert_eq!(app.favsearch.nav_stack.last(), Some(&directory));
+        assert!(
+            app.items
+                .iter()
+                .any(|item| item.drag_source_path() == Some(book.as_path()))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn section1339_copied_history_destination_crosses_source_row_publication() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = false;
+        let directory = app.tmp.path().join("history-search-source");
+        let destination = app.tmp.path().join("history-search-destination");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        let book = directory.join("z-book.zip");
+        write_1328_zip(&book);
+        app.current_folder = Some(directory.clone());
+        app.install_new_items(vec![GridItem::ZipFile(book.clone())], vec![None]);
+        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(destination.clone()).into()];
+        app.dispatch_folder_history_input_for_test(FolderHistoryDirection::Back);
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+        );
+        // A source presentation publication changes rows, not the mounted Folder owner.
+        app.install_new_items(
+            vec![
+                GridItem::ZipFile(directory.join("earlier.zip")),
+                GridItem::ZipFile(book),
+            ],
+            vec![None, None],
+        );
+        finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(app.current_folder.as_ref(), Some(&destination));
+        assert!(app.folder_nav_back_stack.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn section1339_search_query_reentry_retires_pending_copied_open() {
+        use crate::app::top_level_grid_view::TopLevelSearchView;
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let folder = app.tmp.path().to_path_buf();
+        let book = folder.join("pending.zip");
+        write_1328_zip(&book);
+        arm_context_jump_source(
+            &mut app,
+            TopLevelSearchView::Global,
+            folder,
+            GridItem::ZipFile(book.clone()),
+        );
+        app.global_search.query = "book".into();
+        app.global_search.last_executed = "book".into();
+        app.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+            book,
+            false,
+            super::OpenRequestOwner::Navigation,
+            crate::app::StartupListIntent::ExplicitList,
+        );
+        let navigation = match app
+            .top_level_grid_view
+            .history_navigation_transition()
+            .unwrap()
+        {
+            super::HistoryNavigationTransition::Physical(request) => request.navigation.clone(),
+            _ => panic!("copied ZIP must own a Physical request"),
+        };
+        let ctx = egui::Context::default();
+        // The actual query-change/reset boundary owns re-entry even with the same text.
+        app.reset_global_search_for_query_change(&ctx);
+        app.global_search.last_executed = "book".into();
+        assert!(!app.main_list_navigation_is_current(&navigation));
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_none()
+        );
+        finish_staged_physical_history_for_test(&mut app);
+        assert!(app.global_search.active);
+        assert_eq!(
+            app.current_folder,
+            Some(crate::app::search_results_synthetic_path())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn section1339_required_fullscreen_scan_keeps_original_proof_across_source_row_publication() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = false;
+        let directory = app.tmp.path().join("required-search-destination");
+        std::fs::create_dir_all(&directory).unwrap();
+        let book = directory.join("z-book.zip");
+        let image = directory.join("page.jpg");
+        write_1328_zip(&book);
+        std::fs::write(&image, b"destination image").unwrap();
+        let origin = app.tmp.path().join("required-source");
+        app.current_folder = Some(origin.clone());
+        app.install_new_items(vec![GridItem::Image(origin.join("old.jpg"))], vec![None]);
+        app.fullscreen_idx = Some(0);
+        app.start_folder_open_scan(
+            directory.clone(),
+            super::FolderOpenScanPurpose::RequiredFullscreenTarget {
+                target: crate::snapshot::SnapshotTarget::Fs(image.clone()),
+                history_trigger: super::HistoryTrigger::UserChosen,
+                navigation_purpose: super::FsNavigationPurpose::Ordinary,
+            },
+        );
+        app.install_new_items(
+            vec![GridItem::Image(origin.join("updated.jpg"))],
+            vec![None],
+        );
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let ready = loop {
+            if let Some(ready) = app.poll_folder_pane_open(&ctx) {
+                break ready;
+            }
+            assert!(app.folder_pane_open_pending.is_some());
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        };
+        assert!(app.resolve_main_folder_open_ready(&ctx, ready).is_none());
+        assert_eq!(app.current_folder.as_ref(), Some(&directory));
+        let idx = app
+            .fullscreen_idx
+            .expect("exact copied leaf must open after adoption");
+        assert_eq!(app.items[idx].drag_source_path(), Some(image.as_path()));
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_none()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn section1339_search_result_zip_open_crosses_real_refresh_in_preflight() {
+        use crate::app::top_level_grid_view::TopLevelSearchView;
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        let origin = app.tmp.path().join("zip-search-origin");
+        let directory = app.tmp.path().join("zip-search-destination");
+        std::fs::create_dir_all(&directory).unwrap();
+        let book = directory.join("z-book.zip");
+        write_1328_zip(&book);
+        arm_context_jump_source(
+            &mut app,
+            TopLevelSearchView::Favorite,
+            origin,
+            GridItem::ZipFile(book.clone()),
+        );
+        app.favsearch.query = "book".into();
+        app.favsearch.last_executed = "book".into();
+        app.settings.facet_filter.exts.insert("zip".into());
+        app.rebuild_visible_indices();
+        let history = app.folder_nav_history_snapshot();
+        let ctx = egui::Context::default();
+        // Go through the real explicit page-list handler, including its admission gates
+        // and source/effects capture. Only the async completion poll is held back.
+        let Some(crate::ui_main::AddressBarNav::GridVirtual(intent)) = app
+            .open_grid_container_with_mode(
+                &ctx,
+                0,
+                crate::app::GridContainerOpenMode::PageList,
+                "zip-search-regression",
+            )
+        else {
+            panic!("search ZIP must produce the ordinary copied-path intent");
+        };
+        assert!(app.start_grid_virtual_open(intent));
+        // Ordinary ZIP bypasses classification and starts its real ZIP worker directly.
+        assert!(app.top_level_grid_view.open_path_classification().is_none());
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+        );
+        refresh_favorite_zip_search_for_test(&mut app, &directory, &book);
+        finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(
+            app.current_folder.as_ref(),
+            Some(&book),
+            "same-query refresh cannot cancel the copied ZIP request"
+        );
+        assert_eq!(app.items.len(), 4);
+        assert_eq!(app.visible_indices.len(), 4);
+        assert!(!app.settings.facet_filter.is_active());
+        assert_eq!(app.facet_navigation.saved_frame_count(), 1);
+        assert_eq!(app.folder_nav_back_stack, history.back_stack);
+        assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn section1339_copied_zip_classification_adapters_cross_real_search_refresh() {
+        use crate::app::top_level_grid_view::TopLevelSearchView;
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        let directory = app.tmp.path().join("classified-zip-destination");
+        std::fs::create_dir_all(&directory).unwrap();
+        let book = directory.join("z-book.zip");
+        write_1328_zip(&book);
+        let origin = app.tmp.path().join("classified-zip-origin");
+        arm_context_jump_source(
+            &mut app,
+            TopLevelSearchView::Favorite,
+            origin,
+            GridItem::ZipFile(book.clone()),
+        );
+        app.favsearch.query = "book".into();
+        app.favsearch.last_executed = "book".into();
+        // ZIP normally bypasses classification. Exercise the shared typed classification
+        // boundary directly with the real worker, including the scan adapter that also owns
+        // its path/effects instead of retaining a source row index.
+        assert!(matches!(
+            app.start_open_path_classification_owned(
+                crate::pdf_loader::LeasedEpubPath::try_new(book.clone()).unwrap(),
+                crate::app::ClassifiedOpenContinuation::DirectScan {
+                    pre_scan: None,
+                    owner: crate::app::OpenRequestOwner::Navigation,
+                    grid_effects: None,
+                    restore_intent: crate::app::StartupListIntent::ExplicitList,
+                },
+            ),
+            crate::app::OpenAdmission::Accepted
+        ));
+        assert!(app.top_level_grid_view.open_path_classification().is_some());
+        refresh_favorite_zip_search_for_test(&mut app, &directory, &book);
+        finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(app.current_folder.as_ref(), Some(&book));
+        assert_eq!(app.items.len(), 4);
+    }
+
+    #[test]
+    fn section1339_address_bar_zip_enter_keeps_copied_path_across_row_refresh() {
+        use egui_kittest::{
+            Harness,
+            kittest::{NodeT, Queryable},
+        };
+        use std::{
+            cell::{Cell, RefCell},
+            rc::Rc,
+        };
+        let mut env = setup_app();
+        env.active_quick_folder_slot = None;
+        env.settings.sidecar_backup_enabled = false;
+        env.settings.auto_fullscreen_zip_pdf = false;
+        let parent = env.tmp.path().join("address-zip-parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        let book = parent.join("book.zip");
+        write_1328_zip(&book);
+        env.load_folder(parent.clone());
+        env.address = book.to_string_lossy().into_owned();
+        env.settings.show_toolbar_folder_tree_button = false;
+        env.settings.show_toolbar_effetune = false;
+        env.settings.show_toolbar_bookshelf = false;
+        env.settings.show_toolbar_collections = false;
+        env.settings.show_toolbar_cols = false;
+        env.settings.show_toolbar_aspect = false;
+        env.settings.show_toolbar_sort = false;
+        env.settings.show_toolbar_rating = false;
+        env.settings.show_toolbar_favorites = false;
+        env.settings.show_toolbar_smart_folders = false;
+        env.settings.show_toolbar_tags = false;
+        env.settings.show_toolbar_folder = true;
+        let app = Rc::new(RefCell::new(env));
+        let render = Rc::clone(&app);
+        let fonts = Cell::new(false);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1200.0, 280.0))
+            .build(move |ctx| {
+                crate::ime_focus::install_ime_input_policy(ctx);
+                if !fonts.replace(true) {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    ctx.request_repaint();
+                    return;
+                }
+                let mut app = render.borrow_mut();
+                app.update_ime_state(ctx);
+                if let Some(nav) = app.render_toolbar(ctx).1 {
+                    let crate::ui_main::AddressBarNav::Direct(path, restore_intent) = nav else {
+                        panic!("address Enter must produce Direct navigation");
+                    };
+                    // The exact consumer used by App::update after merging AddressBarNav::Direct.
+                    app.open_direct_navigation_target(
+                        path,
+                        None,
+                        crate::app::OpenRequestOwner::Navigation,
+                        None,
+                        None,
+                        restore_intent,
+                    );
+                }
+            });
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .click();
+        harness.run();
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+        let mut app = app.borrow_mut();
+        let Some(crate::app::HistoryNavigationTransition::Physical(candidate)) =
+            app.top_level_grid_view.history_navigation_transition()
+        else {
+            panic!("real address Enter starts ZIP preflight");
+        };
+        assert_eq!(candidate.path.as_path(), book.as_path());
+        assert_eq!(app.current_folder.as_ref(), Some(&parent));
+        let old_generation = app.items_generation;
+        app.install_new_items(
+            vec![
+                GridItem::ZipFile(parent.join("other.zip")),
+                GridItem::ZipFile(book.clone()),
+            ],
+            vec![None, None],
+        );
+        assert!(app.items_generation > old_generation);
+        finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(app.current_folder.as_ref(), Some(&book));
+        assert_eq!(app.items.len(), 4);
+        assert_eq!(
+            app.folder_nav_back_stack.last().unwrap().location,
+            FolderNavHistoryTarget::Path(parent)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn section1339_context_jump_keeps_each_search_source_until_successful_adoption() {
         use crate::app::top_level_grid_view::{TopLevelGridSurface, TopLevelSearchView};
         use crate::ui_dialogs::context_menu::{
             JumpToFolderDestination, JumpToFolderRequest, JumpToFolderSelection,
@@ -24079,22 +26316,88 @@ mod phase_c_folder_nav_history_tests {
             TopLevelSearchView::Tag,
         ] {
             let mut app = setup_app();
+            app.active_quick_folder_slot = None;
+            app.active_quick_folder_slot = None;
             let origin = app.tmp.path().join(format!("origin-{search:?}"));
             let destination = app.tmp.path().join(format!("destination-{search:?}"));
             std::fs::create_dir_all(&destination).unwrap();
+            let exact = destination.join("z-exact.jpg");
+            std::fs::write(destination.join("a-other.jpg"), b"other").unwrap();
+            std::fs::write(&exact, b"target").unwrap();
             arm_context_jump_source(
                 &mut app,
                 search,
                 origin.clone(),
-                GridItem::Image(destination.join("target.jpg")),
+                GridItem::Image(exact.clone()),
             );
-
-            let request = JumpToFolderRequest {
-                destination: JumpToFolderDestination::PhysicalDirectory(destination),
-                selection: JumpToFolderSelection::None,
+            app.selected = Some(0);
+            app.settings.facet_filter.exts.insert("jpg".to_owned());
+            let before = app.folder_nav_history_snapshot();
+            let source_route = app.facet_navigation.route().clone();
+            let request = || JumpToFolderRequest {
+                destination: JumpToFolderDestination::PhysicalDirectory(destination.clone()),
+                selection: JumpToFolderSelection::ExactPath(exact.clone()),
                 origin: None,
             };
-            assert!(app.begin_context_jump_to_folder(request).is_none());
+
+            for cancel in [true, false] {
+                assert!(app.begin_context_jump_to_folder(request()).is_none());
+                assert!(app.context_folder_jump_pending());
+                assert!(matches!(app.top_level_grid_view.surface(),
+                    TopLevelGridSurface::Search(actual) if *actual == search));
+                assert!(app.top_level_grid_view.return_to().is_some());
+                assert_eq!(app.items.len(), 1);
+                assert_eq!(app.items[0].drag_source_path(), Some(exact.as_path()));
+                assert_eq!(app.selected, Some(0));
+                assert_eq!(app.facet_navigation.route(), &source_route);
+                assert!(app.settings.facet_filter.exts.contains("jpg"));
+                assert_eq!(
+                    app.folder_nav_history_snapshot().back_stack,
+                    before.back_stack
+                );
+                assert_eq!(
+                    app.folder_nav_history_snapshot().forward_stack,
+                    before.forward_stack
+                );
+                if cancel {
+                    app.cancel_folder_pane_open(crate::app::PaneOpenRestoreExit::Abandoned);
+                } else {
+                    let ready = take_context_jump_ready(
+                        &mut app,
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "test denied",
+                        )),
+                    );
+                    assert!(
+                        app.resolve_main_folder_open_ready(&egui::Context::default(), ready)
+                            .is_none()
+                    );
+                }
+                assert!(!app.context_folder_jump_pending());
+                assert!(matches!(app.top_level_grid_view.surface(),
+                    TopLevelGridSurface::Search(actual) if *actual == search));
+                assert_eq!(app.items.len(), 1);
+                assert_eq!(app.selected, Some(0));
+                assert_eq!(app.facet_navigation.route(), &source_route);
+                assert!(app.settings.facet_filter.exts.contains("jpg"));
+                assert_eq!(
+                    app.folder_nav_history_snapshot().back_stack,
+                    before.back_stack
+                );
+                assert_eq!(
+                    app.folder_nav_history_snapshot().forward_stack,
+                    before.forward_stack
+                );
+            }
+
+            assert!(app.begin_context_jump_to_folder(request()).is_none());
+            let ready = take_context_jump_ready(&mut app, Ok(scan_directory(&destination)));
+            assert!(
+                app.resolve_main_folder_open_ready(&egui::Context::default(), ready)
+                    .is_none()
+            );
+            finish_context_jump_hydration(&mut app);
             assert!(!app.favsearch.active);
             assert!(!app.global_search.active);
             assert!(!app.tag_view.active);
@@ -24103,26 +26406,30 @@ mod phase_c_folder_nav_history_tests {
                 TopLevelGridSurface::Folder
             ));
             assert!(app.top_level_grid_view.return_to().is_none());
+            assert_eq!(app.current_folder, Some(destination));
+            let selected = app
+                .selected
+                .expect("exact selection follows metadata hydration");
             assert_eq!(
-                app.quick_folder_workspaces[QuickFolderSlotId::A.index()]
-                    .history
-                    .back_stack,
-                vec![origin]
+                app.items[selected].drag_source_path(),
+                Some(exact.as_path())
             );
-            app.cancel_folder_pane_open(crate::app::PaneOpenRestoreExit::Abandoned);
+            assert!(app.scroll_to_selected);
+            assert_eq!(
+                app.folder_history_back_target(),
+                Some(&FolderNavHistoryTarget::Path(origin))
+            );
+            assert_eq!(
+                app.folder_nav_history_snapshot().back_stack.len(),
+                before.back_stack.len() + 1
+            );
             assert!(!app.context_folder_jump_pending());
-            assert!(app.items.is_empty());
-            assert!(app.current_folder.is_none());
-            assert!(matches!(
-                app.top_level_grid_view.surface(),
-                TopLevelGridSurface::Folder
-            ));
         }
     }
 
     #[cfg(windows)]
     #[test]
-    fn non_folder_canonical_return_is_consumed_without_physical_history_flattening() {
+    fn non_folder_context_jump_records_typed_canonical_return_only_after_success() {
         use crate::app::top_level_grid_view::{
             TopLevelGridRestore, TopLevelGridSurface, TopLevelSearchView,
         };
@@ -24134,7 +26441,7 @@ mod phase_c_folder_nav_history_tests {
         let slot = QuickFolderSlotId::A;
         let older = app.tmp.path().join("older");
         app.quick_folder_workspaces[slot.index()].history.back_stack =
-            vec![FolderNavHistoryTarget::Path(older.clone())];
+            vec![FolderNavHistoryTarget::Path(older.clone()).into()];
         let origin = app.tmp.path().join("legacy-folder-fallback");
         let destination = app.tmp.path().join("destination");
         std::fs::create_dir_all(&destination).unwrap();
@@ -24151,7 +26458,7 @@ mod phase_c_folder_nav_history_tests {
 
         assert!(
             app.begin_context_jump_to_folder(JumpToFolderRequest {
-                destination: JumpToFolderDestination::PhysicalDirectory(destination),
+                destination: JumpToFolderDestination::PhysicalDirectory(destination.clone()),
                 selection: JumpToFolderSelection::None,
                 origin: None,
             })
@@ -24159,15 +26466,37 @@ mod phase_c_folder_nav_history_tests {
         );
         assert_eq!(
             app.quick_folder_workspaces[slot.index()].history.back_stack,
-            vec![older]
+            vec![older.clone()]
         );
-        assert!(app.top_level_grid_view.return_to().is_none());
+        assert!(matches!(
+            app.top_level_grid_view.return_to(),
+            Some(TopLevelGridRestore::Rating { stars: 3 })
+        ));
         assert!(
             !app.quick_folder_workspaces[slot.index()]
                 .history
                 .suppress_record_once
         );
-        app.cancel_folder_pane_open(crate::app::PaneOpenRestoreExit::Abandoned);
+        let ready = take_context_jump_ready(&mut app, Ok(scan_directory(&destination)));
+        assert!(
+            app.resolve_main_folder_open_ready(&egui::Context::default(), ready)
+                .is_none()
+        );
+        finish_context_jump_hydration(&mut app);
+        assert_eq!(app.current_folder, Some(destination));
+        assert!(app.top_level_grid_view.return_to().is_none());
+        assert_eq!(
+            app.quick_folder_workspaces[slot.index()]
+                .history
+                .back_stack
+                .iter()
+                .map(|entry| entry.location.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                FolderNavHistoryTarget::Path(older),
+                FolderNavHistoryTarget::Rating { stars: 3 }
+            ]
+        );
     }
 
     #[cfg(windows)]
@@ -24240,6 +26569,7 @@ mod phase_c_folder_nav_history_tests {
                 .resolve_main_folder_open_ready(&egui::Context::default(), ready)
                 .is_none()
         );
+        finish_context_jump_hydration(&mut missing_app);
         assert!(missing_app.folder_pane_open_pending.is_none());
         assert!(missing_app.fs_feedback_toast.as_ref().is_some_and(|toast| {
             toast.0.contains("移動先の項目が見つかりません")
@@ -24281,11 +26611,15 @@ mod phase_c_folder_nav_history_tests {
                 .is_none()
         );
         assert!(failed_app.folder_pane_open_pending.is_none());
-        assert!(failed_app.items.is_empty());
-        assert!(failed_app.current_folder.is_none());
+        assert_eq!(failed_app.items.len(), 1);
+        assert!(failed_app.global_search.active);
+        assert_eq!(
+            failed_app.current_folder,
+            Some(crate::app::search_results_synthetic_path())
+        );
         assert!(matches!(
             failed_app.top_level_grid_view.surface(),
-            TopLevelGridSurface::Folder
+            TopLevelGridSurface::Search(TopLevelSearchView::Global)
         ));
         assert!(
             failed_app
@@ -24297,16 +26631,24 @@ mod phase_c_folder_nav_history_tests {
 
     #[cfg(windows)]
     #[test]
-    fn zip_search_container_conversion_cancel_does_not_restore_search_rows() {
+    fn section1339_zip_search_container_conversion_preserves_source_until_cached_adoption() {
         use crate::app::top_level_grid_view::{TopLevelGridSurface, TopLevelSearchView};
         use crate::ui_dialogs::context_menu::{
             JumpToFolderDestination, JumpToFolderRequest, JumpToFolderSelection,
         };
 
         let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        app.settings
+            .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ask);
         let archive = app.tmp.path().join("search-container.7z");
+        let cached = app.tmp.path().join("search-conversion-cached.zip");
         let origin = app.tmp.path().join("origin");
         std::fs::write(&archive, b"not-a-real-archive").unwrap();
+        write_1328_zip(&cached);
         arm_context_jump_source(
             &mut app,
             TopLevelSearchView::Global,
@@ -24318,46 +26660,116 @@ mod phase_c_folder_nav_history_tests {
                 representative: None,
             },
         );
-        let navigate = app.begin_context_jump_to_folder(JumpToFolderRequest {
+        app.settings.facet_filter.exts.insert("7z".into());
+        let before = app.folder_nav_history_snapshot();
+        let source_route = app.facet_navigation.route().clone();
+        let request = || JumpToFolderRequest {
             destination: JumpToFolderDestination::ArchiveContainer(archive.clone()),
             selection: JumpToFolderSelection::None,
             origin: None,
-        });
-        assert_eq!(navigate.as_ref(), Some(&archive));
-        assert_eq!(
-            app.load_folder_or_convert_archive(navigate.unwrap()),
-            FolderOpenOutcome::Classifying
-        );
-        app.settle_open_path_classification_for_test();
-        assert!(app.archive_convert.is_none());
-        replace_physical_history_preflight_for_test(
-            &mut app,
-            crate::app::collection_navigation::PhysicalHistoryPreflightPayload::ConvertiblePasswordRequired,
-        );
-        app.poll_collection_history_transition(&egui::Context::default());
-        assert!(app.archive_convert.is_some());
+        };
 
-        assert!(app.cancel_archive_convert_for_navigation("test_user_cancel"));
-        assert!(app.archive_convert.is_none());
-        assert!(!app.global_search.active);
-        assert!(app.items.is_empty());
-        assert!(app.current_folder.is_none());
-        assert_eq!(
-            app.quick_folder_workspaces[QuickFolderSlotId::A.index()]
-                .history
-                .back_stack,
-            vec![origin]
-        );
-        assert!(
-            !app.quick_folder_workspaces[QuickFolderSlotId::A.index()]
-                .history
-                .suppress_record_once
-        );
-        assert!(app.select_after_load.is_none());
-        assert!(matches!(
-            app.top_level_grid_view.surface(),
-            TopLevelGridSurface::Folder
-        ));
+        for cancel in [true, false] {
+            assert!(app.begin_context_jump_to_folder(request()).is_none());
+            app.settle_open_path_classification_for_test();
+            replace_physical_history_preflight_for_test(
+                &mut app,
+                crate::app::collection_navigation::PhysicalHistoryPreflightPayload::ConvertiblePasswordRequired,
+            );
+            app.poll_collection_history_transition(&egui::Context::default());
+            assert!(app.archive_convert.is_some());
+            assert!(app.global_search.active);
+            assert!(app.items_are_global_search_view);
+            assert_eq!(app.items.len(), 1);
+            assert_eq!(
+                app.current_folder,
+                Some(crate::app::search_results_synthetic_path())
+            );
+            assert!(matches!(
+                app.top_level_grid_view.surface(),
+                TopLevelGridSurface::Search(TopLevelSearchView::Global)
+            ));
+            assert!(app.top_level_grid_view.return_to().is_some());
+            assert_eq!(app.facet_navigation.route(), &source_route);
+            assert!(app.settings.facet_filter.exts.contains("7z"));
+            assert_eq!(
+                app.folder_nav_history_snapshot().back_stack,
+                before.back_stack
+            );
+            assert_eq!(
+                app.folder_nav_history_snapshot().forward_stack,
+                before.forward_stack
+            );
+
+            if cancel {
+                assert!(app.cancel_archive_convert_for_navigation("test_user_cancel"));
+                app.poll_collection_history_transition(&egui::Context::default());
+                assert!(app.archive_convert.is_none());
+                assert!(app.global_search.active);
+                assert_eq!(app.items.len(), 1);
+                assert_eq!(app.facet_navigation.route(), &source_route);
+                assert_eq!(
+                    app.folder_nav_history_snapshot().back_stack,
+                    before.back_stack
+                );
+                continue;
+            }
+            // Only the converter's usable result is fabricated; its completion and next
+            // cached-ZIP enumeration run through the real native owner and adoption path.
+            let (tx, rx) = std::sync::mpsc::channel();
+            let state = app.archive_convert.as_mut().unwrap();
+            state.rx = rx;
+            state.phase = crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Converting {
+                progress: std::sync::Arc::new(
+                    crate::ui_dialogs::archive_convert::ArchiveConvertProgressShared::new(),
+                ),
+            };
+            tx.send(
+                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ConvertDone(Ok((
+                    crate::archive_converter::ArchiveImageSummary {
+                        image_count: 4,
+                        total_uncompressed_bytes: 16,
+                        nested_archive_count: 0,
+                    },
+                    cached.clone(),
+                    std::fs::metadata(&cached).unwrap().len() as i64,
+                ))),
+            )
+            .unwrap();
+            let ctx = egui::Context::default();
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                app.show_archive_convert_dialog(ctx)
+            });
+            finish_staged_physical_history_for_test(&mut app);
+            finish_context_jump_hydration(&mut app);
+            assert!(app.archive_convert.is_none());
+            assert!(!app.global_search.active);
+            assert!(!app.items_are_global_search_view);
+            assert!(app.top_level_grid_view.return_to().is_none());
+            assert!(matches!(
+                app.top_level_grid_view.surface(),
+                TopLevelGridSurface::Folder
+            ));
+            assert_eq!(app.current_folder.as_ref(), Some(&cached));
+            assert_eq!(app.effective_folder().as_deref(), Some(archive.as_path()));
+            assert_eq!(app.items.len(), 4);
+            assert_eq!(
+                app.archive_source_override.as_deref(),
+                Some(archive.as_path())
+            );
+            assert_eq!(
+                app.facet_navigation.route().current(),
+                Some(&crate::app::FacetScope::book(&archive, ""))
+            );
+            assert_eq!(
+                app.folder_history_back_target(),
+                Some(&FolderNavHistoryTarget::Path(origin.clone()))
+            );
+            assert_eq!(
+                app.folder_nav_history_snapshot().back_stack.len(),
+                before.back_stack.len() + 1
+            );
+        }
     }
 
     #[test]
@@ -25419,30 +27831,26 @@ mod phase_c_drill_nav_tests {
         use crate::grid_item::{GridItem, ThumbnailState};
 
         let mut app = setup_app();
-        app.facet_filter_scope = Some(std::path::PathBuf::from("c:/pics/a"));
+        let parent = crate::app::FacetRoute::root(crate::app::FacetScope::path(
+            std::path::Path::new("c:/pics/a"),
+        ));
+        app.adopt_main_facet_route(parent.clone());
+        app.settings.facet_filter.exts.insert("jpg".into());
+        app.adopt_main_facet_route(parent.child(crate::app::FacetScope::path(
+            std::path::Path::new("c:/pics/a/child"),
+        )));
+        app.settings
+            .facet_filter
+            .place_keys
+            .insert("c:/pics/a/child".into());
+        app.adopt_main_facet_route(crate::app::FacetRoute::root(crate::app::FacetScope::path(
+            std::path::Path::new("c:/pics/b"),
+        )));
         app.current_folder = Some(std::path::PathBuf::from("c:/pics/b"));
         app.items.push(GridItem::Image(std::path::PathBuf::from(
             "c:/pics/b/one.jpg",
         )));
         app.thumbnails = vec![ThumbnailState::Pending];
-
-        app.settings
-            .facet_filter
-            .place_keys
-            .insert(crate::adjustment_db::normalize_path(
-                &std::path::PathBuf::from("c:/pics/a"),
-            ));
-        let mut saved_filter = crate::settings::FacetFilter::default();
-        saved_filter
-            .place_keys
-            .insert(crate::adjustment_db::normalize_path(
-                &std::path::PathBuf::from("c:/pics/a"),
-            ));
-        app.facet_filter_suppression_stack
-            .push(crate::app::FacetFilterSuppression {
-                anchor: std::path::PathBuf::from("c:/pics/a"),
-                saved_filter,
-            });
 
         app.rebuild_visible_indices();
 
@@ -25451,7 +27859,7 @@ mod phase_c_drill_nav_tests {
             "場所フィルタはフォルダ移動で常に解除する"
         );
         assert!(
-            app.facet_filter_suppression_stack.is_empty(),
+            !app.facet_navigation.suppressed(),
             "場所だけの退避フィルタも移動時に破棄する"
         );
         assert_eq!(
@@ -25609,7 +28017,10 @@ mod phase_c_drill_nav_tests {
 
         app.converted_archive_cache_paths.insert(
             crate::path_key::normalize_keep_drive(&src),
-            crate::app::ConvertedArchiveSourceState::CachedZip(cache.clone()),
+            crate::app::ConvertedArchiveSourceState::CachedZip {
+                logical_source: src.clone(),
+                path: cache.clone(),
+            },
         );
         app.rebuild_visible_indices();
         assert_eq!(
@@ -25959,7 +28370,9 @@ mod phase_c_drill_nav_tests {
             "ZIP 絞り込みで親 ZIP が見える"
         );
 
-        app.maybe_suppress_facet_filter_for_opened_container(0);
+        let parent_route = crate::app::FacetRoute::root(crate::app::FacetScope::path(&parent));
+        app.adopt_main_facet_route(parent_route.clone());
+        app.adopt_main_facet_route(parent_route.child(crate::app::FacetScope::book(&zip_path, "")));
         assert!(
             !app.facet_filter_active(),
             "ZIP を開いた直後は親の種類フィルタが退避される"
@@ -25988,6 +28401,7 @@ mod phase_c_drill_nav_tests {
             "退避中でも内側の拡張子フィルタを設定できる"
         );
 
+        app.adopt_main_facet_route(parent_route);
         app.current_folder = Some(parent);
         app.items = vec![GridItem::ZipFile(zip_path)];
         app.thumbnails = vec![ThumbnailState::Pending];
@@ -26007,6 +28421,32 @@ mod phase_c_drill_nav_tests {
             "内側で設定したフィルタは親へ持ち越さない"
         );
         assert_eq!(app.visible_indices, vec![0]);
+    }
+
+    #[test]
+    fn section1339_manual_facet_restore_survives_reprojection_and_same_route_adoption() {
+        let mut app = setup_app();
+        let parent = std::path::PathBuf::from(r"C:\books");
+        let book = parent.join("vol.zip");
+        let route = crate::app::FacetRoute::root(crate::app::FacetScope::path(&parent));
+        app.adopt_main_facet_route(route.clone());
+        app.active_facet_filter_mut().name_query = "vol".into();
+        app.active_facet_filter_mut().exts.insert("zip".into());
+        let child = route.child(crate::app::FacetScope::book(&book, ""));
+        app.adopt_main_facet_route(child.clone());
+        assert!(app.facet_name_input.is_empty());
+        assert!(app.restore_facet_filter_suppression()); // The actual toolbar badge handler.
+        assert_eq!(app.facet_name_input, "vol");
+        assert!(!app.facet_name_tokens.is_empty());
+        assert!(!app.facet_filter_suppressed());
+        let restored = app.settings.facet_filter.clone();
+        app.rebuild_visible_indices();
+        app.adopt_main_facet_route(child);
+        assert_eq!(app.settings.facet_filter, restored);
+        assert!(!app.facet_filter_suppressed());
+        app.adopt_main_facet_route(route);
+        assert_eq!(app.settings.facet_filter, restored);
+        assert!(!app.facet_filter_suppressed());
     }
 
     fn run_grid_key(app: &mut super::App, modifiers: egui::Modifiers, key: egui::Key) {
@@ -26943,6 +29383,7 @@ mod phase_c_drill_nav_tests {
                 file_size: 20,
             }],
             truncated: false,
+            video_thumb_overrides: Default::default(),
         });
         assert!(app.items_are_tag_view);
         assert!(
@@ -26989,6 +29430,7 @@ mod phase_c_drill_nav_tests {
                 file_size: 5,
             }],
             truncated: false,
+            video_thumb_overrides: Default::default(),
         });
 
         assert!(matches!(
@@ -27744,7 +30186,7 @@ mod phase_c_drill_nav_tests {
             Some(crate::ui_main::AddressBarNav::ReadingHistory)
         ));
         assert!(matches!(
-            app.resolve_grid_parent_nav(),
+            app.handle_grid_parent_folder_action(),
             Some(crate::ui_main::AddressBarNav::ReadingHistory)
         ));
 
@@ -27925,6 +30367,7 @@ mod phase_c_drill_nav_tests {
                 .expect("the real gamepad path must start folder classification");
             real_pending.cancel.store(true, Ordering::Relaxed);
             app.folder_pane_open_pending = Some(FolderPaneOpenPending {
+                navigation: real_pending.navigation,
                 epub_restore: None,
                 path: folder.clone(),
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -28620,11 +31063,19 @@ fn unchanged_bookmark_refresh_keeps_grid_and_tag_cache_mounted() {
     let generation_before = app.items_generation;
 
     let (tx, rx) = std::sync::mpsc::channel();
-    tx.send(Ok(vec![row])).expect("send bookmark rows");
-    app.bookmark_browser_pending = Some(crate::bookmark_browser::BookmarkBrowserPending {
-        cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        rx,
-    });
+    tx.send(Ok(crate::bookmark_browser::BookmarkBrowserBuildResult {
+        rows: vec![row],
+        video_thumb_overrides: app.video_thumb_overrides.clone(),
+    }))
+    .expect("send bookmark rows");
+    app.bookmark_browser_pending = Some(Box::new(BookmarkBrowserBuild {
+        source: app.smart_folder_source_lease().unwrap(),
+        switch_sequence: app.quick_folder_switch_sequence,
+        worker: crate::bookmark_browser::BookmarkBrowserPending {
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            rx,
+        },
+    }));
     app.poll_bookmark_browser(&egui::Context::default());
 
     assert_eq!(app.items_generation, generation_before);
@@ -28993,7 +31444,7 @@ fn ignored_epub_bookmark_row_keeps_existing_detached_window_and_bookmark_positio
     app.items_are_bookmark_view = true;
     app.current_folder = Some(super::bookmark_view_synthetic_path());
     app.address = "ブックマーク".into();
-    app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(app.tmp.path().into())];
+    app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(app.tmp.path().into()).into()];
     app.settings.detached_viewer_open_images_in_window = true;
     let existing_context =
         app.build_active_context_for_test(Some(9101), DetachedSource::Image, |detached| {
@@ -29157,6 +31608,7 @@ fn ignored_epub_bookmark_resolver_keeps_refusal_feedback() {
     app.finish_startup_open_path_resolve(
         owner,
         StartupOpenPathResolveResult {
+            rar_volume_proof: None,
             requested: epub.clone(),
             resolved: Some(crate::folder_tree::OpenablePathResolution {
                 path: epub,
@@ -29844,9 +32296,10 @@ fn begin_detached_bookmark_media_test(
     );
     app.converted_archive_cache_paths.insert(
         "main-grid-archive".to_string(),
-        crate::app::ConvertedArchiveSourceState::CachedZip(PathBuf::from(
-            r"C:\main-grid\cached.zip",
-        )),
+        crate::app::ConvertedArchiveSourceState::CachedZip {
+            logical_source: PathBuf::from(r"C:\main-grid\source.7z"),
+            path: PathBuf::from(r"C:\main-grid\cached.zip"),
+        },
     );
     app.current_color_cache_map = Some(std::sync::Arc::new(std::sync::RwLock::new(
         std::collections::HashMap::from([(
@@ -33426,19 +35879,19 @@ mod favorite_adjustment_defaults_tests {
         let ctx = egui::Context::default();
         let color = egui::ColorImage::from_rgba_unmultiplied([2, 2], &[255u8; 16]);
         app.tx
-            .send(crate::thumb_loader::ThumbMsg {
-                idx: 0,
-                image: Some(color),
-                origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
-                from_edit_preview: false,
-                edit_preview_adjustment: None,
-                source_dims: Some((2, 2)),
-                layout_dims: None,
-                canceled: false,
-                finalized: false,
-                input_seq: 0,
-                items_gen: cur_gen,
-            })
+            .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                0,
+                Some(color),
+                crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+                false,
+                None,
+                Some((2, 2)),
+                None,
+                false,
+                false,
+                0,
+                cur_gen,
+            ))
             .unwrap();
 
         app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
@@ -33472,22 +35925,22 @@ mod favorite_adjustment_defaults_tests {
         app.last_input_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
         app.display_px_shared.store(1024, Ordering::Relaxed);
         app.tx
-            .send(crate::thumb_loader::ThumbMsg {
-                idx: 0,
-                image: Some(egui::ColorImage::filled(
+            .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                0,
+                Some(egui::ColorImage::filled(
                     [64, 64],
                     egui::Color32::LIGHT_BLUE,
                 )),
-                origin: crate::thumb_loader::ThumbLoadOrigin::FinalCache,
-                from_edit_preview: false,
-                edit_preview_adjustment: None,
-                source_dims: Some((64, 64)),
-                layout_dims: None,
-                canceled: false,
-                finalized: false,
-                input_seq: 0,
-                items_gen: app.items_generation,
-            })
+                crate::thumb_loader::ThumbLoadOrigin::FinalCache,
+                false,
+                None,
+                Some((64, 64)),
+                None,
+                false,
+                false,
+                0,
+                app.items_generation,
+            ))
             .unwrap();
 
         app.poll_thumbnails(&egui::Context::default(), ThumbnailConsumptionPolicy::Grid);
@@ -33964,55 +36417,55 @@ mod favorite_adjustment_defaults_tests {
         let items_gen = app.items_generation;
         for idx in 0..8 {
             app.tx
-                .send(crate::thumb_loader::ThumbMsg {
+                .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
                     idx,
-                    image: Some(egui::ColorImage::filled([1, 1], egui::Color32::DARK_GRAY)),
-                    origin: crate::thumb_loader::ThumbLoadOrigin::FinalCache,
-                    from_edit_preview: false,
-                    edit_preview_adjustment: None,
-                    source_dims: Some((1, 1)),
-                    layout_dims: None,
-                    canceled: false,
-                    finalized: false,
-                    input_seq: 0,
+                    Some(egui::ColorImage::filled([1, 1], egui::Color32::DARK_GRAY)),
+                    crate::thumb_loader::ThumbLoadOrigin::FinalCache,
+                    false,
+                    None,
+                    Some((1, 1)),
+                    None,
+                    false,
+                    false,
+                    0,
                     items_gen,
-                })
+                ))
                 .unwrap();
         }
         app.tx
-            .send(crate::thumb_loader::ThumbMsg {
-                idx: 8,
-                image: Some(egui::ColorImage::filled(
+            .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                8,
+                Some(egui::ColorImage::filled(
                     [247, 124],
                     egui::Color32::LIGHT_BLUE,
                 )),
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                     evaluated_display_px: 374,
                 },
-                from_edit_preview: false,
-                edit_preview_adjustment: None,
-                source_dims: Some((884, 444)),
-                layout_dims: None,
-                canceled: false,
-                finalized: false,
-                input_seq: 0,
+                false,
+                None,
+                Some((884, 444)),
+                None,
+                false,
+                false,
+                0,
                 items_gen,
-            })
+            ))
             .unwrap();
         app.tx
-            .send(crate::thumb_loader::ThumbMsg {
-                idx: 8,
-                image: None,
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-                from_edit_preview: false,
-                edit_preview_adjustment: None,
-                source_dims: None,
-                layout_dims: None,
-                canceled: false,
-                finalized: true,
-                input_seq: 0,
+            .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                8,
+                None,
+                crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+                false,
+                None,
+                None,
+                None,
+                false,
+                true,
+                0,
                 items_gen,
-            })
+            ))
             .unwrap();
 
         let ctx = egui::Context::default();
@@ -34020,7 +36473,7 @@ mod favorite_adjustment_defaults_tests {
         assert!(matches!(app.thumbnails[8], ThumbnailState::Pending));
         assert_eq!(app.texture_backlog.len(), 1);
         assert!(matches!(
-            app.texture_backlog[0].origin,
+            app.texture_backlog[0].pixels().unwrap().origin,
             crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 374
             }
@@ -34032,24 +36485,24 @@ mod favorite_adjustment_defaults_tests {
         );
 
         app.tx
-            .send(crate::thumb_loader::ThumbMsg {
-                idx: 8,
-                image: Some(egui::ColorImage::filled(
+            .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                8,
+                Some(egui::ColorImage::filled(
                     [400, 201],
                     egui::Color32::LIGHT_RED,
                 )),
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                     evaluated_display_px: 400,
                 },
-                from_edit_preview: false,
-                edit_preview_adjustment: None,
-                source_dims: Some((884, 444)),
-                layout_dims: None,
-                canceled: false,
-                finalized: false,
-                input_seq: 0,
-                items_gen: items_gen.wrapping_add(1),
-            })
+                false,
+                None,
+                Some((884, 444)),
+                None,
+                false,
+                false,
+                0,
+                items_gen.wrapping_add(1),
+            ))
             .unwrap();
         app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
 
@@ -34117,39 +36570,39 @@ mod favorite_adjustment_defaults_tests {
         // the previous 400px coverage when its image lands after the cell grows again.
         app.requested.insert(0, true);
         app.tx
-            .send(crate::thumb_loader::ThumbMsg {
-                idx: 0,
-                image: Some(egui::ColorImage::filled(
+            .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                0,
+                Some(egui::ColorImage::filled(
                     [247, 124],
                     egui::Color32::LIGHT_BLUE,
                 )),
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                     evaluated_display_px: 374,
                 },
-                from_edit_preview: false,
-                edit_preview_adjustment: None,
-                source_dims: Some((884, 444)),
-                layout_dims: None,
-                canceled: false,
-                finalized: false,
-                input_seq: 0,
+                false,
+                None,
+                Some((884, 444)),
+                None,
+                false,
+                false,
+                0,
                 items_gen,
-            })
+            ))
             .unwrap();
         app.tx
-            .send(crate::thumb_loader::ThumbMsg {
-                idx: 0,
-                image: None,
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-                from_edit_preview: false,
-                edit_preview_adjustment: None,
-                source_dims: None,
-                layout_dims: None,
-                canceled: false,
-                finalized: true,
-                input_seq: 0,
+            .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                0,
+                None,
+                crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+                false,
+                None,
+                None,
+                None,
+                false,
+                true,
+                0,
                 items_gen,
-            })
+            ))
             .unwrap();
         app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
         assert!(matches!(
@@ -34175,19 +36628,19 @@ mod favorite_adjustment_defaults_tests {
 
         // Cancellation has no replacement image, so it must keep the resident coverage intact.
         app.tx
-            .send(crate::thumb_loader::ThumbMsg {
-                idx: 0,
-                image: None,
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-                from_edit_preview: false,
-                edit_preview_adjustment: None,
-                source_dims: None,
-                layout_dims: None,
-                canceled: true,
-                finalized: false,
-                input_seq: 0,
+            .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                0,
+                None,
+                crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+                false,
+                None,
+                None,
+                None,
+                true,
+                false,
+                0,
                 items_gen,
-            })
+            ))
             .unwrap();
         app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
         assert!(matches!(
@@ -34205,19 +36658,19 @@ mod favorite_adjustment_defaults_tests {
         // A real load error is terminal for the resident image and therefore drops its coverage.
         app.requested.insert(0, true);
         app.tx
-            .send(crate::thumb_loader::ThumbMsg {
-                idx: 0,
-                image: None,
-                origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-                from_edit_preview: false,
-                edit_preview_adjustment: None,
-                source_dims: None,
-                layout_dims: None,
-                canceled: false,
-                finalized: false,
-                input_seq: 0,
+            .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                0,
+                None,
+                crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+                false,
+                None,
+                None,
+                None,
+                false,
+                false,
+                0,
                 items_gen,
-            })
+            ))
             .unwrap();
         app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
         assert!(matches!(app.thumbnails[0], ThumbnailState::Failed));
@@ -39263,7 +41716,10 @@ mod favorite_adjustment_defaults_tests {
         let mut converted = std::collections::HashMap::new();
         converted.insert(
             crate::path_key::normalize_keep_drive(&src),
-            crate::app::ConvertedArchiveSourceState::CachedZip(cache.clone()),
+            crate::app::ConvertedArchiveSourceState::CachedZip {
+                logical_source: src.clone(),
+                path: cache.clone(),
+            },
         );
         let pins: std::collections::HashMap<String, FolderPinSource> =
             std::collections::HashMap::new();
@@ -39330,7 +41786,10 @@ mod favorite_adjustment_defaults_tests {
 
         assert_eq!(
             state,
-            Some(crate::app::ConvertedArchiveSourceState::CachedZip(cached))
+            Some(crate::app::ConvertedArchiveSourceState::CachedZip {
+                logical_source: source.clone(),
+                path: cached
+            })
         );
         assert_eq!(inspections.get(), 0);
     }
@@ -39364,7 +41823,10 @@ mod favorite_adjustment_defaults_tests {
 
         assert_eq!(
             state,
-            Some(crate::app::ConvertedArchiveSourceState::CachedZip(cached)),
+            Some(crate::app::ConvertedArchiveSourceState::CachedZip {
+                logical_source: source.clone(),
+                path: cached
+            }),
             "A1 intentionally changes Direct + converted from Direct to CachedZip"
         );
         assert!(!direct_inspection_would_run.get());
@@ -39481,7 +41943,9 @@ mod favorite_adjustment_defaults_tests {
 
         let unavailable_sources = std::collections::HashMap::from([(
             key.clone(),
-            crate::app::ConvertedArchiveSourceState::Unavailable,
+            crate::app::ConvertedArchiveSourceState::Unavailable {
+                logical_source: None,
+            },
         )]);
         assert!(
             make_load_request(
@@ -39507,7 +41971,10 @@ mod favorite_adjustment_defaults_tests {
 
         for state in [
             crate::app::ConvertedArchiveSourceState::Direct(direct.clone()),
-            crate::app::ConvertedArchiveSourceState::CachedZip(cached.clone()),
+            crate::app::ConvertedArchiveSourceState::CachedZip {
+                logical_source: src.clone(),
+                path: cached.clone(),
+            },
         ] {
             let expected = state.load_path().unwrap().to_path_buf();
             let sources = std::collections::HashMap::from([(key.clone(), state)]);
@@ -39602,8 +42069,8 @@ mod favorite_adjustment_defaults_tests {
         );
 
         let message = rx.recv().expect("cache-only hit should emit thumbnail");
-        assert!(message.image.is_some());
-        assert!(message.origin.from_cache());
+        assert!(message.pixels().is_some());
+        assert!(message.pixels().unwrap().origin.from_cache());
     }
 
     #[test]
@@ -39721,9 +42188,10 @@ mod favorite_adjustment_defaults_tests {
         };
         tx.send(ConvertedArchiveCachePathsMsg::Resolved {
             archive_key: keys[0].clone(),
-            state: crate::app::ConvertedArchiveSourceState::CachedZip(
-                app.tmp.path().join("first.zip"),
-            ),
+            state: crate::app::ConvertedArchiveSourceState::CachedZip {
+                logical_source: app.items[0].drag_source_path().unwrap().to_path_buf(),
+                path: app.tmp.path().join("first.zip"),
+            },
             idx: 0,
             ordinal: 1,
             elapsed_ms: 5.0,
@@ -39750,9 +42218,10 @@ mod favorite_adjustment_defaults_tests {
         app.requested.insert(0, false);
         tx.send(ConvertedArchiveCachePathsMsg::Resolved {
             archive_key: keys[0].clone(),
-            state: crate::app::ConvertedArchiveSourceState::CachedZip(
-                app.tmp.path().join("first.zip"),
-            ),
+            state: crate::app::ConvertedArchiveSourceState::CachedZip {
+                logical_source: app.items[0].drag_source_path().unwrap().to_path_buf(),
+                path: app.tmp.path().join("first.zip"),
+            },
             idx: 0,
             ordinal: 1,
             elapsed_ms: 5.0,
@@ -39809,7 +42278,10 @@ mod favorite_adjustment_defaults_tests {
         let cached = app.tmp.path().join("first.zip");
         tx.send(ConvertedArchiveCachePathsMsg::Resolved {
             archive_key: keys[0].clone(),
-            state: crate::app::ConvertedArchiveSourceState::CachedZip(cached.clone()),
+            state: crate::app::ConvertedArchiveSourceState::CachedZip {
+                logical_source: app.items[0].drag_source_path().unwrap().to_path_buf(),
+                path: cached.clone(),
+            },
             idx: 0,
             ordinal: 1,
             elapsed_ms: 5.0,
@@ -39872,9 +42344,10 @@ mod favorite_adjustment_defaults_tests {
         });
         tx.send(ConvertedArchiveCachePathsMsg::Resolved {
             archive_key: key.clone(),
-            state: crate::app::ConvertedArchiveSourceState::CachedZip(
-                app.tmp.path().join("stale.zip"),
-            ),
+            state: crate::app::ConvertedArchiveSourceState::CachedZip {
+                logical_source: source.clone(),
+                path: app.tmp.path().join("stale.zip"),
+            },
             idx: 0,
             ordinal: 1,
             elapsed_ms: 1.0,
@@ -39911,7 +42384,9 @@ mod favorite_adjustment_defaults_tests {
 
         assert_eq!(
             app.converted_archive_cache_paths.get(&keys[0]),
-            Some(&crate::app::ConvertedArchiveSourceState::Unavailable)
+            Some(&crate::app::ConvertedArchiveSourceState::Unavailable {
+                logical_source: Some(app.items[0].drag_source_path().unwrap().to_path_buf())
+            })
         );
         for key in &keys[1..] {
             assert_eq!(
@@ -39936,7 +42411,9 @@ mod favorite_adjustment_defaults_tests {
         poll_archive_decisions_for_test(&mut app);
         assert_eq!(
             app.converted_archive_cache_paths.get(&keys[2]),
-            Some(&crate::app::ConvertedArchiveSourceState::Unavailable)
+            Some(&crate::app::ConvertedArchiveSourceState::Unavailable {
+                logical_source: Some(app.items[2].drag_source_path().unwrap().to_path_buf())
+            })
         );
     }
 
@@ -40015,10 +42492,12 @@ mod favorite_adjustment_defaults_tests {
 
         app.start_converted_archive_cache_paths_refresh(&scope, (0, 1), (0, 1));
         poll_archive_decisions_for_test(&mut app);
-        for key in keys {
+        for (idx, key) in keys.into_iter().enumerate() {
             assert_eq!(
                 app.converted_archive_cache_paths.get(&key),
-                Some(&crate::app::ConvertedArchiveSourceState::Unavailable)
+                Some(&crate::app::ConvertedArchiveSourceState::Unavailable {
+                    logical_source: Some(app.items[idx].drag_source_path().unwrap().to_path_buf())
+                })
             );
         }
     }
@@ -40753,7 +43232,10 @@ mod favorite_adjustment_defaults_tests {
         let mut converted = std::collections::HashMap::new();
         converted.insert(
             crate::path_key::normalize_keep_drive(&src),
-            crate::app::ConvertedArchiveSourceState::CachedZip(cache.clone()),
+            crate::app::ConvertedArchiveSourceState::CachedZip {
+                logical_source: src.clone(),
+                path: cache.clone(),
+            },
         );
         let mut pins = std::collections::HashMap::new();
         pins.insert(crate::path_key::normalize_keep_drive(&src), source.clone());
@@ -40891,7 +43373,7 @@ mod favorite_adjustment_defaults_tests {
             None,
         );
 
-        assert!(rx.recv().unwrap().image.is_some());
+        assert!(rx.recv().unwrap().pixels().is_some());
     }
 
     #[test]
@@ -40959,7 +43441,10 @@ mod favorite_adjustment_defaults_tests {
         let mut converted = std::collections::HashMap::new();
         converted.insert(
             crate::path_key::normalize_keep_drive(&archive),
-            crate::app::ConvertedArchiveSourceState::CachedZip(cached.clone()),
+            crate::app::ConvertedArchiveSourceState::CachedZip {
+                logical_source: archive.clone(),
+                path: cached.clone(),
+            },
         );
 
         let req = make_load_request(
@@ -41053,7 +43538,10 @@ mod favorite_adjustment_defaults_tests {
         let mut converted = std::collections::HashMap::new();
         converted.insert(
             crate::path_key::normalize_keep_drive(&archive),
-            crate::app::ConvertedArchiveSourceState::CachedZip(cached.clone()),
+            crate::app::ConvertedArchiveSourceState::CachedZip {
+                logical_source: archive.clone(),
+                path: cached.clone(),
+            },
         );
 
         let req = make_load_request(
@@ -41551,7 +44039,10 @@ mod favorite_adjustment_defaults_tests {
 
         app.converted_archive_cache_paths.insert(
             crate::path_key::normalize_keep_drive(&archive),
-            crate::app::ConvertedArchiveSourceState::CachedZip(cached.clone()),
+            crate::app::ConvertedArchiveSourceState::CachedZip {
+                logical_source: archive.clone(),
+                path: cached.clone(),
+            },
         );
         let ready_in_memory = app.compute_folder_pin_button_state().unwrap();
         assert!(ready_in_memory.enabled);
@@ -42053,7 +44544,7 @@ mod favorite_adjustment_defaults_tests {
             )
             .expect("root level should contain bookA ZipDir");
 
-        app.maybe_suppress_facet_filter_for_opened_zip_book(idx);
+        app.selected = Some(idx);
         app.zip_nav_enter("bookA/");
         assert!(
             !app.facet_filter_active(),
@@ -43435,7 +45926,6 @@ mod favorite_adjustment_defaults_tests {
     #[test]
     fn batch_export_items_take_only_exportable_selection_and_count_the_rest() {
         use crate::grid_item::GridItem;
-        let ctx = egui::Context::default();
         let mut app = setup_app();
         app.items
             .push(GridItem::Image(std::path::PathBuf::from("c:/trip/a.jpg")));
@@ -43716,7 +46206,6 @@ mod favorite_adjustment_defaults_tests {
     #[test]
     fn batch_export_items_fall_back_to_the_cursor_selection() {
         use crate::grid_item::GridItem;
-        let ctx = egui::Context::default();
         let mut app = setup_app();
         app.items
             .push(GridItem::Image(std::path::PathBuf::from("c:/trip/a.jpg")));
@@ -44832,22 +47321,22 @@ mod favorite_adjustment_defaults_tests {
         };
         let send = |app: &mut App, red: u8| {
             app.tx
-                .send(crate::thumb_loader::ThumbMsg {
-                    idx: 0,
-                    image: Some(egui::ColorImage::new(
+                .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                    0,
+                    Some(egui::ColorImage::new(
                         [2, 2],
                         vec![egui::Color32::from_rgb(red, 10, 20); 4],
                     )),
-                    origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
-                    from_edit_preview: false,
-                    edit_preview_adjustment: None,
-                    source_dims: Some((2, 2)),
-                    layout_dims: None,
-                    canceled: false,
-                    finalized: false,
-                    input_seq: 0,
-                    items_gen: app.items_generation,
-                })
+                    crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+                    false,
+                    None,
+                    Some((2, 2)),
+                    None,
+                    false,
+                    false,
+                    0,
+                    app.items_generation,
+                ))
                 .unwrap();
         };
         prepare(&mut app, first);
@@ -44964,7 +47453,7 @@ mod favorite_adjustment_defaults_tests {
             );
             let image = rx
                 .try_iter()
-                .find_map(|message| message.image)
+                .find_map(|message| message.into_pixels().map(|pixels| pixels.image))
                 .unwrap_or_else(|| panic!("{name} did not resolve archive WebP"));
             let pixel = image.pixels[0].to_srgba_unmultiplied();
             assert!(pixel[2] > pixel[0], "{name} should use the cached archive");
@@ -45489,11 +47978,9 @@ mod favorite_adjustment_defaults_tests {
             pending_nav: None,
             pending_direct_nav: None,
             allow_direct_read: false,
-            fallback_cached_zip: None,
             completion:
                 crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
             pending_sibling_output: None,
-            nav_history_rollback: None,
             auto_fullscreen: false,
             deferred_fullscreen: None,
             suppress_confirm: true,
@@ -45533,11 +48020,9 @@ mod favorite_adjustment_defaults_tests {
             pending_nav: None,
             pending_direct_nav: None,
             allow_direct_read: false,
-            fallback_cached_zip: None,
             completion:
                 crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
             pending_sibling_output: None,
-            nav_history_rollback: None,
             auto_fullscreen: false,
             deferred_fullscreen: None,
             suppress_confirm: false,
@@ -45569,11 +48054,9 @@ mod favorite_adjustment_defaults_tests {
             pending_nav: None,
             pending_direct_nav: None,
             allow_direct_read: true,
-            fallback_cached_zip: None,
             completion:
                 crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
             pending_sibling_output: None,
-            nav_history_rollback: None,
             auto_fullscreen: false,
             deferred_fullscreen: None,
             suppress_confirm: false,
@@ -45632,11 +48115,9 @@ mod favorite_adjustment_defaults_tests {
             pending_nav: None,
             pending_direct_nav: None,
             allow_direct_read: false,
-            fallback_cached_zip: None,
             completion:
                 crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
             pending_sibling_output: None,
-            nav_history_rollback: None,
             auto_fullscreen: false,
             deferred_fullscreen: None,
             suppress_confirm: true,
@@ -45699,11 +48180,9 @@ mod favorite_adjustment_defaults_tests {
             pending_nav: None,
             pending_direct_nav: None,
             allow_direct_read: false,
-            fallback_cached_zip: None,
             completion:
                 crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
             pending_sibling_output: None,
-            nav_history_rollback: None,
             auto_fullscreen: false,
             deferred_fullscreen: None,
             suppress_confirm: true,
@@ -56947,11 +59426,19 @@ mod native_video_rating_key_tests {
         // main の rating cache は共有 path 世代から更新済みで、grid install は不要。
         let generation_before = app.items_generation;
         let (tx, rx) = std::sync::mpsc::channel();
-        tx.send(Ok(vec![row])).unwrap();
-        app.bookmark_browser_pending = Some(crate::bookmark_browser::BookmarkBrowserPending {
-            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            rx,
-        });
+        tx.send(Ok(crate::bookmark_browser::BookmarkBrowserBuildResult {
+            rows: vec![row],
+            video_thumb_overrides: app.video_thumb_overrides.clone(),
+        }))
+        .unwrap();
+        app.bookmark_browser_pending = Some(Box::new(BookmarkBrowserBuild {
+            source: app.smart_folder_source_lease().unwrap(),
+            switch_sequence: app.quick_folder_switch_sequence,
+            worker: crate::bookmark_browser::BookmarkBrowserPending {
+                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                rx,
+            },
+        }));
         app.poll_bookmark_browser(&egui::Context::default());
         assert_eq!(app.items_generation, generation_before);
         assert_eq!(app.rating_cache.get(&0), Some(&2));
@@ -57786,6 +60273,7 @@ mod still_window_mode_key_tests {
             idx: target_idx,
             path: target_path.clone(),
             from_grid: false,
+            playback_origin: crate::video::PlaybackStartOrigin::NewSource,
             autoplay_override: None,
             ignore_resume: false,
             wait_for_detached_host: false,
@@ -59910,22 +62398,22 @@ mod still_window_mode_key_tests {
         size: [usize; 2],
         source_dims: Option<(u32, u32)>,
     ) -> crate::thumb_loader::ThumbMsg {
-        crate::thumb_loader::ThumbMsg {
+        crate::thumb_loader::ThumbMsg::from_legacy_parts(
             idx,
-            image: Some(egui::ColorImage::filled(
+            Some(egui::ColorImage::filled(
                 size,
                 egui::Color32::from_rgb(32, 96, 160),
             )),
-            origin: crate::thumb_loader::ThumbLoadOrigin::FinalCache,
-            from_edit_preview: false,
-            edit_preview_adjustment: None,
+            crate::thumb_loader::ThumbLoadOrigin::FinalCache,
+            false,
+            None,
             source_dims,
-            layout_dims: None,
-            canceled: false,
-            finalized: false,
-            input_seq: 0,
+            None,
+            false,
+            false,
+            0,
             items_gen,
-        }
+        )
     }
 
     fn keep_detached_transition_gap_open(app: &mut App) {
@@ -64042,10 +66530,8 @@ mod still_window_mode_key_tests {
         let c_virtual_idx = push_image(&mut app, c.to_str().unwrap());
         let a_virtual_idx = push_image(&mut app, a.to_str().unwrap());
         app.visible_indices = vec![c_virtual_idx, a_virtual_idx];
-        app.search_filter = Some(std::collections::HashSet::from([
-            c_virtual_idx,
-            a_virtual_idx,
-        ]));
+        app.search_filter =
+            Some(std::collections::HashSet::from([c_virtual_idx, a_virtual_idx]).into());
         app.show_search_bar = true;
         app.items_are_global_search_view = true;
         app.selected = Some(a_virtual_idx);
@@ -64079,7 +66565,9 @@ mod still_window_mode_key_tests {
             "the main virtual c/a order must remain untouched"
         );
         assert_eq!(
-            app.search_filter,
+            app.search_filter
+                .as_ref()
+                .map(|filter| filter.matches.clone()),
             Some(std::collections::HashSet::from([
                 c_virtual_idx,
                 a_virtual_idx
@@ -64127,6 +66615,7 @@ mod still_window_mode_key_tests {
                 .expect("real physical scan must have started");
             real_pending.cancel.store(true, Ordering::Relaxed);
             mounted.folder_pane_open_pending = Some(FolderPaneOpenPending {
+                navigation: None,
                 epub_restore: None,
                 path: first.clone(),
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -64249,7 +66738,9 @@ mod still_window_mode_key_tests {
         assert_eq!(app.current_folder, Some(main_surface));
         assert_eq!(app.visible_indices, vec![c_virtual_idx, a_virtual_idx]);
         assert_eq!(
-            app.search_filter,
+            app.search_filter
+                .as_ref()
+                .map(|filter| filter.matches.clone()),
             Some(std::collections::HashSet::from([
                 c_virtual_idx,
                 a_virtual_idx
@@ -64311,6 +66802,7 @@ mod still_window_mode_key_tests {
                 .expect("real physical scan must have started");
             real_pending.cancel.store(true, Ordering::Relaxed);
             mounted.folder_pane_open_pending = Some(FolderPaneOpenPending {
+                navigation: None,
                 epub_restore: None,
                 path: folder.clone(),
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -64679,6 +67171,7 @@ mod still_window_mode_key_tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let resolver_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
+            navigation: None,
             diagnostic: None,
             requested: crate::pdf_loader::LeasedEpubPath::try_new(media.clone()).unwrap(),
             owner: StartupOpenPathOwner::Bookmark(
@@ -64710,6 +67203,7 @@ mod still_window_mode_key_tests {
         .expect("cancel must retire the exact detached owner, not the main bundle");
         assert!(
             tx.send(StartupOpenPathResolveResult {
+                rar_volume_proof: None,
                 requested: media,
                 resolved: None,
                 bookmark_relative_page_openable: None,
@@ -64907,6 +67401,7 @@ mod still_window_mode_key_tests {
             context.viewer_presentation = ViewerPresentation::DetachedWindow;
             context.detached_viewer_independent_active = true;
             context.folder_pane_open_pending = Some(FolderPaneOpenPending {
+                navigation: None,
                 epub_restore: None,
                 path: folder,
                 cancel,
@@ -65030,7 +67525,7 @@ mod still_window_mode_key_tests {
         app.thumbnails = vec![ThumbnailState::Pending];
         app.image_metas = vec![None];
         app.visible_indices = vec![0];
-        app.search_filter = Some(std::collections::HashSet::from([0]));
+        app.search_filter = Some(std::collections::HashSet::from([0]).into());
         app.show_search_bar = true;
         app.selected = Some(0);
         app.scroll_offset_y = 219.0;
@@ -65054,7 +67549,9 @@ mod still_window_mode_key_tests {
         ));
         assert_eq!(app.visible_indices, vec![0]);
         assert_eq!(
-            app.search_filter,
+            app.search_filter
+                .as_ref()
+                .map(|filter| filter.matches.clone()),
             Some(std::collections::HashSet::from([0]))
         );
         assert!(app.show_search_bar);
@@ -65110,12 +67607,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             pending_nav,
             pending_direct_nav,
             allow_direct_read: format == ArchiveFormat::Rar,
-            fallback_cached_zip: None,
             completion: crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::DetachedGridArchive(
                 owner.clone(),
             ),
             pending_sibling_output: None,
-            nav_history_rollback: None,
             auto_fullscreen: true,
             deferred_fullscreen: None,
             suppress_confirm: false,
@@ -65301,8 +67796,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     #[cfg(windows)]
     fn detached_grid_archive_direct_read_completion_opens_detached_without_main_navigation() {
         let mut app = setup_app();
-        let source = app.tmp.path().join("selected.part2.rar");
-        let backing = app.tmp.path().join("resolved.part1.rar");
+        let source = app.tmp.path().join("selected.part1.rar");
+        let backing = source.clone();
         std::fs::write(&source, b"source").unwrap();
         std::fs::write(&backing, b"backing").unwrap();
         let (main_folder, items_generation) =
@@ -65613,24 +68108,21 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             .archive_convert
             .as_mut()
             .expect("RAR cache hit must still probe direct-read capability first");
-        assert_eq!(
-            state.fallback_cached_zip.as_deref(),
-            Some(backing.as_path())
-        );
+        assert!(matches!(
+            state.phase,
+            crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning
+        ));
         state.cancel.store(true, Ordering::Relaxed);
         state.cancel = Arc::new(AtomicBool::new(false));
         state.rx = scan_rx;
         scan_tx
             .send(
-                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Ok((
-                    crate::archive_converter::ArchiveImageSummary {
-                        image_count: 2,
-                        total_uncompressed_bytes: 2,
-                        nested_archive_count: 1,
+                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Ok(
+                    crate::ui_dialogs::archive_convert::ArchiveScanOutcome::CachedZip {
+                        source: source.clone(),
+                        path: backing.clone(),
                     },
-                    false,
-                    source.clone(),
-                ))),
+                )),
             )
             .unwrap();
 
@@ -66101,6 +68593,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         pending.cancel.store(true, Ordering::Relaxed);
         app.selected = None;
         let ready = FolderPaneOpenReady {
+            navigation: None,
             epub_restore: None,
             path: folder.clone(),
             scan: Ok(scan_directory(&folder)),
@@ -66154,7 +68647,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.thumbnails = vec![ThumbnailState::Pending];
         app.image_metas = vec![None];
         app.visible_indices = vec![0];
-        app.search_filter = Some(std::collections::HashSet::from([0]));
+        app.search_filter = Some(std::collections::HashSet::from([0]).into());
         app.show_search_bar = true;
         app.selected = Some(0);
         app.scroll_offset_y = 246.0;
@@ -66198,6 +68691,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             .expect("the main bundle must own the Folder candidate scan");
         real_pending.cancel.store(true, Ordering::Relaxed);
         app.folder_pane_open_pending = Some(FolderPaneOpenPending {
+            navigation: None,
             epub_restore: None,
             path: child.clone(),
             cancel: Arc::new(AtomicBool::new(false)),
@@ -66246,7 +68740,9 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             [GridItem::Folder(path)] if path == &child
         ));
         assert_eq!(
-            app.search_filter,
+            app.search_filter
+                .as_ref()
+                .map(|filter| filter.matches.clone()),
             Some(std::collections::HashSet::from([0]))
         );
         assert!(app.show_search_bar);
@@ -66305,6 +68801,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         let real_pending = app.folder_pane_open_pending.take().unwrap();
         real_pending.cancel.store(true, Ordering::Relaxed);
         app.folder_pane_open_pending = Some(FolderPaneOpenPending {
+            navigation: None,
             epub_restore: None,
             path: child.clone(),
             cancel: Arc::new(AtomicBool::new(false)),
@@ -66473,6 +68970,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             .wanted_revision = restore.revision_at_open + 1;
 
         let ready = FolderPaneOpenReady {
+            navigation: None,
             epub_restore: None,
             path: folder.clone(),
             scan: Ok(scan_directory(&folder)),
@@ -66620,6 +69118,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 .expect("real detached image scan must have started");
             real_pending.cancel.store(true, Ordering::Relaxed);
             mounted.folder_pane_open_pending = Some(FolderPaneOpenPending {
+                navigation: None,
                 epub_restore: None,
                 path: folder,
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -66672,6 +69171,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 .expect("real physical scan must have started");
             real_pending.cancel.store(true, Ordering::Relaxed);
             mounted.folder_pane_open_pending = Some(FolderPaneOpenPending {
+                navigation: None,
                 epub_restore: None,
                 path: folder.clone(),
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -66819,7 +69319,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         ];
         app.thumbnails = vec![ThumbnailState::Pending; 2];
         app.visible_indices = vec![0];
-        app.search_filter = Some(std::collections::HashSet::from([0]));
+        app.search_filter = Some(std::collections::HashSet::from([0]).into());
         app.show_search_bar = true;
 
         app.build_active_context_for_test(None, DetachedSource::Image, |context| {
@@ -66830,14 +69330,14 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 GridItem::Image(PathBuf::from(r"C:\detached\b.jpg")),
             ];
             context.thumbnails = vec![ThumbnailState::Pending; 2];
-            context.search_filter = Some(std::collections::HashSet::from([0]));
+            context.search_filter = Some(std::collections::HashSet::from([0]).into());
         });
 
         app.with_active_viewer_context(|mounted| {
             mounted.rebuild_visible_indices();
             assert_eq!(mounted.visible_indices, vec![0, 1]);
             assert_eq!(
-                mounted.search_filter,
+                mounted.search_filter.as_ref().map(|filter| filter.matches.clone()),
                 Some(std::collections::HashSet::from([0])),
                 "the context may retain a stale local-filter snapshot, but physical policy ignores it"
             );
@@ -66846,7 +69346,9 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         assert_eq!(app.visible_indices, vec![0]);
         assert_eq!(
-            app.search_filter,
+            app.search_filter
+                .as_ref()
+                .map(|filter| filter.matches.clone()),
             Some(std::collections::HashSet::from([0]))
         );
         assert!(app.show_search_bar);
@@ -67104,6 +69606,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         fn scan_pending(cancel: Arc<AtomicBool>) -> FolderPaneOpenPending {
             let (_tx, rx) = mpsc::channel::<std::io::Result<ScannedDir>>();
             FolderPaneOpenPending {
+                navigation: None,
                 epub_restore: None,
                 path: PathBuf::from(r"C:\detached"),
                 cancel,
@@ -67372,7 +69875,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.scroll_offset_y = 137.5;
         app.show_search_bar = true;
         app.search_query = "tag:keep".to_string();
-        app.search_filter = Some(HashSet::from([1]));
+        app.search_filter = Some(HashSet::from([1]).into());
         app.search_filter_origin_folder = Some(main_folder.clone());
         app.settings.rating_filter = [false, true, false, true, false, true];
         app.folder_history
@@ -67412,7 +69915,9 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 (
                     msg.idx,
                     msg.items_gen,
-                    msg.image.as_ref().map(|image| image.size),
+                    msg.pixels()
+                        .map(|pixels| &pixels.image)
+                        .map(|image| image.size),
                 )
             })
             .collect::<Vec<_>>();
@@ -67467,7 +69972,9 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 (
                     msg.idx,
                     msg.items_gen,
-                    msg.image.as_ref().map(|image| image.size),
+                    msg.pixels()
+                        .map(|pixels| &pixels.image)
+                        .map(|image| image.size),
                 )
             })
             .collect::<Vec<_>>();
@@ -67803,6 +70310,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         install_detached_transition_gap_for_test(&mut app, window_id, |bundle| {
             bundle.current_folder = Some(PathBuf::from(r"C:\books\images"));
             bundle.folder_pane_open_pending = Some(FolderPaneOpenPending {
+                navigation: None,
                 epub_restore: None,
                 path: PathBuf::from(r"C:\books\images"),
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -68894,6 +71402,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             let (tx, rx) = std::sync::mpsc::channel();
             let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
+                navigation: None,
                 diagnostic: None,
                 requested: crate::pdf_loader::LeasedEpubPath::try_new(target.clone()).unwrap(),
                 owner: StartupOpenPathOwner::Activation,
@@ -68904,6 +71413,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 held_resolve_for_activation_admission: None,
             });
             let result = || StartupOpenPathResolveResult {
+                rar_volume_proof: None,
                 requested: target.clone(),
                 resolved: Some(crate::folder_tree::OpenablePathResolution {
                     path: target.clone(),
@@ -69010,11 +71520,9 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 pending_nav: (!direct).then(|| target.clone()),
                 pending_direct_nav: direct.then(|| target.clone()),
                 allow_direct_read: direct,
-                fallback_cached_zip: None,
                 completion:
                     crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
                 pending_sibling_output: None,
-                nav_history_rollback: None,
                 auto_fullscreen: true,
                 deferred_fullscreen: None,
                 suppress_confirm: false,
@@ -69996,19 +72504,20 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             parked_live_window_id: None,
         });
         let items_gen = app.items_generation;
-        app.texture_backlog.push(crate::thumb_loader::ThumbMsg {
-            idx: video,
-            image: None,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-            from_edit_preview: false,
-            edit_preview_adjustment: None,
-            source_dims: None,
-            layout_dims: None,
-            canceled: false,
-            finalized: false,
-            input_seq: 0,
-            items_gen,
-        });
+        app.texture_backlog
+            .push(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                video,
+                None,
+                crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+                false,
+                None,
+                None,
+                None,
+                false,
+                false,
+                0,
+                items_gen,
+            ));
 
         assert!(app.park_current_viewer_context_as_live_media(&ctx, "test"));
 
@@ -70874,6 +73383,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             idx: video,
             path: video_path.clone(),
             from_grid: false,
+            playback_origin: crate::video::PlaybackStartOrigin::NewSource,
             autoplay_override: None,
             ignore_resume: false,
             wait_for_detached_host: false,
@@ -73027,7 +75537,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         }];
         app.thumbnails = vec![ThumbnailState::Pending];
         app.image_metas = vec![None];
-        app.search_filter = Some(HashSet::from([0]));
+        app.search_filter = Some(HashSet::from([0]).into());
         app.selected = Some(0);
         app.scroll_offset_y = 184.0;
         app.rating_db
@@ -73054,7 +75564,12 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             vec![item_key.to_string()]
         );
         assert_eq!(app.visible_indices, vec![0]);
-        assert_eq!(app.search_filter, Some(HashSet::from([0])));
+        assert_eq!(
+            app.search_filter
+                .as_ref()
+                .map(|filter| filter.matches.clone()),
+            Some(HashSet::from([0]))
+        );
         assert_eq!(
             app.settings.rating_filter,
             [false, false, false, false, false, true]
@@ -73065,7 +75580,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_eq!(app.scroll_offset_y, 184.0);
         assert_eq!(app.items_generation, generation);
         assert!(app.rating_filter_suppressed_at.is_none());
-        assert!(app.facet_filter_suppression_stack.is_empty());
+        assert!(!app.facet_navigation.suppressed());
     }
 
     #[cfg(windows)]
@@ -73135,7 +75650,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.thumbnails = vec![ThumbnailState::Pending, ThumbnailState::Pending];
         app.image_metas = vec![None, None];
         app.visible_indices = vec![0, 1];
-        app.search_filter = Some(HashSet::from([0]));
+        app.search_filter = Some(HashSet::from([0]).into());
         app.show_search_bar = true;
         app.selected = Some(0);
         app.scroll_offset_y = 137.0;
@@ -73182,7 +75697,12 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.items.as_slice(),
             [GridItem::PdfFile(_), GridItem::PdfFile(_)]
         ));
-        assert_eq!(app.search_filter, Some(HashSet::from([0])));
+        assert_eq!(
+            app.search_filter
+                .as_ref()
+                .map(|filter| filter.matches.clone()),
+            Some(HashSet::from([0]))
+        );
         assert!(app.show_search_bar);
         assert_eq!(app.selected, Some(0));
         assert_eq!(app.scroll_offset_y, 137.0);
@@ -73204,7 +75724,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.thumbnails = vec![ThumbnailState::Pending, ThumbnailState::Pending];
         app.image_metas = vec![None, None];
         app.visible_indices = vec![0, 1];
-        app.search_filter = Some(HashSet::from([1]));
+        app.search_filter = Some(HashSet::from([1]).into());
         app.show_search_bar = true;
         app.selected = Some(1);
         app.scroll_offset_y = 173.0;
@@ -73253,7 +75773,12 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.items.as_slice(),
             [GridItem::ZipFile(_), GridItem::ZipFile(_)]
         ));
-        assert_eq!(app.search_filter, Some(HashSet::from([1])));
+        assert_eq!(
+            app.search_filter
+                .as_ref()
+                .map(|filter| filter.matches.clone()),
+            Some(HashSet::from([1]))
+        );
         assert!(app.show_search_bar);
         assert_eq!(app.selected, Some(1));
         assert_eq!(app.scroll_offset_y, 173.0);
@@ -73266,21 +75791,43 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.active_quick_folder_slot = None;
         let back = FolderNavHistoryTarget::Path(app.tmp.path().join("history-back"));
         let forward = FolderNavHistoryTarget::Path(app.tmp.path().join("history-forward"));
-        app.folder_nav_back_stack = vec![back.clone()];
-        app.folder_nav_forward_stack = vec![forward.clone()];
+        app.folder_nav_back_stack = vec![back.clone().into()];
+        app.folder_nav_forward_stack = vec![forward.clone().into()];
+        let parent = app.tmp.path().join("facet-parent");
+        let child = parent.join("book.zip");
+        let route = crate::app::FacetRoute::root(crate::app::FacetScope::path(&parent));
+        app.adopt_main_facet_route(route.clone());
+        app.settings.facet_filter.exts.insert("zip".into());
+        app.adopt_main_facet_route(route.child(crate::app::FacetScope::book(&child, "")));
+        app.settings.facet_filter.name_query = "child-only".into();
+        let facet = app.facet_navigation.clone();
+        let active = app.settings.facet_filter.clone();
         app.build_active_context_for_test(None, DetachedSource::Book, |_| {});
 
         app.with_active_viewer_context(|detached| {
             assert!(detached.folder_history_back_target().is_none());
             assert!(detached.folder_history_forward_target().is_none());
-            assert!(detached.navigate_folder_history_back().is_none());
-            assert!(detached.navigate_folder_history_forward().is_none());
+            assert!(
+                detached
+                    .dispatch_main_folder_history_input(FolderHistoryDirection::Back)
+                    .is_none()
+            );
+            assert!(
+                detached
+                    .dispatch_main_folder_history_input(FolderHistoryDirection::Forward)
+                    .is_none()
+            );
+            detached.rebuild_visible_indices();
+            assert_eq!(detached.facet_navigation, facet);
+            assert_eq!(detached.settings.facet_filter, active);
         })
         .expect("detached context remains mounted");
 
         assert_eq!(app.folder_nav_back_stack, vec![back]);
         assert_eq!(app.folder_nav_forward_stack, vec![forward]);
         assert!(!app.suppress_folder_nav_record_once);
+        assert_eq!(app.facet_navigation, facet);
+        assert_eq!(app.settings.facet_filter, active);
     }
 
     #[test]
@@ -80626,6 +83173,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             idx: 0,
             path,
             from_grid: false,
+            playback_origin: crate::video::PlaybackStartOrigin::NewSource,
             autoplay_override: None,
             ignore_resume: false,
             wait_for_detached_host: true,
@@ -86132,7 +88680,7 @@ mod smart_folder_transition_tests {
             back_stack: Vec::new(),
         };
         app.folder_nav_back_stack
-            .push(FolderNavHistoryTarget::SmartFolder(target.clone()));
+            .push(FolderNavHistoryTarget::SmartFolder(target.clone()).into());
         let ctx = egui::Context::default();
 
         assert!(app.begin_smart_history_navigation(
@@ -86157,7 +88705,9 @@ mod smart_folder_transition_tests {
         assert_eq!(app.top_level_grid_view.smart_folder(), Some(&target));
         assert!(app.folder_nav_back_stack.is_empty());
         assert_eq!(
-            app.folder_nav_forward_stack.last(),
+            app.folder_nav_forward_stack
+                .last()
+                .map(|entry| &entry.location),
             Some(&FolderNavHistoryTarget::Path(prior)),
         );
     }
@@ -86182,7 +88732,7 @@ mod smart_folder_transition_tests {
         app.settings.smart_folders = vec![definition];
         let target = SmartFolderViewState::root(id, Vec::new());
         app.folder_nav_back_stack
-            .push(FolderNavHistoryTarget::SmartFolder(target.clone()));
+            .push(FolderNavHistoryTarget::SmartFolder(target.clone()).into());
         let ctx = egui::Context::default();
 
         assert!(app.begin_smart_history_navigation(
@@ -86202,7 +88752,9 @@ mod smart_folder_transition_tests {
         }
         assert!(app.folder_nav_back_stack.is_empty());
         assert_eq!(
-            app.folder_nav_forward_stack.last(),
+            app.folder_nav_forward_stack
+                .last()
+                .map(|entry| &entry.location),
             Some(&FolderNavHistoryTarget::Path(prior)),
         );
         assert!(!app.suppress_folder_nav_record_once);
@@ -86212,7 +88764,7 @@ mod smart_folder_transition_tests {
             super::FolderOpenOutcome::Loaded
         ));
         assert!(matches!(
-            app.folder_nav_back_stack.last(),
+            app.folder_nav_back_stack.last().map(|entry| &entry.location),
             Some(FolderNavHistoryTarget::SmartFolder(state)) if state.definition_id == id
         ));
     }
@@ -86242,7 +88794,7 @@ mod smart_folder_transition_tests {
         app.settings.smart_folders = vec![definition];
         let target = SmartFolderViewState::root(id, Vec::new());
         app.folder_nav_back_stack
-            .push(FolderNavHistoryTarget::SmartFolder(target.clone()));
+            .push(FolderNavHistoryTarget::SmartFolder(target.clone()).into());
 
         assert!(app.begin_smart_history_navigation(
             target,
@@ -86346,7 +88898,7 @@ mod smart_folder_transition_tests {
         app.settings.smart_folders = vec![definition];
         let target = SmartFolderViewState::root(id, Vec::new());
         app.folder_nav_back_stack
-            .push(FolderNavHistoryTarget::SmartFolder(target.clone()));
+            .push(FolderNavHistoryTarget::SmartFolder(target.clone()).into());
         assert!(app.begin_smart_history_navigation(
             target.clone(),
             crate::app::smart_folder::SmartHistoryDirection::Back,
@@ -86389,8 +88941,8 @@ mod smart_folder_transition_tests {
         let root_b = SmartFolderViewState::root(definition_b.id, Vec::new());
         app.settings.smart_folders = vec![definition_a, definition_b];
         app.folder_nav_back_stack = vec![
-            FolderNavHistoryTarget::SmartFolder(root_a.clone()),
-            FolderNavHistoryTarget::SmartFolder(root_b.clone()),
+            FolderNavHistoryTarget::SmartFolder(root_a.clone()).into(),
+            FolderNavHistoryTarget::SmartFolder(root_b.clone()).into(),
         ];
         assert!(app.begin_smart_history_navigation(
             root_b.clone(),
@@ -86433,8 +88985,8 @@ mod smart_folder_transition_tests {
         let root = SmartFolderViewState::root(definition.id, Vec::new());
         app.settings.smart_folders = vec![definition];
         app.folder_nav_back_stack = vec![
-            FolderNavHistoryTarget::Path(earlier.clone()),
-            FolderNavHistoryTarget::SmartFolder(root.clone()),
+            FolderNavHistoryTarget::Path(earlier.clone()).into(),
+            FolderNavHistoryTarget::SmartFolder(root.clone()).into(),
         ];
         assert!(app.begin_smart_history_navigation(
             root.clone(),
@@ -86446,14 +88998,21 @@ mod smart_folder_transition_tests {
             &action,
             Some(StagedSmartHistoryAction::Dispatch { .. })
         ));
-        let mut rollback = None;
-        let path = app.dispatch_staged_smart_history_action(action.unwrap(), &mut rollback);
-        assert_eq!(path.as_deref(), Some(earlier.as_path()));
-        assert!(rollback.is_some());
-        assert!(matches!(
-            app.load_folder_or_convert_archive(path.unwrap()),
-            super::FolderOpenOutcome::Loaded
-        ));
+        let before = app.folder_nav_history_snapshot();
+        assert!(
+            app.dispatch_staged_smart_history_action(action.unwrap())
+                .is_none()
+        );
+        assert_eq!(
+            app.folder_nav_history_snapshot().back_stack,
+            before.back_stack
+        );
+        assert_eq!(
+            app.folder_nav_history_snapshot().forward_stack,
+            before.forward_stack
+        );
+        super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(app.current_folder.as_deref(), Some(earlier.as_path()));
         assert!(app.folder_nav_back_stack.is_empty());
         assert_eq!(
             app.folder_nav_forward_stack,
@@ -87265,7 +89824,7 @@ mod smart_folder_transition_tests {
             back_stack: Vec::new(),
         };
         app.folder_nav_back_stack
-            .push(FolderNavHistoryTarget::SmartFolder(target.clone()));
+            .push(FolderNavHistoryTarget::SmartFolder(target.clone()).into());
         let history = app.folder_nav_history_snapshot();
         assert!(app.begin_smart_history_navigation(
             target,
@@ -87296,6 +89855,343 @@ mod smart_folder_transition_tests {
         assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
     }
 
+    fn section1339_fake_pdf_pages(
+        path: &Path,
+        count: u32,
+    ) -> crate::pdf_loader::PdfEnumerateResult {
+        let stamp = std::fs::metadata(path).unwrap();
+        crate::pdf_loader::PdfEnumerateResult {
+            pages: (0..count)
+                .map(|page_num| crate::pdf_loader::PdfPageEntry {
+                    page_num,
+                    mtime: crate::ui_helpers::mtime_secs(&stamp),
+                    file_size: stamp.len(),
+                })
+                .collect(),
+            direction: None,
+            stamp: None,
+        }
+    }
+
+    fn section1339_seed_warm_pdf(app: &mut App, parent: &Path, pdf: &Path) {
+        let stamp = std::fs::metadata(pdf).unwrap();
+        app.get_or_open_catalog(parent)
+            .unwrap()
+            .set_pdf_meta(
+                pdf.file_name().unwrap().to_str().unwrap(),
+                crate::ui_helpers::mtime_secs(&stamp),
+                stamp.len() as i64,
+                2,
+                false,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn section1339_direct_warm_pdf_adopts_facet_and_history_before_verification_once() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        let parent = app.tmp.path().join("direct-warm-adoption");
+        std::fs::create_dir_all(&parent).unwrap();
+        let pdf = parent.join("book.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        section1339_seed_warm_pdf(&mut app, &parent, &pdf);
+        app.load_folder(parent.clone());
+        app.settings.facet_filter.exts.insert("pdf".into());
+        let before = app.folder_nav_history_snapshot();
+        assert_eq!(
+            app.load_pdf_as_folder_owned(
+                pdf.clone(),
+                OpenRequestOwner::Navigation,
+                StartupListIntent::ExplicitList
+            ),
+            FolderOpenOutcome::Loaded
+        );
+        assert_eq!(app.current_folder.as_deref(), Some(pdf.as_path()));
+        assert_eq!(app.items.len(), 2, "the first warm display is immediate");
+        assert_eq!(app.folder_nav_back_stack.len(), before.back_stack.len() + 1);
+        assert_eq!(
+            app.folder_history_back_target(),
+            Some(&FolderNavHistoryTarget::Path(parent))
+        );
+        assert_eq!(app.facet_navigation.saved_frame_count(), 1);
+        assert!(!app.settings.facet_filter.is_active());
+        let adopted = app.folder_nav_history_snapshot();
+        let facet = app.facet_navigation.clone();
+        app.pdf_enumerate_pending.as_mut().unwrap().2 =
+            crate::pdf_loader::completed_enumerate_result_handle(
+                &pdf,
+                Ok(section1339_fake_pdf_pages(&pdf, 3)),
+            );
+        app.poll_pdf_enumerate();
+        assert_eq!(app.items.len(), 3);
+        assert_eq!(app.folder_nav_back_stack, adopted.back_stack);
+        assert_eq!(app.folder_nav_forward_stack, adopted.forward_stack);
+        assert_eq!(app.facet_navigation, facet);
+        app.poll_pdf_enumerate();
+        assert_eq!(app.folder_nav_back_stack, adopted.back_stack);
+        assert_eq!(app.facet_navigation, facet);
+    }
+
+    #[test]
+    fn section1339_cold_pdf_success_retires_ready_retained_warm_verification_once() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        let parent = app.tmp.path().join("cold-retained-warm");
+        std::fs::create_dir_all(&parent).unwrap();
+        let warm = parent.join("warm.pdf");
+        let cold = parent.join("cold.pdf");
+        std::fs::write(&warm, b"%PDF-1.4\n").unwrap();
+        std::fs::write(&cold, b"%PDF-1.4\n").unwrap();
+        section1339_seed_warm_pdf(&mut app, &parent, &warm);
+        app.load_folder(parent.clone());
+        app.settings.facet_filter.exts.insert("pdf".into());
+        assert_eq!(
+            app.load_pdf_as_folder_owned(
+                warm.clone(),
+                OpenRequestOwner::Navigation,
+                StartupListIntent::ExplicitList
+            ),
+            FolderOpenOutcome::Loaded
+        );
+        app.settings.facet_filter.exts.insert("png".into());
+        let history = app.folder_nav_history_snapshot();
+        let facet = app.facet_navigation.clone();
+        let live = app.settings.facet_filter.clone();
+        let rows = app.items.clone();
+        assert_eq!(
+            app.load_pdf_as_folder_owned(
+                cold.clone(),
+                OpenRequestOwner::Navigation,
+                StartupListIntent::ExplicitList
+            ),
+            FolderOpenOutcome::Loaded
+        );
+        let retained = match &mut app.pdf_enumerate_pending.as_mut().unwrap().5 {
+            super::PdfOpenPhase::ColdCandidate {
+                retained_source: Some(source),
+                ..
+            } => source,
+            _ => panic!("cold candidate must own the original warm verifier"),
+        };
+        retained.2 = crate::pdf_loader::completed_enumerate_result_handle(
+            &warm,
+            Ok(section1339_fake_pdf_pages(&warm, 3)),
+        );
+        let retained_cancel = std::sync::Arc::clone(&retained.2.cancel);
+        assert_eq!(app.current_folder.as_deref(), Some(warm.as_path()));
+        assert_eq!(app.items, rows);
+        assert_eq!(app.folder_nav_back_stack, history.back_stack);
+        assert_eq!(app.facet_navigation, facet);
+        assert_eq!(app.settings.facet_filter, live);
+        app.pdf_enumerate_pending.as_mut().unwrap().2 =
+            crate::pdf_loader::completed_enumerate_result_handle(
+                &cold,
+                Ok(section1339_fake_pdf_pages(&cold, 4)),
+            );
+        app.poll_pdf_enumerate();
+        assert_eq!(app.current_folder.as_deref(), Some(cold.as_path()));
+        assert_eq!(app.items.len(), 4);
+        assert!(retained_cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(
+            app.folder_nav_back_stack.len(),
+            history.back_stack.len() + 1
+        );
+        assert_eq!(
+            app.folder_history_back_target(),
+            Some(&FolderNavHistoryTarget::Path(warm))
+        );
+        assert_eq!(app.facet_navigation.saved_frame_count(), 1);
+        assert!(!app.settings.facet_filter.is_active());
+        let adopted = app.folder_nav_history_snapshot();
+        let adopted_facet = app.facet_navigation.clone();
+        app.poll_pdf_enumerate();
+        assert_eq!(app.folder_nav_back_stack, adopted.back_stack);
+        assert_eq!(app.facet_navigation, adopted_facet);
+    }
+
+    #[test]
+    fn section1339_direct_password_retry_keeps_same_navigation_until_single_adoption() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        let parent = app.tmp.path().join("password-navigation-adoption");
+        std::fs::create_dir_all(&parent).unwrap();
+        let pdf = parent.join("locked.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        app.load_folder(parent.clone());
+        app.settings.facet_filter.exts.insert("pdf".into());
+        let history = app.folder_nav_history_snapshot();
+        let facet = app.facet_navigation.clone();
+        let live = app.settings.facet_filter.clone();
+        assert_eq!(
+            app.load_pdf_as_folder_owned(
+                pdf.clone(),
+                OpenRequestOwner::Navigation,
+                StartupListIntent::ExplicitList
+            ),
+            FolderOpenOutcome::Loaded
+        );
+        app.pdf_enumerate_pending.as_mut().unwrap().2 =
+            crate::pdf_loader::completed_enumerate_result_handle(
+                &pdf,
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    crate::pdf_loader::PdfReadError::PasswordRequired,
+                )),
+            );
+        app.poll_pdf_enumerate();
+        assert!(matches!(
+            app.pdf_password_request
+                .as_ref()
+                .map(|request| &request.owner),
+            Some(super::PdfPasswordRequestOwner::Direct(_))
+        ));
+        assert_eq!(app.current_folder.as_deref(), Some(parent.as_path()));
+        assert_eq!(app.folder_nav_back_stack, history.back_stack);
+        assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+        assert_eq!(app.facet_navigation, facet);
+        assert_eq!(app.settings.facet_filter, live);
+        assert!(app.retry_pdf_password_dialog_request("pw".into(), false));
+        assert_eq!(app.current_folder.as_deref(), Some(parent.as_path()));
+        assert_eq!(app.folder_nav_back_stack, history.back_stack);
+        app.pdf_enumerate_pending.as_mut().unwrap().2 =
+            crate::pdf_loader::completed_enumerate_result_handle(
+                &pdf,
+                Ok(section1339_fake_pdf_pages(&pdf, 2)),
+            );
+        app.poll_pdf_enumerate();
+        assert_eq!(app.current_folder.as_deref(), Some(pdf.as_path()));
+        assert_eq!(
+            app.folder_nav_back_stack.len(),
+            history.back_stack.len() + 1
+        );
+        assert_eq!(
+            app.folder_history_back_target(),
+            Some(&FolderNavHistoryTarget::Path(parent))
+        );
+        assert_eq!(app.facet_navigation.saved_frame_count(), 1);
+        assert!(!app.settings.facet_filter.is_active());
+        let adopted = app.folder_nav_history_snapshot();
+        app.poll_pdf_enumerate();
+        assert_eq!(app.folder_nav_back_stack, adopted.back_stack);
+        assert_eq!(app.facet_navigation.saved_frame_count(), 1);
+    }
+
+    #[test]
+    fn section1339_smart_surface_survives_real_pdf_verification_but_row_request_expires() {
+        for supersede in [false, true] {
+            let mut app = setup_app();
+            app.active_quick_folder_slot = None;
+            app.settings.sidecar_backup_enabled = false;
+            app.settings.auto_fullscreen_zip_pdf = false;
+            let parent = app.tmp.path().join("pdf-verification-source");
+            let target = app.tmp.path().join("smart-after-verification");
+            let other = app.tmp.path().join("new-owner");
+            std::fs::create_dir_all(&parent).unwrap();
+            std::fs::create_dir_all(&target).unwrap();
+            std::fs::create_dir_all(&other).unwrap();
+            std::fs::write(target.join("page.jpg"), b"fixture").unwrap();
+            let pdf = parent.join("warm.pdf");
+            std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+            let stamp = std::fs::metadata(&pdf).unwrap();
+            app.get_or_open_catalog(&parent)
+                .unwrap()
+                .set_pdf_meta(
+                    "warm.pdf",
+                    crate::ui_helpers::mtime_secs(&stamp),
+                    stamp.len() as i64,
+                    2,
+                    false,
+                )
+                .unwrap();
+            app.load_folder(parent);
+            assert_eq!(
+                app.load_pdf_as_folder_owned(
+                    pdf.clone(),
+                    OpenRequestOwner::Navigation,
+                    crate::app::StartupListIntent::ExplicitList
+                ),
+                FolderOpenOutcome::Loaded
+            );
+            assert_eq!(app.items.len(), 2, "warm pages display before verification");
+            let source_route = app.facet_navigation.route().clone();
+            let source_generation = app.items_generation;
+            let row_navigation = app.capture_main_list_navigation(
+                crate::app::MainHistoryOperation::Direct(
+                    crate::app::DirectNavigationPurpose::Navigation,
+                ),
+                crate::app::MainListSourceProof::Row,
+            );
+            let row_destination = app.main_list_destination_entry(
+                FolderNavHistoryTarget::Path(target.clone()),
+                row_navigation.source_location.as_ref(),
+                None,
+            );
+            app.settings.facet_filter.exts.insert("pdf".into());
+            let definition = definition("Smart after PDF", target);
+            let id = definition.id;
+            app.settings.smart_folders = vec![definition];
+            app.open_smart_folder_staged(id, false);
+            assert!(app.smart_folder_transition.is_some());
+            let history = app.folder_nav_history_snapshot();
+            app.pdf_enumerate_pending.as_mut().unwrap().2 =
+                crate::pdf_loader::completed_enumerate_result_handle(
+                    &pdf,
+                    Ok(crate::pdf_loader::PdfEnumerateResult {
+                        pages: (0..3)
+                            .map(|page_num| crate::pdf_loader::PdfPageEntry {
+                                page_num,
+                                mtime: crate::ui_helpers::mtime_secs(&stamp),
+                                file_size: stamp.len(),
+                            })
+                            .collect(),
+                        direction: None,
+                        stamp: None,
+                    }),
+                );
+            app.poll_pdf_enumerate();
+            assert!(app.items_generation > source_generation);
+            assert_eq!(app.items.len(), 3);
+            assert_eq!(app.facet_navigation.route(), &source_route);
+            assert_eq!(app.folder_nav_back_stack, history.back_stack);
+            assert!(
+                app.prepare_main_list_adoption(row_navigation, row_destination)
+                    .is_none(),
+                "row-bound snapshot must expire on the same generation change"
+            );
+            let ctx = egui::Context::default();
+            if supersede {
+                app.load_folder(other.clone());
+                wait_for_staged_smart_terminal(&mut app, &ctx);
+                assert_eq!(app.current_folder.as_ref(), Some(&other));
+                assert!(!app.items_are_smart_folder_view);
+            } else {
+                wait_for_smart_folder(&mut app, &ctx, id);
+                assert_eq!(
+                    app.folder_nav_back_stack.len(),
+                    history.back_stack.len() + 1
+                );
+                assert_eq!(
+                    app.folder_history_back_target(),
+                    Some(&FolderNavHistoryTarget::Path(pdf))
+                );
+                assert_eq!(app.facet_navigation.saved_frame_count(), 1);
+                assert!(!app.settings.facet_filter.is_active());
+                let adopted_history = app.folder_nav_history_snapshot();
+                let adopted_facet = app.facet_navigation.clone();
+                app.poll_smart_folder(&ctx);
+                assert_eq!(app.folder_nav_back_stack, adopted_history.back_stack);
+                assert_eq!(app.facet_navigation, adopted_facet);
+            }
+        }
+    }
+
     #[test]
     #[cfg(windows)]
     fn staged_smart_folder_collection_lease_survives_revision_refresh() {
@@ -87316,14 +90212,25 @@ mod smart_folder_transition_tests {
         let definition = definition("Smart Lease", source);
         let id = definition.id;
         app.settings.smart_folders = vec![definition];
+        app.settings.facet_filter.exts.insert("jpg".into());
+        let history = app.folder_nav_history_snapshot();
         app.open_smart_folder_staged(id, false);
         assert!(app.smart_folder_transition.is_some());
         app.top_level_grid_view
             .collection_session_mut()
             .unwrap()
             .accepted_revision += 1;
+        app.items[0] = GridItem::Image(prior.with_file_name("updated-row.jpg"));
+        app.bump_items_generation();
+        assert_eq!(app.folder_nav_back_stack, history.back_stack);
         wait_for_smart_folder(&mut app, &egui::Context::default(), id);
         assert!(app.smart_folder_transition.is_none());
+        assert_eq!(
+            app.folder_nav_back_stack.len(),
+            history.back_stack.len() + 1
+        );
+        assert_eq!(app.facet_navigation.saved_frame_count(), 1);
+        assert!(!app.settings.facet_filter.is_active());
     }
 
     #[test]
@@ -87402,7 +90309,7 @@ mod smart_folder_transition_tests {
             back_stack: Vec::new(),
         };
         app.folder_nav_back_stack
-            .push(FolderNavHistoryTarget::SmartFolder(target.clone()));
+            .push(FolderNavHistoryTarget::SmartFolder(target.clone()).into());
         assert!(app.begin_smart_history_navigation(
             target,
             crate::app::smart_folder::SmartHistoryDirection::Back,
@@ -87477,7 +90384,7 @@ mod smart_folder_transition_tests {
         reading_history_return_from: Option<PathBuf>,
         rating_filter_suppressed_at: Option<(PathBuf, [bool; 6])>,
         facet_filter: crate::settings::FacetFilter,
-        facet_filter_suppression_stack: Vec<(PathBuf, crate::settings::FacetFilter)>,
+        facet_navigation: crate::app::FacetNavigationState,
         smart_folder: super::top_level_grid_view::SmartFolderViewState,
         item_keys: Vec<String>,
     }
@@ -87487,11 +90394,7 @@ mod smart_folder_transition_tests {
             reading_history_return_from: app.reading_history_return_from.clone(),
             rating_filter_suppressed_at: app.rating_filter_suppressed_at.clone(),
             facet_filter: app.settings.facet_filter.clone(),
-            facet_filter_suppression_stack: app
-                .facet_filter_suppression_stack
-                .iter()
-                .map(|suppression| (suppression.anchor.clone(), suppression.saved_filter.clone()))
-                .collect(),
+            facet_navigation: app.facet_navigation.clone(),
             smart_folder: app
                 .top_level_grid_view
                 .smart_folder()
@@ -87550,7 +90453,7 @@ mod smart_folder_transition_tests {
         assert!(app.visible_indices.contains(&idx));
         app.reading_history_return_from = Some(app.tmp.path().join("reserved-history.zip"));
         assert!(app.rating_filter_suppressed_at.is_none());
-        assert!(app.facet_filter_suppression_stack.is_empty());
+        assert!(!app.facet_navigation.suppressed());
 
         let before = convertible_archive_main_state(app);
         (source, before)
@@ -87620,7 +90523,6 @@ mod smart_folder_transition_tests {
                     collection_navigation_continuation: None,
                 },
             ),
-            None,
         )
     }
 
@@ -87629,7 +90531,6 @@ mod smart_folder_transition_tests {
         source: &Path,
         with_deferred_fullscreen: bool,
         completion: crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy,
-        nav_history_rollback: Option<FolderNavHistorySnapshot>,
     ) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         let (_tx, rx) = std::sync::mpsc::channel();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -87663,10 +90564,8 @@ mod smart_folder_transition_tests {
             pending_nav: None,
             pending_direct_nav: Some(source.to_path_buf()),
             allow_direct_read: true,
-            fallback_cached_zip: None,
             completion,
             pending_sibling_output: None,
-            nav_history_rollback,
             auto_fullscreen: false,
             deferred_fullscreen,
             suppress_confirm: false,
@@ -87675,18 +90574,68 @@ mod smart_folder_transition_tests {
         cancel
     }
 
+    fn install_staged_history_rar_completion(app: &mut App, source: &Path) {
+        let target = app.folder_history_back_entry().unwrap().clone();
+        let plan = FolderHistoryPlan::capture(app, FolderHistoryDirection::Back, target).unwrap();
+        let navigation = app.capture_main_list_navigation(
+            MainHistoryOperation::Replay(Box::new(plan)),
+            MainListSourceProof::Row,
+        );
+        assert!(app.start_physical_navigation_owned(
+            PhysicalHistoryIntent::Navigation {
+                replay: None,
+                auto_fullscreen: false
+            },
+            source.to_path_buf(),
+            StartupListIntent::ExplicitList,
+            navigation
+        ));
+        app.settle_open_path_classification_for_test();
+        let mut transition = app
+            .top_level_grid_view
+            .take_history_navigation_transition()
+            .unwrap();
+        let crate::app::HistoryNavigationTransition::Physical(request) = &mut transition else {
+            panic!("expected physical RAR history request");
+        };
+        request.phase = crate::app::PhysicalHistoryPhase::ArchiveConverting;
+        let request_id = request.request_id;
+        app.replace_history_navigation_transition(Some(transition));
+        install_pending_direct_rar_completion_with_policy(
+            app,
+            source,
+            false,
+            crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::StagedHistory(
+                request_id,
+            ),
+        );
+    }
+
     fn wait_for_snapshot_archive_listing(app: &mut App, cached: &Path) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while (app.top_level_grid_view.open_path_classification().is_some()
             || app.zip_enumerate_pending.is_some()
-            || app.smart_folder_transition.is_some())
+            || app.smart_folder_transition.is_some()
+            || app
+                .top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+            || app.sidecar_restore_active())
             && std::time::Instant::now() < deadline
         {
             app.settle_open_path_classification_for_test();
+            app.poll_collection_history_transition(&egui::Context::default());
+            app.poll_sidecar_restore(&egui::Context::default());
             app.poll_zip_enumerate();
             app.poll_smart_folder(&egui::Context::default());
             std::thread::yield_now();
         }
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_none()
+        );
+        assert!(!app.sidecar_restore_active());
         assert!(app.zip_enumerate_pending.is_none());
         assert!(app.smart_folder_transition.is_none());
         assert!(matches!(
@@ -87694,6 +90643,100 @@ mod smart_folder_transition_tests {
             [GridItem::ZipImage { zip_path, entry_name }]
                 if zip_path == cached && entry_name == "page-001.jpg"
         ));
+    }
+
+    #[test]
+    fn section1339_plain_main_converted_archive_preserves_source_until_owned_cached_zip_adoption() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        app.settings.detached_viewer_open_images_in_window = false;
+        let parent = app.tmp.path().join("main-converted-parent");
+        let other = app.tmp.path().join("main-converted-other");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let source = parent.join("book.7z");
+        let cached = app.tmp.path().join("main-converted-cache.zip");
+        std::fs::write(&source, b"converted source fixture").unwrap();
+        write_convert_completion_zip(&cached);
+        record_convertible_archive_cache(&mut app, &source, &cached);
+        app.load_folder(parent.clone());
+        let index = select_real_path(&mut app, &source);
+        assert!(matches!(
+            app.items[index],
+            GridItem::ConvertibleArchive { .. }
+        ));
+        app.settings.facet_filter.exts.insert("7z".into());
+        app.rebuild_visible_indices();
+        let rows = app.items.clone();
+        let filter = app.settings.facet_filter.clone();
+        let facet = app.facet_navigation.clone();
+        let history = app.folder_nav_history_snapshot();
+        let owner = app.main_grid_archive_open_owner(index, &source);
+        assert!(matches!(&owner, OpenRequestOwner::MainGridArchive(intent)
+            if intent.rating_grid_owner.is_none() && intent.collection_grid_owner.is_none()
+                && matches!(intent.smart_folder_owner, SmartGridArchiveOwner::None)));
+        let result = app.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+            source.clone(),
+            false,
+            owner,
+            StartupListIntent::ExplicitList,
+        );
+        assert!(matches!(
+            result,
+            FolderOpenOutcome::Loaded | FolderOpenOutcome::Classifying
+        ));
+        app.settle_open_path_classification_for_test();
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+        );
+        assert_eq!(app.current_folder.as_ref(), Some(&parent));
+        assert_eq!(app.items, rows);
+        assert_eq!(app.settings.facet_filter, filter);
+        assert_eq!(app.facet_navigation, facet);
+        assert_eq!(app.folder_nav_back_stack, history.back_stack);
+        app.start_folder_pane_open(other);
+        app.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
+        app.poll_collection_history_transition(&egui::Context::default());
+        assert_eq!(app.current_folder.as_ref(), Some(&parent));
+        assert_eq!(app.items, rows);
+        assert_eq!(app.settings.facet_filter, filter);
+        assert_eq!(app.facet_navigation, facet);
+        assert_eq!(app.folder_nav_back_stack, history.back_stack);
+        assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+        assert!(app.archive_source_override.is_none());
+        let owner = app.main_grid_archive_open_owner(index, &source);
+        assert!(matches!(
+            app.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                source.clone(),
+                false,
+                owner,
+                StartupListIntent::ExplicitList
+            ),
+            FolderOpenOutcome::Loaded | FolderOpenOutcome::Classifying
+        ));
+        super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(app.effective_folder().as_deref(), Some(source.as_path()));
+        assert_eq!(app.items.len(), 1);
+        assert_eq!(app.visible_indices.len(), 1);
+        assert!(!app.settings.facet_filter.is_active());
+        assert_eq!(app.facet_navigation.saved_frame_count(), 1);
+        assert_eq!(
+            app.folder_nav_back_stack.len(),
+            history.back_stack.len() + 1
+        );
+        assert!(
+            matches!(app.facet_navigation.route().current(), Some(crate::app::FacetScope::Book { source: identity, .. }) if identity == &crate::app::facet_navigation::FacetPathIdentity::new(&source))
+        );
+        let adopted = app.folder_nav_history_snapshot();
+        let adopted_facet = app.facet_navigation.clone();
+        app.poll_collection_history_transition(&egui::Context::default());
+        assert_eq!(app.folder_nav_back_stack, adopted.back_stack);
+        assert_eq!(app.folder_nav_forward_stack, adopted.forward_stack);
+        assert_eq!(app.facet_navigation, adopted_facet);
     }
 
     #[test]
@@ -87781,6 +90824,115 @@ mod smart_folder_transition_tests {
     }
 
     #[test]
+    fn section1339_foreign_zip_conversion_cancel_and_cached_hydration_keep_same_location() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.settings
+            .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ask);
+        let parent = app.tmp.path().join("foreign-offer-parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        let logical_zip = parent.join("outer.zip");
+        let cached = app.tmp.path().join("foreign-offer-cached.zip");
+        write_convert_completion_zip(&logical_zip);
+        write_convert_completion_zip(&cached);
+        app.load_folder(parent);
+        app.settings.facet_filter.exts.insert("zip".into());
+        assert!(app.start_grid_virtual_open(GridVirtualOpenIntent {
+            path: logical_zip.clone(),
+            source: GridVirtualOpenSource::Direct,
+            effects: GridVirtualOpenEffects {
+                auto_fullscreen: false,
+                suppress_rating_filter: false,
+                suppress_facet_filter: true,
+                reading_history_return_from: None,
+            },
+        }));
+        super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(app.zip_nav.as_ref().unwrap().tree.zip_path, logical_zip);
+        assert!(app.restore_facet_filter_suppression());
+        assert!(app.settings.facet_filter.exts.contains("zip"));
+        assert_eq!(app.facet_navigation.saved_frame_count(), 0);
+        let rows = app.items.clone();
+        let filter = app.settings.facet_filter.clone();
+        let facet = app.facet_navigation.clone();
+        let history = app.folder_nav_history_snapshot();
+        app.offer_zip_foreign_archive_conversion(
+            &logical_zip,
+            false,
+            StartupListIntent::ExplicitList,
+        );
+        let request = match app.top_level_grid_view.history_navigation_transition() {
+            Some(HistoryNavigationTransition::Physical(request)) => request,
+            _ => panic!("foreign expansion must own a typed physical request"),
+        };
+        assert!(matches!(
+            request.navigation.history,
+            MainHistoryOperation::SameLocation
+        ));
+        assert!(
+            matches!(app.archive_convert.as_ref().map(|state| &state.completion), Some(crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::StagedHistory(id)) if *id == request.request_id)
+        );
+        let cancel = std::sync::Arc::clone(&app.archive_convert.as_ref().unwrap().cancel);
+        assert_eq!(app.current_folder.as_ref(), Some(&logical_zip));
+        assert_eq!(app.items, rows);
+        assert_eq!(app.settings.facet_filter, filter);
+        assert_eq!(app.facet_navigation, facet);
+        assert_eq!(app.folder_nav_back_stack, history.back_stack);
+        assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+        assert!(app.cancel_archive_convert_for_navigation("test_foreign_offer_cancel"));
+        app.poll_collection_history_transition(&egui::Context::default());
+        assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_none()
+        );
+        assert_eq!(app.current_folder.as_ref(), Some(&logical_zip));
+        assert_eq!(app.items, rows);
+        assert_eq!(app.settings.facet_filter, filter);
+        assert_eq!(app.facet_navigation, facet);
+        assert_eq!(app.folder_nav_back_stack, history.back_stack);
+        assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+        app.offer_zip_foreign_archive_conversion(
+            &logical_zip,
+            false,
+            StartupListIntent::ExplicitList,
+        );
+        publish_convert_done_and_open(&mut app, &cached);
+        assert_eq!(
+            app.current_folder.as_ref(),
+            Some(&logical_zip),
+            "conversion completion prepares before adopting"
+        );
+        assert_eq!(app.settings.facet_filter, filter);
+        assert_eq!(app.facet_navigation, facet);
+        assert_eq!(app.folder_nav_back_stack, history.back_stack);
+        super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(app.current_folder.as_ref(), Some(&cached));
+        assert_eq!(
+            app.archive_source_override.as_deref(),
+            Some(logical_zip.as_path())
+        );
+        assert_eq!(
+            app.effective_folder().as_deref(),
+            Some(logical_zip.as_path())
+        );
+        assert_eq!(app.items.len(), 1);
+        assert_eq!(app.settings.facet_filter, filter);
+        assert!(app.settings.facet_filter.is_active());
+        assert_eq!(app.facet_navigation, facet);
+        assert_eq!(app.facet_navigation.saved_frame_count(), 0);
+        assert_eq!(app.folder_nav_back_stack, history.back_stack);
+        assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+        app.poll_collection_history_transition(&egui::Context::default());
+        assert_eq!(app.facet_navigation, facet);
+        assert_eq!(app.folder_nav_back_stack, history.back_stack);
+    }
+
+    #[test]
     fn successful_convertible_archive_completion_commits_main_transition_intent() {
         let mut app = setup_app();
         let (source, before) = install_convertible_archive_main_grid(&mut app);
@@ -87844,12 +90996,15 @@ mod smart_folder_transition_tests {
             Some(&source)
         );
         assert!(!app.settings.facet_filter.is_active());
-        assert_eq!(app.facet_filter_suppression_stack.len(), 1);
-        assert_eq!(app.facet_filter_suppression_stack[0].anchor, source);
-        assert_eq!(
-            app.facet_filter_suppression_stack[0].saved_filter,
-            before.facet_filter
+        assert_eq!(app.facet_navigation.saved_frame_count(), 1);
+        let destination = FolderNavHistoryTarget::SmartFolder(
+            app.top_level_grid_view.smart_folder().unwrap().clone(),
         );
+        assert_eq!(
+            app.facet_navigation.route().current(),
+            Some(&App::facet_scope_for_location(&destination))
+        );
+        assert_eq!(*app.facet_navigation.saved_filter(0), before.facet_filter);
         assert_eq!(
             app.top_level_grid_view
                 .smart_folder()
@@ -88402,7 +91557,7 @@ mod smart_folder_transition_tests {
         std::fs::create_dir_all(&outside).unwrap();
         app.load_folder(outside.clone());
         assert!(app.top_level_grid_view.smart_folder_session().is_none());
-        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::SmartFolder(saved.clone())];
+        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::SmartFolder(saved.clone()).into()];
         assert!(app.begin_smart_history_navigation(
             saved,
             crate::app::smart_folder::SmartHistoryDirection::Back,
@@ -88487,7 +91642,7 @@ mod smart_folder_transition_tests {
         let outside = app.tmp.path().join("outside-nested-pdf");
         std::fs::create_dir_all(&outside).unwrap();
         app.load_folder(outside.clone());
-        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::SmartFolder(saved.clone())];
+        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::SmartFolder(saved.clone()).into()];
         assert!(app.begin_smart_history_navigation(
             saved,
             crate::app::smart_folder::SmartHistoryDirection::Back,
@@ -88567,7 +91722,7 @@ mod smart_folder_transition_tests {
         let outside = app.tmp.path().join("outside-nested-archive");
         std::fs::create_dir_all(&outside).unwrap();
         app.load_folder(outside.clone());
-        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::SmartFolder(saved.clone())];
+        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::SmartFolder(saved.clone()).into()];
         assert!(app.begin_smart_history_navigation(
             saved,
             crate::app::smart_folder::SmartHistoryDirection::Back,
@@ -88581,7 +91736,7 @@ mod smart_folder_transition_tests {
         assert_eq!(app.address, archive.to_string_lossy());
         assert!(matches!(app.items.as_slice(), [GridItem::ZipImage { .. }]));
         assert!(matches!(
-            app.resolve_grid_parent_nav(),
+            app.handle_grid_parent_folder_action(),
             Some(crate::ui_main::AddressBarNav::Direct(path, _))
                 if crate::folder_tree::path_eq(&path, &folder)
         ));
@@ -88731,6 +91886,7 @@ mod smart_folder_transition_tests {
         record_convertible_archive_cache(&mut app, &source, &cached);
         activate_convertible_archive_snapshot(&mut app, &source);
 
+        let source_folder = app.current_folder.clone();
         assert!(
             app.handle_gamepad_grid_accept(&egui::Context::default())
                 .is_none()
@@ -88738,13 +91894,17 @@ mod smart_folder_transition_tests {
         app.settle_open_path_classification_for_test();
 
         assert!(app.archive_convert.is_none());
+        assert_eq!(
+            app.current_folder, source_folder,
+            "source remains until usable cached rows"
+        );
+        wait_for_snapshot_archive_listing(&mut app, &cached);
         assert_eq!(app.current_folder.as_deref(), Some(cached.as_path()));
         assert_eq!(
             app.archive_source_override.as_deref(),
             Some(source.as_path())
         );
         assert!(app.is_snapshot_active());
-        wait_for_snapshot_archive_listing(&mut app, &cached);
         // Mutation `scope_cache_zip_instead_of_owned_source`: resolve snapshot ownership from
         // `cached` instead of MainGridArchiveTransitionIntent::source_path. The current-folder and
         // listing assertions fail because the common snapshot guard refuses the implementation
@@ -88759,30 +91919,54 @@ mod smart_folder_transition_tests {
         write_convert_completion_zip(&cached);
         activate_convertible_archive_snapshot(&mut app, &source);
 
+        let source_folder = app.current_folder.clone();
         assert!(
             app.handle_gamepad_grid_accept(&egui::Context::default())
                 .is_none()
         );
         app.settle_open_path_classification_for_test();
+        let request_id = match app.top_level_grid_view.history_navigation_transition() {
+            Some(super::HistoryNavigationTransition::Physical(request)) => request.request_id,
+            _ => panic!("snapshot archive open must retain a typed physical owner"),
+        };
+        super::phase_c_folder_nav_history_tests::replace_physical_history_preflight_for_test(
+            &mut app,
+            crate::app::collection_navigation::PhysicalHistoryPreflightPayload::ConvertibleArchive(
+                crate::archive_converter::ArchiveImageSummary {
+                    image_count: 1,
+                    total_uncompressed_bytes: 1,
+                    nested_archive_count: 0,
+                },
+            ),
+        );
+        app.poll_collection_history_transition(&egui::Context::default());
+        assert!(
+            matches!(app.top_level_grid_view.history_navigation_transition(),
+            Some(super::HistoryNavigationTransition::Physical(request))
+                if request.request_id == request_id
+                    && matches!(request.phase, super::PhysicalHistoryPhase::ArchiveConverting))
+        );
+        assert_eq!(app.current_folder, source_folder);
         assert!(matches!(
             app.archive_convert.as_ref().map(|state| &state.completion),
-            Some(
-                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::MainGridArchive(
-                    _
-                )
-            )
+            Some(crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::StagedHistory(id))
+                if *id == request_id
         ));
 
         publish_convert_done_and_open(&mut app, &cached);
 
         assert!(app.archive_convert.is_none());
+        assert_eq!(
+            app.current_folder, source_folder,
+            "source remains until usable cached rows"
+        );
+        wait_for_snapshot_archive_listing(&mut app, &cached);
         assert_eq!(app.current_folder.as_deref(), Some(cached.as_path()));
         assert_eq!(
             app.archive_source_override.as_deref(),
             Some(source.as_path())
         );
         assert!(app.is_snapshot_active());
-        wait_for_snapshot_archive_listing(&mut app, &cached);
         // The same `scope_cache_zip_instead_of_owned_source` mutation reaches this test through
         // ConvertDone -> pending_nav -> load_folder_with_scan_owned and leaves the source grid
         // mounted instead of opening the completed archive.
@@ -88884,13 +92068,13 @@ mod smart_folder_transition_tests {
     }
 
     #[test]
-    fn rar_direct_navigation_generation_swap_restores_history_on_scope_refusal() {
+    fn rar_direct_navigation_generation_swap_preserves_history_on_scope_refusal() {
         let mut app = setup_app();
         let root = app.tmp.path().join("rar-navigation-generation-swap");
         std::fs::create_dir_all(&root).unwrap();
         let stale_source = root.join("history-generation-n.rar");
         let current_source = root.join("history-generation-n-plus-one.rar");
-        std::fs::write(&stale_source, b"stale rar").unwrap();
+        write_convert_completion_zip(&stale_source);
         std::fs::write(&current_source, b"current rar").unwrap();
         app.current_folder = Some(root.clone());
         app.items = vec![
@@ -88912,34 +92096,20 @@ mod smart_folder_transition_tests {
 
         let slot = QuickFolderSlotId::A;
         app.quick_folder_workspaces[slot.index()].history.back_stack =
-            vec![FolderNavHistoryTarget::Path(stale_source.clone())];
+            vec![FolderNavHistoryTarget::Path(stale_source.clone()).into()];
         app.quick_folder_workspaces[slot.index()]
             .history
             .forward_stack
             .clear();
-        let rollback = app.folder_nav_history_snapshot();
+        let before = app.folder_nav_history_snapshot();
+        install_staged_history_rar_completion(&mut app, &stale_source);
         assert_eq!(
-            app.navigate_folder_history_back(),
-            Some(FolderNavHistoryTarget::Path(stale_source.clone()))
-        );
-        assert!(
-            app.quick_folder_workspaces[slot.index()]
-                .history
-                .back_stack
-                .is_empty()
+            app.folder_nav_history_snapshot().back_stack,
+            before.back_stack
         );
         assert_eq!(
-            app.quick_folder_workspaces[slot.index()]
-                .history
-                .forward_stack,
-            vec![root.clone()]
-        );
-        install_pending_direct_rar_completion_with_policy(
-            &mut app,
-            &stale_source,
-            false,
-            crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
-            Some(rollback),
+            app.folder_nav_history_snapshot().forward_stack,
+            before.forward_stack
         );
 
         app.deactivate_snapshot();
@@ -88958,6 +92128,12 @@ mod smart_folder_transition_tests {
             app.show_archive_convert_dialog(ctx);
         });
 
+        super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_none()
+        );
         assert!(app.archive_convert.is_none());
         assert_eq!(app.current_folder.as_deref(), Some(root.as_path()));
         assert!(app.zip_enumerate_pending.is_none());
@@ -88971,8 +92147,7 @@ mod smart_folder_transition_tests {
                 .forward_stack
                 .is_empty()
         );
-        // Mutation `omit_rar_direct_scope_refusal_history_restore`: drop the refusal branch's
-        // restore call. The post-click empty back stack and root-bearing forward stack remain.
+        // The typed cursor is committed only when source proof and usable listing both pass.
     }
 
     #[test]
@@ -88981,7 +92156,12 @@ mod smart_folder_transition_tests {
         let root = app.tmp.path().join("rar-navigation-current-generation");
         std::fs::create_dir_all(&root).unwrap();
         let source = root.join("history-in-scope.rar");
-        std::fs::write(&source, b"direct rar").unwrap();
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testdata/archives/multiwindow-rar-nav/01-direct.rar"),
+            &source,
+        )
+        .unwrap();
         app.current_folder = Some(root.clone());
         app.items = vec![GridItem::ConvertibleArchive {
             path: source.clone(),
@@ -88996,34 +92176,20 @@ mod smart_folder_transition_tests {
 
         let slot = QuickFolderSlotId::A;
         app.quick_folder_workspaces[slot.index()].history.back_stack =
-            vec![FolderNavHistoryTarget::Path(source.clone())];
+            vec![FolderNavHistoryTarget::Path(source.clone()).into()];
         app.quick_folder_workspaces[slot.index()]
             .history
             .forward_stack
             .clear();
-        let rollback = app.folder_nav_history_snapshot();
+        let before = app.folder_nav_history_snapshot();
+        install_staged_history_rar_completion(&mut app, &source);
         assert_eq!(
-            app.navigate_folder_history_back(),
-            Some(FolderNavHistoryTarget::Path(source.clone()))
-        );
-        assert!(
-            app.quick_folder_workspaces[slot.index()]
-                .history
-                .back_stack
-                .is_empty()
+            app.folder_nav_history_snapshot().back_stack,
+            before.back_stack
         );
         assert_eq!(
-            app.quick_folder_workspaces[slot.index()]
-                .history
-                .forward_stack,
-            vec![root.clone()]
-        );
-        install_pending_direct_rar_completion_with_policy(
-            &mut app,
-            &source,
-            false,
-            crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
-            Some(rollback),
+            app.folder_nav_history_snapshot().forward_stack,
+            before.forward_stack
         );
 
         let ctx = egui::Context::default();
@@ -89032,8 +92198,13 @@ mod smart_folder_transition_tests {
         });
 
         assert!(app.archive_convert.is_none());
+        assert_eq!(app.current_folder.as_deref(), Some(root.as_path()));
+        assert_eq!(
+            app.folder_nav_history_snapshot().back_stack,
+            before.back_stack
+        );
+        super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
         assert_eq!(app.current_folder.as_deref(), Some(source.as_path()));
-        assert!(app.zip_enumerate_pending.is_some());
         assert!(
             app.quick_folder_workspaces[slot.index()]
                 .history
@@ -89046,8 +92217,7 @@ mod smart_folder_transition_tests {
                 .forward_stack,
             vec![root]
         );
-        // Mutation `restore_rar_direct_history_unconditionally`: apply the rollback before the
-        // scope decision. The successful click is undone to back=[source], forward=[].
+        // The typed cursor is committed only when source proof and usable listing both pass.
     }
 
     #[test]
@@ -89196,13 +92366,13 @@ mod smart_folder_transition_tests {
         assert!(app.address.contains("entry"));
         assert!(app.address.contains("child"));
         assert!(matches!(
-            app.resolve_grid_parent_nav(),
+            app.handle_grid_parent_folder_action(),
             Some(crate::ui_main::AddressBarNav::Direct(path, _))
                 if crate::folder_tree::path_eq(&path, &entry)
         ));
         app.open_staged_smart_folder_and_wait(&ctx, &entry);
         assert!(matches!(
-            app.resolve_grid_parent_nav(),
+            app.handle_grid_parent_folder_action(),
             Some(crate::ui_main::AddressBarNav::Direct(path, _))
                 if crate::folder_tree::path_eq(&path, &synthetic)
         ));
@@ -89255,26 +92425,23 @@ mod smart_folder_transition_tests {
         app.load_folder(child.clone());
         wait_for_smart_folder_scope(&mut app, &ctx, &child);
 
-        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(normal.clone())];
-        let back = app.navigate_folder_history_back().expect("history back");
-        assert_eq!(back, normal);
+        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(normal.clone()).into()];
         assert_eq!(
-            app.dispatch_synthetic_folder_history_target(&back),
-            super::SyntheticFolderHistoryDispatch::NotSynthetic
+            app.folder_history_back_target(),
+            Some(&FolderNavHistoryTarget::Path(normal.clone()))
         );
-        app.load_folder(back.into_path().expect("real folder target"));
+        app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
+        super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
         let forward = app
-            .navigate_folder_history_forward()
-            .expect("history forward");
+            .folder_history_forward_entry()
+            .expect("history forward")
+            .clone();
         assert!(matches!(
-            &forward,
+            &forward.location,
             FolderNavHistoryTarget::SmartFolder(state)
                 if state.scoped_current() == Some(child.as_path())
         ));
-        assert_eq!(
-            app.dispatch_synthetic_folder_history_target(&forward),
-            super::SyntheticFolderHistoryDispatch::Restored
-        );
+        app.dispatch_main_folder_history_input(FolderHistoryDirection::Forward);
         wait_for_smart_folder_scope(&mut app, &ctx, &child);
         assert!(app.top_level_grid_view.smart_folder_session().is_some());
     }
@@ -89374,7 +92541,7 @@ mod smart_folder_transition_tests {
         app.scroll_offset_y = 900.0;
         app.scroll_to_selected = false;
         app.open_staged_smart_folder_and_wait(&ctx, entry);
-        let parent = match app.resolve_grid_parent_nav() {
+        let parent = match app.handle_grid_parent_folder_action() {
             Some(crate::ui_main::AddressBarNav::Direct(path, _)) => path,
             other => panic!("Backspace must resolve to smart root: {other:?}"),
         };
@@ -89418,7 +92585,7 @@ mod smart_folder_transition_tests {
         assert!(app.begin_staged_smart_drill(&pdf));
         finish_smart_pdf_enumeration(&mut app, &pdf);
 
-        let parent = match app.resolve_grid_parent_nav() {
+        let parent = match app.handle_grid_parent_folder_action() {
             Some(crate::ui_main::AddressBarNav::Direct(path, _)) => path,
             other => panic!("Backspace must resolve to smart root: {other:?}"),
         };
@@ -89852,19 +93019,15 @@ mod smart_folder_transition_tests {
             !app.folder_nav_back_stack
                 .iter()
                 .chain(app.folder_nav_forward_stack.iter())
-                .any(|target| matches!(target, FolderNavHistoryTarget::Path(path) if path == &pdf))
+                .any(|target| matches!(&target.location, FolderNavHistoryTarget::Path(path) if path == &pdf))
         );
 
-        let mut rollback = Some(app.folder_nav_history_snapshot());
-        let forward = app
-            .navigate_folder_history_forward()
-            .expect("forward to normal folder");
-        assert_eq!(forward, normal);
         assert_eq!(
-            app.dispatch_synthetic_folder_history_target_with_rollback(&forward, &mut rollback),
-            super::SyntheticFolderHistoryDispatch::NotSynthetic
+            app.folder_history_forward_target(),
+            Some(&FolderNavHistoryTarget::Path(normal.clone()))
         );
-        app.load_folder(forward.into_path().unwrap());
+        app.dispatch_main_folder_history_input(FolderHistoryDirection::Forward);
+        super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
         assert!(app.top_level_grid_view.smart_folder_session().is_none());
         assert!(
             matches!(app.folder_history_back_target(), Some(FolderNavHistoryTarget::SmartFolder(state)) if matches!(state.position, SmartFolderPosition::Container { .. }))
@@ -91238,9 +94401,11 @@ mod smart_folder_transition_tests {
         std::fs::create_dir_all(&normal).unwrap();
         std::fs::create_dir_all(source_a.join("book-a")).unwrap();
         std::fs::create_dir_all(source_b.join("book-b")).unwrap();
+        app.current_folder = Some(normal.clone());
+        app.open_favsearch();
         app.current_folder = Some(super::search_results_synthetic_path());
-        app.favsearch.active = true;
-        app.favsearch.saved_folder = Some(normal.clone());
+        assert!(app.favsearch.active);
+        assert_eq!(app.favsearch.saved_folder.as_ref(), Some(&normal));
         let a = definition("A", source_a);
         let b = definition("B", source_b);
         let a_id = a.id;
@@ -91320,21 +94485,25 @@ mod smart_folder_transition_tests {
             match incoming {
                 SearchMode::LocalMeta => {
                     assert!(app.show_search_bar);
+                    super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
                     assert_eq!(app.current_folder.as_ref(), Some(&normal));
                 }
                 SearchMode::Favsearch => {
                     assert_eq!(app.favsearch.saved_folder.as_ref(), Some(&normal));
                     app.close_favsearch();
+                    super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
                     assert_eq!(app.current_folder.as_ref(), Some(&normal));
                 }
                 SearchMode::Global => {
                     assert_eq!(app.global_search.saved_folder.as_ref(), Some(&normal));
                     app.close_global_search();
+                    super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
                     assert_eq!(app.current_folder.as_ref(), Some(&normal));
                 }
                 SearchMode::TagView => {
                     assert_eq!(app.tag_view.saved_folder.as_ref(), Some(&normal));
                     app.close_tag_view();
+                    super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
                     assert_eq!(app.current_folder.as_ref(), Some(&normal));
                 }
             }
@@ -91460,26 +94629,20 @@ mod smart_folder_transition_tests {
                 Some(FolderNavHistoryTarget::SmartFolder(state)) if state.definition_id == a_id
             ));
 
-            let back = app.navigate_folder_history_back().unwrap();
+            let back = app.folder_history_back_entry().unwrap().clone();
             assert!(matches!(
-                &back,
+                &back.location,
                 FolderNavHistoryTarget::SmartFolder(state) if state.definition_id == a_id
             ));
-            assert_eq!(
-                app.dispatch_synthetic_folder_history_target(&back),
-                super::SyntheticFolderHistoryDispatch::Restored
-            );
+            app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
             wait_for_smart_folder_idle(&mut app, &ctx, a_id);
 
-            let forward = app.navigate_folder_history_forward().unwrap();
+            let forward = app.folder_history_forward_entry().unwrap().clone();
             assert!(matches!(
-                &forward,
+                &forward.location,
                 FolderNavHistoryTarget::SmartFolder(state) if state.definition_id == b_id
             ));
-            assert_eq!(
-                app.dispatch_synthetic_folder_history_target(&forward),
-                super::SyntheticFolderHistoryDispatch::Restored
-            );
+            app.dispatch_main_folder_history_input(FolderHistoryDirection::Forward);
             wait_for_smart_folder_idle(&mut app, &ctx, b_id);
         }
     }
@@ -91804,12 +94967,9 @@ mod smart_folder_transition_tests {
         assert!(app.folder_nav_subfolder_restore.is_some());
         assert!(app.grid_parent_nav_target().is_none());
 
-        let back = app.navigate_folder_history_back().unwrap();
+        let back = app.folder_history_back_entry().unwrap().clone();
         assert_eq!(back, super::subfolder_expansion_synthetic_path());
-        assert_eq!(
-            app.dispatch_synthetic_folder_history_target(&back),
-            super::SyntheticFolderHistoryDispatch::Restored
-        );
+        app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
         app.finish_subfolder_expansion_prepare_for_test();
         assert!(app.items_are_subfolder_expansion_view);
         assert!(
@@ -91818,15 +94978,12 @@ mod smart_folder_transition_tests {
                 .any(|item| matches!(item, GridItem::Image(path) if path == &image))
         );
 
-        let forward = app.navigate_folder_history_forward().unwrap();
+        let forward = app.folder_history_forward_entry().unwrap().clone();
         assert!(matches!(
-            &forward,
+            &forward.location,
             FolderNavHistoryTarget::SmartFolder(state) if state.definition_id == id
         ));
-        assert_eq!(
-            app.dispatch_synthetic_folder_history_target(&forward),
-            super::SyntheticFolderHistoryDispatch::Restored
-        );
+        app.dispatch_main_folder_history_input(FolderHistoryDirection::Forward);
         wait_for_smart_folder(&mut app, &ctx, id);
     }
 
@@ -91862,10 +95019,7 @@ mod smart_folder_transition_tests {
             Some(&FolderNavHistoryTarget::Path(normal.clone()))
         );
         assert!(app.facet_filter_suppressed());
-        assert_eq!(
-            app.facet_filter_suppression_stack.last().map(|s| &s.anchor),
-            Some(&a_path)
-        );
+        assert_eq!(app.facet_navigation.saved_frame_count(), 1);
         assert_eq!(
             app.rating_filter_suppressed_at
                 .as_ref()
@@ -91880,10 +95034,7 @@ mod smart_folder_transition_tests {
             Some(FolderNavHistoryTarget::SmartFolder(state)) if state.definition_id == a_id
         ));
         assert!(!app.settings.facet_filter.is_active());
-        assert_eq!(
-            app.facet_filter_suppression_stack.last().map(|s| &s.anchor),
-            Some(&b_path)
-        );
+        assert_eq!(app.facet_navigation.saved_frame_count(), 1);
         assert_eq!(
             app.rating_filter_suppressed_at
                 .as_ref()
@@ -91899,7 +95050,7 @@ mod smart_folder_transition_tests {
         app.items_are_subfolder_expansion_view = true;
         app.subfolder_expansion_root = Some(root.clone());
         app.subfolder_expansion_roots = vec![root];
-        app.search_filter = Some(std::collections::HashSet::new());
+        app.search_filter = Some(std::collections::HashSet::new().into());
 
         let error = app
             .smart_folder_current_rule_source()
@@ -91940,6 +95091,7 @@ fn subfolder_display_prepare_blocks_background_input() {
     let root = PathBuf::from(r"C:\photos");
     let (_tx, rx) = std::sync::mpsc::channel();
     app.subfolder_expansion_pending = Some(subfolder_expansion::SubfolderExpansionPending {
+        navigation: None,
         root: root.clone(),
         roots: vec![root.clone()],
         cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -91951,6 +95103,7 @@ fn subfolder_display_prepare_blocks_background_input() {
     app.subfolder_expansion_pending = None;
     app.subfolder_expansion_confirm_pending =
         Some(subfolder_expansion::SubfolderExpansionConfirmPending {
+            navigation: None,
             snapshot: subfolder_expansion::SubfolderExpansionSnapshot {
                 root: root.clone(),
                 roots: vec![root],
@@ -91972,6 +95125,7 @@ fn subfolder_display_prepare_blocks_background_input() {
     let (_tx, rx) = std::sync::mpsc::channel();
     app.subfolder_expansion_install_pending =
         Some(subfolder_expansion::SubfolderExpansionInstallPending {
+            navigation: None,
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rx,
             progress: subfolder_expansion::SubfolderExpansionPrepareProgress {
@@ -99277,3 +102431,1149 @@ fn section1335_direct_zip_exit_restart_keeps_explicit_parent_list() {
 
 #[path = "tests/startup_restore.rs"]
 mod startup_restore_tests;
+
+mod background_click_scroll_regression_tests {
+    use super::*;
+    use egui_kittest::Harness;
+
+    struct State {
+        app: AppTestEnvForTest,
+        navs: Vec<crate::ui_main::AddressBarNav>,
+        wheels_consumed: Vec<bool>,
+        parent_return_scroll: Vec<f32>,
+    }
+
+    fn install_items(app: &mut App, folder: &Path, count: usize) {
+        app.current_folder = Some(folder.to_path_buf());
+        app.items = (0..count)
+            .map(|idx| GridItem::ZipFile(folder.join(format!("book-{idx:03}.zip"))))
+            .collect();
+        app.visible_indices = (0..count).collect();
+        app.thumbnails = vec![ThumbnailState::Pending; count];
+        app.image_metas = vec![None; count];
+    }
+
+    fn harness(app: AppTestEnvForTest) -> Harness<'static, State> {
+        let mut fonts_set = false;
+        Harness::builder()
+            .with_size(egui::vec2(2000.0, 480.0))
+            .with_step_dt(0.01)
+            .build_state(
+                move |ctx, state| {
+                    if !fonts_set {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_set = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    state.app.begin_grid_click_input_frame(ctx);
+                    // Match App::update: the wheel owner runs before render_grid.
+                    let had_wheel = ctx.input(|input| input.raw_scroll_delta.y.abs() > 0.5);
+                    state.app.process_scroll(ctx);
+                    if had_wheel {
+                        assert_eq!(ctx.input(|input| input.raw_scroll_delta), egui::Vec2::ZERO);
+                        assert!(!ctx.input(|input| {
+                            input
+                                .events
+                                .iter()
+                                .any(|event| matches!(event, egui::Event::MouseWheel { .. }))
+                        }));
+                        state
+                            .wheels_consumed
+                            .push(ctx.input(|input| input.modifiers.ctrl));
+                    }
+                    let old_folder = state.app.current_folder.clone();
+                    if let Some(nav) = state.app.render_grid(ctx) {
+                        state.navs.push(nav);
+                    }
+                    if state.app.current_folder != old_folder {
+                        state.parent_return_scroll.push(state.app.scroll_offset_y);
+                    }
+                },
+                State {
+                    app,
+                    navs: Vec::new(),
+                    wheels_consumed: Vec::new(),
+                    parent_return_scroll: Vec::new(),
+                },
+            )
+    }
+
+    fn click(harness: &mut Harness<'_, State>, pos: egui::Pos2) {
+        harness.hover_at(pos);
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        harness.step();
+    }
+
+    fn wheel_breaks_pair(view: crate::settings::GridViewMode) {
+        for ctrl in [false, true] {
+            let mut app = setup_app_for_test();
+            let child = app.tmp.path().join("child");
+            install_items(&mut app, &child, 1);
+            app.settings.grid_view_mode = view;
+            // Ctrl+wheel is still accepted at the column limit, without saving a change.
+            app.settings.grid_cols = crate::settings::MAX_GRID_COLS;
+            app.settings.grid_background_double_click_parent = true;
+            let mut harness = harness(app);
+            harness
+                .ctx
+                .options_mut(|options| options.input_options.max_double_click_delay = 5.0);
+            harness.run_steps(6);
+            let pos = egui::pos2(30.0, 430.0);
+            click(&mut harness, pos);
+            assert!(harness.state().navs.is_empty());
+            let modifiers = egui::Modifiers {
+                ctrl,
+                ..egui::Modifiers::NONE
+            };
+            harness.event_modifiers(
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, -1.0),
+                    modifiers,
+                },
+                modifiers,
+            );
+            harness.step();
+            assert_eq!(harness.state().wheels_consumed, vec![ctrl]);
+            click(&mut harness, pos);
+            assert!(
+                harness.state().navs.is_empty(),
+                "consumed wheel must break the pair: {view:?}, ctrl={ctrl}"
+            );
+            // This click was the first in a new pair, rather than disabling the feature.
+            click(&mut harness, pos);
+            assert_eq!(harness.state().navs.len(), 1);
+        }
+    }
+
+    fn snapshot_return_keeps_new_scroll(view: crate::settings::GridViewMode) {
+        let mut app = setup_app_for_test();
+        let origin = app.tmp.path().join("origin");
+        install_items(&mut app, &origin, 240);
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        assert!(app.is_snapshot_active());
+        install_items(&mut app, &origin.join("child"), 41);
+        app.settings.grid_view_mode = view;
+        app.settings.grid_cols = 4;
+        app.settings.grid_background_double_click_parent = true;
+        app.scroll_offset_y = 100_000.0;
+        let mut harness = harness(app);
+        harness
+            .ctx
+            .options_mut(|options| options.input_options.max_double_click_delay = 5.0);
+        harness.run_steps(6);
+        let old_offset = harness.state().app.scroll_offset_y;
+        assert!(old_offset > 100.0);
+        // The snapped end extent includes unowned background below the last row.
+        let body_top = if view == crate::settings::GridViewMode::Details {
+            38.0
+        } else {
+            8.0
+        };
+        let pos = egui::pos2(30.0, body_top + harness.state().app.last_viewport_h - 1.0);
+        assert!(pos.y < 480.0);
+        click(&mut harness, pos);
+        assert_eq!(
+            harness.state().app.current_folder.as_ref(),
+            Some(&origin.join("child"))
+        );
+        assert!(harness.state().parent_return_scroll.is_empty());
+        click(&mut harness, pos);
+        assert_eq!(harness.state().app.current_folder.as_ref(), Some(&origin));
+        assert_eq!(harness.state().app.items.len(), 240);
+        assert_eq!(
+            harness.state().parent_return_scroll,
+            vec![0.0],
+            "old {view:?} ScrollArea offset {old_offset} must not overwrite the restored list"
+        );
+        assert_eq!(harness.state().app.scroll_offset_y, 0.0);
+        harness.run_steps(6);
+        assert_eq!(
+            harness.state().app.scroll_offset_y,
+            0.0,
+            "long restored list must remain at its own position"
+        );
+    }
+
+    #[test]
+    fn background_scroll_consumed_wheel_thumbnail_breaks_pair() {
+        wheel_breaks_pair(crate::settings::GridViewMode::Thumbnail);
+    }
+
+    #[test]
+    fn background_scroll_consumed_wheel_details_breaks_pair() {
+        wheel_breaks_pair(crate::settings::GridViewMode::Details);
+    }
+
+    #[test]
+    fn background_scroll_snapshot_return_thumbnail_keeps_new_offset() {
+        snapshot_return_keeps_new_scroll(crate::settings::GridViewMode::Thumbnail);
+    }
+
+    #[test]
+    fn background_scroll_snapshot_return_details_keeps_new_offset() {
+        snapshot_return_keeps_new_scroll(crate::settings::GridViewMode::Details);
+    }
+
+    fn letterbox_harness(size: [usize; 2]) -> Harness<'static, State> {
+        let mut app = setup_app_for_test();
+        let child = app.tmp.path().join("child");
+        install_items(&mut app, &child, 1);
+        app.settings.grid_cols = 4;
+        app.settings.grid_background_double_click_parent = true;
+        app.selected = Some(0);
+        let mut harness = harness(app);
+        harness.run_steps(6);
+        let tex = harness.ctx.load_texture(
+            "letterbox-test",
+            egui::ColorImage::filled(size, egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        harness.state_mut().app.thumbnails[0] = ThumbnailState::Loaded {
+            tex,
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+            from_edit_preview: false,
+            rendered_at_px: size[0].max(size[1]) as u32,
+            source_dims: None,
+            layout_dims: None,
+        };
+        harness.run_steps(6);
+        harness
+    }
+
+    #[test]
+    fn letterbox_real_grid_portrait_single_click_clears_selection() {
+        let mut harness = letterbox_harness([40, 120]);
+        let pos = egui::pos2(13.0, 8.0 + harness.state().app.last_cell_h * 0.5);
+        click(&mut harness, pos);
+        assert_eq!(harness.state().app.selected, None);
+    }
+
+    #[test]
+    fn letterbox_real_grid_portrait_double_click_requests_parent() {
+        let mut harness = letterbox_harness([40, 120]);
+        let parent = harness.state().app.tmp.path().to_path_buf();
+        let pos = egui::pos2(13.0, 8.0 + harness.state().app.last_cell_h * 0.5);
+        click(&mut harness, pos);
+        click(&mut harness, pos);
+        assert_eq!(harness.state().navs.len(), 1);
+        assert!(
+            matches!(&harness.state().navs[0], crate::ui_main::AddressBarNav::Direct(path, _) if path == &parent)
+        );
+    }
+
+    fn cell_rect(harness: &Harness<'_, State>) -> egui::Rect {
+        egui::Rect::from_min_size(
+            egui::pos2(8.0, 8.0),
+            egui::vec2(
+                harness.state().app.last_cell_size,
+                harness.state().app.last_cell_h,
+            ),
+        )
+    }
+
+    #[test]
+    fn letterbox_real_grid_landscape_and_cell_padding_are_background() {
+        for padding in [false, true] {
+            let mut harness = letterbox_harness([120, 40]);
+            let rect = cell_rect(&harness);
+            let pos = if padding {
+                rect.min + egui::vec2(1.0, rect.height() * 0.5)
+            } else {
+                rect.min + egui::vec2(rect.width() * 0.5, 5.0)
+            };
+            click(&mut harness, pos);
+            assert_eq!(harness.state().app.selected, None);
+            click(&mut harness, pos);
+            assert!(matches!(
+                harness.state().navs.as_slice(),
+                [crate::ui_main::AddressBarNav::Direct(_, _)]
+            ));
+        }
+    }
+
+    #[test]
+    fn letterbox_real_grid_image_and_filename_remain_item_areas() {
+        for filename in [false, true] {
+            let mut harness = letterbox_harness([40, 120]);
+            let rect = cell_rect(&harness);
+            let painter = harness.ctx.layer_painter(egui::LayerId::background());
+            let app = &harness.state().app;
+            let layout = crate::app::layout_cell_overlays(
+                &painter,
+                rect,
+                Default::default(),
+                0,
+                &app.items[0],
+                &app.thumbnails[0],
+                &[],
+                None,
+                false,
+                app.settings.video_thumbnail_indicator,
+                app.settings.audio_thumbnail_indicator,
+                false,
+                None,
+                None,
+                app.settings.thumb_show_resume_meter,
+            );
+            let pos = if filename {
+                layout
+                    .bottom_left
+                    .filename
+                    .as_ref()
+                    .expect("filename plate")
+                    .rect
+                    .center()
+            } else {
+                rect.center()
+            };
+            harness.state_mut().app.selected = None;
+            click(&mut harness, pos);
+            assert_eq!(harness.state().app.selected, Some(0));
+            click(&mut harness, pos);
+            assert!(matches!(
+                harness.state().navs.as_slice(),
+                [crate::ui_main::AddressBarNav::GridVirtual(_)]
+            ));
+        }
+    }
+
+    #[test]
+    fn letterbox_real_grid_disabled_preserves_whole_cell_open() {
+        let mut harness = letterbox_harness([40, 120]);
+        harness
+            .state_mut()
+            .app
+            .settings
+            .grid_background_double_click_parent = false;
+        harness.state_mut().app.selected = None;
+        let pos = cell_rect(&harness).min + egui::vec2(5.0, cell_rect(&harness).height() * 0.5);
+        click(&mut harness, pos);
+        assert_eq!(harness.state().app.selected, Some(0));
+        click(&mut harness, pos);
+        assert!(matches!(
+            harness.state().navs.as_slice(),
+            [crate::ui_main::AddressBarNav::GridVirtual(_)]
+        ));
+    }
+
+    #[test]
+    fn letterbox_real_grid_mixed_clicks_in_same_cell_do_not_pair() {
+        for image_first in [true, false] {
+            let mut harness = letterbox_harness([40, 120]);
+            let image = cell_rect(&harness).center();
+            let background =
+                cell_rect(&harness).min + egui::vec2(5.0, cell_rect(&harness).height() * 0.5);
+            let (first, second) = if image_first {
+                (image, background)
+            } else {
+                (background, image)
+            };
+            click(&mut harness, first);
+            click(&mut harness, second);
+            assert!(harness.state().navs.is_empty());
+            click(&mut harness, second);
+            assert_eq!(harness.state().navs.len(), 1);
+            assert_eq!(
+                matches!(
+                    harness.state().navs[0],
+                    crate::ui_main::AddressBarNav::Direct(_, _)
+                ),
+                image_first
+            );
+        }
+    }
+
+    #[test]
+    fn letterbox_real_grid_press_release_targets_and_separate_frames() {
+        for image_first in [true, false] {
+            let mut harness = letterbox_harness([40, 120]);
+            // Cross a boundary by less than egui's max_click_dist so the release is a click.
+            let cell = cell_rect(&harness);
+            let image_left = cell.center().x - (cell.height() - 8.0) / 6.0;
+            let inside = egui::pos2(image_left + 1.0, cell.center().y);
+            let outside = egui::pos2(image_left - 1.0, cell.center().y);
+            let (press, release) = if image_first {
+                (inside, outside)
+            } else {
+                (outside, inside)
+            };
+            harness.state_mut().app.selected = None;
+            harness.hover_at(press);
+            harness.event(egui::Event::PointerButton {
+                pos: press,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.step();
+            harness.hover_at(release);
+            harness.event(egui::Event::PointerButton {
+                pos: release,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.step();
+            assert_eq!(harness.state().app.selected, None);
+            click(&mut harness, release);
+            assert!(harness.state().navs.is_empty());
+            click(&mut harness, release);
+            assert_eq!(harness.state().navs.len(), 1);
+        }
+    }
+
+    #[test]
+    fn letterbox_real_grid_rotation_and_dpi_follow_drawn_image() {
+        for ppp in [1.0, 1.25, 2.0] {
+            let mut harness = letterbox_harness([40, 120]);
+            harness.ctx.set_pixels_per_point(ppp);
+            harness
+                .state_mut()
+                .app
+                .rotation_cache
+                .insert(0, crate::rotation_db::Rotation::Cw90);
+            harness.run_steps(6);
+            let rect = cell_rect(&harness);
+            // Rotated landscape texture leaves a top letterbox rather than a side letterbox.
+            let background = rect.min + egui::vec2(rect.width() * 0.5, 5.0);
+            click(&mut harness, background);
+            assert_eq!(harness.state().app.selected, None, "DPI {ppp}");
+            click(&mut harness, rect.center());
+            assert_eq!(harness.state().app.selected, Some(0), "DPI {ppp}");
+            assert!(harness.state().navs.is_empty());
+        }
+    }
+
+    #[test]
+    fn letterbox_real_grid_loaded_media_and_folder_variants() {
+        let kinds: Vec<GridItem> = vec![
+            GridItem::Image("picture.png".into()),
+            GridItem::Video("movie.mp4".into()),
+            GridItem::Folder("folder".into()),
+            GridItem::PdfFile("book.pdf".into()),
+            GridItem::ConvertibleArchive {
+                path: "book.rar".into(),
+                format: crate::archive_converter::ArchiveFormat::Rar,
+            },
+            GridItem::ZipImage {
+                zip_path: "book.zip".into(),
+                entry_name: "page.png".into(),
+            },
+            GridItem::PdfPage {
+                pdf_path: "book.pdf".into(),
+                page_num: 0,
+                content_type: None,
+            },
+            GridItem::ZipDir {
+                zip_path: "book.zip".into(),
+                dir_prefix: "chapter/".into(),
+                is_archive: false,
+                representative: Some("chapter/page.png".into()),
+            },
+            GridItem::ZipDir {
+                zip_path: "book.zip".into(),
+                dir_prefix: "nested.zip/".into(),
+                is_archive: true,
+                representative: Some("nested.zip/page.png".into()),
+            },
+            GridItem::Stack {
+                key: "page".into(),
+                representative: "page01.png".into(),
+                count: 3,
+            },
+        ];
+        for item in kinds {
+            let mut harness = letterbox_harness([40, 120]);
+            harness.state_mut().app.items[0] = item.clone();
+            harness.state_mut().app.selected = None;
+            harness.run_steps(4);
+            let rect = cell_rect(&harness);
+            let background = rect.min + egui::vec2(5.0, rect.height() * 0.5);
+            click(&mut harness, background);
+            assert_eq!(harness.state().app.selected, None, "{item:?}");
+            click(&mut harness, rect.center());
+            assert_eq!(harness.state().app.selected, Some(0), "{item:?}");
+            assert!(harness.state().navs.is_empty(), "{item:?}");
+        }
+    }
+
+    fn audio_art_harness(
+        indicator: crate::settings::AudioThumbnailIndicator,
+    ) -> Harness<'static, State> {
+        // Deliberately narrow: some of the drawn music mark is outside the art.
+        let mut harness = letterbox_harness([4, 120]);
+        harness.state_mut().app.items[0] = GridItem::Audio("song.mp3".into());
+        harness.state_mut().app.settings.audio_thumbnail_indicator = indicator;
+        harness.run_steps(4);
+        harness
+    }
+
+    fn audio_art_layout(
+        harness: &Harness<'_, State>,
+    ) -> crate::thumb_overlay_layout::ThumbnailOverlayLayout {
+        let app = &harness.state().app;
+        crate::app::layout_cell_overlays(
+            &harness.ctx.layer_painter(egui::LayerId::background()),
+            cell_rect(harness),
+            Default::default(),
+            0,
+            &app.items[0],
+            &app.thumbnails[0],
+            &[],
+            None,
+            false,
+            app.settings.video_thumbnail_indicator,
+            app.settings.audio_thumbnail_indicator,
+            false,
+            None,
+            None,
+            app.settings.thumb_show_resume_meter,
+        )
+    }
+
+    fn assert_audio_item_clicks(harness: &mut Harness<'_, State>, pos: egui::Pos2) {
+        harness.state_mut().app.selected = None;
+        click(harness, pos);
+        assert_eq!(harness.state().app.selected, Some(0));
+        click(harness, pos);
+        assert!(
+            harness.state().navs.is_empty(),
+            "audio item must never invoke parent navigation"
+        );
+        assert_eq!(
+            harness.state().app.fullscreen_idx,
+            Some(0),
+            "item double click still opens audio"
+        );
+    }
+
+    #[test]
+    fn letterbox_real_grid_audio_art_letterbox_is_background_for_every_indicator_and_dpi() {
+        for &indicator in crate::settings::AudioThumbnailIndicator::all() {
+            for ppp in [1.0, 1.25, 2.0] {
+                let mut harness = audio_art_harness(indicator);
+                harness.ctx.set_pixels_per_point(ppp);
+                harness.run_steps(4);
+                let cell = cell_rect(&harness);
+                let pos = cell.min + egui::vec2(5.0, cell.height() * 0.5);
+                click(&mut harness, pos);
+                assert_eq!(
+                    harness.state().app.selected,
+                    None,
+                    "{indicator:?}, DPI {ppp}"
+                );
+                click(&mut harness, pos);
+                assert!(matches!(
+                    harness.state().navs.as_slice(),
+                    [crate::ui_main::AddressBarNav::Direct(_, _)]
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn letterbox_real_grid_audio_art_and_filename_remain_item_areas() {
+        for filename in [false, true] {
+            let mut harness = audio_art_harness(crate::settings::AudioThumbnailIndicator::Hidden);
+            let cell = cell_rect(&harness);
+            let pos = if filename {
+                audio_art_layout(&harness)
+                    .bottom_left
+                    .filename
+                    .expect("drawn filename plate")
+                    .rect
+                    .center()
+            } else {
+                // Above the marker, on the actual portrait art.
+                egui::pos2(cell.center().x, cell.min.y + cell.height() * 0.25)
+            };
+            assert_audio_item_clicks(&mut harness, pos);
+        }
+    }
+
+    #[test]
+    fn letterbox_real_grid_audio_music_mark_outside_art_remains_item_area() {
+        let mut harness =
+            audio_art_harness(crate::settings::AudioThumbnailIndicator::MusicNoteIcon);
+        let cell = cell_rect(&harness);
+        let art_right = cell.center().x + (cell.height() - 8.0) * (4.0 / 120.0) * 0.5;
+        let pos = harness
+            .output()
+            .shapes
+            .iter()
+            .find_map(|clipped| {
+                let egui::Shape::Circle(circle) = &clipped.shape else {
+                    return None;
+                };
+                let color = circle.fill;
+                if color != egui::Color32::from_rgb(150, 182, 222)
+                    && color != egui::Color32::from_rgb(70, 112, 162)
+                {
+                    return None;
+                }
+                let visible = clipped
+                    .shape
+                    .visual_bounding_rect()
+                    .intersect(clipped.clip_rect)
+                    .intersect(egui::Rect::from_min_max(
+                        egui::pos2(art_right + 0.25, cell.min.y),
+                        cell.max,
+                    ));
+                visible.is_positive().then(|| visible.center())
+            })
+            .expect("the actual music note paints into the narrow art's letterbox");
+        assert_audio_item_clicks(&mut harness, pos);
+    }
+
+    #[test]
+    fn letterbox_real_grid_audio_badge_outside_art_remains_item_area() {
+        let mut harness =
+            audio_art_harness(crate::settings::AudioThumbnailIndicator::BottomLeftBadge);
+        let pos = audio_art_layout(&harness)
+            .bottom_left
+            .container
+            .expect("drawn audio badge")
+            .rect
+            .center();
+        assert!(
+            pos.x < cell_rect(&harness).center().x - 20.0,
+            "badge is outside art"
+        );
+        assert_audio_item_clicks(&mut harness, pos);
+    }
+
+    #[test]
+    fn letterbox_real_grid_audio_art_disabled_preserves_whole_cell_open_and_pair_ownership() {
+        let mut harness = audio_art_harness(crate::settings::AudioThumbnailIndicator::Hidden);
+        harness
+            .state_mut()
+            .app
+            .settings
+            .grid_background_double_click_parent = false;
+        let cell = cell_rect(&harness);
+        let pos = cell.min + egui::vec2(5.0, cell.height() * 0.5);
+        assert_audio_item_clicks(&mut harness, pos);
+        drop(harness); // Release the serialized App/settings fixture before creating the next one.
+
+        let mut harness = audio_art_harness(crate::settings::AudioThumbnailIndicator::Hidden);
+        let cell = cell_rect(&harness);
+        let image = egui::pos2(cell.center().x, cell.min.y + cell.height() * 0.25);
+        let letterbox = cell.min + egui::vec2(5.0, cell.height() * 0.5);
+        click(&mut harness, image);
+        click(&mut harness, letterbox);
+        assert!(harness.state().navs.is_empty());
+        assert_eq!(harness.state().app.fullscreen_idx, None);
+        click(&mut harness, letterbox);
+        assert!(matches!(
+            harness.state().navs.as_slice(),
+            [crate::ui_main::AddressBarNav::Direct(_, _)]
+        ));
+    }
+
+    #[test]
+    fn letterbox_real_grid_no_letterbox_for_missing_audio_or_placeholder_plates() {
+        for state in [
+            ThumbnailState::Pending,
+            ThumbnailState::Evicted,
+            ThumbnailState::NoArt,
+            ThumbnailState::Failed,
+        ] {
+            for audio in [false, true] {
+                let mut harness = letterbox_harness([40, 120]);
+                harness.state_mut().app.thumbnails[0] = state.clone();
+                if audio {
+                    harness.state_mut().app.items[0] = GridItem::Audio("song.mp3".into());
+                }
+                harness.state_mut().app.selected = None;
+                harness.run_steps(4);
+                let rect = cell_rect(&harness);
+                click(
+                    &mut harness,
+                    rect.min + egui::vec2(5.0, rect.height() * 0.5),
+                );
+                assert_eq!(harness.state().app.selected, Some(0));
+                click(
+                    &mut harness,
+                    rect.min + egui::vec2(1.0, rect.height() * 0.5),
+                );
+                assert_eq!(harness.state().app.selected, None);
+                assert!(harness.state().navs.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn letterbox_real_grid_folder_and_drive_icons_protect_only_drawn_area() {
+        for drive in [false, true] {
+            let mut harness = letterbox_harness([40, 120]);
+            harness.state_mut().app.thumbnails[0] = ThumbnailState::Pending;
+            harness.state_mut().app.items[0] = GridItem::Folder("C:\\".into());
+            harness.state_mut().app.items_are_drive_list = drive;
+            harness.state_mut().app.selected = None;
+            harness.run_steps(4);
+            let rect = cell_rect(&harness);
+            click(
+                &mut harness,
+                rect.min + egui::vec2(5.0, rect.height() * 0.5),
+            );
+            assert_eq!(harness.state().app.selected, None);
+            click(&mut harness, rect.center() - egui::vec2(0.0, 14.0));
+            assert_eq!(harness.state().app.selected, Some(0));
+            assert!(harness.state().navs.is_empty());
+        }
+    }
+
+    #[test]
+    fn letterbox_real_grid_check_mode_preserves_background_checks() {
+        let mut harness = letterbox_harness([40, 120]);
+        harness.state_mut().app.settings.grid_click_selection_mode =
+            crate::settings::GridClickSelectionMode::Check;
+        harness.state_mut().app.checked.insert(0);
+        let rect = cell_rect(&harness);
+        click(
+            &mut harness,
+            rect.min + egui::vec2(5.0, rect.height() * 0.5),
+        );
+        assert_eq!(harness.state().app.selected, Some(0));
+        assert!(harness.state().app.checked.contains(&0));
+        assert!(harness.state().navs.is_empty());
+    }
+
+    fn touch_event(harness: &mut Harness<'_, State>, phase: egui::TouchPhase, pos: egui::Pos2) {
+        harness.event(egui::Event::Touch {
+            device_id: egui::TouchDeviceId(1),
+            id: egui::TouchId(1),
+            phase,
+            pos,
+            force: None,
+        });
+        match phase {
+            egui::TouchPhase::Start => {
+                harness.event(egui::Event::PointerMoved(pos));
+                harness.event(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            egui::TouchPhase::End => {
+                harness.event(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                harness.event(egui::Event::PointerGone);
+            }
+            egui::TouchPhase::Move => harness.event(egui::Event::PointerMoved(pos)),
+            egui::TouchPhase::Cancel => harness.event(egui::Event::PointerGone),
+        }
+        harness.step();
+    }
+
+    #[test]
+    fn letterbox_real_grid_touch_double_tap_and_image_mixing() {
+        for image_first in [false, true] {
+            let mut harness = letterbox_harness([40, 120]);
+            let rect = cell_rect(&harness);
+            let background = rect.min + egui::vec2(5.0, rect.height() * 0.5);
+            let first = if image_first {
+                rect.center()
+            } else {
+                background
+            };
+            for pos in [first, background] {
+                touch_event(&mut harness, egui::TouchPhase::Start, pos);
+                touch_event(&mut harness, egui::TouchPhase::End, pos);
+            }
+            assert_eq!(harness.state().navs.len(), usize::from(!image_first));
+            if image_first {
+                touch_event(&mut harness, egui::TouchPhase::Start, background);
+                touch_event(&mut harness, egui::TouchPhase::End, background);
+                assert_eq!(harness.state().navs.len(), 1);
+            }
+            assert!(matches!(
+                harness.state().navs[0],
+                crate::ui_main::AddressBarNav::Direct(_, _)
+            ));
+        }
+    }
+
+    #[test]
+    fn letterbox_real_grid_touch_scroll_ends_pair() {
+        let mut harness = letterbox_harness([40, 120]);
+        let rect = cell_rect(&harness);
+        let pos = rect.min + egui::vec2(5.0, rect.height() * 0.5);
+        for phase in [egui::TouchPhase::Start, egui::TouchPhase::End] {
+            touch_event(&mut harness, phase, pos);
+        }
+        touch_event(&mut harness, egui::TouchPhase::Start, pos);
+        let moved = pos + egui::vec2(0.0, 40.0);
+        touch_event(&mut harness, egui::TouchPhase::Move, moved);
+        touch_event(&mut harness, egui::TouchPhase::End, moved);
+        for phase in [egui::TouchPhase::Start, egui::TouchPhase::End] {
+            touch_event(&mut harness, phase, pos);
+        }
+        assert!(harness.state().navs.is_empty());
+    }
+
+    #[test]
+    fn letterbox_real_grid_adjusted_texture_owns_its_actual_fit() {
+        let mut harness = letterbox_harness([40, 120]);
+        harness.state_mut().app.items[0] = GridItem::Image("adjusted.png".into());
+        let tex = harness.ctx.load_texture(
+            "letterbox-adjusted",
+            egui::ColorImage::filled([120, 40], egui::Color32::RED),
+            Default::default(),
+        );
+        harness.state_mut().app.thumb_adjust_tex.insert(0, tex);
+        harness.run_steps(4);
+        let rect = cell_rect(&harness);
+        let top = rect.min + egui::vec2(rect.width() * 0.5, 5.0);
+        click(&mut harness, top);
+        assert_eq!(harness.state().app.selected, None);
+        // The replacement landscape image occupies the side that the source portrait did not.
+        click(
+            &mut harness,
+            rect.min + egui::vec2(5.0, rect.height() * 0.5),
+        );
+        assert_eq!(harness.state().app.selected, Some(0));
+        assert!(harness.state().navs.is_empty());
+    }
+
+    #[test]
+    fn letterbox_real_grid_search_representative_and_label_plate() {
+        let mut harness = letterbox_harness([40, 120]);
+        harness.state_mut().app.items[0] = GridItem::SearchContainer {
+            path: "parent/child".into(),
+            kind: crate::grid_item::SearchContainerKind::Folder,
+            hit_count: 3,
+            representative: Some(crate::grid_item::ContainerRepresentative {
+                path: "page.png".into(),
+                zip_entry: None,
+                pdf_page: None,
+            }),
+        };
+        harness.run_steps(4);
+        let rect = cell_rect(&harness);
+        click(
+            &mut harness,
+            rect.min + egui::vec2(5.0, rect.height() * 0.3),
+        );
+        assert_eq!(harness.state().app.selected, None);
+        click(
+            &mut harness,
+            rect.min + egui::vec2(5.0, rect.height() * 0.8),
+        );
+        assert_eq!(harness.state().app.selected, Some(0));
+        assert!(harness.state().navs.is_empty());
+    }
+
+    #[test]
+    fn letterbox_real_grid_format_and_check_badges_remain_item_areas() {
+        for check in [false, true] {
+            let mut harness = letterbox_harness([40, 120]);
+            let rect = cell_rect(&harness);
+            if check {
+                harness.state_mut().app.checked.insert(0);
+            }
+            let painter = harness.ctx.layer_painter(egui::LayerId::background());
+            let app = &harness.state().app;
+            let layout = crate::app::layout_cell_overlays(
+                &painter,
+                rect,
+                Default::default(),
+                0,
+                &app.items[0],
+                &app.thumbnails[0],
+                &[],
+                None,
+                false,
+                app.settings.video_thumbnail_indicator,
+                app.settings.audio_thumbnail_indicator,
+                check,
+                None,
+                None,
+                app.settings.thumb_show_resume_meter,
+            );
+            let pos = if check {
+                layout.check.expect("check badge").center()
+            } else {
+                layout
+                    .bottom_left
+                    .container
+                    .as_ref()
+                    .expect("ZIP badge")
+                    .rect
+                    .center()
+            };
+            harness.state_mut().app.selected = None;
+            click(&mut harness, pos);
+            assert_eq!(harness.state().app.selected, Some(0));
+            assert!(harness.state().navs.is_empty());
+        }
+    }
+
+    fn press(harness: &mut Harness<'_, State>, pos: egui::Pos2) {
+        harness.hover_at(pos);
+        harness.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+    }
+
+    #[test]
+    fn letterbox_real_grid_drag_keeps_item_press_when_thumbnail_loads() {
+        let mut harness = letterbox_harness([40, 120]);
+        let loaded = harness.state().app.thumbnails[0].clone();
+        harness.state_mut().app.thumbnails[0] = ThumbnailState::Pending;
+        harness.run_steps(4);
+        let rect = cell_rect(&harness);
+        let pos = rect.min + egui::vec2(5.0, rect.height() * 0.5);
+        press(&mut harness, pos);
+        assert!(matches!(
+            harness.state().app.grid_click_pairing.primary_press,
+            Some((_, _, GridPressTarget::Cell(0)))
+        ));
+        harness.state_mut().app.thumbnails[0] = loaded;
+        harness.step();
+        harness.hover_at(pos + egui::vec2(20.0, 0.0));
+        harness.step();
+        // render_grid only queues native D&D; App::update's shell dispatch is never run.
+        let drag = harness
+            .state()
+            .app
+            .pending_native_drag
+            .as_ref()
+            .expect("loading must not revoke the item press's drag ownership");
+        assert_eq!(
+            drag.paths,
+            vec![
+                harness.state().app.items[0]
+                    .drag_source_path()
+                    .unwrap()
+                    .to_path_buf()
+            ]
+        );
+        assert!(harness.state().navs.is_empty());
+    }
+
+    #[test]
+    fn letterbox_real_grid_drag_does_not_acquire_item_when_plate_replaces_letterbox() {
+        let mut harness = letterbox_harness([40, 120]);
+        let rect = cell_rect(&harness);
+        let pos = rect.min + egui::vec2(5.0, rect.height() * 0.5);
+        press(&mut harness, pos);
+        assert!(matches!(
+            harness.state().app.grid_click_pairing.primary_press,
+            Some((_, _, GridPressTarget::Background))
+        ));
+        harness.state_mut().app.thumbnails[0] = ThumbnailState::Pending;
+        harness.step();
+        harness.hover_at(pos + egui::vec2(20.0, 0.0));
+        harness.step();
+        assert!(
+            harness.state().app.pending_native_drag.is_none(),
+            "a later plate must not turn a background press into native D&D"
+        );
+        assert!(harness.state().navs.is_empty());
+    }
+
+    fn small_cell_harness(item: GridItem, thumb: ThumbnailState) -> Harness<'static, State> {
+        let mut harness = letterbox_harness([40, 120]);
+        harness.set_size(egui::vec2(640.0, 480.0));
+        let app = &mut harness.state_mut().app;
+        app.settings.grid_cols = crate::settings::MAX_GRID_COLS;
+        app.settings.thumb_show_resume_meter = false;
+        app.items[0] = item;
+        app.thumbnails[0] = thumb;
+        harness.run_steps(4);
+        assert!(cell_rect(&harness).width() < 40.0);
+        harness
+    }
+
+    fn painted_text_in_padding(harness: &Harness<'_, State>, label: &str) -> egui::Pos2 {
+        use egui::emath::GuiRounding;
+        let cell = cell_rect(harness);
+        let inner = cell.shrink(4.0);
+        let padding = [
+            egui::Rect::from_min_max(cell.min, egui::pos2(inner.min.x, cell.max.y)),
+            egui::Rect::from_min_max(egui::pos2(inner.max.x, cell.min.y), cell.max),
+            egui::Rect::from_min_max(cell.min, egui::pos2(cell.max.x, inner.min.y)),
+            egui::Rect::from_min_max(egui::pos2(cell.min.x, inner.max.y), cell.max),
+        ];
+        harness
+            .output()
+            .shapes
+            .iter()
+            .find_map(|clipped| {
+                let egui::Shape::Text(text) = &clipped.shape else {
+                    return None;
+                };
+                if text.galley.text() != label {
+                    return None;
+                }
+                let ink = text
+                    .galley
+                    .mesh_bounds
+                    .translate(
+                        text.pos
+                            .round_to_pixels(harness.ctx.pixels_per_point())
+                            .to_vec2(),
+                    )
+                    .intersect(clipped.clip_rect)
+                    .intersect(cell);
+                padding.iter().find_map(|padding| {
+                    let visible = ink.intersect(*padding);
+                    visible.is_positive().then(|| visible.center())
+                })
+            })
+            .unwrap_or_else(|| panic!("{label:?} must really paint into the cell padding"))
+    }
+
+    fn assert_padding_text_is_item(harness: &mut Harness<'_, State>, label: &str) {
+        let pos = painted_text_in_padding(harness, label);
+        harness.state_mut().app.selected = None;
+        click(harness, pos);
+        assert_eq!(
+            harness.state().app.selected,
+            Some(0),
+            "visible {label:?} is item content"
+        );
+        click(harness, pos);
+        assert!(
+            !harness
+                .state()
+                .navs
+                .iter()
+                .any(|nav| matches!(nav, crate::ui_main::AddressBarNav::Direct(_, _))),
+            "visible {label:?} must not invoke the background parent action"
+        );
+    }
+
+    #[test]
+    fn letterbox_real_grid_missing_caption_and_reason_own_painted_padding() {
+        let name = "very-long-missing-collection-file-name.png";
+        for label in [name, "見つかりません", "?"] {
+            let item = GridItem::CollectionPlaceholder {
+                path: name.into(),
+                last_known_kind: crate::collection_store::CollectionResolvedKind::Image,
+                reason: crate::grid_item::CollectionPlaceholderReason::Missing,
+            };
+            let mut harness = small_cell_harness(item, ThumbnailState::Failed);
+            assert_padding_text_is_item(&mut harness, label);
+        }
+    }
+
+    #[test]
+    fn letterbox_real_grid_plate_text_and_icons_own_painted_padding() {
+        for (item, thumb, label) in [
+            (
+                GridItem::Image("pending.png".into()),
+                ThumbnailState::Pending,
+                "読込中",
+            ),
+            (
+                GridItem::Image("failed.png".into()),
+                ThumbnailState::Failed,
+                "読込失敗",
+            ),
+            (
+                GridItem::ZipFile("book.zip".into()),
+                ThumbnailState::Pending,
+                "📦",
+            ),
+            (
+                GridItem::PdfFile("book.pdf".into()),
+                ThumbnailState::Pending,
+                "📄",
+            ),
+        ] {
+            let mut harness = small_cell_harness(item, thumb);
+            assert_padding_text_is_item(&mut harness, label);
+        }
+    }
+
+    #[test]
+    fn letterbox_real_grid_small_audio_icon_owns_painted_padding() {
+        let mut harness =
+            small_cell_harness(GridItem::Audio("music.mp3".into()), ThumbnailState::Pending);
+        let cell = cell_rect(&harness);
+        let inner = cell.shrink(4.0);
+        let top = egui::Rect::from_min_max(cell.min, egui::pos2(cell.max.x, inner.min.y));
+        let pos = harness
+            .output()
+            .shapes
+            .iter()
+            .find_map(|clipped| {
+                let egui::Shape::LineSegment { points, .. } = &clipped.shape else {
+                    return None;
+                };
+                if points[0].x != points[1].x {
+                    return None;
+                }
+                let visible = clipped
+                    .shape
+                    .visual_bounding_rect()
+                    .intersect(clipped.clip_rect)
+                    .intersect(top);
+                visible.is_positive().then(|| visible.center())
+            })
+            .expect("the minimum-size music stem must really paint above the inner plate");
+        harness.state_mut().app.selected = None;
+        click(&mut harness, pos);
+        assert_eq!(harness.state().app.selected, Some(0));
+        click(&mut harness, pos);
+        assert!(
+            !harness
+                .state()
+                .navs
+                .iter()
+                .any(|nav| matches!(nav, crate::ui_main::AddressBarNav::Direct(_, _)))
+        );
+    }
+
+    #[test]
+    fn letterbox_real_grid_drag_cannot_transfer_press_to_new_generation() {
+        let mut harness = letterbox_harness([40, 120]);
+        let pos = cell_rect(&harness).center();
+        press(&mut harness, pos);
+        harness.state_mut().app.items_generation += 1;
+        harness.step();
+        harness.hover_at(pos + egui::vec2(20.0, 0.0));
+        harness.step();
+        assert!(harness.state().app.pending_native_drag.is_none());
+    }
+}
+
+#[path = "tests/audio_favsearch_sidecars.rs"]
+mod audio_favsearch_sidecar_tests;
+
+#[path = "tests/audio_refresh.rs"]
+mod audio_refresh_tests;
+
+#[path = "tests/audio_idle_upgrade.rs"]
+mod audio_idle_upgrade_tests;
+
+#[cfg(all(windows, not(feature = "portable")))]
+#[path = "tests/effetune_auto_open.rs"]
+mod effetune_auto_open_tests;
+
+#[path = "tests/merge_adoption.rs"]
+mod merge_adoption_tests;
+
+#[path = "tests/bookmark_build_adoption.rs"]
+mod bookmark_build_adoption_tests;

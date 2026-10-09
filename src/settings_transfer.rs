@@ -263,10 +263,13 @@ preferences_policy! {
         startup_window_state: StartupWindowState => ("起動時のウィンドウ状態", |_, _| true, plain, plain);
         grid_click_selection_mode: GridClickSelectionMode => ("サムネイルのクリック選択", |v, _raw| !matches!(v, GridClickSelectionMode::Unknown), plain, plain);
         grid_open_selected_item_on_click: bool => ("選択中の項目をクリックで開く", |_, _| true, plain, plain);
+        grid_background_double_click_parent: bool => ("サムネイルの余白ダブルクリック", |_, _| true, plain, plain);
         grid_cursor_wrap: bool => ("サムネイルのカーソル折り返し", |_, _| true, plain, plain);
         remember_favorite_view_state: bool => ("お気に入りごとの表示設定", |_, _| true, plain, plain);
+        details_name_colors: crate::details_name_colors::DetailsNameColors => ("詳細一覧の名前色", |v, _raw| v.valid_standard_custom(), plain, plain);
         grid_display_order: GridDisplayOrder => ("カテゴリの表示順", |v, _raw| v == &v.normalized(), plain, plain);
         video_thumbnail_indicator: VideoThumbnailIndicator => ("動画サムネイルの表示", |v, _raw| !matches!(v, VideoThumbnailIndicator::Unknown), plain, plain);
+        audio_thumbnail_indicator: AudioThumbnailIndicator => ("音声サムネイルの表示", |v, _raw| !matches!(v, AudioThumbnailIndicator::Unknown), plain, plain);
         thumb_show_media_duration: bool => ("サムネイルの再生時間表示", |_, _| true, plain, plain);
         thumb_show_resume_meter: bool => ("サムネイルの読書・再生位置表示", |_, _| true, plain, plain);
         selection_info_display_mode: SelectionInfoDisplayMode => ("選択項目の情報表示", |v, _raw| !matches!(v, SelectionInfoDisplayMode::Unknown), plain, plain);
@@ -309,7 +312,7 @@ preferences_policy! {
         skip_zip_if_folder_exists: bool => ("同名フォルダがあるZIPを省略", |_, _| true, plain, plain);
         skip_archive_if_zip_exists: bool => ("同名ZIPがあるアーカイブを省略", |_, _| true, plain, plain);
         skip_epub_if_pdf_exists: bool => ("同名PDFがあるEPUBを省略", |_, _| true, plain, plain);
-        skip_image_if_video_exists: bool => ("同名動画がある画像を省略", |_, _| true, plain, plain);
+        skip_image_if_video_exists: bool => ("同名の動画・音声がある画像を省略", |_, _| true, plain, plain);
         skip_duplicate_images: bool => ("同名の重複画像を省略", |_, _| true, plain, plain);
         image_ext_priority: Vec<String> => ("画像拡張子の優先順", valid_extensions, plain, plain);
         minimize_to_tray_on_close: bool => ("閉じるときトレイに常駐", |_, _| true, plain, plain);
@@ -377,7 +380,7 @@ preferences_policy! {
         video_seek_bar_with_strip: VideoSeekBarWithStrip => ("動画サムネイル列とシークバー", |_, _| true, plain, plain);
         video_loop_mode: VideoLoopMode => ("動画のループ再生", |_, _| true, plain, video_loop);
         video_start_muted: bool => ("動画をミュートで開始", |_, _| true, plain, plain);
-        video_thumb_use_sidecar_image: bool => ("動画サムネイルに同名画像を使用", |_, _| true, plain, plain);
+        video_thumb_use_sidecar_image: bool => ("動画・音声サムネイルに同名画像を使用", |_, _| true, plain, plain);
         video_grid_open_starts_from_beginning: bool => ("一覧から開く動画の位置復元", |_, _| true, plain, plain);
         video_nav_resume: ResumeMode => ("移動時の動画の位置復元", |_, _| true, plain, plain);
         book_open_resume: ResumeMode => ("本を開くときの位置復元", |_, _| true, plain, plain);
@@ -392,6 +395,7 @@ preferences_policy! {
         show_facet_sort => "環境設定外のツールバーで管理するソート区画の表示状態";
         toolbar_folder_section_migrated => "ツールバー配置の一度だけの内部移行記録";
         effetune_pre_limiter_enabled => "移行先の EffeTune/VST 導入状態と音声処理構成に依存する微調整";
+        effetune_auto_open_on_video => "移行先の EffeTune 導入状態とウィンドウ運用に依存する表示方針";
         effetune_keep_visible_when_minimized => "移行先の EffeTune/VST 導入状態とウィンドウ運用に依存する表示方針";
         grid_cols => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         grid_view_mode => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -866,6 +870,12 @@ mod tests {
     }
     fn nondefault_source() -> Settings {
         let mut settings = Settings::default();
+        settings.details_name_colors.enabled = false;
+        settings.details_name_colors.colors[0] =
+            crate::details_name_colors::DetailsNameColor::Custom {
+                light: [80, 60, 0],
+                dark: [214, 186, 102],
+            };
         settings.raw_brightness = crate::raw::RawBrightness::None;
         settings.ui_theme = different_enum(
             &settings.ui_theme,
@@ -904,6 +914,7 @@ mod tests {
                 GridClickSelectionMode::Explorer,
             ],
         );
+        settings.grid_background_double_click_parent = true;
         settings.grid_open_selected_item_on_click = !settings.grid_open_selected_item_on_click;
         settings.grid_cursor_wrap = !settings.grid_cursor_wrap;
         settings.remember_favorite_view_state = !settings.remember_favorite_view_state;
@@ -919,6 +930,14 @@ mod tests {
                 VideoThumbnailIndicator::PlayIcon,
                 VideoThumbnailIndicator::BottomLeftBadge,
                 VideoThumbnailIndicator::Hidden,
+            ],
+        );
+        settings.audio_thumbnail_indicator = different_enum(
+            &settings.audio_thumbnail_indicator,
+            &[
+                AudioThumbnailIndicator::MusicNoteIcon,
+                AudioThumbnailIndicator::BottomLeftBadge,
+                AudioThumbnailIndicator::Hidden,
             ],
         );
         settings.thumb_show_media_duration = !settings.thumb_show_media_duration;
@@ -1582,15 +1601,77 @@ mod tests {
     }
 
     #[test]
+    fn grid_background_double_click_transfer_preserves_boolean_and_rejects_wrong_type() {
+        let mut settings = Settings::default();
+        let parsed = parse_preferences(&document(
+            json!({"grid_background_double_click_parent": true}),
+        ))
+        .unwrap();
+        assert!(parsed.apply_to(&mut settings).issues.is_empty());
+        assert_eq!(settings.grid_background_double_click_parent, true);
+        let exported = export_preferences(&settings).unwrap();
+        let mut restored = Settings::default();
+        assert!(
+            parse_preferences(&exported.json)
+                .unwrap()
+                .apply_to(&mut restored)
+                .issues
+                .is_empty()
+        );
+        assert_eq!(restored.grid_background_double_click_parent, true);
+        let parsed = parse_preferences(&document(
+            json!({"grid_background_double_click_parent": "invalid_boolean"}),
+        ))
+        .unwrap();
+        assert_eq!(parsed.apply_to(&mut settings).issues.len(), 1);
+        assert_eq!(settings.grid_background_double_click_parent, true);
+    }
+
+    #[test]
+    fn details_name_colors_transfer_preserves_disabled_custom_and_rejects_invalid() {
+        use crate::details_name_colors::DetailsNameColor;
+        let mut source = Settings::default();
+        source.details_name_colors.enabled = false;
+        source.details_name_colors.colors[2] = DetailsNameColor::Custom {
+            light: [55, 80, 15],
+            dark: [180, 220, 140],
+        };
+        let exported = export_preferences(&source).unwrap();
+        assert!(exported.issues.is_empty());
+        let mut destination = Settings::default();
+        let report = parse_preferences(&exported.json)
+            .unwrap()
+            .apply_to(&mut destination);
+        assert!(report.issues.is_empty());
+        assert_eq!(source.details_name_colors, destination.details_name_colors);
+        let before = destination.details_name_colors.clone();
+        for invalid in [
+            json!({"enabled": true, "colors": [{"mode": "custom", "light": [255,255,255], "dark": [0,0,0]}, {"mode":"default"},{"mode":"default"},{"mode":"default"},{"mode":"default"},{"mode":"default"}]}),
+            json!({"enabled": true, "colors": [{"mode":"default"}]}),
+            json!({"enabled": true}),
+            json!({"enabled": true, "colors": [{"mode":"future"},{"mode":"default"},{"mode":"default"},{"mode":"default"},{"mode":"default"},{"mode":"default"}]}),
+        ] {
+            let parsed =
+                parse_preferences(&document(json!({"details_name_colors": invalid}))).unwrap();
+            assert_eq!(parsed.issues.len(), 1);
+            parsed.apply_to(&mut destination);
+            assert_eq!(destination.details_name_colors, before);
+        }
+        let parsed = parse_preferences(INITIAL_V1).unwrap();
+        parsed.apply_to(&mut destination);
+        assert_eq!(destination.details_name_colors, before);
+    }
+
+    #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 448);
+        assert_eq!(entries.len(), 452);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            136
+            139
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -1600,7 +1681,7 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 134);
+        assert_eq!(wire.len(), 137);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);
@@ -1782,6 +1863,7 @@ mod tests {
         source.show_facet_sort = true;
         source.toolbar_folder_section_migrated = false;
         source.effetune_pre_limiter_enabled = false;
+        source.effetune_auto_open_on_video = true;
         source.effetune_keep_visible_when_minimized = true;
         source.window_pos = Some([100.0, 200.0]);
         source.toolbar_section_order.reverse();
@@ -1794,6 +1876,7 @@ mod tests {
             ("show_facet_sort", serde_json::json!(true)),
             ("toolbar_folder_section_migrated", serde_json::json!(false)),
             ("effetune_pre_limiter_enabled", serde_json::json!(false)),
+            ("effetune_auto_open_on_video", serde_json::json!(true)),
             (
                 "effetune_keep_visible_when_minimized",
                 serde_json::json!(true),
@@ -1815,7 +1898,7 @@ mod tests {
         let before = destination.clone();
         let parsed = parse_preferences(&document.to_string()).unwrap();
         let report = parsed.apply_to(&mut destination);
-        assert_eq!(report.unknown_count, 11);
+        assert_eq!(report.unknown_count, 12);
         assert_eq!(destination.raw_brightness, crate::raw::RawBrightness::None);
         assert_excluded_unchanged(&before, &destination);
 
@@ -1884,6 +1967,8 @@ mod tests {
             ("ui_theme", json!("Standard")),
             ("ui_theme", json!("SECRET_PIN")),
             ("text_contrast", json!("unknown")),
+            ("audio_thumbnail_indicator", json!("FutureIndicator")),
+            ("audio_thumbnail_indicator", json!("Unknown")),
             ("fullscreen_side_panel_mode", json!("Unknown")),
             ("panorama_projection", json!("unknown")),
             ("fullscreen_fit_mode", json!("MarginFit")),

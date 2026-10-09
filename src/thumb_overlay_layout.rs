@@ -95,6 +95,8 @@ pub enum FormatBadgeKind {
     Archive,
     /// Video media marker, independent from the file extension label.
     Video,
+    /// Audio media marker for a loaded representative image.
+    Audio,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

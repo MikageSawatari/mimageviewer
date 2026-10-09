@@ -301,6 +301,21 @@ const V4_4_HIGHLIGHTS: &[HighlightItem] = &[
     },
 ];
 
+const V4_5_HIGHLIGHTS: &[HighlightItem] = &[
+    HighlightItem {
+        title: "音声ファイルの一覧にジャケット画像を表示します",
+        body: "音声と同じ名前の画像があればその画像を、なければ MP3 に埋め込まれた画像を表示します。目印は環境設定の「表示 → サムネイル」で選べます。",
+    },
+    HighlightItem {
+        title: "RAR・7z などの書庫にも読書位置バーを表示します",
+        body: "変換して開く書庫でも、前回読んだ位置を一覧のバーで表示します。変換済みのキャッシュを削除しても、開き直すと続きから読めます。",
+    },
+    HighlightItem {
+        title: "F11 の全画面のときだけ、固定したバーやパネルを自動表示にできます",
+        body: "環境設定の「表示 → 閲覧表示」で、上部バー・下部バーとストリップ・右情報パネル・ナビゲータを選べます（既定はすべてオフ）。",
+    },
+];
+
 const TABLE: &[VersionHighlights] = &[
     VersionHighlights {
         version: "2.0.0",
@@ -1013,6 +1028,15 @@ const TABLE: &[VersionHighlights] = &[
             },
         ],
         highlights: V4_4_HIGHLIGHTS,
+    },
+    VersionHighlights {
+        version: "4.5.0",
+        // 分割 RAR の後続巻を開けなくなる操作の変更を必読へ置く。
+        must_read: &[HighlightItem {
+            title: "分割した RAR は、最初のファイルから開いてください",
+            body: "分割した RAR の 2 つ目以降のファイル（part2 以降）を開くと、変換せずに「最初のファイルを開いてください」と案内します。最初のファイル（part1）から開くと、これまでどおり読めます。",
+        }],
+        highlights: V4_5_HIGHLIGHTS,
     },
 ];
 

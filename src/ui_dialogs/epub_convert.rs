@@ -7,10 +7,7 @@ use std::time::Duration;
 
 use eframe::egui;
 
-use crate::app::{
-    App, FolderNavHistorySnapshot, OpenRequestOwner, PdfOpenFailure, PdfOpenFailureRoute,
-    ViewerContextId,
-};
+use crate::app::{App, OpenRequestOwner, PdfOpenFailure, PdfOpenFailureRoute, ViewerContextId};
 use crate::epub_cache::PublishOutcome;
 use crate::epub_convert::{
     self, CancelToken, ConvertProgress, EpubConvertError, EpubInspectSummary,
@@ -42,7 +39,6 @@ pub(crate) enum EpubConvertExit {
 /// View state to restore if a request ends before any successor owns the view.
 pub(crate) struct EpubOpenRestore {
     pub(crate) logical: PathBuf,
-    pub(crate) history: Option<FolderNavHistorySnapshot>,
     pub(crate) address_before: Option<String>,
     /// Direct PDF/EPUB adoption survives the NotConverted dialog and resumes with the same
     /// source origin. Staged history carries its own transition instead.
@@ -151,7 +147,6 @@ impl EpubConvertState {
             smart_transition_sequence,
             open_restore: EpubOpenRestore {
                 logical,
-                history: None,
                 address_before: None,
                 adoption: None,
             },
@@ -185,7 +180,6 @@ impl EpubConvertState {
             smart_transition_sequence,
             open_restore: EpubOpenRestore {
                 logical,
-                history: None,
                 address_before: None,
                 adoption: None,
             },
@@ -443,7 +437,6 @@ impl App {
                     smart_transition_sequence: self.smart_folder_transition_sequence,
                     open_restore: EpubOpenRestore {
                         logical: logical.to_owned(),
-                        history: None,
                         address_before: None,
                         adoption: None,
                     },
@@ -482,9 +475,6 @@ impl App {
     }
 
     pub(crate) fn restore_epub_open(&mut self, restore: EpubOpenRestore) {
-        if let Some(snapshot) = restore.history {
-            self.restore_folder_nav_history(snapshot);
-        }
         if let Some(address) = restore.address_before {
             self.address = address;
             self.update_global_search_address();
@@ -503,7 +493,6 @@ impl App {
             &mut state.open_restore,
             EpubOpenRestore {
                 logical: state.src_path.clone(),
-                history: None,
                 address_before: None,
                 adoption: None,
             },
@@ -562,7 +551,6 @@ impl App {
             &mut state.open_restore,
             EpubOpenRestore {
                 logical: state.src_path.clone(),
-                history: None,
                 address_before: None,
                 adoption: None,
             },
@@ -616,25 +604,20 @@ impl App {
             }
             return;
         }
-        let reopened = if matches!(owner, OpenRequestOwner::CollectionGridPhysical(_)) {
-            self.load_folder_with_scan_owned(
+        let reopened = matches!(
+            self.load_pdf_as_folder_owned_with_restore(
                 path.clone(),
-                None,
                 owner.clone(),
                 restore_intent.clone(),
-            )
-        } else {
-            matches!(
-                self.load_pdf_as_folder_owned(path.clone(), owner.clone(), restore_intent.clone()),
-                crate::app::FolderOpenOutcome::Loaded
-            )
-        };
+                Some(restore),
+            ),
+            crate::app::FolderOpenOutcome::Loaded
+        );
         if reopened
             && let Some(pending) = self.pdf_enumerate_pending.as_mut()
             && crate::folder_tree::path_eq(&pending.0, &path)
             && pending.3.as_ref() == &owner
         {
-            pending.4 = Some(restore);
             if deferred.is_some() {
                 self.fs_nav_after_pdf_enumerate = deferred;
             }
@@ -872,7 +855,6 @@ mod tests {
                 smart_transition_sequence: 0,
                 open_restore: EpubOpenRestore {
                     logical: PathBuf::from("C:/books/book.epub"),
-                    history: None,
                     address_before: None,
                     adoption: None,
                 },

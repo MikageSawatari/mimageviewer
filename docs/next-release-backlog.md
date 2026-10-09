@@ -32,6 +32,15 @@
 
 ## 1. 優先候補
 
+### 1.359 EffeTune の新しい版を同梱し、再生中の曲情報（タイトル・アルバム・アーティスト・アートワーク）を Visualizer へ渡す — EffeTune 作者の対応 (2026-10-09)
+- **次の版の決定 (利用者 2026-10-09)**: v4.5.0 には入れず、次の版で進める。
+- 経緯: 利用者が EffeTune 作者 (Frieve-A 氏) へ要望した 2 点 (プラグイン版の起動時表示に Visualizer を選べること、ホストからの曲情報の受け渡し) について、作者から「間もなくリリースする最新版で対応した」と返信があった (2026-10-09、利用者経由)。2026-10-09 時点の GitHub Releases の最新は v0.12.0 (2026-10-02) で、対応版はまだ公開されていない。
+- 仕様の正本 (作者): https://github.com/Frieve-A/effetune-mixwright/blob/main/docs/host-now-playing.md 。作者の説明では、IConnectionPoint::notify で "EffeTune.NowPlaying" メッセージを送り、title / album / artist は文字列、artwork は画像のバイト列、artworkMimeType は MIME 種別。送信は UI スレッドから行い、曲が切り替わるたびにまとめて送る。未指定・空の項目は消去される。
+- mIV 側の作業: (1) 対応版の EffeTune Mixwright を同梱 (manifest `third_party/effetune-mixwright/<版>/manifest.sha256` の作り直し、署名、launcher の世代公開・更新の確認)。(2) 曲情報の送り元を決める: 音声は動画・音楽のメタデータと、§1.347 の同名画像 / MP3 埋め込み画像、動画は代表画像。(3) Rust 側から VST3 host bridge への IPC と、host (C++) の plugin UI スレッドでの notify。曲の切り替え・停止・別ウィンドウ・リモート閲覧中の扱い、画像サイズの上限を設計で決める。
+- 実装可否の調査 (2026-10-09、コードの参照): 実装可能・中規模と判断。host は `IMessage` / `IAttributeList` を既に生成できる (`crates/vst3-host/src/host_app.cpp:78`、SDK の `HostAttributeList::setBinary` は uint32 長で 8 MiB も可)。plugin ごとの GUI スレッドへの `post_async` (`plugin_loader.cpp` の `set_gui_remote_session` 等) と同じ形で `set_now_playing` 命令を足す。IPC は 4byte 長 + UTF-8 JSON、最大 32 MiB (`protocol.h:100` / `bridge.rs:1179`)、画像は既存の base64 方式で約 11 MiB。`PROTOCOL_VERSION` を 5→6 にし、bridge exe を作り直す。送信は EffeTune 専用 bridge の `effetune-host-control` worker から行い、UI スレッドで大きな書き込みをしない。読み込み直し時の再送は `publish_running` → `HostCommand::RegisterBridge` (`src/effetune/mod.rs:1522`) で行える。曲名・アーティストは `VideoInfo` (avformat タグ)、アルバムは同じ箇所に追加が必要。アートワークは §1.347 の同名画像 / APIC、動画は代表画像 (キャッシュの WebP はそのまま送れる)。JXL/HEIC/RAW 等や 8 MiB 超は worker で JPEG/WebP (長辺 ~1024px) へ変換。送り先: 利用者の確認 (2026-10-09) では、音楽・動画は同時に 1 つしか再生できないため、送る曲情報は常に再生中の 1 件に決まる (リモート配信中も同じく再生中の 1 件)。ポータブル版 (EffeTune 非同梱) では何もしない。前提: 対応版 EffeTune の同梱 (v0.12.0 は非対応)。
+- 「起動時の表示」を Visualizer にする設定はプラグイン側の設定なので、対応版の同梱だけで使える見込み (未確認)。
+- 規模 / 優先度: Medium / P2 (次の版)。
+
 ### 1.358 回転＋トリムの入力が描画・capture・PDF要求で異なる — §1.342の設計照合で確認 (2026-10-09)
 - **状態: 別件として起票 (利用者決定 2026-10-09)**。今版の§1.342には含めない。
 - 出典: §1.342の独立設計レビューP2を受けたsource inspection。製品を起動した観測ではない。
@@ -50,6 +59,19 @@
 - **利用者決定 (2026-10-09、複数トラック追補)**: 「音声 N」は両HUDで基本操作に続く優先項目とし、省略しない。native動画の約820px窓の時間重なり・トラック消失もv4.4.0からの固定幅配置に存在する。native下段にも実フォント測定と単一配置ownerを適用し、通常 / 測定で同じ配置を使う。[原因・範囲・回帰](video-architecture.md#複数トラックと狭いnative動画hud2026-10-09)。
 - 独立レビュー修正 (2026-10-09): P2の音声トラックだけを先に外す従来座標分岐を撤去。全項目が収まる場合のみ従来座標を保持し、他は既決の共通省略順へ接続する。実フォントの幅往復と実HUDメニュー保持・省略時終了の回帰を追加。検証結果と確認用buildの完了を上の配置文書へ記録した。
 - 規模 / 優先度: Small〜Medium / P2。修正の再レビュー / 実機確認待ち。
+
+### 1.355 分割RARは最初のファイルから開き、後続巻の誤変換を防ぐ — 利用者実機報告 (2026-10-08)
+
+- **次の版の決定 (利用者 2026-10-09)**: ラインA。後続巻を開く機能はサポートしない。以前の先頭巻解決・旧cache互換・identity維持案を置き換える。
+- 発見: §1.350の利用者実機確認で、後続巻から有効cacheを見落として再変換し、使用中ZIPのpublishがアクセス拒否になる公開済みv4.4.0の不具合を確認。実RAR5ヘッダー暗号化fixtureではpassword後の後続巻scanが画像0件、直接変換がCRCエラーになることも確認した。
+- 共通決定: RAR scan workerで、secretなしのheaderが後続巻と示したら画像scan・cache照会・Direct採用・変換前に拒否。「分割RARの2つ目以降のファイルです。最初のファイル（header解決済みの最初のファイル名）を開いてください。」を表示する。通常／Smart／履歴／Rating／Collection／ブックマーク／起動／別ウィンドウ／password retryの共通scan入口に適用し、古い後続巻entryも同じ通知にする。
+- ヘッダー暗号化: 先頭巻をファイル名から推測しない。password後に画像も展開対象の入れ子も無ければ「画像が見つかりません。分割RARの場合は最初のファイルを開いてください。」を表示・logする。part1／単巻のDirect → 有効cache → 変換は維持する。
+- 保存データ: 後続巻keyの読書位置・ページ編集が参照できなくなるまれな制約を利用者が受容。既存cache・保存行を削除／移行せず、互換peek・alias・探索を追加しない。
+- 一覧: 後続巻のサムネイルとthumbnail／pin source owner・失効は既存動作を維持。バーだけ、非同期source ownerのtyped header証明がSubsequentの後続巻セルで非表示にする。描画中I/O・ファイル名推測・新しいeligibility状態は追加しない。
+- 維持: 保存失敗loggerの操作・src／tmp／dst・native code、平易な通知、no-clobber、既存ZIP保持を維持。別ウィンドウ本ブックマークの直接cache hit、★固定のcache-only、別ウィンドウDFSの既存policyを入口表の例外として明記する。
+- 追加修正 (2026-10-09、8b327fa02レビュー): Remote、別窓bookmark cache hit、固定snapshot entry／grid、DFSも採用前にtyped volume証明で拒否する。大文字RAR／CBRの案内先解決を修正し、パス差によるmeter判定とcache-onlyの拒否例外を撤去。保存データとthumbnailは保持。
+- 回帰: 有効な旧後続巻cacheを置いた各入口、Remote、大文字RAR／CBRのDFS skip／meter非表示／true first案内、各handlerの後続巻拒否／変換未開始、実暗号化RARの0画像hint／part1変換、実workerの後続巻メーター非表示とthumbnail維持、先頭／単巻のcache再利用・位置復元、新通知snapshotを検証する。
+- 設計記録: [読書位置メーター計画 §19](book-resume-meter-plan.md#19-1355-分割rarは最初のファイルから開く2026-10-09利用者決定)。
 
 ### 1.354 既存の画像経路の EXIF 読み取りで、小さい入力から大量のメモリを確保しうる — 次の版の音声ジャケット (§1.347) の独立レビューで発見 (2026-10-08)
 - **状態: 今後検討 (利用者 2026-10-08)**。
@@ -92,10 +114,12 @@
 ### 1.350 RAR などの変換対象書庫にも一覧の読書位置バーを表示する — mIV スレ >>529 (2026-10-07)
 - **次の版の決定 (利用者 2026-10-07)**: ライン A。最初に実装する。
 
+- **追加決定 (利用者 2026-10-08)**: 変換キャッシュ削除後も読書位置バーを保持する。workerがheaderで確定した論理sourceをキャッシュなしの終端状態にも保持し、決定的な変換ZIP keyを参照する。Pendingは一時非表示でよい。共有source失効（サムネイル／pin、stash／parked）は維持する。
+
 - 報告: v4.4.0 の読書位置バーが RAR の一覧サムネイルに出ない。利用者の手元でも再現。次のバージョンでの対応を目標にする。
 - 原因: `thumbnail_book_resume_meter` は `Folder` / `ZipFile` / `PdfFile` だけを対象にし、RAR/CBR/7z/LZH の一覧セル `ConvertibleArchive` を除外している。`docs/book-resume-meter-plan.md` §2 でも初版の対象外と明記され、既存テストも非表示を期待している。単なる保存失敗ではない。
 - 保存キー: 直読みRARは `current_folder` が元書庫なので元RARのキーへ記録する。変換が必要なRAR/7z/LZHは `current_folder` がキャッシュZIP、`archive_source_override` が元書庫なので、位置はキャッシュZIPのキーへ記録する。元書庫キーだけを一律に参照しても直らない。
-- 方針: 既存の非同期 `converted_archive_cache_paths` の `Direct` / `CachedZip` が解決した実読込元を使い、`BookResumeMeters` の既存mapから比率を取得する。未解決・無効なキャッシュでは表示を捏造しない。UIのセル描画中に書庫検査・ファイルI/O・DB照会を追加しない。分割RARの後続パートは、既存の読込元解決に従い先頭パートと同じ本を参照する。読書位置の保存・復元キー自体は変更しない。
+- 方針: 既存の非同期 `converted_archive_cache_paths` の `Direct` / `CachedZip` の実読込元、またはsource確定済み `Unavailable` だけは現在のdata-dirと論理sourceから計算した変換ZIP keyを使い、`BookResumeMeters` の既存mapから比率を取得する。未解決・論理source未確定・保存行無しでは表示を捏造しない。キャッシュの有無だけでは非表示にしない。UIのセル描画中に書庫検査・ファイルI/O・DB照会を追加しない。2026-10-09の§1.355決定により、headerで後続パートと確定したセルのバーは非表示とする。サムネイルの先頭パート参照は維持する。読書位置の保存・復元キー自体は変更しない。
 - 回帰: 直読みRAR/CBR、変換RAR/CBR・7z/CB7・LZH/LHA、分割RAR、未変換/キャッシュ失効、一覧からの再読込、既存ZIP/PDF/フォルダのバーを確認する。既存の「ConvertibleArchiveは非表示」というテストを新仕様へ更新する。
 - 規模 / 優先度: Small〜Medium / P2 (次版目標)。
 
@@ -161,12 +185,16 @@
 
 ### 1.345 種類の絞り込みを起点フォルダの下位でも維持できるようにする — mIV スレ >>511、>>517、>>521 (2026-10-07)
 - **次の版の決定 (利用者 2026-10-07)**: ライン A。**今の絞り込みとは別の機能として作り直す**: mIV 全体で「表示するファイル種類」を絞る設定 (例: RAR を見ない、RAW を除外)。同名ファイルの除去と同じく、一覧を作るときに最初にかける層で除く (退避・復元を持たない)。適用範囲 (通常・ZIP 内・★一覧・検索・コレクション・Remote)、代表サムネイル・Ctrl+↑↓・本の判定への影響、切り替え手段は設計で利用者に相談する。
+- 確定設計: [file-type-visibility-plan.md](file-type-visibility-plan.md)。全一覧producerの共通ポリシー、派生動作・保存設定・切替UI、状態の簡素化を記載。全質問を推奨どおり採用・既定を維持（利用者2026-10-08）。bf509352dの実装・設計への独立レビュー承認を記録。§1.345は未実装。
 
 - 画像だけを閲覧したい場合に、フォルダを下りるたび動画・音声を再び非表示にする手間をなくす。現在の種類絞り込みは下位フォルダへ移ると解除される。
 - 起点フォルダとその下位への適用範囲、別の場所へ移ったときの解除、ZIP/PDF 本のページ一覧への誤継承を設計時に決める。現行のフォルダ単位の絞り込みを無条件に変更しない。
 - 規模 / 優先度: 未見積もり / P3。
 
 ### 1.346 詳細一覧のファイル名を画像・動画・音声で色分けできるようにする — mIV スレ >>511、>>522 (2026-10-07)
+- 2026-10-08: [確定設計と実装記録](details-name-color-plan.md)。フォルダ黄系、六分類の標準カスタム色、
+  選択/チェック共通色、hover分類色、名前の切り取り不透明表示。標準のカスタム通常比は3:1以上、
+  強めは固定色。ラインCのこの項目だけ実装し、§1.329/§1.337は設計のまま。
 - **次の版の決定 (利用者 2026-10-07)**: ライン C。既定はフォルダとファイル系だけを控えめに色分けし、ほかは利用者がカスタム色を指定。分類は フォルダ / 本 (ZIP・PDF・RAR・EPUB) / 画像 / RAW / 動画 / 音声 を想定。細かい仕様は実装前に利用者と相談して決める。
 
 - 対象は詳細一覧のファイル名。サムネイル一覧は画像や音符アイコンで判別できており、色分けの要望対象ではない。
@@ -175,6 +203,7 @@
 
 ### 1.347 MP3 の埋め込みアルバムアートを一覧に表示する — mIV スレ >>522 (2026-10-07)
 - **次の版の決定 (利用者 2026-10-07)**: ライン D。MP3 から。最初から Remote にも対応する。
+- 2026-10-08 の追加決定: 同名 sidecar を動画と共有し最優先、埋め込みは先頭 ID3v2 一つだけ、音声マーク三択。実装・検証記録と独立レビュー修正 (§20、Remote全入口監査と受付証明/ZIP RAW継続の修正 §21) は [音声画像計画 §19](audio-album-art-plan.md#19-先頭タグ限定版の実装検証記録-2026-10-08) を参照。以下は着手前の状況記録。
 
 - 現状は音声項目を固定の音楽アイコンで描画し、埋め込み画像を読まない。報告者の ID3v2.3/JPEG 画像が出ないのはファイルの異常とは限らず、現行仕様による。返信では実装したい旨を伝えた。
 - まず MP3 の埋め込み画像を対象にし、画像がない・読めない場合は現行の音楽アイコンを残す。FLAC/M4A 等への拡張範囲は設計時に判断する。
@@ -190,8 +219,20 @@
 - 現状の代替: フォルダバー ↑、一覧で `Backspace` / `Alt+↑`。矢印キーと Enter だけの移動 (§1.297) は見送り。
 - 規模 / 優先度: 未見積もり / P3。
 
+- 実装／追加決定 (利用者 2026-10-08、8cb4d57de の実機確認後): セルが隙間なく並ぶため、セル外判定だけではサムネイル周囲の余白で起動しなかった。ON時は描いた画像・ファイル名・アイコン・各バッジ以外のセル内余白（letterbox・外周余白）も背景とし、単クリックの選択解除とdouble-click親移動を行う。OFF時の既存セル操作は維持する。
+- 設定は「サムネイルの余白部分のダブルクリックで親フォルダへ移動」のチェックボックス1つ（既定OFF）へ変更。同じ設定で詳細一覧の最終行より下、touch／ペンのdouble tapも扱う。未公開のenum保存形式は移行せずboolへ置換する。
+- [設計ノート](grid-background-double-click-plan.md)に最新決定・セル種類・描画と押下の所有を記録。画像→同じセルの余白は対にならず、描いた矩形を同frameの入力に使う。親操作はキー側と共有し、ホイール受理時のpair終了と旧ScrollArea読戻し後の親操作を維持する。上の見送り／未決と旧Q1／Q3は当時の記録であり、最新の2026-10-08決定が優先。
+
 ### 1.339 拡張子で絞り込んだ一覧から ZIP を開き、BS → ← → → と移動すると、ZIP のページ一覧に絞り込みが残って空になる — 利用者報告 (2026-10-07)
 - **次の版の決定 (利用者 2026-10-07)**: ライン A。今の絞り込み (facet) の退避の不具合として、§1.345 とは別に直す。
+- 独立した根治設計案: [file-type-visibility-plan.md §9](file-type-visibility-plan.md#9-1339--履歴再入場のfacet退避を採用境界へ集約する)。履歴に親子scopeのrouteを保持し、成功採用時の一つのownerで退避・復元する。§1.345に依存せず実装 (2026-10-08)。通常履歴もtyped要求へ移し、履歴は成功採用後だけ更新する。退避済みfilter値は履歴に保存せず、再入場時のliveな親条件を退避する。sidecarは採用後のhydrationとして既存の待機・表示順序を維持し、採用前の取消・失敗は表示中の一覧と履歴を保つ。
+- 実装レビューの5指摘を修正 (2026-10-08): Collection拒否時のfullscreen終端、toolbarの仮cursor投影、検索更新をまたぐコピー済み移動、Smart分類のrow/path証明、ZIP再読込の準備済みprefix整合。追加のrollback/stateを持たず、実handler・非同期交差の回帰で検証する。
+- 同根の通常ZIP openも修正 (2026-10-08): 検索結果・アドレスバー等でコピー済みpath/effectsを持つNavigationはSurface証明へ統一し、検索更新と分類／準備の交差を検証する。SmartGrid／Rating／Collectionの行依存検証は維持。選択箇所の棚卸しは[async-architecture.md](async-architecture.md#source-proof選択箇所の監査2026-10-08)。
+
+- proof第4回修正 (2026-10-08): コピー済み宛先はSurface、現行行／prepare snapshot依存はRowへ全受付・採用adapterを監査して統一。既存switch sequenceを全証明で照合し、Quick Folder再選択／往復・検索owner切替で未採用要求を退役。実ペインEnterと同queryの実検索refresh交差は許可。履歴／fullscreen scanは元証明を保持。監査表は [async-architecture.md](async-architecture.md#source-proof選択箇所の監査2026-10-08)。
+- native restore証明の追加修正 (2026-10-08): RatingPhysicalのRestoreとQuickFolderSwitchはコピー済み状態に従い、不要なsource行世代条件を除く。Restoreのsource意味identityは元共通Surface証明に委ね、Collection revision／viewport hintの一致を重ねない。BSはRestoreとして共通Direct履歴を維持。実ZIP pin通知による同階層再構築とBack／BS、実Collection revision publishとBackを交差させ、明示open／行順Refreshの行検証は維持する。committed warm PDFの履歴／分類pending・modal中の保留は出荷済み動作として維持し、§9の記述を訂正。
+
+- master統合後の公開境界を追加修正 (2026-10-09): 検索prepareのthumbnail/source map・badge・ratingは成功採用closure内だけで適用。Bookmark buildはmainのSurface leaseとswitch sequenceを持つ単一ownerへ接続し、退出時に退役、遅延pollで再検証する。同一覧sortはownerを継続し、A/B記憶クリアでは旧epochを退役して表示中一覧のbuildを再開始する。ReadingHistory hydrationは送信済みCtrl+F条件で再計算し、未送信の編集を保持。実handlerとworker完了の交差回帰を追加し、§1.345は未着手。
 
 - 出典: 利用者が v4.4.0 リリース前の master 確認ビルド (2e84ee67f) で観測。手順:
   1. 一覧で拡張子の絞り込みをかける
@@ -224,6 +265,9 @@
 
 ### 1.329 外部ツールへ、渡すファイルの一覧を書いたリストファイルを渡す (`{file_list}`) — 利用者要望 (2026-10-05)
 - **次の版の決定 (利用者 2026-10-07)**: ライン C。固定の書き方 (1 行 1 パス、UTF-8 BOM なし、CRLF)。
+- **実装・自動検証完了 (2026-10-08、ライン C、独立実装レビュー・利用者動作確認待ち)**: [決定済み設計・検証記録](external-tool-file-list-plan.md)。
+  起動ごとのリストを既存 worker と一時成果物 lease へ追加し、index を保持した要求準備を
+  128 entry / 2ms の frame cursor へ分割する。C329-1 は利用者が 2026-10-08 に推奨案を採用。
 
 - 出典: 利用者メール (§1.308 の要望者、v4.3.0)。複数選択して右クリックから外部ツールを起動するとき、
   選んだファイルの一覧を書いた一時ファイルを作り、そのパスを `{file_list}` として渡したい。
@@ -1935,6 +1979,17 @@ V キーと同じ入口・同じ後始末を通るので、こちらとは別の
 
 ### 1.175 `ui_snapshot` のテスト実行体が、たまにアクセス違反で落ちる / 進まなくなる
 
+**2026-10-09 Line A / master統合gateで再観測:** 最終差分の並列snapshot（4 threads）は終盤4件で停滞した後、
+`ui_snapshot-bfef3a5205bc7fdd.exe` が `0xc0000005 / STATUS_ACCESS_VIOLATION` で異常終了した。
+実終了値は `-1073741819`、gate経過750秒。timeoutで中断した結果ではなく、製品変更との因果関係や
+fault moduleは未確定。証跡は `target/A-merge-final-snapshot.log` と `target/A-merge-final-results.json`。
+ソース・期待画像を変えず直列で一度再実行し、124/124成功（94.38秒、exit 0）。
+証跡は `target/A-merge-final-snapshot-serial.log`。同じ最終差分の全libは11,359成功・52 ignoredで
+AVなし（`target/A-merge-final-lib.log`）。並列AVを直列成功で消さず、既存の調査対象として残す。
+製品バイナリは起動せず、他worktreeのプロセスも操作していない。
+
+**2026-10-09 再観測 (利用者):** 次の版の並行作業中、テストを回している間に「wgpu Device Class」のメモリ read エラーダイアログがときどき出ると利用者が報告 (スクリーンショットあり)。タイトルの実行体名は `mimageviewer-7b8981ee7979cd4e…` で、`ui_snapshot` ではなく **lib テストの実行体** (`cargo test -p mimageviewer --lib`。環境設定などの egui_kittest snapshot を含む)。同じ時間帯は複数の worktree で cargo test / build が並行しており、実装担当の `cargo test` は `test-full.ps1 -SuppressCrashDialogs` を通らないためダイアログが出る。同型の AV が lib 実行体でも起きることになるので、調査対象を lib 実行体にも広げる。利用者の判断待ち: 調査の時期 (推奨は次の版の取り込みが一段落した後、他の重い処理と重ねずに cdb で繰り返し実行して例外時の stack を取る)。
+
 **2026-09-08 再観測:** v3.7.0向け動画高さ設定追加後の全体gateで、
 `ui_snapshot-6bb93fba2c7d6bab.exe` が45件の途中で `0xc0000005 / STATUS_ACCESS_VIOLATION` により終了した。
 利用者が報告した「wgpu Device Class」のWindowsメモリreadエラーダイアログとexe名が一致する。
@@ -2271,16 +2326,19 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
 
 - 要望: EffeTune を主にビジュアライザーとして使っており、毎回ツールバーの「音響調整」から窓を開いている。
   動画を再生したら自動で窓を開く設定がほしい。作者へも「mIV 側で追加を考えている」と伝え済み (2026-10-06 のメール、§1.338)。
-- 現状のコード: 読み込み完了後に窓を開く経路は既にある (`App::poll_effetune` の `open_gui_when_ready` →
-  `request_show_gui_with_permit`、`src/app.rs`)。最小化中・Remote 操作中に出さない判定 (`ShowPermit`) もそのまま使える。
-  窓は閉じても破棄せず隠すだけなので、表示中の画面 (Visualizer 等) は mIV を終了するまで保たれるはず (コードからの推定、未確認)。
-- 実装前に決めること:
-  - **開く頻度**: 起動後の最初の再生 1 回だけを推奨。利用者が閉じた後も再生のたびに開くと煩わしい。
-  - **フルスクリーン再生中の扱い**: 窓が動画に重なり、フォーカスを取るとキー操作を奪う。前面に出さず開く (自動復帰と同じ非アクティブ表示) か、フルスクリーン中は開かないか。
-  - **未起動のとき**: 自動で開くと「一度起動したら終了まで経由」(`docs/effetune-integration-plan.md` §0) に入る。設定を ON にした人だけなので許容でよいか確認する。
-  - 音声ファイルの再生も対象にするか (要望は動画)。
-  - 代替案: 「mIV 起動時に窓を開く」なら既存の起動時読み込み経路に乗せられて単純。
-- 既定 OFF。設定は環境設定 → 動画・音声の「音響調整 (EffeTune)」に置く想定。portable 版は音響調整自体が無いので表示しない。
+- 2026-10-08 利用者決定・実装: [確定設計と実装記録](effetune-auto-open-plan.md)。既定 OFF、
+  起動内の最初の適格なローカル動画成功で一度だけ非アクティブ表示する。音声／動画→音声モード／portable は対象外。
+  F12 通常別窓も対象とし、いずれかのローカル閲覧窓が全画面なら抑止する。
+- Playing 成功を transport owner の単一 PlaybackStart で確定し、normalize・seek・DSP・loop の内部再開は新しい開始にしない。
+  設定 OFF／root 非表示／全画面／最小化／Remote を一つの atomic projection と revision に集約し、
+  成功時の revision を worker／hidden attach／host 表示直前まで保持する。抑止往復後も遅延 popup を出さない。
+- 未起動なら既存 worker で EffeTune を開始し、終了まで DSP を経由する。成功した手動表示も自動機会を消費する。
+  自動要求後の取消し／失敗では再試行せず、既存表示済み窓・手動表示の lifecycle は維持する。
+- 設定は環境設定 → 動画・音声 → 動画 → 音響調整。旧 settings.db には既定 false の加算設定として保存する。
+  段階別配送テストの修正後、全 lib 11,027件成功／52件ignore。UI変更なしのため全 UI snapshot 116件の既存成功を再利用。
+  818606b3b レビューで host 再ビルド・source identity 一致を確認済みとして受領。
+  焦点85件・通常／portable core check・fmt・glyphも成功。
+  段階別取消しテストの修正後、test-full と変更 host を含む release launcher/core build は ClaudeCode が担当する。
 - 文書: `htdocs/mimageviewer/manual/effetune.html`、`docs/effetune-integration-plan.md`。
 - 規模 / 優先度: Small〜Medium / P3 (利用者本人の運用要望)。
 
@@ -2465,6 +2523,7 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
     レーティング一覧の件はコード調査のみ。
   - 報告者へ「今後の版で修正する。ほかの画面から開いた場合も確認する」と返信済み (2026-10-05)。
   - 報告者へ v4.4.0 での修正を連絡し、閲覧履歴・サブフォルダ展開は「コードを確認したところ同じく先頭が選ばれる作りで、引き続き対応する」と伝えた (2026-10-07)。
+  - **報告者が v4.4.0 で期待どおりの動き (通常フォルダ・レーティング一覧) になったことを確認** (2026-10-08、報告者のメール)。
 - 望ましい動き: ← で戻ったとき、開いていた ZIP を選択し、画面内に収める (BS で戻ったときと同じ)。
 - 原因 (コード調査、行番号は §1.335 統合後の修正前 `f18de061e` で再照合):
   - **通常フォルダ**: フォルダを離れるときの位置 (`folder_history` の scroll / selected) は `start_loading_items_inner`

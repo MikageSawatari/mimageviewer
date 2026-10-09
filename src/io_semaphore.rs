@@ -45,7 +45,7 @@ pub enum IoPriority {
 }
 
 struct SemState {
-    available: usize,
+    in_use: usize,
     total: usize,
     /// 各優先度の待機数 (対応する `IoPriority` をキーに、0..=2)
     waiting: [usize; 3],
@@ -57,15 +57,15 @@ struct SemState {
 
 impl SemState {
     /// 指定優先度が今 permit を取得してよいか?
-    /// - available > 0
+    /// - in_use < total
     /// - かつ自分より高い優先度の待機者がいない (または自分が最高優先度)
-    /// - かつ throttled=true の場合は in_use == 0 (= available == total) である
+    /// - かつ throttled=true の場合は in_use == 0 である
     fn can_acquire(&self, pri: IoPriority) -> bool {
-        if self.available == 0 {
+        if self.in_use >= self.total {
             return false;
         }
         // throttle モード: 実効上限 1 permit。in_use >= 1 なら新規取得不可。
-        if self.throttled && self.available < self.total {
+        if self.throttled && self.in_use != 0 {
             return false;
         }
         // 自分より高い優先度の waiter がいるなら、その人に譲る
@@ -83,13 +83,36 @@ pub struct GlobalIoSemaphore {
 }
 
 impl GlobalIoSemaphore {
+    /// Process-wide production I/O budget, also used before indexer startup.
+    pub fn process_shared(total: usize) -> Arc<Self> {
+        let owner = Self::process_shared_owner(total.max(1));
+        owner.set_total(total.max(1));
+        owner
+    }
+
+    fn process_shared_owner(initial_total: usize) -> Arc<Self> {
+        static SHARED: std::sync::OnceLock<Arc<GlobalIoSemaphore>> = std::sync::OnceLock::new();
+        Arc::clone(SHARED.get_or_init(|| Arc::new(Self::new(initial_total))))
+    }
+
+    /// Update the budget without revoking holders or replacing the shared owner.
+    /// A shrink below in_use blocks new acquisitions until enough holders release.
+    pub fn set_total(&self, total: usize) {
+        assert!(total >= 1, "total permits must be >= 1");
+        let (mu, cv) = &*self.inner;
+        let mut state = mu.lock().unwrap();
+        if state.total != total {
+            state.total = total;
+            cv.notify_all();
+        }
+    }
     /// 最大 `total` 個の I/O 同時実行を許可するセマフォを作る。
     pub fn new(total: usize) -> Self {
         assert!(total >= 1, "total permits must be >= 1");
         Self {
             inner: Arc::new((
                 Mutex::new(SemState {
-                    available: total,
+                    in_use: 0,
                     total,
                     waiting: [0, 0, 0],
                     throttled: false,
@@ -107,7 +130,7 @@ impl GlobalIoSemaphore {
     /// 見かけ上スループットは設定 `indexer_speed_profile` によらず 1 permit 相当に落ちる。
     ///
     /// 既存の permit holder は revoke しない (drop まで維持)。throttle 発効直後に
-    /// `available == total` になるまで最大 1 permit 分の処理が走る点は許容する
+    /// `in_use == 0` になるまで既存 holder 分の処理が走る点は許容する
     /// (通常は数百 ms 単位)。
     pub fn set_throttled(&self, throttled: bool) {
         let (mu, cv) = &*self.inner;
@@ -139,7 +162,7 @@ impl GlobalIoSemaphore {
             st = cv.wait(st).unwrap();
         }
         st.waiting[priority as usize] -= 1;
-        st.available -= 1;
+        st.in_use += 1;
         IoPermit {
             sem: Arc::clone(&self.inner),
         }
@@ -174,7 +197,7 @@ impl GlobalIoSemaphore {
             return None;
         }
         st.waiting[priority as usize] -= 1;
-        st.available -= 1;
+        st.in_use += 1;
         Some(IoPermit {
             sem: Arc::clone(&self.inner),
         })
@@ -188,7 +211,7 @@ impl GlobalIoSemaphore {
         if !st.can_acquire(priority) {
             return None;
         }
-        st.available -= 1;
+        st.in_use += 1;
         Some(IoPermit {
             sem: Arc::clone(&self.inner),
         })
@@ -198,7 +221,7 @@ impl GlobalIoSemaphore {
     pub fn stats(&self) -> (usize, usize) {
         let (mu, _cv) = &*self.inner;
         let st = mu.lock().unwrap();
-        (st.available, st.total)
+        (st.total.saturating_sub(st.in_use), st.total)
     }
 
     #[cfg(test)]
@@ -208,7 +231,7 @@ impl GlobalIoSemaphore {
     }
 }
 
-/// RAII permit。Drop で available を元に戻し、Condvar で待機者を起床させる。
+/// RAII permit。Drop で in_use を減らし、Condvar で待機者を起床させる。
 pub struct IoPermit {
     sem: Arc<(Mutex<SemState>, Condvar)>,
 }
@@ -217,11 +240,11 @@ impl Drop for IoPermit {
     fn drop(&mut self) {
         let (mu, cv) = &*self.sem;
         let mut st = mu.lock().unwrap();
-        st.available += 1;
         debug_assert!(
-            st.available <= st.total,
-            "IoPermit: available exceeded total (double-release?)"
+            st.in_use > 0,
+            "IoPermit: no holder to release (double-release?)"
         );
+        st.in_use -= 1;
         // 待機者に通知。優先度別に最適化した notify にしたいが、Condvar はキー別 wait を
         // 持たないので notify_all で全員起床させ、`can_acquire` で二次判定させる。
         // 待機数が少ない前提なので thundering herd は問題にならない。
@@ -484,5 +507,108 @@ mod tests {
         assert_eq!(done.load(Ordering::SeqCst), 8);
         // 最終的に available が 2 に戻っていること
         assert_eq!(sem.stats().0, 2);
+    }
+
+    #[test]
+    fn shrinking_budget_preserves_every_outstanding_holder() {
+        let sem = GlobalIoSemaphore::new(4);
+        let holders = (0..4)
+            .map(|_| sem.acquire(IoPriority::Normal))
+            .collect::<Vec<_>>();
+        sem.set_total(1);
+        assert_eq!(sem.stats(), (0, 1));
+        for (index, holder) in holders.into_iter().enumerate() {
+            assert!(sem.try_acquire(IoPriority::High).is_none());
+            drop(holder);
+            assert_eq!(sem.stats(), (usize::from(index == 3), 1));
+        }
+        let last = sem.try_acquire(IoPriority::Normal).unwrap();
+        assert!(sem.try_acquire(IoPriority::Normal).is_none());
+        drop(last);
+        assert_eq!(sem.stats(), (1, 1));
+    }
+
+    fn wait_for_waiter(sem: &GlobalIoSemaphore, priority: IoPriority) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while sem.waiting_for_test(priority) == 0 {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn increasing_budget_wakes_waiters_without_losing_priority_or_existing_holders() {
+        let sem = Arc::new(GlobalIoSemaphore::new(1));
+        let holder = sem.acquire(IoPriority::Normal);
+        let (order_tx, order_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let low_sem = Arc::clone(&sem);
+        let low_tx = order_tx.clone();
+        let low = std::thread::spawn(move || {
+            let _permit = low_sem.acquire(IoPriority::Low);
+            low_tx.send("low").unwrap();
+        });
+        wait_for_waiter(&sem, IoPriority::Low);
+        let high_sem = Arc::clone(&sem);
+        let high = std::thread::spawn(move || {
+            let _permit = high_sem.acquire(IoPriority::High);
+            order_tx.send("high").unwrap();
+            release_rx.recv().unwrap();
+        });
+        wait_for_waiter(&sem, IoPriority::High);
+
+        sem.set_total(2);
+        assert_eq!(
+            order_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            "high"
+        );
+        assert_eq!(sem.stats(), (0, 2));
+        assert!(
+            order_rx.try_recv().is_err(),
+            "low cannot pass either live holder"
+        );
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            order_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            "low"
+        );
+        high.join().unwrap();
+        low.join().unwrap();
+        assert_eq!(sem.stats(), (1, 2));
+        drop(holder);
+        assert_eq!(sem.stats(), (2, 2));
+    }
+
+    #[test]
+    fn changing_total_keeps_throttle_and_counts_holders_across_shrink_and_growth() {
+        let sem = GlobalIoSemaphore::new(2);
+        let first = sem.acquire(IoPriority::Normal);
+        let second = sem.acquire(IoPriority::Normal);
+        sem.set_throttled(true);
+        sem.set_total(4);
+        assert!(sem.try_acquire(IoPriority::High).is_none());
+        drop(first);
+        assert!(sem.try_acquire(IoPriority::High).is_none());
+        drop(second);
+        let throttled = sem.try_acquire(IoPriority::Normal).unwrap();
+        sem.set_total(1);
+        assert!(sem.try_acquire(IoPriority::Normal).is_none());
+        sem.set_total(4);
+        assert!(sem.is_throttled());
+        assert!(sem.try_acquire(IoPriority::Normal).is_none());
+        sem.set_throttled(false);
+        let additional = sem.try_acquire(IoPriority::Normal).unwrap();
+        assert_eq!(sem.stats(), (2, 4));
+        drop(additional);
+        drop(throttled);
+        assert_eq!(sem.stats(), (4, 4));
+    }
+
+    #[test]
+    fn process_budget_lookup_reuses_one_owner_without_mutating_its_configuration() {
+        // Identity only: local-instance tests exercise resizing, avoiding global test races.
+        let first = GlobalIoSemaphore::process_shared_owner(1);
+        let second = GlobalIoSemaphore::process_shared_owner(4);
+        assert!(Arc::ptr_eq(&first, &second));
     }
 }

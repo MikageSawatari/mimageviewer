@@ -650,6 +650,43 @@ impl VideoThumbnailIndicator {
     }
 }
 
+// 音声の画像がある場合だけ重ねる目印。無画像 fallback は設定に関係なく残す。
+/// サムネイル一覧で音声を示す目印の表示方法。
+///
+/// `Unknown` は将来版の値を旧版で読み込んだときの受け皿。設定の sanitize 時に、
+/// 既存動作の音楽アイコンへ正規化する。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AudioThumbnailIndicator {
+    #[default]
+    MusicNoteIcon,
+    BottomLeftBadge,
+    Hidden,
+    #[serde(other)]
+    Unknown,
+}
+
+impl AudioThumbnailIndicator {
+    pub fn label(self) -> &'static str {
+        match self.normalized() {
+            Self::MusicNoteIcon => "音楽アイコン",
+            Self::BottomLeftBadge => "左下バッジ",
+            Self::Hidden => "なし",
+            Self::Unknown => unreachable!("normalized audio thumbnail indicator"),
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[Self::MusicNoteIcon, Self::BottomLeftBadge, Self::Hidden]
+    }
+
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Unknown => Self::MusicNoteIcon,
+            indicator => indicator,
+        }
+    }
+}
+
 // -----------------------------------------------------------------------
 // 選択情報の表示方法
 // -----------------------------------------------------------------------
@@ -4204,6 +4241,8 @@ pub struct Settings {
     #[serde(default)]
     pub grid_open_selected_item_on_click: bool,
     #[serde(default)]
+    pub grid_background_double_click_parent: bool,
+    #[serde(default)]
     pub grid_cursor_wrap: bool,
     #[serde(default)]
     pub details_sort_key: DetailsSortKey,
@@ -4222,6 +4261,9 @@ pub struct Settings {
     pub details_timestamp_show_seconds: bool,
     #[serde(default)]
     pub details_row_style: DetailsRowStyle,
+    /// 詳細一覧の名前列だけに適用するカテゴリ色。既存設定の欠落は既定 ON。
+    #[serde(default)]
+    pub details_name_colors: crate::details_name_colors::DetailsNameColors,
     #[serde(default)]
     pub details_column_order: Vec<DetailsColumnId>,
     #[serde(default)]
@@ -4471,6 +4513,9 @@ pub struct Settings {
     /// 動画サムネイルを示す目印。既定は従来どおり中央の再生アイコン。
     #[serde(default)]
     pub video_thumbnail_indicator: VideoThumbnailIndicator,
+    /// 音声の代表画像に重ねる目印。無画像時の音楽アイコンは常に表示する。
+    #[serde(default)]
+    pub audio_thumbnail_indicator: AudioThumbnailIndicator,
     /// ファイル名 prefix スタック (v2.0.0) のグループ化区切り文字。既定 '_'。
     /// 例: '_' のとき "12345678_p0.jpg" は prefix "12345678" でまとまる
     /// (docs/filename-stack-plan.md)。スタックモードの ON/OFF 自体は transient で
@@ -4784,7 +4829,7 @@ pub struct Settings {
     pub skip_archive_if_zip_exists: bool,
     #[serde(default = "default_true")]
     pub skip_epub_if_pdf_exists: bool,
-    /// 同名の動画と画像がある場合、画像をスキップする（動画サムネイルで代替）
+    /// 同名の動画・音声と画像がある場合、画像を省略する。released field 名は互換性のため保持。
     #[serde(default = "default_true")]
     pub skip_image_if_video_exists: bool,
     /// 同名の画像が複数拡張子で存在する場合、優先度の低いものをスキップする
@@ -5725,11 +5770,11 @@ pub struct Settings {
     /// interlaced を示す場合に bwdif を適用する。
     #[serde(default)]
     pub video_deinterlace: VideoDeinterlaceMode,
-    /// 動画グリッドサムネに、同名ファイル名の画像 (= sidecar、例 movie.mp4 の隣の
-    /// movie.jpg) があれば優先採用するか。Phase 5.3 で導入。
-    /// 既存ユーザー (= 過去の動作と整合) のため既定 true。OFF にすると Windows Shell
-    /// 経由の動画自身のデフォルトサムネのみが使われる。
-    /// ピン留めサムネ (= Phase 5.4.1 で実装予定) は本設定とは独立で常に最優先。
+    /// 動画・音声の同 stem の sidecar 画像を代表サムネイルに使うか。
+    /// 例: movie.mp4 + movie.jpg、song.mp3 + song.jpg を同じフォルダへ置く。
+    /// released field 名と既定 true は維持する。既存 OFF は音声にも適用する。
+    /// OFF の場合、動画は Windows Shell、MP3 は埋め込み画像へ進む。
+    /// 動画のピン留めフレームは本設定とは独立で常に最優先。
     #[serde(default = "default_true")]
     pub video_thumb_use_sidecar_image: bool,
     /// 動画タイルモードの列数 (Phase 6.D)。タイル中 Ctrl+Wheel で
@@ -5789,6 +5834,9 @@ pub struct Settings {
     /// EffeTune へ渡す前に 0 dBFS 超のサンプルを抑える。設定の確定時に音声処理へ公開する。
     #[serde(default = "default_true")]
     pub effetune_pre_limiter_enabled: bool,
+    /// 起動後の最初の適格なローカル動画再生で音響調整の窓を非アクティブ表示する。
+    #[serde(default)]
+    pub effetune_auto_open_on_video: bool,
     /// メイン最小化中も、表示していた音響調整の窓を残す。
     #[serde(default)]
     pub effetune_keep_visible_when_minimized: bool,
@@ -7311,6 +7359,7 @@ impl Default for Settings {
             grid_view_mode: GridViewMode::default(),
             grid_click_selection_mode: GridClickSelectionMode::default(),
             grid_open_selected_item_on_click: false,
+            grid_background_double_click_parent: false,
             grid_cursor_wrap: false,
             details_sort_key: DetailsSortKey::default(),
             details_page_count_sort_stash: false,
@@ -7319,6 +7368,7 @@ impl Default for Settings {
             details_size_display_mode: DetailsSizeDisplayMode::default(),
             details_timestamp_show_seconds: false,
             details_row_style: DetailsRowStyle::default(),
+            details_name_colors: crate::details_name_colors::DetailsNameColors::default(),
             details_column_order: Vec::new(),
             details_column_widths: Vec::new(),
             details_rated_at_width: None,
@@ -7409,6 +7459,7 @@ impl Default for Settings {
             subfolder_expansion_filter_size_preset: None,
             grid_display_order: GridDisplayOrder::default(),
             video_thumbnail_indicator: VideoThumbnailIndicator::default(),
+            audio_thumbnail_indicator: AudioThumbnailIndicator::default(),
             thumb_px: default_thumb_px(),
             text_preview_scale: default_text_preview_scale(),
             text_smart_snap_enabled: true,
@@ -7731,6 +7782,7 @@ impl Default for Settings {
             vst3_plugin_state: None,
             vst3_gui_visible: true,
             effetune_pre_limiter_enabled: true,
+            effetune_auto_open_on_video: false,
             effetune_keep_visible_when_minimized: false,
             effetune_gui_pos: None,
             effetune_gui_size: None,
@@ -9882,7 +9934,9 @@ impl Settings {
         self.facet_name_filter_width = self.facet_name_filter_width.normalized();
         self.grid_click_selection_mode = self.grid_click_selection_mode.normalized();
         self.video_thumbnail_indicator = self.video_thumbnail_indicator.normalized();
-        // grid_open_selected_item_on_click / grid_cursor_wrap は bool のため不正値を持たない。
+        self.audio_thumbnail_indicator = self.audio_thumbnail_indicator.normalized();
+        // grid_open_selected_item_on_click / grid_background_double_click_parent /
+        // grid_cursor_wrap は bool のため不正値を持たない。
         // 旧設定の欠落は serde default で false に補い、sanitize では読み込んだ ON/OFF を
         // そのまま維持する。
         self.selection_info_display_mode = self.selection_info_display_mode.normalized();
@@ -10386,6 +10440,41 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn details_name_colors_legacy_missing_and_sqlite_roundtrip() {
+        use crate::details_name_colors::{DetailsNameColor, DetailsNameColors};
+        let old: Settings = serde_json::from_str(r#"{"details_name_width":222.0}"#).unwrap();
+        assert_eq!(old.details_name_colors, DetailsNameColors::default());
+        assert_eq!(old.details_name_width, 222.0);
+        let mut settings = old;
+        settings.details_name_colors.enabled = false;
+        settings.details_name_colors.colors[0] = DetailsNameColor::Custom {
+            light: [90, 60, 0],
+            dark: [214, 186, 102],
+        };
+        settings.text_contrast = TextContrast::Strong;
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::settings_db::SettingsDb::create_new(tmp.path()).unwrap();
+        db.save_full(&settings).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert_eq!(loaded.details_name_colors, settings.details_name_colors);
+        assert_eq!(loaded.text_contrast, TextContrast::Strong);
+        assert_eq!(loaded.details_name_width, 222.0);
+        drop(db);
+        let conn = rusqlite::Connection::open(tmp.path().join("settings.db")).unwrap();
+        conn.execute(
+            "DELETE FROM settings_kv WHERE key = 'details_name_colors'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let db = crate::settings_db::SettingsDb::open(tmp.path()).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert_eq!(loaded.details_name_colors, DetailsNameColors::default());
+        assert_eq!(loaded.details_name_width, 222.0);
+        assert_eq!(loaded.text_contrast, TextContrast::Strong);
+    }
+
     #[test]
     fn thumb_show_resume_meter_defaults_on_and_preserves_disabled_setting() {
         assert!(Settings::default().thumb_show_resume_meter);
@@ -11959,6 +12048,29 @@ mod tests {
     }
 
     #[test]
+    fn grid_background_double_click_settings_default_and_roundtrip() {
+        assert!(!Settings::default().grid_background_double_click_parent);
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!missing.grid_background_double_click_parent);
+        // The enum was never released. Its old field is ignored, with no migration.
+        let old: Settings = serde_json::from_value(serde_json::json!({
+            "grid_background_double_click_action": "parent_folder"
+        }))
+        .unwrap();
+        assert!(!old.grid_background_double_click_parent);
+        for enabled in [false, true] {
+            let mut settings: Settings = serde_json::from_value(serde_json::json!({
+                "grid_background_double_click_parent": enabled
+            }))
+            .unwrap();
+            settings.sanitize();
+            let roundtrip: Settings =
+                serde_json::from_value(serde_json::to_value(&settings).unwrap()).unwrap();
+            assert_eq!(roundtrip.grid_background_double_click_parent, enabled);
+        }
+    }
+
+    #[test]
     fn grid_open_selected_item_on_click_defaults_off_and_survives_sanitize() {
         assert!(!Settings::default().grid_open_selected_item_on_click);
         let loaded: Settings = serde_json::from_str("{}").unwrap();
@@ -12263,6 +12375,42 @@ mod tests {
         assert_eq!(
             loaded.video_thumbnail_indicator,
             VideoThumbnailIndicator::PlayIcon
+        );
+    }
+
+    #[test]
+    fn audio_thumbnail_indicator_defaults_to_the_music_note_icon() {
+        assert_eq!(
+            Settings::default().audio_thumbnail_indicator,
+            AudioThumbnailIndicator::MusicNoteIcon
+        );
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            loaded.audio_thumbnail_indicator,
+            AudioThumbnailIndicator::MusicNoteIcon
+        );
+        assert_eq!(
+            AudioThumbnailIndicator::all(),
+            &[
+                AudioThumbnailIndicator::MusicNoteIcon,
+                AudioThumbnailIndicator::BottomLeftBadge,
+                AudioThumbnailIndicator::Hidden,
+            ]
+        );
+    }
+
+    #[test]
+    fn audio_thumbnail_indicator_normalizes_unknown_to_the_existing_default() {
+        let mut loaded: Settings =
+            serde_json::from_str(r#"{"audio_thumbnail_indicator":"FutureIndicator"}"#).unwrap();
+        assert_eq!(
+            loaded.audio_thumbnail_indicator,
+            AudioThumbnailIndicator::Unknown
+        );
+        loaded.sanitize();
+        assert_eq!(
+            loaded.audio_thumbnail_indicator,
+            AudioThumbnailIndicator::MusicNoteIcon
         );
     }
 
@@ -18676,5 +18824,22 @@ mod tests {
             live.clipboard_capture_min_short_side_px,
             super::CLIPBOARD_CAPTURE_MIN_SHORT_SIDE_MAX_PX
         );
+    }
+}
+
+impl Settings {
+    /// A lightweight immutable scan snapshot, without copying histories, preset rows or VST state.
+    pub(crate) fn thumbnail_source_discovery_snapshot(&self) -> Self {
+        Self {
+            skip_image_if_video_exists: self.skip_image_if_video_exists,
+            video_thumb_use_sidecar_image: self.video_thumb_use_sidecar_image,
+            show_hidden_files: self.show_hidden_files,
+            archive_file_handling: self.archive_file_handling,
+            epub_file_handling: self.epub_file_handling,
+            skip_duplicate_images: self.skip_duplicate_images,
+            image_ext_priority: self.image_ext_priority.clone(),
+            susie_enabled: self.susie_enabled,
+            ..Self::default()
+        }
     }
 }

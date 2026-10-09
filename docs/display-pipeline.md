@@ -5,6 +5,13 @@
 
 ---
 
+### 音声セルの代表画像 (§1.347、2026-10-08)
+
+Audio は既存 worker / texture backlog に乗り、同名 sidecar → MP3 先頭 ID3v2 の前面表紙優先 → 音楽アイコンの順で表示する。`ThumbnailState::NoArt` は正常終端で、Failed とともに一覧世代内では再投入・hover repaint を続けない。Loaded の画像寸法を Auto 比率へ使い、画像のない音声を分母から除く。全音声が終端なら Auto 未確定も現在の比率で終わる。
+
+`ThumbMsgPayload` が Pixels / NoArt / Failed / Canceled / Finalized を一つに所有する。Audio は保存完了後に一通知を送り、既存の他媒体の Finalized 通知は維持する。音声マークは `AudioThumbnailIndicator` の音楽アイコン (既定) / 文字バッジ / なし。画像なしではどの設定でも音楽アイコンを描く。音声を補正対象の画像ページにせず、再生画面・入力操作は保持する。[詳細設計](audio-album-art-plan.md)。
+
+
 ## 1. サムネイル表示パイプライン
 
 ### 1.1 状態機械
@@ -50,6 +57,17 @@ hover と pointer owner は通常 alpha のまま後段で描く。詳細一覧�
 カーソルを通常 alpha にし、preview icon と列文字だけを 0.5 にする。詳細行 helper を共有する
 下部情報バーは表示専用 caller なので opacity 1.0 を維持する。fullscreen 本体はこの projection を
 参照しない。
+
+### 1.1.2 サムネイル余白の一次クリック（§1.298）
+
+既定OFFの「サムネイルの余白部分のダブルクリックで親フォルダへ移動」がONの場合だけ、
+`grid_paint::draw_cell_with_hit_areas`が描画した画像・plate・label・overlayの矩形を同frameの
+一次入力に返す。補正texture・回転・DPI・clipを別計算せず、letterboxと外周余白を背景にする。
+bookmark title plateも実描画の矩形を返す。右クリック／右ドラッグとOFF時は従来のセル全体の判定。
+押下のCell／Background所属は既存pairing ownerの型で持ち、永続hit cacheや別の背景ownerを作らない。
+native D&Dはその押下時の所属を使い、読込み完了後の矩形で押下点を再判定しない。
+小さいセルでplateからはみ出すcaption・理由・アイコンも、描いた領域のセル／一覧clip内を項目として返す。
+媒体別の境界・実描画順の検証は[決定仕様](grid-background-double-click-plan.md#描画領域とセル種類)を参照。
 
 ### 1.2 2 フェーズ優先ロード
 

@@ -120,6 +120,9 @@ const STARTUP_DIALOG_CASES: &[(&str, &[&str])] = &[
     ("archive_sibling", &["ZIP ファイルに変換", "キャンセル"]),
     ("archive_converting", &["キャンセル"]),
     ("archive_error", &["閉じる"]),
+    ("archive_publish_error", &["閉じる"]),
+    ("archive_later_volume_error", &["閉じる"]),
+    ("archive_no_images_error", &["閉じる"]),
 ];
 
 #[test]
@@ -310,9 +313,16 @@ fn startup_dialogs_small_viewport() {
                 harness.hover_at(egui::Pos2::ZERO);
                 harness.run_steps(3);
                 // Geometry and pointer assertions cover every case. Keep PNGs
-                // only for four representative views and two settled highlights.
+                // for representative views, archive errors, and settled highlights.
                 let snapshot = ((width, height) == (1093, 614)
-                    && matches!(kind, "first_setup" | "archive_confirm"))
+                    && matches!(
+                        kind,
+                        "first_setup"
+                            | "archive_confirm"
+                            | "archive_publish_error"
+                            | "archive_later_volume_error"
+                            | "archive_no_images_error"
+                    ))
                     || (kind == "whats_new" && scale == 1.0);
                 if snapshot {
                     let suffix = if scale == 1.0 { "" } else { "_ui200" };
@@ -1482,6 +1492,79 @@ fn details_icons_light() {
 }
 
 #[test]
+fn details_name_colors_light() {
+    snapshot_details_name_colors("details_name_colors_light", false, false);
+}
+#[test]
+fn details_name_colors_dark() {
+    snapshot_details_name_colors("details_name_colors_dark", true, false);
+}
+#[test]
+fn details_name_colors_strong_light() {
+    snapshot_details_name_colors("details_name_colors_strong_light", false, true);
+}
+#[test]
+fn details_name_colors_strong_dark() {
+    snapshot_details_name_colors("details_name_colors_strong_dark", true, true);
+}
+#[test]
+fn details_name_color_settings_light() {
+    snapshot_details_name_settings("details_name_color_settings_light", false, false);
+}
+#[test]
+fn details_name_color_settings_dark() {
+    snapshot_details_name_settings("details_name_color_settings_dark", true, false);
+}
+#[test]
+fn details_name_color_settings_strong_light() {
+    snapshot_details_name_settings("details_name_color_settings_strong_light", false, true);
+}
+#[test]
+fn details_name_color_settings_strong_dark() {
+    snapshot_details_name_settings("details_name_color_settings_strong_dark", true, true);
+}
+
+// Each test owns one harness: egui_kittest requires explicitly merged results
+// when multiple harnesses update snapshots in a single test.
+fn snapshot_details_name_colors(name: &str, dark: bool, strong: bool) {
+    snapshot_details_name_fixture(
+        name,
+        dark,
+        strong,
+        egui::vec2(620.0, 580.0),
+        mimageviewer::draw_details_name_colors_snapshot_fixture,
+    );
+}
+
+fn snapshot_details_name_settings(name: &str, dark: bool, strong: bool) {
+    snapshot_details_name_fixture(
+        name,
+        dark,
+        strong,
+        egui::vec2(760.0, 800.0),
+        mimageviewer::draw_details_name_color_settings_snapshot_fixture,
+    );
+}
+
+fn snapshot_details_name_fixture(
+    name: &str,
+    dark: bool,
+    strong: bool,
+    size: egui::Vec2,
+    fixture: impl FnMut(&mut egui::Ui),
+) {
+    use mimageviewer::os_theme::ResolvedTheme::{Dark, Light};
+    use mimageviewer::settings::TextContrast::{Standard, Strong};
+    snapshot_with_theme_contrast_and_size(
+        name,
+        if dark { Dark } else { Light },
+        if strong { Strong } else { Standard },
+        size,
+        fixture,
+    );
+}
+
+#[test]
 fn details_icons_dark() {
     snapshot_with_theme_at_size(
         "details_icons_dark",
@@ -1524,6 +1607,16 @@ fn preferences_effetune_input_limit_dark() {
 }
 
 #[test]
+#[cfg(not(feature = "portable"))]
+fn preferences_effetune_auto_open_light() {
+    snapshot_with_theme(
+        "preferences_effetune_auto_open_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        mimageviewer::draw_effetune_input_limit_snapshot_fixture,
+    );
+}
+
+#[test]
 fn preferences_book_resume_meter_light() {
     snapshot_with_theme(
         "preferences_book_resume_meter_light",
@@ -1552,6 +1645,18 @@ fn preferences_video_thumbnail_indicator_dark() {
     snapshot_with_theme(
         "preferences_video_thumbnail_indicator_dark",
         mimageviewer::os_theme::ResolvedTheme::Dark,
+        |ui| {
+            ui.set_width(440.0);
+            mimageviewer::draw_video_thumbnail_indicator_settings_snapshot_fixture(ui);
+        },
+    );
+}
+
+#[test]
+fn preferences_media_thumbnail_sources_light() {
+    snapshot_with_theme(
+        "preferences_media_thumbnail_sources_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
         |ui| {
             ui.set_width(440.0);
             mimageviewer::draw_video_thumbnail_indicator_settings_snapshot_fixture(ui);
@@ -1602,6 +1707,17 @@ fn metadata_panel_similar_states_dark() {
         egui::vec2(400.0, 640.0),
         None,
         mimageviewer::draw_similar_states_snapshot_fixture,
+    );
+}
+
+#[test]
+fn grid_background_double_click_settings_dark() {
+    snapshot_with_theme_at_size(
+        "grid_background_double_click_settings_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(480.0, 150.0),
+        None,
+        mimageviewer::draw_grid_background_double_click_settings_snapshot_fixture,
     );
 }
 
@@ -3053,5 +3169,71 @@ fn normalize_hud_navigation_music_400pt_time_dark() {
         Some(4),
         mimageviewer::ui_music_panels::draw_music_normalize_snapshot_fixture,
         |_| {},
+    );
+}
+
+#[test]
+fn audio_thumbnail_indicator_modes_dark() {
+    snapshot_with_theme_at_size(
+        "audio_thumbnail_indicator_modes_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(480.0, 430.0),
+        None,
+        mimageviewer::draw_audio_thumbnail_indicator_snapshot_fixture,
+    );
+}
+
+#[test]
+fn audio_thumbnail_indicator_modes_light() {
+    snapshot_with_theme_at_size(
+        "audio_thumbnail_indicator_modes_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(480.0, 430.0),
+        None,
+        mimageviewer::draw_audio_thumbnail_indicator_snapshot_fixture,
+    );
+}
+
+#[test]
+fn external_tool_file_list_help_light() {
+    snapshot_with_theme(
+        "external_tool_file_list_help_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        mimageviewer::external_tool::draw_external_tool_placeholder_help,
+    );
+}
+
+#[test]
+fn external_tool_file_list_help_dark() {
+    snapshot_with_theme(
+        "external_tool_file_list_help_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::external_tool::draw_external_tool_placeholder_help,
+    );
+}
+
+#[test]
+fn external_tool_preparing_light() {
+    snapshot_with_theme_and_contrast_settling(
+        "external_tool_preparing_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        mimageviewer::settings::TextContrast::Standard,
+        Some(4),
+        |ui| {
+            mimageviewer::external_tool::draw_external_tool_preparing_body(ui, 128);
+        },
+    );
+}
+
+#[test]
+fn external_tool_preparing_dark() {
+    snapshot_with_theme_and_contrast_settling(
+        "external_tool_preparing_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::Standard,
+        Some(4),
+        |ui| {
+            mimageviewer::external_tool::draw_external_tool_preparing_body(ui, 128);
+        },
     );
 }

@@ -990,13 +990,13 @@ fn load_palette_for_request(
 
     let mut image = None;
     while let Ok(msg) = rx.try_recv() {
-        if msg.canceled {
+        if msg.is_canceled() {
             // Transient unavailable pixels must not become an empty, final palette.
             cancel.store(true, Ordering::Release);
             return None;
         }
         if image.is_none() {
-            image = msg.image;
+            image = msg.into_pixels().map(|pixels| pixels.image);
         }
     }
     image
