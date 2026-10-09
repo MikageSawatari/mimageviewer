@@ -2377,6 +2377,7 @@ fn draw_music_playback_row(
                     spd_r,
                     text_center_y,
                     speed,
+                    None,
                     speed_id,
                     speed_popup_id,
                     hud_rect.left(),

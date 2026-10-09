@@ -2900,6 +2900,12 @@ pub(super) fn draw_native_frame_step_button(
     let held_from_this_button = hold
         .as_ref()
         .is_some_and(|state| state.direction == direction);
+    if !resp.enabled() {
+        if held_from_this_button {
+            *hold = None;
+        }
+        return false;
+    }
     let down = resp.is_pointer_button_down_on() || (primary_down && held_from_this_button);
     let now = Instant::now();
     if down {
@@ -7349,6 +7355,7 @@ pub(crate) fn draw_overlay_speed_control(
     speed_rect: egui::Rect,
     text_center_y: f32,
     playback_speed: f64,
+    measured_label: Option<&std::sync::Arc<egui::Galley>>,
     button_id: egui::Id,
     popup_area_id: egui::Id,
     container_left: f32,
@@ -7362,13 +7369,19 @@ pub(crate) fn draw_overlay_speed_control(
     let mut result = None;
     let mut speed_resp = ui.interact(speed_rect, button_id, egui::Sense::click());
     draw_overlay_button_bg(painter, speed_rect, speed_resp.hovered(), false);
-    painter.text(
-        egui::pos2(speed_rect.center().x, text_center_y),
-        egui::Align2::CENTER_CENTER,
-        format_playback_speed(playback_speed),
-        crate::ui_fonts::hud_text_font(12.0),
-        egui::Color32::from_rgb(238, 238, 238),
-    );
+    let center = egui::pos2(speed_rect.center().x, text_center_y);
+    let color = egui::Color32::from_rgb(238, 238, 238);
+    if let Some(label) = measured_label {
+        painter.galley_with_override_text_color(center - label.size() * 0.5, label.clone(), color);
+    } else {
+        painter.text(
+            center,
+            egui::Align2::CENTER_CENTER,
+            format_playback_speed(playback_speed),
+            crate::ui_fonts::hud_text_font(12.0),
+            color,
+        );
+    }
     // リセットはダブルクリックのみ (音量スライダーと同じ理由。右クリックは背後の
     // フルスクリーン右クリック挙動に譲る。実機 FB 2026-07-02)。
     if speed_resp.double_clicked() {

@@ -3866,3 +3866,41 @@ cargo fmt / fmt --check、glyph lint（危険glyph 0）、通常 / portable core
 `build-dev.ps1 -PreserveRuntime`は、このworktreeの起動中core（PID 95144）を検出してexit 1で
 停止した。プロセスを終了せず、今回の確認用バイナリは未生成。利用者が閉じた後に同じscriptを
 再実行する必要がある。独立レビュー・今回の修正の実機確認・製品起動・commitは行っていない。
+
+#### 複数トラックHUDのレビュー修正（2026-10-09）
+
+測定開始がフレーム送りの押下中に到着すると、disabled表示でも既存holdから100msごとの
+`FrameStep`が続いていた。`set_normalize_state`でScanningへ入る際に既存holdを終了し、
+実ボタンの入力producerも`Response::enabled()`を確認してdisabled時には新規・継続commandを
+発行しない。Appのcommand consumerやキー操作のownerは変更しない。実CPU HUDへのnative入力で
+通常押下 → Scanning → 押下継続 → viewport外releaseを両方向に検査する。
+
+文字計測はnative coreに属する`bottom_hud::TextCache`へまとめた。時間（全体 / 現在位置）、
+速度、音声番号、dB、Normのgalleyを値ごとに保持し、同じgalleyの実幅で配置し、そのまま描画する。
+時間の短縮・小さい高さへのfittingも同じ文字と割当サイズが続く間は再利用する。
+速度の計測フォントは描画と同じ12ptに揃える。共有速度popupの操作は維持し、音楽側の呼出しは
+従来の描画経路を使う。キャッシュはcoreとともに破棄され、保存設定・表示先identityは増やさない。
+
+フォントatlas / フォント定義 / DPIの変更で古いUVを使わないため、egui自身のgalley cacheの
+空jobを毎描画passで1回参照し、返るArcのidentityが変わったら文字cacheを破棄する。
+空jobはラベルStringを所有化しない。値が変わらないフレームではこの1回の参照、数値key比較、
+Arc参照の複製、矩形計算と既存の描画・入力登録が残る。追加した6ラベルの文字列整形と文字layout
+要求は行わない。既存tooltip、開いたpopup、シーク行などの処理まで無割当にしたとは主張しない。
+egui Areaの既存transformは描画meshを複製するため、この費用も残る。実HUDの連続frameで
+文字layout回数が増えず、描画まで同じLayoutJobのArc（所有文字列）を使うこと、resizeだけでは
+再計測せず、値の変更・DPI / フォント変更で必要な再計測を行うことを回帰で検査する。
+
+検証（2026-10-09、HEAD fc34e3040に対する未commit差分）: holdの実HUD回帰は修正前に
+1件red（exit 101、Scanning開始時のownerが残る）を確認し、修正後は追加3件を含む焦点12件、
+既存測定入力13件・音楽HUD9件が成功した。初回全libは10,997成功 / 1失敗 / 52 ignoredで、
+既存VST bridgeの`strict_open_handler_rejects_invalid_restore_without_loaded_event`が
+Loadedイベント待ち25秒のtimeoutになった。同ソースの単独再実行はfixtureを備えた状態で
+1件成功し、同じ全libコマンドの再実行は10,998成功 / 52 ignored（968.09秒、exit 0）。
+初回失敗の原因は断定せず、`target/E-tracks-fix-lib.log`と再実行の
+`target/E-tracks-fix-lib-recheck.log`を保持する。
+
+ui_snapshotは直列で123件成功し、既存PNGと一致した（更新不要）。cargo fmt / fmt --check、
+glyph lint（危険glyph 0）、通常 / portable core checkも成功。起動中のこのworktreeのdev coreは
+検出されず、`build-dev.ps1 -PreserveRuntime`はexit 0でcore・remote service・EPUB PDF workerを
+生成した。製品の起動・実機操作・commitは行っていない。今回のレビュー修正の実機確認は利用者へ
+引き継ぐ。検証ログのprefixは`target/E-tracks-fix-`、英語commit文は`target/E-tracks-fix-msg.txt`。

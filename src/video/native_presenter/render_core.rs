@@ -357,7 +357,7 @@ fn native_seek_strip_range_text_pos(strip_rect: egui::Rect) -> egui::Pos2 {
     )
 }
 
-fn fitted_strip_text_galley(
+pub(super) fn fitted_strip_text_galley(
     painter: &egui::Painter,
     text: &str,
     rect: egui::Rect,
@@ -2741,6 +2741,7 @@ struct NativeEguiOverlayState {
     seek_strip_menu_open: bool,
     audio_track_menu_open: bool,
     frame_step_hold: Option<NativeFrameStepHold>,
+    bottom_hud_text: super::bottom_hud::TextCache,
     video_loop_enabled: bool,
     /// HUD ボタン表示用のループモード (= ユーザー設定の display_mode)。
     /// 「BM 設定 + BM 無し動画」のとき、`video_loop_enabled` は effective から導出した
@@ -9043,6 +9044,7 @@ impl NativeEguiOverlayState {
             seek_strip_menu_open: false,
             audio_track_menu_open: false,
             frame_step_hold: None,
+            bottom_hud_text: Default::default(),
             video_loop_enabled: false,
             video_loop_mode: crate::settings::VideoLoopMode::Off,
             video_continuous_mode: crate::video::VideoContinuousMode::Off,
@@ -10553,6 +10555,12 @@ impl NativeEguiOverlayState {
     fn set_normalize_state(&mut self, state: crate::video::normalize_types::NormalizeOverlayState) {
         if self.normalize_state == state {
             return;
+        }
+        if matches!(
+            state.ui_state,
+            crate::video::normalize_types::NormalizeUiState::Scanning
+        ) {
+            self.frame_step_hold = None;
         }
         self.normalize_state = state;
         self.dirty = true;
@@ -13025,11 +13033,6 @@ impl NativeEguiOverlayState {
                         let controls_row_rect = rows.controls_row_rect;
 
                         let btn_size = rows.button_size;
-                        let label = format!(
-                            "{} / {}",
-                            format_overlay_time(position_secs),
-                            format_overlay_time(duration_secs)
-                        );
                         let ordinal = video_metadata
                             .as_ref()
                             .filter(|m| m.audio_track_rows.len() >= 2)
@@ -13042,13 +13045,13 @@ impl NativeEguiOverlayState {
                         let row_layout = super::bottom_hud::Layout::resolve(
                             controls_row_rect,
                             btn_size,
-                            super::bottom_hud::Metrics::measure(
+                            self.bottom_hud_text.measure(
                                 painter,
                                 btn_size,
-                                label,
-                                format_overlay_time(position_secs),
-                                &crate::video::clock::format_playback_speed(playback_speed),
-                                &format_video_volume_db_compact(volume),
+                                position_secs,
+                                duration_secs,
+                                playback_speed,
+                                volume,
                                 ordinal,
                                 !audio_only,
                             ),
@@ -13084,6 +13087,7 @@ impl NativeEguiOverlayState {
                                 video_metadata: video_metadata.as_ref(),
                             },
                             NativeBottomControlOwners {
+                                text_cache: &mut self.bottom_hud_text,
                                 frame_step_hold: &mut frame_step_hold,
                                 last_volume_target: &mut self.last_volume_target,
                                 video_speed_popup_open: &mut video_speed_popup_open,
@@ -14138,6 +14142,7 @@ struct NativeBottomControls<'a> {
 }
 
 struct NativeBottomControlOwners<'a> {
+    text_cache: &'a mut super::bottom_hud::TextCache,
     frame_step_hold: &'a mut Option<NativeFrameStepHold>,
     last_volume_target: &'a mut Option<f64>,
     video_speed_popup_open: &'a mut bool,
@@ -14178,6 +14183,7 @@ fn draw_native_bottom_controls(
         video_metadata,
     } = view;
     let NativeBottomControlOwners {
+        text_cache,
         frame_step_hold,
         last_volume_target,
         video_speed_popup_open,
@@ -14506,14 +14512,20 @@ fn draw_native_bottom_controls(
         }
 
         if let Some(time_text_rect) = layout.get(HudItem::Time) {
-            let _ = paint_fitted_strip_text_left_centered(
-                painter,
-                time_text_rect,
-                text_center_y,
-                &layout.time,
-                14.0,
-                egui::Color32::from_rgb(238, 238, 238),
-            );
+            if let Some(galley) = text_cache.fit_time(painter, time_text_rect, &layout.time) {
+                let pos = egui::pos2(
+                    time_text_rect.left(),
+                    (text_center_y - galley.size().y * 0.5).clamp(
+                        time_text_rect.top(),
+                        (time_text_rect.bottom() - galley.size().y).max(time_text_rect.top()),
+                    ),
+                );
+                painter.galley_with_override_text_color(
+                    pos,
+                    galley,
+                    egui::Color32::from_rgb(238, 238, 238),
+                );
+            }
         }
         if let Some(rect) = layout.get(HudItem::Track) {
             let painter = &base_painter.with_clip_rect(rect);
@@ -14536,17 +14548,13 @@ fn draw_native_bottom_controls(
                 },
             ));
             draw_overlay_button_bg(painter, rect, response.hovered(), *audio_track_menu_open);
-            let ordinal = video_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.audio_track_rows.iter().find(|row| row.is_current))
-                .map_or(1, |row| row.ordinal);
-            painter.text(
-                egui::pos2(rect.center().x, text_center_y),
-                egui::Align2::CENTER_CENTER,
-                format!("音声 {ordinal}"),
-                crate::ui_fonts::hud_text_font(12.0),
-                egui::Color32::from_gray(226),
-            );
+            if let Some(label) = &layout.labels.track {
+                painter.galley_with_override_text_color(
+                    egui::pos2(rect.center().x, text_center_y) - label.size() * 0.5,
+                    label.clone(),
+                    egui::Color32::from_gray(226),
+                );
+            }
             if response.clicked() {
                 *audio_track_menu_open = !*audio_track_menu_open;
             }
@@ -14560,6 +14568,7 @@ fn draw_native_bottom_controls(
                 speed_rect,
                 text_center_y,
                 playback_speed,
+                Some(&layout.labels.speed),
                 egui::Id::new("native_video_speed"),
                 egui::Id::new("native_video_speed_popup"),
                 0.0,
@@ -14646,11 +14655,9 @@ fn draw_native_bottom_controls(
                 egui::Color32::from_gray(180)
             };
             // "Norm" ラベル
-            painter.text(
-                egui::pos2(norm_rect.center().x, text_center_y),
-                egui::Align2::CENTER_CENTER,
-                "Norm",
-                crate::ui_fonts::hud_text_font(11.0),
+            painter.galley_with_override_text_color(
+                egui::pos2(norm_rect.center().x, text_center_y) - layout.labels.norm.size() * 0.5,
+                layout.labels.norm.clone(),
                 norm_color,
             );
             let norm_resp = norm_resp.hover_tip_dark(norm_hover_label);
@@ -14704,17 +14711,17 @@ fn draw_native_bottom_controls(
         if let Some(rect) = layout.get(HudItem::Db) {
             let painter = &base_painter.with_clip_rect(rect);
 
-            let volume_label = format_video_volume_db_compact(volume);
             let volume_label_color = if volume > 1.0 {
                 egui::Color32::from_rgb(255, 210, 80)
             } else {
                 egui::Color32::from_rgb(238, 238, 238)
             };
-            painter.text(
-                egui::pos2(rect.right(), text_center_y),
-                egui::Align2::RIGHT_CENTER,
-                volume_label,
-                crate::ui_fonts::hud_text_font(13.0),
+            painter.galley_with_override_text_color(
+                egui::pos2(
+                    rect.right() - layout.labels.db.size().x,
+                    text_center_y - layout.labels.db.size().y * 0.5,
+                ),
+                layout.labels.db.clone(),
                 volume_label_color,
             );
         }
@@ -14841,16 +14848,21 @@ fn draw_native_bottom_snapshot(ui: &mut egui::Ui, scan: bool) {
         .rect_filled(hud, 0.0, egui::Color32::from_black_alpha(176));
     let rows = native_bottom_hud_rows(hud, true);
     let metadata = native_hud_multitrack_fixture_metadata();
+    let cache_id = egui::Id::new("native_bottom_snapshot_text_cache");
+    let mut text_cache = ui
+        .ctx()
+        .data_mut(|data| data.get_temp::<super::bottom_hud::TextCache>(cache_id))
+        .unwrap_or_default();
     let layout = super::bottom_hud::Layout::resolve(
         rows.controls_row_rect,
         rows.button_size,
-        super::bottom_hud::Metrics::measure(
+        text_cache.measure(
             ui.painter(),
             rows.button_size,
-            "0:05 / 0:30".into(),
-            "0:05".into(),
-            "x1",
-            "0.0dB",
+            5.0,
+            30.0,
+            1.0,
+            1.0,
             Some(1),
             true,
         ),
@@ -14902,6 +14914,7 @@ fn draw_native_bottom_snapshot(ui: &mut egui::Ui, scan: bool) {
             video_metadata: Some(&metadata),
         },
         NativeBottomControlOwners {
+            text_cache: &mut text_cache,
             frame_step_hold: &mut frame_hold,
             last_volume_target: &mut volume_target,
             video_speed_popup_open: &mut speed_open,
@@ -14913,6 +14926,8 @@ fn draw_native_bottom_snapshot(ui: &mut egui::Ui, scan: bool) {
             ui_smoke_audio_controls: &mut smoke_controls,
         },
     );
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(cache_id, text_cache));
     if scan {
         let ctx = ui.ctx().clone();
         draw_native_normalize_progress(
@@ -14939,6 +14954,181 @@ mod chrome_suppression_interaction_tests {
         NativeVideoTouchEvent, NativeVideoTouchPhase, NativeVideoWindowEvent,
         NativeVideoWindowSource,
     };
+
+    #[test]
+    fn native_tracks_hud_frame_hold_terminates_on_scan_and_outside_release() {
+        for (id, direction) in [
+            ("native_video_prev_frame", -1),
+            ("native_video_next_frame", 1),
+        ] {
+            let (mut overlay, _) = fixture(false);
+            overlay.set_metadata(Some(native_hud_multitrack_fixture_metadata()));
+            overlay.resize_dimensions(900, 360);
+            for _ in 0..4 {
+                frame(&mut overlay);
+            }
+            let pos = overlay
+                .egui_ctx
+                .read_response(egui::Id::new(id))
+                .unwrap()
+                .rect
+                .center();
+            pointer(&mut overlay, pos);
+            frame(&mut overlay);
+            button(&mut overlay, pos, true);
+            let output = frame(&mut overlay);
+            assert!(output.commands.iter().any(|command| matches!(command,
+                NativeOverlayCommand::FrameStep { direction: d } if *d == direction)));
+            overlay.frame_step_hold.as_mut().unwrap().last_step_at -=
+                std::time::Duration::from_millis(200);
+            overlay.set_normalize_state(crate::video::normalize_types::NormalizeOverlayState {
+                ui_state: crate::video::normalize_types::NormalizeUiState::Scanning,
+                progress: Some(Default::default()),
+            });
+            assert!(
+                overlay.frame_step_hold.is_none(),
+                "scan entry must terminate the existing owner"
+            );
+            for iteration in 0..4 {
+                let output = frame(&mut overlay);
+                if iteration > 0 {
+                    assert!(
+                        !overlay
+                            .egui_ctx
+                            .read_response(egui::Id::new(id))
+                            .unwrap()
+                            .enabled()
+                    );
+                }
+                assert!(
+                    !output
+                        .commands
+                        .iter()
+                        .any(|c| matches!(c, NativeOverlayCommand::FrameStep { .. }))
+                );
+                assert!(overlay.frame_step_hold.is_none());
+            }
+            let outside = egui::pos2(-200.0, -200.0);
+            pointer(&mut overlay, outside);
+            button(&mut overlay, outside, false);
+            let output = frame(&mut overlay);
+            assert!(!overlay.egui_ctx.input(|i| i.pointer.primary_down()));
+            assert!(
+                !output
+                    .commands
+                    .iter()
+                    .any(|c| matches!(c, NativeOverlayCommand::FrameStep { .. }))
+            );
+            assert!(overlay.frame_step_hold.is_none());
+        }
+    }
+
+    #[test]
+    fn native_tracks_hud_disabled_frame_button_cannot_resume_a_hold() {
+        let (mut overlay, _) = fixture(false);
+        let id = egui::Id::new("native_video_next_frame");
+        let pos = overlay.egui_ctx.read_response(id).unwrap().rect.center();
+        pointer(&mut overlay, pos);
+        frame(&mut overlay);
+        button(&mut overlay, pos, true);
+        frame(&mut overlay);
+        overlay.set_normalize_state(crate::video::normalize_types::NormalizeOverlayState {
+            ui_state: crate::video::normalize_types::NormalizeUiState::Scanning,
+            progress: Some(Default::default()),
+        });
+        // Exercise the renderer's disabled contract independently of entry cleanup.
+        overlay.frame_step_hold = Some(NativeFrameStepHold {
+            direction: 1,
+            last_step_at: Instant::now() - Duration::from_millis(200),
+        });
+        let output = frame(&mut overlay);
+        assert!(
+            !output
+                .commands
+                .iter()
+                .any(|c| matches!(c, NativeOverlayCommand::FrameStep { .. }))
+        );
+        assert!(overlay.frame_step_hold.is_none());
+        frame(&mut overlay);
+        assert!(!overlay.egui_ctx.read_response(id).unwrap().enabled());
+    }
+
+    #[test]
+    fn native_tracks_hud_cached_labels_reused_by_real_draw_until_values_or_fonts_change() {
+        fn label(output: &NativeOverlayLogicalOutput, text: &str) -> std::sync::Arc<egui::Galley> {
+            output
+                .full_output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(s) if s.galley.text() == text => Some(s.galley.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("real HUD label {text}"))
+        }
+        let (mut overlay, _) = fixture(false);
+        overlay.set_metadata(Some(native_hud_multitrack_fixture_metadata()));
+        overlay.resize_dimensions(2000, 360);
+        for _ in 0..4 {
+            frame(&mut overlay);
+        }
+        let first = frame(&mut overlay);
+        let count = overlay.bottom_hud_text.label_layouts;
+        let names = ["2:30 / 10:00", "x1", "音声 1", "0.0dB", "Norm"];
+        let galleys = names.map(|name| label(&first, name));
+        for _ in 0..8 {
+            let output = frame(&mut overlay);
+            assert_eq!(overlay.bottom_hud_text.label_layouts, count);
+            for (name, galley) in names.into_iter().zip(&galleys) {
+                // Area transforms clone Galley's mesh via Arc::make_mut even at scale 1.
+                // Its shared LayoutJob still identifies the measured text passed to draw.
+                assert!(
+                    std::sync::Arc::ptr_eq(&galley.job, &label(&output, name).job),
+                    "galley reuse: {name}"
+                );
+            }
+        }
+        overlay.resize_dimensions(1900, 400);
+        frame(&mut overlay);
+        assert_eq!(
+            overlay.bottom_hud_text.label_layouts, count,
+            "width changes only recompute rectangles"
+        );
+        overlay.video_playback_speed = 1.25;
+        let output = frame(&mut overlay);
+        label(&output, "x1.25");
+        assert_eq!(overlay.bottom_hud_text.label_layouts, count + 1);
+        overlay.video_position_secs += 0.1;
+        frame(&mut overlay);
+        assert_eq!(
+            overlay.bottom_hud_text.label_layouts,
+            count + 1,
+            "unchanged displayed second reuses text"
+        );
+        overlay.set_effective_pixels_per_point(1.5);
+        let output = frame(&mut overlay);
+        assert_eq!(
+            overlay.bottom_hud_text.label_layouts,
+            count + 7,
+            "DPI invalidates all six labels"
+        );
+        assert!(!std::sync::Arc::ptr_eq(
+            &galleys[2].job,
+            &label(&output, "音声 1").job
+        ));
+        let mut definitions = overlay.egui_ctx.fonts(|fonts| fonts.definitions().clone());
+        definitions.families.insert(
+            egui::FontFamily::Name("cache-test-unused".into()),
+            definitions.families[&egui::FontFamily::Proportional].clone(),
+        );
+        overlay.egui_ctx.set_fonts(definitions);
+        frame(&mut overlay);
+        assert_eq!(
+            overlay.bottom_hud_text.label_layouts,
+            count + 13,
+            "font replacement invalidates cached UVs"
+        );
+    }
 
     #[test]
     fn native_tracks_hud_multitrack_button_survives_narrow_widths() {

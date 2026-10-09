@@ -1,6 +1,163 @@
 //! Frame-local bottom-row geometry. No stored compaction or scan layout state.
 
-use egui::{Color32, Painter, Rect};
+use egui::{Color32, Galley, Painter, Rect};
+use std::sync::Arc;
+
+#[derive(Clone, Copy, PartialEq)]
+enum LabelKey {
+    Time(u64, u64),
+    Position(u64),
+    Speed(u64),
+    Track(usize),
+    Db(u64),
+    Norm,
+}
+
+#[derive(Clone, Default)]
+pub(super) struct TextCache {
+    font_identity: Option<Arc<Galley>>,
+    labels: [Option<(LabelKey, Arc<Galley>)>; 6],
+    fitted_time: Option<(Arc<Galley>, egui::Vec2, Option<Arc<Galley>>)>,
+    #[cfg(test)]
+    pub(super) label_layouts: usize,
+}
+
+impl TextCache {
+    fn label(
+        &mut self,
+        painter: &Painter,
+        slot: usize,
+        key: LabelKey,
+        size: f32,
+        format: impl FnOnce() -> String,
+    ) -> Arc<Galley> {
+        let entry = &mut self.labels[slot];
+        if let Some((previous, galley)) = entry {
+            if *previous == key {
+                return galley.clone();
+            }
+        }
+        let galley = painter.layout_no_wrap(
+            format(),
+            crate::ui_fonts::hud_text_font(size),
+            Color32::PLACEHOLDER,
+        );
+        #[cfg(test)]
+        {
+            self.label_layouts += 1;
+        }
+        *entry = Some((key, galley.clone()));
+        galley
+    }
+
+    pub(super) fn measure(
+        &mut self,
+        painter: &Painter,
+        button: f32,
+        position: f64,
+        duration: f64,
+        speed: f64,
+        volume: f64,
+        ordinal: Option<usize>,
+        strip: bool,
+    ) -> Metrics {
+        // A single empty-job lookup keeps this identity alive in egui's galley cache.
+        // Font/atlas resets, DPI changes and eviction replace it: never reuse stale UVs.
+        // The empty job has no owned label text and allocates no String.
+        let identity = painter
+            .ctx()
+            .fonts_mut(|fonts| fonts.layout_job(egui::text::LayoutJob::default()));
+        if !self
+            .font_identity
+            .as_ref()
+            .is_some_and(|old| Arc::ptr_eq(old, &identity))
+        {
+            self.labels = Default::default();
+            self.fitted_time = None;
+            self.font_identity = Some(identity);
+        }
+        let seconds = |value: f64| {
+            if value.is_finite() && value >= 0.0 {
+                value.round() as u64
+            } else {
+                0
+            }
+        };
+        let p = seconds(position);
+        let d = seconds(duration);
+        let time = self.label(painter, 0, LabelKey::Time(p, d), 14.0, || {
+            format!(
+                "{} / {}",
+                super::overlay_draw::format_overlay_time(position),
+                super::overlay_draw::format_overlay_time(duration)
+            )
+        });
+        let short = self.label(painter, 1, LabelKey::Position(p), 14.0, || {
+            super::overlay_draw::format_overlay_time(position)
+        });
+        let speed = crate::video::clock::clamp_playback_speed(speed);
+        let speed = self.label(painter, 2, LabelKey::Speed(speed.to_bits()), 12.0, || {
+            crate::video::clock::format_playback_speed(speed)
+        });
+        let track = ordinal
+            .map(|n| self.label(painter, 3, LabelKey::Track(n), 12.0, || format!("音声 {n}")));
+        let volume = super::overlay_draw::finite_video_volume(volume);
+        let db = self.label(painter, 4, LabelKey::Db(volume.to_bits()), 13.0, || {
+            super::render_core::format_video_volume_db_compact(volume)
+        });
+        let norm = self.label(painter, 5, LabelKey::Norm, 11.0, || "Norm".into());
+        Metrics::from_labels(
+            button,
+            time,
+            short,
+            Labels {
+                speed,
+                track,
+                db,
+                norm,
+            },
+            strip,
+        )
+    }
+
+    pub(super) fn fit_time(
+        &mut self,
+        painter: &Painter,
+        rect: Rect,
+        label: &Arc<Galley>,
+    ) -> Option<Arc<Galley>> {
+        let size = rect.size();
+        if label.size().x <= size.x
+            && label.size().y <= size.y
+            && size.y * 0.72 >= 14.0
+            && size.x * 0.72 >= 14.0
+        {
+            return Some(label.clone());
+        }
+        if let Some((old, old_size, fitted)) = &self.fitted_time {
+            if Arc::ptr_eq(old, label) && *old_size == size {
+                return fitted.clone();
+            }
+        }
+        let fitted = super::render_core::fitted_strip_text_galley(
+            painter,
+            label.text(),
+            rect,
+            14.0,
+            Color32::PLACEHOLDER,
+        );
+        self.fitted_time = Some((label.clone(), size, fitted.clone()));
+        fitted
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct Labels {
+    pub(super) speed: Arc<Galley>,
+    pub(super) track: Option<Arc<Galley>>,
+    pub(super) db: Arc<Galley>,
+    pub(super) norm: Arc<Galley>,
+}
 
 #[derive(Clone, Copy, Debug)]
 #[repr(usize)]
@@ -57,9 +214,10 @@ const ITEMS: [Item; 22] = [
 #[derive(Clone)]
 pub(super) struct Metrics {
     widths: [Option<f32>; 22],
-    time: String,
-    short: String,
+    time: Arc<Galley>,
+    short: Arc<Galley>,
     short_width: f32,
+    labels: Labels,
 }
 
 #[cfg(test)]
@@ -201,6 +359,7 @@ mod tests {
 }
 
 impl Metrics {
+    #[cfg(test)]
     pub(super) fn measure(
         painter: &Painter,
         button: f32,
@@ -211,39 +370,59 @@ impl Metrics {
         ordinal: Option<usize>,
         strip: bool,
     ) -> Self {
-        use Item::*;
-        let measure = |text: &str, size| {
-            painter
-                .layout_no_wrap(
-                    text.into(),
-                    crate::ui_fonts::hud_text_font(size),
-                    Color32::WHITE,
-                )
-                .size()
-                .x
+        let measure = |text: String, size| {
+            painter.layout_no_wrap(
+                text,
+                crate::ui_fonts::hud_text_font(size),
+                Color32::PLACEHOLDER,
+            )
         };
+        Self::from_labels(
+            button,
+            measure(time, 14.0),
+            measure(short, 14.0),
+            Labels {
+                speed: measure(speed.into(), 12.0),
+                track: ordinal.map(|n| measure(format!("音声 {n}"), 12.0)),
+                norm: measure("Norm".into(), 11.0),
+                db: measure(db.into(), 13.0),
+            },
+            strip,
+        )
+    }
+
+    fn from_labels(
+        button: f32,
+        time: Arc<Galley>,
+        short: Arc<Galley>,
+        labels: Labels,
+        strip: bool,
+    ) -> Self {
+        use Item::*;
         let mut widths = [Some(button); 22];
-        widths[Time as usize] = Some(measure(&time, 14.0).max(132.0));
-        widths[Speed as usize] = Some(measure(speed, 11.0).max(button * 1.55));
-        widths[Track as usize] = ordinal.map(|n| measure(&format!("音声 {n}"), 12.0).max(62.0));
-        widths[Norm as usize] = Some(measure("Norm", 11.0).max(button));
+        widths[Time as usize] = Some(time.size().x.max(132.0));
+        widths[Speed as usize] = Some(labels.speed.size().x.max(button * 1.55));
+        widths[Track as usize] = labels.track.as_ref().map(|label| label.size().x.max(62.0));
+        widths[Norm as usize] = Some(labels.norm.size().x.max(button));
         widths[Volume as usize] = Some(144.0);
-        widths[Db as usize] = Some(measure(db, 13.0).max(60.0));
+        widths[Db as usize] = Some(labels.db.size().x.max(60.0));
         widths[Limiter as usize] = Some(14.0);
         widths[Strip as usize] = strip.then_some(button);
-        let short_width = measure(&short, 14.0);
+        let short_width = short.size().x;
         Self {
             widths,
             time,
             short,
             short_width,
+            labels,
         }
     }
 }
 
 pub(super) struct Layout {
     pub(super) rects: [Option<Rect>; 22],
-    pub(super) time: String,
+    pub(super) time: Arc<Galley>,
+    pub(super) labels: Labels,
 }
 
 impl Layout {
@@ -287,6 +466,7 @@ impl Layout {
             return Self {
                 rects,
                 time: metrics.time,
+                labels: metrics.labels,
             };
         }
         let padding = 10.0_f32.min(row.width().max(0.0) * 0.1);
@@ -349,6 +529,10 @@ impl Layout {
                 right -= width + gap;
             }
         }
-        Self { rects, time }
+        Self {
+            rects,
+            time,
+            labels: metrics.labels,
+        }
     }
 }
