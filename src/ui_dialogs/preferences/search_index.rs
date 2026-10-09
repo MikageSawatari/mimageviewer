@@ -23,6 +23,30 @@ macro_rules! entry {
 
 pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     entry!(
+        "file-types/categories",
+        FileTypeVisibility,
+        "表示するファイル種類",
+        [
+            "非表示",
+            "画像",
+            "RAW",
+            "動画",
+            "音声",
+            "ZIP",
+            "PDF",
+            "EPUB",
+            "RAR",
+            "7z",
+            "LZH"
+        ]
+    ),
+    entry!(
+        "file-types/extensions",
+        FileTypeVisibility,
+        "個別に非表示にする拡張子",
+        ["png", "cr2", "形式", "拡張子"]
+    ),
+    entry!(
         "general/theme",
         General,
         "テーマ",
@@ -1466,6 +1490,10 @@ mod tests {
                             .contains("crate::ui_raw::draw_settings(ui, &mut state.settings)")
                     );
                     RAW_SETTINGS_SOURCE
+                } else if entry.anchor == "file-types/categories" {
+                    assert_eq!(entry.title, PreferencesPage::FileTypeVisibility.label());
+                    assert!(PREFERENCES_SOURCE.contains("ui.heading(state.selected.label())"));
+                    PREFERENCES_SOURCE
                 } else if entry.anchor == "thumbnail/details-name-colors" {
                     assert!(
                         PAGES_SOURCE
@@ -1611,7 +1639,6 @@ mod tests {
     #[test]
     fn raw_settings_search_targets_dedicated_page() {
         for query in [
-            "raw",
             "RAW 現像",
             "同時現像数",
             "RAW 明るさ",
@@ -1624,6 +1651,23 @@ mod tests {
                 entry.page == PreferencesPage::RawDevelop && entry.anchor == "raw-develop/settings"
             }));
         }
+    }
+
+    #[test]
+    fn raw_keyword_includes_development_and_visibility_settings() {
+        let results = search_preferences("raw", test_tree_position);
+        assert!(
+            results
+                .iter()
+                .any(|entry| entry.page == PreferencesPage::RawDevelop
+                    && entry.anchor == "raw-develop/settings")
+        );
+        assert!(
+            results
+                .iter()
+                .any(|entry| entry.page == PreferencesPage::FileTypeVisibility
+                    && entry.anchor == "file-types/categories")
+        );
     }
 
     #[test]

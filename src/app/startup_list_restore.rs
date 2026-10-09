@@ -138,7 +138,7 @@ impl App {
             return None;
         }
         if self.is_snapshot_active()
-            || self.sidecar_restore_active()
+            || self.sidecar_restore_list_adoption_blocked()
             || (self.zip_enumerate_pending.is_some() && self.zip_nav.is_none())
         {
             return None;

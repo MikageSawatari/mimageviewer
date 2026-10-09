@@ -31,8 +31,9 @@ impl NavigationArchivePolicy {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct FolderTreeOptions {
+    pub file_type_visibility: crate::file_type_visibility::FileTypeVisibility,
     /// 同名フォルダがある ZIP をスキップする (= `Settings.skip_zip_if_folder_exists`)。
     pub skip_zip: bool,
     /// 同名 ZIP/CBZ がある変換アーカイブをスキップする。
@@ -51,6 +52,7 @@ impl FolderTreeOptions {
     /// `Settings` から関連フィールドだけ抜き出す convenience。
     pub fn from_settings(settings: &crate::settings::Settings) -> Self {
         Self {
+            file_type_visibility: settings.file_type_visibility.clone(),
             skip_zip: settings.skip_zip_if_folder_exists,
             skip_archive_if_zip_exists: settings.skip_archive_if_zip_exists,
             skip_epub_if_pdf_exists: settings.skip_epub_if_pdf_exists,
@@ -68,6 +70,7 @@ impl FolderTreeOptions {
 impl Default for FolderTreeOptions {
     fn default() -> Self {
         Self {
+            file_type_visibility: crate::file_type_visibility::FileTypeVisibility::default(),
             skip_zip: true,
             skip_archive_if_zip_exists: true,
             skip_epub_if_pdf_exists: true,
@@ -249,7 +252,7 @@ impl FolderNavDecisionMemo {
         if let Some(landing) = self.0.borrow().get(&key) {
             return landing.clone();
         }
-        let landing = resolve_folder_nav_landing(path, opts, cancel, cache);
+        let landing = resolve_folder_nav_landing(path, opts.clone(), cancel, cache);
         if cancelled(cancel) {
             return None;
         }
@@ -266,8 +269,8 @@ fn resolve_with_memo(
     memo: Option<&FolderNavDecisionMemo>,
 ) -> Option<FolderNavLanding> {
     match memo {
-        Some(memo) => memo.resolve(path, opts, cancel, cache),
-        None => resolve_folder_nav_landing(path, opts, cancel, cache),
+        Some(memo) => memo.resolve(path, opts.clone(), cancel, cache),
+        None => resolve_folder_nav_landing(path, opts.clone(), cancel, cache),
     }
 }
 
@@ -288,6 +291,8 @@ pub fn resolve_folder_nav_landing(
     }
     let (kind, backing_path) = if path.is_dir() {
         (FolderNavLandingKind::Folder, path.to_path_buf())
+    } else if !opts.file_type_visibility.allows_physical_file(path) {
+        return None;
     } else if is_virtual_folder(path) {
         (FolderNavLandingKind::NativeZipPdf, path.to_path_buf())
     } else if is_convertible_archive_path(path) {
@@ -318,7 +323,12 @@ pub fn resolve_folder_nav_landing(
                 }
                 cache_source = inspection.resolved_path.clone();
                 if inspection.decision == crate::rar_loader::RarDirectReadDecision::Direct
-                    && inspection.summary.image_count > 0
+                    && crate::zip_loader::first_visible_image_entry(
+                        &inspection.resolved_path,
+                        cancel,
+                        &opts.file_type_visibility,
+                    )
+                    .is_some()
                 {
                     return Some(FolderNavLanding {
                         logical_source: path.to_path_buf(),
@@ -334,13 +344,19 @@ pub fn resolve_folder_nav_landing(
             if cancelled(cancel) {
                 return None;
             }
-            let cached = cache?.peek(
+            let cached = cache?.peek_with_visibility(
                 &cache_source,
                 crate::ui_helpers::mtime_secs(&metadata),
                 metadata.len() as i64,
+                &opts.file_type_visibility,
             )?;
             if cancelled(cancel)
-                || crate::zip_loader::first_image_entry(&cached, cancel).is_none()
+                || crate::zip_loader::first_visible_image_entry(
+                    &cached,
+                    cancel,
+                    &opts.file_type_visibility,
+                )
+                .is_none()
                 || cancelled(cancel)
             {
                 return None;
@@ -367,6 +383,9 @@ fn is_folder_nav_file_candidate(
     if cancelled(cancel) {
         return false;
     }
+    if !opts.file_type_visibility.allows_physical_file(path) {
+        return false;
+    }
     if !opts.include_epub
         && path
             .extension()
@@ -388,7 +407,7 @@ fn is_folder_nav_file_candidate(
         }
         NavigationArchivePolicy::IgnoreConvertible => false,
         NavigationArchivePolicy::DetachedReadable => {
-            resolve_with_memo(path, opts, cancel, cache, memo).is_some()
+            resolve_with_memo(path, opts.clone(), cancel, cache, memo).is_some()
         }
     }
 }
@@ -434,7 +453,7 @@ pub fn folder_should_stop_with_options(
     cancel: Option<&AtomicBool>,
     opts: FolderTreeOptions,
 ) -> bool {
-    folder_qualifies(path, cancel, true, opts, None, None)
+    folder_qualifies(path, cancel, true, opts.clone(), None, None)
 }
 
 pub fn folder_should_stop_with_context(
@@ -443,7 +462,7 @@ pub fn folder_should_stop_with_context(
     opts: FolderTreeOptions,
     cache: Option<&crate::archive_cache::ArchiveCacheDb>,
 ) -> bool {
-    folder_should_stop_with_memo(path, cancel, opts, cache, None)
+    folder_should_stop_with_memo(path, cancel, opts.clone(), cache, None)
 }
 
 pub fn folder_should_stop_with_memo(
@@ -453,7 +472,7 @@ pub fn folder_should_stop_with_memo(
     cache: Option<&crate::archive_cache::ArchiveCacheDb>,
     memo: Option<&FolderNavDecisionMemo>,
 ) -> bool {
-    folder_qualifies(path, cancel, true, opts, cache, memo)
+    folder_qualifies(path, cancel, true, opts.clone(), cache, memo)
 }
 
 /// スライドショーの次フォルダ判定用: 静止画系コンテンツがあるか。
@@ -470,7 +489,7 @@ pub fn folder_has_still_image_with_options(
     cancel: Option<&AtomicBool>,
     opts: FolderTreeOptions,
 ) -> bool {
-    folder_qualifies(path, cancel, false, opts, None, None)
+    folder_qualifies(path, cancel, false, opts.clone(), None, None)
 }
 
 pub fn folder_has_still_image_with_context(
@@ -479,7 +498,7 @@ pub fn folder_has_still_image_with_context(
     opts: FolderTreeOptions,
     cache: Option<&crate::archive_cache::ArchiveCacheDb>,
 ) -> bool {
-    folder_has_still_image_with_memo(path, cancel, opts, cache, None)
+    folder_has_still_image_with_memo(path, cancel, opts.clone(), cache, None)
 }
 
 pub fn folder_has_still_image_with_memo(
@@ -489,7 +508,7 @@ pub fn folder_has_still_image_with_memo(
     cache: Option<&crate::archive_cache::ArchiveCacheDb>,
     memo: Option<&FolderNavDecisionMemo>,
 ) -> bool {
-    folder_qualifies(path, cancel, false, opts, cache, memo)
+    folder_qualifies(path, cancel, false, opts.clone(), cache, memo)
 }
 
 /// `folder_should_stop` / `folder_has_still_image` の共通実装。
@@ -507,6 +526,9 @@ fn folder_qualifies(
     }
 
     if path.is_file() {
+        if !opts.file_type_visibility.allows_physical_file(path) {
+            return false;
+        }
         if !opts.include_epub
             && path
                 .extension()
@@ -516,7 +538,7 @@ fn folder_qualifies(
             return false;
         }
         if is_convertible_archive_path(path) {
-            return resolve_with_memo(path, opts, cancel, cache, memo).is_some();
+            return resolve_with_memo(path, opts.clone(), cancel, cache, memo).is_some();
         }
         if !is_virtual_folder(path) {
             return false;
@@ -528,9 +550,12 @@ fn folder_qualifies(
             .unwrap_or_default();
         return match ext.as_str() {
             _ if is_paged_document_path(path) => true,
-            e if is_zip_extension(e) => {
-                crate::zip_loader::first_image_entry(path, cancel).is_some()
-            }
+            e if is_zip_extension(e) => crate::zip_loader::first_visible_image_entry(
+                path,
+                cancel,
+                &opts.file_type_visibility,
+            )
+            .is_some(),
             _ => false,
         };
     }
@@ -543,14 +568,22 @@ fn folder_qualifies(
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             return false;
         }
+        let Ok(file_type) = e.file_type() else {
+            continue;
+        };
+        if !crate::fs_entry::classify_dir_entry(&e, &file_type).is_file() {
+            continue;
+        }
         let p = e.path();
-        if is_apple_double(&p) {
+        if is_apple_double(&p) || !opts.file_type_visibility.allows_physical_file(&p) {
             continue;
         }
         if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
             let ext_lower = ext.to_lowercase();
             if is_recognized_image_ext(&ext_lower)
-                || (include_video && SUPPORTED_VIDEO_EXTENSIONS.contains(&ext_lower.as_str()))
+                || (include_video
+                    && (SUPPORTED_VIDEO_EXTENSIONS.contains(&ext_lower.as_str())
+                        || is_audio_ext(&ext_lower)))
             {
                 return true;
             }
@@ -654,7 +687,7 @@ where
 /// 到達できなくなる。後方 DFS (`last_descendant_dir_inner`) の visited-set ガードと
 /// 対になる前方側の循環対策。
 pub fn next_folder_dfs(current: &Path, opts: FolderTreeOptions) -> Option<PathBuf> {
-    next_folder_dfs_with_context(current, opts, None, None)
+    next_folder_dfs_with_context(current, opts.clone(), None, None)
 }
 
 pub fn next_folder_dfs_with_context(
@@ -663,7 +696,7 @@ pub fn next_folder_dfs_with_context(
     cancel: Option<&AtomicBool>,
     cache: Option<&crate::archive_cache::ArchiveCacheDb>,
 ) -> Option<PathBuf> {
-    next_folder_dfs_with_memo(current, opts, cancel, cache, None)
+    next_folder_dfs_with_memo(current, opts.clone(), cancel, cache, None)
 }
 
 pub fn next_folder_dfs_with_memo(
@@ -674,7 +707,7 @@ pub fn next_folder_dfs_with_memo(
     memo: Option<&FolderNavDecisionMemo>,
 ) -> Option<PathBuf> {
     // 1. 子フォルダがあれば最初の (循環でない) 子へ
-    let children = sorted_subdirs_for_nav(current, opts, cancel, cache, None, memo)?;
+    let children = sorted_subdirs_for_nav(current, opts.clone(), cancel, cache, None, memo)?;
     if !children.is_empty() {
         let current_ancestor_keys = canonical_ancestor_keys(current);
         for (child, candidate) in children {
@@ -687,7 +720,7 @@ pub fn next_folder_dfs_with_memo(
         }
     }
     // 2. 子がない / 子がすべて循環なら、次の兄弟または祖先の次の兄弟を探す
-    next_sibling_or_ancestor_sibling(current, opts, cancel, cache, memo)
+    next_sibling_or_ancestor_sibling(current, opts.clone(), cancel, cache, memo)
 }
 
 /// `current` を canonicalize し、その実体パスと全祖先の正規化キーを返す。
@@ -721,7 +754,7 @@ fn directory_descent_creates_cycle(current_ancestor_keys: &[String], child: &Pat
 /// 深さ優先前順で前のフォルダを返す。
 /// 前の兄弟がいればその最後の子孫、最初の子であれば親。
 pub fn prev_folder_dfs(current: &Path, opts: FolderTreeOptions) -> Option<PathBuf> {
-    prev_folder_dfs_with_context(current, opts, None, None)
+    prev_folder_dfs_with_context(current, opts.clone(), None, None)
 }
 
 pub fn prev_folder_dfs_with_context(
@@ -730,7 +763,7 @@ pub fn prev_folder_dfs_with_context(
     cancel: Option<&AtomicBool>,
     cache: Option<&crate::archive_cache::ArchiveCacheDb>,
 ) -> Option<PathBuf> {
-    prev_folder_dfs_with_memo(current, opts, cancel, cache, None)
+    prev_folder_dfs_with_memo(current, opts.clone(), cancel, cache, None)
 }
 
 pub fn prev_folder_dfs_with_memo(
@@ -741,7 +774,8 @@ pub fn prev_folder_dfs_with_memo(
     memo: Option<&FolderNavDecisionMemo>,
 ) -> Option<PathBuf> {
     let parent = current.parent()?;
-    let siblings = sorted_subdirs_for_nav(parent, opts, cancel, cache, Some(current), memo)?;
+    let siblings =
+        sorted_subdirs_for_nav(parent, opts.clone(), cancel, cache, Some(current), memo)?;
     let pos = siblings.iter().position(|(s, _)| path_eq(s, current))?;
 
     if let Some((previous, _)) = siblings[..pos]
@@ -750,7 +784,11 @@ pub fn prev_folder_dfs_with_memo(
         .find(|(_, candidate)| *candidate)
     {
         Some(last_descendant_dir_with_memo(
-            previous, opts, cancel, cache, memo,
+            previous,
+            opts.clone(),
+            cancel,
+            cache,
+            memo,
         ))
     } else {
         // 最初の子 → 親へ
@@ -761,7 +799,7 @@ pub fn prev_folder_dfs_with_memo(
 /// 現在のフォルダ / 仮想フォルダと同じ親を持つ、次の兄弟を返す。
 /// 子や祖先の兄弟へは移動しない (Ctrl+PageDown 用)。
 pub fn next_sibling_folder(current: &Path, opts: FolderTreeOptions) -> Option<PathBuf> {
-    next_sibling_folder_with_context(current, opts, None, None)
+    next_sibling_folder_with_context(current, opts.clone(), None, None)
 }
 
 pub fn next_sibling_folder_with_context(
@@ -770,7 +808,7 @@ pub fn next_sibling_folder_with_context(
     cancel: Option<&AtomicBool>,
     cache: Option<&crate::archive_cache::ArchiveCacheDb>,
 ) -> Option<PathBuf> {
-    next_sibling_folder_with_memo(current, opts, cancel, cache, None)
+    next_sibling_folder_with_memo(current, opts.clone(), cancel, cache, None)
 }
 
 pub fn next_sibling_folder_with_memo(
@@ -781,7 +819,8 @@ pub fn next_sibling_folder_with_memo(
     memo: Option<&FolderNavDecisionMemo>,
 ) -> Option<PathBuf> {
     let parent = current.parent()?;
-    let siblings = sorted_subdirs_for_nav(parent, opts, cancel, cache, Some(current), memo)?;
+    let siblings =
+        sorted_subdirs_for_nav(parent, opts.clone(), cancel, cache, Some(current), memo)?;
     let pos = siblings.iter().position(|(s, _)| path_eq(s, current))?;
     siblings[pos + 1..]
         .iter()
@@ -792,7 +831,7 @@ pub fn next_sibling_folder_with_memo(
 /// 現在のフォルダ / 仮想フォルダと同じ親を持つ、前の兄弟を返す。
 /// 前の兄弟の末端へ潜らず、兄弟そのものを返す (Ctrl+PageUp 用)。
 pub fn prev_sibling_folder(current: &Path, opts: FolderTreeOptions) -> Option<PathBuf> {
-    prev_sibling_folder_with_context(current, opts, None, None)
+    prev_sibling_folder_with_context(current, opts.clone(), None, None)
 }
 
 pub fn prev_sibling_folder_with_context(
@@ -801,7 +840,7 @@ pub fn prev_sibling_folder_with_context(
     cancel: Option<&AtomicBool>,
     cache: Option<&crate::archive_cache::ArchiveCacheDb>,
 ) -> Option<PathBuf> {
-    prev_sibling_folder_with_memo(current, opts, cancel, cache, None)
+    prev_sibling_folder_with_memo(current, opts.clone(), cancel, cache, None)
 }
 
 pub fn prev_sibling_folder_with_memo(
@@ -812,7 +851,8 @@ pub fn prev_sibling_folder_with_memo(
     memo: Option<&FolderNavDecisionMemo>,
 ) -> Option<PathBuf> {
     let parent = current.parent()?;
-    let siblings = sorted_subdirs_for_nav(parent, opts, cancel, cache, Some(current), memo)?;
+    let siblings =
+        sorted_subdirs_for_nav(parent, opts.clone(), cancel, cache, Some(current), memo)?;
     let pos = siblings.iter().position(|(s, _)| path_eq(s, current))?;
     siblings[..pos]
         .iter()
@@ -830,19 +870,19 @@ fn next_sibling_or_ancestor_sibling(
     memo: Option<&FolderNavDecisionMemo>,
 ) -> Option<PathBuf> {
     let parent = path.parent()?;
-    let siblings = sorted_subdirs_for_nav(parent, opts, cancel, cache, Some(path), memo)?;
+    let siblings = sorted_subdirs_for_nav(parent, opts.clone(), cancel, cache, Some(path), memo)?;
     let pos = siblings.iter().position(|(s, _)| path_eq(s, path))?;
 
     if let Some((next, _)) = siblings[pos + 1..].iter().find(|(_, candidate)| *candidate) {
         Some(next.clone())
     } else {
-        next_sibling_or_ancestor_sibling(parent, opts, cancel, cache, memo)
+        next_sibling_or_ancestor_sibling(parent, opts.clone(), cancel, cache, memo)
     }
 }
 
 /// path の最も深い最後の子孫フォルダを返す（子がなければ path 自身）。
 pub(crate) fn last_descendant_dir(path: &Path, opts: FolderTreeOptions) -> PathBuf {
-    last_descendant_dir_with_context(path, opts, None, None)
+    last_descendant_dir_with_context(path, opts.clone(), None, None)
 }
 
 pub(crate) fn last_descendant_dir_with_context(
@@ -851,7 +891,7 @@ pub(crate) fn last_descendant_dir_with_context(
     cancel: Option<&AtomicBool>,
     cache: Option<&crate::archive_cache::ArchiveCacheDb>,
 ) -> PathBuf {
-    last_descendant_dir_with_memo(path, opts, cancel, cache, None)
+    last_descendant_dir_with_memo(path, opts.clone(), cancel, cache, None)
 }
 
 fn last_descendant_dir_with_memo(
@@ -862,7 +902,7 @@ fn last_descendant_dir_with_memo(
     memo: Option<&FolderNavDecisionMemo>,
 ) -> PathBuf {
     let mut visited = HashSet::new();
-    last_descendant_dir_inner(path, opts, cancel, cache, memo, 0, &mut visited)
+    last_descendant_dir_inner(path, opts.clone(), cancel, cache, memo, 0, &mut visited)
 }
 
 fn last_descendant_dir_inner(
@@ -879,10 +919,10 @@ fn last_descendant_dir_inner(
         return path.to_path_buf();
     }
     let children =
-        sorted_subdirs_for_nav(path, opts, cancel, cache, None, memo).unwrap_or_default();
+        sorted_subdirs_for_nav(path, opts.clone(), cancel, cache, None, memo).unwrap_or_default();
     match children.iter().rev().find(|(_, candidate)| *candidate) {
         Some((last, _)) => {
-            last_descendant_dir_inner(last, opts, cancel, cache, memo, depth + 1, visited)
+            last_descendant_dir_inner(last, opts.clone(), cancel, cache, memo, depth + 1, visited)
         }
         None => path.to_path_buf(),
     }
@@ -1045,7 +1085,7 @@ fn walk_dirs_recursive_with_progress_inner(
 /// 撲滅するため `FolderTreeOptions` を呼び出し側から受け取る形に変更
 /// (= ナビ中の並列 Settings::load() を 0 件に)。
 pub fn sorted_subdirs(path: &Path, opts: FolderTreeOptions) -> Vec<PathBuf> {
-    sorted_subdirs_for_nav(path, opts, None, None, None, None)
+    sorted_subdirs_for_nav(path, opts.clone(), None, None, None, None)
         .unwrap_or_default()
         .into_iter()
         .filter_map(|(path, candidate)| candidate.then_some(path))
@@ -1060,7 +1100,7 @@ fn sorted_subdirs_for_nav(
     anchor: Option<&Path>,
     memo: Option<&FolderNavDecisionMemo>,
 ) -> Option<Vec<(PathBuf, bool)>> {
-    sorted_subdirs_for_nav_observed(path, opts, cancel, cache, anchor, memo, &mut |_| {})
+    sorted_subdirs_for_nav_observed(path, opts.clone(), cancel, cache, anchor, memo, &mut |_| {})
 }
 
 fn sorted_subdirs_for_nav_observed(
@@ -1126,7 +1166,7 @@ fn sorted_subdirs_for_nav_observed(
                 }
                 dirs.push((p, mtime));
             } else if kind.is_file() {
-                let candidate = is_folder_nav_file_candidate(&p, opts, cancel, cache, memo);
+                let candidate = is_folder_nav_file_candidate(&p, opts.clone(), cancel, cache, memo);
                 after_file_inspection(&p);
                 if cancelled(cancel) {
                     return None;
@@ -1393,14 +1433,14 @@ mod tests {
         };
 
         assert_eq!(
-            labels(sorted_subdirs(&root, options)),
+            labels(sorted_subdirs(&root, options.clone())),
             ["chapter10", "chapter2", "chapter1"]
         );
-        let first = next_folder_dfs(&root, options).expect("first DFS child");
+        let first = next_folder_dfs(&root, options.clone()).expect("first DFS child");
         assert_eq!(first.file_name().unwrap(), "chapter10");
-        let second = next_sibling_folder(&first, options).expect("second sibling");
+        let second = next_sibling_folder(&first, options.clone()).expect("second sibling");
         assert_eq!(second.file_name().unwrap(), "chapter2");
-        let previous = prev_sibling_folder(&second, options).expect("previous sibling");
+        let previous = prev_sibling_folder(&second, options.clone()).expect("previous sibling");
         assert!(path_eq(&previous, &first));
     }
 
@@ -1701,12 +1741,16 @@ mod tests {
                 };
                 let memo = FolderNavDecisionMemo::default();
                 assert!(
-                    memo.resolve(&later, opts, None, Some(&db)).is_none(),
+                    memo.resolve(&later, opts.clone(), None, Some(&db))
+                        .is_none(),
                     "{extension}/{archive_policy:?}: a valid cache cannot admit a later volume",
                 );
-                assert!(memo.resolve(&first, opts, None, Some(&db)).is_some());
+                assert!(
+                    memo.resolve(&first, opts.clone(), None, Some(&db))
+                        .is_some()
+                );
                 assert_eq!(
-                    next_folder_dfs_with_memo(&first, opts, None, Some(&db), Some(&memo)),
+                    next_folder_dfs_with_memo(&first, opts.clone(), None, Some(&db), Some(&memo)),
                     Some(after.clone()),
                     "{extension}/{archive_policy:?}: forward DFS must skip part2",
                 );
@@ -1732,7 +1776,7 @@ mod tests {
             ..FolderTreeOptions::default()
         };
 
-        let names: Vec<_> = sorted_subdirs(root, opts)
+        let names: Vec<_> = sorted_subdirs(root, opts.clone())
             .into_iter()
             .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
             .collect();
@@ -1772,12 +1816,12 @@ mod tests {
         };
 
         assert_eq!(
-            next_folder_dfs(&root.join("01-direct.rar"), opts),
+            next_folder_dfs(&root.join("01-direct.rar"), opts.clone()),
             Some(root.join("06-control.zip")),
             "forward DFS must locate a current RAR even when conversion candidates are excluded"
         );
         assert_eq!(
-            prev_folder_dfs(&root.join("08-direct.cbr"), opts),
+            prev_folder_dfs(&root.join("08-direct.cbr"), opts.clone()),
             Some(root.join("06-control.zip")),
             "backward DFS must locate a current CBR even when conversion candidates are excluded"
         );
@@ -1804,12 +1848,12 @@ mod tests {
         };
 
         assert_eq!(
-            next_folder_dfs(&root.join("06-control.zip"), opts),
+            next_folder_dfs(&root.join("06-control.zip"), opts.clone()),
             Some(root.join("08-direct.cbr")),
             "a direct-read CBR must be reachable from ZIP"
         );
         assert_eq!(
-            prev_folder_dfs(&root.join("10-images"), opts),
+            prev_folder_dfs(&root.join("10-images"), opts.clone()),
             Some(root.join("08-direct.cbr")),
             "a direct-read CBR must be reachable from an image folder"
         );
@@ -1827,11 +1871,11 @@ mod tests {
 
         let opts = FolderTreeOptions::default();
         assert_eq!(
-            next_folder_dfs(&root.join("01-direct.rar"), opts),
+            next_folder_dfs(&root.join("01-direct.rar"), opts.clone()),
             Some(root.join("02-solid.rar")),
         );
         assert_eq!(
-            prev_folder_dfs(&root.join("02-solid.rar"), opts),
+            prev_folder_dfs(&root.join("02-solid.rar"), opts.clone()),
             Some(root.join("01-direct.rar")),
         );
     }
@@ -1855,19 +1899,19 @@ mod tests {
             ..FolderTreeOptions::default()
         };
         assert_eq!(
-            next_sibling_folder(&root.join("01-direct.rar"), ignore),
+            next_sibling_folder(&root.join("01-direct.rar"), ignore.clone()),
             Some(root.join("06-control.zip"))
         );
         assert_eq!(
-            prev_sibling_folder(&root.join("08-direct.cbr"), ignore),
+            prev_sibling_folder(&root.join("08-direct.cbr"), ignore.clone()),
             Some(root.join("06-control.zip"))
         );
         assert_eq!(
-            next_folder_dfs(&root.join("01-direct.rar"), ignore),
+            next_folder_dfs(&root.join("01-direct.rar"), ignore.clone()),
             Some(root.join("06-control.zip"))
         );
         assert_eq!(
-            prev_folder_dfs(&root.join("08-direct.cbr"), ignore),
+            prev_folder_dfs(&root.join("08-direct.cbr"), ignore.clone()),
             Some(root.join("06-control.zip"))
         );
         assert_eq!(
@@ -1895,8 +1939,8 @@ mod tests {
         };
         let outcome = navigate_folder_with_skip(
             &root.join("01-direct.rar"),
-            |path| next_folder_dfs(path, opts),
-            |path, cancel| folder_has_still_image_with_options(path, cancel, opts),
+            |path| next_folder_dfs(path, opts.clone()),
+            |path, cancel| folder_has_still_image_with_options(path, cancel, opts.clone()),
             8,
             None,
         )
@@ -1919,14 +1963,17 @@ mod tests {
             ..FolderTreeOptions::default()
         };
         assert_eq!(
-            prev_sibling_folder(&root.join("2.rar"), opts),
+            prev_sibling_folder(&root.join("2.rar"), opts.clone()),
             Some(root.join("1.zip"))
         );
         assert_eq!(
-            next_sibling_folder(&root.join("2.rar"), opts),
+            next_sibling_folder(&root.join("2.rar"), opts.clone()),
             Some(root.join("10.zip"))
         );
-        assert_eq!(next_sibling_folder(&root.join("missing.rar"), opts), None);
+        assert_eq!(
+            next_sibling_folder(&root.join("missing.rar"), opts.clone()),
+            None
+        );
     }
 
     #[test]
@@ -1937,15 +1984,15 @@ mod tests {
         std::fs::write(root.join("book.zip"), b"zip").unwrap();
         std::fs::write(root.join("next.zip"), b"zip").unwrap();
         let opts = FolderTreeOptions::default();
-        assert!(!sorted_subdirs(root, opts).contains(&root.join("book.rar")));
+        assert!(!sorted_subdirs(root, opts.clone()).contains(&root.join("book.rar")));
         assert_eq!(
-            next_sibling_folder(&root.join("book.rar"), opts),
+            next_sibling_folder(&root.join("book.rar"), opts.clone()),
             Some(root.join("book.zip"))
         );
         std::fs::create_dir(root.join("book")).unwrap();
-        assert!(!sorted_subdirs(root, opts).contains(&root.join("book.zip")));
+        assert!(!sorted_subdirs(root, opts.clone()).contains(&root.join("book.zip")));
         assert_eq!(
-            next_sibling_folder(&root.join("book.zip"), opts),
+            next_sibling_folder(&root.join("book.zip"), opts.clone()),
             Some(root.join("next.zip"))
         );
     }
@@ -1966,7 +2013,7 @@ mod tests {
         };
         let result = sorted_subdirs_for_nav_observed(
             root,
-            opts,
+            opts.clone(),
             Some(&cancel),
             None,
             None,
@@ -2014,12 +2061,14 @@ mod tests {
             archive_policy: NavigationArchivePolicy::DetachedReadable,
             ..FolderTreeOptions::default()
         };
-        assert!(resolve_folder_nav_landing(&solid, opts, None, Some(&db)).is_none());
-        let direct_target = resolve_folder_nav_landing(&direct, opts, None, Some(&db)).unwrap();
+        assert!(resolve_folder_nav_landing(&solid, opts.clone(), None, Some(&db)).is_none());
+        let direct_target =
+            resolve_folder_nav_landing(&direct, opts.clone(), None, Some(&db)).unwrap();
         assert_eq!(direct_target.kind, FolderNavLandingKind::DirectRar);
         assert_eq!(direct_target.backing_path, direct);
         std::fs::copy(fixtures.join("06-control.zip"), &cache_zip).unwrap();
-        let solid_target = resolve_folder_nav_landing(&solid, opts, None, Some(&db)).unwrap();
+        let solid_target =
+            resolve_folder_nav_landing(&solid, opts.clone(), None, Some(&db)).unwrap();
         assert_eq!(solid_target.kind, FolderNavLandingKind::ConversionCacheHit);
         assert_eq!(solid_target.backing_path, cache_zip);
     }
@@ -2054,7 +2103,7 @@ mod tests {
             archive_policy: NavigationArchivePolicy::DetachedReadable,
             ..FolderTreeOptions::default()
         };
-        assert!(resolve_folder_nav_landing(&source, opts, None, Some(&db)).is_none());
+        assert!(resolve_folder_nav_landing(&source, opts.clone(), None, Some(&db)).is_none());
     }
 
     #[test]
@@ -2073,7 +2122,8 @@ mod tests {
         };
         let memo = FolderNavDecisionMemo::default();
         let candidates =
-            sorted_subdirs_for_nav(temp.path(), opts, None, None, None, Some(&memo)).unwrap();
+            sorted_subdirs_for_nav(temp.path(), opts.clone(), None, None, None, Some(&memo))
+                .unwrap();
         assert!(
             candidates
                 .iter()
@@ -2083,11 +2133,11 @@ mod tests {
         assert!(folder_has_still_image_with_memo(
             &source,
             None,
-            opts,
+            opts.clone(),
             None,
             Some(&memo)
         ));
-        let target = memo.resolve(&source, opts, None, None).unwrap();
+        let target = memo.resolve(&source, opts.clone(), None, None).unwrap();
         assert_eq!(target.kind, FolderNavLandingKind::DirectRar);
         assert_eq!(target.logical_source, source);
     }
@@ -2142,14 +2192,14 @@ mod tests {
         let mut settings = crate::settings::Settings::default();
         settings.epub_file_handling = crate::settings::EpubFileHandling::Ignore;
         let options = FolderTreeOptions::from_settings(&settings);
-        let paths = sorted_subdirs(temp.path(), options);
+        let paths = sorted_subdirs(temp.path(), options.clone());
         assert!(!paths.iter().any(|path| path.ends_with("book.epub")));
         assert!(paths.iter().any(|path| path.ends_with("document.pdf")));
         assert!(paths.iter().any(|path| path.ends_with("archive.7z")));
         assert!(!folder_should_stop_with_options(
             &temp.path().join("book.epub"),
             None,
-            options
+            options.clone()
         ));
     }
 
@@ -2174,7 +2224,7 @@ mod tests {
             skip_archive_if_zip_exists: false,
             ..FolderTreeOptions::default()
         };
-        let names: Vec<_> = sorted_subdirs(tmp.path(), options)
+        let names: Vec<_> = sorted_subdirs(tmp.path(), options.clone())
             .into_iter()
             .filter_map(|path| {
                 path.file_name()
@@ -2195,8 +2245,12 @@ mod tests {
             ..FolderTreeOptions::default()
         };
 
-        assert!(!folder_should_stop_with_options(&rar, None, opts));
-        assert!(!folder_has_still_image_with_options(&rar, None, opts));
+        assert!(!folder_should_stop_with_options(&rar, None, opts.clone()));
+        assert!(!folder_has_still_image_with_options(
+            &rar,
+            None,
+            opts.clone()
+        ));
     }
 
     #[cfg(windows)]
@@ -2685,5 +2739,75 @@ mod tests {
             "祖先 junction には潜らず mid の次兄弟 other へ, got {:?}",
             next
         );
+    }
+}
+
+#[cfg(test)]
+mod file_type_visibility_navigation_tests {
+    use super::*;
+    use crate::file_type_visibility::FileTypeCategory;
+
+    #[test]
+    fn visibility_landing_preserves_a_real_directory_with_archive_suffix() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("notes.zip");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("page.jpg"), b"image").unwrap();
+        let mut options = FolderTreeOptions::default();
+        options
+            .file_type_visibility
+            .excluded_categories
+            .insert(FileTypeCategory::Zip);
+        options
+            .file_type_visibility
+            .excluded_extensions
+            .insert("zip".into());
+        let landing = resolve_folder_nav_landing(&directory, options, None, None).unwrap();
+        assert_eq!(landing.kind, FolderNavLandingKind::Folder);
+        assert_eq!(landing.backing_path, directory);
+    }
+
+    #[test]
+    fn hidden_media_folder_is_skipped_while_directory_passages_remain() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("01-video/child")).unwrap();
+        std::fs::create_dir(root.join("02-image")).unwrap();
+        std::fs::write(root.join("01-video/movie.mp4"), b"video").unwrap();
+        std::fs::write(root.join("01-video/child/page.jpg"), b"image").unwrap();
+        std::fs::write(root.join("02-image/page.jpg"), b"image").unwrap();
+        let mut options = FolderTreeOptions::default();
+        options
+            .file_type_visibility
+            .excluded_categories
+            .insert(FileTypeCategory::Video);
+        assert!(!folder_should_stop_with_options(
+            &root.join("01-video"),
+            None,
+            options.clone()
+        ));
+        assert_eq!(
+            next_folder_dfs(&root.join("01-video"), options.clone()),
+            Some(root.join("01-video/child"))
+        );
+        assert!(folder_should_stop_with_options(
+            &root.join("01-video/child"),
+            None,
+            options
+        ));
+    }
+
+    #[test]
+    fn excluded_zip_does_not_suppress_same_name_rar_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("book.zip"), b"zip").unwrap();
+        std::fs::write(temp.path().join("book.rar"), b"rar").unwrap();
+        let mut options = FolderTreeOptions::default();
+        options
+            .file_type_visibility
+            .excluded_categories
+            .insert(FileTypeCategory::Zip);
+        let entries = sorted_subdirs(temp.path(), options);
+        assert_eq!(entries, vec![temp.path().join("book.rar")]);
     }
 }

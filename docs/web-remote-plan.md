@@ -781,6 +781,28 @@ folder entry と同じであり、UNC 等の既存拒否条件も変えない。
 canonicalize／存在確認を行わず、応答の遅い登録先が Home worker と IPC deadline を塞がない。
 wire shape は同じなので protocol 66 を維持する。その他の場所項目の既存解決処理は変更しない。
 
+2026-10-08 の §1.345 では `PROTOCOL_VERSION` を 66 → 67 に更新した。
+`CollectionPayload.registered_total` (任意値) と
+`PersistentCollectionSnapshotPayload.registered_total` (登録全件数) を追加し、
+種類の非表示や表示上限を適用した結果件数とは分けて「表示 X / 登録 Y」を表示する。
+`ContainerPayload.resume_refusal` は serde-default の任意値で、非表示・削除・改名などにより保存した
+論理ページが一覧にない場合は `saved_page_unavailable`、種類を制限した一覧で旧版の
+raw index を検証できない場合は `legacy_position_unverified` を返す。
+「続きから」の再開を拒否した場合は `open_mode=grid` とし、Web は理由と一覧からの
+ページ選択案内を表示する。別ページを自動で代用しない。フォルダ・ZIP・PDF の再開照合は
+列挙に使った種類ポリシーの snapshot を使う。保存位置なし・全種類表示時の旧 raw の範囲外位置・
+UI reader の Busy / Timeout / Stopped は従来どおり先頭ページへの fallback を保つ。
+
+2026-10-09 の §1.345 レビュー修正で protocol 68 とする。旧 `/api/image-info` と
+`/api/image` は認証済み Home worker の stateless `SourceReadEligibility` を共有し、
+最新の種類設定と source 解決を照合してから既存 Library の寸法取得・画像描画へ進む。
+判定は File 専用で、復号・入れ子列挙・許可cacheの保存を行わない。動画・音声の開始も
+同じ source owner を通り、UI が player を所有する直前にも最新設定を照合する。
+評価・ブックマーク一覧と本内ブックマークの任意 `visibility_notice` は、来歴のない旧変換cacheの
+項目を一時非表示にしたことを伝える。登録は保持し、再生成後の再読込で再投影する。
+RAW 先読みは取消可能な direct member の central directory / manifest の照合だけを行い、
+全入れ子列挙を追加しない（§14.24 の負荷・取消契約を維持）。
+
 スマートフォルダの定義一覧と、ドライブ一覧・読書履歴・レーティング・本棚・ブックマーク・
 スマートフォルダの評価結果は本体 IPC から取得する。remote-web は DB の集約条件や並び順を
 再実装しない。
@@ -1331,6 +1353,11 @@ protocol v14 は `ContainerPayload` に `resume_page`、`open_mode`、
 container 取得エラーへ伝播させない。Web の viewer は page address から `page_groups` 上の所属 group を引くため、
 見開き時は保存ページを含む見開きを開く。純粋関数テストで有効位置、ページ数ちょうどの上限、
 大幅な超過、Web 側の不一致 fallback を固定する。
+
+§1.345 / protocol v69 の種類制限時は上記の任意情報欠落と再開拒否を区別する。
+新しく保存した位置は論理 identity で照合し、非表示の保存ページや検証できない旧版 index は
+`resume_refusal` と `open_mode=grid` で明示する。Web は理由を一覧に表示して再選択を促し、
+先頭や同じ index の別ページを自動で開かない。
 
 コンテナのサムネイル比率は collection 一覧と同じ
 `aggregate_thumb_aspect_height_ratio(&settings)` から取得する。これはローカル設定に対応する
@@ -1913,7 +1940,7 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 
 `crates/remote-ipc` の protocol version を上げた増分では、**本体と remote-web の両方を
 再ビルドして再起動する**必要がある。片方だけだとハンドシェイクで弾かれる。
-現行版は **v67**。v67 は §1.347 の音声サムネイル生成と共通一覧 presentation の audio indicator を追加する。同名 sidecar は動画・音声の共通 discovery を使い、永続コレクションの snapshot / navigation replacement にも出所を含む。Web の無画像・失敗終端は一覧 owner が保持し、明示再取得で artEpoch とともに破棄する。v66 は場所一覧の本体 materializer の統一 (§12.15) を含む。v65 は表示位置の RAW 先読み窓の宣言と ack を追加した (§14.24)。v64 は RAW ブランチの v62 と master の v63 を統合し、RAW ページの `RawPrefetchSkipped` / `RawCapacity`、サムネイルの `NoThumbnail` と、EPUB・音声トラック選択・再生位置書き戻しをすべて含む。本体と service を同時に更新する。v63 は audio-tracks ブランチの追加を統合し、Remote 動画の音声トラック列挙・選択状態、start の選択指定、世代照合付き切り替え control と、端末で見た再生位置の PC への書き戻し (`RecordVideoProgress`、所有世代と連番の照合) を含む。audio-tracks ブランチでは音声トラック追加時に v62、再生位置追加時に v63 としていた。master の v62 は EPUB 対応で、wire の形と enum 値は変えず、既存の `RemoteEntryKind::Pdf` / `ContainerKind::Pdf` が元 `.epub` の論理パスも表すようになった。旧 remote-web は EPUB を PDF 本として再検証できないため版を上げた。統合後の v63 では EPUB と音声トラック・再生位置の追加をすべて含み、本体と service を同時に更新する。v61 は物理フォルダの評価順読み取り失敗を一覧へ通知する任意の `sort_notice` を追加した。v60 は表紙直後・最終ページの強制単独表示、白い表示側、二つの本別値と Remote write を追加した。v59 は見開き先頭・末尾の単ページ配置を別々の保存値と Remote write に分けた。v58 は永続コレクションの着地位置を実媒体別の
+現行版は **v69**。v69 は §1.345 の v68 と出荷済み v4.5.0 master の v67 を統合した版（共通base v66、両側が独立に版を上げたため max+1）。種類投影・最新policyでの読出し制限と音声サムネイルpresentationを両方保持し、本体とserviceを同時に更新する。v67 は §1.347 の音声サムネイル生成と共通一覧 presentation の audio indicator を追加する。同名 sidecar は動画・音声の共通 discovery を使い、永続コレクションの snapshot / navigation replacement にも出所を含む。Web の無画像・失敗終端は一覧 owner が保持し、明示再取得で artEpoch とともに破棄する。v66 は場所一覧の本体 materializer の統一 (§12.15) を含む。v65 は表示位置の RAW 先読み窓の宣言と ack を追加した (§14.24)。v64 は RAW ブランチの v62 と master の v63 を統合し、RAW ページの `RawPrefetchSkipped` / `RawCapacity`、サムネイルの `NoThumbnail` と、EPUB・音声トラック選択・再生位置書き戻しをすべて含む。本体と service を同時に更新する。v63 は audio-tracks ブランチの追加を統合し、Remote 動画の音声トラック列挙・選択状態、start の選択指定、世代照合付き切り替え control と、端末で見た再生位置の PC への書き戻し (`RecordVideoProgress`、所有世代と連番の照合) を含む。audio-tracks ブランチでは音声トラック追加時に v62、再生位置追加時に v63 としていた。master の v62 は EPUB 対応で、wire の形と enum 値は変えず、既存の `RemoteEntryKind::Pdf` / `ContainerKind::Pdf` が元 `.epub` の論理パスも表すようになった。旧 remote-web は EPUB を PDF 本として再検証できないため版を上げた。統合後の v63 では EPUB と音声トラック・再生位置の追加をすべて含み、本体と service を同時に更新する。v61 は物理フォルダの評価順読み取り失敗を一覧へ通知する任意の `sort_notice` を追加した。v60 は表紙直後・最終ページの強制単独表示、白い表示側、二つの本別値と Remote write を追加した。v59 は見開き先頭・末尾の単ページ配置を別々の保存値と Remote write に分けた。v58 は永続コレクションの着地位置を実媒体別の
 `{ kind, ordinal, count }` にし、v57 はコレクションの shuffle order、v56 は永続コレクションの
 catalog / snapshot / navigation を追加した。collection の session spread request と
 address-based `page_groups` を追加した版は v49。

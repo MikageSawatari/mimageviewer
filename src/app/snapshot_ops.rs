@@ -512,13 +512,44 @@ impl App {
     }
 
     /// snapshot active 中か。
+    pub(crate) fn direct_media_basis_allows_index(&self, idx: usize) -> bool {
+        match self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| &snapshot.source_label)
+        {
+            Some(SnapshotSourceLabel::DirectMedia { target, policy, .. }) => {
+                match self.items.get(idx) {
+                    Some(GridItem::Image(path) | GridItem::Video(path) | GridItem::Audio(path)) => {
+                        !crate::path_key::eq_keep_drive(path, target)
+                            && policy.allows_physical_file(path)
+                    }
+                    _ => true,
+                }
+            }
+            _ => true,
+        }
+    }
+
+    pub(crate) fn direct_media_reader_active(&self) -> bool {
+        self.snapshot.as_ref().is_some_and(|snapshot| {
+            matches!(
+                snapshot.source_label,
+                SnapshotSourceLabel::DirectMedia { .. }
+            )
+        })
+    }
+
     pub(crate) fn is_snapshot_active(&self) -> bool {
-        self.snapshot.is_some()
+        self.snapshot.is_some() && !self.direct_media_reader_active()
     }
 
     /// snapshot 中の件数。inactive なら None。
     pub(crate) fn snapshot_count(&self) -> Option<usize> {
-        self.snapshot.as_ref().map(|s| s.items.len())
+        self.snapshot
+            .as_ref()
+            .filter(|_| !self.direct_media_reader_active())
+            .map(|s| s.items.len())
     }
 
     /// snapshot の起点フォルダ path。inactive なら None。
@@ -679,7 +710,58 @@ impl App {
     /// 3. **activate snapshot**: `self.snapshot = Some(SnapshotState { ... })`、
     ///    items / thumbnails / visible_indices / scroll_offset / selected を退避して
     ///    snapshot subset で置き換え
+    /// Compose the external reader with a normal fixed snapshot at its ownership
+    /// boundary. The prepared parent is a stable prefix; completed thumbnail and
+    /// metadata work survives while the explicit tail page leaves the ordinary basis.
+    fn normalize_direct_media_basis_for_snapshot(&mut self) {
+        if !self.direct_media_reader_active() {
+            return;
+        }
+        let direct = self.snapshot.take().expect("typed direct reader exists");
+        self.top_level_grid_view.take_return_origin();
+        self.top_level_grid_view
+            .replace_surface(super::top_level_grid_view::TopLevelGridSurface::Folder);
+        let parent_len = direct.list_view_items.len();
+        let membership = self
+            .items
+            .iter()
+            .take(parent_len)
+            .enumerate()
+            .filter_map(|(idx, item)| snapshot_key_from_grid_item(item).map(|key| (key, idx)))
+            .collect::<HashMap<_, _>>();
+        // Reconcile before removing the tail so the old player still has its exact
+        // identity. The consumed Direct owner cannot dispatch a competing reload.
+        let viewer_swap = self.prepare_snapshot_viewer_index_swap("direct-to-fixed", &membership);
+        self.items.truncate(parent_len);
+        self.thumbnails.truncate(parent_len);
+        self.image_metas.truncate(parent_len);
+        self.page_identity_index = direct.saved_page_identity_index;
+        self.visible_indices.retain(|idx| *idx < parent_len);
+        self.details_order.retain(|idx| *idx < parent_len);
+        self.checked.retain(|idx| *idx < parent_len);
+        self.rating_cache.remove(&parent_len);
+        self.rotation_cache.remove(&parent_len);
+        self.zip_nav = direct.saved_zip_nav;
+        self.finish_snapshot_viewer_index_swap(viewer_swap);
+    }
+
     pub(crate) fn activate_snapshot(&mut self, source_label: SnapshotSourceLabel) {
+        if self.sidecar_restore_active() {
+            return;
+        }
+        if !self.visible_indices.iter().any(|&idx| {
+            self.direct_media_basis_allows_index(idx)
+                && self
+                    .items
+                    .get(idx)
+                    .and_then(snapshot_key_from_grid_item)
+                    .is_some()
+        }) {
+            self.show_feedback_toast("固定する items がありません".into());
+            return;
+        }
+        self.normalize_direct_media_basis_for_snapshot();
+        let accepted_policy = self.page_identity_index.policy.clone();
         let source_had_exact_page_edits = self.page_edit_snapshot.is_some();
         // Step 1: capture (= visible_indices から SnapshotEntry を構築)。
         let captured_entries: Vec<SnapshotEntry> = self
@@ -800,6 +882,7 @@ impl App {
         let list_view_items = captured_items_grid.clone();
         let list_view_thumbnails = captured_thumbnails.clone();
         let list_view_image_metas = captured_image_metas.clone();
+        let saved_page_identity_index = self.page_identity_index.clone();
         let saved_items = std::mem::replace(&mut self.items, captured_items_grid);
         let saved_thumbnails = std::mem::replace(&mut self.thumbnails, captured_thumbnails);
         let saved_image_metas = std::mem::replace(&mut self.image_metas, captured_image_metas);
@@ -844,6 +927,7 @@ impl App {
             source_label,
             generation_id,
             saved_items,
+            saved_page_identity_index,
             saved_thumbnails,
             saved_image_metas,
             saved_visible_indices,
@@ -853,6 +937,7 @@ impl App {
             list_view_items,
             list_view_thumbnails,
             list_view_image_metas,
+            list_view_page_identity_index: Default::default(),
             pre_snapshot_search_origin,
         });
         let return_origin = top_level_return.map(|restore| {
@@ -880,6 +965,8 @@ impl App {
         self.invalidate_idx_state_and_queues();
         self.invalidate_snapshot_details_index_state();
         self.finish_snapshot_viewer_index_swap(viewer_index_swap);
+        self.page_identity_index = Default::default();
+        self.prepare_snapshot_page_identity_index(accepted_policy);
         // tags_cache は invalidate 対象外なので手動 clear (= 既存 clear は冗長になるが
         // 残しておく方が安全、二重 clear は no-op)
         self.clear_tags_cache();
@@ -1030,7 +1117,9 @@ impl App {
             canonical.map(|origin| std::borrow::Cow::Owned(origin.restore)),
             || (path, subfolder_restore),
         );
-        self.show_feedback_toast("★固定を解除しました".into());
+        if !matches!(snap.source_label, SnapshotSourceLabel::DirectMedia { .. }) {
+            self.show_feedback_toast("★固定を解除しました".into());
+        }
         Some(super::top_level_grid_view::TopLevelGridOrigin {
             restore: return_context,
             route,
@@ -1190,6 +1279,7 @@ impl App {
                 }
             }
             self.items = snap.saved_items;
+            self.page_identity_index = snap.saved_page_identity_index;
             self.thumbnails = merged_thumbnails;
             self.image_metas = snap.saved_image_metas;
             self.visible_indices = snap.saved_visible_indices;
@@ -1252,7 +1342,14 @@ impl App {
         // list_view_items / list_view_thumbnails は activate_snapshot 時に保存した clone を
         // 使う (= reconstruct だと folder 代表サムネが Pending に戻って「フォルダアイコン」
         // 表示になるユーザー報告対応)。
-        let (snap_origin, list_items, list_thumbs, list_image_metas, exact_page_edits) = {
+        let (
+            snap_origin,
+            list_items,
+            list_thumbs,
+            list_image_metas,
+            list_identity_index,
+            exact_page_edits,
+        ) = {
             let Some(snap) = self.snapshot.as_ref() else {
                 return false;
             };
@@ -1261,6 +1358,7 @@ impl App {
                 snap.list_view_items.clone(),
                 snap.list_view_thumbnails.clone(),
                 snap.list_view_image_metas.clone(),
+                snap.list_view_page_identity_index.clone(),
                 // 検索 view 由来 snapshot は origin が cross-folder prefix なので rehydrate せず
                 // clear のみ (= activate と同じ判定。pre_snapshot_search_origin Some が search 由来)。
                 snap.page_edit_source == crate::snapshot::SnapshotPageEditSource::PreparedExact,
@@ -1305,6 +1403,7 @@ impl App {
         }
         // items 入れ替え (= 保存したサムネ付き state を復帰)
         self.items = list_items;
+        self.page_identity_index = list_identity_index;
         self.thumbnails = list_thumbs;
         self.image_metas = list_image_metas;
         self.visible_indices = (0..n).collect();
@@ -1394,6 +1493,7 @@ impl App {
             GridItem::Folder(p)
             | GridItem::Image(p)
             | GridItem::Video(p)
+            | GridItem::Audio(p)
             | GridItem::ZipFile(p)
             | GridItem::PdfFile(p) => Some(p.clone()),
             GridItem::ConvertibleArchive { path, .. } => Some(path.clone()),
@@ -2576,6 +2676,19 @@ mod tests {
         app
     }
 
+    fn drain_snapshot_identity_preparation(app: &mut App) {
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.sidecar_restore_active() {
+            app.poll_sidecar_restore(&ctx);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "snapshot identity preparation did not settle"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
     fn legacy_later_rar_cache_fixture(app: &AppTestEnvForTest) -> (PathBuf, PathBuf) {
         use std::io::Write;
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2638,6 +2751,7 @@ mod tests {
         app.thumbnails = vec![ThumbnailState::Pending];
         app.visible_indices = vec![0];
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
         let generation = app.items_generation;
         let _ = app.snapshot_open_entry(0, false, crate::app::HistoryTrigger::UserChosen);
         drain_snapshot_archive_classification(&mut app);
@@ -2662,6 +2776,7 @@ mod tests {
         app.thumbnails = vec![ThumbnailState::Pending];
         app.visible_indices = vec![0];
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
         let generation = app.items_generation;
         let _ = app.snapshot_navigate_grid(true);
         drain_snapshot_archive_classification(&mut app);
@@ -2726,6 +2841,7 @@ mod tests {
         app.thumbnails = vec![ThumbnailState::Pending];
         app.visible_indices = vec![0];
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(app);
     }
 
     #[test]
@@ -2801,6 +2917,7 @@ mod tests {
         ));
         app.deactivate_snapshot();
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
         assert_ne!(app.snapshot.as_ref().unwrap().generation_id, old_snapshot);
         drain_snapshot_archive_adoption(&mut app);
         assert_eq!(app.current_folder, Some(origin));
@@ -2824,6 +2941,7 @@ mod tests {
         app.thumbnails = vec![ThumbnailState::Pending];
         app.visible_indices = vec![0];
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
         assert!(app.snapshot_open_entry(0, false, crate::app::HistoryTrigger::UserChosen));
         drain_snapshot_archive_classification(&mut app);
         // Classification admits the logical source; the cached ZIP owner adopts its pages.
@@ -2851,6 +2969,7 @@ mod tests {
         app.thumbnails = vec![ThumbnailState::Pending];
         app.visible_indices = vec![0];
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
         let generation = app.items_generation;
         assert!(app.snapshot_navigate_grid(true));
         drain_snapshot_archive_classification(&mut app);
@@ -2873,6 +2992,7 @@ mod tests {
         app.thumbnails = vec![ThumbnailState::Pending];
         app.visible_indices = vec![0];
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
         let generation = app.items_generation;
         assert!(app.snapshot_navigate_grid(true));
         app.snapshot.as_mut().unwrap().generation_id += 1;
@@ -2927,6 +3047,7 @@ mod tests {
                 entry_name: "page.png".into(),
                 uncompressed_size: 0,
                 mtime: 0,
+                container_ancestry: Vec::new(),
             }],
         ));
         app.zip_nav = Some(crate::zip_tree::ZipNavState::new(tree));
@@ -3036,11 +3157,13 @@ mod tests {
                 entry_name: "bookA/p1.jpg".to_string(),
                 uncompressed_size: 0,
                 mtime: 0,
+                container_ancestry: Vec::new(),
             },
             crate::zip_loader::ZipImageEntry {
                 entry_name: "bookB/p1.jpg".to_string(),
                 uncompressed_size: 0,
                 mtime: 0,
+                container_ancestry: Vec::new(),
             },
         ];
         let tree = std::sync::Arc::new(crate::zip_tree::ZipTree::build(zip_path, entries));
@@ -3183,9 +3306,11 @@ mod tests {
     fn generation_id_advances_per_activate() {
         let mut app = test_app_with_items(vec![GridItem::Image(PathBuf::from(r"E:\a.png"))]);
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
         let gen1 = app.snapshot.as_ref().unwrap().generation_id;
         app.deactivate_snapshot();
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
         let gen2 = app.snapshot.as_ref().unwrap().generation_id;
         assert!(gen2 > gen1);
     }
@@ -3529,6 +3654,7 @@ mod tests {
             GridItem::Image(PathBuf::from(r"E:\test\b.png")),
         ]);
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
         // entry idx 1 (= b.png) を open する → items[1] が既にあるので open_fullscreen 直接呼び
         let result = app.snapshot_open_entry(
             1,
@@ -3650,6 +3776,7 @@ mod tests {
             GridItem::Image(PathBuf::from(r"E:\test\b.png")),
         ]);
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
         // a を fullscreen で開く (= 現 items 内なので直接 open)。
         assert!(app.snapshot_open_entry(
             0,
@@ -3704,6 +3831,7 @@ mod tests {
         ]);
         app.settings.archive_file_handling = crate::settings::ArchiveFileHandling::Ignore;
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
         app.fullscreen_idx = Some(0);
         let mut player =
             crate::video::VideoPlayer::stream_ready_disconnected_for_test(old_path.clone());
@@ -3775,6 +3903,7 @@ mod tests {
         );
         app.current_folder = Some(book);
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
         assert!(app.snapshot_open_entry(1, false, crate::app::HistoryTrigger::UserChosen,));
         assert_eq!(
             app.snapshot_owner_entry(&app.snapshot_current_fullscreen_path().unwrap()),
@@ -3809,6 +3938,7 @@ mod tests {
         );
         app.current_folder = Some(book);
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
         assert!(app.snapshot_open_entry(1, false, crate::app::HistoryTrigger::UserChosen));
         assert_eq!(
             app.snapshot_owner_entry(&app.snapshot_current_fullscreen_path().unwrap()),
@@ -3834,6 +3964,7 @@ mod tests {
             GridItem::Image(PathBuf::from(r"E:\test\b.png")),
         ]);
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
         assert!(app.snapshot_open_entry(
             0,
             /*resume_slideshow=*/ true,

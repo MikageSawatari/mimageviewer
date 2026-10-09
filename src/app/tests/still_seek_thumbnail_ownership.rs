@@ -402,7 +402,12 @@ fn show_bookmark_panel(
     app.fullscreen_idx = Some(fullscreen_idx);
     app.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
     app.settings.fullscreen_left_panel_tab = crate::settings::FullscreenLeftPanelTab::Bookmarks;
-    app.current_book_bookmarks_key = Some(container_key);
+    app.current_book_bookmarks_key = Some(BookBookmarkProjectionKey {
+        container_key,
+        visibility: app.listing_file_type_visibility().clone(),
+        context_id: app.virtual_list_context_id(),
+        items_generation: app.items_generation,
+    });
     app.current_book_bookmarks = bookmarks;
 }
 

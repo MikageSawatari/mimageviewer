@@ -570,6 +570,8 @@ pub(crate) enum CollectionGridLoadState {
 }
 
 pub(crate) struct CollectionGridPreparedInstall {
+    pub(crate) page_identity_index:
+        std::sync::Arc<super::file_type_resume::PreparedPageIdentityIndex>,
     pub(crate) prepared: crate::collection_store::CollectionPreparedSnapshot,
     pub(crate) page_edits: Option<(
         super::page_edit_snapshot::PageEditSnapshot,
@@ -640,6 +642,7 @@ pub(crate) fn collection_pin_blob_sizes_fit_retention_budget(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CollectionGridPrepareReuseKey {
+    pub(crate) file_type_visibility: crate::file_type_visibility::FileTypeVisibility,
     pub(crate) order: crate::collection_store::CollectionPrepareReuseKey,
     pub(crate) sidecar_scan_fingerprint: i64,
     pub(crate) skip_image_if_video_exists: bool,
@@ -661,6 +664,7 @@ impl CollectionGridPrepareReuseKey {
         thumbnail_source_epoch: u64,
     ) -> Self {
         Self {
+            file_type_visibility: settings.file_type_visibility.clone(),
             order: crate::collection_store::CollectionPrepareReuseKey::new(
                 collection_id,
                 revision,
@@ -688,6 +692,8 @@ pub(crate) enum CollectionGridPresentationSources {
 
 #[derive(Clone, Debug)]
 pub(crate) struct CollectionGridNavigationSources {
+    pub(crate) page_identity_index:
+        std::sync::Arc<super::file_type_resume::PreparedPageIdentityIndex>,
     pub(crate) reuse_key: CollectionGridPrepareReuseKey,
     pub(crate) page_edit_revision: u64,
     pub(crate) presentation: CollectionGridPresentationSources,
@@ -719,8 +725,10 @@ impl CollectionGridNavigationSources {
         page_edit_revision: u64,
         presentation: CollectionGridPresentationSources,
         live: Option<CollectionGridLiveThumbnailSources>,
+        page_identity_index: std::sync::Arc<super::file_type_resume::PreparedPageIdentityIndex>,
     ) -> Self {
         Self {
+            page_identity_index,
             reuse_key,
             page_edit_revision,
             presentation,
@@ -841,6 +849,8 @@ impl Default for CollectionGridPreparedThumbnailDelivery {
 
 #[derive(Clone, Debug)]
 pub(crate) struct CollectionGridInstalledPresentation {
+    pub(crate) page_identity_index:
+        std::sync::Arc<super::file_type_resume::PreparedPageIdentityIndex>,
     pub(crate) prepared: std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>,
     pub(crate) sources: CollectionGridPresentationSources,
     pub(crate) reuse_key: CollectionGridPrepareReuseKey,
@@ -864,8 +874,10 @@ impl CollectionGridInstalledPresentation {
         prepared: std::sync::Arc<crate::collection_store::CollectionPreparedSnapshot>,
         sources: CollectionGridPresentationSources,
         reuse_key: CollectionGridPrepareReuseKey,
+        page_identity_index: std::sync::Arc<super::file_type_resume::PreparedPageIdentityIndex>,
     ) -> Self {
         Self {
+            page_identity_index,
             prepared,
             sources,
             reuse_key,
@@ -891,6 +903,10 @@ impl CollectionGridInstalledPresentation {
                 None,
                 None,
                 0,
+            ),
+            super::collection_grid::prepare_collection_page_identity_index(
+                &prepared,
+                settings.file_type_visibility.clone(),
             ),
         ))
     }
