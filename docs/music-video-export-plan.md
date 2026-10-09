@@ -457,6 +457,244 @@ UI は操作コマンドの送信と再生位置のスナップショット読�
   Tab、Enter 確定、フォーカス復帰と Undo の所有。2026-10-09 のラボでの短い歌詞入力確認は、
   この範囲の保証にはならない。
 
+#### I1 設計（2026-10-09 案）
+
+段 1 の調査・設計案。**未実装・独立レビュー前**。段 2 は別途指示を受けてから着手する。
+本体の補正を挙動不変で切り出す部分と、エディタへ補正を適用する部分を分ける。
+以下の file:line は 2026-10-09 の調査時点のソースを指す。
+
+**1. 共有境界と依存**
+
+新設は `crates/egui-ime/`（package `egui-ime`、Rust 名 `egui_ime`）。通常依存は
+`egui = "0.33"` だけとし、eframe、本体 lib、keyboard owner、logger、Windows API に依存しない。
+標準ライブラリの `HashMap` / `Instant` / `Duration` を使う。workspace member に加え、本体と
+`musicvideo-ui` が path dependency を持つ。workspace root の `[patch.crates-io]` は既に
+`egui = { path = "vendor/egui" }`（`Cargo.toml:34`）、本体・共有 UI・ラボは同じ 0.33 系
+（`Cargo.toml:366`、`crates/musicvideo-ui/Cargo.toml:12`、`tools/musicvideo_lab/Cargo.toml:11`）。
+新クレートだけ別の egui を解決しないことを `cargo tree -p egui-ime` / `cargo tree -d` で確認する。
+`musicvideo-core` / `music-core` には egui 依存を追加しない。
+
+| 現要素・根拠 | 配置 | 理由・維持する契約 |
+| --- | --- | --- |
+| `ImeInputPlugin`、`install_ime_input_policy`、`normalize_ime_input`、`apply_ime_event`（`src/ime_focus.rs:18`〜140） | 共有 | `Memory::begin_pass` 前の唯一の composition owner。IME event の順序、composing 中の Esc **press だけ**の除去、取消時の空 preedit 挿入をそのまま移す |
+| per-viewport `ImeFocusState` と 300ms grace（同:13、42） | 共有 | Context 内の `ViewportId` ごとに状態を保持。`< 300ms`、`Instant`、非空 Commit の判定を維持。grace を Esc 除去条件へ混ぜない |
+| `ime_input_active` / `ime_input_active_in_viewport` / `ime_composing_with_pending_events` / `ime_input_active_with_pending_events`（同:610〜669） | 状態読取・pending event の純投影は共有、現在 viewport の診断開始は本体 facade | 他 viewport の read は queue・composition を更新しない。pending native event は queue が所有し、共有側はコピーした状態への投影だけを行う |
+| focus retry、`ImeTextFocusContract`、`focused_text_input` / `recovering_text_input`、`keyboard_focus_recovery_input`、remember / forget（同:148、251、671〜743） | 共有 | widget / viewport / pass の focus 契約が helper と入力所有の共通の根拠。直前 1 pass の recovery、pointer / touch と既存の別 widget focus の優先を維持 |
+| `restore_focus_for_ime_key`（同:778） | 共有 | 外部 `focus_request` と内部 retry の選択、focus lock、復帰時の repaint を維持。新しい retry・待機・猶予は追加しない |
+| `show_singleline` / `add_singleline` / `add_singleline_sensitive` / `add_sized_singleline` と内部 policy variant（同:832〜922） | 描画・補正は共有、本体の同名入口は薄い facade | `dyn TextBuffer`、configure closure、Response / TextEditOutput、サイズ指定を維持。widget 描画前に IME activity を採取する |
+| `TextInputDiagnosticKeyPolicy`（同:141） | 共有の中立 metadata | sensitive helper の focus 契約に Standard / Sensitive を記録するため必要。キー収集・マスク・ログは共有しない |
+| `begin_pass_diagnostics`、`TextInputKeyDiagnostic`、`observe_helper_widget`、整形・異常判定・文字マスク・ログ予算（同:165〜609） | 本体 | 本体の診断責務。keyboard owner の型、通常 1 MiB / 異常継続、Sensitive の全 redaction、次 pass の finalize と repaint を維持 |
+| `record_keyboard_owner` / `record_side_panel_close`（同:570、589） | 本体 | App の所有決定とパネル寿命を診断へ記録する。本体固有の型・call site を共有しない |
+| `src/egui_focus_policy.rs` の全域 Tab policy | 本体 | mIV は非 IME 時も全域で Tab traversal を無効化し、キー event は keymap に残す。IME helper の field-level lock とは別の製品仕様。エディタへ全域無効化を輸入しない |
+| App の `update_ime_state` と各 viewport 入口、native presenter の登録・pending event 経路 | 本体の既存位置 | 所有 viewport の pass で更新し、他 viewport は read だけという境界を維持。入力配送や detached 述語を変更しない |
+
+plugin type は共有側の 1 種だけにする。既存の debug name、temp ID の文字列と
+`(viewport, widget)` のキー構成を変えない。再登録は `Context::add_plugin` の type 単位の
+冪等性を使い、composition を再初期化しない。Context の破棄で状態が破棄されること、
+別 Context / viewport の読取・描画が sibling の状態を書き換えないことを維持する。
+抽出と同時に viewport map の掃除や新たな focus 状態機械を導入しない。
+
+**2. 本体固有部分の接続と呼び出し互換**
+
+接続は **本体 facade が共有 helper の前後で診断を行う方式**を推奨する。
+共有側から本体へ呼び返す callback / trait は不要。本体が共有側の結果を観測するだけにし、
+Context にホスト callback を保存する仕組み、二重の focus 契約、keyboard owner の変換型を作らない。
+
+- 共有側に read-only の `text_focus_contract_snapshot(ctx)` を設け、現在 viewport の
+  widget ID / focused pass / Standard・Sensitive をコピーして返す。診断は focus 消失後にも
+  直前の契約が必要なので、`focused_text_input` の結果だけでは代用できない。
+  snapshot は既存契約の投影であり、共有 state を変更する setter は公開しない。
+- 本体 `begin_pass_diagnostics` はこの snapshot を読み、既存の started-pass 検査、前 pass の
+  finalize、キー採取を行う。本体 `ime_input_active` は従来どおり先に診断を開始してから
+  共有側の activity を返す。他 viewport / pending event の読取入口には診断を追加しない。
+- 本体の 4 種の public(crate) helper は従来の引数・戻り値を保ち、先に診断開始、次に共有 helper、
+  最後に `observe_helper_widget` を呼ぶ。呼び出し元に対する raw TextEdit 入口は復活させない。
+  現状の observe は復帰後・remember / forget 前（`src/ime_focus.rs:822`）、facade では
+  remember / forget 後になる。この 2 処理は別の temp ID を操作し、observe は focus と widget ID
+  だけを見るため結果は同じ。診断の field_seen / field_id_after / focused_after を adapter test で固定する。
+- owner の決定は今の App / `keyboard_input` が行い、その結果を本体の
+  `record_keyboard_owner` に渡す（`src/app.rs:21059`）。共有側に owner 決定を移さない。
+  logger は本体の `log_key_diagnostic` だけから呼ぶ。
+- `src/ime_focus.rs` はモジュール名を維持する。副作用のない predicate / projection は
+  `pub(crate) use egui_ime::...` で再エクスポートできる。診断を伴う activity / helper は
+  上記 facade が必要なので、全関数の単純な再エクスポートは採らない。
+  `src/` の **35 ファイル**に `crate::ime_focus` の参照があり（自身のテストを含む）、
+  既存の呼び出し元を書き換える必要はない。
+  plugin 未登録の `Context::default()` でも本体 helper の診断が動く現状を維持し、facade が
+  勝手に plugin を登録する変更はしない（Sensitive の既存テストはその条件を使う）。
+- 本体ホストの `install_ime_input_policy` は共有 plugin 登録へ委譲し、全域 Tab policy の
+  登録順は今のまま（`src/lib.rs:1695`、native は
+  `src/video/native_presenter/render_core.rs:9245`）。App の viewport 入口も変更しない。
+  IMM32 の 2 経路・TSF 非採用・未対応範囲の本体固有 doc comment（`src/ime_focus.rs:758`）は
+  facade に残し、共有側の helper doc はホスト非依存の focus 契約を説明する。
+
+簡素化の検討: I1 は短い同期の入力変換で、保存・変換のような長い非同期処理ではないため、
+モーダル化や窓の再生成は不要。1 つの plugin owner と既存 focus 契約を再利用し、
+登録 callback・独立した editor composition flag・新しい復旧機構を増やさない。
+
+**3. エディタ側の適用と前提の訂正**
+
+`musicvideo-ui::install_input_policy(ctx)` をホスト用の登録入口として追加する案。
+この入口が共有 plugin とエディタ専用の `on_begin_pass` policy を冪等に登録する。
+ラボは `tools/musicvideo_lab/src/project.rs:55` の `setup_egui` から呼ぶ。
+通常 GUI と preview benchmark の creation closure の両方がこの関数を通る
+（`tools/musicvideo_lab/src/main.rs:158`、181）。headless handler / layout test の Context も
+同じ入口で登録し、UI 描画中の遅い登録を成功条件にしない。P4b のホスト移設後も登録入口を維持する。
+
+single-line はレイヤー名（`crates/musicvideo-ui/src/lib.rs:1327`）、テキスト本文（同:1506）、
+モジュレータ名（`crates/musicvideo-ui/src/modulators.rs:57`）、音名範囲の上下限（同:216、220）の
+**5 構築箇所**を共有 `add_singleline` へ替える。余分な Ui scope / container を足さず、
+auto ID の採番、既存の親 layer / modulator ID、幅 56pt、configure と `.changed()` の扱いを保つ。
+
+指示書の **「Hz 範囲の single-line」には相違がある**。
+Hz は `DragValue`（`crates/musicvideo-ui/src/modulators.rs:179`〜199）、raw TextEdit 2 箇所は
+`BandRange::Semitone` の `C1` / `C#4` 等の音名入力（同:200〜236）。Hz を String 欄へ置き換えると
+ドラッグ・数値範囲・clamp の既存機能が失われるため、`DragValue` を維持する。
+内部の TextEdit には Context の plugin / editor policy が効く。数値編集モードの Esc / Enter / Tab
+も回帰対象にする。raw TextEdit 禁止検査は vendor 内部の TextEdit を禁止しない。
+
+歌詞は **raw multiline を理由付きで維持**する。
+`LyricsTextBuffer`、`editor.widget_id(layer_id)`、`.desired_rows(7)`、各レイヤーの native Undo と
+sidecar の identity / cue time を変えない（`crates/musicvideo-ui/src/lib.rs:1682`〜1708、
+`crates/musicvideo-ui/src/lyrics_editing.rs:308`、338、1345）。plugin が挿入する空 preedit も
+`event_may_mutate_text` の対象になるため、既存の rollback capture → begin_pass → TextEdit →
+native reachability refresh → finish_pass の順序を保てる。I1 で buffer を String に替えたり、
+widget generation / native history をリセットしたりしない。
+
+plugin 登録だけで歌詞の **Esc / 空 preedit** は補正できる。既存
+`raw_multiline_text_edit_keeps_focus_and_cancels_preedit_across_delayed_disabled`
+（`src/ime_focus.rs:1484`）がその経路を検証している。ただし全操作の保証にはならない。
+egui の multiline は `tab: false`（`vendor/egui/src/widgets/text_edit/builder.rs:141`）で、
+Tab traversal は描画前に決まる（`vendor/egui/src/memory/mod.rs:553`）。また Enter を改行として
+扱い、IME event があるだけでは除去しない（builder 同:1006、934、1142）。
+**plugin のみで Tab / Enter も安全という前提は採らない**。
+
+エディタ専用 policy は最初の widget 登録前の `on_begin_pass` で次を行う案とする。
+これは本体の切り出しへ混ぜず、段 2b の独立レビュー対象とする。
+
+- IME がキーを所有する pass を「現在 composing、またはこの pass の入力に Ime event がある」と
+  既存 snapshot / event から判定する。composition が同 pass で終わる Commit / Disabled も含める。
+  composing は共有 `ime_composing_with_pending_events(ctx, ctx.viewport_id(), &[])` で読める。
+  新しい bool / pending flag / 時間窓は保存しない。**300ms grace だけでは TextEdit の Enter を消さない**。
+- 上記 pass で `wants_keyboard_input()` または helper の recovery claim があるときだけ、
+  Tab の focus direction を `None` に戻し、Tab / Enter の press を egui の入力から取り除く。
+  release と Ime event は残す。OS の候補選択・確定は既に処理された入力であり、egui の
+  traversal / 改行 / 数値欄確定へ同じ press を渡さないための処理である。
+  Tab は event を消すだけでは描画前に決まった方向が残るので、両方の処理が必要。
+- 非 IME の Tab 移動、歌詞の Enter 改行、数値欄の確定、pointer による focus 移動は維持する。
+  本体の「常時 Tab 無効・event は残す」policy は使わない。
+  multiline の Esc loss は pre-input plugin、Tab loss はこの描画前 policy で発生元から防ぐ。
+  Enter は multiline の focus を外さないため、歌詞に single-line の post-draw recovery / retry を
+  追加する必要はない。追加が必要という反証が handler test で出たら、場当たり的 latch を足さず
+  設計担当へ返す。single-line の復帰は共有 helper が所有する。
+
+`App::update_ime_state` 相当の **composition 更新処理はエディタには不要**。
+現在の本体関数も診断を開始する read-only の入口で、状態更新は input plugin にある
+（`src/app.rs:20938`、`src/ime_focus.rs:67`、610）。エディタは診断を開始しない。
+policy が `on_begin_pass`、Undo gate が `begin_frame_with_input_enabled` の冒頭側で読むため、
+TextEdit の event 消費前に判断できる。追加 viewport / Context ができた場合も、Context への
+登録と所有 viewport の pass での読取を守り、別 viewport の queue を更新しない。
+
+**Undo の所有**: `apply_history_shortcut` は UI 描画前に実行される
+（`crates/musicvideo-ui/src/lib.rs:794`〜796）。現状の gate は `wants_keyboard_input()` のみ
+（同:1185）で、名前に IME を含む既存テストも bool を渡す純関数検査である（同:3466）。
+新 gate は `wants_keyboard_input() || egui_ime::ime_input_active(context) ||
+egui_ime::recovering_text_input(context).is_some()` とする。
+これにより IME 変換中・300ms grace・single-line 復帰前は **Project の** Ctrl+Z / Ctrl+Y /
+Ctrl+Shift+Z を発火させない。gate で戻るときは event を consume せず、TextEdit / IME の native
+Undo 所有を保つ。IME 中の native Ctrl+Z を一律に消す処理は加えない。
+既存のモーダル時 `input_enabled` gate、Undo ボタン、Project 履歴の集約は変更しない。
+本体 keymap の移植はせず、固定 shortcut の理由は D10 / P4f の方針に従う。
+
+**4. 既存テスト・禁止検査の移設**
+
+現 `src/ime_focus.rs` の `#[test]` は **23 件**。assertion を弱めず、次の対応表で全件維持する。
+
+| 件数 | 段 2 の配置 | 対象 |
+| --- | --- | --- |
+| 16 | `egui-ime` の unit test | viewport read の分離 / root tracking / pending event 純投影の 3 件、composing Esc・非 composing / grace Esc・空 preedit・Windows 取消列・非空 Commit・空 Commit・別 viewport Disabled・raw multiline 遅延 Disabled の 8 件、IME Tab・描画前 start 採取・矢印・正当な focus 移動・Enter / Esc 復帰の 5 件 |
+| 5 | 本体 `ime_focus` | 診断 identity / focus / owner / close site、文字マスク、非文字キー、Sensitive redaction、通常ログ予算。Sensitive は本体 facade と共有 focus 契約の結合も検証する |
+| 1 | 本体 `ime_focus` | `tab_without_ime_keeps_editing_field_focus_and_input_working`。本体固有の全域 Tab policy と共有 helper の統合なので共有へ移さない |
+| 1 | 本体 `ime_focus` | `raw_text_edits_are_ime_aware_or_explicitly_exempt`。本体 source と理由付き allowlist を本体に残す |
+
+移設で本体 helper 自身・共有へ移す multiline fixture の raw 箇所が本体からなくなるため、
+allowlist の該当行だけ削除する。他の理由付き exemption、expected occurrence の厳密検査は維持する。
+共有クレートにも helper 構築境界 / 低レベル fixture の理由・件数検査を置き、移設で検査を逃がさない。
+`musicvideo-ui` にも source scan の raw single-line / multiline 禁止検査を加える。
+歌詞 multiline は path / anchor / 1 件 / 独自 buffer と native Undo を保つ理由で許可し、
+低レベルの native Undo fixture も個別の理由と件数を持つ。tests module 全体を丸ごと免除しない。
+本体の keymap / App / fullscreen / native presenter に既にある関連テストも残す。
+
+新しい本体 adapter test で、各 helper の Standard / Sensitive 契約、描画前診断開始、
+widget 観測と次 pass finalize、plugin 二重登録後の composition 継続、
+plugin 未登録 Context の従来動作、現在 viewport の診断と explicit viewport read の無副作用を確認する。
+ログ文面、redaction、予算は本体の既存 5 件の証拠を再利用する。
+
+**5. リスクと段 2 の検証計画**
+
+主要リスクは plugin type の二重化、facade による診断開始順の変化、契約 snapshot の age / viewport
+取り違え、Sensitive metadata の喪失、helper 置換による auto ID / native Undo の変化、
+エディタ専用 Tab / Enter policy の非 IME 操作への漏れ。共有 crate 内へ本体の型を引き込むことも
+依存境界の違反になる。切り出しでは input normalizer・grace・復帰条件・repaint を変更しない。
+
+| 回帰対象 | handler / headless 検査の期待結果 |
+| --- | --- |
+| Esc 取消 | 5 single-line と歌詞で Preedit → Esc press/release → 遅延 Disabled、および `Disabled, Disabled, Commit(""), Disabled, Disabled`。未確定文字が残らず、既存本文・歌詞 identity / cue time は維持 |
+| Tab 候補選択 | Enabled / Preedit と同 pass の Tab、継続 pass の Tab / Shift+Tab / repeat、Commit と同 pass の Tab。focus が sibling 欄へ移らず、歌詞へ tab が入らない。IME 外では通常の Tab traversal を維持 |
+| Enter 確定 | Key と非空 Commit の両順序、同 pass の start / commit、Commit と Key が別 pass。確定文字は一度だけ入り、歌詞へ余計な改行を入れない。IME 終了後の通常 Enter は歌詞改行・single-line / DragValue 確定として残る。grace だけの Enter を widget 側から消さない |
+| single-line focus 復帰 | 描画前に focus を失う経路、外部 latch 有無、1 pass recovery の失効、pointer / touch / 他 widget focus を優先。先に走る Project shortcut へ recovery key が漏れない |
+| 歌詞の所有 | 既存 `editor_frame_ime_replacement_keeps_the_timed_line_identity` と native Undo / global Undo / merge 取消 / layer switch / project replacement / layout 回帰を維持。plugin の空 preedit に既存 buffer の rollback / reachability が対応し、widget ID・native Undo graph を保つ |
+| Undo gate | text focus 有無 × composing / grace / recovery / 通常で Ctrl+Z、Ctrl+Y、Ctrl+Shift+Z。抑止時に Project / 履歴・resource manifest が変わらず、event が native TextEdit に残る。grace 経過後は Project shortcut が復帰 |
+| Hz の数値入力 | `DragValue` の text mode / drag / range / clamp、IME 中の取消・確定、IME 外の Enter / Tab を維持 |
+| 所有境界 | 同 Context の root / child、および別 Context の入力・契約・診断が独立。二重登録、別欄への pointer 移動、欄が閉じる / 再表示される経路で sibling 状態をリセットしない |
+
+別 pass の Commit / Key では、終了後の新しい Enter と IME が送る確定キーを source 情報なしに
+区別できない場合がある。**これは実装前レビューで確認する未確定の入力配送論点**であり、
+上の editor policy だけで全配送列が解決済みとはしない。300ms を widget キーの握り潰しへ転用せず、実機の配送列と headless
+再現を照合する。余計な改行等が残るなら合格扱いにせず、入力所有境界の設計へ返す。
+
+検証担当は段 2 の実装担当 1 人とし、独立レビューは記録された有効な結果を再利用する。
+段 2a は `cargo test -p egui-ime --lib` → `cargo test -p mimageviewer --lib ime_focus::tests` →
+`cargo test -p mimageviewer --lib egui_focus_policy::tests` / 関連 keymap・App / native テスト →
+`cargo check -p mimageviewer --bin mimageviewer-core` の順。
+段 2b は `cargo test -p musicvideo-ui --lib` と `cargo test -p musicvideo_lab`、ホストの check を加える。
+本体 helper の利用が広いので、段 2a の区切りで
+`cargo test -p mimageviewer --test ui_snapshot` と `.\scripts\test-full.ps1` を必須とする。
+段 2b 完了時も追加された共有 UI / ホストを含む全体 gate を通す。
+変更されていない snapshot の baseline を更新して入力問題を隠さない。
+editor は既存 layout / native Undo headless 検査を維持し、見た目の変更が出る場合のみ snapshot を追加する。
+fmt / glyph（UI string を変えた場合）を確認し、compile 済み tree から
+`.\scripts\build-dev.ps1` と利用者が起動できるラボの build を準備する。検証対象 diff / command /
+feature / 件数 / exit code を記録し、0 件一致・中断を成功としない。
+
+実機は Microsoft IME のひらがな入力・候補 Tab / Shift+Tab・Enter 確定・Esc 取消・直後の通常入力・
+focus 移動・Ctrl+Z/Y を、本体のメイン / fullscreen / native 動画の入力欄とエディタの 5 欄・歌詞・
+Hz 数値欄で利用者に確認してもらう。歌詞は空行・時刻付き行を含む使い捨て Project で、取消前後と
+native Undo 後に本文 / 行 identity / 時刻が保たれることを確認する。目安 20〜30 分。
+この段階では起動・入力操作を行わず、段 2 完了後に成果物と手順を渡す。
+本体の利用者向け起動コマンドは `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。
+インストール版 / tray 常駐版を先に終了する必要があり、通常 `%APPDATA%\mimageviewer` を使って
+実設定・データを更新し得ると明記する。エージェントによる実機確認を行うなら、別の明示了承済み
+検証枠で disposable portable のみを用い、通常 profile の binary は起動しない。
+
+**6. 段 2 の分割・規模・レビュー境界**
+
+- **段 2a: 本体の切り出し**。共有 crate / workspace dependency、16 テスト移設、本体 facade と
+  診断 snapshot 接続、禁止検査を作る。本体の利用箇所・viewport / native 配送は変更しない。
+  共有 production code は約 450〜550 行、移設 test は約 750〜900 行、本体への新規 adapter test は
+  約 100〜200 行。おおむね 6〜8 ファイル＋必要な依存 lock 差分。実装・自動検証で **1〜2 日**。
+  独立 completion review と本体の挙動不変の証拠を確定してから 2b へ進む。
+- **段 2b: エディタ適用**。5 欄の helper 置換、登録入口とホストへの接続、エディタ専用
+  Tab / Enter policy、Undo gate、raw 禁止検査、歌詞 / handler 回帰を作る。
+  `musicvideo-ui` の lib / modulators / input policy / tests / manifest、ラボの setup / test の
+  おおむね 7〜10 ファイル。production 追加・置換は約 80〜150 行、test は約 250〜450 行。
+  実装・自動検証で **1〜2 日**。歌詞の buffer / widget lifetime を変える工数は含めない。
+- 合計 **2〜4 開発日＋独立レビュー・長い build / 全体 gate・利用者実機確認の待ち時間**。
+  数値は調査時点の概算であり、未検証の Windows 配送差が判明した場合は設計へ戻す。
+  2a / 2b はどちらも coherent な差分としてレビューし、2a の成功で I1 全体を完了扱いにしない。
+  実装前レビューでは境界・診断の順序・Tab / Enter の editor 限定・Hz 前提訂正を確認する。
+  shared viewport 経路へ変更が必要になった場合は detached plan §2 の合意と §11 の記録も先に行う。
+
 受け入れるコスト: 配布物の PE が 1 本増える（launcher 内包・署名・portable 同梱・全 PE / VC runtime
 gate・runtime 清掃）。閲覧中の音楽ビューと同時に再生すると両方鳴る（WASAPI shared で混ざるだけで
 互いの状態には影響しない）。
