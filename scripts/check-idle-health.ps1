@@ -8,11 +8,45 @@ param(
     [switch]$NoLaunch,
     [switch]$SkipPrompt,
     [string]$ThresholdPath = "",
-    [string]$OutputDirectory = ""
+    [string]$OutputDirectory = "",
+    [switch]$PortableSmoke,
+    [switch]$InteractiveApproved,
+    [datetime]$ExpectedStartTimeUtc,
+    [string]$SleepEvidencePath = "",
+    [long]$RootHwnd = 0,
+    [long]$BackgroundHwnd = 0,
+    [int]$BackgroundProcessId = 0,
+    [string]$CaseId = ""
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 2.0
+
+# This branch cannot launch or attach by name, or fall back to APPDATA logs.
+# Reject before even compiling native helpers or creating output directories.
+if ($PortableSmoke) {
+    if (-not $InteractiveApproved -or $ProcessId -le 0 -or -not $SkipPrompt -or
+        -not $PSBoundParameters.ContainsKey('ExpectedStartTimeUtc') -or
+        [string]::IsNullOrWhiteSpace($SleepEvidencePath) -or
+        [string]::IsNullOrWhiteSpace($OutputDirectory) -or
+        -not [string]::IsNullOrWhiteSpace($ExePath) -or
+        -not [string]::IsNullOrWhiteSpace($ThresholdPath) -or $NoLaunch) {
+        [Console]::Error.WriteLine('PortableSmoke requires approval, exact PID/start time, SkipPrompt, sleep evidence and run output; executable/threshold overrides and NoLaunch are refused.')
+        exit 2
+    }
+    & (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Sampler.ps1') `
+        -Scenario $Scenario -TargetKey $TargetKey -ProcessId $ProcessId `
+        -ExpectedStartTimeUtc $ExpectedStartTimeUtc -SleepEvidencePath $SleepEvidencePath `
+        -OutputDirectory $OutputDirectory -RootHwnd $RootHwnd -BackgroundHwnd $BackgroundHwnd `
+        -BackgroundProcessId $BackgroundProcessId -CaseId $CaseId -InteractiveApproved
+    exit $LASTEXITCODE
+}
+if ($InteractiveApproved -or $PSBoundParameters.ContainsKey('ExpectedStartTimeUtc') -or
+    $PSBoundParameters.ContainsKey('SleepEvidencePath') -or $PSBoundParameters.ContainsKey('RootHwnd') -or
+    $PSBoundParameters.ContainsKey('BackgroundHwnd') -or $PSBoundParameters.ContainsKey('BackgroundProcessId') -or $PSBoundParameters.ContainsKey('CaseId')) {
+    [Console]::Error.WriteLine('ReleaseChecks execution options require -PortableSmoke; they do not authorize normal-profile launch.')
+    exit 2
+}
 
 if ($Scenario -eq "video-pin-background") {
     if ([string]::IsNullOrWhiteSpace($TargetKey)) {

@@ -3985,15 +3985,12 @@ mod tests {
     #[test]
     fn details_name_colors_preferences_ok_validation_save_and_cancel() {
         use crate::details_name_colors::DetailsNameColor;
-        use egui_kittest::{
-            Harness,
-            kittest::{NodeT, Queryable},
-        };
+        use egui_kittest::kittest::{NodeT, Queryable};
 
         let mut app = crate::app::setup_app_for_test();
         let old = app.settings.details_name_colors.clone();
         app.open_preferences_page(PreferencesPage::General);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
             .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
         harness.run();
@@ -4093,7 +4090,7 @@ mod tests {
     fn raw_review_preferences_ok_saves_reloads_and_applies_executor_and_source_change() {
         use crate::app::raw_page_store::{RawDevelopPhase, RawInstalledStage, RawPageLoadState};
         use crate::raw::RawBrightness;
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
         for executor_closed in [false, true] {
             let mut app = crate::app::raw_page_store::tests::app_with_raw_and_jpeg();
             let ctx = egui::Context::default();
@@ -4129,7 +4126,7 @@ mod tests {
                 app.raw_develop_executor.shutdown();
             }
             app.open_preferences_page(PreferencesPage::RawDevelop);
-            let mut harness = Harness::builder()
+            let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1100.0, 850.0))
                 .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
             harness.run();
@@ -4279,7 +4276,7 @@ mod tests {
 
     #[test]
     fn section292_sort_placements_survive_toolbar_ui_preferences_ok_save_and_reopen() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
         use std::{
             cell::{Cell, RefCell},
             rc::Rc,
@@ -4299,7 +4296,7 @@ mod tests {
             app.borrow_mut().settings.show_facet_sort = !facet;
             let render = Rc::clone(&app);
             let fonts = Cell::new(false);
-            let mut harness = Harness::builder()
+            let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(500.0, 650.0))
                 .build(move |ctx| {
                     if !fonts.replace(true) {
@@ -4353,7 +4350,7 @@ mod tests {
     #[test]
     fn section207_folder_layout_survives_toolbar_ui_preferences_ok_db_and_reopen() {
         use crate::settings::ToolbarSectionId as TS;
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
         use std::{
             cell::{Cell, RefCell},
             rc::Rc,
@@ -4366,7 +4363,7 @@ mod tests {
             let mut state = preferences_state_for_test(&app.borrow().settings);
             let render = Rc::clone(&app);
             let fonts = Cell::new(false);
-            let mut harness = Harness::builder()
+            let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(600.0, 1050.0))
                 .build(move |ctx| {
                     if !fonts.replace(true) {
@@ -4548,7 +4545,7 @@ mod tests {
     #[test]
     fn file_organize_destinations_preferences_ok_save_failure_keeps_memory_db_and_notifies() {
         use crate::settings::FileOrganizeDestination;
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
         let mut app = crate::app::setup_app_for_test();
         app.settings.file_organize_destinations = vec![FileOrganizeDestination::from_path(
@@ -4564,7 +4561,7 @@ mod tests {
         }];
 
         app.open_preferences_page(PreferencesPage::Folder);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
             .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
         harness.run();
@@ -5498,10 +5495,8 @@ mod tests {
 
     #[test]
     fn preferences_search_results_snapshot() {
-        use egui_kittest::Harness;
-
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(560.0, 320.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -5522,7 +5517,7 @@ mod tests {
 
     #[test]
     fn preferences_context_menu_layout_snapshot() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
         let mut layout = crate::context_menu_model::ContextMenuLayoutSettings::default();
         layout.set_separator_before(
@@ -5532,7 +5527,7 @@ mod tests {
         let mut scenario =
             crate::context_menu_model::ContextMenuPreviewScenario::GridImageWithDynamicApps;
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(620.0, 700.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -5566,12 +5561,12 @@ mod tests {
 
     #[test]
     fn opening_context_menu_page_and_switching_preview_scene_do_not_edit_settings() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
         let mut state = preferences_state_for_test(&crate::settings::Settings::default());
         state.selected = PreferencesPage::ContextMenuLayout;
         let expected = serde_json::to_value(&state.settings).unwrap();
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(700.0, 520.0))
             .build_state(
                 |ctx, state| {
@@ -5623,8 +5618,6 @@ mod tests {
 
     #[test]
     fn preferences_parallelism_pdf_count_snapshot() {
-        use egui_kittest::Harness;
-
         let mut state = PreferencesState::from_settings(
             &crate::settings::Settings::default(),
             crate::external_tool::LaunchTarget::None,
@@ -5636,7 +5629,7 @@ mod tests {
             0,
         );
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(560.0, 340.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -5677,8 +5670,6 @@ mod tests {
 
     #[test]
     fn preferences_duplicate_files_epub_option_snapshot() {
-        use egui_kittest::Harness;
-
         let mut state = PreferencesState::from_settings(
             &crate::settings::Settings::default(),
             crate::external_tool::LaunchTarget::None,
@@ -5690,7 +5681,7 @@ mod tests {
             0,
         );
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(780.0, 300.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -5711,11 +5702,9 @@ mod tests {
 
     #[test]
     fn preferences_recycle_bin_delete_confirmation_snapshot() {
-        use egui_kittest::Harness;
-
         let mut settings = crate::settings::Settings::default();
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(560.0, 230.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -5736,8 +5725,6 @@ mod tests {
 
     #[test]
     fn preferences_folder_edit_restore_snapshot() {
-        use egui_kittest::Harness;
-
         let mut state = PreferencesState::from_settings(
             &crate::settings::Settings::default(),
             crate::external_tool::LaunchTarget::None,
@@ -5749,7 +5736,7 @@ mod tests {
             0,
         );
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(620.0, 680.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -5772,8 +5759,6 @@ mod tests {
 
     #[test]
     fn preferences_viewer_notice_visibility_snapshot() {
-        use egui_kittest::Harness;
-
         let mut state = PreferencesState::from_settings(
             &crate::settings::Settings::default(),
             crate::external_tool::LaunchTarget::None,
@@ -5785,7 +5770,7 @@ mod tests {
             0,
         );
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(560.0, 360.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -5808,11 +5793,9 @@ mod tests {
 
     #[test]
     fn spread_page_supplement_setting_snapshot() {
-        use egui_kittest::Harness;
-
         let mut enabled = true;
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(540.0, 100.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -5833,12 +5816,10 @@ mod tests {
 
     #[test]
     fn singleton_spread_placement_setting_snapshot() {
-        use egui_kittest::Harness;
-
         let mut first_enabled = true;
         let mut last_enabled = false;
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(540.0, 100.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -5862,14 +5843,12 @@ mod tests {
     }
 
     fn still_seek_strip_height_settings_snapshot(size: egui::Vec2, name: &str) {
-        use egui_kittest::Harness;
-
         let mut settings = crate::settings::Settings {
             still_seek_strip_visible: true,
             ..crate::settings::Settings::default()
         };
         let mut fonts_ready = false;
-        let mut harness = Harness::builder().with_size(size).build(move |ctx| {
+        let mut harness = crate::test_ui::builder().with_size(size).build(move |ctx| {
             crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
             if !fonts_ready {
                 crate::ui_fonts::configure_fonts(ctx);
@@ -5908,11 +5887,9 @@ mod tests {
     }
 
     fn video_seek_strip_height_settings_snapshot(size: egui::Vec2, name: &str) {
-        use egui_kittest::Harness;
-
         let mut settings = crate::settings::Settings::default();
         let mut fonts_ready = false;
-        let mut harness = Harness::builder().with_size(size).build_ui(|ui| {
+        let mut harness = crate::test_ui::builder().with_size(size).build_ui(|ui| {
             if !fonts_ready {
                 crate::ui_fonts::configure_fonts(ui.ctx());
                 fonts_ready = true;
@@ -6053,11 +6030,11 @@ mod tests {
 
     #[test]
     fn shared_sidecar_checkbox_lives_on_thumbnail_page_and_edits_one_setting() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
         let _data_dir = crate::data_dir::TestDataDirGuard::new();
         let mut state = preferences_state_for_test(&Settings::default());
         state.selected = PreferencesPage::Thumbnail;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(600.0, 2400.0))
             .build_state(
                 |ctx, state| {
@@ -6093,10 +6070,10 @@ mod tests {
 
     #[test]
     fn raw_controls_only_appear_on_dedicated_page() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
         let mut state = preferences_state_for_test(&Settings::default());
         state.selected = PreferencesPage::Parallelism;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(600.0, 400.0))
             .build_state(
                 |ctx, state| {
@@ -6378,7 +6355,7 @@ mod tests {
     #[test]
     #[cfg(all(windows, not(feature = "portable")))]
     fn effetune_pre_limiter_preferences_checkbox_ok_save_reload_consumers() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
         let mut app = crate::app::setup_app_for_test();
         // Retain consumers BEFORE opening preferences: an existing player/pump
         // and existing Remote admission/generation must see OK without reopening.
@@ -6390,7 +6367,7 @@ mod tests {
             PreferencesPage::Video,
             "video/effetune-input-limit",
         ));
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
             .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
         // The search anchor intentionally animates a highlight; settle the scroll
@@ -6466,14 +6443,14 @@ mod tests {
     #[test]
     #[cfg(all(windows, not(feature = "portable")))]
     fn effetune_auto_open_preferences_cancel_ok_save_reload() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
         let mut app = crate::app::setup_app_for_test();
         assert!(!app.settings.effetune_auto_open_on_video);
         app.open_preferences_request(PreferencesOpenRequest::anchored(
             PreferencesPage::Video,
             "video/effetune-auto-open",
         ));
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
             .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
         for cancel in [true, false] {
@@ -6545,12 +6522,12 @@ mod tests {
     #[test]
     #[cfg(all(windows, not(feature = "portable")))]
     fn effetune_minimized_preferences_ok_publishes_saved_policy() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
         let mut app = crate::app::setup_app_for_test();
         app.settings.effetune_keep_visible_when_minimized = true;
         let app = crate::app::App::new_from_settings(app.settings.clone());
         assert!(app.effetune.keep_visible_when_minimized());
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
             .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
         for enabled in [false, true] {
@@ -6605,7 +6582,7 @@ mod tests {
     #[test]
     fn epub_handling_preferences_cancel_ok_reload_reset_and_listing_effect() {
         use crate::settings::{ArchiveFileHandling, EpubFileHandling, Settings};
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
         let mut app = crate::app::setup_app_for_test();
         app.settings
@@ -6616,7 +6593,7 @@ mod tests {
         std::fs::write(folder.join("archive.7z"), b"archive").unwrap();
 
         app.open_preferences_page(PreferencesPage::Cache);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
             .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
         harness.run();
@@ -6693,7 +6670,7 @@ mod tests {
     fn ignoring_open_epub_on_preferences_ok_does_not_select_same_named_item_in_next_book() {
         use crate::grid_item::GridItem;
         use crate::settings::EpubFileHandling;
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
         let mut app = crate::app::setup_app_for_test();
         let epub = app.tmp.path().join("open-book.epub");
@@ -6716,7 +6693,7 @@ mod tests {
         app.selected = Some(1);
         app.open_preferences_page(PreferencesPage::Cache);
 
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
             .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
         harness.run();
@@ -6759,7 +6736,7 @@ mod tests {
     fn archive_and_epub_handling_ok_use_same_history_reload_timing() {
         use crate::reading_history_db::{ReadingHistoryEntry, ReadingHistoryKind};
         use crate::settings::{ArchiveFileHandling, EpubFileHandling};
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
         let apply = |change_epub: bool| {
             let mut app = crate::app::setup_app_for_test();
@@ -6787,7 +6764,7 @@ mod tests {
             assert_eq!(app.visible_indices, vec![0, 1]);
 
             app.open_preferences_page(PreferencesPage::Cache);
-            let mut harness = Harness::builder()
+            let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1100.0, 850.0))
                 .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
             harness.run();
@@ -6817,11 +6794,11 @@ mod tests {
 
     #[test]
     fn epub_handling_cache_page_radio_and_reset_edit_only_epub_setting() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
         let mut state = preferences_state_for_test(&crate::settings::Settings::default());
         state.selected = PreferencesPage::Cache;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(760.0, 950.0))
             .build_state(
                 |ctx, state| {
@@ -6893,11 +6870,11 @@ mod tests {
 
     #[test]
     fn clipboard_capture_picker_result_on_another_page_is_polled_before_ok_commit() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
         let mut app = crate::app::setup_app_for_test();
         app.open_preferences_page(PreferencesPage::ClipboardCapture);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
             .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
         // Opening requests the page; the first dialog frame creates its draft.

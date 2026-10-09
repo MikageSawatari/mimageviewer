@@ -10320,14 +10320,11 @@ mod context_menu_layout_settings_tests {
 
     #[test]
     fn fit_cycle_subset_ui_keeps_the_last_mode_enabled() {
-        use egui_kittest::{
-            Harness,
-            kittest::{NodeT, Queryable},
-        };
+        use egui_kittest::kittest::{NodeT, Queryable};
         let mut settings = crate::settings::Settings::default();
         settings.fullscreen_fit_cycle_excluded =
             vec!["Page".into(), "Width".into(), "Height".into()];
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(480.0, 300.0))
             .build_state(
                 |ctx, (settings, fonts_ready)| {
@@ -10372,14 +10369,14 @@ mod context_menu_layout_settings_tests {
 
     #[test]
     fn actual_settings_ui_scrolls_and_edits_move_hide_show_all_and_reset() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
         let state = (
             ContextMenuLayoutSettings::default(),
             ContextMenuPreviewScenario::GridImageWithDynamicApps,
             false,
         );
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(620.0, 420.0))
             .build_state(
                 |ctx, (layout, scenario, fonts_ready)| {

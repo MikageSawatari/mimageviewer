@@ -513,7 +513,7 @@ mod tests {
         }
 
         app.show_settings_restore = true;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
             .build_state(
                 |ctx, app| {
@@ -627,7 +627,7 @@ mod tests {
         )
         .unwrap();
         app.show_settings_restore = true;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
             .build_state(
                 |ctx, app| {
@@ -674,7 +674,7 @@ mod tests {
     fn restore_harness() -> Harness<'static, crate::app::AppTestEnvForTest> {
         let mut app = crate::app::setup_app_for_test();
         app.show_settings_restore = true;
-        Harness::builder()
+        crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
             .build_state(
                 |ctx, app| {
@@ -697,7 +697,7 @@ mod tests {
                 app.open_settings_restore_dialog();
                 app.open_preferences_page(PreferencesPage::General);
             }
-            let mut harness = Harness::builder()
+            let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1200.0, 900.0))
                 .build_state(
                     |ctx, app| {
@@ -788,7 +788,7 @@ mod tests {
             }) => assert!(message.contains("環境設定を閉じてから行ってください")),
             _ => panic!("import must terminate with a notification"),
         }
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
             .build_state(
                 |ctx, app| {
@@ -849,7 +849,7 @@ mod tests {
             let mut app = crate::app::setup_app_for_test();
             app.show_operation_customize = true;
             app.open_settings_restore_dialog();
-            let mut harness = Harness::builder()
+            let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1200.0, 950.0))
                 .build_state(
                     |ctx, app| {
@@ -954,7 +954,7 @@ mod tests {
         let selected = state.selected;
         let before = serde_json::to_value(&state.settings).unwrap();
         let generation = crate::settings::save_generation();
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
             .build_state(
                 |ctx, app| {
@@ -1246,7 +1246,7 @@ mod tests {
             app.load_folder_with_scan(folder, None);
             app.finish_page_identity_preparation_for_test();
             let mut fonts_ready = false;
-            let mut harness = Harness::builder()
+            let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1700.0, 500.0))
                 .build_state(
                     move |ctx, app| {

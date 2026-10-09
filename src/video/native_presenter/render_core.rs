@@ -18994,7 +18994,7 @@ mod tests {
 
         let captured = Arc::new(Mutex::new(Vec::new()));
         let captured_for_ui = Arc::clone(&captured);
-        let mut harness = egui_kittest::Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(80.0, 80.0))
             .build(move |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
@@ -19051,7 +19051,7 @@ mod tests {
             let captured_for_ui = Arc::clone(&captured);
             let drag_origin = Arc::new(Mutex::new(None));
             let mut fonts_ready = false;
-            let mut harness = egui_kittest::Harness::builder()
+            let mut harness = crate::test_ui::builder()
                 .with_size(overlay_size)
                 .build(move |ctx| {
                     if !fonts_ready {
@@ -19163,7 +19163,7 @@ mod tests {
             let captured_for_ui = Arc::clone(&captured);
             let drag_origin = Arc::new(Mutex::new(None));
             let mut fonts_ready = false;
-            let mut harness = egui_kittest::Harness::builder()
+            let mut harness = crate::test_ui::builder()
                 .with_size(overlay_size)
                 .with_pixels_per_point(1.5)
                 .build(move |ctx| {
@@ -19295,7 +19295,6 @@ mod tests {
     /// button under it for as long as it shows.
     #[test]
     fn a_toast_does_not_swallow_clicks_on_the_hud_beneath_it() {
-        use egui_kittest::Harness;
         use std::sync::{Arc, Mutex};
 
         let overlay_size = egui::vec2(1242.7, 916.0);
@@ -19321,7 +19320,7 @@ mod tests {
             let captured = Arc::new(Mutex::new(Vec::new()));
             let captured_for_ui = Arc::clone(&captured);
             let mut fonts_ready = false;
-            let mut harness = Harness::builder()
+            let mut harness = crate::test_ui::builder()
                 .with_size(overlay_size)
                 .with_pixels_per_point(1.5)
                 .build(move |ctx| {

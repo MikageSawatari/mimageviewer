@@ -976,7 +976,7 @@ fn progress_widget_height(progress: TransferProgress) -> f32 {
 
     let height = Arc::new(Mutex::new(None));
     let captured_height = Arc::clone(&height);
-    let mut harness = egui_kittest::Harness::builder()
+    let mut harness = crate::test_ui::builder()
         .with_size(egui::vec2(430.0, 240.0))
         .build(move |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {

@@ -568,6 +568,8 @@ mod subfolder_expansion;
 pub(crate) use subfolder_expansion::listing_sort_metas_for_items;
 pub(crate) use subfolder_expansion::{SubfolderExpansionEntry, listing_sort_metas_for_entries};
 #[cfg(all(windows, feature = "test-script"))]
+pub(crate) mod release_checks;
+#[cfg(all(windows, feature = "test-script"))]
 mod test_script_support;
 pub(crate) use subfolder_expansion::{
     SUBFOLDER_EXPANSION_FILTER_KINDS, SubfolderExpansionDepthChoice, SubfolderExpansionScanFilter,
@@ -50401,6 +50403,22 @@ impl App {
 
             let in_keep_range = self.keep_set.contains(&i);
 
+            #[cfg(all(windows, feature = "test-script"))]
+            if from_cache && color_image_opt.is_some() {
+                if let Some(item) = self.items.get(i) {
+                    crate::test_script::release_checks::trace(
+                        "cache_read",
+                        serde_json::json!({
+                            "key": item.perf_key(),
+                            "idx": i,
+                            "items_gen": msg_items_gen,
+                            "input_seq": req_input_seq,
+                            "from_cache": true,
+                        }),
+                    );
+                }
+            }
+
             // finalized = true: 第 2 シグナル (decode 成功 + cache save 完了)。
             // **`thumbnails[i]` の状態は変更しない**。
             //
@@ -89957,8 +89975,19 @@ impl App {
         {
             let snapshot = self.test_script_snapshot(ctx);
             if crate::test_script::ui_update(ctx, snapshot) {
-                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+                if crate::test_script::release_checks::take_quit_after_finish() {
+                    if let Some(tray) = self.tray_controller.as_ref() {
+                        if let Err(error) = tray.quit_for_smoke() {
+                            crate::logger::log(format!(
+                                "[release-checks] environment: normal tray Quit failed: {error}"
+                            ));
+                        }
+                    }
+                } else {
+                    ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+                }
             }
+            self.poll_release_check_commands(ctx);
             if crate::test_script::take_smoke_action(
                 crate::test_script::UiSmokeAction::OpenThumbnailPreferences,
             ) {
@@ -90494,6 +90523,8 @@ impl App {
         if self.indexer_init.overlay_active() {
             self.render_startup_overlay(ctx);
             self.consume_input_during_startup(ctx);
+            #[cfg(all(feature = "test-script", windows))]
+            self.release_check_record_early_tail(ctx);
             finish_update_perf(&mut update_perf, self.frame_counter);
             return;
         }
@@ -91193,6 +91224,8 @@ impl App {
                 fullscreen_close_nav = Some(nav);
             } else if self.apply_fullscreen_close_nav_immediate(nav) {
                 ctx.request_repaint();
+                #[cfg(all(feature = "test-script", windows))]
+                self.release_check_record_early_tail(ctx);
                 finish_update_perf(&mut update_perf, self.frame_counter);
                 return;
             }
@@ -91312,6 +91345,8 @@ impl App {
                     "early_return",
                     "reason=native_main_backdrop main_ui=false repaint_after=16ms",
                 );
+                #[cfg(all(feature = "test-script", windows))]
+                self.release_check_record_early_tail(ctx);
                 finish_update_perf(&mut update_perf, self.frame_counter);
                 return;
             }
@@ -91324,6 +91359,8 @@ impl App {
                     "early_return",
                     "reason=still_viewport_enter_suppressed main_ui=holdover",
                 );
+                #[cfg(all(feature = "test-script", windows))]
+                self.release_check_record_early_tail(ctx);
                 finish_update_perf(&mut update_perf, self.frame_counter);
                 return;
             }
@@ -91348,6 +91385,8 @@ impl App {
                 if let Some(nav) = fullscreen_close_nav.take() {
                     if self.apply_fullscreen_close_nav_immediate(nav) {
                         ctx.request_repaint();
+                        #[cfg(all(feature = "test-script", windows))]
+                        self.release_check_record_early_tail(ctx);
                         finish_update_perf(&mut update_perf, self.frame_counter);
                         return;
                     }
@@ -91395,6 +91434,8 @@ impl App {
                         self.fs_nav_deferred_reopen_wait_active()
                     ),
                 );
+                #[cfg(all(feature = "test-script", windows))]
+                self.release_check_record_early_tail(ctx);
                 finish_update_perf(&mut update_perf, self.frame_counter);
                 return;
             }
@@ -93021,6 +93062,8 @@ impl eframe::App for App {
         // 後段の本物の on_exit に処理を委譲する (trait impl は 1 つしか書けないため、
         // helper メソッド群は trait impl の外の `impl App` ブロックへ逃がしてある)。
         self.on_exit_inner();
+        #[cfg(all(windows, feature = "test-script"))]
+        crate::test_script::release_checks::record_on_exit();
     }
 }
 

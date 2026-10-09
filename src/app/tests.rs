@@ -15958,7 +15958,7 @@ mod startup_open_path_resolve_tests {
 
     #[test]
     fn cancel_button_closes_normal_archive_scan_and_cancels_worker() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
         use std::cell::RefCell;
         use std::rc::Rc;
 
@@ -15966,7 +15966,7 @@ mod startup_open_path_resolve_tests {
         let source = app.borrow().tmp.path().join("button-normal-scan.7z");
         let (tx, cancel) = install_normal_archive_scan_transition(&mut app.borrow_mut(), source);
         let app_for_ui = Rc::clone(&app);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(640.0, 360.0))
             .build(move |ctx| {
                 app_for_ui.borrow_mut().show_archive_convert_dialog(ctx);
@@ -26468,10 +26468,7 @@ mod phase_c_folder_nav_history_tests {
 
     #[test]
     fn section1339_address_bar_zip_enter_keeps_copied_path_across_row_refresh() {
-        use egui_kittest::{
-            Harness,
-            kittest::{NodeT, Queryable},
-        };
+        use egui_kittest::kittest::{NodeT, Queryable};
         use std::{
             cell::{Cell, RefCell},
             rc::Rc,
@@ -26501,7 +26498,7 @@ mod phase_c_folder_nav_history_tests {
         let app = Rc::new(RefCell::new(env));
         let render = Rc::clone(&app);
         let fonts = Cell::new(false);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1200.0, 280.0))
             .build(move |ctx| {
                 crate::ime_focus::install_ime_input_policy(ctx);
@@ -103219,7 +103216,7 @@ mod background_click_scroll_regression_tests {
 
     fn harness(app: AppTestEnvForTest) -> Harness<'static, State> {
         let mut fonts_set = false;
-        Harness::builder()
+        crate::test_ui::builder()
             .with_size(egui::vec2(2000.0, 480.0))
             .with_step_dt(0.01)
             .build_state(

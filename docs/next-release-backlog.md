@@ -1809,6 +1809,27 @@ V キーと同じ入口・同じ後始末を通るので、こちらとは別の
 
 ### 1.175 `ui_snapshot` のテスト実行体が、たまにアクセス違反で落ちる / 進まなくなる
 
+**2026-10-09 Line F 後続修正 (base `5d7b30619`):** Windows 製品 root は `DX12 | VULKAN`、
+native video は独立 D3D11 / DX12 HUD で、GL を要求しないことを確認した。
+既定 kittest の GL 初期化は製品経路と不一致で、捕捉した2件の AV はその WGL 生成中だった。
+共通 test builder の要求 mask を製品の共通 policy に揃え、integration / lib の163箇所へ接続した。
+CPU adapter 優先・lazy 初期化・各 Harness の独立 GPU 所有・並列性・既存画像は維持する。
+共有 Device / 直列化 / retry は追加しない。未採取 hang と driver 内部原因は未確定のまま区別する。
+旧AV捕捉と同じ9起動のstressは各142/142、全snapshot142/142、通常全lib11,417成功・52 ignored。
+追加test-script全libでは既存fake-frame double-clickが1件失敗し単独でも再現、別件として保持する。
+詳細・回帰結果・dump の主要 stack と削除状況は [GPU snapshot 調査記録](ui-snapshot-gpu-investigation.md)、
+引き継ぎは `target/F-1175-fix-msg.txt`。実アプリ起動・コミットなし。
+
+**2026-10-09 Line F 調査 (`next-qa` / `d1c95344e`):** actual `ui_snapshot` の4-thread実行で
+second-chance AVを捕捉。fault threadはWGL hidden-window ownerで、
+`setup_pixel_format → ChoosePixelFormat → nvoglv64.dll` の生成経路。別WGL threadsの初期化と
+bootstrap contextの削除も同時に観測した。GPU描画やprocess-exit teardownの事故とは未証明。
+既定maskはadapter選択前にGLも初期化するので、描画にDX12を選んでもこの経路へ入る。
+小さなstress probe・actual suiteの成功は故障の否定に使わず、失敗attemptとstackを保持。
+原因の引き金は未確定、製品/vendor/既存harness/期待画像の修正なし、直列化/retryによるgate変更なし。
+詳細と対照結果・次の構造修正候補は [GPU snapshot 調査記録](ui-snapshot-gpu-investigation.md)。
+`target/F-1175-msg.txt` に引き継ぎを残す。実アプリ起動・WER registry変更・コミットなし。
+
 **2026-10-09 Line A / master統合gateで再観測:** 最終差分の並列snapshot（4 threads）は終盤4件で停滞した後、
 `ui_snapshot-bfef3a5205bc7fdd.exe` が `0xc0000005 / STATUS_ACCESS_VIOLATION` で異常終了した。
 実終了値は `-1073741819`、gate経過750秒。timeoutで中断した結果ではなく、製品変更との因果関係や

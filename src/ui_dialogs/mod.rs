@@ -379,11 +379,10 @@ mod tests {
     #[test]
     fn startup_dialog_body_grows_for_overflow_and_shrinks_to_content() {
         use eframe::egui;
-        use egui_kittest::Harness;
         for size in [egui::vec2(1093.0, 614.0), egui::vec2(1920.0, 1440.0)] {
             for scale in [1.0, 2.0] {
                 for long in [false, true] {
-                    let mut harness = Harness::builder().with_size(size).build_state(
+                    let mut harness = crate::test_ui::builder().with_size(size).build_state(
                         move |ctx, rects: &mut Option<(f32, f32, egui::Rect)>| {
                             crate::settings::apply_ui_scale_factor(ctx, scale);
                             egui::Modal::new(egui::Id::new("body_sizing")).show(ctx, |ui| {
@@ -444,10 +443,9 @@ mod tests {
     #[test]
     fn startup_dialog_short_window_keeps_natural_height() {
         use eframe::egui;
-        use egui_kittest::Harness;
         for size in [egui::vec2(1093.0, 614.0), egui::vec2(1920.0, 1440.0)] {
             for scale in [1.0, 2.0] {
-                let mut harness = Harness::builder().with_size(size).build_state(
+                let mut harness = crate::test_ui::builder().with_size(size).build_state(
                     move |ctx, height: &mut Option<f32>| {
                         crate::settings::apply_ui_scale_factor(ctx, scale);
                         let response = egui::Window::new("Short startup notice")
@@ -485,9 +483,8 @@ mod tests {
     #[test]
     fn startup_dialog_wrapped_button_remains_inside_narrow_window() {
         use eframe::egui;
-        use egui_kittest::Harness;
         for scale in [1.0, 2.0] {
-            let mut harness = Harness::builder()
+            let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1093.0, 614.0))
                 .build_state(
                     move |ctx, rects: &mut Option<(egui::Rect, egui::Rect)>| {
@@ -523,10 +520,9 @@ mod tests {
     #[test]
     fn startup_dialog_body_respects_window_height() {
         use eframe::egui;
-        use egui_kittest::Harness;
         let mut footer_tops = Vec::new();
         for height in [220.0, 400.0] {
-            let mut harness = Harness::builder()
+            let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1093.0, 614.0))
                 .build_state(
                     move |ctx, rects: &mut Option<(egui::Rect, egui::Rect)>| {
@@ -563,8 +559,7 @@ mod tests {
     #[test]
     fn startup_dialog_body_scrolls_and_consumes_wheel() {
         use eframe::egui;
-        use egui_kittest::Harness;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1093.0, 614.0))
             .build_state(
                 |ctx, state: &mut (f32, bool)| {

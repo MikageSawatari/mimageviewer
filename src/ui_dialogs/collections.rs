@@ -6299,7 +6299,7 @@ mod tests {
         assert_eq!(app.collection_ui.selected_id, manager_selection);
         let ui_app = std::rc::Rc::new(std::cell::RefCell::new(app));
         let render_app = std::rc::Rc::clone(&ui_app);
-        let mut harness = egui_kittest::Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1040.0, 760.0))
             .build(move |ctx| render_app.borrow_mut().show_collection_manager(ctx));
         harness.step();
@@ -6594,12 +6594,10 @@ mod tests {
         theme: crate::os_theme::ResolvedTheme,
         preview: bool,
     ) {
-        use egui_kittest::Harness;
-
         let app = std::rc::Rc::new(std::cell::RefCell::new(snapshot_app(preview)));
         let ui_app = std::rc::Rc::clone(&app);
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1040.0, 760.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, theme);
@@ -6637,8 +6635,6 @@ mod tests {
     }
 
     fn snapshot_collection_remove_confirm(name: &str) {
-        use egui_kittest::Harness;
-
         let mut app = snapshot_app(false);
         let collection_id = app.collection_ui.selected_id.unwrap();
         let entry_id = app.collection_ui.snapshot.as_ref().unwrap().entries[0].id;
@@ -6661,7 +6657,7 @@ mod tests {
             ),
         };
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1040.0, 760.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Light);
@@ -6683,8 +6679,6 @@ mod tests {
     }
 
     fn snapshot_collection_reorder(name: &str) {
-        use egui_kittest::Harness;
-
         let mut app = snapshot_app(false);
         app.collection_ui.show_manager = false;
         let snapshot = app.collection_ui.snapshot.clone().unwrap();
@@ -6696,7 +6690,7 @@ mod tests {
             state.selection_anchor = Some(0);
         }
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1040.0, 760.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -7476,7 +7470,7 @@ mod tests {
         }
         let ui_app = std::rc::Rc::new(std::cell::RefCell::new(app));
         let render_app = std::rc::Rc::clone(&ui_app);
-        let mut harness = egui_kittest::Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1040.0, 760.0))
             .build(move |ctx| render_app.borrow_mut().draw_collection_reorder(ctx));
         harness.step();
@@ -7531,7 +7525,7 @@ mod tests {
 
         let ui_app = std::rc::Rc::new(std::cell::RefCell::new(app));
         let render_app = std::rc::Rc::clone(&ui_app);
-        let mut harness = egui_kittest::Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1040.0, 760.0))
             .build(move |ctx| render_app.borrow_mut().draw_collection_reorder(ctx));
         harness.step();
@@ -8942,7 +8936,7 @@ mod tests {
             task,
         };
         let ui_app = std::rc::Rc::clone(&app);
-        let mut harness = egui_kittest::Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1040.0, 760.0))
             .build(move |ctx| ui_app.borrow_mut().show_collection_manager(ctx));
         harness.step();
@@ -8993,7 +8987,7 @@ mod tests {
             task,
         };
         let ui_app = std::rc::Rc::clone(&app);
-        let mut harness = egui_kittest::Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1040.0, 760.0))
             .build(move |ctx| ui_app.borrow_mut().show_collection_manager(ctx));
         harness.step();

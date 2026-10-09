@@ -3571,6 +3571,9 @@ def main() -> None:
     )
     p_hit = subs.add_parser("hitches")
     p_hit.add_argument("--ms", type=float, default=33.0, help="ヒッチ閾値 (ms、既定 33.0)")
+    p_perf_smoke = subs.add_parser("perf-smoke", help="isolated release-check verdict / JSON")
+    from release_check_analysis import add_perf_arguments, perf_smoke_cli
+    add_perf_arguments(p_perf_smoke)
     p_idle = subs.add_parser("idle-health")
     p_idle.add_argument("--start-t", type=float, default=None, help="測定開始 t (秒)")
     p_idle.add_argument("--end-t", type=float, default=None, help="測定終了 t (秒)")
@@ -3623,6 +3626,9 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+
+    if args.cmd == "perf-smoke":
+        sys.exit(perf_smoke_cli(args))
 
     if not args.jsonl.is_file():
         print(f"ファイルが見つかりません: {args.jsonl}", file=sys.stderr)
