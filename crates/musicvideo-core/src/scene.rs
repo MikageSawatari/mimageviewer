@@ -112,16 +112,7 @@ pub enum SceneItemKind {
 
 /// Evaluates all animation and time-dependent values without touching assets.
 pub fn evaluate(project: &Project, t_secs: f64, spectrum: &SpectrumFrame) -> Scene {
-    let duration = if project.duration_secs.is_finite() {
-        project.duration_secs.max(0.0)
-    } else {
-        0.0
-    };
-    let time = if t_secs.is_finite() {
-        t_secs.clamp(0.0, duration)
-    } else {
-        0.0
-    };
+    let (duration, time) = evaluation_time(project, t_secs);
     let progress = if duration > 0.0 {
         (time / duration).clamp(0.0, 1.0) as f32
     } else {
@@ -133,53 +124,17 @@ pub fn evaluate(project: &Project, t_secs: f64, spectrum: &SpectrumFrame) -> Sce
         if !layer.visible.evaluate(time) {
             continue;
         }
-        let mut opacity = layer.opacity.evaluate(time);
-        let mut rect = layer.rect.evaluate(time);
-        let mut scale = 1.0_f32;
-        let mut image_zoom = match &layer.kind {
-            LayerKind::Image { zoom, .. } => finite_or(zoom.evaluate(time), 1.0).max(0.01),
-            _ => 1.0,
-        };
-        let mut rotation_deg = finite_or(layer.rotation.evaluate(time), 0.0);
-        let mut corner_radius_px = finite_or(layer.corner_radius.evaluate(time), 0.0);
-        let mut glow = layer.glow.evaluate(time).map(sanitize_glow);
-        let mut fill_brightness = 0.0_f32;
-        let mut spectrum_thickness_px = 0.0_f32;
-        let mut spectrum_radius_px = 0.0_f32;
-        for binding in &layer.modulations {
-            let amount = finite_or(binding.amount, 0.0)
-                * binding
-                    .curve
-                    .apply(modulator_value(spectrum, binding.modulator));
-            match binding.target {
-                ModulationTarget::Opacity => opacity = (opacity + amount).clamp(0.0, 1.0),
-                ModulationTarget::Scale => scale = (scale + amount).max(0.0),
-                ModulationTarget::ImageZoom => image_zoom = (image_zoom + amount).max(0.01),
-                ModulationTarget::Rotation => rotation_deg += amount,
-                ModulationTarget::CornerRadius => {
-                    corner_radius_px = (corner_radius_px + amount).max(0.0)
-                }
-                ModulationTarget::GlowRadius => {
-                    if let Some(glow) = &mut glow {
-                        glow.radius_px = (glow.radius_px + amount).max(0.0);
-                    }
-                }
-                ModulationTarget::GlowAlpha => {
-                    if let Some(glow) = &mut glow {
-                        let alpha = f32::from(glow.color.a) / 255.0;
-                        glow.color.a = ((alpha + amount).clamp(0.0, 1.0) * 255.0).round() as u8;
-                    }
-                }
-                ModulationTarget::FillBrightness => {
-                    fill_brightness = (fill_brightness + amount).clamp(-1.0, 1.0)
-                }
-                ModulationTarget::SpectrumThickness => {
-                    spectrum_thickness_px += amount;
-                }
-                ModulationTarget::SpectrumRadius => spectrum_radius_px += amount,
-            }
-        }
-        rect = scale_rect_from_center(rect, scale);
+        let EvaluatedLayer {
+            mut opacity,
+            rect,
+            image_zoom,
+            rotation_deg,
+            corner_radius_px,
+            glow,
+            fill_brightness,
+            spectrum_thickness_px,
+            spectrum_radius_px,
+        } = evaluate_layer_properties(layer, time, &spectrum.modulators);
         let active_lyric = match &layer.kind {
             LayerKind::Lyrics(lyrics) => {
                 let Some(active) = active_lyric_at(lyrics, time) else {
@@ -291,9 +246,161 @@ pub fn evaluate(project: &Project, t_secs: f64, spectrum: &SpectrumFrame) -> Sce
     }
 }
 
-fn modulator_value(spectrum: &SpectrumFrame, id: crate::model::ModulatorId) -> f32 {
-    spectrum
-        .modulators
+/// The common animation/binding evaluation, including declaration-order clamping.
+/// Rendering and editor geometry must both use this owner.
+struct EvaluatedLayer {
+    opacity: f32,
+    rect: NormRect,
+    image_zoom: f32,
+    rotation_deg: f32,
+    corner_radius_px: f32,
+    glow: Option<Glow>,
+    fill_brightness: f32,
+    spectrum_thickness_px: f32,
+    spectrum_radius_px: f32,
+}
+
+fn evaluation_time(project: &Project, t_secs: f64) -> (f64, f64) {
+    let duration = if project.duration_secs.is_finite() {
+        project.duration_secs.max(0.0)
+    } else {
+        0.0
+    };
+    let time = if t_secs.is_finite() {
+        t_secs.clamp(0.0, duration)
+    } else {
+        0.0
+    };
+    (duration, time)
+}
+
+fn evaluate_layer_properties(
+    layer: &crate::model::Layer,
+    time: f64,
+    modulators: &[ModulatorValue],
+) -> EvaluatedLayer {
+    let mut opacity = layer.opacity.evaluate(time);
+    let mut rect = layer.rect.evaluate(time);
+    let mut scale = 1.0_f32;
+    let mut image_zoom = match &layer.kind {
+        LayerKind::Image { zoom, .. } => finite_or(zoom.evaluate(time), 1.0).max(0.01),
+        _ => 1.0,
+    };
+    let mut rotation_deg = finite_or(layer.rotation.evaluate(time), 0.0);
+    let mut corner_radius_px = finite_or(layer.corner_radius.evaluate(time), 0.0);
+    let mut glow = layer.glow.evaluate(time).map(sanitize_glow);
+    let mut fill_brightness = 0.0_f32;
+    let mut spectrum_thickness_px = 0.0_f32;
+    let mut spectrum_radius_px = 0.0_f32;
+    for binding in &layer.modulations {
+        let amount = finite_or(binding.amount, 0.0)
+            * binding
+                .curve
+                .apply(modulator_value(modulators, binding.modulator));
+        match binding.target {
+            ModulationTarget::Opacity => opacity = (opacity + amount).clamp(0.0, 1.0),
+            ModulationTarget::Scale => scale = (scale + amount).max(0.0),
+            ModulationTarget::ImageZoom => image_zoom = (image_zoom + amount).max(0.01),
+            ModulationTarget::Rotation => rotation_deg += amount,
+            ModulationTarget::CornerRadius => {
+                corner_radius_px = (corner_radius_px + amount).max(0.0)
+            }
+            ModulationTarget::GlowRadius => {
+                if let Some(glow) = &mut glow {
+                    glow.radius_px = (glow.radius_px + amount).max(0.0);
+                }
+            }
+            ModulationTarget::GlowAlpha => {
+                if let Some(glow) = &mut glow {
+                    let alpha = f32::from(glow.color.a) / 255.0;
+                    glow.color.a = ((alpha + amount).clamp(0.0, 1.0) * 255.0).round() as u8;
+                }
+            }
+            ModulationTarget::FillBrightness => {
+                fill_brightness = (fill_brightness + amount).clamp(-1.0, 1.0)
+            }
+            ModulationTarget::SpectrumThickness => {
+                spectrum_thickness_px += amount;
+            }
+            ModulationTarget::SpectrumRadius => spectrum_radius_px += amount,
+        }
+    }
+    rect = scale_rect_from_center(rect, scale);
+    EvaluatedLayer {
+        opacity,
+        rect,
+        image_zoom,
+        rotation_deg,
+        corner_radius_px,
+        glow,
+        fill_brightness,
+        spectrum_thickness_px,
+        spectrum_radius_px,
+    }
+}
+
+/// Evaluated layer box, independent of raster assets, glow and content extent.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayerBounds {
+    pub rect: NormRect,
+    pub rotation_deg: f32,
+    pub visible: bool,
+    /// Clockwise corners in normalized output coordinates. Rotation is performed
+    /// in output pixels before normalization, preserving non-square aspect ratios.
+    pub corners: [(f32, f32); 4],
+}
+
+pub fn evaluate_layer_bounds(
+    project: &Project,
+    layer_id: crate::model::LayerId,
+    t_secs: f64,
+    modulators: &[ModulatorValue],
+) -> Option<LayerBounds> {
+    let layer = project.layers.iter().find(|layer| layer.id == layer_id)?;
+    let (_, time) = evaluation_time(project, t_secs);
+    let properties = evaluate_layer_properties(layer, time, modulators);
+    let rect = properties.rect;
+    let width = project.output.width.max(1) as f32;
+    let height = project.output.height.max(1) as f32;
+    let center = (
+        (rect.x + rect.width * 0.5) * width,
+        (rect.y + rect.height * 0.5) * height,
+    );
+    let (sin, cos) = properties.rotation_deg.to_radians().sin_cos();
+    let corners = [
+        (rect.x, rect.y),
+        (rect.x + rect.width, rect.y),
+        (rect.x + rect.width, rect.y + rect.height),
+        (rect.x, rect.y + rect.height),
+    ]
+    .map(|(x, y)| {
+        let dx = x * width - center.0;
+        let dy = y * height - center.1;
+        (
+            (center.0 + dx * cos - dy * sin) / width,
+            (center.1 + dx * sin + dy * cos) / height,
+        )
+    });
+    if !corners.iter().all(|(x, y)| x.is_finite() && y.is_finite()) {
+        return None;
+    }
+    let content_opacity = match &layer.kind {
+        LayerKind::Lyrics(lyrics) => active_lyric_at(lyrics, time)
+            .filter(|active| !active.text.is_empty())
+            .map_or(0.0, |active| active.opacity),
+        _ => 1.0,
+    };
+    Some(LayerBounds {
+        rect,
+        rotation_deg: properties.rotation_deg,
+        visible: layer.visible.evaluate(time)
+            && (properties.opacity * content_opacity).clamp(0.0, 1.0) > 0.0,
+        corners,
+    })
+}
+
+fn modulator_value(modulators: &[ModulatorValue], id: crate::model::ModulatorId) -> f32 {
+    modulators
         .iter()
         .find(|value| value.id == id)
         .map_or(0.0, |value| finite_or(value.value, 0.0).clamp(0.0, 1.0))

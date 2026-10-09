@@ -10,6 +10,7 @@ mod history;
 mod keyframes;
 mod lyrics_editing;
 mod modulators;
+mod preview;
 mod resources;
 mod timeline;
 
@@ -21,10 +22,10 @@ pub use keyframes::{
     AnimProperty, AnimationValue, CommandResult, EditorCommand, EditorCommandError,
     LayerMoveDirection, apply_editor_command,
 };
+pub use preview::{PreviewFrame, draw_preview};
 pub use resources::{EditTargetLifetime, ResourceLease, ResourceManifest, ResourceRevision};
 pub use timeline::{TimelineResponse, TimelineWaveform, draw_timeline};
 
-use egui::TextureHandle;
 use musicvideo_core::{
     Fill, Glow, GradientStop, GradientStops, ImageId, Layer, LayerId, LayerKind, LyricLine,
     LyricsLayer, MIV_SPECTRUM_BANDS, ModulatorCalibration, ModulatorValue, MusicColorMode, Project,
@@ -81,6 +82,7 @@ pub struct EditorState {
     pending_text_edit_restores: Vec<(egui::Id, PendingLyricsInvalidation)>,
     pending_layer_delete: Option<LayerId>,
     inspector_tab: InspectorTab,
+    show_selection_bounds: bool,
     modulator_editor: ModulatorEditorState,
     history: UndoHistory,
 }
@@ -98,6 +100,7 @@ impl Default for EditorState {
             pending_text_edit_restores: Vec::new(),
             pending_layer_delete: None,
             inspector_tab: InspectorTab::Layer,
+            show_selection_bounds: true,
             modulator_editor: ModulatorEditorState::default(),
             history: UndoHistory::default(),
         }
@@ -1215,26 +1218,6 @@ fn draw_layer_delete_confirmation(
             state.pending_layer_delete = None;
         }
         None
-    }
-}
-
-/// Draws the already-composited frame. Texture creation and updates stay with the caller.
-pub fn draw_preview(ui: &mut egui::Ui, texture: Option<&TextureHandle>, _state: &mut EditorState) {
-    if let Some(texture) = texture {
-        let source = texture.size_vec2();
-        let available = ui.available_size();
-        let scale = (available.x / source.x)
-            .min(available.y / source.y)
-            .max(0.01);
-        let size = source * scale;
-        ui.centered_and_justified(|ui| {
-            ui.image((texture.id(), size));
-        });
-    } else {
-        ui.centered_and_justified(|ui| {
-            ui.spinner();
-            ui.label("プレビューを準備しています");
-        });
     }
 }
 

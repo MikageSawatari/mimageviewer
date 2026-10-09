@@ -14,8 +14,9 @@ use musicvideo_core::{
 };
 use musicvideo_ui::{
     DocumentSession, DocumentSessionId, EditGeneration, EditTargetLifetime, EditorCommand,
-    EditorResponse, EditorState, InspectorTab, MissingImageNotice, ResourceLease, ResourceManifest,
-    ResourceRevision, SaveCheckpoint, TimelineWaveform, draw_missing_images, draw_preview,
+    EditorResponse, EditorState, InspectorTab, MissingImageNotice, PreviewFrame, ResourceLease,
+    ResourceManifest, ResourceRevision, SaveCheckpoint, TimelineWaveform, draw_missing_images,
+    draw_preview,
 };
 
 use crate::decode::{AudioData, decode_audio};
@@ -63,12 +64,33 @@ struct ImageLoadRequest {
 
 struct PreviewResult {
     revision: u64,
+    project: Project,
+    time_secs: f64,
     image: egui::ColorImage,
     render_ms: f64,
     report: RenderReport,
     spectrum: Option<SpectrumSource>,
     modulator_values: Vec<ModulatorValue>,
     timings: PreviewWorkerTimings,
+}
+
+/// Texture and evaluation inputs are published/cleared as one displayed frame.
+struct DisplayedPreview {
+    texture: egui::TextureHandle,
+    project: Project,
+    time_secs: f64,
+    modulator_values: Vec<ModulatorValue>,
+}
+
+impl DisplayedPreview {
+    fn frame(&self) -> PreviewFrame<'_> {
+        PreviewFrame {
+            texture: &self.texture,
+            project: &self.project,
+            time_secs: self.time_secs,
+            modulator_values: &self.modulator_values,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -438,11 +460,10 @@ pub struct MusicVideoLabApp {
     preview_pending: Option<PreviewPending>,
     preview_dirty: bool,
     preview_revision: u64,
-    preview_texture: Option<egui::TextureHandle>,
+    displayed_preview: Option<DisplayedPreview>,
     preview_render_ms: f64,
     preview_report: RenderReport,
     preview_spectrum: Option<SpectrumSource>,
-    preview_modulator_values: Vec<ModulatorValue>,
     modulator_calibrations: Vec<ModulatorCalibration>,
     calibration_request: Vec<ModulatorCalibrationRequest>,
     calibration_pending: Option<CalibrationPending>,
@@ -497,11 +518,10 @@ impl MusicVideoLabApp {
             preview_pending: None,
             preview_dirty: true,
             preview_revision: 1,
-            preview_texture: None,
+            displayed_preview: None,
             preview_render_ms: 0.0,
             preview_report: RenderReport::default(),
             preview_spectrum: None,
-            preview_modulator_values: Vec::new(),
             modulator_calibrations: Vec::new(),
             calibration_request: Vec::new(),
             calibration_pending: None,
@@ -1136,7 +1156,9 @@ impl MusicVideoLabApp {
                 frame.inspector(
                     ui,
                     self.position_secs,
-                    &self.preview_modulator_values,
+                    self.displayed_preview
+                        .as_ref()
+                        .map_or(&[], |preview| preview.modulator_values.as_slice()),
                     &self.modulator_calibrations,
                 );
             });
@@ -1187,7 +1209,7 @@ impl MusicVideoLabApp {
             store.defer_drop(old_assets);
         }
         self.preview_report = RenderReport::default();
-        self.preview_texture = None;
+        self.displayed_preview = None;
         self.mark_preview_dirty();
     }
 
@@ -1339,6 +1361,14 @@ impl MusicVideoLabApp {
         }
     }
 
+    fn draw_preview(&mut self, ui: &mut egui::Ui) {
+        draw_preview(
+            ui,
+            self.displayed_preview.as_ref().map(DisplayedPreview::frame),
+            &mut self.editor_state,
+        );
+    }
+
     fn start_preview_if_needed(&mut self, ctx: &egui::Context) {
         if !self.preview_dirty
             || self.preview_pending.is_some()
@@ -1423,6 +1453,8 @@ impl MusicVideoLabApp {
                     let total_ms = worker_started.elapsed().as_secs_f64() * 1000.0;
                     Ok(PreviewResult {
                         revision,
+                        project,
+                        time_secs: position_secs,
                         image,
                         render_ms,
                         report,
@@ -1461,19 +1493,27 @@ impl MusicVideoLabApp {
                 self.preview_pending = None;
                 if result.revision == self.preview_revision {
                     self.preview_spectrum = result.spectrum;
-                    self.preview_modulator_values = result.modulator_values;
                     self.preview_render_ms = result.render_ms;
                     self.preview_report = result.report;
                     let texture_started = Instant::now();
-                    if let Some(texture) = &mut self.preview_texture {
-                        texture.set(result.image, egui::TextureOptions::LINEAR);
+                    let texture = if let Some(mut previous) = self.displayed_preview.take() {
+                        previous
+                            .texture
+                            .set(result.image, egui::TextureOptions::LINEAR);
+                        previous.texture
                     } else {
-                        self.preview_texture = Some(ctx.load_texture(
+                        ctx.load_texture(
                             "musicvideo-preview",
                             result.image,
                             egui::TextureOptions::LINEAR,
-                        ));
-                    }
+                        )
+                    };
+                    self.displayed_preview = Some(DisplayedPreview {
+                        texture,
+                        project: result.project,
+                        time_secs: result.time_secs,
+                        modulator_values: result.modulator_values,
+                    });
                     let texture_update_ms = texture_started.elapsed().as_secs_f64() * 1000.0;
                     if let Some(display_interval_ms) =
                         self.preview_perf.displayed_interval(Instant::now())
@@ -1773,6 +1813,7 @@ impl MusicVideoLabApp {
         if let Some(store) = &self.resource_store {
             store.defer_drop(old_assets);
         }
+        self.displayed_preview = None;
         self.project = loaded.project;
         self.document
             .replace_with_loaded(loaded.path, &self.project);
@@ -2537,7 +2578,7 @@ impl eframe::App for MusicVideoLabApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
             .show(ctx, |ui| {
-                draw_preview(ui, self.preview_texture.as_ref(), &mut self.editor_state);
+                self.draw_preview(ui);
             });
         let egui_layout_ms = egui_layout_started.elapsed().as_secs_f64() * 1000.0;
 
@@ -2695,6 +2736,184 @@ impl Drop for MusicVideoLabApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn selection_result(project: Project, revision: u64, time_secs: f64) -> PreviewResult {
+        PreviewResult {
+            project,
+            revision,
+            time_secs,
+            image: egui::ColorImage::filled([160, 90], egui::Color32::BLACK),
+            render_ms: 0.0,
+            report: RenderReport::default(),
+            spectrum: None,
+            modulator_values: vec![ModulatorValue {
+                id: musicvideo_core::ModulatorId(1),
+                value: 0.5,
+            }],
+            timings: PreviewWorkerTimings::default(),
+        }
+    }
+
+    fn selection_deliver(app: &mut MusicVideoLabApp, ctx: &egui::Context, result: PreviewResult) {
+        let (tx, rx) = mpsc::channel();
+        app.preview_pending = Some(PreviewPending {
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx,
+        });
+        tx.send(Ok(result)).unwrap();
+        app.poll_preview(ctx);
+    }
+
+    #[test]
+    fn selection_displayed_frame_uses_result_time_modulation_and_project_in_real_draw() {
+        use musicvideo_core::{
+            Animatable, Interp, Keyframe, ModulationBinding, ModulationCurve, ModulationTarget,
+            ModulatorId, NormRect, Track,
+        };
+        let ctx = egui::Context::default();
+        let mut app = MusicVideoLabApp::new(Arc::new(Assets::default()));
+        app.project.layers[0].name = "displayed-box".into();
+        app.project.layers[0].rect = Animatable::Track(
+            Track::new(vec![
+                Keyframe {
+                    t: 0.0,
+                    value: NormRect::new(0.0, 0.2, 0.2, 0.2),
+                    interp: Interp::Linear,
+                },
+                Keyframe {
+                    t: 10.0,
+                    value: NormRect::new(1.0, 0.2, 0.2, 0.2),
+                    interp: Interp::Linear,
+                },
+            ])
+            .unwrap(),
+        );
+        app.project.layers[0].modulations.push(ModulationBinding {
+            target: ModulationTarget::Scale,
+            modulator: ModulatorId(1),
+            amount: 1.0,
+            curve: ModulationCurve::Linear,
+        });
+        app.editor_state.select_layer(&app.project, 0);
+        let project_snapshot = app.project.clone();
+        app.position_secs = 9.0;
+        // Ordinary edits deliberately do not reject an already-composed frame.
+        app.project.layers[0].rect = Animatable::Const(NormRect::new(0.9, 0.9, 0.1, 0.1));
+        app.project.layers[0].name = "latest-box".into();
+        let result = selection_result(project_snapshot, app.preview_revision, 2.0);
+        selection_deliver(&mut app, &ctx, result);
+        let displayed = app.displayed_preview.as_ref().unwrap();
+        let bounds = displayed
+            .frame()
+            .selected_bounds(&app.editor_state)
+            .unwrap();
+        assert!((bounds.rect.x - 0.15).abs() < 1e-6);
+        assert!((bounds.rect.width - 0.3).abs() < 1e-6);
+        assert_eq!(displayed.time_secs, 2.0);
+        let mut output = egui::FullOutput::default();
+        for _ in 0..2 {
+            output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::Vec2::new(640.0, 480.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.draw_preview(ui));
+                },
+            );
+        }
+        assert!(output.shapes.iter().any(
+            |s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text() == "displayed-box")
+        ));
+        assert!(
+            !output.shapes.iter().any(
+                |s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text() == "latest-box")
+            )
+        );
+        let image = output
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Mesh(mesh) => Some(mesh.calc_bounds()),
+                _ => None,
+            })
+            .unwrap();
+        let path = output
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Path(path) if path.closed && s.clip_rect.min.y > 20.0 => Some(path),
+                _ => None,
+            })
+            .unwrap();
+        assert!((path.points[0].x - (image.left() + image.width() * 0.15)).abs() < 1e-4);
+        assert!((path.points[0].y - (image.top() + image.height() * 0.15)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn selection_stale_preview_keeps_all_displayed_inputs_and_clear_removes_them() {
+        let ctx = egui::Context::default();
+        let mut app = MusicVideoLabApp::new(Arc::new(Assets::default()));
+        let first_revision = app.preview_revision;
+        selection_deliver(
+            &mut app,
+            &ctx,
+            selection_result(default_project(10.0), first_revision, 2.0),
+        );
+        app.mark_preview_dirty();
+        let mut stale = selection_result(default_project(20.0), first_revision, 9.0);
+        stale.modulator_values[0].value = 0.9;
+        selection_deliver(&mut app, &ctx, stale);
+        let displayed = app.displayed_preview.as_ref().unwrap();
+        assert_eq!(displayed.time_secs, 2.0);
+        assert_eq!(displayed.project.duration_secs, 10.0);
+        assert_eq!(displayed.modulator_values[0].value, 0.5);
+        let texture_id = displayed.texture.id();
+        let revision = app.preview_revision;
+        selection_deliver(
+            &mut app,
+            &ctx,
+            selection_result(default_project(30.0), revision, 4.0),
+        );
+        let displayed = app.displayed_preview.as_ref().unwrap();
+        assert_eq!(displayed.time_secs, 4.0);
+        assert_eq!(displayed.project.duration_secs, 30.0);
+        assert_eq!(displayed.texture.id(), texture_id);
+        app.clear_decoded_resources();
+        assert!(app.displayed_preview.is_none());
+        let revision = app.preview_revision;
+        selection_deliver(
+            &mut app,
+            &ctx,
+            selection_result(default_project(30.0), revision, 4.0),
+        );
+        app.apply_loaded_project(loaded_project("new.mivmv", 12.0));
+        assert!(app.displayed_preview.is_none());
+    }
+
+    #[test]
+    fn selection_worker_result_carries_its_captured_time_and_project() {
+        let ctx = egui::Context::default();
+        let mut app = MusicVideoLabApp::new(Arc::new(Assets::default()));
+        app.project.output.width = 32;
+        app.project.output.height = 18;
+        app.position_secs = 2.0;
+        let project = app.project.clone();
+        app.start_preview_if_needed(&ctx);
+        app.position_secs = 9.0;
+        app.project.duration_secs = 99.0;
+        let pending = app.preview_pending.take().unwrap();
+        let result = pending
+            .rx
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.time_secs, 2.0);
+        assert_eq!(result.project, project);
+    }
 
     #[test]
     fn playback_and_project_edits_do_not_cancel_a_complete_in_flight_frame() {
@@ -3341,11 +3560,16 @@ mod tests {
             id.clone(),
             ImageAsset::new(1, 1, vec![1, 2, 3, 255]).unwrap(),
         );
-        app.preview_texture = Some(context.load_texture(
-            "old-preview",
-            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
-            egui::TextureOptions::LINEAR,
-        ));
+        app.displayed_preview = Some(DisplayedPreview {
+            project: app.project.clone(),
+            time_secs: 0.0,
+            modulator_values: vec![],
+            texture: context.load_texture(
+                "old-preview",
+                egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+                egui::TextureOptions::LINEAR,
+            ),
+        });
 
         app.sync_runtime_resources(&context);
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -3363,7 +3587,7 @@ mod tests {
             RuntimeResourceState::Unresolved { .. }
         ));
         assert!(!app.assets.has_image(&id));
-        assert!(app.preview_texture.is_none());
+        assert!(app.displayed_preview.is_none());
         assert!(app.editor_state.can_undo());
         app.retry_runtime_restore(&context);
         assert!(matches!(

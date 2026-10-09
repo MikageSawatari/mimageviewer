@@ -15,6 +15,9 @@ pub mod scene;
 pub mod spectrum;
 mod text;
 
+#[cfg(test)]
+mod selection_tests;
+
 pub use anim::{Interpolate, easing_amount, evaluate_track};
 pub use assets::{
     AssetError, Assets, ImageAsset, MAX_SCALED_IMAGE_CACHE_ENTRIES, ScaledImageCacheStats,
@@ -44,7 +47,10 @@ pub use preset::{
 pub use raster::{
     Frame, PixelRect, RasterError, RenderReport, UnresolvedAsset, norm_rect_to_pixels, render_frame,
 };
-pub use scene::{Scene, SceneItem, SceneItemKind, SpectrumFrame, evaluate, format_time};
+pub use scene::{
+    LayerBounds, Scene, SceneItem, SceneItemKind, SpectrumFrame, evaluate, evaluate_layer_bounds,
+    format_time,
+};
 pub use spectrum::{
     BandFeature, MAX_SEQUENTIAL_GAP_SECS, MAX_SPECTRUM_BANDS, MODULATOR_CALIBRATION_HZ,
     ModulatorCalibration, ModulatorCalibrationError, ModulatorCalibrationRequest, Smoothing,
