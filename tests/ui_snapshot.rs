@@ -2883,6 +2883,54 @@ fn normalize_hud_navigation_native_narrow_dark() {
 
 #[test]
 #[cfg(windows)]
+fn tracks_hud_native_543pt_dark() {
+    snapshot_with_theme_at_size(
+        "tracks_hud_native_543pt_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(543.0, 360.0),
+        None,
+        mimageviewer::video::native_presenter::draw_native_multitrack_bottom_snapshot_fixture,
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn tracks_hud_native_360pt_dark() {
+    snapshot_with_theme_at_size(
+        "tracks_hud_native_360pt_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(360.0, 360.0),
+        None,
+        mimageviewer::video::native_presenter::draw_native_multitrack_bottom_snapshot_fixture,
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn tracks_hud_music_543pt_dark() {
+    snapshot_with_theme_at_size(
+        "tracks_hud_music_543pt_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(543.0, 360.0),
+        None,
+        mimageviewer::ui_music_panels::draw_music_multitrack_snapshot_fixture,
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn tracks_hud_music_360pt_dark() {
+    snapshot_with_theme_at_size(
+        "tracks_hud_music_360pt_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(360.0, 360.0),
+        None,
+        mimageviewer::ui_music_panels::draw_music_multitrack_snapshot_fixture,
+    );
+}
+
+#[test]
+#[cfg(windows)]
 fn normalize_hud_navigation_music_narrow_dark() {
     snapshot_with_theme_options(
         "normalize_hud_navigation_music_narrow_dark",

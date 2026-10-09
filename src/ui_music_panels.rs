@@ -598,7 +598,7 @@ fn music_hud_row_layout(hud: egui::Rect, metrics: MusicHudRowMetrics) -> MusicHu
     let area = hud.width().max(0.0);
     let padding = 10.0_f32.min(area * 0.1);
     let available = (area - 2.0 * padding).max(0.0);
-    let core_count = 4.0;
+    let core_count = 4.0 + usize::from(metrics.widths[Track as usize].is_some()) as f32;
     let gap = 8.0_f32.min(available / (core_count + 1.0));
     let mut widths = metrics.widths;
     let total = |widths: &[Option<f32>; 16]| {
@@ -606,7 +606,7 @@ fn music_hud_row_layout(hud: egui::Rect, metrics: MusicHudRowMetrics) -> MusicHu
             + gap * widths.iter().flatten().count().saturating_sub(1) as f32
     };
     let drop_order = [
-        Limiter, Db, Speed, Norm, Continuous, Loop, Volume, Track, NextMarker, PrevMarker, Start,
+        Limiter, Db, Speed, Norm, Continuous, Loop, Volume, NextMarker, PrevMarker, Start,
     ];
     for item in drop_order {
         if total(&widths) <= available {
@@ -2562,6 +2562,16 @@ fn music_hud_snapshot_chrome() -> MusicChromeViewState {
 
 #[cfg(windows)]
 pub fn draw_music_playback_snapshot_fixture(ui: &mut egui::Ui) {
+    draw_music_playback_snapshot(ui, false);
+}
+
+#[cfg(windows)]
+pub fn draw_music_multitrack_snapshot_fixture(ui: &mut egui::Ui) {
+    draw_music_playback_snapshot(ui, true);
+}
+
+#[cfg(windows)]
+fn draw_music_playback_snapshot(ui: &mut egui::Ui, multitrack: bool) {
     let rect = ui.max_rect();
     ui.set_min_size(rect.size());
     let hud = egui::Rect::from_min_max(
@@ -2578,14 +2588,19 @@ pub fn draw_music_playback_snapshot_fixture(ui: &mut egui::Ui) {
     chrome.playing = true;
     chrome.normalize_ui_state =
         crate::video::normalize_types::NormalizeUiState::OnApplied { gain_db: 0.0 };
-    let layout = music_hud_row_layout(hud, measure_music_hud_row(ui, &chrome, &[]));
+    let rows = if multitrack {
+        music_hud_multitrack_fixture_rows().to_vec()
+    } else {
+        vec![]
+    };
+    let layout = music_hud_row_layout(hud, measure_music_hud_row(ui, &chrome, &rows));
     let _ = draw_music_playback_row(
         ui,
         hud,
         0,
         &chrome,
         &layout,
-        &[],
+        &rows,
         ui.id().with("track"),
         false,
         MusicHudPresentation::Interactive,
@@ -2593,6 +2608,17 @@ pub fn draw_music_playback_snapshot_fixture(ui: &mut egui::Ui) {
         &mut None,
         &mut false,
     );
+}
+
+#[cfg(windows)]
+fn music_hud_multitrack_fixture_rows() -> [crate::video::audio_track_ui::AudioTrackRow; 3] {
+    [0, 1, 2].map(|index| crate::video::audio_track_ui::AudioTrackRow {
+        label: format!("Track {}", index + 1),
+        stream_index: index,
+        ordinal: index + 1,
+        is_current: index == 0,
+        state: crate::video::AudioTrackSelectionDisplayState::Applied,
+    })
 }
 
 #[cfg(windows)]
@@ -2638,6 +2664,137 @@ pub fn draw_music_normalize_snapshot_fixture(ui: &mut egui::Ui) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(windows)]
+    fn music_tracks_hud_selector_is_never_dropped() {
+        let metrics =
+            MusicHudRowMetrics::new("0:05 / 0:30".into(), 132.0, "0:05".into(), 32.0, true);
+        for width in 1..=2000 {
+            let hud = egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width as f32, MUSIC_HUD_HEIGHT),
+            );
+            let layout = music_hud_row_layout(hud, metrics.clone());
+            assert!(
+                layout.rects[MusicHudItem::Track as usize].is_some(),
+                "track selection dropped at {width}pt"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn music_tracks_hud_real_mouse_and_touch_select_third_at_narrow_widths() {
+        for width in [300.0, 360.0, 543.0, 820.0] {
+            for touch_input in [false, true] {
+                let ctx = egui::Context::default();
+                crate::ui_fonts::configure_fonts(&ctx);
+                let rows = music_hud_multitrack_fixture_rows();
+                let mut chrome = music_hud_snapshot_chrome();
+                chrome.normalize_ui_state = crate::video::normalize_types::NormalizeUiState::Off;
+                let mut last_volume = None;
+                let mut speed_open = false;
+                let selector_id = egui::Id::new("tracks_hud_selector");
+                let mut clock = 0.0;
+                let mut frame = |events| {
+                    clock += 1.0 / 60.0;
+                    let mut result = None;
+                    let _ = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(width, 360.0),
+                            )),
+                            events,
+                            time: Some(clock),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default().frame(egui::Frame::NONE).show(
+                                ctx,
+                                |ui| {
+                                    let hud = egui::Rect::from_min_max(
+                                        egui::pos2(0.0, 360.0 - MUSIC_HUD_HEIGHT),
+                                        egui::pos2(width, 360.0),
+                                    );
+                                    let layout = music_hud_row_layout(
+                                        hud,
+                                        measure_music_hud_row(ui, &chrome, &rows),
+                                    );
+                                    let actions = draw_music_playback_row(
+                                        ui,
+                                        hud,
+                                        0,
+                                        &chrome,
+                                        &layout,
+                                        &rows,
+                                        selector_id,
+                                        false,
+                                        MusicHudPresentation::Interactive,
+                                        &crate::keymap::Keymap::empty(),
+                                        &mut last_volume,
+                                        &mut speed_open,
+                                    );
+                                    result = Some((
+                                        layout.rects[MusicHudItem::Track as usize].unwrap(),
+                                        actions.selected_audio_track,
+                                    ));
+                                },
+                            );
+                        },
+                    );
+                    result.unwrap()
+                };
+                for _ in 0..4 {
+                    frame(vec![]);
+                }
+                let pos = frame(vec![]).0.center();
+                let events = |pos, down| {
+                    let mut events = vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: down,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ];
+                    if touch_input {
+                        events.push(egui::Event::Touch {
+                            device_id: egui::TouchDeviceId(1),
+                            id: egui::TouchId(1),
+                            phase: if down {
+                                egui::TouchPhase::Start
+                            } else {
+                                egui::TouchPhase::End
+                            },
+                            pos,
+                            force: None,
+                        });
+                    }
+                    events
+                };
+                frame(events(pos, true));
+                frame(events(pos, false));
+                for _ in 0..4 {
+                    frame(vec![]);
+                }
+                let pos = ctx
+                    .read_response(selector_id.with("popup").with(2usize))
+                    .unwrap()
+                    .rect
+                    .center();
+                frame(events(pos, true));
+                assert_eq!(
+                    frame(events(pos, false)).1,
+                    Some(2),
+                    "{width}pt touch={touch_input}"
+                );
+                assert_eq!(frame(vec![]).1, None);
+            }
+        }
+    }
 
     #[test]
     #[cfg(windows)]
@@ -3364,10 +3521,9 @@ mod tests {
             });
         });
         let metrics = metrics.unwrap();
-        // Specification order, including the track selector after the volume slider.
+        // Track selection is retained; every optional control follows this order.
         let order = [
-            Limiter, Db, Speed, Norm, Continuous, Loop, Volume, Track, NextMarker, PrevMarker,
-            Start,
+            Limiter, Db, Speed, Norm, Continuous, Loop, Volume, NextMarker, PrevMarker, Start,
         ];
 
         let mut previous = [true; 16];
@@ -3523,10 +3679,10 @@ mod tests {
             assert!(open, "visible track menu closed at {width}pt");
         }
         let (track, open) = frame(300.0, vec![]);
-        assert!(track.is_none());
-        assert!(!open, "actual track omission terminates its popup");
+        assert!(track.is_some());
+        assert!(open, "narrow width must not terminate track selection");
         let (track, open) = frame(950.0, vec![]);
         assert!(track.is_some());
-        assert!(!open, "restoring the button must not resurrect its popup");
+        assert!(open, "the visible track menu survives width restoration");
     }
 }

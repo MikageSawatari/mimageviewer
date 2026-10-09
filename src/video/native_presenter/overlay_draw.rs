@@ -3990,8 +3990,9 @@ pub(super) fn draw_native_file_navigation_ui(
         ),
     ] {
         let response = ui.interact(rect, egui::Id::new(id), egui::Sense::click());
-        draw_overlay_button_bg(ui.painter(), rect, response.hovered(), false);
-        draw_overlay_arrow_icon(ui.painter(), rect, delta);
+        let painter = ui.painter().with_clip_rect(rect);
+        draw_overlay_button_bg(&painter, rect, response.hovered(), false);
+        draw_overlay_arrow_icon(&painter, rect, delta);
         if response
             .hover_tip_dark(native_label_with_shortcut(label, shortcut))
             .clicked()
