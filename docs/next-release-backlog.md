@@ -191,6 +191,8 @@
 - proof第4回修正 (2026-10-08): コピー済み宛先はSurface、現行行／prepare snapshot依存はRowへ全受付・採用adapterを監査して統一。既存switch sequenceを全証明で照合し、Quick Folder再選択／往復・検索owner切替で未採用要求を退役。実ペインEnterと同queryの実検索refresh交差は許可。履歴／fullscreen scanは元証明を保持。監査表は [async-architecture.md](async-architecture.md#source-proof選択箇所の監査2026-10-08)。
 - native restore証明の追加修正 (2026-10-08): RatingPhysicalのRestoreとQuickFolderSwitchはコピー済み状態に従い、不要なsource行世代条件を除く。Restoreのsource意味identityは元共通Surface証明に委ね、Collection revision／viewport hintの一致を重ねない。BSはRestoreとして共通Direct履歴を維持。実ZIP pin通知による同階層再構築とBack／BS、実Collection revision publishとBackを交差させ、明示open／行順Refreshの行検証は維持する。committed warm PDFの履歴／分類pending・modal中の保留は出荷済み動作として維持し、§9の記述を訂正。
 
+- master統合後の公開境界を追加修正 (2026-10-09): 検索prepareのthumbnail/source map・badge・ratingは成功採用closure内だけで適用。Bookmark buildはmainのSurface leaseとswitch sequenceを持つ単一ownerへ接続し、退出時に退役、遅延pollで再検証する。同一覧sortはownerを継続し、A/B記憶クリアでは旧epochを退役して表示中一覧のbuildを再開始する。ReadingHistory hydrationは送信済みCtrl+F条件で再計算し、未送信の編集を保持。実handlerとworker完了の交差回帰を追加し、§1.345は未着手。
+
 - 出典: 利用者が v4.4.0 リリース前の master 確認ビルド (2e84ee67f) で観測。手順:
   1. 一覧で拡張子の絞り込みをかける
   2. ZIP を開く (本はページを直接表示する設定)

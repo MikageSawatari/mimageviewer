@@ -3289,6 +3289,10 @@ impl App {
         } else {
             None
         };
+        let old_search_submission = self
+            .search_filter
+            .as_ref()
+            .map(|filter| filter.submitted.clone());
         let old_search_query = old_binding_is_current.then(|| self.search_query.clone());
         let old_search_origin = old_binding_is_current
             .then(|| self.search_filter_origin_folder.clone())
@@ -3353,8 +3357,8 @@ impl App {
             self.search_filter_origin_folder = old_search_origin;
         }
         if let Some(anchors) = old_search_anchors {
-            self.search_filter = Some(
-                anchors
+            self.search_filter = Some(super::LocalSearchFilter {
+                matches: anchors
                     .iter()
                     .filter_map(|anchor| {
                         prepared
@@ -3369,7 +3373,9 @@ impl App {
                             })
                     })
                     .collect(),
-            );
+                submitted: old_search_submission
+                    .expect("search anchors carry their submitted conditions"),
+            });
             self.rebuild_visible_indices();
         }
         self.address = format!("コレクション: {}", prepared.collection_name);
@@ -6543,7 +6549,9 @@ mod tests {
             Some(temp.path())
         );
         assert_eq!(
-            app.search_filter,
+            app.search_filter
+                .as_ref()
+                .map(|filter| filter.matches.clone()),
             Some(
                 [reordered
                     .entries

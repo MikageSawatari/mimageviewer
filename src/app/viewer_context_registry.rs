@@ -878,7 +878,7 @@ pub(in crate::app) struct ViewerContextBundle {
     folder_pane_open_pending: Option<FolderPaneOpenPending>,
     pending_folder_nav_steps: i32,
     pending_folder_nav_mode: FolderNavMode,
-    search_filter: Option<std::collections::HashSet<usize>>,
+    search_filter: Option<super::LocalSearchFilter>,
     search_filter_origin_folder: Option<PathBuf>,
     checked: std::collections::HashSet<usize>,
     rotation_cache: crate::rotation_cache::RotationCache,

@@ -720,6 +720,29 @@ enum RatingPhysicalLoadIntent {
     Restore,
 }
 
+/// One build owns the main Bookmark surface, independently of row hydration/sorting.
+pub(crate) struct BookmarkBrowserBuild {
+    source: smart_folder::SmartFolderSourceLease,
+    switch_sequence: u64,
+    worker: crate::bookmark_browser::BookmarkBrowserPending,
+}
+impl std::ops::Deref for BookmarkBrowserBuild {
+    type Target = crate::bookmark_browser::BookmarkBrowserPending;
+    fn deref(&self) -> &Self::Target {
+        &self.worker
+    }
+}
+impl std::ops::DerefMut for BookmarkBrowserBuild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.worker
+    }
+}
+impl Drop for BookmarkBrowserBuild {
+    fn drop(&mut self) {
+        self.worker.cancel();
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct QuickFolderSwitchLoadOwner {
     source_context: ViewerContextId,
@@ -7413,6 +7436,53 @@ pub(crate) enum SearchMode {
     TagView,
 }
 
+/// Immutable conditions accepted by Enter; the search bar remains an independent draft.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LocalSearchSubmission {
+    query: String,
+    target: crate::fts_index::SearchTarget,
+    or_mode: bool,
+}
+
+/// Completed membership and the conditions that produced it have one lifetime.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LocalSearchFilter {
+    matches: HashSet<usize>,
+    submitted: Arc<LocalSearchSubmission>,
+}
+
+impl std::ops::Deref for LocalSearchFilter {
+    type Target = HashSet<usize>;
+    fn deref(&self) -> &Self::Target {
+        &self.matches
+    }
+}
+impl std::ops::DerefMut for LocalSearchFilter {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.matches
+    }
+}
+
+#[cfg(test)]
+impl From<HashSet<usize>> for LocalSearchFilter {
+    fn from(matches: HashSet<usize>) -> Self {
+        Self {
+            matches,
+            submitted: Arc::new(LocalSearchSubmission {
+                query: String::new(),
+                target: Default::default(),
+                or_mode: false,
+            }),
+        }
+    }
+}
+#[cfg(test)]
+impl FromIterator<usize> for LocalSearchFilter {
+    fn from_iter<T: IntoIterator<Item = usize>>(values: T) -> Self {
+        HashSet::from_iter(values).into()
+    }
+}
+
 /// 非同期メタデータ検索 (Ctrl+F) の状態。
 ///
 /// 背景: 検索マッチの判定には `png_metadata::build_searchable_from_path` や
@@ -7420,6 +7490,7 @@ pub(crate) enum SearchMode {
 /// フォルダに数百〜数千枚の画像があると UI スレッドで数秒ブロックしていたため、
 /// バックグラウンドスレッドで実行して結果を `poll_search` で受け取る構造に変更した。
 pub(crate) struct SearchPending {
+    submitted: Arc<LocalSearchSubmission>,
     /// 検索キャンセル用トークン。新クエリ / 検索バー閉じ / フォルダ切替で立てる。
     cancel: Arc<AtomicBool>,
     /// UI が毎フレーム読む検索進捗。worker は item 完了ごとに更新する。
@@ -15830,7 +15901,7 @@ pub struct App {
     /// 検索キーワード入力
     pub(crate) search_query: String,
     /// 検索結果フィルタ: Some = フィルタ中（表示するアイテムの元インデックス集合）
-    pub(crate) search_filter: Option<std::collections::HashSet<usize>>,
+    pub(crate) search_filter: Option<LocalSearchFilter>,
     /// Ctrl+F のフィルタが作られたユーザー視点のフォルダ。
     /// この場所では BS / Alt+↑ / ⬆ による親移動を止め、子フォルダ等へ移動して
     /// フィルタが解除された後は通常どおり親へ戻れるようにする。
@@ -16259,7 +16330,7 @@ pub struct App {
 
     /// 「場所 > ブックマーク」の全メディア横断一覧。`items` と同じ順序の sidecar。
     pub(crate) bookmark_browser_rows: Vec<crate::bookmark_browser::BookmarkBrowserRow>,
-    pub(crate) bookmark_browser_pending: Option<crate::bookmark_browser::BookmarkBrowserPending>,
+    pub(crate) bookmark_browser_pending: Option<Box<BookmarkBrowserBuild>>,
     /// 状態フィルタ用の全メディア横断ブックマーク集合。DB 読み出しは worker 側で行う。
     pub(crate) bookmark_presence: Option<crate::bookmark_browser::BookmarkPresence>,
     pub(crate) bookmark_presence_pending: Option<crate::bookmark_browser::BookmarkPresencePending>,
@@ -23355,6 +23426,8 @@ impl App {
     }
 
     pub(crate) fn clear_quick_folder_slots(&mut self) {
+        let renew_bookmark_build = self.projected_viewer_context_id() == self.viewer_context_main()
+            && self.bookmark_browser_pending.is_some();
         self.retire_main_list_requests_for_surface_switch();
         for workspace in &mut self.quick_folder_workspaces {
             *workspace = QuickFolderWorkspace::default();
@@ -23378,6 +23451,10 @@ impl App {
         // history above stays cleared, so the visible list still starts at the top.
         if let Some(current) = self.effective_folder() {
             self.update_active_quick_folder_target(&current);
+        }
+        // The list remains mounted; retire the old epoch but finish its loading shell.
+        if renew_bookmark_build && self.items_are_bookmark_view {
+            self.refresh_bookmark_browser();
         }
     }
 
@@ -25274,7 +25351,10 @@ impl App {
         let show_search_bar = self.show_search_bar;
         let query = self.search_query.clone();
         let filter = self.search_filter.clone();
-        let search_was_pending = self.search_pending.is_some();
+        let pending_submission = self
+            .search_pending
+            .as_ref()
+            .map(|pending| pending.submitted.clone());
         self.zip_nav_show_current_level(crate::app::StartupListIntent::PreservePresentation);
         self.selected = selected.filter(|index| *index < self.items.len());
         self.scroll_offset_y = scroll;
@@ -25283,8 +25363,10 @@ impl App {
         self.search_query = query;
         self.search_filter = filter;
         self.rebuild_visible_indices();
-        if search_was_pending && let Some(ctx) = self.edit_preview_repaint_ctx.clone() {
-            self.execute_search(&ctx);
+        if let Some(submitted) = pending_submission
+            && let Some(ctx) = self.edit_preview_repaint_ctx.clone()
+        {
+            self.execute_submitted_local_search(&ctx, submitted);
         }
     }
 
@@ -30880,7 +30962,7 @@ impl App {
         sidecars: HashMap<String, PathBuf>,
         ctx: &egui::Context,
     ) {
-        let refresh_search = self.search_filter.is_some() || self.search_pending.is_some();
+        let submitted_search = self.submitted_local_search();
         let PreparedReadingHistoryList {
             inputs:
                 ReadingHistoryLoadInputs {
@@ -30899,10 +30981,9 @@ impl App {
         self.items_are_reading_history_view = true;
         self.reading_history_rows = rows;
         self.address = "閲覧履歴".to_owned();
-        if refresh_search {
-            // Submitted searches own the empty shell's indices. The existing entrypoint
-            // retires that worker and rebuilds membership over these hydrated rows.
-            self.execute_search(ctx);
+        if let Some(submitted) = submitted_search {
+            // Rebuild the submitted membership over hydrated rows, preserving the input draft.
+            self.execute_submitted_local_search(ctx, submitted);
         }
         self.prewarm_rating_cache();
         self.prewarm_grid_tags();
@@ -31375,6 +31456,7 @@ impl App {
             return;
         }
         self.quick_folder_switch_sequence = self.quick_folder_switch_sequence.wrapping_add(1);
+        self.retire_bookmark_browser_build_for_current_context();
         self.retire_replaced_main_list_requests(None);
         self.cancel_pending_folder_nav();
     }
@@ -39533,6 +39615,7 @@ impl App {
         refresh_container_metadata: bool,
     ) {
         debug_assert_eq!(items.len(), image_metas.len());
+        self.retire_bookmark_browser_build_for_current_context();
         if !self.navigation_scope.is_detached_physical() {
             self.cancel_content_identity_detection();
         }
@@ -42476,7 +42559,7 @@ impl App {
         if let Some(ref mut filter) = self.search_filter {
             let new_filter: std::collections::HashSet<usize> =
                 filter.iter().filter_map(|&i| shift(i)).collect();
-            *filter = new_filter;
+            filter.matches = new_filter;
         }
 
         // adjustment_page_params / mask_pages / conceal_pages は DB 復元済みの
@@ -46941,13 +47024,38 @@ impl App {
         hydration
     }
 
-    pub(crate) fn refresh_bookmark_browser(&mut self) {
-        if let Some(pending) = self.bookmark_browser_pending.take() {
-            pending.cancel();
+    fn retire_bookmark_browser_build_for_current_context(&mut self) {
+        if self.projected_viewer_context_id() == self.viewer_context_main() {
+            // Dropping the one owner cancels both running work and a queued completion.
+            self.bookmark_browser_pending = None;
         }
-        self.bookmark_browser_pending = Some(crate::bookmark_browser::spawn_build(
-            self.settings.thumbnail_source_discovery_snapshot(),
-        ));
+    }
+
+    fn bookmark_browser_build_is_current(&self, pending: &BookmarkBrowserBuild) -> bool {
+        self.items_are_bookmark_view
+            && pending.switch_sequence == self.quick_folder_switch_sequence
+            && self.smart_folder_source_lease().as_ref() == Some(&pending.source)
+    }
+
+    pub(crate) fn refresh_bookmark_browser(&mut self) {
+        // This App-global worker belongs to main, never to a temporarily mounted viewer.
+        if self.projected_viewer_context_id() != self.viewer_context_main() {
+            return;
+        }
+        self.retire_bookmark_browser_build_for_current_context();
+        if !self.items_are_bookmark_view {
+            return;
+        }
+        let Some(source) = self.smart_folder_source_lease() else {
+            return;
+        };
+        self.bookmark_browser_pending = Some(Box::new(BookmarkBrowserBuild {
+            source,
+            switch_sequence: self.quick_folder_switch_sequence,
+            worker: crate::bookmark_browser::spawn_build(
+                self.settings.thumbnail_source_discovery_snapshot(),
+            ),
+        }));
     }
 
     pub(crate) fn delete_bookmark_browser_rows(
@@ -46995,17 +47103,42 @@ impl App {
     }
 
     fn install_bookmark_view_rows(&mut self) {
+        self.install_bookmark_view_rows_with_sources(self.bookmark_browser_rows.clone(), None);
+    }
+
+    fn install_bookmark_view_rows_with_sources(
+        &mut self,
+        mut rows: Vec<crate::bookmark_browser::BookmarkBrowserRow>,
+        sources: Option<HashMap<String, PathBuf>>,
+    ) {
+        if self.projected_viewer_context_id() != self.viewer_context_main() {
+            return;
+        }
+        let (items, image_metas) = crate::bookmark_browser::sort_and_materialize_rows(
+            &mut rows,
+            self.bookmark_view_sort,
+            &self.settings.grid_display_order,
+        );
+        let Ok(token) = self.prepare_visible_install(&bookmark_view_synthetic_path(), &items, None)
+        else {
+            return;
+        };
         let previous_selected = self.selected;
         let previous_key = previous_selected
             .and_then(|idx| self.bookmark_browser_rows.get(idx))
             .map(crate::bookmark_browser::BookmarkBrowserRow::stable_key);
         let return_grid = self.take_bookmark_restore_grid();
-        // 登録日時順のときはカテゴリ再配置を通さない (§1.142、レーティング一覧と同じ規約)。
-        let (items, image_metas) = crate::bookmark_browser::sort_and_materialize_rows(
-            &mut self.bookmark_browser_rows,
-            self.bookmark_view_sort,
-            &self.settings.grid_display_order,
-        );
+        // Publication starts only after admission succeeds for the owning Bookmark surface.
+        self.bookmark_browser_rows = rows;
+        if let Some(sources) = sources {
+            self.video_thumb_overrides = sources;
+        }
+        // A sort reprojects this same owner. Carry its live build through the item install,
+        // then rebind the native surface lease; another surface's build is never carried.
+        let continuing_build = self
+            .bookmark_browser_pending
+            .take()
+            .filter(|pending| self.bookmark_browser_build_is_current(pending));
         let installed_keys: Vec<_> = self
             .bookmark_browser_rows
             .iter()
@@ -47027,17 +47160,31 @@ impl App {
             })
             .collect();
         let existing_keys = std::collections::HashSet::new();
-        self.start_loading_items(
+        let hydration = self.install_loading_items_inner(
             bookmark_view_synthetic_path(),
             items,
             image_metas,
             existing_keys,
             video_items,
             None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            VisibleInstallAuthority::Ordinary,
+            token,
         );
+        self.hydrate_installed_main_list(hydration);
         self.items_are_bookmark_view = true;
         self.top_level_grid_view
             .replace_surface(top_level_grid_view::TopLevelGridSurface::Bookmarks);
+        if let Some(mut pending) = continuing_build
+            && let Some(source) = self.smart_folder_source_lease()
+        {
+            pending.source = source;
+            self.bookmark_browser_pending = Some(pending);
+        }
         self.address = "ブックマーク".to_string();
         for (idx, image) in self
             .bookmark_browser_rows
@@ -47353,6 +47500,16 @@ impl App {
     }
 
     pub(crate) fn poll_bookmark_browser(&mut self, ctx: &egui::Context) {
+        if self.projected_viewer_context_id() != self.viewer_context_main() {
+            return;
+        }
+        if self
+            .bookmark_browser_pending
+            .as_ref()
+            .is_some_and(|pending| !self.bookmark_browser_build_is_current(pending))
+        {
+            self.retire_bookmark_browser_build_for_current_context();
+        }
         // Delete is a DB writer accepted before the sidecar modal. It must reach its ordinary
         // terminal before the restore transaction starts, while build/open results below retain
         // their exact owners until the modal ends. Keep the normal non-modal ordering (build then
@@ -47381,7 +47538,6 @@ impl App {
                     let mut rows = prepared.rows;
                     let source_map_unchanged =
                         self.video_thumb_overrides == prepared.video_thumb_overrides;
-                    self.video_thumb_overrides = prepared.video_thumb_overrides;
                     rows.retain(|row| {
                         !matches!(&row.item, GridItem::PdfFile(path) if self.settings.epub_file_handling_ignores_path(path))
                     });
@@ -47405,10 +47561,10 @@ impl App {
                             "[bookmark-open] bookmark grid refresh unchanged; keep mounted grid",
                         );
                     } else {
-                        self.bookmark_browser_rows = rows;
-                    }
-                    if self.items_are_bookmark_view && !grid_content_unchanged {
-                        self.install_bookmark_view_rows();
+                        self.install_bookmark_view_rows_with_sources(
+                            rows,
+                            Some(prepared.video_thumb_overrides),
+                        );
                     }
                 }
                 Err(err) => {
@@ -68383,13 +68539,34 @@ impl App {
     /// スレッドを spawn し、結果は `poll_search` で受け取る。連打/新クエリで
     /// 既存検索をキャンセルできるよう `SearchPending.cancel` を立てる。
     pub(crate) fn execute_search(&mut self, ctx: &egui::Context) {
+        let submitted = Arc::new(LocalSearchSubmission {
+            query: self.search_query.clone(),
+            target: self.search_target.clone(),
+            or_mode: self.search_or_mode,
+        });
+        self.execute_submitted_local_search(ctx, submitted);
+    }
+
+    fn submitted_local_search(&self) -> Option<Arc<LocalSearchSubmission>> {
+        self.search_pending
+            .as_ref()
+            .map(|pending| &pending.submitted)
+            .or_else(|| self.search_filter.as_ref().map(|filter| &filter.submitted))
+            .cloned()
+    }
+
+    fn execute_submitted_local_search(
+        &mut self,
+        ctx: &egui::Context,
+        submitted: Arc<LocalSearchSubmission>,
+    ) {
         // 既存の in-flight 検索をキャンセル (新クエリ / 再 Enter)。
         if let Some(pending) = self.search_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
 
         // クエリ構文: space = AND / `-word` = NOT / `"..."` = フレーズ (`-"..."` も可)。
-        let tokens = crate::search_query::parse(&self.search_query);
+        let tokens = crate::search_query::parse(&submitted.query);
         if tokens.is_empty() {
             self.search_filter = None;
             self.search_filter_origin_folder = None;
@@ -68407,7 +68584,7 @@ impl App {
             .tags_db
             .as_ref()
             .map(|db| {
-                crate::global_search_ui::tag_bridge_suggestions_for_query(db, &self.search_query, 3)
+                crate::global_search_ui::tag_bridge_suggestions_for_query(db, &submitted.query, 3)
             })
             .unwrap_or_default();
 
@@ -68434,9 +68611,9 @@ impl App {
         let target = if self.grid_is_zip_entries() {
             crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::Filename])
         } else {
-            self.search_target.clone()
+            submitted.target.clone()
         };
-        let mode: crate::search_query::MatchMode = self.search_or_mode.into();
+        let mode: crate::search_query::MatchMode = submitted.or_mode.into();
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_w = Arc::clone(&cancel);
         let progress = Arc::new(SearchProgressShared::new(ctrl_f_progress_total(
@@ -68446,7 +68623,7 @@ impl App {
         let progress_w = Arc::clone(&progress);
         let (tx, rx) = mpsc::channel();
         // perf 計装上、検索開始を input イベントとして記録する (input_seq は副作用で更新)。
-        self.bump_input_seq("search", Some(&self.search_query.clone()));
+        self.bump_input_seq("search", Some(&submitted.query.clone()));
 
         std::thread::Builder::new()
             .name("metadata-search".to_string())
@@ -68468,6 +68645,7 @@ impl App {
             .ok();
 
         self.search_pending = Some(SearchPending {
+            submitted,
             cancel,
             progress,
             rx,
@@ -68539,7 +68717,10 @@ impl App {
                 for (key, xmp) in xmp_additions {
                     self.xmp_cache.entry(key).or_insert(xmp);
                 }
-                self.search_filter = Some(matches);
+                self.search_filter = Some(LocalSearchFilter {
+                    matches,
+                    submitted: pending.submitted.clone(),
+                });
                 self.search_filter_origin_folder = self.effective_folder();
                 self.rebuild_visible_indices();
                 self.selected = None;

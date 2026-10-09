@@ -4374,7 +4374,7 @@ fn navigation_cache_rebuilds_after_filter_change() {
 
     crate::ui_helpers::reset_still_image_display_indices_build_count_for_test();
     let _ = app.collect_image_indices();
-    app.search_filter = Some(std::collections::HashSet::from([0, 2]));
+    app.search_filter = Some(std::collections::HashSet::from([0, 2]).into());
     app.rebuild_visible_indices();
     assert_eq!(app.collect_image_indices().as_ref(), &[0, 2]);
     assert_eq!(
@@ -12204,7 +12204,7 @@ fn omitted_entries_are_exposed_only_for_the_normal_folder_surface() {
 
     app.top_level_grid_view
         .replace_surface(TopLevelGridSurface::Folder);
-    app.search_filter = Some(std::collections::HashSet::new());
+    app.search_filter = Some(std::collections::HashSet::new().into());
     assert_eq!(app.current_normal_folder_omitted_counts(), None);
     app.search_filter = None;
     app.stack_mode_requested = true;
@@ -17050,7 +17050,7 @@ mod phase_c_key_tests {
         let origin = PathBuf::from("C:/pics/origin");
         app.current_folder = Some(origin.clone());
         app.show_search_bar = true;
-        app.search_filter = Some(std::collections::HashSet::new());
+        app.search_filter = Some(std::collections::HashSet::new().into());
         app.search_filter_origin_folder = Some(origin);
 
         let nav = grid_key_nav(&mut app, egui::Modifiers::NONE, egui::Key::Backspace);
@@ -17070,7 +17070,7 @@ mod phase_c_key_tests {
         let child = origin.join("child");
         app.current_folder = Some(child);
         app.show_search_bar = true;
-        app.search_filter = Some(std::collections::HashSet::new());
+        app.search_filter = Some(std::collections::HashSet::new().into());
         app.search_filter_origin_folder = Some(origin.clone());
 
         let nav = grid_key_nav(&mut app, egui::Modifiers::NONE, egui::Key::Backspace);
@@ -17275,7 +17275,7 @@ mod phase_c_key_tests {
         let origin = PathBuf::from("C:/pics/origin");
         app.current_folder = Some(origin.clone());
         app.show_search_bar = true;
-        app.search_filter = Some(std::collections::HashSet::new());
+        app.search_filter = Some(std::collections::HashSet::new().into());
         app.search_filter_origin_folder = Some(origin);
 
         let nav = app.handle_gamepad_grid_back();
@@ -19867,7 +19867,7 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.current_quick_folder_target(), None);
 
         app.show_search_bar = false;
-        app.search_filter = Some(std::collections::HashSet::new());
+        app.search_filter = Some(std::collections::HashSet::new().into());
         assert_eq!(app.current_quick_folder_target(), None);
     }
 
@@ -31068,10 +31068,14 @@ fn unchanged_bookmark_refresh_keeps_grid_and_tag_cache_mounted() {
         video_thumb_overrides: app.video_thumb_overrides.clone(),
     }))
     .expect("send bookmark rows");
-    app.bookmark_browser_pending = Some(crate::bookmark_browser::BookmarkBrowserPending {
-        cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        rx,
-    });
+    app.bookmark_browser_pending = Some(Box::new(BookmarkBrowserBuild {
+        source: app.smart_folder_source_lease().unwrap(),
+        switch_sequence: app.quick_folder_switch_sequence,
+        worker: crate::bookmark_browser::BookmarkBrowserPending {
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            rx,
+        },
+    }));
     app.poll_bookmark_browser(&egui::Context::default());
 
     assert_eq!(app.items_generation, generation_before);
@@ -59427,10 +59431,14 @@ mod native_video_rating_key_tests {
             video_thumb_overrides: app.video_thumb_overrides.clone(),
         }))
         .unwrap();
-        app.bookmark_browser_pending = Some(crate::bookmark_browser::BookmarkBrowserPending {
-            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            rx,
-        });
+        app.bookmark_browser_pending = Some(Box::new(BookmarkBrowserBuild {
+            source: app.smart_folder_source_lease().unwrap(),
+            switch_sequence: app.quick_folder_switch_sequence,
+            worker: crate::bookmark_browser::BookmarkBrowserPending {
+                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                rx,
+            },
+        }));
         app.poll_bookmark_browser(&egui::Context::default());
         assert_eq!(app.items_generation, generation_before);
         assert_eq!(app.rating_cache.get(&0), Some(&2));
@@ -66522,10 +66530,8 @@ mod still_window_mode_key_tests {
         let c_virtual_idx = push_image(&mut app, c.to_str().unwrap());
         let a_virtual_idx = push_image(&mut app, a.to_str().unwrap());
         app.visible_indices = vec![c_virtual_idx, a_virtual_idx];
-        app.search_filter = Some(std::collections::HashSet::from([
-            c_virtual_idx,
-            a_virtual_idx,
-        ]));
+        app.search_filter =
+            Some(std::collections::HashSet::from([c_virtual_idx, a_virtual_idx]).into());
         app.show_search_bar = true;
         app.items_are_global_search_view = true;
         app.selected = Some(a_virtual_idx);
@@ -66559,7 +66565,9 @@ mod still_window_mode_key_tests {
             "the main virtual c/a order must remain untouched"
         );
         assert_eq!(
-            app.search_filter,
+            app.search_filter
+                .as_ref()
+                .map(|filter| filter.matches.clone()),
             Some(std::collections::HashSet::from([
                 c_virtual_idx,
                 a_virtual_idx
@@ -66730,7 +66738,9 @@ mod still_window_mode_key_tests {
         assert_eq!(app.current_folder, Some(main_surface));
         assert_eq!(app.visible_indices, vec![c_virtual_idx, a_virtual_idx]);
         assert_eq!(
-            app.search_filter,
+            app.search_filter
+                .as_ref()
+                .map(|filter| filter.matches.clone()),
             Some(std::collections::HashSet::from([
                 c_virtual_idx,
                 a_virtual_idx
@@ -67515,7 +67525,7 @@ mod still_window_mode_key_tests {
         app.thumbnails = vec![ThumbnailState::Pending];
         app.image_metas = vec![None];
         app.visible_indices = vec![0];
-        app.search_filter = Some(std::collections::HashSet::from([0]));
+        app.search_filter = Some(std::collections::HashSet::from([0]).into());
         app.show_search_bar = true;
         app.selected = Some(0);
         app.scroll_offset_y = 219.0;
@@ -67539,7 +67549,9 @@ mod still_window_mode_key_tests {
         ));
         assert_eq!(app.visible_indices, vec![0]);
         assert_eq!(
-            app.search_filter,
+            app.search_filter
+                .as_ref()
+                .map(|filter| filter.matches.clone()),
             Some(std::collections::HashSet::from([0]))
         );
         assert!(app.show_search_bar);
@@ -68635,7 +68647,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.thumbnails = vec![ThumbnailState::Pending];
         app.image_metas = vec![None];
         app.visible_indices = vec![0];
-        app.search_filter = Some(std::collections::HashSet::from([0]));
+        app.search_filter = Some(std::collections::HashSet::from([0]).into());
         app.show_search_bar = true;
         app.selected = Some(0);
         app.scroll_offset_y = 246.0;
@@ -68728,7 +68740,9 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             [GridItem::Folder(path)] if path == &child
         ));
         assert_eq!(
-            app.search_filter,
+            app.search_filter
+                .as_ref()
+                .map(|filter| filter.matches.clone()),
             Some(std::collections::HashSet::from([0]))
         );
         assert!(app.show_search_bar);
@@ -69305,7 +69319,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         ];
         app.thumbnails = vec![ThumbnailState::Pending; 2];
         app.visible_indices = vec![0];
-        app.search_filter = Some(std::collections::HashSet::from([0]));
+        app.search_filter = Some(std::collections::HashSet::from([0]).into());
         app.show_search_bar = true;
 
         app.build_active_context_for_test(None, DetachedSource::Image, |context| {
@@ -69316,14 +69330,14 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 GridItem::Image(PathBuf::from(r"C:\detached\b.jpg")),
             ];
             context.thumbnails = vec![ThumbnailState::Pending; 2];
-            context.search_filter = Some(std::collections::HashSet::from([0]));
+            context.search_filter = Some(std::collections::HashSet::from([0]).into());
         });
 
         app.with_active_viewer_context(|mounted| {
             mounted.rebuild_visible_indices();
             assert_eq!(mounted.visible_indices, vec![0, 1]);
             assert_eq!(
-                mounted.search_filter,
+                mounted.search_filter.as_ref().map(|filter| filter.matches.clone()),
                 Some(std::collections::HashSet::from([0])),
                 "the context may retain a stale local-filter snapshot, but physical policy ignores it"
             );
@@ -69332,7 +69346,9 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         assert_eq!(app.visible_indices, vec![0]);
         assert_eq!(
-            app.search_filter,
+            app.search_filter
+                .as_ref()
+                .map(|filter| filter.matches.clone()),
             Some(std::collections::HashSet::from([0]))
         );
         assert!(app.show_search_bar);
@@ -69859,7 +69875,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.scroll_offset_y = 137.5;
         app.show_search_bar = true;
         app.search_query = "tag:keep".to_string();
-        app.search_filter = Some(HashSet::from([1]));
+        app.search_filter = Some(HashSet::from([1]).into());
         app.search_filter_origin_folder = Some(main_folder.clone());
         app.settings.rating_filter = [false, true, false, true, false, true];
         app.folder_history
@@ -75521,7 +75537,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         }];
         app.thumbnails = vec![ThumbnailState::Pending];
         app.image_metas = vec![None];
-        app.search_filter = Some(HashSet::from([0]));
+        app.search_filter = Some(HashSet::from([0]).into());
         app.selected = Some(0);
         app.scroll_offset_y = 184.0;
         app.rating_db
@@ -75548,7 +75564,12 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             vec![item_key.to_string()]
         );
         assert_eq!(app.visible_indices, vec![0]);
-        assert_eq!(app.search_filter, Some(HashSet::from([0])));
+        assert_eq!(
+            app.search_filter
+                .as_ref()
+                .map(|filter| filter.matches.clone()),
+            Some(HashSet::from([0]))
+        );
         assert_eq!(
             app.settings.rating_filter,
             [false, false, false, false, false, true]
@@ -75629,7 +75650,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.thumbnails = vec![ThumbnailState::Pending, ThumbnailState::Pending];
         app.image_metas = vec![None, None];
         app.visible_indices = vec![0, 1];
-        app.search_filter = Some(HashSet::from([0]));
+        app.search_filter = Some(HashSet::from([0]).into());
         app.show_search_bar = true;
         app.selected = Some(0);
         app.scroll_offset_y = 137.0;
@@ -75676,7 +75697,12 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.items.as_slice(),
             [GridItem::PdfFile(_), GridItem::PdfFile(_)]
         ));
-        assert_eq!(app.search_filter, Some(HashSet::from([0])));
+        assert_eq!(
+            app.search_filter
+                .as_ref()
+                .map(|filter| filter.matches.clone()),
+            Some(HashSet::from([0]))
+        );
         assert!(app.show_search_bar);
         assert_eq!(app.selected, Some(0));
         assert_eq!(app.scroll_offset_y, 137.0);
@@ -75698,7 +75724,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.thumbnails = vec![ThumbnailState::Pending, ThumbnailState::Pending];
         app.image_metas = vec![None, None];
         app.visible_indices = vec![0, 1];
-        app.search_filter = Some(HashSet::from([1]));
+        app.search_filter = Some(HashSet::from([1]).into());
         app.show_search_bar = true;
         app.selected = Some(1);
         app.scroll_offset_y = 173.0;
@@ -75747,7 +75773,12 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.items.as_slice(),
             [GridItem::ZipFile(_), GridItem::ZipFile(_)]
         ));
-        assert_eq!(app.search_filter, Some(HashSet::from([1])));
+        assert_eq!(
+            app.search_filter
+                .as_ref()
+                .map(|filter| filter.matches.clone()),
+            Some(HashSet::from([1]))
+        );
         assert!(app.show_search_bar);
         assert_eq!(app.selected, Some(1));
         assert_eq!(app.scroll_offset_y, 173.0);
@@ -95019,7 +95050,7 @@ mod smart_folder_transition_tests {
         app.items_are_subfolder_expansion_view = true;
         app.subfolder_expansion_root = Some(root.clone());
         app.subfolder_expansion_roots = vec![root];
-        app.search_filter = Some(std::collections::HashSet::new());
+        app.search_filter = Some(std::collections::HashSet::new().into());
 
         let error = app
             .smart_folder_current_rule_source()
@@ -103543,3 +103574,6 @@ mod effetune_auto_open_tests;
 
 #[path = "tests/merge_adoption.rs"]
 mod merge_adoption_tests;
+
+#[path = "tests/bookmark_build_adoption.rs"]
+mod bookmark_build_adoption_tests;

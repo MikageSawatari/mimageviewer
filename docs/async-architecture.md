@@ -152,14 +152,34 @@ ReadingHistoryは空のloading shellを準備・token検証し、直接移動と
 source discovery Pendingへ渡す。完了callbackは既存`install_new_items`とidx失効で同じsurfaceを
 hydrateし、正規化sidecar、rows、rating、tags、videoの既存setupを適用する。
 surface generation、context、history、facet、検索入力・optionsと無関係なpending navigationは保持する。
-適用中または待機中のCtrl+Fは、空shellのindices／worker結果を採用し続けず、既存execute_searchで
-新rowsに対して再実行する。未実行の入力だけでは検索を開始しない。
+適用中または待機中のCtrl+Fは、空shellのindices／worker結果を採用し続けず、送信済みspec
+（query / target / OR mode）を新rowsに対して再実行する。specは既存`SearchPending`と完了した
+typed filter payloadが所有し、入力欄のdraftから復元しない。検索入力・optionsを上書きせず、
+未実行の入力だけでは検索を開始しない。追加のownerやpending flagは設けない。
 一覧navigationの完全なinstallerは再実行しない。上の2026-10-08記録にある履歴entriesとsource mapの
 採用は、この採用済みshellへのhydrationを指す。
 
 shellの既存native generation / context / switch sequence証明をhydrationにも保持し、
 遅延・置換済み結果を捨てる。新しいnavigation owner、rollback、pending mapは作らない。
 worker spawn / disconnectのまれな失敗は、採用済みの空shellでlog・通知し、rollbackしない。
+
+### P2追補：非同期一覧結果の公開所有（2026-10-09）
+
+外部レビュー`8037fe3dc`のP2に対し、利用者が了承した根因修正の実装契約を記録する。
+Global SearchのReady結果は、サムネイル、source map、件数、ratingを含むすべての副作用を
+採用が成立したclosure内で適用する。準備結果や拒否された結果から一覧mapへpublishしない。
+
+ブックマーク一覧構築の既存`bookmark_browser_pending`をowned worker wrapperとし、
+main contextの安定したSurface leaseとswitch sequenceを一緒に保持する。
+mainの成功したitems置換とQuick Folder切替で退役し、遅延結果はmap公開前に拒否する。
+表示中のBookmarkを残すA/B記憶クリアでは、旧epochを退役してから同じ既存refreshを
+新epoch／slotで再開始し、loading shellの行取得を完了させる。
+同じBookmark一覧のsortはownerを維持・再束縛し、detached contextのmountでmain要求を取消さない。
+本を開くBookmark resolverのnative request所有とは区別する。
+
+状態削減として、遅い一覧処理のmodal化も検討した。通常の一覧閲覧・移動を待たせる必要はなく、
+既存Pendingと採用closureに要求の証明・送信済みspecを持たせて所有を閉じる。
+新しいnavigation request、rollback、別pending mapを追加せず、既存の非同期操作を維持する。
 
 
 ## 1. ワーカー一覧

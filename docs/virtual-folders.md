@@ -21,6 +21,26 @@ sidecar hydrationへ進み、metadata復元後のfirst-displayを既存continuat
 failed/cancel/staleの未採用移動は表示、履歴、退避状態を変更しない。
 設定項目や保存・読書位置keyは変えず、§1.345のファイル種類除外は実装しない。
 
+## 合成一覧の採用と採用後hydration（§1.339 / §1.347、2026-10-09）
+
+master統合と外部レビュー`8037fe3dc`のP2に対する実装契約。Global SearchのReady結果は、
+一覧採用が成立したclosure内でサムネイル・source map・件数・ratingをまとめて公開する。
+古い結果や採用拒否された準備結果は、表示中の一覧やmapを変更しない。
+
+ReadingHistoryは空のloading shellを共通境界で一回採用し、既存workerのentriesとsidecar出所を
+同じsurfaceへhydrateする。履歴cursor・facet・context・surface generationを再採用しない。
+Ctrl+Fの適用中／待機中spec（query / target / OR mode）は既存`SearchPending`と完了したtyped
+filter payloadで保持し、新rowsへ再実行する。入力欄の未送信draftは使わず、検索入力・optionsと
+無関係なpending navigationを保持する。新owner・pending flagは追加しない。
+
+ブックマーク一覧の構築workerはmain contextのSurface leaseとswitch sequenceを保持する。
+mainの成功したitems置換・Quick Folder切替で退役し、遅延結果をmap公開前に拒否する。
+表示中のBookmarkを残すA/B記憶クリアでは、旧epochを退役してから同じ既存refreshを
+新epoch／slotで再開始し、loading shellの行取得を完了させる。
+同じ一覧のsortはownerを維持・再束縛し、detached mountではmain workerを取消さない。
+遅い一覧のmodal化は不要とし、既存Pendingと採用境界の所有を使って非同期の一覧操作を保つ。
+[統合時の所有契約](async-architecture.md#master統合時の採用境界1339--13472026-10-09)を参照。
+
 ## EPUB → PDF 読み取り境界とオープン導線 (S2b / S2c-1)
 
 S2b は `pdf_loader` の読み取り経路を用意した。S2c-1 では、アドレスバー・起動引数・復元先に指定された

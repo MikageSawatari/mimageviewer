@@ -223,11 +223,21 @@ fn reading_hydration_reexecutes_completed_shell_search() {
     let (mut app, _, _) = reading_shell_with_audio();
     submit_shell_search(&mut app);
     finish_search(&mut app);
-    assert_eq!(app.search_filter, Some(HashSet::new()));
+    assert_eq!(
+        app.search_filter
+            .as_ref()
+            .map(|filter| filter.matches.clone()),
+        Some(HashSet::new())
+    );
     finish_sources(&mut app);
     finish_search(&mut app);
     assert_eq!(app.search_query, "song");
-    assert_eq!(app.search_filter, Some(HashSet::from([0])));
+    assert_eq!(
+        app.search_filter
+            .as_ref()
+            .map(|filter| filter.matches.clone()),
+        Some(HashSet::from([0]))
+    );
     assert_eq!(app.visible_indices, vec![0]);
 }
 
@@ -240,7 +250,103 @@ fn reading_hydration_retires_pending_shell_search_before_new_rows_publish() {
     finish_sources(&mut app);
     finish_search(&mut app);
     assert_eq!(app.search_query, "song");
-    assert_eq!(app.search_filter, Some(HashSet::from([0])));
+    assert_eq!(
+        app.search_filter
+            .as_ref()
+            .map(|filter| filter.matches.clone()),
+        Some(HashSet::from([0]))
+    );
     assert_eq!(app.visible_indices, vec![0]);
     assert!(old_cancel.load(Ordering::Relaxed));
+}
+
+// Exercise the real search-bar Enter gate, then keep its worker/sources unpolled.
+fn submit_reading_search_through_bar(app: &mut App) -> Arc<AtomicBool> {
+    app.show_search_bar = true;
+    app.search_query = " song ".into();
+    app.search_target =
+        crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::Filename]);
+    app.search_focus_request = true;
+    let ctx = egui::Context::default();
+    let _ = ctx.run(egui::RawInput::default(), |ctx| app.render_search_bar(ctx));
+    let _ = ctx.run(
+        egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        },
+        |ctx| app.render_search_bar(ctx),
+    );
+    Arc::clone(
+        &app.search_pending
+            .as_ref()
+            .expect("Enter must submit shell search")
+            .cancel,
+    )
+}
+
+fn reading_hydration_with_unsent_edit(applied: bool, draft: &str) {
+    let (mut app, _, _) = reading_shell_with_audio();
+    let old_cancel = submit_reading_search_through_bar(&mut app);
+    if applied {
+        finish_search(&mut app);
+        assert_eq!(
+            app.search_filter
+                .as_ref()
+                .map(|filter| filter.matches.clone()),
+            Some(HashSet::new())
+        );
+    }
+    app.search_query = draft.into();
+    app.search_target =
+        crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::Exif]);
+    app.search_or_mode = true;
+    finish_sources(&mut app);
+    finish_search(&mut app);
+    assert_eq!(app.search_query, draft, "hydration must preserve the draft");
+    assert_eq!(
+        app.search_target,
+        crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::Exif])
+    );
+    assert!(app.search_or_mode);
+    let submitted = &app.search_filter.as_ref().unwrap().submitted;
+    assert_eq!(submitted.query, " song ");
+    assert_eq!(
+        submitted.target,
+        crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::Filename])
+    );
+    assert!(!submitted.or_mode);
+    assert_eq!(
+        app.search_filter
+            .as_ref()
+            .map(|filter| filter.matches.clone()),
+        Some(HashSet::from([0])),
+        "hydrate the submitted song query, never the draft"
+    );
+    assert_eq!(app.visible_indices, vec![0]);
+    if !applied {
+        assert!(old_cancel.load(Ordering::Relaxed));
+    }
+}
+
+#[test]
+fn reading_hydration_applied_search_preserves_unsent_other_edit() {
+    reading_hydration_with_unsent_edit(true, "other");
+}
+#[test]
+fn reading_hydration_applied_search_preserves_unsent_empty_edit() {
+    reading_hydration_with_unsent_edit(true, "");
+}
+#[test]
+fn reading_hydration_pending_search_preserves_unsent_other_edit() {
+    reading_hydration_with_unsent_edit(false, "other");
+}
+#[test]
+fn reading_hydration_pending_search_preserves_unsent_empty_edit() {
+    reading_hydration_with_unsent_edit(false, "");
 }

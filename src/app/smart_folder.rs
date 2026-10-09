@@ -309,7 +309,7 @@ pub(crate) struct SmartFolderPreparedGrid {
     details_order: Vec<usize>,
     show_search_bar: bool,
     search_query: String,
-    search_filter: Option<HashSet<usize>>,
+    search_filter: Option<super::LocalSearchFilter>,
     search_filter_origin_folder: Option<PathBuf>,
     rating_cache: HashMap<usize, u8>,
     tags_cache: HashMap<String, Vec<String>>,
@@ -10641,7 +10641,7 @@ mod tests {
         };
         app.show_search_bar = true;
         app.search_query = "a".into();
-        app.search_filter = Some(HashSet::from([0]));
+        app.search_filter = Some(HashSet::from([0]).into());
         app.rebuild_visible_indices();
         assert_eq!(app.visible_indices, [0]);
         app.write_user_ratings_shared(&[(keys[1].clone(), 4, None), (keys[2].clone(), 5, None)])
