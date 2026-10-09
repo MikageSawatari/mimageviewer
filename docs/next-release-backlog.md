@@ -32,6 +32,14 @@
 
 ## 1. 優先候補
 
+### 1.360 トレイ常駐中に、キャッシュの無いフォルダのサムネイルを作り直し続け CPU を使う — v4.5.0 の idle health で検出 (2026-10-09)
+- **次の版の決定 (利用者 2026-10-09)**: v4.4.0 から入った退行ではないため、v4.5.0 はこのまま出荷し、次の版で直す。
+- 観測 (利用者が配布ビルドの core で `check-idle-health.ps1 -Scenario tray-residency` を実施、`G:\home\comfyui`): 窓を全部隠した 15 秒間で CPU 1 コア比 0.44、描画 9.5 回/秒、`requested_nonempty` / `texture_backlog_nonempty` が 14.7 秒継続。フォルダのタイル idx 138 / 139 を heavy queue へ各 116 回 enqueue (decode_end は毎回 from_cache=false、保存省略)、他のタイルも idle_upgrade_enqueue 13 回。利用者の見立て: よく開かないフォルダで、サブフォルダ内の画像から作るフォルダサムネイルのキャッシュが無かった。v4.4.0 の同シナリオは別フォルダ (`H:\home\mimageviewer_old\testimage` が多い) で PASS。perf ログの写し: worktree mimageviewer-nextview の `target/trayloop/`。
+- 原因 (Codex 調査、コードの参照・未修正): トレイ格納時の `release_gpu_resources()` が `Loaded → Evicted` にし (`src/tray_integration.rs:450`)、隠れていても通常の再投入が続く (`src/app.rs:50774`)。worker は画像の後に `Finalized` を送るが、UI は 1 フレーム 8 枚までしかテクスチャ化せず残りは `texture_backlog` に残る (`src/app.rs:49567` / `49896`)。`Finalized` の `Evicted` 分岐が backlog に同じ要求の画像があるのを見ずに `requested` を解除し (`src/app.rs:49702`、由来 `ade512de84` 2026-04-21)、次のフレームで再投入される。idle upgrade も同型 (`Loaded` 分岐、`src/app.rs:49703` / `51377`)。隠れているときは 100ms 間隔の処理 (`20fb2db4b`) で排水が遅く、重複画像が積み上がる (backlog 最大 4,812 件)。見えているときも 8 枚の予算を超える再ロード / 高画質化で起こり得る (未確認)。
+- 直し方の案: 表示状態 (Pending / Evicted / Loaded) から要求の完了を推測せず、`ThumbnailRequests` (`src/app.rs:6566`) に「worker の保存処理の終端」と「その要求の画像の採用または破棄」の両方がそろって初めて再投入できる寿命を集約する。取消・keep 外・世代変更・遅着通知・トレイ格納時の backlog 破棄も同じ終端を通す。テスト: 9 枚目を backlog に残すケースを Pending / Evicted / Loaded 高画質化それぞれで (現行は Pending のみ、`src/app/tests.rs:36396`)。
+- あわせて直す: (1) `analyze_perf.py idle-health` が `modifier_probe` の heartbeat (keys 空・focused=false) を入力として数える (`scripts/analyze_perf.py:1957`、`d68ddcf35` 以降)。(2) `docs/idle-health-check.md` と CLAUDE.md の tray-residency 手順を「読み込み中に閉じる」と「読み込み完了後に閉じる」の両方にする (利用者の指摘: 読み込み中に閉じるのは手では合わせにくく、いつも完了後に測っていた)。
+- 規模 / 優先度: Medium / P2 (次の版)。
+
 ### 1.359 EffeTune の新しい版を同梱し、再生中の曲情報（タイトル・アルバム・アーティスト・アートワーク）を Visualizer へ渡す — EffeTune 作者の対応 (2026-10-09)
 - **次の版の決定 (利用者 2026-10-09)**: v4.5.0 には入れず、次の版で進める。
 - 経緯: 利用者が EffeTune 作者 (Frieve-A 氏) へ要望した 2 点 (プラグイン版の起動時表示に Visualizer を選べること、ホストからの曲情報の受け渡し) について、作者から「間もなくリリースする最新版で対応した」と返信があった (2026-10-09、利用者経由)。2026-10-09 時点の GitHub Releases の最新は v0.12.0 (2026-10-02) で、対応版はまだ公開されていない。
