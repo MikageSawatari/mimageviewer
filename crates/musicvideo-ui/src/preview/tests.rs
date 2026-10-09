@@ -97,7 +97,7 @@ fn render(state: &mut EditorState, project: &Project, ready: bool) -> egui::Full
                 .map(|lifetime| (layer.id, lifetime))
         })
         .collect();
-    let context = egui::Context::default();
+    let context = crate::test_context();
     let texture = context.load_texture(
         "test",
         egui::ColorImage::filled([160, 90], Color32::BLACK),

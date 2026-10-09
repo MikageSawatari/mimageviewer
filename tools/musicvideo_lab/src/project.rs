@@ -53,6 +53,7 @@ pub fn create_assets(font: Option<&FontData>) -> Result<Arc<Assets>, String> {
 }
 
 pub fn setup_egui(ctx: &egui::Context, font: Option<&FontData>) {
+    musicvideo_ui::install_input_policy(ctx);
     if let Some(font) = font {
         let mut fonts = egui::FontDefinitions::default();
         fonts.font_data.insert(
@@ -69,6 +70,82 @@ pub fn setup_egui(ctx: &egui::Context, font: Option<&FontData>) {
         ctx.set_fonts(fonts);
     }
     ctx.set_visuals(egui::Visuals::dark());
+}
+
+#[cfg(test)]
+pub fn test_context() -> egui::Context {
+    let context = egui::Context::default();
+    setup_egui(&context, None);
+    context
+}
+
+#[cfg(test)]
+mod input_policy_tests {
+    use super::*;
+
+    #[test]
+    fn setup_registers_tab_and_ime_before_first_pass_and_preserves_composition_on_reregistration() {
+        let context = egui::Context::default();
+        setup_egui(&context, None);
+        let first_id = egui::Id::new("host-input-first");
+        let second_id = egui::Id::new("host-input-second");
+        let mut first = "original".to_owned();
+        let mut second = String::new();
+        let mut frame = |events: Vec<egui::Event>, request_focus: bool| {
+            let _ = context.run(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let response = ui.add(egui::TextEdit::singleline(&mut first).id(first_id));
+                        ui.add(egui::TextEdit::singleline(&mut second).id(second_id));
+                        if request_focus {
+                            response.request_focus();
+                        }
+                    });
+                },
+            );
+            assert_eq!(context.memory(|memory| memory.focused()), Some(first_id));
+        };
+        frame(vec![], true);
+        for modifiers in [egui::Modifiers::NONE, egui::Modifiers::SHIFT] {
+            frame(
+                vec![egui::Event::Key {
+                    key: egui::Key::Tab,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }],
+                false,
+            );
+        }
+        frame(
+            vec![
+                egui::Event::Ime(egui::ImeEvent::Enabled),
+                egui::Event::Ime(egui::ImeEvent::Preedit("unconfirmed".into())),
+            ],
+            false,
+        );
+        setup_egui(&context, None);
+        frame(
+            vec![
+                egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::Ime(egui::ImeEvent::Disabled),
+            ],
+            false,
+        );
+        assert_eq!(first, "original");
+        assert!(second.is_empty());
+    }
 }
 
 pub fn synthetic_background(width: u32, height: u32) -> ImageAsset {

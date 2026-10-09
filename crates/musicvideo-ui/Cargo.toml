@@ -10,4 +10,5 @@ path = "src/lib.rs"
 
 [dependencies]
 egui = "0.33"
+egui-ime = { path = "../egui-ime" }
 musicvideo-core = { path = "../musicvideo-core" }

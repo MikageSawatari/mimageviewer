@@ -3,6 +3,10 @@
 //! Install the input policy before the first pass of each Context. Hosts retain
 //! their own shortcut ownership, diagnostics and application-wide focus policy.
 
+mod tab_focus;
+
+pub use tab_focus::{cancel_tab_focus_traversal, install_tab_shortcut_focus_policy};
+
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 

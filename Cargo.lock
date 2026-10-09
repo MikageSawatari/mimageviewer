@@ -4323,6 +4323,7 @@ name = "musicvideo-ui"
 version = "0.1.0"
 dependencies = [
  "egui",
+ "egui-ime",
  "musicvideo-core",
 ]
 

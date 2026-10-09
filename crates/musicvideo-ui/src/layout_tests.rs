@@ -22,7 +22,7 @@ impl Harness {
         let mut state = EditorState::default();
         state.reset_for_project(&project);
         let mut harness = Self {
-            context: egui::Context::default(),
+            context: crate::test_context(),
             timeline_entry: project.clone(),
             properties_entry: project.clone(),
             project,

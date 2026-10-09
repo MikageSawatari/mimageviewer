@@ -2,6 +2,21 @@
 //!
 //! ウィンドウ、ファイル I/O、音声再生、書き出しは呼び出し側が所有する。
 
+/// Install the shared IME repair and globally disabled Tab traversal before the first pass.
+///
+/// Registration is idempotent. Shortcut ownership and native text Undo remain with the host/widgets.
+pub fn install_input_policy(context: &egui::Context) {
+    egui_ime::install_ime_input_policy(context);
+    egui_ime::install_tab_shortcut_focus_policy(context);
+}
+
+#[cfg(test)]
+fn test_context() -> egui::Context {
+    let context = egui::Context::default();
+    install_input_policy(&context);
+    context
+}
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -14,6 +29,10 @@ mod preview;
 mod resources;
 mod timeline;
 
+#[cfg(test)]
+mod ime_tests;
+#[cfg(test)]
+mod input_source_tests;
 #[cfg(test)]
 mod layout_tests;
 
@@ -1182,12 +1201,14 @@ fn apply_history_shortcut(
     project: &mut Project,
     state: &mut EditorState,
 ) -> bool {
-    let text_input_focused = context.wants_keyboard_input();
+    let text_input_owned = context.wants_keyboard_input()
+        || egui_ime::ime_input_active(context)
+        || egui_ime::recovering_text_input(context).is_some();
     let requested = context.input(|input| {
         input
             .events
             .iter()
-            .find_map(|event| history_action_for_event(event, text_input_focused))
+            .find_map(|event| history_action_for_event(event, text_input_owned))
     });
     let Some(action) = requested else {
         return false;
@@ -1324,7 +1345,7 @@ fn edit_layer_properties(
     modulators: &[musicvideo_core::Modulator],
     modulator_values: &[ModulatorValue],
 ) -> LayerEditResult {
-    let mut changed = ui.text_edit_singleline(&mut layer.name).changed();
+    let mut changed = egui_ime::add_singleline(ui, &mut layer.name, None, |edit| edit).changed();
     let mut commands = Vec::new();
     let mut import_lrc_requested = None;
     let mut export_lrc_requested = None;
@@ -1503,7 +1524,7 @@ fn edit_time_text(ui: &mut egui::Ui, text: &mut TimeTextLayer) -> bool {
 }
 
 fn edit_text(ui: &mut egui::Ui, text: &mut TextLayer) -> bool {
-    let mut changed = ui.text_edit_singleline(&mut text.text).changed();
+    let mut changed = egui_ime::add_singleline(ui, &mut text.text, None, |edit| edit).changed();
     changed |= edit_text_layout(ui, &mut text.size_px, &mut text.align);
     changed
 }
@@ -2370,7 +2391,7 @@ mod tests {
         let mut state = EditorState::default();
         state.reset_for_project(&project);
         state.select_layer_id(&project, layer_id);
-        let context = egui::Context::default();
+        let context = test_context();
         run_editor_frame(&context, &mut project, &mut state, 0.0, Vec::new());
         let text_id = state.lyrics_editors[&layer_id].widget_id(layer_id);
         set_text_cursor(&context, text_id, CCursorRange::one(CCursor::new(0)));
@@ -2400,7 +2421,7 @@ mod tests {
         let mut state = EditorState::default();
         state.reset_for_project(&project);
         state.select_layer_id(&project, layer_id);
-        let context = egui::Context::default();
+        let context = test_context();
         run_editor_frame(&context, &mut project, &mut state, 0.0, Vec::new());
         let text_id = state.lyrics_editors[&layer_id].widget_id(layer_id);
         let selection = CCursorRange::two(CCursor::new(0), CCursor::new(3));
@@ -2453,7 +2474,7 @@ mod tests {
         let mut state = EditorState::default();
         state.reset_for_project(&project);
         state.select_layer_id(&project, layer_id);
-        let context = egui::Context::default();
+        let context = test_context();
         run_editor_frame(&context, &mut project, &mut state, 0.0, Vec::new());
         let text_id = state.lyrics_editors[&layer_id].widget_id(layer_id);
         let initial_char_count = state.lyrics_editors[&layer_id].as_str().chars().count();
@@ -2531,7 +2552,7 @@ mod tests {
         let mut state = EditorState::default();
         state.reset_for_project(&project);
         state.select_layer_id(&project, layer_id);
-        let context = egui::Context::default();
+        let context = test_context();
         run_editor_frame(&context, &mut project, &mut state, 0.0, Vec::new());
         let text_id = state.lyrics_editors[&layer_id].widget_id(layer_id);
         let selection = CCursorRange::two(CCursor::new(1), CCursor::new(2));
@@ -2608,7 +2629,7 @@ mod tests {
         let mut state = EditorState::default();
         state.reset_for_project(&project);
         state.select_layer_id(&project, layer_id);
-        let context = egui::Context::default();
+        let context = test_context();
         run_editor_frame(&context, &mut project, &mut state, 0.0, Vec::new());
         let text_id = state.lyrics_editors[&layer_id].widget_id(layer_id);
         set_text_cursor(
@@ -2671,7 +2692,7 @@ mod tests {
         state.reset_for_project(&project);
         state.select_layer_id(&project, layer_id);
         let original_identity = state.lyrics_editors[&layer_id].identity_snapshot();
-        let context = egui::Context::default();
+        let context = test_context();
         run_editor_frame(&context, &mut project, &mut state, 0.0, Vec::new());
         let text_id = state.lyrics_editors[&layer_id].widget_id(layer_id);
         set_text_cursor(&context, text_id, CCursorRange::one(CCursor::new(0)));
@@ -2723,7 +2744,7 @@ mod tests {
         let mut state = EditorState::default();
         state.reset_for_project(&project);
         state.select_layer_id(&project, layer_id);
-        let context = egui::Context::default();
+        let context = test_context();
         run_editor_frame(&context, &mut project, &mut state, 0.0, Vec::new());
         let text_id = state.lyrics_editors[&layer_id].widget_id(layer_id);
         let selection = CCursorRange::two(CCursor::new(1), CCursor::new(2));
@@ -2774,7 +2795,7 @@ mod tests {
         project.layers.push(second);
         let mut state = EditorState::default();
         state.reset_for_project(&project);
-        let context = egui::Context::default();
+        let context = test_context();
 
         state.select_layer_id(&project, first_id);
         run_editor_frame(&context, &mut project, &mut state, 0.0, Vec::new());
@@ -3510,7 +3531,7 @@ mod tests {
             project.display_gain_db = 6.0;
         });
         let edited = project.clone();
-        let context = egui::Context::default();
+        let context = test_context();
         let text_id = egui::Id::new("undo-owned-by-text-edit");
         let mut text = "入力中".to_owned();
         let _ = context.run(Default::default(), |context| {

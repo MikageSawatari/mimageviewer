@@ -20,7 +20,7 @@ impl Harness {
     fn unstarted(width: f32) -> Self {
         Self {
             app: MusicVideoLabApp::new(Arc::new(Assets::default())),
-            ctx: egui::Context::default(),
+            ctx: crate::project::test_context(),
             output: Default::default(),
             width,
         }
@@ -607,7 +607,7 @@ fn l3_chrome_heights_are_invariant_across_all_host_states_and_widths() {
 
 #[test]
 fn l3_play_pause_button_and_seek_digits_do_not_change_toolbar_geometry() {
-    let ctx = egui::Context::default();
+    let ctx = crate::project::test_context();
     let font = crate::project::load_default_font();
     crate::project::setup_egui(&ctx, font.as_ref());
     let app = MusicVideoLabApp::new(Arc::new(Assets::default()));

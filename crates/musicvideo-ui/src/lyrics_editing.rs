@@ -1779,7 +1779,7 @@ mod tests {
     fn reachable_native_history_garbage_collects_eviction_uncertainty() {
         let original = vec![line("initial", Some(1.0))];
         let mut buffer = LyricsTextBuffer::new(&original, 1);
-        let context = Context::default();
+        let context = crate::test_context();
         let id = buffer.widget_id(LayerId(1));
         let cursor = CCursorRange::one(CCursor::new(original[0].text.chars().count()));
         let mut text_state = TextEditState::default();
@@ -1869,7 +1869,7 @@ mod tests {
     fn native_checkpoint_survives_many_unsaved_intermediate_input_passes() {
         let original = vec![line("保存点", Some(1.0))];
         let mut buffer = LyricsTextBuffer::new(&original, 1);
-        let context = Context::default();
+        let context = crate::test_context();
         let id = buffer.widget_id(LayerId(1));
         let cursor = CCursorRange::one(CCursor::new(original[0].text.chars().count()));
         let mut state = TextEditState::default();
@@ -2059,7 +2059,7 @@ mod tests {
 
     #[test]
     fn cancelling_pending_native_restore_can_restore_cursor_and_undoer() {
-        let context = Context::default();
+        let context = crate::test_context();
         let id = Id::new("lyrics-native-rollback");
         let mut native_state = TextEditState::default();
         let old_cursor = CCursorRange::one(CCursor::new(1));

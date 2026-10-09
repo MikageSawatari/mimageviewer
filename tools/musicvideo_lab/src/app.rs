@@ -2537,7 +2537,7 @@ mod tests {
             Animatable, Interp, Keyframe, ModulationBinding, ModulationCurve, ModulationTarget,
             ModulatorId, NormRect, Track,
         };
-        let ctx = egui::Context::default();
+        let ctx = crate::project::test_context();
         let mut app = MusicVideoLabApp::new(Arc::new(Assets::default()));
         app.project.layers[0].name = "displayed-box".into();
         app.project.layers[0].rect = Animatable::Track(
@@ -2628,7 +2628,7 @@ mod tests {
 
     #[test]
     fn selection_stale_preview_keeps_all_displayed_inputs_and_clear_removes_them() {
-        let ctx = egui::Context::default();
+        let ctx = crate::project::test_context();
         let mut app = MusicVideoLabApp::new(Arc::new(Assets::default()));
         app.editor_state.reset_for_project(&app.project);
         let first_revision = app.preview_revision;
@@ -2698,7 +2698,7 @@ mod tests {
 
     #[test]
     fn selection_worker_result_carries_its_captured_time_and_project() {
-        let ctx = egui::Context::default();
+        let ctx = crate::project::test_context();
         let mut app = MusicVideoLabApp::new(Arc::new(Assets::default()));
         app.project.output.width = 32;
         app.project.output.height = 18;
@@ -2810,7 +2810,7 @@ mod tests {
     }
 
     fn selection_check_reused_layer_id(undo_add: bool) {
-        let ctx = egui::Context::default();
+        let ctx = crate::project::test_context();
         let mut app = MusicVideoLabApp::new(Arc::new(Assets::default()));
         app.project.output.width = 32;
         app.project.output.height = 18;
@@ -2979,7 +2979,7 @@ mod tests {
         app.document
             .replace_with_loaded(PathBuf::from("b.mivmv.json"), &app.project);
         tx.send(Ok(())).unwrap();
-        app.poll_projects(&egui::Context::default());
+        app.poll_projects(&crate::project::test_context());
 
         assert_eq!(
             app.document.path(),
@@ -3001,7 +3001,7 @@ mod tests {
         app.document.note_edit();
 
         tx.send(Ok(())).unwrap();
-        app.poll_projects(&egui::Context::default());
+        app.poll_projects(&crate::project::test_context());
 
         assert_eq!(
             app.document.path(),
@@ -3183,7 +3183,7 @@ mod tests {
         preset: &str,
         added_count: usize,
     ) {
-        let ctx = egui::Context::default();
+        let ctx = crate::project::test_context();
         let mut app = MusicVideoLabApp::new(Arc::new(Assets::default()));
         app.project.output.width = 32;
         app.project.output.height = 18;
@@ -3300,7 +3300,7 @@ mod tests {
     #[test]
     fn editor_panels_keep_timeline_full_width_and_inspector_tabs_separate() {
         let mut app = MusicVideoLabApp::new(Arc::new(Assets::default()));
-        let context = egui::Context::default();
+        let context = crate::project::test_context();
         for tab in [
             InspectorTab::Layer,
             InspectorTab::Modulators,
@@ -3347,7 +3347,7 @@ mod tests {
             rx,
             queued: None,
         });
-        let context = egui::Context::default();
+        let context = crate::project::test_context();
         app.editor_state.set_inspector_tab(InspectorTab::Project);
         let pos = rendered_editor_text(&mut app, &context, "表示ゲイン", false);
         editor_input(&mut app, &context, pointer_input(pos, true));
@@ -3390,7 +3390,7 @@ mod tests {
         tx.send(Ok(loaded_project("loaded.mivmv.json", 18.0)))
             .unwrap();
 
-        app.poll_projects(&egui::Context::default());
+        app.poll_projects(&crate::project::test_context());
 
         assert_eq!(app.project.duration_secs, 18.0);
         assert!(matches!(app.project_load, ProjectLoadState::Idle));
@@ -3504,7 +3504,7 @@ mod tests {
         tx.send(Ok((PathBuf::from("late.png"), replacement, lease)))
             .unwrap();
 
-        app.poll_loads(&egui::Context::default());
+        app.poll_loads(&crate::project::test_context());
 
         assert_eq!(app.project.images[0].path, PathBuf::from("new-owner.png"));
         assert_eq!(app.assets.image(&image_id).unwrap().rgba[0], 1);
@@ -3551,7 +3551,7 @@ mod tests {
 
     #[test]
     fn disconnected_restore_worker_is_replaced_before_retry() {
-        let context = egui::Context::default();
+        let context = crate::project::test_context();
         let mut app = MusicVideoLabApp::new(Arc::new(Assets::default()));
         let manifest = ResourceManifest::default();
         app.runtime_resources = RuntimeResourceState::Restoring {
@@ -3635,7 +3635,7 @@ mod tests {
 
     #[test]
     fn restore_failure_detaches_old_pixels_and_keeps_logical_history_retryable() {
-        let context = egui::Context::default();
+        let context = crate::project::test_context();
         let mut app = MusicVideoLabApp::new(Arc::new(Assets::default()));
         let id = ImageId::new("broken-history");
         app.project.images.push(ImageRef {
@@ -3697,7 +3697,7 @@ mod tests {
 
     #[test]
     fn imports_during_restore_request_a_complete_latest_bundle() {
-        let context = egui::Context::default();
+        let context = crate::project::test_context();
         let mut image_app = MusicVideoLabApp::new(Arc::new(Assets::default()));
         let image_id = ImageId::new("image");
         image_app.project.images.push(ImageRef {
@@ -3810,7 +3810,7 @@ mod tests {
 
     #[test]
     fn lrc_completion_after_same_frame_input_waits_for_a_choice() {
-        let context = egui::Context::default();
+        let context = crate::project::test_context();
         let mut app = MusicVideoLabApp::new(Arc::new(Assets::default()));
         let mut layer = musicvideo_core::new_lyrics_layer(&app.project);
         let layer_id = layer.id;

@@ -502,7 +502,7 @@ workspace root の `[patch.crates-io]` は既に
 | `TextInputDiagnosticKeyPolicy`（同:141） | 共有の中立 metadata | sensitive helper の focus 契約に Standard / Sensitive を記録するため必要。キー収集・マスク・ログは共有しない |
 | `begin_pass_diagnostics`、`TextInputKeyDiagnostic`、`observe_helper_widget`、整形・異常判定・文字マスク・ログ予算（同:165〜609） | 本体 | 本体の診断責務。keyboard owner の型、通常 1 MiB / 異常継続、Sensitive の全 redaction、次 pass の finalize と repaint を維持 |
 | `record_keyboard_owner` / `record_side_panel_close`（同:570、589） | 本体 | App の所有決定とパネル寿命を診断へ記録する。本体固有の型・call site を共有しない |
-| `src/egui_focus_policy.rs` の全域 Tab policy | 本体 | mIV は非 IME 時も全域で Tab traversal を無効化し、キー event は keymap に残す。IME helper の field-level lock とは別の製品仕様。エディタへ全域無効化を輸入しない |
+| `src/egui_focus_policy.rs` の全域 Tab policy | 段 2b の利用者判断により共有へ移設、本体は facade | mIV は非 IME 時も全域で Tab traversal を無効化し、キー event は keymap に残す。IME helper の field-level lock とは別の製品仕様。同じ実装を本体とエディタのホストが登録する（冒頭の決定が旧案に優先） |
 | App の `update_ime_state` と各 viewport 入口、native presenter の登録・pending event 経路 | 本体の既存位置 | 所有 viewport の pass で更新し、他 viewport は read だけという境界を維持。入力配送や detached 述語を変更しない |
 
 plugin type は共有側の 1 種だけにする。既存の debug name、temp ID の文字列と
@@ -701,8 +701,9 @@ native Undo 後に本文 / 行 identity / 時刻が保たれることを確認�
   共有 production code は約 450〜550 行、移設 test は約 750〜900 行、本体への新規 adapter test は
   約 100〜200 行。おおむね 6〜8 ファイル＋必要な依存 lock 差分。実装・自動検証で **1〜2 日**。
   独立 completion review と本体の挙動不変の証拠を確定してから 2b へ進む。
-- **段 2b: エディタ適用**。5 欄の helper 置換、登録入口とホストへの接続、エディタ専用
-  Tab / Enter policy、Undo gate、raw 禁止検査、歌詞 / handler 回帰を作る。
+- **段 2b: エディタ適用**。5 欄の helper 置換、登録入口とホストへの接続、全域 Tab policy の
+  共有化、Undo gate、raw 禁止検査、歌詞 / handler 回帰を作る。冒頭の利用者判断により
+  エディタ専用 Tab / Enter policy は作らない。
   `musicvideo-ui` の lib / modulators / input policy / tests / manifest、ラボの setup / test の
   おおむね 7〜10 ファイル。production 追加・置換は約 80〜150 行、test は約 250〜450 行。
   実装・自動検証で **1〜2 日**。歌詞の buffer / widget lifetime を変える工数は含めない。
@@ -775,6 +776,92 @@ Tab / Enter policy・Undo gate・禁止検査は段 2b まで行わない。
 ひらがな入力、候補 Tab / Shift+Tab、Enter 確定、Esc 取消、直後の通常入力、focus 移動、Ctrl+Z/Y を
 利用者が確認する。detached の切替・閉じる / 再表示でも sibling の入力状態を保つことを確認する。
 段 2b は未着手であり、I1 全体を完了扱いにしない。
+
+**8. 段 2b の実装・検証記録（2026-10-09、未コミット）**
+
+段 2a はその後 `367f9c9d3` としてコミットされ、独立実装レビュー ACCEPT（指摘なし）。
+段 2b の Tab / Enter 方針は `49d994df3`。その後、下記のモジュレータ見出し ID 固定についても
+利用者が同時修正を承認した。**段 2b の実装・自動検証は完了**。未コミット、実機未確認であり、
+利用者による実機確認と最終受け入れは別途行う。
+
+全域 Tab policy の production 処理を `egui-ime::tab_focus` へ移した。本体は再公開の facade とし、
+登録順序・callback / temp ID・event 非消費・既存 5 テストを維持した。関数本体は公開範囲と
+末尾空白を除いて移設前と一致。`musicvideo-ui::install_input_policy` で IME plugin と Tab policy を
+冪等登録し、ラボの `setup_egui` と headless Context の生成入口に接続した。
+single-line 5 欄を共有 helper に置換し、auto ID の割当方法、既存 Ui scope、幅、`.changed()` を維持。
+歌詞の raw multiline / `LyricsTextBuffer` / widget ID / native Undo と Hz DragValue は維持した。
+Project Undo gate に IME activity / 300ms grace / recovering owner を加え、gate で event を消費しない。
+UI の通常依存に `egui-ime` を追加し、raw TextEdit を理由・anchor・件数付き allowlist で検査する。
+allowlist は歌詞 multiline 1 箇所と既存 native Undo テスト fixture 2 箇所だけで、test module 全域の
+免除は設けない。architecture overview も共有境界に合わせた。
+
+**実装中に確認した前提の矛盾**: モジュレータ行は既存の `push_id(modulator.id.0)` 内でも
+`CollapsingHeader::new(modulator.name.clone())` の既定 ID が表示名に依存する。
+preedit で名前が変わると、次の pass で見出し・子 Ui・auto text widget の ID が変わり、
+focused ID が `Some(87CC)` から `None` になる。実際のエディタを描画する handler テストで再現した。
+helper 置換だけでは「変換中の取消でフォーカスを維持」の条件を満たせない。
+修正候補は内側の見出しへ `.id_salt(modulator.id.0)` を 1 行追加すること。
+既存 ModulatorId を使い、Ui scope と auto ID 採番数は増やさないが、見出し配下の widget ID 値は変わる。
+初回は適合判断を問い合わせて停止した。利用者判断（2026-10-09）で同時修正を承認:
+「auto ID を変えない」は入力欄の状態・native Undo・選択の対応を壊さないための条件であり、
+この修正による UI 状態 ID の一度の変更は保存データ / Project 履歴に入らず、条件の趣旨に反しない。
+承認どおり `.id_salt(modulator.id.0)` を追加し、初回の handler 3 件の失敗は解消した。
+
+同型箇所を musicvideo-ui 全域で確認した。モジュレータ内側の見出し以外は該当なし。
+外側「モジュレータ」/「変調の割り当て」は固定文字列、animatable property の見出しは
+既に固定の (layer ID, property) salt を持つ。レイヤー名は layer-list の selectable label、timeline の
+painter text / label、削除確認の表示だけで、入力欄を含む子 Ui の ID を名前から生成しない。
+ComboBox の selected text は名前を表示するが ID は固定 salt を使う。scope / ScrollArea / lyrics
+widget も既存の固定 ID を使う。追加回帰はレイヤー名とモジュレータ名の両方を実際に描画し、
+通常入力を 1 文字ずつ、preedit を複数 pass、Commit / Disabled と idle pass を通して、
+focus / helper contract / native TextEditState が同一 widget に残ることを確認する。
+
+独立実装レビュー（GPT-6.1 Sol / xhigh）は **ACCEPT、P1 / P2 / P3 の要修正指摘なし**。
+Tab 処理と既存 5 テストの移設前後照合、5 欄の採番 / scope、Undo 所有、類似 ID 箇所、
+歌詞 production 処理の一致、全 GUI / benchmark / headless 登録入口、厳密な raw allowlist、
+追加 13 テストと 6 変異の runtime ログが確認された。レビュー担当は read-only とし、
+検証担当の成功結果を再利用した。全体 gate / release build は実装担当が完了を確認する。
+
+追加は UI の handler 11 件、raw 禁止 1 件、ラボの setup 登録 handler 1 件（計 13 件）。
+handler は 5 欄と歌詞の Esc 取消、Tab / Shift+Tab / 押し続けによる repeat、Commit / Enter の配送順、
+single-line recovery、IME 中 / grace 中 / recovery-only の Ctrl+Z/Y と event 非消費、歌詞の cue / ID /
+native Undo を検査する。歌詞は raw multiline の既存 Enter 処理を維持し、合成入力では
+Commit + Enter が同じ pass に届く場合も別 pass の場合も改行が入ることを観測した。
+本文の Commit は 1 回だけ適用される。新しい Enter filter は加えず、実機の配送は未確認。
+
+検証ログ・command / exit code は `target/i1-2b/*.log` / `*.json` に保存した。
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo test -p egui-ime` | 17 passed、0 failed、doc-test 0 件 |
+| `cargo test -p musicvideo-ui` | **117 passed / 0 failed**（既存 105＋handler 11＋raw 禁止 1）。初回 113 / 3 の失敗は全件解消 |
+| `cargo test -p musicvideo_lab` | 75 passed（既存 74＋setup 登録 1）、0 failed |
+| `cargo test -p musicvideo-core` | 80 passed、0 failed、doc-test 0 件 |
+| `cargo test -p mimageviewer --lib egui_focus_policy` | 既存 5 passed、0 failed |
+| `cargo test -p mimageviewer --lib ime_focus` | 12 passed、0 failed |
+| `cargo test -p mimageviewer --lib ime` | 380 passed / 既存 ignored 2 / 0 failed（子プロセスの再掲 2 件を重複加算しない） |
+| `cargo test --test ui_snapshot` | 123 passed、0 failed。baseline 更新なし |
+| `cargo fmt --all -- --check` / `python scripts/check_ui_glyphs.py` | exit 0 / 危険 glyph 0 |
+| `cargo tree -p musicvideo-ui` | exit 0。eframe / cpal / ffmpeg / mimageviewer なし |
+| `cargo tree -p egui-ime` / `cargo tree -d` | exit 0。egui は vendored 0.33.3 の 1 系統 |
+| `.\scripts\test-full.ps1 -SuppressCrashDialogs` | **PASS、exit 0**（1,317.39 秒）。workspace 12,640 passed / 58 ignored、vendor egui 25・egui-wgpu 11・eframe 18 passed。合計 **12,694 passed / 0 failed / 58 ignored** |
+| `cargo build --release -p musicvideo_lab` | **成功、exit 0**（34.42 秒）。成果物 `target/release/musicvideo_lab.exe` |
+
+変異検証は 6 件とも、コンパイルエラーではなく実行された対応テストの失敗で検出した:
+UI の IME plugin 登録削除、共有 Tab cancellation 削除、IME / grace Undo gate 削除、
+recovery Undo gate 削除、ラボの setup 登録削除、今回追加のモジュレータ見出し salt 削除。
+各変異後に元のソース bytes を復元。salt 削除では名前の連続入力テストが ModulatorName の
+focus 喪失を検出する。復元後の通常コードを全体 gate で再検証した。詳細は `target/i1-2b/mutations.json`。
+L1〜L3 の既存テストは維持・通過。コミット・アプリ起動・`build-dev.ps1` は実行せず、
+`target/dev-runtime` の確認用 exe は更新していない。無関係な `out.mp4` も変更していない。
+
+全体 gate の件数は各 target の最終 summary を集計し、子プロセスの再掲 2 件を重複加算していない。
+本体 lib は 11,188 passed / 52 ignored、既存の ignored は維持した。crash-dialog 抑止の error mode は
+終了時に元の `0x00008001` へ復元された。段 2a の確認用 exe 3 本はサイズ・更新時刻が作業前と一致。
+ラボの実機確認では、レイヤー名・モジュレータ名を 1 文字ずつ変更し、preedit 中と確定後の
+focus、Esc 取消、Tab / Shift+Tab、Enter 確定、native Undo を確認する。歌詞の cue・改行・Undo と
+Project 履歴の所有も確認する。起動するのは利用者だけとし、コマンドは
+`Start-Process -FilePath .\target\release\musicvideo_lab.exe`。
 
 受け入れるコスト: 配布物の PE が 1 本増える（launcher 内包・署名・portable 同梱・全 PE / VC runtime
 gate・runtime 清掃）。閲覧中の音楽ビューと同時に再生すると両方鳴る（WASAPI shared で混ざるだけで
@@ -1104,7 +1191,7 @@ frame n → t = n/fps → evaluate → rasterize(CPU, rayon) → RGBA→NV12/YUV
 | **L2** 実装済み・追加P2修正の再検収待ち | 選択レイヤーの枠（D14 末尾）: 選んだレイヤーの矩形をプレビュー上に表示。画面外・非表示も示す | 初版 `838f8503e`（計232件）。ID再利用・stale textureのP2/P3修正 `42a74db10` は独立再レビューで解消確認（計234件）。**通常UI追加のlifetime登録遅延P2を修正・自動検証済み**（2026-10-09、未コミット差分）: `EditorFrame::finish` で対象lifetimeを同期し、同フレームの要求へ全LayerIdを捕捉。実UIから単色/2レイヤー追加→停止中の最初の完成フレームの枠・名前を検査。新規3件は同期を外す変異で全件失敗、復元後core 80 / UI 104 / lab 53、計237件成功。Undo単位・歌詞native Undo・L1 API・RGBAハッシュ維持。全要求経路の確認、releaseビルド等は下記L2追加修正記録 |
 | **L3** 実装済み・追加P3修正の再検収待ち | 状態で動かない上部とステータス（D14 末尾）: ツールバー 1 段・固定 1 行のステータスバー・読込衝突はモーダル・未解決素材と診断は別ウィンドウ・素材パスはプロジェクトタブ | 初版 `e958226a9`（254件）。キャンセル領域/未保存の印/タイトル送信の3件を修正した `a5c05ef65`（258件）は独立再レビューで条件付きACCEPT。**追加P3「詳細メニューのID変化」を修正・自動検証済み**（2026-10-09、未コミット差分）: ステータスの子UI4領域を用途ごとの固定IDにする。新規lab 1件、500/1400pt×書出/画像読込/保存完了の7組合せ、計14ケースでメニュー維持とメニュー内の未解決素材操作を実描画/実クリックで検査。修正前と詳細IDだけを戻す変異で失敗確認。復元後 core 80 / UI 105 / lab 74、計259件成功。禁止依存なし、fmt/glyph成功、releaseラボ再build成功（30.53秒）。L1/L2・H1/H2・非同期採否順序は維持。根拠・ログは下記L3追加P3記録。アプリ起動・停止、コミットなし |
 | **T1** | 文字装飾（D15）: comic-core 既存の縁取り・追加縁取り・影・エコー・背景・字間/行間を Text / TimeText / Lyrics に共通の型で接続 | 3 レイヤーで同じ型・同じ描画経路。装飾なしのプロジェクトはフレームハッシュ不変。補間規則（構造一致時のみ補間）をテストで固定。保存往復。装飾ありシーンの合成時間を実測して記録 |
-| **I1 段 2a 実装・自動検証済み／段 2b 未着手** | IME 補正の共有（D10「設定・入力」）: 本体 `ime_focus` の egui 依存部分（入力補正 plugin・single-line helper）を共有クレートへ挙動不変で切り出し、本体とエディタのホストが policy を登録する | **段 2a（2026-10-09、未コミット）**: `egui-ime` を新設、本体 facade・既存呼び出し元を維持。既存 23 件は共有 16 / 本体 7 に配置し、共有 raw 禁止 1 / 本体 adapter 5 を追加（共有 17 / 本体 12 passed）。関連入力・snapshot、full gate 12,681 passed / 58 ignored / 0 failed、fmt / glyph、通常 profile の検証 build 成功。独立 completion review ACCEPT（P3 文言修正も解消）。エディタ / ラボには未適用、実機未確認。詳細は D10「I1 設計」§7。**I1 全体は未完了**。全体の受け入れ条件: 本体の既存 IME テスト・raw TextEdit 禁止検査が全件維持。`musicvideo-ui` の single-line 入力は共有 helper 経由。歌詞は独自の multiline（`LyricsTextBuffer`）なので、入力補正 plugin を効かせたうえで既存の buffer・widget ID・native Undo を保つ。IME の Esc 取消・候補選択中 Tab・Enter 確定・フォーカス復帰・Undo 所有を handler テストで固定。独立レビューで「挙動不変の切り出し」に合意 |
+| **I1 段 2a / 2b 実装・自動検証済み／実機確認待ち** | IME 補正の共有（D10「設定・入力」）: 本体 `ime_focus` の egui 依存部分（入力補正 plugin・single-line helper）を共有クレートへ挙動不変で切り出し、本体とエディタのホストが policy を登録する | **段 2a（2026-10-09、`367f9c9d3`・独立実装レビュー ACCEPT）**: `egui-ime` と本体 facade、既存呼び出し元を維持。既存 23 件は共有 16 / 本体 7 に配置、raw 禁止・adapter を追加（共有 17 / 本体 12 passed）。full gate 12,681 passed / 58 ignored、fmt / glyph、通常 profile の確認用 build 成功。**段 2b（同日、未コミット）**: 全域 Tab policy を挙動不変で共有化、本体 facade・既存 5 テストを維持。エディタの登録入口・5 欄 helper・Undo gate・raw 禁止を実装、歌詞 buffer / widget ID / native Undo と Hz DragValue を維持。利用者承認でモジュレータ見出しを不変 ID に固定し、同型箇所も調査。追加 13 テスト、UI 117 / ラボ 75 / core 80 / 共有 17 passed、既存 L1〜L3 全件維持、変異 6 件を検出。本体 Tab / IME / 関連・snapshot も通過。full gate **12,694 passed / 58 ignored / 0 failed**、fmt / glyph / 依存検査、ラボ release build 成功。独立実装レビュー **ACCEPT、指摘なし**。build-dev 再実行・コミット・アプリ起動なし。詳細は D10「I1 設計」§7・§8。**実装・自動検証は完了、実機確認・最終受け入れは未完了**。本体の確認用 exe は更新せず、ラボの確認用 exe は `target/release/musicvideo_lab.exe` |
 | **H3a** | 解析契約の確定: 正規の較正区間（出力尺に合わせた PCM か全尺か）と解析の時刻列・seek 復帰の規則を決める | [引き継ぎ監査](music-video-handoff-20260907.md) §3 H3。可変時刻列と較正入力差をテストで固定。無変調ハッシュ維持 |
 | **H3b** | 一致の検証（P4b 接続後） | プレビューで表示したフレームが、同じ時刻の書き出しフレームと一致する: 表示フレームの欠落、前後への seek、直接 seek、音源より短い / 長い出力尺。これが通るまで H3 を完了扱いにしない |
 | **P4a** ✅ | 方式の設計確定: 本書 D10 / D14〜D16 の独立レビュー | GPT-6.1 Sol / xhigh の設計レビューで blocking 指摘なし。**完了**（2026-10-09）: 3 回目で条件付き ACCEPT（残った P3 の文言は反映済み）。runtime 競合の割り切りはユーザー判断で確定 |

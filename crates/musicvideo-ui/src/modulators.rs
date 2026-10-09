@@ -52,9 +52,12 @@ pub(crate) fn draw_modulators(
                     } else {
                         modulator.name.clone()
                     })
+                    .id_salt(modulator.id.0)
                     .default_open(index == 0)
                     .show(ui, |ui| {
-                        changed |= ui.text_edit_singleline(&mut modulator.name).changed();
+                        changed |=
+                            egui_ime::add_singleline(ui, &mut modulator.name, None, |edit| edit)
+                                .changed();
                         changed |= edit_source(ui, modulator, state, calibrations);
                         ui.add(
                             egui::ProgressBar::new(live)
@@ -212,13 +215,15 @@ fn edit_source(
             let mut text_changed = false;
             ui.horizontal(|ui| {
                 ui.label("下限");
-                text_changed |= ui
-                    .add(egui::TextEdit::singleline(&mut inputs.low).desired_width(56.0))
-                    .changed();
+                text_changed |= egui_ime::add_singleline(ui, &mut inputs.low, None, |edit| {
+                    edit.desired_width(56.0)
+                })
+                .changed();
                 ui.label("上限");
-                text_changed |= ui
-                    .add(egui::TextEdit::singleline(&mut inputs.high).desired_width(56.0))
-                    .changed();
+                text_changed |= egui_ime::add_singleline(ui, &mut inputs.high, None, |edit| {
+                    edit.desired_width(56.0)
+                })
+                .changed();
                 ui.weak("例: C1–B1 / C#4");
             });
             let parsed = note_name_to_midi(&inputs.low).zip(note_name_to_midi(&inputs.high));
