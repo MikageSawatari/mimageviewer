@@ -58,4 +58,4 @@ pub use spectrum::{
     SpectrumSource, SpectrumSourceError, calibrate_modulators, modulator_calibration_requests,
 };
 
-pub use text::{MAX_TEXT_CACHE_BYTES, TextCacheStats};
+pub use text::{MAX_TEXT_CACHE_BYTES, MAX_TEXT_RASTER_BYTES, TextCacheStats};

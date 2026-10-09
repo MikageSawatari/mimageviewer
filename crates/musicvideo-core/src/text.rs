@@ -1,12 +1,27 @@
 use crate::TextStyle;
 use comic_core::{
-    AnnotationObject, FontSet, Rgba, TextBlock, bake_overlay, layout_text, text_effect_padding,
+    AnnotationObject, FontSet, Rgba, TextBlock, bake_overlay, bake_text_region, layout_text,
+    text_effect_padding,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 pub const MAX_TEXT_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const TRANSIENT_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum combined RGBA allocation per text bake (cache retention is separate).
+pub const MAX_TEXT_RASTER_BYTES: usize = 8 * 1024 * 1024;
+const TILE_EDGE: usize = 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum TextRasterArea {
+    Full,
+    Region {
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+    },
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TextCacheKey {
@@ -14,6 +29,7 @@ struct TextCacheKey {
     font_key: String,
     size_bits: u32,
     style: Vec<u32>,
+    area: TextRasterArea,
 }
 impl TextCacheKey {
     fn new(text: &str, font_key: &str, size: f32, s: &TextStyle) -> Self {
@@ -55,6 +71,7 @@ impl TextCacheKey {
             font_key: font_key.to_owned(),
             size_bits: size.to_bits(),
             style,
+            area: TextRasterArea::Full,
         }
     }
     fn bytes(&self) -> usize {
@@ -71,6 +88,7 @@ pub(crate) struct TextBitmap {
     pub logical_width: f32,
     pub logical_height: f32,
     pub origin_offset: (usize, usize),
+    pub region_origin: (usize, usize),
     pub rgba: Vec<u8>,
     pub decoration: Option<Vec<u8>>,
 }
@@ -128,6 +146,43 @@ struct CacheState {
     stable: Lane,
     transient: Lane,
 }
+impl CacheState {
+    fn lookup(&mut self, key: &TextCacheKey, transient: bool) -> Option<Arc<TextBitmap>> {
+        if let Some(bitmap) = self.stable.get(key) {
+            return Some(bitmap);
+        }
+        if transient {
+            return self.transient.get(key);
+        }
+        // A static consumer owns retention priority regardless of producer order.
+        let (key, entry) = self.transient.entries.remove_entry(key)?;
+        self.transient.bytes -= entry.bytes;
+        self.stable.insert(
+            key,
+            Arc::clone(&entry.bitmap),
+            MAX_TEXT_CACHE_BYTES - TRANSIENT_BYTES,
+        );
+        Some(entry.bitmap)
+    }
+    fn publish(
+        &mut self,
+        key: TextCacheKey,
+        bitmap: Arc<TextBitmap>,
+        transient: bool,
+    ) -> Arc<TextBitmap> {
+        // Recheck both lanes under the same lock after concurrent raster misses.
+        if let Some(existing) = self.lookup(&key, transient) {
+            return existing;
+        }
+        let (lane, limit) = if transient {
+            (&mut self.transient, TRANSIENT_BYTES)
+        } else {
+            (&mut self.stable, MAX_TEXT_CACHE_BYTES - TRANSIENT_BYTES)
+        };
+        lane.insert(key, Arc::clone(&bitmap), limit);
+        bitmap
+    }
+}
 #[derive(Default)]
 pub(crate) struct TextCache {
     entries: Mutex<CacheState>,
@@ -147,6 +202,7 @@ impl TextCache {
             entries: s.stable.entries.len() + s.transient.entries.len(),
         }
     }
+    #[cfg(test)]
     pub fn get_or_rasterize(
         &self,
         fonts: &FontSet,
@@ -162,12 +218,179 @@ impl TextCache {
             1.0
         };
         let key = TextCacheKey::new(text, font_key, size_px, style);
-        {
-            let mut s = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(v) = s.stable.get(&key).or_else(|| s.transient.get(&key)) {
-                return Some(v);
+        if let Some(bitmap) = self.lookup(&key, transient) {
+            return Some(bitmap);
+        }
+        let bake = TextBake::new(fonts, text, font_key, size_px, style)?;
+        (bake.bytes() <= MAX_TEXT_RASTER_BYTES).then(|| self.bake(fonts, &bake, key, transient))
+    }
+
+    fn lookup(&self, key: &TextCacheKey, transient: bool) -> Option<Arc<TextBitmap>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .lookup(key, transient)
+    }
+
+    pub fn visit(
+        &self,
+        fonts: &FontSet,
+        text: &str,
+        font_key: &str,
+        size_px: f32,
+        style: &TextStyle,
+        transient: bool,
+        align: crate::TextAlign,
+        rect: crate::raster::PixelRect,
+        mut visit: impl FnMut(&TextBitmap, i32, i32),
+    ) -> Option<()> {
+        let size_px = if size_px.is_finite() {
+            size_px.max(1.0)
+        } else {
+            1.0
+        };
+        let key = TextCacheKey::new(text, font_key, size_px, style);
+        let destination = |logical_width: f32, logical_height: f32, origin: (usize, usize)| {
+            let x = match align {
+                crate::TextAlign::Start => rect.x0 as f32,
+                crate::TextAlign::Center => {
+                    rect.x0 as f32 + (rect.width() as f32 - logical_width) * 0.5
+                }
+                crate::TextAlign::End => rect.x1 as f32 - logical_width,
+            };
+            let y = rect.y0 as f32 + (rect.height() as f32 - logical_height) * 0.5;
+            (
+                x.round() as i32 - origin.0 as i32,
+                y.round() as i32 - origin.1 as i32,
+            )
+        };
+        if let Some(bitmap) = self.lookup(&key, transient) {
+            let (x, y) = destination(
+                bitmap.logical_width,
+                bitmap.logical_height,
+                bitmap.origin_offset,
+            );
+            visit(&bitmap, x, y);
+            return Some(());
+        }
+        let bake = TextBake::new(fonts, text, font_key, size_px, style)?;
+        let (dx, dy) = destination(bake.logical_width, bake.logical_height, bake.origin_offset);
+        if bake.bytes() <= MAX_TEXT_RASTER_BYTES {
+            let bitmap = self.bake(fonts, &bake, key, transient);
+            visit(&bitmap, dx, dy);
+        } else {
+            // Intersect in the original full-canvas coordinates. Keep that origin
+            // for comic-core's floating-point calculations and integer rounding.
+            let x0 = (rect.x0 as i64 - dx as i64).clamp(0, bake.width as i64) as usize;
+            let y0 = (rect.y0 as i64 - dy as i64).clamp(0, bake.height as i64) as usize;
+            let x1 = (rect.x1 as i64 - dx as i64).clamp(0, bake.width as i64) as usize;
+            let y1 = (rect.y1 as i64 - dy as i64).clamp(0, bake.height as i64) as usize;
+            for y in (y0..y1).step_by(TILE_EDGE) {
+                for x in (x0..x1).step_by(TILE_EDGE) {
+                    let mut key = key.clone();
+                    key.area = TextRasterArea::Region {
+                        x,
+                        y,
+                        width: (x1 - x).min(TILE_EDGE),
+                        height: (y1 - y).min(TILE_EDGE),
+                    };
+                    let bitmap = self
+                        .lookup(&key, transient)
+                        .unwrap_or_else(|| self.bake(fonts, &bake, key, transient));
+                    visit(
+                        &bitmap,
+                        (dx as i64 + bitmap.region_origin.0 as i64) as i32,
+                        (dy as i64 + bitmap.region_origin.1 as i64) as i32,
+                    );
+                }
             }
         }
+        Some(())
+    }
+
+    fn bake(
+        &self,
+        fonts: &FontSet,
+        prepared: &TextBake,
+        key: TextCacheKey,
+        transient: bool,
+    ) -> Arc<TextBitmap> {
+        let (x, y, width, height) = match key.area {
+            TextRasterArea::Full => (0, 0, prepared.width, prepared.height),
+            TextRasterArea::Region {
+                x,
+                y,
+                width,
+                height,
+            } => (x, y, width, height),
+        };
+        let bytes = width
+            .checked_mul(height)
+            .and_then(|n| n.checked_mul(if prepared.painted { 8 } else { 4 }))
+            .unwrap();
+        assert!(
+            bytes <= MAX_TEXT_RASTER_BYTES,
+            "text bake exceeds allocation budget"
+        );
+        let paint = |block: TextBlock| {
+            let origin = (
+                prepared.origin_offset.0 as f32,
+                prepared.origin_offset.1 as f32,
+            );
+            match key.area {
+                TextRasterArea::Full => bake_overlay(
+                    &[AnnotationObject::new_text(1, origin, block)],
+                    width,
+                    height,
+                    fonts,
+                ),
+                TextRasterArea::Region { .. } => {
+                    bake_text_region(&block, origin, (x as i32, y as i32), width, height, fonts)
+                }
+            }
+            .pixels
+        };
+        let bitmap = Arc::new(TextBitmap {
+            width,
+            height,
+            logical_width: prepared.logical_width,
+            logical_height: prepared.logical_height,
+            origin_offset: prepared.origin_offset,
+            region_origin: (x, y),
+            rgba: paint(prepared.glyph.clone()),
+            decoration: prepared.painted.then(|| paint(prepared.decoration.clone())),
+        });
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .publish(key, bitmap, transient)
+    }
+}
+
+struct TextBake {
+    glyph: TextBlock,
+    decoration: TextBlock,
+    width: usize,
+    height: usize,
+    logical_width: f32,
+    logical_height: f32,
+    origin_offset: (usize, usize),
+    painted: bool,
+}
+impl TextBake {
+    fn bytes(&self) -> usize {
+        self.width
+            .checked_mul(self.height)
+            .and_then(|n| n.checked_mul(if self.painted { 8 } else { 4 }))
+            .unwrap_or(usize::MAX)
+    }
+    fn new(
+        fonts: &FontSet,
+        text: &str,
+        font_key: &str,
+        size_px: f32,
+        style: &TextStyle,
+    ) -> Option<Self> {
         let font = fonts.get(font_key)?;
         let glyph = TextBlock {
             text: text.to_owned(),
@@ -216,40 +439,20 @@ impl TextCache {
             .checked_add(margins[0].checked_add(margins[2])?)?;
         let height = (layout.bounds.1.ceil().max(1.0) as usize)
             .checked_add(margins[1].checked_add(margins[3])?)?;
-        width.checked_mul(height)?.checked_mul(4)?;
-        let bake = |block| {
-            bake_overlay(
-                &[AnnotationObject::new_text(
-                    1,
-                    (origin_offset.0 as f32, origin_offset.1 as f32),
-                    block,
-                )],
-                width,
-                height,
-                fonts,
-            )
-            .pixels
-        };
-        let bitmap = Arc::new(TextBitmap {
+        // Pixel coordinates in comic-core are i32, even for a sparse region.
+        if width > i32::MAX as usize || height > i32::MAX as usize {
+            return None;
+        }
+        Some(Self {
             width,
             height,
             logical_width: layout.bounds.0,
             logical_height: layout.bounds.1,
             origin_offset,
-            rgba: bake(glyph),
-            decoration: style.has_paint().then(|| bake(decoration)),
-        });
-        let mut s = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        let (lane, limit) = if transient {
-            (&mut s.transient, TRANSIENT_BYTES)
-        } else {
-            (&mut s.stable, MAX_TEXT_CACHE_BYTES - TRANSIENT_BYTES)
-        };
-        if let Some(existing) = lane.get(&key) {
-            return Some(existing);
-        }
-        lane.insert(key, Arc::clone(&bitmap), limit);
-        Some(bitmap)
+            glyph,
+            decoration,
+            painted: style.has_paint(),
+        })
     }
 }
 #[cfg(test)]
@@ -336,12 +539,190 @@ mod tests {
             logical_width: n as f32,
             logical_height: 1.0,
             origin_offset: (0, 0),
+            region_origin: (0, 0),
             rgba: vec![255; n * 4],
             decoration: None,
         })
     }
     fn key(n: usize) -> TextCacheKey {
         TextCacheKey::new(&n.to_string(), "font", 32.0, &TextStyle::default())
+    }
+    #[test]
+    fn t1_static_request_promotes_transient_hit_and_survives_pressure() {
+        let mut fonts = FontSet::new();
+        fonts.insert(
+            comic_core::LoadedFont::from_bytes(
+                "font",
+                std::fs::read(r"C:\Windows\Fonts\YuGothM.ttc").unwrap(),
+            )
+            .unwrap(),
+        );
+        let cache = TextCache::default();
+        let style = TextStyle::default();
+        let first = cache
+            .get_or_rasterize(&fonts, "Static", "font", 32.0, &style, true)
+            .unwrap();
+        assert_eq!(cache.stats().stable_bytes, 0);
+        let second = cache
+            .get_or_rasterize(&fonts, "Static", "font", 32.0, &style, false)
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(cache.stats().transient_bytes, 0);
+        let stable_bytes = cache.stats().stable_bytes;
+        {
+            let mut state = cache.entries.lock().unwrap();
+            for n in 0..20 {
+                state.publish(key(n), bitmap(300_000), true);
+            }
+        }
+        let third = cache
+            .get_or_rasterize(&fonts, "Static", "font", 32.0, &style, true)
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &third));
+        assert_eq!(cache.stats().stable_bytes, stable_bytes);
+    }
+    #[test]
+    fn t1_publication_after_parallel_misses_checks_both_lanes() {
+        for first_transient in [false, true] {
+            let mut state = CacheState::default();
+            let key = key(1);
+            // Both workers missed before either completed rasterization.
+            assert!(state.lookup(&key, true).is_none());
+            assert!(state.lookup(&key, false).is_none());
+            let first = bitmap(20);
+            let second = bitmap(20);
+            let retained = state.publish(key.clone(), first.clone(), first_transient);
+            let reused = state.publish(key.clone(), second, !first_transient);
+            assert!(Arc::ptr_eq(&retained, &reused));
+            assert_eq!(state.stable.entries.len(), 1);
+            assert!(state.transient.entries.is_empty());
+            assert_eq!(state.transient.bytes, 0);
+            assert_eq!(state.stable.bytes, state.stable.entries[&key].bytes);
+        }
+    }
+    #[test]
+    fn t1_maximum_ui_effects_are_bounded_before_baking_and_tiles_match_uncropped_pixels() {
+        let mut fonts = FontSet::new();
+        fonts.insert(
+            comic_core::LoadedFont::from_bytes(
+                "font",
+                std::fs::read(r"C:\Windows\Fonts\YuGothM.ttc").unwrap(),
+            )
+            .unwrap(),
+        );
+        let width = 1050;
+        let height = 1100;
+        let rect = crate::raster::PixelRect {
+            x0: 0,
+            y0: 0,
+            x1: width,
+            y1: height,
+        };
+        for (offset, painted_extras) in [
+            ((512.0, 0.0), false),
+            ((0.0, -512.0), false),
+            ((512.0, 512.0), false),
+            ((-512.0, -512.0), false),
+            ((512.0, -512.0), true),
+            ((-512.0, 512.0), true),
+        ] {
+            let style = TextStyle {
+                echo: Some(crate::TextEchoStyle {
+                    offset,
+                    count: 12,
+                    ..Default::default()
+                }),
+                outline: painted_extras.then_some(crate::StrokeStyle {
+                    width_px: 128.0,
+                    ..Default::default()
+                }),
+                extra_outlines: if painted_extras {
+                    vec![crate::StrokeStyle {
+                        width_px: 128.0,
+                        ..Default::default()
+                    }]
+                } else {
+                    Vec::new()
+                },
+                shadow: painted_extras.then_some(crate::TextShadowStyle {
+                    offset: (512.0, -512.0),
+                    blur_px: 128.0,
+                    spread_px: 128.0,
+                    ..Default::default()
+                }),
+                background: painted_extras.then_some(crate::TextBackgroundStyle {
+                    padding_px: 256.0,
+                    corner_px: 256.0,
+                    ..Default::default()
+                }),
+                letter_gap: if painted_extras { 256.0 } else { 0.0 },
+                line_gap: if painted_extras { -128.0 } else { 0.0 },
+            };
+            let cache = TextCache::default();
+            let prepared = TextBake::new(&fonts, "A", "font", 63.25, &style).unwrap();
+            assert!(
+                prepared.bytes() > 1024 * 1024 * 1024,
+                "fixture reproduces the old >1GiB allocation"
+            );
+            let origin = (
+                prepared.origin_offset.0 as f32,
+                prepared.origin_offset.1 as f32,
+            );
+            let top = ((height as f32 - prepared.logical_height) * 0.5).round() as i32;
+            // One unsplit visible-region reference, using the original canvas
+            // coordinates; comic-core separately tests this against full baking.
+            let region = (
+                prepared.origin_offset.0 as i32,
+                prepared.origin_offset.1 as i32 - top,
+            );
+            let expected_glyph =
+                bake_text_region(&prepared.glyph, origin, region, width, height, &fonts).pixels;
+            let expected_decoration =
+                bake_text_region(&prepared.decoration, origin, region, width, height, &fonts)
+                    .pixels;
+            for transient in [true, false] {
+                let mut glyph = vec![0; width * height * 4];
+                let mut decoration = glyph.clone();
+                let mut tiles = 0;
+                cache
+                    .visit(
+                        &fonts,
+                        "A",
+                        "font",
+                        63.25,
+                        &style,
+                        transient,
+                        crate::TextAlign::Start,
+                        rect,
+                        |bitmap, dx, dy| {
+                            tiles += 1;
+                            let paint = bitmap.decoration.as_ref().unwrap();
+                            assert!(
+                                bitmap.rgba.capacity() + paint.capacity() <= MAX_TEXT_RASTER_BYTES
+                            );
+                            for y in 0..bitmap.height {
+                                let source = y * bitmap.width * 4;
+                                let target = ((dy as usize + y) * width + dx as usize) * 4;
+                                glyph[target..target + bitmap.width * 4].copy_from_slice(
+                                    &bitmap.rgba[source..source + bitmap.width * 4],
+                                );
+                                decoration[target..target + bitmap.width * 4]
+                                    .copy_from_slice(&paint[source..source + bitmap.width * 4]);
+                            }
+                        },
+                    )
+                    .unwrap();
+                assert!(tiles > 1);
+                assert_eq!(
+                    glyph, expected_glyph,
+                    "glyph offset={offset:?}, extras={painted_extras}"
+                );
+                assert_eq!(
+                    decoration, expected_decoration,
+                    "decoration offset={offset:?}, extras={painted_extras}"
+                );
+            }
+        }
     }
     #[test]
     fn t1_lru_evicts_least_recently_used_by_bytes_and_bypasses_oversized() {

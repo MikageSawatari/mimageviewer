@@ -1683,6 +1683,89 @@ fn draw_layout_glyphs(
     origin_y: f32,
     clip: Option<(f32, f32, f32, f32)>,
 ) {
+    draw_layout_glyphs_into(
+        &mut TextSurface {
+            overlay,
+            origin: (0, 0),
+        },
+        layout,
+        block,
+        font,
+        origin_x,
+        origin_y,
+        clip,
+    );
+}
+
+/// Bake only a region of an unrotated text block, using the same coordinates
+/// and pixel rounding as a full-canvas bake. `origin` is the text layout origin;
+/// `region_origin` is the integer top-left of the requested canvas region.
+///
+/// The caller controls the allocation size through `width` and `height`.
+/// Effects are drawn by the shared text painter; this is a crop, not a rescale
+/// or a translation of the text's floating-point coordinates.
+pub fn bake_text_region(
+    block: &TextBlock,
+    origin: (f32, f32),
+    region_origin: (i32, i32),
+    width: usize,
+    height: usize,
+    fonts: &FontSet,
+) -> RgbaOverlay {
+    let mut overlay = RgbaOverlay::new(width, height);
+    if width == 0 || height == 0 || block.text.is_empty() {
+        return overlay;
+    }
+    let Some(font) = fonts.get(&block.font_key) else {
+        return overlay;
+    };
+    crate::font::reset_glyph_cache();
+    let layout = layout_text(block, font);
+    draw_layout_glyphs_into(
+        &mut TextSurface {
+            overlay: &mut overlay,
+            origin: region_origin,
+        },
+        &layout,
+        block,
+        font,
+        origin.0,
+        origin.1,
+        None,
+    );
+    overlay
+}
+
+// Translate only integer pixel addresses, after all existing raster calculations.
+// The zero-origin adapter used by existing annotation paths is an identity.
+struct TextSurface<'a> {
+    overlay: &'a mut RgbaOverlay,
+    origin: (i32, i32),
+}
+impl TextSurface<'_> {
+    #[inline]
+    fn blend_px(&mut self, x: i32, y: i32, color: Rgba, coverage: f32) {
+        if self.origin == (0, 0) {
+            self.overlay.blend_px(x, y, color, coverage);
+            return;
+        }
+        let dx = x as i64 - self.origin.0 as i64;
+        let dy = y as i64 - self.origin.1 as i64;
+        if dx >= 0 && dy >= 0 && dx < self.overlay.w as i64 && dy < self.overlay.h as i64 {
+            self.overlay.blend_px(dx as i32, dy as i32, color, coverage);
+        }
+    }
+}
+
+fn draw_layout_glyphs_into(
+    overlay: &mut TextSurface<'_>,
+    layout: &TextLayout,
+    block: &TextBlock,
+    font: &LoadedFont,
+    origin_x: f32,
+    origin_y: f32,
+    clip: Option<(f32, f32, f32, f32)>,
+) {
     draw_text_background(overlay, layout, block, origin_x, origin_y, clip);
 
     if let Some(shadow) = block.shadow {
@@ -1771,7 +1854,7 @@ fn draw_layout_glyphs(
 }
 
 fn blit_bitmap(
-    overlay: &mut RgbaOverlay,
+    overlay: &mut TextSurface<'_>,
     bmp: &GlyphBitmap,
     left: f32,
     top: f32,
@@ -1870,7 +1953,7 @@ fn measure_layout_ink_bounds(layout: &TextLayout, font: &LoadedFont) -> Option<I
 }
 
 fn draw_layout_mask(
-    overlay: &mut RgbaOverlay,
+    overlay: &mut TextSurface<'_>,
     layout: &TextLayout,
     font: &LoadedFont,
     origin_x: f32,
@@ -1893,7 +1976,7 @@ fn draw_layout_mask(
 }
 
 fn draw_layout_soft_mask(
-    overlay: &mut RgbaOverlay,
+    overlay: &mut TextSurface<'_>,
     layout: &TextLayout,
     font: &LoadedFont,
     origin_x: f32,
@@ -1942,7 +2025,7 @@ fn draw_layout_soft_mask(
 }
 
 fn draw_text_background(
-    overlay: &mut RgbaOverlay,
+    overlay: &mut TextSurface<'_>,
     layout: &TextLayout,
     block: &TextBlock,
     origin_x: f32,
@@ -2575,7 +2658,7 @@ fn fill_polygon(overlay: &mut RgbaOverlay, poly: &[(f32, f32)], color: Rgba) {
 }
 
 fn fill_polygon_clipped(
-    overlay: &mut RgbaOverlay,
+    overlay: &mut TextSurface<'_>,
     poly: &[(f32, f32)],
     color: Rgba,
     clip: Option<(f32, f32, f32, f32)>,
@@ -2585,8 +2668,8 @@ fn fill_polygon_clipped(
     }
     let min_y = poly.iter().map(|p| p.1).fold(f32::INFINITY, f32::min);
     let max_y = poly.iter().map(|p| p.1).fold(f32::NEG_INFINITY, f32::max);
-    let mut y0 = (min_y.floor() as i32).max(0);
-    let mut y1 = (max_y.ceil() as i32).min(overlay.h as i32 - 1);
+    let mut y0 = (min_y.floor() as i32).max(overlay.origin.1);
+    let mut y1 = (max_y.ceil() as i32).min(overlay.origin.1 + overlay.overlay.h as i32 - 1);
     if let Some((_, cy0, _, cy1)) = clip {
         y0 = y0.max(cy0.floor() as i32);
         y1 = y1.min(cy1.ceil() as i32);
@@ -2612,6 +2695,8 @@ fn fill_polygon_clipped(
                 xa = xa.max(cx0.floor() as i32);
                 xb = xb.min(cx1.ceil() as i32);
             }
+            xa = xa.max(overlay.origin.0);
+            xb = xb.min(overlay.origin.0 + overlay.overlay.w as i32 - 1);
             for x in xa..=xb {
                 overlay.blend_px(x, y, color, 1.0);
             }

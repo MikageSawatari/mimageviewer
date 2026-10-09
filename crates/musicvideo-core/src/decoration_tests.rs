@@ -207,6 +207,96 @@ fn t1_overlap_alpha_opacity_and_clip_apply_once() {
     }
 }
 #[test]
+fn t1_partial_rounded_clip_on_overlapping_glyph_and_decoration_is_applied_once() {
+    let assets = Assets::new(fonts());
+    let style = TextStyle {
+        background: Some(TextBackgroundStyle {
+            fill: TextColor::WHITE,
+            padding_px: 8.0,
+            corner_px: 0.0,
+        }),
+        ..Default::default()
+    };
+    let rect = PixelRect {
+        x0: 0,
+        y0: 0,
+        x1: 64,
+        y1: 64,
+    };
+    let mut frame = Frame::new(64, 64).unwrap();
+    let opacity = 0.65;
+    assert!(draw_text(
+        &mut frame,
+        rect,
+        &assets,
+        "MMMM",
+        DEFAULT_FONT_KEY,
+        64.0,
+        TextAlign::Start,
+        &style,
+        false,
+        &Fill::Solid(Rgba8::WHITE),
+        opacity,
+        32.0,
+        false
+    ));
+    let mut mask = vec![0; 64 * 64];
+    assert!(draw_text_mask(
+        &mut mask,
+        64,
+        64,
+        &assets,
+        "MMMM",
+        DEFAULT_FONT_KEY,
+        64.0,
+        TextAlign::Start,
+        &style,
+        false,
+        &Fill::Solid(Rgba8::WHITE),
+        opacity,
+        32.0
+    ));
+    let bitmap = assets
+        .rasterized_text("MMMM", DEFAULT_FONT_KEY, 64.0, &style, false)
+        .unwrap();
+    let dx = -(bitmap.origin_offset.0 as i32);
+    let dy = ((64.0 - bitmap.logical_height) * 0.5).round() as i32 - bitmap.origin_offset.1 as i32;
+    let mut checked = 0;
+    for y in 0..64 {
+        for x in 0..64 {
+            let sx = x as i32 - dx;
+            let sy = y as i32 - dy;
+            if sx < 0 || sy < 0 || sx as usize >= bitmap.width || sy as usize >= bitmap.height {
+                continue;
+            }
+            let source = (sy as usize * bitmap.width + sx as usize) * 4;
+            if bitmap.rgba[source + 3] != 255
+                || bitmap.decoration.as_ref().unwrap()[source + 3] == 0
+            {
+                continue;
+            }
+            // A 64px box with radius 32 is a circle: independent geometric oracle.
+            let distance = (x as f32 + 0.5 - 32.0).hypot(y as f32 + 0.5 - 32.0);
+            let clip = (32.5 - distance).clamp(0.0, 1.0);
+            if clip <= 0.05 || clip >= 0.95 {
+                continue;
+            }
+            let expected = (255.0 * (opacity * clip)).round() as u8;
+            assert_eq!(
+                frame.rgba[(y * 64 + x) * 4],
+                expected,
+                "body at {x},{y} clip={clip}"
+            );
+            assert_eq!(mask[y * 64 + x], expected, "mask at {x},{y} clip={clip}");
+            checked += 1;
+        }
+    }
+    assert!(
+        checked > 0,
+        "fixture must overlap glyph/decorations on a partial clip pixel"
+    );
+}
+#[test]
 fn t1_rotation_glow_uses_multicolor_combined_silhouette_and_is_deterministic() {
     let assets = Assets::new(fonts());
     let mut p = project();

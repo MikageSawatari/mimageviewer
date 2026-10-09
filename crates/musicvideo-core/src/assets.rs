@@ -315,6 +315,31 @@ impl Assets {
         self.text_cache.stats()
     }
 
+    pub(crate) fn visit_rasterized_text(
+        &self,
+        text: &str,
+        font_key: &str,
+        size_px: f32,
+        style: &crate::TextStyle,
+        transient: bool,
+        align: crate::TextAlign,
+        rect: crate::raster::PixelRect,
+        visit: impl FnMut(&TextBitmap, i32, i32),
+    ) -> Option<()> {
+        self.text_cache.visit(
+            &self.fonts,
+            text,
+            font_key,
+            size_px,
+            style,
+            transient,
+            align,
+            rect,
+            visit,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn rasterized_text(
         &self,
         text: &str,

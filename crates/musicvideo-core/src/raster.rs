@@ -1638,60 +1638,60 @@ fn draw_text(
     corner_radius_px: f32,
     mask_mode: bool,
 ) -> bool {
-    let Some(bitmap) = assets.rasterized_text(text, font_key, size_px, style, transient_style)
-    else {
-        return false;
-    };
-    let logical_x = match align {
-        TextAlign::Start => rect.x0 as f32,
-        TextAlign::Center => rect.x0 as f32 + (rect.width() as f32 - bitmap.logical_width) * 0.5,
-        TextAlign::End => rect.x1 as f32 - bitmap.logical_width,
-    };
-    let logical_y = rect.y0 as f32 + (rect.height() as f32 - bitmap.logical_height) * 0.5;
-    let destination_x = logical_x.round() as i32 - bitmap.origin_offset.0 as i32;
-    let destination_y = logical_y.round() as i32 - bitmap.origin_offset.1 as i32;
     let sampler = FillSampler::new(fill, rect);
     let frame_width = frame.width as usize;
-    for source_y in 0..bitmap.height {
-        let y = destination_y + source_y as i32;
-        if y < rect.y0 as i32 || y >= rect.y1 as i32 {
-            continue;
-        }
-        for source_x in 0..bitmap.width {
-            let x = destination_x + source_x as i32;
-            if x < rect.x0 as i32 || x >= rect.x1 as i32 {
-                continue;
-            }
-            let source_offset = (source_y * bitmap.width + source_x) * 4;
-            let glyph_alpha = bitmap.rgba[source_offset + 3] as f32 / 255.0;
-            if glyph_alpha <= 0.0 && bitmap.decoration.is_none() {
-                continue;
-            }
-            let px = x as f32 + 0.5;
-            let py = y as f32 + 0.5;
-            let clip = rounded_rect_coverage(px, py, rect, corner_radius_px);
-            let color = sampler.sample(px, py, None, mask_mode);
-            let destination_offset = (y as usize * frame_width + x as usize) * 4;
-            let (color, coverage) = if let Some(decoration) = &bitmap.decoration {
-                (
-                    composite_text_pixel(
-                        &decoration[source_offset..source_offset + 4],
-                        color,
-                        bitmap.rgba[source_offset + 3],
-                    ),
-                    1.0,
-                )
-            } else {
-                (color, glyph_alpha)
-            };
-            blend_pixel(
-                &mut frame.rgba[destination_offset..destination_offset + 4],
-                color,
-                opacity * coverage * clip,
-            );
-        }
-    }
-    true
+    assets
+        .visit_rasterized_text(
+            text,
+            font_key,
+            size_px,
+            style,
+            transient_style,
+            align,
+            rect,
+            |bitmap, destination_x, destination_y| {
+                for source_y in 0..bitmap.height {
+                    let y = destination_y + source_y as i32;
+                    if y < rect.y0 as i32 || y >= rect.y1 as i32 {
+                        continue;
+                    }
+                    for source_x in 0..bitmap.width {
+                        let x = destination_x + source_x as i32;
+                        if x < rect.x0 as i32 || x >= rect.x1 as i32 {
+                            continue;
+                        }
+                        let source_offset = (source_y * bitmap.width + source_x) * 4;
+                        let glyph_alpha = bitmap.rgba[source_offset + 3] as f32 / 255.0;
+                        if glyph_alpha <= 0.0 && bitmap.decoration.is_none() {
+                            continue;
+                        }
+                        let px = x as f32 + 0.5;
+                        let py = y as f32 + 0.5;
+                        let clip = rounded_rect_coverage(px, py, rect, corner_radius_px);
+                        let color = sampler.sample(px, py, None, mask_mode);
+                        let destination_offset = (y as usize * frame_width + x as usize) * 4;
+                        let (color, coverage) = if let Some(decoration) = &bitmap.decoration {
+                            (
+                                composite_text_pixel(
+                                    &decoration[source_offset..source_offset + 4],
+                                    color,
+                                    bitmap.rgba[source_offset + 3],
+                                ),
+                                1.0,
+                            )
+                        } else {
+                            (color, glyph_alpha)
+                        };
+                        blend_pixel(
+                            &mut frame.rgba[destination_offset..destination_offset + 4],
+                            color,
+                            opacity * coverage * clip,
+                        );
+                    }
+                }
+            },
+        )
+        .is_some()
 }
 
 struct MaskSurface {
@@ -2079,62 +2079,62 @@ fn draw_text_mask(
     opacity: f32,
     corner_radius_px: f32,
 ) -> bool {
-    let Some(bitmap) = assets.rasterized_text(text, font_key, size_px, style, transient_style)
-    else {
-        return false;
-    };
     let rect = PixelRect {
         x0: 0,
         y0: 0,
         x1: width,
         y1: height,
     };
-    let logical_x = match align {
-        TextAlign::Start => 0.0,
-        TextAlign::Center => (width as f32 - bitmap.logical_width) * 0.5,
-        TextAlign::End => width as f32 - bitmap.logical_width,
-    };
-    let logical_y = (height as f32 - bitmap.logical_height) * 0.5;
-    let destination_x = logical_x.round() as i32 - bitmap.origin_offset.0 as i32;
-    let destination_y = logical_y.round() as i32 - bitmap.origin_offset.1 as i32;
     let sampler = FillSampler::new(fill, rect);
-    for source_y in 0..bitmap.height {
-        let y = destination_y + source_y as i32;
-        if y < 0 || y >= height as i32 {
-            continue;
-        }
-        for source_x in 0..bitmap.width {
-            let x = destination_x + source_x as i32;
-            if x < 0 || x >= width as i32 {
-                continue;
-            }
-            let glyph_alpha = bitmap.rgba[(source_y * bitmap.width + source_x) * 4 + 3];
-            if glyph_alpha == 0 && bitmap.decoration.is_none() {
-                continue;
-            }
-            let px = x as f32 + 0.5;
-            let py = y as f32 + 0.5;
-            let fill_alpha = sampler.sample(px, py, None, true).a as u32;
-            let source_alpha = if let Some(decoration) = &bitmap.decoration {
-                let offset = (source_y * bitmap.width + source_x) * 4;
-                composite_text_pixel(
-                    &decoration[offset..offset + 4],
-                    Rgba8::new(255, 255, 255, fill_alpha as u8),
-                    glyph_alpha,
-                )
-                .a
-            } else {
-                ((glyph_alpha as u32 * fill_alpha + 127) / 255) as u8
-            };
-            let coverage = rounded_rect_coverage(px, py, rect, corner_radius_px);
-            blend_mask_pixel(
-                &mut alpha[y as usize * width + x as usize],
-                source_alpha,
-                opacity * coverage,
-            );
-        }
-    }
-    true
+    assets
+        .visit_rasterized_text(
+            text,
+            font_key,
+            size_px,
+            style,
+            transient_style,
+            align,
+            rect,
+            |bitmap, destination_x, destination_y| {
+                for source_y in 0..bitmap.height {
+                    let y = destination_y + source_y as i32;
+                    if y < 0 || y >= height as i32 {
+                        continue;
+                    }
+                    for source_x in 0..bitmap.width {
+                        let x = destination_x + source_x as i32;
+                        if x < 0 || x >= width as i32 {
+                            continue;
+                        }
+                        let glyph_alpha = bitmap.rgba[(source_y * bitmap.width + source_x) * 4 + 3];
+                        if glyph_alpha == 0 && bitmap.decoration.is_none() {
+                            continue;
+                        }
+                        let px = x as f32 + 0.5;
+                        let py = y as f32 + 0.5;
+                        let fill_alpha = sampler.sample(px, py, None, true).a as u32;
+                        let source_alpha = if let Some(decoration) = &bitmap.decoration {
+                            let offset = (source_y * bitmap.width + source_x) * 4;
+                            composite_text_pixel(
+                                &decoration[offset..offset + 4],
+                                Rgba8::new(255, 255, 255, fill_alpha as u8),
+                                glyph_alpha,
+                            )
+                            .a
+                        } else {
+                            ((glyph_alpha as u32 * fill_alpha + 127) / 255) as u8
+                        };
+                        let coverage = rounded_rect_coverage(px, py, rect, corner_radius_px);
+                        blend_mask_pixel(
+                            &mut alpha[y as usize * width + x as usize],
+                            source_alpha,
+                            opacity * coverage,
+                        );
+                    }
+                }
+            },
+        )
+        .is_some()
 }
 
 fn draw_rotated_item(

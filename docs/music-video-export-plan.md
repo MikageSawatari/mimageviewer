@@ -985,7 +985,8 @@ disabled Ui にし、`begin_frame_with_input_enabled` で context から直接�
 
 Text / TimeText / Lyrics の 3 レイヤーで同じ文字スタイルの型を共有する（実装を 1 つにする）。
 `comic-core` は出荷済みの画像注釈と共有しているので、計算・描画挙動を変更しない。
-T1 検収で、既存 `text_effect_padding` の可視性拡張・再エクスポートだけを認めた（利用者判断）。
+T1 検収で既存 `text_effect_padding` の可視性拡張・再エクスポートを認め、独立レビュー後は
+可視領域だけを焼く公開 API の追加も行う。既存の計算・描画挙動は維持する（利用者判断）。
 
 **合成の境界**（独立レビュー P2 対応）: 現行の文字描画は comic-core の bitmap を白で焼き、その
 **alpha だけ**を使って RGB を `Fill` から作る（`musicvideo-core` `raster.rs` の文字描画）。このまま装飾を
@@ -1037,7 +1038,7 @@ bitmap が溜まり続ける。容量上限つき（LRU）にし、補間中の�
   mask も同じ合成 alpha を使うので、歌詞フェード・回転・グローが同じ silhouette を参照する。
   装飾ありは単色 body 再構成へ流さない。装飾なしの既存の丸め・描画経路は保持する。
 - 到達範囲は comic-core の既存 `text_effect_padding` を公開・再エクスポートして共有する。
-  初回実装の余白式の複製は検収で削除した。comic-core の変更は doc comment / pub / 再エクスポートだけで、
+  初回実装の余白式の複製は検収で削除した。この検収時の comic-core の変更は doc comment / pub / 再エクスポートだけで、
   関数本体の計算と画像注釈の描画挙動は変えない。musicvideo の TextBlock は glow を設定しないため、
   旧計算との等価性を glow なしの 960 通り（装飾の有無、負値・小数、echo 枚数の clamp 境界）で固定した。
   公開関数の戻り値へ AA 用 1px を加えて ceil する。大きい別キャンバスとの alpha 全画素一致で
@@ -1061,7 +1062,8 @@ bitmap が溜まり続ける。容量上限つき（LRU）にし、補間中の�
 - キャッシュキーは文字列・font key・サイズの bit 値・スタイル全項目（float の bit 値と色）を含む。
   2 つの独立した byte-budget LRU に分け、静的用 56 MiB、補間用 8 MiB、合計 64 MiB。
   Const とキー値そのもの（Step / endpoint / 色の丸めでキー値と一致するフレーム）は静的用、
-  キー間の新しい値は補間用とする。補間の流入は静的 LRU を一切 eviction しない。
+  キー間の新しい値は補間用とする。静的要求が補間用にヒットした場合は、同じ Arc を静的用へ昇格する。
+  補間の流入は静的 LRU を一切 eviction しない。
   超過サイズの結果は描画だけ行い保持しない。budget は bitmap Vec capacity、キー所有容量、
   bitmap / entry / key 構造体を数え、HashMap bucket / allocator / 描画中の一時確保は含まない。
   8 MiB は 1080p の代表的な装飾文字の数フレームを保持する規模とし、残りを静的文字・時刻へ確保した。
@@ -1088,9 +1090,46 @@ bitmap が溜まり続ける。容量上限つき（LRU）にし、補間中の�
   `cargo check -p comic_lab`、`cargo check -p mimageviewer --bin mimageviewer-core`、`cargo fmt --check` も成功。
   comic-core の余白関数の本体が HEAD と完全一致することをソース比較でも確認した。
   ログ・コマンド・終了コード・ソース SHA-256 は `target/t1-review-validation/` に記録。
-  計算・描画結果が同じため下記の初回合成計測・キャッシュ計測を再利用し、計測・release build は繰り返さない。
+  この可視性変更時は計算・描画結果が同じため下記の初回合成計測・キャッシュ計測を再利用した。
 
-**T1 計測結果（2026-10-09、headless core 測定器の実測）**
+#### T1 独立レビュー後の修正（fce65bb15 / master v4.5.0 マージ 2c229c2be 後）
+
+- P2（巨大な焼成確保）: LRU の保持上限と、焼成前の RGBA 確保上限を分ける。
+  1 回の焼成で所有する glyph + 装飾の RGBA Vec 合計は **8 MiB 以下**（`MAX_TEXT_RASTER_BYTES`）。
+  上限を満たす通常の全文 bitmap は従来通り焼き、超える場合はレイヤーの既存 rect clip に入る部分だけを
+  最大 1024×1024 のタイルで順に焼き、すぐ既存の body / mask 合成へ渡す。全タイルを一時 Vec に集めない。
+  64 MiB の LRU 保持予算は別枠。フォント・glyph coverage / dilation の comic-core 内作業領域、
+  出力 Frame・回転・グローの既存作業領域はこの RGBA 8 MiB の計上対象ではない。
+  方向別の余白だけでは斜めエコーの巨大面積が残るため、可視領域の制限とタイル化を採用した。
+  UI 上限の縮小、効果の弱化、オフセットや枚数の clamp 追加はしない。
+- comic-core に `bake_text_region` を追加し、既存文字 painter を領域書込アダプタで共有する。
+  既存の `text_effect_padding` の計算・描画順序・色合成は変更しない。浮動小数点の配置・画素丸めは
+  元の全文 canvas 座標のまま計算し、整数の書込先だけを領域へ移す。原点を焼成前にずらす方法は
+  0 近傍の切捨てや大きい座標の丸めを変え得るため採らない。既存注釈経路は原点 (0,0) のアダプタを通す。
+  負・小数・6145px の原点、全装飾（glow 含む）で既存 `bake_overlay` の領域との RGBA 全バイト一致を固定。
+  回転・グローでは既存の回転前レイヤー rect 全域を保ち、最終フレームでの不可視判定を先に掛けない。
+  論理寸法・揃え位置は不変。キャッシュキーは Full / Region（原点・寸法）の型を含む。
+- P3（昇格・二重保持）: `CacheState` が lookup / publish を所有する。静的要求で補間 lane にヒットしたら
+  entry を取り出して byte 数を減算し、同じ Arc を静的 lane に入れる。焼成は mutex 外で行い、
+  並行 miss 後の publish は同じ mutex 内で両 lane を再確認する。静的側への優先を逆順でも維持し、
+  同じキーの二重保持・byte 計上の重複を防ぐ。
+- P3（clip の検出力）: opaque glyph と背景の重なりを 64px / radius 32px の角丸境界へ置く。
+  0.05 < clip < 0.95 の画素を円の距離から独立に求め、body と mask を opacity × clip 一度分の期待値と比較する。
+  body の clip²、mask の clip² の別々の変異で失敗することを確認した。
+- 今回追加は comic-core 1 / musicvideo-core 4、計 5 件。最大エコー count 12 / offset ±512 の水平・垂直・
+  斜め、outline 128 / shadow spread・blur 128 / offset 512 / 背景 padding・corner 256 等の 6 組み合わせで、
+  従来の全文確保が 1 GiB 超になる fixture を用いる。実際の各タイルの Vec capacity 合計が 8 MiB 以下で、
+  分割しない可視領域描画と glyph / 装飾の全バイトが一致することを静的・補間の両要求で確認した。
+  装飾なしの既存 4 hash は不変。指定テストは comic-core 122（既存の ignored 性能テスト 1 件を除く）、
+  musicvideo-core 103 / musicvideo-ui 121 / musicvideo_lab 75、計 **421 件成功**。
+  `cargo check -p mimageviewer --features dev-tools --bin mvexport_cli`、fmt、diff check も成功。
+  clip 二度掛け 2 件、昇格の欠落、片 lane だけの publish、2048px タイルの 5 変異を全て検出した。
+- ログ・コマンド・終了コード・ソース SHA-256 は `target/t1-independent-review/`。
+  別セッションの rustc 稼働を確認したため、合成時間の再計測は行わない。下記は初回実装の参考測定であり、
+  Region メタデータ追加後のキャッシュ byte 数・今回修正後のプロセス peak の実測としては扱わない。
+  アプリ起動・build-dev・release ラボ build・commit は利用者指示により実施しない。
+
+**T1 初回計測結果（2026-10-09、headless core 測定器の実測、独立レビュー修正前）**
 
 再現用: `cargo build --release -p musicvideo-core --example t1_measure` の後、
 `target\release\examples\t1_measure.exe composition` と `... long` を実行する。
@@ -1307,7 +1346,7 @@ frame n → t = n/fps → evaluate → rasterize(CPU, rayon) → RGBA→NV12/YUV
 | **L1** 実装済み・修正検収待ち | 画面構成（D14）: 左にレイヤー一覧、右は選択レイヤーのプロパティだけ、モジュレータ・プロジェクト設定は別タブ | 初版 `e6fda1f9b`。**独立レビューP2/P3修正・自動テスト済み**（2026-10-09、同commitに対する未コミット差分）。core 73件 / UI 96件（既存87＋L1新規7＋修正新規2）/ lab 46件（既存45＋L1新規1）、全215件成功。タブ/左一覧の部品ID分離とnative Undo往復を追加検証。同フレームProject/LRC完了2件は本番の共通入口へ移し、入口内の既存poll呼出を入力前へ移す変異で失敗確認。`cargo tree` の禁止依存なし、fmt・glyph検査成功。releaseラボのビルド結果と変異検証は下記。修正作業ではアプリ未起動・コミットなし |
 | **L2** 実装済み・追加P2修正の再検収待ち | 選択レイヤーの枠（D14 末尾）: 選んだレイヤーの矩形をプレビュー上に表示。画面外・非表示も示す | 初版 `838f8503e`（計232件）。ID再利用・stale textureのP2/P3修正 `42a74db10` は独立再レビューで解消確認（計234件）。**通常UI追加のlifetime登録遅延P2を修正・自動検証済み**（2026-10-09、未コミット差分）: `EditorFrame::finish` で対象lifetimeを同期し、同フレームの要求へ全LayerIdを捕捉。実UIから単色/2レイヤー追加→停止中の最初の完成フレームの枠・名前を検査。新規3件は同期を外す変異で全件失敗、復元後core 80 / UI 104 / lab 53、計237件成功。Undo単位・歌詞native Undo・L1 API・RGBAハッシュ維持。全要求経路の確認、releaseビルド等は下記L2追加修正記録 |
 | **L3** 実装済み・追加P3修正の再検収待ち | 状態で動かない上部とステータス（D14 末尾）: ツールバー 1 段・固定 1 行のステータスバー・読込衝突はモーダル・未解決素材と診断は別ウィンドウ・素材パスはプロジェクトタブ | 初版 `e958226a9`（254件）。キャンセル領域/未保存の印/タイトル送信の3件を修正した `a5c05ef65`（258件）は独立再レビューで条件付きACCEPT。**追加P3「詳細メニューのID変化」を修正・自動検証済み**（2026-10-09、未コミット差分）: ステータスの子UI4領域を用途ごとの固定IDにする。新規lab 1件、500/1400pt×書出/画像読込/保存完了の7組合せ、計14ケースでメニュー維持とメニュー内の未解決素材操作を実描画/実クリックで検査。修正前と詳細IDだけを戻す変異で失敗確認。復元後 core 80 / UI 105 / lab 74、計259件成功。禁止依存なし、fmt/glyph成功、releaseラボ再build成功（30.53秒）。L1/L2・H1/H2・非同期採否順序は維持。根拠・ログは下記L3追加P3記録。アプリ起動・停止、コミットなし |
-| **T1** | 文字装飾（D15）: comic-core 既存の縁取り・追加縁取り・影・エコー・背景・字間/行間を Text / TimeText / Lyrics に共通の型で接続 | 3 レイヤーで同じ型・同じ描画経路。装飾なしのプロジェクトはフレームハッシュ不変。補間規則（構造一致時のみ補間）をテストで固定。保存往復。装飾ありシーンの合成時間を実測して記録。**実装・自動テスト・release build・計測完了 (2026-10-09)、検収修正済み**。余白は公開した comic-core の text_effect_padding を共有（計算・描画挙動は不変、glow なし 960 通りで旧式との等価性を固定）。core 99 / UI 121 / lab 75、comic-core 122、今回計 417 件成功。egui-ime 17 は初回証拠を再利用。追加 23、初回 7 変異検出。straight RGBA 修正は既存不具合修正として検収採用。byte-budget LRU 64 MiB（静的 56 / 補間 8）。1080p mean / p95: 装飾なし 1.825 / 2.465ms、装飾あり 4.274 / 4.915ms。5 分の最大 cache 9.166 MiB / working set 43.988 MiB。条件と詳細は D15 の T1 記録を参照。独立レビュー・検収の最終確認待ち |
+| **T1** | 文字装飾（D15）: comic-core 既存の縁取り・追加縁取り・影・エコー・背景・字間/行間を Text / TimeText / Lyrics に共通の型で接続 | 3 レイヤーで同じ型・同じ描画経路。装飾なしのプロジェクトは既存 4 hash 不変。構造一致時のみ補間。保存往復。**実装済み、独立レビューの P2 / P3 / P3 を修正（再確認待ち）**。余白は text_effect_padding を共有、可視領域は追加した bake_text_region を通して最大 1024×1024 で逐次焼成（glyph + 装飾 RGBA は焼成前に 8 MiB 以下を保証、方向・UI 上限・画素丸めを変えない）。LRU 64 MiB（静的 56 / 補間 8）は別枠、静的要求への昇格と publish 時の両 lane 再確認を実装。独立した角丸境界の clip 期待値を追加。今回追加 5 件（comic 1 / core 4）、comic-core 122 / core 103 / UI 121 / lab 75、計 421 件成功、5 変異検出。T1 全体の追加は 28 件（初回の 7 変異検出も記録）。CLI dev-tools check・fmt 成功。straight RGBA 修正は既存不具合修正として検収採用。初回参考値の 1080p mean / p95 は装飾なし 1.825 / 2.465ms、装飾あり 4.274 / 4.915ms、5 分の最大 cache 9.166 MiB / working set 43.988 MiB。今回の byte 数・peak の再実測ではない。別 rustc 稼働中のため時間の再計測なし。条件・保証範囲・初回 release build と修正後の証拠は D15 を参照 |
 | **I1 段 2a / 2b 実装・自動検証済み／実機確認待ち** | IME 補正の共有（D10「設定・入力」）: 本体 `ime_focus` の egui 依存部分（入力補正 plugin・single-line helper）を共有クレートへ挙動不変で切り出し、本体とエディタのホストが policy を登録する | **段 2a（2026-10-09、`367f9c9d3`・独立実装レビュー ACCEPT）**: `egui-ime` と本体 facade、既存呼び出し元を維持。既存 23 件は共有 16 / 本体 7 に配置、raw 禁止・adapter を追加（共有 17 / 本体 12 passed）。full gate 12,681 passed / 58 ignored、fmt / glyph、通常 profile の確認用 build 成功。**段 2b（同日、未コミット）**: 全域 Tab policy を挙動不変で共有化、本体 facade・既存 5 テストを維持。エディタの登録入口・5 欄 helper・Undo gate・raw 禁止を実装、歌詞 buffer / widget ID / native Undo と Hz DragValue を維持。利用者承認でモジュレータ見出しを不変 ID に固定し、同型箇所も調査。追加 13 テスト、UI 117 / ラボ 75 / core 80 / 共有 17 passed、既存 L1〜L3 全件維持、変異 6 件を検出。本体 Tab / IME / 関連・snapshot も通過。full gate **12,694 passed / 58 ignored / 0 failed**、fmt / glyph / 依存検査、ラボ release build 成功。独立実装レビュー **ACCEPT、指摘なし**。build-dev 再実行・コミット・アプリ起動なし。詳細は D10「I1 設計」§7・§8。**実装・自動検証は完了、実機確認・最終受け入れは未完了**。本体の確認用 exe は更新せず、ラボの確認用 exe は `target/release/musicvideo_lab.exe` |
 | **H3a** | 解析契約の確定: 正規の較正区間（出力尺に合わせた PCM か全尺か）と解析の時刻列・seek 復帰の規則を決める | [引き継ぎ監査](music-video-handoff-20260907.md) §3 H3。可変時刻列と較正入力差をテストで固定。無変調ハッシュ維持 |
 | **H3b** | 一致の検証（P4b 接続後） | プレビューで表示したフレームが、同じ時刻の書き出しフレームと一致する: 表示フレームの欠落、前後への seek、直接 seek、音源より短い / 長い出力尺。これが通るまで H3 を完了扱いにしない |
