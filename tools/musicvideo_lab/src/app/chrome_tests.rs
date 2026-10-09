@@ -328,6 +328,118 @@ fn l3_review_status_details_preserves_hidden_material_actions_and_progress() {
     );
 }
 
+#[test]
+fn l3_review_status_details_survives_async_completions_and_keeps_menu_actions() {
+    let font = crate::project::load_default_font();
+    for width in [500.0, 1400.0] {
+        for completed in 1..=7 {
+            let mut h = Harness::new(width);
+            crate::project::setup_egui(&h.ctx, font.as_ref());
+            // A font notice remains unresolved even when an image finishes loading.
+            h.app.preview_report.unresolved_assets = vec![UnresolvedAsset::Font("missing".into())];
+            let (export_tx, export_rx) = mpsc::channel();
+            h.app.export_pending = Some(ExportPending {
+                cancel: Arc::new(AtomicBool::new(false)),
+                progress: Arc::new(AtomicUsize::new(20)),
+                total_frames: 100,
+                rx: export_rx,
+            });
+            let path = PathBuf::from("loaded.png");
+            let image = Arc::new(ImageAsset::new(1, 1, vec![2, 3, 4, 255]).unwrap());
+            let lease = h
+                .app
+                .resource_store
+                .as_ref()
+                .unwrap()
+                .store_image(path.clone(), &image)
+                .unwrap();
+            let (image_tx, image_rx) = mpsc::channel();
+            h.app.image_pending = Some(ImagePending {
+                request: ImageLoadRequest {
+                    session: h.app.document.id(),
+                    target: ImageLoadTarget::AddLayer,
+                    target_lifetime: None,
+                    path: path.clone(),
+                },
+                cancel: Arc::new(AtomicBool::new(false)),
+                rx: image_rx,
+                queued: None,
+            });
+            h.click("詳細");
+            h.frame(vec![]);
+            assert!(egui::Popup::is_any_open(&h.ctx));
+            assert!(h.app.document.is_dirty(&h.app.project));
+
+            // Deliver actual worker messages through the production completion handlers.
+            // Loads/export keep update's pre-editor order; saving is polled after input.
+            if completed & 1 != 0 {
+                export_tx
+                    .send(Ok(ExportOutcome::Completed {
+                        output_dir: "frames".into(),
+                        stats: crate::export::RenderStats {
+                            frames: 100,
+                            width: h.app.project.output.width,
+                            height: h.app.project.output.height,
+                            fps: h.app.project.output.fps,
+                            analysis: Default::default(),
+                            composition: Default::default(),
+                            total: Default::default(),
+                            realtime_ratio: 1.0,
+                        },
+                    }))
+                    .unwrap();
+            }
+            if completed & 2 != 0 {
+                image_tx.send(Ok((path.clone(), image, lease))).unwrap();
+            }
+            h.app.poll_loads(&h.ctx);
+            h.app.poll_export();
+            if completed & 4 != 0 {
+                let checkpoint = h
+                    .app
+                    .document
+                    .begin_save("saved.mivmv.json".into(), &h.app.project);
+                let (tx, rx) = mpsc::channel();
+                h.app.project_save_pending = Some(ProjectSavePending { checkpoint, rx });
+                tx.send(Ok(())).unwrap();
+            }
+            for _ in 0..3 {
+                h.frame(vec![]);
+            }
+            assert_eq!(h.app.export_pending.is_none(), completed & 1 != 0);
+            assert_eq!(h.app.image_pending.is_none(), completed & 2 != 0);
+            assert_eq!(h.app.document.is_dirty(&h.app.project), completed & 4 == 0);
+            assert!(
+                egui::Popup::is_any_open(&h.ctx),
+                "details closed: width={width}, completed={completed}"
+            );
+            let item = h
+                .output
+                .shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::Shape::Text(t) if t.galley.text() == "未解決の素材 1 件" => {
+                        let pos = t.pos + t.galley.rect.center().to_vec2();
+                        // At wide widths the status row also has this button. Click the popup's item.
+                        h.ctx
+                            .layer_id_at(pos)
+                            .filter(|layer| layer.order == egui::Order::Foreground)
+                            .map(|_| pos)
+                    }
+                    _ => None,
+                })
+                .expect("visible unresolved-material action inside the open details popup");
+            h.frame(pointer(item, true));
+            h.frame(pointer(item, false));
+            assert!(
+                h.app.show_missing_resources,
+                "menu action ignored: width={width}, completed={completed}"
+            );
+            assert!(!egui::Popup::is_any_open(&h.ctx));
+        }
+    }
+}
+
 fn pointer(pos: egui::Pos2, pressed: bool) -> Vec<egui::Event> {
     vec![
         egui::Event::PointerMoved(pos),

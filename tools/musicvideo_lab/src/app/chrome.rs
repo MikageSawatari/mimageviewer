@@ -276,6 +276,7 @@ impl MusicVideoLabApp {
             cancel_budget / cancel_count as f32
         };
         let mut right = row.right();
+        // Keep automatic widget IDs independent of conditional siblings in the parent.
         let mut draw_cancel = |salt, full: &str, short: &str, tiny: &str, action| {
             let label = if !compact {
                 full
@@ -297,7 +298,7 @@ impl MusicVideoLabApp {
             right = rect.left() - gap;
             let mut child = ui.new_child(
                 egui::UiBuilder::new()
-                    .id_salt(salt)
+                    .id(salt)
                     .max_rect(rect)
                     .layout(egui::Layout::left_to_right(egui::Align::Center)),
             );
@@ -312,7 +313,7 @@ impl MusicVideoLabApp {
         };
         if cancel_export {
             draw_cancel(
-                "status-cancel-export",
+                "musicvideo-status-cancel-export",
                 "書き出しをキャンセル",
                 "書出取消",
                 "E",
@@ -321,7 +322,7 @@ impl MusicVideoLabApp {
         }
         if cancel_resources {
             draw_cancel(
-                "status-cancel-resources",
+                "musicvideo-status-cancel-resources",
                 "素材読込をキャンセル",
                 "素材取消",
                 "R",
@@ -343,7 +344,7 @@ impl MusicVideoLabApp {
             egui::Rect::from_min_size(egui::pos2(left, row.top()), egui::vec2(menu_width, height));
         let mut menu_ui = ui.new_child(
             egui::UiBuilder::new()
-                .id_salt("status-details")
+                .id("musicvideo-status-details")
                 .max_rect(menu_rect)
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
@@ -377,7 +378,7 @@ impl MusicVideoLabApp {
             );
             let mut info = ui.new_child(
                 egui::UiBuilder::new()
-                    .id_salt("status-info")
+                    .id("musicvideo-status-info")
                     .max_rect(rect)
                     .layout(egui::Layout::left_to_right(egui::Align::Center)),
             );
