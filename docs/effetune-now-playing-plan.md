@@ -3,7 +3,8 @@
 状態: **設計案・未実装、利用者への質問は §7**。2026-10-09。
 対象は **v4.5.0 の次のリリース**。Coordinator は ClaudeCode、実装担当は Codex。
 調査基準は `next-effetune` / `33a018417e13a271be2da2c109fa571f64079684`。
-今回はこの設計書と `target/F-design-msg.txt` だけを作る。vendor 差し替え、製品コード、
+初稿の引き継ぎは `target/F-design-msg.txt`。R2は設計commit `5b0dc1877` の独立レビューP2六件と
+Coordinator決定を反映し、この設計書と `target/F-design-r2-msg.txt` だけを変更／作成する。vendor 差し替え、製品コード、
 署名、製品／プラグインの起動、コミットは行わない。
 
 ## 0. 前提と証拠の読み方
@@ -133,16 +134,17 @@ Now Playingは保存状態と分離し、復元失敗で旧stateを消さない�
 ### 1.5 `0.12.0` / `424` 検索による変更一覧
 
 追跡テキスト全体を検索し、gitignoreのvendor原本VERSIONも別途読んだ。
-`424`を要求する実コードgateは見つからず、実gateはmanifestの全path/hash固定である。
+`424`を直接要求する実コードgateは見つからないが、VERSION込み**425**をassertする
+`crates/launcher/build_effetune_source.rs:173` がある。manifestの全path/hash固定と件数assertを両方更新する。
 **一括置換しない**。以下の現行pinは更新し、過去の証拠と無関係な数字は残す。
 
 | 現在の参照 | 実装時の変更 |
 | --- | --- |
 | `scripts/effetune-distribution.ps1:37`, `:41`, `:52`, `:95`, `:132`, `:133` | 承認版、復旧文、manifest参照をv0.13.0へ。任意VERSIONを受け入れる緩和はしない |
-| `crates/launcher/build_effetune_source.rs:11`, `:75`, `:168`; `build_effetune.rs:23` | 原本pin／実vendor test／復旧文を更新 |
+| `crates/launcher/build_effetune_source.rs:11`, `:75`, `:160`, `:168`, `:173`; `build_effetune.rs:23` | 原本pin／実vendor test／復旧文を更新。test名の425と`assert_eq!(manifest.len(), 425)`も449へ |
 | `scripts/test-effetune-distribution.ps1:46`, `:54`, `:67`, `:139` | synthetic fixtureを新しいpinへ。欠落／追加／非PE改変／偽署名等の負例を維持 |
 | `src/ui_dialogs/about.rs:68`, `:75`, `:82`, `:398` | 3通知のinclude／VERSION一致検査と補足項目の見直し |
-| `CLAUDE.md:1029`, `:1725`, `:1747`; `docs/release-operations.md:310`; `docs/effetune-integration-plan.md:10`, `:381` | 現行配置・件数・配布契約を更新。旧§10.2／§10.3の実績は履歴として残し、新版節から現行手順を示す |
+| `CLAUDE.md:1029`, `:1725`, `:1747`; `docs/release-operations.md:231`, `:310`; `docs/effetune-integration-plan.md:10`, `:381` | 現行配置・件数・配布契約を更新。release-operationsの署名前425照合は449へ。旧§10.2／§10.3の実績は履歴として残し、新版節から現行手順を示す |
 | `scripts/gen-effetune-docs.py:4`, `:27`; `docs/effetune-docs-overrides/README.md:8`, `:101`; `selection.json:27` | 新版に対応する上流日本語snapshotの正確なcommitを取得・記録し、DEFAULT_SOURCEとoverrideを再照合。旧snapshotを新版とラベルだけで称しない |
 | `scripts/test_gen_effetune_docs.py:153`, `:157`, `:161`, `:177`, `:207`, `:234`, `:257`, `:268`, `:274`, `:283`以降 | 新版生成／入口／snapshot対応testを更新。旧版不一致の負例は残せる |
 | `htdocs/mimageviewer/manual/effetune.html:92`, `:93`; `manual/effetune/index.html:8`; `htdocs/sitemap.xml:74`以降 | 新版HTMLをconverterで生成して入口を切替、sitemapを再生成。旧v0.12.0の版別HTMLは既存converter方針どおり保持 |
@@ -222,9 +224,9 @@ JSだけから「SFZの全sampleがWebView内にコピーされる」とは書�
 | 現行説明と根拠 | 実装時の扱い |
 | --- | --- |
 | `htdocs/mimageviewer/index.html:1213`「AI処理はすべてPCの中で」本文は画像AI4種類とGPUを列挙 | 画像AIの説明を維持。Adaptive PredictionまでGPU動作の保証を広げない。音声予測はPC内の音響処理という説明にし、native確認の根拠を別途得る |
-| `同ファイル:1219`「通信するのは4つの場面だけ」; `privacy.html:212`通信一覧 | Now Playingはcore→ローカルhost→pluginのIPCであり、新しいHTTP endpoint／通信先を足さない。新Remote JSの存在だけで第5の場面を追加しない。上記VST経路の静的調査＋新版の実機network確認を公開前gateとする。新しいlisten／外向き通信が観測されたら両ページを同時修正し、同梱可否をClaudeCode／利用者へ戻す |
+| `同ファイル:1219`「通信するのは4つの場面だけ」; `privacy.html:212`通信一覧 | Now Playingはcore→ローカルhost→pluginのIPCであり、新しいHTTP endpoint／通信先を足さない。新Remote JSの存在だけで第5の場面を追加しない。上記VST経路の静的調査と、起動／idleだけでなくSFZ選択・load・reload、Adaptive Prediction Learn／実音声処理時のhost／WebView子プロセスの通信・I/O観測を公開前gateとする（§6.2）。同梱はgate通過が条件。新しいlisten／外向き通信が観測されたら説明を確定する前に同梱可否をClaudeCode／利用者へ戻し、合意した内容で両ページを同時修正する |
 | `privacy.html:139`, `:166` と `index.html:1247` のEffeTune保存データ | SFZの楽器／参照情報を追加する必要がある。nativeの正確な保存先確認後に記述し、保存先不明のままIRと同じと決めない。Now Playingはplugin instance内の一時情報でpreset／historyへ保存しない（作者契約）。画像生成で利用する既存サムネcacheとは区別する |
-| `manual/effetune.html:92`以降、版別説明書、DSP NOTICE案内 | 新版の説明書snapshot／VST向けoverrideを用意。曲情報／画像、空欄、pause／stop、起動時Visualizer、SFZの外部ファイル依存、local処理、portable非対応を平易に説明。EffeTune独立版のRemote／media playerをmIVで使える説明として残さない |
+| `manual/effetune.html:92`以降、版別説明書、DSP NOTICE案内 | 新版の説明書snapshot／VST向けoverrideを用意。曲情報／画像、空欄、pause／stop、Remote EOF後の保持、起動時Visualizer、SFZの外部ファイル依存、local処理、portable非対応を平易に説明。EffeTune独立版のRemote／media playerをmIVで使える説明として残さない |
 
 privacy.htmlの英語側（`:315`, `:338`）も同じ内容へ更新する。
 実装が未完了の今回、製品ページの断定文を書き換えない。
@@ -260,8 +262,11 @@ error／EOFが新ownerを消去しないよう一致を条件にする。同じp
 
 ### 3.2 Rust IPC: protocol 6、typed Cmd、応答なし
 
-- `src/video/dsp/bridge.rs:40` と `crates/vst3-host/include/protocol.h:91` のversionを5→6。
-  helloコメント (`protocol.h:13`)、handshake test、host identityとexeも同時更新する。
+- `src/video/dsp/bridge.rs:40`、`crates/vst3-host/include/protocol.h:91`、独立testerの
+  `crates/vst3-host-tester/src/bridge.rs:19` のversionをすべて5→6。
+  helloコメント (`protocol.h:13`)、ready例 (`protocol.h:30`) と
+  `crates/vst3-host/tests/smoke_hello.py:68` のコメント、`:69` のhello送信値、`:75` の応答version assertも6へ。
+  本体／testerのhandshake test、host identityとexeも同時更新する。v5 hostの拒否回帰は維持する。
 - `Cmd` はinternally tagged enum (`bridge.rs:73`)。新variantは明示的renameで
   `set_now_playing`。wire keyの順は `cmd`, `slot_id`, `revision`, `title`, `album`, `artist`,
   `artwork`, `artworkMimeType` とし、revisionは診断用、artworkはbase64文字列。
@@ -273,10 +278,15 @@ error／EOFが新ownerを消去しないよう一致を条件にする。同じp
   現C++のfield抽出は名前探索であり (`main.cpp:654`, `:659`)、ユーザーtitle内の
   `cmd`／`slot_id`風文字列に誤認しないserialization／抽出testを付ける。
   必要な新コマンドのfieldはJSON-awareなtop-level抽出で検証し、既存汎用parserをついでに全置換しない。
-- 4byte little-endian長 + UTF-8 JSON。32 MiBのgateは維持
+- 4byte little-endian長 + UTF-8 JSON。以下の三つの上限を別々に検査する。
+  JSON frame bodyは**33,554,432 bytes（32 MiB）**まで。4byte長prefixは含めず、確保前に検査する
   (`protocol.h:100`, `main.cpp:119`, `bridge.rs:1179`)。
-  8 MiB画像のbase64は11,184,812 bytes、3文字列の最大escapeを足しても32 MiB内。
-  C++はencoded長／decoded長を**確保前／decode中**に8 MiB以下へ検証する。
+  wireのbase64文字列は標準alphabet／padding付き、**11,184,812 ASCII文字（同bytes）**まで
+  (`4 * ceil(8,388,608 / 3)`)。JSONから取り出した文字列の長さであり画像bytesではない。
+  decode後の画像は**8,388,608 bytes**まで。paddingから実decoded長を確保前に計算し、decode中も検査する。
+  8,388,609 bytesの画像もbase64長は11,184,812になり得るため、wire長の検査だけでは拒否できない。
+  3文字列の最大escapeを加えた正常な最大画像frameは32 MiB内。decoded画像の8 MiB上限を
+  base64文字列へ適用しない。JSON frame内のescape分はframe上限で別途扱う。
   malformed base64、型不正、MIME不一致ではnotifyしない。
 - **reply eventなし**を推奨。受理／拒否／slot不在はC++ stderr logだけ。
   既存の応答なしGUI命令は `main.cpp:950`。共有event_rxへ汎用Error／ackを投げない。
@@ -290,8 +300,8 @@ error／EOFが新ownerを消去しないよう一致を条件にする。同じp
 
 ### 3.3 C++: per-slot plugin UI threadで通知
 
-`main.cpp`で新命令をslotにdispatchし、PluginLoaderが所有payloadをmoveして
-既存 `post_async` (`plugin_loader.cpp:702`, `:1753`) へ投げる。
+新命令は§3.3.1のslot単位mailboxへ渡し、軽量wakeだけをcontrol threadから
+既存 `post_async` (`plugin_loader.cpp:702`, `:1753`) へ投げる。snapshotごとのtaskは作らない。
 **audio threadや音声state fenceでは実行しない**。GUI未表示でもload時のper-slot threadがある。
 
 GUI task内で次を行う:
@@ -313,8 +323,75 @@ GUI task内で次を行う:
    allocation、各setter、notifyのtresultをチェック。notifyが終わるまでpayloadを保持する。
    logはslot、revision（診断用）、receiver、tresult、画像byte数のみ。title／画像base64をlogへ出さない。
 5. slot破棄後へraw pointerだけのtaskを残さない。既存unloadはGUI queue上で行う
-   (`plugin_loader.cpp:2532`)。同じcontrol順序でpostしたtask→unloadを検証し、
+   (`plugin_loader.cpp:2532`)。§3.3.1のClosed状態と同じcontrol順序のtask→unloadを検証し、
    quarantine／thread未準備／component無しはlogして破棄する。UIを開くための同期waitを追加しない。
+
+#### 3.3.1 bridge内も実行中一件＋最新pending一件に限定する（R2 / P2-2）
+
+現受信readerは全JSONを `cmd_queue_` に積む (`main.cpp:314`, queue宣言`:1876`)。
+GUI taskも無制限のdequeへ積む (`plugin_loader.cpp:734`)。Rustだけのlatest mailboxでは
+この二箇所のMB級滞留を防げない。新commandは**readerの受信・検証境界から**専用mailboxへ分岐し、
+完全なJSON／画像を既存cmd_queueやGUI taskのcaptureへ入れない。
+
+- live slotごとに、slot incarnationに結び付いたshared mailboxを一つ登録する。
+  状態は `Idle / Scheduled / Running / Closed` の単一ownerとし、Running snapshot一件と
+  **最新pending snapshot一件**だけを保持する。受信readerはbounded parse／base64 decode後にpendingを
+  置換し、古いbufferを解放する。未知slot／Closedへの入力はlogして捨て、readerからplugin APIを呼ばない。
+  初期化完了前にはRegisterBridgeが発行されないため、未登録slotへのmetadataを保存する別queueは不要。
+- Idle→Scheduledのときだけ、mailboxへのshared handleを持つ**軽量wake一件**をcmd_queueへ積む。
+  control側は同じtokenをGUIへ移す。GUI開始待ち／Running中の追加snapshotはpending置換だけで、
+  wakeを増やさない。GUI task開始時に最新pendingをRunningへmoveし、lockを解放して通知する。
+  完了時にpendingがあれば次の軽量wakeを一つcontrolへ返し、無ければIdleへ戻す。
+  GUI thread上のpost_asyncはinline実行する (`plugin_loader.cpp:703`) ので、そこで自己再帰／無限drainせず、
+  control経由で次taskをqueueへ渡して他のGUI処理へ機会を返す。未実行wakeは全段合計一件まで。
+- clearも同じmailboxの空snapshotであり、別queueへ逃がさない。受信済み最大revisionをwatermarkとして、
+  clearより古いrevisionを再採用しない。より新しいmediaでclearが置換されることは許す。
+  既に実行開始した旧notifyは取り消せないが、その後はclearまたはそれより新しいsnapshotだけを通知する。
+- remove／unload／resetでslot自体を廃棄する際は、readerがその制御命令を受け付けた順序で
+  旧mailboxへのadmissionをClosedにしpendingを捨て、既存制御命令をqueueへ渡す。
+  未開始wakeはshared ownerのClosedを見て何もしない。Closedはadmissionの終了であり、既にRunningの
+  payload／開始時刻は完了まで保持し、Closed後もwatchdogの監視対象に残す。完了callbackは再起床しない。
+  Runningを途中解放せず、既存unloadのGUI直列経路で
+  完了後にloaderを破棄する（hangなら§3.3.2でprocess終了）。同じslot_idを再利用しても新incarnationと
+  新mailboxを作り、旧wake／旧完了callbackから新slotへアクセスしない。taskはbare loader pointerだけを捕まえない。
+  このsealはslotを実際に廃棄する命令だけに適用し、通常seekのDSP resetやpreset reloadではClosedにしない。
+- mailboxの画像保持はrunning8 MiB＋pending8 MiB＝**16 MiB以下**。
+  readerの一時frameは32 MiB以下、一時decode候補は8 MiB以下。frameを二つのqueueへ複製せず、
+  JSON fieldはframe内view／有界抽出で扱う。置換中の旧pendingと候補の一時共存はこの読取予算に含める。
+  IMessageへのコピー一件も最大8 MiBなので、Now Playing用途の専用host（送り先一slot）が所有する
+  画像／frame部分はこれらの合計
+  **64 MiB以下**（text／小さい構造の予算は別）。plugin／WebView自身の内部コピーはこのhost保持予算には含めない。
+  slow-GUI headless試験で件数・byte数のhigh-waterと、slot破棄後の解放を実測する（§6.1）。
+
+この共用mailboxは二段の各queueに別pendingを置く設計ではない。slow receiverでは中間snapshotを
+省略し最新完全snapshotへ収束するため、各更新のFIFO配送を保証するという初稿の表現は撤回する。
+clear／incarnationの順序と、適用revisionが後退しない不変条件を保証する。
+
+#### 3.3.2 通常の拒否とGUI hangを分ける（R2 / P2-1）
+
+`post_async`には期限監視が無く (`plugin_loader.cpp:702`)、既存watchdogは
+Running getStateだけを監視する (`main.cpp:460`)。notifyが戻らないと後続getStateもQueuedのままで、
+この監視には掛からない。新しいRunning mailboxにはGUI task開始時刻を持たせ、
+既存独立watchdog (`main.cpp:447`) から**実行開始後5秒**を監視する。
+上限は `kPluginStateTimeout` (`plugin_loader.cpp:599`) と同じ固定値。
+message構築／receiver query／setter／notifyを含むtask開始前後で登録・解除し、
+plugin API呼出し中はmailbox／watchdogのlockを保持しない。queue待ちはnotify実行時間に含めない。
+
+- setter失敗、payload拒否、interface無し等でtaskが戻る通常失敗はlogし、音響処理を維持する。
+- taskが戻らず期限超過した場合は既存GUI timeoutの**process終了方針**
+  (`plugin_loader.cpp:602`, `:616`) に合わせ、診断を残して専用EffeTune hostを終了する。
+  既存helperには汎用Error送信もある (`plugin_loader.cpp:613`) が、Now Playingのtimeout経路では
+  それを通常応答として流用せず、stderr診断→process終了にする。終了検知をHostLostへ一意に流す。
+  GUI threadへのcancel／join／notify retryで解除を待たない。metadataの通常ackは増やさず、
+  getState応答を待つ経路にもhostの死亡が伝わる既存経路を使う。
+- 既存host monitor (`src/effetune/mod.rs:1534`, `:1550`) → `fail(HostLost)`
+  (`:1578`) → EffeTune slot clear →音声素通し／利用者へ一度の故障通知に収束する。
+  この実行中は自動再起動しない (`docs/effetune-integration-plan.md:89`, `:281`)。
+  専用hostなのでユーザーVSTチェーンを終了させない。§7.6の「効果を止めない」は通常失敗だけに適用する。
+  故障の案内はcontrollerのFailedへの遷移で一度だけ発行し、毎frameのruntime参照や複数の未完了要求から
+  重複発行しない。timeoutによる未完了の状態取得で保存済みpreset／stateを上書きしない。
+  現Appのpoll入口 (`src/app.rs:29146`) は故障toastを発行していないため、実装ではpoll前後の
+  canonical runtimeのFailedへの変化をUIが一度通知する。通知済みboolを窓ごとに増やさない。
 
 ### 3.4 worker送信と初期化後の再送
 
@@ -334,8 +411,9 @@ plugin再作成はRegisterBridge（または同じ意味の初期化完了通知
 Disableは送信先Weakを外す既存経路 (`mod.rs:1026`) を維持。
 Unavailable／portableではsource I/O・artwork job・transport送信を開始しない。
 Idle／Loadingは軽いtext／source descriptorだけ保持し、利用可能なロード時に画像jobを始めればよい。
-音響調整の未使用だけを理由にpluginを起動しない。送信失敗を音響処理の失敗へ分類して
-EffeTune段をdisableすることもしない。失敗扱いは §7.6 の判断待ち。
+音響調整の未使用だけを理由にpluginを起動しない。通常のmetadata読込／受渡し拒否だけでは
+EffeTune段をdisableしない。host終了／notify hangは§3.3.2のHostLostへ収束させる。
+利用者への説明は §7.6。
 
 ## 4. metadata・画像の選択とlifecycle
 
@@ -348,7 +426,36 @@ EffeTune段をdisableすることもしない。失敗扱いは §7.6 の判断�
 | main／detached／parked live／tray | `src/app/viewer_context_registry.rs:3595`, `:3795` のcontext identityとread-only参照、`src/app.rs:14056` のresident presenter更新。mountやF12移送だけで別曲／clearにしない。既存playerの生存identityを維持 |
 | Remote start確定 | `src/remote_ipc/ui.rs:1562` のStable start→`:1581` publish。`AppRemoteVideoStreaming`のmetadata playerとrequested_path (`:565`) を使う。paused headlessのis_playingを根拠にしない |
 | Remote pause／seek／画質／音声track | `src/remote_ipc/ui.rs:2042`, `:2048` Play／Pause、session/generation検証。再生中mediaは維持。配信generationの切替はartwork completionのmedia identityと区別する |
-| Remote stop／cancel／切断／返却／error | `src/remote_ipc/ui.rs:1343`, `:1470`, `:1486`, `:2203` と `src/remote_ipc/session.rs:610`, `:629`。そのownerのmetadataだけclear。退役旧workerの終了で新曲をclearしない |
+| Remote session終了／cancel／切断／返却／error | `src/remote_ipc/ui.rs:1343`, `:1470`, `:1486`, `:2203` と `src/remote_ipc/session.rs:610`, `:629`。そのownerのmetadataだけclear。media EOF／端末側の最終停止はsession終了と扱わない。退役旧workerの終了で新曲をclearしない |
+
+#### 4.1.1 Remote EOFではclearしない（R2 / P2-3、Coordinator決定）
+
+現実装の `RemoteVideoStreamingSession::reconcile` (`src/video/stream/session.rs:865`, `:876`) は
+配信workerのEndedでもActiveを返す。これは生成完了であり端末側の再生完了ではない。
+Web側も最終停止は `setPlaying(false)` → Pauseとして送る
+(`crates/remote-web/web/video-stream.mjs:2805`, `:2846`)、app側の受理は
+`src/remote_ipc/ui.rs:2048`。`onEnded` はloop判定より先に進捗のendedを送る
+(`video-stream.mjs:2002`)。進捗handlerはresume更新用 (`src/remote_ipc/ui.rs:2351`) で、
+Now Playingの最終停止通知には使えない。
+
+`CLAUDE.md:111`の単純化を適用し、Remote EOFを識別する新command／終端通知／Remote protocol更新は
+**追加しない**。以下の表示仕様に固定し、最後の曲が終わった後にその曲名・画像が残ることを許容する。
+
+| Remoteの境界 | Now Playingの扱い |
+| --- | --- |
+| 配信生成Ended、端末ended進捗、Pause、端末側の最終停止 | 現在のmetadataを保持。clearの条件にしない |
+| 同曲loop | 保持。既存seek／再生を使い、配信generationが変わっても別mediaにしない（`video-stream.mjs:2863`） |
+| 次曲へ進む | 次のmediaがStable startで採用された時点で置換。next要求だけでは前曲をclearしない（`:2851`） |
+| 次曲が無い | 既存Web処理はPauseへ落ちる（`crates/remote-web/web/app.js:3160`, `:3173`）。metadataを保持 |
+| EOF後に同曲を再開 | 同じmediaのまま保持。session／media identityを新規採用した場合は通常start境界で再公開 |
+| Remote session終了／media close／cancel／切断／返却／error | 現ownerに一致する終了だけclear。Localが採用済みなら旧Remote終了でclearしない |
+| Local playbackが採用される | Local snapshotへ置換。表示窓のfocusだけでは置換しない |
+
+Remote progressのendedは、新旧session／owner generation／配信generationを問わずmetadata更新の入口にしない。
+旧generationの生成完了、旧session終了callbackも現在owner／registrationを照合し、現snapshotを変更しない。
+既存progressの順序／resume処理は維持する (`src/remote_ipc/ui.rs:2282`)。
+最終停止だけのclearを追加する境界は、この保持仕様では正しさのために不要と判断した。
+handler-level試験で、loop前ended、次曲なしPause、同曲再開、旧session／generation報告の不変性を確認する。
 
 detachedの述語／viewportを変える実装が必要なら、事前にClaudeCodeと独立reviewerで構造判断し、
 `docs/detached-rework-plan.md` §11へ記録する。単にmetadataを観測するためにwindow再生成や
@@ -414,11 +521,12 @@ sidecarの全file無制限read、EXIF全展開は新経路へ持ち込まない�
 
 ### 4.5 変更検知、clear、stale結果
 
-- media切替／明示stop／close／error／最終EOFでownerのrevisionを進める。
+- media切替／ownerに一致するclose／errorと、Localの明示stop／最終EOFでownerのrevisionを進める。
+  Remoteは§4.1.1のとおりEOF／端末最終停止では保持し、session終了または次の再生owner採用で更新する。
   明示clearは全空欄snapshot。新曲は旧artwork無しのtextを直ちに公開し、画像完了後に
   title／album／artistも含む完全snapshotを送る。source無しを前曲画像の保持にしない。
 - 推奨はpause／seek／buffering／同じ曲のloop／F12移送／最小化では保持。
-  EOF後の連続再生は次mediaの採用で置換し、play intentが残っていても最終停止はclear。
+  EOF後の連続再生は次mediaの採用で置換する。Localの最終停止はclear、Remoteの最終停止は保持。
   sourceの明示refresh／pin更新／metadata変更は同じmediaでも新revision。
   定期file pollやframeごとのbase64生成をしない。
 - ownerはtypedな `Empty` / `Media { identity, revision, text, artwork: Pending|Absent|Ready }` を
@@ -430,8 +538,9 @@ sidecarの全file無制限read、EXIF全展開は新経路へ持ち込まない�
   古いjobを破棄し最新入力で再発行する。同じsourceの既存cacheはworkerで再利用できる。
   Pending→Absentのみで送信内容が変わらない場合は再送不要。Clear→同path再開は新revisionを送る。
 - completionはmutex下の小さいrevision検査とArc置換だけ。古い画像は今のsnapshotを更新せず破棄。
-  host-controlは序列を崩さずC++へ送る。C++ GUI queueも同順に適用するので、古い画像を
-  新snapshotの後に適用することはない。write開始済みの旧snapshotが切替直後に一時的に見える可能性と、
+  host-controlは序列を崩さずC++へ送る。C++は§3.3.1のmailboxで中間値をcoalesceし、
+  clearのwatermarkとslot incarnationを守るので、古い画像を新snapshotの後に適用することはない。
+  write開始済みの旧snapshotが切替直後に一時的に見える可能性と、
   stale画像が後から戻る不具合は区別する。即時のプロセス間atomic表示まで保証しない。
 - registerされた新bridgeはtransportの送信revisionをリセットし最新値だけ再送。
   artwork jobのrevisionはmediaのrevisionであり、GUIの開閉やaudio DSP generationで失効させない。
@@ -451,7 +560,11 @@ sidecarの全file無制限read、EXIF全展開は新経路へ持ち込まない�
    再loadは音響state／連続音声を妨げ、snapshot更新で済む。
 4. **全応答／retry／配送保証を作る**: 不採用を推奨。notifyの結果はC++ log、
    sendはworker、resendはRegisterBridgeと次の正常media更新だけ。タイマーretry、
-   DB保存、rollback、旧画像回復、失敗の細分類を作らない。失敗時の見え方は §7.6 で合意する。
+   DB保存、rollback、旧画像回復、失敗の細分類を作らない。通常拒否とhost hangは分け、
+   hangは固定期限→専用host終了→HostLostへ一本化する。失敗時の見え方は §7.6 で説明する。
+5. **Remoteの最終停止だけを識別する境界を作る**: 不採用（CoordinatorのR2決定）。
+   EOF後も次項目／session終了／Local置換まで保持する表示を採用し、loop／次曲なし／同曲再開を
+   新しい終端状態や通知で分ける必要をなくす。最終曲名が残る仕様は§7.2に明記する。
 
 実装はレビュー可能な二つのchunkに分ける。
 
@@ -471,23 +584,44 @@ ClaudeCodeは署名済み最終artifact／release checklistと利用者のnative
 
 ### 6.1 自動・headless
 
-- Rust pure owner／fake transport: text-only→画像付き完全置換、各空欄clear、stop／close／error／EOF、
+- Rust pure owner／fake transport: text-only→画像付き完全置換、各空欄clear、Local stop／close／error／EOF、
   pause／seek保持、A→B→A、遅い旧画像、旧Remote退役、別context closeによる新曲不変、
   metadata準備遅延、Remote pause headless、Idle→RegisterBridge、再RegisterBridge（同値／emptyも再送）、
   portable／Unavailable（job／sendゼロ）。fake transportで順序、実slot、送信スレッドを検査する。
+- Remote handler-level: worker生成Ended、端末ended進捗（loop前も含む）、最終停止Pause、
+  次曲なしPause、同曲loop／EOF後再開ではmetadata保持。次mediaのStable採用／Local置換で更新し、
+  現ownerのsession終了だけclear。旧session／owner generation／配信generationのended／退役報告を
+  実handlerへ通して、現在のtext／画像／revisionが変わらないことを確認する。
+  resume進捗記録の既存順序回帰も維持し、Now Playing用の終端通知を増やしていないことを確認する。
 - serializationはfake Valueだけで済ませず、**実 `serde_json::to_vec(Cmd)` のbyte列**を検査。
   先頭 `{"cmd":"set_now_playing"`、JSON round-trip、空MIME、Unicode／quote／backslash／
   title内のkey風文字列、画像8 MiBのframe長。偽ackをevent_rxへ送らないことも検査する。
+  wire 11,184,812文字の最大画像をdecodeして8,388,608 bytesとして受理し、
+  **8,388,609 bytes（同じwire長になり得る）**を拒否する。wire文字上限＋1、padding不正、
+  JSON frame 33,554,432 bytesのframing受理／＋1の確保前拒否を各層で別々に試験する。
+  最大image frameの受理はC++側でも確認し、Rustのserialize成功だけで済ませない。
 - C++非plugin fake: component／controller別・同一identity、component受理時の一回、controller fallback、
   no interface、各setter失敗、tresult、GUI thread ID、unload前後queue順とpayload寿命。
   4095／4096／4097 UTF-16単位、emoji境界、NUL、malformed UTF-8／surrogate、base64長／decode超過、
   MIME、unknown slot。SDK HostMessageでsetString／setBinaryの実コピーも検査する。
+- C++ slow-GUI headless: fake receiverを期限内で意図的に待たせ、実stdin frame→mailbox→GUI経路へ
+  最大画像を多数連投する。generic JSON queueに画像ゼロ、running≤1、pending≤1、未実行wake≤1、
+  mailbox画像≤16 MiB、reader候補≤8 MiB／frame≤32 MiB／bridge画像・frame合計≤64 MiBを
+  high-water counterでassert。clear後の古いrevision、clear→新media、slot close／同ID再利用、
+  closeとRunning完了の競合を通し、古い画像の復活が無く最終値へ収束し、全payloadが解放されることを確認する。
+- C++ hang headlessはfake receiverを子host内で戻らなくし、後続getStateがqueue待ちでも
+  実行開始後5秒＋watchdog tick余裕でhostが終了することを親harnessから確認する。
+  slot close後もRunning期限監視が残る場合を含む。Rust側ではHostLost→Failed／slot clear→素通し、
+  利用者通知一回、ユーザーVST不変、自動再起動なしを検査する。通常kInvalidArgumentではhostを終了しない。
 - artwork: sidecar優先、設定OFF、MP3前面表紙、非MP3無画像、video pin優先、source変更、
   static WebP再利用、large input縮小、1024px境界、EXIF回転、透過、GIF等first frame、
   JXL／HEIC／RAW、decode／encode失敗、8 MiB境界、bounded入力／割当、cancel後の新source不変。
 - 配布: `scripts/test-effetune-distribution.ps1`、launcher source approval／publisher／path tests、
   `src/runtime_cleanup.rs`のlease／publisher／旧版／reparse tests、about全文一致。
   manifest449 entry、欠落／余計なファイル拒否、署名stage改変拒否、portable非同梱も検査。
+- protocol gate: 本体／C++／testerのv6一致、旧v5 host拒否、
+  `smoke_hello.py`のhello=6／ready=6を実行する。独立testerは
+  `cargo check -p vst3-host-tester --bin vst3-host-tester` で検証し、tester GUIは起動しない。
 - 狭い `cargo test -p mimageviewer --lib <filter>`、CMake build＋ctestの後、
   `cargo fmt --check`、UI文字列追加なら `python scripts/check_ui_glyphs.py`。
   共有protocol／Local／Remoteを変更するため最終は `scripts/test-full.ps1`。
@@ -502,13 +636,26 @@ ClaudeCodeが具体的scenario／所要時間／desktop利用／データ範囲�
 1. 新bundleのUIを開く前の送信→Visualizerへtitle／album／artist／画像表示。
    UI閉じる→再度開く、plugin初期化し直し→同曲を再送、起動時Visualizer選択。
 2. 日本語／emoji、長い文字列、欠落tag、画像無しの次曲、MP3 APIC／同名画像、動画代表pin／sidecar。
-   pause／seekで保持し、stop／close／最終EOFで消える。速い曲送りで前曲画像が戻らない。
+   pause／seekで保持し、Localのstop／close／最終EOFで消える。速い曲送りで前曲画像が戻らない。
 3. main／別窓／F12移送／tray、Remote開始・切替・pause・seek・stop・切断・返却。
-   Remoteでplugin GUIが隠れる既存方針を変えず、返却後に古い曲が戻らない。
+   Remoteでplugin GUIが隠れる既存方針を変えず、EOF／loop／最終停止／次曲なしでは保持する。
+   同曲再開、次曲採用、session終了、Local置換で§4.1.1どおりになり、返却後に古い曲が戻らない。
 4. 同じv0.12.0保存状態とpresetを新版で読んで効果を維持。SFZのfolder選択／再起動後の参照、
    保存先／外部file依存、Adaptive Predictionと既存EQ／oversamplingのnative処理を確認。
-5. 新版起動・UI open／idleでplugin host／WebView由来のlisten／外向き接続を記録。
-   mIV Remoteを明示ONにした通信や利用者による外部リンクopenと区別する。
+5. **新版同梱・公開の通信／I/O gate**。通常起動・UI open／idleに加え、実音声を流しながら
+   SFZ folder選択、楽器load／sample読取、reload、UI再open／アプリ再起動後の参照復元、library removeを
+   使い捨てfixtureで実使用する。Adaptive PredictionもLearn値変更／学習、Freeze解除、
+   実音声処理／Resetを実使用する。各段階で専用hostと全WebView子プロセスのPID／親子関係、
+   listen endpoint、外向き接続先／port／時刻、成功・失敗・観測不能の結果を記録する。
+   mIV Remoteの明示ON、利用者の外部リンクopen、OSによる選択済み共有folderへのアクセスは別記する。
+   観測不能／未実施を「通信無し」と扱わない。
+   同じ枠でSFZの保存path、元fileへの参照かcopyか、cache／index／sampleの範囲、再起動後の参照保持、
+   library remove／runtime世代cleanupの削除範囲をfile I/Oと前後inventoryで確認する。
+   元SFZ／sample、利用者の他のdataが勝手に削除されないことと、mIVのruntime cleanupから
+   SFZ保存領域が分離されることを確認する。normal-profileの設定をagentが操作するtest setupは行わない。
+   **gate通過条件**は、実使用中を含め説明外のlisten／外向き通信が無いこと、保存／参照／削除範囲を
+   根拠付きで特定できること、public/privacy/manualの説明と一致すること。
+   未確認や説明外の挙動は同梱・公開を保留しClaudeCode／利用者へ戻す。追加機能を無断で削って通さない。
 6. 署名後の最終launcherで新世代公開、全448ファイル／VERSION／署名hash一致、
    再起動reuse、欠落修復、新旧世代の使用中保護と次回cleanup、長pathの拒否、
    通常版／installer同梱・portable非同梱を検査する。
@@ -528,22 +675,28 @@ bundleを足して今回のnative受入れの代わりにはしない。新版pl
 1. **曲名がファイルに入っていないとき、ファイル名を出しますか。**
    推奨: 拡張子を除いたファイル名を出す。アルバム名とアーティスト名は、情報が無ければ空欄。
    絶対パスやURLは渡さない。
-2. **一時停止中は曲情報を残し、停止・閉じる・最後まで再生して終了したときに消してよいですか。**
-   推奨: 残す。シーク中や読み込み待ちでも消さない。次の曲へ移るときは前の画像をすぐ消す。
+2. **一時停止中は曲情報を残し、リモートでは最後の曲が終わった後も残してよいですか。**
+   推奨: はい。シーク中や読み込み待ち、同じ曲の繰り返しでも残す。
+   PCでの再生は停止・閉じる・最後まで再生して終了したときに消す。
+   リモートは次の項目、再生セッションの終了、PC側の再生への切り替えまで残す。
+   次曲へ切り替わったら前の画像を消す。リモートの最後の曲名が残る扱いはCoordinatorの決定済み方針。
 3. **画像は長辺1024ピクセルまで、動く画像は最初の一枚でよいですか。**
    推奨: はい。再生を待たせず、先に曲名を出し、画像が用意できたら表示する。
    音楽は同名画像・MP3表紙、動画は一覧と同じ代表画像を使う。
 4. **曲情報は音響調整の使用中に自動で渡し、専用のON/OFF設定は増やさなくてよいですか。**
    推奨: はい。PC内のプラグインに渡すだけで、未使用ならプラグインをこのために起動しない。
    Visualizerで表示するかと起動時の画面はEffeTune側で選ぶ。
-5. **新版の追加機能はそのまま同梱し、説明はmIVから実際に使える機能に限ってよいですか。**
-   推奨: はい。SFZの外部ファイルと保存先を確認して説明を補う。
+5. **追加機能を実際に使って通信と保存先を確認できたら、新版を同梱してよいですか。**
+   推奨: はい。SFZの選択・読み込み・再読み込みと、音声予測の学習・処理中も確認する。
+   保存されるファイル、元ファイルへの参照、削除の範囲を確かめ、説明はmIVから実際に使える機能に限る。
    独立版EffeTuneのLANリモート操作は、mIVでも使えるとは案内しない。
-   今回のファイル調査ではVST版からの起動経路は見つからず、実機での通信確認は公開前に残る。
-6. **画像や曲情報の受け渡しだけが失敗しても音楽は続け、分かる範囲で知らせる扱いでよいですか。**
-   推奨: はい。画像読込やアプリからの送信失敗はログと一度の案内、画像は無しにする。
+   実機確認が終わるまでは同梱・公開の判断を保留する。説明外の通信や保存動作があれば相談する。
+6. **通常の受け渡し失敗では音響調整を続け、プラグインが固まったときは音響調整を停止して知らせる扱いでよいですか。**
+   推奨: はい。通常の画像読込やアプリからの送信失敗はログと一度の案内、画像は無しにする。
    プラグイン側の受理・拒否は返信を受け取らずログだけに記録するため、その失敗の画面通知は行わない。
-   次の曲の変更またはプラグインの次回初期化で送り直す。自動で繰り返したり、音響調整の効果を止めたりしない。
+   通常の拒否では効果を止めず、次の曲の変更またはプラグインの次回初期化で送り直す。
+   5秒戻らず固まった場合は音響調整用のプロセスを終了し、音声を素通しで再生し、一度知らせる。
+   ユーザーVSTは終了させない。自動で繰り返したり、再起動したりしない（Coordinatorの決定済み方針）。
    新曲へのnotifyが拒否されると作者契約上は前のsnapshotが残るので、この見え方も含めた合意が必要。
    拒否も画面へ知らせたい場合は、要求IDで専用routeへ返信を戻す追加設計が必要になる。
 
