@@ -13,6 +13,120 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 
+// This identity observes one worker invocation; it is not a lifecycle owner or
+// an admission check. Keep it entirely out of production builds.
+#[cfg(feature = "test-script")]
+struct DiagnosticRequest {
+    id: u64,
+    key: String,
+    idx: usize,
+    items_gen: u64,
+    input_seq: u64,
+    force_cache: bool,
+}
+
+#[cfg(feature = "test-script")]
+std::thread_local! {
+    static DIAGNOSTIC_REQUEST: std::cell::RefCell<Option<DiagnosticRequest>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(feature = "test-script")]
+static NEXT_DIAGNOSTIC_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(feature = "test-script")]
+pub(crate) fn diagnostic_current_id() -> u64 {
+    DIAGNOSTIC_REQUEST.with(|current| current.borrow().as_ref().map_or(0, |request| request.id))
+}
+
+#[cfg(feature = "test-script")]
+fn diagnostic_request_key(req: &LoadRequest) -> String {
+    let folder = match req.resolve_override {
+        Some(ResolveStrategy::FolderRepresentative) => true,
+        Some(_) => false,
+        None => {
+            req.zip_entry.is_none()
+                && req.pdf_page.is_none()
+                && req
+                    .cache_key_override
+                    .as_deref()
+                    .is_some_and(|key| key.starts_with(CACHE_KEY_FOLDER))
+        }
+    };
+    if folder {
+        format!("dir::{}", req.path.display())
+    } else if let Some(page) = req.pdf_page {
+        crate::grid_item::pdf_page_perf_key(&req.path, page)
+    } else if let Some(entry) = req.zip_entry.as_deref() {
+        format!("zip::{}#{entry}", req.path.display())
+    } else {
+        req.path.display().to_string()
+    }
+}
+
+#[cfg(feature = "test-script")]
+struct DiagnosticRequestScope(Option<DiagnosticRequest>);
+
+#[cfg(feature = "test-script")]
+impl DiagnosticRequestScope {
+    fn enter(req: &LoadRequest, display_px: u32) -> Self {
+        let request = DiagnosticRequest {
+            id: NEXT_DIAGNOSTIC_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
+            key: diagnostic_request_key(req),
+            idx: req.idx,
+            items_gen: req.items_gen,
+            input_seq: req.input_seq,
+            force_cache: req.force_cache,
+        };
+        crate::perf::event(
+            "qa",
+            "request_begin",
+            Some(&request.key),
+            request.input_seq,
+            &[
+                ("request_id", request.id.into()),
+                ("idx", request.idx.into()),
+                ("items_gen", request.items_gen.into()),
+                ("input_seq", request.input_seq.into()),
+                ("force_cache", request.force_cache.into()),
+                ("evaluated_display_px", display_px.into()),
+            ],
+        );
+        Self(DIAGNOSTIC_REQUEST.with(|current| current.replace(Some(request))))
+    }
+}
+
+#[cfg(feature = "test-script")]
+impl Drop for DiagnosticRequestScope {
+    fn drop(&mut self) {
+        DIAGNOSTIC_REQUEST.with(|current| current.replace(self.0.take()));
+    }
+}
+
+#[cfg(feature = "test-script")]
+fn diagnostic_record_source(should_save: bool, force_cache: bool) {
+    DIAGNOSTIC_REQUEST.with(|current| {
+        if let Some(request) = current.borrow().as_ref() {
+            crate::perf::event(
+                "qa",
+                "source",
+                Some(&request.key),
+                request.input_seq,
+                &[
+                    ("request_id", request.id.into()),
+                    ("idx", request.idx.into()),
+                    ("items_gen", request.items_gen.into()),
+                    ("input_seq", request.input_seq.into()),
+                    ("should_save", should_save.into()),
+                    ("force_cache", force_cache.into()),
+                    ("from_cache", false.into()),
+                ],
+            );
+        }
+    });
+}
+
 // -----------------------------------------------------------------------
 // ワーカーキュー優先度
 // -----------------------------------------------------------------------
@@ -355,6 +469,9 @@ pub struct ThumbMsg {
     pub input_seq: u64,
     pub items_gen: u64,
     pub payload: ThumbMsgPayload,
+    /// Read-only correlation for disposable release checks; zero outside a scoped worker request.
+    #[cfg(feature = "test-script")]
+    pub diagnostic_id: u64,
 }
 
 pub enum ThumbMsgPayload {
@@ -422,6 +539,8 @@ impl ThumbMsg {
             input_seq,
             items_gen,
             payload,
+            #[cfg(feature = "test-script")]
+            diagnostic_id: diagnostic_current_id(),
         }
     }
 
@@ -1931,6 +2050,9 @@ pub fn process_load_request(
     adjustment_db: Option<&crate::adjustment_db::AdjustmentDb>,
     raw_handoff: Option<&RawThumbHandoff>,
 ) {
+    #[cfg(all(windows, feature = "test-script"))]
+    let _diagnostic_scope = crate::test_script::release_checks::is_active()
+        .then(|| DiagnosticRequestScope::enter(req, display_px));
     if let LoadRequestSource::AudioThumbnail(audio) = &req.raw_source {
         // Display/ordering stamps (notably bookmarks/history) never participate in Audio source identity.
         let should_cancel = || {
@@ -1988,6 +2110,8 @@ pub fn process_load_request(
             input_seq: req.input_seq,
             items_gen: req.items_gen,
             payload,
+            #[cfg(feature = "test-script")]
+            diagnostic_id: diagnostic_current_id(),
         });
         // Unlike the generic source path, the shared generator has completed cache admission before returning.
         gen_done.fetch_add(1, Ordering::Relaxed);
@@ -2064,6 +2188,8 @@ pub fn process_load_request(
                     input_seq: req.input_seq,
                     items_gen: req.items_gen,
                     payload: ThumbMsgPayload::Canceled,
+                    #[cfg(feature = "test-script")]
+                    diagnostic_id: diagnostic_current_id(),
                 });
                 gen_done.fetch_add(1, Ordering::Relaxed);
             } else {
@@ -4985,6 +5111,8 @@ pub fn load_one_cached(
     //     それ以外は CacheDecision の判定に従う
     let policy_should_save = cache_decision.should_cache(path, file_size, decode_ms, display_ms);
     let should_save = catalog.is_some() && (force_cache || policy_should_save);
+    #[cfg(feature = "test-script")]
+    diagnostic_record_source(should_save, force_cache);
     let mut cache_encode_ms = 0.0;
     let mut cache_save_ms = 0.0;
     let mut cache_map_ms = 0.0;
@@ -5182,6 +5310,13 @@ pub fn load_one_cached(
             ("idx", serde_json::Value::from(idx)),
             ("input_seq", serde_json::Value::from(input_seq)),
         ];
+        #[cfg(feature = "test-script")]
+        {
+            extras.push(("request_id", diagnostic_current_id().into()));
+            extras.push(("items_gen", items_gen.into()));
+            extras.push(("force_cache", force_cache.into()));
+            extras.push(("from_cache", false.into()));
+        }
         // New disjoint intervals shrink unaccounted. prefill_db is a nested detail
         // of offer_raster, and cache_save already includes catalog mutex + SQL.
         for (ms_key, timing) in [
@@ -5213,6 +5348,98 @@ pub fn load_one_cached(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn diagnostic_request_scope_restores_nested_ids_and_separates_threads() {
+        assert_eq!(super::diagnostic_current_id(), 0);
+        let request = super::LoadRequest::default();
+        let outer = super::DiagnosticRequestScope::enter(&request, 374);
+        let outer_id = super::diagnostic_current_id();
+        assert_ne!(outer_id, 0);
+        {
+            let _inner = super::DiagnosticRequestScope::enter(&request, 374);
+            assert_ne!(super::diagnostic_current_id(), outer_id);
+        }
+        assert_eq!(super::diagnostic_current_id(), outer_id);
+        let other_id = std::thread::spawn(|| {
+            assert_eq!(super::diagnostic_current_id(), 0);
+            let _scope = super::DiagnosticRequestScope::enter(&super::LoadRequest::default(), 374);
+            super::diagnostic_current_id()
+        })
+        .join()
+        .unwrap();
+        assert_ne!(other_id, outer_id);
+        assert_eq!(super::diagnostic_current_id(), outer_id);
+        drop(outer);
+        assert_eq!(super::diagnostic_current_id(), 0);
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn diagnostic_request_scope_restores_id_on_unwind() {
+        let request = super::LoadRequest::default();
+        let _outer = super::DiagnosticRequestScope::enter(&request, 374);
+        let outer_id = super::diagnostic_current_id();
+        let result = std::panic::catch_unwind(|| {
+            let _inner = super::DiagnosticRequestScope::enter(&request, 374);
+            panic!("test-only worker unwind");
+        });
+        assert!(result.is_err());
+        assert_eq!(super::diagnostic_current_id(), outer_id);
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn diagnostic_messages_share_worker_identity_without_changing_the_payload_owner() {
+        let request = super::LoadRequest {
+            idx: 9,
+            input_seq: 7,
+            items_gen: 11,
+            path: std::path::PathBuf::from("C:/fixture/folder-0001"),
+            cache_key_override: Some("folderthumb:auto-v4:name:d3:folder-0001".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::diagnostic_request_key(&request),
+            crate::grid_item::GridItem::Folder(request.path.clone()).perf_key()
+        );
+        let scope = super::DiagnosticRequestScope::enter(&request, 374);
+        let pixels = super::ThumbMsg::from_legacy_parts(
+            request.idx,
+            Some(egui::ColorImage::filled([1, 1], egui::Color32::BLACK)),
+            super::ThumbLoadOrigin::SourceGenerated {
+                evaluated_display_px: 374,
+            },
+            false,
+            None,
+            None,
+            None,
+            false,
+            false,
+            request.input_seq,
+            request.items_gen,
+        );
+        let finalized = super::ThumbMsg::from_legacy_parts(
+            request.idx,
+            None,
+            super::ThumbLoadOrigin::SourceIntrinsic,
+            false,
+            None,
+            None,
+            None,
+            false,
+            true,
+            request.input_seq,
+            request.items_gen,
+        );
+        assert_ne!(pixels.diagnostic_id, 0);
+        assert_eq!(pixels.diagnostic_id, finalized.diagnostic_id);
+        assert!(pixels.pixels().is_some());
+        assert!(finalized.is_finalized());
+        drop(scope);
+        assert_eq!(super::diagnostic_current_id(), 0);
+    }
+
     use super::*;
     use crate::settings::{CachePolicy, Settings, SortOrder};
     use std::path::PathBuf;

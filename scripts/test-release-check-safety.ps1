@@ -1,0 +1,112 @@
+# Noninteractive safety regressions: fake processes and argument parsing only.
+# No apps, helpers, foreground operations, builds or real process commands run.
+[CmdletBinding()]
+param()
+$ErrorActionPreference='Stop'
+Set-StrictMode -Version 2
+. (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Support.ps1')
+function Assert-True {param([bool]$Condition,[string]$Message) if(-not $Condition){throw $Message}}
+function Assert-Throws {param([scriptblock]$Action,[string]$Message) $threw=$false;try{& $Action}catch{$threw=$true};Assert-True $threw $Message}
+function Get-TestAst {
+    param([string]$Path)
+    $tokens=$null;$errors=$null
+    $ast=[Management.Automation.Language.Parser]::ParseFile($Path,[ref]$tokens,[ref]$errors)
+    Assert-True ($errors.Count -eq 0) "Parse errors: $Path"
+    return $ast
+}
+$repo=Split-Path $PSScriptRoot -Parent
+Import-ReleaseCheckFunctions (Join-Path $PSScriptRoot 'ui-smoke.ps1') @('Get-NormalizedPath','Assert-ExactPath','Assert-NoReparsePath','Assert-NoReparseTree')
+Assert-Throws {Assert-ReleaseCheckApproval $false} 'Missing approval was accepted.'
+foreach($reason in @('path refused','desktop unavailable','runner lock busy')){
+    $preflight=Invoke-ReleaseCheckPreflight {throw $reason}
+    Assert-True ($preflight.exit_code -eq 2 -and $preflight.environment_error -eq $reason -and $null -eq $preflight.value) 'Preflight failure escaped SKIPPED/2 classification.'
+}
+$preflight=Invoke-ReleaseCheckPreflight {'fake-owned-lock'}
+Assert-True ($preflight.exit_code -eq 0 -and $preflight.value -eq 'fake-owned-lock') 'Successful preflight lost its lock.'
+$exe=Join-Path $repo 'target\portable-smoke\mimageviewer.exe';$data=Join-Path $repo 'target\portable-smoke\data';$output=Join-Path $repo 'target\ui-smoke\runs\fake-release-check'
+# Mock filesystem observers: the tests do not read real application/profile data.
+function Assert-NoReparsePath {param($Path,$StopAt,$Label)}
+function Assert-NoReparseTree {param($Path,$Label)}
+Assert-ReleaseCheckPaths $repo $exe $data $output
+Assert-Throws {Assert-ReleaseCheckPaths $repo (Join-Path $repo 'target\release\mimageviewer.exe') $data $output} 'Normal executable accepted.'
+Assert-Throws {Assert-ReleaseCheckPaths $repo $exe (Join-Path $repo 'fake-normal-profile') $output} 'Other profile accepted.'
+Assert-Throws {Assert-ReleaseCheckPaths $repo $exe $data (Join-Path $repo 'target\ui-smoke\runs-other\fake')} 'Sibling output prefix accepted.'
+Assert-Throws {Assert-ReleaseCheckPaths $repo $exe $data (Join-Path $repo 'target\ui-smoke\runs')} 'Run root itself accepted.'
+if(-not ('MivReleaseCheckNative' -as [type])){
+    # Fake command-line parser; no native imports and no real process queries.
+    Add-Type @'
+using System.Text.RegularExpressions;
+public static class MivReleaseCheckNative {
+ public static string[] Arguments(string s) {var m=Regex.Matches(s,"\"([^\"]*)\"|([^ ]+)");var a=new string[m.Count];for(int i=0;i<a.Length;i++)a[i]=m[i].Groups[1].Success?m[i].Groups[1].Value:m[i].Groups[2].Value;return a;}
+}
+'@
+}
+$start=[datetime]'2026-10-09T00:00:00Z'
+$fake=[pscustomobject]@{Id=101;Path=$exe;StartTime=$start;HasExited=$false}
+$line='"'+$exe+'" --perf-log --test-script "fake.rhai" --settings-override "fake.json" --data-dir "'+$data+'"'
+$cim=[pscustomobject]@{ProcessId=101;ExecutablePath=$exe;CommandLine=$line}
+Assert-ReleaseCheckIdentity $fake $cim 101 $start $exe $data
+Assert-Throws {Assert-ReleaseCheckIdentity $fake $cim 102 $start $exe $data} 'Wrong PID accepted.'
+Assert-Throws {Assert-ReleaseCheckIdentity $fake $cim 101 $start.AddSeconds(1) $exe $data} 'Reused PID/start time accepted.'
+$cim.CommandLine=$line.Replace('--data-dir','--other-data-dir')
+Assert-Throws {Assert-ReleaseCheckIdentity $fake $cim 101 $start $exe $data} 'Substring data argument accepted.'
+$cim.CommandLine=$line+' --data-dir "'+$data+'"'
+Assert-Throws {Assert-ReleaseCheckIdentity $fake $cim 101 $start $exe $data} 'Duplicate data override accepted.'
+$cim.CommandLine=$line;$fake.HasExited=$true
+Assert-Throws {Assert-ReleaseCheckIdentity $fake $cim 101 $start $exe $data} 'Exited PID accepted.'
+$sample=[pscustomobject]@{foreground_pid=101;foreground_hwnd=888;total=2;visible=1}
+Assert-ReleaseCheckWindowSamples @($sample) 'static-foreground' 101 888 0
+Assert-Throws {Assert-ReleaseCheckWindowSamples @($sample) 'static-foreground' 101 889 0} 'Other same-PID HWND accepted.'
+Assert-Throws {Assert-ReleaseCheckWindowSamples @($sample) 'static-background' 101 888 999} 'App foreground accepted as background.'
+$sample.foreground_pid=202;$sample.foreground_hwnd=999
+Assert-ReleaseCheckWindowSamples @($sample) 'static-background' 101 888 999 202
+Assert-Throws {Assert-ReleaseCheckWindowSamples @($sample) 'static-background' 101 888 998 202} 'User window accepted instead of runner-owned window.'
+Assert-Throws {Assert-ReleaseCheckWindowSamples @($sample) 'static-background' 101 888 999 203} 'Reused runner HWND owned by another PID was accepted.'
+$sample.visible=0
+Assert-ReleaseCheckWindowSamples @($sample) 'tray-residency' 101 888 0
+$sample.total=0
+Assert-Throws {Assert-ReleaseCheckWindowSamples @($sample) 'tray-residency' 101 888 0} 'No top-level windows accepted as tray.'
+Import-ReleaseCheckFunctions (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Run.ps1') @('Assert-NoSmokeProcess','Stop-OwnedReleaseProcess','Test-OwnedReleaseProcessAlive')
+$smoke=Split-Path $exe -Parent
+$installed=[pscustomobject]@{ProcessName='mimageviewer';Id=303;Path='C:\Program Files\mImageViewer\mimageviewer.exe';HasExited=$false}
+$inventory=@($installed)
+function Get-Process {param($ErrorAction) return $script:inventory}
+Assert-NoSmokeProcess
+$inventory=@([pscustomobject]@{ProcessName='mimageviewer';Id=404;Path=$exe})
+Assert-Throws {Assert-NoSmokeProcess} 'Another portable smoke was not rejected.'
+$inventory=@($installed)
+$fake.HasExited=$false
+$fake|Add-Member -MemberType ScriptMethod -Name Refresh -Value {} -Force
+$fake|Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {$this.HasExited=$true} -Force
+$cim.CommandLine=$line
+$owned=$fake;$ownedStart=$start.AddSeconds(1);$stopped=@()
+function Get-CimInstance {param($ClassName,$Filter,$ErrorAction) return $script:cim}
+function Stop-Process {param($Id,[switch]$Force,$ErrorAction) $script:stopped+=@($Id)}
+Assert-Throws {Test-OwnedReleaseProcessAlive} 'Live mismatched identity was accepted.'
+$ownedStart=$start
+Assert-True (Test-OwnedReleaseProcessAlive) 'Correct live owned process was rejected.'
+function Get-CimInstance {param($ClassName,$Filter,$ErrorAction) $script:owned.HasExited=$true;throw 'fake normal-exit lookup race'}
+Assert-True (-not (Test-OwnedReleaseProcessAlive)) 'Normal exit during WMI was misclassified as an identity failure.'
+$fake.HasExited=$false;$ownedStart=$start.AddSeconds(1)
+function Get-CimInstance {param($ClassName,$Filter,$ErrorAction) return $script:cim}
+Assert-Throws {Stop-OwnedReleaseProcess} 'Cleanup stopped a reused/mismatched process.'
+Assert-True ($stopped.Count -eq 0) 'Mismatch still issued Stop-Process.'
+$ownedStart=$start
+Stop-OwnedReleaseProcess
+Assert-True ($stopped.Count -eq 1 -and $stopped[0] -eq 101) 'Cleanup did not target exactly the owned PID.'
+Assert-True (-not $installed.HasExited) 'Installed/tray instance was changed.'
+foreach($relative in @('ui-smoke.ps1','check-idle-health.ps1','ui-smoke\release-checks\Run.ps1','ui-smoke\release-checks\Sampler.ps1')){
+    $path=Join-Path $PSScriptRoot $relative
+    $ast=Get-TestAst $path
+    $text=Get-Content -LiteralPath $path -Encoding UTF8 -Raw
+    $approvalOffset=$text.IndexOf('if (-not $InteractiveApproved')
+    if($relative -eq 'check-idle-health.ps1'){$approvalOffset=$text.IndexOf('if (-not $InteractiveApproved -or $ProcessId')}
+    Assert-True ($approvalOffset -ge 0) "Approval guard missing: $relative"
+    $topCalls=@($ast.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -in @('Start-Process','New-Item','Add-Type')},$true))
+    foreach($call in $topCalls){Assert-True ($call.Extent.StartOffset -gt $approvalOffset) "Side effect before guard: $relative"}
+}
+$samplerText=Get-Content -LiteralPath (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Sampler.ps1') -Encoding UTF8 -Raw
+Assert-True ($samplerText.Contains('clock-window $perf --sampler')) 'Session clock conversion missing.'
+Assert-True ($samplerText.Contains('$converted.evidence.clock.start_t') -and $samplerText.Contains('$converted.evidence.clock.end_t')) 'Analyzer uses another clock.'
+Assert-True (-not $samplerText.Contains('$env:APPDATA') -and -not $samplerText.Contains('StartTime).TotalSeconds')) 'Sampler falls back to normal data or OS elapsed clock.'
+Write-Host 'release-check safety: PASS (approval, path, exact PID/start time, lifetime windows and clock routing; no applications/process commands)'

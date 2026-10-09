@@ -31,6 +31,8 @@ pub(crate) mod grid_observation;
 #[cfg(feature = "test-script")]
 mod history_input;
 pub(crate) mod pointer_input;
+#[cfg(all(windows, feature = "test-script"))]
+pub(crate) mod release_checks;
 
 const MAX_SCRIPT_BYTES: u64 = 1024 * 1024;
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -1450,6 +1452,8 @@ struct PreconditionTrace {
 
 #[derive(Debug)]
 enum UiCommand {
+    #[cfg(all(windows, feature = "test-script"))]
+    ReleaseCheck(release_checks::Request),
     Key(SyntheticKeyCommand),
     Cancel(Instant),
     SetRepeat {
@@ -2890,6 +2894,7 @@ fn parse_navigation_key(name: &str) -> Result<SyntheticNavigationKey, Box<EvalAl
         "backspace" => SyntheticNavigationKey::Backspace,
         "escape" | "esc" => SyntheticNavigationKey::Escape,
         "f12" => SyntheticNavigationKey::F12,
+        "g" => SyntheticNavigationKey::G,
         _ => {
             return Err(rhai_error(format!(
                 "unsupported synthetic navigation key: {name}"
@@ -2995,6 +3000,8 @@ fn wait_interruptibly(
 fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
     #[cfg(feature = "test-script")]
     history_input::register(engine, bridge.clone());
+    #[cfg(all(windows, feature = "test-script"))]
+    release_checks::register(engine, bridge.clone());
     #[cfg(feature = "test-script")]
     clipboard_capture::register(engine, bridge.clone());
     let always_on_top_bridge = bridge.clone();
@@ -5092,6 +5099,14 @@ pub(crate) fn ui_update(ctx: &egui::Context, mut snapshot: TestScriptSnapshot) -
 
     while let Ok(command) = runtime.rx.try_recv() {
         match command {
+            #[cfg(all(windows, feature = "test-script"))]
+            UiCommand::ReleaseCheck(request) => {
+                if let Err(error) = runtime.validate_selected_owner(&request.owner) {
+                    let _ = request.reply.send(Err(error));
+                } else {
+                    release_checks::enqueue(request);
+                }
+            }
             UiCommand::Key(command) => {
                 if runtime.finish.is_none() && !crate::key_input::enqueue_synthetic_command(command)
                 {
@@ -5340,6 +5355,17 @@ pub(crate) fn ui_update(ctx: &egui::Context, mut snapshot: TestScriptSnapshot) -
         *guard = None;
     }
     close
+}
+
+#[cfg(all(windows, feature = "test-script"))]
+pub(crate) fn validate_release_owner(owner: &TestScriptWindowIdentity) -> Result<(), String> {
+    let guard = runtime()
+        .lock()
+        .map_err(|_| "environment: test runtime poisoned")?;
+    guard
+        .as_ref()
+        .ok_or("environment: test runtime finished")?
+        .validate_selected_owner(owner)
 }
 
 /// Replace the read-only detached-window table after a lifecycle phase that can
@@ -6816,6 +6842,24 @@ mod tests {
             target_viewport: "ROOT".to_string(),
             ..TestScriptSnapshot::default()
         }
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn release_checks_recipe_compiles_with_registered_api_without_running_it() {
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let engine = build_engine(bridge);
+        let source = include_str!("../scripts/ui-smoke/release-checks.rhai")
+            .replace("__SEARCH_HITS__", "[]")
+            .replace("__CACHE_PATHS__", "[]")
+            .replace("__NAVIGATION_PATHS__", "[]")
+            .replace("__INCLUDE_FIRST_AI__", "false");
+        engine.compile(source).expect("release recipe syntax");
+        assert_eq!(
+            parse_navigation_key("G").unwrap(),
+            SyntheticNavigationKey::G
+        );
+        // This check compiles a recipe; it never evaluates begin or accesses a window.
     }
 
     fn receive_through_finished(rx: &mpsc::Receiver<UiCommand>) -> Vec<UiCommand> {

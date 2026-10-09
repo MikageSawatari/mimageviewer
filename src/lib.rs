@@ -1255,6 +1255,16 @@ pub fn run() -> eframe::Result {
     let perf_enabled = std::env::args().any(|a| a == "--perf-log" || a == "--perf-log-path")
         || perf_log_path.is_some();
     perf::init_with_path(perf_enabled, Some(prog_start), perf_log_path);
+    #[cfg(all(feature = "test-script", windows))]
+    if test_script_path.is_some() {
+        if let Some(directory) = test_evidence_dir.as_deref() {
+            if let Err(error) = test_script::release_checks::arm_startup(directory) {
+                write_to_parent_console(&format!("error: {error}\n"));
+                entry_trace.finish(miv_startup::Outcome::Error);
+                exit_startup(2);
+            }
+        }
+    }
 
     // WASAPI can take over a second to create the first output stream on a cold
     // boot. Warm it in the background so the first video open does not freeze

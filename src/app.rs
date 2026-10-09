@@ -567,6 +567,8 @@ mod subfolder_expansion;
 pub(crate) use subfolder_expansion::listing_sort_metas_for_items;
 pub(crate) use subfolder_expansion::{SubfolderExpansionEntry, listing_sort_metas_for_entries};
 #[cfg(all(windows, feature = "test-script"))]
+pub(crate) mod release_checks;
+#[cfg(all(windows, feature = "test-script"))]
 mod test_script_support;
 pub(crate) use subfolder_expansion::{
     SUBFOLDER_EXPANSION_FILTER_KINDS, SubfolderExpansionDepthChoice, SubfolderExpansionScanFilter,
@@ -49585,6 +49587,8 @@ impl App {
                 payload,
                 input_seq: req_input_seq,
                 items_gen: msg_items_gen,
+                #[cfg(feature = "test-script")]
+                diagnostic_id,
             } = msg;
             if msg_items_gen != self.items_generation {
                 continue;
@@ -49668,6 +49672,23 @@ impl App {
 
             let in_keep_range = self.keep_set.contains(&i);
 
+            #[cfg(all(windows, feature = "test-script"))]
+            if from_cache && color_image_opt.is_some() {
+                if let Some(item) = self.items.get(i) {
+                    crate::test_script::release_checks::trace(
+                        "cache_read",
+                        serde_json::json!({
+                            "key": item.perf_key(),
+                            "idx": i,
+                            "items_gen": msg_items_gen,
+                            "input_seq": req_input_seq,
+                            "request_id": diagnostic_id,
+                            "from_cache": true,
+                        }),
+                    );
+                }
+            }
+
             // finalized = true: 第 2 シグナル (decode 成功 + cache save 完了)。
             // **`thumbnails[i]` の状態は変更しない**。
             //
@@ -49688,6 +49709,14 @@ impl App {
             // drop された後の幽霊シグナル。pending_finalize に挿入すると stale 状態が
             // 残り続けるので無視する。
             if finalized {
+                #[cfg(all(windows, feature = "test-script"))]
+                crate::app::release_checks::record_finalized(
+                    self,
+                    diagnostic_id,
+                    i,
+                    msg_items_gen,
+                    req_input_seq,
+                );
                 // Source decode/cache replacement advances the representative identity. Ordinary
                 // cache reads and GPU eviction do not invalidate unchanged color results.
                 self.invalidate_color_representative(i);
@@ -49896,21 +49925,25 @@ impl App {
                     } else if treat_as_in_range {
                         // 上限到達で keep_range 内 (or 動画): 次フレームに持ち越す。
                         // requested は除去しない (重複リクエスト防止)。
-                        self.texture_backlog.push(
-                            crate::thumb_loader::ThumbMsg::from_legacy_parts(
-                                i,
-                                Some(color_image),
-                                origin,
-                                from_edit_preview,
-                                edit_preview_adjustment,
-                                source_dims,
-                                layout_dims,
-                                false,
-                                false,
-                                req_input_seq,
-                                msg_items_gen,
-                            ),
+                        let backlog_message = crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                            i,
+                            Some(color_image),
+                            origin,
+                            from_edit_preview,
+                            edit_preview_adjustment,
+                            source_dims,
+                            layout_dims,
+                            false,
+                            false,
+                            req_input_seq,
+                            msg_items_gen,
                         );
+                        #[cfg(feature = "test-script")]
+                        let backlog_message = crate::thumb_loader::ThumbMsg {
+                            diagnostic_id,
+                            ..backlog_message
+                        };
+                        self.texture_backlog.push(backlog_message);
                     } else {
                         // 範囲外: ColorImage を drop し Evicted にしておく。
                         // from_cache / from_source に関わらず、UI 側の要求はここで完了扱い。
@@ -89121,8 +89154,19 @@ impl App {
         {
             let snapshot = self.test_script_snapshot(ctx);
             if crate::test_script::ui_update(ctx, snapshot) {
-                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+                if crate::test_script::release_checks::take_quit_after_finish() {
+                    if let Some(tray) = self.tray_controller.as_ref() {
+                        if let Err(error) = tray.quit_for_smoke() {
+                            crate::logger::log(format!(
+                                "[release-checks] environment: normal tray Quit failed: {error}"
+                            ));
+                        }
+                    }
+                } else {
+                    ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+                }
             }
+            self.poll_release_check_commands(ctx);
             if crate::test_script::take_smoke_action(
                 crate::test_script::UiSmokeAction::OpenThumbnailPreferences,
             ) {
@@ -89658,6 +89702,8 @@ impl App {
         if self.indexer_init.overlay_active() {
             self.render_startup_overlay(ctx);
             self.consume_input_during_startup(ctx);
+            #[cfg(all(feature = "test-script", windows))]
+            self.release_check_record_early_tail(ctx);
             finish_update_perf(&mut update_perf, self.frame_counter);
             return;
         }
@@ -90357,6 +90403,8 @@ impl App {
                 fullscreen_close_nav = Some(nav);
             } else if self.apply_fullscreen_close_nav_immediate(nav) {
                 ctx.request_repaint();
+                #[cfg(all(feature = "test-script", windows))]
+                self.release_check_record_early_tail(ctx);
                 finish_update_perf(&mut update_perf, self.frame_counter);
                 return;
             }
@@ -90476,6 +90524,8 @@ impl App {
                     "early_return",
                     "reason=native_main_backdrop main_ui=false repaint_after=16ms",
                 );
+                #[cfg(all(feature = "test-script", windows))]
+                self.release_check_record_early_tail(ctx);
                 finish_update_perf(&mut update_perf, self.frame_counter);
                 return;
             }
@@ -90488,6 +90538,8 @@ impl App {
                     "early_return",
                     "reason=still_viewport_enter_suppressed main_ui=holdover",
                 );
+                #[cfg(all(feature = "test-script", windows))]
+                self.release_check_record_early_tail(ctx);
                 finish_update_perf(&mut update_perf, self.frame_counter);
                 return;
             }
@@ -90512,6 +90564,8 @@ impl App {
                 if let Some(nav) = fullscreen_close_nav.take() {
                     if self.apply_fullscreen_close_nav_immediate(nav) {
                         ctx.request_repaint();
+                        #[cfg(all(feature = "test-script", windows))]
+                        self.release_check_record_early_tail(ctx);
                         finish_update_perf(&mut update_perf, self.frame_counter);
                         return;
                     }
@@ -90559,6 +90613,8 @@ impl App {
                         self.fs_nav_deferred_reopen_wait_active()
                     ),
                 );
+                #[cfg(all(feature = "test-script", windows))]
+                self.release_check_record_early_tail(ctx);
                 finish_update_perf(&mut update_perf, self.frame_counter);
                 return;
             }
@@ -92192,6 +92248,8 @@ impl eframe::App for App {
         // 後段の本物の on_exit に処理を委譲する (trait impl は 1 つしか書けないため、
         // helper メソッド群は trait impl の外の `impl App` ブロックへ逃がしてある)。
         self.on_exit_inner();
+        #[cfg(all(windows, feature = "test-script"))]
+        crate::test_script::release_checks::record_on_exit();
     }
 }
 

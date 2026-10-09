@@ -129,6 +129,9 @@ enum TrayCommand {
     /// Drive the tray icon's Open closure from an unattended disposable smoke run.
     #[cfg(feature = "test-script")]
     OpenForSmoke,
+    /// Route an approved disposable smoke shutdown through the normal tray Quit action.
+    #[cfg(feature = "test-script")]
+    QuitForSmoke,
     /// スレッド終了
     Shutdown,
 }
@@ -279,6 +282,14 @@ impl TrayController {
     /// トレイ「終了」メニューが押されたか。`App::maybe_intercept_close` が判定用に読む。
     pub fn is_quit_requested(&self) -> bool {
         self.quit_flag.load(Ordering::SeqCst)
+    }
+
+    /// Queue the same action as the tray's Quit menu without changing UI lifecycle ownership.
+    #[cfg(feature = "test-script")]
+    pub(crate) fn quit_for_smoke(&self) -> Result<(), String> {
+        self.cmd_tx
+            .try_send(TrayCommand::QuitForSmoke)
+            .map_err(|error| format!("tray smoke quit command unavailable: {error}"))
     }
 
     /// UI-owned media state machine needs explicit hidden-window ticks only while playback or
@@ -466,13 +477,64 @@ fn run_tray_thread(
         }
     };
 
+    // One action for the released Quit menu and the test-script command. Hidden
+    // windows still use the existing DWM cloak / WM_CLOSE / on_exit path.
+    let do_quit = {
+        let quit_flag = Arc::clone(&quit_flag);
+        let event_tx = event_tx.clone();
+        let ctx = egui_ctx.clone();
+        move || {
+            quit_flag.store(true, Ordering::SeqCst);
+            let hwnd = make_hwnd(hwnd_raw);
+            // 常に eframe の通常 close 経路を通って on_exit / Drop を走らせる。
+            // 非表示状態では winit が hidden window に対して `update` を回さないため
+            // close_requested が処理されない。そこで以下の手順で「winit は可視と見るが
+            // 画面には出ない」状態に持っていく:
+            //   1. DWM の DWMWA_CLOAK を有効化 → コンポジットされないので画面に出ない
+            //   2. ShowWindow(SW_SHOWNOACTIVATE) → Win32 的に可視に (winit が update を回す)
+            //   3. PostMessage(WM_CLOSE) → 通常の close フロー
+            // 結果として黒フラッシュ / 復元アニメーションを完全に抑制しつつ、インデクサや
+            // tag writer 等の graceful shutdown を保証できる。
+            unsafe {
+                use windows::Win32::Graphics::Dwm::{DWMWA_CLOAK, DwmSetWindowAttribute};
+                if !IsWindowVisible(hwnd).as_bool() {
+                    let cloak_true: i32 = 1;
+                    let cloak_ok = DwmSetWindowAttribute(
+                        hwnd,
+                        DWMWA_CLOAK,
+                        &cloak_true as *const _ as *const _,
+                        std::mem::size_of::<i32>() as u32,
+                    )
+                    .is_ok();
+                    crate::presentation_observer::observe_dwm_cloak(
+                        hwnd,
+                        crate::presentation_observer::WindowRole::Main,
+                        true,
+                        "tray::quit",
+                        cloak_ok,
+                    );
+                    let _ = crate::presentation_observer::show_window(
+                        hwnd,
+                        SW_SHOWNOACTIVATE,
+                        crate::presentation_observer::WindowRole::Main,
+                        "tray::quit",
+                    );
+                }
+                let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+            let _ = event_tx.try_send(TrayEvent::QuitRequested);
+            ctx.request_repaint();
+            crate::logger::log("tray: Quit → DWM cloak + SW_SHOWNOACTIVATE + WM_CLOSE");
+        }
+    };
+
     // メニューイベントを `set_event_handler` で受信 (receiver の race を回避)。
     {
         let event_tx = event_tx.clone();
         let ctx = egui_ctx.clone();
         let activity_gate = Arc::clone(&activity_gate);
-        let quit_flag = Arc::clone(&quit_flag);
         let do_show_window = do_show_window.clone();
+        let do_quit = do_quit.clone();
         let open_id = open_id.clone();
         let pause_id = pause_id.clone();
         let quit_id = quit_id.clone();
@@ -495,49 +557,7 @@ fn run_tray_thread(
                 ctx.request_repaint();
                 crate::logger::log(format!("tray: Pause toggled → new_checked = {new_checked}"));
             } else if ev.id == quit_id {
-                quit_flag.store(true, Ordering::SeqCst);
-                let hwnd = make_hwnd(hwnd_raw);
-                // 常に eframe の通常 close 経路を通って on_exit / Drop を走らせる。
-                // 非表示状態では winit が hidden window に対して `update` を回さないため
-                // close_requested が処理されない。そこで以下の手順で「winit は可視と見るが
-                // 画面には出ない」状態に持っていく:
-                //   1. DWM の DWMWA_CLOAK を有効化 → コンポジットされないので画面に出ない
-                //   2. ShowWindow(SW_SHOWNOACTIVATE) → Win32 的に可視に (winit が update を回す)
-                //   3. PostMessage(WM_CLOSE) → 通常の close フロー
-                // 結果として黒フラッシュ / 復元アニメーションを完全に抑制しつつ、インデクサや
-                // tag writer 等の graceful shutdown を保証できる。
-                unsafe {
-                    use windows::Win32::Graphics::Dwm::{DWMWA_CLOAK, DwmSetWindowAttribute};
-                    if !IsWindowVisible(hwnd).as_bool() {
-                        // BOOL は 4 バイト整数 (TRUE=1)。DWM 側は *const c_void で受ける
-                        // のでサイズを厳密に指定するだけでよい (型は BOOL 相当)。
-                        let cloak_true: i32 = 1;
-                        let cloak_ok = DwmSetWindowAttribute(
-                            hwnd,
-                            DWMWA_CLOAK,
-                            &cloak_true as *const _ as *const _,
-                            std::mem::size_of::<i32>() as u32,
-                        )
-                        .is_ok();
-                        crate::presentation_observer::observe_dwm_cloak(
-                            hwnd,
-                            crate::presentation_observer::WindowRole::Main,
-                            true,
-                            "tray::quit",
-                            cloak_ok,
-                        );
-                        let _ = crate::presentation_observer::show_window(
-                            hwnd,
-                            SW_SHOWNOACTIVATE,
-                            crate::presentation_observer::WindowRole::Main,
-                            "tray::quit",
-                        );
-                    }
-                    let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
-                }
-                let _ = event_tx.try_send(TrayEvent::QuitRequested);
-                ctx.request_repaint();
-                crate::logger::log("tray: Quit → DWM cloak + SW_SHOWNOACTIVATE + WM_CLOSE");
+                do_quit();
             }
         }));
     }
@@ -615,6 +635,8 @@ fn run_tray_thread(
                 }
                 #[cfg(feature = "test-script")]
                 TrayCommand::OpenForSmoke => do_show_window(),
+                #[cfg(feature = "test-script")]
+                TrayCommand::QuitForSmoke => do_quit(),
                 TrayCommand::Shutdown => {
                     MenuEvent::set_event_handler(None::<fn(MenuEvent)>);
                     TrayIconEvent::set_event_handler(None::<fn(TrayIconEvent)>);
@@ -768,5 +790,28 @@ mod tests {
         let (ctrl, cmd_rx, _event_tx) = TrayController::new_for_test();
         ctrl.open_for_smoke().unwrap();
         assert!(matches!(cmd_rx.try_recv(), Ok(TrayCommand::OpenForSmoke)));
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn smoke_quit_routes_to_the_tray_thread_without_publishing_a_fake_exit() {
+        let (ctrl, cmd_rx, _event_tx) = TrayController::new_for_test();
+        ctrl.quit_for_smoke().unwrap();
+        assert!(matches!(cmd_rx.try_recv(), Ok(TrayCommand::QuitForSmoke)));
+        assert!(
+            !ctrl.is_quit_requested(),
+            "the tray action owns the quit flag"
+        );
+        assert!(ctrl.try_recv().is_none(), "enqueue is not a completed exit");
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn smoke_quit_reports_unavailable_commands_without_forcing_shutdown() {
+        let (ctrl, cmd_rx, _event_tx) = TrayController::new_for_test();
+        drop(cmd_rx);
+        assert!(ctrl.quit_for_smoke().is_err());
+        assert!(!ctrl.is_quit_requested());
+        assert!(!ctrl.shutdown.load(Ordering::Relaxed));
     }
 }

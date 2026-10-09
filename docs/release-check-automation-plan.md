@@ -318,4 +318,30 @@ suite が具体化した後、5 idle ケース・2 perf ケース、見込み **
 - **手動実データ確認**: UI / I/O 経路変更版だけ普段のフォルダで短い確認を残す。
   通常ビルドの起動は利用者自身、生成 suite と実データの結果は別に記録する。
 
-回答済みの3点について再確認は不要。本書の修正は設計だけであり、実装・実アプリ検証の開始を意味しない。
+回答済みの3点について再確認は不要。設計受理時点では実装・実アプリ検証は開始していない。
+その後の実装指示と今回の範囲は §9 に記録する。
+
+## 9. Phase 2 / 3 の実装（2026-10-09）
+
+利用者の追加指示で Phase 2 / 3 を実装する。Phase 4 の実アプリ起動・採用測定は今回の対象外。
+
+- `scripts/ui-smoke/generate_release_checks_fixture.py` が固定形の画像・動画・索引用画像、
+  overlay、manifest を生成／検証する。cache / pin / index は了承済み seed session の通常 producer が作る。
+  媒体生成は PATH 上の FFmpeg CLI を使い、実行体 hash と引数を manifest に記録する。
+  アプリ同梱の FFmpeg は DLL のため CLI と区別し、CLI 不在は環境不成立とする。
+- `scripts/release_check_analysis.py` が clock-anchor 変換、成立証拠、perf / idle verdict、
+  suite JSON と貼付用 `release-record.md` を出す。`analyze_perf.py` への変更は新 subcommand の接続だけ。
+  初期 many-folder は停止済み DB の読み取り専用 `pre-launch-cache.json` と起動前 diagnostic arm で相関させる。
+  早期 return の tail は test-only の egui scheduler 読み取りで補い、未知の delayed repaint を正常扱いしない。
+- `scripts/ui-smoke/release-checks/{Run,Sampler,Support}.ps1` と `release-checks.rhai` が
+  exact portable artifact / PID / HWND を検査し、seed の完全終了・復元を挟んで逐次実行する。
+  path / desktop / lock / artifact 不成立は SKIPPED / 2、強制終了は正常完了証拠に含めない。
+
+実行窓の明示了承後の入口は `scripts/ui-smoke.ps1 -Scenario ReleaseChecks -InteractiveApproved`。
+AI / GPU 経路変更版だけ `-IncludeFirstAi` を追加する。出力は各 run の `summary.json` と `release-record.md`。
+通常 data、既存常駐版の停止、release-verification-records 正本への自動追記は行わない。
+
+非対話検証は Python の analyzer / fixture / preflight 回帰、`scripts/test-release-check-safety.ps1`、
+Rust の diagnostic / recipe / payload 焦点テストと feature 有無の check。検証証跡の引き継ぎ先は
+`target/F-1361-impl-msg.txt`。Line A の modifier_probe 入力集計と §1.360 lifecycle 修正の統合、
+tray 2ケースの旧版 FAIL / 修正版 PASS、固定 PC 各3回の成立率・閾値、実 foreground は Phase 4 に残す。
