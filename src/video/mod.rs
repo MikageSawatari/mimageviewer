@@ -300,7 +300,11 @@ enum LocalDspAcquisition {
     Waiting(PendingLocalDspHandoff),
 }
 
+static NEXT_MEDIA_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
 pub struct VideoPlayer {
+    /// Lifetime identity travels with the player across viewer-context moves.
+    media_identity: u64,
     path: PathBuf,
     /// All player-owned workers and the native event funnel wake the same egui root.
     ui_wake: Arc<VideoUiWake>,
@@ -8670,6 +8674,7 @@ impl VideoPlayer {
         let (raw_engine_event_tx, engine_event_rx) = crossbeam_channel::bounded(8);
         let engine_event_tx = EngineEventSender::new(raw_engine_event_tx, Arc::clone(&ui_wake));
         Self {
+            media_identity: NEXT_MEDIA_IDENTITY.fetch_add(1, Ordering::Relaxed),
             path,
             ui_wake,
             clock,
@@ -8775,6 +8780,7 @@ impl VideoPlayer {
             effective_deinterlace_mode: crate::settings::VideoDeinterlaceMode::Off,
             dynamic: Arc::new(crate::video::decoder::VideoDynamicState::default()),
             title: None,
+            album: None,
             artist: None,
             original_url: None,
             description: None,
@@ -8786,6 +8792,15 @@ impl VideoPlayer {
             sar_num: 1,
             sar_den: 1,
         });
+        player
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_ready_disconnected_for_test(path: PathBuf) -> Self {
+        let player = Self::stream_ready_disconnected_for_test(path);
+        // The generic disconnected fixture is deliberately pre-cancelled. Local
+        // ownership tests need a live lifetime token, followed by real shutdown.
+        player.cancel.store(false, Ordering::Release);
         player
     }
 
@@ -8892,6 +8907,22 @@ impl VideoPlayer {
     pub(crate) fn set_last_displayed_pts_for_test(&self, position_secs: f64) {
         self.last_displayed_pts_bits
             .store(position_secs.to_bits(), Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_now_playing_metadata_for_test(
+        &mut self,
+        title: Option<&str>,
+        album: Option<&str>,
+        artist: Option<&str>,
+    ) {
+        let info = self
+            .info
+            .as_mut()
+            .expect("metadata test player must be ready");
+        info.title = title.map(str::to_owned);
+        info.album = album.map(str::to_owned);
+        info.artist = artist.map(str::to_owned);
     }
 
     #[cfg(test)]
@@ -9111,6 +9142,7 @@ impl VideoPlayer {
             let engine_state_atomic =
                 Arc::new(AtomicU8::new(crate::video::engine::actor::state_code::IDLE));
             return Self {
+                media_identity: NEXT_MEDIA_IDENTITY.fetch_add(1, Ordering::Relaxed),
                 path,
                 ui_wake,
                 clock: dummy_clock,
@@ -9376,6 +9408,7 @@ impl VideoPlayer {
         let native_init_error: Option<String> = None;
 
         let mut player = Self {
+            media_identity: NEXT_MEDIA_IDENTITY.fetch_add(1, Ordering::Relaxed),
             path,
             ui_wake,
             clock,
@@ -9698,6 +9731,17 @@ impl VideoPlayer {
 
     pub fn path(&self) -> &PathBuf {
         &self.path
+    }
+
+    pub(crate) fn media_identity(&self) -> u64 {
+        self.media_identity
+    }
+
+    /// Pause, seek, buffering, and an enabled loop keep the current snapshot.
+    pub(crate) fn local_now_playing_finished(&self) -> bool {
+        self.cancel.load(Ordering::Acquire)
+            || self.error.is_some()
+            || (self.is_at_eof() && !self.loop_enabled.load(Ordering::Acquire))
     }
 
     pub fn info(&self) -> Option<&VideoInfo> {

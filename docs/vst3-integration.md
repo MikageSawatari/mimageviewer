@@ -373,6 +373,18 @@ v5 は EffeTune の専用 suppression-source mapping と `set_gui_visibility_che
 pipe 書き込みでは Rust の表示情報を更新しない。表示／非表示の結果と native close は同じ FIFO
 signal で処理する。mapping は最小化・Remote の正本を運ぶだけで、表示希望の持ち主は host のまま。
 
+v6 は EffeTune 専用の `set_now_playing` を追加した。本体・独立tester・C++ host の
+hello/ready を6に揃え、旧v5を拒否する。typed Rust command は `cmd` を先頭にserializeし、
+`effetune-host-control` worker が送る。返信eventは発行しない。
+host の stdin reader はこのpayloadを汎用JSONキューへ積まず、slot incarnationとrevisionで
+順序を判定する有界mailboxへ渡す（実行中一件＋最新pending一件、未実行wake一件）。
+plugin UI thread で `IConnectionPoint::notify` に完全snapshotを渡し、同じcomponent/controllerへ
+二重通知しない。画像はdecode後8,388,608 bytes、base64文字列11,184,812文字、frame32 MiBを
+それぞれ別に制限する。通常拒否はlogのみ、実行開始済みnotifyの5秒hangは専用host終了へ
+収束し、Rustの既存HostLostで素通し・一度の案内・自動再起動無しとなる。ユーザーVSTは別host。
+metadata owner、画像worker、Local/Remote終端と詳細試験は
+[Now Playing 計画](effetune-now-playing-plan.md) を参照。
+
 要件:
 - アプリ起動中ずっとプラグイン GUI を表示しておける
 - 動画再生中のホバーバーから VST3 プレイバックパネルを開き、チェーン全体の

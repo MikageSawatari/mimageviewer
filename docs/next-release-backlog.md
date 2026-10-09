@@ -48,6 +48,9 @@
 - 規模 / 優先度: Medium / P1 (次の版で優先)。
 
 ### 1.359 EffeTune の新しい版を同梱し、再生中の曲情報（タイトル・アルバム・アーティスト・アートワーク）を Visualizer へ渡す — EffeTune 作者の対応 (2026-10-09)
+- **状態: v4.5.0公開後のbranchで実装・自動回帰検証済み、実機／公開前gate待ち**。v0.13.0同梱と全六項目の利用者決定済み。
+  現行の設計・検証・公開前gateは [Now Playing 計画](effetune-now-playing-plan.md) を正本とする。
+  以下の未公開版に関する記述とfile:lineは初回調査時点の履歴。
 - **次の版の決定 (利用者 2026-10-09)**: v4.5.0 には入れず、次の版で進める。
 - 経緯: 利用者が EffeTune 作者 (Frieve-A 氏) へ要望した 2 点 (プラグイン版の起動時表示に Visualizer を選べること、ホストからの曲情報の受け渡し) について、作者から「間もなくリリースする最新版で対応した」と返信があった (2026-10-09、利用者経由)。2026-10-09 時点の GitHub Releases の最新は v0.12.0 (2026-10-02) で、対応版はまだ公開されていない。
 - 仕様の正本 (作者): https://github.com/Frieve-A/effetune-mixwright/blob/main/docs/host-now-playing.md 。作者の説明では、IConnectionPoint::notify で "EffeTune.NowPlaying" メッセージを送り、title / album / artist は文字列、artwork は画像のバイト列、artworkMimeType は MIME 種別。送信は UI スレッドから行い、曲が切り替わるたびにまとめて送る。未指定・空の項目は消去される。

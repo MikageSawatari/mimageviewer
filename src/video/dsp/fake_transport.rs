@@ -52,6 +52,7 @@ impl Bridge {
                 child: None,
                 stdin: Mutex::new(None),
                 fake_commands: Some(commands),
+                fake_command_threads: Mutex::new(Vec::new()),
                 event_rx,
                 sync_call_mutex: Mutex::new(()),
                 cached_latency_samples: Arc::new(AtomicU32::new(0)),

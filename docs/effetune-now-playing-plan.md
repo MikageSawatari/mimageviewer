@@ -1,12 +1,13 @@
 # §1.359 EffeTune Mixwright v0.13.0 更新と Now Playing 連携
 
-状態: **設計案・未実装、利用者への質問は §7**。2026-10-09。
+状態: **実装・自動検証・確認用build完了、実機／公開前gate待ち**。2026-10-09。§7は全項目回答済み。
 対象は **v4.5.0 の次のリリース**。Coordinator は ClaudeCode、実装担当は Codex。
 調査基準は `next-effetune` / `33a018417e13a271be2da2c109fa571f64079684`。
 初稿の引き継ぎは `target/F-design-msg.txt`、R2は `target/F-design-r2-msg.txt`。
-R3は設計commit `45d65a17e` の再レビュー（前回P2六件は解消、新規P2一件・P3二件）を反映し、
-この設計書と `target/F-design-r3-msg.txt` だけを変更／作成する。vendor 差し替え、製品コード、
-署名、製品／プラグインの起動、コミットは行わない。
+R3は設計commit `45d65a17e` の再レビューを反映し、`39b293a75` の独立再レビューで新規指摘無し。
+v4.5.0公開済みのmaster `840c309ec` を `ba5367125` で本branchへmerge済み。
+利用者の2026-10-09回答により§5のA/Bを実装する。coherent chunkごとの検証・引き継ぎは
+`target/D359-<chunk>-msg.txt`。アプリ起動とコミットは行わない。署名・公開はrelease leadの担当。
 
 ## 0. 前提と証拠の読み方
 
@@ -26,7 +27,8 @@ R3は設計commit `45d65a17e` の再レビュー（前回P2六件は解消、新
   `crates/vst3-host/include/protocol.h`）、`bridge.rs` / `dsp/mod.rs` は `src/video/dsp/` を指す。
   `mod.rs` は `src/effetune/mod.rs`、remote／sfzのJS短名は直前に示したW内directoryを指す。
   製品ページの短名は `htdocs/mimageviewer/` を基点とする。
-- 本書の「コード参照」は静的読取。実行時の挙動は今回未確認。
+- 初稿の「コード参照」は静的読取時点の行番号。実装後の自動検証は§8へ記録する。
+  新版pluginの実機表示・通信・保存動作は未確認。
   バイナリの文字列／import検査はソースの代わりでも、ネットワーク不使用の証明でもない。
 
 ## 1. バンドル更新を完了させる手順
@@ -225,7 +227,7 @@ JSだけから「SFZの全sampleがWebView内にコピーされる」とは書�
 | 現行説明と根拠 | 実装時の扱い |
 | --- | --- |
 | `htdocs/mimageviewer/index.html:1213`「AI処理はすべてPCの中で」本文は画像AI4種類とGPUを列挙 | 画像AIの説明を維持。Adaptive PredictionまでGPU動作の保証を広げない。音声予測はPC内の音響処理という説明にし、native確認の根拠を別途得る |
-| `同ファイル:1219`「通信するのは4つの場面だけ」; `privacy.html:212`通信一覧 | Now Playingはcore→ローカルhost→pluginのIPCであり、新しいHTTP endpoint／通信先を足さない。新Remote JSの存在だけで第5の場面を追加しない。上記VST経路の静的調査と、起動／idleだけでなくSFZ選択・load・reload、Adaptive Prediction Learn／実音声処理時のhost／WebView子プロセスの通信・I/O観測を公開前gateとする（§6.2）。同梱はgate通過が条件。新しいlisten／外向き通信が観測されたら説明を確定する前に同梱可否をClaudeCode／利用者へ戻し、合意した内容で両ページを同時修正する |
+| `同ファイル:1219`「通信するのは4つの場面だけ」; `privacy.html:212`通信一覧 | Now Playingはcore→ローカルhost→pluginのIPCであり、新しいHTTP endpoint／通信先を足さない。新Remote JSの存在だけで第5の場面を追加しない。起動／idleとSFZ選択・load・reload、Adaptive Prediction Learn／実音声処理時のhost／WebView子プロセスの通信・I/Oを公開前に観測する（§6.2）。新版同梱は利用者決定済み。通信・保存動作が説明と異なれば同梱を取り下げる代わりにprivacy／製品ページ／manualを事実へ更新する |
 | `privacy.html:139`, `:166` と `index.html:1247` のEffeTune保存データ | SFZの楽器／参照情報を追加する必要がある。nativeの正確な保存先確認後に記述し、保存先不明のままIRと同じと決めない。Now Playingはplugin instance内の一時情報でpreset／historyへ保存しない（作者契約）。画像生成で利用する既存サムネcacheとは区別する |
 | `manual/effetune.html:92`以降、版別説明書、DSP NOTICE案内 | 新版の説明書snapshot／VST向けoverrideを用意。曲情報／画像、空欄、pause／stop、Remote EOF後の保持、起動時Visualizer、SFZの外部ファイル依存、local処理、portable非対応を平易に説明。EffeTune独立版のRemote／media playerをmIVで使える説明として残さない |
 
@@ -386,6 +388,14 @@ plugin API呼出し中はmailbox／watchdogのlockを保持しない。queue待�
   (`plugin_loader.cpp:602`, `:616`) に合わせ、診断を残して専用EffeTune hostを終了する。
   既存helperには汎用Error送信もある (`plugin_loader.cpp:613`) が、Now Playingのtimeout経路では
   それを通常応答として流用せず、stderr診断→process終了にする。終了検知をHostLostへ一意に流す。
+  実装レビューで、notify背後のclose/open/query/show等が既存の短いGUI sync期限で先に
+  汎用Errorを発行できる競合を確認した。slot GUI executorはcanonical mailboxへのweak参照を持ち、
+  同期futureの期限満了時にExecuting notifyがあれば、その同一開始時刻＋5秒までCVで完了を待つ。
+  notify期限超過はwatchdogと同じstderr専用終了へ収束する。期限内に完了すれば同じfutureを
+  操作自身の従来budgetで待ち、元操作のhangは既存方針とする。再度commandをqueueへ積まない。
+  baseline待機中に開始・完了してIdleへ戻ったnotifyも、同一mailboxのexecution_count増加で
+  待ち時間の消費を判定する。同IDの別incarnationにはこのbudget回復を引き継がない。
+  metadata用の別Running flag、sleep／try_lock loop、timeoutへの余裕値追加は使わない。
   GUI threadへのcancel／join／notify retryで解除を待たない。metadataの通常ackは増やさず、
   getState応答を待つ経路にもhostの死亡が伝わる既存経路を使う。
 - 既存host monitor (`src/effetune/mod.rs:1534`, `:1550`) → `fail(HostLost)`
@@ -394,6 +404,8 @@ plugin API呼出し中はmailbox／watchdogのlockを保持しない。queue待�
   専用hostなのでユーザーVSTチェーンを終了させない。§7.6の「効果を止めない」は通常失敗だけに適用する。
   故障の案内はcontrollerのFailedへの遷移で一度だけ発行し、毎frameのruntime参照や複数の未完了要求から
   重複発行しない。timeoutによる未完了の状態取得で保存済みpreset／stateを上書きしない。
+  Failedと同pollまたは後から届くmetadata write警告は常にdrainし、logだけへ収束させる。
+  停止案内を通常送信失敗の案内で上書きせず、同じhost故障を二度通知しない。
   現Appのpoll入口 (`src/app.rs:29146`) は故障toastを発行していないため、実装ではpoll前後の
   canonical runtimeのFailedへの変化をUIが一度通知する。通知済みboolを窓ごとに増やさない。
 
@@ -482,6 +494,10 @@ test fixtures (`src/video/mod.rs:8743`等) を揃える。Now Playing用にUIか
 `original_url`などの別metadata、ファイルの絶対path、URLを送信しない。
 推奨はtitle無しなら再生ファイルのstem、album／artist無しなら空欄（§7.1）。
 遅れて届いたVideoInfoはmedia identityが現在と一致する場合だけ採用する。
+上流VideoInfoの文字列は変更せず、Now PlayingのUI側descriptor生成前に共有の借用prefix関数で
+最初のNUL／4096 UTF-16単位までに制限する。Unicode scalarを途中で切らず、上限以降は走査・複製しない。
+毎tickの変更判定もこのprefixだけを比較し、送信されないsuffixの変更ではrevisionを進めない。
+snapshotの空title判定も制限後の文字列で行い、trim／cloneを上限検査より先に行わない。
 
 ### 4.3 artworkの優先順位
 
@@ -589,11 +605,11 @@ sidecarの全file無制限read、EXIF全展開は新経路へ持ち込まない�
   Local／Remote lifecycle、ドキュメント更新。開始前にClaudeCodeと独立reviewerで所有設計を合意し、
   coherent diff完成後も独立review。共用ファイルは担当writerを一人に固定する。
 
-## 6. 検証と受け入れ条件（今後実行するもの）
+## 6. 検証と受け入れ条件
 
-今回実行したのはgit状態／版／source読取、ZIP hash、ZIP対抽出全448ファイル比較、追加／削除一覧、
-通知diff、PE通常import／ASCII文字列の非起動検査だけ。製品の動作試験／Rust build／CMakeは未実行。
-今後のAの非署名source／fixture検証とBのRust／C++／画像／lifecycle検証、最終full gateは実装担当が所有する。
+設計時にはgit状態／版／source読取、ZIP hash、ZIP対抽出全448ファイル比較、追加／削除一覧、
+通知diff、PE通常import／ASCII文字列を非起動で検査した。実装後の結果は§8に追記する。
+Aの非署名source／fixture検証とBのRust／C++／画像／lifecycle検証、最終full gateは実装担当が所有する。
 ClaudeCodeは署名済み最終artifact／release checklistと利用者のnative受入れ枠を所有し、独立reviewerは
 設計とdiffを別contextで確認する。既に同じdiffで通った自動検証は再実行せず証拠を再利用する。
 
@@ -676,9 +692,9 @@ ClaudeCodeが具体的scenario／所要時間／desktop利用／データ範囲�
    library remove／runtime世代cleanupの削除範囲をfile I/Oと前後inventoryで確認する。
    元SFZ／sample、利用者の他のdataが勝手に削除されないことと、mIVのruntime cleanupから
    SFZ保存領域が分離されることを確認する。normal-profileの設定をagentが操作するtest setupは行わない。
-   **gate通過条件**は、実使用中を含め説明外のlisten／外向き通信が無いこと、保存／参照／削除範囲を
-   根拠付きで特定できること、public/privacy/manualの説明と一致すること。
-   未確認や説明外の挙動は同梱・公開を保留しClaudeCode／利用者へ戻す。追加機能を無断で削って通さない。
+   **公開前条件**は、実使用中のlisten／外向き通信と保存／参照／削除範囲を根拠付きで確認し、
+   public/privacy/manualの説明を実測に合わせること。新版同梱は2026-10-09利用者決定済み。
+   説明と異なる挙動があれば同梱を取り下げるのでなく公開説明を更新する。追加機能を無断で削らない。
 6. 署名後の最終launcherで新世代公開、全448ファイル／VERSION／署名hash一致、
    再起動reuse、欠落修復、新旧世代の使用中保護と次回cleanup、長pathの拒否、
    通常版／installer同梱・portable非同梱を検査する。
@@ -693,37 +709,100 @@ hostを変えるので、実装時はdev coreだけで引き渡しを終えな�
 エージェントはこの通常版を起動しない。自動UIのportable-smokeはEffeTune非同梱という製品境界があるため、
 bundleを足して今回のnative受入れの代わりにはしない。新版pluginのnative検証は利用者の手動枠を正本にする。
 
-## 7. 利用者へ確認すること（推奨案、未回答）
+## 7. 利用者決定（2026-10-09、全六項目回答済み）
 
 1. **曲名がファイルに入っていないとき、ファイル名を出しますか。**
-   推奨: 拡張子を除いたファイル名を出す。アルバム名とアーティスト名は、情報が無ければ空欄。
+   **決定: 推奨案を採用。** 拡張子を除いたファイル名を出す。アルバム名とアーティスト名は、情報が無ければ空欄。
    絶対パスやURLは渡さない。
 2. **一時停止中は曲情報を残し、リモートでは最後の曲が終わった後も残してよいですか。**
-   推奨: はい。シーク中や読み込み待ち、同じ曲の繰り返しでも残す。
+   **決定: 推奨案を採用。** シーク中や読み込み待ち、同じ曲の繰り返しでも残す。
    PCでの再生は停止・閉じる・最後まで再生して終了したときに消す。
    リモートは曲が終わっただけでは消さない。次曲へ移るときの停止・取消や再生セッション終了で消し、
    次曲の開始が確定したら新しい情報を出す。切替待ちや開始失敗時は空表示でもよい。
    PC側の再生へ切り替わったらその情報に置き換える。最後の曲名が残ることと切替中の空表示を許す方針。
+   利用者補足: Remote使用中はPC画面をほとんど見ないので、実装を簡単にする。
 3. **画像は長辺1024ピクセルまで、動く画像は最初の一枚でよいですか。**
-   推奨: はい。再生を待たせず、先に曲名を出し、画像が用意できたら表示する。
+   **決定: 推奨案を採用。** 再生を待たせず、先に曲名を出し、画像が用意できたら表示する。
    音楽は同名画像・MP3表紙、動画は一覧と同じ代表画像を使う。
 4. **曲情報は音響調整の使用中に自動で渡し、専用のON/OFF設定は増やさなくてよいですか。**
-   推奨: はい。PC内のプラグインに渡すだけで、未使用ならプラグインをこのために起動しない。
+   **決定: 推奨案を採用。** PC内のプラグインに渡すだけで、未使用ならプラグインをこのために起動しない。
    Visualizerで表示するかと起動時の画面はEffeTune側で選ぶ。
-5. **追加機能を実際に使って通信と保存先を確認できたら、新版を同梱してよいですか。**
-   推奨: はい。SFZの選択・読み込み・再読み込みと、音声予測の学習・処理中も確認する。
+5. **新版の同梱と公開前確認。**
+   **決定: 新版同梱は確定。** 公開前にSFZの選択・読み込み・再読み込みと、音声予測の学習・処理中も確認する。
    保存されるファイル、元ファイルへの参照、削除の範囲を確かめ、説明はmIVから実際に使える機能に限る。
    独立版EffeTuneのLANリモート操作は、mIVでも使えるとは案内しない。
-   実機確認が終わるまでは同梱・公開の判断を保留する。説明外の通信や保存動作があれば相談する。
+   必要ならprivacy.html／製品ページ「安心して使えます」／manualを実測に合わせて更新する。
+   通信・保存動作を理由に新版同梱を保留する方針は撤回する。実機確認自体は公開前に残る。
 6. **通常の受け渡し失敗では音響調整を続け、プラグインが固まったときは音響調整を停止して知らせる扱いでよいですか。**
-   推奨: はい。画像を読み込めなければ画像無しで曲情報を送る。読込失敗はログと一度の案内で知らせる。
+   **決定: 推奨案を採用。** 画像を読み込めなければ画像無しで曲情報を送る。読込失敗はログと一度の案内で知らせる。
    アプリからの送信に失敗した場合はログと一度の案内で知らせるが、前の曲名や画像が残る場合がある。
    プラグインに拒否された場合も前の表示が残る。返信を受け取らずログだけに記録するため、拒否の画面通知は行わない。
    通常の拒否では効果を止めず、次の曲の変更またはプラグインの次回初期化で送り直す。
    5秒戻らず固まった場合は音響調整用のプロセスを終了し、音声を素通しで再生し、一度知らせる。
    ユーザーVSTは終了させない。自動で繰り返したり、再起動したりしない（Coordinatorの決定済み方針）。
-   送信できなければ消去も届かず、notify拒否でも作者契約上は前のsnapshotが残る。この見え方も含めた合意が必要。
-   拒否も画面へ知らせたい場合は、要求IDで専用routeへ返信を戻す追加設計が必要になる。
+   送信できなければ消去も届かず、notify拒否でも作者契約上は前のsnapshotが残る。この見え方も了承済み。
 
 component優先・必要時controller fallback（同じobjectには一度だけ）、reply無し、
-latest一件の画像workerは技術上の推奨。ClaudeCode／独立reviewerの設計合意後に実装briefへ固定する。
+latest一件の画像workerを含め独立設計レビュー完了。実装後の独立completion reviewと§6の検証を行う。
+
+## 8. 実装・検証記録（2026-10-09）
+
+実装基点は `ba5367125`。コミットせず、アプリも起動しない。C++／Rust bridge／App lifecycleを
+担当別に実装し、独立reviewerが別contextで確認した。以下の未実施項目は自動検証の成功と区別する。
+
+- A: 原本ZIP hashと全448ファイルのbytes一致を確認し、vendorを実ファイルでv0.13.0へ更新。
+  旧原本は `target/D359-v0.12.0-source-backup` へ退避し、旧承認manifest／noticeは別の
+  `target/D359-v0.12.0-approval-backup` に保存した。新版承認manifestはVERSIONを含む449 entry。
+  `third_party/effetune-docs/6791afdf` は新版の上流EffeTune commit
+  `6791afdfc6f4e6c913b9f48c8189a44e29a09bde` の固定snapshotで、旧snapshotも保持する。
+  日本語manualは133 HTML＋4画像、113 effects。原本notice三本と追加licenseをaboutへ反映した。
+- B: protocol v6、UI thread上のnotify、有界mailbox、5秒hang方針、Rust latest worker、
+  Local／Remote owner、album metadata、非同期有界artworkを実装した。
+  既存一覧はpin更新中も旧WebPを表示するため、Now Playingのread-only pin選択もPTS一致を条件にしない。
+  非空BLOBと64 MiB読取上限は保ち、実 `set_pin` の更新待ち状態と一覧の一致をtempDBで試験する。
+- C++ completion reviewで見つかったGUI timeoutの競合を修正。
+  同じmailbox／incarnationと既存futureでnotifyの5秒期限を裁定し、実行回数により
+  最初の待ち中に完了したnotifyも識別する。再投稿・retry・独立したRunning状態は追加しない。
+  Rust/AppのHostLostと同時・直後に届くsend warningは既存Failed通知へ収束させる。
+  pin補正もaffected-path reviewで追加指摘無し。
+- 追加reviewで巨大tagのUI側全文clone／毎tick比較をP2として確認した。
+  共有borrowed prefixでdescriptor生成・変更判定・snapshotを制限し、既存VideoInfoの内容は保つ。
+  巨大suffix、Unicode scalar、NUL境界のheadless回帰とaffected-path reviewで解消を確認した。
+  最終独立reviewの未解消P指摘はゼロ。
+
+| 検証 | 結果・証拠 |
+| --- | --- |
+| ZIP／raw source gate | 全448ファイル一致、manifest449、`effetune-distribution.ps1 -ValidateSource` exit 0 |
+| 配布fixture | `test-effetune-distribution.ps1` PASS、exit 0 |
+| 日本語manual | converter 22/22、137出力＋entryの`--check`成功、sitemap343 URLs一致 |
+| C++ Release | CMake exit 0、最終ctest 3/3（17.05秒、`target/D359-vst3-ctest-final.log`）、v6 hello／旧v5拒否／metadata無応答、identity一致 |
+| C++ hang／slow GUI | 後続query／unload、watchdog ON/OFFとも約5.002秒で専用終了、stdout空。期限内slow／完了直後の同future回帰成功 |
+| 本体check | 最新版 `cargo check -j 1 -p mimageviewer --bin mimageviewer-core` exit 0、`target/D359-normal-check-final.log`（30.02秒） |
+| Rust Now Playing | 48/48、`target/D359-now-playing-tests-r5.log`。Local／Remote handler、stale画像、再Register、最大wire、失敗通知、巨大tag境界を含む。r4のtest-only型エラー五件は修正済み |
+| 追加画像予算 | RAW返却raster／Shell割当前上限 各1/1、`target/D359-test-bounded_thumbnail.log`／`target/D359-test-shell_bitmap_budget.log` |
+| 既存EffeTune回帰 | 105/105、`target/D359-test-effetune-r2.log`。既存fake hostもmetadataを無応答で受信しGUI試験を維持 |
+| notice／cleanup | about原本一致1/1、runtime cleanup22/22、`target/D359-test-effetune_notice.log`／`target/D359-test-runtime_cleanup.log` |
+| portable／独立tester | 最新core portable check exit 0（19.97秒）、`target/D359-portable-check-final.log`。独立tester check exit 0、`target/D359-tester-check.log`、full gateでtesterもcompile成功（unit caseは0件） |
+| C++引き継ぎ | `target/D359-b-cpp-msg.txt`。source marker `2899e71293f96a8ffe5852b1a991b0a6d6aabe67a9c7f61e5e6ca3cd13f52541` |
+| launcher | 39/39、`target/D359-launcher-tests.log`。承認449 raw files、実bundle抽出／修復／publisher／lease回帰 |
+| Remote Web | 518/518、`target/D359-remote-node-tests-r2.log`。初回runnerはchild spawn EPERMで未実行、Node22のsame-process isolationで全assert成功 |
+| 静的context audit | `cargo run --locked -p viewer_context_audit --quiet` exit 0、指摘ゼロ |
+| 初回Release build | `build-release.ps1 -PreserveRuntime` exit 0、CRT依存runtime4／embedded12検査成功。巨大tag補正前のcoreなので最終確認用binaryとは区別する |
+| 全体gate | `test-full.ps1 -SuppressCrashDialogs` PASS／exit 0、`target/D359-full-gate.log`。lib11457成功／52 ignored、UI snapshot140/140、Remote service137成功／1 ignored、IPC65/65 |
+| vendor gate | 同じfull gateでegui25/25・egui-wgpu11/11・eframe18/18。viewer-context crate36/36。全targetの結果は`target/D359-full-results.json` |
+| 最新確認用build | 利用者の続行指示どおり `build-dev.ps1 -PreserveRuntime` exit 0、`target/D359-dev-build.log`。core38m38s／Remote3m48s／EPUB2m26s、CRT runtime4／PE3成功 |
+| 最終artifact一致 | dev-runtime内のEffeTune全448ファイルを承認manifestのbytesと照合し一致。B source30ファイルのSHA256不変、`target/D359-artifacts-final.json` |
+
+最終 `cargo fmt --all -- --check` はclean、UI glyph lintは危険文字ゼロ。
+コミット分割はA194ファイル／B33ファイルで、完全な一覧は `target/D359-commit-files.json`。
+正本の引き継ぎは `target/D359-a-msg.txt`／`target/D359-b-msg.txt`／`target/D359-final-msg.txt`。
+B内のC++／Rust／App記録は担当別の証拠であり、protocol／album／ownerの依存があるBを別々にcommitする推奨ではない。
+利用者指定の最新版確認用起動コマンドは `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。
+通常APPDATAの実settings／dataを更新し得るため、installed／tray常駐版を先に閉じる。エージェントは起動していない。
+実機・通信／保存の詳細手順は `target/D359-hardware-check.md`。
+新版pluginの実機表示／v0.12.0 state互換、SFZ／Adaptive Prediction実使用中の通信・保存観測、
+署名後の最終artifactは未実施でrelease leadの受入れ枠に残す。workspace外のvendor backup更新も
+release leadへ引き継ぐ。unsigned原本を署名済みstageのhashで上書きしない。
+再buildしたhost＋CRTの実ファイルは `target/D359-vst3-host-current` にも保存した。
+これはツリー外backupの代わりではない。release leadは `CLAUDE.md` の
+`C:/home/mimageviewer_vendor_backup/vst3-host` を現host＋CRTで更新し、新EffeTune原本もツリー外へ保存する。

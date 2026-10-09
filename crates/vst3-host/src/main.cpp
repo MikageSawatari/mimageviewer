@@ -56,6 +56,7 @@
 #include "utf8_paths.h"
 #include "vcrt_preload.h"
 #include "build_identity.h"
+#include "now_playing.h"
 
 namespace miv {
 
@@ -112,18 +113,9 @@ static void setup_streams() {
 
 // length-prefixed UTF-8 メッセージを読み出す。EOF で false。
 static bool read_message(std::string& out) {
-    uint32_t len = 0;
-    if (std::fread(&len, sizeof(len), 1, stdin) != 1) {
-        return false;
-    }
-    if (len == 0 || len > MAX_CONTROL_MSG_SIZE) {
-        return false;
-    }
-    out.resize(len);
-    if (std::fread(out.data(), 1, len, stdin) != len) {
-        return false;
-    }
-    return true;
+    return read_control_frame([](void* data, size_t size) {
+        return std::fread(data, 1, size, stdin) == size;
+    }, out);
 }
 
 // stdout 書き込みは複数スレッド (main / audio thread) から呼ばれる可能性があるため
@@ -309,15 +301,26 @@ public:
             while (running_ && read_message(msg)) {
                 reader_cmds_received_.fetch_add(1, std::memory_order_relaxed);
                 enter_reader_state(BridgeReaderState::Queueing);
-                {
+                const auto command = extract_string_field(msg, "cmd");
+                if (command == "set_now_playing") {
+                    if (!admit_now_playing_frame(msg, now_playing_, [this](auto mailbox) {
+                        enqueue_now_playing(std::move(mailbox));
+                    })) {
+                        std::fprintf(stderr, "[BRIDGE] now_playing rejected invalid payload or unknown/closed slot\n");
+                    }
+                    std::fflush(stderr);
+                } else {
+                    const uint64_t epoch = command == "open" || command == "close" || command == "shutdown"
+                        ? now_playing_.seal_all() : now_playing_.epoch();
                     std::lock_guard<std::mutex> lk(cmd_mutex_);
-                    cmd_queue_.push_back(std::move(msg));
+                    cmd_queue_.push_back({std::move(msg), {}, epoch});
                 }
                 cmd_cv_.notify_all();
-                msg.clear();
+                std::string{}.swap(msg); // Do not carry artwork frame capacity into a later generic command.
                 enter_reader_state(BridgeReaderState::WaitingRead);
             }
             enter_reader_state(BridgeReaderState::Eof);
+            now_playing_.seal_all();
             // EOF: 親が stdin を閉じた → graceful shutdown
             {
                 std::lock_guard<std::mutex> lk(cmd_mutex_);
@@ -371,6 +374,19 @@ public:
     }
 
 private:
+    struct ControlCommand {
+        std::string json;
+        std::shared_ptr<NowPlayingMailbox> now_playing;
+        uint64_t epoch = 0;
+    };
+    void enqueue_now_playing(std::shared_ptr<NowPlayingMailbox> mailbox) {
+        {
+            std::lock_guard<std::mutex> lock(cmd_mutex_);
+            cmd_queue_.push_back({{}, std::move(mailbox), 0});
+        }
+        cmd_cv_.notify_all();
+    }
+
     enum class CapturePhase { Queued, Running, Canceled, Done };
     struct ConcurrentCapture {
         uint64_t id = 0;
@@ -452,6 +468,13 @@ private:
         for (;;) {
             ::Sleep(100);
             const ULONGLONG now = GetTickCount64();
+            bool notify_active = false;
+            for (const auto& mailbox : now_playing_.watched()) {
+                notify_active |= mailbox->stats().executing;
+                if (mailbox->expired(now)) {
+                    terminate_now_playing_timeout(mailbox);
+                }
+            }
             bool captures_active = false;
             {
                 std::lock_guard<std::mutex> lk(captures_mutex_);
@@ -472,7 +495,7 @@ private:
                     }
                 }
             }
-            if (!running_ && !captures_active) break;
+            if (!running_ && !captures_active && !notify_active) break;
             if (now - last_diagnostic_tick < 1000) continue;
             last_diagnostic_tick = now;
             const int main_state = main_state_.load(std::memory_order_acquire);
@@ -616,7 +639,7 @@ private:
             }
             // 3) コマンドキューを 1 件処理
             enter_main_state(BridgeMainState::WaitingCmdQueue);
-            std::string cmd_msg;
+            ControlCommand command;
             {
                 std::unique_lock<std::mutex> lk(cmd_mutex_);
                 if (cmd_queue_.empty()) {
@@ -626,19 +649,29 @@ private:
                     cmd_cv_.wait_for(lk, std::chrono::milliseconds(8));
                     continue;
                 }
-                cmd_msg = std::move(cmd_queue_.front());
+                command = std::move(cmd_queue_.front());
                 cmd_queue_.pop_front();
-                if (extract_string_field(cmd_msg, "cmd") == "notify_host_resize") {
+                if (extract_string_field(command.json, "cmd") == "notify_host_resize") {
                     while (!cmd_queue_.empty() &&
-                           extract_string_field(cmd_queue_.front(), "cmd") == "notify_host_resize") {
-                        cmd_msg = std::move(cmd_queue_.front());
+                           extract_string_field(cmd_queue_.front().json, "cmd") == "notify_host_resize") {
+                        command = std::move(cmd_queue_.front());
                         cmd_queue_.pop_front();
                     }
                 }
             }
-            set_current_cmd(extract_string_field(cmd_msg, "cmd"));
+            set_current_cmd(command.now_playing ? "set_now_playing" : extract_string_field(command.json, "cmd"));
             enter_main_state(BridgeMainState::ProcessingCmd);
-            const bool keep_running = handle_message(cmd_msg);
+            bool keep_running = true;
+            if (command.now_playing) {
+                auto mailbox = command.now_playing;
+                if (mailbox->stats().phase != NowPlayingMailbox::Phase::Closed) {
+                    if (auto* loader = loader_at(mailbox->slot_id)) {
+                        loader->post_now_playing(mailbox, [this](auto next) { enqueue_now_playing(std::move(next)); });
+                    } else { mailbox->close(); }
+                }
+            } else {
+                keep_running = handle_message(command.json, command.epoch);
+            }
             main_cmds_processed_.fetch_add(1, std::memory_order_relaxed);
             set_current_cmd({});
             if (!keep_running) {
@@ -790,7 +823,7 @@ private:
         return nullptr;
     }
 
-    bool handle_message(const std::string& msg) {
+    bool handle_message(const std::string& msg, uint64_t epoch) {
         std::string cmd = extract_string_field(msg, "cmd");
         if (cmd == "hello") {
             // T09 (v0.9.0): 受信した version を **必ず比較する**。host (mIV) と bridge exe
@@ -812,10 +845,10 @@ private:
             return true;
         }
         if (cmd == "open") {
-            return handle_open(msg);
+            return handle_open(msg, epoch);
         }
         if (cmd == "add_plugin") {
-            return handle_add_plugin(msg);
+            return handle_add_plugin(msg, epoch);
         }
         if (cmd == "probe") {
             std::string plugin_path = extract_string_field(msg, "plugin_path");
@@ -1182,7 +1215,7 @@ private:
         return true;
     }
 
-    bool handle_open(const std::string& msg) {
+    bool handle_open(const std::string& msg, uint64_t epoch) {
         cancel_and_drain_captures();
         std::string plugin_path = extract_string_field(msg, "plugin_path");
         std::string shm_name = extract_string_field(msg, "shm_name");
@@ -1276,6 +1309,7 @@ private:
             rebuild_chain_snapshot_unlocked();
         }
         loader_->set_processing_enabled(false);
+        now_playing_.add(0, epoch);
 
         std::string reply = "{\"event\":\"loaded\",\"plugin_name\":\"" +
                             json_escape(info.plugin_name) +
@@ -1288,7 +1322,7 @@ private:
         return true;
     }
 
-    bool handle_add_plugin(const std::string& msg) {
+    bool handle_add_plugin(const std::string& msg, uint64_t epoch) {
         std::string plugin_path = extract_string_field(msg, "plugin_path");
         if (plugin_path.empty()) {
             send_event_error("add_plugin: plugin_path missing");
@@ -1361,6 +1395,7 @@ private:
             processing_order_.push_back(slot_id);
             rebuild_chain_snapshot_unlocked();
         }
+        now_playing_.add(slot_id, epoch);
         std::string reply = "{\"event\":\"loaded\",\"plugin_name\":\"" +
                             json_escape(info.plugin_name) +
                             "\",\"slot_id\":" + std::to_string(slot_id) +
@@ -1873,7 +1908,8 @@ private:
     // GUI / コマンドキュー
     std::mutex cmd_mutex_;
     std::condition_variable cmd_cv_;
-    std::deque<std::string> cmd_queue_;
+    std::deque<ControlCommand> cmd_queue_;
+    NowPlayingRegistry now_playing_;
     std::atomic<bool> running_{false};
 
     // watchdog diagnostics for bridge main/reader stalls

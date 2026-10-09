@@ -29132,9 +29132,141 @@ impl App {
         }
     }
 
+    /// Snapshot the owning context's source proof without touching disk or GPU images.
+    #[cfg(windows)]
+    pub(crate) fn now_playing_input_for_player(
+        &self,
+        player: &crate::video::VideoPlayer,
+        sidecar: Option<PathBuf>,
+    ) -> crate::effetune::NowPlayingInput {
+        use crate::effetune::NowPlayingArtworkSource;
+        let settings = Arc::new(self.settings.thumbnail_source_discovery_snapshot());
+        let raw_executor = Arc::clone(&self.raw_develop_executor);
+        let io_semaphore = Arc::clone(&self.content_identity_fallback_io_sem);
+        let audio = player
+            .path()
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| {
+                crate::folder_tree::SUPPORTED_AUDIO_EXTENSIONS
+                    .contains(&ext.to_ascii_lowercase().as_str())
+            });
+        let artwork = if audio {
+            NowPlayingArtworkSource::Audio {
+                sidecar,
+                settings,
+                raw_executor,
+                io_semaphore,
+            }
+        } else {
+            NowPlayingArtworkSource::Video {
+                pinned_webp: None,
+                sidecar,
+                settings,
+                raw_executor,
+                io_semaphore,
+            }
+        };
+        let info = player.info();
+        let clone_prefix =
+            |text: &str| crate::effetune::now_playing::bounded_text_prefix(text).to_owned();
+        crate::effetune::NowPlayingInput {
+            path: player.path().clone(),
+            title: info
+                .and_then(|info| info.title.as_deref())
+                .map(clone_prefix),
+            album: info
+                .and_then(|info| info.album.as_deref())
+                .map(clone_prefix),
+            artist: info
+                .and_then(|info| info.artist.as_deref())
+                .map(clone_prefix),
+            artwork,
+        }
+    }
+
+    /// Only the current Local owner is inspected; focus and context mounting cannot adopt it.
+    #[cfg(windows)]
+    fn reconcile_local_now_playing(&mut self) {
+        let Some(owner @ crate::effetune::NowPlayingOwner::Local(identity)) =
+            self.effetune.now_playing_owner()
+        else {
+            return;
+        };
+        let live = self.viewer_context_ids().into_iter().any(|id| {
+            self.with_viewer_context_ref(id, |context| {
+                context.fullscreen_idx().and_then(|idx| context.fs_cache().get(&idx))
+                    .is_some_and(|entry| matches!(entry, FsCacheEntry::Video { player, .. }
+                        if player.media_identity() == identity && !player.local_now_playing_finished()))
+            }).unwrap_or(false)
+        });
+        if !live {
+            self.effetune.clear_now_playing(owner);
+        }
+    }
+
+    /// Called after this mounted player's tick and native input/close processing.
+    #[cfg(windows)]
+    fn publish_mounted_local_now_playing(
+        &mut self,
+        successes: &[(usize, u64, crate::video::PlaybackSuccess)],
+    ) {
+        let Some(idx) = self.fullscreen_idx else {
+            return;
+        };
+        let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) else {
+            return;
+        };
+        if !matches!(self.items.get(idx), Some(GridItem::Video(path) | GridItem::Audio(path)) if path == player.path())
+        {
+            return;
+        }
+        let owner = crate::effetune::NowPlayingOwner::Local(player.media_identity());
+        if player.local_now_playing_finished() {
+            self.effetune.clear_now_playing(owner);
+            return;
+        }
+        // Actual Playing is historical proof for metadata. A same-tick Pause may revoke
+        // the GUI auto-open permit below, but still keeps this adopted track's metadata.
+        let adopted_start = successes.iter().any(|(success_idx, identity, success)| {
+            *success_idx == idx
+                && *identity == player.media_identity()
+                && success.viewer_context == Some(self.projected_viewer_context_id().serial())
+        });
+        if !adopted_start && self.effetune.now_playing_owner() != Some(owner) {
+            return;
+        }
+        let Some(info) = player.info() else {
+            return;
+        };
+        let sidecar = self
+            .video_thumb_overrides
+            .get(&crate::path_key::normalize_keep_drive(player.path()));
+        if self.effetune.now_playing_metadata_matches(
+            owner,
+            player.path(),
+            info.title.as_deref(),
+            info.album.as_deref(),
+            info.artist.as_deref(),
+        ) && self.effetune.now_playing_artwork_source_matches(
+            owner,
+            sidecar.map(PathBuf::as_path),
+            &self.settings,
+        ) {
+            return;
+        }
+        let input = self.now_playing_input_for_player(player, sidecar.cloned());
+        self.effetune.publish_now_playing(owner, input);
+    }
+
     #[cfg(windows)]
     pub(crate) fn poll_effetune(&mut self, ctx: &egui::Context) {
+        self.reconcile_local_now_playing();
         self.effetune.set_repaint_context(ctx);
+        let was_failed = matches!(
+            self.effetune.runtime,
+            crate::effetune::EffetuneRuntime::Failed(_)
+        );
         let startup_pending = self.effetune.startup_pending();
         let open_gui_when_ready = match self.effetune.runtime {
             crate::effetune::EffetuneRuntime::Loading {
@@ -29173,6 +29305,24 @@ impl App {
                     .fail(crate::effetune::EffetuneFailure::ProcessFailed(
                         "unexpected editor bypass event".into(),
                     ));
+            }
+        }
+        if !was_failed
+            && matches!(
+                self.effetune.runtime,
+                crate::effetune::EffetuneRuntime::Failed(_)
+            )
+        {
+            self.show_feedback_toast(
+                "音響調整を停止しました。音声はそのまま再生を続けます。".to_owned(),
+            );
+        }
+        if let Some(warning) = self.effetune.take_now_playing_warning() {
+            if !matches!(
+                self.effetune.runtime,
+                crate::effetune::EffetuneRuntime::Failed(_)
+            ) {
+                self.show_feedback_toast(warning);
             }
         }
     }
@@ -41366,6 +41516,23 @@ impl App {
             return;
         }
         let dirty = std::mem::take(&mut self.video_thumb_overrides_dirty_paths);
+        #[cfg(windows)]
+        if let Some(FsCacheEntry::Video { player, .. }) =
+            self.fullscreen_idx.and_then(|idx| self.fs_cache.get(&idx))
+            && dirty.contains(player.path())
+            && self.effetune.now_playing_owner()
+                == Some(crate::effetune::NowPlayingOwner::Local(
+                    player.media_identity(),
+                ))
+        {
+            let owner = crate::effetune::NowPlayingOwner::Local(player.media_identity());
+            let sidecar = self
+                .video_thumb_overrides
+                .get(&crate::path_key::normalize_keep_drive(player.path()))
+                .cloned();
+            let input = self.now_playing_input_for_player(player, sidecar);
+            self.effetune.refresh_now_playing(owner, input);
+        }
         if !self.video_pin_dirty_visible_in_items(&dirty) {
             return;
         }
@@ -88546,6 +88713,8 @@ impl App {
         #[cfg(windows)]
         let mut auto_video_successes = Vec::new();
         #[cfg(windows)]
+        let mut now_playing_successes = Vec::new();
+        #[cfg(windows)]
         let mut anime4k_info_ready_indices: Vec<usize> = Vec::new();
         // 連続再生 EOF の振り分け種別 (Inc 7):
         //   - AudioFile     = 純粋な音声ファイル (`GridItem::Audio`) → 次の音声へ。
@@ -88641,6 +88810,12 @@ impl App {
                 }
                 #[cfg(windows)]
                 if let Some(success) = player.take_playback_success() {
+                    if success.viewer_context == Some(playback_viewer_context)
+                        && self.fullscreen_idx == Some(*idx)
+                        && matches!(self.items.get(*idx), Some(GridItem::Video(path) | GridItem::Audio(path)) if path == player.path())
+                    {
+                        now_playing_successes.push((*idx, player.media_identity(), success));
+                    }
                     // fs_cache is bound to this mounted context; only its current real-file
                     // video is adopted, never an audio-mode or unadopted cached player.
                     if success.viewer_context == Some(playback_viewer_context)
@@ -88981,6 +89156,8 @@ impl App {
             }
             return;
         }
+        #[cfg(windows)]
+        self.publish_mounted_local_now_playing(&now_playing_successes);
         // Sole automatic decision boundary: adopted playback facts survive all native
         // pause/close/source-result processing above, or are discarded in this frame.
         #[cfg(all(windows, not(feature = "portable")))]
@@ -94226,6 +94403,314 @@ mod still_seek_thumbnail_ownership;
 pub(crate) use tests::phase_c_support::{
     AppTestEnv as AppTestEnvForTest, setup_app as setup_app_for_test,
 };
+
+#[cfg(all(test, windows))]
+mod now_playing_lifecycle_tests {
+    use super::*;
+    use crate::effetune::NowPlayingOwner;
+
+    #[test]
+    fn now_playing_app_descriptor_clones_bounded_unicode_and_nul_prefixes() {
+        let app = setup_app_for_test();
+        let path = app.tmp.path().join("large-tags.mp3");
+        let mut player = crate::video::VideoPlayer::local_ready_disconnected_for_test(path);
+        let huge_suffix = "suffix".repeat(350_000);
+        let title_prefix = "\u{1f600}".repeat(2048);
+        let album_prefix = "a".repeat(4095);
+        let title = format!("{title_prefix}{huge_suffix}");
+        let album = format!("{album_prefix}\u{1f600}{huge_suffix}");
+        let artist = format!("Artist\0{huge_suffix}");
+        player.set_now_playing_metadata_for_test(Some(&title), Some(&album), Some(&artist));
+
+        let input = app.now_playing_input_for_player(&player, None);
+        assert_eq!(input.title.as_deref(), Some(title_prefix.as_str()));
+        assert_eq!(input.album.as_deref(), Some(album_prefix.as_str()));
+        assert_eq!(input.artist.as_deref(), Some("Artist"));
+        for text in [&input.title, &input.album, &input.artist] {
+            let text = text.as_ref().unwrap();
+            assert!(text.encode_utf16().count() <= 4096);
+            assert!(text.len() <= 3 * 4096);
+            assert!(!text.contains('\0'));
+        }
+        let info = player.info().unwrap();
+        assert_eq!(info.title.as_deref(), Some(title.as_str()));
+        assert_eq!(info.album.as_deref(), Some(album.as_str()));
+        assert_eq!(info.artist.as_deref(), Some(artist.as_str()));
+    }
+
+    #[test]
+    fn now_playing_host_failed_transition_notifies_once_from_canonical_runtime() {
+        let mut app = setup_app_for_test();
+        app.effetune.runtime = crate::effetune::EffetuneRuntime::Loading {
+            origin: crate::effetune::LoadOrigin::Startup,
+            open_gui_when_ready: None,
+        };
+        app.effetune
+            .set_test_startup_completion(Err(crate::effetune::EffetuneFailure::HostLost(
+                "fixture".to_owned(),
+            )));
+        let ctx = egui::Context::default();
+        app.poll_effetune(&ctx);
+        let toast = app.fs_feedback_toast.clone().expect("failure must notify");
+        app.poll_effetune(&ctx);
+        assert_eq!(app.fs_feedback_toast.as_ref(), Some(&toast));
+    }
+
+    #[test]
+    fn now_playing_send_warning_during_host_loss_keeps_canonical_notice() {
+        let mut app = setup_app_for_test();
+        app.effetune.runtime = crate::effetune::EffetuneRuntime::Loading {
+            origin: crate::effetune::LoadOrigin::Startup,
+            open_gui_when_ready: None,
+        };
+        app.effetune
+            .set_test_startup_completion(Err(crate::effetune::EffetuneFailure::HostLost(
+                "fixture".to_owned(),
+            )));
+        app.effetune
+            .set_now_playing_warning_for_test("曲情報を送信できませんでした: BrokenPipe");
+        app.poll_effetune(&egui::Context::default());
+        assert_eq!(
+            app.fs_feedback_toast
+                .as_ref()
+                .map(|(message, _, _)| message.as_str()),
+            Some("音響調整を停止しました。音声はそのまま再生を続けます。")
+        );
+        assert!(app.effetune.take_now_playing_warning().is_none());
+    }
+
+    #[test]
+    fn now_playing_late_send_warning_after_host_loss_is_drained_without_notice() {
+        let mut app = setup_app_for_test();
+        app.effetune.runtime = crate::effetune::EffetuneRuntime::Failed(
+            crate::effetune::EffetuneFailure::HostLost("fixture".to_owned()),
+        );
+        app.fs_feedback_toast = None;
+        app.effetune
+            .set_now_playing_warning_for_test("曲情報を送信できませんでした: BrokenPipe");
+        app.poll_effetune(&egui::Context::default());
+        assert!(app.fs_feedback_toast.is_none());
+        assert!(app.effetune.take_now_playing_warning().is_none());
+    }
+
+    fn install_player(app: &mut App, path: PathBuf) -> u64 {
+        let player = crate::video::VideoPlayer::local_ready_disconnected_for_test(path.clone());
+        let identity = player.media_identity();
+        player.bind_playback_viewer_context(app.projected_viewer_context_id().serial());
+        app.items = vec![GridItem::Audio(path)];
+        app.fullscreen_idx = Some(0);
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        identity
+    }
+
+    fn adopt(app: &mut App) -> u64 {
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+            panic!()
+        };
+        player.confirm_playback_start_for_test(crate::video::PlaybackStartOrigin::NewSource);
+        let identity = player.media_identity();
+        let success = player.take_playback_success().unwrap();
+        app.publish_mounted_local_now_playing(&[(0, identity, success)]);
+        assert_eq!(
+            app.effetune.now_playing_owner(),
+            Some(NowPlayingOwner::Local(identity))
+        );
+        identity
+    }
+
+    #[test]
+    fn now_playing_local_adopts_start_and_keeps_pause_seek_buffer_loop() {
+        let mut app = setup_app_for_test();
+        let path = app.tmp.path().join("song.mp3");
+        install_player(&mut app, path.clone());
+        let identity = adopt(&mut app);
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+            panic!()
+        };
+        player.set_playing_with_origin(false, crate::video::PlaybackStartOrigin::UserPlay);
+        player.seek_paused(4.0);
+        app.publish_mounted_local_now_playing(&[]);
+        app.reconcile_local_now_playing();
+        assert_eq!(
+            app.effetune.now_playing_owner(),
+            Some(NowPlayingOwner::Local(identity))
+        );
+        install_player(&mut app, path);
+        let identity = adopt(&mut app);
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+            panic!()
+        };
+        player.set_loop_enabled(true);
+        player.mark_eof_for_test(30.0);
+        assert!(player.is_at_eof());
+        app.reconcile_local_now_playing();
+        assert_eq!(
+            app.effetune.now_playing_owner(),
+            Some(NowPlayingOwner::Local(identity))
+        );
+    }
+
+    #[test]
+    fn now_playing_local_natural_end_and_shutdown_clear_only_current_owner() {
+        let mut app = setup_app_for_test();
+        let path = app.tmp.path().join("song.mp3");
+        install_player(&mut app, path.clone());
+        adopt(&mut app);
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+            panic!()
+        };
+        player.set_loop_enabled(false);
+        player.mark_eof_for_test(30.0);
+        app.reconcile_local_now_playing();
+        assert_eq!(app.effetune.now_playing_owner(), None);
+        install_player(&mut app, path);
+        adopt(&mut app);
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get_mut(&0).unwrap() else {
+            panic!()
+        };
+        player.shutdown();
+        app.reconcile_local_now_playing();
+        assert_eq!(app.effetune.now_playing_owner(), None);
+    }
+
+    #[test]
+    fn now_playing_local_mount_pause_and_stale_metadata_cannot_take_remote_owner() {
+        let mut app = setup_app_for_test();
+        let path = app.tmp.path().join("old.mp3");
+        install_player(&mut app, path.clone());
+        adopt(&mut app);
+        let remote = NowPlayingOwner::Remote {
+            session: 12,
+            registration: 34,
+        };
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+            panic!()
+        };
+        let input = app.now_playing_input_for_player(player, None);
+        app.effetune.publish_now_playing(remote, input);
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get_mut(&0).unwrap() else {
+            panic!()
+        };
+        player.set_now_playing_metadata_for_test(
+            Some("late old title"),
+            Some("old album"),
+            Some("old artist"),
+        );
+        app.publish_mounted_local_now_playing(&[]);
+        app.reconcile_local_now_playing();
+        assert_eq!(app.effetune.now_playing_owner(), Some(remote));
+    }
+
+    #[test]
+    fn now_playing_local_metadata_readiness_updates_current_owner() {
+        let mut app = setup_app_for_test();
+        let path = app.tmp.path().join("song.mp3");
+        install_player(&mut app, path.clone());
+        let identity = adopt(&mut app);
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get_mut(&0).unwrap() else {
+            panic!()
+        };
+        player.set_now_playing_metadata_for_test(Some("Title"), Some("Album"), Some("Artist"));
+        app.publish_mounted_local_now_playing(&[]);
+        assert!(app.effetune.now_playing_metadata_matches(
+            NowPlayingOwner::Local(identity),
+            &path,
+            Some("Title"),
+            Some("Album"),
+            Some("Artist")
+        ));
+        app.settings.video_thumb_use_sidecar_image = !app.settings.video_thumb_use_sidecar_image;
+        let cover = app.tmp.path().join("song-cover.png");
+        app.video_thumb_overrides
+            .insert(crate::path_key::normalize_keep_drive(&path), cover.clone());
+        assert!(!app.effetune.now_playing_artwork_source_matches(
+            NowPlayingOwner::Local(identity),
+            Some(&cover),
+            &app.settings,
+        ));
+        app.publish_mounted_local_now_playing(&[]);
+        assert!(app.effetune.now_playing_artwork_source_matches(
+            NowPlayingOwner::Local(identity),
+            Some(&cover),
+            &app.settings,
+        ));
+    }
+
+    #[test]
+    fn now_playing_local_same_tick_pause_keeps_actual_start_adoption() {
+        let mut app = setup_app_for_test();
+        let path = app.tmp.path().join("paused-new.mp3");
+        let identity = install_player(&mut app, path);
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+            panic!()
+        };
+        player.confirm_playback_start_for_test(crate::video::PlaybackStartOrigin::NewSource);
+        let success = player.take_playback_success().unwrap();
+        player.set_playing_with_origin(false, crate::video::PlaybackStartOrigin::UserPlay);
+        assert!(!player.playback_success_is_current(success.id));
+        app.publish_mounted_local_now_playing(&[(0, identity, success)]);
+        app.reconcile_local_now_playing();
+        assert_eq!(
+            app.effetune.now_playing_owner(),
+            Some(NowPlayingOwner::Local(identity))
+        );
+    }
+
+    #[test]
+    fn now_playing_local_cancelled_start_fact_cannot_adopt() {
+        let mut app = setup_app_for_test();
+        let path = app.tmp.path().join("cancelled-new.mp3");
+        let identity = install_player(&mut app, path);
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get_mut(&0).unwrap() else {
+            panic!()
+        };
+        player.confirm_playback_start_for_test(crate::video::PlaybackStartOrigin::NewSource);
+        let success = player.take_playback_success().unwrap();
+        player.shutdown();
+        assert!(player.local_now_playing_finished());
+        app.publish_mounted_local_now_playing(&[(0, identity, success)]);
+        assert_eq!(app.effetune.now_playing_owner(), None);
+    }
+
+    #[test]
+    fn now_playing_local_context_move_and_sibling_close_preserve_identity() {
+        let mut app = setup_app_for_test();
+        let path = app.tmp.path().join("parked.mp3");
+        let cover = app.tmp.path().join("parked.png");
+        app.video_thumb_overrides
+            .insert(crate::path_key::normalize_keep_drive(&path), cover.clone());
+        install_player(&mut app, path);
+        let identity = adopt(&mut app);
+        let parked = app.stash_mounted_as_active_for_test(907);
+        let sibling = app.tmp.path().join("sibling.mp3");
+        install_player(&mut app, sibling);
+        app.publish_mounted_local_now_playing(&[]);
+        app.close_fullscreen();
+        app.reconcile_local_now_playing();
+        assert_eq!(
+            app.effetune.now_playing_owner(),
+            Some(NowPlayingOwner::Local(identity))
+        );
+        assert!(app.effetune.now_playing_artwork_source_matches(
+            NowPlayingOwner::Local(identity),
+            Some(&cover),
+            &app.settings,
+        ));
+        app.with_window_context_for_test(parked, |app| {
+            app.publish_mounted_local_now_playing(&[]);
+            assert!(matches!(app.fs_cache.get(&0), Some(FsCacheEntry::Video { player, .. }) if player.media_identity() == identity));
+            app.close_fullscreen();
+        });
+        app.reconcile_local_now_playing();
+        assert_eq!(app.effetune.now_playing_owner(), None);
+    }
+}
 
 #[cfg(test)]
 mod index_full_check_tests {

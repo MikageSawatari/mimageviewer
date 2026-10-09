@@ -1049,6 +1049,11 @@ impl DspBridge {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_fake_slot_id_for_test(&self, slot_id: u64) {
+        self.inner.lock().unwrap().slots[0].slot_id = slot_id;
+    }
+
+    #[cfg(test)]
     pub(crate) fn gui_all_visible_desired_for_test(&self) -> bool {
         self.gui_all_visible_desired.load(Ordering::Acquire)
     }
@@ -1408,6 +1413,22 @@ impl DspBridge {
             ));
         }
         out
+    }
+
+    /// Snapshot the real slot under the DSP lock; serialization and pipe I/O run
+    /// after releasing it, without an audio processing permit.
+    pub(crate) fn send_now_playing(
+        &self,
+        snapshot: &crate::effetune::now_playing::NowPlayingSnapshot,
+    ) -> std::io::Result<()> {
+        let (host, slot_id) = {
+            let inner = self.inner.lock().unwrap();
+            let slot = inner.slots.first().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotConnected, "no EffeTune slot")
+            })?;
+            (Arc::clone(&slot.bridge), slot.slot_id)
+        };
+        host.send(&snapshot.command(slot_id))
     }
 
     /// Request the first loaded plugin's state without occupying the normal
