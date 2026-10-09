@@ -1,7 +1,8 @@
 # サムネイル要求の寿命を一つの owner に集約する（§1.360）
 
 作成: 2026-10-09。ライン A / `next-tray`、基点 `840c309ec`。
-状態: **設計案のみ。未実装・独立設計レビュー前。コミットは利用者が行う。**
+状態: **設計案のみ。未実装。`37353cb0e` の独立設計レビュー REVISE / P2 を反映し、
+再レビュー待ち。コミットは利用者が行う。**
 
 ## 1. 対象と根拠
 
@@ -88,7 +89,7 @@ Loaded→Evicted となっても Finalized を受けた時点で正しく要求�
 
 owner が保持するもの:
 
-- idx ごとの現在の request key と要求種別（通常 / upgrade / 動画 / 直接画像など）。
+- idx ごとの現在の request key と要求種別（§3.4の Normal / Upgrade / VideoBatch / DirectPixels）。
 - request の typed lifecycle と、その要求が所有する未採用 `ThumbPixels`。
 - アップロード順の queue。これは request key を指す順序だけを持ち、別の完了判定に使わない。
 - 既存の `edit_preview_epoch` 等の採用証明。
@@ -170,6 +171,100 @@ invalidate scope / source、drop に絞る。段階ごとに別の保留集合�
 5. 完了条件が揃った owner だけを除去する。次の通常需要評価で既存の再ロード経路へ戻る。
    表示状態の一括 Pending 化、追加 repaint、時間待ちによる競合回避はしない。
 
+### 3.4 idle upgrade / tail repaint / progress の投影（独立レビュー P2 反映）
+
+**寿命の所有と、UI が何を待つかは別の契約である。** 現行の動画専用スレッドは
+`requested` に登録されない。動画を新ownerへ登録しても、owner全体の `is_empty/len` を
+旧 `requested` の判定へ流用しない。再投入可否だけは全種別で個別ownerを照合し、
+以下の投影はそのownerの読み取りAPIに集約する。別のboolや保留集合は追加しない。
+
+**要求種別**は画像のoriginや媒体から推測せず、受付入口で固定する。
+
+| 種別 | 入口と既存の意味 |
+| --- | --- |
+| Normal | 通常 / foreground の reload・heavy worker要求。Audio、Folder代表、ドライブseed検証、RAW継続も含む。旧 `requested` の `idle_upgrade=false` に対応 |
+| Upgrade | `enqueue_idle_upgrades` のworker要求。旧 `requested` の `idle_upgrade=true` に対応。既存Loaded画像を描き続ける |
+| VideoBatch | `spawn_video_thread` のバッチ要求。pin / sidecar / Shell retryを含み、旧 `requested` には入らない |
+| DirectPixels | bookmark markerなどworkerを介さない画像投入。旧 `requested` には入らず、未採用画像だけが旧backlogへ入る |
+
+cache hitやsource生成への分岐で種別を変えない。RAW follow-upも元のNormal / Upgradeを保持する。
+
+投影の入力は、当該contextの現世代で有効なowner、現在の `keep_set`、画像待ち状態である。
+`D(r)` は `r.idx ∈ keep_set`（grid / navigation / hover / bookmark / seekの既存需要の和）。
+raw idx の連続bbox、Videoのkeep外強制保持、window visibilityを `D` の代用にしない。
+画像待ち状態はlifecycleから次のように導出する。
+
+- **Awaiting**: AwaitingResult / FinalizedAwaitingResult。画像はまだUIへ届いていない。
+- **Queued**: SourceImageQueued / TerminalImageQueued、またはProvisionalImageの未採用seed。
+  UIが画像を所有し、採用/破棄の処理が残る。
+- **Settled**: ImageSettledAwaitingFinalized、またはProvisionalImageの採用/破棄済seed。
+  画像側は終了しているがworker終端/検証待ちなのでownerは残る。
+
+完了/失効済ownerは投影の対象外。以下で `L` は画像待ち状態を問わず存続する
+Normal / Upgradeの集合、`Q` は全種別のQueued集合とする。
+投影の実装は種別別のowner参照、既存keep集合、画像queueを使い、各frameで
+keep外のVideoBatch全件を走査しない。件数/集合参照は同じowner内で管理し、
+完了条件の別ownerやconsumer側のキャッシュは作らない。
+
+#### 3.4.1 idle upgrade の開始・時刻再確認
+
+`blocks_idle_upgrade = (L が非空)`。**需要範囲外のNormal / Upgradeも含める**。
+これは旧 `requested.is_empty()` の意味を保つためであり、keep退出後の保存待ちや
+9枚目の画像待ちでupgradeを追加投入しない。Awaiting / Queued / Settledのいずれもblockする。
+VideoBatch / DirectPixelsは `D` と画像待ち状態を問わず、このblockerには含めない。
+
+`enqueue_idle_upgrades` と `thumb_idle_upgrade_recheck_delay` は同じ投影を使う。
+reload / heavy queueが空である条件、既存の入力/scroll idle時間、設定、候補のorigin /
+解像度判定は維持する。各idxのbeginは別途全種別ownerを照合し、同じidxの二重要求を防ぐ。
+したがって、**keep外VideoBatchが数十秒Shell retry中でも、別idxの画像のupgradeは進む**。
+動画待ちを理由にidle recheckの既存deadlineを消さず、新しい周期pollも足さない。
+
+#### 3.4.2 tail repaint と同じ意味を持つ計装
+
+thumbnail由来の各reasonを次のように定義する。他のrepaint理由やdelayed pollは変更しない。
+
+| 既存reason | 新ownerからの投影 |
+| --- | --- |
+| `requested_nonempty` | `L が非空`。Normal / Upgradeの全画像待ち状態を含み、`D` で絞らない。VideoBatch / DirectPixelsは含めない |
+| `texture_backlog_nonempty` | `Q が非空`。全種別の採用/破棄待ち画像を含む。keep外動画もGrid policyで採用する既存仕様を保つ。画像未受信のretryやSettledは含めない |
+| `visible_video_thumb_pending` | `VideoBatch ∧ D(r) ∧ 画像待ち状態がAwaitingまたはQueued` のownerが存在する。keep外のAwaiting動画だけでは成立しない |
+
+Queuedの範囲外画像は既存のpoll/consumption policyで採用または破棄するまでbacklog理由を持つ。
+VideoBatchの画像受信後にこの理由で有限に排水することと、画像のないShell retryを
+新たな継続repaintにすることを区別する。動画がkeep内へ入れば既存の動画待ち理由が立ち、
+keep外へ出ればその理由だけが消える。終端・採用/破棄後は対応する理由も消える。
+動画要求をownerに登録した事実だけではwakeせず、worker retryごとのUI heartbeatも追加しない。
+動画の受信/pollとschedulerは既存経路を使い、hidden用のguardや新しいdelayは追加しない。
+
+`thumbnail_work_active` は上記3投影のOR。`requested_len` は `|L|`、
+`texture_backlog_len` は `|Q|` とし、frame-gap / tailの計装と実際のrepaint判断を一致させる。
+owner総数が診断に必要なら別名の値にし、旧requested件数として報告しない。
+tray tooltipは既存のindex pause / window visibilityの投影を維持し、owner件数を新しく使わない。
+
+#### 3.4.3 通常 / 高画質化の進捗
+
+当該contextの需要内だけを数え、VideoBatch / DirectPixelsを通常/upgradeの件数、peak、
+`cache_gen_total/done`へ追加しない。種別だけで除外するため、動画がkeep内に入っても、
+画像が到着してQueuedになっても進捗へ誤算入しない。
+
+```text
+N  = count(Normal  AND D AND ownerが存続)   # count_pending / snapshotの通常cur
+U  = count(Upgrade AND D AND ownerが存続)   # count_pending / snapshotのupgrade cur
+QN = count(Normal  AND D AND image_wait == Queued)
+normal_peak_input  = N - QN
+upgrade_peak_input = U
+```
+
+Awaiting / Queued / Settledは存続中ならN/Uに一度だけ入る。保存/検証待ちも既存の
+要求進捗として残し、画像queueやworker queueを別件として加算しない。
+通常peakは既存の「decode済みbacklogを差し引く」意図を同じNormal・同じ需要内のQNで表す。
+**全種別のQをNから差し引かない**。動画/DirectPixels/Upgradeのbacklogが通常peakを
+下げたり、keep外画像が需要内の進捗を打ち消したりしてはならない。
+upgrade peakは既存どおりUを使い、peak更新/zero時resetとsnapshotの表示方法は維持する。
+
+この区別は要求数をprogress/repaintの都合で解除するものではない。
+投影から除外されたVideoBatchも、画像受信後は採用/破棄まで同じtyped ownerが所有する。
+
 ## 4. producer / consumer と終了経路の棚卸し
 
 下表は基点での入口と同型経路。実装時は型変更によるコンパイル検査に加え、
@@ -187,11 +282,11 @@ invalidate scope / source、drop に絞る。段階ごとに別の保留集合�
 | RAW preview / half handoff | preview が十分なら既存 source 経路。不足なら同じ key を `RawThumbPending`、callback、follow-up queue、`finish_pruned_raw_half_followup` に渡す。handoff 自体は完了でない。取消通知と callback の遅着が後続 owner を壊さず、進捗の一回計上も維持 |
 | Audio | generator は cache admission 後に一通知。Pixels は TerminalPixels、NoArt / Failed / Canceled は画像なし終端。sidecar / MP3 art / RAW sidecar、idle upgrade と cache revisit は既存の共通 dispatch を維持 |
 | ドライブ代表 / child pin | seed→同一確定Finalized、seed→確定FinalCache、seed→child miss の各経路。seed の upload 有無に依存せず旧seedを閉じる。seed表示の省略や追加DB参照はしない |
-| `spawn_video_thread` | pin blob→sidecar→Shell の既存優先順・worker内retryを維持。バッチ投入前に owner と key を確定し、終端画像/失敗を返す。grid の keep 外動画保持と tray 解放除外を維持。fullscreen-only policy を grid に変えない |
+| `spawn_video_thread` | pin blob→sidecar→Shell の既存優先順・worker内retryを維持。バッチ投入前にVideoBatch ownerとkeyを確定し、終端画像/失敗を返す。§3.4の投影により画像のないkeep外retryはupgradeを妨げずrepaint/進捗を増やさない。grid の keep 外動画保持と tray 解放除外を維持。fullscreen-only policy を grid に変えない |
 | ブックマーク marker の直接画像 | `install_bookmark_view_rows_with_sources` の backlog 直接 push（47196行付近）も begin→TerminalPixels の同期入口にする。workerなしを理由に相関検査を迂回しない |
 | `poll_thumbnails` / upload backlog | 通知受信・優先排水・8枚予算・adopt/discard を owner API へ。NoArt、Failed、idx不正、旧世代、旧request、旧edit-preview epoch を個別に処理し、他の要求を idx だけで remove しない |
 | grid / detached の消費policy | main の Grid poll と、mounted viewer 内の PassthroughRendition poll（61285行付近）で同じ owner 遷移を使う。動画keep外保持・auto aspectを駆動するpolicy差は維持し、mainの需要を兄弟へ投影しない |
-| progress / repaint / idle判定 | `count_pending`、`update_progress_peaks`、`progress_snapshot`、idle recheck、tail repaint、tray tooltipとperf件数はownerの読み取り投影。表示中のupgrade、未採用画像、保存待ちを区別し、画像queueを要求数と二重計上しない。完了判定をconsumerへ分散させない |
+| progress / repaint / idle判定 | `count_pending`、`update_progress_peaks`、`progress_snapshot`、idle recheck、tail repaintとperf件数は§3.4の別々の読み取り投影を使い、owner全体の非空判定へ置換しない。tray tooltipは従来のindex/window状態のみ。完了判定をconsumerへ分散させない |
 | keep projection / eviction | `install_thumbnail_keep_projection` の差分、通常 grid eviction、details切替、hover終了、seek set終了。GPU eviction は採用済み事実を維持。未採用画像を捨てても source Finalized 待ちは残す。再入場で保存中の同じ需要を再投入しない |
 | tray hide / restore | `release_gpu_resources` の backlog clear を owner の discard-all-images に置換。未終端workerを取消済みと推測しない。detach保持で現在 clear を通らない分岐も既存どおり。restore は通常需要の再評価だけで、owner再初期化や全通知無視をしない |
 | items / worker session 更新 | drive一覧、`start_loading_items` / `install_new_items`、`invalidate_idx_state_and_queues`、search / smart / collection / bookmark一覧採用、pin更新時のworker再作成（43890行付近）。既存 generation / channel / cancel 境界で旧 namespace を retire、未採用画像を discard、旧queue / RAW ticket を取消 |
@@ -276,7 +371,9 @@ hidden schedulerの100ms制限やactive mediaのwake契約も変更しない。
 - queue pruneやdiscardは既存queue/keep差分を対象とし、消えたorder tokenを溜め続けない。
   tray時の解放は当該contextの所有画像だけをdropする。
 - progressの`cache_gen_done`はworker完了の既存意味を維持し、UI adoptで二重計上しない。
-  requested/backlog件数はownerの読み取り投影として既存計装・repaint判定へ渡す。
+  requested/backlog件数とidle gating / progressは§3.4の投影で渡し、VideoBatch登録による
+  消費者の待ち範囲拡大を防ぐ。投影は既存のowner/keep/画像状態から求め、ShellのOS状態を
+  UIで問い合わせたり、新しいtimerでretryを監視したりしない。
 - `--perf-log`有効時のbegin / pixels / finalized / adopted / discarded / canceledに
   request IDを載せる場合も外ガードを使う。requestごとの有限イベントとし、
   毎frameの反復ログや新たなheartbeatは足さない。
@@ -323,6 +420,9 @@ fake通知を使うhandler-level poll/enqueue検査を組み合わせる。
 | 同一世代のlate notification | Aを終端/明示失効させBをbeginし、AのPixels / Finalized / Canceled / Failed / NoArtを全て注入。Bの予約・表示・origin・dims・writeback・色代表状態は不変 |
 | items generation / channel / source証明の失効 | 同じidxへの旧結果を拒否。新世代/新edit epochは採用可能。単なるkeep退出やGPU退去では失効扱いにしない |
 | 単一通知 | cache hit、edit preview、Audio Pixels、video、marker直接画像はFinalizedなしで画像採用/破棄後に終わる。Audio NoArt/Failed/Canceledは画像なしで終端。NoArt/Failedの通常静止再要求なし、明示cache maintenance後の再要求あり |
+| keep外動画retryと画像upgrade（設計レビューP2-1） | keep外idxにVideoBatch Awaiting ownerを残し、keep内の別idxにUpgradeableCache画像を用意。fake retry待ちのまま、期限前はidle recheckが従来の残り時間を返し、期限後はreload/heavy両queueが空ならupgradeを1回beginして採用まで進む。owner全体は非空でもblockerは動画を除外。対照としてNormal / Upgradeはkeep外・画像Queued/Settledでも終端までblockする |
+| 動画待ちのrepaint投影（設計レビューP2-2） | 動画以外のwake理由を除いたfake frameで、keep外VideoBatch Awaitingだけなら3つのthumbnail reasonとthumbnail_work_activeは全てfalse。keep内へ入れるとvisible_video_thumb_pendingだけtrue、退出でfalse。動画PixelsをQueuedにするとkeep外でもbacklog理由だけtrue（Gridの既存保持）、8枚予算で採用/破棄後false。retry時間相当の反復評価でも追加timer/heartbeat/通常requested理由を作らず、既存の動画待ち以上にrepaintしない |
+| 動画要求の進捗非算入（設計レビューP2-3） | VideoBatchだけをkeep内/外、Awaiting/Queued、採用/失敗終端へ遷移させ、通常/upgrade cur・peak・cache_gen_total/doneは0のまま。別にNormalとUpgradeを混在させ、動画/DirectPixelsのQueued画像を増減し、既存Upgradeやkeep外Normalの画像待ちphaseを変えてもN/UとNormal peak入力N-QNが不変。Normalの需要内QueuedだけをQNへ入れ、queueとownerの二重計上なし |
 | ドライブseed | seed未upload/採用済みそれぞれで同一確定、別画像確定、child miss、cancel。旧seedの残存/再uploadなし、早いseed表示を維持 |
 | PDF/ZIP/RAW | saveあり/skip、PDF Interruptedとharvest後save、ZIP/Folder resolve取消、RAW ticket取消/late callback/follow-up prune。request相関と進捗一回計上を保つ |
 | sibling context invariance | mainと兄弟を同じidx/世代、別request keyとqueue/channelで用意。mainのhide/restore/keep退出/取消/世代変更/closeで兄弟の要求、backlog画像、texture ID、世代、token、queue、channel、shared keepが不変。mount/unmountはowner移動、forkはin-flight非共有、retireは当該contextのみ |
@@ -383,5 +483,17 @@ hidden需要削減は将来案であり、今回承認された仕様変更と�
 
 実装前の設計レビューでは、sourceの両終端、単一通知、seed検証、RAW継続、
 同一世代の明示更新と古い通知、context局所所有を重点確認する。
-この文書は設計担当/独立レビュアーの合意をまだ記録しておらず、実装着手の証拠にはしない。
-今回の有効な検証証拠は、基点のソース照合と提供ログ/reportの読み取りだけである。
+この文書は設計担当/独立レビュアーの最終合意をまだ記録しておらず、実装着手の証拠にはしない。
+有効な検証証拠は、基点のソース照合と提供ログ/reportの読み取り、下記の独立レビュー報告である。
+
+## 11. 独立設計レビューへの対応
+
+利用者が設計を `37353cb0e` としてコミット後、独立設計レビューはREVISE。
+唯一のP2は「VideoBatchの新規owner登録により、旧requested非空判定の意味が広がる」点だった。
+§3.4で種別・現在需要・画像待ち状態からidle gating / tail repaint / progressを確定し、
+§4 / §6を合わせ、§8へ対応する3件の回帰を追加した。**再レビュー待ちであり、承認済みとは扱わない。**
+
+独立レビュアーは両終端owner、通知相関、8枚予算、heartbeat除外、二つのtray測定案について
+他の重大指摘はないと報告した。また提供ログから該当heartbeatだけを除いて再解析し、
+`input=0`、同一work最大116回、FAIL維持を報告した（レビュアーによる読み取り検証）。
+今回の改訂でも製品コード変更、テスト実行、ビルド、アプリ起動、コミットは行わない。
