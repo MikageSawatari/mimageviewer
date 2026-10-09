@@ -399,6 +399,7 @@ impl ThumbnailEngine {
         })?;
 
         let mut load_request = crate::thumb_loader::LoadRequest {
+            request_id: crate::thumb_loader::ThumbnailRequestId::Standalone,
             // decode は検証済みの logical path を使う。catalog key、pin DB、回転 DB が
             // 本体 UI と同じ spelling になり、canonical path は境界判定専用に保つ。
             path: resolved.logical.clone(),
@@ -519,10 +520,7 @@ impl ThumbnailEngine {
         drop(tx);
         let color_image = rx
             .into_iter()
-            .find_map(|message| match message.payload {
-                crate::thumb_loader::ThumbMsgPayload::Pixels(pixels) => Some(pixels.image),
-                _ => None,
-            })
+            .find_map(|message| message.into_pixels().map(|pixels| pixels.image))
             .ok_or_else(|| {
                 if matches!(
                     raw_requirement,

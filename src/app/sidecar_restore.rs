@@ -3846,37 +3846,25 @@ mod tests {
         use crate::grid_item::ThumbnailState;
 
         let mut requested = ThumbnailRequests::default();
-        let mut pending_finalize = std::collections::HashSet::from([0]);
         let mut thumbnails = vec![ThumbnailState::Pending];
         requested.insert_with_edit_preview_epoch(0, false, Some(4));
+        requested.mark_finalized_for_test(0);
 
-        cleanup_stale_edit_preview_request(
-            &mut requested,
-            &mut pending_finalize,
-            &mut thumbnails,
-            0,
-            4,
-        );
+        cleanup_stale_edit_preview_request(&mut requested, &mut thumbnails, 0, 4);
 
         assert!(requested.is_empty());
-        assert!(pending_finalize.is_empty());
+        assert!(!requested.any_finalized_image_wait());
         assert!(matches!(thumbnails[0], ThumbnailState::Evicted));
 
         requested.insert_with_edit_preview_epoch(0, false, Some(5));
-        pending_finalize.insert(0);
+        requested.mark_finalized_for_test(0);
         thumbnails[0] = ThumbnailState::Pending;
 
-        cleanup_stale_edit_preview_request(
-            &mut requested,
-            &mut pending_finalize,
-            &mut thumbnails,
-            0,
-            4,
-        );
+        cleanup_stale_edit_preview_request(&mut requested, &mut thumbnails, 0, 4);
 
         assert_eq!(requested.get(&0), Some(&false));
         assert!(requested.owner_matches_edit_preview_epoch(0, 5));
-        assert!(pending_finalize.contains(&0));
+        assert!(requested.finalized_image_wait(0));
         assert!(matches!(thumbnails[0], ThumbnailState::Pending));
     }
 

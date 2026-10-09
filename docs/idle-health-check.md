@@ -80,8 +80,9 @@ perf log の `session.start.pid` と一致するプロセスを選ぶ。背面�
 2. 同じ状態を背面へ移して静止 (`static-background`)
 3. 動画を代表画像に固定したフォルダを keep 範囲内へ置き、背面で静止
    (`video-pin-background`)
-4. サムネイルが多いフォルダを開き、読込完了前に閉じてトレイへ格納したまま静止
-   (`tray-residency`)
+4. cache の無い Folder 代表を多数含む一覧を、**読込中に格納**と**読込完了後に格納**の
+   両方で測る (`tray-residency` を 2 回実行)。前者は未完了要求が残る間、後者は通常ロードと
+   idle upgrade が完了してから `[×]` で close-to-tray し、格納したまま静止する。
 
 通常画像の前面・背面測定には、884×444のような横長画像と、要求長辺374px付近の条件を
 含める（§1.198）。既存の整数比率選択では374px要求が247×124になり、400px要求なら
@@ -98,6 +99,20 @@ ready件数0や`load_phases.should_save=false`だけで結果破棄と判断せ�
 先に環境設定 →「タスクトレイ常駐」→「アプリを閉じる代わりに、タスクトレイに常駐する」を
 ON にしてから `[×]` で閉じる。**最小化では成立しない** — Win32 では最小化したウィンドウも
 `IsWindowVisible` が真を返すため。
+
+読込中ケースは hide をまたぐ既存要求、読込完了後ケースは Loaded→Evicted の GPU 解放に
+続く再取得の寿命を検査する。case 間で利用者の cache や設定を消さず、使い捨て fixture・
+隔離データ、または利用者が用意した cache 未作成の対象をそれぞれ使う。2 回目が保存済み
+cache hit だけになった場合は source の画像通知と保存完了通知の両方を検査したことには
+ならないので、cache 状態を分けて記録する。保存省略 / 保存ありの source と cache hit の対照は
+自動テストでも補う。
+
+各ケースの名前、対象、cache 状態、close 時の requested / backlog、hide から収束までの
+時系列と各 report をリリース記録に残す。close 操作は測定窓外に置くが、close 直後からの
+work / backlog の経過も残す。warmup 5 秒・測定 15 秒は維持する。正当な初回 load が測定中に
+残った場合は準備条件と収束時点を記録し、同じケースで収束後の静止窓も測る。
+長時間の重複生成を warmup 延長で隠さない。読込中の時点を手動で合わせにくいことを理由に
+完了後ケースを無効扱いしない。既存の完了後格納の利用者測定も GPU 退去経路の有効な証拠である。
 
 warmup 後の測定開始時と 15 秒後の終了時に、対象 PID が top-level window を 1 個以上所有し、
 その visible window 数がどちらも 0 であることを必須にする。これにより「単に別ウィンドウの
@@ -151,6 +166,12 @@ pin / keep-range を測るシナリオで `VideoPlayer` を生成しないため
 | 通常ログ増加 | 上限 16 KiB / 15 秒 | 非構造化ログの高速肥大を検出 |
 | perf ログ増加 | 上限 256 KiB / 15 秒 | 未知のイベントループも量で検出 |
 
+input event から除くのは `cat=input` / `kind=modifier_probe` / `trigger=heartbeat` /
+`keys=[]` / `wheel=false` が全て揃う受動 snapshot だけで、focus や修飾キーの値は問わない。
+key press / release、wheel、他の input、keys 非空 / wheel=true の矛盾 heartbeat、必須 field が
+欠けたものや型の異なる未知形式は操作として数える。snapshot は総 event 数に残し、
+frame / repaint / 同一 work の反復、CPU・ログ量、PID / session、空窓の判定は変えない。
+
 正常版で各シナリオを 3 回程度測定し、JSON report を残して環境内の分布を確認する。閾値を
 調整するときは単に失敗を消すのではなく、`top_repaint_causes`、reason streak、repeated work
 から正当な継続処理かを確認する。静止シナリオで継続理由が説明できなければコード側を直す。
@@ -176,6 +197,9 @@ Sourceの`thumb.decode_end`には、実際に生成へ使った`evaluated_displa
 ```powershell
 python scripts\test_analyze_perf.py
 ```
+
+回帰テストは focus 有無の受動 heartbeat が input=0 になること、実操作・矛盾・未知形式が
+FAIL になること、および heartbeat を除いても work / repaint 反復による FAIL が残ることを検査する。
 
 このテストは `scripts/build-dist.ps1` の先頭でも必ず実行され、解析ゲート自体の退行がある
 状態では配布ビルドへ進まない。hidden repaint scheduler の純ロジックは vendored eframe の

@@ -1455,6 +1455,8 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+2026-10-09 §1.360: 利用者が独立設計再レビュー ACCEPT 済みの thumbnail-request-lifecycle-plan に従い、既存 ViewerContextBundle の requested・pending_finalize・CPU texture_backlog を一つの typed ThumbnailRequests owner に集約する。mount/unmount は画像と request ID を含む owner 全体を移動し、fork は in-flight を複製しない。park の画像破棄も同じ owner の画像側終端を通し、未終端 worker の保存完了を偽装しない。main の tray hide/restore は既存の対象範囲を維持し、兄弟 context の owner・channel・queue・世代・token に触れない。detached predicate・viewport・HWND・placement・park 発火条件・repaint scheduler は変更せず、表示状態から要求完了を推測していた所有境界を直す構造修正として §2 に適合する。設計担当の採用方針と独立 reviewer の合意は同 plan の §10 に記録されている。
+
 2026-10-09 master統合後の一覧公開境界修正: 利用者指定の構造修正として、Bookmark一覧buildをmainの既存Surface lease・switch sequenceで所有し、mainの成功したitems交換だけが旧buildを退役させる。detached contextのmount・items交換・pollはmainのbuildを退役も採用もしない。同じBookmarkのsortは要求ownerを継続し、A/B記憶クリアは新epochで既存refreshを再開始する。Ctrl+Fの完了filterは送信済み条件を一緒に保持し、ViewerContextBundleの既存swap/park/dropとSmart退避で一緒に運ぶ。新しいdetached predicate・viewport・placement・待機・retry・pending ownerを設けず、公開先の所有証明と既存payloadの未接続を直すため、§2の症状パッチに当たらない。
 
 2026-10-09 §1.355追加修正: Coordinator指定の構造修正として、別窓bookmarkの既存startup resolve workerからtyped RAR header証明を採用境界へ運び、cache hit前に後続巻を拒否する。DFSも同じ証明で候補から除外する。新しいdetached predicate／viewport／待機／retryを作らず、既存requestの取消・held-owner再開・context所有を保つ。旧cacheの直接採用が共通の開封不変条件を迂回していた根因を入口ownerで直すため、§2の症状パッチに当たらない。

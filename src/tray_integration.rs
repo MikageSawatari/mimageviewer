@@ -499,7 +499,7 @@ impl App {
         // 補正済みサムネテクスチャ
         self.thumb_adjust_tex.clear();
         // アップロード待ち (CPU 側 ColorImage データ)
-        self.texture_backlog.clear();
+        self.requested.discard_images();
         self.fs_upload_backlog.clear();
         // 単発テクスチャ各種 (None にして drop)
         self.erase_mask_texture = None;

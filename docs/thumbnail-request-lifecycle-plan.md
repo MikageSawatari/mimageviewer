@@ -1,14 +1,15 @@
 # サムネイル要求の寿命を一つの owner に集約する（§1.360）
 
 作成: 2026-10-09。ライン A / `next-tray`、基点 `840c309ec`。
-状態: **設計案のみ。未実装。`37353cb0e` の独立設計レビュー REVISE / P2 を反映し、
-再レビュー待ち。コミットは利用者が行う。**
+状態: **独立設計再レビュー ACCEPT（利用者報告、2026-10-09）。実装・指定自動検証・確認build完了。
+実機検収は未実施。コミットは利用者が行う。**
 
 ## 1. 対象と根拠
 
 [次リリースバックログ §1.360](next-release-backlog.md)
-の根治案。今回はこの文書だけを作成する。製品コード、analyzer、既存手順書の変更、
-ビルド、アプリ起動、実機検証、コミットは次工程であり、この工程の完了には含めない。
+の根治案。初回工程は文書のみとし、その後、利用者の ACCEPT 済み設計に沿う実装指示を受けた。
+現在は製品コード・analyzer・手順書・回帰テストの実装と自動検証を行う。
+アプリ起動とコミットは行わず、実機確認は利用者へ引き継ぐ。
 
 参照した正本は `AGENTS.md`、`CLAUDE.md` の関連節、`docs/README.md`、
 [architecture-overview.md](architecture-overview.md)、
@@ -483,17 +484,64 @@ hidden需要削減は将来案であり、今回承認された仕様変更と�
 
 実装前の設計レビューでは、sourceの両終端、単一通知、seed検証、RAW継続、
 同一世代の明示更新と古い通知、context局所所有を重点確認する。
-この文書は設計担当/独立レビュアーの最終合意をまだ記録しておらず、実装着手の証拠にはしない。
-有効な検証証拠は、基点のソース照合と提供ログ/reportの読み取り、下記の独立レビュー報告である。
+利用者は独立設計再レビューが ACCEPT と報告し、本計画に沿う実装を明示指示した。
+§11 に設計合意、§12 に実装検証の進捗と証拠を記録する。
 
 ## 11. 独立設計レビューへの対応
 
 利用者が設計を `37353cb0e` としてコミット後、独立設計レビューはREVISE。
 唯一のP2は「VideoBatchの新規owner登録により、旧requested非空判定の意味が広がる」点だった。
 §3.4で種別・現在需要・画像待ち状態からidle gating / tail repaint / progressを確定し、
-§4 / §6を合わせ、§8へ対応する3件の回帰を追加した。**再レビュー待ちであり、承認済みとは扱わない。**
+§4 / §6を合わせ、§8へ対応する3件の回帰を追加した。その改訂への独立再レビューは
+利用者の報告により ACCEPT。追加の未決設計事項はない。
 
 独立レビュアーは両終端owner、通知相関、8枚予算、heartbeat除外、二つのtray測定案について
 他の重大指摘はないと報告した。また提供ログから該当heartbeatだけを除いて再解析し、
 `input=0`、同一work最大116回、FAIL維持を報告した（レビュアーによる読み取り検証）。
-今回の改訂でも製品コード変更、テスト実行、ビルド、アプリ起動、コミットは行わない。
+この設計改訂時点では製品コード変更、テスト実行、ビルド、アプリ起動、コミットは行わなかった。
+
+## 12. 実装・検証記録（2026-10-09〜10-10）
+
+修正前に handler 回帰9件を実行し、Pending 等の対照4件は成功、Evicted / Loaded-upgrade の
+9枚目、keep退出 / keep外破棄、Finalized先着の5件は意図した不変条件で失敗した。
+証拠: `target/A-1360-before.log`（4 passed / 5 failed）。初回ネイティブ依存のビルド失敗は
+テスト結果へ混ぜず、単一並列でビルド後に実行した。
+
+`ThumbnailRequests` が context-local な予約・CPU画像・upload順序を所有する。
+worker は登録済みrequest IDとitems generationを全通知・RAW継続・EPUB fallbackへ運び、
+Pixels / SourcePixels / ProvisionalPixelsで完了契約を明示する。
+VideoBatch / DirectPixels画像のkeep外採用/破棄は既存pollのConsumptionPolicyで決める。
+keep投影だけで動画画像を捨てると再spawnできないため、通常画像のkeep外破棄から除外する。
+動画bookmark markerもDirectPixelsであり、同じ規則を適用する。非動画の直接画像は
+pollで従来どおりkeep外破棄する。第9動画markerのGrid採用/Rendition破棄と非動画対照を回帰に含める。
+hide/parkの明示discard-allは従来の対象範囲で全種別の画像側終端を通す。
+
+analyzer自動回帰71件成功。提供窓129.495..144.510の再解析は
+`input=0 / max_same_work=116 / FAIL`（期待どおりexit 1）。
+証拠: `target/A-1360-analyzer-tests.log`、`target/A-1360-analyzer-trayloop.json` / `.log`。
+中断後に各ゲートを個別に再実行した。`cargo fmt --check`、glyph lint（危険文字0）、
+lifecycle 35件、worker 88件、still-seek所有権15件、source評価サイズ1件、prune関連56件、
+analyzer 71件、`ui_snapshot` 140件、normal / portable core check、viewer context audit（指摘0）は成功。
+個別ログ: `target/A-1360-resume-*.log`。
+
+前回の `test-full.ps1` はlib実行体の終了コード143で中断し、完了扱いにしていない。
+問題と報告されたF4 geometryテストは単独で成功（44.70秒）。180条件ごとにAppTestEnvを作り、
+既存の共有test override lockを使う。テスト本体/helperは未変更で、Failed画像の描画はdecode/I/Oを使わない。
+今回の無filter・従来並列設定の `cargo test -p mimageviewer --lib` は全件を実行して完走した。
+初回は11456成功 / 1失敗 / 52既存ignore（1355.20秒）。唯一の失敗は未変更の音声テスト
+`tokenless_stage_deactivation_preserves_in_flight_dry_audio` のpump到達待ち2秒Timeoutで、
+無効化とcommit保持の検証より前だった。単独（0.01秒）と音声62件（2.14秒）は成功。
+読み取り独立確認でもcoordinator/channel等はテスト専有で、Aの要求ownerとの待機依存はない。
+到達前traceが無く、負荷原因は断定しない。製品・timeout・並列設定を変えず全libを再実行し、
+**11457成功 / 0失敗 / 52既存ignore（1284.96秒）**。F4と音声テストも全体内で成功した。
+証拠: `target/A-1360-resume-lib.log` / `A-1360-resume-lib-retry.log`、音声・geometry個別ログ。
+
+提供ログの個別再解析も `input=0 / max_same_work=116 / FAIL`（期待どおりexit 1）。
+`target/A-1360-resume-analyzer-trayloop.json` / `.log`。旧ログであり修正buildの実機測定ではない。
+確認buildと実機検収の状態は `target/A-1360-impl-msg.txt` / `A-1360-hardware-check.txt` に記録する。
+
+`build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` は2026-10-10に成功（exit0、2742.2秒）。
+normal feature setのcore / remote / EPUB PDF workerを `target/dev-runtime` に生成し、依存DLLと
+VCRT/PE検査も成功。単一並列・node reuse無効でbuildし、対象外のプロセスは停止しなかった。
+アプリ起動・コミットは行っていない。前回 `test-full` の中断を全workspace/vendor完走とは扱わず、
+今回明示された個別ゲートの結果を記録した。修正buildの実機tray両ケースは利用者の検収に残る。

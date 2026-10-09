@@ -10856,8 +10856,9 @@ mod tests {
         app.keep_range = (0, app.items.len());
         app.requested.insert(video_index, false);
         let generation = app.items_generation;
-        app.tx
-            .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+        send_thumbnail_for_test!(
+            app,
+            crate::thumb_loader::ThumbMsg::from_legacy_parts(
                 video_index,
                 Some(egui::ColorImage::from_rgba_unmultiplied(
                     [2, 2],
@@ -10872,8 +10873,9 @@ mod tests {
                 false,
                 0,
                 generation,
-            ))
-            .unwrap();
+            )
+        )
+        .unwrap();
         app.write_user_ratings_shared(&[(keys[0].clone(), 4, None), (keys[2].clone(), 5, None)])
             .unwrap();
         wait_for_smart_rating_membership(&mut app);
