@@ -7,10 +7,10 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use music_core::{AnalysisConfig, analyze_stereo_waveform_cancellable};
 use musicvideo_core::{
-    Assets, AudioRef, Frame, ImageAsset, ImageId, ImageRef, LayerKind, LrcParseReport, LyricLine,
-    ModulatorCalibration, ModulatorCalibrationRequest, ModulatorValue, Project, RenderReport,
-    Smoothing, SpectrumFrame, SpectrumSource, UnresolvedAsset, calibrate_modulators, evaluate,
-    modulator_calibration_requests, new_image_layer, parse_lrc, render_frame, write_lrc,
+    Assets, AudioRef, Frame, ImageAsset, ImageId, ImageRef, LayerId, LayerKind, LrcParseReport,
+    LyricLine, ModulatorCalibration, ModulatorCalibrationRequest, ModulatorValue, Project,
+    RenderReport, Smoothing, SpectrumFrame, SpectrumSource, UnresolvedAsset, calibrate_modulators,
+    evaluate, modulator_calibration_requests, new_image_layer, parse_lrc, render_frame, write_lrc,
 };
 use musicvideo_ui::{
     DocumentSession, DocumentSessionId, EditGeneration, EditTargetLifetime, EditorCommand,
@@ -65,6 +65,7 @@ struct ImageLoadRequest {
 struct PreviewResult {
     revision: u64,
     project: Project,
+    layer_lifetimes: HashMap<LayerId, EditTargetLifetime>,
     time_secs: f64,
     image: egui::ColorImage,
     render_ms: f64,
@@ -78,6 +79,7 @@ struct PreviewResult {
 struct DisplayedPreview {
     texture: egui::TextureHandle,
     project: Project,
+    layer_lifetimes: HashMap<LayerId, EditTargetLifetime>,
     time_secs: f64,
     modulator_values: Vec<ModulatorValue>,
 }
@@ -87,6 +89,7 @@ impl DisplayedPreview {
         PreviewFrame {
             texture: &self.texture,
             project: &self.project,
+            layer_lifetimes: &self.layer_lifetimes,
             time_secs: self.time_secs,
             modulator_values: &self.modulator_values,
         }
@@ -1381,6 +1384,15 @@ impl MusicVideoLabApp {
         let revision = self.preview_revision;
         let project = self.project.clone();
         let position_secs = self.position_secs;
+        let layer_lifetimes = project
+            .layers
+            .iter()
+            .filter_map(|layer| {
+                self.editor_state
+                    .layer_target_lifetime(layer.id)
+                    .map(|lifetime| (layer.id, lifetime))
+            })
+            .collect();
         let audio = self.audio.clone();
         let previous_spectrum = self.preview_spectrum.take();
         let calibrations = self.modulator_calibrations.clone();
@@ -1454,6 +1466,7 @@ impl MusicVideoLabApp {
                     Ok(PreviewResult {
                         revision,
                         project,
+                        layer_lifetimes,
                         time_secs: position_secs,
                         image,
                         render_ms,
@@ -1511,6 +1524,7 @@ impl MusicVideoLabApp {
                     self.displayed_preview = Some(DisplayedPreview {
                         texture,
                         project: result.project,
+                        layer_lifetimes: result.layer_lifetimes,
                         time_secs: result.time_secs,
                         modulator_values: result.modulator_values,
                     });
@@ -2737,12 +2751,28 @@ impl Drop for MusicVideoLabApp {
 mod tests {
     use super::*;
 
-    fn selection_result(project: Project, revision: u64, time_secs: f64) -> PreviewResult {
+    fn selection_result(
+        app: &MusicVideoLabApp,
+        project: Project,
+        revision: u64,
+        time_secs: f64,
+        color: egui::Color32,
+    ) -> PreviewResult {
+        let layer_lifetimes = project
+            .layers
+            .iter()
+            .filter_map(|layer| {
+                app.editor_state
+                    .layer_target_lifetime(layer.id)
+                    .map(|lifetime| (layer.id, lifetime))
+            })
+            .collect();
         PreviewResult {
             project,
+            layer_lifetimes,
             revision,
             time_secs,
-            image: egui::ColorImage::filled([160, 90], egui::Color32::BLACK),
+            image: egui::ColorImage::filled([160, 90], color),
             render_ms: 0.0,
             report: RenderReport::default(),
             spectrum: None,
@@ -2794,13 +2824,20 @@ mod tests {
             amount: 1.0,
             curve: ModulationCurve::Linear,
         });
+        app.editor_state.reset_for_project(&app.project);
         app.editor_state.select_layer(&app.project, 0);
         let project_snapshot = app.project.clone();
         app.position_secs = 9.0;
         // Ordinary edits deliberately do not reject an already-composed frame.
         app.project.layers[0].rect = Animatable::Const(NormRect::new(0.9, 0.9, 0.1, 0.1));
         app.project.layers[0].name = "latest-box".into();
-        let result = selection_result(project_snapshot, app.preview_revision, 2.0);
+        let result = selection_result(
+            &app,
+            project_snapshot,
+            app.preview_revision,
+            2.0,
+            egui::Color32::BLACK,
+        );
         selection_deliver(&mut app, &ctx, result);
         let displayed = app.displayed_preview.as_ref().unwrap();
         let bounds = displayed
@@ -2810,21 +2847,7 @@ mod tests {
         assert!((bounds.rect.x - 0.15).abs() < 1e-6);
         assert!((bounds.rect.width - 0.3).abs() < 1e-6);
         assert_eq!(displayed.time_secs, 2.0);
-        let mut output = egui::FullOutput::default();
-        for _ in 0..2 {
-            output = ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::Vec2::new(640.0, 480.0),
-                    )),
-                    ..Default::default()
-                },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| app.draw_preview(ui));
-                },
-            );
-        }
+        let output = selection_draw_output(&mut app, &ctx);
         assert!(output.shapes.iter().any(
             |s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text() == "displayed-box")
         ));
@@ -2853,31 +2876,70 @@ mod tests {
         assert!((path.points[0].y - (image.top() + image.height() * 0.15)).abs() < 1e-4);
     }
 
+    fn selection_assert_texture_color(
+        delta: &egui::TexturesDelta,
+        texture: egui::TextureId,
+        color: egui::Color32,
+    ) {
+        let updates: Vec<_> = delta.set.iter().filter(|(id, _)| *id == texture).collect();
+        assert_eq!(updates.len(), 1);
+        let egui::ImageData::Color(image) = &updates[0].1.image;
+        assert_eq!(image.size, [160, 90]);
+        assert!(image.pixels.iter().all(|pixel| *pixel == color));
+        assert!(!delta.free.contains(&texture));
+    }
+
     #[test]
     fn selection_stale_preview_keeps_all_displayed_inputs_and_clear_removes_them() {
         let ctx = egui::Context::default();
         let mut app = MusicVideoLabApp::new(Arc::new(Assets::default()));
+        app.editor_state.reset_for_project(&app.project);
         let first_revision = app.preview_revision;
-        selection_deliver(
-            &mut app,
-            &ctx,
-            selection_result(default_project(10.0), first_revision, 2.0),
+        let first = selection_result(
+            &app,
+            default_project(10.0),
+            first_revision,
+            2.0,
+            egui::Color32::BLACK,
         );
+        selection_deliver(&mut app, &ctx, first);
+        let texture_id = app.displayed_preview.as_ref().unwrap().texture.id();
+        // Consume the initial upload before examining whether a rejected result
+        // publishes another upload. TextureHandle::set preserves the same ID.
+        let initial_delta = ctx.tex_manager().write().take_delta();
+        selection_assert_texture_color(&initial_delta, texture_id, egui::Color32::BLACK);
         app.mark_preview_dirty();
-        let mut stale = selection_result(default_project(20.0), first_revision, 9.0);
+        let mut stale = selection_result(
+            &app,
+            default_project(20.0),
+            first_revision,
+            9.0,
+            egui::Color32::RED,
+        );
         stale.modulator_values[0].value = 0.9;
         selection_deliver(&mut app, &ctx, stale);
+        let stale_delta = ctx.tex_manager().write().take_delta();
+        assert!(
+            !stale_delta.set.iter().any(|(id, _)| *id == texture_id),
+            "stale result uploaded pixels to the displayed texture"
+        );
+        assert!(!stale_delta.free.contains(&texture_id));
         let displayed = app.displayed_preview.as_ref().unwrap();
+        assert_eq!(displayed.texture.id(), texture_id);
         assert_eq!(displayed.time_secs, 2.0);
         assert_eq!(displayed.project.duration_secs, 10.0);
         assert_eq!(displayed.modulator_values[0].value, 0.5);
-        let texture_id = displayed.texture.id();
         let revision = app.preview_revision;
-        selection_deliver(
-            &mut app,
-            &ctx,
-            selection_result(default_project(30.0), revision, 4.0),
+        let latest = selection_result(
+            &app,
+            default_project(30.0),
+            revision,
+            4.0,
+            egui::Color32::GREEN,
         );
+        selection_deliver(&mut app, &ctx, latest);
+        let latest_delta = ctx.tex_manager().write().take_delta();
+        selection_assert_texture_color(&latest_delta, texture_id, egui::Color32::GREEN);
         let displayed = app.displayed_preview.as_ref().unwrap();
         assert_eq!(displayed.time_secs, 4.0);
         assert_eq!(displayed.project.duration_secs, 30.0);
@@ -2885,11 +2947,14 @@ mod tests {
         app.clear_decoded_resources();
         assert!(app.displayed_preview.is_none());
         let revision = app.preview_revision;
-        selection_deliver(
-            &mut app,
-            &ctx,
-            selection_result(default_project(30.0), revision, 4.0),
+        let next = selection_result(
+            &app,
+            default_project(30.0),
+            revision,
+            4.0,
+            egui::Color32::BLUE,
         );
+        selection_deliver(&mut app, &ctx, next);
         app.apply_loaded_project(loaded_project("new.mivmv", 12.0));
         assert!(app.displayed_preview.is_none());
     }
@@ -2901,6 +2966,7 @@ mod tests {
         app.project.output.width = 32;
         app.project.output.height = 18;
         app.position_secs = 2.0;
+        app.editor_state.reset_for_project(&app.project);
         let project = app.project.clone();
         app.start_preview_if_needed(&ctx);
         app.position_secs = 9.0;
@@ -2913,6 +2979,181 @@ mod tests {
             .unwrap();
         assert_eq!(result.time_secs, 2.0);
         assert_eq!(result.project, project);
+        for layer in &result.project.layers {
+            assert_eq!(
+                result.layer_lifetimes.get(&layer.id).copied(),
+                app.editor_state.layer_target_lifetime(layer.id)
+            );
+        }
+    }
+
+    fn selection_request_frame(app: &mut MusicVideoLabApp, ctx: &egui::Context) -> PreviewResult {
+        app.schedule_project_edit_preview();
+        app.start_preview_if_needed(ctx);
+        app.preview_pending
+            .take()
+            .unwrap()
+            .rx
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap()
+            .unwrap()
+    }
+
+    fn selection_draw_output(app: &mut MusicVideoLabApp, ctx: &egui::Context) -> egui::FullOutput {
+        let mut output = egui::FullOutput::default();
+        for _ in 0..2 {
+            output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::Vec2::new(640.0, 480.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.draw_preview(ui));
+                },
+            );
+        }
+        output
+    }
+
+    fn selection_assert_outline(
+        app: &mut MusicVideoLabApp,
+        ctx: &egui::Context,
+        name: Option<&str>,
+    ) {
+        let output = selection_draw_output(app, ctx);
+        let paths = output
+            .shapes
+            .iter()
+            .filter(|s| {
+                s.clip_rect.min.y > 20.0
+                    && matches!(&s.shape, egui::Shape::Path(path) if path.closed)
+            })
+            .count();
+        assert_eq!(paths, if name.is_some() { 2 } else { 0 });
+        for label in ["deleted-box", "replacement-box"] {
+            let shown = output.shapes.iter().any(|s| {
+                matches!(&s.shape,
+                egui::Shape::Text(text) if text.galley.text() == label)
+            });
+            assert_eq!(
+                shown,
+                name == Some(label),
+                "unexpected preview label: {label}"
+            );
+        }
+    }
+
+    fn selection_add_test_layer(app: &mut MusicVideoLabApp, replacement: bool) -> LayerId {
+        let checkpoint = app.editor_state.begin_external_edit(&app.project);
+        let mut layer = if replacement {
+            musicvideo_core::new_progress_bar_layer(&app.project)
+        } else {
+            musicvideo_core::new_solid_layer(&app.project)
+        };
+        layer.name = if replacement {
+            "replacement-box"
+        } else {
+            "deleted-box"
+        }
+        .into();
+        let id = layer.id;
+        app.project.layers.push(layer);
+        assert!(
+            app.editor_state
+                .finish_external_edit(&app.project, checkpoint)
+        );
+        app.editor_state
+            .select_layer(&app.project, app.project.layers.len() - 1);
+        id
+    }
+
+    fn selection_check_reused_layer_id(undo_add: bool) {
+        let ctx = egui::Context::default();
+        let mut app = MusicVideoLabApp::new(Arc::new(Assets::default()));
+        app.project.output.width = 32;
+        app.project.output.height = 18;
+        app.editor_state.reset_for_project(&app.project);
+        let original_id = selection_add_test_layer(&mut app, false);
+        let original_lifetime = app.editor_state.layer_target_lifetime(original_id).unwrap();
+        let first = selection_request_frame(&mut app, &ctx);
+        assert_eq!(
+            first.layer_lifetimes.get(&original_id),
+            Some(&original_lifetime)
+        );
+        selection_deliver(&mut app, &ctx, first);
+        selection_assert_outline(&mut app, &ctx, Some("deleted-box"));
+        // Keep a second result from the old lifetime in flight across editing.
+        let in_flight = selection_request_frame(&mut app, &ctx);
+        let revision = app.preview_revision;
+        if undo_add {
+            assert!(app.editor_state.undo(&mut app.project));
+        } else {
+            assert!(app.editor_state.apply_external_command(
+                &mut app.project,
+                &EditorCommand::DeleteLayer { layer: original_id },
+            ));
+        }
+        assert!(
+            app.editor_state
+                .layer_target_lifetime(original_id)
+                .is_none()
+        );
+        let replacement_id = selection_add_test_layer(&mut app, true);
+        assert_eq!(replacement_id, original_id);
+        let replacement_lifetime = app
+            .editor_state
+            .layer_target_lifetime(replacement_id)
+            .unwrap();
+        assert_ne!(replacement_lifetime, original_lifetime);
+        app.schedule_project_edit_preview();
+        assert_eq!(app.preview_revision, revision);
+        // The old displayed frame and the accepted old-lifetime result must
+        // neither draw a box nor publish the deleted layer's name for this ID.
+        selection_assert_outline(&mut app, &ctx, None);
+        assert_eq!(in_flight.revision, revision);
+        selection_deliver(&mut app, &ctx, in_flight);
+        selection_assert_outline(&mut app, &ctx, None);
+        assert_eq!(
+            app.displayed_preview
+                .as_ref()
+                .unwrap()
+                .layer_lifetimes
+                .get(&original_id),
+            Some(&original_lifetime)
+        );
+        // Another layer still owns its lifetime: don't suppress all outlines
+        // just because this project has been edited or the texture is old.
+        app.editor_state.select_layer(&app.project, 0);
+        assert!(
+            app.displayed_preview
+                .as_ref()
+                .unwrap()
+                .frame()
+                .selected_bounds(&app.editor_state)
+                .is_some()
+        );
+        app.editor_state
+            .select_layer(&app.project, app.project.layers.len() - 1);
+        let latest = selection_request_frame(&mut app, &ctx);
+        assert_eq!(
+            latest.layer_lifetimes.get(&original_id),
+            Some(&replacement_lifetime)
+        );
+        selection_deliver(&mut app, &ctx, latest);
+        selection_assert_outline(&mut app, &ctx, Some("replacement-box"));
+    }
+
+    #[test]
+    fn selection_reused_layer_id_after_delete_does_not_draw_old_lifetime() {
+        selection_check_reused_layer_id(false);
+    }
+
+    #[test]
+    fn selection_reused_layer_id_after_undo_and_other_layer_add_does_not_draw_old_lifetime() {
+        selection_check_reused_layer_id(true);
     }
 
     #[test]
@@ -3562,6 +3803,7 @@ mod tests {
         );
         app.displayed_preview = Some(DisplayedPreview {
             project: app.project.clone(),
+            layer_lifetimes: HashMap::new(),
             time_secs: 0.0,
             modulator_values: vec![],
             texture: context.load_texture(

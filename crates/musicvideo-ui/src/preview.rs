@@ -1,13 +1,17 @@
-use egui::{Color32, Pos2, Rect, Stroke, TextureHandle, Vec2};
-use musicvideo_core::{LayerBounds, ModulatorValue, Project, evaluate_layer_bounds};
+use std::collections::HashMap;
 
-use crate::EditorState;
+use egui::{Color32, Pos2, Rect, Stroke, TextureHandle, Vec2};
+use musicvideo_core::{LayerBounds, LayerId, ModulatorValue, Project, evaluate_layer_bounds};
+
+use crate::{EditTargetLifetime, EditorState};
 
 /// All inputs belong to the displayed texture, never the transport's current time.
 #[derive(Clone, Copy)]
 pub struct PreviewFrame<'a> {
     pub texture: &'a TextureHandle,
     pub project: &'a Project,
+    /// Captured with the project at request time, never at result application.
+    pub layer_lifetimes: &'a HashMap<LayerId, EditTargetLifetime>,
     pub time_secs: f64,
     pub modulator_values: &'a [ModulatorValue],
 }
@@ -17,12 +21,12 @@ impl PreviewFrame<'_> {
         if !state.show_selection_bounds {
             return None;
         }
-        evaluate_layer_bounds(
-            self.project,
-            state.selected_layer?,
-            self.time_secs,
-            self.modulator_values,
-        )
+        let layer = state.selected_layer?;
+        let lifetime = state.layer_target_lifetime(layer)?;
+        if self.layer_lifetimes.get(&layer).copied() != Some(lifetime) {
+            return None;
+        }
+        evaluate_layer_bounds(self.project, layer, self.time_secs, self.modulator_values)
     }
 }
 

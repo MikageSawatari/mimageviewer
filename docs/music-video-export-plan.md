@@ -749,7 +749,7 @@ frame n → t = n/fps → evaluate → rasterize(CPU, rayon) → RGBA→NV12/YUV
 | **P3i** ✅ | 歌詞レイヤー: 行単位の時刻付け、音声再生中のタップ入力、タイムライン修正、LRC 読み書き | **完了**（2026-09-05）。未設定行・空行・同一時刻の後勝ちを含む専用モデルを追加し、描画は comic-core の既存テキスト経路を共有。UTF-8 / Shift_JIS 判定、複数時刻タグ、offset、行内時刻タグを扱い、ファイル I/O はラボのワーカーに閉じる |
 | **P3j** 実装済み・実機未検収 | 編集履歴: Project・素材・歌詞行 identity の snapshot、選択復元、連続操作のグループ化 | 共有履歴の初期実装は `4f41cce35`。2026-09-08 に `91326ca8d` / `0c24a453e` で画像・音声の履歴と host 復元を補完、`8e12458e4` で歌詞本文と native Undo の対応を補完。128 段、ドラッグ/フォーカス単位、読込時消去、Redo 破棄、入力中の shortcut 抑止を維持。独立レビューと全体テスト完了。実音・実 IME・操作感は未検収。[検証記録](brief-musicvideo-edit-integrity.md) を参照 |
 | **L1** 実装済み・修正検収待ち | 画面構成（D14）: 左にレイヤー一覧、右は選択レイヤーのプロパティだけ、モジュレータ・プロジェクト設定は別タブ | 初版 `e6fda1f9b`。**独立レビューP2/P3修正・自動テスト済み**（2026-10-09、同commitに対する未コミット差分）。core 73件 / UI 96件（既存87＋L1新規7＋修正新規2）/ lab 46件（既存45＋L1新規1）、全215件成功。タブ/左一覧の部品ID分離とnative Undo往復を追加検証。同フレームProject/LRC完了2件は本番の共通入口へ移し、入口内の既存poll呼出を入力前へ移す変異で失敗確認。`cargo tree` の禁止依存なし、fmt・glyph検査成功。releaseラボのビルド結果と変異検証は下記。修正作業ではアプリ未起動・コミットなし |
-| **L2** 実装・自動検証済み、独立レビュー/検収待ち | 選択レイヤーの枠（D14 末尾）: 選んだレイヤーの矩形をプレビュー上に表示。画面外・非表示も示す | 書き出し・プレビューの RGBA が不変（無変調ハッシュ維持）。枠の幾何は `evaluate` と同じ評価を通す純関数で、キーフレーム・Scale 変調・回転・画面外・非表示をテストで固定。表示中フレームの時刻で評価する。**2026-10-09 実装・自動検証済み（未コミット）**: core 80 / UI 103 / lab 49、計232件成功（追加17件）。25種類の変異を検出。表示texture・Project snapshot・時刻・変調値を一括保持し、L1の編集フレームAPIを維持。詳細は下記L2記録 |
+| **L2** 実装済み・レビューP2/P3修正の再検収待ち | 選択レイヤーの枠（D14 末尾）: 選んだレイヤーの矩形をプレビュー上に表示。画面外・非表示も示す | 初版 `838f8503e`（core 80 / UI 103 / lab 49、計232件、追加17件・25変異検出）。**独立レビューP2/P3修正・自動検証済み**（2026-10-09、未コミット差分）: 要求時の `EditTargetLifetime` を表示snapshotへ保持し、選択と同じlifetimeの場合のみ枠と名前を表示。削除/Undo後のID再利用2件を追加、stale結果のtexture delta検査を強化。core 80 / UI 103 / lab 51、計234件成功。無変調RGBAハッシュ・L1編集フレームAPIを維持。詳細は下記L2修正記録 |
 | **T1** | 文字装飾（D15）: comic-core 既存の縁取り・追加縁取り・影・エコー・背景・字間/行間を Text / TimeText / Lyrics に共通の型で接続 | 3 レイヤーで同じ型・同じ描画経路。装飾なしのプロジェクトはフレームハッシュ不変。補間規則（構造一致時のみ補間）をテストで固定。保存往復。装飾ありシーンの合成時間を実測して記録 |
 | **I1** | IME 補正の共有（D10「設定・入力」）: 本体 `ime_focus` の egui 依存部分（入力補正 plugin・single-line helper）を共有クレートへ挙動不変で切り出し、本体とエディタのホストが policy を登録する | 本体の既存 IME テスト・raw TextEdit 禁止検査が全件維持。`musicvideo-ui` の single-line 入力は共有 helper 経由。歌詞は独自の multiline（`LyricsTextBuffer`）なので、入力補正 plugin を効かせたうえで既存の buffer・widget ID・native Undo を保つ。IME の Esc 取消・候補選択中 Tab・Enter 確定・フォーカス復帰・Undo 所有を handler テストで固定。独立レビューで「挙動不変の切り出し」に合意 |
 | **H3a** | 解析契約の確定: 正規の較正区間（出力尺に合わせた PCM か全尺か）と解析の時刻列・seek 復帰の規則を決める | [引き継ぎ監査](music-video-handoff-20260907.md) §3 H3。可変時刻列と較正入力差をテストで固定。無変調ハッシュ維持 |
@@ -880,6 +880,49 @@ L2 実装・自動検証記録（2026-10-09、`eb1b3445b` に対する未コミ�
 `target/l2-render-baseline.txt`、`target/l2-mutation-*.log` と `target/l2-mutation-summary.txt`。
 本体は変更していないため、本体用build-devではなく指示書どおりラボのreleaseビルドを確認用成果物とする。
 コミットなし。独立レビュー/検収・実機での目視確認は未実施。
+
+L2 独立レビュー修正記録（2026-10-09、`838f8503e` に対する未コミット差分）:
+
+- **P2 — ID再利用とsnapshotの所有**: `next_layer_id` は現在の最大ID+1なので、最大IDの削除や追加のUndo後に
+  IDを再利用する。通常編集はpreview revisionを進めず処理中の結果も採用するため、ID照合では別レイヤーを
+  同一対象と誤認する。既存の `EditorState::layer_target_lifetime` が削除/Undoで消えたIDの再追加時に新しい
+  lifetimeを発行することを確認した。要求開始時にProjectと各LayerIdのlifetimeを対応付け、
+  `PreviewResult` → `DisplayedPreview` → `PreviewFrame` へ同じmapを引き継ぐ。
+  `selected_bounds` は現在の選択のlifetimeとsnapshot側のlifetimeが一致する場合だけ評価する。
+  結果適用時に現在のlifetimeを取り直してはならない（処理中の旧Projectに新対象のlifetimeを誤付与する）。
+  時刻・変調値・Projectのsnapshot評価、RGBA合成、通常編集の応答性、保存/Undo形式は維持。
+  新たな取消/generationやモーダル化は加えず、既存の表示フレーム所有者へidentity metadataを含めた。
+- **P2の新規回帰2件**（lab）: `selection_reused_layer_id_after_delete_does_not_draw_old_lifetime` /
+  `selection_reused_layer_id_after_undo_and_other_layer_add_does_not_draw_old_lifetime`。
+  実workerの要求経路でlifetimeを捕捉し、実際の削除/Undo・別kindのレイヤー追加で同IDを再利用する。
+  旧表示フレームと編集前から処理中だった結果の両方で、枠の描画pathと旧レイヤー名が消えることを
+  実ホストのheadless描画で検査。変更していない別レイヤーの枠は維持し、新snapshot採用後には新しい
+  レイヤーの枠・名前が表示されることも確認した。既存worker結果テストも捕捉したlifetimeの検査を追加。
+- **P3 — texture更新の観測**: 既存 `selection_stale_preview_keeps_all_displayed_inputs_and_clear_removes_them`
+  を強化。初回=黒、stale=赤、新規採用=緑、次のframe=青のfixtureに分ける。
+  初回upload deltaを消費して画像内容を確認した後、stale結果が対象textureのset/free deltaを出さず、
+  metadataとtexture IDも維持することを検査する。採用した次の結果は同じtexture IDへ緑のpixelsを
+  uploadすることも検査。既存の素材clear/別文書のclear検査は維持。
+
+| 変異（修正前の挙動/意図的な退行） | 確認結果 |
+| --- | --- |
+| P2: lifetime照合を外し、修正前のLayerIdのみの照合へ戻す | 新規削除/Undoテストがそれぞれ失敗（2件） |
+| P2: snapshotのlifetimeを結果適用時の現在Projectから取り直す | 新規削除/Undoテストがそれぞれ失敗（2件） |
+| P3: metadataは維持したままstale画像だけを `texture.set` で更新 | 強化したdelta検査で失敗（1件） |
+| P3の検出力対照: 同じ画像更新変異でstaleのset delta検査だけを外す | metadata/texture ID等の検査は成功。同じIDの画像だけを変える退行を旧検査が見逃すことを再確認 |
+
+3種類の変異を5件のテスト実行で検出し、検出力の対照1件も確認。その都度元のソースへ復元した。
+最終ソースで `cargo test -p musicvideo-core` 80 / `-p musicvideo-ui` 103 / `-p musicvideo_lab` 51、
+計234件成功（初版232件＋新規2件、既存2件の検査も強化）。無変調RGBAハッシュ3時刻も不変。
+`cargo tree -p musicvideo-ui` のeframe / cpal / ffmpegなし、fmt・glyph検査はexit code 0・危険glyph 0。
+既存 `target/release/musicvideo_lab.exe` が実行中だったため、プロセスを停止せず、
+`CARGO_TARGET_DIR=target/l2-release` で `cargo build --release -p musicvideo_lab` を実行。
+37.1秒、exit code 0で成功。成果物は `target/l2-release/release/musicvideo_lab.exe`。
+検証環境はWindows、`MSBUILDDISABLENODEREUSE=1`。
+ログは `target/l2-review-{core-tests,ui-tests,lab-tests,ui-dependencies,format,glyphs,release-lab}.log`、
+`target/l2-review-verification-summary.txt`、`target/l2-review-mutation-*.log` と
+`target/l2-review-mutation-summary.txt`。アプリ起動・停止、コミットなし。
+この修正の独立再レビュー/検収は未実施。
 
 P4e の範囲（独立レビューの整理による）:
 

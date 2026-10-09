@@ -87,6 +87,16 @@ fn selection_fully_offscreen_markers_point_to_all_sides_and_corners() {
 }
 
 fn render(state: &mut EditorState, project: &Project, ready: bool) -> egui::FullOutput {
+    state.target_lifetimes.reconcile(project);
+    let layer_lifetimes = project
+        .layers
+        .iter()
+        .filter_map(|layer| {
+            state
+                .layer_target_lifetime(layer.id)
+                .map(|lifetime| (layer.id, lifetime))
+        })
+        .collect();
     let context = egui::Context::default();
     let texture = context.load_texture(
         "test",
@@ -107,6 +117,7 @@ fn render(state: &mut EditorState, project: &Project, ready: bool) -> egui::Full
                         ready.then_some(PreviewFrame {
                             texture: &texture,
                             project,
+                            layer_lifetimes: &layer_lifetimes,
                             time_secs: 3.0,
                             modulator_values: &[],
                         }),
