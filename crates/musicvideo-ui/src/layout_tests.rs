@@ -417,6 +417,39 @@ fn split_layout_selection_keeps_tab_but_added_layer_opens_properties() {
 }
 
 #[test]
+fn split_layout_frame_finish_registers_lifetimes_for_ui_added_layers() {
+    for (preset, added_count) in [("単色", 1), ("mIV スペクトラム + 鍵盤", 2)] {
+        let mut h = Harness::new();
+        let before = h.project.clone();
+        let original: Vec<_> = before
+            .layers
+            .iter()
+            .map(|layer| (layer.id, h.state.layer_target_lifetime(layer.id).unwrap()))
+            .collect();
+        h.click("プロジェクト");
+        h.click("＋ レイヤーを追加");
+        h.frame(vec![]);
+        h.click(preset);
+        // No subsequent begin_frame or external-edit helper is allowed here:
+        // the host can request its preview immediately after finish returns.
+        assert_eq!(h.project.layers.len(), before.layers.len() + added_count);
+        for layer in &h.project.layers {
+            assert!(
+                h.state.layer_target_lifetime(layer.id).is_some(),
+                "unregistered layer: {:?}",
+                layer.id
+            );
+        }
+        for (id, lifetime) in original {
+            assert_eq!(h.state.layer_target_lifetime(id), Some(lifetime));
+        }
+        assert_eq!(h.state.history_depths(), (1, 0));
+        assert!(h.state.undo(&mut h.project));
+        assert_eq!(h.project, before);
+    }
+}
+
+#[test]
 fn split_layout_shortcut_precedes_timeline_and_runs_once() {
     let mut h = Harness::new();
     let before = h.project.clone();

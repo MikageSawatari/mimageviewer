@@ -3440,6 +3440,124 @@ mod tests {
             .unwrap_or_else(|| panic!("missing panel text: {text}"))
     }
 
+    fn selection_check_ui_add_captures_lifetimes_in_the_same_frame(
+        preset: &str,
+        added_count: usize,
+    ) {
+        let ctx = egui::Context::default();
+        let mut app = MusicVideoLabApp::new(Arc::new(Assets::default()));
+        app.project.output.width = 32;
+        app.project.output.height = 18;
+        app.editor_state.set_inspector_tab(InspectorTab::Project);
+        assert!(app.audio_player.is_none());
+        assert_eq!(app.position_secs, 0.0);
+        let before = app.project.clone();
+        let menu = rendered_editor_text(&mut app, &ctx, "＋ レイヤーを追加", true);
+        editor_input(&mut app, &ctx, pointer_input(menu, true));
+        editor_input(&mut app, &ctx, pointer_input(menu, false));
+        let item = rendered_editor_text(&mut app, &ctx, preset, true);
+        editor_input(&mut app, &ctx, pointer_input(item, true));
+        // Release adds through the real menu. As in update, create the request
+        // after process_editor_frame in THIS pass, before another begin_frame.
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1400.0, 1200.0),
+                )),
+                events: pointer_input(item, false),
+                ..Default::default()
+            },
+            |ctx| {
+                app.process_editor_frame(ctx);
+                egui::CentralPanel::default().show(ctx, |ui| app.draw_preview(ui));
+                app.start_calibration_if_needed(ctx);
+                app.start_preview_if_needed(ctx);
+            },
+        );
+        assert_eq!(app.project.layers.len(), before.layers.len() + added_count);
+        assert_eq!(app.editor_state.history_depths(), (1, 0));
+        assert_eq!(app.position_secs, 0.0);
+        let result = app
+            .preview_pending
+            .take()
+            .expect("same-frame preview request")
+            .rx
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.project, app.project);
+        assert_eq!(result.time_secs, 0.0);
+        assert_eq!(
+            result.layer_lifetimes.len(),
+            result.project.layers.len(),
+            "the first request must contain every layer's lifetime"
+        );
+        for layer in &result.project.layers {
+            let captured = result
+                .layer_lifetimes
+                .get(&layer.id)
+                .copied()
+                .expect("captured lifetime");
+            assert_eq!(
+                Some(captured),
+                app.editor_state.layer_target_lifetime(layer.id)
+            );
+        }
+        let selected = app.project.layers[app.editor_state.selected_layer(&app.project)].clone();
+        selection_deliver(&mut app, &ctx, result);
+        assert!(
+            app.displayed_preview
+                .as_ref()
+                .unwrap()
+                .frame()
+                .selected_bounds(&app.editor_state)
+                .is_some()
+        );
+        // Rendering the first completion does not run editor preparation.
+        let output = selection_draw_output(&mut app, &ctx);
+        assert_eq!(
+            output
+                .shapes
+                .iter()
+                .filter(|s| s.clip_rect.min.y > 20.0
+                    && matches!(&s.shape, egui::Shape::Path(path) if path.closed))
+                .count(),
+            2
+        );
+        assert!(output.shapes.iter().any(
+            |s| matches!(&s.shape, egui::Shape::Text(text) if text.galley.text() == selected.name)
+        ));
+        assert!(!app.preview_dirty);
+        assert!(app.preview_pending.is_none());
+        assert_eq!(app.editor_state.history_depths(), (1, 0));
+        let added = app.project.clone();
+        assert!(app.editor_state.undo(&mut app.project));
+        assert_eq!(app.project, before);
+        assert!(
+            app.editor_state
+                .layer_target_lifetime(selected.id)
+                .is_none()
+        );
+        assert!(app.editor_state.redo(&mut app.project));
+        assert_eq!(app.project, added);
+        assert!(
+            app.editor_state
+                .layer_target_lifetime(selected.id)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn selection_ui_add_solid_captures_lifetimes_and_draws_the_first_stopped_frame() {
+        selection_check_ui_add_captures_lifetimes_in_the_same_frame("単色", 1);
+    }
+
+    #[test]
+    fn selection_ui_add_two_layers_captures_lifetimes_and_draws_the_first_stopped_frame() {
+        selection_check_ui_add_captures_lifetimes_in_the_same_frame("mIV スペクトラム + 鍵盤", 2);
+    }
+
     #[test]
     fn editor_panels_keep_timeline_full_width_and_inspector_tabs_separate() {
         let mut app = MusicVideoLabApp::new(Arc::new(Assets::default()));

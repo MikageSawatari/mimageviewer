@@ -1058,6 +1058,9 @@ impl EditorFrame<'_> {
         {
             self.response.project_changed |= self.state.apply_command(self.project, &command);
         }
+        // Direct UI additions must have lifetimes before the host captures a preview.
+        // Reconcile only targets here, preserving lyrics' native Undo reachability.
+        self.state.target_lifetimes.reconcile(self.project);
         let pointer_active = self.context.input(|input| input.pointer.primary_down());
         let text_focus = self.context.memory(|memory| memory.focused());
         self.state.observe_ui_pass(
