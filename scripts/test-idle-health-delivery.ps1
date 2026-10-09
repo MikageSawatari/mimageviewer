@@ -10,7 +10,7 @@ $typeBlock = $ast.FindAll({ param($node)
     $node.Extent.Text.StartsWith('if (-not ("MivLogDelivery1"')
 }, $true) | Select-Object -First 1
 Invoke-Expression $typeBlock.Extent.Text
-foreach ($name in @("Get-DeliveryCheckpoint", "Save-DeliveryPrefix")) {
+foreach ($name in @("Get-DeliveryCheckpoint", "Save-DeliveryPrefix", "Get-DeliveredLogGrowth")) {
     $function = $ast.FindAll({ param($node)
         $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
     }, $true) | Where-Object { $_.Name -eq $name } | Select-Object -First 1
@@ -81,6 +81,18 @@ Assert-Rejected { Get-DeliveryCheckpoint -Session $session -RequestId "test-nonc
 Assert-True ($server.Wait(3000)) "Busy server did not complete"
 Assert-Rejected { Get-DeliveryCheckpoint -Session ([pscustomobject]@{ log_delivery_schema = 0 }) -RequestId "test-nonce" } "legacy session accepted"
 
+# Completed byte watermarks include a buffered tail and survive current-file rotation.
+$before = [pscustomobject]@{ session_id = "growth"; pid = 4; process_start_unix_ms = 5; normal_status = "ready"; perf_status = "ready"; normal_written_bytes = 100; perf_written_bytes = 200 }
+$after = [pscustomobject]@{ session_id = "growth"; pid = 4; process_start_unix_ms = 5; normal_status = "ready"; perf_status = "ready"; normal_written_bytes = 6100; perf_written_bytes = 4200 }
+$growth = Get-DeliveredLogGrowth $before $after
+Assert-True ($growth.normal -eq 6000 -and $growth.perf -eq 4000) "ACK-flushed tail omitted from growth gate"
+Assert-True ($growth.normal -gt 5000) "normal rotation falsely passed log growth gate"
+$after.normal_written_bytes = 99
+Assert-Rejected { Get-DeliveredLogGrowth $before $after } "regressed watermark accepted"
+$after.normal_written_bytes = 6100
+$after.PSObject.Properties.Remove("perf_written_bytes")
+Assert-Rejected { Get-DeliveredLogGrowth $before $after } "missing byte watermark accepted"
+
 $directory = Join-Path (Join-Path $PSScriptRoot "..\target") ("test-idle-delivery-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $directory | Out-Null
 try {
@@ -101,6 +113,7 @@ try {
             session_id = $session.session_id; pid = $session.pid
             process_start_unix_ms = $session.process_start_unix_ms
             request_id = "test-nonce"; purpose = "measurement"; coverage_t = 25.0
+            normal_written_bytes = 100; perf_written_bytes = 200
             ticket_cutoff = 3; settled_watermark = 3; written_watermark = 3
             normal_status = "ready"; perf_status = "ready"
             normal_dropped_total = 0; perf_dropped_total = $drops; diagnostic_dropped_total = 0

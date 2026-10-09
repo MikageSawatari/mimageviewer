@@ -324,17 +324,25 @@ mod tests {
         let logs = tmp.path().join("logs");
         std::fs::create_dir_all(&logs).unwrap();
         let writer = crate::log_writer::test_support::writer(&logs, 32, 65536);
+        let enqueue = writer.pause_dequeue();
         assert!(writer.submit_normal("normal_before_export"));
         assert!(
             writer.submit_perf(serde_json::json!({"cat":"grid", "kind":"buffered_before_export"}))
         );
+        drop(enqueue);
         let snapshot = writer.snapshot().unwrap();
         let normal_len = snapshot.normal.len;
         let perf_len = snapshot.perf.as_ref().unwrap().len;
         let request_id = snapshot.checkpoint.request_id.clone();
         // Later appends are outside the sealed archive prefix.
+        let enqueue = writer.pause_dequeue();
         assert!(writer.submit_normal("normal_after_export"));
         assert!(writer.submit_perf(serde_json::json!({"cat":"grid", "kind":"after_export"})));
+        drop(enqueue);
+        let after = writer.snapshot().unwrap();
+        assert!(after.normal.len > normal_len);
+        assert!(after.perf.as_ref().unwrap().len > perf_len);
+        drop(after);
         std::fs::write(logs.join("perf_events.1.jsonl"), "old generation").unwrap();
         std::fs::write(logs.join("panic.log"), "independent panic evidence").unwrap();
         let path = tmp.path().join("diagnostics.zip");

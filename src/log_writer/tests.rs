@@ -85,42 +85,43 @@ fn oversize_and_journal_contention_restore_reservations_without_waiting() {
     assert!(submit(&service, Sink::Normal, "resumed\n"));
 }
 
-fn producers_finish_while_stalled(service: &Arc<Service>) {
+fn producers_finish_while_stalled(service: &Arc<Service>) -> Vec<String> {
     let (finished, receiver) = mpsc::channel();
     let producer = service.clone();
     let first = finished.clone();
     let regular = std::thread::spawn(move || {
+        let mut accepted = Vec::new();
         for sequence in 0..64 {
-            assert!(submit(
-                &producer,
-                Sink::Normal,
-                &format!("regular-{sequence}\n")
-            ));
-            assert!(submit(
+            let normal = format!("regular-{sequence}\n");
+            if submit(&producer, Sink::Normal, &normal) {
+                accepted.push(normal);
+            }
+            let _ = submit(
                 &producer,
                 Sink::Perf,
-                &format!("{{\"kind\":\"producer\",\"seq\":{sequence}}}\n")
-            ));
+                &format!("{{\"kind\":\"producer\",\"seq\":{sequence}}}\n"),
+            );
         }
-        first.send(()).unwrap();
+        first.send(accepted).unwrap();
     });
     let reader = service.clone();
     let stderr = std::thread::spawn(move || {
         // A diagnostic stderr pump must keep draining its IPC source even
         // when both logging destinations share a stalled file owner.
+        let mut accepted = Vec::new();
         for line in std::io::BufReader::new(Cursor::new("stderr diagnostic\n".repeat(64))).lines() {
-            assert!(submit(
-                &reader,
-                Sink::Normal,
-                &format!("stderr: {}\n", line.unwrap())
-            ));
+            let normal = format!("stderr: {}\n", line.unwrap());
+            if submit(&reader, Sink::Normal, &normal) {
+                accepted.push(normal);
+            }
         }
-        finished.send(()).unwrap();
+        finished.send(accepted).unwrap();
     });
-    receiver.recv_timeout(BARRIER_WAIT).unwrap();
-    receiver.recv_timeout(BARRIER_WAIT).unwrap();
+    let mut accepted = receiver.recv_timeout(BARRIER_WAIT).unwrap();
+    accepted.extend(receiver.recv_timeout(BARRIER_WAIT).unwrap());
     regular.join().unwrap();
     stderr.join().unwrap();
+    accepted
 }
 
 #[test]
@@ -130,30 +131,28 @@ fn real_worker_open_stall_does_not_block_producer_or_stderr_pump() {
     let pause = test_support::pause_service(&service, "open");
     service.start();
     pause.entered();
-    producers_finish_while_stalled(&service);
+    let accepted = producers_finish_while_stalled(&service);
     assert!(!directory.path().join("mimageviewer.log").exists());
     drop(pause);
     assert!(service.shutdown(Instant::now() + BARRIER_WAIT));
-    assert!(
-        std::fs::read_to_string(directory.path().join("mimageviewer.log"))
-            .unwrap()
-            .contains("regular-63")
-    );
+    let text = std::fs::read_to_string(directory.path().join("mimageviewer.log")).unwrap();
+    assert!(accepted.iter().all(|line| text.contains(line)));
 }
 
 fn worker_stall(stage: &'static str) {
     let directory = tempfile::tempdir().unwrap();
     let writer = test_support::writer(directory.path(), 1024, 65536);
+    let enqueue = writer.pause_dequeue();
     let pause = writer.pause(stage);
     assert!(writer.submit_normal("trigger stalled sink"));
+    drop(enqueue);
     pause.entered();
-    producers_finish_while_stalled(&writer.service);
+    let accepted = producers_finish_while_stalled(&writer.service);
     drop(pause);
-    let delivered = writer.snapshot().unwrap();
-    let text = snapshot_text(delivered.normal);
+    let delivered = writer.service.barrier("stall-tail".into(), "test").unwrap();
+    let text = snapshot_text(delivered.normal.unwrap());
     assert!(text.contains("trigger stalled sink"));
-    assert!(text.contains("regular-63"));
-    assert!(text.contains("stderr: stderr diagnostic"));
+    assert!(accepted.iter().all(|line| text.contains(line)));
     assert!(writer.shutdown());
 }
 
@@ -186,7 +185,7 @@ fn rotation_stall_and_snapshot_handle_preserve_saved_prefix() {
     assert!(submit(&service, Sink::Normal, "rotated-tail\n"));
     let thread = std::thread::spawn(move || worker.run());
     pause.entered();
-    producers_finish_while_stalled(&service);
+    let _ = producers_finish_while_stalled(&service);
     drop(pause);
     assert!(service.shutdown(Instant::now() + BARRIER_WAIT));
     thread.join().unwrap();
@@ -203,37 +202,48 @@ fn multithreaded_producer_timestamps_tids_and_each_thread_order_survive_delivery
     for producer in 0..4u64 {
         let service = writer.service.clone();
         threads.push(std::thread::spawn(move || {
+            let mut accepted = Vec::new();
             for sequence in 0..32 {
                 let stamp = 100.0 + producer as f64 + sequence as f64 / 1000.0;
                 let event = json!({"t":stamp,"tid":producer+500,"kind":"ordered","producer":producer,"seq":sequence});
                 let publication = service.publication(Sink::Perf).unwrap();
-                assert!(publication.submit(format!("{event}\n"), stamp, producer+500, std::panic::Location::caller()));
+                if publication.submit(format!("{event}\n"), stamp, producer+500, std::panic::Location::caller()) { accepted.push(sequence); }
             }
+            accepted
         }));
     }
-    for thread in threads {
-        thread.join().unwrap();
-    }
-    let delivered = writer.snapshot().unwrap();
-    assert_eq!(delivered.checkpoint.perf_dropped_total, 0);
+    let accepted = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect::<Vec<_>>();
+    let delivered = writer.service.barrier("ordered".into(), "test").unwrap();
+    let adopted: usize = accepted.iter().map(Vec::len).sum();
+    assert_eq!(
+        delivered.checkpoint.perf_dropped_total,
+        (128 - adopted) as u64
+    );
+    assert_eq!(
+        delivered.checkpoint.dropped_by_reason["perf"]["journal_contended"],
+        (128 - adopted) as u64
+    );
     let perf = snapshot_text(delivered.perf.unwrap());
     let ordered = perf
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .filter(|event| event["kind"] == "ordered")
         .collect::<Vec<_>>();
-    assert_eq!(ordered.len(), 128);
+    assert_eq!(ordered.len(), adopted);
     for producer in 0..4u64 {
         let own = ordered
             .iter()
             .filter(|event| event["producer"] == producer)
             .collect::<Vec<_>>();
-        for (sequence, event) in own.iter().enumerate() {
-            assert_eq!(event["seq"], sequence);
+        for (sequence, event) in accepted[producer as usize].iter().zip(own.iter()) {
+            assert_eq!(event["seq"], *sequence);
             assert_eq!(event["tid"], producer + 500);
             assert_eq!(
                 event["t"],
-                100.0 + producer as f64 + sequence as f64 / 1000.0
+                100.0 + producer as f64 + *sequence as f64 / 1000.0
             );
         }
     }
@@ -298,12 +308,14 @@ fn registered_publication_prevents_premature_barrier_ack_and_busy_request() {
     assert!(writer.service.barrier("duplicate".into(), "test").is_err());
     drop(pause);
     assert!(receiver.recv_timeout(Duration::from_millis(30)).is_err());
+    let enqueue = writer.pause_dequeue();
     assert!(publication.submit(
         "registered tail\n".into(),
         writer.service.clock(),
         808,
         std::panic::Location::caller()
     ));
+    drop(enqueue);
     let delivered = receiver.recv_timeout(BARRIER_WAIT).unwrap().unwrap();
     assert_eq!(delivered.checkpoint.ticket_cutoff, cutoff);
     assert_eq!(delivered.checkpoint.settled_watermark, cutoff);
@@ -442,8 +454,10 @@ fn expired_control_never_reports_successful_delivery() {
 fn shutdown_deadline_leaves_io_on_worker_then_flushes_tail_and_drop_summary() {
     let directory = tempfile::tempdir().unwrap();
     let writer = test_support::writer(directory.path(), 2, 65536);
+    let enqueue = writer.pause_dequeue();
     let pause = writer.pause_write();
     assert!(writer.submit_normal("shutdown accepted tail"));
+    drop(enqueue);
     pause.entered();
     assert!(writer.submit_normal("queued tail"));
     assert!(!writer.submit_normal("drop at capacity"));
@@ -477,9 +491,17 @@ fn snapshot_permits_perf_off_but_contains_current_export_marker() {
             truncate: true,
         })
         .ok();
+    let open = test_support::pause_service(&service, "open");
     service.start();
+    open.entered();
     assert!(submit(&service, Sink::Normal, "normal only tail\n"));
-    let snapshot = service.snapshot().unwrap();
+    let marker = test_support::pause_service(&service, "snapshot-marker");
+    let producer = service.clone();
+    let request = std::thread::spawn(move || producer.snapshot());
+    marker.entered();
+    drop(marker);
+    drop(open);
+    let snapshot = request.join().unwrap().unwrap();
     assert!(snapshot.perf.is_none());
     assert_eq!(snapshot.checkpoint.perf_status, "disabled");
     let text = snapshot_text(snapshot.normal);
@@ -547,8 +569,10 @@ fn late_perf_enable_retains_inflight_barrier_absolute_coverage_boundary() {
 fn own_export_marker_drop_refuses_snapshot_without_barrier() {
     let directory = tempfile::tempdir().unwrap();
     let writer = test_support::writer(directory.path(), 1, 65536);
+    let enqueue = writer.pause_dequeue();
     let pause = writer.pause_write();
     assert!(writer.submit_normal("occupy in-flight record budget"));
+    drop(enqueue);
     pause.entered();
     assert!(writer.snapshot().is_err());
     assert!(!writer.service.control_busy.load(Ordering::Acquire));
@@ -564,8 +588,10 @@ fn own_export_marker_drop_refuses_snapshot_without_barrier() {
 fn shutdown_final_checkpoint_follows_tail_and_drop_summary() {
     let directory = tempfile::tempdir().unwrap();
     let writer = test_support::writer(directory.path(), 32, 65536);
+    let enqueue = writer.pause_dequeue();
     assert!(writer.submit_perf(json!({"cat":"frame","kind":"last_tail"})));
     writer.force_drop();
+    drop(enqueue);
     assert!(writer.shutdown());
     let rows = rows(&directory.path().join("perf_events.jsonl"));
     let checkpoint = rows.last().unwrap();
@@ -645,8 +671,10 @@ fn slow_open_witness_uses_file_owner_times_without_a_producer_wait() {
 fn resumed_batch_reports_drops_before_the_remaining_tail_is_drained() {
     let directory = tempfile::tempdir().unwrap();
     let writer = test_support::writer(directory.path(), 2, 65536);
+    let enqueue = writer.pause_dequeue();
     let stalled = writer.pause_write();
     assert!(writer.submit_normal("blocked batch"));
+    drop(enqueue);
     stalled.entered();
     assert!(writer.submit_normal("remaining queued tail"));
     assert!(!writer.submit_normal("drop at capacity"));
@@ -699,4 +727,222 @@ fn rejected_registration_publishes_its_drop_before_settling_the_old_cohort() {
         1
     );
     assert!(writer.shutdown());
+}
+
+#[test]
+fn perf_initialization_failure_discards_buffer_without_drop_retry() {
+    struct Fails(std::sync::Arc<AtomicUsize>);
+    impl Write for Fails {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::other("injected init failure"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    assert!(initialize_perf_buffer(Fails(calls.clone()), b"session\n").is_err());
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "drop must not retry initialization"
+    );
+}
+
+#[test]
+fn real_worker_dequeue_contention_drops_without_waiting_and_barrier_accounts_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let writer = test_support::writer(directory.path(), 32, 65536);
+    let pause = writer.pause("dequeue-held");
+    writer.service.wake();
+    pause.entered();
+    let producer = writer.clone();
+    let (tx, rx) = mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        tx.send(producer.submit_normal("contended")).unwrap();
+    });
+    let result = rx.recv_timeout(BARRIER_WAIT);
+    drop(pause);
+    thread.join().unwrap();
+    assert_eq!(
+        result.unwrap(),
+        false,
+        "production admission must never wait on dequeue"
+    );
+    let delivered = writer.service.barrier("contention".into(), "test").unwrap();
+    assert_eq!(delivered.checkpoint.normal_dropped_total, 1);
+    assert_eq!(
+        delivered.checkpoint.dropped_by_reason["normal"]["journal_contended"],
+        1
+    );
+    assert!(!snapshot_text(delivered.normal.unwrap()).contains("contended\n"));
+    assert!(writer.shutdown());
+}
+
+#[test]
+fn export_fails_when_marker_rotates_away_before_snapshot() {
+    let directory = tempfile::tempdir().unwrap();
+    let service = configured(directory.path(), 32, 65536);
+    let mut worker = Worker::new(service.clone());
+    worker.initialize();
+    if let FileSink::Ready(normal) = &mut worker.normal {
+        normal.set_test_retention(256, 1);
+    }
+    let pause = test_support::pause_service(&service, "snapshot-marker");
+    let request_service = service.clone();
+    let request = std::thread::spawn(move || request_service.snapshot());
+    pause.entered();
+    assert!(worker.batch()); // includes this request's accepted markers
+    worker.raw(Sink::Normal, &format!("{}\n", "x".repeat(256)));
+    worker.raw(Sink::Normal, &format!("{}\n", "y".repeat(256)));
+    let run = std::thread::spawn(move || worker.run());
+    drop(pause);
+    assert!(matches!(request.join().unwrap(), Err(error) if error.contains("marker")));
+    assert!(service.shutdown(Instant::now() + BARRIER_WAIT));
+    run.join().unwrap();
+}
+
+#[test]
+fn actual_perf_flush_probe_tail_is_saved_before_shutdown_checkpoint() {
+    for mode in ["perf", "normal"] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "log_writer::tests::perf_flush_probe_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("MIV_FLUSH_PROBE_CHILD", mode)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+#[ignore = "isolated real perf clock and diagnostic queue"]
+fn perf_flush_probe_child() {
+    let mode = std::env::var("MIV_FLUSH_PROBE_CHILD").unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let service = configured(directory.path(), 32, 65536);
+    crate::perf::install_test_clock(service.clock);
+    let mut worker = Worker::new(service.clone());
+    worker.initialize();
+    if mode == "normal" {
+        let normal_io = test_support::pause_service(&service, "normal-write-io");
+        let write = std::thread::spawn(move || {
+            worker.raw(Sink::Normal, "slow normal tail\n");
+            worker
+        });
+        normal_io.entered();
+        std::thread::sleep(Duration::from_millis(70));
+        drop(normal_io);
+        let worker = write.join().unwrap();
+        assert!(!worker.perf_dirty);
+        let periodic = test_support::pause_service(&service, "perf-flush-io");
+        let run = std::thread::spawn(move || worker.run());
+        // No perf event, flush request, barrier or shutdown may trigger this drain.
+        periodic.entered();
+        drop(periodic);
+        assert!(service.shutdown(Instant::now() + BARRIER_WAIT));
+        run.join().unwrap();
+        assert!(
+            rows(&directory.path().join("perf_events.jsonl"))
+                .iter()
+                .any(|row| row["kind"] == "slow_io"
+                    && row["operation"] == "writer"
+                    && row["logger"] == "normal")
+        );
+        return;
+    }
+    let pause = test_support::pause_service(&service, "perf-flush-io");
+    let run = std::thread::spawn(move || worker.run());
+    let end_service = service.clone();
+    let end = std::thread::spawn(move || end_service.shutdown(Instant::now() + BARRIER_WAIT));
+    pause.entered();
+    std::thread::sleep(Duration::from_millis(70)); // force the actual IoProbe slow threshold
+    drop(pause);
+    assert!(end.join().unwrap());
+    run.join().unwrap();
+    let events = rows(&directory.path().join("perf_events.jsonl"));
+    assert!(events.iter().any(|e| e["kind"] == "slow_io"
+        && e["operation"] == "writer_flush"
+        && e["logger"] == "perf"));
+    assert_eq!(events.last().unwrap()["kind"], "drain_checkpoint");
+}
+
+#[test]
+fn completed_byte_watermarks_include_buffered_tail_and_do_not_reset_on_rotation() {
+    let directory = tempfile::tempdir().unwrap();
+    let service = configured(directory.path(), 32, 65536);
+    let mut worker = Worker::new(service.clone());
+    worker.initialize();
+    if let FileSink::Ready(normal) = &mut worker.normal {
+        normal.set_test_retention(32, 1);
+    }
+    let (response, _) = mpsc::channel();
+    let control = Control {
+        request_id: "bytes".into(),
+        purpose: "test".into(),
+        coverage_at: Instant::now(),
+        cutoff: 1,
+        deadline: Instant::now() + BARRIER_WAIT,
+        response,
+    };
+    let before = worker.deliver(&control).unwrap().checkpoint;
+    let original_len = std::fs::metadata(directory.path().join("perf_events.jsonl"))
+        .unwrap()
+        .len();
+    worker.raw(Sink::Normal, "first output that will rotate away\n");
+    worker.raw(Sink::Normal, "tail\n");
+    worker.raw(Sink::Perf, "{\"kind\":\"buffered-tail\"}\n");
+    assert_eq!(
+        std::fs::metadata(directory.path().join("perf_events.jsonl"))
+            .unwrap()
+            .len(),
+        original_len
+    );
+    let after = worker.deliver(&control).unwrap().checkpoint;
+    assert_eq!(after.normal_written_bytes - before.normal_written_bytes, 40);
+    assert_eq!(after.perf_written_bytes - before.perf_written_bytes, 25);
+    assert_eq!(
+        std::fs::metadata(directory.path().join("mimageviewer.log"))
+            .unwrap()
+            .len(),
+        5
+    );
+}
+
+#[test]
+fn single_producer_fifo_has_zero_drops_with_latched_worker() {
+    let directory = tempfile::tempdir().unwrap();
+    let service = configured(directory.path(), 128, 65536);
+    let open = test_support::pause_service(&service, "open");
+    service.start();
+    open.entered();
+    for sequence in 0..32 {
+        assert!(submit(
+            &service,
+            Sink::Perf,
+            &format!("{{\"kind\":\"fifo\",\"seq\":{sequence}}}\n")
+        ));
+    }
+    drop(open);
+    let delivered = service.barrier("fifo".into(), "test").unwrap();
+    assert_eq!(delivered.checkpoint.perf_dropped_total, 0);
+    let perf = snapshot_text(delivered.perf.unwrap());
+    let sequence = perf
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|row| row["kind"] == "fifo")
+        .map(|row| row["seq"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(sequence, (0..32).collect::<Vec<_>>());
+    assert!(service.shutdown(Instant::now() + BARRIER_WAIT));
 }

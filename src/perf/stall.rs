@@ -248,6 +248,12 @@ pub(crate) fn drain(writer: &mut impl Write) -> std::io::Result<()> {
     drain_queue(writer, queue)
 }
 
+pub(crate) fn pending() -> bool {
+    DIAGNOSTICS
+        .get()
+        .is_some_and(|q| q.queued.load(Ordering::Acquire) || q.dropped.load(Ordering::Acquire) != 0)
+}
+
 pub(crate) fn dropped_total() -> u64 {
     DIAGNOSTICS
         .get()

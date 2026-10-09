@@ -74,6 +74,7 @@ pub(crate) struct LogFile {
     pub(crate) path: PathBuf,
     file: Option<std::fs::File>,
     bytes_written: u64,
+    total_written_bytes: u64,
     retention: LogRetention,
 }
 
@@ -159,6 +160,7 @@ impl LogFile {
             path: path.to_owned(),
             file: Some(file),
             bytes_written,
+            total_written_bytes: 0,
             retention: LogRetention::from_environment(),
         })
     }
@@ -169,7 +171,11 @@ impl LogFile {
             .ok_or_else(|| std::io::Error::other("rotation failed"))?
             .write_all(line)?;
         self.bytes_written += line.len() as u64;
+        self.total_written_bytes += line.len() as u64;
         Ok(())
+    }
+    pub(crate) fn total_written_bytes(&self) -> u64 {
+        self.total_written_bytes
     }
     pub(crate) fn flush(&mut self) -> std::io::Result<()> {
         self.file
@@ -351,8 +357,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let writer = crate::log_writer::test_support::writer(directory.path(), 32, 65536);
         crate::log_writer::test_support::install_global(&writer);
+        let enqueue = writer.pause_dequeue();
         let stalled_sink = writer.pause_write();
         log("reach stalled write");
+        drop(enqueue);
         stalled_sink.entered();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();

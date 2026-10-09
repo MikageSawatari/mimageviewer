@@ -207,6 +207,32 @@ function Get-DeliveryCheckpoint {
     return $ack
 }
 
+function Get-DeliveredLogGrowth {
+    param($Start, $End)
+    foreach ($field in @("session_id", "pid", "process_start_unix_ms")) {
+        if ($null -eq $Start.PSObject.Properties[$field] -or
+            $null -eq $End.PSObject.Properties[$field] -or $Start.$field -ne $End.$field) {
+            throw "log byte watermarks belong to different or unknown processes"
+        }
+    }
+    $growth = @{}
+    foreach ($sink in @("normal", "perf")) {
+        $field = $sink + "_written_bytes"
+        $status = $sink + "_status"
+        foreach ($checkpoint in @($Start, $End)) {
+            if ($null -eq $checkpoint.PSObject.Properties[$status] -or $checkpoint.$status -ne "ready" -or
+                $null -eq $checkpoint.PSObject.Properties[$field] -or
+                ($checkpoint.$field -isnot [int] -and $checkpoint.$field -isnot [long] -and $checkpoint.$field -isnot [uint64]) -or
+                [decimal]$checkpoint.$field -lt 0) {
+                throw "unknown or invalid completed log byte watermark: $field"
+            }
+        }
+        if ([decimal]$End.$field -lt [decimal]$Start.$field) { throw "log byte watermark regressed: $field" }
+        $growth[$sink] = [decimal]$End.$field - [decimal]$Start.$field
+    }
+    [pscustomobject]$growth
+}
+
 function Save-DeliveryPrefix {
     param($Ack, [string]$Destination)
     [MivLogDelivery1]::Snapshot([string]$Ack.perf_path, [string]$Ack.perf_file_identity,
@@ -505,8 +531,6 @@ if ($DeliveryFailures.Count -eq 0) {
     $StartProcessElapsed = [double]$MeasuredSession.wall_t + ($StartUnixMs - [double]$MeasuredSession.wall_unix_ms) / 1000.0
 }
 $StartCpu = $Process.TotalProcessorTime.TotalSeconds
-$StartAppLogBytes = Get-FileLength -Path $AppLog
-$StartPerfLogBytes = Get-FileLength -Path $PerfLog
 $StartForegroundProcessId = Get-ForegroundProcessId
 $StartWindowSummary = Get-ProcessTopLevelWindowSummary -Id $Process.Id
 $Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -523,8 +547,6 @@ if ($DeliveryFailures.Count -eq 0) {
     $EndProcessElapsed = [double]$MeasuredSession.wall_t + ($EndUnixMs - [double]$MeasuredSession.wall_unix_ms) / 1000.0
 }
 $EndCpu = $Process.TotalProcessorTime.TotalSeconds
-$EndAppLogBytes = Get-FileLength -Path $AppLog
-$EndPerfLogBytes = Get-FileLength -Path $PerfLog
 $EndForegroundProcessId = Get-ForegroundProcessId
 $EndWindowSummary = Get-ProcessTopLevelWindowSummary -Id $Process.Id
 
@@ -532,8 +554,8 @@ $ElapsedSeconds = [Math]::Max($Stopwatch.Elapsed.TotalSeconds, 0.001)
 $CpuDeltaSeconds = [Math]::Max($EndCpu - $StartCpu, 0.0)
 # 1.0 means one logical core is fully occupied; do not divide by machine core count.
 $CpuCoreRatio = $CpuDeltaSeconds / $ElapsedSeconds
-$AppLogGrowth = [Math]::Max($EndAppLogBytes - $StartAppLogBytes, 0)
-$PerfLogGrowth = [Math]::Max($EndPerfLogBytes - $StartPerfLogBytes, 0)
+$AppLogGrowth = $null
+$PerfLogGrowth = $null
 
 $Timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $SafeScenario = $Scenario -replace "[^A-Za-z0-9_.-]", "_"
@@ -545,6 +567,9 @@ try {
     $EndCheckpoint = Get-DeliveryCheckpoint -Session $MeasuredSession -RequestId ([guid]::NewGuid().ToString("N"))
     if ($EndCheckpoint.coverage_t -lt $EndProcessElapsed) { throw "checkpoint coverage does not reach measurement end" }
     Save-DeliveryPrefix -Ack $EndCheckpoint -Destination $PerfPrefixPath
+    $LogGrowth = Get-DeliveredLogGrowth -Start $StartCheckpoint -End $EndCheckpoint
+    $AppLogGrowth = $LogGrowth.normal
+    $PerfLogGrowth = $LogGrowth.perf
     $EndCheckpoint | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $DeliveryAckPath -Encoding UTF8
 }
 catch { $DeliveryFailures.Add("after measurement: " + $_.Exception.Message) }

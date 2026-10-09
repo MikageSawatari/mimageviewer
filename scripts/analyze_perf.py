@@ -95,7 +95,7 @@ DELIVERY_CHECKPOINT_FIELDS = (
     "schema", "session_id", "pid", "process_start_unix_ms", "request_id", "purpose",
     "coverage_t", "ticket_cutoff", "settled_watermark", "written_watermark",
     "normal_status", "perf_status", "normal_dropped_total", "perf_dropped_total",
-    "diagnostic_dropped_total",
+    "diagnostic_dropped_total", "normal_written_bytes", "perf_written_bytes",
 )
 
 
@@ -146,7 +146,8 @@ def validate_delivery(
         reasons.append("Checkpoint coverage does not reach measurement end")
     elif checkpoint_id is not None and coverage_end_t is None:
         reasons.append("Specify measurement coverage end")
-    for field in ("ticket_cutoff", "settled_watermark", "written_watermark"):
+    for field in ("ticket_cutoff", "settled_watermark", "written_watermark",
+                  "normal_written_bytes", "perf_written_bytes"):
         if type(checkpoint.get(field)) is not int or checkpoint[field] < 0:
             reasons.append(f"Unknown {field}")
     cutoff = checkpoint.get("ticket_cutoff")

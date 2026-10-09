@@ -96,7 +96,10 @@ timeout、Busy、Closing、writer／sink failure、不一致は判定不能に�
 clientはACKの`perf_path`をread共有で開き、Windowsのvolume serial／file indexを`perf_file_identity`と
 照合する。同じhandleから`perf_end_offset`までだけ読み、後続append中のJSONやrotation後の別ファイルを
 混ぜない。analyzerはこのprefixのbyte長と保存済み`log.drain_checkpoint`をACKと照合する。
-完全性確認に失敗してもprocess reportにCPU・ログ増加量の参考値を残す。
+ログ増加量は開始・終了の成功ACKにある`normal_written_bytes`／`perf_written_bytes`の差で計算する。
+通常logのrotationでも累計値は減らず、終了barrierで保存したtailを含む。perfのcheckpoint自身は
+自己参照を避けるためbyte数から除外する。counter不明・逆行・identity不一致はCannotJudge。
+完全性確認に失敗してもprocess reportにCPUの参考値を残し、増加量不明はnullのままにする。
 
 `idle-health`、`hitches`、`scroll`、`startup`は同じ完全性validatorを使う。手動で確定prefixを解析する場合は、
 `--checkpoint-id <nonce>`と測定末尾（idleは`--end-t`、他は`--coverage-end-t`）を指定する。

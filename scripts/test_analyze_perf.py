@@ -84,7 +84,7 @@ def delivery_events(events: list[dict], end_t: float = 30.0) -> list[dict]:
                  "schema": 1, "session_id": "fixture-session", "pid": starts[0]["pid"],
                  "process_start_unix_ms": 1234, "request_id": "fixture-nonce", "purpose": "shutdown",
                  "coverage_t": end_t, "ticket_cutoff": 20, "settled_watermark": 20,
-                 "written_watermark": 20, "normal_status": "ready", "perf_status": "ready",
+                 "written_watermark": 20, "normal_written_bytes": 100, "perf_written_bytes": 200, "normal_status": "ready", "perf_status": "ready",
                  "normal_dropped_total": 0, "perf_dropped_total": 0, "diagnostic_dropped_total": 0})
     return rows
 
@@ -2048,6 +2048,18 @@ class DeliveryCompletenessTests(unittest.TestCase):
         for kind in ("records_dropped", "diagnostic_dropped"):
             rows = base[:-1] + [{"t": 2, "cat": "log", "kind": kind, "count": 1}] + base[-1:]
             self.assertEqual(validate_delivery(rows, checkpoint_id="fixture-nonce", coverage_end_t=25.0)["status"], "CannotJudge")
+
+    def test_completed_byte_watermarks_are_required_and_ack_matches(self):
+        for field in ("normal_written_bytes", "perf_written_bytes"):
+            for value in (None, -1, 1.5, "100"):
+                with self.subTest(field=field, value=value):
+                    rows = delivery_events([frame(1.0, 1), tail(1.0, 1)], 25.0)
+                    rows[-1][field] = value
+                    self.assertEqual(validate_delivery(rows)["status"], "CannotJudge")
+            rows = delivery_events([frame(1.0, 1), tail(1.0, 1)], 25.0)
+            ack = dict(rows[-1])
+            ack[field] += 1
+            self.assertEqual(validate_delivery(rows, checkpoint_id="fixture-nonce", coverage_end_t=25, ack=ack)["status"], "CannotJudge")
 
     def test_four_cli_gates_legacy_exit_two(self):
         with writable_test_directory() as directory:

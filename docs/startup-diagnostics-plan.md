@@ -888,3 +888,13 @@ timeout時はwriterのI/O所有を残す。呼出元でjoin/flush/retry/fallback
 回帰はlauncher/coreのWindows実ファイル、active/legacy leaseと10-run grouping、既存証拠保護、
 pending192件の順序と最終terminal一度、journal満杯/競合、file cap予約、writer自身のwrite/
 final flush stall中のpublisher進行とdeadline、失敗ACK、実ファイルflush/lease解放後ACKを検査する。
+
+
+### §1.356 実装レビューの終了境界補完（2026-10-09）
+
+launcherの正常returnとエラーexitを同じ`complete_launcher`へまとめ、terminal公開後に
+startup writerのflush／close ACKを最大2秒で待つ。エラー表示もこの境界の後に行う。
+TensorRT builderはusage／不正モデル／DirectML専用モデルのskipを含む全exitを
+coreの`exit_startup`へ接続し、一般writerとstartup writerで一つの2秒deadlineを共有する。
+正常・エラー・skipの実終了は、独立したunit-test executableの子processと一時LOCALAPPDATAで
+回帰確認する。製品binary・モデルruntimeを起動せず、pending記録と末尾terminalを検査する。

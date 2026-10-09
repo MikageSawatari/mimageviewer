@@ -5,7 +5,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
@@ -58,6 +58,8 @@ pub(crate) struct Checkpoint {
     pub ticket_cutoff: u64,
     pub settled_watermark: u64,
     pub written_watermark: u64,
+    pub normal_written_bytes: u64,
+    pub perf_written_bytes: u64,
     pub normal_status: &'static str,
     pub perf_status: &'static str,
     pub normal_dropped_total: u64,
@@ -167,8 +169,6 @@ struct Service {
     clock: Instant,
     #[cfg(test)]
     hook: Mutex<Option<Arc<test_support::Latch>>>,
-    #[cfg(test)]
-    fixture_gate: Mutex<()>,
 }
 impl Service {
     fn new(record_limit: usize, payload_limit: usize) -> Arc<Self> {
@@ -196,8 +196,6 @@ impl Service {
             clock: Instant::now(),
             #[cfg(test)]
             hook: Mutex::new(None),
-            #[cfg(test)]
-            fixture_gate: Mutex::new(()),
         })
     }
     fn start(self: &Arc<Self>) {
@@ -381,10 +379,18 @@ impl Service {
         if !normal || !perf {
             return Err("export marker dropped".into());
         }
-        let delivered = self.barrier(id, "diagnostics")?;
+        #[cfg(test)]
+        self.pause("snapshot-marker");
+        let delivered = self.barrier(id.clone(), "diagnostics")?;
+        let mut normal = delivered.normal.ok_or("normal snapshot unavailable")?;
+        verify_export_marker(&mut normal, &id, false)?;
+        let mut perf = delivered.perf;
+        if let Some(file) = &mut perf {
+            verify_export_marker(file, &id, true)?;
+        }
         Ok(ExportSnapshot {
-            normal: delivered.normal.ok_or("normal snapshot unavailable")?,
-            perf: delivered.perf,
+            normal,
+            perf,
             checkpoint: delivered.checkpoint,
         })
     }
@@ -429,8 +435,6 @@ impl Publication {
         tid: u64,
         site: &'static std::panic::Location<'static>,
     ) -> bool {
-        #[cfg(test)]
-        let _fixture = self.service.fixture_gate.lock().unwrap();
         self.service
             .enqueue(self.sink, line, self.service.clock(), tid, site)
     }
@@ -510,7 +514,29 @@ impl<T> FileSink<T> {
 struct PerfFile {
     path: PathBuf,
     file: BufWriter<File>,
+    written_bytes: u64,
 }
+impl Write for PerfFile {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let count = self.file.write(bytes)?;
+        self.written_bytes += count as u64;
+        Ok(count)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+fn initialize_perf_buffer<W: Write>(sink: W, header: &[u8]) -> std::io::Result<BufWriter<W>> {
+    let mut file = BufWriter::with_capacity(64 * 1024, sink);
+    if let Err(error) = file.write_all(header).and_then(|()| file.flush()) {
+        // No implicit retry from BufWriter::drop on the initialization path.
+        let (sink, _) = file.into_parts();
+        drop(sink);
+        return Err(error);
+    }
+    Ok(file)
+}
+
 struct Worker {
     service: Arc<Service>,
     normal: FileSink<crate::logger::LogFile>,
@@ -564,12 +590,12 @@ impl Worker {
                 let mut options = OpenOptions::new();
                 options.create(true).write(true).truncate(true);
                 crate::logger::allow_live_log_reading(&mut options);
-                let mut file = BufWriter::with_capacity(64 * 1024, options.open(&config.path)?);
-                writeln!(file, "{}", config.session)?;
-                file.flush()?;
+                let header = format!("{}\n", config.session);
+                let file = initialize_perf_buffer(options.open(&config.path)?, header.as_bytes())?;
                 Ok(PerfFile {
                     path: config.path.clone(),
                     file,
+                    written_bytes: header.len() as u64,
                 })
             })();
             match result {
@@ -614,6 +640,10 @@ impl Worker {
         if let Some(p) = probe.as_mut() {
             p.acquired(&HOLDER);
         }
+        #[cfg(test)]
+        if matches!(sink, Sink::Normal) {
+            self.service.pause("normal-write-io");
+        }
         let at = crate::perf::stall::timer(&probe);
         let result = match sink {
             Sink::Normal => match &mut self.normal {
@@ -623,7 +653,7 @@ impl Worker {
             Sink::Perf => match &mut self.perf {
                 FileSink::Ready(f) => {
                     self.perf_dirty = true;
-                    f.file.write_all(line.as_bytes())
+                    f.write_all(line.as_bytes())
                 }
                 _ => Ok(()),
             },
@@ -663,12 +693,14 @@ impl Worker {
         if let Some(p) = probe.as_mut() {
             p.acquired(&HOLDER);
         }
+        #[cfg(test)]
+        if perf {
+            self.service.pause("perf-flush-io");
+        }
         let at = crate::perf::stall::timer(&probe);
         let result = if perf {
             match &mut self.perf {
-                FileSink::Ready(f) => {
-                    crate::perf::stall::drain(&mut f.file).and_then(|()| f.file.flush())
-                }
+                FileSink::Ready(f) => crate::perf::stall::drain(f).and_then(|()| f.flush()),
                 _ => Ok(()),
             }
         } else {
@@ -683,19 +715,31 @@ impl Worker {
         {
             p.finish(end, 0.0, flush_ms, 0.0);
         }
+        // finish() can enqueue this flush's own slow_io. Drain it once without
+        // measuring the final drain/flush, so no recursive proof tail is created.
+        let result = if perf {
+            result.and_then(|()| match &mut self.perf {
+                FileSink::Ready(f) => crate::perf::stall::drain(f).and_then(|()| f.flush()),
+                _ => Ok(()),
+            })
+        } else {
+            result
+        };
         if let Err(error) = result {
             self.failed(if perf { Sink::Perf } else { Sink::Normal }, error);
         }
         if perf {
-            self.perf_dirty = false;
+            self.perf_dirty = crate::perf::stall::pending();
             self.last_flush = Instant::now();
         }
     }
     fn batch(&mut self) -> bool {
+        #[cfg(test)]
+        self.service.pause("dequeue");
         let records: Vec<_> = {
-            #[cfg(test)]
-            let _fixture = self.service.fixture_gate.lock().unwrap();
             let mut queue = self.service.queue.lock().unwrap_or_else(|e| e.into_inner());
+            #[cfg(test)]
+            self.service.pause("dequeue-held");
             let count = queue.len().min(BATCH);
             queue.drain(..count).collect()
         };
@@ -776,6 +820,9 @@ impl Worker {
         self.drop_summaries();
         self.flush(false);
         self.flush(true);
+        if matches!(self.perf, FileSink::Ready(_)) && crate::perf::stall::pending() {
+            return Err("diagnostic tail unavailable at completion boundary".into());
+        }
         // Read each counter once. Producers continue after the cutoff, so an
         // independently sampled total and reason map could disagree.
         let dropped_by_reason: std::collections::BTreeMap<
@@ -822,6 +869,14 @@ impl Worker {
             ticket_cutoff: control.cutoff,
             settled_watermark: control.cutoff,
             written_watermark: control.cutoff,
+            normal_written_bytes: match &self.normal {
+                FileSink::Ready(f) => f.total_written_bytes(),
+                _ => 0,
+            },
+            perf_written_bytes: match &self.perf {
+                FileSink::Ready(f) => f.written_bytes,
+                _ => 0,
+            },
             normal_status: self.normal.status(),
             perf_status: self.perf.status(),
             normal_dropped_total,
@@ -952,7 +1007,10 @@ impl Worker {
                 self.flush(false);
                 self.flush(true);
             }
-            if self.perf_dirty && self.last_flush.elapsed() >= PERF_FLUSH {
+            if matches!(self.perf, FileSink::Ready(_))
+                && (self.perf_dirty || crate::perf::stall::pending())
+                && self.last_flush.elapsed() >= PERF_FLUSH
+            {
                 self.drop_summaries();
                 self.flush(true);
             }
@@ -969,6 +1027,35 @@ impl Worker {
         }
     }
 }
+fn verify_export_marker(snapshot: &mut SnapshotFile, id: &str, perf: bool) -> Result<(), String> {
+    let suffix = format!("diagnostics: export_requested request_id={id}");
+    let found = {
+        let mut lines = BufReader::new((&mut snapshot.file).take(snapshot.len)).lines();
+        lines
+            .try_fold(false, |found, line| {
+                let line = line?;
+                Ok::<_, std::io::Error>(
+                    found
+                        || if perf {
+                            serde_json::from_str::<Value>(&line).is_ok_and(|row| {
+                                row["cat"] == "diagnostics"
+                                    && row["kind"] == "export_requested"
+                                    && row["request_id"] == id
+                            })
+                        } else {
+                            line.ends_with(&suffix)
+                        },
+                )
+            })
+            .map_err(|error| format!("export marker snapshot read: {error}"))?
+    };
+    snapshot.file.rewind().map_err(|error| error.to_string())?;
+    if !found {
+        return Err("export marker absent from retained snapshot".into());
+    }
+    Ok(())
+}
+
 fn snapshot(path: &Path) -> Result<SnapshotFile, String> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -1039,13 +1126,36 @@ pub(crate) mod test_support {
             p.submit(format!("{event}\n"), t, tid, std::panic::Location::caller())
         }
         pub fn snapshot(&self) -> Result<ExportSnapshot, String> {
-            self.service.snapshot()
+            let existing = self.service.hook.lock().unwrap().clone();
+            if existing.is_some_and(|latch| {
+                let state = latch.state.lock().unwrap();
+                state.0 && !state.1
+            }) {
+                return self.service.snapshot();
+            }
+            // Control this fixture's marker/dequeue ordering without changing
+            // producer admission. Contention tests call the real service directly.
+            let dequeue = self.pause_dequeue();
+            let marker = self.pause("snapshot-marker");
+            let service = self.service.clone();
+            let request = std::thread::spawn(move || service.snapshot());
+            marker.entered();
+            drop(marker);
+            drop(dequeue);
+            request.join().unwrap()
         }
+
         pub fn shutdown(&self) -> bool {
             self.service.shutdown(Instant::now() + BARRIER_WAIT)
         }
         pub fn force_drop(&self) {
             let _ = self.submit_normal(&"x".repeat(RECORD_BYTES + 1));
+        }
+        pub fn pause_dequeue(&self) -> Pause {
+            let pause = self.pause("dequeue");
+            self.service.wake();
+            pause.entered();
+            pause
         }
         pub fn pause_write(&self) -> Pause {
             self.pause("write")
@@ -1093,7 +1203,9 @@ pub(crate) mod test_support {
                 .changed
                 .wait_timeout_while(state, BARRIER_WAIT, |s| !s.0)
                 .unwrap();
-            assert!(state.0, "writer did not reach latch");
+            let reached = state.0;
+            drop(state); // A failed fixture assertion must not poison Pause::drop.
+            assert!(reached, "writer did not reach latch");
         }
     }
     impl Drop for Pause {

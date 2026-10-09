@@ -153,7 +153,7 @@ focusedで有効なred→greenの後、`cargo fmt`／`cargo fmt --check`、`carg
 
 1. **C356-1 容量（変更して決定）**: 262,144件・本文合計128MiB・1件1MiB。内部定数とし設定を増やさない。利用者PCの実測を理由として旧推奨8,192件から増量。
 2. **C356-2 捨て方（推奨を採用）**: 満杯／競合では新規記録を捨て、保存再開時に欠落件数と発生時間幅を記録。panic／watchdog／常時起動診断は独立経路を維持。
-3. **C356-3 保存完了と終了（推奨を採用、C356-4に合わせ周期を明確化）**: perfは250ms周期。終了は一般writerとstartup writer合計2秒。診断ZIPはworkerで完了barrierを待つ。過去欠落はmanifest／画面で証拠不完全を知らせZIP保存、今回要求印drop／barrier timeout／必須snapshot読取り失敗は作成失敗。性能gateは完全性不明・欠落ありなら判定不能。自動再試行なし。
+3. **C356-3 保存完了と終了（推奨を採用、C356-4に合わせ周期を明確化）**: perfは250ms周期。終了は一般writerとstartup writer合計2秒。診断ZIPはworkerで完了barrierを待つ。過去欠落はmanifest／画面で証拠不完全を知らせZIP保存、今回要求印drop／確定snapshot内の要求印消失／barrier timeout／必須snapshot読取り失敗は作成失敗。性能gateは完全性不明・欠落ありなら判定不能。自動再試行なし。
 4. **C356-4 crash時（変更して決定）**: panic.log／UI hang watchdogは直接writeを維持。通常sinkは各到着batchを直ちにwrite・flushし、250ms周期にしない。perfだけ250ms周期。異常終了でqueue全体の排出は保証しない。ディスク障害や強制killでpanic.log自体の保存も保証できない。
 5. **C356-5 まれな保存失敗（推奨を採用）**: 一度通知し、affected sinkは次回起動までUnavailable、自動再試行なし。他sinkと閲覧を維持。設定・タグ等の利用者データには触れない。
 
@@ -183,3 +183,16 @@ focusedで有効なred→greenの後、`cargo fmt`／`cargo fmt --check`、`carg
 - `90a8a9353`からstartup .lock sidecar／retention試験のみ移植。allocator flavorやsession_header refactorは移植しない。startup writerは独立のまま、terminal保護・全pending排出・最終flush／close後ACKを追加。
 - 診断ZIPは実writer→自分の要求印→barrier→snapshot→ZIP経路で検証する。perf gateはcheckpoint・欠落数・session・nonce・coverage・prefixを確認し、旧ログは参考値だけ残してCannotJudgeとする。過去欠落のZIP警告は実配送fixtureとUI snapshotで確認する。
 - 同期loggerの有効REDはactual `logger::log`を使う隔離test harnessで取得（`target/C1356-legacy-logger-red.txt`）。通常profile／製品binaryを使わず、旧FILE所有guardを保持するとproducerの完了channelが解除前に届かず失敗した。新facadeは同じ隔離testと実worker I/O latchで検査する。最終gate結果はhandoffに記録する。
+
+## 10. 実装レビュー修正（2026-10-09、642ed1ee5への追補）
+
+6件とも指摘を採用した。まれな失敗を再試行する仕組みは追加しない。
+
+- **P2-1・増加量**: ACKに`normal_written_bytes`／`perf_written_bytes`を追加する。session内で実際にwriterへ書き込んだ累計byte数で、通常logのrotation後も減らない。perfはbufferを排出・flushしてから確定する。session header、通常record、drop summary、slow_ioを含み、自己参照を避けるためdrain_checkpoint自身だけをperf byte数から除外する。gateは開始・終了の成功ACK差で閾値を評価し、取得前のファイルサイズ差は使わない。identity不一致・counter不明・逆行ならCannotJudge。analyzerもcounterの型・非負・ACKと保存checkpointの一致を検査する。
+- **P2-2・process終了**: launcherの正常return／エラーexitは同じ最終境界でterminalを公開し、startup writerのflush／close ACKを最大2秒で待ってから終了する。エラー画面は排出待ちの後。TensorRT builderのusage／モデル拒否／成功／全エラーexitはcore共通の終了helperへ接続し、一般writerとstartup writerで一つの2秒deadlineを共有する。unit-test executableの子processで実際の終了経路を通し、pendingと末尾terminalを確認する。製品binaryは起動しない。
+- **P2-3・perf初期化**: session headerのwrite／flush失敗時も`BufWriter::into_parts()`で未保存bufferを破棄し、Failedと一度通知へ進む。dropの暗黙write再試行をしない。書込み回数を数えるsinkで初期化失敗の回帰を固定する。
+- **P2-4・ZIP印**: enqueue成功に加え、完了barrierで取得した通常／有効perfの固定prefix内に、この要求IDの`export_requested`があることをworker上で検査する。印がrotationで消失した場合は既存の失敗通知でZIP作成を中止する。バックアップ収集・過去dropの警告付き保存を代用としない。snapshot取得前に複数rotationする実配送回帰を追加する。過去のdropだけではZIPを禁止しない。
+- **P2-5・flush診断**: 計測したperf flushのIoProbe.finish後に、診断queueをもう一度排出・flushする。この最後の排出は計測しないので自己診断を再帰生成しない。残った診断がある場合はperiodic flush対象を維持し、completion ACKは成功にしない。通常logのIoProbeだけが診断を作り、perf recordが無い場合も診断queueを周期排出の対象にする。実IoProbeがslow_ioを生成する停止fixtureで、追加イベント無しでもshutdown checkpointより前に保存されることを確認する。
+- **P3・受付試験**: test専用fixture_gateを廃止し、producerとwriterの受付競合は本番と同じtry_lockを通す。latchはworkerの各段階・dequeue guard保持中を止めるだけで、受付の同期方式を変更しない。採用された各threadの連番・stamp・tid、拒否数とbarrierの理由別drop集計、guard競合中にもproducerが戻ることを検査する。
+
+利用者の2026-10-09決定と、未回答の質問がない状態は維持する。
