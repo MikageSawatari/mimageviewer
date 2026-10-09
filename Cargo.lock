@@ -1921,6 +1921,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "egui-ime"
+version = "0.1.0"
+dependencies = [
+ "egui",
+]
+
+[[package]]
 name = "egui-wgpu"
 version = "0.33.3"
 dependencies = [
@@ -4062,6 +4069,7 @@ dependencies = [
  "delharc",
  "eframe",
  "egui",
+ "egui-ime",
  "egui-wgpu",
  "egui_kittest",
  "encoding_rs",
