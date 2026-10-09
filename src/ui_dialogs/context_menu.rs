@@ -3615,7 +3615,7 @@ mod delete_confirm_tests {
     }
 
     #[test]
-    fn external_tool_context_target_uses_checked_display_order_with_clicked_first() {
+    fn external_tool_context_target_uses_checked_display_order() {
         let mut app = crate::app::setup_app_for_test();
         app.items = vec![
             GridItem::Image(PathBuf::from(r"C:\media\zero.jpg")),
@@ -3644,9 +3644,9 @@ mod delete_confirm_tests {
         assert_eq!(
             paths,
             vec![
-                PathBuf::from(r"C:\media\clicked.jpg"),
                 PathBuf::from(r"C:\media\two.jpg"),
                 PathBuf::from(r"C:\media\zero.jpg"),
+                PathBuf::from(r"C:\media\clicked.jpg"),
             ]
         );
     }
