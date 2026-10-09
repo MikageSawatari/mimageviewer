@@ -2896,7 +2896,9 @@ pub(super) fn draw_native_frame_step_button(
     draw_overlay_button_bg(painter, rect, resp.hovered(), false);
     draw_overlay_frame_step_icon(painter, rect, direction);
     let resp = resp.hover_tip_dark(tooltip);
-    let primary_down = ui.ctx().input(|i| i.pointer.primary_down());
+    let (primary_down, primary_pressed) = ui
+        .ctx()
+        .input(|i| (i.pointer.primary_down(), i.pointer.primary_pressed()));
     let held_from_this_button = hold
         .as_ref()
         .is_some_and(|state| state.direction == direction);
@@ -2906,7 +2908,10 @@ pub(super) fn draw_native_frame_step_button(
         }
         return false;
     }
-    let down = resp.is_pointer_button_down_on() || (primary_down && held_from_this_button);
+    // egui can retain the click owner across disabled frames. Only a new press
+    // may start a hold; an ended hold must not resume from that retained owner.
+    let fresh_press = primary_pressed && resp.is_pointer_button_down_on();
+    let down = primary_down && (held_from_this_button || fresh_press);
     let now = Instant::now();
     if down {
         match hold {

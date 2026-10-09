@@ -15023,6 +15023,132 @@ mod chrome_suppression_interaction_tests {
         }
     }
 
+    fn frame_hold_scan_end_before_release(cancel: bool) {
+        use crate::video::normalize_types::{NormalizeOverlayState, NormalizeUiState};
+        fn draw(overlay: &mut NativeEguiOverlayState) -> NativeOverlayLogicalOutput {
+            // Keep the real egui click-duration contract deterministic under full-suite load.
+            let time = overlay.egui_ctx.input(|i| i.time) + 1.0 / 60.0;
+            overlay.started_at = Instant::now() - Duration::from_secs_f64(time);
+            frame(overlay)
+        }
+        fn steps(output: &NativeOverlayLogicalOutput, direction: i32) -> usize {
+            output
+                .commands
+                .iter()
+                .filter(|c| {
+                    matches!(c,
+                NativeOverlayCommand::FrameStep { direction: d } if *d == direction)
+                })
+                .count()
+        }
+        for (id, direction) in [
+            ("native_video_prev_frame", -1),
+            ("native_video_next_frame", 1),
+        ] {
+            let (mut overlay, _) = fixture(false);
+            overlay.set_metadata(Some(native_hud_multitrack_fixture_metadata()));
+            overlay.resize_dimensions(900, 360);
+            for _ in 0..4 {
+                draw(&mut overlay);
+            }
+            let pos = overlay
+                .egui_ctx
+                .read_response(egui::Id::new(id))
+                .unwrap()
+                .rect
+                .center();
+            pointer(&mut overlay, pos);
+            draw(&mut overlay);
+            button(&mut overlay, pos, true);
+            assert_eq!(steps(&draw(&mut overlay), direction), 1);
+            assert!(overlay.frame_step_hold.is_some());
+            overlay.set_normalize_state(NormalizeOverlayState {
+                ui_state: NormalizeUiState::Scanning,
+                progress: Some(Default::default()),
+            });
+            assert!(overlay.frame_step_hold.is_none());
+            for _ in 0..3 {
+                assert_eq!(steps(&draw(&mut overlay), direction), 0);
+            }
+            if cancel {
+                let key = crate::video::native_window::NativeVideoKeyEvent {
+                    receipt: crate::mouse_seek_debug::test_receipt(1),
+                    virtual_key: 0x1B,
+                    scan_code: 0,
+                    extended: false,
+                    shift: false,
+                    ctrl: false,
+                    alt: false,
+                    repeat: false,
+                };
+                overlay.push_native_event(NativeVideoWindowEvent::KeyDown(key));
+                let output = draw(&mut overlay);
+                // Native Escape is forwarded to App's existing modal-cancel owner,
+                // not emitted by this CPU core as an overlay button command.
+                assert_eq!(steps(&output, direction), 0);
+                overlay.push_native_event(NativeVideoWindowEvent::KeyUp(key));
+            }
+            // Apply the existing App -> presenter acknowledgement/result snapshot.
+            overlay.set_normalize_state(NormalizeOverlayState {
+                ui_state: if cancel {
+                    NormalizeUiState::OnUnmeasured
+                } else {
+                    NormalizeUiState::OnApplied { gain_db: 1.0 }
+                },
+                progress: None,
+            });
+            for _ in 0..4 {
+                assert_eq!(
+                    steps(&draw(&mut overlay), direction),
+                    0,
+                    "scan end must not recreate a hold from the old press: cancel={cancel}"
+                );
+                assert!(overlay.egui_ctx.input(|i| i.pointer.primary_down()));
+                assert!(overlay.frame_step_hold.is_none());
+            }
+            assert!(
+                overlay
+                    .egui_ctx
+                    .read_response(egui::Id::new(id))
+                    .unwrap()
+                    .enabled()
+            );
+            let outside = egui::pos2(-200.0, -200.0);
+            pointer(&mut overlay, outside);
+            button(&mut overlay, outside, false);
+            assert_eq!(steps(&draw(&mut overlay), direction), 0);
+            assert!(overlay.frame_step_hold.is_none());
+            pointer(&mut overlay, pos);
+            draw(&mut overlay);
+            button(&mut overlay, pos, true);
+            assert_eq!(
+                steps(&draw(&mut overlay), direction),
+                1,
+                "fresh normal press still starts"
+            );
+            overlay.frame_step_hold.as_mut().unwrap().last_step_at -= Duration::from_millis(200);
+            assert_eq!(
+                steps(&draw(&mut overlay), direction),
+                1,
+                "existing hold still repeats"
+            );
+            pointer(&mut overlay, outside);
+            button(&mut overlay, outside, false);
+            assert_eq!(steps(&draw(&mut overlay), direction), 0);
+            assert!(overlay.frame_step_hold.is_none());
+        }
+    }
+
+    #[test]
+    fn native_tracks_hud_frame_hold_cancel_before_release_needs_fresh_press() {
+        frame_hold_scan_end_before_release(true);
+    }
+
+    #[test]
+    fn native_tracks_hud_frame_hold_completion_before_release_needs_fresh_press() {
+        frame_hold_scan_end_before_release(false);
+    }
+
     #[test]
     fn native_tracks_hud_disabled_frame_button_cannot_resume_a_hold() {
         let (mut overlay, _) = fixture(false);

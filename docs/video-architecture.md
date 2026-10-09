@@ -3904,3 +3904,39 @@ glyph lint（危険glyph 0）、通常 / portable core checkも成功。起動�
 検出されず、`build-dev.ps1 -PreserveRuntime`はexit 0でcore・remote service・EPUB PDF workerを
 生成した。製品の起動・実機操作・commitは行っていない。今回のレビュー修正の実機確認は利用者へ
 引き継ぐ。検証ログのprefixは`target/E-tracks-fix-`、英語commit文は`target/E-tracks-fix-msg.txt`。
+
+#### release前に測定が終了する場合のhold再生成防止（2026-10-09）
+
+Scanningでholdを終了しても、eguiの`potential_click_id`はdisabled化だけでは消えない。
+release前に測定が取り消される / 完了すると、再有効化されたボタンの
+`is_pointer_button_down_on()`は古い押下に対してもtrueとなる。この値だけで新しいholdを
+作ることが原因だった。`draw_native_frame_step_button`のowner開始は、enabledなボタン上の
+**そのframeのprimary press**に限定する。既存の同方向holdはprimary downの間だけ継続し、
+viewport外releaseで終了する。Scanning開始時の終了・disabled時の新規 / 継続発行禁止、
+100ms反復、既存galley cacheはそのまま維持する。状態fieldやegui memoryのresetは追加しない。
+
+実CPU HUDを使い、前 / 次フレームの両方向で通常押下 → Scanning → release前の取消 / 完了
+snapshot採用 → primary downのまま通常HUD復帰 → 外側release → 新規押下 → hold反復を検査する。
+取消側はnative Esc入力も通し、Appが所有する取消の応答を既存setterで適用する。
+CPU fixtureがAppの取消handlerを実行したとは扱わない。Escの実ownerは
+`src/app/native_video.rs`の`NativeVideoFixedKeyAction::CancelNormalizeScan`で、変更しない。
+取消 / 完了とも、通常HUD復帰後の古い押下からFrameStepが出る修正前のredを確認する。
+
+同じHUDのpress-and-hold経路も確認した。down状態だけから反復ownerを作るのはnativeの
+フレーム送りだけで、音楽HUDに同型の反復holdはない。native / 音楽の音量は共有helperの
+`clicked()` / `dragged()` / `drag_stopped()`、音楽seekは`clicked()` / `dragged()`、
+native seek行 / seek stripのgesture開始は`drag_started()`を使う。これらのdrag寿命を
+今回の新規hold開始契約へ変更したり、Scanning後の全drag継続を新たに保証したりはしない。
+その他の再生・項目移動・loop・markerボタンはクリックによる単発操作であり、同型の
+timer hold再生成はない。描画・配置・HUDの表示先判定・キー反復ownerは変更しない。
+
+検証（2026-10-09、HEAD 5b3c509f1に対する未commit差分）: 修正前は取消 / 完了の2件が
+古い押下からFrameStepを再発行してred（exit 101）。修正後は焦点14件、既存測定入力13件、
+音楽HUD9件が成功し、全libは初回で11,000件成功 / 52 ignored（934.10秒、exit 0）。
+ui_snapshotは直列で123件成功し、既存PNGと一致した。cargo fmt / fmt --check、glyph lint
+（危険glyph 0）、通常 / portable core checkも成功。検証ログのprefixは
+`target/E-tracks-fix2-`、英語commit文は`target/E-tracks-fix2-msg.txt`。
+起動中のこのworktreeのcoreは検出されず、`build-dev.ps1 -PreserveRuntime`はexit 0で
+通常profileのcore・remote service・EPUB PDF workerを生成した。製品起動・実機操作・commitは
+行っていない。実機では測定がrelease前に終了してもフレーム送りが再開せず、新しい押下で
+通常の反復が戻ることを利用者が確認する。
