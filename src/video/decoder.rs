@@ -10915,10 +10915,13 @@ mod audio_track_fixture_tests {
                 std::time::Instant::now() < deadline,
                 "new-serial PCM missing after failed seek"
             );
-            let frame = handles
-                .audio_rx
-                .recv_timeout(Duration::from_millis(250))
-                .unwrap();
+            let frame = match handles.audio_rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(frame) => frame,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    panic!("audio decoder disconnected after failed seek")
+                }
+            };
             if frame.seek_serial == 1 {
                 break frame;
             }

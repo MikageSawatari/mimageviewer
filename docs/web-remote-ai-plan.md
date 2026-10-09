@@ -28,6 +28,11 @@ PC 優先 preemption、tile 境界での協調取消し、remote job の最初�
 同じ誤りを繰り返さないため、設計レビューでは最初に
 「リモート接続中は PC がモーダルで停止している」を確認する。
 
+2026-10-08 補足: このmodalは新しいPC入力の排他であり、既存のbackground cache削除を停止しない。
+管理画面を閉じた後も削除は続くため、Remote AIの受付証明をsource callback・PDF原本検証/countまで
+渡し、削除完了後の新catalog世代を下位で取り直さない。
+[受付証明とRemote全入口監査](audio-album-art-plan.md#21-921f1e457-再レビュー-remoteの受付証明とcacheonly継続-2026-10-08)を参照。
+
 ### 1.2 ただし接続取得時の残存ローカル AI はある
 
 現在の `pause_local_progress_for_remote_session()` が止めるのは media、slideshow、

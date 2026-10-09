@@ -383,7 +383,9 @@ fn mouse_button_action_blocked_by_edit_mode(edit_mode_active: bool, action: &Rin
     edit_mode_active
         && matches!(
             action,
-            RingActionId::CloseMainWindow | RingActionId::QuitApplication
+            RingActionId::CloseMainWindow
+                | RingActionId::QuitApplication
+                | RingActionId::ImageFitModeCycle
         )
 }
 
@@ -5933,6 +5935,10 @@ impl App {
                 self.apply_ring_pin_representative_thumb(ctx, context);
                 None
             }
+            RingActionId::GridOrganizeFiles if context == RingShortcutContext::Grid => {
+                self.request_file_organize_dialog(None);
+                None
+            }
             RingActionId::OpenPreferences if context == RingShortcutContext::Grid => {
                 self.show_preferences = true;
                 None
@@ -6192,6 +6198,12 @@ impl App {
                 } else {
                     "[ピクセルグリッド OFF]".to_string()
                 });
+                None
+            }
+            RingActionId::ImageFitModeCycle if context == RingShortcutContext::ImageFullscreen => {
+                if let Some(fs_idx) = self.fullscreen_idx {
+                    self.cycle_fullscreen_fit_mode(ctx, fs_idx);
+                }
                 None
             }
             RingActionId::ImageBackgroundCycle
@@ -9415,6 +9427,419 @@ mod tests {
             let group = post_filter_group_index(filter);
             let item = post_filter_item_index_in_group(filter, group);
             assert_eq!(POST_FILTER_GROUPS[group].filters[item], filter);
+        }
+    }
+}
+
+#[cfg(test)]
+mod next_input_tests {
+    use super::*;
+    use crate::grid_item::GridItem;
+    use crate::settings::{FullscreenFitMode, ReadingFlow};
+    use crate::ui_dialogs::file_organize::FileOrganizeRequest;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Route {
+        Ring,
+        Gesture,
+        Back,
+        Forward,
+        Middle,
+        PadRing,
+    }
+
+    const ROUTES: [Route; 6] = [
+        Route::Ring,
+        Route::Gesture,
+        Route::Back,
+        Route::Forward,
+        Route::Middle,
+        Route::PadRing,
+    ];
+
+    fn action(id: &str) -> RingActionId {
+        serde_json::from_value(serde_json::Value::String(id.to_owned())).unwrap()
+    }
+
+    fn dispatch(
+        app: &mut App,
+        ctx: &egui::Context,
+        context: RingShortcutContext,
+        route: Route,
+        action: RingActionId,
+    ) {
+        let direction = RingDirection::Up;
+        app.settings.ring_shortcuts.profile_mut(context).slots[direction.slot_index()] =
+            action.clone();
+        match route {
+            Route::Ring => {
+                app.trigger_ring_shortcut_action(ctx, context, direction, "mouse-ring");
+            }
+            Route::PadRing => {
+                let now = Instant::now();
+                app.gamepad_state
+                    .set_button_down(PadButton::West, true, now);
+                app.gamepad_state.mark_west_ring_direction(direction);
+                app.gamepad_state
+                    .set_button_down(PadButton::West, false, now);
+                app.finish_gamepad_west_release(ctx);
+            }
+            Route::Gesture => {
+                let drag_context = match context {
+                    RingShortcutContext::Grid => RightDragContext::Grid,
+                    RingShortcutContext::ImageFullscreen => RightDragContext::ImageFullscreen,
+                    RingShortcutContext::VideoFullscreen => RightDragContext::VideoFullscreen,
+                };
+                app.settings
+                    .ring_shortcuts
+                    .mouse_gesture_profile_mut(drag_context)
+                    .bindings = vec![crate::ring_shortcut::MouseGestureBinding::new(
+                    vec![crate::ring_shortcut::MouseGestureDirection::Up],
+                    action,
+                )];
+                app.trigger_mouse_gesture_action(
+                    ctx,
+                    drag_context,
+                    &[crate::ring_shortcut::MouseGestureDirection::Up],
+                );
+            }
+            Route::Back | Route::Forward | Route::Middle => {
+                let slot = match route {
+                    Route::Back => MouseButtonSlot::Back,
+                    Route::Forward => MouseButtonSlot::Forward,
+                    _ => MouseButtonSlot::Middle,
+                };
+                let profile = app
+                    .settings
+                    .ring_shortcuts
+                    .mouse_button_profile_mut(context);
+                match slot {
+                    MouseButtonSlot::Back => profile.back = action,
+                    MouseButtonSlot::Forward => profile.forward = action,
+                    MouseButtonSlot::Middle => profile.middle = action,
+                }
+                app.apply_mouse_button(
+                    ctx,
+                    slot,
+                    match context {
+                        RingShortcutContext::Grid => crate::app::ActionSurface::MainWindow,
+                        _ => crate::app::ActionSurface::Viewer,
+                    },
+                    "test-mouse-button",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn next_input_organize_routes_open_only_the_existing_picker() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let paths = [
+            app.tmp.path().join("first.jpg"),
+            app.tmp.path().join("second.jpg"),
+        ];
+        app.items = paths.iter().cloned().map(GridItem::Image).collect();
+        app.visible_indices = vec![1, 0];
+        app.selected = Some(0);
+        app.checked.extend([0, 1]);
+        for details in [false, true] {
+            app.settings.grid_view_mode = if details {
+                crate::settings::GridViewMode::Details
+            } else {
+                crate::settings::GridViewMode::Thumbnail
+            };
+            for route in ROUTES {
+                app.file_organize_request = FileOrganizeRequest::Hidden;
+                dispatch(
+                    &mut app,
+                    &ctx,
+                    RingShortcutContext::Grid,
+                    route,
+                    action("grid_organize_files"),
+                );
+                let FileOrganizeRequest::Selecting(selection) = &app.file_organize_request else {
+                    panic!("{route:?} must open the destination picker");
+                };
+                assert_eq!(selection.sources, vec![paths[1].clone(), paths[0].clone()]);
+                assert_eq!(selection.focus, None, "no move/copy operation is selected");
+                assert_eq!(app.selected, Some(0));
+                assert_eq!(app.checked.len(), 2);
+            }
+        }
+    }
+
+    fn dispatch_fit_cycle(app: &mut App, ctx: &egui::Context, route: Option<Route>) {
+        if let Some(route) = route {
+            dispatch(
+                app,
+                ctx,
+                RingShortcutContext::ImageFullscreen,
+                route,
+                action("image_fit_mode_cycle"),
+            );
+        } else {
+            #[cfg(windows)]
+            crate::key_input::set_test_frame(vec![crate::key_input::KeyEdge {
+                source_hwnd: 1,
+                source_viewport: egui::ViewportId::ROOT,
+                virtual_key: 0x30,
+                scan_code: 0x0b,
+                extended: false,
+                pressed: true,
+                repeat: false,
+                ctrl: false,
+                shift: false,
+                alt: false,
+            }]);
+            ctx.begin_pass(egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Num0,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            });
+            let _ = app.handle_fs_key_input(ctx, 0, false);
+            let _ = ctx.end_pass();
+            #[cfg(windows)]
+            crate::key_input::set_test_frame(Vec::new());
+        }
+    }
+
+    #[test]
+    fn fit_cycle_subset_all_input_routes_use_the_same_owner() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        app.items = vec![GridItem::Image(app.tmp.path().join("page.jpg"))];
+        app.fullscreen_idx = Some(0);
+        app.note_input_surface(crate::app::ActionSurface::Viewer);
+        for flow in [
+            ReadingFlow::Paged,
+            ReadingFlow::Vertical,
+            ReadingFlow::Horizontal,
+        ] {
+            app.reading_flow = flow;
+            for (excluded, start, expected) in [
+                (
+                    vec!["Width", "Height"],
+                    FullscreenFitMode::Page,
+                    vec![FullscreenFitMode::Original, FullscreenFitMode::Page],
+                ),
+                (
+                    vec!["Width", "Height"],
+                    FullscreenFitMode::Width,
+                    vec![FullscreenFitMode::Page, FullscreenFitMode::Original],
+                ),
+                (
+                    vec!["Page", "Width", "Height"],
+                    FullscreenFitMode::Page,
+                    vec![FullscreenFitMode::Original, FullscreenFitMode::Original],
+                ),
+                (
+                    vec!["Page", "Width", "Height"],
+                    FullscreenFitMode::Original,
+                    vec![FullscreenFitMode::Original, FullscreenFitMode::Original],
+                ),
+            ] {
+                for route in ROUTES.into_iter().map(Some).chain(std::iter::once(None)) {
+                    let mut saved = serde_json::to_value(&app.settings).unwrap();
+                    saved["fullscreen_fit_cycle_excluded"] = serde_json::json!(excluded);
+                    app.settings = serde_json::from_value(saved).unwrap();
+                    app.settings.fullscreen_fit_mode = start;
+                    for &mode in &expected {
+                        dispatch_fit_cycle(&mut app, &ctx, route);
+                        assert_eq!(
+                            app.settings.fullscreen_fit_mode, mode,
+                            "{route:?}, {flow:?}, {excluded:?}"
+                        );
+                    }
+                    // A direct picker choice must remain available even when excluded from cycling.
+                    app.set_fullscreen_fit_mode_for_current(&ctx, 0, FullscreenFitMode::Width);
+                    assert_eq!(app.settings.fullscreen_fit_mode, FullscreenFitMode::Width);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn next_input_fit_routes_share_the_key_cycle_for_all_reading_flows() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        app.items = vec![GridItem::Image(app.tmp.path().join("page.jpg"))];
+        app.fullscreen_idx = Some(0);
+        app.note_input_surface(crate::app::ActionSurface::Viewer);
+        for flow in [
+            ReadingFlow::Paged,
+            ReadingFlow::Vertical,
+            ReadingFlow::Horizontal,
+        ] {
+            app.reading_flow = flow;
+            for route in ROUTES {
+                app.settings.fullscreen_fit_mode = FullscreenFitMode::Page;
+                for expected in [
+                    FullscreenFitMode::Width,
+                    FullscreenFitMode::Height,
+                    FullscreenFitMode::Original,
+                    FullscreenFitMode::Page,
+                ] {
+                    dispatch(
+                        &mut app,
+                        &ctx,
+                        RingShortcutContext::ImageFullscreen,
+                        route,
+                        action("image_fit_mode_cycle"),
+                    );
+                    assert_eq!(
+                        app.settings.fullscreen_fit_mode, expected,
+                        "{route:?}, {flow:?}"
+                    );
+                    assert!(matches!(
+                        app.file_organize_request,
+                        FileOrganizeRequest::Hidden
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn next_input_fit_routes_preserve_edit_mode_ownership() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        app.items = vec![GridItem::Image(app.tmp.path().join("page.jpg"))];
+        app.fullscreen_idx = Some(0);
+        for enter in [
+            |app: &mut App| app.erase_mode = true,
+            |app: &mut App| app.conceal_mode = true,
+            |app: &mut App| app.local_adjust_mode = true,
+            |app: &mut App| app.export_crop_mode = true,
+            |app: &mut App| app.text_mode = true,
+            |app: &mut App| {
+                app.sns_split = Some(crate::sns_split::SnsSplitLayout::centered_max(
+                    crate::sns_split::SnsTarget::X,
+                    2,
+                    [2400, 1600],
+                ))
+            },
+        ] {
+            enter(&mut app);
+            app.settings.fullscreen_fit_mode = FullscreenFitMode::Page;
+            for route in ROUTES {
+                dispatch(
+                    &mut app,
+                    &ctx,
+                    RingShortcutContext::ImageFullscreen,
+                    route,
+                    action("image_fit_mode_cycle"),
+                );
+                assert_eq!(app.settings.fullscreen_fit_mode, FullscreenFitMode::Page);
+            }
+            app.execute_right_drag_command(
+                &ctx,
+                RightDragCommand::MouseGesture {
+                    context: RightDragContext::EditMode,
+                    action: action("image_fit_mode_cycle"),
+                    pattern_label: "↑".to_owned(),
+                    show_result_toast: false,
+                },
+            );
+            assert_eq!(app.settings.fullscreen_fit_mode, FullscreenFitMode::Page);
+            app.erase_mode = false;
+            app.conceal_mode = false;
+            app.local_adjust_mode = false;
+            app.export_crop_mode = false;
+            app.text_mode = false;
+            app.sns_split = None;
+        }
+    }
+
+    #[test]
+    fn next_input_fit_routes_support_zip_and_pdf_pages() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        for item in [
+            GridItem::ZipImage {
+                zip_path: app.tmp.path().join("book.zip"),
+                entry_name: "page.jpg".to_owned(),
+            },
+            GridItem::PdfPage {
+                pdf_path: app.tmp.path().join("book.pdf"),
+                page_num: 0,
+                content_type: None,
+            },
+        ] {
+            app.items = vec![item];
+            app.fullscreen_idx = Some(0);
+            for route in ROUTES {
+                app.settings.fullscreen_fit_mode = FullscreenFitMode::Page;
+                app.fs_zoom = 2.0;
+                app.fs_pan = egui::vec2(10.0, 20.0);
+                dispatch(
+                    &mut app,
+                    &ctx,
+                    RingShortcutContext::ImageFullscreen,
+                    route,
+                    action("image_fit_mode_cycle"),
+                );
+                assert_eq!(app.settings.fullscreen_fit_mode, FullscreenFitMode::Width);
+                assert_eq!(app.fs_zoom, 1.0);
+                assert_eq!(app.fs_pan, egui::Vec2::ZERO);
+                assert_eq!(app.fullscreen_idx, Some(0));
+            }
+        }
+    }
+
+    #[test]
+    fn next_input_routes_reject_wrong_context_and_video_audio_fit() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        for item in [
+            GridItem::Video(app.tmp.path().join("video.mp4")),
+            GridItem::Image(app.tmp.path().join("page.jpg")),
+        ] {
+            app.items = vec![item];
+            app.fullscreen_idx = Some(0);
+            app.note_input_surface(crate::app::ActionSurface::Viewer);
+            for route in ROUTES {
+                let context = app.current_ring_shortcut_context();
+                dispatch(
+                    &mut app,
+                    &ctx,
+                    context,
+                    route,
+                    action("grid_organize_files"),
+                );
+                assert!(matches!(
+                    app.file_organize_request,
+                    FileOrganizeRequest::Hidden
+                ));
+            }
+        }
+        app.items = vec![GridItem::Video(app.tmp.path().join("video.mp4"))];
+        for audio in [false, true] {
+            app.video_audio_mode = audio.then_some(0);
+            for route in ROUTES {
+                app.settings.fullscreen_fit_mode = FullscreenFitMode::Page;
+                dispatch(
+                    &mut app,
+                    &ctx,
+                    RingShortcutContext::VideoFullscreen,
+                    route,
+                    action("image_fit_mode_cycle"),
+                );
+                assert_eq!(app.settings.fullscreen_fit_mode, FullscreenFitMode::Page);
+                // Even a stale image-context command must never change video fit.
+                app.apply_ring_action(
+                    &ctx,
+                    RingShortcutContext::ImageFullscreen,
+                    action("image_fit_mode_cycle"),
+                    "test-stale-context",
+                );
+                assert_eq!(app.settings.fullscreen_fit_mode, FullscreenFitMode::Page);
+            }
         }
     }
 }

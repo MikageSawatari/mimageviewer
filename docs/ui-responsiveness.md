@@ -265,16 +265,21 @@ DB / decode / raster / compose の長さと分けて追跡する。
 
 ### 2.1.1 外部受け渡し実体化 worker
 
-外部ツールへ ZIP / PDF page や加工済み画像を渡す P3 materializer も同じ境界を使う。
-UI は対象、payload policy、ページ key、補正の軽量 snapshot、items generation だけを要求へ詰め、
-ファイル metadata、補正 DB の read-only open / SELECT、ZIP read、decode、合成、encode、外部起動は
-`external-tool-materialize` worker に閉じる。UI は atomic progress と completion channel を poll し、
-cancel、新要求、対象移動では token / materializer generation を進めて古い結果を起動境界へ通さない。
-worker は実体化後、UI が同じ frame の進捗 modal の Cancel / Esc と、その後の items mutation を
-先に処理し、frame tail で items generation と起動元 viewer target を再検証して launch ACK を
-返すまで待つ。進捗表示後に積まれた新要求は次 frame の UI checkpoint まで ACK しない。
-ACK 後はキャンセル操作を表示しない。
-この handshake により、navigation が completion poll より先に起きても古い対象を spawn / Invoke しない。
+外部ツールへ ZIP / PDF page や加工済み画像を渡す materializer も同じ境界を使う。
+§1.329 の対象列挙・Stack 展開・ページ編集 snapshot は UI から読むため、単一の Preparing owner が
+1 frame 最大 128 entry / 経過 2ms の cursor に分割する。modal を全件構築より先に開始し、
+一覧 index / 所有 context / items generation / typed source identity を保つ。RealFile のページ探索を
+せず、旧内部入口の source map も一度だけ分割して作る。LUT / AI 材料などの不変 snapshot は
+要求内で共有し、各対象から一覧全走査や巨大 clone を繰り返さない。単一対象の予算超過は perf で検出する。
+準備中は所有 context の mutation / close と明示 cancel / supersede で破棄し、別 context を巻き込まない。
+具体的 source の確定後はナビ移動で取消さず、明示 cancel / 新要求 / 終了の既存 generation 契約を維持する。
+ファイル metadata、補正 DB の read-only open / SELECT、ZIP read、decode、合成、encode、リストの
+検証・作成・行単位書込み・flush / close、外部起動は `external-tool-materialize` worker に閉じる。
+元動画だけを渡す場合もリスト API が directory 初期化を worker で済ませ、UI で I/O を行わない。
+UI は atomic progress と completion channel を poll する。worker は実体化後、UI が同じ frame の
+進捗 modal の Cancel / Esc を先に処理し、frame tail で materializer generation を検証して
+launch ACK を返すまで待つ。進捗表示後に積まれた新要求は次 frame の checkpoint まで ACK しない。
+ACK 後はキャンセル操作を表示しない。準備 cursor と worker の待ちを UI の sleep / try_lock で代用しない。
 一時 directory の起動時孤児回収と終了時削除も専用 worker で行い、UI から `read_dir` / 再帰削除を呼ばない。
 
 ### 2.1.2 AI runtime 初期化 owner

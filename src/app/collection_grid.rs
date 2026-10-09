@@ -421,7 +421,7 @@ pub(in crate::app) fn prepare_collection_grid_install(
         .entries
         .iter()
         .filter_map(|entry| match &entry.item {
-            GridItem::Video(path) => Some(path.clone()),
+            GridItem::Video(path) | GridItem::Audio(path) => Some(path.clone()),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -3377,6 +3377,10 @@ impl App {
         } else {
             None
         };
+        let old_search_submission = self
+            .search_filter
+            .as_ref()
+            .map(|filter| filter.submitted.clone());
         let old_search_query = old_binding_is_current.then(|| self.search_query.clone());
         let old_search_origin = old_binding_is_current
             .then(|| self.search_filter_origin_folder.clone())
@@ -3443,8 +3447,8 @@ impl App {
             self.search_filter_origin_folder = old_search_origin;
         }
         if let Some(anchors) = old_search_anchors {
-            self.search_filter = Some(
-                anchors
+            self.search_filter = Some(super::LocalSearchFilter {
+                matches: anchors
                     .iter()
                     .filter_map(|anchor| {
                         prepared
@@ -3459,7 +3463,9 @@ impl App {
                             })
                     })
                     .collect(),
-            );
+                submitted: old_search_submission
+                    .expect("search anchors carry their submitted conditions"),
+            });
             self.rebuild_visible_indices();
         }
         self.address = format!("コレクション: {}", prepared.collection_name);
@@ -3572,12 +3578,7 @@ impl App {
     ) {
         let auto_aspect_eligible_total = items
             .iter()
-            .filter(|item| {
-                !matches!(
-                    item,
-                    GridItem::CollectionPlaceholder { .. } | GridItem::Audio(_)
-                )
-            })
+            .filter(|item| !matches!(item, GridItem::CollectionPlaceholder { .. }))
             .count();
         self.install_collection_grid_items_with_thumbnail_sources(
             items,
@@ -6089,14 +6090,14 @@ mod tests {
         assert_eq!(app.auto_aspect.current, None);
         wait_for_grid(&mut app, created.collection_id());
         assert_eq!(app.auto_aspect.current, Some(ThumbAspect::Landscape16x9));
-        assert_eq!(app.auto_aspect_eligible_total(), 1);
+        assert_eq!(app.auto_aspect_eligible_total(), 2);
         let installed = app
             .top_level_grid_view
             .collection_session()
             .and_then(CollectionGridSession::installed_presentation)
             .unwrap()
             .clone();
-        assert_eq!(installed.prepared.auto_aspect_eligible_total, 1);
+        assert_eq!(installed.prepared.auto_aspect_eligible_total, 2);
         let original_generation = app.items_generation;
         app.items_generation = app.items_generation.wrapping_add(1);
         assert_eq!(
@@ -6152,7 +6153,7 @@ mod tests {
             .collection_session_mut()
             .unwrap()
             .load = CollectionGridLoadState::Ready(installed);
-        assert_eq!(app.auto_aspect_eligible_total(), 1);
+        assert_eq!(app.auto_aspect_eligible_total(), 2);
         assert!(matches!(app.auto_aspect_cache_target(),
             Some(super::super::AutoAspectCacheTarget::CollectionRoot(id)) if id == created.collection_id()));
 
@@ -6823,7 +6824,9 @@ mod tests {
             Some(temp.path())
         );
         assert_eq!(
-            app.search_filter,
+            app.search_filter
+                .as_ref()
+                .map(|filter| filter.matches.clone()),
             Some(
                 [reordered
                     .entries

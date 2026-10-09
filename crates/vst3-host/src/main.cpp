@@ -964,7 +964,8 @@ private:
             const uint64_t id = extract_number_field(msg, "request_id");
             const uint64_t slot = extract_number_field(msg, "slot_id");
             const bool visible = extract_number_field(msg, "visible") != 0;
-            const GuiGateSnapshot permit {extract_number_field(msg, "minimized_sequence"), extract_number_field(msg, "remote_token")};
+            const GuiGateSnapshot permit {extract_number_field(msg, "minimized_sequence"), extract_number_field(msg, "remote_token"), 0,
+                                          extract_number_field(msg, "auto_video") != 0, extract_number_field(msg, "auto_revision")};
             auto reply = [id, slot](const char* outcome) {
                 write_message("{\"event\":\"gui_visibility_result\",\"request_id\":" + std::to_string(id) +
                               ",\"slot_id\":" + std::to_string(slot) + ",\"outcome\":\"" + outcome + "\"}");

@@ -10,6 +10,33 @@ use windows::Win32::System::Memory::{
 };
 use windows::core::HSTRING;
 
+const AUTO_BITS: u32 = 5;
+const AUTO_MASK: u64 = (1 << AUTO_BITS) - 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AutoSuppression {
+    SettingOff = 1,
+    RootHidden = 2,
+    Fullscreen = 4,
+    Minimized = 8,
+    RemoteBlocked = 16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AutoPresentationSnapshot {
+    pub revision: u64,
+    pub allowed: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AutoPresentationReader(Arc<GuiGate>);
+
+impl AutoPresentationReader {
+    pub(crate) fn snapshot(&self) -> AutoPresentationSnapshot {
+        self.0.auto_snapshot()
+    }
+}
+
 // Must match GuiGateState in the host. Both processes are x64 and use aligned,
 // lock-free 64-bit loads/stores; the mapping never contains a process pointer.
 #[repr(C)]
@@ -19,6 +46,7 @@ struct GateState {
     minimized_sequence: AtomicU64,
     remote: AtomicU64,
     keep_visible_when_minimized: AtomicU64,
+    auto_presentation: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -32,6 +60,10 @@ unsafe impl Send for GuiGate {}
 unsafe impl Sync for GuiGate {}
 
 impl GuiGate {
+    #[cfg(test)]
+    pub(crate) fn create_for_test() -> Arc<Self> {
+        Self::create(None).expect("test presentation gate")
+    }
     pub(super) fn create(
         notify: Option<std::sync::mpsc::Sender<super::HostCommand>>,
     ) -> Result<Arc<Self>, String> {
@@ -67,10 +99,15 @@ impl GuiGate {
         unsafe {
             view.Value.cast::<GateState>().write(GateState {
                 magic: 0x4d49_5647_4154_4501,
-                version: 2,
+                version: 3,
                 minimized_sequence: AtomicU64::new(0),
                 remote: AtomicU64::new(0),
                 keep_visible_when_minimized: AtomicU64::new(0),
+                // Canonical owners publish their initial facts before a player
+                // receives its read-only reader. Fail closed while unbound.
+                auto_presentation: AtomicU64::new(
+                    AutoSuppression::SettingOff as u64 | AutoSuppression::RootHidden as u64,
+                ),
             })
         };
         Ok(Arc::new(Self {
@@ -85,6 +122,47 @@ impl GuiGate {
     }
     pub(crate) fn name(&self) -> &str {
         &self.name
+    }
+    pub(crate) fn auto_reader(self: &Arc<Self>) -> AutoPresentationReader {
+        AutoPresentationReader(Arc::clone(self))
+    }
+    pub(crate) fn auto_snapshot(&self) -> AutoPresentationSnapshot {
+        let value = self.state().auto_presentation.load(Ordering::Acquire);
+        AutoPresentationSnapshot {
+            revision: value >> AUTO_BITS,
+            allowed: value & AUTO_MASK == 0,
+        }
+    }
+    pub(crate) fn set_auto_factor(&self, factor: AutoSuppression, blocked: bool) {
+        self.update_auto_factor(factor, blocked, false);
+    }
+    pub(crate) fn invalidate_auto(&self) {
+        let _ = self.state().auto_presentation.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |value| Some(value + (1 << AUTO_BITS)),
+        );
+    }
+    fn update_auto_factor(&self, factor: AutoSuppression, blocked: bool, force: bool) {
+        let atomic = &self.state().auto_presentation;
+        let bit = factor as u64;
+        let mut previous = atomic.load(Ordering::Acquire);
+        loop {
+            let bits = if blocked {
+                previous | bit
+            } else {
+                previous & !bit
+            } & AUTO_MASK;
+            if !force && bits == previous & AUTO_MASK {
+                return;
+            }
+            let next = ((previous >> AUTO_BITS) + 1) << AUTO_BITS | bits;
+            match atomic.compare_exchange_weak(previous, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return,
+                Err(actual) => previous = actual,
+            }
+        }
     }
     pub(crate) fn minimized_sequence(&self) -> u64 {
         self.state().minimized_sequence.load(Ordering::Acquire)
@@ -108,15 +186,24 @@ impl GuiGate {
             != 0
     }
     pub(crate) fn note_minimized(&self) {
+        self.update_auto_factor(AutoSuppression::Minimized, true, true);
         self.state()
             .minimized_sequence
             .fetch_add(1, Ordering::AcqRel);
     }
-    #[cfg(test)]
     pub(crate) fn remote(&self) -> u64 {
         self.state().remote.load(Ordering::Acquire)
     }
     pub(crate) fn publish_remote(&self, sequence: Option<u64>, blocks: bool) {
+        self.publish_remote_with_revision(sequence, blocks, false);
+    }
+    pub(crate) fn publish_remote_with_revision(
+        &self,
+        sequence: Option<u64>,
+        blocks: bool,
+        force: bool,
+    ) {
+        self.update_auto_factor(AutoSuppression::RemoteBlocked, blocks, force);
         self.state().remote.store(
             Self::remote_token(sequence) | u64::from(blocks),
             Ordering::Release,
@@ -143,9 +230,103 @@ impl Drop for GuiGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn eligible_gate() -> Arc<GuiGate> {
+        let gate = GuiGate::create_for_test();
+        gate.set_auto_factor(AutoSuppression::SettingOff, false);
+        gate.set_auto_factor(AutoSuppression::RootHidden, false);
+        gate
+    }
+
+    #[test]
+    fn auto_projection_invalidates_every_suppression_round_trip() {
+        for factor in [
+            AutoSuppression::SettingOff,
+            AutoSuppression::RootHidden,
+            AutoSuppression::Fullscreen,
+            AutoSuppression::Minimized,
+            AutoSuppression::RemoteBlocked,
+        ] {
+            let gate = eligible_gate();
+            let reader = gate.auto_reader();
+            let success = reader.snapshot();
+            assert!(success.allowed);
+            gate.set_auto_factor(factor, true);
+            assert!(!reader.snapshot().allowed);
+            gate.set_auto_factor(factor, false);
+            assert!(reader.snapshot().allowed);
+            assert_ne!(success, reader.snapshot());
+        }
+    }
+
+    #[test]
+    fn auto_projection_preserves_other_owners_and_forced_event_revisions() {
+        let gate = eligible_gate();
+        gate.set_auto_factor(AutoSuppression::Fullscreen, true);
+        gate.set_auto_factor(AutoSuppression::SettingOff, true);
+        gate.set_auto_factor(AutoSuppression::SettingOff, false);
+        assert!(!gate.auto_snapshot().allowed);
+        gate.set_auto_factor(AutoSuppression::Fullscreen, false);
+        let initial = gate.auto_snapshot();
+        gate.note_minimized();
+        let minimized = gate.auto_snapshot();
+        gate.note_minimized();
+        assert!(gate.auto_snapshot().revision > minimized.revision);
+        gate.set_auto_factor(AutoSuppression::Minimized, false);
+        gate.publish_remote_with_revision(Some(1), true, true);
+        let remote = gate.auto_snapshot();
+        gate.publish_remote_with_revision(Some(2), true, true);
+        assert!(gate.auto_snapshot().revision > remote.revision);
+        gate.publish_remote_with_revision(Some(2), false, false);
+        assert!(gate.auto_snapshot().allowed);
+        assert!(gate.auto_snapshot().revision > initial.revision);
+        let before = gate.auto_snapshot();
+        gate.invalidate_auto();
+        assert!(gate.auto_snapshot().allowed);
+        assert!(gate.auto_snapshot().revision > before.revision);
+    }
+
+    #[test]
+    fn concurrent_auto_owners_do_not_clear_each_others_suppression() {
+        let gate = eligible_gate();
+        let workers: Vec<_> = [
+            AutoSuppression::SettingOff,
+            AutoSuppression::RootHidden,
+            AutoSuppression::Fullscreen,
+            AutoSuppression::Minimized,
+            AutoSuppression::RemoteBlocked,
+        ]
+        .into_iter()
+        .map(|factor| {
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || {
+                for _ in 0..1000 {
+                    gate.set_auto_factor(factor, true);
+                    gate.set_auto_factor(factor, false);
+                }
+                gate.set_auto_factor(factor, true);
+            })
+        })
+        .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        for factor in [
+            AutoSuppression::SettingOff,
+            AutoSuppression::RootHidden,
+            AutoSuppression::Fullscreen,
+            AutoSuppression::Minimized,
+        ] {
+            gate.set_auto_factor(factor, false);
+            assert!(!gate.auto_snapshot().allowed);
+        }
+        gate.set_auto_factor(AutoSuppression::RemoteBlocked, false);
+        assert!(gate.auto_snapshot().allowed);
+    }
     #[test]
     fn source_epochs_survive_completed_suppression_intervals() {
-        assert_eq!(std::mem::size_of::<GateState>(), 40);
+        assert_eq!(std::mem::size_of::<GateState>(), 48);
+        assert_eq!(std::mem::offset_of!(GateState, auto_presentation), 40);
         assert_eq!(
             std::mem::offset_of!(GateState, keep_visible_when_minimized),
             32
@@ -169,7 +350,7 @@ mod tests {
     fn minimize_policy_notifies_only_changes_and_preserves_permit_epochs() {
         let (tx, rx) = std::sync::mpsc::channel();
         let gate = GuiGate::create(Some(tx)).unwrap();
-        assert_eq!(gate.state().version, 2);
+        assert_eq!(gate.state().version, 3);
         assert!(!gate.keep_visible_when_minimized());
         gate.publish_remote(Some(3), true);
         let _ = rx.try_recv().unwrap();

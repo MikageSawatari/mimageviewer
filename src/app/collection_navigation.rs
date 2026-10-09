@@ -378,6 +378,7 @@ enum CollectionNavigationPreflightPayload {
     PdfOpenFailure(super::PdfOpenFailure),
     ConvertibleArchive(crate::archive_converter::ArchiveImageSummary),
     ConvertiblePasswordRequired,
+    RarOpen,
 }
 
 /// Offscreen physical destination probe shared by Collection child replay, Rating child replay,
@@ -394,6 +395,7 @@ pub(crate) enum PhysicalHistoryPreflightPayload {
     PdfOpenFailure(super::PdfOpenFailure),
     ConvertibleArchive(crate::archive_converter::ArchiveImageSummary),
     ConvertiblePasswordRequired,
+    RarOpen,
 }
 
 pub(crate) enum PhysicalHistoryPreflightPoll {
@@ -1009,6 +1011,15 @@ fn preflight_candidates(
                         .and_then(|extension| extension.to_str())
                         .and_then(crate::archive_converter::ArchiveFormat::from_extension);
                     format.and_then(|format| {
+                        // Keep empty/invalid candidate skipping for first/single archives, but
+                        // leave later-volume refusal to the shared scan without reading entries.
+                        if format == crate::archive_converter::ArchiveFormat::Rar
+                            && crate::rar_loader::resolved_volume_path(path).is_ok_and(
+                                |(_, kind)| kind == crate::rar_loader::RarVolumeKind::Subsequent,
+                            )
+                        {
+                            return Some(CollectionNavigationPreflightPayload::RarOpen);
+                        }
                         match crate::archive_converter::scan_summary_with_password_cancelable(
                             path, format, None, cancel,
                         ) {
@@ -1189,8 +1200,10 @@ impl App {
                         CollectionResolvedKind::Zip => {
                             // A ZIP with converted nested archives can have a cached ZIP backing.
                             // Keep DB and filesystem work off the UI thread; if the cache became
-                            // unreadable, the original ZIP remains a valid destination.
+                            // unreadable, the original ZIP remains a valid destination. A native
+                            // RAR backing already passed the shared Direct/cache decision.
                             if use_archive_cache
+                                && !crate::rar_loader::is_rar_path(&path)
                                 && let Some(db) = archive_cache_db.as_ref()
                                 && let Ok(metadata) = std::fs::metadata(&path)
                                 && let Some(backing_path) = db.lookup_with_visibility(
@@ -1247,6 +1260,8 @@ impl App {
                             }
                         }
                         CollectionResolvedKind::ConvertibleArchive => {
+                            // RAR source selection belongs to the shared scan worker, including
+                            // a first-volume cache hit. Preparation must not bypass Direct-first.
                             let extension = path
                                 .extension()
                                 .and_then(|value| value.to_str())
@@ -1255,6 +1270,11 @@ impl App {
                             let format =
                                 crate::archive_converter::ArchiveFormat::from_extension(&extension)
                                     .ok_or_else(|| "対応していない書庫です".to_string())?;
+                            // RAR content/cache decisions (including later-volume refusal) have
+                            // one owner. Do not scan entries during physical preparation.
+                            if format == crate::archive_converter::ArchiveFormat::Rar {
+                                return Ok(PhysicalHistoryPreflightPayload::RarOpen);
+                            }
                             // A valid converted backing is already the prepared destination.
                             // Check it on this worker before probing the original archive; a
                             // source may no longer be readable even though its stamped cache is.
@@ -3690,7 +3710,7 @@ impl App {
                 && let Some(super::FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
             {
                 player.seek(0.0);
-                player.set_playing(true);
+                player.set_playing_internal(true, crate::video::InternalContinuation::Loop);
             }
             return;
         }
@@ -3730,6 +3750,7 @@ impl App {
             ));
         }
         let payload_description = match &ready.payload {
+            CollectionNavigationPreflightPayload::RarOpen => "rar-open".into(),
             CollectionNavigationPreflightPayload::Media => "media".to_string(),
             CollectionNavigationPreflightPayload::Folder(scan) => format!(
                 "folder:{}",
@@ -3814,6 +3835,7 @@ impl App {
                 ready.payload,
                 CollectionNavigationPreflightPayload::PdfOpenFailure(_)
                     | CollectionNavigationPreflightPayload::ConvertibleArchive(_)
+                    | CollectionNavigationPreflightPayload::RarOpen
             )
         {
             let payload = match std::mem::replace(
@@ -3825,6 +3847,9 @@ impl App {
                 }
                 CollectionNavigationPreflightPayload::ConvertibleArchive(summary) => {
                     PhysicalHistoryPreflightPayload::ConvertibleArchive(summary)
+                }
+                CollectionNavigationPreflightPayload::RarOpen => {
+                    PhysicalHistoryPreflightPayload::RarOpen
                 }
                 _ => unreachable!("typed failure/conversion transfer was checked"),
             };
@@ -6343,6 +6368,7 @@ mod tests {
                 crate::grid_item::ThumbnailState::Pending => "pending",
                 crate::grid_item::ThumbnailState::Loaded { .. } => "loaded",
                 crate::grid_item::ThumbnailState::Failed => "failed",
+                crate::grid_item::ThumbnailState::NoArt => "no-art",
                 crate::grid_item::ThumbnailState::Evicted => "evicted",
             })
             .collect()

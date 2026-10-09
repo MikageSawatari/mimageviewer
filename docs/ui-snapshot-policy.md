@@ -27,6 +27,18 @@ UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot
 更新後は `tests/snapshots/*.png` の差分を必ず目視確認してからコミットする。
 git diff のバイナリ比較では変化の意図 (改善なのか回帰なのか) は判断できない。
 
+詳細一覧の名前色 (§1.346) は `details_name_colors_*` と `details_name_color_settings_*` の
+Light／Dark × 標準／強い、計8枚を保持する。前者は六分類・長い日本語名・hover・選択・チェック・
+切り取り・選択情報バー・カスタム・OFF、後者は本体と共通の環境設定表・比・警告・強い固定色を描く。
+`cut_item_appearance_light/dark` は名前が不透明、他列とプレビューが薄い境界を合わせて確認する。
+名前色の追加8枚は合計1,157,523 bytes (約1.10 MiB)。一覧620×580、設定表760×800で全項目を収める。
+`preferences_favorite_view_state_dark` は同じページ全体を縦スクロールするため、名前色表を追加すると
+スクロールバーのつまみが短くなる。既存本文が変わらないことを差分画像で確認して期待画像を更新する。
+
+外部ツールの `{file_list}` (§1.329) は `external_tool_file_list_help_light/dark` と
+`external_tool_preparing_light/dark` の4枚を追加する。本体と同じ記法説明・準備中の件数・
+キャンセルボタンを描き、アプリの起動や外部プロセスの実起動は行わない。
+
 ## ディレクトリ構成
 
 ```

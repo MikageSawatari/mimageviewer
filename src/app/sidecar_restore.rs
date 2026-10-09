@@ -103,6 +103,9 @@ pub(super) enum FirstDisplayAction {
 
 pub(crate) struct SidecarLoadContinuation {
     pub(super) navigation_after_hydration: Option<super::MainListAfterHydration>,
+    /// Accepted folder maintenance travels with this continuation to its new worker queue.
+    /// Dropping a superseded continuation also drops the work and its catalog admission.
+    pub(super) audio_art_prune: Option<crate::thumb_loader::LoadRequest>,
     pub(super) first_display_action: FirstDisplayAction,
     pub(super) restore_intent: super::StartupListIntent,
     /// Initial geometry seed captured from the accepted list's session position.
@@ -853,6 +856,7 @@ impl App {
                 continuation: ContinuationOwner::Live(SidecarLoadContinuation {
                     first_display_action: FirstDisplayAction::None,
                     navigation_after_hydration: None,
+                    audio_art_prune: None,
                     auto_aspect_seed: None,
                     source_path: folder.clone(),
                     source_is_directory: true,
@@ -1106,6 +1110,23 @@ impl App {
                     .to_string(),
             );
             return Err(continuation);
+        }
+
+        // An empty non-import list has no identities or provenance to discover.
+        // Publish its policy immediately and use the existing display tail, so a
+        // loading shell remains navigable while its list producer is still running.
+        if self.items.is_empty() && !restore_sidecar {
+            let previous = std::mem::replace(
+                &mut self.page_identity_index,
+                Arc::new(super::file_type_resume::PreparedPageIdentityIndex::empty(
+                    self.settings.file_type_visibility.clone(),
+                )),
+            );
+            self.retire_smart_folder_payloads([
+                Box::new(previous) as smart_folder::RetiredSmartFolderPayload
+            ]);
+            self.resume_loading_items_after_sidecar(continuation);
+            return Ok(());
         }
 
         // The same accepted-list hydration owner prepares resume identities even when
@@ -3620,6 +3641,7 @@ mod tests {
         let now = std::time::Instant::now();
         let continuation = SidecarLoadContinuation {
             navigation_after_hydration: None,
+            audio_art_prune: None,
             first_display_action: FirstDisplayAction::None,
             restore_intent: crate::app::StartupListIntent::PreservePresentation,
             auto_aspect_seed: None,
@@ -3682,6 +3704,7 @@ mod tests {
         let continuation = SidecarLoadContinuation {
             first_display_action: FirstDisplayAction::None,
             navigation_after_hydration: None,
+            audio_art_prune: None,
             auto_aspect_seed: None,
             source_path: folder.clone(),
             source_is_directory: true,
@@ -3770,6 +3793,7 @@ mod tests {
                 SidecarLoadContinuation {
                     first_display_action: FirstDisplayAction::None,
                     navigation_after_hydration: None,
+                    audio_art_prune: None,
                     auto_aspect_seed: None,
                     source_path: folder.clone(),
                     source_is_directory: true,
@@ -4285,6 +4309,7 @@ mod tests {
         let mut owner = ContinuationOwner::Live(SidecarLoadContinuation {
             first_display_action: FirstDisplayAction::None,
             navigation_after_hydration: None,
+            audio_art_prune: None,
             auto_aspect_seed: None,
             source_path: PathBuf::from("C:/book"),
             source_is_directory: true,

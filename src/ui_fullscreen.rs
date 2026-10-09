@@ -6882,6 +6882,24 @@ fn music_panel_open_state_after_reach(
     }
 }
 
+// HUD drawing and widget hit areas share the original viewport, never the
+// right-panel-reserved music content rectangle. These are per-frame values.
+fn music_hud_rects(full_rect: egui::Rect) -> [egui::Rect; 2] {
+    [
+        egui::Rect::from_min_size(
+            full_rect.min,
+            egui::vec2(full_rect.width(), MUSIC_TOP_BAR_HEIGHT),
+        ),
+        egui::Rect::from_min_max(
+            egui::pos2(
+                full_rect.left(),
+                full_rect.bottom() - crate::ui_music_panels::MUSIC_HUD_HEIGHT,
+            ),
+            full_rect.max,
+        ),
+    ]
+}
+
 /// 音楽ビューの右パネルが占める帯 — `(確保幅, 右端, パネル幅)`。
 ///
 /// `reserved` は `fullscreen_media_rect` が `rect` から**実際に引いた**幅で、ロックして
@@ -16513,27 +16531,46 @@ pub fn draw_music_panel_reach_snapshot_fixture(
     left_panel_open: bool,
     right_panel_open: bool,
 ) {
+    draw_music_layout_snapshot_fixture(
+        ui,
+        touch_observed,
+        left_panel_open,
+        right_panel_open,
+        false,
+    );
+}
+
+/// Visual-only music layout fixture sharing production HUD and reserved-band geometry.
+#[doc(hidden)]
+pub fn draw_music_locked_panel_snapshot_fixture(ui: &mut egui::Ui) {
+    draw_music_layout_snapshot_fixture(ui, false, false, true, true);
+}
+
+fn draw_music_layout_snapshot_fixture(
+    ui: &mut egui::Ui,
+    touch_observed: bool,
+    left_panel_open: bool,
+    right_panel_open: bool,
+    right_panel_locked: bool,
+) {
     let full_rect = ui.max_rect();
+    let reserved = if right_panel_locked {
+        crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH.min(full_rect.width() * 0.5)
+    } else {
+        0.0
+    };
+    let content_rect =
+        egui::Rect::from_min_max(full_rect.min, full_rect.max - egui::vec2(reserved, 0.0));
     let painter = ui.painter();
     painter.rect_filled(full_rect, 0.0, crate::ui_music_timeline::MUSIC_VIEW_BG);
-    let top_rect = egui::Rect::from_min_size(
-        full_rect.min,
-        egui::vec2(full_rect.width(), MUSIC_TOP_BAR_HEIGHT),
-    );
-    let hud_rect = egui::Rect::from_min_max(
-        egui::pos2(
-            full_rect.left(),
-            full_rect.bottom() - crate::ui_music_panels::MUSIC_HUD_HEIGHT,
-        ),
-        full_rect.max,
-    );
+    let [top_rect, hud_rect] = music_hud_rects(full_rect);
     painter.rect_filled(top_rect, 0.0, egui::Color32::from_rgb(22, 25, 31));
     painter.rect_filled(hud_rect, 0.0, egui::Color32::from_rgb(22, 25, 31));
 
-    let margin = music_visualization_side_margin(full_rect.width());
+    let margin = music_visualization_side_margin(content_rect.width());
     let waveform_rect = egui::Rect::from_min_max(
-        egui::pos2(full_rect.left() + margin, top_rect.bottom() + 16.0),
-        egui::pos2(full_rect.right() - margin, hud_rect.top() - 16.0),
+        egui::pos2(content_rect.left() + margin, top_rect.bottom() + 16.0),
+        egui::pos2(content_rect.right() - margin, hud_rect.top() - 16.0),
     );
     painter.rect_filled(waveform_rect, 4.0, egui::Color32::from_rgb(8, 10, 14));
     let center_y = waveform_rect.center().y;
@@ -16558,6 +16595,21 @@ pub fn draw_music_panel_reach_snapshot_fixture(
             panel_rect.left_top() + egui::vec2(16.0, 16.0),
             egui::Align2::LEFT_TOP,
             "ブックマーク",
+            egui::FontId::proportional(18.0),
+            egui::Color32::WHITE,
+        );
+    }
+    if right_panel_locked {
+        let (_, right, width) = music_right_panel_band(content_rect, reserved);
+        let panel = egui::Rect::from_min_max(
+            egui::pos2(right - width, top_rect.bottom()),
+            egui::pos2(right, hud_rect.top()),
+        );
+        painter.rect_filled(panel, 0.0, egui::Color32::from_rgb(28, 28, 32));
+        painter.text(
+            panel.left_top() + egui::vec2(16.0, 16.0),
+            egui::Align2::LEFT_TOP,
+            "音楽情報",
             egui::FontId::proportional(18.0),
             egui::Color32::WHITE,
         );
@@ -17587,6 +17639,44 @@ impl App {
             return Self::detached_image_window_viewport_id(window_id);
         }
         egui::ViewportId::from_hash_of(("fullscreen_viewer", self.fs_viewport_generation))
+    }
+
+    /// Resolve only the destination bound to this projected viewer context.
+    pub(crate) fn viewer_chrome_surface(&self) -> crate::ui_helpers::ViewerChromeSurface {
+        use crate::ui_helpers::ViewerChromeSurface;
+        #[cfg(windows)]
+        {
+            if let Some(window_id) = self.detached_viewer_window_id() {
+                let borderless_applied = self
+                    .active_detached_session
+                    .is_some_and(|session| session.window_id == window_id)
+                    && self.detached_viewer_borderless_fullscreen;
+                return ViewerChromeSurface::Detached {
+                    window_id,
+                    borderless_applied,
+                };
+            }
+            // An active sibling's global presentation is not this main context's surface.
+            if self.active_detached_session.is_some() {
+                return ViewerChromeSurface::MainEmbedded;
+            }
+        }
+        if self.viewer_presentation == ViewerPresentation::Fullscreen {
+            ViewerChromeSurface::Fullscreen
+        } else {
+            ViewerChromeSurface::MainEmbedded
+        }
+    }
+
+    pub(crate) fn resolved_still_chrome(&self) -> crate::ui_helpers::ResolvedViewerChrome {
+        crate::ui_helpers::ResolvedViewerChrome::resolve(
+            self.viewer_chrome_surface(),
+            self.settings.fullscreen_chrome_suppression,
+            self.settings.fullscreen_top_bar_locked,
+            self.settings.still_bottom_lock(),
+            self.fs_info_panel.locked,
+            self.settings.fullscreen_navigator_visible,
+        )
     }
 
     pub(crate) fn invalidate_similar_preview(&mut self) {
@@ -19140,7 +19230,14 @@ impl App {
             egui::pos2(full_rect.left(), full_rect.bottom() - hud_h),
             full_rect.max,
         );
-        self.draw_music_bottom_hud(ui, hud_rect, info.fs_idx, &chrome, true, false);
+        self.draw_music_bottom_hud(
+            ui,
+            hud_rect,
+            info.fs_idx,
+            &chrome,
+            true,
+            crate::ui_music_panels::MusicHudPresentation::Disabled,
+        );
 
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
     }
@@ -20491,7 +20588,7 @@ impl App {
                 .fullscreen_seek_info_cached(fs_idx)
                 .is_some_and(|info| info.has_page_strip_content());
         let bottom_lock = if allowed {
-            self.settings.still_bottom_lock()
+            self.resolved_still_chrome().bottom_lock
         } else {
             crate::settings::BottomBarLock::None
         };
@@ -20562,7 +20659,7 @@ impl App {
     }
 
     fn fullscreen_top_bar_locked_for_idx(&self, fs_idx: usize, is_video: bool) -> bool {
-        self.settings.fullscreen_top_bar_locked
+        self.resolved_still_chrome().top_locked
             && !is_video
             && self.items.get(fs_idx).is_some_and(GridItem::has_page_data)
             && self.fullscreen_top_bar_chrome_allowed(fs_idx)
@@ -20589,7 +20686,8 @@ impl App {
     /// **表示領域を確保する側と、パネルを描く側の両方がこれを見る。**片方だけが別の条件を
     /// 綴ると、パネルを描かないモードで右に空白の帯が残る (backlog §1.158)。
     fn still_info_panel_lock_effective_for_idx(&self, fs_idx: usize, is_video: bool) -> bool {
-        self.fs_info_panel.locked && self.still_info_panel_eligible_for_idx(fs_idx, is_video)
+        self.resolved_still_chrome().info_locked
+            && self.still_info_panel_eligible_for_idx(fs_idx, is_video)
     }
 
     fn still_info_panel_eligible_for_idx(&self, fs_idx: usize, is_video: bool) -> bool {
@@ -20641,13 +20739,13 @@ impl App {
             && chrome.seek_eligible
             && chrome.strip_has_content;
         let bottom_lock = if chrome.seek_eligible {
-            self.settings.still_bottom_lock()
+            self.resolved_still_chrome().bottom_lock
         } else {
             crate::settings::BottomBarLock::None
         };
         StillSeekGeometry::resolve(
             full_rect,
-            self.settings.fullscreen_top_bar_locked && chrome.top_bar_eligible,
+            self.resolved_still_chrome().top_locked && chrome.top_bar_eligible,
             strip_visible,
             self.settings
                 .still_seek_strip_height_values
@@ -20664,7 +20762,7 @@ impl App {
         seek_height: f32,
         eligible: bool,
     ) -> f32 {
-        (eligible && self.fs_info_panel.locked)
+        (eligible && self.resolved_still_chrome().info_locked)
             .then(|| metadata_panel_rect_with_seek_height(full_rect, seek_height).width())
             .unwrap_or(0.0)
     }
@@ -20681,7 +20779,7 @@ impl App {
             };
         };
         let seek_geometry = self.still_seek_geometry_for_navigation_chrome(full_rect, chrome);
-        let lock_effective = chrome.info_panel_eligible && self.fs_info_panel.locked;
+        let lock_effective = chrome.info_panel_eligible && self.resolved_still_chrome().info_locked;
         let reserved_width = self.locked_info_panel_reserved_width_for_eligibility(
             full_rect,
             seek_geometry.total_height,
@@ -20967,7 +21065,7 @@ impl App {
             return;
         }
         if self.fs_seek_overlay_visible
-            && self.settings.still_bottom_lock().bar_locked()
+            && self.resolved_still_chrome().bottom_lock.bar_locked()
             && seek_geometry.bar_height > 0.0
         {
             return;
@@ -21187,7 +21285,8 @@ impl App {
 
         let primary_down = ctx.input(|i| i.pointer.primary_down());
         let bottom_lock = self.settings.still_bottom_lock();
-        let locked = bottom_lock.bar_locked();
+        let locked = self.resolved_still_chrome().bottom_lock.bar_locked();
+        let raw_locked = bottom_lock.bar_locked();
         let strip_locked = bottom_lock.strip_locked();
         let geometry = seek_geometry;
         if geometry.total_height <= 0.0 {
@@ -21269,17 +21368,20 @@ impl App {
                 ui,
                 lock_rect,
                 "fullscreen_seek_lock",
-                |hovered| bar_button_bg(hovered, locked),
-                locked,
-                |p, c, r| draw_seek_lock_icon(p, c, r, locked),
+                |hovered| bar_button_bg(hovered, raw_locked),
+                raw_locked,
+                |p, c, r| draw_seek_lock_icon(p, c, r, raw_locked),
             );
-            let lock_resp = lock_resp.hover_tip_dark(if locked {
-                "シークバー固定を解除"
-            } else {
-                "シークバーを固定表示"
-            });
+            let lock_resp = lock_resp.hover_tip_dark(crate::ui_helpers::chrome_lock_hint(
+                if raw_locked {
+                    "シークバー固定を解除"
+                } else {
+                    "シークバーを固定表示"
+                },
+                raw_locked && !locked,
+            ));
             if lock_resp.clicked() {
-                self.settings.set_still_seek_bar_locked(!locked);
+                self.settings.set_still_seek_bar_locked(!raw_locked);
                 self.settings.save();
                 ctx.request_repaint();
             }
@@ -21434,7 +21536,9 @@ impl App {
                         .map_or(StillSeekStripThumbnail::Unavailable, |&rotation| {
                             StillSeekStripThumbnail::Loaded(tex.size_vec2(), rotation)
                         }),
-                    Some(ThumbnailState::Failed) => StillSeekStripThumbnail::Failed,
+                    Some(ThumbnailState::Failed | ThumbnailState::NoArt) => {
+                        StillSeekStripThumbnail::Failed
+                    }
                     Some(ThumbnailState::Pending | ThumbnailState::Evicted) | None => {
                         StillSeekStripThumbnail::Unavailable
                     }
@@ -21633,11 +21737,15 @@ impl App {
                 strip_lock_response.hovered(),
                 strip_locked,
             );
-            let strip_lock_response = strip_lock_response.hover_tip_dark(if strip_locked {
-                "サムネイル列の固定を解除"
-            } else {
-                "サムネイル列を固定表示"
-            });
+            let strip_lock_response =
+                strip_lock_response.hover_tip_dark(crate::ui_helpers::chrome_lock_hint(
+                    if strip_locked {
+                        "サムネイル列の固定を解除"
+                    } else {
+                        "サムネイル列を固定表示"
+                    },
+                    strip_locked && !self.resolved_still_chrome().bottom_lock.strip_locked(),
+                ));
             if strip_lock_response.clicked() {
                 self.settings.set_still_seek_strip_locked(!strip_locked);
                 self.settings.save();
@@ -23194,8 +23302,8 @@ impl App {
                             strip_rtl: directions.strip_rtl,
                             seek_bar_rtl: directions.bar_rtl,
                             strip_visible: self.settings.still_seek_strip_visible,
-                            strip_locked: self.settings.still_bottom_lock().strip_locked(),
-                            bar_locked: self.settings.still_bottom_lock().bar_locked(),
+                            strip_locked: self.resolved_still_chrome().bottom_lock.strip_locked(),
+                            bar_locked: self.resolved_still_chrome().bottom_lock.bar_locked(),
                         },
                     );
                 }
@@ -23828,6 +23936,7 @@ impl App {
                                         music_view_frame_ui = self.draw_fs_music_view(
                                             ui,
                                             ctx,
+                                            full_rect,
                                             image_rect,
                                             reserved_panel_width,
                                             fs_idx,
@@ -24724,7 +24833,7 @@ impl App {
                             });
                             let top_bar_visible =
                                 still_top_bar_visible_from_inputs(StillTopBarVisibilityInputs {
-                                    locked: self.settings.fullscreen_top_bar_locked,
+                                    locked: self.resolved_still_chrome().top_locked,
                                     hover_in_top,
                                     side_panel_visible,
                                     spread_popup_open: self.spread_popup_open,
@@ -24763,6 +24872,7 @@ impl App {
                                 Vec::new()
                             };
                             let cursor_hidden = self.cursor_hidden();
+                            let effective_top_bar_locked = self.resolved_still_chrome().top_locked;
                             Self::draw_fs_hover_bar(
                                 ui,
                                 ctx,
@@ -24824,6 +24934,7 @@ impl App {
                                 embedded,
                                 &mut window_mode_pressed,
                                 self.settings.fullscreen_top_bar_locked,
+                                effective_top_bar_locked,
                                 &mut top_bar_lock_pressed,
                                 cursor_hidden,
                                 navigator_exclusion,
@@ -30214,10 +30325,6 @@ impl App {
         }
         if key_0 && display_mode_keys_supported {
             self.cycle_fullscreen_fit_mode(ctx, fs_idx);
-            self.show_feedback_toast(format!(
-                "[0:{}]",
-                self.effective_fullscreen_fit_mode().label()
-            ));
         }
 
         // U キー: AI アップスケールモデルをサイクル
@@ -31024,7 +31131,7 @@ impl App {
         // 「修飾キーを押している間」と「ナビゲータを掴んでいる間」は別の状態。
         // ドラッグ中は後者を優先し、Alt を離しても操作を最後まで継続させる。
         fs_navigator_visibility_requested(
-            self.settings.fullscreen_navigator_visible,
+            self.resolved_still_chrome().navigator_fixed,
             hold_active,
             focused,
             interaction_active,
@@ -32755,7 +32862,7 @@ impl App {
         let touch_chrome_latched = self.still_touch_chrome_is_latched(ctx);
         let seek_panel_interactive = self.fullscreen_idx.is_some_and(|idx| {
             self.fullscreen_seek_overlay_allowed(idx, state.is_video)
-                && (self.settings.still_bottom_lock().bar_locked()
+                && (self.resolved_still_chrome().bottom_lock.bar_locked()
                     || self.fs_seek_drag_active
                     || touch_chrome_latched
                     || ctx.input(|i| {
@@ -33207,7 +33314,7 @@ impl App {
         let top_bar_visible = panel_fs_idx.is_some_and(|idx| {
             self.fullscreen_top_bar_chrome_allowed(idx)
                 && still_top_bar_visible_from_inputs(StillTopBarVisibilityInputs {
-                    locked: self.settings.fullscreen_top_bar_locked,
+                    locked: self.resolved_still_chrome().top_locked,
                     hover_in_top,
                     side_panel_visible,
                     spread_popup_open: self.spread_popup_open,
@@ -37087,11 +37194,24 @@ impl App {
         ctx.request_repaint();
     }
 
-    fn cycle_fullscreen_fit_mode(&mut self, ctx: &egui::Context, fs_idx: usize) {
-        let next = self
-            .effective_fullscreen_fit_mode()
-            .next_for_flow(self.reading_flow);
+    pub(crate) fn cycle_fullscreen_fit_mode(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        // The key, ring, gesture and mouse buttons share the same image-only operation.
+        // A stale image-context command must not change the next image's fit during media playback.
+        if !self.continuous_reading_supported_idx(fs_idx)
+            || self.fs_music_view_active(fs_idx)
+            || self.is_overlay_edit_mode_active()
+        {
+            return;
+        }
+        let next = self.effective_fullscreen_fit_mode().next_for_flow(
+            self.reading_flow,
+            &self.settings.fullscreen_fit_cycle_excluded,
+        );
         self.set_fullscreen_fit_mode_for_current(ctx, fs_idx, next);
+        self.show_feedback_toast(format!(
+            "[0:{}]",
+            self.effective_fullscreen_fit_mode().label()
+        ));
     }
 
     fn set_default_fullscreen_fit_for_flow(
@@ -41598,6 +41718,7 @@ impl App {
         in_window_mode: bool,
         window_mode_pressed: &mut bool,
         top_bar_locked: bool,
+        effective_top_bar_locked: bool,
         top_bar_lock_pressed: &mut bool,
         cursor_hidden: bool,
         navigator_exclusion: Option<egui::Rect>,
@@ -41615,7 +41736,7 @@ impl App {
                     .unwrap_or(false)
         });
         if !still_top_bar_visible_from_inputs(StillTopBarVisibilityInputs {
-            locked: top_bar_locked,
+            locked: effective_top_bar_locked,
             hover_in_top,
             side_panel_visible,
             spread_popup_open: *spread_popup_open,
@@ -41638,7 +41759,7 @@ impl App {
             0.0,
             egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
         );
-        let separator_y = fullscreen_top_bar_separator_y(bar_rect, top_bar_locked);
+        let separator_y = fullscreen_top_bar_separator_y(bar_rect, effective_top_bar_locked);
         ui.painter().line_segment(
             [
                 egui::pos2(bar_rect.min.x, separator_y),
@@ -41724,11 +41845,14 @@ impl App {
                 top_bar_locked,
                 |p, c, r| draw_seek_lock_icon(p, c, r, top_bar_locked),
             );
-            let lock_resp = lock_resp.hover_tip_dark(if top_bar_locked {
-                "上部情報バー固定を解除"
-            } else {
-                "上部情報バーを固定表示"
-            });
+            let lock_resp = lock_resp.hover_tip_dark(crate::ui_helpers::chrome_lock_hint(
+                if top_bar_locked {
+                    "上部情報バー固定を解除"
+                } else {
+                    "上部情報バーを固定表示"
+                },
+                top_bar_locked && !effective_top_bar_locked,
+            ));
             if lock_resp.clicked() {
                 *top_bar_lock_pressed = true;
             }
@@ -47905,13 +48029,15 @@ impl App {
     /// headless `VideoPlayer` が音声を再生し、ここでは egui で「音楽アイコン + ファイル名 +
     /// 再生位置/長さ + シークバー + 再生/一時停止ボタン」を描く。タイムライン波形 /
     /// スペクトラム / 左右パネルの作り込みは Inc 3b / Inc 5。native presenter は使わない (D3)。
-    /// `reserved_info_panel_w` は `fullscreen_media_rect` が `rect` から**実際に引いた**
-    /// 右情報パネルの帯幅。ロックしていなければ 0。縮んだ `rect` から逆算しないこと (F11)。
+    /// `full_rect` owns HUD drawing and input; `content_rect` owns the reserved central content.
+    /// `reserved_info_panel_w` is the width actually removed by `fullscreen_media_rect`.
+    /// It is zero when the effective info lock is off; never infer it from the shrunken content.
     pub(crate) fn draw_fs_music_view(
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
-        rect: egui::Rect,
+        full_rect: egui::Rect,
+        content_rect: egui::Rect,
         reserved_info_panel_w: f32,
         fs_idx: usize,
         music_ctrl_wheel_key_gate_reached: bool,
@@ -47920,10 +48046,12 @@ impl App {
         // ここは常にダーク配色にする (CLAUDE.md「フルスクリーン内は黒背景ベース統一」、実機 FB:
         // 上下バーが Light 基調で中央のダーク波形と食い違っていた)。
         let dark = true;
-        let painter = ui.painter_at(rect);
+        let [top_rect, hud_rect] = music_hud_rects(full_rect);
+        let painter = ui.painter_at(content_rect);
         // 背景色はタイムラインのラベル列 / 左右隙間と共有 (実機 FB 2026-07、色の不揃い解消)。
         let bg = crate::ui_music_timeline::MUSIC_VIEW_BG;
-        painter.rect_filled(rect, 0.0, bg);
+        // The translucent HUDs need the same underlay across the reserved right band.
+        ui.painter_at(full_rect).rect_filled(full_rect, 0.0, bg);
         let touch_observed = observe_music_touch_for_panel_handles(
             ctx,
             crate::touch_correlation::touch_gestures_disabled(),
@@ -47987,7 +48115,7 @@ impl App {
                 self.handle_cancel_normalize_scan(ctx, fs_idx);
             }
             painter.text(
-                rect.center(),
+                content_rect.center(),
                 egui::Align2::CENTER_CENTER,
                 format!("音声を再生できません: {e}"),
                 egui::FontId::proportional(20.0),
@@ -47997,15 +48125,12 @@ impl App {
         }
 
         // ── レイアウト (Inc 5 FB: 動画に合わせる) ──
-        // 上バー (常時) / 中央 (timeline + spectrum、全幅・縮小しない) / 下 HUD (常時、
-        // seek 行 + コントロール行)。左右パネルは表示モードに従ってオーバーレイ表示し、
-        // **中央は縮小しない** (動画のジャンプ/メタパネルと同じ)。
+        // Top and bottom HUDs always span the viewport. Only central timeline/spectrum
+        // shrink for a locked right panel; unlocked side panels overlay the middle band.
         // 上バー高さは動画 native 上バー (draw_top_bar_background = 54px) に合わせる。これで
         // 音楽ビューと VST 画面 (native シェル) でボタン / タイトルの縦位置が揃う (ユーザー要望)。
-        let top_h = MUSIC_TOP_BAR_HEIGHT;
-        let hud_h = crate::ui_music_panels::MUSIC_HUD_HEIGHT;
-        let hud_top = rect.bottom() - hud_h;
-        let panel_band_top = rect.top() + top_h;
+        let hud_top = hud_rect.top();
+        let panel_band_top = top_rect.bottom();
         let panel_band_bottom = hud_top;
 
         // 中央コンテンツ (波形 timeline + spectrum) は左右にトリガ幅ぶんの gutter を空ける
@@ -48018,7 +48143,7 @@ impl App {
         // 接し、グラフ端をクリックしようとして僅かにはみ出すとパネルが出てしまう。3% の隙間を挟む
         // ことでその誤爆を防ぐ (トリガ自体は 5% のまま = パネルの開けやすさをウィンドウモードでも
         // 維持)。gutter (= 5%+3% = 8%) は最低 8px。
-        let content_gutter = music_visualization_side_margin(rect.width());
+        let content_gutter = music_visualization_side_margin(content_rect.width());
 
         // 中央領域の下端に MIDI 半音 spectrum + ピッチ鍵盤 (Inc 4) の帯を確保する。残りが
         // タイムライン (or 解析中アイコン) の領域。縦窓が短いときに spectrum が timeline を
@@ -48028,7 +48153,7 @@ impl App {
         const MUSIC_SPECTRUM_MIN_H: f32 = 60.0;
         const MUSIC_TIMELINE_MIN_H: f32 = 120.0;
         const MUSIC_SPECTRUM_GAP: f32 = 8.0;
-        let band_top = rect.top() + top_h;
+        let band_top = top_rect.bottom();
         let band_bottom = hud_top - 4.0;
         let band_h = (band_bottom - band_top).max(0.0);
         let spectrum_h =
@@ -48041,8 +48166,11 @@ impl App {
         let music_shell_active = false;
         let show_spectrum = spectrum_h >= MUSIC_SPECTRUM_MIN_H && !music_shell_active;
         let spectrum_rect = egui::Rect::from_min_max(
-            egui::pos2(rect.left() + content_gutter, band_bottom - spectrum_h),
-            egui::pos2(rect.right() - content_gutter, band_bottom),
+            egui::pos2(
+                content_rect.left() + content_gutter,
+                band_bottom - spectrum_h,
+            ),
+            egui::pos2(content_rect.right() - content_gutter, band_bottom),
         );
         let central_bottom = if show_spectrum {
             (band_bottom - spectrum_h - MUSIC_SPECTRUM_GAP).max(band_top + 1.0)
@@ -48050,8 +48178,8 @@ impl App {
             hud_top.max(band_top + 1.0)
         };
         let central_rect = egui::Rect::from_min_max(
-            egui::pos2(rect.left() + content_gutter, band_top),
-            egui::pos2(rect.right() - content_gutter, central_bottom),
+            egui::pos2(content_rect.left() + content_gutter, band_top),
+            egui::pos2(content_rect.right() - content_gutter, central_bottom),
         );
 
         // ── 左右パネル (端ホバー) の判定を timeline より先に確定する ──
@@ -48063,10 +48191,10 @@ impl App {
         // ビュー幅の半分でクランプする (Inc 7 ④ / Codex P3)。狭幅ウィンドウで右パネルが
         // timeline の半分超を覆わないようにする。
         // 固定中は `fullscreen_media_rect` が既に右を空けている。パネルはその**空けた帯**へ
-        // 置くので、右端は縮める前の位置に戻す。縮んだ `rect` の右端に置くと、確保した帯が
+        // 置くので、右端は縮める前の位置に戻す。縮んだ `content_rect` の右端に置くと、確保した帯が
         // そのまま空白として残る (backlog §1.158)。
         let (panel_reserved_w, panel_right_edge, right_w) =
-            music_right_panel_band(rect, reserved_info_panel_w);
+            music_right_panel_band(content_rect, reserved_info_panel_w);
         // 改名 / 一括登録の中央モーダル、または再生前ノーマライズスキャンのモーダルを開いて
         // いる間は端ホバーのパネルを出さず、timeline seek も抑止し、HUD も非操作にする
         // (背後クリック漏れ防止 + モーダルへ集中、Inc 5c-A / Norm系)。
@@ -48088,12 +48216,12 @@ impl App {
         //  ラッチ state は music_left/right_panel_active。ClickToShow / モーダル中は両方 OFF。
         // ClickToShow の実効表示は左右とも current-file runtime state から解決する。
         let in_band = |p: egui::Pos2| p.y >= panel_band_top && p.y <= panel_band_bottom;
-        let trigger_w =
-            crate::ui_helpers::panel_edge_trigger_px(rect.width()).min(rect.width().max(0.0));
-        let sustain_margin = crate::ui_helpers::panel_hover_sustain_px(rect.width());
+        let trigger_w = crate::ui_helpers::panel_edge_trigger_px(content_rect.width())
+            .min(content_rect.width().max(0.0));
+        let sustain_margin = crate::ui_helpers::panel_hover_sustain_px(content_rect.width());
         let left_panel_rect = egui::Rect::from_min_max(
-            egui::pos2(rect.left(), panel_band_top),
-            egui::pos2(rect.left() + left_w, panel_band_bottom),
+            egui::pos2(content_rect.left(), panel_band_top),
+            egui::pos2(content_rect.left() + left_w, panel_band_bottom),
         );
         let right_panel_rect = egui::Rect::from_min_max(
             egui::pos2(panel_right_edge - right_w, panel_band_top),
@@ -48101,7 +48229,8 @@ impl App {
         );
         let side_panel_mode = self.settings.fullscreen_side_panel_mode.normalized();
         if side_panel_mode == crate::settings::FsSidePanelMode::Hover && !music_modal_open {
-            let left_open = hover_pos.is_some_and(|p| p.x <= rect.left() + trigger_w && in_band(p));
+            let left_open =
+                hover_pos.is_some_and(|p| p.x <= content_rect.left() + trigger_w && in_band(p));
             let right_open =
                 hover_pos.is_some_and(|p| p.x >= panel_right_edge - trigger_w && in_band(p));
             let left_sustain = self.music_left_panel_active
@@ -48177,7 +48306,7 @@ impl App {
             // label_w=content_gutter を渡すと波形左端が central_rect.left に揃い (spectrum と同じ)、
             // 旧 56px ラベル列ぶん波形が広がる (実機 FB 2026-07)。
             let timeline_rect = egui::Rect::from_min_max(
-                egui::pos2(rect.left(), central_rect.top()),
+                egui::pos2(content_rect.left(), central_rect.top()),
                 egui::pos2(central_rect.right(), central_rect.bottom()),
             );
             // ▲▼ 縦スクロールボタン (ユーザー確定 2026-07-03「動画統一 + ▲▼追加」)。↓↑ を
@@ -48316,7 +48445,7 @@ impl App {
             }
         } else {
             // 中央: 音楽アイコン + ファイル名 + 状態 (解析中 / エラー)。
-            let icon_side = rect.width().min(rect.height()) * 0.3;
+            let icon_side = content_rect.width().min(content_rect.height()) * 0.3;
             let icon_rect = egui::Rect::from_center_size(
                 central_rect.center() - egui::vec2(0.0, central_rect.height() * 0.06),
                 egui::vec2(icon_side, icon_side),
@@ -48378,19 +48507,20 @@ impl App {
         }
 
         // ── 左右パネル (Inc 5 FB / §1.15) ── 表示モードに従ってオーバーレイ表示する。
-        // 中央は縮小せず timeline/spectrum の上に重ねる。左=ブックマーク、右=情報/タグ/★。
+        // The locked right panel owns its reserved band; unlocked panels overlay content.
+        // Left = bookmarks, right = information / tags / rating.
         // ホバー判定 (left_hover / right_hover) は timeline seek 抑止のため上で計算済み。
         // 左ブックマーク UI: 一覧パネル本体は左端ホバー時のみ、中央モーダル (改名 / 一括登録)
         // は開いている間常に描く (draw_music_bookmark_ui 内で分岐)。動画のジャンプ/ブックマーク
         // パネルと同一コードを共有 (Inc 5c-A)。
         // パネル矩形は上のホバー判定で使ったものを再利用する (発火/維持と描画のずれ防止)。
-        self.draw_music_bookmark_ui(ctx, left_panel_rect, rect, fs_idx, left_hover);
+        self.draw_music_bookmark_ui(ctx, left_panel_rect, full_rect, fs_idx, left_hover);
         if right_hover {
             self.draw_fs_music_right_panel(ui, ctx, right_panel_rect, fs_idx);
         }
         self.draw_music_panel_callouts(
             ctx,
-            rect,
+            content_rect,
             panel_band_top,
             panel_band_bottom,
             fs_idx,
@@ -48402,7 +48532,6 @@ impl App {
 
         // 上情報バー (常時): ファイル名 (左) + Row ステッパー (中央、timeline 時) +
         // 左右パネル表示モード i。位置/長さ・音量・再生などは下 HUD に集約する。
-        let top_rect = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), top_h));
         let top_response =
             self.draw_music_top_chrome(ui, top_rect, fs_idx, &active_chrome, fg, accent, true);
         if top_response.close_clicked {
@@ -48437,15 +48566,21 @@ impl App {
             }
         }
 
-        let hud_rect = egui::Rect::from_min_max(egui::pos2(rect.left(), hud_top), rect.max);
         // 中央モーダル (改名 / 一括登録) 表示中は HUD 操作を止める (Codex 5c-A P2)。
-        self.draw_music_bottom_hud(
+        let hud_presentation = if self.music_normalize_modal_active(fs_idx) {
+            crate::ui_music_panels::MusicHudPresentation::NormalizeScan
+        } else if music_modal_open {
+            crate::ui_music_panels::MusicHudPresentation::Disabled
+        } else {
+            crate::ui_music_panels::MusicHudPresentation::Interactive
+        };
+        let navigation_rects = self.draw_music_bottom_hud(
             ui,
             hud_rect,
             fs_idx,
             &active_chrome,
             dark,
-            !music_modal_open,
+            hud_presentation,
         );
         self.handle_music_timeline_ctrl_wheel_after_hud(
             ctx,
@@ -48457,7 +48592,7 @@ impl App {
         // 上の music_modal_open で背後操作は抑止済み。
         #[cfg(windows)]
         if self.music_normalize_modal_active(fs_idx) {
-            self.draw_music_normalize_modal(ui, ctx, rect, fs_idx);
+            self.draw_music_normalize_modal(ui, ctx, full_rect, fs_idx, navigation_rects);
         }
 
         // 再生中は毎フレーム再描画して位置/シークバーを更新する。
@@ -48468,8 +48603,853 @@ impl App {
     }
 }
 
+#[cfg(all(test, windows))]
+mod music_full_width_hud_tests {
+    use super::*;
+
+    #[test]
+    fn music_hud_layout_normal_real_time_does_not_overlap_controls() {
+        for width in [300.0, 383.0, 575.0, 860.0, 1000.0] {
+            let (mut app, ctx) = fixture();
+            let probe = frame(&mut app, &ctx, egui::vec2(width, 360.0), vec![]);
+            assert!(
+                probe.time.is_positive(),
+                "time must remain visible at {width}pt"
+            );
+            for rect in probe.row {
+                assert!(
+                    !rect.intersects(probe.time),
+                    "normal playback control overlaps real time galley at {width}pt"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn music_hud_layout_normal_compact_click_and_touch_route_the_drawn_arrows() {
+        for width in [300.0, 383.0, 575.0, 860.0, 1200.0] {
+            for touch in [false, true] {
+                let (mut app, ctx) = fixture();
+                let size = egui::vec2(width, 360.0);
+                let probe = frame(&mut app, &ctx, size, vec![]);
+                for rect in probe.nav {
+                    let pos = rect.center();
+                    frame(&mut app, &ctx, size, vec![egui::Event::PointerMoved(pos)]);
+                    let before = app.input_seq;
+                    frame(&mut app, &ctx, size, button(pos, true, touch));
+                    frame(&mut app, &ctx, size, button(pos, false, touch));
+                    assert_eq!(
+                        app.input_seq,
+                        before + 1,
+                        "drawn arrow routes once at {width}pt, touch={touch}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn music_hud_layout_resize_during_real_volume_drag_finishes_without_navigation() {
+        let (mut app, ctx) = fixture();
+        let wide = egui::vec2(1200.0, 360.0);
+        let probe = frame(&mut app, &ctx, wide, vec![]);
+        let pos = probe.volume.center();
+        frame(&mut app, &ctx, wide, button(pos, true, false));
+        let dragged = pos - egui::vec2(50.0, 0.0);
+        frame(
+            &mut app,
+            &ctx,
+            wide,
+            vec![egui::Event::PointerMoved(dragged)],
+        );
+        assert!(
+            app.music_hud_last_volume_target.is_some(),
+            "real drag owns a pending value"
+        );
+        let volume = app.settings.video_volume;
+        let before = app.input_seq;
+        let narrow = egui::vec2(300.0, 360.0);
+        frame(&mut app, &ctx, narrow, vec![]);
+        // read_response can retain a removed widget from the previous pass.
+        let compact = frame(&mut app, &ctx, narrow, vec![]);
+        assert!(!compact.volume.is_positive());
+        assert!(app.music_hud_last_volume_target.is_none());
+        frame(
+            &mut app,
+            &ctx,
+            narrow,
+            button(compact.nav[0].center(), false, false),
+        );
+        assert_eq!(
+            app.input_seq, before,
+            "omitted slider release cannot become navigation"
+        );
+        assert_eq!(app.settings.video_volume, volume);
+        let restored = frame(&mut app, &ctx, wide, vec![]);
+        assert!(restored.volume.is_positive());
+        assert!(app.music_hud_last_volume_target.is_none());
+    }
+
+    #[test]
+    fn normalize_hud_navigation_music_scan_time_never_overlaps_arrows() {
+        for width in [360.0, 400.0, 548.0, 640.0, 1000.0 / 1.5, 800.0, 1000.0] {
+            let (mut app, ctx) = fixture();
+            scan(&mut app);
+            let size = egui::vec2(width, 360.0);
+            let probe = frame(&mut app, &ctx, size, vec![]);
+            assert!(
+                probe.time.is_positive(),
+                "time remains visible at {width}pt"
+            );
+            for nav in probe.nav {
+                assert!(
+                    !nav.intersects(probe.time),
+                    "time overlaps arrow at {width}pt"
+                );
+            }
+            for (index, rect) in probe.row.iter().enumerate() {
+                for other in &probe.row[index + 1..] {
+                    assert!(
+                        !rect.intersects(*other),
+                        "real bottom-row controls overlap at {width}pt"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn normalize_hud_navigation_parked_music_ignores_other_context_scan_same_idx() {
+        let (mut app, _) = fixture();
+        // A's parked chrome is an owning-context snapshot. B is currently projected,
+        // with the same local index and a different file, and starts a modal scan.
+        let parked = app.build_window_context_for_test(1351, |context| {
+            context.items = vec![GridItem::Audio(PathBuf::from("parked.flac"))];
+            context.fullscreen_idx = Some(0);
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+        });
+        assert_ne!(parked, crate::app::ViewerContextId::for_test(0));
+        let draw = |app: &mut App| {
+            let info = app
+                .parked_live_music_window_info_for_window_id(1351)
+                .unwrap();
+            assert_eq!(info.fs_idx, 0);
+            assert_eq!(
+                info.normalize_ui_state,
+                crate::video::normalize_types::NormalizeUiState::Off
+            );
+            let ctx = egui::Context::default();
+            crate::ui_fonts::configure_fonts(&ctx);
+            let mut nav = Vec::new();
+            let _ = ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 600.0))),
+                ..Default::default()
+            }, |ctx| {
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
+                    app.draw_parked_live_music_window(ui, ctx, ui.max_rect(), &info, &mut false);
+                    for name in ["music_hud_prevfile", "music_hud_nextfile"] {
+                        let response = ctx.read_response(ui.id().with((name, info.fs_idx)))
+                            .expect("parked target's arrows must be registered independently of B's scan");
+                        assert!(!response.sense.senses_click());
+                        nav.push(response.rect);
+                    }
+                });
+            });
+            nav
+        };
+        let before = draw(&mut app);
+        scan(&mut app);
+        let seq = app.input_seq;
+        assert_eq!(draw(&mut app), before);
+        assert_eq!(app.input_seq, seq);
+        assert!(app.music_normalize_modal_active(0));
+        app.normalize_state = None;
+        assert_eq!(draw(&mut app), before);
+    }
+
+    fn scan(app: &mut App) {
+        let path = PathBuf::from("music-hud-layout.flac");
+        if let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get_mut(&0) {
+            player.set_opened_audio_stream_for_test(1, 0);
+        }
+        app.normalize_state = Some(crate::app::normalize::NormalizeScanState {
+            owner_context_id: crate::app::ViewerContextId::for_test(0),
+            fs_idx: 0,
+            stream_index: 1,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            progress: std::sync::Arc::new(
+                crate::video::normalize_scanner::NormalizeScanProgress::default(),
+            ),
+            rx: std::sync::mpsc::channel().1,
+            was_playing: false,
+            file_path: path,
+            target_lufs_milli: -14_000,
+            provisional_applied: false,
+            provisional_result: None,
+            _join: std::thread::spawn(|| {}),
+        });
+        assert!(app.music_normalize_modal_active(0));
+    }
+
+    #[test]
+    fn normalize_hud_navigation_music_scan_routes_only_hud_arrows() {
+        let (mut app, ctx) = fixture();
+        scan(&mut app);
+        let size = egui::vec2(640.0, 360.0);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, size, vec![]);
+        }
+        for index in 0..2 {
+            let probe = frame(&mut app, &ctx, size, vec![]);
+            let pos = probe.nav[index].center();
+            frame(&mut app, &ctx, size, vec![egui::Event::PointerMoved(pos)]);
+            let before = app.input_seq;
+            frame(&mut app, &ctx, size, button(pos, true, false));
+            frame(&mut app, &ctx, size, button(pos, false, false));
+            assert_eq!(
+                app.input_seq,
+                before + 1,
+                "real HUD invokes the existing music navigation owner exactly once"
+            );
+            assert!(
+                app.music_normalize_modal_active(0),
+                "boundary navigation retains scan"
+            );
+        }
+        let probe = frame(&mut app, &ctx, size, vec![]);
+        for pos in [probe.play.center(), probe.seek.center()] {
+            let before = app.input_seq;
+            let old_pos = app.fs_cache.get(&0).and_then(|entry| match entry {
+                FsCacheEntry::Video { player, .. } => Some(player.position()),
+                _ => None,
+            });
+            frame(&mut app, &ctx, size, button(pos, true, false));
+            frame(&mut app, &ctx, size, button(pos, false, false));
+            assert_eq!(
+                app.input_seq, before,
+                "non-navigation HUD input stays blocked"
+            );
+            assert_eq!(
+                app.fs_cache.get(&0).and_then(|entry| match entry {
+                    FsCacheEntry::Video { player, .. } => Some(player.position()),
+                    _ => None,
+                }),
+                old_pos
+            );
+            assert!(app.music_normalize_modal_active(0));
+        }
+    }
+
+    #[test]
+    fn normalize_hud_navigation_music_narrow_scan_click_owns_overlapping_controls() {
+        narrow_scan_navigation(false);
+    }
+
+    #[test]
+    fn normalize_hud_navigation_music_narrow_scan_touch_owns_overlapping_controls() {
+        narrow_scan_navigation(true);
+    }
+
+    fn narrow_scan_navigation(touch: bool) {
+        for width in [360.0, 400.0, 548.0, 640.0, 1000.0] {
+            let (mut app, ctx) = fixture();
+            scan(&mut app);
+            let size = egui::vec2(width, 360.0);
+            for _ in 0..3 {
+                frame(&mut app, &ctx, size, vec![]);
+            }
+            let volume = app.settings.video_volume;
+            let speed = app.video_playback_speed;
+            for index in 0..2 {
+                let probe = frame(&mut app, &ctx, size, vec![]);
+                let pos = probe.nav[index].center();
+                for other in [probe.volume, probe.speed, probe.time, probe.play] {
+                    assert!(
+                        !probe.nav[index].intersects(other),
+                        "reserved scan layout at {width}pt never overlaps another control"
+                    );
+                }
+                assert!(!probe.volume_enabled && !probe.speed_enabled);
+                assert!(
+                    probe.nav_above_modal[index],
+                    "arrow is painted above the modal and HUD controls"
+                );
+                let before = app.input_seq;
+                frame(&mut app, &ctx, size, button(pos, true, touch));
+                frame(&mut app, &ctx, size, button(pos, false, touch));
+                assert_eq!(
+                    app.input_seq,
+                    before + 1,
+                    "real HUD arrow owns {width}pt input (touch={touch})"
+                );
+                assert!(app.music_normalize_modal_active(0));
+                assert_eq!(app.settings.video_volume, volume);
+                assert_eq!(app.video_playback_speed, speed);
+                assert!(app.music_hud_last_volume_target.is_none());
+                assert!(!app.music_speed_popup_open);
+            }
+            // Shown volume, or its old area when dropped, stays modal including drag.
+            let probe = frame(&mut app, &ctx, size, vec![]);
+            let pos = if probe.volume.is_positive() {
+                egui::pos2(probe.volume.right() - 2.0, probe.volume.center().y)
+            } else {
+                egui::pos2(width - 94.0, probe.nav[0].center().y)
+            };
+            assert!(probe.nav.iter().all(|r| !r.contains(pos)));
+            let before = app.input_seq;
+            frame(&mut app, &ctx, size, button(pos, true, touch));
+            frame(
+                &mut app,
+                &ctx,
+                size,
+                vec![egui::Event::PointerMoved(pos - egui::vec2(8.0, 0.0))],
+            );
+            frame(&mut app, &ctx, size, button(pos, false, touch));
+            assert_eq!(app.input_seq, before);
+            assert_eq!(app.settings.video_volume, volume);
+            assert!(app.music_hud_last_volume_target.is_none());
+            assert!(app.music_normalize_modal_active(0));
+        }
+    }
+
+    #[test]
+    fn normalize_hud_navigation_music_f11_touch_and_cancel_keep_existing_owners() {
+        let (mut app, ctx) = fixture();
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.settings.fullscreen_chrome_suppression.info = true;
+        scan(&mut app);
+        let size = egui::vec2(640.0, 360.0);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, size, vec![]);
+        }
+        for index in 0..2 {
+            let pos = frame(&mut app, &ctx, size, vec![]).nav[index].center();
+            let before = app.input_seq;
+            frame(&mut app, &ctx, size, button(pos, true, true));
+            frame(&mut app, &ctx, size, button(pos, false, true));
+            assert_eq!(
+                app.input_seq,
+                before + 1,
+                "F11 touch reaches the existing music HUD navigation"
+            );
+            assert!(app.music_normalize_modal_active(0));
+        }
+        let cancel = app.normalize_state.as_ref().unwrap().cancel.clone();
+        frame(
+            &mut app,
+            &ctx,
+            size,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(cancel.load(std::sync::atomic::Ordering::Acquire));
+        assert!(app.normalize_state.is_none());
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(0),
+            "Esc cancels scan, does not close the viewer"
+        );
+    }
+
+    fn fixture() -> (crate::app::AppTestEnvForTest, egui::Context) {
+        let mut app = crate::app::setup_app_for_test();
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = ViewerPresentation::MainWindow;
+        app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
+        app.fs_info_panel.locked = true;
+        let mut player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(
+            PathBuf::from("music-hud-layout.flac"),
+        );
+        player.set_position_for_test(30.0);
+        player.set_duration_for_test(120.0);
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        // No item/source: the real draw runs without analysis, decoder, or file I/O.
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        (app, ctx)
+    }
+
+    struct Probe {
+        time: egui::Rect,
+        row: Vec<egui::Rect>,
+        nav: [egui::Rect; 2],
+        play: egui::Rect,
+        close: egui::Rect,
+        seek: egui::Rect,
+        volume: egui::Rect,
+        speed: egui::Rect,
+        volume_enabled: bool,
+        speed_enabled: bool,
+        nav_above_modal: [bool; 2],
+        panel: Option<egui::Rect>,
+        panel_clicked: bool,
+        content_clip: egui::Rect,
+        painted_background: egui::Rect,
+        painted_top: egui::Rect,
+        painted_hud: egui::Rect,
+    }
+
+    fn frame(
+        app: &mut App,
+        ctx: &egui::Context,
+        size: egui::Vec2,
+        events: Vec<egui::Event>,
+    ) -> Probe {
+        let mut probe = None;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        let full = ui.max_rect();
+                        let reserved = if app.resolved_still_chrome().info_locked {
+                            crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH.min(full.width() * 0.5)
+                        } else {
+                            0.0
+                        };
+                        let content = egui::Rect::from_min_max(
+                            full.min,
+                            full.max - egui::vec2(reserved, 0.0),
+                        );
+                        app.draw_fs_music_view(ui, ctx, full, content, reserved, 0, false);
+                        let response = |name| ctx.read_response(ui.id().with((name, 0usize)));
+                        let panel = response("music_right_bg");
+                        probe = Some(Probe {
+                            time: egui::Rect::NOTHING,
+                            row: [
+                                "music_hud_start",
+                                "music_hud_play",
+                                "music_hud_loop",
+                                "music_hud_continuous",
+                                "music_hud_prevfile",
+                                "music_hud_nextfile",
+                                "music_hud_prevbm",
+                                "music_hud_nextbm",
+                                "music_hud_time",
+                                "music_hud_speed",
+                                "music_hud_mute",
+                                "music_hud_normalize",
+                                "music_hud_vol",
+                                "music_hud_db",
+                                "music_hud_limiter",
+                            ]
+                            .into_iter()
+                            .filter_map(|name| response(name).map(|r| r.rect))
+                            .collect(),
+                            nav: [
+                                response("music_hud_prevfile").unwrap().rect,
+                                response("music_hud_nextfile").unwrap().rect,
+                            ],
+                            play: response("music_hud_play").unwrap().rect,
+                            close: response("music_top_close")
+                                .expect("actual close button")
+                                .rect,
+                            seek: response("music_hud_seek").expect("actual seek widget").rect,
+                            volume: response("music_hud_vol")
+                                .map_or(egui::Rect::NOTHING, |r| r.rect),
+                            speed: response("music_hud_speed")
+                                .map_or(egui::Rect::NOTHING, |r| r.rect),
+                            volume_enabled: response("music_hud_vol").is_some_and(|r| r.enabled()),
+                            speed_enabled: response("music_hud_speed").is_some_and(|r| r.enabled()),
+                            nav_above_modal: [false; 2],
+                            panel: panel.as_ref().map(|r| r.rect),
+                            panel_clicked: panel.is_some_and(|r| r.clicked()),
+                            content_clip: egui::Rect::NOTHING,
+                            painted_background: egui::Rect::NOTHING,
+                            painted_top: egui::Rect::NOTHING,
+                            painted_hud: egui::Rect::NOTHING,
+                        });
+                    });
+            },
+        );
+        let mut probe = probe.unwrap();
+        probe.time = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.text() == "0:30 / 2:00" => {
+                    Some(egui::Rect::from_min_size(text.pos, text.galley.size()))
+                }
+                _ => None,
+            })
+            .unwrap_or(egui::Rect::NOTHING);
+        if let Some(modal_index) = output.shapes.iter().position(|shape| {
+            matches!(&shape.shape, egui::epaint::Shape::Rect(r)
+                if r.fill == egui::Color32::from_black_alpha(120))
+        }) {
+            for (index, rect) in probe.nav.iter().enumerate() {
+                probe.nav_above_modal[index] =
+                    output
+                        .shapes
+                        .iter()
+                        .enumerate()
+                        .any(|(paint_index, shape)| {
+                            matches!(&shape.shape, egui::epaint::Shape::Path(path)
+                        if path.closed && path.fill == egui::Color32::from_gray(238)
+                            && path.points.len() == 3
+                            && path.points.iter().all(|point| rect.contains(*point)))
+                                && paint_index > modal_index
+                        });
+            }
+        }
+        let painted = |fill| {
+            output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Rect(rect) if rect.fill == fill => Some(rect.rect),
+                _ => None,
+            })
+        };
+        probe.content_clip = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text)
+                    if text.galley.text() == "波形を解析しています…" =>
+                {
+                    Some(shape.clip_rect)
+                }
+                _ => None,
+            })
+            .expect("actual central content paint clip");
+        probe.painted_background = painted(crate::ui_music_timeline::MUSIC_VIEW_BG).unwrap();
+        probe.painted_top = painted(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 90)).unwrap();
+        probe.painted_hud = painted(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150)).unwrap();
+        // read_response can retain a hidden widget from an earlier frame: visibility
+        // comes from this frame's actual paint, not the retained response.
+        probe.panel = painted(egui::Color32::from_rgba_premultiplied(16, 16, 20, 235));
+        probe
+    }
+
+    fn button(pos: egui::Pos2, down: bool, touch: bool) -> Vec<egui::Event> {
+        let mut events = vec![egui::Event::PointerMoved(pos)];
+        if touch {
+            events.push(egui::Event::Touch {
+                device_id: egui::TouchDeviceId(1352),
+                id: egui::TouchId(1),
+                phase: if down {
+                    egui::TouchPhase::Start
+                } else {
+                    egui::TouchPhase::End
+                },
+                pos,
+                force: None,
+            });
+        }
+        events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: down,
+            modifiers: egui::Modifiers::NONE,
+        });
+        events
+    }
+
+    #[test]
+    fn music_full_width_hud_real_draw_reaches_the_viewport_right_edge() {
+        let (mut app, ctx) = fixture();
+        for width in [1280.0, 640.0, 360.0] {
+            let size = egui::vec2(width, 540.0);
+            let probe = frame(&mut app, &ctx, size, vec![]);
+            assert!(
+                probe.close.center().x > width - 60.0,
+                "top controls must use viewport width, not reserved content width: {width}"
+            );
+            assert!(
+                probe.seek.right() > width - 20.0,
+                "actual seek hit area must span viewport width: {width}"
+            );
+            let panel = probe.panel.expect("locked panel is drawn");
+            assert_eq!(panel.right(), width);
+            assert!(panel.top() >= probe.close.bottom());
+            assert!(panel.bottom() <= probe.seek.top());
+        }
+    }
+
+    #[test]
+    fn music_full_width_hud_f11_suppression_only_changes_central_reservation() {
+        let (mut app, ctx) = fixture();
+        for width in [1280.0, 640.0, 360.0] {
+            for (presentation, suppress, locked, reserved) in [
+                (ViewerPresentation::MainWindow, false, true, true),
+                (ViewerPresentation::MainWindow, true, true, true),
+                (ViewerPresentation::Fullscreen, true, true, false),
+                (ViewerPresentation::Fullscreen, false, true, true),
+                (ViewerPresentation::MainWindow, false, false, false),
+            ] {
+                app.viewer_presentation = presentation;
+                app.settings.fullscreen_chrome_suppression.info = suppress;
+                app.fs_info_panel.locked = locked;
+                app.fs_info_panel.open = crate::ui_helpers::MetadataPanelOpenState::Closed;
+                let probe = frame(&mut app, &ctx, egui::vec2(width, 540.0), vec![]);
+                let expected_reserved = if reserved {
+                    crate::ui_music_panels::MUSIC_RIGHT_PANEL_WIDTH.min(width * 0.5)
+                } else {
+                    0.0
+                };
+                assert_eq!(probe.content_clip.width(), width - expected_reserved);
+                assert_eq!(probe.painted_background.width(), width);
+                assert_eq!(probe.painted_top.width(), width);
+                assert_eq!(probe.painted_hud.width(), width);
+                assert_eq!(probe.panel.is_some(), reserved);
+                assert_eq!(
+                    app.fs_info_panel.locked, locked,
+                    "layout preserves raw lock"
+                );
+                assert!(probe.painted_top.contains_rect(probe.close));
+                assert!(probe.painted_hud.contains_rect(probe.seek));
+                if let Some(panel) = probe.panel {
+                    assert!(!panel.intersect(probe.close).is_positive());
+                    assert!(!panel.intersect(probe.seek).is_positive());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn music_full_width_hud_mouse_touch_and_panel_keep_separate_input_areas() {
+        for width in [1280.0, 640.0, 360.0] {
+            for touch in [false, true] {
+                let (mut app, ctx) = fixture();
+                let size = egui::vec2(width, 540.0);
+                for _ in 0..3 {
+                    frame(&mut app, &ctx, size, vec![]);
+                }
+                // Formerly reserved right band: actual top close must be reachable here.
+                let close = egui::pos2(width - 27.0, MUSIC_TOP_BAR_HEIGHT * 0.5);
+                frame(&mut app, &ctx, size, button(close, true, touch));
+                frame(&mut app, &ctx, size, button(close, false, touch));
+                assert!(
+                    app.music_view_close_requested,
+                    "viewport-right close, touch={touch}"
+                );
+                app.music_view_close_requested = false;
+                let probe = frame(&mut app, &ctx, size, vec![]);
+                let panel = probe.panel.unwrap();
+                let panel_pos = panel.center();
+                let before = app
+                    .fs_cache
+                    .get(&0)
+                    .and_then(|e| match e {
+                        FsCacheEntry::Video { player, .. } => {
+                            Some(player.user_seek_base_secs_for_test())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                frame(&mut app, &ctx, size, button(panel_pos, true, touch));
+                let clicked = frame(&mut app, &ctx, size, button(panel_pos, false, touch));
+                assert!(
+                    clicked.panel_clicked,
+                    "right panel owns its actual middle band"
+                );
+                assert!(!app.music_view_close_requested);
+                let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    player.user_seek_base_secs_for_test().to_bits(),
+                    before.to_bits(),
+                    "panel cannot seek"
+                );
+                let seek_pos = egui::pos2(width - 40.0, probe.seek.center().y);
+                frame(&mut app, &ctx, size, button(seek_pos, true, touch));
+                frame(&mut app, &ctx, size, button(seek_pos, false, touch));
+                let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&0).unwrap() else {
+                    unreachable!()
+                };
+                assert!(
+                    player.user_seek_base_secs_for_test() > 100.0,
+                    "actual HUD seek owns the bottom band"
+                );
+                assert!(app.fs_info_panel.locked);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn chrome_suppression_right_close_hit_keeps_raw_lock_in_still_and_music() {
+        use crate::ui_helpers::MetadataPanelOpenState;
+        for music in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            app.viewer_presentation = crate::app::ViewerPresentation::Fullscreen;
+            app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
+            app.settings.fullscreen_chrome_suppression.info = true;
+            app.fs_info_panel.locked = true;
+            app.fs_info_panel.open = MetadataPanelOpenState::ByPointer;
+            let ctx = egui::Context::default();
+            crate::ui_fonts::configure_fonts(&ctx);
+            let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0));
+            let panel = egui::Rect::from_min_max(egui::pos2(960.0, 54.0), rect.max);
+            let mut close = egui::Pos2::ZERO;
+            for (frame, pressed) in [None, None, Some(true), Some(false), None]
+                .into_iter()
+                .enumerate()
+            {
+                let events = pressed.map_or_else(Vec::new, |down| {
+                    vec![
+                        egui::Event::PointerMoved(close),
+                        navigator_button_event(close, egui::PointerButton::Primary, down),
+                    ]
+                });
+                let _ = ctx.run(
+                    navigator_ordered_input_for_screen(
+                        events,
+                        frame as f64 * 0.1,
+                        rect.size(),
+                        1.0,
+                    ),
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            if music {
+                                app.draw_fs_music_right_panel(ui, ctx, panel, 0);
+                            } else {
+                                let lock = app.resolved_still_chrome().info_locked;
+                                app.draw_metadata_panel(ui, ctx, rect, lock, 0.0);
+                            }
+                        });
+                    },
+                );
+                if frame == 1 {
+                    close = if music {
+                        ctx.read_response(
+                            egui::Id::new("central_panel").with(("music_right_close", 0usize)),
+                        )
+                        .map(|response| response.rect.center())
+                        .unwrap_or(egui::pos2(panel.right() - 44.0, panel.top() + 16.0))
+                    } else {
+                        crate::ui_metadata_panel::take_metadata_close_button_rect_for_test()
+                            .expect(
+                                "effective-unlocked raw-locked panel must draw its close hit area",
+                            )
+                            .center()
+                    };
+                    assert!(rect.contains(close));
+                }
+            }
+            assert_eq!(
+                app.fs_info_panel.open,
+                MetadataPanelOpenState::Closed,
+                "music={music}"
+            );
+            assert!(
+                app.fs_info_panel.locked,
+                "explicit close must never unlock the saved panel"
+            );
+            app.viewer_presentation = crate::app::ViewerPresentation::MainWindow;
+            assert!(app.resolved_still_chrome().info_locked);
+        }
+    }
+    #[cfg(windows)]
+    #[test]
+    fn chrome_suppression_isolated_context_binding_and_latest_raw_exit() {
+        use crate::settings::{BottomBarLock, FullscreenChromeSuppression};
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.fullscreen_chrome_suppression = FullscreenChromeSuppression {
+            top: true,
+            bottom: true,
+            info: true,
+            navigator: true,
+        };
+        app.settings.fullscreen_top_bar_locked = true;
+        app.settings
+            .set_still_bottom_lock(BottomBarLock::BarAndStrip);
+        app.fs_info_panel.locked = true;
+        let a = app.build_window_context_for_test(1344, |app| {
+            app.fs_info_panel.locked = true;
+        });
+        let b = app.build_window_context_for_test(1345, |app| {
+            app.fs_info_panel.locked = true;
+        });
+        app.begin_active_detached_session(1344, crate::app::DetachedSource::Image);
+        app.detached_viewer_borderless_fullscreen = true;
+        let main_generation = app.items_generation;
+        assert!(app.resolved_still_chrome().top_locked && app.resolved_still_chrome().info_locked);
+        app.with_window_context_for_test(a, |app| {
+            let generation = app.items_generation;
+            let cache_count = app.fs_cache.len();
+            let resolved = app.resolved_still_chrome();
+            assert!(!resolved.top_locked && !resolved.info_locked);
+            assert_eq!(resolved.bottom_lock, BottomBarLock::None);
+            assert!(app.fs_info_panel.locked);
+            assert_eq!(app.items_generation, generation);
+            assert_eq!(app.fs_cache.len(), cache_count);
+        });
+        app.with_window_context_for_test(b, |app| {
+            assert!(
+                app.resolved_still_chrome().top_locked && app.resolved_still_chrome().info_locked
+            );
+        });
+        assert_eq!(app.items_generation, main_generation);
+        app.settings.fullscreen_top_bar_locked = false;
+        app.detached_viewer_borderless_fullscreen = false;
+        app.with_window_context_for_test(a, |app| {
+            assert!(!app.resolved_still_chrome().top_locked);
+            assert!(app.resolved_still_chrome().info_locked);
+            assert_eq!(
+                app.resolved_still_chrome().bottom_lock,
+                BottomBarLock::BarAndStrip
+            );
+        });
+    }
+
+    #[test]
+    fn chrome_suppression_navigation_gap_geometry_releases_reservation_without_resetting_open() {
+        use crate::settings::{BottomBarLock, FullscreenChromeSuppression};
+        let mut app = crate::app::setup_app_for_test();
+        app.viewer_presentation = crate::app::ViewerPresentation::Fullscreen;
+        app.settings.fullscreen_top_bar_locked = true;
+        app.settings
+            .set_still_bottom_lock(BottomBarLock::BarAndStrip);
+        app.settings.still_seek_strip_visible = true;
+        app.fs_info_panel.locked = true;
+        app.fs_info_panel.open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
+        app.fullscreen_idx = None;
+        let chrome = FsNavigationChromeContinuation::Still(FsNavigationStillChromeInputs {
+            top_bar_eligible: true,
+            seek_eligible: true,
+            strip_has_content: true,
+            info_panel_eligible: true,
+        });
+        for size in [egui::vec2(1920.0, 1080.0), egui::vec2(480.0, 320.0)] {
+            let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            let fixed = app.fs_navigation_gap_layout(rect, chrome);
+            assert!(fixed.media_rect.width() < rect.width());
+            assert!(fixed.media_rect.height() < rect.height());
+            app.settings.fullscreen_chrome_suppression = FullscreenChromeSuppression {
+                top: true,
+                bottom: true,
+                info: true,
+                navigator: true,
+            };
+            let automatic = app.fs_navigation_gap_layout(rect, chrome);
+            assert_eq!(automatic.media_rect, rect);
+            assert_eq!(automatic.panel.unwrap().0, false);
+            assert!(app.fs_info_panel.locked);
+            assert_eq!(
+                app.fs_info_panel.open,
+                crate::ui_helpers::MetadataPanelOpenState::ByPointer
+            );
+            app.settings.fullscreen_chrome_suppression = FullscreenChromeSuppression::default();
+        }
+    }
     #[test]
     fn raw_review_cancelled_paged_preview_reenters_before_and_after_info() {
         assert_cancelled_raw_preview_reenters(false);
@@ -53508,6 +54488,7 @@ mod tests {
                         false,
                         &mut window_mode_pressed,
                         true,
+                        true,
                         &mut top_bar_lock_pressed,
                         false,
                         None,
@@ -53649,6 +54630,7 @@ mod tests {
                         false,
                         false,
                         &mut window_mode_pressed,
+                        true,
                         true,
                         &mut top_bar_lock_pressed,
                         false,

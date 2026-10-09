@@ -10,12 +10,12 @@ use windows::Win32::UI::Input::Touch::{
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, HTCLIENT, WA_CLICKACTIVE, WA_INACTIVE, WM_ACTIVATE, WM_CANCELMODE,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MOUSEACTIVATE,
-    WM_NCDESTROY, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCMBUTTONDBLCLK, WM_NCMBUTTONDOWN,
-    WM_NCRBUTTONDBLCLK, WM_NCRBUTTONDOWN, WM_NCXBUTTONDBLCLK, WM_NCXBUTTONDOWN, WM_POINTERACTIVATE,
-    WM_POINTERDOWN, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_SIZE, WM_TOUCH, WM_XBUTTONDBLCLK,
-    WM_XBUTTONDOWN,
+    GetForegroundWindow, HTCLIENT, IsIconic, IsWindowVisible, WA_CLICKACTIVE, WA_INACTIVE,
+    WM_ACTIVATE, WM_CANCELMODE, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN,
+    WM_MOUSEACTIVATE, WM_NCDESTROY, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCMBUTTONDBLCLK,
+    WM_NCMBUTTONDOWN, WM_NCRBUTTONDBLCLK, WM_NCRBUTTONDOWN, WM_NCXBUTTONDBLCLK, WM_NCXBUTTONDOWN,
+    WM_POINTERACTIVATE, WM_POINTERDOWN, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_SHOWWINDOW, WM_SIZE,
+    WM_TOUCH, WM_WINDOWPOSCHANGED, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN,
 };
 
 use super::{HostCommand, gui_gate::GuiGate};
@@ -74,6 +74,17 @@ impl MainWindowObserver {
         let _ = self.notify.send(HostCommand::ReconcileVisibility);
     }
     pub fn install(self: &Arc<Self>, hwnd: u64) {
+        if let Ok(gate) = &self.gate {
+            let hwnd = HWND(hwnd as *mut _);
+            gate.set_auto_factor(
+                super::gui_gate::AutoSuppression::RootHidden,
+                !unsafe { IsWindowVisible(hwnd) }.as_bool(),
+            );
+            gate.set_auto_factor(
+                super::gui_gate::AutoSuppression::Minimized,
+                unsafe { IsIconic(hwnd) }.as_bool(),
+            );
+        }
         // The subclass owns one strong reference until WM_NCDESTROY.
         let state = Arc::into_raw(Arc::clone(self));
         let ok = unsafe {
@@ -190,12 +201,28 @@ unsafe extern "system" fn subclass(
                 if let Ok(gate) = &observer.gate {
                     gate.note_minimized();
                 }
+            } else if let Ok(gate) = &observer.gate {
+                gate.set_auto_factor(
+                    super::gui_gate::AutoSuppression::Minimized,
+                    unsafe { IsIconic(hwnd) }.as_bool(),
+                );
             }
             let result = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
             observer.notify_visibility();
             return result;
         }
+        WM_SHOWWINDOW | WM_WINDOWPOSCHANGED => {
+            if let Ok(gate) = &observer.gate {
+                gate.set_auto_factor(
+                    super::gui_gate::AutoSuppression::RootHidden,
+                    !unsafe { IsWindowVisible(hwnd) }.as_bool(),
+                );
+            }
+        }
         WM_NCDESTROY => unsafe {
+            if let Ok(gate) = &observer.gate {
+                gate.set_auto_factor(super::gui_gate::AutoSuppression::RootHidden, true);
+            }
             let _ = RemoveWindowSubclass(hwnd, Some(subclass), SUBCLASS_ID);
             drop(Arc::from_raw(data as *const MainWindowObserver));
         },

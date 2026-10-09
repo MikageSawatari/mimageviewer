@@ -311,7 +311,7 @@ pub(crate) struct SmartFolderPreparedGrid {
     details_order: Vec<usize>,
     show_search_bar: bool,
     search_query: String,
-    search_filter: Option<HashSet<usize>>,
+    search_filter: Option<super::LocalSearchFilter>,
     search_filter_origin_folder: Option<PathBuf>,
     rating_cache: HashMap<usize, u8>,
     tags_cache: HashMap<String, Vec<String>>,
@@ -1435,6 +1435,7 @@ impl App {
         let load_tags = self.tags_db.is_some();
         let load_local_adjust = self.local_adjust_db.is_some();
         let resources = SmartFolderPrepareResources {
+            catalog_work: crate::catalog::CatalogWork::default(),
             membership_only: true,
             prepare_catalog: false,
             load_adjustments: self.adjustment_db.is_some(),
@@ -2731,19 +2732,15 @@ impl App {
             .and_then(|extension| extension.to_str())
             .and_then(crate::archive_converter::ArchiveFormat::from_extension);
         let started = match format {
-            Some(crate::archive_converter::ArchiveFormat::Rar) => {
-                let fallback = self.try_archive_cache_lookup(&path);
-                self.request_rar_open_owned(
-                    path,
-                    auto_fullscreen,
-                    fallback,
-                    owner,
-                    transition.restore_intent.clone(),
-                )
-            }
+            Some(crate::archive_converter::ArchiveFormat::Rar) => self.request_rar_open_owned(
+                path,
+                auto_fullscreen,
+                owner,
+                transition.restore_intent.clone(),
+            ),
             Some(format) => {
                 if let Some(cached) = self.try_archive_cache_lookup(&path) {
-                    self.supply_smart_archive_load_alias(&path, &cached, &owner)
+                    self.supply_smart_archive_load_alias(&cached, &owner)
                 } else {
                     self.request_archive_convert_owned(
                         path,
@@ -2941,7 +2938,6 @@ impl App {
     /// Smart row. It joins the same offscreen request instead of entering the ordinary loader.
     pub(crate) fn supply_smart_archive_load_alias(
         &mut self,
-        source_path: &Path,
         load_path: &Path,
         owner: &super::OpenRequestOwner,
     ) -> bool {
@@ -2951,6 +2947,9 @@ impl App {
         let super::SmartGridArchiveOwner::Transition(request_id) = intent.smart_folder_owner else {
             return false;
         };
+        // The row owner keeps the clicked logical path; the worker may resolve a later RAR
+        // volume to a different physical first-volume source before delivering this alias.
+        let source_path = intent.source_path.as_path();
         if !self.smart_folder_transition_request_is_current(request_id, source_path) {
             return false;
         }
@@ -4017,6 +4016,7 @@ impl App {
             membership,
             None,
             SmartFolderPrepareResources {
+                catalog_work: crate::catalog::CatalogWork::default(),
                 membership_only: false,
                 prepare_catalog: true,
                 rating_write_overlay: self
@@ -5258,7 +5258,10 @@ fn scan_one_directory(
                 .then_with(|| a.definition_order.cmp(&b.definition_order))
         });
         let primary = matching_rules[0];
-        if kind == SmartFolderEntryKind::Video {
+        if matches!(
+            kind,
+            SmartFolderEntryKind::Video | SmartFolderEntryKind::Audio
+        ) {
             let video_key = crate::path_key::normalize_keep_drive(&path);
             if let Some(image) = directory_video_overrides.get(&video_key) {
                 video_thumb_overrides.insert(video_key, image.clone());
@@ -5921,6 +5924,7 @@ fn compare_smart_entries_for_request(
 
 #[derive(Clone, Default)]
 struct SmartFolderPrepareResources {
+    catalog_work: crate::catalog::CatalogWork,
     membership_only: bool,
     prepare_catalog: bool,
     load_adjustments: bool,
@@ -5949,6 +5953,7 @@ fn prepared_converted_archive_path(
     db: Option<&crate::archive_cache::ArchiveCacheDb>,
 ) -> ConvertedArchiveSourceState {
     let mut source = path.to_path_buf();
+    let mut logical_source = (!crate::rar_loader::is_rar_path(path)).then(|| source.clone());
     if crate::rar_loader::is_rar_path(path) {
         match crate::rar_loader::inspect_for_direct_read(path) {
             Ok(inspection)
@@ -5958,6 +5963,7 @@ fn prepared_converted_archive_path(
             }
             Ok(inspection) => {
                 source = inspection.resolved_path;
+                logical_source = Some(source.clone());
                 if let Ok(metadata) = std::fs::metadata(&source) {
                     mtime = crate::ui_helpers::mtime_secs(&metadata);
                     size = metadata.len() as i64;
@@ -5967,8 +5973,11 @@ fn prepared_converted_archive_path(
         }
     }
     db.and_then(|db| db.peek(&source, mtime, size))
-        .map(ConvertedArchiveSourceState::CachedZip)
-        .unwrap_or(ConvertedArchiveSourceState::Unavailable)
+        .map(|path| ConvertedArchiveSourceState::CachedZip {
+            logical_source: source.clone(),
+            path,
+        })
+        .unwrap_or(ConvertedArchiveSourceState::Unavailable { logical_source })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6814,10 +6823,10 @@ fn prepare_smart_folder(
     } else if !resources.prepare_catalog {
         None
     } else {
-        match crate::catalog::CatalogDb::open(
-            &crate::catalog::default_cache_dir(),
-            &smart_folder_synthetic_path(snapshot.definition.id),
-        ) {
+        match resources
+            .catalog_work
+            .open(&smart_folder_synthetic_path(snapshot.definition.id))
+        {
             Ok(db) => {
                 let db = Arc::new(db);
                 let mut entries = db.load_all().unwrap_or_else(|error| {
@@ -7880,6 +7889,7 @@ impl App {
             precounted_membership,
             reused_metadata,
             SmartFolderPrepareResources {
+                catalog_work: crate::catalog::CatalogWork::default(),
                 membership_only: false,
                 prepare_catalog: !is_sort_only,
                 rating_write_overlay: self
@@ -9907,6 +9917,7 @@ mod tests {
                 if original == &target && shifted == &after));
         let remaining_rows = app.items.clone();
         tx.send(Ok(super::super::ClassifiedOpenPath {
+            rar_volume_proof: None,
             kind: super::super::OpenPathKind::File,
             folder_scan: None,
         }))
@@ -10908,7 +10919,7 @@ mod tests {
         };
         app.show_search_bar = true;
         app.search_query = "a".into();
-        app.search_filter = Some(HashSet::from([0]));
+        app.search_filter = Some(HashSet::from([0]).into());
         app.rebuild_visible_indices();
         assert_eq!(app.visible_indices, [0]);
         app.write_user_ratings_shared(&[(keys[1].clone(), 4, None), (keys[2].clone(), 5, None)])
@@ -11124,22 +11135,22 @@ mod tests {
         app.requested.insert(video_index, false);
         let generation = app.items_generation;
         app.tx
-            .send(crate::thumb_loader::ThumbMsg {
-                idx: video_index,
-                image: Some(egui::ColorImage::from_rgba_unmultiplied(
+            .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                video_index,
+                Some(egui::ColorImage::from_rgba_unmultiplied(
                     [2, 2],
                     &[255u8; 16],
                 )),
-                origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
-                from_edit_preview: false,
-                edit_preview_adjustment: None,
-                source_dims: Some((2, 2)),
-                layout_dims: None,
-                canceled: false,
-                finalized: false,
-                input_seq: 0,
-                items_gen: generation,
-            })
+                crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+                false,
+                None,
+                Some((2, 2)),
+                None,
+                false,
+                false,
+                0,
+                generation,
+            ))
             .unwrap();
         app.write_user_ratings_shared(&[(keys[0].clone(), 4, None), (keys[2].clone(), 5, None)])
             .unwrap();
@@ -12714,7 +12725,10 @@ mod tests {
         edits.adjustment.insert(format!("{cache_key}::page:0"));
         let converted = HashMap::from([(
             crate::path_key::normalize_keep_drive(&archive_path),
-            ConvertedArchiveSourceState::CachedZip(cache_path),
+            ConvertedArchiveSourceState::CachedZip {
+                logical_source: archive_path.clone(),
+                path: cache_path,
+            },
         )]);
 
         assert!(metadata_filter_passes(

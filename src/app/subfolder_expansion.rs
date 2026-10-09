@@ -813,6 +813,15 @@ fn scan_one_directory(
         }
     }
 
+    // Audio is absent from this view and cannot own an image sidecar or suppress an
+    // image row. Its visible presence still prevents image-folder book folding.
+    let has_visible_audio = media.iter().any(|entry| {
+        entry.kind == super::folder_scan::ScanMediaKind::Audio
+            && options
+                .file_type_visibility
+                .allows_physical_file(&entry.path)
+    });
+    media.retain(|entry| entry.kind != super::folder_scan::ScanMediaKind::Audio);
     if options.skip_image_if_video_exists && options.video_thumb_use_sidecar_image {
         for (video, image) in super::folder_scan::discover_scanned_video_sidecars(&media) {
             if options.file_type_visibility.allows_physical_file(&video) {
@@ -830,7 +839,10 @@ fn scan_one_directory(
     super::folder_scan::filter_upscaled_video_pairs_fast(&mut media, &entry_file_names_ci);
     apply_duplicate_filters_to_media(&mut media, options, &mut result.video_thumb_overrides);
     if options.image_folder_books
-        && super::folder_scan::is_image_only_book_contents(has_book_container, &media)
+        && super::folder_scan::is_image_only_book_contents(
+            has_book_container || has_visible_audio,
+            &media,
+        )
     {
         let metadata = std::fs::metadata(dir).ok();
         if metadata.is_none() {
@@ -862,7 +874,6 @@ fn scan_one_directory(
             .scan_filter
             .entry_matches(entry.kind, entry.mtime, entry.file_size, filter_now)
     });
-    media.retain(|entry| entry.kind != super::folder_scan::ScanMediaKind::Audio);
     media.retain(|entry| {
         let entry_kind = match entry.kind {
             super::folder_scan::ScanMediaKind::Image => SubfolderExpansionEntryKind::Image,
@@ -3835,6 +3846,94 @@ mod tests {
         assert_eq!(result.entries[0].kind, SubfolderExpansionEntryKind::Folder);
     }
 
+    #[test]
+    fn visible_audio_keeps_image_folder_unfolded_without_suppressing_its_image() {
+        let tmp = tempfile::tempdir().unwrap();
+        let audio = tmp.path().join("song.mp3");
+        let image = tmp.path().join("song.jpg");
+        std::fs::write(&audio, b"audio").unwrap();
+        std::fs::write(&image, b"image").unwrap();
+        let mut options = test_scan_options(true);
+        options.skip_image_if_video_exists = true;
+        options.video_thumb_use_sidecar_image = true;
+
+        let result = scan_test_root(tmp.path(), options.clone());
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].path, image);
+        assert_eq!(result.entries[0].kind, SubfolderExpansionEntryKind::Image);
+        assert!(result.video_thumb_overrides.is_empty());
+
+        options
+            .file_type_visibility
+            .excluded_categories
+            .insert(crate::file_type_visibility::FileTypeCategory::Audio);
+        let result = scan_test_root(tmp.path(), options);
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].path, tmp.path());
+        assert_eq!(result.entries[0].kind, SubfolderExpansionEntryKind::Folder);
+        assert!(result.video_thumb_overrides.is_empty());
+    }
+
+    #[test]
+    fn audio_sidecar_images_remain_in_subfolder_expansion_while_video_sidecars_stay_suppressed() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let audio = root.join("song.mp3");
+        let audio_image = root.join("song.jpg");
+        let video = root.join("movie.mp4");
+        let video_image = root.join("movie.jpg");
+        let mut mp3 = crate::audio_album_art::tests::tag(&[], 4, 0);
+        mp3.extend([0xff, 0xfb, 0x90, 0x00]);
+        std::fs::write(&audio, mp3).unwrap();
+        std::fs::write(&video, b"video").unwrap();
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            2,
+            2,
+            image::Rgb([30, 120, 200]),
+        ))
+        .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+        .unwrap();
+        for path in [&audio_image, &video_image] {
+            std::fs::write(path, jpeg.get_ref()).unwrap();
+        }
+        for use_sidecar in [false, true] {
+            let mut options = test_scan_options(false);
+            options.skip_image_if_video_exists = true;
+            options.video_thumb_use_sidecar_image = use_sidecar;
+            let result = scan_test_root(&root, options);
+            assert_eq!(result.entries.len(), 2);
+            assert!(
+                result
+                    .entries
+                    .iter()
+                    .any(|entry| entry.kind == SubfolderExpansionEntryKind::Image
+                        && entry.path == audio_image)
+            );
+            assert!(result.entries.iter().any(|entry| entry.kind
+                == SubfolderExpansionEntryKind::Video
+                && entry.path == video));
+            assert!(
+                !result
+                    .entries
+                    .iter()
+                    .any(|entry| entry.path == audio || entry.path == video_image)
+            );
+            assert!(
+                !result
+                    .video_thumb_overrides
+                    .contains_key(&crate::path_key::normalize_keep_drive(&audio))
+            );
+            assert_eq!(
+                result
+                    .video_thumb_overrides
+                    .get(&crate::path_key::normalize_keep_drive(&video)),
+                use_sidecar.then_some(&video_image),
+            );
+        }
+    }
     #[test]
     fn duplicate_filter_is_scoped_to_one_parent() {
         let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();

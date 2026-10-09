@@ -414,6 +414,26 @@ impl TouchRecognizer {
         Vec::new()
     }
 
+    pub(crate) fn accepts_grid_tap_end(&self, sample: TouchSample) -> bool {
+        if sample.phase != TouchPhase::End
+            || self.contacts.len() != 1
+            || !matches!(
+                self.owner,
+                TouchOwner::Undecided | TouchOwner::WidgetPassthrough
+            )
+        {
+            return false;
+        }
+        self.contacts
+            .iter()
+            .find(|contact| contact.id == sample.id)
+            .is_some_and(|contact| {
+                let mut contact = *contact;
+                contact.update(sample.pos);
+                contact.is_tap(sample.now_ms)
+            })
+    }
+
     fn handle_end(&mut self, geom: &TapZoneGeometry, sample: TouchSample) -> Vec<TouchCommand> {
         let Some(index) = self
             .contacts

@@ -331,6 +331,7 @@ struct CacheRecord {
 #[derive(Default)]
 struct TempState {
     initialized: bool,
+    next_file_list_sequence: u64,
     cache: HashMap<CacheKey, CacheRecord>,
     reserved: HashSet<PathBuf>,
     keep_paths: HashSet<PathBuf>,
@@ -379,6 +380,11 @@ impl Materializer {
         {
             Self::new_at(temp_root, std::process::id(), true)
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_at_for_test(temp_root: PathBuf, pid: u32) -> Self {
+        Self::new_at(temp_root, pid, false)
     }
 
     fn new_at(temp_root: PathBuf, pid: u32, start_cleanup: bool) -> Self {
@@ -540,6 +546,26 @@ impl LoadedMaterializePageEdits {
 impl MaterializeSession {
     pub fn ensure_current(&self, cancel: &AtomicBool, generation: u64) -> Result<(), String> {
         check_current(&self.inner, cancel, generation)
+    }
+
+    /// 外部ツールの 1 起動へ渡す実パスを UTF-8 BOM なし・CRLF 固定で書く。
+    /// 相対パス解決を含む I/O は materialize / launch worker からだけ呼ぶ。
+    pub fn create_file_list(
+        &mut self,
+        paths: &[PathBuf],
+        cancel: &Arc<AtomicBool>,
+        generation: u64,
+    ) -> Result<PreparedFileList, String> {
+        check_current(&self.inner, cancel, generation)?;
+        // 元動画など DirectOriginal だけでも、この API 自身が初期化を完了する。
+        ensure_process_directory(&self.inner)?;
+        check_current(&self.inner, cancel, generation)?;
+        let mut lease = reserve_file_list_path(&self.inner)?;
+        write_file_list(paths, lease.file_mut()?, || {
+            check_current(&self.inner, cancel, generation)
+        })?;
+        lease.flush()?;
+        lease.finish_file_list(cancel, generation)
     }
 
     pub fn materialize(
@@ -1183,33 +1209,95 @@ fn reserve_collision_path(
             format!("{stem}-{sequence}")
         };
         let path = inner.process_dir.join(name);
-        if state.reserved.contains(&path) {
-            continue;
-        }
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(file) => {
-                state.reserved.insert(path.clone());
-                return Ok(PendingTempLease {
-                    path,
-                    inner: Arc::clone(inner),
-                    file: Some(file),
-                    active: true,
-                });
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(format!(
-                    "一時ファイルを予約できません: {}: {error}",
-                    path.display()
-                ));
-            }
+        if let Some(lease) = try_reserve_temp_path(inner, &mut state, path)? {
+            return Ok(lease);
         }
     }
     Err("一時ファイル名の連番が上限に達しました".to_string())
+}
+
+fn reserve_file_list_path(inner: &Arc<MaterializerInner>) -> Result<PendingTempLease, String> {
+    validate_real_directory(&inner.process_dir, "一時フォルダー")?;
+    let mut state = inner
+        .state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    for _ in 0..10_000 {
+        let sequence = state.next_file_list_sequence;
+        state.next_file_list_sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| "一時リストファイル名の連番が上限に達しました".to_string())?;
+        let path = inner.process_dir.join(format!("file-list-{sequence}.txt"));
+        if let Some(lease) = try_reserve_temp_path(inner, &mut state, path)? {
+            return Ok(lease);
+        }
+    }
+    Err("一時リストファイル名の連番が上限に達しました".to_string())
+}
+
+fn try_reserve_temp_path(
+    inner: &Arc<MaterializerInner>,
+    state: &mut TempState,
+    path: PathBuf,
+) -> Result<Option<PendingTempLease>, String> {
+    if state.reserved.contains(&path) {
+        return Ok(None);
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(file) => {
+            state.reserved.insert(path.clone());
+            Ok(Some(PendingTempLease {
+                path,
+                inner: Arc::clone(inner),
+                file: Some(file),
+                active: true,
+            }))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+        Err(error) => Err(format!(
+            "一時ファイルを予約できません: {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn write_file_list(
+    paths: &[PathBuf],
+    writer: &mut impl std::io::Write,
+    mut ensure_current: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    for path in paths {
+        ensure_current()?;
+        // 元の OsStr を先に厳密検査する。absolute も canonicalize / lossy 変換しない。
+        validate_file_list_path(path)?;
+        let absolute = if path.is_absolute() {
+            path.clone()
+        } else {
+            std::path::absolute(path)
+                .map_err(|error| format!("リストのパスを絶対パスにできません: {error}"))?
+        };
+        let text = validate_file_list_path(&absolute)?;
+        writer
+            .write_all(text.as_bytes())
+            .and_then(|()| writer.write_all(b"\r\n"))
+            .map_err(|error| format!("一時リストファイルを書き込めません: {error}"))?;
+        ensure_current()?;
+    }
+    ensure_current()
+}
+
+fn validate_file_list_path(path: &Path) -> Result<&str, String> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| "リストへ渡すパスは Unicode で表現できません".to_string())?;
+    if text.contains(['\r', '\n', '\0']) {
+        return Err("リストへ渡すパスに CR / LF / NUL が含まれています".to_string());
+    }
+    Ok(text)
 }
 
 fn delete_request_owned_file(inner: &MaterializerInner, path: &Path) {
@@ -1269,6 +1357,25 @@ impl PendingTempLease {
             output_stamp,
         ))
     }
+
+    fn finish_file_list(
+        mut self,
+        cancel: &AtomicBool,
+        generation: u64,
+    ) -> Result<PreparedFileList, String> {
+        drop(self.file.take());
+        check_current(&self.inner, cancel, generation)?;
+        self.active = false;
+        Ok(PreparedFileList {
+            file: PreparedMaterializedFile {
+                path: self.path.clone(),
+                original: false,
+                ownership: PreparedOwnership::RequestOwnedArtifact {
+                    inner: Arc::clone(&self.inner),
+                },
+            },
+        })
+    }
 }
 
 impl Drop for PendingTempLease {
@@ -1311,6 +1418,21 @@ pub struct PreparedMaterializedFile {
     ownership: PreparedOwnership,
 }
 
+/// 再利用 cache を持たない要求所有のリスト。spawn 成功時だけ process 所有へ移す。
+pub struct PreparedFileList {
+    file: PreparedMaterializedFile,
+}
+
+impl PreparedFileList {
+    pub fn path(&self) -> &Path {
+        self.file.path()
+    }
+
+    pub fn transfer_to_process_directory(&mut self, keep_temp: bool) {
+        self.file.transfer_to_process_directory(keep_temp);
+    }
+}
+
 enum PreparedOwnership {
     Direct,
     /// Cache hit は既に process directory ownership へ移ったファイルを借りる。
@@ -1322,6 +1444,10 @@ enum PreparedOwnership {
         cache_key: CacheKey,
         source_stamp: FileStamp,
         output_stamp: FileStamp,
+    },
+    /// リストなど 1 起動専用の成果物。画像 cache key / stamp を持たず、再利用しない。
+    RequestOwnedArtifact {
+        inner: Arc<MaterializerInner>,
     },
     Transferred,
 }
@@ -1367,7 +1493,9 @@ impl PreparedOwnership {
         match self {
             Self::Direct => TempOwnershipStage::Direct,
             Self::ProcessOwnedReuse { .. } => TempOwnershipStage::ProcessOwned,
-            Self::RequestOwned { .. } => TempOwnershipStage::RequestOwned,
+            Self::RequestOwned { .. } | Self::RequestOwnedArtifact { .. } => {
+                TempOwnershipStage::RequestOwned
+            }
             Self::Transferred => TempOwnershipStage::Transferred,
         }
     }
@@ -1461,6 +1589,16 @@ impl PreparedMaterializedFile {
                     state.keep_paths.insert(self.path.clone());
                 }
             }
+            PreparedOwnership::RequestOwnedArtifact { inner } => {
+                let mut state = inner
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                state.reserved.remove(&self.path);
+                if keep_temp {
+                    state.keep_paths.insert(self.path.clone());
+                }
+            }
         }
     }
 }
@@ -1469,7 +1607,8 @@ impl Drop for PreparedMaterializedFile {
     fn drop(&mut self) {
         if temp_ownership_transition(self.ownership.stage(), TempOwnershipEvent::RequestDropped)
             == TempOwnershipTransition::DeleteRequestFile
-            && let PreparedOwnership::RequestOwned { inner, .. } = &self.ownership
+            && let PreparedOwnership::RequestOwned { inner, .. }
+            | PreparedOwnership::RequestOwnedArtifact { inner } = &self.ownership
         {
             delete_request_owned_file(inner, &self.path);
         }
@@ -2336,6 +2475,378 @@ mod tests {
                 .ensure_current(&AtomicBool::new(false), current)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn file_list_writes_exact_utf8_crlf_absolute_paths_without_quoting() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = Materializer::new_at(temp.path().join("materialized"), 100, false);
+        let generation = manager.begin_generation();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut paths = vec![
+            temp.path().join("日本語 空白 😀.jpg"),
+            PathBuf::from("relative folder").join("不存在.jpg"),
+        ];
+        #[cfg(windows)]
+        paths.push(PathBuf::from(r"\\server\共有\with space\😀.png"));
+        let expected: Vec<u8> = paths
+            .iter()
+            .flat_map(|path| {
+                let absolute = if path.is_absolute() {
+                    path.clone()
+                } else {
+                    std::env::current_dir().unwrap().join(path)
+                };
+                format!("{}\r\n", absolute.to_str().unwrap()).into_bytes()
+            })
+            .collect();
+        let list = manager
+            .session()
+            .create_file_list(&paths, &cancel, generation)
+            .unwrap();
+        assert_eq!(std::fs::read(list.path()).unwrap(), expected);
+        assert_eq!(list.path().file_name().unwrap(), "file-list-0.txt");
+        assert!(manager.inner.state.lock().unwrap().cache.is_empty());
+    }
+
+    #[test]
+    fn file_list_refuses_unrepresentable_paths_and_deletes_partial_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = Materializer::new_at(temp.path().join("materialized"), 101, false);
+        let generation = manager.begin_generation();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let invalid_paths = ["bad\rname.jpg", "bad\nname.jpg", "bad\0name.jpg"];
+        for invalid in invalid_paths {
+            let paths = [temp.path().join("valid.jpg"), PathBuf::from(invalid)];
+            let error = manager
+                .session()
+                .create_file_list(&paths, &cancel, generation)
+                .err()
+                .expect("an invalid line must reject the whole launch");
+            assert!(error.contains("CR / LF / NUL"));
+            assert_eq!(
+                std::fs::read_dir(&manager.inner.process_dir)
+                    .unwrap()
+                    .count(),
+                0
+            );
+            assert!(manager.inner.state.lock().unwrap().reserved.is_empty());
+        }
+        #[cfg(windows)]
+        let invalid_unicode = {
+            use std::os::windows::ffi::OsStringExt as _;
+            std::ffi::OsString::from_wide(&[b'a' as u16, 0xd800, b'b' as u16])
+        };
+        #[cfg(not(windows))]
+        let invalid_unicode = {
+            use std::os::unix::ffi::OsStringExt as _;
+            std::ffi::OsString::from_vec(vec![b'a', 0xff, b'b'])
+        };
+        let error = manager
+            .session()
+            .create_file_list(&[PathBuf::from(invalid_unicode)], &cancel, generation)
+            .err()
+            .expect("non-Unicode paths must not undergo lossy conversion");
+        assert!(error.contains("Unicode"));
+        assert_eq!(
+            std::fs::read_dir(&manager.inner.process_dir)
+                .unwrap()
+                .count(),
+            0
+        );
+        assert!(manager.inner.state.lock().unwrap().reserved.is_empty());
+    }
+
+    #[test]
+    fn file_list_never_reuses_names_or_overwrites_prior_or_foreign_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = Materializer::new_at(temp.path().join("materialized"), 102, false);
+        let generation = manager.begin_generation();
+        let cancel = Arc::new(AtomicBool::new(false));
+        ensure_process_directory(&manager.inner).unwrap();
+        let foreign = manager.inner.process_dir.join("file-list-0.txt");
+        std::fs::write(&foreign, b"foreign").unwrap();
+        let mut session = manager.session();
+        let paths = [temp.path().join("first.jpg")];
+        let mut first = session
+            .create_file_list(&paths, &cancel, generation)
+            .unwrap();
+        let first_path = first.path().to_path_buf();
+        let first_bytes = std::fs::read(&first_path).unwrap();
+        assert_eq!(first_path.file_name().unwrap(), "file-list-1.txt");
+        first.transfer_to_process_directory(false);
+        drop(first);
+        let second = session
+            .create_file_list(&[temp.path().join("second.jpg")], &cancel, generation)
+            .unwrap();
+        let second_path = second.path().to_path_buf();
+        assert_ne!(second_path, first_path);
+        assert_ne!(std::fs::read(&second_path).unwrap(), first_bytes);
+        drop(second);
+        let third = session
+            .create_file_list(&paths, &cancel, generation)
+            .unwrap();
+        assert_ne!(
+            third.path(),
+            second_path,
+            "deleted lists cannot be reused either"
+        );
+        assert_eq!(std::fs::read(&first_path).unwrap(), first_bytes);
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"foreign");
+        assert!(manager.inner.state.lock().unwrap().cache.is_empty());
+    }
+
+    #[test]
+    fn file_list_drop_transfer_and_keep_follow_media_lifetime() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manager = Materializer::new_at(temp.path().join("materialized"), 103, false);
+        let generation = manager.begin_generation();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let paths = [temp.path().join("page.jpg")];
+        let mut session = manager.session();
+        let dropped = session
+            .create_file_list(&paths, &cancel, generation)
+            .unwrap();
+        let dropped_path = dropped.path().to_path_buf();
+        drop(dropped);
+        assert!(!dropped_path.exists());
+        let mut normal = session
+            .create_file_list(&paths, &cancel, generation)
+            .unwrap();
+        let normal_path = normal.path().to_path_buf();
+        normal.transfer_to_process_directory(false);
+        drop(normal);
+        let mut kept = session
+            .create_file_list(&paths, &cancel, generation)
+            .unwrap();
+        let kept_path = kept.path().to_path_buf();
+        kept.transfer_to_process_directory(true);
+        kept.transfer_to_process_directory(true);
+        drop(kept);
+        assert!(normal_path.exists());
+        assert!(kept_path.exists());
+        assert!(manager.inner.state.lock().unwrap().reserved.is_empty());
+        manager.shutdown();
+        assert!(!normal_path.exists());
+        assert!(kept_path.exists());
+        assert!(manager.inner.state.lock().unwrap().cache.is_empty());
+    }
+
+    #[test]
+    fn file_list_cancel_and_supersession_reject_before_reserving_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = Materializer::new_at(temp.path().join("materialized"), 104, false);
+        let generation = manager.begin_generation();
+        let cancel = Arc::new(AtomicBool::new(true));
+        let paths = [temp.path().join("page.jpg")];
+        assert!(
+            manager
+                .session()
+                .create_file_list(&paths, &cancel, generation)
+                .is_err()
+        );
+        cancel.store(false, Ordering::Release);
+        manager.begin_generation();
+        assert!(
+            manager
+                .session()
+                .create_file_list(&paths, &cancel, generation)
+                .is_err()
+        );
+        assert!(!manager.inner.process_dir.exists());
+        assert!(manager.inner.state.lock().unwrap().reserved.is_empty());
+    }
+
+    #[test]
+    fn file_list_checks_cancel_during_writing_and_releases_the_partial_lease() {
+        struct CancellingWriter<'a> {
+            file: &'a mut std::fs::File,
+            cancel: &'a AtomicBool,
+        }
+        impl std::io::Write for CancellingWriter<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let written = self.file.write(bytes)?;
+                self.cancel.store(true, Ordering::Release);
+                Ok(written)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.file.flush()
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let manager = Materializer::new_at(temp.path().join("materialized"), 105, false);
+        let generation = manager.begin_generation();
+        let cancel = AtomicBool::new(false);
+        ensure_process_directory(&manager.inner).unwrap();
+        let mut lease = reserve_file_list_path(&manager.inner).unwrap();
+        let path = lease.path().to_path_buf();
+        let result = write_file_list(
+            &[
+                temp.path().join("first.jpg"),
+                temp.path().join("second.jpg"),
+            ],
+            &mut CancellingWriter {
+                file: lease.file_mut().unwrap(),
+                cancel: &cancel,
+            },
+            || check_current(&manager.inner, &cancel, generation),
+        );
+        assert!(result.is_err());
+        assert!(!std::fs::read(&path).unwrap().is_empty());
+        drop(lease);
+        assert!(!path.exists());
+        assert!(manager.inner.state.lock().unwrap().reserved.is_empty());
+    }
+
+    #[test]
+    fn file_list_write_failure_releases_reservation_without_caching_output() {
+        struct FailingWriter;
+        impl std::io::Write for FailingWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    "fake disk full",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let manager = Materializer::new_at(temp.path().join("materialized"), 106, false);
+        ensure_process_directory(&manager.inner).unwrap();
+        let lease = reserve_file_list_path(&manager.inner).unwrap();
+        let path = lease.path().to_path_buf();
+        let error = write_file_list(&[temp.path().join("page.jpg")], &mut FailingWriter, || {
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.contains("fake disk full"));
+        drop(lease);
+        assert!(!path.exists());
+        let state = manager.inner.state.lock().unwrap();
+        assert!(state.reserved.is_empty());
+        assert!(state.cache.is_empty());
+    }
+
+    #[test]
+    fn file_list_cancel_or_supersession_after_writing_deletes_the_closed_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = Materializer::new_at(temp.path().join("materialized"), 110, false);
+        ensure_process_directory(&manager.inner).unwrap();
+        for supersede in [false, true] {
+            let generation = manager.begin_generation();
+            let cancel = AtomicBool::new(false);
+            let mut lease = reserve_file_list_path(&manager.inner).unwrap();
+            let path = lease.path().to_path_buf();
+            write_file_list(
+                &[temp.path().join("page.jpg")],
+                lease.file_mut().unwrap(),
+                || check_current(&manager.inner, &cancel, generation),
+            )
+            .unwrap();
+            lease.flush().unwrap();
+            assert!(path.exists());
+            if supersede {
+                manager.begin_generation();
+            } else {
+                cancel.store(true, Ordering::Release);
+            }
+            assert!(lease.finish_file_list(&cancel, generation).is_err());
+            assert!(!path.exists());
+            assert!(manager.inner.state.lock().unwrap().reserved.is_empty());
+        }
+    }
+
+    #[test]
+    fn file_list_initializes_after_first_direct_original_video() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("first.mp4");
+        std::fs::write(&source, b"video path only, no decoder involved").unwrap();
+        let manager = Materializer::new_at(temp.path().join("materialized"), 107, false);
+        let generation = manager.begin_generation();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let request = MaterializeRequest {
+            source: MaterializeSource::File {
+                path: source.clone(),
+                image_page: false,
+            },
+            raw_brightness: crate::raw::RawBrightness::default(),
+            policy: MaterializePolicy::TempOriginal,
+            page_edits: None,
+            pdf_render_long_edge: 4096,
+        };
+        let mut session = manager.session();
+        let original = session.materialize(&request, &cancel, generation).unwrap();
+        assert!(original.is_original());
+        assert!(!manager.inner.process_dir.exists());
+        let list = session
+            .create_file_list(&[original.path().to_path_buf()], &cancel, generation)
+            .unwrap();
+        assert_eq!(
+            std::fs::read(list.path()).unwrap(),
+            format!("{}\r\n", source.to_str().unwrap()).as_bytes()
+        );
+        assert!(manager.inner.state.lock().unwrap().initialized);
+    }
+
+    #[test]
+    fn file_list_initialization_failure_never_reserves_or_writes_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let blocked_root = temp.path().join("not-a-directory");
+        std::fs::write(&blocked_root, b"keep").unwrap();
+        let manager = Materializer::new_at(blocked_root.clone(), 108, false);
+        let generation = manager.begin_generation();
+        let cancel = Arc::new(AtomicBool::new(false));
+        assert!(
+            manager
+                .session()
+                .create_file_list(&[temp.path().join("page.jpg")], &cancel, generation)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&blocked_root).unwrap(), b"keep");
+        let state = manager.inner.state.lock().unwrap();
+        assert!(!state.initialized);
+        assert!(state.reserved.is_empty());
+    }
+
+    #[test]
+    fn file_list_initialization_refuses_preexisting_process_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = Materializer::new_at(temp.path().join("materialized"), 111, false);
+        std::fs::create_dir_all(&manager.inner.process_dir).unwrap();
+        let sentinel = manager.inner.process_dir.join("file-list-0.txt");
+        std::fs::write(&sentinel, b"prior process output").unwrap();
+        let generation = manager.begin_generation();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let error = manager
+            .session()
+            .create_file_list(&[temp.path().join("page.jpg")], &cancel, generation)
+            .err()
+            .expect("a preexisting process directory is not safe to reuse");
+        assert!(error.contains("安全のため再利用しません"));
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"prior process output");
+        assert!(!manager.inner.state.lock().unwrap().initialized);
+        assert!(manager.inner.state.lock().unwrap().reserved.is_empty());
+    }
+
+    #[test]
+    fn file_list_uses_configured_normal_and_portable_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        for root in [
+            temp.path().join("normal-temp").join("mimageviewer"),
+            temp.path().join("portable-data").join("temp"),
+        ] {
+            let manager = Materializer::new_at(root.clone(), 109, false);
+            let generation = manager.begin_generation();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let list = manager
+                .session()
+                .create_file_list(&[temp.path().join("page.jpg")], &cancel, generation)
+                .unwrap();
+            assert_eq!(list.path().parent().unwrap(), root.join("ext-109"));
+            assert!(list.path().exists());
+        }
     }
 
     #[test]

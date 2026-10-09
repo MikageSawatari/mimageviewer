@@ -92,6 +92,18 @@ impl TouchFrame {
             .map(|event| event.pos)
     }
 
+    pub(crate) fn is_touch_primary(&self, pos: Pos2, pressed: bool) -> bool {
+        self.primary_events
+            .iter()
+            .any(|event| event.pos == pos && event.pressed == pressed)
+    }
+
+    pub(crate) fn accepts_grid_tap_release(&self, pos: Pos2) -> bool {
+        self.primary_events
+            .iter()
+            .any(|event| !event.pressed && event.pos == pos && event.accepted_grid_tap)
+    }
+
     /// Returns true only after the primary event has first been correlated to
     /// an exact touch signature and the recognizer then requested suppression.
     pub(crate) fn should_suppress_primary(&self, pos: Pos2, pressed: bool) -> bool {
@@ -142,6 +154,7 @@ impl TouchCorrelationState {
                     pos: touch.pos,
                     pressed: true,
                     should_suppress: touch.should_suppress,
+                    accepted_grid_tap: touch.accepted_grid_tap,
                 });
                 frame.commands.extend(touch.commands);
                 true
@@ -162,6 +175,7 @@ impl TouchCorrelationState {
                     pos: touch.pos,
                     pressed: false,
                     should_suppress: touch.should_suppress,
+                    accepted_grid_tap: touch.accepted_grid_tap,
                 });
                 frame.commands.extend(touch.commands);
                 self.pending = Some(PendingSignature::EndGone);
@@ -192,6 +206,7 @@ struct CorrelatedPrimary {
     pos: Pos2,
     pressed: bool,
     should_suppress: bool,
+    accepted_grid_tap: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -199,6 +214,7 @@ struct PendingTouch {
     pos: Pos2,
     commands: Vec<TouchCommand>,
     should_suppress: bool,
+    accepted_grid_tap: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -514,6 +530,8 @@ impl TouchCorrelationState {
         // Move/End events from another contact that is still down.
         let receives_synthetic_pointer =
             self.pointer_touch.is_none() || self.pointer_touch == Some(id);
+        let accepted_grid_tap = geometry.behavior == crate::touch_input::TouchSurfaceBehavior::Grid
+            && self.recognizer.accepts_grid_tap_end(sample);
         let recognizer_was_active = self.recognizer.is_active();
         let commands =
             if matches!(phase, TouchPhase::Move | TouchPhase::End) && !recognizer_was_active {
@@ -525,6 +543,7 @@ impl TouchCorrelationState {
             };
         let pending = PendingTouch {
             pos,
+            accepted_grid_tap,
             commands,
             // This is sampled only after the raw touch event has updated the
             // recognizer. It is never consulted for an uncorrelated primary.

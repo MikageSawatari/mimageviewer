@@ -81,6 +81,7 @@ pub(crate) struct RatingViewPreparedItems {
     pub(crate) pin_map:
         std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
     pub(crate) video_items: Vec<(usize, PathBuf, u64)>,
+    pub(crate) video_thumb_overrides: std::collections::HashMap<String, PathBuf>,
     pub(crate) page_edits: crate::app::page_edit_snapshot::StablePageEditProjection,
     pub(crate) rating_stamp: crate::page_edit_write_epoch::WriteStamp,
     pub(crate) tag_stamp: crate::page_edit_write_epoch::WriteStamp,
@@ -99,6 +100,7 @@ pub(crate) struct RatingViewPrepareOptions {
     pub(crate) folder_thumb_depth: u32,
     pub(crate) edits: crate::app::page_edit_snapshot::PageEditAvailability,
     pub(crate) tags_db_path: Option<PathBuf>,
+    pub(crate) sidecar_settings: crate::settings::Settings,
 }
 
 /// A rating write changes membership without replacing the installed order.
@@ -254,6 +256,33 @@ fn prepare_rating_view(
             Some((index, path.clone(), size))
         })
         .collect();
+    let media_paths = items
+        .iter()
+        .filter_map(|item| match item {
+            GridItem::Video(path) | GridItem::Audio(path) => Some(path.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let sidecars = crate::app::folder_scan::discover_aggregate_video_sidecars_while(
+        &options.sidecar_settings,
+        &media_paths,
+        64,
+        || !cancel.load(Ordering::Relaxed),
+    )
+    .ok_or_else(|| "cancelled".to_string())?;
+    if sidecars.skipped_parents > 0 {
+        crate::logger::log(format!(
+            "rating sidecar discovery capped: scanned={} skipped={}",
+            sidecars.scanned_parents, sidecars.skipped_parents
+        ));
+    }
+    for (parent, error) in &sidecars.scan_errors {
+        crate::logger::log(format!(
+            "rating sidecar discovery failed {}: {error}",
+            parent.display()
+        ));
+    }
+    let video_thumb_overrides = sidecars.by_video_path;
     let pin_map = if let Some(db) = options.pin_db.as_ref() {
         let containers = items
             .iter()
@@ -324,6 +353,7 @@ fn prepare_rating_view(
         existing_keys,
         pin_map,
         video_items,
+        video_thumb_overrides,
         page_edits,
         rating_stamp,
         tag_stamp,
@@ -747,6 +777,7 @@ mod tests {
                 folder_thumb_depth: 0,
                 edits: Default::default(),
                 tags_db_path: None,
+                sidecar_settings: crate::settings::Settings::default(),
             };
             invalidate_source();
             let legacy =
@@ -1225,5 +1256,68 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn audio_sidecar_is_prepared_by_rating_worker_with_released_setting_off_preserved() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let audio = temp.path().join("song.flac");
+        let cover = temp.path().join("song.png");
+        std::fs::write(&audio, b"flac").unwrap();
+        std::fs::write(&cover, b"image").unwrap();
+        let db_path = temp.path().join("rating.db");
+        let db = crate::rating_db::RatingDb::open_at(&db_path).unwrap();
+        let key = crate::path_key::normalize_keep_drive(&audio);
+        let meta =
+            crate::rating_db::RatingMeta::new(RatingItemKind::Audio).with_source_path(&audio);
+        db.set_user_rating(&key, 3, Some(&meta)).unwrap();
+        drop(db);
+        for (enabled, hide_audio) in [(true, false), (false, false), (true, true)] {
+            let mut settings = crate::settings::Settings::default();
+            settings.video_thumb_use_sidecar_image = enabled;
+            // Sidecar images are metadata resources even when ordinary images are excluded.
+            settings
+                .file_type_visibility
+                .excluded_categories
+                .insert(crate::file_type_visibility::FileTypeCategory::Image);
+            if hide_audio {
+                settings
+                    .file_type_visibility
+                    .excluded_categories
+                    .insert(crate::file_type_visibility::FileTypeCategory::Audio);
+            }
+            let result = prepare_rating_view(
+                db_path.clone(),
+                3,
+                RatingViewPrepareOptions {
+                    sort: RatingViewSort::default(),
+                    visibility: settings.file_type_visibility.clone(),
+                    include_epub: true,
+                    intent: RatingViewBuildIntent::Reorder,
+                    display_order: settings.grid_display_order.clone(),
+                    pin_db: None,
+                    folder_thumb_sort: settings.folder_thumb_sort,
+                    folder_thumb_depth: settings.folder_thumb_depth,
+                    edits: Default::default(),
+                    tags_db_path: None,
+                    sidecar_settings: settings.thumbnail_source_discovery_snapshot(),
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            let prepared = result.prepared.unwrap();
+            if hide_audio {
+                assert!(prepared.items.is_empty());
+                assert!(prepared.image_metas.is_empty());
+                assert!(result.rows.is_empty());
+            } else {
+                assert!(matches!(&prepared.items[..], [GridItem::Audio(path)] if path == &audio));
+            }
+            assert_eq!(
+                prepared.video_thumb_overrides.get(&key),
+                (enabled && !hide_audio).then_some(&cover)
+            );
+        }
     }
 }

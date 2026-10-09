@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 
 fn multipart_extension() -> &'static Regex {
     static INSTANCE: OnceLock<Regex> = OnceLock::new();
-    INSTANCE.get_or_init(|| Regex::new(r"(\.part|\.r?)(\d+)((?:\.rar)?)$").unwrap())
+    INSTANCE.get_or_init(|| Regex::new(r"(?i)(\.part|\.r?)(\d+)((?:\.(?:rar|cbr))?)$").unwrap())
 }
 
 fn extension() -> &'static Regex {
@@ -509,6 +509,20 @@ mod tests {
             PathBuf::from("v8/v8.rar")
         );
         assert_eq!(Archive::new("v8/v8").first_part(), PathBuf::from("v8/v8"));
+    }
+
+    #[test]
+    fn first_part_preserves_rar_cbr_extension_case() {
+        for extension in ["RAR", "cbr", "CBR"] {
+            assert_eq!(
+                Archive::new(&format!("archive.part002.{extension}")).first_part(),
+                PathBuf::from(format!("archive.part001.{extension}")),
+            );
+        }
+        assert_eq!(
+            Archive::new("archive.PART002.RAR").first_part(),
+            PathBuf::from("archive.PART001.RAR"),
+        );
     }
 
     #[test]

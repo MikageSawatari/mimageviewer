@@ -1520,6 +1520,9 @@ items generation、live cancel、detached scope、exact media pathを照合し�
 実装前にこの構造へ合意した。新しいpendingやwindow predicateを足さず、
 video/audioのseek継続、既存窓再利用、Mainと退避した別窓の内容を維持する。
 準備worker切断は公開した窓だけを既存の初回open terminalで閉じる。
+2026-10-09 master統合後の一覧公開境界修正: 利用者指定の構造修正として、Bookmark一覧buildをmainの既存Surface lease・switch sequenceで所有し、mainの成功したitems交換だけが旧buildを退役させる。detached contextのmount・items交換・pollはmainのbuildを退役も採用もしない。同じBookmarkのsortは要求ownerを継続し、A/B記憶クリアは新epochで既存refreshを再開始する。Ctrl+Fの完了filterは送信済み条件を一緒に保持し、ViewerContextBundleの既存swap/park/dropとSmart退避で一緒に運ぶ。新しいdetached predicate・viewport・placement・待機・retry・pending ownerを設けず、公開先の所有証明と既存payloadの未接続を直すため、§2の症状パッチに当たらない。
+
+2026-10-09 §1.355追加修正: Coordinator指定の構造修正として、別窓bookmarkの既存startup resolve workerからtyped RAR header証明を採用境界へ運び、cache hit前に後続巻を拒否する。DFSも同じ証明で候補から除外する。新しいdetached predicate／viewport／待機／retryを作らず、既存requestの取消・held-owner再開・context所有を保つ。旧cacheの直接採用が共通の開封不変条件を迂回していた根因を入口ownerで直すため、§2の症状パッチに当たらない。
 
 **2026-10-08 §1.339 proof第4回監査・main切替要求の退役**
 
@@ -1545,6 +1548,15 @@ items、pin来歴、Direct、読込済み画像、読書保存keyを一括reset�
 Codex実装担当の判断は共有ストアの失効を各payload ownerへ届ける所有境界の修正であり、
 detachedの症状guardではない。設計担当の検収・独立再レビューは未実施で、合意済みとは記録しない。
 根因・経路監査・自動検証は[読書位置plan §17](book-resume-meter-plan.md#17-r4--退避した解決元ownerへのキャッシュ失効2026-10-08)を参照。
+
+**2026-10-08 §1.298 一覧背景の親操作を既存キー入口へ共有**
+
+独立レビュー済みの `grid-background-double-click-plan.md` と利用者決定に従い、
+キー `GridParentFolder` の処理を `handle_grid_parent_folder_action` へ移し、メイン一覧背景の
+ダブルクリック／double tapからも同じ入口を使う。ネストZIPの戻り前に行う既存の
+active detached保存・fullscreen closeと、仮想ページ一覧からの既存close処理は、
+条件・順序・所有経路をそのまま移した。detached判定やviewport・mount・hostの変更、
+専用復元状態、症状パッチは追加していない。detached表示面そのものは背景判定の対象外。
 
 **2026-10-06 §1.241 plan A Phase A 起動診断・Indexer単一採用**
 
@@ -4231,3 +4243,88 @@ foreground ownership を扱う際の観測として残す。
 | 2026-09-22 | fresh detached open の async sidecar restore 待ちを、既存 runtime reducer の `Opening` / `Resuming` が初回 viewport render まで所有 | `begin_active_detached_session` は publish 時に pre-viewport state を `Active` へ上書きせず、`mark_active_detached_viewport_rendered` だけがその initial open / resume の `Opening` / `Resuming -> Active` を確定する。Image / BookFolder / ZIP / PDF と、それらへ収束する変換書庫・コレクション・bookmark の共通 constructor / scan / enumerate / sidecar continuation を対象とし、scan・enumerate・password・deferred-open・sidecar identity の失敗 / cancel / discard は projected context の一つの typed terminal event から `Closing` へ進める。Active detached navigation の既存 pending owner、通常 fullscreen、F12 の既存 anchor、fullscreen folder navigation / 連結読みの §1.233 owner は変更しない | v4.0.0 実機ログでは session publish 後、sidecar restore 開始と同じ update 内に `active_terminal_before_viewport -> target disappeared` が10回反復した。`should_drop` 到達は `fullscreen_idx=None && !active_detached_transition_outstanding() && !fs_viewport_shown` を確定し、ログの `transition=0` は outstanding 件数ではなく presentation observer ID だった。根因は `Opening` を早期消去し、初回 open の lifetime を sidecar continuation を含まない複数 pending の OR から再構成した BA-7、同一 update の premature terminal は BA-5 の表出。App-global sidecar guard、新規 bool / Option、時間窓、delay / retry / repaint / reset / silent fallback は追加せず、context-owned lifecycle と producer terminal を一つの reducer 契約へ揃えたため §2 に適合する。live `SidecarLoadContinuation` を用いた begin -> wait -> resume -> viewport 回帰、identity mismatch の Closing / sibling isolation、bookmark failure terminal を追加し、detached 回帰群を通過した。履歴監査では async sidecar 化を含む v3.10.0 にも同じ構造欠陥があり、`a81f13ced` は根因導入ではなく発現 timing への影響候補と判定。親と独立 Sol / xhigh reviewer は、bookmark terminal と passive HWND 再生成を含む lifecycle 棚卸し後に §2 適合・残存 finding なしで合意 |
 | 2026-09-22 | detached の fresh open / F12 で、内容 producer の完了前に安定 window を公開し、通常 fullscreen と同じ loading placeholder から同一 window の通常表示へ遷移 | `src/ui_fullscreen.rs` の通常 fresh-load placeholder を共通 helper 化し、既存 detached builder・visibility・activation/focus protocol と同じ stable `ViewportId` で最初の host を描く。実 callback 後だけ `Opening / Resuming -> Active` とし、`ActiveDetachedSession::content_phase` の `Preparing / Ready` が loading render 後から最初の通常 content render までの owner を表す。`src/app.rs` / `startup_ops.rs` / `bookmark_browser.rs` / `ui_dialogs/archive_convert.rs` で Image・BookFolder / 画像フォルダ・ZIP・PDF・変換書庫・Collection・bookmark book/media の producer を `DetachedSessionLease` へ接続し、成功は同一 context / window を継続、失敗・cancel・timeout・X / Esc・replacement は exact lease だけを terminal にする。Folder candidate の scan は main の既存 navigation arbitration owner に残し、purpose が detached lease と collection owner を運ぶため、画像本は shell を充填し、mixed は shell を閉じて完了 scan を通常 navigation tail へ一度だけ渡し、新しい main 操作や stale collection revision が勝つ場合は巻き戻さない。PDF/background の同時実行数は変更しない | 遅い PDF open 自体を短縮・再試行・別 queue 化する変更ではなく、「操作時点で window identity と initial-open owner が未作成」という lifecycle / ownership 境界を修正した。App-global detached bool / `Option` sentinel、時間窓、delay、polling workaround、別 loading UI は追加せず、既存 runtime reducer・typed request owner・canonical fullscreen placeholder に統合している。loading viewport を実際に描く前は `Active` にせず、描画後も `Preparing` が複数 frame の producer 生存を所有し、通常 content の実描画だけが `Ready` にするため、`1ffce8118` の「viewport 前 Active による同一 update 破棄」を再導入しない。sidecar wait/mismatch、sync build failure、folder arbitration、変換 / bookmark terminal と stale sibling isolation、password dialog cleanup を状態遷移回帰で固定する構造修正であり §2 に適合する |
 | 2026-09-25 | §1.237B R2: ファイル名スタックの reload 後の選択復元を、パスではなく typed な group key で行うため、`ViewerContextBundle` の `stack_toggle_select_path: Option<PathBuf>` を `stack_selection_target: Option<StackSelectionTarget>` へ置き換え | `src/app/viewer_context_registry.rs` の bundle field、mount / deposit / swap の field 列挙だけ。物理フォルダの評価順は main と detached が共有する既存の folder load 経路の中で読み取りと並べ替えを行い、detached predicate、viewport / host / geometry / focus / lifecycle は変更しない | 評価順では reload で代表 member が変わり stack の `perf_key` (代表の path) が一致しなくなるため、同じ一覧内で不変な group key を選択の identity にした。既存 field の型を置き換えるだけで新規 bool / Option / delay / retry を足さず、所有 context と寿命は旧 field と同じ。独立 Sol / xhigh reviewer が R2 レビューで「選択 target を所有 bundle に保つ」変更として確認し ACCEPT、親 (ClaudeCode) も同意。main + detached で sibling の items / cache / generation が不変な回帰を `multiwindow_scenario_tests.rs` に追加したため §2 に適合 |
+| 2026-10-08 | §1.344 F11中のlocked chromeをexact表示先の実効値へ投影 | `src/app.rs::apply_detached_viewer_borderless_target`のapplied同期・native初期config・既存右close ownerのpicker終了、`app/native_video.rs`のraw snapshot factory / Prepare既存host claim / contextごとのcache player・source-swap待機outputへの設定同期 / 右close、`ui_dialogs/preferences.rs`のOK境界、`ui_fullscreen.rs`のprojected window binding / active host解決・navigation continuation / holdover / geometry / hit / navigator、`ui_helpers.rs`の純resolver、`ui_metadata_panel.rs` / `ui_music_panels.rs`の右×、`video/mod.rs`のconfig / Prepare payload / deferred snapshot適用、`video/native_presenter/{render_core,overlay_draw}.rs`のdraw / DComp予約 / HUD region / 同core操作可視性 / 明示close。native probeのconfigとテストも型へ追従。`app/presentation_transition.rs`のreducer、phase / effect / commit / retire / abort条件、target-changeのopen ownerは変更しない | 利用者の実装指示でClaudeCodeと独立Sol / xhigh reviewerの構造合意を確認。raw lockを保持し、exact window binding / host incarnation / HWND・既存native generationとcoreのplacementから派生する値をdraw / layout / hitへ揃える所有境界の修正で、描画だけの症状guardではない。viewport / host / placement / focus owner、rect捕捉、geometry heuristic、時間窓、復元bool / pendingを追加せず、main / siblingのlockとresource ownerを変更しない。自動回帰と利用者実機確認の結果は[実装記録](fullscreen-locked-chrome-suppression-plan.md)へ記録する |
+| 2026-10-08 | §1.344 実装レビュー追補: 音声VST shellの右× routingと同core入力回帰 | `src/app/native_video.rs`の既存shell allow-listと実handler回帰、`src/video/native_presenter/render_core.rs`のmandatory GPU資源 / CPU overlay状態の分離・既存resize dimension境界・native入力から最終描画 / hidden cleanup / release-cancelまでの回帰。detached predicate、host identity、placement reducer / phase / effect / commit / retire / abort、viewport / focus / capture ownerは変更しない | 利用者提示の独立実装レビューで構造判定への同意を再確認。既存close ownerへのrouting漏れを修正し、同coreの操作維持を描画・入力の実consumerで検証できるようにした追補。保存lock、実効投影と既存ownerの意味を保持し、GPU資源のoptional化、新しい状態組み合わせ、症状guard / 時間窓 / geometry heuristicは追加しない。実施結果は[実装記録§13](fullscreen-locked-chrome-suppression-plan.md#13-実装レビュー追補2026-10-08)へ記録する |
+| 2026-10-08 | §1.352 音楽HUDと中央コンテンツの矩形責務を分離 | `src/ui_fullscreen.rs` の既存 `ui.max_rect()` を音楽描画入口へ値として渡し、上下HUDの描画とwidget hitを全viewport矩形から導出する。中央と右予約済み帯は既存のcontent / right-band helperを使う。音楽背景・bookmark / normalizeモーダルの外枠も全viewportへ揃える。detached述語、host identity、HWND、placement / commit / abort、viewport生成、focus / capture ownerは変更しない | §2を再読。利用者が採用したHUD / contentの責務分離を実装する構造的な配置修正。縮小後の幅からviewportを逆算せず、新しい状態・症状guard・時間窓は設けない。mouse / touch入力と狭幅 / F11の回帰、snapshotで確認する |
+| 2026-10-08 | §1.351 測定中の項目移動を既存HUDの単一producerへ集約 | native_presenter/{render_core,overlay_draw}.rsのフレーム内HUD配置・描画順・モーダルhit遮断・scan中の下部HUD touchを既存touch latchへ接続、ui_helpers.rsの矩形分割、ui_music_panels.rsの音楽HUD↑↓・進捗描画、ui_fullscreen.rsの既存全viewport値からHUD矩形を渡すcallsiteと回帰、app/native_video.rsのshell gate / Escのhandler回帰（テストのみ）。既存NavigateItem / music_navigate_fileへ接続し、音声専用VST shellのallow-list・key gate・Esc寿命は変更しない。detached述語・host identity・placement / transition / viewport生成・focus / capture ownerも変更しない | §2を再読。利用者採用のQ1/Q2/Q3に従い、既存scan状態から一時配置を導出し、描く矢印と入力遮断の矩形を同じ値へ集約する構造的変更。HUD到達性を新規表示bool・代替パネル操作・別navigation owner・時間窓で補う症状パッチではない。通常再生のcompactionと既存window ownershipを保持する。実装の独立レビューは別途行う |
+| 2026-10-08 | §1.351 実装レビュー追補: 狭い音楽HUDの入力所有 | `ui_music_panels.rs`の既存volume / speedのdisabled登録、共通HUD矢印producerのscan overlay後の描画・入力登録、snapshot用volume矩形の共有。`ui_fullscreen.rs`は実HUDの360pt / 400pt / 548pt click・touch回帰の追加のみ。detached述語、viewport生成 / placement / focus / capture、native presenterとVST shellのownerは変更しない | 独立レビューの構造判定への同意を維持した利用者修正指示の範囲。既存scan ownerから非操作controlの入力所有を除き、同じrect / widget ID / music_navigate_fileを一度だけ描画・登録する責務修正。新しい表示state・幅制限・別navigation owner・時間窓を追加せず、通常HUDの配置を保持する。結果は[動画Normの追補](video-architecture.md#1351-実装レビュー追補-狭い音楽hudの入力所有)へ記録 |
+| 2026-10-09 | §1.351 実機・再レビュー追補: 音楽HUDの配置と表示対象 | `ui_music_panels.rs`のモーダル測定用下段row配置・描画とHUD返却矩形、`ui_fullscreen.rs`のactive / ParkedLive callsiteが渡す描画区分とprogressへの同じ矩形の接続、実HUD・同じidxの別context描画回帰。snapshotは同じrow rendererを使用。detached述語、viewport生成 / placement / activation / focus / capture、native presenterとVST shellのownerは変更しない | §2を再読。利用者が指示した単一配置ownerと表示対象の所有境界修正。前面塗りで重なりを隠す方式を、全項目の予約と既存scan owner由来の型付き描画区分へ置き換える構造的変更。別contextの測定状態をParkedLiveへ流さず、通常配置を保持する。新規永続state・幅制限・navigation owner・時間窓は追加しない。結果は[動画Normの検証追補](video-architecture.md#1351-実機再レビュー追補-音楽hudの配置と表示対象)へ記録 |
+
+### 2026-10-08 §1.347 音声 NoArt の cache 削除時再調査
+
+registry protocol・binding・detached 述語・viewport routing・構造状態は変更しない。
+既存 projection / AtRest bundle の Audio NoArt / Failed を、明示 cache 削除完了の scope 内だけ Evicted へ戻す。
+Loaded / Pending、generation、cancel token、他親 / drive の scope 外終端を保持する memory-only helper を使う。
+一時 mount による reconciliation / I/O は行わない。通常 open / close はこの mutation を発行しない。
+進行中の表示 / worker owner は既存のまま。[仕様・簡素化](audio-album-art-plan.md#43-組み合わせを減らすために検討した案)。
+
+### §1.337 EffeTune 自動表示の全画面 projection (2026-10-08)
+
+利用者から独立レビュー承認済みの effetune-auto-open-plan.md に従う実装指示を受領した。
+別窓の症状修正ではなく、全ローカル閲覧窓の全画面を自動表示から除くための正本公開である。
+意味上の presentation／content／F11 変更境界から既存 GuiGate の Fullscreen bit を更新し、
+ContextRef には ViewerSession.presentation を読む accessor だけを追加する。
+context mount／swap／退避だけで別 context の全画面抑止を消さない。
+受動別窓 builder は従来どおり decorations=true を要求する。geometry 判定、HWND 取得、時間窓、
+別窓状態 flag、viewport 再生成・保存経路は追加しない。兄弟 context の非起動テストを追加した。
+製品は起動せず実機確認は利用者検証へ残す。実装差分の独立レビューは未実施。
+
+### 2026-10-09 v4.5.0 CI viewer-context audit の現行契約への追従
+
+43c170c4f で停止を再現。旧 `start_loading_items_inner` の A2b 登録が stale で、
+その修正後は A4 / A6 の 32 指摘を確認した。製品動作・registry protocol は変更しない。
+
+- A2b: §1.339 の成功採用分離 (56c11e621) により prepared metadata / projection の
+  `mem::take` が移った `install_loading_items_inner` へ同じ限定登録を移す。
+  App / 既存 context の抽出ではなく、採用済み宛先への完成 payload の install である。
+- A4: RAW (3e57109e4) の `ContextAsyncOwner::RawPages` / 19 件の `ALL` と
+  読取専用 `ContextRef::raw_pages`、§1.337 の `ContextRef::presentation`、
+  §1.347 の `invalidate_audio_art_terminals_after_catalog_maintenance`、
+  §1.350 の `invalidate_converted_archive_sources_in_parked_contexts` を正確な指紋で登録。
+  RAW は context の demand / park owner、presentation は所有表示状態の読取、
+  二つの invalidation は明示 cache 削除の既存 mutation を生存 owner に伝える境界である。
+- A6: 親の test cfg のみで囲われた `book_resume_meter_tests` /
+  `media_resume_meter_tests` / `rar_archive_cache_tests` / archive dialog の `rar_cache_tests` /
+  `effetune::delivery_tests` / DSP `fake_transport` に同等の inner test cfg を明記する。
+  Windows / non-portable の追加条件も維持。既存の単一ファイル監査が test 所有を確認でき、
+  production から test API を呼べないという規則はそのまま残る。
+
+規則・閾値・ファイル除外は変更せず、A2b の stale 検査、A4 の完全一致、A6 の
+production 呼出し拒否を維持する。新しい状態や runtime 経路は追加しない。
+
+検証: `cargo test --locked -p viewer_context_audit` 36 件成功、
+`cargo run --locked -p viewer_context_audit` exit 0。`--no-allowlist` は
+既存の限定登録 5 件の A2b だけを再検出 (期待する exit 1)。
+関連 lib の `resume_meter` 75 件 / `rar_` 96 件 / `effetune` 85 件成功。
+`cargo fmt --check`、通常 / portable core check、`git diff --check` 成功。
+全変更ファイルの CRLF を維持し、製品起動・コミットは行っていない。
+
+
+### 2026-10-09 v4.5.0 master と §1.345 の統合
+
+利用者指定のmergeでは、出荷済み§1.339のmain専用facet/adoption proof、
+BookmarkBrowserBuildのSurface lease・switch sequence、§1.355のtyped RAR header証明を保持する。
+§1.345の本内bookmark rows・policy key・request・draftとページ対応表は既存の
+ViewerContextBundleで引き続きswap/park/dropし、mainの全体bookmark buildとは共有しない。
+全体buildの既存結果に登録総数・可視性通知・音声sidecar mapを揃え、採用成功後に公開する。
+親移動のキーと背景操作はmasterの共通入口を使い、その入口へ§1.345の既存direct-reader退役を接続する。
+新しいcontext registry、detached述語、viewport/placement、待機・retryを追加しない。
+実装担当と独立Sol / xhigh reviewerは、既存ownerを保つ統合であり§2の症状パッチではないと合意した。
+viewer_context_auditはmasterの規則・既知項目ゼロを保持し、§1.345の四つの読み取り専用ContextRef APIの
+fingerprintだけを用途を説明して追加する。新しいmutating APIを包括的に許可しない。
+
+同じ統合テストで、閲覧履歴loading shellのidentity準備中にsource worker応答を回収すると、
+masterの`prepare_visible_install`がbusyで拒否した後に応答を失うことを確認した。
+既存consumerはcontext/items世代/switch sequenceの失効を先に確認し、その後は既存sidecar ownerの
+準備中に受信せず、同じPendingに応答を保持する。準備終了後に一度だけhydrateする。
+masterの採用拒否境界は維持し、bool・registry・retryを追加しない処理順の接続として、
+実装担当と独立Sol / xhigh reviewerが構造面で合意した。回帰は準備中の応答保持、
+行・map・surface世代の未変更、準備完了後の同じsurfaceへの採用を本番consumerで検証する。
+
+空のloading shellからの即時ナビゲーションも出荷版のまま保つ。
+共通`begin_sidecar_restore`は、既存ownerのbusy判定後、`items.is_empty() && !restore_sidecar`
+ならI/Oの不要な`empty(policy)`を同期確定し、既存display continuationへ進む。
+特定pathを例外化せず、空でもsidecar復元対象なら元の復元手順を維持する。
+独立Sol / xhigh reviewerは、採用済み入力の同期処理であり継続の義務を失わない構造と確認した。
+受信延期の回帰は既存の`prepare_current_listing_page_identity_index`を同じshellに開始して実際の
+準備中を作り、保留応答の保持とその後の一度だけの採用を確認する。出荷版の即時reselect回帰も保持する。

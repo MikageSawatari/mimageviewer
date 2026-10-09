@@ -1813,7 +1813,7 @@ void PluginLoader::set_gui_visibility_checked(bool visible, GuiGateSnapshot perm
         return;
     }
     const bool previously_requested = gui_visibility_.requested();
-    if (!gui_visibility_.accept_show(permit, gui_gate_->snapshot(), IsIconic(main) != FALSE)) {
+    if (!gui_visibility_.accept_show(permit, gui_gate_->snapshot(), IsIconic(main) != FALSE, IsWindowVisible(main) != FALSE)) {
         sync_gui_main_visibility();
         reply("cancelled");
         return;
@@ -1821,7 +1821,7 @@ void PluginLoader::set_gui_visibility_checked(bool visible, GuiGateSnapshot perm
     ShowWindow(container, SW_SHOWNA);
     // ShowWindow can call plugin/window code reentrantly. Recheck before
     // accepting the first show and before activation, without a queued raise.
-    if (!permit.permits(gui_gate_->snapshot(), IsIconic(main) != FALSE)) {
+    if (!IsWindow(main) || !permit.permits(gui_gate_->snapshot(), IsIconic(main) != FALSE, IsWindowVisible(main) != FALSE)) {
         if (gui_visibility_.requested()) gui_visibility_.request(previously_requested);
         sync_gui_main_visibility();
         reply("cancelled");
@@ -1833,13 +1833,13 @@ void PluginLoader::set_gui_visibility_checked(bool visible, GuiGateSnapshot perm
         return;
     }
     refresh_gui_surface(container);
-    if (!permit.permits(gui_gate_->snapshot(), IsIconic(main) != FALSE)) {
+    if (!IsWindow(main) || !permit.permits(gui_gate_->snapshot(), IsIconic(main) != FALSE, IsWindowVisible(main) != FALSE)) {
         if (gui_visibility_.requested()) gui_visibility_.request(previously_requested);
         sync_gui_main_visibility();
         reply("cancelled");
         return;
     }
-    activate_gui();
+    if (!permit.auto_video) activate_gui();
     reply(gui_visibility_.requested() && IsWindowVisible(container) ? "shown" : "cancelled");
 }
 

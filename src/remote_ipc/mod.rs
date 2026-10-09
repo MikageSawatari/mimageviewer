@@ -71,7 +71,7 @@ pub(super) fn response_entry_limit(
 /// Remote grid thumbnail provenance shared by physical folders and aggregate lists.
 ///
 /// Sidecar discovery remains owned by `folder_scan::filter_video_image_duplicates`.
-/// Aggregate lists only group videos by physical parent and feed one scan per parent
+/// Aggregate lists group videos and audio by physical parent and feed one scan per parent
 /// into that existing rule; they never remove entries from the aggregate result set.
 #[derive(Default)]
 pub(super) struct RemoteThumbnailSources {
@@ -91,43 +91,60 @@ impl RemoteThumbnailSources {
         settings: &crate::settings::Settings,
         entries: &[mimageviewer_ipc::RemoteEntry],
     ) -> Self {
-        if !settings.skip_image_if_video_exists || !settings.video_thumb_use_sidecar_image {
-            return Self::default();
-        }
-
-        let videos = entries
-            .iter()
-            .filter(|entry| entry.kind == mimageviewer_ipc::RemoteEntryKind::Video)
-            .map(|entry| std::path::PathBuf::from(&entry.path))
-            .collect::<Vec<_>>();
-        if videos.is_empty() {
-            return Self::default();
-        }
-
-        let discovered = crate::app::folder_scan::discover_aggregate_video_sidecars_while(
+        Self::for_paths_while(
             settings,
-            &videos,
-            MAX_REMOTE_AGGREGATE_SIDECAR_PARENT_SCANS,
+            &entries
+                .iter()
+                .map(|entry| (std::path::PathBuf::from(&entry.path), entry.kind))
+                .collect::<Vec<_>>(),
             || true,
         )
-        .expect("unconditional remote sidecar discovery cannot be cancelled");
-        if discovered.skipped_parents > 0 {
-            crate::logger::log(format!(
-                "remote_ipc: aggregate sidecar parent scan capped limit={} scanned={} skipped_parents={}",
-                MAX_REMOTE_AGGREGATE_SIDECAR_PARENT_SCANS,
-                discovered.scanned_parents,
-                discovered.skipped_parents,
-            ));
+        .expect("unconditional remote sidecar discovery cannot be cancelled")
+    }
+
+    /// Both listing producers use the canonical core discovery. No endpoint rescans.
+    pub(super) fn for_paths_while(
+        settings: &crate::settings::Settings,
+        paths: &[(std::path::PathBuf, mimageviewer_ipc::RemoteEntryKind)],
+        keep_running: impl FnMut() -> bool,
+    ) -> Option<Self> {
+        if !settings.skip_image_if_video_exists || !settings.video_thumb_use_sidecar_image {
+            return Some(Self::default());
         }
-        for (parent, error) in discovered.scan_errors {
+        let media = paths
+            .iter()
+            .filter(|(_, kind)| {
+                matches!(
+                    kind,
+                    mimageviewer_ipc::RemoteEntryKind::Video
+                        | mimageviewer_ipc::RemoteEntryKind::Audio
+                )
+            })
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        let discovered = crate::app::folder_scan::discover_aggregate_video_sidecars_while(
+            settings,
+            &media,
+            MAX_REMOTE_AGGREGATE_SIDECAR_PARENT_SCANS,
+            keep_running,
+        )?;
+        for (parent, error) in &discovered.scan_errors {
             crate::logger::log(format!(
                 "remote_ipc: aggregate sidecar scan failed parent={} error={error}",
                 parent.display()
             ));
         }
-        Self {
-            video_sidecars: discovered.by_video_path,
+        if discovered.skipped_parents > 0 {
+            crate::logger::log(format!(
+                "remote_ipc: aggregate sidecar parent scan capped limit={} scanned={} skipped_parents={}",
+                MAX_REMOTE_AGGREGATE_SIDECAR_PARENT_SCANS,
+                discovered.scanned_parents,
+                discovered.skipped_parents
+            ));
         }
+        Some(Self {
+            video_sidecars: discovered.by_video_path,
+        })
     }
 
     pub(super) fn source_address(
@@ -135,7 +152,10 @@ impl RemoteThumbnailSources {
         path: &std::path::Path,
         kind: mimageviewer_ipc::RemoteEntryKind,
     ) -> Option<mimageviewer_ipc::RemoteAddress> {
-        if kind != mimageviewer_ipc::RemoteEntryKind::Video {
+        if !matches!(
+            kind,
+            mimageviewer_ipc::RemoteEntryKind::Video | mimageviewer_ipc::RemoteEntryKind::Audio
+        ) {
             return None;
         }
         let source = self
@@ -185,6 +205,31 @@ mod remote_thumbnail_source_tests {
         std::fs::write(&video, b"video").unwrap();
         std::fs::write(parent.join("clip.jpg"), b"sidecar").unwrap();
         video
+    }
+
+    #[test]
+    fn aggregate_audio_sidecars_use_shared_discovery_and_cancellation() {
+        let temp = tempfile::tempdir().unwrap();
+        let audio = temp.path().join("song.flac");
+        std::fs::write(&audio, b"audio").unwrap();
+        std::fs::write(temp.path().join("song.jpg"), b"image").unwrap();
+        let mut entry = entry(&audio);
+        entry.kind = mimageviewer_ipc::RemoteEntryKind::Audio;
+        let settings = crate::settings::Settings::default();
+        let sources = RemoteThumbnailSources::for_remote_entries(&settings, &[entry]);
+        assert!(
+            sources
+                .source_address(&audio, mimageviewer_ipc::RemoteEntryKind::Audio)
+                .is_some()
+        );
+        assert!(
+            RemoteThumbnailSources::for_paths_while(
+                &settings,
+                &[(audio, mimageviewer_ipc::RemoteEntryKind::Audio)],
+                || false
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -805,6 +850,7 @@ impl RemoteIpcServer {
             crate::collection_store::CollectionRemoteProducerControl,
         >,
         raw_develop_executor: std::sync::Arc<crate::raw::RawDevelopExecutor>,
+        io_sem: std::sync::Arc<crate::io_semaphore::GlobalIoSemaphore>,
     ) -> Result<Self, String> {
         #[cfg(windows)]
         {
@@ -812,6 +858,7 @@ impl RemoteIpcServer {
                 settings,
                 persistent_collection_producer,
                 raw_develop_executor,
+                io_sem,
             )
             .map(|guard| Self { _guard: guard });
         }
@@ -821,6 +868,7 @@ impl RemoteIpcServer {
                 settings,
                 persistent_collection_producer,
                 raw_develop_executor,
+                io_sem,
             );
             Err("リモート接続は Windows の名前付きパイプ専用です".to_owned())
         }
@@ -859,5 +907,22 @@ impl RemoteIpcServer {
         {
             unreachable!("remote IPC server is Windows-only")
         }
+    }
+}
+
+/// Snapshot presentation once per adopted listing; thumbnail generation is unaffected.
+pub(super) fn thumbnail_presentation(
+    settings: &crate::settings::Settings,
+) -> mimageviewer_ipc::ThumbnailPresentation {
+    use crate::settings::AudioThumbnailIndicator;
+    use mimageviewer_ipc::RemoteAudioThumbnailIndicator;
+    mimageviewer_ipc::ThumbnailPresentation {
+        audio_indicator: match settings.audio_thumbnail_indicator.normalized() {
+            AudioThumbnailIndicator::BottomLeftBadge => {
+                RemoteAudioThumbnailIndicator::BottomLeftBadge
+            }
+            AudioThumbnailIndicator::Hidden => RemoteAudioThumbnailIndicator::Hidden,
+            _ => RemoteAudioThumbnailIndicator::MusicNoteIcon,
+        },
     }
 }

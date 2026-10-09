@@ -442,6 +442,12 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 
 ## 10. 新しいキー操作を追加するとき (保守 runbook)
 
+2026-10-07 §1.349 / §1.343: 操作カスタマイズの対応表は
+`GridOrganizeFiles` → `RingActionId::GridOrganizeFiles` (Grid)、
+`FsFitModeCycle` → `RingActionId::ImageFitModeCycle` (ImageFullscreen)。
+リング／パッド、ジェスチャ、マウス3ボタンは既存の対応表・候補フィルタを共有し、
+既定割り当てや保存形式は変更しない。整理先は既存要求生成へ、fitはキーと同じ循環へ接続する。
+
 ユーザーから「keymap 対応も」と明示されなくても、キーボード操作を追加・変更する修正では
 毎回この手順を通す。
 

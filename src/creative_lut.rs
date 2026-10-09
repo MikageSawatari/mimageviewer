@@ -324,13 +324,15 @@ struct ManagedCopyBatch {
 /// 読み込み済み LUT の不変スナップショット。worker が params から自分で引く。
 #[derive(Clone, Debug, Default)]
 pub struct CreativeLutSnapshot {
-    loaded: HashMap<Uuid, SharedCreativeLut>,
+    loaded: Arc<HashMap<Uuid, SharedCreativeLut>>,
 }
 
 impl CreativeLutSnapshot {
     #[cfg(test)]
     pub(crate) fn from_loaded(loaded: HashMap<Uuid, SharedCreativeLut>) -> Self {
-        Self { loaded }
+        Self {
+            loaded: Arc::new(loaded),
+        }
     }
 
     /// params が指す LUT と強度。identity か、その LUT が読み込めていなければ `None`。
@@ -348,7 +350,7 @@ impl CreativeLutSnapshot {
 
 #[derive(Default)]
 pub struct CreativeLutLibrary {
-    loaded: HashMap<Uuid, SharedCreativeLut>,
+    loaded: Arc<HashMap<Uuid, SharedCreativeLut>>,
     errors: HashMap<Uuid, String>,
     managed_migrated: HashSet<Uuid>,
     signature: Vec<(Uuid, PathBuf, Option<BuiltinCreativeLut>)>,
@@ -360,7 +362,10 @@ impl CreativeLutLibrary {
     #[cfg(test)]
     pub(crate) fn from_builtin_for_test(builtin: BuiltinCreativeLut) -> Self {
         Self {
-            loaded: HashMap::from([(builtin.id(), Arc::new(build_builtin_creative_lut(builtin)))]),
+            loaded: Arc::new(HashMap::from([(
+                builtin.id(),
+                Arc::new(build_builtin_creative_lut(builtin)),
+            )])),
             ..Self::default()
         }
     }
@@ -381,7 +386,7 @@ impl CreativeLutLibrary {
             return;
         }
         self.signature = signature.clone();
-        self.loaded
+        Arc::make_mut(&mut self.loaded)
             .retain(|id, _| signature.iter().any(|(entry_id, _, _)| entry_id == id));
         self.errors
             .retain(|id, _| signature.iter().any(|(entry_id, _, _)| entry_id == id));
@@ -441,13 +446,13 @@ impl CreativeLutLibrary {
                     for (id, result) in results {
                         match result {
                             Ok(lut) => {
-                                self.loaded.insert(id, Arc::new(lut));
+                                Arc::make_mut(&mut self.loaded).insert(id, Arc::new(lut));
                             }
                             Err(error) => {
                                 if self.managed_migrated.contains(&id)
                                     && let Some(lut) = previous_loaded.get(&id)
                                 {
-                                    self.loaded.insert(id, Arc::clone(lut));
+                                    Arc::make_mut(&mut self.loaded).insert(id, Arc::clone(lut));
                                 } else {
                                     self.errors.insert(id, error);
                                 }
@@ -479,7 +484,7 @@ impl CreativeLutLibrary {
                     }
                     match result {
                         Ok(lut) => {
-                            self.loaded.insert(id, Arc::new(lut));
+                            Arc::make_mut(&mut self.loaded).insert(id, Arc::new(lut));
                             self.errors.remove(&id);
                             self.managed_migrated.insert(id);
                             changed = true;
@@ -909,6 +914,37 @@ pub fn apply_to_color_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn creative_lut_snapshots_share_map_and_remain_immutable_after_library_mutation() {
+        let mut library = CreativeLutLibrary::from_builtin_for_test(BuiltinCreativeLut::WarmFilm);
+        let first = library.snapshot();
+        let shared = library.snapshot();
+        assert!(Arc::ptr_eq(&first.loaded, &shared.loaded));
+        let id = BuiltinCreativeLut::WarmFilm.id();
+        let original = first.loaded.get(&id).unwrap().clone();
+        Arc::make_mut(&mut library.loaded).insert(
+            id,
+            Arc::new(build_builtin_creative_lut(BuiltinCreativeLut::CoolFade)),
+        );
+        let newer = library.snapshot();
+        assert!(Arc::ptr_eq(first.loaded.get(&id).unwrap(), &original));
+        assert!(!Arc::ptr_eq(
+            first.loaded.get(&id).unwrap(),
+            newer.loaded.get(&id).unwrap()
+        ));
+        assert!(!Arc::ptr_eq(&first.loaded, &newer.loaded));
+        let mut params = crate::adjustment::AdjustParams::default();
+        params.creative_lut = CreativeLutSelection {
+            id: Some(id),
+            strength: 1.0,
+        };
+        Arc::make_mut(&mut library.loaded).retain(|candidate, _| *candidate != id);
+        let removed = library.snapshot();
+        assert!(removed.resolve(&params).is_none());
+        assert!(Arc::ptr_eq(&first.resolve(&params).unwrap().0, &original));
+        assert!(newer.resolve(&params).is_some());
+    }
 
     const VALID_CUBE: &str = r#"
 TITLE "Managed test"

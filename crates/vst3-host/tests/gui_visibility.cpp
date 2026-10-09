@@ -132,3 +132,41 @@ static_assert(minimized_policy_and_remote(true, true));
 static_assert(policy_changes_while_minimized());
 static_assert(policy_never_opens_user_hidden_or_missing_main(false));
 static_assert(policy_never_opens_user_hidden_or_missing_main(true));
+
+// AutoVideo keeps the revision captured by the Playing producer through load,
+// hidden attach and GUI task dispatch. Every completed suppression interval
+// invalidates it even though the GUI task sees an eligible window again.
+constexpr bool auto_suppression_cancels_without_restore(unsigned bit, bool completed) {
+    miv::GuiVisibility state;
+    const miv::GuiGateSnapshot issued {4, 2, 0, true, 7};
+    const miv::GuiGateSnapshot execution {4, 2, (uint64_t(8 + completed) << 5) | (completed ? 0 : bit)};
+    if (state.accept_show(issued, execution, false, true)) return false;
+    state.reconcile_main(true, false, true);
+    return !state.requested() && !state.should_show(true, true);
+}
+constexpr bool all_auto_factors_invalidate() {
+    for (unsigned bit : {1U, 2U, 4U, 8U, 16U}) {
+        if (!auto_suppression_cancels_without_restore(bit, false) ||
+            !auto_suppression_cancels_without_restore(bit, true)) return false;
+    }
+    return true;
+}
+constexpr bool auto_requires_actual_visible_root_and_retains_success_revision() {
+    const miv::GuiGateSnapshot issued {4, 2, 0, true, 7};
+    const miv::GuiGateSnapshot current {4, 2, uint64_t(7) << 5};
+    miv::GuiVisibility state;
+    if (state.accept_show(issued, current, false, false)) return false;
+    if (state.requested()) return false;
+    return state.accept_show(issued, current, false, true) && state.requested();
+}
+constexpr bool auto_projection_does_not_change_manual_or_displayed_lifecycle() {
+    miv::GuiVisibility manual;
+    if (!manual.accept_show({4, 2}, {4, 2, 31}, false, false)) return false;
+    manual.reconcile_main(true, false, false);
+    if (!manual.should_show(true, false)) return false;
+    manual.reconcile_main(true, true, true);
+    return manual.should_show(true, false);
+}
+static_assert(all_auto_factors_invalidate());
+static_assert(auto_requires_actual_visible_root_and_retains_success_revision());
+static_assert(auto_projection_does_not_change_manual_or_displayed_lifecycle());

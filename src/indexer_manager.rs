@@ -297,6 +297,7 @@ impl IndexerManager {
             similar_passwords,
             progress,
             skip_offline_change_scan,
+            Some(GlobalIoSemaphore::process_shared(speed.io_permits())),
         ) {
             Some(manager) => StartupInitOutcome::Ready(manager),
             None => StartupInitOutcome::Unavailable,
@@ -332,6 +333,7 @@ impl IndexerManager {
             None,
             None,
             false,
+            None,
         )
     }
 
@@ -355,6 +357,7 @@ impl IndexerManager {
             Some(passwords),
             None,
             false,
+            None,
         )
         .unwrap()
     }
@@ -371,6 +374,7 @@ impl IndexerManager {
         similar_passwords: Option<crate::pdf_passwords::PdfPasswordStore>,
         progress: Option<StartupProgressHook>,
         skip_offline_change_scan: bool,
+        shared_io_sem: Option<Arc<GlobalIoSemaphore>>,
     ) -> Option<Self> {
         // IndexWriter は dispatcher に owner として渡す (Tantivy は 1 Index 1 writer 制約)。
         // dispatcher が常駐スレッドで処理するので、reconciliation も submit ベースで行う。
@@ -391,7 +395,7 @@ impl IndexerManager {
             "IndexerManager: speed profile = {:?} → io_permits = {permits}",
             speed
         ));
-        let io_sem = Arc::new(GlobalIoSemaphore::new(permits));
+        let io_sem = shared_io_sem.unwrap_or_else(|| Arc::new(GlobalIoSemaphore::new(permits)));
 
         let dispatcher = span(Lane::Indexer, Stage::IndexerDispatcher);
         let writer =
@@ -958,6 +962,7 @@ mod tests {
             None,
             None,
             true,
+            None,
         )
         .unwrap();
         wait_until("restored complete marker", || {

@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 68;
+pub const PROTOCOL_VERSION: u32 = 69;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -196,8 +196,25 @@ pub struct FolderListEntry {
     pub mtime: i64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteAudioThumbnailIndicator {
+    #[default]
+    MusicNoteIcon,
+    BottomLeftBadge,
+    Hidden,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ThumbnailPresentation {
+    #[serde(default)]
+    pub audio_indicator: RemoteAudioThumbnailIndicator,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct FolderListPayload {
+    #[serde(default)]
+    pub thumbnail_presentation: ThumbnailPresentation,
     pub effective_address: RemoteAddress,
     /// 起点の種類を公開せずパンくず先頭を表示するための名前。
     pub root_name: String,
@@ -1112,6 +1129,8 @@ pub enum RemotePageAloneEndpoint {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ContainerPayload {
+    #[serde(default)]
+    pub thumbnail_presentation: ThumbnailPresentation,
     pub title: String,
     /// 起点の種類を公開せずパンくず先頭を表示するための名前。
     pub root_name: String,
@@ -1465,6 +1484,8 @@ pub struct CollectionPayload {
     /// Full saved membership for registration-backed lists; separate from displayed rows.
     #[serde(default)]
     pub registered_total: Option<usize>,
+    #[serde(default)]
+    pub thumbnail_presentation: ThumbnailPresentation,
     pub title: String,
     pub thumb_aspect_height_ratio: f64,
     pub sort_state: RemoteGridSortState,
@@ -1599,6 +1620,8 @@ pub struct PersistentCollectionSnapshotRequest {
 pub struct PersistentCollectionSnapshotPayload {
     #[serde(default)]
     pub registered_total: usize,
+    #[serde(default)]
+    pub thumbnail_presentation: ThumbnailPresentation,
     pub collection_id: String,
     pub collection_revision: u64,
     pub view_token: String,
@@ -3259,9 +3282,10 @@ mod tests {
 
     #[test]
     fn protocol_v67_registered_collection_total_round_trips_and_defaults() {
-        assert_eq!(PROTOCOL_VERSION, 68);
+        assert_eq!(PROTOCOL_VERSION, 69);
         let payload = PersistentCollectionSnapshotPayload {
             registered_total: 12,
+            thumbnail_presentation: ThumbnailPresentation::default(),
             collection_id: "fixture".into(),
             collection_revision: 1,
             view_token: "fixture-view".into(),
@@ -3298,6 +3322,41 @@ mod tests {
         assert!(!reply.accepted);
         assert_eq!(reply.protocol_version, PROTOCOL_VERSION);
         assert_ne!(client_version, reply.protocol_version);
+    }
+
+    #[test]
+    fn protocol_v67_audio_thumbnail_presentation_has_three_stable_values_and_default() {
+        for (indicator, label) in [
+            (
+                RemoteAudioThumbnailIndicator::MusicNoteIcon,
+                "music_note_icon",
+            ),
+            (
+                RemoteAudioThumbnailIndicator::BottomLeftBadge,
+                "bottom_left_badge",
+            ),
+            (RemoteAudioThumbnailIndicator::Hidden, "hidden"),
+        ] {
+            let value = ThumbnailPresentation {
+                audio_indicator: indicator,
+            };
+            assert_eq!(
+                serde_json::to_value(value).unwrap()["audio_indicator"],
+                label
+            );
+            assert_eq!(
+                serde_json::from_str::<ThumbnailPresentation>(
+                    &serde_json::to_string(&value).unwrap()
+                )
+                .unwrap(),
+                value
+            );
+        }
+        assert_eq!(
+            serde_json::from_str::<ThumbnailPresentation>("{}").unwrap(),
+            ThumbnailPresentation::default()
+        );
+        assert_eq!(PROTOCOL_VERSION, 69);
     }
 
     #[test]
@@ -3353,7 +3412,7 @@ mod tests {
 
     #[test]
     fn protocol_v63_audio_track_control_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 68);
+        assert_eq!(PROTOCOL_VERSION, 69);
         let action = VideoStreamControlAction::AudioTrack {
             stream_index: 3,
             position_secs: 42.5,
@@ -3503,7 +3562,7 @@ mod tests {
 
     #[test]
     fn protocol_v55_connection_info_round_trips_with_tailnet_prerequisites_without_credentials() {
-        assert_eq!(PROTOCOL_VERSION, 68);
+        assert_eq!(PROTOCOL_VERSION, 69);
         let expected = ClientMessage::RemoteWebConnectionInfo {
             id: 10,
             info: RemoteWebConnectionInfo {
@@ -3546,7 +3605,7 @@ mod tests {
 
     #[test]
     fn protocol_v62_raw_error_codes_round_trip() {
-        assert_eq!(PROTOCOL_VERSION, 68);
+        assert_eq!(PROTOCOL_VERSION, 69);
         for (code, wire) in [
             (MediaErrorCode::RawPrefetchSkipped, "raw_prefetch_skipped"),
             (MediaErrorCode::RawCapacity, "raw_capacity"),
@@ -3568,7 +3627,7 @@ mod tests {
 
     #[test]
     fn protocol_v65_raw_window_request_and_all_ack_outcomes_round_trip() {
-        assert_eq!(PROTOCOL_VERSION, 68);
+        assert_eq!(PROTOCOL_VERSION, 69);
         let expected = ClientMessage::RawPrefetchWindow {
             id: 65,
             owner: test_owner("window-client"),
@@ -3714,6 +3773,7 @@ mod tests {
         let response = ServerMessage::FolderList {
             id: 49,
             response: FolderListResponse::Success(FolderListPayload {
+                thumbnail_presentation: ThumbnailPresentation::default(),
                 effective_address: RemoteAddress::file("C:/Movies"),
                 root_name: "Fixture".to_owned(),
                 thumb_aspect_height_ratio: 9.0 / 16.0,
@@ -3768,7 +3828,7 @@ mod tests {
 
     #[test]
     fn protocol_v55_remote_video_thumbnail_shape_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 68);
+        assert_eq!(PROTOCOL_VERSION, 69);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -3922,6 +3982,7 @@ mod tests {
         let expected = ServerMessage::Container {
             id: 44,
             response: ContainerResponse::Success(ContainerPayload {
+                thumbnail_presentation: ThumbnailPresentation::default(),
                 title: "book.pdf".to_owned(),
                 root_name: "Fixture".to_owned(),
                 kind: ContainerKind::Pdf,
@@ -4388,6 +4449,7 @@ mod tests {
             response: CollectionResponse::Success(CollectionPayload {
                 visibility_notice: None,
                 registered_total: None,
+                thumbnail_presentation: ThumbnailPresentation::default(),
                 title: "最近読んだ本".to_owned(),
                 thumb_aspect_height_ratio: 1.0,
                 sort_state: test_sort_state(Some("この一覧では並び順が固定されています")),
@@ -4468,6 +4530,7 @@ mod tests {
                 listing: CollectionPayload {
                     visibility_notice: None,
                     registered_total: None,
+                    thumbnail_presentation: ThumbnailPresentation::default(),
                     title: "検索結果".to_owned(),
                     thumb_aspect_height_ratio: 1.0,
                     sort_state: test_sort_state(Some("この一覧では並び順が固定されています")),
@@ -4534,6 +4597,7 @@ mod tests {
                 listing: CollectionPayload {
                     visibility_notice: None,
                     registered_total: None,
+                    thumbnail_presentation: ThumbnailPresentation::default(),
                     title: "タグの項目".to_owned(),
                     thumb_aspect_height_ratio: 1.0,
                     sort_state: test_sort_state(Some("この一覧では並び順が固定されています")),
@@ -4699,7 +4763,7 @@ mod tests {
         assert_eq!(json["places"][0]["entries"][0]["name"], "保管");
         assert_eq!(json["places"][0]["entries"][1]["path"], "Z:/absent");
         assert_eq!(json["places"][0]["entries"][1]["kind"], "folder");
-        assert_eq!(PROTOCOL_VERSION, 68);
+        assert_eq!(PROTOCOL_VERSION, 69);
     }
 
     #[test]
@@ -4897,7 +4961,7 @@ mod tests {
 
     #[test]
     fn persistent_collection_shuffle_order_round_trips_on_protocol_59() {
-        assert_eq!(PROTOCOL_VERSION, 68);
+        assert_eq!(PROTOCOL_VERSION, 69);
         let encoded = serde_json::to_value(PersistentCollectionOrderSummary::Shuffle).unwrap();
         assert_eq!(encoded, serde_json::json!({ "kind": "shuffle" }));
         let decoded: PersistentCollectionOrderSummary = serde_json::from_value(encoded).unwrap();

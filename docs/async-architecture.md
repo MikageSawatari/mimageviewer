@@ -90,6 +90,7 @@ Surfaceもswitch epochを省略しない。Bookmarkはコピー済み入力のna
 | 同scanのGridFolderCandidate／CurrentViewOrderRefresh | native Collection owner付きcandidateとorder refreshはRow（現row/revision／order snapshot）。通常candidateはSurface（copied path、scan結果でkind決定）。DetachedFolder / DetachedImageは共通main要求を作らずnative window leaseで処理 |
 | `smart_folder.rs::capture_smart_list_navigation`、`begin_smart_physical_navigation_with_navigation`、`begin_smart_history_navigation` | Surface（copied destination/root payloadと安定したowner lease）。同owner PDF verification/Collection revisionは許可。SmartGridの分類で渡されたRowは置換しない |
 | `collection_navigation.rs::enqueue_collection_navigation` | 共通headerはSurface（copied destination）、native requestはrow/entry ID/revision/anchorを厳密に照合。共通headerだけでnative検証を緩めない |
+| Snapshot cache-only分類／採用 | Snapshot row証明（既存snapshot generation + key/kind/target）。viewerの画像metadata世代ではなく、採用時に読むsnapshot自身を検証する。元RARはtyped source、ZIPは既存ArchivePreflightingのbackingとし、成功採用まで同じ証明を保持 |
 | `global_search_ui.rs::capture_search_view_adoption` | Row（search viewのprepare snapshotとsurvivor等）。**prepare要求の送信前**にcaptureし、非同期準備から採用まで保持。結果からのcopied-path openとは別owner |
 | `subfolder_expansion.rs::capture_subfolder_expansion_adoption` | 初回／root-only scanはSurface（copied roots・除去path）。現snapshotの再install/除去/reused metadata・snapshot付きrestoreはRow（現items/cache由来のprepare snapshot）。scan→prepare→installは元証明をmove |
 | `startup_ops.rs::start_startup_open_path_resolution_owned_with_navigation` | Bookmark（native resolver request ID/target）。alias・page待ちでも同要求をmoveし、取消はexact IDで行う。通常startupはnative startup ownerで共通main要求を新規captureしない |
@@ -129,6 +130,56 @@ committed PDFのpoll保留は出荷済みの状態削減策であり、
 | `bookmark_open_owner_is_current`／startup | request ID／target／window leaseを照合。restoreへsource行世代を追加しない |
 | `detached_grid_archive_open_owner_is_current`／completion | request sequenceとpreparing window leaseを照合。copy後にsource行世代を追加しない。copy前のDetachedGrid分類はindex依存 |
 | subfolder adoption | 元共通証明をmove。copied root scanはSurface、現snapshot／reused metadataを読むrestoreはRow。別native行世代条件を重ねない |
+
+## 音声画像の worker 境界 (§1.347、2026-10-08)
+
+Local は既存 heavy queue、Remote は既存 heavy worker から同じ bounded Rust PIC/APIC reader を使う。FFmpeg input / 再生 decoder / ActivityGate は抽出経路に入れない。全 Audio 抽出・decode は本体と Remote の共通 `GlobalIoSemaphore` の permit 内で行う。共有 owner は indexer profile の 1 / 2 / 4 上限変更と throttle を保持し、上限縮小時にも既存 holder を取り消さない。
+
+sidecar 出所は既存一覧準備 worker の共通 discovery で返す。履歴は entries と source map を一つの準備結果として、context / items generation / navigation sequence が合う場合だけ採用する。合成一覧の明示 refresh も既存の世代所有 worker で出所を再取得する。追加 catalog I/O・schema・prune は worker 限定、削除は admission / lease の境界で Local と Remote を同時に退役させる。一般媒体のdetails / batch / smart / EPUB / Remoteの遅延catalog openも受付時の証明を保持し、削除完了後の新epochへ乗り換えない。SourceOnly Remoteページはcatalogを必須にしない。Remote AIのsource callbackと共有PDF検証も同じ受付証明を必須引数で保持する。ZIP内RAWのCacheOnlyだけは通常RAWと同じ既存cancelでDeleting終了を待ち、一回の既存DB読取専用lookupを許す (元のwrite証明は更新しない)。[所有契約・全Remote入口監査](audio-album-art-plan.md#21-921f1e457-再レビュー-remoteの受付証明とcacheonly継続-2026-10-08)。
+
+
+## master統合時の採用境界（§1.339 / §1.347、2026-10-09）
+
+両側の採用契約を照合し、状態を減らして統合する。通常フォルダのprepared payloadは
+sidecarのVecと完全な音声inventoryを保持し、prepare中にmap変更やprune enqueueを行わない。
+成功installで全keyを正規化する。`AudioArtPrune`は完全inventoryと受付時のcatalog admissionを
+既存sidecar continuationに保持し、hydration後に起動した新items世代のworker queueへ送る。
+continuationの退役で未送信pruneも破棄し、旧queueや兄弟contextへ送らない。
+Ratingのsidecarも、受付証明を通過したinstallで設定する。
+
+ReadingHistoryは空のloading shellを準備・token検証し、直接移動とReplayの全入口で
+`adopt_main_list_navigation`を一度だけ通す。採用後にコピー済みhistory entriesを既存の
+source discovery Pendingへ渡す。完了callbackは既存`install_new_items`とidx失効で同じsurfaceを
+hydrateし、正規化sidecar、rows、rating、tags、videoの既存setupを適用する。
+surface generation、context、history、facet、検索入力・optionsと無関係なpending navigationは保持する。
+適用中または待機中のCtrl+Fは、空shellのindices／worker結果を採用し続けず、送信済みspec
+（query / target / OR mode）を新rowsに対して再実行する。specは既存`SearchPending`と完了した
+typed filter payloadが所有し、入力欄のdraftから復元しない。検索入力・optionsを上書きせず、
+未実行の入力だけでは検索を開始しない。追加のownerやpending flagは設けない。
+一覧navigationの完全なinstallerは再実行しない。上の2026-10-08記録にある履歴entriesとsource mapの
+採用は、この採用済みshellへのhydrationを指す。
+
+shellの既存native generation / context / switch sequence証明をhydrationにも保持し、
+遅延・置換済み結果を捨てる。新しいnavigation owner、rollback、pending mapは作らない。
+worker spawn / disconnectのまれな失敗は、採用済みの空shellでlog・通知し、rollbackしない。
+
+### P2追補：非同期一覧結果の公開所有（2026-10-09）
+
+外部レビュー`8037fe3dc`のP2に対し、利用者が了承した根因修正の実装契約を記録する。
+Global SearchのReady結果は、サムネイル、source map、件数、ratingを含むすべての副作用を
+採用が成立したclosure内で適用する。準備結果や拒否された結果から一覧mapへpublishしない。
+
+ブックマーク一覧構築の既存`bookmark_browser_pending`をowned worker wrapperとし、
+main contextの安定したSurface leaseとswitch sequenceを一緒に保持する。
+mainの成功したitems置換とQuick Folder切替で退役し、遅延結果はmap公開前に拒否する。
+表示中のBookmarkを残すA/B記憶クリアでは、旧epochを退役してから同じ既存refreshを
+新epoch／slotで再開始し、loading shellの行取得を完了させる。
+同じBookmark一覧のsortはownerを維持・再束縛し、detached contextのmountでmain要求を取消さない。
+本を開くBookmark resolverのnative request所有とは区別する。
+
+状態削減として、遅い一覧処理のmodal化も検討した。通常の一覧閲覧・移動を待たせる必要はなく、
+既存Pendingと採用closureに要求の証明・送信済みspecを持たせて所有を閉じる。
+新しいnavigation request、rollback、別pending mapを追加せず、既存の非同期操作を維持する。
 
 
 ## 1. ワーカー一覧
@@ -203,7 +254,7 @@ session 取消で通知・未開始仕事を失効させ、最後の fetch / sav
 | edit materialization (local / conceal) | `std::thread` (`local-adjust-render` / `conceal-materialize`、要求ごとの短命 worker) + idx 別 mpsc | viewer context 内で idx ごとに最新 1 本。可視ページが複数なら別 idx は並行し得る | source 解像度 edit chain の lazy LocalAdjust DB / JSON load、mask resize、local compose、および Conceal DB read、deflate / JSON decode、shape raster、conceal compose を UI thread 外で行う。local と conceal は同じ `local_adjust_pending[idx]` slot を共有し、後段が必要な local 完了前に conceal を誤った下位 source へ合成しない。CPU 結果だけを返し、generation / key を UI 側で検証した後、共通予算で 1 フレーム 1 枚だけ GPU upload する。詳細は §3.2.2 |
 | AI 消しゴム (MI-GAN inpaint) | `std::thread` (使い捨て) + mpsc | preview/commit ごと | erase ツールの補完推論 (`erase_inpaint_pending`、final pipeline とは別経路、§3.3) |
 | Ctrl+E エクスポート | `std::thread` (`ctrl-e-export`) + mpsc | ダイアログ確定ごとに 1 本 | UI スレッドで snapshot した base pixels / composite mask / preset を使い、隠蔽合成と JPEG/PNG/WebP 保存を順番に実行する。元画像メタデータ転記と `create_new` 書き込みも worker 側で実行し、キャンセルは各エントリ開始前に `Arc<AtomicBool>` を確認する |
-| 外部受け渡し実体化 | `std::thread` (`external-tool-materialize`) + mpsc | 論理的に最新世代 1 本。cancel 済み旧 worker の drain 中だけ一時的に重なり得る | UI が作った `MaterializeRequest` snapshot から、補正 DB の read-only open、ZIP entry read、source stat、画像 / PDF decode、`BakedEditSnapshot` 合成、PNG encode、起動直前の編集用 guard、process / Shell Invoke までを行う。実体化後は worker が launch-boundary channel で待ち、UI が items generation と起動元 viewer target を再検証して ACK した場合だけ外部起動へ進む。進捗は atomic + Mutex の小状態を UI が poll し、利用者 cancel、新要求、対象変更、終了で token または materializer generation を無効化する。新規 temp は `create_new` で atomic claim した request-owned RAII lease が handoff まで所有し、drop 時は自分の file だけを削除する。cache hit は process-owned file を借り、失敗要求から削除しない。起動成功後だけ新規 temp を process directory 所有へ移す。起動時の dead-PID / 起動前から存在する現 PID 名の孤児回収と終了時 cleanup は別の短命 worker (`materializer-orphan-cleanup` / `materializer-exit-cleanup`) で行い、reparse point を辿らない。動画 frame / 見開き実体化は P4 |
+| 外部受け渡し準備 / 実体化 | UI の frame cursor + `std::thread` (`external-tool-materialize`) + mpsc | 単一 owner の Preparing → Confirmation → Materializing → Launching。cancel 済み旧 worker は drain 中のみ重なり得る | Preparing は一覧 index / context / items generation / typed source identity を保持し、表示順・Stack・編集 snapshot を 128 entry / 2ms に分割する。所有 context の mutation / close で準備を破棄し、別 context の変更は無関係。具体的 source が確定した後は明示 cancel / supersede の既存契約を維持する。worker は補正 DB read-only、ZIP read、source stat、画像 / PDF / 動画 frame decode、見開き・編集合成、encode、リスト生成、process / Shell Invoke を行う。実体化後は UI の frame tail の launch ACK を待つ。新規メディアとリストは `create_new` の request-owned RAII lease が持ち、起動成功時だけ process 所有へ一緒に移す。画像の cache hit は process-owned 借用、リストは cache key を作らず起動ごとの別名。keep_temp は双方の終了時削除に適用する。孤児回収 / 終了時 cleanup の短命 worker と reparse point 非追従を流用し、worker / 削除 timer を増やさない |
 | 操作カスタマイズ共有 / 世代取り込み | `std::thread` (操作ごとの短命 worker) + mpsc | 「設定の復元」ダイアログ中に最大 1 本 | 過去世代 DB の一時コピーと読み込み、`.mivkeys.json` の読み書き、取り込み前の自動退避を UI スレッド外で行う。UI は native ファイルダイアログでパスを選び、50ms polling で結果を受け取ってから差分表示またはライブ適用する |
 | サブ展開 snapshot | `std::thread` (`subfolder-expansion` / `subfolder-view-prepare`) + mpsc | 最大 1 scan + 1 prepare | 現在地以下の画像 / 動画、ZIP/PDF 本体、設定上の画像フォルダ本を共通 recursive snapshot walker で列挙する。ZIP/PDF 内部は開かない。`GlobalIoSemaphore` Normal priority と `ActivityGate` を通し、`Arc<AtomicBool>` で cancel、generation で stale 結果を破棄する。大量ソート、metadata 構築、コンテナピンの一括照会も worker 側で行う |
 | スマートフォルダ snapshot | `std::thread` (`smart-folder-scan` / `smart-folder-prepare`) + mpsc | 最大 1 scan + 1 prepare | 保存済みの複数ルールを OR 結合し、ルールごとの実検索元 / 再帰指定からフォルダ / 画像 / 動画 / 音声 / ZIP / PDF / 対応アーカイブを列挙する。各 `read_dir` の候補へ通常一覧と同じ同名ファイル規則を物理フォルダ単位で適用してから保存条件を判定し、動画 sidecar は full-path key の snapshot で表示準備へ渡す。★ / タグ / 編集状態と一覧復元用の個別編集状態は prepare worker で exact-key batch 取得し、変換アーカイブ対応表、catalog、固定代表も同 worker で準備する。開始時に snapshot した現在の全体ソート順と定義固有のグループ化単位でフラット一覧を構築し、UI は同期 DB I/O をせず完成 snapshot だけを install する。削除は scan 開始世代以後の tombstone を成功 snapshot へ適用してから破棄し、全 source 失敗では保持する。★ / タグ / 編集状態・定義変更は再 prepare する。通常一覧のソート順・サムネイル / 詳細表示は上書きしない。定義変更・移動・終了時は cancel、generation と定義 snapshot の一致で stale 結果を拒否する。cancel時はreceiver内に到着済みの巨大な`Done`結果と大件数確認待ちsnapshotをpending所有者ごと専用drop workerへ移し、UIスレッドで破棄しない |
@@ -246,7 +297,7 @@ session 取消で通知・未開始仕事を失効させ、最後の fetch / sav
 | VST3 plugin GUI worker | bridge 内 per-slot STA thread (lazy) | editor を生成した slot ごと。表示した plugin 数まで増え得る | C++ bridge の plugin loader が slot ごとに STA message thread を lazy 生成し、bridge-owned editor surface と `IPlugView::attached()` を管理する。Rust 側に単一 `vst3-plugin-gui` thread はない |
 | 動画音声 RT 出力 | `cpal::Stream` 内部スレッド | 動画 1 つにつき 1 本 | WASAPI Shared モード。コールバックで ring buffer から f32 stereo を pop し、**実消費サンプル数 (= `real_consumed`) 分のみ** `next_pts_secs` を進めて `AvClock::set_audio_pts` でマスタークロックを更新。silence 出力中 (= `real_consumed=0`) は pts 進行 skip。`!clock.is_playing()` (= 一時停止 / EOF) と `pump_seek_serial < clock_serial` (= pre-seek サンプル全消去) は早期 return。`AvClock::set_audio_pts` 側に defensive wall-rate cap (= `wall_dt + 5ms` で pts 進行を頭打ち) を保持し、buffer 非空 pre-fill burst の異常前進への保険にしている (Phase 9 後の cleanup refactor、詳細は [docs/video-engine-redesign.md](video-engine-redesign.md) の「Phase 9 後の Post-cleanup refactor」節) |
 | 起動 / activation パス解決 | `std::thread` (`startup-open-resolve`) | 起動引数 / 2 重起動 activation ごとに最大 1 本 | `resolve_openable_path_detailed` (`Path::is_dir` / `is_file` + 親探索) を UI スレッド外で実行する。400ms 以上未完了ならメインウィンドウに「パスを確認しています…」toast を出し、完了後だけ UI スレッドで既存の `load_folder_or_convert_archive...` に戻す。新しい activation または Remote 取得時には旧 pending を終了し、古い結果は適用しない。Remote が操作権を持つ間の二重起動パスはログ・toast とともに拒否して返却後へ持ち越さない |
-| RAR / 7z / LZH / ZIP スキャン・変換 | `std::thread` (scan / convert ごとの使い捨て) + mpsc | `ArchiveConvertState` 1 件 | 直接 RAR 判定、画像 inventory、パスワード再試行、キャッシュ ZIP 変換を行う。`ArchiveConvertState.cancel` は事前 scan から変換完了までの単一 owner で、RAR / 7z / LZH / ZIP の各 entry 境界が同じ token を確認する。`OpenRequestOwner::Navigation` はarchive種別判定より前にvisible-open lifecycleを取得し、archive Aのscan中にarchive Bを開く場合もAのtokenとreceiverを終了してからBのstateを作る。state drop、Esc / cancel、activation、競合する通常 navigation、後続 bookmark、Remote 取得も同じ規約で古いworkerとlate resultを無効化する。Remote 取得では閲覧を開く completion だけを終了し、閲覧を開かない sibling ZIP の出力は続ける。ブックマーク起点では`completion`がrequest IDとtarget identityも保持し、直接RARまたは元アーカイブ→キャッシュZIPのmount後に同じownerでページ待機へ進める。確認・パスワード・変換中は通常の45秒resolve timeoutを適用せず、完了はownerが現在値と一致する場合だけ表示へ適用する |
+| RAR / 7z / LZH / ZIP スキャン・変換 | `std::thread` (scan / convert ごとの使い捨て) + mpsc | `ArchiveConvertState` 1 件 | 直接 RAR 判定、画像 inventory、パスワード再試行、キャッシュ ZIP 変換を行う。閲覧RARのscanはsecretなしのheaderが後続巻と示したら`Rejected`で先頭ファイルを案内する。許可された先頭巻／単巻は`ArchiveScanOutcome::Direct` / `CachedZip` / `NeedsConversion`のどれか一つを返し、password後の0画像・入れ子なしも案内付き`Rejected`とする。UI側のclicked-volume cache lookup／`fallback_cached_zip`は持たず、Directに確定したRAR backingを履歴のZip-kind prepareでcacheへ再振替しない。`ArchiveConvertState.cancel` は事前 scan から変換完了までの単一 owner で、RAR / 7z / LZH / ZIP の各 entry 境界が同じ token を確認する。`OpenRequestOwner::Navigation` はarchive種別判定より前にvisible-open lifecycleを取得し、archive Aのscan中にarchive Bを開く場合もAのtokenとreceiverを終了してからBのstateを作る。state drop、Esc / cancel、activation、競合する通常 navigation、後続 bookmark、Remote 取得も同じ規約で古いworkerとlate resultを無効化する。Remote 取得では閲覧を開く completion だけを終了し、閲覧を開かない sibling ZIP の出力は続ける。ブックマーク起点では`completion`がrequest IDとtarget identityも保持し、直接RARまたは元アーカイブ→キャッシュZIPのmount後に同じownerでページ待機へ進める。確認・パスワード・変換中は通常の45秒resolve timeoutを適用せず、完了はownerが現在値と一致する場合だけ表示へ適用する |
 | EPUB → PDF 変換 (S2a、呼出元は S2b) | 背景 worker + 子プロセス + Job Object + mpsc | 変換 1 冊につき子プロセス 1 本 | `epub_convert` が書き込み排除した元ファイルから一時コピーを作る。子を suspended で生成し `KILL_ON_JOB_CLOSE` の Job に割り当ててから再開する。stdout の JSON 進捗は channel へ、stderr は別スレッドでログへ流す。cancel event または timeout で Job を停止し、一時フォルダと `.part` を回収する。公開前の PDF 検証器は必須注入で、S2b 接続時に PDFium を使う。成功時の世代ファイルは不変で、廃止分と未完了予約だけを `epub_cache` の次回起動ゲートで掃除し、完了予約行を削除する。ファイル削除は root と各親ディレクトリを再解析ポイントを辿らずに開いて確認した後、対象ハンドルから行う |
 | フォルダ一覧の変換アーカイブ読み取り元判定 | `std::thread` (`archive-cache-peek`) + mpsc | viewer context / items generation ごとに最大 1 | 全候補を UI 側で `Pending` 登録するが、worker へは visible + keep + その item の pin 依存先だけを渡す。RAR は volume header 解決 → cache DB peek → miss 時だけ full inspection の順。候補ごとに `Direct` / `CachedZip` / `Unavailable` を逐次送信し、UI は通知ごとに `items_generation` を照合する。range 移動時は共有 scope を差し替え、既に開始済みの 1 冊だけを完了可として旧 range の queued 候補を skip する。現 batch 終了後に新 range の未解決候補を追加する。folder 切替・再読込・drop は cancel token を立てる。rollup edit filter 時だけ folder 全体 scope。batch 完了時は `nav/archive_cache_peek`、各候補は `nav/archive_cache_candidate` を記録する |
 | フォルダナビゲーション | `std::thread` | 1 (常時 ≤ 1 本) | 深さ優先で次フォルダを検索。連打は `pending_folder_nav_steps` に累積され、完了ごとに連鎖実行する (並行 DFS による FS 競合を避ける) |
@@ -366,7 +417,7 @@ ZIP 自動/pin 代表を `process_load_request` の `RawThumbHandoff::DedicatedW
 | `cache_gen_done` | `Arc<AtomicUsize>` | キャッシュ生成 rayon | UI | 進捗カウンタ |
 | `SupervisorHandle.cancel` | `Arc<AtomicBool>` | UI (お気に入り OFF, App drop) | メタ / 名前索引 supervisor | supervisor 全体の停止シグナル |
 | `GlobalSearchHandle.cancel` | `Arc<AtomicBool>` | UI (クエリ変更, バー閉じ, folder 遷移, Handle drop) | Ctrl+G クエリワーカー | Tantivy ページングループの中断 |
-| `ExternalMaterializePending.cancel` / `MaterializerInner.generation` | `Arc<AtomicBool>` / `AtomicU64` | UI (取消、新要求、対象移動、終了) | `external-tool-materialize` worker | request 単位 cancel と materializer 全体の世代を別々に検査し、古い対象の実体化結果から外部起動しない |
+| `ExternalMaterializePending.cancel` / `MaterializerInner.generation` | `Arc<AtomicBool>` / `AtomicU64` | UI (明示取消、新要求、終了) | `external-tool-materialize` worker | request cancel と materializer 世代を別々に検査し、無効化された結果から起動しない。所有 context の mutation / close は Preparing の locator を無効化するが、具体的 source 確定後のナビ移動は cancel しない |
 | `MaterializeProgress.completed` | `AtomicUsize` | `external-tool-materialize` worker | UI | 完了 target 数。stage 文言は同 owner の小さな `Mutex<String>` で渡し、UI は 50ms repaint polling で進捗 modal を更新する |
 | `tag_write_worker.shutdown` | `Arc<AtomicBool>` | App drop | タグ書き込みワーカー | 書込ループの停止 |
 | `tag_write_worker.release_db_requested` / `.db_released` | `Arc<AtomicBool>` | UI (明示メタ情報 import) / worker | タグ書き込みワーカー | import が WAL → rollback journal へ切り替える間、worker に `TagsDb` 接続を手放させる要求と、その ACK |
@@ -396,7 +447,7 @@ ZIP 自動/pin 代表を `process_load_request` の `RawThumbHandoff::DedicatedW
 | `content_identity_backfill_pending.rx` | content identity backfill worker → UI | `BackfillResult`。完了した ledger 行と per-file error 数を持つ。各完了行は同時に recorder の global update channel へ送られるため、folder switch で pending owner を drop しても commit 済み row は次の index poll に残る |
 | `content_identity_restore_pending.rx` | content identity 復元 worker → UI | `ContentRestoreReport`。batch copy 件数、拒否件数、エラー、復元先 identity 行、sidecar mirror、5 種の presence 差分を持つ。UI は report 到着後だけ既存 owner と cache invalidation を適用する |
 | `export_pending.rx` | Ctrl+E エクスポート worker → UI | `ExportEvent`: `Started` / `Completed` / `Failed` / `Cancelled` / `AllDone`。UI は毎フレーム `try_recv` で進捗モーダルを更新し、エラーがあればモーダルを残す |
-| `external_tool_materialize_pending.rx` / launch-boundary channels | worker ↔ UI | completion channel は実体化と起動を 1 操作として集約した `ExternalLaunchCompletion` を返す。別の boundary channel で worker が起動直前に停止し、UI は同じ frame の進捗 modal が Cancel / Esc を処理し、late-frame items mutation も終えた frame tail で materializer generation、items generation、起動時の viewer target snapshot を再検証して `Launch` / `Cancel` を返す。進捗表示より後に積まれた要求は次 frame の UI checkpoint まで ACK せず、ACK 後はキャンセル操作を表示しない。UI は成功 / 失敗件数と関連付け handler の更新を受け、user-cancel した完了通知はトーストへ出さない |
+| 外部起動 owner の completion / launch-boundary channels | worker ↔ UI | completion は実体化と起動を 1 操作として集約した `ExternalLaunchCompletion` を返す。worker は実体化後に境界 channel で待ち、UI は同じ frame の Cancel / Esc を処理した tail で materializer generation を検査し `Launch` / `Cancel` を返す。進捗表示より後に積まれた要求は次 frame の checkpoint まで ACK せず、ACK 後はキャンセル操作を表示しない。UI は成否件数と関連付け handler の更新を受け、user-cancel 完了はトーストへ出さない。リスト生成失敗 / パス表現拒否は当該起動の失敗として通知し、`{files}` へ代替しない |
 | `pdf_enumerate_pending` | PDF 列挙スレッド → UI | waiter ごとの `PdfEnumerateHandle` receiver。同じ `(path, password)` の実行中 request は結果を全 waiter へ fan-out し、cancel 済み request には合流せず新規 request として開始する |
 | PDF ワーカー stdin/stdout | UI プロセス ↔ PDF ワーカープロセス | 長さプレフィクス付きバイナリプロトコル (Enumerate / Render / Shutdown) |
 | Ctrl+G `SearchStreamEvent` | Ctrl+G ワーカー → UI | `Batch { hits, scanned_candidates, valid_hits }` / `Done { truncated, reason }` / `Error`。毎フレーム `try_recv` を MAX_EVENTS_PER_FRAME=8 までループ消費 |
@@ -421,6 +472,23 @@ ZIP 自動/pin 代表を `process_load_request` の `RawThumbHandoff::DedicatedW
 
 #### 2.3.1 変換アーカイブ判定 batch の range 追従
 
+RAR開封の共通scan workerは、secretなしのnative headerが後続巻と示した場合にscan・cache照会・
+Direct採用・変換前にRejectedを返し、UIの既存Error phaseで最初のファイル名を案内する（§1.355、2026-10-09決定）。
+passwordでvolume番号を確認できない場合は名前から推測せず、password後の0画像・入れ子なしのscan結果を
+先頭ファイルを案内する通知・logにする。part1／単巻はDirect → DBの実CachedZip → 変換を維持する。
+後続巻を先頭巻へ変更して開く／cacheを再利用する879802c44の閲覧経路は撤去する。
+新しいpending・rollback・retryは設けず、モーダルscan／convert ownerのcancelと古い完了破棄を維持する。
+保存失敗loggerの操作・src／tmp／dst・native code、平易な通知は維持する。
+一覧thumbnail／pin sourceの先頭巻解決と失効は変更せず、メーターはsource ownerのtyped header証明で
+header確認済み後続巻だけを隠す。cache-only入口も拒否の例外にはしない。
+RarVolumeProof（First／Subsequent { first }／UnknownEncrypted）を既存のsource／startup resolve／
+OpenPathClassification payloadで運び、Remote／DFSも同じworker-only probeを使う。
+別窓bookmarkはstartup resolve完了で採用前に拒否し、snapshotは既存分類ownerのSnapshot証明と
+snapshot世代／対象検証後にcache-only採用する。元RAR sourceとZIP backingを既存の
+PhysicalHistoryTransition / ArchivePreflightingへ渡し、成功採用でも同じ証明を検証する。
+一時的なsnapshot_internal_nav flagに非同期完了の許可を依存させない。UI callback／paintでheader I/Oをしない。
+[入口表](book-resume-meter-plan.md#入口と採用前の共通証明)を参照。
+
 `converted_archive_cache_paths` は items generation 開始時に全候補を `Pending` 登録するが、
 `ConvertedArchiveCachePathsPending` worker へ渡すのは現在の可視範囲 + thumbnail keep set と、
 その範囲内 item の folder-thumb pin 依存先だけである。range 変更は worker を cancel / respawn せず、
@@ -428,6 +496,13 @@ UI が共有 desired scope を差し替える。worker は pin root / archive �
 読み直すため、範囲外へ出た queued 候補は skip し、既に開始済みの in-flight 1 冊だけを完了させる。
 その結果は同 generation なら採用し、現 batch 終了後に新 range の `Pending` key だけを次 batch へ渡す。
 終端 key は再投入しない。
+
+2026-10-08の利用者決定により、CachedZipとキャッシュなしのUnavailableは論理sourceを
+同じtyped ownerに保持する（未確定ならNone）。メーターはload_pathの可用性ではなく、
+Direct / CachedZipの実path、またはsource確定済みUnavailableだけは現在のdata-dirと
+論理sourceから純粋計算した変換ZIP keyでBookResumeMetersを参照する。
+キャッシュ削除後も保存済みのバーを表示し、Pending／未確定／設定OFFでは非表示。
+分割RARの論理sourceはworkerのheader確認で確定し、描画中のI/Oやファイル名推測はしない。
 
 変換cache管理のDeletedSelected / DeletedMissing / DeletedAll完了は、読込元ownerへ
 変異通知を渡す。旧batchのreceiverを破棄/cancelし、CachedZipだけをPendingへ戻して
@@ -1606,3 +1681,13 @@ CPU time とログ増加量も含むリリース前手順は
 4. ワーカー側で `perf::event("<cat>", "begin"/"end", key, req.input_seq, &[...])` を emit
 5. Ready 遷移 (texture upload 完了) で `perf::event("<cat>", "ready", ...)` を emit
 6. `docs/async-architecture.md` のこの表にエントリを追加
+
+### §1.337 再生成功からの EffeTune 自動表示
+
+EngineActor の PlaybackStart が NewSource／UserPlay／ContinuousAdvance を所有し、Playing 確定時に
+共有 GuiGate の5要因 atomic projection と viewer binding を採取する。normalize／seek／DSP／loop は内部継続である。
+App は不適格な通知も消費し、現行 source／start ID／viewer を検査して既存 controller の Armed/Spent と
+Loading／host-control queue へ合流する。AutoVideo permit は成功時 revision を host GUI 表示直前まで保持する。
+設定OFF・root hide・全画面・最小化・Remote は各正本の境界で公開し、復帰でも古い permit は再利用しない。
+成功した手動表示も古い AutoVideo を失効させる。自動表示は非アクティブとし、既存 Manual と表示済み窓の
+visibility lifecycle、worker 数、owner=0 を維持する。

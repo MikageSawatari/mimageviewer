@@ -279,6 +279,42 @@ pub(crate) fn resolved_volume_path(path: &Path) -> io::Result<(PathBuf, RarVolum
     Ok((resolved, volume_kind))
 }
 
+/// Header evidence, carried by worker-owned results. `First` includes non-split archives.
+/// Names may locate the first file only after a native header proves `Subsequent`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RarVolumeProof {
+    First,
+    Subsequent { first: PathBuf },
+    UnknownEncrypted,
+}
+
+impl RarVolumeProof {
+    pub(crate) fn rejection_message(&self) -> Option<String> {
+        let Self::Subsequent { first } = self else {
+            return None;
+        };
+        let name = first
+            .file_name()
+            .unwrap_or(first.as_os_str())
+            .to_string_lossy();
+        Some(format!(
+            "分割RARの2つ目以降のファイルです。最初のファイル（{name}）を開いてください。"
+        ))
+    }
+}
+
+/// Worker-only header probe; never call this from cell painting or an adoption callback.
+pub(crate) fn volume_proof(path: &Path) -> io::Result<RarVolumeProof> {
+    match resolved_volume_path(path) {
+        Ok((first, RarVolumeKind::Subsequent)) => Ok(RarVolumeProof::Subsequent { first }),
+        Ok(_) => Ok(RarVolumeProof::First),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            Ok(RarVolumeProof::UnknownEncrypted)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Header-backed decision for worker-side folder navigation. A malformed or unreadable RAR is
 /// reported as an error so callers can conservatively keep it visible.
 pub fn is_subsequent_volume(path: &Path) -> io::Result<bool> {

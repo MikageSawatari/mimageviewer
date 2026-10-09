@@ -1087,3 +1087,46 @@ fmt・glyph lint（危険文字0）・通常/portable core checkが成功し、
 8-threadの全lib再実行は不要だった。これは先行AVの原因解明・解消の証明ではない。
 API前提の停止、テストfixtureの隔離修正と先行失敗も今回の検証記録に保存した。
 製品起動・commit・build-dist・test-fullは実施していない。実機確認は手動手順へ引き継ぐ。
+
+
+## 14. v4.5.0 masterとの統合（2026-10-09）
+
+§1.345の独立レビュー承認済み `1c2fb00f1` に、出荷済みv4.5.0 `840c309ec` を統合する。
+§1.345はv4.5.0の公開機能には含めず、次版の利用者実機確認へ渡す。
+masterの§1.339 facet保存/復元のsource proofと採用境界、§1.350 RAR読書位置バー、
+§1.355後続RAR巻の拒否、§1.347音声artを維持し、共通FileTypeVisibilityを一覧生成の最初の層に適用する。
+画像非表示でも表示する動画・音声のsidecar補助画像は残し、非表示音声も既存cache pruningの
+complete inventoryからは除かない。全体bookmark buildはmasterのmain Surface ownerを維持し、
+採用した行・source map・登録総数・legacy通知を揃える。本内bookmarkは各viewer bundleの所有を維持する。
+IPCは共通base v66、feature v68、master v67から統合版v69（max+1）にする。
+設定はbase446項目＋§1.345の1項目＋masterの6項目で453項目
+（転送対象140、除外313、wire138）と全field分類を照合する。
+検証証跡と利用者確認手順は `target/B345-merge-verification.md` に記録する。
+Git index/merge stateは利用者が所有し、実装担当は作業ツリーだけを編集する。
+
+閲覧履歴のloading shellでもidentity準備を既存hydration ownerが担当するため、一覧workerの
+受信はその準備後に行う。既存Pendingは失効条件を照合しながら応答を保持し、busy時の
+採用拒否で完了結果を失わない。新しいpending ownerや一覧の再採用を加えない。
+
+空のloading shellからの即時ナビゲーションも出荷版のまま保つ。
+共通`begin_sidecar_restore`は、既存ownerのbusy判定後、`items.is_empty() && !restore_sidecar`
+ならI/Oの不要な`empty(policy)`を同期確定し、既存display continuationへ進む。
+特定pathを例外化せず、空でもsidecar復元対象なら元の復元手順を維持する。
+独立Sol / xhigh reviewerは、採用済み入力の同期処理であり継続の義務を失わない構造と確認した。
+受信延期の回帰は既存の`prepare_current_listing_page_identity_index`を同じshellに開始して実際の
+準備中を作り、保留応答の保持とその後の一度だけの採用を確認する。出荷版の即時reselect回帰も保持する。
+
+サブフォルダ展開は出荷版の「音声行を表示しないが、音声混在フォルダは本集約しない」を維持する。
+展開のsidecar/同名重複候補からAudioを先に除き、policy適用後の重複除去を一度だけ行う。
+policyで表示対象となるAudioの存在は本集約判定に残し、Audioを除外した場合は画像フォルダとして
+集約できる。同名画像の保持・動画sidecar・Audio除外による集約の回帰を合わせて確認する。
+独立Sol / xhigh reviewerも、両側の意味を保つ構造的統合と確認した。
+
+統合後の最終検証は全lib 11,553成功／52除外、ui_snapshot 142、audit test 36と実audit、
+Remote-web 140成功／1除外、IPC 67、fmt・glyph lint・通常／portable core checkが成功。
+初回の16件の統合失敗は非同期fixtureのpoll不足と音声重複処理の衝突として修正し、期待値は維持した。
+AV・既知similar-index flakeは今回再発せず、snapshot PNGは253枚すべてhash不変だった。
+検証用buildは旧vendor VST3 hostのidentity不一致で一度停止し、CLAUDE.mdの手順に従い
+masterの現ソース一致host＋公式CRT4本を実ファイル復元して再実行成功（389.9秒、VCRT runtime=4／PE=3）。
+source identityとCRT正本hashを照合し、APPDATA・runtime cacheはimportしていない。
+製品起動・Git index変更・commitは行わず、利用者のstage／commitと実機確認へ渡す。

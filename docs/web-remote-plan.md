@@ -1354,7 +1354,7 @@ container 取得エラーへ伝播させない。Web の viewer は page address
 見開き時は保存ページを含む見開きを開く。純粋関数テストで有効位置、ページ数ちょうどの上限、
 大幅な超過、Web 側の不一致 fallback を固定する。
 
-§1.345 / protocol v67 の種類制限時は上記の任意情報欠落と再開拒否を区別する。
+§1.345 / protocol v69 の種類制限時は上記の任意情報欠落と再開拒否を区別する。
 新しく保存した位置は論理 identity で照合し、非表示の保存ページや検証できない旧版 index は
 `resume_refusal` と `open_mode=grid` で明示する。Web は理由を一覧に表示して再選択を促し、
 先頭や同じ index の別ページを自動で開かない。
@@ -1940,7 +1940,7 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 
 `crates/remote-ipc` の protocol version を上げた増分では、**本体と remote-web の両方を
 再ビルドして再起動する**必要がある。片方だけだとハンドシェイクで弾かれる。
-現行版は **v65**。v65 は表示位置の RAW 先読み窓の宣言と ack を追加した (§14.24)。v64 は RAW ブランチの v62 と master の v63 を統合し、RAW ページの `RawPrefetchSkipped` / `RawCapacity`、サムネイルの `NoThumbnail` と、EPUB・音声トラック選択・再生位置書き戻しをすべて含む。本体と service を同時に更新する。v63 は audio-tracks ブランチの追加を統合し、Remote 動画の音声トラック列挙・選択状態、start の選択指定、世代照合付き切り替え control と、端末で見た再生位置の PC への書き戻し (`RecordVideoProgress`、所有世代と連番の照合) を含む。audio-tracks ブランチでは音声トラック追加時に v62、再生位置追加時に v63 としていた。master の v62 は EPUB 対応で、wire の形と enum 値は変えず、既存の `RemoteEntryKind::Pdf` / `ContainerKind::Pdf` が元 `.epub` の論理パスも表すようになった。旧 remote-web は EPUB を PDF 本として再検証できないため版を上げた。統合後の v63 では EPUB と音声トラック・再生位置の追加をすべて含み、本体と service を同時に更新する。v61 は物理フォルダの評価順読み取り失敗を一覧へ通知する任意の `sort_notice` を追加した。v60 は表紙直後・最終ページの強制単独表示、白い表示側、二つの本別値と Remote write を追加した。v59 は見開き先頭・末尾の単ページ配置を別々の保存値と Remote write に分けた。v58 は永続コレクションの着地位置を実媒体別の
+現行版は **v69**。v69 は §1.345 の v68 と出荷済み v4.5.0 master の v67 を統合した版（共通base v66、両側が独立に版を上げたため max+1）。種類投影・最新policyでの読出し制限と音声サムネイルpresentationを両方保持し、本体とserviceを同時に更新する。v67 は §1.347 の音声サムネイル生成と共通一覧 presentation の audio indicator を追加する。同名 sidecar は動画・音声の共通 discovery を使い、永続コレクションの snapshot / navigation replacement にも出所を含む。Web の無画像・失敗終端は一覧 owner が保持し、明示再取得で artEpoch とともに破棄する。v66 は場所一覧の本体 materializer の統一 (§12.15) を含む。v65 は表示位置の RAW 先読み窓の宣言と ack を追加した (§14.24)。v64 は RAW ブランチの v62 と master の v63 を統合し、RAW ページの `RawPrefetchSkipped` / `RawCapacity`、サムネイルの `NoThumbnail` と、EPUB・音声トラック選択・再生位置書き戻しをすべて含む。本体と service を同時に更新する。v63 は audio-tracks ブランチの追加を統合し、Remote 動画の音声トラック列挙・選択状態、start の選択指定、世代照合付き切り替え control と、端末で見た再生位置の PC への書き戻し (`RecordVideoProgress`、所有世代と連番の照合) を含む。audio-tracks ブランチでは音声トラック追加時に v62、再生位置追加時に v63 としていた。master の v62 は EPUB 対応で、wire の形と enum 値は変えず、既存の `RemoteEntryKind::Pdf` / `ContainerKind::Pdf` が元 `.epub` の論理パスも表すようになった。旧 remote-web は EPUB を PDF 本として再検証できないため版を上げた。統合後の v63 では EPUB と音声トラック・再生位置の追加をすべて含み、本体と service を同時に更新する。v61 は物理フォルダの評価順読み取り失敗を一覧へ通知する任意の `sort_notice` を追加した。v60 は表紙直後・最終ページの強制単独表示、白い表示側、二つの本別値と Remote write を追加した。v59 は見開き先頭・末尾の単ページ配置を別々の保存値と Remote write に分けた。v58 は永続コレクションの着地位置を実媒体別の
 `{ kind, ordinal, count }` にし、v57 はコレクションの shuffle order、v56 は永続コレクションの
 catalog / snapshot / navigation を追加した。collection の session spread request と
 address-based `page_groups` を追加した版は v49。

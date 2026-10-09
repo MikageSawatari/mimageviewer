@@ -507,10 +507,11 @@ pub fn sort_and_materialize_rows_with_visibility(
     )
 }
 
-pub struct BookmarkBrowserRows {
+pub struct BookmarkBrowserBuildResult {
     pub rows: Vec<BookmarkBrowserRow>,
     /// Full stored registration count, captured before any display policy projection.
     pub registered_total: usize,
+    pub(crate) video_thumb_overrides: std::collections::HashMap<String, PathBuf>,
     pub(crate) visibility_notice: Option<crate::archive_visibility::ArchiveVisibilityNotice>,
 }
 
@@ -538,7 +539,7 @@ pub(crate) fn project_book_bookmarks(
 
 pub struct BookmarkBrowserPending {
     pub cancel: Arc<AtomicBool>,
-    pub rx: mpsc::Receiver<Result<BookmarkBrowserRows, String>>,
+    pub rx: mpsc::Receiver<Result<BookmarkBrowserBuildResult, String>>,
 }
 
 impl BookmarkBrowserPending {
@@ -547,17 +548,49 @@ impl BookmarkBrowserPending {
     }
 }
 
-pub fn spawn_build(
-    visibility: crate::file_type_visibility::FileTypeVisibility,
-) -> BookmarkBrowserPending {
+pub fn spawn_build(settings: crate::settings::Settings) -> BookmarkBrowserPending {
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_worker = Arc::clone(&cancel);
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("bookmark-browser-build".to_string())
         .spawn(move || {
-            let result = build_rows_with_access(&cancel_worker, false, &visibility)
-                .map_err(|err| err.to_string());
+            let result =
+                build_rows_with_access(&cancel_worker, false, &settings.file_type_visibility)
+                    .map_err(|err| err.to_string())
+                    .and_then(|mut result| {
+                        let media_paths = result
+                            .rows
+                            .iter()
+                            .filter(|row| !row.missing && row.marker_thumbnail.is_none())
+                            .filter_map(|row| match &row.item {
+                                GridItem::Video(path) | GridItem::Audio(path) => Some(path.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>();
+                        let sidecars =
+                            crate::app::folder_scan::discover_aggregate_video_sidecars_while(
+                                &settings,
+                                &media_paths,
+                                64,
+                                || !cancel_worker.load(Ordering::Relaxed),
+                            )
+                            .ok_or_else(|| "cancelled".to_string())?;
+                        if sidecars.skipped_parents > 0 {
+                            crate::logger::log(format!(
+                                "bookmark sidecar discovery capped: scanned={} skipped={}",
+                                sidecars.scanned_parents, sidecars.skipped_parents
+                            ));
+                        }
+                        for (parent, error) in &sidecars.scan_errors {
+                            crate::logger::log(format!(
+                                "bookmark sidecar discovery failed {}: {error}",
+                                parent.display()
+                            ));
+                        }
+                        result.video_thumb_overrides = sidecars.by_video_path;
+                        Ok(result)
+                    });
             let _ = tx.send(result);
         })
         .ok();
@@ -578,7 +611,7 @@ pub fn build_rows_readonly_with_visibility(
 
 pub fn build_rows_readonly_with_visibility_and_total(
     visibility: &crate::file_type_visibility::FileTypeVisibility,
-) -> Result<BookmarkBrowserRows, rusqlite::Error> {
+) -> Result<BookmarkBrowserBuildResult, rusqlite::Error> {
     build_rows_with_access(&AtomicBool::new(false), true, visibility)
 }
 
@@ -586,7 +619,7 @@ fn build_rows_with_access(
     cancel: &AtomicBool,
     read_only: bool,
     visibility: &crate::file_type_visibility::FileTypeVisibility,
-) -> Result<BookmarkBrowserRows, rusqlite::Error> {
+) -> Result<BookmarkBrowserBuildResult, rusqlite::Error> {
     let mut rows = Vec::new();
     let media = if read_only {
         if crate::video_bookmarks::VideoBookmarkDb::db_path()
@@ -608,10 +641,11 @@ fn build_rows_with_access(
     let registered_total = media.len() + book_bookmarks.len();
     for bookmark in media {
         if cancel.load(Ordering::Relaxed) {
-            return Ok(BookmarkBrowserRows {
+            return Ok(BookmarkBrowserBuildResult {
                 rows: Vec::new(),
                 registered_total,
                 visibility_notice: None,
+                video_thumb_overrides: Default::default(),
             });
         }
         let ext = bookmark
@@ -665,10 +699,11 @@ fn build_rows_with_access(
     let projected = project_book_bookmarks(book_bookmarks, visibility, cancel);
     for bookmark in projected.bookmarks {
         if cancel.load(Ordering::Relaxed) {
-            return Ok(BookmarkBrowserRows {
+            return Ok(BookmarkBrowserBuildResult {
                 rows: Vec::new(),
                 registered_total,
                 visibility_notice: None,
+                video_thumb_overrides: Default::default(),
             });
         }
         let (mut item, relative_page_missing, mut relative_page_provenance) =
@@ -703,10 +738,11 @@ fn build_rows_with_access(
         });
     }
     sort_rows(&mut rows, BookmarkViewSort::default());
-    Ok(BookmarkBrowserRows {
+    Ok(BookmarkBrowserBuildResult {
         rows,
         registered_total,
         visibility_notice: projected.notice,
+        video_thumb_overrides: Default::default(),
     })
 }
 

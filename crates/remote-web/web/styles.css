@@ -3058,3 +3058,12 @@ button:not(.grid-tile):focus-visible {
   background: transparent;
   color: #a1a1aa;
 }
+
+/* The fallback is independent of the optional mark painted over loaded audio art. */
+.audio-art-fallback { position: absolute; z-index: 1; }
+.tile-preview.thumb-loaded .audio-art-fallback { visibility: hidden; }
+.audio-art-indicator { visibility: hidden; position: absolute; z-index: 2; }
+.tile-preview.thumb-loaded .audio-art-indicator { visibility: visible; }
+svg.audio-art-indicator { width: 32px; height: 32px; right: 8px; bottom: 8px; }
+
+.audio-art-indicator.type-badge { left: 8px; right: auto; bottom: 8px; }

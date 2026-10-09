@@ -409,6 +409,20 @@ transient とする。`Settings.fullscreen_click_info_open` は未リリース�
 [video-architecture.md](video-architecture.md) の右パネルの節を参照。鍵の形は静止画・動画の
 固定バーと同じベクターを使い、面ごとに描き直さない。
 
+### §6.6追補: F11中の固定表示抑制 (§1.344、利用者決定2026-10-08)
+
+右lockは既存context所有のまま、予約・可視性・×のlock禁止条件だけを実効値へ投影する。
+鍵表示・toggleはraw。明示closeはopen / hoverと該当pickerを閉じ、raw lockを解除しない。
+明示openは抑制開始時にresetせず、raw lock ONでは対象変更後も保持する。音楽の右panelも同じ契約。
+通常Hoverだけの表示へ新たな×は追加しない。詳細は[設計](fullscreen-locked-chrome-suppression-plan.md) §5.1・Q4。
+
+### §1.352: 音楽のHUDは全viewport幅（利用者決定2026-10-08）
+
+音楽も静止画・native動画と同じく、上下HUDは常に全viewport幅を使い、右パネル固定時に狭めるのは
+中央のtimeline / spectrumだけとする。右パネルは上下HUDの間の予約済み帯を使い、HUDの描画・click / touch
+領域はそこへ重ならない。F11右抑制は既存の実効lockから予約を0にし、raw lockを保持する。
+詳しい矩形の責務と回帰は [音楽ビュー§5.4](music-integration-plan.md#1352-上下hudと中央コンテンツの幅利用者決定2026-10-08) を参照。
+
 ## 7. 手動実機検証チェックリスト (実施状況未確認)
 
 当時の検証計画では `.\scripts\build-release.ps1 -SkipVst3Bridge` で検証バイナリを

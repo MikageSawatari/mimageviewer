@@ -20,6 +20,9 @@ use std::thread;
 
 use eframe::egui;
 
+#[cfg(test)]
+mod rar_cache_tests;
+
 use crate::app::App;
 use crate::archive_cache::ArchiveCacheDb;
 use crate::archive_converter::{
@@ -33,10 +36,35 @@ use crate::archive_converter::{
 
 /// スキャン完了 / 変換完了通知用メッセージ。
 pub(crate) enum ArchiveConvertMsg {
-    ScanDone(Result<(ArchiveImageSummary, bool, PathBuf), ConvertError>),
+    ScanDone(Result<ArchiveScanOutcome, ConvertError>),
     /// 変換完了。Ok なら (summary, cached_zip_path, cached_zip_size)
     ConvertDone(Result<(ArchiveImageSummary, PathBuf, i64), ConvertError>),
     SiblingConvertDone(Result<(ArchiveImageSummary, PathBuf, i64), ConvertError>),
+}
+
+/// Worker-owned decision after header resolution; UI never looks up a clicked volume's cache.
+pub(crate) enum ArchiveScanOutcome {
+    Direct {
+        source: PathBuf,
+    },
+    CachedZip {
+        source: PathBuf,
+        path: PathBuf,
+    },
+    NeedsConversion {
+        source: PathBuf,
+        summary: ArchiveImageSummary,
+    },
+    Rejected {
+        message: String,
+    },
+}
+
+enum ArchiveScanPurpose {
+    Open {
+        cache_db: Option<Arc<ArchiveCacheDb>>,
+    },
+    SiblingZip,
 }
 
 /// What may happen after this archive state reaches a readable backing archive.
@@ -162,8 +190,6 @@ pub(crate) struct ArchiveConvertState {
     pub pending_direct_nav: Option<PathBuf>,
     /// Probe flat non-solid RAR before falling back to conversion/cache.
     pub allow_direct_read: bool,
-    /// Existing conversion cache, used only when the direct-read probe rejects the RAR.
-    pub fallback_cached_zip: Option<PathBuf>,
     pub completion: ArchiveConvertCompletionPolicy,
     /// The original open's final presentation intent survives scan, password and conversion.
     pub restore_intent: crate::app::StartupListIntent,
@@ -190,48 +216,123 @@ impl Drop for ArchiveConvertState {
     }
 }
 
+const RAR_NO_IMAGES_MESSAGE: &str =
+    "画像が見つかりません。分割RARの場合は最初のファイルを開いてください。";
+
+fn later_rar_volume_message(first: &std::path::Path) -> String {
+    crate::rar_loader::RarVolumeProof::Subsequent {
+        first: first.to_path_buf(),
+    }
+    .rejection_message()
+    .expect("subsequent proof has a message")
+}
+
 fn spawn_archive_scan(
     src: PathBuf,
     format: ArchiveFormat,
     password: Option<String>,
-    allow_direct_read: bool,
+    purpose: ArchiveScanPurpose,
     input_seq: u64,
     cancel: Arc<AtomicBool>,
 ) -> mpsc::Receiver<ArchiveConvertMsg> {
     spawn_archive_scan_task(cancel, move |cancel| {
-        if allow_direct_read && format == ArchiveFormat::Rar && password.is_none() {
-            match crate::rar_loader::inspect_for_direct_read_cancelable_traced(
-                &src,
-                cancel,
-                crate::rar_loader::RarInspectionOrigin::ExplicitOpen,
-                input_seq,
-            ) {
-                Ok(inspection) => Ok((
-                    inspection.summary,
-                    inspection.decision == crate::rar_loader::RarDirectReadDecision::Direct,
-                    inspection.resolved_path,
-                )),
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
-                    Err(ConvertError::Cancelled)
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                    scan_summary_with_password_cancelable(&src, format, None, cancel)
-                        .map(|summary| (summary, false, src.clone()))
-                }
-                Err(error) => Err(ConvertError::Archive(error.to_string())),
+        let check_cancel = || {
+            if cancel.load(Ordering::Relaxed) {
+                Err(ConvertError::Cancelled)
+            } else {
+                Ok(())
             }
-        } else {
-            scan_summary_with_password_cancelable(&src, format, password.as_deref(), cancel)
-                .map(|summary| (summary, false, src.clone()))
+        };
+        check_cancel()?;
+        // Refuse header-confirmed subsequent volumes before content scan or cache adoption.
+        // Encrypted headers may not expose a volume number: never infer it from the filename.
+        if format == ArchiveFormat::Rar {
+            match crate::rar_loader::volume_proof(&src) {
+                Ok(crate::rar_loader::RarVolumeProof::Subsequent { first }) => {
+                    check_cancel()?;
+                    crate::logger::log(format!(
+                        "archive_open: reject_subsequent_rar src={} first={}",
+                        src.display(),
+                        first.display(),
+                    ));
+                    return Ok(ArchiveScanOutcome::Rejected {
+                        message: later_rar_volume_message(&first),
+                    });
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+                Err(error) => return Err(ConvertError::Archive(error.to_string())),
+            }
         }
+        check_cancel()?;
+        let source = src;
+        let mut inspected_summary = None;
+        if format == ArchiveFormat::Rar
+            && let ArchiveScanPurpose::Open { cache_db } = purpose
+        {
+            if password.is_none() {
+                match crate::rar_loader::inspect_for_direct_read_cancelable_traced(
+                    &source,
+                    cancel,
+                    crate::rar_loader::RarInspectionOrigin::ExplicitOpen,
+                    input_seq,
+                ) {
+                    Ok(inspection) => {
+                        check_cancel()?;
+                        if inspection.decision == crate::rar_loader::RarDirectReadDecision::Direct {
+                            return Ok(ArchiveScanOutcome::Direct { source });
+                        }
+                        inspected_summary = Some(inspection.summary);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                        return Err(ConvertError::Cancelled);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+                    Err(error) => return Err(ConvertError::Archive(error.to_string())),
+                }
+            }
+            check_cancel()?;
+            // Keep first/single-archive cache hits at the DB's actual saved ZIP path.
+            // No subsequent-volume source substitution or compatibility cache lookup.
+            if let Some(db) = cache_db
+                && let Ok(meta) = std::fs::metadata(&source)
+                && let Some(path) = db.lookup(
+                    &source,
+                    crate::ui_helpers::mtime_secs(&meta),
+                    meta.len() as i64,
+                )
+            {
+                check_cancel()?;
+                return Ok(ArchiveScanOutcome::CachedZip { source, path });
+            }
+        }
+        let summary = match inspected_summary {
+            Some(summary) => summary,
+            None => {
+                scan_summary_with_password_cancelable(&source, format, password.as_deref(), cancel)?
+            }
+        };
+        check_cancel()?;
+        if format == ArchiveFormat::Rar
+            && password.is_some()
+            && summary.image_count == 0
+            && summary.nested_archive_count == 0
+        {
+            crate::logger::log(format!(
+                "archive_open: rar_scan_no_images_after_password src={} images=0 nested=0",
+                source.display(),
+            ));
+            return Ok(ArchiveScanOutcome::Rejected {
+                message: RAR_NO_IMAGES_MESSAGE.to_string(),
+            });
+        }
+        Ok(ArchiveScanOutcome::NeedsConversion { source, summary })
     })
 }
 
 fn spawn_archive_scan_task<F>(cancel: Arc<AtomicBool>, task: F) -> mpsc::Receiver<ArchiveConvertMsg>
 where
-    F: FnOnce(&AtomicBool) -> Result<(ArchiveImageSummary, bool, PathBuf), ConvertError>
-        + Send
-        + 'static,
+    F: FnOnce(&AtomicBool) -> Result<ArchiveScanOutcome, ConvertError> + Send + 'static,
 {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
@@ -340,7 +441,7 @@ impl App {
             crate::app::OpenRequestOwner::MainGridArchive(intent)
                 if matches!(intent.smart_folder_owner, crate::app::SmartGridArchiveOwner::Transition(_))
         ) {
-            return self.supply_smart_archive_load_alias(&src, &cached_zip, &owner);
+            return self.supply_smart_archive_load_alias(&cached_zip, &owner);
         }
         if auto_fullscreen {
             self.pending_auto_fs_open = true;
@@ -509,7 +610,9 @@ impl App {
             src.clone(),
             format,
             None,
-            false,
+            ArchiveScanPurpose::Open {
+                cache_db: self.archive_cache_db.clone(),
+            },
             self.input_seq,
             Arc::clone(&cancel),
         );
@@ -525,8 +628,7 @@ impl App {
             rx,
             pending_nav: None,
             pending_direct_nav: None,
-            allow_direct_read: false,
-            fallback_cached_zip: None,
+            allow_direct_read: format == ArchiveFormat::Rar,
             completion: match owner {
                 crate::app::OpenRequestOwner::Navigation => {
                     ArchiveConvertCompletionPolicy::Navigation
@@ -567,12 +669,11 @@ impl App {
     }
 
     /// Probe a RAR on the scan worker and open it directly when eligible.
-    /// Rejected RARs continue through the unchanged conversion-cache flow.
+    /// Header-resolved sources share the worker-owned Direct / cache / conversion decision.
     pub(crate) fn request_rar_open_owned(
         &mut self,
         src: PathBuf,
         auto_fullscreen: bool,
-        fallback_cached_zip: Option<PathBuf>,
         owner: crate::app::OpenRequestOwner,
         restore_intent: crate::app::StartupListIntent,
     ) -> bool {
@@ -587,7 +688,9 @@ impl App {
             src.clone(),
             ArchiveFormat::Rar,
             None,
-            true,
+            ArchiveScanPurpose::Open {
+                cache_db: self.archive_cache_db.clone(),
+            },
             self.input_seq,
             Arc::clone(&cancel),
         );
@@ -603,7 +706,6 @@ impl App {
             pending_nav: None,
             pending_direct_nav: None,
             allow_direct_read: true,
-            fallback_cached_zip,
             completion: match owner {
                 crate::app::OpenRequestOwner::Navigation => {
                     ArchiveConvertCompletionPolicy::Navigation
@@ -656,7 +758,7 @@ impl App {
             src.clone(),
             format,
             None,
-            false,
+            ArchiveScanPurpose::SiblingZip,
             self.input_seq,
             Arc::clone(&cancel),
         );
@@ -672,7 +774,6 @@ impl App {
             pending_nav: None,
             pending_direct_nav: None,
             allow_direct_read: false,
-            fallback_cached_zip: None,
             completion: ArchiveConvertCompletionPolicy::SiblingZip,
             restore_intent: crate::app::StartupListIntent::PreservePresentation,
             pending_sibling_output: None,
@@ -1041,7 +1142,7 @@ impl App {
                     crate::app::SmartGridArchiveOwner::Transition(_)
                 )
             {
-                let _ = self.supply_smart_archive_load_alias(&src, &src, owner);
+                let _ = self.supply_smart_archive_load_alias(&src, owner);
                 return;
             }
             if auto_fs {
@@ -1282,14 +1383,14 @@ impl App {
                     }
                     return;
                 };
-                if let Some(source) = src.as_deref()
+                if src.is_some()
                     && matches!(
                         &open_owner,
                         crate::app::OpenRequestOwner::MainGridArchive(intent)
                             if matches!(intent.smart_folder_owner, crate::app::SmartGridArchiveOwner::Transition(_))
                     )
                 {
-                    let _ = self.supply_smart_archive_load_alias(source, &nav, &open_owner);
+                    let _ = self.supply_smart_archive_load_alias(&nav, &open_owner);
                     return;
                 }
                 if auto_fs {
@@ -1600,33 +1701,36 @@ impl App {
         let mut clear_deferred_fullscreen = false;
         while let Ok(msg) = state.rx.try_recv() {
             match msg {
-                ArchiveConvertMsg::ScanDone(Ok((summary, direct_read, resolved_src))) => {
-                    if !crate::folder_tree::path_eq(&state.src_path, &resolved_src) {
-                        state.src_path = resolved_src;
-                        // A cache lookup made for a requested subsequent volume does not identify
-                        // the first volume that header inspection resolved.
-                        state.fallback_cached_zip = None;
-                    }
-                    if direct_read {
-                        state.pending_direct_nav = Some(state.src_path.clone());
-                        if crate::perf::is_enabled() {
-                            let archive_key =
-                                crate::path_key::normalize_keep_drive(&state.src_path);
-                            crate::perf::event(
-                                "archive",
-                                "pending_direct_nav_publish",
-                                Some(&archive_key),
-                                state.input_seq,
-                                &[],
-                            );
-                        }
-                        continue;
-                    }
+                ArchiveConvertMsg::ScanDone(Ok(ArchiveScanOutcome::Rejected { message })) => {
                     state.allow_direct_read = false;
-                    if let Some(cached_zip) = state.fallback_cached_zip.take() {
-                        state.pending_nav = Some(cached_zip);
-                        continue;
+                    state.phase = ArchiveConvertPhase::Error { message };
+                    clear_deferred_fullscreen = true;
+                }
+                ArchiveConvertMsg::ScanDone(Ok(ArchiveScanOutcome::Direct { source })) => {
+                    state.src_path = source;
+                    state.pending_direct_nav = Some(state.src_path.clone());
+                    if crate::perf::is_enabled() {
+                        let archive_key = crate::path_key::normalize_keep_drive(&state.src_path);
+                        crate::perf::event(
+                            "archive",
+                            "pending_direct_nav_publish",
+                            Some(&archive_key),
+                            state.input_seq,
+                            &[],
+                        );
                     }
+                }
+                ArchiveConvertMsg::ScanDone(Ok(ArchiveScanOutcome::CachedZip { source, path })) => {
+                    state.src_path = source;
+                    state.allow_direct_read = false;
+                    state.pending_nav = Some(path);
+                }
+                ArchiveConvertMsg::ScanDone(Ok(ArchiveScanOutcome::NeedsConversion {
+                    source,
+                    summary,
+                })) => {
+                    state.src_path = source;
+                    state.allow_direct_read = false;
                     // 直下画像 0 でも入れ子アーカイブがあれば変換対象 (展開で画像が出る)。
                     if summary.image_count == 0 && summary.nested_archive_count == 0 {
                         state.phase = ArchiveConvertPhase::Error {
@@ -1740,7 +1844,10 @@ impl App {
                 ArchiveConvertMsg::ConvertDone(Err(e))
                 | ArchiveConvertMsg::SiblingConvertDone(Err(e)) => {
                     state.phase = ArchiveConvertPhase::Error {
-                        message: format!("変換失敗: {e}"),
+                        message: match e {
+                            ConvertError::Archive(message) => format!("変換失敗: {message}"),
+                            error => format!("変換失敗: {error}"),
+                        },
                     };
                     clear_deferred_fullscreen = true;
                 }
@@ -1771,7 +1878,13 @@ impl App {
                         src,
                         format,
                         Some(password),
-                        false,
+                        if state.completion.is_sibling_zip() {
+                            ArchiveScanPurpose::SiblingZip
+                        } else {
+                            ArchiveScanPurpose::Open {
+                                cache_db: self.archive_cache_db.clone(),
+                            }
+                        },
                         state.input_seq,
                         Arc::clone(&state.cancel),
                     );
@@ -2005,12 +2118,22 @@ mod tests {
         assert!(stopped.load(Ordering::Relaxed));
 
         let followup = Arc::new(AtomicBool::new(false));
-        let followup_rx = spawn_archive_scan(source, ArchiveFormat::Zip, None, false, 0, followup);
+        let followup_rx = spawn_archive_scan(
+            source,
+            ArchiveFormat::Zip,
+            None,
+            ArchiveScanPurpose::SiblingZip,
+            0,
+            followup,
+        );
         match followup_rx
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("follow-up scan result")
         {
-            ArchiveConvertMsg::ScanDone(Ok((summary, false, _))) => {
+            ArchiveConvertMsg::ScanDone(Ok(ArchiveScanOutcome::NeedsConversion {
+                summary,
+                ..
+            })) => {
                 assert_eq!(summary.image_count, 1);
             }
             _ => panic!("follow-up scan should complete normally"),
@@ -2034,7 +2157,6 @@ mod tests {
             pending_nav: None,
             pending_direct_nav: None,
             allow_direct_read: false,
-            fallback_cached_zip: None,
             completion: ArchiveConvertCompletionPolicy::Navigation,
             restore_intent: crate::app::StartupListIntent::PageContinuation,
             pending_sibling_output: None,
@@ -2437,7 +2559,10 @@ pub(super) fn draw_archive_startup_snapshot_fixture(ctx: &egui::Context, kind: &
     let title = match kind {
         "archive_scanning" => "7z を読み込み中...",
         "archive_converting" => "7z を ZIP に変換中",
-        "archive_error" => "変換エラー",
+        "archive_error"
+        | "archive_publish_error"
+        | "archive_later_volume_error"
+        | "archive_no_images_error" => "変換エラー",
         _ => "7z を ZIP に変換",
     };
     egui::Window::new(title)
@@ -2480,6 +2605,19 @@ pub(super) fn draw_archive_startup_snapshot_fixture(ctx: &egui::Context, kind: &
                             bytes: 2_000_000,
                         },
                     );
+                }
+                "archive_later_volume_error" => {
+                    draw_archive_status_content(
+                        ui,
+                        "分割RAR本.part2.rar",
+                        ArchiveStatus::Error(&later_rar_volume_message(std::path::Path::new("分割RAR本.part1.rar"))),
+                    );
+                }
+                "archive_no_images_error" => {
+                    draw_archive_status_content(ui, "分割RAR本.part2.rar", ArchiveStatus::Error(RAR_NO_IMAGES_MESSAGE));
+                }
+                "archive_publish_error" => {
+                    draw_archive_status_content(ui, "分割RAR本.part1.rar", ArchiveStatus::Error("変換失敗: 変換したZIPを保存できませんでした。保存先が使用中か、読み取り専用か、書き込みが許可されていません。"));
                 }
                 "archive_error" => {
                     draw_archive_status_content(

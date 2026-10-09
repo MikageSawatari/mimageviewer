@@ -270,6 +270,7 @@ struct SearchPreparedItems {
     page_identity_index: Arc<crate::app::file_type_resume::PreparedPageIdentityIndex>,
     items: Vec<GridItem>,
     image_metas: Vec<Option<(i64, i64)>>,
+    video_thumb_overrides: HashMap<String, std::path::PathBuf>,
     drilled_counts: HashMap<String, [u32; 6]>,
     page_edits: crate::app::page_edit_snapshot::StablePageEditProjection,
     ratings: Option<(HashMap<usize, u8>, u64)>,
@@ -319,6 +320,7 @@ impl SearchPageEditPrepare {
         ctx: &egui::Context,
         available: crate::app::page_edit_snapshot::PageEditAvailability,
         visibility: crate::file_type_visibility::FileTypeVisibility,
+        settings: crate::settings::Settings,
     ) -> Result<Self, String> {
         let (tx, command_rx) = mpsc::channel();
         let (output_tx, rx) = mpsc::channel();
@@ -340,6 +342,7 @@ impl SearchPageEditPrepare {
                     repaint,
                     available,
                     visibility,
+                    settings,
                 );
             })
             .map_err(|error| format!("検索結果の準備 worker を起動できません: {error}"))?;
@@ -1462,6 +1465,7 @@ fn search_prepare_worker(
     ctx: egui::Context,
     available: crate::app::page_edit_snapshot::PageEditAvailability,
     visibility: crate::file_type_visibility::FileTypeVisibility,
+    sidecar_settings: crate::settings::Settings,
 ) {
     let mut state = GlobalSearchState::default();
     let mut archive_visibility =
@@ -1687,6 +1691,36 @@ fn search_prepare_worker(
                         projection,
                     )
                 {
+                    let media_paths = items
+                        .iter()
+                        .filter_map(|item| match item {
+                            GridItem::Video(path) | GridItem::Audio(path) => Some(path.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    let Some(sidecars) =
+                        crate::app::folder_scan::discover_aggregate_video_sidecars_while(
+                            &sidecar_settings,
+                            &media_paths,
+                            64,
+                            || !cancel.load(Ordering::Relaxed),
+                        )
+                    else {
+                        break;
+                    };
+                    if sidecars.skipped_parents > 0 {
+                        crate::logger::log(format!(
+                            "search sidecar discovery capped: scanned={} skipped={}",
+                            sidecars.scanned_parents, sidecars.skipped_parents
+                        ));
+                    }
+                    for (parent, error) in &sidecars.scan_errors {
+                        crate::logger::log(format!(
+                            "search sidecar discovery failed {}: {error}",
+                            parent.display()
+                        ));
+                    }
+                    let video_thumb_overrides = sidecars.by_video_path;
                     cache_completion = after.completed_writes;
                     let page_identity_index = Arc::new(
                         crate::app::file_type_resume::PreparedPageIdentityIndex::prepare(
@@ -1701,6 +1735,7 @@ fn search_prepare_worker(
                             page_identity_index,
                             items,
                             image_metas,
+                            video_thumb_overrides,
                             drilled_counts,
                             page_edits,
                             ratings,
@@ -2039,11 +2074,8 @@ impl App {
     ///    破棄されない。
     ///
     /// 2. **同名 stem の sidecar 画像 leak 回避**:
-    ///    `App::video_thumb_overrides` は前フォルダの sidecar を stem キーで保持する
-    ///    (src/app.rs:`hydrate_video_thumb_overrides_from_current_folder`)。Ctrl+G の
-    ///    結果は複数フォルダにまたがるため、これを渡すと別フォルダの同 stem 動画に
-    ///    sidecar 画像が誤って当たる。よって empty map を渡す (sidecar は Ctrl+G では
-    ///    使わない)。Codex P1 #2 指摘。
+    ///    The accepted prepared-list worker supplies a full-path source map shared by video/audio.
+    ///    Only that generation's map is passed; identical stems in unrelated parents cannot leak.
     ///
     /// 3. **重複 Shell 呼び出し抑制**:
     ///    既存の per-search cancel (`search_video_thread_cancel`) を毎回上書きする
@@ -2139,13 +2171,12 @@ impl App {
         // 新 cancel を作成して保存。
         let new_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.search_video_thread_cancel = Some(std::sync::Arc::clone(&new_cancel));
-        // empty thumb_overrides で sidecar leak を回避 (`respawn_search_video_thread`
-        // doc 内 #2 参照)。
+        // Full paths come from this accepted search-list preparation, not the previous physical folder.
         self.spawn_video_thread(
             self.tx.clone(),
             new_cancel,
             candidates,
-            std::collections::HashMap::new(),
+            self.video_thumb_overrides.clone(),
             std::sync::Arc::new(pin_blobs),
         );
     }
@@ -2312,6 +2343,7 @@ impl App {
             ctx,
             crate::app::page_edit_snapshot::PageEditAvailability::for_app(self),
             self.settings.file_type_visibility.clone(),
+            self.settings.thumbnail_source_discovery_snapshot(),
         ) {
             Ok(prepare) => self.global_search.page_edit_prepare = Some(prepare),
             Err(error) => {
@@ -2664,17 +2696,31 @@ impl App {
                             prepare.metrics.lookup_passes = prepared.lookup_passes;
                             prepare.metrics.looked_up_keys = prepared.looked_up_keys;
                         }
-                        if let Some(values) = prepared.hit_rating_values.as_ref() {
-                            for hit in &mut self.global_search.all_hits {
-                                if let Some(stars) = values.get(&hit_rating_key(&hit.path)) {
-                                    hit.stars = *stars;
+                        if !self.adopt_prepared_search_view(wish.adoption, |app| {
+                            if let Some(values) = prepared.hit_rating_values.as_ref() {
+                                for hit in &mut app.global_search.all_hits {
+                                    if let Some(stars) = values.get(&hit_rating_key(&hit.path)) {
+                                        hit.stars = *stars;
+                                    }
                                 }
                             }
-                        }
-                        writes_after_read =
-                            self.rating_session_writes_after(wish.rating_write_generation);
-                        self.search_drilled_folder_counts = prepared.drilled_counts;
-                        if !self.adopt_prepared_search_view(wish.adoption, |app| {
+                            writes_after_read =
+                                app.rating_session_writes_after(wish.rating_write_generation);
+                            // Source selection belongs to this accepted prepared list; unchanged contexts are untouched.
+                            for (idx, item) in app.items.iter().enumerate() {
+                                if let GridItem::Video(path) | GridItem::Audio(path) = item {
+                                    let key = crate::path_key::normalize_keep_drive(path);
+                                    if app.video_thumb_overrides.get(&key)
+                                        != prepared.video_thumb_overrides.get(&key)
+                                    {
+                                        if let Some(thumbnail) = app.thumbnails.get_mut(idx) {
+                                            *thumbnail = ThumbnailState::Pending;
+                                        }
+                                    }
+                                }
+                            }
+                            app.video_thumb_overrides = prepared.video_thumb_overrides;
+                            app.search_drilled_folder_counts = prepared.drilled_counts;
                             app.replace_search_view_items_with_ratings(
                                 prepared.items,
                                 prepared.image_metas,
@@ -2793,6 +2839,7 @@ impl App {
                 ctx,
                 crate::app::page_edit_snapshot::PageEditAvailability::for_app(self),
                 self.settings.file_type_visibility.clone(),
+                self.settings.thumbnail_source_discovery_snapshot(),
             )
             .unwrap(),
         );
@@ -3074,37 +3121,34 @@ impl App {
         ) {
             self.show_feedback_toast("評価順を準備できなかったため名前順で表示しました".into());
         }
-        let (items, image_metas) = match self.global_search.view() {
-            GlobalSearchView::Flat => {
-                // 一覧ビューはサブフォルダバッジを使わない。残骸を破棄する。
-                self.search_drilled_folder_counts.clear();
-                build_flat_items(&self.global_search, sort_order, &rating_filter)
-            }
-            GlobalSearchView::Aggregated => {
-                // Aggregated ではサブフォルダのバッジ計算なし。残骸を破棄する。
-                self.search_drilled_folder_counts.clear();
-                build_aggregated_items(&mut self.global_search)
-            }
+        // Badge counts and rows belong to one accepted projection, including the fallback path.
+        let drilled_counts = match self.global_search.view() {
             GlobalSearchView::DrilledInto {
                 ref current_path,
                 is_zip,
                 ..
-            } => {
-                // サブフォルダごとの per-★ 件数を all_hits から集計し直す。
-                // build_drilled_items が rating_filter で表示アイテムを絞る一方、
-                // バッジ件数表示には raw 集計が必要 (なし含む 6 バケット)。
-                self.search_drilled_folder_counts =
-                    compute_drilled_subfolder_counts(&self.global_search, current_path, is_zip);
-                build_drilled_items(
-                    &self.global_search,
-                    current_path,
-                    is_zip,
-                    sort_order,
-                    &rating_filter,
-                )
+            } => compute_drilled_subfolder_counts(&self.global_search, current_path, is_zip),
+            _ => HashMap::new(),
+        };
+        let (items, image_metas) = match self.global_search.view() {
+            GlobalSearchView::Flat => {
+                build_flat_items(&self.global_search, sort_order, &rating_filter)
             }
+            GlobalSearchView::Aggregated => build_aggregated_items(&mut self.global_search),
+            GlobalSearchView::DrilledInto {
+                ref current_path,
+                is_zip,
+                ..
+            } => build_drilled_items(
+                &self.global_search,
+                current_path,
+                is_zip,
+                sort_order,
+                &rating_filter,
+            ),
         };
         if !self.adopt_prepared_search_view(adoption, |app| {
+            app.search_drilled_folder_counts = drilled_counts;
             app.replace_search_view_items(items, image_metas);
         }) {
             return;
@@ -4027,6 +4071,7 @@ mod tests {
                 egui::Context::default(),
                 crate::app::page_edit_snapshot::PageEditAvailability::default(),
                 worker_visibility,
+                crate::settings::Settings::default(),
             );
         });
         command_tx
@@ -4142,6 +4187,114 @@ mod tests {
         assert!(
             matches!(&zip_rows[0], GridItem::ZipImage { entry_name, .. } if entry_name == "z.jpg")
         );
+    }
+
+    #[test]
+    fn search_ready_after_clear_quick_slots_preserves_media_sources_and_loaded_thumbnail() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let parent = app.tmp.path().join("search-source-adoption");
+        std::fs::create_dir(&parent).unwrap();
+        let audio = parent.join("song.flac");
+        let old_cover = parent.join("song.png");
+        let new_cover = parent.join("song.jpg");
+        std::fs::write(&audio, b"audio").unwrap();
+        std::fs::write(&old_cover, b"old cover").unwrap();
+        app.settings.skip_image_if_video_exists = true;
+        app.settings.video_thumb_use_sidecar_image = true;
+        app.global_search.aggregate_auto = false;
+        let ctx = egui::Context::default();
+        app.begin_search_page_edit_prepare_for_test(&ctx);
+        let (stream, rx) = crossbeam_channel::unbounded();
+        app.global_search.pending = Some(crate::indexer_manager::SearchHandle {
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx,
+        });
+        stream
+            .send(SearchStreamEvent::Batch {
+                hits: vec![GlobalHit {
+                    path: audio.to_string_lossy().into_owned(),
+                    score: 1.0,
+                    stars: 0,
+                    mtime: 0,
+                    file_size: Some(0),
+                }],
+                scanned_candidates: 1,
+                valid_hits: 1,
+                visibility_notice: None,
+            })
+            .unwrap();
+        stream
+            .send(SearchStreamEvent::Done {
+                truncated: false,
+                reason: DoneReason::Complete,
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            app.poll_global_search_events(&ctx);
+            let prepare = app.global_search.page_edit_prepare.as_ref().unwrap();
+            if app.items.len() == 1 && prepare.in_flight.is_none() && prepare.desired.is_none() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "initial search projection never settled"
+            );
+            std::thread::yield_now();
+        }
+        assert!(matches!(&app.items[0], GridItem::Audio(path) if path == &audio));
+        let key = crate::path_key::normalize_keep_drive(&audio);
+        assert_eq!(app.video_thumb_overrides.get(&key), Some(&old_cover));
+        app.thumbnails[0] = make_loaded_state();
+        let texture = match &app.thumbnails[0] {
+            ThumbnailState::Loaded { tex, .. } => tex.id(),
+            _ => unreachable!(),
+        };
+        let counts = HashMap::from([("unchanged-counts".to_owned(), [1, 2, 3, 4, 5, 6])]);
+        app.search_drilled_folder_counts = counts.clone();
+        std::fs::remove_file(&old_cover).unwrap();
+        std::fs::write(&new_cover, b"new cover").unwrap();
+        app.hold_next_search_ready_for_test();
+        app.rebuild_items_from_global_search();
+        while !app.search_ready_is_held_for_test() {
+            app.poll_global_search_events(&ctx);
+            assert!(
+                Instant::now() < deadline,
+                "changed-source projection was not held"
+            );
+            std::thread::yield_now();
+        }
+        let prepare = app.global_search.page_edit_prepare.as_ref().unwrap();
+        let Some(SearchPrepareOutput::Ready(wish, prepared)) = &prepare.held_ready_for_test else {
+            panic!("real worker did not publish Ready");
+        };
+        assert_eq!(prepared.video_thumb_overrides.get(&key), Some(&new_cover));
+        assert!(matches!(wish.adoption, SearchViewAdoption::Main { .. }));
+        let generation = app.items_generation;
+        let cancel = app.cancel_token.clone();
+        // The production clear preserves the visible list but retires the captured switch epoch.
+        app.execute_clear_quick_folder_slots();
+        app.release_search_ready_for_test();
+        app.poll_global_search_events(&ctx);
+        assert_eq!(app.items_generation, generation);
+        assert!(Arc::ptr_eq(&app.cancel_token, &cancel));
+        assert_eq!(app.video_thumb_overrides.get(&key), Some(&old_cover));
+        assert!(matches!(
+            &app.thumbnails[0],
+            ThumbnailState::Loaded { tex, .. } if tex.id() == texture
+        ));
+        assert_eq!(app.search_drilled_folder_counts, counts);
+        // A new request captures the cleared slot's owner and must still adopt the changed source.
+        app.rebuild_items_from_global_search();
+        while app.items_generation == generation {
+            app.poll_global_search_events(&ctx);
+            assert!(Instant::now() < deadline, "fresh projection did not adopt");
+            std::thread::yield_now();
+        }
+        assert_eq!(app.video_thumb_overrides.get(&key), Some(&new_cover));
+        assert!(matches!(app.thumbnails[0], ThumbnailState::Pending));
+        assert!(app.search_drilled_folder_counts.is_empty());
     }
 
     #[cfg(windows)]

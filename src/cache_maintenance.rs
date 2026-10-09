@@ -500,11 +500,38 @@ pub(crate) fn spawn(
 ) -> CacheMaintPending {
     let cancel = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
+    let deletion = if matches!(task, CacheMaintTask::Stats) {
+        None
+    } else {
+        let operation = match &task {
+            CacheMaintTask::DeleteAll => crate::catalog::CatalogDeleteOperation::All,
+            CacheMaintTask::DeleteOld { days } => {
+                crate::catalog::CatalogDeleteOperation::OlderThan(*days)
+            }
+            CacheMaintTask::DeleteFolder { folder, .. } => {
+                crate::catalog::CatalogDeleteOperation::Folder(folder.clone())
+            }
+            CacheMaintTask::Stats => unreachable!(),
+        };
+        match crate::catalog::CatalogAccess::for_cache_dir(&cache_dir).begin_delete(operation) {
+            Ok(token) => Some(token),
+            Err(error) => {
+                let _ = tx.send(CacheMaintResult::Error(format!(
+                    "キャッシュを整理中です: {error}"
+                )));
+                return CacheMaintPending { task, rx, cancel };
+            }
+        }
+    };
     let tx_worker = tx.clone();
     let task_clone = task.clone();
     let spawn_result = std::thread::Builder::new()
         .name("cache-maint".into())
         .spawn(move || {
+            if let Some(deletion) = deletion.as_ref() {
+                deletion.retire_connections();
+            }
+            let mut catalog_error = None;
             // Collection UUID cache work was admitted on the UI side. Wait here, not in UI,
             // before reporting a successful combined clear. Failure leaves the other caches usable.
             let collection_aspect = match collection_reply
@@ -528,7 +555,9 @@ pub(crate) fn spawn(
                     }
                 }
                 CacheMaintTask::DeleteOld { days } => {
-                    let deleted = crate::catalog::delete_old_cache(&cache_dir, days);
+                    let report = crate::catalog::delete_old_cache_under_delete(&cache_dir, days);
+                    catalog_error = report.error_message();
+                    let deleted = report.deleted;
                     let (auto_aspect_deleted, auto_aspect_entries) = auto_aspect_delete_old(days);
                     let new_stats = crate::catalog::cache_stats(&cache_dir);
                     CacheMaintResult::DeleteOldDone {
@@ -540,7 +569,8 @@ pub(crate) fn spawn(
                     }
                 }
                 CacheMaintTask::DeleteAll => {
-                    crate::catalog::delete_all_cache(&cache_dir);
+                    let report = crate::catalog::delete_all_cache_under_delete(&cache_dir);
+                    catalog_error = report.error_message();
                     // 通常経路: open 済みインスタンスがあれば clear_all (DELETE + VACUUM)。
                     // 失敗 / インスタンス None なら fallback で DB ファイルを物理削除する
                     // (Codex P2: DB 壊れ / ロックで「全削除」しても残らないように)。
@@ -572,16 +602,19 @@ pub(crate) fn spawn(
                     folder,
                     auto_aspect_folder,
                 } => {
-                    let db_path = crate::catalog::db_path_for(&cache_dir, &folder);
                     let folder_name = folder
                         .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or("?")
                         .to_string();
-                    let existed = db_path.exists();
-                    if existed {
-                        let _ = std::fs::remove_file(&db_path);
-                    }
+                    let existed = match crate::catalog::delete_folder_cache_under_delete(&cache_dir, &folder) {
+                        Ok(existed) => existed,
+                        Err(error) => {
+                            crate::logger::log(format!("folder catalog delete failed: {}: {error}", folder.display()));
+                            catalog_error = Some(format!("フォルダのキャッシュを削除できませんでした: {error}"));
+                            false
+                        }
+                    };
                     // フォルダ単位削除は prefix DELETE が必要なので、open 失敗時の
                     // fallback は無い (= DB 全消しで対応すべきケースではない)。Untouched
                     // を返して UI 側でメッセージを区別する。
@@ -614,6 +647,10 @@ pub(crate) fn spawn(
                     }
                 }
             };
+            // Resume admission before waking the UI. Unwind/spawn failure drops
+            // the same token, so no stuck Deleting state or recovery journal exists.
+            drop(deletion);
+            let result = catalog_error.map(CacheMaintResult::Error).unwrap_or(result);
             let _ = tx_worker.send(result);
         });
     if let Err(e) = spawn_result {
@@ -623,6 +660,38 @@ pub(crate) fn spawn(
         )));
     }
     CacheMaintPending { task, rx, cancel }
+}
+
+/// One completed physical inventory job on the existing heavy queue. The caller
+/// owns the low-priority GlobalIoSemaphore permit and context cancellation token.
+/// No additional thread, connection LRU, idle gate, or UI result state is created.
+pub(crate) fn run_audio_art_prune(
+    cache_dir: &std::path::Path,
+    parent: &std::path::Path,
+    inventory: &std::collections::HashSet<String>,
+    admission: crate::catalog::CatalogAdmission,
+    cancel: &AtomicBool,
+) -> usize {
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        return 0;
+    }
+    let scope = crate::catalog::AudioArtCatalogScope::new(parent);
+    match crate::catalog::prune_audio_art_scope(cache_dir, &scope, inventory, admission, cancel) {
+        Ok(deleted) => deleted,
+        Err(error) => {
+            let access = crate::catalog::CatalogAccess::for_cache_dir(cache_dir);
+            if !access.is_admitted(admission) {
+                return 0;
+            }
+            access.record_audio_art_cache_error(format!("audio art scope prune: {error}"));
+            // Rebuildable cache failure: report once, no retry/recovery machinery.
+            crate::logger::log(format!(
+                "audio art catalog prune failed: {}: {error}",
+                parent.display()
+            ));
+            0
+        }
+    }
 }
 
 fn with_auto_aspect_db<T>(
@@ -866,8 +935,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let folder = temp.path().join("book");
         let db_path = crate::catalog::db_path_for(temp.path(), &folder);
-        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
-        std::fs::write(&db_path, b"cached").unwrap();
+        let db = crate::catalog::CatalogDb::open(temp.path(), &folder).unwrap();
+        drop(db);
         let pending = spawn(
             CacheMaintTask::DeleteFolder {
                 folder,

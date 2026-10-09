@@ -546,7 +546,6 @@ pub(crate) fn prepare_collection_snapshot_while(
             !matches!(
                 &entry.item,
                 crate::grid_item::GridItem::CollectionPlaceholder { .. }
-                    | crate::grid_item::GridItem::Audio(_)
             )
         })
         .count();
@@ -844,7 +843,6 @@ mod tests {
                     !matches!(
                         &entry.item,
                         crate::grid_item::GridItem::CollectionPlaceholder { .. }
-                            | crate::grid_item::GridItem::Audio(_)
                     )
                 })
                 .count(),

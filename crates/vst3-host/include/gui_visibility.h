@@ -12,8 +12,8 @@ public:
     constexpr bool requested() const { return requested_; }
     // A rejected open must not create a request for restoration. Preserve an
     // earlier accepted request if this was only an explicit raise attempt.
-    constexpr bool accept_show(GuiGateSnapshot permit, GuiGateSnapshot current, bool minimized) {
-        if (!permit.permits(current, minimized)) return false;
+    constexpr bool accept_show(GuiGateSnapshot permit, GuiGateSnapshot current, bool minimized, bool main_visible = true) {
+        if (!permit.permits(current, minimized, main_visible)) return false;
         requested_ = true;
         return true;
     }
