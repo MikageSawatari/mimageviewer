@@ -1,6 +1,6 @@
 //! Later multipart RAR opens are refused; first-volume cache and resume keys stay valid.
 //! These are headless handler/worker tests; no application or native window is launched.
-#![cfg(windows)]
+#![cfg(all(test, windows))]
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;

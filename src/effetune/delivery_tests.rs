@@ -1,5 +1,7 @@
 //! Actual controller worker -> DspBridge -> checked host command/ACK delivery.
 //! Only the process/editor boundary is fake; no product binary or HWND is launched.
+#![cfg(all(test, not(feature = "portable")))]
+
 use super::*;
 use crate::video::dsp::bridge::{Bridge, Event, GuiVisibilityOutcome};
 

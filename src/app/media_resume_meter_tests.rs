@@ -1,4 +1,6 @@
 //! 再生位置の表示はlive settingsと同じsourceの遅延メタだけを参照する。
+#![cfg(test)]
+
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;

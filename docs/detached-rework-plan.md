@@ -4199,3 +4199,33 @@ context mount／swap／退避だけで別 context の全画面抑止を消さな
 受動別窓 builder は従来どおり decorations=true を要求する。geometry 判定、HWND 取得、時間窓、
 別窓状態 flag、viewport 再生成・保存経路は追加しない。兄弟 context の非起動テストを追加した。
 製品は起動せず実機確認は利用者検証へ残す。実装差分の独立レビューは未実施。
+
+### 2026-10-09 v4.5.0 CI viewer-context audit の現行契約への追従
+
+43c170c4f で停止を再現。旧 `start_loading_items_inner` の A2b 登録が stale で、
+その修正後は A4 / A6 の 32 指摘を確認した。製品動作・registry protocol は変更しない。
+
+- A2b: §1.339 の成功採用分離 (56c11e621) により prepared metadata / projection の
+  `mem::take` が移った `install_loading_items_inner` へ同じ限定登録を移す。
+  App / 既存 context の抽出ではなく、採用済み宛先への完成 payload の install である。
+- A4: RAW (3e57109e4) の `ContextAsyncOwner::RawPages` / 19 件の `ALL` と
+  読取専用 `ContextRef::raw_pages`、§1.337 の `ContextRef::presentation`、
+  §1.347 の `invalidate_audio_art_terminals_after_catalog_maintenance`、
+  §1.350 の `invalidate_converted_archive_sources_in_parked_contexts` を正確な指紋で登録。
+  RAW は context の demand / park owner、presentation は所有表示状態の読取、
+  二つの invalidation は明示 cache 削除の既存 mutation を生存 owner に伝える境界である。
+- A6: 親の test cfg のみで囲われた `book_resume_meter_tests` /
+  `media_resume_meter_tests` / `rar_archive_cache_tests` / archive dialog の `rar_cache_tests` /
+  `effetune::delivery_tests` / DSP `fake_transport` に同等の inner test cfg を明記する。
+  Windows / non-portable の追加条件も維持。既存の単一ファイル監査が test 所有を確認でき、
+  production から test API を呼べないという規則はそのまま残る。
+
+規則・閾値・ファイル除外は変更せず、A2b の stale 検査、A4 の完全一致、A6 の
+production 呼出し拒否を維持する。新しい状態や runtime 経路は追加しない。
+
+検証: `cargo test --locked -p viewer_context_audit` 36 件成功、
+`cargo run --locked -p viewer_context_audit` exit 0。`--no-allowlist` は
+既存の限定登録 5 件の A2b だけを再検出 (期待する exit 1)。
+関連 lib の `resume_meter` 75 件 / `rar_` 96 件 / `effetune` 85 件成功。
+`cargo fmt --check`、通常 / portable core check、`git diff --check` 成功。
+全変更ファイルの CRLF を維持し、製品起動・コミットは行っていない。

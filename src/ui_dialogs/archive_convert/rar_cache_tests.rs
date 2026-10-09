@@ -1,5 +1,5 @@
 //! Real scan workers exercise retry, native reader sharing, and explicit-output policy.
-#![cfg(windows)]
+#![cfg(all(test, windows))]
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
