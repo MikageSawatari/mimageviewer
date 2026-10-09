@@ -845,3 +845,36 @@ host PE SHA256は `6ddac733f87b255fe87ae24c55c392af43bcd30bfc07e170b628d2e398ef5
 確認用buildはportable featureを使わず、通常の `%APPDATA%\mimageviewer` を使う。
 稼働中だった別worktreeのruntimeを停止せず、製品runtimeは起動しなかった。
 実機手順は `target/E-1342-hardware-check.md`。独立実装レビュー・実機確認・commitは未実施。
+
+## 16. 独立実装レビューのP2修正（2026-10-09）
+
+`4b8fe1c07` のレビュー2件をコードで確認し、両指摘に同意した。
+連結の通常prefetch退去が元textureと派生cacheを除去すると、同じ参照unitでも原寸再取得が
+失敗し、確定済みの `ContinuousSpecifiedFitReference::Specified.base` を失っていた。
+同じunit・指定値・原寸制限なら確定済みgeometryを保持し、参照unit自身の配置計算にも
+同じ値を使う。倍率だけを保持してviewport fallbackでページ配置を変える修正にはしない。
+未確定unitは従来どおり寸法到着を待ち、明示値・方式・source変更の既存失効ownerは維持する。
+resize / DPIでは同じ物理geometryからfitを解き、scroll / 手動zoomを変更しない。
+
+live数値編集は既存共通投影をメモリへ更新するだけにし、widgetの `changed()` から
+`Settings::save()` を呼ばない。環境設定の確定や既存の
+`persist_window_state_and_flush`（トレイ退避・終了）の共通設定保存境界が永続化する。
+favorite専用値は既存 `FavoriteViewWrites` ownerへ渡すままで、別の保存worker・dirty bool・
+debounce・release時保存を追加しない。既存geometryと保存ownerへ戻す構造修正である。
+
+回帰は寸法fallbackのない画像で実際の `update_continuous_reading_prefetch_window` 退去を通し、
+単ページ / 見開き、縦 / 横連結のfit・配置・scroll範囲・resize / DPIを確認する。
+live編集は実ビューのfit popupから共通preferenceのDragValueを操作し、連続変更・外側releaseで
+保存予約ではなく同期保存が増えないことと、既存保存境界を通した再読込を確認する。
+両指摘の修正前失敗ログは `target/E-1342-fix-red.log` と
+`target/E-1342-fix-live-red.log`。最終gate結果は `target/E-1342-fix-msg.txt` に記録する。
+
+2026-10-10の修正後検証: 焦点111件（重複あり）、全lib **11,472成功 / 52 ignore / 0失敗**、
+ui_snapshot **143成功**、viewer context監査テスト **36成功** と実監査がすべてexit 0。
+`cargo fmt --check`、glyph lint（危険glyph 0）、通常 / portable core checkもexit 0。
+snapshot画像を変更せず、指定サイズの狭幅表示を目視確認した。CRLFと差分を確認し、
+独立再レビュー・実機確認・commitの成功とは区別する。
+
+`.\scripts\build-dev.ps1 -PreserveRuntime` もexit 0で完了した。別worktreeのnative build完了を
+待って通常featureの確認用runtimeを配置し、稼働プロセスを停止せず製品も起動しなかった。
+修正の実機手順は `target/E-1342-hardware-check.md` の追加確認を参照する。

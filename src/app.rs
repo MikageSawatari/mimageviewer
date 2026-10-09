@@ -83660,8 +83660,6 @@ impl App {
             .remember_favorite_view_state
             .then(|| self.settings.active_favorite_view_id())
             .flatten();
-        let common_changed =
-            favorite.is_none() && self.settings.common_fullscreen_specified_scale() != value;
         self.settings.fullscreen_specified_scale = value;
         if let Some(id) = favorite {
             let mut state = crate::settings::FavoriteViewState::from_settings(&self.settings);
@@ -83674,11 +83672,10 @@ impl App {
         } else {
             // Disabling favorite memory is reconciled by the existing overlay
             // owner. An explicit common edit before that reconciliation still
-            // updates its common projection, which Settings::save serializes.
+            // updates its common projection. Live widgets remain memory-only;
+            // the existing common-settings boundaries (including tray/exit
+            // persist_window_state_and_flush) serialize it with Settings::save.
             self.settings.set_common_fullscreen_specified_scale(value);
-            if common_changed {
-                self.settings.save();
-            }
         }
         changed
     }

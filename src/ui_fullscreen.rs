@@ -38020,12 +38020,12 @@ impl App {
         let settings = self.settings.fullscreen_specified_scale;
         let limits = self.fullscreen_fit_scale_limits(pixels_per_point);
         let old = std::mem::take(&mut self.fs_continuous_fit_reference);
-        let unit = match old {
+        let (unit, retained_base) = match old {
             ContinuousSpecifiedFitReference::Specified {
                 unit,
                 settings: old_settings,
                 limits: old_limits,
-                ..
+                base,
             } if old_settings == settings
                 && old_limits.no_upscale == limits.no_upscale
                 && old_limits.no_downscale == limits.no_downscale
@@ -38035,10 +38035,10 @@ impl App {
                         && candidate.singleton_placement == unit.singleton_placement
                 }) =>
             {
-                unit
+                (unit, base)
             }
             _ => match units.get(current_pos) {
-                Some(unit) => unit.clone(),
+                Some(unit) => (unit.clone(), None),
                 None => return,
             },
         };
@@ -38053,7 +38053,9 @@ impl App {
             apply_continuous_spread_geometry(&mut base, true);
             Some(base)
         } else {
-            None
+            // A texture/cache lifetime must not invalidate a confirmed fit unit.
+            // A newly selected unit still waits for its own source dimensions.
+            retained_base
         };
         self.fs_continuous_fit_reference = ContinuousSpecifiedFitReference::Specified {
             unit,
@@ -38110,8 +38112,31 @@ impl App {
         pixels_per_point: f32,
     ) -> ContinuousReadingUnitSize {
         let fit_mode = self.effective_fullscreen_fit_mode();
-        let mut base = self.continuous_unit_base_size(unit, fallback, prefer_processed);
-        apply_continuous_spread_geometry(&mut base, spread_should_match_page_heights(fit_mode));
+        // Reuse the same confirmed geometry for the reference unit's layout,
+        // not just its fit scale: viewport fallbacks would change scroll offsets
+        // after eviction. The retained pair already includes height matching.
+        let retained_base = match &self.fs_continuous_fit_reference {
+            ContinuousSpecifiedFitReference::Specified {
+                unit: reference,
+                base: Some(base),
+                ..
+            } if fit_mode == FullscreenFitMode::SpecifiedScale
+                && reference.presentation == unit.presentation
+                && reference.slice == unit.slice
+                && reference.singleton_placement == unit.singleton_placement
+                && unit
+                    .source_indices()
+                    .any(|idx| self.continuous_specified_fit_basis_for_idx(idx).is_none()) =>
+            {
+                Some(base.clone())
+            }
+            _ => None,
+        };
+        let mut base = retained_base.unwrap_or_else(|| {
+            let mut base = self.continuous_unit_base_size(unit, fallback, prefer_processed);
+            apply_continuous_spread_geometry(&mut base, spread_should_match_page_heights(fit_mode));
+            base
+        });
         let saved_spread_gap = quantize_points_to_physical_pixels(
             self.settings.spread_page_gap_px.min(200) as f32,
             pixels_per_point,
@@ -78218,11 +78243,13 @@ mod specified_scale_consumer_tests {
     }
 
     #[test]
-    fn specified_scale_common_explicit_setter_persists_and_rejects_invalid_value() {
+    fn specified_scale_common_explicit_setter_defers_to_save_boundary_and_rejects_invalid_value() {
         let mut app = crate::app::setup_app_for_test();
         let value = height(1234);
         let before = crate::settings::save_generation();
         assert!(app.set_current_fullscreen_specified_scale(value));
+        assert_eq!(crate::settings::save_generation(), before);
+        app.persist_window_state_and_flush(crate::app::PersistScope::ProcessKeepsRunning);
         assert!(crate::settings::save_generation() > before);
         assert_eq!(
             crate::settings::Settings::load().fullscreen_specified_scale,
@@ -78703,6 +78730,186 @@ mod specified_scale_consumer_tests {
                 modifiers: egui::Modifiers::NONE,
             },
         ]
+    }
+
+    #[test]
+    fn specified_scale_review_real_eviction_keeps_confirmed_reference_and_layout() {
+        for flow in [ReadingFlow::Vertical, ReadingFlow::Horizontal] {
+            for paired in [false, true] {
+                let ctx = egui::Context::default();
+                let mut app = pdf_app(&ctx, 48);
+                app.reading_flow = flow;
+                app.spread_mode = if paired {
+                    crate::settings::SpreadMode::Ltr
+                } else {
+                    crate::settings::SpreadMode::Single
+                };
+                app.settings.fullscreen_specified_scale = FullscreenSpecifiedScale {
+                    width: Some(SpecifiedScaleAxis::PercentTenths(800)),
+                    height: Some(SpecifiedScaleAxis::PercentTenths(800)),
+                };
+                app.settings.fullscreen_fit_no_upscale = false;
+                app.settings.fullscreen_fit_no_downscale = false;
+                for idx in 0..48 {
+                    app.items[idx] =
+                        GridItem::Image(app.tmp.path().join(format!("unloaded-{idx}.png")));
+                    let dims = match idx {
+                        0 => [100, 100],
+                        1 => [160, 200],
+                        _ => [200, 600],
+                    };
+                    app.record_page_layout_dims_for_spread(idx, (dims[0], dims[1]));
+                    if let Some(FsCacheEntry::Static { source_dims, .. }) =
+                        app.fs_cache.get_mut(&idx)
+                    {
+                        *source_dims = Some([dims[0] as usize, dims[1] as usize]);
+                    }
+                }
+                // The only known originals are the selected unit and the distant current one.
+                // No early dimensions, thumbnail or retained AI/PDF source can hide eviction.
+                app.fs_cache.retain(|idx, _| {
+                    if paired {
+                        [0, 1, 40, 41].contains(idx)
+                    } else {
+                        [0, 40].contains(idx)
+                    }
+                });
+                let units = if paired {
+                    (0..24)
+                        .map(|pos| {
+                            ContinuousReadingUnitSpec::pages(pos * 2, vec![pos * 2, pos * 2 + 1])
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    (0..48)
+                        .map(|idx| ContinuousReadingUnitSpec::pages(idx, vec![idx]))
+                        .collect::<Vec<_>>()
+                };
+                let current_pos = if paired { 20 } else { 40 };
+                let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+                app.continuous_reading_layout(&ctx, rect, &units, 0, false)
+                    .unwrap();
+                app.fullscreen_idx = Some(40);
+                app.fs_zoom = 1.3;
+                app.fs_vertical_scroll = 37.0;
+                let before = app
+                    .continuous_reading_layout(&ctx, rect, &units, current_pos, false)
+                    .unwrap();
+                let fit_before = app
+                    .continuous_specified_reference_fit(rect, flow, 1.0)
+                    .unwrap();
+                app.update_continuous_reading_prefetch_window(&units, &[current_pos], &[]);
+                assert!(
+                    !app.fs_cache.contains_key(&0),
+                    "real prefetch eviction releases the reference texture"
+                );
+                assert!(app.continuous_specified_fit_basis_for_idx(0).is_none());
+                assert!(!app.fs_early_dims.contains_key(&0));
+                let after = app
+                    .continuous_reading_layout(&ctx, rect, &units, current_pos, false)
+                    .unwrap();
+                let fit_after = app
+                    .continuous_specified_reference_fit(rect, flow, 1.0)
+                    .expect("confirmed geometry must outlive all reference cache entries");
+                close(fit_after.scale, fit_before.scale);
+                assert_eq!(reference_idx(&app), 0);
+                assert_eq!(app.fs_zoom, 1.3);
+                assert_eq!(app.fs_vertical_scroll, 37.0);
+                assert_eq!(before.2, after.2, "eviction must not change unit offsets");
+                assert_eq!(before.3, after.3, "eviction must not change scroll limits");
+                assert_eq!(
+                    before.0.iter().map(|p| p.rect).collect::<Vec<_>>(),
+                    after.0.iter().map(|p| p.rect).collect::<Vec<_>>()
+                );
+                // Resize/DPI still resolve the held physical geometry, rather than reselection.
+                ctx.set_pixels_per_point(2.0);
+                app.continuous_reading_layout(&ctx, rect.expand(100.0), &units, current_pos, false)
+                    .unwrap();
+                assert!(
+                    app.continuous_specified_reference_fit(
+                        rect.expand(100.0),
+                        flow,
+                        ctx.pixels_per_point()
+                    )
+                    .is_some()
+                );
+                assert_eq!(reference_idx(&app), 0);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn specified_scale_review_real_live_drag_defers_common_save_to_existing_boundary() {
+        let ctx = egui::Context::default();
+        install_fs_navigator_input_tracking(&ctx);
+        let mut app = pdf_app(&ctx, 1);
+        app.items[0] = GridItem::Image(app.tmp.path().join("live.png"));
+        app.settings.fullscreen_specified_scale = FullscreenSpecifiedScale::default();
+        app.settings.fullscreen_top_bar_locked = true;
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        app.native_video_in_window_active = true;
+        app.fit_popup_open = true;
+        assert!(app.fullscreen_embedded_still_active());
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 900.0));
+        let mut draw = |events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.render_fullscreen_viewport(ctx),
+            )
+        };
+        let mut output = draw(vec![]);
+        for _ in 0..4 {
+            output = draw(vec![]);
+        }
+        let number = painted_label(&output, "80.0")
+            .expect("the real fit popup exposes the preference DragValue");
+        let press = number.center();
+        draw(vec![
+            egui::Event::PointerMoved(press),
+            egui::Event::PointerButton {
+                pos: press,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        let generation = crate::settings::save_generation();
+        for delta in [20.0, 40.0, 60.0] {
+            draw(vec![egui::Event::PointerMoved(
+                press + egui::vec2(delta, 0.0),
+            )]);
+            assert_eq!(
+                crate::settings::save_generation(),
+                generation,
+                "each real drag change must remain memory-only"
+            );
+        }
+        draw(vec![egui::Event::PointerButton {
+            pos: egui::pos2(1199.0, 899.0),
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        drop(draw);
+        let final_value = app.settings.common_fullscreen_specified_scale();
+        assert_ne!(
+            final_value.width,
+            FullscreenSpecifiedScale::default().width,
+            "actual numeric changes must reach the live setter"
+        );
+        assert_eq!(app.settings.fullscreen_specified_scale, final_value);
+        assert_eq!(crate::settings::save_generation(), generation);
+        app.persist_window_state_and_flush(crate::app::PersistScope::ProcessKeepsRunning);
+        assert!(crate::settings::save_generation() > generation);
+        assert_eq!(
+            crate::settings::Settings::load().common_fullscreen_specified_scale(),
+            final_value
+        );
     }
 
     #[test]

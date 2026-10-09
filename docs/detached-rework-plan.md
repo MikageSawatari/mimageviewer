@@ -1487,6 +1487,16 @@ native window lifecycleは変更しない。既存4方式、単ページ / 見�
 本項は実際に触れた所有境界の記録であり、独立実装レビューの合格記録ではない。
 自動gateの結果と未実施の独立実装レビュー・実機確認は [計画§15](fullscreen-specified-scale-plan.md#15-実装接続と検証結果2026-10-09) へ集約する。
 
+2026-10-09 独立実装レビューP2 follow-up: 実変更は `ui_fullscreen.rs` の同一連結参照unitの
+確定geometry保持と配置consumer、実退去 / live preference入力回帰、および `app.rs` の
+指定値live setterからwidget単位の同期保存を外す境界である。共通設定の永続化は既存の
+環境設定確定・トレイ退避・終了へ戻し、favorite保存ownerは変えない。viewport predicates、
+context identity / mount / deposit / swap、placement / HWND / focus、worker寿命は変更しない。
+texture寿命から独立したfit ownerと既存保存ownerを使う構造修正であり、新しい状態flag・
+保存worker・別窓guardを追加しない。実退去で参照geometryと配置を検証し、実widget入力で
+保存頻度を検証する。利用者指示・レビューの構造判定への合意に従い、§2の症状パッチを避ける。
+修正後gate結果は `target/E-1342-fix-msg.txt` へ記録し、再レビュー合格とは区別する。
+
 2026-10-09 master統合後の一覧公開境界修正: 利用者指定の構造修正として、Bookmark一覧buildをmainの既存Surface lease・switch sequenceで所有し、mainの成功したitems交換だけが旧buildを退役させる。detached contextのmount・items交換・pollはmainのbuildを退役も採用もしない。同じBookmarkのsortは要求ownerを継続し、A/B記憶クリアは新epochで既存refreshを再開始する。Ctrl+Fの完了filterは送信済み条件を一緒に保持し、ViewerContextBundleの既存swap/park/dropとSmart退避で一緒に運ぶ。新しいdetached predicate・viewport・placement・待機・retry・pending ownerを設けず、公開先の所有証明と既存payloadの未接続を直すため、§2の症状パッチに当たらない。
 
 2026-10-09 §1.355追加修正: Coordinator指定の構造修正として、別窓bookmarkの既存startup resolve workerからtyped RAR header証明を採用境界へ運び、cache hit前に後続巻を拒否する。DFSも同じ証明で候補から除外する。新しいdetached predicate／viewport／待機／retryを作らず、既存requestの取消・held-owner再開・context所有を保つ。旧cacheの直接採用が共通の開封不変条件を迂回していた根因を入口ownerで直すため、§2の症状パッチに当たらない。
