@@ -1244,6 +1244,7 @@ mod tests {
             app.settings.toolbar_sort_items = vec![SortOrder::RatingDesc];
             app.settings.toolbar_sort_display = ToolbarSectionDisplay::Buttons;
             app.load_folder_with_scan(folder, None);
+            app.finish_page_identity_preparation_for_test();
             let mut fonts_ready = false;
             let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1700.0, 500.0))

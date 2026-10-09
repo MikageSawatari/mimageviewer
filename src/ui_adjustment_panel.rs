@@ -15281,6 +15281,7 @@ impl App {
                                         if ui.small_button("名前を編集").clicked() {
                                             start_title_edit =
                                                 Some(crate::app::BookBookmarkTitleEdit {
+                                                    focus_viewport: ctx.viewport_id(),
                                                     id: bookmark.id,
                                                     title: bookmark
                                                         .title

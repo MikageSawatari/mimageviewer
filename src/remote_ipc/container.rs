@@ -8,13 +8,14 @@ use std::time::{Duration, Instant};
 
 use mimageviewer_ipc::{
     ContainerEntry, ContainerEntryKind, ContainerKind, ContainerOpenMode, ContainerPayload,
-    ContainerRequest, ContainerResponse, FolderListEntry, FolderListPayload, FolderListRequest,
-    FolderListResponse, MediaError, MediaErrorCode, PageGroup, PagePayload, PagePriority,
-    PageRequest, PageResponse, RemoteAddress, RemoteAiProgressPhase, RemoteAiStartRequest,
-    RemoteAiTerminalCode, RemoteBookBookmarkList, RemoteBookBookmarkRow, RemoteBookBookmarkTarget,
-    RemoteEntryKind, RemoteFinalCoverSpreadPreference, RemotePageAlonePreference,
-    RemotePageDisplaySlot, RemotePagePresentationRole, RemotePagePresentationSlot,
-    RemotePageRenderContext, RemoteReadingDirection, RemoteSingletonSpreadPlacement,
+    ContainerRequest, ContainerResponse, ContainerResumeRefusal, FolderListEntry,
+    FolderListPayload, FolderListRequest, FolderListResponse, MediaError, MediaErrorCode,
+    PageGroup, PagePayload, PagePriority, PageRequest, PageResponse, RemoteAddress,
+    RemoteAiProgressPhase, RemoteAiStartRequest, RemoteAiTerminalCode, RemoteBookBookmarkList,
+    RemoteBookBookmarkRow, RemoteBookBookmarkTarget, RemoteEntryKind,
+    RemoteFinalCoverSpreadPreference, RemotePageAlonePreference, RemotePageDisplaySlot,
+    RemotePagePresentationRole, RemotePagePresentationSlot, RemotePageRenderContext,
+    RemoteReadingDirection, RemoteSingletonSpreadPlacement,
     RemoteSingletonSpreadPlacementPreference, RemoteSpreadMode, RemoteSubresource,
     RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse,
     RemoteWriteResult, ThumbnailError, ThumbnailErrorCode, ThumbnailResponse,
@@ -1125,6 +1126,7 @@ struct RemoteAutoTrimCacheEntry {
 /// producing the same raw raster here.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct RemoteSourceDecodeIdentity {
+    file_type_visibility: crate::file_type_visibility::FileTypeVisibility,
     path: PathBuf,
     mtime: i64,
     file_size: i64,
@@ -1200,6 +1202,7 @@ impl RemoteSourceDecodeIdentity {
         // - folder_thumb_sort is fixed to BOOK_READING_PAGE_ORDER for ZipDirectory, asserted
         //   above. Other remote source shapes never read it.
         Self {
+            file_type_visibility: request.file_type_visibility.clone(),
             path: request.path.clone(),
             mtime: request.mtime,
             file_size: request.file_size,
@@ -1245,7 +1248,10 @@ impl super::raw_prefetch::PrefetchIdentifier for ContainerEngine {
         ) {
             return None;
         }
-        let resolved = self.resolve(address).ok()?;
+        // Source admission is shared with foreground reads. Member admission below
+        // uses the direct central-directory proof and never expands nested containers.
+        let resolved = self.resolve_source(address).ok()?;
+        let policy = self.current_file_type_visibility().ok()?;
         let metadata = std::fs::metadata(&resolved.canonical).ok()?;
         let brightness = self.adjustment_render_settings().ok()?.raw_brightness;
         let (candidate, size_limit) = match &address.subresource {
@@ -1257,6 +1263,7 @@ impl super::raw_prefetch::PrefetchIdentifier for ContainerEngine {
                     resolved.readable_canonical(),
                     entry_name,
                     cancel,
+                    &policy,
                 )
                 .ok()??;
                 (Some(candidate), size)
@@ -1987,15 +1994,60 @@ enum ResumeReader {
     Session(super::session::SessionHandle),
     #[cfg(test)]
     Error(super::session::UiReadError),
+    #[cfg(test)]
+    Saved(crate::book_resume_db::ReadingPosition),
 }
 
 impl ResumeReader {
-    fn read_book_resume(&self, path: &Path) -> Result<Option<usize>, super::session::UiReadError> {
+    fn read_book_resume(
+        &self,
+        path: &Path,
+    ) -> Result<Option<crate::book_resume_db::ReadingPosition>, super::session::UiReadError> {
         match self {
-            Self::Session(session) => session.read_book_resume(path),
+            Self::Session(session) => session.read_book_position(path),
             #[cfg(test)]
             Self::Error(error) => Err(*error),
+            #[cfg(test)]
+            Self::Saved(saved) => Ok(Some(saved.clone())),
         }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ResumePageResolution {
+    Unavailable,
+    Page(RemoteAddress),
+    VisibilityRefused(ContainerResumeRefusal),
+}
+
+fn resolve_saved_resume_for_items(
+    container: &RemoteAddress,
+    container_path: &Path,
+    items: &[crate::grid_item::GridItem],
+    saved: &crate::book_resume_db::ReadingPosition,
+    policy: &crate::file_type_visibility::FileTypeVisibility,
+) -> ResumePageResolution {
+    let page = if let Some(identity) = &saved.identity {
+        items
+            .iter()
+            .find(|item| {
+                crate::book_resume_db::PageIdentity::for_item(item, Some(container_path)).as_ref()
+                    == Some(identity)
+            })
+            .and_then(|item| grid_item_address(container, item))
+    } else if policy.is_all_visible() {
+        resolve_resume_page(container, items, saved.page)
+    } else {
+        return ResumePageResolution::VisibilityRefused(
+            ContainerResumeRefusal::LegacyPositionUnverified,
+        );
+    };
+    match page {
+        Some(page) => ResumePageResolution::Page(page),
+        None if saved.identity.is_some() || !policy.is_all_visible() => {
+            ResumePageResolution::VisibilityRefused(ContainerResumeRefusal::SavedPageUnavailable)
+        }
+        None => ResumePageResolution::Unavailable,
     }
 }
 
@@ -2199,6 +2251,7 @@ struct PreparedZipBookmarkList {
 }
 
 struct RecomputedFolderListing {
+    file_type_visibility: crate::file_type_visibility::FileTypeVisibility,
     items: Vec<crate::grid_item::GridItem>,
     metas: Vec<Option<(i64, i64)>>,
     video_thumb_overrides: Vec<(std::path::PathBuf, std::path::PathBuf)>,
@@ -2615,6 +2668,15 @@ impl ContainerEngine {
             #[cfg(test)]
             AdjustmentSettingsSource::Snapshot(settings) => Ok((settings.clone(), 0.0)),
         }
+    }
+
+    pub(super) fn current_file_type_visibility(
+        &self,
+    ) -> Result<crate::file_type_visibility::FileTypeVisibility, crate::settings_db::SettingsDbError>
+    {
+        self.listing_settings
+            .load(&self.settings)
+            .map(|snapshot| snapshot.file_type_visibility().clone())
     }
 
     pub(super) fn raw_develop_executor(&self) -> &crate::raw::RawDevelopExecutor {
@@ -3373,6 +3435,7 @@ impl ContainerEngine {
             return RemoteWriteResponse::Success(RemoteWriteResult::book_bookmarks(
                 RemoteBookBookmarkList {
                     supported: false,
+                    visibility_notice: None,
                     rows: Vec::new(),
                 },
             ));
@@ -3403,6 +3466,17 @@ impl ContainerEngine {
                     ));
                 }
             };
+        let settings = match self.settings_for_listing() {
+            Ok(settings) => settings,
+            Err(error) => return RemoteWriteResponse::Error(error),
+        };
+        let projection = crate::bookmark_browser::project_book_bookmarks(
+            bookmarks,
+            &settings.file_type_visibility,
+            &AtomicBool::new(false),
+        );
+        let visibility_notice = projection.notice.map(|notice| notice.message().to_owned());
+        let bookmarks = projection.bookmarks;
         let container_address = RemoteAddress::file(context_address.path.clone());
 
         let rows = if std::fs::metadata(&resolved.canonical).is_ok_and(|metadata| metadata.is_dir())
@@ -3532,6 +3606,7 @@ impl ContainerEngine {
 
         RemoteWriteResponse::Success(RemoteWriteResult::book_bookmarks(RemoteBookBookmarkList {
             supported: true,
+            visibility_notice,
             rows,
         }))
     }
@@ -3577,8 +3652,10 @@ impl ContainerEngine {
         // 現行のページ検証は archive 内の全 entry を見る。一方、一覧の移動先は
         // RemoteAddress として安全な entry だけを公開する。この差を保ったまま、重い
         // archive 列挙だけを共有し、tree の構築はメモリ上でそれぞれ行う。
+        let policy = self.settings_for_listing()?.file_type_visibility;
         let validation_tree =
-            crate::zip_tree::ZipTree::build(resolved.logical.clone(), enumeration.entries.clone());
+            crate::zip_tree::ZipTree::build(resolved.logical.clone(), enumeration.entries.clone())
+                .project(&policy);
         let validated =
             self.validate_zip_page_in_tree(&validation_tree, &requested_prefix, entry_name)?;
         *page_index = validated.page_index;
@@ -3595,7 +3672,8 @@ impl ContainerEngine {
             })
             .collect();
         Ok(Some(PreparedZipBookmarkList {
-            tree: crate::zip_tree::ZipTree::build(resolved.logical.clone(), safe_entries),
+            tree: crate::zip_tree::ZipTree::build(resolved.logical.clone(), safe_entries)
+                .project(&policy),
             resolved,
         }))
     }
@@ -3808,6 +3886,7 @@ impl ContainerEngine {
         let auto_fullscreen_image_folders_enabled =
             settings.auto_fullscreen_image_folders_enabled();
         Ok(RecomputedFolderListing {
+            file_type_visibility: settings.file_type_visibility.clone(),
             items: materialized.items,
             metas: materialized.metas,
             video_thumb_overrides: materialized.video_thumb_overrides,
@@ -3871,7 +3950,9 @@ impl ContainerEngine {
     ) -> Result<ValidatedPageContext, RemoteWriteError> {
         let (resolved, requested_prefix, enumeration) =
             self.enumerate_zip_page_context(address, context_address)?;
-        let tree = crate::zip_tree::ZipTree::build(resolved.logical, enumeration.entries);
+        let policy = self.settings_for_listing()?.file_type_visibility;
+        let tree =
+            crate::zip_tree::ZipTree::build(resolved.logical, enumeration.entries).project(&policy);
         self.validate_zip_page_in_tree(&tree, &requested_prefix, entry_name)
     }
 
@@ -4046,11 +4127,12 @@ impl ContainerEngine {
         let raw_thumbnail = std::fs::metadata(&resolved.canonical)
             .ok()
             .and_then(|metadata| {
-                remote_raw_dep_spec(
+                remote_raw_dep_spec_with_visibility(
                     &request.address,
                     &resolved,
                     &metadata,
                     crate::raw::RawBrightness::default(),
+                    &self.current_file_type_visibility().ok()?,
                 )
                 .ok()
                 .flatten()
@@ -4258,11 +4340,16 @@ impl ContainerEngine {
             priority = effective_priority();
             let mut specs = Vec::new();
             for ((address, resolved), metadata) in dependencies.iter().zip(&metadata_by_address) {
-                let selection =
-                    match remote_archive_representative(address, resolved, &cancel, None) {
-                        Ok(selection) => selection,
-                        Err(error) => return PageResponse::Error(error),
-                    };
+                let selection = match remote_archive_representative_with_visibility(
+                    address,
+                    resolved,
+                    &cancel,
+                    None,
+                    &pins.settings.file_type_visibility,
+                ) {
+                    Ok(selection) => selection,
+                    Err(error) => return PageResponse::Error(error),
+                };
                 pins.selections
                     .insert((*address).clone(), selection.clone());
                 let spec = match remote_raw_dep_spec_with_selection(
@@ -4454,6 +4541,31 @@ impl ContainerEngine {
     }
 
     fn resolve(&self, address: &RemoteAddress) -> Result<ResolvedPath, MediaError> {
+        let resolved = self.resolve_source(address)?;
+        if let RemoteSubresource::ZipEntry { entry_name } = &address.subresource {
+            let policy = self
+                .current_file_type_visibility()
+                .map_err(|error| media_error(MediaErrorCode::RenderFailed, error.to_string()))?;
+            let visible = crate::zip_loader::visible_image_entry(
+                resolved.readable_logical(),
+                entry_name,
+                &policy,
+            )
+            .map_err(|error| media_error(MediaErrorCode::RenderFailed, error.to_string()))?;
+            if !visible {
+                return Err(media_error(
+                    MediaErrorCode::Unsupported,
+                    "表示するファイル種類の設定で、このページは非表示になっています",
+                ));
+            }
+        }
+        Ok(resolved)
+    }
+
+    pub(super) fn resolve_source(
+        &self,
+        address: &RemoteAddress,
+    ) -> Result<ResolvedPath, MediaError> {
         address.validate_syntax().map_err(|error| {
             media_error(
                 MediaErrorCode::BadRequest,
@@ -4472,6 +4584,7 @@ impl ContainerEngine {
             match registry.active_resolved_path(&address.path) {
                 Ok(Some(resolved)) => {
                     self.ensure_epub_allowed(&resolved)?;
+                    self.ensure_source_visibility(&resolved)?;
                     return Ok(self.retain_epub_request_read(resolved));
                 }
                 Ok(None) => {}
@@ -4480,7 +4593,39 @@ impl ContainerEngine {
         }
         let resolved = resolve_existing(&address.path).map_err(resolve_media_error)?;
         self.ensure_epub_allowed(&resolved)?;
+        self.ensure_source_visibility(&resolved)?;
         Ok(self.retain_epub_request_read(resolved))
+    }
+
+    pub(super) fn source_read_eligibility(
+        &self,
+        address: &RemoteAddress,
+    ) -> mimageviewer_ipc::SourceReadEligibilityResponse {
+        use mimageviewer_ipc::SourceReadEligibilityResponse;
+        if !matches!(address.subresource, RemoteSubresource::File) {
+            return SourceReadEligibilityResponse::Error(media_error(
+                MediaErrorCode::BadRequest,
+                "実ファイルのアドレスが必要です",
+            ));
+        }
+        match self.resolve_source(address) {
+            Ok(_) => SourceReadEligibilityResponse::Success,
+            Err(error) => SourceReadEligibilityResponse::Error(error),
+        }
+    }
+
+    fn ensure_source_visibility(&self, resolved: &ResolvedPath) -> Result<(), MediaError> {
+        let policy = self
+            .current_file_type_visibility()
+            .map_err(|error| media_error(MediaErrorCode::RenderFailed, error.to_string()))?;
+        let is_directory = std::fs::metadata(&resolved.canonical).is_ok_and(|meta| meta.is_dir());
+        if !is_directory && !policy.allows_physical_file(&resolved.logical) {
+            return Err(media_error(
+                MediaErrorCode::Unsupported,
+                "表示するファイル種類の設定で、このファイルは非表示になっています",
+            ));
+        }
+        Ok(())
     }
 
     fn retain_epub_request_read(&self, resolved: ResolvedPath) -> ResolvedPath {
@@ -4571,7 +4716,13 @@ impl ContainerEngine {
             );
         let mut selection = match pins.selections.get(address) {
             Some(selection) => selection.clone(),
-            None => remote_archive_representative(address, resolved, cancel, None)?,
+            None => remote_archive_representative_with_visibility(
+                address,
+                resolved,
+                cancel,
+                None,
+                &pins.settings.file_type_visibility,
+            )?,
         };
         loop {
             if cancel.load(Ordering::Acquire) {
@@ -4665,6 +4816,7 @@ impl ContainerEngine {
                 selection.as_ref().map(|candidate| &candidate.cursor),
                 cancel,
                 None,
+                &pins.settings.file_type_visibility,
             )?;
         }
     }
@@ -5053,7 +5205,7 @@ impl ContainerEngine {
                 let partner_resolved = self.resolve(partner).map_err(remote_ai_media_error)?;
                 let partner_metadata = std::fs::metadata(&partner_resolved.canonical)
                     .map_err(|error| RemoteAiRunError::Failed(format!("partner metadata: {error}")))?;
-                let partner_selection = remote_archive_representative(partner, &partner_resolved, cancel, None)
+                let partner_selection = remote_archive_representative_with_visibility(partner, &partner_resolved, cancel, None, &operation_settings.file_type_visibility)
                     .map_err(remote_ai_media_error)?;
                 raw_pins.selections.insert(partner.clone(), partner_selection);
                 if self.remote_auto_trim_bbox_cache_lookup_timed(
@@ -5329,12 +5481,13 @@ impl ContainerEngine {
         container_path: &Path,
         items: &[crate::grid_item::GridItem],
         resume_supported: bool,
-    ) -> Option<RemoteAddress> {
+        policy: &crate::file_type_visibility::FileTypeVisibility,
+    ) -> ResumePageResolution {
         if !resume_supported {
-            return None;
+            return ResumePageResolution::Unavailable;
         }
         let Some(reader) = self.resume_reader.as_ref() else {
-            return None;
+            return ResumePageResolution::Unavailable;
         };
         let saved = match reader.read_book_resume(container_path) {
             Ok(saved) => saved,
@@ -5342,20 +5495,44 @@ impl ContainerEngine {
                 crate::logger::log(format!(
                     "remote_ipc: book resume read failed; falling back to first page error={error:?}"
                 ));
-                return None;
+                return ResumePageResolution::Unavailable;
             }
         };
         let Some(saved) = saved else {
-            return None;
+            return ResumePageResolution::Unavailable;
         };
-        let resolved = resolve_resume_page(container, items, saved);
-        if resolved.is_none() {
+        let resolved =
+            resolve_saved_resume_for_items(container, container_path, items, &saved, policy);
+        if !matches!(resolved, ResumePageResolution::Page(_)) {
             crate::logger::log(format!(
-                "remote_ipc: saved book resume is outside the current readable pages saved_index={saved} item_count={}",
+                "remote_ipc: saved book resume is outside the current readable pages saved_index={} item_count={}",
+                saved.page,
                 items.len()
             ));
         }
         resolved
+    }
+
+    fn container_resume_fields(
+        &self,
+        auto_open: bool,
+        resume: ResumePageResolution,
+    ) -> (
+        Option<RemoteAddress>,
+        Option<ContainerResumeRefusal>,
+        ContainerOpenMode,
+    ) {
+        match resume {
+            ResumePageResolution::Page(page) => {
+                (Some(page), None, self.container_open_mode(auto_open))
+            }
+            ResumePageResolution::VisibilityRefused(reason)
+                if self.settings.book_open_resume.resumes() =>
+            {
+                (None, Some(reason), ContainerOpenMode::Grid)
+            }
+            _ => (None, None, self.container_open_mode(auto_open)),
+        }
     }
 
     fn container_open_mode(&self, auto_open: bool) -> ContainerOpenMode {
@@ -5383,14 +5560,21 @@ impl ContainerEngine {
         let listing = self
             .recompute_folder_listing(&resolved.logical)
             .map_err(media_error_from_remote_write)?;
-        let resume_page =
-            self.resume_page_for_items(&address, &resolved.logical, &listing.items, true);
+        let resume = self.resume_page_for_items(
+            &address,
+            &resolved.logical,
+            &listing.items,
+            true,
+            &listing.file_type_visibility,
+        );
         let source_items = listing.items;
         let total = source_items
             .iter()
             .filter(|item| matches!(item, crate::grid_item::GridItem::Image(_)))
             .count();
         let auto_open = listing.image_only && listing.auto_fullscreen_image_folders_enabled;
+        let (resume_page, resume_refusal, open_mode) =
+            self.container_resume_fields(auto_open, resume);
         let mut budget = ContainerEntryBudget::new(super::REMOTE_LIST_RESPONSE_BUDGET_BYTES);
         let mut items = Vec::new();
         let mut entries = Vec::new();
@@ -5452,7 +5636,8 @@ impl ContainerEngine {
                 Some(super::BOOK_SORT_LOCK_REASON),
             ),
             resume_page,
-            open_mode: self.container_open_mode(auto_open),
+            resume_refusal,
+            open_mode,
             configured_spread_mode: spread.configured,
             effective_spread_mode: spread.effective,
             reading_direction: spread.reading_direction,
@@ -5521,7 +5706,11 @@ impl ContainerEngine {
                 safe
             })
             .collect();
-        let tree = crate::zip_tree::ZipTree::build(resolved.logical.clone(), safe_entries);
+        let policy = self
+            .current_file_type_visibility()
+            .map_err(|error| media_error(MediaErrorCode::RenderFailed, &error.to_string()))?;
+        let tree = crate::zip_tree::ZipTree::build(resolved.logical.clone(), safe_entries)
+            .project(&policy);
         let requested_segments = zip_prefix_segments(&requested_prefix);
         if tree.node_at(&requested_segments).is_none() {
             return Err(media_error(
@@ -5540,8 +5729,17 @@ impl ContainerEngine {
                 .iter()
                 .all(|item| matches!(item, crate::grid_item::GridItem::ZipImage { .. }));
         let at_resume_root = effective_segments == root_segments;
-        let resume_page =
-            self.resume_page_for_items(&address, &resolved.logical, &items, at_resume_root);
+        let resume = self.resume_page_for_items(
+            &address,
+            &resolved.logical,
+            &items,
+            at_resume_root,
+            &policy,
+        );
+        let (resume_page, resume_refusal, open_mode) = self.container_resume_fields(
+            at_resume_root && self.settings.effective_auto_fullscreen_zip_pdf(),
+            resume,
+        );
         let mut budget = ContainerEntryBudget::new(super::REMOTE_LIST_RESPONSE_BUDGET_BYTES);
         let mut bounded_items = Vec::new();
         let mut entries = Vec::new();
@@ -5617,9 +5815,8 @@ impl ContainerEngine {
                 Some(super::BOOK_SORT_LOCK_REASON),
             ),
             resume_page,
-            open_mode: self.container_open_mode(
-                at_resume_root && self.settings.effective_auto_fullscreen_zip_pdf(),
-            ),
+            resume_refusal,
+            open_mode,
             configured_spread_mode: spread.configured,
             effective_spread_mode: spread.effective,
             reading_direction: spread.reading_direction,
@@ -5695,7 +5892,12 @@ impl ContainerEngine {
             items.push(item);
             entries.push(entry);
         }
-        let resume_page = self.resume_page_for_items(&address, &resolved.logical, &items, true);
+        let policy = self
+            .current_file_type_visibility()
+            .map_err(|error| media_error(MediaErrorCode::RenderFailed, &error.to_string()))?;
+        let resume = self.resume_page_for_items(&address, &resolved.logical, &items, true, &policy);
+        let (resume_page, resume_refusal, open_mode) =
+            self.container_resume_fields(self.settings.effective_auto_fullscreen_zip_pdf(), resume);
         let complete_book_eligible = entries.len() == page_count as usize && !byte_truncated;
         let spread = self.spread_payload_with_read(
             request,
@@ -5728,7 +5930,8 @@ impl ContainerEngine {
                 Some(super::BOOK_SORT_LOCK_REASON),
             ),
             resume_page,
-            open_mode: self.container_open_mode(self.settings.effective_auto_fullscreen_zip_pdf()),
+            resume_refusal,
+            open_mode,
             configured_spread_mode: spread.configured,
             effective_spread_mode: spread.effective,
             reading_direction: spread.reading_direction,
@@ -6720,6 +6923,9 @@ impl ContainerEngine {
             file_size = size;
         }
         let mut request = crate::thumb_loader::LoadRequest {
+            file_type_visibility: self
+                .current_file_type_visibility()
+                .map_err(|error| media_error(MediaErrorCode::RenderFailed, error.to_string()))?,
             path: resolved.readable_logical().to_path_buf(),
             mtime,
             file_size,
@@ -8390,13 +8596,30 @@ fn remote_raw_flight_media_error(error: RemoteRawFlightError) -> MediaError {
 
 /// Identify from directory metadata; payload readability is checked only after
 /// the request's RAW admission decision.
+#[cfg(test)]
 fn remote_archive_representative(
     address: &RemoteAddress,
     resolved: &ResolvedPath,
     cancel: &Arc<AtomicBool>,
     stop: Option<&AtomicBool>,
 ) -> Result<Option<crate::zip_loader::RemoteImageCandidate>, MediaError> {
-    remote_archive_next_representative(address, resolved, None, cancel, stop)
+    remote_archive_representative_with_visibility(
+        address,
+        resolved,
+        cancel,
+        stop,
+        &Default::default(),
+    )
+}
+
+fn remote_archive_representative_with_visibility(
+    address: &RemoteAddress,
+    resolved: &ResolvedPath,
+    cancel: &Arc<AtomicBool>,
+    stop: Option<&AtomicBool>,
+    policy: &crate::file_type_visibility::FileTypeVisibility,
+) -> Result<Option<crate::zip_loader::RemoteImageCandidate>, MediaError> {
+    remote_archive_next_representative(address, resolved, None, cancel, stop, policy)
 }
 
 fn remote_archive_next_representative(
@@ -8405,6 +8628,7 @@ fn remote_archive_next_representative(
     after: Option<&crate::zip_loader::RemoteArchiveCandidateCursor>,
     cancel: &Arc<AtomicBool>,
     stop: Option<&AtomicBool>,
+    policy: &crate::file_type_visibility::FileTypeVisibility,
 ) -> Result<Option<crate::zip_loader::RemoteImageCandidate>, MediaError> {
     let archive = resolved.readable_canonical();
     let prefix = match &address.subresource {
@@ -8428,8 +8652,9 @@ fn remote_archive_next_representative(
         }
         _ => return Ok(None),
     };
-    let selected =
-        crate::zip_loader::next_remote_image_candidate(archive, prefix, after, cancel, stop);
+    let selected = crate::zip_loader::next_remote_image_candidate_with_visibility(
+        archive, prefix, after, cancel, stop, policy,
+    );
     selected.map_err(|error| {
         if cancel.load(Ordering::Acquire) || stop.is_some_and(|token| token.load(Ordering::Acquire))
         {
@@ -8538,14 +8763,32 @@ fn remote_raw_dep_spec_with_selection(
     }))
 }
 
+#[cfg(test)]
 fn remote_raw_dep_spec(
     address: &RemoteAddress,
     resolved: &ResolvedPath,
     metadata: &std::fs::Metadata,
     brightness: crate::raw::RawBrightness,
 ) -> Result<Option<RawDepSpec>, MediaError> {
+    remote_raw_dep_spec_with_visibility(
+        address,
+        resolved,
+        metadata,
+        brightness,
+        &Default::default(),
+    )
+}
+
+fn remote_raw_dep_spec_with_visibility(
+    address: &RemoteAddress,
+    resolved: &ResolvedPath,
+    metadata: &std::fs::Metadata,
+    brightness: crate::raw::RawBrightness,
+    policy: &crate::file_type_visibility::FileTypeVisibility,
+) -> Result<Option<RawDepSpec>, MediaError> {
     let cancel = Arc::new(AtomicBool::new(false));
-    let selected = remote_archive_representative(address, resolved, &cancel, None)?;
+    let selected =
+        remote_archive_representative_with_visibility(address, resolved, &cancel, None, policy)?;
     remote_raw_dep_spec_with_selection(address, resolved, metadata, brightness, selected.as_ref())
 }
 
@@ -8732,7 +8975,7 @@ fn thumbnail_error(code: ThumbnailErrorCode, message: impl Into<String>) -> Thum
 mod tests {
     use super::*;
 
-    fn initialize_remote_page_edit_databases() {
+    pub(super) fn initialize_remote_page_edit_databases() {
         drop(crate::adjustment_db::AdjustmentDb::open().unwrap());
         drop(crate::mask_db::MaskDb::open().unwrap());
         drop(crate::local_adjust_db::LocalAdjustDb::open().unwrap());
@@ -10986,6 +11229,7 @@ mod tests {
         full_page: bool,
     ) -> RemoteSourceDecodeIdentity {
         RemoteSourceDecodeIdentity {
+            file_type_visibility: Default::default(),
             path: PathBuf::from(name),
             mtime: 10,
             file_size: 20,
@@ -11372,6 +11616,7 @@ mod tests {
                 None,
             ),
             resume_page: None,
+            resume_refusal: None,
             open_mode: ContainerOpenMode::Grid,
             configured_spread_mode: RemoteSpreadMode::Single,
             effective_spread_mode: RemoteSpreadMode::Single,
@@ -12507,7 +12752,7 @@ mod tests {
         bytes
     }
 
-    fn remote_ai_test_jpeg(width: u32, height: u32) -> Vec<u8> {
+    pub(super) fn remote_ai_test_jpeg(width: u32, height: u32) -> Vec<u8> {
         let mut bytes = Vec::new();
         image::codecs::jpeg::JpegEncoder::new(&mut bytes)
             .encode_image(&image::DynamicImage::new_rgb8(width, height))
@@ -14151,6 +14396,131 @@ mod tests {
     }
 
     #[test]
+    fn restricted_resume_refusals_keep_remote_grid_without_replacing_saved_page() {
+        let temp = tempfile::tempdir().unwrap();
+        let album = temp.path().join("album");
+        std::fs::create_dir(&album).unwrap();
+        let hidden = album.join("001.png");
+        let visible = album.join("002.jpg");
+        std::fs::write(&hidden, b"hidden").unwrap();
+        std::fs::write(&visible, b"visible").unwrap();
+        let mut settings = crate::settings::Settings::default();
+        settings.auto_fullscreen_zip_pdf = true;
+        settings.auto_fullscreen_image_folders = true;
+        settings.book_open_resume = crate::settings::ResumeMode::Resume;
+        settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("png".into());
+        let request = ContainerRequest {
+            address: RemoteAddress::file(album.to_string_lossy().into_owned()),
+            spread_mode: None,
+            reading_direction: None,
+            force_single_page: false,
+        };
+        for (identity, expected_reason) in [
+            (None, ContainerResumeRefusal::LegacyPositionUnverified),
+            (
+                crate::book_resume_db::PageIdentity::for_item(
+                    &crate::grid_item::GridItem::Image(hidden.clone()),
+                    Some(&album),
+                ),
+                ContainerResumeRefusal::SavedPageUnavailable,
+            ),
+        ] {
+            let mut engine = ContainerEngine::new(settings.clone());
+            engine.resume_reader = Some(ResumeReader::Saved(
+                crate::book_resume_db::ReadingPosition { page: 0, identity },
+            ));
+            let ContainerResponse::Success(payload) = engine.container(request.clone()) else {
+                panic!("restricted album enumeration failed");
+            };
+            assert_eq!(payload.entries.len(), 1);
+            assert_eq!(payload.entries[0].name, "002.jpg");
+            assert_eq!(payload.resume_page, None);
+            assert_eq!(payload.resume_refusal, Some(expected_reason));
+            assert_eq!(payload.open_mode, ContainerOpenMode::Grid);
+        }
+        let mut engine = ContainerEngine::new(settings);
+        engine.resume_reader = Some(ResumeReader::Saved(
+            crate::book_resume_db::ReadingPosition {
+                page: 999,
+                identity: crate::book_resume_db::PageIdentity::for_item(
+                    &crate::grid_item::GridItem::Image(visible),
+                    Some(&album),
+                ),
+            },
+        ));
+        let ContainerResponse::Success(payload) = engine.container(request) else {
+            panic!("exact visible resume enumeration failed");
+        };
+        assert_eq!(
+            payload.resume_page,
+            Some(payload.entries[0].address.clone())
+        );
+        assert_eq!(payload.resume_refusal, None);
+        assert_eq!(payload.open_mode, ContainerOpenMode::ResumePage);
+    }
+
+    #[test]
+    fn resume_resolution_keeps_released_missing_and_unrestricted_legacy_fallback() {
+        let path = Path::new("C:/album.zip");
+        let address = RemoteAddress::file(path.to_string_lossy().into_owned());
+        // Virtual addresses do not require a filesystem fixture. Physical images are
+        // resolved through the released existing-path guard by grid_item_address.
+        let items = vec![crate::grid_item::GridItem::ZipImage {
+            zip_path: path.into(),
+            entry_name: "002.jpg".into(),
+        }];
+        let policy = crate::file_type_visibility::FileTypeVisibility::default();
+        let legacy = crate::book_resume_db::ReadingPosition {
+            page: 0,
+            identity: None,
+        };
+        assert_eq!(
+            resolve_saved_resume_for_items(&address, path, &items, &legacy, &policy),
+            ResumePageResolution::Page(grid_item_address(&address, &items[0]).unwrap()),
+        );
+        let missing = crate::book_resume_db::ReadingPosition {
+            page: 99,
+            identity: None,
+        };
+        assert_eq!(
+            resolve_saved_resume_for_items(&address, path, &items, &missing, &policy),
+            ResumePageResolution::Unavailable,
+        );
+        let missing_exact = crate::book_resume_db::ReadingPosition {
+            page: 0,
+            identity: crate::book_resume_db::PageIdentity::for_item(
+                &crate::grid_item::GridItem::ZipImage {
+                    zip_path: path.into(),
+                    entry_name: "001.png".into(),
+                },
+                Some(path),
+            ),
+        };
+        let exact_result =
+            resolve_saved_resume_for_items(&address, path, &items, &missing_exact, &policy);
+        assert_eq!(
+            exact_result,
+            ResumePageResolution::VisibilityRefused(ContainerResumeRefusal::SavedPageUnavailable)
+        );
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            book_open_resume: crate::settings::ResumeMode::Resume,
+            ..Default::default()
+        });
+        let (page, refusal, mode) =
+            engine.container_resume_fields(true, ResumePageResolution::Unavailable);
+        assert_eq!(page, None);
+        assert_eq!(refusal, None);
+        assert_eq!(mode, ContainerOpenMode::ResumePage);
+        let (page, refusal, mode) = engine.container_resume_fields(true, exact_result);
+        assert_eq!(page, None);
+        assert_eq!(refusal, Some(ContainerResumeRefusal::SavedPageUnavailable));
+        assert_eq!(mode, ContainerOpenMode::Grid);
+    }
+
+    #[test]
     fn resume_read_failures_fall_back_without_failing_container_enumeration() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("favorite");
@@ -14186,8 +14556,144 @@ mod tests {
             };
             assert_eq!(payload.entries.len(), 2);
             assert_eq!(payload.resume_page, None);
+            assert_eq!(payload.resume_refusal, None);
             assert_eq!(payload.open_mode, ContainerOpenMode::ResumePage);
         }
+    }
+
+    #[test]
+    fn remote_visibility_rejects_hidden_direct_targets_and_keeps_directory_passages() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("notes.zip");
+        std::fs::create_dir(&directory).unwrap();
+        let hidden = temp.path().join("hidden.png");
+        std::fs::write(&hidden, b"image").unwrap();
+        let mut settings = crate::settings::Settings::default();
+        settings
+            .file_type_visibility
+            .excluded_extensions
+            .extend(["zip".to_owned(), "png".to_owned()]);
+        let engine = ContainerEngine::new(settings);
+        assert!(
+            engine
+                .resolve(&RemoteAddress::file(
+                    directory.to_string_lossy().into_owned()
+                ))
+                .is_ok()
+        );
+        let error = engine
+            .resolve(&RemoteAddress::file(hidden.to_string_lossy().into_owned()))
+            .unwrap_err();
+        assert_eq!(error.code, MediaErrorCode::Unsupported);
+        assert!(error.message.contains("非表示"));
+    }
+
+    #[test]
+    fn source_read_eligibility_uses_current_policy_and_rejects_virtual_members() {
+        let guard = crate::settings_db::DataDirOverrideGuard::new();
+        assert!(
+            crate::settings_db::boot_settings_db(guard.path())
+                .db
+                .is_some()
+        );
+        let path = guard.path().join("page.png");
+        std::fs::write(&path, b"no image decode is required for admission").unwrap();
+        let mut settings = crate::settings::Settings::default();
+        let engine = ContainerEngine::new_with_session(
+            settings.clone(),
+            super::super::session::SessionHandle::new(),
+        );
+        let address = RemoteAddress::file(path.to_string_lossy().into_owned());
+        for excluded in [false, true, false] {
+            settings.file_type_visibility.excluded_extensions.clear();
+            if excluded {
+                settings
+                    .file_type_visibility
+                    .excluded_extensions
+                    .insert("png".into());
+            }
+            crate::settings_db::with_db_result(|db| db.save_full(&settings)).unwrap();
+            let response = engine.source_read_eligibility(&address);
+            if excluded {
+                assert!(matches!(
+                    response,
+                    mimageviewer_ipc::SourceReadEligibilityResponse::Error(MediaError {
+                        code: MediaErrorCode::Unsupported,
+                        ..
+                    })
+                ));
+            } else {
+                assert_eq!(
+                    response,
+                    mimageviewer_ipc::SourceReadEligibilityResponse::Success
+                );
+            }
+        }
+        let virtual_address = RemoteAddress {
+            path: path.to_string_lossy().into_owned(),
+            subresource: RemoteSubresource::ZipEntry {
+                entry_name: "nested.dng".into(),
+            },
+        };
+        assert!(matches!(
+            engine.source_read_eligibility(&virtual_address),
+            mimageviewer_ipc::SourceReadEligibilityResponse::Error(MediaError {
+                code: MediaErrorCode::BadRequest,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn remote_representative_uses_the_current_policy_before_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("book.cbz");
+        let inner = temp.path().join("inner.zip");
+        write_remote_ai_test_zip(&inner, &[("01.jpg", b"nested")]);
+        let bytes = std::fs::read(&inner).unwrap();
+        write_remote_ai_test_zip(
+            &archive,
+            &[
+                ("00.png", b"hidden"),
+                ("inner.zip", &bytes),
+                ("notes.zip/02.jpg", b"directory"),
+            ],
+        );
+        let mut settings = crate::settings::Settings::default();
+        settings
+            .file_type_visibility
+            .excluded_extensions
+            .extend(["zip".to_owned(), "png".to_owned()]);
+        let engine = ContainerEngine::new(settings.clone());
+        let address = RemoteAddress::file(archive.to_string_lossy().into_owned());
+        let resolved = engine.resolve(&address).unwrap();
+        let selected = remote_archive_representative_with_visibility(
+            &address,
+            &resolved,
+            &Arc::new(AtomicBool::new(false)),
+            None,
+            &settings.file_type_visibility,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.entry_name, "notes.zip/02.jpg");
+        let hidden = RemoteAddress {
+            path: address.path.clone(),
+            subresource: RemoteSubresource::ZipEntry {
+                entry_name: "inner.zip/01.jpg".to_owned(),
+            },
+        };
+        assert_eq!(
+            engine.resolve(&hidden).unwrap_err().code,
+            MediaErrorCode::Unsupported
+        );
+        let permitted = RemoteAddress {
+            path: address.path,
+            subresource: RemoteSubresource::ZipEntry {
+                entry_name: "notes.zip/02.jpg".to_owned(),
+            },
+        };
+        assert!(engine.resolve(&permitted).is_ok());
     }
 
     #[test]
@@ -14346,11 +14852,13 @@ mod tests {
                     entry_name: "10.jpg".to_owned(),
                     uncompressed_size: 1,
                     mtime: 0,
+                    container_ancestry: Vec::new(),
                 },
                 crate::zip_loader::ZipImageEntry {
                     entry_name: "2.jpg".to_owned(),
                     uncompressed_size: 1,
                     mtime: 0,
+                    container_ancestry: Vec::new(),
                 },
             ],
         );
@@ -14611,6 +15119,105 @@ mod tests {
     }
 
     #[test]
+    fn remote_in_book_bookmarks_use_real_ancestry_and_retain_missing_registrations() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("book.cbz");
+        let inner = remote_ai_test_zip_bytes(&[("nested.jpg", b"nested")]);
+        write_remote_ai_test_zip(
+            &archive,
+            &[
+                ("part-a/001.jpg", b"anchor"),
+                ("inner.zip", &inner),
+                ("notes.zip/kept.jpg", b"direct"),
+            ],
+        );
+        let service = crate::book_bookmarks::BookBookmarkService::spawn().unwrap();
+        for (index, entry) in [
+            "inner.zip/nested.jpg",
+            "notes.zip/kept.jpg",
+            "missing.jpg",
+            "unknown.bin",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            service.add(
+                index as u64 + 1,
+                crate::book_bookmarks::NewBookBookmark {
+                    container_path: archive.clone(),
+                    container_kind: crate::book_bookmarks::BookContainerKind::Zip,
+                    page_identity: crate::book_bookmarks::PageIdentity::ArchiveEntry(entry.into()),
+                    page_index_hint: index,
+                },
+            );
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match service.try_recv() {
+                    Ok(crate::book_bookmarks::BookBookmarkEvent::Added {
+                        result: Ok(_), ..
+                    }) => break,
+                    Ok(event) => panic!("unexpected bookmark event: {event:?}"),
+                    Err(mpsc::TryRecvError::Empty) if Instant::now() < deadline => {
+                        std::thread::yield_now()
+                    }
+                    Err(error) => panic!("bookmark service failed: {error}"),
+                }
+            }
+        }
+        let mut settings = crate::settings::Settings::default();
+        settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("zip".into());
+        let engine = ContainerEngine::new(settings);
+        let mut request = RemoteWriteRequest::ListBookBookmarks {
+            address: RemoteAddress {
+                path: archive.to_string_lossy().into_owned(),
+                subresource: RemoteSubresource::ZipEntry {
+                    entry_name: "part-a/001.jpg".into(),
+                },
+            },
+            context_address: RemoteAddress {
+                path: archive.to_string_lossy().into_owned(),
+                subresource: RemoteSubresource::ZipDirectory {
+                    prefix: "part-a/".into(),
+                },
+            },
+            page_index: 0,
+            bookmark_supported: true,
+        };
+        let RemoteWriteResponse::Success(result) = engine.book_bookmarks(&mut request) else {
+            panic!("bookmark list failed");
+        };
+        let list = result.book_bookmarks.unwrap();
+        assert!(list.supported);
+        assert_eq!(list.rows.len(), 3);
+        assert!(!list.rows.iter().any(|row| row.page_label == "nested.jpg"));
+        let kept = list
+            .rows
+            .iter()
+            .find(|row| row.page_label == "kept.jpg")
+            .unwrap();
+        assert!(kept.target.is_some());
+        for missing in ["missing.jpg", "unknown.bin"] {
+            let row = list
+                .rows
+                .iter()
+                .find(|row| row.page_label == missing)
+                .unwrap();
+            assert!(row.target.is_none());
+            assert!(row.id > 0);
+        }
+        assert_eq!(
+            crate::book_bookmarks::load_for_container_from_disk_readonly(&archive)
+                .unwrap()
+                .len(),
+            4
+        );
+    }
+
+    #[test]
     fn mixed_folder_publishes_resume_index_but_not_history_or_bookmark_state() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("favorite");
@@ -14658,6 +15265,7 @@ mod tests {
             result.book_bookmarks,
             Some(RemoteBookBookmarkList {
                 supported: false,
+                visibility_notice: None,
                 rows: Vec::new(),
             })
         );
@@ -14834,6 +15442,93 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn remote_physical_folder_keeps_selected_audio_sidecar_when_its_extension_is_hidden() {
+        let guard = crate::settings_db::DataDirOverrideGuard::new();
+        assert!(
+            crate::settings_db::boot_settings_db(guard.path())
+                .db
+                .is_some()
+        );
+        let root = guard.path().join("favorite");
+        let album = root.join("album");
+        std::fs::create_dir_all(&album).unwrap();
+        std::fs::write(album.join("song.mp3"), b"audio").unwrap();
+        std::fs::write(album.join("song.jpg"), b"jpeg sidecar").unwrap();
+        std::fs::write(album.join("song.png"), b"png sidecar").unwrap();
+        let favorite = FavoriteEntry::new("test".to_owned(), root);
+        let mut settings = crate::settings::Settings {
+            favorites: vec![favorite.clone()],
+            sort_order: crate::settings::SortOrder::FileName,
+            skip_image_if_video_exists: true,
+            video_thumb_use_sidecar_image: true,
+            ..Default::default()
+        };
+        crate::settings_db::with_db_result(|db| db.save_full(&settings)).unwrap();
+        let engine = ContainerEngine::new_with_session(
+            settings.clone(),
+            super::super::session::SessionHandle::new(),
+        );
+        let request = FolderListRequest {
+            address: favorite_address(&favorite, "album"),
+        };
+        let FolderListResponse::Success(all_visible) = engine.folder_list(request.clone()) else {
+            panic!("all-visible audio folder listing failed");
+        };
+        assert_eq!(all_visible.entries.len(), 1);
+        let original_audio = &all_visible.entries[0];
+        assert_eq!(original_audio.name, "song.mp3");
+        assert_eq!(original_audio.kind, RemoteEntryKind::Audio);
+        assert_eq!(
+            original_audio.address,
+            favorite_address(&favorite, "album/song.mp3")
+        );
+        // The shipped name-ascending filter adopts its last same-stem candidate.
+        assert_eq!(
+            original_audio.thumbnail_address,
+            favorite_address(&favorite, "album/song.png")
+        );
+        assert_eq!(
+            all_visible.sort_state.selected,
+            super::super::sort_order_wire_value(crate::settings::SortOrder::FileName)
+        );
+        assert!(all_visible.sort_state.locked_reason.is_none());
+
+        settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("png".into());
+        crate::settings_db::with_db_result(|db| db.save_full(&settings)).unwrap();
+        let FolderListResponse::Success(png_hidden) = engine.folder_list(request) else {
+            panic!("PNG-hidden audio folder listing failed");
+        };
+        // Refresh the same production engine through its live settings snapshot:
+        // hiding an auxiliary candidate must not select the remaining JPEG.
+        assert!(
+            engine
+                .settings_for_listing()
+                .unwrap()
+                .file_type_visibility
+                .excluded_extensions
+                .contains("png")
+        );
+        assert_eq!(png_hidden.entries.len(), 1);
+        let audio = &png_hidden.entries[0];
+        assert_eq!(audio.kind, RemoteEntryKind::Audio);
+        assert_eq!(audio.name, original_audio.name);
+        assert_eq!(audio.address, original_audio.address);
+        assert_eq!(audio.thumbnail_address, original_audio.thumbnail_address);
+        assert_eq!(audio.mtime, original_audio.mtime);
+        assert_eq!(audio.size, original_audio.size);
+        assert!(
+            png_hidden
+                .entries
+                .iter()
+                .all(|entry| entry.kind != RemoteEntryKind::Image),
+            "same-stem sidecars must not remain as independent remote tiles"
+        );
     }
 
     #[test]
@@ -15746,6 +16441,545 @@ mod tests {
 #[cfg(test)]
 mod raw_window_tests {
     use super::*;
+    fn zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(&mut cursor);
+        for (name, bytes) in entries {
+            writer
+                .start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap();
+        cursor.into_inner()
+    }
+
+    /// Use the real archive job's result activation: public addresses name the 7z,
+    /// while all reads receive its canonical converted ZIP backing (verbatim on Windows).
+    #[cfg(windows)]
+    fn visibility_open_converted_remote_archive(
+        folder: &Path,
+        entries: &[(&str, &[u8])],
+    ) -> (
+        Arc<ContainerEngine>,
+        Arc<super::super::archive_job::RemoteArchiveJobRegistry>,
+        PathBuf,
+        PathBuf,
+    ) {
+        use super::super::archive_job::{ContainerRemoteArchiveExecutor, RemoteArchiveJobRegistry};
+        use crate::settings::FavoriteEntry;
+        use mimageviewer_ipc::{
+            RemoteArchiveJobState, RemoteArchiveResultResponse, RemoteArchiveStartRequest,
+            RemoteArchiveStartResponse, RemoteArchiveStateResponse, SessionAcquireRequest,
+            SessionConnectionKind, SessionPeerInfo, SessionStatus,
+        };
+
+        std::fs::create_dir_all(folder).unwrap();
+        let source = folder.join("source.7z");
+        let mut writer = sevenz_rust2::ArchiveWriter::create(&source).unwrap();
+        for (name, data) in entries {
+            writer
+                .push_archive_entry(
+                    sevenz_rust2::ArchiveEntry::new_file(name),
+                    Some(std::io::Cursor::new(data.to_vec())),
+                )
+                .unwrap();
+        }
+        writer.finish().unwrap();
+        let db = Arc::new(crate::archive_cache::ArchiveCacheDb::open().unwrap());
+        let cached = db.reserve_cache_zip_path(&source).unwrap();
+        let summary = crate::archive_converter::convert_to_zip(
+            &source,
+            &cached,
+            crate::archive_converter::ArchiveFormat::SevenZ,
+            &AtomicBool::new(false),
+            None,
+        )
+        .unwrap();
+        let metadata = std::fs::metadata(&source).unwrap();
+        db.record(
+            &source,
+            crate::ui_helpers::mtime_secs(&metadata),
+            metadata.len() as i64,
+            crate::archive_converter::ArchiveFormat::SevenZ,
+            &cached,
+            std::fs::metadata(&cached).unwrap().len() as i64,
+            summary.image_count,
+            false,
+        )
+        .unwrap();
+        let mut settings = crate::settings::Settings {
+            favorites: vec![FavoriteEntry::new("canonical cache".into(), folder.into())],
+            ..Default::default()
+        };
+        settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("zip".into());
+        crate::settings_db::with_db_result(|db| db.save_full(&settings)).unwrap();
+        let session = super::super::session::SessionHandle::new();
+        session.install_archive_cache_db(Some(db));
+        let engine = Arc::new(ContainerEngine::new_with_session(settings, session.clone()));
+        let jobs = RemoteArchiveJobRegistry::new(Arc::new(ContainerRemoteArchiveExecutor::new(
+            Arc::clone(&engine),
+            session.clone(),
+        )));
+        session.install_archive_jobs(&jobs);
+        assert_eq!(
+            session
+                .acquire(SessionAcquireRequest {
+                    client_id: "visibility".into(),
+                    peer: SessionPeerInfo {
+                        connection_kind: SessionConnectionKind::Direct,
+                        device_name: Some("canonical cache test".into()),
+                    },
+                })
+                .status,
+            SessionStatus::Active
+        );
+        assert!(session.finish_acquire(session.snapshot().generation));
+        let operation = session
+            .begin_operation(
+                &session.owner_for_test("visibility"),
+                "open canonical cache".into(),
+            )
+            .unwrap();
+        let RemoteArchiveStartResponse::Accepted(snapshot) = jobs.start(
+            "visibility".into(),
+            RemoteArchiveStartRequest {
+                request_id: "canonical-cache".into(),
+                source: RemoteAddress::file(source.to_string_lossy().into_owned()),
+            },
+            u64::MAX,
+            operation,
+        ) else {
+            panic!("archive job was not admitted")
+        };
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let RemoteArchiveStateResponse::Success(current) =
+                jobs.state("visibility", &snapshot.job_id)
+            else {
+                panic!("archive job disappeared")
+            };
+            if current.state == RemoteArchiveJobState::Ready {
+                break;
+            }
+            assert!(!current.state.is_terminal(), "{current:?}");
+            assert!(Instant::now() < deadline, "{current:?}");
+            std::thread::yield_now();
+        }
+        assert!(matches!(
+            jobs.result("visibility", &snapshot.job_id),
+            RemoteArchiveResultResponse::Success(_)
+        ));
+        let resolved = engine
+            .resolve_source(&RemoteAddress::file(source.to_string_lossy().into_owned()))
+            .unwrap();
+        let canonical = std::fs::canonicalize(&cached).unwrap();
+        assert_eq!(resolved.readable_canonical(), canonical);
+        assert!(canonical.to_string_lossy().starts_with(r"\\?\"));
+        (engine, jobs, source, cached)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn visibility_raw_identification_checks_canonical_converted_cache_without_nested_reads() {
+        use super::super::raw_prefetch::PrefetchIdentifier;
+        let data = crate::settings_db::DataDirOverrideGuard::new();
+        let nested = zip_bytes(&[("nested.dng", b"NESTED RAW")]);
+        let (engine, _jobs, source, cached) = visibility_open_converted_remote_archive(
+            &data.path().join("raw-canonical"),
+            &[
+                ("root.dng", b"ROOT RAW"),
+                ("notes.zip/direct.dng", b"DIRECT RAW"),
+                ("inner.zip", &nested),
+            ],
+        );
+        let canonical = std::fs::canonicalize(&cached).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let address = |name: &str| RemoteAddress {
+            path: source.to_string_lossy().into_owned(),
+            subresource: RemoteSubresource::ZipEntry {
+                entry_name: name.into(),
+            },
+        };
+        for member in ["root.dng", "notes.zip/direct.dng"] {
+            assert!(
+                engine.identify(&address(member), &cancel).is_some(),
+                "{member}"
+            );
+        }
+        assert!(
+            engine
+                .identify(&address("inner.zip/nested.dng"), &cancel)
+                .is_none()
+        );
+        for path in [&cached, &canonical] {
+            assert!(!crate::zip_loader::nested_cache_contains(path, "inner.zip"));
+            for member in ["root.dng", "notes.zip/direct.dng", "inner.zip/nested.dng"] {
+                assert_eq!(crate::zip_loader::raw_payload_read_count(path, member), 0);
+            }
+        }
+        cancel.store(true, Ordering::Release);
+        assert!(engine.identify(&address("root.dng"), &cancel).is_none());
+        cancel.store(false, Ordering::Release);
+        // Legacy caches cannot prove the direct entry's ancestry either.
+        std::fs::write(
+            &cached,
+            zip_bytes(&[
+                ("root.dng", b"ROOT RAW"),
+                ("inner.zip/nested.dng", b"NESTED RAW"),
+            ]),
+        )
+        .unwrap();
+        for member in ["root.dng", "inner.zip/nested.dng"] {
+            assert!(engine.identify(&address(member), &cancel).is_none());
+            assert_eq!(
+                crate::zip_loader::raw_payload_read_count(&canonical, member),
+                0
+            );
+        }
+        assert!(!crate::zip_loader::nested_cache_contains(
+            &canonical,
+            "inner.zip"
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn visibility_thumbnail_representatives_check_canonical_converted_cache_and_keep_page_contract()
+    {
+        use super::tests::{initialize_remote_page_edit_databases, remote_ai_test_jpeg};
+        let data = crate::settings_db::DataDirOverrideGuard::new();
+        initialize_remote_page_edit_databases();
+        let hidden = zip_bytes(&[("page.jpg", &remote_ai_test_jpeg(10, 4))]);
+        let allowed = remote_ai_test_jpeg(7, 5);
+        let (engine, _jobs, source, _) = visibility_open_converted_remote_archive(
+            &data.path().join("page-canonical"),
+            &[
+                ("chapter.zip", &hidden),
+                ("pages/chapter.zip", &hidden),
+                ("pages/notes.zip/page.jpg", &allowed),
+            ],
+        );
+        for subresource in [
+            RemoteSubresource::File,
+            RemoteSubresource::ZipDirectory {
+                prefix: "pages/".into(),
+            },
+        ] {
+            let address = RemoteAddress {
+                path: source.to_string_lossy().into_owned(),
+                subresource: subresource.clone(),
+            };
+            let mut settings = engine.settings_for_listing().unwrap();
+            for excluded in [true, false, true] {
+                settings.file_type_visibility.excluded_extensions.clear();
+                if excluded {
+                    settings
+                        .file_type_visibility
+                        .excluded_extensions
+                        .insert("zip".into());
+                }
+                crate::settings_db::with_db_result(|db| db.save_full(&settings)).unwrap();
+                let response = engine.thumbnail(
+                    &mimageviewer_ipc::ThumbnailRequest {
+                        address: address.clone(),
+                        source_address: None,
+                        target_px: 256,
+                    },
+                    &WorkerContext::open(),
+                );
+                let ThumbnailResponse::Success { webp_bytes } = response else {
+                    panic!("{subresource:?} excluded={excluded}: {response:?}")
+                };
+                let image = image::load_from_memory(&webp_bytes).unwrap();
+                let expected = if excluded { (7, 5) } else { (10, 4) };
+                assert_eq!(
+                    (image.width(), image.height()),
+                    expected,
+                    "{subresource:?} excluded={excluded}"
+                );
+            }
+            for priority in [PagePriority::Foreground, PagePriority::Prefetch] {
+                let response = engine.page_with_job_cancel_and_priority(
+                    PageRequest {
+                        job_id: format!("canonical-{subresource:?}-{priority:?}"),
+                        display_request_id: None,
+                        address: address.clone(),
+                        target_px: 256,
+                        priority,
+                        render_context: None,
+                        adjustment_preview: None,
+                    },
+                    &WorkerContext::open(),
+                    Arc::new(AtomicBool::new(false)),
+                    &|| priority,
+                );
+                // Public HTTP rejects archive File and ZipDirectory pages. The
+                // core still accepts File representatives; ZipDirectory has no
+                // page trim/edit identity and must retain its existing refusal.
+                if matches!(subresource, RemoteSubresource::ZipDirectory { .. }) {
+                    assert!(
+                        matches!(
+                            response,
+                            PageResponse::Error(MediaError {
+                                code: MediaErrorCode::BadRequest,
+                                ..
+                            })
+                        ),
+                        "{priority:?}: {response:?}"
+                    );
+                    continue;
+                }
+                let PageResponse::Success(payload) = response else {
+                    panic!("{subresource:?} {priority:?}: {response:?}")
+                };
+                assert_eq!(
+                    (payload.width, payload.height),
+                    (7, 5),
+                    "{subresource:?} {priority:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn raw_window_converted_cache_direct_proof_uses_manifest_without_nested_reads() {
+        let data = crate::data_dir::TestDataDirGuard::new();
+        let source = data.path().join("source.cbz");
+        let inner = zip_bytes(&[("nested.dng", b"NESTED RAW")]);
+        std::fs::write(
+            &source,
+            zip_bytes(&[
+                ("root.dng", b"ROOT RAW"),
+                ("notes.zip/direct.dng", b"DIRECT RAW"),
+                ("inner.zip", &inner),
+            ]),
+        )
+        .unwrap();
+        let db = crate::archive_cache::ArchiveCacheDb::open().unwrap();
+        let cached = db.reserve_cache_zip_path(&source).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let summary = crate::archive_converter::convert_to_zip(
+            &source,
+            &cached,
+            crate::archive_converter::ArchiveFormat::Zip,
+            &cancel,
+            None,
+        )
+        .unwrap();
+        let source_meta = std::fs::metadata(&source).unwrap();
+        db.record(
+            &source,
+            crate::ui_helpers::mtime_secs(&source_meta),
+            source_meta.len() as i64,
+            crate::archive_converter::ArchiveFormat::Zip,
+            &cached,
+            std::fs::metadata(&cached).unwrap().len() as i64,
+            summary.image_count,
+            false,
+        )
+        .unwrap();
+        let policy = crate::file_type_visibility::FileTypeVisibility {
+            excluded_extensions: ["zip".into()].into_iter().collect(),
+            ..Default::default()
+        };
+        assert!(policy.allows_physical_file(&source));
+        assert_eq!(
+            db.peek_with_visibility(
+                &source,
+                crate::ui_helpers::mtime_secs(&source_meta),
+                source_meta.len() as i64,
+                &policy
+            ),
+            Some(cached.clone())
+        );
+        // Native ZIP source addresses do not consult converted mappings. Test the
+        // same direct proof used after an active Remote archive target resolves its
+        // cache, without fabricating an archive-job target or another read route.
+        for member in ["root.dng", "notes.zip/direct.dng"] {
+            let (candidate, _) = crate::zip_loader::resolve_direct_raw_prefetch_candidate(
+                &cached, member, &cancel, &policy,
+            )
+            .unwrap()
+            .expect("literal RAW entries remain eligible");
+            assert_eq!(
+                crate::zip_loader::candidate_payload_read_count(&cached, &candidate.cursor),
+                0
+            );
+        }
+        assert!(
+            crate::zip_loader::resolve_direct_raw_prefetch_candidate(
+                &cached,
+                "inner.zip/nested.dng",
+                &cancel,
+                &policy,
+            )
+            .unwrap()
+            .is_none()
+        );
+        for path in [&source, &cached] {
+            assert!(!crate::zip_loader::nested_cache_contains(path, "inner.zip"));
+            for member in ["root.dng", "notes.zip/direct.dng", "inner.zip/nested.dng"] {
+                assert_eq!(crate::zip_loader::raw_payload_read_count(path, member), 0);
+            }
+        }
+        cancel.store(true, Ordering::Release);
+        assert_eq!(
+            crate::zip_loader::resolve_direct_raw_prefetch_candidate(
+                &cached, "root.dng", &cancel, &policy,
+            )
+            .unwrap_err()
+            .kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        cancel.store(false, Ordering::Release);
+        // Preserve the converted literal leaves while removing only the manifest.
+        // The existing registered conversion still expects version 1 provenance.
+        std::fs::write(
+            &cached,
+            zip_bytes(&[
+                ("root.dng", b"ROOT RAW"),
+                ("notes.zip/direct.dng", b"DIRECT RAW"),
+                ("inner.zip/nested.dng", b"NESTED RAW"),
+            ]),
+        )
+        .unwrap();
+        for member in ["root.dng", "notes.zip/direct.dng", "inner.zip/nested.dng"] {
+            assert!(
+                crate::zip_loader::resolve_direct_raw_prefetch_candidate(
+                    &cached, member, &cancel, &policy,
+                )
+                .unwrap()
+                .is_none()
+            );
+            assert_eq!(
+                crate::zip_loader::raw_payload_read_count(&cached, member),
+                0
+            );
+        }
+        assert!(!crate::zip_loader::nested_cache_contains(
+            &cached,
+            "inner.zip"
+        ));
+    }
+
+    #[test]
+    fn raw_window_direct_admission_never_walks_nested_containers_with_restricted_policy() {
+        use super::super::raw_prefetch::PrefetchIdentifier;
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("book.cbz");
+        let nested = zip_bytes(&[("nested.dng", b"RAW")]);
+        std::fs::write(
+            &archive,
+            zip_bytes(&[("inner.zip", &nested), ("notes.zip/direct.dng", b"RAW")]),
+        )
+        .unwrap();
+        let mut settings = crate::settings::Settings::default();
+        settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("zip".into());
+        let engine = ContainerEngine::new(settings);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let address = |name: &str| RemoteAddress {
+            path: archive.to_string_lossy().into_owned(),
+            subresource: RemoteSubresource::ZipEntry {
+                entry_name: name.into(),
+            },
+        };
+        assert!(
+            engine
+                .identify(&address("notes.zip/direct.dng"), &cancel)
+                .is_some()
+        );
+        assert!(
+            engine
+                .identify(&address("inner.zip/nested.dng"), &cancel)
+                .is_none()
+        );
+        assert!(!crate::zip_loader::nested_cache_contains(
+            &archive,
+            "inner.zip"
+        ));
+        assert_eq!(
+            crate::zip_loader::raw_payload_read_count(&archive, "notes.zip/direct.dng"),
+            0
+        );
+        cancel.store(true, Ordering::Release);
+        assert!(
+            engine
+                .identify(&address("notes.zip/direct.dng"), &cancel)
+                .is_none()
+        );
+        assert!(!crate::zip_loader::nested_cache_contains(
+            &archive,
+            "inner.zip"
+        ));
+        // Foreground still resolves real nested ancestry and rejects excluded ZIPs.
+        let hidden = engine
+            .resolve(&address("inner.zip/nested.dng"))
+            .unwrap_err();
+        assert_eq!(hidden.code, MediaErrorCode::Unsupported);
+        assert!(engine.resolve(&address("notes.zip/direct.dng")).is_ok());
+        let visible_engine = ContainerEngine::new(crate::settings::Settings::default());
+        assert!(
+            visible_engine
+                .resolve(&address("inner.zip/nested.dng"))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn raw_window_checks_declared_limit_without_nested_expansion_and_honors_leaf_policy() {
+        use super::super::raw_prefetch::PrefetchIdentifier;
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("book.cbz");
+        let mut bytes = zip_bytes(&[
+            ("page.dng", b"RAW"),
+            ("inner.zip", &zip_bytes(&[("nested.dng", b"RAW")])),
+        ]);
+        let central = bytes
+            .windows(4)
+            .position(|bytes| bytes == b"PK\x01\x02")
+            .unwrap();
+        bytes[central + 24..central + 28]
+            .copy_from_slice(&(256_u32 * 1024 * 1024 + 1).to_le_bytes());
+        std::fs::write(&archive, bytes).unwrap();
+        let mut settings = crate::settings::Settings::default();
+        settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("zip".into());
+        let engine = ContainerEngine::new(settings.clone());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let address = RemoteAddress {
+            path: archive.to_string_lossy().into_owned(),
+            subresource: RemoteSubresource::ZipEntry {
+                entry_name: "page.dng".into(),
+            },
+        };
+        assert!(engine.identify(&address, &cancel).is_none());
+        assert!(!crate::zip_loader::nested_cache_contains(
+            &archive,
+            "inner.zip"
+        ));
+        std::fs::write(&archive, zip_bytes(&[("page.dng", b"RAW")])).unwrap();
+        settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("dng".into());
+        assert!(
+            ContainerEngine::new(settings)
+                .identify(&address, &cancel)
+                .is_none()
+        );
+    }
     #[test]
     fn raw_window_identification_owns_only_the_address_source_not_auto_trim_partner() {
         use super::super::raw_prefetch::PrefetchIdentifier;

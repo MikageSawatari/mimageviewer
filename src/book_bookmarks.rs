@@ -1844,6 +1844,46 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn bookmark_visibility_total_counts_full_media_and_book_registration() {
+        let data = crate::data_dir::TestDataDirGuard::new();
+        let db = BookBookmarkDb::open_at(&db_path()).unwrap();
+        let hidden = db
+            .add(&NewBookBookmark {
+                container_path: data.path().join("folder"),
+                container_kind: BookContainerKind::ImageFolder,
+                page_identity: PageIdentity::RelativePath("hidden.PNG".into()),
+                page_index_hint: 3,
+            })
+            .unwrap()
+            .0;
+        let document = db
+            .add(&NewBookBookmark {
+                container_path: data.path().join("missing.pdf"),
+                container_kind: BookContainerKind::Pdf,
+                page_identity: PageIdentity::PdfPage(4),
+                page_index_hint: 4,
+            })
+            .unwrap()
+            .0;
+        let media = crate::video_bookmarks::VideoBookmarkDb::open().unwrap();
+        media
+            .add(&data.path().join("missing.mp4"), 2.0, Some("marker"), &[])
+            .unwrap();
+        let policy = crate::file_type_visibility::FileTypeVisibility {
+            excluded_extensions: ["png".into()].into_iter().collect(),
+            ..Default::default()
+        };
+        let built = crate::bookmark_browser::build_rows_readonly_with_visibility_and_total(&policy)
+            .unwrap();
+        assert_eq!(built.registered_total, 3);
+        assert_eq!(built.rows.len(), 2);
+        assert!(built.rows.iter().any(|row| matches!(&row.source, crate::bookmark_browser::BookmarkRowSource::Book(bookmark) if bookmark.id == document.id)));
+        assert!(!built.rows.iter().any(|row| matches!(&row.source, crate::bookmark_browser::BookmarkRowSource::Book(bookmark) if bookmark.id == hidden.id)));
+        assert_eq!(db.list_all().unwrap().len(), 2);
+        assert_eq!(media.list_all_global().unwrap().len(), 1);
+    }
+
     fn open_in_memory() -> BookBookmarkDb {
         let conn = rusqlite::Connection::open_in_memory().expect("memory DB");
         BookBookmarkDb::init_schema(&conn).expect("schema");
@@ -2100,16 +2140,19 @@ mod tests {
                 entry_name: "book-a/001.jpg".to_owned(),
                 uncompressed_size: 10,
                 mtime: 1,
+                container_ancestry: Vec::new(),
             },
             crate::zip_loader::ZipImageEntry {
                 entry_name: "book-b/wrapper/010.jpg".to_owned(),
                 uncompressed_size: 10,
                 mtime: 1,
+                container_ancestry: Vec::new(),
             },
             crate::zip_loader::ZipImageEntry {
                 entry_name: "book-b/wrapper/020.jpg".to_owned(),
                 uncompressed_size: 10,
                 mtime: 1,
+                container_ancestry: Vec::new(),
             },
         ];
         let tree = crate::zip_tree::ZipTree::build(PathBuf::from("C:/Books/all.zip"), entries);

@@ -1124,6 +1124,10 @@ fn filtered_count_label(total: usize, visible: usize) -> String {
     format!("{visible} / {total} 件")
 }
 
+fn registered_count_label(registered_total: usize, visible: usize) -> String {
+    format!("表示{visible} / 登録{registered_total}")
+}
+
 fn facet_menu_label(base: &str, active: usize) -> String {
     if active == 0 {
         base.to_string()
@@ -1596,6 +1600,35 @@ fn omitted_entries_chip_label(counts: crate::app::OmittedFolderEntryCounts) -> O
     (primary > 0).then(|| format!("非表示 {primary} 件"))
 }
 
+fn file_type_visibility_button(ui: &mut egui::Ui, active: bool) -> bool {
+    ui.selectable_label(
+        active,
+        if active {
+            "ファイル種類 (適用中)"
+        } else {
+            "ファイル種類"
+        },
+    )
+    .on_hover_text("環境設定の「表示するファイル種類」を開きます")
+    .clicked()
+}
+
+#[doc(hidden)]
+pub fn draw_file_type_visibility_status_snapshot_fixture(ui: &mut egui::Ui) {
+    let _ = file_type_visibility_button(ui, true);
+    ui.label(registered_count_label(12, 7));
+    let _ = draw_omitted_entries_chip(
+        ui,
+        crate::app::OmittedFolderEntryCounts {
+            same_name: 3,
+            hidden: 2,
+            file_type: 4,
+            unsupported: 1,
+            ..Default::default()
+        },
+    );
+}
+
 /// 内訳の区切りは `/` ではなく `、` を使う。
 ///
 /// 書庫の分類名が `RAR / 7z / LZH` を含むので、区切りも `/` にすると
@@ -1615,6 +1648,9 @@ fn omitted_entries_breakdown_label(counts: crate::app::OmittedFolderEntryCounts)
     }
     if counts.ignored_epub > 0 {
         parts.push(format!("EPUB（設定で無視） {}", counts.ignored_epub));
+    }
+    if counts.file_type > 0 {
+        parts.push(format!("ファイル種類 {}", counts.file_type));
     }
     parts.push(format!("対象外 {}", counts.unsupported));
     if counts.system > 0 {
@@ -1649,12 +1685,19 @@ fn draw_omitted_entries_chip(
             || counts.ignored_archive > 0
             || counts.ignored_epub > 0
             || counts.hidden > 0
+            || counts.file_type > 0
         {
             ui.separator();
         }
         if counts.same_name > 0 && ui.link("同名ファイル設定を開く").clicked() {
             open_preferences =
                 Some(crate::ui_dialogs::preferences::PreferencesOpenRequest::DUPLICATE_FILES);
+            ui.close();
+        }
+        if counts.file_type > 0 && ui.link("表示するファイル種類を設定する").clicked()
+        {
+            open_preferences =
+                Some(crate::ui_dialogs::preferences::PreferencesOpenRequest::FILE_TYPE_VISIBILITY);
             ui.close();
         }
         if counts.ignored_archive > 0 {
@@ -12500,6 +12543,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 facet_name_changed |= self.clear_facet_name_filter_state();
                             }
                         }
+                        FI::FileTypeVisibility => {
+                            let active = !self.settings.file_type_visibility.is_all_visible();
+                            if file_type_visibility_button(ui, active) {
+                                self.open_preferences_request(crate::ui_dialogs::preferences::PreferencesOpenRequest::FILE_TYPE_VISIBILITY);
+                            }
+                        }
                         FI::Unknown => {}
                     }
                 }
@@ -12570,10 +12619,15 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 }
                 ui.separator();
                 ui.label(
-                    egui::RichText::new(filtered_count_label(
-                        self.smart_folder_rule_total(),
-                        self.visible_indices.len(),
-                    ))
+                    egui::RichText::new(
+                        if self.items_are_bookmark_view {
+                            registered_count_label(self.bookmark_view_registered_total, self.visible_indices.len())
+                        } else if let Some(total) = self.collection_registered_total() {
+                            registered_count_label(total, self.visible_indices.len())
+                        } else {
+                            filtered_count_label(self.smart_folder_rule_total(), self.visible_indices.len())
+                        }
+                    )
                     .small(),
                 );
                 if self.settings.show_facet_sort {
@@ -14203,7 +14257,18 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             && !self.items_are_tag_view
             && self.search_filter.is_none()
             && self.search_pending.is_none())
-        .then(|| thumbnail_count_label(self.smart_folder_rule_total(), self.visible_indices.len()));
+        .then(|| {
+            if self.items_are_bookmark_view {
+                registered_count_label(
+                    self.bookmark_view_registered_total,
+                    self.visible_indices.len(),
+                )
+            } else if let Some(total) = self.collection_registered_total() {
+                registered_count_label(total, self.visible_indices.len())
+            } else {
+                thumbnail_count_label(self.smart_folder_rule_total(), self.visible_indices.len())
+            }
+        });
         // 📌 (代表サムネ固定) ボタンの表示判定 + 状態をあらかじめ計算する。
         // closure 内で `self` のミュータブル借用が衝突しないように外で確定しておく。
         let pin_button_info = self.compute_folder_pin_button_state();
@@ -20380,6 +20445,7 @@ mod facet_filter_bar_tests {
             hidden: 2,
             ignored_archive: 4,
             ignored_epub: 0,
+            file_type: 0,
             unsupported: 1,
             system: 4,
         };
@@ -20409,6 +20475,7 @@ mod facet_filter_bar_tests {
             hidden: 0,
             ignored_archive: 0,
             ignored_epub: 0,
+            file_type: 0,
             unsupported: 5,
             system: 0,
         };
@@ -20428,6 +20495,7 @@ mod facet_filter_bar_tests {
             hidden: 0,
             ignored_archive: 0,
             ignored_epub: 0,
+            file_type: 0,
             unsupported: 0,
             system: 9,
         };
@@ -20448,6 +20516,7 @@ mod facet_filter_bar_tests {
             hidden: 2,
             ignored_archive: 4,
             ignored_epub: 0,
+            file_type: 0,
             unsupported: 1,
             system: 0,
         };
@@ -20484,6 +20553,7 @@ mod facet_filter_bar_tests {
             hidden: 0,
             ignored_archive: 0,
             ignored_epub: 0,
+            file_type: 0,
             unsupported: 1,
             system: 0,
         };
@@ -20545,6 +20615,7 @@ mod facet_filter_bar_tests {
                 hidden: 0,
                 ignored_archive: 0,
                 ignored_epub: 0,
+                file_type: 0,
                 unsupported: 0,
                 system: 0,
             },
@@ -20561,6 +20632,7 @@ mod facet_filter_bar_tests {
                 hidden: 0,
                 ignored_archive: 1,
                 ignored_epub: 0,
+                file_type: 0,
                 unsupported: 0,
                 system: 0,
             },
@@ -20573,6 +20645,7 @@ mod facet_filter_bar_tests {
                 hidden: 1,
                 ignored_archive: 0,
                 ignored_epub: 0,
+                file_type: 0,
                 unsupported: 0,
                 system: 0,
             },
@@ -21508,6 +21581,13 @@ mod rating_filter_op_tests {
     #[test]
     fn filtered_count_label_shows_visible_and_total_counts() {
         assert_eq!(filtered_count_label(300, 123), "123 / 300 件");
+    }
+
+    #[test]
+    fn registered_count_label_keeps_filtered_and_stored_totals_distinct() {
+        assert_eq!(registered_count_label(12, 7), "表示7 / 登録12");
+        assert_eq!(registered_count_label(12, 0), "表示0 / 登録12");
+        assert_eq!(registered_count_label(0, 0), "表示0 / 登録0");
     }
 
     #[test]
@@ -28779,7 +28859,9 @@ mod section207_tests {
                         std::fs::create_dir_all(&folder).unwrap();
                         std::fs::write(folder.join("image.jpg"), b"fixture").unwrap();
                         app.load_folder_with_scan(folder, None);
+                        app.finish_page_identity_preparation_for_test();
                         app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+                        app.finish_page_identity_preparation_for_test();
                         if changed {
                             app.settings.rating_filter = [false; 6];
                         }
@@ -29562,6 +29644,7 @@ mod section292_tests {
             std::fs::write(path, b"image").unwrap();
         }
         app.load_folder_with_scan(root.join("a"), None);
+        app.finish_page_identity_preparation_for_test();
         app.settings.show_toolbar_sort = false;
         app.settings.show_facet_sort = true;
         app.settings.toolbar_sort_items = vec![SortOrder::FileName];
@@ -29607,6 +29690,7 @@ mod section292_tests {
         refresh.click();
         harness.run();
         SORT_CONTROL_TEST_RELOADS.with(|count| assert_eq!(count.get(), 1));
+        app.borrow_mut().finish_page_identity_preparation_for_test();
         assert!(
             app.borrow()
                 .items
@@ -29633,6 +29717,7 @@ mod section292_tests {
             app.borrow_mut().poll_subfolder_expansion(&ctx);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        app.borrow_mut().finish_page_identity_preparation_for_test();
         assert!(app.borrow().items_are_subfolder_expansion_view);
         assert_eq!(app.borrow().items.len(), 2);
         assert_eq!(app.borrow().items[0].name(), "a.jpg");
@@ -29666,7 +29751,9 @@ mod section292_tests {
                 app.settings.subfolder_expansion_order,
                 SubfolderExpansionOrder::FolderGrouped
             );
+            app.finish_page_identity_preparation_for_test();
             app.finish_subfolder_expansion_prepare_for_test();
+            app.finish_page_identity_preparation_for_test();
             assert_eq!(app.items.len(), 2);
             assert_eq!(app.items[0].name(), "z.jpg");
             assert!(std::sync::Arc::ptr_eq(

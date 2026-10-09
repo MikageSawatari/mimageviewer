@@ -94,14 +94,23 @@ fn book_resume_meter_records_hud_ordinal_in_mixed_items() {
         );
         app.record_book_resume(idx);
         assert_eq!(
-            app.last_book_resume,
+            app.last_book_resume.as_ref().map(|(path, page, meter, _)| (
+                path.clone(),
+                *page,
+                *meter
+            )),
             Some((book.clone(), idx, meter(ordinal, 3)))
         );
         assert_eq!(app.book_resume_meters.get(&book), meter(ordinal, 3));
     }
     app.record_book_resume(1);
     app.record_book_resume(2);
-    assert_eq!(app.last_book_resume, Some((book.clone(), 4, meter(3, 3))));
+    assert_eq!(
+        app.last_book_resume
+            .as_ref()
+            .map(|(path, page, meter, _)| (path.clone(), *page, *meter)),
+        Some((book.clone(), 4, meter(3, 3)))
+    );
     settle(&mut app);
     assert_eq!(
         stored_row(app.tmp.path(), &book),
@@ -129,7 +138,12 @@ fn book_resume_meter_uses_hud_rtl_reading_order_and_spread_anchor() {
         Some("2 / 4")
     );
     app.record_book_resume(1);
-    assert_eq!(app.last_book_resume, Some((book.clone(), 1, meter(2, 4))));
+    assert_eq!(
+        app.last_book_resume
+            .as_ref()
+            .map(|(path, page, meter, _)| (path.clone(), *page, *meter)),
+        Some((book.clone(), 1, meter(2, 4)))
+    );
 
     app.spread_mode = SpreadMode::Rtl;
     assert_eq!(
@@ -137,7 +151,12 @@ fn book_resume_meter_uses_hud_rtl_reading_order_and_spread_anchor() {
         Some("2, 1 / 4")
     );
     app.record_book_resume(1);
-    assert_eq!(app.last_book_resume, Some((book.clone(), 1, meter(2, 4))));
+    assert_eq!(
+        app.last_book_resume
+            .as_ref()
+            .map(|(path, page, meter, _)| (path.clone(), *page, *meter)),
+        Some((book.clone(), 1, meter(2, 4)))
+    );
     assert_eq!(app.book_resume_meters.get(&book), meter(2, 4));
 }
 
@@ -217,7 +236,12 @@ fn book_resume_meter_pending_snapshot_replays_record_remove_and_clear() {
     app.reload_book_resume_meters();
     writer_ack(app.book_resume_writer.as_ref().unwrap());
     app.clear_book_resume_async();
-    assert_eq!(app.last_book_resume, None);
+    assert_eq!(
+        app.last_book_resume
+            .as_ref()
+            .map(|(path, page, meter, _)| (path.clone(), *page, *meter)),
+        None
+    );
     app.persist_book_resume(keep.clone(), 1, meter(2, 3));
     app.poll_book_resume_meters(&egui::Context::default());
     assert_eq!(app.book_resume_meters.get(&keep), meter(2, 3));
@@ -259,14 +283,22 @@ fn book_resume_meter_reload_preserves_latest_pending_resume_source() {
     let latest = Some((book.clone(), 7, value));
     app.reload_book_resume_meters();
     assert_eq!(
-        app.last_book_resume, latest,
+        app.last_book_resume
+            .as_ref()
+            .map(|(path, page, meter, _)| (path.clone(), *page, *meter)),
+        latest,
         "Remoteの直近raw位置は再読込で失わない"
     );
     assert_eq!(app.book_resume_meters.get(&book), value);
 
     resume.send(()).unwrap();
     settle(&mut app);
-    assert_eq!(app.last_book_resume, latest);
+    assert_eq!(
+        app.last_book_resume
+            .as_ref()
+            .map(|(path, page, meter, _)| (path.clone(), *page, *meter)),
+        latest
+    );
     assert_eq!(app.book_resume_meters.get(&book), value);
     assert_eq!(
         stored_row(app.tmp.path(), &book),
@@ -1188,6 +1220,31 @@ fn book_resume_meter_archive_cache_rows_and_error_do_not_invalidate_sources() {
     }
 }
 
+#[test]
+fn book_resume_identity_write_retains_exact_page_and_raw_record_together() {
+    let mut app = setup_app();
+    settle(&mut app);
+    let book = app.tmp.path().join("identity-book");
+    app.current_folder = Some(book.clone());
+    let page = GridItem::Image(book.join("2.png"));
+    set_pages(
+        &mut app,
+        vec![GridItem::Image(book.join("1.jpg")), page.clone()],
+    );
+    app.record_book_resume(1);
+    settle(&mut app);
+    let stored = app
+        .book_resume_db
+        .as_ref()
+        .unwrap()
+        .get_position(&book)
+        .unwrap();
+    assert_eq!(stored.page, 1);
+    assert_eq!(
+        stored.identity,
+        crate::book_resume_db::PageIdentity::for_item(&page, None)
+    );
+}
 fn refresh_converted_source(app: &mut AppTestEnv, idx: usize) {
     let scope = std::collections::HashSet::from([idx]);
     app.start_converted_archive_cache_paths_refresh(&scope, (idx, idx + 1), (idx, idx + 1));
@@ -1249,16 +1306,36 @@ fn convert_and_record_cache(
     cached
 }
 
+fn drain_book_identity_preparation(app: &mut AppTestEnv) {
+    let ctx = egui::Context::default();
+    let deadline = Instant::now() + WORKER_TIMEOUT;
+    while app.sidecar_restore_active() {
+        app.poll_sidecar_restore(&ctx);
+        assert!(
+            Instant::now() < deadline,
+            "book identity preparation did not settle"
+        );
+        std::thread::yield_now();
+    }
+}
+
 fn install_converted_zip(app: &mut AppTestEnv, source: &Path, cached: &Path) {
+    drain_book_identity_preparation(app);
     let enumeration = crate::zip_loader::enumerate_image_entries_detailed(cached).unwrap();
     app.settings.sidecar_backup_enabled = false;
     app.settings.tag_sidecar_backup_enabled = false;
-    app.load_zip_as_folder_prepared_with_logical_source(
+    let prepared = crate::zip_loader::PreparedZipEnumeration::prepare(
         cached.to_path_buf(),
         enumeration,
+        app.settings.file_type_visibility.clone(),
+    );
+    app.load_zip_as_folder_prepared_with_logical_source(
+        cached.to_path_buf(),
+        prepared,
         Some(source),
         super::StartupListIntent::ExplicitList,
     );
+    drain_book_identity_preparation(app);
     assert_eq!(app.current_folder.as_deref(), Some(cached));
 }
 
