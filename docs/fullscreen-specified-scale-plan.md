@@ -492,6 +492,7 @@ favorite別へ広げない。手動zoom / pan、連結の基準unit、viewport /
 
 - remember OFF: 共通値だけを使う。保存済みfavorite値を削除しない。ONへ戻せば既存状態を使う。
 - ON・新しいfavorite: :80531の既存transitionが初回入場時の有効値を引き継いでseedする。
+  指定サイズ値の欠落は下記の継承規則に従い、入場だけでfavorite専用の具体値へ固定しない。
   :80466の`favorite_view_state_for_path`も同じ指定値を含む投影にする。別のpath resolverを追加しない。
 - ON・保存済みfavorite: その指定値を適用する。現在地の表示用fit popupへ、prefsと同じ2行の
   指定値編集helperを置く。live変更は同じeffective設定setterと既存メモリcapture / 500ms DB workerへ
@@ -505,8 +506,20 @@ favorite別へ広げない。手動zoom / pan、連結の基準unit、viewport /
   context mount / deposit、reset / OFF / favorite削除に新フィールドを含める。既存fieldやUUIDを失わない。
 - **既存state_jsonの欠落互換**: 新フィールド欠落で行全体を拒否しない。favoriteのwire adapterでは
   追加値の欠落を表せるserde defaultを使い、適用時は共通値へ継承する。これは「幅 / 高さを両Noneに
-  指定した」という保存値とは異なる。新しいcaptureは有効な構造体を保存する。既存行の強制一括書換え、
+  指定した」という保存値とは異なる。明示変更を確定した指定値は有効な構造体を保存する。既存行の強制一括書換え、
   migration、DDL、schema version変更は不要。単なる読込でfavorite行や共通値を書き換えない。
+- **継承解決は変更ではない（r5 P2対応）**: 既存のcapture / reconcile ownerで、実効指定サイズ値と
+  保存済みfavorite stateを比較するとき、欠落した指定値を共通値へ解決したことだけによる差分を
+  変更から除外する。保存stateの欠落をメモリ上でも維持し、その差分だけでは
+  `favorite_view_writes.note_at`を呼ばず、DB書込みを予約しない。idleのreconcile、離脱時capture、
+  終了時reconcile / flushにも同じ規則を適用する。指定値への**明示的な利用者変更だけ**が
+  favorite専用値を作る。現在地の指定値編集を既存setterで確定する境界から同じstate ownerへ渡し、
+  継承後の値を`from_settings`で採っただけで明示変更と判定しない。共通値の変更もfavoriteへの
+  明示変更ではない。他の既存8項目の正当な変更でstateを保存する場合も、指定値への明示変更が
+  なければ欠落を保持する。明示両Noneと欠落を混同せず、専用の書込みworker / 同期boolは追加しない。
+  根拠は現行[app.rs:83269](../src/app.rs#L83269)の実効state比較と:83274の予約、:83299の離脱capture、
+  :83422のidle reconcile、:83557の終了時reconcile。継承解決だけの比較差をここで除外しなければ、
+  共通値を具体値として固定して次の入場で新しい共通値を継承できなくなる。
 - **転送**: 共通の指定値だけを転送する。favorite UUID / path / 専用行とruntime overlayは既存除外のまま。
   通常のprefs draftは標準snapshotだが、export helper単体もoverlay.commonから共通値を取るgetterに
   接続する（capture_export:185のplain getterが有効値を直接取る前提はこのfieldに使わない）。
@@ -591,6 +604,14 @@ viewer_context_registryの同じcontext-local fieldの型・移送境界、必�
    全field分類、旧転送文書でdestination維持、OK / Cancel / import、IME Enter / Esc、狭幅widget到達。
    remember OFF / ON、新規favorite継承、既存state_jsonのfield欠落（全既存項目保持）、両Noneとの差、
    最長一致、行先projection、標準prefsとlive専用値のroute、reset / 削除 / context切替・500ms書込 / dropを通す。
+   **欠落継承のlifecycle回帰**: 指定サイズfieldを持たないlegacy JSONを読み、favoriteへ入場
+   →複数idle frameの実reconcile→離脱 / 終了の実capture / flushをそれぞれ通す。
+   他項目を変更しない条件でメモリstateの欠落が維持され、書込み予約が一度も作られず、
+   store commandも送られないことを確認する。その後共通指定値を変更→再入場し、変更後の共通値を
+   継承することを確認する（終了経路は永続JSONを再読込して再入場）。予約後に取消しただけでは合格にしない。
+   次に現在地で指定値を明示変更し、その操作だけが専用値を作って既存ownerへ保存予約すること、
+   明示両Noneを保持することを確認する。他の8項目だけを変更して保存した場合も指定値の欠落を保持し、
+   後の共通値変更を継承できることを固定する。解決済み値のbool比較だけでなく実handler / lifecycleを通す。
    共通値のsave / exportにfavorite専用値・UUID・pathが漏れず、importが専用行を上書きしないことを固定。
 6. **context / lifecycle**: main / F12 / F11 / 異DPI、実効HUD / 右予約と抑制ON/OFF。
    capture後の値変更が旧holdover / frozen siblingを変形させない。正しいpppと既存ownerを使い、
