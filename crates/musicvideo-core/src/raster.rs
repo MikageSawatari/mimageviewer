@@ -1662,7 +1662,12 @@ fn draw_text(
                         }
                         let source_offset = (source_y * bitmap.width + source_x) * 4;
                         let glyph_alpha = bitmap.rgba[source_offset + 3] as f32 / 255.0;
-                        if glyph_alpha <= 0.0 && bitmap.decoration.is_none() {
+                        if glyph_alpha <= 0.0
+                            && bitmap
+                                .decoration
+                                .as_ref()
+                                .is_none_or(|paint| paint[source_offset + 3] == 0)
+                        {
                             continue;
                         }
                         let px = x as f32 + 0.5;
@@ -2107,7 +2112,11 @@ fn draw_text_mask(
                             continue;
                         }
                         let glyph_alpha = bitmap.rgba[(source_y * bitmap.width + source_x) * 4 + 3];
-                        if glyph_alpha == 0 && bitmap.decoration.is_none() {
+                        if glyph_alpha == 0
+                            && bitmap.decoration.as_ref().is_none_or(|paint| {
+                                paint[(source_y * bitmap.width + source_x) * 4 + 3] == 0
+                            })
+                        {
                             continue;
                         }
                         let px = x as f32 + 0.5;

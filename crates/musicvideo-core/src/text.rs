@@ -1,13 +1,17 @@
 use crate::TextStyle;
 use comic_core::{
-    AnnotationObject, FontSet, Rgba, TextBlock, bake_overlay, bake_text_region, layout_text,
-    text_effect_padding,
+    AnnotationObject, FontSet, PreparedTextRaster, Rgba, TextBlock, bake_overlay, layout_text,
+    prepare_text_regions, text_effect_padding,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 pub const MAX_TEXT_CACHE_BYTES: usize = 64 * 1024 * 1024;
-const TRANSIENT_BYTES: usize = 8 * 1024 * 1024;
+// A full-HD RGBA pair needs ~16 MiB; keep 24 MiB for static results.
+// Prepared multi-pass coverage is larger than the RGBA of a small text block,
+// so give it 32 MiB and preserve the original 8 MiB transient RGBA lane.
+const TRANSIENT_BYTES: usize = 40 * 1024 * 1024;
+const PREPARED_BYTES: usize = 32 * 1024 * 1024;
 /// Maximum combined RGBA allocation per text bake (cache retention is separate).
 pub const MAX_TEXT_RASTER_BYTES: usize = 8 * 1024 * 1024;
 const TILE_EDGE: usize = 1024;
@@ -141,10 +145,53 @@ impl Lane {
         );
     }
 }
+// Prepared paint programs are an accelerator, independent of bitmap retention
+// priority. They own their glyph Arc values, so mask/body, all tiles and later
+// frames reuse them even if another comic bake resets the thread-local cache.
+#[derive(Default)]
+struct PreparedLane {
+    entries: HashMap<TextCacheKey, (Arc<TextBake>, u64, usize)>,
+    bytes: usize,
+    clock: u64,
+}
+impl PreparedLane {
+    fn get(&mut self, key: &TextCacheKey) -> Option<Arc<TextBake>> {
+        let (bake, used, _) = self.entries.get_mut(key)?;
+        self.clock += 1;
+        *used = self.clock;
+        Some(Arc::clone(bake))
+    }
+    fn publish(&mut self, key: TextCacheKey, bake: Arc<TextBake>) -> Arc<TextBake> {
+        if let Some(existing) = self.get(&key) {
+            return existing;
+        }
+        let bytes = key.bytes()
+            + bake.retained_bytes()
+            + std::mem::size_of::<(Arc<TextBake>, u64, usize)>();
+        if bytes > PREPARED_BYTES {
+            return bake;
+        }
+        while self.bytes + bytes > PREPARED_BYTES {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, used, _))| *used)
+                .map(|(key, _)| key.clone())
+                .unwrap();
+            self.bytes -= self.entries.remove(&oldest).unwrap().2;
+        }
+        self.clock += 1;
+        self.bytes += bytes;
+        self.entries
+            .insert(key, (Arc::clone(&bake), self.clock, bytes));
+        bake
+    }
+}
 #[derive(Default)]
 struct CacheState {
     stable: Lane,
     transient: Lane,
+    prepared: PreparedLane,
 }
 impl CacheState {
     fn lookup(&mut self, key: &TextCacheKey, transient: bool) -> Option<Arc<TextBitmap>> {
@@ -175,7 +222,7 @@ impl CacheState {
             return existing;
         }
         let (lane, limit) = if transient {
-            (&mut self.transient, TRANSIENT_BYTES)
+            (&mut self.transient, TRANSIENT_BYTES - PREPARED_BYTES)
         } else {
             (&mut self.stable, MAX_TEXT_CACHE_BYTES - TRANSIENT_BYTES)
         };
@@ -190,7 +237,10 @@ pub(crate) struct TextCache {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TextCacheStats {
     pub stable_bytes: usize,
+    /// Non-static budget: transient RGBA plus prepared paint programs.
     pub transient_bytes: usize,
+    /// Prepared programs, already included in transient_bytes (do not add twice).
+    pub prepared_bytes: usize,
     pub entries: usize,
 }
 impl TextCache {
@@ -198,8 +248,9 @@ impl TextCache {
         let s = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         TextCacheStats {
             stable_bytes: s.stable.bytes,
-            transient_bytes: s.transient.bytes,
-            entries: s.stable.entries.len() + s.transient.entries.len(),
+            transient_bytes: s.transient.bytes + s.prepared.bytes,
+            prepared_bytes: s.prepared.bytes,
+            entries: s.stable.entries.len() + s.transient.entries.len() + s.prepared.entries.len(),
         }
     }
     #[cfg(test)]
@@ -221,8 +272,39 @@ impl TextCache {
         if let Some(bitmap) = self.lookup(&key, transient) {
             return Some(bitmap);
         }
-        let bake = TextBake::new(fonts, text, font_key, size_px, style)?;
+        let bake = self.prepare(fonts, text, font_key, size_px, style, &key)?;
         (bake.bytes() <= MAX_TEXT_RASTER_BYTES).then(|| self.bake(fonts, &bake, key, transient))
+    }
+
+    fn prepare(
+        &self,
+        fonts: &FontSet,
+        text: &str,
+        font_key: &str,
+        size_px: f32,
+        style: &TextStyle,
+        key: &TextCacheKey,
+    ) -> Option<Arc<TextBake>> {
+        if let Some(bake) = self
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .prepared
+            .get(key)
+        {
+            return Some(bake);
+        }
+        let bake = Arc::new(TextBake::new(fonts, text, font_key, size_px, style)?);
+        if bake.painters.is_empty() {
+            return Some(bake);
+        }
+        Some(
+            self.entries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .prepared
+                .publish(key.clone(), bake),
+        )
     }
 
     fn lookup(&self, key: &TextCacheKey, transient: bool) -> Option<Arc<TextBitmap>> {
@@ -273,7 +355,7 @@ impl TextCache {
             visit(&bitmap, x, y);
             return Some(());
         }
-        let bake = TextBake::new(fonts, text, font_key, size_px, style)?;
+        let bake = self.prepare(fonts, text, font_key, size_px, style, &key)?;
         let (dx, dy) = destination(bake.logical_width, bake.logical_height, bake.origin_offset);
         if bake.bytes() <= MAX_TEXT_RASTER_BYTES {
             let bitmap = self.bake(fonts, &bake, key, transient);
@@ -332,7 +414,7 @@ impl TextCache {
             bytes <= MAX_TEXT_RASTER_BYTES,
             "text bake exceeds allocation budget"
         );
-        let paint = |block: TextBlock| {
+        let paint = |block: TextBlock, surface: usize| {
             let origin = (
                 prepared.origin_offset.0 as f32,
                 prepared.origin_offset.1 as f32,
@@ -345,7 +427,7 @@ impl TextCache {
                     fonts,
                 ),
                 TextRasterArea::Region { .. } => {
-                    bake_text_region(&block, origin, (x as i32, y as i32), width, height, fonts)
+                    prepared.painters[surface].bake_region((x as i32, y as i32), width, height)
                 }
             }
             .pixels
@@ -357,8 +439,10 @@ impl TextCache {
             logical_height: prepared.logical_height,
             origin_offset: prepared.origin_offset,
             region_origin: (x, y),
-            rgba: paint(prepared.glyph.clone()),
-            decoration: prepared.painted.then(|| paint(prepared.decoration.clone())),
+            rgba: paint(prepared.glyph.clone(), 0),
+            decoration: prepared
+                .painted
+                .then(|| paint(prepared.decoration.clone(), 1)),
         });
         self.entries
             .lock()
@@ -376,8 +460,29 @@ struct TextBake {
     logical_height: f32,
     origin_offset: (usize, usize),
     painted: bool,
+    painters: Vec<PreparedTextRaster>,
 }
 impl TextBake {
+    fn retained_bytes(&self) -> usize {
+        let blocks = [&self.glyph, &self.decoration];
+        std::mem::size_of::<Self>()
+            + blocks
+                .iter()
+                .map(|b| {
+                    b.text.capacity()
+                        + b.font_key.capacity()
+                        + b.extra_outlines.capacity()
+                            * std::mem::size_of::<comic_core::StrokeStyle>()
+                })
+                .sum::<usize>()
+            + self.painters.capacity() * std::mem::size_of::<PreparedTextRaster>()
+            + self
+                .painters
+                .iter()
+                .map(PreparedTextRaster::retained_bytes)
+                .sum::<usize>()
+    }
+
     fn bytes(&self) -> usize {
         self.width
             .checked_mul(self.height)
@@ -443,6 +548,26 @@ impl TextBake {
         if width > i32::MAX as usize || height > i32::MAX as usize {
             return None;
         }
+        let painted = style.has_paint();
+        let bytes = width
+            .checked_mul(height)
+            .and_then(|n| n.checked_mul(if painted { 8 } else { 4 }))
+            .unwrap_or(usize::MAX);
+        let painters = if bytes > MAX_TEXT_RASTER_BYTES {
+            let blocks = if painted {
+                vec![&glyph, &decoration]
+            } else {
+                vec![&glyph]
+            };
+            prepare_text_regions(
+                &layout,
+                font,
+                (origin_offset.0 as f32, origin_offset.1 as f32),
+                &blocks,
+            )
+        } else {
+            Vec::new()
+        };
         Some(Self {
             width,
             height,
@@ -451,13 +576,101 @@ impl TextBake {
             origin_offset,
             glyph,
             decoration,
-            painted: style.has_paint(),
+            painted,
+            painters,
         })
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use comic_core::bake_text_region;
+    #[test]
+    fn t1_prepared_tiles_reuse_one_logical_bake_across_mask_body_and_keep_total_budget() {
+        let mut fonts = FontSet::new();
+        fonts.insert(
+            comic_core::LoadedFont::from_bytes(
+                "font",
+                include_bytes!("../../../tools/comic_lab/assets/fonts/ZenKurenaido-Regular.ttf")
+                    .to_vec(),
+            )
+            .unwrap(),
+        );
+        let cache = TextCache::default();
+        let style = TextStyle {
+            echo: Some(crate::TextEchoStyle {
+                offset: (512.0, 512.0),
+                count: 12,
+                ..Default::default()
+            }),
+            outline: Some(Default::default()),
+            ..Default::default()
+        };
+        let key = TextCacheKey::new("日本語 A", "font", 64.0, &style);
+        let first = cache
+            .prepare(&fonts, "日本語 A", "font", 64.0, &style, &key)
+            .unwrap();
+        assert_eq!(first.painters.len(), 2);
+        let rect = crate::raster::PixelRect {
+            x0: 0,
+            y0: 0,
+            x1: 1920,
+            y1: 1080,
+        };
+        // Transient 1024x1024 RGBA pairs cannot fit, but the coverage program can.
+        for transient in [true, false, true] {
+            cache
+                .visit(
+                    &fonts,
+                    "日本語 A",
+                    "font",
+                    64.0,
+                    &style,
+                    transient,
+                    crate::TextAlign::Center,
+                    rect,
+                    |bitmap, _, _| {
+                        assert!(
+                            bitmap.rgba.capacity() + bitmap.decoration.as_ref().unwrap().capacity()
+                                <= MAX_TEXT_RASTER_BYTES
+                        );
+                    },
+                )
+                .unwrap();
+            let again = cache
+                .prepare(&fonts, "日本語 A", "font", 64.0, &style, &key)
+                .unwrap();
+            assert!(Arc::ptr_eq(&first, &again));
+            let stats = cache.stats();
+            assert!(stats.stable_bytes + stats.transient_bytes <= MAX_TEXT_CACHE_BYTES);
+        }
+        // Many changing styles must evict old preparation without retaining all
+        // dilation coverage. The oldest program stays usable through its Arc.
+        for n in 0..300 {
+            let mut next = style.clone();
+            next.outline.as_mut().unwrap().width_px = 1.0 + n as f32 * 0.125;
+            let key = TextCacheKey::new("日本語 ABCDEFGHIJKLMNOPQRSTUVWXYZ", "font", 64.0, &next);
+            cache
+                .prepare(
+                    &fonts,
+                    "日本語 ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+                    "font",
+                    64.0,
+                    &next,
+                    &key,
+                )
+                .unwrap();
+            assert!(cache.entries.lock().unwrap().prepared.bytes <= PREPARED_BYTES);
+        }
+        assert!(cache.entries.lock().unwrap().prepared.entries.len() < 300);
+        assert!(cache.entries.lock().unwrap().prepared.get(&key).is_none());
+        assert!(
+            !first.painters[0]
+                .bake_region((6145, 6145), 64, 64)
+                .pixels
+                .is_empty()
+        );
+    }
     #[test]
     fn t1_shared_effect_padding_matches_legacy_without_glow() {
         // Frozen pre-review formula, only as a compatibility oracle in this test.

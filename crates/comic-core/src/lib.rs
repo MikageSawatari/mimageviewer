@@ -33,9 +33,10 @@ pub use model::{
     markup_rules_white,
 };
 pub use raster::{
-    AnnotationLayer, RgbaOverlay, StampImages, bake_annotation_layers, bake_overlay,
-    bake_overlay_with_stamps, bake_text_region, composite_stamp_sticker, effective_bubble_shape,
-    effective_window_half_extents, message_window_overflows, text_effect_padding,
+    AnnotationLayer, PreparedTextRaster, RgbaOverlay, StampImages, bake_annotation_layers,
+    bake_overlay, bake_overlay_with_stamps, bake_text_region, composite_stamp_sticker,
+    effective_bubble_shape, effective_window_half_extents, message_window_overflows,
+    prepare_text_regions, text_effect_padding,
 };
 pub use tessellate::{
     BubbleGeometry, auto_base_t, bubble_geometry, fit_bubble_shape, nearest_base_t,

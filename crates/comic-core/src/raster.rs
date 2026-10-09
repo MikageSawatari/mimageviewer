@@ -9,7 +9,8 @@
 //!
 //! This is the WYSIWYG "truth" the lab compares its live egui preview against.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::font::{FontSet, GlyphBitmap, LoadedFont, rotate_cw};
 use crate::layout::{GlyphForm, TextLayout, layout_text, layout_text_wrapped};
@@ -1685,7 +1686,7 @@ fn draw_layout_glyphs(
 ) {
     draw_layout_glyphs_into(
         &mut TextSurface {
-            overlay,
+            target: TextTarget::Pixels(overlay),
             origin: (0, 0),
         },
         layout,
@@ -1723,7 +1724,7 @@ pub fn bake_text_region(
     let layout = layout_text(block, font);
     draw_layout_glyphs_into(
         &mut TextSurface {
-            overlay: &mut overlay,
+            target: TextTarget::Pixels(&mut overlay),
             origin: region_origin,
         },
         &layout,
@@ -1736,23 +1737,181 @@ pub fn bake_text_region(
     overlay
 }
 
+/// A text paint program with owned glyph coverage. All regions reuse the same
+/// layout, placement, dilation and coverage; unrelated overlay bakes cannot
+/// invalidate it. Build one program per paint surface, then stream its tiles.
+#[derive(Debug)]
+pub struct PreparedTextRaster {
+    operations: Vec<TextPaintOp>,
+}
+#[derive(Debug)]
+enum TextPaintOp {
+    Glyph {
+        bitmap: Arc<GlyphBitmap>,
+        left: f32,
+        top: f32,
+        color: Rgba,
+    },
+    Background {
+        polygon: Vec<(f32, f32)>,
+        color: Rgba,
+    },
+}
+/// Prepare several paint surfaces from one caller-supplied layout (same font,
+/// text, size, orientation and spacing). Only paint styles may differ. Starts
+/// one glyph-cache generation for the logical bake; coverage is shared by Arc
+/// across surfaces, effects, repeated glyphs and all later region replays.
+/// No RGBA canvas is allocated here. Existing annotation entry points are unchanged.
+pub fn prepare_text_regions(
+    layout: &TextLayout,
+    font: &LoadedFont,
+    origin: (f32, f32),
+    blocks: &[&TextBlock],
+) -> Vec<PreparedTextRaster> {
+    crate::font::reset_glyph_cache();
+    blocks
+        .iter()
+        .map(|block| {
+            let mut operations = Vec::new();
+            draw_layout_glyphs_into(
+                &mut TextSurface {
+                    target: TextTarget::Prepare(&mut operations),
+                    origin: (0, 0),
+                },
+                layout,
+                block,
+                font,
+                origin.0,
+                origin.1,
+                None,
+            );
+            PreparedTextRaster { operations }
+        })
+        .collect()
+}
+impl PreparedTextRaster {
+    /// Owned storage including unique glyph coverage (shared references within
+    /// this program counted once). Adding two programs' sizes is conservative
+    /// when they share glyphs. Temporary rasterizer/dilation scratch is excluded.
+    pub fn retained_bytes(&self) -> usize {
+        let mut bytes = std::mem::size_of::<Self>()
+            + self.operations.capacity() * std::mem::size_of::<TextPaintOp>();
+        let mut seen = HashSet::new();
+        for op in &self.operations {
+            match op {
+                TextPaintOp::Glyph { bitmap, .. } => {
+                    if seen.insert(Arc::as_ptr(bitmap)) {
+                        bytes += std::mem::size_of::<GlyphBitmap>()
+                            + bitmap.coverage.capacity() * std::mem::size_of::<f32>();
+                    }
+                }
+                TextPaintOp::Background { polygon, .. } => {
+                    bytes += polygon.capacity() * std::mem::size_of::<(f32, f32)>()
+                }
+            }
+        }
+        bytes
+    }
+    /// Replay a crop with the original float coordinates, integer rounding,
+    /// effect order and source-over. Allocates only the requested RGBA region.
+    pub fn bake_region(
+        &self,
+        region_origin: (i32, i32),
+        width: usize,
+        height: usize,
+    ) -> RgbaOverlay {
+        let mut overlay = RgbaOverlay::new(width, height);
+        if width == 0 || height == 0 {
+            return overlay;
+        }
+        let mut surface = TextSurface {
+            target: TextTarget::Pixels(&mut overlay),
+            origin: region_origin,
+        };
+        for op in &self.operations {
+            match op {
+                TextPaintOp::Background { polygon, color } => {
+                    fill_polygon_clipped(&mut surface, polygon, *color, None)
+                }
+                TextPaintOp::Glyph {
+                    bitmap,
+                    left,
+                    top,
+                    color,
+                } => {
+                    let xs = bitmap_axis_range(
+                        *left,
+                        bitmap.width,
+                        region_origin.0 as i64,
+                        region_origin.0 as i64 + width as i64,
+                    );
+                    let ys = bitmap_axis_range(
+                        *top,
+                        bitmap.height,
+                        region_origin.1 as i64,
+                        region_origin.1 as i64 + height as i64,
+                    );
+                    for py in ys {
+                        for px in xs.clone() {
+                            let c = bitmap.coverage[py * bitmap.width + px];
+                            if c > 0.0 {
+                                surface.blend_px(
+                                    (*left + px as f32) as i32,
+                                    (*top + py as f32) as i32,
+                                    *color,
+                                    c,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        overlay
+    }
+}
+// Find the exact source index interval using the legacy float-add + truncation.
+// This also preserves multiple samples that round to the same pixel at negative
+// origins or large coordinates; subtracting floats before rounding would not.
+fn bitmap_axis_range(origin: f32, len: usize, low: i64, high: i64) -> std::ops::Range<usize> {
+    let lower_bound = |target: i64| {
+        let (mut start, mut end) = (0, len);
+        while start < end {
+            let mid = start + (end - start) / 2;
+            if ((origin + mid as f32) as i32 as i64) < target {
+                start = mid + 1;
+            } else {
+                end = mid;
+            }
+        }
+        start
+    };
+    lower_bound(low)..lower_bound(high)
+}
 // Translate only integer pixel addresses, after all existing raster calculations.
 // The zero-origin adapter used by existing annotation paths is an identity.
+enum TextTarget<'a> {
+    Pixels(&'a mut RgbaOverlay),
+    Prepare(&'a mut Vec<TextPaintOp>),
+}
 struct TextSurface<'a> {
-    overlay: &'a mut RgbaOverlay,
+    target: TextTarget<'a>,
     origin: (i32, i32),
 }
 impl TextSurface<'_> {
     #[inline]
     fn blend_px(&mut self, x: i32, y: i32, color: Rgba, coverage: f32) {
+        let TextTarget::Pixels(overlay) = &mut self.target else {
+            unreachable!()
+        };
         if self.origin == (0, 0) {
-            self.overlay.blend_px(x, y, color, coverage);
+            overlay.blend_px(x, y, color, coverage);
             return;
         }
         let dx = x as i64 - self.origin.0 as i64;
         let dy = y as i64 - self.origin.1 as i64;
-        if dx >= 0 && dy >= 0 && dx < self.overlay.w as i64 && dy < self.overlay.h as i64 {
-            self.overlay.blend_px(dx as i32, dy as i32, color, coverage);
+        if dx >= 0 && dy >= 0 && dx < overlay.w as i64 && dy < overlay.h as i64 {
+            overlay.blend_px(dx as i32, dy as i32, color, coverage);
         }
     }
 }
@@ -1892,17 +2051,36 @@ fn for_each_layout_glyph_bitmap(
     dilate_px: f32,
     mut visit: impl FnMut(&GlyphBitmap, f32, f32),
 ) {
+    for_each_layout_glyph_bitmap_shared(
+        layout,
+        font,
+        origin_x,
+        origin_y,
+        dilate_px,
+        |bmp, left, top| visit(&bmp, left, top),
+    );
+}
+
+fn for_each_layout_glyph_bitmap_shared(
+    layout: &TextLayout,
+    font: &LoadedFont,
+    origin_x: f32,
+    origin_y: f32,
+    dilate_px: f32,
+    mut visit: impl FnMut(Arc<GlyphBitmap>, f32, f32),
+) {
     for g in &layout.glyphs {
         let Some(bmp) = font.rasterize_gid(g.glyph_id, g.size, dilate_px.max(0.0)) else {
             continue;
         };
         if g.form == GlyphForm::Sideways {
-            let rot = rotate_cw(&bmp);
+            let rot = Arc::new(rotate_cw(&bmp));
             let left = origin_x + g.x - rot.width as f32 * 0.5;
             let top = origin_y + g.y - rot.height as f32 * 0.5;
-            visit(&rot, left, top);
+            visit(rot, left, top);
         } else {
-            visit(&bmp, origin_x + g.x + bmp.left, origin_y + g.y + bmp.top);
+            let (left, top) = (origin_x + g.x + bmp.left, origin_y + g.y + bmp.top);
+            visit(bmp, left, top);
         }
     }
 }
@@ -1963,6 +2141,25 @@ fn draw_layout_mask(
     clip: Option<(f32, f32, f32, f32)>,
 ) {
     if color.a == 0 {
+        return;
+    }
+    if let TextTarget::Prepare(operations) = &mut overlay.target {
+        debug_assert!(clip.is_none());
+        for_each_layout_glyph_bitmap_shared(
+            layout,
+            font,
+            origin_x,
+            origin_y,
+            dilate_px,
+            |bitmap, left, top| {
+                operations.push(TextPaintOp::Glyph {
+                    bitmap,
+                    left,
+                    top,
+                    color,
+                });
+            },
+        );
         return;
     }
     for_each_layout_glyph_bitmap(
@@ -2666,10 +2863,22 @@ fn fill_polygon_clipped(
     if poly.len() < 3 || color.a == 0 {
         return;
     }
+    if let TextTarget::Prepare(operations) = &mut overlay.target {
+        debug_assert!(clip.is_none());
+        operations.push(TextPaintOp::Background {
+            polygon: poly.to_vec(),
+            color,
+        });
+        return;
+    }
+    let TextTarget::Pixels(pixels) = &overlay.target else {
+        unreachable!()
+    };
+    let (width, height) = (pixels.w, pixels.h);
     let min_y = poly.iter().map(|p| p.1).fold(f32::INFINITY, f32::min);
     let max_y = poly.iter().map(|p| p.1).fold(f32::NEG_INFINITY, f32::max);
     let mut y0 = (min_y.floor() as i32).max(overlay.origin.1);
-    let mut y1 = (max_y.ceil() as i32).min(overlay.origin.1 + overlay.overlay.h as i32 - 1);
+    let mut y1 = (max_y.ceil() as i32).min(overlay.origin.1 + height as i32 - 1);
     if let Some((_, cy0, _, cy1)) = clip {
         y0 = y0.max(cy0.floor() as i32);
         y1 = y1.min(cy1.ceil() as i32);
@@ -2696,7 +2905,7 @@ fn fill_polygon_clipped(
                 xb = xb.min(cx1.ceil() as i32);
             }
             xa = xa.max(overlay.origin.0);
-            xb = xb.min(overlay.origin.0 + overlay.overlay.w as i32 - 1);
+            xb = xb.min(overlay.origin.0 + width as i32 - 1);
             for x in xa..=xb {
                 overlay.blend_px(x, y, color, 1.0);
             }

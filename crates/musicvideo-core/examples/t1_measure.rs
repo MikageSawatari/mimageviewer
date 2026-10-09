@@ -165,8 +165,101 @@ fn long() {
         assets.text_cache_stats()
     );
 }
+// One scenario per process makes the OS peak meaningful (including font/frame,
+// layout, glyph-cache, LRU, rotated body and glow buffers). The Python driver
+// samples Windows peak_wset / peak_pagefile and checks CPU competition.
+fn matrix(case: &str) {
+    let parts: Vec<_> = case.split('-').collect();
+    assert_eq!(parts.len(), 3);
+    let tiled = parts[0] == "tile";
+    let animated = parts[1] == "interp";
+    let (mut p, assets) = setup(true, animated);
+    if tiled {
+        p.layers.truncate(2); // opaque background + one full-HD text layer
+        p.layers[1].rect = Animatable::Const(NormRect::FULL);
+        let mut s = style();
+        s.shadow = Some(TextShadowStyle {
+            color: TextColor::new(0, 0, 0, 180),
+            offset: (512.0, -512.0),
+            blur_px: 48.0,
+            spread_px: 16.0,
+        });
+        s.echo = Some(TextEchoStyle {
+            color: TextColor::new(60, 130, 220, 150),
+            offset: (512.0, 512.0),
+            count: 12,
+        });
+        let mut end = s.clone();
+        end.outline.as_mut().unwrap().width_px = 18.0;
+        if let LayerKind::Text(t) = &mut p.layers[1].kind {
+            t.style = if animated {
+                Animatable::Track(
+                    Track::new(vec![
+                        Keyframe {
+                            t: 0.0,
+                            value: s,
+                            interp: Interp::Linear,
+                        },
+                        Keyframe {
+                            t: 300.0,
+                            value: end,
+                            interp: Interp::Linear,
+                        },
+                    ])
+                    .unwrap(),
+                )
+            } else {
+                Animatable::Const(s)
+            };
+        }
+    }
+    for layer in p.layers.iter_mut().skip(1) {
+        if matches!(parts[2], "glow" | "both") {
+            layer.glow = Animatable::Const(Some(Glow {
+                color: Rgba8::new(120, 180, 240, 180),
+                radius_px: 12.0,
+                spread_px: 3.0,
+            }));
+        }
+        if matches!(parts[2], "rotate" | "both") {
+            layer.rotation = Animatable::Const(12.0);
+        }
+    }
+    let mut frame = Frame::new(1920, 1080).unwrap();
+    let frames: usize = std::env::var("T1_FRAMES")
+        .ok()
+        .map(|s| s.parse().unwrap())
+        .unwrap_or(300);
+    let mut times = Vec::with_capacity(frames);
+    let mut max_cache = 0;
+    let mut hash = 0;
+    for n in 0..30 + frames {
+        let scene = evaluate(&p, n as f64 / 30.0, &SpectrumFrame::default());
+        let start = Instant::now();
+        let _ = render_frame(&scene, &assets, &mut frame).unwrap();
+        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+        if n >= 30 {
+            times.push(elapsed);
+        }
+        let stats = assets.text_cache_stats();
+        max_cache = max_cache.max(stats.stable_bytes + stats.transient_bytes);
+        if n + 1 == 30 + frames {
+            hash = frame.rgba.iter().fold(0xcbf29ce484222325_u64, |h, b| {
+                (h ^ *b as u64).wrapping_mul(0x100000001b3)
+            });
+        }
+    }
+    let mean = times.iter().sum::<f64>() / times.len() as f64;
+    times.sort_by(f64::total_cmp);
+    println!(
+        "matrix case={case} frames={frames} mean_ms={mean:.4} p95_ms={:.4} max_cache_bytes={max_cache} hash={hash:016x} final_cache={:?}",
+        times[(frames * 95).div_ceil(100) - 1],
+        assets.text_cache_stats()
+    );
+}
 fn main() {
     match std::env::args().nth(1).as_deref() {
+        Some("matrix") => matrix(&std::env::args().nth(2).expect("matrix case")),
         Some("long") => long(),
         _ => {
             composition(false);
