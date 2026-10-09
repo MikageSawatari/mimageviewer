@@ -1177,6 +1177,81 @@ bitmap が溜まり続ける。容量上限つき（LRU）にし、補間中の�
 - releaseラボ `cargo build --release -p musicvideo_lab` 成功（fixture修正後の最終build 31.72秒、初回build 43.34秒）。標準出力先が使用中でないことを確認し
   `target/release/musicvideo_lab.exe` を作成、起動なし。commit / アプリ起動 / build-devなし。
 
+#### T1 計測器・eviction テストの検収修正（338a38899 後、2026-10-09）
+
+- eviction の確認を「確保された Vec が非空」から、文字の alpha が存在する論理 glyph 領域の
+  **eviction 前 / 保持中の Arc / eviction 後の再準備の RGBA 完全一致**へ変更。
+  全透明 RGBA を拒否することも同じテストで確認する。全透明化の変異は新比較で exit101、
+  旧非空判定では exit0。比較を旧判定へ戻す変異は oracle の確認で exit101になる。全て復元済み。
+- ignored な `target/t1-rereview/run-matrix.py` を置き換え、リポジトリ内の
+  `scripts/musicvideo/t1-measure.py` と `test_t1_measure.py` に保存した。
+  計測前5秒・計測中・終了後の通知回収中を20ms間隔で監視する。
+  rustc / cargo / link / lld-link / cl / codex（自分の Codex ancestor は PID + 作成 FILETIME で除外）
+  の新規PIDまたは **CPU消費が少しでもあれば棄却**し、フェーズ・PID・理由・CPU秒を出す。
+  Codex の sandbox broker は worker に含めない。明示的な所有PIDは `--own-codex-pid` で指定可能。
+  watched process の Windows handle を終了まで保持し、終了後の最終CPU時間も集計する。
+  新PIDの初回CPUをゼロ扱いせず、PID再利用も作成時刻で区別する。
+  `Win32_ProcessStartTrace` の通知で、poll の間に開始・終了したPIDも棄却する。
+  handle取得前に終了してCPUを採取できなかった場合も、採取不可を記録して棄却する。
+  WMI通知やCPU/メモリ取得が利用できなければ採用しない（snapshot-only監視へのfallbackなし）。
+- **実行コマンド（今回は正式計測しない。利用者が競合のない環境で後日実行）**:
+
+  ```powershell
+  python scripts/musicvideo/t1-measure.py
+  ```
+
+  Python 3.10以上、psutil、WMIのプロセス開始通知を利用できるWindows PowerShellが前提。
+  psutilがなければ `python -m pip install psutil` で準備する。
+  このCodex実行環境ではWMI Startがアクセス拒否だった。後日の実行シェルでも拒否される場合は
+  WMI通知の権限があるシェル（必要なら管理者PowerShell）で実行する。権限不足の結果は不採用。
+  スクリプト1本で `cargo build --locked --release -p musicvideo-core --features text-measure --example t1_measure`
+  を行い、全ケースを別processで実行する。MSBUILDDISABLENODEREUSE=1をbuildに設定する。
+  アプリ・ラボは起動しない。既定は同一マシン・1920×1080・YuGothM.ttc・Rayon 4 threads。
+  フォントは `--font`、Rayonは `--rayon-threads` で指定でき、フォント・exe・driverのSHA-256と
+  HEAD / 差分のSHA-256・実行条件をJSONに記録する。
+- 通常/タイル × 静的/補間 × plain/glow/rotate/both の **16ケース**を、装飾なし / 現行で各3回。
+  各ケースはcold 1 frame、同じt=0のwarmup 30 frame、測定300 frame（10秒相当）。
+  通常の文字3層と、影offset=(512,-512)・blur48・spread16・echo12枚offset=(512,512)の
+  タイル文字1層を使う。glow radius12・spread3、rotation12°。
+  別に通常/タイル × 全補間/静的＋補間混在（glow＋回転）を、両variant各3回。
+  長尺は **9001 frame、t=0〜300秒の全区間・終端を含み、縁幅3→UI最大128px**。
+  t=300にもlayerが存在するようfixtureのproject尺を301秒にする。
+  静的＋補間では固定文字を追加し、3つの保持枠を同時に使う。
+  合計 **120回、244,824測定frame**。短い検証は下記で行える:
+
+  ```powershell
+  python scripts/musicvideo/t1-measure.py --smoke --no-build --output target/t1-followup/smoke
+  python -m unittest discover -s scripts/musicvideo -p 'test_*.py' -v
+  ```
+
+- 修正前fce65bb15相当は互換JSON harnessがなく、タイルで1GiB超の旧全文確保が起こり得るため
+  **既定では未測定理由を記録**する。別に準備した同条件の旧rendererは `--before-exe <path>` で追加可能
+  （equivalentであること・source revisionは採取者が記録する）。旧装飾ありと旧装飾なしも各3回追加し、
+  装飾なしは現行と揺らぎを比較する。現行を修正前の代用にしない。
+  装飾なしの退行比較には `--reference-json <旧測定のresults.json>` を指定できる。
+  machine / OS / CPU / release / font hash / Rayon / case設定が一致した採用3回とRGBA hashを確認し、
+  3回のrangeと標準誤差から揺らぎを評価する。参照がない場合は **NOT ASSESSED** を出す。
+- 出力は `target/t1-measure/results.json`、`results.txt`、各processのJSONL。
+  renderのmean / nearest-rank p95と、初回準備のlayout・coverage・RGBAの累積時間、cold frame全体、
+  font/Frame初期化時間を別記する（準備時間は並列callerの累積、wall時間との単純差ではない）。
+  cache 3枠と各焼成RGBAの最大値、30 frameごとの保持量、OS working set / private commitの時系列と
+  終了後handleからのOS最終peakを記録する。長尺の後半の中央値変化と頭打ちの目安も出す。
+  `text-measure` featureだけに計時・最大焼成量counterを追加し、通常buildの計算・描画・計時負荷は変えない。
+- 出力の合否目安: 装飾なしの悪化は3回の測定揺らぎ以内（参照がなければ未判定）、通常p95は
+  16.7msを十分下回る（80%=13.36msをheadroom目安）、保持は **24+8+32MiB**、各焼成RGBA **8MiB以下**。
+  タイルp95が8.3msを超えた回のmean/p95を列挙し、設計判断は利用者が行う。
+  memoryの後半増分はmax(8MiB,後半初期中央値の5%)以内を頭打ちの目安とし、生の時系列も残す。
+  途中棄却で止まった部分実行やsmokeを最終合格にしない。
+- 実行時間目安: 平均5/20/100msなら約 **20/82/408分** ＋監視約11分、cold/warmup・release build。
+  128px縁・タイルの実時間はこれより長くなり得る。回数・frame数とこの目安は実行開始時・結果にも出す。
+- **今回は性能計測を実施していない**（利用者指定。他セッションのCPU使用が継続）。
+  1ケース3frameのheadless smokeはJSON/表を出し、WMIアクセス拒否・rustc/CodexのCPU消費で不採用。
+  競合なし/あり、新規・終了・再利用PID、短命PID通知、監視失敗、実handle終了後CPU/peak取得を
+  Python **15件**で確認。core **104** / UI **121** / lab **75**と合わせ **315件成功**。
+  計測feature付きeviction 1件も成功。装飾なし既存4hash維持、fmt / release headless例build / CLI dev-tools check成功。
+  検証・変異・smoke記録は `target/t1-followup/`。comic-coreの変更なし。
+  commit / アプリ起動 / build-dev / 正式matrix・長尺実行なし。
+
 **T1 初回計測結果（2026-10-09、headless core 測定器の実測、独立レビュー修正前）**
 
 再現用: `cargo build --release -p musicvideo-core --example t1_measure` の後、
@@ -1394,7 +1469,7 @@ frame n → t = n/fps → evaluate → rasterize(CPU, rayon) → RGBA→NV12/YUV
 | **L1** 実装済み・修正検収待ち | 画面構成（D14）: 左にレイヤー一覧、右は選択レイヤーのプロパティだけ、モジュレータ・プロジェクト設定は別タブ | 初版 `e6fda1f9b`。**独立レビューP2/P3修正・自動テスト済み**（2026-10-09、同commitに対する未コミット差分）。core 73件 / UI 96件（既存87＋L1新規7＋修正新規2）/ lab 46件（既存45＋L1新規1）、全215件成功。タブ/左一覧の部品ID分離とnative Undo往復を追加検証。同フレームProject/LRC完了2件は本番の共通入口へ移し、入口内の既存poll呼出を入力前へ移す変異で失敗確認。`cargo tree` の禁止依存なし、fmt・glyph検査成功。releaseラボのビルド結果と変異検証は下記。修正作業ではアプリ未起動・コミットなし |
 | **L2** 実装済み・追加P2修正の再検収待ち | 選択レイヤーの枠（D14 末尾）: 選んだレイヤーの矩形をプレビュー上に表示。画面外・非表示も示す | 初版 `838f8503e`（計232件）。ID再利用・stale textureのP2/P3修正 `42a74db10` は独立再レビューで解消確認（計234件）。**通常UI追加のlifetime登録遅延P2を修正・自動検証済み**（2026-10-09、未コミット差分）: `EditorFrame::finish` で対象lifetimeを同期し、同フレームの要求へ全LayerIdを捕捉。実UIから単色/2レイヤー追加→停止中の最初の完成フレームの枠・名前を検査。新規3件は同期を外す変異で全件失敗、復元後core 80 / UI 104 / lab 53、計237件成功。Undo単位・歌詞native Undo・L1 API・RGBAハッシュ維持。全要求経路の確認、releaseビルド等は下記L2追加修正記録 |
 | **L3** 実装済み・追加P3修正の再検収待ち | 状態で動かない上部とステータス（D14 末尾）: ツールバー 1 段・固定 1 行のステータスバー・読込衝突はモーダル・未解決素材と診断は別ウィンドウ・素材パスはプロジェクトタブ | 初版 `e958226a9`（254件）。キャンセル領域/未保存の印/タイトル送信の3件を修正した `a5c05ef65`（258件）は独立再レビューで条件付きACCEPT。**追加P3「詳細メニューのID変化」を修正・自動検証済み**（2026-10-09、未コミット差分）: ステータスの子UI4領域を用途ごとの固定IDにする。新規lab 1件、500/1400pt×書出/画像読込/保存完了の7組合せ、計14ケースでメニュー維持とメニュー内の未解決素材操作を実描画/実クリックで検査。修正前と詳細IDだけを戻す変異で失敗確認。復元後 core 80 / UI 105 / lab 74、計259件成功。禁止依存なし、fmt/glyph成功、releaseラボ再build成功（30.53秒）。L1/L2・H1/H2・非同期採否順序は維持。根拠・ログは下記L3追加P3記録。アプリ起動・停止、コミットなし |
-| **T1** | 文字装飾（D15）: comic-core既存装飾をText / TimeText / Lyricsに共通接続 | 初版fce65bb15、巨大確保・昇格・clip修正f54b6e5b6は条件付きACCEPT。追加修正: 準備済みlayout / coverageを全タイル・mask/bodyで共有するAPIとLRUを追加。旧版の固定RGBAハッシュ22個で注釈・message clip互換性を固定。追加4件、comic125 / core104 / UI121 / lab75 / egui-ime17、計442件成功、今回4変異検出（T1全体追加32件）。既存4hash維持。保持64MiB = 静的RGBA24 / 補間RGBA8 / 準備32、1焼成RGBA8MiB以下。CLI・comic_lab・本体check、fmt、glyph・依存境界成功。straight RGBA修正は検収採用済み。1080p通常/タイル×静的/補間×glow/回転の16ケース計測器を追加。**P2性能測定は他rustc/CodexのCPU競合で環境待ち、未完了**。初回4.274ms等は今回の採用値ではない。releaseラボbuild成功、起動・commit・build-devなし。採取・検証手順はD15参照 |
+| **T1** | 文字装飾（D15）: comic-core既存装飾をText / TimeText / Lyricsに共通接続 | 初版fce65bb15、巨大確保・昇格・clip修正f54b6e5b6、準備共有・旧注釈22hash固定338a38899は条件付きACCEPT。保持64MiB = 静的RGBA24 / 補間RGBA8 / 準備32、1焼成RGBA8MiB以下。straight RGBA修正は検収採用済み。今回P3: eviction前後・再準備のglyph RGBA比較、旧非空判定への復帰変異も検出。計測器をscripts/musicvideo/t1-measure.pyへ保存し、前/中のCPU・新規PID・終了後CPU・短命PID通知を監視、取得不可も棄却。16ケース各3回＋5分全補間/混在、3枠保持とOSメモリ時系列・合否目安・所要時間をJSON/表へ。core104 / UI121 / lab75 / Python15、計315件成功、計測feature付きeviction1件も成功。既存4hash・fmt維持、release headless例build成功。**P2正式性能計測は利用者指定で今回は未実施、後日利用者が python scripts/musicvideo/t1-measure.py を実行**。smokeは競合/WMI拒否で不採用。初回4.274ms等を現行の採用値にしない。今回comic-core変更・commit・アプリ起動・build-devなし。手順・旧経路未測定理由はD15参照 |
 | **I1 段 2a / 2b 実装・自動検証済み／実機確認待ち** | IME 補正の共有（D10「設定・入力」）: 本体 `ime_focus` の egui 依存部分（入力補正 plugin・single-line helper）を共有クレートへ挙動不変で切り出し、本体とエディタのホストが policy を登録する | **段 2a（2026-10-09、`367f9c9d3`・独立実装レビュー ACCEPT）**: `egui-ime` と本体 facade、既存呼び出し元を維持。既存 23 件は共有 16 / 本体 7 に配置、raw 禁止・adapter を追加（共有 17 / 本体 12 passed）。full gate 12,681 passed / 58 ignored、fmt / glyph、通常 profile の確認用 build 成功。**段 2b（同日、未コミット）**: 全域 Tab policy を挙動不変で共有化、本体 facade・既存 5 テストを維持。エディタの登録入口・5 欄 helper・Undo gate・raw 禁止を実装、歌詞 buffer / widget ID / native Undo と Hz DragValue を維持。利用者承認でモジュレータ見出しを不変 ID に固定し、同型箇所も調査。追加 13 テスト、UI 117 / ラボ 75 / core 80 / 共有 17 passed、既存 L1〜L3 全件維持、変異 6 件を検出。本体 Tab / IME / 関連・snapshot も通過。full gate **12,694 passed / 58 ignored / 0 failed**、fmt / glyph / 依存検査、ラボ release build 成功。独立実装レビュー **ACCEPT、指摘なし**。build-dev 再実行・コミット・アプリ起動なし。詳細は D10「I1 設計」§7・§8。**実装・自動検証は完了、実機確認・最終受け入れは未完了**。本体の確認用 exe は更新せず、ラボの確認用 exe は `target/release/musicvideo_lab.exe` |
 | **H3a** | 解析契約の確定: 正規の較正区間（出力尺に合わせた PCM か全尺か）と解析の時刻列・seek 復帰の規則を決める | [引き継ぎ監査](music-video-handoff-20260907.md) §3 H3。可変時刻列と較正入力差をテストで固定。無変調ハッシュ維持 |
 | **H3b** | 一致の検証（P4b 接続後） | プレビューで表示したフレームが、同じ時刻の書き出しフレームと一致する: 表示フレームの欠落、前後への seek、直接 seek、音源より短い / 長い出力尺。これが通るまで H3 を完了扱いにしない |

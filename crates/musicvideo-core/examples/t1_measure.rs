@@ -1,6 +1,5 @@
 //! Headless T1 rendering measurement. Never opens an app/window or writes video.
-//! cargo build --release -p musicvideo-core --example t1_measure
-//! target/release/examples/t1_measure.exe [composition|long]
+//! Driven by python scripts/musicvideo/t1-measure.py (headless, release only).
 use musicvideo_core::*;
 use std::time::Instant;
 
@@ -33,12 +32,14 @@ fn setup(decorated: bool, animated: bool) -> (Project, Assets) {
     fonts.insert(
         comic_core::LoadedFont::from_bytes(
             DEFAULT_FONT_KEY,
-            std::fs::read(r"C:\Windows\Fonts\YuGothM.ttc").unwrap(),
+            std::fs::read(std::env::var("T1_FONT").expect("T1_FONT")).unwrap(),
         )
         .unwrap(),
     );
     let assets = Assets::new(fonts);
-    let mut p = default_project(300.0);
+    // Keep layers active at t=300 (end-exclusive spans), so the maximum outline
+    // is actually baked on the final frame of the five-minute interval.
+    let mut p = default_project(301.0);
     p.output = Output {
         width: 1920,
         height: 1080,
@@ -114,70 +115,54 @@ fn setup(decorated: bool, animated: bool) -> (Project, Assets) {
     }
     (p, assets)
 }
-fn composition(decorated: bool) {
-    let (p, assets) = setup(decorated, false);
-    let mut frame = Frame::new(1920, 1080).unwrap();
-    for _ in 0..30 {
-        let _ = render_frame(
-            &evaluate(&p, 0.5, &SpectrumFrame::default()),
-            &assets,
-            &mut frame,
-        )
-        .unwrap();
+
+fn animation(s: TextStyle, animated: bool, maximum: f32) -> Animatable<TextStyle> {
+    if !animated {
+        return Animatable::Const(s);
     }
-    let mut times = Vec::new();
-    for n in 0..300 {
-        let scene = evaluate(&p, 0.5 + n as f64 / 30.0, &SpectrumFrame::default());
-        let start = Instant::now();
-        let _ = render_frame(&scene, &assets, &mut frame).unwrap();
-        times.push(start.elapsed().as_secs_f64() * 1000.0);
+    let mut end = s.clone();
+    if let Some(outline) = &mut end.outline {
+        outline.width_px = maximum;
     }
-    let mean = times.iter().sum::<f64>() / times.len() as f64;
-    times.sort_by(f64::total_cmp);
-    println!(
-        "composition decorated={decorated} frames=300 mean_ms={mean:.4} p95_ms={:.4} cache={:?}",
-        times[284],
-        assets.text_cache_stats()
-    );
+    Animatable::Track(
+        Track::new(vec![
+            Keyframe {
+                t: 0.0,
+                value: s,
+                interp: Interp::Linear,
+            },
+            Keyframe {
+                t: 300.0,
+                value: end,
+                interp: Interp::Linear,
+            },
+        ])
+        .unwrap(),
+    )
 }
-fn long() {
-    let (p, assets) = setup(true, true);
-    let mut frame = Frame::new(1920, 1080).unwrap();
-    let start = Instant::now();
-    let mut max_bytes = 0;
-    let mut max_entries = 0;
-    let mut max_transient = 0;
-    for n in 0..9000 {
-        let scene = evaluate(&p, n as f64 / 30.0, &SpectrumFrame::default());
-        let _ = render_frame(&scene, &assets, &mut frame).unwrap();
-        let stats = assets.text_cache_stats();
-        max_bytes = max_bytes.max(stats.stable_bytes + stats.transient_bytes);
-        max_transient = max_transient.max(stats.transient_bytes);
-        max_entries = max_entries.max(stats.entries);
-        if n % 900 == 0 {
-            println!("long frame={n} cache={stats:?}");
-        }
-        assert!(stats.stable_bytes + stats.transient_bytes <= MAX_TEXT_CACHE_BYTES);
-    }
-    println!(
-        "long frames=9000 duration_secs=300 fps=30 max_cache_bytes={max_bytes} max_transient_bytes={max_transient} max_entries={max_entries} elapsed_secs={:.3} final={:?}",
-        start.elapsed().as_secs_f64(),
-        assets.text_cache_stats()
-    );
-}
-// One scenario per process makes the OS peak meaningful (including font/frame,
-// layout, glyph-cache, LRU, rotated body and glow buffers). The Python driver
-// samples Windows peak_wset / peak_pagefile and checks CPU competition.
-fn matrix(case: &str) {
+fn main() {
+    let init = Instant::now();
+    let case = std::env::args().nth(1).expect("scenario");
+    let variant = std::env::args().nth(2).expect("none/current");
+    assert!(matches!(variant.as_str(), "none" | "current"));
     let parts: Vec<_> = case.split('-').collect();
     assert_eq!(parts.len(), 3);
     let tiled = parts[0] == "tile";
-    let animated = parts[1] == "interp";
-    let (mut p, assets) = setup(true, animated);
+    let animated = matches!(parts[1], "interp" | "mixed");
+    let long = std::env::var("T1_LONG").as_deref() == Ok("1");
+    let frames: usize = std::env::var("T1_FRAMES").unwrap().parse().unwrap();
+    assert!(frames > 0);
+    let (mut p, assets) = setup(variant == "current", animated);
     if tiled {
-        p.layers.truncate(2); // opaque background + one full-HD text layer
+        p.layers.truncate(2);
         p.layers[1].rect = Animatable::Const(NormRect::FULL);
-        let mut s = style();
+    }
+    let mut s = if variant == "current" {
+        style()
+    } else {
+        TextStyle::default()
+    };
+    if tiled && variant == "current" {
         s.shadow = Some(TextShadowStyle {
             color: TextColor::new(0, 0, 0, 180),
             offset: (512.0, -512.0),
@@ -189,29 +174,26 @@ fn matrix(case: &str) {
             offset: (512.0, 512.0),
             count: 12,
         });
-        let mut end = s.clone();
-        end.outline.as_mut().unwrap().width_px = 18.0;
-        if let LayerKind::Text(t) = &mut p.layers[1].kind {
-            t.style = if animated {
-                Animatable::Track(
-                    Track::new(vec![
-                        Keyframe {
-                            t: 0.0,
-                            value: s,
-                            interp: Interp::Linear,
-                        },
-                        Keyframe {
-                            t: 300.0,
-                            value: end,
-                            interp: Interp::Linear,
-                        },
-                    ])
-                    .unwrap(),
-                )
-            } else {
-                Animatable::Const(s)
-            };
+    }
+    // Full-span retention stress reaches the UI maximum outline (128px).
+    let anim = animation(s.clone(), animated, if long { 128.0 } else { 18.0 });
+    for layer in p.layers.iter_mut().skip(1) {
+        match &mut layer.kind {
+            LayerKind::Text(t) => t.style = anim.clone(),
+            LayerKind::TimeText(t) => t.style = anim.clone(),
+            LayerKind::Lyrics(t) => t.style = anim.clone(),
+            _ => unreachable!(),
         }
+    }
+    if parts[1] == "mixed" {
+        let mut fixed = new_text_layer(&p);
+        fixed.rect = Animatable::Const(NormRect::new(0.05, 0.45, 0.9, 0.2));
+        if let LayerKind::Text(t) = &mut fixed.kind {
+            t.text = "静的 + 補間".into();
+            t.size_px = 64.0;
+            t.style = Animatable::Const(s);
+        }
+        p.layers.push(fixed);
     }
     for layer in p.layers.iter_mut().skip(1) {
         if matches!(parts[2], "glow" | "both") {
@@ -226,44 +208,83 @@ fn matrix(case: &str) {
         }
     }
     let mut frame = Frame::new(1920, 1080).unwrap();
-    let frames: usize = std::env::var("T1_FRAMES")
-        .ok()
-        .map(|s| s.parse().unwrap())
-        .unwrap_or(300);
+    let initialization_ms = init.elapsed().as_secs_f64() * 1000.0;
+    let cold = Instant::now();
+    let _ = render_frame(
+        &evaluate(&p, 0.0, &SpectrumFrame::default()),
+        &assets,
+        &mut frame,
+    )
+    .unwrap();
+    let first_frame_ms = cold.elapsed().as_secs_f64() * 1000.0;
+    // Sum of preparation durations (layout/coverage + RGBA), excludes composition.
+    // Across parallel callers this is aggregate time, not wall-clock subtraction.
+    let initial_preparation_ms = assets.text_cache_stats().preparation_ns as f64 / 1e6;
+    for _ in 0..30 {
+        let _ = render_frame(
+            &evaluate(&p, 0.0, &SpectrumFrame::default()),
+            &assets,
+            &mut frame,
+        )
+        .unwrap();
+    }
+    let wall = Instant::now();
     let mut times = Vec::with_capacity(frames);
-    let mut max_cache = 0;
-    let mut hash = 0;
-    for n in 0..30 + frames {
-        let scene = evaluate(&p, n as f64 / 30.0, &SpectrumFrame::default());
+    let mut maxima = [0_usize; 4];
+    // Include cold/warm allocations in the retained-memory maxima too.
+    let st = assets.text_cache_stats();
+    maxima[0] = st.stable_bytes;
+    maxima[1] = st.transient_bytes - st.prepared_bytes;
+    maxima[2] = st.prepared_bytes;
+    maxima[3] = st.max_raster_bytes;
+    for n in 0..frames {
+        let t = if long {
+            n as f64 * 300.0 / (frames - 1).max(1) as f64
+        } else {
+            n as f64 / 30.0
+        };
+        let scene = evaluate(&p, t, &SpectrumFrame::default());
         let start = Instant::now();
         let _ = render_frame(&scene, &assets, &mut frame).unwrap();
-        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-        if n >= 30 {
-            times.push(elapsed);
+        times.push(start.elapsed().as_secs_f64() * 1000.0);
+        let st = assets.text_cache_stats();
+        let lanes = [
+            st.stable_bytes,
+            st.transient_bytes - st.prepared_bytes,
+            st.prepared_bytes,
+            st.max_raster_bytes,
+        ];
+        for (max, current) in maxima.iter_mut().zip(lanes) {
+            *max = (*max).max(current);
         }
-        let stats = assets.text_cache_stats();
-        max_cache = max_cache.max(stats.stable_bytes + stats.transient_bytes);
-        if n + 1 == 30 + frames {
-            hash = frame.rgba.iter().fold(0xcbf29ce484222325_u64, |h, b| {
-                (h ^ *b as u64).wrapping_mul(0x100000001b3)
-            });
+        if n % 30 == 0 || n + 1 == frames {
+            println!(
+                "{}",
+                serde_json::json!({"type":"sample", "frame":n, "scene_secs":t,
+                "elapsed_secs":wall.elapsed().as_secs_f64(), "stable_bytes":lanes[0],
+                "transient_rgba_bytes":lanes[1], "prepared_bytes":lanes[2], "max_raster_bytes":lanes[3]})
+            );
         }
+        assert!(
+            lanes[0] <= 24 * 1024 * 1024
+                && lanes[1] <= 8 * 1024 * 1024
+                && lanes[2] <= 32 * 1024 * 1024
+        );
+        assert!(lanes[3] <= MAX_TEXT_RASTER_BYTES);
     }
     let mean = times.iter().sum::<f64>() / times.len() as f64;
     times.sort_by(f64::total_cmp);
+    let hash = frame.rgba.iter().fold(0xcbf29ce484222325_u64, |h, b| {
+        (h ^ *b as u64).wrapping_mul(0x100000001b3)
+    });
     println!(
-        "matrix case={case} frames={frames} mean_ms={mean:.4} p95_ms={:.4} max_cache_bytes={max_cache} hash={hash:016x} final_cache={:?}",
-        times[(frames * 95).div_ceil(100) - 1],
-        assets.text_cache_stats()
+        "{}",
+        serde_json::json!({"type":"result", "case":case, "variant":variant,
+        "frames":frames,"long":long, "initialization_ms":initialization_ms,
+        "initial_preparation_ms":initial_preparation_ms, "first_frame_ms":first_frame_ms,
+        "mean_ms":mean,"p95_ms":times[(frames*95).div_ceil(100)-1],"hash":format!("{hash:016x}"),
+        "max_stable_bytes":maxima[0], "max_transient_rgba_bytes":maxima[1],
+        "max_prepared_bytes":maxima[2], "max_raster_bytes":maxima[3],
+        "measured_secs":wall.elapsed().as_secs_f64()})
     );
-}
-fn main() {
-    match std::env::args().nth(1).as_deref() {
-        Some("matrix") => matrix(&std::env::args().nth(2).expect("matrix case")),
-        Some("long") => long(),
-        _ => {
-            composition(false);
-            composition(true);
-        }
-    }
 }

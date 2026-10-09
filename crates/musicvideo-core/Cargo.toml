@@ -8,6 +8,14 @@ rust-version.workspace = true
 name = "musicvideo_core"
 path = "src/lib.rs"
 
+[features]
+# Headless measurement only; no counters/timers in normal application builds.
+text-measure = []
+
+[[example]]
+name = "t1_measure"
+required-features = ["text-measure"]
+
 [dependencies]
 # テキストは comic-core が所有する (docs/music-video-export-plan.md D4)。日本語シェーピング
 # (rustybuzz)・グリフラスタライズ・袋文字・影・グローが RGBA8 への焼き込みまで揃っており、

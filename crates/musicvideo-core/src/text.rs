@@ -233,6 +233,10 @@ impl CacheState {
 #[derive(Default)]
 pub(crate) struct TextCache {
     entries: Mutex<CacheState>,
+    #[cfg(feature = "text-measure")]
+    preparation_ns: std::sync::atomic::AtomicU64,
+    #[cfg(feature = "text-measure")]
+    max_raster_bytes: std::sync::atomic::AtomicUsize,
 }
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TextCacheStats {
@@ -242,6 +246,12 @@ pub struct TextCacheStats {
     /// Prepared programs, already included in transient_bytes (do not add twice).
     pub prepared_bytes: usize,
     pub entries: usize,
+    /// Measurement-only cumulative layout/coverage/RGBA preparation time.
+    #[cfg(feature = "text-measure")]
+    pub preparation_ns: u64,
+    /// Measurement-only high water of combined glyph/decoration RGBA per bake.
+    #[cfg(feature = "text-measure")]
+    pub max_raster_bytes: usize,
 }
 impl TextCache {
     pub fn stats(&self) -> TextCacheStats {
@@ -251,6 +261,14 @@ impl TextCache {
             transient_bytes: s.transient.bytes + s.prepared.bytes,
             prepared_bytes: s.prepared.bytes,
             entries: s.stable.entries.len() + s.transient.entries.len() + s.prepared.entries.len(),
+            #[cfg(feature = "text-measure")]
+            preparation_ns: self
+                .preparation_ns
+                .load(std::sync::atomic::Ordering::Relaxed),
+            #[cfg(feature = "text-measure")]
+            max_raster_bytes: self
+                .max_raster_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
         }
     }
     #[cfg(test)]
@@ -294,7 +312,14 @@ impl TextCache {
         {
             return Some(bake);
         }
+        #[cfg(feature = "text-measure")]
+        let start = std::time::Instant::now();
         let bake = Arc::new(TextBake::new(fonts, text, font_key, size_px, style)?);
+        #[cfg(feature = "text-measure")]
+        self.preparation_ns.fetch_add(
+            start.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if bake.painters.is_empty() {
             return Some(bake);
         }
@@ -414,6 +439,8 @@ impl TextCache {
             bytes <= MAX_TEXT_RASTER_BYTES,
             "text bake exceeds allocation budget"
         );
+        #[cfg(feature = "text-measure")]
+        let start = std::time::Instant::now();
         let paint = |block: TextBlock, surface: usize| {
             let origin = (
                 prepared.origin_offset.0 as f32,
@@ -444,6 +471,17 @@ impl TextCache {
                 .painted
                 .then(|| paint(prepared.decoration.clone(), 1)),
         });
+        #[cfg(feature = "text-measure")]
+        {
+            self.preparation_ns.fetch_add(
+                start.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            self.max_raster_bytes.fetch_max(
+                bitmap.rgba.capacity() + bitmap.decoration.as_ref().map_or(0, Vec::capacity),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         self.entries
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -585,6 +623,9 @@ impl TextBake {
 mod tests {
     use super::*;
     use comic_core::bake_text_region;
+    fn assert_eviction_rgba(expected: &[u8], actual: &[u8]) {
+        assert_eq!(actual, expected, "eviction must preserve glyph RGBA");
+    }
     #[test]
     fn t1_prepared_tiles_reuse_one_logical_bake_across_mask_body_and_keep_total_budget() {
         let mut fonts = FontSet::new();
@@ -611,6 +652,12 @@ mod tests {
             .prepare(&fonts, "日本語 A", "font", 64.0, &style, &key)
             .unwrap();
         assert_eq!(first.painters.len(), 2);
+        // The logical glyph rectangle, not merely an allocated transparent tile.
+        let origin = (first.origin_offset.0 as i32, first.origin_offset.1 as i32);
+        let width = first.logical_width.ceil() as usize;
+        let height = first.logical_height.ceil() as usize;
+        let before = first.painters[0].bake_region(origin, width, height).pixels;
+        assert!(before.chunks_exact(4).any(|pixel| pixel[3] != 0));
         let rect = crate::raster::PixelRect {
             x0: 0,
             y0: 0,
@@ -643,6 +690,11 @@ mod tests {
             assert!(Arc::ptr_eq(&first, &again));
             let stats = cache.stats();
             assert!(stats.stable_bytes + stats.transient_bytes <= MAX_TEXT_CACHE_BYTES);
+            #[cfg(feature = "text-measure")]
+            {
+                assert_eq!(stats.max_raster_bytes, MAX_TEXT_RASTER_BYTES);
+                assert!(stats.preparation_ns > 0);
+            }
         }
         // Many changing styles must evict old preparation without retaining all
         // dilation coverage. The oldest program stays usable through its Arc.
@@ -664,12 +716,22 @@ mod tests {
         }
         assert!(cache.entries.lock().unwrap().prepared.entries.len() < 300);
         assert!(cache.entries.lock().unwrap().prepared.get(&key).is_none());
-        assert!(
-            !first.painters[0]
-                .bake_region((6145, 6145), 64, 64)
-                .pixels
-                .is_empty()
+        let after = first.painters[0].bake_region(origin, width, height).pixels;
+        assert_eviction_rgba(&before, &after);
+        let rebuilt = cache
+            .prepare(&fonts, "日本語 A", "font", 64.0, &style, &key)
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &rebuilt));
+        assert_eviction_rgba(
+            &before,
+            &rebuilt.painters[0]
+                .bake_region(origin, width, height)
+                .pixels,
         );
+        // Guard the oracle itself: reverting it to !is_empty() must fail this
+        // test even if today's painter still happens to produce correct ink.
+        let transparent = vec![0; before.len()];
+        assert!(std::panic::catch_unwind(|| assert_eviction_rgba(&before, &transparent)).is_err());
     }
     #[test]
     fn t1_shared_effect_padding_matches_legacy_without_glow() {
