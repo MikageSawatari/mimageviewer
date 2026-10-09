@@ -1,17 +1,17 @@
 # 指定サイズのフルスクリーンfit計画（§1.342）
 
-作成: 2026-10-08 / 改訂: 2026-10-09（r4・利用者回答反映）/ ラインE。
-状態: **§10の決定を記録済み。未決はQ2とQ4（高さ初期値・上限値 / 適用範囲）のみ。r4の設計レビュー待ち**。
-コード照合基準: 初版 `6078f6595`、r2 `2d327da31`、r3 `ab99c0a6b`（レビュー対象文書 `d648a5d54`）、r4 `511694cd7`。本ラウンドは文書のみ。製品コード・保存データを変更しない。1.357の実装は評価・変更しない。
+作成: 2026-10-08 / 改訂: 2026-10-09（r5・v4.5.0後の再照合と残る利用者決定の反映）/ ラインE。
+状態: **Q1〜Q11の利用者判断はすべて決定済み（§10.1）。独立設計レビューの承認は未記録**。
+コード照合基準: 初版 `6078f6595`、r2 `2d327da31`、r3 `ab99c0a6b`（レビュー対象文書 `d648a5d54`）、r4 `511694cd7`。v4.5.0出荷後の `840c309ec` での再照合は§14。過去のfile:lineは各ラウンド時点の記録。本ラウンドは文書のみ。製品コード・保存データを変更しない。
 
 ## 1. 要求と境界
 
-[backlog §1.342 / §1.343](next-release-backlog.md)の利用者決定を前提とする。
+[backlog §1.342](next-release-backlog.md)と、v4.5.0で出荷済みの[§1.343のfit循環仕様](keymap-spec.md)の利用者決定を前提とする。
 幅と高さは独立・各軸任意、単位は％ / px。既存のPage / Width / Height / Originalに
 一方式を追加し、既存の循環と直接選択で切り替える。縦横比を変える指定ではない。
 高さだけ800pxなどを指定できる。ウィンドウ・F11・F12・見開き・縦横連結・回転・画像フォルダを対象とする。
 
-決定仕様は§10に2026-10-09付で記録する。未決のQ2 / Q4は下記でも推奨案と明記する。
+決定仕様は§10.1に2026-10-09付で記録する。利用者への未決質問はない。
 §1.343の確定済みの除外ID規則、割り当ての既定なし、単一循環ownerは再判断しない。
 今回の範囲は画像表示のfit。動画・音楽のサイズ方式、加工・書き出し解像度、
 モニター選択、窓の配置やサイズ自体、画像別プリセットは追加しない。
@@ -62,7 +62,7 @@ file:lineは上記HEAD時点。既存の状態・入口を拡張できる根拠�
 | お気に入りの状態 | [settings.rs:4147](../src/settings.rs#L4147)は`FavoriteViewState`の8項目。指定値・fit mode・倍率制限は現在含まれない。[app.rs:80466](../src/app.rs#L80466)が行先の状態を投影し、:80507のcapture / :80531のtransitionが既存owner。[adjustment_db.rs:389](../src/adjustment_db.rs#L389)・:411は既存state_jsonを読む / 書く。新フィールド欠落で既存行全体のdeserializeを失敗させない |
 | 共通値の保護 | [settings.rs:8564](../src/settings.rs#L8564)のoverlay、:8589のprefs snapshot、:8601のprefs route、:10297の保存前overlay解除が共通値を守る。[preferences.rs:2073](../src/ui_dialogs/preferences.rs#L2073)の標準 / 有効値の分離、既存DB workerも再利用する |
 
-**Q2の結論案**: 指定サイズは画像生成解像度ではなく表示寸法なので、pxをlogical point相当へ揃える。
+**Q2の決定（2026-10-09）**: 指定サイズは画像生成解像度ではなく表示寸法なので、pxをlogical point相当へ揃える。
 既存の表示寸法pxと異なる物理pxを維持する具体的な必要性は見つからない。Originalの物理1:1や
 PDF要求の物理pxは用途が異なるため、表示寸法の単位変更によってそれらを変更しない。
 
@@ -95,22 +95,25 @@ Originalは引き続き物理1:1。指定値を消さず往復できる。Margin
 hover HUD / popup等の重なりは新たに差し引かない。§1.344で予約が抑制されれば％の基準も広がる。
 元画像画素数に対する％、モニター解像度、保存した窓サイズにはしない。
 
-pxは**100%表示時のlogical point相当**へ揃える推奨案（Q2未決、§2.1）。
+pxは**100%表示時のlogical point相当**へ揃える（Q2決定、2026-10-09、§2.1）。
 指定値をそのままpoint矩形の長さに使い、`/ppp`しない。OS DPIとUI倍率を含む描画先の
 effective pppで物理表示寸法へ変換される。main Contextのpppを別窓へ使い回さない。
 表示領域を`Vw, Vh`（point）、pppを`P`、解決済み各軸枠を`Bw, Bh`とすると:
 
 - ％: `Bw = Vw × width_percent / 100`、高さも同様。
-- px（推奨）: `Bw = width_px`、高さも同様。物理表示幅は`Bw × P`。
+- px: `Bw = width_px`、高さも同様。物理表示幅は`Bw × P`。
 - 未指定軸: 制約なし。両方未指定だけはPageと同じfitへ解決する（Q4）。
-- 初期幅は**80％で決定**。初期高さは**指定なしを推奨（Q4未決）**。現在のfit modeを変えない。
-  幅だけで決める初期状態によりPageとの差が分かる。倍率制限が働く場合は同じ寸法になることもある。
+- 初期値は**幅80％・高さ80％（両軸指定）**で決定（Q4、2026-10-09）。現在のfit modeを変えない。
+  画像表示領域の幅・高さとも80％の枠へ内接し、周囲に余白を残す設定例とする。
+  利用者が用途に合わせて変更する前提。原寸制限・手動zoomで指定枠を超える場合は下記の契約に従う。
   未編集でも循環へ参加し、動的に候補を減らさない。
   極小領域のgap補正は§5による。両Noneはその補正も行わず既存Page基準を使う。
   両NoneのPage相当はfit式に限る。selected modeはSpecifiedScaleで、原寸入力と上限の契約は
   §4.3 / 下記のまま。trimは§5.1の既存経路別規則を使う。
 
-例（Q2推奨案）: P=1.5で高さ800pxだけなら高さ枠800 point、物理1200px。
+初期値の例: image rectが1000×800pointなら枠は800×640point。
+1000×2000の単ページは320×640pointへ内接する（倍率制限OFF・上限未到達・manual zoom=1）。
+片軸へ変更した例: P=1.5で高さ800pxだけなら高さ枠800 point、物理1200px。
 1000×2000の単ページは物理600×1200pxになる（倍率制限OFF・上限未到達・manual zoom=1）。
 幅50％＋高さ800pxなら両方の小さい倍率を採る。
 
@@ -135,7 +138,8 @@ effective pppで物理表示寸法へ変換される。main Contextのpppを別�
 viewportを超える画像は既存clipと閲覧操作を使う。物理格子整列と丸めの画素単位の差は既存契約を維持。
 paint / hit / UVを異なる倍率で解かない。
 
-**過大拡大の上限（Q4未決の推奨）**: SpecifiedScaleの自動fitに固定 **5.0倍**を追加する。
+**過大拡大の上限（Q4決定、2026-10-09）**: SpecifiedScaleの自動fitに固定 **5.0倍**を追加する。
+過大な拡大による画質低下を避ける元の要望に対応し、この既定の固定上限も確認ケースにする。
 原寸基準Oをpointへ正規化した物理原寸倍率`1/P`に対し、
 `s_auto = min(FullscreenFitScaleLimits::apply(s_requested), 5.0 / P)`とする。
 「拡大しない」は1倍までなので5倍上限より強い。「縮小しない」は1倍を下限として指定枠より
@@ -146,7 +150,7 @@ PDF raster要求の上限ではない。見開きでは既存高さ合わせ後�
 する契約ではない。連結は基準unitの自動倍率に適用し、周辺unitを個別に再fitしない。
 手動zoomはこの後に掛け、5倍を超えられる。単ページZはPage・制限なし、見開きZの照準は
 上限適用済みfitを使い、確定Zは既存専用solveを維持する。Zの結果や手動操作まで5倍に
-制限する別仕様は今回推奨しない。Q4でこの適用範囲も確認する。
+制限しない。追加の上限入力欄は作らない。
 
 ### 4.3 resolver入力: アスペクトとAI前の物理原寸（Q3決定、2026-10-09）
 
@@ -234,7 +238,7 @@ frozen captureはその時点のA / O・geometryを保持し、AI完了の通知
 
 ## 5. 表示単位・媒体・窓（Q5〜Q9）
 
-| 場面 | 決定契約（Q2 / Q4のみ推奨案） |
+| 場面 | 決定契約 |
 | --- | --- |
 | 単ページ・画像フォルダ | 同じfit入口。通常ファイル、ZIP/CBZ・PDF/EPUBページ、RAW、アニメーション画像の既存分類を保つ。フォルダ検出や専用modeを追加しない |
 | trim / 分割 | §5.1の既存経路別入力を使い、分割がtrimに優先する。canonicalはアスペクト基準、原寸は§4.3のAI前pixel基準。AI到着だけで表示寸法を変えない |
@@ -245,7 +249,7 @@ frozen captureはその時点のA / O・geometryを保持し、AI完了の通知
 | 90° / 270° | §5.1の既存経路別trim入力を維持（Q7）。高さ800pxは回転後の縦方向。EXIF / 保存回転を再加算せず、既存4方式も変更しない |
 | 自由回転・Z・比較 | free rotation時の既存effective_bbox / trim解除・専用placement・viewportを維持。自由回転AABBへの新しいfitは追加しない。Zは§4.4の単ページ / 見開き別契約（Q11） |
 | 動画 / 音楽 | 画像用のみ（Q8）。既存循環guard、native videoのplacement / shader / HUD、音楽の中央表示方式は変更しない |
-| resize / F11 / F12 / DPI | 値と選択方式を保持。％は現在image rectへ追従、pxは同じpoint寸法（Q2推奨）。小窓でもpxを窓内へ自動縮小しない。連結は同じ保持基準unitで再計算し、現在中央へ基準を移さない。既存clip / pan制約を保つ |
+| resize / F11 / F12 / DPI | 値と選択方式を保持。％は現在image rectへ追従、pxは同じpoint寸法（Q2決定）。小窓でもpxを窓内へ自動縮小しない。連結は同じ保持基準unitで再計算し、現在中央へ基準を移さない。既存clip / pan制約を保つ |
 | 複数窓・保存範囲 | 共通指定値＋既存favorite overlay（Q9、§7.1）。各表示先のrect / pppで解く。凍結passive / holdoverはcapture時policyを保持し、新設定を後読みしない |
 | prefs OK / import適用 | 指定値だけの変更は既存確定境界で公開し、次のlive描画で再計算（Q9）。選択modeと手動zoom / panは保持。mode自体のprefs変更は選択どおり適用。メニュー等で別方式へ切り替えると既存リセット。同じ方式の再選択はno-op。窓を閉じたり再生成したりしない |
 
@@ -443,12 +447,14 @@ struct FullscreenSpecifiedScale {
 }
 enum SpecifiedScaleAxis {
     PercentTenths(u32), // 1000 = 100.0%
-    LogicalPixels(u32), // 表示寸法のpoint相当。Q2推奨、未リリースなので改名migrationなし
+    LogicalPixels(u32), // 表示寸法のpoint相当。Q2決定、未リリースなので改名migrationなし
 }
 ```
 
 Noneは指定なし。％は0.1％単位の整数でNaN / infinity / 等価な複数表現をなくす。
-初期値は幅PercentTenths(800)、高さNoneを推奨（高さのみ未決）。新フィールドにserde defaultを付ける。
+初期値は幅・高さとも`Some(PercentTenths(800))`。新フィールドにserde defaultを付け、
+新設定が欠落した既存Settingsもこの両軸80％を使う。各軸Noneは利用者が明示した指定なしであり、
+初期値で埋め直さない。お気に入り行のfield欠落は§7.1の共通値継承、旧転送の欠落は転送先保持に従う。
 **新規・未リリース**の機能・キー・型なので専用migration・schema version・DDLは不要。
 旧指定倍率設定の読み替えはしない。汎用settings_kvを使い、既存fit modeや実データを保持する。
 旧版の新variant読込は既存互換性保護に従い、旧版用silent fallbackを増設しない。
@@ -467,9 +473,9 @@ Noneは指定なし。％は0.1％単位の整数でNaN / infinity / 等価な�
 [レイアウト指針](preferences-layout-guidelines.md)のsolid scrollbar / available_widthを使う。
 preferences/search_indexへ幅・高さ・％・px・指定サイズの検索anchorを追加。
 表示領域100％、100%表示時のpx相当（DPI / UI倍率で拡大）、縮小しない優先、
-5倍は自動fitだけの上限という推奨範囲を短く示す。値の確定はQ2 / Q4回答後。
+5倍は自動fitだけの上限であること、初期の両軸80％は余白を残す変更可能な設定例であることを短く示す。
 
-Q10の推奨範囲は**0.1〜1000.0％ / 1〜32768px**。数値widgetとvalidatorで範囲を共有。
+Q10の決定範囲は**0.1〜1000.0％ / 1〜32768px**。数値widgetとvalidatorで範囲を共有。
 0・負値・超過・小数pxを保存値にしない。ローカル読込範囲補修はsanitize、転送は範囲外拒否。
 単位切替は画面から逆算せず数値を維持（px化は丸め、新範囲へclamp）。
 OFFはNone、再ONは100％。以前の単位・数値の別保存は作らない（Q10）。OK前は既存draft内に留める。
@@ -507,8 +513,8 @@ favorite別へ広げない。手動zoom / pan、連結の基準unit、viewport /
   importは標準値へ適用するrouteを使い、既存favorite行へコピー・上書きしない。旧転送に新キーが
   なければ転送先の共通値を保持。キーがあれば両Noneを含め検証済みの値をそのまま適用する。
 
-初期共通値は幅80％ / 高さNoneの推奨。既存favorite行の追加値欠落はその時点の共通値を使い、
-共通値を利用者が変更済みでも固定80％へ戻さない。既存favorite表示stateのJSONを破棄する案、
+初期共通値は幅80％ / 高さ80％。既存favorite行の追加値欠落はその時点の共通値を使い、
+共通値を利用者が変更済みでも固定の両軸80％へ戻さない。既存favorite表示stateのJSONを破棄する案、
 別のfavorite指定値テーブル、標準とfavoriteを独自に同期するboolは採らない。
 
 ## 8. 簡素化とdetached憲法
@@ -559,8 +565,10 @@ viewer_context_registryの同じcontext-local fieldの型・移送境界、必�
 
 1. **純粋計算**: 片軸 / 両軸 / 両None、％ / px / mixed、縦横比、各範囲端、大小画像、
    no_up / no_downの4通り、5倍上限の直前 / 一致 / 超過、manual zoom、P=1 / 1.25 / 1.5 / 2とUI倍率。
-   Q2推奨では指定800px=800point、物理幅 / 高さはP倍になること、Originalは物理1:1を固定。
-   default幅80％ / 高さNone、両None fallback、既存4方式の幾何不変。
+   Q2決定の指定800px=800point、物理幅 / 高さはP倍になること、Originalは物理1:1を固定。
+   default幅80％ / 高さ80％の内接、両None fallback、既存4方式の幾何不変。
+   初期値と大きい表示領域の組合せでも自動fitがAI前原寸の5.0倍を超えず、no_upは1倍、
+   手動zoom / Zは5倍超を許すことを確認する。
 2. **表示単位**: 高さ違い見開き、左右読み、指定幅とgap境界、virtual slot / 中央単独表紙、
    trim / 分割・90° / 270°・RAW preview→full / AI差替え。paint / hit / UV / navigator / Zとscaleの一致。
    アスペクト基準Aとpixel原寸Oを別入力で検証。PDF page box（1/1000 point）の倍率を変えても
@@ -579,7 +587,7 @@ viewer_context_registryの同じcontext-local fieldの型・移送境界、必�
 4. **handler**: key / ring / gesture / mouse3ボタン / padが同じownerを通る。
    除外なし / 明示指定方式除外 / 1候補 / 現在対象外 / 全5除外 / 未知ID保持 / 従来4だけ除外。
    直接pickerには5方式。動画 / 音楽 / 編集では循環しない。
-5. **保存・prefs・転送**: serde欠落default、mixed / None / 範囲のround-trip、無効単位・数値拒否、
+5. **保存・prefs・転送**: Settingsの新設定欠落は両軸80％、mixed / None / 範囲のround-trip、無効単位・数値拒否、
    全field分類、旧転送文書でdestination維持、OK / Cancel / import、IME Enter / Esc、狭幅widget到達。
    remember OFF / ON、新規favorite継承、既存state_jsonのfield欠落（全既存項目保持）、両Noneとの差、
    最長一致、行先projection、標準prefsとlive専用値のroute、reset / 削除 / context切替・500ms書込 / dropを通す。
@@ -618,7 +626,7 @@ viewer_context_registryの同じcontext-local fieldの型・移送境界、必�
     metadataの真正な変更以外でA / Oが変わらず、別contextの結果が混ざらないことを確認する。
 
 snapshotは純粋な設定描画helperをtests/ui_snapshotへ渡す（App全体のsnapshotにしない）。
-循環5checkbox、指定2行、幅80％ / 高さNone、mixed / None、ライト / ダーク、通常 / 狭幅、説明折返し、限界値を撮る。
+循環5checkbox、指定2行、初期の幅80％ / 高さ80％（両軸ON）、片軸のみ / mixed / None、ライト / ダーク、通常 / 狭幅、説明折返し、限界値を撮る。
 同じhelperのlive fit popupも標準 / favoriteの表示と幅・高さ・上限説明を撮る。
 必要なら単ページ・見開き幾何fixtureも追加。PNGを目視し、widget欠け・scrollbar重なり・説明の読みやすさを確認。
 入力routingの証明にはhandler testを使う。
@@ -631,9 +639,11 @@ snapshotは純粋な設定描画helperをtests/ui_snapshotへ渡す（App全体�
 
 実装時co-update: display-pipeline、keymap-specの5方式順、必要なkey-customization / ring文書、
 backlog、prefs検索、manual fullscreen / settings、detached §11。実装・検証・実機結果を本計画へ集約。
+manualには「初期は幅・高さ80％の枠へ内接して余白を残す設定例。用途に合わせて変更できる」、
+表示寸法pxのDPI / UI倍率への追従、AI前原寸の自動fit上限5.0倍と手動zoom / Zの例外を記す。
 動画 / Remoteの仕様変更が必要なら、今回の範囲へ黙って追加しない。
 
-## 10. 利用者決定と残る質問（2026-10-09）
+## 10. 利用者決定（2026-10-09、全質問決定済み）
 
 幅・高さを独立かつ任意に指定、両軸なら内接・片軸ならその軸で倍率を決めること、
 既存方式との切替と％ / px両対応は依頼済み要件。Q1〜Q11のIDは追跡用に保持する。
@@ -643,9 +653,9 @@ backlog、prefs検索、manual fullscreen / settings、detached §11。実装・
 | 質問 | 利用者決定（2026-10-09） |
 | --- | --- |
 | Q1 | 100％は現在の画像表示領域。固定HUD / 右パネルの予約を除く。F11抑制後は広がった領域を使う |
-| Q2 | 他の表示寸法px設定と揃える方向。調査を踏まえた具体的な単位案のみ下記で確認する |
+| Q2 | 推奨どおり、pxは他の表示寸法設定と同じ100％時のlogical point相当。800pxは800pointで、Windows拡大率とアプリUI倍率に追従する。両方100％なら800物理px、Windows150％・アプリ100％なら1200物理px。画像生成解像度やOriginalの物理1:1は変更しない |
 | Q3 | 通常画像の既存「拡大しない / 縮小しない」を維持。新方式のAI結果は拡大前の原寸を使い、到着だけで表示を大きくも小さくもしない。単ページ / 見開き / 連結・AI後の合成textureも対象。PDF固定A / Oは§4.3のまま |
-| Q4 | 初期幅は80％。高さの初期値と約5倍上限の正確な値・適用範囲だけ未決。両軸未指定のfallback / 明示除外による循環は維持 |
+| Q4 | Q4-aは推奨と異なり、初期幅80％・高さ80％の両軸指定へ決定。枠へ内接して周囲に余白を残す設定例で、利用者が変更する前提。Q4-bは推奨どおり、指定サイズの自動fitだけAI前原寸基準の固定5.0倍上限。「拡大しない」は1倍まで、「縮小しない」は1〜5倍、両方ONは1倍。手動zoom / Zは5倍超を許し、上限入力欄を追加しない。見開きは高さ合わせ後の全体への自動倍率を制限し、内部の高さ合わせ倍率までは制限しない。画質低下を避ける元の要望に対する確認ケースにもする。両軸未指定fallback / 明示除外による循環は維持 |
 | Q5 | 見開きは2枚と間隔を合わせた全体へ指定枠を適用。既存高さ合わせと空き側slotを維持。極小指定の実効gap補正は表示だけへ適用 |
 | Q6 | 連結は選択 / 変更時に焦点となる中央page pair（単ページはその1枚）を基準にし、scrollで倍率を替えない。幅 / 高さとも同じ式。既存flow変更時の既定fitは維持。コードのper-unit計算・可視枚数zoom例外との差と接続は§5.3 |
 | Q7 | 新方式も既存trim入力経路と回転時の例外を今版では維持。全方式の統一は別件§1.358。費用を1.342の追加質問にしない |
@@ -653,22 +663,6 @@ backlog、prefs検索、manual fullscreen / settings、detached §11。実装・
 | Q9 | アプリ共通の指定値を持ち、既存remember_favorite_view_state / favorite_view_state_for_pathへ参加。favoriteには指定幅・高さ・単位・未指定を保存し、共通値の転送と専用値の保持を分ける（§7.1） |
 | Q10 | ％0.1〜1000.0 / px1〜32768。単位変更は数値維持、pxは整数へ丸め範囲へclamp。OFFから再ONは100％。OFF値の別保存なし、既存draft / widget / IME境界を使う |
 | Q11 | 単ページZはPage・制限なし、見開きZは選択fitを照準基準にする現行差を維持。新方式のPDFは実Z geometryに合わせた絶対需要を送り、解除 / resize / 結果採用後の収束も検証。既存4方式のZ / PDF制限は今版では変更しない |
-
-### 10.2 残る質問（番号付き・変更箇所）
-
-1. **Q2［変更］pxの意味** — ストリップや固定バー間隔と同じく、100％表示時のサイズを基準にしてよいですか？
-   **推奨: 同じ基準にする。** 800pxは800pointとして使い、Windowsの拡大率とアプリの表示倍率に応じて
-   画面上でも拡大します。両方100％なら800物理px、Windows150％・アプリ100％なら1200物理pxです。
-   サムネイル画像の生成解像度と「100％原寸」は実画素数ですが、表示枠とは用途が違います。
-   指定サイズだけを物理pxへ固定する具体的な必要性は見つかりませんでした。
-2. **Q4-a［変更］高さの初期値** — 初期幅80％に対し、高さは指定なしにしてよいですか？
-   **推奨: 高さは指定なし。** 幅だけで大きさを決めるので、Pageとの違いが分かります。
-   縦長画像の高さが表示領域を超える場合は、既存の移動操作で見ます。後から高さも指定できます。
-3. **Q4-b［新規］拡大の上限** — 指定サイズの自動合わせだけに、原寸基準のちょうど5.0倍を上限としてよいですか？
-   **推奨: 5.0倍を固定上限にする。** 「拡大しない」は1倍まで、「縮小しない」は1〜5倍、
-   両方ONは1倍です。AI後も拡大前の基準で判定します。手動ズームとZは今の操作を保ち、5倍を超えられます。
-   見開きでは高さ合わせ後の全体へ掛ける自動倍率を制限します。小さい相方を高さ合わせする倍率まで
-   5倍以下にする仕様ではありません。追加の上限入力欄は作りません。
 
 ## 11. 独立設計レビューへの対応（r2、2026-10-09）
 
@@ -708,9 +702,12 @@ Q1〜Q11の番号・件数を維持する。Q3だけPDF固定原寸の推奨と�
 
 ## 13. 利用者回答の反映（r4、2026-10-09）
 
+以下はr4当時の記録。後続回答でQ2 / Q4も決定し、現在仕様は§10.1が優先する。
+
 Q1 / Q3 / Q5〜Q11とQ4の初期幅80％を決定仕様へ移した。Q2は表示用pointと生成用物理pxを
 §2.1で区別し、他の表示寸法と揃えるLogicalPixelsを推奨する。物理pxを維持する理由は見つからない。
-初期高さNoneと5.0倍の自動fit上限は未決で、§10.2の3問だけを残す。
+当時は初期高さNoneを推奨し、px基準・高さ初期値・自動fit上限の3問を残した。
+後続のQ4-a回答は高さ80％を採用したため、この初期高さ推奨は撤回する。
 
 Q3はr2 / r3のAI到着時の条件付き保証を撤回し、新方式のAI前O / Aと各派生textureの対応を
 固定する。PDFのmetadata→geometry→需要→結果採用の一方向契約と収束回帰は維持する。
@@ -724,3 +721,36 @@ Q9は既存FavoriteViewState / overlay / 行先投影 / 保存workerに指定値
 設計変更であり、scrollやAI到着へguard / retry / 別窓判定を足す症状パッチではない。
 detached §11への記録は実装時に実際に触れた境界だけを記録する。r4は独立レビュー待ち。
 文書差分・リンク先・CRLFを確認した。製品コード変更・cargo / snapshot / build・製品起動・commitは行わない。
+
+## 14. v4.5.0出荷後の前提再照合（2026-10-09）
+
+利用者指示により、masterへfast-forward済みのnext-viewer `840c309ec` で設計を再開した。
+以下はsource inspectionとr4基準との差分照合であり、製品起動・テストによる観測ではない。
+再照合時に設計前提との矛盾は見つからず、既存の決定仕様・推奨案を維持した。
+続く利用者回答により§10.1のQ2 / Q4を確定し、初期高さだけ当時の推奨と異なる80％へ変更した。
+過去のレビュー記録とfile:lineを残し、現行コードの主な接続点をここに記録する。
+
+| 再照合対象 | `840c309ec`のfile:lineと結果 |
+| --- | --- |
+| 出荷済みfit循環 | [settings.rs:3664](../src/settings.rs#L3664)のenumと`all / cycle_id / next_for_flow`は既存4方式。除外集合の既定は:7543で空、:9630以降で全候補除外を補修する。新方式はまだ未実装。§1.343は出荷済みの[keymap仕様](keymap-spec.md)を参照する |
+| 入力再利用 | [keymap.rs:6621](../src/keymap.rs#L6621)は既存0 / Numpad0、[ring_shortcut.rs:1074](../src/ring_shortcut.rs#L1074)は既存ID。[ui_fullscreen.rs:30134](../src/ui_fullscreen.rs#L30134)のキー入口は音楽を除外する。新しい操作ownerを足す理由はない |
+| 表示寸法pxとDPI | [settings.rs:6759](../src/settings.rs#L6759)、[seek_strip_layout.rs:76](../src/video/seek_strip_layout.rs#L76)、[preferences/pages.rs:9440](../src/ui_dialogs/preferences/pages.rs#L9440)は100％時のpoint / px相当。[ui_fullscreen.rs:4207](../src/ui_fullscreen.rs#L4207)の固定間隔はpointへ直接使い、[egui/context.rs:451](../vendor/egui/src/context.rs#L451)でnative DPIとUI倍率が物理pxへ反映される。Q2の表示寸法に揃える推奨を維持する |
+| AI前原寸の接続 | [final_pipeline.rs:23](../src/ai/final_pipeline.rs#L23)の出力はAI前`source_size`と`used_upscale`を保持する。同ファイルと`displayed_image_transform.rs`はr4基準から差分なし。§4.3のAI前A / Oを使う契約と、全派生textureの入力対応を実装時に確認する条件を維持する |
+| PDFの固定原寸・需要 | [pdf_loader.rs:5010](../src/pdf_loader.rs#L5010)は4096pxのOriginal最低長辺、:5024はraster native cap、:5110以降はpage boxを1/1000 pointへ変換、:6559以降はheadroom / cap。[app.rs:72715](../src/app.rs#L72715)は再レンダのpage boxを捨て、:72729以降でraster寸法をsource_dimsへ採用し、:80936のgetterが画素寸法を返す。§4.3 / §5.2の固定A / Oと一方向の需要、結果採用後の収束回帰が引き続き必要 |
+| 連結の倍率 | [ui_fullscreen.rs:37636](../src/ui_fullscreen.rs#L37636)はunitごとのfit、:37784以降は毎frameの計算、:37828以降は可視枚数によるzoom増加。r4基準からこの経路の変更なし。§5.3の新方式だけ中央unit基準を保持する契約を維持する |
+| favoriteの既存owner | [settings.rs:4184](../src/settings.rs#L4184)のstateは既存8項目、:8616以降のoverlayと標準値保護を維持。[app.rs:83222](../src/app.rs#L83222)が行先投影、:83261が変更capture、:83285以降がtransition / seed / 適用。指定値の追加、欠落互換、共通値だけの転送は§7.1へ接続する |
+| 転送分類 | [settings_transfer.rs:338](../src/settings_transfer.rs#L338)は循環除外を転送し、現在の`all()`で最低1候補を検証する。新方式追加時は5方式へ追従させ、新設定を分類する。件数テストは実装時のベースに追加分を足して再計算する |
+
+r4基準からの`ui_fullscreen.rs`差分はseek stripのNoArt扱い、`pdf_loader.rs`差分は
+テスト用のPDF分析経路であり、ここで使う幾何・需要規則を変更していない。
+`settings.rs`の追加設定もfit循環・FavoriteViewStateの既存ownerを変更していない。
+出荷済みHUDの変更を本ラウンドで再評価・変更しない。
+
+**残る利用者回答の反映（2026-10-09）**: Q2は表示寸法pxのlogical point基準、Q4-aは
+幅80％・高さ80％の初期内接、Q4-bは自動fitだけAI前原寸の固定5.0倍上限へ決定した。
+§10.1へ記録し、未決質問節を削除した。初期設定・例・欠落default・snapshot / 回帰・
+実装時のmanual説明を両軸80％へ揃えた。片軸None / 両Noneの明示設定は引き続き有効。
+本節のv4.5.0後のコード照合と所有境界は維持する。
+独立設計レビュー承認・構造判定への合意は、通知されていないため記録しない。
+実装はレビュー合意後に着手し、detached §11は実際に触った境界を記録する。
+今回は文書・参照先・EOLだけを検証し、製品コード・保存データ・snapshotは変更しない。
