@@ -15445,6 +15445,93 @@ mod tests {
     }
 
     #[test]
+    fn remote_physical_folder_keeps_selected_audio_sidecar_when_its_extension_is_hidden() {
+        let guard = crate::settings_db::DataDirOverrideGuard::new();
+        assert!(
+            crate::settings_db::boot_settings_db(guard.path())
+                .db
+                .is_some()
+        );
+        let root = guard.path().join("favorite");
+        let album = root.join("album");
+        std::fs::create_dir_all(&album).unwrap();
+        std::fs::write(album.join("song.mp3"), b"audio").unwrap();
+        std::fs::write(album.join("song.jpg"), b"jpeg sidecar").unwrap();
+        std::fs::write(album.join("song.png"), b"png sidecar").unwrap();
+        let favorite = FavoriteEntry::new("test".to_owned(), root);
+        let mut settings = crate::settings::Settings {
+            favorites: vec![favorite.clone()],
+            sort_order: crate::settings::SortOrder::FileName,
+            skip_image_if_video_exists: true,
+            video_thumb_use_sidecar_image: true,
+            ..Default::default()
+        };
+        crate::settings_db::with_db_result(|db| db.save_full(&settings)).unwrap();
+        let engine = ContainerEngine::new_with_session(
+            settings.clone(),
+            super::super::session::SessionHandle::new(),
+        );
+        let request = FolderListRequest {
+            address: favorite_address(&favorite, "album"),
+        };
+        let FolderListResponse::Success(all_visible) = engine.folder_list(request.clone()) else {
+            panic!("all-visible audio folder listing failed");
+        };
+        assert_eq!(all_visible.entries.len(), 1);
+        let original_audio = &all_visible.entries[0];
+        assert_eq!(original_audio.name, "song.mp3");
+        assert_eq!(original_audio.kind, RemoteEntryKind::Audio);
+        assert_eq!(
+            original_audio.address,
+            favorite_address(&favorite, "album/song.mp3")
+        );
+        // The shipped name-ascending filter adopts its last same-stem candidate.
+        assert_eq!(
+            original_audio.thumbnail_address,
+            favorite_address(&favorite, "album/song.png")
+        );
+        assert_eq!(
+            all_visible.sort_state.selected,
+            super::super::sort_order_wire_value(crate::settings::SortOrder::FileName)
+        );
+        assert!(all_visible.sort_state.locked_reason.is_none());
+
+        settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("png".into());
+        crate::settings_db::with_db_result(|db| db.save_full(&settings)).unwrap();
+        let FolderListResponse::Success(png_hidden) = engine.folder_list(request) else {
+            panic!("PNG-hidden audio folder listing failed");
+        };
+        // Refresh the same production engine through its live settings snapshot:
+        // hiding an auxiliary candidate must not select the remaining JPEG.
+        assert!(
+            engine
+                .settings_for_listing()
+                .unwrap()
+                .file_type_visibility
+                .excluded_extensions
+                .contains("png")
+        );
+        assert_eq!(png_hidden.entries.len(), 1);
+        let audio = &png_hidden.entries[0];
+        assert_eq!(audio.kind, RemoteEntryKind::Audio);
+        assert_eq!(audio.name, original_audio.name);
+        assert_eq!(audio.address, original_audio.address);
+        assert_eq!(audio.thumbnail_address, original_audio.thumbnail_address);
+        assert_eq!(audio.mtime, original_audio.mtime);
+        assert_eq!(audio.size, original_audio.size);
+        assert!(
+            png_hidden
+                .entries
+                .iter()
+                .all(|entry| entry.kind != RemoteEntryKind::Image),
+            "same-stem sidecars must not remain as independent remote tiles"
+        );
+    }
+
+    #[test]
     fn remote_physical_folder_reuses_local_size_sort_order() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("favorite");

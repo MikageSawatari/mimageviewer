@@ -24,6 +24,10 @@ legacy規則が可視性を所有する。物理パスの通常／Windows verbat
 I/Oなしhelperで比較し、`archive_cache::is_under_cache_root`とcache対応表の照合で共有する。
 代表ページとRAW先読みはこのcache-root判定を使い、既存DBキーと公開addressは保持する。
 来歴と状態遷移の正本は [表示するファイル種類](file-type-visibility-plan.md)。
+動画・音声の補助画像は表示行とは独立した`AuxiliaryMediaCandidates`として既存走査で保持する。
+sourceの種類採否と派生動画判定後、producer既存のsort／走査順で採用し、画像種類の非表示で
+採用候補を変えない。候補metadataを既存signatureへ含め、追加I/Oやcontext ownerを作らない。
+
 
 検索索引の所有判定は `metadata_ownership`、metadata の構成変更は
 `metadata_reconfiguration`、名前索引の root 所有は `name_index_manager` に集約する。

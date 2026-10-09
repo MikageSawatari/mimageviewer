@@ -1130,3 +1130,33 @@ AV・既知similar-index flakeは今回再発せず、snapshot PNGは253枚す�
 masterの現ソース一致host＋公式CRT4本を実ファイル復元して再実行成功（389.9秒、VCRT runtime=4／PE=3）。
 source identityとCRT正本hashを照合し、APPDATA・runtime cacheはimportしていない。
 製品起動・Git index変更・commitは行わず、利用者のstage／commitと実機確認へ渡す。
+
+
+### 統合独立レビューP2: 補助画像の採用順（2026-10-09、b76c19e34後）
+
+レビューで、画像種類の除外後に可視候補を再採用し、保持済みの非表示候補を落とす経路が指摘された。
+表示投影とは独立した `AuxiliaryMediaCandidates` を既存の物理フォルダ走査から作り、
+動画・音声のsource採否だけを共通policyで判定する。画像は種類除外を適用せず補助入力として保持し、
+既存の派生動画判定後に、各producerの出荷済み候補順で一度だけ採用する。
+通常／Remote物理一覧は既存一覧sort、Smart／集約／サブ展開は既存走査順を維持する。
+表示行の同名除去は候補mapを書き換えず、非表示画像の更新も既存signatureで検出する。
+音声・動画自体が非表示ならその補助sourceを採用しない。Audioを表示しないサブ展開も既存契約を維持する。
+
+既存の一覧reload／worker成果物で完結するため、設定変更専用のlive再構築、待機状態、横断registry、
+追加I/Oは不要。表示可否の単一ownerは引き続きFileTypeVisibilityであり、補助画像は既存の例外を適用する。
+通常フォルダ、Smart、Rating workerを通る集約、Remote `folder_list` の実経路へ
+複数画像のうち採用候補だけを隠す回帰を追加する。通常／Remoteの名前昇順はPNG採用を固定し、
+Smart／集約の実workerはfilesystemの走査順を維持するためbaselineの採用候補を隠す。
+共通候補とSmartのproducerには固定したjpg→png／png→jpg順で採用PNG／JPGだけを隠す検査も置く。
+通常は名前降順・size昇降順と動画も検査し、
+サブ展開の動画、JSONが実在する派生動画の除外で元動画と補助画像が戻るケースも検査する。
+検証証跡は `target/B345-fix-verification.md`、引き継ぎ文は `target/B345-fix-msg.txt` に記録する。
+
+
+本修正の検証はfmt check・glyph lint・重点スイート・全lib（11,560成功／52除外、既定threads）・
+ui_snapshot 142・Remote-web 140成功／1除外・IPC 67・通常／portable core check・
+audit test 36と実auditが成功した。AV・既知similar-index flakeは再発せず、253枚のsnapshot PNGは
+hash不変で再生成画像はない。`build-dev.ps1 -PreserveRuntime` は272.8秒で成功し、
+VCRT PE gate（runtime=4／PE=3）も成功した。製品起動とGit index変更・commitは行っていない。
+補助候補・source採否・採用順・signatureの構造を独立Sol / xhighが読み取り専用でレビューし、
+追加P2以上の指摘はなかった。走査順依存のテストはbaseline比較と固定候補順検査に分け、再レビュー済み。

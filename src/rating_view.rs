@@ -1259,6 +1259,71 @@ mod tests {
     }
 
     #[test]
+    fn rating_worker_keeps_selected_sidecar_when_only_its_image_kind_is_hidden() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let audio = temp.path().join("song.mp3");
+        let png = audio.with_extension("png");
+        for path in [&audio, &audio.with_extension("jpg"), &png] {
+            std::fs::write(path, b"fixture").unwrap();
+        }
+        let db_path = temp.path().join("rating.db");
+        let db = crate::rating_db::RatingDb::open_at(&db_path).unwrap();
+        let key = crate::path_key::normalize_keep_drive(&audio);
+        let meta =
+            crate::rating_db::RatingMeta::new(RatingItemKind::Audio).with_source_path(&audio);
+        db.set_user_rating(&key, 3, Some(&meta)).unwrap();
+        drop(db);
+        let mut adopted: Option<PathBuf> = None;
+        for hide_adopted in [false, true] {
+            let mut settings = crate::settings::Settings::default();
+            settings.sort_order = crate::settings::SortOrder::FileName;
+            settings.skip_image_if_video_exists = true;
+            settings.video_thumb_use_sidecar_image = true;
+            if hide_adopted {
+                settings.file_type_visibility.excluded_extensions.insert(
+                    adopted
+                        .as_ref()
+                        .unwrap()
+                        .extension()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_owned(),
+                );
+            }
+            let result = prepare_rating_view(
+                db_path.clone(),
+                3,
+                RatingViewPrepareOptions {
+                    sort: RatingViewSort::default(),
+                    visibility: settings.file_type_visibility.clone(),
+                    include_epub: true,
+                    intent: RatingViewBuildIntent::Reorder,
+                    display_order: settings.grid_display_order.clone(),
+                    pin_db: None,
+                    folder_thumb_sort: settings.folder_thumb_sort,
+                    folder_thumb_depth: settings.folder_thumb_depth,
+                    edits: Default::default(),
+                    tags_db_path: None,
+                    sidecar_settings: settings.thumbnail_source_discovery_snapshot(),
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            let prepared = result.prepared.unwrap();
+            assert_eq!(prepared.items, vec![GridItem::Audio(audio.clone())]);
+            let selected = prepared.video_thumb_overrides.get(&key).unwrap();
+            if let Some(adopted) = &adopted {
+                assert_eq!(selected, adopted);
+            } else {
+                assert!([audio.with_extension("jpg"), png.clone()].contains(selected));
+                adopted = Some(selected.clone());
+            }
+        }
+    }
+
+    #[test]
     fn audio_sidecar_is_prepared_by_rating_worker_with_released_setting_off_preserved() {
         let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();

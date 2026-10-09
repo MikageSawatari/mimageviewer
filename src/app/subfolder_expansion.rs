@@ -823,7 +823,13 @@ fn scan_one_directory(
     });
     media.retain(|entry| entry.kind != super::folder_scan::ScanMediaKind::Audio);
     if options.skip_image_if_video_exists && options.video_thumb_use_sidecar_image {
-        for (video, image) in super::folder_scan::discover_scanned_video_sidecars(&media) {
+        for (video, image) in super::folder_scan::AuxiliaryMediaCandidates::capture(
+            &media,
+            &options.file_type_visibility,
+            &entry_file_names_ci,
+        )
+        .sidecars()
+        {
             if options.file_type_visibility.allows_physical_file(&video) {
                 result
                     .video_thumb_overrides
@@ -837,7 +843,7 @@ fn scan_one_directory(
             .allows_physical_file(&entry.path)
     });
     super::folder_scan::filter_upscaled_video_pairs_fast(&mut media, &entry_file_names_ci);
-    apply_duplicate_filters_to_media(&mut media, options, &mut result.video_thumb_overrides);
+    apply_duplicate_filters_to_media(&mut media, options);
     if options.image_folder_books
         && super::folder_scan::is_image_only_book_contents(
             has_book_container || has_visible_audio,
@@ -905,16 +911,9 @@ fn scan_one_directory(
 fn apply_duplicate_filters_to_media(
     media: &mut Vec<super::folder_scan::ScannedMediaEntry>,
     options: &SubfolderExpansionOptions,
-    video_thumb_overrides: &mut HashMap<String, PathBuf>,
 ) {
     if options.skip_image_if_video_exists {
-        let filtered = super::folder_scan::filter_video_image_duplicates(
-            media,
-            options.video_thumb_use_sidecar_image,
-        );
-        for (video, image) in filtered.sidecars {
-            video_thumb_overrides.insert(crate::path_key::normalize_keep_drive(&video), image);
-        }
+        super::folder_scan::filter_video_image_duplicates(media, false);
     }
     if options.skip_duplicate_images {
         super::folder_scan::filter_image_ext_duplicates(media, &options.image_ext_priority);
@@ -3215,6 +3214,33 @@ mod tests {
     }
 
     #[test]
+    fn subfolder_keeps_selected_video_sidecar_when_only_its_image_kind_is_hidden() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("movie.mp4");
+        for path in [
+            &source,
+            &source.with_extension("jpg"),
+            &source.with_extension("png"),
+        ] {
+            std::fs::write(path, b"fixture").unwrap();
+        }
+        let mut options = test_scan_options(false);
+        options.skip_image_if_video_exists = true;
+        let baseline = scan_test_root(temp.path(), options.clone());
+        let key = crate::path_key::normalize_keep_drive(&source);
+        let adopted = baseline.video_thumb_overrides.get(&key).unwrap();
+        assert!([source.with_extension("jpg"), source.with_extension("png")].contains(adopted));
+        options
+            .file_type_visibility
+            .excluded_extensions
+            .insert(adopted.extension().unwrap().to_str().unwrap().to_owned());
+        let hidden = scan_test_root(temp.path(), options);
+        assert_eq!(hidden.video_thumb_overrides, baseline.video_thumb_overrides);
+        assert_eq!(hidden.entries.len(), 1);
+        assert_eq!(hidden.entries[0].kind, SubfolderExpansionEntryKind::Video);
+    }
+
+    #[test]
     fn file_type_policy_keeps_hidden_image_as_video_sidecar() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("movie.jpg"), b"image").unwrap();
@@ -3962,16 +3988,15 @@ mod tests {
             image_ext_priority: vec!["jpg".into(), "png".into()],
             scan_filter: SubfolderExpansionScanFilter::default(),
         };
-        let mut overrides = HashMap::new();
-        apply_duplicate_filters_to_media(&mut media, &options, &mut overrides);
+        apply_duplicate_filters_to_media(&mut media, &options);
 
         assert_eq!(media.len(), 1);
         assert_eq!(media[0].path, a);
 
         let mut parent_a = vec![entry(a.clone(), 1, 10)];
         let mut parent_b = vec![entry(b.clone(), 2, 20)];
-        apply_duplicate_filters_to_media(&mut parent_a, &options, &mut overrides);
-        apply_duplicate_filters_to_media(&mut parent_b, &options, &mut overrides);
+        apply_duplicate_filters_to_media(&mut parent_a, &options);
+        apply_duplicate_filters_to_media(&mut parent_b, &options);
         assert_eq!(parent_a[0].path, a);
         assert_eq!(parent_b[0].path, b);
     }

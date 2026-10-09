@@ -5016,7 +5016,12 @@ fn normalize_smart_folder_candidates(
         .collect::<Vec<_>>();
     let preserved_sidecars =
         if options.skip_image_if_video_exists && options.video_thumb_use_sidecar_image {
-            super::folder_scan::discover_scanned_video_sidecars(&raw_media)
+            super::folder_scan::AuxiliaryMediaCandidates::capture(
+                &raw_media,
+                &options.file_type_visibility,
+                entry_file_names_ci,
+            )
+            .sidecars()
         } else {
             Vec::new()
         };
@@ -5054,14 +5059,14 @@ fn normalize_smart_folder_candidates(
         .map(|(video, image)| (crate::path_key::normalize_keep_drive(&video), image))
         .collect::<HashMap<_, _>>();
     if options.skip_image_if_video_exists {
-        let filtered = super::folder_scan::filter_video_image_duplicates(
-            &mut media,
-            options.video_thumb_use_sidecar_image,
-        );
-        for (video, image) in filtered.sidecars {
-            video_thumb_overrides.insert(crate::path_key::normalize_keep_drive(&video), image);
-        }
+        super::folder_scan::filter_video_image_duplicates(&mut media, false);
     }
+    let surviving_sources = media
+        .iter()
+        .filter(|entry| matches!(entry.kind, ScanMediaKind::Video | ScanMediaKind::Audio))
+        .map(|entry| crate::path_key::normalize_keep_drive(&entry.path))
+        .collect::<HashSet<_>>();
+    video_thumb_overrides.retain(|source, _| surviving_sources.contains(source));
     if options.skip_duplicate_images {
         super::folder_scan::filter_image_ext_duplicates(&mut media, &options.image_ext_priority);
     }
@@ -12209,6 +12214,94 @@ mod tests {
         assert!(names.contains("book.7z"));
         assert!(names.contains("inside.webp"));
         assert!(!names.contains("note.txt"));
+    }
+
+    #[test]
+    fn smart_candidates_keep_selected_sidecar_in_each_explicit_candidate_order() {
+        for extensions in [["jpg", "png"], ["png", "jpg"]] {
+            for hide_adopted in [false, true] {
+                let source = PathBuf::from("album/song.mp3");
+                let adopted = source.with_extension(extensions[1]);
+                let mut candidates = vec![SmartFolderCandidate {
+                    path: source.clone(),
+                    kind: SmartFolderEntryKind::Audio,
+                    mtime: 1,
+                    file_size: Some(5),
+                }];
+                candidates.extend(extensions.iter().map(|ext| SmartFolderCandidate {
+                    path: source.with_extension(ext),
+                    kind: SmartFolderEntryKind::Image,
+                    mtime: 1,
+                    file_size: Some(5),
+                }));
+                let mut options = unfiltered_scan_options();
+                options.skip_image_if_video_exists = true;
+                if hide_adopted {
+                    options
+                        .file_type_visibility
+                        .excluded_extensions
+                        .insert(extensions[1].into());
+                }
+                let sidecars =
+                    normalize_smart_folder_candidates(&mut candidates, &HashSet::new(), &options);
+                assert_eq!(
+                    sidecars.get(&crate::path_key::normalize_keep_drive(&source)),
+                    Some(&adopted)
+                );
+                assert_eq!(candidates.len(), 1);
+                assert_eq!(candidates[0].path, source);
+            }
+        }
+    }
+
+    #[test]
+    fn smart_folder_keeps_selected_sidecar_when_only_its_image_kind_is_hidden() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in [
+            "song.mp3",
+            "song.jpg",
+            "song.png",
+            "movie.mp4",
+            "movie.jpg",
+            "movie.png",
+        ] {
+            std::fs::write(temp.path().join(name), b"fixture").unwrap();
+        }
+        let mut definition = crate::settings::SmartFolderDefinition::new("media");
+        definition.rules.push(rule(
+            uuid::Uuid::new_v4(),
+            temp.path().to_path_buf(),
+            true,
+            false,
+            Default::default(),
+        ));
+        let mut options = unfiltered_scan_options();
+        options.skip_image_if_video_exists = true;
+        let baseline = run_test_scan(definition.clone(), options.clone());
+        for source_name in ["song.mp3", "movie.mp4"] {
+            let source = temp.path().join(source_name);
+            let adopted = baseline
+                .snapshot
+                .video_thumb_overrides
+                .get(&crate::path_key::normalize_keep_drive(&source))
+                .unwrap();
+            assert!([source.with_extension("jpg"), source.with_extension("png")].contains(adopted));
+            // read_dir order is intentionally preserved by this producer.
+            let mut hidden_options = options.clone();
+            hidden_options
+                .file_type_visibility
+                .excluded_extensions
+                .insert(adopted.extension().unwrap().to_str().unwrap().to_owned());
+            let hidden = run_test_scan(definition.clone(), hidden_options);
+            assert_eq!(
+                hidden.snapshot.video_thumb_overrides,
+                baseline.snapshot.video_thumb_overrides
+            );
+        }
+        assert_eq!(baseline.snapshot.entries.len(), 2);
+        assert!(baseline.snapshot.entries.iter().all(|entry| {
+            [temp.path().join("song.mp3"), temp.path().join("movie.mp4")].contains(&entry.path)
+        }));
     }
 
     #[test]

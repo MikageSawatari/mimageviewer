@@ -43,8 +43,7 @@ fn grid_item_keys(items: &[GridItem]) -> Vec<String> {
 
 fn image_scan(paths: &[PathBuf]) -> ScannedDir {
     ScannedDir {
-        auxiliary_sidecar_stamps: Default::default(),
-        video_thumb_overrides: Default::default(),
+        auxiliary_media: Default::default(),
         complete_audio_inventory: None,
         folders: Vec::new(),
         all_media: paths
