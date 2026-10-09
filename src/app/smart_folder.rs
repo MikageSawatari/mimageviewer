@@ -1337,6 +1337,7 @@ impl App {
         let load_tags = self.tags_db.is_some();
         let load_local_adjust = self.local_adjust_db.is_some();
         let resources = SmartFolderPrepareResources {
+            catalog_work: crate::catalog::CatalogWork::default(),
             membership_only: true,
             prepare_catalog: false,
             load_adjustments: self.adjustment_db.is_some(),
@@ -3869,6 +3870,7 @@ impl App {
             membership,
             None,
             SmartFolderPrepareResources {
+                catalog_work: crate::catalog::CatalogWork::default(),
                 membership_only: false,
                 prepare_catalog: true,
                 rating_write_overlay: self
@@ -5054,7 +5056,10 @@ fn scan_one_directory(
                 .then_with(|| a.definition_order.cmp(&b.definition_order))
         });
         let primary = matching_rules[0];
-        if kind == SmartFolderEntryKind::Video {
+        if matches!(
+            kind,
+            SmartFolderEntryKind::Video | SmartFolderEntryKind::Audio
+        ) {
             let video_key = crate::path_key::normalize_keep_drive(&path);
             if let Some(image) = directory_video_overrides.get(&video_key) {
                 video_thumb_overrides.insert(video_key, image.clone());
@@ -5713,6 +5718,7 @@ fn compare_smart_entries_for_request(
 
 #[derive(Clone, Default)]
 struct SmartFolderPrepareResources {
+    catalog_work: crate::catalog::CatalogWork,
     membership_only: bool,
     prepare_catalog: bool,
     load_adjustments: bool,
@@ -6611,10 +6617,10 @@ fn prepare_smart_folder(
     } else if !resources.prepare_catalog {
         None
     } else {
-        match crate::catalog::CatalogDb::open(
-            &crate::catalog::default_cache_dir(),
-            &smart_folder_synthetic_path(snapshot.definition.id),
-        ) {
+        match resources
+            .catalog_work
+            .open(&smart_folder_synthetic_path(snapshot.definition.id))
+        {
             Ok(db) => {
                 let db = Arc::new(db);
                 let mut entries = db.load_all().unwrap_or_else(|error| {
@@ -7672,6 +7678,7 @@ impl App {
             precounted_membership,
             reused_metadata,
             SmartFolderPrepareResources {
+                catalog_work: crate::catalog::CatalogWork::default(),
                 membership_only: false,
                 prepare_catalog: !is_sort_only,
                 rating_write_overlay: self
@@ -10850,22 +10857,22 @@ mod tests {
         app.requested.insert(video_index, false);
         let generation = app.items_generation;
         app.tx
-            .send(crate::thumb_loader::ThumbMsg {
-                idx: video_index,
-                image: Some(egui::ColorImage::from_rgba_unmultiplied(
+            .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                video_index,
+                Some(egui::ColorImage::from_rgba_unmultiplied(
                     [2, 2],
                     &[255u8; 16],
                 )),
-                origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
-                from_edit_preview: false,
-                edit_preview_adjustment: None,
-                source_dims: Some((2, 2)),
-                layout_dims: None,
-                canceled: false,
-                finalized: false,
-                input_seq: 0,
-                items_gen: generation,
-            })
+                crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+                false,
+                None,
+                Some((2, 2)),
+                None,
+                false,
+                false,
+                0,
+                generation,
+            ))
             .unwrap();
         app.write_user_ratings_shared(&[(keys[0].clone(), 4, None), (keys[2].clone(), 5, None)])
             .unwrap();

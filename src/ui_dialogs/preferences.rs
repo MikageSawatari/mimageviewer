@@ -16,6 +16,21 @@ use crate::ring_shortcut::{
 };
 use crate::settings::{Parallelism, Settings};
 
+#[doc(hidden)]
+pub fn draw_fullscreen_fit_cycle_settings_snapshot_fixture(ui: &mut egui::Ui) {
+    let mut settings = Settings::default();
+    settings.fullscreen_fit_cycle_excluded = vec!["Page".into(), "Width".into(), "Height".into()];
+    pages::draw_fullscreen_fit_cycle_settings(ui, &mut settings);
+}
+
+#[doc(hidden)]
+pub fn draw_grid_background_double_click_settings_snapshot_fixture(ui: &mut egui::Ui) {
+    let mut settings = Settings::default();
+    settings.grid_background_double_click_parent = true;
+    pages::draw_grid_background_double_click_setting(ui, &mut settings);
+}
+
+mod name_colors;
 mod pages;
 mod search_index;
 mod transfer;
@@ -23,6 +38,17 @@ use self::pages::*;
 use self::search_index::{PrefSearchEntry, search_preferences};
 use self::transfer::PreferencesTransferFeedback;
 pub(crate) use self::transfer::{PreferencesTransferAction, PreferencesTransferState};
+
+#[doc(hidden)]
+pub fn draw_details_name_color_settings_snapshot_fixture(ui: &mut egui::Ui) {
+    let mut settings = Settings::default();
+    settings.text_contrast = crate::os_theme::current_text_contrast(ui.ctx());
+    settings.details_name_colors.colors[0] = crate::details_name_colors::DetailsNameColor::Custom {
+        light: [168, 126, 0],
+        dark: [214, 186, 102],
+    };
+    name_colors::draw_settings(ui, &mut settings);
+}
 
 #[doc(hidden)]
 pub fn draw_preferences_transfer_settings_snapshot_fixture(ui: &mut egui::Ui, busy: bool) {
@@ -78,6 +104,7 @@ pub fn draw_file_organize_destinations_settings_snapshot_fixture(ui: &mut egui::
 #[doc(hidden)]
 pub fn draw_effetune_input_limit_snapshot_fixture(ui: &mut egui::Ui) {
     pages::draw_effetune_input_limit_settings(ui, &mut Settings::default());
+    pages::draw_effetune_auto_open_settings(ui, &mut Settings::default());
     pages::draw_effetune_minimized_settings(ui, &mut Settings::default());
 }
 
@@ -103,7 +130,12 @@ pub fn draw_video_thumbnail_indicator_settings_snapshot_fixture(ui: &mut egui::U
         video_thumbnail_indicator: crate::settings::VideoThumbnailIndicator::BottomLeftBadge,
         ..Settings::default()
     };
+    pages::draw_media_sidecar_thumbnail_settings(ui, &mut settings);
+    ui.add_space(8.0);
     pages::draw_video_thumbnail_indicator_settings(ui, &mut settings);
+    ui.add_space(8.0);
+    pages::draw_audio_thumbnail_indicator_settings(ui, &mut settings);
+    pages::draw_media_duration_settings(ui, &mut settings);
 }
 
 #[doc(hidden)]
@@ -2165,6 +2197,8 @@ impl App {
             || self.settings.thumb_show_resume_meter != settings.thumb_show_resume_meter;
         let books_root_changed = self.settings.books_root_path() != settings.books_root_path();
         self.settings = settings;
+        #[cfg(windows)]
+        self.publish_effetune_auto_setting();
         if old_raw_brightness != self.settings.raw_brightness {
             self.raw_brightness_changed();
         }
@@ -2552,7 +2586,9 @@ impl App {
                         font_ready
                             && lut_ready
                             && clipboard_folder_ready
-                            && organize_validation.is_ok(),
+                            && organize_validation.is_ok()
+                            && state.settings.details_name_colors.valid_standard_custom()
+                            && name_colors::hex_input_ready(ctx),
                         egui::Button::new("  OK  "),
                     );
                     #[cfg(all(windows, feature = "test-script"))]
@@ -2577,6 +2613,16 @@ impl App {
                         ui.small("保存先フォルダの操作完了後に適用できます。");
                     } else if let Err(error) = organize_validation {
                         ui.colored_label(ui.visuals().error_fg_color, error);
+                    } else if !name_colors::hex_input_ready(ctx) {
+                        ui.colored_label(
+                            ui.visuals().error_fg_color,
+                            "名前色: HEX は6桁で指定してください",
+                        );
+                    } else if !state.settings.details_name_colors.valid_standard_custom() {
+                        ui.colored_label(
+                            ui.visuals().error_fg_color,
+                            "名前色: 通常行は3:1以上の色を指定してください",
+                        );
                     }
                 });
             });
@@ -2594,6 +2640,7 @@ impl App {
 
         let mut close_requested_this_frame = false;
         if apply {
+            name_colors::clear_hex_editor(ctx);
             if let Some(mut state) = self.pref_state.take() {
                 let old_dup = (
                     self.settings.skip_zip_if_folder_exists,
@@ -2620,9 +2667,6 @@ impl App {
 
                 // 動画ループモード変更を検出してフルスクリーン中の player に反映する
                 let old_loop_mode = self.settings.video_loop_mode;
-                let old_video_seek_preview_size = self.settings.video_seek_preview_size;
-                let old_video_seek_preview_size_values =
-                    self.settings.video_seek_preview_size_values;
 
                 // AI バックエンド設定変更を検出してホットリロードトリガに使う
                 let old_ai_backend = self.settings.ai_backend.clone();
@@ -2850,26 +2894,8 @@ impl App {
                     self.show_feedback_toast("設定を保存できませんでした。再起動すると今回の変更が残らない可能性があります。".to_owned());
                 }
                 creative_lut_transaction.commit();
-
-                // Settings are global; every live native presenter receives the new display
-                // size through the same snapshot used at presenter creation.
                 #[cfg(windows)]
-                if old_video_seek_preview_size != self.settings.video_seek_preview_size
-                    || old_video_seek_preview_size_values
-                        != self.settings.video_seek_preview_size_values
-                {
-                    let state = self.native_bar_lock_state();
-                    for (_, entry) in &self.fs_cache {
-                        if let crate::fs_animation::FsCacheEntry::Video { player, .. } = entry {
-                            player.set_native_bar_lock_state(state);
-                        }
-                    }
-                }
-                #[cfg(not(windows))]
-                let _ = (
-                    old_video_seek_preview_size,
-                    old_video_seek_preview_size_values,
-                );
+                self.sync_all_native_chrome_policy();
 
                 if let Some(service) = &self.edit_preview_cache {
                     if !self.settings.edit_preview_cache_enabled {
@@ -2999,6 +3025,7 @@ impl App {
             self.show_preferences = false;
             self.show_preferences_discard_confirm = false;
         } else if cancel || !open {
+            name_colors::clear_hex_editor(ctx);
             close_requested_this_frame = true;
             self.request_close_preferences_dialog();
         }
@@ -3776,6 +3803,113 @@ pub(crate) fn draw_raw_settings_snapshot_fixture(ui: &mut egui::Ui) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn details_name_colors_preferences_ok_validation_save_and_cancel() {
+        use crate::details_name_colors::DetailsNameColor;
+        use egui_kittest::{
+            Harness,
+            kittest::{NodeT, Queryable},
+        };
+
+        let mut app = crate::app::setup_app_for_test();
+        let old = app.settings.details_name_colors.clone();
+        app.open_preferences_page(PreferencesPage::General);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 850.0))
+            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+        harness.run();
+        harness
+            .state_mut()
+            .pref_state
+            .as_mut()
+            .unwrap()
+            .settings
+            .details_name_colors
+            .colors[0] = DetailsNameColor::Custom {
+            light: [255, 255, 255],
+            dark: [214, 186, 102],
+        };
+        harness.run();
+        assert!(
+            harness
+                .get_by_label("  OK  ")
+                .accesskit_node()
+                .is_disabled()
+        );
+        assert_eq!(harness.state().settings.details_name_colors, old);
+        harness
+            .state_mut()
+            .pref_state
+            .as_mut()
+            .unwrap()
+            .settings
+            .details_name_colors
+            .colors[0] = DetailsNameColor::Custom {
+            light: [168, 126, 0],
+            dark: [214, 186, 102],
+        };
+        harness
+            .state_mut()
+            .pref_state
+            .as_mut()
+            .unwrap()
+            .settings
+            .details_name_colors
+            .enabled = false;
+        harness
+            .state_mut()
+            .pref_state
+            .as_mut()
+            .unwrap()
+            .settings
+            .text_contrast = crate::settings::TextContrast::Strong;
+        let expected = harness
+            .state()
+            .pref_state
+            .as_ref()
+            .unwrap()
+            .settings
+            .details_name_colors
+            .clone();
+        harness.run();
+        // The accepted yellow has hover contrast <3, which must not block OK.
+        assert!(
+            !harness
+                .get_by_label("  OK  ")
+                .accesskit_node()
+                .is_disabled()
+        );
+        harness.get_by_label("  OK  ").click();
+        harness.run();
+        assert!(!harness.state().show_preferences);
+        assert_eq!(harness.state().settings.details_name_colors, expected);
+        let loaded = crate::settings::Settings::load();
+        assert_eq!(loaded.details_name_colors, expected);
+        assert_eq!(loaded.text_contrast, crate::settings::TextContrast::Strong);
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::General);
+        harness.run();
+        harness
+            .state_mut()
+            .pref_state
+            .as_mut()
+            .unwrap()
+            .settings
+            .details_name_colors = Default::default();
+        harness.run();
+        harness.get_by_label("キャンセル").click();
+        harness.run();
+        harness.get_by_label("破棄して閉じる").click();
+        harness.run();
+        assert!(!harness.state().show_preferences);
+        assert_eq!(harness.state().settings.details_name_colors, expected);
+        assert_eq!(
+            crate::settings::Settings::load().details_name_colors,
+            expected
+        );
+    }
 
     #[test]
     fn raw_review_preferences_ok_saves_reloads_and_applies_executor_and_source_change() {
@@ -5740,6 +5874,46 @@ mod tests {
     }
 
     #[test]
+    fn shared_sidecar_checkbox_lives_on_thumbnail_page_and_edits_one_setting() {
+        use egui_kittest::{Harness, kittest::Queryable};
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let mut state = preferences_state_for_test(&Settings::default());
+        state.selected = PreferencesPage::Thumbnail;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(600.0, 2400.0))
+            .build_state(
+                |ctx, state| {
+                    egui::CentralPanel::default().show(ctx, |ui| draw_page(ui, state, false));
+                },
+                state,
+            );
+        harness.run();
+        let label = "同名の画像をサムネイルに使う（動画・音声）";
+        assert!(
+            harness.query_by_label(label).is_some(),
+            "shared setting must be on the Thumbnail page"
+        );
+        assert_eq!(preference_category(PreferencesPage::Thumbnail).0, "表示");
+        harness.get_by_label(label).click();
+        harness.run();
+        assert!(!harness.state().settings.video_thumb_use_sidecar_image);
+        assert!(harness.state().settings.skip_image_if_video_exists);
+        harness.state_mut().selected = PreferencesPage::Video;
+        harness.run();
+        assert!(
+            harness.query_by_label(label).is_none(),
+            "shared setting must have one UI location"
+        );
+        harness.state_mut().selected = PreferencesPage::Thumbnail;
+        harness.run();
+        assert!(!harness.state().settings.video_thumb_use_sidecar_image);
+        harness.get_by_label(label).click();
+        harness.run();
+        assert!(harness.state().settings.video_thumb_use_sidecar_image);
+        assert!(harness.state().settings.skip_image_if_video_exists);
+    }
+
+    #[test]
     fn raw_controls_only_appear_on_dedicated_page() {
         use egui_kittest::{Harness, kittest::Queryable};
         let mut state = preferences_state_for_test(&Settings::default());
@@ -6109,6 +6283,85 @@ mod tests {
             !app.remote_clockless_audio_processing(1.0)
                 .effetune_pre_limiter_enabled()
         );
+    }
+
+    #[test]
+    #[cfg(all(windows, not(feature = "portable")))]
+    fn effetune_auto_open_preferences_cancel_ok_save_reload() {
+        use egui_kittest::{Harness, kittest::Queryable};
+        let mut app = crate::app::setup_app_for_test();
+        assert!(!app.settings.effetune_auto_open_on_video);
+        app.open_preferences_request(PreferencesOpenRequest::anchored(
+            PreferencesPage::Video,
+            "video/effetune-auto-open",
+        ));
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 850.0))
+            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+        for cancel in [true, false] {
+            if !harness.state().show_preferences {
+                harness
+                    .state_mut()
+                    .open_preferences_request(PreferencesOpenRequest::anchored(
+                        PreferencesPage::Video,
+                        "video/effetune-auto-open",
+                    ));
+            }
+            harness.run_steps(5);
+            harness.state_mut().pref_state.as_mut().unwrap().highlight = None;
+            harness.run();
+            let before = harness.state().effetune.auto_reader().unwrap().snapshot();
+            harness
+                .get_by_label("起動後の最初の動画再生で音響調整の窓を自動で開く")
+                .click();
+            harness.run();
+            assert!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .effetune_auto_open_on_video
+            );
+            assert!(!harness.state().settings.effetune_auto_open_on_video);
+            assert_eq!(
+                harness.state().effetune.auto_reader().unwrap().snapshot(),
+                before
+            );
+            harness
+                .get_by_label(if cancel { "キャンセル" } else { "  OK  " })
+                .click();
+            harness.run();
+            if cancel {
+                assert!(harness.state().show_preferences_discard_confirm);
+                assert_eq!(
+                    harness.state().effetune.auto_reader().unwrap().snapshot(),
+                    before
+                );
+                harness.get_by_label("破棄して閉じる").click();
+                harness.run();
+            }
+            assert!(!harness.state().show_preferences);
+            assert_eq!(
+                harness.state().settings.effetune_auto_open_on_video,
+                !cancel
+            );
+            let after = harness.state().effetune.auto_reader().unwrap().snapshot();
+            if cancel {
+                assert_eq!(after, before);
+            } else {
+                assert_ne!(after.revision, before.revision);
+                assert!(Settings::load().effetune_auto_open_on_video);
+            }
+        }
+        let mut disabled = harness.state().settings.clone();
+        disabled.effetune_auto_open_on_video = false;
+        let before = harness.state().effetune.auto_reader().unwrap().snapshot();
+        harness.state_mut().install_preferences_settings(disabled);
+        let after = harness.state().effetune.auto_reader().unwrap().snapshot();
+        assert!(!after.allowed);
+        assert_ne!(after.revision, before.revision);
     }
 
     #[test]

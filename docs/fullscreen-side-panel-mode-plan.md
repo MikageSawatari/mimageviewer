@@ -409,6 +409,13 @@ transient とする。`Settings.fullscreen_click_info_open` は未リリース�
 [video-architecture.md](video-architecture.md) の右パネルの節を参照。鍵の形は静止画・動画の
 固定バーと同じベクターを使い、面ごとに描き直さない。
 
+### §6.6追補: F11中の固定表示抑制 (§1.344、利用者決定2026-10-08)
+
+右lockは既存context所有のまま、予約・可視性・×のlock禁止条件だけを実効値へ投影する。
+鍵表示・toggleはraw。明示closeはopen / hoverと該当pickerを閉じ、raw lockを解除しない。
+明示openは抑制開始時にresetせず、raw lock ONでは対象変更後も保持する。音楽の右panelも同じ契約。
+通常Hoverだけの表示へ新たな×は追加しない。詳細は[設計](fullscreen-locked-chrome-suppression-plan.md) §5.1・Q4。
+
 ## 7. 手動実機検証チェックリスト (実施状況未確認)
 
 当時の検証計画では `.\scripts\build-release.ps1 -SkipVst3Bridge` で検証バイナリを

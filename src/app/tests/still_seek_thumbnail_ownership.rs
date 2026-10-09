@@ -225,19 +225,20 @@ fn last_owner_prunes_queued_material_but_keeps_popped_request_until_worker_resul
         });
     let input_seq = app.input_seq;
     let items_generation = app.items_generation;
-    app.texture_backlog.push(crate::thumb_loader::ThumbMsg {
-        idx: 2,
-        image: Some(egui::ColorImage::filled([1, 1], egui::Color32::WHITE)),
-        origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
-        from_edit_preview: false,
-        edit_preview_adjustment: None,
-        source_dims: Some((1, 1)),
-        layout_dims: None,
-        canceled: false,
-        finalized: false,
-        input_seq,
-        items_gen: items_generation,
-    });
+    app.texture_backlog
+        .push(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+            2,
+            Some(egui::ColorImage::filled([1, 1], egui::Color32::WHITE)),
+            crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+            false,
+            None,
+            Some((1, 1)),
+            None,
+            false,
+            false,
+            input_seq,
+            items_generation,
+        ));
     app.pending_finalize.insert(3);
 
     let item_count = app.items.len();
@@ -273,21 +274,21 @@ fn last_owner_prunes_queued_material_but_keeps_popped_request_until_worker_resul
     );
 
     app.tx
-        .send(crate::thumb_loader::ThumbMsg {
-            idx: 1,
-            image: None,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+            1,
+            None,
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 320,
             },
-            from_edit_preview: false,
-            edit_preview_adjustment: None,
-            source_dims: None,
-            layout_dims: None,
-            canceled: true,
-            finalized: false,
-            input_seq: app.input_seq,
-            items_gen: app.items_generation,
-        })
+            false,
+            None,
+            None,
+            None,
+            true,
+            false,
+            app.input_seq,
+            app.items_generation,
+        ))
         .unwrap();
     app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::PassthroughRendition);
     assert!(!app.requested.contains_key(&1));
@@ -311,57 +312,57 @@ fn finalized_first_and_error_results_preserve_existing_worker_lifecycle() {
     app.requested.extend([(0, false), (1, false)]);
 
     app.tx
-        .send(crate::thumb_loader::ThumbMsg {
-            idx: 0,
-            image: None,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+            0,
+            None,
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 320,
             },
-            from_edit_preview: false,
-            edit_preview_adjustment: None,
-            source_dims: None,
-            layout_dims: None,
-            canceled: false,
-            finalized: true,
-            input_seq: app.input_seq,
-            items_gen: app.items_generation,
-        })
+            false,
+            None,
+            None,
+            None,
+            false,
+            true,
+            app.input_seq,
+            app.items_generation,
+        ))
         .unwrap();
     app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::PassthroughRendition);
     assert!(app.requested.contains_key(&0));
     assert!(app.pending_finalize.contains(&0));
 
     app.tx
-        .send(crate::thumb_loader::ThumbMsg {
-            idx: 0,
-            image: Some(egui::ColorImage::filled([1, 1], egui::Color32::WHITE)),
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+            0,
+            Some(egui::ColorImage::filled([1, 1], egui::Color32::WHITE)),
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 320,
             },
-            from_edit_preview: false,
-            edit_preview_adjustment: None,
-            source_dims: Some((1, 1)),
-            layout_dims: None,
-            canceled: false,
-            finalized: false,
-            input_seq: app.input_seq,
-            items_gen: app.items_generation,
-        })
+            false,
+            None,
+            Some((1, 1)),
+            None,
+            false,
+            false,
+            app.input_seq,
+            app.items_generation,
+        ))
         .unwrap();
     app.tx
-        .send(crate::thumb_loader::ThumbMsg {
-            idx: 1,
-            image: None,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-            from_edit_preview: false,
-            edit_preview_adjustment: None,
-            source_dims: None,
-            layout_dims: None,
-            canceled: false,
-            finalized: false,
-            input_seq: app.input_seq,
-            items_gen: app.items_generation,
-        })
+        .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+            1,
+            None,
+            crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+            false,
+            None,
+            None,
+            None,
+            false,
+            false,
+            app.input_seq,
+            app.items_generation,
+        ))
         .unwrap();
     app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::PassthroughRendition);
 
@@ -416,21 +417,21 @@ fn bookmark_panel_owner_survives_poll_then_projection_without_a_second_decode() 
     app.reload_queue.as_ref().unwrap().0.lock().unwrap().clear();
 
     app.tx
-        .send(crate::thumb_loader::ThumbMsg {
-            idx: 3,
-            image: Some(egui::ColorImage::filled([2, 2], egui::Color32::WHITE)),
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+            3,
+            Some(egui::ColorImage::filled([2, 2], egui::Color32::WHITE)),
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 320,
             },
-            from_edit_preview: false,
-            edit_preview_adjustment: None,
-            source_dims: Some((2, 2)),
-            layout_dims: None,
-            canceled: false,
-            finalized: false,
-            input_seq: app.input_seq,
-            items_gen: app.items_generation,
-        })
+            false,
+            None,
+            Some((2, 2)),
+            None,
+            false,
+            false,
+            app.input_seq,
+            app.items_generation,
+        ))
         .unwrap();
     app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::PassthroughRendition);
     app.update_keep_range_and_requests(&ctx, std::time::Instant::now());
@@ -452,21 +453,21 @@ fn bookmark_panel_owner_survives_poll_then_projection_without_a_second_decode() 
     );
 
     app.tx
-        .send(crate::thumb_loader::ThumbMsg {
-            idx: 3,
-            image: None,
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+            3,
+            None,
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 320,
             },
-            from_edit_preview: false,
-            edit_preview_adjustment: None,
-            source_dims: Some((2, 2)),
-            layout_dims: None,
-            canceled: false,
-            finalized: true,
-            input_seq: app.input_seq,
-            items_gen: app.items_generation,
-        })
+            false,
+            None,
+            Some((2, 2)),
+            None,
+            false,
+            true,
+            app.input_seq,
+            app.items_generation,
+        ))
         .unwrap();
     app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::PassthroughRendition);
     app.update_keep_range_and_requests(&ctx, std::time::Instant::now());
@@ -586,21 +587,21 @@ fn stale_generation_result_cannot_restore_a_released_bookmark_owner() {
     app.reconcile_details_thumbnail_keep_owners();
 
     app.tx
-        .send(crate::thumb_loader::ThumbMsg {
-            idx: 3,
-            image: Some(egui::ColorImage::filled([2, 2], egui::Color32::WHITE)),
-            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+        .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+            3,
+            Some(egui::ColorImage::filled([2, 2], egui::Color32::WHITE)),
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 320,
             },
-            from_edit_preview: false,
-            edit_preview_adjustment: None,
-            source_dims: Some((2, 2)),
-            layout_dims: None,
-            canceled: false,
-            finalized: false,
-            input_seq: app.input_seq,
-            items_gen: old_generation,
-        })
+            false,
+            None,
+            Some((2, 2)),
+            None,
+            false,
+            false,
+            app.input_seq,
+            old_generation,
+        ))
         .unwrap();
     app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::PassthroughRendition);
 
@@ -727,4 +728,94 @@ fn bookmark_owner_for_same_index_is_scoped_by_context_and_container() {
         ));
     })
     .expect("detached bookmark context remains available");
+}
+
+#[test]
+fn audio_no_art_is_terminal_across_grid_details_hover_and_stale_completions() {
+    let ctx = egui::Context::default();
+    let mut app = setup_thumbnail_app(1);
+    app.items[0] = GridItem::Audio(PathBuf::from("C:/section-1347/song.mp3"));
+    app.image_metas[0] = None;
+    app.keep_set.insert(0);
+    app.keep_range = (0, 1);
+    app.requested.insert(0, false);
+    app.tx
+        .send(crate::thumb_loader::ThumbMsg {
+            idx: 0,
+            input_seq: app.input_seq,
+            items_gen: app.items_generation,
+            payload: crate::thumb_loader::ThumbMsgPayload::NoArt,
+        })
+        .unwrap();
+    app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+    assert!(matches!(app.thumbnails[0], ThumbnailState::NoArt));
+    assert!(!app.requested.contains_key(&0));
+    assert!(!app.pending_finalize.contains(&0));
+    for _ in 0..3 {
+        app.set_details_hover_thumbnail_idx(Some(0));
+        app.set_details_hover_thumbnail_idx(None);
+    }
+    assert!(
+        app.reload_queue
+            .as_ref()
+            .unwrap()
+            .0
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        app.heavy_io_queue
+            .as_ref()
+            .unwrap()
+            .0
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+
+    app.thumbnails[0] = loaded_thumbnail(&ctx, "audio-current-generation");
+    app.tx
+        .send(crate::thumb_loader::ThumbMsg {
+            idx: 0,
+            input_seq: app.input_seq,
+            items_gen: app.items_generation.wrapping_sub(1),
+            payload: crate::thumb_loader::ThumbMsgPayload::NoArt,
+        })
+        .unwrap();
+    app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+    assert!(
+        matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }),
+        "late absence belongs only to its old list generation"
+    );
+}
+
+#[test]
+fn audio_art_dimensions_participate_in_auto_aspect_and_no_art_settles_the_denominator() {
+    let ctx = egui::Context::default();
+    let mut app = setup_thumbnail_app(2);
+    app.settings.thumb_aspect_auto = true;
+    app.items = vec![
+        GridItem::Audio(PathBuf::from("C:/section-1347/art.mp3")),
+        GridItem::Audio(PathBuf::from("C:/section-1347/empty.flac")),
+    ];
+    let mut loaded = loaded_thumbnail(&ctx, "audio-aspect-source-dimensions");
+    if let ThumbnailState::Loaded { source_dims, .. } = &mut loaded {
+        *source_dims = Some((1600, 900));
+    }
+    app.thumbnails = vec![loaded, ThumbnailState::NoArt];
+    app.rebuild_auto_aspect_samples_from_loaded();
+    assert_eq!(app.auto_aspect.samples.get(&0), Some(&(900.0 / 1600.0)));
+    assert!(!app.auto_aspect.samples.contains_key(&1));
+    assert_eq!(app.auto_aspect_eligible_total(), 1);
+    app.thumbnails = vec![ThumbnailState::NoArt, ThumbnailState::NoArt];
+    app.auto_aspect = Default::default();
+    let expected = app.effective_thumb_aspect();
+    app.maybe_apply_auto_aspect(true);
+    assert_eq!(app.auto_aspect_eligible_total(), 0);
+    assert_eq!(
+        app.auto_aspect.current,
+        Some(expected),
+        "absence is a settled result, not an unbounded wait for dimensions"
+    );
 }

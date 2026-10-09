@@ -103,6 +103,9 @@ pub(super) enum FirstDisplayAction {
 
 pub(crate) struct SidecarLoadContinuation {
     pub(super) navigation_after_hydration: Option<super::MainListAfterHydration>,
+    /// Accepted folder maintenance travels with this continuation to its new worker queue.
+    /// Dropping a superseded continuation also drops the work and its catalog admission.
+    pub(super) audio_art_prune: Option<crate::thumb_loader::LoadRequest>,
     pub(super) first_display_action: FirstDisplayAction,
     pub(super) restore_intent: super::StartupListIntent,
     /// Initial geometry seed captured from the accepted list's session position.
@@ -762,6 +765,7 @@ impl App {
                 continuation: ContinuationOwner::Live(SidecarLoadContinuation {
                     first_display_action: FirstDisplayAction::None,
                     navigation_after_hydration: None,
+                    audio_art_prune: None,
                     auto_aspect_seed: None,
                     source_path: folder.clone(),
                     source_is_directory: true,
@@ -2785,6 +2789,7 @@ mod tests {
         let continuation = SidecarLoadContinuation {
             first_display_action: FirstDisplayAction::None,
             navigation_after_hydration: None,
+            audio_art_prune: None,
             auto_aspect_seed: None,
             source_path: folder.clone(),
             source_is_directory: true,
@@ -2873,6 +2878,7 @@ mod tests {
                 SidecarLoadContinuation {
                     first_display_action: FirstDisplayAction::None,
                     navigation_after_hydration: None,
+                    audio_art_prune: None,
                     auto_aspect_seed: None,
                     source_path: folder.clone(),
                     source_is_directory: true,
@@ -3388,6 +3394,7 @@ mod tests {
         let mut owner = ContinuationOwner::Live(SidecarLoadContinuation {
             first_display_action: FirstDisplayAction::None,
             navigation_after_hydration: None,
+            audio_art_prune: None,
             auto_aspect_seed: None,
             source_path: PathBuf::from("C:/book"),
             source_is_directory: true,

@@ -55,7 +55,7 @@ const REMOTE_LISTING_SETTINGS_SQL: &str = r#"SELECT key, value FROM settings_kv 
     'sort_order', 'rating_sort_unrated_position', 'show_hidden_files', 'grid_display_order',
     'archive_file_handling', 'archive_convert_without_dialog', 'epub_file_handling',
     'skip_zip_if_folder_exists', 'skip_archive_if_zip_exists', 'skip_epub_if_pdf_exists',
-    'skip_image_if_video_exists', 'video_thumb_use_sidecar_image',
+    'skip_image_if_video_exists', 'video_thumb_use_sidecar_image', 'audio_thumbnail_indicator',
     'skip_duplicate_images', 'image_ext_priority', 'book_root',
     'auto_fullscreen_zip_pdf', 'auto_fullscreen_image_folders',
     'detached_viewer_open_images_in_window', 'thumb_aspect', 'thumb_aspect_auto'
@@ -305,6 +305,7 @@ pub(crate) struct RemoteListingSettings {
     skip_epub_if_pdf_exists: bool,
     skip_image_if_video_exists: bool,
     video_thumb_use_sidecar_image: bool,
+    audio_thumbnail_indicator: crate::settings::AudioThumbnailIndicator,
     skip_duplicate_images: bool,
     image_ext_priority: Vec<String>,
     book_root: Option<PathBuf>,
@@ -366,6 +367,7 @@ impl RemoteListingSettings {
             skip_epub_if_pdf_exists: settings.skip_epub_if_pdf_exists,
             skip_image_if_video_exists: settings.skip_image_if_video_exists,
             video_thumb_use_sidecar_image: settings.video_thumb_use_sidecar_image,
+            audio_thumbnail_indicator: settings.audio_thumbnail_indicator.normalized(),
             skip_duplicate_images: settings.skip_duplicate_images,
             image_ext_priority: settings.image_ext_priority.clone(),
             book_root: settings.book_root.clone(),
@@ -390,6 +392,7 @@ impl RemoteListingSettings {
         settings.skip_epub_if_pdf_exists = self.skip_epub_if_pdf_exists;
         settings.skip_image_if_video_exists = self.skip_image_if_video_exists;
         settings.video_thumb_use_sidecar_image = self.video_thumb_use_sidecar_image;
+        settings.audio_thumbnail_indicator = self.audio_thumbnail_indicator.normalized();
         settings.skip_duplicate_images = self.skip_duplicate_images;
         settings.image_ext_priority = self.image_ext_priority;
         settings.book_root = self.book_root;
@@ -853,6 +856,7 @@ impl SettingsDb {
             apply_remote_listing_setting(&mut settings, &key, &raw)?;
         }
         crate::settings::normalize_image_ext_priority(&mut settings.image_ext_priority);
+        settings.audio_thumbnail_indicator = settings.audio_thumbnail_indicator.normalized();
         Ok(settings)
     }
 
@@ -3132,6 +3136,7 @@ fn apply_remote_listing_setting(
         "skip_epub_if_pdf_exists" => assign!(skip_epub_if_pdf_exists),
         "skip_image_if_video_exists" => assign!(skip_image_if_video_exists),
         "video_thumb_use_sidecar_image" => assign!(video_thumb_use_sidecar_image),
+        "audio_thumbnail_indicator" => assign!(audio_thumbnail_indicator),
         "skip_duplicate_images" => assign!(skip_duplicate_images),
         "image_ext_priority" => assign!(image_ext_priority),
         "book_root" => assign!(book_root),
@@ -4662,6 +4667,42 @@ mod tests {
     }
 
     #[test]
+    fn effetune_auto_open_default_missing_blob_and_db_roundtrip() {
+        assert!(!Settings::default().effetune_auto_open_on_video);
+        let mut blob = serde_json::to_value(Settings::default()).unwrap();
+        blob.as_object_mut()
+            .unwrap()
+            .remove("effetune_auto_open_on_video");
+        let old: Settings = serde_json::from_value(blob).unwrap();
+        assert!(!old.effetune_auto_open_on_video);
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        for enabled in [true, false] {
+            let settings = Settings {
+                effetune_auto_open_on_video: enabled,
+                effetune_keep_visible_when_minimized: true,
+                ..Settings::default()
+            };
+            db.save_full(&settings).unwrap();
+            let loaded = db.load_into_settings().unwrap();
+            assert_eq!(loaded.effetune_auto_open_on_video, enabled);
+            assert!(loaded.effetune_keep_visible_when_minimized);
+        }
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'effetune_auto_open_on_video'",
+                [],
+            )
+            .unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert!(!loaded.effetune_auto_open_on_video);
+        assert!(loaded.effetune_keep_visible_when_minimized);
+    }
+
+    #[test]
     fn twenty_grid_columns_roundtrip_without_changing_toolbar_choices() {
         let dir = TempDir::new().unwrap();
         let db = SettingsDb::create_new(dir.path()).unwrap();
@@ -5828,6 +5869,48 @@ mod tests {
     }
 
     #[test]
+    fn audio_thumbnail_indicator_roundtrips_and_normalizes_live_unknown() {
+        use crate::settings::AudioThumbnailIndicator;
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let mut settings = Settings::default();
+        for &indicator in AudioThumbnailIndicator::all() {
+            settings.audio_thumbnail_indicator = indicator;
+            db.save_full(&settings).unwrap();
+            assert_eq!(
+                db.load_into_settings().unwrap().audio_thumbnail_indicator,
+                indicator
+            );
+        }
+        settings.audio_thumbnail_indicator = AudioThumbnailIndicator::Unknown;
+        db.save_full(&settings).unwrap();
+        let mut snapshot = Settings::default();
+        db.load_remote_listing_settings(&snapshot)
+            .unwrap()
+            .apply_to(&mut snapshot);
+        assert_eq!(
+            snapshot.audio_thumbnail_indicator,
+            AudioThumbnailIndicator::MusicNoteIcon
+        );
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'audio_thumbnail_indicator'",
+                [],
+            )
+            .unwrap();
+        snapshot.audio_thumbnail_indicator = AudioThumbnailIndicator::MusicNoteIcon;
+        db.load_remote_listing_settings(&snapshot)
+            .unwrap()
+            .apply_to(&mut snapshot);
+        assert_eq!(
+            snapshot.audio_thumbnail_indicator,
+            AudioThumbnailIndicator::MusicNoteIcon
+        );
+    }
+
+    #[test]
     fn remote_listing_settings_overlay_reads_every_live_field_only() {
         use crate::settings::{
             ArchiveFileHandling, GridDisplayOrder, GridItemDisplayKind, SortOrder, ThumbAspect,
@@ -5852,6 +5935,7 @@ mod tests {
         live.skip_epub_if_pdf_exists = false;
         live.skip_image_if_video_exists = false;
         live.video_thumb_use_sidecar_image = false;
+        live.audio_thumbnail_indicator = crate::settings::AudioThumbnailIndicator::Hidden;
         live.skip_duplicate_images = false;
         live.image_ext_priority = vec!["avif".to_owned(), "png".to_owned()];
         live.book_root = Some(PathBuf::from(r"D:\Books"));
@@ -7262,6 +7346,51 @@ mod tests {
             crate::settings::apply_load_time_migrations(&mut loaded);
             assert_eq!(loaded.facet_name_filter_width, width);
         }
+    }
+
+    #[test]
+    fn chrome_suppression_settings_kv_roundtrip_and_missing_released_key_keep_raw_locks() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let mut settings = Settings::default();
+        settings.fullscreen_top_bar_locked = true;
+        settings.set_still_bottom_lock(crate::settings::BottomBarLock::BarAndStrip);
+        settings.video_top_bar_locked = true;
+        settings.set_video_bottom_lock(crate::settings::BottomBarLock::BarAndStrip);
+        settings.fullscreen_chrome_suppression = crate::settings::FullscreenChromeSuppression {
+            top: true,
+            bottom: true,
+            info: true,
+            navigator: true,
+        };
+        db.save_full(&settings).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert_eq!(
+            loaded.fullscreen_chrome_suppression,
+            settings.fullscreen_chrome_suppression
+        );
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'fullscreen_chrome_suppression'",
+                [],
+            )
+            .unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert_eq!(
+            loaded.fullscreen_chrome_suppression,
+            crate::settings::FullscreenChromeSuppression::default()
+        );
+        assert!(loaded.fullscreen_top_bar_locked && loaded.video_top_bar_locked);
+        assert_eq!(
+            loaded.still_bottom_lock(),
+            crate::settings::BottomBarLock::BarAndStrip
+        );
+        assert_eq!(
+            loaded.video_bottom_lock(),
+            crate::settings::BottomBarLock::BarAndStrip
+        );
     }
 
     #[test]

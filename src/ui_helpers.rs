@@ -13,6 +13,210 @@ use eframe::egui;
 
 use crate::grid_item::GridItem;
 
+/// The actual drawing destination, never a saved preference or requested placement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewerChromeSurface {
+    MainEmbedded,
+    Fullscreen,
+    Detached {
+        window_id: u64,
+        borderless_applied: bool,
+    },
+}
+
+impl ViewerChromeSurface {
+    pub fn is_f11_fullscreen(self) -> bool {
+        matches!(
+            self,
+            Self::Fullscreen
+                | Self::Detached {
+                    borderless_applied: true,
+                    ..
+                }
+        )
+    }
+}
+
+/// A read-only projection: the source locks remain owned by settings/the viewer context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolvedViewerChrome {
+    pub top_locked: bool,
+    pub bottom_lock: crate::settings::BottomBarLock,
+    pub info_locked: bool,
+    pub navigator_fixed: bool,
+}
+
+impl ResolvedViewerChrome {
+    pub fn resolve(
+        surface: ViewerChromeSurface,
+        targets: crate::settings::FullscreenChromeSuppression,
+        top_locked: bool,
+        bottom_lock: crate::settings::BottomBarLock,
+        info_locked: bool,
+        navigator_fixed: bool,
+    ) -> Self {
+        let fullscreen = surface.is_f11_fullscreen();
+        Self {
+            top_locked: top_locked && !(fullscreen && targets.top),
+            bottom_lock: if fullscreen && targets.bottom {
+                crate::settings::BottomBarLock::None
+            } else {
+                bottom_lock
+            },
+            info_locked: info_locked && !(fullscreen && targets.info),
+            navigator_fixed: navigator_fixed && !(fullscreen && targets.navigator),
+        }
+    }
+}
+
+/// The glyph and action still describe the saved lock; only the explanation is contextual.
+pub fn chrome_lock_hint(hint: &str, suppressed: bool) -> String {
+    if suppressed {
+        format!("{hint}\n全画面中は固定設定を保持して自動表示にします")
+    } else {
+        hint.to_owned()
+    }
+}
+
+pub const FULLSCREEN_CHROME_SUPPRESSION_SETTING_LABEL: &str =
+    "全画面中は固定表示を一時的に自動表示にする";
+
+pub fn draw_fullscreen_chrome_suppression_setting(
+    ui: &mut egui::Ui,
+    targets: &mut crate::settings::FullscreenChromeSuppression,
+) {
+    ui.label(FULLSCREEN_CHROME_SUPPRESSION_SETTING_LABEL);
+    ui.horizontal_wrapped(|ui| {
+        ui.checkbox(&mut targets.top, "上部バー");
+        ui.checkbox(&mut targets.bottom, "下部バーとストリップ");
+        ui.checkbox(&mut targets.info, "右情報パネル");
+        ui.checkbox(&mut targets.navigator, "ナビゲータ");
+    });
+    ui.label(egui::RichText::new("固定設定は保持します。バーやパネルは通常の端操作で呼び出せます。ナビゲータは保持キーで表示します。").weak());
+}
+
+#[cfg(test)]
+mod chrome_suppression_tests {
+    use super::*;
+    use crate::settings::{BottomBarLock, FullscreenChromeSuppression, Settings};
+
+    #[test]
+    fn chrome_suppression_resolves_every_target_without_mutating_raw_locks() {
+        let surfaces = [
+            ViewerChromeSurface::MainEmbedded,
+            ViewerChromeSurface::Fullscreen,
+            ViewerChromeSurface::Detached {
+                window_id: 7,
+                borderless_applied: false,
+            },
+            ViewerChromeSurface::Detached {
+                window_id: 7,
+                borderless_applied: true,
+            },
+        ];
+        for mask in 0..16 {
+            let targets = FullscreenChromeSuppression {
+                top: mask & 1 != 0,
+                bottom: mask & 2 != 0,
+                info: mask & 4 != 0,
+                navigator: mask & 8 != 0,
+            };
+            for surface in surfaces {
+                for raw in [false, true] {
+                    for bottom in [
+                        BottomBarLock::None,
+                        BottomBarLock::BarOnly,
+                        BottomBarLock::BarAndStrip,
+                    ] {
+                        let resolved =
+                            ResolvedViewerChrome::resolve(surface, targets, raw, bottom, raw, raw);
+                        let fullscreen = surface.is_f11_fullscreen();
+                        assert_eq!(resolved.top_locked, raw && !(fullscreen && targets.top));
+                        assert_eq!(
+                            resolved.bottom_lock,
+                            if fullscreen && targets.bottom {
+                                BottomBarLock::None
+                            } else {
+                                bottom
+                            }
+                        );
+                        assert_eq!(resolved.info_locked, raw && !(fullscreen && targets.info));
+                        assert_eq!(
+                            resolved.navigator_fixed,
+                            raw && !(fullscreen && targets.navigator)
+                        );
+                        assert_eq!(
+                            ResolvedViewerChrome::resolve(
+                                ViewerChromeSurface::MainEmbedded,
+                                targets,
+                                raw,
+                                bottom,
+                                raw,
+                                raw
+                            ),
+                            ResolvedViewerChrome {
+                                top_locked: raw,
+                                bottom_lock: bottom,
+                                info_locked: raw,
+                                navigator_fixed: raw
+                            }
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chrome_suppression_legacy_settings_and_roundtrip_preserve_saved_values() {
+        let mut settings: Settings = serde_json::from_str(r#"{"fullscreen_top_bar_locked":true,"fullscreen_seek_bar_locked":true,"still_seek_strip_locked":true,"video_top_bar_locked":true,"video_seek_bar_locked":true,"video_seek_strip_locked":true}"#).unwrap();
+        assert_eq!(
+            settings.fullscreen_chrome_suppression,
+            FullscreenChromeSuppression::default()
+        );
+        settings.fullscreen_chrome_suppression = FullscreenChromeSuppression {
+            top: true,
+            bottom: true,
+            info: true,
+            navigator: true,
+        };
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(
+            restored.fullscreen_chrome_suppression,
+            settings.fullscreen_chrome_suppression
+        );
+        assert!(restored.fullscreen_top_bar_locked && restored.video_top_bar_locked);
+        assert_eq!(restored.still_bottom_lock(), BottomBarLock::BarAndStrip);
+        assert_eq!(restored.video_bottom_lock(), BottomBarLock::BarAndStrip);
+    }
+
+    #[test]
+    fn chrome_suppression_retains_explicit_open_on_target_change_and_closes_without_unlocking() {
+        let mut panel = FullscreenInfoPanelState {
+            locked: true,
+            open: MetadataPanelOpenState::ByPointer,
+            hover_active: false,
+        };
+        panel.on_display_target_changed();
+        assert_eq!(panel.open, MetadataPanelOpenState::ByPointer);
+        let transient = FullscreenInfoPanelState {
+            locked: false,
+            ..panel
+        };
+        assert!(transient.visible(crate::settings::FsSidePanelMode::ClickToShow, false));
+        panel.open = MetadataPanelOpenState::Closed;
+        assert!(panel.locked);
+        assert!(
+            !FullscreenInfoPanelState {
+                locked: false,
+                ..panel
+            }
+            .visible(crate::settings::FsSidePanelMode::ClickToShow, false)
+        );
+    }
+}
+
 /// お気に入り編集と環境設定で共有する起動時の索引確認設定。
 pub const OFFLINE_CHANGE_SCAN_SETTING_LABEL: &str =
     "起動時に、mIV を終了していた間の変更を確認しない";
@@ -1194,7 +1398,7 @@ pub fn draw_play_icon(painter: &egui::Painter, center: egui::Pos2, radius: f32) 
 /// 絵文字グリフ (🎵 / 🎶 等) は環境依存フォントで tofu 化しうる (CLAUDE.md「UI 文字列の
 /// Unicode グリフ選定ルール」)。動画セルの再生アイコン (`draw_play_icon`) と同様に
 /// painter プリミティブで描いてフォント依存を避ける。
-pub fn draw_music_icon(painter: &egui::Painter, inner: egui::Rect, dark: bool) {
+pub fn draw_music_icon(painter: &egui::Painter, inner: egui::Rect, dark: bool) -> egui::Rect {
     let side = inner.width().min(inner.height());
     let s = (side * 0.34).clamp(22.0, 64.0);
     let center = inner.center() - egui::vec2(0.0, side * 0.05);
@@ -1213,31 +1417,38 @@ pub fn draw_music_icon(painter: &egui::Painter, inner: egui::Rect, dark: bool) {
     let right_stem_x = right_head.x + head_r * 0.9;
     let stem_top_y = left_head.y - stem_h;
     // 符幹 (符頭の右端から上へ)
-    painter.line_segment(
-        [
-            egui::pos2(left_stem_x, left_head.y),
-            egui::pos2(left_stem_x, stem_top_y),
-        ],
-        egui::Stroke::new(stem_w, color),
-    );
-    painter.line_segment(
-        [
-            egui::pos2(right_stem_x, right_head.y),
-            egui::pos2(right_stem_x, stem_top_y),
-        ],
-        egui::Stroke::new(stem_w, color),
-    );
-    // 連桁 (2 本の符幹の上端をつなぐ太線)
-    painter.line_segment(
-        [
-            egui::pos2(left_stem_x - stem_w * 0.5, stem_top_y),
-            egui::pos2(right_stem_x + stem_w * 0.5, stem_top_y),
-        ],
-        egui::Stroke::new(stem_w * 1.9, color),
-    );
-    // 符頭
-    painter.circle_filled(left_head, head_r, color);
-    painter.circle_filled(right_head, head_r, color);
+    let shapes = [
+        egui::Shape::line_segment(
+            [
+                egui::pos2(left_stem_x, left_head.y),
+                egui::pos2(left_stem_x, stem_top_y),
+            ],
+            egui::Stroke::new(stem_w, color),
+        ),
+        egui::Shape::line_segment(
+            [
+                egui::pos2(right_stem_x, right_head.y),
+                egui::pos2(right_stem_x, stem_top_y),
+            ],
+            egui::Stroke::new(stem_w, color),
+        ),
+        // 連桁 (2 本の符幹の上端をつなぐ太線)
+        egui::Shape::line_segment(
+            [
+                egui::pos2(left_stem_x - stem_w * 0.5, stem_top_y),
+                egui::pos2(right_stem_x + stem_w * 0.5, stem_top_y),
+            ],
+            egui::Stroke::new(stem_w * 1.9, color),
+        ),
+        // 符頭
+        egui::Shape::circle_filled(left_head, head_r, color),
+        egui::Shape::circle_filled(right_head, head_r, color),
+    ];
+    let bounds = shapes.iter().fold(egui::Rect::NOTHING, |bounds, shape| {
+        bounds.union(shape.visual_bounding_rect())
+    });
+    painter.extend(shapes);
+    bounds
 }
 
 /// フルスクリーン右パネル共通の ★ レーティング行を描く (画像 / 動画 / 音声で共有)。
@@ -1285,6 +1496,7 @@ pub fn format_badge_background(
         FormatBadgeKind::Zip => egui::Color32::from_rgba_unmultiplied(30, 80, 160, 200),
         FormatBadgeKind::Pdf => egui::Color32::from_rgba_unmultiplied(180, 30, 30, 200),
         FormatBadgeKind::Archive => egui::Color32::from_rgba_unmultiplied(200, 110, 20, 200),
+        FormatBadgeKind::Audio => egui::Color32::from_rgba_unmultiplied(95, 75, 160, 200),
         FormatBadgeKind::Video => egui::Color32::from_rgba_unmultiplied(20, 135, 145, 200),
     }
 }

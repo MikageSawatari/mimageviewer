@@ -1365,6 +1365,7 @@ pub(crate) struct NativeVideoOpenPending {
     pub(crate) idx: usize,
     pub(crate) path: std::path::PathBuf,
     pub(crate) from_grid: bool,
+    pub(crate) playback_origin: crate::video::PlaybackStartOrigin,
     pub(crate) autoplay_override: Option<bool>,
     pub(crate) ignore_resume: bool,
     pub(crate) wait_for_detached_host: bool,
@@ -1834,7 +1835,7 @@ impl App {
         state.cancel();
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             if state.was_playing {
-                player.set_playing(true);
+                player.set_playing_internal(true, crate::video::InternalContinuation::Normalize);
             }
             player.set_audio_preroll_suspended(false);
         }
@@ -2381,6 +2382,7 @@ impl App {
             idx,
             path: path.to_path_buf(),
             from_grid,
+            playback_origin: crate::video::PlaybackStartOrigin::NewSource,
             autoplay_override,
             ignore_resume,
             wait_for_detached_host: false,
@@ -2429,6 +2431,7 @@ impl App {
             idx,
             path: path.to_path_buf(),
             from_grid,
+            playback_origin: crate::video::PlaybackStartOrigin::NewSource,
             autoplay_override,
             ignore_resume,
             wait_for_detached_host: true,
@@ -2512,6 +2515,7 @@ impl App {
         let idx = pending.idx;
         let path = pending.path.clone();
         let from_grid = pending.from_grid;
+        let playback_origin = pending.playback_origin;
         let autoplay_override = pending.autoplay_override;
         let ignore_resume = pending.ignore_resume;
         let wait_for_detached_host = pending.wait_for_detached_host;
@@ -2609,6 +2613,7 @@ impl App {
                 );
             }
             resume_open(self, idx);
+            self.register_media_playback_origin(idx, playback_origin);
             ctx.request_repaint();
             return;
         }
@@ -2855,6 +2860,7 @@ impl App {
                                 rect,
                                 request.activate
                                     && request.target != ViewerPresentation::DetachedWindow,
+                                host.map(|claim| self.native_chrome_host_for_claim(claim)),
                             );
                         } else if let Some(pending) = self.native_video_source_swap_pending.as_ref()
                         {
@@ -2865,6 +2871,7 @@ impl App {
                                 rect,
                                 request.activate
                                     && request.target != ViewerPresentation::DetachedWindow,
+                                host.map(|claim| self.native_chrome_host_for_claim(claim)),
                             );
                         } else {
                             self.video_presentation_transition.dispatch(
@@ -3354,7 +3361,7 @@ impl App {
         let native_output = match self.fs_cache.get_mut(&from_idx) {
             Some(FsCacheEntry::Video { player, .. }) => {
                 player.pause_audio_output();
-                player.set_playing(false);
+                player.set_playing_with_origin(false, crate::video::PlaybackStartOrigin::UserPlay);
                 player.clear_audio_output_buffer();
                 player.take_native_output()
             }
@@ -3981,6 +3988,10 @@ impl App {
         if audio_mode_after_swap {
             new_player.set_media_visual_mode(music_core::MediaVisualMode::Music);
         }
+        if matches!(history_trigger, crate::app::HistoryTrigger::AutoAdvance) {
+            new_player
+                .register_playback_start(crate::video::PlaybackStartOrigin::ContinuousAdvance);
+        }
         new_player.attach_native_output(native_output);
         let payload = new_player.build_switch_source_payload(source_epoch, show_preparing_overlay);
         new_player.switch_native_source(payload);
@@ -4055,7 +4066,7 @@ impl App {
 
         if reason == "tile" {
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&target_idx) {
-                player.set_playing(false);
+                player.set_playing_with_origin(false, crate::video::PlaybackStartOrigin::UserPlay);
             }
             self.video_tile_mode_active = true;
             self.video_tile_swap_pending = Some(VideoTileSwapPending {
@@ -5089,6 +5100,7 @@ impl App {
         } else {
             ViewerPresentation::Fullscreen
         };
+        self.publish_effetune_auto_fullscreen();
         if in_window
             && self
                 .fullscreen_idx
@@ -5156,6 +5168,7 @@ impl App {
         let in_window = matches!(presentation, ViewerPresentation::MainWindow);
         self.native_video_in_window_active = in_window;
         self.viewer_presentation = presentation;
+        self.publish_effetune_auto_fullscreen();
         if matches!(presentation, ViewerPresentation::DetachedWindow) {
             let id = self.ensure_detached_viewer_window_id();
             self.ensure_mounted_detached_session_binding(id);
@@ -5424,6 +5437,7 @@ impl App {
             | Ev::ToggleBarLock { .. }
             | Ev::ToggleSeekStripLock { .. }
             | Ev::ToggleClickInfoOpen
+            | Ev::CloseInfoPanel
             | Ev::ToggleInfoPanelLock
             | Ev::OpenTouchInfoPanel
             | Ev::DismissTouchSidePanels
@@ -5838,6 +5852,7 @@ impl App {
                     | crate::video::NativeVideoOutputEvent::ToggleSidePanelMode
                     | crate::video::NativeVideoOutputEvent::ToggleBarLock { .. }
                     | crate::video::NativeVideoOutputEvent::ToggleClickInfoOpen
+                    | crate::video::NativeVideoOutputEvent::CloseInfoPanel
                     | crate::video::NativeVideoOutputEvent::ToggleInfoPanelLock
                     | crate::video::NativeVideoOutputEvent::OpenTouchInfoPanel
                     | crate::video::NativeVideoOutputEvent::DismissTouchSidePanels
@@ -6418,6 +6433,12 @@ impl App {
             }
             crate::video::NativeVideoOutputEvent::ToggleClickInfoOpen => {
                 self.toggle_fullscreen_click_info_open();
+                self.sync_native_video_metadata(fs_idx);
+                self.mark_native_video_hud_activity(ctx);
+            }
+            crate::video::NativeVideoOutputEvent::CloseInfoPanel => {
+                crate::ime_focus::record_side_panel_close(ctx, "native_video:explicit_info_close");
+                self.close_fullscreen_info_panel();
                 self.sync_native_video_metadata(fs_idx);
                 self.mark_native_video_hud_activity(ctx);
             }
@@ -7109,6 +7130,11 @@ impl App {
             Some(FsCacheEntry::Video { player, .. }) => !player.intent_playing(),
             _ => false,
         };
+        if will_request_play {
+            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                player.register_playback_start(crate::video::PlaybackStartOrigin::UserPlay);
+            }
+        }
         if will_request_play && self.start_normalize_scan_for_deferred_play_intent(fs_idx) {
             self.mark_native_video_hud_activity(ctx);
             return;
@@ -7138,7 +7164,7 @@ impl App {
             return;
         }
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-            player.set_playing(false);
+            player.set_playing_with_origin(false, crate::video::PlaybackStartOrigin::UserPlay);
         }
         crate::ui_helpers::open_url(&url);
         self.mark_native_video_hud_activity(ctx);
@@ -7542,7 +7568,8 @@ impl App {
                 if state.was_playing
                     && player.applied_audio_stream_index() == Some(state.stream_index)
                 {
-                    player.set_playing(true);
+                    player
+                        .set_playing_internal(true, crate::video::InternalContinuation::Normalize);
                     player.set_audio_preroll_suspended(false);
                 }
             }
@@ -7614,7 +7641,10 @@ impl App {
             if let Some(FsCacheEntry::Video { player, .. }) = owner.fs_cache.get(&state.fs_idx) {
                 if player.path() == state.file_path.as_path() {
                     if state.was_playing {
-                        player.set_playing(true);
+                        player.set_playing_internal(
+                            true,
+                            crate::video::InternalContinuation::Normalize,
+                        );
                     }
                     player.set_audio_preroll_suspended(false);
                     owner.normalize_ui_states.insert(
@@ -7727,7 +7757,7 @@ impl App {
                     "[native-video] deferred normalize scan not started; resume playback idx={fs_idx}"
                 ));
             }
-            player.set_playing(true);
+            player.set_playing_internal(true, crate::video::InternalContinuation::Normalize);
             player.set_audio_preroll_suspended(false);
         }
     }
@@ -7803,7 +7833,7 @@ impl App {
         }
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             player.set_audio_preroll_suspended(true);
-            player.set_playing(false);
+            player.set_playing_internal(false, crate::video::InternalContinuation::Normalize);
         }
         true
     }
@@ -7851,7 +7881,7 @@ impl App {
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             if was_playing {
                 player.set_audio_preroll_suspended(true);
-                player.set_playing(false);
+                player.set_playing_internal(false, crate::video::InternalContinuation::Normalize);
             }
             // A manual scan can supersede an in-flight lookup. Invalidate its exact request
             // after suspension so a late cache result cannot replace this scan's gain.
@@ -7907,7 +7937,10 @@ impl App {
                 if was_playing {
                     if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                         player.set_normalize_gain_for_stream(stream_index, 1.0);
-                        player.set_playing(true);
+                        player.set_playing_internal(
+                            true,
+                            crate::video::InternalContinuation::Normalize,
+                        );
                         player.set_audio_preroll_suspended(false);
                     }
                 }
@@ -7990,7 +8023,10 @@ impl App {
                         "scan_provisional",
                     );
                     if was_playing && player.applied_audio_stream_index() == Some(stream_index) {
-                        player.set_playing(true);
+                        player.set_playing_internal(
+                            true,
+                            crate::video::InternalContinuation::Normalize,
+                        );
                         player.set_audio_preroll_suspended(false);
                     }
                 }
@@ -8061,7 +8097,10 @@ impl App {
                         if state.was_playing
                             && player.applied_audio_stream_index() == Some(state.stream_index)
                         {
-                            player.set_playing(true);
+                            player.set_playing_internal(
+                                true,
+                                crate::video::InternalContinuation::Normalize,
+                            );
                             player.set_audio_preroll_suspended(false);
                         }
                     }
@@ -8111,7 +8150,10 @@ impl App {
                             if state.was_playing
                                 && player.applied_audio_stream_index() == Some(state.stream_index)
                             {
-                                player.set_playing(true);
+                                player.set_playing_internal(
+                                    true,
+                                    crate::video::InternalContinuation::Normalize,
+                                );
                                 player.set_audio_preroll_suspended(false);
                             }
                         }
@@ -9162,7 +9204,7 @@ impl App {
 
     #[cfg(windows)]
     /// 上下バーの固定状態を設定から読む唯一の場所。presenter の生成時 (config) と
-    /// 生成後の同期 (`SetBarLockState`) が同じ値を見ることを、この 1 か所で保証する。
+    /// 生成後の同期 (`SetChromeSnapshot`) が同じ値を見ることを、この 1 か所で保証する。
     #[cfg(windows)]
     pub(crate) fn native_bar_lock_state(&self) -> crate::video::NativeBarLockState {
         crate::video::NativeBarLockState {
@@ -9175,6 +9217,95 @@ impl App {
             seek_preview_size_values: self.settings.video_seek_preview_size_values,
             seek_hover_preview_mode: self.settings.video_seek_hover_preview_mode,
             seek_bar_with_strip: self.settings.video_seek_bar_with_strip,
+        }
+    }
+
+    #[cfg(windows)]
+    fn native_chrome_host_for_claim(
+        &self,
+        claim: super::DetachedHostClaim,
+    ) -> crate::video::NativeDetachedChromeHost {
+        crate::video::NativeDetachedChromeHost {
+            window_id: claim.lease.window_id,
+            incarnation: claim.incarnation,
+            hwnd: claim.hwnd,
+            borderless_applied: self
+                .active_detached_session
+                .is_some_and(|session| session.window_id == claim.lease.window_id)
+                && self.detached_viewer_borderless_fullscreen,
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn native_chrome_snapshot(
+        &self,
+        fs_idx: usize,
+    ) -> crate::video::NativeChromeSnapshot {
+        let generation = self
+            .fs_cache
+            .get(&fs_idx)
+            .and_then(|entry| {
+                if let FsCacheEntry::Video { player, .. } = entry {
+                    player.native_committed_generation()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(1)
+            .max(1);
+        self.native_chrome_snapshot_for_generation(generation)
+    }
+
+    #[cfg(windows)]
+    fn native_chrome_snapshot_for_generation(
+        &self,
+        generation: u64,
+    ) -> crate::video::NativeChromeSnapshot {
+        let detached = self
+            .detached_viewer_window_id()
+            .and_then(|window_id| {
+                self.detached_host_claim_for_lease(super::DetachedSessionLease { window_id })
+            })
+            .map(|claim| crate::video::NativeDetachedChromeFact {
+                host: self.native_chrome_host_for_claim(claim),
+                generation,
+            });
+        crate::video::NativeChromeSnapshot {
+            policy: crate::video::NativeChromePolicy {
+                bars: self.native_bar_lock_state(),
+                side_panel_mode: self.settings.fullscreen_side_panel_mode,
+                info_open: self.fs_info_panel.open,
+                info_locked: self.fs_info_panel.locked,
+                suppression: self.settings.fullscreen_chrome_suppression,
+            },
+            detached,
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn sync_mounted_native_chrome_policy(&self) {
+        for (idx, entry) in &self.fs_cache {
+            if let FsCacheEntry::Video { player, .. } = entry {
+                player.set_native_chrome_snapshot(self.native_chrome_snapshot(*idx));
+            }
+        }
+        // A source swap temporarily owns the output outside fs_cache. Keep the same
+        // context policy and existing output generation during that ownership transfer.
+        if let Some(pending) = self.native_video_source_swap_pending.as_ref() {
+            pending
+                .native_output
+                .set_chrome_snapshot(self.native_chrome_snapshot_for_generation(
+                    pending.native_output.committed_generation().max(1),
+                ));
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn sync_all_native_chrome_policy(&mut self) {
+        for id in self.viewer_context_ids() {
+            let _ = self.with_viewer_context(id, |app| {
+                app.sync_mounted_native_chrome_policy();
+            });
         }
     }
 
@@ -9197,12 +9328,11 @@ impl App {
         let shortcut_tags = self.cached_native_overlay_shortcut_tags();
         let shortcuts = self.native_overlay_shortcut_labels();
         let shortcut_help = self.cached_native_overlay_shortcut_help();
-        let side_panel_mode = self.settings.fullscreen_side_panel_mode;
-        let info_panel_open = self.fs_info_panel.open;
+
         // 右パネルの固定は静止画と同じ状態を使う。動画でも「タグを付けながら前後へ送る」
         // ために出したままにできる必要がある (利用者要望 2026-09-02、backlog §1.158)。
-        let info_panel_locked = self.fs_info_panel.locked;
-        let bar_lock = self.native_bar_lock_state();
+
+        let chrome = self.native_chrome_snapshot(fs_idx);
         let touch_video_chrome_learned = self.settings.touch_video_chrome_learned;
         // ★ レーティング (右パネル先頭。get_rating は &mut self なので player 借用より前に取る)。
         let rating = self.get_rating(fs_idx);
@@ -9315,8 +9445,7 @@ impl App {
             }
         };
         player.set_native_metadata(Some(metadata));
-        player.set_native_side_panel_state(side_panel_mode, info_panel_open, info_panel_locked);
-        player.set_native_bar_lock_state(bar_lock);
+        player.set_native_chrome_snapshot(chrome);
     }
 
     #[cfg(windows)]
@@ -10370,9 +10499,9 @@ impl App {
         }
         self.settings.video_seek_strip_height = height;
         self.settings.save();
-        let bar_lock = self.native_bar_lock_state();
+        let chrome = self.native_chrome_snapshot(fs_idx);
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-            player.set_native_bar_lock_state(bar_lock);
+            player.set_native_chrome_snapshot(chrome);
         }
         if let VideoSeekStripRuntime::Open(session) = &mut self.video_seek_strip_runtime
             && session.owner_fs_idx == fs_idx
@@ -10393,9 +10522,9 @@ impl App {
         }
         self.settings.video_seek_preview_size = size;
         self.settings.save();
-        let bar_lock = self.native_bar_lock_state();
+        let chrome = self.native_chrome_snapshot(fs_idx);
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-            player.set_native_bar_lock_state(bar_lock);
+            player.set_native_chrome_snapshot(chrome);
         }
         true
     }
@@ -13403,7 +13532,7 @@ impl App {
             self.settings.video_downscale_smoothing_percent,
             self.settings.video_anime4k_budget,
             self.settings.fullscreen_image_margin_color,
-            self.native_bar_lock_state(),
+            self.native_chrome_snapshot(fs_idx),
             true, // audio_only (frameless present、Inc 6 ②-1)
         ) else {
             return;
@@ -13557,6 +13686,7 @@ impl App {
                 | Ev::ToggleSidePanelMode
                 | Ev::ToggleBarLock { .. }
                 | Ev::ToggleClickInfoOpen
+                | Ev::CloseInfoPanel
                 | Ev::ToggleInfoPanelLock
                 | Ev::SetVst3PanelVisible { .. }
                 | Ev::SetVst3PanelPos { .. }
@@ -14268,7 +14398,7 @@ impl App {
                 self.settings.video_downscale_smoothing_percent,
                 self.settings.video_anime4k_budget,
                 self.settings.fullscreen_image_margin_color,
-                self.native_bar_lock_state(),
+                self.native_chrome_snapshot(fs_idx),
                 false,
             )
         });
@@ -14936,7 +15066,7 @@ impl App {
         let native_output = match self.fs_cache.get_mut(&from_idx) {
             Some(FsCacheEntry::Video { player, .. }) => {
                 player.pause_audio_output();
-                player.set_playing(false);
+                player.set_playing_with_origin(false, crate::video::PlaybackStartOrigin::UserPlay);
                 player.clear_audio_output_buffer();
                 player.take_native_output()
             }
@@ -14976,6 +15106,10 @@ impl App {
             crate::video::VideoOutputConsumer::Presentation,
             None,
         );
+        if matches!(history_trigger, crate::app::HistoryTrigger::AutoAdvance) {
+            new_player
+                .register_playback_start(crate::video::PlaybackStartOrigin::ContinuousAdvance);
+        }
         new_player.attach_native_output(native_output);
         self.video_zoom_state = None;
         new_player.set_native_video_zoom_state(None);
@@ -15144,7 +15278,7 @@ impl App {
         };
 
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&target_idx) {
-            player.set_playing(false);
+            player.set_playing_with_origin(false, crate::video::PlaybackStartOrigin::UserPlay);
         }
         self.video_tile_mode_active = true;
         self.video_tile_swap_pending = Some(VideoTileSwapPending {
@@ -15870,6 +16004,69 @@ mod iconic_thumbnail_tests {
 #[cfg(all(test, windows))]
 mod native_video_display_mode_toggle_tests {
     use super::*;
+
+    #[test]
+    fn chrome_suppression_native_explicit_close_is_idempotent_and_keeps_context_lock() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        app.fullscreen_idx = Some(0);
+        app.fs_info_panel.locked = true;
+        app.fs_info_panel.open = crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle;
+        app.fs_info_panel.hover_active = true;
+        for _ in 0..2 {
+            app.handle_native_video_output_event(
+                &ctx,
+                0,
+                0,
+                crate::video::NativeVideoOutputEvent::CloseInfoPanel,
+            );
+            assert!(app.fs_info_panel.locked);
+            assert_eq!(
+                app.fs_info_panel.open,
+                crate::ui_helpers::MetadataPanelOpenState::Closed
+            );
+            assert!(!app.fs_info_panel.hover_active);
+        }
+    }
+
+    #[test]
+    fn chrome_suppression_music_vst_shell_close_info_reaches_handler_with_suppression_off_and_on() {
+        for suppressed in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let ctx = egui::Context::default();
+            app.fullscreen_idx = Some(0);
+            app.viewer_presentation = ViewerPresentation::Fullscreen;
+            app.music_vst_shell = Some(super::super::MusicVstShell {
+                fs_idx: 0,
+                activated: true,
+            });
+            app.show_vst3_manager = false;
+            app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
+            app.settings.fullscreen_chrome_suppression.info = suppressed;
+            app.fs_info_panel.locked = suppressed;
+            app.fs_info_panel.open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
+            app.fs_info_panel.hover_active = true;
+            app.fullscreen_tag_picker_open = true;
+            for _ in 0..2 {
+                app.handle_native_video_output_event(
+                    &ctx,
+                    0,
+                    0,
+                    crate::video::NativeVideoOutputEvent::CloseInfoPanel,
+                );
+                assert_eq!(app.fs_info_panel.locked, suppressed);
+                assert_eq!(
+                    app.fs_info_panel.open,
+                    crate::ui_helpers::MetadataPanelOpenState::Closed,
+                    "active music VST shell must route close even with suppression={suppressed}"
+                );
+                assert!(!app.fs_info_panel.hover_active);
+                assert!(!app.fullscreen_tag_picker_open);
+                assert!(!app.show_vst3_manager);
+                assert!(app.music_vst_shell.is_some_and(|shell| shell.activated));
+            }
+        }
+    }
 
     /// V キーと overlay イベントは同じ 1 つの規則を呼ぶ。ここで固定するのはその規則で、
     /// 「両方の入口が同じ関数を通る」ことは、選ぶ関数がこれ 1 つしかないことが保証する。

@@ -2484,7 +2484,7 @@ pub(super) fn draw_native_bar_lock_button(
     rect: egui::Rect,
     id: &'static str,
     locked: bool,
-    tooltip: &'static str,
+    tooltip: &str,
     bar: crate::video::NativeVideoBar,
     commands: &mut Vec<NativeOverlayCommand>,
 ) -> egui::Rect {
@@ -4384,6 +4384,7 @@ pub(super) fn draw_native_top_bar(
     audio_only: bool,
     side_panel_mode: crate::settings::FsSidePanelMode,
     top_bar_locked: bool,
+    lock_suppressed: bool,
     dimmed: bool,
     commands: &mut Vec<NativeOverlayCommand>,
     #[cfg(feature = "test-script")] native_top_panorama_observation_out: &mut Option<
@@ -4485,11 +4486,14 @@ pub(super) fn draw_native_top_bar(
                 lock_rect,
                 "native_top_bar_lock",
                 top_bar_locked,
-                if top_bar_locked {
-                    "上部情報バー固定を解除"
-                } else {
-                    "上部情報バーを固定表示"
-                },
+                &crate::ui_helpers::chrome_lock_hint(
+                    if top_bar_locked {
+                        "上部情報バー固定を解除"
+                    } else {
+                        "上部情報バーを固定表示"
+                    },
+                    lock_suppressed,
+                ),
                 crate::video::NativeVideoBar::Top,
                 commands,
             );
@@ -5872,6 +5876,7 @@ pub(super) fn draw_native_metadata_panel(
     commands: &mut Vec<NativeOverlayCommand>,
     click_to_show: bool,
     info_panel_locked: bool,
+    effective_info_panel_locked: bool,
 ) {
     let rect = native_metadata_panel_rect(
         overlay_width_points,
@@ -5937,10 +5942,16 @@ pub(super) fn draw_native_metadata_panel(
             } else {
                 "パネルを固定 (映像に重ねず、前後へ移動しても表示したまま)"
             };
-            if lock_response.on_hover_text(lock_hint).clicked() {
+            if lock_response
+                .on_hover_text(crate::ui_helpers::chrome_lock_hint(
+                    lock_hint,
+                    info_panel_locked && !effective_info_panel_locked,
+                ))
+                .clicked()
+            {
                 commands.push(NativeOverlayCommand::ToggleInfoPanelLock);
             }
-            if click_to_show && !info_panel_locked {
+            if click_to_show && !effective_info_panel_locked {
                 let close_rect = egui::Rect::from_min_size(
                     rect.right_top() + egui::vec2(-58.0, 6.0),
                     egui::vec2(24.0, 24.0),
@@ -5954,7 +5965,7 @@ pub(super) fn draw_native_metadata_panel(
                 draw_overlay_close_icon(painter, close_rect);
                 if response.on_hover_text("情報パネルを閉じる").clicked() {
                     *tag_picker_open = false;
-                    commands.push(NativeOverlayCommand::ToggleClickInfoOpen);
+                    commands.push(NativeOverlayCommand::CloseInfoPanel);
                 }
             }
 
@@ -7662,6 +7673,79 @@ pub(super) fn layout_truncated_to_width(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn chrome_suppression_native_info_close_draws_hit_and_emits_explicit_close() {
+        use std::sync::{Arc, Mutex};
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_for_ui = Arc::clone(&captured);
+        let metadata = test_overlay_metadata(
+            String::new(),
+            Ok(crate::video::spherical_metadata::VideoPanoramaTrigger::Auto),
+        );
+        let mut picker_open = false;
+        let mut fonts_ready = false;
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1280.0, 720.0))
+            .build(move |ctx| {
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |_| {});
+                let mut commands = Vec::new();
+                draw_native_metadata_panel(
+                    ctx,
+                    1280.0,
+                    720.0,
+                    0.0,
+                    &metadata,
+                    &mut picker_open,
+                    &mut String::new(),
+                    &mut false,
+                    &mut None,
+                    &mut Vec::new(),
+                    &mut false,
+                    false,
+                    false,
+                    &mut commands,
+                    true,
+                    true,
+                    false,
+                );
+                captured_for_ui.lock().unwrap().extend(commands);
+            });
+        harness.run();
+        let close = harness
+            .ctx
+            .read_response(egui::Id::new("native_metadata_close"))
+            .expect("raw locked/effective unlocked must expose the close hit")
+            .rect
+            .center();
+        harness.hover_at(close);
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos: close,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        harness.run();
+        let commands = captured.lock().unwrap();
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, NativeOverlayCommand::CloseInfoPanel))
+                .count(),
+            1
+        );
+        assert!(!commands.iter().any(|command| matches!(
+            command,
+            NativeOverlayCommand::ToggleInfoPanelLock | NativeOverlayCommand::ToggleClickInfoOpen
+        )));
+    }
     use super::*;
 
     #[test]
@@ -7707,6 +7791,7 @@ pub(crate) mod tests {
                         true,
                         false,
                         crate::settings::FsSidePanelMode::Hover,
+                        false,
                         false,
                         false,
                         &mut commands,
@@ -7788,6 +7873,7 @@ pub(crate) mod tests {
                 audio_only,
                 crate::settings::FsSidePanelMode::Hover,
                 top_bar_locked,
+                false,
                 dimmed,
                 &mut commands,
                 #[cfg(feature = "test-script")]
@@ -7892,6 +7978,7 @@ pub(crate) mod tests {
                         crate::settings::FsSidePanelMode::Hover,
                         false,
                         false,
+                        false,
                         &mut commands,
                         &mut observation,
                         None,
@@ -7985,6 +8072,7 @@ pub(crate) mod tests {
                     false,
                     false,
                     crate::settings::FsSidePanelMode::Hover,
+                    false,
                     false,
                     false,
                     &mut commands,
@@ -8107,6 +8195,7 @@ pub(crate) mod tests {
                     false,
                     false,
                     crate::settings::FsSidePanelMode::Hover,
+                    false,
                     false,
                     false,
                     &mut commands,
@@ -8419,6 +8508,7 @@ pub(crate) mod tests {
                     false,
                     false,
                     crate::settings::FsSidePanelMode::Hover,
+                    false,
                     false,
                     false,
                     &mut commands,

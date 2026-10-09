@@ -689,6 +689,66 @@ impl<P> ContextTable<P> {
     }
 }
 
+fn reset_audio_art_terminal_rows(
+    items: &[GridItem],
+    parent: Option<&Path>,
+    thumbnails: &mut [ThumbnailState],
+    requested: &mut ThumbnailRequests,
+    pending_finalize: &mut std::collections::HashSet<usize>,
+) -> usize {
+    let mut changed = 0;
+    for (idx, (item, state)) in items.iter().zip(thumbnails.iter_mut()).enumerate() {
+        let GridItem::Audio(path) = item else {
+            continue;
+        };
+        if parent.is_some_and(|scope| {
+            !path
+                .parent()
+                .is_some_and(|actual| crate::path_key::eq_keep_drive(actual, scope))
+        }) || !matches!(state, ThumbnailState::NoArt | ThumbnailState::Failed)
+        {
+            continue;
+        }
+        *state = ThumbnailState::Evicted;
+        requested.remove(&idx);
+        pending_finalize.remove(&idx);
+        changed += 1;
+    }
+    changed
+}
+
+impl App {
+    /// Explicit cache maintenance reopens only terminal audio requests. Mutate
+    /// every living owner in place: no mount/swap, generation/cancel change,
+    /// viewport routing, SQLite work, or loss of already displayed pixels.
+    pub(crate) fn invalidate_audio_art_terminals_after_catalog_maintenance(
+        &mut self,
+        parent: Option<&Path>,
+    ) -> usize {
+        let mut changed = reset_audio_art_terminal_rows(
+            &self.items,
+            parent,
+            &mut self.thumbnails,
+            &mut self.requested,
+            &mut self.pending_finalize,
+        );
+        #[cfg(windows)]
+        for slot in self.viewer_contexts.table.slots.values_mut() {
+            let Slot::AtRest(bundle) = slot else {
+                continue;
+            };
+            changed += reset_audio_art_terminal_rows(
+                &bundle.items,
+                parent,
+                &mut bundle.thumbnails,
+                &mut bundle.requested,
+                &mut bundle.pending_finalize,
+            );
+        }
+        changed
+    }
+}
+
 #[cfg(windows)]
 pub(in crate::app) struct ViewerContextRegistry {
     table: ContextTable<Box<ViewerContextBundle>>,
@@ -1382,6 +1442,13 @@ impl<'a> ContextRef<'a> {
     pub(in crate::app) fn at_rest(bundle: &'a ViewerContextBundle) -> Self {
         Self {
             source: ContextRefSource::AtRest(bundle),
+        }
+    }
+
+    pub(in crate::app) fn presentation(self) -> ViewerPresentation {
+        match self.source {
+            ContextRefSource::Mounted(app) => app.viewer_presentation,
+            ContextRefSource::AtRest(bundle) => bundle.viewer_session.presentation,
         }
     }
 
@@ -4306,6 +4373,195 @@ mod tests {
     use std::rc::Rc;
 
     #[cfg(windows)]
+    #[test]
+    fn audio_folder_cache_maintenance_preserves_sibling_and_other_drive_terminals() {
+        let mut app = crate::app::setup_app_for_test();
+        let seed = |owner: &mut App| {
+            owner.items = [
+                r"C:\Music\empty.mp3",
+                r"D:\Music\empty.mp3",
+                r"C:\Music\Child\empty.mp3",
+                r"C:\Other\empty.mp3",
+            ]
+            .map(|path| GridItem::Audio(PathBuf::from(path)))
+            .into();
+            owner.thumbnails = vec![ThumbnailState::NoArt; 4];
+        };
+        seed(&mut app);
+        let parked_id = app.build_window_context_for_test(9813, seed);
+        assert_eq!(
+            app.invalidate_audio_art_terminals_after_catalog_maintenance(Some(Path::new(
+                "c:/MUSIC"
+            ))),
+            2
+        );
+        assert!(matches!(app.thumbnails[0], ThumbnailState::Evicted));
+        assert!(
+            app.thumbnails[1..]
+                .iter()
+                .all(|state| matches!(state, ThumbnailState::NoArt))
+        );
+        let parked = app.viewer_contexts.table.at_rest(parked_id).unwrap();
+        assert!(matches!(parked.thumbnails[0], ThumbnailState::Evicted));
+        assert!(
+            parked.thumbnails[1..]
+                .iter()
+                .all(|state| matches!(state, ThumbnailState::NoArt))
+        );
+        assert_eq!(
+            app.invalidate_audio_art_terminals_after_catalog_maintenance(Some(Path::new(
+                "c:/Music"
+            ))),
+            0
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn audio_cache_maintenance_reopens_terminals_across_contexts_without_cancel_or_pixel_loss() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        let seed = |owner: &mut App, prefix: &str| {
+            owner.items = vec![
+                GridItem::Audio(PathBuf::from(format!("{prefix}/empty.mp3"))),
+                GridItem::Audio(PathBuf::from(format!("{prefix}/failed.mp3"))),
+                GridItem::Audio(PathBuf::from(format!("{prefix}/loaded.mp3"))),
+                GridItem::Audio(PathBuf::from(format!("{prefix}/pending.mp3"))),
+                GridItem::Image(PathBuf::from(format!("{prefix}/failed.jpg"))),
+                GridItem::Video(PathBuf::from(format!("{prefix}/loaded.mp4"))),
+            ];
+            let pixels = ThumbnailState::Loaded {
+                tex: ctx.load_texture(
+                    prefix,
+                    egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+                    egui::TextureOptions::LINEAR,
+                ),
+                origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+                from_edit_preview: false,
+                rendered_at_px: 1,
+                source_dims: Some((13, 17)),
+                layout_dims: None,
+            };
+            owner.thumbnails = vec![
+                ThumbnailState::NoArt,
+                ThumbnailState::Failed,
+                pixels.clone(),
+                ThumbnailState::Pending,
+                ThumbnailState::Failed,
+                pixels,
+            ];
+            owner.image_metas = vec![None; 6];
+            owner.requested.clear();
+            for idx in 0..4 {
+                owner.requested.insert(idx, false);
+            }
+            owner.pending_finalize = std::collections::HashSet::from([0, 1, 2, 3]);
+            owner.heavy_io_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+        };
+        seed(&mut app, "c:/main");
+        let main = app.viewer_context_main();
+        let first = app.build_window_context_for_test(9811, |owner| seed(owner, "c:/first"));
+        let second = app.build_window_context_for_test(9812, |owner| seed(owner, "c:/second"));
+        let snapshot = |owner: &App| {
+            let ThumbnailState::Loaded { tex, .. } = &owner.thumbnails[2] else {
+                panic!("expected pixels")
+            };
+            (
+                owner.items_generation,
+                Arc::clone(&owner.cancel_token),
+                tex.id(),
+                owner.cancel_token.load(Ordering::Relaxed),
+            )
+        };
+        let current_snapshot = snapshot(&app);
+        let parked_snapshots = [first, second].map(|id| {
+            let owner = app.viewer_contexts.table.at_rest(id).unwrap();
+            let ThumbnailState::Loaded { tex, .. } = &owner.thumbnails[2] else {
+                panic!("expected pixels")
+            };
+            (
+                id,
+                owner.items_generation,
+                Arc::clone(&owner.cancel_token),
+                tex.id(),
+                owner.cancel_token.load(Ordering::Relaxed),
+            )
+        });
+        assert_eq!(app.projected_viewer_context_id(), main);
+        assert_eq!(
+            app.invalidate_audio_art_terminals_after_catalog_maintenance(None),
+            6
+        );
+        let assert_rows = |states: &[ThumbnailState],
+                           requested: &ThumbnailRequests,
+                           finalize: &std::collections::HashSet<usize>,
+                           texture: egui::TextureId| {
+            assert!(matches!(states[0], ThumbnailState::Evicted));
+            assert!(matches!(states[1], ThumbnailState::Evicted));
+            assert!(
+                matches!(&states[2],ThumbnailState::Loaded{tex,source_dims:Some((13,17)),..} if tex.id()==texture)
+            );
+            assert!(matches!(states[3], ThumbnailState::Pending));
+            assert!(matches!(states[4], ThumbnailState::Failed));
+            assert!(matches!(states[5], ThumbnailState::Loaded { .. }));
+            assert!(!requested.contains_key(&0) && !requested.contains_key(&1));
+            assert!(requested.contains_key(&2) && requested.contains_key(&3));
+            assert_eq!(finalize, &std::collections::HashSet::from([2, 3]));
+        };
+        assert_rows(
+            &app.thumbnails,
+            &app.requested,
+            &app.pending_finalize,
+            current_snapshot.2,
+        );
+        assert_eq!(app.items_generation, current_snapshot.0);
+        assert!(Arc::ptr_eq(&app.cancel_token, &current_snapshot.1));
+        assert_eq!(app.cancel_token.load(Ordering::Relaxed), current_snapshot.3);
+        for (id, generation, token, texture, canceled) in parked_snapshots {
+            let owner = app.viewer_contexts.table.at_rest(id).unwrap();
+            assert_rows(
+                &owner.thumbnails,
+                &owner.requested,
+                &owner.pending_finalize,
+                texture,
+            );
+            assert_eq!(owner.items_generation, generation);
+            assert!(Arc::ptr_eq(&owner.cancel_token, &token));
+            assert_eq!(owner.cancel_token.load(Ordering::Relaxed), canceled);
+        }
+        assert_eq!(app.projected_viewer_context_id(), main);
+        assert_eq!(
+            app.invalidate_audio_art_terminals_after_catalog_maintenance(None),
+            0
+        );
+        // The real request handler admits one new lookup, then its existing
+        // requested owner prevents duplicate enqueue on the following update.
+        app.enqueue_priority_thumbnail(0);
+        app.enqueue_priority_thumbnail(0);
+        assert_eq!(
+            app.heavy_io_queue.as_ref().unwrap().0.lock().unwrap().len(),
+            1
+        );
+        assert!(app.requested.contains_key(&0));
+        app.tx
+            .send(ThumbMsg {
+                idx: 0,
+                payload: crate::thumb_loader::ThumbMsgPayload::NoArt,
+                input_seq: app.input_seq,
+                items_gen: app.items_generation,
+            })
+            .unwrap();
+        app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+        assert!(matches!(app.thumbnails[0], ThumbnailState::NoArt));
+        app.enqueue_priority_thumbnail(0);
+        assert_eq!(
+            app.heavy_io_queue.as_ref().unwrap().0.lock().unwrap().len(),
+            1
+        );
+        assert!(!app.requested.contains_key(&0));
+    }
+
+    #[cfg(windows)]
     fn still_seek_committed_center(center: usize) -> crate::ui_fullscreen::StillSeekGesture {
         crate::ui_fullscreen::StillSeekGesture::StripCommitted {
             layout_center_pos: center,
@@ -4460,7 +4716,7 @@ mod tests {
         assert!(
             rx.recv_timeout(std::time::Duration::from_secs(5))
                 .unwrap()
-                .canceled
+                .is_canceled()
         );
         assert_eq!(done.load(Ordering::Relaxed), 1);
         assert!(app.raw_thumb_develop.lock().unwrap().is_empty());

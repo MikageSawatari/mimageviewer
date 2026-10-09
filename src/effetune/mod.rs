@@ -83,6 +83,7 @@ impl UnavailableReason {
 pub enum LoadOrigin {
     Startup,
     UserButton,
+    AutoVideo,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -136,7 +137,7 @@ pub enum EffetuneRuntime {
     Idle,
     Loading {
         origin: LoadOrigin,
-        open_gui_when_ready: Option<ShowPermit>,
+        open_gui_when_ready: Option<ShowIntent>,
     },
     Running {
         generation: u64,
@@ -328,7 +329,7 @@ enum HostCommand {
     Disable(Arc<DspBridge>),
     Show {
         bridge: Arc<DspBridge>,
-        permit: ShowPermit,
+        permit: ShowIntent,
     },
     Gui {
         bridge: Arc<crate::video::dsp::bridge::Bridge>,
@@ -835,6 +836,81 @@ pub struct ShowPermit {
     remote_acquisition: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AutoPermit {
+    manual: ShowPermit,
+    projection: gui_gate::AutoPresentationSnapshot,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShowIntent {
+    Manual(ShowPermit),
+    AutoVideo(AutoPermit),
+}
+
+impl ShowIntent {
+    fn manual(self) -> ShowPermit {
+        match self {
+            Self::Manual(permit) => permit,
+            Self::AutoVideo(permit) => permit.manual,
+        }
+    }
+
+    fn auto_revision(self) -> Option<u64> {
+        match self {
+            Self::Manual(_) => None,
+            Self::AutoVideo(permit) => Some(permit.projection.revision),
+        }
+    }
+
+    fn allows(
+        self,
+        current: ShowPermit,
+        remote: bool,
+        minimized: bool,
+        gate: &gui_gate::GuiGate,
+    ) -> bool {
+        self.manual().allows(current, remote, minimized)
+            && match self {
+                Self::Manual(_) => true,
+                Self::AutoVideo(permit) => {
+                    permit.projection.allowed && permit.projection == gate.auto_snapshot()
+                }
+            }
+    }
+}
+
+#[derive(Default)]
+struct AutoOpenSession {
+    // Armed = 0, Spent = 1. One session is shared by controller acceptance and
+    // the worker's successful manual ACK; there is no per-viewer opportunity.
+    spent: AtomicBool,
+}
+
+impl AutoOpenSession {
+    fn take(&self) -> bool {
+        self.spent
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+    fn note_show_result(
+        &self,
+        intent: ShowIntent,
+        outcome: crate::video::dsp::bridge::GuiVisibilityOutcome,
+        gate: &gui_gate::GuiGate,
+    ) {
+        if matches!(intent, ShowIntent::Manual(_))
+            && outcome == crate::video::dsp::bridge::GuiVisibilityOutcome::Shown
+        {
+            self.spent.store(true, Ordering::Release);
+            // A Manual request queued before AutoVideo can succeed after its
+            // opportunity was accepted. Revoke that still-unshown Auto permit
+            // without adding a new session state or changing displayed windows.
+            gate.invalidate_auto();
+        }
+    }
+}
+
 impl ShowPermit {
     fn allows(self, current: Self, remote: bool, minimized: bool) -> bool {
         self == current && !remote && !minimized
@@ -878,6 +954,7 @@ fn complete_load(
 }
 
 pub struct EffetuneController {
+    auto_open: Arc<AutoOpenSession>,
     main_window: Arc<window::MainWindowObserver>,
     remote_session: Arc<Mutex<Option<crate::remote_ipc::session::SessionHandle>>>,
     // Edge notification only. Worker presentation reads the canonical handle.
@@ -934,6 +1011,8 @@ impl EffetuneController {
         let host_remote_session = Arc::downgrade(&remote_session);
         let host_repaint = Arc::clone(&repaint_context);
         let host_failure_tx = failure_tx.clone();
+        let auto_open = Arc::new(AutoOpenSession::default());
+        let host_auto_open = Arc::clone(&auto_open);
         std::thread::Builder::new()
             .name("effetune-host-control".into())
             .spawn(move || {
@@ -948,15 +1027,18 @@ impl EffetuneController {
                         HostCommand::Show { bridge, permit } => {
                             let Some(host_main_window) = host_main_window.upgrade() else { continue; };
                             let Some(host_remote_session) = host_remote_session.upgrade() else { continue; };
+                            let Ok(gate) = host_main_window.gate() else { continue; };
                             let result = (|| {
-                                if !permit.allows(show_permit(&host_main_window, &host_remote_session), remote_playback_active(&host_remote_session), bridge.main_window_is_minimized()) { return Ok(()); }
+                                if !permit.allows(show_permit(&host_main_window, &host_remote_session), remote_playback_active(&host_remote_session), bridge.main_window_is_minimized(), &gate) { return Ok(()); }
                                 bridge.attach_slot_gui_hidden(0)?;
                                 let remote = remote_playback_active(&host_remote_session);
                                 bridge.set_slot_gui_remote_session_checked(0, remote)?;
                                 // An editor attached while Remote acquired control remains hidden.
                                 // It was never visible, so release must not open it later.
-                                if permit.allows(show_permit(&host_main_window, &host_remote_session), remote, bridge.main_window_is_minimized()) {
-                                    bridge.show_slot_gui_checked(0, permit.minimize_sequence, gui_gate::GuiGate::remote_token(permit.remote_acquisition))?;
+                                if permit.allows(show_permit(&host_main_window, &host_remote_session), remote, bridge.main_window_is_minimized(), &gate) {
+                                    let manual = permit.manual();
+                                    let outcome = bridge.show_slot_gui_checked_with_origin(0, manual.minimize_sequence, gui_gate::GuiGate::remote_token(manual.remote_acquisition), permit.auto_revision())?;
+                                    host_auto_open.note_show_result(permit, outcome, &gate);
                                 }
                                 Ok::<_, String>(())
                             })();
@@ -996,6 +1078,7 @@ impl EffetuneController {
             Err(reason) => EffetuneRuntime::Unavailable(reason.clone()),
         };
         Self {
+            auto_open,
             main_window,
             remote_session,
             remote_session_notified: false,
@@ -1027,6 +1110,72 @@ impl EffetuneController {
 
     pub fn set_main_hwnd(&self, hwnd: u64) {
         self.main_window.install(hwnd);
+    }
+
+    pub(crate) fn gui_gate(&self) -> Option<Arc<gui_gate::GuiGate>> {
+        self.main_window.gate().ok()
+    }
+
+    pub(crate) fn auto_reader(&self) -> Option<gui_gate::AutoPresentationReader> {
+        self.gui_gate().map(|gate| gate.auto_reader())
+    }
+
+    /// Called only after draining a successful logical start for an eligible
+    /// local video. A stale fact is discarded without spending the session.
+    pub(crate) fn try_auto_open(
+        &mut self,
+        success: gui_gate::AutoPresentationSnapshot,
+        pos: Option<(i32, i32)>,
+        size: Option<(u32, u32)>,
+    ) -> bool {
+        #[cfg(feature = "portable")]
+        {
+            let _ = (success, pos, size);
+            return false;
+        }
+        #[cfg(not(feature = "portable"))]
+        {
+            let Some(gate) = self.gui_gate() else {
+                return false;
+            };
+            if !success.allowed
+                || success != gate.auto_snapshot()
+                || !matches!(
+                    self.runtime,
+                    EffetuneRuntime::Idle
+                        | EffetuneRuntime::Loading { .. }
+                        | EffetuneRuntime::Running { .. }
+                )
+                || !self.auto_open.take()
+            {
+                return false;
+            }
+            let intent = ShowIntent::AutoVideo(AutoPermit {
+                manual: show_permit(&self.main_window, &self.remote_session),
+                projection: success,
+            });
+            match &mut self.runtime {
+                EffetuneRuntime::Idle => {
+                    self.start_load(LoadOrigin::AutoVideo, Some(intent), pos, size);
+                }
+                EffetuneRuntime::Loading {
+                    open_gui_when_ready,
+                    ..
+                } => {
+                    // Initial Startup may finish without a bridge for inert
+                    // saved state. App's missing-cache Video/Audio open paths
+                    // defer on media_startup_load_pending before creating any
+                    // player, so that first load cannot receive a Playing fact.
+                    // UserButton/AutoVideo loads always construct the bridge.
+                    if !matches!(open_gui_when_ready, Some(ShowIntent::Manual(_))) {
+                        *open_gui_when_ready = Some(intent);
+                    }
+                }
+                EffetuneRuntime::Running { .. } => self.request_show_gui_with_permit(intent),
+                _ => unreachable!(),
+            }
+            true
+        }
     }
 
     pub(crate) fn set_keep_visible_when_minimized(&self, keep_visible: bool) {
@@ -1075,10 +1224,13 @@ impl EffetuneController {
     }
 
     pub fn request_show_gui(&self) {
-        self.request_show_gui_with_permit(show_permit(&self.main_window, &self.remote_session));
+        self.request_show_gui_with_permit(ShowIntent::Manual(show_permit(
+            &self.main_window,
+            &self.remote_session,
+        )));
     }
 
-    pub fn request_show_gui_with_permit(&self, permit: ShowPermit) {
+    pub fn request_show_gui_with_permit(&self, permit: ShowIntent) {
         if remote_playback_active(&self.remote_session) {
             return;
         }
@@ -1102,17 +1254,26 @@ impl EffetuneController {
     }
 
     pub fn startup(&mut self, pos: Option<(i32, i32)>, size: Option<(u32, u32)>) {
-        self.start_load(LoadOrigin::Startup, false, pos, size);
+        self.start_load(LoadOrigin::Startup, None, pos, size);
     }
 
     pub fn click_idle(&mut self, pos: Option<(i32, i32)>, size: Option<(u32, u32)>) {
-        self.start_load(LoadOrigin::UserButton, true, pos, size);
+        let intent = ShowIntent::Manual(show_permit(&self.main_window, &self.remote_session));
+        if let EffetuneRuntime::Loading {
+            open_gui_when_ready,
+            ..
+        } = &mut self.runtime
+        {
+            *open_gui_when_ready = Some(intent);
+        } else {
+            self.start_load(LoadOrigin::UserButton, Some(intent), pos, size);
+        }
     }
 
     fn start_load(
         &mut self,
         origin: LoadOrigin,
-        open_gui_when_ready: bool,
+        open_gui_when_ready: Option<ShowIntent>,
         pos: Option<(i32, i32)>,
         size: Option<(u32, u32)>,
     ) {
@@ -1135,8 +1296,7 @@ impl EffetuneController {
         let bundle = self.bundle_path.clone();
         self.runtime = EffetuneRuntime::Loading {
             origin,
-            open_gui_when_ready: open_gui_when_ready
-                .then(|| show_permit(&self.main_window, &self.remote_session)),
+            open_gui_when_ready,
         };
         let captures = Arc::clone(&self.captures);
         let gui_failure_tx = self.gui_failure_tx.clone();
@@ -1231,6 +1391,17 @@ impl EffetuneController {
                 result: Ok(None),
             },
             Err(error) => LoadCompletion::Failed(error),
+        })
+        .unwrap();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_load_bridge_completion(&mut self, bridge: Arc<DspBridge>) {
+        let (tx, rx) = mpsc::channel();
+        self.pending_load = Some(rx);
+        tx.send(LoadCompletion::Loaded {
+            bundle: PathBuf::new(),
+            result: Ok(Some(LoadDone { bridge })),
         })
         .unwrap();
     }
@@ -1547,6 +1718,156 @@ fn startup_state_requires_load(saved: Option<&[u8]>) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(not(feature = "portable"))]
+    fn auto_test_controller() -> EffetuneController {
+        let mut controller = EffetuneController::new();
+        let gate = controller.gui_gate().unwrap();
+        gate.set_auto_factor(gui_gate::AutoSuppression::SettingOff, false);
+        gate.set_auto_factor(gui_gate::AutoSuppression::RootHidden, false);
+        controller.runtime = EffetuneRuntime::Loading {
+            origin: LoadOrigin::Startup,
+            open_gui_when_ready: None,
+        };
+        controller
+    }
+
+    #[test]
+    #[cfg(not(feature = "portable"))]
+    fn auto_success_preserves_revision_and_spends_one_shared_opportunity() {
+        let mut controller = auto_test_controller();
+        let success = controller.auto_reader().unwrap().snapshot();
+        assert!(controller.try_auto_open(success, None, None));
+        let EffetuneRuntime::Loading {
+            open_gui_when_ready: Some(ShowIntent::AutoVideo(permit)),
+            ..
+        } = controller.runtime
+        else {
+            panic!("automatic intent missing");
+        };
+        assert_eq!(permit.projection, success);
+        assert!(!controller.try_auto_open(success, None, None));
+    }
+
+    #[test]
+    #[cfg(not(feature = "portable"))]
+    fn undrained_success_after_every_suppression_round_trip_does_not_spend() {
+        for factor in [
+            gui_gate::AutoSuppression::SettingOff,
+            gui_gate::AutoSuppression::RootHidden,
+            gui_gate::AutoSuppression::Fullscreen,
+            gui_gate::AutoSuppression::Minimized,
+            gui_gate::AutoSuppression::RemoteBlocked,
+        ] {
+            let mut controller = auto_test_controller();
+            let gate = controller.gui_gate().unwrap();
+            let success = gate.auto_snapshot();
+            gate.set_auto_factor(factor, true);
+            let blocked_success = gate.auto_snapshot();
+            gate.set_auto_factor(factor, false);
+            assert!(!controller.try_auto_open(success, None, None));
+            assert!(!controller.try_auto_open(blocked_success, None, None));
+            assert!(!controller.auto_open.spent.load(Ordering::Acquire));
+            assert!(controller.try_auto_open(gate.auto_snapshot(), None, None));
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "portable"))]
+    fn manual_loading_intent_wins_and_successful_manual_ack_spends_auto() {
+        let mut controller = auto_test_controller();
+        controller.click_idle(None, None);
+        let EffetuneRuntime::Loading {
+            open_gui_when_ready: Some(ShowIntent::Manual(manual)),
+            ..
+        } = controller.runtime
+        else {
+            panic!("manual intent missing");
+        };
+        let gate = controller.gui_gate().unwrap();
+        assert!(controller.try_auto_open(gate.auto_snapshot(), None, None));
+        assert!(matches!(
+            controller.runtime,
+            EffetuneRuntime::Loading {
+                open_gui_when_ready: Some(ShowIntent::Manual(_)),
+                ..
+            }
+        ));
+        for factor in [
+            gui_gate::AutoSuppression::SettingOff,
+            gui_gate::AutoSuppression::RootHidden,
+            gui_gate::AutoSuppression::Fullscreen,
+        ] {
+            gate.set_auto_factor(factor, true);
+            assert!(ShowIntent::Manual(manual).allows(manual, false, false, &gate));
+            gate.set_auto_factor(factor, false);
+        }
+        let mut controller = auto_test_controller();
+        let manual = ShowIntent::Manual(show_permit(
+            &controller.main_window,
+            &controller.remote_session,
+        ));
+        for outcome in [
+            crate::video::dsp::bridge::GuiVisibilityOutcome::Cancelled,
+            crate::video::dsp::bridge::GuiVisibilityOutcome::Hidden,
+            crate::video::dsp::bridge::GuiVisibilityOutcome::Error,
+        ] {
+            controller
+                .auto_open
+                .note_show_result(manual, outcome, &controller.gui_gate().unwrap());
+            assert!(!controller.auto_open.spent.load(Ordering::Acquire));
+        }
+        controller.auto_open.note_show_result(
+            manual,
+            crate::video::dsp::bridge::GuiVisibilityOutcome::Shown,
+            &controller.gui_gate().unwrap(),
+        );
+        assert!(!controller.try_auto_open(
+            controller.gui_gate().unwrap().auto_snapshot(),
+            None,
+            None
+        ));
+    }
+
+    #[test]
+    #[cfg(not(feature = "portable"))]
+    fn queued_manual_success_revokes_previously_accepted_unshown_auto() {
+        let mut controller = auto_test_controller();
+        let gate = controller.gui_gate().unwrap();
+        let success = gate.auto_snapshot();
+        assert!(controller.try_auto_open(success, None, None));
+        let EffetuneRuntime::Loading {
+            open_gui_when_ready: Some(auto),
+            ..
+        } = controller.runtime
+        else {
+            panic!("automatic intent missing");
+        };
+        let manual = show_permit(&controller.main_window, &controller.remote_session);
+        assert!(auto.allows(manual, false, false, &gate));
+        controller.auto_open.note_show_result(
+            ShowIntent::Manual(manual),
+            crate::video::dsp::bridge::GuiVisibilityOutcome::Shown,
+            &gate,
+        );
+        assert!(gate.auto_snapshot().allowed);
+        assert_ne!(success.revision, gate.auto_snapshot().revision);
+        assert!(!auto.allows(manual, false, false, &gate));
+        assert!(ShowIntent::Manual(manual).allows(manual, false, false, &gate));
+        assert!(!controller.try_auto_open(gate.auto_snapshot(), None, None));
+    }
+
+    #[test]
+    #[cfg(feature = "portable")]
+    fn portable_never_accepts_auto_video_even_with_eligible_projection() {
+        let mut controller = EffetuneController::new();
+        controller.runtime = EffetuneRuntime::Idle;
+        let gate = controller.gui_gate().unwrap();
+        gate.set_auto_factor(gui_gate::AutoSuppression::SettingOff, false);
+        gate.set_auto_factor(gui_gate::AutoSuppression::RootHidden, false);
+        assert!(!controller.try_auto_open(gate.auto_snapshot(), None, None));
+        assert!(!controller.auto_open.spent.load(Ordering::Acquire));
+    }
+
     #[test]
     fn process_generation_pin_survives_path_consumers_and_failed_load() {
         let temp = tempfile::tempdir().unwrap();
@@ -1689,10 +2010,10 @@ mod tests {
         controller.bridge = Some(DspBridge::new());
         controller.runtime = EffetuneRuntime::Loading {
             origin: LoadOrigin::UserButton,
-            open_gui_when_ready: Some(show_permit(
+            open_gui_when_ready: Some(ShowIntent::Manual(show_permit(
                 &controller.main_window,
                 &controller.remote_session,
-            )),
+            ))),
         };
         controller.set_remote_session(true);
         assert!(matches!(
@@ -2247,3 +2568,6 @@ mod tests {
         assert_eq!(fs::read(path).unwrap(), b"previous");
     }
 }
+
+#[cfg(all(test, not(feature = "portable")))]
+pub(crate) mod delivery_tests;

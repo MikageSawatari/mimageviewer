@@ -193,6 +193,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["再生アイコン", "左下バッジ", "非表示"]
     ),
     entry!(
+        "thumbnail/audio-indicator",
+        Thumbnail,
+        "音声サムネイルの目印",
+        ["音声", "音楽", "マーク", "左下バッジ", "非表示"]
+    ),
+    entry!(
         "thumbnail/resume-meter",
         Thumbnail,
         "本・動画・音声のサムネイルに前回の位置を表示",
@@ -224,7 +230,11 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
             "複数選択",
             "選択済み項目",
             "もう一度",
-            "開く"
+            "開く",
+            "余白",
+            "ダブルクリック",
+            "ダブルタップ",
+            "親フォルダ"
         ]
     ),
     entry!(
@@ -244,6 +254,34 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         Thumbnail,
         "詳細表示時の下部情報バー:",
         ["詳細表示", "列設定", "専用設定"]
+    ),
+    entry!(
+        "thumbnail/details-name-colors",
+        Thumbnail,
+        "名前の色分け",
+        [
+            "詳細一覧",
+            "名前",
+            "色",
+            "フォルダ",
+            "本",
+            "単体画像",
+            "RAW",
+            "動画",
+            "音声",
+            "Light",
+            "Dark",
+            "HEX",
+            "カスタム",
+            "既定",
+            "コントラスト",
+            "通常行",
+            "交互行",
+            "hover",
+            "選択",
+            "チェック",
+            "切り取り"
+        ]
     ),
     entry!(
         "thumbnail/tooltip-items",
@@ -635,8 +673,8 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     entry!(
         "duplicate/video-image",
         DuplicateFiles,
-        "同名の動画と画像がある場合、画像をスキップ",
-        ["重複", "sidecar", "サイドカー"]
+        "同名の動画・音声がある画像を省略",
+        ["重複", "動画", "音声", "sidecar", "サイドカー"]
     ),
     entry!(
         "duplicate/image-priority",
@@ -655,6 +693,21 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ExifDisplay,
         "カスタム追加:",
         ["MakerNote", "内部名", "EXIF タグ"]
+    ),
+    entry!(
+        "spread/chrome-suppression",
+        SpreadMode,
+        crate::ui_helpers::FULLSCREEN_CHROME_SUPPRESSION_SETTING_LABEL,
+        [
+            "F11",
+            "固定",
+            "ロック",
+            "上部バー",
+            "下部バー",
+            "ストリップ",
+            "右情報パネル",
+            "ナビゲータ"
+        ]
     ),
     entry!(
         "spread/side-panels",
@@ -737,6 +790,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         SpreadMode,
         "横連結の方向",
         ["右から左", "左から右", "RTL", "LTR", "読み方向"]
+    ),
+    entry!(
+        "spread/fit-cycle",
+        SpreadMode,
+        "フィット循環に含めるモード",
+        ["切り替え", "リング", "ジェスチャ", "0キー", "倍率"]
     ),
     entry!(
         "spread/fit",
@@ -1145,6 +1204,19 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     ),
     #[cfg(not(feature = "portable"))]
     entry!(
+        "video/effetune-auto-open",
+        Video,
+        "起動後の最初の動画再生で音響調整の窓を自動で開く",
+        [
+            "音響調整",
+            "ビジュアライザー",
+            "自動表示",
+            "初回",
+            "EffeTune"
+        ]
+    ),
+    #[cfg(not(feature = "portable"))]
+    entry!(
         "video/effetune-minimized",
         Video,
         "メインウィンドウを最小化しても音響調整の窓を表示したままにする",
@@ -1158,9 +1230,9 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     ),
     entry!(
         "video/sidecar-thumbnail",
-        Video,
-        "同名ファイル名の画像があれば動画サムネに優先採用",
-        ["サイドカー", "sidecar", "動画サムネイル"]
+        Thumbnail,
+        "同名の画像をサムネイルに使う（動画・音声）",
+        ["サイドカー", "sidecar", "動画サムネイル", "音声", "音楽"]
     ),
     entry!(
         "vst3/enabled",
@@ -1246,6 +1318,7 @@ mod tests {
     const PAGES_SOURCE: &str = include_str!("pages.rs");
     const PREFERENCES_SOURCE: &str = include_str!("../preferences.rs");
     const RAW_SETTINGS_SOURCE: &str = include_str!("../../ui_raw.rs");
+    const NAME_COLORS_SOURCE: &str = include_str!("name_colors.rs");
 
     fn anchors_in_pages_source(source: &str) -> Vec<&str> {
         source
@@ -1377,6 +1450,15 @@ mod tests {
                 assert!(
                     PAGES_SOURCE.contains("crate::ui_helpers::draw_offline_change_scan_setting(")
                 );
+            } else if entry.anchor == "spread/chrome-suppression" {
+                assert_eq!(
+                    entry.title,
+                    crate::ui_helpers::FULLSCREEN_CHROME_SUPPRESSION_SETTING_LABEL
+                );
+                assert!(
+                    PAGES_SOURCE
+                        .contains("crate::ui_helpers::draw_fullscreen_chrome_suppression_setting(")
+                );
             } else {
                 let title_source = if entry.anchor == "raw-develop/settings" {
                     assert!(
@@ -1384,6 +1466,12 @@ mod tests {
                             .contains("crate::ui_raw::draw_settings(ui, &mut state.settings)")
                     );
                     RAW_SETTINGS_SOURCE
+                } else if entry.anchor == "thumbnail/details-name-colors" {
+                    assert!(
+                        PAGES_SOURCE
+                            .contains("super::name_colors::draw_settings(ui, &mut state.settings)")
+                    );
+                    NAME_COLORS_SOURCE
                 } else {
                     PAGES_SOURCE
                 };
@@ -1480,6 +1568,18 @@ mod tests {
     }
 
     #[test]
+    fn effetune_auto_open_search_matches_the_build_flavor() {
+        let result = search_preferences("EffeTune 自動表示", test_tree_position);
+        #[cfg(not(feature = "portable"))]
+        assert_eq!(
+            result.first().map(|entry| entry.anchor),
+            Some("video/effetune-auto-open")
+        );
+        #[cfg(feature = "portable")]
+        assert!(result.is_empty());
+    }
+
+    #[test]
     fn title_prefix_precedes_title_substring() {
         let results = search_preferences("表示", test_tree_position);
         let prefix = results
@@ -1520,7 +1620,7 @@ mod tests {
         ] {
             let results = search_preferences(query, test_tree_position);
             assert!(!results.is_empty(), "no RAW settings result for {query}");
-            assert!(results.iter().all(|entry| {
+            assert!(results.iter().any(|entry| {
                 entry.page == PreferencesPage::RawDevelop && entry.anchor == "raw-develop/settings"
             }));
         }
@@ -1595,6 +1695,57 @@ mod tests {
                 .find(|entry| entry.anchor == anchor)
                 .expect("clipboard capture settings must be discoverable");
             assert_eq!(result.page, PreferencesPage::ClipboardCapture);
+        }
+    }
+    #[test]
+    fn audio_thumbnail_indicator_and_common_sidecar_settings_are_searchable() {
+        for (query, anchor, page) in [
+            (
+                "音声 マーク",
+                "thumbnail/audio-indicator",
+                PreferencesPage::Thumbnail,
+            ),
+            (
+                "音声 サイドカー",
+                "video/sidecar-thumbnail",
+                PreferencesPage::Thumbnail,
+            ),
+            (
+                "動画 サイドカー",
+                "video/sidecar-thumbnail",
+                PreferencesPage::Thumbnail,
+            ),
+            (
+                "音声 重複",
+                "duplicate/video-image",
+                PreferencesPage::DuplicateFiles,
+            ),
+        ] {
+            let entry = search_preferences(query, test_tree_position)
+                .into_iter()
+                .find(|entry| entry.anchor == anchor)
+                .expect("audio thumbnail setting is searchable");
+            assert_eq!(entry.page, page);
+            assert!(PAGES_SOURCE.contains(&format!("anchored(ui, state, \"{anchor}\"")));
+        }
+    }
+
+    #[test]
+    fn details_name_color_search_finds_categories_themes_and_validation() {
+        for query in [
+            "名前 色",
+            "RAW HEX",
+            "Light カスタム",
+            "通常行 コントラスト",
+            "切り取り 名前",
+        ] {
+            assert!(
+                search_preferences(query, test_tree_position)
+                    .iter()
+                    .any(|entry| entry.page == PreferencesPage::Thumbnail
+                        && entry.anchor == "thumbnail/details-name-colors"),
+                "missing name-color result: {query}"
+            );
         }
     }
 }

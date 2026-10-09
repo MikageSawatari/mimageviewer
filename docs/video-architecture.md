@@ -9,6 +9,13 @@ NVIDIA RTX VSR 関連の Phase 2 (DComp overlay) を撤回した後の **最終�
 > HUD 描画コードは旧版の残骸 (v0.9.0 で native presenter に移行)。新規 UI 機能を追加する際は
 > `native_presenter` 側に書くこと。詳細は本書「採用アーキテクチャ」節と「ファイル責務」節を参照。
 
+native overlayは必須のGPU資源 `NativeEguiOverlayGpu` とCPU側の入力・描画状態
+`NativeEguiOverlayState` を分けて保持する。native presenterとheadless回帰は同じ
+`hud_visible`・resize寸法更新・egui描画・最終可視性・hidden cleanupを使用し、
+テスト用のboolだけで同core操作継続を判定しない。DCompのattach / detachとGPU
+configure / submissionは製品rendererの既存境界に残る。検証範囲は
+[locked chrome抑制の実装追補](fullscreen-locked-chrome-suppression-plan.md#13-実装レビュー追補2026-10-08)を参照。
+
 ## 設計目標
 
 | 優先順位 | 目標 |
@@ -2947,6 +2954,18 @@ Phase 2 で `handle_native_video_output_event` (= 入力イベント反映)、�
 XButton の context-owned hold を tickし、Phase 3 で `tick_native_video_loop_boundary` (= 境界 tick)。
 UP terminal がrepeatより先に確定し、repeatは既存 `next_repaint` deadlineへ合流する。順序は P2/P3を
 入れ替えると serial guardが直近 seekを検出できないため固定。
+
+### F11の固定表示抑制とnative chrome snapshot (§1.344)
+
+`NativeChromeSnapshot` はraw bar / context info state / 抑制対象を一体で運び、従来のbar・side-panel別更新を置換する。
+初期configとcandidateはraw policyとtarget host identityを受け取る。`NativeChromeState` はそのcoreのplacement・
+既存generation・window lease / host incarnation / HWNDに対応付けたapplied factを保持し、更新時に実効値を解く。
+保留commandのraw policyは適用先のplacementで再計算し、host factだけexact identity / generationで照合する。
+不一致factやabsenceで現target factを消さず、abortは旧coreとともに旧factを保持・復元する。
+draw / DComp media予約 / HUD regionは同じ実効値を使い、鍵はraw。右×は明示closeとして既存App ownerへ返す。
+同coreのseek / strip dragとpopupは可視性入力に含め、通常F11のcore再生成では移譲しない。
+stripのhideは既存Hidden / Suspendedのpresent契約に従い、worker / decoderのterminal closeへ変換しない。
+[設計](fullscreen-locked-chrome-suppression-plan.md) §4.1・5・6を参照。
 
 ## 配布要件
 

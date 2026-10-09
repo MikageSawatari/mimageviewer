@@ -297,9 +297,10 @@ impl SessionStateMachine {
         }
         #[cfg(windows)]
         if let Some(gate) = self.gui_gate.as_ref().and_then(Weak::upgrade) {
-            gate.publish_remote(
+            gate.publish_remote_with_revision(
                 Some(self.acquisition_sequence),
                 self.lifecycle.phase.blocks_local_control(),
+                transition == RemoteControlTransition::BeginAcquire,
             );
         }
         Ok(())
@@ -1376,9 +1377,11 @@ impl SessionHandle {
     pub(crate) fn set_gui_gate(&self, gate: Option<Arc<crate::effetune::gui_gate::GuiGate>>) {
         let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(previous) = state.gui_gate.take().and_then(|gate| gate.upgrade()) {
+            previous.invalidate_auto();
             previous.publish_remote(None, false);
         }
         if let Some(gate) = &gate {
+            gate.invalidate_auto();
             gate.publish_remote(
                 Some(state.acquisition_sequence),
                 state.lifecycle.phase.blocks_local_control(),
@@ -3020,6 +3023,68 @@ mod tests {
                 .drain_wait_diagnostic(Duration::from_secs(13))
                 .is_some()
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn effetune_auto_remote_round_trip_publishes_at_each_canonical_transition() {
+        let controller = crate::effetune::EffetuneController::new();
+        let gate = controller.gui_gate().unwrap();
+        gate.set_auto_factor(
+            crate::effetune::gui_gate::AutoSuppression::SettingOff,
+            false,
+        );
+        gate.set_auto_factor(
+            crate::effetune::gui_gate::AutoSuppression::RootHidden,
+            false,
+        );
+        let mut state = SessionStateMachine::default();
+        state.gui_gate = Some(Arc::downgrade(&gate));
+        let success = gate.auto_snapshot();
+        assert!(success.allowed);
+        state
+            .transition_lifecycle(RemoteControlTransition::BeginAcquire)
+            .unwrap();
+        assert!(!gate.auto_snapshot().allowed);
+        let acquisition_revision = gate.auto_snapshot().revision;
+        state
+            .transition_lifecycle(RemoteControlTransition::FinishAcquire)
+            .unwrap();
+        state
+            .transition_lifecycle(RemoteControlTransition::BeginDrain)
+            .unwrap();
+        assert!(!gate.auto_snapshot().allowed);
+        state
+            .transition_lifecycle(RemoteControlTransition::FinishDrain)
+            .unwrap();
+        assert!(gate.auto_snapshot().allowed);
+        assert!(gate.auto_snapshot().revision > acquisition_revision);
+        assert_ne!(gate.auto_snapshot(), success);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn effetune_auto_remote_gate_registration_and_detach_revoke_old_facts() {
+        let controller = crate::effetune::EffetuneController::new();
+        let gate = controller.gui_gate().unwrap();
+        gate.set_auto_factor(
+            crate::effetune::gui_gate::AutoSuppression::SettingOff,
+            false,
+        );
+        gate.set_auto_factor(
+            crate::effetune::gui_gate::AutoSuppression::RootHidden,
+            false,
+        );
+        let handle = SessionHandle::new();
+        let before = gate.auto_snapshot();
+        handle.set_gui_gate(Some(gate.clone()));
+        assert_ne!(gate.auto_snapshot(), before);
+        let attached = gate.auto_snapshot();
+        handle.set_gui_gate(None);
+        assert_ne!(gate.auto_snapshot(), attached);
+        assert!(gate.auto_snapshot().allowed);
+        handle.set_gui_gate(Some(gate.clone()));
+        assert_ne!(gate.auto_snapshot(), attached);
     }
 
     #[test]

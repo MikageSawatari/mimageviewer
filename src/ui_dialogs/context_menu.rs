@@ -399,7 +399,7 @@ struct NativeGridContextMenuTarget {
     is_folder_context: bool,
     has_checked: bool,
     checked_count: usize,
-    external_tool_targets: Vec<crate::external_tool::LaunchTarget>,
+    external_tool_descriptor: crate::external_tool::ExternalTargetDescriptor,
     surface: ContextMenuSurface,
     explorer_folder: Option<PathBuf>,
     folder_command_target: Option<PathBuf>,
@@ -1303,18 +1303,10 @@ impl crate::app::App {
                 .map(|path| vec![(idx, path.to_path_buf())])
                 .unwrap_or_default()
         };
-        let external_tool_targets = if is_folder_context {
-            // 背景は checked 項目ではなく、現在開いているフォルダー / 本そのものを渡す。
-            // effective_folder を所有する共通 helper 経由なので、変換 cache の ZIP ではなく
-            // ユーザー視点の元アーカイブになり、合成一覧の stale origin は拒否される。
-            self.external_tool_container_targets()
+        let external_tool_descriptor = if is_folder_context {
+            self.external_tool_container_descriptor()
         } else if surface == ContextMenuSurface::Grid && item.container_path().is_some() {
-            // コンテナー項目の右クリックは「項目集合を開く」ではなく「このコンテナーを開く」
-            // 専用入口。既存の平坦なツール列は保ち、対象だけ Container の 1 件へ切り替える。
-            crate::external_tool::resolve_external_targets(
-                &self.items,
-                self.current_grid_order(),
-                &self.checked,
+            self.external_tool_target_descriptor(
                 crate::external_tool::ExternalTargetSource::Container {
                     path: item.container_path().map(Path::to_path_buf),
                 },
@@ -1328,12 +1320,7 @@ impl crate::app::App {
                     crate::external_tool::ExternalTargetSource::Viewer { current: Some(idx) }
                 }
             };
-            crate::external_tool::resolve_external_targets(
-                &self.items,
-                self.current_grid_order(),
-                &self.checked,
-                source,
-            )
+            self.external_tool_context_menu_descriptor(source)
         };
         let collection_root_delete = self
             .collection_root_delete_resolution((!is_folder_context).then_some(idx), has_checked);
@@ -1347,7 +1334,7 @@ impl crate::app::App {
             is_folder_context,
             has_checked,
             checked_count: if has_checked { self.checked.len() } else { 0 },
-            external_tool_targets,
+            external_tool_descriptor,
             surface,
             explorer_folder,
             folder_command_target,
@@ -1362,9 +1349,7 @@ impl crate::app::App {
     ) -> Vec<MenuNode> {
         let external_items = crate::external_tool::external_tool_menu_items(
             &self.settings.external_tools,
-            crate::external_tool::ExternalToolMenuTarget::from_launch_targets(
-                &target.external_tool_targets,
-            ),
+            target.external_tool_descriptor.capability,
         );
         let labels: Vec<_> = external_items
             .iter()
@@ -1822,11 +1807,10 @@ impl crate::app::App {
                     self.show_feedback_toast(format!("外部ツールが見つかりません (ID: {})", id.0));
                     return None;
                 };
-                self.queue_external_tool_launch_targets_from_context_menu(
+                self.queue_external_tool_launch_from_context_menu(
                     ctx,
                     &tool,
-                    &target.external_tool_targets,
-                    target.surface == ContextMenuSurface::Fullscreen,
+                    &target.external_tool_descriptor,
                 );
                 None
             }
@@ -3221,11 +3205,14 @@ mod delete_confirm_tests {
         );
     }
 
-    fn target(item: GridItem, surface: ContextMenuSurface) -> NativeGridContextMenuTarget {
+    fn target(
+        app: &crate::app::App,
+        item: GridItem,
+        surface: ContextMenuSurface,
+    ) -> NativeGridContextMenuTarget {
         let path = item.drag_source_path().map(Path::to_path_buf);
-        let external_tool_targets = vec![crate::external_tool::LaunchTarget::from_grid_item(Some(
-            &item,
-        ))];
+        let external_tool_descriptor =
+            crate::external_tool::ExternalTargetDescriptor::for_test_item(app, &item);
         NativeGridContextMenuTarget {
             shell_paths: path.clone().map(|path| vec![path]),
             real_paths: path.into_iter().collect(),
@@ -3236,7 +3223,7 @@ mod delete_confirm_tests {
             is_folder_context: false,
             has_checked: false,
             checked_count: 0,
-            external_tool_targets,
+            external_tool_descriptor,
             surface,
             explorer_folder: Some(PathBuf::from(r"C:\media")),
             folder_command_target: None,
@@ -3259,7 +3246,7 @@ mod delete_confirm_tests {
                 }
             }
         }
-        let target = target(item, surface);
+        let target = target(app, item, surface);
         let mut commands = Vec::new();
         visit(&app.context_menu_nodes(&target, false), &mut commands);
         commands
@@ -3329,6 +3316,7 @@ mod delete_confirm_tests {
         }
         let mut app = crate::app::setup_app_for_test();
         let mut root = target(
+            &app,
             GridItem::Image(PathBuf::from(r"C:\media\linked.jpg")),
             ContextMenuSurface::Grid,
         );
@@ -3380,20 +3368,16 @@ mod delete_confirm_tests {
             collection_jump_source_path(&missing),
             Some(Path::new(r"C:\media\missing.jpg"))
         );
-        let missing_target = target(missing, ContextMenuSurface::Grid);
+        let mut app = crate::app::setup_app_for_test();
+        let missing_target = target(&app, missing, ContextMenuSurface::Grid);
         assert!(missing_target.shell_paths.is_none());
         assert!(missing_target.real_paths.is_empty());
         assert!(missing_target.delete_targets.is_empty());
-        assert!(
-            missing_target
-                .external_tool_targets
-                .iter()
-                .all(|target| target.real_file().is_err())
-        );
+        assert!(missing_target.item.drag_source_path().is_none());
 
-        let mut app = crate::app::setup_app_for_test();
         for root in [PathBuf::from(r"C:\"), PathBuf::from(r"\\server\share")] {
             let mut target = target(
+                &app,
                 GridItem::CollectionPlaceholder {
                     path: root,
                     last_known_kind: CollectionResolvedKind::Image,
@@ -3460,6 +3444,7 @@ mod delete_confirm_tests {
         let mut app = crate::app::setup_app_for_test();
         let ctx = egui::Context::default();
         let mut target = target(
+            &app,
             GridItem::Image(PathBuf::from(r"C:\media\clicked.jpg")),
             ContextMenuSurface::Grid,
         );
@@ -3607,6 +3592,7 @@ mod delete_confirm_tests {
     fn file_cut_copy_labels_follow_keymap_overrides_and_unbinding() {
         let mut app = crate::app::setup_app_for_test();
         let target = target(
+            &app,
             GridItem::Image(PathBuf::from(r"C:\media\image.jpg")),
             ContextMenuSurface::Grid,
         );
@@ -3649,7 +3635,8 @@ mod delete_confirm_tests {
             Some(PathBuf::from(r"C:\media")),
         );
         let paths: Vec<_> = target
-            .external_tool_targets
+            .external_tool_descriptor
+            .targets_for_test(&app)
             .iter()
             .map(|target| target.real_file().unwrap().to_path_buf())
             .collect();
@@ -3685,7 +3672,7 @@ mod delete_confirm_tests {
         );
 
         assert_eq!(
-            target.external_tool_targets,
+            target.external_tool_descriptor.targets_for_test(&app),
             vec![crate::external_tool::LaunchTarget::RealFile(PathBuf::from(
                 r"C:\media\book.zip"
             ))]
@@ -3707,7 +3694,7 @@ mod delete_confirm_tests {
             None,
         );
         assert_eq!(
-            target.external_tool_targets,
+            target.external_tool_descriptor.targets_for_test(&app),
             vec![crate::external_tool::LaunchTarget::RealFile(PathBuf::from(
                 r"C:\books\book.7z"
             ))]
@@ -3723,7 +3710,12 @@ mod delete_confirm_tests {
             ContextMenuSurface::Grid,
             None,
         );
-        assert!(target.external_tool_targets.is_empty());
+        assert!(
+            target
+                .external_tool_descriptor
+                .targets_for_test(&app)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3763,7 +3755,7 @@ mod delete_confirm_tests {
             )
         }));
         assert!(matches!(
-            &target.external_tool_targets[..],
+            &target.external_tool_descriptor.targets_for_test(&app)[..],
             [
                 crate::external_tool::LaunchTarget::ImagePage(_),
                 crate::external_tool::LaunchTarget::PdfPage { page_num: 2, .. }
@@ -3799,9 +3791,11 @@ mod delete_confirm_tests {
             is_folder_context: false,
             has_checked: true,
             checked_count: 1,
-            external_tool_targets: vec![crate::external_tool::LaunchTarget::RealFile(
-                PathBuf::from(r"C:\media\checked-other.jpg"),
-            )],
+            external_tool_descriptor: app.external_tool_target_descriptor(
+                crate::external_tool::ExternalTargetSource::Container {
+                    path: Some(PathBuf::from(r"C:\media\checked-other.jpg")),
+                },
+            ),
             surface: ContextMenuSurface::Grid,
             explorer_folder: Some(PathBuf::from(r"C:\media")),
             folder_command_target: None,
@@ -3846,6 +3840,7 @@ mod delete_confirm_tests {
     fn missing_external_tool_id_is_reported_instead_of_ignored() {
         let mut app = crate::app::setup_app_for_test();
         let target = target(
+            &app,
             GridItem::Image(PathBuf::from(r"C:\media\clicked.jpg")),
             ContextMenuSurface::Grid,
         );
@@ -3996,7 +3991,9 @@ mod delete_confirm_tests {
 
     #[test]
     fn collection_root_forces_an_explicit_source_shell_submenu_even_when_inline_is_enabled() {
+        let app = crate::app::setup_app_for_test();
         let mut root = target(
+            &app,
             GridItem::Image(PathBuf::from(r"C:\media\linked.jpg")),
             ContextMenuSurface::Grid,
         );
@@ -4064,6 +4061,7 @@ mod delete_confirm_tests {
         }
         let mut app = crate::app::setup_app_for_test();
         let mut target = target(
+            &app,
             GridItem::Image(PathBuf::from(r"C:\media\linked.jpg")),
             ContextMenuSurface::Grid,
         );
