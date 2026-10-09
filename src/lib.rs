@@ -21,6 +21,11 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#[cfg(test)]
+#[path = "../tests/support/ui_harness.rs"]
+pub(crate) mod test_ui;
+mod wgpu_backend_policy;
+
 pub mod activity_gate;
 pub mod adjustment;
 pub mod adjustment_db;
@@ -1486,8 +1491,8 @@ pub fn run() -> eframe::Result {
     // wgpu 既定のスコアリングでは Vulkan が DX12 より優先選択される環境があるため、
     // カスタムアダプタセレクタで明示的に DX12 アダプタを最優先する。DX12 が無ければ
     // Vulkan、それも無ければ任意の adapter を返す (eframe / egui 自体は描画される)。
-    // 動画 GPU 経路は実行時に `cc.wgpu_render_state.adapter.get_info().backend` を見て
-    // DX12 のときだけ有効化、Vulkan ならスキップして CPU readback で再生する。
+    // native video は独立した D3D11 device、HUD は別の DX12 Instance を使い、
+    // root GUI の選択 backend に依存しない。
     let mut wgpu_options = egui_wgpu::WgpuConfiguration::default();
     configure_wgpu_presentation(&mut wgpu_options);
     wgpu_options.startup_diagnostics = Some(Arc::new(|event| {
@@ -1538,7 +1543,7 @@ pub fn run() -> eframe::Result {
         }
     }));
     if let egui_wgpu::WgpuSetup::CreateNew(create_new) = &mut wgpu_options.wgpu_setup {
-        create_new.instance_descriptor.backends = wgpu::Backends::DX12 | wgpu::Backends::VULKAN;
+        create_new.instance_descriptor.backends = wgpu_backend_policy::native_backends();
         create_new.native_adapter_selector = Some(std::sync::Arc::new(
             |adapters: &[wgpu::Adapter], _surface: Option<&wgpu::Surface<'_>>| {
                 if let Some(a) = adapters
@@ -1784,11 +1789,8 @@ pub fn run() -> eframe::Result {
             if let Some(rs) = cc.wgpu_render_state.clone() {
                 #[cfg(windows)]
                 {
-                    // 実際に選ばれた wgpu バックエンドを確認。動画 GPU 経路は
-                    // `wgpu_hal::api::Dx12` 経由で D3D11 NT shared texture を
-                    // import するので **DX12 でないと使えない**。Vulkan
-                    // (= リモートデスクトップ等の fallback) では GPU video device を
-                    // 作らず CPU readback + swscale 経路にフォールバックする。
+                    // root GUI の backend を診断用に記録する。native video の
+                    // 独立した D3D11 device 作成を、この値で制限しない。
                     let backend = rs.adapter.get_info().backend;
                     crate::logger::log(format!("wgpu backend selected: {backend:?}"));
                     // GpuVideoDevice は wgpu backend に依存せず独立した D3D11 device を

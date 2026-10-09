@@ -1790,6 +1790,17 @@ V キーと同じ入口・同じ後始末を通るので、こちらとは別の
 
 ### 1.175 `ui_snapshot` のテスト実行体が、たまにアクセス違反で落ちる / 進まなくなる
 
+**2026-10-09 Line F 後続修正 (base `5d7b30619`):** Windows 製品 root は `DX12 | VULKAN`、
+native video は独立 D3D11 / DX12 HUD で、GL を要求しないことを確認した。
+既定 kittest の GL 初期化は製品経路と不一致で、捕捉した2件の AV はその WGL 生成中だった。
+共通 test builder の要求 mask を製品の共通 policy に揃え、integration / lib の163箇所へ接続した。
+CPU adapter 優先・lazy 初期化・各 Harness の独立 GPU 所有・並列性・既存画像は維持する。
+共有 Device / 直列化 / retry は追加しない。未採取 hang と driver 内部原因は未確定のまま区別する。
+旧AV捕捉と同じ9起動のstressは各142/142、全snapshot142/142、通常全lib11,417成功・52 ignored。
+追加test-script全libでは既存fake-frame double-clickが1件失敗し単独でも再現、別件として保持する。
+詳細・回帰結果・dump の主要 stack と削除状況は [GPU snapshot 調査記録](ui-snapshot-gpu-investigation.md)、
+引き継ぎは `target/F-1175-fix-msg.txt`。実アプリ起動・コミットなし。
+
 **2026-10-09 Line F 調査 (`next-qa` / `d1c95344e`):** actual `ui_snapshot` の4-thread実行で
 second-chance AVを捕捉。fault threadはWGL hidden-window ownerで、
 `setup_pixel_format → ChoosePixelFormat → nvoglv64.dll` の生成経路。別WGL threadsの初期化と

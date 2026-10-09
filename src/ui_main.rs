@@ -1479,11 +1479,9 @@ mod sticky_settings_menu_header_tests {
 
     #[test]
     fn header_width_does_not_follow_available_screen_width() {
-        use egui_kittest::Harness;
-
         let measured_width = Arc::new(Mutex::new(None));
         let measured_width_in_ui = measured_width.clone();
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(800.0, 180.0))
             .build(move |ctx| {
                 let area = egui::Area::new(egui::Id::new("sticky_settings_menu_header_test"))
@@ -1509,11 +1507,11 @@ mod sticky_settings_menu_header_tests {
 
     #[test]
     fn sticky_menu_keeps_checkbox_clicks_open_and_closes_explicitly() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
         let dedicated = Arc::new(Mutex::new(false));
         let dedicated_in_ui = Arc::clone(&dedicated);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(640.0, 360.0))
             .build(move |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
@@ -6147,11 +6145,9 @@ mod details_column_context_menu_layout_tests {
 
     #[test]
     fn tall_screen_shows_the_full_menu_without_scrolling() {
-        use egui_kittest::Harness;
-
         let measured = Arc::new(Mutex::new(None));
         let measured_in_ui = Arc::clone(&measured);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_pixels_per_point(1.25)
             .with_size(egui::vec2(900.0, 900.0))
             .build(move |ctx| {
@@ -6195,11 +6191,11 @@ mod details_column_context_menu_layout_tests {
 
     #[test]
     fn short_screen_bounds_the_menu_and_keeps_it_scrollable() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
         let measured = Arc::new(Mutex::new(None));
         let measured_in_ui = Arc::clone(&measured);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(900.0, 200.0))
             .build(move |ctx| {
                 let area = egui::Area::new(egui::Id::new(0xD37A_12_u64))
@@ -6236,11 +6232,9 @@ mod details_column_context_menu_layout_tests {
 
     #[test]
     fn menu_width_is_bounded_and_columns_are_side_by_side() {
-        use egui_kittest::Harness;
-
         let measured = Arc::new(Mutex::new(None));
         let measured_in_ui = Arc::clone(&measured);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1200.0, 700.0))
             .build(move |ctx| {
                 let area = egui::Area::new(egui::Id::new("details_column_menu_layout_test"))
@@ -6403,7 +6397,7 @@ fn details_header_sort_hover_text(
 #[cfg(test)]
 mod collection_order_mode_menu_tests {
     use super::*;
-    use egui_kittest::{Harness, kittest::Queryable};
+    use egui_kittest::kittest::Queryable;
 
     #[test]
     fn reorder_disabled_message_matches_root_mode_and_admission_state() {
@@ -6494,7 +6488,7 @@ mod collection_order_mode_menu_tests {
 
         let app = std::rc::Rc::new(std::cell::RefCell::new(app));
         let render_app = std::rc::Rc::clone(&app);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(520.0, 240.0))
             .build(move |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
@@ -6557,10 +6551,7 @@ mod collection_order_mode_menu_tests {
 #[cfg(test)]
 mod fixed_sort_control_tests {
     use super::*;
-    use egui_kittest::{
-        Harness,
-        kittest::{NodeT, Queryable},
-    };
+    use egui_kittest::kittest::{NodeT, Queryable};
     use std::{
         cell::{Cell, RefCell},
         rc::Rc,
@@ -6634,7 +6625,7 @@ mod fixed_sort_control_tests {
             let render_app = Rc::clone(&app);
             let fonts_set = Cell::new(false);
             SORT_CONTROL_TEST_RELOADS.with(|count| count.set(0));
-            let mut harness = Harness::builder()
+            let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1700.0, 500.0))
                 .build(move |ctx| {
                     if !fonts_set.replace(true) {
@@ -6730,7 +6721,7 @@ mod fixed_sort_control_tests {
         let app = Rc::new(RefCell::new(app));
         let render_app = Rc::clone(&app);
         let fonts_set = Cell::new(false);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1280.0, 800.0))
             .build(move |ctx| {
                 if !fonts_set.replace(true) {
@@ -6897,7 +6888,7 @@ mod fixed_sort_control_tests {
         let app = Rc::new(RefCell::new(app));
         let render_app = Rc::clone(&app);
         let fonts_set = Cell::new(false);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1700.0, 500.0))
             .build(move |ctx| {
                 if !fonts_set.replace(true) {
@@ -6940,7 +6931,7 @@ mod fixed_sort_control_tests {
         let render_app = Rc::clone(&app);
         let fonts_set = Cell::new(false);
         SORT_CONTROL_TEST_RESPONSES.with(|responses| responses.borrow_mut().clear());
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1500.0, 500.0))
             .build(move |ctx| {
                 if !fonts_set.replace(true) {
@@ -20431,7 +20422,7 @@ mod facet_filter_bar_tests {
 
     #[test]
     fn omitted_chip_shows_only_relevant_settings_links() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
         let counts = crate::app::OmittedFolderEntryCounts {
             same_name: 3,
@@ -20441,7 +20432,7 @@ mod facet_filter_bar_tests {
             unsupported: 1,
             system: 0,
         };
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(640.0, 240.0))
             .build(move |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
@@ -20477,7 +20468,7 @@ mod facet_filter_bar_tests {
             unsupported: 1,
             system: 0,
         };
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(640.0, 240.0))
             .build(move |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
@@ -20501,13 +20492,13 @@ mod facet_filter_bar_tests {
         link_label: &str,
         expected: crate::ui_dialogs::preferences::PreferencesOpenRequest,
     ) {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
         use std::sync::{Arc, Mutex};
 
         let opened = Arc::new(Mutex::new(None));
         let opened_for_ui = Arc::clone(&opened);
         let chip_label = omitted_entries_chip_label(counts).expect("chip label");
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(640.0, 240.0))
             .build(move |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
@@ -24978,10 +24969,7 @@ mod effetune_toolbar_flavor_tests {
     #[cfg(not(feature = "portable"))]
     fn effetune_button_enables_preparation_retry_but_keeps_other_failures_disabled() {
         use crate::effetune::{EffetuneFailure, EffetuneRuntime, LoadOrigin, UnavailableReason};
-        use egui_kittest::{
-            Harness,
-            kittest::{NodeT, Queryable},
-        };
+        use egui_kittest::kittest::{NodeT, Queryable};
         let cases = [
             (EffetuneRuntime::Idle, true),
             (EffetuneRuntime::Running { generation: 1 }, true),
@@ -25019,7 +25007,7 @@ mod effetune_toolbar_flavor_tests {
             app.effetune.runtime = runtime;
             assert_eq!(app.effetune_toolbar_available(), expected);
             let mut fonts_ready = false;
-            let mut harness = Harness::builder()
+            let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(1200.0, 300.0))
                 .build(move |ctx| {
                     if fonts_ready {
@@ -25256,7 +25244,7 @@ mod collection_toolbar_interaction_tests {
         first: crate::collection_store::CollectionId,
     ) -> Harness<'static, ToolbarState> {
         let second = crate::collection_store::CollectionId::new();
-        Harness::builder()
+        crate::test_ui::builder()
             .with_size(egui::vec2(900.0, 240.0))
             .build_state(
                 |ctx, state| {
@@ -25619,7 +25607,7 @@ mod collection_toolbar_interaction_tests {
 #[cfg(test)]
 mod checked_selection_overlay_tests {
     use super::*;
-    use egui_kittest::{Harness, kittest::Queryable};
+    use egui_kittest::kittest::Queryable;
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -25731,7 +25719,7 @@ mod checked_selection_overlay_tests {
     fn checked_selection_overlay_real_area_honors_available_top_and_marker_clearance() {
         let available_top = Arc::new(std::sync::Mutex::new(None));
         let available_top_in_ui = Arc::clone(&available_top);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(640.0, 420.0))
             .build(move |ctx| {
                 egui::TopBottomPanel::top("checked-overlay-test-toolbar")
@@ -25752,7 +25740,7 @@ mod checked_selection_overlay_tests {
 
     #[test]
     fn checked_selection_overlay_is_absent_when_no_items_are_checked() {
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(480.0, 300.0))
             .build(|ctx| {
                 let _ = show_checked_selection_overlay(ctx, 0);
@@ -25765,7 +25753,7 @@ mod checked_selection_overlay_tests {
 
     #[test]
     fn checked_selection_overlay_shows_the_exact_checked_count() {
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(480.0, 300.0))
             .build(|ctx| {
                 let _ = show_checked_selection_overlay(ctx, 1);
@@ -25780,7 +25768,7 @@ mod checked_selection_overlay_tests {
     fn checked_selection_overlay_click_requests_deselect() {
         let clicked = Arc::new(AtomicBool::new(false));
         let clicked_in_ui = Arc::clone(&clicked);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(480.0, 300.0))
             .build(move |ctx| {
                 if show_checked_selection_overlay(ctx, 2) {
@@ -25798,7 +25786,7 @@ mod checked_selection_overlay_tests {
     fn checked_selection_overlay_count_text_does_not_deselect() {
         let clicked = Arc::new(AtomicBool::new(false));
         let clicked_in_ui = Arc::clone(&clicked);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(480.0, 300.0))
             .build(move |ctx| {
                 if show_checked_selection_overlay(ctx, 2) {
@@ -26097,8 +26085,6 @@ mod saved_group_number_ui_tests {
 
     #[test]
     fn book_manager_numbered_dark_snapshot() {
-        use egui_kittest::Harness;
-
         let mut app = crate::app::setup_app_for_test();
         app.show_book_manager = true;
         app.settings.active_book_name = "Alpha".into();
@@ -26119,7 +26105,7 @@ mod saved_group_number_ui_tests {
         let app = std::rc::Rc::new(std::cell::RefCell::new(app));
         let ui_app = std::rc::Rc::clone(&app);
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(900.0, 600.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -26198,7 +26184,7 @@ mod grid_reclick_open_tests {
             background_navs: Vec::new(),
             close_popup_before_background: false,
         };
-        Harness::builder()
+        crate::test_ui::builder()
             .with_size(egui::vec2(460.0, 200.0))
             .with_step_dt(0.01)
             .build_state(
@@ -26729,7 +26715,7 @@ mod grid_reclick_open_tests {
             app.image_metas = vec![None];
             app.settings.grid_cols = 4;
             let fonts_set = std::cell::Cell::new(false);
-            let mut harness = Harness::builder()
+            let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(640.0, 480.0))
                 .with_step_dt(0.01)
                 .build_state(
@@ -27690,7 +27676,7 @@ mod toolbar_wrap_tests {
 
     #[test]
     fn sort_popup_shows_all_ten_rows_or_fits_a_short_screen() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
         for (screen_size, font_size, all_rows_expected) in [
             (egui::vec2(600.0, 480.0), 14.0, true),
@@ -27701,40 +27687,42 @@ mod toolbar_wrap_tests {
             let observed_id = combo_id.clone();
             let row_geometry = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let observed_rows = row_geometry.clone();
-            let mut harness = Harness::builder().with_size(screen_size).build(move |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.spacing_mut().interact_size.y = 22.0;
-                    ui.spacing_mut().button_padding.y = 1.0;
-                    ui.style_mut().text_styles.insert(
-                        egui::TextStyle::Button,
-                        egui::FontId::proportional(font_size),
-                    );
-                    let orders = crate::settings::SortOrder::all();
-                    let height =
-                        sort_combo_popup_height(ui, orders.len(), false, false, false, 0, 0);
-                    let combo = egui::ComboBox::from_id_salt("ten-sort-rows")
-                        .width(100.0)
-                        .height(height)
-                        .popup_style(sort_combo_popup_style())
-                        .selected_text("ソート")
-                        .show_ui(ui, |ui| {
-                            ui.spacing_mut().interact_size.y = 22.0;
-                            ui.style_mut().text_styles.insert(
-                                egui::TextStyle::Button,
-                                egui::FontId::proportional(font_size),
-                            );
-                            observed_rows.lock().unwrap().clear();
-                            for &order in orders {
-                                let row = ui.selectable_label(false, order.short_label());
-                                observed_rows
-                                    .lock()
-                                    .unwrap()
-                                    .push((row.rect, ui.clip_rect()));
-                            }
-                        });
-                    *observed_id.lock().unwrap() = Some(combo.response.id);
+            let mut harness = crate::test_ui::builder()
+                .with_size(screen_size)
+                .build(move |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.spacing_mut().interact_size.y = 22.0;
+                        ui.spacing_mut().button_padding.y = 1.0;
+                        ui.style_mut().text_styles.insert(
+                            egui::TextStyle::Button,
+                            egui::FontId::proportional(font_size),
+                        );
+                        let orders = crate::settings::SortOrder::all();
+                        let height =
+                            sort_combo_popup_height(ui, orders.len(), false, false, false, 0, 0);
+                        let combo = egui::ComboBox::from_id_salt("ten-sort-rows")
+                            .width(100.0)
+                            .height(height)
+                            .popup_style(sort_combo_popup_style())
+                            .selected_text("ソート")
+                            .show_ui(ui, |ui| {
+                                ui.spacing_mut().interact_size.y = 22.0;
+                                ui.style_mut().text_styles.insert(
+                                    egui::TextStyle::Button,
+                                    egui::FontId::proportional(font_size),
+                                );
+                                observed_rows.lock().unwrap().clear();
+                                for &order in orders {
+                                    let row = ui.selectable_label(false, order.short_label());
+                                    observed_rows
+                                        .lock()
+                                        .unwrap()
+                                        .push((row.rect, ui.clip_rect()));
+                                }
+                            });
+                        *observed_id.lock().unwrap() = Some(combo.response.id);
+                    });
                 });
-            });
             harness.run();
             let popup_id = combo_id.lock().unwrap().expect("sort combo").with("popup");
             egui::Popup::open_id(&harness.ctx, popup_id);
@@ -27786,10 +27774,7 @@ mod toolbar_wrap_tests {
 
     #[test]
     fn collection_sort_popup_shows_manual_shuffle_and_all_standard_rows_or_fits_screen() {
-        use egui_kittest::{
-            Harness,
-            kittest::{NodeT, Queryable},
-        };
+        use egui_kittest::kittest::{NodeT, Queryable};
 
         for (screen_size, font_size, all_rows_expected) in [
             (egui::vec2(600.0, 480.0), 14.0, true),
@@ -27800,52 +27785,54 @@ mod toolbar_wrap_tests {
             let observed_id = combo_id.clone();
             let row_geometry = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let observed_rows = row_geometry.clone();
-            let mut harness = Harness::builder().with_size(screen_size).build(move |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.spacing_mut().interact_size.y = 22.0;
-                    ui.spacing_mut().button_padding.y = 1.0;
-                    ui.style_mut().text_styles.insert(
-                        egui::TextStyle::Button,
-                        egui::FontId::proportional(font_size),
-                    );
-                    let orders = crate::settings::SortOrder::all();
-                    let height =
-                        sort_combo_popup_height(ui, orders.len(), true, false, false, 0, 0);
-                    let combo = egui::ComboBox::from_id_salt("collection-sort-rows")
-                        .width(100.0)
-                        .height(height)
-                        .popup_style(sort_combo_popup_style())
-                        .selected_text("手動")
-                        .show_ui(ui, |ui| {
-                            ui.spacing_mut().interact_size.y = 22.0;
-                            ui.style_mut().text_styles.insert(
-                                egui::TextStyle::Button,
-                                egui::FontId::proportional(font_size),
-                            );
-                            observed_rows.lock().unwrap().clear();
-                            for label in ["手動", "シャッフル（再選択で並べ直す）"]
-                            {
-                                let row = ui.selectable_label(false, label);
-                                observed_rows
-                                    .lock()
-                                    .unwrap()
-                                    .push((row.rect, ui.clip_rect()));
-                            }
-                            ui.separator();
-                            for &order in orders {
-                                let row = ui.add_enabled(
-                                    !order.is_rating(),
-                                    egui::Button::selectable(false, order.short_label()),
+            let mut harness = crate::test_ui::builder()
+                .with_size(screen_size)
+                .build(move |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.spacing_mut().interact_size.y = 22.0;
+                        ui.spacing_mut().button_padding.y = 1.0;
+                        ui.style_mut().text_styles.insert(
+                            egui::TextStyle::Button,
+                            egui::FontId::proportional(font_size),
+                        );
+                        let orders = crate::settings::SortOrder::all();
+                        let height =
+                            sort_combo_popup_height(ui, orders.len(), true, false, false, 0, 0);
+                        let combo = egui::ComboBox::from_id_salt("collection-sort-rows")
+                            .width(100.0)
+                            .height(height)
+                            .popup_style(sort_combo_popup_style())
+                            .selected_text("手動")
+                            .show_ui(ui, |ui| {
+                                ui.spacing_mut().interact_size.y = 22.0;
+                                ui.style_mut().text_styles.insert(
+                                    egui::TextStyle::Button,
+                                    egui::FontId::proportional(font_size),
                                 );
-                                observed_rows
-                                    .lock()
-                                    .unwrap()
-                                    .push((row.rect, ui.clip_rect()));
-                            }
-                        });
-                    *observed_id.lock().unwrap() = Some(combo.response.id);
+                                observed_rows.lock().unwrap().clear();
+                                for label in ["手動", "シャッフル（再選択で並べ直す）"]
+                                {
+                                    let row = ui.selectable_label(false, label);
+                                    observed_rows
+                                        .lock()
+                                        .unwrap()
+                                        .push((row.rect, ui.clip_rect()));
+                                }
+                                ui.separator();
+                                for &order in orders {
+                                    let row = ui.add_enabled(
+                                        !order.is_rating(),
+                                        egui::Button::selectable(false, order.short_label()),
+                                    );
+                                    observed_rows
+                                        .lock()
+                                        .unwrap()
+                                        .push((row.rect, ui.clip_rect()));
+                                }
+                            });
+                        *observed_id.lock().unwrap() = Some(combo.response.id);
+                    });
                 });
-            });
             harness.run();
             let popup_id = combo_id.lock().unwrap().expect("sort combo").with("popup");
             egui::Popup::open_id(&harness.ctx, popup_id);
@@ -27893,13 +27880,12 @@ mod toolbar_wrap_tests {
 
     #[test]
     fn collection_popup_first_frame_fits_right_edge_at_150_percent_dpi() {
-        use egui_kittest::Harness;
         let rows = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let observed = rows.clone();
         let id = std::sync::Arc::new(std::sync::Mutex::new(None));
         let observed_id = id.clone();
         let fonts_set = std::cell::Cell::new(false);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(853.0, 533.0))
             .with_pixels_per_point(1.5)
             .build(move |ctx| {
@@ -28258,7 +28244,7 @@ mod details_header_right_click_tests {
                 crate::ring_shortcut::RightDragMode::MouseGesture,
             );
         }
-        Harness::builder()
+        crate::test_ui::builder()
             .with_size(egui::vec2(640.0, 400.0))
             .with_step_dt(0.01)
             .build_state(
@@ -28378,7 +28364,7 @@ mod section207_tests {
         let nav = Rc::new(RefCell::new(Vec::new()));
         let nav_render = Rc::clone(&nav);
         let fonts = Cell::new(false);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 480.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -28459,7 +28445,7 @@ mod section207_tests {
         let wheel_after = Rc::new(Cell::new(false));
         let observed = Rc::clone(&wheel_after);
         let fonts = Cell::new(false);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 480.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -28516,7 +28502,7 @@ mod section207_tests {
         let app = Rc::new(RefCell::new(env));
         let render = Rc::clone(&app);
         let fonts = Cell::new(false);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(480.0, 700.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -28572,7 +28558,7 @@ mod section207_tests {
                         let render = Rc::new(RefCell::new(app));
                         let state = render.clone();
                         let fonts = Cell::new(false);
-                        let mut harness = Harness::builder()
+                        let mut harness = crate::test_ui::builder()
                             .with_size(egui::vec2(width * zoom, 400.0 * zoom))
                             .build(move |ctx| {
                                 ctx.set_zoom_factor(zoom);
@@ -28691,7 +28677,7 @@ mod section207_tests {
                     if new_row { vec![TS::Folder] } else { vec![] };
                 let render = Rc::new(RefCell::new(env));
                 let fonts = Cell::new(false);
-                let mut harness = Harness::builder()
+                let mut harness = crate::test_ui::builder()
                     .with_size(egui::vec2(width, 400.0 * zoom))
                     .build(move |ctx| {
                         ctx.set_zoom_factor(zoom);
@@ -28818,7 +28804,7 @@ mod section207_tests {
                         let app = Rc::new(RefCell::new(env));
                         let render = Rc::clone(&app);
                         let fonts = Cell::new(false);
-                        let mut harness = Harness::builder()
+                        let mut harness = crate::test_ui::builder()
                             .with_size(egui::vec2(width, 360.0))
                             .build(move |ctx| {
                                 if !fonts.replace(true) {
@@ -28881,7 +28867,7 @@ mod section207_tests {
         let app = Rc::new(RefCell::new(env));
         let render = Rc::clone(&app);
         let fonts = Cell::new(false);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1200.0, 280.0))
             .build(move |ctx| {
                 if !fonts.replace(true) {
@@ -28992,7 +28978,7 @@ mod section207_tests {
         let nav = Rc::new(RefCell::new(Vec::new()));
         let nav_render = Rc::clone(&nav);
         let fonts = Cell::new(false);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1200.0, 280.0))
             .build(move |ctx| {
                 crate::ime_focus::install_ime_input_policy(ctx);
@@ -29068,7 +29054,7 @@ mod section207_tests {
         let nav = Rc::new(Cell::new(false));
         let nav_render = Rc::clone(&nav);
         let fonts = Cell::new(false);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(720.0, 360.0))
             .build(move |ctx| {
                 crate::ime_focus::install_ime_input_policy(ctx);
@@ -29129,7 +29115,7 @@ mod section207_tests {
         let legacy = Rc::new(Cell::new(true));
         let legacy_render = Rc::clone(&legacy);
         let fonts = Cell::new(false);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1200.0, 280.0))
             .build(move |ctx| {
                 if !fonts.replace(true) {
@@ -29208,10 +29194,7 @@ mod section207_tests {
 #[cfg(test)]
 mod section292_tests {
     use super::*;
-    use egui_kittest::{
-        Harness,
-        kittest::{NodeT, Queryable},
-    };
+    use egui_kittest::kittest::{NodeT, Queryable};
     use std::{
         cell::{Cell, RefCell},
         rc::Rc,
@@ -29237,7 +29220,7 @@ mod section292_tests {
         let fonts = Cell::new(false);
         let wheel_after = Rc::new(Cell::new(false));
         let observed = Rc::clone(&wheel_after);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1400.0, 600.0))
             .build(move |ctx| {
                 if !fonts.replace(true) {
@@ -29356,7 +29339,7 @@ mod section292_tests {
         let app = Rc::new(RefCell::new(app));
         let render = Rc::clone(&app);
         let fonts = Cell::new(false);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1400.0, 600.0))
             .build(move |ctx| {
                 if !fonts.replace(true) {
@@ -29465,7 +29448,7 @@ mod section292_tests {
 
     fn facet_sort_snapshot(name: &str, width: f32) {
         let fonts = Cell::new(false);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(width, 240.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
