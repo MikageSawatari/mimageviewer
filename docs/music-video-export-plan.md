@@ -460,8 +460,22 @@ UI は操作コマンドの送信と再生位置のスナップショット読�
 #### I1 設計（2026-10-09 案）
 
 段 1 の調査・設計案は `bcddec29b`。独立設計レビュー（GPT-6.1 Sol / xhigh）で
-**段 2a は ACCEPT**。段 2b はエディタ専用 Tab / Enter policy に P2 が 4 件あり、
-方針を利用者と相談中。今回の実装指示は段 2a だけで、段 2b は未着手。
+**段 2a は ACCEPT**（設計・実装とも、実装は `367f9c9d3`）。段 2b はエディタ専用 Tab / Enter policy に
+P2 が 4 件あり（grace による通常 Tab/Enter への影響、Commit と Enter の別 pass、`wants_keyboard_input` が
+text owner でない、recovery claim の根拠キーの除去）、**利用者判断（2026-10-09）で方針を変更した**:
+
+- **エディタも mIV 本体と同じ扱いにそろえる。エディタ専用の Tab / Enter policy は作らない。**
+  下の §3 の「エディタ専用 policy」は採らない（記録として残す）。
+- **Tab traversal は本体と同じく全域で無効**（Tab で入力欄を移動しない。案 A）。本体の
+  `egui_focus_policy`（全域 Tab policy）と同じ挙動をエディタのホストにも登録する。共有 helper の
+  grace を含む Tab lock と食い違わないため、レビュー P2-1 の通常 Tab への影響が消える。
+- single-line 5 欄は共有 helper、歌詞 multiline は plugin のみ（buffer・widget ID・native Undo 維持）、
+  Hz は DragValue 維持。
+- IME 中・grace・single-line 復帰前の Project Undo 抑止（Undo gate の拡張）は維持する（レビューで妥当）。
+- Commit と Enter が別 pass で届いた場合の歌詞の余分な改行は、本体の multiline と同じ性質として受け入れ、
+  実機で発生したら原因を調べて対応する（発生は未観測。レビューの指摘は設計上の反例）。
+- 段 2b の実機確認に detached（F12 別窓）を加える必要はない（エディタは別 exe で、本体の viewport に
+  触れない）。段 2a の本体実機確認には detached を含める（レビュー P3-5）。
 本体の補正を挙動不変で切り出す部分と、エディタへ補正を適用する部分を分ける。
 以下の file:line は 2026-10-09 の調査時点のソースを指す。
 
