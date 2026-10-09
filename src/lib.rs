@@ -97,6 +97,7 @@ pub mod dwm_iconic_thumbnail;
 #[cfg(windows)]
 pub mod dwm_transitions;
 mod empty_items_reason;
+mod fullscreen_specified_scale;
 mod gpu_anime4k;
 mod gpu_lanczos;
 pub mod metadata_transfer;
@@ -2190,3 +2191,8 @@ mod tests {
         assert!(path.ends_with("book.zip"));
     }
 }
+
+pub use ui_dialogs::preferences::{
+    draw_fullscreen_fit_cycle_settings, draw_fullscreen_specified_scale_live_settings,
+    draw_fullscreen_specified_scale_settings,
+};

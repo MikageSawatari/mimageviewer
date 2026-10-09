@@ -73,6 +73,13 @@ F11中の固定chrome一時抑制は `ui_helpers::{ViewerChromeSurface, Resolved
 実際の表示先を所有する。nativeのraw policyとhost factを一つのsnapshotで運び、適用先でdraw / layout / hitを揃える。
 独自のplacement遷移・世代・復元stateは設けない。詳細は [決定仕様](fullscreen-locked-chrome-suppression-plan.md)。
 
+指定サイズfit（§1.342）は `fullscreen_specified_scale` の純粋計算を各 viewer の幾何へ渡す。
+canonical aspect と AI 前の物理原寸を分けた型付き descriptor を live / frozen / capture が共有し、
+PDF は検証済みページ metadata から固定原寸を解く。描画 raster は sampling にだけ採用し、
+fit 基準へ戻さない。連結の基準 unit と PDF の絶対需要比較は既存 viewer bundle と一緒に
+移送する。共通指定値と favorite 専用値は既存 overlay / 保存 worker を使い、欠落継承だけで
+専用値を書き込まない。実装・検証状況は [指定サイズfit計画 §15](fullscreen-specified-scale-plan.md#15-実装接続と検証結果2026-10-09) を参照。
+
 ---
 
 ## 2. モジュールマップ
@@ -158,7 +165,8 @@ F11中の固定chrome一時抑制は `ui_helpers::{ViewerChromeSurface, Resolved
 | `ui_fullscreen.rs` | フルスクリーンビューポート (`show_viewport_immediate`)。描画テクスチャの優先順位はここで決定。見開きのcanonical `SpreadDisplayUnit`はpage列と形成理由（paired / 本当に相方がない / 横長境界 / 非ペア境界）を同じcache tokenで所有し、共通compositionだけが端の単ページ配置を解決する。paged、F12、連結読み、holdover、Remoteはtyped placementを消費し、縦横を再判定しない |
 | `seek_ruler.rs` | 静止画 / 本のページ数と動画 / 音楽の duration から、トラック幅に収まる 1 / 2 / 5 系の目盛り位置と大小区分を生成する純ロジック。3 面の共通寸法・低コントラスト色も所有する |
 | `page_dims.rs` | 一度判明したページ寸法を GPU texture の生存期間から分離して保持する generation 付き CPU cache。`ViewerContextBundle` 所有で、同じ idx の別 items へ寸法を誤適用しない |
-| `displayed_image_transform.rs` | identity に依存しない `DisplayedImageGeometry` が fit / scale limit / trim / 90 度・free rotation / 通常または Z の zoom-pan から paint・hit・UV rect、source↔screen 写像、total scale を一度に解決する。ページは `DisplayedImageTransform` が page idx を付け、類似候補はページへ偽装せず geometry を利用する。見開き端の単ページは `SingletonSpreadPlacement` と同じページ寸法の仮想 2-slot canvasをlayoutにだけ持ち、page/sourceを増やさず Page / Width / Height / Original と Z を解く。`FullscreenPageLayout` は各 viewer の最後に描いた Single / Spread / Continuous の transform を paint 順で保持し、`ViewerContextBundle` とともに交換する。navigator・ルーペ・範囲コピーはその viewer の layout を参照する。見開き・連結読みの配置計算自体は `ui_fullscreen.rs` が担当する |
+| `fullscreen_specified_scale.rs` | `FullscreenFitInput` が legacy fit と指定値＋`FullscreenFitBasis` を型で区別する。A（canonical aspect）と O（AI 前の物理原寸）を正規化し、任意軸の％ / logical px、合成 unit の実効 gap、既存倍率制限と指定方式だけの自動 5 倍上限を純粋計算する。PDF の O は page metadata と既存 Original 長辺 / native cap から解き、現在 raster へ依存しない |
+| `displayed_image_transform.rs` | identity に依存しない `DisplayedImageGeometry` が fit descriptor / scale limit / trim / 90 度・free rotation / 通常または Z の zoom-pan から paint・hit・UV rect、source↔screen 写像、total scale を一度に解決する。指定方式の `layout_full_image_rect` は A/O 由来の安定した fit 枠で、実 raster の縦横比丸めは枠内の contain と sampling へ閉じる。ページは `DisplayedImageTransform` が page idx を付け、類似候補はページへ偽装せず geometry を利用する。見開き端の単ページは `SingletonSpreadPlacement` と同じページ寸法の仮想 2-slot canvasをlayoutにだけ持ち、page/sourceを増やさず既存 4 方式・SpecifiedScale と Z を解く。`FullscreenPageLayout` は各 viewer の最後に描いた Single / Spread / Continuous の transform を paint 順で保持し、`ViewerContextBundle` とともに交換する。navigator・ルーペ・範囲コピーはその viewer の layout を参照する。見開き・連結読みの配置計算自体は `ui_fullscreen.rs` が担当する |
 | `vendor/egui` | egui 0.33.3 の判定済み全 pointer release 列を、非 click を含めて順序どおり読み取る API を追加したローカルパッチ。クリック判定は変えず、アプリの ordered focus / hit / gesture 所有と対応付ける。root と standalone vendor の path patch を統一し、`test-full.ps1` でこの crate の lib test も無 filter 実行する。navigator 側への接続・検証状況は [レビュー修正記録](duplicate-detection-review-fixes-20260907.md) を参照 |
 | `vendor/eframe` | eframe 0.33.3 の Windows hidden/minimized repaint scheduler に upstream PR #7905 を backport するローカルパッチ。不可視 HWND へ `ControlFlow::Poll` + OS redraw を要求せず direct UI pass で pending command を消化し、アプリが要求した repaint だけを `max(要求済み時刻, now + 100ms)` へ制限し、先の予定は早めない。要求が無ければ heartbeat を作らず sleep する。App / tray / detached の状態 ownership は変更しない。**もう 1 件**: wgpu backend は `max_texture_side` を `State::new` で 1 度スナップショットするだけだったのを、glow backend と同じく毎フレーム painter の値へ同期するようにした。egui は font atlas を `Context` に 1 つしか持たず、`max_texture_side` が変わると全フォントを再パースして atlas を作り直すので、2 つの viewport が 2048 と 8192 を交互に報告すると毎パス rebuild (実測 38.6ms) になる。詳細と実測は [next-release-backlog.md](next-release-backlog.md) §1.129。上流還元候補なので vendored crate 更新時はこの差分を持ち越す |
 | `vendor/egui-wgpu` | egui 0.33.3 の managed texture に opt-in GPU mipmap を追加するローカルパッチ。`TextureOptions::mipmap_mode` 指定時だけ完全な mip chain を確保・生成し、静止画の論理 `TextureHandle` / cache 構造は変えない。`Rgba8Unorm`生成器は比較callbackと360度パノラマの独自textureにも公開して共用する。上流の`LICENSE-MIT` / `LICENSE-APACHE`本文をcrate内に保持し、アプリ内表示と配布物同梱の正本にする |

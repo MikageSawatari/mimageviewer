@@ -143,6 +143,7 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn invalidate_converted_archive_sources_in_parked_contexts (& mut self)",
     // 1.347 explicit cache maintenance resets only terminal audio art in living owners.
     "inherent fn    App ::  pub (crate) fn invalidate_audio_art_terminals_after_catalog_maintenance (& mut self , parent : Option < & Path > ,) -> usize",
+    "inherent fn    App ::  pub (crate) fn invalidate_all_continuous_specified_fit_references (& mut self)",
     // 1.337 reads the owning presentation to suppress automatic EffeTune in fullscreen.
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn presentation (self) -> ViewerPresentation",
     // RAW context-owned demand/park inventory and read-only mounted/at-rest view (3e57109e4).

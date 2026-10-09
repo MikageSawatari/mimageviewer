@@ -718,6 +718,20 @@ fn reset_audio_art_terminal_rows(
 }
 
 impl App {
+    /// A global fit-mode change ends each context's selected continuous unit.
+    /// Do this at the setting boundary: a parked context may not draw between
+    /// two changes, so observing a later layout frame cannot detect the exit.
+    pub(crate) fn invalidate_all_continuous_specified_fit_references(&mut self) {
+        self.fs_continuous_fit_reference = Default::default();
+        #[cfg(windows)]
+        for slot in self.viewer_contexts.table.slots.values_mut() {
+            let bundle = match slot {
+                Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
+            };
+            bundle.fs_continuous_fit_reference = Default::default();
+        }
+    }
+
     /// Explicit cache maintenance reopens only terminal audio requests. Mutate
     /// every living owner in place: no mount/swap, generation/cancel change,
     /// viewport routing, SQLite work, or loss of already displayed pixels.
@@ -1022,8 +1036,8 @@ pub(in crate::app) struct ViewerContextBundle {
     fs_zoom_active: bool,
     fs_zoom_aiming: bool,
     fs_zoom_factor: f32,
-    fs_zoom_pdf_rerender_idx: Option<usize>,
-    fs_zoom_pdf_rerender_zoom: f32,
+    fs_pdf_rerender_demand: PdfRerenderDemand,
+    fs_continuous_fit_reference: crate::ui_fullscreen::ContinuousSpecifiedFitReference,
     fs_pan_drag_start: Option<(egui::Pos2, egui::Vec2)>,
     fs_vertical_scroll: f32,
     fs_seek_drag_active: bool,
@@ -1967,8 +1981,9 @@ impl ViewerContextBundle {
             fs_zoom_active: false,
             fs_zoom_aiming: false,
             fs_zoom_factor: 1.0,
-            fs_zoom_pdf_rerender_idx: None,
-            fs_zoom_pdf_rerender_zoom: 1.0,
+            fs_pdf_rerender_demand: PdfRerenderDemand::default(),
+            fs_continuous_fit_reference:
+                crate::ui_fullscreen::ContinuousSpecifiedFitReference::Legacy,
             fs_pan_drag_start: None,
             fs_vertical_scroll: 0.0,
             fs_seek_drag_active: false,
@@ -2331,8 +2346,8 @@ impl App {
             fs_zoom_active,
             fs_zoom_aiming,
             fs_zoom_factor,
-            fs_zoom_pdf_rerender_idx,
-            fs_zoom_pdf_rerender_zoom,
+            fs_pdf_rerender_demand,
+            fs_continuous_fit_reference,
             fs_pan_drag_start,
             fs_vertical_scroll,
             fs_seek_drag_active,
@@ -2612,8 +2627,8 @@ impl App {
         swap_field!(fs_zoom_active);
         swap_field!(fs_zoom_aiming);
         swap_field!(fs_zoom_factor);
-        swap_field!(fs_zoom_pdf_rerender_idx);
-        swap_field!(fs_zoom_pdf_rerender_zoom);
+        swap_field!(fs_pdf_rerender_demand);
+        swap_field!(fs_continuous_fit_reference);
         swap_field!(fs_pan_drag_start);
         swap_field!(fs_vertical_scroll);
         swap_field!(fs_seek_drag_active);
@@ -2931,8 +2946,8 @@ impl App {
             fs_zoom_active,
             fs_zoom_aiming,
             fs_zoom_factor,
-            fs_zoom_pdf_rerender_idx,
-            fs_zoom_pdf_rerender_zoom,
+            fs_pdf_rerender_demand,
+            fs_continuous_fit_reference,
             fs_pan_drag_start,
             fs_vertical_scroll,
             fs_seek_drag_active,
@@ -3144,8 +3159,8 @@ impl App {
             fs_zoom_active,
             fs_zoom_aiming,
             fs_zoom_factor,
-            fs_zoom_pdf_rerender_idx,
-            fs_zoom_pdf_rerender_zoom,
+            fs_pdf_rerender_demand,
+            fs_continuous_fit_reference,
             fs_pan_drag_start,
             fs_vertical_scroll,
             fs_seek_drag_active,
@@ -6212,6 +6227,116 @@ mod tests {
         assert_eq!(
             app.settings.grid_cols, 3,
             "共通状態はどちらの窓にも上書きされない"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn specified_global_fit_change_invalidates_parked_references_without_mounting() {
+        let mut app = crate::app::setup_app_for_test();
+        let seed = |owner: &mut App| {
+            owner.fs_continuous_fit_reference =
+                crate::ui_fullscreen::ContinuousSpecifiedFitReference::Specified {
+                    unit: crate::ui_fullscreen::ContinuousReadingUnitSpec::pages(0, vec![0]),
+                    settings: Default::default(),
+                    limits: Default::default(),
+                    base: None,
+                };
+            owner.fs_vertical_scroll = 123.0;
+            owner.fs_zoom = 1.7;
+        };
+        let parked_id = app.build_window_context_for_test(1342, seed);
+        seed(&mut app);
+        let mounted = app.mounted_viewer_context_id();
+        app.invalidate_all_continuous_specified_fit_references();
+        assert!(matches!(
+            app.fs_continuous_fit_reference,
+            crate::ui_fullscreen::ContinuousSpecifiedFitReference::Legacy
+        ));
+        let parked = app.viewer_contexts.table.at_rest(parked_id).unwrap();
+        assert!(matches!(
+            parked.fs_continuous_fit_reference,
+            crate::ui_fullscreen::ContinuousSpecifiedFitReference::Legacy
+        ));
+        assert_eq!(parked.fs_vertical_scroll, 123.0);
+        assert_eq!(parked.fs_zoom, 1.7);
+        assert_eq!(app.mounted_viewer_context_id(), mounted);
+        assert_eq!(app.fs_zoom, 1.7);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn specified_pdf_metadata_and_demand_move_with_the_owning_bundle() {
+        let mut app = crate::app::setup_app_for_test();
+        let main_path = app.tmp.path().join("main.pdf");
+        let other_path = app.tmp.path().join("other.pdf");
+        app.items.push(GridItem::PdfPage {
+            pdf_path: main_path,
+            page_num: 0,
+            content_type: Some(crate::pdf_loader::PdfPageContentType::Vector),
+        });
+        let main_generation = app.items_generation;
+        app.page_dims_cache
+            .record_layout(main_generation, 0, (612_000, 612_000));
+        assert!(
+            app.fs_pdf_rerender_demand
+                .note_absolute(0, "main".into(), 5407)
+        );
+        let main_basis = app.pdf_specified_basis_for_idx(0).unwrap();
+        let main_reference = crate::ui_fullscreen::ContinuousSpecifiedFitReference::Specified {
+            unit: crate::ui_fullscreen::ContinuousReadingUnitSpec::pages(0, vec![0]),
+            settings: crate::settings::FullscreenSpecifiedScale::default(),
+            limits: Default::default(),
+            base: None,
+        };
+        app.fs_continuous_fit_reference = main_reference.clone();
+        let mut parked = ViewerContextBundle::empty();
+        parked.items.push(GridItem::PdfPage {
+            pdf_path: other_path,
+            page_num: 0,
+            content_type: Some(crate::pdf_loader::PdfPageContentType::Raster { w: 100, h: 200 }),
+        });
+        parked
+            .page_dims_cache
+            .record_layout(parked.items_generation, 0, (100_000, 200_000));
+        assert!(
+            parked
+                .fs_pdf_rerender_demand
+                .note_absolute(0, "other".into(), 200)
+        );
+        app.swap_viewer_context_bundle(&mut parked);
+        let other_basis = app.pdf_specified_basis_for_idx(0).unwrap();
+        assert_eq!(other_basis.original_size, egui::vec2(100.0, 200.0));
+        assert!(
+            !app.fs_pdf_rerender_demand
+                .note_absolute(0, "other".into(), 200)
+        );
+        assert!(
+            !parked
+                .fs_pdf_rerender_demand
+                .note_absolute(0, "main".into(), 5407)
+        );
+        app.fs_pdf_rerender_demand.reset();
+        app.reset_continuous_reading_transform();
+        app.swap_viewer_context_bundle(&mut parked);
+        assert_eq!(app.pdf_specified_basis_for_idx(0), Some(main_basis));
+        assert_eq!(
+            format!("{:?}", app.fs_continuous_fit_reference),
+            format!("{main_reference:?}"),
+            "resetting a same-index sibling must preserve the original unit"
+        );
+        assert!(matches!(
+            parked.fs_continuous_fit_reference,
+            crate::ui_fullscreen::ContinuousSpecifiedFitReference::Legacy
+        ));
+        assert!(
+            !app.fs_pdf_rerender_demand
+                .note_absolute(0, "main".into(), 5407)
+        );
+        assert!(
+            parked
+                .fs_pdf_rerender_demand
+                .note_absolute(0, "other".into(), 200)
         );
     }
 

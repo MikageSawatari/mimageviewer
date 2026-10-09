@@ -1,5 +1,8 @@
 use eframe::egui;
 
+use crate::fullscreen_specified_scale::{
+    FullscreenFitInput, apply_specified_scale_limits, resolve_specified_scale,
+};
 use crate::rotation_db::Rotation;
 use crate::settings::FullscreenFitMode;
 
@@ -147,7 +150,7 @@ pub(crate) struct DisplayedImageTransformInput {
     pub(crate) rotation: Rotation,
     pub(crate) free_rotation_rad: f32,
     pub(crate) content_bbox: Option<egui::Rect>,
-    pub(crate) fit_mode: FullscreenFitMode,
+    pub(crate) fit_mode: FullscreenFitInput,
     pub(crate) fit_scale_limits: FullscreenFitScaleLimits,
     pub(crate) pixels_per_point: f32,
     pub(crate) placement: ResolvedDisplayPlacement,
@@ -181,7 +184,7 @@ pub(crate) struct DisplayedImageGeometryInput {
     pub(crate) rotation: Rotation,
     pub(crate) free_rotation_rad: f32,
     pub(crate) content_bbox: Option<egui::Rect>,
-    pub(crate) fit_mode: FullscreenFitMode,
+    pub(crate) fit_mode: FullscreenFitInput,
     pub(crate) fit_scale_limits: FullscreenFitScaleLimits,
     pub(crate) pixels_per_point: f32,
     pub(crate) placement: ResolvedDisplayPlacement,
@@ -196,6 +199,10 @@ pub(crate) struct DisplayedImageGeometry {
     pub(crate) viewport_rect: egui::Rect,
     /// 回転後の表示寸法を fit した、trim 前の画像全体矩形。
     pub(crate) full_image_rect: egui::Rect,
+    /// Stable full-page fit frame before sampler aspect containment / physical pixel snapping.
+    /// SpecifiedScale demand and captured layout use this A/O-derived extent; a rounded
+    /// AI/PDF raster may only alter the contained paint rectangle.
+    pub(crate) layout_full_image_rect: egui::Rect,
     /// 実際に texture を paint する矩形。表示 trim 時は bbox 部分だけになる。
     pub(crate) paint_rect: egui::Rect,
     /// ポインタ判定の broad phase。自由回転時は paint quad の AABB。
@@ -206,6 +213,7 @@ pub(crate) struct DisplayedImageGeometry {
     /// 要求された表示 trim。回転中は現行仕様どおり UV crop には適用しない。
     pub(crate) content_bbox: Option<egui::Rect>,
     pub(crate) fit_mode: FullscreenFitMode,
+    pub(crate) fit_input: FullscreenFitInput,
     pub(crate) fit_scale_limits: FullscreenFitScaleLimits,
     pub(crate) placement: ResolvedDisplayPlacement,
     /// texture の回転後表示ピクセル 1px あたりの画面スケール。
@@ -274,7 +282,18 @@ impl DisplayedImageGeometry {
         {
             return None;
         }
-        let display_size = rotated_size(input.texture_size, input.rotation);
+        let display_size = match input.fit_mode {
+            FullscreenFitInput::SpecifiedScale { basis, .. }
+            | FullscreenFitInput::CanonicalPage { basis } => {
+                let basis = crate::fullscreen_specified_scale::FullscreenFitBasis::new(
+                    basis.aspect_size,
+                    basis.original_size,
+                )?;
+                rotated_size(basis.normalized_original_size(), input.rotation)
+            }
+            FullscreenFitInput::Legacy(FullscreenFitMode::SpecifiedScale) => return None,
+            FullscreenFitInput::Legacy(_) => rotated_size(input.texture_size, input.rotation),
+        };
         let fit_bbox = effective_bbox(input.free_rotation_rad, input.content_bbox)
             .map(|bbox| rotate_bbox_to_display(bbox, input.rotation));
         let bbox_fit = fit_bbox.map(|bbox| {
@@ -286,7 +305,7 @@ impl DisplayedImageGeometry {
             );
             (width, height, center)
         });
-        let singleton = match input.placement {
+        let mut singleton = match input.placement {
             ResolvedDisplayPlacement::SingletonSpread { side, gap, .. }
                 if side != SingletonSpreadPlacement::Center =>
             {
@@ -301,7 +320,7 @@ impl DisplayedImageGeometry {
             }
             _ => None,
         };
-        let (fit_scale, content_center, visible_width) = match (input.fit_mode, bbox_fit) {
+        let (fit_scale, content_center, visible_width) = match (input.fit_mode.mode(), bbox_fit) {
             (FullscreenFitMode::Width, Some((width, _, center))) => {
                 let scale = singleton.map_or(input.viewport_rect.width() / width, |(_, gap, _)| {
                     (input.viewport_rect.width() - gap).max(1.0) / (width * 2.0)
@@ -362,7 +381,32 @@ impl DisplayedImageGeometry {
                 )
             }
         };
-        let fit_scale = input.fit_scale_limits.apply(fit_scale);
+        let fit_scale = match input.fit_mode {
+            FullscreenFitInput::SpecifiedScale { size, .. }
+                if size.width.is_none() && size.height.is_none() && singleton.is_none() =>
+            {
+                // Page has no minimum one-point width for a real single page. Spread's
+                // legacy one-point minimum is composition-specific, including gap=0.
+                apply_specified_scale_limits(fit_scale, input.fit_scale_limits)
+            }
+            FullscreenFitInput::SpecifiedScale { size, .. } => {
+                let (width, height, _) =
+                    bbox_fit.unwrap_or((display_size.x, display_size.y, egui::Vec2::ZERO));
+                let resolved = resolve_specified_scale(
+                    input.viewport_rect.size(),
+                    egui::vec2(width * if singleton.is_some() { 2.0 } else { 1.0 }, height),
+                    singleton.map_or(0.0, |(_, gap, _)| gap),
+                    size,
+                    input.fit_scale_limits,
+                )?;
+                if let Some((_, gap, _)) = singleton.as_mut() {
+                    *gap = resolved.gap;
+                }
+                resolved.scale
+            }
+            FullscreenFitInput::Legacy(_) => input.fit_scale_limits.apply(fit_scale),
+            FullscreenFitInput::CanonicalPage { .. } => fit_scale,
+        };
         let (total_scale, base_center) = match input.placement.zoom_pan() {
             Some((zoom, pan)) => (fit_scale * zoom, input.viewport_rect.center() + pan),
             None => (fit_scale, input.viewport_rect.center()),
@@ -388,7 +432,35 @@ impl DisplayedImageGeometry {
         });
         let center = base_center + egui::vec2(slot_offset, 0.0) - content_center * total_scale;
         let full_image_rect = egui::Rect::from_center_size(center, display_size * total_scale);
-        Self::from_resolved_rect(input, full_image_rect)
+        if matches!(
+            input.fit_mode,
+            FullscreenFitInput::SpecifiedScale { .. } | FullscreenFitInput::CanonicalPage { .. }
+        ) {
+            Self::from_layout_rect(input, full_image_rect)
+        } else {
+            Self::from_resolved_rect(input, full_image_rect)
+        }
+    }
+
+    /// Bind a stable full-page layout frame to the sampler raster, without stretching.
+    /// The frame belongs to the fit/composition owner and survives raster aspect rounding.
+    pub(crate) fn from_layout_rect(
+        input: DisplayedImageGeometryInput,
+        layout_full_image_rect: egui::Rect,
+    ) -> Option<Self> {
+        if !rect_is_valid(layout_full_image_rect) || !size_is_valid(input.texture_size) {
+            return None;
+        }
+        let texture_display = rotated_size(input.texture_size, input.rotation);
+        let contain = (layout_full_image_rect.width() / texture_display.x)
+            .min(layout_full_image_rect.height() / texture_display.y);
+        let full_image_rect = egui::Rect::from_center_size(
+            layout_full_image_rect.center(),
+            texture_display * contain,
+        );
+        let mut geometry = Self::from_resolved_rect(input, full_image_rect)?;
+        geometry.layout_full_image_rect = layout_full_image_rect;
+        Some(geometry)
     }
 
     /// 見開き・連結読みのレイアウトが先に確定させた画像全体矩形から transform を構築する。
@@ -451,13 +523,15 @@ impl DisplayedImageGeometry {
             texture_size: input.texture_size,
             viewport_rect: input.viewport_rect,
             full_image_rect,
+            layout_full_image_rect: full_image_rect,
             paint_rect,
             hit_rect,
             uv_rect,
             rotation: input.rotation,
             free_rotation_rad: input.free_rotation_rad,
             content_bbox: input.content_bbox,
-            fit_mode: input.fit_mode,
+            fit_mode: input.fit_mode.mode(),
+            fit_input: input.fit_mode,
             fit_scale_limits: input.fit_scale_limits,
             placement: input.placement,
             total_scale,
@@ -486,6 +560,7 @@ impl DisplayedImageGeometry {
                 .intersect(self.viewport_rect);
         Self {
             full_image_rect,
+            layout_full_image_rect: self.layout_full_image_rect.translate(offset),
             paint_rect,
             hit_rect,
             ..self
@@ -725,6 +800,15 @@ impl DisplayedImageTransform {
             .map(|geometry| Self { page_idx, geometry })
     }
 
+    pub(crate) fn from_layout_rect(
+        input: DisplayedImageTransformInput,
+        layout_full_image_rect: egui::Rect,
+    ) -> Option<Self> {
+        let page_idx = input.page_idx;
+        DisplayedImageGeometry::from_layout_rect(input.without_page(), layout_full_image_rect)
+            .map(|geometry| Self { page_idx, geometry })
+    }
+
     pub(crate) fn translated_by(self, offset: egui::Vec2) -> Self {
         Self {
             page_idx: self.page_idx,
@@ -955,6 +1039,10 @@ impl FullscreenPageLayout {
     /// 「いま画面に出ているのはどれか」の読み取り専用の正本。見開きなら 2 枚、連結読みなら
     /// 可視ユニットのぶんだけ入る。アニメーションの次コマ期限をここから集めることで、
     /// 現在ページ以外のコマ送りが止まるのを防ぐ (§1.157、Codex Sol の指摘 1)。
+    pub(crate) fn displayed_pages(&self) -> impl Iterator<Item = &DisplayedPage> {
+        self.pages.iter()
+    }
+
     pub(crate) fn page_indices(&self) -> impl Iterator<Item = usize> + '_ {
         self.pages.iter().map(|page| page.transform.page_idx)
     }
@@ -1124,7 +1212,7 @@ impl ResolvedZTransform {
             } => (singleton_side, singleton_gap.max(0.0)),
             _ => (SingletonSpreadPlacement::Center, 0.0),
         };
-        input.image.fit_mode = FullscreenFitMode::Page;
+        input.image.fit_mode = input.image.fit_mode.for_single_page_z();
         input.image.fit_scale_limits = FullscreenFitScaleLimits::default();
         input.image.free_rotation_rad = 0.0;
         // **Z の矩形は中間枠であって貼り先ではない。** 描く経路はこれを layout として受け取り、
@@ -1135,7 +1223,13 @@ impl ResolvedZTransform {
         // 意味を持たない値だから。照準枠・factor・full_image_zoom は viewport と content から
         // 決まるので、この宣言では動かない。
         input.image.pixel_fit = RectPixelFit::Proportional;
-        let display_size = rotated_size(input.image.texture_size, input.image.rotation);
+        let display_size = rotated_size(
+            match input.image.fit_mode {
+                FullscreenFitInput::CanonicalPage { basis } => basis.normalized_original_size(),
+                _ => input.image.texture_size,
+            },
+            input.image.rotation,
+        );
         let bbox = effective_bbox(0.0, input.image.content_bbox)
             .map(|bbox| rotate_bbox_to_display(bbox, input.image.rotation));
         let (content_min, content_size) = bbox
@@ -1894,7 +1988,7 @@ mod tests {
             rotation,
             free_rotation_rad: 0.0,
             content_bbox,
-            fit_mode,
+            fit_mode: FullscreenFitInput::legacy(fit_mode),
             fit_scale_limits: FullscreenFitScaleLimits::default(),
             pixels_per_point: 1.0,
             placement: ResolvedDisplayPlacement::Normal {
@@ -1933,7 +2027,7 @@ mod tests {
                 rotation: Rotation::None,
                 free_rotation_rad: 0.0,
                 content_bbox: None,
-                fit_mode: FullscreenFitMode::Page,
+                fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
                 fit_scale_limits: FullscreenFitScaleLimits::default(),
                 pixels_per_point: 1.0,
                 placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
@@ -2295,7 +2389,7 @@ mod tests {
                 rotation: Rotation::None,
                 free_rotation_rad: 0.0,
                 content_bbox: Some(trim),
-                fit_mode: FullscreenFitMode::Page,
+                fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
                 fit_scale_limits: FullscreenFitScaleLimits::default(),
                 pixels_per_point: 1.0,
                 placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
@@ -2331,7 +2425,7 @@ mod tests {
                 rotation: Rotation::Cw90,
                 free_rotation_rad: 0.0,
                 content_bbox: None,
-                fit_mode: FullscreenFitMode::Page,
+                fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
                 fit_scale_limits: FullscreenFitScaleLimits::default(),
                 pixels_per_point: 1.0,
                 placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
@@ -2407,7 +2501,7 @@ mod tests {
             rotation: Rotation::None,
             free_rotation_rad: 0.0,
             content_bbox: None,
-            fit_mode: FullscreenFitMode::Page,
+            fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
             fit_scale_limits: FullscreenFitScaleLimits::default(),
             pixels_per_point: 1.0,
             placement: ResolvedDisplayPlacement::Normal {
@@ -2468,7 +2562,7 @@ mod tests {
                 rotation: Rotation::None,
                 free_rotation_rad: 0.0,
                 content_bbox: None,
-                fit_mode: FullscreenFitMode::Page,
+                fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
                 fit_scale_limits: FullscreenFitScaleLimits::default(),
                 pixels_per_point: 1.0,
                 placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
@@ -2745,6 +2839,472 @@ mod tests {
         }
     }
 
+    fn specified_input(
+        original: egui::Vec2,
+        size: crate::settings::FullscreenSpecifiedScale,
+    ) -> DisplayedImageTransformInput {
+        let mut value = input(FullscreenFitMode::Page, Rotation::None, None);
+        value.source_size = original;
+        value.texture_size = original;
+        value.viewport_rect =
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 800.0));
+        value.fit_mode = FullscreenFitInput::SpecifiedScale {
+            size,
+            basis: crate::fullscreen_specified_scale::FullscreenFitBasis::new(original, original)
+                .unwrap(),
+        };
+        value.placement = ResolvedDisplayPlacement::Normal { zoom_pan: None };
+        value.pixel_fit = RectPixelFit::Proportional;
+        value
+    }
+
+    #[test]
+    fn specified_geometry_stays_at_pre_ai_original_after_texture_adoption() {
+        use crate::settings::{FullscreenSpecifiedScale, SpecifiedScaleAxis};
+        let trim = egui::Rect::from_min_max(egui::pos2(0.0, 0.25), egui::pos2(1.0, 0.75));
+        for (up, down, expected_height) in [
+            (false, false, 800.0),
+            (true, false, 400.0),
+            (false, true, 800.0),
+            (true, true, 400.0),
+        ] {
+            let mut before = specified_input(
+                egui::vec2(800.0, 800.0),
+                FullscreenSpecifiedScale {
+                    width: None,
+                    height: Some(SpecifiedScaleAxis::LogicalPixels(800)),
+                },
+            );
+            before.content_bbox = Some(trim);
+            before.fit_scale_limits.no_upscale = up;
+            before.fit_scale_limits.no_downscale = down;
+            let initial = DisplayedImageTransform::resolve(before).unwrap();
+            let mut after = before;
+            after.texture_size *= 4.0;
+            let adopted = DisplayedImageTransform::resolve(after).unwrap();
+            close(initial.paint_rect.height(), expected_height);
+            assert_eq!(initial.full_image_rect, adopted.full_image_rect);
+            assert_eq!(initial.paint_rect, adopted.paint_rect);
+            assert_eq!(initial.hit_rect, adopted.hit_rect);
+            assert_eq!(initial.uv_rect, adopted.uv_rect);
+            assert_eq!(initial.fit_input, adopted.fit_input);
+            let uv = egui::pos2(0.37, 0.64);
+            let round_trip =
+                adopted.screen_to_source_normalized(adopted.source_normalized_to_screen(uv));
+            close(round_trip.x, uv.x);
+            close(round_trip.y, uv.y);
+        }
+    }
+
+    #[test]
+    fn specified_fit_frame_survives_rounded_ai_and_pdf_sampling_aspects() {
+        use crate::settings::FullscreenSpecifiedScale;
+        for rotation in [Rotation::None, Rotation::Cw90, Rotation::Cw270] {
+            for trim in [
+                None,
+                Some(egui::Rect::from_min_max(
+                    egui::pos2(0.1, 0.2),
+                    egui::pos2(0.9, 0.8),
+                )),
+            ] {
+                let mut original = specified_input(
+                    egui::vec2(1000.0, 2000.0),
+                    FullscreenSpecifiedScale::default(),
+                );
+                original.rotation = rotation;
+                original.content_bbox = trim;
+                let initial = DisplayedImageTransform::resolve(original).unwrap();
+                for raster in [
+                    egui::vec2(4001.0, 8000.0),
+                    egui::vec2(4000.0, 8001.0),
+                    egui::vec2(4096.0, 8193.0),
+                    egui::vec2(2704.0, 5407.0),
+                ] {
+                    let mut adopted = original;
+                    adopted.texture_size = raster;
+                    let sampled = DisplayedImageTransform::resolve(adopted).unwrap();
+                    assert_eq!(
+                        sampled.layout_full_image_rect,
+                        initial.layout_full_image_rect
+                    );
+                    assert_eq!(sampled.fit_input, initial.fit_input);
+                    // Paint/hit/UV follow the isotropic contained raster, not the tiny
+                    // letterbox margins of the independent canonical fit frame.
+                    assert!(
+                        sampled
+                            .layout_full_image_rect
+                            .expand(0.001)
+                            .contains_rect(sampled.full_image_rect)
+                    );
+                    close(
+                        sampled.full_image_rect.width() / sampled.full_image_rect.height(),
+                        rotated_size(raster, rotation).x / rotated_size(raster, rotation).y,
+                    );
+                    let uv = egui::pos2(0.37, 0.64);
+                    let screen = sampled.source_normalized_to_screen(uv);
+                    let round_trip = sampled.screen_to_source_normalized(screen);
+                    close(round_trip.x, uv.x);
+                    close(round_trip.y, uv.y);
+                    assert!(sampled.contains_screen(sampled.paint_rect.center()));
+                    let shift = egui::vec2(10.0, -20.0);
+                    let shifted = sampled.translated_by(shift);
+                    assert_eq!(
+                        shifted.layout_full_image_rect,
+                        sampled.layout_full_image_rect.translate(shift)
+                    );
+                    assert_eq!(
+                        shifted.full_image_rect,
+                        sampled.full_image_rect.translate(shift)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn specified_composition_fit_frame_is_captured_before_sampler_containment() {
+        use crate::settings::FullscreenSpecifiedScale;
+        let mut value = specified_input(
+            egui::vec2(1000.0, 2000.0),
+            FullscreenSpecifiedScale::default(),
+        );
+        let frame = egui::Rect::from_min_size(egui::pos2(200.0, 40.0), egui::vec2(320.0, 640.0));
+        value.texture_size = egui::vec2(4001.0, 8000.0);
+        let geometry = DisplayedImageTransform::from_layout_rect(value, frame).unwrap();
+        assert_eq!(geometry.layout_full_image_rect, frame);
+        assert!(frame.expand(0.001).contains_rect(geometry.full_image_rect));
+        assert_ne!(geometry.full_image_rect.size(), frame.size());
+        // Replaying a stored descriptor at this frame has no dependency on live settings.
+        let replay =
+            DisplayedImageTransform::from_layout_rect(value, geometry.layout_full_image_rect)
+                .unwrap();
+        assert_eq!(
+            replay.layout_full_image_rect,
+            geometry.layout_full_image_rect
+        );
+        assert_eq!(replay.paint_rect, geometry.paint_rect);
+    }
+
+    #[test]
+    fn specified_cap_is_before_manual_zoom_and_rotation_swaps_axes_once() {
+        use crate::settings::{FullscreenSpecifiedScale, SpecifiedScaleAxis};
+        let mut tiny = specified_input(egui::vec2(10.0, 20.0), FullscreenSpecifiedScale::default());
+        tiny.placement = ResolvedDisplayPlacement::Normal {
+            zoom_pan: Some((2.0, egui::Vec2::ZERO)),
+        };
+        let enlarged = DisplayedImageTransform::resolve(tiny).unwrap();
+        close(enlarged.full_image_rect.height(), 200.0);
+        close(enlarged.total_scale, 10.0);
+        for rotation in [Rotation::Cw90, Rotation::Cw270] {
+            let mut rotated = specified_input(
+                egui::vec2(1000.0, 2000.0),
+                FullscreenSpecifiedScale {
+                    width: None,
+                    height: Some(SpecifiedScaleAxis::LogicalPixels(800)),
+                },
+            );
+            rotated.rotation = rotation;
+            let geometry = DisplayedImageTransform::resolve(rotated).unwrap();
+            close(geometry.full_image_rect.height(), 800.0);
+            close(geometry.full_image_rect.width(), 1600.0);
+        }
+    }
+
+    #[test]
+    fn specified_singleton_fits_the_whole_canvas_and_reduces_effective_gap() {
+        use crate::settings::{FullscreenSpecifiedScale, SpecifiedScaleAxis};
+        let mut value = specified_input(
+            egui::vec2(1000.0, 2000.0),
+            FullscreenSpecifiedScale {
+                width: Some(SpecifiedScaleAxis::LogicalPixels(800)),
+                height: None,
+            },
+        );
+        value.placement = ResolvedDisplayPlacement::SingletonSpread {
+            side: SingletonSpreadPlacement::Left,
+            gap: 40.0,
+            zoom_pan: None,
+        };
+        let geometry = DisplayedImageTransform::resolve(value).unwrap();
+        close(geometry.full_image_rect.width(), 380.0);
+        close(
+            geometry.full_image_rect.right(),
+            value.viewport_rect.center().x - 20.0,
+        );
+        value.fit_mode = FullscreenFitInput::SpecifiedScale {
+            size: FullscreenSpecifiedScale {
+                width: Some(SpecifiedScaleAxis::LogicalPixels(1)),
+                height: None,
+            },
+            basis: crate::fullscreen_specified_scale::FullscreenFitBasis::new(
+                value.source_size,
+                value.source_size,
+            )
+            .unwrap(),
+        };
+        let geometry = DisplayedImageTransform::resolve(value).unwrap();
+        close(geometry.full_image_rect.width(), 0.5);
+        close(
+            geometry.full_image_rect.right(),
+            value.viewport_rect.center().x,
+        );
+    }
+
+    #[test]
+    fn specified_single_z_forces_unlimited_page_and_restores_normal_fit_on_exit() {
+        use crate::settings::{FullscreenSpecifiedScale, SpecifiedScaleAxis};
+        let mut value = specified_input(
+            egui::vec2(1000.0, 1000.0),
+            FullscreenSpecifiedScale {
+                width: None,
+                height: Some(SpecifiedScaleAxis::LogicalPixels(100)),
+            },
+        );
+        value.fit_scale_limits.no_upscale = true;
+        value.fit_scale_limits.no_downscale = true;
+        let normal = DisplayedImageTransform::resolve(value).unwrap();
+        close(normal.full_image_rect.height(), 1000.0);
+        for active in [false, true] {
+            let resolved = ResolvedZTransform::resolve(ZTransformInput {
+                image: value,
+                active,
+                factor: 1.0,
+                cursor: value.viewport_rect.center(),
+                pan_band: value.viewport_rect,
+            })
+            .unwrap();
+            assert_eq!(resolved.transform.fit_mode, FullscreenFitMode::Page);
+            assert_eq!(
+                resolved.transform.fit_input,
+                value.fit_mode.for_single_page_z()
+            );
+            assert!(!resolved.transform.fit_scale_limits.active());
+            close(
+                resolved.transform.full_image_rect.height(),
+                if active { 1000.0 } else { 800.0 },
+            );
+        }
+        let restored = DisplayedImageTransform::resolve(value).unwrap();
+        assert_eq!(normal.full_image_rect, restored.full_image_rect);
+        assert_eq!(normal.fit_input, restored.fit_input);
+    }
+
+    #[test]
+    fn specified_single_z_canonical_basis_ignores_rounded_raster_and_limits() {
+        use crate::fullscreen_specified_scale::FullscreenFitBasis;
+        use crate::pdf_loader::PdfPageContentType;
+        use crate::settings::{FullscreenSpecifiedScale, SpecifiedScaleAxis};
+        let basis = FullscreenFitBasis::from_pdf(
+            egui::vec2(600000.0, 800000.0),
+            PdfPageContentType::Vector,
+        )
+        .unwrap();
+        for rotation in [Rotation::None, Rotation::Cw90, Rotation::Cw270] {
+            for pixels_per_point in [1.0, 1.25, 1.5, 2.0] {
+                for active in [false, true] {
+                    let mut value = specified_input(
+                        basis.normalized_original_size(),
+                        FullscreenSpecifiedScale {
+                            width: None,
+                            height: Some(SpecifiedScaleAxis::LogicalPixels(100)),
+                        },
+                    );
+                    value.fit_mode = FullscreenFitInput::SpecifiedScale {
+                        size: FullscreenSpecifiedScale {
+                            width: None,
+                            height: Some(SpecifiedScaleAxis::LogicalPixels(100)),
+                        },
+                        basis,
+                    };
+                    value.rotation = rotation;
+                    value.pixels_per_point = pixels_per_point;
+                    value.fit_scale_limits = FullscreenFitScaleLimits {
+                        no_upscale: true,
+                        no_downscale: true,
+                        pixels_per_point,
+                    };
+                    let z_input = |image: DisplayedImageTransformInput| ZTransformInput {
+                        image,
+                        active,
+                        factor: 1.2,
+                        cursor: image.viewport_rect.center(),
+                        pan_band: image.viewport_rect,
+                    };
+                    let initial = ResolvedZTransform::resolve(z_input(value)).unwrap();
+                    assert_eq!(
+                        initial.transform.fit_input,
+                        FullscreenFitInput::CanonicalPage { basis }
+                    );
+                    assert!(!initial.transform.fit_scale_limits.active());
+                    for raster in [
+                        egui::vec2(4055.0, 5407.0),
+                        egui::vec2(5354.0, 7138.0),
+                        egui::vec2(6145.0, 8192.0),
+                    ] {
+                        let mut adopted = value;
+                        adopted.source_size = raster;
+                        adopted.texture_size = raster;
+                        let next = ResolvedZTransform::resolve(z_input(adopted)).unwrap();
+                        assert_eq!(
+                            next.transform.layout_full_image_rect,
+                            initial.transform.layout_full_image_rect
+                        );
+                        assert_eq!(next.aim_frame, initial.aim_frame);
+                        close(next.full_image_zoom, initial.full_image_zoom);
+                        close(next.factor, initial.factor);
+                        assert!(
+                            next.transform
+                                .layout_full_image_rect
+                                .expand(0.001)
+                                .contains_rect(next.transform.full_image_rect)
+                        );
+                    }
+                    // With unchanged factor, a changed viewport must legitimately update demand.
+                    let mut resized = value;
+                    resized.viewport_rect =
+                        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1500.0, 1200.0));
+                    let larger = ResolvedZTransform::resolve(z_input(resized)).unwrap();
+                    close(
+                        larger.transform.layout_full_image_rect.width(),
+                        initial.transform.layout_full_image_rect.width() * 1.5,
+                    );
+                    close(
+                        larger.transform.layout_full_image_rect.height(),
+                        initial.transform.layout_full_image_rect.height() * 1.5,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn specified_single_z_has_no_five_times_cap_in_aim_or_confirmed_geometry() {
+        use crate::settings::FullscreenSpecifiedScale;
+        for active in [false, true] {
+            let mut value =
+                specified_input(egui::vec2(10.0, 20.0), FullscreenSpecifiedScale::default());
+            value.fit_scale_limits.no_upscale = true;
+            value.fit_scale_limits.no_downscale = true;
+            let result = ResolvedZTransform::resolve(ZTransformInput {
+                image: value,
+                active,
+                factor: 1.0,
+                cursor: value.viewport_rect.center(),
+                pan_band: value.viewport_rect,
+            })
+            .unwrap();
+            close(
+                result.transform.layout_full_image_rect.height(),
+                if active { 2000.0 } else { 800.0 },
+            );
+            assert!(result.transform.layout_full_image_rect.height() / 20.0 > 5.0);
+            assert!(!result.transform.fit_scale_limits.active());
+        }
+    }
+
+    #[test]
+    fn specified_both_none_keeps_real_single_page_subpoint_formula() {
+        use crate::settings::FullscreenSpecifiedScale;
+        let mut value = specified_input(
+            egui::vec2(2000.0, 1000.0),
+            FullscreenSpecifiedScale {
+                width: None,
+                height: None,
+            },
+        );
+        value.viewport_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(0.5, 0.8));
+        let specified = DisplayedImageTransform::resolve(value).unwrap();
+        let legacy = DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+            fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
+            ..value
+        })
+        .unwrap();
+        assert_eq!(specified.layout_full_image_rect, legacy.full_image_rect);
+        close(specified.layout_full_image_rect.width(), 0.5);
+        close(specified.layout_full_image_rect.height(), 0.25);
+        // A virtual two-slot canvas retains its own legacy minimum width at gap=0.
+        value.placement = ResolvedDisplayPlacement::SingletonSpread {
+            side: SingletonSpreadPlacement::Left,
+            gap: 0.0,
+            zoom_pan: None,
+        };
+        let singleton = DisplayedImageTransform::resolve(value).unwrap();
+        close(singleton.layout_full_image_rect.width(), 0.5);
+        close(singleton.layout_full_image_rect.height(), 0.25);
+    }
+
+    #[test]
+    fn specified_free_rotation_disables_trim_without_fitting_a_new_aabb() {
+        use crate::settings::{FullscreenSpecifiedScale, SpecifiedScaleAxis};
+        let mut value = specified_input(
+            egui::vec2(1000.0, 2000.0),
+            FullscreenSpecifiedScale {
+                width: None,
+                height: Some(SpecifiedScaleAxis::LogicalPixels(800)),
+            },
+        );
+        value.content_bbox = Some(egui::Rect::from_min_max(
+            egui::pos2(0.1, 0.2),
+            egui::pos2(0.9, 0.8),
+        ));
+        value.free_rotation_rad = std::f32::consts::FRAC_PI_2;
+        let rotated = DisplayedImageTransform::resolve(value).unwrap();
+        close(rotated.layout_full_image_rect.width(), 400.0);
+        close(rotated.layout_full_image_rect.height(), 800.0);
+        assert_eq!(rotated.uv_rect, full_uv_rect());
+        assert_eq!(rotated.paint_rect, rotated.full_image_rect);
+        assert_eq!(
+            rotated.hit_rect,
+            rotated_rect_aabb(
+                rotated.paint_rect,
+                rotated.full_image_rect.center(),
+                value.free_rotation_rad
+            )
+            .intersect(value.viewport_rect)
+        );
+    }
+
+    #[test]
+    fn specified_pdf_geometry_uses_metadata_original_even_after_raster_source_adoption() {
+        use crate::fullscreen_specified_scale::FullscreenFitBasis;
+        use crate::pdf_loader::PdfPageContentType;
+        use crate::settings::{FullscreenSpecifiedScale, SpecifiedScaleAxis};
+        let basis = FullscreenFitBasis::from_pdf(
+            egui::vec2(100000.0, 100000.0),
+            PdfPageContentType::Vector,
+        )
+        .unwrap();
+        let mut value = specified_input(
+            basis.normalized_original_size(),
+            FullscreenSpecifiedScale {
+                width: None,
+                height: Some(SpecifiedScaleAxis::LogicalPixels(100)),
+            },
+        );
+        value.fit_mode = FullscreenFitInput::SpecifiedScale {
+            size: FullscreenSpecifiedScale {
+                width: None,
+                height: Some(SpecifiedScaleAxis::LogicalPixels(100)),
+            },
+            basis,
+        };
+        value.fit_scale_limits.no_downscale = true;
+        value.placement = ResolvedDisplayPlacement::Normal {
+            zoom_pan: Some((1.2, egui::Vec2::ZERO)),
+        };
+        let initial = DisplayedImageTransform::resolve(value).unwrap();
+        close(initial.layout_full_image_rect.width(), 4915.2);
+        for raster_edge in [5407.0, 7138.0, 8192.0] {
+            let mut adopted = value;
+            adopted.source_size = egui::Vec2::splat(raster_edge);
+            adopted.texture_size = adopted.source_size;
+            let next = DisplayedImageTransform::resolve(adopted).unwrap();
+            assert_eq!(next.layout_full_image_rect, initial.layout_full_image_rect);
+            close(next.layout_full_image_rect.width(), 4915.2);
+            close((next.layout_full_image_rect.width() * 1.10).ceil(), 5407.0);
+        }
+    }
+
     #[test]
     fn scale_limits_are_part_of_the_resolved_geometry() {
         let mut no_up = input(FullscreenFitMode::Page, Rotation::None, None);
@@ -2818,7 +3378,7 @@ mod tests {
             rotation: Rotation::None,
             free_rotation_rad: 0.0,
             content_bbox: None,
-            fit_mode: FullscreenFitMode::Original,
+            fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Original),
             fit_scale_limits: FullscreenFitScaleLimits {
                 pixels_per_point,
                 ..FullscreenFitScaleLimits::default()
@@ -2868,7 +3428,7 @@ mod tests {
                 rotation: Rotation::None,
                 free_rotation_rad: 0.0,
                 content_bbox: None,
-                fit_mode: FullscreenFitMode::Page,
+                fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
                 fit_scale_limits: FullscreenFitScaleLimits::default(),
                 pixels_per_point: 1.0,
                 placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
@@ -2945,7 +3505,9 @@ mod tests {
                                         rotation,
                                         free_rotation_rad: 0.0,
                                         content_bbox,
-                                        fit_mode: FullscreenFitMode::Page,
+                                        fit_mode: FullscreenFitInput::legacy(
+                                            FullscreenFitMode::Page,
+                                        ),
                                         fit_scale_limits: FullscreenFitScaleLimits {
                                             pixels_per_point,
                                             ..FullscreenFitScaleLimits::default()

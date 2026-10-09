@@ -139,11 +139,17 @@ macro_rules! transfer_get {
     ($s:expr, $f:ident, plain) => {
         $s.$f.clone()
     };
+    ($s:expr, $f:ident, specified_scale) => {
+        $s.common_fullscreen_specified_scale()
+    };
     ($s:expr, $f:ident, archive) => {
         $s.archive_file_handling_resolved()
     };
 }
 macro_rules! transfer_set {
+    ($s:expr, $f:ident, $v:expr, specified_scale) => {
+        $s.set_common_fullscreen_specified_scale(*$v)
+    };
     ($s:expr, $f:ident, $v:expr, plain) => {
         $s.$f = $v.clone()
     };
@@ -225,7 +231,7 @@ macro_rules! preferences_policy {
                 let mut changed_fields = Vec::new();
                 for accepted in &self.accepted { match accepted {
                     $( Accepted::$field(value) => {
-                        if settings.$field != *value { changed_fields.push($label.into()); }
+                        if transfer_get!(settings, $field, $get) != *value { changed_fields.push($label.into()); }
                         transfer_set!(settings, $field, value, $set);
                     }, )*
                     Accepted::StillChrome(value) => {
@@ -335,6 +341,7 @@ preferences_policy! {
         continuous_reading_gap_px: u32 => ("連結読書のページ間隔", |v, _raw| (0..=200).contains(v), plain, plain);
         fullscreen_image_margin_color: [u8; 3] => ("閲覧表示の余白色", |_, _| true, plain, plain);
         fullscreen_fit_mode: FullscreenFitMode => ("閲覧表示のフィット方法", |v, _raw| FullscreenFitMode::all().contains(v), plain, plain);
+        fullscreen_specified_scale: FullscreenSpecifiedScale => ("指定サイズの幅・高さ", |v, _| v.is_valid(), specified_scale, specified_scale);
         fullscreen_fit_cycle_excluded: Vec<String> => ("フィット循環に含めるモード", |v, _| FullscreenFitMode::all().iter().any(|mode| mode.cycle_enabled(v)), plain, plain);
         fullscreen_fit_no_upscale: bool => ("フィットで拡大しない", |_, _| true, plain, plain);
         fullscreen_fit_no_downscale: bool => ("フィットで縮小しない", |_, _| true, plain, plain);
@@ -1591,13 +1598,101 @@ mod tests {
             copy.fullscreen_fit_cycle_excluded,
             settings.fullscreen_fit_cycle_excluded
         );
+        let legacy =
+            parse_preferences(&document(json!(["Page", "Width", "Height", "Original"]))).unwrap();
+        assert!(legacy.apply_to(&mut settings).issues.is_empty());
+        assert!(
+            FullscreenFitMode::SpecifiedScale
+                .cycle_enabled(&settings.fullscreen_fit_cycle_excluded)
+        );
         let before = settings.fullscreen_fit_cycle_excluded.clone();
         let parsed = parse_preferences(&document(serde_json::json!([
-            "Page", "Width", "Height", "Original"
+            "Page",
+            "Width",
+            "Height",
+            "Original",
+            "SpecifiedScale"
         ])))
         .unwrap();
         assert_eq!(parsed.apply_to(&mut settings).issues.len(), 1);
         assert_eq!(settings.fullscreen_fit_cycle_excluded, before);
+    }
+
+    #[test]
+    fn specified_scale_transfer_validates_complete_values_and_preserves_common_owner() {
+        let mut settings = Settings::default();
+        let common = FullscreenSpecifiedScale {
+            width: Some(SpecifiedScaleAxis::PercentTenths(125)),
+            height: Some(SpecifiedScaleAxis::LogicalPixels(800)),
+        };
+        settings.fullscreen_specified_scale = common;
+        let explicit_none = FullscreenSpecifiedScale {
+            width: None,
+            height: None,
+        };
+        let mut favorite = FavoriteViewState::from_settings(&settings);
+        favorite.fullscreen_specified_scale = Some(explicit_none);
+        let id = uuid::Uuid::new_v4();
+        settings.apply_favorite_view_overlay(id, &favorite);
+        let exported = export_preferences(&settings).unwrap();
+        let wire: Value = serde_json::from_str(&exported.json).unwrap();
+        assert_eq!(
+            wire["preferences"]["fullscreen_specified_scale"],
+            serde_json::to_value(common).unwrap()
+        );
+        assert!(!exported.json.contains(&id.to_string()));
+        let mut destination = Settings::default();
+        parse_preferences(&exported.json)
+            .unwrap()
+            .apply_to(&mut destination);
+        assert_eq!(destination.fullscreen_specified_scale, common);
+        parse_preferences(&document(json!({})))
+            .unwrap()
+            .apply_to(&mut settings);
+        assert_eq!(settings.common_fullscreen_specified_scale(), common);
+        let replacement = FullscreenSpecifiedScale {
+            width: Some(SpecifiedScaleAxis::LogicalPixels(32768)),
+            height: Some(SpecifiedScaleAxis::PercentTenths(10000)),
+        };
+        let parsed = parse_preferences(&document(
+            json!({"fullscreen_specified_scale": replacement}),
+        ))
+        .unwrap();
+        assert!(parsed.apply_to(&mut settings).issues.is_empty());
+        assert_eq!(settings.fullscreen_specified_scale, explicit_none);
+        assert_eq!(settings.common_fullscreen_specified_scale(), replacement);
+        assert_eq!(settings.active_favorite_view_id(), Some(id));
+        for invalid in [
+            json!({"width":{"PercentTenths":0},"height":null}),
+            json!({"width":{"PercentTenths":10001},"height":null}),
+            json!({"width":null,"height":{"LogicalPixels":0}}),
+            json!({"width":null,"height":{"LogicalPixels":32769}}),
+            json!({"width":null,"height":{"LogicalPixels":1.5}}),
+            json!({"width":{"FutureUnit":80},"height":null}),
+            json!({"width":null}),
+        ] {
+            let parsed =
+                parse_preferences(&document(json!({"fullscreen_specified_scale":invalid})))
+                    .unwrap();
+            assert_eq!(parsed.issues.len(), 1, "{invalid}");
+            parsed.apply_to(&mut settings);
+            assert_eq!(settings.common_fullscreen_specified_scale(), replacement);
+        }
+        // Match the existing transfer schema: unknown object children remain
+        // forward-compatible, while all recognized axes must be complete/valid.
+        let extended = parse_preferences(&document(json!({
+            "fullscreen_specified_scale":{"width":null,"height":null,"extra":true}
+        })))
+        .unwrap();
+        assert!(extended.issues.is_empty());
+        extended.apply_to(&mut destination);
+        assert_eq!(destination.fullscreen_specified_scale, explicit_none);
+        let parsed = parse_preferences(&document(
+            json!({"fullscreen_specified_scale":explicit_none}),
+        ))
+        .unwrap();
+        assert!(parsed.apply_to(&mut destination).issues.is_empty());
+        assert_eq!(destination.fullscreen_specified_scale, explicit_none);
     }
 
     #[test]
@@ -1665,13 +1760,13 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 452);
+        assert_eq!(entries.len(), 453);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            139
+            140
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -1681,7 +1776,7 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 137);
+        assert_eq!(wire.len(), 138);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);

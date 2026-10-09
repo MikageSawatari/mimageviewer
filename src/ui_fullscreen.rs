@@ -47,6 +47,9 @@ use crate::displayed_image_transform::{
     physical_scale_is_near_integer, quantize_points_to_physical_pixels, z_cursor_image_px,
 };
 use crate::fs_animation::{AnimationPlayback, FsCacheEntry};
+use crate::fullscreen_specified_scale::{
+    FullscreenFitBasis, FullscreenFitInput, resolve_specified_scale,
+};
 use crate::gpu_lanczos::FullscreenPaintResource;
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::items_generation_cache::ItemsGenerationMap;
@@ -2130,6 +2133,7 @@ enum FsPageLayoutSource {
     Captured {
         layout_size: egui::Vec2,
         post_filter: crate::adjustment::PostFilter,
+        fit_input: FullscreenFitInput,
     },
 }
 
@@ -2927,7 +2931,7 @@ impl FsCapturedWhiteCompanion {
                 rotation: captured.rotation,
                 free_rotation_rad: captured.free_rotation_rad,
                 content_bbox: captured.content_bbox,
-                fit_mode: captured.fit_mode,
+                fit_mode: captured.fit_input,
                 fit_scale_limits: FullscreenFitScaleLimits {
                     pixels_per_point,
                     ..captured.fit_scale_limits
@@ -3156,7 +3160,7 @@ fn build_flat_navigator_layout(
                 // rotation and resolved spread placement belong in the overview; active trim
                 // remains visible through the frame derived from the main transform.
                 content_bbox: None,
-                fit_mode: main.fit_mode,
+                fit_mode: main.fit_input,
                 fit_scale_limits: main.fit_scale_limits,
                 pixels_per_point: main.fit_scale_limits.pixels_per_point,
                 placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
@@ -3226,7 +3230,7 @@ fn build_similar_preview_navigator_layout(
             rotation: main.rotation,
             free_rotation_rad: 0.0,
             content_bbox: None,
-            fit_mode: main.fit_mode,
+            fit_mode: main.fit_input,
             fit_scale_limits: main.fit_scale_limits,
             pixels_per_point: main.fit_scale_limits.pixels_per_point,
             placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
@@ -8144,8 +8148,48 @@ impl VerticalReadingPage {
     }
 }
 
+/// One context-owned reference; scrolling never selects a new automatic fit basis.
+#[derive(Clone, Debug, Default)]
+pub(crate) enum ContinuousSpecifiedFitReference {
+    #[default]
+    Legacy,
+    Specified {
+        unit: ContinuousReadingUnitSpec,
+        settings: crate::settings::FullscreenSpecifiedScale,
+        limits: FullscreenFitScaleLimits,
+        base: Option<ContinuousReadingUnitSize>,
+    },
+}
+
+impl ContinuousSpecifiedFitReference {
+    pub(crate) fn remap_indices(&mut self, remap: &impl Fn(usize) -> Option<usize>) {
+        let Self::Specified { unit, base, .. } = self else {
+            return;
+        };
+        let Some(anchor) = remap(unit.anchor_idx) else {
+            *self = Self::Legacy;
+            return;
+        };
+        let mut presentation = unit.presentation.clone();
+        for page in &mut presentation {
+            let (Some(idx), Some(navigation_anchor_idx)) =
+                (remap(page.idx), remap(page.navigation_anchor_idx))
+            else {
+                *self = Self::Legacy;
+                return;
+            };
+            page.idx = idx;
+            page.navigation_anchor_idx = navigation_anchor_idx;
+        }
+        unit.anchor_idx = anchor;
+        unit.presentation = presentation;
+        // Dimensions are source-derived and recomputed on the next layout pass.
+        *base = None;
+    }
+}
+
 #[derive(Clone, Debug)]
-struct ContinuousReadingUnitSpec {
+pub(crate) struct ContinuousReadingUnitSpec {
     anchor_idx: usize,
     presentation: Vec<SpreadPageOccurrence>,
     singleton_placement: SingletonSpreadPlacement,
@@ -8158,7 +8202,7 @@ struct ContinuousReadingUnitSpec {
 }
 
 impl ContinuousReadingUnitSpec {
-    fn pages(anchor_idx: usize, pages: Vec<usize>) -> Self {
+    pub(crate) fn pages(anchor_idx: usize, pages: Vec<usize>) -> Self {
         Self {
             anchor_idx,
             presentation: pages
@@ -8330,7 +8374,7 @@ enum ContinuousAxis {
 }
 
 #[derive(Clone, Debug)]
-struct ContinuousReadingUnitSize {
+pub(crate) struct ContinuousReadingUnitSize {
     pages: Vec<ContinuousReadingPageSize>,
     width: f32,
     height: f32,
@@ -8361,6 +8405,67 @@ fn apply_continuous_spread_geometry(
     size.pages[1].logical_scale = geometry.right.scale_factor;
     size.width = geometry.fit_size.x;
     size.height = geometry.fit_size.y;
+}
+
+fn specified_pdf_provisional_target(
+    viewport: egui::Vec2,
+    specified: crate::settings::FullscreenSpecifiedScale,
+) -> (egui::Vec2, crate::pdf_loader::PdfDisplayFitMode) {
+    let axis = |axis: crate::settings::SpecifiedScaleAxis, length: f32| match axis {
+        crate::settings::SpecifiedScaleAxis::PercentTenths(value) => length * value as f32 / 1000.0,
+        crate::settings::SpecifiedScaleAxis::LogicalPixels(value) => value as f32,
+    };
+    let size = egui::vec2(
+        specified.width.map_or(viewport.x, |v| axis(v, viewport.x)),
+        specified.height.map_or(viewport.y, |v| axis(v, viewport.y)),
+    );
+    let mode = match (specified.width.is_some(), specified.height.is_some()) {
+        (true, false) => crate::pdf_loader::PdfDisplayFitMode::Width,
+        (false, true) => crate::pdf_loader::PdfDisplayFitMode::Height,
+        _ => crate::pdf_loader::PdfDisplayFitMode::Page,
+    };
+    (size, mode)
+}
+
+fn fit_input_layout_size(input: FullscreenFitInput, legacy: egui::Vec2) -> egui::Vec2 {
+    match input {
+        FullscreenFitInput::SpecifiedScale { basis, .. }
+        | FullscreenFitInput::CanonicalPage { basis } => basis.normalized_original_size(),
+        FullscreenFitInput::Legacy(_) => legacy,
+    }
+}
+
+fn fit_input_specified_size(
+    input: FullscreenFitInput,
+) -> Option<crate::settings::FullscreenSpecifiedScale> {
+    match input {
+        FullscreenFitInput::SpecifiedScale { size, .. } => Some(size),
+        _ => None,
+    }
+}
+
+fn resolve_paged_auto_fit(
+    mode: FullscreenFitMode,
+    specified: crate::settings::FullscreenSpecifiedScale,
+    viewport: egui::Rect,
+    unit: egui::Vec2,
+    gap: f32,
+    limits: FullscreenFitScaleLimits,
+) -> Option<crate::fullscreen_specified_scale::ResolvedSpecifiedScale> {
+    if mode == FullscreenFitMode::SpecifiedScale {
+        return resolve_specified_scale(viewport.size(), unit, gap, specified, limits);
+    }
+    let page = ((viewport.width() - gap).max(1.0) / unit.x).min(viewport.height() / unit.y);
+    let requested = match mode {
+        FullscreenFitMode::Width => (viewport.width() - gap).max(1.0) / unit.x,
+        FullscreenFitMode::Height => viewport.height() / unit.y,
+        FullscreenFitMode::Original => physical_pixel_scale(limits.pixels_per_point),
+        _ => page,
+    };
+    Some(crate::fullscreen_specified_scale::ResolvedSpecifiedScale {
+        scale: limits.apply(requested),
+        gap,
+    })
 }
 
 fn spread_should_match_page_heights(fit_mode: FullscreenFitMode) -> bool {
@@ -8404,7 +8509,7 @@ pub(crate) fn fs_image_draw_geometry_for_size(
     rotation: crate::rotation_db::Rotation,
     zoom_pan: Option<(f32, egui::Vec2)>,
     free_rotation_rad: f32,
-    fit_mode: FullscreenFitMode,
+    fit_mode: FullscreenFitInput,
     fit_scale_limits: FullscreenFitScaleLimits,
     pixels_per_point: f32,
     content_bbox: Option<egui::Rect>,
@@ -8715,6 +8820,12 @@ fn resolve_fs_geometry_in_layout_rect(
     input: DisplayedImageGeometryInput,
     page_rect: egui::Rect,
 ) -> Option<DisplayedImageGeometry> {
+    if matches!(
+        input.fit_mode,
+        FullscreenFitInput::SpecifiedScale { .. } | FullscreenFitInput::CanonicalPage { .. }
+    ) {
+        return DisplayedImageGeometry::from_layout_rect(input, page_rect);
+    }
     let texture_rect = fs_texture_content_rect(page_rect, input.texture_size, input.rotation);
     DisplayedImageGeometry::from_resolved_rect(input, texture_rect)
 }
@@ -8740,6 +8851,12 @@ fn resolve_fs_image_geometry(
     input: DisplayedImageGeometryInput,
     layout_source_size: Option<egui::Vec2>,
 ) -> Option<DisplayedImageGeometry> {
+    if matches!(
+        input.fit_mode,
+        FullscreenFitInput::SpecifiedScale { .. } | FullscreenFitInput::CanonicalPage { .. }
+    ) {
+        return DisplayedImageGeometry::resolve(input);
+    }
     let Some(layout_source_size) = layout_source_size else {
         return DisplayedImageGeometry::resolve(input);
     };
@@ -10443,7 +10560,7 @@ impl App {
                 rotation: page.rotation,
                 free_rotation_rad: self.fs_free_rotation,
                 content_bbox: page.content_bbox,
-                fit_mode: self.effective_fullscreen_fit_mode(),
+                fit_mode: page.fit_input,
                 fit_scale_limits: self.fullscreen_fit_scale_limits(pixels_per_point),
                 pixels_per_point,
                 placement,
@@ -10558,6 +10675,11 @@ impl App {
             .or(source_size)
             .unwrap_or_else(|| texture.size_vec2());
         let post_filter = self.fullscreen_paint_post_filter(&texture);
+        let fit_input = self.fs_fit_input_for_resource(
+            idx,
+            self.effective_fullscreen_fit_mode(),
+            texture.source_texture(),
+        )?;
         let trace_key = self.perf_item_key(idx);
         let trace_load_seq = self
             .fs_cache
@@ -10568,6 +10690,10 @@ impl App {
             occurrence,
             texture,
             rotation,
+            fit_input,
+            fit_scale_limits: self.fullscreen_fit_scale_limits(
+                rendition_ctx.map_or(1.0, egui::Context::pixels_per_point),
+            ),
             layout_size,
             post_filter,
             trace_key,
@@ -12253,7 +12379,7 @@ impl App {
         self.fs_zoom_aiming = false;
         self.fs_zoom_exit_pending = false;
         self.fs_zoom_z_was_down = false;
-        self.fs_zoom_pdf_rerender_idx = None;
+        self.fs_pdf_rerender_demand.reset();
     }
 
     /// 一時状態 (照準中 + エッジ検出) だけリセットする。確定済みズーム (`fs_zoom_active`) は残す。
@@ -12472,7 +12598,8 @@ impl App {
                 rotation,
                 free_rotation_rad: 0.0,
                 content_bbox: trim_bbox,
-                fit_mode: FullscreenFitMode::Page,
+                fit_mode: self
+                    .fs_fit_input_for_idx(fs_idx, self.effective_fullscreen_fit_mode())?,
                 fit_scale_limits: no_limits,
                 pixels_per_point: ctx.pixels_per_point(),
                 placement: ResolvedDisplayPlacement::Z {
@@ -12530,12 +12657,11 @@ impl App {
             // Phase C: PDF ページはズーム後の実効倍率で高解像度へ再レンダ (鮮明化)。毎フレ呼ぶと
             // in-flight 要求をキャンセルし続けて完了しないので (Codex P1)、(idx, zoom) が変わった
             // ときだけ要求する。判定は画面上の拡大率に比例する full-image 基準 zoom_full を使う。
-            let rerender = self.fs_zoom_pdf_rerender_idx != Some(fs_idx)
-                || (resolved.full_image_zoom - self.fs_zoom_pdf_rerender_zoom).abs()
-                    > self.fs_zoom_pdf_rerender_zoom.max(1.0) * 0.02;
-            if rerender {
-                self.fs_zoom_pdf_rerender_idx = Some(fs_idx);
-                self.fs_zoom_pdf_rerender_zoom = resolved.full_image_zoom;
+            if self.effective_fullscreen_fit_mode() != FullscreenFitMode::SpecifiedScale
+                && self
+                    .fs_pdf_rerender_demand
+                    .note_legacy(fs_idx, resolved.full_image_zoom)
+            {
                 self.maybe_rerender_pdf(resolved.full_image_zoom);
             }
         } else if let Some(frame) = resolved.aim_frame {
@@ -18083,11 +18209,12 @@ impl App {
         idx: usize,
         placement: crate::settings::DetachedViewerWindowPlacement,
         pixels_per_point: f32,
-        texture_size: egui::Vec2,
+        texture: &egui::TextureHandle,
         rotation: crate::rotation_db::Rotation,
         zoom_pan: Option<(f32, egui::Vec2)>,
         free_rotation: f32,
-    ) -> (egui::Rect, f32, Option<egui::Rect>) {
+    ) -> Option<(egui::Rect, f32, Option<egui::Rect>)> {
+        let texture_size = texture.size_vec2();
         let full_rect = egui::Rect::from_min_size(
             egui::pos2(0.0, 0.0),
             egui::vec2(placement.w.max(1.0), placement.h.max(1.0)),
@@ -18107,7 +18234,7 @@ impl App {
             rotation,
             zoom_pan,
             free_rotation,
-            self.effective_fullscreen_fit_mode(),
+            self.fs_fit_input_for_resource(idx, self.effective_fullscreen_fit_mode(), texture)?,
             self.fullscreen_fit_scale_limits(pixels_per_point),
             pixels_per_point,
             content_bbox,
@@ -18118,11 +18245,11 @@ impl App {
                 .min(image_rect.height() / rotated.y.max(1.0));
             (image_rect, scale)
         });
-        (
+        Some((
             Self::normalize_rect_to_full_rect(draw_rect, full_rect),
             draw_scale,
             content_bbox,
-        )
+        ))
     }
 
     #[cfg(windows)]
@@ -18187,33 +18314,33 @@ impl App {
             let resource = &page.texture;
             let texture_size = resource.size_vec2();
             let z_projection = matches!(resolved_placement, ResolvedDisplayPlacement::Z { .. });
-            let (fit_mode, fit_scale_limits, free_rotation) = if let Some(captured) = captured_white
-            {
-                let transform = captured.real_transform;
-                (
-                    transform.fit_mode,
-                    FullscreenFitScaleLimits {
-                        pixels_per_point,
-                        ..transform.fit_scale_limits
-                    },
-                    transform.free_rotation_rad,
-                )
-            } else if z_projection {
-                (
-                    FullscreenFitMode::Page,
-                    FullscreenFitScaleLimits {
-                        pixels_per_point,
-                        ..FullscreenFitScaleLimits::default()
-                    },
-                    0.0,
-                )
-            } else {
-                (
-                    self.effective_fullscreen_fit_mode(),
-                    self.fullscreen_fit_scale_limits(pixels_per_point),
-                    self.fs_free_rotation,
-                )
-            };
+            let (_fit_mode, fit_scale_limits, free_rotation) =
+                if let Some(captured) = captured_white {
+                    let transform = captured.real_transform;
+                    (
+                        transform.fit_mode,
+                        FullscreenFitScaleLimits {
+                            pixels_per_point,
+                            ..transform.fit_scale_limits
+                        },
+                        transform.free_rotation_rad,
+                    )
+                } else if z_projection {
+                    (
+                        FullscreenFitMode::Page,
+                        FullscreenFitScaleLimits {
+                            pixels_per_point,
+                            ..FullscreenFitScaleLimits::default()
+                        },
+                        0.0,
+                    )
+                } else {
+                    (
+                        self.effective_fullscreen_fit_mode(),
+                        self.fullscreen_fit_scale_limits(pixels_per_point),
+                        self.fs_free_rotation,
+                    )
+                };
             let transform = captured_white
                 .and_then(|captured| {
                     captured.reprojected_real_transform(image_rect, pixels_per_point)
@@ -18229,8 +18356,21 @@ impl App {
                             rotation: page.rotation,
                             free_rotation_rad: free_rotation,
                             content_bbox: page.content_bbox,
-                            fit_mode,
-                            fit_scale_limits,
+                            fit_mode: if z_projection {
+                                page.fit_input.for_single_page_z()
+                            } else {
+                                page.fit_input
+                            },
+                            fit_scale_limits: if !z_projection
+                                && page.fit_input.mode() == FullscreenFitMode::SpecifiedScale
+                            {
+                                FullscreenFitScaleLimits {
+                                    pixels_per_point,
+                                    ..page.fit_scale_limits
+                                }
+                            } else {
+                                fit_scale_limits
+                            },
                             pixels_per_point,
                             placement: resolved_placement,
                         },
@@ -18311,8 +18451,14 @@ impl App {
         let right = right_page.idx();
         let left_rot = left_page.rotation;
         let right_rot = right_page.rotation;
-        let left_size = rotated_display_size(left_page.layout_size, left_rot);
-        let right_size = rotated_display_size(right_page.layout_size, right_rot);
+        let left_size = rotated_display_size(
+            fit_input_layout_size(left_page.fit_input, left_page.layout_size),
+            left_rot,
+        );
+        let right_size = rotated_display_size(
+            fit_input_layout_size(right_page.fit_input, right_page.layout_size),
+            right_rot,
+        );
         if left_size.x <= 0.0 || left_size.y <= 0.0 || right_size.x <= 0.0 || right_size.y <= 0.0 {
             self.log_detached_image_window_debug(format!(
                 "detached_spread_frozen_fallback reason=invalid_size idx={idx} left={left} \
@@ -18327,7 +18473,7 @@ impl App {
         let left_bbox = content_left.unwrap_or(full_bbox);
         let right_bbox = content_right.unwrap_or(full_bbox);
         let content_active = content_left.is_some() || content_right.is_some();
-        let fit_mode = self.effective_fullscreen_fit_mode();
+        let fit_mode = left_page.fit_input.mode();
         let geometry = spread_layout_geometry(
             left_size,
             right_size,
@@ -18335,12 +18481,32 @@ impl App {
             right_bbox,
             spread_should_match_page_heights(fit_mode),
         );
-        let fit_scale_limits = self.fullscreen_fit_scale_limits(pixels_per_point);
+        let fit_scale_limits = if fit_mode == FullscreenFitMode::SpecifiedScale {
+            FullscreenFitScaleLimits {
+                pixels_per_point,
+                ..left_page.fit_scale_limits
+            }
+        } else {
+            self.fullscreen_fit_scale_limits(pixels_per_point)
+        };
         let zoom_pan = match resolved_placement {
             ResolvedDisplayPlacement::Normal { zoom_pan }
             | ResolvedDisplayPlacement::Z { zoom_pan, .. }
             | ResolvedDisplayPlacement::SingletonSpread { zoom_pan, .. } => zoom_pan,
         };
+        let specified = fit_input_specified_size(left_page.fit_input)
+            .unwrap_or(self.settings.fullscreen_specified_scale);
+        let Some(auto_fit) = resolve_paged_auto_fit(
+            fit_mode,
+            specified,
+            image_rect,
+            geometry.fit_size,
+            spread_gap,
+            fit_scale_limits,
+        ) else {
+            return Vec::new();
+        };
+        let spread_gap = auto_fit.gap;
         let effective_gap = match resolved_placement {
             ResolvedDisplayPlacement::Z {
                 active: true,
@@ -18351,19 +18517,7 @@ impl App {
             | ResolvedDisplayPlacement::Z { .. }
             | ResolvedDisplayPlacement::SingletonSpread { .. } => spread_gap,
         };
-        let page_fit = || {
-            ((image_rect.width() - spread_gap).max(1.0) / geometry.fit_size.x)
-                .min(image_rect.height() / geometry.fit_size.y)
-        };
-        let fit_scale = match fit_mode {
-            FullscreenFitMode::Width => {
-                (image_rect.width() - spread_gap).max(1.0) / geometry.fit_size.x
-            }
-            FullscreenFitMode::Height => image_rect.height() / geometry.fit_size.y,
-            FullscreenFitMode::Original => physical_pixel_scale(pixels_per_point),
-            _ => page_fit(),
-        };
-        let fit_scale = fit_scale_limits.apply(fit_scale);
+        let fit_scale = auto_fit.scale;
         let (total_scale, base_center) = match zoom_pan {
             Some((zoom, pan)) => (fit_scale * zoom, image_rect.center() + pan),
             None => (fit_scale, image_rect.center()),
@@ -18399,6 +18553,7 @@ impl App {
             FsPageLayoutSource::Captured {
                 layout_size: left_page.layout_size,
                 post_filter: left_page.post_filter,
+                fit_input: left_page.fit_input,
             },
             left_rot,
             content_left,
@@ -18414,6 +18569,7 @@ impl App {
             FsPageLayoutSource::Captured {
                 layout_size: right_page.layout_size,
                 post_filter: right_page.post_filter,
+                fit_input: right_page.fit_input,
             },
             right_rot,
             content_right,
@@ -22868,6 +23024,9 @@ impl App {
         mark_fs_render_perf(&mut fs_render_perf, FsRenderPerfStage::FrameStart);
 
         self.harvest_page_dims();
+        if self.effective_fullscreen_fit_mode() == FullscreenFitMode::SpecifiedScale {
+            self.adopt_retained_pdf_page_metadata(fs_idx);
+        }
         mark_fs_render_perf(&mut fs_render_perf, FsRenderPerfStage::HarvestPageDims);
         self.reconcile_fullscreen_page_slice(fs_idx);
         mark_fs_render_perf(
@@ -23589,15 +23748,15 @@ impl App {
                         } else {
                             resolved_fullscreen_media_rect
                         };
-                        let pdf_display_target =
-                            crate::pdf_loader::PdfDisplayTarget::from_logical_size(
-                                pdf_media_rect.width(),
-                                pdf_media_rect.height(),
-                                ctx.pixels_per_point(),
-                                pdf_fit_mode,
-                            );
-                        let pdf_target_changed =
-                            self.fs_pdf_display_target != Some(pdf_display_target);
+                        let specified_mode = self.effective_fullscreen_fit_mode() == FullscreenFitMode::SpecifiedScale;
+                        let (pdf_size, pdf_fit_mode) = if specified_mode {
+                            specified_pdf_provisional_target(pdf_media_rect.size(), self.settings.fullscreen_specified_scale)
+                        } else { (pdf_media_rect.size(), pdf_fit_mode) };
+                        let pdf_display_target = crate::pdf_loader::PdfDisplayTarget::from_logical_size(
+                            pdf_size.x, pdf_size.y, ctx.pixels_per_point(), pdf_fit_mode);
+
+                        let pdf_target_changed = !specified_mode
+                            && self.fs_pdf_display_target != Some(pdf_display_target);
                         self.fs_pdf_display_target = Some(pdf_display_target);
 
                         let pdf_partner = match spread_pair {
@@ -24149,7 +24308,7 @@ impl App {
                                         rotation: crate::rotation_db::Rotation::None,
                                         free_rotation_rad: 0.0,
                                         content_bbox: None,
-                                        fit_mode: FullscreenFitMode::Page,
+                                        fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
                                         fit_scale_limits: self
                                             .fullscreen_fit_scale_limits(ctx.pixels_per_point()),
                                         pixels_per_point: ctx.pixels_per_point(),
@@ -24811,7 +24970,11 @@ impl App {
                             }
                             let view_trim_active =
                                 self.view_trim_active_for_display(fs_idx, spread_pair);
+                            self.reconcile_specified_pdf_demand(ctx);
                             let mut fit_mode_choice: Option<FullscreenFitMode> = None;
+                            let mut specified_scale_edit = self.settings.fullscreen_specified_scale;
+                            let specified_scale_favorite = self.settings.remember_favorite_view_state && self.settings.active_favorite_view_id().is_some();
+                            let mut specified_scale_changed = false;
                             let mut fit_no_upscale_choice: Option<bool> = None;
                             let mut fit_no_downscale_choice: Option<bool> = None;
                             let mut overflow_request = None;
@@ -24916,6 +25079,9 @@ impl App {
                                 &mut self.settings.slideshow_continuous_wait_secs,
                                 &mut self.settings.slideshow_continuous_scroll_secs,
                                 &mut self.settings.slideshow_continuous_scroll_percent,
+                                &mut specified_scale_edit,
+                                specified_scale_favorite,
+                                &mut specified_scale_changed,
                                 &mut fit_mode_choice,
                                 &mut fit_no_upscale_choice,
                                 &mut fit_no_downscale_choice,
@@ -24978,6 +25144,10 @@ impl App {
                             }
                             // ズーム/フィットモード: ツールバーボタンはメニューから選択
                             // (0 キーは従来どおり循環)。
+                            if specified_scale_changed {
+                                self.set_current_fullscreen_specified_scale(specified_scale_edit);
+                                self.fs_continuous_fit_reference = ContinuousSpecifiedFitReference::Legacy;
+                            }
                             if let Some(mode) = fit_mode_choice {
                                 self.set_fullscreen_fit_mode_for_current(ctx, fs_idx, mode);
                             }
@@ -27045,6 +27215,159 @@ impl App {
                 .get_layout(self.items_generation, idx)
                 .map(|(w, h)| egui::vec2(w as f32, h as f32)),
         }
+    }
+
+    /// Stable source provenance, independent of the texture currently sampled.
+    fn reconcile_specified_pdf_demand(&mut self, ctx: &egui::Context) {
+        if self.effective_fullscreen_fit_mode() != FullscreenFitMode::SpecifiedScale
+            || self.fs_holdover_tex.is_some()
+        {
+            return;
+        }
+        let mut demands = HashMap::<usize, f32>::new();
+        for page in self.fullscreen_page_layout.displayed_pages() {
+            let idx = page.transform.page_idx;
+            if !matches!(self.items.get(idx), Some(GridItem::PdfPage { .. })) {
+                continue;
+            }
+            let rect = page.transform.layout_full_image_rect;
+            let required = rect.width().max(rect.height()) * ctx.pixels_per_point();
+            demands
+                .entry(idx)
+                .and_modify(|previous| *previous = previous.max(required))
+                .or_insert(required);
+        }
+        let single_z = self.fullscreen_page_layout.kind() == FullscreenPageLayoutKind::Single
+            && self.fs_zoom_mode_engaged();
+        let original_floor = self.settings.fullscreen_fit_no_downscale && !single_z;
+        // A cover source can occur twice in continuous reading at different
+        // matched heights. One source requests the greatest visible demand once.
+        for (idx, required) in demands {
+            self.request_pdf_absolute_demand(idx, required, original_floor);
+        }
+    }
+
+    fn specified_fit_basis_for_idx(&self, idx: usize) -> Option<FullscreenFitBasis> {
+        if matches!(self.items.get(idx), Some(GridItem::PdfPage { .. })) {
+            return self.pdf_specified_basis_for_idx(idx);
+        }
+        let canonical = self.fs_page_layout_source_size(idx);
+        let original = if self.is_raw_page(idx) {
+            self.fs_page_coordinate_source_size(idx)
+        } else {
+            self.pre_ai_display_size_for_idx(idx)
+                .or_else(|| match self.fs_cache.get(&idx) {
+                    Some(FsCacheEntry::Static { tex, .. }) => Some(tex.size_vec2()),
+                    Some(FsCacheEntry::Animated {
+                        frames,
+                        current_frame,
+                        ..
+                    }) => frames.get(*current_frame).map(|(tex, _)| tex.size_vec2()),
+                    _ => self.fs_page_coordinate_source_size(idx),
+                })
+        }?;
+        // An edited canvas is the aspect owner before AI; enlarged outputs never
+        // replace it. RAW keeps the developed coordinate aspect.
+        let aspect = if self.pre_ai_display_size_for_idx(idx).is_some() && !self.is_raw_page(idx) {
+            original
+        } else {
+            canonical.unwrap_or(original)
+        };
+        FullscreenFitBasis::new(aspect, original)
+    }
+
+    fn continuous_specified_fit_basis_for_idx(&self, idx: usize) -> Option<FullscreenFitBasis> {
+        let basis = self.specified_fit_basis_for_idx(idx)?;
+        if matches!(self.items.get(idx), Some(GridItem::PdfPage { .. })) {
+            return Some(basis);
+        }
+        // Continuous reading historically fits source-coordinate dimensions,
+        // even when the resident pre-AI texture was clamped for the GPU.
+        FullscreenFitBasis::new(
+            self.fs_page_layout_source_size(idx)
+                .unwrap_or(basis.aspect_size),
+            self.fs_page_coordinate_source_size(idx)
+                .unwrap_or(basis.original_size),
+        )
+    }
+
+    fn captured_fit_input_for_replay(&self, captured: FullscreenFitInput) -> FullscreenFitInput {
+        match captured {
+            FullscreenFitInput::Legacy(_)
+                if self.effective_fullscreen_fit_mode() != FullscreenFitMode::SpecifiedScale =>
+            {
+                FullscreenFitInput::legacy(self.effective_fullscreen_fit_mode())
+            }
+            _ => captured,
+        }
+    }
+
+    fn fs_fit_input_for_resource(
+        &self,
+        idx: usize,
+        mode: FullscreenFitMode,
+        handle: &egui::TextureHandle,
+    ) -> Option<FullscreenFitInput> {
+        if mode != FullscreenFitMode::SpecifiedScale
+            || matches!(self.items.get(idx), Some(GridItem::PdfPage { .. }))
+            || self.continuous_reading_active_for_idx(idx)
+        {
+            return self.fs_fit_input_for_idx(idx, mode);
+        }
+        let preserve_source = self.fs_page_layout_uses_source_size(idx, handle);
+        let resident_source = match self.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Static { tex, .. }) => tex.id() == handle.id(),
+            Some(FsCacheEntry::Animated { frames, .. }) => {
+                frames.iter().any(|(tex, _)| tex.id() == handle.id())
+            }
+            _ => false,
+        };
+        let thumbnail_source = matches!(self.thumbnails.get(idx), Some(ThumbnailState::Loaded { tex, .. }) if tex.id() == handle.id());
+        let original = if preserve_source {
+            self.fs_page_coordinate_source_size(idx)?
+        } else if resident_source || thumbnail_source {
+            handle.size_vec2()
+        } else {
+            self.pre_ai_display_size_for_idx(idx)
+                .or_else(|| match self.fs_cache.get(&idx) {
+                    Some(FsCacheEntry::Static { tex, .. }) => Some(tex.size_vec2()),
+                    Some(FsCacheEntry::Animated {
+                        frames,
+                        current_frame,
+                        ..
+                    }) => frames.get(*current_frame).map(|(tex, _)| tex.size_vec2()),
+                    _ => None,
+                })?
+        };
+        let aspect = if preserve_source {
+            self.fs_page_layout_source_size(idx).unwrap_or(original)
+        } else {
+            original
+        };
+        Some(FullscreenFitInput::from_mode(
+            mode,
+            self.settings.fullscreen_specified_scale,
+            FullscreenFitBasis::new(aspect, original)?,
+        ))
+    }
+
+    fn fs_fit_input_for_idx(
+        &self,
+        idx: usize,
+        mode: FullscreenFitMode,
+    ) -> Option<FullscreenFitInput> {
+        if mode != FullscreenFitMode::SpecifiedScale {
+            return Some(FullscreenFitInput::legacy(mode));
+        }
+        Some(FullscreenFitInput::from_mode(
+            mode,
+            self.settings.fullscreen_specified_scale,
+            if self.continuous_reading_active_for_idx(idx) {
+                self.continuous_specified_fit_basis_for_idx(idx)?
+            } else {
+                self.specified_fit_basis_for_idx(idx)?
+            },
+        ))
     }
 
     /// Canonical, pre-raster-rounding dimensions used only to lay out a page.
@@ -31481,7 +31804,7 @@ impl App {
                 rotation: main.rotation,
                 free_rotation_rad: main.free_rotation_rad,
                 content_bbox: main.content_bbox,
-                fit_mode: main.fit_mode,
+                fit_mode: main.fit_input,
                 fit_scale_limits: main.fit_scale_limits,
                 pixels_per_point: main.fit_scale_limits.pixels_per_point,
                 placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
@@ -31501,8 +31824,14 @@ impl App {
             let full_bbox = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
             let left_bbox = left.main.content_bbox.unwrap_or(full_bbox);
             let right_bbox = right.main.content_bbox.unwrap_or(full_bbox);
-            let left_size = rotated_display_size(left.main.texture_size, left.main.rotation);
-            let right_size = rotated_display_size(right.main.texture_size, right.main.rotation);
+            let left_size = rotated_display_size(
+                fit_input_layout_size(left.main.fit_input, left.main.texture_size),
+                left.main.rotation,
+            );
+            let right_size = rotated_display_size(
+                fit_input_layout_size(right.main.fit_input, right.main.texture_size),
+                right.main.rotation,
+            );
             let fit_mode = self.effective_fullscreen_fit_mode();
             let geometry = spread_layout_geometry(
                 left_size,
@@ -31516,21 +31845,18 @@ impl App {
                 self.settings.spread_page_gap_px.min(200) as f32,
                 pixels_per_point,
             );
-            let page_fit = || {
-                ((image_rect.width() - spread_gap).max(1.0) / geometry.fit_size.x)
-                    .min(image_rect.height() / geometry.fit_size.y)
+            let Some(auto_fit) = resolve_paged_auto_fit(
+                fit_mode,
+                fit_input_specified_size(left.main.fit_input)
+                    .unwrap_or(self.settings.fullscreen_specified_scale),
+                image_rect,
+                geometry.fit_size,
+                spread_gap,
+                self.fullscreen_fit_scale_limits(pixels_per_point),
+            ) else {
+                return self.fs_zoom_factor;
             };
-            let fit_scale = match fit_mode {
-                FullscreenFitMode::Width => {
-                    (image_rect.width() - spread_gap).max(1.0) / geometry.fit_size.x
-                }
-                FullscreenFitMode::Height => image_rect.height() / geometry.fit_size.y,
-                FullscreenFitMode::Original => physical_pixel_scale(pixels_per_point),
-                _ => page_fit(),
-            };
-            let fit_scale = self
-                .fullscreen_fit_scale_limits(pixels_per_point)
-                .apply(fit_scale);
+            let fit_scale = auto_fit.scale;
             return (left.main.total_scale / fit_scale.max(f32::EPSILON)).clamp(ZOOM_MIN, ZOOM_MAX);
         }
         self.fs_zoom_factor.clamp(ZOOM_MIN, ZOOM_MAX)
@@ -36307,7 +36633,14 @@ impl App {
             rotation: crate::rotation_db::Rotation::None,
             free_rotation_rad: 0.0,
             content_bbox: None,
-            fit_mode: self.effective_fullscreen_fit_mode(),
+            fit_mode: FullscreenFitInput::from_mode(
+                self.effective_fullscreen_fit_mode(),
+                self.settings.fullscreen_specified_scale,
+                FullscreenFitBasis::new(
+                    asset.layout_source_size.unwrap_or(asset.source_size),
+                    asset.source_size,
+                )?,
+            ),
             fit_scale_limits: self.fullscreen_fit_scale_limits(pixels_per_point),
             pixels_per_point,
             placement: ResolvedDisplayPlacement::Normal { zoom_pan },
@@ -36429,6 +36762,14 @@ impl App {
             // 「切り抜きが効いているか」だけを見る。clip の要否と pixel grid の可否に使う。
             let fit_bbox =
                 crate::displayed_image_transform::effective_bbox(free_rotation_rad, content_bbox);
+            let fit_input = match layout_source {
+                FsPageLayoutSource::Captured { fit_input, .. } => resolved_transform
+                    .map(|t| t.fit_input)
+                    .unwrap_or_else(|| self.captured_fit_input_for_replay(fit_input)),
+                FsPageLayoutSource::CurrentItem => resolved_transform
+                    .map(|t| t.fit_input)
+                    .or_else(|| self.fs_fit_input_for_resource(page_idx, fit_mode, handle))?,
+            };
             let transform_input = DisplayedImageTransformInput {
                 pixel_fit: RectPixelFit::Texels,
                 page_idx,
@@ -36438,7 +36779,7 @@ impl App {
                 rotation,
                 free_rotation_rad,
                 content_bbox,
-                fit_mode,
+                fit_mode: fit_input,
                 fit_scale_limits,
                 pixels_per_point: ui.ctx().pixels_per_point(),
                 placement: resolved_transform
@@ -36459,9 +36800,10 @@ impl App {
                     }),
             };
             let transform = match resolved_transform {
-                Some(layout) => {
-                    resolve_fs_transform_in_layout_rect(transform_input, layout.full_image_rect)
-                }
+                Some(layout) => resolve_fs_transform_in_layout_rect(
+                    transform_input,
+                    layout.layout_full_image_rect,
+                ),
                 None => resolve_fs_image_transform(transform_input, layout_source_size),
             };
             let Some(transform) = transform else {
@@ -37049,6 +37391,7 @@ impl App {
     }
 
     pub(crate) fn reset_continuous_reading_transform(&mut self) {
+        self.fs_continuous_fit_reference = ContinuousSpecifiedFitReference::Legacy;
         self.fs_vertical_scroll = 0.0;
         self.fs_pan = egui::Vec2::ZERO;
         self.fs_free_rotation = 0.0;
@@ -37073,6 +37416,7 @@ impl App {
     }
 
     fn reset_fullscreen_fit_transform(&mut self, fs_idx: usize) {
+        self.fs_continuous_fit_reference = ContinuousSpecifiedFitReference::Legacy;
         self.fs_zoom = 1.0;
         self.fs_pan = egui::Vec2::ZERO;
         self.fs_free_rotation = 0.0;
@@ -37106,6 +37450,13 @@ impl App {
             FullscreenFitMode::Width => crate::pdf_loader::PdfDisplayFitMode::Width,
             FullscreenFitMode::Height => crate::pdf_loader::PdfDisplayFitMode::Height,
             FullscreenFitMode::Original => crate::pdf_loader::PdfDisplayFitMode::Original,
+            FullscreenFitMode::SpecifiedScale => {
+                specified_pdf_provisional_target(
+                    egui::Vec2::splat(1.0),
+                    self.settings.fullscreen_specified_scale,
+                )
+                .1
+            }
         }
     }
 
@@ -37167,6 +37518,9 @@ impl App {
         {
             return;
         }
+        if self.settings.fullscreen_fit_mode != mode {
+            self.invalidate_all_continuous_specified_fit_references();
+        }
         self.settings.fullscreen_fit_mode = mode;
         self.settings.margin_fit_enabled = matches!(mode, FullscreenFitMode::MarginFit);
         self.fs_margin_bbox_cache.clear();
@@ -37189,7 +37543,16 @@ impl App {
         }
         self.settings.fullscreen_fit_no_upscale = no_upscale;
         self.settings.fullscreen_fit_no_downscale = no_downscale;
-        self.reset_fullscreen_fit_transform(fs_idx);
+        if self.effective_fullscreen_fit_mode() == FullscreenFitMode::SpecifiedScale
+            && self.continuous_reading_active_for_idx(fs_idx)
+        {
+            // Policy changes rebase the selected reference on the next layout.
+            // Manual zoom and scroll remain owned by the continuous reader.
+            self.fs_continuous_fit_reference = ContinuousSpecifiedFitReference::Legacy;
+            self.slideshow_scroll_range_cache = None;
+        } else {
+            self.reset_fullscreen_fit_transform(fs_idx);
+        }
         self.settings.save();
         ctx.request_repaint();
     }
@@ -37221,6 +37584,9 @@ impl App {
         flow: ReadingFlow,
     ) {
         let mode = FullscreenFitMode::default_for_flow(flow);
+        if self.settings.fullscreen_fit_mode != mode {
+            self.invalidate_all_continuous_specified_fit_references();
+        }
         self.settings.fullscreen_fit_mode = mode;
         self.settings.margin_fit_enabled = false;
         self.fs_margin_bbox_cache.clear();
@@ -37494,6 +37860,12 @@ impl App {
         prefer_processed: bool,
     ) -> egui::Vec2 {
         let rotation = self.get_rotation(idx);
+        if self.effective_fullscreen_fit_mode() == FullscreenFitMode::SpecifiedScale {
+            return self
+                .continuous_specified_fit_basis_for_idx(idx)
+                .map(|basis| rotated_display_size(basis.normalized_original_size(), rotation))
+                .unwrap_or(fallback);
+        }
         if self.is_raw_page(idx) {
             return self
                 .fs_page_coordinate_source_size(idx)
@@ -37633,6 +38005,100 @@ impl App {
         size
     }
 
+    fn prepare_continuous_specified_reference(
+        &mut self,
+        units: &[ContinuousReadingUnitSpec],
+        current_pos: usize,
+        fallback: egui::Vec2,
+        prefer_processed: bool,
+        pixels_per_point: f32,
+    ) {
+        if self.effective_fullscreen_fit_mode() != FullscreenFitMode::SpecifiedScale {
+            self.fs_continuous_fit_reference = ContinuousSpecifiedFitReference::Legacy;
+            return;
+        }
+        let settings = self.settings.fullscreen_specified_scale;
+        let limits = self.fullscreen_fit_scale_limits(pixels_per_point);
+        let old = std::mem::take(&mut self.fs_continuous_fit_reference);
+        let unit = match old {
+            ContinuousSpecifiedFitReference::Specified {
+                unit,
+                settings: old_settings,
+                limits: old_limits,
+                ..
+            } if old_settings == settings
+                && old_limits.no_upscale == limits.no_upscale
+                && old_limits.no_downscale == limits.no_downscale
+                && units.iter().any(|candidate| {
+                    candidate.presentation == unit.presentation
+                        && candidate.slice == unit.slice
+                        && candidate.singleton_placement == unit.singleton_placement
+                }) =>
+            {
+                unit
+            }
+            _ => match units.get(current_pos) {
+                Some(unit) => unit.clone(),
+                None => return,
+            },
+        };
+        for idx in unit.source_indices() {
+            self.adopt_retained_pdf_page_metadata(idx);
+        }
+        let base = if unit
+            .source_indices()
+            .all(|idx| self.continuous_specified_fit_basis_for_idx(idx).is_some())
+        {
+            let mut base = self.continuous_unit_base_size(&unit, fallback, prefer_processed);
+            apply_continuous_spread_geometry(&mut base, true);
+            Some(base)
+        } else {
+            None
+        };
+        self.fs_continuous_fit_reference = ContinuousSpecifiedFitReference::Specified {
+            unit,
+            settings,
+            limits,
+            base,
+        };
+    }
+
+    fn continuous_specified_reference_fit(
+        &self,
+        image_rect: egui::Rect,
+        flow: ReadingFlow,
+        pixels_per_point: f32,
+    ) -> Option<crate::fullscreen_specified_scale::ResolvedSpecifiedScale> {
+        let ContinuousSpecifiedFitReference::Specified {
+            base: Some(base),
+            settings,
+            ..
+        } = &self.fs_continuous_fit_reference
+        else {
+            return None;
+        };
+        let saved_gap = quantize_points_to_physical_pixels(
+            self.settings.spread_page_gap_px.min(200) as f32,
+            pixels_per_point,
+        );
+        let (width, gap) = continuous_spread_fit_width(
+            base.pages.len(),
+            base.width,
+            self.spread_mode,
+            flow,
+            FullscreenFitMode::SpecifiedScale,
+            saved_gap,
+            base.singleton_placement,
+        );
+        resolve_specified_scale(
+            image_rect.size(),
+            egui::vec2(width, base.height),
+            gap,
+            *settings,
+            self.fullscreen_fit_scale_limits(pixels_per_point),
+        )
+    }
+
     fn continuous_unit_size_for_flow(
         &mut self,
         unit: &ContinuousReadingUnitSpec,
@@ -37646,10 +38112,22 @@ impl App {
         let fit_mode = self.effective_fullscreen_fit_mode();
         let mut base = self.continuous_unit_base_size(unit, fallback, prefer_processed);
         apply_continuous_spread_geometry(&mut base, spread_should_match_page_heights(fit_mode));
-        let spread_gap = quantize_points_to_physical_pixels(
+        let saved_spread_gap = quantize_points_to_physical_pixels(
             self.settings.spread_page_gap_px.min(200) as f32,
             pixels_per_point,
         );
+        let spread_gap = if fit_mode == FullscreenFitMode::SpecifiedScale {
+            resolve_specified_scale(
+                image_rect.size(),
+                egui::vec2(base.width, base.height),
+                saved_spread_gap,
+                self.settings.fullscreen_specified_scale,
+                self.fullscreen_fit_scale_limits(pixels_per_point),
+            )
+            .map_or(saved_spread_gap, |resolved| resolved.gap)
+        } else {
+            saved_spread_gap
+        };
         let page_gap = if base.pages.len() > 1
             || base.singleton_placement != SingletonSpreadPlacement::Center
         {
@@ -37669,11 +38147,27 @@ impl App {
         let target_w = (image_rect.width() * zoom - fit_gap_total).max(1.0);
         let target_h = (image_rect.height() * zoom).max(1.0);
         let fit_scale_limits = self.fullscreen_fit_scale_limits(pixels_per_point);
-        let scale = {
+        let scale = if fit_mode == FullscreenFitMode::SpecifiedScale {
+            self.continuous_specified_reference_fit(image_rect, flow, pixels_per_point)
+                .or_else(|| {
+                    resolve_specified_scale(
+                        image_rect.size(),
+                        egui::vec2(fit_width, base.height),
+                        fit_gap_total,
+                        self.settings.fullscreen_specified_scale,
+                        fit_scale_limits,
+                    )
+                })
+                .map_or(1.0, |resolved| resolved.scale)
+                * zoom
+        } else {
             let scale_for = |target_w: f32, target_h: f32| match fit_mode {
                 FullscreenFitMode::Width => target_w / fit_width.max(1.0),
                 FullscreenFitMode::Height => target_h / base.height.max(1.0),
                 FullscreenFitMode::Original => physical_pixel_scale(pixels_per_point),
+                FullscreenFitMode::SpecifiedScale => {
+                    unreachable!("specified continuous fit has one reference owner")
+                }
                 FullscreenFitMode::Page => {
                     (target_w / fit_width.max(1.0)).min(target_h / base.height.max(1.0))
                 }
@@ -37782,6 +38276,13 @@ impl App {
         let mut visible_positions = Vec::new();
         let mut scroll_range = (0.0, 0.0);
 
+        self.prepare_continuous_specified_reference(
+            units,
+            current_pos,
+            fallback,
+            prefer_processed,
+            pixels_per_point,
+        );
         for _ in 0..8 {
             sizes.clear();
             for unit in units {
@@ -37826,7 +38327,10 @@ impl App {
                 viewport_len,
             );
             let visible_pages = Self::continuous_visible_page_count(units, &visible_positions);
-            if visible_pages <= VERTICAL_READING_MAX_VISIBLE_PAGES || zoom >= ZOOM_MAX {
+            if visible_pages <= VERTICAL_READING_MAX_VISIBLE_PAGES
+                || zoom >= ZOOM_MAX
+                || self.effective_fullscreen_fit_mode() == FullscreenFitMode::SpecifiedScale
+            {
                 break;
             }
             let factor =
@@ -39256,7 +39760,7 @@ impl App {
             free_rotation_rad: 0.0,
             content_bbox: None,
             // 比較は現行どおり明示的な Page fit。通常表示設定へ追従させない。
-            fit_mode: FullscreenFitMode::Page,
+            fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
             fit_scale_limits,
             pixels_per_point: fit_scale_limits.pixels_per_point,
             placement: ResolvedDisplayPlacement::Normal { zoom_pan },
@@ -40656,6 +41160,16 @@ impl App {
                         ..captured.real_transform.fit_scale_limits
                     },
                 );
+                let fit_scale_limits = if page.fit_input.mode() == FullscreenFitMode::SpecifiedScale
+                    && captured_white.is_none()
+                {
+                    FullscreenFitScaleLimits {
+                        pixels_per_point: ctx.pixels_per_point(),
+                        ..page.fit_scale_limits
+                    }
+                } else {
+                    fit_scale_limits
+                };
                 self.fullscreen_page_layout
                     .begin(FullscreenPageLayoutKind::Single);
                 let transform = {
@@ -40668,6 +41182,7 @@ impl App {
                         FsPageLayoutSource::Captured {
                             layout_size: page.layout_size,
                             post_filter: page.post_filter,
+                            fit_input: page.fit_input,
                         },
                         resolved_transform,
                         white_companion_override,
@@ -40753,9 +41268,23 @@ impl App {
     ) -> FsNavigatorTextureSources {
         self.fullscreen_page_layout.clear();
         let zoom_pan = self.fs_zoom_pan();
-        let fit_mode = self.effective_fullscreen_fit_mode();
+        let fit_mode = display_override
+            .map(|(left, _)| self.captured_fit_input_for_replay(left.fit_input).mode())
+            .unwrap_or_else(|| self.effective_fullscreen_fit_mode());
         let pixels_per_point = ctx.pixels_per_point();
-        let fit_scale_limits = self.fullscreen_fit_scale_limits(pixels_per_point);
+        let fit_scale_limits = display_override
+            .filter(|_| fit_mode == FullscreenFitMode::SpecifiedScale)
+            .map_or_else(
+                || self.fullscreen_fit_scale_limits(pixels_per_point),
+                |(left, _)| FullscreenFitScaleLimits {
+                    pixels_per_point,
+                    ..left.fit_scale_limits
+                },
+            );
+        if fit_mode == FullscreenFitMode::SpecifiedScale && display_override.is_none() {
+            self.adopt_retained_pdf_page_metadata(left_idx);
+            self.adopt_retained_pdf_page_metadata(right_idx);
+        }
         let (left_rot, right_rot) = match display_override {
             Some((left, right)) => (left.rotation, right.rotation),
             None => (self.get_rotation(left_idx), self.get_rotation(right_idx)),
@@ -40919,15 +41448,59 @@ impl App {
                 )
             }
         };
+        let (left_size, right_size) = if fit_mode == FullscreenFitMode::SpecifiedScale {
+            let left_basis = display_override
+                .map(|(left, _)| left.fit_input)
+                .or_else(|| {
+                    left_display_tex.as_ref().and_then(|resource| {
+                        self.fs_fit_input_for_resource(
+                            left_idx,
+                            fit_mode,
+                            resource.source_texture(),
+                        )
+                    })
+                })
+                .or_else(|| {
+                    self.fs_thumbnail_texture_for_display(left_idx)
+                        .and_then(|tex| self.fs_fit_input_for_resource(left_idx, fit_mode, &tex))
+                });
+            let right_basis = display_override
+                .map(|(_, right)| right.fit_input)
+                .or_else(|| {
+                    right_display_tex.as_ref().and_then(|resource| {
+                        self.fs_fit_input_for_resource(
+                            right_idx,
+                            fit_mode,
+                            resource.source_texture(),
+                        )
+                    })
+                })
+                .or_else(|| {
+                    self.fs_thumbnail_texture_for_display(right_idx)
+                        .and_then(|tex| self.fs_fit_input_for_resource(right_idx, fit_mode, &tex))
+                });
+            (
+                left_basis.map(|input| {
+                    rotated_display_size(fit_input_layout_size(input, egui::Vec2::ZERO), left_rot)
+                }),
+                right_basis.map(|input| {
+                    rotated_display_size(fit_input_layout_size(input, egui::Vec2::ZERO), right_rot)
+                }),
+            )
+        } else {
+            (left_size, right_size)
+        };
         let (left_page_layout_source, right_page_layout_source) = match display_override {
             Some((left, right)) => (
                 FsPageLayoutSource::Captured {
                     layout_size: left.layout_size,
                     post_filter: left.post_filter,
+                    fit_input: left.fit_input,
                 },
                 FsPageLayoutSource::Captured {
                     layout_size: right.layout_size,
                     post_filter: right.post_filter,
+                    fit_input: right.fit_input,
                 },
             ),
             None => (
@@ -40978,19 +41551,21 @@ impl App {
                 right_bbox,
                 spread_should_match_page_heights(fit_mode),
             );
-            let fit_w = geometry.fit_size.x;
-            let fit_h = geometry.fit_size.y;
-            let page_fit = || {
-                ((image_rect.width() - spread_gap).max(1.0) / fit_w)
-                    .min(image_rect.height() / fit_h)
+            let specified = display_override
+                .and_then(|(left, _)| fit_input_specified_size(left.fit_input))
+                .unwrap_or(self.settings.fullscreen_specified_scale);
+            let Some(auto_fit) = resolve_paged_auto_fit(
+                fit_mode,
+                specified,
+                image_rect,
+                geometry.fit_size,
+                spread_gap,
+                fit_scale_limits,
+            ) else {
+                return FsNavigatorTextureSources::default();
             };
-            let fit_scale = match fit_mode {
-                FullscreenFitMode::Width => (image_rect.width() - spread_gap).max(1.0) / fit_w,
-                FullscreenFitMode::Height => image_rect.height() / fit_h,
-                FullscreenFitMode::Original => physical_pixel_scale(pixels_per_point),
-                _ => page_fit(),
-            };
-            let fit_scale = fit_scale_limits.apply(fit_scale);
+            let spread_gap = auto_fit.gap;
+            let fit_scale = auto_fit.scale;
 
             // Height matching now depends only on fit mode, so the geometry is final before the
             // ZipPla solve. The old result-dependent geometry feedback loop is structurally gone,
@@ -41362,6 +41937,16 @@ impl App {
         placement: ResolvedDisplayPlacement,
     ) -> Option<DisplayedImageTransform> {
         let tex_size = handle.size_vec2();
+        let fit_input = match layout_source {
+            FsPageLayoutSource::Captured { fit_input, .. } => {
+                self.captured_fit_input_for_replay(fit_input)
+            }
+            FsPageLayoutSource::CurrentItem => self.fs_fit_input_for_resource(
+                idx,
+                self.effective_fullscreen_fit_mode(),
+                handle.source_texture(),
+            )?,
+        };
         let layout_size = match layout_source {
             FsPageLayoutSource::Captured { layout_size, .. } => layout_size,
             FsPageLayoutSource::CurrentItem => {
@@ -41392,7 +41977,7 @@ impl App {
                 rotation,
                 free_rotation_rad: 0.0,
                 content_bbox,
-                fit_mode: FullscreenFitMode::Page,
+                fit_mode: fit_input,
                 fit_scale_limits: FullscreenFitScaleLimits {
                     pixels_per_point,
                     ..FullscreenFitScaleLimits::default()
@@ -41691,6 +42276,9 @@ impl App {
         slideshow_continuous_wait_secs: &mut f32,
         slideshow_continuous_scroll_secs: &mut f32,
         slideshow_continuous_scroll_percent: &mut u32,
+        specified_scale_edit: &mut crate::settings::FullscreenSpecifiedScale,
+        specified_scale_favorite: bool,
+        specified_scale_changed: &mut bool,
         fit_mode_choice: &mut Option<FullscreenFitMode>,
         fit_no_upscale_choice: &mut Option<bool>,
         fit_no_downscale_choice: &mut Option<bool>,
@@ -42953,157 +43541,45 @@ impl App {
 
         // ズーム/フィットポップアップ (画像のみ)。現在モードを青でハイライト。
         if *fit_popup_open && !is_video && !panorama_mode_active {
-            let modes = FullscreenFitMode::selectable_for_flow(*reading_flow);
-            let header_h = 28.0_f32;
-            let item_h = 36.0_f32;
-            let section_h = 28.0_f32;
-            let popup_w = 280.0_f32;
-            let popup_h = header_h + modes.len() as f32 * item_h + section_h + item_h * 2.0 + 8.0;
-            let popup_rect = egui::Rect::from_min_size(
-                egui::pos2(fit_btn_x, bar_rect.max.y + 4.0),
-                egui::vec2(popup_w, popup_h),
+            let bounds = ui.ctx().content_rect().shrink(4.0);
+            let width = 320.0_f32.min(bounds.width());
+            let height = 480.0_f32.min(bounds.height());
+            let origin = egui::pos2(
+                fit_btn_x.clamp(bounds.left(), (bounds.right() - width).max(bounds.left())),
+                (bar_rect.bottom() + 4.0)
+                    .min(bounds.bottom() - height)
+                    .max(bounds.top()),
             );
-
-            ui.painter().rect_filled(
-                popup_rect,
-                6.0,
-                egui::Color32::from_rgba_unmultiplied(30, 30, 30, 240),
-            );
-            ui.painter().rect_stroke(
-                popup_rect,
-                6.0,
-                egui::Stroke::new(
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(100, 100, 100, 180),
-                ),
-                egui::StrokeKind::Outside,
-            );
-
-            let mut item_y = popup_rect.min.y + 4.0;
-            let fit_header =
-                if let Some(cycle_label) = keymap.first_chord_label(KeyAction::FsFitModeCycle) {
-                    format!("ズーム/フィット  [{cycle_label}で循環]")
-                } else {
-                    "ズーム/フィット".to_owned()
-                };
-            ui.painter().text(
-                egui::pos2(popup_rect.min.x + 12.0, item_y + 16.0),
-                egui::Align2::LEFT_CENTER,
-                fit_header,
-                egui::FontId::proportional(11.0),
-                egui::Color32::from_gray(150),
-            );
-            item_y += header_h;
-            for &mode in modes {
-                let item_rect = egui::Rect::from_min_size(
-                    egui::pos2(popup_rect.min.x + 4.0, item_y),
-                    egui::vec2(popup_w - 8.0, 32.0),
-                );
-                let item_resp = ui.interact(
-                    item_rect,
-                    egui::Id::new(format!("fit_popup_{mode:?}")),
-                    egui::Sense::click(),
-                );
-                let is_current = fit_mode == mode;
-                let bg = if is_current {
-                    egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
-                } else if item_resp.hovered() {
-                    egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200)
-                } else {
-                    egui::Color32::TRANSPARENT
-                };
-                ui.painter().rect_filled(item_rect, 4.0, bg);
-
-                ui.painter().text(
-                    egui::pos2(item_rect.min.x + 16.0, item_rect.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    mode.label(),
-                    egui::FontId::proportional(13.0),
-                    egui::Color32::from_gray(220),
-                );
-
-                if item_resp.clicked() {
-                    *fit_mode_choice = Some(mode);
-                    *fit_popup_open = false;
-                }
-                item_y += item_h;
-            }
-
-            let sep_y = item_y - 2.0;
-            ui.painter().line_segment(
-                [
-                    egui::pos2(popup_rect.min.x + 8.0, sep_y),
-                    egui::pos2(popup_rect.max.x - 8.0, sep_y),
-                ],
-                egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(90, 90, 90, 170)),
-            );
-            ui.painter().text(
-                egui::pos2(popup_rect.min.x + 12.0, item_y + 16.0),
-                egui::Align2::LEFT_CENTER,
-                "倍率制限",
-                egui::FontId::proportional(11.0),
-                egui::Color32::from_gray(150),
-            );
-            item_y += section_h;
-            for (id, label, active, out) in [
-                (
-                    "fit_no_upscale",
-                    "拡大しない",
-                    fit_no_upscale,
-                    fit_no_upscale_choice,
-                ),
-                (
-                    "fit_no_downscale",
-                    "縮小しない",
-                    fit_no_downscale,
-                    fit_no_downscale_choice,
-                ),
-            ] {
-                let item_rect = egui::Rect::from_min_size(
-                    egui::pos2(popup_rect.min.x + 4.0, item_y),
-                    egui::vec2(popup_w - 8.0, 32.0),
-                );
-                let item_resp = ui.interact(item_rect, egui::Id::new(id), egui::Sense::click());
-                let bg = if active {
-                    egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
-                } else if item_resp.hovered() {
-                    egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200)
-                } else {
-                    egui::Color32::TRANSPARENT
-                };
-                ui.painter().rect_filled(item_rect, 4.0, bg);
-                ui.painter().text(
-                    egui::pos2(item_rect.min.x + 16.0, item_rect.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    label,
-                    egui::FontId::proportional(13.0),
-                    egui::Color32::from_gray(220),
-                );
-                ui.painter().text(
-                    egui::pos2(item_rect.max.x - 16.0, item_rect.center().y),
-                    egui::Align2::RIGHT_CENTER,
-                    if active { "ON" } else { "OFF" },
-                    egui::FontId::proportional(12.0),
-                    if active {
-                        egui::Color32::WHITE
-                    } else {
-                        egui::Color32::from_gray(150)
-                    },
-                );
-                if item_resp.clicked() {
-                    *out = Some(!active);
-                }
-                item_y += item_h;
-            }
-
-            // ポップアップ外クリックで閉じる
-            if let Some(pos) = ctx.input(|i| i.pointer.press_origin()) {
-                if !popup_rect.contains(pos)
-                    && !fit_resp_rect.contains(pos)
-                    && ctx.input(|i| i.pointer.any_pressed())
-                {
-                    *fit_popup_open = false;
-                }
+            let popup_rect = egui::Rect::from_min_size(origin, egui::vec2(width, height));
+            let popup_response = ui.scope_builder(egui::UiBuilder::new().id_salt("fs_fit_popup_body").max_rect(popup_rect), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_width((width - 16.0).max(1.0));
+                    egui::ScrollArea::vertical().id_salt("fs_fit_popup_scroll")
+                        .max_height((height - 16.0).max(1.0)).auto_shrink([false, false]).show(ui, |ui| {
+                            ui.label("ズーム/フィット");
+                            for &mode in FullscreenFitMode::selectable_for_flow(*reading_flow) {
+                                if ui.selectable_label(mode == fit_mode, mode.label()).clicked() {
+                                    *fit_mode_choice = Some(mode);
+                                    *fit_popup_open = false;
+                                }
+                            }
+                            ui.separator();
+                            let mut no_up = fit_no_upscale;
+                            let mut no_down = fit_no_downscale;
+                            if ui.checkbox(&mut no_up, "拡大しない").changed() { *fit_no_upscale_choice = Some(no_up); }
+                            if ui.checkbox(&mut no_down, "縮小しない").changed() { *fit_no_downscale_choice = Some(no_down); }
+                            ui.separator();
+                            *specified_scale_changed |= crate::ui_dialogs::preferences::draw_fullscreen_specified_scale_live_settings(
+                                ui, specified_scale_edit, specified_scale_favorite);
+                        });
+                })
+            }).inner.response;
+            if ui.input(|i| i.pointer.any_click())
+                && ui.input(|i| i.pointer.interact_pos()).is_some_and(|pos| {
+                    !popup_response.rect.contains(pos) && !fit_resp_rect.contains(pos)
+                })
+            {
+                *fit_popup_open = false;
             }
         }
 
@@ -44832,7 +45308,7 @@ impl App {
                 // 指すので、選択も取れる画も見えているものと合わない (§1.156)。
                 // 単一ページ経路は描画時の transform をそのまま使うのでこの症状が無かった。
                 content_bbox,
-                fit_mode: FullscreenFitMode::Page,
+                fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
                 fit_scale_limits: FullscreenFitScaleLimits {
                     pixels_per_point,
                     ..FullscreenFitScaleLimits::default()
@@ -44869,24 +45345,23 @@ impl App {
             })?;
         let idx = page.page_idx();
         let source_size = self.capture_region_source_size_for_idx(ctx, idx)?;
-        let mut transform =
-            if self.fullscreen_page_layout.kind() == FullscreenPageLayoutKind::Spread {
-                Self::capture_region_spread_transform_for_source(
-                    idx,
-                    page.transform.full_image_rect,
-                    source_size,
-                    self.get_rotation(idx),
-                    // **描いたときに寄せた後の trim を渡す。** `content_bbox` は要求された
-                    // ままの未量子化の矩形なので、そちらを渡すと選択できる端が実際に描いた
-                    // 端と最大 0.5 画面 px ずれる (縮小時は元画像で数 px。Codex Sol の指摘 4)。
-                    // `uv_rect` は寄せた表示矩形を元画像空間へ戻したもので、描いた端そのもの。
-                    page.transform.content_bbox.map(|_| page.transform.uv_rect),
-                    ctx.pixels_per_point(),
-                )
-                .ok_or_else(|| "ページの表示矩形を解決できません".to_string())?
-            } else {
-                page.transform
-            };
+        let transform = if self.fullscreen_page_layout.kind() == FullscreenPageLayoutKind::Spread {
+            Self::capture_region_spread_transform_for_source(
+                idx,
+                page.transform.full_image_rect,
+                source_size,
+                self.get_rotation(idx),
+                // **描いたときに寄せた後の trim を渡す。** `content_bbox` は要求された
+                // ままの未量子化の矩形なので、そちらを渡すと選択できる端が実際に描いた
+                // 端と最大 0.5 画面 px ずれる (縮小時は元画像で数 px。Codex Sol の指摘 4)。
+                // `uv_rect` は寄せた表示矩形を元画像空間へ戻したもので、描いた端そのもの。
+                page.transform.content_bbox.map(|_| page.transform.uv_rect),
+                ctx.pixels_per_point(),
+            )
+            .ok_or_else(|| "ページの表示矩形を解決できません".to_string())?
+        } else {
+            page.transform
+        };
         let transform = transform
             .with_coordinate_source_size(egui::vec2(source_size[0] as f32, source_size[1] as f32));
         Ok(CaptureRegionTarget {
@@ -50386,7 +50861,7 @@ mod tests {
                                 rotation,
                                 free_rotation_rad: 0.15,
                                 content_bbox: None,
-                                fit_mode,
+                                fit_mode: FullscreenFitInput::legacy(fit_mode),
                                 fit_scale_limits: FullscreenFitScaleLimits::default(),
                                 pixels_per_point: 1.0,
                                 placement,
@@ -50881,7 +51356,7 @@ mod tests {
                 rotation: crate::rotation_db::Rotation::None,
                 free_rotation_rad: 0.37,
                 content_bbox: None,
-                fit_mode: FullscreenFitMode::Page,
+                fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
                 fit_scale_limits: FullscreenFitScaleLimits::default(),
                 pixels_per_point: 1.0,
                 placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
@@ -51884,7 +52359,7 @@ mod tests {
                                     rotation: crate::rotation_db::Rotation::None,
                                     free_rotation_rad: 0.0,
                                     content_bbox: None,
-                                    fit_mode: FullscreenFitMode::Page,
+                                    fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
                                     fit_scale_limits: FullscreenFitScaleLimits {
                                         pixels_per_point,
                                         ..FullscreenFitScaleLimits::default()
@@ -52344,7 +52819,7 @@ mod tests {
                                     rotation: crate::rotation_db::Rotation::None,
                                     free_rotation_rad: 0.0,
                                     content_bbox: bbox,
-                                    fit_mode: FullscreenFitMode::Page,
+                                    fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
                                     fit_scale_limits: FullscreenFitScaleLimits {
                                         pixels_per_point,
                                         ..FullscreenFitScaleLimits::default()
@@ -52489,7 +52964,9 @@ mod tests {
                                                     rotation,
                                                     free_rotation_rad: 0.0,
                                                     content_bbox: bbox,
-                                                    fit_mode: FullscreenFitMode::Page,
+                                                    fit_mode: FullscreenFitInput::legacy(
+                                                        FullscreenFitMode::Page,
+                                                    ),
                                                     fit_scale_limits: FullscreenFitScaleLimits {
                                                         pixels_per_point,
                                                         ..FullscreenFitScaleLimits::default()
@@ -54200,7 +54677,7 @@ mod tests {
             rotation,
             free_rotation_rad: 0.0,
             content_bbox,
-            fit_mode: FullscreenFitMode::Page,
+            fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
             fit_scale_limits: FullscreenFitScaleLimits::default(),
             pixels_per_point: 1.0,
             placement,
@@ -54239,7 +54716,7 @@ mod tests {
                 rotation: crate::rotation_db::Rotation::None,
                 free_rotation_rad: 0.0,
                 content_bbox: None,
-                fit_mode: FullscreenFitMode::Page,
+                fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
                 fit_scale_limits: FullscreenFitScaleLimits::default(),
                 pixels_per_point: 1.0,
                 placement,
@@ -54470,6 +54947,9 @@ mod tests {
                         &mut slideshow_wait,
                         &mut slideshow_scroll,
                         &mut slideshow_percent,
+                        &mut crate::settings::FullscreenSpecifiedScale::default(),
+                        false,
+                        &mut false,
                         &mut fit_mode_choice,
                         &mut fit_no_upscale_choice,
                         &mut fit_no_downscale_choice,
@@ -54613,6 +55093,9 @@ mod tests {
                         &mut slideshow_wait,
                         &mut slideshow_scroll,
                         &mut slideshow_percent,
+                        &mut crate::settings::FullscreenSpecifiedScale::default(),
+                        false,
+                        &mut false,
                         &mut fit_mode_choice,
                         &mut fit_no_upscale_choice,
                         &mut fit_no_downscale_choice,
@@ -55730,6 +56213,8 @@ mod tests {
         texture: egui::TextureHandle,
     ) -> FsDisplayUnitHoldoverPage {
         FsDisplayUnitHoldoverPage {
+            fit_input: FullscreenFitInput::legacy(FullscreenFitMode::Page),
+            fit_scale_limits: FullscreenFitScaleLimits::default(),
             occurrence: SpreadPageOccurrence::navigation(idx, idx),
             layout_size: texture.size_vec2(),
             post_filter: crate::adjustment::PostFilter::None,
@@ -57871,6 +58356,8 @@ mod tests {
             singleton_placement: SingletonSpreadPlacement::Center,
             layout_projection: FsDisplayUnitLayoutProjection::Canonical,
             pages: vec![FsDisplayUnitHoldoverPage {
+                fit_input: FullscreenFitInput::legacy(FullscreenFitMode::Page),
+                fit_scale_limits: FullscreenFitScaleLimits::default(),
                 occurrence: SpreadPageOccurrence::navigation(0, 0),
                 texture: FullscreenPaintResource::direct(old.clone()),
                 rotation: crate::rotation_db::Rotation::None,
@@ -58082,7 +58569,7 @@ mod tests {
             rotation: crate::rotation_db::Rotation::None,
             free_rotation_rad: 0.0,
             content_bbox: None,
-            fit_mode: FullscreenFitMode::Page,
+            fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
             fit_scale_limits: FullscreenFitScaleLimits::default(),
             pixels_per_point: 1.0,
             placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
@@ -58143,7 +58630,7 @@ mod tests {
                 rotation: crate::rotation_db::Rotation::None,
                 free_rotation_rad: 0.0,
                 content_bbox: None,
-                fit_mode: FullscreenFitMode::Page,
+                fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
                 fit_scale_limits: FullscreenFitScaleLimits::default(),
                 pixels_per_point: 1.0,
                 placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
@@ -58179,7 +58666,7 @@ mod tests {
             rotation: crate::rotation_db::Rotation::None,
             free_rotation_rad: 0.0,
             content_bbox: None,
-            fit_mode: FullscreenFitMode::Page,
+            fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
             fit_scale_limits: FullscreenFitScaleLimits::default(),
             pixels_per_point: 1.0,
             placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
@@ -58467,6 +58954,8 @@ mod tests {
             singleton_placement: SingletonSpreadPlacement::Center,
             layout_projection: FsDisplayUnitLayoutProjection::Canonical,
             pages: vec![FsDisplayUnitHoldoverPage {
+                fit_input: FullscreenFitInput::legacy(FullscreenFitMode::Page),
+                fit_scale_limits: FullscreenFitScaleLimits::default(),
                 occurrence: SpreadPageOccurrence::navigation(4, 4),
                 layout_size: held.size_vec2(),
                 post_filter: crate::adjustment::PostFilter::None,
@@ -58757,7 +59246,7 @@ mod tests {
                     rotation: crate::rotation_db::Rotation::None,
                     free_rotation_rad: 0.0,
                     content_bbox: None,
-                    fit_mode: FullscreenFitMode::Page,
+                    fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
                     fit_scale_limits: FullscreenFitScaleLimits::default(),
                     pixels_per_point: 1.0,
                     placement: ResolvedDisplayPlacement::SingletonSpread {
@@ -59656,7 +60145,7 @@ mod tests {
                             rotation: crate::rotation_db::Rotation::None,
                             free_rotation_rad: 0.0,
                             content_bbox: None,
-                            fit_mode: FullscreenFitMode::Page,
+                            fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
                             fit_scale_limits: FullscreenFitScaleLimits::default(),
                             pixels_per_point: ctx.pixels_per_point(),
                             placement: ResolvedDisplayPlacement::Normal {
@@ -63137,6 +63626,8 @@ mod tests {
                     singleton_placement: SingletonSpreadPlacement::Center,
                     layout_projection: FsDisplayUnitLayoutProjection::Canonical,
                     pages: vec![FsDisplayUnitHoldoverPage {
+                        fit_input: FullscreenFitInput::legacy(FullscreenFitMode::Page),
+                        fit_scale_limits: FullscreenFitScaleLimits::default(),
                         occurrence: SpreadPageOccurrence::navigation(0, 0),
                         layout_size: texture.size_vec2(),
                         post_filter: crate::adjustment::PostFilter::None,
@@ -63166,6 +63657,8 @@ mod tests {
             singleton_placement: SingletonSpreadPlacement::Center,
             layout_projection: FsDisplayUnitLayoutProjection::Canonical,
             pages: vec![FsDisplayUnitHoldoverPage {
+                fit_input: FullscreenFitInput::legacy(FullscreenFitMode::Page),
+                fit_scale_limits: FullscreenFitScaleLimits::default(),
                 occurrence: SpreadPageOccurrence::navigation(0, 0),
                 layout_size: texture.size_vec2(),
                 post_filter: crate::adjustment::PostFilter::None,
@@ -69723,7 +70216,7 @@ mod tests {
                 rotation: crate::rotation_db::Rotation::None,
                 free_rotation_rad: 0.0,
                 content_bbox: None,
-                fit_mode: FullscreenFitMode::Page,
+                fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
                 fit_scale_limits: FullscreenFitScaleLimits::default(),
                 pixels_per_point: 1.0,
                 placement: ResolvedDisplayPlacement::Z {
@@ -69795,7 +70288,7 @@ mod tests {
                 rotation: crate::rotation_db::Rotation::None,
                 free_rotation_rad: 0.0,
                 content_bbox: None,
-                fit_mode: FullscreenFitMode::Page,
+                fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
                 fit_scale_limits: FullscreenFitScaleLimits::default(),
                 pixels_per_point: 1.0,
                 placement: ResolvedDisplayPlacement::SingletonSpread {
@@ -74235,7 +74728,7 @@ mod tests {
                 rotation: crate::rotation_db::Rotation::None,
                 free_rotation_rad: 0.0,
                 content_bbox: None,
-                fit_mode: FullscreenFitMode::Page,
+                fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
                 fit_scale_limits: FullscreenFitScaleLimits::default(),
                 pixels_per_point: 1.0,
                 placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
@@ -74679,7 +75172,7 @@ mod tests {
             rotation: crate::rotation_db::Rotation::None,
             free_rotation_rad: 0.0,
             content_bbox: None,
-            fit_mode: FullscreenFitMode::Page,
+            fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
             fit_scale_limits: FullscreenFitScaleLimits::default(),
             pixels_per_point: 1.0,
             placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
@@ -74719,7 +75212,7 @@ mod tests {
             rotation: crate::rotation_db::Rotation::Cw90,
             free_rotation_rad: 0.0,
             content_bbox: None,
-            fit_mode: FullscreenFitMode::Page,
+            fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
             fit_scale_limits: FullscreenFitScaleLimits::default(),
             pixels_per_point: 1.0,
             placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
@@ -74768,7 +75261,7 @@ mod tests {
                 rotation: crate::rotation_db::Rotation::None,
                 free_rotation_rad: 0.0,
                 content_bbox: Some(bbox),
-                fit_mode: FullscreenFitMode::Page,
+                fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
                 fit_scale_limits: FullscreenFitScaleLimits {
                     pixels_per_point,
                     ..FullscreenFitScaleLimits::default()
@@ -77094,5 +77587,1498 @@ mod tests {
         assert_eq!(batch.activate_ids, vec![702]);
         assert_eq!(batch.activation_armed_updates, vec![(702, true)]);
         assert_eq!(batch.right_drag_events, vec![(702, drag(2))]);
+    }
+}
+
+#[cfg(test)]
+mod specified_scale_consumer_tests {
+    use super::*;
+    use crate::app::{PdfRerenderRequestProbe, PollPrefetchOrigin};
+    use crate::fs_animation::{FsLoadResult, StaticAnimationState};
+    use crate::settings::{FullscreenSpecifiedScale, SpecifiedScaleAxis};
+    use std::sync::Arc;
+
+    fn height(value: u32) -> FullscreenSpecifiedScale {
+        FullscreenSpecifiedScale {
+            width: None,
+            height: Some(SpecifiedScaleAxis::LogicalPixels(value)),
+        }
+    }
+
+    fn pdf_app(ctx: &egui::Context, count: usize) -> crate::app::AppTestEnvForTest {
+        let mut app = crate::app::setup_app_for_test();
+        let path = app.tmp.path().join("consumer.pdf");
+        app.items = (0..count)
+            .map(|idx| GridItem::PdfPage {
+                pdf_path: path.clone(),
+                page_num: idx as u32,
+                content_type: Some(PdfPageContentType::Vector),
+            })
+            .collect();
+        app.thumbnails = (0..count)
+            .map(|_| crate::grid_item::ThumbnailState::Pending)
+            .collect();
+        app.visible_indices = (0..count).collect();
+        app.details_order = (0..count).collect();
+        app.fullscreen_idx = Some(0);
+        app.settings.fullscreen_fit_mode = FullscreenFitMode::SpecifiedScale;
+        app.settings.fullscreen_specified_scale = height(1200);
+        for idx in 0..count {
+            app.record_page_layout_dims_for_spread(idx, (600_000, 900_000));
+            let pixels = Arc::new(egui::ColorImage::filled([8, 12], egui::Color32::WHITE));
+            let tex = ctx.load_texture(
+                format!("specified-consumer-{idx}"),
+                (*pixels).clone(),
+                egui::TextureOptions::LINEAR,
+            );
+            app.fs_cache.insert(
+                idx,
+                FsCacheEntry::Static {
+                    tex,
+                    pixels,
+                    source_dims: Some([2731, 4096]),
+                    load_seq: 0,
+                    animation: StaticAnimationState::Still,
+                },
+            );
+        }
+        app
+    }
+
+    fn frame(
+        ctx: &egui::Context,
+        rect: egui::Rect,
+        draw: impl FnOnce(&mut egui::Ui, &egui::Context),
+    ) {
+        let mut draw = Some(draw);
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        draw.take().unwrap()(ui, ctx);
+                    });
+            },
+        );
+    }
+
+    /// Calls the actual single/Z consumer and records its returned paint transform,
+    /// exactly as the fullscreen frame does before central demand reconciliation.
+    fn single(
+        app: &mut App,
+        ctx: &egui::Context,
+        rect: egui::Rect,
+        z: bool,
+    ) -> DisplayedImageTransform {
+        let mut drawn = None;
+        frame(ctx, rect, |ui, ctx| {
+            app.fullscreen_page_layout
+                .begin(FullscreenPageLayoutKind::Single);
+            let tex = match app.fs_cache.get(&0).unwrap() {
+                FsCacheEntry::Static { tex, .. } => tex.clone(),
+                _ => unreachable!(),
+            };
+            if z {
+                let state = FsFrameState {
+                    is_video: false,
+                    original_preview_active: false,
+                    page_turn_decision: FsPageTurnDecision::normal(),
+                    tex: Some(tex),
+                    thumb_tex: None,
+                    location_display: String::new(),
+                    image_dims: None,
+                    image_file_size: None,
+                    image_downscaled: false,
+                    is_loading: false,
+                    vst3_waiting_for_video: false,
+                    fs_load_failed: false,
+                    pdf_content_type: Some(PdfPageContentType::Vector),
+                };
+                drawn = app.draw_fs_zoom_mode(
+                    ui,
+                    ctx,
+                    rect,
+                    0,
+                    SingletonSpreadPlacement::Center,
+                    &state,
+                    StillSeekGeometry::bar_only(),
+                );
+            } else {
+                let source = app.source_dims_for_idx(0).map(|(w, h)| egui::vec2(w, h));
+                let resource = FullscreenPaintResource::direct(tex);
+                drawn = app.draw_fs_image(
+                    ui,
+                    rect,
+                    0,
+                    source,
+                    FsPageLayoutSource::CurrentItem,
+                    None,
+                    None,
+                    SingletonSpreadPlacement::Center,
+                    Some(&resource),
+                    None,
+                    false,
+                    false,
+                    false,
+                    crate::rotation_db::Rotation::None,
+                    app.fs_zoom_pan(),
+                    0.0,
+                    &FsBgStyle::Solid(egui::Color32::BLACK),
+                    "",
+                    false,
+                    app.effective_fullscreen_fit_mode(),
+                    app.fullscreen_fit_scale_limits(ctx.pixels_per_point()),
+                    None,
+                );
+            }
+            app.fullscreen_page_layout.push(drawn.unwrap());
+            app.reconcile_specified_pdf_demand(ctx);
+        });
+        drawn.unwrap()
+    }
+
+    fn spread(
+        app: &mut App,
+        ctx: &egui::Context,
+        rect: egui::Rect,
+        captured: Option<(&FsDisplayUnitHoldoverPage, &FsDisplayUnitHoldoverPage)>,
+    ) -> Vec<DisplayedImageTransform> {
+        frame(ctx, rect, |ui, ctx| {
+            app.draw_fs_spread_with_geometry(
+                ui,
+                ctx,
+                rect,
+                0,
+                1,
+                false,
+                FsPageTurnDecision::normal(),
+                captured,
+                StillSeekGeometry::bar_only(),
+            );
+            app.reconcile_specified_pdf_demand(ctx);
+        });
+        app.fullscreen_page_layout
+            .displayed_pages()
+            .map(|p| p.transform)
+            .collect()
+    }
+
+    fn completion(source_long: u32) -> FsLoadResult {
+        // Deliberately square sampling raster: the canonical page box remains 2:3.
+        FsLoadResult::StaticPdf {
+            ci: egui::ColorImage::filled([8, 8], egui::Color32::WHITE),
+            source_dims: [source_long as usize, source_long as usize],
+            page_size_points: crate::pdf_loader::PdfPageSizePoints {
+                width: 600.0,
+                height: 900.0,
+            },
+            content_type: PdfPageContentType::Vector,
+        }
+    }
+
+    fn close(a: f32, b: f32) {
+        assert!((a - b).abs() < 1.1, "{a} != {b}");
+    }
+
+    #[test]
+    fn specified_scale_single_draw_reconcile_completion_stays_absolute_and_canonical() {
+        let ctx = egui::Context::default();
+        let mut app = pdf_app(&ctx, 1);
+        let probe = PdfRerenderRequestProbe::start();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 800.0));
+        let first = single(&mut app, &ctx, rect, false);
+        close(first.layout_full_image_rect.height(), 1200.0);
+        close(first.layout_full_image_rect.width(), 800.0);
+        let requests = probe.take_requests();
+        assert_eq!(
+            requests,
+            vec![(
+                0,
+                crate::pdf_loader::absolute_display_render_long_edge(
+                    1200.0,
+                    false,
+                    PdfPageContentType::Vector
+                )
+            )]
+        );
+        for long in [5407, 7138, 8192] {
+            let generation = app.items_generation;
+            assert!(probe.complete(&mut app, generation, 0, completion(long)));
+            app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+            let next = single(&mut app, &ctx, rect, false);
+            assert_eq!(next.layout_full_image_rect, first.layout_full_image_rect);
+            assert!(
+                probe.take_requests().is_empty(),
+                "completion must not multiply prior raster demand"
+            );
+        }
+        let generation = app.items_generation.wrapping_add(1);
+        assert!(!probe.complete(&mut app, generation, 0, completion(256)));
+        assert_eq!(
+            single(&mut app, &ctx, rect, false).layout_full_image_rect,
+            first.layout_full_image_rect
+        );
+        app.settings.fullscreen_specified_scale = FullscreenSpecifiedScale::default();
+        let fitted = single(&mut app, &ctx, rect, false);
+        close(fitted.layout_full_image_rect.height(), 640.0);
+        probe.take_requests();
+        let larger = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(2000.0, 1600.0));
+        close(
+            single(&mut app, &ctx, larger, false)
+                .layout_full_image_rect
+                .height(),
+            1280.0,
+        );
+        assert_eq!(probe.take_requests().len(), 1);
+        ctx.set_pixels_per_point(1.5);
+        let dpi = single(&mut app, &ctx, larger, false);
+        let physical = dpi.layout_full_image_rect.height() * ctx.pixels_per_point();
+        assert_eq!(
+            probe.take_requests(),
+            vec![(
+                0,
+                crate::pdf_loader::absolute_display_render_long_edge(
+                    physical,
+                    false,
+                    PdfPageContentType::Vector
+                )
+            )]
+        );
+    }
+
+    #[test]
+    fn specified_scale_single_z_ignores_size_limits_while_spread_z_retains_them() {
+        let ctx = egui::Context::default();
+        let mut app = pdf_app(&ctx, 2);
+        let probe = PdfRerenderRequestProbe::start();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        app.settings.fullscreen_specified_scale = height(200);
+        app.settings.fullscreen_fit_no_upscale = true;
+        app.settings.fullscreen_fit_no_downscale = true;
+        let normal = single(&mut app, &ctx, rect, false);
+        close(normal.layout_full_image_rect.height(), 4096.0);
+        probe.take_requests();
+        app.fs_zoom_aiming = true;
+        let z = single(&mut app, &ctx, rect, true);
+        close(z.layout_full_image_rect.height(), 800.0);
+        assert!(matches!(
+            z.fit_input,
+            FullscreenFitInput::CanonicalPage { .. }
+        ));
+        assert_eq!(
+            probe.take_requests(),
+            vec![(
+                0,
+                crate::pdf_loader::absolute_display_render_long_edge(
+                    800.0,
+                    false,
+                    PdfPageContentType::Vector
+                )
+            )]
+        );
+        app.settings.fullscreen_specified_scale = height(9000);
+        app.settings.fullscreen_fit_no_upscale = false;
+        app.settings.fullscreen_fit_no_downscale = false;
+        assert_eq!(
+            single(&mut app, &ctx, rect, true).layout_full_image_rect,
+            z.layout_full_image_rect
+        );
+        assert!(probe.take_requests().is_empty());
+        app.fs_zoom_aiming = false;
+        app.settings.fullscreen_specified_scale = height(200);
+        app.settings.fullscreen_fit_no_upscale = true;
+        app.settings.fullscreen_fit_no_downscale = true;
+        assert_eq!(
+            single(&mut app, &ctx, rect, false).layout_full_image_rect,
+            normal.layout_full_image_rect
+        );
+        probe.take_requests();
+        app.fs_zoom_aiming = true;
+        let pair = spread(&mut app, &ctx, rect, None);
+        assert_eq!(pair.len(), 2);
+        for p in pair {
+            close(p.layout_full_image_rect.height(), 4096.0);
+            assert!(matches!(
+                p.fit_input,
+                FullscreenFitInput::SpecifiedScale { .. }
+            ));
+        }
+        assert!(probe.take_requests().iter().all(|(_, px)| *px
+            == crate::pdf_loader::absolute_display_render_long_edge(
+                4096.0,
+                true,
+                PdfPageContentType::Vector
+            )));
+        app.fs_zoom_aiming = false;
+        app.fs_zoom_active = true;
+        app.fs_zoom_factor = 1.5;
+        let confirmed = single(&mut app, &ctx, rect, true);
+        assert!(confirmed.layout_full_image_rect.height() > z.layout_full_image_rect.height());
+        assert!(matches!(
+            confirmed.fit_input,
+            FullscreenFitInput::CanonicalPage { .. }
+        ));
+        probe.take_requests();
+        let resized_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, rect.size() * 2.0);
+        let resized = single(&mut app, &ctx, resized_rect, true);
+        assert!(
+            resized.layout_full_image_rect.height() > confirmed.layout_full_image_rect.height()
+        );
+        probe.take_requests();
+        ctx.set_pixels_per_point(1.5);
+        let dpi = single(&mut app, &ctx, resized_rect, true);
+        let required = dpi
+            .layout_full_image_rect
+            .height()
+            .max(dpi.layout_full_image_rect.width())
+            * ctx.pixels_per_point();
+        assert_eq!(
+            probe.take_requests(),
+            vec![(
+                0,
+                crate::pdf_loader::absolute_display_render_long_edge(
+                    required,
+                    false,
+                    PdfPageContentType::Vector
+                )
+            )]
+        );
+        app.fs_zoom_active = false;
+        ctx.set_pixels_per_point(1.0);
+        let exit = single(&mut app, &ctx, rect, false);
+        assert_eq!(exit.layout_full_image_rect, normal.layout_full_image_rect);
+    }
+
+    #[test]
+    fn specified_scale_spread_draw_completion_keeps_both_partner_demands_stable() {
+        let ctx = egui::Context::default();
+        let mut app = pdf_app(&ctx, 2);
+        let probe = PdfRerenderRequestProbe::start();
+        app.settings.fullscreen_specified_scale = height(1200);
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1800.0, 800.0));
+        let first = spread(&mut app, &ctx, rect, None);
+        assert_eq!(first.len(), 2);
+        assert_eq!(probe.take_requests().len(), 2);
+        for idx in 0..2 {
+            let generation = app.items_generation;
+            assert!(probe.complete(&mut app, generation, idx, completion(7138)));
+        }
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+        let next = spread(&mut app, &ctx, rect, None);
+        for (a, b) in first.iter().zip(next.iter()) {
+            assert_eq!(a.layout_full_image_rect, b.layout_full_image_rect);
+        }
+        assert!(probe.take_requests().is_empty());
+    }
+
+    fn reference_idx(app: &App) -> usize {
+        match &app.fs_continuous_fit_reference {
+            ContinuousSpecifiedFitReference::Specified { unit, .. } => unit.anchor_idx,
+            ContinuousSpecifiedFitReference::Legacy => panic!("missing typed reference"),
+        }
+    }
+
+    #[test]
+    fn specified_scale_continuous_real_layout_preserves_reference_and_manual_zoom() {
+        for flow in [ReadingFlow::Vertical, ReadingFlow::Horizontal] {
+            let ctx = egui::Context::default();
+            let mut app = pdf_app(&ctx, 3);
+            app.reading_flow = flow;
+            app.settings.fullscreen_specified_scale = FullscreenSpecifiedScale {
+                width: Some(SpecifiedScaleAxis::PercentTenths(500)),
+                height: None,
+            };
+            app.record_page_layout_dims_for_spread(1, (900_000, 600_000));
+            let units = (0..3)
+                .map(|idx| ContinuousReadingUnitSpec::pages(idx, vec![idx]))
+                .collect::<Vec<_>>();
+            let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+            let first = app
+                .continuous_reading_layout(&ctx, rect, &units, 0, false)
+                .unwrap();
+            let first_size = first.0.iter().find(|p| p.idx() == 0).unwrap().rect.size();
+            let partner_height = first_size.y
+                * app
+                    .pdf_specified_basis_for_idx(1)
+                    .unwrap()
+                    .normalized_original_size()
+                    .y
+                / app
+                    .pdf_specified_basis_for_idx(0)
+                    .unwrap()
+                    .normalized_original_size()
+                    .y;
+            app.fs_vertical_scroll = 100.0;
+            let reanchored = app
+                .continuous_reading_layout(&ctx, rect, &units, 1, false)
+                .unwrap();
+            assert_eq!(reference_idx(&app), 0);
+            close(
+                reanchored
+                    .0
+                    .iter()
+                    .find(|p| p.idx() == 1)
+                    .unwrap()
+                    .rect
+                    .height(),
+                partner_height,
+            );
+            let larger = egui::Rect::from_min_size(egui::Pos2::ZERO, rect.size() * 2.0);
+            let resized = app
+                .continuous_reading_layout(&ctx, larger, &units, 1, false)
+                .unwrap();
+            close(
+                resized
+                    .0
+                    .iter()
+                    .find(|p| p.idx() == 1)
+                    .unwrap()
+                    .rect
+                    .height(),
+                partner_height * 2.0,
+            );
+            assert_eq!(reference_idx(&app), 0);
+            app.fs_zoom = 2.0;
+            let zoomed = app
+                .continuous_reading_layout(&ctx, larger, &units, 1, false)
+                .unwrap();
+            close(
+                zoomed
+                    .0
+                    .iter()
+                    .find(|p| p.idx() == 1)
+                    .unwrap()
+                    .rect
+                    .height(),
+                resized
+                    .0
+                    .iter()
+                    .find(|p| p.idx() == 1)
+                    .unwrap()
+                    .rect
+                    .height()
+                    * 2.0,
+            );
+            assert_eq!(app.fs_zoom, 2.0);
+            app.settings.fullscreen_specified_scale = height(100);
+            app.continuous_reading_layout(&ctx, rect, &units, 1, false)
+                .unwrap();
+            assert_eq!(
+                reference_idx(&app),
+                1,
+                "value change rebases on selected unit"
+            );
+            app.settings.fullscreen_fit_no_downscale = true;
+            app.continuous_reading_layout(&ctx, rect, &units, 2, false)
+                .unwrap();
+            assert_eq!(
+                reference_idx(&app),
+                2,
+                "policy change rebases on selected unit"
+            );
+            assert_eq!(app.fs_zoom, 2.0);
+            app.settings.fullscreen_fit_mode = FullscreenFitMode::Page;
+            app.continuous_reading_layout(&ctx, rect, &units, 2, false)
+                .unwrap();
+            assert!(matches!(
+                app.fs_continuous_fit_reference,
+                ContinuousSpecifiedFitReference::Legacy
+            ));
+        }
+    }
+
+    #[test]
+    fn specified_scale_continuous_missing_metadata_adopts_selected_reference_without_zoom_change() {
+        let ctx = egui::Context::default();
+        let mut app = pdf_app(&ctx, 3);
+        let probe = PdfRerenderRequestProbe::start();
+        app.reading_flow = ReadingFlow::Vertical;
+        app.settings.fullscreen_specified_scale = height(300);
+        app.items[1] = GridItem::PdfPage {
+            pdf_path: app.tmp.path().join("unknown.pdf"),
+            page_num: 0,
+            content_type: None,
+        };
+        let units = (0..3)
+            .map(|idx| ContinuousReadingUnitSpec::pages(idx, vec![idx]))
+            .collect::<Vec<_>>();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        app.continuous_reading_layout(&ctx, rect, &units, 1, false)
+            .unwrap();
+        assert!(matches!(
+            app.fs_continuous_fit_reference,
+            ContinuousSpecifiedFitReference::Specified { base: None, .. }
+        ));
+        assert_eq!(reference_idx(&app), 1);
+        let generation = app.items_generation;
+        assert!(probe.complete(&mut app, generation, 1, completion(8192)));
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+        let adopted = app
+            .continuous_reading_layout(&ctx, rect, &units, 2, false)
+            .unwrap();
+        assert_eq!(reference_idx(&app), 1);
+        assert!(matches!(
+            app.fs_continuous_fit_reference,
+            ContinuousSpecifiedFitReference::Specified { base: Some(_), .. }
+        ));
+        close(
+            adopted
+                .0
+                .iter()
+                .find(|p| p.idx() == 1)
+                .unwrap()
+                .rect
+                .height(),
+            300.0,
+        );
+        assert_eq!(app.fs_zoom, 1.0);
+        let replacements = vec![ContinuousReadingUnitSpec::pages(0, vec![0])];
+        app.continuous_reading_layout(&ctx, rect, &replacements, 0, false)
+            .unwrap();
+        assert_eq!(
+            reference_idx(&app),
+            0,
+            "removed source composition selects current replacement"
+        );
+    }
+
+    #[test]
+    fn specified_scale_continuous_visible_limit_never_invents_zoom() {
+        let ctx = egui::Context::default();
+        let mut app = pdf_app(&ctx, 100);
+        app.reading_flow = ReadingFlow::Vertical;
+        app.settings.fullscreen_specified_scale = height(1);
+        app.settings.continuous_reading_gap_px = 0;
+        app.fs_zoom = 0.5;
+        let units = (0..100)
+            .map(|idx| ContinuousReadingUnitSpec::pages(idx, vec![idx]))
+            .collect::<Vec<_>>();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let (pages, _, offsets, _) = app
+            .continuous_reading_layout(&ctx, rect, &units, 50, false)
+            .unwrap();
+        assert_eq!(app.fs_zoom, 0.5);
+        assert!(pages.len() <= VERTICAL_READING_MAX_VISIBLE_PAGES);
+        assert_eq!(offsets.len(), 100);
+        assert!(offsets.windows(2).all(|p| (p[1] - p[0] - 1.0).abs() < 0.01));
+    }
+
+    #[test]
+    fn specified_scale_captured_single_and_spread_draw_keep_policy_and_basis() {
+        let ctx = egui::Context::default();
+        let mut app = pdf_app(&ctx, 2);
+        let _probe = PdfRerenderRequestProbe::start();
+        app.settings.fullscreen_specified_scale = height(200);
+        app.settings.fullscreen_fit_no_upscale = true;
+        app.settings.fullscreen_fit_no_downscale = true;
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let pages = (0..2)
+            .map(|idx| {
+                app.capture_fs_display_unit_page(
+                    Some(&ctx),
+                    SpreadPageOccurrence::navigation(idx, idx),
+                    crate::rotation_db::Rotation::None,
+                    None,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let original = spread(&mut app, &ctx, rect, Some((&pages[0], &pages[1])));
+        app.settings.fullscreen_fit_mode = FullscreenFitMode::Width;
+        app.settings.fullscreen_specified_scale = height(5000);
+        app.settings.fullscreen_fit_no_upscale = false;
+        app.settings.fullscreen_fit_no_downscale = false;
+        app.record_page_layout_dims_for_spread(0, (1, 1));
+        app.record_page_layout_dims_for_spread(1, (1, 1));
+        let frozen = spread(&mut app, &ctx, rect, Some((&pages[0], &pages[1])));
+        for (a, b) in original.iter().zip(frozen.iter()) {
+            assert_eq!(a.layout_full_image_rect, b.layout_full_image_rect);
+        }
+        let unit = FsDisplayUnitHoldover {
+            pages: vec![pages[0].clone()],
+            singleton_placement: SingletonSpreadPlacement::Center,
+            layout_projection: FsDisplayUnitLayoutProjection::Canonical,
+        };
+        frame(&ctx, rect, |ui, ctx| {
+            app.draw_fs_display_unit_holdover_with_geometry(
+                ui,
+                ctx,
+                rect,
+                &unit,
+                StillSeekGeometry::bar_only(),
+            )
+        });
+        let single = app.fullscreen_page_layout.page_by_idx(0).unwrap().transform;
+        close(single.layout_full_image_rect.height(), 4096.0);
+        assert_eq!(single.fit_input, pages[0].fit_input);
+    }
+
+    #[test]
+    fn specified_scale_common_explicit_setter_persists_and_rejects_invalid_value() {
+        let mut app = crate::app::setup_app_for_test();
+        let value = height(1234);
+        let before = crate::settings::save_generation();
+        assert!(app.set_current_fullscreen_specified_scale(value));
+        assert!(crate::settings::save_generation() > before);
+        assert_eq!(
+            crate::settings::Settings::load().fullscreen_specified_scale,
+            value
+        );
+        assert!(!app.set_current_fullscreen_specified_scale(height(0)));
+        assert_eq!(app.settings.fullscreen_specified_scale, value);
+    }
+
+    #[test]
+    fn specified_scale_limit_handler_rebases_continuous_reference_without_resetting_manual_state() {
+        let ctx = egui::Context::default();
+        let mut app = pdf_app(&ctx, 2);
+        app.reading_flow = ReadingFlow::Vertical;
+        let units = (0..2)
+            .map(|idx| ContinuousReadingUnitSpec::pages(idx, vec![idx]))
+            .collect::<Vec<_>>();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        app.continuous_reading_layout(&ctx, rect, &units, 0, false)
+            .unwrap();
+        app.fs_zoom = 2.5;
+        app.fs_vertical_scroll = 40.0;
+        app.fs_pan = egui::vec2(30.0, 0.0);
+        app.set_fullscreen_fit_scale_limits(&ctx, 1, true, true);
+        assert_eq!(app.fs_zoom, 2.5);
+        assert_eq!(app.fs_vertical_scroll, 40.0);
+        assert_eq!(app.fs_pan, egui::vec2(30.0, 0.0));
+        assert!(matches!(
+            app.fs_continuous_fit_reference,
+            ContinuousSpecifiedFitReference::Legacy
+        ));
+        app.continuous_reading_layout(&ctx, rect, &units, 1, false)
+            .unwrap();
+        assert_eq!(reference_idx(&app), 1);
+        app.set_current_fullscreen_specified_scale(height(300));
+        app.continuous_reading_layout(&ctx, rect, &units, 0, false)
+            .unwrap();
+        assert_eq!(reference_idx(&app), 0);
+        assert_eq!(app.fs_zoom, 2.5);
+        app.set_reading_flow_for_fullscreen(&ctx, 0, ReadingFlow::Horizontal);
+        assert!(matches!(
+            app.fs_continuous_fit_reference,
+            ContinuousSpecifiedFitReference::Legacy
+        ));
+        app.settings.fullscreen_fit_mode = FullscreenFitMode::SpecifiedScale;
+        app.continuous_reading_layout(&ctx, rect, &units, 1, false)
+            .unwrap();
+        assert_eq!(reference_idx(&app), 1);
+        app.set_fullscreen_fit_mode_for_current(&ctx, 0, FullscreenFitMode::Page);
+        assert!(matches!(
+            app.fs_continuous_fit_reference,
+            ContinuousSpecifiedFitReference::Legacy
+        ));
+        app.fs_zoom = 2.5;
+        app.set_fullscreen_fit_scale_limits(&ctx, 0, false, false);
+        assert_eq!(
+            app.fs_zoom, 1.0,
+            "released legacy handler resets its manual transform"
+        );
+    }
+
+    #[test]
+    fn specified_scale_continuous_draw_completion_records_canonical_demand() {
+        let ctx = egui::Context::default();
+        let mut app = pdf_app(&ctx, 3);
+        let probe = PdfRerenderRequestProbe::start();
+        app.reading_flow = ReadingFlow::Vertical;
+        app.spread_mode = SpreadMode::Single;
+        app.settings.fullscreen_specified_scale = height(300);
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let draw = |app: &mut App| {
+            frame(&ctx, rect, |ui, ctx| {
+                app.draw_fs_continuous_reading(
+                    ui,
+                    ctx,
+                    rect,
+                    0,
+                    true,
+                    FsPageTurnDecision::normal(),
+                );
+                app.reconcile_specified_pdf_demand(ctx);
+            });
+            app.fullscreen_page_layout
+                .displayed_pages()
+                .map(|p| (p.page_idx(), p.transform.layout_full_image_rect))
+                .collect::<Vec<_>>()
+        };
+        let before = draw(&mut app);
+        assert!(!before.is_empty());
+        for (_, r) in &before {
+            close(r.height(), 300.0);
+            close(r.width(), 200.0);
+        }
+        let requests = probe.take_requests();
+        assert!(!requests.is_empty());
+        let generation = app.items_generation;
+        for (idx, _) in requests {
+            assert!(probe.complete(&mut app, generation, idx, completion(7138)));
+        }
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+        assert_eq!(draw(&mut app), before);
+        assert!(probe.take_requests().is_empty());
+    }
+
+    #[test]
+    fn specified_scale_repeated_source_occurrences_request_largest_extent_once() {
+        let ctx = egui::Context::default();
+        let mut app = pdf_app(&ctx, 2);
+        let probe = PdfRerenderRequestProbe::start();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1800.0, 800.0));
+        app.settings.fullscreen_specified_scale = height(300);
+        let small = single(&mut app, &ctx, rect, false);
+        app.settings.fullscreen_specified_scale = height(1200);
+        let large = single(&mut app, &ctx, rect, false);
+        probe.take_requests();
+        app.fs_pdf_rerender_demand.reset();
+        for frame_no in 0..4 {
+            app.fullscreen_page_layout
+                .begin(FullscreenPageLayoutKind::Continuous);
+            app.fullscreen_page_layout
+                .push_occurrence(small, SpreadPageOccurrence::navigation(0, 0));
+            app.fullscreen_page_layout
+                .push_occurrence(large, SpreadPageOccurrence::navigation(0, 1));
+            let mut partner = small;
+            partner.page_idx = 1;
+            app.fullscreen_page_layout
+                .push_occurrence(partner, SpreadPageOccurrence::navigation(1, 1));
+            app.reconcile_specified_pdf_demand(&ctx);
+            let mut requests = probe.take_requests();
+            requests.sort_unstable();
+            if frame_no == 0 {
+                assert_eq!(
+                    requests,
+                    vec![
+                        (
+                            0,
+                            crate::pdf_loader::absolute_display_render_long_edge(
+                                1200.0,
+                                false,
+                                PdfPageContentType::Vector
+                            )
+                        ),
+                        (
+                            1,
+                            crate::pdf_loader::absolute_display_render_long_edge(
+                                300.0,
+                                false,
+                                PdfPageContentType::Vector
+                            )
+                        )
+                    ]
+                );
+            } else {
+                assert!(
+                    requests.is_empty(),
+                    "two occurrences must not alternate target and cancel each frame"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn specified_scale_ai_completion_preserves_paged_pre_ai_and_continuous_source_originals() {
+        use crate::app::{FinalAiPending, FinalAiResult};
+        use std::sync::atomic::AtomicBool;
+        let ctx = egui::Context::default();
+        let mut app = pdf_app(&ctx, 1);
+        app.items[0] = GridItem::Image(app.tmp.path().join("source.png"));
+        let source = Arc::new(egui::ColorImage::filled([40, 60], egui::Color32::WHITE));
+        let tex = ctx.load_texture(
+            "pre-ai-consumer",
+            (*source).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Static {
+                tex: tex.clone(),
+                pixels: source,
+                source_dims: Some([10001, 15000]),
+                load_seq: 0,
+                animation: StaticAnimationState::Still,
+            },
+        );
+        app.settings.fullscreen_specified_scale = height(1000);
+        app.settings.fullscreen_fit_no_upscale = true;
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let before = single(&mut app, &ctx, rect, false);
+        close(before.layout_full_image_rect.height(), 60.0);
+        app.reading_flow = ReadingFlow::Vertical;
+        app.settings.fullscreen_fit_no_upscale = false;
+        app.settings.fullscreen_fit_no_downscale = true;
+        let baseline_units = vec![ContinuousReadingUnitSpec::pages(0, vec![0])];
+        let baseline_continuous = app
+            .continuous_reading_layout(&ctx, rect, &baseline_units, 0, true)
+            .unwrap()
+            .0[0]
+            .rect;
+        assert_eq!(baseline_continuous.size(), egui::vec2(10001.0, 15000.0));
+        app.reading_flow = ReadingFlow::Paged;
+        app.settings.fullscreen_fit_no_upscale = true;
+        app.settings.fullscreen_fit_no_downscale = false;
+        app.settings.global_preset.upscale_model = Some("auto".into());
+        app.settings.retained_final_ai_cache_max_entries = 4;
+        app.settings.retained_final_ai_cache_max_mib = 8;
+        let key = app
+            .final_ai_key_for_pixels(
+                app.current_edit_result_key(0),
+                [40, 60],
+                app.effective_params(0),
+            )
+            .unwrap();
+        app.final_ai_pending.insert(
+            key,
+            FinalAiPending {
+                job_id: 77,
+                cancel: Arc::new(AtomicBool::new(false)),
+                retained_key: None,
+                retained_epoch: 0,
+                allow_retained_orphan: false,
+                cancel_on_drop: false,
+            },
+        );
+        app.final_ai_result_backlog.push(FinalAiResult::Ready {
+            job_id: 77,
+            key,
+            retained_key: None,
+            retained_epoch: 0,
+            source_size: [40, 60],
+            image: egui::ColorImage::filled([160, 240], egui::Color32::WHITE),
+            used_upscale: true,
+        });
+        app.poll_final_ai(&ctx);
+        assert_eq!(
+            app.pre_ai_display_size_for_idx(0),
+            Some(egui::vec2(40.0, 60.0))
+        );
+        let final_tex = app.ensure_final_composite_texture(&ctx, 0).unwrap();
+        assert_eq!(final_tex.size(), [160, 240]);
+        let resource = FullscreenPaintResource::direct(final_tex);
+        let paged_limits = app.fullscreen_fit_scale_limits(1.0);
+        let mut after = None;
+        frame(&ctx, rect, |ui, _| {
+            after = app.draw_fs_image(
+                ui,
+                rect,
+                0,
+                Some(egui::vec2(10001.0, 15000.0)),
+                FsPageLayoutSource::CurrentItem,
+                None,
+                None,
+                SingletonSpreadPlacement::Center,
+                Some(&resource),
+                None,
+                false,
+                false,
+                false,
+                crate::rotation_db::Rotation::None,
+                None,
+                0.0,
+                &FsBgStyle::Solid(egui::Color32::BLACK),
+                "",
+                false,
+                FullscreenFitMode::SpecifiedScale,
+                paged_limits,
+                None,
+            );
+        });
+        assert_eq!(
+            after.unwrap().layout_full_image_rect,
+            before.layout_full_image_rect
+        );
+        assert!(!app.retained_final_ai_cache.is_empty());
+        app.final_ai_cache.clear();
+        app.final_composite_cache.clear();
+        app.edit_result_cache.clear();
+        let restored_tex = app.ensure_final_composite_texture(&ctx, 0).unwrap();
+        assert_eq!(restored_tex.size(), [160, 240]);
+        assert_eq!(
+            app.pre_ai_display_size_for_idx(0),
+            Some(egui::vec2(40.0, 60.0))
+        );
+        assert!(
+            app.final_composite_cache
+                .values()
+                .all(|entry| entry.source_size == [40, 60])
+        );
+        app.reading_flow = ReadingFlow::Vertical;
+        app.settings.fullscreen_fit_no_upscale = false;
+        app.settings.fullscreen_fit_no_downscale = true;
+        let units = vec![ContinuousReadingUnitSpec::pages(0, vec![0])];
+        let (pages, _, _, _) = app
+            .continuous_reading_layout(&ctx, rect, &units, 0, true)
+            .unwrap();
+        close(pages[0].rect.height(), 15000.0);
+        assert_eq!(
+            pages[0].rect, baseline_continuous,
+            "40x60 pre-AI rounding must not replace the canonical 10001x15000 aspect on AI arrival"
+        );
+        let input = app
+            .fs_fit_input_for_resource(
+                0,
+                FullscreenFitMode::SpecifiedScale,
+                resource.source_texture(),
+            )
+            .unwrap();
+        let FullscreenFitInput::SpecifiedScale { basis, .. } = input else {
+            panic!()
+        };
+        assert_eq!(basis.original_size, egui::vec2(10001.0, 15000.0));
+        app.fs_cache.remove(&0);
+        app.fs_early_dims.insert(0, [10001, 15000]);
+        let (evicted, _, _, _) = app
+            .continuous_reading_layout(&ctx, rect, &units, 0, true)
+            .unwrap();
+        assert_eq!(evicted[0].rect.size(), pages[0].rect.size());
+    }
+    fn fit_popup_frame(
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        events: Vec<egui::Event>,
+        open: &mut bool,
+        value: &mut FullscreenSpecifiedScale,
+    ) -> egui::FullOutput {
+        let raw_input = egui::RawInput {
+            screen_rect: Some(full_rect),
+            events,
+            ..Default::default()
+        };
+        let output = ctx.run(raw_input, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| {
+                    let keymap = Keymap::default();
+                    let mut close = false;
+                    let mut page_nav = FsPageNav::None;
+                    let mut side_panel_mode_pressed = false;
+                    let mut overflow_request = None;
+                    let mut slideshow_playing = false;
+                    let mut slideshow_interval = 5.0;
+                    let mut slideshow_end_action = SlideshowEndAction::default();
+                    let mut rotation_choice = None;
+                    let mut panorama_pressed = false;
+                    let mut panorama_projection_popup_open = false;
+                    let mut panorama_projection_choice = None;
+                    let mut spread_mode = SpreadMode::Ltr;
+                    let mut reading_flow = ReadingFlow::Paged;
+                    let mut reading_direction = ReadingDirection::Ltr;
+                    let mut final_cover_spread_preference =
+                        crate::settings::FinalCoverSpreadPreference::FollowGlobal;
+                    let mut page_alone_preferences =
+                        crate::settings::PageAlonePreferences::default();
+                    let mut local_adjust_mode = false;
+                    let mut fit_popup_open = *open;
+                    let mut slideshow_popup_open = false;
+                    let mut slideshow_wait = 1.0;
+                    let mut slideshow_scroll = 1.0;
+                    let mut slideshow_percent = 100;
+                    let mut fit_mode_choice = None;
+                    let mut fit_no_upscale_choice = None;
+                    let mut fit_no_downscale_choice = None;
+                    let mut view_trim_mode = false;
+                    let mut tile_pressed = false;
+                    let mut vst_pressed = false;
+                    let mut copy_pressed = false;
+                    let mut copy_region_pressed = false;
+                    let mut window_mode_pressed = false;
+                    let mut top_bar_lock_pressed = false;
+                    App::draw_fs_hover_bar(
+                        ui,
+                        ctx,
+                        &keymap,
+                        full_rect,
+                        &[],
+                        &mut close,
+                        &mut page_nav,
+                        crate::settings::FsSidePanelMode::Hover,
+                        &mut side_panel_mode_pressed,
+                        false,
+                        false,
+                        &mut overflow_request,
+                        &mut slideshow_playing,
+                        &mut slideshow_interval,
+                        &mut slideshow_end_action,
+                        crate::rotation_db::Rotation::None,
+                        &mut rotation_choice,
+                        None,
+                        false,
+                        false,
+                        &mut panorama_pressed,
+                        crate::panorama::PanoProjection::Perspective,
+                        &mut panorama_projection_popup_open,
+                        &mut panorama_projection_choice,
+                        &mut spread_mode,
+                        &mut reading_flow,
+                        &mut reading_direction,
+                        &mut final_cover_spread_preference,
+                        &mut crate::settings::SingletonSpreadEndpointPreferences::default(),
+                        &mut page_alone_preferences,
+                        &mut false,
+                        false,
+                        &mut local_adjust_mode,
+                        false,
+                        FullscreenFitMode::Page,
+                        false,
+                        false,
+                        &mut fit_popup_open,
+                        &mut slideshow_popup_open,
+                        &mut slideshow_wait,
+                        &mut slideshow_scroll,
+                        &mut slideshow_percent,
+                        value,
+                        false,
+                        &mut false,
+                        &mut fit_mode_choice,
+                        &mut fit_no_upscale_choice,
+                        &mut fit_no_downscale_choice,
+                        &mut view_trim_mode,
+                        false,
+                        false,
+                        None,
+                        false,
+                        &mut tile_pressed,
+                        false,
+                        false,
+                        &mut vst_pressed,
+                        &mut copy_pressed,
+                        &mut copy_region_pressed,
+                        false,
+                        false,
+                        &mut window_mode_pressed,
+                        true,
+                        true,
+                        &mut top_bar_lock_pressed,
+                        false,
+                        None,
+                        false,
+                        1,
+                    );
+                    *open = fit_popup_open;
+                });
+        });
+        output
+    }
+
+    fn painted_label(output: &egui::FullOutput, label: &str) -> Option<egui::Rect> {
+        fn find(shape: &egui::epaint::Shape, clip: egui::Rect, label: &str) -> Option<egui::Rect> {
+            match shape {
+                egui::epaint::Shape::Text(text) if text.galley.job.text == label => {
+                    let rect = text.galley.rect.translate(text.pos.to_vec2());
+                    clip.contains(rect.center()).then_some(rect)
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    shapes.iter().find_map(|s| find(s, clip, label))
+                }
+                _ => None,
+            }
+        }
+        output
+            .shapes
+            .iter()
+            .find_map(|s| find(&s.shape, s.clip_rect, label))
+    }
+
+    fn click(pos: egui::Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+
+    #[test]
+    fn specified_scale_real_hover_popup_scrolls_edits_and_survives_ime_in_a_small_viewport() {
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 320.0));
+        let mut open = true;
+        let mut value = FullscreenSpecifiedScale::default();
+        let first = fit_popup_frame(&ctx, rect, vec![], &mut open, &mut value);
+        assert!(open);
+        let title = painted_label(&first, "ズーム/フィット").unwrap();
+        assert!(rect.contains_rect(title));
+        let scroll = vec![
+            egui::Event::PointerMoved(egui::pos2(160.0, 200.0)),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -150.0),
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        fit_popup_frame(&ctx, rect, scroll, &mut open, &mut value);
+        let output = fit_popup_frame(&ctx, rect, vec![], &mut open, &mut value);
+        let checkbox = painted_label(&output, "幅を指定する").expect("scroll exposes width editor");
+        assert!(rect.contains_rect(checkbox));
+        fit_popup_frame(&ctx, rect, click(checkbox.center()), &mut open, &mut value);
+        assert!(open, "an edit inside the actual popup must retain it");
+        assert_eq!(value.width, None);
+        let output = fit_popup_frame(&ctx, rect, vec![], &mut open, &mut value);
+        let checkbox = painted_label(&output, "幅を指定する").unwrap();
+        fit_popup_frame(&ctx, rect, click(checkbox.center()), &mut open, &mut value);
+        assert!(
+            value.width.is_some(),
+            "the width unit control must be enabled"
+        );
+        let output = fit_popup_frame(&ctx, rect, vec![], &mut open, &mut value);
+        assert!(painted_label(&output, "％").is_some());
+        let unit = ctx
+            .data(|data| {
+                data.get_temp::<egui::Rect>(egui::Id::new(("specified_scale_unit_response", "幅")))
+            })
+            .expect("the actual ComboBox response owns the width unit hitbox");
+        assert!(rect.contains_rect(unit));
+        fit_popup_frame(&ctx, rect, click(unit.center()), &mut open, &mut value);
+        let output = fit_popup_frame(&ctx, rect, vec![], &mut open, &mut value);
+        let pixels =
+            painted_label(&output, "px").expect("unit selector opens inside the fit popup");
+        fit_popup_frame(&ctx, rect, click(pixels.center()), &mut open, &mut value);
+        assert!(matches!(
+            value.width,
+            Some(SpecifiedScaleAxis::LogicalPixels(_))
+        ));
+        assert!(open);
+        fit_popup_frame(
+            &ctx,
+            rect,
+            vec![
+                egui::Event::Ime(egui::ImeEvent::Enabled),
+                egui::Event::Ime(egui::ImeEvent::Preedit("幅".into())),
+            ],
+            &mut open,
+            &mut value,
+        );
+        assert!(open, "IME composition does not dismiss the fit popup");
+        fit_popup_frame(
+            &ctx,
+            rect,
+            click(egui::pos2(318.0, 318.0)),
+            &mut open,
+            &mut value,
+        );
+        assert!(!open, "click outside the painted popup dismisses it");
+    }
+
+    #[test]
+    fn specified_scale_capture_extension_preserves_legacy_live_fit_override() {
+        let ctx = egui::Context::default();
+        let mut app = pdf_app(&ctx, 2);
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1800.0, 800.0));
+        app.settings.fullscreen_fit_mode = FullscreenFitMode::Page;
+        let pages = (0..2)
+            .map(|idx| {
+                app.capture_fs_display_unit_page(
+                    Some(&ctx),
+                    SpreadPageOccurrence::navigation(idx, idx),
+                    crate::rotation_db::Rotation::None,
+                    None,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let page = spread(&mut app, &ctx, rect, Some((&pages[0], &pages[1])));
+        app.settings.fullscreen_fit_mode = FullscreenFitMode::Width;
+        let width = spread(&mut app, &ctx, rect, Some((&pages[0], &pages[1])));
+        assert!(width[0].layout_full_image_rect.height() > page[0].layout_full_image_rect.height());
+        assert_eq!(width[0].fit_mode, FullscreenFitMode::Width);
+    }
+
+    #[test]
+    fn specified_scale_new_caller_preserves_legacy_spread_and_z_rotated_trim_exception() {
+        let ctx = egui::Context::default();
+        let mut app = pdf_app(&ctx, 2);
+        let _probe = PdfRerenderRequestProbe::start();
+        app.settings.fullscreen_fit_mode = FullscreenFitMode::Page;
+        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Book;
+        let trim = crate::view_trim::ViewTrimPageOverride::from_margins(
+            crate::view_trim::ViewTrimMargins {
+                left: 0.1,
+                top: 0.1,
+                right: 0.1,
+                bottom: 0.1,
+            },
+        );
+        app.view_trim_page_overrides.insert(0, trim);
+        app.view_trim_page_overrides.insert(1, trim);
+        app.rotation_cache
+            .insert(0, crate::rotation_db::Rotation::Cw90);
+        assert!(
+            app.view_trim_spread_content_bbox(0, crate::view_trim::ViewTrimSpreadSide::Left)
+                .is_some()
+        );
+        assert!(
+            app.view_trim_spread_content_bbox(1, crate::view_trim::ViewTrimSpreadSide::Right)
+                .is_some()
+        );
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1800.0, 800.0));
+        let pair = spread(&mut app, &ctx, rect, None);
+        assert_eq!(pair.len(), 2);
+        assert!(
+            pair.iter()
+                .find(|p| p.page_idx == 0)
+                .unwrap()
+                .content_bbox
+                .is_none()
+        );
+        assert!(
+            pair.iter()
+                .find(|p| p.page_idx == 1)
+                .unwrap()
+                .content_bbox
+                .is_some()
+        );
+        app.fs_zoom_aiming = true;
+        let z = single(&mut app, &ctx, rect, true);
+        assert_eq!(z.rotation, crate::rotation_db::Rotation::Cw90);
+        assert!(z.content_bbox.is_none());
+    }
+
+    #[test]
+    fn specified_scale_thumbnail_and_passthrough_draw_use_the_existing_selected_source_policy() {
+        let ctx = egui::Context::default();
+        let mut app = pdf_app(&ctx, 1);
+        app.items[0] = GridItem::Image(app.tmp.path().join("thumbnail.png"));
+        app.fs_cache.clear();
+        app.settings.fullscreen_specified_scale = height(1000);
+        app.settings.fullscreen_fit_no_upscale = true;
+        app.settings.fullscreen_fit_no_downscale = true;
+        let pixels = Arc::new(egui::ColorImage::filled([8, 12], egui::Color32::WHITE));
+        let thumb = ctx.load_texture(
+            "selected-thumb",
+            (*pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.thumbnails[0] = ThumbnailState::Loaded {
+            tex: thumb.clone(),
+            origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                evaluated_display_px: 12,
+            },
+            from_edit_preview: true,
+            rendered_at_px: 12,
+            source_dims: Some((10000, 15000)),
+            layout_dims: None,
+        };
+        app.thumb_pixels.insert(0, pixels);
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let draw = |app: &mut App,
+                    resource: Option<&FullscreenPaintResource>,
+                    thumbnail: Option<&egui::TextureHandle>| {
+            let mut result = None;
+            frame(&ctx, rect, |ui, ctx| {
+                let limits = app.fullscreen_fit_scale_limits(ctx.pixels_per_point());
+                result = app.draw_fs_image(
+                    ui,
+                    rect,
+                    0,
+                    Some(egui::vec2(10000.0, 15000.0)),
+                    FsPageLayoutSource::CurrentItem,
+                    None,
+                    None,
+                    SingletonSpreadPlacement::Center,
+                    resource,
+                    thumbnail,
+                    false,
+                    false,
+                    false,
+                    crate::rotation_db::Rotation::None,
+                    None,
+                    0.0,
+                    &FsBgStyle::Solid(egui::Color32::BLACK),
+                    "",
+                    false,
+                    FullscreenFitMode::SpecifiedScale,
+                    limits,
+                    None,
+                );
+            });
+            result.unwrap()
+        };
+        let ordinary = draw(&mut app, None, Some(&thumb));
+        close(ordinary.layout_full_image_rect.height(), 12.0);
+        #[cfg(windows)]
+        {
+            let placement = crate::settings::DetachedViewerWindowPlacement {
+                x: 0.0,
+                y: 0.0,
+                w: 1200.0,
+                h: 800.0,
+                maximized: false,
+            };
+            let (snapshot, _, _) = app
+                .detached_single_image_snapshot_layout(
+                    0,
+                    placement,
+                    1.0,
+                    &thumb,
+                    crate::rotation_db::Rotation::None,
+                    None,
+                    0.0,
+                )
+                .unwrap();
+            close(snapshot.height() * placement.h, 12.0);
+        }
+        let passthrough = app.ensure_passthrough_rendition(&ctx, 0).unwrap();
+        assert_ne!(passthrough.id(), thumb.id());
+        let resource = FullscreenPaintResource::direct(passthrough);
+        let rendered = draw(&mut app, Some(&resource), None);
+        close(rendered.layout_full_image_rect.height(), 15000.0);
+        #[cfg(windows)]
+        {
+            let placement = crate::settings::DetachedViewerWindowPlacement {
+                x: 0.0,
+                y: 0.0,
+                w: 1200.0,
+                h: 800.0,
+                maximized: false,
+            };
+            let (snapshot, _, _) = app
+                .detached_single_image_snapshot_layout(
+                    0,
+                    placement,
+                    1.0,
+                    resource.source_texture(),
+                    crate::rotation_db::Rotation::None,
+                    None,
+                    0.0,
+                )
+                .unwrap();
+            close(snapshot.height() * placement.h, 15000.0);
+        }
+        let captured = app
+            .fs_fit_input_for_resource(
+                0,
+                FullscreenFitMode::SpecifiedScale,
+                resource.source_texture(),
+            )
+            .unwrap();
+        let FullscreenFitInput::SpecifiedScale { basis, .. } = captured else {
+            panic!()
+        };
+        assert_eq!(basis.original_size, egui::vec2(10000.0, 15000.0));
+    }
+
+    #[test]
+    fn specified_scale_square_pdf_real_draw_converges_at_4915_point_2_and_5407_target() {
+        let ctx = egui::Context::default();
+        let mut app = pdf_app(&ctx, 1);
+        let probe = PdfRerenderRequestProbe::start();
+        app.record_page_layout_dims_for_spread(0, (612_000, 612_000));
+        app.settings.fullscreen_specified_scale = height(100);
+        app.settings.fullscreen_fit_no_downscale = true;
+        app.fs_zoom = 1.2;
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 800.0));
+        let square_completion = |long: usize| FsLoadResult::StaticPdf {
+            ci: egui::ColorImage::filled([8, 8], egui::Color32::WHITE),
+            source_dims: [long, long],
+            page_size_points: crate::pdf_loader::PdfPageSizePoints {
+                width: 612.0,
+                height: 612.0,
+            },
+            content_type: PdfPageContentType::Vector,
+        };
+        let generation = app.items_generation;
+        assert!(probe.complete(&mut app, generation, 0, square_completion(4096)));
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+        let initial = single(&mut app, &ctx, rect, false);
+        assert!((initial.layout_full_image_rect.height() - 4915.2).abs() < 0.001);
+        assert!((initial.layout_full_image_rect.width() - 4915.2).abs() < 0.001);
+        assert_eq!(probe.take_requests(), vec![(0, 5407)]);
+        for long in [5407, 7138, 8192] {
+            let generation = app.items_generation;
+            assert!(probe.complete(&mut app, generation, 0, square_completion(long)));
+            app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+            let drawn = single(&mut app, &ctx, rect, false);
+            assert_eq!(drawn.layout_full_image_rect, initial.layout_full_image_rect);
+            assert_eq!(
+                app.pdf_specified_basis_for_idx(0).unwrap().original_size,
+                egui::vec2(4096.0, 4096.0)
+            );
+            assert!(
+                probe.take_requests().is_empty(),
+                "raster {long} must not become the next Original basis"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn specified_scale_actual_global_mode_handlers_retire_parked_reference_without_manual_state_loss()
+     {
+        let ctx = egui::Context::default();
+        let mut app = pdf_app(&ctx, 2);
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let seed = |owner: &mut App| {
+            owner.items = (0..2)
+                .map(|idx| GridItem::PdfPage {
+                    pdf_path: PathBuf::from("c:/parked/reader.pdf"),
+                    page_num: idx,
+                    content_type: Some(PdfPageContentType::Vector),
+                })
+                .collect();
+            owner.thumbnails = (0..2).map(|_| ThumbnailState::Pending).collect();
+            owner.visible_indices = vec![0, 1];
+            owner.details_order = vec![0, 1];
+            owner.fullscreen_idx = Some(1);
+            owner.reading_flow = ReadingFlow::Vertical;
+            for idx in 0..2 {
+                owner.record_page_layout_dims_for_spread(idx, (612_000, 612_000));
+            }
+            let units = vec![
+                ContinuousReadingUnitSpec::pages(0, vec![0]),
+                ContinuousReadingUnitSpec::pages(1, vec![1]),
+            ];
+            owner
+                .continuous_reading_layout(&ctx, rect, &units, 1, false)
+                .unwrap();
+            assert_eq!(reference_idx(owner), 1);
+            owner.fs_zoom = 2.5;
+            owner.fs_vertical_scroll = 77.0;
+        };
+        let parked = app.build_window_context_for_test(13421, seed);
+        app.set_fullscreen_fit_mode_for_current(&ctx, 0, FullscreenFitMode::SpecifiedScale);
+        app.with_window_context_for_test(parked, |owner| {
+            assert_eq!(
+                reference_idx(owner),
+                1,
+                "unchanged mode preserves the real prepared parked reference"
+            );
+            assert_eq!(owner.fs_zoom, 2.5);
+            assert_eq!(owner.fs_vertical_scroll, 77.0);
+        });
+        for default_exit in [false, true] {
+            if default_exit {
+                app.set_default_fullscreen_fit_for_flow(&ctx, 0, ReadingFlow::Paged);
+            } else {
+                app.set_fullscreen_fit_mode_for_current(&ctx, 0, FullscreenFitMode::Page);
+            }
+            // No parked mount or layout observes the intervening legacy mode.
+            app.set_fullscreen_fit_mode_for_current(&ctx, 0, FullscreenFitMode::SpecifiedScale);
+            app.with_window_context_for_test(parked, |owner| {
+                assert!(matches!(
+                    owner.fs_continuous_fit_reference,
+                    ContinuousSpecifiedFitReference::Legacy
+                ));
+                assert_eq!(owner.fs_zoom, 2.5);
+                assert_eq!(owner.fs_vertical_scroll, 77.0);
+                seed(owner);
+            });
+        }
     }
 }

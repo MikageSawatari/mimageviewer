@@ -6992,6 +6992,10 @@ fn single_folder_navigation_holdover(page_idx: usize, texture: egui::TextureHand
         singleton_placement: crate::displayed_image_transform::SingletonSpreadPlacement::Center,
         layout_projection: crate::app::FsDisplayUnitLayoutProjection::Canonical,
         pages: vec![FsDisplayUnitHoldoverPage {
+            fit_scale_limits: crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
+            fit_input: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
+                crate::settings::FullscreenFitMode::Page,
+            ),
             occurrence: crate::ui_fullscreen::SpreadPageOccurrence::navigation(page_idx, page_idx),
             layout_size: texture.size_vec2(),
             post_filter: crate::adjustment::PostFilter::None,
@@ -45839,7 +45843,9 @@ mod favorite_adjustment_defaults_tests {
                     rotation: crate::rotation_db::Rotation::None,
                     free_rotation_rad: 0.0,
                     content_bbox: None,
-                    fit_mode: crate::settings::FullscreenFitMode::Page,
+                    fit_mode: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
+                        crate::settings::FullscreenFitMode::Page,
+                    ),
                     fit_scale_limits:
                         crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
                     pixels_per_point: 1.0,
@@ -50230,6 +50236,11 @@ mod pipeline_cache_refactor_tests {
                     crate::displayed_image_transform::SingletonSpreadPlacement::Center,
                 layout_projection: crate::app::FsDisplayUnitLayoutProjection::Canonical,
                 pages: vec![FsDisplayUnitHoldoverPage {
+                    fit_scale_limits:
+                        crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
+                    fit_input: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
+                        crate::settings::FullscreenFitMode::Page,
+                    ),
                     occurrence: crate::ui_fullscreen::SpreadPageOccurrence::navigation(
                         page_idx, target_idx,
                     ),
@@ -50344,6 +50355,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                source_size: pixels.size,
                 pixels: Arc::clone(&pixels),
                 texture,
                 complete: true,
@@ -50479,6 +50491,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                source_size: pixels.size,
                 pixels,
                 texture: final_tex,
                 complete: true,
@@ -50491,6 +50504,7 @@ mod pipeline_cache_refactor_tests {
                 bg: 0,
             },
             FinalAiEntry {
+                source_size: [1, 1],
                 pixels: Arc::new(egui::ColorImage::new(
                     [1, 1],
                     vec![egui::Color32::from_rgb(10, 11, 12)],
@@ -51305,6 +51319,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                source_size: edit_pixels.size,
                 pixels: Arc::clone(&provisional_pixels),
                 texture: provisional,
                 complete: false,
@@ -51376,6 +51391,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                source_size: edit_pixels.size,
                 cancel: Arc::new(AtomicBool::new(false)),
                 rx: final_effect_rx,
                 items_generation,
@@ -51421,8 +51437,14 @@ mod pipeline_cache_refactor_tests {
         params.colorize.mode = ColorizeMode::AllImages;
         let final_key = app.final_composite_key_for_pixels(edit_key, source.size, &params);
 
-        let first =
-            app.start_final_effect_worker(&ctx, final_key, &params, Arc::clone(&source), false);
+        let first = app.start_final_effect_worker(
+            &ctx,
+            final_key,
+            &params,
+            Arc::clone(&source),
+            source.size,
+            false,
+        );
         assert!(
             first.is_none(),
             "a page with no same-key composite must keep using the viewer holdover"
@@ -51446,14 +51468,21 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                source_size: cached_pixels.size,
                 pixels: cached_pixels,
                 texture: cached_texture,
                 complete: false,
             },
         );
 
-        let spawned =
-            app.start_final_effect_worker(&ctx, final_key, &params, Arc::clone(&source), true);
+        let spawned = app.start_final_effect_worker(
+            &ctx,
+            final_key,
+            &params,
+            Arc::clone(&source),
+            source.size,
+            true,
+        );
         assert_eq!(
             spawned.map(|texture| texture.id()),
             Some(cached_id),
@@ -51467,6 +51496,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                source_size: source.size,
                 cancel: Arc::new(AtomicBool::new(false)),
                 rx: prefetch_rx,
                 items_generation,
@@ -51475,8 +51505,14 @@ mod pipeline_cache_refactor_tests {
                 prefetch: true,
             },
         );
-        let reused =
-            app.start_final_effect_worker(&ctx, final_key, &params, Arc::clone(&source), true);
+        let reused = app.start_final_effect_worker(
+            &ctx,
+            final_key,
+            &params,
+            Arc::clone(&source),
+            source.size,
+            true,
+        );
         assert_eq!(
             reused.map(|texture| texture.id()),
             Some(cached_id),
@@ -51520,6 +51556,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                source_size: provisional_pixels.size,
                 pixels: Arc::clone(&provisional_pixels),
                 texture: provisional,
                 complete: false,
@@ -51536,6 +51573,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                source_size: [1, 1],
                 cancel: Arc::new(AtomicBool::new(false)),
                 rx: final_effect_rx,
                 items_generation,
@@ -51587,6 +51625,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                source_size: complete_pixels.size,
                 pixels: complete_pixels,
                 texture: complete,
                 complete: true,
@@ -51662,6 +51701,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                source_size: [2, 2],
                 cancel: Arc::new(AtomicBool::new(false)),
                 rx,
                 items_generation,
@@ -51706,6 +51746,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                source_size: [2, 2],
                 cancel: Arc::new(AtomicBool::new(false)),
                 rx,
                 items_generation,
@@ -55028,6 +55069,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             effect_key,
             FinalEffectPending {
+                source_size: [1, 1],
                 cancel: Arc::clone(&effect_cancel),
                 rx: effect_rx,
                 items_generation,
@@ -55083,6 +55125,7 @@ mod pipeline_cache_refactor_tests {
             app.final_effect_pending.insert(
                 key,
                 FinalEffectPending {
+                    source_size: [1, 1],
                     cancel: Arc::new(AtomicBool::new(false)),
                     rx,
                     items_generation,
@@ -55585,6 +55628,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                source_size: monochrome.size,
                 pixels: Arc::clone(&monochrome),
                 texture: final_texture,
                 complete: true,
@@ -57107,6 +57151,7 @@ mod pipeline_cache_refactor_tests {
         app.final_ai_cache.insert(
             base_key,
             FinalAiEntry {
+                source_size: [1, 1],
                 pixels: Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK])),
                 used_upscale: true,
             },
@@ -57142,6 +57187,7 @@ mod pipeline_cache_refactor_tests {
                 bg: 0,
             },
             FinalCompositeEntry {
+                source_size: [1, 1],
                 pixels: Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK])),
                 texture: tex.clone(),
                 complete: true,
@@ -57253,6 +57299,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                source_size: pending.source_size,
                 cancel: pending.cancel,
                 rx,
                 items_generation: pending.items_generation,
@@ -57311,8 +57358,14 @@ mod pipeline_cache_refactor_tests {
                 .cancel,
         );
         app.open_fullscreen(target, crate::app::HistoryTrigger::UserChosen);
-        let displayed =
-            app.start_final_effect_worker(&ctx, final_key, &params, Arc::clone(&source), true);
+        let displayed = app.start_final_effect_worker(
+            &ctx,
+            final_key,
+            &params,
+            Arc::clone(&source),
+            source.size,
+            true,
+        );
 
         let promoted = app
             .final_effect_pending
@@ -57360,6 +57413,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             current_key,
             FinalCompositeEntry {
+                source_size: current_pixels.size,
                 pixels: current_pixels,
                 texture: current_texture,
                 complete: true,
@@ -57407,6 +57461,7 @@ mod pipeline_cache_refactor_tests {
         app.final_composite_cache.insert(
             target_final_key,
             FinalCompositeEntry {
+                source_size: prefetched_pixels.size,
                 pixels: prefetched_pixels,
                 texture: prefetched_texture,
                 complete: true,
@@ -57949,6 +58004,7 @@ mod pipeline_cache_refactor_tests {
         app.final_ai_cache.insert(
             ai_key,
             FinalAiEntry {
+                source_size: [4, 1],
                 pixels: Arc::new(ai_image.clone()),
                 used_upscale: true,
             },
@@ -57987,6 +58043,7 @@ mod pipeline_cache_refactor_tests {
         app.final_ai_cache.insert(
             dn_key,
             FinalAiEntry {
+                source_size: [4, 1],
                 pixels: Arc::new(dn_image.clone()),
                 used_upscale: false,
             },
@@ -58403,6 +58460,7 @@ mod pipeline_display_edit_split_tests {
         app.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                source_size: image.size,
                 pixels: Arc::new(image),
                 texture,
                 complete: true,
@@ -77368,7 +77426,9 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 rotation: crate::rotation_db::Rotation::None,
                 free_rotation_rad: 0.0,
                 content_bbox: None,
-                fit_mode: crate::settings::FullscreenFitMode::Page,
+                fit_mode: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
+                    crate::settings::FullscreenFitMode::Page,
+                ),
                 fit_scale_limits: FullscreenFitScaleLimits::default(),
                 pixels_per_point: 1.0,
                 placement,
@@ -77556,7 +77616,9 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                     rotation: crate::rotation_db::Rotation::None,
                     free_rotation_rad: 0.0,
                     content_bbox: None,
-                    fit_mode: crate::settings::FullscreenFitMode::Width,
+                    fit_mode: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
+                        crate::settings::FullscreenFitMode::Width,
+                    ),
                     fit_scale_limits: FullscreenFitScaleLimits::default(),
                     pixels_per_point: 1.0,
                     placement,
@@ -77649,7 +77711,9 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 rotation: crate::rotation_db::Rotation::None,
                 free_rotation_rad: 0.0,
                 content_bbox: None,
-                fit_mode: crate::settings::FullscreenFitMode::Page,
+                fit_mode: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
+                    crate::settings::FullscreenFitMode::Page,
+                ),
                 fit_scale_limits: FullscreenFitScaleLimits::default(),
                 pixels_per_point: 1.0,
                 placement,
@@ -77667,6 +77731,13 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                     target_idx: 0,
                     previous: FsDisplayUnitHoldover {
                         pages: vec![FsDisplayUnitHoldoverPage {
+                            fit_scale_limits:
+                                crate::displayed_image_transform::FullscreenFitScaleLimits::default(
+                                ),
+                            fit_input:
+                                crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
+                                    crate::settings::FullscreenFitMode::Page,
+                                ),
                             occurrence: crate::ui_fullscreen::SpreadPageOccurrence::navigation(
                                 0, 0,
                             ),
@@ -77808,7 +77879,9 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             rotation: crate::rotation_db::Rotation::None,
             free_rotation_rad: 0.2,
             content_bbox: None,
-            fit_mode: crate::settings::FullscreenFitMode::Width,
+            fit_mode: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
+                crate::settings::FullscreenFitMode::Width,
+            ),
             fit_scale_limits: FullscreenFitScaleLimits::default(),
             pixels_per_point: 1.0,
             placement,
@@ -83047,7 +83120,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         app.slideshow_anchor_idx = Some(before);
         app.spread_shift_anchor_idx = Some(excluded);
-        app.fs_zoom_pdf_rerender_idx = Some(video);
+        app.fs_pdf_rerender_demand.note_legacy(video, 1.0);
         app.slideshow_scroll_range_cache = Some((video, 1.0, 2.0));
         let _ = app.collect_image_indices();
         app.fs_vertical_cache_keep_set.insert(video);
@@ -83067,7 +83140,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert!(app.fs_holdover_tex.is_none());
         assert_eq!(app.slideshow_anchor_idx, Some(2));
         assert_eq!(app.spread_shift_anchor_idx, None);
-        assert_eq!(app.fs_zoom_pdf_rerender_idx, Some(1));
+        assert_eq!(app.fs_pdf_rerender_demand.legacy_idx(), Some(1));
         assert!(app.slideshow_scroll_range_cache.is_none());
         assert!(!app.viewer_navigation_caches.has_entries_for_test());
         assert!(app.fs_vertical_cache_keep_set.is_empty());

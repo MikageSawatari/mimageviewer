@@ -1274,9 +1274,29 @@ fn snapshot_with_theme_options(
     contrast: mimageviewer::settings::TextContrast,
     size: egui::Vec2,
     animated_steps: Option<usize>,
-    mut build_ui: impl FnMut(&mut egui::Ui),
+    build_ui: impl FnMut(&mut egui::Ui),
     interact: impl FnOnce(&mut Harness<'_>),
 ) {
+    drop(snapshot_with_theme_options_collect(
+        name,
+        resolved,
+        contrast,
+        size,
+        animated_steps,
+        build_ui,
+        interact,
+    ));
+}
+
+fn snapshot_with_theme_options_collect(
+    name: &str,
+    resolved: mimageviewer::os_theme::ResolvedTheme,
+    contrast: mimageviewer::settings::TextContrast,
+    size: egui::Vec2,
+    animated_steps: Option<usize>,
+    mut build_ui: impl FnMut(&mut egui::Ui),
+    interact: impl FnOnce(&mut Harness<'_>),
+) -> egui_kittest::SnapshotResults {
     let mut fonts_ready = false;
     let mut harness = Harness::builder().with_size(size).build(move |ctx| {
         mimageviewer::os_theme::apply_resolved_with_contrast(ctx, resolved, contrast);
@@ -1302,6 +1322,7 @@ fn snapshot_with_theme_options(
     }
     interact(&mut harness);
     harness.snapshot(name);
+    harness.take_snapshot_results()
 }
 
 #[cfg(windows)]
@@ -1730,6 +1751,142 @@ fn fullscreen_fit_cycle_single_mode_dark() {
         None,
         mimageviewer::draw_fullscreen_fit_cycle_settings_snapshot_fixture,
     );
+}
+
+#[test]
+fn fullscreen_specified_scale_editor_snapshots() {
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    use mimageviewer::settings::{FullscreenSpecifiedScale, SpecifiedScaleAxis};
+    let cases = [
+        ("default", FullscreenSpecifiedScale::default()),
+        (
+            "width_only",
+            FullscreenSpecifiedScale {
+                width: Some(SpecifiedScaleAxis::PercentTenths(800)),
+                height: None,
+            },
+        ),
+        (
+            "height_only",
+            FullscreenSpecifiedScale {
+                width: None,
+                height: Some(SpecifiedScaleAxis::LogicalPixels(800)),
+            },
+        ),
+        (
+            "mixed",
+            FullscreenSpecifiedScale {
+                width: Some(SpecifiedScaleAxis::PercentTenths(500)),
+                height: Some(SpecifiedScaleAxis::LogicalPixels(800)),
+            },
+        ),
+        (
+            "none",
+            FullscreenSpecifiedScale {
+                width: None,
+                height: None,
+            },
+        ),
+        (
+            "limits",
+            FullscreenSpecifiedScale {
+                width: Some(SpecifiedScaleAxis::PercentTenths(1)),
+                height: Some(SpecifiedScaleAxis::LogicalPixels(32768)),
+            },
+        ),
+    ];
+    for (theme_name, theme) in [
+        ("light", mimageviewer::os_theme::ResolvedTheme::Light),
+        ("dark", mimageviewer::os_theme::ResolvedTheme::Dark),
+    ] {
+        for (size_name, size) in [
+            ("normal", egui::vec2(560.0, 430.0)),
+            ("narrow", egui::vec2(280.0, 570.0)),
+        ] {
+            for (case, mut value) in cases {
+                if size_name == "narrow" && matches!(case, "width_only" | "height_only" | "limits")
+                {
+                    continue;
+                }
+                snapshots.extend(snapshot_with_theme_options_collect(
+                    &format!("fullscreen_specified_scale_{case}_{size_name}_{theme_name}"),
+                    theme,
+                    mimageviewer::settings::TextContrast::Standard,
+                    size,
+                    None,
+                    |ui| {
+                        ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                assert!(!mimageviewer::draw_fullscreen_specified_scale_settings(
+                                    ui, &mut value
+                                ));
+                            });
+                    },
+                    |_| {},
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn fullscreen_specified_scale_live_popup_snapshots() {
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    for (theme_name, theme) in [
+        ("light", mimageviewer::os_theme::ResolvedTheme::Light),
+        ("dark", mimageviewer::os_theme::ResolvedTheme::Dark),
+    ] {
+        for (size_name, size) in [
+            ("normal", egui::vec2(480.0, 450.0)),
+            ("narrow", egui::vec2(280.0, 620.0)),
+        ] {
+            for (scope, favorite) in [("standard", false), ("favorite", true)] {
+                let mut value = mimageviewer::settings::FullscreenSpecifiedScale::default();
+                snapshots.extend(snapshot_with_theme_options_collect(
+                    &format!("fullscreen_specified_scale_live_{scope}_{size_name}_{theme_name}"),
+                    theme,
+                    mimageviewer::settings::TextContrast::Standard,
+                    size,
+                    None,
+                    |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            mimageviewer::draw_fullscreen_specified_scale_live_settings(
+                                ui, &mut value, favorite,
+                            );
+                        });
+                    },
+                    |_| {},
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn fullscreen_fit_cycle_all_modes_snapshots() {
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    for (theme_name, theme) in [
+        ("light", mimageviewer::os_theme::ResolvedTheme::Light),
+        ("dark", mimageviewer::os_theme::ResolvedTheme::Dark),
+    ] {
+        for (size_name, size) in [
+            ("normal", egui::vec2(480.0, 320.0)),
+            ("narrow", egui::vec2(280.0, 410.0)),
+        ] {
+            let mut settings = mimageviewer::settings::Settings::default();
+            snapshots.extend(snapshot_with_theme_options_collect(
+                &format!("fullscreen_fit_cycle_all_{size_name}_{theme_name}"),
+                theme,
+                mimageviewer::settings::TextContrast::Standard,
+                size,
+                None,
+                |ui| mimageviewer::draw_fullscreen_fit_cycle_settings(ui, &mut settings),
+                |_| {},
+            ));
+        }
+    }
 }
 
 #[test]

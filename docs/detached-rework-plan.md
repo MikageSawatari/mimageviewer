@@ -1455,6 +1455,38 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+**2026-10-09 §1.342 指定サイズfit・canonical枠とcontext-local需要の接続**
+
+利用者の実装指示と独立設計レビュー・構造判定への合意を受領し、
+`ebc6ce987` の [指定サイズfit設計](fullscreen-specified-scale-plan.md) に従って接続する。
+fitを所有する共通geometryへ、指定値snapshotとcanonical aspect / AI前原寸を持つ
+`FullscreenFitInput` を渡し、live / frozen / holdover / capture / replayが同じ入力を保持する。
+`layout_full_image_rect` はcanonical fit枠を保持し、丸めのあるAI / PDF rasterのcontainは
+sampling側へ閉じる。原寸来歴は既存source metadataへ対応付け、raster結果から逆算しない。
+
+実際の変更範囲は共有fit resolver / transform、`ui_fullscreen.rs` の単ページ・見開き・Z・
+navigator・連結unitとcapture / frozen consumer、既存AI / composite metadataへの原寸対応、
+PDF load / rerender completionの検証済みpage metadata採用とretained source key、
+`app.rs` のsource別絶対PDF需要と既存比較fieldの `PdfRerenderDemand` への型置換、
+連結基準の `ContinuousSpecifiedFitReference`、既存 `ViewerContextBundle` のmount / deposit /
+swapとsnapshot / index remapへの同じ値の移送、共通設定 / favorite overlayの継承投影である。
+環境設定・live picker・flow既定方式の明示的な共通方式変更は既存registryのmounted / parked / retiring ownerに保持した
+連結基準だけを終端する。非アクティブ窓をmountして更新せず、zoom / scroll / workerを変更しない。
+同じ入口を単一contextの非Windows面でも使用し、監査toolのA4へこの公開APIのexact fingerprintを登録する。
+凍結consumerは現在のSettingsを後読みせず、live siblingの需要やworkerへ書き込まない。
+favoriteの欠落継承をcapture時の変更差として保存せず、明示live編集だけが専用指定値を作る。
+
+判断理由は、画像のfit基準と需要を所有する既存境界へ値を接続し、AI / PDF出力をfit入力へ
+戻す依存をなくす構造変更であること。detached固有の症状guard、時間窓、待機、repaint、
+第二のmetadata / 保存 / worker ownerは追加しない。contextとworkerの既存取消・generationを保ち、
+別contextのread-only mount / replayでsiblingをreset・cancelしない。
+viewport predicates、host identity / HWND取得、viewport生成 / recreate、placement / focus /
+native window lifecycleは変更しない。既存4方式、単ページ / 見開きZの違い、回転＋trimの
+現行経路別例外は維持するため、§2の症状パッチには当たらないとの構造合意に従う。
+
+本項は実際に触れた所有境界の記録であり、独立実装レビューの合格記録ではない。
+自動gateの結果と未実施の独立実装レビュー・実機確認は [計画§15](fullscreen-specified-scale-plan.md#15-実装接続と検証結果2026-10-09) へ集約する。
+
 2026-10-09 master統合後の一覧公開境界修正: 利用者指定の構造修正として、Bookmark一覧buildをmainの既存Surface lease・switch sequenceで所有し、mainの成功したitems交換だけが旧buildを退役させる。detached contextのmount・items交換・pollはmainのbuildを退役も採用もしない。同じBookmarkのsortは要求ownerを継続し、A/B記憶クリアは新epochで既存refreshを再開始する。Ctrl+Fの完了filterは送信済み条件を一緒に保持し、ViewerContextBundleの既存swap/park/dropとSmart退避で一緒に運ぶ。新しいdetached predicate・viewport・placement・待機・retry・pending ownerを設けず、公開先の所有証明と既存payloadの未接続を直すため、§2の症状パッチに当たらない。
 
 2026-10-09 §1.355追加修正: Coordinator指定の構造修正として、別窓bookmarkの既存startup resolve workerからtyped RAR header証明を採用境界へ運び、cache hit前に後続巻を拒否する。DFSも同じ証明で候補から除外する。新しいdetached predicate／viewport／待機／retryを作らず、既存requestの取消・held-owner再開・context所有を保つ。旧cacheの直接採用が共通の開封不変条件を迂回していた根因を入口ownerで直すため、§2の症状パッチに当たらない。

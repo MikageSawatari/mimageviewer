@@ -5007,7 +5007,7 @@ enum PdfRenderTarget {
 const PDF_DISPLAY_RENDER_HEADROOM: f32 = 1.10;
 /// 100% 原寸 / no-downscale は raster 長辺が表示寸法にもなるため、従来の見え方と
 /// サンプル密度を下げない最低値。raster native 上限はこの後に優先する。
-const PDF_ORIGINAL_RENDER_MIN_LONG_PX: u32 = 4096;
+pub(crate) const PDF_ORIGINAL_RENDER_MIN_LONG_PX: u32 = 4096;
 
 /// PDF ページのコンテンツ種別。
 /// ラスター画像のみで構成されるページ (スキャン PDF) と、
@@ -5073,6 +5073,29 @@ pub fn zoom_render_long_edge(base_px: u32, zoom: f32, native_cap: Option<u32>) -
     let scaled = ((base_px.max(1) as f32) * zoom.max(0.01)).ceil() as u32;
     let mut target = scaled.clamp(PDF_RENDER_MIN_LONG_PX, PDF_RENDER_MAX_LONG_PX);
     if let Some(native_long) = native_cap {
+        target = target.min(native_long.max(1));
+    }
+    target
+}
+
+/// Absolute full-page demand from resolved display geometry. Headroom, Original
+/// floor and native cap are applied once, after geometry has used fixed metadata.
+pub(crate) fn absolute_display_render_long_edge(
+    required_long_edge_px: f32,
+    original_floor: bool,
+    content_type: PdfPageContentType,
+) -> u32 {
+    let required = if required_long_edge_px.is_finite() {
+        required_long_edge_px.max(1.0)
+    } else {
+        1.0
+    };
+    let mut target = ((required * PDF_DISPLAY_RENDER_HEADROOM).ceil() as u32)
+        .clamp(PDF_RENDER_MIN_LONG_PX, PDF_RENDER_MAX_LONG_PX);
+    if original_floor {
+        target = target.max(PDF_ORIGINAL_RENDER_MIN_LONG_PX);
+    }
+    if let Some(native_long) = content_type.native_long_edge() {
         target = target.min(native_long.max(1));
     }
     target

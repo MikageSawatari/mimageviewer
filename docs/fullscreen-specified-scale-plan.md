@@ -1,8 +1,8 @@
 # 指定サイズのフルスクリーンfit計画（§1.342）
 
-作成: 2026-10-08 / 改訂: 2026-10-09（r5・v4.5.0後の再照合と残る利用者決定の反映）/ ラインE。
-状態: **Q1〜Q11の利用者判断はすべて決定済み（§10.1）。独立設計レビューの承認は未記録**。
-コード照合基準: 初版 `6078f6595`、r2 `2d327da31`、r3 `ab99c0a6b`（レビュー対象文書 `d648a5d54`）、r4 `511694cd7`。v4.5.0出荷後の `840c309ec` での再照合は§14。過去のfile:lineは各ラウンド時点の記録。本ラウンドは文書のみ。製品コード・保存データを変更しない。
+作成: 2026-10-08 / 改訂: 2026-10-09（r5の決定仕様・設計合意に基づく実装接続の記録）/ ラインE。
+状態: **Q1〜Q11は決定済み（§10.1）。設計・構造判定への合意を受領し実装中。実装差分の独立レビュー・自動gate・実機確認は未完了（§15）**。
+コード照合基準: 初版 `6078f6595`、r2 `2d327da31`、r3 `ab99c0a6b`（レビュー対象文書 `d648a5d54`）、r4 `511694cd7`。v4.5.0出荷後の `840c309ec` での再照合は§14。実装の受入設計基準は `ebc6ce987`。過去のfile:lineと文書のみの作業範囲は各ラウンド時点の記録として残し、現在の実装状況は§15へ集約する。
 
 ## 1. 要求と境界
 
@@ -563,6 +563,7 @@ draw / hit / capture / PDF要求を同じ値へ接続する。detached症状guar
 窓の誤同定やviewport再生成で直す案ではない。host identity / placement reducer / generation /
 focus / captureのowner、既存reserve計算を変更しない。
 
+以下の承認未記録という記述はr5の設計改訂時点の履歴。受領済みの設計・構造合意と現在の実装状況は§15に記録する。
 viewport / detached経路へ触れる実装前に、**ClaudeCodeと独立reviewerがこの構造判定へ合意する**。
 本案がレビュー済みだとは記録しない。合意後、実装時にdetached §11へ実際の変更範囲だけを記録する。
 記録案は§1.342、shared fit resolver / transform、ui_fullscreenの各consumer・capture・PDF要求、
@@ -775,3 +776,72 @@ r4基準からの`ui_fullscreen.rs`差分はseek stripのNoArt扱い、`pdf_load
 独立設計レビュー承認・構造判定への合意は、通知されていないため記録しない。
 実装はレビュー合意後に着手し、detached §11は実際に触った境界を記録する。
 今回は文書・参照先・EOLだけを検証し、製品コード・保存データ・snapshotは変更しない。
+
+## 15. 実装接続と検証結果（2026-10-09）
+
+利用者の実装指示と独立設計レビュー・構造判定への合意を受領し、`ebc6ce987` の設計を基準に
+実装へ移った。§11〜§14の「承認未記録」「文書のみ」は各改訂時点の履歴として保存する。
+今回の実装差分の独立レビュー、自動gate、確認用build、実機確認は別の検証であり、
+設計承認から完了したとは推定しない。下記は未コミット差分の自動検証結果であり、
+実装差分の独立レビュー・実機確認は未実施。製品はエージェントが起動していない。
+
+### 接続する所有境界
+
+| 境界 | 実装接続・現時点の記録 |
+| --- | --- |
+| 設定 / 入力 / UI | `SpecifiedScale` とstable IDを既存5方式循環へ追加。各軸は `SpecifiedScaleAxis::{PercentTenths, LogicalPixels}`、初期は両軸80％。prefsとlive fit popupは同じ2行helperを使い、既存KeyAction / cycle setterへ接続する。動画・音楽のguardと旧MarginFit互換は保持する |
+| 共通fit / geometry | `fullscreen_specified_scale.rs` の `FullscreenFitInput` がLegacy、指定値＋A/O basis、単ページZの制限なしCanonicalPageを区別する。共通resolverが任意軸、gap、limits、5倍上限を解き、単ページ・合成unitへ渡す。`DisplayedImageGeometry::layout_full_image_rect` はcanonical fit枠を保持し、実際のrasterは `from_layout_rect` で内接する。paint / hit / UVはsampling矩形を共有する |
+| AI前来歴 | 既存edit / final AI / final compositeのsource metadataを同じsource keyへ対応付け、AI前canvasを参照する。RAW・連結・passthroughのsource原寸と、通常の単ページ・見開きで選択された非AI rasterの原寸を既存consumerに合わせる。AI結果の初着、拡大率の割戻し、AI派生textureのGPU clamp後寸法をOの保存先にしない |
+| PDF metadata / retained | `StaticPdf` のpage box / content typeを既存completion検証の後で採用し、既存retained PDF source keyにmetadata snapshotを伴わせる。Vector4096、Raster native capの固定Oを解き、source座標用raster寸法と分離する。再レンダ結果をA/Oへ戻さない |
+| PDF需要 | context-local `PdfRerenderDemand` が既存Legacyのidx / zoom比較とAbsoluteのsource付きページtarget比較を所有する。通常・相方・manual・Zの新方式需要は安定したfull-page fit枠から導出し、既存headroom / capを一度だけ適用する。同じ需要でjobを再送・取消しない。旧4方式の要求判定と見開きZの既知制限は維持する |
+| 連結 / context | `ContinuousSpecifiedFitReference` に選択時unitとbasisを保持し、scrollで基準を移さない。resize / DPIは同じ基準へ再計算する。連結のAは既存source layout基準へ固定し、AI入力の画素丸めで置換しない。PDF需要比較と基準は既存ViewerContextBundleのmount / deposit / swapと共に移送する。環境設定・live picker・flow既定方式の明示的な方式変更時は既存registryのmounted / parked / retiring ownerで基準だけを終端し、途中の描画がなくても旧選択unitを再使用しない。同じ方式の再設定では基準を保持し、別contextのworkerを取消さない |
+| capture / frozen | typed fit descriptor、指定値、A/O、倍率制限、canonical fit枠をcapture / replayへ接続する。新方式の捕捉済みpolicyを現在のSettingsやAI / PDF出力寸法から後読みしない。既存4方式のholdover動作は維持する。凍結passive / holdoverはlive siblingへPDF需要を発行しない |
+| favorite / 転送 | 既存overlay、行先投影、capture / reconcile / 離脱 / 終了workerへ指定値を加える。欠落継承と明示両Noneを区別し、captureの比較で継承解決だけの差を除外する。明示live編集だけが専用値を作る。prefs / import / exportは共通値へrouteし専用行を変更しない |
+
+上表は実装の接続範囲を示す。自動検証の結果と、未実施の実機確認・独立実装レビューを下記に分けて記録する。
+既存4方式、単ページ / 見開きZの違い、§5.1の回転＋trim例外、Remoteのfit非転送は維持する。
+detachedへ実際に触れた境界は [detached計画 §11](detached-rework-plan.md#11-リワーク外からの変更記録) に記録した。
+viewport predicates、host identity / HWND取得、生成 / recreate、placement / focus / native lifecycleは変更しない。
+
+### 検証の記録
+
+共通resolver / geometryに任意軸・default・logical point・4通りのlimits・5倍境界・gap・
+PDF固定原寸・AI差替え・raster丸め・rotation / trim・singleton・Zの回帰を追加した。
+実draw / handler、PDF要求→completion採用→次frame、連結基準、context移送、capture、
+favorite欠落JSON→入場→idle→離脱 / 終了→共通値変更後の再入場まで検証した。
+
+| コマンド（未コミット差分、通常feature） | 結果 / ログ（`target/`） |
+| --- | --- |
+| `cargo fmt --check` | exit 0。`E-1342-fmt.log`。最終CRLF整形後にも再確認済み |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険glyph 0。`E-1342-glyph.log` |
+| `cargo test -p mimageviewer --lib <filter>` | `specified` 63、`fit_cycle` 4、`fit_mode_menu` 1、`settings_transfer` 20、`displayed_image_transform` 43、`continuous_reading` 21、既存snapshot remap 1の計153件（重複あり）、全exit 0。`E-1342-final-focused-*.log` |
+| `cargo test -p mimageviewer --lib` | **11,470成功 / 52 ignore / 0失敗、exit 0**（1247.97秒）。pipeなし、`E-1342-full-lib.log` |
+| `cargo test -p mimageviewer --test ui_snapshot -- --test-threads=1` | **143成功、exit 0**。`E-1342-ui-snapshot.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0。`E-1342-normal-check.log` |
+| 同上 `--features portable` | exit 0。`E-1342-portable-check.log` |
+| `cargo test -p viewer_context_audit` / `cargo run -p viewer_context_audit` | 36成功 / 実監査成功、両exit 0。`E-1342-context-audit-tests.log` / `E-1342-context-audit.log` |
+| `.\scripts\build-dev.ps1 -PreserveRuntime` | **exit 0**、通常featureのcore / remote service / EPUB PDF workerを `target/dev-runtime/` へ配置。`E-1342-build-dev.log` |
+| `cargo test -p mimageviewer --lib video::dsp::` | vendor依存復元後に影響範囲を再検証し、30成功 / exit 0。`E-1342-restored-host-dsp.log` |
+
+snapshotは30枚追加・2枚更新の全32枚を目視した。指定2行・5方式・mixed / None / 限界値、
+共通 / favorite、ライト / ダーク、通常 / 狭幅でwidget欠け・説明重なりがないことを確認。
+既存notice snapshotの変更は新しい設定節によるscrollbar thumbの26画素だけで、本文は維持する。
+複数Harnessのsnapshot結果は一つへ集約し、比較失敗を捨てない。
+
+有効redは狭幅220ptのunit selector到達と、旧方式のsnapshot remapを確認した。
+前者はunit widgetの実測幅をwrap ownerへ先に渡すことで修正し、後者はsource失効で
+新方式のAbsolute需要だけを終端し、Legacyのremap済みidx / zoom比較を保持することで修正した。
+テスト期待値の緩和や既存PNGの一括更新で通していない。redは `E-1342-focused-red2.log` /
+`E-1342-snapshot-remap-red.log`、初回lib結果は `E-1342-full-lib-red.log` に保存した。
+
+初回buildはこのworktreeの既存vendor hostのsource identity不一致でexit 101になった。
+SDK未配置のため、CLAUDE.md記載の正規vendorバックアップの現ソース一致hostとCRT4本を
+このworktreeへ実ファイルで復元した。source identity / CRT正本一致を既存gateで検証してから
+再buildし、成功した。C++ソース・SDK・gateは変更せず、APPDATAや他worktreeからhostを輸入しない。
+復元前の全lib結果を保持し、依存変更で影響するDSP回帰30件を復元後に再実行した。
+復元記録は `E-1342-vendor-restore.log`、初回buildログは `E-1342-build-dev-red.log`。
+host PE SHA256は `6ddac733f87b255fe87ae24c55c392af43bcd30bfc07e170b628d2e398ef5890`、sizeは846,936 bytes。
+
+確認用buildはportable featureを使わず、通常の `%APPDATA%\mimageviewer` を使う。
+稼働中だった別worktreeのruntimeを停止せず、製品runtimeは起動しなかった。
+実機手順は `target/E-1342-hardware-check.md`。独立実装レビュー・実機確認・commitは未実施。
