@@ -4241,6 +4241,8 @@ pub struct Settings {
     #[serde(default)]
     pub grid_open_selected_item_on_click: bool,
     #[serde(default)]
+    pub grid_background_double_click_parent: bool,
+    #[serde(default)]
     pub grid_cursor_wrap: bool,
     #[serde(default)]
     pub details_sort_key: DetailsSortKey,
@@ -7357,6 +7359,7 @@ impl Default for Settings {
             grid_view_mode: GridViewMode::default(),
             grid_click_selection_mode: GridClickSelectionMode::default(),
             grid_open_selected_item_on_click: false,
+            grid_background_double_click_parent: false,
             grid_cursor_wrap: false,
             details_sort_key: DetailsSortKey::default(),
             details_page_count_sort_stash: false,
@@ -9932,7 +9935,8 @@ impl Settings {
         self.grid_click_selection_mode = self.grid_click_selection_mode.normalized();
         self.video_thumbnail_indicator = self.video_thumbnail_indicator.normalized();
         self.audio_thumbnail_indicator = self.audio_thumbnail_indicator.normalized();
-        // grid_open_selected_item_on_click / grid_cursor_wrap は bool のため不正値を持たない。
+        // grid_open_selected_item_on_click / grid_background_double_click_parent /
+        // grid_cursor_wrap は bool のため不正値を持たない。
         // 旧設定の欠落は serde default で false に補い、sanitize では読み込んだ ON/OFF を
         // そのまま維持する。
         self.selection_info_display_mode = self.selection_info_display_mode.normalized();
@@ -12041,6 +12045,29 @@ mod tests {
             loaded.grid_click_selection_mode,
             GridClickSelectionMode::Check
         );
+    }
+
+    #[test]
+    fn grid_background_double_click_settings_default_and_roundtrip() {
+        assert!(!Settings::default().grid_background_double_click_parent);
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!missing.grid_background_double_click_parent);
+        // The enum was never released. Its old field is ignored, with no migration.
+        let old: Settings = serde_json::from_value(serde_json::json!({
+            "grid_background_double_click_action": "parent_folder"
+        }))
+        .unwrap();
+        assert!(!old.grid_background_double_click_parent);
+        for enabled in [false, true] {
+            let mut settings: Settings = serde_json::from_value(serde_json::json!({
+                "grid_background_double_click_parent": enabled
+            }))
+            .unwrap();
+            settings.sanitize();
+            let roundtrip: Settings =
+                serde_json::from_value(serde_json::to_value(&settings).unwrap()).unwrap();
+            assert_eq!(roundtrip.grid_background_double_click_parent, enabled);
+        }
     }
 
     #[test]

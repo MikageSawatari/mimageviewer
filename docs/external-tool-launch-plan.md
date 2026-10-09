@@ -660,7 +660,9 @@ materializer worker が source を再デコードして共通合成する。
 | `Association` | **全件を 1 つの `IDataObject` に載せて 1 回 `Invoke`**。`shell_data_object_for_paths` が既に複数パスを取る ([file_drag.rs](../src/file_drag.rs)) |
 | `OsDefault` | **`Each` と同じ**。「既定のアプリ」へ N 件まとめて渡す API が無い。`Each` の上限と確認をそのまま適用し、設定 UI にその旨を出す (P2b-2) |
 
-- 順序はクリック / 現在項目を先頭にし、以降は一覧の表示順 (ZipPla と同じ配慮)。
+- **順序は一覧の表示順** (利用者決定 2026-10-09)。チェック済みのクリック / 現在項目を先頭へ移さない。
+  `Batch` の `{files}` 引数 / `{file_list}` の行順と `Each` の起動要求順を共通にする。
+  スタック内はページ順、見開きの「両ページ」は読み順を維持する。
   **表示順の持ち主は `App::current_grid_order()`** ([app.rs](../src/app.rs))。詳細表示では列ソートが
   効くので `items` の索引順とは一致しない。**索引順で並べ直さない** (2026-08-31 追記)。
   なお外向き D&D (`decide_drag_payload`) は今も索引順で安定化している。今回は挙動が壊れて

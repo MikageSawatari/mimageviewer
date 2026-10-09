@@ -1686,11 +1686,10 @@ fn run_multiwindow_rar_tree_nav(
             pending_nav: None,
             pending_direct_nav: None,
             allow_direct_read: false,
-            fallback_cached_zip: None,
             completion:
                 crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
             pending_sibling_output: None,
-            nav_history_rollback: None,
+
             auto_fullscreen: false,
             deferred_fullscreen: None,
             suppress_confirm: false,

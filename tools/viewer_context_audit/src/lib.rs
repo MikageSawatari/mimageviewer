@@ -108,9 +108,9 @@ const ALLOWLIST_ENTRIES: &[AllowlistEntry] = &[
     },
     AllowlistEntry {
         file: "src/app.rs",
-        function: "start_loading_items_inner",
+        function: "install_loading_items_inner",
         rule: Rule::A2b,
-        reason: "Consumes same-named fields from prepared loader metadata/results into the mounted projection; the mem::take receivers are metadata/prepared payloads, not App, so this installs a completed load rather than extracting or transferring an existing viewer context.",
+        reason: "The 1.339 success-adoption split moved these operations from start_loading_items_inner into install_loading_items_inner. Consumes same-named fields from prepared loader metadata/results into the mounted projection; the mem::take receivers are metadata/prepared payloads, not App, so this installs a completed load rather than extracting or transferring an existing viewer context.",
     },
     AllowlistEntry {
         file: "src/app.rs",
@@ -139,6 +139,14 @@ const ALLOWLIST_ENTRIES: &[AllowlistEntry] = &[
 // implemented. A6 is therefore deliberately defined against the implementation that exists:
 // cfg(test)-gated App methods/functions ending in _for_test, plus their call sites.
 const PUBLIC_API_ALLOWLIST: &[&str] = &[
+    // 1.350 cache deletion invalidates shared source owners without mounting parked contexts.
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn invalidate_converted_archive_sources_in_parked_contexts (& mut self)",
+    // 1.347 explicit cache maintenance resets only terminal audio art in living owners.
+    "inherent fn    App ::  pub (crate) fn invalidate_audio_art_terminals_after_catalog_maintenance (& mut self , parent : Option < & Path > ,) -> usize",
+    // 1.337 reads the owning presentation to suppress automatic EffeTune in fullscreen.
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn presentation (self) -> ViewerPresentation",
+    // RAW context-owned demand/park inventory and read-only mounted/at-rest view (3e57109e4).
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn raw_pages (self) -> & 'a RawPageStore",
     "item struct pub (crate) struct ViewerContextId () ;",
     "inherent fn    ViewerContextId ::  pub (in crate :: app) fn serial (self) -> u64",
     "inherent fn    ViewerContextId :: # [cfg (not (windows))] pub (in crate :: app) const fn single_context () -> Self",
@@ -199,9 +207,10 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn viewer_context_ids (& self) -> Vec < ViewerContextId >",
     "inherent fn # [cfg (not (windows))]   App ::  pub (in crate :: app) fn viewer_context_ids (& self) -> Vec < ViewerContextId >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn other_viewer_context_ids (& self) -> Vec < ViewerContextId >",
-    "item enum # [cfg (windows)] pub (in crate :: app) enum ContextAsyncOwner { PathClassification , HistoryTransition , CollectionGrid , CollectionNavigation , RatingNavigation , BookmarkOpen , FolderNavigation , FolderPaneScan , PdfEnumeration , ZipEnumeration , EpubConversion , PdfPassword , FullscreenDecode , FinalAi , LocalAdjustment , ComicBake , EraseInpaint , SimilarPreview , }",
+    // RAW adds RawPages and its ordered ALL entry; keep the exact 19-owner inventory.
+    "item enum # [cfg (windows)] pub (in crate :: app) enum ContextAsyncOwner { PathClassification , HistoryTransition , CollectionGrid , CollectionNavigation , RatingNavigation , BookmarkOpen , FolderNavigation , FolderPaneScan , PdfEnumeration , ZipEnumeration , EpubConversion , PdfPassword , FullscreenDecode , RawPages , FinalAi , LocalAdjustment , ComicBake , EraseInpaint , SimilarPreview , }",
     "item enum # [cfg (windows)] pub (in crate :: app) enum ContextAsyncServicePhase { Background , Dialog , }",
-    "inherent const # [cfg (windows)]   ContextAsyncOwner :: pub (in crate :: app) const ALL : [Self ; 18] = [Self :: EpubConversion , Self :: PdfPassword , Self :: PathClassification , Self :: HistoryTransition , Self :: CollectionGrid , Self :: CollectionNavigation , Self :: RatingNavigation , Self :: BookmarkOpen , Self :: FolderNavigation , Self :: FolderPaneScan , Self :: PdfEnumeration , Self :: ZipEnumeration , Self :: FullscreenDecode , Self :: FinalAi , Self :: LocalAdjustment , Self :: ComicBake , Self :: EraseInpaint , Self :: SimilarPreview ,] ;",
+    "inherent const # [cfg (windows)]   ContextAsyncOwner :: pub (in crate :: app) const ALL : [Self ; 19] = [Self :: EpubConversion , Self :: PdfPassword , Self :: PathClassification , Self :: HistoryTransition , Self :: CollectionGrid , Self :: CollectionNavigation , Self :: RatingNavigation , Self :: BookmarkOpen , Self :: FolderNavigation , Self :: FolderPaneScan , Self :: PdfEnumeration , Self :: ZipEnumeration , Self :: FullscreenDecode , Self :: RawPages , Self :: FinalAi , Self :: LocalAdjustment , Self :: ComicBake , Self :: EraseInpaint , Self :: SimilarPreview ,] ;",
     "inherent fn # [cfg (windows)]   ContextAsyncOwner ::  pub (in crate :: app) fn is_pending (self , context : ContextRef < '_ >) -> bool",
     "inherent fn # [cfg (windows)]   ContextAsyncOwner ::  pub (in crate :: app) fn needs_mounted_service (self , context : ContextRef < '_ >) -> bool",
     "inherent fn # [cfg (windows)]   ContextAsyncOwner ::  pub (in crate :: app) fn service (self , app : & mut App , ctx : & egui :: Context , phase : ContextAsyncServicePhase ,)",

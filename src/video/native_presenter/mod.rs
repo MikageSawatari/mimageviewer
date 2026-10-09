@@ -3,6 +3,7 @@
 //! Window ownership lives in `native_window_host`; this module exposes only the
 //! GPU/DComp render core and value-type overlay commands/state.
 
+mod bottom_hud;
 pub(crate) mod overlay_draw;
 mod overlay_gpu;
 mod render_core;

@@ -13,6 +13,36 @@ use eframe::egui;
 
 use crate::grid_item::GridItem;
 
+/// Partition a modal input shield around the exact controls drawn in this frame.
+/// No persistent hit-area state; both renderers pass their HUD drawing rectangles.
+pub(crate) fn modal_shield_rects(full: egui::Rect, allowed: &[egui::Rect]) -> Vec<egui::Rect> {
+    let mut parts = vec![full];
+    for hole in allowed {
+        parts = parts
+            .into_iter()
+            .flat_map(|part| {
+                let cut = part.intersect(*hole);
+                if !cut.is_positive() {
+                    return vec![part];
+                }
+                [
+                    egui::Rect::from_min_max(part.min, egui::pos2(part.right(), cut.top())),
+                    egui::Rect::from_min_max(egui::pos2(part.left(), cut.bottom()), part.max),
+                    egui::Rect::from_min_max(egui::pos2(part.left(), cut.top()), cut.left_bottom()),
+                    egui::Rect::from_min_max(
+                        cut.right_top(),
+                        egui::pos2(part.right(), cut.bottom()),
+                    ),
+                ]
+                .into_iter()
+                .filter(egui::Rect::is_positive)
+                .collect()
+            })
+            .collect();
+    }
+    parts
+}
+
 /// The actual drawing destination, never a saved preference or requested placement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ViewerChromeSurface {
@@ -1398,7 +1428,7 @@ pub fn draw_play_icon(painter: &egui::Painter, center: egui::Pos2, radius: f32) 
 /// 絵文字グリフ (🎵 / 🎶 等) は環境依存フォントで tofu 化しうる (CLAUDE.md「UI 文字列の
 /// Unicode グリフ選定ルール」)。動画セルの再生アイコン (`draw_play_icon`) と同様に
 /// painter プリミティブで描いてフォント依存を避ける。
-pub fn draw_music_icon(painter: &egui::Painter, inner: egui::Rect, dark: bool) {
+pub fn draw_music_icon(painter: &egui::Painter, inner: egui::Rect, dark: bool) -> egui::Rect {
     let side = inner.width().min(inner.height());
     let s = (side * 0.34).clamp(22.0, 64.0);
     let center = inner.center() - egui::vec2(0.0, side * 0.05);
@@ -1417,31 +1447,38 @@ pub fn draw_music_icon(painter: &egui::Painter, inner: egui::Rect, dark: bool) {
     let right_stem_x = right_head.x + head_r * 0.9;
     let stem_top_y = left_head.y - stem_h;
     // 符幹 (符頭の右端から上へ)
-    painter.line_segment(
-        [
-            egui::pos2(left_stem_x, left_head.y),
-            egui::pos2(left_stem_x, stem_top_y),
-        ],
-        egui::Stroke::new(stem_w, color),
-    );
-    painter.line_segment(
-        [
-            egui::pos2(right_stem_x, right_head.y),
-            egui::pos2(right_stem_x, stem_top_y),
-        ],
-        egui::Stroke::new(stem_w, color),
-    );
-    // 連桁 (2 本の符幹の上端をつなぐ太線)
-    painter.line_segment(
-        [
-            egui::pos2(left_stem_x - stem_w * 0.5, stem_top_y),
-            egui::pos2(right_stem_x + stem_w * 0.5, stem_top_y),
-        ],
-        egui::Stroke::new(stem_w * 1.9, color),
-    );
-    // 符頭
-    painter.circle_filled(left_head, head_r, color);
-    painter.circle_filled(right_head, head_r, color);
+    let shapes = [
+        egui::Shape::line_segment(
+            [
+                egui::pos2(left_stem_x, left_head.y),
+                egui::pos2(left_stem_x, stem_top_y),
+            ],
+            egui::Stroke::new(stem_w, color),
+        ),
+        egui::Shape::line_segment(
+            [
+                egui::pos2(right_stem_x, right_head.y),
+                egui::pos2(right_stem_x, stem_top_y),
+            ],
+            egui::Stroke::new(stem_w, color),
+        ),
+        // 連桁 (2 本の符幹の上端をつなぐ太線)
+        egui::Shape::line_segment(
+            [
+                egui::pos2(left_stem_x - stem_w * 0.5, stem_top_y),
+                egui::pos2(right_stem_x + stem_w * 0.5, stem_top_y),
+            ],
+            egui::Stroke::new(stem_w * 1.9, color),
+        ),
+        // 符頭
+        egui::Shape::circle_filled(left_head, head_r, color),
+        egui::Shape::circle_filled(right_head, head_r, color),
+    ];
+    let bounds = shapes.iter().fold(egui::Rect::NOTHING, |bounds, shape| {
+        bounds.union(shape.visual_bounding_rect())
+    });
+    painter.extend(shapes);
+    bounds
 }
 
 /// フルスクリーン右パネル共通の ★ レーティング行を描く (画像 / 動画 / 音声で共有)。

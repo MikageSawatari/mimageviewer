@@ -44,6 +44,7 @@
 | [collection-spec-proposal.md](collection-spec-proposal.md) | §1.118 名前付きコレクションの初期仕様案と、その後の利用者判断の記録。現在の操作仕様はマニュアル、実装状態は実装計画 §23 を参照 |
 | [collection-implementation-plan.md](collection-implementation-plan.md) | コレクションの保存・管理UI・一覧・再生・Remoteを触るとき。actorと各画面の所有境界、出荷前修正の実装・検収台帳 |
 | [folder-history-location-plan.md](folder-history-location-plan.md) | **Stage B 実装・自動 gate 完了**。§1.280 / §1.281 / §1.282 の Rating・Collection子の表示位置とフォルダ履歴、A/B・detached の所有境界、Rating 一覧ソート保存の設計・検証台帳。実アプリ smoke は未実行 |
+| [file-type-visibility-plan.md](file-type-visibility-plan.md) | **仕様確定・未実装（利用者決定2026-10-08）**。§1.345の全体ファイル種類設定、全一覧producer・代表画像・本判定・Remoteの共通ポリシーと確定仕様。§1.339の履歴再入場facet退避の独立した根治設計。bf509352dの独立レビュー承認を記録 |
 | [startup-restore-target-plan.md](startup-restore-target-plan.md) | §1.335「前回終了した場所」の明示一覧所有、物理／本／Drive の復元範囲、旧データの初回移行、ZIP 内階層、一覧復帰要求の受理境界と回帰検証。実機確認は未実施 |
 | [collection-rereview-fixes-20260921.md](collection-rereview-fixes-20260921.md) | v4.0.0再レビューの追加修正。指摘の妥当性、直列の実装範囲、バックアップ・復旧・待機要求の設計合意と検証記録 |
 | [collection-migration-journal-recovery.md](collection-migration-journal-recovery.md) | M-2/M-1 の復旧記録保護。読込失敗時の物理変更の事前停止、旧記録保持、再読込・終了と名前変更 scope の所有境界 |
@@ -78,7 +79,7 @@
 | [fullscreen-folder-sidecar-transition-investigation-20260913.md](fullscreen-folder-sidecar-transition-investigation-20260913.md) | §1.233 サイドカー復元の非同期待機と画像フォルダ移動の表示保持。v3.9.0退行のログ・所有境界・修正検証 |
 | [fullscreen-navigation-consistency.md](fullscreen-navigation-consistency.md) | フルスクリーン / 検索結果 / 動画タイルをまたぐ Ctrl+↑↓・境界ヒント・前後移動の統一仕様メモ |
 | [keymap-spec.md](keymap-spec.md) + [key-customization-impl-plan.md](key-customization-impl-plan.md) + [key-command-catalog-plan.md](key-command-catalog-plan.md) | キーボード操作 / ショートカット / `consume_key` / `key_pressed` / native VK 判定 / コマンドカタログ化を触るとき。新しいキー操作は keymap 対応要否を必ず確認 |
-| [grid-background-double-click-plan.md](grid-background-double-click-plan.md) | §1.298 の設計レビュー用ノート。余白ダブルクリックの割り当て、セルと背景のクリック対所有、バー／dialog／touch、選択解除と一覧種類。利用者への質問付き、未実装 |
+| [grid-background-double-click-plan.md](grid-background-double-click-plan.md) | §1.298 の決定仕様と実装記録。既定OFFの余白double-click、描画領域に一致するletterbox／label／badge、クリック対の単一所有、バー／dialog／touch、選択解除と一覧種類。2026-10-08追加決定を記録、未回答質問なし |
 | [touch-support-plan.md](touch-support-plan.md) | **仕様確定 / Phase 2 + Step 3d まで実装済み**。タブレット PC のタッチ操作対応。静止画 / 本フルスクリーンは左右タップのページ送り、中央タップの上下クロームと左右パネルハンドル、2 本指ズーム / パン、中央タップを学習するまでの初回オーバーレイヘルプを配線済み。サムネイル一覧は行スナップを維持した 1 本指スクロール、進行方向への release 確定、2 本指ピンチによる列数変更を配線済み。選択済みセルの再タップ open は利用者判断で見送り。動画 / 音楽のタッチ操作は Phase 3。3 領域タップ + 中央クローム + anchor-fraction スクロール + ピンチの設計とフェーズ別工数。タッチ / ポインタ入力を触るときに読む |
 
 ## 仕様・機能
@@ -89,12 +90,13 @@
 | [music-video-export-plan.md](music-video-export-plan.md) | **実装中**。音楽ビデオの共有シーンモデル、CPU ラスタライザ、MP4 書き出し、共有編集 UI、プロジェクト JSON と音付きプレビューの正本 |
 | [music-video-handoff-20260907.md](music-video-handoff-20260907.md) | **2026-09-07 引き継ぎ監査**。コードと過去報告の照合、保存・Undo の未解決事項、検証範囲、P4 前の設計課題、Astra / Sol への担当移行 |
 | [brief-musicvideo-edit-integrity.md](brief-musicvideo-edit-integrity.md) | **実装・独立レビュー完了、実機未確認**。保存要求・素材と Undo・歌詞の行編集・選択状態の所有境界、受入条件、設計判断と検証記録 |
-| [settings-export-import-plan.md](settings-export-import-plan.md) | **§1.317 実装済み (レビュー前)**。環境設定の持ち運び、全447フィールドの分類 (135対象 / 312除外、§1.347更新)、形式 v1、draft → 既存 OK、単一転送 job、利用者承認と検証計画。既存 OK の §1.305 / §1.295 は今回未修正 |
+| [settings-export-import-plan.md](settings-export-import-plan.md) | **§1.317 実装済み (レビュー前)**。環境設定の持ち運び、全452フィールドの分類 (139対象 / 313除外、§1.298とmasterの結合後)、形式 v1、draft → 既存 OK、単一転送 job、利用者承認と検証計画。既存 OK の §1.305 / §1.295 は今回未修正 |
 | [comic-integration-plan.md](comic-integration-plan.md) | comic DB、注釈 overlay、編集・書き出しパイプラインの統合契約 |
 | [conceal-feature-plan.md](conceal-feature-plan.md) | 隠蔽加工の形状、保存、合成、キャッシュ無効化の現行仕様 |
 | [panorama-360-view-plan.md](panorama-360-view-plan.md) | **コード実装済み・実素材／実機性能の手動確認は記録上未確認**。360° パノラマ表示、GPano crop、mipmap、settle refinement、fullscreen 合成の現行仕様と設計経緯 |
 | [fullscreen-side-panel-mode-plan.md](fullscreen-side-panel-mode-plan.md) | **実装済み・手動実機確認は記録上未確認**。静止画・動画・音楽で共通のサイドパネル表示モード仕様 |
 | [fullscreen-locked-chrome-suppression-plan.md](fullscreen-locked-chrome-suppression-plan.md) | §1.344 の決定仕様と実装記録。F11 の正確な表示先から導く実効ロック、native 動画・F12・描画/予約/hit の共通契約。2026-10-08に利用者判断・構造合意済み |
+| [fullscreen-specified-scale-plan.md](fullscreen-specified-scale-plan.md) | §1.342 の設計案（利用者判断・独立設計レビュー待ち）。既存fit cycleへ指定サイズを追加、％/物理px・表示単位・保存/転送・Q1〜Q10 |
 | [edit-content-identity-plan.md](edit-content-identity-plan.md) | **Phase 1 実装済み・実機確認済み (A1〜A6)**。OS 側でファイルを移動・コピーしたときに、内容ハッシュで編集内容 (補正 / 消しゴム / モザイク / 注釈 / トリミング / ★ / タグ) を再結合して復元する機能。size → 先頭 64KB → 全体の 3 段照合、`rename_key_migration::STORES` 駆動の batch copy、変換アーカイブの 4 面キー、モーダル確認ウィンドウ |
 | [next-release-backlog.md](next-release-backlog.md) | **次リリース検討バックログ**。いま着手できる未対応の P2/P3、ユーザー要望、依存ライブラリ更新、リリース手順の未解決点だけを恒久管理。完了した項目はこのファイルから削除する |
 | [book-resume-meter-plan.md](book-resume-meter-plan.md) | 本・動画・音声のサムネイルの前回位置。記録時のHUD位置/総数と既存再生位置/長さ、常に左→右、writer移行・全行map、下端帯、Remote NULL、通常削除競合の合意済み割り切り |

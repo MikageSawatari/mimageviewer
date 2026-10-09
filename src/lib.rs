@@ -42,6 +42,7 @@ pub use ui_dialogs::preferences::draw_book_resume_meter_settings_snapshot_fixtur
 pub use ui_dialogs::preferences::draw_file_organize_destinations_settings_snapshot_fixture;
 #[doc(hidden)]
 pub use ui_dialogs::preferences::draw_fullscreen_fit_cycle_settings_snapshot_fixture;
+pub use ui_dialogs::preferences::draw_grid_background_double_click_settings_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_preferences_transfer_explanation_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_preferences_transfer_settings_snapshot_fixture;
 pub use ui_dialogs::settings_restore::draw_preferences_transfer_disabled_entry_snapshot_fixture;
@@ -329,8 +330,9 @@ pub mod ui_startup;
 #[doc(hidden)]
 pub use ui_fullscreen::{
     draw_fs_page_wait_indicator_snapshot_fixture, draw_fs_prefetch_indicator_snapshot_fixture,
-    draw_music_panel_reach_snapshot_fixture, draw_still_panel_reach_snapshot_fixture,
-    draw_still_seek_strip_snapshot_fixture, draw_still_touch_first_run_help_snapshot_fixture,
+    draw_music_locked_panel_snapshot_fixture, draw_music_panel_reach_snapshot_fixture,
+    draw_still_panel_reach_snapshot_fixture, draw_still_seek_strip_snapshot_fixture,
+    draw_still_touch_first_run_help_snapshot_fixture,
 };
 mod ui_details_icon;
 pub mod ui_helpers;

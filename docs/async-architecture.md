@@ -20,11 +20,166 @@ spawn/disconnectはUnavailable通知と既存Similar終端処理へ渡し、同�
 初期フォルダの同期loaderはPhase Bまで現状維持。詳しくは
 [startup-diagnostics-plan.md](startup-diagnostics-plan.md) §10を参照。
 
-### 音声画像の worker 境界 (§1.347、2026-10-08)
+## 主一覧の移動採用と採用後の復元（§1.339）
+
+`MainListNavigation` がtyped宛先、帰路、要求別source proofと履歴操作を既存の
+classification / Physical / Rating / Collection / Smartの要求owner間で引き継ぐ。
+履歴entryは場所と`FacetRoute`だけを持ち、地点別filter値は保存しない。
+待機中の←←/←→は同じ`FolderHistoryPlan`の仮cursorを進め、確定stackは変更しない。
+toolbarの有効状態と宛先もこの仮cursorを投影する。採用・baseline検証は確定stackだけを参照する。
+取消・失敗・staleは未採用要求を破棄するだけで、移動のrollback snapshotを復元しない。
+独立したmain移動の受理時には、同じownerの旧分類・仮履歴・Rating要求等を退役させる。
+要求を取り消しても旧replyへ採用権限を戻さず、別windowの読取要求にはこの退役を及ぼさない。
+
+既存のsnapshot、catalog、source admission、EPUB leaseの検証を準備段階で完了し、
+`adopt_main_list_navigation`でfacet route、location/items、履歴を同じUI呼出し中に一回採用する。
+`FacetNavigationState`はAppのmain専用ownerで、context bundleには移さない。
+rebuild/paint、detachedのread-only mount/swapは退避条件を変更しない。
+active値は従来の`settings.facet_filter`で、設定・履歴DBのschema/keyは変えない。
+
+採用後に既存sidecar continuationを開始し、復元後にselection、startup intent、folder/ZIPの
+first-displayとdeferred fullscreenを仕上げる。sidecarのwarning/resumeでも履歴/facetを再採用しない。
+新items世代を検証するhydration ownerと、採用前のsource proofは目的が異なる。
+row依存要求は既存items世代・revision証明を維持し、Smartのsurface leaseは同じownerの
+PDF verification/Collection revision更新を許す。別context/path/同ID再openは許さない。
+ブックマークのresolver/書庫要求はnative request IDとreturn targetを証明に使い、同じ要求中の
+行再読込をitems世代だけで失効させない。要求を置換した旧取消は新requestに届かない。
+検索の「フォルダへ移動」、ペイン移動、通常open、履歴宛先は、コピー済み入力だけで
+採用するSurface要求として同query／同folderの行更新を許す。拡張子・入口名・移動先種類では証明を選ばない。
+元のindex・行・準備snapshotを再参照する要求はRowとし、Rating／Collectionのnative row validatorを維持する。
+分類→準備→採用は元の証明をmoveし、fullscreen scanも準備済みPhysical ownerへ引き継ぐ。
+すべての証明は既存の`quick_folder_switch_sequence`を共通switch epochとして照合する。
+Quick Folder再選択／同target A→B→A、検索entry・query切替・drill入力でepochを進め、
+そのmain ownerの未採用要求を既存取消終端へ渡す。同じ検索の結果追加・PDF verification・Collection revision
+更新ではepochを進めない。履歴／paneの独立要求は既存の共通退役入口を使い、連続Replayは元planを保持する。
+Bookmarkはnative request ID/return targetも維持し、detachedのrequest/window leaseをmain退役の対象にしない。
+SmartGridの分類はrow要求で、items世代と要求時pathの一致を検証してからrowのkindを読む。
+Collectionの採用拒否・native取消完了も既存の要求終端を通し、所有するfullscreen lock/holdoverを解除する。
+Collectionの自動再生・本をまたぐページ継続はRestoreとして同じ採用境界へ渡し、
+外側の履歴cursorを進めない。payloadと元要求の準備後にだけroot/physical表示を交換する。
+既存のinput gate・holdoverとwarm PDFの即時placeholder表示は維持する。
+詳細と回帰一覧は[file-type-visibility-plan.md §9](file-type-visibility-plan.md#9-1339--履歴再入場のfacet退避を採用境界へ集約する)。
+
+### source proof選択箇所の監査（2026-10-08）
+
+**単一規則**: 後続の分類continuation／準備／採用が読む入力で決める。コピー済み宛先・effects・typed
+restoreだけならSurface、現在の行/indexまたはsourceから取得したprepare snapshotを読むならRow。
+Surfaceもswitch epochを省略しない。Bookmarkはコピー済み入力のnative request ID/targetを証明し、
+同じ共通epochを照合する。native row/entry/revision証明は共通headerと別に厳密に検証する。
+新しいpending・epoch field・rollbackを追加せず、既存sequenceとcancel/drop/終端ownerを再利用する。
+分類のenum matchは排他的で、入口を追加するときにもこの依存規則を適用する。
+
+以下は全`capture_main_list_navigation`と証明helperの製品呼出しを照合した一覧。
+`#[cfg(test)]`のCollection prepared adapter／Smart fixture／sidecar fixtureは製品producerに数えない。
+
+| 選択箇所／consumer | 証明と採用時に読む入力 |
+| --- | --- |
+| `app.rs::start_open_path_classification_owned` | Direct / DirectNavigation / DirectScanは下のowner helper。BookmarkRowはSurface（boxed rowを保持）。Physicalは下のintent helper、CollectionはSurface。SmartGrid / DetachedGridはRow（元indexからkind／pathを読む） |
+| `app.rs::copied_open_source_proof` → `capture_physical_open_navigation`、`open_direct_navigation_target_classified`、PDF fallback | Navigation / QuickFolderSwitchとnative row ownerのないMainGridArchiveはSurface（path/effects）。Bookmarkはnative request ID。RatingPhysicalのRestoreはSurface（コピー済みchain／宛先）、Explicit／RefreshはRow＋native validator。CollectionGridPhysicalとSmart・Rating・Collection owner付きMainGridArchiveはRow＋native validator。DetachedGridArchiveの既存Row fallbackはmain採用producerではなく、実読込はwindow leaseのcontextで行う。suffixで分岐しない |
+| `app.rs::dispatch_main_folder_history_input` | Surface（typed宛先・cursor plan）。宛先が通常Path／Rating／Collection／Smartでも同じ規則。連続Replayは元証明をmoveし、committed stack baselineも検証 |
+| `app.rs::apply_collection_input_nav`、`collection_grid.rs::open_collection_grid_from_navigation` | Surface（コピー済みrestore/IDと新しいdestination shell）。帰路の記録自体はrow依存ではない |
+| `app.rs::dispatch_synthetic_folder_history_target`、`adopt_synthetic_surface` | Surface（typed restore・準備済みdestination）。物理Pathのdispatchは元要求を渡し、再captureしない |
+| `app.rs::start_collection_history_transition`、`start_rating_navigation` | Surface（copied target/root restore/starsとworker結果）。Collection destinationのsnapshot/revision検証は別に維持。Rating行からのphysical openとは区別する |
+| `app.rs::physical_navigation_source_proof` → `start_physical_history_transition_with_dfs`／Physical分類adapter | Navigation / RequiredFullscreen / QuickFolder / CollectionNavigationはSurface（宛先とflags）。Ratingは上のintent別owner helper（RestoreはSurface、Explicit／RefreshはRow）、CollectionGridはRow＋native owner。MainGridArchiveは上のowner helper、Bookmarkはnative request。DFSはcount/mode/holdoverだけを保持し、source indexを読まない |
+| `app.rs::restore_view_return_origin` | Surface（copied origin/route）。source indexを参照しない |
+| `app.rs::offer_zip_foreign_archive_conversion` | Surface（copied ZIP pathとprepared replacement）。変換modalと元要求を保持 |
+| `app.rs::zip_nav_show_current_level` | Row（現在のZIP tree/prefixから一覧をmaterialize）。非同期openのprepared ZIPとは区別する |
+| `app.rs::open_bookmark_browser_row_classified` | Surface（コピー済みbrowser row）。resolver受付時にnative Bookmark requestへ移し、同じrequest ID/target/epochを保持 |
+| `app.rs::copied_destination_source_proof` → context Jumpの同期／scan adapter | Surface（copied path・exact selection）。Collection由来のnative row/anchor validatorは別に維持 |
+| `app.rs::start_folder_open_scan_with_restore` → pane / RequiredFullscreen / Jump | Surface（copied path・purpose・exact leaf）。RequiredFullscreenのscan完了は元navigationを準備済みPhysical ownerへmoveし、source teardownより前に検証・採用を準備 |
+| 同scanのGridFolderCandidate／CurrentViewOrderRefresh | native Collection owner付きcandidateとorder refreshはRow（現row/revision／order snapshot）。通常candidateはSurface（copied path、scan結果でkind決定）。DetachedFolder / DetachedImageは共通main要求を作らずnative window leaseで処理 |
+| `smart_folder.rs::capture_smart_list_navigation`、`begin_smart_physical_navigation_with_navigation`、`begin_smart_history_navigation` | Surface（copied destination/root payloadと安定したowner lease）。同owner PDF verification/Collection revisionは許可。SmartGridの分類で渡されたRowは置換しない |
+| `collection_navigation.rs::enqueue_collection_navigation` | 共通headerはSurface（copied destination）、native requestはrow/entry ID/revision/anchorを厳密に照合。共通headerだけでnative検証を緩めない |
+| Snapshot cache-only分類／採用 | Snapshot row証明（既存snapshot generation + key/kind/target）。viewerの画像metadata世代ではなく、採用時に読むsnapshot自身を検証する。元RARはtyped source、ZIPは既存ArchivePreflightingのbackingとし、成功採用まで同じ証明を保持 |
+| `global_search_ui.rs::capture_search_view_adoption` | Row（search viewのprepare snapshotとsurvivor等）。**prepare要求の送信前**にcaptureし、非同期準備から採用まで保持。結果からのcopied-path openとは別owner |
+| `subfolder_expansion.rs::capture_subfolder_expansion_adoption` | 初回／root-only scanはSurface（copied roots・除去path）。現snapshotの再install/除去/reused metadata・snapshot付きrestoreはRow（現items/cache由来のprepare snapshot）。scan→prepare→installは元証明をmove |
+| `startup_ops.rs::start_startup_open_path_resolution_owned_with_navigation` | Bookmark（native resolver request ID/target）。alias・page待ちでも同要求をmoveし、取消はexact IDで行う。通常startupはnative startup ownerで共通main要求を新規captureしない |
+| copied detached archive／Bookmark読込 | main資格のないwindow contextへ渡し、native window lease＋request ID（そのwindowの切替epoch相当）を検証。common main headerを新規captureしない。コピー前に元indexを読むDetachedGrid分類は上のRow。main switch sequenceを別windowへpublishしない |
+
+Surface取得不能時の既存Row fallbackは保持する（main以外にはmain採用資格がない）。
+表にあるRow＋native validatorでは、共通のitems世代を外すこともnative revision/index検証を外すこともしない。
+
+| 所有権の切替境界 | 退役／保持の規則 |
+| --- | --- |
+| `activate_quick_folder_slot`／`clear_quick_folder_slots` | `Current`分岐・「場所を忘れる」操作も含め先にepoch更新＋共通退役。A→B→Aや同slot再選択で旧replyを復活させない。未採用main Bookmark resolver/Resolvingはexact IDで終了。現在のreaderのAwaitingPage hydration/帰路とdetached leaseは保持 |
+| pane／context Jump／RequiredFullscreen scanの受理 | 共通退役で旧分類・Physical/Rating/Smart/Collection・subfolderを終了し、受理したPane ownerだけ保持。main Bookmark resolverの既存exact取消も行う。scan完了で証明を再取得しない |
+| 新規history／open／Rating／Collection／Smartの受理 | 既存の共通退役で受理phaseだけ保持。phase handoffは元navigationをmove。Replay逆入力で仮cursorが原点へ戻れば未採用要求を終了し、stackは不変 |
+| 同期synthetic／Collection shellの入口、subfolder scan/prepare | 同じ共通退役へ接続。subfolder handoffはSubfolder ownerを保持し、未採用scan/install/confirmだけを取消。現表示のsnapshotは捨てない |
+| `take_origin_for_search_entry`、query変更／明示reset、global drill/back | epoch更新＋main共通退役。Smartの帰路は先に次ownerへ移譲。Favorite/Tagは異なるquery（Tagはkindも）で切替。globalはquery resetを明示切替とする |
+| 同queryの検索結果refresh／PDF verification／Collection revision／sidecar hydration | switchではない。検索worker/prepare wishは既存の世代で置換し、copied-destination要求のepochを更新しない。Row要求はsnapshotが変われば失効。committed warm verifierとsidecar採用後hydrationは既存ownerで仕上げる |
+| main以外のwindow、Bookmark native phase | main退役を別contextへpublishしない。Bookmark resolver→分類→Physicalの同request IDはnative claim/終端で保持・置換し、main switchでdetached requestを取消さない |
+
+
+### native validatorのrestore依存監査（2026-10-08）
+
+共通証明とnative証明を両方、同じ「採用が何を読むか」で判定する。コピー済みRestoreでもnativeに
+source items世代やsource地点のrevision／viewport hintまで一致させればSurfaceと矛盾する。
+Restoreのsource意味identityは元の共通Surface証明が検証し、nativeにsource表示snapshotを重ねない。
+committed PDFのpoll保留は出荷済みの状態削減策であり、
+証明とは別のスケジューリング契約として維持する（coordinator決定、3729208d7 / 4640930d2）。
+
+| native owner／validator | 行世代条件とrestoreの扱い |
+| --- | --- |
+| `rating_physical_load_owner_is_current` | Explicitとsource行順snapshotにも使うRefreshはsource items世代を照合。Restoreはコピー済みchain／宛先とload結果を使用する。BSもRestoreで、共通Direct履歴記録は維持。context／surface／slot／sequence／target pathは引き続き照合。source地点全体の一致はExplicit／Refreshだけに要求し、Restoreの意味identityは元の共通Surface証明に委ねる（Collection revision／viewport hintをsource所有証明に使わない） |
+| `quick_folder_switch_owner_is_current` | コピー済みtarget slot/pathだけで行を読まないためsource items世代条件とそのfieldを除く。他のowner／sequence／path条件は維持。現行Quick採用は直接installでこのpredicateを通らないが、native claim契約も同じ規則に揃える |
+| `collection_history_source_is_current`／`prepare_collection_history_child_session` | typed Collection／CollectionPhysical履歴は共通Surfaceと宛先catalog／revision／prepared snapshotを検証。source行世代の追加条件なし |
+| `collection_grid_physical_load_owner_is_current` | Rootは現entryの明示activationなのでitems／entry／revisionを厳密検証。PhysicalSourceはposition／path／revisionでitems条件なし。typed履歴はこのsource-row ownerを生成しない |
+| `collection_navigation_request_is_current`／manual continuation | indexed fullscreen／mediaとprepared entriesをindexで読むmanual continuationは行世代を維持。OuterGridはrefreshを許しselected stable identityを再検証。typed restoreと混同しない |
+| `main_grid_archive_transition_is_current` | Smart／Rating／Collection native ownerに委譲。通常のcopied archiveには追加行世代条件なし。RatingGrid ownerはExplicitの現行行activation |
+| `smart_folder_transition_request_is_current` | 元navigation／request ID／pathを照合。typed Smart restoreに独立した行世代条件なし。SmartGrid分類は元indexを読むのでRowを維持 |
+| `bookmark_open_owner_is_current`／startup | request ID／target／window leaseを照合。restoreへsource行世代を追加しない |
+| `detached_grid_archive_open_owner_is_current`／completion | request sequenceとpreparing window leaseを照合。copy後にsource行世代を追加しない。copy前のDetachedGrid分類はindex依存 |
+| subfolder adoption | 元共通証明をmove。copied root scanはSurface、現snapshot／reused metadataを読むrestoreはRow。別native行世代条件を重ねない |
+
+## 音声画像の worker 境界 (§1.347、2026-10-08)
 
 Local は既存 heavy queue、Remote は既存 heavy worker から同じ bounded Rust PIC/APIC reader を使う。FFmpeg input / 再生 decoder / ActivityGate は抽出経路に入れない。全 Audio 抽出・decode は本体と Remote の共通 `GlobalIoSemaphore` の permit 内で行う。共有 owner は indexer profile の 1 / 2 / 4 上限変更と throttle を保持し、上限縮小時にも既存 holder を取り消さない。
 
 sidecar 出所は既存一覧準備 worker の共通 discovery で返す。履歴は entries と source map を一つの準備結果として、context / items generation / navigation sequence が合う場合だけ採用する。合成一覧の明示 refresh も既存の世代所有 worker で出所を再取得する。追加 catalog I/O・schema・prune は worker 限定、削除は admission / lease の境界で Local と Remote を同時に退役させる。一般媒体のdetails / batch / smart / EPUB / Remoteの遅延catalog openも受付時の証明を保持し、削除完了後の新epochへ乗り換えない。SourceOnly Remoteページはcatalogを必須にしない。Remote AIのsource callbackと共有PDF検証も同じ受付証明を必須引数で保持する。ZIP内RAWのCacheOnlyだけは通常RAWと同じ既存cancelでDeleting終了を待ち、一回の既存DB読取専用lookupを許す (元のwrite証明は更新しない)。[所有契約・全Remote入口監査](audio-album-art-plan.md#21-921f1e457-再レビュー-remoteの受付証明とcacheonly継続-2026-10-08)。
+
+
+## master統合時の採用境界（§1.339 / §1.347、2026-10-09）
+
+両側の採用契約を照合し、状態を減らして統合する。通常フォルダのprepared payloadは
+sidecarのVecと完全な音声inventoryを保持し、prepare中にmap変更やprune enqueueを行わない。
+成功installで全keyを正規化する。`AudioArtPrune`は完全inventoryと受付時のcatalog admissionを
+既存sidecar continuationに保持し、hydration後に起動した新items世代のworker queueへ送る。
+continuationの退役で未送信pruneも破棄し、旧queueや兄弟contextへ送らない。
+Ratingのsidecarも、受付証明を通過したinstallで設定する。
+
+ReadingHistoryは空のloading shellを準備・token検証し、直接移動とReplayの全入口で
+`adopt_main_list_navigation`を一度だけ通す。採用後にコピー済みhistory entriesを既存の
+source discovery Pendingへ渡す。完了callbackは既存`install_new_items`とidx失効で同じsurfaceを
+hydrateし、正規化sidecar、rows、rating、tags、videoの既存setupを適用する。
+surface generation、context、history、facet、検索入力・optionsと無関係なpending navigationは保持する。
+適用中または待機中のCtrl+Fは、空shellのindices／worker結果を採用し続けず、送信済みspec
+（query / target / OR mode）を新rowsに対して再実行する。specは既存`SearchPending`と完了した
+typed filter payloadが所有し、入力欄のdraftから復元しない。検索入力・optionsを上書きせず、
+未実行の入力だけでは検索を開始しない。追加のownerやpending flagは設けない。
+一覧navigationの完全なinstallerは再実行しない。上の2026-10-08記録にある履歴entriesとsource mapの
+採用は、この採用済みshellへのhydrationを指す。
+
+shellの既存native generation / context / switch sequence証明をhydrationにも保持し、
+遅延・置換済み結果を捨てる。新しいnavigation owner、rollback、pending mapは作らない。
+worker spawn / disconnectのまれな失敗は、採用済みの空shellでlog・通知し、rollbackしない。
+
+### P2追補：非同期一覧結果の公開所有（2026-10-09）
+
+外部レビュー`8037fe3dc`のP2に対し、利用者が了承した根因修正の実装契約を記録する。
+Global SearchのReady結果は、サムネイル、source map、件数、ratingを含むすべての副作用を
+採用が成立したclosure内で適用する。準備結果や拒否された結果から一覧mapへpublishしない。
+
+ブックマーク一覧構築の既存`bookmark_browser_pending`をowned worker wrapperとし、
+main contextの安定したSurface leaseとswitch sequenceを一緒に保持する。
+mainの成功したitems置換とQuick Folder切替で退役し、遅延結果はmap公開前に拒否する。
+表示中のBookmarkを残すA/B記憶クリアでは、旧epochを退役してから同じ既存refreshを
+新epoch／slotで再開始し、loading shellの行取得を完了させる。
+同じBookmark一覧のsortはownerを維持・再束縛し、detached contextのmountでmain要求を取消さない。
+本を開くBookmark resolverのnative request所有とは区別する。
+
+状態削減として、遅い一覧処理のmodal化も検討した。通常の一覧閲覧・移動を待たせる必要はなく、
+既存Pendingと採用closureに要求の証明・送信済みspecを持たせて所有を閉じる。
+新しいnavigation request、rollback、別pending mapを追加せず、既存の非同期操作を維持する。
 
 
 ## 1. ワーカー一覧
@@ -142,7 +297,7 @@ session 取消で通知・未開始仕事を失効させ、最後の fetch / sav
 | VST3 plugin GUI worker | bridge 内 per-slot STA thread (lazy) | editor を生成した slot ごと。表示した plugin 数まで増え得る | C++ bridge の plugin loader が slot ごとに STA message thread を lazy 生成し、bridge-owned editor surface と `IPlugView::attached()` を管理する。Rust 側に単一 `vst3-plugin-gui` thread はない |
 | 動画音声 RT 出力 | `cpal::Stream` 内部スレッド | 動画 1 つにつき 1 本 | WASAPI Shared モード。コールバックで ring buffer から f32 stereo を pop し、**実消費サンプル数 (= `real_consumed`) 分のみ** `next_pts_secs` を進めて `AvClock::set_audio_pts` でマスタークロックを更新。silence 出力中 (= `real_consumed=0`) は pts 進行 skip。`!clock.is_playing()` (= 一時停止 / EOF) と `pump_seek_serial < clock_serial` (= pre-seek サンプル全消去) は早期 return。`AvClock::set_audio_pts` 側に defensive wall-rate cap (= `wall_dt + 5ms` で pts 進行を頭打ち) を保持し、buffer 非空 pre-fill burst の異常前進への保険にしている (Phase 9 後の cleanup refactor、詳細は [docs/video-engine-redesign.md](video-engine-redesign.md) の「Phase 9 後の Post-cleanup refactor」節) |
 | 起動 / activation パス解決 | `std::thread` (`startup-open-resolve`) | 起動引数 / 2 重起動 activation ごとに最大 1 本 | `resolve_openable_path_detailed` (`Path::is_dir` / `is_file` + 親探索) を UI スレッド外で実行する。400ms 以上未完了ならメインウィンドウに「パスを確認しています…」toast を出し、完了後だけ UI スレッドで既存の `load_folder_or_convert_archive...` に戻す。新しい activation または Remote 取得時には旧 pending を終了し、古い結果は適用しない。Remote が操作権を持つ間の二重起動パスはログ・toast とともに拒否して返却後へ持ち越さない |
-| RAR / 7z / LZH / ZIP スキャン・変換 | `std::thread` (scan / convert ごとの使い捨て) + mpsc | `ArchiveConvertState` 1 件 | 直接 RAR 判定、画像 inventory、パスワード再試行、キャッシュ ZIP 変換を行う。`ArchiveConvertState.cancel` は事前 scan から変換完了までの単一 owner で、RAR / 7z / LZH / ZIP の各 entry 境界が同じ token を確認する。`OpenRequestOwner::Navigation` はarchive種別判定より前にvisible-open lifecycleを取得し、archive Aのscan中にarchive Bを開く場合もAのtokenとreceiverを終了してからBのstateを作る。state drop、Esc / cancel、activation、競合する通常 navigation、後続 bookmark、Remote 取得も同じ規約で古いworkerとlate resultを無効化する。Remote 取得では閲覧を開く completion だけを終了し、閲覧を開かない sibling ZIP の出力は続ける。ブックマーク起点では`completion`がrequest IDとtarget identityも保持し、直接RARまたは元アーカイブ→キャッシュZIPのmount後に同じownerでページ待機へ進める。確認・パスワード・変換中は通常の45秒resolve timeoutを適用せず、完了はownerが現在値と一致する場合だけ表示へ適用する |
+| RAR / 7z / LZH / ZIP スキャン・変換 | `std::thread` (scan / convert ごとの使い捨て) + mpsc | `ArchiveConvertState` 1 件 | 直接 RAR 判定、画像 inventory、パスワード再試行、キャッシュ ZIP 変換を行う。閲覧RARのscanはsecretなしのheaderが後続巻と示したら`Rejected`で先頭ファイルを案内する。許可された先頭巻／単巻は`ArchiveScanOutcome::Direct` / `CachedZip` / `NeedsConversion`のどれか一つを返し、password後の0画像・入れ子なしも案内付き`Rejected`とする。UI側のclicked-volume cache lookup／`fallback_cached_zip`は持たず、Directに確定したRAR backingを履歴のZip-kind prepareでcacheへ再振替しない。`ArchiveConvertState.cancel` は事前 scan から変換完了までの単一 owner で、RAR / 7z / LZH / ZIP の各 entry 境界が同じ token を確認する。`OpenRequestOwner::Navigation` はarchive種別判定より前にvisible-open lifecycleを取得し、archive Aのscan中にarchive Bを開く場合もAのtokenとreceiverを終了してからBのstateを作る。state drop、Esc / cancel、activation、競合する通常 navigation、後続 bookmark、Remote 取得も同じ規約で古いworkerとlate resultを無効化する。Remote 取得では閲覧を開く completion だけを終了し、閲覧を開かない sibling ZIP の出力は続ける。ブックマーク起点では`completion`がrequest IDとtarget identityも保持し、直接RARまたは元アーカイブ→キャッシュZIPのmount後に同じownerでページ待機へ進める。確認・パスワード・変換中は通常の45秒resolve timeoutを適用せず、完了はownerが現在値と一致する場合だけ表示へ適用する |
 | EPUB → PDF 変換 (S2a、呼出元は S2b) | 背景 worker + 子プロセス + Job Object + mpsc | 変換 1 冊につき子プロセス 1 本 | `epub_convert` が書き込み排除した元ファイルから一時コピーを作る。子を suspended で生成し `KILL_ON_JOB_CLOSE` の Job に割り当ててから再開する。stdout の JSON 進捗は channel へ、stderr は別スレッドでログへ流す。cancel event または timeout で Job を停止し、一時フォルダと `.part` を回収する。公開前の PDF 検証器は必須注入で、S2b 接続時に PDFium を使う。成功時の世代ファイルは不変で、廃止分と未完了予約だけを `epub_cache` の次回起動ゲートで掃除し、完了予約行を削除する。ファイル削除は root と各親ディレクトリを再解析ポイントを辿らずに開いて確認した後、対象ハンドルから行う |
 | フォルダ一覧の変換アーカイブ読み取り元判定 | `std::thread` (`archive-cache-peek`) + mpsc | viewer context / items generation ごとに最大 1 | 全候補を UI 側で `Pending` 登録するが、worker へは visible + keep + その item の pin 依存先だけを渡す。RAR は volume header 解決 → cache DB peek → miss 時だけ full inspection の順。候補ごとに `Direct` / `CachedZip` / `Unavailable` を逐次送信し、UI は通知ごとに `items_generation` を照合する。range 移動時は共有 scope を差し替え、既に開始済みの 1 冊だけを完了可として旧 range の queued 候補を skip する。現 batch 終了後に新 range の未解決候補を追加する。folder 切替・再読込・drop は cancel token を立てる。rollup edit filter 時だけ folder 全体 scope。batch 完了時は `nav/archive_cache_peek`、各候補は `nav/archive_cache_candidate` を記録する |
 | フォルダナビゲーション | `std::thread` | 1 (常時 ≤ 1 本) | 深さ優先で次フォルダを検索。連打は `pending_folder_nav_steps` に累積され、完了ごとに連鎖実行する (並行 DFS による FS 競合を避ける) |
@@ -317,6 +472,23 @@ ZIP 自動/pin 代表を `process_load_request` の `RawThumbHandoff::DedicatedW
 
 #### 2.3.1 変換アーカイブ判定 batch の range 追従
 
+RAR開封の共通scan workerは、secretなしのnative headerが後続巻と示した場合にscan・cache照会・
+Direct採用・変換前にRejectedを返し、UIの既存Error phaseで最初のファイル名を案内する（§1.355、2026-10-09決定）。
+passwordでvolume番号を確認できない場合は名前から推測せず、password後の0画像・入れ子なしのscan結果を
+先頭ファイルを案内する通知・logにする。part1／単巻はDirect → DBの実CachedZip → 変換を維持する。
+後続巻を先頭巻へ変更して開く／cacheを再利用する879802c44の閲覧経路は撤去する。
+新しいpending・rollback・retryは設けず、モーダルscan／convert ownerのcancelと古い完了破棄を維持する。
+保存失敗loggerの操作・src／tmp／dst・native code、平易な通知は維持する。
+一覧thumbnail／pin sourceの先頭巻解決と失効は変更せず、メーターはsource ownerのtyped header証明で
+header確認済み後続巻だけを隠す。cache-only入口も拒否の例外にはしない。
+RarVolumeProof（First／Subsequent { first }／UnknownEncrypted）を既存のsource／startup resolve／
+OpenPathClassification payloadで運び、Remote／DFSも同じworker-only probeを使う。
+別窓bookmarkはstartup resolve完了で採用前に拒否し、snapshotは既存分類ownerのSnapshot証明と
+snapshot世代／対象検証後にcache-only採用する。元RAR sourceとZIP backingを既存の
+PhysicalHistoryTransition / ArchivePreflightingへ渡し、成功採用でも同じ証明を検証する。
+一時的なsnapshot_internal_nav flagに非同期完了の許可を依存させない。UI callback／paintでheader I/Oをしない。
+[入口表](book-resume-meter-plan.md#入口と採用前の共通証明)を参照。
+
 `converted_archive_cache_paths` は items generation 開始時に全候補を `Pending` 登録するが、
 `ConvertedArchiveCachePathsPending` worker へ渡すのは現在の可視範囲 + thumbnail keep set と、
 その範囲内 item の folder-thumb pin 依存先だけである。range 変更は worker を cancel / respawn せず、
@@ -324,6 +496,27 @@ UI が共有 desired scope を差し替える。worker は pin root / archive �
 読み直すため、範囲外へ出た queued 候補は skip し、既に開始済みの in-flight 1 冊だけを完了させる。
 その結果は同 generation なら採用し、現 batch 終了後に新 range の `Pending` key だけを次 batch へ渡す。
 終端 key は再投入しない。
+
+2026-10-08の利用者決定により、CachedZipとキャッシュなしのUnavailableは論理sourceを
+同じtyped ownerに保持する（未確定ならNone）。メーターはload_pathの可用性ではなく、
+Direct / CachedZipの実path、またはsource確定済みUnavailableだけは現在のdata-dirと
+論理sourceから純粋計算した変換ZIP keyでBookResumeMetersを参照する。
+キャッシュ削除後も保存済みのバーを表示し、Pending／未確定／設定OFFでは非表示。
+分割RARの論理sourceはworkerのheader確認で確定し、描画中のI/Oやファイル名推測はしない。
+
+変換cache管理のDeletedSelected / DeletedMissing / DeletedAll完了は、読込元ownerへ
+変異通知を渡す。旧batchのreceiverを破棄/cancelし、CachedZipだけをPendingへ戻して
+既存range/admission経路で非同期再判定する。Direct / Unavailable、pin rootの来歴、
+保存済み読書位置mapは変更しない。削除結果は件数だけなので全CachedZipを再検証するが、
+source一覧や読込済み画像を一括resetしない。Rows / Errorは変異通知にしない。
+
+同じ変異通知をmounted ownerだけでなく、全AtRest / Retiring bundleと各Smart sessionの
+Visible / Offscreen親payloadにも届ける。parked contextをmountせず、各ownerの解決batchだけを
+cancel/破棄する。history/A-Bの地点record自体はmapを持たず、Smartの親payload復元か通常再列挙へ戻る。
+共有sort metadataや進行中prepareの古いmapは、prepared aggregateの採用/評価条件での行追加の境界でCachedZipを
+Pendingにして既存workerへ渡す。初回/再prepareでもキャッシュ解決を非同期に確かめるため、
+新しいepochや巨大metadataのclone、sort/読書sessionの中断を足さない。
+復帰・context swapというread-only操作を共有ストアの変異通知にしない。
 
 pin root の cascade 結果は `converted_archive_pin_root_states` に root 単位で保持する。root が batch
 候補になるのは、同 generation / 同 `folder_thumb_depth` で未走査か、記録済み archive key にまだ

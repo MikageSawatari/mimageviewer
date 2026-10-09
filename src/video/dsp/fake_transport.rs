@@ -1,4 +1,6 @@
 //! In-memory host boundary for delivery regressions. No child or native window is created.
+#![cfg(test)]
+
 use super::*;
 
 pub(crate) struct FakeHostEvents {

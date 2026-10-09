@@ -3362,6 +3362,177 @@ preroll suspension を復帰し、未補正でも再生不能にしない。
 `analyze_perf.py av_drift` で `norm_apply_begin → buffer_clear → underrun_begin/end →
 audio_pts_jump` の連鎖と、累積的に成長する負値 `A/V offset` として観測されていた。
 
+
+### §1.351 測定中の移動を既存HUDへ集約（2026-10-08）
+
+**利用者決定 Q1（2026-10-08）**: scan中だけ既存native HUDの配置優先順を変更し、
+操作不能の非移動コントロールより同じ↑↓を優先する。通常再生のcompactionは維持する。
+この測定専用の配置条件は、2026-10-09の複数トラック実機指摘に対する利用者指示で更新した。
+現在は通常 / 測定共通の単一配置ownerが↑↓と「音声 N」を残し、省略項目・位置は変えない。
+[現行の優先順・既存操作ownerの保持](#複数トラックと狭いnative動画hud2026-10-09)を参照。
+専用の表示bool、進捗パネル内の代替ボタン、別のnavigation ownerは追加しない。
+
+**利用者決定 Q2（2026-10-08）**: 音声専用VST shellの既存ナビ制限とEsc離脱は維持する。
+NavigateItemは既存allow-listで棄却、↑↓キーもMusicVstShell gateで拒否される。
+Escはscan取消より先にshellを離脱し、scanは継続する。×の取消は通る。
+動画の音声モードVST hostとは別の既存制限で、今回許可を広げない。
+
+通常native動画の狭幅HUDはscan中、操作不能の頭出し・再生・ループ・連続を省略し、
+同じHUDの↑↓を左端へ置く。640ptでも右の縮小クラスタと重ならない。
+通常再生は従来のFull / NoCapture / NoMarkers / NoFileNav / Minimalのまま。
+進捗パネルは取消×だけを持ち、前後移動の描画・click producerは既存HUDの共通描画へ一本化する。
+モーダルの入力遮断は、このフレームでHUDが描く↑↓の矩形だけを除外する。
+矩形を保持する専用状態は追加せず、描画側から値として渡す。
+
+scan自体はHUDを強制表示しない。通常の下端220pt hover・touch latch・実効bottom lockで呼び出す。
+§1.344のF11抑制はlock理由だけを外すのでhover / touchは残る。
+HUDが隠れている間は進捗パネルだけを表示し、代替ナビボタンは出さない。
+tile / navigation previewは従来どおり通常chromeを隠す。遷移中の表示・操作ownerは変更しない。
+
+通常動画の↑↓キーは既存VideoPrevFile / VideoNextFileのkeymap入口とscan gateから
+navigate_native_video_fullscreenへ通る。HUDも既存NavigateItemへ通る。
+egui音楽のHUD・↑↓キーはmusic_navigate_fileへ集約する。
+TextEdit / IME / bookmarkモーダルの既存guard、wheelナビ、取消× / Escの既存ownerは保持する。
+
+簡素化検討: scan中の全操作停止は利用者が選んだ移動継続を失うため採らない。
+既存HUDと移動ownerへ集約し、scan表示状態から配置を導出する。
+独立した表示状態・代替producer・新しいnavigation寿命は設けない。
+検証は実CPU overlayの描画・入力を通し、640ptでの矢印の可視性・単一command・
+他操作の遮断、隠れたHUDのedge / touch reveal、通常再生の省略、取消を固定する。
+音声側の実HUD入力と既存navigation owner・キーgate・VST shellの制限もhandler回帰で確認する。
+
+**利用者決定 Q3（2026-10-08、推奨案採用）**: scan中、下部HUDの描画矩形への
+native HUD Touch Startで既存touch latchをONにし、同じHUDを指を離した後も表示する。
+描画と同じseek_geometry.normal_bar_rectとnative_posの変換を使い、
+全面modal入力領域や220ptのhover帯全体をラッチ対象にはしない。
+modalの他の場所、scan外、tile / navigation previewの非表示chromeには適用しない。
+新規表示bool・代替ボタン・別navigation ownerは設けず、既存show_chromeを呼ぶ。
+以後の解除・source-swap等は既存touch latchの寿命に従い、scan終了用の保存・復元状態は作らない。
+
+原因確認: scan中は全面HUD入力領域からTouchがwidget passthroughへ入りToggleChromeを作らず、
+touch EndのPointerGoneでHUDが隠れていた。raw lockを変更せず、
+明示的なHUD touchを既存touch表示ownerへ接続してrelease frameの描画とclickを維持する。
+実CPU draw / native input / touch End / PointerGoneを通る失敗回帰を修正し、
+HUD外のtouchではラッチしないこと、F11抑制中のHUD↑↓と取消も検査する。
+
+検証（2026-10-08）: Q3の変更前red（終了101）と、640pt HUD矢印欠落の変更前redを確認済み。
+対象はHEAD `bde36de42` 上の§1.351未コミット差分。焦点は新規7件と既存key gate / navigationの5件が成功。
+`cargo test -p mimageviewer --lib` は10,972成功・52 ignored・失敗0（通常feature、終了0）。
+`cargo test -p mimageviewer --test ui_snapshot` は追加2枚を含む111件成功。
+`cargo fmt --check`、glyph lint（危険glyph 0）、通常 / portable core checkは終了0。
+ログは `target/E-1351-{focused,existing-key-gates,existing-navigation,full-lib,snapshot,check,portable-check,glyph}.log`。
+未決質問はない。製品起動・commitは行っておらず、実機確認は未実施。
+検証用build `scripts/build-dev.ps1 -PreserveRuntime` は終了0。
+通常featureのcore / remote / EPUB PDF workerを `target/dev-runtime/` に作成し、
+PE依存確認も成功（runtime=4 / pe=3）。native build競合の待機後、core buildは3分13秒で完了した。
+検証用バイナリは起動していない。
+
+実機確認は未測定の動画 / 音声を複数用意し、次を行う。
+
+1. 640pt程度の動画窓でscanを開始し、進捗パネルは取消×だけで、HUD↑↓と↑↓キーが移動できることを確認する。seek / 再生 / 音量は操作できない。
+2. F11でbottom lockとその抑制をONにし、ポインタを下端から離す。edge hoverでHUDを呼び出せること、下部HUDへのtouch後は指を離してもHUDが残り、その↑↓を押せることを確認する。
+3. 音楽ビューでもHUD↑↓のmouse / touchと↑↓キーが移動でき、他操作は遮断されることを確認する。通常ビューの× / Escはscan取消として働く。
+4. 音声専用VST shellでは↑↓が移動せず、Escは音楽ビューへ戻ってscanを継続することを確認する。取消は×を使う。
+5. scan完了 / 取消後は通常の狭幅compactionへ戻り、広幅の矢印位置も従来どおりであることを確認する。
+
+#### §1.351 実装レビュー追補: 狭い音楽HUDの入力所有
+
+独立実装レビューのP2をsource inspectionで確認。360ptの音楽HUDでは↑↓の矩形
+（x=162–190 / 198–226）を、後から登録する音量フェーダー（x=124–268）が覆っていた。
+modal中もshared volume / speed helperを入力可能なUIへ登録しており、変更intentを
+捨てるだけではarrow hitの所有が一致しなかった。F12には640ptの最小幅を追加しない。
+
+修正は既存scan ownerから導出する入力責務に限定する。非操作のvolume / speed UIを
+disabledとして登録し、通常と同じHUD↑↓のproducerをscan overlay描画後へ移す。
+その矢印矩形に背景を描いて重なる非操作部品を覆い、描画順・hit順を一致させる。
+HUD矢印・shieldの穴は同じmusic_file_navigation_rects、volumeは同じrect helperから導出する。
+既存music_navigate_file・widget IDを再利用し、矢印を二重登録しない。
+新規の表示bool・代替dialogボタン・navigation owner・window幅制限は追加しない。
+通常再生の配置、native動画のcompaction、音声専用VST shell制限とEscは維持する。
+
+実HUDのclick / touch回帰を360pt / 400pt（volume重なり）と548pt（speed重なり）で追加。
+ownerが一度だけ移動を受け、scanが保持され、volume / speedがdisabledかつ矢印が
+modalより後に描画され、穴の外のvolume dragは遮断されることを検査する。
+既存640pt・native / F11 touch・shell回帰は保持する。snapshotはAppを丸ごと構築せず、
+同じvolume helper・HUD矢印producer・progress描画を使い、360ptの重なりも固定する。
+追加の永続stateを作らず登録責務だけで競合を除去する簡素化を採用した。
+
+検証（2026-10-09）: 変更前は実HUDの360pt click / touchの2件が
+「music_navigate_fileへ到達せずinput_seqが増えない」で失敗（終了101）。
+修正後はnormalize_hud_navigationの9件（既存7件と新規2件）が成功（終了0）。
+snapshotは更新2件を確認し、新規360ptの1枚を含む112件すべて成功
+（`cargo test -p mimageviewer --test ui_snapshot -- --test-threads=1`、終了0）。
+通常の並列snapshot実行はSTATUS_ACCESS_VIOLATIONで途中終了したため成功扱いにせず、
+1 threadで全件を再実行した。更新した2枚は目視確認済み。
+fmt / glyph lint（危険glyph 0）、通常 / portable core checkはすべて終了0。
+`cargo test -p mimageviewer --lib` は10,974成功・52 ignored・失敗0（終了0、905.94秒）。
+`scripts/build-dev.ps1 -PreserveRuntime` は終了0。通常featureのcore / remote / EPUB PDF workerを
+`target/dev-runtime/`へ作成し、PE依存確認も成功（runtime=4 / pe=3、core buildは2分25秒）。
+本追補で製品起動・commitは行っていない。未決質問はなく、実機確認は未実施。
+ログは `target/E-1351-fix-{red,focused,full-lib,snapshot-update,snapshot,snapshot-serial,check,portable-check,fmt,glyph}.log`。
+build記録は `target/E-1351-fix-build-dev.log`。
+実機確認では音楽ビューをF12にし、幅360pt / 400pt程度で測定中の↑↓をclick / touchする。
+一度ずつ項目移動でき、音量・速度・seekは操作できず、× / Escで取消できることを確認する。
+
+#### §1.351 実機・再レビュー追補: 音楽HUDの配置と表示対象
+
+**2026-10-09利用者決定（§1.357 fix2）**: egui音楽の測定専用省略順は廃止し、通常再生と
+同じ項目・位置・共通row描画を使う。測定中は操作可否と矢印の強調だけを変更し、
+同じ矩形からshieldの穴を導出する。[現行契約と回帰](music-integration-plan.md#1357-通常再生も含む音楽下段hudの幅対応2026-10-09)。
+以下の初回追補は経緯の記録。native動画のQ1優先配置、VST shell制限、取消・navigation ownerは変更しない。
+
+利用者の2026-10-09実機画像で、測定中の音楽HUD↑↓が時間表示に重なることを確認。
+独立再レビューP3の、マウント中の別contextの測定により非操作ParkedLiveの矢印が消える
+経路も確認した。配置と表示対象の所有境界を修正する。仕様・省略順・簡素化の検討は
+[音楽HUDの追補](music-integration-plan.md#1351-測定中の移動を音楽hudへ集約2026-10-08)を正本とする。
+native動画、VST shellの既存制限、keymap、取消と既存navigation ownerは変更しない。
+
+修正前の実HUD回帰は640ptで時間galleyと矢印の交差により失敗（終了101）。
+ParkedLiveの実描画回帰も、同じidxの操作側scan開始後に矢印widgetが消えて失敗（終了101）。
+修正後の回帰ではcontext registryに窓Aを実際に登録し、非測定A / 測定Bの同じidxについて
+scan開始前・中・終了後を通す。実HUDのmouse / touch、時間・全controlの非交差、
+全幅の配置検査、同じrow rendererのsnapshotを追加・拡張する。
+
+実機手順: 同じ曲を音楽ビューで測定し、以前の約1000px窓とF12の360 / 400pt相当の窓で
+↑↓と時間が重ならず、↑↓をclick / touchすると一度だけ移動することを確認する。
+非操作の音量・速度・seekは動かず、× / Escで測定を取り消せることを確認する。
+非測定の音楽窓Aを残して窓Bで測定を開始し、Aの矢印表示が変わらないことも確認する。
+通常再生、1.352の全幅HUD、1.344のF11抑制とnative動画の既確認配置は保持する。
+検証（2026-10-09、HEAD `d648a5d54` 上の修正差分）:
+`--lib normalize_hud_navigation` は12件、`--lib music_full_width_hud` は9件成功
+（2つの焦点suiteには重複あり、終了0）。`cargo test -p mimageviewer --lib` は
+10,977成功・52 ignored・失敗0（終了0、1019.21秒）。
+`--test ui_snapshot -- --test-threads=1` は114件成功（終了0、114.23秒）。
+前回確認済みの並列AVを避けて今回は最初から1 threadを使用し、並列版の再試行はしていない。
+更新・追加した1000 / 640 / 400 / 360ptの4枚は目視確認済み。
+fmt / glyph lint（危険glyph 0）、通常 / portable core checkはすべて終了0。
+`scripts/build-dev.ps1 -PreserveRuntime` は終了0。通常featureのcore / remote / EPUB PDF workerを
+`target/dev-runtime/`へ作成し、PE依存確認も成功（runtime=4 / pe=3、core buildは3分26秒）。
+build記録は `target/E-1351-fix2-build-dev.log`。
+ログは `target/E-1351-fix2-{red-layout,red-context,focused,focused-music,full-lib,snapshot-update,snapshot,check,portable-check,fmt,glyph}.log`。
+製品起動・commitは行っていない。実機での修正後確認は利用者へ引き継ぐ。
+
+#### §1.351 再レビュー追補: 極小幅の矢印描画
+
+2026-10-09のP3を確認。音楽scan rowは矢印矩形を縮めるが、共通アイコンは幅12pt固定で
+描画clipが矩形に揃っていなかった。scan中だけ同じ入力矩形をPainterのclipへ渡し、
+背景・三角・軸線が隣のslotへはみ出さないようにした。
+[音楽HUDのclip契約](music-integration-plan.md#1351-測定中の移動を音楽hudへ集約2026-10-08)に記録。
+通常再生、配置・入力owner、native動画、detached述語 / viewport経路は変更しない。
+
+検証（HEAD `b6809decd` 上のfix3差分、2026-10-09）:
+実scan HUDの三角・軸線を検査する回帰は、修正前に1pt幅の出力clipが入力矩形を超えて失敗
+（終了101、`target/E-1351-fix3-red.log`）。修正後は1 / 2 / 5 / 10 / 16 / 24 / 40 / 80 / 2000ptで成功。
+`--lib normalize_hud_navigation` は13件成功。全libは10,978成功・52 ignored・失敗0
+（終了0、826.67秒）。`--test ui_snapshot -- --test-threads=1` は115件成功
+（終了0、86.71秒）。追加10pt画像は目視と描画ピクセルを確認し、矢印間に空きがある。
+既存の音楽HUD 4枚は変更なし。fmt / glyph lint（危険glyph 0）/ 通常・portable core checkは終了0。
+`scripts/build-dev.ps1 -PreserveRuntime` は終了0。通常featureのcore（1分56秒）・remote・
+EPUB PDF workerを作成し、PE確認も成功（runtime=4 / pe=3）。製品は起動していない。
+ログは `target/E-1351-fix3-{red,focused,full-lib,fmt,glyph,check,portable-check,snapshot-update,snapshot,build-dev}.log`。
+手動確認は音楽の測定中にF12窓を縮め、↑↓が互いにはみ出さずclick / touchで一度だけ移動すること、
+取消× / Escと通常再生のHUD表示・操作が維持されること。1.342文書は変更せず、commitは行っていない。
+
 ### P キー perf overlay 拡張
 
 フルスクリーン再生中に P キーで開く既存の perf overlay (`src/video/native_presenter/
@@ -3640,3 +3811,132 @@ codex exec --sandbox read-only -o /tmp/codex-video.txt \
 - NVIDIA が公式に「任意の D3D11 アプリで `SetStreamExtension` 経由 VSR を許可」と明文化
 - wgpu が DComp 統合を first-class support
 - mIV のメイン用途が動画 viewer に大きくシフト (= eframe マルチビューポート構造を捨てる正当性が出る)
+
+### 複数トラックと狭いnative動画HUD（2026-10-09）
+
+利用者がeef62147fの約820px窓で、3音声トラックの動画の時間とループ / 連続再生が
+重なり、「音声 N」も消えることを実機確認した。これは音楽ビューとは別のnative動画HUD。
+`v4.4.0`の`render_core.rs:12973`は時間132pt、速度43.4ptなどを固定予約し、
+`:13057`の段階的省略でも最小段階以下の追加省略をしない。`:13554`で右群を右端から
+独立配置するため、左群と正の面積で重なる。28ptボタンの通常動画で最小段階の必要幅は
+607.4pt（旧コメントの約571ptではない）。トラックは`:13078`でFull / NoCaptureだけに
+限定され、それ以下では`:13080`でメニューも閉じる（複数トラックの保持境界955.4pt）。
+HEAD修正前の同じ入口は`:13062` / `:13139` / `:13171` / `:13597`。
+1.344は実効固定・可視性、1.351 Q1は測定中の矢印優先、1.352 / 1.357はegui音楽HUDであり、
+この通常動画の退行原因ではない。画像のpxを論理ptと同一視しない。実際のDPIは未確認。
+
+**利用者決定（2026-10-09）**: 複数トラックの選び直しは窓を広げなくてもできること。
+ネイティブ動画・音楽とも再生 / 一時停止・↑↓・時間・ミュートに続いて「音声 N」を優先し、
+トラックボタンは省略しない。動画のストリップ切替・固定ボタンも既存HUDの入口として残す。
+通常 / 測定で項目選択と座標を変えず、測定は操作可否・矢印の強調だけを変える。
+測定中のトラック変更禁止、VST shell制限、× / Escの取消、navigation ownerは維持する。
+
+`native_presenter/bottom_hud.rs`のフレーム内`Metrics` / `Layout`を唯一の下段配置ownerとする。
+HUDの実フォントで時間・速度・Norm・dB・「音声 N」を測定し、全項目が収まる場合だけ
+従来座標を使う。それ以外は固定順でリミッター → dB → 速度 → Norm → 連続再生 → ループ →
+音量スライダー → フレーム送り / capture一組 → マーカー一組 → 頭出しを省略する。
+まだ足りなければ時間を現在位置に短縮、次に時間を省略、最後に基本操作の幅・隙間を縮める。
+残るボタンのアイコン・ラベルは割当矩形にclipする。幅の拡大では同じ計算により復帰する。
+`render_core.rs::draw_native_bottom_controls`が同じ配置結果から実部品を描画・登録し、
+↑↓の矩形は通常入力、測定shieldの穴、測定中の前面描画にもそのまま渡す。
+シーク行・HUD帯のnative入力領域とタッチlatchの既存ownerは変更しない。
+
+音声メニューは同じownerでボタン移動・縮小後もopenを維持する。source変更・選択・外側press・
+非表示cleanupの既存終端は保つ。省略された速度popupは既存stateを閉じ、capture holdは既存解除へ
+接続する。音量sliderのdrag中に省略されたときは、既存の最後の値を一度だけpersistし、
+後のreleaseを別操作へ転用しない。測定中に新しいvolume操作は生成しない。
+
+簡素化: 保存compaction段階、幅 / 測定専用bool、代替トラック入口、新しいcommand / navigation
+ownerは作らない。配置結果と既存操作ownerへの借用だけを使う。decoder、D3D11、表示先identity、
+detached述語・viewport経路・window / transition ownerには触れず、detached §11の追加対象はない。
+範囲は下段の配置・描画・既存入力producerへの接続であり、大規模なpresenter再設計は不要。
+
+回帰: 修正前の実CPU描画の543ptで時間交差、両HUDのトラック消失を確認し3件red（exit 101）。
+実フォントの1〜2000pt・長時間・3トラック・strip有無で正の面積の交差がないこと、省略順と
+縮小 / 復元の単調性、十分な幅の従来座標を検査する。実native CPU描画・native mouse / touchを
+使い1200 / 820 / 543 / 360 / 300 / 950ptでメニューを開き、300ptへresize後も3番目を一度だけ
+選択できることを検査する。820物理px・ppp=1.5の通常→測定では同じhit矩形と操作可否を確認する。
+実slider drag→省略→releaseの一度だけ確定、既存F11抑制・touch latch・測定shieldの回帰も維持する。
+snapshotは実共有row rendererを使い、3トラックの動画 / 音楽を543 / 360ptで追加する。
+既存native測定snapshotも実row rendererへ接続する。製品は起動しない。
+
+自動検証（2026-10-09）: 新規9件・既存音楽配置9件・測定入力13件、全lib 10,995件成功 /
+52件ignored、ui_snapshot 123件成功（直列、追加4枚と更新1枚を目視確認）。各testのexitは0。
+cargo fmt / fmt --check、glyph lint（危険glyph 0）、通常 / portable core checkも成功。
+`build-dev.ps1 -PreserveRuntime`は、このworktreeの起動中core（PID 95144）を検出してexit 1で
+停止した。プロセスを終了せず、今回の確認用バイナリは未生成。利用者が閉じた後に同じscriptを
+再実行する必要がある。独立レビュー・今回の修正の実機確認・製品起動・commitは行っていない。
+
+#### 複数トラックHUDのレビュー修正（2026-10-09）
+
+測定開始がフレーム送りの押下中に到着すると、disabled表示でも既存holdから100msごとの
+`FrameStep`が続いていた。`set_normalize_state`でScanningへ入る際に既存holdを終了し、
+実ボタンの入力producerも`Response::enabled()`を確認してdisabled時には新規・継続commandを
+発行しない。Appのcommand consumerやキー操作のownerは変更しない。実CPU HUDへのnative入力で
+通常押下 → Scanning → 押下継続 → viewport外releaseを両方向に検査する。
+
+文字計測はnative coreに属する`bottom_hud::TextCache`へまとめた。時間（全体 / 現在位置）、
+速度、音声番号、dB、Normのgalleyを値ごとに保持し、同じgalleyの実幅で配置し、そのまま描画する。
+時間の短縮・小さい高さへのfittingも同じ文字と割当サイズが続く間は再利用する。
+速度の計測フォントは描画と同じ12ptに揃える。共有速度popupの操作は維持し、音楽側の呼出しは
+従来の描画経路を使う。キャッシュはcoreとともに破棄され、保存設定・表示先identityは増やさない。
+
+フォントatlas / フォント定義 / DPIの変更で古いUVを使わないため、egui自身のgalley cacheの
+空jobを毎描画passで1回参照し、返るArcのidentityが変わったら文字cacheを破棄する。
+空jobはラベルStringを所有化しない。値が変わらないフレームではこの1回の参照、数値key比較、
+Arc参照の複製、矩形計算と既存の描画・入力登録が残る。追加した6ラベルの文字列整形と文字layout
+要求は行わない。既存tooltip、開いたpopup、シーク行などの処理まで無割当にしたとは主張しない。
+egui Areaの既存transformは描画meshを複製するため、この費用も残る。実HUDの連続frameで
+文字layout回数が増えず、描画まで同じLayoutJobのArc（所有文字列）を使うこと、resizeだけでは
+再計測せず、値の変更・DPI / フォント変更で必要な再計測を行うことを回帰で検査する。
+
+検証（2026-10-09、HEAD fc34e3040に対する未commit差分）: holdの実HUD回帰は修正前に
+1件red（exit 101、Scanning開始時のownerが残る）を確認し、修正後は追加3件を含む焦点12件、
+既存測定入力13件・音楽HUD9件が成功した。初回全libは10,997成功 / 1失敗 / 52 ignoredで、
+既存VST bridgeの`strict_open_handler_rejects_invalid_restore_without_loaded_event`が
+Loadedイベント待ち25秒のtimeoutになった。同ソースの単独再実行はfixtureを備えた状態で
+1件成功し、同じ全libコマンドの再実行は10,998成功 / 52 ignored（968.09秒、exit 0）。
+初回失敗の原因は断定せず、`target/E-tracks-fix-lib.log`と再実行の
+`target/E-tracks-fix-lib-recheck.log`を保持する。
+
+ui_snapshotは直列で123件成功し、既存PNGと一致した（更新不要）。cargo fmt / fmt --check、
+glyph lint（危険glyph 0）、通常 / portable core checkも成功。起動中のこのworktreeのdev coreは
+検出されず、`build-dev.ps1 -PreserveRuntime`はexit 0でcore・remote service・EPUB PDF workerを
+生成した。製品の起動・実機操作・commitは行っていない。今回のレビュー修正の実機確認は利用者へ
+引き継ぐ。検証ログのprefixは`target/E-tracks-fix-`、英語commit文は`target/E-tracks-fix-msg.txt`。
+
+#### release前に測定が終了する場合のhold再生成防止（2026-10-09）
+
+Scanningでholdを終了しても、eguiの`potential_click_id`はdisabled化だけでは消えない。
+release前に測定が取り消される / 完了すると、再有効化されたボタンの
+`is_pointer_button_down_on()`は古い押下に対してもtrueとなる。この値だけで新しいholdを
+作ることが原因だった。`draw_native_frame_step_button`のowner開始は、enabledなボタン上の
+**そのframeのprimary press**に限定する。既存の同方向holdはprimary downの間だけ継続し、
+viewport外releaseで終了する。Scanning開始時の終了・disabled時の新規 / 継続発行禁止、
+100ms反復、既存galley cacheはそのまま維持する。状態fieldやegui memoryのresetは追加しない。
+
+実CPU HUDを使い、前 / 次フレームの両方向で通常押下 → Scanning → release前の取消 / 完了
+snapshot採用 → primary downのまま通常HUD復帰 → 外側release → 新規押下 → hold反復を検査する。
+取消側はnative Esc入力も通し、Appが所有する取消の応答を既存setterで適用する。
+CPU fixtureがAppの取消handlerを実行したとは扱わない。Escの実ownerは
+`src/app/native_video.rs`の`NativeVideoFixedKeyAction::CancelNormalizeScan`で、変更しない。
+取消 / 完了とも、通常HUD復帰後の古い押下からFrameStepが出る修正前のredを確認する。
+
+同じHUDのpress-and-hold経路も確認した。down状態だけから反復ownerを作るのはnativeの
+フレーム送りだけで、音楽HUDに同型の反復holdはない。native / 音楽の音量は共有helperの
+`clicked()` / `dragged()` / `drag_stopped()`、音楽seekは`clicked()` / `dragged()`、
+native seek行 / seek stripのgesture開始は`drag_started()`を使う。これらのdrag寿命を
+今回の新規hold開始契約へ変更したり、Scanning後の全drag継続を新たに保証したりはしない。
+その他の再生・項目移動・loop・markerボタンはクリックによる単発操作であり、同型の
+timer hold再生成はない。描画・配置・HUDの表示先判定・キー反復ownerは変更しない。
+
+検証（2026-10-09、HEAD 5b3c509f1に対する未commit差分）: 修正前は取消 / 完了の2件が
+古い押下からFrameStepを再発行してred（exit 101）。修正後は焦点14件、既存測定入力13件、
+音楽HUD9件が成功し、全libは初回で11,000件成功 / 52 ignored（934.10秒、exit 0）。
+ui_snapshotは直列で123件成功し、既存PNGと一致した。cargo fmt / fmt --check、glyph lint
+（危険glyph 0）、通常 / portable core checkも成功。検証ログのprefixは
+`target/E-tracks-fix2-`、英語commit文は`target/E-tracks-fix2-msg.txt`。
+起動中のこのworktreeのcoreは検出されず、`build-dev.ps1 -PreserveRuntime`はexit 0で
+通常profileのcore・remote service・EPUB PDF workerを生成した。製品起動・実機操作・commitは
+行っていない。実機では測定がrelease前に終了してもフレーム送りが再開せず、新しい押下で
+通常の反復が戻ることを利用者が確認する。

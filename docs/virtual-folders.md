@@ -1,5 +1,46 @@
 # 仮想フォルダ (ZIP / RAR / PDF / EPUB) 処理
 
+## 本への再入場とfacetの帰路（§1.339）
+
+通常open、履歴←/→、親移動/BSはtyped場所と`FacetRoute`を保持した要求を成功時だけ採用する。
+ZIP/PDF/EPUB/変換書庫の帰路は元のarchive aliasとtyped親を使い、★一覧やCollectionなどの
+合成pathを実パスの親子比較へ変換しない。ZIP内部のprefix移動はrouteだけを採用し、外側履歴を進めない。
+Search rootは元の帰路を保つ一時表示で、drillした子scopeと終了時のRestoreを同じ採用境界へ渡す。
+外側履歴からZIPへ戻る際の表示階層は、従来のルート／自動collapse結果を維持する。
+保存routeの内部prefixを実際の準備済み階層へ合わせ、表示していない階層の退避frameを残さない。
+ZIP内の他形式書庫を変換する提案も、同じ論理ZIPのSameLocation要求を既存dialogへ引き継ぐ。
+EPUBのSave PDFは元要求の帰路を保持したDirect移動に切り替え、未採用のReplay cursorを確定しない。
+
+親から子へ入るとlive親facetを退避して子を無条件にし、親へ戻ると退避値を戻す。
+履歴から同じ子へ再入場しても、その時点の親条件を退避する。履歴entryにfilter値は保存しない。
+手動復元はframeを消費し、同じrouteのreload/rebuildはframeを作り直さない。
+ZIPの全再読込で準備済みprefixが変わる場合はSameLocationでもrouteを合わせ、実際の親frameを復元する。
+同階層の再読込は手動復元済みの値を維持し、外側の履歴cursorはどちらも進めない。
+場所条件は移動時にactive/frame双方から除く。folder/PDF/ZIPのinstall後は履歴とfacetを確定してから
+sidecar hydrationへ進み、metadata復元後のfirst-displayを既存continuationが担当する。
+failed/cancel/staleの未採用移動は表示、履歴、退避状態を変更しない。
+設定項目や保存・読書位置keyは変えず、§1.345のファイル種類除外は実装しない。
+
+## 合成一覧の採用と採用後hydration（§1.339 / §1.347、2026-10-09）
+
+master統合と外部レビュー`8037fe3dc`のP2に対する実装契約。Global SearchのReady結果は、
+一覧採用が成立したclosure内でサムネイル・source map・件数・ratingをまとめて公開する。
+古い結果や採用拒否された準備結果は、表示中の一覧やmapを変更しない。
+
+ReadingHistoryは空のloading shellを共通境界で一回採用し、既存workerのentriesとsidecar出所を
+同じsurfaceへhydrateする。履歴cursor・facet・context・surface generationを再採用しない。
+Ctrl+Fの適用中／待機中spec（query / target / OR mode）は既存`SearchPending`と完了したtyped
+filter payloadで保持し、新rowsへ再実行する。入力欄の未送信draftは使わず、検索入力・optionsと
+無関係なpending navigationを保持する。新owner・pending flagは追加しない。
+
+ブックマーク一覧の構築workerはmain contextのSurface leaseとswitch sequenceを保持する。
+mainの成功したitems置換・Quick Folder切替で退役し、遅延結果をmap公開前に拒否する。
+表示中のBookmarkを残すA/B記憶クリアでは、旧epochを退役してから同じ既存refreshを
+新epoch／slotで再開始し、loading shellの行取得を完了させる。
+同じ一覧のsortはownerを維持・再束縛し、detached mountではmain workerを取消さない。
+遅い一覧のmodal化は不要とし、既存Pendingと採用境界の所有を使って非同期の一覧操作を保つ。
+[統合時の所有契約](async-architecture.md#master統合時の採用境界1339--13472026-10-09)を参照。
+
 ## EPUB → PDF 読み取り境界とオープン導線 (S2b / S2c-1)
 
 S2b は `pdf_loader` の読み取り経路を用意した。S2c-1 では、アドレスバー・起動引数・復元先に指定された
@@ -265,6 +306,29 @@ comic-book 別名 (`.cbz`/`.cbr`/`.cb7`) は実体フォーマットと同一扱
 
 ### 変換アーカイブ閲覧中の current_folder と「ユーザー視点パス」の二重化
 
+RAR/CBRは最初のファイルから開く（2026-10-09利用者決定、§1.355）。共通RAR scan workerで
+secretなしのvolume headerが後続巻と示したら、scan・Direct・cache・変換前に拒否し、header解決の
+最初のファイル名を案内する。通常・履歴・Smart・Rating・Collection・ブックマーク・起動・別ウィンドウ・
+password retryの共通scan入口に適用する。ヘッダー暗号化で番号を読めない場合はファイル名から推測せず、
+password後に画像も展開対象の入れ子も無ければ「画像が見つかりません。分割RARの場合は最初のファイルを開いてください。」
+と通知・logする。part1／単巻のDirect → 有効cache（DBの実ZIP path）→ 変換は維持する。
+後続巻の公開済み位置・ページ編集が参照できなくなる制約は利用者受容済みで、削除・移行・互換探索はしない。
+後続巻サムネイルの先頭巻解決は維持し、メーターだけsource ownerのtyped header証明がSubsequentのRARセルでは非表示にする。
+パス差では判定せず、First（単巻を含む）／Subsequent { first }／UnknownEncryptedを保持する。
+Remote、別窓bookmark cache hit、固定snapshot移動もcache採用前に同じ証明を検証する。
+固定範囲のcache missで変換しない契約と、thumbnail／pinのsource解決は維持する。
+固定範囲の先頭巻cacheは元RARのsnapshot identityと実ZIP backingを既存のtyped archive prepareへ渡す。
+snapshot自身のgeneration／entryを成功採用まで検証し、一時的なinternal-nav flagに遅延採用を依存させない。
+DFSは拡張子大小やpart風の名前で絞り込まず、header証明で後続巻を除外する。
+UIスレッドのI/Oや新しい状態は追加せず、既存のモーダルowner・取消・成功時採用境界を維持する。
+別ウィンドウ本ブックマークcache hit／★固定のcache-only等も採用前に同じheader証明で後続巻を拒否する。入口ごとの扱いは[入口表](book-resume-meter-plan.md#入口と採用前の共通証明)参照。
+
+変換ZIPの保存失敗は、操作・元書庫・一時ZIP・保存先・元OSエラーを既存loggerに記録する。
+Windowsのpublishは捕捉済みHRESULTからWin32 codeを保持し、UIには
+「変換したZIPを保存できませんでした。保存先が使用中か、読み取り専用か、書き込みが許可されていません。」
+と通知する。閲覧cacheと明示sibling／batchの共通処理であり、既存ZIPを先に削除しない。
+明示変換の同名ZIP拒否（no-clobber）は従来の専用メッセージを維持する。
+
 ソリッド・入れ子あり・暗号化 RAR/CBR と 7z/CB7/LZH/LHA を開くと無圧縮 ZIP に変換し
 (`archive_cache\<hash>\book.zip`)、以降はそれを通常 ZIP として開く。このとき **`current_folder` は
 キャッシュ ZIP を指す**が、ユーザー視点 (address bar / BS の親 / 次回起動の復元) では
@@ -272,8 +336,10 @@ comic-book 別名 (`.cbz`/`.cbr`/`.cb7`) は実体フォーマットと同一扱
 (`open_archive_via_cache` が set、`effective_folder()` =
 `archive_source_override.or(current_folder)`)。
 
-直接閲覧 RAR/CBR は `current_folder` 自体が元アーカイブを指し、`archive_source_override` は
-使わない。現在開いているコンテナの判定には `is_open_as_container` を使い、静的な一覧分類用
+直接閲覧 RAR/CBR は `current_folder` がheaderで確定した元アーカイブ（分割なら先頭volume）を指す。
+typedな履歴／一覧遷移ではクリックした論理pathを`archive_source_override`へ保持する経路もあるが、
+読込・ページ・読書位置keyは実際のRAR backingのままにする。現在開いているコンテナの判定には
+`is_open_as_container` を使い、静的な一覧分類用
 `is_virtual_folder` は RAR を false のまま保つ。ページ DB / sidecar キーは常に
 `ZipImage.zip_path::{entry_name}` で作るため、直接閲覧は `{元 RAR}::entry`、従来の変換
 キャッシュ閲覧はリリース済みデータと互換の `{cache ZIP}::entry` になる。両経路のキー parity
@@ -616,7 +682,12 @@ README の更新履歴で確認できる最新リリース v2.13.0 までの cat
 読み取り専用で参照する経路では、未追加の `layout_*` を NULL として扱う。
 
 `ConvertibleArchive` の読み取り元表 (`App.converted_archive_cache_paths`) は、候補ごとに
-`Pending / Direct(PathBuf) / CachedZip(PathBuf) / Unavailable` を持つ。map entry の欠落を
+`Pending / Direct(PathBuf) / CachedZip { logical_source, path } / Unavailable { logical_source }` を持つ。
+CachedZipの読書位置バーはopen／保存／復元と同じ実読込pathを参照する。
+キャッシュなしでもworkerが確認した論理sourceを保持し、その場合だけ現在のdata-dirとsourceから
+純粋計算した決定的な変換ZIP keyを参照する。論理sourceが未確定ならNoneで、RARのファイル名から
+先頭volumeを推測しない。Pendingのバーは非表示。cache削除後もサムネイル／pin用sourceの共有失効
+（Smartのstash／prepared再利用、parked context、旧reply取消）は維持する。map entry の欠落を
 「未判定」と「判定済みだが読み取り元なし」の兼用 sentinel にしない。`install_new_items` は
 current-folder generation の全候補を I/O なしで先に `Pending` 登録する。実際の判定 batch は
 **現在の可視範囲 + thumbnail keep set + その範囲の container pin 依存先**だけを対象にする。

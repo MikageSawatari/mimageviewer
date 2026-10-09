@@ -2896,11 +2896,22 @@ pub(super) fn draw_native_frame_step_button(
     draw_overlay_button_bg(painter, rect, resp.hovered(), false);
     draw_overlay_frame_step_icon(painter, rect, direction);
     let resp = resp.hover_tip_dark(tooltip);
-    let primary_down = ui.ctx().input(|i| i.pointer.primary_down());
+    let (primary_down, primary_pressed) = ui
+        .ctx()
+        .input(|i| (i.pointer.primary_down(), i.pointer.primary_pressed()));
     let held_from_this_button = hold
         .as_ref()
         .is_some_and(|state| state.direction == direction);
-    let down = resp.is_pointer_button_down_on() || (primary_down && held_from_this_button);
+    if !resp.enabled() {
+        if held_from_this_button {
+            *hold = None;
+        }
+        return false;
+    }
+    // egui can retain the click owner across disabled frames. Only a new press
+    // may start a hold; an ended hold must not resume from that retained owner.
+    let fresh_press = primary_pressed && resp.is_pointer_button_down_on();
+    let down = primary_down && (held_from_this_button || fresh_press);
     let now = Instant::now();
     if down {
         match hold {
@@ -3965,7 +3976,62 @@ fn draw_native_overlay_scrollbar(
 }
 
 /// 音量ノーマライズ スキャン中の進捗パネル (中央表示)。
-/// プログレスバー + キャンセルボタン (× / ESC)。
+/// HUD ↑↓の共通描画・入力。進捗パネルには移動ボタンを作らない。
+/// The same HUD arrow producer in playback and scan; the modal never recreates it.
+pub(super) fn draw_native_file_navigation_ui(
+    ui: &mut egui::Ui,
+    rects: [egui::Rect; 2],
+    shortcuts: Option<&NativeOverlayShortcutLabels>,
+    commands: &mut Vec<NativeOverlayCommand>,
+) {
+    for (rect, id, delta, label, shortcut) in [
+        (
+            rects[0],
+            "native_video_prev_file",
+            -1,
+            "\u{524d}\u{306e}\u{9805}\u{76ee}",
+            shortcuts.and_then(|s| s.prev_file.as_deref()),
+        ),
+        (
+            rects[1],
+            "native_video_next_file",
+            1,
+            "\u{6b21}\u{306e}\u{9805}\u{76ee}",
+            shortcuts.and_then(|s| s.next_file.as_deref()),
+        ),
+    ] {
+        let response = ui.interact(rect, egui::Id::new(id), egui::Sense::click());
+        let painter = ui.painter().with_clip_rect(rect);
+        draw_overlay_button_bg(&painter, rect, response.hovered(), false);
+        draw_overlay_arrow_icon(&painter, rect, delta);
+        if response
+            .hover_tip_dark(native_label_with_shortcut(label, shortcut))
+            .clicked()
+        {
+            commands.push(NativeOverlayCommand::NavigateItem {
+                delta,
+                via_wheel: false,
+            });
+        }
+    }
+}
+
+pub(super) fn draw_native_scan_file_navigation(
+    ctx: &egui::Context,
+    rects: [egui::Rect; 2],
+    shortcuts: Option<&NativeOverlayShortcutLabels>,
+    commands: &mut Vec<NativeOverlayCommand>,
+) {
+    egui::Area::new(egui::Id::new("native_video_file_navigation_hud"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(rects[0].min)
+        .movable(false)
+        .show(ctx, |ui| {
+            ui.set_min_size(rects[0].union(rects[1]).size());
+            draw_native_file_navigation_ui(ui, rects, shortcuts, commands);
+        });
+}
+
 pub(super) fn draw_native_normalize_progress(
     ctx: &egui::Context,
     overlay_width_points: f32,
@@ -3974,38 +4040,48 @@ pub(super) fn draw_native_normalize_progress(
     file_nav_rects: Option<[egui::Rect; 2]>,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
+    let full_rect = egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(overlay_width_points, overlay_height_points),
+    );
+    let panel_rect = egui::Rect::from_center_size(
+        full_rect.center(),
+        egui::vec2(420.0_f32.min((full_rect.width() - 40.0).max(120.0)), 110.0),
+    );
+    for (index, shield) in crate::ui_helpers::modal_shield_rects(
+        full_rect,
+        file_nav_rects
+            .as_ref()
+            .map_or(&[], |rects| rects.as_slice()),
+    )
+    .into_iter()
+    .enumerate()
+    {
+        egui::Area::new(egui::Id::new(("native_video_normalize_shield", index)))
+            .order(egui::Order::Foreground)
+            .fixed_pos(shield.min)
+            .movable(false)
+            .show(ctx, |ui| {
+                ui.set_min_size(shield.size());
+                ui.interact(
+                    shield,
+                    egui::Id::new(("native_video_normalize_blocker", index)),
+                    egui::Sense::click_and_drag(),
+                );
+            });
+    }
     egui::Area::new(egui::Id::new("native_video_normalize_progress"))
         .order(egui::Order::Foreground)
-        .fixed_pos(egui::Pos2::ZERO)
+        .fixed_pos(panel_rect.min)
+        .movable(false)
         .show(ctx, |ui| {
-            let full_rect = egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(overlay_width_points, overlay_height_points),
-            );
-            ui.set_min_size(full_rect.size());
+            ui.set_min_size(panel_rect.size());
             let painter = ui.painter().clone();
-            // Codex 2周目 P2: 全画面 blocker — 進捗パネル外のクリック / ホバーが背面の
-            // HUD / seek bar / volume slider 等に届かないようキャプチャする (= モーダル化)。
-            // 半透明の暗幕も兼ねる (動画は見えるが UI 操作は止まる)。
-            let _block = ui.interact(
-                full_rect,
-                egui::Id::new("native_video_normalize_blocker"),
-                egui::Sense::CLICK | egui::Sense::HOVER,
-            );
             painter.rect_filled(
                 full_rect,
                 0.0,
                 egui::Color32::from_rgba_unmultiplied(0, 0, 0, 96),
             );
-            // 中央パネル
-            let panel_w = 420.0_f32;
-            let panel_h = if file_nav_rects.is_some() {
-                110.0
-            } else {
-                150.0
-            };
-            let panel_rect =
-                egui::Rect::from_center_size(full_rect.center(), egui::vec2(panel_w, panel_h));
             painter.rect_filled(
                 panel_rect,
                 10.0,
@@ -4084,48 +4160,6 @@ pub(super) fn draw_native_normalize_progress(
             let cancel_resp = cancel_resp.hover_tip_dark("キャンセル [ESC]");
             if cancel_resp.clicked() || ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
                 commands.push(NativeOverlayCommand::CancelNormalizeScan);
-            }
-            // The modal owns pointer input. Recreate only the two file-navigation controls above
-            // its blocker, at the HUD positions when available and inside the panel otherwise.
-            // Both positions emit the ordinary NavigateItem command.
-            let nav_rects = file_nav_rects.unwrap_or_else(|| {
-                let size = egui::vec2(104.0, 28.0);
-                let y = panel_rect.max.y - size.y - 9.0;
-                [
-                    egui::Rect::from_min_size(
-                        egui::pos2(panel_rect.center().x - size.x - 6.0, y),
-                        size,
-                    ),
-                    egui::Rect::from_min_size(egui::pos2(panel_rect.center().x + 6.0, y), size),
-                ]
-            });
-            for (direction, rect, label) in [
-                (-1, nav_rects[0], "前の項目"),
-                (1, nav_rects[1], "次の項目"),
-            ] {
-                let response = ui.interact(
-                    rect,
-                    egui::Id::new(("native_video_normalize_file_nav", direction)),
-                    egui::Sense::click(),
-                );
-                draw_overlay_button_bg(&painter, rect, response.hovered(), false);
-                if file_nav_rects.is_some() {
-                    draw_overlay_arrow_icon(&painter, rect, direction);
-                } else {
-                    painter.text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        label,
-                        egui::FontId::proportional(13.0),
-                        egui::Color32::WHITE,
-                    );
-                }
-                if response.hover_tip_dark(label).clicked() {
-                    commands.push(NativeOverlayCommand::NavigateItem {
-                        delta: direction,
-                        via_wheel: false,
-                    });
-                }
             }
         });
 }
@@ -7326,6 +7360,7 @@ pub(crate) fn draw_overlay_speed_control(
     speed_rect: egui::Rect,
     text_center_y: f32,
     playback_speed: f64,
+    measured_label: Option<&std::sync::Arc<egui::Galley>>,
     button_id: egui::Id,
     popup_area_id: egui::Id,
     container_left: f32,
@@ -7339,13 +7374,19 @@ pub(crate) fn draw_overlay_speed_control(
     let mut result = None;
     let mut speed_resp = ui.interact(speed_rect, button_id, egui::Sense::click());
     draw_overlay_button_bg(painter, speed_rect, speed_resp.hovered(), false);
-    painter.text(
-        egui::pos2(speed_rect.center().x, text_center_y),
-        egui::Align2::CENTER_CENTER,
-        format_playback_speed(playback_speed),
-        crate::ui_fonts::hud_text_font(12.0),
-        egui::Color32::from_rgb(238, 238, 238),
-    );
+    let center = egui::pos2(speed_rect.center().x, text_center_y);
+    let color = egui::Color32::from_rgb(238, 238, 238);
+    if let Some(label) = measured_label {
+        painter.galley_with_override_text_color(center - label.size() * 0.5, label.clone(), color);
+    } else {
+        painter.text(
+            center,
+            egui::Align2::CENTER_CENTER,
+            format_playback_speed(playback_speed),
+            crate::ui_fonts::hud_text_font(12.0),
+            color,
+        );
+    }
     // リセットはダブルクリックのみ (音量スライダーと同じ理由。右クリックは背後の
     // フルスクリーン右クリック挙動に譲る。実機 FB 2026-07-02)。
     if speed_resp.double_clicked() {
