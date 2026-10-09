@@ -1,0 +1,9 @@
+[
+  {
+    "operation": "replace_inline",
+    "scope_heading_id": "adaptive-prediction",
+    "anchor": "Adaptive Prediction はモノラルまたはステレオに対応し、オーディオ設定の **WebAssembly 音声処理を使用する** を有効にする必要があります。エフェクトのルーティングでは、1 チャンネルまたはステレオペアを選びます。対応外の設定ではバイパスされるため、対応する音声形式を選んでください。",
+    "replacement": "mImageViewer の同梱 VST 版では、Adaptive Prediction は native 音声処理を使います。WebAssembly の有効化操作は不要です。エフェクトのルーティングでは、1 チャンネルまたはステレオペアを選びます。",
+    "reason": "The bundled VST hides standalone audio settings and uses native Adaptive Prediction processing."
+  }
+]
