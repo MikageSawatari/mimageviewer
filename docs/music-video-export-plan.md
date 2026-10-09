@@ -459,7 +459,9 @@ UI は操作コマンドの送信と再生位置のスナップショット読�
 
 #### I1 設計（2026-10-09 案）
 
-段 1 の調査・設計案。**未実装・独立レビュー前**。段 2 は別途指示を受けてから着手する。
+段 1 の調査・設計案は `bcddec29b`。独立設計レビュー（GPT-6.1 Sol / xhigh）で
+**段 2a は ACCEPT**。段 2b はエディタ専用 Tab / Enter policy に P2 が 4 件あり、
+方針を利用者と相談中。今回の実装指示は段 2a だけで、段 2b は未着手。
 本体の補正を挙動不変で切り出す部分と、エディタへ補正を適用する部分を分ける。
 以下の file:line は 2026-10-09 の調査時点のソースを指す。
 
@@ -468,7 +470,8 @@ UI は操作コマンドの送信と再生位置のスナップショット読�
 新設は `crates/egui-ime/`（package `egui-ime`、Rust 名 `egui_ime`）。通常依存は
 `egui = "0.33"` だけとし、eframe、本体 lib、keyboard owner、logger、Windows API に依存しない。
 標準ライブラリの `HashMap` / `Instant` / `Duration` を使う。workspace member に加え、本体と
-`musicvideo-ui` が path dependency を持つ。workspace root の `[patch.crates-io]` は既に
+`musicvideo-ui` が path dependency を持つ（段 2a では本体のみ、`musicvideo-ui` は段 2b）。
+workspace root の `[patch.crates-io]` は既に
 `egui = { path = "vendor/egui" }`（`Cargo.toml:34`）、本体・共有 UI・ラボは同じ 0.33 系
 （`Cargo.toml:366`、`crates/musicvideo-ui/Cargo.toml:12`、`tools/musicvideo_lab/Cargo.toml:11`）。
 新クレートだけ別の egui を解決しないことを `cargo tree -p egui-ime` / `cargo tree -d` で確認する。
@@ -694,6 +697,70 @@ native Undo 後に本文 / 行 identity / 時刻が保たれることを確認�
   2a / 2b はどちらも coherent な差分としてレビューし、2a の成功で I1 全体を完了扱いにしない。
   実装前レビューでは境界・診断の順序・Tab / Enter の editor 限定・Hz 前提訂正を確認する。
   shared viewport 経路へ変更が必要になった場合は detached plan §2 の合意と §11 の記録も先に行う。
+
+**7. 段 2a の実装・検証記録（2026-10-09、未コミット）**
+
+段 2a の実装のみ。`crates/egui-ime` の通常依存は egui だけで、本体の path dependency と
+workspace member を追加した。plugin、viewport 別 composition / 300ms grace、focus contract / retry、
+pending event の純投影、4 種の single-line helper を移設した。plugin debug name、temp ID、
+widget 描画前の activity 採取、取消・focus 復帰・Tab lock の条件は維持した。
+
+`src/ime_focus.rs` は診断付き facade として残した。read-only contract snapshot を使い、
+描画前の診断開始 → 共有 helper → widget 観測を接続する。診断・文字マスク・Sensitive redaction・
+通常ログ予算・keyboard owner・logger・全域 Tab policy・viewport / native 入力入口は本体のまま。
+本体の既存呼び出し元、`musicvideo-ui`、ラボには変更なし。エディタの登録・helper 置換・
+Tab / Enter policy・Undo gate・禁止検査は段 2b まで行わない。
+
+既存 23 テストは assertion を維持し、共有へ 16、本体へ 7（診断 5・非 IME Tab 1・raw 禁止 1）を
+配置した。共有の raw TextEdit 理由・anchor・件数検査を 1 件追加し、本体の既存 allowlist は
+移設された 4 箇所の exemption だけを削除した。本体 adapter test は 5 件追加し、4 helper の
+描画前診断 / Standard・Sensitive / 未登録 Context / 次 pass finalize、contract の更新・消去後の
+観測、IME 復帰と latch、explicit viewport / pending read の無副作用、plugin 再登録を検査する。
+
+独立 completion review（GPT-6.1 Sol / xhigh）は **ACCEPT**。共有 Sensitive helper の説明が
+ログまで担当するように読める P3 を修正し、metadata の記録だけで redaction / logger はホスト責務と
+明記した。修正後の再レビューで P3 解消・追加指摘なし。抽出前後の production function body と
+既存 23 test body の照合でも、意図した本体 hook の移動以外の挙動変更はないことを確認した。
+
+検証ログと command / 時刻 / 所要時間 / exit code は `target/i1-2a/*.log` / `*.json` に保存した。
+以下は段 2a の差分に対する非対話検証。snapshot baseline は更新していない。
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo test -p egui-ime` | 17 passed、0 failed、0 ignored。doc-test 0 件 |
+| `cargo test -p mimageviewer --lib ime_focus` | 12 passed、0 failed、0 ignored（既存 7＋adapter 5） |
+| `cargo test -p mimageviewer --lib ime` | 380 passed、0 failed、既存 ignored 2 |
+| `cargo test -p mimageviewer --lib egui_focus_policy` | 5 passed、0 failed、0 ignored |
+| `cargo test -p mimageviewer --lib keyboard_input` | 16 passed、0 failed、0 ignored |
+| `cargo test --test ui_snapshot` | 123 passed、0 failed、0 ignored |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0 |
+| `cargo tree -p egui-ime` / `cargo tree -d` | exit 0。共有も vendored egui 0.33.3 を参照。egui / epaint / eframe の重複系統なし |
+| `.\scripts\test-full.ps1 -SuppressCrashDialogs` | **PASS、exit 0**（1,400.87 秒）。workspace 12,627 passed / 58 ignored、vendor egui 25・egui-wgpu 11・eframe 18 passed。合計 12,681 passed / 0 failed / 58 ignored |
+| `cargo fmt --check` | 最終実行 exit 0 |
+| `python scripts/check_ui_glyphs.py` | 最終実行 exit 0、危険 glyph 0 |
+| `.\scripts\build-dev.ps1 -WaitForOtherBuildsMinutes 0` | 最終実行 **DONE、exit 0**（302.17 秒）。通常 feature / `dev-runtime` profile の core・remote・EPUB worker を作成し、FFmpeg / VC runtime / EffeTune を staging。PE 検査 runtime 4 / PE 3 passed |
+
+全体 gate の件数は各 target の最終 summary を集計し、子プロセスによる 2 件の再掲は重複加算していない。
+本体 lib は 11,188 passed / 52 ignored。既存の ignored は維持し、full gate の crash-dialog
+抑止設定も終了時に復元された。
+
+検証ビルドの初回は `turbojpeg-sys` の CMake / MSBuild が exit 1（スクリプト exit 101）。
+同じ CMake 構成を `--parallel 1 -- /v:diag` で単独ビルドすると exit 0、警告 0 / エラー 0
+（124.33 秒）だった。初回失敗と同時刻に生成された低 CPU の MSBuild worker が残っていたため、
+最終ビルドでは待機を 0 にし、`MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=24` を指定した。
+完了した native 依存を再利用し、feature / profile / 最適化設定は変更していない。
+途中の待機・単一並列の実行は中断しており、有効な最終結果は `build-dev-ready.log` / `.json`。
+初回 MSBuild 失敗の詳細原因は未断定で、I1 のコード変更による compile / test failure とは扱わない。
+
+実機確認は未実施。アプリ起動・入力操作・コミットは行っていない。
+利用者向け成果物は `target\dev-runtime\mimageviewer-core.exe`。起動は
+`Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。
+通常 `%APPDATA%\mimageviewer` の実設定・データを更新し得るため、インストール版 / tray 常駐版を
+先に終了する（single-instance mutex を共有する）。
+本体のメイン / fullscreen / native 動画と F12 detached の入力欄で Microsoft IME の
+ひらがな入力、候補 Tab / Shift+Tab、Enter 確定、Esc 取消、直後の通常入力、focus 移動、Ctrl+Z/Y を
+利用者が確認する。detached の切替・閉じる / 再表示でも sibling の入力状態を保つことを確認する。
+段 2b は未着手であり、I1 全体を完了扱いにしない。
 
 受け入れるコスト: 配布物の PE が 1 本増える（launcher 内包・署名・portable 同梱・全 PE / VC runtime
 gate・runtime 清掃）。閲覧中の音楽ビューと同時に再生すると両方鳴る（WASAPI shared で混ざるだけで
@@ -1023,7 +1090,7 @@ frame n → t = n/fps → evaluate → rasterize(CPU, rayon) → RGBA→NV12/YUV
 | **L2** 実装済み・追加P2修正の再検収待ち | 選択レイヤーの枠（D14 末尾）: 選んだレイヤーの矩形をプレビュー上に表示。画面外・非表示も示す | 初版 `838f8503e`（計232件）。ID再利用・stale textureのP2/P3修正 `42a74db10` は独立再レビューで解消確認（計234件）。**通常UI追加のlifetime登録遅延P2を修正・自動検証済み**（2026-10-09、未コミット差分）: `EditorFrame::finish` で対象lifetimeを同期し、同フレームの要求へ全LayerIdを捕捉。実UIから単色/2レイヤー追加→停止中の最初の完成フレームの枠・名前を検査。新規3件は同期を外す変異で全件失敗、復元後core 80 / UI 104 / lab 53、計237件成功。Undo単位・歌詞native Undo・L1 API・RGBAハッシュ維持。全要求経路の確認、releaseビルド等は下記L2追加修正記録 |
 | **L3** 実装済み・追加P3修正の再検収待ち | 状態で動かない上部とステータス（D14 末尾）: ツールバー 1 段・固定 1 行のステータスバー・読込衝突はモーダル・未解決素材と診断は別ウィンドウ・素材パスはプロジェクトタブ | 初版 `e958226a9`（254件）。キャンセル領域/未保存の印/タイトル送信の3件を修正した `a5c05ef65`（258件）は独立再レビューで条件付きACCEPT。**追加P3「詳細メニューのID変化」を修正・自動検証済み**（2026-10-09、未コミット差分）: ステータスの子UI4領域を用途ごとの固定IDにする。新規lab 1件、500/1400pt×書出/画像読込/保存完了の7組合せ、計14ケースでメニュー維持とメニュー内の未解決素材操作を実描画/実クリックで検査。修正前と詳細IDだけを戻す変異で失敗確認。復元後 core 80 / UI 105 / lab 74、計259件成功。禁止依存なし、fmt/glyph成功、releaseラボ再build成功（30.53秒）。L1/L2・H1/H2・非同期採否順序は維持。根拠・ログは下記L3追加P3記録。アプリ起動・停止、コミットなし |
 | **T1** | 文字装飾（D15）: comic-core 既存の縁取り・追加縁取り・影・エコー・背景・字間/行間を Text / TimeText / Lyrics に共通の型で接続 | 3 レイヤーで同じ型・同じ描画経路。装飾なしのプロジェクトはフレームハッシュ不変。補間規則（構造一致時のみ補間）をテストで固定。保存往復。装飾ありシーンの合成時間を実測して記録 |
-| **I1** | IME 補正の共有（D10「設定・入力」）: 本体 `ime_focus` の egui 依存部分（入力補正 plugin・single-line helper）を共有クレートへ挙動不変で切り出し、本体とエディタのホストが policy を登録する | 本体の既存 IME テスト・raw TextEdit 禁止検査が全件維持。`musicvideo-ui` の single-line 入力は共有 helper 経由。歌詞は独自の multiline（`LyricsTextBuffer`）なので、入力補正 plugin を効かせたうえで既存の buffer・widget ID・native Undo を保つ。IME の Esc 取消・候補選択中 Tab・Enter 確定・フォーカス復帰・Undo 所有を handler テストで固定。独立レビューで「挙動不変の切り出し」に合意 |
+| **I1 段 2a 実装・自動検証済み／段 2b 未着手** | IME 補正の共有（D10「設定・入力」）: 本体 `ime_focus` の egui 依存部分（入力補正 plugin・single-line helper）を共有クレートへ挙動不変で切り出し、本体とエディタのホストが policy を登録する | **段 2a（2026-10-09、未コミット）**: `egui-ime` を新設、本体 facade・既存呼び出し元を維持。既存 23 件は共有 16 / 本体 7 に配置し、共有 raw 禁止 1 / 本体 adapter 5 を追加（共有 17 / 本体 12 passed）。関連入力・snapshot、full gate 12,681 passed / 58 ignored / 0 failed、fmt / glyph、通常 profile の検証 build 成功。独立 completion review ACCEPT（P3 文言修正も解消）。エディタ / ラボには未適用、実機未確認。詳細は D10「I1 設計」§7。**I1 全体は未完了**。全体の受け入れ条件: 本体の既存 IME テスト・raw TextEdit 禁止検査が全件維持。`musicvideo-ui` の single-line 入力は共有 helper 経由。歌詞は独自の multiline（`LyricsTextBuffer`）なので、入力補正 plugin を効かせたうえで既存の buffer・widget ID・native Undo を保つ。IME の Esc 取消・候補選択中 Tab・Enter 確定・フォーカス復帰・Undo 所有を handler テストで固定。独立レビューで「挙動不変の切り出し」に合意 |
 | **H3a** | 解析契約の確定: 正規の較正区間（出力尺に合わせた PCM か全尺か）と解析の時刻列・seek 復帰の規則を決める | [引き継ぎ監査](music-video-handoff-20260907.md) §3 H3。可変時刻列と較正入力差をテストで固定。無変調ハッシュ維持 |
 | **H3b** | 一致の検証（P4b 接続後） | プレビューで表示したフレームが、同じ時刻の書き出しフレームと一致する: 表示フレームの欠落、前後への seek、直接 seek、音源より短い / 長い出力尺。これが通るまで H3 を完了扱いにしない |
 | **P4a** ✅ | 方式の設計確定: 本書 D10 / D14〜D16 の独立レビュー | GPT-6.1 Sol / xhigh の設計レビューで blocking 指摘なし。**完了**（2026-10-09）: 3 回目で条件付き ACCEPT（残った P3 の文言は反映済み）。runtime 競合の割り切りはユーザー判断で確定 |
