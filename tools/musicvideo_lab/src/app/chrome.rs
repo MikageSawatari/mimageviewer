@@ -1,5 +1,6 @@
 //! Host-owned chrome, file dialogs and decision presentation. No completion admission here.
 use super::*;
+use egui::emath::GuiRounding;
 
 pub(super) enum ChromeAction {
     OpenProject,
@@ -160,17 +161,20 @@ impl MusicVideoLabApp {
     }
 
     pub(super) fn project_caption(&self) -> String {
-        let name = self
-            .document
-            .path()
-            .and_then(|p| p.file_name())
-            .map_or_else(|| "新規".to_owned(), |p| p.to_string_lossy().into_owned());
+        let name = self.project_name();
         let suffix = if self.document.is_dirty(&self.project) {
             "（未保存）"
         } else {
             ""
         };
         format!("{name}{suffix}")
+    }
+
+    fn project_name(&self) -> String {
+        self.document
+            .path()
+            .and_then(|p| p.file_name())
+            .map_or_else(|| "新規".to_owned(), |p| p.to_string_lossy().into_owned())
     }
 
     fn missing_count(&self) -> usize {
@@ -201,53 +205,229 @@ impl MusicVideoLabApp {
             .show(ctx, |ui| {
                 ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
                 ui.add_enabled_ui(input_enabled, |ui| {
-                    ui.horizontal(|ui| {
-                        let caption = self.project_caption();
-                        let caption_width = (ui.available_width() * 0.18).min(190.0);
-                        ui.add_sized([caption_width, 20.0], egui::Label::new(caption).truncate())
-                            .on_hover_text(self.document.path().map_or_else(
-                                || "新規プロジェクト".to_owned(),
-                                |p| p.display().to_string(),
-                            ));
-                        let count = self.missing_count();
-                        if count > 0 && ui.button(format!("未解決の素材 {count} 件")).clicked()
-                        {
-                            actions.push(ChromeAction::ShowMissing);
-                        }
-                        if matches!(
-                            self.runtime_resources,
-                            RuntimeResourceState::Restoring { .. }
-                        ) && ui.button("素材復元中").clicked()
-                        {
-                            actions.push(ChromeAction::ShowMissing);
-                        }
-                        if self.pending_project_edit_in_progress()
-                            && ui.button("素材読込をキャンセル").clicked()
-                        {
-                            actions.push(ChromeAction::CancelResources);
-                        }
-                        if let Some(pending) = &self.export_pending {
-                            let completed = pending.progress.load(Ordering::Relaxed);
-                            ui.add(
-                                egui::ProgressBar::new(
-                                    completed as f32 / pending.total_frames.max(1) as f32,
-                                )
-                                .desired_width(160.0)
-                                .show_percentage()
-                                .text(format!("{completed} / {} フレーム", pending.total_frames)),
-                            );
-                            if ui.button("書き出しをキャンセル").clicked() {
-                                actions.push(ChromeAction::CancelExport);
-                            }
-                        }
-                        ui.add_sized(
-                            [ui.available_width().max(0.0), 20.0],
-                            egui::Label::new(&self.status).truncate(),
-                        )
-                        .on_hover_text(&self.status);
-                    });
+                    self.draw_status_row(ui, actions);
                 });
             });
+    }
+
+    fn draw_status_row(&self, ui: &mut egui::Ui, actions: &mut Vec<ChromeAction>) {
+        let row = ui.available_rect_before_wrap();
+        let width = row.width().max(0.0);
+        let height = row.height();
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        let painter = ui.painter().clone();
+        let color = ui.visuals().text_color();
+        let padding = ui.spacing().button_padding.x * 2.0;
+        let text_width = |text: &str| {
+            painter
+                .layout_no_wrap(text.to_owned(), font.clone(), color)
+                .size()
+                .x
+        };
+        let button_width = |text: &str| text_width(text) + padding;
+        let dirty = self.document.is_dirty(&self.project);
+        let cancel_export = self.export_pending.is_some();
+        let cancel_resources = self.pending_project_edit_in_progress();
+        let cancel_count = usize::from(cancel_export) + usize::from(cancel_resources);
+        let mut gap = ui.spacing().item_spacing.x.min(width / 12.0);
+        // Essential controls own space before any project name, progress or status text.
+        // Compact labels keep the same direct cancellation actions at small widths.
+        let full_cancel_width = if cancel_export {
+            button_width("書き出しをキャンセル")
+        } else {
+            0.0
+        } + if cancel_resources {
+            button_width("素材読込をキャンセル")
+        } else {
+            0.0
+        };
+        let full_dirty_width = if dirty {
+            text_width("（未保存）").ceil() + 2.0
+        } else {
+            0.0
+        };
+        let compact =
+            full_cancel_width + full_dirty_width + button_width("詳細") + gap * 4.0 > width;
+        let dirty_label = if compact { "*" } else { "（未保存）" };
+        // Label placement rounds to pixels; include padding around the measured glyphs.
+        let dirty_width = if dirty {
+            text_width(dirty_label).ceil() + 2.0
+        } else {
+            0.0
+        };
+        let menu_label = if width < 160.0 { "..." } else { "詳細" };
+        let menu_width = button_width(menu_label).min(width * 0.3);
+        let minimum_cancel_width = if cancel_export {
+            button_width("E")
+        } else {
+            0.0
+        } + if cancel_resources {
+            button_width("R")
+        } else {
+            0.0
+        };
+        let gap_count = cancel_count as f32 + 2.0;
+        gap = gap
+            .min(((width - dirty_width - menu_width - minimum_cancel_width) / gap_count).max(0.0));
+        let cancel_budget = (width - dirty_width - menu_width - gap * gap_count).max(0.0);
+        let cancel_slot = if cancel_count == 0 {
+            0.0
+        } else {
+            cancel_budget / cancel_count as f32
+        };
+        let mut right = row.right();
+        let mut draw_cancel = |salt, full: &str, short: &str, tiny: &str, action| {
+            let label = if !compact {
+                full
+            } else if button_width(short) <= cancel_slot {
+                short
+            } else {
+                tiny
+            };
+            let size = if compact {
+                button_width(label).min(cancel_slot)
+            } else {
+                button_width(label)
+            };
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(right - size, row.top()),
+                egui::vec2(size, height),
+            )
+            .round_ui();
+            right = rect.left() - gap;
+            let mut child = ui.new_child(
+                egui::UiBuilder::new()
+                    .id_salt(salt)
+                    .max_rect(rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            child.set_clip_rect(ui.clip_rect().intersect(rect));
+            if child
+                .add_sized(rect.size(), egui::Button::new(label).truncate())
+                .on_hover_text(full)
+                .clicked()
+            {
+                actions.push(action);
+            }
+        };
+        if cancel_export {
+            draw_cancel(
+                "status-cancel-export",
+                "書き出しをキャンセル",
+                "書出取消",
+                "E",
+                ChromeAction::CancelExport,
+            );
+        }
+        if cancel_resources {
+            draw_cancel(
+                "status-cancel-resources",
+                "素材読込をキャンセル",
+                "素材取消",
+                "R",
+                ChromeAction::CancelResources,
+            );
+        }
+
+        let mut left = row.left();
+        if dirty {
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(left, row.top()),
+                egui::vec2(dirty_width, height),
+            );
+            ui.put(rect, egui::Label::new(dirty_label).extend())
+                .on_hover_text("未保存の変更があります");
+            left = rect.right() + gap;
+        }
+        let menu_rect =
+            egui::Rect::from_min_size(egui::pos2(left, row.top()), egui::vec2(menu_width, height));
+        let mut menu_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("status-details")
+                .max_rect(menu_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        menu_ui.menu_button(menu_label, |ui| {
+            ui.set_max_width((ui.ctx().content_rect().width() - 24.0).clamp(80.0, 500.0));
+            ui.label(egui::RichText::new(self.project_caption()).strong())
+                .on_hover_text(self.project_caption());
+            ui.add(egui::Label::new(&self.status).truncate())
+                .on_hover_text(&self.status);
+            let count = self.missing_count();
+            if count > 0 && ui.button(format!("未解決の素材 {count} 件")).clicked() {
+                actions.push(ChromeAction::ShowMissing);
+                ui.close();
+            }
+            if matches!(
+                self.runtime_resources,
+                RuntimeResourceState::Restoring { .. }
+            ) && ui.button("素材復元中").clicked()
+            {
+                actions.push(ChromeAction::ShowMissing);
+                ui.close();
+            }
+            self.draw_export_progress(ui);
+        });
+        left = menu_rect.right() + gap;
+        let info_width = (right - left).max(0.0);
+        if info_width > 0.0 {
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(left, row.top()),
+                egui::vec2(info_width, height),
+            );
+            let mut info = ui.new_child(
+                egui::UiBuilder::new()
+                    .id_salt("status-info")
+                    .max_rect(rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            info.set_clip_rect(ui.clip_rect().intersect(rect));
+            let name_width = (info_width * 0.25).min(190.0);
+            info.add_sized(
+                [name_width, 20.0],
+                egui::Label::new(self.project_name()).truncate(),
+            )
+            .on_hover_text(self.document.path().map_or_else(
+                || "新規プロジェクト".to_owned(),
+                |p| p.display().to_string(),
+            ));
+            let count = self.missing_count();
+            let missing_label = format!("未解決の素材 {count} 件");
+            if count > 0
+                && info.available_width() > button_width(&missing_label) + 90.0
+                && info.button(missing_label).clicked()
+            {
+                actions.push(ChromeAction::ShowMissing);
+            }
+            if matches!(
+                self.runtime_resources,
+                RuntimeResourceState::Restoring { .. }
+            ) && info.available_width() > button_width("素材復元中") + 90.0
+                && info.button("素材復元中").clicked()
+            {
+                actions.push(ChromeAction::ShowMissing);
+            }
+            if info.available_width() > 260.0 {
+                self.draw_export_progress(&mut info);
+            }
+            info.add_sized(
+                [info.available_width().max(0.0), 20.0],
+                egui::Label::new(&self.status).truncate(),
+            )
+            .on_hover_text(&self.status);
+        }
+    }
+
+    fn draw_export_progress(&self, ui: &mut egui::Ui) {
+        if let Some(pending) = &self.export_pending {
+            let completed = pending.progress.load(Ordering::Relaxed);
+            ui.add(
+                egui::ProgressBar::new(completed as f32 / pending.total_frames.max(1) as f32)
+                    .desired_width(160.0)
+                    .show_percentage()
+                    .text(format!("{completed} / {} フレーム", pending.total_frames)),
+            );
+        }
     }
 
     pub(super) fn draw_load_choice(&self, ctx: &egui::Context) -> Vec<ChromeAction> {

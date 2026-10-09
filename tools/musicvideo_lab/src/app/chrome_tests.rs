@@ -11,15 +11,19 @@ struct Harness {
 
 impl Harness {
     fn new(width: f32) -> Self {
-        let mut h = Self {
+        let mut h = Self::unstarted(width);
+        h.frame(vec![]);
+        h.frame(vec![]);
+        h
+    }
+
+    fn unstarted(width: f32) -> Self {
+        Self {
             app: MusicVideoLabApp::new(Arc::new(Assets::default())),
             ctx: egui::Context::default(),
             output: Default::default(),
             width,
-        };
-        h.frame(vec![]);
-        h.frame(vec![]);
-        h
+        }
     }
 
     fn frame(&mut self, events: Vec<egui::Event>) {
@@ -71,6 +75,257 @@ impl Harness {
         self.frame(pointer(pos, true));
         self.frame(pointer(pos, false));
     }
+}
+
+fn pending_status_operations(h: &mut Harness, mask: usize) -> (Arc<AtomicBool>, Arc<AtomicBool>) {
+    let export_cancel = Arc::new(AtomicBool::new(false));
+    let resource_cancel = Arc::new(AtomicBool::new(false));
+    if mask & 1 != 0 {
+        let (_tx, rx) = mpsc::channel();
+        h.app.export_pending = Some(ExportPending {
+            cancel: export_cancel.clone(),
+            progress: Arc::new(AtomicUsize::new(20)),
+            total_frames: 100,
+            rx,
+        });
+    }
+    if mask & 2 != 0 {
+        let (_tx, rx) = mpsc::channel();
+        h.app.audio_pending = Some(AudioPending {
+            request: AudioLoadRequest {
+                session: h.app.document.id(),
+                expected: None,
+                path: "audio.wav".into(),
+            },
+            cancel: resource_cancel.clone(),
+            rx,
+            queued: None,
+        });
+    }
+    (export_cancel, resource_cancel)
+}
+
+fn status_button(h: &Harness, labels: &[&str]) -> egui::Pos2 {
+    let status = h.panel("musicvideo-status");
+    let (text_rect, text_clip) = h
+        .output
+        .shapes
+        .iter()
+        .find_map(|s| match &s.shape {
+            egui::Shape::Text(t) if labels.contains(&t.galley.text()) && status.contains(t.pos) => {
+                Some((t.galley.rect.translate(t.pos.to_vec2()), s.clip_rect))
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("missing status button {labels:?} at width {}", h.width));
+    assert!(
+        status.contains_rect(text_rect),
+        "button label outside status: {text_rect:?}"
+    );
+    assert!(
+        text_clip.contains_rect(text_rect),
+        "button label clipped: {text_rect:?}"
+    );
+    let (button_rect, button_clip) = h
+        .output
+        .shapes
+        .iter()
+        .filter_map(|s| match &s.shape {
+            egui::Shape::Rect(r) if r.rect.contains_rect(text_rect) => Some((r.rect, s.clip_rect)),
+            _ => None,
+        })
+        .min_by(|a, b| a.0.area().total_cmp(&b.0.area()))
+        .expect("painted button background");
+    assert!(
+        status.contains_rect(button_rect),
+        "button outside status: {button_rect:?}"
+    );
+    assert!(
+        button_clip.contains_rect(button_rect),
+        "button background clipped: rect={button_rect:?}, clip={button_clip:?}, width={}, labels={labels:?}",
+        h.width
+    );
+    text_rect.center()
+}
+
+#[test]
+fn l3_review_cancel_controls_are_visible_and_clickable_in_narrow_combined_states() {
+    let font = crate::project::load_default_font();
+    for width in [500.0, 480.0, 520.0, 100.0, 160.0, 250.0, 900.0] {
+        for mask in [3, 1, 2] {
+            for missing in [true, false] {
+                for restoring in [true, false] {
+                    for cancel_export in [true, false] {
+                        if (cancel_export && mask & 1 == 0) || (!cancel_export && mask & 2 == 0) {
+                            continue;
+                        }
+                        let mut h = Harness::new(width);
+                        crate::project::setup_egui(&h.ctx, font.as_ref());
+                        let baseline = h.heights();
+                        let (export_cancel, resource_cancel) =
+                            pending_status_operations(&mut h, mask);
+                        if missing {
+                            h.app.preview_report.unresolved_assets = vec![
+                                UnresolvedAsset::Image(ImageId::new(BACKGROUND_ID)),
+                                UnresolvedAsset::Font("missing".into()),
+                            ];
+                            h.app.audio_error = Some("missing audio".into());
+                        }
+                        if restoring {
+                            h.app.runtime_resources = RuntimeResourceState::Restoring {
+                                manifest: ResourceManifest::default(),
+                                generation: 1,
+                            };
+                        }
+                        h.app.status = "長い状態通知 ".repeat(100);
+                        for _ in 0..3 {
+                            h.frame(vec![]);
+                        }
+                        assert_eq!(h.panel("musicvideo-status").height(), baseline.1);
+                        let labels = if cancel_export {
+                            ["書き出しをキャンセル", "書出取消", "E"]
+                        } else {
+                            ["素材読込をキャンセル", "素材取消", "R"]
+                        };
+                        let pos = status_button(&h, &labels);
+                        h.frame(pointer(pos, true));
+                        h.frame(pointer(pos, false));
+                        assert_eq!(
+                            export_cancel.load(Ordering::Relaxed),
+                            cancel_export,
+                            "export cancellation, width={width}, mask={mask}, missing={missing}, restoring={restoring}"
+                        );
+                        assert_eq!(
+                            resource_cancel.load(Ordering::Relaxed),
+                            !cancel_export,
+                            "resource cancellation, width={width}, mask={mask}, missing={missing}, restoring={restoring}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn l3_review_long_project_name_never_hides_the_unsaved_marker() {
+    let font = crate::project::load_default_font();
+    for width in [500.0, 100.0, 160.0, 250.0, 900.0] {
+        for mask in 0..=3 {
+            let mut h = Harness::new(width);
+            crate::project::setup_egui(&h.ctx, font.as_ref());
+            h.app.document.replace_with_loaded(
+                PathBuf::from(format!("{}.mivmv.json", "長いプロジェクト名".repeat(60))),
+                &h.app.project,
+            );
+            h.app.project.display_gain_db = 4.0;
+            h.app.document.note_edit();
+            pending_status_operations(&mut h, mask);
+            for _ in 0..3 {
+                h.frame(vec![]);
+            }
+            let status = h.panel("musicvideo-status");
+            let (rect, clip) = h
+                .output
+                .shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::Shape::Text(t)
+                        if ["（未保存）", "*"].contains(&t.galley.text())
+                            && status.contains(t.pos) =>
+                    {
+                        Some((t.galley.rect.translate(t.pos.to_vec2()), s.clip_rect))
+                    }
+                    _ => None,
+                })
+                .expect("independent unsaved marker");
+            assert!(status.contains_rect(rect));
+            assert!(
+                clip.contains_rect(rect),
+                "unsaved marker is clipped at {width}pt: rect={rect:?}, clip={clip:?}, mask={mask}"
+            );
+        }
+    }
+}
+
+fn titles(output: &egui::FullOutput) -> Vec<&str> {
+    output
+        .viewport_output
+        .values()
+        .flat_map(|v| &v.commands)
+        .filter_map(|c| {
+            if let egui::ViewportCommand::Title(title) = c {
+                Some(title.as_str())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn l3_review_title_is_sent_initially_and_only_after_its_text_changes() {
+    let mut h = Harness::unstarted(1400.0);
+    h.frame(vec![]);
+    assert_eq!(titles(&h.output), ["新規（未保存） - mIV 音楽ビデオ"]);
+    for position in [0.0, 1.0, 4.0] {
+        h.app.position_secs = position;
+        h.app.status = format!("Position {position}");
+        h.frame(vec![]);
+        assert!(titles(&h.output).is_empty());
+    }
+    h.app
+        .document
+        .replace_with_loaded("saved.mivmv.json".into(), &h.app.project);
+    h.frame(vec![]);
+    assert_eq!(titles(&h.output), ["saved.mivmv.json - mIV 音楽ビデオ"]);
+    h.frame(vec![]);
+    assert!(titles(&h.output).is_empty());
+    h.app.project.display_gain_db = 4.0;
+    h.app.document.note_edit();
+    h.frame(vec![]);
+    assert_eq!(
+        titles(&h.output),
+        ["saved.mivmv.json（未保存） - mIV 音楽ビデオ"]
+    );
+    h.frame(vec![]);
+    assert!(titles(&h.output).is_empty());
+    h.app.project.display_gain_db = 0.0;
+    h.app.document.note_edit();
+    h.frame(vec![]);
+    assert_eq!(titles(&h.output), ["saved.mivmv.json - mIV 音楽ビデオ"]);
+}
+
+#[test]
+fn l3_review_status_details_preserves_hidden_material_actions_and_progress() {
+    let mut h = Harness::new(500.0);
+    pending_status_operations(&mut h, 3);
+    h.app.preview_report.unresolved_assets =
+        vec![UnresolvedAsset::Image(ImageId::new(BACKGROUND_ID))];
+    h.click("詳細");
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert!(h.output.shapes.iter().any(
+        |s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text() == "20 / 100 フレーム")
+    ));
+    h.click("未解決の素材 1 件");
+    assert!(h.app.show_missing_resources);
+    assert!(
+        !h.app
+            .export_pending
+            .as_ref()
+            .unwrap()
+            .cancel
+            .load(Ordering::Relaxed)
+    );
+    assert!(
+        !h.app
+            .audio_pending
+            .as_ref()
+            .unwrap()
+            .cancel
+            .load(Ordering::Relaxed)
+    );
 }
 
 fn pointer(pos: egui::Pos2, pressed: bool) -> Vec<egui::Event> {

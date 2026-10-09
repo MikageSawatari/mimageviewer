@@ -466,6 +466,7 @@ pub struct MusicVideoLabApp {
     status: String,
     show_missing_resources: bool,
     show_diagnostics: bool,
+    last_sent_title: String,
     audio_pending: Option<AudioPending>,
     image_pending: Option<ImagePending>,
     preview_pending: Option<PreviewPending>,
@@ -526,6 +527,7 @@ impl MusicVideoLabApp {
             status,
             show_missing_resources: false,
             show_diagnostics: false,
+            last_sent_title: String::new(),
             audio_pending: None,
             image_pending: None,
             preview_pending: None,
@@ -1146,10 +1148,11 @@ impl MusicVideoLabApp {
         self.poll_projects(ctx);
         self.poll_lrc(ctx);
         self.sync_runtime_resources(ctx);
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
-            "{} - mIV 音楽ビデオ",
-            self.project_caption()
-        )));
+        let title = format!("{} - mIV 音楽ビデオ", self.project_caption());
+        if title != self.last_sent_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.last_sent_title = title;
+        }
         reset_preview_perf
     }
 
