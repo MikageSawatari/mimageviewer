@@ -1,6 +1,6 @@
 # §1.356 通常ログ・perfログの非同期writer 設計案
 
-2026-10-09、ライン C。**設計のみ。r3再レビューのP2とcoordinator決定を反映。過去の欠落は警告付きZIP保存とし、性能gateの判定不能は維持。製品コード未変更、再レビューと下記の利用者回答待ち。**
+2026-10-09、ライン C。**設計承認済み。2026-10-09の利用者回答を記録し、ラインCで実装する。過去の欠落は警告付きZIP保存、性能gateは判定不能。**
 基準: master `70cf4de4e`。本文のコード行番号はこのworktreeの当該HEADで確認した値。
 正本: [バックログ §1.356](next-release-backlog.md)、関連: [UI応答性 §4](ui-responsiveness.md#4-新機能追加時のチェックリスト)、[非同期構成 §7](async-architecture.md#7-パフォーマンス計装-perfrs)、[起動診断](startup-diagnostics-plan.md)、[idle health](idle-health-check.md)。
 
@@ -38,7 +38,7 @@
 `src/ui_startup.rs:5–22` のrenderer自体はmemory-only。`src/app.rs:87681` がoverlayを描く**前**に、通常heartbeat（`:87308`）、perf有効時のframe.begin（`:87578`）、最初のupdateのstartup.first_frame（`:87619`）、初回から実行するperf::flush（`:87632–87637`）に到達する。creatorの `src/lib.rs:1681/:1704/:1714/:1759/:1845` → `:429` もperf有効時は同期writeである。通常loggerは常時ON（`:1222–1228`）、perfはCLIまたは設定で有効になる。
 従って、現行コードには初回overlayの描画前に同期ログI/Oで止まる経路がある。本変更はその経路のファイルI/Oを外す。旧perfのfirst_frameはupdate入口の印であり、実PRESENTを意味しない。常時起動診断のGPU／Present観測（`src/lib.rs:1482–1509`）は別経路として維持する。Storeの観測ログがないため、今回の16秒停止とStoreの報告を同一原因と扱わず、審査問題の修正完了とも書かない。
 
-## 3. 単一writerと非blocking受付（利用者回答待ちの推奨案）
+## 3. 単一writerと非blocking受付（2026-10-09決定仕様）
 
 ### 3.1 所有と初期化
 
@@ -48,18 +48,18 @@ perfのsession.startは、producerがpid／process_start_unix_ms／wall clock an
 
 ### 3.2 queue、順序、欠落
 
-推奨容量は通常＋perf合計 **8,192件、payload合計8MiB、1レコード256KiBまで**。制限はすべて同時に適用。制限値は内部定数とし、設定画面／DBキーを増やさない。
+決定容量は通常＋perf合計 **262,144件、payload合計128MiB、1レコード1MiBまで**（利用者 2026-10-09）。利用者PCでperf平均約470bytes・最大約3,000件/秒を測定し、8,192件ではdisk stall約3秒で欠落するため増量。制限はすべて同時に適用。制限値は内部定数とし、設定画面／DBキーを増やさない。
 producerは現在のメッセージ／JSON構築を維持し、enqueue前に自身のelapsed timestamp、OS thread ID、call siteを採取する。writer時刻／writer tidへ置き換えない。queueは先に確保した有界journalとし、memory-onlyの短いcritical sectionへ**一度だけtry_lock**して受付する。writerも固定件数のbatchを取り出し、guardを解放してからserialize／I/Oする。try_lock失敗時のsleep／再試行／通常loggerへの同期fallbackは禁止。
-8MiBのpayload会計はqueueから取り出した未処理batchも含み、writeまたは破棄が終わるまで解放しない。固定journalの管理領域、各sinkの固定buffer、session初期化設定は別の固定上限を持つ。sink I/O中はmemory journalもbyte会計のguardも保持しない。
+128MiBのpayload会計はqueueから取り出した未処理batchも含み、writeまたは破棄が終わるまで解放しない。固定journalの管理領域、各sinkの固定buffer、session初期化設定は別の固定上限を持つ。sink I/O中はmemory journalもbyte会計のguardも保持しない。
 満杯、byte上限、oversize、memory競合時は**新しいレコードを捨てる**。既存queueの古いレコードを追い出さず、採用済みレコードは受付FIFO、同一threadの順序を維持する。異なるthreadの時刻順は保証しない（既存mutexでも時刻採取と取得順は一致しない）。oversizeはメッセージを途中で切ってJSON／既存書式を壊さず、件数に含める。producerの一時的なformat領域はqueue容量とは別であり、無制限入力の新しい収集を足さない。
-sink別・理由別のAtomic dropped counterを持ち、writerが復帰したとき／flush／shutdown時に差分と累計を**queueを経由せず**直接記録する。通常は既存prefix付き `[async-log] dropped ...`、perf有効時は `cat=log, kind=records_dropped`（count／total／sink／reason）を追加。既存 `diagnostic_dropped` と別kindにして意味を変更しない。writer内部の自己ログはpublic facadeを呼ばず、再帰しない。ディスクが永久停止／processが強制終了した場合、そのcounterまでディスクへ残せるとは保証しない。
+sink別・理由別のAtomic dropped counterとsession累計first_t／last_tを持ち、writerが復帰したとき／flush／shutdown時に差分と累計・累計欠落の発生時間幅を**queueを経由せず**直接記録する。通常は既存prefix付き `[async-log] dropped ...`、perf有効時は `cat=log, kind=records_dropped`（count／total／sink／reason／first_t／last_t）を追加。既存 `diagnostic_dropped` と別kindにして意味を変更しない。writer内部の自己ログはpublic facadeを呼ばず、再帰しない。ディスクが永久停止／processが強制終了した場合、そのcounterまでディスクへ残せるとは保証しない。
 
 ### 3.3 flushとslow_io
 
 `perf::flush()` と `logger::flush()`（現行 `src/logger.rs:290–312`）は **非blockingのflush要求**へ変更する。UIの1秒周期、初期化直後のflushを含め、呼出しが戻ってもwrite完了を意味しない。要求はqueue満杯で失われないcoalesced controlとして記録し、受付済みレコードのwatermarkまで排出後にwriterがflushする。後続の記録が絶えなくてもwatermarkでflushできるよう、無限のqueue空待ちにしない。**保存完了を前提にする呼出元を棚卸しし、診断ZIP・解析gate・終了・testは§3.4の完了barrierへ移す。** 描画経路から完了待ちを呼ばない。
 writerが採用したwatermarkはそのflushが終わるまで固定し、追加要求は次のflushにまとめる。初期化のLogger／perf stageは受付とwriter開始要求までの時間になり、open完了と誤表示しない。実際のsink open開始／完了はwriter側診断として別に記録する。
-通常sinkもbuffer化し、推奨 **250ms周期**（記録があるときだけ）と明示flush／shutdownでflushする。アイドル時の新しいUI repaintやログ記録を作らない。周期待ちはwriter側の通知付き待機であり、producer待機ではない。flushはOSへのwriteであってsync_allによる電源断耐性の保証ではない。
-既存slow_ioのkind／既存fieldは保持するが、今後はwriter上のI/Oとしてtid／holderを記録する。producerのcaller情報は追加fieldで伝え、UIが16秒待ったかのような旧caller tidの偽装はしない。queue residenceは別kind `queue_delay` とし、既存write_msへ足さない。診断はslow-onlyかつ有界、1レコードごとの自己診断を増やさない。既存解析の区間推定がwriter I/OとUI停止を混同しないよう `scripts/analyze_perf.py` のhitchesも同時確認する。
+**通常sinkは到着した各batchを直ちにwrite・flushする**（利用者 2026-10-09、C356-4変更）。healthy diskでは従来の毎行flushと同じくcrash直前までの保存を保つ。250ms待ってbatch化しない。**perf sinkだけ250ms周期**（dirty時）と明示flush／shutdownでflushする。アイドル時の新しいUI repaintやログ記録を作らない。周期待ちはwriter側の通知付き待機であり、producer待機ではない。flushはOSへのwriteであってsync_allによる電源断耐性の保証ではない。
+既存slow_ioのkind／既存fieldは保持するが、今後はwriter上のI/Oとしてtid／holderを記録する。producerのcaller情報は追加fieldで伝え、UIが16秒待ったかのような旧caller tidの偽装はしない。queue residenceは別kind `queue_delay` とし、batch・sinkごとの遅延件数と最大値だけを集約し、既存write_msへ足さない。診断はslow-onlyかつ有界、1レコードごとの自己診断を増やさない。既存解析の区間推定がwriter I/OとUI停止を混同しないよう `scripts/analyze_perf.py` のhitchesも同時確認する。
 
 ### 3.4 保存完了barrierとcheckpoint（r2追加、P2-1／P2-2共通）
 
@@ -105,7 +105,7 @@ hitchesはrecords_dropped（sink／理由／count／total）とdiagnostic_droppe
 
 ### 4.1 allocラインの .lock sidecar と取り込み境界
 
-利用者指定のstartup JSONL **`.lock` sidecar修正を維持する**。ただし基準HEADでは `crates/startup-diagnostics/src/output.rs:61` がJSONL本体をshared lockし、`:228` のretentionも本体をexclusive lockするコードであり、sidecar修正はまだこのHEADに無い。これは取り込み順の依存である。allocラインのcommit／契約をcoordinatorから取り込み、同じsidecarをwriterの生存証明／retention判定に使うことを確認してから実装・検証を完了する。他worktreeを編集しない。本件でJSONL本体lockへ戻す変更や独自の二つ目のlock方式を作らない。sidecarの既存schema／寿命／cleanupはalloc側仕様を正本とする。
+利用者指定のstartup JSONL **`.lock` sidecar修正を維持する**。ただし基準HEADでは `crates/startup-diagnostics/src/output.rs:61` がJSONL本体をshared lockし、`:228` のretentionも本体をexclusive lockするコードであり、sidecar修正はまだこのHEADに無い。これは取り込み順の依存である。利用者指定commit `90a8a9353` のsidecar修正／testsだけを現行session_headerへ移植し、同じsidecarをwriterの生存証明／retention判定に使うことを確認してから実装・検証を完了する。他worktreeを編集しない。本件でJSONL本体lockへ戻す変更や独自の二つ目のlock方式を作らない。sidecarの既存schema／寿命／cleanupはalloc側仕様を正本とする。
 
 ## 5. 終了、crash、まれなI/O失敗
 
@@ -117,7 +117,7 @@ hitchesはrecords_dropped（sink／理由／count／total）とdiagnostic_droppe
 
 startup writerのterminalは現行 `lib.rs:654–697` がpublish＋wakeだけで、flush完了ACKはない。また `output.rs:105–145` はbatch処理後にStoppedを見て戻るため、64件を超えるpending全体の排出保証でもない。**必要な最小共有変更**として、独立ownerが採用済みterminalまでのpendingを排出し、最後のflush／close後にACKする終了契約をstartup／alloc担当と合意する。容量上限到達／sink failureは成功ACKと区別する完了結果だけを返し、再試行や新しいqueueは足さない。通常publish／watchdogはACKを待たず、core／launcherの最終終了境界だけが同じbounded deadlineで待つ。一般writerがstartupファイルをopen／lock／flushする変更はしない。取り込み時にterminal順序・.lock sidecar寿命・retentionの担当をcoordinatorが確定し、既存terminal testに排出完了testを追加する。先行変更だけでACKがあるとは扱わない。
 terminalの最終1件は独立ownerの終了metadataとして保持し、通常journalの満杯／try_lock競合で失わない。writerが既存schemaのterminal行を末尾へ一度だけ出す（従来queue内との二重出力は禁止）。ファイル上限にもその一行分を予約する。途中stage記録の既存drop上限は維持し、通常queue全体を無損失化する仕組みは追加しない。この小さい保護とACKをstartup側の同じ終了ownerに置き、一般loggerに複製しない。
-open／write／rotation失敗はaffected sinkをそのprocess中Unavailableにし、自動再open／retry／回復queueを足さない。他sinkとUIを続け、memory statusへ一度だけ失敗を公開し、次の通常UIで「診断ログを保存できません。次回起動時に再試行します」を一度通知する案。次の起動で通常初期化を試す。失敗通知を失敗sinkへ書く再帰を作らない。shutdown timeout時は新しい同期panic.log書込みも試さない（上限を破るため）。未flush tailの欠落は利用者質問C356-3／4／5で明示承認を得る。
+open／write／rotation失敗はaffected sinkをそのprocess中Unavailableにし、自動再open／retry／回復queueを足さない。他sinkとUIを続け、memory statusへ一度だけ失敗を公開し、次の通常UIで「診断ログを保存できません。次回起動時に再試行します」を一度通知する。次の起動で通常初期化を試す。失敗通知を失敗sinkへ書く再帰を作らない。shutdown timeout時は新しい同期panic.log書込みも試さない（上限を破るため）。未flush tailの欠落はC356-3／4／5の2026-10-09回答で承認済み。
 
 ## 6. 状態の簡素化と互換性
 
@@ -146,18 +146,18 @@ open／write／rotation失敗はaffected sinkをそのprocess中Unavailableに�
 | 欠落による偽PASS | records_droppedがある場合、summary未保存でもACK counterがnonzeroの場合、counter不明、diagnostic_dropped、nonce／session違い、coverage不足、file末尾の不完全JSON、旧buildの全ケースで判定不能。headlessの `scripts/test_analyze_perf.py` とscriptのfake control／analyzer経路で非zeroとstatusを固定。完全・drop zero・checkpointありの空区間だけPASS可能 |
 | hitches／scroll／startup | records_droppedとdiagnostic_droppedを理由・sink・累計付きで表示し二重計上無し。欠落でhitches=0を断定しない、scrollのall_ready未保存を完了扱いしない、startup終点未保存を到達扱いしない。旧ログは参考値＋証拠不完全、checkpoint付き正常fixtureは従来数値。writer診断のtidとqueue_delayをUI停止へ誤帰属しない |
 
-focusedで有効なred→greenの後、`cargo fmt`／`cargo fmt --check`、`cargo test -p mimageviewer --lib`（pipe無し・実exit）、normal／portable `cargo check -p mimageviewer --bin mimageviewer-core`（portableは `--features portable`）、`python scripts/check_ui_glyphs.py`。startup crateも単体testし、UI失敗通知を変更するならui_snapshot。共用loggerの横断変更なので最終 `scripts/test-full.ps1` はcoordinatorと担当を決め実施し、valid evidenceを共有する。依頼された実装時にはbuild-devを作るが起動しない。現在のroundは文書のみなのでbuild／test／実機検証は行わない。
+focusedで有効なred→greenの後、`cargo fmt`／`cargo fmt --check`、`cargo test -p mimageviewer --lib`（pipe無し・実exit）、normal／portable `cargo check -p mimageviewer --bin mimageviewer-core`（portableは `--features portable`）、`python scripts/check_ui_glyphs.py`。startup crateも単体testし、UI失敗通知を変更するならui_snapshot。共用loggerの横断変更なので最終 `scripts/test-full.ps1` はcoordinatorと担当を決め実施し、valid evidenceを共有する。依頼された実装時にはbuild-devを作るが起動しない。実装roundでは指定された全gateとbuild-dev -PreserveRuntimeを実行し、製品は起動しない。
 利用者の実機確認は、coordinatorがbuild後に手順を渡す。起動・VST復元中の操作、perf ON/OFF、tray Quit、診断の保存と欠落summaryを確認する。重い並行build/testは観測条件だが、負荷を掛けた実機確認は別途利用者と計画し、こちらでは実行しない。
 
-## 8. 利用者への質問（未回答。r3でC356-3を変更、ほかは変更なし）
+## 8. 利用者決定（全5項目回答済み、2026-10-09）
 
-1. **C356-1 容量**: 通常ログとperfを合わせ、最大8,192件・本文合計8MiB・1件256KiBでよいですか。**推奨: はい。** メモリが増え続けない上限です。256KiBを超える通常記録は捨て、panic全文は独立panic.logへ残します。
-2. **C356-2 捨て方**: 満杯やqueue競合時は新しい通常／perf記録を捨て、保存が再開したときに欠落件数を記録してよいですか。**推奨: はい。** 起動直後の採用済み記録を残し、画面やstderr読取りを待たせません。panic／watchdog／常時起動診断はこのqueueへ移しません。
-3. **C356-3 保存完了と終了（r3変更）**: 通常は250msごとに保存し、終了時は通常／perfと起動診断を合わせて最大2秒待ち、間に合わなければ残りを諦めて終了してよいですか。診断ZIPは画面を止めず背景で作り、ログの保存完了を最大2秒待って確認します。過去にログが欠けていてもZIPを保存し、ZIP内の説明と画面で「証拠不完全」と知らせます。今回の要求印が欠けた・保存確認が時間切れ・必要なログを読めない場合は通知して作成失敗にします。性能の検証は、測定終了までの保存と欠落なしを確認できなければ「判定不能」として通しません。**推奨: はい。** 自動再試行は増やしません。ZIPを保存できても、性能の検証に使える完全な記録とは限りません。
-4. **C356-4 crash時**: panic／UI hangは独立panic.logへ直接書く一方、crash時に通常／perfの未保存queue全体を書き切る保証は設けない方針でよいですか。**推奨: はい。** 止まったwriterをpanic処理から待つ危険を避けます。panic.log自体もディスク故障や強制killでは保存を保証できません。
-5. **C356-5 まれな保存失敗**: ログ保存に失敗したら一度通知し、その保存先は次回起動まで使わず、再試行を増やさない扱いでよいですか。**推奨: はい。** 閲覧と他の診断先は継続し、利用者が作った設定やタグには触れません。
+1. **C356-1 容量（変更して決定）**: 262,144件・本文合計128MiB・1件1MiB。内部定数とし設定を増やさない。利用者PCの実測を理由として旧推奨8,192件から増量。
+2. **C356-2 捨て方（推奨を採用）**: 満杯／競合では新規記録を捨て、保存再開時に欠落件数と発生時間幅を記録。panic／watchdog／常時起動診断は独立経路を維持。
+3. **C356-3 保存完了と終了（推奨を採用、C356-4に合わせ周期を明確化）**: perfは250ms周期。終了は一般writerとstartup writer合計2秒。診断ZIPはworkerで完了barrierを待つ。過去欠落はmanifest／画面で証拠不完全を知らせZIP保存、今回要求印drop／barrier timeout／必須snapshot読取り失敗は作成失敗。性能gateは完全性不明・欠落ありなら判定不能。自動再試行なし。
+4. **C356-4 crash時（変更して決定）**: panic.log／UI hang watchdogは直接writeを維持。通常sinkは各到着batchを直ちにwrite・flushし、250ms周期にしない。perfだけ250ms周期。異常終了でqueue全体の排出は保証しない。ディスク障害や強制killでpanic.log自体の保存も保証できない。
+5. **C356-5 まれな保存失敗（推奨を採用）**: 一度通知し、affected sinkは次回起動までUnavailable、自動再試行なし。他sinkと閲覧を維持。設定・タグ等の利用者データには触れない。
 
-決定記録: **2026-10-09 利用者: 本件を次の版・ラインCへ入れる。今回は設計のみ。** 上記の数値・欠落・終了方針は、この決定で回答済みとは扱わない。
+未回答の利用者質問はない。実装には`90a8a9353`のstartup診断.lock lease修正と試験だけを移植し、allocator flavor／session_header変更は持ち込まない。
 
 ## 9. r2レビュー指摘への対応記録（2026-10-09）
 
@@ -170,3 +170,16 @@ focusedで有効なred→greenの後、`cargo fmt`／`cargo fmt --check`、`carg
 - **P2採用、coordinator決定を反映**: `src/diagnostics.rs:13/:87–96` のbest-effort収集と既存UIの保存path表示（`src/ui_dialogs/preferences/pages.rs:10662–10675`）を再照合。過去の欠落だけで以後の診断ZIPを禁止する必要はなく、残ったログ／panic.logを渡す既存機能を維持する。
 - §3.4／§3.5／§6／§7／C356-3を統一し、barrier保存完了と証拠完全性を分けた。過去の累計dropはmanifest・画面で証拠不完全を表示してZIPを保存。今回の要求印drop、barrier timeout、必須snapshotの読取り失敗は作成失敗を維持。性能gateは証拠不完全なら判定不能のまま。
 - この取扱いはcoordinatorの決定済み仕様。C356-3にはその説明を含め、保存周期／待機上限などの残る利用者回答を求める。製品コード・テスト・アプリ起動は変更／実行していない。
+
+## 11. 実装の所有・境界記録（2026-10-09）
+
+- `src/log_writer.rs` の単一Service／Workerが通常・perf sinkを所有。facadeはメモリ設定・publication登録・format・一回のtry_lock受付のみ。262,144件／128MiB／1MiBの制限はqueueと取出し中batchを合算する。通常batchは即flush、perfはdirty時250ms。定常idleでは新しいUI repaintを作らない。
+- Lifecycleは一つのtyped atomic phase（Running / Closing / Stopped / Failed）。ファイル状態はworker内のDisabled / Ready / Failed。別のinitialized boolを持たず、この状態で一回だけ初期化する。openの開始／終了時刻もworkerが採取し、slow-onlyのopen診断として残す。保存失敗の通知はClear / Pending / Reportedという一つのownerで一度だけ渡し、sinkは再openしない。BufWriterの失敗bufferを破棄する際もdropによるwrite再試行を避ける。
+- publication ticketは個別recordの履歴を無限に保持せず、単調増加cohortと二つのactive counterを使う。登録はtimestampより前、epoch不一致は一回でdrop確定。拒否の欠落counterはactive counterを減らす前に更新し、barrierが未集計の拒否を完了扱いしない。barrierは旧cohortが全settleするまでACKせず、timeoutでも旧cohortが終わるまで次のbarrierをBusyとし、slotの再利用を防ぐ。checkpointのticket_cutoff / settled / writtenはこのpublication境界番号であり、record件数ではない。境界以前のjournal prefixを固定件数だけ排出し、後続流入で飢餓にならない。
+- coverageはepoch変更前の絶対monotonic Instantを保持し、保存時に当該perf STARTへ換算する。perfの後発有効化がbarrierと交差しても、初期化時刻との差で過大なcoverageを作らない。producer timestamp／tidは既存record内で保持する。
+- 復帰した各batchの後で欠落summaryを記録し、queue全体が空になるまで通知を遅らせない。ACK前にdrop集計と両sinkをflushし、最後にcheckpoint自身をflush。checkpointの書込みを自己診断として後ろへ再帰出力しない。checkpointの総数は同時に採取した理由別counterから合計し、後続producerの欠落で両者が食い違わない。通常終了もshutdown checkpointを末尾に残す。file identityと確定offsetはcontrol ACK、固定prefix handle／長さは診断ZIPへ返す。
+- `src/log_writer/control_pipe.rs` はcurrent-user DACL、remote拒否、first-instance保護のlocal endpoint。UI／Remote操作queueを使わない。requestは4KiBまで、schema／pid／OS process creation／session／nonceを照合。overlapped transportはdeadline付きで、取消完了までbuffer／OVERLAPPEDを保持する。保存完了を示すACK以外の機能は持たない。
+- `src/lib.rs::finish_logs` はprocess内一つの2秒deadlineを保持し、run/mainの再呼出しでも待機上限を延長しない。runtime cleanupと実terminalを先に完了し、一般／startupを同じdeadlineで待つ。早期exit／scripted exit／TRT worker／bench_aiも接続。tray hideは変更しない。
+- `90a8a9353`からstartup .lock sidecar／retention試験のみ移植。allocator flavorやsession_header refactorは移植しない。startup writerは独立のまま、terminal保護・全pending排出・最終flush／close後ACKを追加。
+- 診断ZIPは実writer→自分の要求印→barrier→snapshot→ZIP経路で検証する。perf gateはcheckpoint・欠落数・session・nonce・coverage・prefixを確認し、旧ログは参考値だけ残してCannotJudgeとする。過去欠落のZIP警告は実配送fixtureとUI snapshotで確認する。
+- 同期loggerの有効REDはactual `logger::log`を使う隔離test harnessで取得（`target/C1356-legacy-logger-red.txt`）。通常profile／製品binaryを使わず、旧FILE所有guardを保持するとproducerの完了channelが解除前に届かず失敗した。新facadeは同じ隔離testと実worker I/O latchで検査する。最終gate結果はhandoffに記録する。

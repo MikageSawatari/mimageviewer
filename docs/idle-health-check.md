@@ -15,10 +15,13 @@
 PowerShell 側で測る。ただし空の窓を、perf log を書かない別 instance の sleep と誤認しないよう、
 外部 sampler は取得できた `Win32_Process.CommandLine` に `--perf-log` があることを、完全 sleep を
 許可するための必須証拠にする。WMI が拒否されて command line を取得できない環境では、path だけを
-記録して warning を出し、空の窓を FAIL にする。実行パスが取得できた場合は常に
+記録して warning を出し、空の窓の sleep 証明を認めない。実行パスが取得できた場合は常に
 `%APPDATA%\mimageviewer\runtime\` 配下のランチャー展開コピーではないことも確認する。
 analyzer の `session.start.pid` 照合はその後のログ整合性確認であり、単独ではプロセス同一性の証拠に
-しない。
+しない。2026-10-09の§1.356以降は、測定開始前と終了後の保存完了checkpointも必須とする。
+session累計の通常／perf／診断ログ欠落が一件でもある場合、完全性を確認できない場合、旧buildの場合は
+参考値を残して `CannotJudge`（判定不能、exit 2）にする。CPUが低い、保存済みframeが少ない、
+command lineに`--perf-log`があるという事実だけではPASSにしない。
 
 ## 2. 実行方法
 
@@ -63,14 +66,46 @@ perf log の `session.start.pid` と一致するプロセスを選ぶ。背面�
 既存の対象プロセスを明示する場合は `-ProcessId <PID>` を使う。そのプロセスが
 `--perf-log` なしで起動されていた場合、stale perf log を誤解析せずエラーにする。
 
-結果は `target/idle-health/` に 2 ファイル出る。
+結果は `target/idle-health/` に出る。
 
 - `*-perf.json`: update / repaint / work 反復の解析結果
 - `*-process.json`: CPU / ログ増加量、top-level / visible window 数、対象の
-  `identity_evidence` / `command_line` / `path`、`index_scan_wait` と、両検査を統合した最終 PASS / FAIL
+  `identity_evidence` / `command_line` / `path`、`index_scan_wait`、checkpoint／完全性失敗理由と、
+  両検査を統合した最終 PASS / FAIL / CannotJudge
+- `*-prefix.jsonl`: 終了checkpointのACKで確定したperfファイルのbyte prefix
+- `*-checkpoint.json`: 保存済みcheckpointとの照合に使うACK
 
-スクリプトは失敗時に exit 1 を返す。起動した mImageViewer は追加シナリオを続けられるよう
+スクリプトは性能・シナリオの失敗時にexit 1、証拠不完全時にexit 2を返す。判定不能はPASSへ変換しない。
+起動した mImageViewer は追加シナリオを続けられるよう
 終了させないので、検査後に通常操作で完全終了する。
+
+### 2.1 非同期ログの保存完了証明
+
+local logging-controlは`\\.\pipe\mimageviewer-log-{pid}-{process_start_unix_ms}`のnamed pipeを使う。
+u32 little-endianの長さに続くUTF-8 JSONで、schema、request ID（nonce）、PID、OS process作成時刻、
+session IDを指定する。clientのconnect／write／read全体は一つの2秒deadlineで、再要求しない。
+timeout、Busy、Closing、writer／sink failure、不一致は判定不能にする。計測用warmupや測定時間は
+残すが、固定sleepをflush完了の証明に使わない。制御requestはUI入力やrepaintを発生させない。
+
+開始前のACK取得後にCPU・wall time・ログサイズの測定を開始し、終了時の測定値を採取してから
+終了checkpointを要求する。sessionの`process_start_unix_ms`を実process作成時刻と照合し、
+`wall_unix_ms`／`wall_t`で測定境界をperfのmonotonic `t`へ換算する。終了ACKの`coverage_t`が測定末尾を
+覆い、publication cutoff以前のsettled／written watermark、両sink状態、三種の累計drop counterが
+明示されることを必須にする。drop summary未保存をzeroと推測しない。
+
+clientはACKの`perf_path`をread共有で開き、Windowsのvolume serial／file indexを`perf_file_identity`と
+照合する。同じhandleから`perf_end_offset`までだけ読み、後続append中のJSONやrotation後の別ファイルを
+混ぜない。analyzerはこのprefixのbyte長と保存済み`log.drain_checkpoint`をACKと照合する。
+完全性確認に失敗してもprocess reportにCPU・ログ増加量の参考値を残す。
+
+`idle-health`、`hitches`、`scroll`、`startup`は同じ完全性validatorを使う。手動で確定prefixを解析する場合は、
+`--checkpoint-id <nonce>`と測定末尾（idleは`--end-t`、他は`--coverage-end-t`）を指定する。
+live prefixには`--delivery-ack <ACK.json>`も渡す。終了済みsessionの末尾shutdown checkpoint、または
+診断ZIPを展開した`delivery_manifest.json`を`--delivery-manifest <path>`で指定した場合は、その確定境界まで
+解析できる。manifestのperf byte長・checkpoint・evidence_statusも検査する。
+証明のない旧ログは既存の参考値を表示し、検証用の終了コードは2となる。startupのfirst_frame、scrollの
+all_readyという終点自体が確認できない場合も判定不能とする。writer上のslow_io区間の重複だけで
+UIがそのI/Oを待ったとは判断しない。
 
 ## 3. リリース前シナリオ
 
@@ -175,9 +210,12 @@ Sourceの`thumb.decode_end`には、実際に生成へ使った`evaluated_displa
 
 ```powershell
 python scripts\test_analyze_perf.py
+.\scripts\test-idle-health-delivery.ps1
 ```
 
-このテストは `scripts/build-dist.ps1` の先頭でも必ず実行され、解析ゲート自体の退行がある
+Pythonテストは `scripts/build-dist.ps1` の先頭でも必ず実行され、解析ゲート自体の退行がある
 状態では配布ビルドへ進まない。hidden repaint scheduler の純ロジックは vendored eframe の
 unit test で production の throttle 関数に対して「即時要求を最短 100 ms 後へ送る」
 「既に先の予定を早めない」「既存要求の無い window に heartbeat を挿入しない」を検査する。
+logging-controlテストはアプリを起動せず、fake pipe→実client→file identityとprefix snapshot→実analyzerを
+通してdrop zeroの完全sleepがPASS、累計dropが非zeroならCannotJudge／exit 2となることを検査する。

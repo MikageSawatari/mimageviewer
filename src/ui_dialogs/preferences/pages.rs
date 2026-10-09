@@ -10631,6 +10631,53 @@ pub(super) fn page_susie_plugins(ui: &mut egui::Ui, state: &mut PreferencesState
     });
 }
 
+/// 本体とsnapshotで共用する描画。I/Oは提出後にworkerだけが行う。
+pub(super) fn draw_diagnostics_export(
+    ui: &mut egui::Ui,
+    view: &crate::diagnostics::ExportView,
+) -> (bool, Option<std::path::PathBuf>) {
+    use crate::diagnostics::ExportView;
+    let submit = ui
+        .add_enabled(
+            !matches!(view, ExportView::Running),
+            egui::Button::new("ログを zip にする"),
+        )
+        .clicked();
+    let mut open_folder = None;
+    match view {
+        ExportView::Running => {
+            ui.label("保存中…");
+        }
+        ExportView::Finished(Ok(saved)) => {
+            ui.add_space(6.0);
+            ui.colored_label(
+                egui::Color32::from_rgb(120, 200, 120),
+                format!("保存しました: {}", saved.path.display()),
+            );
+            if saved.evidence_incomplete {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    "証拠不完全: 一部のログが欠けています。残っているログを保存しました",
+                );
+            }
+            if let Some(parent) = saved.path.parent() {
+                if ui.button("保存先フォルダを開く").clicked() {
+                    open_folder = Some(parent.to_path_buf());
+                }
+            }
+        }
+        ExportView::Finished(Err(message)) => {
+            ui.add_space(6.0);
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("書き出しに失敗しました: {message}"),
+            );
+        }
+        ExportView::Idle => {}
+    }
+    (submit, open_folder)
+}
+
 /// 開発者 / 診断ページ。
 ///
 /// 普通の利用者が「再生できない」「重い」等の不具合をサポートに伝えるとき、
@@ -10652,34 +10699,12 @@ pub(super) fn page_developer(ui: &mut egui::Ui, state: &mut PreferencesState) {
         );
         ui.add_space(6.0);
 
-        if ui.button("ログを zip にする").clicked() {
-            // 利用者が明示的に押すボタンなので同期実行で問題ない
-            // (ログは通常数 MB、最大でも数十 MB で deflate 圧縮は速い)。
-            state.diag_export_result = Some(crate::diagnostics::export_diagnostics_zip());
+        let (submit, open_folder) = draw_diagnostics_export(ui, &state.diag_export_view);
+        if submit {
+            state.diag_export_submit = true;
         }
-
-        match &state.diag_export_result {
-            Some(Ok(path)) => {
-                ui.add_space(6.0);
-                ui.colored_label(
-                    egui::Color32::from_rgb(120, 200, 120),
-                    format!("保存しました: {}", path.display()),
-                );
-                let parent = path.parent().map(|p| p.to_path_buf());
-                if let Some(parent) = parent {
-                    if ui.button("保存先フォルダを開く").clicked() {
-                        open_in_explorer(&parent);
-                    }
-                }
-            }
-            Some(Err(msg)) => {
-                ui.add_space(6.0);
-                ui.colored_label(
-                    egui::Color32::from_rgb(230, 120, 120),
-                    format!("書き出しに失敗しました: {msg}"),
-                );
-            }
-            None => {}
+        if let Some(folder) = open_folder {
+            open_in_explorer(&folder);
         }
 
         ui.add_space(8.0);

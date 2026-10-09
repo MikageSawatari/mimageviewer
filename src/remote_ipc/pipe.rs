@@ -4031,13 +4031,13 @@ fn frame_error_kind(error: &mimageviewer_ipc::FrameError) -> &'static str {
 
 /// `PIPE_REJECT_REMOTE_CLIENTS` はネットワーク経由だけを拒否する。既定 DACL はローカルの
 /// Everyone に read を許すため、current user だけに full access を与える DACL を明示する。
-struct CurrentUserPipeSecurity {
+pub(crate) struct CurrentUserPipeSecurity {
     _acl: Vec<u32>,
     descriptor: SECURITY_DESCRIPTOR,
 }
 
 impl CurrentUserPipeSecurity {
-    fn attributes(&mut self) -> SECURITY_ATTRIBUTES {
+    pub(crate) fn attributes(&mut self) -> SECURITY_ATTRIBUTES {
         SECURITY_ATTRIBUTES {
             nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: (&mut self.descriptor as *mut SECURITY_DESCRIPTOR).cast(),
@@ -4046,7 +4046,7 @@ impl CurrentUserPipeSecurity {
     }
 }
 
-fn current_user_pipe_security() -> Result<CurrentUserPipeSecurity, std::io::Error> {
+pub(crate) fn current_user_pipe_security() -> Result<CurrentUserPipeSecurity, std::io::Error> {
     let mut token = HANDLE::default();
     unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
         .map_err(|_| std::io::Error::last_os_error())?;

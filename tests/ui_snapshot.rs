@@ -3018,3 +3018,67 @@ fn external_tool_preparing_dark() {
         },
     );
 }
+
+fn diagnostics_export_snapshot(
+    state: &str,
+    theme_name: &str,
+    theme: mimageviewer::os_theme::ResolvedTheme,
+) {
+    snapshot_with_theme_contrast_and_size(
+        &format!("diagnostics_export_{state}_{theme_name}"),
+        theme,
+        mimageviewer::settings::TextContrast::Standard,
+        egui::vec2(620.0, 180.0),
+        |ui| mimageviewer::draw_diagnostics_export_snapshot_fixture(ui, state),
+    );
+}
+
+#[test]
+fn diagnostics_export_running_light() {
+    diagnostics_export_snapshot(
+        "running",
+        "light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+    );
+}
+
+#[test]
+fn diagnostics_export_running_dark() {
+    diagnostics_export_snapshot(
+        "running",
+        "dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+    );
+}
+
+#[test]
+fn diagnostics_export_incomplete_light() {
+    diagnostics_export_snapshot(
+        "incomplete",
+        "light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+    );
+}
+
+#[test]
+fn diagnostics_export_incomplete_dark() {
+    diagnostics_export_snapshot(
+        "incomplete",
+        "dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+    );
+}
+
+#[test]
+fn diagnostics_export_error_light() {
+    diagnostics_export_snapshot(
+        "error",
+        "light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+    );
+}
+
+#[test]
+fn diagnostics_export_error_dark() {
+    diagnostics_export_snapshot("error", "dark", mimageviewer::os_theme::ResolvedTheme::Dark);
+}

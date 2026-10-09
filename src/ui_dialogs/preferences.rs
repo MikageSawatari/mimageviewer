@@ -17,6 +17,23 @@ use crate::ring_shortcut::{
 use crate::settings::{Parallelism, Settings};
 
 #[doc(hidden)]
+pub fn draw_diagnostics_export_snapshot_fixture(ui: &mut egui::Ui, state: &str) {
+    use crate::diagnostics::{ExportView, SavedExport};
+    let view = match state {
+        "running" => ExportView::Running,
+        "incomplete" => ExportView::Finished(Ok(SavedExport {
+            path: PathBuf::from(r"C:\Users\User\Desktop\mImageViewer_diag.zip"),
+            evidence_incomplete: true,
+        })),
+        "error" => ExportView::Finished(Err(
+            "ログの保存完了を確認できないため、書き出しに失敗しました".into(),
+        )),
+        _ => ExportView::Idle,
+    };
+    let _ = pages::draw_diagnostics_export(ui, &view);
+}
+
+#[doc(hidden)]
 pub fn draw_fullscreen_fit_cycle_settings_snapshot_fixture(ui: &mut egui::Ui) {
     let mut settings = Settings::default();
     settings.fullscreen_fit_cycle_excluded = vec!["Page".into(), "Width".into(), "Height".into()];
@@ -1118,9 +1135,10 @@ pub(crate) struct PreferencesState {
     #[cfg(windows)]
     pub vst3_auto_bypassed: Vec<(String, f64)>,
 
-    /// 開発者タブ「ログを zip にする」ボタンの直近の実行結果。
-    /// `Ok(path)` なら作成した zip パス、`Err(msg)` なら失敗理由を表示する。
-    pub diag_export_result: Option<Result<std::path::PathBuf, String>>,
+    /// Appのexport ownerから毎フレーム投影する進捗・結果。
+    pub diag_export_view: crate::diagnostics::ExportView,
+    /// One-shot UI command, not worker lifecycle state.
+    pub diag_export_submit: bool,
 }
 
 impl PreferencesState {
@@ -1614,7 +1632,8 @@ impl PreferencesState {
             vst3_show_unusable: false,
             #[cfg(windows)]
             vst3_auto_bypassed: Vec::new(),
-            diag_export_result: None,
+            diag_export_view: crate::diagnostics::ExportView::Idle,
+            diag_export_submit: false,
         }
     }
 
@@ -2393,6 +2412,7 @@ impl App {
         let favorite_view_state_active = self.settings.active_favorite_view_id().is_some();
         let clipboard_capture_startup_failed = self.clipboard_capture_startup_failed();
         if let Some(state) = self.pref_state.as_mut() {
+            state.diag_export_view = self.diagnostics_export.view();
             state.clipboard_capture_startup_failed = clipboard_capture_startup_failed;
             state.clipboard_capture_default_output_dir =
                 crate::clipboard_capture::default_destination();
@@ -2639,6 +2659,14 @@ impl App {
         }
 
         let mut close_requested_this_frame = false;
+        let submit_diagnostics = self
+            .pref_state
+            .as_mut()
+            .is_some_and(|state| std::mem::take(&mut state.diag_export_submit));
+        if submit_diagnostics {
+            self.diagnostics_export.submit(ctx);
+        }
+
         if apply {
             name_colors::clear_hex_editor(ctx);
             if let Some(mut state) = self.pref_state.take() {
