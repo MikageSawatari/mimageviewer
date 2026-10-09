@@ -586,11 +586,15 @@ pub fn convert_to_zip_with_password(
     progress: Option<&dyn Fn(ConvertProgress)>,
     options: ConvertOptions,
 ) -> Result<ArchiveImageSummary, ConvertError> {
+    let tmp_path = dst.with_extension("zip.part");
     if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent).map_err(|error| {
+            let error = ConvertError::Io(error);
+            log_conversion_failure("create_output_directory", src, &tmp_path, dst, &error);
+            error
+        })?;
     }
     // 中間ファイルに書いて atomic rename。途中失敗時に壊れた zip が残らないようにする。
-    let tmp_path = dst.with_extension("zip.part");
     let _ = std::fs::remove_file(&tmp_path);
     // 早期 return / panic のいずれでも .part を残さない RAII ガード。publish 成功後だけ
     // disarm する (成功時は tmp が消費済みなので掃除不要)。
@@ -604,14 +608,23 @@ pub fn convert_to_zip_with_password(
         cancel,
         progress,
         options.verify,
-    )?;
+    )
+    .map_err(|error| {
+        log_conversion_failure("convert", src, &tmp_path, dst, &error);
+        error
+    })?;
 
     if summary.image_count == 0 {
-        return Err(ConvertError::NoImages);
+        let error = ConvertError::NoImages;
+        log_conversion_failure("convert", src, &tmp_path, dst, &error);
+        return Err(error);
     }
 
     if options.verify {
-        verify_output_zip(&tmp_path, summary.image_count, cancel)?;
+        verify_output_zip(&tmp_path, summary.image_count, cancel).map_err(|error| {
+            log_conversion_failure("verify_output", src, &tmp_path, dst, &error);
+            error
+        })?;
     }
 
     // publish 直前の最終キャンセルチェック。検証中 / 検証後にキャンセルされたのに
@@ -621,6 +634,9 @@ pub fn convert_to_zip_with_password(
     }
 
     if let Err(e) = replace_file_atomic(&tmp_path, dst, options.no_clobber) {
+        // UI 向けの文言に置き換える前に、元の OS エラーと対象パスを記録する。
+        let error = ConvertError::Io(e);
+        log_conversion_failure("publish_zip", src, &tmp_path, dst, &error);
         // no_clobber の非置換 move が「既存 dst」で失敗した場合は、汎用 Io ではなく
         // 意味の分かるメッセージで返す (publish 直前に同名 zip が現れたレース)。
         if options.no_clobber && dst.exists() {
@@ -628,10 +644,36 @@ pub fn convert_to_zip_with_password(
                 "同名の ZIP が既に存在するため上書きしませんでした".to_string(),
             ));
         }
-        return Err(ConvertError::Io(e));
+        return Err(ConvertError::Archive(
+            "変換したZIPを保存できませんでした。保存先が使用中か、読み取り専用か、書き込みが許可されていません。"
+                .to_string(),
+        ));
     }
     tmp_guard.disarm();
     Ok(summary)
+}
+
+/// パスワード入力待ちと取消は通常の制御フローなので、失敗診断には含めない。
+fn log_conversion_failure(
+    operation: &str,
+    src: &Path,
+    tmp_path: &Path,
+    dst: &Path,
+    error: &ConvertError,
+) {
+    if matches!(
+        error,
+        ConvertError::Cancelled | ConvertError::PasswordRequired | ConvertError::BadPassword
+    ) {
+        return;
+    }
+    let native_error = match error {
+        ConvertError::Io(error) => error.raw_os_error(),
+        _ => None,
+    };
+    crate::logger::log(format!(
+        "archive_converter: failed operation={operation} src={src:?} tmp={tmp_path:?} dst={dst:?} native_error={native_error:?} error={error:?} detail={error}"
+    ));
 }
 
 fn verify_output_zip(
@@ -741,8 +783,18 @@ pub(crate) fn replace_file_atomic(
     };
     let tmp_wide: Vec<u16> = tmp_path.as_os_str().encode_wide().chain([0]).collect();
     let dst_wide: Vec<u16> = dst.as_os_str().encode_wide().chain([0]).collect();
-    unsafe { MoveFileExW(PCWSTR(tmp_wide.as_ptr()), PCWSTR(dst_wide.as_ptr()), flags) }
-        .map_err(|error| std::io::Error::other(error.to_string()))
+    unsafe { MoveFileExW(PCWSTR(tmp_wide.as_ptr()), PCWSTR(dst_wide.as_ptr()), flags) }.map_err(
+        |error| {
+            // windows が捕捉済みの HRESULT から Win32 エラーを復元する。wrapper 後の
+            // GetLastError は参照せず、raw_os_error を診断まで保持する。
+            let code = error.code().0 as u32;
+            if code & 0xffff_0000 == 0x8007_0000 {
+                std::io::Error::from_raw_os_error((code & 0xffff) as i32)
+            } else {
+                std::io::Error::other(error)
+            }
+        },
+    )
 }
 
 #[cfg(not(windows))]
@@ -1918,6 +1970,31 @@ mod tests {
 
         assert_eq!(std::fs::read(&dst).unwrap(), b"new zip");
         assert!(!tmp.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_atomic_replace_retains_native_error_for_locked_destination() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dst = dir.path().join("book.zip");
+        let tmp = dir.path().join("book.zip.part");
+        std::fs::write(&dst, b"old zip").unwrap();
+        std::fs::write(&tmp, b"new zip").unwrap();
+        // 読み書きは共有しても削除を共有しない handle は置換を拒否する。
+        let _held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x0000_0001 | 0x0000_0002)
+            .open(&dst)
+            .unwrap();
+
+        let error = replace_file_atomic(&tmp, &dst, false).unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(5)); // ERROR_ACCESS_DENIED
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"old zip");
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"new zip");
     }
 
     #[test]

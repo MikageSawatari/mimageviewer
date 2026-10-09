@@ -1455,6 +1455,35 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+2026-10-09 master統合後の一覧公開境界修正: 利用者指定の構造修正として、Bookmark一覧buildをmainの既存Surface lease・switch sequenceで所有し、mainの成功したitems交換だけが旧buildを退役させる。detached contextのmount・items交換・pollはmainのbuildを退役も採用もしない。同じBookmarkのsortは要求ownerを継続し、A/B記憶クリアは新epochで既存refreshを再開始する。Ctrl+Fの完了filterは送信済み条件を一緒に保持し、ViewerContextBundleの既存swap/park/dropとSmart退避で一緒に運ぶ。新しいdetached predicate・viewport・placement・待機・retry・pending ownerを設けず、公開先の所有証明と既存payloadの未接続を直すため、§2の症状パッチに当たらない。
+
+2026-10-09 §1.355追加修正: Coordinator指定の構造修正として、別窓bookmarkの既存startup resolve workerからtyped RAR header証明を採用境界へ運び、cache hit前に後続巻を拒否する。DFSも同じ証明で候補から除外する。新しいdetached predicate／viewport／待機／retryを作らず、既存requestの取消・held-owner再開・context所有を保つ。旧cacheの直接採用が共通の開封不変条件を迂回していた根因を入口ownerで直すため、§2の症状パッチに当たらない。
+
+**2026-10-08 §1.339 proof第4回監査・main切替要求の退役**
+
+mainのQuick Folder再選択／往復と検索owner切替を、既存sequence＋共通の未採用要求終了へ接続する。
+`main_folder_history_available`でmainだけを対象とし、main Bookmark resolver/Resolvingはnative IDで
+終了する。既存の`detached_lease`付きresolverは対象外。同じreaderの採用後AwaitingPage/帰路と
+committed warm PDF verificationは保持する。mainのsequenceをwindow bundleへ移さない。
+コピー前に元indexを読むDetachedGrid分類はRow、コピー後の読込は既存window lease/request IDで
+所有を証明する。detachedのmount/viewport/native reducer/placement/公開所有契約は変更しない。
+§9の単一main採用・要求別validator保持は8ca300171の独立構造レビューと利用者の実装指示に基づく。
+今回の実装担当の判断は、所有する受付境界で旧要求を終える構造修正であり、症状guardや追加stateではない。
+この修正版の設計担当検収・独立再レビューは待ちで、合意済みとは記録しない。
+全producer/consumer、scopeとphaseの監査は[async-architecture.md](async-architecture.md#source-proof選択箇所の監査2026-10-08)を参照。
+
+**2026-10-08 §1.350 r4 共有変換cache削除のsource-owner失効**
+
+利用者の独立レビュー指摘を受け、削除完了時の失効をmounted mapから全AtRest/Retiring
+bundleとSmart sessionの退避親payloadにも届ける。registryでは既存slot所有者へ同じ
+source map/解決batch失効helperを呼ぶだけで、parked contextをmountしない。
+共有ZIPストアの変異時だけCachedZipをPendingへ戻し、旧source batchをcancel/破棄する。
+read-only mount/swap/open/close、detached述語/viewport/native窓制御は変更しない。
+items、pin来歴、Direct、読込済み画像、読書保存keyを一括resetしない。
+Codex実装担当の判断は共有ストアの失効を各payload ownerへ届ける所有境界の修正であり、
+detachedの症状guardではない。設計担当の検収・独立再レビューは未実施で、合意済みとは記録しない。
+根因・経路監査・自動検証は[読書位置plan §17](book-resume-meter-plan.md#17-r4--退避した解決元ownerへのキャッシュ失効2026-10-08)を参照。
+
 **2026-10-08 §1.298 一覧背景の親操作を既存キー入口へ共有**
 
 独立レビュー済みの `grid-background-double-click-plan.md` と利用者決定に従い、
@@ -1463,7 +1492,6 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 active detached保存・fullscreen closeと、仮想ページ一覧からの既存close処理は、
 条件・順序・所有経路をそのまま移した。detached判定やviewport・mount・hostの変更、
 専用復元状態、症状パッチは追加していない。detached表示面そのものは背景判定の対象外。
-
 
 **2026-10-06 §1.241 plan A Phase A 起動診断・Indexer単一採用**
 

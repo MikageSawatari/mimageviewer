@@ -512,6 +512,10 @@ pub(crate) mod content_identity_restore;
 #[cfg(windows)]
 mod detached_window_manager;
 mod facet_name_filter;
+mod facet_navigation;
+#[cfg(test)]
+mod rar_archive_cache_tests;
+pub(crate) use facet_navigation::{FacetNavigationState, FacetRoute, FacetScope};
 pub(crate) mod folder_scan;
 #[cfg(test)]
 mod media_resume_meter_tests;
@@ -639,10 +643,10 @@ const CURRENT_FOLDER_WATCH_DEBOUNCE_MS: u64 = 700;
 const COLORIZE_MONO_SUMMARY_BUDGET_PER_FRAME: usize = 4;
 static NEXT_HISTORY_ARCHIVE_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FolderNavHistorySnapshot {
-    back_stack: Vec<FolderNavHistoryTarget>,
-    forward_stack: Vec<FolderNavHistoryTarget>,
+    back_stack: Vec<FolderNavHistoryEntry>,
+    forward_stack: Vec<FolderNavHistoryEntry>,
     recent_folders: Vec<PathBuf>,
     suppress_record_once: bool,
     quick_folder_workspaces: [QuickFolderWorkspace; 2],
@@ -654,7 +658,7 @@ pub(crate) struct FolderNavHistorySnapshot {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FolderHistoryDirection {
+pub(crate) enum FolderHistoryDirection {
     Back,
     Forward,
 }
@@ -676,12 +680,7 @@ enum RatingNavigationIntent {
 #[derive(Clone)]
 pub(crate) struct RatingNavigationTransition {
     intent: RatingNavigationIntent,
-    history_before: FolderNavHistorySnapshot,
-    source_context: ViewerContextId,
-    source_surface_generation: u64,
-    source_items_generation: u64,
-    source_slot: Option<QuickFolderSlotId>,
-    source_slot_switch_sequence: u64,
+    navigation: MainListNavigation,
     target_stars: u8,
     target_sort: crate::rating_view::RatingViewSort,
     target_display_order: crate::settings::GridDisplayOrder,
@@ -692,6 +691,13 @@ pub(crate) struct RatingNavigationTransition {
 
 /// Provenance captured by a user open from an adopted Rating root or child. A worker may
 /// preflight the physical destination, but only this exact source may commit its BS chain.
+impl std::ops::Deref for RatingNavigationTransition {
+    type Target = MainListNavigation;
+    fn deref(&self) -> &Self::Target {
+        &self.navigation
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RatingPhysicalLoadOwner {
     intent: RatingPhysicalLoadIntent,
@@ -714,11 +720,33 @@ enum RatingPhysicalLoadIntent {
     Restore,
 }
 
+/// One build owns the main Bookmark surface, independently of row hydration/sorting.
+pub(crate) struct BookmarkBrowserBuild {
+    source: smart_folder::SmartFolderSourceLease,
+    switch_sequence: u64,
+    worker: crate::bookmark_browser::BookmarkBrowserPending,
+}
+impl std::ops::Deref for BookmarkBrowserBuild {
+    type Target = crate::bookmark_browser::BookmarkBrowserPending;
+    fn deref(&self) -> &Self::Target {
+        &self.worker
+    }
+}
+impl std::ops::DerefMut for BookmarkBrowserBuild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.worker
+    }
+}
+impl Drop for BookmarkBrowserBuild {
+    fn drop(&mut self) {
+        self.worker.cancel();
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct QuickFolderSwitchLoadOwner {
     source_context: ViewerContextId,
     source_surface_generation: u64,
-    source_items_generation: u64,
     source_slot: Option<QuickFolderSlotId>,
     source_slot_switch_sequence: u64,
     target_slot: QuickFolderSlotId,
@@ -781,6 +809,13 @@ enum PhysicalHistoryIntent {
     CollectionGrid {
         owner: top_level_grid_view::CollectionGridPhysicalLoadOwner,
     },
+    CollectionNavigation {
+        owner: Box<collection_navigation::PreparedCollectionPhysicalNavigation>,
+    },
+    Bookmark {
+        owner: crate::bookmark_browser::BookmarkOpenRequestOwner,
+        auto_fullscreen: bool,
+    },
     QuickFolder {
         slot: QuickFolderSlotId,
     },
@@ -798,13 +833,7 @@ pub(crate) struct PhysicalHistoryTransition {
     path_owner: Option<crate::pdf_loader::LeasedEpubPath>,
     classified_kind: Option<OpenPathKind>,
     phase: PhysicalHistoryPhase,
-    history_before: FolderNavHistorySnapshot,
-    source_context: ViewerContextId,
-    source_surface_generation: u64,
-    source_items_generation: u64,
-    source_slot: Option<QuickFolderSlotId>,
-    source_slot_switch_sequence: u64,
-    source_location: Option<FolderNavHistoryTarget>,
+    navigation: MainListNavigation,
     dfs_continuation: Option<PhysicalHistoryDfsContinuation>,
     favsearch_origin: bool,
     tag_view_origin: bool,
@@ -812,13 +841,62 @@ pub(crate) struct PhysicalHistoryTransition {
     grid_open_effects: Option<GridVirtualOpenEffects>,
 }
 
-struct PhysicalHistoryDfsContinuation {
+impl std::ops::Deref for PhysicalHistoryTransition {
+    type Target = MainListNavigation;
+    fn deref(&self) -> &Self::Target {
+        &self.navigation
+    }
+}
+
+pub(super) struct PhysicalHistoryDfsContinuation {
     queued_steps: i32,
     mode: FolderNavMode,
     history_trigger: HistoryTrigger,
     restore_video_tile: bool,
     resume_slideshow: bool,
     fullscreen: bool,
+}
+
+struct PreparedReadingHistoryList {
+    inputs: ReadingHistoryLoadInputs,
+    existing_keys: HashSet<String>,
+    token: PreparedVisibleInstall,
+}
+
+enum BookmarkSurfaceEntrance {
+    Menu,
+    History,
+    Restore,
+}
+
+enum PreparedSyntheticSurface {
+    Drive {
+        origin: Option<PathBuf>,
+    },
+    Reading {
+        prepared: PreparedReadingHistoryList,
+        entries: Vec<crate::reading_history_db::ReadingHistoryEntry>,
+    },
+    Bookmarks {
+        token: PreparedVisibleInstall,
+        entrance: BookmarkSurfaceEntrance,
+    },
+}
+
+pub(super) enum MainListAfterHydration {
+    JumpSelection(crate::ui_dialogs::context_menu::JumpToFolderSelection),
+    CollectionNavigation {
+        owner: Box<collection_navigation::PreparedCollectionPhysicalNavigation>,
+        ctx: egui::Context,
+    },
+    Dfs {
+        continuation: PhysicalHistoryDfsContinuation,
+        ctx: egui::Context,
+    },
+    RequiredFullscreen {
+        target: crate::snapshot::SnapshotTarget,
+        history_trigger: HistoryTrigger,
+    },
 }
 
 enum PhysicalHistoryPhase {
@@ -843,15 +921,16 @@ pub(crate) struct CollectionHistoryTransition {
     target: FolderNavHistoryTarget,
     target_owner: Option<crate::pdf_loader::LeasedEpubPath>,
     classified_kind: Option<OpenPathKind>,
-    history_before: FolderNavHistorySnapshot,
-    source_context: ViewerContextId,
-    source_surface_generation: u64,
-    source_items_generation: u64,
-    source_slot: Option<QuickFolderSlotId>,
-    source_slot_switch_sequence: u64,
-    source_location: Option<FolderNavHistoryTarget>,
-    return_to: Option<top_level_grid_view::TopLevelGridRestore>,
+    navigation: MainListNavigation,
+    return_to: Option<top_level_grid_view::TopLevelGridOrigin>,
     phase: CollectionHistoryPhase,
+}
+
+impl std::ops::Deref for CollectionHistoryTransition {
+    type Target = MainListNavigation;
+    fn deref(&self) -> &Self::Target {
+        &self.navigation
+    }
 }
 
 pub(crate) enum HistoryNavigationTransition {
@@ -869,6 +948,7 @@ pub(crate) struct OpenPathClassification {
     cancel: Arc<AtomicBool>,
     rx: mpsc::Receiver<std::io::Result<ClassifiedOpenPath>>,
     continuation: Option<Box<ClassifiedOpenContinuation>>,
+    navigation: Option<MainListNavigation>,
     grid_open_effects: Option<GridVirtualOpenEffects>,
 }
 
@@ -886,16 +966,17 @@ enum OpenPathKind {
 }
 
 struct ClassifiedOpenPath {
+    rar_volume_proof: Option<crate::rar_loader::RarVolumeProof>,
     kind: OpenPathKind,
     folder_scan: Option<ScannedDir>,
 }
 
 enum ClassifiedOpenContinuation {
+    SnapshotArchiveCacheOnly(snapshot_ops::SnapshotArchiveCacheOpen),
     DirectNavigation {
         restore_intent: StartupListIntent,
         pre_scan: Option<ScannedDir>,
         owner: OpenRequestOwner,
-        history_nav_rollback: Option<FolderNavHistorySnapshot>,
         pane_epub_restore: Option<crate::ui_dialogs::epub_convert::EpubOpenRestore>,
     },
     BookmarkRow(Box<crate::bookmark_browser::BookmarkBrowserRow>),
@@ -929,7 +1010,7 @@ enum ClassifiedOpenContinuation {
     Collection {
         target: FolderNavHistoryTarget,
         intent: CollectionHistoryIntent,
-        return_to: Option<top_level_grid_view::TopLevelGridRestore>,
+        return_to: Option<top_level_grid_view::TopLevelGridOrigin>,
     },
 }
 
@@ -970,6 +1051,201 @@ impl PartialEq for FolderNavHistoryTarget {
 }
 
 impl Eq for FolderNavHistoryTarget {}
+
+/// A committed history destination carries its facet lineage with its typed location.
+/// The route contains identities only; historical filter values are never copied here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FolderNavHistoryEntry {
+    pub(crate) location: FolderNavHistoryTarget,
+    pub(crate) route: FacetRoute,
+}
+
+impl FolderNavHistoryEntry {
+    pub(crate) fn new(location: FolderNavHistoryTarget, route: FacetRoute) -> Self {
+        Self { location, route }
+    }
+    fn into_path(self) -> Option<PathBuf> {
+        self.location.into_path()
+    }
+}
+
+impl From<FolderNavHistoryTarget> for FolderNavHistoryEntry {
+    fn from(location: FolderNavHistoryTarget) -> Self {
+        let route = FacetRoute::root(App::facet_scope_for_location(&location));
+        Self { location, route }
+    }
+}
+
+impl std::ops::Deref for FolderNavHistoryEntry {
+    type Target = FolderNavHistoryTarget;
+    fn deref(&self) -> &Self::Target {
+        &self.location
+    }
+}
+
+impl PartialEq<FolderNavHistoryTarget> for FolderNavHistoryEntry {
+    fn eq(&self, other: &FolderNavHistoryTarget) -> bool {
+        &self.location == other
+    }
+}
+
+#[cfg(test)]
+impl PartialEq<PathBuf> for FolderNavHistoryEntry {
+    fn eq(&self, other: &PathBuf) -> bool {
+        self.location == *other
+    }
+}
+
+/// One cursor plan travels with the latest replay worker. The committed vectors are a
+/// read-only baseline until adoption; reversing to the origin simply drops this value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FolderHistoryPlan {
+    pub(crate) virtual_current: Option<FolderNavHistoryEntry>,
+    pub(crate) previous: Option<FolderNavHistoryEntry>,
+    original_back: Vec<FolderNavHistoryEntry>,
+    original_forward: Vec<FolderNavHistoryEntry>,
+    virtual_back: Vec<FolderNavHistoryEntry>,
+    virtual_forward: Vec<FolderNavHistoryEntry>,
+    quick_slot: Option<QuickFolderSlotId>,
+}
+
+impl FolderHistoryPlan {
+    pub(crate) fn capture(
+        app: &App,
+        direction: FolderHistoryDirection,
+        target: FolderNavHistoryEntry,
+    ) -> Option<Self> {
+        let (back, forward) = app.active_folder_history_vectors();
+        let mut plan = Self {
+            previous: app.folder_nav_current_entry(),
+            virtual_current: app.folder_nav_current_entry(),
+            original_back: back.to_vec(),
+            original_forward: forward.to_vec(),
+            virtual_back: back.to_vec(),
+            virtual_forward: forward.to_vec(),
+            quick_slot: app.active_quick_folder_slot,
+        };
+        (plan.advance(direction).as_ref() == Some(&target)).then_some(plan)
+    }
+
+    pub(crate) fn advance(
+        &mut self,
+        direction: FolderHistoryDirection,
+    ) -> Option<FolderNavHistoryEntry> {
+        let (from, to) = match direction {
+            FolderHistoryDirection::Back => (&mut self.virtual_back, &mut self.virtual_forward),
+            FolderHistoryDirection::Forward => (&mut self.virtual_forward, &mut self.virtual_back),
+        };
+        let target = from.pop()?;
+        if let Some(current) = &self.virtual_current
+            && !App::folder_nav_targets_eq(&current.location, &target.location)
+        {
+            App::push_folder_nav_stack(to, current.clone());
+        }
+        self.virtual_current = Some(target.clone());
+        Some(target)
+    }
+
+    pub(crate) fn is_current(&self, app: &App) -> bool {
+        let (back, forward) = app.active_folder_history_vectors();
+        self.quick_slot == app.active_quick_folder_slot
+            && back == self.original_back
+            && forward == self.original_forward
+    }
+
+    pub(crate) fn returned_to_origin(&self) -> bool {
+        match (&self.virtual_current, &self.previous) {
+            (Some(current), Some(previous)) => {
+                App::folder_nav_targets_eq(&current.location, &previous.location)
+                    && current.route == previous.route
+            }
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn commit(self, app: &mut App) {
+        if let Some(workspace) = app.active_quick_folder_workspace_mut() {
+            workspace.history.back_stack = self.virtual_back;
+            workspace.history.forward_stack = self.virtual_forward;
+            workspace.history.suppress_record_once = false;
+        } else {
+            app.folder_nav_back_stack = self.virtual_back;
+            app.folder_nav_forward_stack = self.virtual_forward;
+            app.suppress_folder_nav_record_once = false;
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MainListSourceProof {
+    /// Existing row-bound physical owners retain their generation/revision validators.
+    Row,
+    /// Snapshot entries use their own row identity across cached backing preparation.
+    Snapshot(snapshot_ops::SnapshotArchiveSourceProof),
+    /// Copied destinations use stable surface meaning; all proofs also check the switch epoch.
+    Surface(smart_folder::SmartFolderSourceLease),
+    /// Bookmark resolution belongs to the stable request ID and return target, not its rows.
+    Bookmark(crate::bookmark_browser::BookmarkOpenRequestOwner),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DirectNavigationPurpose {
+    Navigation,
+    ExitTemporaryView {
+        selection: crate::ui_dialogs::context_menu::JumpToFolderSelection,
+    },
+}
+
+/// Native worker owner retained while a newly admitted main request replaces sibling intents.
+/// This is an admission argument, not another pending state or source-generation guard.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum MainListRequestOwner {
+    Classification,
+    Physical,
+    Rating,
+    Smart,
+    Collection,
+    Pane,
+    Subfolder,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MainHistoryOperation {
+    Direct(DirectNavigationPurpose),
+    Replay(Box<FolderHistoryPlan>),
+    Restore { route: Option<FacetRoute> },
+    SameLocation,
+}
+
+/// The only navigation value owns the return entry, native source proof and cursor intent.
+/// Native row fields are captured once; Surface ignores row generation, never the switch epoch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MainListNavigation {
+    history_before: Box<FolderNavHistorySnapshot>,
+    source_context: ViewerContextId,
+    source_surface_generation: u64,
+    source_items_generation: u64,
+    source_slot: Option<QuickFolderSlotId>,
+    source_slot_switch_sequence: u64,
+    pub(crate) source_location: Option<FolderNavHistoryEntry>,
+    pub(crate) source_proof: MainListSourceProof,
+    pub(crate) history: MainHistoryOperation,
+    selection_after_load: Option<String>,
+}
+
+pub(crate) struct MainListAdoption {
+    navigation: MainListNavigation,
+    destination: FolderNavHistoryEntry,
+}
+
+pub(crate) type MainListHydration = Option<(sidecar_restore::SidecarLoadContinuation, bool)>;
+
+/// A visible EPUB lease is acquired once before facet/history mutation and moved into the
+/// installer. Cache deletion cannot turn a prepared success into a late install refusal.
+pub(crate) struct PreparedVisibleInstall {
+    display_epub_source: Option<crate::pdf_loader::LeasedEpubPath>,
+}
 
 impl FolderNavHistoryTarget {
     pub(crate) fn from_restore(restore: &top_level_grid_view::TopLevelGridRestore) -> Option<Self> {
@@ -1056,8 +1332,8 @@ pub(crate) enum QuickFolderSwitchTarget {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct FolderNavHistoryState {
-    pub back_stack: Vec<FolderNavHistoryTarget>,
-    pub forward_stack: Vec<FolderNavHistoryTarget>,
+    pub back_stack: Vec<FolderNavHistoryEntry>,
+    pub forward_stack: Vec<FolderNavHistoryEntry>,
     pub suppress_record_once: bool,
 }
 
@@ -1362,7 +1638,7 @@ pub(crate) enum PdfOpenPhase {
 /// The direct PDF request keeps its source until enumeration proves the destination usable.
 /// No visible grid/surface change belongs to an unadopted request.
 pub(crate) struct DirectPdfAdoption {
-    history_origin: Option<FolderNavHistoryTarget>,
+    navigation: MainListNavigation,
     grid_open_effects: Option<GridVirtualOpenEffects>,
 }
 
@@ -4207,6 +4483,48 @@ struct PreparedZipGrid {
     has_foreign_archives: bool,
 }
 
+/// Only materialized, admitted memory payloads may cross the main adoption boundary.
+enum PreparedPhysicalListing {
+    Folder(PreparedScannedFolderListing),
+    Zip {
+        backing: PathBuf,
+        prepared: PreparedZipGrid,
+    },
+    Pdf {
+        path: PathBuf,
+        source: crate::pdf_loader::LeasedEpubPath,
+        items: Vec<GridItem>,
+        image_metas: Vec<Option<(i64, i64)>>,
+        existing_keys: HashSet<String>,
+        pages: crate::pdf_loader::PdfEnumerateResult,
+        password: Option<String>,
+    },
+}
+
+impl PreparedPhysicalListing {
+    fn items(&self) -> &[GridItem] {
+        match self {
+            Self::Folder(prepared) => &prepared.items,
+            Self::Zip { prepared, .. } => &prepared.items,
+            Self::Pdf { items, .. } => items,
+        }
+    }
+    fn source_path(&self) -> &Path {
+        match self {
+            Self::Folder(prepared) => &prepared.path,
+            Self::Zip { backing, .. } => backing,
+            Self::Pdf { path, .. } => path,
+        }
+    }
+    fn book_prefix(&self) -> Option<String> {
+        match self {
+            Self::Zip { prepared, .. } => Some(prepared.nav.current().join("/")),
+            Self::Pdf { .. } => Some(String::new()),
+            Self::Folder(_) => None,
+        }
+    }
+}
+
 /// Geometry of the single UI pane, usable only by the context/generation that laid it out.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) enum GridAspectLayout {
@@ -4248,6 +4566,31 @@ struct FolderListingMetrics {
     scan_started: std::time::Instant,
     pre_scanned: bool,
     path_display: String,
+}
+
+pub(crate) struct PreparedScannedFolderListing {
+    path: PathBuf,
+    pub(crate) items: Vec<GridItem>,
+    image_metas: Vec<Option<(i64, i64)>>,
+    existing_keys: HashSet<String>,
+    video_items: Vec<(usize, PathBuf, u64)>,
+    folder_signature: folder_scan::FolderScanSignature,
+    prepared_folder_rating: Option<(HashMap<usize, u8>, u64, f64)>,
+    video_thumb_overrides: Vec<(PathBuf, PathBuf)>,
+    audio_inventory: Option<HashSet<String>>,
+    omitted: folder_scan::OmittedFolderEntryCounts,
+    rating_order_failed: bool,
+    auto_open_image_folder: bool,
+    restore_intent: StartupListIntent,
+    metrics: FolderListingMetrics,
+    stack_order_request: crate::rating_sort::ListingOrderRequest,
+    stack_async_prep: Option<(
+        bool,
+        char,
+        crate::filename_stack_ui::StackListingSource,
+        HashSet<String>,
+        PathBuf,
+    )>,
 }
 
 impl Drop for ZipEnumeratePending {
@@ -4314,6 +4657,7 @@ impl StartupOpenPathSource {
 
 /// `resolve_openable_path_detailed` を UI スレッド外で済ませた結果。
 pub(crate) struct StartupOpenPathResolveResult {
+    rar_volume_proof: Option<crate::rar_loader::RarVolumeProof>,
     requested: PathBuf,
     resolved: Option<crate::folder_tree::OpenablePathResolution>,
     /// 本ブックマークの relative page だけ、open 時点の containment + existence。
@@ -4329,6 +4673,7 @@ pub(crate) struct StartupOpenPathResolveResult {
 pub(crate) struct StartupOpenPathResolvePending {
     requested: crate::pdf_loader::LeasedEpubPath,
     owner: StartupOpenPathOwner,
+    navigation: Option<MainListNavigation>,
     cancel: Arc<AtomicBool>,
     rx: mpsc::Receiver<StartupOpenPathResolveResult>,
     started_at: std::time::Instant,
@@ -5849,6 +6194,7 @@ pub(crate) struct FolderPaneOpenPending {
     /// この request に内包し、main の仮想一覧や別の deferred field に依存しない。
     purpose: FolderOpenScanPurpose,
     epub_restore: Option<crate::ui_dialogs::epub_convert::EpubOpenRestore>,
+    navigation: Option<MainListNavigation>,
 }
 
 impl FolderPaneOpenPending {
@@ -5971,10 +6317,11 @@ pub(crate) struct FolderPaneOpenReady {
     scan: std::io::Result<ScannedDir>,
     purpose: FolderOpenScanPurpose,
     epub_restore: Option<crate::ui_dialogs::epub_convert::EpubOpenRestore>,
+    navigation: Option<MainListNavigation>,
 }
 
 /// What happened to the view which a pane scan was going to replace. The EPUB
-/// rollback has exactly one owner until the successor is visibly adopted.
+/// address preview has one owner until the successor is visibly adopted.
 #[derive(Clone, Copy)]
 enum PaneOpenRestoreExit {
     ReplacedByPaneScan,
@@ -5989,6 +6336,7 @@ struct ResolvedMainFolderOpen {
     scan: ScannedDir,
     collection_owner: Option<top_level_grid_view::CollectionGridPhysicalLoadOwner>,
     epub_restore: Option<crate::ui_dialogs::epub_convert::EpubOpenRestore>,
+    navigation: Option<MainListNavigation>,
 }
 
 impl FolderPaneOpenReady {
@@ -6013,17 +6361,52 @@ enum DetachedPhysicalFolderOpenPoll {
 /// 1 件ずつ終端状態へ遷移する。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ConvertedArchiveSourceState {
+    // Native volume evidence belongs to the same owner as thumbnail/cache resolution.
+    Rar {
+        volume: crate::rar_loader::RarVolumeProof,
+        source: Box<ConvertedArchiveSourceState>,
+    },
     Pending,
     Direct(PathBuf),
-    CachedZip(PathBuf),
-    Unavailable,
+    CachedZip {
+        logical_source: PathBuf,
+        path: PathBuf,
+    },
+    // No loadable cache; retain the worker-confirmed logical book for its stable resume key.
+    // None means metadata/header resolution could not establish that identity.
+    Unavailable {
+        logical_source: Option<PathBuf>,
+    },
 }
 
 impl ConvertedArchiveSourceState {
+    pub(crate) fn read_source(&self) -> &Self {
+        match self {
+            Self::Rar { source, .. } => source.read_source(),
+            source => source,
+        }
+    }
+
+    pub(crate) fn rar_volume_proof(&self) -> Option<&crate::rar_loader::RarVolumeProof> {
+        match self {
+            Self::Rar { volume, .. } => Some(volume),
+            _ => None,
+        }
+    }
+
+    fn invalidate_cached_paths(paths: &mut HashMap<String, Self>) {
+        for state in paths.values_mut() {
+            if matches!(state.read_source(), Self::CachedZip { .. }) {
+                *state = Self::Pending;
+            }
+        }
+    }
+
     pub(crate) fn load_path(&self) -> Option<&Path> {
         match self {
-            Self::Direct(path) | Self::CachedZip(path) => Some(path),
-            Self::Pending | Self::Unavailable => None,
+            Self::Rar { source, .. } => source.load_path(),
+            Self::Direct(path) | Self::CachedZip { path, .. } => Some(path),
+            Self::Pending | Self::Unavailable { .. } => None,
         }
     }
 
@@ -6033,10 +6416,11 @@ impl ConvertedArchiveSourceState {
 
     fn perf_label(&self) -> &'static str {
         match self {
+            Self::Rar { source, .. } => source.perf_label(),
             Self::Pending => "pending",
             Self::Direct(_) => "direct",
-            Self::CachedZip(_) => "cached_zip",
-            Self::Unavailable => "unavailable",
+            Self::CachedZip { .. } => "cached_zip",
+            Self::Unavailable { .. } => "unavailable",
         }
     }
 }
@@ -6384,10 +6768,22 @@ fn resolve_converted_archive_candidate(
     cancel: &AtomicBool,
     input_seq: u64,
 ) -> Option<ConvertedArchiveSourceState> {
-    resolve_converted_archive_candidate_with(
+    let mut volume = None;
+    let source = resolve_converted_archive_candidate_with(
         candidate,
         cancel,
-        |path| crate::rar_loader::resolved_volume_path(path).map(|(resolved, _)| resolved),
+        |path| {
+            let proof = crate::rar_loader::volume_proof(path)?;
+            volume = Some(proof.clone());
+            match proof {
+                crate::rar_loader::RarVolumeProof::First => Ok(path.to_path_buf()),
+                crate::rar_loader::RarVolumeProof::Subsequent { first } => Ok(first),
+                crate::rar_loader::RarVolumeProof::UnknownEncrypted => Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "encrypted RAR volume header",
+                )),
+            }
+        },
         |path, mtime, file_size| db.and_then(|db| db.peek(path, mtime, file_size)),
         |path, cancel| {
             crate::rar_loader::inspect_for_direct_read_cancelable_traced(
@@ -6398,7 +6794,14 @@ fn resolve_converted_archive_candidate(
             )
             .map(|inspection| (inspection.decision, inspection.resolved_path))
         },
-    )
+    )?;
+    Some(match volume {
+        Some(volume) => ConvertedArchiveSourceState::Rar {
+            volume,
+            source: Box::new(source),
+        },
+        None => source,
+    })
 }
 
 fn resolve_converted_archive_candidate_with(
@@ -6415,6 +6818,8 @@ fn resolve_converted_archive_candidate_with(
         return None;
     }
     let mut cache_src = candidate.path.clone();
+    let mut logical_source =
+        (!crate::rar_loader::is_rar_path(&candidate.path)).then(|| cache_src.clone());
     let mut cache_mtime = candidate.mtime;
     let mut cache_file_size = candidate.file_size;
     if crate::rar_loader::is_rar_path(&candidate.path) {
@@ -6423,6 +6828,7 @@ fn resolve_converted_archive_candidate_with(
         // a valid converted ZIP then avoids the full per-entry direct-read inspection entirely.
         if let Ok(resolved_path) = resolve_volume(&candidate.path) {
             cache_src = resolved_path;
+            logical_source = Some(cache_src.clone());
             if cache_src != candidate.path
                 && let Ok(metadata) = std::fs::metadata(&cache_src)
             {
@@ -6435,20 +6841,28 @@ fn resolve_converted_archive_candidate_with(
         return None;
     }
     if let Some(cached) = peek(&cache_src, cache_mtime, cache_file_size) {
-        return Some(ConvertedArchiveSourceState::CachedZip(cached));
+        return Some(ConvertedArchiveSourceState::CachedZip {
+            logical_source: cache_src.clone(),
+            path: cached,
+        });
     }
     if cancel.load(Ordering::Relaxed) {
         return None;
     }
     if !crate::rar_loader::is_rar_path(&candidate.path) {
-        return Some(ConvertedArchiveSourceState::Unavailable);
+        return Some(ConvertedArchiveSourceState::Unavailable {
+            logical_source: Some(cache_src),
+        });
     }
     match inspect(&candidate.path, cancel) {
         Ok((crate::rar_loader::RarDirectReadDecision::Direct, resolved_path)) => {
             Some(ConvertedArchiveSourceState::Direct(resolved_path))
         }
         Err(error) if error.kind() == std::io::ErrorKind::Interrupted => None,
-        Ok(_) | Err(_) => Some(ConvertedArchiveSourceState::Unavailable),
+        Ok((_, resolved_path)) => Some(ConvertedArchiveSourceState::Unavailable {
+            logical_source: Some(resolved_path),
+        }),
+        Err(_) => Some(ConvertedArchiveSourceState::Unavailable { logical_source }),
     }
 }
 
@@ -7022,6 +7436,53 @@ pub(crate) enum SearchMode {
     TagView,
 }
 
+/// Immutable conditions accepted by Enter; the search bar remains an independent draft.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LocalSearchSubmission {
+    query: String,
+    target: crate::fts_index::SearchTarget,
+    or_mode: bool,
+}
+
+/// Completed membership and the conditions that produced it have one lifetime.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LocalSearchFilter {
+    matches: HashSet<usize>,
+    submitted: Arc<LocalSearchSubmission>,
+}
+
+impl std::ops::Deref for LocalSearchFilter {
+    type Target = HashSet<usize>;
+    fn deref(&self) -> &Self::Target {
+        &self.matches
+    }
+}
+impl std::ops::DerefMut for LocalSearchFilter {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.matches
+    }
+}
+
+#[cfg(test)]
+impl From<HashSet<usize>> for LocalSearchFilter {
+    fn from(matches: HashSet<usize>) -> Self {
+        Self {
+            matches,
+            submitted: Arc::new(LocalSearchSubmission {
+                query: String::new(),
+                target: Default::default(),
+                or_mode: false,
+            }),
+        }
+    }
+}
+#[cfg(test)]
+impl FromIterator<usize> for LocalSearchFilter {
+    fn from_iter<T: IntoIterator<Item = usize>>(values: T) -> Self {
+        HashSet::from_iter(values).into()
+    }
+}
+
 /// 非同期メタデータ検索 (Ctrl+F) の状態。
 ///
 /// 背景: 検索マッチの判定には `png_metadata::build_searchable_from_path` や
@@ -7029,6 +7490,7 @@ pub(crate) enum SearchMode {
 /// フォルダに数百〜数千枚の画像があると UI スレッドで数秒ブロックしていたため、
 /// バックグラウンドスレッドで実行して結果を `poll_search` で受け取る構造に変更した。
 pub(crate) struct SearchPending {
+    submitted: Arc<LocalSearchSubmission>,
     /// 検索キャンセル用トークン。新クエリ / 検索バー閉じ / フォルダ切替で立てる。
     cancel: Arc<AtomicBool>,
     /// UI が毎フレーム読む検索進捗。worker は item 完了ごとに更新する。
@@ -12493,12 +12955,6 @@ pub(crate) struct FullscreenVideoMarkerCache {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct FacetFilterSuppression {
-    pub(crate) anchor: PathBuf,
-    pub(crate) saved_filter: crate::settings::FacetFilter,
-}
-
-#[derive(Clone, Debug)]
 pub(crate) struct FullscreenVideoMarkerSnapshot {
     pub(crate) pin_pts: Option<f64>,
     pub(crate) pin_thumbnail: Option<VideoMarkerCachedThumbnail>,
@@ -15410,9 +15866,9 @@ pub struct App {
 
     // ── フォルダ移動履歴（戻る/進む + 履歴メニュー）───────────────
     /// フォルダ移動履歴の戻るスタック。末尾が次に戻る先。
-    pub(crate) folder_nav_back_stack: Vec<FolderNavHistoryTarget>,
+    pub(crate) folder_nav_back_stack: Vec<FolderNavHistoryEntry>,
     /// フォルダ移動履歴の進むスタック。末尾が次に進む先。
-    pub(crate) folder_nav_forward_stack: Vec<FolderNavHistoryTarget>,
+    pub(crate) folder_nav_forward_stack: Vec<FolderNavHistoryEntry>,
     /// 履歴メニュー用の最近開いたフォルダ。先頭が最新。
     pub(crate) recent_folders: Vec<PathBuf>,
     /// 履歴戻る/進むで発生する次回 load_folder は通常履歴に積まない。
@@ -15427,6 +15883,7 @@ pub struct App {
     /// 現在ナビゲーション履歴を受け持つクイックフォルダスロット。
     pub(crate) active_quick_folder_slot: Option<QuickFolderSlotId>,
     /// Monotonic switch intent identity; even a same-path Current shortcut retires older replay.
+    /// Shared main surface-switch epoch; row publication and phase handoff never advance it.
     pub(crate) quick_folder_switch_sequence: u64,
     /// 検索クローズで検索前フォルダへ復帰する `load_folder` を履歴に積まないための
     /// ワンショット。検索中は `global_search.active` / `favsearch.active` で判定できるが、
@@ -15444,7 +15901,7 @@ pub struct App {
     /// 検索キーワード入力
     pub(crate) search_query: String,
     /// 検索結果フィルタ: Some = フィルタ中（表示するアイテムの元インデックス集合）
-    pub(crate) search_filter: Option<std::collections::HashSet<usize>>,
+    pub(crate) search_filter: Option<LocalSearchFilter>,
     /// Ctrl+F のフィルタが作られたユーザー視点のフォルダ。
     /// この場所では BS / Alt+↑ / ⬆ による親移動を止め、子フォルダ等へ移動して
     /// フィルタが解除された後は通常どおり親へ戻れるようにする。
@@ -15514,12 +15971,11 @@ pub struct App {
     /// AI モデル/生成ツール facet をユーザーが開いたか、条件が有効なときに遅延メタを読む。
     pub(crate) ai_model_facet_requested: bool,
     /// facet filter の適用元。場所変更時の一時解除 / 復元判定に使う。
-    pub(crate) facet_filter_scope: Option<PathBuf>,
+    pub(crate) facet_navigation: FacetNavigationState,
     /// facet filter の階層別退避: ZIP/PDF/フォルダなどのコンテナを絞り込みで見つけて
     /// 開いたあと、中身が別種別・別拡張子で空表示になる事故を防ぐ。
     /// anchor 配下へ入ると現在の filter を退避して内側は filter なしで始め、
     /// 内側で新しい filter を設定できる。anchor 外へ戻ると退避した filter を復元する。
-    pub(crate) facet_filter_suppression_stack: Vec<FacetFilterSuppression>,
     /// 絞り込みバーで編集中のファイル名。適用済み query とは debounce 境界で分ける。
     pub(crate) facet_name_input: String,
     /// ファイル名欄がフォーカス中なら grid shortcut を抑止する。
@@ -15874,7 +16330,7 @@ pub struct App {
 
     /// 「場所 > ブックマーク」の全メディア横断一覧。`items` と同じ順序の sidecar。
     pub(crate) bookmark_browser_rows: Vec<crate::bookmark_browser::BookmarkBrowserRow>,
-    pub(crate) bookmark_browser_pending: Option<crate::bookmark_browser::BookmarkBrowserPending>,
+    pub(crate) bookmark_browser_pending: Option<Box<BookmarkBrowserBuild>>,
     /// 状態フィルタ用の全メディア横断ブックマーク集合。DB 読み出しは worker 側で行う。
     pub(crate) bookmark_presence: Option<crate::bookmark_browser::BookmarkPresence>,
     pub(crate) bookmark_presence_pending: Option<crate::bookmark_browser::BookmarkPresencePending>,
@@ -19164,8 +19620,7 @@ impl App {
             details_lazy_visible_revision: 0,
             details_image_dims_state: LazyColumnState::Disabled,
             ai_model_facet_requested: false,
-            facet_filter_scope: None,
-            facet_filter_suppression_stack: Vec::new(),
+            facet_navigation: FacetNavigationState::default(),
             facet_name_input,
             facet_name_has_focus: false,
             facet_name_tokens,
@@ -21942,9 +22397,6 @@ impl App {
         if intent.suppress_rating_filter {
             self.maybe_suppress_rating_filter_for_opened_container_path(&intent.source_path);
         }
-        if intent.suppress_facet_filter {
-            self.maybe_suppress_facet_filter_for_opened_container_path(&intent.source_path);
-        }
         let collection_committed = intent
             .collection_grid_owner
             .as_ref()
@@ -22128,20 +22580,18 @@ impl App {
         fullscreen_close_origin: bool,
     ) {
         let collection_id = restore.identity.collection_id;
-        let source_location = self.collection_nav_history_source();
-        let return_to = self.collection_open_return_to(collection_id, true);
-        let change = self.prepare_collection_main_context_change(collection_id);
-        if let CollectionMainContextChange::Blocked(reason) = change {
-            crate::logger::log(format!("collection parent navigation blocked: {reason}"));
-            return;
-        }
-        if fullscreen_close_origin && matches!(change, CollectionMainContextChange::NotNeeded) {
-            self.close_fullscreen();
-        }
-        // AddressBarNav::Collection is a parent-navigation request. The root loading shell is
-        // visible adoption, so commit its child -> parent edge before replacing the child.
-        self.record_collection_nav_transition(restore.clone(), source_location);
-        self.open_collection_grid_after_context_change(collection_id, Some(restore), return_to);
+        self.retire_replaced_main_list_requests(None);
+        let navigation = self.capture_main_list_navigation(
+            MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation),
+            self.copied_destination_source_proof(),
+        );
+        self.adopt_direct_collection_shell(
+            collection_id,
+            Some(restore),
+            None,
+            navigation,
+            fullscreen_close_origin,
+        );
     }
 
     /// Early-return 経路で `pending_return_to_parent` 由来のナビを消化する。
@@ -22150,8 +22600,8 @@ impl App {
     /// in-window 静止画フルスクリーンはグリッド描画を飛ばして return するため、
     /// そこでナビを捨てないよう同じロード処理を先に適用する。
     ///
-    /// 履歴戻る / 進むは扱わない (`false` を返す)。rollback は open 結果まで見る必要が
-    /// あり、その機構は合流点側だけが持つ。呼び出し側は履歴ナビを合流点へ回すこと。
+    /// 履歴戻る / 進むは扱わない (`false` を返す)。typed履歴要求の共通dispatcherへ
+    /// 回し、読込成功後にだけ仮cursorを採用する。
     pub(crate) fn apply_fullscreen_close_nav_immediate(
         &mut self,
         nav: crate::ui_main::AddressBarNav,
@@ -22304,7 +22754,7 @@ impl App {
 
     /// Main Back/Forward stacks live on App, outside ViewerContextBundle. A projected detached
     /// payload must not observe or mutate them, even while its navigation scope is CollectionRoot.
-    fn main_folder_history_available(&self) -> bool {
+    pub(crate) fn main_folder_history_available(&self) -> bool {
         #[cfg(windows)]
         {
             self.projected_viewer_context_id() == self.viewer_context_main()
@@ -22335,12 +22785,12 @@ impl App {
     }
 
     fn push_folder_nav_stack(
-        stack: &mut Vec<FolderNavHistoryTarget>,
-        target: FolderNavHistoryTarget,
+        stack: &mut Vec<FolderNavHistoryEntry>,
+        target: FolderNavHistoryEntry,
     ) {
         if stack
             .last()
-            .is_some_and(|last| Self::folder_nav_targets_eq(last, &target))
+            .is_some_and(|last| Self::folder_nav_targets_eq(&last.location, &target.location))
         {
             // Same collection ID receives the freshest revision/anchor hint. Smart-folder state
             // likewise keeps its latest scoped position.
@@ -22355,6 +22805,486 @@ impl App {
         }
     }
 
+    fn active_folder_history_vectors(
+        &self,
+    ) -> (&[FolderNavHistoryEntry], &[FolderNavHistoryEntry]) {
+        if let Some(workspace) = self.active_quick_folder_workspace() {
+            (
+                &workspace.history.back_stack,
+                &workspace.history.forward_stack,
+            )
+        } else {
+            (&self.folder_nav_back_stack, &self.folder_nav_forward_stack)
+        }
+    }
+
+    pub(crate) fn folder_nav_current_entry(&self) -> Option<FolderNavHistoryEntry> {
+        self.folder_nav_current_target().map(|location| {
+            let route = if self.facet_navigation.route().0.is_empty() {
+                FacetRoute::root(Self::facet_scope_for_location(&location))
+            } else {
+                self.facet_navigation.route().clone()
+            };
+            FolderNavHistoryEntry::new(location, route)
+        })
+    }
+
+    fn facet_scope_for_location(location: &FolderNavHistoryTarget) -> FacetScope {
+        match location {
+            FolderNavHistoryTarget::Path(path) => FacetScope::path(path),
+            FolderNavHistoryTarget::Rating { stars } => FacetScope::Rating { stars: *stars },
+            FolderNavHistoryTarget::RatingPhysical(restore) => {
+                FacetScope::path(&restore.visible_path)
+            }
+            FolderNavHistoryTarget::SmartFolder(state) => FacetScope::Smart {
+                id: state.definition_id.to_string(),
+                position: match &state.position {
+                    top_level_grid_view::SmartFolderPosition::Root => "root".into(),
+                    top_level_grid_view::SmartFolderPosition::Container {
+                        root_entry,
+                        current,
+                    } => format!(
+                        "container:{}:{}",
+                        crate::path_key::normalize_keep_drive(root_entry),
+                        crate::path_key::normalize_keep_drive(current)
+                    ),
+                    top_level_grid_view::SmartFolderPosition::Scoped {
+                        entry_root,
+                        current,
+                        current_kind,
+                        ..
+                    } => format!(
+                        "scoped:{}:{}:{current_kind:?}",
+                        crate::path_key::normalize_keep_drive(entry_root),
+                        crate::path_key::normalize_keep_drive(current)
+                    ),
+                },
+            },
+            FolderNavHistoryTarget::Collection(restore) => FacetScope::Collection {
+                id: restore.identity.collection_id.to_string(),
+                entry: None,
+            },
+            FolderNavHistoryTarget::CollectionPhysical(restore) => FacetScope::Collection {
+                id: restore.root.identity.collection_id.to_string(),
+                entry: Some(restore.visible_path.to_string_lossy().into_owned()),
+            },
+        }
+    }
+
+    pub(crate) fn main_list_destination_entry(
+        &self,
+        location: FolderNavHistoryTarget,
+        source: Option<&FolderNavHistoryEntry>,
+        book_prefix: Option<&str>,
+    ) -> FolderNavHistoryEntry {
+        let scope = match (book_prefix, &location) {
+            (Some(prefix), FolderNavHistoryTarget::Path(path)) => FacetScope::book(path, prefix),
+            (Some(prefix), FolderNavHistoryTarget::RatingPhysical(restore)) => {
+                FacetScope::book(&restore.visible_path, prefix)
+            }
+            _ => Self::facet_scope_for_location(&location),
+        };
+        let route = match source {
+            Some(source) if source.route.current() == Some(&scope) => source.route.clone(),
+            Some(source) if source.route.0.iter().any(|prior| prior == &scope) => {
+                let end = source
+                    .route
+                    .0
+                    .iter()
+                    .rposition(|prior| prior == &scope)
+                    .unwrap()
+                    + 1;
+                FacetRoute(source.route.0[..end].to_vec())
+            }
+            Some(source) if book_prefix.is_some() => {
+                // Retargeting a book restores the live outside parent, then enters its new
+                // child. Nested ZIP levels retain only the proved prefix ancestors.
+                let end = source
+                    .route
+                    .0
+                    .iter()
+                    .rposition(|prior| prior.contains(&scope))
+                    .map(|index| index + 1)
+                    .unwrap_or_else(|| {
+                        source
+                            .route
+                            .0
+                            .iter()
+                            .position(|prior| matches!(prior, FacetScope::Book { .. }))
+                            .unwrap_or(source.route.0.len())
+                    });
+                FacetRoute(source.route.0[..end].to_vec()).child(scope)
+            }
+            Some(source) if matches!(&location, FolderNavHistoryTarget::SmartFolder(_)) => {
+                let mut route = source.route.clone();
+                if let (
+                    FolderNavHistoryTarget::SmartFolder(from),
+                    FolderNavHistoryTarget::SmartFolder(to),
+                ) = (&source.location, &location)
+                {
+                    let child = match (&from.position, &to.position) {
+                        (top_level_grid_view::SmartFolderPosition::Root, _)
+                            if from.definition_id == to.definition_id =>
+                        {
+                            true
+                        }
+                        (
+                            top_level_grid_view::SmartFolderPosition::Scoped {
+                                current: parent,
+                                current_kind: smart_folder::SmartChildKind::Folder,
+                                ..
+                            },
+                            top_level_grid_view::SmartFolderPosition::Scoped {
+                                current: child, ..
+                            },
+                        ) if from.definition_id == to.definition_id => {
+                            crate::books::path_is_under_or_equal(child, parent)
+                        }
+                        _ => false,
+                    };
+                    if !child {
+                        if let Some(first) = route
+                            .0
+                            .iter()
+                            .position(|prior| matches!(prior, FacetScope::Smart { .. }))
+                        {
+                            route.0.truncate(first);
+                        }
+                        if from.definition_id == to.definition_id
+                            && !matches!(
+                                to.position,
+                                top_level_grid_view::SmartFolderPosition::Root
+                            )
+                        {
+                            let mut root = to.clone();
+                            root.position = top_level_grid_view::SmartFolderPosition::Root;
+                            route.0.push(Self::facet_scope_for_location(
+                                &FolderNavHistoryTarget::SmartFolder(root),
+                            ));
+                        }
+                    }
+                }
+                route.child(scope)
+            }
+            Some(source)
+                if matches!(
+                    (&source.location, &location),
+                    (
+                        FolderNavHistoryTarget::Rating { .. }
+                            | FolderNavHistoryTarget::RatingPhysical(_),
+                        FolderNavHistoryTarget::RatingPhysical(_)
+                    ) | (
+                        FolderNavHistoryTarget::Collection(_),
+                        FolderNavHistoryTarget::CollectionPhysical(_)
+                    )
+                ) || source
+                    .route
+                    .current()
+                    .is_some_and(|parent| parent.contains(&scope)) =>
+            {
+                source.route.child(scope)
+            }
+            _ => FacetRoute::root(scope),
+        };
+        FolderNavHistoryEntry::new(location, route)
+    }
+
+    /// A saved route is lineage, not a request to restore an old ZIP level. The released
+    /// history loader opens the actual root/auto-collapse result; reconcile its book suffix
+    /// before adoption so route and installed rows describe the same destination.
+    fn reconcile_main_list_saved_destination(
+        &self,
+        location: FolderNavHistoryTarget,
+        mut route: FacetRoute,
+        prefix: Option<&str>,
+    ) -> FolderNavHistoryEntry {
+        let Some(prefix) = prefix else {
+            return FolderNavHistoryEntry::new(location, route);
+        };
+        if matches!(
+            location,
+            FolderNavHistoryTarget::Path(_) | FolderNavHistoryTarget::RatingPhysical(_)
+        ) {
+            let saved = FolderNavHistoryEntry::new(location.clone(), route);
+            return self.main_list_destination_entry(location, Some(&saved), Some(prefix));
+        }
+        let logical = match &location {
+            FolderNavHistoryTarget::CollectionPhysical(child) => Some(&child.visible_path),
+            FolderNavHistoryTarget::SmartFolder(state) => match &state.position {
+                top_level_grid_view::SmartFolderPosition::Container { current, .. }
+                | top_level_grid_view::SmartFolderPosition::Scoped { current, .. } => Some(current),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(logical) = logical {
+            let book = FacetScope::book(logical, prefix);
+            while route.current().is_some_and(|scope| matches!((scope,&book), (FacetScope::Book {source,..}, FacetScope::Book {source: actual,..}) if source == actual)) {
+                route.0.pop();
+            }
+            if !prefix.is_empty() {
+                route.0.push(book);
+            }
+        }
+        FolderNavHistoryEntry::new(location, route)
+    }
+
+    fn main_list_requested_destination(
+        &self,
+        navigation: &MainListNavigation,
+        location: FolderNavHistoryTarget,
+        prefix: Option<&str>,
+    ) -> FolderNavHistoryEntry {
+        match &navigation.history {
+            MainHistoryOperation::Replay(plan) => self.reconcile_main_list_saved_destination(
+                location,
+                plan.virtual_current
+                    .as_ref()
+                    .expect("replay destination")
+                    .route
+                    .clone(),
+                prefix,
+            ),
+            MainHistoryOperation::Restore { route: Some(route) } => {
+                self.reconcile_main_list_saved_destination(location, route.clone(), prefix)
+            }
+            MainHistoryOperation::SameLocation => self.reconcile_main_list_saved_destination(
+                location,
+                navigation
+                    .source_location
+                    .as_ref()
+                    .map(|source| source.route.clone())
+                    .unwrap_or_default(),
+                prefix,
+            ),
+            _ => self.main_list_destination_entry(
+                location,
+                navigation.source_location.as_ref(),
+                prefix,
+            ),
+        }
+    }
+
+    pub(crate) fn capture_main_list_navigation(
+        &mut self,
+        history: MainHistoryOperation,
+        source_proof: MainListSourceProof,
+    ) -> MainListNavigation {
+        // Search is transparent to history even when the admitted install transfers its
+        // source bundle out of main. Capture that semantic operation before the transfer.
+        let history = if matches!(
+            history,
+            MainHistoryOperation::Direct(DirectNavigationPurpose::Navigation)
+        ) && (self.global_search.active
+            || self.favsearch.active
+            || self.tag_view.active
+            || self.suppress_nav_record_for_search_restore)
+        {
+            MainHistoryOperation::Restore { route: None }
+        } else {
+            history
+        };
+        MainListNavigation {
+            history_before: Box::new(self.folder_nav_history_snapshot()),
+            source_context: self.projected_viewer_context_id(),
+            source_surface_generation: self.top_level_grid_view.generation(),
+            source_items_generation: self.items_generation,
+            source_slot: self.active_quick_folder_slot,
+            source_slot_switch_sequence: self.quick_folder_switch_sequence,
+            source_location: self.folder_nav_current_entry(),
+            source_proof,
+            history,
+            selection_after_load: self.select_after_load.take(),
+        }
+    }
+
+    pub(crate) fn main_list_navigation_is_current(&self, navigation: &MainListNavigation) -> bool {
+        if !self.main_folder_history_available()
+            || self.quick_folder_switch_sequence != navigation.source_slot_switch_sequence
+        {
+            return false;
+        }
+        let source_current = match &navigation.source_proof {
+            MainListSourceProof::Bookmark(owner) => self.bookmark_open_owner_is_current(owner),
+            MainListSourceProof::Surface(lease) => {
+                self.smart_folder_source_lease().as_ref() == Some(lease)
+            }
+            MainListSourceProof::Snapshot(proof) => {
+                self.projected_viewer_context_id() == navigation.source_context
+                    && self.top_level_grid_view.generation() == navigation.source_surface_generation
+                    && self.active_quick_folder_slot == navigation.source_slot
+                    && self.folder_nav_current_entry() == navigation.source_location
+                    && proof.is_current(self)
+            }
+            MainListSourceProof::Row => {
+                self.projected_viewer_context_id() == navigation.source_context
+                    && self.top_level_grid_view.generation() == navigation.source_surface_generation
+                    && self.items_generation == navigation.source_items_generation
+                    && self.active_quick_folder_slot == navigation.source_slot
+                    && self.folder_nav_current_entry() == navigation.source_location
+            }
+        };
+        if !source_current
+            || (!self.facet_navigation.route().0.is_empty()
+                && self.facet_navigation.route()
+                    != navigation
+                        .source_location
+                        .as_ref()
+                        .map_or(self.facet_navigation.route(), |entry| &entry.route))
+        {
+            return false;
+        }
+        let baseline_current = match navigation.source_slot {
+            Some(slot) => {
+                self.quick_folder_workspaces[slot.index()].history
+                    == navigation.history_before.quick_folder_workspaces[slot.index()].history
+            }
+            None => {
+                self.folder_nav_back_stack == navigation.history_before.back_stack
+                    && self.folder_nav_forward_stack == navigation.history_before.forward_stack
+            }
+        };
+        baseline_current
+            && match &navigation.history {
+                MainHistoryOperation::Replay(plan) => plan.is_current(self),
+                _ => true,
+            }
+    }
+
+    pub(crate) fn prepare_main_list_adoption(
+        &self,
+        mut navigation: MainListNavigation,
+        destination: FolderNavHistoryEntry,
+    ) -> Option<MainListAdoption> {
+        if !self.main_list_navigation_is_current(&navigation) {
+            return None;
+        }
+        // Surface requests may cross native PDF verification or collection revision updates.
+        // Refresh presentation/restore hints only after the native semantic lease validates;
+        // neither the captured proof nor its route is recaptured or replaced.
+        if matches!(
+            navigation.source_proof,
+            MainListSourceProof::Surface(_) | MainListSourceProof::Bookmark(_)
+        ) && let (Some(source), Some(current)) = (
+            &mut navigation.source_location,
+            self.folder_nav_current_target(),
+        ) {
+            source.location = current;
+        }
+        Some(MainListAdoption {
+            navigation,
+            destination,
+        })
+    }
+
+    /// This closure receives only an already-admitted prepared install. It cannot reject or
+    /// start hydration. Location/items, cursor and facet route become one UI-call adoption.
+    pub(crate) fn adopt_main_list_navigation(
+        &mut self,
+        adoption: MainListAdoption,
+        install: impl FnOnce(&mut Self) -> MainListHydration,
+    ) -> bool {
+        let MainListAdoption {
+            navigation,
+            destination,
+        } = adoption;
+        self.save_leaving_folder_grid_position();
+        self.adopt_main_facet_route(destination.route.clone());
+        self.select_after_load = navigation.selection_after_load;
+        if matches!(
+            navigation.history,
+            MainHistoryOperation::Direct(DirectNavigationPurpose::ExitTemporaryView { .. })
+        ) {
+            self.dismiss_transparent_view_for_admitted_jump();
+        }
+        let mut hydration = install(self);
+        match navigation.history {
+            MainHistoryOperation::Direct(purpose) => {
+                self.record_folder_nav_entry_transition(destination, navigation.source_location);
+                if let DirectNavigationPurpose::ExitTemporaryView { selection } = purpose {
+                    if let Some((continuation, _)) = hydration.as_mut() {
+                        continuation.navigation_after_hydration =
+                            Some(MainListAfterHydration::JumpSelection(selection));
+                    } else {
+                        self.finish_jump_to_physical_folder_selection(selection);
+                    }
+                }
+            }
+            MainHistoryOperation::Replay(plan) => plan.commit(self),
+            MainHistoryOperation::Restore { .. } => {
+                self.suppress_nav_record_for_search_restore = false;
+                self.set_active_folder_nav_suppress_record_once(false);
+            }
+            MainHistoryOperation::SameLocation => {}
+        }
+        self.hydrate_installed_main_list(hydration);
+        true
+    }
+
+    pub(crate) fn active_facet_filter_mut(&mut self) -> &mut crate::settings::FacetFilter {
+        &mut self.settings.facet_filter
+    }
+
+    /// Prepared explicit Jump keeps its source mounted until this success-only memory tail.
+    fn dismiss_transparent_view_for_admitted_jump(&mut self) {
+        if self.global_search.active {
+            let _ = self.dismiss_global_search_without_restore();
+        }
+        if self.favsearch.active {
+            let _ = self.dismiss_favsearch_without_restore();
+        }
+        if self.tag_view.active {
+            let _ = self.dismiss_tag_view_without_restore();
+        }
+        if matches!(
+            self.top_level_grid_view.surface(),
+            top_level_grid_view::TopLevelGridSurface::Search(_)
+        ) {
+            self.top_level_grid_view.take_return_origin();
+            self.top_level_grid_view
+                .replace_surface(top_level_grid_view::TopLevelGridSurface::Folder);
+        }
+    }
+
+    pub(crate) fn adopt_main_facet_route(&mut self, route: FacetRoute) {
+        let result = self
+            .facet_navigation
+            .adopt(route, &mut self.settings.facet_filter);
+        if result.location_changed || result.restored > 0 || result.stashed > 0 {
+            self.sync_facet_name_runtime_from_filter();
+        }
+        if result.stashed > 0 {
+            self.show_feedback_toast("親の絞り込みを退避しました (戻ると復元)".to_owned());
+        }
+    }
+
+    fn hydrate_installed_main_list(&mut self, hydration: MainListHydration) {
+        if let Some((continuation, prepared)) = hydration
+            && let Err(continuation) = self.begin_sidecar_restore(continuation, prepared)
+        {
+            self.resume_loading_items_after_sidecar(continuation);
+        }
+    }
+
+    pub(crate) fn prepare_visible_install(
+        &self,
+        source_path: &Path,
+        items: &[GridItem],
+        logical_source: Option<&Path>,
+    ) -> Result<PreparedVisibleInstall, OpenAdmissionRefusal> {
+        if self.sidecar_restore_active() {
+            return Err(OpenAdmissionRefusal::DocumentOpenBusy);
+        }
+        let logical = logical_source.unwrap_or(source_path);
+        let display_epub_source = if items.iter().any(|item| matches!(item, GridItem::PdfPage { pdf_path, .. } if crate::folder_tree::path_eq(pdf_path, logical))) {
+            let owner = crate::pdf_loader::LeasedEpubPath::try_new(logical.to_path_buf()).map_err(OpenAdmissionRefusal::from)?;
+            owner.has_epub_lease().then_some(owner)
+        } else { None };
+        Ok(PreparedVisibleInstall {
+            display_epub_source,
+        })
+    }
+
     fn active_quick_folder_workspace(&self) -> Option<&QuickFolderWorkspace> {
         self.active_quick_folder_slot
             .map(|slot| &self.quick_folder_workspaces[slot.index()])
@@ -22365,7 +23295,7 @@ impl App {
             .map(|slot| &mut self.quick_folder_workspaces[slot.index()])
     }
 
-    fn push_active_folder_nav_back_stack(&mut self, target: FolderNavHistoryTarget) {
+    fn push_active_folder_nav_back_stack(&mut self, target: FolderNavHistoryEntry) {
         if !self.main_folder_history_available() {
             return;
         }
@@ -22496,6 +23426,9 @@ impl App {
     }
 
     pub(crate) fn clear_quick_folder_slots(&mut self) {
+        let renew_bookmark_build = self.projected_viewer_context_id() == self.viewer_context_main()
+            && self.bookmark_browser_pending.is_some();
+        self.retire_main_list_requests_for_surface_switch();
         for workspace in &mut self.quick_folder_workspaces {
             *workspace = QuickFolderWorkspace::default();
         }
@@ -22519,6 +23452,10 @@ impl App {
         if let Some(current) = self.effective_folder() {
             self.update_active_quick_folder_target(&current);
         }
+        // The list remains mounted; retire the old epoch but finish its loading shell.
+        if renew_bookmark_build && self.items_are_bookmark_view {
+            self.refresh_bookmark_browser();
+        }
     }
 
     /// フォルダバーのメニュー・キー・リングから共有する場所記憶クリア入口。
@@ -22532,15 +23469,7 @@ impl App {
         &mut self,
         slot: QuickFolderSlotId,
     ) -> QuickFolderSwitchTarget {
-        self.quick_folder_switch_sequence = self.quick_folder_switch_sequence.wrapping_add(1);
-        self.replace_history_navigation_transition(None);
-        if let Some(pending) = self.rating_view_pending.as_ref()
-            && pending.navigation.is_some()
-        {
-            if let Some(pending) = self.rating_view_pending.take() {
-                pending.cancel();
-            }
-        }
+        self.retire_main_list_requests_for_surface_switch();
         let target = self.quick_folder_target(slot).cloned();
         self.cancel_pending_folder_nav();
         match target {
@@ -22622,7 +23551,7 @@ impl App {
     /// `record_folder_nav_transition` の自動記録では移動元が正しく取れないケース
     /// (検索から「フォルダに移動」で抜ける等) に、呼び出し側が確定した移動元を渡す。
     pub(crate) fn push_nav_history_entry(&mut self, from: PathBuf) {
-        self.push_active_folder_nav_back_stack(FolderNavHistoryTarget::Path(from));
+        self.push_active_folder_nav_back_stack(FolderNavHistoryTarget::Path(from).into());
         self.clear_active_folder_nav_forward_stack();
     }
 
@@ -22811,11 +23740,17 @@ impl App {
         self.main_folder_history_available()
             && self.projected_viewer_context_id() == owner.source_context
             && self.top_level_grid_view.generation() == owner.source_surface_generation
-            && self.items_generation == owner.source_items_generation
+            // Typed restores consume copied state plus the destination load. Explicit
+            // activation and refresh owners also authorize source-row/order snapshots.
+            && (owner.intent == RatingPhysicalLoadIntent::Restore
+                || self.items_generation == owner.source_items_generation)
             && self.active_quick_folder_slot == owner.source_slot
             && self.quick_folder_switch_sequence == owner.source_slot_switch_sequence
             && crate::folder_tree::path_eq(path, &owner.target_path)
-            && self.folder_nav_current_target().as_ref() == Some(&owner.source_location)
+            // Restore source identity belongs to the original common Surface proof;
+            // source presentation hints (for example collection revision) may refresh.
+            && (owner.intent == RatingPhysicalLoadIntent::Restore
+                || self.folder_nav_current_target().as_ref() == Some(&owner.source_location))
     }
 
     fn quick_folder_switch_owner_is_current(
@@ -22826,7 +23761,6 @@ impl App {
         self.main_folder_history_available()
             && self.projected_viewer_context_id() == owner.source_context
             && self.top_level_grid_view.generation() == owner.source_surface_generation
-            && self.items_generation == owner.source_items_generation
             && self.active_quick_folder_slot == owner.source_slot
             && self.quick_folder_switch_sequence == owner.source_slot_switch_sequence
             && crate::folder_tree::path_eq(path, &owner.target_path)
@@ -22978,6 +23912,18 @@ impl App {
         target: FolderNavHistoryTarget,
         current: Option<FolderNavHistoryTarget>,
     ) {
+        let current = current.map(|location| {
+            FolderNavHistoryEntry::new(location, self.facet_navigation.route().clone())
+        });
+        let target = self.main_list_destination_entry(target, current.as_ref(), None);
+        self.record_folder_nav_entry_transition(target, current);
+    }
+
+    fn record_folder_nav_entry_transition(
+        &mut self,
+        target: FolderNavHistoryEntry,
+        current: Option<FolderNavHistoryEntry>,
+    ) {
         if !self.main_folder_history_available() {
             return;
         }
@@ -23003,8 +23949,10 @@ impl App {
         if let (
             Some(FolderNavHistoryTarget::SmartFolder(state)),
             FolderNavHistoryTarget::Path(target_path),
-        ) = (current.as_ref(), &target)
-        {
+        ) = (
+            current.as_ref().map(|entry| &entry.location),
+            &target.location,
+        ) {
             let synthetic = smart_folder::smart_folder_synthetic_path(state.definition_id);
             let current_in_scope = state.scoped_current().is_some_and(|current| {
                 crate::folder_tree::path_eq(current, &synthetic)
@@ -23020,32 +23968,32 @@ impl App {
             .as_ref()
             .is_some_and(|current| Self::folder_nav_targets_eq(current, &target))
         {
-            if let FolderNavHistoryTarget::Path(target) = &target {
+            if let FolderNavHistoryTarget::Path(target) = &target.location {
                 self.update_active_quick_folder_target(target);
             }
             self.set_active_folder_nav_suppress_record_once(false);
             return;
         }
 
-        if let FolderNavHistoryTarget::Path(target) = &target {
+        if let FolderNavHistoryTarget::Path(target) = &target.location {
             self.remember_recent_folder(target);
         }
 
         if self.take_active_folder_nav_suppress_record_once() {
-            if let FolderNavHistoryTarget::Path(target) = &target {
+            if let FolderNavHistoryTarget::Path(target) = &target.location {
                 self.update_active_quick_folder_target(target);
             }
             return;
         }
 
         let Some(current) = current else {
-            if let FolderNavHistoryTarget::Path(target) = &target {
+            if let FolderNavHistoryTarget::Path(target) = &target.location {
                 self.update_active_quick_folder_target(target);
             }
             return;
         };
         if Self::folder_nav_targets_eq(&current, &target) {
-            if let FolderNavHistoryTarget::Path(target) = &target {
+            if let FolderNavHistoryTarget::Path(target) = &target.location {
                 self.update_active_quick_folder_target(target);
             }
             return;
@@ -23053,7 +24001,7 @@ impl App {
 
         self.push_active_folder_nav_back_stack(current);
         self.clear_active_folder_nav_forward_stack();
-        if let FolderNavHistoryTarget::Path(target) = &target {
+        if let FolderNavHistoryTarget::Path(target) = &target.location {
             self.update_active_quick_folder_target(target);
         }
     }
@@ -23087,6 +24035,7 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn restore_folder_nav_history(&mut self, snapshot: FolderNavHistorySnapshot) {
         if !self.main_folder_history_available() {
             return;
@@ -23107,22 +24056,51 @@ impl App {
         self.prune_collection_folder_history_from_ready_catalog();
     }
 
-    pub(crate) fn attach_archive_convert_nav_history_rollback(
-        &mut self,
-        snapshot: FolderNavHistorySnapshot,
-    ) {
-        if let Some(state) = self.archive_convert.as_mut() {
-            state.nav_history_rollback = Some(snapshot);
-        }
-    }
-
-    pub(crate) fn clear_archive_convert_nav_history_rollback(&mut self) {
-        if let Some(state) = self.archive_convert.as_mut() {
-            state.nav_history_rollback = None;
-        }
+    /// Presentation/input availability uses the uncommitted cursor; capture and validation
+    /// keep reading the committed entry getters and active history vectors below.
+    fn provisional_folder_history_plan(&self) -> Option<&FolderHistoryPlan> {
+        let physical = self
+            .top_level_grid_view
+            .history_navigation_transition()
+            .map(|request| match request {
+                HistoryNavigationTransition::Physical(request) => &request.navigation,
+                HistoryNavigationTransition::Collection(request) => &request.navigation,
+            });
+        let rating = self
+            .rating_view_pending
+            .as_ref()
+            .and_then(|request| request.navigation.as_deref());
+        let classification = self
+            .top_level_grid_view
+            .open_path_classification()
+            .and_then(|request| request.navigation.as_ref());
+        [
+            self.staged_smart_history_navigation(),
+            physical,
+            rating,
+            classification,
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(|navigation| match &navigation.history {
+            MainHistoryOperation::Replay(plan)
+                if self.main_list_navigation_is_current(navigation) =>
+            {
+                Some(plan.as_ref())
+            }
+            _ => None,
+        })
     }
 
     pub(crate) fn folder_history_back_target(&self) -> Option<&FolderNavHistoryTarget> {
+        let entry = match self.provisional_folder_history_plan() {
+            Some(plan) => plan.virtual_back.last(),
+            None => self.folder_history_back_entry(),
+        };
+        entry.map(|entry| &entry.location)
+    }
+
+    pub(crate) fn folder_history_back_entry(&self) -> Option<&FolderNavHistoryEntry> {
         if !self.main_folder_history_available() {
             return None;
         }
@@ -23138,6 +24116,14 @@ impl App {
     }
 
     pub(crate) fn folder_history_forward_target(&self) -> Option<&FolderNavHistoryTarget> {
+        let entry = match self.provisional_folder_history_plan() {
+            Some(plan) => plan.virtual_forward.last(),
+            None => self.folder_history_forward_entry(),
+        };
+        entry.map(|entry| &entry.location)
+    }
+
+    pub(crate) fn folder_history_forward_entry(&self) -> Option<&FolderNavHistoryEntry> {
         if !self.main_folder_history_available() {
             return None;
         }
@@ -23152,12 +24138,19 @@ impl App {
             })
     }
 
+    #[cfg(test)]
+    pub(crate) fn dispatch_folder_history_input_for_test(
+        &mut self,
+        direction: FolderHistoryDirection,
+    ) {
+        self.dispatch_main_folder_history_input(direction);
+    }
+
     /// All merged Back/Forward input routes land here. A transient search or Snapshot surface
     /// keeps its exit target in `return_to`; it must not advance the main history cursor.
     fn dispatch_main_folder_history_input(
         &mut self,
         direction: FolderHistoryDirection,
-        history_nav_rollback: &mut Option<FolderNavHistorySnapshot>,
     ) -> Option<PathBuf> {
         if !self.history_input_nav_allowed() {
             return None;
@@ -23167,91 +24160,205 @@ impl App {
             FolderHistoryDirection::Forward => smart_folder::SmartHistoryDirection::Forward,
         };
         if let Some(action) = self.advance_staged_smart_history(smart_direction) {
-            return self.dispatch_staged_smart_history_action(action, history_nav_rollback);
+            return self.dispatch_staged_smart_history_action(action);
         }
-        let head = match direction {
-            FolderHistoryDirection::Back => self.folder_history_back_target().cloned(),
-            FolderHistoryDirection::Forward => self.folder_history_forward_target().cloned(),
-        };
-        match head {
-            Some(FolderNavHistoryTarget::SmartFolder(state)) => {
-                let smart_direction = match direction {
-                    FolderHistoryDirection::Back => smart_folder::SmartHistoryDirection::Back,
-                    FolderHistoryDirection::Forward => smart_folder::SmartHistoryDirection::Forward,
+        // Rapid input advances the existing provisional cursor. The mounted source and its
+        // native ownership proof remain unchanged until one usable destination is adopted.
+        let pending = self
+            .top_level_grid_view
+            .history_navigation_transition()
+            .map(|request| match request {
+                HistoryNavigationTransition::Physical(request) => request.navigation.clone(),
+                HistoryNavigationTransition::Collection(request) => request.navigation.clone(),
+            })
+            .or_else(|| {
+                self.rating_view_pending.as_ref().and_then(|pending| {
+                    pending
+                        .navigation
+                        .as_ref()
+                        .map(|request| request.navigation.clone())
+                })
+            })
+            .or_else(|| {
+                self.top_level_grid_view
+                    .open_path_classification()
+                    .and_then(|request| request.navigation.clone())
+            });
+        let (target, navigation) = if let Some(mut navigation) =
+            pending.filter(|navigation| self.main_list_navigation_is_current(navigation))
+        {
+            if let MainHistoryOperation::Replay(plan) = &mut navigation.history {
+                let Some(target) = plan.advance(direction) else {
+                    return None;
                 };
-                self.begin_smart_history_navigation(state, smart_direction);
-                None
-            }
-            Some(FolderNavHistoryTarget::Rating { stars }) => {
-                self.start_rating_history_replay(direction, stars);
-                None
-            }
-            Some(
-                target @ (FolderNavHistoryTarget::Collection(_)
-                | FolderNavHistoryTarget::CollectionPhysical(_)),
-            ) => {
-                self.start_collection_history_transition(
-                    target.clone(),
-                    CollectionHistoryIntent::Replay { direction, target },
-                    None,
-                );
-                None
-            }
-            Some(target @ FolderNavHistoryTarget::Path(_))
-                if matches!(&target, FolderNavHistoryTarget::Path(path)
-                    if crate::folder_tree::is_virtual_folder(path)
-                        || crate::folder_tree::is_convertible_archive_path(path)) =>
-            {
-                self.start_ordinary_archive_history_replay(direction, target);
-                None
-            }
-            _ => {
-                let mut snapshot = Some(self.folder_nav_history_snapshot());
-                let target = match direction {
-                    FolderHistoryDirection::Back => self.navigate_folder_history_back(),
-                    FolderHistoryDirection::Forward => self.navigate_folder_history_forward(),
-                }?;
-                match self
-                    .dispatch_synthetic_folder_history_target_with_rollback(&target, &mut snapshot)
-                {
-                    SyntheticFolderHistoryDispatch::NotSynthetic => {
-                        *history_nav_rollback = snapshot.take();
-                        target.into_path()
+                if plan.returned_to_origin() {
+                    self.replace_history_navigation_transition(None);
+                    if let Some(pending) = self.rating_view_pending.take() {
+                        pending.cancel();
                     }
-                    SyntheticFolderHistoryDispatch::Restored => None,
-                    SyntheticFolderHistoryDispatch::Unavailable => {
-                        if let Some(snapshot) = snapshot.take() {
-                            self.restore_folder_nav_history(snapshot);
-                        }
-                        None
-                    }
+                    self.top_level_grid_view.set_open_path_classification(None);
+                    return None;
                 }
+                (target, navigation)
+            } else {
+                let target = match direction {
+                    FolderHistoryDirection::Back => self.folder_history_back_entry(),
+                    FolderHistoryDirection::Forward => self.folder_history_forward_entry(),
+                }?
+                .clone();
+                let plan = FolderHistoryPlan::capture(self, direction, target.clone())?;
+                (
+                    target,
+                    self.capture_main_list_navigation(
+                        MainHistoryOperation::Replay(Box::new(plan)),
+                        self.copied_destination_source_proof(),
+                    ),
+                )
             }
-        }
+        } else {
+            let target = match direction {
+                FolderHistoryDirection::Back => self.folder_history_back_entry(),
+                FolderHistoryDirection::Forward => self.folder_history_forward_entry(),
+            }?
+            .clone();
+            let plan = FolderHistoryPlan::capture(self, direction, target.clone())?;
+            let proof = self.copied_destination_source_proof();
+            (
+                target,
+                self.capture_main_list_navigation(
+                    MainHistoryOperation::Replay(Box::new(plan)),
+                    proof,
+                ),
+            )
+        };
+        self.dispatch_folder_history_entry(target, navigation);
+        None
     }
 
     fn dispatch_staged_smart_history_action(
         &mut self,
         action: smart_folder::StagedSmartHistoryAction,
-        history_nav_rollback: &mut Option<FolderNavHistorySnapshot>,
     ) -> Option<PathBuf> {
-        let smart_folder::StagedSmartHistoryAction::Dispatch { target, rollback } = action else {
-            return None;
-        };
-        let mut snapshot = Some(rollback);
-        match self.dispatch_synthetic_folder_history_target_with_rollback(&target, &mut snapshot) {
-            SyntheticFolderHistoryDispatch::NotSynthetic => {
-                *history_nav_rollback = snapshot.take();
-                target.into_path()
-            }
-            SyntheticFolderHistoryDispatch::Restored => None,
-            SyntheticFolderHistoryDispatch::Unavailable => {
-                if let Some(snapshot) = snapshot.take() {
-                    self.restore_folder_nav_history(snapshot);
-                }
-                None
-            }
+        if let smart_folder::StagedSmartHistoryAction::Dispatch { target, navigation } = action {
+            self.dispatch_folder_history_entry(target, navigation);
         }
+        None
+    }
+
+    fn synthetic_folder_history_target_unavailable(&self, path: &Path) -> bool {
+        !(crate::folder_tree::path_eq(path, &drive_list_synthetic_path())
+            || crate::folder_tree::path_eq(path, &reading_history_synthetic_path())
+            || crate::folder_tree::path_eq(path, &bookmark_view_synthetic_path())
+            || crate::folder_tree::path_eq(path, &subfolder_expansion_synthetic_path()))
+    }
+
+    pub(crate) fn dispatch_folder_history_entry(
+        &mut self,
+        target: FolderNavHistoryEntry,
+        navigation: MainListNavigation,
+    ) -> bool {
+        match target.location.clone() {
+            FolderNavHistoryTarget::SmartFolder(state) => {
+                self.begin_smart_history_navigation_request(state, navigation)
+            }
+            FolderNavHistoryTarget::Rating { stars } => {
+                self.start_rating_navigation_owned(
+                    stars,
+                    RatingNavigationIntent::Restore,
+                    self.rating_view_saved_folder.clone(),
+                    self.rating_view_subfolder_restore.clone(),
+                    navigation,
+                );
+                true
+            }
+            location @ (FolderNavHistoryTarget::Collection(_)
+            | FolderNavHistoryTarget::CollectionPhysical(_)) => self
+                .start_collection_history_transition_owned(
+                    location,
+                    CollectionHistoryIntent::Restore,
+                    None,
+                    navigation,
+                ),
+            FolderNavHistoryTarget::RatingPhysical(restore) => {
+                let Some(owner) =
+                    self.rating_physical_restore_owner(&restore, RatingPhysicalLoadIntent::Restore)
+                else {
+                    return false;
+                };
+                self.start_physical_navigation_owned(
+                    PhysicalHistoryIntent::Rating {
+                        owner,
+                        restore: Some(restore.clone()),
+                        replay: None,
+                        zip_dir_prefix: None,
+                    },
+                    restore.visible_path,
+                    StartupListIntent::ExplicitList,
+                    navigation,
+                )
+            }
+            FolderNavHistoryTarget::Path(path)
+                if crate::folder_tree::path_eq(&path, &subfolder_expansion_synthetic_path()) =>
+            {
+                self.restore_subfolder_expansion_navigation(path, navigation)
+            }
+            FolderNavHistoryTarget::Path(path) if is_synthetic_view_path(&path) => {
+                let Some(prepared) = self.prepare_synthetic_surface(
+                    &target.location,
+                    None,
+                    BookmarkSurfaceEntrance::History,
+                ) else {
+                    return false;
+                };
+                let Some(adoption) = self.prepare_main_list_adoption(navigation, target) else {
+                    return false;
+                };
+                self.adopt_main_list_navigation(adoption, |app| {
+                    app.install_prepared_synthetic_surface(prepared)
+                })
+            }
+            FolderNavHistoryTarget::Path(path) => self.start_physical_navigation_owned(
+                PhysicalHistoryIntent::Navigation {
+                    replay: None,
+                    auto_fullscreen: false,
+                },
+                path,
+                StartupListIntent::ExplicitList,
+                navigation,
+            ),
+        }
+    }
+
+    fn start_physical_navigation_owned(
+        &mut self,
+        intent: PhysicalHistoryIntent,
+        path: PathBuf,
+        restore_intent: StartupListIntent,
+        navigation: MainListNavigation,
+    ) -> bool {
+        if Self::path_needs_open_classification(&path) {
+            return matches!(
+                self.start_open_path_classification_with_navigation(
+                    path,
+                    ClassifiedOpenContinuation::Physical {
+                        intent,
+                        dfs_continuation: None,
+                        restore_intent
+                    },
+                    navigation
+                ),
+                OpenAdmission::Accepted
+            );
+        }
+        self.start_physical_history_transition_classified(
+            intent,
+            path,
+            None,
+            None,
+            restore_intent,
+            navigation,
+            None,
+        )
     }
 
     pub(crate) fn recent_folder_entries(&self) -> &[PathBuf] {
@@ -23266,144 +24373,138 @@ impl App {
         }
     }
 
-    pub(crate) fn navigate_folder_history_back(&mut self) -> Option<FolderNavHistoryTarget> {
-        if !self.main_folder_history_available() {
-            return None;
-        }
-        let current = self.folder_nav_current_target();
-        let target = if let Some(workspace) = self.active_quick_folder_workspace_mut() {
-            workspace.history.back_stack.pop()?
-        } else {
-            self.folder_nav_back_stack.pop()?
-        };
-        if let Some(current) = current
-            && !Self::folder_nav_targets_eq(&current, &target)
-        {
-            if let Some(workspace) = self.active_quick_folder_workspace_mut() {
-                Self::push_folder_nav_stack(&mut workspace.history.forward_stack, current);
-            } else {
-                Self::push_folder_nav_stack(&mut self.folder_nav_forward_stack, current);
-            }
-        }
-        self.set_active_folder_nav_suppress_record_once(true);
-        Some(target)
-    }
-
     /// フォルダ履歴が指す合成パスを、実ディレクトリとしてロードせず対応ビューへ戻す。
     ///
-    /// `Unavailable` は保持 state が既に無いケース。呼び出し側は履歴 snapshot を戻して
-    /// no-op にし、合成パスを `load_folder` へ流してはならない。
+    /// `Unavailable` は保持 state が既に無いケース。確定履歴は変更せずno-opとし、
+    /// 合成パスを `load_folder` へ流してはならない。
     pub(crate) fn dispatch_synthetic_folder_history_target(
         &mut self,
         target: &FolderNavHistoryTarget,
     ) -> SyntheticFolderHistoryDispatch {
-        self.dispatch_synthetic_folder_history_target_with_rollback(target, &mut None)
-    }
-
-    fn dispatch_synthetic_folder_history_target_with_rollback(
-        &mut self,
-        target: &FolderNavHistoryTarget,
-        history_rollback: &mut Option<FolderNavHistorySnapshot>,
-    ) -> SyntheticFolderHistoryDispatch {
         let dispatch = match target {
-            FolderNavHistoryTarget::Collection(_)
-            | FolderNavHistoryTarget::CollectionPhysical(_) => {
-                if let Some(snapshot) = history_rollback.take() {
-                    self.restore_folder_nav_history(snapshot);
-                    let direction = if self.folder_history_back_target() == Some(target) {
-                        Some(FolderHistoryDirection::Back)
-                    } else if self.folder_history_forward_target() == Some(target) {
-                        Some(FolderHistoryDirection::Forward)
-                    } else {
-                        None
-                    };
-                    if direction.is_some_and(|direction| {
-                        self.start_collection_history_transition(
-                            target.clone(),
-                            CollectionHistoryIntent::Replay {
-                                direction,
-                                target: target.clone(),
-                            },
-                            None,
-                        )
-                    }) {
-                        return SyntheticFolderHistoryDispatch::Restored;
-                    }
-                    return SyntheticFolderHistoryDispatch::Unavailable;
-                }
-                if self.start_collection_history_transition(
-                    target.clone(),
-                    CollectionHistoryIntent::Restore,
-                    None,
-                ) {
-                    return SyntheticFolderHistoryDispatch::Restored;
-                }
-                return SyntheticFolderHistoryDispatch::Unavailable;
+            FolderNavHistoryTarget::Rating { stars } if !(1..=5).contains(stars) => {
+                SyntheticFolderHistoryDispatch::Unavailable
             }
-            FolderNavHistoryTarget::Rating { stars } => {
-                if !(1..=5).contains(stars) {
-                    return SyntheticFolderHistoryDispatch::Unavailable;
-                }
-                if let Some(snapshot) = history_rollback.take() {
-                    // Older callers already selected a target. Put their pre-pop cursor back;
-                    // the staged request will move it only with the visible Rating install.
-                    self.restore_folder_nav_history(snapshot);
-                    let direction = if self.folder_history_back_target() == Some(target) {
-                        Some(FolderHistoryDirection::Back)
-                    } else if self.folder_history_forward_target() == Some(target) {
-                        Some(FolderHistoryDirection::Forward)
-                    } else {
-                        None
-                    };
-                    if direction.is_some_and(|direction| {
-                        self.start_rating_history_replay(direction, *stars)
-                    }) {
-                        return SyntheticFolderHistoryDispatch::Restored;
-                    }
-                    return SyntheticFolderHistoryDispatch::Unavailable;
-                }
-                self.restore_rating_without_history(*stars);
-                return SyntheticFolderHistoryDispatch::Restored;
+            FolderNavHistoryTarget::Path(_) => {
+                return self.install_synthetic_history_surface(target);
             }
-            FolderNavHistoryTarget::RatingPhysical(restore) => {
-                if let Some(snapshot) = history_rollback.take() {
-                    self.restore_folder_nav_history(snapshot);
-                    let direction = if self.folder_history_back_target() == Some(target) {
-                        Some(FolderHistoryDirection::Back)
-                    } else if self.folder_history_forward_target() == Some(target) {
-                        Some(FolderHistoryDirection::Forward)
-                    } else {
-                        None
-                    };
-                    if direction.is_some_and(|direction| {
-                        self.start_rating_physical_restore(
-                            restore.clone(),
-                            Some((direction, target.clone())),
-                            RatingPhysicalLoadIntent::Restore,
-                        )
-                    }) {
-                        return SyntheticFolderHistoryDispatch::Restored;
-                    }
-                    return SyntheticFolderHistoryDispatch::Unavailable;
-                }
-                if self.start_rating_physical_restore(
-                    restore.clone(),
-                    None,
-                    RatingPhysicalLoadIntent::Restore,
-                ) {
-                    return SyntheticFolderHistoryDispatch::Restored;
-                }
-                return SyntheticFolderHistoryDispatch::Unavailable;
-            }
-            FolderNavHistoryTarget::SmartFolder(state) => {
-                if self
-                    .restore_smart_folder_view_state_with_history(state.clone(), history_rollback)
-                {
+            _ => {
+                let entry: FolderNavHistoryEntry = target.clone().into();
+                let nav = self.capture_main_list_navigation(
+                    MainHistoryOperation::Restore {
+                        route: Some(entry.route.clone()),
+                    },
+                    self.copied_destination_source_proof(),
+                );
+                if self.dispatch_folder_history_entry(entry, nav) {
                     SyntheticFolderHistoryDispatch::Restored
                 } else {
                     SyntheticFolderHistoryDispatch::Unavailable
                 }
             }
+        };
+        dispatch
+    }
+
+    fn adopt_synthetic_surface(
+        &mut self,
+        target: FolderNavHistoryTarget,
+        mut history: MainHistoryOperation,
+        drive_origin: Option<Option<PathBuf>>,
+    ) {
+        if self.global_search.active
+            || self.favsearch.active
+            || self.tag_view.active
+            || self.suppress_nav_record_for_search_restore
+        {
+            history = MainHistoryOperation::Restore { route: None };
+        }
+        let entrance = if matches!(
+            history,
+            MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation)
+        ) {
+            BookmarkSurfaceEntrance::Menu
+        } else {
+            BookmarkSurfaceEntrance::Restore
+        };
+        self.retire_replaced_main_list_requests(None);
+        let navigation =
+            self.capture_main_list_navigation(history, self.copied_destination_source_proof());
+        let Some(prepared) = self.prepare_synthetic_surface(&target, drive_origin, entrance) else {
+            return;
+        };
+        let destination = self.main_list_requested_destination(&navigation, target, None);
+        if self.main_folder_history_available() {
+            let Some(adoption) = self.prepare_main_list_adoption(navigation, destination) else {
+                return;
+            };
+            self.adopt_main_list_navigation(adoption, |app| {
+                app.install_prepared_synthetic_surface(prepared)
+            });
+        } else {
+            let hydration = self.install_prepared_synthetic_surface(prepared);
+            self.hydrate_installed_main_list(hydration);
+        }
+    }
+
+    fn prepare_synthetic_surface(
+        &mut self,
+        target: &FolderNavHistoryTarget,
+        drive_origin: Option<Option<PathBuf>>,
+        entrance: BookmarkSurfaceEntrance,
+    ) -> Option<PreparedSyntheticSurface> {
+        let FolderNavHistoryTarget::Path(path) = target else {
+            return None;
+        };
+        if crate::folder_tree::path_eq(path, &drive_list_synthetic_path()) {
+            self.prepare_visible_install(path, &[], None).ok()?;
+            return Some(PreparedSyntheticSurface::Drive {
+                origin: drive_origin.unwrap_or_else(|| self.effective_folder()),
+            });
+        }
+        if crate::folder_tree::path_eq(path, &reading_history_synthetic_path()) {
+            let entries = self.read_reading_history_entries();
+            return self
+                .prepare_reading_history_entries(Vec::new())
+                .map(|prepared| PreparedSyntheticSurface::Reading { prepared, entries });
+        }
+        if crate::folder_tree::path_eq(path, &bookmark_view_synthetic_path()) {
+            let token = self.prepare_visible_install(path, &[], None).ok()?;
+            return Some(PreparedSyntheticSurface::Bookmarks { token, entrance });
+        }
+        None
+    }
+
+    fn install_prepared_synthetic_surface(
+        &mut self,
+        prepared: PreparedSyntheticSurface,
+    ) -> MainListHydration {
+        match prepared {
+            PreparedSyntheticSurface::Drive { origin } => {
+                self.install_drive_list(origin);
+                None
+            }
+            PreparedSyntheticSurface::Reading { prepared, entries } => {
+                self.install_reading_history_surface(prepared, entries)
+            }
+            PreparedSyntheticSurface::Bookmarks { token, entrance } => {
+                if matches!(entrance, BookmarkSurfaceEntrance::Menu) {
+                    self.clear_bookmark_view_return_state();
+                    self.bookmark_view_sort = crate::bookmark_browser::BookmarkViewSort::default();
+                }
+                if !matches!(entrance, BookmarkSurfaceEntrance::Restore) {
+                    self.reset_details_sort_to_toolbar();
+                }
+                self.install_bookmark_view_surface(token)
+            }
+        }
+    }
+
+    fn install_synthetic_history_surface(
+        &mut self,
+        target: &FolderNavHistoryTarget,
+    ) -> SyntheticFolderHistoryDispatch {
+        let dispatch = match target {
             FolderNavHistoryTarget::Path(target)
                 if crate::folder_tree::path_eq(target, &drive_list_synthetic_path()) =>
             {
@@ -23449,7 +24550,7 @@ impl App {
                     SyntheticFolderHistoryDispatch::Unavailable
                 }
             }
-            FolderNavHistoryTarget::Path(_) => SyntheticFolderHistoryDispatch::NotSynthetic,
+            _ => SyntheticFolderHistoryDispatch::NotSynthetic,
         };
 
         if dispatch == SyntheticFolderHistoryDispatch::Restored {
@@ -23599,29 +24700,6 @@ impl App {
 
     fn current_folder_watch_event_relevant(event: &notify::Event) -> bool {
         !matches!(event.kind, notify::EventKind::Access(_))
-    }
-
-    pub(crate) fn navigate_folder_history_forward(&mut self) -> Option<FolderNavHistoryTarget> {
-        if !self.main_folder_history_available() {
-            return None;
-        }
-        let current = self.folder_nav_current_target();
-        let target = if let Some(workspace) = self.active_quick_folder_workspace_mut() {
-            workspace.history.forward_stack.pop()?
-        } else {
-            self.folder_nav_forward_stack.pop()?
-        };
-        if let Some(current) = current
-            && !Self::folder_nav_targets_eq(&current, &target)
-        {
-            if let Some(workspace) = self.active_quick_folder_workspace_mut() {
-                Self::push_folder_nav_stack(&mut workspace.history.back_stack, current);
-            } else {
-                Self::push_folder_nav_stack(&mut self.folder_nav_back_stack, current);
-            }
-        }
-        self.set_active_folder_nav_suppress_record_once(true);
-        Some(target)
     }
 
     /// 現在のフォルダを再読み込みする。変換済みアーカイブ閲覧中 (キャッシュ ZIP を
@@ -24273,7 +25351,10 @@ impl App {
         let show_search_bar = self.show_search_bar;
         let query = self.search_query.clone();
         let filter = self.search_filter.clone();
-        let search_was_pending = self.search_pending.is_some();
+        let pending_submission = self
+            .search_pending
+            .as_ref()
+            .map(|pending| pending.submitted.clone());
         self.zip_nav_show_current_level(crate::app::StartupListIntent::PreservePresentation);
         self.selected = selected.filter(|index| *index < self.items.len());
         self.scroll_offset_y = scroll;
@@ -24282,8 +25363,10 @@ impl App {
         self.search_query = query;
         self.search_filter = filter;
         self.rebuild_visible_indices();
-        if search_was_pending && let Some(ctx) = self.edit_preview_repaint_ctx.clone() {
-            self.execute_search(&ctx);
+        if let Some(submitted) = pending_submission
+            && let Some(ctx) = self.edit_preview_repaint_ctx.clone()
+        {
+            self.execute_submitted_local_search(&ctx, submitted);
         }
     }
 
@@ -24759,12 +25842,23 @@ impl App {
         if self.document_open_modal_admission_blocked() {
             return;
         }
-        self.record_folder_nav_transition(&drive_list_synthetic_path());
-        self.enter_drive_list(origin);
+        self.adopt_synthetic_surface(
+            FolderNavHistoryTarget::Path(drive_list_synthetic_path()),
+            MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation),
+            Some(origin),
+        );
     }
 
     /// ドライブ一覧本体を構築する。履歴 dispatch からも呼ぶため、ここでは履歴を記録しない。
     pub(crate) fn enter_drive_list(&mut self, origin: Option<PathBuf>) {
+        self.adopt_synthetic_surface(
+            FolderNavHistoryTarget::Path(drive_list_synthetic_path()),
+            MainHistoryOperation::Restore { route: None },
+            Some(origin),
+        );
+    }
+
+    fn install_drive_list(&mut self, origin: Option<PathBuf>) {
         self.capture_main_list_restore_cursor();
         self.save_leaving_rating_grid_position();
 
@@ -25019,6 +26113,69 @@ impl App {
         candidate_source: crate::pdf_loader::LeasedEpubPath,
         continuation: ClassifiedOpenContinuation,
     ) -> OpenAdmission {
+        let proof = match &continuation {
+            ClassifiedOpenContinuation::Direct { owner, .. }
+            | ClassifiedOpenContinuation::DirectNavigation { owner, .. }
+            | ClassifiedOpenContinuation::DirectScan { owner, .. } => {
+                Some(self.copied_open_source_proof(owner))
+            }
+            ClassifiedOpenContinuation::BookmarkRow(_) => {
+                Some(self.copied_destination_source_proof())
+            }
+            ClassifiedOpenContinuation::Physical { intent, .. } => {
+                Some(self.physical_navigation_source_proof(intent))
+            }
+            ClassifiedOpenContinuation::Collection { .. } => {
+                Some(self.copied_destination_source_proof())
+            }
+            // These continuations read the original index after classification.
+            ClassifiedOpenContinuation::SmartGrid { .. } => Some(MainListSourceProof::Row),
+            ClassifiedOpenContinuation::SnapshotArchiveCacheOnly(request) => {
+                Some(MainListSourceProof::Snapshot(request.source_proof()))
+            }
+            #[cfg(windows)]
+            ClassifiedOpenContinuation::DetachedGrid { .. } => Some(MainListSourceProof::Row),
+        };
+        let navigation = if self.main_folder_history_available() {
+            proof.map(|proof| {
+                self.capture_main_list_navigation(
+                    MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation),
+                    proof,
+                )
+            })
+        } else {
+            None
+        };
+        self.start_open_path_classification_owned_with_navigation(
+            candidate_source,
+            continuation,
+            navigation,
+        )
+    }
+
+    fn start_open_path_classification_with_navigation(
+        &mut self,
+        path: PathBuf,
+        continuation: ClassifiedOpenContinuation,
+        navigation: MainListNavigation,
+    ) -> OpenAdmission {
+        let candidate_source = match crate::pdf_loader::LeasedEpubPath::try_new(path) {
+            Ok(owner) => owner,
+            Err(reason) => return OpenAdmission::Refused(reason.into()),
+        };
+        self.start_open_path_classification_owned_with_navigation(
+            candidate_source,
+            continuation,
+            Some(navigation),
+        )
+    }
+
+    fn start_open_path_classification_owned_with_navigation(
+        &mut self,
+        candidate_source: crate::pdf_loader::LeasedEpubPath,
+        continuation: ClassifiedOpenContinuation,
+        navigation: Option<MainListNavigation>,
+    ) -> OpenAdmission {
         if self.document_open_modal_admission_blocked() {
             return OpenAdmission::Refused(OpenAdmissionRefusal::DocumentOpenBusy);
         }
@@ -25045,11 +26202,19 @@ impl App {
                             Some(&worker_cancel),
                         )?;
                         Ok(ClassifiedOpenPath {
+                            rar_volume_proof: None,
                             kind: OpenPathKind::Directory,
                             folder_scan: Some(scan),
                         })
                     } else {
                         Ok(ClassifiedOpenPath {
+                            rar_volume_proof: if metadata.is_file()
+                                && crate::rar_loader::is_rar_path(&worker_path)
+                            {
+                                crate::rar_loader::volume_proof(&worker_path).ok()
+                            } else {
+                                None
+                            },
                             kind: if metadata.is_file() {
                                 OpenPathKind::File
                             } else {
@@ -25067,6 +26232,24 @@ impl App {
         {
             return OpenAdmission::Refused(OpenAdmissionRefusal::ClassificationWorkerUnavailable);
         }
+        // A newly admitted typed main navigation replaces the previous provisional cursor.
+        // Detached classification is read-only with respect to the main navigation owners.
+        let detached_destination = match &continuation {
+            #[cfg(windows)]
+            ClassifiedOpenContinuation::DetachedGrid { .. } => true,
+            ClassifiedOpenContinuation::Direct { owner, .. }
+            | ClassifiedOpenContinuation::DirectNavigation { owner, .. }
+            | ClassifiedOpenContinuation::DirectScan { owner, .. } => match owner {
+                OpenRequestOwner::DetachedGridArchive(_) => true,
+                #[cfg(windows)]
+                OpenRequestOwner::Bookmark(owner) => owner.detached_lease.is_some(),
+                _ => false,
+            },
+            _ => false,
+        };
+        if navigation.is_some() && !detached_destination && self.main_folder_history_available() {
+            self.retire_replaced_main_list_requests(Some(MainListRequestOwner::Classification));
+        }
         let candidate = OpenPathClassification {
             request_id: NEXT_OPEN_PATH_CLASSIFICATION_ID.fetch_add(1, Ordering::Relaxed),
             context: self.projected_viewer_context_id(),
@@ -25074,6 +26257,7 @@ impl App {
             cancel,
             rx,
             continuation: Some(Box::new(continuation)),
+            navigation,
             grid_open_effects: None,
         };
         self.top_level_grid_view
@@ -25114,10 +26298,15 @@ impl App {
         if Some(candidate.request_id) != request_id
             || candidate.context != self.projected_viewer_context_id()
             || candidate.cancel.load(Ordering::Acquire)
+            || candidate
+                .navigation
+                .as_ref()
+                .is_some_and(|navigation| !self.main_list_navigation_is_current(navigation))
         {
             return;
         }
         let Ok(ClassifiedOpenPath {
+            rar_volume_proof,
             kind,
             mut folder_scan,
         }) = result
@@ -25126,6 +26315,21 @@ impl App {
             self.show_feedback_toast("移動先を確認できません".into());
             return;
         };
+        if matches!(
+            candidate.continuation.as_deref(),
+            Some(ClassifiedOpenContinuation::SnapshotArchiveCacheOnly(_))
+        ) && let Some(message) = rar_volume_proof
+            .as_ref()
+            .and_then(|proof| proof.rejection_message())
+        {
+            crate::logger::log(format!(
+                "snapshot_open: reject_subsequent_rar src={} message={message}",
+                candidate.path.display()
+            ));
+            self.finish_rejected_open_path_classification(&candidate);
+            self.show_feedback_toast(message);
+            return;
+        }
         if kind == OpenPathKind::Other {
             self.finish_rejected_open_path_classification(&candidate);
             return;
@@ -25150,12 +26354,20 @@ impl App {
         };
         let path = candidate.path.to_path_buf();
         match *continuation {
+            ClassifiedOpenContinuation::SnapshotArchiveCacheOnly(request) => {
+                self.finish_snapshot_archive_cache_open(
+                    ctx,
+                    path,
+                    kind,
+                    request,
+                    candidate.navigation.take(),
+                );
+            }
             ClassifiedOpenContinuation::DirectNavigation {
                 restore_intent,
 
                 pre_scan,
                 owner,
-                history_nav_rollback,
                 pane_epub_restore,
             } => {
                 let pre_scan = (kind == OpenPathKind::Directory)
@@ -25165,14 +26377,18 @@ impl App {
                     path,
                     pre_scan,
                     owner,
-                    history_nav_rollback,
+                    candidate.navigation.take(),
                     pane_epub_restore,
                     Some(kind),
                     restore_intent.clone(),
                 );
             }
             ClassifiedOpenContinuation::BookmarkRow(row) => {
-                self.open_bookmark_browser_row_classified(ctx, &row);
+                self.open_bookmark_browser_row_classified_with_navigation(
+                    ctx,
+                    &row,
+                    candidate.navigation.take(),
+                );
             }
             #[cfg(windows)]
             ClassifiedOpenContinuation::DetachedGrid {
@@ -25214,6 +26430,7 @@ impl App {
                     kind,
                     folder_scan.take(),
                     restore_intent.clone(),
+                    candidate.navigation.take(),
                 ) {
                     crate::logger::log("classified smart grid open: request not adopted");
                 }
@@ -25228,15 +26445,18 @@ impl App {
                     OpenRequestOwner::Bookmark(bookmark) => Some(bookmark.clone()),
                     _ => None,
                 };
-                let outcome = self.load_folder_or_convert_archive_with_auto_fullscreen_classified(
-                    path,
-                    auto_fullscreen,
-                    owner,
-                    Some(kind),
-                    folder_scan.take(),
-                    restore_intent.clone(),
-                );
+                let outcome = self
+                    .load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation(
+                        path,
+                        auto_fullscreen,
+                        owner,
+                        Some(kind),
+                        folder_scan.take(),
+                        restore_intent.clone(),
+                        candidate.navigation.take(),
+                    );
                 if matches!(outcome, FolderOpenOutcome::Loaded)
+                    && !self.main_folder_history_available()
                     && let Some(bookmark) = bookmark_owner.as_ref()
                 {
                     self.begin_bookmark_page_wait(bookmark);
@@ -25261,15 +26481,18 @@ impl App {
                 let pre_scan = (kind == OpenPathKind::Directory)
                     .then(|| folder_scan.take().or(pre_scan))
                     .flatten();
-                let outcome = self.load_folder_with_scan_owned_outcome_and_effects_classified(
-                    path,
-                    pre_scan,
-                    owner,
-                    grid_effects,
-                    Some(kind),
-                    restore_intent.clone(),
-                );
+                let outcome = self
+                    .load_folder_with_scan_owned_outcome_and_effects_classified_with_navigation(
+                        path,
+                        pre_scan,
+                        owner,
+                        grid_effects,
+                        Some(kind),
+                        restore_intent.clone(),
+                        candidate.navigation.take(),
+                    );
                 if matches!(outcome, FolderOpenOutcome::Loaded)
+                    && !self.main_folder_history_available()
                     && let Some(bookmark) = bookmark_owner.as_ref()
                 {
                     self.begin_bookmark_page_wait(bookmark);
@@ -25294,6 +26517,11 @@ impl App {
                     dfs_continuation,
                     Some(kind),
                     restore_intent.clone(),
+                    candidate
+                        .navigation
+                        .take()
+                        .expect("physical classification owns its navigation"),
+                    folder_scan.take(),
                 ) {
                     crate::logger::log("classified physical history: request not adopted");
                 }
@@ -25310,6 +26538,10 @@ impl App {
                     intent,
                     return_to,
                     Some(kind),
+                    candidate
+                        .navigation
+                        .take()
+                        .expect("collection classification owns navigation"),
                 ) {
                     crate::logger::log("classified collection history: request not adopted");
                 }
@@ -25434,23 +26666,24 @@ impl App {
         path: PathBuf,
         pre_scan: Option<ScannedDir>,
         owner: OpenRequestOwner,
-        history_nav_rollback: Option<FolderNavHistorySnapshot>,
+        navigation: Option<MainListNavigation>,
         pane_epub_restore: Option<crate::ui_dialogs::epub_convert::EpubOpenRestore>,
 
         restore_intent: crate::app::StartupListIntent,
     ) {
         if Self::path_needs_open_classification(&path) {
-            match self.start_open_path_classification(
-                path,
-                ClassifiedOpenContinuation::DirectNavigation {
-                    restore_intent: restore_intent.clone(),
-
-                    pre_scan,
-                    owner,
-                    history_nav_rollback,
-                    pane_epub_restore,
-                },
-            ) {
+            let continuation = ClassifiedOpenContinuation::DirectNavigation {
+                restore_intent: restore_intent.clone(),
+                pre_scan,
+                owner,
+                pane_epub_restore,
+            };
+            let admission = if let Some(navigation) = navigation {
+                self.start_open_path_classification_with_navigation(path, continuation, navigation)
+            } else {
+                self.start_open_path_classification(path, continuation)
+            };
+            match admission {
                 OpenAdmission::Accepted => {}
                 OpenAdmission::Refused(reason) => {
                     self.show_open_admission_refusal(reason);
@@ -25465,7 +26698,7 @@ impl App {
             path,
             pre_scan,
             owner,
-            history_nav_rollback,
+            navigation,
             pane_epub_restore,
             None,
             restore_intent.clone(),
@@ -25477,43 +26710,40 @@ impl App {
         path: PathBuf,
         pre_scan: Option<ScannedDir>,
         owner: OpenRequestOwner,
-        history_nav_rollback: Option<FolderNavHistorySnapshot>,
+        navigation: Option<MainListNavigation>,
         pane_epub_restore: Option<crate::ui_dialogs::epub_convert::EpubOpenRestore>,
         classified_kind: Option<OpenPathKind>,
         restore_intent: crate::app::StartupListIntent,
     ) {
-        let search_rollback = if self.favsearch.active
-            || self.tag_view.active
-            || self.rating_view_nav_context_active()
-        {
-            Some(self.folder_nav_history_snapshot())
-        } else {
-            None
-        };
-        // Search navigation stages its path before opening; a refusal restores the snapshot.
-        if self.favsearch.active {
-            self.favsearch.nav_stack.push(path.clone());
-        }
-        if self.tag_view.active {
-            self.record_tag_view_nav_open(&path);
-        }
+        let navigation = navigation.or_else(|| {
+            self.main_folder_history_available().then(|| {
+                self.capture_main_list_navigation(
+                    MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation),
+                    self.copied_open_source_proof(&owner),
+                )
+            })
+        });
         let outcome = match pre_scan {
-            Some(scan) => self.load_folder_with_scan_owned_outcome_and_effects_classified(
-                path.clone(),
-                Some(scan),
-                owner,
-                None,
-                classified_kind,
-                restore_intent.clone(),
-            ),
-            None => self.load_folder_or_convert_archive_with_auto_fullscreen_classified(
-                path.clone(),
-                false,
-                owner,
-                classified_kind,
-                None,
-                restore_intent.clone(),
-            ),
+            Some(scan) => self
+                .load_folder_with_scan_owned_outcome_and_effects_classified_with_navigation(
+                    path.clone(),
+                    Some(scan),
+                    owner,
+                    None,
+                    classified_kind,
+                    restore_intent.clone(),
+                    navigation,
+                ),
+            None => self
+                .load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation(
+                    path.clone(),
+                    false,
+                    owner,
+                    classified_kind,
+                    None,
+                    restore_intent.clone(),
+                    navigation,
+                ),
         };
         self.finish_pane_open_restore(
             pane_epub_restore,
@@ -25523,35 +26753,7 @@ impl App {
                 PaneOpenRestoreExit::Abandoned
             },
         );
-        if matches!(outcome, FolderOpenOutcome::Loaded) {
-            self.advance_drilled_current_path(&path);
-        }
-        let rollback = history_nav_rollback.or(search_rollback);
-        match (outcome, rollback) {
-            (FolderOpenOutcome::ConversionDialogOpened, Some(snapshot)) => {
-                self.attach_archive_convert_nav_history_rollback(snapshot);
-            }
-            (FolderOpenOutcome::Ignored | FolderOpenOutcome::Refused(_), Some(snapshot)) => {
-                self.restore_folder_nav_history(snapshot);
-            }
-            _ => {}
-        }
         self.clear_pending_folder_nav_steps();
-        if self.favsearch.active && matches!(outcome, FolderOpenOutcome::Loaded) {
-            self.update_favsearch_address();
-        }
-        if self.tag_view.active && matches!(outcome, FolderOpenOutcome::Loaded) {
-            self.update_tag_view_address();
-        }
-
-        if matches!(
-            self.top_level_grid_view.surface(),
-            top_level_grid_view::TopLevelGridSurface::Search(
-                top_level_grid_view::TopLevelSearchView::Global
-            )
-        ) {
-            self.finish_main_list_open(restore_intent);
-        }
     }
 
     fn load_folder_nav_target(
@@ -25647,10 +26849,10 @@ impl App {
                     || crate::folder_tree::is_convertible_archive_path(path))
                     && !self.visible_grid_item_is_folder(path)
             }
-            OpenRequestOwner::MainGridArchive(intent) => {
-                crate::folder_tree::is_convertible_archive_path(path)
-                    && (intent.rating_grid_owner.is_some()
-                        || intent.collection_grid_owner.is_some())
+            OpenRequestOwner::MainGridArchive(_) | OpenRequestOwner::Bookmark(_) => {
+                (crate::folder_tree::is_virtual_folder(path)
+                    || crate::folder_tree::is_convertible_archive_path(path))
+                    && !self.visible_grid_item_is_folder(path)
             }
             _ => false,
         }
@@ -25683,6 +26885,12 @@ impl App {
         if !self.snapshot_scope_allows_open(&path, &owner) {
             self.show_snapshot_out_of_scope_open_feedback();
             return FolderOpenOutcome::Ignored;
+        }
+        if matches!(owner, OpenRequestOwner::Navigation)
+            && self.main_folder_history_available()
+            && self.restore_smart_folder_for_synthetic_path(&path)
+        {
+            return FolderOpenOutcome::Loaded;
         }
         if Self::path_needs_open_classification(&path) {
             return match self.start_open_path_classification(
@@ -25721,9 +26929,32 @@ impl App {
         owner: OpenRequestOwner,
         classified_kind: Option<OpenPathKind>,
         pre_scan: Option<ScannedDir>,
+        restore_intent: StartupListIntent,
+    ) -> FolderOpenOutcome {
+        self.load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation(
+            path,
+            auto_fullscreen,
+            owner,
+            classified_kind,
+            pre_scan,
+            restore_intent,
+            None,
+        )
+    }
+
+    fn load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation(
+        &mut self,
+        path: PathBuf,
+        auto_fullscreen: bool,
+        owner: OpenRequestOwner,
+        classified_kind: Option<OpenPathKind>,
+        pre_scan: Option<ScannedDir>,
 
         restore_intent: crate::app::StartupListIntent,
+        navigation: Option<MainListNavigation>,
     ) -> FolderOpenOutcome {
+        let navigation =
+            navigation.or_else(|| self.capture_physical_open_navigation(&owner, &path));
         // Scope refusal must precede lifecycle adoption: claim_open_request_owner cancels an
         // in-flight archive conversion, unresolved startup open, and conflicting bookmark open.
         if !self.snapshot_scope_allows_open(&path, &owner) {
@@ -25754,11 +26985,14 @@ impl App {
                     matches!(item, GridItem::ConvertibleArchive { path: source, .. }
                         if crate::folder_tree::path_eq(source, &path))
                 }) {
-                    return if self.begin_smart_grid_container_navigation(
+                    return if self.begin_smart_grid_container_navigation_classified(
                         index,
                         path,
                         auto_fullscreen,
+                        classified_kind.unwrap_or(OpenPathKind::File),
+                        pre_scan,
                         restore_intent.clone(),
+                        navigation,
                     ) {
                         FolderOpenOutcome::Loaded
                     } else {
@@ -25767,13 +27001,14 @@ impl App {
                 }
             } else {
                 return if self
-                    .begin_smart_physical_navigation(
+                    .begin_smart_physical_navigation_with_navigation(
                         path,
                         kind,
                         auto_fullscreen,
                         pre_scan,
                         None,
                         restore_intent.clone(),
+                        navigation,
                     )
                     .is_ok()
                 {
@@ -25785,42 +27020,21 @@ impl App {
         }
         if classified_kind != Some(OpenPathKind::Directory)
             && crate::folder_tree::is_convertible_archive_path(&path)
-            && self.main_folder_history_available()
-            && let OpenRequestOwner::MainGridArchive(intent) = &owner
-            && (intent.rating_grid_owner.is_some() || intent.collection_grid_owner.is_some())
-        {
-            if !self.claim_open_request_owner(&path, &owner) {
-                return FolderOpenOutcome::Ignored;
-            }
-            return if self.start_physical_history_transition(
-                PhysicalHistoryIntent::MainGridArchive {
-                    owner: intent.clone(),
-                    auto_fullscreen,
-                },
-                path,
-                restore_intent.clone(),
-            ) {
-                FolderOpenOutcome::ConversionDialogOpened
-            } else {
-                FolderOpenOutcome::Ignored
-            };
-        }
-        if classified_kind != Some(OpenPathKind::Directory)
-            && crate::folder_tree::is_convertible_archive_path(&path)
             && !self.visible_grid_item_is_folder(&path)
-            && self.main_folder_history_available()
-            && matches!(owner, OpenRequestOwner::Navigation)
+            && let Some(navigation) = navigation.clone()
+            && let Some(intent) = Self::physical_open_intent(&owner, auto_fullscreen)
         {
             if !self.claim_open_request_owner(&path, &owner) {
                 return FolderOpenOutcome::Ignored;
             }
-            return if self.start_physical_history_transition(
-                PhysicalHistoryIntent::Navigation {
-                    replay: None,
-                    auto_fullscreen,
-                },
+            return if self.start_physical_history_transition_classified(
+                intent,
                 path,
-                restore_intent.clone(),
+                None,
+                classified_kind,
+                restore_intent,
+                navigation,
+                pre_scan,
             ) {
                 FolderOpenOutcome::ConversionDialogOpened
             } else {
@@ -25851,11 +27065,9 @@ impl App {
                 return FolderOpenOutcome::Ignored;
             }
             if format == crate::archive_converter::ArchiveFormat::Rar {
-                let fallback_cached_zip = self.try_archive_cache_lookup(&path);
                 return if self.request_rar_open_owned(
                     path,
                     auto_fullscreen,
-                    fallback_cached_zip,
                     owner,
                     restore_intent.clone(),
                 ) {
@@ -25919,6 +27131,7 @@ impl App {
             None,
             classified_kind,
             restore_intent.clone(),
+            navigation,
         )
     }
 
@@ -26058,7 +27271,28 @@ impl App {
         owner: OpenRequestOwner,
         grid_effects: Option<GridVirtualOpenEffects>,
         classified_kind: Option<OpenPathKind>,
+        restore_intent: StartupListIntent,
+    ) -> FolderOpenOutcome {
+        self.load_folder_with_scan_owned_outcome_and_effects_classified_with_navigation(
+            path,
+            pre_scan,
+            owner,
+            grid_effects,
+            classified_kind,
+            restore_intent,
+            None,
+        )
+    }
+
+    fn load_folder_with_scan_owned_outcome_and_effects_classified_with_navigation(
+        &mut self,
+        path: PathBuf,
+        pre_scan: Option<ScannedDir>,
+        owner: OpenRequestOwner,
+        grid_effects: Option<GridVirtualOpenEffects>,
+        classified_kind: Option<OpenPathKind>,
         restore_intent: crate::app::StartupListIntent,
+        navigation: Option<MainListNavigation>,
     ) -> FolderOpenOutcome {
         if !self.snapshot_scope_allows_open(&path, &owner) {
             self.reject_snapshot_out_of_scope_open();
@@ -26082,13 +27316,14 @@ impl App {
             && kind != smart_folder::SmartChildKind::ConvertibleArchive
         {
             return if self
-                .begin_smart_physical_navigation(
+                .begin_smart_physical_navigation_with_navigation(
                     path,
                     kind,
                     false,
                     pre_scan,
                     None,
                     restore_intent.clone(),
+                    navigation,
                 )
                 .is_ok()
             {
@@ -26108,6 +27343,7 @@ impl App {
             grid_effects,
             classified_kind,
             restore_intent.clone(),
+            navigation,
         )
     }
 
@@ -26527,6 +27763,96 @@ impl App {
         }
     }
 
+    fn copied_open_source_proof(&self, owner: &OpenRequestOwner) -> MainListSourceProof {
+        match owner {
+            // These requests own the destination path/effects and never read a source index
+            // after admission. Keep their semantic owner across same-query/folder row refreshes.
+            OpenRequestOwner::Navigation | OpenRequestOwner::QuickFolderSwitch(_) => {
+                self.copied_destination_source_proof()
+            }
+            OpenRequestOwner::MainGridArchive(intent)
+                if matches!(intent.smart_folder_owner, SmartGridArchiveOwner::None)
+                    && intent.rating_grid_owner.is_none()
+                    && intent.collection_grid_owner.is_none() =>
+            {
+                self.copied_destination_source_proof()
+            }
+            OpenRequestOwner::Bookmark(owner) => MainListSourceProof::Bookmark(owner.clone()),
+            OpenRequestOwner::RatingPhysical(owner)
+                if owner.intent == RatingPhysicalLoadIntent::Restore =>
+            {
+                self.copied_destination_source_proof()
+            }
+            // Requests with native row/snapshot owners retain their strict validators.
+            // Their items/revision/index checks must remain strict, regardless of file suffix.
+            OpenRequestOwner::RatingPhysical(_)
+            | OpenRequestOwner::CollectionGridPhysical(_)
+            | OpenRequestOwner::MainGridArchive(_)
+            | OpenRequestOwner::DetachedGridArchive(_) => MainListSourceProof::Row,
+        }
+    }
+
+    fn capture_physical_open_navigation(
+        &mut self,
+        owner: &OpenRequestOwner,
+        path: &Path,
+    ) -> Option<MainListNavigation> {
+        if !self.main_folder_history_available() {
+            return None;
+        }
+        let proof = self.copied_open_source_proof(owner);
+        let operation = if matches!(owner, OpenRequestOwner::QuickFolderSwitch(_))
+            || self
+                .effective_folder()
+                .is_some_and(|current| crate::folder_tree::path_eq(&current, path))
+            || self
+                .current_folder
+                .as_ref()
+                .is_some_and(|current| crate::folder_tree::path_eq(current, path))
+        {
+            // A refresh may load the backing ZIP while the adopted identity is its source
+            // archive. Keep the canonical source and route instead of recording a cache hop.
+            MainHistoryOperation::SameLocation
+        } else {
+            MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation)
+        };
+        Some(self.capture_main_list_navigation(operation, proof))
+    }
+
+    fn physical_open_intent(
+        owner: &OpenRequestOwner,
+        auto_fullscreen: bool,
+    ) -> Option<PhysicalHistoryIntent> {
+        match owner {
+            OpenRequestOwner::Navigation => Some(PhysicalHistoryIntent::Navigation {
+                replay: None,
+                auto_fullscreen,
+            }),
+            OpenRequestOwner::MainGridArchive(owner) => {
+                Some(PhysicalHistoryIntent::MainGridArchive {
+                    owner: owner.clone(),
+                    auto_fullscreen,
+                })
+            }
+            OpenRequestOwner::Bookmark(owner) => Some(PhysicalHistoryIntent::Bookmark {
+                owner: owner.clone(),
+                auto_fullscreen,
+            }),
+            OpenRequestOwner::CollectionGridPhysical(owner) => {
+                Some(PhysicalHistoryIntent::CollectionGrid {
+                    owner: owner.clone(),
+                })
+            }
+            OpenRequestOwner::RatingPhysical(owner) => Some(PhysicalHistoryIntent::Rating {
+                owner: owner.clone(),
+                restore: None,
+                replay: None,
+                zip_dir_prefix: None,
+            }),
+            _ => None,
+        }
+    }
+
     fn load_folder_with_scan_claimed(
         &mut self,
         path: PathBuf,
@@ -26536,6 +27862,7 @@ impl App {
         grid_effects: Option<GridVirtualOpenEffects>,
         classified_kind: Option<OpenPathKind>,
         restore_intent: crate::app::StartupListIntent,
+        navigation: Option<MainListNavigation>,
     ) -> FolderOpenOutcome {
         let detached_physical = self.navigation_scope.is_detached_physical();
         if classified_kind != Some(OpenPathKind::Directory)
@@ -26543,332 +27870,63 @@ impl App {
         {
             return self.report_pdf_open_refusal(&path, reason);
         }
+        let navigation =
+            navigation.or_else(|| self.capture_physical_open_navigation(&owner, &path));
         if !detached_physical
-            && self.main_folder_history_available()
-            && let OpenRequestOwner::CollectionGridPhysical(collection) = &owner
             && pre_scan.is_none()
             && crate::folder_tree::is_virtual_folder(&path)
-            && classified_kind != Some(OpenPathKind::Directory)
-            && !self.visible_grid_item_is_folder(&path)
-        {
-            return if self.start_physical_history_transition(
-                PhysicalHistoryIntent::CollectionGrid {
-                    owner: collection.clone(),
-                },
-                path,
-                restore_intent.clone(),
-            ) {
-                FolderOpenOutcome::Loaded
-            } else {
-                FolderOpenOutcome::Ignored
-            };
-        }
-        if !detached_physical
-            && self.main_folder_history_available()
-            && matches!(owner, OpenRequestOwner::Navigation)
-            && pre_scan.is_none()
-            && crate::folder_tree::is_virtual_folder(&path)
-            // The released direct PDF path commits a warm placeholder immediately. Cold PDF
-            // opens already retain their source and rollback in PdfOpenPhase::ColdCandidate.
-            // Keep history staging for ZIP and EPUB; EPUB conversion owns its typed continuation.
-            && !path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+            // Direct PDF keeps the released immediate warm display and its native verifier.
+            && !path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
             && classified_kind != Some(OpenPathKind::Directory)
             && !self.visible_grid_item_is_folder(&path)
             && !self.smart_folder_session_owns_load(&path)
+            && let Some(navigation) = navigation.clone()
+            && let Some(intent) = Self::physical_open_intent(&owner, self.pending_auto_fs_open)
         {
-            let auto_fullscreen = std::mem::take(&mut self.pending_auto_fs_open);
-            return if self.start_physical_history_transition(
-                PhysicalHistoryIntent::Navigation {
-                    replay: None,
-                    auto_fullscreen,
-                },
+            self.pending_auto_fs_open = false;
+            return if self.start_physical_history_transition_classified(
+                intent,
                 path,
-                restore_intent.clone(),
+                None,
+                classified_kind,
+                restore_intent,
+                navigation,
+                None,
             ) {
                 FolderOpenOutcome::Loaded
             } else {
                 FolderOpenOutcome::Ignored
             };
         }
-        let independent_navigation = !detached_physical
-            && matches!(
-                &owner,
-                OpenRequestOwner::Navigation
-                    | OpenRequestOwner::Bookmark(_)
-                    | OpenRequestOwner::MainGridArchive(MainGridArchiveTransitionIntent {
-                        collection_grid_owner: None,
-                        ..
-                    })
-            )
-            && !matches!(
-                &owner,
-                OpenRequestOwner::MainGridArchive(intent) if intent.rating_grid_owner.is_some()
-            );
-        // Capture before any surface reconciliation. Drive/rating/smart/collection identities are
-        // typed by the visible origin; later `replace_surface(Folder)` must not flatten them into
-        // whatever legacy `current_folder` marker happens to remain.
-        let navigation_history_origin = independent_navigation
-            .then(|| self.folder_nav_current_target())
-            .flatten();
-        // ★固定 (Snapshot Lock) 中は **範囲外** フォルダへの移動を block する (= §4.4)。
-        // 範囲内 (= snapshot 内 entry またはその下の階層) は自由に navigate 可能。
-        // 変換 cache ZIP は source archive の実装 alias なので、typed owner が保持する
-        // source identity に対して同じ完全一致 / prefix owner 解決を行う。source 自体が
-        // snapshot 範囲外なら cache の場所にかかわらず拒否される。
-        // snapshot_internal_nav は snapshot_load_and_open 経由の forced bypass (= 既知
-        // safe path のみ)、ここの owner_entry チェックは UI 経由 click を扱う。
         if !self.snapshot_scope_allows_open(&path, &owner) {
             self.reject_snapshot_out_of_scope_open();
-            self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
             return FolderOpenOutcome::Ignored;
         }
-        // A direct PDF/EPUB request owns its enumeration but has not adopted the destination.
-        // Keep the source rows, surface and selection intact until the worker proves the book.
         if pre_scan.is_none()
             && crate::folder_tree::is_paged_document_path(&path)
+            && classified_kind != Some(OpenPathKind::Directory)
             && !self.visible_grid_item_is_folder(&path)
-            && (classified_kind == Some(OpenPathKind::File)
-                || (classified_kind.is_none() && path.is_file()))
         {
-            let outcome = self.load_pdf_as_folder_with_prepared_pages(
+            return self.load_pdf_as_folder_with_prepared_pages(
                 path,
                 None,
                 owner,
                 None,
-                Some(navigation_history_origin.clone()),
-                restore_intent.clone(),
-            );
-            if matches!(outcome, FolderOpenOutcome::Loaded) {
-                if let Some(pending) = self.pdf_enumerate_pending.as_mut() {
-                    if let Some(restore) = pending.4.as_mut() {
-                        restore.adoption = Some(Box::new(DirectPdfAdoption {
-                            history_origin: navigation_history_origin,
-                            grid_open_effects: None,
-                        }));
-                    }
-                }
-            }
-            return outcome;
-        }
-        // A converted cache ZIP is an implementation alias outside the source archive's smart
-        // scope. Keep the resident session mounted here; the typed owner commits the logical
-        // source path only after the cache/direct load proves successful.
-        if !detached_physical && !smart_folder::is_smart_folder_synthetic_path(&path) {
-            let preserve_smart_folder_session = self.smart_folder_session_owns_load(&path);
-            if self.smart_folder_pending.is_some()
-                || self.smart_folder_prepare_pending.is_some()
-                || self.smart_folder_confirm_pending.is_some()
-            {
-                self.cancel_smart_folder_pending();
-            }
-            if !preserve_smart_folder_session
-                && (self.items_are_smart_folder_view
-                    || self.top_level_grid_view.smart_folder().is_some())
-            {
-                self.clear_smart_folder_view_state();
-            }
-        }
-        // Retire a previous pane scan only when this load has been adopted or refused.
-        // An EPUB rollback in that scan must survive a failed successor.
-        if !detached_physical {
-            if self.restore_smart_folder_for_synthetic_path(&path) {
-                self.suppress_nav_record_for_search_restore = false;
-                self.cancel_folder_pane_open(PaneOpenRestoreExit::Adopted);
-                return FolderOpenOutcome::Loaded;
-            }
-            if self.restore_subfolder_expansion_for_synthetic_path(&path) {
-                self.suppress_nav_record_for_search_restore = false;
-                self.cancel_folder_pane_open(PaneOpenRestoreExit::Adopted);
-                return FolderOpenOutcome::Loaded;
-            }
-        }
-        if self.stack_mode_requested
-            && self.stack_selection_target.is_none()
-            && self
-                .stack_view
-                .as_ref()
-                .is_some_and(|view| crate::folder_tree::path_eq(&view.folder, &path))
-        {
-            self.stack_selection_target = self.selected.and_then(|idx| {
-                let view = self.stack_view.as_ref()?;
-                let key = if self.stack_showing_flat {
-                    view.group_key_at_flat_index(idx)
-                } else {
-                    view.group_key_at_aggregated_index(idx)
-                }?;
-                Some(crate::filename_stack_ui::StackSelectionTarget::GroupKey(
-                    key.to_owned(),
-                ))
-            });
-        }
-        if matches!(
-            self.top_level_grid_view.surface(),
-            top_level_grid_view::TopLevelGridSurface::DriveList
-                | top_level_grid_view::TopLevelGridSurface::ReadingHistory
-                | top_level_grid_view::TopLevelGridSurface::Bookmarks
-        ) {
-            self.top_level_grid_view
-                .replace_surface(top_level_grid_view::TopLevelGridSurface::Folder);
-        }
-        // 閲覧履歴から開いた本以外の実フォルダへ明示ナビで出たら、戻り先予約を捨てる
-        // (アドレスバー / 履歴戻る / フォルダナビ等。予約した本そのものを開き直す場合は維持)。
-        if !self.smart_folder_session_owns_load(&path)
-            && self
-                .reading_history_return_from
-                .as_ref()
-                .is_some_and(|from| !crate::folder_tree::path_eq(from, &path))
-        {
-            self.reading_history_return_from = None;
-        }
-        if !detached_physical
-            && !self.smart_folder_session_owns_load(&path)
-            && matches!(
-                owner,
-                OpenRequestOwner::Navigation
-                    | OpenRequestOwner::CollectionGridPhysical(_)
-                    | OpenRequestOwner::MainGridArchive(_)
-            )
-        {
-            self.reconcile_bookmark_return_target_for_folder_load(&path);
-        }
-        // owner が持つ user-facing source を優先し、変換 cache の実装パスを
-        // お気に入り解決へ混ぜない。解決規則自体は adjustment 標準と同じ最長一致。
-        let favorite_path = match &owner {
-            OpenRequestOwner::MainGridArchive(intent) => &intent.source_path,
-            OpenRequestOwner::RatingPhysical(rating) => &rating.target_path,
-            OpenRequestOwner::Bookmark(bookmark_owner) => match &bookmark_owner.target {
-                crate::bookmark_browser::BookmarkViewReturnTarget::Media(path)
-                | crate::bookmark_browser::BookmarkViewReturnTarget::Book(path) => path,
-            },
-            OpenRequestOwner::DetachedGridArchive(detached_owner) => &detached_owner.source_path,
-            OpenRequestOwner::CollectionGridPhysical(collection) => &collection.target_path,
-            OpenRequestOwner::QuickFolderSwitch(switch) => &switch.target_path,
-            OpenRequestOwner::Navigation => &path,
-        };
-        if !self.smart_folder_session_owns_load(&path) {
-            self.transition_favorite_view_for_path(Some(favorite_path));
-        }
-        // perf: UI スレッドをブロックする load_folder 全体の wall time を計測する。
-        // Ctrl+↑↓ 連打時の引っかかりの主要因がここに集まる想定。
-        let lf_t0 = std::time::Instant::now();
-        let lf_seq = self.input_seq;
-        let pre_scanned = pre_scan.is_some();
-        // path.display().to_string() のアロケーションを perf-log 有効時に限定する
-        // (通常起動では空文字のまま放置する)。
-        let lf_path_disp: String = if crate::perf::is_enabled() {
-            path.display().to_string()
-        } else {
-            String::new()
-        };
-        if crate::perf::is_enabled() {
-            crate::perf::event(
-                "nav",
-                "load_folder_begin",
-                None,
-                lf_seq,
-                &[
-                    ("path", serde_json::Value::from(lf_path_disp.clone())),
-                    ("pre_scanned", serde_json::Value::from(pre_scanned)),
-                ],
+                navigation,
+                restore_intent,
             );
         }
-        let folder_changes = self
-            .current_folder
-            .as_ref()
-            .map(|current| !crate::folder_tree::path_eq(current, &path))
-            .unwrap_or(true);
-        if folder_changes {
-            // ファイル名スタックは「現在フォルダに束縛されたビューモード」なので、別フォルダへ
-            // ナビゲートしたら自動解除する (plan §3.5)。同一フォルダ再読込 (ソート変更・外部更新・
-            // メンバーグリッドからの戻り) では folder_changes=false なので維持される。
-            self.stack_mode_requested = false;
-            if !detached_physical {
-                self.clear_archive_convert_nav_history_rollback();
-            }
-            // **review #11/#13 対応**: 前フォルダ向けの catch-up / neighbor-prefetch
-            // ジョブをまとめてキャンセル & queue から破棄する。これにより:
-            //   - 未処理 job が即 drop され、握っていた `Arc<CatalogDb>` が解放される
-            //     (catalog_cache LRU が実際に Connection を close できるようになる)
-            //   - 進行中の render_page / enumerate_pages が cancel flag を読んで
-            //     Interrupted で抜け、PDF worker Normal 枠を即解放する
-            //   - 新フォルダ向けの enqueue は新しい cancel flag で焼き付くので、
-            //     混ざらない
-            if !detached_physical {
-                crate::thumb_loader::bump_catchup_epoch();
-                // PDF render pool の context epoch も bump し、前フォルダの page-grid
-                // render ジョブを stale prune する。`load_pdf_as_folder` の async enumerate
-                // 待ちの間も保護されるよう、`start_loading_items` (= helper 経由) より早い
-                // load_folder の入口で先に bump する (二重 bump は fetch_add で別 epoch
-                // になるだけで無害)。
-                let _ = crate::pdf_loader::bump_render_context_epoch();
-            }
-        }
-        // パスが .zip / .cbz / .pdf ファイルなら仮想フォルダとして開く
         if pre_scan.is_none()
             && crate::folder_tree::is_virtual_folder(&path)
+            && classified_kind != Some(OpenPathKind::Directory)
             && !self.visible_grid_item_is_folder(&path)
-            && (classified_kind == Some(OpenPathKind::File)
-                || (classified_kind.is_none() && path.is_file()))
         {
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.to_ascii_lowercase())
-                .unwrap_or_default();
-            if crate::folder_tree::is_zip_extension(&ext) {
-                if !self.adopt_collection_surface_for_physical_load(
-                    &path,
-                    &owner,
-                    navigation_history_origin.as_ref(),
-                ) {
-                    self.pending_auto_fs_open = false;
-                    self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
-                    return FolderOpenOutcome::Ignored;
-                }
-                self.cancel_folder_pane_open(PaneOpenRestoreExit::Adopted);
-                self.load_zip_as_folder(path, restore_intent.clone());
-                if crate::perf::is_enabled() {
-                    crate::perf::event(
-                        "nav",
-                        "load_folder_end",
-                        None,
-                        lf_seq,
-                        &[
-                            (
-                                "ms",
-                                serde_json::Value::from(lf_t0.elapsed().as_secs_f64() * 1000.0),
-                            ),
-                            ("kind", serde_json::Value::from("zip")),
-                            ("path", serde_json::Value::from(lf_path_disp)),
-                        ],
-                    );
-                }
-                return FolderOpenOutcome::Loaded;
-            }
+            // Native detached archive navigation does not own the main facet or history.
+            self.load_zip_as_folder(path, restore_intent);
+            return FolderOpenOutcome::Loaded;
         }
-
-        crate::logger::log(format!("=== load_folder: {} ===", path.display()));
-
-        // フォルダ移動でメタ操作の Undo/Redo スタックを破棄する (移動先で過去の
-        // レーティング操作を巻き戻すと UX が混乱するため)。
-        if !detached_physical {
-            self.clear_meta_undo();
-        }
-
-        // 外側の ZIP/PDF/フォルダを切り替えたので、ネスト ZIP バイト列キャッシュを破棄する。
-        // これで古い外側アーカイブのバイト列が RAM に居残るのを防ぐ。
-        crate::zip_loader::clear_nested_cache();
-        // ZIP を出るのでツリーナビ状態も破棄 (start_loading_items でも消えるが、
-        // enumerate pending 窓中の stale 参照を防ぐため早期にクリア)。
-        self.zip_nav = None;
-
-        // ── ディレクトリ走査（画像はメタデータも収集）────────────────
-        // pre_scan が与えられていれば DFS スレッドで既に走査済み (UI 非ブロック)。
-        // 無ければ UI スレッドで scan_directory を呼ぶ (従来挙動)。
-        let scan_t0 = std::time::Instant::now();
+        let scan_started = std::time::Instant::now();
+        let pre_scanned = pre_scan.is_some();
         let scan = match pre_scan {
             Some(scan) => scan,
             None => match scan_directory_with_settings(&path, &self.settings) {
@@ -26879,58 +27937,96 @@ impl App {
                         path.display()
                     ));
                     self.pending_auto_fs_open = false;
-                    self.release_fs_nav_lock();
-                    self.show_feedback_toast("フォルダを読み取れませんでした".to_string());
                     self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
+                    self.release_fs_nav_lock();
+                    self.show_feedback_toast("フォルダを読み取れませんでした".into());
                     return FolderOpenOutcome::Ignored;
                 }
             },
         };
-        if !self.adopt_collection_surface_for_physical_load(
-            &path,
-            &owner,
-            navigation_history_origin.as_ref(),
-        ) {
-            self.pending_auto_fs_open = false;
-            self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
+        if !self.open_request_owner_is_current(&path, &owner) {
             return FolderOpenOutcome::Ignored;
         }
-        // The worker proved this suffix path is a Folder. Apply the source tile's filter and
-        // return effects after owner admission but before deriving visible rows and fullscreen.
-        let grid_archive_source_adopts = matches!(
-            &owner,
-            OpenRequestOwner::MainGridArchive(intent)
-                if intent.collection_grid_owner.as_ref().is_none_or(|collection| {
-                    collection.navigation_request.is_none()
-                })
-        ) && (grid_effects.is_some()
-            || classified_kind == Some(OpenPathKind::Directory));
-        if grid_archive_source_adopts {
-            // A stale archive tile may prove to be a directory. It still owns the original
-            // Collection/Rating source position, which must commit before row installation
-            // changes the source generation.
-            self.commit_main_grid_archive_transition(&owner);
-        } else if let Some(effects) = grid_effects {
-            self.commit_grid_virtual_open_effects(&path, effects);
-        }
-        self.cancel_folder_pane_open(PaneOpenRestoreExit::Adopted);
-        if self.install_scanned_folder_listing(
-            path,
+        let full_keys = matches!(owner, OpenRequestOwner::CollectionGridPhysical(_))
+            || matches!(&owner,OpenRequestOwner::MainGridArchive(intent) if intent.collection_grid_owner.is_some())
+            || use_full_path_cache_keys_for_folder(&path);
+        let prepared = self.prepare_scanned_folder_listing_with_cache_keys(
+            path.clone(),
             scan,
-            authority,
             FolderListingMetrics {
-                seq: lf_seq,
-                started: lf_t0,
-                scan_started: scan_t0,
+                seq: self.input_seq,
+                started: scan_started,
+                scan_started,
                 pre_scanned,
-                path_display: lf_path_disp,
+                path_display: String::new(),
             },
-            restore_intent.clone(),
-        ) {
-            FolderOpenOutcome::Loaded
+            restore_intent,
+            full_keys,
+        );
+        let token = match self.prepare_visible_install(&path, &prepared.items, None) {
+            Ok(token) => token,
+            Err(reason) => {
+                self.show_open_admission_refusal(reason);
+                return FolderOpenOutcome::Ignored;
+            }
+        };
+        let rating = match &owner {
+            OpenRequestOwner::RatingPhysical(owner) => {
+                Some(self.rating_physical_destination(owner, &path))
+            }
+            OpenRequestOwner::MainGridArchive(owner) => owner
+                .rating_grid_owner
+                .as_ref()
+                .map(|rating| self.rating_physical_destination(rating, &path)),
+            _ => None,
+        };
+        let location = self.physical_destination_for_owner(&path, &owner, rating.as_ref());
+        let search_origin = (
+            self.favsearch.active,
+            self.tag_view.active,
+            self.global_search.active,
+        );
+        let book_prefix = grid_effects
+            .as_ref()
+            .is_some_and(|effects| effects.suppress_facet_filter)
+            .then_some("");
+        let install = move |app: &mut Self| {
+            if let OpenRequestOwner::QuickFolderSwitch(switch) = &owner {
+                app.active_quick_folder_slot = Some(switch.target_slot);
+            }
+            if !detached_physical {
+                app.finish_direct_pdf_visible_adoption(&path, &owner);
+                app.install_admitted_physical_surface(&path, &owner, rating.as_ref());
+                if let OpenRequestOwner::Bookmark(owner) = &owner {
+                    app.begin_bookmark_page_wait(owner);
+                }
+            }
+            if let Some(effects) = grid_effects {
+                app.commit_grid_virtual_open_effects(&path, effects);
+            }
+            let hydration = app.install_prepared_scanned_folder_listing(prepared, authority, token);
+            if !detached_physical {
+                app.commit_staged_search_navigation_effects(
+                    &path,
+                    search_origin.0,
+                    search_origin.1,
+                    search_origin.2,
+                );
+            }
+            hydration
+        };
+        if let Some(navigation) = navigation {
+            let destination =
+                self.main_list_requested_destination(&navigation, location, book_prefix);
+            let Some(adoption) = self.prepare_main_list_adoption(navigation, destination) else {
+                return FolderOpenOutcome::Ignored;
+            };
+            self.adopt_main_list_navigation(adoption, install);
         } else {
-            FolderOpenOutcome::Ignored
+            let hydration = install(self);
+            self.hydrate_installed_main_list(hydration);
         }
+        FolderOpenOutcome::Loaded
     }
 
     /// Shared, already-admitted Folder listing tail. Smart opens enter here only after their
@@ -26944,6 +28040,58 @@ impl App {
 
         restore_intent: crate::app::StartupListIntent,
     ) -> bool {
+        let prepared = self.prepare_scanned_folder_listing_with_cache_keys(
+            path,
+            scan,
+            metrics,
+            restore_intent,
+            self.use_full_path_cache_keys(),
+        );
+        let logical = match &authority {
+            VisibleInstallAuthority::StagedArchive { logical_source }
+            | VisibleInstallAuthority::SmartPhysical { logical_source, .. } => {
+                Some(*logical_source)
+            }
+            _ => None,
+        };
+        let token = match self.prepare_visible_install(&prepared.path, &prepared.items, logical) {
+            Ok(token) => token,
+            Err(reason) => {
+                self.show_open_admission_refusal(reason);
+                return false;
+            }
+        };
+        let hydration = self.install_prepared_scanned_folder_listing(prepared, authority, token);
+        self.hydrate_installed_main_list(hydration);
+        true
+    }
+
+    fn prepare_scanned_folder_listing(
+        &mut self,
+        path: PathBuf,
+        scan: ScannedDir,
+        metrics: FolderListingMetrics,
+        restore_intent: StartupListIntent,
+    ) -> PreparedScannedFolderListing {
+        let full_path = use_full_path_cache_keys_for_folder(&path);
+        self.prepare_scanned_folder_listing_with_cache_keys(
+            path,
+            scan,
+            metrics,
+            restore_intent,
+            full_path,
+        )
+    }
+
+    fn prepare_scanned_folder_listing_with_cache_keys(
+        &mut self,
+        path: PathBuf,
+        scan: ScannedDir,
+        metrics: FolderListingMetrics,
+
+        restore_intent: crate::app::StartupListIntent,
+        use_full_path_cache_keys: bool,
+    ) -> PreparedScannedFolderListing {
         let detached_physical = self.navigation_scope.is_detached_physical();
         let FolderListingMetrics {
             seq: lf_seq,
@@ -26956,7 +28104,6 @@ impl App {
         // source deliberately keeps the Collection surface (and therefore uses full paths),
         // while an independent navigation adopts Folder and keeps the ordinary basename keys.
         // The same decision must feed request/read, seed, and delete_missing.
-        let use_full_path_cache_keys = self.use_full_path_cache_keys();
         // Keep the image-book boundary independent from the caller and from the eventual
         // detached/main owner. Grid Folder preflight uses this same predicate before it
         // commits a context, preventing the two load paths from drifting apart.
@@ -26964,15 +28111,22 @@ impl App {
         // フォーカス復帰時の差分判定用シグネチャ。scan を消費する前に計算しておき、
         // `start_loading_items` に引数として渡す。
         let audio_inventory = scan.complete_audio_inventory.clone();
-        let audio_inventory_parent = path.clone();
         let folder_signature = signature_from_scan(&scan);
         let scan_ms = scan_t0.elapsed().as_secs_f64() * 1000.0;
-        let order_request = crate::rating_sort::ListingOrderRequest::from_settings(&self.settings);
+        // Prepare using the destination's existing favorite presentation without changing
+        // the still-visible source. The real overlay transition belongs to admitted install.
+        let mut listing_settings = self.settings.clone();
+        if !detached_physical {
+            self.favorite_view_state_for_path(&path)
+                .apply_to_settings(&mut listing_settings);
+        }
+        let order_request =
+            crate::rating_sort::ListingOrderRequest::from_settings(&listing_settings);
         let rating_generation_before_read = self.rating_session_write_generation;
         let materialized = folder_scan::materialize_local_folder_listing_with_order(
             &path,
             scan,
-            &self.settings,
+            &listing_settings,
             order_request,
             |keys| {
                 self.rating_db
@@ -27031,19 +28185,6 @@ impl App {
         // `materialize_local_folder_listing` が唯一の集計者。ここで数え直すと
         // remote 一覧と本体一覧で違う数が出る。
         let omitted_entries = materialized.omitted;
-        if !detached_physical
-            && matches!(
-                self.top_level_grid_view.surface(),
-                top_level_grid_view::TopLevelGridSurface::Folder
-            )
-        {
-            // main の通常フォルダだけがこの常設チップの対象。サブ展開・スマートフォルダ・
-            // 検索結果は後追い範囲なので、同じ filter を共有していてもここへ公開しない。
-            self.normal_folder_omitted_entries = Some(NormalFolderOmittedEntries {
-                folder: path.clone(),
-                counts: omitted_entries,
-            });
-        }
         if omitted_entries != folder_scan::OmittedFolderEntryCounts::default() {
             // チップが出ない / 数が合わないという報告を、推測でなくログで切り分けるための 1 行。
             // 走査済みの値を書くだけで追加の I/O は無い。
@@ -27089,16 +28230,12 @@ impl App {
             }
             folder_scan::FolderRatingOrder::Failed => (None, true),
         };
-        self.video_thumb_overrides.clear();
-        for (video, image) in materialized.video_thumb_overrides {
-            self.video_thumb_overrides
-                .insert(crate::path_key::normalize_keep_drive(&video), image);
-        }
+        let video_thumb_overrides = materialized.video_thumb_overrides;
         let items = materialized.items;
         let image_metas = materialized.metas;
         let listing_sort_metas = materialized.sort_metas;
         let video_items = crate::filename_stack_ui::stack_video_items(&items, &image_metas);
-        let auto_open_image_folder = if std::mem::take(&mut self.pending_auto_fs_open) {
+        let auto_open_image_folder = if self.pending_auto_fs_open {
             self.settings.auto_fullscreen_image_folders_enabled() && scanned_folder_is_image_book
         } else {
             false
@@ -27213,11 +28350,86 @@ impl App {
         } else {
             None
         };
+
+        PreparedScannedFolderListing {
+            path,
+            items,
+            image_metas,
+            existing_keys,
+            video_items,
+            folder_signature,
+            prepared_folder_rating,
+            video_thumb_overrides,
+            audio_inventory,
+            omitted: omitted_entries,
+            rating_order_failed,
+            auto_open_image_folder,
+            restore_intent,
+            metrics: FolderListingMetrics {
+                seq: lf_seq,
+                started: lf_t0,
+                scan_started: scan_t0,
+                pre_scanned,
+                path_display: lf_path_disp,
+            },
+            stack_order_request,
+            stack_async_prep,
+        }
+    }
+
+    fn install_prepared_scanned_folder_listing(
+        &mut self,
+        prepared: PreparedScannedFolderListing,
+        authority: VisibleInstallAuthority<'_>,
+        prepared_visible: PreparedVisibleInstall,
+    ) -> MainListHydration {
+        let detached_physical = self.navigation_scope.is_detached_physical();
+        let PreparedScannedFolderListing {
+            path,
+            items,
+            image_metas,
+            existing_keys,
+            video_items,
+            folder_signature,
+            prepared_folder_rating,
+            video_thumb_overrides,
+            audio_inventory,
+            omitted,
+            rating_order_failed,
+            auto_open_image_folder,
+            restore_intent,
+            metrics,
+            stack_order_request,
+            stack_async_prep,
+        } = prepared;
+        let FolderListingMetrics {
+            seq: lf_seq,
+            started: lf_t0,
+            path_display: lf_path_disp,
+            ..
+        } = metrics;
+        self.pending_auto_fs_open = false;
+        let audio_inventory_parent = path.clone();
+        self.video_thumb_overrides.clear();
+        for (video, image) in video_thumb_overrides {
+            self.video_thumb_overrides
+                .insert(crate::path_key::normalize_keep_drive(&video), image);
+        }
+        if !detached_physical
+            && matches!(
+                self.top_level_grid_view.surface(),
+                top_level_grid_view::TopLevelGridSurface::Folder
+            )
+        {
+            self.normal_folder_omitted_entries = Some(NormalFolderOmittedEntries {
+                folder: path.clone(),
+                counts: omitted,
+            });
+        }
         self.stack_active_rule = None;
         self.stack_script_error = None;
-
         let items_len = items.len();
-        self.start_loading_items_inner(
+        let mut hydration = self.install_loading_items_inner(
             path,
             items,
             image_metas,
@@ -27230,25 +28442,23 @@ impl App {
             None,
             prepared_folder_rating,
             authority,
+            prepared_visible,
         );
-        if let (Some(inventory), Some(queue)) = (audio_inventory, self.heavy_io_queue.as_ref()) {
+        if let (Some(inventory), Some((continuation, _))) = (audio_inventory, hydration.as_mut()) {
             let cache_dir = crate::catalog::default_cache_dir();
             let admission = crate::catalog::CatalogAccess::for_cache_dir(&cache_dir).admit();
-            let (mutex, wakeup) = &**queue;
-            mutex
-                .lock()
-                .unwrap()
-                .push(crate::thumb_loader::LoadRequest {
-                    items_gen: self.items_generation,
-                    raw_source: crate::thumb_loader::LoadRequestSource::AudioArtPrune {
-                        parent: audio_inventory_parent,
-                        inventory: Arc::new(inventory),
-                        cache_dir,
-                        admission,
-                    },
-                    ..Default::default()
-                });
-            wakeup.notify_one();
+            // Keep maintenance with this accepted list through sidecar hydration. Its new
+            // worker queues do not exist until resume_loading_items_after_sidecar.
+            continuation.audio_art_prune = Some(crate::thumb_loader::LoadRequest {
+                items_gen: self.items_generation,
+                raw_source: crate::thumb_loader::LoadRequestSource::AudioArtPrune {
+                    parent: audio_inventory_parent,
+                    inventory: Arc::new(inventory),
+                    cache_dir,
+                    admission,
+                },
+                ..Default::default()
+            });
         }
         if rating_order_failed {
             self.show_feedback_toast(
@@ -27273,29 +28483,11 @@ impl App {
             );
         }
 
-        if auto_open_image_folder {
-            let mut new_idx = if self.settings.book_open_resume.resumes() {
-                self.resume_page_for_container()
-            } else {
-                None
-            };
-            if new_idx.is_none() {
-                new_idx = self.find_fullscreen_nav_target_filtered(false);
-            }
-            if let Some(new_idx) = new_idx {
-                #[cfg(windows)]
-                {
-                    // `pending_auto_fs_open` はグリッド/外部からの明示的なフォルダ open に
-                    // 由来する one-shot。画像のみ通常フォルダは列挙後にここで初めて
-                    // open_fullscreen するため、ZIP/PDF の DeferredFsReopen と同様に
-                    // grid-origin の意図を復元してから開く。これを省くと always-new
-                    // detached で「継続ナビ」扱いになり、直前 active 窓を再利用してしまう。
-                    self.fs_open_intent_from_grid = true;
-                }
-                self.open_fullscreen(new_idx, crate::app::HistoryTrigger::UserChosen);
-                self.selected = Some(new_idx);
-                self.scroll_to_selected = true;
-                self.update_last_selected_image();
+        if let Some((continuation, _)) = hydration.as_mut() {
+            continuation.restore_intent = restore_intent.clone();
+            if auto_open_image_folder {
+                continuation.first_display_action =
+                    sidecar_restore::FirstDisplayAction::AutoFullscreenFolder;
             }
         }
 
@@ -27319,8 +28511,7 @@ impl App {
         if !detached_physical {
             self.update_smart_folder_scoped_address();
         }
-        self.finish_main_list_open(restore_intent);
-        true
+        hydration
     }
 
     /// settings 更新後の起動/編集を同じ root owner 経路へ提出する。
@@ -28683,8 +29874,8 @@ impl App {
         self.favsearch.results_paths.clear();
         // 検索モードに入る際、現在のフォルダを保存して戻れるようにする
         if let Some(origin) = transferred_origin {
-            self.favsearch.saved_folder = origin.legacy_path().or(fallback_origin);
-            self.favsearch_subfolder_restore = origin.subfolder_restore();
+            self.favsearch.saved_folder = origin.restore.legacy_path().or(fallback_origin);
+            self.favsearch_subfolder_restore = origin.restore.subfolder_restore();
         } else if self.favsearch.saved_folder.is_none() {
             self.favsearch.saved_folder = fallback_origin;
             self.favsearch_subfolder_restore = None;
@@ -28724,8 +29915,8 @@ impl App {
         self.tag_view.active = true;
         self.tag_view.focus_request = focus_request;
         if let Some(origin) = transferred_origin {
-            self.tag_view.saved_folder = origin.legacy_path().or(fallback_origin);
-            self.tag_view_subfolder_restore = origin.subfolder_restore();
+            self.tag_view.saved_folder = origin.restore.legacy_path().or(fallback_origin);
+            self.tag_view_subfolder_restore = origin.restore.subfolder_restore();
         } else {
             self.tag_view.saved_folder = fallback_origin;
             self.tag_view_subfolder_restore = None;
@@ -28751,12 +29942,13 @@ impl App {
         let transferred_origin = self.take_origin_for_search_entry(SearchMode::LocalMeta);
         let restore_smart_folder = transferred_origin.as_ref().is_some_and(|origin| {
             origin
+                .restore
                 .legacy_path()
                 .as_deref()
                 .is_some_and(smart_folder::is_smart_folder_synthetic_path)
         });
         if let Some(origin) = transferred_origin {
-            self.restore_view_return_context(origin);
+            self.restore_view_return_origin(origin);
             if restore_smart_folder {
                 // Keep the pending smart restore as the owner of the grid.  Its install boundary
                 // will run the query typed while the worker is active against the final indices.
@@ -28786,11 +29978,20 @@ impl App {
     pub(crate) fn take_origin_for_search_entry(
         &mut self,
         keep: SearchMode,
-    ) -> Option<top_level_grid_view::TopLevelGridRestore> {
+    ) -> Option<top_level_grid_view::TopLevelGridOrigin> {
         self.save_leaving_rating_grid_position();
         self.capture_main_list_restore_cursor();
-        let current_restore = self.current_top_level_restore_snapshot();
-        let mut transferred = self.dismiss_snapshot_without_restore();
+        let source_route = self.folder_nav_current_entry().map_or_else(
+            || self.facet_navigation.route().clone(),
+            |entry| entry.route,
+        );
+        let current_restore = self.current_top_level_restore_snapshot().map(|restore| {
+            top_level_grid_view::TopLevelGridOrigin {
+                restore,
+                route: source_route.clone(),
+            }
+        });
+        let mut transferred = self.dismiss_snapshot_with_origin();
         if !matches!(keep, SearchMode::LocalMeta) && self.show_search_bar {
             self.show_search_bar = false;
             self.search_query.clear();
@@ -28802,20 +30003,20 @@ impl App {
             self.rebuild_visible_indices();
         }
         if !matches!(keep, SearchMode::Favsearch) && self.favsearch.active {
-            transferred = Some(self.dismiss_favsearch_without_restore());
+            transferred = Some(self.dismiss_favsearch_with_origin());
         }
         if !matches!(keep, SearchMode::Global) && self.global_search.active {
-            transferred = Some(self.dismiss_global_search_without_restore());
+            transferred = Some(self.dismiss_global_search_with_origin());
         }
         if !matches!(keep, SearchMode::TagView) && self.tag_view.active {
-            transferred = Some(self.dismiss_tag_view_without_restore());
+            transferred = Some(self.dismiss_tag_view_with_origin());
         }
         // A pending smart-folder worker may still own the pre-search origin while the previous
         // result grid remains visible. Its context is more authoritative than that synthetic path.
         if let Some(origin) = self.take_smart_folder_origin_for_search_entry() {
             transferred = Some(origin);
         }
-        self.cancel_pending_folder_nav();
+        self.retire_main_list_requests_for_surface_switch();
         if matches!(keep, SearchMode::LocalMeta) {
             return transferred;
         }
@@ -28826,7 +30027,7 @@ impl App {
             SearchMode::TagView => top_level_grid_view::TopLevelSearchView::Tag,
             SearchMode::LocalMeta => unreachable!(),
         };
-        self.top_level_grid_view.begin(
+        self.top_level_grid_view.begin_with_origin(
             top_level_grid_view::TopLevelGridSurface::Search(search),
             origin.clone(),
         );
@@ -28841,8 +30042,8 @@ impl App {
         {
             return;
         }
-        let return_context = self.dismiss_favsearch_without_restore();
-        self.restore_view_return_context(return_context);
+        let return_context = self.dismiss_favsearch_with_origin();
+        self.restore_view_return_origin(return_context);
     }
 
     /// Ctrl+S の状態だけを終了し、元ビューの再構築は行わず戻り先の所有権を返す。
@@ -28865,6 +30066,12 @@ impl App {
     pub(crate) fn dismiss_favsearch_without_restore(
         &mut self,
     ) -> top_level_grid_view::TopLevelGridRestore {
+        self.dismiss_favsearch_with_origin().restore
+    }
+
+    pub(crate) fn dismiss_favsearch_with_origin(
+        &mut self,
+    ) -> top_level_grid_view::TopLevelGridOrigin {
         self.cancel_pending_folder_nav();
         self.favsearch.active = false;
         self.favsearch.has_focus = false;
@@ -28877,94 +30084,63 @@ impl App {
         }
         let path = self.favsearch.saved_folder.take();
         let subfolder_restore = self.favsearch_subfolder_restore.take();
-        let canonical = self.top_level_grid_view.take_return_to();
-        self.view_return_context_from_canonical_or_fallback(
-            canonical.map(std::borrow::Cow::Owned),
-            || (path, subfolder_restore),
-        )
+        let canonical = self.top_level_grid_view.take_return_origin();
+        canonical.unwrap_or_else(|| top_level_grid_view::TopLevelGridOrigin {
+            restore: self
+                .view_return_context_from_canonical_or_fallback(None, || (path, subfolder_restore)),
+            route: self.facet_navigation.route().clone(),
+        })
     }
 
     pub(crate) fn restore_view_return_context(
         &mut self,
         context: top_level_grid_view::TopLevelGridRestore,
     ) {
-        use top_level_grid_view::TopLevelGridRestore;
+        self.restore_view_return_origin(top_level_grid_view::TopLevelGridOrigin {
+            restore: context,
+            route: self.facet_navigation.route().clone(),
+        });
+    }
 
-        let (saved, rating_view_stars) = match context {
-            TopLevelGridRestore::SmartFolder(state) => {
-                self.restore_smart_folder_view_state(state);
-                return;
-            }
-            TopLevelGridRestore::SubfolderExpansion(state) => {
-                self.suppress_nav_record_for_search_restore = true;
-                let restored = self.restore_subfolder_expansion_for_synthetic_path_with_state(
+    pub(crate) fn restore_view_return_origin(
+        &mut self,
+        origin: top_level_grid_view::TopLevelGridOrigin,
+    ) {
+        if !self.main_folder_history_available() {
+            // Mounted detached return paths keep their native context-local restore owner.
+            // They cannot adopt the main facet reducer or committed main history vectors.
+            if let top_level_grid_view::TopLevelGridRestore::SubfolderExpansion(state) =
+                origin.restore
+            {
+                self.restore_subfolder_expansion_for_synthetic_path_with_state(
                     &subfolder_expansion_synthetic_path(),
                     Some(state),
                 );
-                self.suppress_nav_record_for_search_restore = false;
-                if !restored {
-                    self.set_active_folder_nav_suppress_record_once(false);
-                }
-                return;
+            } else if let Some(path) = origin.restore.legacy_path() {
+                self.load_folder(path);
             }
-            TopLevelGridRestore::Unavailable => return,
-            TopLevelGridRestore::Collection(restore) => {
-                self.start_collection_history_transition(
-                    FolderNavHistoryTarget::Collection(restore),
-                    CollectionHistoryIntent::Restore,
-                    None,
-                );
-                return;
-            }
-            TopLevelGridRestore::RatingPhysical(restore) => {
-                self.start_rating_physical_restore(
-                    restore,
-                    None,
-                    RatingPhysicalLoadIntent::Restore,
-                );
-                return;
-            }
-            TopLevelGridRestore::CollectionPhysical(restore) => {
-                self.start_collection_history_transition(
-                    FolderNavHistoryTarget::CollectionPhysical(restore),
-                    CollectionHistoryIntent::Restore,
-                    None,
-                );
-                return;
-            }
-            TopLevelGridRestore::Folder(path) => {
-                self.top_level_grid_view
-                    .replace_surface(top_level_grid_view::TopLevelGridSurface::Folder);
-                (path, None)
-            }
-            TopLevelGridRestore::DriveList => (drive_list_synthetic_path(), None),
-            TopLevelGridRestore::ReadingHistory => (reading_history_synthetic_path(), None),
-            TopLevelGridRestore::Bookmarks => (bookmark_view_synthetic_path(), None),
-            TopLevelGridRestore::Rating { stars } => (rating_view_synthetic_path(), Some(stars)),
-        };
-        self.suppress_nav_record_for_search_restore = true;
-
-        let target = rating_view_stars.map_or_else(
-            || FolderNavHistoryTarget::Path(saved.clone()),
-            |stars| FolderNavHistoryTarget::Rating { stars },
-        );
-        match self.dispatch_synthetic_folder_history_target(&target) {
-            SyntheticFolderHistoryDispatch::Restored => {
-                // Drive list / reading history / rating view restoration does not call the real
-                // folder loader, so consume the one-shot explicitly at this ownership boundary.
-                self.suppress_nav_record_for_search_restore = false;
-                self.set_active_folder_nav_suppress_record_once(false);
-            }
-            SyntheticFolderHistoryDispatch::NotSynthetic => self.load_folder(saved),
-            SyntheticFolderHistoryDispatch::Unavailable => {
-                // Never hand a recognized but unavailable synthetic path to `load_folder`.
-                self.suppress_nav_record_for_search_restore = false;
-                self.set_active_folder_nav_suppress_record_once(false);
-            }
+            return;
         }
+        let Some(location) = FolderNavHistoryTarget::from_restore(&origin.restore) else {
+            return;
+        };
+        let destination = FolderNavHistoryEntry::new(location, origin.route);
+        let proof = self
+            .smart_folder_source_lease()
+            .map_or(MainListSourceProof::Row, MainListSourceProof::Surface);
+        let navigation = self.capture_main_list_navigation(
+            MainHistoryOperation::Restore {
+                route: Some(destination.route.clone()),
+            },
+            proof,
+        );
+        if let top_level_grid_view::TopLevelGridRestore::SubfolderExpansion(state) = origin.restore
+        {
+            self.folder_nav_subfolder_restore = Some(state);
+        }
+        self.dispatch_folder_history_entry(destination, navigation);
     }
 
-    /// タグビューを閉じて、開く前のフォルダに戻る。
     pub(crate) fn close_tag_view(&mut self) {
         if !self.tag_view.active {
             return;
@@ -28975,8 +30151,8 @@ impl App {
         {
             return;
         }
-        let return_context = self.dismiss_tag_view_without_restore();
-        self.restore_view_return_context(return_context);
+        let return_context = self.dismiss_tag_view_with_origin();
+        self.restore_view_return_origin(return_context);
     }
 
     pub(crate) fn tag_view_return_context_without_restore(
@@ -28997,6 +30173,12 @@ impl App {
     pub(crate) fn dismiss_tag_view_without_restore(
         &mut self,
     ) -> top_level_grid_view::TopLevelGridRestore {
+        self.dismiss_tag_view_with_origin().restore
+    }
+
+    pub(crate) fn dismiss_tag_view_with_origin(
+        &mut self,
+    ) -> top_level_grid_view::TopLevelGridOrigin {
         self.cancel_pending_folder_nav();
         if let Some(pending) = self.tag_view_pending.take() {
             pending.cancel();
@@ -29014,11 +30196,12 @@ impl App {
         self.items_are_tag_view = false;
         let path = self.tag_view.saved_folder.take();
         let subfolder_restore = self.tag_view_subfolder_restore.take();
-        let canonical = self.top_level_grid_view.take_return_to();
-        self.view_return_context_from_canonical_or_fallback(
-            canonical.map(std::borrow::Cow::Owned),
-            || (path, subfolder_restore),
-        )
+        let canonical = self.top_level_grid_view.take_return_origin();
+        canonical.unwrap_or_else(|| top_level_grid_view::TopLevelGridOrigin {
+            restore: self
+                .view_return_context_from_canonical_or_fallback(None, || (path, subfolder_restore)),
+            route: self.facet_navigation.route().clone(),
+        })
     }
 
     pub(crate) fn record_tag_view_nav_open(&mut self, path: &Path) {
@@ -29107,6 +30290,11 @@ impl App {
     }
 
     pub(crate) fn execute_tag_view(&mut self) {
+        if self.tag_view.query != self.tag_view.last_executed
+            || self.tag_view.kind_filter != self.tag_view.last_executed_kind_filter
+        {
+            self.retire_main_list_requests_for_surface_switch();
+        }
         self.tag_view.last_executed = self.tag_view.query.clone();
         self.tag_view.last_executed_kind_filter = self.tag_view.kind_filter;
         self.tag_view.reject_message = None;
@@ -29404,6 +30592,9 @@ impl App {
     /// SQLite FTS クエリは通常数 ms だが、インデックスが大きいと数十〜数百 ms に
     /// 達し UI を止め得る。結果は `poll_favsearch` で受信する。
     pub(crate) fn execute_favsearch(&mut self) {
+        if self.favsearch.query != self.favsearch.last_executed {
+            self.retire_main_list_requests_for_surface_switch();
+        }
         self.favsearch.last_executed = self.favsearch.query.clone();
         let query = self.favsearch.query.trim().to_string();
         self.favsearch.nav_stack.clear();
@@ -29612,40 +30803,25 @@ impl App {
     /// `enter_reading_history` を直接呼ぶ。ここでだけ遷移を記録することで、メニュー起動時の
     /// 直前フォルダは back stack に残しつつ、履歴復元時の二重記録を避ける。
     pub(crate) fn enter_reading_history_from_menu(&mut self) {
-        self.record_folder_nav_transition(&reading_history_synthetic_path());
-        self.enter_reading_history();
+        self.adopt_synthetic_surface(
+            FolderNavHistoryTarget::Path(reading_history_synthetic_path()),
+            MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation),
+            None,
+        );
     }
 
     /// 閲覧履歴ビューを開く。
     pub(crate) fn enter_reading_history(&mut self) {
-        self.capture_main_list_restore_cursor();
-        crate::logger::log("=== enter_reading_history ===");
-        // いま閲覧履歴ビューにいるので、戻り先予約は消費済み扱いにする。
-        self.reading_history_return_from = None;
-        self.clear_bookmark_view_return_state();
-        self.gamepad_location_picker = None;
-        if self.global_search.active {
-            self.global_search.saved_folder = None;
-            self.close_global_search();
-        }
-        if self.favsearch.active {
-            self.favsearch.saved_folder = None;
-            self.close_favsearch();
-        }
-        if self.tag_view.active {
-            self.tag_view.saved_folder = None;
-            self.close_tag_view();
-        }
-        if self.show_search_bar {
-            self.show_search_bar = false;
-            self.search_query.clear();
-            self.search_filter = None;
-            self.search_filter_origin_folder = None;
-            self.search_has_focus = false;
-            self.search_tag_bridge.clear();
-            self.cancel_search_pending();
-        }
+        self.adopt_synthetic_surface(
+            FolderNavHistoryTarget::Path(reading_history_synthetic_path()),
+            MainHistoryOperation::Restore { route: None },
+            None,
+        );
+    }
 
+    fn read_reading_history_entries(
+        &mut self,
+    ) -> Vec<crate::reading_history_db::ReadingHistoryEntry> {
         let limit = self
             .settings
             .reading_history_limit
@@ -29667,11 +30843,47 @@ impl App {
             }
         };
 
+        entries
+    }
+
+    fn install_reading_history_surface(
+        &mut self,
+        prepared: PreparedReadingHistoryList,
+        entries: Vec<crate::reading_history_db::ReadingHistoryEntry>,
+    ) -> MainListHydration {
+        self.capture_main_list_restore_cursor();
+        crate::logger::log("=== enter_reading_history ===");
+        // いま閲覧履歴ビューにいるので、戻り先予約は消費済み扱いにする。
+        self.reading_history_return_from = None;
+        self.clear_bookmark_view_return_state();
+        self.gamepad_location_picker = None;
+        if self.global_search.active {
+            self.global_search.saved_folder = None;
+            let _ = self.dismiss_global_search_without_restore();
+        }
+        if self.favsearch.active {
+            self.favsearch.saved_folder = None;
+            let _ = self.dismiss_favsearch_without_restore();
+        }
+        if self.tag_view.active {
+            self.tag_view.saved_folder = None;
+            let _ = self.dismiss_tag_view_without_restore();
+        }
+        if self.show_search_bar {
+            self.show_search_bar = false;
+            self.search_query.clear();
+            self.search_filter = None;
+            self.search_filter_origin_folder = None;
+            self.search_has_focus = false;
+            self.search_tag_bridge.clear();
+            self.cancel_search_pending();
+        }
+
+        self.video_thumb_overrides.clear();
+        let hydration = self.install_prepared_reading_history_entries(prepared);
         let settings = crate::reading_history_thumbnail_sources::DiscoverySettings::from_settings(
             &self.settings,
         );
-        self.video_thumb_overrides.clear();
-        self.install_reading_history_entries(Vec::new());
         let owner = crate::reading_history_thumbnail_sources::Owner {
             items_generation: self.items_generation,
             context_id: self.projected_viewer_context_id(),
@@ -29688,6 +30900,7 @@ impl App {
                 self.show_feedback_toast("閲覧履歴を準備できませんでした".to_owned());
             }
         }
+        hydration
     }
 
     fn poll_reading_history_thumbnail_sources(&mut self, ctx: &egui::Context) {
@@ -29725,8 +30938,9 @@ impl App {
             Ok(prepared) => {
                 self.reading_history_sources_pending
                     .remove(&owner.context_id);
-                self.video_thumb_overrides = prepared.sidecars;
-                self.install_reading_history_entries(prepared.entries);
+                if let Some(list) = self.prepare_reading_history_entries(prepared.entries) {
+                    self.hydrate_reading_history_entries(list, prepared.sidecars, ctx);
+                }
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 ctx.request_repaint_after(std::time::Duration::from_millis(50))
@@ -29740,10 +30954,77 @@ impl App {
         }
     }
 
+    /// Fill the adopted loading shell without performing another location adoption.
+    /// Its existing pools remain mounted; only consumers of the old item indices retire.
+    fn hydrate_reading_history_entries(
+        &mut self,
+        prepared: PreparedReadingHistoryList,
+        sidecars: HashMap<String, PathBuf>,
+        ctx: &egui::Context,
+    ) {
+        let submitted_search = self.submitted_local_search();
+        let PreparedReadingHistoryList {
+            inputs:
+                ReadingHistoryLoadInputs {
+                    items,
+                    image_metas,
+                    video_items,
+                    rows,
+                },
+            existing_keys: _,
+            token: _,
+        } = prepared;
+        self.video_thumb_overrides = sidecars;
+        self.bump_render_epoch_only();
+        self.install_new_items(items, image_metas);
+        self.invalidate_idx_state_and_queues();
+        self.items_are_reading_history_view = true;
+        self.reading_history_rows = rows;
+        self.address = "閲覧履歴".to_owned();
+        if let Some(submitted) = submitted_search {
+            // Rebuild the submitted membership over hydrated rows, preserving the input draft.
+            self.execute_submitted_local_search(ctx, submitted);
+        }
+        self.prewarm_rating_cache();
+        self.prewarm_grid_tags();
+        self.rebuild_visible_indices();
+        if self.selected.is_none()
+            && let Some(&idx) = self.visible_indices.first()
+        {
+            self.selected = Some(idx);
+            self.scroll_to_selected = true;
+        }
+        if !video_items.is_empty() {
+            let pin_blobs = self
+                .video_pin_db
+                .as_ref()
+                .map(|db| db.lookup_webps_many(video_items.iter().map(|(_, path, _)| path)))
+                .unwrap_or_default();
+            self.spawn_video_thread(
+                self.tx.clone(),
+                Arc::clone(&self.cancel_token),
+                video_items,
+                self.video_thumb_overrides.clone(),
+                Arc::new(pin_blobs),
+            );
+        }
+    }
+
     fn install_reading_history_entries(
         &mut self,
         entries: Vec<crate::reading_history_db::ReadingHistoryEntry>,
     ) {
+        let Some(prepared) = self.prepare_reading_history_entries(entries) else {
+            return;
+        };
+        let hydration = self.install_prepared_reading_history_entries(prepared);
+        self.hydrate_installed_main_list(hydration);
+    }
+
+    fn prepare_reading_history_entries(
+        &mut self,
+        entries: Vec<crate::reading_history_db::ReadingHistoryEntry>,
+    ) -> Option<PreparedReadingHistoryList> {
         let entries = entries
             .into_iter()
             .filter(|entry| !self.settings.epub_file_handling_ignores_path(&entry.path))
@@ -29785,13 +31066,55 @@ impl App {
             })
             .collect();
 
-        self.start_loading_items(
+        let token =
+            match self.prepare_visible_install(&reading_history_synthetic_path(), &items, None) {
+                Ok(token) => token,
+                Err(reason) => {
+                    self.show_open_admission_refusal(reason);
+                    return None;
+                }
+            };
+        Some(PreparedReadingHistoryList {
+            inputs: ReadingHistoryLoadInputs {
+                items,
+                image_metas,
+                video_items,
+                rows,
+            },
+            existing_keys,
+            token,
+        })
+    }
+
+    fn install_prepared_reading_history_entries(
+        &mut self,
+        prepared: PreparedReadingHistoryList,
+    ) -> MainListHydration {
+        let PreparedReadingHistoryList {
+            inputs:
+                ReadingHistoryLoadInputs {
+                    items,
+                    image_metas,
+                    video_items,
+                    rows,
+                },
+            existing_keys,
+            token,
+        } = prepared;
+        let hydration = self.install_loading_items_inner(
             reading_history_synthetic_path(),
             items,
             image_metas,
             existing_keys,
             video_items,
             None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            VisibleInstallAuthority::Ordinary,
+            token,
         );
         self.items_are_reading_history_view = true;
         self.top_level_grid_view
@@ -29805,6 +31128,7 @@ impl App {
             self.selected = Some(idx);
             self.scroll_to_selected = true;
         }
+        hydration
     }
 
     /// Menu and gamepad entry share one staged adoption boundary.
@@ -29853,9 +31177,10 @@ impl App {
     ) -> bool {
         let target = FolderNavHistoryTarget::Rating { stars };
         let head = match direction {
-            FolderHistoryDirection::Back => self.folder_history_back_target(),
-            FolderHistoryDirection::Forward => self.folder_history_forward_target(),
-        };
+            FolderHistoryDirection::Back => self.folder_history_back_entry(),
+            FolderHistoryDirection::Forward => self.folder_history_forward_entry(),
+        }
+        .map(|entry| &entry.location);
         if head != Some(&target) {
             return false;
         }
@@ -29878,7 +31203,35 @@ impl App {
         &mut self,
         target: FolderNavHistoryTarget,
         intent: CollectionHistoryIntent,
-        return_to: Option<top_level_grid_view::TopLevelGridRestore>,
+        return_to: Option<top_level_grid_view::TopLevelGridOrigin>,
+    ) -> bool {
+        let history = match &intent {
+            CollectionHistoryIntent::Restore => MainHistoryOperation::Restore { route: None },
+            CollectionHistoryIntent::Replay { direction, target } => {
+                let entry = match direction {
+                    FolderHistoryDirection::Back => self.folder_history_back_entry(),
+                    FolderHistoryDirection::Forward => self.folder_history_forward_entry(),
+                };
+                let Some(entry) = entry.filter(|entry| &entry.location == target).cloned() else {
+                    return false;
+                };
+                let Some(plan) = FolderHistoryPlan::capture(self, *direction, entry) else {
+                    return false;
+                };
+                MainHistoryOperation::Replay(Box::new(plan))
+            }
+        };
+        let navigation =
+            self.capture_main_list_navigation(history, self.copied_destination_source_proof());
+        self.start_collection_history_transition_owned(target, intent, return_to, navigation)
+    }
+
+    fn start_collection_history_transition_owned(
+        &mut self,
+        target: FolderNavHistoryTarget,
+        intent: CollectionHistoryIntent,
+        return_to: Option<top_level_grid_view::TopLevelGridOrigin>,
+        navigation: MainListNavigation,
     ) -> bool {
         if self.document_open_modal_admission_blocked() {
             return false;
@@ -29889,13 +31242,14 @@ impl App {
         if let FolderNavHistoryTarget::CollectionPhysical(child) = &target
             && Self::path_needs_open_classification(&child.visible_path)
         {
-            return match self.start_open_path_classification(
+            return match self.start_open_path_classification_with_navigation(
                 child.visible_path.clone(),
                 ClassifiedOpenContinuation::Collection {
                     target,
                     intent,
                     return_to,
                 },
+                navigation,
             ) {
                 OpenAdmission::Accepted => true,
                 OpenAdmission::Refused(reason) => {
@@ -29907,15 +31261,18 @@ impl App {
                 }
             };
         }
-        self.start_collection_history_transition_classified(target, intent, return_to, None)
+        self.start_collection_history_transition_classified(
+            target, intent, return_to, None, navigation,
+        )
     }
 
     fn start_collection_history_transition_classified(
         &mut self,
         target: FolderNavHistoryTarget,
         intent: CollectionHistoryIntent,
-        return_to: Option<top_level_grid_view::TopLevelGridRestore>,
+        return_to: Option<top_level_grid_view::TopLevelGridOrigin>,
         classified_kind: Option<OpenPathKind>,
+        navigation: MainListNavigation,
     ) -> bool {
         let root = match &target {
             FolderNavHistoryTarget::Collection(root) => root.clone(),
@@ -29935,14 +31292,8 @@ impl App {
                 return false;
             }
         }
-        if let CollectionHistoryIntent::Replay { direction, .. } = &intent {
-            let head = match direction {
-                FolderHistoryDirection::Back => self.folder_history_back_target(),
-                FolderHistoryDirection::Forward => self.folder_history_forward_target(),
-            };
-            if head != Some(&target) {
-                return false;
-            }
+        if !self.main_list_navigation_is_current(&navigation) {
+            return false;
         }
         let target_owner = match &target {
             FolderNavHistoryTarget::CollectionPhysical(child)
@@ -29982,19 +31333,14 @@ impl App {
         {
             pending.cancel();
         }
+        self.retire_replaced_main_list_requests(Some(MainListRequestOwner::Physical));
         let transition = CollectionHistoryTransition {
             request_id: NEXT_HISTORY_ARCHIVE_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
             intent,
             target,
             target_owner,
             classified_kind,
-            history_before: self.folder_nav_history_snapshot(),
-            source_context: self.projected_viewer_context_id(),
-            source_surface_generation: self.top_level_grid_view.generation(),
-            source_items_generation: self.items_generation,
-            source_slot: self.active_quick_folder_slot,
-            source_slot_switch_sequence: self.quick_folder_switch_sequence,
-            source_location: self.folder_nav_current_target(),
+            navigation,
             return_to,
             phase: CollectionHistoryPhase::Preparing(prepare),
         };
@@ -30005,41 +31351,7 @@ impl App {
     }
 
     fn collection_history_source_is_current(&self, request: &CollectionHistoryTransition) -> bool {
-        if !self.main_folder_history_available()
-            || self.projected_viewer_context_id() != request.source_context
-            || self.top_level_grid_view.generation() != request.source_surface_generation
-            || self.items_generation != request.source_items_generation
-            || self.active_quick_folder_slot != request.source_slot
-            || self.quick_folder_switch_sequence != request.source_slot_switch_sequence
-            || self.folder_nav_current_target() != request.source_location
-        {
-            return false;
-        }
-        let same_history = match request.source_slot {
-            Some(slot) => {
-                self.quick_folder_workspaces[slot.index()].history
-                    == request.history_before.quick_folder_workspaces[slot.index()].history
-            }
-            None => {
-                self.folder_nav_back_stack == request.history_before.back_stack
-                    && self.folder_nav_forward_stack == request.history_before.forward_stack
-                    && self.suppress_folder_nav_record_once
-                        == request.history_before.suppress_record_once
-            }
-        };
-        if !same_history {
-            return false;
-        }
-        match &request.intent {
-            CollectionHistoryIntent::Restore => true,
-            CollectionHistoryIntent::Replay { direction, target } => {
-                let head = match direction {
-                    FolderHistoryDirection::Back => self.folder_history_back_target(),
-                    FolderHistoryDirection::Forward => self.folder_history_forward_target(),
-                };
-                head == Some(target)
-            }
-        }
+        self.main_list_navigation_is_current(&request.navigation)
     }
 
     fn start_physical_history_transition(
@@ -30050,6 +31362,103 @@ impl App {
         restore_intent: crate::app::StartupListIntent,
     ) -> bool {
         self.start_physical_history_transition_with_dfs(intent, path, None, restore_intent.clone())
+    }
+
+    fn physical_navigation_operation(
+        &self,
+        intent: &PhysicalHistoryIntent,
+    ) -> Option<MainHistoryOperation> {
+        let replay = match intent {
+            PhysicalHistoryIntent::Navigation { replay, .. }
+            | PhysicalHistoryIntent::Rating { replay, .. } => replay.as_ref(),
+            PhysicalHistoryIntent::RequiredFullscreen { .. } => {
+                return Some(MainHistoryOperation::Restore { route: None });
+            }
+            PhysicalHistoryIntent::QuickFolder { .. } => {
+                return Some(MainHistoryOperation::SameLocation);
+            }
+            _ => {
+                return Some(MainHistoryOperation::Direct(
+                    crate::app::DirectNavigationPurpose::Navigation,
+                ));
+            }
+        };
+        if let Some((direction, target)) = replay {
+            let entry = match direction {
+                FolderHistoryDirection::Back => self.folder_history_back_entry(),
+                FolderHistoryDirection::Forward => self.folder_history_forward_entry(),
+            }?
+            .clone();
+            if &entry.location != target {
+                return None;
+            }
+            FolderHistoryPlan::capture(self, *direction, entry)
+                .map(|plan| MainHistoryOperation::Replay(Box::new(plan)))
+        } else {
+            Some(MainHistoryOperation::Direct(
+                crate::app::DirectNavigationPurpose::Navigation,
+            ))
+        }
+    }
+
+    /// Retire unadopted sibling requests after admission succeeds. A phase handoff retains its
+    /// native owner; the mounted source, committed cursor and warm verifier remain unchanged.
+    pub(super) fn retire_replaced_main_list_requests(
+        &mut self,
+        retained: Option<MainListRequestOwner>,
+    ) {
+        if !self.main_folder_history_available() {
+            return;
+        }
+        if retained != Some(MainListRequestOwner::Classification) {
+            self.top_level_grid_view.set_open_path_classification(None);
+        }
+        if retained != Some(MainListRequestOwner::Physical) {
+            self.replace_history_navigation_transition(None);
+        }
+        if retained != Some(MainListRequestOwner::Rating)
+            && self
+                .rating_view_pending
+                .as_ref()
+                .is_some_and(|pending| pending.navigation.is_some())
+            && let Some(pending) = self.rating_view_pending.take()
+        {
+            pending.cancel();
+        }
+        if retained != Some(MainListRequestOwner::Pane) {
+            self.cancel_folder_pane_open(PaneOpenRestoreExit::Adopted);
+        }
+        if retained != Some(MainListRequestOwner::Smart) {
+            self.retire_staged_smart_navigation_for_independent_intent();
+        }
+        if retained != Some(MainListRequestOwner::Collection)
+            && self.top_level_grid_view.collection_navigation_pending()
+        {
+            self.cancel_collection_navigation_intent();
+        }
+        if retained != Some(MainListRequestOwner::Subfolder) {
+            self.cancel_subfolder_expansion_pending();
+        }
+        if retained.is_none() {
+            self.retire_main_bookmark_open_for_surface_switch();
+        }
+        if retained != Some(MainListRequestOwner::Classification) {
+            // A suffix classification is not yet file admission: Ignore may reject it, or
+            // metadata may prove a directory. Its accepted continuation retires cold PDF.
+            self.retire_direct_document_open_for_history_admission();
+        }
+    }
+
+    /// Existing quick-folder sequence is the common switch epoch. Same-owner row publication
+    /// never calls this boundary; a reselect/query switch does, even if its path is unchanged.
+    pub(crate) fn retire_main_list_requests_for_surface_switch(&mut self) {
+        if !self.main_folder_history_available() {
+            return;
+        }
+        self.quick_folder_switch_sequence = self.quick_folder_switch_sequence.wrapping_add(1);
+        self.retire_bookmark_browser_build_for_current_context();
+        self.retire_replaced_main_list_requests(None);
+        self.cancel_pending_folder_nav();
     }
 
     fn replace_history_navigation_transition(&mut self, next: Option<HistoryNavigationTransition>) {
@@ -30073,7 +31482,7 @@ impl App {
     }
 
     /// An accepted staged request inherits the location before any unfinished direct book open.
-    /// Retire the direct owner and consume its rollback before recording the staged source.
+    /// Retire an unfinished direct owner before admitting a staged request from its visible source.
     fn retire_direct_document_open_for_history_admission(&mut self) {
         let Some(mut pending) = self.pdf_enumerate_pending.take() else {
             return;
@@ -30088,6 +31497,28 @@ impl App {
             self.restore_epub_open(restore);
         }
         self.resume_retained_pdf_source(phase);
+    }
+
+    fn physical_navigation_source_proof(
+        &self,
+        intent: &PhysicalHistoryIntent,
+    ) -> MainListSourceProof {
+        match intent {
+            PhysicalHistoryIntent::MainGridArchive { owner, .. } => {
+                self.copied_open_source_proof(&OpenRequestOwner::MainGridArchive(owner.clone()))
+            }
+            PhysicalHistoryIntent::Bookmark { owner, .. } => {
+                MainListSourceProof::Bookmark(owner.clone())
+            }
+            PhysicalHistoryIntent::Rating { owner, .. } => {
+                self.copied_open_source_proof(&OpenRequestOwner::RatingPhysical(owner.clone()))
+            }
+            PhysicalHistoryIntent::CollectionGrid { .. } => MainListSourceProof::Row,
+            PhysicalHistoryIntent::Navigation { .. }
+            | PhysicalHistoryIntent::RequiredFullscreen { .. }
+            | PhysicalHistoryIntent::CollectionNavigation { .. }
+            | PhysicalHistoryIntent::QuickFolder { .. } => self.copied_destination_source_proof(),
+        }
     }
 
     fn start_physical_history_transition_with_dfs(
@@ -30118,8 +31549,13 @@ impl App {
         if !self.main_folder_history_available() {
             return false;
         }
+        let Some(history) = self.physical_navigation_operation(&intent) else {
+            return false;
+        };
+        let proof = self.physical_navigation_source_proof(&intent);
+        let navigation = self.capture_main_list_navigation(history, proof);
         if Self::path_needs_open_classification(&path) {
-            return match self.start_open_path_classification(
+            return match self.start_open_path_classification_with_navigation(
                 path.clone(),
                 ClassifiedOpenContinuation::Physical {
                     intent,
@@ -30127,6 +31563,7 @@ impl App {
 
                     restore_intent: restore_intent.clone(),
                 },
+                navigation,
             ) {
                 OpenAdmission::Accepted => true,
                 OpenAdmission::Refused(reason) => {
@@ -30144,6 +31581,8 @@ impl App {
             dfs_continuation,
             None,
             restore_intent.clone(),
+            navigation,
+            None,
         )
     }
 
@@ -30154,8 +31593,10 @@ impl App {
         dfs_continuation: Option<PhysicalHistoryDfsContinuation>,
         classified_kind: Option<OpenPathKind>,
         restore_intent: crate::app::StartupListIntent,
+        navigation: MainListNavigation,
+        folder_scan: Option<ScannedDir>,
     ) -> bool {
-        if !self.main_folder_history_available() {
+        if !self.main_list_navigation_is_current(&navigation) {
             return false;
         }
         if classified_kind != Some(OpenPathKind::Directory)
@@ -30175,9 +31616,96 @@ impl App {
                 }
             }
         };
-        let Ok(preflight) = self.start_physical_history_preflight(path.clone(), None) else {
+        let preflight = if let Some(scan) = folder_scan {
+            collection_navigation::PhysicalHistoryPreflight::prepared(
+                collection_navigation::PhysicalHistoryPreflightPayload::Folder(scan),
+            )
+        } else {
+            let Ok(preflight) = self.start_physical_history_preflight(path.clone(), None) else {
+                return false;
+            };
+            preflight
+        };
+        self.admit_physical_history_phase(
+            intent,
+            path,
+            path_owner,
+            classified_kind,
+            PhysicalHistoryPhase::Preflighting {
+                preflight,
+                pdf_password_submission: None,
+            },
+            navigation,
+            dfs_continuation,
+            restore_intent,
+        )
+    }
+
+    /// Reuse the staged archive owner for an already-proven snapshot cache. The source remains
+    /// the pinned RAR identity while only the ZIP backing is prepared; no RAR conversion starts.
+    fn start_snapshot_archive_cache_transition(
+        &mut self,
+        source: PathBuf,
+        backing: PathBuf,
+        navigation: MainListNavigation,
+        dfs_continuation: Option<PhysicalHistoryDfsContinuation>,
+    ) -> bool {
+        if !self.main_list_navigation_is_current(&navigation) {
+            return false;
+        }
+        let Ok(path_owner) = crate::pdf_loader::LeasedEpubPath::try_new(source.clone()) else {
             return false;
         };
+        let Ok(preflight) = self.start_physical_history_preflight(
+            backing.clone(),
+            Some(crate::collection_store::CollectionResolvedKind::Zip),
+        ) else {
+            return false;
+        };
+        let owner = MainGridArchiveTransitionIntent {
+            source_path: source.clone(),
+            reading_history_return_from: None,
+            suppress_rating_filter: false,
+            suppress_facet_filter: false,
+            smart_folder_owner: SmartGridArchiveOwner::None,
+            rating_grid_owner: None,
+            collection_grid_owner: None,
+            collection_navigation_continuation: None,
+        };
+        let restore_intent = if dfs_continuation.is_some() {
+            StartupListIntent::PageContinuation
+        } else {
+            StartupListIntent::ExplicitList
+        };
+        self.admit_physical_history_phase(
+            PhysicalHistoryIntent::MainGridArchive {
+                owner,
+                auto_fullscreen: false,
+            },
+            source,
+            Some(path_owner),
+            Some(OpenPathKind::File),
+            PhysicalHistoryPhase::ArchivePreflighting {
+                backing_path: backing,
+                preflight,
+            },
+            navigation,
+            dfs_continuation,
+            restore_intent,
+        )
+    }
+
+    fn admit_physical_history_phase(
+        &mut self,
+        intent: PhysicalHistoryIntent,
+        path: PathBuf,
+        path_owner: Option<crate::pdf_loader::LeasedEpubPath>,
+        classified_kind: Option<OpenPathKind>,
+        phase: PhysicalHistoryPhase,
+        navigation: MainListNavigation,
+        dfs_continuation: Option<PhysicalHistoryDfsContinuation>,
+        restore_intent: StartupListIntent,
+    ) -> bool {
         if path
             .extension()
             .and_then(|ext| ext.to_str())
@@ -30202,23 +31730,15 @@ impl App {
         {
             pending.cancel();
         }
+        self.retire_replaced_main_list_requests(Some(MainListRequestOwner::Physical));
         let request = PhysicalHistoryTransition {
             request_id: NEXT_HISTORY_ARCHIVE_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
             intent,
             path,
             path_owner,
             classified_kind,
-            phase: PhysicalHistoryPhase::Preflighting {
-                preflight,
-                pdf_password_submission: None,
-            },
-            history_before: self.folder_nav_history_snapshot(),
-            source_context: self.projected_viewer_context_id(),
-            source_surface_generation: self.top_level_grid_view.generation(),
-            source_items_generation: self.items_generation,
-            source_slot: self.active_quick_folder_slot,
-            source_slot_switch_sequence: self.quick_folder_switch_sequence,
-            source_location: self.folder_nav_current_target(),
+            phase,
+            navigation,
             dfs_continuation,
             favsearch_origin: self.favsearch.active,
             tag_view_origin: self.tag_view.active,
@@ -30354,9 +31874,6 @@ impl App {
         if effects.suppress_rating_filter {
             self.maybe_suppress_rating_filter_for_opened_container_path(path);
         }
-        if effects.suppress_facet_filter {
-            self.maybe_suppress_facet_filter_for_opened_container_path(path);
-        }
     }
 
     fn start_rating_physical_zipdir_open(
@@ -30380,17 +31897,16 @@ impl App {
         )
     }
 
-    fn start_rating_physical_restore(
-        &mut self,
-        restore: top_level_grid_view::RatingPhysicalRestore,
-        replay: Option<(FolderHistoryDirection, FolderNavHistoryTarget)>,
+    fn rating_physical_restore_owner(
+        &self,
+        restore: &top_level_grid_view::RatingPhysicalRestore,
         intent: RatingPhysicalLoadIntent,
-    ) -> bool {
+    ) -> Option<RatingPhysicalLoadOwner> {
         let path = restore.visible_path.clone();
         let Some(source_location) = self.folder_nav_current_target() else {
-            return false;
+            return None;
         };
-        let owner = RatingPhysicalLoadOwner {
+        Some(RatingPhysicalLoadOwner {
             intent,
             source_context: self.projected_viewer_context_id(),
             source_surface_generation: self.top_level_grid_view.generation(),
@@ -30402,12 +31918,25 @@ impl App {
             stars: restore.stars,
             nav_chain: restore.nav_chain.clone(),
             saved_folder: restore.saved_folder.clone(),
+        })
+    }
+
+    fn start_rating_physical_restore(
+        &mut self,
+        restore: top_level_grid_view::RatingPhysicalRestore,
+        replay: Option<(FolderHistoryDirection, FolderNavHistoryTarget)>,
+        intent: RatingPhysicalLoadIntent,
+    ) -> bool {
+        let path = restore.visible_path.clone();
+        let Some(owner) = self.rating_physical_restore_owner(&restore, intent) else {
+            return false;
         };
         if let Some((direction, target)) = replay.as_ref() {
             let head = match direction {
-                FolderHistoryDirection::Back => self.folder_history_back_target(),
-                FolderHistoryDirection::Forward => self.folder_history_forward_target(),
-            };
+                FolderHistoryDirection::Back => self.folder_history_back_entry(),
+                FolderHistoryDirection::Forward => self.folder_history_forward_entry(),
+            }
+            .map(|entry| &entry.location);
             if head != Some(target) {
                 return false;
             }
@@ -30433,9 +31962,10 @@ impl App {
             return false;
         };
         let head = match direction {
-            FolderHistoryDirection::Back => self.folder_history_back_target(),
-            FolderHistoryDirection::Forward => self.folder_history_forward_target(),
-        };
+            FolderHistoryDirection::Back => self.folder_history_back_entry(),
+            FolderHistoryDirection::Forward => self.folder_history_forward_entry(),
+        }
+        .map(|entry| &entry.location);
         if head != Some(&target)
             || !(crate::folder_tree::is_virtual_folder(path)
                 || crate::folder_tree::is_convertible_archive_path(path))
@@ -30452,58 +31982,65 @@ impl App {
         )
     }
 
-    fn physical_history_source_is_current(&self, request: &PhysicalHistoryTransition) -> bool {
-        if !self.main_folder_history_available()
-            || self.projected_viewer_context_id() != request.source_context
-            || self.top_level_grid_view.generation() != request.source_surface_generation
-            || self.items_generation != request.source_items_generation
-            || self.active_quick_folder_slot != request.source_slot
-            || self.quick_folder_switch_sequence != request.source_slot_switch_sequence
-            || self.folder_nav_current_target() != request.source_location
-        {
+    fn start_prepared_collection_physical_navigation(
+        &mut self,
+        owner: Box<collection_navigation::PreparedCollectionPhysicalNavigation>,
+        navigation: MainListNavigation,
+        payload: collection_navigation::PhysicalHistoryPreflightPayload,
+        restore_intent: StartupListIntent,
+        ctx: &egui::Context,
+    ) -> bool {
+        if !owner.is_current(self) || !self.main_list_navigation_is_current(&navigation) {
             return false;
         }
-        let same_history = match request.source_slot {
-            Some(slot) => {
-                self.quick_folder_workspaces[slot.index()].history
-                    == request.history_before.quick_folder_workspaces[slot.index()].history
-            }
-            None => {
-                self.folder_nav_back_stack == request.history_before.back_stack
-                    && self.folder_nav_forward_stack == request.history_before.forward_stack
-                    && self.suppress_folder_nav_record_once
-                        == request.history_before.suppress_record_once
+        let path = owner.path().to_path_buf();
+        let path_owner = match crate::pdf_loader::LeasedEpubPath::try_new(path.clone()) {
+            Ok(owner) => Some(owner),
+            Err(reason) => {
+                self.show_open_admission_refusal(reason.into());
+                return false;
             }
         };
-        if !same_history {
+        self.cancel_replaced_staged_archive_conversion();
+        let request = PhysicalHistoryTransition {
+            request_id: NEXT_HISTORY_ARCHIVE_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
+            restore_intent,
+            intent: PhysicalHistoryIntent::CollectionNavigation { owner },
+            path,
+            path_owner,
+            classified_kind: Some(OpenPathKind::File),
+            phase: PhysicalHistoryPhase::Preflighting {
+                preflight: collection_navigation::PhysicalHistoryPreflight::prepared(payload),
+                pdf_password_submission: None,
+            },
+            navigation,
+            dfs_continuation: None,
+            favsearch_origin: self.favsearch.active,
+            tag_view_origin: self.tag_view.active,
+            global_search_origin: self.global_search.active,
+            grid_open_effects: None,
+        };
+        self.replace_history_navigation_transition(None);
+        self.poll_physical_history_transition(ctx, request);
+        true
+    }
+
+    fn physical_history_source_is_current(&self, request: &PhysicalHistoryTransition) -> bool {
+        if !self.main_list_navigation_is_current(&request.navigation) {
             return false;
         }
         match &request.intent {
+            PhysicalHistoryIntent::CollectionNavigation { owner } => owner.is_current(self),
             PhysicalHistoryIntent::RequiredFullscreen { .. } => true,
-            PhysicalHistoryIntent::Navigation { replay, .. } => {
-                if let Some((direction, target)) = replay {
-                    let head = match direction {
-                        FolderHistoryDirection::Back => self.folder_history_back_target(),
-                        FolderHistoryDirection::Forward => self.folder_history_forward_target(),
-                    };
-                    head == Some(target)
-                } else {
-                    true
-                }
+            PhysicalHistoryIntent::Navigation { .. } => true,
+            PhysicalHistoryIntent::Bookmark { owner, .. } => {
+                self.bookmark_open_owner_is_current(owner)
             }
-            PhysicalHistoryIntent::Rating { owner, replay, .. } => {
+            PhysicalHistoryIntent::Rating { owner, .. } => {
                 if !self.rating_physical_load_owner_is_current(owner, &request.path) {
                     return false;
                 }
-                if let Some((direction, target)) = replay {
-                    let head = match direction {
-                        FolderHistoryDirection::Back => self.folder_history_back_target(),
-                        FolderHistoryDirection::Forward => self.folder_history_forward_target(),
-                    };
-                    head == Some(target)
-                } else {
-                    true
-                }
+                true
             }
             PhysicalHistoryIntent::CollectionGrid { owner } => {
                 self.collection_grid_physical_load_owner_is_current(owner, &request.path)
@@ -30575,17 +32112,9 @@ impl App {
                                     restore,
                                     prepared,
                                     request.return_to.take(),
+                                    request.navigation,
                                 ) {
                                     return;
-                                }
-                                if let CollectionHistoryIntent::Replay { direction, target } =
-                                    &request.intent
-                                {
-                                    self.commit_staged_history_replay_after_adoption(
-                                        *direction,
-                                        target,
-                                        request.source_location,
-                                    );
                                 }
                             }
                             FolderNavHistoryTarget::CollectionPhysical(saved) => {
@@ -30715,6 +32244,7 @@ impl App {
                         if matches!(payload,
                             collection_navigation::PhysicalHistoryPreflightPayload::ConvertibleArchive(_)
                                 | collection_navigation::PhysicalHistoryPreflightPayload::ConvertiblePasswordRequired
+                                | collection_navigation::PhysicalHistoryPreflightPayload::RarOpen
                         ) {
                             let CollectionHistoryPhase::ChildPreflighting { prepared, target, .. } =
                                 std::mem::replace(&mut request.phase, CollectionHistoryPhase::Finished)
@@ -30761,16 +32291,8 @@ impl App {
                             pdf_password_submission
                                 .as_ref()
                                 .map(|(password, _)| password.clone()),
+                            request.navigation,
                         ) {
-                            if let CollectionHistoryIntent::Replay { direction, target } =
-                                &request.intent
-                            {
-                                self.commit_staged_history_replay_after_adoption(
-                                    *direction,
-                                    target,
-                                    request.source_location,
-                                );
-                            }
                         } else {
                             self.restore_staged_pdf_password_after_failed_adoption(
                                 prior_pdf_password,
@@ -30839,17 +32361,8 @@ impl App {
                             request.return_to.take(),
                             Some(cached_backing.unwrap_or(backing_path)),
                             None,
-                        ) {
-                            if let CollectionHistoryIntent::Replay { direction, target } =
-                                &request.intent
-                            {
-                                self.commit_staged_history_replay_after_adoption(
-                                    *direction,
-                                    target,
-                                    request.source_location,
-                                );
-                            }
-                        }
+                            request.navigation,
+                        ) {}
                     }
                 }
             }
@@ -31040,7 +32553,8 @@ impl App {
                         ctx.request_repaint();
                     } else {
                         if matches!(payload, collection_navigation::PhysicalHistoryPreflightPayload::ConvertibleArchive(_)
-                            | collection_navigation::PhysicalHistoryPreflightPayload::ConvertiblePasswordRequired) {
+                            | collection_navigation::PhysicalHistoryPreflightPayload::ConvertiblePasswordRequired
+                                | collection_navigation::PhysicalHistoryPreflightPayload::RarOpen) {
                             if self.start_staged_archive_conversion(request.request_id, &request.path,
         request.restore_intent.clone(),
     ) {
@@ -31154,11 +32668,20 @@ impl App {
             .and_then(|ext| ext.to_str())
             .and_then(crate::archive_converter::ArchiveFormat::from_extension);
         let Some(format) = format else { return false };
+        self.start_staged_archive_conversion_with_format(request_id, path, format, restore_intent)
+    }
+
+    fn start_staged_archive_conversion_with_format(
+        &mut self,
+        request_id: u64,
+        path: &Path,
+        format: crate::archive_converter::ArchiveFormat,
+        restore_intent: StartupListIntent,
+    ) -> bool {
         let started = if format == crate::archive_converter::ArchiveFormat::Rar {
             self.request_rar_open_owned(
                 path.to_path_buf(),
                 false,
-                self.try_archive_cache_lookup(path),
                 OpenRequestOwner::Navigation,
                 restore_intent.clone(),
             )
@@ -31386,61 +32909,6 @@ impl App {
         handled
     }
 
-    fn commit_staged_history_replay_after_adoption(
-        &mut self,
-        direction: FolderHistoryDirection,
-        target: &FolderNavHistoryTarget,
-        source: Option<FolderNavHistoryTarget>,
-    ) {
-        if !self.main_folder_history_available() {
-            return;
-        }
-        let stack = if let Some(workspace) = self.active_quick_folder_workspace_mut() {
-            &mut workspace.history
-        } else {
-            // The normal workspace has separate legacy vectors. Handle it below.
-            let popped = match direction {
-                FolderHistoryDirection::Back => self.folder_nav_back_stack.pop(),
-                FolderHistoryDirection::Forward => self.folder_nav_forward_stack.pop(),
-            };
-            if popped.as_ref() != Some(target) {
-                return;
-            }
-            if let Some(source) =
-                source.filter(|source| !Self::folder_nav_targets_eq(source, target))
-            {
-                match direction {
-                    FolderHistoryDirection::Back => {
-                        Self::push_folder_nav_stack(&mut self.folder_nav_forward_stack, source)
-                    }
-                    FolderHistoryDirection::Forward => {
-                        Self::push_folder_nav_stack(&mut self.folder_nav_back_stack, source)
-                    }
-                }
-            }
-            self.suppress_folder_nav_record_once = false;
-            return;
-        };
-        let popped = match direction {
-            FolderHistoryDirection::Back => stack.back_stack.pop(),
-            FolderHistoryDirection::Forward => stack.forward_stack.pop(),
-        };
-        if popped.as_ref() != Some(target) {
-            return;
-        }
-        if let Some(source) = source.filter(|source| !Self::folder_nav_targets_eq(source, target)) {
-            match direction {
-                FolderHistoryDirection::Back => {
-                    Self::push_folder_nav_stack(&mut stack.forward_stack, source)
-                }
-                FolderHistoryDirection::Forward => {
-                    Self::push_folder_nav_stack(&mut stack.back_stack, source)
-                }
-            }
-        }
-        stack.suppress_record_once = false;
-    }
-
     fn commit_physical_history_transition(
         &mut self,
         ctx: &egui::Context,
@@ -31449,618 +32917,584 @@ impl App {
         pdf_password_submission: Option<(String, bool)>,
         backing_path: Option<PathBuf>,
     ) {
-        // Resolve an unclassified Folder from the same accepted request that controls its
-        // existing execution. A Rating Folder, for example, lands on a list even when the
-        // global image-book setting is enabled; its branch does not reserve auto-open.
-        let folder_auto_open_requested = match &request.intent {
+        if !self.physical_history_source_is_current(&request) || self.sidecar_restore_active() {
+            return;
+        }
+        let auto_fullscreen = match &request.intent {
             PhysicalHistoryIntent::Navigation {
                 auto_fullscreen, ..
             }
             | PhysicalHistoryIntent::MainGridArchive {
                 auto_fullscreen, ..
-            } => {
-                *auto_fullscreen
-                    || request
-                        .grid_open_effects
-                        .as_ref()
-                        .is_some_and(|effects| effects.auto_fullscreen)
             }
+            | PhysicalHistoryIntent::Bookmark {
+                auto_fullscreen, ..
+            } => *auto_fullscreen,
             _ => false,
+        } || request
+            .grid_open_effects
+            .as_ref()
+            .is_some_and(|effects| effects.auto_fullscreen);
+        let owner = match &request.intent {
+            PhysicalHistoryIntent::Bookmark { owner, .. } => {
+                OpenRequestOwner::Bookmark(owner.clone())
+            }
+            PhysicalHistoryIntent::Rating { owner, .. } => {
+                OpenRequestOwner::RatingPhysical(owner.clone())
+            }
+            PhysicalHistoryIntent::CollectionGrid { owner } => {
+                OpenRequestOwner::CollectionGridPhysical(owner.clone())
+            }
+            PhysicalHistoryIntent::MainGridArchive { owner, .. } => {
+                OpenRequestOwner::MainGridArchive(owner.clone())
+            }
+            PhysicalHistoryIntent::QuickFolder { slot } => {
+                OpenRequestOwner::QuickFolderSwitch(QuickFolderSwitchLoadOwner {
+                    source_context: request.source_context,
+                    source_surface_generation: request.source_surface_generation,
+                    source_slot: request.source_slot,
+                    source_slot_switch_sequence: request.source_slot_switch_sequence,
+                    target_slot: *slot,
+                    target_path: request.path.clone(),
+                })
+            }
+            _ => OpenRequestOwner::Navigation,
         };
+        if !self.snapshot_scope_allows_open(&request.path, &owner) {
+            return;
+        }
         let restore_intent = match &payload {
             collection_navigation::PhysicalHistoryPreflightPayload::Folder(scan) => {
                 request.restore_intent.clone().for_scanned_folder(
-                    folder_auto_open_requested
+                    auto_fullscreen
                         && self.settings.auto_fullscreen_image_folders_enabled()
                         && self.scanned_folder_is_image_book(&request.path, scan),
                 )
             }
             _ => request.restore_intent.clone().for_book(),
         };
-
-        if self.sidecar_restore_active() {
-            if request.dfs_continuation.is_some() {
-                self.clear_pending_folder_nav_steps();
-                self.release_fs_nav_lock();
-            }
+        let full_path = matches!(
+            request.intent,
+            PhysicalHistoryIntent::CollectionNavigation { .. }
+        ) || matches!(owner, OpenRequestOwner::CollectionGridPhysical(_))
+            || matches!(&owner,OpenRequestOwner::MainGridArchive(owner) if owner.collection_grid_owner.is_some())
+            || use_full_path_cache_keys_for_folder(&request.path);
+        let password = pdf_password_submission
+            .as_ref()
+            .map(|(password, _)| password.clone());
+        let Some(mut prepared) = self.prepare_physical_listing(
+            request.path.clone(),
+            payload,
+            backing_path.as_deref(),
+            password,
+            restore_intent.clone(),
+            auto_fullscreen,
+            full_path,
+        ) else {
             return;
+        };
+        // Rating ZIP directory identity is resolved from the prepared tree, before install.
+        if let PhysicalHistoryIntent::Rating {
+            zip_dir_prefix: Some(prefix),
+            ..
+        } = &request.intent
+            && let PreparedPhysicalListing::Zip { prepared, .. } = &mut prepared
+        {
+            prepared.nav.enter(prefix);
+            let (items, image_metas) = prepared.nav.materialize_current(BOOK_READING_PAGE_ORDER);
+            prepared.items = items;
+            prepared.image_metas = image_metas;
         }
-        let prior_pdf_password = if matches!(
-            &payload,
-            collection_navigation::PhysicalHistoryPreflightPayload::PdfPages(_)
+        let token = match self.prepare_visible_install(
+            prepared.source_path(),
+            prepared.items(),
+            Some(&request.path),
         ) {
-            self.prepare_staged_pdf_password_for_adoption(
-                &request.path,
-                pdf_password_submission.as_ref(),
+            Ok(token) => token,
+            Err(reason) => {
+                self.show_open_admission_refusal(reason);
+                return;
+            }
+        };
+        let rating_destination = match &request.intent {
+            PhysicalHistoryIntent::Rating { owner, restore, .. } => Some(
+                restore
+                    .clone()
+                    .unwrap_or_else(|| self.rating_physical_destination(owner, &request.path)),
+            ),
+            PhysicalHistoryIntent::MainGridArchive { owner, .. } => owner
+                .rating_grid_owner
+                .as_ref()
+                .map(|rating| self.rating_physical_destination(rating, &request.path)),
+            _ => None,
+        };
+        let location = if matches!(
+            request.navigation.history,
+            MainHistoryOperation::SameLocation
+        ) && !matches!(request.intent, PhysicalHistoryIntent::QuickFolder { .. })
+            && let Some(source) = request.navigation.source_location.as_ref()
+        {
+            source.location.clone()
+        } else if let PhysicalHistoryIntent::CollectionNavigation { owner } = &request.intent {
+            FolderNavHistoryTarget::CollectionPhysical(owner.destination())
+        } else if let Some(rating) = rating_destination.as_ref() {
+            FolderNavHistoryTarget::RatingPhysical(rating.clone())
+        } else if let PhysicalHistoryIntent::CollectionGrid { owner } = &request.intent {
+            FolderNavHistoryTarget::CollectionPhysical(
+                top_level_grid_view::CollectionGridPhysicalRestore {
+                    root: owner.restore(
+                        self.top_level_grid_view
+                            .collection_session()
+                            .map_or(owner.wanted_revision, |session| session.wanted_revision),
+                    ),
+                    root_source_path: owner.root_source_path.clone(),
+                    visible_path: request.path.clone(),
+                },
+            )
+        } else if let PhysicalHistoryIntent::MainGridArchive { owner, .. } = &request.intent
+            && let Some(collection) = owner.collection_grid_owner.as_ref()
+        {
+            FolderNavHistoryTarget::CollectionPhysical(
+                top_level_grid_view::CollectionGridPhysicalRestore {
+                    root: top_level_grid_view::CollectionGridRestore {
+                        identity: top_level_grid_view::CollectionGridIdentity {
+                            collection_id: collection.stamp.collection_id,
+                        },
+                        revision_at_open: collection
+                            .accepted_revision
+                            .max(collection.wanted_revision),
+                        viewport_anchor: Some(collection.anchor.clone()),
+                    },
+                    root_source_path: owner.source_path.clone(),
+                    visible_path: request.path.clone(),
+                },
             )
         } else {
-            None
+            FolderNavHistoryTarget::Path(request.path.clone())
         };
-        let grid_effects = request.grid_open_effects.clone();
-        if let PhysicalHistoryIntent::RequiredFullscreen {
-            target,
-            history_trigger,
-            navigation_purpose,
-        } = &request.intent
-        {
-            if !matches!(
-                &payload,
-                collection_navigation::PhysicalHistoryPreflightPayload::Zip(_)
-                    | collection_navigation::PhysicalHistoryPreflightPayload::PdfPages(_)
-            ) {
-                return;
-            }
-            // The required leaf belongs to this prepared destination. Keep the old viewer and
-            // snapshot mounted until the archive is usable, then begin the fullscreen handoff
-            // and resolve the exact leaf against the installed items.
-            if !self.prepare_required_fullscreen_navigation(ctx, navigation_purpose.clone()) {
-                self.show_feedback_toast("画像の場所を開けません".to_string());
-                return;
-            }
-            let adopted = self.adopt_prepared_ordinary_archive_navigation(
-                &request.path,
-                payload,
-                backing_path.as_deref(),
-                request.source_location.as_ref(),
-                false,
-                None,
-                pdf_password_submission
-                    .as_ref()
-                    .map(|(password, _)| password.clone()),
-                false,
-                StartupListIntent::InternalHydration(Box::new(restore_intent.clone())),
-            );
-            if adopted {
-                self.finish_required_fullscreen_load(target.clone(), *history_trigger);
-                self.finish_main_list_open(restore_intent.clone());
-            } else {
-                self.restore_staged_pdf_password_after_failed_adoption(prior_pdf_password);
-                self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::RequestFailed);
-            }
-            return;
-        }
-        if let PhysicalHistoryIntent::Navigation {
-            replay,
-            auto_fullscreen,
-        } = &request.intent
-        {
-            let previous_suppress =
-                request
-                    .source_slot
-                    .map_or(request.history_before.suppress_record_once, |slot| {
-                        request.history_before.quick_folder_workspaces[slot.index()]
-                            .history
-                            .suppress_record_once
-                    });
-            if replay.is_some() {
-                self.set_active_folder_nav_suppress_record_once(true);
-            }
-            let adopted = match payload {
-                collection_navigation::PhysicalHistoryPreflightPayload::Folder(scan) => {
-                    // A suffix is only a candidate for worker preflight. A directory called
-                    // `book.zip` must still land as a directory after metadata resolves it.
-                    if (*auto_fullscreen
-                        || grid_effects
-                            .as_ref()
-                            .is_some_and(|effects| effects.auto_fullscreen))
-                        && self.settings.auto_fullscreen_image_folders_enabled()
-                    {
-                        self.pending_auto_fs_open = true;
-                    }
-                    if request
-                        .dfs_continuation
-                        .as_ref()
-                        .is_some_and(|dfs| dfs.fullscreen)
-                    {
-                        self.close_fullscreen_for_folder_nav_reopen();
-                    }
-                    self.load_folder_with_scan_owned_and_effects(
-                        request.path.clone(),
-                        Some(scan),
-                        OpenRequestOwner::Navigation,
-                        grid_effects.clone(),
-                        StartupListIntent::InternalInstall,
-                    )
-                }
-                payload => self.adopt_prepared_ordinary_archive_navigation(
-                    &request.path,
-                    payload,
-                    backing_path.as_deref(),
-                    request.source_location.as_ref(),
-                    *auto_fullscreen
-                        || grid_effects
-                            .as_ref()
-                            .is_some_and(|effects| effects.auto_fullscreen),
-                    grid_effects.as_ref(),
-                    pdf_password_submission
-                        .as_ref()
-                        .map(|(password, _)| password.clone()),
-                    request
-                        .dfs_continuation
-                        .as_ref()
-                        .is_some_and(|dfs| dfs.fullscreen),
-                    StartupListIntent::InternalHydration(Box::new(restore_intent.clone())),
-                ),
-            };
-            if adopted {
-                if replay.is_none() {
-                    self.commit_staged_search_navigation_effects(
-                        &request.path,
-                        request.favsearch_origin,
-                        request.tag_view_origin,
-                        request.global_search_origin,
-                    );
-                }
-                if let Some((direction, target)) = replay {
-                    self.commit_staged_history_replay_after_adoption(
-                        *direction,
-                        target,
-                        request.source_location,
-                    );
-                }
-                self.finish_main_list_open(restore_intent.clone());
-                if let Some(dfs) = request.dfs_continuation {
-                    if dfs.fullscreen {
-                        let _ = self.reopen_fullscreen_after_folder_nav_load(
-                            ctx,
-                            dfs.restore_video_tile,
-                            dfs.resume_slideshow,
-                            dfs.history_trigger,
-                        );
-                    }
-                    self.chain_folder_nav_if_pending(dfs.queued_steps, dfs.mode);
-                }
-            } else {
-                self.set_active_folder_nav_suppress_record_once(previous_suppress);
-                self.restore_staged_pdf_password_after_failed_adoption(prior_pdf_password);
-                self.clear_pending_folder_nav_steps();
-                self.release_fs_nav_lock();
-            }
-            return;
-        }
-        if let PhysicalHistoryIntent::QuickFolder { slot } = &request.intent {
-            if self.commit_quick_folder_switch(
-                &request,
-                *slot,
-                payload,
-                backing_path.clone(),
-                pdf_password_submission
-                    .as_ref()
-                    .map(|(password, _)| password.clone()),
-            ) {
-                if let Some(backing) = backing_path.as_deref() {
-                    self.adopt_staged_archive_source_alias(&request.path, backing);
-                }
-                self.finish_main_list_open(restore_intent.clone());
-            } else {
-                self.restore_staged_pdf_password_after_failed_adoption(prior_pdf_password);
-            }
-            return;
-        }
-        if let PhysicalHistoryIntent::MainGridArchive {
-            owner,
-            auto_fullscreen,
-        } = &request.intent
-        {
-            let open_owner = OpenRequestOwner::MainGridArchive(owner.clone());
-            let payload = match payload {
-                collection_navigation::PhysicalHistoryPreflightPayload::Folder(scan) => {
-                    if *auto_fullscreen && self.settings.auto_fullscreen_image_folders_enabled() {
-                        self.pending_auto_fs_open = true;
-                    }
-                    let path = request.path;
-                    let effects = GridVirtualOpenEffects {
-                        reading_history_return_from: owner.reading_history_return_from.clone(),
-                        suppress_rating_filter: owner.suppress_rating_filter,
-                        suppress_facet_filter: owner.suppress_facet_filter,
-                        auto_fullscreen: *auto_fullscreen,
-                    };
-                    if self.load_folder_with_scan_owned_and_effects(
-                        path.clone(),
-                        Some(scan),
-                        open_owner.clone(),
-                        Some(effects),
-                        StartupListIntent::InternalInstall,
-                    ) {
-                        if owner
-                            .collection_grid_owner
-                            .as_ref()
-                            .is_some_and(|collection| collection.navigation_request.is_some())
-                        {
-                            // Descendant navigation is landed only once its physical path is visible.
-                            self.commit_main_grid_archive_transition(&open_owner);
-                        }
-                        self.commit_staged_search_navigation_effects(
-                            &path,
-                            request.favsearch_origin,
-                            request.tag_view_origin,
-                            request.global_search_origin,
-                        );
-                        self.finish_main_list_open(restore_intent.clone());
-                    }
-                    return;
-                }
-                payload => payload,
-            };
-            let collection_navigation::PhysicalHistoryPreflightPayload::Zip(enumeration) = payload
-            else {
-                return;
-            };
-            if !self.snapshot_scope_allows_open(&request.path, &open_owner)
-                || !self.main_grid_archive_transition_is_current(&open_owner)
-                || !self.adopt_collection_surface_for_physical_load(
-                    &request.path,
-                    &open_owner,
-                    None,
-                )
+        let prefix = prepared.book_prefix().or_else(|| {
+            request
+                .grid_open_effects
+                .as_ref()
+                .is_some_and(|effects| effects.suppress_facet_filter)
+                .then(String::new)
+        });
+        let destination = match &request.navigation.history {
+            MainHistoryOperation::Restore { route: None }
+                if matches!(
+                    request.intent,
+                    PhysicalHistoryIntent::CollectionNavigation { .. }
+                ) =>
             {
-                return;
+                let collection_id = location
+                    .collection_id()
+                    .expect("collection physical destination");
+                let root_scope = FacetScope::Collection {
+                    id: collection_id.as_uuid().to_string(),
+                    entry: None,
+                };
+                let mut route = request
+                    .navigation
+                    .source_location
+                    .as_ref()
+                    .map(|source| source.route.clone())
+                    .unwrap_or_default();
+                if let Some(index) = route.0.iter().position(|scope| scope == &root_scope) {
+                    route.0.truncate(index + 1);
+                } else {
+                    route = FacetRoute::root(root_scope);
+                }
+                route.0.push(Self::facet_scope_for_location(&location));
+                FolderNavHistoryEntry::new(location, route)
             }
-            let backing = backing_path.unwrap_or_else(|| request.path.clone());
-            if *auto_fullscreen {
-                self.pending_auto_fs_open = true;
+            MainHistoryOperation::SameLocation
+                if matches!(request.intent, PhysicalHistoryIntent::QuickFolder { .. }) =>
+            {
+                FolderNavHistoryEntry::new(
+                    location.clone(),
+                    FacetRoute::root(Self::facet_scope_for_location(&location)),
+                )
             }
-            self.load_zip_as_folder_prepared_with_logical_source(
-                backing.clone(),
-                enumeration,
-                Some(&request.path),
-                StartupListIntent::InternalHydration(Box::new(restore_intent.clone())),
+            _ => self.main_list_requested_destination(
+                &request.navigation,
+                location,
+                prefix.as_deref(),
+            ),
+        };
+        let Some(adoption) = self.prepare_main_list_adoption(request.navigation, destination)
+        else {
+            return;
+        };
+        if let PhysicalHistoryIntent::RequiredFullscreen {
+            navigation_purpose, ..
+        } = &request.intent
+            && !self.prepare_required_fullscreen_navigation(ctx, navigation_purpose.clone())
+        {
+            return;
+        }
+        let mut collection_navigation = None;
+        let after_hydration = match request.intent {
+            PhysicalHistoryIntent::CollectionNavigation { owner } => {
+                collection_navigation = Some(owner);
+                None
+            }
+            PhysicalHistoryIntent::RequiredFullscreen {
+                ref target,
+                history_trigger,
+                ..
+            } => Some(MainListAfterHydration::RequiredFullscreen {
+                target: target.clone(),
+                history_trigger,
+            }),
+            _ => request
+                .dfs_continuation
+                .map(|continuation| MainListAfterHydration::Dfs {
+                    continuation,
+                    ctx: ctx.clone(),
+                }),
+        };
+        let path = request.path;
+        let close_fullscreen = matches!(&after_hydration,Some(MainListAfterHydration::Dfs {continuation,..}) if continuation.fullscreen);
+        self.adopt_main_list_navigation(adoption, |app| {
+            if close_fullscreen {
+                app.close_fullscreen_for_folder_nav_reopen();
+            }
+            if let Some((password, save)) = pdf_password_submission {
+                app.pdf_current_password = Some(password.clone());
+                app.pdf_password_pending_save = save.then(|| (path.clone(), password));
+            }
+            if let Some(native) = collection_navigation.as_mut() {
+                native.install(app);
+            } else {
+                app.install_admitted_physical_surface(&path, &owner, rating_destination.as_ref());
+            }
+            if let OpenRequestOwner::Bookmark(owner) = &owner {
+                app.begin_bookmark_page_wait(owner);
+            }
+            if let Some(effects) = request.grid_open_effects {
+                app.commit_grid_virtual_open_effects(&path, effects);
+            }
+            if auto_fullscreen && !matches!(prepared, PreparedPhysicalListing::Folder(_)) {
+                app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                    history_trigger: HistoryTrigger::UserChosen,
+                    resume_slideshow: false,
+                    target: DeferredFsTarget::None,
+                    resume_to_last_page: app.settings.book_open_resume.resumes(),
+                    from_explicit_open: true,
+                    preserve_after_password_prompt: true,
+                });
+            }
+            let authority = backing_path
+                .as_ref()
+                .map_or(VisibleInstallAuthority::Ordinary, |_| {
+                    VisibleInstallAuthority::StagedArchive {
+                        logical_source: &path,
+                    }
+                });
+            let mut hydration = app.install_prepared_physical_listing(
+                prepared,
+                authority,
+                restore_intent.clone(),
+                token,
             );
-            self.adopt_staged_archive_source_alias(&request.path, &backing);
-            self.commit_main_grid_archive_transition(&open_owner);
-            self.commit_staged_search_navigation_effects(
-                &request.path,
+            if let Some((continuation, _)) = hydration.as_mut() {
+                continuation.navigation_after_hydration = collection_navigation
+                    .take()
+                    .map(|owner| MainListAfterHydration::CollectionNavigation {
+                        owner,
+                        ctx: ctx.clone(),
+                    })
+                    .or(after_hydration);
+            }
+            if let Some(backing) = backing_path.as_deref() {
+                app.adopt_staged_archive_source_alias(&path, backing);
+            }
+            app.commit_staged_search_navigation_effects(
+                &path,
                 request.favsearch_origin,
                 request.tag_view_origin,
                 request.global_search_origin,
             );
-            self.finish_main_list_open(restore_intent.clone());
-            return;
-        }
-        if let PhysicalHistoryIntent::CollectionGrid { owner } = &request.intent {
-            let open_owner = OpenRequestOwner::CollectionGridPhysical(owner.clone());
-            let payload = match payload {
-                collection_navigation::PhysicalHistoryPreflightPayload::Folder(scan) => {
-                    let path = request.path;
-                    if grid_effects
-                        .as_ref()
-                        .is_some_and(|effects| effects.auto_fullscreen)
-                    {
-                        self.pending_auto_fs_open = true;
-                    }
-                    let adopted = self.load_folder_with_scan_owned_and_effects(
-                        path,
-                        Some(scan),
-                        open_owner,
-                        grid_effects,
-                        StartupListIntent::InternalInstall,
-                    );
-                    if adopted {
-                        self.finish_main_list_open(restore_intent.clone());
-                    }
-                    return;
-                }
-                payload => payload,
-            };
-            if !matches!(
-                &payload,
-                collection_navigation::PhysicalHistoryPreflightPayload::Zip(_)
-                    | collection_navigation::PhysicalHistoryPreflightPayload::PdfPages(_)
-            ) || !self.snapshot_scope_allows_open(&request.path, &open_owner)
-                || !self.adopt_collection_surface_for_physical_load(
-                    &request.path,
-                    &open_owner,
-                    None,
-                )
-            {
-                self.restore_staged_pdf_password_after_failed_adoption(prior_pdf_password);
-                return;
-            }
-            if grid_effects
-                .as_ref()
-                .is_some_and(|effects| effects.auto_fullscreen)
-            {
-                self.pending_auto_fs_open = true;
-            }
-            let path = request.path;
-            if let Some(effects) = grid_effects {
-                self.commit_grid_virtual_open_effects(&path, effects);
-            }
-            match payload {
-                collection_navigation::PhysicalHistoryPreflightPayload::Zip(enumeration) => {
-                    let backing = backing_path.as_deref().unwrap_or(&path);
-                    self.load_zip_as_folder_prepared_with_logical_source(
-                        backing.to_path_buf(),
-                        enumeration,
-                        backing_path.is_some().then_some(path.as_path()),
-                        StartupListIntent::InternalHydration(Box::new(restore_intent.clone())),
-                    );
-                    if backing_path.is_some() {
-                        self.adopt_staged_archive_source_alias(&path, backing);
-                    }
-                }
-                collection_navigation::PhysicalHistoryPreflightPayload::PdfPages(pages) => {
-                    let outcome = self.load_pdf_as_folder_prepared_with_password(
-                        path.clone(),
-                        pages,
-                        pdf_password_submission
-                            .as_ref()
-                            .map(|(password, _)| password.clone()),
-                        StartupListIntent::InternalInstall,
-                    );
-                    debug_assert!(matches!(outcome, FolderOpenOutcome::Loaded));
-                }
-                _ => unreachable!("collection grid archive must have a prepared payload"),
-            }
-            self.finish_main_list_open(restore_intent.clone());
-            return;
-        }
-        let PhysicalHistoryIntent::Rating {
-            owner,
-            restore,
-            replay,
-            zip_dir_prefix,
-        } = request.intent
-        else {
-            return;
-        };
-        let path = request.path;
-        let adopted = match payload {
-            collection_navigation::PhysicalHistoryPreflightPayload::Folder(scan) => self
-                .load_folder_with_scan_owned(
-                    path.clone(),
-                    Some(scan),
-                    OpenRequestOwner::RatingPhysical(owner.clone()),
-                    StartupListIntent::InternalInstall,
-                ),
-            collection_navigation::PhysicalHistoryPreflightPayload::Zip(enumeration) => {
-                if !self.adopt_collection_surface_for_physical_load(
-                    &path,
-                    &OpenRequestOwner::RatingPhysical(owner.clone()),
-                    None,
-                ) {
-                    false
-                } else {
-                    if let Some(effects) = grid_effects.clone() {
-                        self.commit_grid_virtual_open_effects(&path, effects);
-                    }
-                    if grid_effects
-                        .as_ref()
-                        .is_some_and(|effects| effects.auto_fullscreen)
-                    {
-                        self.pending_auto_fs_open = true;
-                    }
-                    if let Some(dir_prefix) = zip_dir_prefix {
-                        self.pending_rating_view_zipdir_open = Some(PendingRatingViewZipDirOpen {
-                            source_path: path.clone(),
-                            dir_prefix,
-                        });
-                    }
-                    self.load_zip_as_folder_prepared_with_logical_source(
-                        backing_path.clone().unwrap_or_else(|| path.clone()),
-                        enumeration,
-                        backing_path.as_ref().map(|_| path.as_path()),
-                        StartupListIntent::InternalHydration(Box::new(restore_intent.clone())),
-                    );
-                    true
-                }
-            }
-            collection_navigation::PhysicalHistoryPreflightPayload::PdfPages(pages) => {
-                if !self.adopt_collection_surface_for_physical_load(
-                    &path,
-                    &OpenRequestOwner::RatingPhysical(owner.clone()),
-                    None,
-                ) {
-                    false
-                } else {
-                    if let Some(effects) = grid_effects.clone() {
-                        self.commit_grid_virtual_open_effects(&path, effects);
-                    }
-                    if grid_effects
-                        .as_ref()
-                        .is_some_and(|effects| effects.auto_fullscreen)
-                    {
-                        self.pending_auto_fs_open = true;
-                    }
-                    let outcome = self.load_pdf_as_folder_prepared_with_password(
-                        path.clone(),
-                        pages,
-                        pdf_password_submission
-                            .as_ref()
-                            .map(|(password, _)| password.clone()),
-                        StartupListIntent::InternalInstall,
-                    );
-                    matches!(outcome, FolderOpenOutcome::Loaded)
-                }
-            }
-            collection_navigation::PhysicalHistoryPreflightPayload::PdfPasswordRequired
-            | collection_navigation::PhysicalHistoryPreflightPayload::PdfOpenFailure(_)
-            | collection_navigation::PhysicalHistoryPreflightPayload::ZipCached { .. }
-            | collection_navigation::PhysicalHistoryPreflightPayload::ConvertiblePasswordRequired
-            | collection_navigation::PhysicalHistoryPreflightPayload::ConvertibleArchive(_) => {
-                self.show_feedback_toast("[書庫の開封を続けられませんでした]".into());
-                false
-            }
-        };
-        if !adopted {
-            self.restore_staged_pdf_password_after_failed_adoption(prior_pdf_password);
-            return;
-        }
-        if let Some(backing) = backing_path.as_deref() {
-            self.adopt_staged_archive_source_alias(&path, backing);
-        }
-        if let Some(restore) = restore {
-            self.rating_view_stars = restore.stars;
-            self.rating_view_nav_stack = restore.nav_chain;
-            self.rating_view_saved_folder = restore.saved_folder;
-            self.rating_view_subfolder_restore = restore.subfolder_restore;
-        }
-        if let Some((direction, target)) = replay {
-            self.commit_staged_history_replay_after_adoption(
-                direction,
-                &target,
-                request.source_location,
-            );
-        }
-
-        self.finish_main_list_open(restore_intent);
+            hydration
+        });
     }
 
-    fn adopt_prepared_ordinary_archive_navigation(
+    pub(crate) fn prepare_physical_listing(
         &mut self,
-        logical_path: &Path,
+        path: PathBuf,
         payload: collection_navigation::PhysicalHistoryPreflightPayload,
         backing_path: Option<&Path>,
-        history_origin: Option<&FolderNavHistoryTarget>,
+        password_override: Option<String>,
+        restore_intent: StartupListIntent,
         auto_fullscreen: bool,
-        grid_effects: Option<&GridVirtualOpenEffects>,
-        pdf_password_override: Option<String>,
-        close_fullscreen_before_load: bool,
-
-        restore_intent: crate::app::StartupListIntent,
-    ) -> bool {
-        if !matches!(
-            &payload,
-            collection_navigation::PhysicalHistoryPreflightPayload::Zip(_)
-                | collection_navigation::PhysicalHistoryPreflightPayload::PdfPages(_)
-        ) {
-            return false;
-        }
-        let owner = OpenRequestOwner::Navigation;
-        if !self.snapshot_scope_allows_open(logical_path, &owner)
-            || !self.adopt_collection_surface_for_physical_load(
-                logical_path,
-                &owner,
-                history_origin,
-            )
-        {
-            return false;
-        }
-        if auto_fullscreen {
-            self.pending_auto_fs_open = true;
-        }
-        if let Some(effects) = grid_effects {
-            self.commit_grid_virtual_open_effects(logical_path, effects.clone());
-        }
-        if close_fullscreen_before_load {
-            self.close_fullscreen_for_folder_nav_reopen();
-        }
-        match payload {
-            collection_navigation::PhysicalHistoryPreflightPayload::Zip(enumeration) => {
-                let backing = backing_path.unwrap_or(logical_path);
-                self.load_zip_as_folder_prepared_with_logical_source(
-                    backing.to_path_buf(),
-                    enumeration,
-                    backing_path.map(|_| logical_path),
+        full_path_cache_keys: bool,
+    ) -> Option<PreparedPhysicalListing> {
+        let prepared = match payload {
+            collection_navigation::PhysicalHistoryPreflightPayload::Folder(scan) => {
+                let now = std::time::Instant::now();
+                let full_path = full_path_cache_keys;
+                let auto_book = auto_fullscreen
+                    && self.settings.auto_fullscreen_image_folders_enabled()
+                    && self.scanned_folder_is_image_book(&path, &scan);
+                let mut prepared = self.prepare_scanned_folder_listing_with_cache_keys(
+                    path.clone(),
+                    scan,
+                    FolderListingMetrics {
+                        seq: self.input_seq,
+                        started: now,
+                        scan_started: now,
+                        pre_scanned: true,
+                        path_display: String::new(),
+                    },
                     restore_intent.clone(),
+                    full_path,
                 );
-                if backing_path.is_some() {
-                    self.adopt_staged_archive_source_alias(logical_path, backing);
+                prepared.auto_open_image_folder = auto_book;
+                PreparedPhysicalListing::Folder(prepared)
+            }
+            collection_navigation::PhysicalHistoryPreflightPayload::Zip(enumeration) => {
+                let backing = backing_path
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| path.clone());
+                PreparedPhysicalListing::Zip {
+                    prepared: self.prepare_zip_grid(
+                        backing.clone(),
+                        enumeration,
+                        Some(&path),
+                        restore_intent.clone(),
+                    ),
+                    backing,
                 }
-                true
             }
             collection_navigation::PhysicalHistoryPreflightPayload::PdfPages(pages) => {
-                let outcome = self.load_pdf_as_folder_prepared_with_password(
-                    logical_path.to_path_buf(),
+                let source = match crate::pdf_loader::LeasedEpubPath::try_new(path.clone()) {
+                    Ok(source) => source,
+                    Err(reason) => {
+                        self.show_open_admission_refusal(reason.into());
+                        return None;
+                    }
+                };
+                let (items, image_metas, existing_keys) =
+                    Self::build_pdf_page_rows(&path, &pages.pages);
+                PreparedPhysicalListing::Pdf {
+                    path: path.clone(),
+                    source,
+                    items,
+                    image_metas,
+                    existing_keys,
                     pages,
-                    pdf_password_override,
-                    restore_intent.clone(),
-                );
-                matches!(outcome, FolderOpenOutcome::Loaded)
+                    password: password_override.or_else(|| self.pdf_open_password(&path)),
+                }
             }
-            _ => {
-                self.pending_auto_fs_open = false;
-                false
+            _ => return None,
+        };
+        Some(prepared)
+    }
+
+    pub(crate) fn install_prepared_physical_listing(
+        &mut self,
+        prepared: PreparedPhysicalListing,
+        authority: VisibleInstallAuthority<'_>,
+        restore_intent: StartupListIntent,
+        token: PreparedVisibleInstall,
+    ) -> MainListHydration {
+        let seq = self.input_seq;
+        match prepared {
+            PreparedPhysicalListing::Folder(prepared) => {
+                self.install_prepared_scanned_folder_listing(prepared, authority, token)
+            }
+            PreparedPhysicalListing::Zip { backing, prepared } => self.install_prepared_zip_grid(
+                backing,
+                seq,
+                prepared,
+                authority,
+                restore_intent.clone(),
+                token,
+            ),
+            PreparedPhysicalListing::Pdf {
+                path,
+                source,
+                items,
+                image_metas,
+                existing_keys,
+                pages,
+                password,
+            } => {
+                self.prepare_pdf_visible_adoption(&source);
+                let mut hydration = self.install_loading_items_inner(
+                    path,
+                    items,
+                    image_metas,
+                    existing_keys,
+                    Vec::new(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    authority,
+                    token,
+                );
+                if let Some((continuation, _)) = hydration.as_mut() {
+                    continuation.restore_intent = restore_intent.clone();
+                    continuation.first_display_action =
+                        sidecar_restore::FirstDisplayAction::Pdf { pages, password };
+                }
+                hydration
             }
         }
     }
 
-    fn commit_quick_folder_switch(
-        &mut self,
-        request: &PhysicalHistoryTransition,
-        slot: QuickFolderSlotId,
-        payload: collection_navigation::PhysicalHistoryPreflightPayload,
-        backing_path: Option<PathBuf>,
-        pdf_password_override: Option<String>,
-    ) -> bool {
-        let owner = QuickFolderSwitchLoadOwner {
-            source_context: request.source_context,
-            source_surface_generation: request.source_surface_generation,
-            source_items_generation: request.source_items_generation,
-            source_slot: request.source_slot,
-            source_slot_switch_sequence: request.source_slot_switch_sequence,
-            target_slot: slot,
-            target_path: request.path.clone(),
-        };
-        let path = request.path.clone();
-        match payload {
-            collection_navigation::PhysicalHistoryPreflightPayload::Folder(scan) => {
-                return self.load_folder_with_scan_owned(
-                    path,
-                    Some(scan),
-                    OpenRequestOwner::QuickFolderSwitch(owner),
-                    crate::app::StartupListIntent::ExplicitList,
-                );
-            }
-            collection_navigation::PhysicalHistoryPreflightPayload::Zip(enumeration) => {
-                if self.adopt_collection_surface_for_physical_load(
-                    &path,
-                    &OpenRequestOwner::QuickFolderSwitch(owner),
-                    None,
-                ) {
-                    self.load_zip_as_folder_prepared_with_logical_source(
-                        backing_path.clone().unwrap_or_else(|| path.clone()),
-                        enumeration,
-                        backing_path.as_ref().map(|_| path.as_path()),
-                        crate::app::StartupListIntent::ExplicitList,
-                    );
-                    return true;
-                }
-            }
-            collection_navigation::PhysicalHistoryPreflightPayload::PdfPages(pages) => {
-                if self.adopt_collection_surface_for_physical_load(
-                    &path,
-                    &OpenRequestOwner::QuickFolderSwitch(owner),
-                    None,
-                ) {
-                    let outcome = self.load_pdf_as_folder_prepared_with_password(
-                        path,
-                        pages,
-                        pdf_password_override,
-                        crate::app::StartupListIntent::ExplicitList,
-                    );
-                    return matches!(outcome, FolderOpenOutcome::Loaded);
-                }
-            }
-            collection_navigation::PhysicalHistoryPreflightPayload::PdfPasswordRequired
-            | collection_navigation::PhysicalHistoryPreflightPayload::PdfOpenFailure(_)
-            | collection_navigation::PhysicalHistoryPreflightPayload::ZipCached { .. }
-            | collection_navigation::PhysicalHistoryPreflightPayload::ConvertiblePasswordRequired
-            | collection_navigation::PhysicalHistoryPreflightPayload::ConvertibleArchive(_) => {
-                self.show_feedback_toast("[書庫の開封を続けられませんでした]".into());
+    fn rating_physical_destination(
+        &self,
+        rating: &RatingPhysicalLoadOwner,
+        path: &Path,
+    ) -> top_level_grid_view::RatingPhysicalRestore {
+        let mut nav_chain = rating.nav_chain.clone();
+        if rating.intent != RatingPhysicalLoadIntent::Refresh
+            && !nav_chain
+                .last()
+                .is_some_and(|last| crate::folder_tree::path_eq(last, path))
+        {
+            nav_chain.push(path.to_path_buf());
+            if nav_chain.len() > MAX_FOLDER_NAV_STACK {
+                nav_chain.remove(0);
             }
         }
-        false
+        top_level_grid_view::RatingPhysicalRestore {
+            visible_path: path.to_path_buf(),
+            stars: rating.stars,
+            nav_chain,
+            saved_folder: rating.saved_folder.clone(),
+            subfolder_restore: self.rating_view_subfolder_restore.clone(),
+        }
+    }
+
+    fn physical_destination_for_owner(
+        &self,
+        path: &Path,
+        owner: &OpenRequestOwner,
+        rating: Option<&top_level_grid_view::RatingPhysicalRestore>,
+    ) -> FolderNavHistoryTarget {
+        if let Some(rating) = rating {
+            return FolderNavHistoryTarget::RatingPhysical(rating.clone());
+        }
+        match owner {
+            OpenRequestOwner::CollectionGridPhysical(collection) => {
+                FolderNavHistoryTarget::CollectionPhysical(
+                    top_level_grid_view::CollectionGridPhysicalRestore {
+                        root: collection.restore(
+                            self.top_level_grid_view
+                                .collection_session()
+                                .map_or(collection.wanted_revision, |session| {
+                                    session.wanted_revision
+                                }),
+                        ),
+                        root_source_path: collection.root_source_path.clone(),
+                        visible_path: path.to_path_buf(),
+                    },
+                )
+            }
+            OpenRequestOwner::MainGridArchive(archive)
+                if archive.collection_grid_owner.is_some() =>
+            {
+                let collection = archive.collection_grid_owner.as_ref().unwrap();
+                FolderNavHistoryTarget::CollectionPhysical(
+                    top_level_grid_view::CollectionGridPhysicalRestore {
+                        root: top_level_grid_view::CollectionGridRestore {
+                            identity: top_level_grid_view::CollectionGridIdentity {
+                                collection_id: collection.stamp.collection_id,
+                            },
+                            revision_at_open: collection
+                                .accepted_revision
+                                .max(collection.wanted_revision),
+                            viewport_anchor: Some(collection.anchor.clone()),
+                        },
+                        root_source_path: archive.source_path.clone(),
+                        visible_path: path.to_path_buf(),
+                    },
+                )
+            }
+            _ => FolderNavHistoryTarget::Path(path.to_path_buf()),
+        }
+    }
+
+    fn install_admitted_physical_surface(
+        &mut self,
+        path: &Path,
+        owner: &OpenRequestOwner,
+        rating: Option<&top_level_grid_view::RatingPhysicalRestore>,
+    ) {
+        self.clear_meta_undo();
+        crate::zip_loader::clear_nested_cache();
+        self.zip_nav = None;
+        self.cancel_folder_pane_open(PaneOpenRestoreExit::Adopted);
+        if !self.smart_folder_session_owns_load(path) {
+            self.transition_favorite_view_for_path(Some(path));
+        }
+        if let Some(rating) = rating {
+            self.rating_view_stars = rating.stars;
+            self.rating_view_nav_stack = rating.nav_chain.clone();
+            self.rating_view_saved_folder = rating.saved_folder.clone();
+            self.rating_view_subfolder_restore = rating.subfolder_restore.clone();
+            self.top_level_grid_view
+                .replace_surface(top_level_grid_view::TopLevelGridSurface::Folder);
+        } else {
+            match owner {
+                OpenRequestOwner::QuickFolderSwitch(switch) => {
+                    self.active_quick_folder_slot = Some(switch.target_slot);
+                    self.rating_view_nav_stack.clear();
+                    self.rating_view_saved_folder = None;
+                    self.rating_view_subfolder_restore = None;
+                    self.top_level_grid_view
+                        .replace_surface(top_level_grid_view::TopLevelGridSurface::Folder);
+                }
+                OpenRequestOwner::CollectionGridPhysical(collection) => {
+                    self.install_collection_grid_physical_load(collection, path)
+                }
+                OpenRequestOwner::MainGridArchive(owner)
+                    if owner.collection_grid_owner.is_some() =>
+                {
+                    self.install_collection_grid_source_open_owned(
+                        owner.collection_grid_owner.as_ref().unwrap(),
+                        owner.source_path.clone(),
+                    )
+                }
+                _ => {
+                    self.rating_view_nav_stack.clear();
+                    self.rating_view_saved_folder = None;
+                    self.rating_view_subfolder_restore = None;
+                    if !self.smart_folder_session_owns_load(path)
+                        && !self.is_snapshot_active()
+                        && !(self.global_search.active
+                            || self.favsearch.active
+                            || self.tag_view.active)
+                    {
+                        self.top_level_grid_view
+                            .replace_surface(top_level_grid_view::TopLevelGridSurface::Folder);
+                    }
+                }
+            }
+        }
+        if let OpenRequestOwner::MainGridArchive(owner) = owner {
+            self.reading_history_return_from = owner.reading_history_return_from.clone();
+            if owner.suppress_rating_filter {
+                self.maybe_suppress_rating_filter_for_opened_container_path(path);
+            }
+        }
+        if self
+            .current_folder
+            .as_ref()
+            .is_none_or(|current| !crate::folder_tree::path_eq(current, path))
+        {
+            self.stack_mode_requested = false;
+            crate::thumb_loader::bump_catchup_epoch();
+            let _ = crate::pdf_loader::bump_render_context_epoch();
+        }
+        if !self.smart_folder_session_owns_load(path) {
+            self.reconcile_bookmark_return_target_for_folder_load(path);
+        }
     }
 
     fn adopt_staged_archive_source_alias(&mut self, logical_source: &Path, backing: &Path) {
@@ -32249,7 +33683,9 @@ impl App {
             saved_folder: self.rating_view_saved_folder.clone(),
             subfolder_restore: self.rating_view_subfolder_restore.clone(),
         };
-        self.start_rating_physical_restore(restore, None, RatingPhysicalLoadIntent::Explicit);
+        // BS restores a copied parent chain, rather than activating a current source row.
+        // The common Direct operation still records this move only after successful adoption.
+        self.start_rating_physical_restore(restore, None, RatingPhysicalLoadIntent::Restore);
     }
 
     fn select_rating_view_row_for_opened_path(&mut self, path: &Path) {
@@ -32285,45 +33721,7 @@ impl App {
     }
 
     fn rating_navigation_source_is_current(&self, transition: &RatingNavigationTransition) -> bool {
-        if self.projected_viewer_context_id() != transition.source_context
-            || self.top_level_grid_view.generation() != transition.source_surface_generation
-            || self.items_generation != transition.source_items_generation
-            || self.active_quick_folder_slot != transition.source_slot
-            || self.quick_folder_switch_sequence != transition.source_slot_switch_sequence
-        {
-            return false;
-        }
-        if !self.main_folder_history_available() {
-            return matches!(
-                transition.intent,
-                RatingNavigationIntent::Direct { .. } | RatingNavigationIntent::Restore
-            );
-        }
-        let same_history = match transition.source_slot {
-            Some(slot) => {
-                self.quick_folder_workspaces[slot.index()].history
-                    == transition.history_before.quick_folder_workspaces[slot.index()].history
-            }
-            None => {
-                self.folder_nav_back_stack == transition.history_before.back_stack
-                    && self.folder_nav_forward_stack == transition.history_before.forward_stack
-                    && self.suppress_folder_nav_record_once
-                        == transition.history_before.suppress_record_once
-            }
-        };
-        if !same_history {
-            return false;
-        }
-        match &transition.intent {
-            RatingNavigationIntent::Direct { .. } | RatingNavigationIntent::Restore => true,
-            RatingNavigationIntent::Replay { direction, target } => {
-                let head = match direction {
-                    FolderHistoryDirection::Back => self.folder_history_back_target(),
-                    FolderHistoryDirection::Forward => self.folder_history_forward_target(),
-                };
-                head.is_some_and(|head| head == target)
-            }
-        }
+        self.main_list_navigation_is_current(&transition.navigation)
     }
 
     fn poll_staged_rating_navigation(&mut self) {
@@ -32417,61 +33815,90 @@ impl App {
         if !self.rating_navigation_source_is_current(&transition) {
             return;
         }
-        match &transition.intent {
-            RatingNavigationIntent::Direct { from } => {
-                self.record_folder_nav_transition_from_current(
-                    FolderNavHistoryTarget::Rating {
-                        stars: transition.target_stars,
-                    },
-                    from.clone(),
-                );
+        let destination = match &transition.navigation.history {
+            MainHistoryOperation::Replay(plan) => {
+                plan.virtual_current.clone().expect("replay destination")
             }
-            RatingNavigationIntent::Restore => {}
-            RatingNavigationIntent::Replay { direction, target } => {
-                let adopted = match direction {
-                    FolderHistoryDirection::Back => self.navigate_folder_history_back(),
-                    FolderHistoryDirection::Forward => self.navigate_folder_history_forward(),
-                };
-                if adopted.as_ref() != Some(target) {
+            MainHistoryOperation::Restore { route: Some(route) } => FolderNavHistoryEntry::new(
+                FolderNavHistoryTarget::Rating {
+                    stars: transition.target_stars,
+                },
+                route.clone(),
+            ),
+            _ => self.main_list_destination_entry(
+                FolderNavHistoryTarget::Rating {
+                    stars: transition.target_stars,
+                },
+                transition.navigation.source_location.as_ref(),
+                None,
+            ),
+        };
+        let token = match result.prepared.as_ref() {
+            Some(prepared) => match self.prepare_visible_install(
+                &rating_view_synthetic_path(),
+                &prepared.items,
+                None,
+            ) {
+                Ok(token) => Some(token),
+                Err(reason) => {
+                    self.show_open_admission_refusal(reason);
                     return;
                 }
-                self.set_active_folder_nav_suppress_record_once(false);
+            },
+            None => None,
+        };
+        let Some(adoption) = self.prepare_main_list_adoption(transition.navigation, destination)
+        else {
+            return;
+        };
+        self.adopt_main_list_navigation(adoption, |app| {
+            let _ = app.dismiss_snapshot_without_restore();
+            if app.global_search.active {
+                let _ = app.dismiss_global_search_without_restore();
             }
-        }
-        let _ = self.dismiss_snapshot_without_restore();
-        if self.global_search.active {
-            let _ = self.dismiss_global_search_without_restore();
-        }
-        if self.favsearch.active {
-            let _ = self.dismiss_favsearch_without_restore();
-        }
-        if self.tag_view.active {
-            let _ = self.dismiss_tag_view_without_restore();
-        }
-        if self.show_search_bar {
-            self.show_search_bar = false;
-            self.search_query.clear();
-            self.search_filter = None;
-            self.search_filter_origin_folder = None;
-            self.search_has_focus = false;
-            self.search_tag_bridge.clear();
-            self.cancel_search_pending();
-        }
-        self.gamepad_location_picker = None;
-        self.rating_view_stars = transition.target_stars;
-        self.rating_view_sort = transition.target_sort;
-        self.rating_view_saved_folder = transition.saved_folder;
-        self.rating_view_subfolder_restore = transition.subfolder_restore;
-        self.rating_view_nav_stack.clear();
-        self.pending_rating_view_zipdir_open = None;
-        self.reset_details_sort_to_toolbar();
-        self.persist_pending_view_trim_state();
-        self.apply_rating_view_result(result);
-        self.overlay_rating_session_writes_since(read_generation);
-        self.rebuild_visible_indices_after_rating_publication();
-        if let Some(path) = transition.select_opened_path.as_deref() {
-            self.select_rating_view_row_for_opened_path(path);
-        }
+            if app.favsearch.active {
+                let _ = app.dismiss_favsearch_without_restore();
+            }
+            if app.tag_view.active {
+                let _ = app.dismiss_tag_view_without_restore();
+            }
+            if app.show_search_bar {
+                app.show_search_bar = false;
+                app.search_query.clear();
+                app.search_filter = None;
+                app.search_filter_origin_folder = None;
+                app.search_has_focus = false;
+                app.search_tag_bridge.clear();
+                app.cancel_search_pending();
+            }
+            app.gamepad_location_picker = None;
+            app.rating_view_stars = transition.target_stars;
+            app.rating_view_sort = transition.target_sort;
+            app.rating_view_saved_folder = transition.saved_folder;
+            app.rating_view_subfolder_restore = transition.subfolder_restore;
+            app.rating_view_nav_stack.clear();
+            app.pending_rating_view_zipdir_open = None;
+            app.reset_details_sort_to_toolbar();
+            app.persist_pending_view_trim_state();
+            app.rating_view_rows = result.rows;
+            app.rating_view_skipped = result.skipped;
+            let hydration = match (result.prepared, token) {
+                (Some(prepared), Some(token)) => {
+                    app.install_prepared_rating_view_rows_inner(prepared, token)
+                }
+                (None, None) => {
+                    app.install_rating_view_rows();
+                    None
+                }
+                _ => unreachable!("prepared Rating token travels with prepared rows"),
+            };
+            app.overlay_rating_session_writes_since(read_generation);
+            app.rebuild_visible_indices_after_rating_publication();
+            if let Some(path) = transition.select_opened_path.as_deref() {
+                app.select_rating_view_row_for_opened_path(path);
+            }
+            hydration
+        });
     }
 
     pub(crate) fn poll_rating_view(&mut self) {
@@ -32622,22 +34049,55 @@ impl App {
         saved_folder: Option<PathBuf>,
         subfolder_restore: Option<subfolder_expansion::SubfolderExpansionRestoreState>,
     ) {
+        let history = match &intent {
+            RatingNavigationIntent::Direct { .. } => {
+                MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation)
+            }
+            RatingNavigationIntent::Restore => MainHistoryOperation::Restore { route: None },
+            RatingNavigationIntent::Replay { direction, target } => {
+                let entry = match direction {
+                    FolderHistoryDirection::Back => self.folder_history_back_entry(),
+                    FolderHistoryDirection::Forward => self.folder_history_forward_entry(),
+                };
+                let Some(entry) = entry.filter(|entry| &entry.location == target).cloned() else {
+                    return;
+                };
+                let Some(plan) = FolderHistoryPlan::capture(self, *direction, entry) else {
+                    return;
+                };
+                MainHistoryOperation::Replay(Box::new(plan))
+            }
+        };
+        let navigation =
+            self.capture_main_list_navigation(history, self.copied_destination_source_proof());
+        self.start_rating_navigation_owned(
+            stars,
+            intent,
+            saved_folder,
+            subfolder_restore,
+            navigation,
+        );
+    }
+
+    fn start_rating_navigation_owned(
+        &mut self,
+        stars: u8,
+        intent: RatingNavigationIntent,
+        saved_folder: Option<PathBuf>,
+        subfolder_restore: Option<subfolder_expansion::SubfolderExpansionRestoreState>,
+        navigation: MainListNavigation,
+    ) {
         if self.document_open_modal_admission_blocked() {
             return;
         }
         self.cancel_replaced_staged_archive_conversion();
-        self.replace_history_navigation_transition(None);
-        let select_opened_path = matches!(&intent, RatingNavigationIntent::Replay { .. })
+        self.retire_replaced_main_list_requests(Some(MainListRequestOwner::Rating));
+        let select_opened_path = matches!(&navigation.history, MainHistoryOperation::Replay(_))
             .then(|| self.effective_folder())
             .flatten();
         let transition = RatingNavigationTransition {
             intent,
-            history_before: self.folder_nav_history_snapshot(),
-            source_context: self.projected_viewer_context_id(),
-            source_surface_generation: self.top_level_grid_view.generation(),
-            source_items_generation: self.items_generation,
-            source_slot: self.active_quick_folder_slot,
-            source_slot_switch_sequence: self.quick_folder_switch_sequence,
+            navigation,
             target_stars: stars,
             target_sort: self.settings.rating_view_sort.normalized_for_rating_view(),
             target_display_order: self.rating_view_destination_display_order(),
@@ -32786,6 +34246,26 @@ impl App {
         &mut self,
         prepared: crate::rating_view::RatingViewPreparedItems,
     ) {
+        let token = match self.prepare_visible_install(
+            &rating_view_synthetic_path(),
+            &prepared.items,
+            None,
+        ) {
+            Ok(token) => token,
+            Err(reason) => {
+                self.show_open_admission_refusal(reason);
+                return;
+            }
+        };
+        let hydration = self.install_prepared_rating_view_rows_inner(prepared, token);
+        self.hydrate_installed_main_list(hydration);
+    }
+
+    fn install_prepared_rating_view_rows_inner(
+        &mut self,
+        prepared: crate::rating_view::RatingViewPreparedItems,
+        prepared_visible: PreparedVisibleInstall,
+    ) -> MainListHydration {
         let previous_selected_key = self.selected.and_then(|idx| self.rating_path_key(idx));
         let previous_selected = self.rating_view_rebuild_selected_index();
         let retained_details_rated_at_sort = (self.items_are_rating_view
@@ -32797,12 +34277,13 @@ impl App {
         {
             self.rating_view_subfolder_restore = Some(restore_state);
         }
-        self.start_loading_prepared_rating_items(prepared);
+        let hydration = self.install_loading_prepared_rating_items(prepared, prepared_visible);
         self.finish_rating_view_install(
             previous_selected,
             previous_selected_key,
             retained_details_rated_at_sort,
         );
+        hydration
     }
 
     fn install_rating_view_rows(&mut self) {
@@ -33632,6 +35113,41 @@ impl App {
 
         restore_intent: crate::app::StartupListIntent,
     ) {
+        let logical = match &authority {
+            VisibleInstallAuthority::StagedArchive { logical_source }
+            | VisibleInstallAuthority::SmartPhysical { logical_source, .. } => {
+                Some(*logical_source)
+            }
+            _ => None,
+        };
+        let token = match self.prepare_visible_install(&zip_path, &prepared.items, logical) {
+            Ok(token) => token,
+            Err(reason) => {
+                self.show_open_admission_refusal(reason);
+                return;
+            }
+        };
+        let hydration = self.install_prepared_zip_grid(
+            zip_path,
+            input_seq,
+            prepared,
+            authority,
+            restore_intent,
+            token,
+        );
+        self.hydrate_installed_main_list(hydration);
+    }
+
+    fn install_prepared_zip_grid(
+        &mut self,
+        zip_path: PathBuf,
+        input_seq: u64,
+        prepared: PreparedZipGrid,
+        authority: VisibleInstallAuthority<'_>,
+
+        restore_intent: crate::app::StartupListIntent,
+        prepared_visible: PreparedVisibleInstall,
+    ) -> MainListHydration {
         let PreparedZipGrid {
             nav,
             items,
@@ -33641,7 +35157,7 @@ impl App {
         } = prepared;
         let installed_items = items.len();
 
-        self.start_loading_items_inner(
+        let mut hydration = self.install_loading_items_inner(
             zip_path.clone(),
             items,
             image_metas,
@@ -33654,6 +35170,7 @@ impl App {
             None,
             None,
             authority,
+            prepared_visible,
         );
         let archive_key = crate::path_key::normalize_keep_drive(&zip_path);
         if let Some(trace) = self.archive_auto_fs_paint_trace.as_mut()
@@ -33702,6 +35219,31 @@ impl App {
         //   フルスクリーン継続を優先して今回は提案しない (グリッドから開き直すと出る)
         // - グリッドからの自動フルスクリーン予約 (lock なし): FS 予約を取り下げて提案を
         //   出し、変換完了後の自動フルスクリーンへ引き継ぐ (ConvertState.auto_fullscreen)
+        if let Some((continuation, _)) = hydration.as_mut() {
+            continuation.first_display_action = sidecar_restore::FirstDisplayAction::Zip {
+                has_foreign_archives,
+            };
+        }
+        if let Some((continuation, _)) = hydration.as_mut() {
+            continuation.restore_intent = restore_intent;
+        }
+        hydration
+    }
+
+    /// `offer_zip_foreign_archive_conversion` を出してよい状況か (ループ / 多重防止)。
+    /// - キャッシュ ZIP 自身では提案しない (変換出力は非 ZIP アーカイブのファイル
+    ///   エントリを含まないので通常 flag 自体立たないが、手作りの類似 ZIP への防御)
+    /// - RAR 等の変換キャッシュを開いている最中 (`archive_source_override`) も同様
+    /// - 既に別の変換ダイアログが動作中なら出さない
+    /// - ★固定 (snapshot) 中も出さない: キャッシュ ZIP は snapshot 範囲外なので
+    ///   振り替え (`load_folder`) が範囲外ガードでブロックされ、自動フルスクリーン
+    ///   予約だけ消える中途半端な状態になる (Codex R2 P3)。固定解除後に開き直せば
+    ///   通常どおり提案される。
+    fn finish_installed_zip_first_display(
+        &mut self,
+        has_foreign_archives: bool,
+        restore_intent: StartupListIntent,
+    ) {
         let offer_foreign = has_foreign_archives
             && self
                 .zip_nav
@@ -33738,18 +35280,8 @@ impl App {
                 );
             }
         }
-        self.finish_main_list_open(restore_intent);
     }
 
-    /// `offer_zip_foreign_archive_conversion` を出してよい状況か (ループ / 多重防止)。
-    /// - キャッシュ ZIP 自身では提案しない (変換出力は非 ZIP アーカイブのファイル
-    ///   エントリを含まないので通常 flag 自体立たないが、手作りの類似 ZIP への防御)
-    /// - RAR 等の変換キャッシュを開いている最中 (`archive_source_override`) も同様
-    /// - 既に別の変換ダイアログが動作中なら出さない
-    /// - ★固定 (snapshot) 中も出さない: キャッシュ ZIP は snapshot 範囲外なので
-    ///   振り替え (`load_folder`) が範囲外ガードでブロックされ、自動フルスクリーン
-    ///   予約だけ消える中途半端な状態になる (Codex R2 P3)。固定解除後に開き直せば
-    ///   通常どおり提案される。
     fn zip_foreign_offer_applicable(&self, zip_path: &Path) -> bool {
         !crate::archive_cache::is_under_cache_root(zip_path)
             && self.archive_source_override.is_none()
@@ -33772,6 +35304,70 @@ impl App {
         restore_intent: crate::app::StartupListIntent,
     ) {
         if !self.zip_foreign_offer_applicable(zip_path) {
+            return;
+        }
+        if self.main_folder_history_available() {
+            let navigation = self.capture_main_list_navigation(
+                MainHistoryOperation::SameLocation,
+                self.copied_destination_source_proof(),
+            );
+            let owner = self.current_folder_reload_owner(zip_path);
+            let Some(intent) = Self::physical_open_intent(&owner, auto_fullscreen) else {
+                return;
+            };
+            let path = zip_path.to_path_buf();
+            let path_owner = match crate::pdf_loader::LeasedEpubPath::try_new(path.clone()) {
+                Ok(owner) => Some(owner),
+                Err(reason) => {
+                    self.show_open_admission_refusal(reason.into());
+                    return;
+                }
+            };
+            let request_id = NEXT_HISTORY_ARCHIVE_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+            let phase = if let Some(backing_path) = self.try_archive_cache_lookup(zip_path) {
+                let Ok(preflight) =
+                    self.start_physical_history_preflight(backing_path.clone(), None)
+                else {
+                    return;
+                };
+                PhysicalHistoryPhase::ArchivePreflighting {
+                    backing_path,
+                    preflight,
+                }
+            } else {
+                if !self.start_staged_archive_conversion_with_format(
+                    request_id,
+                    zip_path,
+                    crate::archive_converter::ArchiveFormat::Zip,
+                    restore_intent.clone(),
+                ) {
+                    return;
+                }
+                PhysicalHistoryPhase::ArchiveConverting
+            };
+            let request = PhysicalHistoryTransition {
+                request_id,
+                restore_intent,
+                intent,
+                path,
+                path_owner,
+                classified_kind: Some(OpenPathKind::File),
+                phase,
+                navigation,
+                dfs_continuation: None,
+                favsearch_origin: self.favsearch.active,
+                tag_view_origin: self.tag_view.active,
+                global_search_origin: self.global_search.active,
+                grid_open_effects: auto_fullscreen.then(|| GridVirtualOpenEffects {
+                    reading_history_return_from: self.reading_history_return_from.clone(),
+                    suppress_rating_filter: false,
+                    suppress_facet_filter: false,
+                    auto_fullscreen,
+                }),
+            };
+            self.replace_history_navigation_transition(Some(
+                HistoryNavigationTransition::Physical(request),
+            ));
             return;
         }
         // 既にキャッシュがある (開いている間に別経路で変換が完了した等) なら
@@ -33817,6 +35413,51 @@ impl App {
             );
             (items, metas, nav.tree.zip_path.clone())
         };
+        if self.main_folder_history_available() {
+            let Some(source) = self.folder_nav_current_entry() else {
+                return;
+            };
+            let nav = self
+                .zip_nav
+                .as_ref()
+                .expect("ZIP materialization owns its level");
+            let logical = self
+                .archive_source_override
+                .as_deref()
+                .unwrap_or(&nav.tree.zip_path);
+            let mut destination = self.main_list_destination_entry(
+                FolderNavHistoryTarget::Path(logical.to_path_buf()),
+                Some(&source),
+                Some(&nav.current().join("/")),
+            );
+            destination.location = source.location.clone();
+            let operation = if source.route == destination.route {
+                MainHistoryOperation::SameLocation
+            } else {
+                MainHistoryOperation::Restore {
+                    route: Some(destination.route.clone()),
+                }
+            };
+            let navigation = self.capture_main_list_navigation(operation, MainListSourceProof::Row);
+            let Some(adoption) = self.prepare_main_list_adoption(navigation, destination) else {
+                return;
+            };
+            self.adopt_main_list_navigation(adoption, |app| {
+                app.install_zip_current_level(items, metas, zip_path, restore_intent);
+                None
+            });
+        } else {
+            self.install_zip_current_level(items, metas, zip_path, restore_intent);
+        }
+    }
+
+    fn install_zip_current_level(
+        &mut self,
+        items: Vec<GridItem>,
+        metas: Vec<Option<(i64, i64)>>,
+        zip_path: PathBuf,
+        restore_intent: StartupListIntent,
+    ) {
         // 旧レベルの in-flight 検索 / 詳細メタ pending を停止 (idx が付け替わるので無意味)。
         if let Some(pending) = self.search_pending.take() {
             pending.cancel();
@@ -33949,7 +35590,6 @@ impl App {
         self.prewarm_rating_cache();
         // facet filter は visible_indices の構築に直接効くため、ZIP 階層で anchor 外へ
         // 戻った場合は再構築前に親条件を復元しておく。
-        self.maybe_restore_facet_filter_after_zip_level_change();
         // ★ visible_indices を再構築。これがないと旧レベルの stale index が
         // update_keep_range_and_requests で thumbnails[i] を範囲外参照して panic する (Codex P1)。
         self.rebuild_visible_indices();
@@ -34018,26 +35658,15 @@ impl App {
             self.start_rating_physical_zipdir_open(owner, dir_prefix);
             return;
         }
-        let rollback = self
-            .rating_view_nav_context_active()
-            .then(|| self.folder_nav_history_snapshot());
         self.pending_rating_view_zipdir_open = Some(PendingRatingViewZipDirOpen {
             source_path: zip_path.clone(),
             dir_prefix,
         });
-        match self.load_folder_or_convert_archive(zip_path) {
-            FolderOpenOutcome::Ignored | FolderOpenOutcome::Refused(_) => {
-                self.pending_rating_view_zipdir_open = None;
-                if let Some(snapshot) = rollback {
-                    self.restore_folder_nav_history(snapshot);
-                }
-            }
-            FolderOpenOutcome::Classifying | FolderOpenOutcome::ConversionDialogOpened => {
-                if let Some(snapshot) = rollback {
-                    self.attach_archive_convert_nav_history_rollback(snapshot);
-                }
-            }
-            FolderOpenOutcome::Loaded => {}
+        if matches!(
+            self.load_folder_or_convert_archive(zip_path),
+            FolderOpenOutcome::Ignored | FolderOpenOutcome::Refused(_)
+        ) {
+            self.pending_rating_view_zipdir_open = None;
         }
     }
 
@@ -34375,6 +36004,10 @@ impl App {
         let next = match transition {
             HistoryNavigationTransition::Physical(mut request) => {
                 if saved_sibling {
+                    request.navigation.history = MainHistoryOperation::Direct(
+                        crate::app::DirectNavigationPurpose::Navigation,
+                    );
+                    request.restore_intent = StartupListIntent::ExplicitList;
                     request.path = path;
                     request.dfs_continuation = None;
                     self.clear_pending_folder_nav_steps();
@@ -34423,7 +36056,9 @@ impl App {
                 };
                 HistoryNavigationTransition::Collection(request)
             }
-            HistoryNavigationTransition::Collection(request) => {
+            HistoryNavigationTransition::Collection(mut request) => {
+                request.navigation.history =
+                    MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation);
                 // Save PDF chooses a sibling path outside the EPUB entry. It is an explicit
                 // physical destination; the pending EPUB replay stack head remains untouched.
                 HistoryNavigationTransition::Physical(PhysicalHistoryTransition {
@@ -34439,13 +36074,7 @@ impl App {
                         preflight,
                         pdf_password_submission: None,
                     },
-                    history_before: request.history_before,
-                    source_context: request.source_context,
-                    source_surface_generation: request.source_surface_generation,
-                    source_items_generation: request.source_items_generation,
-                    source_slot: request.source_slot,
-                    source_slot_switch_sequence: request.source_slot_switch_sequence,
-                    source_location: request.source_location,
+                    navigation: request.navigation,
                     dfs_continuation: None,
                     favsearch_origin: self.favsearch.active,
                     tag_view_origin: self.tag_view.active,
@@ -34586,10 +36215,114 @@ impl App {
         {
             self.stack_mode_requested = false;
             if !self.navigation_scope.is_detached_physical() {
-                self.clear_archive_convert_nav_history_rollback();
                 crate::thumb_loader::bump_catchup_epoch();
                 let _ = crate::pdf_loader::bump_render_context_epoch();
             }
+        }
+    }
+
+    fn adopt_direct_pdf_rows(
+        &mut self,
+        path: &Path,
+        owner: &OpenRequestOwner,
+        source: &crate::pdf_loader::LeasedEpubPath,
+        adoption: Option<Box<DirectPdfAdoption>>,
+        items: Vec<GridItem>,
+        image_metas: Vec<Option<(i64, i64)>>,
+        existing_keys: HashSet<String>,
+        action: sidecar_restore::FirstDisplayAction,
+        intent: StartupListIntent,
+    ) -> bool {
+        if !self.open_request_owner_is_current(path, owner)
+            || !self.snapshot_scope_allows_open(path, owner)
+        {
+            return false;
+        }
+        let token = match self.prepare_visible_install(path, &items, Some(path)) {
+            Ok(token) => token,
+            Err(reason) => {
+                self.show_open_admission_refusal(reason);
+                return false;
+            }
+        };
+        let admitted = if let Some(adoption) = adoption {
+            let rating = match owner {
+                OpenRequestOwner::RatingPhysical(rating) => {
+                    Some(self.rating_physical_destination(rating, path))
+                }
+                _ => None,
+            };
+            let location = self.physical_destination_for_owner(path, owner, rating.as_ref());
+            let destination =
+                self.main_list_requested_destination(&adoption.navigation, location, Some(""));
+            let Some(admitted) = self.prepare_main_list_adoption(adoption.navigation, destination)
+            else {
+                return false;
+            };
+            Some((admitted, adoption.grid_open_effects))
+        } else {
+            None
+        };
+        let search_origin = (
+            self.favsearch.active,
+            self.tag_view.active,
+            self.global_search.active,
+        );
+        let install = move |app: &mut Self| {
+            app.finish_direct_pdf_visible_adoption(path, owner);
+            let rating = match owner {
+                OpenRequestOwner::RatingPhysical(rating) => {
+                    Some(app.rating_physical_destination(rating, path))
+                }
+                _ => None,
+            };
+            if !app.navigation_scope.is_detached_physical() {
+                app.install_admitted_physical_surface(path, owner, rating.as_ref());
+            }
+            if let OpenRequestOwner::Bookmark(owner) = owner {
+                app.begin_bookmark_page_wait(owner);
+            }
+            app.prepare_pdf_visible_adoption(source);
+            let mut hydration = app.install_loading_items_inner(
+                path.to_path_buf(),
+                items,
+                image_metas,
+                existing_keys,
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                VisibleInstallAuthority::Ordinary,
+                token,
+            );
+            if let Some((continuation, _)) = hydration.as_mut() {
+                continuation.restore_intent = intent;
+                continuation.first_display_action = action;
+            }
+            if !app.navigation_scope.is_detached_physical() {
+                app.commit_staged_search_navigation_effects(
+                    path,
+                    search_origin.0,
+                    search_origin.1,
+                    search_origin.2,
+                );
+            }
+            hydration
+        };
+        if let Some((admitted, effects)) = admitted {
+            self.adopt_main_list_navigation(admitted, move |app| {
+                if let Some(effects) = effects {
+                    app.commit_grid_virtual_open_effects(path, effects);
+                }
+                install(app)
+            })
+        } else {
+            let hydration = install(self);
+            self.hydrate_installed_main_list(hydration);
+            true
         }
     }
 
@@ -34599,9 +36332,42 @@ impl App {
         prepared_pages: Option<crate::pdf_loader::PdfEnumerateResult>,
         owner: OpenRequestOwner,
         password_override: Option<String>,
-        history_origin: Option<Option<FolderNavHistoryTarget>>,
+        navigation: Option<MainListNavigation>,
+        restore_intent: StartupListIntent,
+    ) -> FolderOpenOutcome {
+        self.load_pdf_as_folder_with_prepared_pages_and_restore(
+            pdf_path,
+            prepared_pages,
+            owner,
+            password_override,
+            navigation,
+            restore_intent,
+            None,
+        )
+    }
+
+    pub(crate) fn load_pdf_as_folder_owned_with_restore(
+        &mut self,
+        path: PathBuf,
+        owner: OpenRequestOwner,
+        intent: StartupListIntent,
+        restore: Option<crate::ui_dialogs::epub_convert::EpubOpenRestore>,
+    ) -> FolderOpenOutcome {
+        self.load_pdf_as_folder_with_prepared_pages_and_restore(
+            path, None, owner, None, None, intent, restore,
+        )
+    }
+
+    fn load_pdf_as_folder_with_prepared_pages_and_restore(
+        &mut self,
+        pdf_path: PathBuf,
+        prepared_pages: Option<crate::pdf_loader::PdfEnumerateResult>,
+        owner: OpenRequestOwner,
+        password_override: Option<String>,
+        navigation: Option<MainListNavigation>,
 
         restore_intent: crate::app::StartupListIntent,
+        restore_override: Option<crate::ui_dialogs::epub_convert::EpubOpenRestore>,
     ) -> FolderOpenOutcome {
         let restore_intent = restore_intent.for_book();
 
@@ -34620,6 +36386,11 @@ impl App {
                 return FolderOpenOutcome::Refused(FolderOpenRefusal::Admission(reason));
             }
         };
+        if !self.open_request_owner_is_current(&pdf_path, &owner)
+            || !self.snapshot_scope_allows_open(&pdf_path, &owner)
+        {
+            return FolderOpenOutcome::Ignored;
+        }
         let mut previous_pdf_enumerate = self.pdf_enumerate_pending.take();
         let mut retained_source = None;
         if let Some(previous) = previous_pdf_enumerate.as_mut() {
@@ -34644,20 +36415,32 @@ impl App {
                 }
             }
         }
-        let mut open_restore =
+        let navigation = navigation.or_else(|| {
+            (prepared_pages.is_none()
+                && restore_override.is_none()
+                && self.main_folder_history_available())
+            .then(|| {
+                let proof = self.copied_open_source_proof(&owner);
+                self.capture_main_list_navigation(
+                    MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation),
+                    proof,
+                )
+            })
+        });
+        let mut open_restore = restore_override.or_else(|| {
             prepared_pages
                 .is_none()
                 .then(|| crate::ui_dialogs::epub_convert::EpubOpenRestore {
                     logical: pdf_path.clone(),
-                    history: Some(self.folder_nav_history_snapshot()),
                     address_before: Some(self.address.clone()),
-                    adoption: history_origin.clone().map(|history_origin| {
+                    adoption: navigation.map(|navigation| {
                         Box::new(DirectPdfAdoption {
-                            history_origin,
+                            navigation,
                             grid_open_effects: None,
                         })
                     }),
-                });
+                })
+        });
         crate::logger::log(format!(
             "=== load_pdf_as_folder: {} ===",
             pdf_path.display()
@@ -34773,47 +36556,28 @@ impl App {
             let adoption = open_restore
                 .as_mut()
                 .and_then(|restore| restore.adoption.take());
-            if !self.adopt_collection_surface_for_physical_load(
+            let (items, image_metas, existing_keys) =
+                Self::build_pdf_meta_placeholder_rows(&pdf_path, page_count, mtime, file_size);
+            if !self.adopt_direct_pdf_rows(
                 &pdf_path,
                 &owner,
-                adoption
-                    .as_ref()
-                    .and_then(|adoption| adoption.history_origin.as_ref()),
+                &candidate_source,
+                adoption,
+                items,
+                image_metas,
+                existing_keys,
+                sidecar_restore::FirstDisplayAction::WarmPdf,
+                restore_intent.clone(),
             ) {
                 if let Some(restore) = open_restore {
                     self.restore_epub_open(restore);
                 }
                 self.pdf_enumerate_pending = retained_source.map(|source| *source);
-                if let Some((
-                    _,
-                    _,
-                    _,
-                    _,
-                    _,
-                    PdfOpenPhase::CommittedVerification { placeholder_count },
-                    _,
-                )) = self.pdf_enumerate_pending.as_ref()
-                {
-                    self.pdf_placeholder_count = Some(*placeholder_count);
-                }
                 return FolderOpenOutcome::Ignored;
             }
-            self.finish_direct_pdf_visible_adoption(&pdf_path, &owner);
-            self.prepare_pdf_visible_adoption(&candidate_source);
-            let (items, image_metas, existing_keys) =
-                Self::build_pdf_meta_placeholder_rows(&pdf_path, page_count, mtime, file_size);
-            self.start_loading_items(
-                pdf_path.clone(),
-                items,
-                image_metas,
-                existing_keys,
-                Vec::new(),
-                None,
-            );
             #[cfg(all(windows, feature = "test-script"))]
             crate::test_script::record_pdf_warm_adoption(&pdf_path);
             self.cancel_folder_pane_open(PaneOpenRestoreExit::Adopted);
-            self.finish_main_list_open(restore_intent.clone());
             self.pdf_placeholder_count = Some(page_count);
             if is_epub && crate::perf::is_enabled() {
                 let key = crate::grid_item::pdf_file_perf_key(&pdf_path);
@@ -35134,6 +36898,18 @@ impl App {
 
         restore_intent: crate::app::StartupListIntent,
     ) {
+        self.finish_pdf_enumerate_success_inner(pdf_path, password, pages, restore_intent, false);
+    }
+
+    fn finish_pdf_enumerate_success_inner(
+        &mut self,
+        pdf_path: PathBuf,
+        password: Option<String>,
+        pages: crate::pdf_loader::PdfEnumerateResult,
+
+        restore_intent: crate::app::StartupListIntent,
+        rows_already_installed: bool,
+    ) {
         let actual_count = pages.pages.len() as u32;
         crate::logger::log(format!("  pdf: {actual_count} pages"));
         self.pdf_current_password = password.clone();
@@ -35242,22 +37018,23 @@ impl App {
         // page_count と一致するか確認。完全一致なら grid 再構築は skip して
         // Ctrl+↑↓ deferred fullscreen 等の tail 処理だけ実行する。
         let placeholder_count = self.pdf_placeholder_count.take();
-        let need_rebuild = match placeholder_count {
-            Some(n) if n == actual_count => {
-                crate::logger::log(format!(
-                    "  pdf meta cache verified: count={actual_count} (no grid rebuild)"
-                ));
-                false
-            }
-            Some(n) => {
-                crate::logger::log(format!(
-                    "  pdf meta cache mismatch: cached={n} actual={actual_count} for {} (rebuilding grid)",
-                    pdf_path.display()
-                ));
-                true
-            }
-            None => true, // cache miss / placeholder 未作成
-        };
+        let need_rebuild = !rows_already_installed
+            && match placeholder_count {
+                Some(n) if n == actual_count => {
+                    crate::logger::log(format!(
+                        "  pdf meta cache verified: count={actual_count} (no grid rebuild)"
+                    ));
+                    false
+                }
+                Some(n) => {
+                    crate::logger::log(format!(
+                        "  pdf meta cache mismatch: cached={n} actual={actual_count} for {} (rebuilding grid)",
+                        pdf_path.display()
+                    ));
+                    true
+                }
+                None => true, // cache miss / placeholder 未作成
+            };
 
         if need_rebuild {
             let (items, image_metas, existing_keys) =
@@ -35285,6 +37062,8 @@ impl App {
                     &[("placeholder", serde_json::Value::from(false))],
                 );
             }
+        }
+        if need_rebuild || rows_already_installed {
             if self.settings.follow_document_reading_direction {
                 let defaults = SpreadRestoreDefaults::for_book(&self.settings);
                 if let Err(error) = self.apply_spread_for_key_with_document_direction(
@@ -35435,48 +37214,40 @@ impl App {
         }
 
         match result {
-            Ok(pages) => {
-                if let Some(mut adoption) = open_restore
-                    .as_mut()
-                    .and_then(|restore| restore.adoption.take())
-                {
-                    if !self.adopt_collection_surface_for_physical_load(
+            Ok(pages) => match phase {
+                PdfOpenPhase::ColdCandidate {
+                    retained_source, ..
+                } => {
+                    let adoption = open_restore
+                        .as_mut()
+                        .and_then(|restore| restore.adoption.take());
+                    let (items, image_metas, existing_keys) =
+                        Self::build_pdf_page_rows(&pdf_path, &pages.pages);
+                    if !self.adopt_direct_pdf_rows(
                         &pdf_path,
                         &owner,
-                        adoption.history_origin.as_ref(),
+                        &candidate_source,
+                        adoption,
+                        items,
+                        image_metas,
+                        existing_keys,
+                        sidecar_restore::FirstDisplayAction::Pdf { pages, password },
+                        restore_intent.clone(),
                     ) {
                         if let Some(restore) = open_restore {
                             self.restore_epub_open(restore);
                         }
-                        self.resume_retained_pdf_source(phase);
-                        self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
+                        self.pdf_enumerate_pending = retained_source.map(|source| *source);
                         return;
                     }
-                    self.finish_direct_pdf_visible_adoption(&pdf_path, &owner);
-                    if let Some(effects) = adoption.grid_open_effects.take() {
-                        self.commit_grid_virtual_open_effects(&pdf_path, effects);
-                    }
-                    self.cancel_folder_pane_open(PaneOpenRestoreExit::Adopted);
                 }
-                match phase {
-                    PdfOpenPhase::ColdCandidate {
-                        retained_source, ..
-                    } => {
-                        drop(retained_source);
-                        self.prepare_pdf_visible_adoption(&candidate_source);
-                    }
-                    PdfOpenPhase::CommittedVerification { .. } => {
-                        // The placeholder grid has already adopted this PDF and started
-                        // its thumbnail workers. Verification must not cancel them.
-                    }
-                }
-                self.finish_pdf_enumerate_success(
+                PdfOpenPhase::CommittedVerification { .. } => self.finish_pdf_enumerate_success(
                     pdf_path,
                     password,
                     pages,
                     restore_intent.clone(),
-                );
-            }
+                ),
+            },
             Err(e) => {
                 let failure = PdfOpenFailure::from(e.clone());
                 let route = self.route_pdf_open_failure(
@@ -35746,20 +37517,15 @@ impl App {
                 self.pdf_password_pending_save =
                     save.then(|| (request.path.to_path_buf(), password));
                 self.resume_fs_navigation_sequence_after_password();
-                let outcome = self.load_pdf_as_folder_owned(
+                let outcome = self.load_pdf_as_folder_owned_with_restore(
                     request.path.to_path_buf(),
                     continuation.open_owner,
                     continuation.restore_intent,
+                    Some(continuation.restore),
                 );
                 if !matches!(outcome, FolderOpenOutcome::Loaded) {
                     self.pdf_password_pending_save = None;
-                    self.restore_epub_open(continuation.restore);
                     return false;
-                }
-                if let Some(pending) = self.pdf_enumerate_pending.as_mut()
-                    && crate::folder_tree::path_eq(&pending.0, &request.path)
-                {
-                    pending.4 = Some(continuation.restore);
                 }
                 return true;
             }
@@ -36280,6 +38046,26 @@ impl App {
         &mut self,
         prepared: crate::rating_view::RatingViewPreparedItems,
     ) {
+        let token = match self.prepare_visible_install(
+            &rating_view_synthetic_path(),
+            &prepared.items,
+            None,
+        ) {
+            Ok(token) => token,
+            Err(reason) => {
+                self.show_open_admission_refusal(reason);
+                return;
+            }
+        };
+        let hydration = self.install_loading_prepared_rating_items(prepared, token);
+        self.hydrate_installed_main_list(hydration);
+    }
+
+    fn install_loading_prepared_rating_items(
+        &mut self,
+        prepared: crate::rating_view::RatingViewPreparedItems,
+        prepared_visible: PreparedVisibleInstall,
+    ) -> MainListHydration {
         let crate::rating_view::RatingViewPreparedItems {
             video_thumb_overrides,
             items,
@@ -36294,7 +38080,7 @@ impl App {
             tags_cache,
         } = prepared;
         self.video_thumb_overrides = video_thumb_overrides;
-        self.start_loading_items_inner(
+        self.install_loading_items_inner(
             rating_view_synthetic_path(),
             items,
             image_metas,
@@ -36309,7 +38095,8 @@ impl App {
             VisibleInstallAuthority::Rating {
                 stars: self.rating_view_stars,
             },
-        );
+            prepared_visible,
+        )
     }
 
     pub(crate) fn save_leaving_rating_grid_position(&mut self) {
@@ -36397,6 +38184,75 @@ impl App {
         catalog_existing_keys: std::collections::HashSet<String>,
         video_items: Vec<(usize, PathBuf, u64)>,
         folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
+        prepared_subfolder: Option<subfolder_expansion::PreparedSubfolderMetadata>,
+        prepared_page_edits: Option<(
+            page_edit_snapshot::PageEditSnapshot,
+            page_edit_snapshot::PageEditProjection,
+        )>,
+        prepared_pin_map: Option<
+            std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+        >,
+        prepared_rating_tags: Option<(
+            std::collections::HashMap<usize, u8>,
+            std::collections::HashMap<String, Vec<String>>,
+        )>,
+        prepared_folder_rating: Option<(std::collections::HashMap<usize, u8>, u64, f64)>,
+        authority: VisibleInstallAuthority<'_>,
+    ) {
+        let logical = match &authority {
+            VisibleInstallAuthority::StagedArchive { logical_source }
+            | VisibleInstallAuthority::SmartPhysical { logical_source, .. } => {
+                Some(*logical_source)
+            }
+            _ => None,
+        };
+        let prepared_visible = match self.prepare_visible_install(&source_path, &items, logical) {
+            Ok(prepared) => prepared,
+            Err(reason) => {
+                self.show_open_admission_refusal(reason);
+                return;
+            }
+        };
+        if let VisibleInstallAuthority::SmartPhysical {
+            definition_id,
+            load_path,
+            ..
+        } = &authority
+            && (self.navigation_scope.is_detached_physical()
+                || !crate::folder_tree::path_eq(&source_path, load_path)
+                || self
+                    .top_level_grid_view
+                    .smart_folder_session()
+                    .is_none_or(|session| session.definition_id() != *definition_id))
+        {
+            return;
+        }
+        let hydration = self.install_loading_items_inner(
+            source_path,
+            items,
+            image_metas,
+            catalog_existing_keys,
+            video_items,
+            folder_signature,
+            prepared_subfolder,
+            prepared_page_edits,
+            prepared_pin_map,
+            prepared_rating_tags,
+            prepared_folder_rating,
+            authority,
+            prepared_visible,
+        );
+        self.hydrate_installed_main_list(hydration);
+    }
+
+    fn install_loading_items_inner(
+        &mut self,
+        source_path: PathBuf,
+        items: Vec<GridItem>,
+        image_metas: Vec<Option<(i64, i64)>>,
+        catalog_existing_keys: std::collections::HashSet<String>,
+        video_items: Vec<(usize, PathBuf, u64)>,
+        folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
         mut prepared_subfolder: Option<subfolder_expansion::PreparedSubfolderMetadata>,
         prepared_page_edits: Option<(
             page_edit_snapshot::PageEditSnapshot,
@@ -36411,17 +38267,8 @@ impl App {
         )>,
         prepared_folder_rating: Option<(std::collections::HashMap<usize, u8>, u64, f64)>,
         authority: VisibleInstallAuthority<'_>,
-    ) {
-        // An earlier accepted load owns the sole restore continuation.  Results from sibling
-        // folder/PDF/ZIP workers that were already in flight must not replace its generation and
-        // then bypass recovery through the ordinary first-display tail.
-        if self.sidecar_restore_active() {
-            crate::logger::log(format!(
-                "sidecar restore discarded concurrent load result path={}",
-                source_path.display()
-            ));
-            return;
-        }
+        prepared_visible: PreparedVisibleInstall,
+    ) -> MainListHydration {
         self.page_edit_snapshot = None;
         let detached_physical = self.navigation_scope.is_detached_physical();
         let smart_open_path = match &authority {
@@ -36429,51 +38276,13 @@ impl App {
             VisibleInstallAuthority::StagedArchive { logical_source } => {
                 Some((*logical_source).to_path_buf())
             }
-            VisibleInstallAuthority::SmartPhysical {
-                request_id,
-                definition_id,
-                logical_source,
-                load_path,
-            } => {
-                if detached_physical
-                    || !crate::folder_tree::path_eq(&source_path, load_path)
-                    || self
-                        .top_level_grid_view
-                        .smart_folder_session()
-                        .is_none_or(|session| session.definition_id() != *definition_id)
-                {
-                    crate::logger::log(format!(
-                        "smart visible install rejected request={request_id} path={}",
-                        source_path.display()
-                    ));
-                    return;
-                }
+            VisibleInstallAuthority::SmartPhysical { logical_source, .. } => {
                 Some((*logical_source).to_path_buf())
             }
         };
-        // Acquire the new visible owner's lease while the staged owner still exists.
-        // A failed acquisition means deletion won the coordinator before this install.
-        let visible_logical = smart_open_path.as_deref().unwrap_or(&source_path);
-        let display_epub_source = if items.iter().any(|item| {
-            matches!(item, GridItem::PdfPage { pdf_path, .. }
-                if crate::folder_tree::path_eq(pdf_path, visible_logical))
-        }) {
-            let source =
-                match crate::pdf_loader::LeasedEpubPath::try_new(visible_logical.to_path_buf()) {
-                    Ok(source) => source,
-                    Err(reason) => {
-                        crate::logger::log(format!(
-                            "epub open: visible install deferred by cache deletion: {}",
-                            visible_logical.display()
-                        ));
-                        self.show_open_admission_refusal(reason.into());
-                        return;
-                    }
-                };
-            source.has_epub_lease().then_some(source)
-        } else {
-            None
-        };
+        let PreparedVisibleInstall {
+            display_epub_source,
+        } = prepared_visible;
         let preserve_smart_folder_session = match &authority {
             VisibleInstallAuthority::Ordinary
             | VisibleInstallAuthority::Rating { .. }
@@ -36805,6 +38614,11 @@ impl App {
             }
             self.converted_archive_cache_paths =
                 std::mem::take(&mut metadata.converted_archive_cache_paths);
+            // Prepared/reused metadata can outlive a cache deletion. Publish only sources
+            // revalidated by this installed list's existing asynchronous source owner.
+            ConvertedArchiveSourceState::invalidate_cached_paths(
+                &mut self.converted_archive_cache_paths,
+            );
             self.folder_pin_map = std::mem::take(&mut metadata.folder_pin_map);
         }
         // 準備 worker が sparse metadata を完成させているため、未登録キーの同期 DB
@@ -37069,6 +38883,9 @@ impl App {
         // the App-global restore owner before returning to the event loop.
         let continuation = sidecar_restore::SidecarLoadContinuation {
             restore_intent: StartupListIntent::InternalInstall,
+            first_display_action: sidecar_restore::FirstDisplayAction::None,
+            navigation_after_hydration: None,
+            audio_art_prune: None,
             auto_aspect_seed: match authority {
                 VisibleInstallAuthority::Rating { stars } => self
                     .top_level_grid_view
@@ -37091,10 +38908,7 @@ impl App {
             cancel,
             restore_started_at: std::time::Instant::now(),
         };
-        if let Err(continuation) = self.begin_sidecar_restore(continuation, has_prepared_aggregate)
-        {
-            self.resume_loading_items_after_sidecar(continuation);
-        }
+        Some((continuation, has_prepared_aggregate))
     }
 
     fn resume_loading_items_after_sidecar(
@@ -37103,6 +38917,9 @@ impl App {
     ) {
         let sidecar_restore::SidecarLoadContinuation {
             restore_intent,
+            first_display_action,
+            navigation_after_hydration,
+            audio_art_prune,
             auto_aspect_seed,
             source_path,
             source_is_directory: _,
@@ -37469,6 +39286,11 @@ impl App {
             catalog_arc,
             self.folder_thumb_pin_db.clone(),
         );
+        if let (Some(request), Some(queue)) = (audio_art_prune, self.heavy_io_queue.as_ref()) {
+            let (mutex, wakeup) = &**queue;
+            mutex.lock().unwrap().push(request);
+            wakeup.notify_one();
+        }
         if !video_items.is_empty() {
             // Phase 8.B': ピン留めフレームを path → WebP の map で snapshot し
             // worker thread に渡す (= grid サムネ最優先で使用される)。
@@ -37579,7 +39401,8 @@ impl App {
             // 保存する (通常フォルダ / ネイティブ ZIP/PDF では override が無く source_path と
             // 一致するので挙動不変)。recent_folders は open_archive_via_cache が既に元
             // アーカイブを記録済み。
-            self.settings.last_folder = Some(self.effective_folder().unwrap_or(source_path));
+            self.settings.last_folder =
+                Some(self.effective_folder().unwrap_or(source_path.clone()));
             self.sync_quick_folder_settings();
             self.settings.save();
         }
@@ -37611,8 +39434,78 @@ impl App {
         if !detached_physical {
             self.maybe_start_content_identity_detection();
         }
+        if matches!(
+            first_display_action,
+            sidecar_restore::FirstDisplayAction::AutoFullscreenFolder
+        ) {
+            let new_idx = if self.settings.book_open_resume.resumes() {
+                self.resume_page_for_container()
+            } else {
+                None
+            }
+            .or_else(|| self.find_fullscreen_nav_target_filtered(false));
+            if let Some(new_idx) = new_idx {
+                #[cfg(windows)]
+                {
+                    self.fs_open_intent_from_grid = true;
+                }
+                self.open_fullscreen(new_idx, HistoryTrigger::UserChosen);
+                self.selected = Some(new_idx);
+                self.scroll_to_selected = true;
+                self.update_last_selected_image();
+            }
+        }
+        if let sidecar_restore::FirstDisplayAction::Zip {
+            has_foreign_archives,
+        } = first_display_action
+        {
+            self.finish_installed_zip_first_display(has_foreign_archives, restore_intent.clone());
+        }
+        if matches!(
+            first_display_action,
+            sidecar_restore::FirstDisplayAction::WarmPdf
+        ) {
+            self.finish_main_list_open(restore_intent.clone());
+        }
+        if let sidecar_restore::FirstDisplayAction::Pdf { pages, password } = first_display_action {
+            self.finish_pdf_enumerate_success_inner(
+                source_path.clone(),
+                password,
+                pages,
+                restore_intent.clone(),
+                true,
+            );
+        }
         self.finish_main_list_open(restore_intent);
+        if let Some(action) = navigation_after_hydration {
+            self.finish_main_list_after_hydration(action);
+        }
     }
+
+    fn finish_main_list_after_hydration(&mut self, action: MainListAfterHydration) {
+        match action {
+            MainListAfterHydration::JumpSelection(selection) => {
+                self.finish_jump_to_physical_folder_selection(selection)
+            }
+            MainListAfterHydration::CollectionNavigation { owner, ctx } => owner.finish(self, &ctx),
+            MainListAfterHydration::RequiredFullscreen {
+                target,
+                history_trigger,
+            } => self.finish_required_fullscreen_load(target, history_trigger),
+            MainListAfterHydration::Dfs { continuation, ctx } => {
+                if continuation.fullscreen {
+                    let _ = self.reopen_fullscreen_after_folder_nav_load(
+                        &ctx,
+                        continuation.restore_video_tile,
+                        continuation.resume_slideshow,
+                        continuation.history_trigger,
+                    );
+                }
+                self.chain_folder_nav_if_pending(continuation.queued_steps, continuation.mode);
+            }
+        }
+    }
+
     fn set_items_generation(&mut self, items_generation: u64) {
         if self.items_generation != items_generation {
             self.reading_history_sources_pending
@@ -37722,6 +39615,7 @@ impl App {
         refresh_container_metadata: bool,
     ) {
         debug_assert_eq!(items.len(), image_metas.len());
+        self.retire_bookmark_browser_build_for_current_context();
         if !self.navigation_scope.is_detached_physical() {
             self.cancel_content_identity_detection();
         }
@@ -37818,7 +39712,9 @@ impl App {
             let state = if self.image_metas.get(idx).and_then(|meta| *meta).is_some() {
                 ConvertedArchiveSourceState::Pending
             } else {
-                ConvertedArchiveSourceState::Unavailable
+                ConvertedArchiveSourceState::Unavailable {
+                    logical_source: None,
+                }
             };
             self.converted_archive_cache_paths
                 .entry(archive_key)
@@ -37828,6 +39724,31 @@ impl App {
                     }
                 })
                 .or_insert(state);
+        }
+    }
+
+    /// Cache maintenance changed the shared ZIP store, not the source archives or pins.
+    /// Discard pre-delete replies and recheck cached sources through the existing worker.
+    fn invalidate_converted_archive_cached_sources(&mut self) {
+        Self::invalidate_converted_archive_source_owner(
+            &mut self.converted_archive_cache_paths,
+            &mut self.converted_archive_cache_paths_pending,
+            &mut self.top_level_grid_view,
+        );
+        self.invalidate_converted_archive_sources_in_parked_contexts();
+    }
+
+    fn invalidate_converted_archive_source_owner(
+        paths: &mut HashMap<String, ConvertedArchiveSourceState>,
+        pending: &mut Option<ConvertedArchiveCachePathsPending>,
+        grid: &mut top_level_grid_view::TopLevelGridView,
+    ) {
+        if let Some(pending) = pending.take() {
+            pending.cancel();
+        }
+        ConvertedArchiveSourceState::invalidate_cached_paths(paths);
+        if let Some(session) = grid.smart_folder_session_mut() {
+            session.invalidate_cached_sources();
         }
     }
 
@@ -37895,8 +39816,12 @@ impl App {
                 continue;
             }
             let Some((mtime, file_size)) = self.image_metas.get(idx).and_then(|meta| *meta) else {
-                self.converted_archive_cache_paths
-                    .insert(archive_key, ConvertedArchiveSourceState::Unavailable);
+                self.converted_archive_cache_paths.insert(
+                    archive_key,
+                    ConvertedArchiveSourceState::Unavailable {
+                        logical_source: None,
+                    },
+                );
                 continue;
             };
             let candidate = ConvertedArchiveCandidate {
@@ -38206,7 +40131,9 @@ impl App {
                     if let Some(state) = self.converted_archive_cache_paths.get_mut(&key)
                         && matches!(state, ConvertedArchiveSourceState::Pending)
                     {
-                        *state = ConvertedArchiveSourceState::Unavailable;
+                        *state = ConvertedArchiveSourceState::Unavailable {
+                            logical_source: None,
+                        };
                     }
                 }
                 crate::logger::log(format!("archive_cache_peek spawn failed: {e}"));
@@ -40632,7 +42559,7 @@ impl App {
         if let Some(ref mut filter) = self.search_filter {
             let new_filter: std::collections::HashSet<usize> =
                 filter.iter().filter_map(|&i| shift(i)).collect();
-            *filter = new_filter;
+            filter.matches = new_filter;
         }
 
         // adjustment_page_params / mask_pages / conceal_pages は DB 復元済みの
@@ -45024,17 +46951,26 @@ impl App {
     }
 
     pub(crate) fn open_bookmark_browser(&mut self) {
-        self.clear_bookmark_view_return_state();
-        self.record_folder_nav_transition(&bookmark_view_synthetic_path());
-        self.bookmark_view_sort = crate::bookmark_browser::BookmarkViewSort::default();
-        // レーティング一覧と同じ規約 (§1.143): ビューの既定ソートを入れ直す場所で、
-        // 詳細表示の列ソートの所有権も戻す。
-        self.reset_details_sort_to_toolbar();
-        self.enter_bookmark_view();
+        self.adopt_synthetic_surface(
+            FolderNavHistoryTarget::Path(bookmark_view_synthetic_path()),
+            MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation),
+            None,
+        );
     }
 
     /// 動画・音声・本のブックマークを、通常のメイン一覧 surface へ読み込む。
     pub(crate) fn enter_bookmark_view(&mut self) {
+        self.adopt_synthetic_surface(
+            FolderNavHistoryTarget::Path(bookmark_view_synthetic_path()),
+            MainHistoryOperation::Restore { route: None },
+            None,
+        );
+    }
+
+    fn install_bookmark_view_surface(
+        &mut self,
+        token: PreparedVisibleInstall,
+    ) -> MainListHydration {
         self.capture_main_list_restore_cursor();
         // Embedded viewer close transitions the explicit origin state to Restoring. A detached
         // context never calls this: its main context already owns the mounted bookmark grid.
@@ -45042,15 +46978,15 @@ impl App {
         self.gamepad_location_picker = None;
         if self.global_search.active {
             self.global_search.saved_folder = None;
-            self.close_global_search();
+            let _ = self.dismiss_global_search_without_restore();
         }
         if self.favsearch.active {
             self.favsearch.saved_folder = None;
-            self.close_favsearch();
+            let _ = self.dismiss_favsearch_without_restore();
         }
         if self.tag_view.active {
             self.tag_view.saved_folder = None;
-            self.close_tag_view();
+            let _ = self.dismiss_tag_view_without_restore();
         }
         if self.show_search_bar {
             self.show_search_bar = false;
@@ -45065,28 +47001,61 @@ impl App {
             pending.cancel();
         }
         self.bookmark_browser_rows.clear();
-        self.start_loading_items(
+        let hydration = self.install_loading_items_inner(
             bookmark_view_synthetic_path(),
             Vec::new(),
             Vec::new(),
-            std::collections::HashSet::new(),
+            HashSet::new(),
             Vec::new(),
             None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            VisibleInstallAuthority::Ordinary,
+            token,
         );
         self.items_are_bookmark_view = true;
         self.top_level_grid_view
             .replace_surface(top_level_grid_view::TopLevelGridSurface::Bookmarks);
         self.address = "ブックマークを読み込み中…".to_string();
         self.refresh_bookmark_browser();
+        hydration
+    }
+
+    fn retire_bookmark_browser_build_for_current_context(&mut self) {
+        if self.projected_viewer_context_id() == self.viewer_context_main() {
+            // Dropping the one owner cancels both running work and a queued completion.
+            self.bookmark_browser_pending = None;
+        }
+    }
+
+    fn bookmark_browser_build_is_current(&self, pending: &BookmarkBrowserBuild) -> bool {
+        self.items_are_bookmark_view
+            && pending.switch_sequence == self.quick_folder_switch_sequence
+            && self.smart_folder_source_lease().as_ref() == Some(&pending.source)
     }
 
     pub(crate) fn refresh_bookmark_browser(&mut self) {
-        if let Some(pending) = self.bookmark_browser_pending.take() {
-            pending.cancel();
+        // This App-global worker belongs to main, never to a temporarily mounted viewer.
+        if self.projected_viewer_context_id() != self.viewer_context_main() {
+            return;
         }
-        self.bookmark_browser_pending = Some(crate::bookmark_browser::spawn_build(
-            self.settings.thumbnail_source_discovery_snapshot(),
-        ));
+        self.retire_bookmark_browser_build_for_current_context();
+        if !self.items_are_bookmark_view {
+            return;
+        }
+        let Some(source) = self.smart_folder_source_lease() else {
+            return;
+        };
+        self.bookmark_browser_pending = Some(Box::new(BookmarkBrowserBuild {
+            source,
+            switch_sequence: self.quick_folder_switch_sequence,
+            worker: crate::bookmark_browser::spawn_build(
+                self.settings.thumbnail_source_discovery_snapshot(),
+            ),
+        }));
     }
 
     pub(crate) fn delete_bookmark_browser_rows(
@@ -45134,17 +47103,42 @@ impl App {
     }
 
     fn install_bookmark_view_rows(&mut self) {
+        self.install_bookmark_view_rows_with_sources(self.bookmark_browser_rows.clone(), None);
+    }
+
+    fn install_bookmark_view_rows_with_sources(
+        &mut self,
+        mut rows: Vec<crate::bookmark_browser::BookmarkBrowserRow>,
+        sources: Option<HashMap<String, PathBuf>>,
+    ) {
+        if self.projected_viewer_context_id() != self.viewer_context_main() {
+            return;
+        }
+        let (items, image_metas) = crate::bookmark_browser::sort_and_materialize_rows(
+            &mut rows,
+            self.bookmark_view_sort,
+            &self.settings.grid_display_order,
+        );
+        let Ok(token) = self.prepare_visible_install(&bookmark_view_synthetic_path(), &items, None)
+        else {
+            return;
+        };
         let previous_selected = self.selected;
         let previous_key = previous_selected
             .and_then(|idx| self.bookmark_browser_rows.get(idx))
             .map(crate::bookmark_browser::BookmarkBrowserRow::stable_key);
         let return_grid = self.take_bookmark_restore_grid();
-        // 登録日時順のときはカテゴリ再配置を通さない (§1.142、レーティング一覧と同じ規約)。
-        let (items, image_metas) = crate::bookmark_browser::sort_and_materialize_rows(
-            &mut self.bookmark_browser_rows,
-            self.bookmark_view_sort,
-            &self.settings.grid_display_order,
-        );
+        // Publication starts only after admission succeeds for the owning Bookmark surface.
+        self.bookmark_browser_rows = rows;
+        if let Some(sources) = sources {
+            self.video_thumb_overrides = sources;
+        }
+        // A sort reprojects this same owner. Carry its live build through the item install,
+        // then rebind the native surface lease; another surface's build is never carried.
+        let continuing_build = self
+            .bookmark_browser_pending
+            .take()
+            .filter(|pending| self.bookmark_browser_build_is_current(pending));
         let installed_keys: Vec<_> = self
             .bookmark_browser_rows
             .iter()
@@ -45166,17 +47160,31 @@ impl App {
             })
             .collect();
         let existing_keys = std::collections::HashSet::new();
-        self.start_loading_items(
+        let hydration = self.install_loading_items_inner(
             bookmark_view_synthetic_path(),
             items,
             image_metas,
             existing_keys,
             video_items,
             None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            VisibleInstallAuthority::Ordinary,
+            token,
         );
+        self.hydrate_installed_main_list(hydration);
         self.items_are_bookmark_view = true;
         self.top_level_grid_view
             .replace_surface(top_level_grid_view::TopLevelGridSurface::Bookmarks);
+        if let Some(mut pending) = continuing_build
+            && let Some(source) = self.smart_folder_source_lease()
+        {
+            pending.source = source;
+            self.bookmark_browser_pending = Some(pending);
+        }
         self.address = "ブックマーク".to_string();
         for (idx, image) in self
             .bookmark_browser_rows
@@ -45332,6 +47340,27 @@ impl App {
         ctx: &egui::Context,
         row: &crate::bookmark_browser::BookmarkBrowserRow,
     ) {
+        let navigation = self.main_folder_history_available().then(|| {
+            self.capture_main_list_navigation(
+                MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation),
+                self.copied_destination_source_proof(),
+            )
+        });
+        self.open_bookmark_browser_row_classified_with_navigation(ctx, row, navigation);
+    }
+
+    fn open_bookmark_browser_row_classified_with_navigation(
+        &mut self,
+        ctx: &egui::Context,
+        row: &crate::bookmark_browser::BookmarkBrowserRow,
+        navigation: Option<MainListNavigation>,
+    ) {
+        if navigation
+            .as_ref()
+            .is_some_and(|nav| !self.main_list_navigation_is_current(nav))
+        {
+            return;
+        }
         if let Some(previous_request_id) = self
             .bookmark_open_pending
             .as_ref()
@@ -45450,16 +47479,37 @@ impl App {
                     return;
                 }
                 self.bookmark_open_pending = Some(pending);
-                self.start_startup_open_path_resolve(
+                let navigation = navigation.map(|mut navigation| {
+                    let StartupOpenPathOwner::Bookmark(owner) = self
+                        .startup_open_path_owner(StartupOpenPathSource::Bookmark)
+                        .expect("accepted bookmark request")
+                    else {
+                        unreachable!()
+                    };
+                    navigation.source_proof = MainListSourceProof::Bookmark(owner);
+                    navigation
+                });
+                self.start_startup_open_path_resolution_owned_with_navigation(
                     bookmark.container_path.clone(),
                     StartupOpenPathSource::Bookmark,
                     ctx,
+                    navigation,
                 );
             }
         }
     }
 
     pub(crate) fn poll_bookmark_browser(&mut self, ctx: &egui::Context) {
+        if self.projected_viewer_context_id() != self.viewer_context_main() {
+            return;
+        }
+        if self
+            .bookmark_browser_pending
+            .as_ref()
+            .is_some_and(|pending| !self.bookmark_browser_build_is_current(pending))
+        {
+            self.retire_bookmark_browser_build_for_current_context();
+        }
         // Delete is a DB writer accepted before the sidecar modal. It must reach its ordinary
         // terminal before the restore transaction starts, while build/open results below retain
         // their exact owners until the modal ends. Keep the normal non-modal ordering (build then
@@ -45488,7 +47538,6 @@ impl App {
                     let mut rows = prepared.rows;
                     let source_map_unchanged =
                         self.video_thumb_overrides == prepared.video_thumb_overrides;
-                    self.video_thumb_overrides = prepared.video_thumb_overrides;
                     rows.retain(|row| {
                         !matches!(&row.item, GridItem::PdfFile(path) if self.settings.epub_file_handling_ignores_path(path))
                     });
@@ -45512,10 +47561,10 @@ impl App {
                             "[bookmark-open] bookmark grid refresh unchanged; keep mounted grid",
                         );
                     } else {
-                        self.bookmark_browser_rows = rows;
-                    }
-                    if self.items_are_bookmark_view && !grid_content_unchanged {
-                        self.install_bookmark_view_rows();
+                        self.install_bookmark_view_rows_with_sources(
+                            rows,
+                            Some(prepared.video_thumb_overrides),
+                        );
                     }
                 }
                 Err(err) => {
@@ -46617,6 +48666,14 @@ impl App {
             }
         };
         self.archive_cache_maint_pending = None;
+        if matches!(
+            &msg,
+            crate::cache_maintenance::ArchiveMaintResult::DeletedSelected { .. }
+                | crate::cache_maintenance::ArchiveMaintResult::DeletedMissing { .. }
+                | crate::cache_maintenance::ArchiveMaintResult::DeletedAll { .. }
+        ) {
+            self.invalidate_converted_archive_cached_sources();
+        }
         match msg {
             crate::cache_maintenance::ArchiveMaintResult::Rows {
                 entries,
@@ -50497,54 +52554,13 @@ impl App {
                                 return None;
                             }
                             let owner = self.main_grid_archive_open_owner(idx, &pf);
-                            let deferred_archive = self.will_stage_archive_navigation(&pf, &owner);
-                            let search_rollback = if self.favsearch.active
-                                || self.tag_view.active
-                                || self.rating_view_nav_context_active()
-                            {
-                                Some(self.folder_nav_history_snapshot())
-                            } else {
-                                None
-                            };
-                            if self.favsearch.active && !deferred_archive {
-                                self.favsearch.nav_stack.push(pf.clone());
-                            }
-                            if self.tag_view.active && !deferred_archive {
-                                self.record_tag_view_nav_open(&pf);
-                            }
-                            let open_outcome = self
+                            let _open_outcome = self
                                 .load_folder_or_convert_archive_with_auto_fullscreen_owned(
                                     pf,
                                     auto_fs,
                                     owner,
                                     crate::app::StartupListIntent::container_open(auto_fs),
                                 );
-                            match (open_outcome, search_rollback) {
-                                (FolderOpenOutcome::ConversionDialogOpened, Some(snapshot))
-                                    if !deferred_archive =>
-                                {
-                                    self.attach_archive_convert_nav_history_rollback(snapshot);
-                                }
-                                (
-                                    FolderOpenOutcome::Ignored | FolderOpenOutcome::Refused(_),
-                                    Some(snapshot),
-                                ) => {
-                                    self.restore_folder_nav_history(snapshot);
-                                }
-                                _ => {}
-                            }
-                            if self.favsearch.active
-                                && matches!(open_outcome, FolderOpenOutcome::Loaded)
-                                && !deferred_archive
-                            {
-                                self.update_favsearch_address();
-                            }
-                            if self.tag_view.active
-                                && matches!(open_outcome, FolderOpenOutcome::Loaded)
-                                && !deferred_archive
-                            {
-                                self.update_tag_view_address();
-                            }
                         }
                         Some(GridItem::SearchContainer { path, kind, .. }) => {
                             // Ctrl+G 結果ビュー (Aggregated) でコンテナを Enter
@@ -50554,7 +52570,6 @@ impl App {
                             // ★コンテナを開いた時、内部画像が未評価で空表示にならないよう
                             // フィルタを一時解除する (Codex P2)。
                             self.maybe_suppress_rating_filter_for_opened_container_path(&p);
-                            self.maybe_suppress_facet_filter_for_opened_container_path(&p);
                             self.drill_into_container(p, is_zip);
                             return None;
                         }
@@ -50573,7 +52588,6 @@ impl App {
                             // ★付きの本を絞り込み中に開くと中身が空表示になるのを防ぐ
                             // (Codex P2)。enter 前に抑制を仕込む。
                             self.maybe_suppress_rating_filter_for_opened_zip_book(idx);
-                            self.maybe_suppress_facet_filter_for_opened_zip_book(idx);
                             self.zip_nav_enter(&dp);
                         }
                         // ファイル名スタック (v2.0.0): 集約グリッドのセルは上の
@@ -51221,12 +53235,9 @@ impl App {
         self.keymap.consume_context_shortcuts_help_action(ctx)
     }
 
-    /// Commit a winning context-menu jump before dispatching its destination.
-    ///
-    /// Search/read-history rows cannot remain mounted after their typed surface has been
-    /// dismissed: a slow scan, read error, replacement, or archive-conversion cancel would
-    /// otherwise expose those stale rows as an ordinary Folder surface. Install an empty
-    /// generation first, then let the request-owned folder scan or archive lifecycle replace it.
+    /// Dispatch a winning context-menu jump with its source and success-only exit intent.
+    /// The source rows remain owned and visible during classification, scan and conversion;
+    /// the common adoption boundary dismisses a temporary view only when usable rows install.
     fn begin_context_jump_to_folder(
         &mut self,
         request: crate::ui_dialogs::context_menu::JumpToFolderRequest,
@@ -51266,32 +53277,6 @@ impl App {
             return None;
         }
 
-        self.dismiss_source_for_jump_to_folder(&request);
-        let destination_label = request.destination.path().to_string_lossy().to_string();
-
-        self.top_level_grid_view
-            .replace_surface(top_level_grid_view::TopLevelGridSurface::Folder);
-        self.install_prepared_aggregate_items(Vec::new(), Vec::new());
-        self.invalidate_idx_state_and_queues();
-        self.visible_indices.clear();
-        self.details_order.clear();
-        self.details_order_revision = self.details_order_revision.wrapping_add(1);
-        self.details_tag_prewarm_indices.clear();
-        self.search_filter = None;
-        self.selected = None;
-        // This winning typed request supersedes legacy basename hints from an older
-        // navigation.  In particular, a failed/cancelled scan must not let such a hint
-        // escape into the next unrelated folder load.
-        self.select_after_load = None;
-        self.scroll_offset_y = 0.0;
-        self.scroll_to_selected = false;
-        self.pending_grid_scroll = None;
-        self.display_epub_source = None;
-        self.current_folder = None;
-        self.archive_source_override = None;
-        self.address = destination_label;
-        self.empty_items_reason = None;
-
         match request.destination {
             JumpToFolderDestination::PhysicalDirectory(path) => {
                 self.start_folder_open_scan(
@@ -51308,7 +53293,25 @@ impl App {
                     request.selection,
                     crate::ui_dialogs::context_menu::JumpToFolderSelection::None
                 ));
-                Some(path)
+                if self.main_folder_history_available() {
+                    let navigation = self.capture_main_list_navigation(
+                        MainHistoryOperation::Direct(DirectNavigationPurpose::ExitTemporaryView {
+                            selection: request.selection,
+                        }),
+                        self.copied_destination_source_proof(),
+                    );
+                    self.open_direct_navigation_target(
+                        path,
+                        None,
+                        OpenRequestOwner::Navigation,
+                        Some(navigation),
+                        None,
+                        StartupListIntent::ExplicitList,
+                    );
+                    None
+                } else {
+                    Some(path)
+                }
             }
         }
     }
@@ -51342,6 +53345,30 @@ impl App {
         selection: crate::ui_dialogs::context_menu::JumpToFolderSelection,
         origin: Option<top_level_grid_view::CollectionGridPhysicalLoadOwner>,
     ) {
+        self.apply_jump_to_physical_folder_ready_with_navigation(
+            path, scan, selection, origin, None,
+        );
+    }
+
+    fn apply_jump_to_physical_folder_ready_with_navigation(
+        &mut self,
+        path: PathBuf,
+        scan: ScannedDir,
+        selection: crate::ui_dialogs::context_menu::JumpToFolderSelection,
+        origin: Option<top_level_grid_view::CollectionGridPhysicalLoadOwner>,
+        navigation: Option<MainListNavigation>,
+    ) {
+        let navigation = navigation.or_else(|| {
+            self.main_folder_history_available().then(|| {
+                self.capture_main_list_navigation(
+                    MainHistoryOperation::Direct(DirectNavigationPurpose::ExitTemporaryView {
+                        selection: selection.clone(),
+                    }),
+                    self.copied_destination_source_proof(),
+                )
+            })
+        });
+        let native_selection = navigation.is_none();
         if let Some(origin) = origin.as_ref() {
             if !self.collection_jump_origin_is_current(&path, &selection, origin) {
                 if self.collection_grid_context_id() == origin.stamp.context_id {
@@ -51366,19 +53393,41 @@ impl App {
             // A legacy basename hint must not override the exact source after adoption.
             // Restore it if an unexpected load refusal leaves the root mounted.
             let previous_hint = self.select_after_load.take();
-            if self.load_folder_with_scan_owned(
-                path,
-                Some(scan),
-                OpenRequestOwner::Navigation,
-                crate::app::StartupListIntent::ExplicitList,
+            if matches!(
+                self.load_folder_with_scan_owned_outcome_and_effects_classified_with_navigation(
+                    path,
+                    Some(scan),
+                    OpenRequestOwner::Navigation,
+                    None,
+                    Some(OpenPathKind::Directory),
+                    crate::app::StartupListIntent::ExplicitList,
+                    navigation,
+                ),
+                FolderOpenOutcome::Loaded
             ) {
-                self.finish_jump_to_physical_folder_selection(selection);
+                if native_selection {
+                    self.finish_jump_to_physical_folder_selection(selection);
+                }
             } else {
                 self.select_after_load = previous_hint;
             }
         } else {
-            self.load_folder_with_scan(path, Some(scan));
-            self.finish_jump_to_physical_folder_selection(selection);
+            if matches!(
+                self.load_folder_with_scan_owned_outcome_and_effects_classified_with_navigation(
+                    path,
+                    Some(scan),
+                    OpenRequestOwner::Navigation,
+                    None,
+                    Some(OpenPathKind::Directory),
+                    StartupListIntent::ExplicitList,
+                    navigation,
+                ),
+                FolderOpenOutcome::Loaded
+            ) {
+                if native_selection {
+                    self.finish_jump_to_physical_folder_selection(selection);
+                }
+            }
         }
     }
 
@@ -51455,6 +53504,13 @@ impl App {
         );
     }
 
+    fn copied_destination_source_proof(&self) -> MainListSourceProof {
+        // The destination and exact selection are owned paths. Same-query result refreshes
+        // may replace rows; another surface/query/context still loses this native lease.
+        self.smart_folder_source_lease()
+            .map_or(MainListSourceProof::Row, MainListSourceProof::Surface)
+    }
+
     fn start_folder_open_scan(&mut self, path: PathBuf, purpose: FolderOpenScanPurpose) {
         self.start_folder_open_scan_with_restore(path, purpose, None);
     }
@@ -51476,11 +53532,31 @@ impl App {
         // Candidate, detached and fullscreen scans may target another viewer context; a refresh
         // does not express a new open. Retire only the proven main-context pane intent here.
         let mut epub_restore = inherited_restore;
-        if !matches!(
-            &purpose,
-            FolderOpenScanPurpose::CurrentViewOrderRefresh { .. }
-        ) {
-            self.retire_staged_smart_navigation_for_independent_intent();
+        if self.main_folder_history_available()
+            && matches!(
+                purpose,
+                FolderOpenScanPurpose::PaneNavigation
+                    | FolderOpenScanPurpose::JumpToPhysicalFolder { .. }
+                    | FolderOpenScanPurpose::RequiredFullscreenTarget { .. }
+            )
+        {
+            self.retire_replaced_main_list_requests(Some(MainListRequestOwner::Pane));
+            if let Some(request_id) =
+                self.startup_open_path_resolve_pending
+                    .as_ref()
+                    .and_then(|pending| match &pending.owner {
+                        StartupOpenPathOwner::Bookmark(owner) => {
+                            #[cfg(windows)]
+                            if owner.detached_lease.is_some() {
+                                return None;
+                            }
+                            Some(owner.request_id)
+                        }
+                        _ => None,
+                    })
+            {
+                self.cancel_bookmark_open_request(request_id, "main_scan_replaced_bookmark");
+            }
         }
         // 旧 pending を破棄 (連打で最後のクリックだけ生かす)。
         let previous = self.cancel_folder_pane_open(
@@ -51492,6 +53568,39 @@ impl App {
         );
         debug_assert!(epub_restore.is_none() || previous.is_none());
         epub_restore = epub_restore.or(previous);
+        let navigation = if self.main_folder_history_available()
+            && !matches!(
+                purpose,
+                FolderOpenScanPurpose::DetachedFolder | FolderOpenScanPurpose::DetachedImage { .. }
+            ) {
+            let operation = if matches!(
+                purpose,
+                FolderOpenScanPurpose::CurrentViewOrderRefresh { .. }
+            ) {
+                MainHistoryOperation::SameLocation
+            } else if let FolderOpenScanPurpose::JumpToPhysicalFolder { selection, .. } = &purpose {
+                MainHistoryOperation::Direct(DirectNavigationPurpose::ExitTemporaryView {
+                    selection: selection.clone(),
+                })
+            } else {
+                MainHistoryOperation::Direct(DirectNavigationPurpose::Navigation)
+            };
+            let proof = if !matches!(
+                purpose,
+                FolderOpenScanPurpose::CurrentViewOrderRefresh { .. }
+                    | FolderOpenScanPurpose::GridFolderCandidate {
+                        collection_owner: Some(_),
+                        ..
+                    }
+            ) {
+                self.copied_destination_source_proof()
+            } else {
+                MainListSourceProof::Row
+            };
+            Some(self.capture_main_list_navigation(operation, proof))
+        } else {
+            None
+        };
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_w = Arc::clone(&cancel);
         let (tx, rx) = mpsc::channel();
@@ -51520,6 +53629,7 @@ impl App {
             rx,
             purpose,
             epub_restore,
+            navigation,
         });
         if let Some(trace) = self
             .folder_pane_open_pending
@@ -51657,6 +53767,14 @@ impl App {
             stale.cancel_with_diagnostic("detached_loading_lease_stale");
             return None;
         }
+        if pending
+            .navigation
+            .as_ref()
+            .is_some_and(|nav| !self.main_list_navigation_is_current(nav))
+        {
+            self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
+            return None;
+        }
         match pending.rx.try_recv() {
             Ok(scan) => {
                 let pending = self.folder_pane_open_pending.take().unwrap();
@@ -51665,6 +53783,7 @@ impl App {
                     scan,
                     purpose: pending.purpose,
                     epub_restore: pending.epub_restore,
+                    navigation: pending.navigation,
                 })
             }
             Err(mpsc::TryRecvError::Empty) => {
@@ -51801,6 +53920,7 @@ impl App {
                 scan,
                 collection_owner: None,
                 epub_restore: ready.epub_restore,
+                navigation: ready.navigation,
             }),
             FolderOpenScanPurpose::GridFolderCandidate {
                 collection_owner,
@@ -51864,7 +53984,6 @@ impl App {
                         )
                     }) {
                         self.maybe_suppress_rating_filter_for_opened_container(idx);
-                        self.maybe_suppress_facet_filter_for_opened_container(idx);
                     }
                     // If the user changed from always-new to full-feature mode during a slow
                     // scan, preserve the current full-feature auto-open policy.
@@ -51879,6 +53998,7 @@ impl App {
                         scan,
                         collection_owner,
                         epub_restore: None,
+                        navigation: ready.navigation,
                     });
                 }
 
@@ -51919,7 +54039,13 @@ impl App {
                 None
             }
             FolderOpenScanPurpose::JumpToPhysicalFolder { selection, origin } => {
-                self.apply_jump_to_physical_folder_ready(ready.path, scan, selection, origin);
+                self.apply_jump_to_physical_folder_ready_with_navigation(
+                    ready.path,
+                    scan,
+                    selection,
+                    origin,
+                    ready.navigation,
+                );
                 None
             }
             FolderOpenScanPurpose::RequiredFullscreenTarget {
@@ -51934,6 +54060,7 @@ impl App {
                     target,
                     history_trigger,
                     navigation_purpose,
+                    ready.navigation,
                 );
                 None
             }
@@ -51976,6 +54103,7 @@ impl App {
                     None,
                     Some(OpenPathKind::Directory),
                     crate::app::StartupListIntent::PreservePresentation,
+                    None,
                 ),
                 FolderOpenOutcome::Loaded
             );
@@ -52105,6 +54233,7 @@ impl App {
                     target,
                     history_trigger,
                     navigation_purpose,
+                    ready.navigation,
                 );
                 DetachedPhysicalFolderOpenPoll::Applied
             }
@@ -52250,53 +54379,13 @@ impl App {
                     return None;
                 }
                 let owner = self.main_grid_archive_open_owner(idx, &path);
-                let deferred_archive = self.will_stage_archive_navigation(&path, &owner);
-                let search_rollback = if self.favsearch.active
-                    || self.tag_view.active
-                    || self.rating_view_nav_context_active()
-                {
-                    Some(self.folder_nav_history_snapshot())
-                } else {
-                    None
-                };
-                if self.favsearch.active && !deferred_archive {
-                    self.favsearch.nav_stack.push(path.clone());
-                }
-                if self.tag_view.active && !deferred_archive {
-                    self.record_tag_view_nav_open(&path);
-                }
-                let open_outcome = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                let _open_outcome = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
                     path,
                     auto_fs,
                     owner,
                     crate::app::StartupListIntent::container_open(auto_fs),
                 );
-                match (open_outcome, search_rollback) {
-                    (FolderOpenOutcome::ConversionDialogOpened, Some(snapshot))
-                        if !deferred_archive =>
-                    {
-                        self.attach_archive_convert_nav_history_rollback(snapshot);
-                    }
-                    (
-                        FolderOpenOutcome::Ignored | FolderOpenOutcome::Refused(_),
-                        Some(snapshot),
-                    ) => {
-                        self.restore_folder_nav_history(snapshot);
-                    }
-                    _ => {}
-                }
-                if self.favsearch.active
-                    && matches!(open_outcome, FolderOpenOutcome::Loaded)
-                    && !deferred_archive
-                {
-                    self.update_favsearch_address();
-                }
-                if self.tag_view.active
-                    && matches!(open_outcome, FolderOpenOutcome::Loaded)
-                    && !deferred_archive
-                {
-                    self.update_tag_view_address();
-                }
+
                 None
             }
             _ => unreachable!("explicit container mode is gated above"),
@@ -60171,6 +62260,26 @@ impl App {
 
     /// Decide before Collection history or transient-state mutation. A locked detached media
     /// navigation cannot give its context to a new Collection until its own transition ends.
+    pub(crate) fn collection_main_context_change_allowed(
+        &self,
+        collection_id: crate::collection_store::CollectionId,
+    ) -> bool {
+        if self.collection_root_installed_binding_matches(collection_id)
+            || self.fullscreen_idx.is_none()
+        {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            !(self.fs_nav_is_locked()
+                && self.active_detached_media_requires_main_context_transfer())
+        }
+        #[cfg(not(windows))]
+        {
+            true
+        }
+    }
+
     pub(crate) fn prepare_collection_main_context_change(
         &mut self,
         collection_id: crate::collection_store::CollectionId,
@@ -64661,7 +66770,7 @@ impl App {
     }
 
     /// DB / bookmarkなど外部snapshotの更新で、現在mount中のcontext-owned表示集合だけを
-    /// 再計算する。`facet_filter_scope`とsuppressionはApp-globalなので、detached/pausedを
+    /// 再計算する。`facet_navigation`はAppのmain専用ownerなので、detached/pausedを
     /// 一時mountする経路ではnavigation扱いのscope同期を行わない。
     fn rebuild_visible_indices_preserving_facet_scope(&mut self) {
         self.rebuild_visible_indices_impl(false, false);
@@ -64734,9 +66843,7 @@ impl App {
         self.facet_place_counts_cache = None;
         self.facet_ai_model_counts_cache = None;
         self.facet_ai_tool_counts_cache = None;
-        if sync_facet_scope {
-            self.sync_facet_filter_scope();
-        }
+        if sync_facet_scope {}
         let search_filter = self.search_filter.clone();
         // Codex P1-2 fix: effective_rating_filter() で ★一時解除中は [true;6] が返るので
         // 表示は全 ON 相当になる。旧版は settings.rating_filter を書き換えて同じ効果を
@@ -64901,58 +67008,6 @@ impl App {
             self.checked.retain(|idx| vi.binary_search(idx).is_ok());
         }
         self.ensure_selected_visible_or_first();
-    }
-
-    fn sync_facet_filter_scope(&mut self) {
-        let scope = self.effective_folder();
-        if self.facet_filter_scope == scope {
-            return;
-        }
-        let previous_scope = self.facet_filter_scope.clone();
-        self.facet_filter_scope = scope;
-        self.update_facet_filter_suppression_for_scope_change(previous_scope);
-    }
-
-    fn update_facet_filter_suppression_for_scope_change(
-        &mut self,
-        previous_scope: Option<PathBuf>,
-    ) {
-        let current = self.facet_filter_scope.clone();
-        if previous_scope != current {
-            self.clear_place_facet_for_scope_change();
-        }
-        self.restore_facet_filter_suppression_for_path(current.as_deref());
-
-        if !self.facet_filter_active() {
-            return;
-        }
-        let (Some(prev), Some(cur)) = (previous_scope.as_ref(), current.as_ref()) else {
-            return;
-        };
-        if prev != cur && path_in_subtree_ci(cur, prev) {
-            self.suppress_current_facet_filter_at(
-                cur.clone(),
-                "親の絞り込みを退避しました (戻ると復元)".to_string(),
-            );
-        }
-    }
-
-    fn clear_place_facet_for_scope_change(&mut self) {
-        self.settings.facet_filter.place_keys.clear();
-        for suppression in &mut self.facet_filter_suppression_stack {
-            suppression.saved_filter.place_keys.clear();
-        }
-        self.facet_filter_suppression_stack
-            .retain(|suppression| suppression.saved_filter.is_active());
-    }
-
-    pub(crate) fn restore_facet_filter_suppression_for_path(&mut self, current: Option<&Path>) {
-        while let Some(top) = self.facet_filter_suppression_stack.last() {
-            if current.is_some_and(|cur| path_in_subtree_ci(cur, &top.anchor)) {
-                break;
-            }
-            self.restore_facet_filter_suppression();
-        }
     }
 
     pub(crate) fn facet_candidate_indices(&mut self, ignore: FacetField) -> Vec<usize> {
@@ -66484,13 +68539,34 @@ impl App {
     /// スレッドを spawn し、結果は `poll_search` で受け取る。連打/新クエリで
     /// 既存検索をキャンセルできるよう `SearchPending.cancel` を立てる。
     pub(crate) fn execute_search(&mut self, ctx: &egui::Context) {
+        let submitted = Arc::new(LocalSearchSubmission {
+            query: self.search_query.clone(),
+            target: self.search_target.clone(),
+            or_mode: self.search_or_mode,
+        });
+        self.execute_submitted_local_search(ctx, submitted);
+    }
+
+    fn submitted_local_search(&self) -> Option<Arc<LocalSearchSubmission>> {
+        self.search_pending
+            .as_ref()
+            .map(|pending| &pending.submitted)
+            .or_else(|| self.search_filter.as_ref().map(|filter| &filter.submitted))
+            .cloned()
+    }
+
+    fn execute_submitted_local_search(
+        &mut self,
+        ctx: &egui::Context,
+        submitted: Arc<LocalSearchSubmission>,
+    ) {
         // 既存の in-flight 検索をキャンセル (新クエリ / 再 Enter)。
         if let Some(pending) = self.search_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
 
         // クエリ構文: space = AND / `-word` = NOT / `"..."` = フレーズ (`-"..."` も可)。
-        let tokens = crate::search_query::parse(&self.search_query);
+        let tokens = crate::search_query::parse(&submitted.query);
         if tokens.is_empty() {
             self.search_filter = None;
             self.search_filter_origin_folder = None;
@@ -66508,7 +68584,7 @@ impl App {
             .tags_db
             .as_ref()
             .map(|db| {
-                crate::global_search_ui::tag_bridge_suggestions_for_query(db, &self.search_query, 3)
+                crate::global_search_ui::tag_bridge_suggestions_for_query(db, &submitted.query, 3)
             })
             .unwrap_or_default();
 
@@ -66535,9 +68611,9 @@ impl App {
         let target = if self.grid_is_zip_entries() {
             crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::Filename])
         } else {
-            self.search_target.clone()
+            submitted.target.clone()
         };
-        let mode: crate::search_query::MatchMode = self.search_or_mode.into();
+        let mode: crate::search_query::MatchMode = submitted.or_mode.into();
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_w = Arc::clone(&cancel);
         let progress = Arc::new(SearchProgressShared::new(ctrl_f_progress_total(
@@ -66547,7 +68623,7 @@ impl App {
         let progress_w = Arc::clone(&progress);
         let (tx, rx) = mpsc::channel();
         // perf 計装上、検索開始を input イベントとして記録する (input_seq は副作用で更新)。
-        self.bump_input_seq("search", Some(&self.search_query.clone()));
+        self.bump_input_seq("search", Some(&submitted.query.clone()));
 
         std::thread::Builder::new()
             .name("metadata-search".to_string())
@@ -66569,6 +68645,7 @@ impl App {
             .ok();
 
         self.search_pending = Some(SearchPending {
+            submitted,
             cancel,
             progress,
             rx,
@@ -66640,7 +68717,10 @@ impl App {
                 for (key, xmp) in xmp_additions {
                     self.xmp_cache.entry(key).or_insert(xmp);
                 }
-                self.search_filter = Some(matches);
+                self.search_filter = Some(LocalSearchFilter {
+                    matches,
+                    submitted: pending.submitted.clone(),
+                });
                 self.search_filter_origin_folder = self.effective_folder();
                 self.rebuild_visible_indices();
                 self.selected = None;
@@ -67685,85 +69765,13 @@ impl App {
         self.rating_filter_suppressed_at = None;
     }
 
-    fn suppress_current_facet_filter_at(&mut self, anchor: PathBuf, message: String) {
-        if !self.facet_filter_active() {
-            return;
-        }
-        if self
-            .facet_filter_suppression_stack
-            .last()
-            .is_some_and(|top| top.anchor == anchor)
-        {
-            return;
-        }
-        let saved_filter = std::mem::take(&mut self.settings.facet_filter);
-        self.sync_facet_name_runtime_from_filter();
-        self.facet_filter_suppression_stack
-            .push(FacetFilterSuppression {
-                anchor,
-                saved_filter,
-            });
-        self.show_feedback_toast(message);
-    }
-
-    pub(crate) fn maybe_suppress_facet_filter_for_opened_container_path(&mut self, anchor: &Path) {
-        self.suppress_current_facet_filter_at(
-            anchor.to_path_buf(),
-            "親の絞り込みを退避しました (戻ると復元)".to_string(),
-        );
-    }
-
-    pub(crate) fn maybe_suppress_facet_filter_for_opened_container(&mut self, idx: usize) {
-        if !self.facet_filter_active() {
-            return;
-        }
-        if !self.passes_facet_filter(idx, None) {
-            return;
-        }
-        let Some(anchor) = self
-            .items
-            .get(idx)
-            .and_then(|it| it.container_path())
-            .map(Path::to_path_buf)
-        else {
-            return;
-        };
-        self.suppress_current_facet_filter_at(
-            anchor,
-            "親の絞り込みを退避しました (戻ると復元)".to_string(),
-        );
-    }
-
-    pub(crate) fn maybe_suppress_facet_filter_for_opened_zip_book(&mut self, idx: usize) {
-        if !self.facet_filter_active() {
-            return;
-        }
-        if !self.passes_facet_filter(idx, None) {
-            return;
-        }
-        let Some(GridItem::ZipDir {
-            zip_path,
-            dir_prefix,
-            ..
-        }) = self.items.get(idx)
-        else {
-            return;
-        };
-        let root = zip_rating_root_path(
-            zip_path,
-            self.archive_source_override.as_deref(),
-            self.current_folder.as_deref(),
-        );
-        let anchor = book_container_key(root, dir_prefix);
-        self.suppress_current_facet_filter_at(
-            anchor,
-            "親の絞り込みを退避しました (本から戻ると復元)".to_string(),
-        );
-    }
+    /// Only successful container-adoption adapters call this; input carries typed intent.
 
     pub(crate) fn restore_facet_filter_suppression(&mut self) -> bool {
-        if let Some(suppression) = self.facet_filter_suppression_stack.pop() {
-            self.settings.facet_filter = suppression.saved_filter;
+        if self
+            .facet_navigation
+            .restore_latest(&mut self.settings.facet_filter)
+        {
             self.sync_facet_name_runtime_from_filter();
             self.settings.save();
             true
@@ -67773,19 +69781,9 @@ impl App {
     }
 
     pub(crate) fn facet_filter_suppressed(&self) -> bool {
-        !self.facet_filter_suppression_stack.is_empty()
+        self.facet_navigation.suppressed()
     }
 
-    /// ZIP 階層の移動 (`zip_nav_show_current_level`) 後に呼ぶ: ★付きの本を開いて
-    /// 一時解除したフィルタを、その本より上の階層へ戻ったら復元する。
-    ///
-    /// 判定はアンカーの正規化キー (= 抑制した本の rating キー) と現在階層のコンテナ
-    /// キーの **接頭辞包含** で行う。本のセル literal prefix は入った後の effective
-    /// prefix の接頭辞なので、collapse された本でも「中にいる間は cur_key が anchor_key を
-    /// 接頭辞に持つ」が成り立つ (= 中にいる限り誤復元しない)。判定不能 (検索ビュー等で
-    /// `current_container_rating_key_and_source` が `None`) のときは **復元しない**
-    /// (= 保持側に倒す)。ZIP を完全に抜けた場合は `load_folder` 末尾の
-    /// `maybe_restore_rating_filter_if_out_of_scope` が拾う。
     fn maybe_restore_rating_filter_after_zip_level_change(&mut self) {
         let Some((anchor, _)) = self.rating_filter_suppressed_at.as_ref() else {
             return;
@@ -67801,26 +69799,6 @@ impl App {
         }
     }
 
-    fn maybe_restore_facet_filter_after_zip_level_change(&mut self) {
-        let Some((cur_key, _)) = self.current_container_rating_key_and_source() else {
-            return;
-        };
-        while let Some(top) = self.facet_filter_suppression_stack.last() {
-            let anchor_key = crate::adjustment_db::normalize_path(&top.anchor);
-            let inside = cur_key == anchor_key || cur_key.starts_with(&format!("{anchor_key}/"));
-            if inside {
-                break;
-            }
-            self.restore_facet_filter_suppression();
-        }
-    }
-
-    /// 毎フレーム呼ぶ: フィルタ ON かつ現フォルダ未スキャンなら worker 起動、
-    /// フィルタ OFF ならバッファを片付ける。Ctrl+G 検索結果ビュー / rating_db 無し /
-    /// current_folder 無しは no-op。
-    ///
-    /// change-detection は `folder_rating_counts_folder_key` のみを見る。handle の有無を
-    /// 条件に入れると worker 終了直後 (handle=None) に再 spawn するループで点滅する。
     pub(crate) fn ensure_folder_rating_counter(&mut self) {
         if !self.rating_filter_active() {
             if self.folder_rating_counter_handle.is_some()
@@ -88475,60 +90453,14 @@ impl App {
                 } else if let Some(crate::ui_main::AddressBarNav::Direct(path, restore_intent)) =
                     gamepad_nav
                 {
-                    let deferred_archive =
-                        self.will_stage_archive_navigation(&path, &OpenRequestOwner::Navigation);
-                    let search_rollback = if self.favsearch.active
-                        || self.tag_view.active
-                        || self.rating_view_nav_context_active()
-                    {
-                        Some(self.folder_nav_history_snapshot())
-                    } else {
-                        None
-                    };
-                    if self.favsearch.active && !deferred_archive {
-                        self.favsearch.nav_stack.push(path.clone());
-                    }
-                    if self.tag_view.active && !deferred_archive {
-                        self.record_tag_view_nav_open(&path);
-                    }
-                    let open_target = path.clone();
-                    let open_outcome = self
-                        .load_folder_or_convert_archive_with_auto_fullscreen_owned(
-                            path,
-                            false,
-                            OpenRequestOwner::Navigation,
-                            restore_intent,
-                        );
-                    if matches!(open_outcome, FolderOpenOutcome::Loaded) && !deferred_archive {
-                        self.advance_drilled_current_path(&open_target);
-                    }
-                    match (open_outcome, search_rollback) {
-                        (FolderOpenOutcome::ConversionDialogOpened, Some(snapshot))
-                            if !deferred_archive =>
-                        {
-                            self.attach_archive_convert_nav_history_rollback(snapshot);
-                        }
-                        (
-                            FolderOpenOutcome::Ignored | FolderOpenOutcome::Refused(_),
-                            Some(snapshot),
-                        ) => {
-                            self.restore_folder_nav_history(snapshot);
-                        }
-                        _ => {}
-                    }
+                    let _ = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                        path,
+                        false,
+                        OpenRequestOwner::Navigation,
+                        restore_intent,
+                    );
+
                     self.clear_pending_folder_nav_steps();
-                    if self.favsearch.active
-                        && matches!(open_outcome, FolderOpenOutcome::Loaded)
-                        && !deferred_archive
-                    {
-                        self.update_favsearch_address();
-                    }
-                    if self.tag_view.active
-                        && matches!(open_outcome, FolderOpenOutcome::Loaded)
-                        && !deferred_archive
-                    {
-                        self.update_tag_view_address();
-                    }
                 } else if let Some(result) = self.poll_folder_nav() {
                     let folder_nav_wins = keyboard_nav.is_none();
                     if folder_nav_wins {
@@ -89267,7 +91199,7 @@ impl App {
         } else {
             // folder_nav が未完了 or 他の高優先 nav 源が勝ったケース
             let higher_priority_direct_nav = fav_nav.or(toolbar_fav_nav);
-            let mut history_nav_rollback = None;
+            let mut navigation = None;
             let mut navigate_pre_scan: Option<ScannedDir> = None;
             let mut pane_epub_restore = None;
             let mut navigate_owner = OpenRequestOwner::Navigation;
@@ -89334,16 +91266,12 @@ impl App {
                         self.adopt_saved_group_ready(id);
                         None
                     }
-                    crate::ui_main::AddressBarNav::HistoryBack => self
-                        .dispatch_main_folder_history_input(
-                            FolderHistoryDirection::Back,
-                            &mut history_nav_rollback,
-                        ),
-                    crate::ui_main::AddressBarNav::HistoryForward => self
-                        .dispatch_main_folder_history_input(
-                            FolderHistoryDirection::Forward,
-                            &mut history_nav_rollback,
-                        ),
+                    crate::ui_main::AddressBarNav::HistoryBack => {
+                        self.dispatch_main_folder_history_input(FolderHistoryDirection::Back)
+                    }
+                    crate::ui_main::AddressBarNav::HistoryForward => {
+                        self.dispatch_main_folder_history_input(FolderHistoryDirection::Forward)
+                    }
                 }
             } else if let Some(p) = open_folder_nav {
                 Some(p)
@@ -89438,6 +91366,7 @@ impl App {
                             navigate_restore_intent = ready.restore_intent;
                             navigate_pre_scan = Some(ready.scan);
                             pane_epub_restore = ready.epub_restore;
+                            navigation = ready.navigation;
                             if let Some(owner) = ready.collection_owner {
                                 navigate_owner = OpenRequestOwner::CollectionGridPhysical(owner);
                             }
@@ -89568,7 +91497,7 @@ impl App {
                     p,
                     navigate_pre_scan.take(),
                     navigate_owner,
-                    history_nav_rollback,
+                    navigation,
                     pane_epub_restore.take(),
                     navigate_restore_intent,
                 );
@@ -91075,17 +93004,22 @@ fn make_load_request(
         }),
         GridItem::ConvertibleArchive { path, format } => {
             let archive_key = crate::path_key::normalize_keep_drive(path);
-            let (load_path, source_policy) =
-                match converted_archive_cache_paths.get(&archive_key)? {
-                    ConvertedArchiveSourceState::Pending => {
-                        (path.as_path(), LoadSourcePolicy::CacheOnly)
-                    }
-                    ConvertedArchiveSourceState::Direct(load_path)
-                    | ConvertedArchiveSourceState::CachedZip(load_path) => {
-                        (load_path.as_path(), base.source_policy)
-                    }
-                    ConvertedArchiveSourceState::Unavailable => return None,
-                };
+            let (load_path, source_policy) = match converted_archive_cache_paths
+                .get(&archive_key)?
+                .read_source()
+            {
+                ConvertedArchiveSourceState::Pending => {
+                    (path.as_path(), LoadSourcePolicy::CacheOnly)
+                }
+                ConvertedArchiveSourceState::Direct(load_path)
+                | ConvertedArchiveSourceState::CachedZip {
+                    path: load_path, ..
+                } => (load_path.as_path(), base.source_policy),
+                ConvertedArchiveSourceState::Unavailable { .. } => return None,
+                ConvertedArchiveSourceState::Rar { .. } => {
+                    unreachable!("read_source unwraps RAR evidence")
+                }
+            };
             let base_key = convertible_archive_cache_base_key(path, *format, use_full_path_keys)?;
             let req = LoadRequest {
                 path: load_path.to_path_buf(),

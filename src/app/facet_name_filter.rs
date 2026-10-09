@@ -30,7 +30,7 @@ impl App {
             || !self.facet_name_tokens.is_empty()
             || self.facet_name_debounce_deadline.is_some();
         self.facet_name_input.clear();
-        self.settings.facet_filter.name_query.clear();
+        self.active_facet_filter_mut().name_query.clear();
         self.facet_name_tokens.clear();
         self.facet_name_debounce_deadline = None;
         self.facet_name_cache_failed_generation = None;
@@ -115,7 +115,7 @@ impl App {
         if query == self.settings.facet_filter.name_query {
             return;
         }
-        self.settings.facet_filter.name_query = query;
+        self.active_facet_filter_mut().name_query = query;
         self.facet_name_tokens = crate::search_query::parse(&self.settings.facet_filter.name_query);
         self.facet_name_cache_failed_generation = None;
         self.ensure_facet_name_cache();

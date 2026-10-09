@@ -410,10 +410,14 @@ fn book_resume_meter_scope_removal_respects_boundaries_and_tile_kind() {
             },
         ],
     );
+    app.converted_archive_cache_paths.insert(
+        crate::path_key::normalize_keep_drive(&sibling),
+        super::ConvertedArchiveSourceState::Direct(sibling.clone()),
+    );
     for idx in 0..app.items.len() {
         assert_eq!(
             app.thumbnail_book_resume_meter(idx),
-            if idx < 3 { value } else { None }
+            if idx < 3 || idx == 8 { value } else { None }
         );
     }
     app.settings.thumb_show_resume_meter = false;
@@ -523,4 +527,1182 @@ fn book_resume_meter_purge_retry_waits_for_unprocessed_record() {
     assert_eq!(stored_row(&dir, &sibling), Some((1, Some(2), Some(4))));
     assert_eq!(app.book_resume_meters.get(&deleted), None);
     assert_eq!(app.book_resume_meters.get(&sibling), meter(2, 4));
+}
+
+#[test]
+fn book_resume_meter_converted_archives_use_only_resolved_read_source() {
+    use super::ConvertedArchiveSourceState as Source;
+    use crate::archive_converter::ArchiveFormat;
+
+    let mut app = setup_app();
+    settle(&mut app);
+    let direct_value = meter(2, 5);
+    let cached_value = meter(4, 5);
+    for ext in ["rar", "cbr", "7z", "cb7", "lzh", "lha"] {
+        let source = app.tmp.path().join(format!("book.{ext}"));
+        let cache = crate::archive_cache::cache_zip_path_for_data_dir(app.tmp.path(), &source);
+        app.persist_book_resume(source.clone(), 1, direct_value);
+        app.persist_book_resume(cache.clone(), 3, cached_value);
+        set_pages(
+            &mut app,
+            vec![GridItem::ConvertibleArchive {
+                path: source.clone(),
+                format: ArchiveFormat::from_extension(ext).unwrap(),
+            }],
+        );
+        let key = crate::path_key::normalize_keep_drive(&source);
+        app.converted_archive_cache_paths.clear();
+        assert_eq!(app.thumbnail_book_resume_meter(0), None, "unresolved {ext}");
+        for state in [
+            Source::Pending,
+            Source::Unavailable {
+                logical_source: None,
+            },
+        ] {
+            app.converted_archive_cache_paths.insert(key.clone(), state);
+            assert_eq!(app.thumbnail_book_resume_meter(0), None, "invalid {ext}");
+        }
+        app.converted_archive_cache_paths.insert(
+            key.clone(),
+            Source::CachedZip {
+                logical_source: source.clone(),
+                path: cache.clone(),
+            },
+        );
+        assert_eq!(
+            app.thumbnail_book_resume_meter(0),
+            cached_value,
+            "cached {ext}"
+        );
+        assert_eq!(
+            app.thumbnail_resume_meter(0),
+            cached_value.map(ReadingMeterValue::fraction)
+        );
+        app.converted_archive_cache_paths.insert(
+            key.clone(),
+            Source::Unavailable {
+                logical_source: Some(source.clone()),
+            },
+        );
+        assert_eq!(
+            app.thumbnail_book_resume_meter(0),
+            cached_value,
+            "no cache {ext}"
+        );
+        app.settings.thumb_show_resume_meter = false;
+        assert_eq!(app.thumbnail_book_resume_meter(0), None);
+        app.settings.thumb_show_resume_meter = true;
+        // A cache invalidation / list reload must never fall back to the source row.
+        app.initialize_converted_archive_cache_paths();
+        assert_eq!(app.thumbnail_book_resume_meter(0), None, "reloaded {ext}");
+        if matches!(ext, "rar" | "cbr") {
+            app.converted_archive_cache_paths
+                .insert(key, Source::Direct(source));
+            assert_eq!(
+                app.thumbnail_book_resume_meter(0),
+                direct_value,
+                "direct {ext}"
+            );
+        }
+    }
+}
+
+fn assert_converted_thumbnail_read_path(app: &AppTestEnv, idx: usize, expected: Option<&Path>) {
+    let request = super::make_load_request(
+        &app.items[idx],
+        idx,
+        0,
+        0,
+        false,
+        None,
+        None,
+        app.settings.folder_thumb_depth,
+        &Default::default(),
+        &app.converted_archive_cache_paths,
+        None,
+        None,
+        None,
+        None,
+        false,
+    );
+    assert_eq!(
+        request.as_ref().map(|request| request.path.as_path()),
+        expected
+    );
+}
+
+#[test]
+fn book_resume_meter_split_rar_hides_later_volume_without_changing_thumbnail_sources() {
+    use super::ConvertedArchiveSourceState as Source;
+    let mut app = setup_app();
+    settle(&mut app);
+    for ext in ["rar", "cbr"] {
+        let first = app.tmp.path().join(format!("book.part1.{ext}"));
+        let next = app.tmp.path().join(format!("book.part2.{ext}"));
+        let cache = crate::archive_cache::cache_zip_path_for_data_dir(app.tmp.path(), &first);
+        let next_cache = crate::archive_cache::cache_zip_path_for_data_dir(app.tmp.path(), &next);
+        let direct_value = meter(3, 5);
+        let cached_value = meter(4, 5);
+        app.persist_book_resume(first.clone(), 2, direct_value);
+        app.persist_book_resume(next.clone(), 0, meter(1, 5));
+        app.persist_book_resume(cache.clone(), 3, cached_value);
+        app.persist_book_resume(next_cache, 1, meter(2, 5));
+        set_pages(
+            &mut app,
+            [&first, &next]
+                .into_iter()
+                .map(|path| GridItem::ConvertibleArchive {
+                    path: path.clone(),
+                    format: crate::archive_converter::ArchiveFormat::Rar,
+                })
+                .collect(),
+        );
+        let first_key = crate::path_key::normalize_keep_drive(&first);
+        let next_key = crate::path_key::normalize_keep_drive(&next);
+        for (state, first_value, thumbnail_path) in [
+            (
+                Source::Direct(first.clone()),
+                direct_value,
+                Some(first.as_path()),
+            ),
+            (
+                Source::CachedZip {
+                    logical_source: first.clone(),
+                    path: cache.clone(),
+                },
+                cached_value,
+                Some(cache.as_path()),
+            ),
+            (
+                Source::Unavailable {
+                    logical_source: Some(first.clone()),
+                },
+                cached_value,
+                None,
+            ),
+        ] {
+            app.converted_archive_cache_paths.clear();
+            app.converted_archive_cache_paths
+                .insert(first_key.clone(), state.clone());
+            app.converted_archive_cache_paths.insert(
+                next_key.clone(),
+                Source::Rar {
+                    volume: crate::rar_loader::RarVolumeProof::Subsequent {
+                        first: first.clone(),
+                    },
+                    source: Box::new(state),
+                },
+            );
+            let thumbnail_sources = app.converted_archive_cache_paths.clone();
+            assert_eq!(app.thumbnail_book_resume_meter(0), first_value);
+            assert_eq!(app.thumbnail_book_resume_meter(1), None, "later {ext}");
+            assert_eq!(app.thumbnail_resume_meter(1), None);
+            for idx in [0, 1] {
+                assert_converted_thumbnail_read_path(&app, idx, thumbnail_path);
+            }
+            app.settings.thumb_show_resume_meter = false;
+            assert_eq!(app.thumbnail_book_resume_meter(0), None);
+            assert_eq!(app.thumbnail_book_resume_meter(1), None);
+            app.settings.thumb_show_resume_meter = true;
+            assert_eq!(app.converted_archive_cache_paths, thumbnail_sources);
+        }
+        for state in [
+            Source::Pending,
+            Source::Unavailable {
+                logical_source: None,
+            },
+        ] {
+            app.converted_archive_cache_paths
+                .insert(first_key.clone(), state.clone());
+            app.converted_archive_cache_paths
+                .insert(next_key.clone(), state);
+            assert_eq!(app.thumbnail_book_resume_meter(0), None);
+            assert_eq!(app.thumbnail_book_resume_meter(1), None);
+        }
+        // A filename alone does not prove a later volume: retain its own released row
+        // when the worker's logical source equals the cell path.
+        app.converted_archive_cache_paths
+            .insert(next_key, Source::Direct(next.clone()));
+        assert_eq!(app.thumbnail_book_resume_meter(1), meter(1, 5));
+    }
+}
+
+#[test]
+fn book_resume_meter_archive_cache_deletion_completion_rechecks_sources() {
+    use super::ConvertedArchiveSourceState as Source;
+    use super::{ConvertedArchiveCachePathsMsg, ConvertedArchiveCachePathsPending};
+    use crate::cache_maintenance::{ArchiveMaintTask, spawn_archive};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+
+    for action in ["selected", "missing", "all"] {
+        let mut app = setup_app();
+        settle(&mut app);
+        let source = app.tmp.path().join("book.7z");
+        let direct = app.tmp.path().join("direct.rar");
+        std::fs::write(&source, b"archive").unwrap();
+        let metadata = std::fs::metadata(&source).unwrap();
+        let stamp = (
+            crate::ui_helpers::mtime_secs(&metadata),
+            metadata.len() as i64,
+        );
+        let db = app.archive_cache_db.as_ref().unwrap().clone();
+        let cached = db.reserve_cache_zip_path(&source).unwrap();
+        std::fs::write(&cached, b"cached archive").unwrap();
+        db.record(
+            &source,
+            stamp.0,
+            stamp.1,
+            crate::archive_converter::ArchiveFormat::SevenZ,
+            &cached,
+            14,
+            5,
+            false,
+        )
+        .unwrap();
+        app.persist_book_resume(cached.clone(), 2, meter(3, 5));
+        app.persist_book_resume(direct.clone(), 1, meter(2, 5));
+        set_pages(
+            &mut app,
+            vec![
+                GridItem::ConvertibleArchive {
+                    path: source.clone(),
+                    format: crate::archive_converter::ArchiveFormat::SevenZ,
+                },
+                GridItem::ConvertibleArchive {
+                    path: direct.clone(),
+                    format: crate::archive_converter::ArchiveFormat::Rar,
+                },
+            ],
+        );
+        app.image_metas = vec![Some(stamp), None];
+        let key = crate::path_key::normalize_keep_drive(&source);
+        let direct_key = crate::path_key::normalize_keep_drive(&direct);
+        app.converted_archive_cache_paths.insert(
+            key.clone(),
+            Source::CachedZip {
+                logical_source: source.clone(),
+                path: cached.clone(),
+            },
+        );
+        app.converted_archive_cache_paths
+            .insert(direct_key.clone(), Source::Direct(direct.clone()));
+        assert_eq!(app.thumbnail_book_resume_meter(0), meter(3, 5));
+
+        // A pre-delete result already queued in the source owner's old batch must be discarded.
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.converted_archive_cache_paths_pending = Some(ConvertedArchiveCachePathsPending {
+            generation: app.items_generation,
+            cascade_depth: app.settings.folder_thumb_depth as usize,
+            cancel: cancel.clone(),
+            desired_indices: Arc::new(std::sync::RwLock::new(std::collections::HashSet::from([0]))),
+            rx,
+            pin_archive_dependencies: Default::default(),
+        });
+        tx.send(ConvertedArchiveCachePathsMsg::Resolved {
+            archive_key: key.clone(),
+            state: Source::CachedZip {
+                logical_source: source.clone(),
+                path: cached.clone(),
+            },
+            idx: 0,
+            ordinal: 1,
+            elapsed_ms: 0.0,
+            input_seq: 0,
+        })
+        .unwrap();
+        let task = match action {
+            "selected" => ArchiveMaintTask::DeleteSelected {
+                src_paths: vec![source.clone()],
+            },
+            "missing" => {
+                std::fs::remove_file(&source).unwrap();
+                ArchiveMaintTask::DeleteMissing
+            }
+            _ => ArchiveMaintTask::DeleteAll,
+        };
+        app.archive_cache_manager_result = None;
+        app.archive_cache_maint_pending = Some(spawn_archive(task, db.clone()));
+        let deadline = Instant::now() + WORKER_TIMEOUT;
+        while app.archive_cache_manager_result.is_none() {
+            app.poll_archive_cache_maint_pending();
+            assert!(
+                Instant::now() < deadline,
+                "{action}: maintenance did not finish"
+            );
+            std::thread::yield_now();
+        }
+        assert!(
+            !cached.exists(),
+            "{action}: the real deletion worker must remove the ZIP"
+        );
+        assert_eq!(
+            app.thumbnail_book_resume_meter(0),
+            None,
+            "{action}: deleted cache bar"
+        );
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "{action}: discard stale batch"
+        );
+        app.poll_converted_archive_cache_paths(&egui::Context::default());
+        assert_eq!(
+            app.converted_archive_cache_paths.get(&key),
+            Some(&Source::Pending)
+        );
+        assert_eq!(
+            app.thumbnail_book_resume_meter(1),
+            meter(2, 5),
+            "Direct is unaffected"
+        );
+        assert_eq!(
+            app.book_resume_meters.get(&cached),
+            meter(3, 5),
+            "saved record is retained"
+        );
+        let scope = std::collections::HashSet::from([0]);
+        app.start_converted_archive_cache_paths_refresh(&scope, (0, 1), (0, 1));
+        let deadline = Instant::now() + WORKER_TIMEOUT;
+        while app.converted_archive_cache_paths_pending.is_some() {
+            app.poll_converted_archive_cache_paths(&egui::Context::default());
+            assert!(
+                Instant::now() < deadline,
+                "{action}: source recheck did not finish"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            app.converted_archive_cache_paths.get(&key),
+            Some(&Source::Unavailable {
+                logical_source: Some(source.clone())
+            })
+        );
+        assert_eq!(app.thumbnail_book_resume_meter(0), meter(3, 5));
+    }
+}
+
+#[test]
+fn book_resume_meter_smart_parent_cache_delete_backspace_rechecks_stashed_sources() {
+    use super::ConvertedArchiveSourceState as Source;
+    use crate::cache_maintenance::{ArchiveMaintTask, spawn_archive};
+
+    let mut app = setup_app();
+    settle(&mut app);
+    app.active_quick_folder_slot = None;
+    let root = app.tmp.path().join("smart-meter-root");
+    let child = root.join("child");
+    std::fs::create_dir_all(&child).unwrap();
+    std::fs::write(child.join("page.jpg"), []).unwrap();
+    let source = root.join("book.7z");
+    std::fs::write(&source, b"archive").unwrap();
+    let metadata = std::fs::metadata(&source).unwrap();
+    let db = app.archive_cache_db.as_ref().unwrap().clone();
+    let cached = db.reserve_cache_zip_path(&source).unwrap();
+    std::fs::write(&cached, b"cached archive").unwrap();
+    db.record(
+        &source,
+        crate::ui_helpers::mtime_secs(&metadata),
+        metadata.len() as i64,
+        crate::archive_converter::ArchiveFormat::SevenZ,
+        &cached,
+        14,
+        5,
+        false,
+    )
+    .unwrap();
+    app.persist_book_resume(cached.clone(), 2, meter(3, 5));
+    let mut definition = crate::settings::SmartFolderDefinition::new("Smart meter");
+    definition.rules.push(crate::settings::SmartFolderRule::new(
+        root,
+        true,
+        Default::default(),
+    ));
+    let id = definition.id;
+    app.settings.smart_folders = vec![definition];
+    let ctx = egui::Context::default();
+    app.open_smart_folder(id, false);
+    let deadline = Instant::now() + WORKER_TIMEOUT;
+    while !app.items_are_smart_folder_view
+        || app.smart_folder_transition.is_some()
+        || app.smart_folder_prepare_pending.is_some()
+    {
+        app.poll_smart_folder(&ctx);
+        assert!(Instant::now() < deadline, "smart root did not finish");
+        std::thread::yield_now();
+    }
+    let key = crate::path_key::normalize_keep_drive(&source);
+    let index = app
+        .items
+        .iter()
+        .position(|item| item.drag_source_path() == Some(&source))
+        .unwrap();
+    let scope = std::collections::HashSet::from([index]);
+    app.start_converted_archive_cache_paths_refresh(&scope, (index, index + 1), (index, index + 1));
+    let deadline = Instant::now() + WORKER_TIMEOUT;
+    while app.converted_archive_cache_paths_pending.is_some() {
+        app.poll_converted_archive_cache_paths(&ctx);
+        assert!(
+            Instant::now() < deadline,
+            "smart root source did not finish"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        app.converted_archive_cache_paths.get(&key),
+        Some(&Source::CachedZip {
+            logical_source: source.clone(),
+            path: cached.clone()
+        })
+    );
+    // Synthetic Smart roots intentionally hide meters; the source map also serves thumbnails.
+    assert_eq!(app.thumbnail_book_resume_meter(index), None);
+
+    // Production child adoption moves the parent grid, including the resolved source map.
+    app.open_staged_smart_folder_and_wait(&ctx, &child);
+    assert!(!app.converted_archive_cache_paths.contains_key(&key));
+    app.archive_cache_manager_result = None;
+    app.archive_cache_maint_pending = Some(spawn_archive(ArchiveMaintTask::DeleteAll, db));
+    let deadline = Instant::now() + WORKER_TIMEOUT;
+    while app.archive_cache_manager_result.is_none() {
+        app.poll_archive_cache_maint_pending();
+        assert!(Instant::now() < deadline, "cache delete did not finish");
+        std::thread::yield_now();
+    }
+    assert!(!cached.exists());
+    let parent = app
+        .resolve_grid_parent_nav()
+        .expect("Backspace parent route");
+    assert!(app.apply_fullscreen_close_nav_immediate(parent));
+    assert!(app.items_are_smart_folder_view);
+    assert!(
+        app.smart_folder_transition.is_none(),
+        "restore the moved grid, not a rescan"
+    );
+    let index = app
+        .items
+        .iter()
+        .position(|item| item.drag_source_path() == Some(&source))
+        .unwrap();
+    assert_eq!(app.thumbnail_book_resume_meter(index), None);
+    assert_eq!(
+        app.converted_archive_cache_paths.get(&key),
+        Some(&Source::Pending)
+    );
+    let scope = std::collections::HashSet::from([index]);
+    app.start_converted_archive_cache_paths_refresh(&scope, (index, index + 1), (index, index + 1));
+    let deadline = Instant::now() + WORKER_TIMEOUT;
+    while app.converted_archive_cache_paths_pending.is_some() {
+        app.poll_converted_archive_cache_paths(&ctx);
+        assert!(
+            Instant::now() < deadline,
+            "restored parent source did not finish"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        app.converted_archive_cache_paths.get(&key),
+        Some(&Source::Unavailable {
+            logical_source: Some(source.clone())
+        })
+    );
+    assert_eq!(app.book_resume_meters.get(&cached), meter(3, 5));
+
+    // Sort-only prepare reuses the original Arc metadata, whose cache resolution predates
+    // deletion. Its real prepare/adoption path must not republish that terminal CachedZip.
+    assert!(app.reprepare_current_smart_folder_for_sort());
+    let deadline = Instant::now() + WORKER_TIMEOUT;
+    while app.smart_folder_prepare_pending.is_some() {
+        app.poll_smart_folder(&ctx);
+        assert!(
+            Instant::now() < deadline,
+            "reused smart metadata did not finish"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        app.converted_archive_cache_paths.get(&key),
+        Some(&Source::Pending)
+    );
+    let index = app
+        .items
+        .iter()
+        .position(|item| item.drag_source_path() == Some(&source))
+        .unwrap();
+    let scope = std::collections::HashSet::from([index]);
+    app.start_converted_archive_cache_paths_refresh(&scope, (index, index + 1), (index, index + 1));
+    let deadline = Instant::now() + WORKER_TIMEOUT;
+    while app.converted_archive_cache_paths_pending.is_some() {
+        app.poll_converted_archive_cache_paths(&ctx);
+        assert!(
+            Instant::now() < deadline,
+            "reused source recheck did not finish"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        app.converted_archive_cache_paths.get(&key),
+        Some(&Source::Unavailable {
+            logical_source: Some(source.clone())
+        })
+    );
+}
+
+#[test]
+fn book_resume_meter_cache_delete_invalidates_parked_source_owner_without_mounting() {
+    use super::ConvertedArchiveSourceState as Source;
+    use super::{ConvertedArchiveCachePathsMsg, ConvertedArchiveCachePathsPending};
+    use crate::cache_maintenance::{ArchiveMaintTask, spawn_archive};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+
+    let mut app = setup_app();
+    settle(&mut app);
+    let source = app.tmp.path().join("parked.7z");
+    let cached = app.tmp.path().join("parked.zip");
+    let direct = app.tmp.path().join("direct.rar");
+    let key = crate::path_key::normalize_keep_drive(&source);
+    let direct_key = crate::path_key::normalize_keep_drive(&direct);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
+    let parked = app.build_window_context_for_test(1350, |owner| {
+        owner.converted_archive_cache_paths.insert(
+            key.clone(),
+            Source::CachedZip {
+                logical_source: source.clone(),
+                path: cached.clone(),
+            },
+        );
+        owner
+            .converted_archive_cache_paths
+            .insert(direct_key.clone(), Source::Direct(direct.clone()));
+        owner.fs_pan = egui::vec2(13.0, 50.0);
+        owner.converted_archive_cache_paths_pending = Some(ConvertedArchiveCachePathsPending {
+            generation: owner.items_generation,
+            cascade_depth: owner.settings.folder_thumb_depth as usize,
+            cancel: cancel.clone(),
+            desired_indices: Default::default(),
+            rx,
+            pin_archive_dependencies: Default::default(),
+        });
+        tx.send(ConvertedArchiveCachePathsMsg::Resolved {
+            archive_key: key.clone(),
+            state: Source::CachedZip {
+                logical_source: source.clone(),
+                path: cached.clone(),
+            },
+            idx: 0,
+            ordinal: 1,
+            elapsed_ms: 0.0,
+            input_seq: 0,
+        })
+        .unwrap();
+    });
+    let mounted = app.mounted_viewer_context_id();
+    let generation = app.items_generation;
+    let db = app.archive_cache_db.as_ref().unwrap().clone();
+    app.archive_cache_manager_result = None;
+    app.archive_cache_maint_pending = Some(spawn_archive(ArchiveMaintTask::DeleteAll, db));
+    let deadline = Instant::now() + WORKER_TIMEOUT;
+    while app.archive_cache_manager_result.is_none() {
+        app.poll_archive_cache_maint_pending();
+        assert!(Instant::now() < deadline, "cache delete did not finish");
+        std::thread::yield_now();
+    }
+    assert_eq!(app.mounted_viewer_context_id(), mounted);
+    assert_eq!(app.items_generation, generation);
+    assert!(
+        cancel.load(Ordering::Relaxed),
+        "parked batch is cancelled at deletion"
+    );
+    app.with_window_context_for_test(parked, |owner| {
+        owner.poll_converted_archive_cache_paths(&egui::Context::default());
+        assert_eq!(
+            owner.converted_archive_cache_paths.get(&key),
+            Some(&Source::Pending)
+        );
+        assert_eq!(
+            owner.converted_archive_cache_paths.get(&direct_key),
+            Some(&Source::Direct(direct.clone()))
+        );
+        assert!(owner.converted_archive_cache_paths_pending.is_none());
+        assert_eq!(owner.fs_pan, egui::vec2(13.0, 50.0));
+    });
+}
+
+#[test]
+fn book_resume_meter_archive_cache_rows_and_error_do_not_invalidate_sources() {
+    use super::ConvertedArchiveSourceState as Source;
+    use crate::cache_maintenance::{ArchiveMaintPending, ArchiveMaintResult, ArchiveMaintTask};
+
+    let mut app = setup_app();
+    settle(&mut app);
+    let source = app.tmp.path().join("book.7z");
+    let cached = crate::archive_cache::cache_zip_path_for_data_dir(app.tmp.path(), &source);
+    app.persist_book_resume(cached.clone(), 1, meter(2, 5));
+    set_pages(
+        &mut app,
+        vec![GridItem::ConvertibleArchive {
+            path: source.clone(),
+            format: crate::archive_converter::ArchiveFormat::SevenZ,
+        }],
+    );
+    let key = crate::path_key::normalize_keep_drive(&source);
+    app.converted_archive_cache_paths.insert(
+        key.clone(),
+        Source::CachedZip {
+            logical_source: source.clone(),
+            path: cached.clone(),
+        },
+    );
+    for result in [
+        ArchiveMaintResult::Rows {
+            entries: vec![],
+            total_bytes: 0,
+        },
+        ArchiveMaintResult::Error("deletion failed".into()),
+    ] {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(result).unwrap();
+        app.archive_cache_maint_pending = Some(ArchiveMaintPending {
+            task: ArchiveMaintTask::LoadRows,
+            rx,
+        });
+        app.poll_archive_cache_maint_pending();
+        assert_eq!(
+            app.converted_archive_cache_paths.get(&key),
+            Some(&Source::CachedZip {
+                logical_source: source.clone(),
+                path: cached.clone()
+            })
+        );
+        assert_eq!(app.thumbnail_book_resume_meter(0), meter(2, 5));
+    }
+}
+
+fn refresh_converted_source(app: &mut AppTestEnv, idx: usize) {
+    let scope = std::collections::HashSet::from([idx]);
+    app.start_converted_archive_cache_paths_refresh(&scope, (idx, idx + 1), (idx, idx + 1));
+    let deadline = Instant::now() + WORKER_TIMEOUT;
+    while app.converted_archive_cache_paths_pending.is_some() {
+        app.poll_converted_archive_cache_paths(&egui::Context::default());
+        assert!(Instant::now() < deadline, "source worker did not finish");
+        std::thread::yield_now();
+    }
+}
+
+fn delete_converted_cache(app: &mut AppTestEnv, source: &Path) {
+    use crate::cache_maintenance::{ArchiveMaintTask, spawn_archive};
+    app.archive_cache_manager_result = None;
+    app.archive_cache_maint_pending = Some(spawn_archive(
+        ArchiveMaintTask::DeleteSelected {
+            src_paths: vec![source.to_path_buf()],
+        },
+        app.archive_cache_db.as_ref().unwrap().clone(),
+    ));
+    let deadline = Instant::now() + WORKER_TIMEOUT;
+    while app.archive_cache_manager_result.is_none() {
+        app.poll_archive_cache_maint_pending();
+        assert!(Instant::now() < deadline, "cache deletion did not finish");
+        std::thread::yield_now();
+    }
+}
+
+fn convert_and_record_cache(
+    app: &AppTestEnv,
+    source: &Path,
+    format: crate::archive_converter::ArchiveFormat,
+) -> PathBuf {
+    let db = app.archive_cache_db.as_ref().unwrap();
+    let cached = db.reserve_cache_zip_path(source).unwrap();
+    crate::archive_converter::convert_to_zip(
+        source,
+        &cached,
+        format,
+        &std::sync::atomic::AtomicBool::new(false),
+        None,
+    )
+    .unwrap();
+    let meta = std::fs::metadata(source).unwrap();
+    let pages = crate::zip_loader::enumerate_image_entries(&cached)
+        .unwrap()
+        .len();
+    db.record(
+        source,
+        crate::ui_helpers::mtime_secs(&meta),
+        meta.len() as i64,
+        format,
+        &cached,
+        std::fs::metadata(&cached).unwrap().len() as i64,
+        pages.try_into().unwrap(),
+        false,
+    )
+    .unwrap();
+    cached
+}
+
+fn install_converted_zip(app: &mut AppTestEnv, source: &Path, cached: &Path) {
+    let enumeration = crate::zip_loader::enumerate_image_entries_detailed(cached).unwrap();
+    app.settings.sidecar_backup_enabled = false;
+    app.settings.tag_sidecar_backup_enabled = false;
+    app.load_zip_as_folder_prepared_with_logical_source(
+        cached.to_path_buf(),
+        enumeration,
+        Some(source),
+        super::StartupListIntent::ExplicitList,
+    );
+    assert_eq!(app.current_folder.as_deref(), Some(cached));
+}
+
+#[test]
+fn book_resume_meter_copied_data_dir_uses_existing_cache_save_restore_key() {
+    use super::tests::phase_c_support::setup_paused_similar_app_with_fixture;
+    use crate::archive_converter::ArchiveFormat;
+
+    let mut old_app = setup_app();
+    settle(&mut old_app);
+    let source = old_app.tmp.path().join("copied-profile.7z");
+    let mut writer = sevenz_rust2::ArchiveWriter::create(&source).unwrap();
+    for name in ["01.jpg", "02.jpg", "03.jpg"] {
+        writer
+            .push_archive_entry(
+                sevenz_rust2::ArchiveEntry::new_file(name),
+                Some(std::io::Cursor::new(vec![1u8; 3])),
+            )
+            .unwrap();
+    }
+    writer.finish().unwrap();
+    let cached = convert_and_record_cache(&old_app, &source, ArchiveFormat::SevenZ);
+    install_converted_zip(&mut old_app, &source, &cached);
+    old_app.record_book_resume(1);
+    settle(&mut old_app);
+
+    // Close every old-profile DB before copying; retain its directory and valid ZIP,
+    // as the documented migration procedure does until the copied profile is verified.
+    let old_profile = std::mem::replace(&mut old_app.tmp, tempfile::tempdir().unwrap());
+    drop(old_app);
+    let mut app =
+        setup_paused_similar_app_with_fixture(crate::settings::Settings::default(), |new_dir| {
+            for name in ["archive_cache.db", "book_resume.db"] {
+                std::fs::copy(old_profile.path().join(name), new_dir.join(name)).unwrap();
+            }
+        });
+    settle(&mut app);
+    let computed = crate::archive_cache::cache_zip_path_for_data_dir(app.tmp.path(), &source);
+    assert_ne!(computed, cached);
+    let meta = std::fs::metadata(&source).unwrap();
+    let db = app.archive_cache_db.as_ref().unwrap();
+    let stamp = crate::ui_helpers::mtime_secs(&meta);
+    assert_eq!(
+        db.peek(&source, stamp, meta.len() as i64),
+        Some(cached.clone())
+    );
+    assert_eq!(
+        db.lookup(&source, stamp, meta.len() as i64),
+        Some(cached.clone())
+    );
+
+    app.load_folder(source.parent().unwrap().to_path_buf());
+    let idx = app
+        .items
+        .iter()
+        .position(|item| item.drag_source_path() == Some(&source))
+        .unwrap();
+    refresh_converted_source(&mut app, idx);
+    assert_eq!(app.thumbnail_book_resume_meter(idx), meter(2, 3));
+    install_converted_zip(&mut app, &source, &cached);
+    assert_eq!(app.resume_page_for_container(), Some(1));
+    app.record_book_resume(2);
+    settle(&mut app);
+    assert_eq!(
+        stored_row(app.tmp.path(), &cached),
+        Some((2, Some(3), Some(3)))
+    );
+    assert_eq!(stored_row(app.tmp.path(), &computed), None);
+
+    app.load_folder(source.parent().unwrap().to_path_buf());
+    let idx = app
+        .items
+        .iter()
+        .position(|item| item.drag_source_path() == Some(&source))
+        .unwrap();
+    refresh_converted_source(&mut app, idx);
+    assert_eq!(app.thumbnail_book_resume_meter(idx), meter(3, 3));
+    // No aliases/migration machinery: after deleting the old ZIP, the missing-cache
+    // state computes the new profile's key. The old released resume row survives.
+    delete_converted_cache(&mut app, &source);
+    refresh_converted_source(&mut app, idx);
+    assert_eq!(app.thumbnail_book_resume_meter(idx), None);
+    assert_eq!(
+        stored_row(app.tmp.path(), &cached),
+        Some((2, Some(3), Some(3)))
+    );
+}
+
+#[test]
+fn book_resume_meter_deleted_cache_reconversion_and_source_change_resume_same_key() {
+    use super::ConvertedArchiveSourceState as Source;
+    use crate::archive_converter::ArchiveFormat;
+    let mut app = setup_app();
+    settle(&mut app);
+    let source = app.tmp.path().join("resume.7z");
+    let write_source = |extra: bool| {
+        let mut writer = sevenz_rust2::ArchiveWriter::create(&source).unwrap();
+        for name in ["01.jpg", "02.jpg", "03.jpg"] {
+            writer
+                .push_archive_entry(
+                    sevenz_rust2::ArchiveEntry::new_file(name),
+                    Some(std::io::Cursor::new(vec![1u8; if extra { 19 } else { 3 }])),
+                )
+                .unwrap();
+        }
+        writer.finish().unwrap();
+    };
+    write_source(false);
+    let cached = convert_and_record_cache(&app, &source, ArchiveFormat::SevenZ);
+    install_converted_zip(&mut app, &source, &cached);
+    app.record_book_resume(1);
+    settle(&mut app);
+    assert_eq!(
+        stored_row(app.tmp.path(), &cached),
+        Some((1, Some(2), Some(3)))
+    );
+
+    app.load_folder(source.parent().unwrap().to_path_buf());
+    let idx = app
+        .items
+        .iter()
+        .position(|item| item.drag_source_path() == Some(&source))
+        .unwrap();
+    refresh_converted_source(&mut app, idx);
+    assert_eq!(app.thumbnail_book_resume_meter(idx), meter(2, 3));
+    delete_converted_cache(&mut app, &source);
+    assert!(!cached.exists());
+    assert_eq!(
+        app.thumbnail_book_resume_meter(idx),
+        None,
+        "Pending is hidden"
+    );
+    refresh_converted_source(&mut app, idx);
+    assert_eq!(app.thumbnail_book_resume_meter(idx), meter(2, 3));
+    assert!(
+        matches!(app.converted_archive_cache_paths.values().next(), Some(Source::Unavailable { logical_source: Some(path) }) if path == &source)
+    );
+    assert_eq!(
+        convert_and_record_cache(&app, &source, ArchiveFormat::SevenZ),
+        cached
+    );
+    install_converted_zip(&mut app, &source, &cached);
+    assert_eq!(app.resume_page_for_container(), Some(1));
+
+    // Reachable cache lookup stamp invalidation must not delete released resume data either.
+    write_source(true);
+    let meta = std::fs::metadata(&source).unwrap();
+    let db = app.archive_cache_db.as_ref().unwrap();
+    assert!(
+        db.lookup(
+            &source,
+            crate::ui_helpers::mtime_secs(&meta),
+            meta.len() as i64
+        )
+        .is_none()
+    );
+    assert_eq!(
+        stored_row(app.tmp.path(), &cached),
+        Some((1, Some(2), Some(3)))
+    );
+    assert_eq!(
+        convert_and_record_cache(&app, &source, ArchiveFormat::SevenZ),
+        cached
+    );
+    install_converted_zip(&mut app, &source, &cached);
+    assert_eq!(app.resume_page_for_container(), Some(1));
+}
+
+#[test]
+fn book_resume_meter_multipart_direct_worker_keeps_later_thumbnail_but_hides_meter() {
+    use super::ConvertedArchiveSourceState as Source;
+    use crate::archive_converter::ArchiveFormat;
+    let mut app = setup_app();
+    settle(&mut app);
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("testdata/archives/rar-multipart-filename-regression/real-split-control");
+    let paths: Vec<_> = [1, 2]
+        .into_iter()
+        .map(|part| {
+            let name = format!("real-split-control.part{part}.rar");
+            let path = app.tmp.path().join(&name);
+            std::fs::copy(fixture.join(name), &path).unwrap();
+            path
+        })
+        .collect();
+    let first = &paths[0];
+    let next = &paths[1];
+    let inspection = crate::rar_loader::inspect_for_direct_read(next).unwrap();
+    assert_eq!(inspection.resolved_path, *first);
+    assert_eq!(
+        inspection.decision,
+        crate::rar_loader::RarDirectReadDecision::Direct
+    );
+    app.persist_book_resume(first.clone(), 0, meter(1, 1));
+    app.persist_book_resume(next.clone(), 0, meter(1, 5));
+    let next_cache = crate::archive_cache::cache_zip_path_for_data_dir(app.tmp.path(), next);
+    app.persist_book_resume(next_cache, 0, meter(1, 5));
+    app.install_new_items(
+        paths
+            .iter()
+            .map(|path| GridItem::ConvertibleArchive {
+                path: path.clone(),
+                format: ArchiveFormat::Rar,
+            })
+            .collect(),
+        paths
+            .iter()
+            .map(|path| {
+                let meta = std::fs::metadata(path).unwrap();
+                Some((crate::ui_helpers::mtime_secs(&meta), meta.len() as i64))
+            })
+            .collect(),
+    );
+    assert_eq!(
+        app.thumbnail_book_resume_meter(0),
+        None,
+        "Pending is hidden"
+    );
+    assert_eq!(
+        app.thumbnail_book_resume_meter(1),
+        None,
+        "Pending is hidden"
+    );
+    for idx in [0, 1] {
+        refresh_converted_source(&mut app, idx);
+        assert_eq!(
+            app.converted_archive_cache_paths
+                .get(&crate::path_key::normalize_keep_drive(&paths[idx]))
+                .map(super::ConvertedArchiveSourceState::read_source),
+            Some(&Source::Direct(first.clone()))
+        );
+        assert_converted_thumbnail_read_path(&app, idx, Some(first));
+    }
+    let thumbnail_sources = app.converted_archive_cache_paths.clone();
+    assert_eq!(app.thumbnail_book_resume_meter(0), meter(1, 1));
+    assert_eq!(app.thumbnail_book_resume_meter(1), None);
+    assert_eq!(app.thumbnail_resume_meter(1), None);
+    app.settings.thumb_show_resume_meter = false;
+    assert_eq!(app.thumbnail_book_resume_meter(0), None);
+    assert_eq!(app.thumbnail_book_resume_meter(1), None);
+    assert_eq!(app.converted_archive_cache_paths, thumbnail_sources);
+}
+
+#[test]
+fn book_resume_meter_deleted_multipart_solid_rar_keeps_first_meter_only() {
+    use crate::archive_converter::ArchiveFormat;
+    let mut app = setup_app();
+    settle(&mut app);
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("testdata/archives/rar-multipart-filename-regression/real-split-control");
+    // Declare the existing valid RAR5 split fixture solid in its main header, retaining
+    // the compressed entries and real volume headers. Recompute each header CRC.
+    // This exercises the production solid-conversion branch without an external packer.
+    let mut paths = Vec::new();
+    for part in [1, 2] {
+        let name = format!("real-split-control.part{part}.rar");
+        let mut bytes = std::fs::read(fixture.join(&name)).unwrap();
+        assert_eq!(&bytes[..8], b"Rar!\x1a\x07\x01\x00");
+        assert_eq!(bytes[13], 1, "main header");
+        bytes[16] |= 4; // RAR5 archive flag: solid.
+        let end = 13 + bytes[12] as usize;
+        let mut crc = u32::MAX;
+        for byte in &bytes[12..end] {
+            crc ^= *byte as u32;
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xedb88320 & 0u32.wrapping_sub(crc & 1));
+            }
+        }
+        bytes[8..12].copy_from_slice(&(!crc).to_le_bytes());
+        let path = app.tmp.path().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        paths.push(path);
+    }
+    let first = &paths[0];
+    let next = &paths[1];
+    let inspection = crate::rar_loader::inspect_for_direct_read(next).unwrap();
+    assert_eq!(inspection.resolved_path, *first);
+    assert_eq!(
+        inspection.decision,
+        crate::rar_loader::RarDirectReadDecision::Solid
+    );
+    let cached = convert_and_record_cache(&app, first, ArchiveFormat::Rar);
+    app.persist_book_resume(cached.clone(), 0, meter(1, 1));
+    // An unrelated row at the subsequent-volume would-be cache key must not win.
+    let next_cache = crate::archive_cache::cache_zip_path_for_data_dir(app.tmp.path(), next);
+    app.persist_book_resume(next_cache, 0, meter(1, 5));
+    app.install_new_items(
+        paths
+            .iter()
+            .map(|path| GridItem::ConvertibleArchive {
+                path: path.clone(),
+                format: ArchiveFormat::Rar,
+            })
+            .collect(),
+        paths
+            .iter()
+            .map(|path| {
+                let meta = std::fs::metadata(path).unwrap();
+                Some((crate::ui_helpers::mtime_secs(&meta), meta.len() as i64))
+            })
+            .collect(),
+    );
+    for idx in [0, 1] {
+        refresh_converted_source(&mut app, idx);
+        assert_eq!(
+            app.converted_archive_cache_paths
+                .get(&crate::path_key::normalize_keep_drive(&paths[idx]))
+                .map(super::ConvertedArchiveSourceState::read_source),
+            Some(&super::ConvertedArchiveSourceState::CachedZip {
+                logical_source: first.clone(),
+                path: cached.clone(),
+            })
+        );
+        assert_converted_thumbnail_read_path(&app, idx, Some(&cached));
+    }
+    let thumbnail_sources = app.converted_archive_cache_paths.clone();
+    assert_eq!(app.thumbnail_book_resume_meter(0), meter(1, 1));
+    assert_eq!(app.thumbnail_book_resume_meter(1), None);
+    assert_eq!(app.converted_archive_cache_paths, thumbnail_sources);
+    delete_converted_cache(&mut app, first);
+    assert!(!cached.exists());
+    assert_eq!(
+        app.thumbnail_book_resume_meter(0),
+        None,
+        "Pending is hidden"
+    );
+    assert_eq!(
+        app.thumbnail_book_resume_meter(1),
+        None,
+        "Pending is hidden"
+    );
+    for idx in [0, 1] {
+        refresh_converted_source(&mut app, idx);
+        assert_eq!(
+            app.converted_archive_cache_paths
+                .get(&crate::path_key::normalize_keep_drive(&paths[idx]))
+                .map(super::ConvertedArchiveSourceState::read_source),
+            Some(&super::ConvertedArchiveSourceState::Unavailable {
+                logical_source: Some(first.clone())
+            })
+        );
+        assert_converted_thumbnail_read_path(&app, idx, None);
+    }
+    let thumbnail_sources = app.converted_archive_cache_paths.clone();
+    assert_eq!(app.thumbnail_book_resume_meter(0), meter(1, 1));
+    assert_eq!(app.thumbnail_book_resume_meter(1), None);
+    assert_eq!(app.thumbnail_resume_meter(1), None);
+    app.settings.thumb_show_resume_meter = false;
+    assert_eq!(app.thumbnail_book_resume_meter(0), None);
+    assert_eq!(app.thumbnail_book_resume_meter(1), None);
+    assert_eq!(app.converted_archive_cache_paths, thumbnail_sources);
+    settle(&mut app);
+    assert_eq!(
+        stored_row(app.tmp.path(), &cached),
+        Some((0, Some(1), Some(1)))
+    );
+}
+
+#[test]
+fn book_resume_meter_uppercase_later_rar_with_legacy_cache_is_hidden() {
+    use crate::archive_converter::ArchiveFormat;
+    for extension in ["RAR", "cbr", "CBR"] {
+        let mut app = setup_app();
+        settle(&mut app);
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/archives/rar-multipart-filename-regression/real-split-control");
+        let first = app.tmp.path().join(format!("renamed.part1.{extension}"));
+        let later = app.tmp.path().join(format!("renamed.part2.{extension}"));
+        for (part, target) in [(1, &first), (2, &later)] {
+            std::fs::copy(
+                fixture.join(format!("real-split-control.part{part}.rar")),
+                target,
+            )
+            .unwrap();
+        }
+        let cached = convert_and_record_cache(&app, &first, ArchiveFormat::Rar);
+        let meta = std::fs::metadata(&later).unwrap();
+        app.archive_cache_db
+            .as_ref()
+            .unwrap()
+            .record(
+                &later,
+                crate::ui_helpers::mtime_secs(&meta),
+                meta.len() as i64,
+                ArchiveFormat::Rar,
+                &cached,
+                std::fs::metadata(&cached).unwrap().len() as i64,
+                1,
+                false,
+            )
+            .unwrap();
+        app.persist_book_resume(cached.clone(), 0, meter(1, 1));
+        settle(&mut app);
+        app.install_new_items(
+            vec![GridItem::ConvertibleArchive {
+                path: later.clone(),
+                format: ArchiveFormat::Rar,
+            }],
+            vec![Some((
+                crate::ui_helpers::mtime_secs(&meta),
+                meta.len() as i64,
+            ))],
+        );
+        refresh_converted_source(&mut app, 0);
+        assert_eq!(
+            app.thumbnail_book_resume_meter(0),
+            None,
+            "confirmed subsequent {extension} is not openable"
+        );
+        assert!(cached.exists());
+    }
+}
+
+#[test]
+fn book_resume_meter_native_subsequent_proof_hides_even_when_first_path_equals_cell() {
+    use super::ConvertedArchiveSourceState as Source;
+    let mut app = setup_app();
+    settle(&mut app);
+    let clicked = app.tmp.path().join("book.part2.RAR");
+    app.install_new_items(
+        vec![GridItem::ConvertibleArchive {
+            path: clicked.clone(),
+            format: crate::archive_converter::ArchiveFormat::Rar,
+        }],
+        vec![None],
+    );
+    app.persist_book_resume(clicked.clone(), 0, meter(1, 2));
+    settle(&mut app);
+    let key = crate::path_key::normalize_keep_drive(&clicked);
+    app.converted_archive_cache_paths.insert(
+        key.clone(),
+        Source::Rar {
+            volume: crate::rar_loader::RarVolumeProof::Subsequent {
+                first: clicked.clone(),
+            },
+            source: Box::new(Source::Direct(clicked.clone())),
+        },
+    );
+    assert_eq!(app.thumbnail_book_resume_meter(0), None);
+    assert_converted_thumbnail_read_path(&app, 0, Some(&clicked));
+    app.converted_archive_cache_paths.insert(
+        key,
+        Source::Rar {
+            volume: crate::rar_loader::RarVolumeProof::First,
+            source: Box::new(Source::Direct(clicked)),
+        },
+    );
+    assert_eq!(app.thumbnail_book_resume_meter(0), meter(1, 2));
 }

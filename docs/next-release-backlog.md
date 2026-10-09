@@ -40,6 +40,19 @@
 - 「起動時の表示」を Visualizer にする設定はプラグイン側の設定なので、対応版の同梱だけで使える見込み (未確認)。
 - 規模 / 優先度: Medium / P2 (次の版)。
 
+### 1.355 分割RARは最初のファイルから開き、後続巻の誤変換を防ぐ — 利用者実機報告 (2026-10-08)
+
+- **次の版の決定 (利用者 2026-10-09)**: ラインA。後続巻を開く機能はサポートしない。以前の先頭巻解決・旧cache互換・identity維持案を置き換える。
+- 発見: §1.350の利用者実機確認で、後続巻から有効cacheを見落として再変換し、使用中ZIPのpublishがアクセス拒否になる公開済みv4.4.0の不具合を確認。実RAR5ヘッダー暗号化fixtureではpassword後の後続巻scanが画像0件、直接変換がCRCエラーになることも確認した。
+- 共通決定: RAR scan workerで、secretなしのheaderが後続巻と示したら画像scan・cache照会・Direct採用・変換前に拒否。「分割RARの2つ目以降のファイルです。最初のファイル（header解決済みの最初のファイル名）を開いてください。」を表示する。通常／Smart／履歴／Rating／Collection／ブックマーク／起動／別ウィンドウ／password retryの共通scan入口に適用し、古い後続巻entryも同じ通知にする。
+- ヘッダー暗号化: 先頭巻をファイル名から推測しない。password後に画像も展開対象の入れ子も無ければ「画像が見つかりません。分割RARの場合は最初のファイルを開いてください。」を表示・logする。part1／単巻のDirect → 有効cache → 変換は維持する。
+- 保存データ: 後続巻keyの読書位置・ページ編集が参照できなくなるまれな制約を利用者が受容。既存cache・保存行を削除／移行せず、互換peek・alias・探索を追加しない。
+- 一覧: 後続巻のサムネイルとthumbnail／pin source owner・失効は既存動作を維持。バーだけ、非同期source ownerのtyped header証明がSubsequentの後続巻セルで非表示にする。描画中I/O・ファイル名推測・新しいeligibility状態は追加しない。
+- 維持: 保存失敗loggerの操作・src／tmp／dst・native code、平易な通知、no-clobber、既存ZIP保持を維持。別ウィンドウ本ブックマークの直接cache hit、★固定のcache-only、別ウィンドウDFSの既存policyを入口表の例外として明記する。
+- 追加修正 (2026-10-09、8b327fa02レビュー): Remote、別窓bookmark cache hit、固定snapshot entry／grid、DFSも採用前にtyped volume証明で拒否する。大文字RAR／CBRの案内先解決を修正し、パス差によるmeter判定とcache-onlyの拒否例外を撤去。保存データとthumbnailは保持。
+- 回帰: 有効な旧後続巻cacheを置いた各入口、Remote、大文字RAR／CBRのDFS skip／meter非表示／true first案内、各handlerの後続巻拒否／変換未開始、実暗号化RARの0画像hint／part1変換、実workerの後続巻メーター非表示とthumbnail維持、先頭／単巻のcache再利用・位置復元、新通知snapshotを検証する。
+- 設計記録: [読書位置メーター計画 §19](book-resume-meter-plan.md#19-1355-分割rarは最初のファイルから開く2026-10-09利用者決定)。
+
 ### 1.354 既存の画像経路の EXIF 読み取りで、小さい入力から大量のメモリを確保しうる — 次の版の音声ジャケット (§1.347) の独立レビューで発見 (2026-10-08)
 - **状態: 今後検討 (利用者 2026-10-08)**。
 - 出典: §1.347 (音楽のジャケット画像) の独立実装レビュー P1。音声の埋め込み画像の経路は、専用の有界な Orientation 読み取りに置き換えて対処済み (next-audio-art、`docs/audio-album-art-plan.md` §20.1)。既存の画像経路は同じ parser を使ったまま残っている。
@@ -72,10 +85,12 @@
 ### 1.350 RAR などの変換対象書庫にも一覧の読書位置バーを表示する — mIV スレ >>529 (2026-10-07)
 - **次の版の決定 (利用者 2026-10-07)**: ライン A。最初に実装する。
 
+- **追加決定 (利用者 2026-10-08)**: 変換キャッシュ削除後も読書位置バーを保持する。workerがheaderで確定した論理sourceをキャッシュなしの終端状態にも保持し、決定的な変換ZIP keyを参照する。Pendingは一時非表示でよい。共有source失効（サムネイル／pin、stash／parked）は維持する。
+
 - 報告: v4.4.0 の読書位置バーが RAR の一覧サムネイルに出ない。利用者の手元でも再現。次のバージョンでの対応を目標にする。
 - 原因: `thumbnail_book_resume_meter` は `Folder` / `ZipFile` / `PdfFile` だけを対象にし、RAR/CBR/7z/LZH の一覧セル `ConvertibleArchive` を除外している。`docs/book-resume-meter-plan.md` §2 でも初版の対象外と明記され、既存テストも非表示を期待している。単なる保存失敗ではない。
 - 保存キー: 直読みRARは `current_folder` が元書庫なので元RARのキーへ記録する。変換が必要なRAR/7z/LZHは `current_folder` がキャッシュZIP、`archive_source_override` が元書庫なので、位置はキャッシュZIPのキーへ記録する。元書庫キーだけを一律に参照しても直らない。
-- 方針: 既存の非同期 `converted_archive_cache_paths` の `Direct` / `CachedZip` が解決した実読込元を使い、`BookResumeMeters` の既存mapから比率を取得する。未解決・無効なキャッシュでは表示を捏造しない。UIのセル描画中に書庫検査・ファイルI/O・DB照会を追加しない。分割RARの後続パートは、既存の読込元解決に従い先頭パートと同じ本を参照する。読書位置の保存・復元キー自体は変更しない。
+- 方針: 既存の非同期 `converted_archive_cache_paths` の `Direct` / `CachedZip` の実読込元、またはsource確定済み `Unavailable` だけは現在のdata-dirと論理sourceから計算した変換ZIP keyを使い、`BookResumeMeters` の既存mapから比率を取得する。未解決・論理source未確定・保存行無しでは表示を捏造しない。キャッシュの有無だけでは非表示にしない。UIのセル描画中に書庫検査・ファイルI/O・DB照会を追加しない。2026-10-09の§1.355決定により、headerで後続パートと確定したセルのバーは非表示とする。サムネイルの先頭パート参照は維持する。読書位置の保存・復元キー自体は変更しない。
 - 回帰: 直読みRAR/CBR、変換RAR/CBR・7z/CB7・LZH/LHA、分割RAR、未変換/キャッシュ失効、一覧からの再読込、既存ZIP/PDF/フォルダのバーを確認する。既存の「ConvertibleArchiveは非表示」というテストを新仕様へ更新する。
 - 規模 / 優先度: Small〜Medium / P2 (次版目標)。
 
@@ -137,6 +152,7 @@
 
 ### 1.345 種類の絞り込みを起点フォルダの下位でも維持できるようにする — mIV スレ >>511、>>517、>>521 (2026-10-07)
 - **次の版の決定 (利用者 2026-10-07)**: ライン A。**今の絞り込みとは別の機能として作り直す**: mIV 全体で「表示するファイル種類」を絞る設定 (例: RAR を見ない、RAW を除外)。同名ファイルの除去と同じく、一覧を作るときに最初にかける層で除く (退避・復元を持たない)。適用範囲 (通常・ZIP 内・★一覧・検索・コレクション・Remote)、代表サムネイル・Ctrl+↑↓・本の判定への影響、切り替え手段は設計で利用者に相談する。
+- 確定設計: [file-type-visibility-plan.md](file-type-visibility-plan.md)。全一覧producerの共通ポリシー、派生動作・保存設定・切替UI、状態の簡素化を記載。全質問を推奨どおり採用・既定を維持（利用者2026-10-08）。bf509352dの実装・設計への独立レビュー承認を記録。§1.345は未実装。
 
 - 画像だけを閲覧したい場合に、フォルダを下りるたび動画・音声を再び非表示にする手間をなくす。現在の種類絞り込みは下位フォルダへ移ると解除される。
 - 起点フォルダとその下位への適用範囲、別の場所へ移ったときの解除、ZIP/PDF 本のページ一覧への誤継承を設計時に決める。現行のフォルダ単位の絞り込みを無条件に変更しない。
@@ -176,6 +192,14 @@
 
 ### 1.339 拡張子で絞り込んだ一覧から ZIP を開き、BS → ← → → と移動すると、ZIP のページ一覧に絞り込みが残って空になる — 利用者報告 (2026-10-07)
 - **次の版の決定 (利用者 2026-10-07)**: ライン A。今の絞り込み (facet) の退避の不具合として、§1.345 とは別に直す。
+- 独立した根治設計案: [file-type-visibility-plan.md §9](file-type-visibility-plan.md#9-1339--履歴再入場のfacet退避を採用境界へ集約する)。履歴に親子scopeのrouteを保持し、成功採用時の一つのownerで退避・復元する。§1.345に依存せず実装 (2026-10-08)。通常履歴もtyped要求へ移し、履歴は成功採用後だけ更新する。退避済みfilter値は履歴に保存せず、再入場時のliveな親条件を退避する。sidecarは採用後のhydrationとして既存の待機・表示順序を維持し、採用前の取消・失敗は表示中の一覧と履歴を保つ。
+- 実装レビューの5指摘を修正 (2026-10-08): Collection拒否時のfullscreen終端、toolbarの仮cursor投影、検索更新をまたぐコピー済み移動、Smart分類のrow/path証明、ZIP再読込の準備済みprefix整合。追加のrollback/stateを持たず、実handler・非同期交差の回帰で検証する。
+- 同根の通常ZIP openも修正 (2026-10-08): 検索結果・アドレスバー等でコピー済みpath/effectsを持つNavigationはSurface証明へ統一し、検索更新と分類／準備の交差を検証する。SmartGrid／Rating／Collectionの行依存検証は維持。選択箇所の棚卸しは[async-architecture.md](async-architecture.md#source-proof選択箇所の監査2026-10-08)。
+
+- proof第4回修正 (2026-10-08): コピー済み宛先はSurface、現行行／prepare snapshot依存はRowへ全受付・採用adapterを監査して統一。既存switch sequenceを全証明で照合し、Quick Folder再選択／往復・検索owner切替で未採用要求を退役。実ペインEnterと同queryの実検索refresh交差は許可。履歴／fullscreen scanは元証明を保持。監査表は [async-architecture.md](async-architecture.md#source-proof選択箇所の監査2026-10-08)。
+- native restore証明の追加修正 (2026-10-08): RatingPhysicalのRestoreとQuickFolderSwitchはコピー済み状態に従い、不要なsource行世代条件を除く。Restoreのsource意味identityは元共通Surface証明に委ね、Collection revision／viewport hintの一致を重ねない。BSはRestoreとして共通Direct履歴を維持。実ZIP pin通知による同階層再構築とBack／BS、実Collection revision publishとBackを交差させ、明示open／行順Refreshの行検証は維持する。committed warm PDFの履歴／分類pending・modal中の保留は出荷済み動作として維持し、§9の記述を訂正。
+
+- master統合後の公開境界を追加修正 (2026-10-09): 検索prepareのthumbnail/source map・badge・ratingは成功採用closure内だけで適用。Bookmark buildはmainのSurface leaseとswitch sequenceを持つ単一ownerへ接続し、退出時に退役、遅延pollで再検証する。同一覧sortはownerを継続し、A/B記憶クリアでは旧epochを退役して表示中一覧のbuildを再開始する。ReadingHistory hydrationは送信済みCtrl+F条件で再計算し、未送信の編集を保持。実handlerとworker完了の交差回帰を追加し、§1.345は未着手。
 
 - 出典: 利用者が v4.4.0 リリース前の master 確認ビルド (2e84ee67f) で観測。手順:
   1. 一覧で拡張子の絞り込みをかける
@@ -1921,6 +1945,15 @@ V キーと同じ入口・同じ後始末を通るので、こちらとは別の
 - 規模 / 優先度: Medium / P2。
 
 ### 1.175 `ui_snapshot` のテスト実行体が、たまにアクセス違反で落ちる / 進まなくなる
+
+**2026-10-09 Line A / master統合gateで再観測:** 最終差分の並列snapshot（4 threads）は終盤4件で停滞した後、
+`ui_snapshot-bfef3a5205bc7fdd.exe` が `0xc0000005 / STATUS_ACCESS_VIOLATION` で異常終了した。
+実終了値は `-1073741819`、gate経過750秒。timeoutで中断した結果ではなく、製品変更との因果関係や
+fault moduleは未確定。証跡は `target/A-merge-final-snapshot.log` と `target/A-merge-final-results.json`。
+ソース・期待画像を変えず直列で一度再実行し、124/124成功（94.38秒、exit 0）。
+証跡は `target/A-merge-final-snapshot-serial.log`。同じ最終差分の全libは11,359成功・52 ignoredで
+AVなし（`target/A-merge-final-lib.log`）。並列AVを直列成功で消さず、既存の調査対象として残す。
+製品バイナリは起動せず、他worktreeのプロセスも操作していない。
 
 **2026-10-09 再観測 (利用者):** 次の版の並行作業中、テストを回している間に「wgpu Device Class」のメモリ read エラーダイアログがときどき出ると利用者が報告 (スクリーンショットあり)。タイトルの実行体名は `mimageviewer-7b8981ee7979cd4e…` で、`ui_snapshot` ではなく **lib テストの実行体** (`cargo test -p mimageviewer --lib`。環境設定などの egui_kittest snapshot を含む)。同じ時間帯は複数の worktree で cargo test / build が並行しており、実装担当の `cargo test` は `test-full.ps1 -SuppressCrashDialogs` を通らないためダイアログが出る。同型の AV が lib 実行体でも起きることになるので、調査対象を lib 実行体にも広げる。利用者の判断待ち: 調査の時期 (推奨は次の版の取り込みが一段落した後、他の重い処理と重ねずに cdb で繰り返し実行して例外時の stack を取る)。
 
