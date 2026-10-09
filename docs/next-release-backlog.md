@@ -1790,6 +1790,16 @@ V キーと同じ入口・同じ後始末を通るので、こちらとは別の
 
 ### 1.175 `ui_snapshot` のテスト実行体が、たまにアクセス違反で落ちる / 進まなくなる
 
+**2026-10-09 Line F 調査 (`next-qa` / `d1c95344e`):** actual `ui_snapshot` の4-thread実行で
+second-chance AVを捕捉。fault threadはWGL hidden-window ownerで、
+`setup_pixel_format → ChoosePixelFormat → nvoglv64.dll` の生成経路。別WGL threadsの初期化と
+bootstrap contextの削除も同時に観測した。GPU描画やprocess-exit teardownの事故とは未証明。
+既定maskはadapter選択前にGLも初期化するので、描画にDX12を選んでもこの経路へ入る。
+小さなstress probe・actual suiteの成功は故障の否定に使わず、失敗attemptとstackを保持。
+原因の引き金は未確定、製品/vendor/既存harness/期待画像の修正なし、直列化/retryによるgate変更なし。
+詳細と対照結果・次の構造修正候補は [GPU snapshot 調査記録](ui-snapshot-gpu-investigation.md)。
+`target/F-1175-msg.txt` に引き継ぎを残す。実アプリ起動・WER registry変更・コミットなし。
+
 **2026-10-09 Line A / master統合gateで再観測:** 最終差分の並列snapshot（4 threads）は終盤4件で停滞した後、
 `ui_snapshot-bfef3a5205bc7fdd.exe` が `0xc0000005 / STATUS_ACCESS_VIOLATION` で異常終了した。
 実終了値は `-1073741819`、gate経過750秒。timeoutで中断した結果ではなく、製品変更との因果関係や
