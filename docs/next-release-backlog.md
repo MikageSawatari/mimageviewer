@@ -32,6 +32,17 @@
 
 ## 1. 優先候補
 
+### 1.362 一括エクスポート (Ctrl+E) を XnView MP の一括変換に近づける — 利用者要望 (2026-10-10)
+- **利用者決定 (2026-10-10)**: 対象は下の「範囲」の 3 つまで。実装は次のリリースの後 (次の版には入れない)。
+- 経緯: 利用者が XnView MP の一括変換 (Ctrl+U) との機能差を埋めたいと依頼。調査報告 = `internal/batch-convert-2026-10/report.md` (XnView 側は公式ガイド https://www.xnview.com/en/how-to-batch-convert-and-batch-process/ で確認した分と未確認の分を区別している)。
+- mIV の現状 (コードの参照、報告書に file:line): 対象は一覧で選んだ画像・ZIP 内画像・PDF ページのみ。形式は PNG / JPEG 95・85・75 だけ (WebP は 1 枚の書き出しのみ、`src/capture.rs:7`)。リサイズは そのまま / 1/2 / 1/4 / 長辺 N px 以下 (縮小のみ)、Lanczos3 固定 (`src/export_dialog.rs:349`)。ファイル名の置換子は `<filename>` `<dirname>` `<num>`、同名は常に連番 (`src/export_batch.rs:58-101`)。一括では EXIF・XMP・AI プロンプト・ICC・元の日付を捨てる (`src/books.rs:1948`)。前回の設定を 1 組だけ記憶。画像ごとに保存した編集 (補正・AI・消しゴム・隠蔽・注釈など) を焼き込めるのは mIV の強み。
+- 範囲:
+  1. **出力の基本**: リサイズ方式の追加 (幅・高さ・短辺・% 指定・枠に収める、拡大の許可、リサンプル方式の選択)、一括での WebP、JPEG 品質の任意指定、「元と同じ形式」、「元と同じフォルダ」とサブフォルダ構造の維持、メタデータ・AI プロンプト・ICC・元の日付を残すかの選択、上書きの扱いの選択、ファイル名の置換子の追加。
+  2. **透かし**: 文字と画像の透かし (位置・大きさ・不透明度)。全件に同じものを掛け、画像ごとの保存済み編集のあとに重ねる。
+  3. **保存形式のプリセット**: 形式・品質・リサイズ・出力先・名前・メタデータ・透かしの設定に名前を付けて保存・呼び出し。
+- 範囲外 (今回は扱わない): 全件共通の一時的なアクション連鎖 (切り抜き・回転・色調など)、複数サイズの同時出力 (XnView MP 1.10.4 の新機能、二次資料で確認)、並列処理、AVIF / JXL / TIFF の書き出し、一括リネーム、コマンドライン。§1.177 (一括の準備で UI が止まる) は関連として着手時に扱いを決める。
+- 規模 / 優先度: Medium〜Large / P2 (次のリリースの後)。
+
 ### 1.361 リリース前の idle health と perf smoke を自動化する — 利用者の要望 (2026-10-09)
 - 経緯: v4.5.0 の出荷前確認で、`check-idle-health.ps1` の 4 シナリオと `perf_smoke.ps1` を利用者が手で実施した。各シナリオの準備 (前面 / 背面の切り替え、トレイへ格納、動画を代表画像に固定したフォルダ、Enter 待ち、測定中は触らない) と、perf smoke の操作 (フォルダを開く・Ctrl+↓ ×5・Ctrl+G 検索・終了) が手作業。perf smoke の判定 (100ms 超の間隔ごとの直前 `ui.tail_repaint.action`、`request_repaint` 直後の描画フレームの 16ms 未満率、`ui.pre_grid_breakdown` p95) も、その都度エージェントが perf ログをスクリプトで読み直している。tray-residency の「読み込み中に閉じる」は手では合わせにくい (利用者)。
 - 現状の道具 (コードの参照): 隔離データの使い捨てコピー `scripts/prepare-portable-smoke.ps1` (エージェントが操作してよい唯一の起動形態)、画面操作の台本 `scripts/ui-smoke.ps1` / `scripts/ui-smoke/`、`--settings-override` (test-script 限定)、判定 `scripts/analyze_perf.py idle-health` / `hitches`、閾値 `scripts/idle_health_thresholds.json`。
