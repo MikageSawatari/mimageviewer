@@ -1592,8 +1592,11 @@ installer shutdown はこの遮断を迂回して通常終了する。
 「キー入力 → 画面表示」レイテンシを後から解析するための構造化イベントログ。
 `logger.rs` (人間可読) と `perf.rs` (JSON Lines) はmemory facade。process内の一つの
 `log-writer` が両ファイルのopen・write・flush・rotation・retentionを所有する。producerは
-時刻・OS tidを自身で採取し、有界journalへ一度だけtry_lockして非blocking受付する。
-上限は262,144件／本文128MiB／1件1MiBで、未処理batchも会計に含む。満杯・競合はdrop-new。
+時刻・OS tidを自身で採取し、既存crossbeamの有界channelへ一度だけtry_sendする。
+producer／writer間の共有Mutexは置かず、通常の受付競合では捨てない（実機確認後の利用者決定、2026-10-09）。
+上限は262,144件／本文128MiB／1件1MiBで、発行予約・未処理batchも書込み完了まで会計に含む。
+容量上限／oversizeはdrop-new。登録・cohort選択・cutoff・closeは一つのatomic所有者で確定し、
+barrierを跨ぐ発行を拒否せず、終了はclose前に登録済みの発行も排出する。
 `records_dropped` はsink／理由／差分・累計・発生時刻幅をwriterから直接保存する。
 通常logは各到着batchを直ちにwrite・flush、perfだけdirty時250ms周期。`logger::flush` /
 `perf::flush` はcoalesced非blocking要求であり、保存完了の保証ではない。

@@ -54,10 +54,8 @@ fn record_and_payload_limits_drop_new_and_preserve_adopted_fifo() {
     assert_eq!(service.records.load(Ordering::Acquire), 2);
     assert_eq!(service.bytes.load(Ordering::Acquire), 13);
     assert_eq!(service.drops[0][0].count.load(Ordering::Acquire), 1);
-    let queue = service.queue.lock().unwrap();
-    assert_eq!(queue[0].line, "first\n");
-    assert_eq!(queue[1].line, "second\n");
-    drop(queue);
+    assert_eq!(service.queue.try_recv().unwrap().line, "first\n");
+    assert_eq!(service.queue.try_recv().unwrap().line, "second\n");
     let service = configured(directory.path(), 8, 5);
     assert!(submit(&service, Sink::Normal, "1234"));
     assert!(!submit(&service, Sink::Perf, "12"));
@@ -67,7 +65,7 @@ fn record_and_payload_limits_drop_new_and_preserve_adopted_fifo() {
 }
 
 #[test]
-fn oversize_and_journal_contention_restore_reservations_without_waiting() {
+fn oversize_restores_reservations_without_waiting() {
     let directory = tempfile::tempdir().unwrap();
     let service = configured(directory.path(), 8, 2 * RECORD_BYTES);
     assert!(!submit(
@@ -76,12 +74,8 @@ fn oversize_and_journal_contention_restore_reservations_without_waiting() {
         &"x".repeat(RECORD_BYTES + 1)
     ));
     assert_eq!(service.drops[0][2].count.load(Ordering::Acquire), 1);
-    let queue = service.queue.lock().unwrap();
-    assert!(!submit(&service, Sink::Perf, "contended"));
-    assert_eq!(service.drops[1][3].count.load(Ordering::Acquire), 1);
     assert_eq!(service.records.load(Ordering::Acquire), 0);
     assert_eq!(service.bytes.load(Ordering::Acquire), 0);
-    drop(queue);
     assert!(submit(&service, Sink::Normal, "resumed\n"));
 }
 
@@ -219,6 +213,10 @@ fn multithreaded_producer_timestamps_tids_and_each_thread_order_survive_delivery
     let delivered = writer.service.barrier("ordered".into(), "test").unwrap();
     let adopted: usize = accepted.iter().map(Vec::len).sum();
     assert_eq!(
+        adopted, 128,
+        "ordinary producers must not lose records to arbitration"
+    );
+    assert_eq!(
         delivered.checkpoint.perf_dropped_total,
         (128 - adopted) as u64
     );
@@ -251,6 +249,67 @@ fn multithreaded_producer_timestamps_tids_and_each_thread_order_survive_delivery
 }
 
 #[test]
+fn concurrent_normal_and_perf_startup_burst_has_no_drops() {
+    let directory = tempfile::tempdir().unwrap();
+    // Smaller than the production limits; every offered record fits even if
+    // the writer is preempted for the entire burst.
+    let writer = test_support::writer(directory.path(), 4096, 4 * 1024 * 1024);
+    let ready = Arc::new(std::sync::Barrier::new(9));
+    let mut threads = Vec::new();
+    for producer in 0..8u64 {
+        let service = writer.service.clone();
+        let ready = ready.clone();
+        threads.push(std::thread::spawn(move || {
+            ready.wait();
+            for sequence in 0..200 {
+                assert!(submit(&service, Sink::Normal, &format!("burst-{producer}-{sequence}\n")));
+                let stamp = producer as f64 + sequence as f64 / 1000.0;
+                let event = json!({"t":stamp,"tid":producer+500,"kind":"burst","producer":producer,"seq":sequence});
+                assert!(service.publication(Sink::Perf).unwrap().submit(
+                    format!("{event}\n"), stamp, producer+500, std::panic::Location::caller()
+                ));
+            }
+        }));
+    }
+    ready.wait();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    let delivered = writer
+        .service
+        .barrier("startup-burst".into(), "test")
+        .unwrap();
+    assert_eq!(delivered.checkpoint.normal_dropped_total, 0);
+    assert_eq!(delivered.checkpoint.perf_dropped_total, 0);
+    assert_eq!(writer.service.records.load(Ordering::Acquire), 0);
+    assert_eq!(writer.service.bytes.load(Ordering::Acquire), 0);
+    let normal = snapshot_text(delivered.normal.unwrap());
+    let perf = snapshot_text(delivered.perf.unwrap());
+    let events: Vec<Value> = perf
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|event: &Value| event["kind"] == "burst")
+        .collect();
+    assert_eq!(events.len(), 1600);
+    for producer in 0..8u64 {
+        let prefix = format!("burst-{producer}-");
+        let sequences: Vec<usize> = normal
+            .lines()
+            .filter_map(|line| line.strip_prefix(&prefix))
+            .map(|sequence| sequence.parse().unwrap())
+            .collect();
+        assert_eq!(sequences, (0..200).collect::<Vec<_>>());
+        let sequences: Vec<u64> = events
+            .iter()
+            .filter(|event| event["producer"] == producer)
+            .map(|event| event["seq"].as_u64().unwrap())
+            .collect();
+        assert_eq!(sequences, (0..200).collect::<Vec<_>>());
+    }
+    assert!(writer.shutdown());
+}
+
+#[test]
 fn summaries_write_delta_total_and_time_span_without_reentering_full_queue() {
     let directory = tempfile::tempdir().unwrap();
     let service = configured(directory.path(), 1, 4096);
@@ -262,10 +321,12 @@ fn summaries_write_delta_total_and_time_span_without_reentering_full_queue() {
     worker.drop_summaries();
     worker.flush(true);
     assert_eq!(service.records.load(Ordering::Acquire), 1);
-    assert_eq!(
-        service.queue.lock().unwrap().front().unwrap().line,
-        "adopted\n"
-    );
+    let record = service.queue.try_recv().unwrap();
+    assert_eq!(record.line, "adopted\n");
+    service
+        .sender
+        .try_send(record)
+        .unwrap_or_else(|_| panic!("fixture slot unavailable"));
     service.drops[0][0].note(9.5);
     worker.drop_summaries();
     worker.drop_summaries();
@@ -295,7 +356,7 @@ fn registered_publication_prevents_premature_barrier_ack_and_busy_request() {
     let writer = test_support::writer(directory.path(), 32, 65536);
     // Registration precedes the producer's timestamp/formatting boundary.
     let publication = writer.service.publication(Sink::Normal).unwrap();
-    let cutoff = publication.epoch;
+    let cutoff = writer.service.epoch.load(Ordering::SeqCst);
     let pause = writer.pause("control");
     let service = writer.service.clone();
     let (finished, receiver) = mpsc::channel();
@@ -306,6 +367,8 @@ fn registered_publication_prevents_premature_barrier_ack_and_busy_request() {
     });
     pause.entered();
     assert!(writer.service.barrier("duplicate".into(), "test").is_err());
+    let later = writer.service.publication(Sink::Normal).unwrap();
+    assert_ne!(later.cohort, cutoff as usize % 2);
     drop(pause);
     assert!(receiver.recv_timeout(Duration::from_millis(30)).is_err());
     let enqueue = writer.pause_dequeue();
@@ -320,7 +383,10 @@ fn registered_publication_prevents_premature_barrier_ack_and_busy_request() {
     assert_eq!(delivered.checkpoint.ticket_cutoff, cutoff);
     assert_eq!(delivered.checkpoint.settled_watermark, cutoff);
     assert!(snapshot_text(delivered.normal.unwrap()).contains("registered tail"));
+    assert_eq!(delivered.checkpoint.normal_dropped_total, 0);
+    assert_eq!(writer.service.publications.count(later.cohort), 1);
     waiter.join().unwrap();
+    drop(later);
     assert!(writer.shutdown());
 }
 
@@ -427,13 +493,14 @@ fn one_failed_sink_stays_unavailable_while_other_sink_continues() {
 }
 
 #[test]
-fn expired_control_never_reports_successful_delivery() {
+fn expired_control_keeps_old_cohort_busy_until_it_settles() {
     let directory = tempfile::tempdir().unwrap();
-    let service = configured(directory.path(), 32, 65536);
+    let service = configured(directory.path(), 8, 65536);
+    let publication = service.publication(Sink::Normal).unwrap();
     let pause = test_support::pause_service(&service, "control");
     let (response, receiver) = mpsc::channel();
     service.control_busy.store(true, Ordering::Release);
-    let cutoff = service.epoch.fetch_add(1, Ordering::SeqCst);
+    let cutoff = service.cutoff();
     *service.control.lock().unwrap() = Some(Control {
         request_id: "expired".into(),
         purpose: "test".into(),
@@ -444,9 +511,26 @@ fn expired_control_never_reports_successful_delivery() {
     });
     service.start();
     pause.entered();
+    let epoch = service.epoch.load(Ordering::SeqCst);
+    assert!(service.barrier("cannot-recycle".into(), "test").is_err());
+    assert_eq!(service.epoch.load(Ordering::SeqCst), epoch);
     drop(pause);
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    assert!(service.control_busy.load(Ordering::Acquire));
+    drop(publication);
     let result = receiver.recv_timeout(BARRIER_WAIT).unwrap();
     assert!(matches!(result, Err(error) if error.contains("deadline")));
+    // A response can reach the caller just before the worker clears busy. Use
+    // a worker latch after the clear, rather than retrying a control request.
+    let next = test_support::pause_service(&service, "dequeue");
+    service.wake();
+    next.entered();
+    assert!(!service.control_busy.load(Ordering::Acquire));
+    drop(next);
+    assert!(service.barrier("after-expired".into(), "test").is_ok());
     assert!(service.shutdown(Instant::now() + BARRIER_WAIT));
 }
 
@@ -685,17 +769,16 @@ fn resumed_batch_reports_drops_before_the_remaining_tail_is_drained() {
     assert!(normal.contains("blocked batch"));
     assert!(normal.contains("[async-log] dropped count=1 total=1"));
     assert!(!normal.contains("remaining queued tail"));
-    assert_eq!(writer.service.queue.lock().unwrap().len(), 1);
+    assert_eq!(writer.service.queue.len(), 1);
     drop(resumed);
     assert!(writer.shutdown());
 }
 
 #[test]
-fn rejected_registration_publishes_its_drop_before_settling_the_old_cohort() {
+fn publication_crossing_cutoff_is_saved_without_a_contention_drop() {
     let directory = tempfile::tempdir().unwrap();
-    let writer = test_support::writer(directory.path(), 32, 65536);
+    let writer = test_support::writer(directory.path(), 16, 4096);
     let registered = writer.pause("publication-registered");
-    let epoch = writer.service.epoch.load(Ordering::SeqCst);
     let producer = writer.clone();
     let producer = std::thread::spawn(move || producer.submit_normal("crossing the cutoff"));
     registered.entered();
@@ -708,24 +791,18 @@ fn rejected_registration_publishes_its_drop_before_settling_the_old_cohort() {
             .unwrap()
     });
     control.entered();
-    let rejecting = writer.pause("registration-drop");
-    drop(registered);
-    rejecting.entered();
-    let settled_too_soon = writer.service.active[epoch as usize % 2].load(Ordering::SeqCst) == 0;
+    assert!(matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty)));
     drop(control);
-    drop(rejecting);
-    assert!(!producer.join().unwrap());
+    drop(registered);
+    let accepted = producer.join().unwrap();
     let delivery = result.recv_timeout(BARRIER_WAIT).unwrap().unwrap();
     barrier.join().unwrap();
     assert!(
-        !settled_too_soon,
-        "registered drop was declared settled before counter publication"
+        accepted,
+        "a normal cutoff must not reject a registered publication"
     );
-    assert_eq!(delivery.checkpoint.normal_dropped_total, 1);
-    assert_eq!(
-        delivery.checkpoint.dropped_by_reason["normal"]["journal_contended"],
-        1
-    );
+    assert_eq!(delivery.checkpoint.normal_dropped_total, 0);
+    assert!(snapshot_text(delivery.normal.unwrap()).contains("crossing the cutoff\n"));
     assert!(writer.shutdown());
 }
 
@@ -751,10 +828,10 @@ fn perf_initialization_failure_discards_buffer_without_drop_retry() {
 }
 
 #[test]
-fn real_worker_dequeue_contention_drops_without_waiting_and_barrier_accounts_it() {
+fn ordinary_producer_is_admitted_while_worker_is_dequeuing() {
     let directory = tempfile::tempdir().unwrap();
     let writer = test_support::writer(directory.path(), 32, 65536);
-    let pause = writer.pause("dequeue-held");
+    let pause = writer.pause("batch-dequeue");
     writer.service.wake();
     pause.entered();
     let producer = writer.clone();
@@ -767,16 +844,12 @@ fn real_worker_dequeue_contention_drops_without_waiting_and_barrier_accounts_it(
     thread.join().unwrap();
     assert_eq!(
         result.unwrap(),
-        false,
-        "production admission must never wait on dequeue"
+        true,
+        "production admission must not wait or drop during dequeue"
     );
     let delivered = writer.service.barrier("contention".into(), "test").unwrap();
-    assert_eq!(delivered.checkpoint.normal_dropped_total, 1);
-    assert_eq!(
-        delivered.checkpoint.dropped_by_reason["normal"]["journal_contended"],
-        1
-    );
-    assert!(!snapshot_text(delivered.normal.unwrap()).contains("contended\n"));
+    assert_eq!(delivered.checkpoint.normal_dropped_total, 0);
+    assert!(snapshot_text(delivered.normal.unwrap()).contains("contended\n"));
     assert!(writer.shutdown());
 }
 
@@ -945,4 +1018,31 @@ fn single_producer_fifo_has_zero_drops_with_latched_worker() {
         .collect::<Vec<_>>();
     assert_eq!(sequence, (0..32).collect::<Vec<_>>());
     assert!(service.shutdown(Instant::now() + BARRIER_WAIT));
+}
+
+#[test]
+fn shutdown_seals_new_registration_but_saves_already_registered_producer() {
+    let directory = tempfile::tempdir().unwrap();
+    let writer = test_support::writer(directory.path(), 16, 4096);
+    let registered = writer.pause("publication-registered");
+    let producer = writer.clone();
+    let producer = std::thread::spawn(move || producer.submit_normal("registered before shutdown"));
+    registered.entered();
+    assert!(!writer.service.shutdown(Instant::now()));
+    assert!(writer.service.publication(Sink::Normal).is_none());
+    drop(registered);
+    assert!(producer.join().unwrap());
+    assert!(writer.shutdown());
+    assert!(
+        std::fs::read_to_string(directory.path().join("mimageviewer.log"))
+            .unwrap()
+            .contains("registered before shutdown\n")
+    );
+    assert_eq!(
+        writer.service.drops[0]
+            .iter()
+            .map(|d| d.count.load(Ordering::Acquire))
+            .sum::<u64>(),
+        0
+    );
 }

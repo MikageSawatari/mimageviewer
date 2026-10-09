@@ -3,7 +3,6 @@
 //! are deliberately separate from the fire-and-forget facade flush operation.
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -146,17 +145,66 @@ enum ErrorNotice {
     Reported,
 }
 
+// Registration and cutoff share one atomic owner: a publication is always
+// counted in exactly the cohort selected at its registration linearization point.
+// A cutoff cannot reject it or miss a late count increment in the old cohort.
+struct Publications(AtomicU64);
+impl Publications {
+    const COUNT: u64 = (1 << 31) - 1;
+    const COHORT: u64 = 1 << 62;
+    const CLOSED: u64 = 1 << 63;
+
+    fn new() -> Self {
+        Self(AtomicU64::new(Self::COHORT)) // matches initial checkpoint epoch 1
+    }
+    fn cohort(state: u64) -> usize {
+        usize::from(state & Self::COHORT != 0)
+    }
+    fn register(&self) -> Option<usize> {
+        self.0
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+                if state & Self::CLOSED != 0 {
+                    return None;
+                }
+                let shift = Self::cohort(state) * 31;
+                // Each guard belongs to a live facade call. Two billion live
+                // guards cannot fit the process's producer/thread/stack resources.
+                assert!((state >> shift) & Self::COUNT < Self::COUNT);
+                Some(state + (1 << shift))
+            })
+            .ok()
+            .map(Self::cohort)
+    }
+    fn cutoff(&self) -> usize {
+        Self::cohort(self.0.fetch_xor(Self::COHORT, Ordering::SeqCst))
+    }
+    fn count(&self, cohort: usize) -> u64 {
+        (self.0.load(Ordering::SeqCst) >> (cohort * 31)) & Self::COUNT
+    }
+    fn settle(&self, cohort: usize) {
+        let before = self.0.fetch_sub(1 << (cohort * 31), Ordering::SeqCst);
+        debug_assert!((before >> (cohort * 31)) & Self::COUNT != 0);
+    }
+    fn close(&self) {
+        self.0.fetch_or(Self::CLOSED, Ordering::SeqCst);
+    }
+    fn settled(&self) -> bool {
+        self.0.load(Ordering::SeqCst) & !(Self::COHORT | Self::CLOSED) == 0
+    }
+}
+
 struct Service {
     normal: OnceLock<NormalConfig>,
     perf: OnceLock<PerfConfig>,
-    queue: Mutex<VecDeque<Record>>,
+    sender: crossbeam_channel::Sender<Record>,
+    queue: crossbeam_channel::Receiver<Record>,
     records: AtomicUsize,
     bytes: AtomicUsize,
     record_limit: usize,
     payload_limit: usize,
     drops: [[Drops; 4]; 2],
     epoch: AtomicU64,
-    active: [AtomicUsize; 2],
+    publications: Publications,
     phase: AtomicU8,
     control_busy: AtomicBool,
     control: Mutex<Option<Control>>,
@@ -173,17 +221,19 @@ struct Service {
 impl Service {
     fn new(record_limit: usize, payload_limit: usize) -> Arc<Self> {
         let created = crate::perf::process_start_unix_ms().unwrap_or(0);
+        let (sender, queue) = crossbeam_channel::bounded(record_limit);
         Arc::new(Self {
             normal: OnceLock::new(),
             perf: OnceLock::new(),
-            queue: Mutex::new(VecDeque::with_capacity(record_limit)),
+            sender,
+            queue,
             records: AtomicUsize::new(0),
             bytes: AtomicUsize::new(0),
             record_limit,
             payload_limit,
             drops: std::array::from_fn(|_| std::array::from_fn(|_| Drops::default())),
             epoch: AtomicU64::new(1),
-            active: std::array::from_fn(|_| AtomicUsize::new(0)),
+            publications: Publications::new(),
             phase: AtomicU8::new(Lifecycle::Running as u8),
             control_busy: AtomicBool::new(false),
             control: Mutex::new(None),
@@ -234,6 +284,7 @@ impl Service {
         }
     }
     fn complete(&self, success: bool) {
+        self.publications.close();
         let _completion = self.completed.0.lock().unwrap_or_else(|e| e.into_inner());
         self.phase.store(
             if success {
@@ -249,8 +300,8 @@ impl Service {
         self.drops[sink as usize][reason].note(self.clock());
         self.wake();
     }
-    // Cohort registration is bounded by live producers, rather than keeping an
-    // unbounded ledger of tickets while one producer is preempted. No retry.
+    // One atomic registration selects and counts a cohort. The only normal
+    // refusal is closed admission, never an overlapping dequeue or cutoff.
     fn publication(self: &Arc<Self>, sink: Sink) -> Option<Publication> {
         if match sink {
             Sink::Normal => self.normal.get().is_none(),
@@ -261,23 +312,12 @@ impl Service {
         if !self.is_running() {
             return None;
         }
-        let epoch = self.epoch.load(Ordering::SeqCst);
-        self.active[epoch as usize % 2].fetch_add(1, Ordering::SeqCst);
+        let cohort = self.publications.register()?;
         #[cfg(test)]
         self.pause("publication-registered");
-        if self.epoch.load(Ordering::SeqCst) != epoch || !self.is_running() {
-            #[cfg(test)]
-            self.pause("registration-drop");
-            // A barrier may observe zero immediately after this decrement.
-            // Publish the rejected record's counter before settling its cohort.
-            self.drop_record(sink, 3);
-            self.active[epoch as usize % 2].fetch_sub(1, Ordering::SeqCst);
-            self.wake();
-            return None;
-        }
         Some(Publication {
             service: self.clone(),
-            epoch,
+            cohort,
             sink,
         })
     }
@@ -310,25 +350,36 @@ impl Service {
             self.drop_record(sink, 1);
             return false;
         }
-        if let Ok(mut queue) = self.queue.try_lock() {
-            // Closing is sealed only after all registered publications settle.
-            queue.push_back(Record {
-                sink,
-                line,
-                enqueued_at: Instant::now(),
-                tid,
-                site,
-            });
-            drop(queue);
-            self.wake();
-            true
-        } else {
-            self.bytes.fetch_sub(size, Ordering::AcqRel);
-            self.records.fetch_sub(1, Ordering::AcqRel);
-            self.drop_record(sink, 3);
-            false
+        let record = Record {
+            sink,
+            line,
+            enqueued_at: Instant::now(),
+            tid,
+            site,
+        };
+        match self.sender.try_send(record) {
+            Ok(()) => {
+                self.wake();
+                true
+            }
+            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                self.bytes.fetch_sub(size, Ordering::AcqRel);
+                self.records.fetch_sub(1, Ordering::AcqRel);
+                self.drop_record(sink, 0);
+                false
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                unreachable!("Service owns both channel ends while a publication is alive")
+            }
         }
     }
+    fn cutoff(&self) -> u64 {
+        let cutoff = self.epoch.fetch_add(1, Ordering::SeqCst);
+        let cohort = self.publications.cutoff();
+        debug_assert_eq!(cohort, cutoff as usize % 2);
+        cutoff
+    }
+
     fn barrier(self: &Arc<Self>, request_id: String, purpose: &str) -> Result<Delivered, String> {
         if !self.is_running()
             || self
@@ -339,7 +390,7 @@ impl Service {
             return Err("log delivery busy or closing".into());
         }
         let coverage_at = Instant::now(); // before the cutoff, not after it
-        let cutoff = self.epoch.fetch_add(1, Ordering::SeqCst);
+        let cutoff = self.cutoff();
         let (response, receiver) = mpsc::channel();
         let deadline = Instant::now() + BARRIER_WAIT;
         *self.control.lock().unwrap_or_else(|e| e.into_inner()) = Some(Control {
@@ -395,6 +446,7 @@ impl Service {
         })
     }
     fn shutdown(&self, deadline: Instant) -> bool {
+        self.publications.close();
         let _ = self.phase.compare_exchange(
             Lifecycle::Running as u8,
             Lifecycle::Closing as u8,
@@ -424,7 +476,7 @@ impl Service {
 }
 pub(crate) struct Publication {
     service: Arc<Service>,
-    epoch: u64,
+    cohort: usize,
     sink: Sink,
 }
 impl Publication {
@@ -441,7 +493,7 @@ impl Publication {
 }
 impl Drop for Publication {
     fn drop(&mut self) {
-        self.service.active[self.epoch as usize % 2].fetch_sub(1, Ordering::SeqCst);
+        self.service.publications.settle(self.cohort);
         self.service.wake();
     }
 }
@@ -736,13 +788,14 @@ impl Worker {
     fn batch(&mut self) -> bool {
         #[cfg(test)]
         self.service.pause("dequeue");
-        let records: Vec<_> = {
-            let mut queue = self.service.queue.lock().unwrap_or_else(|e| e.into_inner());
-            #[cfg(test)]
-            self.service.pause("dequeue-held");
-            let count = queue.len().min(BATCH);
-            queue.drain(..count).collect()
-        };
+        #[cfg(test)]
+        self.service.pause("batch-dequeue");
+        // The fixed channel owns slots, not a producer/worker shared mutex.
+        // Counts/bytes remain reserved until raw delivery finishes below. This
+        // also prevents a sender wrapping onto a receiver's unpublished slot.
+        let records: Vec<_> = (0..BATCH)
+            .map_while(|_| self.service.queue.try_recv().ok())
+            .collect();
         if records.is_empty() {
             return false;
         }
@@ -943,11 +996,7 @@ impl Worker {
                     let _ = control.response.send(Err("log writer closing".into()));
                     self.service.control_busy.store(false, Ordering::Release);
                 }
-                if self
-                    .service
-                    .active
-                    .iter()
-                    .all(|a| a.load(Ordering::SeqCst) == 0)
+                if self.service.publications.settled()
                     && self.service.records.load(Ordering::Acquire) == 0
                 {
                     let (response, _) = mpsc::channel();
@@ -971,7 +1020,7 @@ impl Worker {
             } else if let Some(control) = self.pending.as_ref() {
                 // Do not recycle a cohort slot until all old publications settled,
                 // even when the requesting worker already timed out.
-                if self.service.active[control.cutoff as usize % 2].load(Ordering::SeqCst) == 0 {
+                if self.service.publications.count(control.cutoff as usize % 2) == 0 {
                     let control = self.pending.take().unwrap();
                     let result = if Instant::now() >= control.deadline {
                         Err("log delivery deadline exceeded".into())
@@ -980,10 +1029,9 @@ impl Worker {
                         // keep this barrier waiting for an ever-empty journal.
                         let tail = self
                             .service
-                            .queue
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .len();
+                            .records
+                            .load(Ordering::Acquire)
+                            .min(self.service.record_limit);
                         for _ in 0..tail.div_ceil(BATCH) {
                             self.batch();
                         }
@@ -996,10 +1044,9 @@ impl Worker {
             if self.service.flush.swap(false, Ordering::AcqRel) {
                 let tail = self
                     .service
-                    .queue
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .len();
+                    .records
+                    .load(Ordering::Acquire)
+                    .min(self.service.record_limit);
                 for _ in 0..tail.div_ceil(BATCH) {
                     self.batch();
                 }

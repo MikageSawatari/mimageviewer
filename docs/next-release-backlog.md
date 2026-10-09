@@ -73,6 +73,7 @@
 - 設計案: 通常／perfファイルのopen・write・flush・rotation・retentionを一つの専用writerへ移す。producerは自身の時刻・tid付きレコードを非blockingで有界queueへ渡す。欠落件数を記録し、UIのperf::flushは要求だけ、通常終了のdrainは上限付き。panic.log／UI watchdog／常時startup JSONL／Remote専用logの独立境界を保持し、allocラインのstartup `.lock` sidecar修正も維持する。
 - Store関連の初回「起動中…」の描画前にも、perf有効時の同期write／flushと常時の通常logがある。これを非同期化するが、Storeの起動問題の原因確定・解消とは扱わない。
 - 実装: 単一writer、worker ZIP、完了checkpointと解析CannotJudge、startup terminal保護／flush ACKを接続。next-alloc `90a8a9353` の.lock sidecar修正と試験のみ移植（allocator flavorは取り込まない）。故意に停止させたsink／ZIP実配送／解析偽PASSの回帰と共用gateを検証し、独立実装レビューへ引き継ぐ。規模 / 優先度: Medium / P2。
+- 実機確認後（利用者2026-10-09）: 7-plugin構成で目立つUI停止なしとの報告。一方、コピーには通常17件／perf60件の`journal_contended`欠落が残った（最初の36秒相当の通常欠落は14件）。利用者は通常負荷で診断ログを失わないことを要求。容量不足ではなく共有journal Mutexの排出／受付競合が根因なので、容量は変えず有界channelとatomic publication ownerへ置換し、barrier登録競合による拒否も除く。調査担当の製品起動はない。詳細と観測限界は設計§14。
 
 ### 1.354 既存の画像経路の EXIF 読み取りで、小さい入力から大量のメモリを確保しうる — 次の版の音声ジャケット (§1.347) の独立レビューで発見 (2026-10-08)
 - **状態: 今後検討 (利用者 2026-10-08)**。
