@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import math
 import shutil
 import subprocess
 import sys
@@ -445,9 +446,9 @@ class EvidenceTests(unittest.TestCase):
     def test_both_tray_cases_independently_require_complete_proof(self):
         for completed in (False, True):
             events, evidence = self.tray(completed)
-            self.assertEqual(analyze_case_evidence(events, evidence, PID)["verdict"], "PASS")
+            self.assertEqual(analyze_case_evidence(events, evidence, PID, setup_deadline_t=10)["verdict"], "PASS")
             events[1]["loading_complete"] = not completed
-            self.assertEqual(analyze_case_evidence(events, evidence, PID)["verdict"], "SKIPPED")
+            self.assertEqual(analyze_case_evidence(events, evidence, PID, setup_deadline_t=10)["verdict"], "SKIPPED")
 
     def test_cache_hit_pre_hide_source_save_or_no_backlog_is_not_reproduction(self):
         for kind, field, value in (("source", "from_cache", True), ("request_begin", "t", 7),
@@ -457,20 +458,49 @@ class EvidenceTests(unittest.TestCase):
             with self.subTest(field=field):
                 events, evidence = self.tray()
                 next(e for e in events if e["kind"] == kind)[field] = value
-                self.assertEqual(analyze_case_evidence(events, evidence, PID)["verdict"], "SKIPPED")
+                self.assertEqual(analyze_case_evidence(events, evidence, PID, setup_deadline_t=10)["verdict"], "SKIPPED")
 
     def test_same_seq_does_not_prove_same_request(self):
         events, evidence = self.tray()
         for e in events:
             e.pop("request_id", None)
-        self.assertEqual(analyze_case_evidence(events, evidence, PID)["verdict"], "SKIPPED")
+        self.assertEqual(analyze_case_evidence(events, evidence, PID, setup_deadline_t=10)["verdict"], "SKIPPED")
 
     def test_seed_recipe_or_script_exit_zero_does_not_prove_normal_exit(self):
         events, evidence = self.tray()
         evidence.update(seed_kind="video-pin", target_key="dir::fixture/child", copied_after_process_exit=True)
-        self.assertEqual(analyze_case_evidence(events, evidence, PID)["verdict"], "SKIPPED")
+        self.assertEqual(analyze_case_evidence(events, evidence, PID, setup_deadline_t=10)["verdict"], "SKIPPED")
         evidence["exit"]["forced"] = True
-        self.assertEqual(analyze_case_evidence(events, evidence, PID)["verdict"], "SKIPPED")
+        self.assertEqual(analyze_case_evidence(events, evidence, PID, setup_deadline_t=10)["verdict"], "SKIPPED")
+
+    def test_standalone_tray_requires_measurement_start_deadline(self):
+        for completed in (False, True):
+            events, evidence = self.tray(completed)
+            for deadline in (None, -1, float("nan"), True):
+                with self.subTest(completed=completed, deadline=deadline):
+                    result = analyze_case_evidence(events, evidence, PID, setup_deadline_t=deadline)
+                    self.assertEqual(result["verdict"], "SKIPPED")
+                    self.assertIn("tray converted measurement-start setup deadline missing/invalid",
+                                  result["environment_errors"])
+
+    def test_every_tray_setup_witness_must_exist_by_start_including_save_decision(self):
+        for completed in (False, True):
+            for kind in ("close_accept", "tray_hide", "request_begin", "source", "finalized"):
+                with self.subTest(completed=completed, kind=kind):
+                    events, evidence = self.tray(completed)
+                    next(e for e in events if e.get("kind") == kind)["t"] = math.nextafter(10, math.inf)
+                    result = analyze_case_evidence(events, evidence, PID, setup_deadline_t=10)
+                    self.assertEqual(result["verdict"], "SKIPPED")
+            events, evidence = self.tray(completed)
+            source = next(e for e in events if e.get("kind") == "source")
+            source.pop("should_save")
+            next(e for e in events if e.get("kind") == "finalized")["t"] = 10
+            load = {**source, "cat": "thumb", "kind": "load_phases", "t": 10,
+                    "total_ms": 50, "should_save": False, "force_cache": False}
+            events.append(load)
+            self.assertEqual(analyze_case_evidence(events, evidence, PID, setup_deadline_t=10)["verdict"], "PASS")
+            load["t"] = math.nextafter(10, math.inf)
+            self.assertEqual(analyze_case_evidence(events, evidence, PID, setup_deadline_t=10)["verdict"], "SKIPPED")
 
     def test_combined_seed_preparation_does_not_invent_cache_reread(self):
         case = "seed-profile"
@@ -519,6 +549,36 @@ class IdleTests(unittest.TestCase):
         self.assertEqual(analyze_idle_case(events, sampler, evidence, thresholds, PID)["verdict"], "PASS_WITH_WARNINGS")
         sampler["window_samples"][7]["foreground_pid"] = 99
         self.assertEqual(analyze_idle_case(events, sampler, evidence, thresholds, PID)["verdict"], "SKIPPED")
+
+    def test_tray_reproduction_complete_by_converted_start_not_measurement_or_sleep_end(self):
+        for completed in (False, True):
+            for finalized_t, expected in ((8.4, "PASS_WITH_WARNINGS"), (10, "PASS"),
+                                          (math.nextafter(10, math.inf), "SKIPPED"),
+                                          (12, "SKIPPED"), (31.4, "SKIPPED")):
+                with self.subTest(completed=completed, finalized_t=finalized_t):
+                    _, sampler, _, thresholds = self.setup_case()
+                    events, evidence = EvidenceTests().tray(completed)
+                    sampler["case_id"] = evidence["case_id"]
+                    # Keep all late setup events within sleep: this is not sufficient.
+                    sampler["sleep_end_unix_ms"] = OS_START + 40_000
+                    for sample in sampler["window_samples"]:
+                        sample["visible"] = 0
+                    events.extend([{"cat": "frame", "kind": "begin", "t": 7.9, "n": 1},
+                                   {"cat": "ui", "kind": "tail_repaint", "t": 7.9, "n": 1, "action": "none"}])
+                    next(e for e in events if e.get("kind") == "request_begin")["t"] = finalized_t - .2
+                    next(e for e in events if e.get("kind") == "source")["t"] = finalized_t - .1
+                    next(e for e in events if e.get("kind") == "finalized")["t"] = finalized_t
+                    result = analyze_idle_case(events, sampler, evidence, thresholds, PID)
+                    self.assertEqual(result["verdict"], expected, result)
+                    clock = result["evidence"]["clock"]
+                    self.assertEqual((clock["start_t"], clock["end_t"]), (10, 25))
+                    self.assertEqual(result["evidence"]["tray"]["setup_deadline_t"], 10)
+                    targets = result["evidence"]["tray"]["valid_targets"]
+                    if expected in ("PASS", "PASS_WITH_WARNINGS"):
+                        self.assertEqual(targets[0]["finalized_t"], finalized_t)
+                        self.assertLessEqual(targets[0]["source_t"], 10)
+                    else:
+                        self.assertEqual(targets, [])
 
     def test_cpu_and_log_limits_fail_without_threshold_relaxation(self):
         for field, value in (("cpu_core_ratio", .10001), ("app_log_growth_bytes", 16385),

@@ -49587,8 +49587,6 @@ impl App {
                 payload,
                 input_seq: req_input_seq,
                 items_gen: msg_items_gen,
-                #[cfg(feature = "test-script")]
-                diagnostic_id,
             } = msg;
             if msg_items_gen != self.items_generation {
                 continue;
@@ -49682,7 +49680,6 @@ impl App {
                             "idx": i,
                             "items_gen": msg_items_gen,
                             "input_seq": req_input_seq,
-                            "request_id": diagnostic_id,
                             "from_cache": true,
                         }),
                     );
@@ -49709,14 +49706,6 @@ impl App {
             // drop された後の幽霊シグナル。pending_finalize に挿入すると stale 状態が
             // 残り続けるので無視する。
             if finalized {
-                #[cfg(all(windows, feature = "test-script"))]
-                crate::app::release_checks::record_finalized(
-                    self,
-                    diagnostic_id,
-                    i,
-                    msg_items_gen,
-                    req_input_seq,
-                );
                 // Source decode/cache replacement advances the representative identity. Ordinary
                 // cache reads and GPU eviction do not invalidate unchanged color results.
                 self.invalidate_color_representative(i);
@@ -49925,25 +49914,21 @@ impl App {
                     } else if treat_as_in_range {
                         // 上限到達で keep_range 内 (or 動画): 次フレームに持ち越す。
                         // requested は除去しない (重複リクエスト防止)。
-                        let backlog_message = crate::thumb_loader::ThumbMsg::from_legacy_parts(
-                            i,
-                            Some(color_image),
-                            origin,
-                            from_edit_preview,
-                            edit_preview_adjustment,
-                            source_dims,
-                            layout_dims,
-                            false,
-                            false,
-                            req_input_seq,
-                            msg_items_gen,
+                        self.texture_backlog.push(
+                            crate::thumb_loader::ThumbMsg::from_legacy_parts(
+                                i,
+                                Some(color_image),
+                                origin,
+                                from_edit_preview,
+                                edit_preview_adjustment,
+                                source_dims,
+                                layout_dims,
+                                false,
+                                false,
+                                req_input_seq,
+                                msg_items_gen,
+                            ),
                         );
-                        #[cfg(feature = "test-script")]
-                        let backlog_message = crate::thumb_loader::ThumbMsg {
-                            diagnostic_id,
-                            ..backlog_message
-                        };
-                        self.texture_backlog.push(backlog_message);
                     } else {
                         // 範囲外: ColorImage を drop し Evicted にしておく。
                         // from_cache / from_source に関わらず、UI 側の要求はここで完了扱い。

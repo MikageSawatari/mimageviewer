@@ -50,7 +50,6 @@ pub(crate) struct Session {
     pub(crate) close_sequence: u64,
     pub(crate) close_proof: Value,
     pub(crate) cache_proof: Value,
-    pub(crate) finalized: Vec<Value>,
     pub(crate) opens: Vec<Value>,
     pub(crate) preflight_opens: Vec<Value>,
     pub(crate) quit_after_finish: bool,
@@ -498,7 +497,6 @@ fn evidence(bridge: &RunnerBridge, directory: &str, script: Map) -> Result<(), S
         value["observation"] = observation.value.clone();
         value["requested_px"] = observation.value["requested_px"].clone();
         value["close"] = state.close_proof.clone();
-        value["finalized"] = json!(state.finalized);
         value["cache"] = json!({"mode":if state.case_id=="perf-uncached" {"uncached"} else {"cached"},"opens":state.opens});
         if state.case_id == "video-pin-background" {
             value["target_key"] = observation.value["targets"]
@@ -580,6 +578,10 @@ pub(super) fn register(engine: &mut Engine, bridge: RunnerBridge) {
             if !matches!(mode.as_str(), "while-loading" | "after-loading") {
                 return Err(rhai_error("environment: invalid tray close mode"));
             }
+            require_tray_request_projection().map_err(|message| {
+                b.interrupt.fail(message.clone());
+                rhai_error(message)
+            })?;
             let deadline = Instant::now() + Duration::from_secs(20);
             let o = loop {
                 let o = request(&b, Operation::Observe).map_err(rhai_error)?;
@@ -747,6 +749,12 @@ pub(super) fn register(engine: &mut Engine, bridge: RunnerBridge) {
         }
     });
 }
+// Phase 3b will connect Line A's ThumbnailRequestId and read-only owner projection.
+// Until then, never run a tray measurement with an invented or missing witness.
+fn require_tray_request_projection() -> Result<(), String> {
+    Err("environment: tray request-owner projection awaits Line A merge and Phase 3b wiring".into())
+}
+
 fn protocol_ai_trace(proof: &Value) {
     trace("first_ai", proof.clone());
 }
@@ -754,6 +762,14 @@ fn protocol_ai_trace(proof: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tray_request_projection_is_unavailable_until_phase_3b() {
+        assert!(
+            require_tray_request_projection()
+                .unwrap_err()
+                .contains("Phase 3b")
+        );
+    }
     #[test]
     fn release_layout_refuses_real_data_and_other_binaries() {
         let root = Path::new(r"C:\repo\target\portable-smoke");

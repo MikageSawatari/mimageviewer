@@ -567,11 +567,13 @@ def analyze_perf_smoke(events: list[dict], *, expected_pid: int | None = None,
     return finish(result)
 
 
-def analyze_case_evidence(events: list[dict], evidence: dict, expected_pid: int | None = None) -> dict:
+def analyze_case_evidence(events: list[dict], evidence: dict, expected_pid: int | None = None,
+                          *, setup_deadline_t: float | None = None) -> dict:
     """Validate actual diagnostic witnesses; recipe claims alone prove no app work.
 
     qa.begin/close_accept/tray_hide/finalized/seed/on_exit are read-only hooks.
     A finalized event's request_id must match source work, independently of seq.
+    Tray reproduction must be complete by the converted measurement start.
     Absent Phase 3 hooks intentionally leave the Phase 2 run SKIPPED.
     """
     case_id = evidence.get("case_id", "evidence")
@@ -622,6 +624,14 @@ def analyze_case_evidence(events: list[dict], evidence: dict, expected_pid: int 
                     or search.get("completed") is not True):
                 errors.append("seed search expected hit set not proven")
     if case_id.startswith("tray-close-"):
+        deadline = number(setup_deadline_t)
+        if deadline is None or deadline < 0:
+            errors.append("tray converted measurement-start setup deadline missing/invalid")
+            deadline = None
+
+        def established_by_start(timestamp: float) -> bool:
+            return deadline is not None and timestamp <= deadline
+
         closes = [e for e in qa if e.get("kind") == "close_accept"]
         hides = [e for e in qa if e.get("kind") == "tray_hide"]
         accepted = None
@@ -633,6 +643,7 @@ def analyze_case_evidence(events: list[dict], evidence: dict, expected_pid: int 
                         and hide.get("folder_path") == close.get("folder_path")
                         and hide.get("folder_path")
                         and number(close.get("t")) is not None and number(hide.get("t")) is not None
+                        and established_by_start(close["t"]) and established_by_start(hide["t"])
                         and hide["t"] >= close["t"]):
                     accepted = (close, hide)
         if accepted is None or len(closes) != 1 or len(hides) != 1:
@@ -663,31 +674,39 @@ def analyze_case_evidence(events: list[dict], evidence: dict, expected_pid: int 
                              and all(e.get(f) == target.get(f) for f in ("key", "idx", "items_gen"))
                              and e.get("close_sequence") == hide.get("close_sequence")
                              and number(e.get("t")) is not None and e["t"] > hide["t"]
+                             and established_by_start(e["t"])
                              and e.get("image_backlog_contains_request") is True and e.get("window_visible") is False]
                 for final in finalized:
                     req_id = final.get("request_id")
                     loads = [e for e in events if e.get("cat") == "thumb" and e.get("kind") == "load_phases"
                              and all(e.get(f) == target.get(f) for f in ("key", "idx", "items_gen"))
                              and e.get("should_save") is False and e.get("force_cache", False) is False
-                             and interval(e) is not None and interval(e)[0] > hide["t"]]
+                             and interval(e) is not None and interval(e)[0] > hide["t"]
+                             and established_by_start(interval(e)[1])]
                     sources = [e for e in events if e.get("cat") in ("thumb", "qa")
                                and e.get("kind") in ("decode_end", "source") and e.get("from_cache") is False
                                and all(e.get(f) == target.get(f) for f in ("key", "idx", "items_gen"))
-                               and number(e.get("t")) is not None and e["t"] > hide["t"]]
+                               and number(e.get("t")) is not None and e["t"] > hide["t"]
+                               and established_by_start(e["t"])]
                     begins = [e for e in events if e.get("cat") == "qa" and e.get("kind") == "request_begin"
                               and e.get("request_id") == req_id and number(e.get("t")) is not None
                               and e["t"] > hide["t"]
+                              and established_by_start(e["t"])
                               and all(e.get(f) == target.get(f) for f in ("key", "idx", "items_gen"))]
                     matching_sources = [e for e in sources if e.get("request_id") == req_id]
-                    save_proven = (any(e.get("request_id") == req_id for e in loads)
-                                   or any(e.get("cat") == "qa" and e.get("should_save") is False
-                                          and e.get("force_cache", False) is False for e in matching_sources))
+                    save_times = ([interval(e)[1] for e in loads if e.get("request_id") == req_id]
+                                  + [e["t"] for e in matching_sources if e.get("cat") == "qa"
+                                     and e.get("should_save") is False and e.get("force_cache", False) is False])
                     if (isinstance(req_id, int) and not isinstance(req_id, bool) and req_id > 0
-                            and save_proven and matching_sources and begins):
-                        valid_targets.append({**target, "request_id": req_id, "finalized_t": final["t"]})
+                            and save_times and matching_sources and begins):
+                        valid_targets.append({**target, "request_id": req_id, "finalized_t": final["t"],
+                                              "request_begin_t": min(e["t"] for e in begins),
+                                              "source_t": min(e["t"] for e in matching_sources),
+                                              "save_skipped_t": min(save_times)})
             if not valid_targets:
-                errors.append("tray save-skip/cache absence/post-hide source/Finalized-image-backlog request correlation missing")
-            result["evidence"]["tray"] = {"close": close, "hide": hide, "valid_targets": valid_targets}
+                errors.append("tray save-skip/cache absence/post-hide source/Finalized-image-backlog request correlation missing by measurement start")
+            result["evidence"]["tray"] = {"close": close, "hide": hide, "valid_targets": valid_targets,
+                                           "setup_deadline_t": deadline}
     return finish(result)
 
 
@@ -696,11 +715,12 @@ def analyze_idle_case(events: list[dict], sampler: dict, evidence: dict,
     """Combine the established idle counter with the stricter suite setup contract."""
     result = convert_clock_window(events, sampler, expected_pid)
     result["case_id"] = evidence.get("case_id", sampler.get("case_id", "idle"))
-    witnesses = analyze_case_evidence(events, evidence, expected_pid)
+    clock = result["evidence"].get("clock")
+    witnesses = analyze_case_evidence(events, evidence, expected_pid,
+                                     setup_deadline_t=clock["start_t"] if clock else None)
     result["environment_errors"].extend(witnesses["environment_errors"])
     result["evidence"].update(witnesses["evidence"])
     result["metrics"].update(witnesses["metrics"])
-    clock = result["evidence"].get("clock")
     if not clock or result["environment_errors"]:
         return finish(result)
     if sampler.get("index_scan_wait") != "settled":

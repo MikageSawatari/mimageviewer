@@ -84,6 +84,24 @@ function Restore-ReleaseSeed {
     Copy-Item -LiteralPath $Seed -Destination $data -Recurse
     Assert-ReleaseCheckArtifact $repo
 }
+function Complete-ReleaseSession {
+    param([string]$CaseId,[string]$Directory)
+    $script:owned.WaitForExit();$exitCode=$script:owned.ExitCode
+    $processPid=$script:owned.Id;$script:owned=$null
+    $exitResult=New-ReleaseCheckProcessExitResult $CaseId $exitCode $processPid $Directory
+    # Record the process verdict before any fallible archive/evidence operation.
+    # A later environment error cannot erase ScriptFailure or a crash.
+    if($null -ne $exitResult){$cases.Add($exitResult)}
+    Save-ReleaseLogs $Directory
+    if($null -eq $exitResult){
+        $caseEvidence=Join-Path $Directory 'case-evidence.json'
+        if(-not (Test-Path -LiteralPath $caseEvidence)){throw "$CaseId missing normal completion evidence."}
+        $evidence=Get-Content -LiteralPath $caseEvidence -Encoding UTF8 -Raw | ConvertFrom-Json
+        $evidence | Add-Member -MemberType NoteProperty -Name exit -Value @{process_exited=$true;forced=$false;process_exit_code=$exitCode} -Force
+        Write-ReleaseCheckJson $caseEvidence $evidence
+    }
+    return [pscustomobject]@{directory=$Directory;pid=$processPid;process_exit_code=$exitCode;exit_result=$exitResult}
+}
 function Invoke-ReleaseSession {
     param([string]$CaseId,[string]$Overlay,[bool]$Idle)
     Assert-NoSmokeProcess
@@ -163,16 +181,7 @@ function Invoke-ReleaseSession {
         }
         Start-Sleep -Milliseconds 100
     }
-    $script:owned.WaitForExit();$exitCode=$script:owned.ExitCode
-    Save-ReleaseLogs $dir
-    $processPid=$script:owned.Id;$script:owned=$null
-    if($exitCode -ne 0){throw "$CaseId application exit code $exitCode"}
-    $caseEvidence=Join-Path $dir 'case-evidence.json'
-    if(-not (Test-Path -LiteralPath $caseEvidence)){throw "$CaseId missing normal completion evidence."}
-    $evidence=Get-Content -LiteralPath $caseEvidence -Encoding UTF8 -Raw | ConvertFrom-Json
-    $evidence | Add-Member -MemberType NoteProperty -Name exit -Value @{process_exited=$true;forced=$false;process_exit_code=$exitCode} -Force
-    Write-ReleaseCheckJson $caseEvidence $evidence
-    return [pscustomobject]@{directory=$dir;pid=$processPid}
+    return Complete-ReleaseSession $CaseId $dir
 }
 try {
     New-Item -ItemType Directory -Path $run | Out-Null
@@ -203,6 +212,7 @@ try {
     $metadata.fixture_version=$m.recipe_version
     # Seed is one normal session; stop/flush before snapshot, preserve fixed paths.
     $seedSession=Invoke-ReleaseSession 'seed-profile' $m.overlays.'seed-static' $false
+    if($null -ne $seedSession.exit_result){throw 'Seed session did not complete successfully; process verdict retained.'}
     $seedEvents=@(Get-Content -LiteralPath (Join-Path $seedSession.directory 'perf_events.jsonl') -Encoding UTF8 | ForEach-Object {try{$_|ConvertFrom-Json}catch{}})
     if(-not @($seedEvents|Where-Object {$_.cat -eq 'qa' -and $_.kind -eq 'on_exit'}).Count){throw 'Seed normal on_exit/flush proof missing.'}
     $seed=Join-Path $run 'seed-profile-stopped'
@@ -225,6 +235,7 @@ try {
         Restore-ReleaseSeed $seed
         $overlay=if($id -eq 'first-ai'){$m.overlays.'static-foreground'}else{$m.overlays.$id}
         $session=Invoke-ReleaseSession $id $overlay ($id -notlike 'perf-*' -and $id -ne 'first-ai')
+        if($null -ne $session.exit_result){break}
         $resultPath=Join-Path $session.directory 'case.json'
         if($id -like 'perf-*' -or $id -eq 'first-ai'){
             & python (Join-Path $scripts 'analyze_perf.py') (Join-Path $session.directory 'perf_events.jsonl') perf-smoke --case-id $id --expected-pid $session.pid --case-evidence (Join-Path $session.directory 'case-evidence.json') --fixture-manifest $fixtureManifest --json-out $resultPath

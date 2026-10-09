@@ -53,14 +53,13 @@ impl App {
         let complete = !keep.is_empty()
             && loaded == keep.len()
             && self.requested.is_empty()
-            && self.texture_backlog.is_empty()
             && !snapshot.startup_open_pending;
         Observation {
             value: json!({"pid":std::process::id(),"root_hwnd":self.main_hwnd.map(|h|h as u64),"perf_t":crate::perf::program_start().map(|s|s.elapsed().as_secs_f64()),
                 "window_visible":self.window_visible,"focused":snapshot.focused,
                 "current_folder_path":snapshot.current_folder_path,"items_generation":self.items_generation,
                 "items_len":self.items.len(),"requested_count":self.requested.len(),
-                "texture_backlog_count":self.texture_backlog.len(),"keep_count":keep.len(),"loaded_keep_count":loaded,
+                "keep_count":keep.len(),"loaded_keep_count":loaded,
                 "requested_px":self.display_px_shared.load(std::sync::atomic::Ordering::Relaxed),
                 "loading_complete":complete,"index_settled":!self.initial_scan_settled_pending,
                 "search_active":self.global_search.active,"search_focused":self.global_search.has_focus,
@@ -147,8 +146,7 @@ pub(crate) fn record_close_accept(app: &App) {
                 .get(i)
                 .is_some_and(ThumbnailState::is_terminal)
         })
-        && app.requested.is_empty()
-        && app.texture_backlog.is_empty();
+        && app.requested.is_empty();
     let mut targets = s.cache_proof["targets"]
         .as_array()
         .cloned()
@@ -186,36 +184,4 @@ pub(crate) fn record_tray_hide(_app: &App) {
     if let Some(proof) = proof {
         protocol::trace("tray_hide", proof);
     }
-}
-pub(crate) fn record_finalized(
-    app: &App,
-    request_id: u64,
-    idx: usize,
-    items_gen: u64,
-    input_seq: u64,
-) {
-    let backlog = app.texture_backlog.iter().any(|msg| {
-        msg.diagnostic_id == request_id
-            && msg.idx == idx
-            && msg.items_gen == items_gen
-            && matches!(msg.payload, crate::thumb_loader::ThumbMsgPayload::Pixels(_))
-    });
-    let state = match app.thumbnails.get(idx) {
-        Some(ThumbnailState::Pending) => "Pending",
-        Some(ThumbnailState::Evicted) => "Evicted",
-        Some(ThumbnailState::Loaded { .. }) => "Loaded",
-        Some(ThumbnailState::NoArt) => "NoArt",
-        Some(ThumbnailState::Failed) => "Failed",
-        None => "missing",
-    };
-    let mut session = protocol::session().lock().unwrap();
-    let Some(s) = session.as_mut().filter(|s| s.close_sequence > 0) else {
-        return;
-    };
-    let value = json!({"request_id":request_id,"close_sequence":s.close_sequence,"key":app.items.get(idx).map(GridItem::perf_key),
-        "idx":idx,"items_gen":items_gen,"input_seq":input_seq,"state":state,
-        "image_backlog_contains_request":backlog,"window_visible":app.window_visible});
-    s.finalized.push(value.clone());
-    drop(session);
-    protocol::trace("finalized", value);
 }

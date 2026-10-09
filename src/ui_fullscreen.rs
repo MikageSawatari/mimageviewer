@@ -28413,6 +28413,7 @@ impl App {
                     crate::key_input::SyntheticNavigationKey::Backspace => KeyName::Backspace,
                     crate::key_input::SyntheticNavigationKey::Escape => KeyName::Esc,
                     crate::key_input::SyntheticNavigationKey::F12 => KeyName::F12,
+                    #[cfg(any(test, feature = "test-script"))]
                     crate::key_input::SyntheticNavigationKey::G => KeyName::G,
                 };
                 crate::test_script::KeymapLevelObservation {

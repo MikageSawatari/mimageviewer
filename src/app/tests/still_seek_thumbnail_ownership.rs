@@ -744,8 +744,6 @@ fn audio_no_art_is_terminal_across_grid_details_hover_and_stale_completions() {
             idx: 0,
             input_seq: app.input_seq,
             items_gen: app.items_generation,
-            #[cfg(feature = "test-script")]
-            diagnostic_id: 0,
             payload: crate::thumb_loader::ThumbMsgPayload::NoArt,
         })
         .unwrap();
@@ -782,8 +780,6 @@ fn audio_no_art_is_terminal_across_grid_details_hover_and_stale_completions() {
             idx: 0,
             input_seq: app.input_seq,
             items_gen: app.items_generation.wrapping_sub(1),
-            #[cfg(feature = "test-script")]
-            diagnostic_id: 0,
             payload: crate::thumb_loader::ThumbMsgPayload::NoArt,
         })
         .unwrap();
@@ -822,48 +818,4 @@ fn audio_art_dimensions_participate_in_auto_aspect_and_no_art_settles_the_denomi
         Some(expected),
         "absence is a settled result, not an unbounded wait for dimensions"
     );
-}
-#[cfg(feature = "test-script")]
-#[test]
-fn release_checks_backlog_preserves_the_exact_worker_request_identity() {
-    let ctx = egui::Context::default();
-    let mut app = setup_thumbnail_app(10);
-    app.keep_set.extend(0..10);
-    app.keep_range = (0, 10);
-    for idx in 0..10 {
-        app.requested.insert(idx, false);
-        let message = crate::thumb_loader::ThumbMsg::from_legacy_parts(
-            idx,
-            Some(egui::ColorImage::filled([1, 1], egui::Color32::BLACK)),
-            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
-                evaluated_display_px: 374,
-            },
-            false,
-            None,
-            None,
-            None,
-            false,
-            false,
-            app.input_seq,
-            app.items_generation,
-        );
-        app.tx
-            .send(crate::thumb_loader::ThumbMsg {
-                diagnostic_id: 100 + idx as u64,
-                ..message
-            })
-            .unwrap();
-    }
-    app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
-    assert_eq!(
-        app.texture_backlog.len(),
-        2,
-        "the normal upload budget is still eight"
-    );
-    for message in &app.texture_backlog {
-        assert_eq!(message.diagnostic_id, 100 + message.idx as u64);
-        assert!(message.pixels().is_some());
-    }
-    app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
-    assert!(app.texture_backlog.is_empty());
 }

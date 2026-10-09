@@ -95,6 +95,30 @@ $ownedStart=$start
 Stop-OwnedReleaseProcess
 Assert-True ($stopped.Count -eq 1 -and $stopped[0] -eq 101) 'Cleanup did not target exactly the owned PID.'
 Assert-True (-not $installed.HasExited) 'Installed/tray instance was changed.'
+# Exercise the actual completion path with fake handles/archive functions.
+# No launch, real process query, filesystem read or write occurs.
+Import-ReleaseCheckFunctions (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Run.ps1') @('Complete-ReleaseSession')
+function Save-ReleaseLogs {param($Directory) if($script:fakeArchiveFails){throw 'fake archive environment failure'}}
+$fakeArchiveFails=$false
+foreach($code in @(1,2,-1073741819)){
+    $cases=New-Object 'Collections.Generic.List[object]'
+    $owned=[pscustomobject]@{Id=101;ExitCode=$code}
+    $owned|Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {}
+    $session=Complete-ReleaseSession 'tray-close-after-loading' 'C:\fake\run\case'
+    $expected=if($code -eq 2){'SKIPPED'}else{'FAIL'}
+    $expectedCode=if($code -eq 2){2}else{1}
+    Assert-True ($cases.Count -eq 1 -and $session.exit_result -eq $cases[0]) 'Nonzero app exit was discarded.'
+    Assert-True ($cases[0].verdict -eq $expected -and $cases[0].exit_code -eq $expectedCode) 'Script/environment/crash exit was misclassified.'
+    Assert-True ($cases[0].failures -is [array] -and $cases[0].environment_errors -is [array]) 'Failure diagnostics do not preserve JSON array shape.'
+    Assert-True ($cases[0].evidence.process.process_exit_code -eq $code -and $session.process_exit_code -eq $code) 'Original process exit code was overwritten.'
+    Assert-True ($cases[0].evidence.failure_artifacts.perf_log -eq 'C:\fake\run\case\perf_events.jsonl') 'Failure evidence location was lost.'
+}
+Assert-True ($null -eq (New-ReleaseCheckProcessExitResult 'case' 0 101 'C:\fake')) 'Zero process exit was classified as successful suite evidence.'
+$cases=New-Object 'Collections.Generic.List[object]';$fakeArchiveFails=$true
+$owned=[pscustomobject]@{Id=101;ExitCode=1}
+$owned|Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {}
+Assert-Throws {Complete-ReleaseSession 'perf-cached' 'C:\fake\run\case'} 'Fake archive error did not exercise the environment catch.'
+Assert-True ($cases.Count -eq 1 -and $cases[0].verdict -eq 'FAIL' -and $cases[0].failures -like '*exit code 1*') 'Environment archive error erased an already observed application FAIL.'
 foreach($relative in @('ui-smoke.ps1','check-idle-health.ps1','ui-smoke\release-checks\Run.ps1','ui-smoke\release-checks\Sampler.ps1')){
     $path=Join-Path $PSScriptRoot $relative
     $ast=Get-TestAst $path

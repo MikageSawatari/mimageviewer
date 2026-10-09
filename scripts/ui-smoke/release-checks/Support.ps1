@@ -5,6 +5,26 @@ function Invoke-ReleaseCheckPreflight {
     catch { return [pscustomobject]@{exit_code=2;value=$null;environment_error=$_.Exception.Message} }
 }
 
+function New-ReleaseCheckProcessExitResult {
+    param([string]$CaseId,[int]$ProcessExitCode,[int]$ProcessId,[string]$Directory)
+    if($ProcessExitCode -eq 0){return $null}
+    # The runtime assigns 1 to ScriptFailure and 2 to EnvironmentFailure.
+    # Unknown nonzero exits are also failures; retain the original process code.
+    $environment=$ProcessExitCode -eq 2
+    $message="$CaseId application exit code $ProcessExitCode"
+    $failureMessages=@();$environmentMessages=@()
+    if($environment){$environmentMessages+=@($message)}else{$failureMessages+=@($message)}
+    return [ordered]@{
+        schema_version=1;case_id=$CaseId;verdict=$(if($environment){'SKIPPED'}else{'FAIL'})
+        exit_code=$(if($environment){2}else{1})
+        failures=$failureMessages;environment_errors=$environmentMessages;warnings=@()
+        evidence=@{process=@{pid=$ProcessId;process_exited=$true;process_exit_code=$ProcessExitCode}
+            failure_artifacts=@{directory=$Directory;perf_log=(Join-Path $Directory 'perf_events.jsonl')
+                app_log=(Join-Path $Directory 'mimageviewer.log');process=(Join-Path $Directory 'process.json')
+                case_evidence=(Join-Path $Directory 'case-evidence.json')}}
+    }
+}
+
 function Import-ReleaseCheckFunctions {
     param([string]$Path, [string[]]$Names)
     $tokens = $null; $errors = $null

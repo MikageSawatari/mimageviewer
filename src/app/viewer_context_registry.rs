@@ -4549,8 +4549,6 @@ mod tests {
                 payload: crate::thumb_loader::ThumbMsgPayload::NoArt,
                 input_seq: app.input_seq,
                 items_gen: app.items_generation,
-                #[cfg(feature = "test-script")]
-                diagnostic_id: 0,
             })
             .unwrap();
         app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);

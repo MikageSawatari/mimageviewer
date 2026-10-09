@@ -302,7 +302,8 @@ suite が具体化した後、5 idle ケース・2 perf ケース、見込み **
    p95 境界、非ゼロのOS作成時刻差と `wall_t`、測定窓 / sleep包含を合成ログで回帰検査。
    path 拒否・approval guard・exact PID は fake テスト。
 3. **台本を接続**: 最小の test-only close / pin / G + text / read-only 証跡、suite の逐次実行と記録出力。
-   A 統合後、loading 受理条件、保存省略 / cache不在 / 格納後source / Finalized-backlog と終端を照合する。
+   **Phase 3b は A が master に統合された後**に行い、A の request ID / read-only 投影へ接続して
+   loading 受理条件、保存省略 / cache不在 / 格納後source / Finalized-image-queue と終端を照合する。
    feature 有無の compile / 焦点テスト、完了独立レビューを実施。
 4. **了承済み検証枠で採用**: 各 case 3 回で成立率 / 実測閾値と所要時間を確認し、既知回帰 fixture が
    trayの読み込み中／完了後それぞれで旧版 FAIL / 修正版 PASS を出す証拠を取る
@@ -335,7 +336,28 @@ suite が具体化した後、5 idle ケース・2 perf ケース、見込み **
   早期 return の tail は test-only の egui scheduler 読み取りで補い、未知の delayed repaint を正常扱いしない。
 - `scripts/ui-smoke/release-checks/{Run,Sampler,Support}.ps1` と `release-checks.rhai` が
   exact portable artifact / PID / HWND を検査し、seed の完全終了・復元を挟んで逐次実行する。
-  path / desktop / lock / artifact 不成立は SKIPPED / 2、強制終了は正常完了証拠に含めない。
+  path / desktop / lock / artifact 不成立は SKIPPED / 2。App の ScriptFailure / 1 は FAIL / 1 として
+  元の process exit code と失敗ログの場所を保持し、後続の環境・保存エラーで上書きしない。
+  強制終了は正常完了証拠に含めない。
+
+**レビュー修正と Phase 3b（A の master 統合後）**:
+
+- tray の close / hide、格納後の同一 request の source 生成・保存省略、画像 queue に要求が残った
+  `Finalized` の全成立証拠を、UTC anchor で変換した**計測開始時刻まで**に要求する。
+  計測中・計測終了後の Observe が起こした処理、時刻証拠なしは SKIPPED とする。
+- F の TLS 採番、`ThumbMsg.diagnostic_id`、backlog 再構築時の引き継ぎ、旧 `texture_backlog` の
+  診断参照・独自 Finalized observer は撤去する。loader / queue に別の所有者や代替 ID を追加しない。
+  Analyzer は read-only JSON 投影の `request_id`、key / idx / generation、source / save、
+  `image_backlog_contains_request` を検査する契約を維持する（この field は実画像 queue の所属を表す）。
+- A の `ThumbnailRequestId` と typed request owner が master に統合された後、その正本 ID と
+  read-only 投影で request begin / evaluated_display_px、source / cache origin、保存判定、loading 状態、
+  `Finalized` 時点の実画像 queue 所属を接続する。F の現行 terminal / requested 観測もそこで見直す。
+  測定開始前に成立を待つ worker と無操作 sleep の境界を整合させ、同じ ID の正例・別 ID / late 証拠の
+  負例を再検証する。新たな所有 state や UI-thread I/O は作らない。
+- 接続前は tray close hook が EnvironmentFailure / 2 を返し、計測を始めない。worker begin/source 証拠を
+  撤去したため、static の requested_px と uncached の source 証明も Phase 3b まで未接続となる。
+  欠損を免除しないので、現段階の suite を PASS／採用済みとは記録しない。
+- 診断用 G は `cfg(any(test, feature="test-script"))` で variant と全 match arm を限定する。
 
 実行窓の明示了承後の入口は `scripts/ui-smoke.ps1 -Scenario ReleaseChecks -InteractiveApproved`。
 AI / GPU 経路変更版だけ `-IncludeFirstAi` を追加する。出力は各 run の `summary.json` と `release-record.md`。

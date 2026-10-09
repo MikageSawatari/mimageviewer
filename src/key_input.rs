@@ -64,6 +64,7 @@ pub enum SyntheticNavigationKey {
     Backspace,
     Escape,
     F12,
+    #[cfg(any(test, feature = "test-script"))]
     G,
 }
 
@@ -83,6 +84,7 @@ impl SyntheticNavigationKey {
             Self::Backspace => "Backspace",
             Self::Escape => "Escape",
             Self::F12 => "F12",
+            #[cfg(any(test, feature = "test-script"))]
             Self::G => "G",
         }
     }
@@ -101,6 +103,7 @@ impl SyntheticNavigationKey {
             Self::Backspace => PhysicalKeySlot::new(0x08, false),
             Self::Escape => PhysicalKeySlot::new(0x1B, false),
             Self::F12 => PhysicalKeySlot::new(0x7B, false),
+            #[cfg(any(test, feature = "test-script"))]
             Self::G => PhysicalKeySlot::new(0x47, false),
         }
     }
@@ -119,6 +122,7 @@ impl SyntheticNavigationKey {
             Self::Backspace => 0x0E,
             Self::Escape => 0x01,
             Self::F12 => 0x58,
+            #[cfg(any(test, feature = "test-script"))]
             Self::G => 0x22,
         }
     }
@@ -137,6 +141,7 @@ impl SyntheticNavigationKey {
             Self::Backspace => egui::Key::Backspace,
             Self::Escape => egui::Key::Escape,
             Self::F12 => egui::Key::F12,
+            #[cfg(any(test, feature = "test-script"))]
             Self::G => egui::Key::G,
         }
     }
@@ -3515,6 +3520,17 @@ unsafe extern "system" fn main_key_input_subclass_proc(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn diagnostic_g_maps_to_the_physical_ctrl_g_key_without_text() {
+        let key = super::SyntheticNavigationKey::G;
+        assert_eq!(
+            key.physical_slot(),
+            super::PhysicalKeySlot::new(0x47, false)
+        );
+        assert_eq!(key.scan_code(), 0x22);
+        assert_eq!(key.egui_key(), egui::Key::G);
+    }
+
     use super::{
         KeyEdge, KeyInputState, PhysicalKeySlot, RawKeyEdge, RegisterHwndResult, ReturnKeyState,
         SyntheticInputFact, SyntheticInputIssue, SyntheticInputPlugin, SyntheticKeyCommand,

@@ -2894,6 +2894,7 @@ fn parse_navigation_key(name: &str) -> Result<SyntheticNavigationKey, Box<EvalAl
         "backspace" => SyntheticNavigationKey::Backspace,
         "escape" | "esc" => SyntheticNavigationKey::Escape,
         "f12" => SyntheticNavigationKey::F12,
+        #[cfg(any(test, feature = "test-script"))]
         "g" => SyntheticNavigationKey::G,
         _ => {
             return Err(rhai_error(format!(
@@ -6842,6 +6843,16 @@ mod tests {
             target_viewport: "ROOT".to_string(),
             ..TestScriptSnapshot::default()
         }
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn phase_3b_tray_projection_absence_is_an_environment_failure() {
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let outcome = evaluate_source("release_check_close(\"after-loading\");", bridge);
+        assert_eq!(outcome.kind, ScriptOutcomeKind::EnvironmentFailure);
+        assert_eq!(outcome.kind.exit_code(), 2);
+        assert!(outcome.message.contains("Phase 3b"));
     }
 
     #[cfg(feature = "test-script")]
