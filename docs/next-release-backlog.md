@@ -32,6 +32,14 @@
 
 ## 1. 優先候補
 
+### 1.359 EffeTune の新しい版を同梱し、再生中の曲情報（タイトル・アルバム・アーティスト・アートワーク）を Visualizer へ渡す — EffeTune 作者の対応 (2026-10-09)
+- **次の版の決定 (利用者 2026-10-09)**: v4.5.0 には入れず、次の版で進める。
+- 経緯: 利用者が EffeTune 作者 (Frieve-A 氏) へ要望した 2 点 (プラグイン版の起動時表示に Visualizer を選べること、ホストからの曲情報の受け渡し) について、作者から「間もなくリリースする最新版で対応した」と返信があった (2026-10-09、利用者経由)。2026-10-09 時点の GitHub Releases の最新は v0.12.0 (2026-10-02) で、対応版はまだ公開されていない。
+- 仕様の正本 (作者): https://github.com/Frieve-A/effetune-mixwright/blob/main/docs/host-now-playing.md 。作者の説明では、IConnectionPoint::notify で "EffeTune.NowPlaying" メッセージを送り、title / album / artist は文字列、artwork は画像のバイト列、artworkMimeType は MIME 種別。送信は UI スレッドから行い、曲が切り替わるたびにまとめて送る。未指定・空の項目は消去される。
+- mIV 側の作業: (1) 対応版の EffeTune Mixwright を同梱 (manifest `third_party/effetune-mixwright/<版>/manifest.sha256` の作り直し、署名、launcher の世代公開・更新の確認)。(2) 曲情報の送り元を決める: 音声は動画・音楽のメタデータと、§1.347 の同名画像 / MP3 埋め込み画像、動画は代表画像。(3) Rust 側から VST3 host bridge への IPC と、host (C++) の plugin UI スレッドでの notify。曲の切り替え・停止・別ウィンドウ・リモート閲覧中の扱い、画像サイズの上限を設計で決める。
+- 「起動時の表示」を Visualizer にする設定はプラグイン側の設定なので、対応版の同梱だけで使える見込み (未確認)。
+- 規模 / 優先度: Medium / P2 (次の版)。
+
 ### 1.354 既存の画像経路の EXIF 読み取りで、小さい入力から大量のメモリを確保しうる — 次の版の音声ジャケット (§1.347) の独立レビューで発見 (2026-10-08)
 - **状態: 今後検討 (利用者 2026-10-08)**。
 - 出典: §1.347 (音楽のジャケット画像) の独立実装レビュー P1。音声の埋め込み画像の経路は、専用の有界な Orientation 読み取りに置き換えて対処済み (next-audio-art、`docs/audio-album-art-plan.md` §20.1)。既存の画像経路は同じ parser を使ったまま残っている。
