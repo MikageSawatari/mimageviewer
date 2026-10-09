@@ -1,4 +1,6 @@
 //! 読書位置の記録、一覧への反映、path-key workerとの順序を本番入口で検証する。
+#![cfg(test)]
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 

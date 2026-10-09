@@ -186,10 +186,20 @@ pub fn render(ui: &mut egui::Ui, entries: &[&VersionHighlights]) {
 fn render_item(ui: &mut egui::Ui, marker: &str, item: &HighlightItem) {
     ui.add_space(3.0);
     ui.label(egui::RichText::new(format!("{marker} {}", item.title)).strong());
-    ui.horizontal_wrapped(|ui| {
-        ui.add_space(14.0);
-        ui.label(egui::RichText::new(item.body).size(12.5));
-    });
+    // Allocate the wrapped galley once in the vertical layout. horizontal_wrapped
+    // allocates individual row rects, whose pixel rounding can exceed the galley's
+    // bounded wrap width and feed a growing content width back into the Window.
+    // Keep the existing first-line indent and minimum row height in the text job.
+    let mut body = std::sync::Arc::unwrap_or_clone(
+        egui::WidgetText::from(egui::RichText::new(item.body).size(12.5)).into_layout_job(
+            ui.style(),
+            egui::FontSelection::Default,
+            egui::Align::Center,
+        ),
+    );
+    body.sections[0].leading_space = 14.0;
+    body.first_row_min_height = ui.spacing().interact_size.y;
+    ui.add(egui::Label::new(body).wrap());
 }
 
 // v3.8.0 は別バージョン索引を休止したまま出荷したので、この版の告知は 2 件のまま固定する。
@@ -298,6 +308,21 @@ const V4_4_HIGHLIGHTS: &[HighlightItem] = &[
     HighlightItem {
         title: "よく使うコピー・移動先を「ファイル整理先」に登録できます",
         body: "環境設定の「ライブラリ → フォルダ・ファイル → ファイル整理先」で登録し、項目を右クリックして「ファイル整理先…」から移動・コピーします。",
+    },
+];
+
+const V4_5_HIGHLIGHTS: &[HighlightItem] = &[
+    HighlightItem {
+        title: "音声ファイルの一覧にジャケット画像を表示します",
+        body: "音声と同じ名前の画像があればその画像を、なければ MP3 に埋め込まれた画像を表示します。目印は環境設定の「表示 → サムネイル」で選べます。",
+    },
+    HighlightItem {
+        title: "RAR・7z などの書庫にも読書位置バーを表示します",
+        body: "変換して開く書庫でも、前回読んだ位置を一覧のバーで表示します。変換済みのキャッシュを削除しても、開き直すと続きから読めます。",
+    },
+    HighlightItem {
+        title: "F11 の全画面のときだけ、固定したバーやパネルを自動表示にできます",
+        body: "環境設定の「表示 → 閲覧表示」で、上部バー・下部バーとストリップ・右情報パネル・ナビゲータを選べます（既定はすべてオフ）。",
     },
 ];
 
@@ -1013,6 +1038,15 @@ const TABLE: &[VersionHighlights] = &[
             },
         ],
         highlights: V4_4_HIGHLIGHTS,
+    },
+    VersionHighlights {
+        version: "4.5.0",
+        // 分割 RAR の後続巻を開けなくなる操作の変更を必読へ置く。
+        must_read: &[HighlightItem {
+            title: "分割した RAR は、最初のファイルから開いてください",
+            body: "分割した RAR の 2 つ目以降のファイル（part2 以降）を開くと、変換せずに「最初のファイルを開いてください」と案内します。最初のファイル（part1）から開くと、これまでどおり読めます。",
+        }],
+        highlights: V4_5_HIGHLIGHTS,
     },
 ];
 
