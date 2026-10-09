@@ -3,6 +3,8 @@
 2026-10-09、line F の Step 1（設計案、未実装・未実行）。`next-qa` / `840c309ec` の
 文書・ソースを参照した。backlog [§1.361 / §1.197](next-release-backlog.md) を、この検証範囲について
 一つの手順へまとめる。§1.197 全体の複数窓・native 入力自動化を完成扱いにはしない。
+`f9d095bec` の独立レビュー REVISE（P2 2件）を受け、tray の source / backlog 成立証拠と
+外部 sampler の時刻変換を追補した。§8 の3点は2026-10-09の利用者回答により決定済み。
 
 正本は [CLAUDE.md](../CLAUDE.md) の Phase 2 9.6 / 9.7、設定データ保護、実機検証用バイナリの準備、
 [idle-health-check.md](idle-health-check.md)、[release-operations.md](release-operations.md)。
@@ -42,7 +44,7 @@ F は `analyze_perf.py` の入力件数ロジックを変更しない。A の統
 | `prepare-portable-smoke.ps1 -TestScript` | `portable,test-script` の release 診断コピー、exact exe/data、marker、manifest / hash、reparse 拒否。元 package の `data` はコピーしない |
 | `ui-smoke.ps1` / Rhai | fixture 準備、deadline、target 選択、receipt / snapshot、ログ・artifact 保存、失敗 / 環境不成立。`Idle198Convergence` の静止区間と外部 lifetime sample も参考にする |
 | `--settings-override` | test-script 限定、明示 `--data-dir` 必須。tray ON、窓 / 列 / 比率、fixture 内だけの索引 root、起動場所等を JSON で固定する |
-| `check-idle-health.ps1` | CPU / wall time、ログ増加、PID / command line、foreground と窓列挙、threshold 読取、統合 verdict を再利用。現状はログ先が APPDATA 固定なので、そのまま呼ばない |
+| `check-idle-health.ps1` | CPU / wall time、ログ増加、PID / command line、foreground と窓列挙、threshold 読取、統合 verdict を再利用。現状はログ先が APPDATA 固定、解析境界も OS StartTime 基準なので、そのまま呼ばない（§4で変換を定義） |
 | `analyze_perf.py idle-health` / `hitches` | idle 判定と frame n / 計測区間の相関を再利用。後続で `perf-smoke` verdict / JSON 出力を追加し、既存 CLI は維持する |
 | 不足 API | root の native close 要求、close 時点の loading 証跡、tray 終了経路への要求、正常経路による動画代表 pin、検索用文字入力 / 結果完了の観測。test-script 限定で最小追加する |
 
@@ -74,8 +76,8 @@ fixture generator は既存 PNG generator と同梱 FFmpeg を使い、次を作
 | fixture | 構成・成立証拠 |
 | --- | --- |
 | static | 884×444 の byte-distinct 画像を含む画像フォルダ。窓 1328×900 / 7 列を出発点に、実要求が 374px 付近になる条件を記録する。DPI で変わるので列数だけで成立としない |
-| many-folders | 512 サブフォルダ、各 4 画像以上、keep 範囲だけでも 8 枚の upload 予算を超える配置。相異なる画像で生成し、初期 `lf_scan` とフォルダ代表サムネの負荷を持つ |
-| cached / uncached | 同じ構成の別 subtree。cached は正常ロード・保存・終了後の cache 読取を確認。uncached は準備時に開かず、当該キーの cache が無いことと初回 `from_cache=false` を確認 |
+| many-folders | 512 サブフォルダ、各 4 画像以上、keep 範囲だけでも 8 枚の upload 予算を超える配置。相異なる画像で生成し、初期 `lf_scan` とフォルダ代表サムネの負荷を持つ。枚数だけでは backlog 発生の証拠にせず、tray は§4の実観測を必須にする |
+| cached / uncached | 同じ構成の別 subtree。cached は正常ロード・保存・終了後の cache 読取を確認。uncached は準備時に開かず、当該キーの cache が無いことと初回 `from_cache=false` を確認。tray 用はさらに保存省略・close直前の cache 不在・格納後 source 再生成を必須にする（§4） |
 | video-pin | 640×360 の短い無音生成動画を child folder の代表に正常 pin 経路で固定。保存完了して App を再起動し、親のタイルが cache から読み直されたことを確認する。動画再生は始めない |
 | navigation / search | 順序の決まった画像フォルダを 6 個以上。生成 PNG の対応 metadata に固定検索語を入れ、fixture だけを索引して Ctrl+G の期待結果集合を作る。現行 indexer で生成し DB / Tantivy を手書きしない |
 
@@ -99,8 +101,8 @@ fixture の root と全親の絶対パス・reparse を確認してからコピ�
 | `static-foreground` | cached static を開き完了、exact root が前面で静止 |
 | `static-background` | 同じ static 条件を runner 所有の無害な別窓の背面へ移す。測定中の foreground PID は App 以外 |
 | `video-pin-background` | 再起動後に親を開き、pin タイルを keep 内に置いて背面へ。TargetKey、当該キーの cached work、idle upgrade 評価を記録 |
-| `tray-close-while-loading` | 未キャッシュ many-folders を開き、当該世代の要求開始を確認して root へ close。実際の格納時に未完了 work があることを必須にする |
-| `tray-close-after-loading` | 別の未キャッシュ many-folders を開き、ロード完了後に root へ close。cache 既存の static を閉じる試験では代替しない |
+| `tray-close-while-loading` | 保存省略を固定した未キャッシュ many-folders を開き、当該世代の要求開始を確認して root へ close。実際の格納時に未完了 work があることと、下記 source / backlog 証拠を必須にする |
+| `tray-close-after-loading` | 別の保存省略を固定した未キャッシュ many-folders を開き、ロード完了後も対象キーの cache が無いことを確認して root へ close。格納後の source 再生成 / backlog 証拠を必須にし、cache 読込では代替しない |
 
 ### `[×]` と同じ経路にする
 
@@ -117,6 +119,32 @@ UI backlog の終端、初期 enqueue / 採用済み状態まで合わせ、keep
 while-loading は close **送信時ではなく受理・格納時**に未完了であることを確認する。
 既に完了していたらそのケースは環境不成立。固定 sleep、worker の遅延、再現できるまで retry は使わない。
 
+### tray の source 再生成と backlog 成立証拠
+
+通常ロードで `CacheDecision` が保存を選ぶと、初回が `from_cache=false` でも格納による GPU 解放後は
+cache hit へ変わる。`thumb_loader.rs` の通常 cache hit は画像を送って return し、source 生成の
+`Finalized` を通らない。これを§1.360の再現成功に数えない。
+tray 2ケースだけは起動時 overlay で既存の `cache_policy=off` を指定し、通常の保存判定を通して
+保存を省略する。static / video-pin / perf の overlay には適用しない。`force_cache` がこの設定を
+上書きする要求は対象にせず、判定・worker・upload 予算を test-only に変更して再現を作らない。
+
+両 tray ケースについて、同じ対象キー / idx / items generation と要求を相関させ、次を必須にする。
+
+1. source 要求の `load_phases.should_save=false`、close直前（受理・格納境界）の catalog / cache_map
+   両方で有効な対象 cache が無いことを、読取専用の証拠で確認する。while-loading の未完了要求は
+   保存判定到達後の証拠も照合する。初回の cache miss だけでは代替しない。
+2. 格納後、GPU 解放で対象が再要求され、`from_cache=false` の source 生成と `Finalized` が
+   実際に発生したことを確認する。格納前の decode / Finalized や格納後の cache hit では成立しない。
+3. その **同じ要求の画像が UI の `texture_backlog` に残った状態で、UI が `Finalized` を受け取った**
+   証拠を必須にする。read-only test-script 計装で受理時の要求・画像 backlog・状態と frame を記録し、
+   A の要求寿命と対応付ける。worker の送信時刻や keep 内の枚数だけでは代替しない。
+
+cache が作られた、source 再生成がない、Finalized 受理時に当該画像が backlog にない等の場合は
+再現条件不足として SKIPPED / 環境不成立。idle 値が低くても PASS にしない。
+成立した後の旧版で同一要求の再投入反復、修正版で収束を確認する。**読み込み中／完了後をそれぞれ
+独立に旧版 FAIL・修正版 PASS** とするのが採用条件で、一方の成功で他方を代替しない。
+通常フローの速度を変えず両版で同じ read-only 計装・fixture / overlay を使う。
+
 ### foreground と無操作区間
 
 v4.4.0 のキー系 SKIPPED を踏まえ、Focus / `SetForegroundWindow` の要求成功だけで判断しない。
@@ -131,6 +159,33 @@ tray は既存の helper 除外つき top-level 列挙を使い、両境界で t
 測定中はこれらも capture / ログ marker 送信も行わず、外部 sampler だけが動く。
 既定 5 秒 warmup + 15 秒測定に余裕を付けた一つの sleep 区間を確保し、その中に実測窓が入ったことを検証する。
 script が早く終了 / 区間を外れた場合は環境不成立。tray の終了も測定後に行う。
+
+### 外部測定境界を perf の時刻へ変換する
+
+perf の `t=0` は core `run()` 入口の `Instant` であり、OS の `Process.StartTime` とは異なる。
+PID 一致だけでは両者の測定窓は一致しない。対象 session の `session.start.wall_unix_ms`（UTC Unix ms）と
+`wall_t`（その壁時計取得時の perf 相対秒）を一組の anchor とし、外部 sampler の CPU / ログ増加を
+採る開始・終了境界の UTC Unix ms `B` を、次の同じ式で analyzer の `--start-t` / `--end-t` へ渡す。
+
+```text
+perf_t(B) = session.wall_t + (B - session.wall_unix_ms) / 1000
+```
+
+`session.start.t` を anchor の代わりにせず、`Process.StartTime` は process 同一性確認にだけ使う。
+sampler report には外部開始・終了 UTC、anchor、変換後 start_t / end_t と Stopwatch の実測 wall 秒を保存する。
+Rhai の sleep 開始・終了境界も worker 側で記録し、UTC なら同じ式で perf 時刻へ変換する。
+**sleep区間内に変換後の測定区間全体が含まれること**を確認し、warmup・終了通知・終了操作を混入させない。
+境界の通知到着時刻を実際の sleep 境界に置き換えず、測定中の marker 送信も増やさない。
+anchor 欠落 / 不正、session 不一致、時刻逆転、包含不成立は環境不成立とし、OS StartTime へ fallback しない。
+測定中の壁時計変更は不可。外部 UTC の差と Stopwatch の経過が時計精度を超えて食い違う場合も保留する。
+
+回帰検査には、OS の作成時刻から core `t=0` まで **7秒の非ゼロ差**、さらに perf 初期化時の
+`wall_t=5.25` を持つ合成ログを使う。anchor の壁時計は OS 作成時刻+12.25秒、外部測定境界は
+OS作成時刻+17秒 / +32秒とし、変換後は `[10,25]` になることを確認する。
+CPU / ログ増加の外部窓に対応して、t=11 / 24 の work は含め、t=26 の終了 input は除外する。
+誤った OS 経過秒 `[17,32]` では前者を落とし後者を混入させるので、この差を検査する。
+同じ変換で sleep 区間への包含、anchor 欠落、非包含の拒否も検査し、StartTime の7秒ずれを使った
+誤った判定が通らないことを保証する。
 
 判定は `idle_health_thresholds.json` を唯一の正本とする。CPU 目標 .05 / 上限 .10、
 update 目標 2/s / 上限 10/s、reason streak ≤2s、同一 work ≤3、input=0、
@@ -172,17 +227,18 @@ gap と update の同一停止を二重に
 tail=`none` を理由に長い UI update を捨てない。`diagnostic_dropped`、session 不一致、欠損 / 壊れたログ、
 必要な tail / breakdown / 操作証跡がない場合は環境不成立として PASS を禁止する。
 
-| 指標 | 閾値案 |
+| 指標 | 閾値（利用者決定2026-10-09、サンプル数は下記暫定） |
 | --- | --- |
 | unexplained 100ms 超 | 0 件を必須。既知形は別報告し、一般の免除にしない |
 | 描画 frame の <16ms 比率 | **直前 frame の tail が厳密に `request_repaint` の gap だけ**を分母にする。n、<16ms 件数、比率、p95 / max を cached / uncached 別に出す。全 frame 比率は gate にしない |
-| 比率の閾値 | 初期は **97%以上を目標、未満は WARN** を推奨。v4.4.0 / 4.5.0 の98.4 / 98.0%は別条件であり baseline に流用しない。環境内で各3回測り、分布から hard gate を合意する |
+| 比率の閾値 | 初期は **97%以上を目標、未満は WARNのみ**。v4.4.0 / 4.5.0 の98.4 / 98.0%は別条件であり baseline に流用しない。固定 fixture / 同じ PC で各3回測定後、cached / uncached 別の hard gate を決める |
 | `pre_grid.total_ms` | session 全サンプルの **p95 ≤0.3ms を必須**、超過は FAIL。p50 / p95 / max、遅い段と frame を出す。既知 startup を含む raw 値を保存し、除外して閾値を通さない |
 
 分母 0 / 有効サンプル不足は PASS にしない。暫定で描画 n≥200 を目安にし、Phase 2 で fixture と
 台本の自然なサンプル数を確認して固定する。足りないから idle に repaint を足して水増ししない。
 AI は基本台本に含まれないため `known-first-ai=0 / AI未実施` を明記する。
-必要な版だけ同じ入口の明示オプション（案: `-IncludeFirstAi`）で、生成静止画の初回 AI を追加する。
+利用者決定により、AI / GPU 経路を変更する版だけ同じ入口の明示オプション（案: `-IncludeFirstAi`）で、
+生成静止画の初回 AI を追加する。
 モデル / backend / pack と準備時間を記録し、モデル unavailable を正常形に数えない。
 
 ## 6. 結果・検証記録への出力
@@ -195,7 +251,8 @@ AI は基本台本に含まれないため `known-first-ai=0 / AI未実施` を�
 `target/ui-smoke/runs/<run-id>/` の既存 evidence 保存に、fixture / seed recipe、設定 overlay、
 各 session の perf / app log、sampler JSON、case JSON、`summary.json` と `release-record.md` を追加する。
 run-id と case、対象 SHA / dirty fingerprint、exe hash / feature / profile、OS / CPU / GPU / DPI、窓サイズ、
-閾値 version、操作証跡を残す。再起動の log rotation 前に保存する。release-record は正本文書へ自動追記しない。
+閾値 version、操作証跡、tray の保存省略 / cache 不在 / source再生成 / Finalized-backlog 相関、
+外部 / perf 時刻と sleep 包含結果を残す。再起動の log rotation 前に保存する。release-record は正本文書へ自動追記しない。
 **次のブロックは出力書式の例で、実測結果ではない。**
 
 ```markdown
@@ -204,9 +261,11 @@ run-id と case、対象 SHA / dirty fingerprint、exe hash / feature / profile�
   環境 <OS / CPU / GPU / DPI / 窓>、run <証跡へのパス>、了承範囲 <suite / AI有無>。
 - **idle health**: static-foreground <判定 CPU / update / streak / same-work / input / log増加>、
   static-background <同上>、video-pin-background <同上 + TargetKey / cached / upgrade証跡>、
-  tray-close-while-loading <同上 + close受理時未完了 / total-visible開始終了>、
-  tray-close-after-loading <同上 + close受理時完了 / total-visible開始終了>。
+  tray-close-while-loading <同上 + close受理時未完了 / 保存省略・cache不在・格納後source・Finalized-backlog / total-visible開始終了>、
+  tray-close-after-loading <同上 + close受理時完了 / 保存省略・cache不在・格納後source・Finalized-backlog / total-visible開始終了>。
   warmup / measure <秒>、index settle <結果>、閾値 <version>、SKIPPED / warning <理由>。
+  sampler UTC境界 <開始終了> / session clock anchor <wall_unix_ms, wall_t> /
+  perf測定窓 <start_t, end_t> / sleep包含 <結果>、tray旧版FAIL・修正版PASS <両ケースの証跡>。
 - **perf smoke cached / uncached**: <各判定>、folder open / Ctrl+Down x5 / Ctrl+G結果 / exit <証跡>。
   各 total frames <n>、drawn <16ms <k>/<n> (<%>) / p95 <ms> / max <ms>、
   pre_grid total p50 / p95 / max <ms>。100ms超 gaps <n> / updates <n>、
@@ -219,7 +278,8 @@ run-id と case、対象 SHA / dirty fingerprint、exe hash / feature / profile�
 ## 7. 手動で残すもの・エージェント実行
 
 利用者の普段の大量フォルダ / HDD / network / 既存索引・キャッシュでの傾向は生成 fixture だけでは
-代表できない。UI / I/O 変更版では、普段の規模での短い perf 操作を利用者確認として残すのを推奨する。
+代表できない。利用者決定により、UI / I/O 経路を変更する版だけ、普段のフォルダで短い確認を残す。
+通常ビルドは利用者自身が起動し、生成 suite と実データの結果を別に記録する。
 実タイトルバー `[×]` と tray icon からの復帰、窓位置・サイズの復元は native hit-test / Shell 操作の確認として残す。
 当該版で変更した実 IME、native video scanout、音声、multi-monitor DPI 等は、対象経路の既存必須検証を維持する。
 本 suite の自動化成功を、これらや他の §1.197 scenario、full gate の成功へ読み替えない。
@@ -233,24 +293,29 @@ suite が具体化した後、5 idle ケース・2 perf ケース、見込み **
 同じ実行了承の対象に含め、了承前に起動しない。`test-full.ps1` / 配布 build に自動連結しない。
 エージェントは normal-profile executable を起動せず、実設定が必要なら利用者へ build と手順を渡す。
 
-## 8. 段階と相談事項
+## 8. 段階と利用者決定
 
 1. **設計確定（今回）**: 本書を design lead と独立 reviewer へ渡す。A との所有境界、tray の入口と完了条件、
    閾値・手動範囲を合意する。コード変更・コミット・実アプリ実行はしない。
 2. **fixture / 判定器を非対話で実装**: generator / seed 検証、analyzer JSON / verdict と sampler の隔離モード。
    v4.5.0 型の tail=none + scan、正常 sleep、初回AI / 反復AI、未知 gap、欠損ログ、比率の分母、
-   p95 境界を合成ログで回帰検査。path 拒否・approval guard・exact PID は fake テスト。
+   p95 境界、非ゼロのOS作成時刻差と `wall_t`、測定窓 / sleep包含を合成ログで回帰検査。
+   path 拒否・approval guard・exact PID は fake テスト。
 3. **台本を接続**: 最小の test-only close / pin / G + text / read-only 証跡、suite の逐次実行と記録出力。
-   A 統合後、loading 受理条件と終端を照合する。feature 有無の compile / 焦点テスト、完了独立レビューを実施。
+   A 統合後、loading 受理条件、保存省略 / cache不在 / 格納後source / Finalized-backlog と終端を照合する。
+   feature 有無の compile / 焦点テスト、完了独立レビューを実施。
 4. **了承済み検証枠で採用**: 各 case 3 回で成立率 / 実測閾値と所要時間を確認し、既知回帰 fixture が
-   旧版で FAIL / 修正版で PASS を出す証拠を取る（同じ test-only 計装、製品挙動は変更しない）。
+   trayの読み込み中／完了後それぞれで旧版 FAIL / 修正版 PASS を出す証拠を取る
+   （同じ read-only test-only 計装・fixture / overlay、製品挙動は変更しない）。
    foreground 不成立はそのまま記録。採用後に CLAUDE Phase 2、idle 正本、運用・索引を更新する。
 
-利用者 / design lead に確認したい点（回答前は推奨案として扱い、実装を始めない）:
+**利用者決定（2026-10-09）**: 当初の3質問は、すべて推奨案を採用する回答を受領した。
 
-- **比率の hard gate**: 97% を初回から FAIL にするか。推奨は初期 WARN、固定 fixture / 同じ PC の
-  3 回測定後に cached / uncached 別の hard 値を決める。pre_grid p95 0.3ms と未知100ms超は初期から FAIL。
-- **AI の範囲**: 毎回初回 AI も測るか。推奨は基本 suite から分離し、AI / GPU 経路変更版で明示追加。
+- **比率の hard gate**: 初期は WARNのみ。固定 fixture / 同じ PC の各3回測定後に
+  cached / uncached 別の hard 値を決める。pre_grid p95 >0.3ms と未知100ms超の gap は初期から FAIL。
+- **AI の範囲**: 基本 suite から分離し、AI / GPU 経路変更版だけ明示追加する。
   モデル・pack 準備を毎回の idle 検査の前提にしない。
-- **手動実データ確認**: 完全撤廃するか。推奨は UI / I/O 変更版だけ普段のフォルダで短い確認を残す。
-  通常版の起動は利用者自身、生成 suite と配布版 / 実データの値は別に記録する。
+- **手動実データ確認**: UI / I/O 経路変更版だけ普段のフォルダで短い確認を残す。
+  通常ビルドの起動は利用者自身、生成 suite と実データの結果は別に記録する。
+
+回答済みの3点について再確認は不要。本書の修正は設計だけであり、実装・実アプリ検証の開始を意味しない。
