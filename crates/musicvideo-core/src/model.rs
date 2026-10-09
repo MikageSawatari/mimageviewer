@@ -287,12 +287,45 @@ pub struct ProgressBarLayer {
     pub border_fill: Animatable<Fill>,
 }
 
+/// Shared comic-core paint effects. Glyph Fill and layer Glow stay independent.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TextStyle {
+    pub outline: Option<StrokeStyle>,
+    pub extra_outlines: Vec<StrokeStyle>,
+    pub shadow: Option<TextShadowStyle>,
+    pub echo: Option<TextEchoStyle>,
+    pub background: Option<TextBackgroundStyle>,
+    pub letter_gap: f32,
+    pub line_gap: f32,
+}
+
+pub use comic_core::{
+    Rgba as TextColor, StrokeStyle, TextBackgroundStyle, TextEchoStyle, TextShadowStyle,
+};
+
+impl TextStyle {
+    pub fn has_paint(&self) -> bool {
+        self.outline.is_some()
+            || !self.extra_outlines.is_empty()
+            || self.shadow.is_some()
+            || self.echo.is_some()
+            || self.background.is_some()
+    }
+}
+
+fn default_text_style() -> Animatable<TextStyle> {
+    Animatable::Const(TextStyle::default())
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TimeTextLayer {
     pub format: TimeFormat,
     pub font_key: String,
     pub size_px: f32,
     pub align: TextAlign,
+    #[serde(default = "default_text_style")]
+    pub style: Animatable<TextStyle>,
     pub fill: Animatable<Fill>,
 }
 
@@ -302,6 +335,8 @@ pub struct TextLayer {
     pub font_key: String,
     pub size_px: f32,
     pub align: TextAlign,
+    #[serde(default = "default_text_style")]
+    pub style: Animatable<TextStyle>,
     pub fill: Animatable<Fill>,
 }
 
@@ -313,6 +348,8 @@ pub struct LyricsLayer {
     pub font_key: String,
     pub size_px: f32,
     pub align: TextAlign,
+    #[serde(default = "default_text_style")]
+    pub style: Animatable<TextStyle>,
     pub fill: Animatable<Fill>,
 }
 

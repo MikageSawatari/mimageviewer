@@ -99,6 +99,8 @@ pub enum SceneItemKind {
         font_key: String,
         size_px: f32,
         align: TextAlign,
+        style: crate::TextStyle,
+        transient_style: bool,
         fill: Fill,
     },
     Text {
@@ -106,6 +108,8 @@ pub enum SceneItemKind {
         font_key: String,
         size_px: f32,
         align: TextAlign,
+        style: crate::TextStyle,
+        transient_style: bool,
         fill: Fill,
     },
 }
@@ -209,6 +213,8 @@ pub fn evaluate(project: &Project, t_secs: f64, spectrum: &SpectrumFrame) -> Sce
                 font_key: layer.font_key.clone(),
                 size_px: layer.size_px.max(1.0),
                 align: layer.align,
+                style: layer.style.evaluate(time),
+                transient_style: text_style_is_transient(&layer.style, time),
                 fill: brighten_fill(layer.fill.evaluate(time), fill_brightness),
             },
             LayerKind::Text(layer) => SceneItemKind::Text {
@@ -216,6 +222,8 @@ pub fn evaluate(project: &Project, t_secs: f64, spectrum: &SpectrumFrame) -> Sce
                 font_key: layer.font_key.clone(),
                 size_px: layer.size_px.max(1.0),
                 align: layer.align,
+                style: layer.style.evaluate(time),
+                transient_style: text_style_is_transient(&layer.style, time),
                 fill: brighten_fill(layer.fill.evaluate(time), fill_brightness),
             },
             LayerKind::Lyrics(layer) => SceneItemKind::Text {
@@ -226,6 +234,8 @@ pub fn evaluate(project: &Project, t_secs: f64, spectrum: &SpectrumFrame) -> Sce
                 font_key: layer.font_key.clone(),
                 size_px: layer.size_px.max(1.0),
                 align: layer.align,
+                style: layer.style.evaluate(time),
+                transient_style: text_style_is_transient(&layer.style, time),
                 fill: brighten_fill(layer.fill.evaluate(time), fill_brightness),
             },
         };
@@ -790,5 +800,15 @@ mod tests {
         };
         assert_eq!(text, "日本語の歌詞");
         assert_eq!(*fill, Fill::Solid(Rgba8::new(90, 90, 90, 255)));
+    }
+}
+
+fn text_style_is_transient(style: &crate::Animatable<crate::TextStyle>, time: f64) -> bool {
+    match style {
+        crate::Animatable::Const(_) => false,
+        crate::Animatable::Track(track) => {
+            let sampled = style.evaluate(time);
+            !track.keys().iter().any(|key| key.value == sampled)
+        }
     }
 }

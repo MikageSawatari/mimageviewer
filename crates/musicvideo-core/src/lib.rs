@@ -32,7 +32,8 @@ pub use model::{
     LayerKind, LyricLine, LyricsLayer, ModulationBinding, ModulationCurve, ModulationTarget,
     Modulator, ModulatorId, ModulatorSource, ModulatorValue, MusicColorMode, NormRect, Output,
     PitchKeyboardLayer, ProgressBarLayer, Project, Rgba8, SpectrumDirection, SpectrumLayer,
-    SpectrumShape, TextAlign, TextLayer, TimeFormat, TimeTextLayer, Track, TrackError,
+    SpectrumShape, StrokeStyle, TextAlign, TextBackgroundStyle, TextColor, TextEchoStyle,
+    TextLayer, TextShadowStyle, TextStyle, TimeFormat, TimeTextLayer, Track, TrackError,
 };
 pub use preset::{
     BAND_ENERGY_CALIBRATION_HIGH_PERCENTILE, BAND_ENERGY_CALIBRATION_LOW_PERCENTILE,
@@ -56,3 +57,5 @@ pub use spectrum::{
     ModulatorCalibration, ModulatorCalibrationError, ModulatorCalibrationRequest, Smoothing,
     SpectrumSource, SpectrumSourceError, calibrate_modulators, modulator_calibration_requests,
 };
+
+pub use text::{MAX_TEXT_CACHE_BYTES, TextCacheStats};

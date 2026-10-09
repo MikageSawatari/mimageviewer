@@ -23,6 +23,7 @@ pub enum AnimProperty {
     TimeTextFill,
     TextFill,
     LyricsFill,
+    TextStyle,
 }
 
 impl AnimProperty {
@@ -44,6 +45,7 @@ impl AnimProperty {
             Self::TimeTextFill => "文字の塗り",
             Self::TextFill => "文字の塗り",
             Self::LyricsFill => "歌詞の塗り",
+            Self::TextStyle => "文字装飾",
         }
     }
 
@@ -67,6 +69,7 @@ pub enum AnimationValue {
     Rect(NormRect),
     Glow(Option<Glow>),
     Fill(Fill),
+    TextStyle(musicvideo_core::TextStyle),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -239,6 +242,7 @@ value_type!(f32, Float);
 value_type!(NormRect, Rect);
 value_type!(Option<Glow>, Glow);
 value_type!(Fill, Fill);
+value_type!(musicvideo_core::TextStyle, TextStyle);
 
 pub fn animation_properties(layer: &Layer) -> Vec<AnimProperty> {
     let mut properties = vec![
@@ -261,9 +265,13 @@ pub fn animation_properties(layer: &Layer) -> Vec<AnimProperty> {
             properties.push(AnimProperty::ProgressFill);
             properties.push(AnimProperty::ProgressBorderFill);
         }
-        LayerKind::TimeText(_) => properties.push(AnimProperty::TimeTextFill),
-        LayerKind::Text(_) => properties.push(AnimProperty::TextFill),
-        LayerKind::Lyrics(_) => properties.push(AnimProperty::LyricsFill),
+        LayerKind::TimeText(_) => {
+            properties.extend([AnimProperty::TimeTextFill, AnimProperty::TextStyle])
+        }
+        LayerKind::Text(_) => properties.extend([AnimProperty::TextFill, AnimProperty::TextStyle]),
+        LayerKind::Lyrics(_) => {
+            properties.extend([AnimProperty::LyricsFill, AnimProperty::TextStyle])
+        }
     }
     properties
 }
@@ -281,6 +289,12 @@ pub fn animation_keys(layer: &Layer, property: AnimProperty) -> Option<Vec<KeyMe
         AnimProperty::Rotation => keys!(&layer.rotation),
         AnimProperty::CornerRadius => keys!(&layer.corner_radius),
         AnimProperty::Glow => keys!(&layer.glow),
+        AnimProperty::TextStyle => match &layer.kind {
+            LayerKind::Text(text) => keys!(&text.style),
+            LayerKind::TimeText(text) => keys!(&text.style),
+            LayerKind::Lyrics(text) => keys!(&text.style),
+            _ => None,
+        },
         AnimProperty::ImageZoom => match &layer.kind {
             LayerKind::Image { zoom, .. } => keys!(zoom),
             _ => None,
@@ -342,6 +356,12 @@ pub fn animation_value(
         AnimProperty::Rotation => value!(&layer.rotation),
         AnimProperty::CornerRadius => value!(&layer.corner_radius),
         AnimProperty::Glow => value!(&layer.glow),
+        AnimProperty::TextStyle => match &layer.kind {
+            LayerKind::Text(text) => value!(&text.style),
+            LayerKind::TimeText(text) => value!(&text.style),
+            LayerKind::Lyrics(text) => value!(&text.style),
+            _ => None,
+        },
         AnimProperty::ImageZoom => match &layer.kind {
             LayerKind::Image { zoom, .. } => value!(zoom),
             _ => None,
@@ -426,6 +446,12 @@ pub fn apply_editor_command(
         AnimProperty::Rotation => apply!(&mut layer.rotation),
         AnimProperty::CornerRadius => apply!(&mut layer.corner_radius),
         AnimProperty::Glow => apply!(&mut layer.glow),
+        AnimProperty::TextStyle => match &mut layer.kind {
+            LayerKind::Text(text) => apply!(&mut text.style),
+            LayerKind::TimeText(text) => apply!(&mut text.style),
+            LayerKind::Lyrics(text) => apply!(&mut text.style),
+            _ => Err(EditorCommandError::PropertyDoesNotBelongToLayer),
+        },
         AnimProperty::ImageZoom => match &mut layer.kind {
             LayerKind::Image { zoom, .. } => apply!(zoom),
             _ => Err(EditorCommandError::PropertyDoesNotBelongToLayer),

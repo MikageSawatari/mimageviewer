@@ -390,3 +390,68 @@ mod tests {
         assert_eq!(Option::<Glow>::interpolate(&from, &None, 0.9), from);
     }
 }
+
+impl Interpolate for crate::TextStyle {
+    fn interpolate(from: &Self, to: &Self, amount: f32) -> Self {
+        if from.outline.is_some() != to.outline.is_some()
+            || from.extra_outlines.len() != to.extra_outlines.len()
+            || from.shadow.is_some() != to.shadow.is_some()
+            || from.echo.is_some() != to.echo.is_some()
+            || from.background.is_some() != to.background.is_some()
+            || from.echo.map(|e| e.count) != to.echo.map(|e| e.count)
+        {
+            return from.clone();
+        }
+        let scalar = |a: f32, b: f32| f32::interpolate(&a, &b, amount);
+        let color = |a: crate::TextColor, b: crate::TextColor| {
+            let c = crate::Rgba8::interpolate(
+                &crate::Rgba8::new(a.r, a.g, a.b, a.a),
+                &crate::Rgba8::new(b.r, b.g, b.b, b.a),
+                amount,
+            );
+            crate::TextColor::new(c.r, c.g, c.b, c.a)
+        };
+        let stroke = |a: &crate::StrokeStyle, b: &crate::StrokeStyle| crate::StrokeStyle {
+            color: color(a.color, b.color),
+            width_px: scalar(a.width_px, b.width_px),
+        };
+        Self {
+            outline: from.outline.zip(to.outline).map(|(a, b)| stroke(&a, &b)),
+            extra_outlines: from
+                .extra_outlines
+                .iter()
+                .zip(&to.extra_outlines)
+                .map(|(a, b)| stroke(a, b))
+                .collect(),
+            shadow: from
+                .shadow
+                .zip(to.shadow)
+                .map(|(a, b)| crate::TextShadowStyle {
+                    color: color(a.color, b.color),
+                    offset: (
+                        scalar(a.offset.0, b.offset.0),
+                        scalar(a.offset.1, b.offset.1),
+                    ),
+                    blur_px: scalar(a.blur_px, b.blur_px),
+                    spread_px: scalar(a.spread_px, b.spread_px),
+                }),
+            echo: from.echo.zip(to.echo).map(|(a, b)| crate::TextEchoStyle {
+                color: color(a.color, b.color),
+                offset: (
+                    scalar(a.offset.0, b.offset.0),
+                    scalar(a.offset.1, b.offset.1),
+                ),
+                count: a.count,
+            }),
+            background: from.background.zip(to.background).map(|(a, b)| {
+                crate::TextBackgroundStyle {
+                    fill: color(a.fill, b.fill),
+                    padding_px: scalar(a.padding_px, b.padding_px),
+                    corner_px: scalar(a.corner_px, b.corner_px),
+                }
+            }),
+            letter_gap: scalar(from.letter_gap, to.letter_gap),
+            line_gap: scalar(from.line_gap, to.line_gap),
+        }
+    }
+}

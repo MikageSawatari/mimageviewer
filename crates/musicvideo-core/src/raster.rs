@@ -264,12 +264,14 @@ fn composite_solid_body(frame: &mut Frame, mask: &MaskSurface, item: &SceneItem)
         } if *shape != SpectrumShape::MivHorizontal => *color,
         SceneItemKind::TimeText {
             fill: Fill::Solid(color),
+            style,
             ..
         }
         | SceneItemKind::Text {
             fill: Fill::Solid(color),
+            style,
             ..
-        } => *color,
+        } if !style.has_paint() => *color,
         SceneItemKind::ProgressBar {
             fill: Fill::Solid(fill),
             border_fill: Fill::Solid(border),
@@ -404,6 +406,8 @@ fn draw_item(
             font_key,
             size_px,
             align,
+            style,
+            transient_style,
             fill,
         } => {
             if !draw_text(
@@ -414,6 +418,8 @@ fn draw_item(
                 font_key,
                 *size_px,
                 *align,
+                style,
+                *transient_style,
                 fill,
                 item.opacity,
                 item.corner_radius_px,
@@ -427,6 +433,8 @@ fn draw_item(
             font_key,
             size_px,
             align,
+            style,
+            transient_style,
             fill,
         } => {
             if !draw_text(
@@ -437,6 +445,8 @@ fn draw_item(
                 font_key,
                 *size_px,
                 *align,
+                style,
+                *transient_style,
                 fill,
                 item.opacity,
                 item.corner_radius_px,
@@ -1621,12 +1631,15 @@ fn draw_text(
     font_key: &str,
     size_px: f32,
     align: TextAlign,
+    style: &crate::TextStyle,
+    transient_style: bool,
     fill: &Fill,
     opacity: f32,
     corner_radius_px: f32,
     mask_mode: bool,
 ) -> bool {
-    let Some(bitmap) = assets.rasterized_text(text, font_key, size_px, Rgba8::WHITE) else {
+    let Some(bitmap) = assets.rasterized_text(text, font_key, size_px, style, transient_style)
+    else {
         return false;
     };
     let logical_x = match align {
@@ -1635,8 +1648,8 @@ fn draw_text(
         TextAlign::End => rect.x1 as f32 - bitmap.logical_width,
     };
     let logical_y = rect.y0 as f32 + (rect.height() as f32 - bitmap.logical_height) * 0.5;
-    let destination_x = logical_x.round() as i32 - bitmap.padding as i32;
-    let destination_y = logical_y.round() as i32 - bitmap.padding as i32;
+    let destination_x = logical_x.round() as i32 - bitmap.origin_offset.0 as i32;
+    let destination_y = logical_y.round() as i32 - bitmap.origin_offset.1 as i32;
     let sampler = FillSampler::new(fill, rect);
     let frame_width = frame.width as usize;
     for source_y in 0..bitmap.height {
@@ -1651,7 +1664,7 @@ fn draw_text(
             }
             let source_offset = (source_y * bitmap.width + source_x) * 4;
             let glyph_alpha = bitmap.rgba[source_offset + 3] as f32 / 255.0;
-            if glyph_alpha <= 0.0 {
+            if glyph_alpha <= 0.0 && bitmap.decoration.is_none() {
                 continue;
             }
             let px = x as f32 + 0.5;
@@ -1659,10 +1672,22 @@ fn draw_text(
             let clip = rounded_rect_coverage(px, py, rect, corner_radius_px);
             let color = sampler.sample(px, py, None, mask_mode);
             let destination_offset = (y as usize * frame_width + x as usize) * 4;
+            let (color, coverage) = if let Some(decoration) = &bitmap.decoration {
+                (
+                    composite_text_pixel(
+                        &decoration[source_offset..source_offset + 4],
+                        color,
+                        bitmap.rgba[source_offset + 3],
+                    ),
+                    1.0,
+                )
+            } else {
+                (color, glyph_alpha)
+            };
             blend_pixel(
                 &mut frame.rgba[destination_offset..destination_offset + 4],
                 color,
-                opacity * glyph_alpha * clip,
+                opacity * coverage * clip,
             );
         }
     }
@@ -1727,6 +1752,8 @@ fn render_item_mask(
             font_key,
             size_px,
             align,
+            style,
+            transient_style,
             fill,
         } => {
             if !draw_text_mask(
@@ -1738,6 +1765,8 @@ fn render_item_mask(
                 font_key,
                 *size_px,
                 *align,
+                style,
+                *transient_style,
                 fill,
                 item.opacity,
                 item.corner_radius_px,
@@ -1750,6 +1779,8 @@ fn render_item_mask(
             font_key,
             size_px,
             align,
+            style,
+            transient_style,
             fill,
         } => {
             if !draw_text_mask(
@@ -1761,6 +1792,8 @@ fn render_item_mask(
                 font_key,
                 *size_px,
                 *align,
+                style,
+                *transient_style,
                 fill,
                 item.opacity,
                 item.corner_radius_px,
@@ -2040,11 +2073,14 @@ fn draw_text_mask(
     font_key: &str,
     size_px: f32,
     align: TextAlign,
+    style: &crate::TextStyle,
+    transient_style: bool,
     fill: &Fill,
     opacity: f32,
     corner_radius_px: f32,
 ) -> bool {
-    let Some(bitmap) = assets.rasterized_text(text, font_key, size_px, Rgba8::WHITE) else {
+    let Some(bitmap) = assets.rasterized_text(text, font_key, size_px, style, transient_style)
+    else {
         return false;
     };
     let rect = PixelRect {
@@ -2059,8 +2095,8 @@ fn draw_text_mask(
         TextAlign::End => width as f32 - bitmap.logical_width,
     };
     let logical_y = (height as f32 - bitmap.logical_height) * 0.5;
-    let destination_x = logical_x.round() as i32 - bitmap.padding as i32;
-    let destination_y = logical_y.round() as i32 - bitmap.padding as i32;
+    let destination_x = logical_x.round() as i32 - bitmap.origin_offset.0 as i32;
+    let destination_y = logical_y.round() as i32 - bitmap.origin_offset.1 as i32;
     let sampler = FillSampler::new(fill, rect);
     for source_y in 0..bitmap.height {
         let y = destination_y + source_y as i32;
@@ -2073,13 +2109,23 @@ fn draw_text_mask(
                 continue;
             }
             let glyph_alpha = bitmap.rgba[(source_y * bitmap.width + source_x) * 4 + 3];
-            if glyph_alpha == 0 {
+            if glyph_alpha == 0 && bitmap.decoration.is_none() {
                 continue;
             }
             let px = x as f32 + 0.5;
             let py = y as f32 + 0.5;
             let fill_alpha = sampler.sample(px, py, None, true).a as u32;
-            let source_alpha = ((glyph_alpha as u32 * fill_alpha + 127) / 255) as u8;
+            let source_alpha = if let Some(decoration) = &bitmap.decoration {
+                let offset = (source_y * bitmap.width + source_x) * 4;
+                composite_text_pixel(
+                    &decoration[offset..offset + 4],
+                    Rgba8::new(255, 255, 255, fill_alpha as u8),
+                    glyph_alpha,
+                )
+                .a
+            } else {
+                ((glyph_alpha as u32 * fill_alpha + 127) / 255) as u8
+            };
             let coverage = rounded_rect_coverage(px, py, rect, corner_radius_px);
             blend_mask_pixel(
                 &mut alpha[y as usize * width + x as usize],
@@ -3613,3 +3659,23 @@ mod tests {
         );
     }
 }
+
+// Composite at full layer opacity first. The caller applies clip/opacity once.
+fn composite_text_pixel(decoration: &[u8], fill: Rgba8, coverage: u8) -> Rgba8 {
+    let mut pixel: [u8; 4] = decoration.try_into().unwrap();
+    let a = (fill.a as u32 * coverage as u32 + 127) / 255;
+    let back = pixel[3] as u32 * (255 - a);
+    let total = a * 255 + back;
+    if total == 0 {
+        return Rgba8::new(0, 0, 0, 0);
+    }
+    for (channel, source) in pixel[..3].iter_mut().zip([fill.r, fill.g, fill.b]) {
+        *channel = ((source as u32 * a * 255 + *channel as u32 * back + total / 2) / total) as u8;
+    }
+    pixel[3] = ((total + 127) / 255) as u8;
+    Rgba8::new(pixel[0], pixel[1], pixel[2], pixel[3])
+}
+
+#[cfg(test)]
+#[path = "decoration_tests.rs"]
+mod decoration_tests;

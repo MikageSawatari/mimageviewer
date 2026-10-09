@@ -27,6 +27,7 @@ mod lyrics_editing;
 mod modulators;
 mod preview;
 mod resources;
+mod text_style;
 mod timeline;
 
 #[cfg(test)]
@@ -1497,6 +1498,7 @@ fn edit_animation_value(
         }
         (AnimProperty::Glow, AnimationValue::Glow(glow)) => edit_glow(ui, glow),
         (_, AnimationValue::Fill(fill)) => edit_fill(ui, fill),
+        (AnimProperty::TextStyle, AnimationValue::TextStyle(style)) => text_style::edit(ui, style),
         _ => false,
     }
 }
@@ -1985,6 +1987,12 @@ fn edit_glow(ui: &mut egui::Ui, glow: &mut Option<Glow>) -> bool {
     changed
 }
 
+// Color32 stores premultiplied channels; the project/rasterizer uses straight RGBA.
+fn color_from_egui(value: egui::Color32) -> Rgba8 {
+    let [r, g, b, a] = value.to_srgba_unmultiplied();
+    Rgba8::new(r, g, b, a)
+}
+
 fn edit_color(ui: &mut egui::Ui, label: &str, color: &mut Rgba8) -> bool {
     let mut value = egui::Color32::from_rgba_unmultiplied(color.r, color.g, color.b, color.a);
     let mut changed = false;
@@ -1993,7 +2001,7 @@ fn edit_color(ui: &mut egui::Ui, label: &str, color: &mut Rgba8) -> bool {
         changed = ui.color_edit_button_srgba(&mut value).changed();
     });
     if changed {
-        *color = Rgba8::new(value.r(), value.g(), value.b(), value.a());
+        *color = color_from_egui(value);
     }
     changed
 }

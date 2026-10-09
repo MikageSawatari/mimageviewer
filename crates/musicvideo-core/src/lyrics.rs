@@ -295,6 +295,7 @@ mod tests {
             fade_out_secs: 0.0,
             font_key: "default".to_owned(),
             size_px: 64.0,
+            style: Animatable::Const(crate::TextStyle::default()),
             align: TextAlign::Center,
             fill: Animatable::Const(Fill::Solid(Rgba8::WHITE)),
         }

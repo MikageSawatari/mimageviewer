@@ -1975,7 +1975,11 @@ fn draw_text_background(
     fill_polygon_clipped(overlay, &poly, bg.fill, clip);
 }
 
-fn text_effect_padding(block: &TextBlock) -> f32 {
+/// Returns the maximum per-side padding in pixels for a text block's effects.
+///
+/// Includes outlines, background, shadow, glow, and echo. Glyph overhang and
+/// the extra antialiasing border are not included; callers add those separately.
+pub fn text_effect_padding(block: &TextBlock) -> f32 {
     let mut pad = block.outline.map(|s| s.width_px).unwrap_or(0.0).max(0.0);
     for st in &block.extra_outlines {
         pad = pad.max(st.width_px.max(0.0));

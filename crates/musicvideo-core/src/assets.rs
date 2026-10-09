@@ -6,7 +6,7 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use comic_core::FontSet;
 use rayon::prelude::*;
 
-use crate::model::{Fit, ImageId, Rgba8};
+use crate::model::{Fit, ImageId};
 use crate::text::{TextBitmap, TextCache};
 
 pub const MAX_SCALED_IMAGE_CACHE_ENTRIES: usize = 16;
@@ -311,15 +311,20 @@ impl Assets {
         }
     }
 
+    pub fn text_cache_stats(&self) -> crate::text::TextCacheStats {
+        self.text_cache.stats()
+    }
+
     pub(crate) fn rasterized_text(
         &self,
         text: &str,
         font_key: &str,
         size_px: f32,
-        color: Rgba8,
+        style: &crate::TextStyle,
+        transient: bool,
     ) -> Option<Arc<TextBitmap>> {
         self.text_cache
-            .get_or_rasterize(&self.fonts, text, font_key, size_px, color)
+            .get_or_rasterize(&self.fonts, text, font_key, size_px, style, transient)
     }
 }
 
