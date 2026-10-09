@@ -186,10 +186,20 @@ pub fn render(ui: &mut egui::Ui, entries: &[&VersionHighlights]) {
 fn render_item(ui: &mut egui::Ui, marker: &str, item: &HighlightItem) {
     ui.add_space(3.0);
     ui.label(egui::RichText::new(format!("{marker} {}", item.title)).strong());
-    ui.horizontal_wrapped(|ui| {
-        ui.add_space(14.0);
-        ui.label(egui::RichText::new(item.body).size(12.5));
-    });
+    // Allocate the wrapped galley once in the vertical layout. horizontal_wrapped
+    // allocates individual row rects, whose pixel rounding can exceed the galley's
+    // bounded wrap width and feed a growing content width back into the Window.
+    // Keep the existing first-line indent and minimum row height in the text job.
+    let mut body = std::sync::Arc::unwrap_or_clone(
+        egui::WidgetText::from(egui::RichText::new(item.body).size(12.5)).into_layout_job(
+            ui.style(),
+            egui::FontSelection::Default,
+            egui::Align::Center,
+        ),
+    );
+    body.sections[0].leading_space = 14.0;
+    body.first_row_min_height = ui.spacing().interact_size.y;
+    ui.add(egui::Label::new(body).wrap());
 }
 
 // v3.8.0 は別バージョン索引を休止したまま出荷したので、この版の告知は 2 件のまま固定する。
