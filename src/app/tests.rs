@@ -42165,6 +42165,8 @@ mod favorite_adjustment_defaults_tests {
             cache_key_override: Some("archivethumb:rar:must-not-open.rar".to_string()),
             resolve_override: Some(crate::thumb_loader::ResolveStrategy::ZipFirstImage),
             source_policy: LoadSourcePolicy::CacheOnly,
+            request_id: crate::thumb_loader::ThumbnailRequestId::Registered(1360),
+            items_gen: 17,
             ..Default::default()
         };
         let cache_map = std::sync::RwLock::new(std::collections::HashMap::new());
@@ -42194,6 +42196,16 @@ mod favorite_adjustment_defaults_tests {
             None,
         );
 
+        let message = rx
+            .try_recv()
+            .expect("cache-only miss must emit an image-less terminal");
+        assert!(matches!(
+            message.payload,
+            crate::thumb_loader::ThumbMsgPayload::CacheOnlyMiss
+        ));
+        assert!(!message.is_finalized());
+        assert_eq!(message.request_id, request.request_id);
+        assert_eq!(message.items_gen, request.items_gen);
         assert!(matches!(
             rx.try_recv(),
             Err(std::sync::mpsc::TryRecvError::Empty)
@@ -42247,6 +42259,120 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn cache_only_miss_keep_exit_reentry_and_judgement_release_only_the_finished_request() {
+        for judgement_before_reentry in [false, true] {
+            let ctx = egui::Context::default();
+            let (mut app, keys, decision_tx) = pending_archive_batch_for_resolution_test();
+            app.reload_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+            app.heavy_io_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+            let projection = || ThumbnailKeepProjection {
+                pages: HashSet::from([0]),
+                bounded_range: (0, 1),
+                interactive_pages: HashSet::new(),
+            };
+            app.install_thumbnail_keep_projection(projection(), true);
+            app.enqueue_priority_thumbnail(0);
+            let mut request = app
+                .heavy_io_queue
+                .as_ref()
+                .unwrap()
+                .0
+                .lock()
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(request.source_policy, LoadSourcePolicy::CacheOnly);
+            let old_id = request.request_id;
+            let cache_map = std::sync::RwLock::new(std::collections::HashMap::new());
+            let done = Arc::new(AtomicUsize::new(0));
+            let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
+            crate::thumb_loader::process_load_request(
+                &mut request,
+                &cache_map,
+                &app.tx,
+                None,
+                64,
+                75,
+                64,
+                CacheDecision::from_settings(&crate::settings::Settings::default()),
+                &done,
+                &stats,
+                None,
+                &app.keep_start_shared,
+                &app.keep_end_shared,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            assert_eq!(done.load(Ordering::Relaxed), 1);
+            // The worker is finished, and scrolling out can exclude this archive from judgement.
+            app.install_thumbnail_keep_projection(ThumbnailKeepProjection::default(), true);
+            app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+            assert_eq!(
+                app.requested.legacy_len(),
+                0,
+                "finished miss must not sustain tail repaint"
+            );
+            assert!(!app.requested.blocks_idle_upgrade());
+            assert_eq!(
+                app.requested.id(0),
+                None,
+                "there is no live worker or image waiting"
+            );
+            assert_eq!(app.requested.images_len(), 0);
+            assert_eq!(
+                app.requested.progress_counts(&HashSet::from([0])),
+                (0, 0, 0)
+            );
+            assert!(!matches!(app.thumbnails[0], ThumbnailState::Failed));
+
+            if !judgement_before_reentry {
+                app.install_thumbnail_keep_projection(projection(), true);
+                for _ in 0..3 {
+                    app.enqueue_priority_thumbnail(0);
+                }
+                assert!(
+                    app.heavy_io_queue
+                        .as_ref()
+                        .unwrap()
+                        .0
+                        .lock()
+                        .unwrap()
+                        .is_empty(),
+                    "a completed cache miss must not be re-enqueued before archive judgement"
+                );
+            }
+            decision_tx
+                .send(ConvertedArchiveCachePathsMsg::Resolved {
+                    archive_key: keys[0].clone(),
+                    state: crate::app::ConvertedArchiveSourceState::CachedZip {
+                        logical_source: app.items[0].drag_source_path().unwrap().to_path_buf(),
+                        path: app.tmp.path().join("first.zip"),
+                    },
+                    idx: 0,
+                    ordinal: 1,
+                    elapsed_ms: 5.0,
+                    input_seq: 7,
+                })
+                .unwrap();
+            app.poll_converted_archive_cache_paths(&ctx);
+            app.install_thumbnail_keep_projection(projection(), true);
+            app.enqueue_priority_thumbnail(0);
+            let queue = app.heavy_io_queue.as_ref().unwrap().0.lock().unwrap();
+            assert_eq!(
+                queue.len(),
+                1,
+                "judgement must restore the ordinary reload route"
+            );
+            assert!(queue[0].source_policy.allows_source());
+            assert_ne!(queue[0].request_id, old_id);
+            assert_eq!(Some(queue[0].request_id), app.requested.id(0));
+        }
+    }
+
+    #[test]
     fn resolved_archive_does_not_evict_a_thumbnail_the_cache_only_request_already_drew() {
         // The cache-only request made while the candidate was Pending uses the same cache key
         // and the same mtime/file_size as the resolved one, so a hit is already the final
@@ -42289,10 +42415,65 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn cache_only_miss_judgement_overtakes_terminal_without_reblocking_reload() {
+        let ctx = egui::Context::default();
+        let (mut app, keys, decision_tx) = pending_archive_batch_for_resolution_test();
+        app.heavy_io_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+        app.enqueue_priority_thumbnail(0);
+        let old = app
+            .heavy_io_queue
+            .as_ref()
+            .unwrap()
+            .0
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap();
+        decision_tx
+            .send(ConvertedArchiveCachePathsMsg::Resolved {
+                archive_key: keys[0].clone(),
+                state: crate::app::ConvertedArchiveSourceState::CachedZip {
+                    logical_source: app.items[0].drag_source_path().unwrap().to_path_buf(),
+                    path: app.tmp.path().join("first.zip"),
+                },
+                idx: 0,
+                ordinal: 1,
+                elapsed_ms: 5.0,
+                input_seq: 7,
+            })
+            .unwrap();
+        app.poll_converted_archive_cache_paths(&ctx);
+        app.enqueue_priority_thumbnail(0);
+        let new_id = app.requested.id(0).unwrap();
+        assert_ne!(new_id, old.request_id);
+        for (id, generation) in [
+            (old.request_id, old.items_gen),
+            (new_id, old.items_gen.wrapping_sub(1)),
+        ] {
+            app.tx
+                .send(ThumbMsg {
+                    idx: 0,
+                    input_seq: 0,
+                    items_gen: generation,
+                    request_id: id,
+                    payload: crate::thumb_loader::ThumbMsgPayload::CacheOnlyMiss,
+                })
+                .unwrap();
+            app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+            assert_eq!(app.requested.id(0), Some(new_id));
+            assert_eq!(app.requested.legacy_len(), 1);
+            assert!(matches!(app.thumbnails[0], ThumbnailState::Evicted));
+            let queue = app.heavy_io_queue.as_ref().unwrap().0.lock().unwrap();
+            assert_eq!(queue.len(), 1);
+            assert!(queue[0].source_policy.allows_source());
+        }
+    }
+
+    #[test]
     fn resolved_archive_reloads_a_tile_whose_cache_only_request_missed() {
         // The other half of the pair: nothing is on screen, so the tile has to be requested
-        // again now that the source is known. Without this the cache-only miss would sit in
-        // `requested` forever and the archive would never get a thumbnail.
+        // again now that the source is known. The archive-judgement admission gate must
+        // be removed along with any old request correlation, without affecting cache hits.
         let ctx = egui::Context::default();
         let (mut app, keys, tx) = pending_archive_batch_for_resolution_test();
         app.thumbnails[0] = ThumbnailState::Pending;

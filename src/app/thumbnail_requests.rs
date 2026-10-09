@@ -43,9 +43,30 @@ struct Request {
     edit_preview_epoch: Option<u64>,
     phase: Phase,
 }
+// A completed CacheOnly miss has no outstanding request, but demand still waits for
+// archive judgement. Keep this bounded, context-local admission state in the same
+// owner instead of preserving a fictitious worker or adding a separate pending set.
+enum Slot {
+    Request(Request),
+    AwaitingArchiveJudgement,
+}
+impl Slot {
+    fn request(&self) -> Option<&Request> {
+        match self {
+            Self::Request(r) => Some(r),
+            Self::AwaitingArchiveJudgement => None,
+        }
+    }
+    fn request_mut(&mut self) -> Option<&mut Request> {
+        match self {
+            Self::Request(r) => Some(r),
+            Self::AwaitingArchiveJudgement => None,
+        }
+    }
+}
 #[derive(Default)]
 pub(crate) struct ThumbnailRequests {
-    entries: HashMap<usize, Request>,
+    entries: HashMap<usize, Slot>,
     upload_order: VecDeque<(usize, ThumbnailRequestId)>,
     legacy_count: usize,
 }
@@ -70,31 +91,33 @@ impl ThumbnailRequests {
         let id = ThumbnailRequestId::Registered(NEXT.fetch_add(1, Ordering::Relaxed));
         self.entries.insert(
             idx,
-            Request {
+            Slot::Request(Request {
                 id,
                 items_gen,
                 kind,
                 edit_preview_epoch,
                 phase: Phase::Awaiting,
-            },
+            }),
         );
         self.legacy_count += usize::from(kind.legacy());
         Some(id)
     }
     pub(crate) fn id(&self, idx: usize) -> Option<ThumbnailRequestId> {
-        self.entries.get(&idx).map(|r| r.id)
+        self.entries.get(&idx).and_then(Slot::request).map(|r| r.id)
     }
     pub(crate) fn matches(&self, msg: &ThumbMsg) -> bool {
         self.entries
             .get(&msg.idx)
+            .and_then(Slot::request)
             .is_some_and(|r| r.id == msg.request_id && r.items_gen == msg.items_gen)
     }
+    /// Admission includes judgement-waiting demand; activity projections only see Requests.
     pub(crate) fn contains_key(&self, idx: &usize) -> bool {
         self.entries.contains_key(idx)
     }
     #[cfg(test)]
     pub(crate) fn get(&self, idx: &usize) -> Option<&bool> {
-        self.entries.get(idx).map(|r| {
+        self.entries.get(idx).and_then(Slot::request).map(|r| {
             if r.kind == ThumbnailRequestKind::Upgrade {
                 &true
             } else {
@@ -105,6 +128,7 @@ impl ThumbnailRequests {
     pub(crate) fn owner_matches_edit_preview_epoch(&self, idx: usize, epoch: u64) -> bool {
         self.entries
             .get(&idx)
+            .and_then(Slot::request)
             .is_some_and(|r| r.edit_preview_epoch == Some(epoch))
     }
     pub(crate) fn clear(&mut self) {
@@ -114,7 +138,9 @@ impl ThumbnailRequests {
     }
     /// Scope/source retirement, never ordinary GPU eviction or keep-range departure.
     pub(crate) fn remove(&mut self, idx: &usize) -> Option<bool> {
-        let r = self.entries.remove(idx)?;
+        let Slot::Request(r) = self.entries.remove(idx)? else {
+            return Some(false);
+        };
         self.legacy_count -= usize::from(r.kind.legacy());
         if matches!(r.phase, Phase::Queued { .. }) {
             self.upload_order
@@ -132,8 +158,19 @@ impl ThumbnailRequests {
             return ThumbnailReceipt::Ignored;
         }
         let idx = msg.idx;
-        let r = self.entries.get_mut(&idx).unwrap();
+        let r = self
+            .entries
+            .get_mut(&idx)
+            .and_then(Slot::request_mut)
+            .unwrap();
         match msg.payload {
+            ThumbMsgPayload::CacheOnlyMiss => {
+                // Explicitly settle both terminals, retire correlation, then retain only
+                // the existing archive-judgement demand gate. It is never busy work.
+                self.remove(&idx);
+                self.entries.insert(idx, Slot::AwaitingArchiveJudgement);
+                ThumbnailReceipt::Terminal(ThumbMsgPayload::CacheOnlyMiss)
+            }
             ThumbMsgPayload::Finalized => {
                 let source_changed = !matches!(
                     r.phase,
@@ -207,7 +244,12 @@ impl ThumbnailRequests {
     }
     pub(crate) fn next_image(&mut self) -> Option<ThumbMsg> {
         while let Some((idx, id)) = self.upload_order.pop_front() {
-            let Some(r) = self.entries.get_mut(&idx).filter(|r| r.id == id) else {
+            let Some(r) = self
+                .entries
+                .get_mut(&idx)
+                .and_then(Slot::request_mut)
+                .filter(|r| r.id == id)
+            else {
                 continue;
             };
             let phase = std::mem::replace(&mut r.phase, Phase::Awaiting);
@@ -222,7 +264,12 @@ impl ThumbnailRequests {
         None
     }
     pub(crate) fn settle_image(&mut self, idx: usize, id: ThumbnailRequestId) {
-        let Some(r) = self.entries.get_mut(&idx).filter(|r| r.id == id) else {
+        let Some(r) = self
+            .entries
+            .get_mut(&idx)
+            .and_then(Slot::request_mut)
+            .filter(|r| r.id == id)
+        else {
             return;
         };
         match r.phase {
@@ -243,7 +290,12 @@ impl ThumbnailRequests {
     pub(crate) fn discard_images_outside(&mut self, keep: &HashSet<usize>) {
         let mut retained = VecDeque::new();
         while let Some((idx, id)) = self.upload_order.pop_front() {
-            let Some(r) = self.entries.get_mut(&idx).filter(|r| r.id == id) else {
+            let Some(r) = self
+                .entries
+                .get_mut(&idx)
+                .and_then(Slot::request_mut)
+                .filter(|r| r.id == id)
+            else {
                 continue;
             };
             // Video batches and direct bookmark images have no normal re-enqueue route.
@@ -278,22 +330,25 @@ impl ThumbnailRequests {
     }
     pub(crate) fn video_image_pending(&self, keep: &HashSet<usize>) -> bool {
         keep.iter().any(|idx| {
-            self.entries.get(idx).is_some_and(|r| {
-                r.kind == ThumbnailRequestKind::VideoBatch
-                    && matches!(
-                        r.phase,
-                        Phase::Awaiting
-                            | Phase::FinalizedAwaiting
-                            | Phase::Queued { .. }
-                            | Phase::Uploading { .. }
-                    )
-            })
+            self.entries
+                .get(idx)
+                .and_then(Slot::request)
+                .is_some_and(|r| {
+                    r.kind == ThumbnailRequestKind::VideoBatch
+                        && matches!(
+                            r.phase,
+                            Phase::Awaiting
+                                | Phase::FinalizedAwaiting
+                                | Phase::Queued { .. }
+                                | Phase::Uploading { .. }
+                        )
+                })
         })
     }
     pub(crate) fn progress_counts(&self, keep: &HashSet<usize>) -> (usize, usize, usize) {
         let (mut normal, mut upgrade, mut queued_normal) = (0, 0, 0);
         for idx in keep {
-            if let Some(r) = self.entries.get(idx) {
+            if let Some(r) = self.entries.get(idx).and_then(Slot::request) {
                 match r.kind {
                     ThumbnailRequestKind::Normal => {
                         normal += 1;
@@ -312,6 +367,7 @@ impl ThumbnailRequests {
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&usize, &bool)> {
         self.entries
             .iter()
+            .filter_map(|(idx, slot)| slot.request().map(|r| (idx, r)))
             .filter(|(_, r)| r.kind.legacy())
             .map(|(idx, r)| {
                 (
@@ -375,7 +431,9 @@ impl ThumbnailRequests {
                 msg.pixels().and_then(|p| p.origin.edit_preview_epoch()),
             );
         }
-        let r = self.entries.get_mut(&msg.idx).unwrap();
+        let Some(r) = self.entries.get_mut(&msg.idx).and_then(Slot::request_mut) else {
+            return msg;
+        };
         // Old handler fixtures do not model admission. New lifecycle regressions use begin + ID.
         if r.items_gen == 0 {
             r.items_gen = msg.items_gen;
@@ -386,7 +444,12 @@ impl ThumbnailRequests {
     pub(crate) fn images(&self) -> impl Iterator<Item = &ThumbMsg> {
         self.upload_order
             .iter()
-            .filter_map(|(idx, id)| self.entries.get(idx).filter(|r| r.id == *id))
+            .filter_map(|(idx, id)| {
+                self.entries
+                    .get(idx)
+                    .and_then(Slot::request)
+                    .filter(|r| r.id == *id)
+            })
             .filter_map(|r| {
                 if let Phase::Queued { image, .. } = &r.phase {
                     Some(image.as_ref())
@@ -408,6 +471,7 @@ impl ThumbnailRequests {
         let mut rows: Vec<_> = self
             .entries
             .iter()
+            .filter_map(|(idx, slot)| slot.request().map(|r| (idx, r)))
             .map(|(idx, r)| {
                 (
                     *idx,
@@ -456,16 +520,19 @@ impl ThumbnailRequests {
     }
     #[cfg(test)]
     pub(crate) fn finalized_image_wait(&self, idx: usize) -> bool {
-        self.entries.get(&idx).is_some_and(|r| {
-            matches!(
-                r.phase,
-                Phase::FinalizedAwaiting
-                    | Phase::Queued {
-                        terminal: ImageTerminal::Complete,
-                        ..
-                    }
-            )
-        })
+        self.entries
+            .get(&idx)
+            .and_then(Slot::request)
+            .is_some_and(|r| {
+                matches!(
+                    r.phase,
+                    Phase::FinalizedAwaiting
+                        | Phase::Queued {
+                            terminal: ImageTerminal::Complete,
+                            ..
+                        }
+                )
+            })
     }
     #[cfg(test)]
     pub(crate) fn any_finalized_image_wait(&self) -> bool {
@@ -478,7 +545,7 @@ impl ThumbnailRequests {
         if !self.contains_key(&idx) {
             self.insert(idx, false);
         }
-        let r = self.entries.get(&idx).unwrap();
+        let r = self.entries.get(&idx).and_then(Slot::request).unwrap();
         let msg = ThumbMsg::from_legacy_parts(
             idx,
             None,

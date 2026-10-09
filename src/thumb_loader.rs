@@ -375,6 +375,8 @@ pub enum ThumbMsgPayload {
     /// Drive child seed awaiting validation or replacement by terminal Pixels.
     ProvisionalPixels(ThumbPixels),
     NoArt,
+    /// Cache lookup ended without pixels; source admission awaits archive judgement.
+    CacheOnlyMiss,
     Failed {
         origin: ThumbLoadOrigin,
     },
@@ -2396,10 +2398,16 @@ pub fn process_load_request(
         }
     }
 
-    // Pending な変換アーカイブの cache-only 要求は、catalog miss ならここで完了する。
-    // UI の `requested` は判定結果の publish 時に対象 idx を evict するまで保持し、
-    // 毎フレーム同じ miss を再投入しない。元アーカイブを開く処理には進まない。
+    // CacheOnly miss completes both worker and image terminals without opening the source.
+    // The UI owner retires this request and retains only archive-judgement demand admission.
     if !req.source_policy.allows_source() {
+        let _ = tx.send(ThumbMsg {
+            idx: req.idx,
+            input_seq: req.input_seq,
+            items_gen: req.items_gen,
+            request_id: req.request_id,
+            payload: ThumbMsgPayload::CacheOnlyMiss,
+        });
         gen_done.fetch_add(1, Ordering::Relaxed);
         if crate::perf::is_enabled() {
             crate::perf::event(

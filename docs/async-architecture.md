@@ -893,6 +893,10 @@ input_seqは操作計装であり、要求identityには使わない。
   ドライブの暫定seedは `ProvisionalPixels` と検証終端/置換を同ownerで扱う。
 - `NoArt` / `Failed` / `Canceled` は一致する要求の未採用画像も捨てて終了する。
   Canceledは既存Loadedを維持し、未LoadedをEvictedへ戻す。
+- `CacheOnlyMiss` はID/gen相関付き一通知で画像なしの両終端を確定する。requestを除去し、
+  同owner内にID/worker/画像のない `AwaitingArchiveJudgement` 需要slotだけ残す。
+  このslotは再投入受付を抑制するがidle blocker/repaint/progressには数えない。
+  keep出退やGPU解放では維持し、判定publish→既存reload/source更新/世代退役で除去する。
 - items generation変更 / source失効 / channel交換 / context dropは旧namespaceを退役する。
   同一generation更新では予約を変えず、遅着通知が新ownerを解除することもない。
 - tray hide / park のCPU画像破棄は同ownerの画像側終端を通す。restoreは既存需要再評価であり、

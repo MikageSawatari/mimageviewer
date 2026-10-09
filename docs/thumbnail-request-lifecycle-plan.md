@@ -128,6 +128,15 @@ idx だけで暗黙に受理する fallback は作らない。Remote の生成�
 
 完了状態は API の返り値として必要な副作用を返し、その request entry を除去する。
 Completed の履歴や tombstone を無期限に蓄積しない。一意の ID と現 owner の照合で遅着を棄却する。
+CacheOnly miss は相関付き `CacheOnlyMiss` 一通知で画像なしの両終端を確定し、request を除去する。
+ただし判定前の同じ cache lookup を毎フレーム再投入しないよう、同じ owner の entry を
+`Slot::Request` から `Slot::AwaitingArchiveJudgement` へ移す。後者は現 items の需要受付状態で、
+request ID・worker・画像を持たず、完了履歴でもない。keep 退出/再入場、GPU解放/画像破棄では維持し、
+既存の判定結果 publish → `evict_thumbnail_for_reload`、明示source更新、世代失効/dropで除去する。
+判定後は新しいIDの通常reloadへ戻る。Loadedのcache hitを判定時にevictしない既存挙動も維持する。
+`begin` / admission用 `contains_key` はこの需要待ちを含むが、通知相関・idle blocker・tail repaint・
+progress・要求診断の投影は有効な `Slot::Request` のみを見る。したがって範囲外で判定されなくても
+完了したcache missがCPU仕事や継続repaintを要求せず、他の画像のupgradeを妨げない。
 FinalizedAwaitingResult は通知順序に依存しない表現で、通常の同一 sender では Pixels が先に届く。
 画像なしの成功を Finalized だけで通知することは許可せず、NoArt 等で明示する。
 
@@ -138,6 +147,7 @@ FinalizedAwaitingResult は通知順序に依存しない表現で、通常の�
 | 単一通知 Pixels | AwaitingResult→TerminalImageQueued（cache hit / Audio / video / 直接画像） |
 | UI 採用 / 明示破棄 | SourceImageQueued→ImageSettledAwaitingFinalized。TerminalImageQueued→完了 |
 | 画像なし終端 | 一致する要求の未採用画像も破棄し、worker 終端と画像側終端を一度に確定→完了 |
+| CacheOnly miss | 相関付き画像なし終端→requestを除去し、IDのないアーカイブ判定待ち需要へ移行。判定結果/明示更新/世代失効で需要待ちを除去 |
 | 実行前 queue prune | lock 下で取り除いた一致する要求を画像なし局所取消→完了 |
 | scope 失効 / drop | その context の旧 namespace と未採用画像を廃棄。終端受信を偽装せず、以降の旧通知は棄却 |
 
@@ -279,7 +289,7 @@ upgrade peakは既存どおりUを使い、peak更新/zero時resetとsnapshotの
 | regular / heavy worker | `spawn_thumbnail_workers` の pop 後 STALE、I/O resolve 後、PDF render 前の取消は元 key を返す。通知を送らず現行 owner を放置する exit を作らない |
 | `process_load_request` の cache hit | 通常 cache、edit-preview cache、固定代表 cache、派生 WebP、cache-only を含む。TerminalPixels、または画像なし Failed / Canceled で一通知終端。backlog 内なら解除しない |
 | `load_one_cached` の source 成功 | 通常画像、Folder 代表、ZIP cover / ZipImage / ZipDir、PdfFile / PdfPage、変換済み archive / Stack 代表。SourcePixels→保存/省略→Finalized。`should_save=false` も必ず終端通知 |
-| source decode / resolve エラー | `send_thumb_failed`、各 cache-only miss、source failure は画像なし終端。デコード途中取消、PDF Interrupted は Failed と区別し既存 retriable 表示を保つ |
+| source decode / resolve エラー、cache-only miss | `send_thumb_failed`、source failure は画像なし Failed 終端。CacheOnly miss は失敗表示を出さず `CacheOnlyMiss` 終端と判定待ち需要へ移行する。デコード途中取消、PDF Interrupted は Failed と区別し既存 retriable 表示を保つ |
 | RAW preview / half handoff | preview が十分なら既存 source 経路。不足なら同じ key を `RawThumbPending`、callback、follow-up queue、`finish_pruned_raw_half_followup` に渡す。handoff 自体は完了でない。取消通知と callback の遅着が後続 owner を壊さず、進捗の一回計上も維持 |
 | Audio | generator は cache admission 後に一通知。Pixels は TerminalPixels、NoArt / Failed / Canceled は画像なし終端。sidecar / MP3 art / RAW sidecar、idle upgrade と cache revisit は既存の共通 dispatch を維持 |
 | ドライブ代表 / child pin | seed→同一確定Finalized、seed→確定FinalCache、seed→child miss の各経路。seed の upload 有無に依存せず旧seedを閉じる。seed表示の省略や追加DB参照はしない |
@@ -421,6 +431,7 @@ fake通知を使うhandler-level poll/enqueue検査を組み合わせる。
 | 同一世代のlate notification | Aを終端/明示失効させBをbeginし、AのPixels / Finalized / Canceled / Failed / NoArtを全て注入。Bの予約・表示・origin・dims・writeback・色代表状態は不変 |
 | items generation / channel / source証明の失効 | 同じidxへの旧結果を拒否。新世代/新edit epochは採用可能。単なるkeep退出やGPU退去では失効扱いにしない |
 | 単一通知 | cache hit、edit preview、Audio Pixels、video、marker直接画像はFinalizedなしで画像採用/破棄後に終わる。Audio NoArt/Failed/Canceledは画像なしで終端。NoArt/Failedの通常静止再要求なし、明示cache maintenance後の再要求あり |
+| CacheOnly miss | 実workerの一通知・ID/gen相関とsource未読を検証。miss→keep退出→再入場/判定完了の両順で活動0・再投入抑制・判定後reload。判定先着の旧miss/wrong-genが新要求を壊さない。画像破棄/hide/restore/同世代維持/世代退役/兄弟context局所性、他画像の実idle upgradeを確認 |
 | keep外動画retryと画像upgrade（設計レビューP2-1） | keep外idxにVideoBatch Awaiting ownerを残し、keep内の別idxにUpgradeableCache画像を用意。fake retry待ちのまま、期限前はidle recheckが従来の残り時間を返し、期限後はreload/heavy両queueが空ならupgradeを1回beginして採用まで進む。owner全体は非空でもblockerは動画を除外。対照としてNormal / Upgradeはkeep外・画像Queued/Settledでも終端までblockする |
 | 動画待ちのrepaint投影（設計レビューP2-2） | 動画以外のwake理由を除いたfake frameで、keep外VideoBatch Awaitingだけなら3つのthumbnail reasonとthumbnail_work_activeは全てfalse。keep内へ入れるとvisible_video_thumb_pendingだけtrue、退出でfalse。動画PixelsをQueuedにするとkeep外でもbacklog理由だけtrue（Gridの既存保持）、8枚予算で採用/破棄後false。retry時間相当の反復評価でも追加timer/heartbeat/通常requested理由を作らず、既存の動画待ち以上にrepaintしない |
 | 動画要求の進捗非算入（設計レビューP2-3） | VideoBatchだけをkeep内/外、Awaiting/Queued、採用/失敗終端へ遷移させ、通常/upgrade cur・peak・cache_gen_total/doneは0のまま。別にNormalとUpgradeを混在させ、動画/DirectPixelsのQueued画像を増減し、既存Upgradeやkeep外Normalの画像待ちphaseを変えてもN/UとNormal peak入力N-QNが不変。Normalの需要内QueuedだけをQNへ入れ、queueとownerの二重計上なし |
@@ -545,3 +556,31 @@ normal feature setのcore / remote / EPUB PDF workerを `target/dev-runtime` に
 VCRT/PE検査も成功。単一並列・node reuse無効でbuildし、対象外のプロセスは停止しなかった。
 アプリ起動・コミットは行っていない。前回 `test-full` の中断を全workspace/vendor完走とは扱わず、
 今回明示された個別ゲートの結果を記録した。修正buildの実機tray両ケースは利用者の検収に残る。
+
+## 13. 実装レビューP2: CacheOnly miss の終端移行（2026-10-10）
+
+利用者が実装を `89cf5cb88` としてコミットした後、独立レビューでCacheOnly missの無通知終了が
+指摘された。修正前の製品コードへworker受信とkeep退出handlerの期待を追加し、
+`cache_only_miss` 3件中1成功/意図した2失敗を確認した。終端受信はEmpty、終了済missの
+legacy activityは1（期待0）。証拠: `target/A-1360-fix-before.log`。
+
+§3.2の `CacheOnlyMiss` と型付き需要待ちslotを実装した。要求相関を完全に退役し、
+需要待ちをworker/画像待ちの投影から除外しながら、判定前の再投入抑制と判定後reloadを維持する。
+独立の読み取り監査でproduction `gen_done` 増加22箇所と通知なしに見えるRAW継続等の退出を確認し、
+この1箇所以外に移行漏れはなかった。VideoBatch取消の残件通知、queue/permit取消、
+RAW follow-up prune、未登録catalog job、context/channel退役も確認した。
+一覧と終了責務は `target/A-1360-fix-msg.txt` に記録する。構造案と最終差分は独立確認で ACCEPT。
+
+追加回帰は実workerの単一通知/ID/gen/source未読、keep出退と判定完了の両順、判定先着/旧ID/旧gen、
+判定待ちの活動0と画像破棄、他画像の実idle upgrade、hide/restore、App/AtRest世代退役と兄弟不変。
+既存の同世代遅着/wrong-context通知の回帰にも新payloadを追加した。
+CacheOnly関連7件、lifecycle38件、worker88件、fmt、glyph（危険文字0）、viewer context audit（指摘0）、
+analyzer71件は成功。提供ログの同じ窓は再び `input=0 / max_same_work=116 / FAIL`（期待exit1）。
+証拠: `target/A-1360-fix-*.log` / `A-1360-fix-analyzer-trayloop.json`。
+全libは11462成功/失敗0/52既存ignore、1139.32秒で完走した。
+F4 geometryと前回timeoutした音声テストも全体内で成功。テストのtimeout/並列設定/期待値は変更していない。
+snapshot140件、normal / portable core checkも成功。diff checkも成功。
+前回test-fullの中断をworkspace/vendor全ゲート完走とは扱わず、今回の個別結果を引継ぎに確定した。
+
+利用者が既存 `target/dev-runtime` を実機測定中のため、今回 `build-dev.ps1` と同directoryへの書込みは
+明示禁止されている。アプリ起動/コミットも行わず、P2差分の実機buildは利用者へ引き継ぐ。

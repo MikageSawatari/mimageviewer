@@ -40177,8 +40177,8 @@ impl App {
                             pending.pin_archive_dependencies.get(&archive_key).cloned()
                         })
                         .unwrap_or_default();
-                    // 判定が付いた候補自身は、cache-only 要求が miss したまま `Requested` で
-                    // 止まっているときだけ組み直す。cache hit で既に描けているサムネイルは、
+                    // 判定が付いた候補自身は、cache-only miss 後の判定待ちなど、
+                    // まだ画像が描けていないときだけ組み直す。cache hit で既に描けているサムネイルは、
                     // 解決後の要求と cache key (`convertible_archive_cache_base_key`) も
                     // mtime / file_size (アーカイブ自身のもの) も同一なので、作り直しても
                     // 同じ絵にしかならない。evict は texture を落として `Evicted` に戻すため、
@@ -49569,6 +49569,9 @@ impl App {
                         self.invalidate_color_representative(i);
                         self.fire_virtual_folder_writeback_if_ready(i);
                     }
+                }
+                ThumbnailReceipt::Terminal(crate::thumb_loader::ThumbMsgPayload::CacheOnlyMiss) => {
+                    // No display failure: only source admission waits for archive judgement.
                 }
                 ThumbnailReceipt::Terminal(crate::thumb_loader::ThumbMsgPayload::NoArt) => {
                     self.thumbnails[i] = ThumbnailState::NoArt;

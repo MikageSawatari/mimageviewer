@@ -643,7 +643,7 @@ fn lifecycle_old_same_generation_notifications_cannot_mutate_new_request_or_disp
         "the fixture must exercise representative invalidation"
     );
     let metas = app.image_metas.clone();
-    for terminal in 0..5 {
+    for terminal in 0..6 {
         let stale = match terminal {
             0 => owner_pixels(0, generation, old_id),
             1 => notification(0, generation, old_id, ThumbMsgPayload::Finalized),
@@ -656,7 +656,8 @@ fn lifecycle_old_same_generation_notifications_cannot_mutate_new_request_or_disp
                     origin: ThumbLoadOrigin::SourceIntrinsic,
                 },
             ),
-            _ => notification(0, generation, old_id, ThumbMsgPayload::NoArt),
+            4 => notification(0, generation, old_id, ThumbMsgPayload::NoArt),
+            _ => notification(0, generation, old_id, ThumbMsgPayload::CacheOnlyMiss),
         };
         app.tx.send(stale).unwrap();
         app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
@@ -1492,7 +1493,7 @@ fn lifecycle_same_generation_wrong_context_notifications_cannot_change_sibling()
             ThumbnailState::Loaded { tex, .. } => tex.id(),
             _ => panic!("adopted sibling source"),
         };
-        for terminal in 0..5 {
+        for terminal in 0..6 {
             let msg = match terminal {
                 0 => owner_pixels(0, generation, main_id),
                 1 => notification(0, generation, main_id, ThumbMsgPayload::Finalized),
@@ -1505,7 +1506,8 @@ fn lifecycle_same_generation_wrong_context_notifications_cannot_change_sibling()
                         origin: ThumbLoadOrigin::SourceIntrinsic,
                     },
                 ),
-                _ => notification(0, generation, main_id, ThumbMsgPayload::NoArt),
+                4 => notification(0, generation, main_id, ThumbMsgPayload::NoArt),
+                _ => notification(0, generation, main_id, ThumbMsgPayload::CacheOnlyMiss),
             };
             mounted.tx.send(msg).unwrap();
             mounted.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
@@ -1813,4 +1815,183 @@ fn lifecycle_at_rest_generation_setter_retires_only_owner_and_preserves_sibling(
         assert!(!main_token.load(Ordering::Relaxed));
         assert_eq!(app.keep_set, main_keep);
     }
+}
+
+#[test]
+fn lifecycle_cache_only_miss_keeps_admission_without_activity_or_correlation() {
+    let mut owner = ThumbnailRequests::default();
+    let id = owner
+        .begin(0, 7, ThumbnailRequestKind::Normal, None)
+        .unwrap();
+    // An image-less terminal also disposes any provisional image still owned by this request.
+    owner.receive(owner_seed(0, 7, id));
+    assert!(matches!(
+        owner.receive(notification(0, 7, id, ThumbMsgPayload::CacheOnlyMiss)),
+        ThumbnailReceipt::Terminal(ThumbMsgPayload::CacheOnlyMiss)
+    ));
+    assert_eq!(owner.id(0), None);
+    assert_eq!(owner.legacy_len(), 0);
+    assert_eq!(owner.iter().count(), 0);
+    assert_eq!(owner.images_len(), 0);
+    for keep in [HashSet::new(), HashSet::from([0])] {
+        assert_eq!(repaint_projection(&owner, &keep), (false, false, false));
+        assert_eq!(owner.progress_counts(&keep), (0, 0, 0));
+        owner.discard_images_outside(&keep);
+        owner.discard_images();
+        owner.cancel_queued(0, id);
+        assert!(
+            owner
+                .begin(0, 7, ThumbnailRequestKind::Normal, None)
+                .is_none()
+        );
+    }
+    for payload in [
+        ThumbMsgPayload::CacheOnlyMiss,
+        ThumbMsgPayload::Finalized,
+        ThumbMsgPayload::Canceled,
+        ThumbMsgPayload::NoArt,
+    ] {
+        assert!(matches!(
+            owner.receive(notification(0, 7, id, payload)),
+            ThumbnailReceipt::Ignored
+        ));
+        assert!(owner.contains_key(&0));
+    }
+    owner.remove(&0); // judgement/source retirement consumes the demand gate
+    let next = owner
+        .begin(0, 7, ThumbnailRequestKind::Normal, None)
+        .unwrap();
+    assert_ne!(next, id);
+    assert!(matches!(
+        owner.receive(notification(0, 7, id, ThumbMsgPayload::CacheOnlyMiss)),
+        ThumbnailReceipt::Ignored
+    ));
+    assert_eq!(owner.id(0), Some(next));
+    assert_eq!(owner.legacy_len(), 1);
+    owner.clear();
+    assert!(owner.is_empty());
+    assert_eq!(owner.legacy_len(), 0);
+}
+
+#[test]
+fn lifecycle_cache_only_miss_outside_keep_allows_other_image_upgrade() {
+    let mut app = fixture(2);
+    let ctx = egui::Context::default();
+    app.items[1] = GridItem::ConvertibleArchive {
+        path: PathBuf::from(r"c:\pics\undecided.rar"),
+        format: crate::archive_converter::ArchiveFormat::Rar,
+    };
+    let waiting = app.requested.id(1).unwrap();
+    app.tx
+        .send(pixels(&app, 0, ThumbLoadOrigin::UpgradeableCache))
+        .unwrap();
+    app.tx
+        .send(notification(
+            1,
+            app.items_generation,
+            waiting,
+            ThumbMsgPayload::CacheOnlyMiss,
+        ))
+        .unwrap();
+    app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+    app.install_thumbnail_keep_projection(
+        ThumbnailKeepProjection {
+            pages: HashSet::from([0]),
+            bounded_range: (0, 1),
+            interactive_pages: HashSet::new(),
+        },
+        true,
+    );
+    assert!(!app.requested.blocks_idle_upgrade());
+    app.enqueue_idle_upgrades();
+    assert_eq!(app.requested.get(&0), Some(&true));
+    assert_eq!(
+        app.reload_queue.as_ref().unwrap().0.lock().unwrap().len(),
+        1
+    );
+    assert_eq!(app.requested.id(1), None);
+    assert!(app.requested.contains_key(&1));
+}
+
+#[test]
+#[cfg(windows)]
+fn lifecycle_cache_only_miss_hide_and_context_retirement_are_local() {
+    let mut app = fixture(1);
+    let ctx = egui::Context::default();
+    let generation = app.items_generation;
+    let old_id = app.requested.id(0).unwrap();
+    app.tx
+        .send(notification(
+            0,
+            generation,
+            old_id,
+            ThumbMsgPayload::CacheOnlyMiss,
+        ))
+        .unwrap();
+    app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+    let sibling = app.build_window_context_for_test(1363, |mounted| {
+        mounted.items_generation = generation;
+        mounted.items = vec![GridItem::Image(PathBuf::from(r"c:\sibling\0.png"))];
+        mounted.thumbnails = vec![ThumbnailState::Pending];
+        let id = mounted
+            .requested
+            .begin(0, generation, ThumbnailRequestKind::Normal, None)
+            .unwrap();
+        mounted.requested.receive(notification(
+            0,
+            generation,
+            id,
+            ThumbMsgPayload::CacheOnlyMiss,
+        ));
+    });
+    app.main_hwnd = None;
+    app.window_visible = true;
+    app.hide_to_tray(&ctx);
+    app.sync_after_restore(&ctx);
+    app.set_items_generation(generation);
+    assert!(app.requested.contains_key(&0));
+    assert_eq!(app.requested.id(0), None);
+    assert_eq!(app.requested.legacy_len(), 0);
+    app.set_viewer_context_generation_for_test(sibling, generation);
+    app.with_viewer_context(sibling, |mounted| {
+        assert!(mounted.requested.contains_key(&0));
+        assert_eq!(mounted.requested.id(0), None);
+    })
+    .unwrap();
+    app.set_viewer_context_generation_for_test(sibling, generation.wrapping_add(1));
+    app.with_viewer_context(sibling, |mounted| assert!(mounted.requested.is_empty()))
+        .unwrap();
+    assert!(
+        app.requested.contains_key(&0),
+        "retiring sibling must preserve main demand"
+    );
+    let sibling_id = app
+        .with_viewer_context(sibling, |mounted| {
+            mounted
+                .requested
+                .begin(
+                    0,
+                    mounted.items_generation,
+                    ThumbnailRequestKind::Normal,
+                    None,
+                )
+                .unwrap()
+        })
+        .unwrap();
+    app.set_items_generation(generation.wrapping_add(1));
+    assert!(app.requested.is_empty());
+    app.tx
+        .send(notification(
+            0,
+            generation,
+            old_id,
+            ThumbMsgPayload::CacheOnlyMiss,
+        ))
+        .unwrap();
+    app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+    assert!(app.requested.is_empty());
+    app.with_viewer_context(sibling, |mounted| {
+        assert_eq!(mounted.requested.id(0), Some(sibling_id))
+    })
+    .unwrap();
 }
