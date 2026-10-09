@@ -15924,9 +15924,22 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         );
     }
 
-    /// Capture popup ownership before widgets can dismiss it with this frame's input.
+    /// Cancel ROOT click pairs before extraction/cell handling, even if focus returns in this
+    /// batch or cell navigation later skips the background handler. Capture popup ownership
+    /// before widgets can dismiss it with this frame's input.
     pub(crate) fn begin_grid_click_input_frame(&mut self, ctx: &egui::Context) {
-        if ctx.viewport_id() == egui::ViewportId::ROOT && egui::Popup::is_any_open(ctx) {
+        if ctx.viewport_id() != egui::ViewportId::ROOT {
+            return;
+        }
+        if ctx.input(|input| {
+            input
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::WindowFocused(false)))
+        }) {
+            self.grid_click_pairing.end_activation();
+        }
+        if egui::Popup::is_any_open(ctx) {
             self.grid_click_pairing.end_activation();
             let frame = ctx.cumulative_frame_nr();
             ctx.data_mut(|data| {
@@ -16664,12 +16677,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let id = egui::Id::new("grid_background_primary_frame");
         let frame_owner = ctx.data(|data| data.get_temp::<GridPrimaryInputFrame>(id));
         let blocked = matches!(frame_owner, Some(GridPrimaryInputFrame::Blocked(owner_frame)) if owner_frame == frame)
-            || ctx.input(|input| {
-                input
-                    .events
-                    .iter()
-                    .any(|event| matches!(event, egui::Event::WindowFocused(false)))
-            })
             || !self.grid_item_input_allowed()
             || suppress_primary_pointer
             || self.any_dialog_open()
@@ -16692,7 +16699,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         if !ctx.input(|input| input.focused) {
             // Background activation requires focus. Cell responses also accept the diagnostic
             // pointer path without OS focus, so this background-only restriction must not erase
-            // their accepted first click. An actual focus-loss event cancels both above.
+            // their accepted first click. The common input start cancels both on focus loss.
             self.grid_click_pairing.end_background_run();
             return None;
         }
@@ -26830,6 +26837,144 @@ mod grid_reclick_open_tests {
     }
 
     #[test]
+    fn cell_focus_roundtrip_batch_restarts_pair_before_handlers() {
+        check_cell_focus_roundtrip_batch(false);
+    }
+
+    #[test]
+    fn cell_focus_roundtrip_batch_restarts_pair_when_navigation_skips_background() {
+        check_cell_focus_roundtrip_batch(true);
+    }
+
+    fn check_cell_focus_roundtrip_batch(skip_background_on_navigation: bool) {
+        let mut app = setup_app_for_test();
+        let path = app.tmp.path().join("book.zip");
+        app.items = vec![GridItem::ZipFile(path.clone())];
+        app.visible_indices = vec![0];
+        app.settings.auto_fullscreen_zip_pdf = false;
+        app.settings.grid_open_selected_item_on_click = false;
+        let ctx = egui::Context::default();
+        let pos = cell_rect(0).center();
+        let click = || {
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        let draw = |app: &mut AppTestEnvForTest, time, events| {
+            let mut navs = Vec::new();
+            let mut background_calls = 0;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(460.0, 200.0),
+                    )),
+                    focused: true,
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    // Same start/extraction/cell/background order as ROOT render_grid.
+                    app.begin_grid_click_input_frame(ctx);
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let previous = app.begin_grid_primary_click_frame(
+                            ctx,
+                            ctx.input(|input| input.pointer.primary_clicked()),
+                        );
+                        let cell_nav = app.handle_cell_interaction(
+                            ui,
+                            ctx,
+                            cell_rect(0),
+                            0,
+                            &crate::thumb_overlay_layout::ThumbnailOverlayLayout::default(),
+                            false,
+                            false,
+                            previous,
+                            None,
+                        );
+                        let mut background = || {
+                            background_calls += 1;
+                            app.handle_grid_background_primary_click(
+                                ctx,
+                                ui.max_rect(),
+                                true,
+                                true,
+                                false,
+                                previous,
+                                &crate::touch_correlation::TouchFrame::default(),
+                            )
+                        };
+                        let nav = if skip_background_on_navigation {
+                            cell_nav.or_else(background)
+                        } else {
+                            let background_nav = background();
+                            cell_nav.or(background_nav)
+                        };
+                        if let Some(nav) = nav {
+                            navs.push(nav);
+                        }
+                    });
+                },
+            );
+            (navs, background_calls)
+        };
+        // Establish the interactive rectangle before supplying pointer edges.
+        for time in [0.8, 0.9] {
+            assert!(draw(&mut app, time, Vec::new()).0.is_empty());
+        }
+        let generation = app.items_generation;
+        assert!(draw(&mut app, 1.0, click()).0.is_empty());
+        assert_eq!(
+            app.grid_click_pairing
+                .pending_index_for_generation(generation),
+            Some(0)
+        );
+        assert!(ctx.options(|options| options.input_options.max_double_click_delay) > 0.2);
+
+        let mut roundtrip = vec![
+            egui::Event::WindowFocused(false),
+            egui::Event::WindowFocused(true),
+        ];
+        roundtrip.extend(click());
+        let (navs, background_calls) = draw(&mut app, 1.1, roundtrip);
+        assert!(
+            ctx.input(|input| input.focused),
+            "focus is regained in the same batch"
+        );
+        assert_eq!(app.items_generation, generation);
+        assert!(
+            navs.is_empty(),
+            "focus roundtrip must break the old cell pair: {navs:?}"
+        );
+        assert!(background_calls > 0);
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(
+            app.grid_click_pairing
+                .pending_index_for_generation(generation),
+            Some(0)
+        );
+
+        // The regained-focus click starts a fresh pair; another click still opens normally.
+        let (navs, background_calls) = draw(&mut app, 1.2, click());
+        assert_eq!(navs.len(), 1);
+        assert!(matches!(&navs[0], AddressBarNav::GridVirtual(intent) if intent.path == path));
+        assert_eq!(background_calls == 0, skip_background_on_navigation);
+    }
+
+    #[test]
     fn background_focus_eligibility_preserves_cells_but_focus_loss_cancels_all() {
         use crate::app::{GridBackgroundClickContext, GridClickSource};
         for cell in [false, true] {
@@ -26872,6 +27017,8 @@ mod grid_reclick_open_tests {
                         ..Default::default()
                     },
                     |ctx| {
+                        app.begin_grid_click_input_frame(ctx);
+                        let previous = app.grid_click_pairing;
                         assert!(
                             app.handle_grid_background_primary_click(
                                 ctx,
@@ -26882,7 +27029,7 @@ mod grid_reclick_open_tests {
                                 false,
                                 false,
                                 false,
-                                accepted,
+                                previous,
                                 &crate::touch_correlation::TouchFrame::default(),
                             )
                             .is_none()

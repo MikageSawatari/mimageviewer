@@ -366,3 +366,38 @@ UI文字列・描画・snapshot変更なし、glyph lintは対象外。全libの
 プロセス停止・アプリ起動・コミットなし。ログは `target/F-dblclick-evidence/build-dev.log` / `.json`。
 この通常profile binaryの既定起動は実 `%APPDATA%\mimageviewer` を使う。
 利用者が確認する場合だけ、常駐版を閉じてセル／余白double-clickとfocus喪失時の取消を確認する。
+
+### e4af66c34 の独立レビューP2対応
+
+背景handlerでの実focus喪失取消は遅かった。セルが以前の対を消費した後に取消しても
+既に返ったnavigationは撤回できず、`nav.or_else`経路では背景handler自体が呼ばれない。
+取消を既存のROOT共通入力開始`begin_grid_click_input_frame`へ移し、previous pairing取得と
+セル処理の前に終了する。`App::update`先頭と直接`render_grid`の入口は既にこの入口を通る。
+未focusという背景だけの受付条件での`end_background_run`は維持する。
+ROOT以外の描画・focus・viewport routing、detached述語は変更しない。
+
+新規handler回帰2件は同じ世代・時間条件内の初回クリック後に、1つのRawInputへ
+`WindowFocused(false)` → `WindowFocused(true)` → 次のセルpress/releaseを入れる。
+背景handlerを常に呼ぶ経路と、セルnavigationでskipする製品と同じ`or_else`経路を検査する。
+このbatchでは開かず、新しい1打目を保持し、次のクリックで正しいZIP navigationを1回返す。
+skip経路の最後の正常navigationでは背景呼出数0も確認する。
+旧4条件回帰も共通入力開始を通す形に更新した。
+
+未修正コードで新規2件とも、focus往復後に`GridVirtual`を返して失敗した（exit101）。
+証跡は`target/F-dblclick-fix-evidence/red.log` / `.json`。
+最初の修正後runは取消・新しい対の保持を通過したが、最後の正常ZIP navigationを
+`Direct`とした新規testの誤った期待値で失敗した。現行のZIP経路の`GridVirtual`と対象pathを
+確認する期待値へ修正し、失敗ログも保持した。主回帰の「往復後は開かない」期待値は不変。
+未focus診断経路の初回失敗はheadlessで確認済みだが、実ユーザーで同じ消去が起きた証拠はない。
+Alt-Tabやsibling viewportへの移動がROOTへ実focus喪失を配送することを前提にする。
+新規回帰はegui入力のheadless検査であり、実HWND／F12の動作確認結果ではない。
+
+修正後、新規2件、元の未focus回帰1件、test-script付きgrid handler 45件と
+`test_script::` 134件が成功。通常featureのgrid handlerも45件成功。
+normal／portable core check、fmt、diff checkも成功（全てexit0、thread数変更なし）。
+command・elapsed・ログは`target/F-dblclick-fix-evidence/results.json`と
+`normal-grid-handler.json`。全libの新たな全体PASSとは扱わず、前回の有効な範囲を再利用する。
+UI文字列・snapshot変更なし。起動・コミット・通常profileデータ操作は行わない。
+
+確認用通常buildも`build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0`で更新済み
+（exit0、121.65秒、`build-dev.log` / `.json`）。プロセス停止なし。

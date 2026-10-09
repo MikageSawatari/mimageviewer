@@ -561,7 +561,10 @@ explicit test-script targetのrevealだけ`scroll_to_rect_animation(..., ScrollA
 2026-10-10追補: 余白double-click追加後、未focusの余白handlerがセルのpending対まで
 `end_activation`で消し、上記headless回帰が単独でも失敗した。未focusという余白だけの
 受付条件では`end_background_run`で余白状態だけを閉じる。実際の`WindowFocused(false)`、
-modal／popup／scroll／touch取消等は従来どおり全対を終了する。セルが既に受理した診断pointerを
+modal／popup／scroll／touch取消等は全対を終了する。実focus喪失はROOTの共通入力開始
+`begin_grid_click_input_frame`で、previous pairing取得・セル処理より前に取り消す。
+同じbatch内でfocusが復帰しても以前の対を持ち越さず、セルのnavigationで余白handlerを
+skipする経路にも適用する。セルが既に受理した診断pointerを
 余白handlerが取り消さない所有境界に戻し、前面化・focus偽装・retryは追加しない。
 masterとの経路比較・red/green・回帰結果は [GPU調査の別件追補](ui-snapshot-gpu-investigation.md#診断double-clickの別件修正-2026-10-10) に記録する。
 
