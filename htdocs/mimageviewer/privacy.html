@@ -5,20 +5,20 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>プライバシーポリシー | mImageViewer</title>
   <!-- meta:begin (generated) -->
-  <meta name="description" content="mImageViewer のプライバシーポリシー。mImageViewer はローカルで動作するデスクトップアプリで、開発者が個人情報を収集・送信・販売することはありません。">
+  <meta name="description" content="mImageViewer のプライバシーポリシー。確認済みの mImageViewer 本体の機能から、開発者が個人情報を収集・送信・販売することはありません。音響調整の画面表示に使う Windows の機能の通信も説明します。">
   <link rel="canonical" href="https://mikage.to/mimageviewer/privacy.html">
   <meta property="og:type" content="article">
   <meta property="og:site_name" content="mImageViewer">
   <meta property="og:locale" content="ja_JP">
   <meta property="og:url" content="https://mikage.to/mimageviewer/privacy.html">
   <meta property="og:title" content="プライバシーポリシー｜mImageViewer">
-  <meta property="og:description" content="mImageViewer のプライバシーポリシー。mImageViewer はローカルで動作するデスクトップアプリで、開発者が個人情報を収集・送信・販売することはありません。">
+  <meta property="og:description" content="mImageViewer のプライバシーポリシー。確認済みの mImageViewer 本体の機能から、開発者が個人情報を収集・送信・販売することはありません。音響調整の画面表示に使う Windows の機能の通信も説明します。">
   <meta property="og:image" content="https://mikage.to/mimageviewer/ogp.jpg">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="プライバシーポリシー｜mImageViewer">
-  <meta name="twitter:description" content="mImageViewer のプライバシーポリシー。mImageViewer はローカルで動作するデスクトップアプリで、開発者が個人情報を収集・送信・販売することはありません。">
+  <meta name="twitter:description" content="mImageViewer のプライバシーポリシー。確認済みの mImageViewer 本体の機能から、開発者が個人情報を収集・送信・販売することはありません。音響調整の画面表示に使う Windows の機能の通信も説明します。">
   <meta name="twitter:image" content="https://mikage.to/mimageviewer/ogp.jpg">
   <!-- meta:end -->
   
@@ -116,8 +116,9 @@
   <section>
     <p class="lead">
       mImageViewer（以下「本アプリ」）は、利用者のプライバシーを尊重します。
-      本アプリは利用者の PC 上でローカルに動作するデスクトップアプリケーションであり、
-      <strong>開発者が利用者の個人情報を収集・送信・販売することは一切ありません。</strong>
+      本アプリは利用者の PC 上で動作するデスクトップアプリケーションです。
+      <strong>確認済みの mImageViewer 本体の機能から、開発者が利用者の個人情報を収集・送信・販売することはありません。</strong>
+      音響調整の画面に使う Windows の表示機能の通信は、下の「ネットワーク通信」で説明します。
     </p>
     <p style="font-size:0.85rem; color:#888;">最終更新日: 2026年10月7日</p>
   </section>
@@ -125,7 +126,7 @@
   <section>
     <h2>収集する個人情報</h2>
     <p>
-      本アプリは、氏名・メールアドレス・位置情報・連絡先などの個人情報を利用者に求めません。
+      確認済みの mImageViewer 本体の機能は、氏名・メールアドレス・位置情報・連絡先などの個人情報を利用者に求めません。
       アカウント登録やログインも不要です。<strong>開発者が利用者の情報や利用状況を受け取ることはありません</strong>。
       ファイルの場所や閲覧位置など利用に必要な情報は利用者の PC に保存され、リモート閲覧中は利用者の端末と PC の間でだけやり取りされます。
     </p>
@@ -214,6 +215,7 @@
     <h2>ネットワーク通信</h2>
     <p>mImageViewer 本体で確認済みの外部通信は、次の場面で発生します。</p>
     <p>同梱 EffeTune v0.13.0 の新機能（SFZ 音源の読み込み・音声予測の学習と処理）は、実使用中の通信・保存動作の実機確認が残っています。確認結果に合わせて、公開前に説明を確定します。</p>
+    <p>音響調整の画面表示に使う Windows の表示機能（WebView2）は、Microsoft に自身の更新を確認することがあります。画面を開き、音楽の再生と曲送りを行った確認では、画面の読み込み先は PC 内で、曲情報や代表画像の外部送信、外部から接続を受け付ける動作は見られませんでした。SFZ 音源と音声予測は、この確認では使っていません。</p>
     <ul class="pink-list">
       <li><strong>更新確認</strong>: 新しいバージョンの有無を確認するため、配布元（GitHub）の公開リリース情報を取得します。通常の HTTP リクエストのみで、個人を特定する情報は送信しません。</li>
       <li><strong>任意コンポーネントのダウンロード</strong>: 利用者が自ら選択した場合に限り、AI 高速化用コンポーネント等を配布元から取得します。</li>
@@ -231,7 +233,7 @@
         中継サーバーでは画像やライブラリの内容を読み取れません。
         <strong>画像やライブラリの内容が、開発者のサーバーへ送られることはありません。</strong></li>
     </ul>
-    <p>EPUB の変換も通信を増やしません。本の外部サイトへの要求はすべて遮断し、PC 内で PDF に変換します。Windows または Edge WebView2 に管理者や利用者がポリシーを設定している場合は、その設定に従います。</p>
+    <p>EPUB は PC 内で PDF に変換し、本に含まれる外部サイトへの要求を遮断します。表示機能自身の通信は、今回の実機確認では EPUB 変換中に調べていません。Windows または Edge WebView2 に管理者や利用者がポリシーを設定している場合は、その設定に従います。</p>
     <p>
       これらの通信先（GitHub / mikage.to、リモート閲覧を使う場合の Tailscale、クリップボード取り込みで画像を取得するサイト等）は、各社のプライバシーポリシーに従って
       通常のアクセスログ（IP アドレス等）を記録する場合がありますが、
@@ -242,7 +244,7 @@
   <section>
     <h2>AI 機能について</h2>
     <p>
-      AI によるアップスケール・ノイズ除去・補完・自動判別などの処理は、
+      mImageViewer 本体の画像 AI によるアップスケール・ノイズ除去・補完・自動判別などの処理は、
       <strong>すべて利用者の PC 内（GPU）で実行</strong>されます。
       AI 処理のために画像を外部のサーバーへアップロードすることはありません。
     </p>
@@ -251,18 +253,18 @@
   <section>
     <h2>解析・広告</h2>
     <p>
-      本アプリは、アクセス解析ツール・広告を<strong>一切含みません</strong>。
+      確認済みの mImageViewer 本体の機能には、<strong>広告・アクセス解析ツール・利用状況の送信はありません</strong>。
       利用状況やクラッシュ情報を開発者へ自動送信することもありません。
     </p>
     <p>
-      動作記録は、利用者自身が不具合を調べるために PC 内へ保存されるものです。
+      本体の動作記録は、利用者自身が不具合を調べるために PC 内へ保存されるものです。
       <strong>開発者がそれを受け取ることはありません。</strong>
     </p>
   </section>
 
   <section>
     <h2>第三者への提供</h2>
-    <p>開発者は利用者の情報を取得しないため、第三者へ提供する情報はありません。</p>
+    <p>確認済みの本体機能から開発者は利用者の情報を取得しないため、その情報を第三者へ提供することはありません。</p>
     <p>
       リモート閲覧を外出先から使う場合に必要な Tailscale は、本アプリとは別の会社が提供する
       ソフトウェアとサービスで、利用者自身が契約・設定します。その利用は
@@ -293,8 +295,9 @@
   <section style="margin-top:2.5rem;">
     <p class="lead">
       mImageViewer ("the App") respects your privacy. The App is a desktop application that
-      runs locally on your PC. <strong>The developer does not collect, transmit, or sell any of
-      your personal information.</strong>
+      runs on your PC. <strong>For the verified features of mImageViewer itself,
+      the developer does not collect, transmit, or sell your personal information.</strong>
+      Network activity of the Windows display feature used by audio adjustment is described below under Network communication.
     </p>
     <p style="font-size:0.85rem; color:#888;">Last updated: October 7, 2026</p>
   </section>
@@ -302,7 +305,7 @@
   <section>
     <h2>Personal information we collect</h2>
     <p>
-      The App does not ask you for personal information such as your name, email address, location,
+      The verified features of mImageViewer itself do not ask you for personal information such as your name, email address, location,
       or contacts, and no account or sign-in is required. <strong>The developer does not receive your
       information or any usage data.</strong> Information needed to use the App, such as file locations
       and viewing positions, is stored on your PC and, during remote viewing, travels only between your
@@ -383,8 +386,9 @@
 
   <section>
     <h2>Network communication</h2>
-    <p>The following network activity has been verified in the mImageViewer host application:</p>
+    <p>The following network activity has been verified for mImageViewer itself:</p>
     <p>Hardware verification of network and storage behavior during actual use of the new features in bundled EffeTune v0.13.0 (SFZ instrument loading and adaptive audio prediction learning and processing) is still pending. This description will be finalized before release based on those results.</p>
+    <p>The Windows display feature used by audio adjustment (WebView2) may contact Microsoft to check for its own updates. In the observed session of opening audio adjustment, playing music and changing tracks, its screen content was loaded from the PC. No external transmission of song information or artwork, or activity accepting incoming connections, was observed. SFZ instruments and adaptive audio prediction were not used in that session.</p>
     <ul class="pink-list">
       <li><strong>Update check</strong>: to see whether a newer version exists, the App retrieves the public release information from the distribution source (GitHub). This is an ordinary HTTP request and includes no personally identifying information.</li>
       <li><strong>Optional component download</strong>: only when you choose to, the App downloads optional components (such as AI acceleration packs) from the distribution source.</li>
@@ -401,7 +405,7 @@
         Tailscale relay server, which cannot read your images or library content.
         <strong>Your images and library content are never sent to the developer's server.</strong></li>
     </ul>
-    <p>EPUB conversion is not another network case. The App blocks every request the book makes to an external site and converts the book to PDF on your PC. If an administrator or user has configured Windows or Edge WebView2 policies, conversion follows those settings.</p>
+    <p>The App converts EPUB to PDF on your PC and blocks requests to external sites included in the book. Network activity of the display feature itself during EPUB conversion was not examined in this hardware session. If an administrator or user has configured Windows or Edge WebView2 policies, conversion follows those settings.</p>
     <p>
       These endpoints (GitHub / mikage.to, Tailscale when you use remote viewing, the sites that serve images fetched by clipboard capture, etc.) may record standard access logs (such as IP
       addresses) under their own privacy policies, but <strong>the developer does not obtain or
@@ -412,7 +416,7 @@
   <section>
     <h2>AI features</h2>
     <p>
-      Upscaling, denoising, inpainting, and automatic classification are performed
+      Image upscaling, denoising, inpainting, and automatic classification in mImageViewer itself are performed
       <strong>entirely on your PC (GPU)</strong>. The App does not upload images to an external
       server for AI processing.
     </p>
@@ -421,18 +425,18 @@
   <section>
     <h2>Analytics and advertising</h2>
     <p>
-      The App contains <strong>no analytics tools and no advertising</strong>, and does
+      The verified features of mImageViewer itself contain <strong>no advertising, analytics tools or usage reporting</strong>, and do
       not automatically send usage or crash data to the developer.
     </p>
     <p>
-      Operation records are kept on your PC so that you can investigate problems yourself.
+      Operation records of mImageViewer itself are kept on your PC so that you can investigate problems yourself.
       <strong>The developer never receives them.</strong>
     </p>
   </section>
 
   <section>
     <h2>Sharing with third parties</h2>
-    <p>Because the developer does not obtain your information, there is nothing to share with third parties.</p>
+    <p>The developer does not obtain your information from the verified features of mImageViewer itself and therefore does not share that information with third parties.</p>
     <p>
       Tailscale, which you need in order to use remote viewing away from home, is software and
       a service from a different company; you sign up for it and configure it yourself. Your use

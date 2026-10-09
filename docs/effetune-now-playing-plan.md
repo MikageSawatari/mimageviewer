@@ -857,3 +857,68 @@ Rust検証と確認buildのprocess-local環境は `CARGO_BUILD_JOBS=1`、
 利用者による起動は `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。
 通常 `%APPDATA%\mimageviewer` の実settings／dataを更新し得るため、installed／tray常駐版を先に閉じる。
 今回もエージェントによる起動は行っていない。
+
+## 10. 公開文面の再レビューと部分実機確認 (2026-10-10)
+
+`5f2f1311c` の再レビューはREVISE（P2×2）。生成元の未追跡は利用者が
+`169a53966` で `resonator.json` をcommitして解消した。このHEADで再生成はupdated 0、
+converter23/23成功、生成元／生成HTMLに差分無し。包括的な広告／解析／利用状況の保証は、
+製品ページの見出し・badge・検索metadata、privacyの導入／日英本文、FAQ本文／JSON-LDまで
+確認済みの本体機能の範囲へ揃えた。「EPUBの変換は通信を増やさない」という包括表現も、
+本の外部要求を遮断する処理と表示機能自身の通信を区別する記述へ訂正した。
+新しい `scripts/test_public_privacy_scope.py` の5回帰は、旧保証の再流入検出、検索metadata、
+FAQ本文とJSON-LDの一致、日英の確認範囲、3ページの実機説明の一致を検査する。
+
+**公開文面は利用者の決定待ちの草案。** `target/D359-fix2-msg.txt` に草案と評価を保存し、
+今回の部分確認だけで最終文面を決定しない。ソフトウェアの通信設定は変更しない。
+
+ClaudeCodeの観測は `target/D359-agent-hwcheck.md`（2026-10-10 01:20–01:30）と
+`target/hw-agent/netlog-d.json`。isolated data-dirで音響調整を開き、音楽を再生／曲送りした範囲で:
+
+- EffeTune UIを表示するWebView2が `edge.microsoft.com/componentupdater/api/v1/update` へHTTPS通信した。
+- page要求はローカルvirtual host `effetune-mixwright.localhost`。曲情報／artworkを外部へ送る要求は観測無し。
+- process treeにlistening TCP socket／UDP endpointは観測無し。記録にはWindows proxy自動検出のWPAD照会もある。
+- SFZ／Adaptive PredictionのUI操作・音声処理と、EPUB workerの通信はこの確認の対象外。
+  Now Playingの実表示もEffeTune画面内を操作していないため未確認。§6.2のgateを完了扱いにしない。
+- EffeTuneのWebView2 user-dataはisolated mIV data-dirの外の
+  `%APPDATA%/mimageviewer-vst3-host.exe/EBWebView`。従来のprivacyの保存先説明と整合する。
+
+草案の平易な説明は「音響調整の画面表示に使うWindowsの表示機能（WebView2）は、
+Microsoftに自身の更新を確認することがあります」。曲情報／画像／待受の説明には
+画面表示・音楽再生・曲送りの観測範囲とSFZ／音声予測未試験を必ず添える。
+「mIVはそれ以外に通信しない」にはしない。
+
+### 10.1 WebView2更新抑制の評価（実装しない）
+
+- **EPUBは既に要求済み**。`crates/epub-pdf-worker/src/webview.rs:82` のbrowser argumentsに
+  `--disable-component-update` があり、`:127` のoptions生成／`:130` のsetterから
+  `:264` のenvironment生成へ渡す。`:602` の既存テストがargumentを検査する。
+  workerは `crates/epub-pdf-worker/src/main.rs:614` でWebView2環境変数を除去する。
+  ただしflagの実効性／policyとの関係を、この音響調整のnet-logから証明しない。
+- **EffeTuneのenvironment optionsをmIVは所有していない**。
+  `src/effetune/mod.rs:1699` → `src/video/dsp/mod.rs:1149` →
+  `src/video/dsp/bridge.rs:609` の専用child spawnを経て、
+  `crates/vst3-host/src/plugin_loader.cpp:1073` がpluginを初期化、`:1488` がpluginのeditorを生成し、
+  `:1547` でHWNDへattachする。hostにはWebView2 environment生成／options setterが無い。
+  直接のAdditionalBrowserArguments設定にはplugin側の変更が必要。将来の検証用として
+  専用childの環境変数で引数を渡す経路は考えられるが、今回追加しない。全プロセスの環境やregistryを変更しない。
+- Microsoftの[AdditionalBrowserArguments API](https://learn.microsoft.com/en-us/microsoft-edge/webview2/reference/win32/icorewebview2environmentoptions)
+  はbrowser引数を渡す方法を規定する。一方、[browser flagsの説明](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/webview-features-flags)
+  は変更／削除され得るflagをproductionで使う保証を与えない。
+  同じuser-data-folderでbrowserを共有する場合、options不一致による生成失敗も
+  [environment生成API](https://learn.microsoft.com/en-us/microsoft-edge/webview2/reference/win32/webview2-idl#createcorewebview2environmentwithoptions)の確認対象。
+- **「何も壊さず無効化できる」は未証明**。Chromiumの
+  [browser起動処理](https://github.com/chromium/chromium/blob/main/chrome/browser/chrome_browser_main.cc)
+  はこのflagで部品更新登録をskipする。引き換えは、そのbrowserが使う部品／データの
+  自動取得・更新と、それに依存する安全性・互換性・任意機能の更新機会。
+  [Chromium登録一覧](https://github.com/chromium/chromium/blob/main/chrome/browser/component_updater/registration.cc)
+  には証明書関連データ、Origin Trials、hyphenation等があるが、これをWebView2の採用部品一覧と同一視しない。
+  正確な対象とmIVへの影響は、使っているRuntimeでの実測が必要。
+- これはmIV／EffeTuneの版更新とは別であり、インストールされたEvergreen Runtime自体を更新する
+  Microsoft Edge Update serviceの停止でもない
+  （[Microsoftの更新構成](https://learn.microsoft.com/en-us/troubleshoot/microsoft-edge/manageability/update-install-rollback-failures)）。
+  flagが効いても全通信を止める保証にはならない。SFZ／予測、Visualizer、PDF変換の挙動を
+  確認せず、同じflagで無影響・通信ゼロと判断しない。
+
+今回は公開文書／Python回帰のみ。Rust／C++／bundleに変更無し。
+前回のfull gateと確認buildの証拠はこの範囲で有効。build-dev・アプリ起動・commitを行わない。
