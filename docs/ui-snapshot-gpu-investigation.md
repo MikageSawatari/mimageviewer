@@ -317,3 +317,52 @@ native完了後の集計で例外になった。読み取り専用の別observer
 静的に確認して ACCEPT、指摘されたlib用の文書例も共通builderへ直した。
 新規UI文字列なし、glyph lintは対象外。テストtoolingと等価なpolicy切出しのため、
 実機確認用アプリbuild / 起動は行わない。コミットなし。
+
+## 診断double-clickの別件修正 (2026-10-10)
+
+対象は上記で保持した単独失敗。base `6832c5483` と master `4b50e3893` の対象テスト、
+fixture setup、pointer request／event生成／実Response登録、`render_grid`、セル／余白handler、
+クリック対の開始・登録は関数本文が一致し、Cargo.toml / Cargo.lock も差分なし。
+従ってmasterにも同じ失敗経路があると判断する（masterの実行結果ではなくsource比較による判断）。
+checkout／stash／別targetでの旧版buildは行わない。比較証跡は
+`target/F-dblclick-evidence/master-path-comparison.json`。
+
+一時的なpassログで再現したredは exit101、0成功・1失敗。
+`t=0.07/0.08/0.09/0.10` のpress／releaseが順に届き、最初のreleaseでselected=310となる。
+全frameはpass=0でnav=None、frame末尾のpairは常にpending=None。
+`handle_cell_interaction` が登録したセル対を、直後の余白handlerの
+`!input.focused → end_activation()` が消すことが原因だった。
+wgpuは呼ばれず、複数passによる戻り値上書きでもない。ログは
+`target/F-dblclick-evidence/instrumented.log`、一時計装は撤去済み。
+
+未focus時の余白受付禁止は`end_background_run()`に限定し、セルの受理済み対を維持する。
+実際のfocus喪失イベント`WindowFocused(false)`は共通取消条件に残し、modal／popup／scroll／
+touch取消等も全対を終了する。別owner・bool・retry・delayを足さず、既存ownerの終了範囲を
+正す簡素な修正とした。未focusでのpointer操作を許す既存Suite契約と、余白操作のfocus条件を
+両立する。期待ナビゲーション・snapshot・入力時刻・foreground取得条件を緩和しない。
+
+追加handler回帰はセル／余白のpending対 × 実focus喪失イベント有無の4条件を検査する。
+既存の600件未focus hover／double-clickテストも変更せず再実行する。
+
+検証は `target/F-qa-cargo` を再利用し、test thread数の変更なし。
+次の結果はすべて exit0、ログ・command・elapsedは `target/F-dblclick-evidence/results.json`。
+
+| 対象 | 結果 |
+| --- | --- |
+| test-script lib / 既存の失敗した単独テスト | 1成功、実行0.31秒 |
+| test-script lib / `grid_reclick_open_tests` | 43成功（新規4条件、セル／余白／touch／modal／popup／scroll／世代・表示面取消を含む） |
+| test-script lib / `test_script::` | 134成功 |
+| normal / portable core check | 両方成功 |
+| `cargo fmt --all -- --check` / `git diff --check` | 両方成功 |
+
+新規回帰の初回compileはfixtureのDeref越しborrowでE0502となり、既にコピー済みの
+`context.items_generation`を渡して修正した。初回失敗ログも保持する。
+UI文字列・描画・snapshot変更なし、glyph lintは対象外。全libの過去の成功範囲を再利用し、
+今回変更したhandlerと診断入力の範囲を再実行した。過去の全lib exit101を今回の全体PASSに
+置き換えない。実アプリの未focus Suiteは未実行、独立レビューは引き継ぎ先で実施する。
+
+`scripts/build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` も exit0（452.84秒）。
+通常featureのcore／remote／EPUB workerと必要DLLを `target/dev-runtime` に準備した。
+プロセス停止・アプリ起動・コミットなし。ログは `target/F-dblclick-evidence/build-dev.log` / `.json`。
+この通常profile binaryの既定起動は実 `%APPDATA%\mimageviewer` を使う。
+利用者が確認する場合だけ、常駐版を閉じてセル／余白double-clickとfocus喪失時の取消を確認する。

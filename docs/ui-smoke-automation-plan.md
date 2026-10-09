@@ -557,6 +557,14 @@ fixtureの600件/3:4・子6列/2:3、settings overrideとfavorite保存schemaは
 explicit test-script targetのrevealだけ`scroll_to_rect_animation(..., ScrollAnimation::none())`を使う。
 既存ScrollArea/readbackで可視化してから実Responseの座標を受け取る。通常のscroll animationや
 履歴/選択producerは変更しない。待機時間を増やして症状を隠さず、対象座標の所有境界で直す。
+
+2026-10-10追補: 余白double-click追加後、未focusの余白handlerがセルのpending対まで
+`end_activation`で消し、上記headless回帰が単独でも失敗した。未focusという余白だけの
+受付条件では`end_background_run`で余白状態だけを閉じる。実際の`WindowFocused(false)`、
+modal／popup／scroll／touch取消等は従来どおり全対を終了する。セルが既に受理した診断pointerを
+余白handlerが取り消さない所有境界に戻し、前面化・focus偽装・retryは追加しない。
+masterとの経路比較・red/green・回帰結果は [GPU調査の別件追補](ui-snapshot-gpu-investigation.md#診断double-clickの別件修正-2026-10-10) に記録する。
+
 実アプリは起動せず、portable test-scriptだけ再buildして引き継ぐ。利用者が確認中のdev-runtimeは
 明示指示があるまで再build/停止しない。
 起動前の変数生成もheadlessで評価する。8画像の名前とlibrary／★一覧の別パスを確認し、600件の全件名配列は生成しない。

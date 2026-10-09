@@ -16664,7 +16664,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let id = egui::Id::new("grid_background_primary_frame");
         let frame_owner = ctx.data(|data| data.get_temp::<GridPrimaryInputFrame>(id));
         let blocked = matches!(frame_owner, Some(GridPrimaryInputFrame::Blocked(owner_frame)) if owner_frame == frame)
-            || !ctx.input(|input| input.focused)
+            || ctx.input(|input| {
+                input
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::WindowFocused(false)))
+            })
             || !self.grid_item_input_allowed()
             || suppress_primary_pointer
             || self.any_dialog_open()
@@ -16682,6 +16687,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             || scroll;
         if blocked {
             self.grid_click_pairing.end_activation();
+            return None;
+        }
+        if !ctx.input(|input| input.focused) {
+            // Background activation requires focus. Cell responses also accept the diagnostic
+            // pointer path without OS focus, so this background-only restriction must not erase
+            // their accepted first click. An actual focus-loss event cancels both above.
+            self.grid_click_pairing.end_background_run();
             return None;
         }
         // One frame may have several egui passes. Observe/consume this input only once.
@@ -26815,6 +26827,79 @@ mod grid_reclick_open_tests {
         harness.state_mut().close_popup_before_background = false;
         click_at(&mut harness, egui::pos2(30.0, 170.0));
         assert!(harness.state().background_navs.is_empty());
+    }
+
+    #[test]
+    fn background_focus_eligibility_preserves_cells_but_focus_loss_cancels_all() {
+        use crate::app::{GridBackgroundClickContext, GridClickSource};
+        for cell in [false, true] {
+            for focus_lost in [false, true] {
+                let mut app = setup_app_for_test();
+                let ctx = egui::Context::default();
+                let context = GridBackgroundClickContext {
+                    items_generation: app.items_generation,
+                    view_mode: app.settings.grid_view_mode,
+                    viewport: ctx.viewport_id(),
+                    source: GridClickSource::Mouse,
+                };
+                let pos = egui::pos2(30.0, 170.0);
+                if cell {
+                    let previous = app.grid_click_pairing;
+                    app.grid_click_pairing.register_cell_click(
+                        previous,
+                        0,
+                        context.items_generation,
+                        1.0,
+                        0.5,
+                    );
+                } else {
+                    app.grid_click_pairing.begin_background_press(context, 0);
+                    let previous = app.grid_click_pairing;
+                    app.grid_click_pairing
+                        .register_background_click(previous, context, pos, 0, 1.0, 0.5, 6.0);
+                }
+                let accepted = app.grid_click_pairing;
+                assert_ne!(accepted, GridClickPairingState::default());
+                let _ = ctx.run(
+                    egui::RawInput {
+                        focused: false,
+                        time: Some(1.1),
+                        events: if focus_lost {
+                            vec![egui::Event::WindowFocused(false)]
+                        } else {
+                            Vec::new()
+                        },
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        assert!(
+                            app.handle_grid_background_primary_click(
+                                ctx,
+                                egui::Rect::from_min_size(
+                                    egui::Pos2::ZERO,
+                                    egui::vec2(400.0, 200.0)
+                                ),
+                                false,
+                                false,
+                                false,
+                                accepted,
+                                &crate::touch_correlation::TouchFrame::default(),
+                            )
+                            .is_none()
+                        );
+                    },
+                );
+                assert_eq!(
+                    app.grid_click_pairing,
+                    if cell && !focus_lost {
+                        accepted
+                    } else {
+                        GridClickPairingState::default()
+                    },
+                    "cell={cell} focus_lost={focus_lost}",
+                );
+            }
+        }
     }
 
     #[test]
