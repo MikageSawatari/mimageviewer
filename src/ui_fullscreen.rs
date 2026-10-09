@@ -48606,6 +48606,89 @@ mod music_full_width_hud_tests {
     use super::*;
 
     #[test]
+    fn music_hud_layout_normal_real_time_does_not_overlap_controls() {
+        for width in [300.0, 383.0, 575.0, 860.0, 1000.0] {
+            let (mut app, ctx) = fixture();
+            let probe = frame(&mut app, &ctx, egui::vec2(width, 360.0), vec![]);
+            assert!(
+                probe.time.is_positive(),
+                "time must remain visible at {width}pt"
+            );
+            for rect in probe.row {
+                assert!(
+                    !rect.intersects(probe.time),
+                    "normal playback control overlaps real time galley at {width}pt"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn music_hud_layout_normal_compact_click_and_touch_route_the_drawn_arrows() {
+        for width in [300.0, 383.0, 575.0, 860.0, 1200.0] {
+            for touch in [false, true] {
+                let (mut app, ctx) = fixture();
+                let size = egui::vec2(width, 360.0);
+                let probe = frame(&mut app, &ctx, size, vec![]);
+                for rect in probe.nav {
+                    let pos = rect.center();
+                    frame(&mut app, &ctx, size, vec![egui::Event::PointerMoved(pos)]);
+                    let before = app.input_seq;
+                    frame(&mut app, &ctx, size, button(pos, true, touch));
+                    frame(&mut app, &ctx, size, button(pos, false, touch));
+                    assert_eq!(
+                        app.input_seq,
+                        before + 1,
+                        "drawn arrow routes once at {width}pt, touch={touch}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn music_hud_layout_resize_during_real_volume_drag_finishes_without_navigation() {
+        let (mut app, ctx) = fixture();
+        let wide = egui::vec2(1200.0, 360.0);
+        let probe = frame(&mut app, &ctx, wide, vec![]);
+        let pos = probe.volume.center();
+        frame(&mut app, &ctx, wide, button(pos, true, false));
+        let dragged = pos - egui::vec2(50.0, 0.0);
+        frame(
+            &mut app,
+            &ctx,
+            wide,
+            vec![egui::Event::PointerMoved(dragged)],
+        );
+        assert!(
+            app.music_hud_last_volume_target.is_some(),
+            "real drag owns a pending value"
+        );
+        let volume = app.settings.video_volume;
+        let before = app.input_seq;
+        let narrow = egui::vec2(300.0, 360.0);
+        frame(&mut app, &ctx, narrow, vec![]);
+        // read_response can retain a removed widget from the previous pass.
+        let compact = frame(&mut app, &ctx, narrow, vec![]);
+        assert!(!compact.volume.is_positive());
+        assert!(app.music_hud_last_volume_target.is_none());
+        frame(
+            &mut app,
+            &ctx,
+            narrow,
+            button(compact.nav[0].center(), false, false),
+        );
+        assert_eq!(
+            app.input_seq, before,
+            "omitted slider release cannot become navigation"
+        );
+        assert_eq!(app.settings.video_volume, volume);
+        let restored = frame(&mut app, &ctx, wide, vec![]);
+        assert!(restored.volume.is_positive());
+        assert!(app.music_hud_last_volume_target.is_none());
+    }
+
+    #[test]
     fn normalize_hud_navigation_music_scan_time_never_overlaps_arrows() {
         for width in [360.0, 400.0, 548.0, 640.0, 1000.0 / 1.5, 800.0, 1000.0] {
             let (mut app, ctx) = fixture();

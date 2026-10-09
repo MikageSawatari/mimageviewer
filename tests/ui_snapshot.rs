@@ -2897,6 +2897,34 @@ fn normalize_hud_navigation_music_narrow_dark() {
 
 #[test]
 #[cfg(windows)]
+fn music_hud_layout_playback_575pt_dark() {
+    snapshot_with_theme_options(
+        "music_hud_layout_playback_575pt_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(591.0, 140.0),
+        None,
+        mimageviewer::ui_music_panels::draw_music_playback_snapshot_fixture,
+        |_| {},
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn music_hud_layout_playback_860pt_dark() {
+    snapshot_with_theme_options(
+        "music_hud_layout_playback_860pt_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(876.0, 140.0),
+        None,
+        mimageviewer::ui_music_panels::draw_music_playback_snapshot_fixture,
+        |_| {},
+    );
+}
+
+#[test]
+#[cfg(windows)]
 fn normalize_hud_navigation_music_10pt_icons_dark() {
     snapshot_with_theme_options(
         "normalize_hud_navigation_music_10pt_icons_dark",
