@@ -151,20 +151,20 @@ class ConverterTests(unittest.TestCase):
 class GenerationTests(unittest.TestCase):
     def test_snapshot_cannot_be_silently_relabelled_for_new_bundle(self):
         with self.assertRaisesRegex(docs.ConversionError, 'associated with Mixwright v0.12.0, not v0.13.0'):
-            docs.generate(docs.DEFAULT_SOURCE, 'v0.13.0')
+            docs.generate(docs.ROOT / 'third_party/effetune-docs/03bffda3', 'v0.13.0')
 
     def test_snapshot_matches_output_and_preserves_license_images(self):
-        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.12.0')
-        self.assertEqual(len(output), 135)  # 20 category/guide/index/license + 111 plugin pages + 4 images
+        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.13.0')
+        self.assertEqual(len(output), 137)  # 20 category/guide/index/license + 113 plugin pages + 4 images
         for name, data in output.items():
             with self.subTest(name=name):
-                self.assertEqual((docs.MANUAL / 'effetune/v0.12.0' / name).read_bytes(), data)
+                self.assertEqual((docs.MANUAL / 'effetune/v0.13.0' / name).read_bytes(), data)
                 if name.endswith('.html'):
                     text = data.decode()
                     self.assertNotIn('sidebar-section', text)
                     self.assertIn('href="../../style.css"', text)
                     self.assertIn('href="license.html"', text)
-                    self.assertIn('03bffda352287f4f438d063d9660aad7864e553a', text)
+                    self.assertIn('6791afdfc6f4e6c913b9f48c8189a44e29a09bde', text)
                     self.assertNotIn('{%', text)
                     self.assertNotIn('<p></p>', text)
                     self.assertNotIn('<li></li>', text)
@@ -174,7 +174,7 @@ class GenerationTests(unittest.TestCase):
             self.assertEqual(output['images/' + path.name], path.read_bytes())
 
     def test_snapshot_split_navigation_index_and_override_survival(self):
-        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.12.0').items() if name.endswith('.html')}
+        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.13.0').items() if name.endswith('.html')}
         eq = output['eq.html'].split('<main class="content">')[1]
         self.assertIn('id="スペクトラムオーバーレイ"', eq)
         self.assertIn('href="eq-15band-geq.html"', eq)
@@ -204,7 +204,7 @@ class GenerationTests(unittest.TestCase):
         self.assertIn('visualizer.html', output)
 
     def test_readme_basic_operations_keep_vst_features_and_exclude_other_platforms(self):
-        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.12.0').items() if name.endswith('.html')}
+        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.13.0').items() if name.endswith('.html')}
         body = output['README.html'].split('<main class="content">')[1].split('</main>')[0]
         for heading in ['Visualizerで音を表示する', 'エフェクトチェーンの作成', 'プリセットの使用', '保存データのバックアップと復元', 'セクション機能の使用方法', 'ABパイプライン機能の使用', 'エフェクト選択とキーボードショートカット', 'よく使われるエフェクトの組み合わせ']:
             self.assertIn(heading, body)
@@ -231,8 +231,8 @@ class GenerationTests(unittest.TestCase):
         self.assertIn('href="controller-mapping.html"', body)
 
     def test_new_effects_and_expanded_visualizer_keep_bundled_operations(self):
-        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.12.0').items() if name.endswith('.html')}
-        for page in ['analyzer-analog-meter.html', 'analyzer-rhythm-analyzer.html', 'eq-tonal-balance-eq.html']:
+        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.13.0').items() if name.endswith('.html')}
+        for page in ['analyzer-analog-meter.html', 'analyzer-rhythm-analyzer.html', 'eq-tonal-balance-eq.html', 'others-sfz-note-player.html', 'resonator-adaptive-prediction.html']:
             self.assertIn(page, output)
             self.assertIn('href="' + page + '"', output['index.html'])
         analog = output['analyzer-analog-meter.html']
@@ -252,11 +252,22 @@ class GenerationTests(unittest.TestCase):
                 self.assertNotIn('省電力', text)
                 self.assertNotIn('非表示時は表示専用DSPをスキップ', text)
         body = output['visualizer.html'].split('<main class="content">')[1].split('</main>')[0]
-        for retained in ['合計50種類', 'Analog Meter', 'Rhythm Analyzer', 'Phase Map', 'リンクを読み込む', 'Ctrl+V', 'Ctrl+D', 'Ctrl+クリック', '最前面へ', 'グラフスケール', 'Trail Feedback']:
+        for retained in ['共通の10種類', 'このほかの4種類', 'Fretboard', 'Guitar', 'Analog Meter', 'Rhythm Analyzer', 'Phase Map', 'リンクを読み込む', 'Ctrl+V', 'Ctrl+D', 'Ctrl+クリック', '最前面へ', 'グラフスケール', 'Trail Feedback']:
             self.assertIn(retained, body)
         for excluded in ['クリーンフィード', 'Macでは', 'WebAssembly 音声処理を使用する', 'ハードウェア アクセラレーションを使用', 'v0.12.0']:
             self.assertNotIn(excluded, body)
-        self.assertIn('03bffda352287f4f438d063d9660aad7864e553a', body)
+        self.assertIn('6791afdfc6f4e6c913b9f48c8189a44e29a09bde', body)
+        for information in ['代表画像をこの表示へ自動で渡します', '長辺1024ピクセル', '最初の一枚', '曲が終わっても情報を残し', '起動時の表示にも指定できます']:
+            self.assertIn(information, body)
+        self.assertNotIn('この表示には渡されません', body)
+        sfz = output['others-sfz-note-player.html']
+        for usable in ['Select SFZ Folder', '元の音源フォルダを保管', '音源への参照だけ', '256 MiB']:
+            self.assertIn(usable, sfz)
+        for other_product in ['Electron 版', 'Web 版', 'Import Folder']:
+            self.assertNotIn(other_product, sfz)
+        prediction = output['resonator-adaptive-prediction.html']
+        self.assertIn('Learn', prediction)
+        self.assertIn('Freeze', prediction)
         controller = output['controller-mapping.html'].split('<main class="content">')[1]
         self.assertIn('mImageViewer の再生やファイル移動は操作しません', controller)
         self.assertIn('MIDI CC', controller)
@@ -271,7 +282,7 @@ class GenerationTests(unittest.TestCase):
         self.assertIn('<link rel="canonical" href="https://mikage.to/mimageviewer/manual/effetune/v0.12.0/index.html">', text)
         self.assertIn('<a href="v0.12.0/index.html">', text)
         self.assertNotEqual(docs.entry_page('v0.12.0'), docs.entry_page('v0.13.0'))
-        self.assertEqual((docs.MANUAL / 'effetune/index.html').read_bytes(), docs.entry_page('v0.12.0'))
+        self.assertEqual((docs.MANUAL / 'effetune/index.html').read_bytes(), docs.entry_page('v0.13.0'))
 
     def test_check_exit_status_and_version_fallback_without_writes(self):
         with workspace_temporary_directory() as temporary:

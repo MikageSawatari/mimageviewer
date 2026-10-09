@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Offline, deterministic Japanese EffeTune snapshot -> mIV manual.
 
-Usage: python scripts/gen-effetune-docs.py [snapshot] [--version v0.12.0] [--check]
+Usage: python scripts/gen-effetune-docs.py [snapshot] [--version v0.13.0] [--check]
 VERSION in vendor/effetune-mixwright takes precedence over --version.
 Selection and post-conversion corrections live in docs/effetune-docs-overrides.
 Unpublished Markdown links become plain text; root-relative links go upstream.
@@ -24,7 +24,7 @@ from urllib.parse import unquote, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 MANUAL = ROOT / "htdocs/mimageviewer/manual"
 RULES = ROOT / "docs/effetune-docs-overrides"
-DEFAULT_SOURCE = ROOT / "third_party/effetune-docs/03bffda3"
+DEFAULT_SOURCE = ROOT / "third_party/effetune-docs/6791afdf"
 UPSTREAM = "https://effetune.frieve.com"
 
 
@@ -429,7 +429,7 @@ def apply_overrides(body, rules, converter):
         op = rule['operation']
         if op == 'replace_paragraph':
             anchor = '<p>' + converter.inline(rule['anchor']) + '</p>'
-            replacement = '<p>' + converter.inline(rule['replacement']) + '</p>'
+            replacement = ('<p>' + converter.inline(rule['replacement']) + '</p>') if rule['replacement'] else ''
         elif op in {'remove_section', 'insert_note'}:
             match, end = section_span(body, rule['heading_id'])
             if op == 'insert_note':

@@ -89,9 +89,23 @@
       <li><a href="https://github.com/Frieve-A/effetune-mixwright">EffeTune Mixwright の GitHub</a>（mImageViewer が使用する EffeTune）</li>
       <li><a href="https://www.youtube.com/@frieveamusic">作者による使い方の動画があります</a></li>
     </ul>
-    <p>チェーン作成、プリセット、A/B 比較などは、<a href="effetune/v0.12.0/README.html">基本操作</a>をご覧ください。</p>
-    <p>エフェクトごとの説明は、<a href="effetune/v0.12.0/index.html">同梱 EffeTune の説明書</a>をご覧ください。
+    <p>チェーン作成、プリセット、A/B 比較などは、<a href="effetune/v0.13.0/README.html">基本操作</a>をご覧ください。</p>
+    <p>エフェクトごとの説明は、<a href="effetune/v0.13.0/index.html">同梱 EffeTune の説明書</a>をご覧ください。
     以下では、mImageViewer から使うときの操作と注意点を説明します。</p>
+
+    <h2 id="now-playing">曲名と代表画像を表示する</h2>
+    <p>音響調整を使用中は、再生中の曲名・アルバム名・アーティスト名と代表画像を EffeTune へ自動で渡します。
+    EffeTune の <strong>Visualizer</strong> で Artwork、Title、Album、Artist を配置すると表示できます。
+    曲名が無いときは拡張子を除いたファイル名を使い、アルバム名とアーティスト名は情報が無ければ空欄です。
+    絶対パスや URL は渡しません。このためだけに音響調整を起動することはありません。</p>
+    <p>画像は長辺1024ピクセルまでにし、動く画像は最初の一枚を使います。先に文字を送り、画像ができたら表示します。
+    音楽は同名画像・MP3表紙、動画は一覧と同じ代表画像を使います。
+    一時停止・シーク・読み込み待ち・同曲の繰り返しでは情報を残します。PCでの停止・閉じる・再生終了では消します。
+    リモートは最後の曲が終わっても情報を残し、次曲への切替やセッション終了で消します。切替中や開始失敗時は空表示になることがあります。</p>
+    <p>画像を読み込めないときは画像無しで送ります。送信失敗やプラグインの拒否では、前の表示が残る場合があります。
+    通常の受け渡し失敗では音響調整を続け、次の情報変更や初期化時に送り直します。
+    プラグインが5秒以上応答しないときは EffeTune の専用ホストを終了して知らせ、音は音響調整を通さず再生します。
+    ほかの VST プラグインは停止しません。自動で再起動はしません。</p>
 
     <h2 id="requirements">利用に必要な環境</h2>
     <p>音響調整には、<strong>AVX2 と FMA の両方に対応した CPU</strong>が必要です。

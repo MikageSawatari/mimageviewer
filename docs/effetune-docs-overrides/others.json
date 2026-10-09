@@ -1,0 +1,26 @@
+[
+  {
+    "operation": "replace_paragraph",
+    "anchor": "Electron 版では **Select SFZ Folder…** を押し、SFZ ファイル、サンプル、インクルードファイルを含む音源のフォルダを選びます。複数の SFZ ファイルが見つかった場合は音源を選んで **Select** を押します。このフォルダ内のファイルは、音源を読み込むたびに直接読み取ります。**Remove** は一覧から登録を外し、元のファイルは削除しません。",
+    "replacement": "**Select SFZ Folder…** を押し、SFZ ファイル、サンプル、インクルードファイルを含む音源フォルダを選びます。複数の SFZ ファイルが見つかった場合は音源を選んで **Select** を押します。登録した音源は **SFZ** で選べます。元の音源フォルダを保管してください。",
+    "reason": "v0.13.0 vst-bootstrap.js:198-253 exposes native sfzLibraryV1; sfz_note_player.js:353 selects native folder route. Do not substitute browser import/storage claims for native implementation."
+  },
+  {
+    "operation": "replace_paragraph",
+    "anchor": "Web 版では **Import Folder…** を押し、SFZ ファイルとサンプルを含むフォルダを選びます。複数の SFZ がある場合は一つを選んで **Import** を押します。保存した音源は **SFZ** で選択でき、**Remove** で選択中のバンクを端末から削除できます。",
+    "replacement": "",
+    "reason": "Browser folder import is not selected when native sfzLibraryV1 is present."
+  },
+  {
+    "operation": "replace_inline",
+    "anchor": "Web 版で省略したサンプルを戻すには、上限を上げた後で元のフォルダを取り込み直してください。",
+    "replacement": "",
+    "reason": "Browser-specific reimport guidance; native selects external folders."
+  },
+  {
+    "operation": "replace_paragraph",
+    "anchor": "プリセットや共有パイプラインに含まれるのは音源への参照だけで、音源ファイルは含まれません。別の端末では、Electron 版ならその端末の音源フォルダを選び直し、Web 版ならフォルダを取り込んでください。SFZ 音源ファイルはユーザーデータのバックアップにも含まれないため、元の SFZ フォルダを保管してください。",
+    "replacement": "プリセットや共有パイプラインに含まれるのは音源への参照だけで、音源ファイルは含まれません。音源をほかのPCでも使うときは、そのPCで音源フォルダを選び直してください。SFZ 音源ファイルはユーザーデータのバックアップにも含まれないため、元の SFZ フォルダを保管してください。",
+    "reason": "Preserve external file dependency and avoid instructions for Electron/Web products."
+  }
+]

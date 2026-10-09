@@ -7,7 +7,7 @@ Sol 設計レビューを反映。第 3 版への指摘 (REVISE、P1×1 / P2×3 
 
 ## 0. 目的と決定済み事項
 
-EffeTune (Frieve-A、MIT) の VST3 版 **EffeTune Mixwright** (v0.12.0、WebView2 UI、AVX2/FMA 必須) を
+EffeTune (Frieve-A、MIT) の VST3 版 **EffeTune Mixwright** (v0.13.0、WebView2 UI、AVX2/FMA 必須) を
 mIV の音声経路へ組み込み、エフェクト処理とビジュアライザーを使えるようにする。
 
 利用者と合意済みの方針 (2026-09-27):
@@ -378,7 +378,7 @@ enum EffectiveState {
 
 ## 7. bundle の配置 (サンプル版の記録、配布版は §10.2)
 
-- `vendor/effetune-mixwright/EffeTune Mixwright.vst3` (gitignore 済み、v0.12.0、未署名)。
+- `vendor/effetune-mixwright/EffeTune Mixwright.vst3` (gitignore 済み、v0.13.0、未署名)。
 - `scripts/build-dev.ps1` が `target\dev-runtime\effetune\EffeTune Mixwright.vst3` へ
   ディレクトリごとコピーする (変更時のみ)。
 - 解決は **EffeTuneモジュール自身** が所有する。配布版はlauncherが検証して渡すgenerationを
@@ -689,6 +689,26 @@ Rust の取得キューでは未開始／実行中の終了交錯を fake execut
   通常 launcher test は release core / remote / EPUB worker が未buildのため保留。
   公開前に release lead が最終 full gate と release build、および実機確認を行う。
 
+
+### 10.4 同梱版更新 (2026-10-09、v4.5.0 の次のリリース)
+
+- 利用者は Mixwright v0.13.0 の同梱と Now Playing 連携を承認済み。
+  決定・所有設計・公開前検証は [Now Playing 計画](effetune-now-playing-plan.md) を正本とする。
+- 承認 ZIP の SHA-256 は
+  `1ad197b57380503fb04d3773a60525e338153182834f96ae6634d4ff8cd25da0`。
+  ZIP の全448ファイルを vendor とバイト単位で照合し、VERSION と合わせて449エントリを
+  `third_party/effetune-mixwright/v0.13.0/manifest.sha256` に固定する。
+  v0.12.0 から24ファイル追加、削除なし。旧manifestと通知は履歴として残す。
+- 上流の二つの THIRD-PARTY-NOTICES に lie 3.3.0、immediate 3.0.6、setImmediate 1.0.5
+  の MIT 通知と pako 1.0.11 の zlib 由来通知が追加された。
+  DSP NOTICE は Emscripten の MIT / University of Illinois/NCSA、Node.js の MIT、
+  musl の MIT と同梱部分の個別通知を追加。既存ライセンスブロックの削除はない。
+  以前の mIV 補足通知で扱った四成分が上流通知に揃ったため、about は新版の三原文を表示する。
+  歴史的な補足原文ファイルは残す。通知原文は `.gitattributes -text` でバイトを保持する。
+- 署名前 raw source と署名後 stage の承認ゲート、launcher の全ファイル埋込み、
+  世代単位の公開・lease・cleanup は既存の経路を使う。portable は引き続き非同梱。
+  新版の保存状態互換、SFZ / Adaptive Prediction の実使用中の通信・保存範囲、
+  最終署名 artifact は公開前の実機確認事項として残る。
 
 ## 11. 試験版の引き渡し時点の記録 (2026-09-28)
 
