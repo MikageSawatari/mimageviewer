@@ -493,6 +493,9 @@ shift Clearへ接続する。HUDと環境設定転送には全体boolを、metad
 再受付するのはshift依存だけで、元のresume receiverと取得済み結果は保持する。
 maintenance epochの進行でも失効するのはshift recipeだけで、元のresume依存は保持する。
 Commonはその固定読取点を満たして調整なしで初回採用を完了し、同期の非fence SELECTへ戻さない。
+読取完了のCaptured/Expiredを型で区別し、失効を保存row不在と解釈しない。retainedの
+受入済みsessionとprojectionは失効時に保持する。maintenance資格は対象scopeのstampで照合し、
+別本のroot改名・変更なしlease・通常writeはそのscopeのreadを失効させない（設計§11.8）。
 resumeのroot資格・キーは既存producerの`at_root()`・`current_folder`を共用する。
 これは設定変更に伴う通常遷移であり、retryやまれな失敗の復旧ではない。
 

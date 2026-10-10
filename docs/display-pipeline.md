@@ -1932,6 +1932,9 @@ snapshotのanchor remapはitems交換で行い、一覧から固定してもfull
 dropしてaccepted sessionを保つ。再採用はfresh cutoffを捕捉し、forkはreceiverと元contextのwrite受付を複製しない。
 forkの保存待ち/失敗の調整はsession扱いとし、元contextだけがwrite完了を採用する。
 初回位置の`FencedResume`はopen continuationの初回採用完了時に終了し、後のresume参照へ持ち越さない。
+maintenanceで失効したshift readはrow不在の証明ではない。retainedのaccepted調整・projection・
+commandを保ち、unit/cache失効と現在ページの再正規化を起こさない。初回Commonはcapture時の
+調整なしと独立resumeを採用する。別本改名はscope stampを変えず、元のreadをそのまま採用できる。
 明示ON/OFFではretained待機を取り消してaccepted sessionを保ち、表示済みsiblingsへ旧保存値を
 適用しない。fresh-openは元のresume cutoffと捕捉済みopen scopeを保ったまま、新settings世代・
 現在のshift受付cutoffで依存を再受付する。世代不一致を理由にresume fenceまで破棄しない。

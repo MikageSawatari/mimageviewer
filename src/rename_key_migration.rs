@@ -1329,7 +1329,7 @@ fn copy_stores_impl(
     data_dir: &Path,
     mappings: &[StoreCopyPathMapping],
     include_identity: bool,
-    _maintenance: &StoreMaintenanceLease,
+    maintenance: &StoreMaintenanceLease,
     mut on_progress: impl FnMut(usize, usize),
 ) -> StoreCopyReport {
     let mut report = StoreCopyReport::default();
@@ -1385,6 +1385,7 @@ fn copy_stores_impl(
             continue;
         }
         let descriptor_start = processed;
+        let previous_errors = report.errors.len();
         copy_store(
             &data_dir.join(descriptor.file),
             descriptor,
@@ -1395,6 +1396,9 @@ fn copy_stores_impl(
                 on_progress(processed, total);
             },
         );
+        if descriptor.file == "spread_shift.db" && report.errors.len() != previous_errors {
+            maintenance.maintenance.invalidate_unknown_failure();
+        }
         // Missing databases and failed transactions still finish this descriptor's work.
         processed = descriptor_start + normalized.len();
         on_progress(processed, total);
@@ -1567,13 +1571,15 @@ fn run_at_with_epub_acquisition(
         store_mutations: StoreMutationEffects::default(),
         panicked: false,
     };
-    let _maintenance = match acquire_store_maintenance_with_epub(data_dir, acquire_epub) {
+    let maintenance = match acquire_store_maintenance_with_epub(data_dir, acquire_epub) {
         Ok(lease) => lease,
         Err(error) => {
             report.errors.push(format!("spread_shift: {error}"));
             return report;
         }
     };
+    maintenance.maintenance.invalidate_root_family(old_path);
+    maintenance.maintenance.invalidate_root_family(new_path);
 
     // 1. 動画/音声の .xmp サイドカー (タグ・★の実体) をファイルごと改名する。
     //    フォルダ改名では中のサイドカーがフォルダと一緒に移動しているので対象外。
@@ -1600,6 +1606,7 @@ fn run_at_with_epub_acquisition(
         if old_key == new_key {
             continue;
         }
+        let previous_errors = report.errors.len();
         migrate_store(
             &data_dir.join(descriptor.file),
             descriptor,
@@ -1607,6 +1614,9 @@ fn run_at_with_epub_acquisition(
             new_key,
             &mut report,
         );
+        if descriptor.file == "spread_shift.db" && report.errors.len() != previous_errors {
+            maintenance.maintenance.invalidate_unknown_failure();
+        }
     }
     drop(rating_write);
     drop(tag_write);
@@ -1622,7 +1632,10 @@ fn run_at_with_epub_acquisition(
         &[(old_path.to_path_buf(), new_path.to_path_buf())],
     ) {
         Ok(rows) => report.rows += rows,
-        Err(error) => report.errors.push(format!("spread_shift: {error}")),
+        Err(error) => {
+            maintenance.maintenance.invalidate_unknown_failure();
+            report.errors.push(format!("spread_shift: {error}"));
+        }
     }
 
     // 5. 閲覧履歴 (exact のみ。raw path 列も更新する)。記述子自体は STORES にあり、
@@ -1800,7 +1813,7 @@ fn purge_removed_scopes_impl(
     scopes: &[crate::delete_worker::DeleteSourceScope],
     pdf_paths: &[PathBuf],
     guard: Option<&crate::pdf_loader::EpubRangeLease>,
-    _maintenance: &crate::spread_shift::SpreadShiftMaintenanceLease,
+    maintenance: &crate::spread_shift::SpreadShiftMaintenanceLease,
 ) -> PurgeReport {
     let mut report = PurgeReport::default();
     if scopes.is_empty() {
@@ -1814,6 +1827,9 @@ fn purge_removed_scopes_impl(
             | crate::delete_worker::DeleteSourceScope::Tree(path) => path.clone(),
         })
         .collect::<Vec<_>>();
+    for root in &removed {
+        maintenance.invalidate_root_family(root);
+    }
     assert!(
         guard.is_none_or(|guard| guard.covers_paths_and_descendants(&removed)),
         "delete purge must keep the Shell range guard"
@@ -1837,7 +1853,11 @@ fn purge_removed_scopes_impl(
             StoreKeyNormalization::KeepDrive => &keep_drive_coverage,
             StoreKeyNormalization::DriveStripped => &drive_stripped_coverage,
         };
+        let previous_errors = report.errors.len();
         purge_store(data_dir, descriptor, keys, coverage, guard, &mut report);
+        if descriptor.file == "spread_shift.db" && report.errors.len() != previous_errors {
+            maintenance.invalidate_unknown_failure();
+        }
     }
     drop(rating_write);
     drop(tag_write);

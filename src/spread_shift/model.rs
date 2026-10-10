@@ -504,8 +504,17 @@ enum RestoreReadAdoption {
 #[derive(Clone, Debug)]
 pub(crate) struct CompletedRestoreReads {
     pub(crate) receipt: RestoreReceipt,
-    pub(crate) shift: Option<ShiftReadReply>,
+    pub(crate) shift: CompletedShiftRead,
     pub(crate) resume: Option<ReadingPosition>,
+}
+
+/// Only a captured, current recipe proves either a saved shift or its absence.
+/// Expiry never changes an already accepted session; fresh opens start unadjusted.
+#[derive(Clone, Debug)]
+pub(crate) enum CompletedShiftRead {
+    Unrequested,
+    Captured(ShiftReadReply),
+    Expired,
 }
 impl RestoreReadDependencies {
     /// A memory-policy change replaces only shift adoption. The resume read was
@@ -571,9 +580,9 @@ impl RestoreReadDependencies {
             match rx.try_recv() {
                 Ok(read) => {
                     validate_shift_completion(&self.receipt, &read)?;
-                    // Maintenance invalidates only the shift recipe. The independent
-                    // resume read remains fixed at admission and must still finish.
-                    self.shift = (read.maintenance_epoch == maintenance_epoch).then_some(read);
+                    // Preserve provenance through completion, even when the recipe
+                    // expires. Neither expiry nor an unrequested read proves absence.
+                    self.shift = Some(read);
                     self.shift_rx = None;
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -603,16 +612,20 @@ impl RestoreReadDependencies {
         if self.shift_rx.is_some() || self.resume_rx.is_some() {
             return Ok(None);
         }
-        if let Some(read) = &self.shift {
-            validate_shift_completion(&self.receipt, read)?;
+        let shift = if let Some(read) = self.shift.take() {
+            validate_shift_completion(&self.receipt, &read)?;
             if read.maintenance_epoch != maintenance_epoch {
-                self.shift = None;
+                CompletedShiftRead::Expired
+            } else {
+                CompletedShiftRead::Captured(read)
             }
-        }
+        } else {
+            CompletedShiftRead::Unrequested
+        };
         self.adoption = RestoreReadAdoption::Consumed;
         Ok(Some(CompletedRestoreReads {
             receipt: self.receipt.clone(),
-            shift: self.shift.take(),
+            shift,
             resume: self.resume.take().and_then(|r| r.position),
         }))
     }
@@ -1169,7 +1182,7 @@ mod tests {
         let completed = pending.try_complete(&original, 6).unwrap().unwrap();
         assert_eq!(completed.resume, Some(position));
         assert_eq!(completed.receipt.resume_cutoff, 7);
-        assert!(completed.shift.is_none());
+        assert!(matches!(completed.shift, CompletedShiftRead::Unrequested));
         assert!(pending.try_complete(&original, 6).is_err());
     }
 
@@ -1279,7 +1292,10 @@ mod tests {
                     .unwrap();
             }
             let completed = pending.try_complete(&receipt, 0).unwrap().unwrap();
-            assert_eq!(completed.shift.unwrap().row, Some(reference));
+            let CompletedShiftRead::Captured(read) = completed.shift else {
+                panic!("expected the current captured recipe");
+            };
+            assert_eq!(read.row, Some(reference));
             assert_eq!(
                 completed.resume,
                 Some(ReadingPosition {
@@ -1376,7 +1392,7 @@ mod tests {
             }
             let completed = pending.try_complete(&receipt, 7).unwrap().unwrap();
             assert!(
-                completed.shift.is_none(),
+                matches!(completed.shift, CompletedShiftRead::Expired),
                 "the old recipe must not be adopted"
             );
             assert_eq!(completed.resume, Some(position));

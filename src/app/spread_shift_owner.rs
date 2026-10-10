@@ -499,27 +499,33 @@ impl App {
         let epoch = self
             .spread_shift_service
             .as_ref()
-            .map_or(0, |s| s.maintenance_epoch());
+            .map_or(0, |s| s.maintenance_epoch_for(&current.scope));
         let Some(reads) = restore.reads.try_complete(&current, epoch)? else {
             return Ok(false);
         };
-        self.spread_shift.scope = Some(current.scope);
-        self.spread_shift.projection = None;
-        self.spread_shift.command = ShiftCommand::Idle;
-        self.spread_shift.state = if restore.memory == ShiftMemoryPolicy::Remember {
-            match reads.shift {
-                Some(read) => read.row.map_or(ViewerShift::None, |anchor_ref| {
-                    ViewerShift::Book(SpreadShiftState::Adjusted {
-                        anchor_ref,
-                        resolution: ShiftResolution::NotInView,
-                        persistence: ShiftPersistence::Saved(read.completed_through),
-                    })
-                }),
-                None => ViewerShift::None,
+        // Fresh capture already seeded an empty session. Retained capture kept
+        // its accepted session. Only a current read may replace either one;
+        // an expired recipe is never evidence that the saved row is absent.
+        if restore.memory == ShiftMemoryPolicy::Remember
+            && let CompletedShiftRead::Captured(read) = reads.shift
+        {
+            self.spread_shift.scope = Some(current.scope);
+            self.spread_shift.projection = None;
+            self.spread_shift.command = ShiftCommand::Idle;
+            self.spread_shift.state = read.row.map_or(ViewerShift::None, |anchor_ref| {
+                ViewerShift::Book(SpreadShiftState::Adjusted {
+                    anchor_ref,
+                    resolution: ShiftResolution::NotInView,
+                    persistence: ShiftPersistence::Saved(read.completed_through),
+                })
+            });
+            let nav = self.get_nav_indices();
+            self.spread_shift.resolve(&self.page_identity_index, &nav);
+            self.invalidate_fullscreen_display_unit_owners();
+            if restore.cause == ShiftRestoreCause::RetainedReadoption {
+                self.adopt_shift_layout_without_navigation();
             }
-        } else {
-            ViewerShift::None
-        };
+        }
         if self.book_resume_writer.is_some()
             && let Some(key) = &restore.resume_key
         {
@@ -527,12 +533,6 @@ impl App {
                 key: key.clone(),
                 position: reads.resume,
             };
-        }
-        let nav = self.get_nav_indices();
-        self.spread_shift.resolve(&self.page_identity_index, &nav);
-        self.invalidate_fullscreen_display_unit_owners();
-        if restore.cause == ShiftRestoreCause::RetainedReadoption {
-            self.adopt_shift_layout_without_navigation();
         }
         Ok(true)
     }

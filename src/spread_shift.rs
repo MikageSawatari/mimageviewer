@@ -34,6 +34,7 @@ pub(crate) struct ShiftOperation {
 pub(crate) struct ShiftReadReply {
     pub(crate) cutoff: u64,
     pub(crate) completed_through: u64,
+    /// Stamp for the requested book scope, independent of unrelated maintenance.
     pub(crate) maintenance_epoch: u64,
     pub(crate) row: Option<SpreadShiftPageRef>,
     pub(crate) status: Result<(), String>,

@@ -1338,6 +1338,11 @@ fn start_import_worker(
             }
             // The worker owns observation even if cancel/exit drops the receiver.
             // Release the writer before UI terminal handling starts snapshot refresh.
+            if result.is_err()
+                && let Ok(lease) = &lease
+            {
+                lease.invalidate_unknown_failure();
+            }
             drop(lease);
             let _ = tx.send(WorkerMessage::Import {
                 result,

@@ -4515,6 +4515,19 @@ QAのcache-read witnessは相関済み画像の受理時に記録し、進捗は
 detached述語・viewport生成・placement・focus・registry protocolは変更しない。
 これは両側の既存ownerを保持する統合であり、新しい待機状態・retry・時間窓を追加しない。
 
+### 2026-10-11 §1.364 D2e: retained読取由来とscope資格の所有
+
+利用者指定の構造修正として、依存完了のCaptured/Expiredを型で分離し、現epochのCapturedだけを
+viewer採用境界へ通す。F12のretained ownerは失効時にaccepted調整・projection・commandを保ち、
+初回Commonはcapture時の調整なしと元のresume fenceを保つ。cause別の解除guardは追加しない。
+maintenance資格も既存service/FIFO/leaseに集約し、対象scope/root familyだけを更新する。
+別本の改名ではretained readを失効させず、実handler回帰で調整済みF12と無関係なmainの不変性を確認する。
+同本改名の失効でもaccepted ownerを保ち、次の通常再入場で得た現epochの不在だけが解除できる。
+detached述語/viewport/registry、改名待機、live-follow、新しいcontext状態やretryは追加しない。
+失効とrow不在の組合せを採用ownerの型とscope所有で除く構造修正であり、症状パッチではない。
+詳細は[spread-shift-memory-plan.md §11.8](spread-shift-memory-plan.md#118-d2e-retained保持とscope単位のmaintenance資格2026-10-11)。
+本記録は独立構造合意・完了レビュー、製品起動や実機受入を表さない。
+
 ### 2026-10-11 §1.364 D2d: Commonの独立resume依存保持
 
 利用者指定の構造修正として`spread_shift::RestoreReadDependencies`の完了境界を変更する。

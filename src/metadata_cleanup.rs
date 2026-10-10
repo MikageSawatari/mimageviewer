@@ -827,6 +827,7 @@ where
             break;
         }
         progress.store_index.store(index, Ordering::Relaxed);
+        let errors_before = report.errors.len();
         delete_descriptor(
             data_dir,
             books_root,
@@ -839,6 +840,9 @@ where
             &mut deleted,
             &mut protected,
         );
+        if STORES[index].file == "spread_shift.db" && report.errors.len() > errors_before {
+            _shift_maintenance.invalidate_unknown_failure();
+        }
         if report.canceled {
             break;
         }

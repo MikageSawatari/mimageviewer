@@ -1,7 +1,8 @@
 //! One writable connection, ordered admission, immutable read publication, and
 //! worker-only maintenance leases. The cloneable front handle never joins.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak, mpsc};
@@ -20,6 +21,7 @@ use super::{
 struct Snapshot {
     completed_through: u64,
     maintenance_epoch: u64,
+    scope_epochs: Arc<ScopeMaintenanceEpochs>,
     rows: BTreeMap<String, SpreadShiftPageRef>,
     status: Result<(), String>,
 }
@@ -29,7 +31,7 @@ impl Snapshot {
         ShiftReadReply {
             cutoff: request.cutoff,
             completed_through: self.completed_through,
-            maintenance_epoch: self.maintenance_epoch,
+            maintenance_epoch: self.scope_epochs.for_key(&request.scope.storage_key()),
             row: self.rows.get(&request.scope.storage_key()).cloned(),
             status: self.status.clone(),
         }
@@ -42,6 +44,93 @@ impl Snapshot {
             maintenance_epoch: self.maintenance_epoch,
             count: self.rows.len(),
             status: self.status.clone(),
+        }
+    }
+}
+
+/// Immutable maintenance qualification, shared by the read snapshot and the
+/// admission publication. Ordinary writes never advance these stamps.
+#[derive(Clone, Default)]
+struct ScopeMaintenanceEpochs {
+    global: u64,
+    exact: BTreeMap<String, u64>,
+    families: BTreeMap<String, u64>,
+}
+
+impl ScopeMaintenanceEpochs {
+    fn for_key(&self, key: &str) -> u64 {
+        let mut epoch = self.global.max(self.exact.get(key).copied().unwrap_or(0));
+        epoch = epoch.max(self.families.get(key).copied().unwrap_or(0));
+        // Probe only separator boundaries in this key, never historical roots.
+        // Include the slash itself for drive/filesystem roots.
+        for (index, separator) in key.char_indices() {
+            if separator == '/' {
+                for ancestor in [&key[..index], &key[..index + 1]] {
+                    epoch = epoch.max(self.families.get(ancestor).copied().unwrap_or(0));
+                }
+            } else if separator == ':' && key[index..].starts_with("::") {
+                epoch = epoch.max(self.families.get(&key[..index]).copied().unwrap_or(0));
+            }
+        }
+        epoch
+    }
+
+    fn advance(&mut self, epoch: u64, changed: &[String], hints: &MaintenanceHints) {
+        match hints {
+            MaintenanceHints::All => {
+                self.global = epoch;
+                self.exact.clear();
+                self.families.clear();
+            }
+            MaintenanceHints::Scoped(root_families) => {
+                for key in changed {
+                    self.exact.insert(key.clone(), epoch);
+                }
+                for root in root_families {
+                    self.families.insert(root.clone(), epoch);
+                }
+            }
+        }
+    }
+
+    fn advanced(
+        previous: &Arc<Self>,
+        epoch: u64,
+        changed: &[String],
+        hints: &MaintenanceHints,
+    ) -> Arc<Self> {
+        match hints {
+            MaintenanceHints::All => Arc::new(Self {
+                global: epoch,
+                ..Self::default()
+            }),
+            MaintenanceHints::Scoped(roots) if roots.is_empty() && changed.is_empty() => {
+                Arc::clone(previous)
+            }
+            MaintenanceHints::Scoped(_) => {
+                let mut next = (**previous).clone();
+                next.advance(epoch, changed, hints);
+                Arc::new(next)
+            }
+        }
+    }
+}
+
+enum MaintenanceHints {
+    Scoped(BTreeSet<String>),
+    All,
+}
+
+impl Default for MaintenanceHints {
+    fn default() -> Self {
+        Self::Scoped(BTreeSet::new())
+    }
+}
+
+impl MaintenanceHints {
+    fn add_root(&mut self, key: String) {
+        if let Self::Scoped(roots) = self {
+            roots.insert(key);
         }
     }
 }
@@ -92,6 +181,7 @@ struct Admission {
     // Published independently of the snapshot, which the worker temporarily
     // takes for COW/DB work outside this lock.
     maintenance_epoch: u64,
+    scope_epochs: Arc<ScopeMaintenanceEpochs>,
     snapshot: Option<Arc<Snapshot>>,
     deferred_commands: VecDeque<Command>,
     results: VecDeque<ShiftWriteReply>,
@@ -142,7 +232,7 @@ enum Command {
         action: MaintenanceAction,
     },
     BeginMaintenance(mpsc::Sender<Result<(), String>>),
-    EndMaintenance(mpsc::Sender<Result<(), String>>),
+    EndMaintenance(MaintenanceHints, mpsc::Sender<Result<(), String>>),
     #[cfg(test)]
     Pause(mpsc::Sender<()>, mpsc::Receiver<()>),
 }
@@ -230,6 +320,7 @@ impl SpreadShiftService {
                     completed_through: 0,
                 },
                 maintenance_epoch: 0,
+                scope_epochs: Arc::new(ScopeMaintenanceEpochs::default()),
                 snapshot: None,
                 deferred_commands: VecDeque::new(),
                 results: VecDeque::new(),
@@ -294,6 +385,15 @@ impl SpreadShiftService {
 
     pub(crate) fn maintenance_epoch(&self) -> u64 {
         self.shared.admission.lock().unwrap().maintenance_epoch
+    }
+
+    pub(crate) fn maintenance_epoch_for(&self, scope: &BookScopeKey) -> u64 {
+        self.shared
+            .admission
+            .lock()
+            .unwrap()
+            .scope_epochs
+            .for_key(&scope.storage_key())
     }
 
     /// HUD-only observation. This is not a completion proof for open/restore.
@@ -637,7 +737,7 @@ fn send_read_error(admission: &Admission, request: ReadRequest, error: String) {
     let _ = request.reply.send(ShiftReadReply {
         cutoff: request.cutoff,
         completed_through: admission.watermarks.completed_through,
-        maintenance_epoch: admission.maintenance_epoch,
+        maintenance_epoch: admission.scope_epochs.for_key(&request.scope.storage_key()),
         row: None,
         status: Err(error),
     });
@@ -714,6 +814,25 @@ impl Drop for SpreadShiftProcessOwner {
 pub(crate) struct SpreadShiftMaintenanceLease {
     portal: Arc<MaintenancePortal>,
     service: Option<(Arc<Shared>, mpsc::Sender<Command>)>,
+    hints: RefCell<MaintenanceHints>,
+}
+
+impl SpreadShiftMaintenanceLease {
+    /// Successful filesystem root operations affect old/new scopes even when
+    /// their shift rows are absent or the destination row wins unchanged.
+    pub(crate) fn invalidate_root_family(&self, root: &Path) {
+        let mut hints = self.hints.borrow_mut();
+        match BookScopeKey::folder(root) {
+            Ok(scope) => {
+                hints.add_root(scope.storage_key());
+            }
+            Err(_) => *hints = MaintenanceHints::All,
+        }
+    }
+
+    pub(crate) fn invalidate_unknown_failure(&self) {
+        *self.hints.borrow_mut() = MaintenanceHints::All;
+    }
 }
 
 pub(crate) fn maintenance_at(data_dir: &Path) -> Result<SpreadShiftMaintenanceLease, String> {
@@ -760,7 +879,11 @@ pub(crate) fn maintenance_at(data_dir: &Path) -> Result<SpreadShiftMaintenanceLe
     } else {
         None
     };
-    Ok(SpreadShiftMaintenanceLease { portal, service })
+    Ok(SpreadShiftMaintenanceLease {
+        portal,
+        service,
+        hints: RefCell::new(MaintenanceHints::default()),
+    })
 }
 
 impl Drop for SpreadShiftMaintenanceLease {
@@ -770,10 +893,13 @@ impl Drop for SpreadShiftMaintenanceLease {
             // Keep the actor alive through lease release even after process-exit
             // admission closes, so accepted dependencies still drain normally.
             service.pending.fetch_add(1, Ordering::AcqRel);
-            let sent = tx.send(Command::EndMaintenance(reply)).map_err(|error| {
-                service.pending.fetch_sub(1, Ordering::Release);
-                error.to_string()
-            });
+            let hints = std::mem::take(self.hints.get_mut());
+            let sent = tx
+                .send(Command::EndMaintenance(hints, reply))
+                .map_err(|error| {
+                    service.pending.fetch_sub(1, Ordering::Release);
+                    error.to_string()
+                });
             let result = sent.and_then(|()| rx.recv().map_err(|error| error.to_string())?);
             if let Err(error) = result {
                 crate::logger::log(format!("spread shift maintenance end failed: {error}"));
@@ -788,6 +914,7 @@ fn open_snapshot(
     data_dir: &Path,
     completed_through: u64,
     maintenance_epoch: u64,
+    scope_epochs: Arc<ScopeMaintenanceEpochs>,
 ) -> (Option<rusqlite::Connection>, Arc<Snapshot>) {
     let loaded = (|| {
         let connection = store::open_existing(&data_dir.join("spread_shift.db"))?;
@@ -809,6 +936,7 @@ fn open_snapshot(
         Arc::new(Snapshot {
             completed_through,
             maintenance_epoch,
+            scope_epochs,
             rows,
             status,
         }),
@@ -859,7 +987,8 @@ fn run_worker(
             state = portal.released.wait(state).unwrap();
         }
     }
-    let (mut connection, snapshot) = open_snapshot(&data_dir, 0, 0);
+    let initial_epochs = Arc::clone(&shared.admission.lock().unwrap().scope_epochs);
+    let (mut connection, snapshot) = open_snapshot(&data_dir, 0, 0, initial_epochs);
     let mut ready_commands = {
         let mut admission = shared.admission.lock().unwrap();
         if let Err(error) = &snapshot.status {
@@ -1026,8 +1155,20 @@ fn run_worker(
                     }
                 };
                 state.completed_through = sequence;
+                let epoch = state.maintenance_epoch + 1;
+                state.maintenance_epoch = epoch;
+                state.scope_epochs = ScopeMaintenanceEpochs::advanced(
+                    &state.scope_epochs,
+                    epoch,
+                    &[],
+                    &MaintenanceHints::All,
+                );
+                let published_epochs = Arc::clone(&state.scope_epochs);
                 let mut admission = shared.admission.lock().unwrap();
                 admission.snapshot = Some(snapshot);
+                let previous_epochs =
+                    std::mem::replace(&mut admission.scope_epochs, published_epochs);
+                admission.maintenance_epoch = epoch;
                 admission.watermarks.completed_through = sequence;
                 admission.changed_scope_keys.extend(changed_keys);
                 admission.clear_results.push_back(ShiftClearAllReply {
@@ -1035,21 +1176,27 @@ fn run_worker(
                     removed,
                     status,
                 });
+                drop(admission);
+                drop(previous_epochs);
             }
             Command::Maintain { sequence, action } => {
                 // All book completion operations share the actor's admission order.
                 // Page mapping reuses an external primitive only after closing its connection.
+                let mut hints = MaintenanceHints::default();
                 let result = match action {
                     MaintenanceAction::PagePaths(mappings) => {
                         connection = None;
                         store::migrate_page_paths_at(&data_dir, &mappings).map(|_| ())
                     }
                     MaintenanceAction::RenameBookRoot { source, target } => {
+                        hints.add_root(source.clone());
+                        hints.add_root(target.clone());
                         connection.as_mut().map_or(Ok(()), |connection| {
                             store::rename_book_root(connection, &source, &target).map(|_| ())
                         })
                     }
                     MaintenanceAction::PurgeBookRoot(root) => {
+                        hints.add_root(root.clone());
                         connection.as_mut().map_or(Ok(()), |connection| {
                             store::purge_book_root(connection, &root).map(|_| ())
                         })
@@ -1058,22 +1205,41 @@ fn run_worker(
                 connection = None;
                 let previous = shared.admission.lock().unwrap().snapshot.take().unwrap();
                 let epoch = previous.maintenance_epoch;
-                let (opened, mut snapshot) = open_snapshot(&data_dir, sequence, epoch + 1);
+                let (opened, mut snapshot) = open_snapshot(
+                    &data_dir,
+                    sequence,
+                    epoch + 1,
+                    Arc::clone(&previous.scope_epochs),
+                );
                 connection = opened;
                 if let Err(error) = &result {
                     crate::logger::log(format!("spread shift book maintenance failed: {error}"));
                     Arc::make_mut(&mut snapshot).status = Err(error.clone());
                 }
                 let changed = changed_keys(&previous, &snapshot);
-                drop(previous); // Potential full-map drop stays outside admission.
+                if previous.status.is_err() || snapshot.status.is_err() {
+                    hints = MaintenanceHints::All;
+                }
+                let published_epochs = ScopeMaintenanceEpochs::advanced(
+                    &previous.scope_epochs,
+                    epoch + 1,
+                    &changed,
+                    &hints,
+                );
+                Arc::make_mut(&mut snapshot).scope_epochs = Arc::clone(&published_epochs);
                 let mut admission = shared.admission.lock().unwrap();
                 if let Err(error) = &snapshot.status {
                     admission.errors.push(error.clone());
                 }
                 admission.snapshot = Some(snapshot);
+                let previous_epochs =
+                    std::mem::replace(&mut admission.scope_epochs, published_epochs);
                 admission.watermarks.completed_through = sequence;
                 admission.changed_scope_keys.extend(changed);
                 admission.maintenance_epoch = epoch + 1;
+                drop(admission);
+                drop(previous_epochs);
+                drop(previous);
             }
             Command::BeginMaintenance(reply) => {
                 connection = None;
@@ -1081,19 +1247,35 @@ fn run_worker(
                 // before their terminal result. Connection drop precedes this ACK.
                 let _ = reply.send(Ok(()));
             }
-            Command::EndMaintenance(reply) => {
+            Command::EndMaintenance(mut hints, reply) => {
                 let previous = shared.admission.lock().unwrap().snapshot.take().unwrap();
                 let (completed, epoch) = (previous.completed_through, previous.maintenance_epoch);
-                let (opened, snapshot) = open_snapshot(&data_dir, completed, epoch + 1);
+                let (opened, mut snapshot) = open_snapshot(
+                    &data_dir,
+                    completed,
+                    epoch + 1,
+                    Arc::clone(&previous.scope_epochs),
+                );
                 connection = opened;
                 let status = snapshot.status.clone();
                 let changed = changed_keys(&previous, &snapshot);
-                drop(previous);
+                if previous.status.is_err() || snapshot.status.is_err() {
+                    hints = MaintenanceHints::All;
+                }
+                let published_epochs = ScopeMaintenanceEpochs::advanced(
+                    &previous.scope_epochs,
+                    epoch + 1,
+                    &changed,
+                    &hints,
+                );
+                Arc::make_mut(&mut snapshot).scope_epochs = Arc::clone(&published_epochs);
                 let mut admission = shared.admission.lock().unwrap();
                 if let Err(error) = &status {
                     admission.errors.push(error.clone());
                 }
                 admission.snapshot = Some(Arc::clone(&snapshot));
+                let previous_epochs =
+                    std::mem::replace(&mut admission.scope_epochs, published_epochs);
                 admission.changed_scope_keys.extend(changed);
                 admission.maintenance_epoch = epoch + 1;
                 admission.mode = if admission.mode.is_closed() {
@@ -1105,6 +1287,8 @@ fn run_worker(
                 // snapshot after its preceding roots, before any later mutation.
                 ready_commands.extend(std::mem::take(&mut admission.deferred_commands));
                 drop(admission);
+                drop(previous_epochs);
+                drop(previous);
                 let _ = reply.send(status);
             }
             #[cfg(test)]
@@ -1460,10 +1644,13 @@ mod tests {
             .unwrap();
         entered.recv_timeout(Duration::from_secs(10)).unwrap();
         assert!(service.shared.admission.lock().unwrap().snapshot.is_none());
-        let epoch = service.maintenance_epoch();
-        assert_eq!(epoch, 1);
+        let epoch = service.maintenance_epoch_for(&scope());
+        assert_eq!(epoch, 0);
         let complete = reads.try_complete(&receipt, epoch).unwrap().unwrap();
-        assert_eq!(complete.shift.unwrap().row, Some(anchor(1)));
+        let super::super::CompletedShiftRead::Captured(shift) = complete.shift else {
+            panic!("unaffected shift read was not retained");
+        };
+        assert_eq!(shift.row, Some(anchor(1)));
         // Invalid requests also report the published epoch while no snapshot is present.
         assert_eq!(
             read(&service, scope(), other_set + 1).maintenance_epoch,
@@ -1473,10 +1660,213 @@ mod tests {
             .count_after(other_set + 1)
             .recv_timeout(Duration::from_secs(10))
             .unwrap();
-        assert_eq!(count_error.maintenance_epoch, epoch);
+        assert_eq!(count_error.maintenance_epoch, service.maintenance_epoch());
         assert!(count_error.status.is_err());
         resume.send(()).unwrap();
         assert_eq!(read(&service, other, other_set).maintenance_epoch, epoch);
+        owner.shutdown_and_join();
+    }
+
+    #[test]
+    fn scoped_epochs_match_only_separator_drive_and_virtual_families() {
+        let mut epochs = ScopeMaintenanceEpochs::default();
+        epochs.families.insert("c:/books/a".into(), 2);
+        epochs.families.insert("d:/".into(), 4);
+        epochs.exact.insert("c:/books/exact.zip/chapter".into(), 3);
+        for key in ["c:/books/a", "c:/books/a/chapter", "c:/books/a::page_1"] {
+            assert_eq!(epochs.for_key(key), 2, "{key}");
+        }
+        for key in ["c:/books/ab", "c:/books/a.zip", "e:/books/a"] {
+            assert_eq!(epochs.for_key(key), 0, "{key}");
+        }
+        assert_eq!(epochs.for_key("d:/"), 4);
+        assert_eq!(epochs.for_key("d:/books/a"), 4);
+        assert_eq!(epochs.for_key("c:/books/exact.zip/chapter"), 3);
+        assert_eq!(epochs.for_key("c:/books/exact.zip/chapter/sub"), 0);
+        epochs.advance(5, &[], &MaintenanceHints::All);
+        assert_eq!(epochs.for_key("c:/books/a"), 5);
+        assert_eq!(epochs.for_key("e:/unrelated"), 5);
+    }
+
+    #[test]
+    fn read_only_lease_keeps_original_read_stamp_and_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let (service, owner) = SpreadShiftService::spawn_at(temp.path().into(), None).unwrap();
+        let saved = service.set_shift(scope(), anchor(1), operation(1)).unwrap();
+        let original = read(&service, scope(), saved);
+        service.drain_changed_scope_keys();
+        drop(maintenance_at(temp.path()).unwrap());
+        let after = read(&service, scope(), saved);
+        assert_eq!(service.maintenance_epoch(), 1);
+        assert_eq!(after.maintenance_epoch, original.maintenance_epoch);
+        assert_eq!(
+            service.maintenance_epoch_for(&scope()),
+            original.maintenance_epoch
+        );
+        assert_eq!(after.row, original.row);
+        assert!(service.drain_changed_scope_keys().is_empty());
+        owner.shutdown_and_join();
+    }
+
+    #[test]
+    fn unrelated_root_rename_retains_read_but_stamps_absent_old_new_families() {
+        let temp = tempfile::tempdir().unwrap();
+        let (service, owner) = SpreadShiftService::spawn_at(temp.path().into(), None).unwrap();
+        let saved = service.set_shift(scope(), anchor(1), operation(1)).unwrap();
+        let original = read(&service, scope(), saved);
+        let old = BookScopeKey::folder("C:/books/old").unwrap();
+        let new = BookScopeKey::folder("C:/books/new").unwrap();
+        let old_chapter = BookScopeKey::new(&old.logical_root, "chapter").unwrap();
+        let new_chapter = BookScopeKey::new(&new.logical_root, "chapter").unwrap();
+        let absent_old = read(&service, old_chapter.clone(), saved);
+        let absent_new = read(&service, new_chapter.clone(), saved);
+        service
+            .rename_book_root(&old.logical_root, &new.logical_root)
+            .unwrap();
+        let cutoff = service.watermarks().admitted;
+        read(&service, scope(), cutoff);
+        assert_eq!(
+            service.maintenance_epoch_for(&scope()),
+            original.maintenance_epoch
+        );
+        assert_eq!(service.maintenance_epoch_for(&old), 1);
+        assert_eq!(service.maintenance_epoch_for(&new), 1);
+        assert_ne!(
+            service.maintenance_epoch_for(&old_chapter),
+            absent_old.maintenance_epoch
+        );
+        assert_ne!(
+            service.maintenance_epoch_for(&new_chapter),
+            absent_new.maintenance_epoch
+        );
+        assert_eq!(read(&service, old_chapter, cutoff).row, None);
+        assert_eq!(read(&service, new_chapter, cutoff).row, None);
+        owner.shutdown_and_join();
+    }
+
+    #[test]
+    fn root_rename_stamps_unchanged_destination_and_preserves_original_reply() {
+        let temp = tempfile::tempdir().unwrap();
+        let (service, owner) = SpreadShiftService::spawn_at(temp.path().into(), None).unwrap();
+        let destination = BookScopeKey::folder("C:/books/destination").unwrap();
+        service.set_shift(scope(), anchor(1), operation(1)).unwrap();
+        let saved = service
+            .set_shift(destination.clone(), anchor(8), operation(2))
+            .unwrap();
+        let original = read(&service, destination.clone(), saved);
+        service
+            .rename_book_root(&scope().logical_root, &destination.logical_root)
+            .unwrap();
+        let after = read(&service, destination.clone(), service.watermarks().admitted);
+        assert_eq!(after.row, original.row);
+        assert_eq!(original.maintenance_epoch, 0);
+        assert_eq!(after.maintenance_epoch, 1);
+        assert_eq!(service.maintenance_epoch_for(&destination), 1);
+        owner.shutdown_and_join();
+    }
+
+    #[test]
+    fn lease_root_hints_cover_absent_scopes_and_unknown_failure_is_global() {
+        let temp = tempfile::tempdir().unwrap();
+        let (service, owner) = SpreadShiftService::spawn_at(temp.path().into(), None).unwrap();
+        let root = BookScopeKey::folder("C:/books/absent").unwrap();
+        let original = read(&service, root.clone(), 0);
+        let sibling = read(&service, scope(), 0);
+        let lease = maintenance_at(temp.path()).unwrap();
+        lease.invalidate_root_family(Path::new("C:/books/absent/"));
+        drop(lease);
+        assert_ne!(
+            service.maintenance_epoch_for(&root),
+            original.maintenance_epoch
+        );
+        assert_eq!(
+            service.maintenance_epoch_for(&scope()),
+            sibling.maintenance_epoch
+        );
+        assert!(service.drain_changed_scope_keys().is_empty());
+        let lease = maintenance_at(temp.path()).unwrap();
+        lease.invalidate_unknown_failure();
+        drop(lease);
+        assert_eq!(service.maintenance_epoch_for(&scope()), 2);
+        assert_eq!(service.maintenance_epoch_for(&root), 2);
+        owner.shutdown_and_join();
+    }
+
+    #[test]
+    fn ordinary_writes_preserve_scope_stamps_but_clear_all_invalidates_globally() {
+        let temp = tempfile::tempdir().unwrap();
+        let (service, owner) = SpreadShiftService::spawn_at(temp.path().into(), None).unwrap();
+        let saved = service.set_shift(scope(), anchor(1), operation(1)).unwrap();
+        let original = read(&service, scope(), saved);
+        let saved = service.set_shift(scope(), anchor(2), operation(2)).unwrap();
+        assert_eq!(
+            read(&service, scope(), saved).maintenance_epoch,
+            original.maintenance_epoch
+        );
+        let cleared = service.clear_shift(scope(), operation(3)).unwrap();
+        assert_eq!(
+            read(&service, scope(), cleared).maintenance_epoch,
+            original.maintenance_epoch
+        );
+        let all = service.clear_all().unwrap();
+        assert_eq!(read(&service, scope(), all).maintenance_epoch, 1);
+        let unrelated = BookScopeKey::folder("D:/unrelated").unwrap();
+        assert_eq!(service.maintenance_epoch_for(&unrelated), 1);
+        owner.shutdown_and_join();
+    }
+
+    #[test]
+    fn purge_invalidates_only_deleted_root_family_including_absent_chapters() {
+        let temp = tempfile::tempdir().unwrap();
+        let (service, owner) = SpreadShiftService::spawn_at(temp.path().into(), None).unwrap();
+        let root = BookScopeKey::folder("C:/books/deleted").unwrap();
+        let chapter = BookScopeKey::new(&root.logical_root, "chapter").unwrap();
+        let saved = service
+            .set_shift(root.clone(), anchor(1), operation(1))
+            .unwrap();
+        let absent = read(&service, chapter.clone(), saved);
+        let parent = BookScopeKey::folder("C:/books").unwrap();
+        let parent_read = read(&service, parent.clone(), saved);
+        service.purge_book_root(&root.logical_root).unwrap();
+        let deleted = read(&service, root.clone(), service.watermarks().admitted);
+        assert_eq!(deleted.row, None);
+        assert_eq!(deleted.maintenance_epoch, 1);
+        assert_ne!(
+            service.maintenance_epoch_for(&chapter),
+            absent.maintenance_epoch
+        );
+        assert_eq!(
+            service.maintenance_epoch_for(&parent),
+            parent_read.maintenance_epoch
+        );
+        assert_eq!(service.maintenance_epoch_for(&scope()), 0);
+        owner.shutdown_and_join();
+    }
+
+    #[test]
+    fn external_row_delta_stamps_only_changed_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let (service, owner) = SpreadShiftService::spawn_at(temp.path().into(), None).unwrap();
+        let saved = service.set_shift(scope(), anchor(1), operation(1)).unwrap();
+        let original = read(&service, scope(), saved);
+        let imported = BookScopeKey::new("C:/books/imported.zip", "chapter").unwrap();
+        let absent = read(&service, imported.clone(), saved);
+        let lease = maintenance_at(temp.path()).unwrap();
+        let mut connection = store::open_existing(&temp.path().join("spread_shift.db"))
+            .unwrap()
+            .unwrap();
+        store::set(&mut connection, &imported.storage_key(), &anchor(8)).unwrap();
+        drop(connection);
+        drop(lease);
+        assert_eq!(
+            service.maintenance_epoch_for(&scope()),
+            original.maintenance_epoch
+        );
+        assert_ne!(
+            service.maintenance_epoch_for(&imported),
+            absent.maintenance_epoch
+        );
+        assert_eq!(read(&service, imported, saved).row, Some(anchor(8)));
         owner.shutdown_and_join();
     }
 

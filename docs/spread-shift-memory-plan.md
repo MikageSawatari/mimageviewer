@@ -1,6 +1,6 @@
 # §1.364 見開きの一ページずらしの本別記憶 — 設計 R3
 
-更新: 2026-10-11（最新決定は§11.6、resume依存保持の追補は§11.7）。対象: `mimageviewer-nextview` / `next-viewer`、R3照合基点
+更新: 2026-10-11（最新決定は§11.6、resume依存保持は§11.7、retained保持とscope epochは§11.8）。対象: `mimageviewer-nextview` / `next-viewer`、R3照合基点
 `ec4a43b38da862f577b2872ed7c7d626f996be5d`（R2 `1837ded3f` と master の新しいまれな失敗方針を統合済み。製品コードは §1.342 統合済みの `fa280d0d0` と同じ）。
 状態: **Q1〜Q5 はすべて決定済み。利用者への未決質問なし。独立再レビュー・構造合意は別工程で、実装の許可・検収ではない。**
 今回の変更は本書と `target/D-1364-design-r3-msg.txt` だけ。コード変更、テスト実行、ビルド、
@@ -332,6 +332,8 @@ resume と shift を一つの DB transaction にまとめる必要はない。
 maintenance epochの進行でshift recipeが失効しても、独立したresumeのreceiver・取得結果・
 固定読取点を破棄しない。旧shiftだけを採用せず、元のresume完了証明を満たして調整なしで
 同じcontinuationの初回採用を完了する。DBの非fence SELECTへ戻さない（§11.7）。
+失効は保存row不在の証明ではない。初回Commonはcapture時の調整なしを保ち、retainedは
+受入済みsessionを保つ。資格は対象scopeのepochで照合する（§11.8）。
 「常に最新commitと一致するまで再試行」や後着save replyを新contextへ再配送する方式にしない。
 explicit target 等で resume を使わない時も shift の fence は必要。記憶 OFF / Composed / A2 なら
 shift適用用読取は不要だが、送信済み保存の完了ownerは残る。構成解除は新しいreceiptで再評価する。
@@ -946,7 +948,8 @@ Commonのエラー終端がresume依存を含む`ViewerBookRestore`を破棄し�
 証明が正常でもepochが異なるrecipeはshift依存だけから除き、未受信のresume receiverも
 取得済みresume結果も保持する。epoch進行が受信前・shift受信後のresume待機・resume受信後の
 shift待機のいずれでも、receiptが一致する元のresume読取点を一回採用する。
-結果の`shift: None`は旧recipeの不採用を表し、保存rowがないことを証明したとは扱わない。
+当時の結果の`shift: None`は旧recipeの不採用を表した。retainedとの共有で不在と誤認する
+問題が再レビューで判明したため、§11.8でこの表現をtyped provenanceへ置き換える。
 Commonは通常の成功終端で元resumeを`FencedResume`へ渡し、初回採用後に依存を終了する。
 receiptのsupersession、cutoff不一致、worker/読取失敗の既存エラー扱いは変更しない。
 
@@ -979,6 +982,47 @@ installed coreは停止せず、製品も起動していない。commitは行っ
 初回compileでは共用validatorの別consumer呼出しが署名変更に未追従だった。
 completion proofとepoch資格のvalidatorを分け、layout resolverのepoch拒否契約を維持してから
 上記検証を実行した。初回compileの非ゼロログを保持し、全libは成功した上記1回だけである。
+
+### 11.8 D2e: retained保持とscope単位のmaintenance資格（2026-10-11）
+
+基点`991cf9ac6`の再レビューで、失効したrecipeを`shift: None`として返すD2dの表現が、
+retained復帰の受入済み調整を解除することが判明した。旧recipeの不採用はrow不在の証明ではない。
+
+依存完了結果を`CompletedShiftRead::Unrequested | Captured | Expired`へ置き換え、
+現epochのCapturedだけにviewer状態更新・layout再解決・unit/cache失効・位置正規化を許す。
+初回Commonはcaptureで既に作られた調整なしのowner、retainedは既に受入済みのsessionを保つ。
+失効時にcause別のresetを足さず、同じ採用境界で由来を保持する。独立resumeのreceiver・取得結果・
+固定読取点は維持する。後の通常retained入場はfresh cutoffで再解決し、現epochで得た不在だけが解除できる。
+
+global epochによる別本との組合せも削減する。既存service/FIFO/maintenance leaseの中で
+immutable scope stampをsnapshotと同時公開し、snapshotの一時欠落と分離して保持する。
+root改名/purgeは旧・新rootのexact/`/`/`::` familyを明示し、不在rowや値不変のdestinationも失効させる。
+page mapping、copy/import/cleanupの外部更新は再読込の実変更scopeだけを更新する。
+通常Set/Clear・読取のみ/変更なしleaseはstampを進めない。ClearAllと影響不明のshift保守失敗は
+global fallbackとし、既存のlog/通知以外の復旧機械は作らない。診断用保守回数は別に維持する。
+lookupは対象keyの区切り境界だけで、歴史上のroot全走査やcontext/read登録を追加しない。
+mapの構築・COW・旧Arc解放はworkerのadmission lock外で行い、UIの同期I/Oや待機を追加しない。
+
+これはR3の単一owner内に収まる資格の限定であり、新しい状態機械、retry、改名待機、live-followを
+必要としない。§11.6のreleased stale-view契約、§6.1の独立resume fence、Q1〜Q5は維持する。
+UI/キー/設定/マニュアルの操作仕様は変わらない。
+
+回帰は調整済みretained F12の読取捕捉→別本の実book-manager rename→元読取pollを通し、
+元readの採用資格・調整・表示位置と無関係なmain owner/items/indexの不変性を検証する。
+同本改名ではExpiredでもaccepted owner全体を保持し、次の通常入場の有効な不在だけが解除する。
+serviceではroot family境界、不在scope、値不変destination、read-only lease、通常write、ClearAll、
+限定purge、外部実変更scopeとunknown failureを検証する。全自動検証の結果はD2e handoffに記録する。
+本記録は独立レビュー合格や製品起動・実機受入を表さない。
+
+自動検証（D2e、2026-10-11）: focused shift 102/0、rename 54/0（1 ignored）、
+cleanup 12/0。全libは一回実行し11,874 passed / 0 failed / 55 ignored、1,098.90秒。
+以前負荷下で失敗した二つのreal-time audio回帰もこの全libで成功し、単独再実行は不要だった。
+ui_snapshotは155/0（121.66秒、baseline変更なし）。normal/portable core check、
+fmt check、UI glyph check（0）、diff checkも成功。ログとverification build結果は
+`target/D-1364-d2e-*.log`と`target/D-1364-d2e-msg.txt`へ記録する。
+`build-dev.ps1 -PreserveRuntime`もexit 0で完了し、core/remote/EPUB workerをstageした。
+runtime/PE検証はruntime=4 / pe=3で成功。worktree由来のcoreがないことを確認し、
+既存installed runtimeを停止・変更せず、製品は起動していない。commitも行っていない。
 
 ## 12. 決定済み事項（番号固定）
 

@@ -5,7 +5,7 @@
 
 ---
 
-## 本別見開き調整の永続化基盤とviewer接続（§1.364 D1/D2c、2026-10-11）
+## 本別見開き調整の永続化基盤とviewer接続（§1.364 D1/D2e、2026-10-11）
 
 `SpreadShiftService`のUI handleは送信・immutable snapshot lookup・結果pollだけを行い、
 一つのworkerが`spread_shift.db`の接続とSet/Clear/読取を所有する。受付sequenceはownerのFIFOへの受理後、
@@ -19,6 +19,10 @@ pureな`RestoreReadDependencies`が両writerの固定した読取点の完了証
 位置はownerの`FencedResume`に保持して既存のresume consumerへ渡す。
 epoch進行はshift recipeだけを不採用にする。独立resumeの元receiver・取得結果は保持して
 同じCommonの完了境界で調整なしの初回採用を完了し、非fence SELECTや後着Recordの再読取へ戻さない。
+完了結果は`CompletedShiftRead::Unrequested | Captured | Expired`で由来を保持する。
+現epochのCapturedだけが保存rowの有無を証明し、既存viewer状態を更新する。
+Expiredは初回captureの調整なし、retainedの受入済み調整・projection・commandをそのまま保つ。
+再解決は次の通常retained再入場に任せ、失効をrow不在として採用しない。
 root改名は永続storeだけを移し、受付済みopenの捕捉source/scope、receiver、continuationを変更しない。
 同一本の未完了openを待つquery・製本管理の待機wrapperは設けない。open側にlive移行境界がなく、
 shiftの受理済みwrite/read/root操作の順序はD1の単一FIFOが所有する（最新決定は設計§11.6）。
@@ -40,7 +44,11 @@ ON/OFF時は既存live調整をsession扱いにし、ON化元のBookだけを保
 この更新はshift依存だけを差し替え、初回resumeのreceiver・取得済み値を保持する。
 resumeの資格とキーは記録producerの`at_root()`・`current_folder`を共用する。
 保守lease中の通常Set/Clearも既存の保守後FIFOへ受理し、兄弟窓の操作を拒否しない。
-maintenance epochはownerの値として保持し、通常writeの一時的なsnapshot移送では変えない。
+maintenance資格はownerのimmutable scope stampとしてsnapshotと同時公開し、通常writeの
+一時的なsnapshot移送でも保持する。診断用の保守回数と分離し、通常writeや変更なしleaseでは進めない。
+root改名/purgeは明示された旧・新root family、外部更新は実変更scopeだけを失効させる。
+ClearAllと影響不明のshift保守失敗はglobal fallback。scope lookupは対象keyの区切り境界だけを調べ、
+map構築・COW・旧Arc解放はworkerでadmission lock外に置く。別本改名は無関係なreadを失効させない。
 write replyはSet/Clear種別も保持し、元contextを閉じた後も対応した成功通知を出す。
 
 新規openの`ViewerBookRestore`は従来どおりglobal `Common` continuationが所有する。
