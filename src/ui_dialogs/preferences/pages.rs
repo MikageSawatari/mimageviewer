@@ -4889,15 +4889,16 @@ pub(super) fn page_menu_layout(ui: &mut egui::Ui, state: &mut PreferencesState) 
                 );
             });
 
+            // The view owner controls openness; egui only keeps rendering caches.
+            let open = state
+                .menu_expanded
+                .get(&top)
+                .copied()
+                .unwrap_or(top_visible);
             let response = egui::CollapsingHeader::new(format!("{} の項目", top.label()))
-                .id_salt(("menu_layout_top", top))
-                .default_open(
-                    state
-                        .menu_expanded
-                        .get(&top)
-                        .copied()
-                        .unwrap_or(top_visible),
-                )
+                .id_salt(("menu_layout_top", top, state.right_panel_scroll_generation))
+                .default_open(open)
+                .open(Some(open))
                 .show(ui, |ui| {
                     egui::Grid::new(("menu_layout_commands", top))
                         .num_columns(4)
@@ -4956,11 +4957,11 @@ pub(super) fn page_menu_layout(ui: &mut egui::Ui, state: &mut PreferencesState) 
                             }
                         });
                 });
-            if let Some(collapse) = egui::collapsing_header::CollapsingState::load(
-                ui.ctx(),
-                response.header_response.id,
-            ) {
-                state.menu_expanded.insert(top, collapse.is_open());
+            state
+                .menu_expanded
+                .insert(top, open ^ response.header_response.clicked());
+            if response.header_response.clicked() {
+                ui.ctx().request_repaint();
             }
         }
 
@@ -4977,6 +4978,7 @@ pub(super) fn page_context_menu_layout(ui: &mut egui::Ui, state: &mut Preference
             &mut state.settings.context_menu_layout,
             &mut state.context_menu_preview_scenario,
             &mut state.context_menu_expanded,
+            state.right_panel_scroll_generation,
         );
     });
 }
@@ -4986,6 +4988,7 @@ pub(super) fn draw_context_menu_layout_settings(
     layout: &mut ContextMenuLayoutSettings,
     scenario: &mut ContextMenuPreviewScenario,
     expanded: &mut HashMap<ContextMenuParentId, bool>,
+    view_generation: u64,
 ) {
     const ITEM_PREVIEW_WIDTH: f32 = 18.0;
     const ITEM_COLUMN_MIN_WIDTH: f32 = 260.0;
@@ -5050,9 +5053,14 @@ pub(super) fn draw_context_menu_layout_settings(
     for &parent in ContextMenuParentId::ALL {
         let order = snapshot.resolved_order(parent);
         ui.add_space(6.0);
+        let open = expanded
+            .get(&parent)
+            .copied()
+            .unwrap_or(parent == ContextMenuParentId::Root);
         let response = egui::CollapsingHeader::new(parent.label())
-            .id_salt(("context_menu_layout_parent", parent))
-            .default_open(expanded.get(&parent).copied().unwrap_or(parent == ContextMenuParentId::Root))
+            .id_salt(("context_menu_layout_parent", parent, view_generation))
+            .default_open(open)
+            .open(Some(open))
             .show(ui, |ui| {
                 egui::Grid::new(("context_menu_layout_items", parent))
                     .num_columns(4)
@@ -5350,10 +5358,9 @@ pub(super) fn draw_context_menu_layout_settings(
                         }
                     });
             });
-        if let Some(collapse) =
-            egui::collapsing_header::CollapsingState::load(ui.ctx(), response.header_response.id)
-        {
-            expanded.insert(parent, collapse.is_open());
+        expanded.insert(parent, open ^ response.header_response.clicked());
+        if response.header_response.clicked() {
+            ui.ctx().request_repaint();
         }
     }
     ui.small(
@@ -10415,11 +10422,12 @@ mod context_menu_layout_settings_tests {
             ContextMenuLayoutSettings::default(),
             ContextMenuPreviewScenario::GridImageWithDynamicApps,
             false,
+            HashMap::new(),
         );
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(620.0, 420.0))
             .build_state(
-                |ctx, (layout, scenario, fonts_ready)| {
+                |ctx, (layout, scenario, fonts_ready, expanded)| {
                     if !*fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);
                         *fonts_ready = true;
@@ -10429,12 +10437,7 @@ mod context_menu_layout_settings_tests {
                     egui::CentralPanel::default().show(ctx, |ui| {
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            draw_context_menu_layout_settings(
-                                ui,
-                                layout,
-                                scenario,
-                                &mut HashMap::new(),
-                            );
+                            draw_context_menu_layout_settings(ui, layout, scenario, expanded, 0);
                         });
                     });
                 },

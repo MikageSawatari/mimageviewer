@@ -5708,6 +5708,7 @@ mod tests {
         let mut scenario =
             crate::context_menu_model::ContextMenuPreviewScenario::GridImageWithDynamicApps;
         let mut fonts_ready = false;
+        let mut expanded = HashMap::new();
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(620.0, 700.0))
             .build(move |ctx| {
@@ -5725,7 +5726,8 @@ mod tests {
                             ui,
                             &mut layout,
                             &mut scenario,
-                            &mut HashMap::new(),
+                            &mut expanded,
+                            0,
                         );
                     });
                 });
@@ -6509,6 +6511,103 @@ mod tests {
                 .external_tool_selected,
             Some(crate::external_tool::ExternalToolId(2))
         );
+    }
+
+    #[test]
+    fn preferences_view_real_headers_off_then_on_does_not_revive_egui_state() {
+        use crate::{context_menu_model::ContextMenuParentId, keymap::TopMenuId};
+        use egui_kittest::kittest::Queryable;
+
+        for (page, header, body) in [
+            (
+                PreferencesPage::MenuLayout,
+                format!("{} の項目", TopMenuId::File.label()),
+                crate::keymap::menu_command_spec(crate::keymap::MenuCommandId::FileOpenFolder)
+                    .unwrap()
+                    .label,
+            ),
+            (
+                PreferencesPage::ContextMenuLayout,
+                ContextMenuParentId::Root.label().to_owned(),
+                crate::context_menu_model::ContextMenuItemId::CutFiles.label(),
+            ),
+        ] {
+            let mut harness = preferences_view_harness(page);
+            assert!(
+                harness.query_by_label(body).is_some(),
+                "{page:?}: default open"
+            );
+            harness.get_by_label(&header).click();
+            harness.run();
+            assert!(
+                harness.query_by_label(body).is_none(),
+                "{page:?}: ON collapse"
+            );
+            harness.get_by_label("キャンセル").click();
+            harness.run();
+
+            harness
+                .state_mut()
+                .open_preferences_page(PreferencesPage::General);
+            harness.run();
+            harness
+                .get_by_label("環境設定を開き直したときに前回の位置を復元する")
+                .click();
+            harness.run();
+            harness.get_by_label("  OK  ").click();
+            harness.run();
+            assert!(!harness.state().settings.preferences_restore_position);
+            assert!(harness.state().preferences_view_position.in_page.is_none());
+
+            // Re-render the real header in the same egui Context, not just its map.
+            harness.state_mut().open_preferences_page(page);
+            harness.run();
+            assert!(
+                harness.query_by_label(body).is_some(),
+                "{page:?}: OFF default"
+            );
+            // OFF remains interactive, but this new collapse must also be discarded.
+            harness.get_by_label(&header).click();
+            harness.run();
+            assert!(
+                harness.query_by_label(body).is_none(),
+                "{page:?}: OFF collapse"
+            );
+            harness.get_by_label("キャンセル").click();
+            harness.run();
+            harness.state_mut().open_preferences_page(page);
+            harness.run();
+            assert!(
+                harness.query_by_label(body).is_some(),
+                "{page:?}: OFF reopen"
+            );
+
+            harness
+                .state_mut()
+                .open_preferences_page(PreferencesPage::General);
+            harness.run();
+            harness
+                .get_by_label("環境設定を開き直したときに前回の位置を復元する")
+                .click();
+            harness.run();
+            harness.get_by_label("  OK  ").click();
+            harness.run();
+            assert!(harness.state().settings.preferences_restore_position);
+            harness.state_mut().open_preferences_page(page);
+            harness.run();
+            assert!(
+                harness.query_by_label(body).is_some(),
+                "{page:?}: ON no revival"
+            );
+            harness.get_by_label("キャンセル").click();
+            harness.run();
+            harness.state_mut().show_preferences = true;
+            harness.run();
+            assert!(
+                harness.query_by_label(body).is_some(),
+                "{page:?}: fresh ON snapshot"
+            );
+        }
     }
 
     #[test]
