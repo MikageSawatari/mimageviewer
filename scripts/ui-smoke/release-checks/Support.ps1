@@ -135,6 +135,19 @@ function Get-ReleaseCheckWindowSample {
     return [pscustomobject]@{ unix_ms = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(); foreground_pid = $owner; foreground_hwnd = $h.ToInt64(); total = $counts[0]; visible = $counts[1] }
 }
 
+function Assert-ReleaseCheckBackgroundTransitionForeground {
+    param([int]$AppPid, [long]$RootHwnd, [int]$RunnerPid, [long]$BackgroundHwnd, [string]$Operation)
+    # A saved grant can survive a foreground change. Check the current exact
+    # PID/HWND pair at each side-effect boundary, without enumerating windows.
+    $foreground=[MivReleaseCheckNative]::GetForegroundWindow(); [uint32]$owner=0
+    $null=[MivReleaseCheckNative]::GetWindowThreadProcessId($foreground,[ref]$owner)
+    $hwnd=$foreground.ToInt64()
+    if (-not (($owner -eq $AppPid -and $hwnd -eq $RootHwnd) -or
+              ($owner -eq $RunnerPid -and $hwnd -eq $BackgroundHwnd))) {
+        throw "Foreground changed before background ${Operation}: expected root PID=$AppPid HWND=$RootHwnd or runner PID=$RunnerPid HWND=$BackgroundHwnd, observed PID=$owner HWND=$hwnd."
+    }
+}
+
 function Set-ReleaseCheckBackgroundForeground {
     param($Ready, [int]$AppPid, $Window, [int]$RunnerPid)
     # The foreground app grants ONLY this runner before publishing ready.json.
@@ -147,7 +160,9 @@ function Set-ReleaseCheckBackgroundForeground {
     $hwnd=$Window.Handle.ToInt64(); [uint32]$owner=0
     $null=[MivReleaseCheckNative]::GetWindowThreadProcessId([IntPtr]$hwnd,[ref]$owner)
     if ($hwnd -le 0 -or $hwnd -eq $Ready.root_hwnd -or $owner -ne $RunnerPid) { throw 'Background HWND is not owned by this runner.' }
+    Assert-ReleaseCheckBackgroundTransitionForeground $AppPid $Ready.root_hwnd $RunnerPid $hwnd 'Show'
     $Window.Show()
+    Assert-ReleaseCheckBackgroundTransitionForeground $AppPid $Ready.root_hwnd $RunnerPid $hwnd 'activation'
     if (-not [MivReleaseCheckNative]::SetForegroundWindow([IntPtr]$hwnd)) { throw 'Runner background foreground activation was refused.' }
     $sample=Get-ReleaseCheckWindowSample $AppPid
     Assert-ReleaseCheckWindowSamples @($sample) 'static-background' $AppPid $Ready.root_hwnd $hwnd $RunnerPid

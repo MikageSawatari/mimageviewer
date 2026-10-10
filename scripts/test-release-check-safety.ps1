@@ -80,8 +80,11 @@ public static class MivReleaseCheckNative {
  public static uint BackgroundOwner=202;
  public static bool ActivationSucceeds=true;
  public static int ActivationCalls=0;
- public static uint GetWindowThreadProcessId(System.IntPtr h,out uint p){p=BackgroundOwner;return 1;}
- public static bool SetForegroundWindow(System.IntPtr h){ActivationCalls++;return ActivationSucceeds;}
+ public static long ForegroundHwnd=888;
+ public static uint ForegroundOwner=101;
+ public static System.IntPtr GetForegroundWindow(){return new System.IntPtr(ForegroundHwnd);}
+ public static uint GetWindowThreadProcessId(System.IntPtr h,out uint p){p=h.ToInt64()==999?BackgroundOwner:(h.ToInt64()==ForegroundHwnd?ForegroundOwner:0);return 1;}
+ public static bool SetForegroundWindow(System.IntPtr h){ActivationCalls++;if(ActivationSucceeds){ForegroundHwnd=h.ToInt64();ForegroundOwner=BackgroundOwner;}return ActivationSucceeds;}
  public static string[] Arguments(string s) {var m=Regex.Matches(s,"\"([^\"]*)\"|([^ ]+)");var a=new string[m.Count];for(int i=0;i<a.Length;i++)a[i]=m[i].Groups[1].Success?m[i].Groups[1].Value:m[i].Groups[2].Value;return a;}
 }
 '@
@@ -110,11 +113,44 @@ Assert-Throws {Assert-ReleaseCheckWindowSamples @($sample) 'static-background' 1
 & {
     $ready=[pscustomobject]@{pid=101;root_hwnd=888;background_foreground_grant=[pscustomobject]@{granted=$true;app_pid=101;root_hwnd=888;runner_pid=202}}
     $window=[pscustomobject]@{Handle=[IntPtr]999}
-    $window|Add-Member -MemberType ScriptMethod -Name Show -Value {}
+    $script:backgroundShowCalls=0
+    $window|Add-Member -MemberType ScriptMethod -Name Show -Value {$script:backgroundShowCalls++}
     $script:backgroundSample=[pscustomobject]@{unix_ms=1700000000000;foreground_pid=202;foreground_hwnd=999;total=2;visible=1}
     function Get-ReleaseCheckWindowSample {param($AppPid) $script:backgroundSample}
     $proof=Set-ReleaseCheckBackgroundForeground $ready 101 $window 202
     Assert-True ($proof.foreground_pid -eq 202 -and $proof.foreground_hwnd -eq 999) 'Runner foreground preparation lost the native PID/HWND proof.'
+    Assert-True ($script:backgroundShowCalls -eq 1 -and [MivReleaseCheckNative]::ActivationCalls -eq 1) 'Exact-root transition did not show/activate once.'
+    # Already foreground in this exact runner window is also an allowed source.
+    $proof=Set-ReleaseCheckBackgroundForeground $ready 101 $window 202
+    Assert-True ($script:backgroundShowCalls -eq 2 -and [MivReleaseCheckNative]::ActivationCalls -eq 2) 'Exact runner foreground was refused.'
+    foreach($source in @(@{pid=303;hwnd=1000},@{pid=101;hwnd=889},@{pid=202;hwnd=1000},@{pid=303;hwnd=888},@{pid=0;hwnd=0})){
+        [MivReleaseCheckNative]::ForegroundOwner=$source.pid;[MivReleaseCheckNative]::ForegroundHwnd=$source.hwnd
+        [MivReleaseCheckNative]::ActivationCalls=0;$script:backgroundShowCalls=0
+        $refusal=Invoke-ReleaseCheckPreflight {Set-ReleaseCheckBackgroundForeground $ready 101 $window 202}
+        Assert-True ($refusal.exit_code -eq 2 -and $refusal.environment_error -like 'Foreground changed before background Show:*' -and $null -eq $refusal.value) 'Lost foreground was not SKIPPED/environment-not-met.'
+        Assert-True ($script:backgroundShowCalls -eq 0 -and [MivReleaseCheckNative]::ActivationCalls -eq 0) 'Foreign foreground still caused Show/activation.'
+    }
+    # Verify the actual suite catch records this refusal as SKIPPED/2.
+    $ast=Get-TestAst (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Run.ps1')
+    $suiteTry=@($ast.EndBlock.Statements | Where-Object {$_ -is [Management.Automation.Language.TryStatementAst]})[-1]
+    $catchBody=($suiteTry.CatchClauses[0].Body.Statements | ForEach-Object {$_.Extent.Text}) -join "`n"
+    $cases=New-Object 'Collections.Generic.List[object]'
+    [MivReleaseCheckNative]::ForegroundHwnd=1000;[MivReleaseCheckNative]::ForegroundOwner=303
+    try{Set-ReleaseCheckBackgroundForeground $ready 101 $window 202}
+    catch{& ([scriptblock]::Create($catchBody))}
+    Assert-True ($cases.Count -eq 1 -and $cases[0].verdict -eq 'SKIPPED' -and $cases[0].exit_code -eq 2 -and $cases[0].environment_errors[0] -like 'Foreground changed before background Show:*') 'Suite catch did not preserve foreground loss as SKIPPED/2.'
+    Assert-True ($script:backgroundShowCalls -eq 0 -and [MivReleaseCheckNative]::ActivationCalls -eq 0) 'Suite refusal caused foreground side effects.'
+    # A foreground loss caused during Show must stop the subsequent activation.
+    [MivReleaseCheckNative]::ForegroundHwnd=888;[MivReleaseCheckNative]::ForegroundOwner=101
+    $window|Add-Member -MemberType ScriptMethod -Name Show -Force -Value {
+        $script:backgroundShowCalls++
+        [MivReleaseCheckNative]::ForegroundHwnd=1000;[MivReleaseCheckNative]::ForegroundOwner=303
+    }
+    $refusal=Invoke-ReleaseCheckPreflight {Set-ReleaseCheckBackgroundForeground $ready 101 $window 202}
+    Assert-True ($refusal.exit_code -eq 2 -and $refusal.environment_error -like 'Foreground changed before background activation:*') 'Foreground loss after Show was not an environment refusal.'
+    Assert-True ($script:backgroundShowCalls -eq 1 -and [MivReleaseCheckNative]::ActivationCalls -eq 0) 'Activation stole foreground after Show lost the exact source.'
+    $window|Add-Member -MemberType ScriptMethod -Name Show -Force -Value {$script:backgroundShowCalls++}
+    [MivReleaseCheckNative]::ForegroundHwnd=888;[MivReleaseCheckNative]::ForegroundOwner=101
     [MivReleaseCheckNative]::ActivationCalls=0
     $ready.background_foreground_grant.runner_pid=203
     Assert-Throws {Set-ReleaseCheckBackgroundForeground $ready 101 $window 202} 'Mismatched grant receiver was accepted.'

@@ -549,6 +549,10 @@ foreground としていた。測定中に他アプリへ移った証跡はなく
 - runner はgrantのapp PID / root HWND / runner PID、実Form HWNDのownerを照合した後で
   Show / SetForegroundWindow を実行し、実foregroundのPID / HWNDがそのFormと一致した場合だけ
   samplerを起動する。背景準備のnative snapshotはbackground-ready.jsonへ保存する。
+  保存済みgrantは現在のforegroundの証明にはならないため、ShowとSetForegroundWindowの各直前に
+  現在のPID／HWNDを再取得し、exact rootまたは当該runner Formと一致する場合だけ操作する。
+  別PID、同PIDの別窓、foregroundなしは環境不成立として止める。Show前の不一致は両操作を行わず、
+  Show後に失われた場合もactivationを行わない。この再検証は測定開始前だけに限定する。
   OS拒否・別窓・別PIDなら引き続き環境不成立。ユーザー窓の操作、input queue接続、global grant、
   focus制限解除、測定中の再foreground化やretryは追加しない。
 - samplerのUTC窓は1791653975685–1791653990687、Stopwatchは15.0046447秒で正常だった。
