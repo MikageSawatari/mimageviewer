@@ -41,6 +41,13 @@ pub fn draw_fullscreen_fit_cycle_settings_snapshot_fixture(ui: &mut egui::Ui) {
 }
 
 #[doc(hidden)]
+pub fn draw_preferences_restore_position_snapshot_fixture(ui: &mut egui::Ui, enabled: bool) {
+    let mut settings = Settings::default();
+    settings.preferences_restore_position = enabled;
+    pages::draw_preferences_restore_position_setting(ui, &mut settings);
+}
+
+#[doc(hidden)]
 pub fn draw_grid_background_double_click_settings_snapshot_fixture(ui: &mut egui::Ui) {
     let mut settings = Settings::default();
     settings.grid_background_double_click_parent = true;
@@ -2230,6 +2237,9 @@ impl App {
             || self.settings.thumb_show_resume_meter != settings.thumb_show_resume_meter;
         let books_root_changed = self.settings.books_root_path() != settings.books_root_path();
         self.settings = settings;
+        if !self.settings.preferences_restore_position {
+            self.preferences_view_position = PreferencesViewPosition::default();
+        }
         #[cfg(windows)]
         self.publish_effetune_auto_setting();
         if old_raw_brightness != self.settings.raw_brightness {
@@ -2368,6 +2378,9 @@ impl App {
 
     fn ensure_preferences_state(&mut self) {
         if self.pref_state.is_none() {
+            if !self.settings.preferences_restore_position {
+                self.preferences_view_position = PreferencesViewPosition::default();
+            }
             let ai_runtime = self.ai_runtime_init.ready_runtime();
             let trt_worker_snapshot = self.ai_runtime_init.trt_worker_lifecycle().snapshot();
             let external_tool_target = crate::external_tool::LaunchTarget::from_grid_item(
@@ -3011,7 +3024,8 @@ impl App {
                 // ScrollArea clamps its output against the current content and viewport.
                 // Capture before any close path drops the draft; never associate a result
                 // list's offset with the page selected by a click inside that list.
-                if !rendered_results
+                if self.settings.preferences_restore_position
+                    && !rendered_results
                     && rendered_page == state.selected
                     && rendered_generation == state.right_panel_scroll_generation
                 {
@@ -6047,6 +6061,164 @@ mod tests {
             "expected {scroll_y}, got {:?}",
             harness.state().preferences_view_position,
         );
+    }
+
+    #[test]
+    fn preferences_position_setting_off_starts_at_top_on_every_close_path() {
+        use egui_kittest::kittest::Queryable;
+        let mut harness = preferences_position_harness();
+        harness
+            .state_mut()
+            .pref_state
+            .as_mut()
+            .unwrap()
+            .settings
+            .preferences_restore_position = false;
+        harness.get_by_label("  OK  ").click();
+        harness.run();
+        assert!(!harness.state().settings.preferences_restore_position);
+        assert_eq!(
+            harness.state().preferences_view_position.page,
+            PreferencesPage::General
+        );
+        assert_eq!(harness.state().preferences_view_position.scroll_y, 0.0);
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        let top_rect = harness.get_by_label("テーマ").rect();
+        for close in ["ok", "cancel", "window", "escape"] {
+            harness
+                .state_mut()
+                .open_preferences_page(PreferencesPage::Cache);
+            harness.run();
+            harness.get_by_label("確認せず変換する").scroll_to_me();
+            harness.run();
+            assert_eq!(
+                harness.state().pref_state.as_ref().unwrap().selected,
+                PreferencesPage::Cache
+            );
+            assert_eq!(harness.state().preferences_view_position.scroll_y, 0.0);
+            match close {
+                "ok" => harness.get_by_label("  OK  ").click(),
+                "cancel" => harness.get_by_label("キャンセル").click(),
+                "window" => harness.get_by_label("Close window").click(),
+                "escape" => harness.event(egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }),
+                _ => unreachable!(),
+            }
+            harness.run();
+            assert!(!harness.state().show_preferences);
+            harness.state_mut().show_preferences = true;
+            harness.run();
+            assert_preferences_position(&harness, PreferencesPage::General, 0.0);
+            assert_eq!(harness.get_by_label("テーマ").rect(), top_rect);
+        }
+    }
+
+    #[test]
+    fn preferences_position_checkbox_toggle_applies_on_ok_and_cancel_keeps_setting() {
+        use egui_kittest::kittest::Queryable;
+        let mut harness = preferences_position_harness();
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::General);
+        harness.run();
+        let label = "環境設定を開き直したときに前回の位置を復元する";
+        harness.get_by_label(label).click();
+        harness.run();
+        assert!(
+            !harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .preferences_restore_position
+        );
+        harness.get_by_label("キャンセル").click();
+        harness.run();
+        harness.get_by_label("破棄して閉じる").click();
+        harness.run();
+        assert!(harness.state().settings.preferences_restore_position);
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        harness.get_by_label(label).click();
+        harness.run();
+        harness.get_by_label("  OK  ").click();
+        harness.run();
+        assert!(!harness.state().settings.preferences_restore_position);
+        assert_eq!(harness.state().preferences_view_position.scroll_y, 0.0);
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        harness.get_by_label(label).click();
+        harness.run();
+        harness.get_by_label("  OK  ").click();
+        harness.run();
+        assert!(harness.state().settings.preferences_restore_position);
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        assert_preferences_position(&harness, PreferencesPage::General, 0.0);
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::Cache);
+        harness.run();
+        harness.get_by_label("確認せず変換する").scroll_to_me();
+        harness.run();
+        let position = harness.state().preferences_view_position;
+        assert!(position.scroll_y > 100.0);
+        harness.state_mut().request_close_preferences_dialog();
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        assert_preferences_position(&harness, position.page, position.scroll_y);
+    }
+
+    #[test]
+    fn preferences_position_setting_off_explicit_anchor_and_search_override() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.preferences_restore_position = false;
+        app.show_preferences = true;
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(1093.0, 614.0))
+            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+        harness.run();
+        assert_preferences_position(&harness, PreferencesPage::General, 0.0);
+        harness
+            .state_mut()
+            .open_preferences_request(PreferencesOpenRequest::EPUB_HANDLING);
+        harness.run_steps(1);
+        let state = harness.state().pref_state.as_ref().unwrap();
+        assert_eq!(state.selected, PreferencesPage::Cache);
+        assert_eq!(state.highlight.unwrap().0, "cache/epub-handling");
+        harness.state_mut().pref_state.as_mut().unwrap().highlight = None;
+        harness.run();
+        // The anchor really scrolls the page while OFF; memory remains cleared.
+        let anchor_y = harness.get_by_label("確認せず変換する").rect().top();
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::Cache);
+        harness.run();
+        assert!(harness.get_by_label("確認せず変換する").rect().top() > anchor_y + 100.0);
+        let state = harness.state_mut().pref_state.as_mut().unwrap();
+        state.search_query = "前回の位置".into();
+        state.showing_results = true;
+        harness.run();
+        harness.event(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run_steps(1);
+        let state = harness.state().pref_state.as_ref().unwrap();
+        assert_eq!(state.selected, PreferencesPage::General);
+        assert_eq!(state.highlight.unwrap().0, "general/restore-position");
+        assert_eq!(harness.state().preferences_view_position.scroll_y, 0.0);
     }
 
     #[test]

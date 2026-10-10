@@ -24,6 +24,17 @@ use crate::settings::{
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
 
+pub(super) fn draw_preferences_restore_position_setting(
+    ui: &mut egui::Ui,
+    settings: &mut Settings,
+) {
+    ui.checkbox(
+        &mut settings.preferences_restore_position,
+        "環境設定を開き直したときに前回の位置を復元する",
+    )
+    .on_hover_text("アプリを終了するまで、前回のページとスクロール位置を覚えます。");
+}
+
 pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
     if state.transfer_feedback.is_some() {
         super::transfer::render_transfer_feedback(ui, state.transfer_feedback.as_ref());
@@ -74,6 +85,10 @@ pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
             )
             .weak(),
         );
+    });
+    ui.add_space(12.0);
+    anchored(ui, state, "general/restore-position", |ui, state| {
+        draw_preferences_restore_position_setting(ui, &mut state.settings);
     });
     ui.add_space(12.0);
     ui.label(

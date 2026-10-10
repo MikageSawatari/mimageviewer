@@ -48,6 +48,7 @@ pub use ui_dialogs::preferences::draw_file_organize_destinations_settings_snapsh
 #[doc(hidden)]
 pub use ui_dialogs::preferences::draw_fullscreen_fit_cycle_settings_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_grid_background_double_click_settings_snapshot_fixture;
+pub use ui_dialogs::preferences::draw_preferences_restore_position_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_preferences_transfer_explanation_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_preferences_transfer_settings_snapshot_fixture;
 pub use ui_dialogs::settings_restore::draw_preferences_transfer_disabled_entry_snapshot_fixture;
