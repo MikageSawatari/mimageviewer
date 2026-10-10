@@ -7845,6 +7845,152 @@ use crate::canonical_image_loader::{
     resolve_canonical_source,
 };
 use crate::fs_animation::{AnimationPlayback, FsCacheEntry, FsLoadResult, StaticAnimationState};
+
+/// Context-local comparison owner for the two existing PDF request policies.
+/// Absolute demands are keyed by the existing page source identity, never by raster size.
+#[cfg(test)]
+thread_local! {
+    static PDF_RERENDER_REQUEST_PROBE: std::cell::RefCell<Option<Vec<(usize, u32)>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Intercepts only the worker dispatch boundary; normalization, cache lookup,
+/// demand ownership, cancellation and completion adoption stay on real paths.
+#[cfg(test)]
+pub(crate) struct PdfRerenderRequestProbe;
+
+#[cfg(test)]
+impl PdfRerenderRequestProbe {
+    pub(crate) fn start() -> Self {
+        PDF_RERENDER_REQUEST_PROBE.with(|probe| {
+            assert!(probe.borrow().is_none());
+            *probe.borrow_mut() = Some(Vec::new());
+        });
+        Self
+    }
+
+    pub(crate) fn take_requests(&self) -> Vec<(usize, u32)> {
+        PDF_RERENDER_REQUEST_PROBE
+            .with(|probe| std::mem::take(probe.borrow_mut().as_mut().unwrap()))
+    }
+
+    pub(crate) fn complete(
+        &self,
+        app: &mut App,
+        generation: u64,
+        idx: usize,
+        result: FsLoadResult,
+    ) -> bool {
+        app.enqueue_fs_upload_result_for_generation(
+            generation,
+            idx,
+            result,
+            0,
+            FsLoadPurpose::for_page(true),
+            None,
+        )
+    }
+}
+
+#[cfg(test)]
+impl Drop for PdfRerenderRequestProbe {
+    fn drop(&mut self) {
+        PDF_RERENDER_REQUEST_PROBE.with(|probe| *probe.borrow_mut() = None);
+    }
+}
+
+#[derive(Default, Debug)]
+pub(crate) enum PdfRerenderDemand {
+    #[default]
+    Idle,
+    Legacy {
+        idx: usize,
+        zoom: f32,
+    },
+    Absolute {
+        targets: std::collections::HashMap<usize, (String, u32)>,
+    },
+}
+
+impl PdfRerenderDemand {
+    pub(crate) fn reset(&mut self) {
+        *self = Self::Idle;
+    }
+
+    /// Source metadata invalidation retires absolute geometry demands. Legacy
+    /// zoom requests keep their existing remapped index/threshold lifetime.
+    pub(crate) fn invalidate_absolute_source_demands(&mut self) {
+        if matches!(self, Self::Absolute { .. }) {
+            self.reset();
+        }
+    }
+
+    pub(crate) fn note_legacy(&mut self, idx: usize, zoom: f32) -> bool {
+        if let Self::Legacy {
+            idx: previous_idx,
+            zoom: previous_zoom,
+        } = self
+        {
+            if *previous_idx == idx
+                && (zoom - *previous_zoom).abs() <= previous_zoom.max(1.0) * 0.02
+            {
+                return false;
+            }
+        }
+        *self = Self::Legacy { idx, zoom };
+        true
+    }
+
+    pub(crate) fn legacy_idx(&self) -> Option<usize> {
+        match self {
+            Self::Legacy { idx, .. } => Some(*idx),
+            _ => None,
+        }
+    }
+
+    fn forget_absolute_page(&mut self, idx: usize) {
+        if let Self::Absolute { targets } = self {
+            targets.remove(&idx);
+        }
+    }
+
+    fn note_absolute(&mut self, idx: usize, source: String, target: u32) -> bool {
+        if !matches!(self, Self::Absolute { .. }) {
+            *self = Self::Absolute {
+                targets: std::collections::HashMap::new(),
+            };
+        }
+        let Self::Absolute { targets } = self else {
+            unreachable!()
+        };
+        if targets
+            .get(&idx)
+            .is_some_and(|previous| previous.0 == source && previous.1 == target)
+        {
+            return false;
+        }
+        targets.insert(idx, (source, target));
+        true
+    }
+
+    pub(crate) fn remap_indices(&mut self, remap: &impl Fn(usize) -> Option<usize>) {
+        match self {
+            Self::Legacy { idx, .. } => {
+                if let Some(next) = remap(*idx) {
+                    *idx = next;
+                } else {
+                    self.reset();
+                }
+            }
+            Self::Absolute { targets } => {
+                *targets = std::mem::take(targets)
+                    .into_iter()
+                    .filter_map(|(idx, demand)| remap(idx).map(|next| (next, demand)))
+                    .collect();
+            }
+            Self::Idle => {}
+        }
+    }
+}
 use crate::fs_page_load_scheduler::{
     FsPageLoadContract, FsPageLoadPermit, FsPageLoadPriority, FsPageLoadScheduler, FsPageLoadTicket,
 };
@@ -9709,6 +9855,7 @@ pub(crate) struct RetainedFinalAiKey {
 
 #[derive(Clone)]
 pub(crate) struct FinalAiEntry {
+    pub(crate) source_size: [usize; 2],
     pub(crate) pixels: Arc<egui::ColorImage>,
     pub(crate) used_upscale: bool,
 }
@@ -9742,7 +9889,14 @@ pub(crate) enum RetainedPdfPageCacheKind {
     },
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PdfPageMetadataSnapshot {
+    pub(crate) layout_dims: (u32, u32),
+    pub(crate) content_type: crate::pdf_loader::PdfPageContentType,
+}
+
 pub(crate) struct RetainedPdfPageEntry {
+    pub(crate) metadata: Option<PdfPageMetadataSnapshot>,
     pub(crate) kind: RetainedPdfPageCacheKind,
     pub(crate) bytes: u64,
     pub(crate) last_used: u64,
@@ -10847,6 +11001,7 @@ impl<'a> IntoIterator for &'a FinalCompositeCache {
 }
 
 pub(crate) struct FinalCompositeEntry {
+    pub(crate) source_size: [usize; 2],
     pub(crate) pixels: Arc<egui::ColorImage>,
     pub(crate) texture: egui::TextureHandle,
     /// false は AI 完了待ち中の暫定プレビュー。AI 到着後の再合成中も表示用に保持し、
@@ -11109,6 +11264,8 @@ pub(crate) struct FsDisplayUnitHoldoverPage {
     pub(crate) trace_load_seq: u64,
     pub(crate) source_size: Option<egui::Vec2>,
     pub(crate) content_bbox: Option<egui::Rect>,
+    pub(crate) fit_input: crate::fullscreen_specified_scale::FullscreenFitInput,
+    pub(crate) fit_scale_limits: crate::displayed_image_transform::FullscreenFitScaleLimits,
 }
 
 impl FsDisplayUnitHoldoverPage {
@@ -11672,6 +11829,7 @@ pub(crate) struct ColorizeMonoSummary {
 }
 
 pub(crate) struct FinalEffectPending {
+    source_size: [usize; 2],
     cancel: Arc<AtomicBool>,
     rx: mpsc::Receiver<FinalCompositeResult>,
     items_generation: u64,
@@ -16557,8 +16715,8 @@ pub struct App {
     pub(crate) fs_zoom_exit_pending: bool,
     /// ズーム中 PDF 再レンダの重複要求抑止 (前回要求した (idx, zoom))。毎フレ要求すると
     /// in-flight をキャンセルし続けて永久に完了しないため (Codex P1)。
-    pub(crate) fs_zoom_pdf_rerender_idx: Option<usize>,
-    pub(crate) fs_zoom_pdf_rerender_zoom: f32,
+    pub(crate) fs_pdf_rerender_demand: PdfRerenderDemand,
+    pub(crate) fs_continuous_fit_reference: crate::ui_fullscreen::ContinuousSpecifiedFitReference,
     /// 通常フルスクリーンのパンドラッグ開始状態
     pub(crate) fs_pan_drag_start: Option<(egui::Pos2, egui::Vec2)>,
     /// 連結読みモードのスクロール量。現在ページ中心を 0 とし、正方向で次のユニットへ進む。
@@ -16816,9 +16974,6 @@ pub struct App {
     pub(crate) smart_folder_metadata_refresh_due: Option<std::time::Instant>,
 
     // ── PDF 非同期ロード ────────────────────────────────────────
-    /// PDF レンダリング完了時に content_type を受け取るチャネル
-    pub(crate) pdf_content_type_tx: mpsc::Sender<(usize, crate::pdf_loader::PdfPageContentType)>,
-    pub(crate) pdf_content_type_rx: mpsc::Receiver<(usize, crate::pdf_loader::PdfPageContentType)>,
     /// ページ列挙の非同期応答待ち: (pdf_path, password, handle)。
     ///
     /// `handle` を drop (新しい pending への置き換え含む) すると `PdfEnumerateHandle::Drop`
@@ -18587,7 +18742,6 @@ impl App {
             settings.vst3_enabled = false;
         }
         let (tx, rx) = mpsc::channel();
-        let (pdf_ct_tx, pdf_ct_rx) = mpsc::channel();
         #[cfg(windows)]
         let (activation_open_path_tx, activation_open_path_rx) = mpsc::channel();
         // 360 度パノラマビュー Phase 2a: NeedsUserConfirmation → SettleApproved の
@@ -19819,8 +19973,9 @@ impl App {
             fs_zoom_factor: 1.0,
             fs_zoom_z_was_down: false,
             fs_zoom_exit_pending: false,
-            fs_zoom_pdf_rerender_idx: None,
-            fs_zoom_pdf_rerender_zoom: 1.0,
+            fs_pdf_rerender_demand: PdfRerenderDemand::default(),
+            fs_continuous_fit_reference:
+                crate::ui_fullscreen::ContinuousSpecifiedFitReference::Legacy,
             fs_pan_drag_start: None,
             fs_vertical_scroll: 0.0,
             fs_seek_drag_active: false,
@@ -19865,8 +20020,6 @@ impl App {
             pdf_password_request: None,
             pdf_password_pending_save: None,
             pdf_current_password: None,
-            pdf_content_type_tx: pdf_ct_tx,
-            pdf_content_type_rx: pdf_ct_rx,
             pdf_enumerate_pending: None,
             zip_enumerate_pending: None,
             zip_nav: None,
@@ -41943,6 +42096,10 @@ impl App {
         // 差し替え経路 (Ctrl+G) では呼び出し元が明示的に clear する。
         self.clear_rotation_cache_for_reload();
         self.page_dims_cache.clear();
+        self.fs_pdf_rerender_demand
+            .invalidate_absolute_source_demands();
+        self.fs_continuous_fit_reference =
+            crate::ui_fullscreen::ContinuousSpecifiedFitReference::Legacy;
         self.rating_cache.clear();
         self.adjustment_cache.clear();
         self.thumb_pixels.clear();
@@ -50316,30 +50473,21 @@ impl App {
                 continue;
             }
             #[cfg(all(windows, feature = "test-script"))]
-            let cache_read = msg
-                .pixels()
-                .filter(|pixels| pixels.origin.from_cache())
-                .map(|_| (msg.items_gen, msg.input_seq));
+            let release_receipt = self.release_check_receipt(&msg);
             match self.requested.receive(msg) {
                 ThumbnailReceipt::Ignored => continue,
-                ThumbnailReceipt::Queued => {
+                ThumbnailReceipt::Queued =>
+                {
                     #[cfg(all(windows, feature = "test-script"))]
-                    if let Some((items_gen, input_seq)) = cache_read
-                        && let Some(item) = self.items.get(i)
-                    {
-                        crate::test_script::release_checks::trace(
-                            "cache_read",
-                            serde_json::json!({
-                                "key": item.perf_key(),
-                                "idx": i,
-                                "items_gen": items_gen,
-                                "input_seq": input_seq,
-                                "from_cache": true,
-                            }),
-                        );
+                    if let Some(("cache_read", proof)) = release_receipt {
+                        crate::test_script::release_checks::trace("cache_read", proof);
                     }
                 }
                 ThumbnailReceipt::Finalized { source_changed } => {
+                    #[cfg(all(windows, feature = "test-script"))]
+                    if let Some(("finalized", proof)) = release_receipt {
+                        crate::test_script::release_checks::trace("finalized", proof);
+                    }
                     if source_changed {
                         self.invalidate_color_representative(i);
                         self.fire_virtual_folder_writeback_if_ready(i);
@@ -62307,11 +62455,11 @@ impl App {
                 idx,
                 placement,
                 pixels_per_point,
-                texture_size,
+                &texture,
                 rotation,
                 zoom_pan,
                 free_rotation,
-            );
+            )?;
         let snapshot_rect = egui::Rect::from_min_size(
             egui::Pos2::ZERO,
             egui::vec2(placement.w.max(1.0), placement.h.max(1.0)),
@@ -62340,7 +62488,9 @@ impl App {
                     rotation,
                     free_rotation_rad: free_rotation,
                     content_bbox: image_content_bbox,
-                    fit_mode: crate::settings::FullscreenFitMode::Page,
+                    fit_mode: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
+                        crate::settings::FullscreenFitMode::Page,
+                    ),
                     fit_scale_limits:
                         crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
                     pixels_per_point,
@@ -72594,6 +72744,9 @@ impl App {
         };
 
         if pdf_page.is_some() {
+            // A fresh provisional load must reconcile the absolute display demand again.
+            self.fs_pdf_rerender_demand.forget_absolute_page(idx);
+            self.adopt_retained_pdf_page_metadata(idx);
             if self.has_retained_pdf_final_ai_for_current_params(idx) {
                 crate::logger::log(format!(
                     "[PDF] Retained page final-ai available idx={idx} reason=start_fs_load_skip_pdf_render"
@@ -72634,7 +72787,6 @@ impl App {
         let pdf_context_epoch = Self::fs_pdf_render_context_epoch(pdf_priority);
 
         let (tx, rx) = mpsc::channel::<FsLoadResult>();
-        let pdf_ct_tx = self.pdf_content_type_tx.clone();
         let perf_key = self.perf_item_key(idx);
         let perf_seq = self.input_seq;
         let ticket = self.fs_page_load_scheduler.request(
@@ -72821,7 +72973,7 @@ impl App {
                         image: img,
                         content_type,
                         page_count: _,
-                        page_size_points: _,
+                        page_size_points,
                     }) => {
                         if cancel.load(Ordering::Relaxed) {
                             emit_exit("pdf_cancel_after_render");
@@ -72854,13 +73006,12 @@ impl App {
                                 ],
                             );
                         }
-                        let _ = tx.send(FsLoadResult::Static {
+                        let _ = tx.send(FsLoadResult::StaticPdf {
                             ci,
                             source_dims,
-                            animation: StaticAnimationState::Still,
+                            page_size_points,
+                            content_type,
                         });
-                        // content_type をメインスレッドに送る
-                        let _ = pdf_ct_tx.send((idx, content_type));
                     }
                     Err(e) => {
                         let cancel_like = Self::fs_pdf_render_error_is_cancel_like(
@@ -73218,11 +73369,134 @@ impl App {
         })
     }
 
+    fn current_pdf_page_metadata_snapshot(&self, idx: usize) -> Option<PdfPageMetadataSnapshot> {
+        let Some(GridItem::PdfPage {
+            content_type: Some(content_type),
+            ..
+        }) = self.items.get(idx)
+        else {
+            return None;
+        };
+        let layout_dims = self
+            .page_dims_cache
+            .get_layout(self.items_generation, idx)
+            .or_else(|| match self.thumbnails.get(idx) {
+                Some(ThumbnailState::Loaded { layout_dims, .. }) => *layout_dims,
+                _ => None,
+            })?;
+        Some(PdfPageMetadataSnapshot {
+            layout_dims,
+            content_type: *content_type,
+        })
+    }
+
+    /// Restore metadata along the existing source-keyed retained-pixel path.
+    /// A sibling's page at the same index cannot supply this snapshot.
+    pub(crate) fn adopt_retained_pdf_page_metadata(&mut self, idx: usize) {
+        if self.current_pdf_page_metadata_snapshot(idx).is_some() {
+            return;
+        }
+        let Some(key) = self.retained_pdf_page_key_for(idx) else {
+            return;
+        };
+        let Some(metadata) = self
+            .retained_pdf_page_cache
+            .get(&key)
+            .and_then(|entry| entry.metadata)
+        else {
+            return;
+        };
+        if let Some(GridItem::PdfPage { content_type, .. }) = self.items.get_mut(idx) {
+            *content_type = Some(metadata.content_type);
+            self.record_page_layout_dims_for_spread(idx, metadata.layout_dims);
+        }
+    }
+
+    pub(crate) fn pdf_specified_basis_for_idx(
+        &self,
+        idx: usize,
+    ) -> Option<crate::fullscreen_specified_scale::FullscreenFitBasis> {
+        let Some(GridItem::PdfPage {
+            content_type: Some(content_type),
+            ..
+        }) = self.items.get(idx)
+        else {
+            return None;
+        };
+        let layout = self
+            .page_dims_cache
+            .get_layout(self.items_generation, idx)
+            .or_else(|| match self.thumbnails.get(idx) {
+                Some(ThumbnailState::Loaded { layout_dims, .. }) => *layout_dims,
+                _ => None,
+            })?;
+        crate::fullscreen_specified_scale::FullscreenFitBasis::from_pdf(
+            egui::vec2(layout.0 as f32, layout.1 as f32),
+            *content_type,
+        )
+    }
+
+    /// One display request per source and normalized target. Both pages of a
+    /// spread use this same owner; one unchanged partner never cancels its job.
+    pub(crate) fn request_pdf_absolute_demand(
+        &mut self,
+        idx: usize,
+        required_long_edge_px: f32,
+        original_floor: bool,
+    ) {
+        let Some(GridItem::PdfPage {
+            content_type: Some(content_type),
+            ..
+        }) = self.items.get(idx)
+        else {
+            return;
+        };
+        let content_type = *content_type;
+        let Some(source) = self.metadata_cache_key(idx) else {
+            return;
+        };
+        let target =
+            if let Some(native_long) = self.pdf_ai_native_render_long_edge(idx, content_type) {
+                crate::pdf_loader::zoom_render_long_edge(native_long, 1.0, Some(native_long))
+            } else {
+                crate::pdf_loader::absolute_display_render_long_edge(
+                    required_long_edge_px,
+                    original_floor,
+                    content_type,
+                )
+            };
+        if self
+            .fs_pdf_rerender_demand
+            .note_absolute(idx, source, target)
+        {
+            self.request_pdf_rerender_at_target(idx, target, true);
+        }
+    }
+
+    fn pdf_ai_native_render_long_edge(
+        &self,
+        idx: usize,
+        content_type: crate::pdf_loader::PdfPageContentType,
+    ) -> Option<u32> {
+        let crate::pdf_loader::PdfPageContentType::Raster { w, h } = content_type else {
+            return None;
+        };
+        let params = self.effective_params(idx);
+        let ai_needs_native = (self.effective_upscale_request(params).is_some()
+            && crate::ai::upscale::should_process_rect(w, h, self.settings.ai_upscale_limit()))
+            || (self.effective_denoise_request(params).is_some()
+                && crate::ai::upscale::should_process_rect(w, h, self.settings.ai_denoise_limit()));
+        ai_needs_native.then_some(w.max(h))
+    }
+
     pub(crate) fn ensure_pdf_display_resolution(
         &mut self,
         idx: usize,
         content_bbox: Option<egui::Rect>,
     ) {
+        if self.settings.fullscreen_fit_mode == crate::settings::FullscreenFitMode::SpecifiedScale {
+            return;
+        }
         let content_type = match self.items.get(idx) {
             Some(GridItem::PdfPage { content_type, .. }) => *content_type,
             _ => return,
@@ -73342,6 +73616,19 @@ impl App {
             pending.cancel();
         }
 
+        #[cfg(test)]
+        if PDF_RERENDER_REQUEST_PROBE.with(|probe| {
+            let mut probe = probe.borrow_mut();
+            if let Some(requests) = probe.as_mut() {
+                requests.push((idx, target_px));
+                true
+            } else {
+                false
+            }
+        }) {
+            return;
+        }
+
         let (fs_tx, fs_rx) = mpsc::channel::<FsLoadResult>();
         let perf_seq = self.input_seq;
         let perf_key = self.perf_item_key(idx);
@@ -73392,9 +73679,9 @@ impl App {
             ) {
                 Ok(crate::pdf_loader::RenderResult {
                     image: img,
-                    content_type: _content_type,
+                    content_type,
                     page_count: _,
-                    page_size_points: _,
+                    page_size_points,
                 }) => {
                     if cancel.load(Ordering::Relaxed) {
                         return;
@@ -73411,10 +73698,11 @@ impl App {
                     let source_dims = [img.width() as usize, img.height() as usize];
                     let img = clamp_dynamic_for_gpu(img);
                     let ci = dynamic_image_to_color_image(&img);
-                    let _ = fs_tx.send(FsLoadResult::Static {
+                    let _ = fs_tx.send(FsLoadResult::StaticPdf {
                         ci,
                         source_dims,
-                        animation: StaticAnimationState::Still,
+                        page_size_points,
+                        content_type,
                     });
                 }
                 Err(e) => {
@@ -75515,7 +75803,15 @@ impl App {
                     post_filter: params.post_filter,
                 }
             };
-            if self.spawn_final_effect_job(ctx, final_key, source, plan, true, true) {
+            if self.spawn_final_effect_job(
+                ctx,
+                final_key,
+                source,
+                edit_pixels.size,
+                plan,
+                true,
+                true,
+            ) {
                 // 背景 CPU / GPU と完成時 upload を一度に積み上げない。
                 return;
             }
@@ -78629,6 +78925,32 @@ impl App {
         }
     }
 
+    /// Exact canvas dimensions immediately before AI, retained with the existing
+    /// entries. Source coordinates and enlarged output textures are not this basis.
+    pub(crate) fn pre_ai_display_size_for_idx(&self, idx: usize) -> Option<egui::Vec2> {
+        let edit_key = self.current_edit_result_key(idx);
+        if let Some(entry) = self.edit_result_cache.get(&edit_key) {
+            return Some(egui::vec2(
+                entry.pixels.size[0] as f32,
+                entry.pixels.size[1] as f32,
+            ));
+        }
+        let params = self.effective_params(idx);
+        if let Some((_, entry)) = self.final_ai_cache.iter().find(|(key, entry)| {
+            key.edit_key == edit_key
+                && self.final_ai_key_for_pixels(edit_key, entry.source_size, params) == Some(**key)
+        }) {
+            return Some(egui::vec2(
+                entry.source_size[0] as f32,
+                entry.source_size[1] as f32,
+            ));
+        }
+        self.final_composite_cache.iter().find_map(|(key, entry)| {
+            (*key == self.final_composite_key_for_pixels(edit_key, entry.source_size, params))
+                .then(|| egui::vec2(entry.source_size[0] as f32, entry.source_size[1] as f32))
+        })
+    }
+
     /// 表示パイプライン用: 編集結果ピクセル + 表示テクスチャを確保する。先読みで
     /// CPU 専用キャッシュ済み (`texture == None`) なら、ここで lazy に GPU アップロードする。
     pub(crate) fn ensure_edit_result_pixels(
@@ -78997,11 +79319,13 @@ impl App {
                 RetainedPdfPageCacheKind::FinalAi { .. } => "final_ai",
             })
             .unwrap_or("none");
+        let metadata = self.current_pdf_page_metadata_snapshot(idx);
         let replaced = self
             .retained_pdf_page_cache
             .insert(
                 key,
                 RetainedPdfPageEntry {
+                    metadata,
                     kind: RetainedPdfPageCacheKind::Raster {
                         pixels,
                         source_dims,
@@ -79041,6 +79365,7 @@ impl App {
         swap_page_axes: bool,
         reason: &str,
     ) -> Option<(Arc<egui::ColorImage>, [usize; 2])> {
+        self.adopt_retained_pdf_page_metadata(idx);
         let dimensions = self
             .retained_pdf_page_key_for(idx)
             .and_then(|key| self.retained_pdf_page_cache.get(&key))
@@ -79209,6 +79534,7 @@ impl App {
         Some((
             final_key,
             FinalAiEntry {
+                source_size: edit_size,
                 pixels,
                 used_upscale,
             },
@@ -79285,6 +79611,7 @@ impl App {
             self.retained_pdf_page_cache_bytes(),
         ));
         Some(FinalAiEntry {
+            source_size: edit_size,
             pixels,
             used_upscale,
         })
@@ -79353,11 +79680,24 @@ impl App {
             .unwrap_or("none");
         let key_log = key.clone();
         let output_size = pixels.size;
+        // Orphan AI jobs retain the metadata already filed under their computed
+        // source key; they never borrow metadata from the current index's new page.
+        let metadata = if self.retained_pdf_page_key_for(idx).as_ref() == Some(&key) {
+            self.current_pdf_page_metadata_snapshot(idx)
+        } else {
+            None
+        }
+        .or_else(|| {
+            self.retained_pdf_page_cache
+                .get(&key)
+                .and_then(|entry| entry.metadata)
+        });
         let replaced = self
             .retained_pdf_page_cache
             .insert(
                 key,
                 RetainedPdfPageEntry {
+                    metadata,
                     kind: RetainedPdfPageCacheKind::FinalAi {
                         pixels,
                         used_upscale,
@@ -80153,6 +80493,7 @@ impl App {
         ));
         self.cancel_final_ai_pending_for_retained_key(&retained_key, "retained_hit");
         Some(FinalAiEntry {
+            source_size: edit_size,
             pixels,
             used_upscale,
         })
@@ -80707,6 +81048,7 @@ impl App {
                     self.final_composite_cache.insert(
                         key,
                         FinalCompositeEntry {
+                            source_size: pending.source_size,
                             pixels,
                             texture: texture.clone(),
                             complete: pending.output_complete,
@@ -80796,6 +81138,7 @@ impl App {
         key: FinalCompositeKey,
         params: &crate::adjustment::AdjustParams,
         source: Arc<egui::ColorImage>,
+        source_size: [usize; 2],
         output_complete: bool,
     ) -> Option<egui::TextureHandle> {
         let reuse_prefetch = self
@@ -80853,7 +81196,15 @@ impl App {
                 .flatten(),
             post_filter: params.post_filter,
         };
-        let _ = self.spawn_final_effect_job(ctx, key, source, plan, output_complete, false);
+        let _ = self.spawn_final_effect_job(
+            ctx,
+            key,
+            source,
+            source_size,
+            plan,
+            output_complete,
+            false,
+        );
         existing_texture
     }
 
@@ -80890,6 +81241,7 @@ impl App {
         ctx: &egui::Context,
         key: FinalCompositeKey,
         source: Arc<egui::ColorImage>,
+        source_size: [usize; 2],
         plan: FinalCompositePlan,
         output_complete: bool,
         prefetch: bool,
@@ -80943,6 +81295,7 @@ impl App {
                 self.final_effect_pending.insert(
                     key,
                     FinalEffectPending {
+                        source_size,
                         cancel,
                         rx,
                         items_generation: self.items_generation,
@@ -80995,7 +81348,7 @@ impl App {
         final_key: FinalCompositeKey,
         params: &crate::adjustment::AdjustParams,
         base_pixels: Arc<egui::ColorImage>,
-        _edit_size: [usize; 2],
+        edit_size: [usize; 2],
         complete: bool,
         base_used_upscale: bool,
         reason: &str,
@@ -81016,7 +81369,8 @@ impl App {
 
         let creative_lut_active = self.creative_lut_requires_final_effect(params);
         if !self.post_filter_bypassed && (params.colorize.is_enabled() || creative_lut_active) {
-            return self.start_final_effect_worker(ctx, final_key, params, sharpened, complete);
+            return self
+                .start_final_effect_worker(ctx, final_key, params, sharpened, edit_size, complete);
         }
 
         let t_post0 = perf_on.then(std::time::Instant::now);
@@ -81047,6 +81401,7 @@ impl App {
         self.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                source_size: edit_size,
                 pixels: post_filtered,
                 texture: texture.clone(),
                 complete,
@@ -81252,7 +81607,14 @@ impl App {
 
         let creative_lut_active = self.creative_lut_requires_final_effect(&params);
         if !self.post_filter_bypassed && (params.colorize.is_enabled() || creative_lut_active) {
-            return self.start_final_effect_worker(ctx, final_key, &params, sharpened, complete);
+            return self.start_final_effect_worker(
+                ctx,
+                final_key,
+                &params,
+                sharpened,
+                edit_pixels.size,
+                complete,
+            );
         }
 
         let t_post0 = perf_on.then(std::time::Instant::now);
@@ -81300,6 +81662,7 @@ impl App {
         self.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
+                source_size: edit_pixels.size,
                 pixels: post_filtered,
                 texture: texture.clone(),
                 complete,
@@ -82172,6 +82535,7 @@ impl App {
                 } => {
                     let pixels = Arc::new(image);
                     let entry = FinalAiEntry {
+                        source_size,
                         pixels: Arc::clone(&pixels),
                         used_upscale,
                     };
@@ -83901,7 +84265,7 @@ impl App {
     /// Project the existing favorite transition without changing the still-visible source.
     /// Include its live, not-yet-debounced state: the real transition captures that state first.
     fn favorite_view_state_for_path(&self, path: &Path) -> crate::settings::FavoriteViewState {
-        let current = crate::settings::FavoriteViewState::from_settings(&self.settings);
+        let mut current = crate::settings::FavoriteViewState::from_settings(&self.settings);
         let common = self
             .settings
             .favorite_view_overlay
@@ -83916,13 +84280,15 @@ impl App {
             && Some(owner) != self.favorite_view_context.location_favorite_id
             && !self.favorite_view_states.contains_key(&owner)
         {
+            current.fullscreen_specified_scale =
+                Some(self.settings.common_fullscreen_specified_scale());
             return current;
         }
         let stored_id =
             active_favorite_default_id_for_path(path, &self.settings.favorites, None, |id| {
                 self.favorite_view_states.contains_key(&id) || active_id == Some(id)
             });
-        match stored_id {
+        let mut projected = match stored_id {
             Some(id) if Some(id) == active_id => current,
             Some(id) => self
                 .favorite_view_states
@@ -83930,7 +84296,74 @@ impl App {
                 .cloned()
                 .unwrap_or(common),
             None => common,
+        };
+        if projected.fullscreen_specified_scale.is_none() {
+            projected.fullscreen_specified_scale =
+                Some(self.settings.common_fullscreen_specified_scale());
         }
+        projected
+    }
+
+    /// Saving a live overlay must retain the wire's inheritance marker.
+    /// Resolving a missing value against common settings is not an edit.
+    pub(crate) fn favorite_view_state_for_capture(&self) -> crate::settings::FavoriteViewState {
+        let mut state = crate::settings::FavoriteViewState::from_settings(&self.settings);
+        if let Some(id) = self.settings.active_favorite_view_id() {
+            state.fullscreen_specified_scale = self
+                .favorite_view_states
+                .get(&id)
+                .and_then(|stored| stored.fullscreen_specified_scale);
+        }
+        state
+    }
+
+    /// Explicit current-view edits are the only operation which materializes a
+    /// favorite's dedicated size, including an explicit pair of unspecified axes.
+    pub(crate) fn set_current_fullscreen_specified_scale(
+        &mut self,
+        value: crate::settings::FullscreenSpecifiedScale,
+    ) -> bool {
+        if !value.is_valid() {
+            return false;
+        }
+        let changed = self.settings.fullscreen_specified_scale != value;
+        let favorite = self
+            .settings
+            .remember_favorite_view_state
+            .then(|| self.settings.active_favorite_view_id())
+            .flatten();
+        self.settings.fullscreen_specified_scale = value;
+        if let Some(id) = favorite {
+            let mut state = crate::settings::FavoriteViewState::from_settings(&self.settings);
+            state.fullscreen_specified_scale = Some(value);
+            if self.favorite_view_states.get(&id) != Some(&state) {
+                self.favorite_view_states.insert(id, state.clone());
+                self.favorite_view_writes
+                    .note_at(id, state, std::time::Instant::now());
+            }
+        } else {
+            // Disabling favorite memory is reconciled by the existing overlay
+            // owner. An explicit common edit before that reconciliation still
+            // updates its common projection. Live widgets remain memory-only;
+            // the existing common-settings boundaries (including tray/exit
+            // persist_window_state_and_flush) serialize it with Settings::save.
+            self.settings.set_common_fullscreen_specified_scale(value);
+        }
+        changed
+    }
+
+    /// Memory-only HUD edits. Common settings save at the existing tray/exit or
+    /// preferences commit boundary; this field never enters favorite view state.
+    pub(crate) fn set_fullscreen_specified_scale_max_tenths(&mut self, value: u32) -> bool {
+        if !(crate::settings::FULLSCREEN_SPECIFIED_SCALE_MAX_MIN_TENTHS
+            ..=crate::settings::FULLSCREEN_SPECIFIED_SCALE_MAX_MAX_TENTHS)
+            .contains(&value)
+        {
+            return false;
+        }
+        let changed = self.settings.fullscreen_specified_scale_max_tenths != value;
+        self.settings.fullscreen_specified_scale_max_tenths = value;
+        changed
     }
 
     fn rating_view_destination_display_order(&self) -> crate::settings::GridDisplayOrder {
@@ -83947,7 +84380,7 @@ impl App {
         let Some(id) = self.settings.active_favorite_view_id() else {
             return;
         };
-        let state = crate::settings::FavoriteViewState::from_settings(&self.settings);
+        let state = self.favorite_view_state_for_capture();
         if self.favorite_view_states.get(&id) == Some(&state) {
             return;
         }
@@ -83978,8 +84411,11 @@ impl App {
         }
 
         self.capture_active_favorite_view_change_at(now);
-        let inherited = inherited_override
+        let mut inherited = inherited_override
             .unwrap_or_else(|| crate::settings::FavoriteViewState::from_settings(&self.settings));
+        // Existing eight fields inherit their effective values, while this new
+        // field keeps following common settings until an explicit live edit.
+        inherited.fullscreen_specified_scale = None;
         self.settings.clear_favorite_view_overlay();
 
         let owner = path.and_then(|path| self.favorite_view_owner_for_path(path));
@@ -87240,16 +87676,6 @@ impl App {
             origin,
             std::time::Instant::now,
         );
-        // PDF ページの content_type を更新 (render 完了時にワーカーから受信)。
-        // native 解像度判明後の AI 用 native 再レンダは、AI 設定変更も合わせて拾うため
-        // `App::update` の `maybe_native_rerender_pdf_for_ai` (sync_upscale_from_preset 直後)
-        // で毎フレーム reconcile する (GitHub issue #1)。ここでは content_type を保存するだけ。
-        while let Ok((idx, ct)) = self.pdf_content_type_rx.try_recv() {
-            if let Some(GridItem::PdfPage { content_type, .. }) = self.items.get_mut(idx) {
-                *content_type = Some(ct);
-            }
-        }
-
         // 完了 / 切断ループは同じ表示 snapshot と共有述語を使う。相方解決を要素ごとに繰り返さない。
         let displayed_page = self.fullscreen_idx.map(|current| {
             let partner = self.displayed_spread_partner(current);
@@ -87554,12 +87980,39 @@ impl App {
             if matches!(
                 &result,
                 FsLoadResult::Static { .. }
+                    | FsLoadResult::StaticPdf { .. }
                     | FsLoadResult::StaticCached { .. }
                     | FsLoadResult::StaticPanorama { .. }
             ) {
                 self.capture_final_effect_source_reload_holdover(key);
             }
             mark_poll_prefetch_perf(&mut prefetch_perf, PollPrefetchPerfStage::UploadBacklog);
+            // Metadata follows the raster's existing context/generation validation.
+            let result = match result {
+                FsLoadResult::StaticPdf {
+                    ci,
+                    source_dims,
+                    page_size_points,
+                    content_type,
+                } => {
+                    if let Some(GridItem::PdfPage {
+                        content_type: stored,
+                        ..
+                    }) = self.items.get_mut(key)
+                    {
+                        *stored = Some(content_type);
+                        if let Some(layout_dims) = page_size_points.catalog_layout_dims() {
+                            self.record_page_layout_dims_for_spread(key, layout_dims);
+                        }
+                    }
+                    FsLoadResult::Static {
+                        ci,
+                        source_dims,
+                        animation: StaticAnimationState::Still,
+                    }
+                }
+                other => other,
+            };
             let entry = match result {
                 FsLoadResult::Static {
                     ci,
@@ -87717,7 +88170,8 @@ impl App {
                     }
                 }
                 FsLoadResult::Failed => FsCacheEntry::Failed,
-                FsLoadResult::Raw { .. }
+                FsLoadResult::StaticPdf { .. }
+                | FsLoadResult::Raw { .. }
                 | FsLoadResult::RawSourceFailed { .. }
                 | FsLoadResult::DimsOnly { .. }
                 | FsLoadResult::AnimationExpansionStarted { .. } => {
@@ -96060,5 +96514,331 @@ mod rated_at_details_sort_tests {
             crate::settings::DetailsSortKey::Toolbar
         );
         assert!(app.settings.details_sort_ascending);
+    }
+}
+
+#[cfg(test)]
+mod specified_scale_contract_tests {
+    use super::*;
+    use crate::settings::{
+        FavoriteEntry, FavoriteViewState, FullscreenSpecifiedScale, SpecifiedScaleAxis,
+    };
+
+    #[test]
+    fn specified_pdf_idx_invalidation_retires_absolute_but_preserves_legacy_remap_threshold() {
+        let mut app = setup_app_for_test();
+        assert!(app.fs_pdf_rerender_demand.note_legacy(3, 1.5));
+        app.fs_pdf_rerender_demand
+            .remap_indices(&|idx| (idx == 3).then_some(1));
+        app.invalidate_idx_state_and_queues();
+        assert_eq!(app.fs_pdf_rerender_demand.legacy_idx(), Some(1));
+        assert!(!app.fs_pdf_rerender_demand.note_legacy(1, 1.51));
+        assert!(
+            app.fs_pdf_rerender_demand
+                .note_absolute(1, "same/source".into(), 5407)
+        );
+        app.invalidate_idx_state_and_queues();
+        assert!(matches!(
+            app.fs_pdf_rerender_demand,
+            PdfRerenderDemand::Idle
+        ));
+        assert!(
+            app.fs_pdf_rerender_demand
+                .note_absolute(1, "same/source".into(), 5407)
+        );
+    }
+
+    #[test]
+    fn specified_pdf_request_owner_preserves_legacy_threshold_and_per_page_absolute_targets() {
+        let mut demand = PdfRerenderDemand::default();
+        assert!(demand.note_legacy(0, 1.0));
+        assert!(!demand.note_legacy(0, 1.01));
+        assert!(demand.note_legacy(0, 1.03));
+        assert!(demand.note_absolute(0, "book/page0".into(), 5407));
+        assert!(demand.note_absolute(1, "book/page1".into(), 720));
+        assert!(!demand.note_absolute(0, "book/page0".into(), 5407));
+        assert!(!demand.note_absolute(1, "book/page1".into(), 720));
+        assert!(demand.note_absolute(0, "replacement/page0".into(), 5407));
+        demand.forget_absolute_page(0);
+        assert!(demand.note_absolute(0, "replacement/page0".into(), 5407));
+        assert!(!demand.note_absolute(1, "book/page1".into(), 720));
+        demand.reset();
+        assert!(demand.note_absolute(1, "book/page1".into(), 720));
+    }
+
+    #[test]
+    fn specified_favorite_missing_marker_survives_idle_leave_exit_and_other_field_write() {
+        let mut app = setup_app_for_test();
+        let outside = app.tmp.path().to_path_buf();
+        let favorite = FavoriteEntry::new("inherited".into(), outside.join("favorite"));
+        app.settings.remember_favorite_view_state = true;
+        app.settings.favorites.push(favorite.clone());
+        let mut state = FavoriteViewState::from_settings(&app.settings);
+        state.fullscreen_specified_scale = None;
+        app.adjustment_db
+            .as_ref()
+            .unwrap()
+            .set_favorite_view_state(favorite.id, &state)
+            .unwrap();
+        app.favorite_view_states = app
+            .adjustment_db
+            .as_ref()
+            .unwrap()
+            .load_all_favorite_view_states();
+        assert_eq!(app.favorite_view_states[&favorite.id], state);
+        app.current_folder = Some(favorite.path.clone());
+        app.transition_favorite_view_for_path(Some(&favorite.path));
+        let now = std::time::Instant::now();
+        for frame in 0..5 {
+            let frame_now = now + std::time::Duration::from_millis(frame * 250);
+            app.reconcile_favorite_view_for_current_context_at(frame_now);
+            assert_eq!(app.favorite_view_states[&favorite.id], state);
+            assert!(app.favorite_view_writes.next_due_in_at(frame_now).is_none());
+            assert!(app.favorite_view_store_writer.is_none());
+        }
+        app.flush_favorite_view_writes_for_exit();
+        assert!(app.favorite_view_store_writer.is_none());
+        app.transition_favorite_view_for_path(Some(&outside));
+        assert!(app.favorite_view_writes.next_due_in_at(now).is_none());
+        let updated_common = FullscreenSpecifiedScale {
+            width: crate::settings::SpecifiedScaleAxisSetting::disabled(
+                crate::settings::SpecifiedScaleAxis::PercentTenths(800),
+            ),
+            height: crate::settings::SpecifiedScaleAxisSetting::enabled(
+                SpecifiedScaleAxis::LogicalPixels(900),
+            ),
+        };
+        app.settings.fullscreen_specified_scale = updated_common;
+        app.current_folder = Some(favorite.path.clone());
+        app.transition_favorite_view_for_path(Some(&favorite.path));
+        assert_eq!(app.settings.fullscreen_specified_scale, updated_common);
+        app.settings.grid_cols += 1;
+        app.reconcile_favorite_view_for_current_context_at(now);
+        assert!(
+            app.favorite_view_states[&favorite.id]
+                .fullscreen_specified_scale
+                .is_none()
+        );
+        app.flush_favorite_view_writes_for_exit();
+        drop(app.favorite_view_store_writer.take()); // Drain the real serial store worker.
+        let loaded = app
+            .adjustment_db
+            .as_ref()
+            .unwrap()
+            .load_all_favorite_view_states();
+        assert!(loaded[&favorite.id].fullscreen_specified_scale.is_none());
+        let mut reloaded = loaded[&favorite.id].clone();
+        reloaded.fullscreen_specified_scale = None;
+        app.favorite_view_states.insert(favorite.id, reloaded);
+        app.transition_favorite_view_for_path(Some(&outside));
+        app.settings.fullscreen_specified_scale = FullscreenSpecifiedScale::default();
+        app.transition_favorite_view_for_path(Some(&favorite.path));
+        assert_eq!(
+            app.settings.fullscreen_specified_scale,
+            FullscreenSpecifiedScale::default()
+        );
+        let explicit = FullscreenSpecifiedScale {
+            width: crate::settings::SpecifiedScaleAxisSetting::disabled(
+                crate::settings::SpecifiedScaleAxis::PercentTenths(800),
+            ),
+            height: crate::settings::SpecifiedScaleAxisSetting::disabled(
+                crate::settings::SpecifiedScaleAxis::PercentTenths(800),
+            ),
+        };
+        app.set_current_fullscreen_specified_scale(explicit);
+        assert_eq!(
+            app.favorite_view_states[&favorite.id].fullscreen_specified_scale,
+            Some(explicit)
+        );
+        app.flush_favorite_view_writes_for_exit();
+        drop(app.favorite_view_store_writer.take());
+        assert_eq!(
+            app.adjustment_db
+                .as_ref()
+                .unwrap()
+                .load_all_favorite_view_states()[&favorite.id]
+                .fullscreen_specified_scale,
+            Some(explicit)
+        );
+    }
+
+    #[test]
+    fn specified_common_edit_after_memory_disabled_survives_overlay_reconcile() {
+        let mut app = setup_app_for_test();
+        let id = uuid::Uuid::new_v4();
+        let mut state = FavoriteViewState::from_settings(&app.settings);
+        state.fullscreen_specified_scale = Some(FullscreenSpecifiedScale {
+            width: crate::settings::SpecifiedScaleAxisSetting::disabled(
+                crate::settings::SpecifiedScaleAxis::PercentTenths(800),
+            ),
+            height: crate::settings::SpecifiedScaleAxisSetting::enabled(
+                SpecifiedScaleAxis::LogicalPixels(240),
+            ),
+        });
+        app.settings.remember_favorite_view_state = true;
+        app.favorite_view_states.insert(id, state.clone());
+        app.settings.apply_favorite_view_overlay(id, &state);
+        app.settings.remember_favorite_view_state = false;
+        let value = FullscreenSpecifiedScale {
+            width: crate::settings::SpecifiedScaleAxisSetting::enabled(
+                SpecifiedScaleAxis::LogicalPixels(400),
+            ),
+            height: crate::settings::SpecifiedScaleAxisSetting::disabled(
+                crate::settings::SpecifiedScaleAxis::PercentTenths(800),
+            ),
+        };
+        assert!(app.set_current_fullscreen_specified_scale(value));
+        assert_eq!(app.settings.common_fullscreen_specified_scale(), value);
+        assert_eq!(app.favorite_view_states[&id], state);
+        app.reconcile_favorite_view_for_current_context_at(std::time::Instant::now());
+        assert!(app.settings.active_favorite_view_id().is_none());
+        assert_eq!(app.settings.fullscreen_specified_scale, value);
+        assert!(
+            app.favorite_view_writes
+                .next_due_in_at(std::time::Instant::now())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn specified_pdf_retained_final_reopen_restores_metadata_without_thumbnail_or_raster() {
+        let mut app = setup_app_for_test();
+        let original_path = app.tmp.path().join("retained.pdf");
+        let replacement_path = app.tmp.path().join("replacement.pdf");
+        app.settings.ai_feature_mode = crate::settings::AiFeatureMode::HighQuality;
+        app.settings.global_preset.upscale_model = Some(
+            crate::ai::ModelKind::UpscaleRealEsrGeneralV3
+                .as_str()
+                .into(),
+        );
+        app.items.push(GridItem::PdfPage {
+            pdf_path: original_path.clone(),
+            page_num: 0,
+            content_type: Some(crate::pdf_loader::PdfPageContentType::Vector),
+        });
+        let generation = app.items_generation;
+        app.page_dims_cache
+            .record_layout(generation, 0, (612_000, 792_000));
+        let basis = app.pdf_specified_basis_for_idx(0).unwrap();
+        let params = app.effective_params(0);
+        let key = app
+            .final_ai_key_for_pixels(app.current_edit_result_key(0), [400, 500], params)
+            .unwrap();
+        let retained_key = app.retained_final_ai_key_for(0, key, [400, 500]).unwrap();
+        let pixels = Arc::new(egui::ColorImage::filled([8, 10], egui::Color32::WHITE));
+        assert!(app.insert_retained_pdf_final_ai(0, retained_key.clone(), Arc::clone(&pixels)));
+        app.bump_items_generation();
+        app.page_dims_cache.clear();
+        if let GridItem::PdfPage { content_type, .. } = &mut app.items[0] {
+            *content_type = None;
+        }
+        assert!(app.thumbnails.is_empty() && app.fs_cache.is_empty());
+        assert!(app.pdf_specified_basis_for_idx(0).is_none());
+        assert_eq!(
+            app.fs_page_load_state(0),
+            FsPageLoadState::DisplayReady(FsPageDisplaySource::RetainedPdfFinalAi)
+        );
+        app.adopt_retained_pdf_page_metadata(0);
+        assert_eq!(app.pdf_specified_basis_for_idx(0), Some(basis));
+        app.items[0] = GridItem::PdfPage {
+            pdf_path: replacement_path,
+            page_num: 0,
+            content_type: None,
+        };
+        app.bump_items_generation();
+        app.page_dims_cache.clear();
+        app.adopt_retained_pdf_page_metadata(0);
+        assert!(app.pdf_specified_basis_for_idx(0).is_none());
+        if let GridItem::PdfPage { content_type, .. } = &mut app.items[0] {
+            *content_type = Some(crate::pdf_loader::PdfPageContentType::Raster { w: 100, h: 200 });
+        }
+        let generation = app.items_generation;
+        app.page_dims_cache
+            .record_layout(generation, 0, (100_000, 200_000));
+        // A completed job for the old document may be retained after the switch.
+        assert!(app.insert_retained_pdf_final_ai(0, retained_key, pixels));
+        app.items[0] = GridItem::PdfPage {
+            pdf_path: original_path,
+            page_num: 0,
+            content_type: None,
+        };
+        app.bump_items_generation();
+        app.page_dims_cache.clear();
+        app.adopt_retained_pdf_page_metadata(0);
+        assert_eq!(app.pdf_specified_basis_for_idx(0), Some(basis));
+    }
+
+    #[test]
+    fn specified_pdf_completion_keeps_metadata_basis_when_raster_source_coordinates_change() {
+        let mut app = setup_app_for_test();
+        let pdf_path = app.tmp.path().join("metadata.pdf");
+        app.items.push(GridItem::PdfPage {
+            pdf_path,
+            page_num: 0,
+            content_type: None,
+        });
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.fullscreen_idx = Some(0);
+        let ctx = egui::Context::default();
+        assert!(app.pdf_specified_basis_for_idx(0).is_none());
+        let mut previous_basis = None;
+        for source_long in [4096, 5407, 7138, 8192] {
+            let generation = app.items_generation;
+            assert!(app.enqueue_fs_upload_result_for_generation(
+                generation,
+                0,
+                FsLoadResult::StaticPdf {
+                    ci: egui::ColorImage::filled([8, 8], egui::Color32::WHITE),
+                    source_dims: [source_long, source_long],
+                    page_size_points: crate::pdf_loader::PdfPageSizePoints {
+                        width: 612.0,
+                        height: 612.0
+                    },
+                    content_type: crate::pdf_loader::PdfPageContentType::Vector,
+                },
+                0,
+                FsLoadPurpose::for_page(true),
+                None
+            ));
+            app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+            let basis = app.pdf_specified_basis_for_idx(0).unwrap();
+            assert_eq!(basis.original_size, egui::vec2(4096.0, 4096.0));
+            assert_eq!(basis.aspect_size, egui::vec2(612_000.0, 612_000.0));
+            assert_eq!(
+                app.source_dims_for_idx(0),
+                Some((source_long as f32, source_long as f32))
+            );
+            if let Some(previous) = previous_basis {
+                assert_eq!(basis, previous);
+            }
+            previous_basis = Some(basis);
+            let target = crate::pdf_loader::absolute_display_render_long_edge(
+                basis.original_size.max_elem() * 1.2,
+                true,
+                crate::pdf_loader::PdfPageContentType::Vector,
+            );
+            assert_eq!(target, 5407);
+            let source = app.metadata_cache_key(0).unwrap();
+            let changed = app.fs_pdf_rerender_demand.note_absolute(0, source, target);
+            assert_eq!(changed, source_long == 4096);
+        }
+        let generation = app.items_generation.wrapping_add(1);
+        assert!(!app.enqueue_fs_upload_result_for_generation(
+            generation,
+            0,
+            FsLoadResult::StaticPdf {
+                ci: egui::ColorImage::filled([8, 8], egui::Color32::WHITE),
+                source_dims: [256, 256],
+                page_size_points: crate::pdf_loader::PdfPageSizePoints {
+                    width: 100.0,
+                    height: 200.0
+                },
+                content_type: crate::pdf_loader::PdfPageContentType::Raster { w: 100, h: 200 },
+            },
+            0,
+            FsLoadPurpose::for_page(true),
+            None
+        ));
+        assert_eq!(app.pdf_specified_basis_for_idx(0), previous_basis);
     }
 }

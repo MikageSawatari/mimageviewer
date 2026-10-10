@@ -63,6 +63,12 @@ try {
     $report.metrics=[ordered]@{cpu_delta_secs=$endCpu-$startCpu; cpu_one_core_ratio=($endCpu-$startCpu)/$clock.Elapsed.TotalSeconds; app_log_growth_bytes=$endApp-$startApp; perf_log_growth_bytes=$endPerf-$startPerf}
     $report.cpu_core_ratio=$report.metrics.cpu_one_core_ratio
     $report.app_log_growth_bytes=$report.metrics.app_log_growth_bytes; $report.perf_log_growth_bytes=$report.metrics.perf_log_growth_bytes
+    # These completed external measurements are independent of perf clock and
+    # delivery evidence. Preserve observed failures even if those proofs fail.
+    if ($report.metrics.cpu_one_core_ratio -gt $thresholds.max_cpu_core_ratio) { $report.failures += 'CPU one-core limit exceeded.' }
+    elseif ($report.metrics.cpu_one_core_ratio -gt $thresholds.target_cpu_core_ratio) { $report.warnings += 'CPU target exceeded.' }
+    if ($report.metrics.app_log_growth_bytes -gt $thresholds.max_app_log_growth_bytes -or $report.metrics.perf_log_growth_bytes -gt $thresholds.max_perf_log_growth_bytes) { $report.failures += 'Log growth limit exceeded.' }
+    if ($report.metrics.app_log_growth_bytes -lt 0 -or $report.metrics.perf_log_growth_bytes -lt 0) { throw 'Logs rotated during measurement.' }
     $report.process_alive_start=$true; $report.process_alive_end=$true
     $report.root_hwnd=$RootHwnd; $report.background_hwnd=$BackgroundHwnd; $report.background_process_id=$BackgroundProcessId
     Assert-ReleaseCheckWindowSamples $samples $Scenario $ProcessId $RootHwnd $BackgroundHwnd $BackgroundProcessId
@@ -81,21 +87,12 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Session clock/sleep containment could not be verified.' }
     $converted = Get-Content -LiteralPath $clockReport -Encoding UTF8 -Raw | ConvertFrom-Json
     $report.evidence=[ordered]@{clock=$converted.evidence.clock; process=[ordered]@{pid=$ProcessId; start_time_utc=$ExpectedStartTimeUtc.ToString('o'); path=$exe; data_dir=$data; identity_evidence='command_line'}}
-    $perfReport = Join-Path $OutputDirectory 'idle-perf.json'
-    $args = @((Join-Path $scripts 'analyze_perf.py'),$perf,'idle-health','--start-t',(Format-Invariant $converted.evidence.clock.start_t),'--end-t',(Format-Invariant $converted.evidence.clock.end_t),
-        '--target-update-rate',(Format-Invariant $thresholds.target_update_rate_per_sec),'--max-update-rate',(Format-Invariant $thresholds.max_update_rate_per_sec),
-        '--max-reason-streak-secs',(Format-Invariant $thresholds.max_reason_streak_seconds),'--max-same-work',[string]$thresholds.max_same_work,
-        '--max-input-events',[string]$thresholds.max_input_events,'--expected-pid',[string]$ProcessId,'--allow-sleeping-window','--json-out',$perfReport)
-    if ($Scenario -eq 'video-pin-background') { $args += @('--require-work-key',$TargetKey) }
-    & python @args
-    if ($LASTEXITCODE -ne 0) { $report.failures += 'Idle perf verdict failed.' }
-    $report.perf_report=$perfReport
-    if ($report.metrics.cpu_one_core_ratio -gt $thresholds.max_cpu_core_ratio) { $report.failures += 'CPU one-core limit exceeded.' }
-    elseif ($report.metrics.cpu_one_core_ratio -gt $thresholds.target_cpu_core_ratio) { $report.warnings += 'CPU target exceeded.' }
-    if ($report.metrics.app_log_growth_bytes -gt $thresholds.max_app_log_growth_bytes -or $report.metrics.perf_log_growth_bytes -gt $thresholds.max_perf_log_growth_bytes) { $report.failures += 'Log growth limit exceeded.' }
-    if ($report.metrics.app_log_growth_bytes -lt 0 -or $report.metrics.perf_log_growth_bytes -lt 0) { throw 'Logs rotated during measurement.' }
-    $report.verdict=if($report.failures.Count){'FAIL'}elseif($report.warnings.Count){'PASS_WITH_WARNINGS'}else{'PASS'}
-    $report.exit_code=if($report.failures.Count){1}else{0}
+    # Master requires a stored shutdown delivery checkpoint. The worker is
+    # still asleep here: evaluate perf only in Run.ps1 after normal process exit.
+    # This sampler verdict covers external CPU/log/window metrics only.
+    $report.perf_evaluation='deferred_until_normal_exit'
 } catch { $report.environment_errors += $_.Exception.Message }
+$report.verdict=if($report.failures.Count){'FAIL'}elseif($report.environment_errors.Count){'SKIPPED'}elseif($report.warnings.Count){'PASS_WITH_WARNINGS'}else{'PASS'}
+$report.exit_code=if($report.failures.Count){1}elseif($report.environment_errors.Count){2}else{0}
 Write-ReleaseCheckJson $reportPath $report
 exit $report.exit_code

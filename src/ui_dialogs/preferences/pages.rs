@@ -9857,6 +9857,175 @@ pub(super) fn draw_fullscreen_fit_cycle_settings(
     ui.small("1つ以上選択してください。0キー・リング・ジェスチャ・マウスボタンの循環に適用します。直接選択メニューにはすべてのモードが表示されます。");
 }
 
+pub(super) fn draw_fullscreen_specified_scale_axis_controls(
+    ui: &mut egui::Ui,
+    axis: &mut crate::settings::SpecifiedScaleAxisSetting,
+    label: &str,
+    dark_popup: bool,
+) {
+    use crate::settings::SpecifiedScaleAxis;
+    let current = axis.value;
+    let (mut number, mut pixels) = match current {
+        SpecifiedScaleAxis::PercentTenths(value) => (value as f64 / 10.0, false),
+        SpecifiedScaleAxis::LogicalPixels(value) => (value as f64, true),
+    };
+    let range = if pixels {
+        SpecifiedScaleAxis::LOGICAL_PIXELS_MIN as f64
+            ..=SpecifiedScaleAxis::LOGICAL_PIXELS_MAX as f64
+    } else {
+        SpecifiedScaleAxis::PERCENT_TENTHS_MIN as f64 / 10.0
+            ..=SpecifiedScaleAxis::PERCENT_TENTHS_MAX as f64 / 10.0
+    };
+    let drag = egui::DragValue::new(&mut number)
+        .range(range)
+        .speed(if pixels { 1.0 } else { 0.1 })
+        .fixed_decimals(if pixels { 0 } else { 1 });
+    let response = if dark_popup {
+        ui.add_sized(egui::vec2(64.0_f32.min(ui.available_width()), 24.0), drag)
+    } else {
+        ui.add(drag)
+    };
+    if response.changed() {
+        axis.value = if pixels {
+            SpecifiedScaleAxis::LogicalPixels(number.round() as u32)
+        } else {
+            SpecifiedScaleAxis::PercentTenths((number * 10.0).round() as u32)
+        }
+        .sanitized();
+    }
+    // ComboBox itself contains an unmeasured horizontal child.
+    // Preallocate its real button dimensions so the outer wrapping
+    // row chooses a new line before that child is positioned.
+    let unit_text = if pixels { "px" } else { "％" };
+    let galley = ui.painter().layout_no_wrap(
+        unit_text.to_owned(),
+        egui::TextStyle::Button.resolve(ui.style()),
+        ui.visuals().text_color(),
+    );
+    let padding = ui.spacing().button_padding;
+    let unit_size = egui::vec2(
+        48.0_f32
+            .max(
+                galley.size().x
+                    + ui.spacing().icon_spacing
+                    + ui.spacing().icon_width
+                    + 2.0 * padding.x,
+            )
+            .ceil(),
+        ui.spacing()
+            .interact_size
+            .y
+            .max(galley.size().y.max(ui.spacing().icon_width) + 2.0 * padding.y)
+            .ceil(),
+    );
+    let _unit_response = ui
+        .allocate_ui_with_layout(
+            unit_size,
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                let combo = egui::ComboBox::from_id_salt("unit")
+                    .selected_text(unit_text)
+                    .width(unit_size.x);
+                let combo = if dark_popup {
+                    combo.popup_style(crate::os_theme::dark_popup_style(ui.ctx()))
+                } else {
+                    combo
+                };
+                combo.show_ui(ui, |ui| {
+                    ui.selectable_value(&mut pixels, false, "％");
+                    ui.selectable_value(&mut pixels, true, "px");
+                })
+            },
+        )
+        .inner;
+    #[cfg(test)]
+    ui.ctx().data_mut(|data| {
+        data.insert_temp(
+            egui::Id::new(("specified_scale_unit_response", label)),
+            _unit_response.response.rect,
+        );
+    });
+    if pixels != matches!(current, SpecifiedScaleAxis::LogicalPixels(_)) {
+        axis.value = axis.value.with_pixel_unit(pixels);
+    }
+}
+
+pub(super) fn draw_fullscreen_specified_scale_max_controls(
+    ui: &mut egui::Ui,
+    max_tenths: &mut u32,
+    dark_popup: bool,
+) -> bool {
+    use crate::settings::{
+        FULLSCREEN_SPECIFIED_SCALE_MAX_MAX_TENTHS, FULLSCREEN_SPECIFIED_SCALE_MAX_MIN_TENTHS,
+    };
+
+    let before = *max_tenths;
+    let mut number = before as f64 / 10.0;
+    let drag = egui::DragValue::new(&mut number)
+        .range(
+            FULLSCREEN_SPECIFIED_SCALE_MAX_MIN_TENTHS as f64 / 10.0
+                ..=FULLSCREEN_SPECIFIED_SCALE_MAX_MAX_TENTHS as f64 / 10.0,
+        )
+        .speed(0.1)
+        .fixed_decimals(1)
+        .suffix(" 倍");
+    let response = if dark_popup {
+        ui.add_sized(egui::vec2(72.0_f32.min(ui.available_width()), 24.0), drag)
+    } else {
+        ui.add(drag)
+    };
+    #[cfg(test)]
+    ui.ctx().data_mut(|data| {
+        data.insert_temp(egui::Id::new("specified_scale_max_response"), response.rect);
+    });
+    if response.changed() {
+        *max_tenths = ((number * 10.0).round() as u32).clamp(
+            FULLSCREEN_SPECIFIED_SCALE_MAX_MIN_TENTHS,
+            FULLSCREEN_SPECIFIED_SCALE_MAX_MAX_TENTHS,
+        );
+    }
+    *max_tenths != before
+}
+
+pub(super) fn draw_fullscreen_specified_scale_settings(
+    ui: &mut egui::Ui,
+    value: &mut crate::settings::FullscreenSpecifiedScale,
+    max_tenths: &mut u32,
+) -> bool {
+    use crate::settings::SpecifiedScaleAxisSetting;
+
+    fn axis_row(ui: &mut egui::Ui, label: &str, axis: &mut SpecifiedScaleAxisSetting) {
+        ui.push_id(label, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.checkbox(&mut axis.enabled, format!("{label}を指定する"));
+                // Keep numeric and unit controls as separate items of this
+                // wrapping row. A grouped child measures its width only after
+                // placement and can overflow the remaining row width.
+                if !axis.enabled {
+                    ui.disable();
+                }
+                draw_fullscreen_specified_scale_axis_controls(ui, axis, label, false);
+            });
+        });
+    }
+
+    let before = *value;
+    ui.label(egui::RichText::new("指定サイズ").strong());
+    axis_row(ui, "幅", &mut value.width);
+    axis_row(ui, "高さ", &mut value.height);
+    ui.small("％は画像表示領域を100％とします。pxは100％表示時の長さで、Windows・アプリの表示倍率に追従します。");
+    ui.small("範囲: 0.1〜1000.0％ / 1〜32768px。幅と高さの両方を指定すると、その枠に収まるように表示します。両方OFFならページ全体にフィットします。");
+    ui.small("OFFにしても数値と単位を記憶します。初期の幅・高さ80％は余白を残す設定例です。用途に合わせて変更できます。");
+    let mut max_changed = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.label("自動フィットの最大倍率（共通）");
+        max_changed = draw_fullscreen_specified_scale_max_controls(ui, max_tenths, false);
+    });
+    ui.small("指定サイズの自動フィットで、元画像を拡大する倍率の上限です。1.0〜20.0倍で指定でき、初期値は5.0倍です。すべての本で共通です。");
+    ui.small("AI拡大前の元画像サイズを基準にします。「縮小しない」は指定枠より優先します。手動ズーム・Zにはこの上限を適用しません。");
+    *value != before || max_changed
+}
+
 pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) {
     anchored(ui, state, "spread/chrome-suppression", |ui, state| {
         crate::ui_helpers::draw_fullscreen_chrome_suppression_setting(
@@ -10011,6 +10180,14 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
         });
     });
     ui.small("自動フィット時の倍率制限。ホイールなどの手動ズームは制限しません。");
+    ui.add_space(8.0);
+    anchored(ui, state, "spread/specified-scale", |ui, state| {
+        draw_fullscreen_specified_scale_settings(
+            ui,
+            &mut state.settings.fullscreen_specified_scale,
+            &mut state.settings.fullscreen_specified_scale_max_tenths,
+        );
+    });
     ui.add_space(8.0);
     anchored(ui, state, "spread/anime-limit", |ui, state| {
         let s = &mut state.settings;
@@ -10369,8 +10546,12 @@ mod context_menu_layout_settings_tests {
     fn fit_cycle_subset_ui_keeps_the_last_mode_enabled() {
         use egui_kittest::kittest::{NodeT, Queryable};
         let mut settings = crate::settings::Settings::default();
-        settings.fullscreen_fit_cycle_excluded =
-            vec!["Page".into(), "Width".into(), "Height".into()];
+        settings.fullscreen_fit_cycle_excluded = vec![
+            "Page".into(),
+            "Width".into(),
+            "Height".into(),
+            "SpecifiedScale".into(),
+        ];
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(480.0, 300.0))
             .build_state(
@@ -10934,6 +11115,374 @@ mod tests {
         MouseGestureBinding, MouseGestureDirection, RightDragContext, RingActionId,
         RingShortcutContext, RingShortcutSettings,
     };
+
+    #[test]
+    fn specified_scale_editor_off_on_restores_pixel_and_percent_values() {
+        use crate::settings::{
+            FullscreenSpecifiedScale, SpecifiedScaleAxis, SpecifiedScaleAxisSetting,
+        };
+        use eframe::egui;
+        use egui_kittest::kittest::Queryable;
+
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(300.0, 540.0))
+            .build_state(
+                |ctx, (value, changed, fonts_ready)| {
+                    if !*fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        *fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let mut max_tenths = 50;
+                        *changed = super::draw_fullscreen_specified_scale_settings(
+                            ui,
+                            value,
+                            &mut max_tenths,
+                        );
+                    });
+                },
+                (
+                    FullscreenSpecifiedScale {
+                        width: SpecifiedScaleAxisSetting::enabled(
+                            SpecifiedScaleAxis::LogicalPixels(800),
+                        ),
+                        height: SpecifiedScaleAxisSetting::enabled(
+                            SpecifiedScaleAxis::PercentTenths(123),
+                        ),
+                    },
+                    false,
+                    false,
+                ),
+            );
+        harness.run();
+        assert!(!harness.state().1, "drawing alone must not edit the draft");
+        harness.get_by_label("幅を指定する").click();
+        harness.run();
+        assert_eq!(
+            harness.state().0.width,
+            SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::LogicalPixels(800))
+        );
+        assert_eq!(
+            harness.state().0.height,
+            SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::PercentTenths(123))
+        );
+        harness.get_by_label("高さを指定する").click();
+        harness.run();
+        assert_eq!(
+            harness.state().0,
+            FullscreenSpecifiedScale {
+                width: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::LogicalPixels(800)),
+                height: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(123))
+            }
+        );
+        harness.get_by_label("幅を指定する").click();
+        harness.run();
+        assert_eq!(
+            harness.state().0.width,
+            SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::LogicalPixels(800))
+        );
+        assert_eq!(
+            harness.state().0.height,
+            SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(123))
+        );
+        harness.get_by_label("高さを指定する").click();
+        harness.run();
+        assert_eq!(
+            harness.state().0.height,
+            SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::PercentTenths(123))
+        );
+    }
+
+    #[test]
+    fn specified_scale_editor_unit_change_preserves_number_and_rounds_pixels() {
+        use crate::settings::{
+            FullscreenSpecifiedScale, SpecifiedScaleAxis, SpecifiedScaleAxisSetting,
+        };
+        use eframe::egui;
+        use egui_kittest::kittest::Queryable;
+
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(400.0, 540.0))
+            .build_state(
+                |ctx, (value, fonts_ready)| {
+                    if !*fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        *fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let mut max_tenths = 50;
+                        super::draw_fullscreen_specified_scale_settings(ui, value, &mut max_tenths);
+                    });
+                },
+                (
+                    FullscreenSpecifiedScale {
+                        width: SpecifiedScaleAxisSetting::enabled(
+                            SpecifiedScaleAxis::PercentTenths(805),
+                        ),
+                        height: SpecifiedScaleAxisSetting::disabled(
+                            SpecifiedScaleAxis::PercentTenths(800),
+                        ),
+                    },
+                    false,
+                ),
+            );
+        harness.run();
+        harness
+            .get_by(|node| {
+                node.role() == egui::accesskit::Role::ComboBox
+                    && node.value().as_deref() == Some("％")
+                    && !node.is_disabled()
+            })
+            .click();
+        harness.run();
+        harness.get_by_label("px").click();
+        harness.run();
+        assert_eq!(
+            harness.state().0.width,
+            SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::LogicalPixels(81))
+        );
+        assert_eq!(
+            harness.state().0.height,
+            SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(800))
+        );
+    }
+
+    #[test]
+    fn specified_scale_editor_numeric_text_keeps_valid_axis_values() {
+        use crate::settings::{
+            FullscreenSpecifiedScale, SpecifiedScaleAxis, SpecifiedScaleAxisSetting,
+        };
+        use eframe::egui;
+        use egui_kittest::kittest::Queryable;
+
+        for (axis, text, expected) in [
+            (
+                SpecifiedScaleAxis::PercentTenths(800),
+                "12.5",
+                SpecifiedScaleAxis::PercentTenths(125),
+            ),
+            (
+                SpecifiedScaleAxis::LogicalPixels(800),
+                "12.5",
+                SpecifiedScaleAxis::LogicalPixels(13),
+            ),
+            (
+                SpecifiedScaleAxis::PercentTenths(800),
+                "0",
+                SpecifiedScaleAxis::PercentTenths(1),
+            ),
+            (
+                SpecifiedScaleAxis::LogicalPixels(800),
+                "0",
+                SpecifiedScaleAxis::LogicalPixels(1),
+            ),
+            (
+                SpecifiedScaleAxis::PercentTenths(800),
+                "1001",
+                SpecifiedScaleAxis::PercentTenths(10000),
+            ),
+            (
+                SpecifiedScaleAxis::LogicalPixels(800),
+                "32769",
+                SpecifiedScaleAxis::LogicalPixels(32768),
+            ),
+        ] {
+            let pixels = matches!(axis, SpecifiedScaleAxis::LogicalPixels(_));
+            let mut harness = crate::test_ui::builder()
+                .with_size(egui::vec2(400.0, 520.0))
+                .build_state(
+                    |ctx, (value, fonts_ready)| {
+                        if !*fonts_ready {
+                            crate::ui_fonts::configure_fonts(ctx);
+                            *fonts_ready = true;
+                            ctx.request_repaint();
+                            return;
+                        }
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            let mut max_tenths = 50;
+                            super::draw_fullscreen_specified_scale_settings(
+                                ui,
+                                value,
+                                &mut max_tenths,
+                            );
+                        });
+                    },
+                    (
+                        FullscreenSpecifiedScale {
+                            width: SpecifiedScaleAxisSetting::enabled(axis),
+                            height: SpecifiedScaleAxisSetting::disabled(
+                                SpecifiedScaleAxis::PercentTenths(800),
+                            ),
+                        },
+                        false,
+                    ),
+                );
+            harness.run();
+            let numeric = |node: &egui_kittest::kittest::AccessKitNode<'_>| {
+                node.min_numeric_value() == Some(if pixels { 1.0 } else { 0.1 })
+                    && node.max_numeric_value() == Some(if pixels { 32768.0 } else { 1000.0 })
+                    && !node.is_disabled()
+            };
+            harness.get_by(numeric).focus();
+            harness.run();
+            // An incomplete numeric edit stays in the stock DragValue editor;
+            // it must not publish an invalid typed setting.
+            harness.get_by(numeric).type_text("-");
+            harness.run();
+            assert_eq!(
+                harness.state().0.width,
+                SpecifiedScaleAxisSetting::enabled(axis)
+            );
+            harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+            harness.run();
+            harness.get_by(numeric).type_text(text);
+            harness.run();
+            harness.key_press(egui::Key::Enter);
+            harness.run();
+            assert_eq!(
+                harness.state().0.width,
+                SpecifiedScaleAxisSetting::enabled(expected),
+                "input={text}, pixels={pixels}"
+            );
+            assert!(harness.state().0.is_valid());
+            assert_eq!(
+                harness.state().0.height,
+                SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(800))
+            );
+        }
+    }
+
+    #[test]
+    fn specified_scale_max_editor_numeric_text_updates_common_cap_within_bounds() {
+        use crate::settings::FullscreenSpecifiedScale;
+        use eframe::egui;
+        use egui_kittest::kittest::Queryable;
+
+        for (text, expected) in [("2.5", 25), ("0", 10), ("20.1", 200), ("1.14", 11)] {
+            let mut harness = crate::test_ui::builder()
+                .with_size(egui::vec2(500.0, 560.0))
+                .build_state(
+                    |ctx, (value, max_tenths, changed, fonts_ready)| {
+                        crate::ime_focus::install_ime_input_policy(ctx);
+                        if !*fonts_ready {
+                            crate::ui_fonts::configure_fonts(ctx);
+                            *fonts_ready = true;
+                            ctx.request_repaint();
+                            return;
+                        }
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            *changed |= super::draw_fullscreen_specified_scale_settings(
+                                ui, value, max_tenths,
+                            );
+                        });
+                    },
+                    (FullscreenSpecifiedScale::default(), 50_u32, false, false),
+                );
+            harness.run();
+            assert!(!harness.state().2, "drawing must not edit the common cap");
+            let numeric = |node: &egui_kittest::kittest::AccessKitNode<'_>| {
+                node.min_numeric_value() == Some(1.0)
+                    && node.max_numeric_value() == Some(20.0)
+                    && !node.is_disabled()
+            };
+            harness.get_by(numeric).focus();
+            harness.run();
+            harness.get_by(numeric).type_text("-");
+            harness.run();
+            assert_eq!(harness.state().1, 50, "incomplete edits stay unpublished");
+            harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+            harness.run();
+            harness.get_by(numeric).type_text(text);
+            harness.run();
+            harness.key_press(egui::Key::Enter);
+            harness.run();
+            assert_eq!(harness.state().1, expected, "input={text}");
+            assert!(harness.state().2, "cap edits must notify the caller");
+            assert_eq!(harness.state().0, FullscreenSpecifiedScale::default());
+        }
+    }
+
+    #[test]
+    fn specified_scale_editor_narrow_controls_remain_visible_and_clickable() {
+        use crate::settings::{
+            FullscreenSpecifiedScale, SpecifiedScaleAxis, SpecifiedScaleAxisSetting,
+        };
+        use eframe::egui;
+        use egui_kittest::kittest::Queryable;
+
+        for width in [220.0, 280.0] {
+            let size = egui::vec2(width, 640.0);
+            let mut harness = crate::test_ui::builder().with_size(size).build_state(
+                |ctx, (value, fonts_ready)| {
+                    if !*fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        *fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                let mut max_tenths = 50;
+                                super::draw_fullscreen_specified_scale_settings(
+                                    ui,
+                                    value,
+                                    &mut max_tenths,
+                                );
+                            });
+                    });
+                },
+                (
+                    FullscreenSpecifiedScale {
+                        width: SpecifiedScaleAxisSetting::enabled(
+                            SpecifiedScaleAxis::PercentTenths(10000),
+                        ),
+                        height: SpecifiedScaleAxisSetting::enabled(
+                            SpecifiedScaleAxis::LogicalPixels(32768),
+                        ),
+                    },
+                    false,
+                ),
+            );
+            harness.run();
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            for label in ["幅を指定する", "高さを指定する"] {
+                assert!(
+                    screen.contains_rect(harness.get_by_label(label).rect()),
+                    "{width}: {label}"
+                );
+            }
+            for unit in ["％", "px"] {
+                let control = harness.get_by(|node| {
+                    node.role() == egui::accesskit::Role::ComboBox
+                        && node.value().as_deref() == Some(unit)
+                });
+                assert!(
+                    screen.contains_rect(control.rect()),
+                    "{width}: {unit}; screen={screen:?}, control={:?}",
+                    control.rect()
+                );
+            }
+            harness.get_by_label("高さを指定する").click();
+            harness.run();
+            assert_eq!(
+                harness.state().0.height,
+                SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::LogicalPixels(32768))
+            );
+            harness.get_by_label("高さを指定する").click();
+            harness.run();
+            assert_eq!(
+                harness.state().0.height,
+                SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::LogicalPixels(32768))
+            );
+        }
+    }
 
     #[test]
     fn single_export_bake_stage_row_updates_its_setting() {

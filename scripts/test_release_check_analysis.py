@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Synthetic Phase 2 regressions. No App process or desktop interaction."""
+"""Synthetic release-check and Phase 3b regressions. No App or desktop interaction."""
 from __future__ import annotations
 
 import contextlib
@@ -27,7 +27,29 @@ OS_START = 1_700_000_000_000
 def session() -> dict:
     return {"cat": "session", "kind": "start", "t": 5.251, "pid": PID,
             "wall_unix_ms": OS_START + 12_250, "wall_t": 5.25,
+            "session_id": "synthetic-session", "log_delivery_schema": 1,
             "process_start_unix_ms": OS_START}
+
+
+def seal(events: list[dict]) -> list[dict]:
+    """Finish a synthetic saved log with the real shutdown delivery schema."""
+    events = [e for e in events if e.get("kind") != "drain_checkpoint"]
+    coverage = max(e["t"] for e in events)
+    events.append({"cat": "log", "kind": "drain_checkpoint", "t": coverage + .1,
+                   "schema": 1, "session_id": "synthetic-session", "pid": PID,
+                   "process_start_unix_ms": OS_START, "request_id": "synthetic-shutdown", "purpose": "shutdown",
+                   "coverage_t": coverage, "ticket_cutoff": 100, "settled_watermark": 100, "written_watermark": 100,
+                   "normal_status": "ready", "perf_status": "ready", "normal_dropped_total": 0,
+                   "perf_dropped_total": 0, "diagnostic_dropped_total": 0,
+                   "normal_written_bytes": 1000, "perf_written_bytes": 1000})
+    return events
+
+
+def cached_request(key: str, generation: int, request_id: int, *, t: float = 5.6, idx: int = 0) -> list[dict]:
+    identity = {"key": key, "items_gen": generation, "request_id": request_id, "idx": idx}
+    return [{"cat": "qa", "kind": "request_begin", "t": t - .01, "evaluated_display_px": 374, **identity},
+            {"cat": "qa", "kind": "cache_read", "t": t, "from_cache": True,
+             "origin": "upgradeable_cache", **identity}]
 
 
 def operations() -> dict:
@@ -58,15 +80,13 @@ def metadata() -> dict:
 def perf_events(gaps: dict[int, float] | None = None, actions: dict[int, str] | None = None,
                 pre_grid_ms: float = .2, frame_count: int = 202) -> list[dict]:
     gaps, actions = gaps or {}, actions or {}
-    events, t = [session(), {"cat": "qa", "kind": "cache_read", "key": "dir::fixture/child",
-                            "items_gen": 3, "idx": 0, "from_cache": True, "t": 5.6}], 6.0
+    events, t = [session(), *cached_request("dir::fixture/child", 3, 1)], 6.0
     for n in range(5):
         events.append({"cat": "qa", "kind": "key_materialized", "t": 5.305 + n * .02,
                        "key": "Down", "ctrl": True, "shift": False, "alt": False,
                        "pressed": True, "repeat": False, "target_viewport": "ROOT", "target_hwnd": 123})
     for n in range(6):
-        events.append({"cat": "qa", "kind": "cache_read", "t": 5.6, "key": f"folder{n}/image.png",
-                       "items_gen": n + 10, "from_cache": True})
+        events.extend(cached_request(f"folder{n}/image.png", n + 10, n + 2))
     events.extend([{"cat": "qa", "kind": "key_materialized", "t": 5.42,
                     "key": "G", "ctrl": True, "shift": False, "alt": False,
                     "pressed": True, "repeat": False, "target_viewport": "ROOT", "target_hwnd": 123},
@@ -83,7 +103,7 @@ def perf_events(gaps: dict[int, float] | None = None, actions: dict[int, str] | 
         previous_t, t = t, t + gaps.get(n, .005)
     events.append({"cat": "qa", "kind": "on_exit", "case_id": "perf-cached", "t": t + 1,
                    "flush_complete": True})
-    return events
+    return seal(events)
 
 
 def frame_time(events: list[dict], n: int) -> float:
@@ -101,7 +121,7 @@ def slow_update(events: list[dict], n: int, ms: float, **stages: float) -> None:
 
 
 def perf(events: list[dict], evidence: dict | None = None) -> dict:
-    return analyze_perf_smoke(events, expected_pid=PID, case_id="perf-cached",
+    return analyze_perf_smoke(seal(events), expected_pid=PID, case_id="perf-cached",
                               evidence=operations() if evidence is None else evidence)
 
 
@@ -344,19 +364,47 @@ class PerfTests(unittest.TestCase):
         for opened in evidence["cache"]["opens"]:
             opened["pre_open_absent"] = True
         for index, e in enumerate([e for e in events if e.get("kind") == "cache_read"]):
-            e.update(kind="source", from_cache=False, request_id=10 + index)
-            events.append({"cat": "qa", "kind": "request_begin", "t": 5.55 + index * .001,
-                           "request_id": 10 + index})
+            e.update(kind="source", from_cache=False, origin="source_generated")
+            next(b for b in events if b.get("kind") == "request_begin"
+                 and b.get("request_id") == e["request_id"])["t"] = 5.55 + index * .001
         for e in events:
             if e.get("kind") == "on_exit":
                 e["case_id"] = "perf-uncached"
-        events.extend([{"cat": "qa", "kind": "request_begin", "t": 5.58, "request_id": 20},
-                       {"cat": "qa", "kind": "cache_read", "t": 5.59, "request_id": 20,
-                        "key": "dir::fixture/child", "items_gen": 3, "from_cache": True}])
+        events.extend(cached_request("dir::fixture/child", 3, 20, t=5.59))
+        events = seal(events)
         result = analyze_perf_smoke(events, expected_pid=PID, case_id="perf-uncached", evidence=evidence)
         self.assertEqual(result["verdict"], "PASS")
         evidence["cache"]["opens"][0]["pre_open_absent"] = False
         self.assertEqual(analyze_perf_smoke(events, expected_pid=PID, case_id="perf-uncached", evidence=evidence)["verdict"], "SKIPPED")
+
+    def test_uncached_provenance_requires_registered_begin_origin_and_earliest_request(self):
+        def fixture():
+            events, evidence = perf_events(), operations()
+            evidence["cache"]["mode"] = "uncached"
+            for opened in evidence["cache"]["opens"]:
+                opened["pre_open_absent"] = True
+            for event in events:
+                if event.get("kind") == "cache_read":
+                    event.update(kind="source", origin="source_generated", from_cache=False)
+                elif event.get("kind") == "on_exit":
+                    event["case_id"] = "perf-uncached"
+            return events, evidence
+
+        for kind, field, value in (("source", "request_id", 999), ("source", "origin", None),
+                                   ("request_begin", "request_id", 0), ("request_begin", "idx", 7),
+                                   ("request_begin", "t", 5.7)):
+            with self.subTest(kind=kind, field=field):
+                events, evidence = fixture()
+                next(e for e in events if e.get("kind") == kind)[field] = value
+                result = analyze_perf_smoke(events, expected_pid=PID, case_id="perf-uncached", evidence=evidence)
+                self.assertEqual(result["verdict"], "SKIPPED")
+        events, evidence = fixture()
+        self.assertEqual(analyze_perf_smoke(events, expected_pid=PID, case_id="perf-uncached",
+                                           evidence=evidence)["verdict"], "PASS")
+        earlier_cached = cached_request("dir::fixture/child", 3, 100, t=5.57)
+        result = analyze_perf_smoke(seal([*events, *earlier_cached]), expected_pid=PID,
+                                    case_id="perf-uncached", evidence=evidence)
+        self.assertEqual(result["verdict"], "SKIPPED")
 
     def test_optional_ai_session_has_independent_proof_and_reports_drawn_samples(self):
         events, ai_evidence = self.ai_shape()
@@ -368,6 +416,7 @@ class PerfTests(unittest.TestCase):
                 e["case_id"] = "first-ai"
         events.append({"cat": "qa", "kind": "first_ai", "case_id": "first-ai", "t": 6.45,
                        **evidence["first_ai"]})
+        events = seal(events)
         result = analyze_perf_smoke(events, expected_pid=PID, case_id="first-ai", evidence=evidence)
         self.assertEqual(result["verdict"], "PASS_WITH_WARNINGS", result)
         self.assertIsNone(result["metrics"]["drawn"]["minimum_samples"])
@@ -430,18 +479,20 @@ class EvidenceTests(unittest.TestCase):
         target = {"key": "dir::fixture/child", "idx": 7, "items_gen": 3,
                   "catalog_absent": True, "cache_map_absent": True}
         common = {"cat": "qa", "case_id": case, "close_sequence": 1, "items_gen": 3,
-                  "folder_path": "fixture", "loading_complete": completed, "targets": [target]}
+                  "folder_path": "fixture", "loading_complete": completed, "targets": [target],
+                  "cache_check_unix_ms": OS_START + 14_900}
         req = {"key": target["key"], "idx": 7, "items_gen": 3, "request_id": 10, "input_seq": 1}
         events = [session(), {**common, "kind": "close_accept", "t": 8},
-                  {**common, "kind": "tray_hide", "t": 8.1},
-                  {"cat": "qa", "kind": "request_begin", "case_id": case, "t": 8.2, **req},
+                  {**common, "kind": "tray_hide", "t": 8.1, "window_visible": False},
+                  {"cat": "qa", "kind": "request_begin", "case_id": case, "t": 8.2,
+                   "evaluated_display_px": 374, **req},
                   {"cat": "qa", "kind": "source", "case_id": case, "t": 8.3, **req,
-                   "should_save": False, "from_cache": False},
+                   "should_save": False, "force_cache": False, "from_cache": False, "origin": "source_generated"},
                   {"cat": "qa", "kind": "finalized", "case_id": case, "t": 8.4, **req,
                    "close_sequence": 1, "image_backlog_contains_request": True, "window_visible": False},
                   {"cat": "qa", "kind": "on_exit", "case_id": case, "t": 34, "flush_complete": True}]
         evidence = {"case_id": case, "pid": PID, "exit": {"process_exited": True, "forced": False}}
-        return events, evidence
+        return seal(events), evidence
 
     def test_both_tray_cases_independently_require_complete_proof(self):
         for completed in (False, True):
@@ -463,7 +514,100 @@ class EvidenceTests(unittest.TestCase):
     def test_same_seq_does_not_prove_same_request(self):
         events, evidence = self.tray()
         for e in events:
-            e.pop("request_id", None)
+            if e.get("cat") == "qa":
+                e.pop("request_id", None)
+        self.assertEqual(analyze_case_evidence(events, evidence, PID, setup_deadline_t=10)["verdict"], "SKIPPED")
+
+    def test_tray_canonical_identity_origin_and_explicit_save_fields_are_required(self):
+        for completed in (False, True):
+            for kind, field, value in (
+                ("request_begin", "request_id", True), ("request_begin", "request_id", 1 << 64),
+                ("request_begin", "request_id", 0), ("request_begin", "request_id", "10"),
+                ("request_begin", "evaluated_display_px", None), ("request_begin", "idx", 8),
+                ("request_begin", "items_gen", 4), ("request_begin", "key", "other"),
+                ("source", "request_id", 11), ("source", "origin", "upgradeable_cache"),
+                ("source", "origin", "source_intrinsic"),
+                ("source", "origin", None), ("source", "should_save", None),
+                ("source", "force_cache", None), ("source", "force_cache", True),
+                ("finalized", "request_id", 11), ("finalized", "idx", True),
+                ("tray_hide", "window_visible", True),
+            ):
+                with self.subTest(completed=completed, kind=kind, field=field, value=value):
+                    events, evidence = self.tray(completed)
+                    next(e for e in events if e.get("kind") == kind)[field] = value
+                    result = analyze_case_evidence(events, evidence, PID, setup_deadline_t=10)
+                    self.assertEqual(result["verdict"], "SKIPPED")
+                    self.assertEqual(result["evidence"].get("tray", {}).get("valid_targets", []), [])
+
+    def test_tray_uint64_boundary_and_other_id_save_do_not_change_this_request(self):
+        for completed in (False, True):
+            events, evidence = self.tray(completed)
+            for event in events:
+                if event.get("cat") == "qa" and "request_id" in event:
+                    event["request_id"] = (1 << 64) - 1
+            other_source = {**next(e for e in events if e.get("kind") == "source"),
+                            "request_id": 11, "should_save": True}
+            other_begin = {**next(e for e in events if e.get("kind") == "request_begin"), "request_id": 11}
+            events = seal([*events, other_begin, other_source])
+            result = analyze_case_evidence(events, evidence, PID, setup_deadline_t=10)
+            self.assertEqual(result["verdict"], "PASS", result)
+            self.assertEqual(result["evidence"]["tray"]["valid_targets"][0]["request_id"], (1 << 64) - 1)
+
+    def test_tray_boolean_sequence_and_target_generation_do_not_alias_uint_one(self):
+        for completed in (False, True):
+            for kind, field in (("close_accept", "close_sequence"), ("tray_hide", "close_sequence"),
+                                ("finalized", "close_sequence"), ("tray_hide", "target_items_gen")):
+                with self.subTest(completed=completed, kind=kind, field=field):
+                    events, evidence = self.tray(completed)
+                    for event in events:
+                        if "items_gen" in event:
+                            event["items_gen"] = 1
+                        for target in event.get("targets", []):
+                            target["items_gen"] = 1
+                    events = json.loads(json.dumps(events))
+                    self.assertEqual(analyze_case_evidence(events, evidence, PID,
+                                                         setup_deadline_t=10)["verdict"], "PASS")
+                    event = next(e for e in events if e.get("kind") == kind)
+                    if field == "target_items_gen":
+                        event["targets"][0]["items_gen"] = True
+                    else:
+                        event[field] = True
+                    self.assertEqual(analyze_case_evidence(events, evidence, PID,
+                                                         setup_deadline_t=10)["verdict"], "SKIPPED")
+
+    def test_tray_lifecycle_order_not_jsonl_row_order_and_duplicate_begin_is_ambiguous(self):
+        events, evidence = self.tray()
+        # The writer need not order producers by timestamp, but shutdown proof is last.
+        reordered = list(reversed(events[:-1])) + events[-1:]
+        self.assertEqual(analyze_case_evidence(reordered, evidence, PID, setup_deadline_t=10)["verdict"], "PASS")
+        for kind, timestamp in (("request_begin", 8.35), ("source", 8.45), ("finalized", 8.25)):
+            with self.subTest(kind=kind):
+                events, evidence = self.tray()
+                next(e for e in events if e.get("kind") == kind)["t"] = timestamp
+                self.assertEqual(analyze_case_evidence(events, evidence, PID, setup_deadline_t=10)["verdict"], "SKIPPED")
+        events, evidence = self.tray()
+        duplicate = dict(next(e for e in events if e.get("kind") == "request_begin"))
+        self.assertEqual(analyze_case_evidence(seal([*events, duplicate]), evidence, PID,
+                                             setup_deadline_t=10)["verdict"], "SKIPPED")
+
+    def test_tray_cache_absence_clock_requires_same_anchor_and_pre_close_proof(self):
+        events, evidence = self.tray()
+        result = analyze_case_evidence(events, evidence, PID, setup_deadline_t=10)
+        self.assertAlmostEqual(result["evidence"]["tray"]["cache_check_t"], 7.9)
+        for field, value in (("cache_check_unix_ms", None), ("cache_check_unix_ms", OS_START + 15_100),
+                             ("cache_check_unix_ms", OS_START + 17_001), ("cache_check_unix_ms", OS_START + 6_999)):
+            with self.subTest(value=value):
+                events, evidence = self.tray()
+                for event in events:
+                    if event.get("kind") in ("close_accept", "tray_hide"):
+                        event[field] = value
+                result = analyze_case_evidence(events, evidence, PID, setup_deadline_t=10)
+                self.assertEqual(result["verdict"], "SKIPPED")
+        events, evidence = self.tray()
+        next(e for e in events if e.get("kind") == "tray_hide")["cache_check_unix_ms"] += 1
+        self.assertEqual(analyze_case_evidence(events, evidence, PID, setup_deadline_t=10)["verdict"], "SKIPPED")
+        events, evidence = self.tray()
+        events[0].pop("wall_t")
         self.assertEqual(analyze_case_evidence(events, evidence, PID, setup_deadline_t=10)["verdict"], "SKIPPED")
 
     def test_seed_recipe_or_script_exit_zero_does_not_prove_normal_exit(self):
@@ -498,7 +642,7 @@ class EvidenceTests(unittest.TestCase):
             load = {**source, "cat": "thumb", "kind": "load_phases", "t": 10,
                     "total_ms": 50, "should_save": False, "force_cache": False}
             events.append(load)
-            self.assertEqual(analyze_case_evidence(events, evidence, PID, setup_deadline_t=10)["verdict"], "PASS")
+            self.assertEqual(analyze_case_evidence(seal(events), evidence, PID, setup_deadline_t=10)["verdict"], "SKIPPED")
             load["t"] = math.nextafter(10, math.inf)
             self.assertEqual(analyze_case_evidence(events, evidence, PID, setup_deadline_t=10)["verdict"], "SKIPPED")
 
@@ -518,7 +662,7 @@ class EvidenceTests(unittest.TestCase):
                     "seed_kinds": ["cache", "video-pin", "search"], "copied_after_process_exit": True,
                     "search": {"completed": True, "expected_hits": ["a"], "actual_hits": ["a"]},
                     "exit": {"process_exited": True, "forced": False}}
-        self.assertEqual(analyze_case_evidence(events, evidence, PID)["verdict"], "PASS")
+        self.assertEqual(analyze_case_evidence(seal(events), evidence, PID)["verdict"], "PASS")
         evidence["seed_phase"] = "reload"
         self.assertEqual(analyze_case_evidence(events, evidence, PID)["verdict"], "SKIPPED")
 
@@ -528,10 +672,7 @@ class IdleTests(unittest.TestCase):
         case = "static-foreground"
         events = [session(), {"cat": "frame", "kind": "begin", "t": 8, "n": 1},
                   {"cat": "ui", "kind": "tail_repaint", "t": 8, "n": 1, "action": "none"},
-                  {"cat": "qa", "kind": "cache_read", "t": 8, "key": "dir::fixture/child",
-                   "items_gen": 3, "from_cache": True},
-                  {"cat": "qa", "kind": "request_begin", "t": 7.9, "key": "dir::fixture/child",
-                   "items_gen": 3, "evaluated_display_px": 374},
+                  *cached_request("dir::fixture/child", 3, 1, t=8),
                   {"cat": "qa", "kind": "on_exit", "case_id": case, "t": 34, "flush_complete": True}]
         sampler = ClockTests().sampler()
         sampler.update(case_id=case, cpu_core_ratio=.01, app_log_growth_bytes=0, perf_log_growth_bytes=0,
@@ -542,7 +683,7 @@ class IdleTests(unittest.TestCase):
         evidence = {"case_id": case, "pid": PID, "exit": {"process_exited": True, "forced": False},
                     "cache": operations()["cache"], "requested_px": 374}
         thresholds = json.loads(Path(__file__).with_name("idle_health_thresholds.json").read_text(encoding="utf-8"))
-        return events, sampler, evidence, thresholds
+        return seal(events), sampler, evidence, thresholds
 
     def test_sleeping_window_requires_external_identity_and_full_foreground_lifetime(self):
         events, sampler, evidence, thresholds = self.setup_case()
@@ -568,6 +709,7 @@ class IdleTests(unittest.TestCase):
                     next(e for e in events if e.get("kind") == "request_begin")["t"] = finalized_t - .2
                     next(e for e in events if e.get("kind") == "source")["t"] = finalized_t - .1
                     next(e for e in events if e.get("kind") == "finalized")["t"] = finalized_t
+                    events = seal(events)
                     result = analyze_idle_case(events, sampler, evidence, thresholds, PID)
                     self.assertEqual(result["verdict"], expected, result)
                     clock = result["evidence"]["clock"]
@@ -631,6 +773,104 @@ class IdleTests(unittest.TestCase):
         events, sampler, evidence, thresholds = self.setup_case()
         next(e for e in events if e.get("kind") == "request_begin")["items_gen"] = 4
         self.assertEqual(analyze_idle_case(events, sampler, evidence, thresholds, PID)["verdict"], "SKIPPED")
+
+    def test_static_requires_canonical_begin_and_same_id_cache_origin(self):
+        for kind, field, value in (("request_begin", "request_id", None), ("request_begin", "idx", True),
+                                   ("cache_read", "request_id", 2), ("cache_read", "origin", "source_generated"),
+                                   ("request_begin", "t", 8.1)):
+            with self.subTest(kind=kind, field=field):
+                events, sampler, evidence, thresholds = self.setup_case()
+                next(e for e in events if e.get("kind") == kind)[field] = value
+                self.assertEqual(analyze_idle_case(events, sampler, evidence, thresholds, PID)["verdict"], "SKIPPED")
+
+    def test_passive_modifier_probe_uses_master_classifier_and_active_shape_still_fails(self):
+        events, sampler, evidence, thresholds = self.setup_case()
+        probe = {"cat": "input", "kind": "modifier_probe", "t": 11, "trigger": "heartbeat",
+                 "keys": [], "wheel": False, "focused": False}
+        events = seal([*events, probe])
+        result = analyze_idle_case(events, sampler, evidence, thresholds, PID)
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertEqual(result["metrics"]["idle"]["input_events"], 0)
+        probe["wheel"] = 0
+        result = analyze_idle_case(events, sampler, evidence, thresholds, PID)
+        self.assertEqual(result["verdict"], "FAIL")
+        self.assertEqual(result["metrics"]["idle"]["input_events"], 1)
+
+
+class DeliveryTests(unittest.TestCase):
+    def test_invalid_clock_retains_external_metrics_and_sampler_failure(self):
+        for clock_gap in ("missing_anchor", "invalid_utc", "reversed_utc", "changed_wall_clock"):
+            for failing_field, value in (("cpu_core_ratio", .5), ("app_log_growth_bytes", 16385),
+                                         ("perf_log_growth_bytes", 262145), ("verdict", "FAIL"),
+                                         (None, None)):
+                with self.subTest(clock_gap=clock_gap, failing_field=failing_field):
+                    events, sampler, evidence, thresholds = IdleTests().setup_case()
+                    if clock_gap == "missing_anchor":
+                        events[0].pop("wall_t")
+                    elif clock_gap == "invalid_utc":
+                        sampler["measure_start_unix_ms"] = None
+                    elif clock_gap == "reversed_utc":
+                        sampler["measure_end_unix_ms"] = sampler["measure_start_unix_ms"] - 1
+                    else:
+                        sampler["wall_seconds"] = 14
+                    if failing_field:
+                        sampler[failing_field] = value
+                    if failing_field == "verdict":
+                        sampler["failures"] = ["external sampler observed CPU failure"]
+                    result = analyze_idle_case(events, sampler, evidence, thresholds, PID)
+                    self.assertEqual((result["verdict"], result["exit_code"]),
+                                     ("FAIL", 1) if failing_field else ("SKIPPED", 2))
+                    self.assertTrue(result["environment_errors"])
+                    self.assertNotIn("idle", result["metrics"])
+                    for field in ("cpu_core_ratio", "app_log_growth_bytes", "perf_log_growth_bytes"):
+                        self.assertEqual(result["metrics"][field], sampler[field])
+                    if failing_field == "verdict":
+                        self.assertIn("external sampler observed CPU failure", result["failures"])
+
+    def test_missing_drop_counter_checkpoint_or_coverage_never_becomes_idle_pass(self):
+        for field, value in (("coverage_t", 24), ("perf_dropped_total", 1),
+                             ("normal_status", "unavailable"), ("written_watermark", 99),
+                             ("session_id", "another-session"), ("diagnostic_dropped_total", None)):
+            with self.subTest(field=field):
+                events, sampler, evidence, thresholds = IdleTests().setup_case()
+                events[-1][field] = value
+                result = analyze_idle_case(events, sampler, evidence, thresholds, PID)
+                self.assertEqual(result["verdict"], "SKIPPED")
+                self.assertEqual(result["evidence"]["delivery"]["status"], "CannotJudge")
+        events, sampler, evidence, thresholds = IdleTests().setup_case()
+        self.assertEqual(analyze_idle_case(events[:-1], sampler, evidence, thresholds, PID)["verdict"], "SKIPPED")
+
+    def test_incomplete_delivery_retains_independently_observed_cpu_and_input_failures(self):
+        events, sampler, evidence, thresholds = IdleTests().setup_case()
+        sampler["cpu_core_ratio"] = .10001
+        result = analyze_idle_case(events[:-1], sampler, evidence, thresholds, PID)
+        self.assertEqual((result["verdict"], result["exit_code"]), ("FAIL", 1))
+        self.assertTrue(result["environment_errors"])
+        events, sampler, evidence, thresholds = IdleTests().setup_case()
+        events = [*events[:-1], {"cat": "input", "kind": "key", "t": 11}]
+        result = analyze_idle_case(events, sampler, evidence, thresholds, PID)
+        self.assertEqual((result["verdict"], result["exit_code"]), ("FAIL", 1))
+        self.assertEqual(result["evidence"]["idle_delivery"]["status"], "CannotJudge")
+
+    def test_perf_uses_shutdown_delivery_without_waiving_detected_performance_failure(self):
+        events = perf_events()
+        result = analyze_perf_smoke(events[:-1], expected_pid=PID, case_id="perf-cached", evidence=operations())
+        self.assertEqual(result["verdict"], "SKIPPED")
+        events = perf_events({0: .25})
+        events[-1]["perf_dropped_total"] = 1
+        result = analyze_perf_smoke(events, expected_pid=PID, case_id="perf-cached", evidence=operations())
+        self.assertEqual(result["verdict"], "FAIL")
+        self.assertTrue(result["environment_errors"])
+
+    def test_strict_loader_retains_invalid_encoding_and_complete_json_without_newline(self):
+        with test_directory() as path:
+            log = path / "perf.jsonl"
+            log.write_text(json.dumps(session()), encoding="utf-8")
+            events, errors = load_events_strict(log)
+            self.assertTrue(any("incomplete JSONL tail" in reason for reason in errors))
+            self.assertTrue(events.evidence_errors)
+            log.write_bytes(b'{"t":1,"cat":"qa","kind":"bad","key":"\xff"}\n')
+            self.assertTrue(load_events_strict(log)[1])
 
 
 class CliTests(unittest.TestCase):

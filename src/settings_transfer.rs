@@ -139,11 +139,17 @@ macro_rules! transfer_get {
     ($s:expr, $f:ident, plain) => {
         $s.$f.clone()
     };
+    ($s:expr, $f:ident, specified_scale) => {
+        $s.common_fullscreen_specified_scale()
+    };
     ($s:expr, $f:ident, archive) => {
         $s.archive_file_handling_resolved()
     };
 }
 macro_rules! transfer_set {
+    ($s:expr, $f:ident, $v:expr, specified_scale) => {
+        $s.set_common_fullscreen_specified_scale(*$v)
+    };
     ($s:expr, $f:ident, $v:expr, plain) => {
         $s.$f = $v.clone()
     };
@@ -225,7 +231,7 @@ macro_rules! preferences_policy {
                 let mut changed_fields = Vec::new();
                 for accepted in &self.accepted { match accepted {
                     $( Accepted::$field(value) => {
-                        if settings.$field != *value { changed_fields.push($label.into()); }
+                        if transfer_get!(settings, $field, $get) != *value { changed_fields.push($label.into()); }
                         transfer_set!(settings, $field, value, $set);
                     }, )*
                     Accepted::StillChrome(value) => {
@@ -337,6 +343,8 @@ preferences_policy! {
         continuous_reading_gap_px: u32 => ("連結読書のページ間隔", |v, _raw| (0..=200).contains(v), plain, plain);
         fullscreen_image_margin_color: [u8; 3] => ("閲覧表示の余白色", |_, _| true, plain, plain);
         fullscreen_fit_mode: FullscreenFitMode => ("閲覧表示のフィット方法", |v, _raw| FullscreenFitMode::all().contains(v), plain, plain);
+        fullscreen_specified_scale: FullscreenSpecifiedScale => ("指定サイズの幅・高さ", |v, _| v.is_valid(), specified_scale, specified_scale);
+        fullscreen_specified_scale_max_tenths: u32 => ("指定サイズの最大倍率", |v, raw| raw.as_u64().is_some() && (FULLSCREEN_SPECIFIED_SCALE_MAX_MIN_TENTHS..=FULLSCREEN_SPECIFIED_SCALE_MAX_MAX_TENTHS).contains(v), plain, plain);
         fullscreen_fit_cycle_excluded: Vec<String> => ("フィット循環に含めるモード", |v, _| FullscreenFitMode::all().iter().any(|mode| mode.cycle_enabled(v)), plain, plain);
         fullscreen_fit_no_upscale: bool => ("フィットで拡大しない", |_, _| true, plain, plain);
         fullscreen_fit_no_downscale: bool => ("フィットで縮小しない", |_, _| true, plain, plain);
@@ -886,6 +894,11 @@ mod tests {
                 light: [80, 60, 0],
                 dark: [214, 186, 102],
             };
+        settings.fullscreen_specified_scale = FullscreenSpecifiedScale {
+            width: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(725)),
+            height: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::LogicalPixels(900)),
+        };
+        settings.fullscreen_specified_scale_max_tenths = 125;
         settings.raw_brightness = crate::raw::RawBrightness::None;
         settings.ui_theme = different_enum(
             &settings.ui_theme,
@@ -1602,13 +1615,147 @@ mod tests {
             copy.fullscreen_fit_cycle_excluded,
             settings.fullscreen_fit_cycle_excluded
         );
+        let legacy =
+            parse_preferences(&document(json!(["Page", "Width", "Height", "Original"]))).unwrap();
+        assert!(legacy.apply_to(&mut settings).issues.is_empty());
+        assert!(
+            FullscreenFitMode::SpecifiedScale
+                .cycle_enabled(&settings.fullscreen_fit_cycle_excluded)
+        );
         let before = settings.fullscreen_fit_cycle_excluded.clone();
         let parsed = parse_preferences(&document(serde_json::json!([
-            "Page", "Width", "Height", "Original"
+            "Page",
+            "Width",
+            "Height",
+            "Original",
+            "SpecifiedScale"
         ])))
         .unwrap();
         assert_eq!(parsed.apply_to(&mut settings).issues.len(), 1);
         assert_eq!(settings.fullscreen_fit_cycle_excluded, before);
+    }
+
+    #[test]
+    fn specified_scale_transfer_validates_complete_values_and_preserves_common_owner() {
+        let mut settings = Settings::default();
+        let common = FullscreenSpecifiedScale {
+            width: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(125)),
+            height: SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::LogicalPixels(800)),
+        };
+        settings.fullscreen_specified_scale = common;
+        settings.fullscreen_specified_scale_max_tenths = 125;
+        let explicit_disabled = FullscreenSpecifiedScale {
+            width: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::LogicalPixels(750)),
+            height: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(725)),
+        };
+        let mut favorite = FavoriteViewState::from_settings(&settings);
+        favorite.fullscreen_specified_scale = Some(explicit_disabled);
+        let id = uuid::Uuid::new_v4();
+        settings.apply_favorite_view_overlay(id, &favorite);
+        let exported = export_preferences(&settings).unwrap();
+        let wire: Value = serde_json::from_str(&exported.json).unwrap();
+        assert_eq!(
+            wire["preferences"]["fullscreen_specified_scale"],
+            serde_json::to_value(common).unwrap()
+        );
+        assert_eq!(
+            wire["preferences"]["fullscreen_specified_scale_max_tenths"],
+            125
+        );
+        assert!(!exported.json.contains(&id.to_string()));
+        let mut destination = Settings::default();
+        parse_preferences(&exported.json)
+            .unwrap()
+            .apply_to(&mut destination);
+        assert_eq!(destination.fullscreen_specified_scale, common);
+        assert_eq!(destination.fullscreen_specified_scale_max_tenths, 125);
+        parse_preferences(&document(json!({})))
+            .unwrap()
+            .apply_to(&mut settings);
+        assert_eq!(settings.common_fullscreen_specified_scale(), common);
+        let replacement = FullscreenSpecifiedScale {
+            width: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::LogicalPixels(32768)),
+            height: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(10000)),
+        };
+        let parsed = parse_preferences(&document(json!({
+            "fullscreen_specified_scale": replacement,
+            "fullscreen_specified_scale_max_tenths": 200
+        })))
+        .unwrap();
+        assert!(parsed.apply_to(&mut settings).issues.is_empty());
+        assert_eq!(settings.fullscreen_specified_scale, explicit_disabled);
+        assert_eq!(settings.common_fullscreen_specified_scale(), replacement);
+        assert_eq!(settings.fullscreen_specified_scale_max_tenths, 200);
+        assert_eq!(settings.active_favorite_view_id(), Some(id));
+        for invalid_axis in [
+            json!({"enabled":false,"value":{"PercentTenths":0}}),
+            json!({"enabled":false,"value":{"PercentTenths":10001}}),
+            json!({"enabled":false,"value":{"LogicalPixels":0}}),
+            json!({"enabled":false,"value":{"LogicalPixels":32769}}),
+            json!({"enabled":false,"value":{"LogicalPixels":1.5}}),
+            json!({"enabled":false,"value":{"FutureUnit":80}}),
+            json!({"enabled":false}),
+            json!({"value":{"PercentTenths":800}}),
+            json!({"enabled":null,"value":{"PercentTenths":800}}),
+            Value::Null,
+        ] {
+            let invalid = json!({"width":invalid_axis,"height":replacement.height});
+            let parsed =
+                parse_preferences(&document(json!({"fullscreen_specified_scale":invalid})))
+                    .unwrap();
+            assert_eq!(parsed.issues.len(), 1, "{invalid}");
+            parsed.apply_to(&mut settings);
+            assert_eq!(settings.common_fullscreen_specified_scale(), replacement);
+        }
+        let missing = parse_preferences(&document(json!({
+            "fullscreen_specified_scale":{"width":replacement.width}
+        })))
+        .unwrap();
+        assert_eq!(missing.issues.len(), 1);
+        // Unknown children remain forward-compatible, while recognized axes must be complete.
+        let mut extended = serde_json::to_value(explicit_disabled).unwrap();
+        extended
+            .as_object_mut()
+            .unwrap()
+            .insert("extra".into(), json!(true));
+        let parsed =
+            parse_preferences(&document(json!({"fullscreen_specified_scale":extended}))).unwrap();
+        assert!(parsed.apply_to(&mut destination).issues.is_empty());
+        assert_eq!(destination.fullscreen_specified_scale, explicit_disabled);
+        let reparsed = parse_preferences(&export_preferences(&destination).unwrap().json).unwrap();
+        let mut roundtrip = Settings::default();
+        assert!(reparsed.apply_to(&mut roundtrip).issues.is_empty());
+        assert_eq!(roundtrip.fullscreen_specified_scale, explicit_disabled);
+    }
+
+    #[test]
+    fn specified_scale_max_transfer_requires_integer_in_range() {
+        let mut settings = Settings::default();
+        for value in [10, 50, 200] {
+            let parsed = parse_preferences(&document(json!({
+                "fullscreen_specified_scale_max_tenths":value
+            })))
+            .unwrap();
+            assert!(parsed.apply_to(&mut settings).issues.is_empty());
+            assert_eq!(settings.fullscreen_specified_scale_max_tenths, value);
+        }
+        for invalid in [
+            json!(9),
+            json!(201),
+            json!(-1),
+            json!(10.0),
+            json!(50.5),
+            json!("50"),
+            json!(null),
+        ] {
+            let parsed = parse_preferences(&document(json!({
+                "fullscreen_specified_scale_max_tenths":invalid
+            })))
+            .unwrap();
+            assert_eq!(parsed.issues.len(), 1, "{invalid}");
+            parsed.apply_to(&mut settings);
+            assert_eq!(settings.fullscreen_specified_scale_max_tenths, 200);
+        }
     }
 
     #[test]
@@ -1676,13 +1823,20 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 454);
+        assert_eq!(entries.len(), 456);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            141
+            143
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|(_, reason)| reason.is_some())
+                .count(),
+            313
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -1692,7 +1846,7 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 139);
+        assert_eq!(wire.len(), 141);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);
@@ -1799,12 +1953,29 @@ mod tests {
         let exported = export_preferences(&source).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);
         let mut destination = private_destination();
+        // The overlay's common projection is transferable. Align it before this
+        // generic exclusion check, whose full runtime-owner equality stays strict.
+        // The focused specified-scale test covers importing a changed common value.
+        destination
+            .set_common_fullscreen_specified_scale(source.common_fullscreen_specified_scale());
         let before = destination.clone();
         let parsed = parse_preferences(&exported.json).unwrap();
         let report = parsed.apply_to(&mut destination);
         assert_eq!(report.accepted_count, wire_keys().len());
         assert!(report.issues.is_empty());
         assert_excluded_unchanged(&before, &destination);
+        assert_eq!(
+            destination.common_fullscreen_specified_scale(),
+            source.common_fullscreen_specified_scale()
+        );
+        assert_eq!(
+            destination.fullscreen_specified_scale,
+            before.fullscreen_specified_scale
+        );
+        assert_eq!(
+            destination.fullscreen_specified_scale_max_tenths,
+            source.fullscreen_specified_scale_max_tenths
+        );
         assert_eq!(
             export_preferences(&destination).unwrap().json,
             exported.json
