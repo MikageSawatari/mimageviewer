@@ -2989,6 +2989,114 @@ fn remove_paths_from_snapshot(
 mod tests {
     use super::*;
 
+    #[test]
+    fn g1_subfolder_real_handler_reopen_restores_legacy_flow_and_book_return() {
+        use crate::app::book_materialization::ExtractedSurface;
+        use crate::settings::{ReadingDirection, ReadingFlow, SpreadMode};
+        let ctx = egui::Context::default();
+        for saved_flow in [None, Some(ReadingFlow::Vertical)] {
+            let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+            let mut app = crate::app::setup_app_for_test();
+            app.active_quick_folder_slot = None;
+            app.settings.detached_viewer_open_images_in_window = false;
+            // Explicit compiled Books remain Books without making the extraction scan
+            // collapse every image-only directory into a Folder row.
+            app.settings.auto_fullscreen_image_folders = false;
+            app.settings.auto_fullscreen_zip_pdf = true;
+            app.settings.default_spread_mode = SpreadMode::RtlCover;
+            app.settings.default_reading_flow = ReadingFlow::Vertical;
+            app.settings.default_reading_direction = ReadingDirection::Rtl;
+            let books_root = app.tmp.path().join("books");
+            let book = books_root.join("subfolder-a2-original-book");
+            app.settings.book_root = Some(books_root);
+            std::fs::create_dir_all(&book).unwrap();
+            for name in ["a_1.png", "a_2.png"] {
+                image::RgbImage::new(2, 3).save(book.join(name)).unwrap();
+            }
+            let synthetic = subfolder_expansion_synthetic_path();
+            if let Some(flow) = saved_flow {
+                let db = app.spread_db.as_ref().unwrap();
+                db.set(
+                    &synthetic,
+                    SpreadMode::RtlCover,
+                    SpreadMode::Single,
+                    ReadingFlow::Paged,
+                    ReadingDirection::Ltr,
+                )
+                .unwrap();
+                db.set_flow(
+                    &synthetic,
+                    flow,
+                    ReadingDirection::Rtl,
+                    SpreadMode::Single,
+                    ReadingFlow::Paged,
+                    ReadingDirection::Ltr,
+                )
+                .unwrap();
+            }
+            let stored = app
+                .spread_db
+                .as_ref()
+                .unwrap()
+                .get_state_with_fallback(&synthetic, None);
+            app.load_folder(book.clone());
+            app.settle_open_path_classification_for_test();
+            app.finish_page_identity_preparation_for_test();
+            assert_eq!(app.spread_mode, SpreadMode::RtlCover);
+            assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+            app.start_subfolder_expansion_scan_roots(book.clone(), vec![book.clone()]);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !app.items_are_subfolder_expansion_view {
+                assert!(
+                    Instant::now() < deadline,
+                    "Subfolder A2 scan did not settle"
+                );
+                app.poll_subfolder_expansion(&ctx);
+                app.poll_sidecar_restore(&ctx);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            finish_list_hydration_for_test(&mut app);
+            assert_eq!(
+                app.extracted_result_surface(),
+                Some(ExtractedSurface::SubfolderExpansion)
+            );
+            // Like a new Smart root, this producer uses the legacy synthetic-key
+            // NON_BOOK restore: no saved flow means Paged after a Vertical Book.
+            let expected_flow = saved_flow.unwrap_or(ReadingFlow::Paged);
+            assert_eq!(app.reading_flow, expected_flow);
+            let index = app
+                .items
+                .iter()
+                .position(|item| matches!(item, GridItem::Image(_)))
+                .unwrap();
+            for _ in 0..2 {
+                app.open_fullscreen(index, crate::app::HistoryTrigger::UserChosen);
+                assert_eq!(app.fullscreen_idx, Some(index));
+                assert_eq!(app.spread_mode, SpreadMode::Single);
+                assert_eq!(app.reading_flow, expected_flow);
+                app.apply_fullscreen_spread_mode(&ctx, index, SpreadMode::RtlCover);
+                assert_eq!(app.spread_mode, SpreadMode::Rtl);
+                assert_eq!(app.reading_flow, expected_flow);
+                app.close_fullscreen();
+            }
+            assert_eq!(
+                app.spread_db
+                    .as_ref()
+                    .unwrap()
+                    .get_state_with_fallback(&synthetic, None),
+                stored
+            );
+            app.exit_subfolder_expansion_view();
+            app.settle_open_path_classification_for_test();
+            app.finish_page_identity_preparation_for_test();
+            assert_eq!(app.current_folder.as_deref(), Some(book.as_path()));
+            assert!(app.extracted_result_surface().is_none());
+            assert_eq!(app.spread_mode, SpreadMode::RtlCover);
+            assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+            assert_eq!(app.reading_direction, ReadingDirection::Rtl);
+        }
+    }
+
     fn finish_list_hydration_for_test(app: &mut App) {
         let ctx = egui::Context::default();
         let deadline = Instant::now() + Duration::from_secs(5);

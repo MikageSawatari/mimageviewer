@@ -25849,12 +25849,21 @@ impl App {
         defaults: SpreadRestoreDefaults,
         document_direction: Option<crate::pdf_loader::PdfReadingDirection>,
     ) -> Result<(), String> {
+        let db = self.spread_db.as_ref().map_err(Clone::clone)?;
+        let stored = db.get_state_with_fallback(key, fallback);
         if self.extracted_result_surface().is_some() {
+            // A2 changes pairing, not the entrance's existing continuous-reading policy.
+            // Legacy Vertical is a flow encoding and overrides a retained flow column,
+            // exactly as in the normal restore below. Other synthetic pairing settings
+            // must not configure the result session.
+            self.reading_flow = stored.flow.unwrap_or(defaults.reading_flow);
+            if stored.mode.unwrap_or(defaults.spread_mode) == crate::settings::SpreadMode::Vertical
+            {
+                self.reading_flow = crate::settings::ReadingFlow::Vertical;
+            }
             self.begin_extracted_result_view();
             return Ok(());
         }
-        let db = self.spread_db.as_ref().map_err(Clone::clone)?;
-        let stored = db.get_state_with_fallback(key, fallback);
         let final_cover_preference =
             db.get_final_cover_spread_preference_with_fallback(key, fallback);
         let endpoint_preferences = db
@@ -95535,6 +95544,10 @@ mod still_seek_thumbnail_ownership;
 pub(crate) use tests::phase_c_support::{
     AppTestEnv as AppTestEnvForTest, setup_app as setup_app_for_test,
 };
+
+#[cfg(test)]
+#[path = "app/tests/g1_extracted_handlers.rs"]
+mod g1_extracted_handlers;
 
 #[cfg(test)]
 mod index_full_check_tests {

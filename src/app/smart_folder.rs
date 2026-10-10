@@ -9855,6 +9855,118 @@ mod tests {
     use super::*;
 
     #[test]
+    fn g1_smart_real_handler_reopen_restores_legacy_flow_and_book_return() {
+        use crate::app::book_materialization::{ExtractedSurface, ProjectionRecipe};
+        use crate::settings::{ReadingDirection, ReadingFlow, SpreadMode};
+        for saved_flow in [None, Some(ReadingFlow::Vertical)] {
+            let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+            let mut app = crate::app::setup_app_for_test();
+            app.active_quick_folder_slot = None;
+            app.settings.detached_viewer_open_images_in_window = false;
+            app.settings.auto_fullscreen_image_folders = true;
+            app.settings.auto_fullscreen_zip_pdf = true;
+            app.settings.default_spread_mode = SpreadMode::RtlCover;
+            app.settings.default_reading_flow = ReadingFlow::Vertical;
+            app.settings.default_reading_direction = ReadingDirection::Rtl;
+            let book = app.tmp.path().join("smart-a2-original-book");
+            std::fs::create_dir_all(&book).unwrap();
+            for name in ["01.png", "02.png"] {
+                image::RgbImage::new(2, 3).save(book.join(name)).unwrap();
+            }
+            app.load_folder(book.clone());
+            app.settle_open_path_classification_for_test();
+            app.finish_page_identity_preparation_for_test();
+            assert!(matches!(app.projection_recipe, ProjectionRecipe::Book(_)));
+            assert_eq!(app.spread_mode, SpreadMode::RtlCover);
+            assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+            let mut definition = crate::settings::SmartFolderDefinition::new("A2 flow");
+            definition.rules.push(crate::settings::SmartFolderRule::new(
+                book.clone(),
+                true,
+                Default::default(),
+            ));
+            let id = definition.id;
+            let synthetic = smart_folder_synthetic_path(id);
+            if let Some(flow) = saved_flow {
+                let db = app.spread_db.as_ref().unwrap();
+                db.set(
+                    &synthetic,
+                    SpreadMode::RtlCover,
+                    SpreadMode::Single,
+                    ReadingFlow::Paged,
+                    ReadingDirection::Ltr,
+                )
+                .unwrap();
+                db.set_flow(
+                    &synthetic,
+                    flow,
+                    ReadingDirection::Rtl,
+                    SpreadMode::Single,
+                    ReadingFlow::Paged,
+                    ReadingDirection::Ltr,
+                )
+                .unwrap();
+            }
+            let stored = app
+                .spread_db
+                .as_ref()
+                .unwrap()
+                .get_state_with_fallback(&synthetic, None);
+            app.settings.smart_folders = vec![definition];
+            app.open_smart_folder(id, false);
+            let ctx = egui::Context::default();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !app.items_are_smart_folder_view || app.smart_folder_busy() {
+                assert!(Instant::now() < deadline, "Smart A2 scan did not settle");
+                app.poll_smart_folder(&ctx);
+                app.poll_sidecar_restore(&ctx);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            app.finish_page_identity_preparation_for_test();
+            assert_eq!(
+                app.extracted_result_surface(),
+                Some(ExtractedSurface::SmartFolder)
+            );
+            // New Smart scans use the released synthetic-key NON_BOOK restore. A moved
+            // root-session return bypasses it and preserves its already accepted flow.
+            let expected_flow = saved_flow.unwrap_or(ReadingFlow::Paged);
+            assert_eq!(app.reading_flow, expected_flow);
+            let index = app
+                .items
+                .iter()
+                .position(|item| matches!(item, GridItem::Image(_)))
+                .unwrap();
+            for _ in 0..2 {
+                app.open_fullscreen(index, crate::app::HistoryTrigger::UserChosen);
+                assert_eq!(app.fullscreen_idx, Some(index));
+                assert_eq!(app.spread_mode, SpreadMode::Single);
+                assert_eq!(app.reading_flow, expected_flow);
+                app.apply_fullscreen_spread_mode(&ctx, index, SpreadMode::RtlCover);
+                assert_eq!(app.spread_mode, SpreadMode::Rtl);
+                assert_eq!(app.reading_flow, expected_flow);
+                app.close_fullscreen();
+            }
+            assert_eq!(
+                app.spread_db
+                    .as_ref()
+                    .unwrap()
+                    .get_state_with_fallback(&synthetic, None),
+                stored
+            );
+            assert!(matches!(app.folder_history_back_target(),
+                Some(super::super::FolderNavHistoryTarget::Path(path)) if path == &book));
+            app.dispatch_main_folder_history_input(super::super::FolderHistoryDirection::Back);
+            app.settle_open_path_classification_for_test();
+            app.finish_history_restore_preparation_for_test();
+            assert_eq!(app.current_folder.as_deref(), Some(book.as_path()));
+            assert!(matches!(app.projection_recipe, ProjectionRecipe::Book(_)));
+            assert_eq!(app.spread_mode, SpreadMode::RtlCover);
+            assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+            assert_eq!(app.reading_direction, ReadingDirection::Rtl);
+        }
+    }
+
+    #[test]
     fn section1339_smart_grid_classification_row_removal_cannot_reinterpret_original_path() {
         let mut app = crate::app::tests::phase_c_support::setup_app();
         app.active_quick_folder_slot = None;

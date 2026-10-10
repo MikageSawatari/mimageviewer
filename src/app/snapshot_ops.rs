@@ -3268,35 +3268,123 @@ mod tests {
 
     #[test]
     fn g1_snapshot_a2_deactivation_preserves_source_book_presentation() {
-        use crate::app::book_materialization::{BookScope, ProjectionRecipe};
-        let mut app = test_app_with_items(vec![
-            GridItem::Image(PathBuf::from(r"E:\test\01.png")),
-            GridItem::Image(PathBuf::from(r"E:\test\02.png")),
-        ]);
-        app.projection_recipe =
-            ProjectionRecipe::Book(BookScope::ImageFolder(PathBuf::from(r"E:\test")));
-        app.spread_mode = crate::settings::SpreadMode::RtlCover;
-        app.reading_direction = crate::settings::ReadingDirection::Rtl;
-        app.settings.default_reading_direction = crate::settings::ReadingDirection::Ltr;
-        app.reading_flow = crate::settings::ReadingFlow::Vertical;
+        use crate::app::book_materialization::{BookScope, ExtractedSurface, ProjectionRecipe};
+        use crate::settings::{ReadingDirection, ReadingFlow, SpreadMode};
+        let mut app = setup_app_for_test();
+        let book = app.tmp.path().join("g1-snapshot-source-book");
+        std::fs::create_dir(&book).unwrap();
+        for name in ["01.png", "02.png"] {
+            image::RgbImage::new(2, 3).save(book.join(name)).unwrap();
+        }
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.settings.auto_fullscreen_image_folders = true;
+        app.settings.default_spread_mode = SpreadMode::LtrCover;
+        app.settings.default_reading_direction = ReadingDirection::Ltr;
+        app.settings.default_reading_flow = ReadingFlow::Horizontal;
+        let db_path = app.tmp.path().join("g1-snapshot-spread.db");
+        app.spread_db = Ok(crate::spread_db::SpreadDb::open_at(&db_path).unwrap());
+        app.spread_db
+            .as_ref()
+            .unwrap()
+            .set_presentation_state(
+                &book,
+                SpreadMode::RtlCover,
+                ReadingFlow::Vertical,
+                ReadingDirection::Rtl,
+                (
+                    SpreadMode::LtrCover,
+                    ReadingFlow::Horizontal,
+                    ReadingDirection::Ltr,
+                ),
+            )
+            .unwrap();
+        app.load_folder(book.clone());
+        app.settle_open_path_classification_for_test();
+        app.finish_page_identity_preparation_for_test();
+        let original_recipe = ProjectionRecipe::Book(BookScope::ImageFolder(book));
+        assert_eq!(app.projection_recipe, original_recipe);
         app.spread_shift_anchor_idx = Some(1);
+        let source_items = app.items.clone();
         let before = app.capture_snapshot_viewing_state();
+        let observer = rusqlite::Connection::open(&db_path).unwrap();
+        let version: i64 = observer
+            .pragma_query_value(None, "data_version", |row| row.get(0))
+            .unwrap();
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
-        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Single);
-        app.apply_fullscreen_spread_mode(
-            &egui::Context::default(),
-            0,
-            crate::settings::SpreadMode::Ltr,
-        );
-        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Ltr);
+        drain_snapshot_identity_preparation(&mut app);
+        let recipe = ProjectionRecipe::ExtractedResult(ExtractedSurface::Snapshot);
+        assert_eq!(app.projection_recipe, recipe);
+        assert_eq!(app.spread_mode, SpreadMode::Single);
+        // HEAD^ activation swapped rows directly and retained the preceding flow.
+        assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+        assert_eq!(app.snapshot.as_ref().unwrap().saved_viewing_state, before);
+        let ctx = egui::Context::default();
+        for idx in [0, 1] {
+            assert!(app.snapshot_open_entry(idx, false, crate::app::HistoryTrigger::UserChosen));
+            assert_eq!(app.fullscreen_idx, Some(idx));
+            assert_eq!(app.projection_recipe, recipe);
+            assert_eq!(app.spread_mode, SpreadMode::Single);
+            assert_eq!(app.reading_direction, ReadingDirection::Ltr);
+            assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+            app.apply_fullscreen_spread_mode(&ctx, idx, SpreadMode::RtlCover);
+            assert_eq!(app.spread_mode, SpreadMode::Ltr);
+            assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+            if idx == 1 {
+                app.set_reading_flow_for_fullscreen(&ctx, idx, ReadingFlow::Horizontal);
+                assert_eq!(app.reading_flow, ReadingFlow::Horizontal);
+            }
+            app.close_fullscreen();
+        }
         app.deactivate_snapshot();
+        assert_eq!(app.items, source_items);
         assert_eq!(app.capture_snapshot_viewing_state(), before);
-        assert!(matches!(app.projection_recipe, ProjectionRecipe::Book(_)));
-        assert_eq!(app.spread_mode, crate::settings::SpreadMode::RtlCover);
+        assert_eq!(app.projection_recipe, original_recipe);
+        assert_eq!(app.spread_mode, SpreadMode::RtlCover);
+        assert_eq!(app.reading_direction, ReadingDirection::Rtl);
         assert_eq!(
-            app.reading_direction,
-            crate::settings::ReadingDirection::Rtl
+            observer
+                .pragma_query_value::<i64, _>(None, "data_version", |row| row.get(0))
+                .unwrap(),
+            version,
+            "snapshot opens and temporary modes/flow must not write spread.db"
         );
+    }
+
+    #[test]
+    fn g1_snapshot_real_producer_classifies_cross_book_and_mixed_lists_as_a2() {
+        use crate::app::book_materialization::{ExtractedSurface, ProjectionRecipe};
+        use crate::settings::{ReadingFlow, SpreadMode};
+        for mixed in [false, true] {
+            let second = if mixed {
+                GridItem::Video(PathBuf::from(r"E:\book-b\clip.mp4"))
+            } else {
+                GridItem::Image(PathBuf::from(r"E:\book-b\page.png"))
+            };
+            let mut app = test_app_with_items(vec![
+                GridItem::Image(PathBuf::from(r"E:\book-a\page.png")),
+                second,
+            ]);
+            app.reading_flow = ReadingFlow::Vertical;
+            app.settings.default_spread_mode = SpreadMode::RtlCover;
+            app.activate_snapshot(SnapshotSourceLabel::Mixed);
+            drain_snapshot_identity_preparation(&mut app);
+            assert_eq!(
+                app.projection_recipe,
+                ProjectionRecipe::ExtractedResult(ExtractedSurface::Snapshot)
+            );
+            assert_eq!(app.snapshot_count(), Some(2));
+            assert_eq!(
+                app.items
+                    .iter()
+                    .any(|item| matches!(item, GridItem::Video(_))),
+                mixed
+            );
+            assert!(app.snapshot_open_entry(0, false, crate::app::HistoryTrigger::UserChosen));
+            assert_eq!(app.spread_mode, SpreadMode::Single);
+            assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+            app.close_fullscreen();
+            app.deactivate_snapshot();
+        }
     }
 
     #[test]

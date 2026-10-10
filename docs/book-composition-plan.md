@@ -1323,6 +1323,8 @@ G1の完了条件へG2以降の構成fixtureを先取りしない。G4F未実装
 
 **2026-10-10 coordinator決定**: A2から元の本へ戻るときは、変更前と同じ本の閲覧状態を復元する。元列と閲覧状態を既存snapshot ownerへ一緒に退避し、同じreturn adoption内で両方を戻す。別owner/第二commit点は作らず、A2のSingle/一時Spreadを本へ書き戻さない（A2「記憶しない」の復帰契約）。BSで固定列へ戻る場合はA2、新規openはSingle。検索のback/BS・履歴の本への復帰は既存Book設定adoption、F12はcontext内snapshot/bundleの復帰、Remoteは本の通常response復帰へ同じ契約を適用し、各境界を回帰testする。
 
+**2026-10-10 G1 review修正（P2-1）**: 連結方式（flow）はA2のpairing初期化と分離し、各入口の従来の採用規則を維持する。タグ・お気に入り・評価・サブ展開・Smart新規rootは既存の保存flow（旧Vertical表現を含む）または従来の分類に対応するdefaults（通常はNON_BOOKのPaged）を採用し、GlobalSearch・Smart保存root復帰・Collection root・固定snapshotの直接列差し替えは既存flowを維持する。単ページ化・再openだけを理由にflowを変更せず、連結読みの操作を維持する。旧Vertical mode行はflow列に別値が残っていても従来どおり縦連結へ復元し、旧行は変更しない。
+
 受入:
 
 - 数字名/日付/評価sort、通常folder/製本、PDF/EPUB、wrapper/nested/直接RAR/変換cacheで元manifest順一致。

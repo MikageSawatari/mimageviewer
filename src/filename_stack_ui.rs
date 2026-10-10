@@ -2172,6 +2172,166 @@ mod tests {
     }
 
     #[test]
+    fn g1_subfolder_stack_book_reopen_preserves_vertical_flow_and_original_book() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let books_root = app.tmp.path().join("books");
+        let folder = books_root.join("subfolder-stack-book");
+        std::fs::create_dir_all(&folder).unwrap();
+        for (name, stars) in [
+            ("a_1.jpg", 1),
+            ("a_2.jpg", 2),
+            ("b_1.jpg", 5),
+            ("b_2.jpg", 4),
+        ] {
+            let path = folder.join(name);
+            image::RgbImage::new(1, 1).save(&path).unwrap();
+            app.rating_db
+                .as_ref()
+                .unwrap()
+                .set_user_rating(&crate::adjustment_db::normalize_path(&path), stars, None)
+                .unwrap();
+        }
+        app.settings.sort_order = SortOrder::RatingDesc;
+        app.active_quick_folder_slot = None;
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.settings.auto_fullscreen_image_folders = false;
+        app.settings.auto_fullscreen_zip_pdf = true;
+        // A compiled Book supplies the source/return flow without causing the
+        // subfolder scan to collapse these pages into a Folder row.
+        app.settings.book_root = Some(books_root);
+        app.settings.default_spread_mode = crate::settings::SpreadMode::RtlCover;
+        app.settings.default_reading_flow = crate::settings::ReadingFlow::Vertical;
+        app.settings.default_reading_direction = crate::settings::ReadingDirection::Rtl;
+        app.load_folder(folder.clone());
+        app.settle_open_path_classification_for_test();
+        app.finish_page_identity_preparation_for_test();
+        assert_eq!(app.reading_flow, crate::settings::ReadingFlow::Vertical);
+        let synthetic = crate::app::subfolder_expansion_synthetic_path();
+        app.spread_db
+            .as_ref()
+            .unwrap()
+            .set_flow(
+                &synthetic,
+                crate::settings::ReadingFlow::Vertical,
+                crate::settings::ReadingDirection::Rtl,
+                crate::settings::SpreadMode::Single,
+                crate::settings::ReadingFlow::Paged,
+                crate::settings::ReadingDirection::Ltr,
+            )
+            .unwrap();
+        let stored = app
+            .spread_db
+            .as_ref()
+            .unwrap()
+            .get_state_with_fallback(&synthetic, None);
+        app.start_subfolder_expansion_scan_roots(folder.clone(), vec![folder.clone()]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.items_are_subfolder_expansion_view && std::time::Instant::now() < deadline {
+            app.poll_subfolder_expansion(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.items_are_subfolder_expansion_view);
+        finish_list_hydration_for_test(&mut app, &ctx);
+        assert_eq!(
+            app.subfolder_expansion_snapshot
+                .as_ref()
+                .unwrap()
+                .stack_order_request,
+            crate::rating_sort::ListingOrderRequest::Standard(SortOrder::Numeric)
+        );
+        app.toggle_subfolder_stack_mode();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.stack_view.is_none() && std::time::Instant::now() < deadline {
+            app.poll_stack_script(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Publishing stack_view precedes the installed listing's hydration terminal.
+        // A flat open during that modal would remain deferred until the terminal is pumped.
+        finish_list_hydration_for_test(&mut app, &ctx);
+        let view = app.stack_view.as_ref().expect("subfolder stack prepared");
+        assert_eq!(
+            app.projection_recipe,
+            crate::app::book_materialization::ProjectionRecipe::ExtractedResult(
+                crate::app::book_materialization::ExtractedSurface::SubfolderExpansion
+            )
+        );
+        assert_eq!(
+            view.groups
+                .iter()
+                .map(|group| group
+                    .representative()
+                    .path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy())
+                .collect::<Vec<_>>(),
+            ["a_1.jpg", "b_1.jpg"]
+        );
+        assert_eq!(
+            view.materialize_flat()
+                .0
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["a_1.jpg", "a_2.jpg", "b_1.jpg", "b_2.jpg"]
+        );
+        app.stack_enter_flat_fullscreen(&ctx, 1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.stack_showing_flat && std::time::Instant::now() < deadline {
+            app.poll_stack_script(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.stack_showing_flat);
+        finish_list_hydration_for_test(&mut app, &ctx);
+        assert!(!app.sidecar_restore_active());
+        assert_eq!(app.fullscreen_idx, Some(1));
+        assert!(app.extracted_result_surface().is_some());
+        assert_eq!(app.items[1].name(), "a_2.jpg");
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Single);
+        assert_eq!(app.reading_flow, crate::settings::ReadingFlow::Vertical);
+        app.apply_fullscreen_spread_mode(&ctx, 1, crate::settings::SpreadMode::RtlCover);
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Rtl);
+        app.close_fullscreen();
+        assert_eq!(app.fullscreen_idx, None);
+        app.stack_reconcile_after_fullscreen_close(&ctx);
+        assert!(!app.stack_showing_flat);
+        app.stack_enter_flat_fullscreen(&ctx, 1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.stack_showing_flat {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stack reopen did not settle"
+            );
+            app.poll_stack_script(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        finish_list_hydration_for_test(&mut app, &ctx);
+        assert!(!app.sidecar_restore_active());
+        assert_eq!(app.fullscreen_idx, Some(1));
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::Single);
+        assert_eq!(app.reading_flow, crate::settings::ReadingFlow::Vertical);
+        assert_eq!(app.items[1].name(), "a_2.jpg");
+        assert_eq!(
+            app.spread_db
+                .as_ref()
+                .unwrap()
+                .get_state_with_fallback(&synthetic, None),
+            stored
+        );
+        app.close_fullscreen();
+        app.stack_reconcile_after_fullscreen_close(&ctx);
+        app.exit_subfolder_expansion_view();
+        app.settle_open_path_classification_for_test();
+        app.finish_page_identity_preparation_for_test();
+        assert_eq!(app.current_folder.as_deref(), Some(folder.as_path()));
+        assert!(app.extracted_result_surface().is_none());
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::RtlCover);
+        assert_eq!(app.reading_flow, crate::settings::ReadingFlow::Vertical);
+    }
+
+    #[test]
     fn subfolder_stack_toggle_keeps_prepared_sort_across_global_sort_changes() {
         let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let ctx = egui::Context::default();

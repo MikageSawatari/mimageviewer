@@ -11,6 +11,7 @@ itemsの採用時に排他的な`ProjectionRecipe`を確定する。抽出結果
 synthetic pathから推定しない。recipeはViewerContextBundleのmount/forkとsnapshot保存列へ登録し、
 物理本へのdrillと抽出rootへの復帰を区別する。A2の表示種別は既存spread/continuous ownerが担い、
 新規openはSingle、一時表示の方向はsession snapshot、表示設定DBには結果用keyを生成しない。
+連結方式（flow）はA2のpairing初期化と分離し、各入口の従来の採用規則を維持する。タグ・お気に入り・評価・サブ展開・Smart新規rootは既存の保存flow（旧Vertical表現を含む）または従来の分類に対応するdefaults（通常はNON_BOOKのPaged）を採用し、GlobalSearch・Smart保存root復帰・Collection root・固定snapshotの直接列差し替えは既存flowを維持する。単ページ化・再openだけを理由にflowを変更せず、連結読みの操作を維持する。旧Vertical mode行はflow列に別値が残っていても従来どおり縦連結へ復元し、旧行は変更しない。
 元の本の列を保存する既存SnapshotStateは閲覧状態（mode/方向/flow/shift index/補助設定）も
 一緒に保持し、固定解除の同じadoption内で復元する。BSで固定列へ戻る場合はA2のまま。
 検索のback/BS・履歴の本への復帰は既存Book設定adoption、F12はcontext内snapshot/bundle、

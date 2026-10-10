@@ -55808,9 +55808,32 @@ mod tests {
         (positions, projection_items)
     }
 
+    #[derive(Clone, Debug, PartialEq)]
     struct SpreadPopupTestState {
         open: bool,
+        extracted_result: bool,
+        spread_mode: SpreadMode,
+        reading_flow: ReadingFlow,
+        reading_direction: ReadingDirection,
+        final_cover_preference: crate::settings::FinalCoverSpreadPreference,
         singleton_preference: crate::settings::SingletonSpreadEndpointPreferences,
+        page_alone_preferences: crate::settings::PageAlonePreferences,
+    }
+
+    impl Default for SpreadPopupTestState {
+        fn default() -> Self {
+            Self {
+                open: true,
+                extracted_result: false,
+                spread_mode: SpreadMode::Ltr,
+                reading_flow: ReadingFlow::Paged,
+                reading_direction: ReadingDirection::Ltr,
+                final_cover_preference: crate::settings::FinalCoverSpreadPreference::FollowGlobal,
+                singleton_preference: crate::settings::SingletonSpreadEndpointPreferences::default(
+                ),
+                page_alone_preferences: crate::settings::PageAlonePreferences::default(),
+            }
+        }
     }
 
     fn spread_popup_test_frame(
@@ -55841,13 +55864,6 @@ mod tests {
                     let mut panorama_pressed = false;
                     let mut panorama_projection_popup_open = false;
                     let mut panorama_projection_choice = None;
-                    let mut spread_mode = SpreadMode::Ltr;
-                    let mut reading_flow = ReadingFlow::Paged;
-                    let mut reading_direction = ReadingDirection::Ltr;
-                    let mut final_cover_spread_preference =
-                        crate::settings::FinalCoverSpreadPreference::FollowGlobal;
-                    let mut page_alone_preferences =
-                        crate::settings::PageAlonePreferences::default();
                     let mut local_adjust_mode = false;
                     let mut fit_popup_open = false;
                     let mut slideshow_popup_open = false;
@@ -55889,13 +55905,13 @@ mod tests {
                         crate::panorama::PanoProjection::Perspective,
                         &mut panorama_projection_popup_open,
                         &mut panorama_projection_choice,
-                        false,
-                        &mut spread_mode,
-                        &mut reading_flow,
-                        &mut reading_direction,
-                        &mut final_cover_spread_preference,
+                        state.extracted_result,
+                        &mut state.spread_mode,
+                        &mut state.reading_flow,
+                        &mut state.reading_direction,
+                        &mut state.final_cover_preference,
                         &mut state.singleton_preference,
-                        &mut page_alone_preferences,
+                        &mut state.page_alone_preferences,
                         &mut state.open,
                         false,
                         &mut local_adjust_mode,
@@ -55946,6 +55962,181 @@ mod tests {
         .map(|response| response.rect)
     }
 
+    fn spread_popup_test_click(
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        state: &mut SpreadPopupTestState,
+        id: egui::Id,
+    ) {
+        let target = crate::settings::SingletonSpreadPlacementPreference::FollowGlobal;
+        for _ in 0..2 {
+            spread_popup_test_frame(ctx, full_rect, Vec::new(), state, target);
+        }
+        let response = ctx.read_response(id).expect("real spread popup row");
+        assert!(
+            full_rect.contains_rect(response.rect),
+            "the click regression requires a fully visible row: {response:?}"
+        );
+        let pos = response.rect.center();
+        spread_popup_test_frame(
+            ctx,
+            full_rect,
+            vec![egui::Event::PointerMoved(pos)],
+            state,
+            target,
+        );
+        for pressed in [true, false] {
+            spread_popup_test_frame(
+                ctx,
+                full_rect,
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                state,
+                target,
+            );
+        }
+    }
+
+    #[test]
+    fn g1_extracted_real_spread_popup_disables_binding_and_helpers() {
+        use crate::settings::{
+            FinalCoverSpreadPreference, PageAlonePreference, SingletonSpreadPlacementPreference,
+        };
+        let full_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 1800.0));
+        let mut binding_and_helper_ids = vec![
+            "reading_direction_popup_0".to_owned(),
+            "reading_direction_popup_1".to_owned(),
+        ];
+        for preference in FinalCoverSpreadPreference::all() {
+            binding_and_helper_ids
+                .push(format!("final_cover_spread_popup_{}", preference.to_int()));
+        }
+        for endpoint in 0..2 {
+            for preference in SingletonSpreadPlacementPreference::all() {
+                binding_and_helper_ids.push(format!(
+                    "singleton_spread_placement_popup_{endpoint}_{}",
+                    preference.to_int()
+                ));
+            }
+            for preference in PageAlonePreference::all() {
+                binding_and_helper_ids.push(format!(
+                    "page_alone_popup_{endpoint}_{}",
+                    preference.to_int()
+                ));
+            }
+        }
+        let edits: [(&str, fn(&mut SpreadPopupTestState)); 6] = [
+            ("reading_direction_popup_1", |state| {
+                state.reading_direction = ReadingDirection::Rtl;
+            }),
+            ("final_cover_spread_popup_1", |state| {
+                state.final_cover_preference = FinalCoverSpreadPreference::On;
+            }),
+            ("singleton_spread_placement_popup_0_1", |state| {
+                state.singleton_preference.first = SingletonSpreadPlacementPreference::Place;
+            }),
+            ("singleton_spread_placement_popup_1_1", |state| {
+                state.singleton_preference.last = SingletonSpreadPlacementPreference::Place;
+            }),
+            ("page_alone_popup_0_1", |state| {
+                state.page_alone_preferences.after_cover = PageAlonePreference::On;
+            }),
+            ("page_alone_popup_1_1", |state| {
+                state.page_alone_preferences.last = PageAlonePreference::On;
+            }),
+        ];
+        for extracted_result in [false, true] {
+            let ctx = egui::Context::default();
+            let mut state = SpreadPopupTestState {
+                extracted_result,
+                spread_mode: SpreadMode::Single,
+                ..Default::default()
+            };
+            spread_popup_test_frame(
+                &ctx,
+                full_rect,
+                Vec::new(),
+                &mut state,
+                SingletonSpreadPlacementPreference::FollowGlobal,
+            );
+            for id in &binding_and_helper_ids {
+                let response = ctx
+                    .read_response(egui::Id::new(id))
+                    .expect("the real popup keeps binding/helper rows visible");
+                assert_eq!(response.enabled(), !extracted_result, "{id}");
+            }
+            for mode in [SpreadMode::LtrCover, SpreadMode::RtlCover] {
+                assert_eq!(
+                    ctx.read_response(egui::Id::new(format!("spread_popup_{}", mode.to_int())))
+                        .is_some(),
+                    !extracted_result,
+                    "cover binding is unavailable in the extracted popup"
+                );
+            }
+            for (id, edit) in edits {
+                let ctx = egui::Context::default();
+                let mut state = SpreadPopupTestState {
+                    extracted_result,
+                    spread_mode: SpreadMode::Single,
+                    ..Default::default()
+                };
+                let mut expected = state.clone();
+                if !extracted_result {
+                    edit(&mut expected);
+                    expected.open = false;
+                }
+                spread_popup_test_click(&ctx, full_rect, &mut state, egui::Id::new(id));
+                assert_eq!(state, expected, "extracted={extracted_result} row={id}");
+            }
+        }
+    }
+
+    #[test]
+    fn g1_extracted_real_spread_popup_preserves_reading_flow_controls() {
+        let full_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 1800.0));
+        for extracted_result in [false, true] {
+            for &flow in ReadingFlow::all() {
+                let ctx = egui::Context::default();
+                let mut state = SpreadPopupTestState {
+                    extracted_result,
+                    spread_mode: SpreadMode::Single,
+                    reading_flow: if flow == ReadingFlow::Paged {
+                        ReadingFlow::Vertical
+                    } else {
+                        ReadingFlow::Paged
+                    },
+                    ..Default::default()
+                };
+                let mut expected = state.clone();
+                expected.reading_flow = flow;
+                expected.open = false;
+                let id = egui::Id::new(format!("reading_flow_popup_{}", flow.to_int()));
+                spread_popup_test_frame(
+                    &ctx,
+                    full_rect,
+                    Vec::new(),
+                    &mut state,
+                    crate::settings::SingletonSpreadPlacementPreference::FollowGlobal,
+                );
+                assert!(
+                    ctx.read_response(id)
+                        .expect("real popup reading-flow row")
+                        .enabled(),
+                    "flow stays enabled in extracted={extracted_result}: {flow:?}"
+                );
+                spread_popup_test_click(&ctx, full_rect, &mut state, id);
+                assert_eq!(
+                    state, expected,
+                    "extracted={extracted_result} flow={flow:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn singleton_spread_preferences_remain_scrollable_and_clickable_on_short_viewports() {
         for height in [576.0, 720.0] {
@@ -55963,6 +56154,7 @@ mod tests {
                         crate::settings::SingletonSpreadPlacementPreference::FollowGlobal
                     })
                     .into(),
+                    ..Default::default()
                 };
                 let first_row =
                     spread_popup_test_frame(&ctx, full_rect, Vec::new(), &mut state, target)

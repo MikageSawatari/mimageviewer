@@ -3824,6 +3824,68 @@ mod tests {
     use crate::grid_item::ThumbnailState;
 
     #[test]
+    fn g1_collection_real_handler_reopen_preserves_vertical_flow_and_book_return() {
+        use crate::app::book_materialization::{ExtractedSurface, ProjectionRecipe};
+        use crate::settings::{ReadingDirection, ReadingFlow, SpreadMode};
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        app.active_quick_folder_slot = None;
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.settings.auto_fullscreen_image_folders = true;
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.settings.default_spread_mode = SpreadMode::RtlCover;
+        app.settings.default_reading_flow = ReadingFlow::Vertical;
+        app.settings.default_reading_direction = ReadingDirection::Rtl;
+        let book = temp.path().join("collection-a2-original-book");
+        std::fs::create_dir_all(&book).unwrap();
+        let pages = [book.join("01.png"), book.join("02.png")];
+        for page in &pages {
+            image::RgbImage::new(2, 3).save(page).unwrap();
+        }
+        app.load_folder(book.clone());
+        app.settle_open_path_classification_for_test();
+        app.finish_page_identity_preparation_for_test();
+        assert!(matches!(app.projection_recipe, ProjectionRecipe::Book(_)));
+        assert_eq!(app.spread_mode, SpreadMode::RtlCover);
+        assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+        let collection = collection_with_sources(
+            &client,
+            &pages.map(|page| (page, CollectionResolvedKind::Image)),
+        );
+        app.open_collection_grid_from_navigation(collection.collection_id());
+        wait_for_grid(&mut app, collection.collection_id());
+        assert_eq!(
+            app.extracted_result_surface(),
+            Some(ExtractedSurface::Collection)
+        );
+        // Released Collection root installation retains the mounted reader's flow.
+        assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            app.open_fullscreen(0, crate::app::HistoryTrigger::UserChosen);
+            assert_eq!(app.fullscreen_idx, Some(0));
+            assert_eq!(app.spread_mode, SpreadMode::Single);
+            assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+            app.apply_fullscreen_spread_mode(&ctx, 0, SpreadMode::RtlCover);
+            assert_eq!(app.spread_mode, SpreadMode::Rtl);
+            assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+            app.close_fullscreen();
+        }
+        assert!(matches!(app.folder_history_back_target(),
+            Some(super::super::FolderNavHistoryTarget::Path(path)) if path == &book));
+        app.dispatch_main_folder_history_input(super::super::FolderHistoryDirection::Back);
+        app.settle_open_path_classification_for_test();
+        app.finish_history_restore_preparation_for_test();
+        assert_eq!(app.current_folder.as_deref(), Some(book.as_path()));
+        assert!(matches!(app.projection_recipe, ProjectionRecipe::Book(_)));
+        assert_eq!(app.spread_mode, SpreadMode::RtlCover);
+        assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+        assert_eq!(app.reading_direction, ReadingDirection::Rtl);
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
     fn audit_collection_grid_readers_with_foreign_writers() {
         crate::page_edit_write_epoch::with_foreign_scoped_writers(|| {
             phase_a_collection_mask_is_projected_for_accepted_revision();

@@ -3924,6 +3924,208 @@ mod tests {
 
     const SEP: char = crate::search_norm::ZIP_ENTRY_SEP;
 
+    fn g1_publish_search_hits(app: &mut App, ctx: &egui::Context, paths: &[PathBuf]) {
+        app.open_global_search();
+        app.global_search.aggregate_auto = false;
+        app.begin_search_page_edit_prepare_for_test(ctx);
+        let (stream, rx) = crossbeam_channel::unbounded();
+        app.global_search.pending = Some(crate::indexer_manager::SearchHandle {
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx,
+        });
+        stream
+            .send(SearchStreamEvent::Batch {
+                hits: paths
+                    .iter()
+                    .map(|path| GlobalHit {
+                        path: path.to_string_lossy().into_owned(),
+                        score: 1.0,
+                        stars: 0,
+                        mtime: 0,
+                        file_size: Some(0),
+                    })
+                    .collect(),
+                scanned_candidates: paths.len(),
+                valid_hits: paths.len(),
+                visibility_notice: None,
+            })
+            .unwrap();
+        stream
+            .send(SearchStreamEvent::Done {
+                truncated: false,
+                reason: DoneReason::Complete,
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            app.poll_global_search_events(ctx);
+            let prepare = app.global_search.page_edit_prepare.as_ref().unwrap();
+            if app.global_search.done
+                && app.items.len() == paths.len()
+                && prepare.in_flight.is_none()
+                && prepare.desired.is_none()
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "search producer did not settle");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn g1_global_search_producer_new_open_reopen_and_return_preserve_flow_policy() {
+        use crate::app::book_materialization::{BookScope, ExtractedSurface, ProjectionRecipe};
+        use crate::app::top_level_grid_view::TopLevelSearchView;
+        use crate::settings::{ReadingDirection, ReadingFlow, SpreadMode};
+
+        for flow in [ReadingFlow::Paged, ReadingFlow::Vertical] {
+            let mut app = crate::app::setup_app_for_test();
+            let book = app.tmp.path().join("g1-search-source-book");
+            std::fs::create_dir(&book).unwrap();
+            let paths = [book.join("01.png"), book.join("02.png")];
+            for path in &paths {
+                image::RgbImage::new(2, 3).save(path).unwrap();
+            }
+            app.settings.auto_fullscreen_zip_pdf = true;
+            app.settings.auto_fullscreen_image_folders = true;
+            app.settings.default_spread_mode = SpreadMode::LtrCover;
+            app.settings.default_reading_direction = ReadingDirection::Ltr;
+            app.settings.default_reading_flow = ReadingFlow::Horizontal;
+            let db_path = app.tmp.path().join("g1-search-spread.db");
+            app.spread_db = Ok(crate::spread_db::SpreadDb::open_at(&db_path).unwrap());
+            app.spread_db
+                .as_ref()
+                .unwrap()
+                .set_presentation_state(
+                    &book,
+                    SpreadMode::RtlCover,
+                    flow,
+                    ReadingDirection::Rtl,
+                    (
+                        SpreadMode::LtrCover,
+                        ReadingFlow::Horizontal,
+                        ReadingDirection::Ltr,
+                    ),
+                )
+                .unwrap();
+            app.spread_db
+                .as_ref()
+                .unwrap()
+                .set_presentation_state(
+                    &crate::app::search_results_synthetic_path(),
+                    SpreadMode::RtlCover,
+                    ReadingFlow::Horizontal,
+                    ReadingDirection::Rtl,
+                    (
+                        SpreadMode::Single,
+                        ReadingFlow::Paged,
+                        ReadingDirection::Ltr,
+                    ),
+                )
+                .unwrap();
+            app.load_folder(book.clone());
+            app.settle_open_path_classification_for_test();
+            app.finish_page_identity_preparation_for_test();
+            assert_eq!(
+                app.projection_recipe,
+                ProjectionRecipe::Book(BookScope::ImageFolder(book.clone()))
+            );
+            let source_items = app.items.clone();
+            let source_state = (app.spread_mode, app.reading_direction, app.reading_flow);
+            assert_eq!(app.reading_flow, flow);
+            let observer = rusqlite::Connection::open(&db_path).unwrap();
+            let version: i64 = observer
+                .pragma_query_value(None, "data_version", |row| row.get(0))
+                .unwrap();
+            let ctx = egui::Context::default();
+            g1_publish_search_hits(&mut app, &ctx, &paths);
+            let recipe = ProjectionRecipe::ExtractedResult(ExtractedSurface::Search(
+                TopLevelSearchView::Global,
+            ));
+            assert_eq!(app.projection_recipe, recipe);
+            // HEAD^ used a lightweight items swap, retaining the previous continuous flow.
+            assert_eq!(app.reading_flow, flow);
+            for idx in [0, 1] {
+                app.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
+                assert_eq!(app.fullscreen_idx, Some(idx));
+                assert_eq!(app.projection_recipe, recipe);
+                assert_eq!(app.spread_mode, SpreadMode::Single);
+                assert_eq!(app.reading_flow, flow);
+                assert_eq!(app.reading_direction, ReadingDirection::Ltr);
+                app.apply_fullscreen_spread_mode(&ctx, idx, SpreadMode::RtlCover);
+                assert_eq!(app.spread_mode, SpreadMode::Ltr);
+                assert_eq!(app.reading_flow, flow);
+                app.close_fullscreen();
+            }
+            app.close_global_search();
+            app.settle_open_path_classification_for_test();
+            app.finish_history_restore_preparation_for_test();
+            assert!(!app.global_search.active);
+            assert_eq!(app.current_folder.as_ref(), Some(&book));
+            assert_eq!(
+                app.projection_recipe,
+                ProjectionRecipe::Book(BookScope::ImageFolder(book))
+            );
+            assert_eq!(app.items, source_items);
+            assert_eq!(
+                (app.spread_mode, app.reading_direction, app.reading_flow),
+                source_state
+            );
+            assert_eq!(
+                observer
+                    .pragma_query_value::<i64, _>(None, "data_version", |row| row.get(0))
+                    .unwrap(),
+                version,
+                "search opens and temporary modes must not write spread.db"
+            );
+        }
+    }
+
+    #[test]
+    fn g1_global_search_real_producer_classifies_cross_book_and_mixed_results_as_a2() {
+        use crate::app::book_materialization::{ExtractedSurface, ProjectionRecipe};
+        use crate::app::top_level_grid_view::TopLevelSearchView;
+        use crate::settings::{ReadingFlow, SpreadMode};
+
+        for mixed in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let first = app.tmp.path().join("book-a");
+            let second = app.tmp.path().join("book-b");
+            std::fs::create_dir(&first).unwrap();
+            std::fs::create_dir(&second).unwrap();
+            let paths = [
+                first.join("page.png"),
+                second.join(if mixed { "clip.mp4" } else { "page.png" }),
+            ];
+            app.reading_flow = ReadingFlow::Vertical;
+            app.settings.default_spread_mode = SpreadMode::RtlCover;
+            let ctx = egui::Context::default();
+            g1_publish_search_hits(&mut app, &ctx, &paths);
+            assert_eq!(
+                app.projection_recipe,
+                ProjectionRecipe::ExtractedResult(ExtractedSurface::Search(
+                    TopLevelSearchView::Global
+                ))
+            );
+            assert_eq!(app.items.len(), 2);
+            assert_eq!(
+                app.items
+                    .iter()
+                    .any(|item| matches!(item, GridItem::Video(_))),
+                mixed
+            );
+            let idx = app
+                .items
+                .iter()
+                .position(|item| matches!(item, GridItem::Image(_)))
+                .unwrap();
+            app.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
+            assert_eq!(app.spread_mode, SpreadMode::Single);
+            assert_eq!(app.reading_flow, ReadingFlow::Vertical);
+            app.close_fullscreen();
+        }
+    }
+
     fn favorite_filter_fixture(id: u128, path: &str, on: bool) -> crate::settings::FavoriteEntry {
         crate::settings::FavoriteEntry {
             id: Uuid::from_u128(id),
