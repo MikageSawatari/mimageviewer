@@ -1,8 +1,8 @@
 # §1.242 本の構成 — 設計案
 
-更新: 2026-10-10、R5。ライン G / `next-book`、改訂元 R4 `9b4e2b56f`。
-状態: §14の全回答、抽出一覧A2、画像フォルダの切り離し方針を反映。独立再レビュー・設計採択は未実施。
-初稿照合は `63f2e23ea` 時点、R5追加照合は現在worktreeソース。実装前にE統合後masterへ再照合する。
+更新: 2026-10-10、R6。ライン G / `next-book`、改訂元 R5 `599001fbd`。
+状態: R5レビューのP2二件/P3とsidecarだけの保存失敗の利用者回答を反映。独立再レビュー・設計採択は未実施。
+初稿照合は `63f2e23ea` 時点、R5/R6追加照合は現在worktreeソース。実装前にE統合後masterへ再照合する。
 
 本書の型名・新規ファイル名は提案であり、現行実装を表さない。実行時の観測はなく、以下の現状はソース調査による。
 
@@ -120,7 +120,7 @@ Ctrl+G/タグ/評価/スマートフォルダ/コレクション/★固定/サ�
     `src/remote_ipc/ui.rs:2603`, `:2644`, `:2703`)。R4ではComposedに対する書込前の共通拒否へ接続する (§9.1)。
     R2/R3で提案した構成recordへの直接小編集は、利用者決定により撤回する。
 
-R5の追加前提照合:
+R5/R6の追加前提照合:
 
 13. EPUBの `GridItem::PdfPage.pdf_path` は元EPUB。共通PDF列生成は要求された論理パスを保持する
     (`src/ui_dialogs/epub_convert.rs:661`, `src/app.rs:36590`, `:36769`, `:37070`)。個別編集キーは `page_path_key` →
@@ -141,6 +141,19 @@ R5の追加前提照合:
 16. 現行抽出結果は自動見開きが利用可能で、本境界なしに隣接nav画像を組む
     (`src/ui_fullscreen.rs:13460`, `:15151`)。cover/shiftも使え、末尾等はcomplete book条件が制限する
     (`:14898`, `:16864`, `:27987`)。A2はreleased挙動の変更であり、互換テスト差分を限定して説明する。
+
+17. sidecarの自動復元はmtime秒値の比較ではない。`SidecarDiskToken` はfolder/byte length/mtime nanos/SHA-256を捕捉し、
+    `sync_marker()` が内容を混ぜた値を生成する (`src/sidecar.rs:187`, `:203`)。
+    probeはmarker完全一致 (`src/sidecar_import.rs:795`)、再利用証明はpending/failed writerを先に判定し、
+    全bytesの再検証も行う (`src/sidecar.rs:358`, `src/sidecar_import/probe_reuse.rs:141`, `:175`)。
+    明示metadata importのmtime秒値 (`src/metadata_transfer.rs:4824`) を構成の消費記録には流用しない (§7.4.2)。
+18. 現行writer/import snapshotはitemsだけで同一性を判定する (`src/sidecar.rs:463`)。
+    空itemsならfile削除 (`:1055`)、flush完了はitems Arc/disabledだけを照合 (`:1148`)、
+    reservation捕捉もitemsだけ (`:1314`)。root構成を加える時は全snapshot契約を拡張する (§7.4.1)。
+19. 連結読みの通常navはsequenceを作らずearly returnする (`src/ui_fullscreen.rs:11248`)。
+    実際の提示候補は `continuous_reading_layout` (`:37762`, 可視判定 `:37823`) が作り、
+    `draw_fs_continuous_reading` (`:38361`) がtextureを選んで直接paintする (`:38567`)。
+    anchor移動へのadmission追加だけでは不十分。既存continuous unit/presentation ownerへ接続する (§6.2)。
 
 ## 3. 所有境界と処理順 — items生成時の一回の投影
 
@@ -455,11 +468,12 @@ PreparedBookは `(scope, source_manifest_revision, policy, composition_revision)
 行削除等のin-place更新でも §3.2のremap後に同じ世代を採用する。
 OrdinaryList/ExtractedResultはmembership/order/source/policyの既存revisionだけを保持し、構成依存を持たない。
 構成保存による一覧/nav/unit失効は発行しない。遅延admissionの返答は対象identity/要求ID/context/items世代/そのscopeの
-publication tokenに相関させ、提示確定前に構成が変わった返答は採用しない。次の明示要求で新値を照合する。
+publication tokenに相関させ、提示確定前に構成が変わった返答は採用しない。次の提示要求 (スクロールによる新入場を含む) で新値を照合する。
 全列hidden cacheへ溜めず、構成なし本も含め新規提示の候補だけ最新snapshotを確認する。
 結果のbase unit cacheには元の隣接組だけを保存し、提示時のHidden欠落をそこへ焼き込まない。
 allowed候補/相方と照合tokenを含む要求所有のpresentationを描画/holdoverへ渡し、geometry/rendition keyにも含める。
-過去の許可やSingle化された描画cacheを次のopen/navの許可として再利用しない。
+連結では§6.2のviewport demandが要求ownerとなり、同一画面内の継続提示だけ許可を保持する。
+過去の許可やSingle化された描画cacheを次のopen/nav/viewport再入場/mode投影の許可として再利用しない。
 `ViewerNavigationCaches` の世代/flowにはこのinstallが含まれるので、新たな「構成dirty」boolは不要。
 unit tokenはLayoutSourceのtagとcomposition revisionを明示追加する。Composed branchにshiftは入らない。
 nav列、items世代、Single/Spread/Splitの閲覧投影、direction、filtered projection identityを含める。
@@ -518,10 +532,11 @@ Missing/種類除外は既存文言を維持し、「構成で非表示」と誤
 先頭や隣ページへsilent fallbackしない。containerを一覧として開く要求自体は許可し、
 非表示resumeのauto-fullscreenだけ拒否する。全非表示本は空一覧と「本の構成を編集」の導線を示す。
 
-遅延照合は既存open/nav要求ownerのworkerで、対象PageIdentityからlogical scopeを確定して行う。
+遅延照合は既存open/nav要求owner、連結では§6.2の表示ownerが候補要求をworkerへ渡し、対象PageIdentityからlogical scopeを確定して行う。
 UIでSQLiteを読む、現在mountの本から推測する、列生成で全本を照合することは禁止。
 クリック/しおり/評価/履歴の明示targetはHiddenならtoast拒否し、現在surface/return routeを保つ。
-送り/連結/slideshowの候補と見開き相方にも同じ受付を通し、Hidden画像を新たに提示しない。
+送り/slideshowの候補と見開き相方にも同じ受付を通し、Hidden画像を新たに提示しない。
+連結のスクロールは明示navを経由しないため、可視候補からの要求とpaint境界を§6.2で具体化する。
 サムネ/通常prefetchは従来どおりで、画像取得とfullscreen提示の許可を同一視しない。
 飛ばしたページを「読んだ」と記録せず、保存通知で既存表示を回収するlive refreshはしない。
 
@@ -571,6 +586,52 @@ metadata import等に伴う構成投影の背景更新も、新しい読書操�
 現行metadata transferはbook resume/履歴を転送しない。構成importの背景更新も新規resumeを書かない。
 Q5の決定は「次回の再開位置は保存要求の元位置に基づく一つ」であり、兄弟窓の移動先を奪い合わない。
 
+### 6.2 連結読みを含む新規提示の許可owner
+
+連結読みは維持し、nav sequenceを強制作成したり、anchor更新まで照合を遅らせたりしない。
+既存 `ContinuousReadingUnitSpec.presentation` (`src/ui_fullscreen.rs:8148`) / 可視位置列 / 描画ownerを使う。
+そのcontextのcontinuous表示要求へ **viewport内のpresentation occurrenceの許可** を載せる。
+要求は `ViewerContextBundle` の既存continuous runtimeと一緒にmount/deposit/fork/closeされる
+(現在のscroll/layout所有: `src/app/viewer_context_registry.rs:977`, `:1040`, swap `:2631`, `:2678`)。
+App共通bool、anchor専用許可、texture cacheに付ける許可の別ownerは作らない。
+
+責務と確定順:
+
+1. `draw_fs_continuous_reading` が `continuous_reading_layout` の可視候補を受け取った時、
+   **texture選択より前**に、新入場のsource identity/occurrence (unit anchor・role・sliceを含む) を
+   表示要求ownerへ渡す。scroll/wheel/drag/gamepad/resize/scale/寸法後着/slideshowで隣ページが
+   見え始める時も同じ経路。準備band/keep-set/prefetchへ入っただけでは提示許可を作らない。
+2. 許可は要求内のtyped outcome `Checking | Allowed(scope_token) | Hidden(scope_token)` として持つ。
+   workerはその画面で新たに提示する候補だけ照合し、同じsourceの補助/sliceは一要求内で照合を共有できる。
+   結果採用はcontext/要求ID/items世代/occurrenceとscope tokenで照合する (§5.2)。
+   未許可候補の領域は既存loading相当の背景/待機表示だけ。UI同期DB/file I/Oや全結果列の照合はしない。
+3. 新しいunitの提示確定は、そのunitの全presentation候補の照合完了を待つ。
+   sourceごとの判定を途中で一枚だけ採用せず、Allowed Pair/片側HiddenのSingle/全Hiddenのskipをatomicに決める。
+   Allowedだけを**提示用pagesとtexture選択入力**へ渡す。texture選択ループ (`src/ui_fullscreen.rs:38485`)
+   と `draw_fs_spread_page` 呼出し (`:38595`) の両方で許可済みprojectionを使う。
+   Checking/Hiddenにはcached processed/raw/transition/thumbnail/pass-throughのどの画像も渡さない。
+   paintだけでなく `fullscreen_page_layout` 登録、hit test/編集target、navigator画像、presentation trace、
+   読了/位置記録も同じ許可済み投影に従う。キャッシュに画像があることを許可とみなさない。
+4. Hiddenはその表示要求内でskipする。片側だけなら元slotのSingle、両側なら次unit候補へ進む。
+   連結の可視投影/offsetも同じ許可済みunitで解決し、Hiddenだけの空段を残さない。
+   新候補が入るなら既存可視ページ上限に収まる分だけ次のworker要求へ渡す。anchorを先に変更せず、
+   描けたNavigationから既存reanchorを行う。全Hiddenで候補を使い切った時だけ一覧へ戻る。
+   base items/nav順は変えず、他unitから相方を借りない。明示openのHiddenはtoast拒否、連結の隣候補はskip。
+5. 画面に残る同じoccurrenceは現在の提示episodeの許可を保持して継続描画できる。
+   同episodeでskipした候補も要求内だけに持ち、毎frame同じHiddenを問い直すloopを作らない。
+   画面から退出/要求retire/closeで提示許可を破棄し、再入場は新要求。Hidden除外は当該可視要求内だけで、
+   全列skip cacheや永続非表示bitmapへ昇格させない。
+   構成保存通知で結果列/表示要求を一括refreshしない (Q16)。既に表示中の画像は残り得るが、
+   未提示候補・再入場は最新値を照合する。Checking後着は提示直前にtokenが古ければ採用しない。
+
+Single→Spread、Split切替、補助表紙の新出現も同じ **presentation demandの差分** で受け付ける。
+既に表示中の実ページと新しい相方を区別し、新しい相方はcached textureがあっても無許可で出さない。
+新しい二ページ投影はCheckingを含む間はatomicに未確定とし、旧許可済み表示/背景を保つ。
+確定後はAllowed PairまたはHidden片側を除くSingleを一回で採用する。page-turn sequence/holdoverの
+役割別presentation、連結のviewport要求が同じ許可resolverを使い、mode handlerに別DB照合を増やさない。
+Bookは採用済み構成snapshotの可視列を入力にでき、OrdinaryList/ExtractedResultは候補ごとにlogical scopeを解決する。
+read-only mount/forkは画像と同じ捕捉済み表示を継続できるが、fork先の新入場/新投影はそのcontextの新要求となる。
+
 ## 7. 新しい本別ストアと既存ライフサイクル
 
 ### 7.1 保存
@@ -612,7 +673,7 @@ shiftは許可せず、構成編集も書込停止中は受けない。次のope
 | restorable probe / metadata cleanup | 構成も復元可能なuser dataとして数える。cleanupラベル、DB件数/clear、設定完全reset、data-dir移動・保存先説明へ登録。resetは既存明示確認の範囲で行う |
 | 明示metadata export/import | §7.3の専用composition familyを追加。既存PortableContainerStateのorigin/挿入keyと分離。root/prefixはbundle相対、page refsは本相対。is_empty/has_view_state/summary/import changed flagsも更新 |
 | metadata import refresh | owner/context/policyを捕捉し、関係する同一本scopeのBook projectionを既存reloadで更新。結果列は更新せず、別本のindex/cacheを捨てない |
-| 自動sidecar | G4Fの画像だけのfolder構成をroot字段へ追加。backup設定/自動不足行復元/既存編集保護は§7.4。書庫/PDF/EPUB構成はsidecarへ追加しない |
+| 自動sidecar | G4Fの画像だけのfolder構成をroot字段へ追加。全snapshotのwriter/予約/reuse、独立構成familyの内容token/消費receipt、backup設定/不足行復元は§7.4。書庫/PDF/EPUB構成は対象外 |
 | F12 | registryのnew/default/destructure/swap/mount/fork/park/drop、親一覧/固定snapshotへprojectionを運ぶ。cache ownerはcontextごとに独立 |
 | Remote | core engineにread snapshot/lookup登録、scope resolver・list/page context・visibility admission・payload登録。IPC版とWeb asset tokenを同時更新 |
 
@@ -698,12 +759,79 @@ G4Fでversion 2へ上げ、readerはv1を「構成字段なし」で保持して
 未来版/破損sidecarは現行write-disabledの原本保護を維持。新DBと違い既存sidecarを捨てて作り直さない。
 旧アプリがv2を読めない点はmanualへ記載する。G4Fを切るならsidecar変更そのものを入れない。
 
-restoreは既存edit familyのprobe/同期marker/worker transactionにroot構成を含める。
-editが同期済みという理由で構成だけ未適用なのにmarkerを確定しない。新schema字段をprobeの検証対象にも追加。
-DB行がある場合は常に保持。明示解除/importの空反映は既存sidecar_syncの「旧backup消費」に参加し、
-残った古いsidecarから直後のreloadで構成を復活させない。構成専用の永続削除tombstoneを新設しない。
-restoreのwriterは既存maintenance/quiesce境界内へ参加し、serviceと同時に二接続で書かない。
-backup失敗の扱いは末尾の新規確認事項で採択する。それまではG4Fの失敗契約を最終採択せず、書庫/PDF/EPUBの設計・実装を止めずに進める。独自二段commit/自動retryを先取りしない。
+#### 7.4.1 rootを含む単一snapshot・writer・再利用証明
+
+現行items Arcだけの契約を、immutable `SidecarSnapshot { items, folder_composition }` 一つへ拡張する。
+SidecarFileはそのArcを所有し、items/rootのどちらの変更もcopy-on-writeでsnapshot identityを替える。
+既存items mapのArcはsnapshot内で共有でき、rootだけの変更で大量のページ編集mapを複製しない。
+root専用dirty bool/別flush queueは作らない。write requestはsnapshot全体を渡し、
+**itemsが空かつroot構成もない時だけRemove**。構成だけのsidecarを保存でき、最後の個別編集を消してもrootは残る。
+
+`PendingWriter` のsequence/kindとsnapshotは不可分。現行 `revalidate_import_source` (`src/sidecar.rs:442`)
+のWrite照合を全snapshotのArc同一性、Remove照合を全snapshotの空判定へ置換する。
+PendingWriterのsequenceは現行どおりprocess内だけで、diskのsync markerへ保存しない。
+`LoadedSidecarImport` / strict prepareの検証対象・requested family・retained probeのreuse keyにもroot構成を加える。
+itemsだけ同じ、またはedit markerだけ同期済みを根拠にrootのprobe/importを省略しない。
+Disk reuseは現行pending/failed writer優先、metadata-before/after + SHA-256再検証を保持する。
+
+`SidecarFlushReservation` とworker batchはfolder/全snapshot Arc/disabled/requestedを捕捉する。
+flush完了がdirtyを消す/clean ownerをevictする条件は、現cache ownerとこの全snapshotの完全一致。
+itemsが同じでもrootが変わったら旧flushは新rootのdirtyを消費しない。
+退出/終了/明示importのflush fenceも同じ予約を使い、他contextの新snapshotを取り出して破棄しない。
+worker failureは現行の通知/dirty owner保持の契約を使い、rootだけのretry/rollbackを追加しない。
+
+#### 7.4.2 自動復元の内容tokenと旧構成の消費
+
+構成は既存sidecar import engineの **独立したfamily** とする (edit/tag familyの同期判定を流用しない)。
+これは二つ目のimport ownerではない。既存prepare/probe/revalidate/workerとmaintenance/quiesceを共有し、
+新composition storeの同じwriterで不足行挿入と同期receiptを一transactionにする。
+commit直前のsource再検証を維持し、そのtransaction内で現在の構成行/receiptを読み直して判定する。
+古いprepare結果で、途中の明示解除/新構成保存が作ったreceiptやrecordを上書きしない。
+既存edit/tag DBのmarker/schema/不足行補充を変更せず、構成だけ未適用なら構成familyをImportRequiredにする。
+
+構成familyの同期receiptはfolder keyに対し `{ disk_sync_marker, consumed_root_digest }` を持つ。
+`disk_sync_marker` は**実際に厳密loadしたSidecarDiskToken.sync_marker()**。mtime秒値を記録しない。
+`consumed_root_digest` はそのsnapshotの検証済みroot構成 (不在を含む) の正規化内容hash。
+タグ/itemsやfileのmtimeを含めず、同じ古いrootが残ったまま他familyだけ更新されたことを証明するために使う。
+完全一致tokenでAlreadySynchronizedにする既存probe契約は維持し、token不一致ならstrict probeで再検証する。
+その後、構成familyだけについてroot digestが既存receiptと一致すれば、そのrootは消費済みとして
+**不足DB行へ再挿入せず、今回の実tokenへreceiptを進める**。別のrootなら通常の不足行補充候補になる。
+全folderを永久に復元禁止にするtombstone、消費token履歴、タグworkerからのDB更新callbackは作らない。
+root witness一つが必要なのは、全fileのtokenだけではタグ書込後の旧構成を区別できないため。
+
+明示解除/新形式metadata importの空反映では、backup設定OFFでも、captured folderの既存sidecar rootを
+workerで厳密snapshot化し、**DBの構成行削除とその消費receiptを同じcomposition transaction** へ入れる。
+既存pending writerは全snapshot/fenceの優先規則で確定させ、旧disk tokenと別のpending rootを組み合わせない。
+Missingなら消費するbackupなし。読めるsourceの消費証明を確定できない場合はDB commit前の保存失敗として
+Q7の通知/旧構成保持に従う。未知/破損sourceは原本保護し自動復元もしない。
+この準備とDB writeはworkerで行い、UI同期readを足さない。DB成功後のsidecar mirrorの失敗とは区別する (§7.4.3)。
+ONなら共有writerへroot不在の新snapshotも渡すが、旧fileが残ってもreceiptで同じ場所の復活を防ぐ。
+明示importのmtime秒値記録には依存せず、import対象folderの空反映もこの構成familyの処理へ接続する。
+旧形式/coverage外/skipは構成/receiptを解除せず、Q15どおり保持する。
+
+**OFF→解除→タグbackup更新→ON→再入場**:
+解除時に旧backup rootを実tokenと共に消費。OFF中のタグwriteはitemsだけを更新しrootを保存したままなので、
+ON後のfile tokenは変わる。strict probeは新bytesを検証し、同じroot digestを根拠に構成は再挿入せず
+新tokenを消費する。edit/tagは各自のmarkerどおり処理でき、構成の消費で新しいタグ復元を抑えない。
+同じbyte length/mtimeでrootが変更された場合もSHA-256/root検証で見分け、旧reuse proofを採用しない。
+新しい場所ではfolder keyが異なりreceiptがないため、運ばれたsidecarから通常の不足行補充を行う。
+
+receiptは転送する利用者構成ではなく、**その場所のbackupの消費記録**。
+metadata export/import・content-ID copyではreceiptを運ばず、import destinationのbackupから新たに作る。
+アプリ内folder renameでは移動先の実sidecarとの照合後だけkeyを更新し、purge/resetでは同じfolder範囲を除去する。
+DBファイル単位のF12 bundleはそのDB内receiptも含む。構成なしでもreceiptの存在をDB構成ありとは扱わない。
+自動restoreによる新record採用、またはDB既存行を保持したrootの消費も、検証したsourceと同じtransactionで記録する。
+PendingWriterでもroot witness一致なら再挿入しない。適用時にsequenceをdisk markerへ変換せず、
+既存disk receiptを保ち、diskに載った全snapshotを次のstrict probeで検証して実tokenを記録する。
+
+#### 7.4.3 sidecarだけの保存失敗 (利用者採択)
+
+DB保存/解除成功後にbackup writeだけ失敗した時は、**DB結果を維持**して
+「フォルダのバックアップを更新できませんでした」を通知する。
+古いbackupが残る可能性、移動前の明示保存またはメタ情報書き出しを案内する。
+同じ場所の解除済みrootは§7.4.2のreceiptで復活を防ぐが、旧backupを別の場所へ運べば旧構成が復元され得る。
+自動retry/DBとfileの同時rollback/終了後draft復旧を追加しない。既存writerのfailed判定は保持し、
+明示再操作または再起動の案内に留める。DB失敗のQ7、保存後reload失敗、backupだけの失敗を混同しない。
 
 ## 8. エディターUI — モーダルを採用する
 
@@ -1080,6 +1208,11 @@ metadata bundleは可視一覧選択からの画像exportとは別で、**非表
 | 抽出一覧の永続mode / per-list spread key / 再入場時の旧mode | modeはview sessionだけ、新規openはSingle。synthetic keyのread/write、旧mode適用と解除migrationを追加しない |
 | EPUB世代cache→元本→独自page remap | 既存個別編集と同じ元EPUB+page_num。再変換でずれる制限を明記し自動救済を作らない |
 | folder構成専用backup toggle / 第二sidecar writer / 復元確認prompt | G4Fは既存backup設定・SidecarFile owner・不足行自動補充だけ。書庫/PDF/EPUBから分離 |
+| items flushとroot flushの別dirty/世代/完了 | SidecarSnapshot一つをPendingWriter/flush予約/import/reuseへ渡す。空判定もrootを含める |
+| mtime秒値の消費 / edit同期が構成同期を兼ねる / タグwriteごとのDB callback | 同じstrict engineの独立構成family。実disk token + root消費witness一つでタグだけの変化を判別。token履歴/全folder削除tombstoneなし |
+| backup失敗でDBを戻す / DB成功とfile成功の二段回復 | 利用者採択: DB結果保持 + 通知。解除の消費receiptとbackup writeを分離し、自動retry/同時rollbackなし |
+| nav anchor移動の許可 / 連結viewportの許可 / cached textureの暗黙許可 | 既存display demand ownerへ候補単位許可を載せ、提示projectionからpaint/geometry/traceを一体生成。prefetchとは分離 |
+| Hidden対策の連結無効化 / 全結果の事前hidden走査 / 永続skip bitmap | 連結の可視新入場だけ照合、要求内だけskip。再入場で再確認、保存時refreshなし |
 | フォルダ例外の修正が共通Book完成を止める | G4Fは独立採択。難航の相談点を固定し、ZIP化の回避で共通部分を保ったまま切れる |
 | 新storeの移行/旧設計試作データ互換 | 未リリースstoreは新schema一つ。released既存DB/bundle互換は維持 |
 | 稀なDB failureのretry/途中保存/rollback後のrollback | record一transaction + draft維持/通知。独自回復網は利用者相談前に作らない |
@@ -1091,6 +1224,7 @@ Remote取得の全窓closeはそのreleased契約を維持する場面であり�
 構成あり本のHUD/キー/Remote操作制限は利用者が明示採択した変更で、追加承認待ちに戻さない。
 抽出一覧A2、本扱いOFF/混在のOrdinaryList、Q16の遅延判定は承認済み。結果列の従来mode記憶/表紙/shiftを維持する互換branchは残さない。
 view-modeだけをbindingから分離する入口は残す。これを削ると利用者が維持を指定した表示切替まで失うため。
+連結読みの禁止も採用しない。anchor移動だけでなく既存可視候補ownerへ照合を接続すれば、閲覧機能を維持できる。
 
 ## 13. 段階・担当範囲・受入テスト
 
@@ -1100,11 +1234,11 @@ view-modeだけをbindingから分離する入口は残す。これを削ると�
 
 ### G0: 設計採択・E統合後の再照合
 
-成果: R5独立レビュー、scope/DTO/shift責任分担、detached構造合意。§14の1〜17は全て決定済み。
-画像folderのbackup失敗だけは末尾の新規確認事項を設計担当が利用者へ確認する。
+成果: R6独立レビュー、scope/DTO/shift責任分担、detached構造合意。§14の1〜17とbackupだけの保存失敗は全て決定済み。
 受入: §2のsymbol/lineをmerge済masterで更新し、Eのgeometry/scale/unit/anchor差分を確認。
 editor start/save-ticketとsession mutexのlock順/全close barrier、Book復帰adoption、
-一つのresume intent、Q16の候補単位admission、A2のview-mode境界を構造レビューする。
+一つのresume intent、Q16の候補単位admission/連結viewportの提示許可、A2のview-mode境界を構造レビューする。
+G4F採択時は全sidecar snapshot/予約/reuse、内容tokenとroot消費receipt、明示空反映との接続を構造レビューする。
 旧REVISEを文書修正だけでACCEPT扱いにしない。今回の全回答をbriefへ反映し、小編集/EPUB延期を再質問しない。
 
 依存順: **G1 (既存列の統一/A2分類) → G2 (pure model/fixture/共通store) → G3 (本への適用/遅延判定)
@@ -1149,7 +1283,7 @@ G1の完了条件へG2以降の構成fixtureを先取りしない。G4F未実装
 
 ### G3: 構成適用・spread/位置・§1.364・遅延非表示
 
-所有: common projection、builder/cache、resume/target resolution、Eとのshift API。
+所有: common projection、builder/cache、resume/target resolution、continuous表示要求/許可resolver、Eとのshift API。
 受入:
 
 - 初期snapshotを旧自動builder oracleへ照合: LTR/RTL×cover×1/2/3/4/5/多数×landscape/non-pairable×
@@ -1168,6 +1302,16 @@ G1の完了条件へG2以降の構成fixtureを先取りしない。G4F未実装
 - 単ページ/見開き/連結/slideshowの次候補だけhidden確認、相方も確認、片側Hidden→元slotSingle、
   両側Hidden→次unit、全Hidden→一覧。非表示解除後の次提示では再確認し、永続skip cacheを持たない。
   取消/世代変更/構成変更後着のadmission replyは旧targetを開かず、UI同期I/O/全列lookupを追加しない。
+- 連結でanchor=Aのまま、prefetch/processed/raw/thumbnail cacheにあるHidden Bがscrollでviewportへ入る。
+  BのChecking中/Hidden確定後に画像paint/transform登録/hit test/読了traceはゼロ、許可されたAは継続。
+  Bをskipして次候補を限定照合し、先行anchor変更/空段/他unitとの再pair/全列lookupなし。
+  wheel/drag/gamepad/slideshow/resize/scale/寸法後着を同じ可視候補受付で検証する。
+- Single→Spreadで相方Bが初めて提示対象になる (pagedと連結の両方)。Bがcachedでも許可前は描かず、
+  B Hiddenなら元slot Single、両AllowedならPairをatomic採用。Split/補助の新occurrenceにも同じ規則。
+  当該結果窓が別窓の構成保存でrefreshされていないケースを含める。
+- 連結の継続表示は保存時に回収せず、退出→再入場の許可を新しく取る。Hidden→可視変更後も再入場で再確認。
+  同一要求内のHiddenをframeごと再照合せず、要求retire/closeで破棄。許可Pending中のholdover/thumbnail fallbackも無許可画像を出さない。cancel/兄弟mount/fork/parked後着の
+  replyを他contextへ採用しない。測定で同期I/O/全結果列照合ゼロ、paint記録で無許可画像ゼロを確認。
 - Book詳細sortは構成順lock、抽出詳細sortは結果順、通常folder詳細sortは従来。
 - trim左右別/ページoverride/Blankの実slot/補助/RTL、Singleはsingle margin、既存非構成本は不変。
   Blank source/readinessなし、実Navigationだけをresume/export targetへ。
@@ -1197,19 +1341,36 @@ G1の完了条件へG2以降の構成fixtureを先取りしない。G4F未実装
 
 ### G4F: 画像だけの本フォルダ (独立・切り離し可能)
 
-所有: folder資格/adoption、RelativePath PageRef migration、sidecar root字段/復元、folder用editor入口。
+所有: folder資格/adoption、RelativePath PageRef migration、sidecar全snapshot/構成family/消費receipt、folder用editor入口。
 G1〜G4の書庫/PDF/EPUB契約を変更せず、共通pure model/storeへfolder adapterだけを追加する。
 受入:
 
 - image-only Book作成/並べ替え/非表示/元一覧/ページ一覧/同folder兄弟窓。OFFはOrdinaryList/既存sort、
   mixed動画/音声は従来閲覧、再適格なら構成再適用。子containerだけの場合は現行本分類を尊重。
 - 個別file改名の相対ref更新、scope外移動はMissing、root改名/copy、folder削除/page削除の差。
-- backup ON/defaultはroot構成ミラー、OFFはDBのみ/自動restoreなし、タグだけONでも構成なし。
+- backup ON/defaultはroot構成ミラー、OFFはDBのみ/自動restoreなし。
+  タグだけONのwriteでは既存rootを保持し、DB構成値への更新/自動restoreをしない。
   編集/タグitemsを保持、ページ保存/dirty flush/終了でroot構成を失わず、sidecar二重writerなし。
 - 新場所/別driveにfolder+sidecarをコピー、DB構成なしで**自動**不足行復元、確認promptゼロ。
   既存DB構成/破損行は上書きしない。旧場所DB行保持。sidecarなし/OFFは明示bundle手段。
 - v1既存編集/タグを保持してv2往復、未知/破損sidecar原本保護、Unsafe refs/blank-only拒否。
-  DBとsidecarの構成解除、新形式importのclear後に古いbackupから復活しない。共通同期markerの再利用を検証。
+  markerのmtime秒値を構成へ流用しない。edit同期済みでも構成未適用なら構成familyだけを復元する。
+- **構成だけのsidecar** を書込/読込/PendingWriter経由で復元できる。最後の個別編集を削除してもroot保持、
+  items/root共に空の時だけfile削除。ページ/タグのreplaceでrootが消えない。
+- flushを予約→items不変のままrootを変更→旧flush完了。新rootのdirty/新ownerをclear/evictしない。
+  rootだけのPendingWriter差替えは旧sequence/Arcのrevalidateを拒否。root変更/消去、requested family差、
+  writer pending/failed、同len/mtime別bytesはretained reuseを拒否してstrict probeへ戻る。
+  PendingWriterに残る消費済みrootも復活させず、process sequenceをdisk markerへ保存しない。
+  prepare後に解除/別構成保存が完了してからrestoreがcommitする順でも、transaction内の再判定で上書きしない。
+- **明示metadata importの新形式空反映**: 複数folderの構成を一括解除し、消費receiptを各項目transactionで更新。
+  一回のsummary確認だけ。古いbackupが残っても再入場/再起動で復活せず、旧形式/coverage外/skipは構成保持。
+  ページ編集/タグfamilyの同期・復元は構成receiptにより抑えられない。
+- **解除後に旧backupが残る場合**: OFFで解除→ON→再入場/再起動で同tokenを消費済みと判定し構成なしを維持。
+  OFF→解除→タグbackup更新→ON→再入場では全file tokenが変わってもroot witness一致で再挿入しない。
+  root自体の変更 (同len/mtimeも含む) は別sourceと判定。別場所へコピーしたfolderは不足行を通常復元する。
+- backup writeだけ失敗は成功DB/解除receipt保持 + 通知、旧backupの同場所再復元なし。
+  source準備/DB commit前の失敗は旧DB構成、backup失敗後の自動retry/DB-file rollbackなし。
+  Missing/未知/破損sourceの原本保護、receiptのrename照合/purge/reset/非転送も検証。
 - 構成保存後の全結果thumbnail/一覧は不変、遅延target拒否だけ。folder-only lookupを抽出全leafへ拡げない。
 - folder entryのmetadata搬送/新形式空/部分coverage、内容IDFolder ledgerなし、backup失敗は採択した通知契約。
 
@@ -1267,9 +1428,9 @@ manual本/見開き/検索/設定/Remote、保存先説明、docs索引、detach
 G1以降のbriefはmerge済masterへrebase後に更新し、Eの指定scale既存テストをそのまま回帰gateへ含める。
 旧anchorやfit算式をG側に複製してconflictを解消しない。
 
-### R2〜R4レビュー契約のR5への接続
+### R2〜R5レビュー契約のR6への接続
 
-| 既存指摘 | R5で維持/置換する契約 | stage |
+| 既存指摘 | R6で維持/置換する契約 | stage |
 | --- | --- | --- |
 | editor/Remote取得・兄弟mount | mount非依存owner、同じsession start/save受付、既存全窓close/save barrier。Q9採択 | G0/G4/G5 |
 | in-place items変更 | 同時slot remap/identity再解決、Missing保持、削除直後F5前のunit/resume/出力 | G1/G2/G3 |
@@ -1280,10 +1441,13 @@ G1以降のbriefはmerge済masterへrebase後に更新し、Eの指定scale既�
 | 外部binding/周辺操作 | Q2/11/17の拒否 + mode-only維持。小編集再導入なし。抽出はDB保存なし | G3/G5 |
 | 共有resume | save owner/seed捕捉、一回write、各窓anchor分離。A/B完了順反転試験を維持 | G4 |
 | 音声/本を開く案内/fixture順 | mixed音声保持、案内はBook可否解決後のみ、G1→G2→G3の依存順 | G1/G3/G4F |
+| R5 P2-1 旧sidecar消費 | 自動復元の実disk token、独立構成familyのreceipt。タグ更新はroot witnessで同じ消費済みbackupと判定 | G0/G4F |
+| R5 P2-2 連結の新入場 | continuous可視候補ownerが許可要求を作り、texture選択前/paintまで同じ許可済みprojection。cached Hidden/新相方の試験 | G0/G3/G5 |
+| R5 P3 root snapshot | 全snapshot ArcをPendingWriter/flush予約/reuseへ。構成だけ/最後の編集消去/旧flush後着を検証 | G0/G4F |
 
 ## 14. 利用者の決定 (番号固定)
 
-全回答は2026-10-10。Q1/2/11/17はR4から維持、その他はR5で反映。
+全回答は2026-10-10。Q1/2/11/17はR4から維持、その他はR5で反映。backupだけの失敗はR6で採択を反映。
 Q14の以前の相談はA2で不要になった。質問の番号を振り直さず、追加のscope判断も別行に記録する。
 
 | 質問 | 決定 | 日付 |
@@ -1303,14 +1467,10 @@ Q14の以前の相談はA2で不要になった。質問の番号を振り直さ
 | Q13 mixed動画・音声 | 通常mixed順/自動閲覧とメディアを維持、保存構成は残す。Book再適格で再適用。hiddenは遅延拒否、子container行は現行資格に従い分離 | 2026-10-10 |
 | Q14 抽出一覧のshift範囲 | 以前の問はA2に置換し不要。抽出列は初期Single/一時Spreadだけ、構成/本別設定/cover/shift/末尾/端/単独なし。synthetic mode keyを読み書きせず次openはSingle。released変更を承認 | 2026-10-10 |
 | Q15 構成なしのメタ情報import | 新形式構成ありは置換、構成なしは解除、旧形式/対象外/skipは保持。追加/置換/解除数と説明を一括確認一回へ追加。本別promptなし | 2026-10-10 |
-| Q16 結果順とhiddenチェック | 結果内直接閲覧を維持しA2適用。通常thumb表示、列生成lookup/保存refreshなし。open/次提示候補だけhiddenを調べtoast拒否/skip。しおり/評価/履歴のページtargetも同じ | 2026-10-10 |
+| Q16 結果順とhiddenチェック | 結果内直接閲覧を維持しA2適用。通常thumb表示、列生成lookup/保存refreshなし。open/次提示候補 (連結のviewport新入場・mode切替の新相方も含む) だけhiddenを調べtoast拒否/skip。しおり/評価/履歴のページtargetも同じ | 2026-10-10 |
 | Q17 末尾・端配置・単独・ずらし | Q2のlock。editorの明示unit編集だけ。初期化は現在の末尾/端/単独/shift後の組を取り込む | 2026-10-10 |
 | 画像folder対応の縮小候補 | G4Fで分離。二回連続の同領域P1/P2 REVISE、または共通部分へ例外状態が必要ならcoordinatorが利用者に切り離しを相談。採択時は書庫/PDF/EPUBだけ、画像folderはZIP圧縮で代替 | 2026-10-10 |
+| フォルダbackupだけの保存失敗 | 成功DB保存/解除を維持して通知。古いbackup/移動前の再保存またはメタ情報書き出しを案内。自動retry/DB-file同時rollbackなし。同じ場所の旧backup消費は§7.4.2で別途保証 | 2026-10-10 |
 
-新規確認事項 (既存17問の未回答ではない):
-
-1. **フォルダのバックアップだけ保存に失敗した場合、DBに保存できた構成はそのまま使ってよいですか。**
-   推奨: 構成は保存/解除済みとして保持し、「フォルダのバックアップを更新できませんでした」と通知。
-   移動前に保存し直すかメタ情報を書き出す。古いbackupが残る場合はその旨も説明する。
-   自動再試行/DBとファイルを同時に戻す仕組みは追加しない。代案は、backup失敗でも保存全体を失敗にして以前へ戻す
-   (DBとファイルを跨ぐ回復設計が必要)。これはQ10で増えた保存先の失敗契約としてG4F採択前に確認する。
+新しい利用者質問はない。R6の提示許可とsidecar同期receiptは採択済みのQ10/Q16を成立させる所有契約であり、
+連結読みの制限やbackup設定の追加を提案していない。設計採択には独立レビュー/設計担当の構造合意が引き続き必要。
