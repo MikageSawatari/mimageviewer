@@ -15442,6 +15442,7 @@ pub struct App {
 
     // ── 統合環境設定ダイアログ ─────────────────────────────────────
     pub(crate) show_preferences: bool,
+    pub(crate) diagnostics_export: crate::diagnostics::ExportOwner,
     /// 前フレームの環境設定可視フラグ。false -> true の open edge だけを検出する。
     pub(crate) preferences_open_last_frame: bool,
     /// 右ペイン ScrollArea の id に使う、ダイアログを閉じても保持する単調増加値。
@@ -18315,6 +18316,7 @@ pub struct App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        self.diagnostics_export.retire();
         self.retire_pending_startup_result();
         crate::thumb_loader::cancel_raw_thumb_tickets(&self.raw_thumb_develop);
         // LibRaw may be inside an uncancellable native interval. Cancel work and
@@ -19390,6 +19392,7 @@ impl App {
             #[cfg(test)]
             rename_migration_data_dir_override: None,
             show_preferences: false,
+            diagnostics_export: crate::diagnostics::ExportOwner::Idle,
             preferences_open_last_frame: false,
             preferences_right_panel_scroll_sequence: 0,
             preferences_requested_page: None,
@@ -29640,6 +29643,22 @@ impl App {
         if !self.indexer_init.overlay_active() && self.window_visible && !minimized && take_notice()
         {
             self.show_feedback_toast("起動記録を保存できませんでした".to_string());
+        }
+    }
+
+    fn poll_log_writer_notice(
+        &mut self,
+        minimized: bool,
+        take_error: impl FnOnce() -> Option<String>,
+    ) {
+        // Retain the writer-owned one-shot error while a toast cannot be seen.
+        // Reporting this failure must not enqueue another log into the failed sink.
+        if !self.indexer_init.overlay_active() && self.window_visible && !minimized {
+            if take_error().is_some() {
+                self.show_feedback_toast(
+                    "診断ログを保存できません。次回起動時に再試行します".to_string(),
+                );
+            }
         }
     }
 
@@ -92694,6 +92713,7 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.diagnostics_export.poll();
         self.begin_grid_click_input_frame(ctx);
         static FIRST_UPDATE: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
@@ -92711,6 +92731,10 @@ impl eframe::App for App {
         self.poll_startup_diagnostics_notice(
             ctx.input(|input| input.viewport().minimized.unwrap_or(false)),
             miv_startup::take_unavailable_notice,
+        );
+        self.poll_log_writer_notice(
+            ctx.input(|input| input.viewport().minimized.unwrap_or(false)),
+            crate::log_writer::take_error,
         );
         self.startup_window_geometry
             .begin_frame(ctx.cumulative_frame_nr());
@@ -92835,6 +92859,7 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.diagnostics_export.retire();
         self.retire_pending_startup_result();
         self.epub_convert = None;
         // A process exit that bypassed the ordinary close-event frame must still fence the exact
@@ -95064,6 +95089,31 @@ mod index_full_check_tests {
         );
         let shown_at = toast.1;
         app.poll_startup_diagnostics_notice(false, take_notice);
+        assert_eq!(app.fs_feedback_toast.as_ref().unwrap().1, shown_at);
+    }
+
+    #[test]
+    fn log_writer_failure_notice_waits_for_visible_ui_and_is_consumed_once() {
+        let mut env = setup_app_for_test();
+        let app = &mut env.app;
+        app.indexer_init = IndexerInit::Unavailable;
+        let pending = std::cell::RefCell::new(Some("sink failed".to_string()));
+        let take_error = || pending.borrow_mut().take();
+        app.window_visible = false;
+        app.poll_log_writer_notice(false, take_error);
+        assert!(pending.borrow().is_some());
+        app.window_visible = true;
+        app.poll_log_writer_notice(true, take_error);
+        assert!(pending.borrow().is_some());
+        assert!(app.fs_feedback_toast.is_none());
+        app.poll_log_writer_notice(false, take_error);
+        assert!(pending.borrow().is_none());
+        let shown_at = app.fs_feedback_toast.as_ref().unwrap().1;
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().unwrap().0,
+            "診断ログを保存できません。次回起動時に再試行します"
+        );
+        app.poll_log_writer_notice(false, take_error);
         assert_eq!(app.fs_feedback_toast.as_ref().unwrap().1, shown_at);
     }
 

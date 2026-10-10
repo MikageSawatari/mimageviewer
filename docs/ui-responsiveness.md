@@ -694,6 +694,20 @@ python scripts\analyze_perf.py $Perf hitches --ms 100  # 100ms 超フレーム�
 python scripts\analyze_perf.py $Perf dump <seq>  # 特定 input_seq のイベント列
 ```
 
+### 7.0 ログの配送と保存完了（§1.356）
+
+UI／stderr reader／workerの `logger::log` / `perf::event` は自身のtimestamp／tid付きで
+有界journalへ非blocking受付する。通常／perfのopen・write・flush・rotationは単一writerの仕事。
+UIから `flush()` を呼んでも待機しない。通常writerは到着batchを直ちにflush、perfだけ250ms周期。
+これにより、ログ保存先の停止がUIやchild stderr排出へ伝播する所有lockを除いた。
+OS側のwrite stall原因は未確定で、Storeの起動問題全体の修正保証ではない。
+
+保存完了が必要な診断ZIPは、Appの単一ownerからworkerを起動し、完了barrierを最大2秒待つ。
+UIは保存中／結果のpollだけ。過去dropは証拠不完全と知らせZIPを保存し、今回要求印drop・
+timeout・必須snapshotの読取り失敗は通知して失敗。解析gateもcheckpointなしをPASSにしない。
+panic.log／UI hang watchdogは直接writeのまま。終了時だけ一般／startup writer合計2秒待つ。
+[設計・利用者決定](async-log-writer-plan.md)を参照。
+
 ### 7.1 `pre_grid` 区間の内訳
 
 `App::update` の `t_toolbar_input` 直後から `t_pre_grid` 直前までは、perf 有効時に

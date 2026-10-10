@@ -168,6 +168,17 @@
 - 着手時: 単ページ / 見開き / 連結 / capture→replay / PDF初回・Z・再要求を棚卸しし、trim・分割・保存回転を一度だけ解決する入力ownerを設計する。既存4方式まで表示範囲が変わる費用と互換性を判断してから実装する。detached経路へ触れる場合は計画§2の構造合意・§11記録も必要。
 - 規模 / 優先度: 未見積もり / P3。
 
+### 1.356 同期ログのディスク書込みが起動中のUIとstderr排出を止める — 利用者報告・perfログ解析 (2026-10-09)
+
+- **次の版の決定 (利用者 2026-10-09)**: ライン Cで修正する。設計の正本は [async-log-writer-plan.md](async-log-writer-plan.md)。2026-10-09にC356-1〜5全回答済み。容量262,144件／128MiB／1件1MiB、drop-new、通常batch即flush・perf250ms、終了合計2秒、ZIPは過去drop警告付き保存、性能gateは完全性不明なら判定不能。
+- 観測者・条件: 利用者がnext-inputのdev build（master取り込み済み）を、重いbuild/testが複数worktreeで並行している間に起動し、しばらく「応答なし」を観測した（2026-10-08夜）。調査担当による製品起動・実機再現は行っていない。
+- 同セッションのperfログから: UIの同期perf writeが16,072.72ms停止。通常logのbridge reader writeも14,243.44ms停止し、EffeTune readerは通常log mutexを14,213.69ms待った。stderr callbackがloggerへ同期writeするため、childのstderr排出まで止まった。UIの16,112.2ms frame gapと一致。起動時のplugin loadの終了logと同時刻でも、UIがpluginのIPC応答を直接待った証拠ではない。
+- リリース済み範囲: v4.4.0タグとのコード比較でlogger／perf／stallに差分がなく、同じUI発行経路がある。同版の実機再現ではない。OS側のwrite停止原因は未確定で、並行build/test負荷との因果も未確定。1.337のGuiGate／host変更による停止と断定しない。
+- 設計案: 通常／perfファイルのopen・write・flush・rotation・retentionを一つの専用writerへ移す。producerは自身の時刻・tid付きレコードを非blockingで有界queueへ渡す。欠落件数を記録し、UIのperf::flushは要求だけ、通常終了のdrainは上限付き。panic.log／UI watchdog／常時startup JSONL／Remote専用logの独立境界を保持し、allocラインのstartup `.lock` sidecar修正も維持する。
+- Store関連の初回「起動中…」の描画前にも、perf有効時の同期write／flushと常時の通常logがある。これを非同期化するが、Storeの起動問題の原因確定・解消とは扱わない。
+- 実装: 単一writer、worker ZIP、完了checkpointと解析CannotJudge、startup terminal保護／flush ACKを接続。next-alloc `90a8a9353` の.lock sidecar修正と試験のみ移植（allocator flavorは取り込まない）。故意に停止させたsink／ZIP実配送／解析偽PASSの回帰と共用gateを検証し、独立実装レビューへ引き継ぐ。規模 / 優先度: Medium / P2。
+- 実機確認後（利用者2026-10-09）: 7-plugin構成で目立つUI停止なしとの報告。一方、コピーには通常17件／perf60件の`journal_contended`欠落が残った（最初の36秒相当の通常欠落は14件）。利用者は通常負荷で診断ログを失わないことを要求。容量不足ではなく共有journal Mutexの排出／受付競合が根因なので、容量は変えず有界channelとatomic publication ownerへ置換し、barrier登録競合による拒否も除く。調査担当の製品起動はない。詳細と観測限界は設計§14。
+
 ### 1.354 既存の画像経路の EXIF 読み取りで、小さい入力から大量のメモリを確保しうる — 次の版の音声ジャケット (§1.347) の独立レビューで発見 (2026-10-08)
 - **状態: 今後検討 (利用者 2026-10-08)**。
 - 出典: §1.347 (音楽のジャケット画像) の独立実装レビュー P1。音声の埋め込み画像の経路は、専用の有界な Orientation 読み取りに置き換えて対処済み (next-audio-art、`docs/audio-album-art-plan.md` §20.1)。既存の画像経路は同じ parser を使ったまま残っている。

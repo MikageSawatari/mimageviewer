@@ -9,8 +9,8 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 pub use watch::{WatchHandle, WatchSlot, first_dispatch_watch, watch_handle};
 
 pub const HANDOFF_ENV: &str = "MIV_STARTUP_TRACE_V1";
@@ -199,6 +199,8 @@ struct Owner {
     unavailable: AtomicBool,
     notice_taken: AtomicBool,
     shutdown: AtomicU8,
+    terminal: OnceLock<Event>,
+    writer_completion: (Mutex<Option<bool>>, Condvar),
     first_present: AtomicBool,
     normal_present: AtomicBool,
     watches: [watch::WatchState; 5],
@@ -213,6 +215,11 @@ impl Owner {
         // A single attempt. Neither queue saturation nor writer contention may
         // turn an observation into a wait on the startup thread.
         if let Ok(mut j) = self.journal.try_lock() {
+            // Inspect the seal under the dequeue lock, so a publisher already
+            // inside this critical section is drained before completion.
+            if self.stopped() {
+                return;
+            }
             if j.history.len() == CAPACITY {
                 j.history.pop_front();
                 self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -235,6 +242,28 @@ impl Owner {
     }
     fn stopped(&self) -> bool {
         self.shutdown.load(Ordering::Acquire) == ProcessState::Stopped as u8
+    }
+    fn complete_writer(&self, success: bool) {
+        *self.writer_completion.0.lock().unwrap() = Some(success);
+        self.writer_completion.1.notify_all();
+    }
+    fn wait_writer_until(&self, deadline: Instant) -> bool {
+        let mut completion = self.writer_completion.0.lock().unwrap();
+        loop {
+            if let Some(success) = *completion {
+                return success;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            completion = self
+                .writer_completion
+                .1
+                .wait_timeout(completion, remaining)
+                .unwrap()
+                .0;
+        }
     }
     fn take_notice(&self) -> bool {
         self.unavailable.load(Ordering::Acquire) && !self.notice_taken.swap(true, Ordering::AcqRel)
@@ -293,6 +322,8 @@ fn initialize(role: Role, version: &str, args: &[String], portable: bool, entry:
         unavailable: AtomicBool::new(false),
         notice_taken: AtomicBool::new(false),
         shutdown: AtomicU8::new(ProcessState::Running as u8),
+        terminal: OnceLock::new(),
+        writer_completion: (Mutex::new(None), Condvar::new()),
         first_present: AtomicBool::new(false),
         normal_present: AtomicBool::new(false),
         watches: std::array::from_fn(|_| watch::WatchState::new()),
@@ -326,6 +357,7 @@ fn initialize(role: Role, version: &str, args: &[String], portable: bool, entry:
     }
     if output::spawn(o.clone()).is_err() {
         o.fail();
+        o.complete_writer(false);
     }
     if watch::spawn(o.clone()).is_err() {
         o.fail();
@@ -658,7 +690,7 @@ pub fn terminal(outcome: Outcome) {
 }
 fn terminal_for(o: &Owner, outcome: Outcome) {
     // A single terminal publisher owns this transition. Stop the writer only
-    // after the winner has queued the actual outcome and final watch events.
+    // after the winner has protected the actual outcome and final watch events.
     if o.shutdown
         .compare_exchange(
             ProcessState::Running as u8,
@@ -686,7 +718,7 @@ fn terminal_for(o: &Owner, outcome: Outcome) {
     )
     .named("process.terminal");
     e.outcome = outcome;
-    o.publish(e);
+    let _ = o.terminal.set(e);
     o.shutdown
         .store(ProcessState::Stopped as u8, Ordering::Release);
     if let Some(writer) = o.writer_wake.get() {
@@ -695,6 +727,15 @@ fn terminal_for(o: &Owner, outcome: Outcome) {
 }
 pub fn shutdown() {
     terminal(Outcome::Cancelled);
+}
+/// Final process-boundary wait only; publishers and UI callbacks never wait.
+/// The caller supplies the one deadline shared with other diagnostic writers.
+/// Timeout leaves all I/O ownership on the worker, without a join or fallback.
+pub fn shutdown_until(deadline: Instant) -> bool {
+    owner().is_none_or(|o| {
+        terminal_for(o, Outcome::Cancelled);
+        o.wait_writer_until(deadline)
+    })
 }
 pub fn record_data_dir(path: &Path, selection: &str, runtime: Option<&Path>) {
     output::environment(
@@ -851,6 +892,8 @@ mod tests {
             unavailable: AtomicBool::new(false),
             notice_taken: AtomicBool::new(false),
             shutdown: AtomicU8::new(ProcessState::Running as u8),
+            terminal: OnceLock::new(),
+            writer_completion: (Mutex::new(None), Condvar::new()),
             first_present: AtomicBool::new(false),
             normal_present: AtomicBool::new(false),
             watches: std::array::from_fn(|_| watch::WatchState::new()),
@@ -1058,12 +1101,31 @@ mod tests {
                 .all(|slot| !watch::is_live(&o, slot))
         );
         let j = o.journal.lock().unwrap();
-        let terminals = j
-            .history
-            .iter()
-            .filter(|e| e.name() == "process.terminal")
-            .collect::<Vec<_>>();
-        assert_eq!(terminals.len(), 1);
-        assert_eq!(terminals[0].outcome, Outcome::Error);
+        assert!(j.history.iter().all(|e| e.name() != "process.terminal"));
+        assert_eq!(o.terminal.get().unwrap().outcome, Outcome::Error);
+    }
+    #[test]
+    fn terminal_is_protected_from_full_journal_and_lock_contention() {
+        let o = test_owner(Role::Core);
+        for id in 0..CAPACITY {
+            o.publish(Event::new(2, Lane::Core, Stage::Entry, id as u64, 0));
+        }
+        let j = o.journal.lock().unwrap();
+        terminal_for(&o, Outcome::Error);
+        assert!(o.stopped());
+        assert_eq!(o.terminal.get().unwrap().outcome, Outcome::Error);
+        assert_eq!(j.pending.len(), CAPACITY);
+        drop(j);
+        o.publish(Event::new(2, Lane::Core, Stage::Entry, 9999, 0));
+        assert_eq!(o.journal.lock().unwrap().pending.len(), CAPACITY);
+    }
+    #[test]
+    fn writer_failure_ack_is_unsuccessful_and_deadline_does_not_reset() {
+        let o = test_owner(Role::Core);
+        let deadline = Instant::now();
+        assert!(!o.wait_writer_until(deadline));
+        assert!(!o.wait_writer_until(deadline));
+        o.complete_writer(false);
+        assert!(!o.wait_writer_until(Instant::now() + Duration::from_secs(2)));
     }
 }

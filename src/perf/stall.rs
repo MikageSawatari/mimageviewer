@@ -32,6 +32,7 @@ struct DiagnosticQueue {
     records: Mutex<DiagnosticRecords>,
     queued: AtomicBool,
     dropped: AtomicU64,
+    dropped_total: AtomicU64,
 }
 
 impl DiagnosticQueue {
@@ -40,6 +41,7 @@ impl DiagnosticQueue {
             records: Mutex::new(DiagnosticRecords::empty()),
             queued: AtomicBool::new(false),
             dropped: AtomicU64::new(0),
+            dropped_total: AtomicU64::new(0),
         }
     }
 
@@ -54,6 +56,7 @@ impl DiagnosticQueue {
             return;
         }
         self.dropped.fetch_add(1, Ordering::Relaxed);
+        self.dropped_total.fetch_add(1, Ordering::Relaxed);
     }
 
     fn take(&self) -> Option<DiagnosticRecords> {
@@ -223,7 +226,8 @@ impl SlowIo {
     fn json(&self) -> Value {
         let p = &self.probe;
         serde_json::json!({
-            "cat": "log", "kind": "slow_io", "t": seconds(self.ended), "tid": p.tid,
+            "cat": "log", "kind": "slow_io",
+            "io_owner": "writer", "t": seconds(self.ended), "tid": p.tid,
             "logger": p.logger, "operation": p.operation, "call_site": site_tag(p.site),
             "start_t": seconds(p.started), "acquired_t": seconds(p.acquired), "end_t": seconds(self.ended),
             "wait_ms": self.wait_ms, "hold_ms": self.hold_ms,
@@ -237,30 +241,43 @@ impl SlowIo {
 
 /// Already under the perf file guard. Bounded work, raw write path, no event()/flush()
 /// recursion. Its time is included in the caller's hold and auxiliary_ms witness.
-pub(super) fn drain(writer: &mut impl Write) {
+pub(crate) fn drain(writer: &mut impl Write) -> std::io::Result<()> {
     let Some(queue) = DIAGNOSTICS.get() else {
-        return;
+        return Ok(());
     };
-    drain_queue(writer, queue);
+    drain_queue(writer, queue)
 }
 
-fn drain_queue(writer: &mut impl Write, queue: &DiagnosticQueue) {
+pub(crate) fn pending() -> bool {
+    DIAGNOSTICS
+        .get()
+        .is_some_and(|q| q.queued.load(Ordering::Acquire) || q.dropped.load(Ordering::Acquire) != 0)
+}
+
+pub(crate) fn dropped_total() -> u64 {
+    DIAGNOSTICS
+        .get()
+        .map_or(0, |q| q.dropped_total.load(Ordering::Relaxed))
+}
+
+fn drain_queue(writer: &mut impl Write, queue: &DiagnosticQueue) -> std::io::Result<()> {
     // take() releases the queue guard before serialization or any file write.
     if let Some(batch) = queue.take() {
         for record in batch.records.into_iter().take(batch.len).flatten() {
-            let _ = writeln!(writer, "{}", record.json());
+            writeln!(writer, "{}", record.json())?;
         }
     }
     let dropped = queue.dropped.swap(0, Ordering::Relaxed);
     if dropped != 0 {
-        let _ = writeln!(
+        writeln!(
             writer,
             "{}",
             serde_json::json!({
                 "t": seconds(Instant::now()), "cat": "log", "kind": "diagnostic_dropped", "count": dropped
             })
-        );
+        )?;
     }
+    Ok(())
 }
 
 pub(crate) fn retire(holder: &Holder, probe: &Option<IoProbe>) -> Option<Instant> {
@@ -586,7 +603,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
             let mut out = Vec::new();
-            drain_queue(&mut out, &other);
+            drain_queue(&mut out, &other).unwrap();
             assert!(
                 out.is_empty(),
                 "drain contention must preserve the queued record"
@@ -617,7 +634,7 @@ mod tests {
         }
         let queue = DiagnosticQueue::new();
         queue.enqueue(test_record());
-        drain_queue(&mut Writer(&queue), &queue);
+        drain_queue(&mut Writer(&queue), &queue).unwrap();
         assert!(queue.take().is_none());
     }
     #[test]

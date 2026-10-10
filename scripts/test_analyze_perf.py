@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from analyze_perf import (
+    validate_delivery,
     analyze_collection,
     analyze_thumb_adjustment_frames,
     analyze_page_turn,
@@ -69,6 +70,27 @@ def tail(t: float, n: int, reasons: list[str] | None = None) -> dict:
 
 def session(pid: int) -> dict:
     return {"t": 0.0, "cat": "session", "kind": "start", "pid": pid}
+
+
+def delivery_events(events: list[dict], end_t: float = 30.0) -> list[dict]:
+    rows = [dict(e) for e in events]
+    starts = [e for e in rows if e.get("cat") == "session"]
+    if not starts:
+        rows.insert(0, session(42))
+        starts = [rows[0]]
+    for start in starts:
+        start.update(log_delivery_schema=1, session_id="fixture-session", process_start_unix_ms=1234)
+    rows.append({"t": end_t + 0.01, "cat": "log", "kind": "drain_checkpoint",
+                 "schema": 1, "session_id": "fixture-session", "pid": starts[0]["pid"],
+                 "process_start_unix_ms": 1234, "request_id": "fixture-nonce", "purpose": "shutdown",
+                 "coverage_t": end_t, "ticket_cutoff": 20, "settled_watermark": 20,
+                 "written_watermark": 20, "normal_written_bytes": 100, "perf_written_bytes": 200, "normal_status": "ready", "perf_status": "ready",
+                 "normal_dropped_total": 0, "perf_dropped_total": 0, "diagnostic_dropped_total": 0})
+    return rows
+
+
+def analyze_complete_idle_health(events, start_t, end_t, **kwargs):
+    return analyze_idle_health(delivery_events(events, end_t), start_t, end_t, **kwargs)
 
 
 def modifier_probe(t: float = 2.0, **fields) -> dict:
@@ -1172,13 +1194,13 @@ class IdleHealthTests(unittest.TestCase):
     ) -> None:
         events = [session(42), frame(1.0, 1), tail(1.0, 1)]
 
-        report = analyze_idle_health(events, 10.0, 25.0)
+        report = analyze_complete_idle_health(events, 10.0, 25.0)
 
         self.assertEqual(report["status"], "fail")
         self.assertEqual(report["metrics"]["frames"], 0)
         self.assertEqual(report["metrics"]["update_rate_per_sec"], 0.0)
 
-        pid_only_report = analyze_idle_health(
+        pid_only_report = analyze_complete_idle_health(
             events,
             10.0,
             25.0,
@@ -1186,7 +1208,7 @@ class IdleHealthTests(unittest.TestCase):
         )
         self.assertEqual(pid_only_report["status"], "fail")
 
-        report = analyze_idle_health(
+        report = analyze_complete_idle_health(
             events,
             10.0,
             25.0,
@@ -1199,9 +1221,9 @@ class IdleHealthTests(unittest.TestCase):
     def test_expected_pid_rejects_a_different_process_log(self) -> None:
         events = [session(41), frame(1.0, 1), tail(1.0, 1)]
 
-        report = analyze_idle_health(events, 0.0, 2.0, expected_pid=42)
+        report = analyze_complete_idle_health(events, 0.0, 2.0, expected_pid=42)
 
-        self.assertEqual(report["status"], "fail")
+        self.assertEqual(report["status"], "CannotJudge")
         self.assertTrue(any("PID" in item for item in report["failures"]))
 
     def test_video_pin_scenario_matches_target_work_case_insensitively(self) -> None:
@@ -1212,7 +1234,7 @@ class IdleHealthTests(unittest.TestCase):
             thumb(0.75, "idle_upgrade_enqueue", "dir::c:/BOOKS/Video-Pin"),
         ]
 
-        report = analyze_idle_health(
+        report = analyze_complete_idle_health(
             events,
             1.0,
             10.0,
@@ -1247,7 +1269,7 @@ class IdleHealthTests(unittest.TestCase):
             load_folder_begin(0.5),
         ]
 
-        report = analyze_idle_health(
+        report = analyze_complete_idle_health(
             events,
             1.0,
             10.0,
@@ -1277,7 +1299,7 @@ class IdleHealthTests(unittest.TestCase):
             tail(5.0, 1),
         ]
 
-        report = analyze_idle_health(
+        report = analyze_complete_idle_health(
             events,
             5.0,
             10.0,
@@ -1300,7 +1322,7 @@ class IdleHealthTests(unittest.TestCase):
             thumb(0.75, "enqueue", "dir::c:/books/video-pin"),
         ]
 
-        report = analyze_idle_health(
+        report = analyze_complete_idle_health(
             events,
             1.0,
             10.0,
@@ -1316,7 +1338,7 @@ class IdleHealthTests(unittest.TestCase):
     def test_video_pin_work_key_gate_is_disabled_by_default(self) -> None:
         events = [session(42), frame(1.0, 1), tail(1.0, 1)]
 
-        report = analyze_idle_health(
+        report = analyze_complete_idle_health(
             events,
             1.0,
             10.0,
@@ -1334,7 +1356,7 @@ class IdleHealthTests(unittest.TestCase):
 
         for blank in ("", "   "):
             with self.assertRaises(ValueError):
-                analyze_idle_health(
+                analyze_complete_idle_health(
                     events,
                     1.0,
                     10.0,
@@ -1360,7 +1382,7 @@ class IdleHealthTests(unittest.TestCase):
                 }
             )
 
-        report = analyze_idle_health(events, 0.0, 3.0)
+        report = analyze_complete_idle_health(events, 0.0, 3.0)
 
         self.assertEqual(report["status"], "fail")
         self.assertGreater(report["metrics"]["update_rate_per_sec"], 10.0)
@@ -1377,7 +1399,7 @@ class IdleHealthTests(unittest.TestCase):
             {"t": 2.0, "cat": "input", "kind": "grid_key", "seq": 1},
         ]
 
-        report = analyze_idle_health(events, 0.0, 10.0)
+        report = analyze_complete_idle_health(events, 0.0, 10.0)
 
         self.assertEqual(report["status"], "fail")
         self.assertEqual(report["metrics"]["input_events"], 1)
@@ -1390,10 +1412,11 @@ class IdleHealthTests(unittest.TestCase):
                     probe["focused"] = focused
                 with self.subTest(focused=focused, ctrl=ctrl):
                     events = [frame(0.0, 0), tail(0.0, 0), probe]
-                    report = analyze_idle_health(events, 0.0, 10.0)
+                    report = analyze_complete_idle_health(events, 0.0, 10.0)
                     self.assertEqual(report["status"], "pass", report["failures"])
                     self.assertEqual(report["metrics"]["input_events"], 0)
-                    self.assertEqual(report["metrics"]["events"], 3)
+                    # The delivery helper adds the session metadata at t=0.
+                    self.assertEqual(report["metrics"]["events"], 4)
                     self.assertEqual(report["metrics"]["frames"], 1)
                     self.assertEqual(report["metrics"]["tail_repaint_events"], 1)
 
@@ -1409,7 +1432,7 @@ class IdleHealthTests(unittest.TestCase):
         ]
         for probe in probes:
             with self.subTest(probe=probe):
-                report = analyze_idle_health(
+                report = analyze_complete_idle_health(
                     [frame(0.0, 0), tail(0.0, 0), probe], 0.0, 10.0
                 )
                 self.assertEqual(report["status"], "fail")
@@ -1437,7 +1460,7 @@ class IdleHealthTests(unittest.TestCase):
             probes.append(probe)
         for probe in probes:
             with self.subTest(probe=probe):
-                report = analyze_idle_health(
+                report = analyze_complete_idle_health(
                     [frame(0.0, 0), tail(0.0, 0), probe], 0.0, 10.0
                 )
                 self.assertEqual(report["status"], "fail")
@@ -1466,10 +1489,10 @@ class IdleHealthTests(unittest.TestCase):
                     events.append(frame(t, n + 1))
                     events.append(tail(t, n + 1, ["requested_nonempty"]))
             with self.subTest(cause=cause):
-                report = analyze_idle_health(events, 0.0, 10.0)
+                report = analyze_complete_idle_health(events, 0.0, 10.0)
                 self.assertEqual(report["status"], "fail")
                 self.assertEqual(report["metrics"]["input_events"], 0)
-                self.assertEqual(report["metrics"]["events"], len(events))
+                self.assertEqual(report["metrics"]["events"], len(events) + 1)
                 self.assertFalse(any("input event" in f for f in report["failures"]))
                 if cause == "work":
                     self.assertEqual(report["metrics"]["max_same_work"], 4)
@@ -1487,7 +1510,7 @@ class IdleHealthTests(unittest.TestCase):
             events.append(frame(t, n))
             events.append(tail(t, n, ["requested_nonempty"]))
 
-        report = analyze_idle_health(events, 0.0, 7.0, expected_pid=42)
+        report = analyze_complete_idle_health(events, 0.0, 7.0, expected_pid=42)
 
         self.assertEqual(report["status"], "fail")
         self.assertLess(report["metrics"]["update_rate_per_sec"], 2.0)
@@ -1511,7 +1534,7 @@ class IdleHealthTests(unittest.TestCase):
                     }
                 )
 
-        report = analyze_idle_health(events, 0.0, 10.0, max_same_work=2)
+        report = analyze_complete_idle_health(events, 0.0, 10.0, max_same_work=2)
 
         self.assertEqual(report["status"], "pass")
         self.assertEqual(report["metrics"]["max_same_work"], 2)
@@ -1522,7 +1545,7 @@ class IdleHealthTests(unittest.TestCase):
             report_path = temp_dir / "idle-health.json"
             with contextlib.redirect_stdout(io.StringIO()):
                 exit_code = cmd_idle_health(
-                    events,
+                    delivery_events(events, 10.0),
                     0.0,
                     10.0,
                     15.0,
@@ -1543,7 +1566,7 @@ class IdleHealthTests(unittest.TestCase):
             )
             with contextlib.redirect_stdout(io.StringIO()):
                 exit_code = cmd_idle_health(
-                    events,
+                    delivery_events(events, 10.0),
                     0.0,
                     10.0,
                     15.0,
@@ -1691,7 +1714,7 @@ class HitchReportTests(unittest.TestCase):
         contents = "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n"
         with mock.patch.object(Path, "open", return_value=io.StringIO(contents)) as opened:
             events = load_events(Path("new-schema-deferred.jsonl"))
-        opened.assert_called_once_with("r", encoding="utf-8")
+        opened.assert_called_once_with("r", encoding="utf-8", errors="replace")
         self.assertEqual([e["_line"] for e in events], list(range(1, 7)))
         self.assertEqual(events[4]["acquired_t"], 1.81)
         report = self.report(events)
@@ -2100,6 +2123,156 @@ class MemoryTimelineTests(unittest.TestCase):
                 mock.patch("analyze_perf.cmd_memory") as command:
             main()
         command.assert_called_once_with([])
+
+
+class DeliveryCompletenessTests(unittest.TestCase):
+    def test_old_metrics_remain_reference_but_sleep_is_not_proven(self):
+        report = analyze_idle_health([session(42), frame(1.0, 1), tail(1.0, 1)],
+                                     10.0, 25.0, expected_pid=42, allow_sleeping_window=True)
+        self.assertEqual(report["status"], "CannotJudge")
+        self.assertEqual(report["metrics"]["frames"], 0)
+
+    def test_modifier_heartbeat_and_delivery_contract_compose(self):
+        cases = [
+            ("complete", {}),
+            ("missing", None),
+            ("coverage", {"coverage_t": 9.0}),
+            ("normal_drop", {"normal_dropped_total": 1}),
+            ("perf_drop", {"perf_dropped_total": 1}),
+            ("diagnostic_drop", {"diagnostic_dropped_total": 1}),
+            ("unsettled", {"settled_watermark": 19}),
+        ]
+        for active in (False, True):
+            probe = modifier_probe(**({"trigger": "key_event"} if active else {}))
+            for label, change in cases:
+                rows = delivery_events([frame(0.0, 0), tail(0.0, 0), probe], 10.0)
+                if change is None:
+                    rows.pop()
+                else:
+                    rows[-1].update(change)
+                expected_status = ("fail" if active else "pass") if label == "complete" else "CannotJudge"
+                expected_exit = (1 if active else 0) if label == "complete" else 2
+                with self.subTest(active=active, delivery=label):
+                    report = analyze_idle_health(rows, 0.0, 10.0)
+                    self.assertEqual(report["status"], expected_status)
+                    self.assertEqual(report["metrics"]["input_events"], int(active))
+                    self.assertEqual(report["metrics"]["frames"], 1)
+                    self.assertEqual(bool(report["delivery"]["reasons"]), label != "complete")
+                    self.assertEqual(bool(report["failures"]), active)
+                    with contextlib.redirect_stdout(io.StringIO()) as output:
+                        exit_code = cmd_idle_health(rows, 0.0, 10.0, 15.0,
+                                                    2.0, 10.0, 2.0, 3, 0, None)
+                    self.assertEqual(exit_code, expected_exit)
+                    self.assertIn(f"判定: {expected_status.upper()}", output.getvalue())
+
+    def test_complete_zero_event_sleep_requires_stored_matching_nonce(self):
+        rows = delivery_events([session(42), frame(1.0, 1), tail(1.0, 1)], 25.0)
+        ack = {k: v for k, v in rows[-1].items() if k not in ("t", "cat", "kind")}
+        report = analyze_idle_health(rows, 10.0, 25.0, expected_pid=42, allow_sleeping_window=True,
+                                     checkpoint_id="fixture-nonce", delivery_ack=ack)
+        self.assertEqual(report["status"], "pass")
+        ack["perf_dropped_total"] = 1
+        self.assertEqual(analyze_idle_health(rows, 10.0, 25.0, expected_pid=42,
+                          allow_sleeping_window=True, checkpoint_id="fixture-nonce", delivery_ack=ack)["status"], "CannotJudge")
+
+    def test_incomplete_variants_never_pass(self):
+        base = delivery_events([frame(1.0, 1), tail(1.0, 1)], 25.0)
+        cases = [("missing", None), ("nonce", {"request_id": "different"}),
+                 ("session", {"session_id": "different"}), ("coverage", {"coverage_t": 24.0}),
+                 ("normal_drop", {"normal_dropped_total": 1}), ("perf_drop", {"perf_dropped_total": 1}),
+                 ("diagnostic_drop", {"diagnostic_dropped_total": 1}),
+                 ("unknown_counter", {"perf_dropped_total": None}), ("disabled", {"perf_status": "disabled"}),
+                 ("unsettled", {"settled_watermark": 19}), ("unwritten", {"written_watermark": 19})]
+        for label, change in cases:
+            with self.subTest(label=label):
+                rows = [dict(row) for row in base]
+                if change is None: rows.pop()
+                else: rows[-1].update(change)
+                self.assertEqual(validate_delivery(rows, checkpoint_id="fixture-nonce", coverage_end_t=25.0)["status"], "CannotJudge")
+        for kind in ("records_dropped", "diagnostic_dropped"):
+            rows = base[:-1] + [{"t": 2, "cat": "log", "kind": kind, "count": 1}] + base[-1:]
+            self.assertEqual(validate_delivery(rows, checkpoint_id="fixture-nonce", coverage_end_t=25.0)["status"], "CannotJudge")
+
+    def test_completed_byte_watermarks_are_required_and_ack_matches(self):
+        for field in ("normal_written_bytes", "perf_written_bytes"):
+            for value in (None, -1, 1.5, "100"):
+                with self.subTest(field=field, value=value):
+                    rows = delivery_events([frame(1.0, 1), tail(1.0, 1)], 25.0)
+                    rows[-1][field] = value
+                    self.assertEqual(validate_delivery(rows)["status"], "CannotJudge")
+            rows = delivery_events([frame(1.0, 1), tail(1.0, 1)], 25.0)
+            ack = dict(rows[-1])
+            ack[field] += 1
+            self.assertEqual(validate_delivery(rows, checkpoint_id="fixture-nonce", coverage_end_t=25, ack=ack)["status"], "CannotJudge")
+
+    def test_four_cli_gates_legacy_exit_two(self):
+        with writable_test_directory() as directory:
+            source = directory / "old.jsonl"
+            source.write_text(json.dumps(frame(1.0, 1)) + "\n", encoding="utf-8")
+            for command in ("idle-health", "hitches", "scroll", "startup"):
+                with self.subTest(command=command), mock.patch.object(sys, "argv", ["analyze_perf.py", str(source), command]), contextlib.redirect_stdout(io.StringIO()) as output:
+                    with self.assertRaises(SystemExit) as caught: main()
+                    self.assertEqual(caught.exception.code, 2)
+                    self.assertIn("CannotJudge", output.getvalue())
+
+    def test_partial_json_cannot_be_silently_skipped_by_gate(self):
+        with writable_test_directory() as directory:
+            source = directory / "partial.jsonl"
+            source.write_text("".join(json.dumps(e) + "\n" for e in delivery_events([frame(1, 1)])) + '{"t":', encoding="utf-8")
+            with contextlib.redirect_stderr(io.StringIO()): rows = load_events(source)
+            self.assertEqual(validate_delivery(rows)["status"], "CannotJudge")
+
+    def test_complete_manifest_covers_offline_prefix_and_incomplete_is_exit_two(self):
+        with writable_test_directory() as directory:
+            rows = delivery_events([frame(1.0, 1), tail(1.0, 1)], 25.0)
+            rows[-1]["purpose"] = "diagnostics"
+            source = directory / "perf_events.jsonl"
+            source.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+            manifest = {"schema": 1, "checkpoint": rows[-1], "evidence_status": "complete",
+                        "snapshots": {"perf": {"length": source.stat().st_size}}}
+            path = directory / "delivery_manifest.json"
+            for state, expected in (("complete", 0), ("incomplete", 2)):
+                manifest["evidence_status"] = state
+                path.write_text(json.dumps(manifest), encoding="utf-8")
+                argv = ["analyze_perf.py", str(source), "idle-health", "--start-t", "10",
+                        "--expected-pid", "42", "--allow-sleeping-window", "--delivery-manifest", str(path)]
+                with self.subTest(state=state), mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaises(SystemExit) as caught:
+                        main()
+                    self.assertEqual(caught.exception.code, expected)
+
+    def test_complete_endpoint_gates_and_missing_endpoints(self):
+        with writable_test_directory() as directory:
+            source = directory / "complete.jsonl"
+            for command, endpoint in (("hitches", frame(2.0, 2)),
+                                      ("startup", {"t": 2.0, "cat": "startup", "kind": "first_frame"}),
+                                      ("scroll", {"t": 2.0, "cat": "ui", "kind": "visible_thumb_all_ready", "settle_seq": 1})):
+                for complete in (True, False):
+                    rows = [frame(1.0, 1), {"t": 1.1, "cat": "ui", "kind": "scroll_settle", "settle_seq": 1}]
+                    if complete:
+                        rows.append(endpoint)
+                    rows = delivery_events(rows, 3.0)
+                    source.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+                    with self.subTest(command=command, complete=complete), mock.patch.object(sys, "argv", ["analyze_perf.py", str(source), command]), contextlib.redirect_stdout(io.StringIO()):
+                        if not complete and command != "hitches":
+                            with self.assertRaises(SystemExit) as caught:
+                                main()
+                            self.assertEqual(caught.exception.code, 2)
+                        else:
+                            main()
+
+    def test_live_ack_prefix_length_mismatch_is_exit_two(self):
+        with writable_test_directory() as directory:
+            rows = delivery_events([frame(1.0, 1), tail(1.0, 1)], 25.0)
+            source = directory / "prefix.jsonl"
+            source.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+            ack = dict(rows[-1], perf_end_offset=source.stat().st_size - 1, perf_file_identity="volume:file")
+            path = directory / "ack.json"
+            path.write_text(json.dumps(ack), encoding="utf-8")
+            with mock.patch.object(sys, "argv", ["analyze_perf.py", str(source), "hitches", "--checkpoint-id", "fixture-nonce", "--coverage-end-t", "25", "--delivery-ack", str(path)]), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as caught:
+                    main()
+                self.assertEqual(caught.exception.code, 2)
 
 
 if __name__ == "__main__":

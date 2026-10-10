@@ -17,6 +17,8 @@ mod video_stream;
 
 #[cfg(windows)]
 mod pipe;
+#[cfg(windows)]
+pub(crate) use pipe::current_user_pipe_security;
 pub(crate) mod session;
 pub(crate) use live_favorites::RemoteSettingsReaderControl;
 pub(crate) use service::{RemoteServiceControl, RemoteServiceManager, RemoteServiceStatus};
