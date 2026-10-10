@@ -13,6 +13,7 @@
 | [raw-libraw-plan.md](raw-libraw-plan.md) | RAW の内蔵現像、プレビュー差し替え・編集 gate・Remote・設定・配布を触るとき |
 | [libraw-source-distribution.md](libraw-source-distribution.md) | LibRaw の対応ソース・checksum・notice の準備と公開手順 |
 | [architecture-overview.md](architecture-overview.md) | 全体像の把握。レイヤー構造・モジュールマップ・永続化ストア一覧 |
+| [book-composition-plan.md](book-composition-plan.md) | §1.242 本の構成。利用者決定・G1〜G5の契約、G2 part Aのpure model/resolver/unit編集fixture。store接続はラインE §1.364統合後のpart B |
 | [thumbnail-request-lifecycle-plan.md](thumbnail-request-lifecycle-plan.md) | §1.360 サムネイル要求とCPU画像の単一owner、保存/画像両終端、request ID相関、動画のidle/repaint/進捗投影、tray両測定、回帰・検証証拠 |
 | [section327-startup-window-flicker-investigation.md](section327-startup-window-flicker-investigation.md) | §1.327 起動時の白窓、native診断の採取・観測限界、利用者ログで確認した最大化起動の原因、採用したnormal表示後の一度だけの最大化 (§8)。大規模backend案 (§7) は将来候補 |
 | [display-pipeline.md](display-pipeline.md) | サムネイル表示・フルスクリーン描画を触るとき。**補正/AI/回転の適用順の決定版** |

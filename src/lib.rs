@@ -63,6 +63,7 @@ pub mod auto_aspect;
 pub mod auto_aspect_cache;
 pub mod bake_stage;
 pub mod book_bookmarks;
+pub mod book_composition;
 mod book_fs_journal;
 pub mod book_resume_db;
 pub mod bookmark_browser;

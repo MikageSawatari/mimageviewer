@@ -5,7 +5,9 @@
 `app/book_materialization`に既存ZIP階層、PDF/EPUB page row、folder listingの生成を集約する。
 source enumeration、policy、raw manifest、cache/lease、既存PreparedPageIdentityIndexとadoptionは
 従来のownerを保つ。ZIPは直下ページblockだけがsurface間で一致し、子containerの位置は従来どおり。
-本の構成modelや永続storeはこの段階で導入しない。
+G2 part Aの`book_composition`はApp/UI/I/Oを持たないpure model・resolver・unit編集を提供する。
+現在の列生成・表示には未接続で、永続storeは未導入。保存キー`BookScopeKey`はラインEの所有であり、
+このmodelはキーを定義せず、参照種類/直下階層の検証用`PageDomain`だけを受け取る。
 
 itemsの採用時に排他的な`ProjectionRecipe`を確定する。抽出結果かどうかを現在のanchorや
 synthetic pathから推定しない。recipeはViewerContextBundleのmount/forkとsnapshot保存列へ登録し、

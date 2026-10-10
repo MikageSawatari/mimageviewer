@@ -1341,6 +1341,35 @@ G1の完了条件へG2以降の構成fixtureを先取りしない。G4F未実装
 ### G2: pure model / 共通store / lifecycle / 転送 (書庫・PDF・EPUB)
 
 所有: pure model/resolver、単一store、rename/purge/content restore、metadata transfer。
+
+**2026-10-10 G2 part A実装範囲**: `src/book_composition/{model,resolve,edit}.rs`。
+`BookComposition`はPair/Singleのみ、BlankはSingleCompanionの値であり独立page/IDを持たない。
+hiddenは登録済refの集合指定、Missingはmanifest不在から導出する。resolverは寸法・自動規則・shift・
+App/UIの入力を持たず、元slotの欠落Singleと新tail中央Singleを生成する。saved recordは変更しない。
+`ResolvedComposition::remap_removed_items`はrowsと同時採用するold→new mapを受け、
+unit/anchor/helper/target/実ページflat列をまとめてremapし、登録済みの削除refをMissingへ更新する。
+G3は同じtransactionで元manifest/identity表も更新し、永続refを削除しない。
+resolverのindexは入力manifestのrow空間を維持する。G3で構成順のrowsを作る時は
+`reindex_items`でtarget/unit/anchor/helperを同じ新slotへ写してから一括採用し、
+並べ替えの未採用row空間をviewerのitems indexとして公開しない。
+`fixtures::four_page_book` / `editor_unit_edits`はG3/G4の再利用用pure checkpoint。
+draft操作はcloneに適用→同じvalidatorで検証し、拒否なら元draft/revisionを変更しない。
+coverを含むPair作成は明示`clear_cover`と補助除去を同じ操作で行える。
+
+schema 1、通常参照/manifest/解決後参照は各100,000件、参照文字列32,768 UTF-8 bytes、
+JSON 16 MiBを上限とする。JSON入出力とdraftで同じ検証を使い、未知字段/variant/schema、
+unsafe relative/entry、種類/直下scope不一致、通常occurrence重複、cover/補助/hidden不整合を拒否する。
+lexical安全検証でFSのreparse-point/containment検証を代替せず、safe raw manifestはsource workerの責任。
+書庫memberはbytes参照なのでWindows file名の禁止文字を流用せず、relative/traversal安全性と直下scopeを検証する。
+`[A,白紙,白紙,B]`はdirectionと無関係に保存unitの読み順slotで拒否する。
+Hidden/Missingに付くBlank指定は保存モデルに残す。
+
+保存キー`BookScopeKey`はラインE §1.364の`src/book_scope.rs`が所有する。
+G2Aは種類/階層の検証用`PageDomain`だけを定義し、root/key/storeを複製しない。
+G2 part BはE統合後。store/rename/purge/content restore/Edit ledger/transfer/sidecar/runtime接続は本chunkに含めない。
+JSON round-tripはpure memory内の検証であり、DB transaction rollbackの検証を済ませた意味ではない。
+自動検証のcommand/件数/exit/logは`target/G-1242-g2a-msg.txt`へ記録し、独立レビュー/製品実機確認は主張しない。
+
 受入:
 
 - Pair/Single/Blank companion/補助/hidden round-trip、unsafe/重複/未知schema/上限拒否、transaction rollback。

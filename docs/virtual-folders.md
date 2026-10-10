@@ -15,7 +15,12 @@ ExtractedResult。本を列挙し直して入った子階層はBook、通常のm
 固定snapshotのmembership、★一致による直接open、帰路は維持し、保存列復帰ではrecipeも復元する。
 抽出一覧は新規fullscreen openでSingle、全体の読む方向をsessionへsnapshotする。一時見開きは
 全結果順で隣接ページを組み、cover/shift/末尾補助/端配置/強制単独を使わず、spread keyを作らない。
-F12の表示中forkだけはcapture-time modeを保持できる。構成model/storeは後続G2以降。
+F12の表示中forkだけはcapture-time modeを保持できる。
+G2 part Aの`book_composition`はpure model/resolverだけを追加し、これらのproduction経路へは未接続。
+PageRefは書庫の完全entry名、PDF/EPUBの物理0-based番号、画像folderの直下file名を区別し、
+bookmarkのcase/slash照合を共有する。EPUBのedit-key adapterは既存`edit_source::page_key_for_pdf`
+を使い、元EPUB+番号の同値をpure testで検査する。変換cache世代・内容reflowの対応表は作らない。
+store・ライフサイクル・転送の接続はG2 part B以降。
 連結方式（flow）はA2のpairing初期化と分離し、各入口の従来の採用規則を維持する。タグ・お気に入り・評価・サブ展開・Smart新規rootは既存の保存flow（旧Vertical表現を含む）または従来の分類に対応するdefaults（通常はNON_BOOKのPaged）を採用し、GlobalSearch・Smart保存root復帰・Collection root・固定snapshotの直接列差し替えは既存flowを維持する。単ページ化・再openだけを理由にflowを変更せず、連結読みの操作を維持する。旧Vertical mode行はflow列に別値が残っていても従来どおり縦連結へ復元し、旧行は変更しない。
 元の本の列を保存する既存SnapshotStateは閲覧状態（mode/方向/flow/shift index/補助設定）も
 一緒に保持し、固定解除の同じadoption内で復元する。BSで固定列へ戻る場合はA2のまま。

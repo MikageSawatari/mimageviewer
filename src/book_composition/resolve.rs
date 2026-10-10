@@ -1,0 +1,351 @@
+use std::collections::{HashMap, HashSet};
+
+use super::*;
+
+/// Facts from a safe raw manifest, after the source's normal duplicate removal.
+/// Excluded/filtered entries must remain here to distinguish them from Missing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManifestPage {
+    pub page: CompositionPageRef,
+    pub availability: ManifestAvailability,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManifestAvailability {
+    /// Input manifest row space. Resolution preserves this space; when G3
+    /// reorders rows, it must reindex the whole result in the same adoption.
+    Present {
+        item_index: usize,
+    },
+    ExcludedByPolicy,
+    FilteredOut,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageStatus {
+    Visible { item_index: usize },
+    HiddenByComposition,
+    ExcludedByPolicy,
+    FilteredOut,
+    Missing,
+    Invalid,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedPage {
+    pub page: CompositionPageRef,
+    pub item_index: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResolvedCompanion {
+    Vacant,
+    Blank,
+    /// Presentation only, never a second navigation/export occurrence.
+    FrontCoverSupplement(ResolvedPage),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResolvedUnit {
+    Pair {
+        first: ResolvedPage,
+        second: ResolvedPage,
+    },
+    Single {
+        page: ResolvedPage,
+        placement: SinglePlacement,
+        companion: ResolvedCompanion,
+    },
+}
+
+impl ResolvedUnit {
+    /// Anchor is the first surviving real navigation page in reading order.
+    pub fn anchor(&self) -> &ResolvedPage {
+        match self {
+            Self::Pair { first, .. } => first,
+            Self::Single { page, .. } => page,
+        }
+    }
+
+    pub fn navigation_pages(&self) -> impl Iterator<Item = &ResolvedPage> {
+        let (first, second) = match self {
+            Self::Pair { first, second } => (first, Some(second)),
+            Self::Single { page, .. } => (page, None),
+        };
+        std::iter::once(first).chain(second)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedComposition {
+    pub revision: u64,
+    pub direction: ReadingDirection,
+    pub units: Vec<ResolvedUnit>,
+    /// Single/Split, page counts and export use this real-only reading order.
+    pub visible_pages: Vec<ResolvedPage>,
+    /// Every unregistered raw page, in source order. Not automatically persisted.
+    pub new_tail: Vec<CompositionPageRef>,
+    /// All policy-admitted, composition-visible pages are present; facet subsets
+    /// are incomplete. This does not certify a later Remote response budget.
+    pub complete: bool,
+    statuses: HashMap<CompositionPageRef, PageStatus>,
+}
+
+impl ResolvedComposition {
+    pub fn page_status(&self, page: &CompositionPageRef) -> PageStatus {
+        self.statuses
+            .get(&page.matching_key())
+            .copied()
+            .unwrap_or(PageStatus::Invalid)
+    }
+
+    /// Pure deletion transaction: applies the same old -> new slots to navigation,
+    /// helpers, anchors and targets. Caller must adopt this with its rows/identity
+    /// manifest in one generation, and retain the saved identity-based composition.
+    pub fn remap_removed_items(&self, old_to_new: &[Option<usize>]) -> CompositionResult<Self> {
+        for (expected, index) in old_to_new.iter().flatten().enumerate() {
+            if *index != expected {
+                return Err(CompositionError::Invalid("invalid deletion slot map"));
+            }
+        }
+        self.remap_slots(old_to_new)
+    }
+
+    /// Reorder/filter materialized rows without declaring any real page Missing.
+    /// Hidden/policy/facet rows may have no output slot, but all navigation and
+    /// helper occurrences must survive. This is not a Remote budget projection.
+    pub fn reindex_items(&self, old_to_new: &[Option<usize>]) -> CompositionResult<Self> {
+        let mut targets = HashSet::new();
+        for index in old_to_new.iter().flatten() {
+            if *index >= old_to_new.len() || !targets.insert(*index) {
+                return Err(CompositionError::Invalid("invalid item reindex map"));
+            }
+        }
+        for page in &self.visible_pages {
+            if old_to_new.get(page.item_index).copied().flatten().is_none() {
+                return Err(CompositionError::Invalid(
+                    "item reindex map loses a visible page",
+                ));
+            }
+        }
+        // A supplement is also a visible ordinary cover occurrence, so the
+        // real-only list above covers every presentation source as well.
+        self.remap_slots(old_to_new)
+    }
+
+    fn remap_slots(&self, old_to_new: &[Option<usize>]) -> CompositionResult<Self> {
+        let remap_page = |page: &ResolvedPage| -> CompositionResult<Option<ResolvedPage>> {
+            let index = old_to_new
+                .get(page.item_index)
+                .ok_or(CompositionError::Invalid(
+                    "slot map does not cover projection",
+                ))?;
+            Ok(index.map(|item_index| ResolvedPage {
+                page: page.page.clone(),
+                item_index,
+            }))
+        };
+        let mut result = self.clone();
+        result.units.clear();
+        for unit in &self.units {
+            let mapped = match unit {
+                ResolvedUnit::Pair { first, second } => {
+                    project_pair(remap_page(first)?, remap_page(second)?)
+                }
+                ResolvedUnit::Single {
+                    page,
+                    placement,
+                    companion,
+                } => {
+                    let mapped_companion = match companion {
+                        ResolvedCompanion::FrontCoverSupplement(cover) => remap_page(cover)?
+                            .map(ResolvedCompanion::FrontCoverSupplement)
+                            .unwrap_or(ResolvedCompanion::Vacant),
+                        other => other.clone(),
+                    };
+                    remap_page(page)?.map(|page| ResolvedUnit::Single {
+                        page,
+                        placement: *placement,
+                        companion: mapped_companion,
+                    })
+                }
+            };
+            if let Some(unit) = mapped {
+                result.units.push(unit);
+            }
+        }
+        result.visible_pages = self
+            .visible_pages
+            .iter()
+            .map(remap_page)
+            .collect::<CompositionResult<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+        for status in result.statuses.values_mut() {
+            if let PageStatus::Visible { item_index } = *status {
+                *status = match old_to_new
+                    .get(item_index)
+                    .ok_or(CompositionError::Invalid("slot map does not cover targets"))?
+                {
+                    Some(index) => PageStatus::Visible { item_index: *index },
+                    None => PageStatus::Missing,
+                };
+            }
+        }
+        // A removed unsaved tail page has no saved occurrence to retain as Missing.
+        // Match fresh resolution against the updated raw manifest.
+        result.new_tail.retain(|page| {
+            let key = page.matching_key();
+            if result.statuses.get(&key) == Some(&PageStatus::Missing) {
+                result.statuses.remove(&key);
+                false
+            } else {
+                true
+            }
+        });
+        Ok(result)
+    }
+}
+
+fn project_pair(first: Option<ResolvedPage>, second: Option<ResolvedPage>) -> Option<ResolvedUnit> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(ResolvedUnit::Pair { first, second }),
+        (Some(page), None) => Some(ResolvedUnit::Single {
+            page,
+            placement: SinglePlacement::Leading,
+            companion: ResolvedCompanion::Vacant,
+        }),
+        (None, Some(page)) => Some(ResolvedUnit::Single {
+            page,
+            placement: SinglePlacement::Trailing,
+            companion: ResolvedCompanion::Vacant,
+        }),
+        (None, None) => None,
+    }
+}
+
+/// Resolve only explicit topology. Dimensions, rotation, automatic rules, mode,
+/// shift and UI state are intentionally absent from this API.
+pub fn resolve_composition(
+    composition: &BookComposition,
+    domain: &PageDomain,
+    manifest: &[ManifestPage],
+) -> CompositionResult<ResolvedComposition> {
+    composition.validate(domain)?;
+    if manifest.len() > MAX_PAGES {
+        return Err(CompositionError::Limit("manifest pages"));
+    }
+    let hidden: HashSet<_> = composition
+        .hidden_pages
+        .iter()
+        .map(CompositionPageRef::matching_key)
+        .collect();
+    let mut facts = HashMap::with_capacity(manifest.len());
+    let mut indices = HashSet::new();
+    for entry in manifest {
+        domain.validate_page(&entry.page)?;
+        if facts.insert(entry.page.matching_key(), entry).is_some() {
+            return Err(CompositionError::Invalid("duplicate manifest identity"));
+        }
+        if let ManifestAvailability::Present { item_index } = entry.availability
+            && !indices.insert(item_index)
+        {
+            return Err(CompositionError::Invalid("duplicate manifest item index"));
+        }
+    }
+    let mut statuses = HashMap::new();
+    let registered: HashSet<_> = composition
+        .pages()
+        .map(CompositionPageRef::matching_key)
+        .collect();
+    let new_tail: Vec<_> = manifest
+        .iter()
+        .filter(|entry| !registered.contains(&entry.page.matching_key()))
+        .map(|entry| entry.page.clone())
+        .collect();
+    if registered.len() + new_tail.len() > MAX_PAGES {
+        return Err(CompositionError::Limit("resolved page count"));
+    }
+    for page in composition.pages().chain(new_tail.iter()) {
+        let key = page.matching_key();
+        let status = match facts.get(&key) {
+            None => PageStatus::Missing,
+            Some(_) if hidden.contains(&key) => PageStatus::HiddenByComposition,
+            Some(entry) => match entry.availability {
+                ManifestAvailability::Present { item_index } => PageStatus::Visible { item_index },
+                ManifestAvailability::ExcludedByPolicy => PageStatus::ExcludedByPolicy,
+                ManifestAvailability::FilteredOut => PageStatus::FilteredOut,
+            },
+        };
+        statuses.insert(key, status);
+    }
+    let resolve_page = |page: &CompositionPageRef| {
+        match statuses.get(&page.matching_key()) {
+            Some(PageStatus::Visible { item_index }) => {
+                // Preserve the manifest spelling for byte reads, not saved spelling.
+                let actual = facts[&page.matching_key()].page.clone();
+                Some(ResolvedPage {
+                    page: actual,
+                    item_index: *item_index,
+                })
+            }
+            _ => None,
+        }
+    };
+    let mut units = Vec::with_capacity(composition.units.len() + new_tail.len());
+    for unit in &composition.units {
+        let projected = match unit {
+            CompositionUnit::Pair { first, second } => {
+                project_pair(resolve_page(first), resolve_page(second))
+            }
+            CompositionUnit::Single {
+                page,
+                placement,
+                companion,
+            } => resolve_page(page).map(|page| {
+                let companion = match companion {
+                    SingleCompanion::Vacant => ResolvedCompanion::Vacant,
+                    SingleCompanion::Blank => ResolvedCompanion::Blank,
+                    SingleCompanion::FrontCoverSupplement { page } => resolve_page(page)
+                        .map(ResolvedCompanion::FrontCoverSupplement)
+                        .unwrap_or(ResolvedCompanion::Vacant),
+                };
+                ResolvedUnit::Single {
+                    page,
+                    placement: *placement,
+                    companion,
+                }
+            }),
+        };
+        if let Some(unit) = projected {
+            units.push(unit);
+        }
+    }
+    for page in &new_tail {
+        if let Some(page) = resolve_page(page) {
+            units.push(ResolvedUnit::Single {
+                page,
+                placement: SinglePlacement::Center,
+                companion: ResolvedCompanion::Vacant,
+            });
+        }
+    }
+    let visible_pages = units
+        .iter()
+        .flat_map(ResolvedUnit::navigation_pages)
+        .cloned()
+        .collect();
+    let complete = !statuses
+        .values()
+        .any(|status| *status == PageStatus::FilteredOut);
+    Ok(ResolvedComposition {
+        revision: composition.revision,
+        direction: composition.direction,
+        units,
+        visible_pages,
+        new_tail,
+        complete,
+        statuses,
+    })
+}
