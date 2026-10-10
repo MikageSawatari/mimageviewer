@@ -1279,10 +1279,8 @@ fn sorted_subdirs_for_nav_observed(
     (!cancelled(cancel)).then_some(sorted)
 }
 
-/// Windows のファイルシステムは大文字小文字を区別しないため小文字化して比較。
-pub fn path_eq(a: &Path, b: &Path) -> bool {
-    a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
-}
+// Physical path identity keeps the drive and ignores case/separator spelling.
+pub use crate::path_key::eq_keep_drive as path_eq;
 
 /// `resolve_openable_path_detailed` が返した「開けるパス」の実体種別。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1322,6 +1320,8 @@ pub fn resolve_openable_path(path: &Path) -> Option<std::path::PathBuf> {
 /// `resolve_openable_path` の詳細版。返却 path の種別と、元リクエストが
 /// ファイルだったかを同じ filesystem stat の流れで返す。
 pub fn resolve_openable_path_detailed(path: &Path) -> Option<OpenablePathResolution> {
+    let accepted_path = crate::path_key::normalize_input_path(path);
+    let path = accepted_path.as_path();
     // そのまま開けるか
     if path.is_dir() {
         return Some(OpenablePathResolution {
@@ -1360,6 +1360,125 @@ pub fn resolve_openable_path_detailed(path: &Path) -> Option<OpenablePathResolut
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_eq_ignores_separator_spelling_but_keeps_path_identity() {
+        assert!(path_eq(
+            Path::new(r"g:/Home/comfyui\genshin_random"),
+            Path::new(r"G:\home\comfyui\genshin_random")
+        ));
+        assert!(path_eq(
+            Path::new("//Server/Share/book.zip"),
+            Path::new(r"\\server\share\book.zip")
+        ));
+        for other in [
+            r"H:\home\comfyui\genshin_random",
+            r"G:\home\comfyui\genshin_random_extra",
+            r"G:\home\comfyui\..\genshin_random",
+        ] {
+            assert!(!path_eq(
+                Path::new("g:/home/comfyui/genshin_random"),
+                Path::new(other)
+            ));
+        }
+        assert!(!path_eq(Path::new(r"\\?\G:\home"), Path::new(r"G:\home")));
+    }
+
+    // Deliberately bypass input normalization: navigation must also handle old
+    // saved paths and read_dir's different separator spelling at every ancestor.
+    #[cfg(windows)]
+    fn mixed_input_spelling(path: &Path) -> PathBuf {
+        let raw = path.to_str().unwrap();
+        assert!(raw.as_bytes()[0].is_ascii_alphabetic() && raw.as_bytes()[1] == b':');
+        let (parent, name) = raw.rsplit_once('\\').unwrap();
+        PathBuf::from(format!(
+            "{}\\{name}",
+            parent.replace('\\', "/").to_lowercase()
+        ))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mixed_path_dfs_reaches_ancestor_sibling_and_returns_backwards() {
+        let (_temp, nodes) = build_seven_node_tree();
+        let [root, a, _a1, a2, b, _c, _c1] = &nodes;
+        let next =
+            next_folder_dfs(&mixed_input_spelling(a2), FolderTreeOptions::default()).unwrap();
+        assert!(path_eq(&next, b));
+        let previous =
+            prev_folder_dfs(&mixed_input_spelling(b), FolderTreeOptions::default()).unwrap();
+        assert!(path_eq(&previous, a2));
+        // Backward preorder first visits the parent, then its previous sibling.
+        assert!(path_eq(
+            &prev_folder_dfs(&mixed_input_spelling(a), FolderTreeOptions::default()).unwrap(),
+            root
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mixed_path_sibling_navigation_stays_at_same_level() {
+        let (_temp, nodes) = build_seven_node_tree();
+        let [_root, a, _a1, a2, b, c, _c1] = &nodes;
+        assert!(path_eq(
+            &next_sibling_folder(&mixed_input_spelling(a), FolderTreeOptions::default()).unwrap(),
+            b
+        ));
+        assert!(path_eq(
+            &prev_sibling_folder(&mixed_input_spelling(c), FolderTreeOptions::default()).unwrap(),
+            b
+        ));
+        assert!(path_eq(
+            &prev_sibling_folder(&mixed_input_spelling(b), FolderTreeOptions::default()).unwrap(),
+            a
+        ));
+        assert!(
+            next_sibling_folder(&mixed_input_spelling(a2), FolderTreeOptions::default()).is_none()
+        );
+        assert!(
+            prev_sibling_folder(&mixed_input_spelling(a), FolderTreeOptions::default()).is_none()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mixed_path_navigation_keeps_zip_pdf_in_the_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let leaf = root.join("a").join("last");
+        let zip = root.join("b.zip");
+        let pdf = root.join("c.pdf");
+        let folder = root.join("d");
+        std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::create_dir(&folder).unwrap();
+        // Navigation lists container files, without decoding their contents.
+        std::fs::write(&zip, b"").unwrap();
+        std::fs::write(&pdf, b"").unwrap();
+        let opts = FolderTreeOptions::default();
+        for (from, to) in [(&leaf, &zip), (&zip, &pdf), (&pdf, &folder)] {
+            assert!(path_eq(
+                &next_folder_dfs(&mixed_input_spelling(from), opts.clone()).unwrap(),
+                to
+            ));
+            assert!(path_eq(
+                &prev_folder_dfs(&mixed_input_spelling(to), opts.clone()).unwrap(),
+                from
+            ));
+        }
+        assert!(path_eq(
+            &next_sibling_folder(&mixed_input_spelling(&zip), opts.clone()).unwrap(),
+            &pdf
+        ));
+        assert!(path_eq(
+            &prev_sibling_folder(&mixed_input_spelling(&pdf), opts).unwrap(),
+            &zip
+        ));
+        let resolved = resolve_openable_path(&mixed_input_spelling(&leaf)).unwrap();
+        assert_eq!(
+            resolved.as_os_str(),
+            crate::path_key::normalize_input_path(&mixed_input_spelling(&leaf)).as_os_str()
+        );
+    }
 
     fn labels(paths: Vec<PathBuf>) -> Vec<String> {
         paths
@@ -2488,8 +2607,6 @@ mod tests {
     /// ```
     /// root/{a/{a1,a2}, b, c/{c1}}
     /// ```
-    /// 段階 join (`.join("a").join("a1")`) で `\` セパレータに揃える
-    /// (`path_eq` はセパレータ正規化をしないため `.join("a/a1")` だと一致しない)。
     fn build_seven_node_tree() -> (tempfile::TempDir, [PathBuf; 7]) {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path().join("root");

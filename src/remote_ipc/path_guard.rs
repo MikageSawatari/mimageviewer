@@ -52,6 +52,8 @@ impl ResolvedPath {
             std::fs::canonicalize(backing_path).map_err(|_| ResolveError::Unavailable)?;
         Ok(Self {
             canonical,
+            // Archive jobs key their active target by the exact public address.
+            // Keep it intact; the physical source/backing is canonicalized above.
             logical: PathBuf::from(public_path),
             archive_backing: Some(ResolvedArchiveBacking {
                 logical: logical_path_from_canonical(&backing_canonical),
@@ -135,13 +137,14 @@ fn caller_is_drive_absolute(path: &Path) -> bool {
 
 fn logical_path_from_canonical(canonical: &Path) -> PathBuf {
     let value = canonical.to_string_lossy();
-    if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+    let logical = if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
         PathBuf::from(format!(r"\\{rest}"))
     } else if let Some(rest) = value.strip_prefix(r"\\?\") {
         PathBuf::from(rest)
     } else {
         canonical.to_path_buf()
-    }
+    };
+    crate::path_key::normalize_input_path(&logical)
 }
 
 /// 画素生成経路が使った canonical path と subresource から公開用 identity を再構成する。
@@ -158,6 +161,28 @@ pub(super) fn page_identity_from_resolved(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn mixed_remote_paths_use_standard_logical_spelling() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("book.7z");
+        let backing = temp.path().join("cache.zip");
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::write(&backing, b"backing").unwrap();
+        let mixed = source.to_str().unwrap().replace('\\', "/").to_lowercase();
+        let resolved = ResolvedPath::with_archive_backing(&source, &mixed, &backing).unwrap();
+        assert_eq!(resolved.logical.as_os_str(), std::ffi::OsStr::new(&mixed));
+        assert_eq!(resolved.readable_logical().as_os_str(), backing.as_os_str());
+        assert_eq!(
+            crate::path_key::normalize(Path::new(&mixed)),
+            crate::path_key::normalize(&resolved.logical)
+        );
+        let ordinary = resolve_existing(&mixed).unwrap();
+        assert!(crate::path_key::eq_keep_drive(&ordinary.logical, &source));
+        assert!(!ordinary.logical.to_str().unwrap().contains('/'));
+        assert!(ordinary.logical.to_str().unwrap().as_bytes()[0].is_ascii_uppercase());
+    }
 
     #[test]
     fn resolves_any_existing_absolute_path_and_canonicalizes_it() {

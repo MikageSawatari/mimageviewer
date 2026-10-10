@@ -4,6 +4,153 @@ use super::*;
 
 #[path = "tests/thumbnail_request_lifecycle.rs"]
 mod thumbnail_request_lifecycle;
+
+#[cfg(windows)]
+#[test]
+fn mixed_path_favorite_direct_navigation_standardizes_input_without_rewriting_saved_record() {
+    for folder_name in [
+        "mixed-input",
+        "mixed-input.zip",
+        "mixed-input.pdf",
+        "mixed-input.epub",
+        "mixed-input.7z",
+    ] {
+        for source in ["menu-toolbar", "gamepad-ring"] {
+            assert_mixed_path_favorite_direct_navigation(folder_name, source, |app, ctx| {
+                if source == "menu-toolbar" {
+                    // render_menubar / render_toolbar return this saved copy. App::update
+                    // sends it directly to open_direct_navigation_target, bypassing _owned.
+                    (
+                        app.settings.favorites[0].path.clone(),
+                        StartupListIntent::ExplicitList,
+                    )
+                } else {
+                    let nav = app
+                        .apply_ring_action(
+                            ctx,
+                            crate::ring_shortcut::RingShortcutContext::Grid,
+                            crate::ring_shortcut::RingActionId::favorite_slot_action(1).unwrap(),
+                            "mixed_favorite_regression",
+                        )
+                        .unwrap();
+                    let crate::ui_main::AddressBarNav::Direct(path, intent) = nav else {
+                        panic!("favorite input must produce a direct navigation");
+                    };
+                    (path, intent)
+                }
+            });
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(super) fn assert_mixed_path_favorite_direct_navigation(
+    folder_name: &str,
+    source: &str,
+    favorite_input: impl FnOnce(&mut App, &egui::Context) -> (PathBuf, StartupListIntent),
+) {
+    let mut app = phase_c_support::setup_app();
+    app.active_quick_folder_slot = None;
+    let folder = app.tmp.path().join(folder_name);
+    std::fs::create_dir(&folder).unwrap();
+    let origin = app.tmp.path().to_path_buf();
+    app.load_folder(origin);
+    app.finish_page_identity_preparation_for_test();
+    let spelling = folder.to_str().unwrap().replace('\\', "/").to_lowercase();
+    let spelling = spelling.replacen(&format!("/{folder_name}"), &format!("\\{folder_name}"), 1);
+    let stored = PathBuf::from(&spelling);
+    app.settings
+        .favorites
+        .push(crate::settings::FavoriteEntry::new(
+            "legacy spelling".to_owned(),
+            stored.clone(),
+        ));
+    let expected = crate::path_key::normalize_input_path(&stored);
+    let ctx = egui::Context::default();
+    let (path, restore_intent) = favorite_input(&mut app, &ctx);
+    assert_eq!(path.as_os_str(), stored.as_os_str());
+    let requires_classification = matches!(folder_name, "mixed-input.epub" | "mixed-input.7z");
+    assert_eq!(
+        App::path_needs_open_classification(&path),
+        requires_classification,
+        "{source}: {folder_name}"
+    );
+    // The same acceptance call as App::update's menu/toolbar/input_nav merge.
+    app.open_direct_navigation_target(
+        path,
+        None,
+        OpenRequestOwner::Navigation,
+        None,
+        None,
+        restore_intent,
+    );
+    let classification = app.top_level_grid_view.open_path_classification();
+    assert_eq!(
+        classification.is_some(),
+        requires_classification,
+        "{source}: {folder_name}"
+    );
+    if let Some(classification) = classification {
+        assert_eq!(classification.path.as_os_str(), expected.as_os_str());
+        assert!(matches!(
+            classification.continuation.as_deref(),
+            Some(ClassifiedOpenContinuation::DirectNavigation { .. })
+        ));
+    }
+    app.settle_open_path_classification_for_test();
+    app.finish_page_identity_preparation_for_test();
+    assert_eq!(
+        app.current_folder.as_ref().unwrap().as_os_str(),
+        expected.as_os_str(),
+        "{source}: {folder_name}"
+    );
+    assert_eq!(
+        app.address,
+        expected.to_string_lossy(),
+        "{source}: {folder_name}"
+    );
+    assert_eq!(
+        app.settings.favorites[0].path.as_os_str(),
+        stored.as_os_str()
+    );
+    app.set_startup_open_path(stored);
+    assert_eq!(
+        app.startup_open_path.as_ref().unwrap().as_os_str(),
+        expected.as_os_str()
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn mixed_path_history_replay_accepts_old_spelling_and_restores_the_same_folder() {
+    let mut app = phase_c_support::setup_app();
+    app.active_quick_folder_slot = None;
+    let origin = app.tmp.path().join("origin");
+    let destination = app.tmp.path().join("destination");
+    std::fs::create_dir(&origin).unwrap();
+    std::fs::create_dir(&destination).unwrap();
+    app.load_folder(origin.clone());
+    app.finish_page_identity_preparation_for_test();
+    assert!(
+        app.apply_fullscreen_close_nav_immediate(crate::ui_main::AddressBarNav::Direct(
+            destination,
+            StartupListIntent::ExplicitList,
+        ))
+    );
+    app.finish_page_identity_preparation_for_test();
+    let old = PathBuf::from(origin.to_str().unwrap().replace('\\', "/").to_lowercase());
+    let mut snapshot = app.folder_nav_history_snapshot();
+    snapshot.back_stack.last_mut().unwrap().location = FolderNavHistoryTarget::Path(old.clone());
+    app.restore_folder_nav_history(snapshot);
+    app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
+    app.finish_history_restore_preparation_for_test();
+    assert_eq!(
+        app.current_folder.as_ref().unwrap().as_os_str(),
+        crate::path_key::normalize_input_path(&old).as_os_str()
+    );
+    assert!(app.folder_nav_history_snapshot().back_stack.is_empty());
+}
+
 impl App {
     pub(crate) fn folder_order_refresh_pending_for_test(&self) -> bool {
         self.folder_pane_open_pending
