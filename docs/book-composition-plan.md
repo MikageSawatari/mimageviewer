@@ -1,7 +1,7 @@
 # §1.242 本の構成 — 設計案
 
-更新: 2026-10-10。ライン G / `next-book`、調査基準 `46318769107b5f86e1cd63a4fc85c33e7d061fa4`。
-状態: 実装担当による設計・前提検証。設計担当の採択、利用者回答、独立設計レビューは未実施。
+更新: 2026-10-10、R2。ライン G / `next-book`、調査基準 `729ae3cf3` (設計以外のソースは `463187691` と同じ)。
+状態: 初回独立設計レビュー REVISE (P1×2 / P2×5) を受けた改訂案。利用者回答、設計採択、独立再レビューは未実施。
 本書の型名・新規ファイル名は提案であり、現行実装を表さない。実行時の観測はなく、以下の現状はソース調査による。
 
 ## 1. 要件と範囲
@@ -26,6 +26,8 @@
 EPUB→PDF は現行共通経路を壊さないが、EPUBへの構成作成を今回の対応対象に追加するかは未決定 (§14)。
 写真の通常フォルダ、スタック、検索/コレクションの結果順を本順に変更する機能ではない。
 ただし、それらから本のページを開く入口でも非表示の判定を迂回させない。
+集約/混在の具体的表示、Remote取得時のdraft、方向/表紙小編集、画像folderの外部移動は
+今回のレビューで明確化した**採択待ちの推奨案**。§14の回答を既存の利用者決定と混同しない。
 
 参照した原則: `CLAUDE.md` のバグ修正・状態削減・まれな失敗・退行相談・永続データ・IME・UI文字列、
 [detached 憲法 §2](detached-rework-plan.md#2-憲法-全ステージ共通の不変条件禁止事項-最重要)、
@@ -75,8 +77,26 @@ EPUB→PDF は現行共通経路を壊さないが、EPUBへの構成作成を�
    しおりのouter+entryから、実際にページを所有する実効階層を解決してから構成を引く。
 3. 深いZIP階層のresumeは現在記録しない (`src/app.rs:56649`)。
    本機能に便乗してcross-book resumeを導入しない。階層内の保存時reanchorはidentityで行う。
-4. Remoteはローカル閲覧と排他 (`docs/web-remote-plan.md` §2.2)。構成編集とRemoteの同時変更を
-   常態として設計する必要はない。取得途中のeditor終了は別途admissionで止める (§10)。
+4. Remoteはローカル閲覧と排他 (`docs/web-remote-plan.md:51`, `:57`, `:83`)。
+   **取得をeditorのUIモーダルで止められるという初稿の前提を撤回**する。
+   別スレッドの `SessionStateMachine::acquire` (`src/remote_ipc/session.rs:309`) が先にBeginAcquireを確定し、
+   UIは後で全窓を閉じる (`src/remote_ipc/ui.rs:1081`)。この既存契約へeditorも含める (§8.1 / §10.2)。
+5. 初回列生成以外にもitemsが変わる。実削除完了 (`src/app.rs:46052`) は
+   `remove_items_batch` (`:42877`, `:42925`) で直接remove・世代更新し、自動reloadを抑止する (`:46055`)。
+   identity表の既存remapだけでは新設explicit unitは直らない。投影ownerの行変更契約も必要 (§3.2)。
+6. 集約からの直接閲覧はreleased経路 (`src/app/snapshot_ops.rs:1736`)。
+   reader orderはsnapshot/collection/detailsを尊重する (`src/app.rs:68508`)。
+   navは動画も含む (`src/ui_fullscreen.rs:13460`)。本を開き直すことを強制しない (§3.1)。
+7. 退避列の復帰は直接代入 (`src/app/snapshot_ops.rs:1281`, `:1405`、
+   `src/app/viewer_context_registry.rs:3403`)。現在のcurrent_folderだけの変更通知では不十分 (§10.1)。
+8. メタ情報転送のcontainer familyはorigin一つ (`src/metadata_transfer.rs:2436`) で、
+   source/cache混在はエラー (`:2163`)。importは共通target key (`:4396`, `:4695`)。
+   構成をそのfamilyへ追加せず、専用の論理scope転送契約へ分離する (§7.3)。
+9. 内容IDはFolderを持たず (`src/content_identity.rs:62`)、Folder itemは対象外 (`:169`)。
+   画像本フォルダの外部移動を既存内容IDが復元するという初稿の前提を撤回する (§4.1)。
+   保存成功時のEdit観測も必要 (`src/app.rs:25803`、§7.2)。
+10. Remoteの方向/表紙操作は既存 `SetSpread` (`src/remote_ipc/ui.rs:2322`, `:2552`)。
+    shift禁止だけからこの入口の廃止を推論しない。構成recordへの可視効果のある操作を提案する (§9.1)。
 
 ## 3. 所有境界と処理順 — items生成時の一回の投影
 
@@ -126,16 +146,84 @@ facet/検索欄でさらに減った列やRemoteの件数/bytes制限による�
 | 通常ZIP・直接RAR・変換ZIP初回/再読込 | `finalize_zip_enumerate` / `materialize_zip_grid` の直後ではなく、その列生成内部を共通ownerへ |
 | ZIP enter/back、Ctrl+↑↓、DFS/slideshow | `zip_nav_show_current_level`へ集約。DFSの着地候補も構成後の可視ページで判断し、全非表示階層は読書着地を作らず次へ進む |
 | 評価ZipDir、startup履歴prefix、Smart/Collection child | prefixを解決した後、同ownerからitemsを受け取る。後からraw列を代入しない |
-| 画像本フォルダ | production folder listingから本projectionへ。auto本扱いOFFでも既存構成がある対象は構成順/非表示を保つ案 (§14) |
+| 画像本フォルダ | production folder listingから本projectionへ。本として適格かを同じownerで確定。本扱いOFF/混在はResultとして自動表示する推奨案 (§3.1 / §14) |
 | PDFと共通Document経路 | page manifest/adoptionから同ownerへ。password/lease/cached adoptionの既存契約を保持 |
 | しおり | entry検索はscopeとidentityのみ返す。item_index hintの生成をやめ、構成後のtarget resolverで解決 |
-| Snapshot leaf / required open / delayed completion | 同じtarget resolver。保存したraw列や直接leaf一致だけで構成を迂回しない |
+| Snapshot leaf / required open / delayed completion | 共通visibility target resolverを必ず通す。一致による直接openは維持し、Resultの順/自動組で開く。本列を新規生成する経路だけmaterialize_bookを通す |
 | Remote ZIP列挙とpage context、PDF、folder listing | 同pure ownerをcore workerから使用。Web側に並べ替え・pairingの第二実装を置かない |
-| 戻り用保存一覧 / F12 fork / parked context | 完成PreparedBookのimmutable projectionをbundleと共に保持。適用し直して二重並べ替えしない |
+| 戻り用保存一覧 / F12 fork / parked context | immutable projectionと再生成recipe・scope/revision依存を保持。復帰adoption前に鮮度を照合 (§10.1) |
 | 検索・★・snapshot等の集約leaf open | 結果一覧の検索順は維持。open前にそのページのscopeの構成visibilityを解決する |
 
 親containerの代表サムネ・pin、類似索引の元内容、メタ情報エクスポートは「本の可視ページ一覧」と別。
 構成で非表示にしても既存pinや画像編集記録を破棄しない。代表画像まで変える要求は本項にないため維持する。
+
+### 3.1 本自身の列と結果列を混ぜない (採択待ち)
+
+列の意味は生成ownerで `ProjectionRecipe::Book(scope, manifest)` または
+`ProjectionRecipe::Result(surface, membership, order_policy)` に確定する。
+各leafにComposed/Automaticを交互に適用する混合layoutは作らない。
+Book資格は既存本分類を入口とし、さらに「一つのscopeの直下実ページblock + 既存子container block、
+閲覧対象の動画/音声なし、結果surfaceではない」をownerで確定する。
+PDFは番号manifest、画像folderは本扱いの実効判定、書庫は実効階層を用いる。
+別scopeのleaf/動画/音声を持つ混在列はResult。子container行だけなら本のページblockと分離できるのでBookを維持する。
+本扱いOFFは実効本分類がOFFになる場合の意味で、明示的な本置き場指定まで自動設定のOFFで解除する意味ではない。
+
+| surface | 利用者に見える順・組・ページ送り |
+| --- | --- |
+| 本自身のZIP実効階層/PDF/適格画像本 | 可視実ページを構成順、explicit unitで表示。子container blockは従来どおり。詳細表示も構成順固定 |
+| 上記の一時facet/一覧内絞り込み | 同じBook投影。既存unitの片側だけ残れば元slotのSingle。絞り込みを解除すると元unitへ戻る |
+| ★固定/検索/評価/コレクション/サブ展開/スタック等の結果列 | membershipと既存結果順を保ち、従来の自動組で直接閲覧。別本の明示Pairの相方を探したり離れた位置から呼び寄せたりしない |
+| 結果列の詳細sort | 従来の詳細sort順で自動組・送り。画像/動画/音声の従来の閲覧適格性を維持する |
+| 本扱いをOFFにした画像フォルダ/本として不適格になった混在フォルダ | Result扱い、従来sort・自動組・動画の送りを維持。保存構成は残り、本として再度適格なら再適用 |
+
+Resultでも**構成の非表示判定は有効**。結果のmembershipは消さず、該当行に
+「本の構成で非表示」と表示し、サムネイルの画像内容は表示しない。クリック/しおり/直接targetは
+トーストで拒否し、送り/slideshow/自動pairingのnav eligible列からも除外する。
+構成以外の実ページ/動画を落とさない。hidden判定は列生成workerのscope/revision snapshotから供給し、
+UI描画中のDB lookupや現在mountのBookScopeから推測しない。これは本自身の「非表示ページは一覧に出ない」
+と、検索等に記録が残っても開けないという要件を分けた案で、結果行の表示方法もG0で確認する。
+
+構成のdirection/cover/明示pairはBookでのみ適用する。Resultには既存surfaceの自動設定が適用される。
+「結果の順で表示しています。本の構成で読むには本を開いてください」を説明し、任意の「本を開く」入口を置く。
+結果をクリックすると必ず本へ入り直す案は、現行直接閲覧と送り順を変えるため採用しない。
+その案へ変える場合は利用者承認が必要。Book適格性変更も未採択の推奨契約であり §14-12/13に分けて相談する。
+
+sort lockは `recipe == Book && accepted composition exists` を既存
+`page_order_locked_for_current_view` / `details_header_sort_active` の所有判定へ含める。
+現行 `physical_page_order_locked` (`src/app.rs:12497`) やsynthetic判定 (`:46582`) だけに依存しない。
+Bookには詳細sortを作用させず、Resultは構成の存在だけでsort lockしない。
+分類・layout・sort lock・nav eligibility・shift eligibilityは一つのaccepted projectionから派生させる。
+
+shiftはResult全体の組を動かすため、**nav eligible列に構成本のページが一枚でもあるResultは全列のshiftを禁止**する推奨案。
+一枚でも含むかをprojection依存から得て、現在anchorだけで切り替えない。
+構成本のページがないResultは従来の一時shiftを維持し、本別記憶を結果全体へ流用しない。
+構成なし本のページも一緒にずらせなくなる不便があるため、§14-14で明示相談する。
+承認なしに構成ありleafだけshiftを除外してunitを交互に再構築する機械を追加しない。
+
+### 3.2 items行変更も投影ownerの更新である
+
+PreparedBookの整数slotは `items_generation` と同時に採用される派生値であり、永続identityを代替しない。
+初回installだけでなく、全行変更を同じ `update_projection` 境界に含める。
+
+- **実削除**: `remove_items_batch` の既存old→new remap
+  (`src/app.rs:42896`のshift、`:42905`のidentity表更新) をitems/metasと同じUI transactionで
+  unit全occurrence・補助・anchor/selectionへ適用する。削除slotはNone、後方slotは同じ差分だけ移す。
+  `[A,B],[C,D]`からBを削除した結果は `Single(A,元slot), Pair(C,D)`。AとCを組にしない。
+  元manifest/identity解決表ではBをMissingへ更新し、構成DBのB参照は保持する。
+  世代だけ進めて旧resolved_unitsを残すことは禁止。F5/workerを待たずunit/resume/exportは新投影を使う。
+- **改名**: 成功経路 `src/ui_dialogs/rename_item.rs:172` は旧surfaceを解放し、migrationを起動し、
+  親一致ならreloadを予約する (`:189`, `:202`)。専用PageRef移行をこの旧→新identity事象に含める。
+  identity変更を反映できる列はpure remapを同時採用、再列挙が必要な列は既存reload完了まで旧投影を
+  holdover専用とし、旧identityでのresume/export/編集を確定させない。単なるpage-edit rehydrate
+  (`src/app.rs:45625`, `:45708`) だけでは構成identity/units更新の代わりにならない。
+- **追加/外部変更/F5/policy・分類変更**: 新manifestとrecipeから共通ownerが再解決し、一括install。
+  数値idxをidentityへ逆推測しない。Missingが同名identityで復帰したら指定unitへ戻る。
+- **subset/詳細sort/復帰**: Bookは元投影のidentityに対するview投影、Resultは従来結果orderの投影。
+  退避列を直接代入する経路も §10.1のadoption契約を通す。保存中にdraftの順をitemsへ差し込まない。
+
+共通更新結果はitems/metas・identity/status表・layout・complete proof・依存revision・世代を一組として持つ。
+公開consumerはその組のaccepted世代だけを見る。delete/rename/importは関連scopeの退避依存にも通知するが、
+読み取りだけのfork/mount/closeは通知しない。resumeの互換rawは更新済元列、位置の正本はPageIdentity。
 
 ## 4. データモデル — 実ページと見せ方を分ける
 
@@ -149,7 +237,13 @@ root構成を子階層へ適用すると、本の別ページをhidden/missing�
 永続キーは既存 `spread_db::container_key` と同じroot+実効prefix合成を
 `path_key::normalize_keep_drive` で正規化する案。`StoreKeyNormalization::KeepDrive`を登録する。
 DriveStrippedなspread/resumeと異なり、利用者が作った構成を別ドライブの同名本へ誤適用しないことを優先。
-ドライブレター変更は既存content-identity restoreで対応する。root aliasは独自に増やさず、
+PDF/書庫ファイルのドライブレター変更・外部移動は既存content-identity restoreへ参加する。
+**画像本フォルダはその対象外**。Folder内容hash/ledgerを新設せず、アプリ内改名/移動は既存key migration、
+外部移動・ドライブ変更後は構成を自動適用せず、旧構成を残して明示メタ情報bundleのexport/importで引き継ぐ推奨案 (§14-10)。
+移動予定なら移動前にbundleを書き出す。既に移動した場合は旧場所へ戻して書き出す方法を案内し、
+名前が似たフォルダや一枚の画像の内容IDから親構成を推測コピーしない。
+別案の「旧場所の構成を選んで引き継ぐ」UI/フォルダ内容IDは今回範囲を増やすので採択前に作らない。
+root aliasは独自に増やさず、
 初回/再入場/しおり/Remote/export全てがcollapse済prefixを得る共通resolverを使う。
 policy変更でcollapse結果が変わる場合、保存scopeはraw treeの実効階層を基準に同定し、
 投影treeの新collapse先へ別構成を誤継承しない (受入テスト必須)。
@@ -193,14 +287,18 @@ BookComposition {
 `BlankId`は構成内の編集用IDのみで、source addressやPageIdentityではない。
 
 Pair/Singleを正本とし、「フラットpage/blank列 + pair上書き + singleton上書き」の三つを別々に保存しない。
-flat列はunitを展開して得る派生値。実ページの通常occurrenceは構成全体でちょうど一つ、
-hiddenとの重複なし。白紙と実ページを組んだunitはSingle、二実ページだけPair。
+flat列はunitを展開して得る派生値。実ページの通常occurrenceは構成全体でちょうど一つ。
+hidden_pagesはその登録済PageRefのvisibility指定で、**unitsから参照を取り除かない**。
+非表示/表示に戻すだけでは元Pair/slotを保持し、resolverがその側を欠落投影する。
+これで非表示解除用の旧位置/旧Pair退避stateを別に増やさない。白紙と実ページを組んだunitはSingle、二実ページだけPair。
 余分なblank単体/連続blankは `BlankBoundary` として編集では保持し、閲覧unitへは投影しない。
 これにより「任意位置」の白紙を保存でき、白紙だけのページ送りや白紙だけのSingleを作らない。
 末尾補助の表紙だけは `FrontCoverSupplement` の再利用を許す。普通のページ複製機能は範囲外。
 
-保存検証では、種類一致、安全なrelative/entry、scope内member、重複、hiddenとの排他、
+保存検証では、種類一致、安全なrelative/entry、scope内member、通常occurrence重複なし、hiddenが登録済refの部分集合、
 companion/placement整合、補助が指定coverを参照すること、ID一意、件数/文字列/JSON bytes上限を確認する。
+cover指定があればその通常occurrenceはSingleとし、表紙を含むPair作成は先に表紙指定を外す同じdraft操作で行う。
+coverなしの補助、cover自身への補助表示は拒否する。これで表紙設定とunitの可視効果を食い違わせない。
 実体欠落は構文エラーではなくMissingとして保持する。利用者が作った構成を欠落だけで捨てない。
 
 ### 4.3 編集操作と初期化
@@ -222,7 +320,9 @@ draftでの戻す/やり直しは在メモリの編集だけで、永続rollback
 
 §1.239/§1.240/末尾補助のフラグは作成時に実際のunitへ変換され、その後の自動規則ではない。
 補助表紙は特定unitに付くpresentation roleとして保存する。新ページ追加後もそのunitに残る案とし、
-自動で新しい末尾へ移すかは§14で利用者判断を求める。操作後の「末尾表紙」の名称/UIにも合わせる。
+自動で新しい末尾へ移すかは§14で利用者判断を求める。
+構成内の名称は「表紙の補助表示」、説明は「この単ページの相方に表紙を表示します」とする。
+自動設定の「末尾表紙」から取り込まれたものでも、途中のunitへ残ったら末尾と呼ばない。
 
 ## 5. Spread / Single / Splitとキャッシュ
 
@@ -255,13 +355,21 @@ Remote `portraitSinglePage/force_single_page`も同じsingle投影。端末の�
 連結読みは同じexplicit spread unitsを使い、anchor・seekとgeometryの対応を保持する。
 現在のpage_edit pivotがSingleへ移っても構成recordは変更しない。
 
-一時facet/検索欄の結果内では順を構成順に保ち、既存ペアの片側欠落を上記投影で扱う。
-集約検索の別本同士を構成Pairにしない。構成を持つ各leafのvisibilityはopen admissionで評価する。
+Book内の一時facet/検索欄は構成順で片側欠落を上記投影にする。
+Resultは §3.1のAutomatic一つで、明示Pairを持ち込まない。動画の非pairable境界とnavigationを維持する。
+LayoutSourceは一列に一つ、hidden/shiftのscope依存はrecipeから得る。複数本のComposedを継ぎ接ぎしない。
 
 ### 5.2 キャッシュのキーと失効
 
 PreparedBookは `(scope, source_manifest_revision, policy, composition_revision)` を持つimmutable snapshot。
+ここでcomposition_revisionはDB rowの数値だけでなく、serviceがscopeの採用値 (構成なしを含む) に付ける
+`(service_epoch, publication_sequence)` を含むtoken。変更したscopeだけ新tokenを発行する。
+解除→再作成で同じrow revisionへ戻っても一致しない。service再初期化ではepochを替え、
+退避値を旧tokenで復帰させない。新たな永続tombstone/dirty storeは作らない。
 構成変更は既存installで必ずitems generationを進め、index/memoを同時に作り直す。
+行削除等のin-place更新でも §3.2のremap後に同じ世代を採用する。
+Resultはmembership/order revisionと依存scope→構成revision (構成なしも含む) を保持し、
+layout自体がAutomaticでもhidden eligibility/shift資格の変更でnav/unit tokenを失効させる。
 `ViewerNavigationCaches` の世代/flowにはこのinstallが含まれるので、新たな「構成dirty」boolは不要。
 unit tokenはLayoutSourceのtagとcomposition revisionを明示追加する。Composed branchにshiftは入らない。
 nav列、items世代、Single/Spread/Splitの閲覧投影、direction、filtered projection identityを含める。
@@ -320,8 +428,15 @@ Missing/種類除外は既存文言を維持し、「構成で非表示」と誤
 先頭や隣ページへsilent fallbackしない。containerを一覧として開く要求自体は許可し、
 非表示resumeのauto-fullscreenだけ拒否する。全非表示本は空一覧と「本の構成を編集」の導線を示す。
 
-保存した現在ページをdraftで非表示にした場合だけは、利用者の明示編集の結果なので、
-保存後は次の可視実ページ→前→空一覧へ移る案。保存直前にプレビューで移動先を示す (§14)。
+保存により現在anchorがHiddenになる**全更新対象context** (editor元窓、同一本の兄弟、
+Result直接閲覧、退避contextの後の復帰を含む) は、同じ着地規則を使う案 (§14-5)。
+各contextが変更直前に採用していた読書flat列を基準に、旧anchorより後の最初の新可視identity、
+なければ前方を逆順に探した最初の新可視identityへ移る。同時に並べ替えても基準は変更前の順。
+旧列の候補が全て消えたが新tail等があるなら新列先頭、可視navが全くなければfullscreenを閉じて空一覧。
+Bookは本の旧構成順、Resultは旧結果/詳細sort順、動画anchorはhidden変更の対象外。
+新可視candidateはMissing/種類除外/現在facetも除く。resumeは着地した実identityだけを記録し、historyを新たに読んだ扱いにしない。
+保存直前に元窓の移動先と「同じ本を開いている他の窓も移動することがあります」をプレビューする。
+ユーザー操作による保存/解除/importの更新と、非表示targetを新規に開く要求の拒否を混同しない。
 
 ## 7. 新しい本別ストアと既存ライフサイクル
 
@@ -340,13 +455,17 @@ rename/purge/import/content restoreも同じmaintenance直列化境界を使い�
 既存共通maintenanceがDBを直接更新する期間はserviceをquiesceし、完了後snapshotを更新する。
 UIスレッドでjoin/lock待ちをせず、既存maintenance workerの完了を受ける。
 
-保存失敗はtransactionで旧recordが残る。draftを表示したまま「本の構成を保存できませんでした」を通知し、
+保存失敗はtransactionで旧recordが残る。editorが存続していればdraftを表示したまま「本の構成を保存できませんでした」を通知し、
 利用者の再操作かキャンセルへ戻す。自動retry、途中unit保存、独自quarantine/複数段回復を追加しない。
+owner終了/Remote取得で既にeditorを閉じた場合は通知だけで、draftを復活させない (§10.2)。
 破損/未知schemaならDBを作り直さず、通知・書込停止・構成本の閲覧拒否とする案 (§14)。
 構成は利用者作成データなので、再生成可能なサムネcacheと同じ扱いにはできない。
 稀なcommit後reload失敗は保存済recordを保持、通知して既存再読込または再起動を案内する。
 表示を新構成で完成したと偽らず、失効した旧indexで編集/移動を続けない。
 これ以上の回復が必要というレビュー指摘は、先に利用者へ割り切り案と費用を相談する。
+明示「今回は構成を使わず開く」の回避案は §14-7の承認待ち。
+選択したopen要求のcontext/scopeに限るAutomatic投影で、DB row/他contextのaccepted構成を変更しない。
+shiftは許可せず、構成編集/小編集も書込停止中は受けない。次のopenへ選択を記憶せず、独自の復旧状態を永続化しない。
 
 ### 7.2 登録先チェックリスト
 
@@ -356,9 +475,9 @@ UIスレッドでjoin/lock待ちをせず、既存maintenance workerの完了を
 | 画像個別改名/移動 | しおりの`migrate_paths_at`同様、該当containerのunits/hidden/cover内のrelative PageRefをまとめてtransaction更新。page移動がscope外ならMissingを保持。root改名だけではJSON内変更不要 |
 | archive内entry変更 | 本体から行う対応操作があれば同じPageRef移行を呼ぶ。外部rewriteはMissing保持で手動再対応。ページ番号から別entryを推測しない |
 | 実ファイル削除purge | 本/rootの削除成功は構成行/prefixをpurge。ページ一枚削除では親構成をpurgeせず参照をMissingとして保持。非表示操作はFS/purgeを一切呼ばない |
-| コンテナcopy / 内容ID復元 | generic `copy_stores_at`の本行とvirtual-prefix mappingへ参加 (`content_identity/restore.rs:414`)。relative payloadなのでcache mapping不要。destination既存構成を上書きしない既存conflict規則を使用 |
+| コンテナcopy / 内容ID復元 | generic `copy_stores_at`の本行とvirtual-prefix mappingへ参加 (`content_identity/restore.rs:414`)。relative payloadなのでcache mapping不要。destination既存構成を上書きしない既存conflict規則を使用。Folderには内容ID復元を約束しない (§4.1) |
 | restorable probe / metadata cleanup | 構成も復元可能なuser dataとして数える。cleanupラベル、DB件数/clear、設定完全reset、data-dir移動・保存先説明へ登録。resetは既存明示確認の範囲で行う |
-| 明示metadata export/import | PortableContainerState/nested stateへversion付き構成追加。root/prefixはbundle相対、page refsは本相対。is_empty/has_view_state/summary/import changed flagsも更新 |
+| 明示metadata export/import | §7.3の専用composition familyを追加。既存PortableContainerStateのorigin/挿入keyと分離。root/prefixはbundle相対、page refsは本相対。is_empty/has_view_state/summary/import changed flagsも更新 |
 | metadata import refresh | owner/context/policyを捕捉し、関係する同一本scopeのprojectionを既存reloadで更新。別本のindex/cacheを捨てない |
 | 自動sidecar | 今回は構成を追加しない。既存自動mimageviewer.datはページ編集等の用途。明示bundleが構成を運ぶ |
 | F12 | registryのnew/default/destructure/swap/mount/fork/park/drop、親一覧/固定snapshotへprojectionを運ぶ。cache ownerはcontextごとに独立 |
@@ -367,12 +486,50 @@ UIスレッドでjoin/lock待ちをせず、既存maintenance workerの完了を
 構成保存/解除、rename/import/restoreが実際に変えたscopeだけに変更通知を出す。
 読み取り専用open/closeはmutation-style invalidationを出さない。
 content identityは元メディアの内容であり、構成revisionを内容hashへ混ぜない。
+**構成保存成功時**には、要求時に捕捉したlogical rootへ `ContentIdentityTrigger::Edit` を送る。
+現行 `record_current_container_content_identity` (`src/app.rs:25803`) の考え方を使うが、
+reply時のmount/current_folderを参照しない。PDF/ZIP/対応元書庫は新規構成だけの保存でも
+restorable ledgerを作る。nested保存もouter logical rootを観測する。Folderは非対応として送信対象外。
+Remote小編集/importによる構成作成も同じ成功通知へ接続する。STORES/copy/probe登録のみで観測済扱いにしない。
 純粋な本読みやmissing検出で永続構成を勝手に掃除しない。
 
 metadata出力版は実装統合時の最新版+1 (調査時はv9→v10候補)。manifest/shard両方を更新し、
 v7/v8/v9入力と旧字段変換を保持する。旧bundleの構成不在は「既存構成の解除」ではない。
 importは既存preview/競合方針に従い、新payload全体を検証してから本行単位で書く。
 imported JSONのabsolute path/`..`/unsafe entry/過大payloadは拒否し、既存データを変更しない。
+
+### 7.3 構成専用のメタ情報転送family
+
+既存 `container_key_base` はspread/trim等のために維持し、構成はそのorigin選択にも
+`insert_container_state(container_target_key, ...)` にも混ぜない。
+portable entryに別の `composition_family` を置き、論理entry rootに属する
+`{ scope_prefix, composition }` の集合とする。root scopeは空prefix、nestedは検証済み実効prefix。
+構成専用rootは常に元フォルダ/PDF/元書庫のbundle相対path。cache origin選択肢はない。
+export照合はKeepDrive、importは搬入先logical rootをKeepDriveで正規化しscopeをjoinする。
+通常のspread/trim familyは今のDriveStripped source/cache選択をそのまま使う。
+scope prefix/relative refsを安全に検証し、受入先treeの実効scope resolverと整合させる。
+cache rootを論理rootへ再分類して既存origin競合を避けるという改変はしない。
+
+従って「元RAR側のroot/nested構成 + cache ZIP側のroot/nested spread/trim」は通常の正当なpayload。
+構成以外の既存family内source/cache競合は従来どおり検出する。構成がその競合の理由になってはならない。
+export選択でfolder entryが省かれる方式でも、構成対象のlogical folder entryをfamilyの搬送ownerとして
+明示列挙し、子Image entryの構成として扱わない。画像folder bundleの受入試験でこれを証明する。
+
+不在の意味はwireで三値を区別する:
+
+- `composition_family`字段なし: 旧版または構成section未選択。既存構成を**保持**する。
+- 新版でsectionを含み `{ scopes: [] }`: 選択logical familyは構成なし。
+  import previewに「この本の構成を解除」と表示し、当該sectionの置換を利用者が承認した場合にだけ解除する (§14-15)。
+- 非空scopes: 同じsectionの置換承認に従い、そのfamilyの選択scopeをreplace。
+  export対象外prefixを巻き添えdeleteしない。payloadにscope coverage (rootのみ/明示prefix集合/family全体) を持たせ、
+  そのcoverage内で「列挙されないscope=構成なし」と解釈する。
+
+旧版の不在を新版の空へ変換しない。sectionを外してimportした場合も保持。
+preview/summaryはset/解除の件数と対象本を示す。輸入元revisionをそのまま採用せず、
+受入先の単一writerが内容の変更時にlocal revision/tokenを進める (§5.2)。
+解除/再作成でも旧保持依存と同じtokenへ戻さない。
+構成と既存spread/trimの各target keyを別々に計算し、
+既存import batch/SAVEPOINT境界へ参加する。完了時は論理scopeの変更通知を発行する。
 
 ## 8. エディターUI — モーダルを採用する案
 
@@ -383,8 +540,8 @@ imported JSONのabsolute path/`..`/unsafe entry/過大payloadは拒否し、既�
 入口は本のHUD「…」と本一覧の右クリック「本の構成を編集」。空/全非表示本でも入口を残す。
 状態は一つの `CompositionEditorState = Preparing | Editing(draft) | Saving | Reloading`。
 owner context/scope/requestは状態内に持ち、show bool + pending bool + draft Optionを重ねない。
-共通modal helperとopen admissionへ同じ「現在画面を描くか」の述語を登録する
-(`src/app.rs:21741`, `:21756`, `:37693`)。
+共通modal helperとローカルopen admissionへ同じ**mount非依存のeditor owner**を登録する (§8.1)。
+既存UI modal判定 (`src/app.rs:21741`, `:21756`, `:37693`) だけをRemoteの確定境界とみなさない。
 
 画面構成:
 
@@ -399,9 +556,10 @@ owner context/scope/requestは状態内に持ち、show bool + pending bool + dr
   「削除」は構成非表示には使わない。白紙の編集操作は「白紙を取り除く」。
 
 virtualized一覧・可視thumbの予算付き取得で大冊も応答性を保つ。画像decode/DB/全件寸法読みをUIへ置かない。
-背面wheel/key、slideshow、folder history、開く、F12、context activate、別editor、Remote acquire、
+背面wheel/key、slideshow、folder history、開く、F12、context activate、別editor、
 ファイル操作/metadata import/settings変更をadmissionで止める。OSの別アプリ操作は制限しない。
-OSで兄弟窓がfocusを得ても編集owner bundleを別contextへswapしない。modal所在を案内する。
+OSで兄弟窓がfocusを得ても操作ownerを移さず、modal所在を案内する。
+既存の兄弟描画用一時mountは許可し、その間もglobal owner参照は不変。Remote取得は拒否せず §10.2へ接続する。
 外部からの新規openは旧要求を後で突然実行するキューに積まず、「本の構成を編集中です」で拒否する。
 
 元manifestは外部FSから変わり得る。save前にworkerで再列挙/fingerprint照合し、変化があれば
@@ -415,15 +573,49 @@ Enter/Escapeは `dialog_enter_pressed` / `dialog_escape_pressed`、日本語sing
 テーマは既存style helper、固定文字の未知glyph/絵文字は使わない。
 1093×614 / 1366×728、UI倍率100/200%で操作行が画面内にあり、本文だけscrollするsnapshotを追加する。
 
+### 8.1 開始の確定境界と終了のowner
+
+App/registryの操作routerに一つのtyped local-operation参照
+`CompositionEditorOwner { context_id, scope, request_id }` を置く。
+draft/phaseはそのcontext bundle一つにだけ持つ。ownerはphaseのコピーやboolではなく所在の正本で、
+どのApp投影をmountしても同じ参照からmodalを判定する。
+context所有draftを現在mountのAppフィールドだけから探す実装は禁止。
+`with_window_viewer_context`による兄弟描画 (`src/ui_fullscreen.rs:22457`) でも
+owner Aを保持し、Bの入力を拒否する。Aを描画する時だけAのdraftへアクセスする。
+main一覧だけにeditorを開いた場合もownerがあり、fullscreen_idx/窓数は所在の判定条件ではない。
+
+ローカルeditor開始要求は、既存SessionHandleのlifecycle mutex確定境界
+(`src/remote_ipc/session.rs:1547`) に短いLocal-phase admissionを追加する。
+その同じlock内でLocalかを確認し、UI側のowner登録とPreparingの採用をO(1)で確定する。
+session未起動時はUI routerの直列順だけで確定する。
+lock内に走査/DB/worker待ち・viewport作成・context mount・再入するcallbackを置かず、登録後にprepareを送信する。
+これは**BeginAcquireの拒否条件を増やす新admission gateではなく、既存取得境界でローカル開始を順序付ける拡張**。
+sessionにeditorフラグや別のLocal/Remote ownerを作らない。startのphase確認とowner採用を
+別々のsnapshot読み取りにするとその隙間で取得済editorを作れるので不可。
+session mutexの保持範囲とlock順をG0で独立レビューする。
+
+開始後にBeginAcquireが来たらRemoteが勝つ。prepare replyからEditingへ進む前・入力/save受付・
+reload採用のいずれもrequest相関と既存session phaseを使い、取得開始後に新しいlocal操作を確定しない。
+特に保存受付は開始と同じLocal-phase確定境界で、phase確認→Saving/ticket登録→非blocking channel送信を一度に行う。
+worker transactionの実行はlock外。BeginAcquireが先なら未送信draftのままclose、save受付が先なら
+全窓closeのbarrierが登録済ticketを必ず数える。phase確認後にlock外で初めてwriteを登録する隙間を作らない。
+終了はownerを引いてcontext/viewportをretireする一つの `close_local_composition_editor(reason)`。
+Preparingのworker replyをcancel/retire、Editingのdraftを破棄し、owner終了を兄弟へ移植しない。
+Savingの送信済writeは §10.2のservice終端へ引き渡す。要求IDとscopeを持つ既存worker完了管理に回収責任を移し、
+消えたeditorをreplyで復活させない。Saving後のキャンセルでDBをrollbackする仕様は追加しない。
+通常cancel、owner窓close、全窓close、Remote取得、app終了をこの同じ終端契約へ接続する。
+
 ## 9. §1.364との境界
 
-E側と共有する問い合わせは `resolve_book_layout_source(scope)`。
+E側と共有する問い合わせは `resolve_book_layout_source(scope)` (Book列に対するもの)。
 構成が存在すれば Composed、なければ Automatic + §1.364の解決済shift。
+ResultはAutomaticで本別shiftを持ち込まない。shift可否はaccepted recipe/依存から一か所で派生させる (§3.1)。
 構成snapshotの取得に失敗した状態を「構成なし」としてshiftを適用しない。
 
-`queue_spread_shift_action`が見開きずらしを作る前にLayoutSourceを見る。
-Composedならactionを消費、anchor/target/cache/DBを変更せず、
+`queue_spread_shift_action`が見開きずらしを作る前に、この共通shift可否を見る。
+Composedまたは構成本のページを含むResultならactionを消費、anchor/target/cache/DBを変更せず、
 「この本の見開きは本の構成で指定されています。組を変えるには構成を編集してください」と通知する。
+Resultには「この一覧には構成を指定した本のページが含まれるため、見開きをずらせません」と通知する。
 四つのFsSpreadShift Action、カスタムキー、ゲームパッド/リング等で同じ結果にする。
 Single/Splitの従来page移動はshiftではないので維持。
 HUDの§1.364保存状態/解除は構成ありでは表示せず、「本の構成を編集」へ接続する。
@@ -431,15 +623,57 @@ HUDの§1.364保存状態/解除は構成ありでは表示せず、「本の構
 **保存済shiftがある本へ構成を作る場合は利用者判断が必要**。
 推奨案: 編集開始時の実効shiftを初期Pair/Singleへ取り込み、構成保存後はsaved shiftを休眠させる。
 saved row自体を消さないので、保存跨ぎの二DB transaction/recoveryを必要としない。
-構成解除時に従来のsaved shiftを再び有効にすることを解除確認で説明する。
+構成解除時は §1.364の現時点の記憶ON/OFF・scope・identity解決規則で再評価する。
+記憶ONかつidentityが解決できた場合だけ旧saved shiftを再び有効にする。記憶OFFなら休眠rowを
+勝手にsessionへ持ち込まない。Missing等の旧anchorはEの採択規則に従い、同じraw番号へ代用しない。
+解除確認ではその時点の実効結果を説明する。「必ず以前のずらしが戻る」とは表示しない。
 作成キャンセルではshiftに一切触れない。記憶OFFのsession shiftも初期値に取り込むが永続shiftを新規作成しない。
 「初期値に取り込んでsaved shiftを消し、解除後は基本見開き」の案も可能だが、別storeの消去失敗時の
 扱いをE/Gで合意する必要がある。採択前にこの二DB処理を作らない (§14-1)。
 
 構成のbinding設定の切替は2026-10-10追補で禁止されていない。
 Single/Spread/Split切替は閲覧方法として維持し、右/左開きや表紙設定の永続ownerを二つ作らない。
-構成ありのHUD方向/表紙切替を構成編集へ接続するか、同じ構成recordへの小編集として即保存するかは
-未決定 (§14-2)。後者でもPairを自動再計算することはしない。既存spread.dbだけを書いて無効な操作に見せない。
+構成ありのHUD方向/表紙切替は §9.1の同じ構成recordへの小編集を推奨する (§14-2/11、未承認)。
+既存spread.dbだけを書いて無効な操作に見せない。
+
+### 9.1 方向/表紙の小編集と可視効果 (利用者判断)
+
+PC/Remote共通のpure操作をworker writerへ送り、一transactionで構成revisionを更新する。
+構成editorはPC限定でも、この既存binding入口を残す。session排他によりPC draftとRemote小編集は並行しない。
+PC editorが開いている時は背景HUD操作を受けず、editor内の方向/表紙widgetでdraftへ同じ操作を適用する。
+この小編集の対象はBook recipeの当該構成。Resultのdirection/cover操作は従来の自動表示設定へ作用し、
+そこに含まれる本の保存構成を変えない。入口ごとにcurrent anchorの親へ暗黙に書き込まない。
+
+- **右/左開き**: directionだけを変更。reading order、Pair membership、SingleのLeading/Trailingを保ち、
+  画面slotを鏡映する。補助表紙/白紙も鏡映する。表示が変わり、pairを組み直さない。
+- **表紙なし→あり**: full Book投影の先頭の可視実ページをcover PageRefにする。
+  Pair内ならそのPairだけを二つのSingleへ分ける。coverはTrailing+Vacant
+  (LTRでは右、RTLでは左)、元相方は元slotのSingleにする。二つのSingleの元読み順は保つ。他のPairは一切ずらさない。
+  coverが既にSingleならそのplacementをTrailingにする。明示Blank companionは残し、
+  Centerからの変更等で不整合ならVacantにする。cover自身を補助として重ねない。
+  非表示/Missingは選ばず、可視実ページゼロなら通知して変更しない。tailのページなら当該tailを明示unitへ取り込む。
+  自動の末尾補助は追加しない。
+- **表紙あり→なし**: cover指定を外し、そのページが今可視なら中央Single+Vacantにする。
+  指定coverを参照する全FrontCoverSupplementはVacantへ変換し、白紙はBlankBoundaryへ残す。
+  他の実ページ順・Pair/Single指定は保持し、前の相方と自動で組み直さない。
+  hidden/Missingのcover指定も解除でき、存在しないページを出現させない。
+- **別のページを表紙に指定**: 全editor内の明示操作。旧表紙解除→選択ページへ同じ単独化規則を適用。
+  cover PageRefを変えるだけで古い補助参照を残さない。操作前後の影響unitをプレビューする。
+
+同じ表紙あり/なしへの再送はno-opで、指定coverを新先頭へ移したり再単独化したりしない。
+Remote `SetSpread` はmode enumのcover有無をそのまま全操作へ適用せず、
+Single/Split要求は閲覧mode変更とdirectionだけ、Spread要求はdirectionと明示cover有無に分解する。
+Single/Splitへ移るだけで保存coverを解除しない。Spreadへ戻る際はaccepted構成のcoverを反映してUIを表示する。
+構成なしのSetSpreadは現行 `persist_remote_spread` / `core_reading_direction`
+(`src/remote_ipc/ui.rs:2552`, `:4510`) の保存を維持する。
+
+この表紙小編集は「表紙切替を維持するため、そのページの組だけを解く」例外を含む。
+2026-10-10の「組はeditorで変更」との整合は**利用者承認が必要**であり、採択済としない。
+復元用の旧Pair/placement保存を別状態として増やさず、表紙なしへ戻しても自動再pairしないことを説明する。
+代案はPCで表紙操作をeditorへ接続し、Remoteでは構成あり本の表紙変更を制限する。
+その代案は現在のRemote表紙切替を失うので承認なしに実装しない。
+Single/Spread/Splitの選択は既存の閲覧mode保存ownerを使い、構成unitsを書き換えない。
+modeに同梱されたdirection/cover操作はこの共通処理で分解し、同じpayloadの新旧設定を二DBで競合保存しない。
 
 ## 10. F12 / 多窓 / Remote
 
@@ -450,15 +684,42 @@ F12 forkはimmutable構成snapshotを共有できるが、nav/cache/queue/cancel
 fork/park/mount/deposit/close自体はDB writeや sibling reloadを発生させない。
 保存replyはrequestを発行したcontextへ配送し、今mountされているcontextを要求元と推測しない。
 
-save後は同じscopeを表示するcontextだけを既存本reloadへ載せる。
-各contextのanchor PageIdentity、元閲覧mode、filter、return route、zoom/scale設定を捕捉し、
-新items投影へ個別に復元する。parked contextも既存metadata import refresh同様のcontext identityで扱う。
+save後は**現在列だけでなく全保持projectionの依存scope**を照合する。
+保存対象と同じscopeを持つBook contextは既存本reload、Result contextはmembership/結果順を保って
+visibility/nav eligibilityだけを再解決する。anchor PageIdentity、閲覧mode、filter、return route、zoom/scaleを捕捉する。
+parked contextも既存metadata import refresh同様のcontext identityで扱う。
+現在anchorがHiddenになれば全contextで §6の着地規則を使う。
 別本/別階層は不変。同じscopeの旧snapshotは新構成を完成表示と扱わず、既存holdoverとして使う。
 窓の無条件閉鎖・zoom全resetで解決するとreleased操作を削るので採用しない。
 reloadが既存routeでは状態を保存できないと判明したら、実装を拡げる前に設計担当/利用者へ相談する。
 
-editor中のcontext terminal closeはPreparing/Editingを取消、SavingはDB replyを収穫してから終了、
-Reloadingは採用/closeの既存終端へ接続する。indexを使うdraftを別窓に移植しない。
+#### 退避projectionの鮮度と復帰adoption
+
+snapshot.saved_items、固定list_items、pre-search/return grid、F12 direct_ownerの元一覧、
+parked bundle、folder-historyの保持列を同じ契約で登録する。保持値は単なるitemsコピーでなく
+`{ recipe, accepted_projection, dependencies: scope→(composition_revision, source_manifest_revision, policy_revision) }`。
+構成なしも依存として記録し、
+後から作成された場合を検出する。保持projectionへの変更通知はrevision差で表し、別のdirty boolは持たない。
+source_manifest_revisionは当該scopeの受入済manifest更新/実削除/改名のpublicationを表し、
+contextごとのitems_generationをscope間比較に使わない。新しいFS watcherは追加せず、既存変更検知/F5の
+列生成結果をownerで発行する。戻り時の既存external-change確認もこのownerへ接続する。
+
+復帰は必ず `adopt_retained_projection` を通す:
+
+1. 現在store/source/policy snapshotのrevisionと依存を比較。一致なら既存immutable値を一度だけinstall。
+2. 不一致ならBookは保存recipeのscopeから既存reloadを要求し、Resultは**固定したmembershipと
+   order policyのまま**hidden eligibilityを再解決する。元book itemsへの再適用による二重並べ替えをしない。
+3. 新accepted projection採用後にidentityでselection/anchorを復元。Hiddenなら §6へ。
+   scroll/index cachesは新世代、thumbはidentity一致分のみ再利用する。
+
+`snapshot_ops.rs:1281` の固定解除、`:1405`の固定一覧へ戻る、
+`viewer_context_registry.rs:3403`のF12元一覧復元を含め、items直接代入からこのadoptionへcutoverする。
+鮮度確認にworkerが要る間は既存loading表示で、旧列をholdoverとして描けても操作を確定しない。
+固定membership、snapshot origin/source label、pre-search origin、return routeをreloadで破棄しない。
+変更された本から離れているcontextを即座に本へ移動させず、保持値は次の復帰時に更新する。
+保存中はローカルmodalで新しい復帰要求を止め、保存後の鮮度チェックへ揃える。
+
+editor terminal closeは §8.1/§10.2に従う。indexを使うdraftを別窓に移植しない。
 detached述語/viewportに触る前にはClaudeCodeと独立Codexレビューで
 「context投影の所有を拡張する構造的修正であり症状パッチでない」ことに合意し、
 実装範囲と理由を `detached-rework-plan.md` §11へ記録する。
@@ -468,20 +729,61 @@ detached述語/viewportに触る前にはClaudeCodeと独立Codexレビューで
 
 coreのContainerEngine workerが同PreparedBookを生成する。Webは返されたentries/PageGroupを表示し、
 構成のorder/pairを自前で再現しない。実addressは元root+entry/物理PDF番号のまま。
-`has_composition`、revision/accepted layout identity、構成の実効binding、shift availabilityをpayloadへ追加し、
+Bookには `has_composition`、revision/accepted layout identity、構成の実効bindingを追加する。
+Resultには列recipeのtag、leafごとのhidden/構成依存、全列のshift availabilityを返し、
+一つのhas_compositionだけで混在を表さない。両者ともaccepted projectionから生成し、
 既存presentation/anchor/singleton placementを共有する。白紙のaddressを発明しない。
 件数/response budgetで切詰める前にfull projectionを作り、切詰め後はcomplete=falseとする。
 Pairの片側が応答外なら残る実ページのslotを保ち、見かけの末尾へ表紙を付け足さない。
 
-構成editorは今回はPCのみを推奨。Remoteは構成で読む、非表示を拒否する、binding切替の契約を満たす。
-Remote編集UI/APIの追加は別段階/要求とし、本機能のPC編集と同時に作らない。
+構成editorの全体編集は今回はPCのみを推奨。Remoteは構成で読む、非表示を拒否する、
+§9.1の同じrecordへの方向/表紙小編集で既存SetSpreadを維持する推奨案 (§14-11、未承認)。
+Remoteの全体編集UI/APIの追加は別段階/要求とし、本機能のPC編集と同時に作らない。
 書込は必ずIPC→core所有service。read-only connection/workerから書かない。
-editor中のRemote acquireは既存共通admissionで「本の構成を編集中です」と拒否し、
-編集draftを突然破棄して全窓を閉じない。Local/Remote排他が変わらないことをreviewする。
+
+#### Remote取得は全ローカル窓closeへeditorを含める (推奨、§14-9)
+
+現在の「後から操作した側が勝つ」を保ち、editor中でもBeginAcquireを拒否しない。
+`poll_remote_session`のAcquiringRemote分岐 (`src/remote_ipc/ui.rs:1081`) の全窓closeに
+editorのterminal closeを含める。`close_all_detached_viewers_for_mode_change`の
+`had_detached == false`早期return (`src/app.rs:58163`) やfullscreen_idxなしでeditorを見落とさない。
+全ローカルsurfaceのclose coordinatorがglobal editor ownerを無条件で列挙し、
+context close関数は同じterminal処理を使う。別modal窓だけ残す設計にしない。
+`local_viewer_close_state` (`src/app.rs:73834`, `:73863`) はeditor owner/viewportと
+送信済構成writeの終端も含めてClosedを判定する。mount中のApp fieldsや窓数を代用しない。
+
+取得順の証明 (startは §8.1の同じsession mutexで確定):
+
+| 確定順 | 結果 |
+| --- | --- |
+| editor開始→BeginAcquire | ownerは既にregistryに存在。Remote phaseがlocal操作を止め、UIの全窓closeがeditorもretire。未保存draftを破棄しmainへ通知 |
+| BeginAcquire→editor開始要求 | sessionはAcquiringRemoteなので登録を拒否。prepare/viewportを作らず「Remoteから操作中です」。取得後にprepare replyで開く余地なし |
+| editor準備replyと取得が競合 | startの順序は変えず、取得後replyはretired requestとして回収。Editingへ復活させない |
+| 兄弟Bを一時mount中に取得/開始/close | global ownerはAのまま。registryのcontext IDでAを閉じ、BのApp投影にdraftがないことを「editorなし」と解釈しない |
+
+Preparing/Editingは取消して「Remoteからの操作に切り替えたため、本の構成の編集を閉じました。未保存の変更は保存されません」。
+Savingは送信済transactionを取り消さず、**窓/draftを先に閉じ、serviceの一回の完了を収穫してからFinishAcquire**。
+commit済なら構成は保存されている。成功は「本の構成を保存し、Remoteからの操作に切り替えました」、
+失敗は旧record保持と保存失敗の通知。消えたdraftを復旧・自動retryしない (§14-7/9)。
+Reloadingは保存済recordを維持し、local reload/返答をretire、Remoteが新snapshotを列挙する。
+service drainは既存AcquiringRemoteのclose barrierへ接続し、Remoteの最初のenumerationは
+保存writeが終端になった後。既存read workerは `wait_until_active`
+(`src/remote_ipc/pipe.rs:1797`) を通り、AcquiringRemoteはそこで待つ
+(`src/remote_ipc/session.rs:2501`, `:2524`)。write workerも同じ待ちを持つ (`src/remote_ipc/pipe.rs:1338`)。
+この既存activation境界を使用し、取得応答がActiveというだけで列挙を先行させない。
+現在の30秒取得失敗処理 (`src/remote_ipc/ui.rs:1130`付近) は維持し、
+追加の待ち時間/retry/保存完了後のlocal窓復元を作らない。
+owner窓終了/Local返却/取得abortでも旧requestを新ownerへ配送せず、replyはserviceで完了させる。
+app終了途中のcommitはDB一transactionの従来の保証に任せ、永続draft回復は要求しない。
+SessionHandle mutexを取った短いUI確定処理からservice状態のblocking lockを取らず、
+worker側からregistry/sessionへ逆向きlockを取らない。通知/完了はchannelでUI routerへ返す。
+
+代案「編集中は取得拒否」はreleased契約を変え、editor start/BeginAcquire両側のownerを
+session stateへ追加する設計が要る。推奨案へ混ぜず、利用者が §14-9で選んだ時だけ別の設計レビューを行う。
 
 PC変更の端末反映は既存session acquire時のcache破棄で扱う (`web-remote-plan.md` §2.2/§12.16)。
-構成編集をPC限定にする限り、home変更検知のための新data_version watcherは要らない。
-Remoteセッション内のbinding変更を許す場合は既存remote generation/invalidation通知へ登録し、
+全editorをPC限定にし、Remote小編集をcore serviceが通知する契約なら、新data_version watcherは要らない。
+Remoteセッション内のbinding変更は既存remote generation/invalidation通知へ登録し、
 container/group cacheも同じaccepted layout revisionで失効させる。
 force_single/端末orientationはこのrevisionを増やさず端末ごとのprojection keyへ載せる。
 IPCは調査時v69から統合時の最新+1、Web asset tokenとstrict handshake/testを一緒に更新する。
@@ -521,6 +823,9 @@ current_folder + archive_source_overrideが同じ受入済cacheを指す場合�
 
 通常一覧の一括書き出し/製本追加は `grid_selection_indices` が返す構成後index昇順。
 構成非表示はitemsにないので選ばれず、白紙/補助もsourceに変換しない。
+Resultの非表示markerはitemsには残るため、selection→実Source確定にも共通visibility resolverを通す。
+markerは書き出し/製本追加の選択対象にしない。Resultの可視選択は従来の出力順・直接閲覧を維持し、
+別本の構成順へ並べ替えない。本全冊追加は必ずBook projectionを生成して渡す。
 workerへは既存の実ページSource/編集snapshotを渡す。元書庫を書き直す機能は作らない。
 全冊追加の入口がraw列挙している場合も「表示中本の可視実ページを渡す」共通snapshotを使用し、
 raw constructor経由でhiddenを取り込まないことをテストする。
@@ -536,23 +841,31 @@ metadata bundleは可視一覧選択からの画像exportとは別で、**非表
 
 | 消した組み合わせ | 方策と理由 |
 | --- | --- |
-| 編集中に別本open / 戻る・進む / F12 / sibling activate / Remote取得 | modal admission。元に戻す/supersede draft/resume機構を作らない |
+| 編集中に別本open / 戻る・進む / F12 / sibling activate | mount非依存のlocal modal owner。元に戻す/supersede draft/resume機構を作らない |
+| editorとRemoteの二重操作 / 取得拒否をする別gate | 同じsession確定境界で開始を順序付け、後のRemote取得が既存全窓closeを使う。draft永続退避/自動再開なし |
 | itemsと別の読み順だけ構成順 | 本列生成ownerで一回投影。通常ナビ・単ページ・seek・連結を同じitemsへ |
 | PC列挙とRemote列挙の異なるorder/hidden/pair | same PreparedBook。Web独自pairingを増やさない |
-| 構成 + 一時shift + saved shiftの合成 | typed LayoutSource二択。Composedでshiftを解決/書込しない |
+| 構成 + 一時shift + saved shiftの合成 | typed LayoutSource二択。Composedでshiftを解決/書込しない。解除時はEの現在の記憶規則へ戻す |
+| 異なる本の明示Pair / Result自動pair / 動画の混合layout | 本自身だけComposed、結果全列はAutomatic。hidden/shift資格だけをscope依存から派生 |
 | 任意page/blank列 + explicit pair overrides + singleton flags | explicit units一つ。flat列は派生、blankはsourceではない |
 | 自動landscape/page_alone設定変更 + 保存済手動Pair | 初期値で自動規則を凍結。以後はgeometryだけ更新 |
 | 閲覧mode/orientation/Splitが本の永続ペアを変更 | view projectionを分離。single/splitは同じ可視flat列 |
-| 保存中のitems in-place並べ替え + index編集cache | draft→commit→既存reload。世代とidentity表を一緒に採用 |
+| 保存中のitems in-place並べ替え + index編集cache | draft→commit→既存reload。削除等は共通remapでitems/units/identityを同時更新 |
+| 新構成で表示中 / ★固定・F12退避に旧構成 | 保持recipeとrevision照合、一つの復帰adoption。固定membership/return routeは維持 |
 | 個別本reloadとF12独自rebuildを別々に実装 | 既存context付きreloadへ接続。scopeに関係するcontextだけ更新 |
 | 読取open/closeでmutation invalidation | readはrevision採用だけ。実際のwrite/rename/importだけ通知 |
 | 書庫cache keyと本のidentityの混在 | logical/physical typed snapshot。ページ編集DBは既存keyのまま |
+| 元書庫構成 + cache spread/trimの転送origin競合 | composition専用logical family。既存container origin判定へ参加させない |
+| Folder内容ID / 一枚の画像ID / 類似pathによる親構成推測 | 外部folder移動は明示bundle転送。自動識別・復元元選択UIを今回追加しない |
+| cover切替の元Pair復旧log / metadataだけ変わるcover | 影響unitだけ単独化し、戻しても自動pair復旧しない小編集案。可視効果を明確にして利用者相談 |
 | 新storeの移行/旧設計試作データ互換 | 未リリースstoreは新schema一つ。released既存DB/bundle互換は維持 |
 | 稀なDB failureのretry/途中保存/rollback後のrollback | record一transaction + draft維持/通知。独自回復網は利用者相談前に作らない |
 
-採用しなかった簡略化: 全窓を閉じる、全設定reset、PDF即時表示を全件待ちへ変える、
+採用しなかった簡略化: 構成保存だけを理由に全窓を閉じる、全設定reset、PDF即時表示を全件待ちへ変える、
 構成なし本のshiftを取り除く、読み取り時の新tail自動保存。いずれもreleased機能の退行、
 利用者データ変更、または別contextへの不要な副作用がある。
+Remote取得の全窓closeはそのreleased契約を維持する場面であり、保存更新の全窓closeとは別。
+Result中のshift制限、表紙小編集、本扱いOFF/混在後の表示は不便/仕様差を伴うので、承認待ちとして残す。
 
 ## 13. 段階・担当範囲・受入テスト
 
@@ -562,8 +875,11 @@ metadata bundleは可視一覧選択からの画像exportとは別で、**非表
 
 ### G0: 設計採択・E統合後の再照合
 
-成果: §14の回答、独立設計レビュー、scope resolver/DTO/shift責任分担、detached構造合意。
+成果: §14の全回答、独立再レビュー、scope resolver/DTO/shift責任分担、detached構造合意。
 受入: 本書§2のsymbol/lineを新masterで更新、下記E接点の差分を読み、仕様の矛盾を潰す。
+editor owner登録・保存ticketとsession mutexのlock順/短い保持、全close barrier、保持recipeの復帰adoptionを
+構造レビューする。初回REVISEをこの設計修正だけでACCEPT扱いにしない。
+小編集の表紙unit変更、Resultのshift、OFF/混在、Folder移動、転送の明示解除を未回答のまま実装briefへ確定しない。
 
 ### G1: items列生成の統一 (構成なしでの互換を先に証明)
 
@@ -575,6 +891,10 @@ metadata bundleは可視一覧選択からの画像exportとは別で、**非表
 - policy before book classification、same-name除去、cached PDF早期adoption、password cancel、古いworker不採用。
 - context Aのread-only open/close/forkがBのitems/generation/queue/cancel/cacheへ変更を出さない。
 - visible_indices昇順、itemsとmetas長/対応、complete proofとRemote切詰めの境界。
+- 行変更入口の一覧を完成させ、実削除完了→remove_items_batchのitems/identity/unit同時remapを先に接続。
+  `[A,B],[C,D]`のB削除直後、F5前にA/C誤pairなし、C/D保持、正しいresume/export選択。
+- 結果への直接snapshot openを維持。構成本/未構成本/動画が混在しても結果順・動画navを保つ。
+  本の詳細表示は構成順lock、Result詳細sortは従来順。OFF/混在→再適格のrecipe往復。
 
 ### G2: model / store / lifecycle
 
@@ -586,6 +906,11 @@ metadata bundleは可視一覧選択からの画像exportとは別で、**非表
 - 内容IDcopy後のrelative参照、destination構成を保持、cache再変換でもlogical key一定。
 - 新formatとreleased v7/v8/v9入力、nested状態、旧bundleの構成不在で既存構成を消さない。
 - readでDB writeなし、clear/reset/cleanup登録漏れなし、変更通知の対象scope限定。
+- 構成だけ新規保存、fullscreen閲覧/読書履歴なし→PDF/ZIP/元変換書庫を外部移動→内容ID復元候補。
+  成功reply時に兄弟mountでも保存したlogical rootのEdit ledgerがある。Folderは自動候補にならない。
+- source KeepDrive構成 + cache DriveStripped spread/左右trimの同居を、root/nested双方でexport/import往復。
+  既存origin競合を誤発火せず、構成は搬入logical root、spread/trimは従来cache key。
+  画像folder entryの搬送、旧字段なし/section未選択/新版明示空/部分coverageの保持・解除をpreview込みで検証。
 
 ### G3: 構成適用・spread/read position・shift境界
 
@@ -603,6 +928,12 @@ metadata bundleは可視一覧選択からの画像exportとは別で、**非表
 - 全FsSpreadShift Action/カスタム割当/ゲームパッドのno-op+通知、Singleでの移動維持、保存shiftの採択規則。
 - composition revisionでunit/nav/geometryが失効、B sibling不変、blankにsource/readiness無し。
 - trim 左右別/page override/blank slot/補助/RTL、capture/export targetが実Navigationだけ。
+- B実削除直後にunit/anchor/resume/書き出しをF5前に検査し、再読込後もMissing参照がDBへ残る。
+  個別改名/親改名/外部変更/種類設定変更の再解決と整数slot失効を検証。
+- Resultでは明示Pair相方が離れていても呼び寄せない、他本と自動pair/video境界は従来builderと一致。
+  hidden行はmarker/拒否、navから除外。構成本を含むResultの全shift拒否は採択回答どおり。
+- 小編集: 方向鏡映でidentity順/Pair不変、表紙ONで当該Pairだけ単独化、OFFで補助解除、同値再送no-op、
+  全非表示/Missing cover/白紙保持、新tail cover、PC/Remote同値。page overrideの左/右別値もslotで一致。
 
 ### G4: modal editor / 保存reload / multi-window
 
@@ -612,7 +943,14 @@ metadata bundleは可視一覧選択からの画像exportとは別で、**非表
 - cancel無変更、draft undo/redo、保存後identity reanchor、現在ページをhiddenにした時の採択済移動規則。
 - Preparing/Editing/Saving/Reloading各状態でopen/history/F12/gamepad/Remote acquire/terminal closeのhandler試験。
 - 外部manifest変更は保存拒否、DB failureはdraft保持、旧worker replyを新ownerへ採用しない。
-- same-book active/parked/F12 forkだけreload、別book/別prefix不変、return route・scale/anchor保持。
+- same-book active/parked/F12 forkと保持projectionだけ更新、別book/別prefix不変、return route・scale/anchor保持。
+- editor開始→BeginAcquire / BeginAcquire→開始を決定的handler試験で入れ替える。
+  Preparing/Editing/Saving/Reloading全phase、prepare reply後着、保存受付と取得の順序、
+  mainだけのeditor/fullscreenなし、A編集中にB一時mountを含め、Remote拒否なし・ownerなし・viewport閉鎖を証明。
+  Saving中はcommit成功/失敗の一回の終端前にFinishAcquireしない。owner終了/取得abort後のreplyで復活なし。
+- ★固定解除/固定一覧帰還/F12元一覧復元/履歴の保持列はrevision不一致なら再adoption。
+  新作成/変更/解除/実削除後、membershipとreturn routeは保持、旧hidden/旧順復活なし。
+  同じ本の兄弟anchorがHidden→旧各reader順の次/前/新列先頭/空、Result動画anchorは維持。
 - snapshot: light/dark、小画面/倍率、長名/長文、多ページ、button到達、IME helperの既存headless検査。
 
 ### G5: Remote / 出力 / 最終gateと文書
@@ -624,6 +962,9 @@ metadata bundleは可視一覧選択からの画像exportとは別で、**非表
 - strict protocol/asset token一致、session acquire refresh、必要なremote writeのgeneration失効。
 - 選択export/本全冊追加/外部受け渡しでorderとhidden除外、white/supplement source無し、製本先に構成無し。
 - source/cache移動・再変換・content restore・metadata importから同じ結果、通常未構成本の回帰なし。
+- Remote既存SetSpreadを小編集serviceへつなぎ、表紙/方向の可視効果・commit後group cache失効・失敗通知。
+  shift禁止とSingle/Split移動維持を区別。PC draft/Remote write同居なし。
+  Single/Split要求でcoverを解除せず、Spreadへ戻ると保存coverを使う。
 
 各段階の実装者が狭いunit/handler/integration/snapshot検証を所有し、レビュー担当は有効な結果を再利用する。
 共有変更の最終gateは `scripts/test-full.ps1`、fmt check、UI文字変更はglyph checker 0件。
@@ -656,30 +997,134 @@ spec、manual本/見開き/設定/Remote、保存先・外部通信説明、docs
 G1以降のbriefはmerge済masterへrebase後に更新し、Eの指定scale既存テストをそのまま回帰gateへ含める。
 旧anchorやfit算式をG側に複製してconflictを解消しない。
 
-## 14. 利用者への未決質問 (各項の推奨は未承認)
+### R2指摘との対応 (検収用)
 
-1. **構成作成前の保存ずらしをどう扱うか。** 推奨: 現在の組を初期値へ取り込み、保存ずらしは休眠保持。
-   構成を解除すると以前の保存ずらしが戻ることを確認文に表示する。二DB消去の失敗処理を増やさず元データも保つ。
-   代案: 初期値へ取り込んだ後にずらし記録を消し、解除後は基本の組へ戻す (別store消去失敗の割り切りも要決定)。
-2. **構成ありのHUD方向/表紙切替の入口。** 推奨: Single/Spread/Splitは従来どおり即切替、
-   右/左開き・表紙あり/なしの変更は構成editorへ接続し、組の変化を見て保存する。
-   これは現在の即時binding切替に一手間を足すため、実装前の承認が必要。
-   代案: 同じ構成recordへの即保存を維持し、directionは鏡映、cover変更もexplicit Pairを自動変更しない。
-3. **後から増えたページと末尾表紙。** 推奨: 新ページは元順で末尾に中央Singleとして追加し、
-   組を変えるならeditorで行う。既存unitとpairは変えない。補助表紙は指定済unitに残す。
-   代案: 新ページ同士だけ自動規則で組む、または補助表紙だけ新末尾へ自動移動する。
-   推奨案は新ページの寸法待ち・PC/Remoteでの暫定pair差をなくし、保存後は手動という仕様にも揃う。
-4. **余分な白紙だけの並び。** 推奨: 編集では保持、一覧/Single/ページ送りには出さない。
-   白紙を単独で閲覧/exportする仕様は追加しない。白紙だけのunit作成を禁止する代案は、任意位置/連続白紙の編集を狭める。
-5. **保存時に今読んでいるページを非表示にした場合。** 推奨: 編集プレビューで示した次の可視ページ、
-   なければ前、全非表示なら空一覧へ。既存しおり/保存位置targetからのhidden移動は一律拒否のまま。
-6. **画像本扱いOFF・mixed化/EPUB・Remote編集の対象。** 推奨: 構成作成は画像本/PDF/対応画像書庫に限定。
-   既存構成がある画像フォルダは本扱いOFFでも構成順/非表示を保ち、後から動画/子folderが増えたら
-   その非ページblockは通常順で残す。EPUBは既存閲覧を維持するが作成対象への追加は保留。
-   Remoteは構成閲覧対応まで、構成editorはPCのみ。混在後に構成を無効化すると非表示が復活するので推奨しない。
-7. **新storeの破損/未知版と保存後reload失敗の割り切り。** 推奨: 構成データを消さず書込停止・通知。
-   読み取れない構成本は開かず、保存後reloadだけ失敗したら保存済データを保持して再読込/再起動を案内する。
-   自動retry/多世代backup/段階回復は追加しない。DB全体の読込不能では存在有無も不明なので、
-   対象本の構成を無視して閲覧する回避は利用者の明示選択とする (勝手なsilent fallbackはしない)。
-8. **左右別トリムを白紙相方の実ページにどう当てるか。** 推奨: 見開き閲覧では実slot側のspread margin、
-   Single閲覧ではsingle margin。元ページにmarginを移植しない。§1.240既存singletonの挙動変更は別途扱う。
+| 指摘 | 構造変更 | 主な受入段階 |
+| --- | --- | --- |
+| P1-1 editorと取得 | §8.1のmount非依存owner・既存session境界、§10.2の全窓close/barrier。取得拒否案は利用者代案 | G0/G4/G5 |
+| P1-2 in-place items | §3.2の共通更新・整数slot remap/identity再解決。Missing recordは保持 | G1/G3 |
+| P2-3 集約/mixed | §3.1のBook/Result recipe、全列一layout、sort/nav/shiftの同じ資格owner | G0/G1/G3 |
+| P2-4 退避/兄弟hidden | §10.1の依存と復帰adoption、§6の全context着地 | G3/G4 |
+| P2-5 転送origin | §7.3の構成専用logical family、空/不在/coverage契約 | G2/G5 |
+| P2-6 folder移動/ledger | §4.1のFolder非対応の明示とbundle推奨、§7.2の保存成功Edit観測 | G0/G2/G5 |
+| P2-7 Remote切替 | §9.1の可視効果ある小編集、§10.2の既存SetSpread維持案 | G0/G3/G5 |
+
+以下の回答と独立再レビューが揃うまでdetached構造合意は未完了。
+
+## 14. 利用者への未決質問 (推奨は全て未承認)
+
+初稿の1〜8を維持して具体化した。6に同居していた本扱いOFF/混在/Remoteの判断は12/13/11へ分けた。
+9以降はレビューによる追加判断。どの選択も回答前に実装仕様として確定しない。
+
+1. **構成を作る前に記憶した「1ページずらし」は残しますか。**
+   推奨: 今の組を構成の初期値に取り込み、以前のずらし記録も残す。構成がある間は使わず、
+   構成を解除した時に「ずらしを記憶」がONで元のページを確認できれば再び使う。
+   OFFなら使わず、記録したページが見つからない時も別ページにずらさない。解除前に結果を説明する。
+   元の設定を失わずに済むため推奨する。
+   代案: 構成を作ったら古いずらし記録を消す。構成解除後は基本の組から読む。
+
+2. **PCの右開き/左開き・表紙あり/なしは、今までのメニューで直接変えますか。**
+   推奨: 直接変更できる。開く方向は左右を入れ替えるだけで、指定した組を保つ。
+   表紙ありへ切り替えると先頭の表示可能なページが単独になり、組だった相方も単独になる。
+   他の組は変えない。表紙なしへ戻すと表紙は中央の単ページになり、補助としての表紙表示を外す。
+   以前の相方とは自動で組に戻さない。この表紙操作だけは編集画面外で組を解く例外になるので承認を求める。
+   操作の手間を増やさず、切替が画面に反映されるため推奨する。
+   代案: 方向/表紙のメニューで編集画面を開き、変更を見て保存する。即切替には一手間増える。
+   単ページ/見開き/横長分割の表示切替はどちらでも今までどおり。
+
+3. **後からページを追加した時、既存の組と補助の表紙をどうしますか。**
+   推奨: 新ページは元の名前順で末尾に中央の単ページとして足し、既存の組は変えない。
+   補助の表紙は指定した単ページに残す。途中へ残る場合も「末尾表紙」と呼ばず
+   「表紙の補助表示」と説明する。意図した組が勝手に変わらず、追加直後から同じ並びで読めるため推奨する。
+   代案: 新ページ同士だけ自動で組む、または補助表紙を新しい末尾へ自動移動する。
+   この二つは別々に選べるが、どちらも追加時に表示が自動変更される。
+
+4. **白紙だけが続く指定を残しますか。**
+   推奨: 編集画面には残すが、一覧・単ページ表示・ページ送り・書き出しには出さない。
+   実ページと組んだ白紙だけ閲覧時に見える。区切りとしての指定を失わず、白紙だけの送りを増やさないため推奨する。
+   代案: 実ページと組まない白紙を保存できなくする。連続白紙などの編集は制限される。
+
+5. **保存によって読んでいるページが非表示になった窓は、どこへ移しますか。**
+   推奨: 変更前のその窓の読み順で次にあった、今も表示できるページへ移す。
+   なければ前のページ、それもなければ新しい一覧の先頭、全て非表示なら空の一覧に戻す。
+   編集した窓だけでなく、同じ本の別窓や後で戻る固定一覧にも同じ規則を使う。
+   次に読む場所を予測しやすいため推奨する。保存前に編集元窓の行き先と他の窓への影響を示す。
+   代案: 非表示になった窓は常に閲覧を閉じ、一覧から選び直す。
+   しおりなどから非表示ページを新たに開こうとした時は、どちらでも通知して拒否する。
+
+6. **今回、EPUBにも構成を作れるようにしますか。**
+   推奨: 今回はZIP等の対応書庫・PDF・画像本フォルダに限定し、EPUB追加は後で検討する。
+   既存のEPUB閲覧は維持する。変換後ページと元本の対応を追加検討する範囲を減らせるため推奨する。
+   代案: EPUBも今回対象にする。その変換・再変換時のページ対応を別途設計してから実装する。
+   構成全体の編集画面は今回はPCに置く案。Remoteの既存の方向/表紙切替は11で別に判断する。
+
+7. **めったに起きない保存失敗や構成データの読込失敗は、どこまで自動回復させますか。**
+   推奨: 保存失敗なら以前の構成を残し、編集画面が開いている間は未保存の編集を残して通知する。
+   利用者が保存し直すかキャンセルする。保存後の読み直しだけ失敗したら保存済み構成を残し、
+   再読込/再起動を案内する。自動の繰り返し保存や終了後の未保存編集の復元は作らない。
+   Remoteへの切替や窓を閉じた後は未保存編集を残さない (9の選択)。
+   構成を読めない場合はデータを消さず書込を止め、通知する。
+   明示的に「今回は構成を使わず開く」を選んだ時だけ、その窓のその本を通常の並びで開く。
+   他の窓/本には適用せず、次回は再度確認する。元データは保持し、ずらし・構成編集は止める。
+   読めない構成を勝手に作り直して利用者の指定を失わないため推奨する。
+   代案: 未保存編集の自動退避や複数世代からの自動回復を追加する。設計・検証の範囲が増える。
+
+8. **白紙と組んだ実ページには、どちらのトリム設定を使いますか。**
+   推奨: 構成による見開き表示では、画面上で実ページがある左/右の設定を使う。
+   単ページ表示では単ページ用の設定を使う。ページごとの指定がある場合も、従来の優先順位でその側を使う。
+   表示される側と設定が一致するため推奨する。構成を使っていない本の単独ページの挙動は変更しない。
+   代案: 白紙と組んだページも常に単ページ用の設定を使う。左右別の余白指定はそこで効かなくなる。
+
+9. **PCで構成を編集中にRemoteから操作を始めたら、どちらを優先しますか。**
+   推奨: 今までどおり後から始めたRemoteを優先し、PCの閲覧窓と編集画面を閉じる。
+   未保存の変更は破棄してPCへ通知する。「保存」を既に押して送信した処理は一度完了させ、
+   成功ならその構成、失敗なら以前の構成をRemoteへ渡して結果を通知する。未保存編集を自動復元しない。
+   取得途中にPCで編集を開こうとしても開かない。既存の操作切替を維持し、編集中の二重操作をなくすため推奨する。
+   代案: 編集が終わるまでRemoteの取得を断る。未保存編集は守れるが、今までの「後からの操作が優先」を変える。
+
+10. **画像本フォルダをアプリの外で移動したりドライブ文字を変えた時、構成をどう引き継ぎますか。**
+    推奨: 勝手には引き継がず、移動前に書き出したメタ情報を新しい場所へ読み込む。
+    古い構成は残す。書き出していなければ旧場所へ戻して書き出す手順が必要になる。
+    PDF/書庫は既存の内容一致による復元を使えるが、画像フォルダは今の仕組みでは識別できない。
+    同名の別の本へ誤適用せず、フォルダ専用の自動識別を増やさないため推奨する。
+    アプリ内の対応する名前変更/移動では構成も引き継ぐ。
+    代案: 「旧場所の構成を選んで引き継ぐ」画面を追加する。移動後でも選べるが、別の本を選ばない確認と追加実装が必要。
+
+11. **Remoteでも、構成がある本の方向/表紙切替を残しますか。**
+    推奨: 残す。2と同じ変更を保存し、右/左開きは左右を入れ替え、表紙切替はそのページの組だけを解く。
+    指定済みの他の組をずらさず、表紙なしへ戻しても自動で組に戻さない。
+    順番や任意の組の編集はPCの編集画面で行う。既存のRemote操作を失わず、PCと同じ結果になるため推奨する。
+    代案: 構成がある本ではRemoteの方向/表紙変更を制限し、PCで変更する案内を出す。
+    これは今使える切替が使えなくなる変更なので承認が必要。2で編集画面を使う案を選んだ場合も、Remote側は別途この判断が必要。
+
+12. **画像フォルダの「本として扱う」をOFFにしたら、保存構成も一時的に使わなくしますか。**
+    推奨: 実際に通常フォルダ扱いになった時は通常の並び・自動の見開きへ戻す。
+    構成は消さず、非表示ページは開けないまま。本扱いを戻したら保存構成で読む。
+    OFFの意味と詳細一覧の並べ替えが揃うため推奨する。明示的な本置き場の本まで、この自動設定だけで通常フォルダにはしない。
+    代案: 保存構成がある限り本扱いを維持する。指定順は残るが、OFFや詳細sortがその本には効かなくなる。
+
+13. **本のページと動画が同じ一覧に混ざったら、どのように読みますか。**
+    推奨: その混在一覧の通常順・自動の見開きで直接読み、動画にも従来どおり進める。
+    保存した構成は消さず、非表示ページは開けないまま。動画がなくなり本の一覧へ戻れば保存構成を使う。
+    子フォルダの行だけがある場合はページ部分へ構成を適用でき、動画の混在とは区別する。
+    通常の混在閲覧を維持し、動画を送りから落とさないため推奨する。
+    代案: 混在一覧でも構成を使う。画像の指定組と動画の位置を一緒に扱う追加設計が必要。
+
+14. **検索などの結果に構成を持つ本のページが混ざる場合、「1ページずらし」を止めてよいですか。**
+    推奨: 送り対象にそのページが一枚でもあれば、その結果一覧全体のずらしを止める。
+    構成のない本だけの結果なら従来どおり使える。構成なしのページも一緒にずらせなくなるが、
+    構成本にはずらしを使わない方針を一貫して守れるため推奨する。
+    代案: 構成なしの本の部分だけずらせるようにする。混在一覧を部分ごとに組む追加設計が必要。
+
+15. **「構成なし」の本のメタ情報を読み込んだ時、読み込み先の構成を解除しますか。**
+    推奨: 新形式で構成を転送対象に含めた場合だけ、確認画面に「構成を解除」と表示し、
+    その置換を承認した時に解除する。転送した範囲外の階層は残す。
+    古い形式や構成を転送対象から外した場合は保持する。書き出し元と同じ状態にでき、解除も見て選べるため推奨する。
+    代案: 「構成なし」を読み込んでも常に既存構成を保持する。安全だが同じ状態に揃えるには別途解除が必要。
+
+16. **検索・★固定・コレクションの結果では、その結果の順で直接読み続けますか。**
+    推奨: 今までの結果順・自動の見開きで直接読む。離れた位置の指定相方を呼び寄せない。
+    非表示ページの記録は結果に残し、「本の構成で非表示」と示して画像内容は出さず、開こうとすると通知する。
+    送りではそのページを飛ばす。保存した順・組で読みたい時は任意で本を開く。
+    直接閲覧と動画を含む結果順を維持できるため推奨する。
+    代案: 結果をクリックしたら必ず本を開き直す。構成で読めるが、今までの結果内閲覧と送り順を変えるので承認が必要。
