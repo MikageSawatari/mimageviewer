@@ -1455,6 +1455,94 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+2026-10-10 §1.342 最大倍率・保持軸モデル: 利用者承認の共通capを既存fit descriptorへ
+snapshotとして接続し、ui_fullscreenの単ページ／見開き／連結・capture／navigator consumerが
+同じpolicyを使う。共通cap編集はfavorite専用値を作らず、live編集はメモリだけを変える。
+各軸enabledと保持valueを同じ型へ集約し、OFFの値破棄をstate ownerで解消する構造修正である。
+capだけの変更で連結参照unitを替えず、元寸法・trim再解決ownerと退去時保持は維持する。
+viewport述語・HWND同定・placement・focus・context移送・workerを変更しない。
+popup背景RGBA(30,30,30,240)と前回のscrollbar予約を保持する。今回の独立レビュー合格は未記録。
+
+2026-10-10 §1.342 HUD fit popupのscrollbar予約: 利用者の実機指摘とCLAUDE.mdの
+floating scrollbar規則に従い、`ui_fullscreen.rs` の共通popup ScrollArea ownerで
+全行・本文・数値／単位widgetが使うcontent幅へバーのgutterを予約する。
+単独labelの症状paddingではなく、描画／hit／touch領域を同じlayoutへ戻す構造修正である。
+背景は指定サイズ追加前と同じalpha240を維持する。viewport述語・context identity・
+placement / HWND / focus・IME / 設定保存・worker寿命は変更しない。
+新しいstate・待機・repaint・再生成を加えず、実描画の非交差・到達性・opacityを検証する。
+今回の変更の独立レビュー合格を表す記録ではなく、利用者指示の実変更範囲として記す。
+
+**2026-10-09 §1.342 指定サイズfit・canonical枠とcontext-local需要の接続**
+
+利用者の実装指示と独立設計レビュー・構造判定への合意を受領し、
+`ebc6ce987` の [指定サイズfit設計](fullscreen-specified-scale-plan.md) に従って接続する。
+fitを所有する共通geometryへ、指定値snapshotとcanonical aspect / AI前原寸を持つ
+`FullscreenFitInput` を渡し、live / frozen / holdover / capture / replayが同じ入力を保持する。
+`layout_full_image_rect` はcanonical fit枠を保持し、丸めのあるAI / PDF rasterのcontainは
+sampling側へ閉じる。原寸来歴は既存source metadataへ対応付け、raster結果から逆算しない。
+
+実際の変更範囲は共有fit resolver / transform、`ui_fullscreen.rs` の単ページ・見開き・Z・
+navigator・連結unitとcapture / frozen consumer、既存AI / composite metadataへの原寸対応、
+PDF load / rerender completionの検証済みpage metadata採用とretained source key、
+`app.rs` のsource別絶対PDF需要と既存比較fieldの `PdfRerenderDemand` への型置換、
+連結基準の `ContinuousSpecifiedFitReference`、既存 `ViewerContextBundle` のmount / deposit /
+swapとsnapshot / index remapへの同じ値の移送、共通設定 / favorite overlayの継承投影である。
+環境設定・live picker・flow既定方式の明示的な共通方式変更は既存registryのmounted / parked / retiring ownerに保持した
+連結基準だけを終端する。非アクティブ窓をmountして更新せず、zoom / scroll / workerを変更しない。
+同じ入口を単一contextの非Windows面でも使用し、監査toolのA4へこの公開APIのexact fingerprintを登録する。
+凍結consumerは現在のSettingsを後読みせず、live siblingの需要やworkerへ書き込まない。
+favoriteの欠落継承をcapture時の変更差として保存せず、明示live編集だけが専用指定値を作る。
+
+判断理由は、画像のfit基準と需要を所有する既存境界へ値を接続し、AI / PDF出力をfit入力へ
+戻す依存をなくす構造変更であること。detached固有の症状guard、時間窓、待機、repaint、
+第二のmetadata / 保存 / worker ownerは追加しない。contextとworkerの既存取消・generationを保ち、
+別contextのread-only mount / replayでsiblingをreset・cancelしない。
+viewport predicates、host identity / HWND取得、viewport生成 / recreate、placement / focus /
+native window lifecycleは変更しない。既存4方式、単ページ / 見開きZの違い、回転＋trimの
+現行経路別例外は維持するため、§2の症状パッチには当たらないとの構造合意に従う。
+
+本項は実際に触れた所有境界の記録であり、独立実装レビューの合格記録ではない。
+自動gateの結果と未実施の独立実装レビュー・実機確認は [計画§15](fullscreen-specified-scale-plan.md#15-実装接続と検証結果2026-10-09) へ集約する。
+
+2026-10-09 独立実装レビューP2 follow-up: 実変更は `ui_fullscreen.rs` の同一連結参照unitの
+確定geometry保持と配置consumer、実退去 / live preference入力回帰、および `app.rs` の
+指定値live setterからwidget単位の同期保存を外す境界である。共通設定の永続化は既存の
+環境設定確定・トレイ退避・終了へ戻し、favorite保存ownerは変えない。viewport predicates、
+context identity / mount / deposit / swap、placement / HWND / focus、worker寿命は変更しない。
+texture寿命から独立したfit ownerと既存保存ownerを使う構造修正であり、新しい状態flag・
+保存worker・別窓guardを追加しない。実退去で参照geometryと配置を検証し、実widget入力で
+保存頻度を検証する。利用者指示・レビューの構造判定への合意に従い、§2の症状パッチを避ける。
+修正後gate結果は `target/E-1342-fix-msg.txt` へ記録し、再レビュー合格とは区別する。
+
+2026-10-10 §1.342 再レビューP2 follow-up: `ui_fullscreen.rs` の参照basisを、保持する非回転・
+AI前元寸法と、そのlayoutで現在のtrim / rotationを解いたgeometryの一組へ置換した。
+通常cache退去は入力寸法を失効させず、明示trim変更は共有layout ownerで再解決する。
+同じ解決結果をfitと配置が使用し、純粋index remapは元寸法を保持してoccurrenceを更新する。
+現在のbboxを固定する症状guardや、trim時の参照一括reset・新しいbool / pending / workerは追加しない。
+変更範囲は参照型、共有unit geometry入口、fit / 配置consumer、remapとそれらの実退去回帰である。
+viewport predicates、context identity / mount / deposit / swap、placement / HWND / focusとworker寿命、
+共通設定・favorite保存境界は変更しない。利用者指示・再レビューの構造判定に従う修正として記録し、
+独立再レビューの合格とは区別する。確認用runtimeは実機確認中のため書き換えない。
+
+同じsource recordには、既存detectorが受理したraw Auto bboxも画素由来の入力として保持する。
+画素退去でAuto入力まで失う退行を防ぎ、Manual bboxや左右調停・rotation後の結果を入力へ戻さない。
+新しい画素では既存load sequence／pixel pointerによる検出cache検証を使う。検出owner・cache・
+workerの寿命と破棄規則は変えず、参照geometry入口で現在のpolicyを適用する。
+同じ入口で既存のwindow identityと `detached_window_runtime_trim_bbox` を読み、画素がない場合も
+runtimeの受理済みAuto結果（trimなしを含む）を優先する。新しいpredicateやruntime保存経路は作らず、
+既存identity／検出ownerの定義と寿命を変えない。実退去した入力を持つ別contextのmount回帰で、
+別窓の現在値とmain参照・trim状態の不変を確認する。
+
+2026-10-10 §1.342 HUD popup意匠復元: 利用者の明示指示に従い、`ui_fullscreen.rs` の
+fit popup bodyを共通のcustom-painted行／rectへ戻し、指定サイズを同じ意匠で追加する。
+既存のviewport内clamp / ScrollAreaを保持し、数値・単位は既存widget / axis検証へ接続する。
+共通／favorite live handler、IME / 0キー、context identity、host / placement、画像fit geometry、
+worker・保存境界は変更しない。既存popup ownerの描画とhitを揃える構造修正であり、
+別窓症状guard・新state・待機・再生成を追加しない。実HUDの狭幅scroll / 入力とsnapshotを検証する。
+2026-10-10 popup再レビュー追加: 描画fixtureのIME主張を実viewport内の数値編集回帰へ置換する。
+IME input policy→App→`render_fullscreen_viewport`で全画面／popup継続を検証し、一時close漏れの
+mutationで検出力も確認する。製品述語・keyboard ownerは変更せず、説明文だけを利用者用語へ揃える。
+
 2026-10-09 §1.360: 利用者が独立設計再レビュー ACCEPT 済みの thumbnail-request-lifecycle-plan に従い、既存 ViewerContextBundle の requested・pending_finalize・CPU texture_backlog を一つの typed ThumbnailRequests owner に集約する。mount/unmount は画像と request ID を含む owner 全体を移動し、fork は in-flight を複製しない。park の画像破棄も同じ owner の画像側終端を通し、未終端 worker の保存完了を偽装しない。main の tray hide/restore は既存の対象範囲を維持し、兄弟 context の owner・channel・queue・世代・token に触れない。detached predicate・viewport・HWND・placement・park 発火条件・repaint scheduler は変更せず、表示状態から要求完了を推測していた所有境界を直す構造修正として §2 に適合する。設計担当の採用方針と独立 reviewer の合意は同 plan の §10 に記録されている。
 
 2026-10-09、§1.345 独立レビュー #1–#4 の修正では、閲覧中に延期した種類設定の再読込を
@@ -4341,3 +4429,37 @@ context epoch・優先度を継承し、元contextへ一度だけ画像とworker
 QAのcache-read witnessは相関済み画像の受理時に記録し、進捗は既存の通常要求projectionとkeep内画像から導出する。
 detached述語・viewport生成・placement・focus・registry protocolは変更しない。
 これは両側の既存ownerを保持する統合であり、新しい待機状態・retry・時間窓を追加しない。
+
+### 2026-10-10 §1.342 HUD fit popup の利用可能高・入力所有修正
+
+§2を読んだ上で、利用者指定の構造修正としてui_fullscreen.rsの共通HUD popup描画境界を変更する。
+現在viewportの余白・HUD位置から本文の親領域を明示確保し、内容が収まる場合は自然高へ縮める。
+背面panel描画前に既存fit / spread / slideshow / 投影方式 / 回転popup、静止画seek列menu、
+overflow panelのwheelを退避し、frame-localの配送先に対応する描画境界だけで戻す。
+overflowは描画・hitと同じ既存矩形内だけを所有し、外側の操作・非modal性を維持する。
+全前面描画後に残りを消費し、閉じるframeも同じ所有とする。ui_metadata_panel.rsは実ScrollAreaの
+offsetを観測するtest-onlyの接続、ui_fullscreen.rsは実overflow ScrollAreaの同様の接続を持つ。
+実HUDの開閉クリックと背面offset・閉じた後のwheel配送を検証する。
+vendor/egui/src/input_state/mod.rsはInputState ownerの未配送wheel平滑化分を破棄するAPIだけを追加し、
+前面targetが閉じた終了境界に接続する。新規wheel・touch入力、開いている間の平滑化は維持する。
+tests/ui_snapshot.rsは既存の共通GPU harness・fixtureで通常 / 狭窓 / 縦長のfit popupだけを検証する。
+新しいdetached predicate、host identity、placement / focus / recreate、context bundle状態は作らない。
+描画・入力の既存ownerで利用可能領域と配送順を揃えるため、症状guard・待機・repaintによる修正ではない。
+利用者の構造修正指示を根拠とし、本差分の独立レビュー合格を先取りしない。
+本追補（d138a9a51後）の変更はui_fullscreen.rsとvendor/egui/src/input_state/mod.rs、
+本§11とfullscreen-specified-scale-plan.md §23だけである。metadataの製品処理、tests/ui_snapshot.rs、
+snapshot PNGは変更せず、既存の実metadata観測とsnapshot harnessを再利用する。
+
+#### 2026-10-10 bd0104aa0後: キー終了・固定ナビゲータへの配送補完
+
+本追補はui_fullscreen.rsのframe-local前面wheel ownerを、キー処理とナビゲータ入力より前に確定する。
+キーでoverflowが閉じたframeも既存転送を維持しつつ、前面終了境界で入力と平滑化残りを消費する。
+固定ナビゲータの即時入力とsimilar preview予約入力は同じraw入力コピーを使い、前面所有wheelだけを除く。
+元のbegin-pass記録とpointer / focus / releaseを保持し、前面外と終了後の新規wheelは既存ownerへ戻す。
+ナビゲータ全体の無効化、新しいApp状態、detached述語・viewport生成・placement・context bundle変更はない。
+既存所有者への入力順序と射影を揃える構造修正で、症状guard・時間窓・待機による修正ではない。
+利用者の構造修正指示を根拠とし、本追補について独立レビュー合格を主張しない。
+実render_fullscreen_viewportでキー終了＋wheelと右上固定ナビゲータの実重なりを回帰検証する。
+変更範囲はsrc/ui_fullscreen.rs、本§11、fullscreen-specified-scale-plan.md §23、vendor/egui/PATCHES.md。
+vendorのAPI実装自体は変更せず、台帳へ破棄対象・呼出境界・更新時の保持差分を補う。
+snapshot PNG、runtime、metadata製品処理は変更しない。

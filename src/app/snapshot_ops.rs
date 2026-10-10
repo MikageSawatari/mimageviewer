@@ -265,7 +265,8 @@ impl App {
 
         self.slideshow_anchor_idx = self.slideshow_anchor_idx.and_then(&remap);
         self.spread_shift_anchor_idx = self.spread_shift_anchor_idx.and_then(&remap);
-        self.fs_zoom_pdf_rerender_idx = self.fs_zoom_pdf_rerender_idx.and_then(&remap);
+        self.fs_pdf_rerender_demand.remap_indices(&remap);
+        self.fs_continuous_fit_reference.remap_indices(&remap);
 
         self.finish_snapshot_platform_media_index_swap(&swap);
         self.clear_snapshot_index_space_derived_state();

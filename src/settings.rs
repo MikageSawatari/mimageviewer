@@ -3672,6 +3672,7 @@ pub enum FullscreenFitMode {
     Width,
     Height,
     Original,
+    SpecifiedScale,
 }
 
 impl FullscreenFitMode {
@@ -3682,11 +3683,18 @@ impl FullscreenFitMode {
             Self::Width => "横幅フィット",
             Self::Height => "縦幅フィット",
             Self::Original => "100%原寸",
+            Self::SpecifiedScale => "指定サイズ",
         }
     }
 
     pub fn all() -> &'static [Self] {
-        &[Self::Page, Self::Width, Self::Height, Self::Original]
+        &[
+            Self::Page,
+            Self::Width,
+            Self::Height,
+            Self::Original,
+            Self::SpecifiedScale,
+        ]
     }
 
     pub fn default_for_flow(flow: ReadingFlow) -> Self {
@@ -3721,6 +3729,7 @@ impl FullscreenFitMode {
             Self::Width => "Width",
             Self::Height => "Height",
             Self::Original => "Original",
+            Self::SpecifiedScale => "SpecifiedScale",
         }
     }
 
@@ -3744,6 +3753,108 @@ impl FullscreenFitMode {
             .iter()
             .position(|&mode| mode == current)
             .map_or(first, |pos| modes[(pos + 1) % modes.len()])
+    }
+}
+
+/// Independent width/height constraints, retaining the value while disabled.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FullscreenSpecifiedScale {
+    pub width: SpecifiedScaleAxisSetting,
+    pub height: SpecifiedScaleAxisSetting,
+}
+
+impl Default for FullscreenSpecifiedScale {
+    fn default() -> Self {
+        Self {
+            width: SpecifiedScaleAxisSetting::default(),
+            height: SpecifiedScaleAxisSetting::default(),
+        }
+    }
+}
+
+impl FullscreenSpecifiedScale {
+    pub fn is_valid(self) -> bool {
+        self.width.value.is_valid() && self.height.value.is_valid()
+    }
+
+    pub fn sanitize(&mut self) {
+        self.width.value = self.width.value.sanitized();
+        self.height.value = self.height.value.sanitized();
+    }
+}
+
+/// The checkbox controls application, while the value and its unit remain stored.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpecifiedScaleAxisSetting {
+    pub enabled: bool,
+    pub value: SpecifiedScaleAxis,
+}
+
+impl SpecifiedScaleAxisSetting {
+    pub const fn enabled(value: SpecifiedScaleAxis) -> Self {
+        Self {
+            enabled: true,
+            value,
+        }
+    }
+
+    pub const fn disabled(value: SpecifiedScaleAxis) -> Self {
+        Self {
+            enabled: false,
+            value,
+        }
+    }
+
+    pub fn active(self) -> Option<SpecifiedScaleAxis> {
+        self.enabled.then_some(self.value)
+    }
+}
+
+impl Default for SpecifiedScaleAxisSetting {
+    fn default() -> Self {
+        Self::enabled(SpecifiedScaleAxis::PercentTenths(800))
+    }
+}
+
+/// Percentages use integer tenths; pixels are display lengths in logical points.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpecifiedScaleAxis {
+    PercentTenths(u32),
+    LogicalPixels(u32),
+}
+
+impl SpecifiedScaleAxis {
+    pub const PERCENT_TENTHS_MIN: u32 = 1;
+    pub const PERCENT_TENTHS_MAX: u32 = 10_000;
+    pub const LOGICAL_PIXELS_MIN: u32 = 1;
+    pub const LOGICAL_PIXELS_MAX: u32 = 32_768;
+
+    pub fn is_valid(self) -> bool {
+        self == self.sanitized()
+    }
+
+    pub fn sanitized(self) -> Self {
+        match self {
+            Self::PercentTenths(value) => {
+                Self::PercentTenths(value.clamp(Self::PERCENT_TENTHS_MIN, Self::PERCENT_TENTHS_MAX))
+            }
+            Self::LogicalPixels(value) => {
+                Self::LogicalPixels(value.clamp(Self::LOGICAL_PIXELS_MIN, Self::LOGICAL_PIXELS_MAX))
+            }
+        }
+    }
+
+    /// Unit changes retain the displayed number, then round/clamp for the new unit.
+    pub fn with_pixel_unit(self, pixels: bool) -> Self {
+        let number = match self {
+            Self::PercentTenths(value) => value as f64 / 10.0,
+            Self::LogicalPixels(value) => value as f64,
+        };
+        if pixels {
+            Self::LogicalPixels(number.round() as u32).sanitized()
+        } else {
+            Self::PercentTenths((number * 10.0).round() as u32).sanitized()
+        }
     }
 }
 
@@ -4196,6 +4307,10 @@ pub struct FavoriteViewState {
     pub sort_order: SortOrder,
     pub default_spread_mode: SpreadMode,
     pub default_reading_flow: ReadingFlow,
+    /// Missing legacy wire value inherits the current common setting. Explicit
+    /// both-axis disabled is represented by Some(FullscreenSpecifiedScale { .. }).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fullscreen_specified_scale: Option<FullscreenSpecifiedScale>,
 }
 
 impl FavoriteViewState {
@@ -4209,6 +4324,7 @@ impl FavoriteViewState {
             sort_order: settings.sort_order,
             default_spread_mode: settings.default_spread_mode,
             default_reading_flow: settings.default_reading_flow,
+            fullscreen_specified_scale: Some(settings.fullscreen_specified_scale),
         }
     }
 
@@ -4221,6 +4337,10 @@ impl FavoriteViewState {
         settings.sort_order = self.sort_order;
         settings.default_spread_mode = self.default_spread_mode;
         settings.default_reading_flow = self.default_reading_flow;
+        settings.fullscreen_specified_scale = self
+            .fullscreen_specified_scale
+            .unwrap_or_else(|| settings.common_fullscreen_specified_scale());
+        settings.fullscreen_specified_scale.sanitize();
     }
 }
 
@@ -5047,6 +5167,12 @@ pub struct Settings {
     /// フルスクリーンの倍率/フィット基準。
     #[serde(default)]
     pub fullscreen_fit_mode: FullscreenFitMode,
+    /// Per-axis display constraints, initially an enabled 80% by 80% frame.
+    #[serde(default)]
+    pub fullscreen_specified_scale: FullscreenSpecifiedScale,
+    /// Common specified-size zoom cap in tenths (10..=200 means 1.0..=20.0x).
+    #[serde(default = "default_fullscreen_specified_scale_max_tenths")]
+    pub fullscreen_specified_scale_max_tenths: u32,
     /// Excluded stable fit-mode IDs; empty means all modes, including future additions.
     /// Unknown IDs are retained so an explicitly excluded future mode stays excluded.
     #[serde(default)]
@@ -6973,6 +7099,9 @@ pub const FULLSCREEN_JUMP_PERCENT_MIN: u32 = 1;
 pub const FULLSCREEN_JUMP_PERCENT_MAX: u32 = 100;
 pub const FULLSCREEN_JUMP_PERCENT_DEFAULT: u32 = 10;
 pub const FULLSCREEN_FIXED_BAR_GAP_MAX_PX: u32 = 100;
+pub const FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS: u32 = 50;
+pub const FULLSCREEN_SPECIFIED_SCALE_MAX_MIN_TENTHS: u32 = 10;
+pub const FULLSCREEN_SPECIFIED_SCALE_MAX_MAX_TENTHS: u32 = 200;
 pub const FULLSCREEN_FIXED_JUMP_MIN: usize = 1;
 pub const FULLSCREEN_FIXED_JUMP_MAX: usize = 100;
 pub const FULLSCREEN_FIXED_JUMP_DEFAULT: usize = 10;
@@ -7091,6 +7220,9 @@ fn default_fullscreen_cursor_hide_delay_secs() -> f32 {
 
 fn default_fullscreen_navigator_size() -> f32 {
     FULLSCREEN_NAVIGATOR_SIZE_DEFAULT
+}
+fn default_fullscreen_specified_scale_max_tenths() -> u32 {
+    FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS
 }
 fn default_fullscreen_image_margin_color() -> [u8; 3] {
     FULLSCREEN_IMAGE_MARGIN_COLOR_DEFAULT
@@ -7552,6 +7684,8 @@ impl Default for Settings {
             continuous_reading_gap_px: default_continuous_reading_gap_px(),
             fullscreen_image_margin_color: FULLSCREEN_IMAGE_MARGIN_COLOR_DEFAULT,
             fullscreen_fit_mode: FullscreenFitMode::default(),
+            fullscreen_specified_scale: FullscreenSpecifiedScale::default(),
+            fullscreen_specified_scale_max_tenths: default_fullscreen_specified_scale_max_tenths(),
             fullscreen_fit_cycle_excluded: Vec::new(),
             fullscreen_fit_no_upscale: false,
             fullscreen_fit_no_downscale: false,
@@ -8673,6 +8807,24 @@ impl Settings {
         };
         overlay.common = standard;
         active.apply_to_settings(self);
+    }
+
+    pub(crate) fn common_fullscreen_specified_scale(&self) -> FullscreenSpecifiedScale {
+        self.favorite_view_overlay
+            .as_ref()
+            .and_then(|overlay| overlay.common.fullscreen_specified_scale)
+            .unwrap_or(self.fullscreen_specified_scale)
+    }
+
+    pub(crate) fn set_common_fullscreen_specified_scale(
+        &mut self,
+        value: FullscreenSpecifiedScale,
+    ) {
+        if let Some(overlay) = self.favorite_view_overlay.as_mut() {
+            overlay.common.fullscreen_specified_scale = Some(value);
+        } else {
+            self.fullscreen_specified_scale = value;
+        }
     }
 
     pub(crate) fn active_favorite_view_id(&self) -> Option<Uuid> {
@@ -9813,6 +9965,12 @@ impl Settings {
         };
         self.slideshow_continuous_scroll_percent =
             self.slideshow_continuous_scroll_percent.clamp(1, 100);
+        self.fullscreen_specified_scale.sanitize();
+        self.fullscreen_specified_scale_max_tenths =
+            self.fullscreen_specified_scale_max_tenths.clamp(
+                FULLSCREEN_SPECIFIED_SCALE_MAX_MIN_TENTHS,
+                FULLSCREEN_SPECIFIED_SCALE_MAX_MAX_TENTHS,
+            );
         self.spread_page_gap_px = self.spread_page_gap_px.min(200);
         self.continuous_reading_gap_px = self.continuous_reading_gap_px.min(200);
         self.fullscreen_fixed_bar_gap_px = self
@@ -14567,6 +14725,7 @@ mod tests {
             FullscreenFitMode::Page,
             FullscreenFitMode::Width,
             FullscreenFitMode::Height,
+            FullscreenFitMode::SpecifiedScale,
         ] {
             assert!(settings.set_fullscreen_fit_cycle_enabled(mode, false));
         }
@@ -14581,6 +14740,7 @@ mod tests {
 
         settings.fullscreen_fit_cycle_excluded = vec![
             "FutureScale".into(),
+            "SpecifiedScale".into(),
             "Original".into(),
             "Page".into(),
             "Width".into(),
@@ -14607,6 +14767,181 @@ mod tests {
         assert_eq!(
             FullscreenFitMode::Page.next_for_flow(ReadingFlow::Paged, &future_only),
             FullscreenFitMode::Width
+        );
+    }
+
+    #[test]
+    fn specified_scale_defaults_units_limits_and_missing_favorite_compatibility() {
+        let defaults: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            defaults.fullscreen_specified_scale,
+            FullscreenSpecifiedScale::default()
+        );
+        assert_eq!(defaults.fullscreen_fit_mode, FullscreenFitMode::Page);
+        let mut constraints = FullscreenSpecifiedScale {
+            width: SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::PercentTenths(0)),
+            height: SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::LogicalPixels(u32::MAX)),
+        };
+        assert!(!constraints.is_valid());
+        constraints.sanitize();
+        assert_eq!(
+            constraints.width,
+            SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::PercentTenths(1))
+        );
+        assert_eq!(
+            constraints.height,
+            SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::LogicalPixels(32768))
+        );
+        assert!(constraints.is_valid());
+        assert_eq!(
+            SpecifiedScaleAxis::PercentTenths(805).with_pixel_unit(true),
+            SpecifiedScaleAxis::LogicalPixels(81)
+        );
+        assert_eq!(
+            SpecifiedScaleAxis::PercentTenths(1).with_pixel_unit(true),
+            SpecifiedScaleAxis::LogicalPixels(1)
+        );
+        assert_eq!(
+            SpecifiedScaleAxis::LogicalPixels(32768).with_pixel_unit(false),
+            SpecifiedScaleAxis::PercentTenths(10000)
+        );
+        let explicit_none = FullscreenSpecifiedScale {
+            width: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(725)),
+            height: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::LogicalPixels(900)),
+        };
+        assert!(explicit_none.is_valid());
+        let mut legacy = serde_json::to_value(FavoriteViewState::from_settings(&defaults)).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("fullscreen_specified_scale");
+        let inherited: FavoriteViewState = serde_json::from_value(legacy).unwrap();
+        assert!(inherited.fullscreen_specified_scale.is_none());
+        let mut settings = Settings::default();
+        settings.fullscreen_specified_scale = constraints;
+        settings.apply_favorite_view_overlay(Uuid::new_v4(), &inherited);
+        assert_eq!(settings.fullscreen_specified_scale, constraints);
+        assert_eq!(
+            settings.preferences_snapshot().fullscreen_specified_scale,
+            constraints
+        );
+        assert!(
+            serde_json::to_value(&inherited)
+                .unwrap()
+                .get("fullscreen_specified_scale")
+                .is_none()
+        );
+        let mut explicit = inherited.clone();
+        explicit.fullscreen_specified_scale = Some(explicit_none);
+        settings.apply_favorite_view_overlay(Uuid::new_v4(), &explicit);
+        assert_eq!(settings.fullscreen_specified_scale, explicit_none);
+        assert_eq!(settings.common_fullscreen_specified_scale(), constraints);
+        let roundtrip: FavoriteViewState =
+            serde_json::from_str(&serde_json::to_string(&explicit).unwrap()).unwrap();
+        assert_eq!(roundtrip, explicit);
+        settings.clear_favorite_view_overlay();
+        assert_eq!(settings.fullscreen_specified_scale, constraints);
+    }
+
+    #[test]
+    fn specified_scale_disabled_values_survive_toggle_json_and_sanitization() {
+        for value in [
+            SpecifiedScaleAxis::PercentTenths(725),
+            SpecifiedScaleAxis::LogicalPixels(900),
+        ] {
+            let mut axis = SpecifiedScaleAxisSetting::enabled(value);
+            assert_eq!(axis.active(), Some(value));
+            axis.enabled = false;
+            assert_eq!(axis.active(), None);
+            assert_eq!(axis.value, value);
+            let json = serde_json::to_string(&axis).unwrap();
+            let mut restored: SpecifiedScaleAxisSetting = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored, axis);
+            restored.enabled = true;
+            assert_eq!(restored.active(), Some(value));
+        }
+        let mut invalid = FullscreenSpecifiedScale {
+            width: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(0)),
+            height: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::LogicalPixels(
+                u32::MAX,
+            )),
+        };
+        assert!(!invalid.is_valid());
+        invalid.sanitize();
+        assert!(invalid.is_valid());
+        assert!(!invalid.width.enabled);
+        assert!(!invalid.height.enabled);
+        assert_eq!(invalid.width.value, SpecifiedScaleAxis::PercentTenths(1));
+        assert_eq!(
+            invalid.height.value,
+            SpecifiedScaleAxis::LogicalPixels(32768)
+        );
+    }
+
+    #[test]
+    fn specified_scale_max_defaults_clamps_and_stays_common_across_favorite_capture_apply() {
+        let mut settings: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.fullscreen_specified_scale_max_tenths, 50);
+        for (raw, expected) in [(0, 10), (10, 10), (125, 125), (200, 200), (u32::MAX, 200)] {
+            settings.fullscreen_specified_scale_max_tenths = raw;
+            settings.sanitize();
+            assert_eq!(settings.fullscreen_specified_scale_max_tenths, expected);
+        }
+        settings.fullscreen_specified_scale = FullscreenSpecifiedScale {
+            width: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(725)),
+            height: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::LogicalPixels(900)),
+        };
+        let favorite = FavoriteViewState::from_settings(&settings);
+        let wire = serde_json::to_value(&favorite).unwrap();
+        assert!(wire.get("fullscreen_specified_scale_max_tenths").is_none());
+        let favorite: FavoriteViewState = serde_json::from_value(wire).unwrap();
+        settings.fullscreen_specified_scale_max_tenths = 125;
+        settings.apply_favorite_view_overlay(Uuid::new_v4(), &favorite);
+        assert_eq!(settings.fullscreen_specified_scale_max_tenths, 125);
+        settings.clear_favorite_view_overlay();
+        assert_eq!(settings.fullscreen_specified_scale_max_tenths, 125);
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(restored.fullscreen_specified_scale_max_tenths, 125);
+        assert_eq!(
+            restored.fullscreen_specified_scale,
+            settings.fullscreen_specified_scale
+        );
+    }
+
+    #[test]
+    fn specified_scale_cycle_keeps_legacy_exclusions_and_unknown_ids() {
+        let mut settings = Settings::default();
+        settings.fullscreen_fit_cycle_excluded = vec![
+            "Page".into(),
+            "Width".into(),
+            "Height".into(),
+            "Original".into(),
+            "FutureScale".into(),
+        ];
+        settings.sanitize();
+        assert!(!FullscreenFitMode::Page.cycle_enabled(&settings.fullscreen_fit_cycle_excluded));
+        assert!(
+            FullscreenFitMode::SpecifiedScale
+                .cycle_enabled(&settings.fullscreen_fit_cycle_excluded)
+        );
+        assert_eq!(
+            FullscreenFitMode::Original.next_for_flow(ReadingFlow::Paged, &[]),
+            FullscreenFitMode::SpecifiedScale
+        );
+        assert_eq!(
+            FullscreenFitMode::SpecifiedScale.next_for_flow(ReadingFlow::Paged, &[]),
+            FullscreenFitMode::Page
+        );
+        assert_eq!(
+            FullscreenFitMode::Page
+                .next_for_flow(ReadingFlow::Paged, &settings.fullscreen_fit_cycle_excluded),
+            FullscreenFitMode::SpecifiedScale
+        );
+        assert!(
+            settings
+                .fullscreen_fit_cycle_excluded
+                .contains(&"FutureScale".to_owned())
         );
     }
 
@@ -14647,7 +14982,7 @@ mod tests {
         );
         for flow in [ReadingFlow::Vertical, ReadingFlow::Horizontal] {
             let modes = FullscreenFitMode::selectable_for_flow(flow);
-            assert_eq!(modes.len(), 4);
+            assert_eq!(modes.len(), 5);
             assert!(!modes.contains(&FullscreenFitMode::MarginFit));
             // メニュー一覧は [0] 循環の対象集合と一致する。
             for &m in modes {
@@ -17710,6 +18045,11 @@ mod tests {
             settings.sort_order = SortOrder::FileName;
             settings.default_spread_mode = SpreadMode::Single;
             settings.default_reading_flow = ReadingFlow::Paged;
+            settings.fullscreen_specified_scale = FullscreenSpecifiedScale {
+                width: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::LogicalPixels(700)),
+                height: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(500)),
+            };
+            settings.fullscreen_specified_scale_max_tenths = 125;
             let common = FavoriteViewState::from_settings(&settings);
 
             let mut favorite = common.clone();
@@ -17723,6 +18063,10 @@ mod tests {
             favorite.sort_order = SortOrder::DateDesc;
             favorite.default_spread_mode = SpreadMode::RtlCover;
             favorite.default_reading_flow = ReadingFlow::Vertical;
+            favorite.fullscreen_specified_scale = Some(FullscreenSpecifiedScale {
+                width: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(725)),
+                height: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::LogicalPixels(900)),
+            });
             settings.apply_favorite_view_overlay(Uuid::new_v4(), &favorite);
 
             // お気に入り内の連続操作後を模す。save 後も実行中の有効値は変えない。
@@ -17730,10 +18074,12 @@ mod tests {
             assert!(settings.save_checked());
             assert_eq!(settings.grid_cols, 9);
             assert_eq!(settings.grid_view_mode, GridViewMode::Details);
+            assert_eq!(settings.fullscreen_specified_scale.width.active(), None);
 
             reset_backup_state_for_test();
             let loaded = Settings::load();
             assert_eq!(FavoriteViewState::from_settings(&loaded), common);
+            assert_eq!(loaded.fullscreen_specified_scale_max_tenths, 125);
             assert!(loaded.remember_favorite_view_state);
             assert!(loaded.favorite_view_overlay.is_none());
         }

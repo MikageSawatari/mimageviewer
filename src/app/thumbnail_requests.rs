@@ -76,6 +76,17 @@ pub(crate) enum ThumbnailReceipt {
     Finalized { source_changed: bool },
     Terminal(ThumbMsgPayload),
 }
+/// Read-only diagnostics from the canonical request and its actual CPU image queue.
+#[cfg(any(test, feature = "test-script"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ThumbnailRequestProjection {
+    pub(crate) request_id: ThumbnailRequestId,
+    pub(crate) idx: usize,
+    pub(crate) items_gen: u64,
+    pub(crate) image_backlog_contains_request: bool,
+    /// The owner has not received this request's worker terminal yet.
+    pub(crate) worker_pending: bool,
+}
 impl ThumbnailRequests {
     pub(crate) fn begin(
         &mut self,
@@ -110,6 +121,62 @@ impl ThumbnailRequests {
             .get(&msg.idx)
             .and_then(Slot::request)
             .is_some_and(|r| r.id == msg.request_id && r.items_gen == msg.items_gen)
+    }
+    #[cfg(any(test, feature = "test-script"))]
+    pub(crate) fn diagnostic_projection(
+        &self,
+        idx: usize,
+        request_id: ThumbnailRequestId,
+        items_gen: u64,
+    ) -> Option<ThumbnailRequestProjection> {
+        let request = self
+            .entries
+            .get(&idx)
+            .and_then(Slot::request)
+            .filter(|request| request.id == request_id && request.items_gen == items_gen)?;
+        let image_backlog_contains_request = match &request.phase {
+            Phase::Queued { image, .. } => {
+                image.idx == idx
+                    && image.request_id == request_id
+                    && image.items_gen == items_gen
+                    && self.upload_order.contains(&(idx, request_id))
+            }
+            _ => false,
+        };
+        let worker_pending = matches!(
+            request.phase,
+            Phase::Awaiting
+                | Phase::Queued {
+                    terminal: ImageTerminal::SourceWaiting | ImageTerminal::SeedWaiting,
+                    ..
+                }
+                | Phase::Uploading {
+                    terminal: ImageTerminal::SourceWaiting | ImageTerminal::SeedWaiting,
+                }
+                | Phase::Settled {
+                    terminal: ImageTerminal::SourceWaiting | ImageTerminal::SeedWaiting,
+                }
+        );
+        Some(ThumbnailRequestProjection {
+            request_id,
+            idx,
+            items_gen,
+            image_backlog_contains_request,
+            worker_pending,
+        })
+    }
+    #[cfg(any(test, feature = "test-script"))]
+    pub(crate) fn diagnostic_requests(&self) -> Vec<ThumbnailRequestProjection> {
+        let mut requests: Vec<_> = self
+            .entries
+            .iter()
+            .filter_map(|(idx, slot)| {
+                let request = slot.request()?;
+                self.diagnostic_projection(*idx, request.id, request.items_gen)
+            })
+            .collect();
+        requests.sort_by_key(|request| request.idx);
+        requests
     }
     /// Admission includes judgement-waiting demand; activity projections only see Requests.
     pub(crate) fn contains_key(&self, idx: &usize) -> bool {
@@ -569,5 +636,127 @@ impl Extend<(usize, bool)> for ThumbnailRequests {
         for (idx, upgrade) in iter {
             self.insert(idx, upgrade);
         }
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_projection_tests {
+    use super::*;
+    use crate::thumb_loader::{ThumbLoadOrigin, ThumbPixels};
+
+    fn source(idx: usize, id: ThumbnailRequestId, items_gen: u64) -> ThumbMsg {
+        ThumbMsg {
+            idx,
+            request_id: id,
+            items_gen,
+            input_seq: 0,
+            payload: ThumbMsgPayload::SourcePixels(ThumbPixels {
+                image: egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+                origin: ThumbLoadOrigin::SourceGenerated {
+                    evaluated_display_px: 128,
+                },
+                from_edit_preview: false,
+                edit_preview_adjustment: None,
+                source_dims: Some((1, 1)),
+                layout_dims: None,
+            }),
+        }
+    }
+
+    fn finalized(idx: usize, id: ThumbnailRequestId, items_gen: u64) -> ThumbMsg {
+        ThumbMsg {
+            idx,
+            request_id: id,
+            items_gen,
+            input_seq: 0,
+            payload: ThumbMsgPayload::Finalized,
+        }
+    }
+
+    #[test]
+    fn same_request_finalized_projects_real_queued_image_before_receive() {
+        let mut owner = ThumbnailRequests::default();
+        let id = owner
+            .begin(4, 7, ThumbnailRequestKind::Normal, None)
+            .unwrap();
+        owner.receive(source(4, id, 7));
+        let before = owner.diagnostic_projection(4, id, 7).unwrap();
+        assert!(before.image_backlog_contains_request);
+        assert!(before.worker_pending);
+        owner.receive(finalized(4, id, 7));
+        let after = owner.diagnostic_projection(4, id, 7).unwrap();
+        assert!(after.image_backlog_contains_request);
+        assert!(!after.worker_pending);
+        assert_eq!(owner.diagnostic_requests(), vec![after]);
+        let image = owner.next_image().unwrap();
+        assert!(
+            !owner
+                .diagnostic_projection(4, id, 7)
+                .unwrap()
+                .image_backlog_contains_request
+        );
+        owner.settle_image(image.idx, image.request_id);
+        assert!(owner.diagnostic_projection(4, id, 7).is_none());
+    }
+
+    #[test]
+    fn other_request_or_generation_cannot_claim_queued_image() {
+        let mut owner = ThumbnailRequests::default();
+        let id = owner
+            .begin(4, 7, ThumbnailRequestKind::Normal, None)
+            .unwrap();
+        let other = owner
+            .begin(5, 7, ThumbnailRequestKind::Normal, None)
+            .unwrap();
+        owner.receive(source(4, id, 7));
+        assert!(owner.diagnostic_projection(4, other, 7).is_none());
+        assert!(owner.diagnostic_projection(4, id, 8).is_none());
+        assert!(
+            owner
+                .diagnostic_projection(4, ThumbnailRequestId::Standalone, 7)
+                .is_none()
+        );
+        assert!(
+            !owner
+                .diagnostic_projection(5, other, 7)
+                .unwrap()
+                .image_backlog_contains_request
+        );
+        assert!(matches!(
+            owner.receive(finalized(4, other, 7)),
+            ThumbnailReceipt::Ignored
+        ));
+        assert!(
+            owner
+                .diagnostic_projection(4, id, 7)
+                .unwrap()
+                .worker_pending
+        );
+    }
+
+    #[test]
+    fn finalized_without_queue_and_discarded_images_do_not_claim_membership() {
+        let mut owner = ThumbnailRequests::default();
+        let id = owner
+            .begin(4, 7, ThumbnailRequestKind::Normal, None)
+            .unwrap();
+        owner.receive(finalized(4, id, 7));
+        let projection = owner.diagnostic_projection(4, id, 7).unwrap();
+        assert!(!projection.image_backlog_contains_request);
+        assert!(!projection.worker_pending);
+        owner.receive(source(4, id, 7));
+        owner.discard_images();
+        assert!(owner.diagnostic_requests().is_empty());
+
+        let id = owner
+            .begin(4, 8, ThumbnailRequestKind::Normal, None)
+            .unwrap();
+        owner.receive(source(4, id, 8));
+        owner.discard_images();
+        let projection = owner.diagnostic_projection(4, id, 8).unwrap();
+        assert!(!projection.image_backlog_contains_request);
+        assert!(projection.worker_pending);
+        owner.receive(finalized(4, id, 8));
+        assert!(owner.diagnostic_requests().is_empty());
     }
 }

@@ -1318,7 +1318,7 @@ PNG エンコードとファイル I/O は `pipeline-debug-export` worker で行
 1. 上記の優先順位で解決済みのページテクスチャと source / texture size
 2. 表示トリムの実効 content bbox
 3. 回転 (rotation_db, 0/90/180/270) と一時的なフリー回転
-4. viewport 固有の `pixels_per_point`、フィットモード、自動フィット倍率制限
+4. viewport 固有の `pixels_per_point`、型付き fit descriptor、自動フィット倍率制限
 5. Zoom / Pan、または Z ズームの確定済み placement
 6. 物理ピクセル境界へ整列済みの paint rect / hit rect / UV / source↔screen 写像 / total scale
 ```
@@ -1715,6 +1715,10 @@ fit 解像度のまま (画像見開きは問題なし。PDF 見開きズーム�
 `zip_spread_zoom_pan` の倍率・パン解決は 1 回だけ行う。`Original` 以外は従来の高さ合わせ
 composite をそのまま使う。
 
+指定サイズfitの PDF は通常 / 手動zoom / 単ページZ / 見開きZの解決済みページごとの
+full-page fit 枠から絶対需要を作る。上記の旧 `(idx, zoom)` 要求と PDF 見開きZの再レンダ制限は
+既存 4 方式の契約として維持する。新方式の一方向依存と要求比較は下の指定サイズfit節を参照。
+
 `settings.fullscreen_fit_mode` は <kbd>0</kbd> と割り当てたリング／ジェスチャ／マウスボタン／
 パッドリングで、同じ `cycle_fullscreen_fit_mode` を経由して循環する。
 `FullscreenFitMode::next_for_flow` は `fullscreen_fit_cycle_excluded` を除外して通常順に進む。
@@ -1723,7 +1727,7 @@ composite をそのまま使う。
 青でハイライトする (見開きボタンのポップアップと同型)。メニュー項目選択は
 `set_fullscreen_fit_mode_for_current` を直接呼び、<kbd>0</kbd> 循環 (`cycle_fullscreen_fit_mode`)
 とは別系統。メニュー候補は `FullscreenFitMode::selectable_for_flow` が返す
-(余白カットフィットを除く4モード)。ページ単位へ切り替えたときはページ全体、
+(余白カットフィットを除く5モード、Page → Width → Height → Original → SpecifiedScale)。ページ単位へ切り替えたときはページ全体、
 縦連結へ切り替えたときは横幅フィット、横連結へ切り替えたときは縦幅フィットに戻す。連結モード中は
 保存値が旧余白カットフィットでもページ全体フィットとして扱う。
 
@@ -1733,7 +1737,7 @@ composite をそのまま使う。
 中ボタンドラッグ、ゲームパッド等の手動ズームは制限しない。`縮小しない` が ON の場合は
 ページ全体フィットでも 100% 表示で画面外へはみ出すことがあるため、`fullscreen_fit_allows_drag_pan`
 も true 扱いにしてパンできるようにする。
-100% 判定の基準サイズは、単ページ / 見開きでは「今実際に描くテクスチャ」のサイズであり、
+既存 4 方式の100% 判定の基準サイズは、単ページ / 見開きでは「今実際に描くテクスチャ」のサイズであり、
 AI アップスケール完了後は `final_composite_cache` の寸法で再レイアウトする。
 連結読みではスクロール中の配置ジャンプを避けるため、processed テクスチャが raw と同じ
 アスペクト比なら raw/source サイズをレイアウト基準として保つ。別の処理で processed 側の
@@ -2015,6 +2019,66 @@ delta に適用するため、ドラッグ途中の Ctrl 押下 / 解放でも�
 ショートカットを押した場合も、同じ文言に機能名を付けた no-op 表示で理由を知らせる。
 
 ---
+
+### 2.4.2 指定サイズfit（§1.342、実装・検証中）
+
+決定仕様と検証の正本は [fullscreen-specified-scale-plan.md](fullscreen-specified-scale-plan.md)。
+以下は接続する所有境界を記録する。実装差分の独立レビュー・自動gate・実機確認は完了扱いにしない。
+
+`SpecifiedScale` は既存4方式に続く第5方式。各軸は `SpecifiedScaleAxisSetting { enabled, value }` で、
+valueは `PercentTenths` / `LogicalPixels`。OFF中も数値・単位を保持し、再ONで同じ値へ戻す。
+初期値は両軸ON・幅80％・高さ80％。％は描画先の現在の media rect、pxは100％時のpoint相当へ解く。
+片軸ONはその軸だけ、両軸ONは内接、両軸OFFはPage相当のfit式になる。pointを `/ppp` しない。
+最大倍率は共通Settingsの `fullscreen_specified_scale_max_tenths`（既定50＝5.0倍、10〜200＝1.0〜20.0倍、
+0.1倍刻み）。既存no_up / no_downの後に新方式だけ `(max_tenths / 10.0) / ppp` 上限を適用する。
+両軸OFFのPage相当にも適用し、no_upの1倍上限が勝つ。no_downの1倍下限は維持する。
+手動zoomはその後に掛けるため共通上限を超えられる。最大倍率はfavorite専用値に含めない。
+単ページZはPage・制限なしを維持し、見開きZの照準は選択fitと実効gapを使う。
+
+`FullscreenFitInput` は旧方式と指定値・共通最大倍率snapshot＋`FullscreenFitBasis` を型で分ける。
+Aは取得済みcanonical aspect、OはAI前の物理原寸で、Aの長辺をOの画素長辺へ正規化する。
+AI前寸法は既存edit / final AI / compositeのsource metadataへ対応付け、派生textureやGPU clamp後の
+寸法から逆算しない。PDFは検証済みpage boxとcontent typeから、Vectorは長辺4096px、Rasterは
+`min(4096, native_long_edge)` の固定Oを解く。既存source座標用のraster寸法は別用途のまま残す。
+
+`layout_full_image_rect` はこのA/Oから得るfull-page fit枠。実textureの整数丸めで縦横比が微妙に
+違ってもこの枠を変更せず、`from_layout_rect` がsampling用の `full_image_rect` を枠内へcontainする。
+paint / hit / UV / source写像は実際のcontained textureを共有し、PDF需要・合成layout・captureの
+fit枠は安定したcanonical extentを使う。descriptorと枠はcapture時の値を保存し、frozen / holdover
+replayやnavigatorから現在の指定値・共通最大倍率や新しいraster寸法を後読みしない。
+捕捉済みの `SpecifiedScale.max_tenths` をgeometryの再解決にも使い、live設定変更を混ぜない。
+
+見開きは既存高さ合わせと仮想slotを維持し、2枚＋gap全体をfitする。幅指定が極小なら表示だけ
+`gap = min(saved_gap, max(0, specified_width - 1/ppp))` とし、保存gapを書き換えない。
+連結の `ContinuousSpecifiedFitReference` は選択 / 明示値変更時の中央unitを保持し、scrollで
+基準を替えない。共通最大倍率だけの編集でも基準unitを選び直さず、保持sourceから再解決した
+同じunitのgeometryへ現在の共通上限を適用する。同じunitの確定済みAI前・非回転の元寸法は
+元texture / 派生cache退去後も保持する。
+現在のtrim / rotationからgeometryを各layoutで再解決し、fitと参照unit自身の配置に同じ値を使う。
+解決済みbboxを退去時の値に固定しない。resize / DPIでは同じunitへ再計算し、手動zoomは保持する。可視枚数上限では
+既存の遠いunit描画除外を使い、新方式のfit / fs_zoomを変更しない。旧4方式のper-unit fitと
+可視上限時のauto zoomは維持する。
+
+PDFの依存はmetadata → 固定A/O → fit枠 → 絶対需要 → raster結果の一方向とする。
+初回 `StaticPdf` と再レンダcompletionは同じcontext / source / generation検証の後でmetadataを採用し、
+既存retained PDF keyと一緒にsnapshotを保持する。同一metadataの再採用でOを更新しない。
+`PdfRerenderDemand` のLegacyは旧idx / zoom閾値、Absoluteはsource identity付き各ページのtargetを
+比較する。同じ需要で再送・in-flight cancelを増やさず、通常 / partner / manual / Zは新方式では
+この一つの絶対需要へ集約する。headroom・最小 / 最大・native capは既存helperで一度だけ適用する。
+凍結描画はlive siblingへ需要を送らない。
+
+回転＋trimの入力は今版も経路別例外を保つ。通常単ページは保存回転でもtrimを渡すが、見開き・
+連結unit・display-unit capture・暫定PDF bboxは回転ページのtrimを除く。分割優先と自由回転時の
+trim解除も維持し、全経路統一は別件§1.358へ残す。
+
+共通の指定値はSettings、favoriteの専用値は既存 `FavoriteViewState` / overlay / workerが所有する。
+favorite外側Optionの欠落は共通値継承、明示両軸OFFは保持値を含む専用指定である。
+共通・favorite、HUD・prefs、保存 / 再起動・転送は同じenabled＋valueを使う。未リリースの旧軸Option
+形式からのmigrationは作らない。最大倍率は共通設定として保存・転送し、live編集はメモリ更新だけで
+既存共通設定保存境界を使う。capture / idle reconcile / 離脱 / 終了は
+保存stateの欠落を保持し、継承解決だけで書込みを予約しない。専用値を作るのはlive popupの
+明示変更だけ。prefs / import / exportは共通値のrouteを使い、favorite専用行を上書きしない。
+新しいDB・worker・viewport生成・host lifecycleは設けない。
 
 ### 2.5 ページ送り中の表示規則 (実装の正本)
 

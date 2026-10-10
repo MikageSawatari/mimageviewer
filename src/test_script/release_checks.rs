@@ -12,6 +12,8 @@ use super::{
     RunnerBridge, TestScriptActionSelection, TestScriptWindowIdentity, UiCommand, rhai_error,
 };
 
+mod tray_witness;
+
 #[derive(Debug)]
 pub(crate) enum Operation {
     Observe,
@@ -53,6 +55,8 @@ pub(crate) struct Session {
     pub(crate) opens: Vec<Value>,
     pub(crate) preflight_opens: Vec<Value>,
     pub(crate) quit_after_finish: bool,
+    // Diagnostic history only; the canonical ThumbnailRequests owner is never mutated.
+    pub(crate) witnesses: Vec<Value>,
 }
 
 pub(crate) fn session() -> &'static Mutex<Option<Session>> {
@@ -98,6 +102,17 @@ pub(crate) fn trace(kind: &str, mut value: Value) {
             .map(|(k, v)| (k.as_str(), v.clone()))
             .collect();
         crate::perf::event("qa", kind, None, 0, &extras);
+        // Record after publishing: this conservative clock cannot place evidence
+        // earlier than its perf event. Setup polling reads memory, never the log.
+        if let Some(t) = crate::perf::program_start().map(|start| start.elapsed().as_secs_f64()) {
+            value["kind"] = json!(kind);
+            value["t"] = json!(t);
+            if let Ok(mut state) = session().lock()
+                && let Some(state) = state.as_mut()
+            {
+                state.witnesses.push(value);
+            }
+        }
     }
 }
 pub(crate) fn record_on_exit() {
@@ -578,17 +593,16 @@ pub(super) fn register(engine: &mut Engine, bridge: RunnerBridge) {
             if !matches!(mode.as_str(), "while-loading" | "after-loading") {
                 return Err(rhai_error("environment: invalid tray close mode"));
             }
-            require_tray_request_projection().map_err(|message| {
-                b.interrupt.fail(message.clone());
-                rhai_error(message)
-            })?;
             let deadline = Instant::now() + Duration::from_secs(20);
             let o = loop {
                 let o = request(&b, Operation::Observe).map_err(rhai_error)?;
-                if o.value["keep_count"].as_u64().unwrap_or(0) > 8
-                    && o.value["items_len"].as_u64().unwrap_or(0) > 0
-                {
+                if tray_witness::close_ready(&o.value, mode.as_str()) {
                     break o;
+                }
+                if mode.as_str() == "while-loading" && o.value["loading_complete"] == true {
+                    return Err(rhai_error(
+                        "environment: tray finished before loading close",
+                    ));
                 }
                 if Instant::now() >= deadline {
                     return Err(rhai_error(
@@ -599,14 +613,6 @@ pub(super) fn register(engine: &mut Engine, bridge: RunnerBridge) {
                     .wait(Duration::from_millis(10))
                     .map_err(rhai_error)?;
             };
-            let expected = mode.as_str() == "after-loading";
-            if o.value["loading_complete"] != expected
-                || (!expected && o.value["requested_count"].as_u64().unwrap_or(0) == 0)
-            {
-                return Err(rhai_error(
-                    "environment: tray close loading state not established",
-                ));
-            }
             let proof = cache_probe(&o).map_err(rhai_error)?;
             if o.value["cache_policy_off"] != true
                 || proof["targets"]
@@ -663,7 +669,9 @@ pub(super) fn register(engine: &mut Engine, bridge: RunnerBridge) {
     engine.register_fn("release_check_pause", move |dir: ImmutableString, seconds: rhai::INT| -> Result<(),Box<EvalAltResult>> {
         let directory=output_path(dir.as_str()).map_err(rhai_error)?;
         if !(30..=60).contains(&seconds) { return Err(rhai_error("environment: release idle pause must be 30..60 seconds")); }
-        let o=request(&b,Operation::Observe).map_err(rhai_error)?;
+        // Active preparation may wake ROOT to drain real worker messages. It
+        // ends BEFORE ready.json and the following no-command idle interval.
+        let o=wait_idle_ready(&b).map_err(rhai_error)?;
         let start=unix_ms();
         let target=o.value["targets"].as_array().and_then(|t|t.first()).map(|t|t["key"].clone()).unwrap_or(Value::Null);
         write_json(&directory.join("ready.json"),&json!({"pid":std::process::id(),"root_hwnd":o.value["root_hwnd"],"target_key":target,"sleep_start_unix_ms":start,"sleep_duration_seconds":seconds,"index_scan_wait":if o.value["index_settled"]==true {"settled"} else {"pending"}})).map_err(rhai_error)?;
@@ -749,10 +757,40 @@ pub(super) fn register(engine: &mut Engine, bridge: RunnerBridge) {
         }
     });
 }
-// Phase 3b will connect Line A's ThumbnailRequestId and read-only owner projection.
-// Until then, never run a tray measurement with an invented or missing witness.
-fn require_tray_request_projection() -> Result<(), String> {
-    Err("environment: tray request-owner projection awaits Line A merge and Phase 3b wiring".into())
+fn wait_idle_ready(bridge: &RunnerBridge) -> Result<Observation, String> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let observation = request(bridge, Operation::Observe)?;
+        let ready = {
+            let state = session().lock().unwrap();
+            let state = state.as_ref().ok_or("environment: release session lost")?;
+            match state.close_mode.as_deref() {
+                Some(mode) => crate::perf::program_start().is_some_and(|start| {
+                    observation.value["window_visible"] == false
+                        && tray_witness::established(
+                            &state.witnesses,
+                            mode,
+                            start.elapsed().as_secs_f64(),
+                        )
+                        .is_some()
+                }),
+                None => {
+                    observation.value["loading_complete"] == true
+                        && observation.value["index_settled"] == true
+                }
+            }
+        };
+        if ready {
+            return Ok(observation);
+        }
+        if Instant::now() >= deadline {
+            return Err(
+                "environment: canonical tray request witnesses not established before idle sleep"
+                    .into(),
+            );
+        }
+        bridge.interrupt.wait(Duration::from_millis(25))?;
+    }
 }
 
 fn protocol_ai_trace(proof: &Value) {
@@ -762,14 +800,6 @@ fn protocol_ai_trace(proof: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn tray_request_projection_is_unavailable_until_phase_3b() {
-        assert!(
-            require_tray_request_projection()
-                .unwrap_err()
-                .contains("Phase 3b")
-        );
-    }
     #[test]
     fn release_layout_refuses_real_data_and_other_binaries() {
         let root = Path::new(r"C:\repo\target\portable-smoke");

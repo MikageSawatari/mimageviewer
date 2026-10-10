@@ -104,6 +104,7 @@ pub mod dwm_iconic_thumbnail;
 pub mod dwm_transitions;
 mod empty_items_reason;
 pub mod file_type_visibility;
+mod fullscreen_specified_scale;
 mod gpu_anime4k;
 mod gpu_lanczos;
 pub mod metadata_transfer;
@@ -339,10 +340,10 @@ mod ui_fullscreen;
 pub mod ui_startup;
 #[doc(hidden)]
 pub use ui_fullscreen::{
-    draw_fs_page_wait_indicator_snapshot_fixture, draw_fs_prefetch_indicator_snapshot_fixture,
-    draw_music_locked_panel_snapshot_fixture, draw_music_panel_reach_snapshot_fixture,
-    draw_still_panel_reach_snapshot_fixture, draw_still_seek_strip_snapshot_fixture,
-    draw_still_touch_first_run_help_snapshot_fixture,
+    draw_fs_fit_popup_snapshot_fixture, draw_fs_page_wait_indicator_snapshot_fixture,
+    draw_fs_prefetch_indicator_snapshot_fixture, draw_music_locked_panel_snapshot_fixture,
+    draw_music_panel_reach_snapshot_fixture, draw_still_panel_reach_snapshot_fixture,
+    draw_still_seek_strip_snapshot_fixture, draw_still_touch_first_run_help_snapshot_fixture,
 };
 mod ui_details_icon;
 pub mod ui_helpers;
@@ -2277,6 +2278,10 @@ mod tests {
 }
 
 pub use ui_dialogs::preferences::draw_file_type_visibility_snapshot_fixture;
+pub use ui_dialogs::preferences::{
+    draw_fullscreen_fit_cycle_settings, draw_fullscreen_specified_scale_live_settings,
+    draw_fullscreen_specified_scale_settings,
+};
 pub use ui_main::draw_file_type_visibility_status_snapshot_fixture;
 
 pub(crate) mod archive_visibility;

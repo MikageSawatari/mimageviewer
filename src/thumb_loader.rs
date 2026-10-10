@@ -802,6 +802,118 @@ pub struct LoadRequest {
     pub raw_source: LoadRequestSource,
 }
 
+/// Derive the original listing identity before representative-source resolution.
+/// A resolved pin can point at a different item, so it cannot establish outer identity.
+#[cfg(any(test, feature = "test-script"))]
+fn diagnostic_request_key(req: &LoadRequest) -> Option<String> {
+    if req.resolve_override.is_some() || req.pinned_only.is_some() {
+        return None;
+    }
+    if let Some(key) = req.cache_key_override.as_deref() {
+        let prefix = if key.starts_with(CACHE_KEY_FOLDER) {
+            "dir"
+        } else if key.starts_with(CACHE_KEY_ZIP) {
+            "zipfile"
+        } else if key.starts_with(CACHE_KEY_PDF) {
+            "pdffile"
+        } else {
+            return None;
+        };
+        return Some(format!("{prefix}::{}", req.path.display()));
+    }
+    Some(if let Some(prefix) = req.zip_dir_prefix.as_deref() {
+        format!("zipdir::{}#{prefix}", req.path.display())
+    } else if let Some(page) = req.pdf_page {
+        crate::grid_item::pdf_page_perf_key(&req.path, page)
+    } else if let Some(entry) = req.zip_entry.as_deref() {
+        format!("zip::{}#{entry}", req.path.display())
+    } else {
+        req.path.display().to_string()
+    })
+}
+
+#[cfg(test)]
+mod diagnostic_request_key_tests {
+    use super::*;
+    use crate::grid_item::GridItem;
+
+    #[test]
+    fn original_item_keys_match_folder_image_and_archive_page_projections() {
+        let path = std::path::PathBuf::from(r"C:\fixture\book");
+        let mut req = LoadRequest {
+            path: path.clone(),
+            cache_key_override: Some("folderthumb:auto-v3:name:d3:book".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            diagnostic_request_key(&req),
+            Some(GridItem::Folder(path.clone()).perf_key())
+        );
+        req.cache_key_override = None;
+        assert_eq!(
+            diagnostic_request_key(&req),
+            Some(GridItem::Image(path.clone()).perf_key())
+        );
+        req.pdf_page = Some(2);
+        assert_eq!(
+            diagnostic_request_key(&req),
+            Some(crate::grid_item::pdf_page_perf_key(&path, 2))
+        );
+        req.pdf_page = None;
+        req.zip_entry = Some("page.jpg".into());
+        assert_eq!(
+            diagnostic_request_key(&req),
+            Some(
+                GridItem::ZipImage {
+                    zip_path: path.clone(),
+                    entry_name: "page.jpg".into()
+                }
+                .perf_key()
+            )
+        );
+        req.zip_entry = None;
+        req.zip_dir_prefix = Some("chapter/".into());
+        assert_eq!(
+            diagnostic_request_key(&req),
+            Some(format!("zipdir::{}#chapter/", path.display()))
+        );
+    }
+
+    #[test]
+    fn resolved_source_cannot_invent_original_outer_item_identity() {
+        let mut req = LoadRequest {
+            path: std::path::PathBuf::from(r"C:\fixture\selected.jpg"),
+            cache_key_override: Some("folderthumb:book#pin:image".into()),
+            resolve_override: Some(ResolveStrategy::DirectImage),
+            ..Default::default()
+        };
+        assert!(diagnostic_request_key(&req).is_none());
+        req.resolve_override = None;
+        req.cache_key_override = Some("archivethumb:book.7z".into());
+        assert!(diagnostic_request_key(&req).is_none());
+    }
+}
+
+#[cfg(all(windows, any(test, feature = "test-script")))]
+fn trace_request_begin(req: &LoadRequest, display_px: u32) {
+    let ThumbnailRequestId::Registered(request_id) = req.request_id else {
+        return;
+    };
+    let Some(key) = diagnostic_request_key(req) else {
+        return;
+    };
+    crate::test_script::release_checks::trace(
+        "request_begin",
+        serde_json::json!({
+            "request_id": request_id,
+            "key": key,
+            "idx": req.idx,
+            "items_gen": req.items_gen,
+            "evaluated_display_px": display_px,
+        }),
+    );
+}
+
 fn raw_image_error(error: crate::raw::RawError) -> image::ImageError {
     image::ImageError::IoError(std::io::Error::other(error))
 }
@@ -2232,6 +2344,8 @@ pub fn process_load_request(
     adjustment_db: Option<&crate::adjustment_db::AdjustmentDb>,
     raw_handoff: Option<&RawThumbHandoff>,
 ) {
+    #[cfg(all(windows, any(test, feature = "test-script")))]
+    trace_request_begin(req, display_px);
     if let Some(key) = req.cache_key_override.as_mut() {
         *key = representative_cache_key_for_policy(key, &req.file_type_visibility);
     }
@@ -4819,6 +4933,10 @@ pub fn load_one_cached(
     raw_handoff: Option<&RawThumbHandoff>,
     deferred_req: Option<LoadRequest>,
 ) {
+    // The existing continuation clone preserves the outer folder item even when
+    // `path` is now its selected image. Diagnostics never register another owner.
+    #[cfg(all(windows, any(test, feature = "test-script")))]
+    let diagnostic_key = deferred_req.as_ref().and_then(diagnostic_request_key);
     let total_started = std::time::Instant::now();
     let total_cycles_started = crate::perf::stall::TotalCycles::start();
     // カタログキー (保存・参照で一致させる) と表示名 (ログ用) を分離。
@@ -5511,6 +5629,23 @@ pub fn load_one_cached(
     //     それ以外は CacheDecision の判定に従う
     let policy_should_save = cache_decision.should_cache(path, file_size, decode_ms, display_ms);
     let should_save = catalog.is_some() && (force_cache || policy_should_save);
+    #[cfg(all(windows, any(test, feature = "test-script")))]
+    if let (ThumbnailRequestId::Registered(request_id), Some(key)) = (request_id, diagnostic_key) {
+        crate::test_script::release_checks::trace(
+            "source",
+            serde_json::json!({
+                "request_id": request_id,
+                "key": key,
+                "idx": idx,
+                "items_gen": items_gen,
+                "evaluated_display_px": display_px,
+                "origin": "source_generated",
+                "from_cache": false,
+                "should_save": should_save,
+                "force_cache": force_cache,
+            }),
+        );
+    }
     let mut cache_encode_ms = 0.0;
     let mut cache_save_ms = 0.0;
     let mut cache_map_ms = 0.0;

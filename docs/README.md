@@ -89,13 +89,13 @@
 | ドキュメント | 内容 |
 | --- | --- |
 | [spec.md](spec.md) | アプリ全体の仕様書 (設定項目・機能一覧) |
-| [settings-export-import-plan.md](settings-export-import-plan.md) | **§1.317 実装済み (レビュー前)**。環境設定の持ち運び、全453フィールドの分類 (140対象 / 313除外、§1.345とv4.5.0 masterの結合後)、形式 v1、draft → 既存 OK、単一転送 job、利用者承認と検証計画。既存 OK の §1.305 / §1.295 は今回未修正 |
+| [settings-export-import-plan.md](settings-export-import-plan.md) | **§1.317 実装済み (レビュー前)**。環境設定の持ち運び、全455フィールドの分類 (142対象 / 313除外、§1.342最大倍率を含む)、形式 v1、draft → 既存 OK、単一転送 job、利用者承認と検証計画。既存 OK の §1.305 / §1.295 は今回未修正 |
 | [comic-integration-plan.md](comic-integration-plan.md) | comic DB、注釈 overlay、編集・書き出しパイプラインの統合契約 |
 | [conceal-feature-plan.md](conceal-feature-plan.md) | 隠蔽加工の形状、保存、合成、キャッシュ無効化の現行仕様 |
 | [panorama-360-view-plan.md](panorama-360-view-plan.md) | **コード実装済み・実素材／実機性能の手動確認は記録上未確認**。360° パノラマ表示、GPano crop、mipmap、settle refinement、fullscreen 合成の現行仕様と設計経緯 |
 | [fullscreen-side-panel-mode-plan.md](fullscreen-side-panel-mode-plan.md) | **実装済み・手動実機確認は記録上未確認**。静止画・動画・音楽で共通のサイドパネル表示モード仕様 |
 | [fullscreen-locked-chrome-suppression-plan.md](fullscreen-locked-chrome-suppression-plan.md) | §1.344 の決定仕様と実装記録。F11 の正確な表示先から導く実効ロック、native 動画・F12・描画/予約/hit の共通契約。2026-10-08に利用者判断・構造合意済み |
-| [fullscreen-specified-scale-plan.md](fullscreen-specified-scale-plan.md) | §1.342 の設計案（利用者判断・独立設計レビュー待ち）。既存fit cycleへ指定サイズを追加、％/物理px・表示単位・保存/転送・Q1〜Q10 |
+| [fullscreen-specified-scale-plan.md](fullscreen-specified-scale-plan.md) | §1.342 の決定仕様と実装記録（2026-10-10の利用者改訂まで反映）。初期幅・高さ80％、表示領域％ / logical point相当のpx、AI前原寸の共通最大倍率（既定5倍）・OFF値保持・PDF需要の収束、連結の中央pair基準、favorite保存 / 共通値転送 |
 | [edit-content-identity-plan.md](edit-content-identity-plan.md) | **Phase 1 実装済み・実機確認済み (A1〜A6)**。OS 側でファイルを移動・コピーしたときに、内容ハッシュで編集内容 (補正 / 消しゴム / モザイク / 注釈 / トリミング / ★ / タグ) を再結合して復元する機能。size → 先頭 64KB → 全体の 3 段照合、`rename_key_migration::STORES` 駆動の batch copy、変換アーカイブの 4 面キー、モーダル確認ウィンドウ |
 | [next-release-backlog.md](next-release-backlog.md) | **次リリース検討バックログ**。いま着手できる未対応の P2/P3、ユーザー要望、依存ライブラリ更新、リリース手順の未解決点だけを恒久管理。完了した項目はこのファイルから削除する |
 | [book-resume-meter-plan.md](book-resume-meter-plan.md) | 本・動画・音声のサムネイルの前回位置。記録時のHUD位置/総数と既存再生位置/長さ、常に左→右、writer移行・全行map、下端帯、Remote NULL、通常削除競合の合意済み割り切り |

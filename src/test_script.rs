@@ -31,7 +31,7 @@ pub(crate) mod grid_observation;
 #[cfg(feature = "test-script")]
 mod history_input;
 pub(crate) mod pointer_input;
-#[cfg(all(windows, feature = "test-script"))]
+#[cfg(all(windows, any(test, feature = "test-script")))]
 pub(crate) mod release_checks;
 
 const MAX_SCRIPT_BYTES: u64 = 1024 * 1024;
@@ -1452,7 +1452,7 @@ struct PreconditionTrace {
 
 #[derive(Debug)]
 enum UiCommand {
-    #[cfg(all(windows, feature = "test-script"))]
+    #[cfg(all(windows, any(test, feature = "test-script")))]
     ReleaseCheck(release_checks::Request),
     Key(SyntheticKeyCommand),
     Cancel(Instant),
@@ -3001,7 +3001,7 @@ fn wait_interruptibly(
 fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
     #[cfg(feature = "test-script")]
     history_input::register(engine, bridge.clone());
-    #[cfg(all(windows, feature = "test-script"))]
+    #[cfg(all(windows, any(test, feature = "test-script")))]
     release_checks::register(engine, bridge.clone());
     #[cfg(feature = "test-script")]
     clipboard_capture::register(engine, bridge.clone());
@@ -5100,7 +5100,7 @@ pub(crate) fn ui_update(ctx: &egui::Context, mut snapshot: TestScriptSnapshot) -
 
     while let Ok(command) = runtime.rx.try_recv() {
         match command {
-            #[cfg(all(windows, feature = "test-script"))]
+            #[cfg(all(windows, any(test, feature = "test-script")))]
             UiCommand::ReleaseCheck(request) => {
                 if let Err(error) = runtime.validate_selected_owner(&request.owner) {
                     let _ = request.reply.send(Err(error));
@@ -5358,7 +5358,7 @@ pub(crate) fn ui_update(ctx: &egui::Context, mut snapshot: TestScriptSnapshot) -
     close
 }
 
-#[cfg(all(windows, feature = "test-script"))]
+#[cfg(all(windows, any(test, feature = "test-script")))]
 pub(crate) fn validate_release_owner(owner: &TestScriptWindowIdentity) -> Result<(), String> {
     let guard = runtime()
         .lock()

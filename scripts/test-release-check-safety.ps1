@@ -131,6 +131,34 @@ foreach($relative in @('ui-smoke.ps1','check-idle-health.ps1','ui-smoke\release-
 }
 $samplerText=Get-Content -LiteralPath (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Sampler.ps1') -Encoding UTF8 -Raw
 Assert-True ($samplerText.Contains('clock-window $perf --sampler')) 'Session clock conversion missing.'
-Assert-True ($samplerText.Contains('$converted.evidence.clock.start_t') -and $samplerText.Contains('$converted.evidence.clock.end_t')) 'Analyzer uses another clock.'
+Assert-True ($samplerText.Contains('clock=$converted.evidence.clock') -and $samplerText.Contains('measure_start_unix_ms=$startUtc') -and $samplerText.Contains('measure_end_unix_ms=$endUtc')) 'Sampler lost the converted session clock or external UTC boundaries.'
 Assert-True (-not $samplerText.Contains('$env:APPDATA') -and -not $samplerText.Contains('StartTime).TotalSeconds')) 'Sampler falls back to normal data or OS elapsed clock.'
+Assert-True ($samplerText.Contains("perf_evaluation='deferred_until_normal_exit'") -and -not $samplerText.Contains("'idle-health'")) 'Sampler evaluates perf before the shutdown delivery checkpoint.'
+# Execute the sampler's real measurement/catch/verdict statements with fakes.
+# No preflight, launch, process query, filesystem access or desktop input runs.
+& {
+    $ast=Get-TestAst (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Sampler.ps1')
+    $body=@($ast.EndBlock.Statements | Where-Object {$_ -is [Management.Automation.Language.TryStatementAst]})
+    $verdicts=@($ast.EndBlock.Statements | Where-Object {$_.Extent.Text -match '^\$report\.(verdict|exit_code)='})
+    Assert-True ($body.Count -eq 1 -and $verdicts.Count -eq 2) 'Sampler fake cannot identify its real measurement/verdict statements.'
+    $thresholds=[pscustomobject]@{warmup_seconds=0;measure_seconds=0.005;max_cpu_core_ratio=0.02;target_cpu_core_ratio=0.01;max_app_log_growth_bytes=100;max_perf_log_growth_bytes=100}
+    $report=[ordered]@{failures=@();environment_errors=@();warnings=@();verdict='SKIPPED';exit_code=2}
+    $ProcessId=101;$Scenario='tray-residency';$TargetKey='';$RootHwnd=1001;$BackgroundHwnd=0;$BackgroundProcessId=0
+    $perf='fake-perf';$app='fake-app';$reportPath='fake-report';$OutputDirectory='fake-output';$SleepEvidencePath='fake-completion';$scripts='fake-scripts';$ExpectedStartTimeUtc=[datetime]'2026-10-09T00:00:00Z'
+    $script:fakeCpuCounter=0
+    function Get-ExactMeasuredProcess {$script:fakeCpuCounter++;[pscustomobject]@{TotalProcessorTime=[timespan]::FromSeconds($script:fakeCpuCounter)}}
+    function Test-InitialIndexScanSettled {param($Path) $true}
+    function Start-Sleep {param($Seconds,$Milliseconds)}
+    function Get-FileLength {param($Path) 0}
+    function Get-ReleaseCheckWindowSample {param($ProcessId) [pscustomobject]@{unix_ms=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds();total=1;visible=0}}
+    function Assert-ReleaseCheckWindowSamples {param($Samples,$Scenario,$ProcessId,$RootHwnd,$BackgroundHwnd,$BackgroundProcessId)}
+    function Test-Path {param($LiteralPath,$PathType) $true}
+    function Get-Content {param($LiteralPath,$Encoding,[switch]$Raw) '{"pid":101,"sleep_start_unix_ms":1,"sleep_end_unix_ms":2}'}
+    function Write-ReleaseCheckJson {param($Path,$Value)}
+    function python {throw 'fake missing session clock anchor'}
+    & ([scriptblock]::Create($body[0].Extent.Text))
+    foreach($statement in $verdicts){& ([scriptblock]::Create($statement.Extent.Text))}
+    Assert-True ($report.verdict -eq 'FAIL' -and $report.exit_code -eq 1) 'Clock environment failure erased the completed external CPU FAIL.'
+    Assert-True ($report.failures -contains 'CPU one-core limit exceeded.' -and $report.environment_errors -contains 'fake missing session clock anchor') ('External CPU failure or clock evidence was lost: '+($report|ConvertTo-Json -Depth 4 -Compress))
+}
 Write-Host 'release-check safety: PASS (approval, path, exact PID/start time, lifetime windows and clock routing; no applications/process commands)'
