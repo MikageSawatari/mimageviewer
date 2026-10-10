@@ -62,7 +62,16 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         "general/restore-position",
         General,
         "環境設定を開き直したときに前回の位置を復元する",
-        ["再表示", "記憶", "スクロール", "ページ", "restore"]
+        [
+            "再表示",
+            "記憶",
+            "スクロール",
+            "ページ",
+            "選択",
+            "折りたたみ",
+            "絞り込み",
+            "restore"
+        ]
     ),
     entry!(
         "general/ai-processing",

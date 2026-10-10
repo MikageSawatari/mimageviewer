@@ -351,10 +351,11 @@ impl PreferencesOpenRequest {
 
 /// App owns the last rendered page position, independently of the settings draft.
 /// Search result lists do not replace this position. Nothing here is persisted.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct PreferencesViewPosition {
     page: PreferencesPage,
     scroll_y: f32,
+    in_page: Option<PreferencesInPageView>,
 }
 
 impl Default for PreferencesViewPosition {
@@ -362,6 +363,100 @@ impl Default for PreferencesViewPosition {
         Self {
             page: PreferencesPage::General,
             scroll_y: 0.0,
+            in_page: None,
+        }
+    }
+}
+
+/// Only navigation and presentation choices belong here, never settings drafts,
+/// editor buffers, pending actions, worker state or search navigation requests.
+#[derive(Clone, Debug)]
+struct PreferencesInPageView {
+    expanded: HashSet<&'static str>,
+    external_tools: Option<PreferencesExternalToolsView>,
+    ui_font_filter: String,
+    duplicate_priority_scroll_y: f32,
+    context_menu_preview_scenario: crate::context_menu_model::ContextMenuPreviewScenario,
+    menu_expanded: HashMap<crate::keymap::TopMenuId, bool>,
+    context_menu_expanded: HashMap<crate::context_menu_model::ContextMenuParentId, bool>,
+    exif_collapsed_groups: HashSet<crate::exif_reader::TagGroup>,
+    vst3_filter: String,
+    vst3_picker_scroll_y: f32,
+    #[cfg(windows)]
+    vst3_show_unusable: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PreferencesExternalToolsView {
+    selected: Option<crate::external_tool::ExternalToolId>,
+    association_ext: String,
+}
+
+impl PreferencesInPageView {
+    fn capture(
+        state: &PreferencesState,
+        previous: Option<&Self>,
+        rendered_page: Option<PreferencesPage>,
+    ) -> Self {
+        Self {
+            expanded: state.expanded.clone(),
+            // Preserve context-derived defaults until this page was shown.
+            external_tools: if rendered_page == Some(PreferencesPage::ExternalTools) {
+                Some(PreferencesExternalToolsView {
+                    selected: state.external_tool_selected,
+                    association_ext: state.external_tool_association_ext.clone(),
+                })
+            } else {
+                previous.and_then(|view| view.external_tools.clone())
+            },
+            ui_font_filter: state.ui_font_filter.clone(),
+            duplicate_priority_scroll_y: state.duplicate_priority_scroll_y,
+            context_menu_preview_scenario: state.context_menu_preview_scenario,
+            menu_expanded: state.menu_expanded.clone(),
+            context_menu_expanded: state.context_menu_expanded.clone(),
+            exif_collapsed_groups: state.exif_collapsed_groups.clone(),
+            vst3_filter: state.vst3_filter.clone(),
+            vst3_picker_scroll_y: state.vst3_picker_scroll_y,
+            #[cfg(windows)]
+            vst3_show_unusable: state.vst3_show_unusable,
+        }
+    }
+
+    fn restore(&self, state: &mut PreferencesState) {
+        state.expanded.clone_from(&self.expanded);
+        // A canceled addition or a removed tool must not restore a stale ID or
+        // its editor buffers. Keep from_settings' default if the ID disappeared.
+        if let Some(view) = &self.external_tools {
+            if let Some(id) = view.selected
+                && state
+                    .settings
+                    .external_tools
+                    .iter()
+                    .any(|tool| tool.id == id)
+            {
+                state.select_external_tool(Some(id));
+            }
+            if pages::association_extension_is_known(&view.association_ext) {
+                state
+                    .external_tool_association_ext
+                    .clone_from(&view.association_ext);
+            }
+        }
+        state.ui_font_filter.clone_from(&self.ui_font_filter);
+        state.duplicate_priority_scroll_y = self.duplicate_priority_scroll_y;
+        state.context_menu_preview_scenario = self.context_menu_preview_scenario;
+        state.menu_expanded.clone_from(&self.menu_expanded);
+        state
+            .context_menu_expanded
+            .clone_from(&self.context_menu_expanded);
+        state
+            .exif_collapsed_groups
+            .clone_from(&self.exif_collapsed_groups);
+        state.vst3_filter.clone_from(&self.vst3_filter);
+        state.vst3_picker_scroll_y = self.vst3_picker_scroll_y;
+        #[cfg(windows)]
+        {
+            state.vst3_show_unusable = self.vst3_show_unusable;
         }
     }
 }
@@ -936,6 +1031,8 @@ pub(crate) struct PreferencesState {
     pub file_type_extension_error: Option<&'static str>,
     /// 右クリックメニュー設定に表示する固定の確認場面。保存対象ではない。
     pub context_menu_preview_scenario: crate::context_menu_model::ContextMenuPreviewScenario,
+    pub menu_expanded: HashMap<crate::keymap::TopMenuId, bool>,
+    pub context_menu_expanded: HashMap<crate::context_menu_model::ContextMenuParentId, bool>,
     /// 右ペインのスクロール状態をページ切替ごとに新しくする世代。
     /// 同じページの再描画では維持し、別ページへ移ったときだけ増やす。
     pub right_panel_scroll_generation: u64,
@@ -1046,6 +1143,7 @@ pub(crate) struct PreferencesState {
     pub operation_mouse_gesture_recorder: Option<OperationMouseGestureRecorder>,
     /// EXIF タグ設定で折りたたみ中のグループ。`HashSet` に入っているものが折りたたみ。
     pub exif_collapsed_groups: HashSet<crate::exif_reader::TagGroup>,
+    pub duplicate_priority_scroll_y: f32,
     /// カスタム追加直後に「自動スクロールして見せる」タグ名 (1 フレームだけ持つ)。
     pub exif_scroll_to_added: Option<String>,
 
@@ -1158,6 +1256,7 @@ pub(crate) struct PreferencesState {
     pub vst3_scan_current: String,
     /// VST3 ページ内のフィルタ文字列。
     pub vst3_filter: String,
+    pub vst3_picker_scroll_y: f32,
     /// 音声入力を持たない plugin (= Instrument / MIDI FX 等) も候補一覧に表示する。
     #[cfg(windows)]
     pub vst3_show_unusable: bool,
@@ -1524,6 +1623,8 @@ impl PreferencesState {
             file_type_extension_error: None,
             context_menu_preview_scenario:
                 crate::context_menu_model::ContextMenuPreviewScenario::default(),
+            menu_expanded: HashMap::new(),
+            context_menu_expanded: HashMap::new(),
             right_panel_scroll_generation: 0,
             search_query: String::new(),
             showing_results: false,
@@ -1609,6 +1710,7 @@ impl PreferencesState {
             operation_mouse_gesture_inputs: HashMap::new(),
             operation_mouse_gesture_recorder: None,
             exif_collapsed_groups: HashSet::new(),
+            duplicate_priority_scroll_y: 0.0,
             exif_scroll_to_added: None,
             auto_thread_count,
             vram_mib: crate::gpu_info::query_vram_summary_mib(),
@@ -1662,6 +1764,7 @@ impl PreferencesState {
             #[cfg(windows)]
             vst3_scan_current: String::new(),
             vst3_filter: String::new(),
+            vst3_picker_scroll_y: 0.0,
             #[cfg(windows)]
             vst3_show_unusable: false,
             #[cfg(windows)]
@@ -2406,10 +2509,14 @@ impl App {
                     .unwrap_or(0),
             );
             new_state.favorite_view_state_entry_count = self.favorite_view_states.len();
+            if let Some(view) = &self.preferences_view_position.in_page {
+                view.restore(&mut new_state);
+            } else {
+                new_state
+                    .expanded
+                    .insert(preference_category(self.preferences_view_position.page).0);
+            }
             new_state.selected = self.preferences_view_position.page;
-            new_state
-                .expanded
-                .insert(preference_category(new_state.selected).0);
             new_state.right_panel_scroll_generation =
                 self.preferences_right_panel_scroll_sequence.wrapping_add(1);
             // 既にスキャン済みの VST3 プラグイン候補を引き継ぐ (= 再スキャン不要で表示)
@@ -3029,10 +3136,19 @@ impl App {
                     && rendered_page == state.selected
                     && rendered_generation == state.right_panel_scroll_generation
                 {
-                    self.preferences_view_position = PreferencesViewPosition {
-                        page: rendered_page,
-                        scroll_y: output.state.offset.y,
-                    };
+                    self.preferences_view_position.page = rendered_page;
+                    self.preferences_view_position.scroll_y = output.state.offset.y;
+                }
+                if self.settings.preferences_restore_position {
+                    let rendered_page = (!rendered_results
+                        && rendered_page == state.selected
+                        && rendered_generation == state.right_panel_scroll_generation)
+                        .then_some(rendered_page);
+                    self.preferences_view_position.in_page = Some(PreferencesInPageView::capture(
+                        state,
+                        self.preferences_view_position.in_page.as_ref(),
+                        rendered_page,
+                    ));
                 }
 
                 // 全体の高さを確保
@@ -5605,7 +5721,12 @@ mod tests {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        draw_context_menu_layout_settings(ui, &mut layout, &mut scenario);
+                        draw_context_menu_layout_settings(
+                            ui,
+                            &mut layout,
+                            &mut scenario,
+                            &mut HashMap::new(),
+                        );
                     });
                 });
             });
@@ -6049,6 +6170,696 @@ mod tests {
         harness
     }
 
+    fn preferences_view_harness(
+        page: PreferencesPage,
+    ) -> egui_kittest::Harness<'static, crate::app::AppTestEnvForTest> {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.external_tools = (1..=2)
+            .map(|id| crate::external_tool::ExternalTool {
+                id: crate::external_tool::ExternalToolId(id),
+                name: format!("Tool {id}"),
+                ..crate::external_tool::ExternalTool::defaults_for_viewing()
+            })
+            .collect();
+        app.open_preferences_page(page);
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(1093.0, 614.0))
+            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+        // External-tool path checks repaint while their worker is pending.
+        // These navigation tests need rendered transitions, not worker quiescence.
+        harness.run_steps(3);
+        harness
+    }
+
+    #[test]
+    fn preferences_view_external_tool_selection_remembers_all_close_paths_and_falls_back() {
+        use crate::external_tool::ExternalToolId;
+        use egui_kittest::kittest::Queryable;
+        let mut harness = preferences_view_harness(PreferencesPage::ExternalTools);
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .external_tool_selected,
+            Some(ExternalToolId(1))
+        );
+        for close in ["ok", "cancel", "window", "escape"] {
+            harness.get_by_label("Tool 2").click();
+            harness.run_steps(3);
+            assert_eq!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .external_tool_selected,
+                Some(ExternalToolId(2))
+            );
+            match close {
+                "ok" => harness.get_by_label("  OK  ").click(),
+                "cancel" => harness.get_by_label("キャンセル").click(),
+                "window" => harness.get_by_label("Close window").click(),
+                "escape" => harness.event(egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }),
+                _ => unreachable!(),
+            }
+            harness.run_steps(3);
+            assert!(harness.state().pref_state.is_none());
+            harness.state_mut().show_preferences = true;
+            harness.run_steps(3);
+            let state = harness.state().pref_state.as_ref().unwrap();
+            assert_eq!(
+                state.external_tool_selected,
+                Some(ExternalToolId(2)),
+                "{close}"
+            );
+            assert_eq!(
+                state.external_tool_editor_loaded_for,
+                Some(ExternalToolId(2))
+            );
+        }
+        // Selection survives discarded edits; editor values are loaded from live settings.
+        harness
+            .state_mut()
+            .pref_state
+            .as_mut()
+            .unwrap()
+            .settings
+            .external_tools[1]
+            .name = "Unsaved tool".into();
+        harness.run_steps(3);
+        harness.get_by_label("キャンセル").click();
+        harness.run_steps(3);
+        harness.get_by_label("破棄して閉じる").click();
+        harness.run_steps(3);
+        harness.state_mut().show_preferences = true;
+        harness.run_steps(3);
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .external_tools[1]
+                .name,
+            "Tool 2"
+        );
+        harness.get_by_label("キャンセル").click();
+        harness.run_steps(3);
+        harness.state_mut().settings.external_tools.pop();
+        harness.state_mut().show_preferences = true;
+        harness.run_steps(3);
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .external_tool_selected,
+            Some(ExternalToolId(1))
+        );
+        harness.get_by_label("キャンセル").click();
+        harness.run_steps(3);
+        harness.state_mut().settings.external_tools.clear();
+        harness.state_mut().show_preferences = true;
+        harness.run_steps(3);
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .external_tool_selected,
+            None
+        );
+    }
+
+    #[test]
+    fn preferences_view_choices_survive_close_and_page_changes_without_preserving_drafts() {
+        use crate::{
+            context_menu_model::{ContextMenuParentId, ContextMenuPreviewScenario},
+            exif_reader::TagGroup,
+            keymap::TopMenuId,
+        };
+        use egui_kittest::kittest::Queryable;
+        let mut harness = preferences_view_harness(PreferencesPage::ExternalTools);
+        {
+            let state = harness.state_mut().pref_state.as_mut().unwrap();
+            state.expanded.insert("表示");
+            state.external_tool_association_ext = "png".into();
+            state.ui_font_filter = "Meiryo".into();
+            state.context_menu_preview_scenario = ContextMenuPreviewScenario::FullscreenVideo;
+            state.menu_expanded.insert(TopMenuId::File, false);
+            state
+                .context_menu_expanded
+                .insert(ContextMenuParentId::OpenWith, true);
+            state.exif_collapsed_groups.insert(TagGroup::Camera);
+            state.vst3_filter = "EQ".into();
+            #[cfg(windows)]
+            {
+                state.vst3_show_unusable = true;
+            }
+            state.file_type_extension_input = "unfinished".into();
+            state.exif_add_tag_input = "unfinished".into();
+            state.external_tool_message = Some("old result".into());
+        }
+        harness.run_steps(3);
+        // Viewing another page starts at its top, but keeps other page choices.
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::Startup);
+        harness.run_steps(3);
+        harness.get_by_label("キャンセル").click();
+        harness.run_steps(3);
+        harness.state_mut().show_preferences = true;
+        harness.run_steps(3);
+        let state = harness.state().pref_state.as_ref().unwrap();
+        assert_eq!(state.selected, PreferencesPage::Startup);
+        assert!(state.expanded.contains("表示"));
+        assert_eq!(state.external_tool_association_ext, "png");
+        assert_eq!(state.ui_font_filter, "Meiryo");
+        assert_eq!(
+            state.context_menu_preview_scenario,
+            ContextMenuPreviewScenario::FullscreenVideo
+        );
+        assert_eq!(state.menu_expanded.get(&TopMenuId::File), Some(&false));
+        assert_eq!(
+            state
+                .context_menu_expanded
+                .get(&ContextMenuParentId::OpenWith),
+            Some(&true)
+        );
+        assert!(state.exif_collapsed_groups.contains(&TagGroup::Camera));
+        assert_eq!(state.vst3_filter, "EQ");
+        #[cfg(windows)]
+        assert!(state.vst3_show_unusable);
+        assert!(state.file_type_extension_input.is_empty());
+        assert!(state.exif_add_tag_input.is_empty());
+        assert!(state.external_tool_message.is_none());
+    }
+
+    #[test]
+    fn preferences_view_unvisited_external_page_uses_current_context_defaults() {
+        use egui_kittest::kittest::Queryable;
+        let mut harness = preferences_view_harness(PreferencesPage::General);
+        assert!(
+            harness
+                .state()
+                .preferences_view_position
+                .in_page
+                .as_ref()
+                .unwrap()
+                .external_tools
+                .is_none()
+        );
+        harness.get_by_label("キャンセル").click();
+        harness.run_steps(3);
+        {
+            let app = harness.state_mut();
+            app.settings.external_tools.swap(0, 1);
+            app.items = vec![crate::grid_item::GridItem::Image(PathBuf::from(
+                r"C:\fake\image.png",
+            ))];
+            app.selected = Some(0);
+            app.open_preferences_page(PreferencesPage::ExternalTools);
+        }
+        harness.run_steps(3);
+        let state = harness.state().pref_state.as_ref().unwrap();
+        assert_eq!(
+            state.external_tool_selected,
+            Some(crate::external_tool::ExternalToolId(2))
+        );
+        assert_eq!(state.external_tool_association_ext, "png");
+        assert!(
+            harness
+                .state()
+                .preferences_view_position
+                .in_page
+                .as_ref()
+                .unwrap()
+                .external_tools
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn preferences_view_off_and_reenabled_on_clear_all_choices() {
+        use crate::{
+            context_menu_model::{ContextMenuParentId, ContextMenuPreviewScenario},
+            exif_reader::TagGroup,
+            keymap::TopMenuId,
+        };
+        use egui_kittest::kittest::Queryable;
+        let mut harness = preferences_view_harness(PreferencesPage::ExternalTools);
+        harness.get_by_label("Tool 2").click();
+        harness.run_steps(3);
+        {
+            let state = harness.state_mut().pref_state.as_mut().unwrap();
+            state.ui_font_filter = "Meiryo".into();
+            state.vst3_filter = "EQ".into();
+            state.duplicate_priority_scroll_y = 123.0;
+            state.vst3_picker_scroll_y = 456.0;
+            state.external_tool_association_ext = "png".into();
+            state.context_menu_preview_scenario = ContextMenuPreviewScenario::FullscreenVideo;
+            state.menu_expanded.insert(TopMenuId::File, false);
+            state
+                .context_menu_expanded
+                .insert(ContextMenuParentId::OpenWith, true);
+            state.exif_collapsed_groups.insert(TagGroup::Camera);
+            state.expanded.insert("表示");
+            #[cfg(windows)]
+            {
+                state.vst3_show_unusable = true;
+            }
+            state.settings.preferences_restore_position = false;
+        }
+        harness.get_by_label("  OK  ").click();
+        harness.run_steps(3);
+        assert!(harness.state().preferences_view_position.in_page.is_none());
+        for enable in [false, true] {
+            harness
+                .state_mut()
+                .open_preferences_page(PreferencesPage::ExternalTools);
+            harness.run_steps(3);
+            let state = harness.state().pref_state.as_ref().unwrap();
+            assert_eq!(
+                state.external_tool_selected,
+                Some(crate::external_tool::ExternalToolId(1))
+            );
+            assert!(state.ui_font_filter.is_empty());
+            assert!(state.vst3_filter.is_empty());
+            assert_eq!(state.duplicate_priority_scroll_y, 0.0);
+            assert_eq!(state.vst3_picker_scroll_y, 0.0);
+            assert_eq!(state.external_tool_association_ext, "jpg");
+            assert_eq!(
+                state.context_menu_preview_scenario,
+                ContextMenuPreviewScenario::default()
+            );
+            assert!(!state.expanded.contains("表示"));
+            assert!(state.menu_expanded.is_empty());
+            assert!(state.context_menu_expanded.is_empty());
+            assert!(state.exif_collapsed_groups.is_empty());
+            #[cfg(windows)]
+            assert!(!state.vst3_show_unusable);
+            harness.get_by_label("Tool 2").click();
+            harness.run_steps(3);
+            harness
+                .state_mut()
+                .pref_state
+                .as_mut()
+                .unwrap()
+                .settings
+                .preferences_restore_position = enable;
+            harness.get_by_label("  OK  ").click();
+            harness.run_steps(3);
+        }
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::ExternalTools);
+        harness.run_steps(3);
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .external_tool_selected,
+            Some(crate::external_tool::ExternalToolId(1))
+        );
+        harness.get_by_label("Tool 2").click();
+        harness.run_steps(3);
+        harness.get_by_label("キャンセル").click();
+        harness.run_steps(3);
+        harness.state_mut().show_preferences = true;
+        harness.run_steps(3);
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .external_tool_selected,
+            Some(crate::external_tool::ExternalToolId(2))
+        );
+    }
+
+    #[test]
+    fn preferences_view_menu_and_exif_header_clicks_are_restored() {
+        use crate::{
+            context_menu_model::ContextMenuParentId, exif_reader::TagGroup, keymap::TopMenuId,
+        };
+        use egui_kittest::kittest::Queryable;
+        let mut harness = preferences_view_harness(PreferencesPage::MenuLayout);
+        let label = format!("{} の項目", TopMenuId::File.label());
+        harness.get_by_label(&label).click();
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .menu_expanded
+                .get(&TopMenuId::File),
+            Some(&false)
+        );
+        harness.get_by_label("キャンセル").click();
+        harness.run();
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .menu_expanded
+                .get(&TopMenuId::File),
+            Some(&false)
+        );
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::ContextMenuLayout);
+        harness.run();
+        harness
+            .get_by_label(ContextMenuParentId::OpenWith.label())
+            .scroll_to_me();
+        harness.run();
+        harness
+            .get_by_label(ContextMenuParentId::OpenWith.label())
+            .click();
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .context_menu_expanded
+                .get(&ContextMenuParentId::OpenWith),
+            Some(&true)
+        );
+        harness.get_by_label("キャンセル").click();
+        harness.run();
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .context_menu_expanded
+                .get(&ContextMenuParentId::OpenWith),
+            Some(&true)
+        );
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::ExifDisplay);
+        harness.run();
+        let header = harness.get_by_label_contains("▼ カメラ");
+        header.click();
+        harness.run();
+        assert!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .exif_collapsed_groups
+                .contains(&TagGroup::Camera)
+        );
+        harness.get_by_label("キャンセル").click();
+        harness.run();
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        harness.get_by_label_contains("▶ カメラ");
+        assert!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .exif_collapsed_groups
+                .contains(&TagGroup::Camera)
+        );
+    }
+
+    #[test]
+    fn preferences_view_tree_expansion_restores_and_explicit_and_search_navigation_win() {
+        use egui_kittest::kittest::Queryable;
+        let mut harness = preferences_view_harness(PreferencesPage::ExternalTools);
+        harness.get_by_label("Tool 2").click();
+        harness.run_steps(3);
+        let category = preference_category(PreferencesPage::ExternalTools).0;
+        harness
+            .state_mut()
+            .pref_state
+            .as_mut()
+            .unwrap()
+            .expanded
+            .remove(category);
+        harness.run_steps(3);
+        harness.get_by_label("キャンセル").click();
+        harness.run_steps(3);
+        harness.state_mut().show_preferences = true;
+        harness.run_steps(3);
+        assert!(
+            !harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .expanded
+                .contains(category)
+        );
+        // Explicit requests override remembered page/scroll and open the target category.
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::ExternalTools);
+        harness.run_steps(3);
+        assert!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .expanded
+                .contains(category)
+        );
+        harness
+            .state_mut()
+            .open_preferences_request(PreferencesOpenRequest::anchored(
+                PreferencesPage::Cache,
+                "cache/epub-handling",
+            ));
+        harness.run_steps(1);
+        assert_eq!(
+            harness.state().pref_state.as_ref().unwrap().selected,
+            PreferencesPage::Cache
+        );
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .highlight
+                .unwrap()
+                .0,
+            "cache/epub-handling"
+        );
+        harness.state_mut().pref_state.as_mut().unwrap().highlight = None;
+        harness.run_steps(3);
+        {
+            let state = harness.state_mut().pref_state.as_mut().unwrap();
+            state.search_query = "外部ツール".into();
+            state.showing_results = true;
+            state.expanded.remove(category);
+        }
+        harness.run_steps(3);
+        let entry = search_preferences("外部ツール", preference_category)
+            .into_iter()
+            .next()
+            .unwrap();
+        harness.event(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run_steps(1);
+        let state = harness.state().pref_state.as_ref().unwrap();
+        assert_eq!(state.selected, entry.page);
+        assert_eq!(state.highlight.unwrap().0, entry.anchor);
+        assert!(state.expanded.contains(category));
+        assert_eq!(
+            state.external_tool_selected,
+            Some(crate::external_tool::ExternalToolId(2))
+        );
+    }
+
+    #[test]
+    fn preferences_view_duplicate_priority_inner_scroll_reopens_clamps_and_resets_when_off() {
+        use egui_kittest::kittest::Queryable;
+        let mut harness = preferences_view_harness(PreferencesPage::DuplicateFiles);
+        let extensions: Vec<_> = (0..40).map(|i| format!("testext{i}")).collect();
+        {
+            let app = harness.state_mut();
+            app.settings.skip_duplicate_images = true;
+            app.settings.image_ext_priority = extensions.clone();
+            let state = app.pref_state.as_mut().unwrap();
+            state.settings.skip_duplicate_images = true;
+            state.settings.image_ext_priority = extensions;
+        }
+        harness.run();
+        harness.get_by_label("testext39").scroll_to_me();
+        harness.run();
+        let y = harness
+            .state()
+            .pref_state
+            .as_ref()
+            .unwrap()
+            .duplicate_priority_scroll_y;
+        assert!(y > 100.0);
+        harness.get_by_label("キャンセル").click();
+        harness.run();
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        assert!(
+            (harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .duplicate_priority_scroll_y
+                - y)
+                .abs()
+                < 1.0
+        );
+        // Smaller content clamps immediately through the same ScrollArea output.
+        harness.get_by_label("キャンセル").click();
+        harness.run();
+        harness.state_mut().settings.image_ext_priority.truncate(2);
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .duplicate_priority_scroll_y,
+            0.0
+        );
+        harness.get_by_label("キャンセル").click();
+        harness.run();
+        harness.state_mut().settings.preferences_restore_position = false;
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::DuplicateFiles);
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .duplicate_priority_scroll_y,
+            0.0
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn preferences_view_vst3_picker_inner_scroll_reopens_clamps_and_resets_when_off() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.vst3_enabled = true;
+        app.vst3_discovered = (0..40)
+            .map(|i| crate::video::dsp::DiscoveredPlugin {
+                path: PathBuf::from(format!(r"C:\fake\Effect {i}.vst3")),
+                display_name: format!("Effect {i}"),
+                audio_input_buses: None,
+                audio_output_buses: None,
+                event_input_buses: None,
+                event_output_buses: None,
+                audio_input_channels: None,
+                audio_output_channels: None,
+                usable_audio_effect: None,
+                probe_error: None,
+            })
+            .collect();
+        app.open_preferences_page(PreferencesPage::Vst3);
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(1093.0, 614.0))
+            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+        harness.run();
+        harness.get_by_label("Effect 39").scroll_to_me();
+        harness.run();
+        let y = harness
+            .state()
+            .pref_state
+            .as_ref()
+            .unwrap()
+            .vst3_picker_scroll_y;
+        assert!(y > 100.0);
+        harness.get_by_label("キャンセル").click();
+        harness.run();
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        assert!(
+            (harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .vst3_picker_scroll_y
+                - y)
+                .abs()
+                < 1.0
+        );
+        harness.get_by_label("キャンセル").click();
+        harness.run();
+        harness.state_mut().vst3_discovered.truncate(2);
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .vst3_picker_scroll_y,
+            0.0
+        );
+        harness.get_by_label("キャンセル").click();
+        harness.run();
+        harness.state_mut().settings.preferences_restore_position = false;
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::Vst3);
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .vst3_picker_scroll_y,
+            0.0
+        );
+    }
+
     fn assert_preferences_position(
         harness: &egui_kittest::Harness<'_, crate::app::AppTestEnvForTest>,
         page: PreferencesPage,
@@ -6168,7 +6979,7 @@ mod tests {
         harness.run();
         harness.get_by_label("確認せず変換する").scroll_to_me();
         harness.run();
-        let position = harness.state().preferences_view_position;
+        let position = harness.state().preferences_view_position.clone();
         assert!(position.scroll_y > 100.0);
         harness.state_mut().request_close_preferences_dialog();
         harness.state_mut().show_preferences = true;
@@ -6226,7 +7037,7 @@ mod tests {
         use egui_kittest::kittest::Queryable;
         for close in ["ok", "cancel", "window", "escape"] {
             let mut harness = preferences_position_harness();
-            let position = harness.state().preferences_view_position;
+            let position = harness.state().preferences_view_position.clone();
             let old = harness.state().settings.skip_zip_if_folder_exists;
             harness
                 .state_mut()
@@ -6269,7 +7080,7 @@ mod tests {
     #[test]
     fn preferences_position_reopen_without_hidden_frame_and_new_process_default() {
         let mut harness = preferences_position_harness();
-        let position = harness.state().preferences_view_position;
+        let position = harness.state().preferences_view_position.clone();
         // Exercise the same handler as an unchanged Cancel/title close, immediately
         // followed by any ordinary menu/toolbar/key/gamepad open flag.
         harness.state_mut().request_close_preferences_dialog();
@@ -6339,7 +7150,7 @@ mod tests {
     #[test]
     fn preferences_position_search_jump_overrides_and_results_do_not_replace_page() {
         let mut harness = preferences_position_harness();
-        let position = harness.state().preferences_view_position;
+        let position = harness.state().preferences_view_position.clone();
         harness
             .state_mut()
             .pref_state
@@ -6383,7 +7194,7 @@ mod tests {
         );
         harness.state_mut().pref_state.as_mut().unwrap().highlight = None;
         harness.run();
-        let position = harness.state().preferences_view_position;
+        let position = harness.state().preferences_view_position.clone();
         assert_preferences_position(&harness, PreferencesPage::General, 0.0);
         harness.state_mut().discard_preferences_dialog();
         harness.state_mut().show_preferences = true;
@@ -6433,6 +7244,7 @@ mod tests {
         app.preferences_view_position = PreferencesViewPosition {
             page: PreferencesPage::Cache,
             scroll_y: 100_000.0,
+            ..Default::default()
         };
         app.show_preferences = true;
         let mut harness = crate::test_ui::builder()
