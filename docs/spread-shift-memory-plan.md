@@ -614,6 +614,8 @@ E固有のC1–C12 receipt/state/request/replyはcrate-level `src/spread_shift.r
 D1はpure契約とworker/lifecycleを供給し、現viewerのRestore/表示/inputへの接続はD2で行う。
 `EffectiveLayoutSnapshot<T>`のtokenはaccepted layout ownerの既存tokenをそのままcaptureする。
 shift側で代替hashや新しいlayout世代を生成せず、units/role/placementと同じcaptureに含める。
+`ResolvedAutomaticRules.page_alone`は既存の実効`PageAloneSettings`を保持し、
+`after_cover`と`last`を独立にAutomatic結果とPreparing captureへ渡す。
 
 提案する公開型/入口（DBの接続や保存rowをGへ公開しない）:
 

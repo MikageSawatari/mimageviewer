@@ -150,6 +150,7 @@ fn run_worker(
     let purge_data_dir = data_dir.clone();
     let has_pdf_passwords = crate::pdf_passwords::PdfPasswordStore::has_entries_at(&data_dir);
     run_worker_with_recycler_scoped(
+        &data_dir,
         paths,
         source_scopes,
         hwnd,
@@ -173,6 +174,7 @@ fn run_worker(
 }
 
 fn run_worker_with_recycler_scoped<F, C, P, J>(
+    data_dir: &std::path::Path,
     paths: Vec<PathBuf>,
     source_scopes: Vec<DeleteSourceScope>,
     hwnd: isize,
@@ -189,7 +191,7 @@ fn run_worker_with_recycler_scoped<F, C, P, J>(
     P: FnMut(
         &[DeleteSourceScope],
         &[PathBuf],
-        &crate::pdf_loader::EpubRangeLease,
+        &crate::rename_key_migration::DeleteMaintenanceLease,
     ) -> crate::rename_key_migration::PurgeReport,
     J: FnMut(&[PathBuf], &[PathBuf]) -> bool,
 {
@@ -200,7 +202,28 @@ fn run_worker_with_recycler_scoped<F, C, P, J>(
 
     // One owner spans every Shell chunk, including its confirmation/progress,
     // and the final purge (also after cancel or a partial Shell failure).
-    let range_guard = crate::rename_key_migration::acquire_delete_epub_guard(&source_scopes);
+    let range_guard =
+        match crate::rename_key_migration::acquire_delete_epub_guard(data_dir, &source_scopes) {
+            Ok(guard) => guard,
+            Err(error) => {
+                let message = format!("削除前のメタ情報処理を開始できません: {error}");
+                crate::logger::log(format!("[delete] maintenance acquisition failed: {error}"));
+                let _ = tx.send(DeleteMsg::Batch {
+                    succeeded: Vec::new(),
+                    failed: paths
+                        .into_iter()
+                        .map(|path| (path, message.clone()))
+                        .collect(),
+                    purged_pdf_password_paths: Vec::new(),
+                    purge_deferred: false,
+                });
+                let _ = tx.send(DeleteMsg::Done {
+                    canceled: false,
+                    store_mutations: Default::default(),
+                });
+                return;
+            }
+        };
 
     for chunk in paths.chunks(FILE_OPERATION_CHUNK_SIZE) {
         if cancel.load(Ordering::Relaxed) {
@@ -373,6 +396,7 @@ fn run_worker_with_recycler_scoped<F, C, P, J>(
 
 #[cfg(test)]
 fn run_worker_with_recycler<F, C, P, J>(
+    data_dir: &std::path::Path,
     paths: Vec<PathBuf>,
     hwnd: isize,
     cancel: Arc<AtomicBool>,
@@ -388,7 +412,7 @@ fn run_worker_with_recycler<F, C, P, J>(
     P: FnMut(
         &[PathBuf],
         &[PathBuf],
-        &crate::pdf_loader::EpubRangeLease,
+        &crate::rename_key_migration::DeleteMaintenanceLease,
     ) -> crate::rename_key_migration::PurgeReport,
     J: FnMut(&[PathBuf], &[PathBuf]) -> bool,
 {
@@ -398,6 +422,7 @@ fn run_worker_with_recycler<F, C, P, J>(
         .map(DeleteSourceScope::Exact)
         .collect();
     run_worker_with_recycler_scoped(
+        data_dir,
         paths,
         scopes,
         hwnd,
@@ -850,6 +875,7 @@ mod worker_tests {
         let mut calls = 0usize;
 
         run_worker_with_recycler(
+            tempfile::tempdir().unwrap().path(),
             paths,
             0,
             cancel,
@@ -881,6 +907,7 @@ mod worker_tests {
         let mut calls = 0usize;
 
         run_worker_with_recycler(
+            tempfile::tempdir().unwrap().path(),
             paths,
             0,
             cancel,
@@ -913,6 +940,7 @@ mod worker_tests {
         let mut purged = Vec::new();
 
         run_worker_with_recycler(
+            tempfile::tempdir().unwrap().path(),
             paths,
             0,
             Arc::new(AtomicBool::new(false)),
@@ -956,6 +984,7 @@ mod worker_tests {
         let mut purged = Vec::new();
 
         run_worker_with_recycler(
+            tempfile::tempdir().unwrap().path(),
             paths,
             0,
             cancel,
@@ -1003,6 +1032,7 @@ mod worker_tests {
         let mut purge_pdf_paths = Vec::new();
 
         run_worker_with_recycler(
+            tempfile::tempdir().unwrap().path(),
             vec![root],
             0,
             Arc::new(AtomicBool::new(false)),
@@ -1074,6 +1104,7 @@ mod worker_tests {
 
         let (tx, rx) = mpsc::channel();
         run_worker_with_recycler(
+            temp.path(),
             vec![succeeded.clone(), failed.clone()],
             0,
             Arc::new(AtomicBool::new(false)),
@@ -1120,6 +1151,7 @@ mod worker_tests {
             let worker = std::thread::spawn(move || {
                 let (tx, _rx) = mpsc::channel();
                 run_worker_with_recycler_scoped(
+                    &data_dir,
                     vec![removed],
                     vec![scope],
                     0,
@@ -1227,6 +1259,7 @@ mod worker_tests {
         let worker = std::thread::spawn(move || {
             let (tx, _rx) = mpsc::channel();
             run_worker_with_recycler_scoped(
+                &worker_data,
                 vec![worker_removed.clone()],
                 vec![DeleteSourceScope::Exact(worker_removed.clone())],
                 0,
@@ -1320,6 +1353,7 @@ mod worker_tests {
         let journal_data_dir = data_dir.clone();
 
         run_worker_with_recycler(
+            tempfile::tempdir().unwrap().path(),
             vec![removed.clone()],
             0,
             Arc::new(AtomicBool::new(false)),

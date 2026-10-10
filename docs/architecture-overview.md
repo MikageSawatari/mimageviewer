@@ -460,9 +460,13 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 
 §1.364 D1の`BookScopeKey`/coverage codecは`book_scope.rs`が共通owner。
 Gの意味分類`BookScope`はG3でconstructorへadaptする。shift保存はAppの単一workerだけが書き、
-移動・purge・cleanup・metadata転送は同workerのFIFOをfenceして接続を閉じるmaintenance leaseを使う。
+共通storeの移動・purge・cleanup・metadata転送は同workerのFIFOをfenceして接続を閉じるmaintenance leaseを使う。
+EPUB保護が必要な処理は対象範囲を先に確保してからshift leaseを取得し、内側のcopy/purgeには
+取得済みownerを渡す。同階層PDF保存の長い変換中は既存の本保護だけを維持する。
 copy/probeの`LogicalBookFamily`は指定descriptorだけにroot exact＋境界付きslash範囲を有効にする。
 相対payloadは本rootの改名で不変、製本の旧→最終ページmappingはworkerで更新し、scope外移動はMissing保持。
+本管理のrename/delete成功は捕捉済みfolderを専用workerのroot移行/hard purgeへ登録する。
+PageRefは保存表記を維持し、照合時だけ共通のcase/slash正規化を使う。
 settings単体reset、履歴/resume/cache削除、自動sidecarにはshiftを混ぜない。
 明示metadata v10のlogical `spread_shift_family`は物理cache由来の`container_state`とは別に搬送する。
 D1はstore/完了契約と登録までで、既存spread setter・表示Restore・HUD・F12・Remoteへの接続はD2/D3。

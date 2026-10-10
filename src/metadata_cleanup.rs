@@ -245,7 +245,17 @@ fn retry_delete_purge_journal_at(data_dir: &Path) -> DeletePurgeRetryReport {
         .iter()
         .map(|entry| crate::delete_worker::DeleteSourceScope::Tree(entry.path.clone()))
         .collect::<Vec<_>>();
-    let range_guard = crate::rename_key_migration::acquire_delete_epub_guard(&retry_scopes);
+    let range_guard =
+        match crate::rename_key_migration::acquire_delete_epub_guard(data_dir, &retry_scopes) {
+            Ok(guard) => guard,
+            Err(error) => {
+                crate::logger::log(format!(
+                    "delete purge maintenance acquisition failed: {error}"
+                ));
+                report.errors.push(format!("spread_shift: {error}"));
+                return report;
+            }
+        };
     let mut completed = Vec::new();
     for entry in &snapshot {
         if classify_path(&entry.path) != PathClassification::Orphan {

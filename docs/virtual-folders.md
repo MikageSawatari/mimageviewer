@@ -6,6 +6,8 @@
 ZIPはcollapse後に受け入れたraw実効prefixをconstructorへ渡す。root/親章へのfallbackはしない。
 基点は画像本の相対path、書庫のouterからの完全entry chain、文書の物理page identityで、
 cache ZIP/PDF pathやHUD ordinal/raw items indexを保存しない。Missing/種類除外でも行を保持する。
+PageRefの保存表記は変更せず、identity索引への照合で`book_scope::normalize_relative_reference`の
+case/slash keyを使う。ページ改名の元表記やimportのbackslash表記も同じidentityへ解く。
 
 明示metadata v10は`spread_shift_family { coverage, scopes }`をlogical entryに所有させる。
 元RARのshiftとcache ZIPの既存spread/trimは独立originのまま共存する。

@@ -49067,11 +49067,17 @@ impl App {
         // Capture the final filesystem map once; SQLite and snapshot publication
         // stay in the shift FIFO, before subsequent opens or maintenance.
         if let Some(service) = &self.spread_shift_service {
-            let moves = mappings
-                .iter()
-                .map(|mapping| (mapping.from.clone(), mapping.to.clone()))
-                .collect();
-            if let Err(error) = service.migrate_page_paths(moves) {
+            let admission = if let Some((source, target)) = collection_tree_migration {
+                // Book rename is a root operation; its relative anchors remain unchanged.
+                service.rename_book_root(source, target)
+            } else {
+                let moves = mappings
+                    .iter()
+                    .map(|mapping| (mapping.from.clone(), mapping.to.clone()))
+                    .collect();
+                service.migrate_page_paths(moves)
+            };
+            if let Err(error) = admission {
                 crate::logger::log(format!(
                     "spread_shift: page mapping admission failed: {error}"
                 ));
@@ -49505,6 +49511,16 @@ impl App {
                     ));
                 }
                 self.invalidate_rename_migrations_for_removed_paths(std::slice::from_ref(&path));
+                if let Some(service) = &self.spread_shift_service
+                    && let Err(error) = service.purge_book_root(&path)
+                {
+                    crate::logger::log(format!(
+                        "spread_shift: book purge admission failed: {error}"
+                    ));
+                    self.show_feedback_toast(format!(
+                        "削除した本の見開き調整を消去できませんでした: {error}"
+                    ));
+                }
                 if self.settings.active_book_name == name {
                     self.settings.active_book_name = crate::books::DEFAULT_BOOK_NAME.to_string();
                     self.settings.save();
@@ -95549,6 +95565,8 @@ pub(crate) mod paint_record_test_support;
 mod similar_navigation_tests;
 #[cfg(all(test, windows))]
 mod similar_preview_context_tests;
+#[cfg(test)]
+mod spread_shift_lifecycle_tests;
 #[cfg(test)]
 pub(crate) mod tests;
 

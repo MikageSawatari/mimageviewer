@@ -17,9 +17,14 @@ viewerのfirst-display continuationへの組込みはD2で、現在のwarm PDF�
 既存`BookResumeWriter`に`ReadPositionAfter`と位置snapshotを追加した。外部準備workerの位置SELECTは、
 transaction開始前にcutoffが完了し、前後の受付/完了watermarkが同一の時だけ証明可能。
 証明できない時は同writerのFIFO読取を使う契約とし、Record/schema/meterの意味は保持する。
-既存maintenance後のmeter Readは位置snapshotも更新する。
+既存maintenance後のmeter Readも受付sequenceを進め、位置snapshotと完了sequenceを一体公開する。
+未完了の再読込がある間はwarm/proven経路を使わず、保持済みの旧Arcも後続receiptを満たせない。
 
 rename/copy/purge/cleanup/metadata workerは`maintenance_at(data_dir)`を一回取得する。
+両保護が必要な共通取得順はEPUB guard/range → shift maintenance。対象範囲を先に確保し、
+取得済みownerを内側のcopy/purgeへ渡して保護を再取得しない。解放はshift → EPUBの順。
+EPUBの同階層PDF保存は既存の本leaseを維持し、末尾のmetadata copyだけshift leaseを取得する。
+長い変換中にshift保守を占有しない。
 Begin ACKは先行保存・成功Setの内容ID送信と接続closeの後。Endは再読込とepoch公開の後に待機readを返す。
 待機readをEndより前のworker queueへ入れて相互待ちにしない。実変更scopeだけ通知する。
 Setとimportのcommit済追加/置換は捕捉logical rootを既存recorderへEditとして送る。
@@ -29,6 +34,10 @@ App終了は既存metadata workerを回収し、最終resumeをenqueueしてshif
 `SpreadShiftProcessOwner`が`run_native`外で末尾までdrain/joinし、成功結果の内容ID送信までrecorderを保持する。
 recorderの既存終了時hash取消契約は変えない。shift UI callbackにjoin/DB待機はない。
 まれな失敗はlog＋通知＋原本保持。retry、再作成、多段回復を追加しない。
+
+本管理のrename成功は捕捉source/target folderを専用workerのroot migrationへ、delete成功は
+捕捉rootをhard purgeへ登録する。どちらも受付sequenceに参加し、後続readはFIFO完了を待つ。
+root migrationは相対payload表記とdestination優先を維持する。ページ一枚の削除では親scopeを消さない。
 
 
 §1.241 Phase A: `crates/startup-diagnostics` の常時timelineはlauncher/coreの共通QPC基準と
@@ -388,7 +397,7 @@ file-local fallback する。close / 動画切替 / fullscreen 終了の cancel 
 
 通常 PDF と固定済み EPUB の列挙は呼出元で合流登録し、新しい実行要求だけ `pdf-enumerate-nav` スレッドを起こす。未固定 EPUB の admission は専用の背景スレッドで source stat・DB 照合・登録・エンコードを行う。固定表 mutex はメモリ検索・挿入だけを保護し、stat・DB 照合中は保持しない。同じ実読込パスへの追加 waiter はスレッドを増やさない。
 
-EPUB の最初の固定と内容同定台帳への書込は、本ごとの固定ロックで直列化する。backfill / stage-0 は worker 上で来歴確認から SQLite 更新まで保持する。復元は候補分岐時の未固定元状態を保持し、本ロック内でコピー前に再照合して、編集行コピーと台帳昇格まで保持する。別の本の固定は待たせない。rename / purge / restore copy の共通 STORES 更新は EPUB キーを含み得る対象パス範囲だけ lease を保持し、PDF・画像の exact key は待たせない。UI のピン要求作成では EPUB の stat をせず、worker で世代 stamp を解決する。元 EPUB が消えたピン要求は worker で通常のフォルダ代表要求へ戻る。ドライブ一覧の cache-only worker は seed の EPUB 出所と世代を比較する。
+EPUB の最初の固定と内容同定台帳への書込は、本ごとの固定ロックで直列化する。backfill / stage-0 は worker 上で来歴確認から SQLite 更新まで保持する。復元は候補分岐時の未固定元状態を保持し、対象範囲lease内でコピー前に再照合して、編集行コピーと台帳昇格まで保持する。範囲外の本の固定は待たせない。rename / purge / restore copy の共通 STORES 更新は EPUB キーを含み得る対象パス範囲だけ lease を保持し、PDF・画像の exact key は待たせない。UI のピン要求作成では EPUB の stat をせず、worker で世代 stamp を解決する。元 EPUB が消えたピン要求は worker で通常のフォルダ代表要求へ戻る。ドライブ一覧の cache-only worker は seed の EPUB 出所と世代を比較する。
 
 ### サムネイルの動画・音声長さ取得
 

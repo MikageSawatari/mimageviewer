@@ -9,8 +9,14 @@ use super::{ShiftReadReply, SpreadShiftService};
 use crate::{
     app::ViewerContextId,
     book_resume_db::{BookResumeWriter, PageIdentity, PositionReadReply, ReadingPosition},
-    book_scope::{BookScopeKey, validate_relative_reference},
-    settings::{ReadingDirection, ReadingFlow, SingletonSpreadEndpointSettings, SpreadMode},
+    book_scope::{
+        BookScopeKey, normalize_relative_reference, relative_reference_from_root,
+        validate_relative_reference,
+    },
+    settings::{
+        PageAloneSettings, ReadingDirection, ReadingFlow, SingletonSpreadEndpointSettings,
+        SpreadMode,
+    },
     ui_fullscreen::SpreadDisplayComposition,
 };
 
@@ -29,6 +35,14 @@ pub(crate) enum SpreadShiftPageRef {
 }
 
 impl SpreadShiftPageRef {
+    fn lookup_key(&self) -> Result<Self, String> {
+        Ok(match self {
+            Self::RelativePath(path) => Self::RelativePath(normalize_relative_reference(path)?),
+            Self::ArchiveEntry(path) => Self::ArchiveEntry(normalize_relative_reference(path)?),
+            Self::DocumentPageIdentity(page) => Self::DocumentPageIdentity(*page),
+        })
+    }
+
     pub(crate) fn validate(&self) -> Result<(), String> {
         match self {
             Self::RelativePath(path) | Self::ArchiveEntry(path) => {
@@ -47,11 +61,7 @@ impl SpreadShiftPageRef {
         let root = crate::path_key::normalize_keep_drive(&scope.logical_root);
         let value = match identity {
             PageIdentity::Image { path } => {
-                let normalized = crate::path_key::normalize_keep_drive(Path::new(path));
-                let relative = normalized
-                    .strip_prefix(&format!("{}/", root.trim_end_matches('/')))
-                    .ok_or_else(|| "page identity is outside its logical book".to_string())?;
-                Self::RelativePath(relative.into())
+                Self::RelativePath(relative_reference_from_root(&scope.logical_root, path)?)
             }
             PageIdentity::Archive {
                 container,
@@ -61,7 +71,7 @@ impl SpreadShiftPageRef {
                     return Err("archive identity belongs to another logical root".into());
                 }
                 // Full outer entry chain; level_prefix must not be prepended a second time.
-                Self::ArchiveEntry(entry_name.replace('\\', "/"))
+                Self::ArchiveEntry(entry_name.clone())
             }
             PageIdentity::Document {
                 container,
@@ -87,15 +97,11 @@ impl SpreadShiftPageRef {
         let root = crate::path_key::normalize_keep_drive(&scope.logical_root);
         Ok(match self {
             Self::RelativePath(path) => PageIdentity::Image {
-                path: format!(
-                    "{}/{}",
-                    root.trim_end_matches('/'),
-                    path.replace('\\', "/").to_lowercase()
-                ),
+                path: format!("{}/{}", root.trim_end_matches('/'), path),
             },
             Self::ArchiveEntry(path) => PageIdentity::Archive {
                 container: root,
-                entry_name: path.replace('\\', "/"),
+                entry_name: path.clone(),
             },
             Self::DocumentPageIdentity(page_num) => PageIdentity::Document {
                 container: root,
@@ -196,7 +202,7 @@ pub(crate) struct ResolvedAutomaticRules {
     pub(crate) flow: ReadingFlow,
     pub(crate) direction: ReadingDirection,
     pub(crate) final_cover: bool,
-    pub(crate) page_alone: bool,
+    pub(crate) page_alone: PageAloneSettings,
     pub(crate) singleton_endpoints: SingletonSpreadEndpointSettings,
     pub(crate) landscape_epoch: u64,
 }
@@ -222,12 +228,12 @@ impl ShiftIdentityIndex {
         let mut index = HashMap::new();
         for (identity, idx) in identities {
             let reference = SpreadShiftPageRef::from_identity(scope, &identity)?;
-            index.entry(reference).or_insert(idx);
+            index.entry(reference.lookup_key()?).or_insert(idx);
         }
         Ok(Self(Arc::new(index)))
     }
     pub(crate) fn resolve(&self, reference: &SpreadShiftPageRef) -> Option<usize> {
-        self.0.get(reference).copied()
+        self.0.get(&reference.lookup_key().ok()?).copied()
     }
 }
 
@@ -594,7 +600,10 @@ mod tests {
             flow: ReadingFlow::Horizontal,
             direction: ReadingDirection::Rtl,
             final_cover: true,
-            page_alone: true,
+            page_alone: PageAloneSettings {
+                after_cover: true,
+                last: false,
+            },
             singleton_endpoints: SingletonSpreadEndpointSettings {
                 first: true,
                 last: false,
@@ -660,11 +669,11 @@ mod tests {
             path: "C:/BOOKS/A/P.JPG".into(),
         };
         let reference = SpreadShiftPageRef::from_identity(&scope, &image).unwrap();
-        assert_eq!(reference, SpreadShiftPageRef::RelativePath("p.jpg".into()));
+        assert_eq!(reference, SpreadShiftPageRef::RelativePath("P.JPG".into()));
         assert_eq!(
             reference.to_identity(&scope).unwrap(),
             PageIdentity::Image {
-                path: "c:/books/a/p.jpg".into()
+                path: "c:/books/a/P.JPG".into()
             }
         );
         assert!(
@@ -740,6 +749,196 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn identity_lookup_normalizes_case_and_slashes_without_rewriting_saved_refs() {
+        let folder = BookScopeKey::folder("C:/books/a").unwrap();
+        let archive = BookScopeKey::archive("C:/books/a.zip", &["chapter".into()]).unwrap();
+        for (scope, identity, saved) in [
+            (
+                folder,
+                PageIdentity::Image {
+                    path: "C:\\BOOKS\\A\\Chapter\\PAGE.JPG".into(),
+                },
+                SpreadShiftPageRef::RelativePath("chapter/page.jpg".into()),
+            ),
+            (
+                archive,
+                PageIdentity::Archive {
+                    container: "C:\\BOOKS\\A.ZIP".into(),
+                    entry_name: "Chapter\\INNER.ZIP\\PAGE.JPG".into(),
+                },
+                SpreadShiftPageRef::ArchiveEntry("chapter/inner.zip/page.jpg".into()),
+            ),
+        ] {
+            let reference = SpreadShiftPageRef::from_identity(&scope, &identity).unwrap();
+            let index = ShiftIdentityIndex::prepare(&scope, [(identity, 7)]).unwrap();
+            assert_eq!(index.resolve(&saved), Some(7));
+            assert_eq!(index.resolve(&reference), Some(7));
+            let wire = serde_json::to_string(&reference).unwrap();
+            let decoded = serde_json::from_str::<SpreadShiftPageRef>(&wire).unwrap();
+            assert_eq!(decoded, reference);
+            assert_ne!(
+                decoded, saved,
+                "lookup normalization must not rewrite wire spelling"
+            );
+        }
+        let index = ShiftIdentityIndex::prepare(
+            &BookScopeKey::folder("C:/books/a").unwrap(),
+            [(
+                PageIdentity::Image {
+                    path: "C:/books/a/page.jpg".into(),
+                },
+                3,
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            index.resolve(&SpreadShiftPageRef::ArchiveEntry("page.jpg".into())),
+            None
+        );
+        assert_eq!(
+            index.resolve(&SpreadShiftPageRef::RelativePath("../page.jpg".into())),
+            None
+        );
+    }
+
+    fn resolve_saved_folder_reference(
+        scope: BookScopeKey,
+        identity: PageIdentity,
+        saved: SpreadShiftPageRef,
+    ) -> ResolveShiftReply {
+        let mut request = request();
+        request.scope = scope.clone();
+        request.receipt.scope = scope.clone();
+        request.identity_index = ShiftIdentityIndex::prepare(&scope, [(identity, 2)]).unwrap();
+        resolve(request, shift_read(Some(saved)))
+    }
+
+    #[test]
+    fn renamed_page_reference_resolves_against_new_manifest_spelling() {
+        use super::super::store;
+        let temp = tempfile::TempDir::new().unwrap();
+        let db_path = temp.path().join("spread_shift.db");
+        store::initialize_database_at(&db_path).unwrap();
+        let scope = BookScopeKey::folder("C:/books/a").unwrap();
+        let mut connection = store::open_existing(&db_path).unwrap().unwrap();
+        store::set(
+            &mut connection,
+            &scope.storage_key(),
+            &SpreadShiftPageRef::RelativePath("Chapter\\Old.JPG".into()),
+        )
+        .unwrap();
+        drop(connection);
+        assert_eq!(
+            store::migrate_page_paths_at(
+                temp.path(),
+                &[(
+                    "C:/books/a/Chapter/Old.JPG".into(),
+                    "C:/books/a/Chapter/New.JPG".into()
+                )]
+            )
+            .unwrap(),
+            1
+        );
+        let connection = store::open_existing(&db_path).unwrap().unwrap();
+        let saved = store::load_rows(&connection)
+            .unwrap()
+            .remove(&scope.storage_key())
+            .unwrap();
+        assert_eq!(
+            saved,
+            SpreadShiftPageRef::RelativePath("Chapter/New.JPG".into())
+        );
+        let reply = resolve_saved_folder_reference(
+            scope,
+            PageIdentity::Image {
+                path: "C:\\BOOKS\\A\\chapter\\new.jpg".into(),
+            },
+            saved.clone(),
+        );
+        assert_eq!(reply.optional_shift.as_ref().unwrap().anchor_idx, 2);
+        assert_eq!(reply.optional_shift.unwrap().anchor_ref, saved);
+    }
+
+    #[test]
+    fn imported_page_reference_preserves_wire_spelling_and_reresolves() {
+        use super::super::store;
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("book");
+        let data = temp.path().join("data");
+        std::fs::create_dir_all(root.join("Pages")).unwrap();
+        std::fs::write(root.join("Pages/Old.JPG"), b"page").unwrap();
+        let db_path = data.join("spread_shift.db");
+        store::initialize_database_at(&db_path).unwrap();
+        let scope = BookScopeKey::folder(&root).unwrap();
+        let reference = SpreadShiftPageRef::RelativePath("Pages\\Old.JPG".into());
+        let mut connection = store::open_existing(&db_path).unwrap().unwrap();
+        store::set(&mut connection, &scope.storage_key(), &reference).unwrap();
+        drop(connection);
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        crate::metadata_transfer::export_at(&data, &root, false, &cancel, |_| {}).unwrap();
+        let mut connection = store::open_existing(&db_path).unwrap().unwrap();
+        store::clear(&mut connection, &scope.storage_key()).unwrap();
+        drop(connection);
+        let imported = crate::metadata_transfer::import_at(&data, &root, &cancel, |_| {}).unwrap();
+        assert_eq!(imported.failed_entries, 0);
+        assert_eq!(imported.committed.spread_shift_additions, 1);
+        let connection = store::open_existing(&db_path).unwrap().unwrap();
+        let saved = store::load_rows(&connection)
+            .unwrap()
+            .remove(&scope.storage_key())
+            .unwrap();
+        assert_eq!(saved, reference);
+        let reply = resolve_saved_folder_reference(
+            scope,
+            PageIdentity::Image {
+                path: root.join("pages/old.jpg").to_string_lossy().into_owned(),
+            },
+            saved.clone(),
+        );
+        assert_eq!(reply.optional_shift.as_ref().unwrap().anchor_idx, 2);
+        assert_eq!(reply.optional_shift.unwrap().anchor_ref, saved);
+    }
+
+    #[test]
+    fn automatic_result_and_preparing_capture_preserve_both_page_alone_choices() {
+        for after_cover in [false, true] {
+            for last in [false, true] {
+                let expected = PageAloneSettings { after_cover, last };
+                let mut request = request();
+                request.rules.page_alone = expected;
+                let BookLayoutSource::Automatic { rules, shift } =
+                    resolve_book_layout_source::<()>(
+                        PreparedLayoutRecipe::Automatic {
+                            shift_read: Some(shift_read(None)),
+                            retained_state: SpreadShiftState::None,
+                            maintenance_epoch: 6,
+                        },
+                        request,
+                    )
+                    .unwrap()
+                else {
+                    panic!("expected Automatic");
+                };
+                assert_eq!(rules.page_alone, expected);
+                let live = EffectiveLayoutSnapshot {
+                    scope: shift.receipt.scope,
+                    context_id: ViewerContextId::for_test(3),
+                    items_generation: 4,
+                    nav_generation: 12,
+                    settings_generation: 5,
+                    rules,
+                    live_shift: shift.state,
+                    units: Arc::from([]),
+                    layout_token: 77,
+                };
+                let captured =
+                    capture_effective_automatic_layout(AutomaticContextToken { effective: &live });
+                assert_eq!(captured.rules.page_alone, expected);
+            }
+        }
     }
 
     #[test]

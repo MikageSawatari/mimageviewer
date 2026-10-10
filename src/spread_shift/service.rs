@@ -99,6 +99,12 @@ enum Mutation {
     Clear,
 }
 
+enum MaintenanceAction {
+    PagePaths(Vec<(PathBuf, PathBuf)>),
+    RenameBookRoot { source: String, target: String },
+    PurgeBookRoot(String),
+}
+
 enum Command {
     Write {
         sequence: u64,
@@ -111,9 +117,9 @@ enum Command {
     ClearAll {
         sequence: u64,
     },
-    Migrate {
+    Maintain {
         sequence: u64,
-        mappings: Vec<(PathBuf, PathBuf)>,
+        action: MaintenanceAction,
     },
     BeginMaintenance(mpsc::Sender<Result<(), String>>),
     EndMaintenance(mpsc::Sender<Result<(), String>>),
@@ -422,6 +428,23 @@ impl SpreadShiftService {
         &self,
         mappings: Vec<(PathBuf, PathBuf)>,
     ) -> Result<(), String> {
+        self.maintain(MaintenanceAction::PagePaths(mappings))
+    }
+
+    pub(crate) fn rename_book_root(&self, source: &Path, target: &Path) -> Result<(), String> {
+        self.maintain(MaintenanceAction::RenameBookRoot {
+            source: BookScopeKey::folder(source)?.storage_key(),
+            target: BookScopeKey::folder(target)?.storage_key(),
+        })
+    }
+
+    pub(crate) fn purge_book_root(&self, root: &Path) -> Result<(), String> {
+        self.maintain(MaintenanceAction::PurgeBookRoot(
+            BookScopeKey::folder(root)?.storage_key(),
+        ))
+    }
+
+    fn maintain(&self, action: MaintenanceAction) -> Result<(), String> {
         let mut admission = self.shared.admission.lock().unwrap();
         require_write_admission(&admission)?;
         let sequence = admission
@@ -432,7 +455,7 @@ impl SpreadShiftService {
         send_command(
             &self.shared,
             &mut admission,
-            Command::Migrate { sequence, mappings },
+            Command::Maintain { sequence, action },
         )?;
         admission.watermarks.admitted = sequence;
         Ok(())
@@ -926,17 +949,32 @@ fn run_worker(
                     status,
                 });
             }
-            Command::Migrate { sequence, mappings } => {
-                // Reuse the same maintenance SQLite primitive with the service
-                // connection closed; there is never a second concurrent writer.
+            Command::Maintain { sequence, action } => {
+                // All book completion operations share the actor's admission order.
+                // Page mapping reuses an external primitive only after closing its connection.
+                let result = match action {
+                    MaintenanceAction::PagePaths(mappings) => {
+                        connection = None;
+                        store::migrate_page_paths_at(&data_dir, &mappings).map(|_| ())
+                    }
+                    MaintenanceAction::RenameBookRoot { source, target } => {
+                        connection.as_mut().map_or(Ok(()), |connection| {
+                            store::rename_book_root(connection, &source, &target).map(|_| ())
+                        })
+                    }
+                    MaintenanceAction::PurgeBookRoot(root) => {
+                        connection.as_mut().map_or(Ok(()), |connection| {
+                            store::purge_book_root(connection, &root).map(|_| ())
+                        })
+                    }
+                };
                 connection = None;
-                let result = store::migrate_page_paths_at(&data_dir, &mappings).map(|_| ());
                 let previous = shared.admission.lock().unwrap().snapshot.take().unwrap();
                 let epoch = previous.maintenance_epoch;
                 let (opened, mut snapshot) = open_snapshot(&data_dir, sequence, epoch + 1);
                 connection = opened;
                 if let Err(error) = &result {
-                    crate::logger::log(format!("spread shift page migration failed: {error}"));
+                    crate::logger::log(format!("spread shift book maintenance failed: {error}"));
                     Arc::make_mut(&mut snapshot).status = Err(error.clone());
                 }
                 let changed = changed_keys(&previous, &snapshot);

@@ -184,24 +184,10 @@ fn with_identity_epub_coverage<T>(
     {
         let ranges = coverage
             .iter()
-            .filter_map(|(path, shape)| match shape {
-                IdentityCoverageShape::Exact
-                    if !path
-                        .extension()
-                        .and_then(|ext| ext.to_str())
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("epub")) =>
-                {
-                    None
+            .map(|(path, shape)| match shape {
+                IdentityCoverageShape::PathAndDescendants => {
+                    crate::pdf_loader::EpubPinCoverage::PathAndDescendants(path.clone())
                 }
-                IdentityCoverageShape::Exact => {
-                    Some(crate::pdf_loader::EpubPinCoverage::Exact(path.clone()))
-                }
-                IdentityCoverageShape::PathAndDescendants => Some(
-                    crate::pdf_loader::EpubPinCoverage::PathAndDescendants(path.clone()),
-                ),
-                IdentityCoverageShape::VirtualDescendants => Some(
-                    crate::pdf_loader::EpubPinCoverage::VirtualDescendants(path.clone()),
-                ),
             })
             .collect::<Vec<_>>();
         crate::pdf_loader::with_epub_pin_ranges(&ranges, action)
@@ -212,9 +198,7 @@ fn with_identity_epub_coverage<T>(
 
 #[derive(Clone, Copy)]
 enum IdentityCoverageShape {
-    Exact,
     PathAndDescendants,
-    VirtualDescendants,
 }
 
 /// 移行結果。`rows` = 書き換えた行数合計 (sidecar / パスワードは 1 件 = 1)。
@@ -1238,11 +1222,21 @@ pub(crate) fn copy_stores_at_with_progress(
     mappings: &[StoreCopyPathMapping],
     on_progress: impl FnMut(usize, usize),
 ) -> StoreCopyReport {
-    copy_stores_impl(data_dir, mappings, true, on_progress)
+    copy_stores_acquire_maintenance(data_dir, mappings, true, on_progress)
 }
 
-/// EPUB restore promotes its ledger row under the book guard after copying.
-/// Copying edit_origin here would recursively enter the EPUB range guard.
+/// Borrow the operation's EPUB-before-shift owner; never acquire recursively.
+pub(crate) fn copy_stores_at_with_maintenance(
+    data_dir: &Path,
+    mappings: &[StoreCopyPathMapping],
+    maintenance: &StoreMaintenanceLease,
+    on_progress: impl FnMut(usize, usize),
+) -> StoreCopyReport {
+    copy_stores_impl(data_dir, mappings, true, maintenance, on_progress)
+}
+
+/// The caller protects its EPUB book; this copy excludes the identity ledger and
+/// only takes short shift maintenance after the existing book protection.
 pub(crate) fn copy_restore_stores_without_identity_at(
     data_dir: &Path,
     mappings: &[StoreCopyPathMapping],
@@ -1255,23 +1249,90 @@ pub(crate) fn copy_restore_stores_without_identity_at_with_progress(
     mappings: &[StoreCopyPathMapping],
     on_progress: impl FnMut(usize, usize),
 ) -> StoreCopyReport {
-    copy_stores_impl(data_dir, mappings, false, on_progress)
+    copy_stores_acquire_maintenance(data_dir, mappings, false, on_progress)
 }
 
-fn copy_stores_impl(
+pub(crate) fn copy_restore_stores_without_identity_with_maintenance(
+    data_dir: &Path,
+    mappings: &[StoreCopyPathMapping],
+    maintenance: &StoreMaintenanceLease,
+    on_progress: impl FnMut(usize, usize),
+) -> StoreCopyReport {
+    copy_stores_impl(data_dir, mappings, false, maintenance, on_progress)
+}
+
+/// Match the identity copy's exact EPUB keys and virtual key families. Normal
+/// files do not acquire book coverage; a virtual family never includes its root.
+pub(crate) fn store_copy_epub_coverage(
+    mappings: &[StoreCopyPathMapping],
+) -> Vec<crate::pdf_loader::EpubPinCoverage> {
+    let mut coverage = Vec::new();
+    for mapping in mappings {
+        let (old_path, new_path) = match mapping {
+            StoreCopyPathMapping::Exact { old_path, new_path }
+            | StoreCopyPathMapping::VirtualPrefix { old_path, new_path } => (old_path, new_path),
+        };
+        if crate::path_key::normalize_keep_drive(old_path)
+            == crate::path_key::normalize_keep_drive(new_path)
+        {
+            continue;
+        }
+        for path in [old_path, new_path] {
+            match mapping {
+                StoreCopyPathMapping::Exact { .. }
+                    if path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("epub")) =>
+                {
+                    coverage.push(crate::pdf_loader::EpubPinCoverage::Exact(path.clone()));
+                }
+                StoreCopyPathMapping::Exact { .. } => {}
+                StoreCopyPathMapping::VirtualPrefix { .. } => coverage.push(
+                    crate::pdf_loader::EpubPinCoverage::VirtualDescendants(path.clone()),
+                ),
+            }
+        }
+    }
+    coverage
+}
+
+fn copy_stores_acquire_maintenance(
     data_dir: &Path,
     mappings: &[StoreCopyPathMapping],
     include_identity: bool,
-    mut on_progress: impl FnMut(usize, usize),
+    on_progress: impl FnMut(usize, usize),
 ) -> StoreCopyReport {
     let mut report = StoreCopyReport::default();
-    let _shift_maintenance = match crate::spread_shift::maintenance_at(data_dir) {
+    let coverage = if include_identity {
+        store_copy_epub_coverage(mappings)
+    } else {
+        Vec::new()
+    };
+    let maintenance = match acquire_store_maintenance(data_dir, &coverage) {
         Ok(lease) => lease,
         Err(error) => {
             report.errors.push(format!("spread_shift: {error}"));
             return report;
         }
     };
+    copy_stores_impl(
+        data_dir,
+        mappings,
+        include_identity,
+        &maintenance,
+        on_progress,
+    )
+}
+
+fn copy_stores_impl(
+    data_dir: &Path,
+    mappings: &[StoreCopyPathMapping],
+    include_identity: bool,
+    _maintenance: &StoreMaintenanceLease,
+    mut on_progress: impl FnMut(usize, usize),
+) -> StoreCopyReport {
+    let mut report = StoreCopyReport::default();
     let total = STORES
         .iter()
         .filter(|store| store.unique && (include_identity || store.file != "content_identity.db"))
@@ -1485,13 +1546,28 @@ pub(crate) fn run_at_with_shape(
     new_path: &Path,
     _tree: bool,
 ) -> RenameMigrationReport {
+    let coverage = [
+        crate::pdf_loader::EpubPinCoverage::PathAndDescendants(old_path.to_path_buf()),
+        crate::pdf_loader::EpubPinCoverage::PathAndDescendants(new_path.to_path_buf()),
+    ];
+    run_at_with_epub_acquisition(data_dir, old_path, new_path, || {
+        crate::pdf_loader::acquire_epub_pin_ranges(&coverage)
+    })
+}
+
+fn run_at_with_epub_acquisition(
+    data_dir: &Path,
+    old_path: &Path,
+    new_path: &Path,
+    acquire_epub: impl FnOnce() -> crate::pdf_loader::EpubRangeLease,
+) -> RenameMigrationReport {
     let mut report = RenameMigrationReport {
         rows: 0,
         errors: Vec::new(),
         store_mutations: StoreMutationEffects::default(),
         panicked: false,
     };
-    let _shift_maintenance = match crate::spread_shift::maintenance_at(data_dir) {
+    let _maintenance = match acquire_store_maintenance_with_epub(data_dir, acquire_epub) {
         Ok(lease) => lease,
         Err(error) => {
             report.errors.push(format!("spread_shift: {error}"));
@@ -1612,7 +1688,7 @@ pub(crate) fn purge_removed_paths_guarded_at(
     data_dir: &Path,
     removed: &[PathBuf],
     pdf_paths: &[PathBuf],
-    guard: &crate::pdf_loader::EpubRangeLease,
+    guard: &DeleteMaintenanceLease,
 ) -> PurgeReport {
     let scopes = removed
         .iter()
@@ -1622,18 +1698,49 @@ pub(crate) fn purge_removed_paths_guarded_at(
     purge_removed_scopes_guarded_at(data_dir, &scopes, pdf_paths, guard)
 }
 
-/// Acquire once before Shell, then pass this guard through every purge attempt.
+/// All maintenance takes EPUB protection before shift. Release shift first so
+/// its writer reload finishes while ledger/pin protection still belongs to us.
+pub(crate) struct StoreMaintenanceLease {
+    maintenance: crate::spread_shift::SpreadShiftMaintenanceLease,
+    epub: crate::pdf_loader::EpubRangeLease,
+}
+
+pub(crate) type DeleteMaintenanceLease = StoreMaintenanceLease;
+
+pub(crate) fn acquire_store_maintenance(
+    data_dir: &Path,
+    coverage: &[crate::pdf_loader::EpubPinCoverage],
+) -> Result<StoreMaintenanceLease, String> {
+    acquire_store_maintenance_with_epub(data_dir, || {
+        crate::pdf_loader::acquire_epub_pin_ranges(coverage)
+    })
+}
+
+fn acquire_store_maintenance_with_epub(
+    data_dir: &Path,
+    acquire_epub: impl FnOnce() -> crate::pdf_loader::EpubRangeLease,
+) -> Result<StoreMaintenanceLease, String> {
+    let epub = acquire_epub();
+    let maintenance = crate::spread_shift::maintenance_at(data_dir)?;
+    Ok(StoreMaintenanceLease { maintenance, epub })
+}
+
+/// Acquire EPUB coverage then shift, once before Shell. Borrow the same owner
+/// through every purge attempt without reacquiring either protection.
 pub(crate) fn acquire_delete_epub_guard(
+    data_dir: &Path,
     scopes: &[crate::delete_worker::DeleteSourceScope],
-) -> crate::pdf_loader::EpubRangeLease {
-    let paths = scopes
+) -> Result<DeleteMaintenanceLease, String> {
+    let coverage = scopes
         .iter()
         .map(|scope| match scope {
             crate::delete_worker::DeleteSourceScope::Exact(path)
-            | crate::delete_worker::DeleteSourceScope::Tree(path) => path.clone(),
+            | crate::delete_worker::DeleteSourceScope::Tree(path) => {
+                crate::pdf_loader::EpubPinCoverage::PathAndDescendants(path.clone())
+            }
         })
         .collect::<Vec<_>>();
-    crate::pdf_loader::acquire_epub_pin_coverage(&paths)
+    acquire_store_maintenance(data_dir, &coverage)
 }
 
 /// The SQL uses exact, slash-descendant and virtual-descendant keys for both
@@ -1644,16 +1751,48 @@ pub(crate) fn purge_removed_scopes_at(
     scopes: &[crate::delete_worker::DeleteSourceScope],
     pdf_paths: &[PathBuf],
 ) -> PurgeReport {
-    purge_removed_scopes_impl(data_dir, scopes, pdf_paths, None)
+    purge_removed_scopes_acquire_maintenance(data_dir, scopes, pdf_paths)
 }
 
 pub(crate) fn purge_removed_scopes_guarded_at(
     data_dir: &Path,
     scopes: &[crate::delete_worker::DeleteSourceScope],
     pdf_paths: &[PathBuf],
-    guard: &crate::pdf_loader::EpubRangeLease,
+    guard: &DeleteMaintenanceLease,
 ) -> PurgeReport {
-    purge_removed_scopes_impl(data_dir, scopes, pdf_paths, Some(guard))
+    purge_removed_scopes_impl(
+        data_dir,
+        scopes,
+        pdf_paths,
+        Some(&guard.epub),
+        &guard.maintenance,
+    )
+}
+
+#[cfg(test)]
+fn purge_removed_scopes_acquire_maintenance(
+    data_dir: &Path,
+    scopes: &[crate::delete_worker::DeleteSourceScope],
+    pdf_paths: &[PathBuf],
+) -> PurgeReport {
+    let mut report = PurgeReport::default();
+    if scopes.is_empty() {
+        return report;
+    }
+    let maintenance = match acquire_delete_epub_guard(data_dir, scopes) {
+        Ok(lease) => lease,
+        Err(error) => {
+            report.errors.push(format!("spread_shift: {error}"));
+            return report;
+        }
+    };
+    purge_removed_scopes_impl(
+        data_dir,
+        scopes,
+        pdf_paths,
+        Some(&maintenance.epub),
+        &maintenance.maintenance,
+    )
 }
 
 fn purge_removed_scopes_impl(
@@ -1661,18 +1800,12 @@ fn purge_removed_scopes_impl(
     scopes: &[crate::delete_worker::DeleteSourceScope],
     pdf_paths: &[PathBuf],
     guard: Option<&crate::pdf_loader::EpubRangeLease>,
+    _maintenance: &crate::spread_shift::SpreadShiftMaintenanceLease,
 ) -> PurgeReport {
     let mut report = PurgeReport::default();
     if scopes.is_empty() {
         return report;
     }
-    let _shift_maintenance = match crate::spread_shift::maintenance_at(data_dir) {
-        Ok(lease) => lease,
-        Err(error) => {
-            report.errors.push(format!("spread_shift: {error}"));
-            return report;
-        }
-    };
 
     let removed = scopes
         .iter()
@@ -1975,74 +2108,62 @@ fn migrate_store(
     if !db_path.exists() {
         return;
     }
-    // The SQL below migrates exact, slash descendants and virtual entries for
-    // both files and folders, so the guard must cover those same key families.
-    let shape = IdentityCoverageShape::PathAndDescendants;
-    let coverage = [
-        (PathBuf::from(old_key), shape),
-        (PathBuf::from(new_key), shape),
-    ];
-    let result = with_identity_epub_coverage(descriptor, &coverage, || {
-        (|| -> Result<usize, Box<dyn std::error::Error>> {
-            let mut conn =
-                open_store_for_write(db_path, descriptor).map_err(std::io::Error::other)?;
-            let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
-            let _rating_write =
-                (descriptor.table == "ratings").then(|| crate::rating_db::RATING_WRITES.begin());
-            let _tag_write =
-                (descriptor.file == "tags.db").then(|| crate::tags_db::TAG_WRITES.begin());
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let columns = table_columns(&tx, descriptor.table)?;
-            if columns.is_empty()
-                && descriptor.table_availability == StoreTableAvailability::OptionalInLegacySchema
-            {
-                return Ok(0);
-            }
-            if !columns.iter().any(|column| column == descriptor.column) {
-                return Err(
-                    rusqlite::Error::InvalidColumnName(descriptor.column.to_string()).into(),
-                );
-            }
-            let mut changed = 0usize;
-            changed += move_exact(
-                &tx,
-                descriptor.table,
-                descriptor.column,
-                descriptor.unique,
-                old_key,
-                new_key,
+    // The operation already owns the union EPUB coverage before shift maintenance.
+    let result = (|| -> Result<usize, Box<dyn std::error::Error>> {
+        let mut conn = open_store_for_write(db_path, descriptor).map_err(std::io::Error::other)?;
+        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+        let _rating_write =
+            (descriptor.table == "ratings").then(|| crate::rating_db::RATING_WRITES.begin());
+        let _tag_write = (descriptor.file == "tags.db").then(|| crate::tags_db::TAG_WRITES.begin());
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let columns = table_columns(&tx, descriptor.table)?;
+        if columns.is_empty()
+            && descriptor.table_availability == StoreTableAvailability::OptionalInLegacySchema
+        {
+            return Ok(0);
+        }
+        if !columns.iter().any(|column| column == descriptor.column) {
+            return Err(rusqlite::Error::InvalidColumnName(descriptor.column.to_string()).into());
+        }
+        let mut changed = 0usize;
+        changed += move_exact(
+            &tx,
+            descriptor.table,
+            descriptor.column,
+            descriptor.unique,
+            old_key,
+            new_key,
+        )?;
+        changed += move_prefix(
+            &tx,
+            descriptor.table,
+            descriptor.column,
+            descriptor.unique,
+            &format!("{old_key}/"),
+            &format!("{new_key}/"),
+        )?;
+        changed += move_prefix(
+            &tx,
+            descriptor.table,
+            descriptor.column,
+            descriptor.unique,
+            &format!("{old_key}::"),
+            &format!("{new_key}::"),
+        )?;
+        // rating.db はキーから導出される source_path 列 (一覧ビューがコンテナを開くのに
+        // 使う) も新キーに合わせる (`RatingDb::copy_entry_key` と同じ導出規則 =
+        // "::" より前、無ければキー自身)。
+        if descriptor.table == "ratings" && changed > 0 {
+            tx.execute(
+                &format!("{RATING_SOURCE_PATH_UPDATE} WHERE path = ?1"),
+                [new_key],
             )?;
-            changed += move_prefix(
-                &tx,
-                descriptor.table,
-                descriptor.column,
-                descriptor.unique,
-                &format!("{old_key}/"),
-                &format!("{new_key}/"),
-            )?;
-            changed += move_prefix(
-                &tx,
-                descriptor.table,
-                descriptor.column,
-                descriptor.unique,
-                &format!("{old_key}::"),
-                &format!("{new_key}::"),
-            )?;
-            // rating.db はキーから導出される source_path 列 (一覧ビューがコンテナを開くのに
-            // 使う) も新キーに合わせる (`RatingDb::copy_entry_key` と同じ導出規則 =
-            // "::" より前、無ければキー自身)。
-            if descriptor.table == "ratings" && changed > 0 {
-                tx.execute(
-                    &format!("{RATING_SOURCE_PATH_UPDATE} WHERE path = ?1"),
-                    [new_key],
-                )?;
-                update_rating_source_paths_for_prefix(&tx, &format!("{new_key}/"))?;
-                update_rating_source_paths_for_prefix(&tx, &format!("{new_key}::"))?;
-            }
-            tx.commit()?;
-            Ok(changed)
-        })()
-    });
+            update_rating_source_paths_for_prefix(&tx, &format!("{new_key}/"))?;
+            update_rating_source_paths_for_prefix(&tx, &format!("{new_key}::"))?;
+        }
+        tx.commit()?;
+        Ok(changed)
+    })();
 
     match result {
         Ok(n) => {
@@ -2151,33 +2272,9 @@ fn copy_store(
         return;
     }
     report.database_opens += 1;
-    let coverage = mappings
-        .iter()
-        .flat_map(|mapping| match mapping {
-            NormalizedStoreCopyMapping::Exact {
-                old_key, new_key, ..
-            } => [
-                (PathBuf::from(old_key), IdentityCoverageShape::Exact),
-                (PathBuf::from(new_key), IdentityCoverageShape::Exact),
-            ],
-            NormalizedStoreCopyMapping::Prefix {
-                old_prefix,
-                new_prefix,
-            } => [
-                (
-                    PathBuf::from(old_prefix.trim_end_matches("::")),
-                    IdentityCoverageShape::VirtualDescendants,
-                ),
-                (
-                    PathBuf::from(new_prefix.trim_end_matches("::")),
-                    IdentityCoverageShape::VirtualDescendants,
-                ),
-            ],
-        })
-        .collect::<Vec<_>>();
-    let result = with_identity_epub_coverage(&descriptor, &coverage, || {
-        copy_store_transaction(db_path, descriptor, mappings, on_mapping)
-    });
+    // Full copies hold their union EPUB coverage at the operation boundary;
+    // without-identity copies have no ledger mutation requiring a nested guard.
+    let result = copy_store_transaction(db_path, descriptor, mappings, on_mapping);
 
     match result {
         Ok(rows) => {
@@ -2570,6 +2667,91 @@ mod tests {
     use rusqlite::OptionalExtension;
     use sha2::{Digest, Sha256};
     use std::path::PathBuf;
+
+    #[test]
+    fn rename_waiting_for_epub_does_not_block_sibling_save_metadata_copy() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let data = tempfile::tempdir().unwrap();
+        let source = data.path().join("source.epub");
+        let renamed = data.path().join("renamed.epub");
+        let sibling = data.path().join("source.zip");
+        let source_key = crate::path_key::normalize_keep_drive(&source);
+        let sibling_key = crate::path_key::normalize_keep_drive(&sibling);
+        let renamed_key = crate::path_key::normalize_keep_drive(&renamed);
+        let connection = rusqlite::Connection::open(data.path().join("rotation.db")).unwrap();
+        connection
+            .execute_batch("CREATE TABLE rotations(path TEXT PRIMARY KEY, angle INTEGER NOT NULL)")
+            .unwrap();
+        connection
+            .execute("INSERT INTO rotations VALUES (?1, 90)", [&source_key])
+            .unwrap();
+        drop(connection);
+
+        // Save keeps this source protection throughout conversion. Global shift
+        // maintenance must remain available when rename needs this same book.
+        let book = crate::pdf_loader::acquire_epub_book_lease(&source);
+        let (epub_stage_tx, epub_stage_rx) = mpsc::channel();
+        let (release_stage_tx, release_stage_rx) = mpsc::channel();
+        let (renamed_tx, renamed_rx) = mpsc::channel();
+        let rename_data = data.path().to_path_buf();
+        let rename_source = source.clone();
+        let rename = std::thread::spawn(move || {
+            let coverage = [
+                crate::pdf_loader::EpubPinCoverage::PathAndDescendants(rename_source.clone()),
+                crate::pdf_loader::EpubPinCoverage::PathAndDescendants(renamed.clone()),
+            ];
+            let report =
+                run_at_with_epub_acquisition(&rename_data, &rename_source, &renamed, || {
+                    // Hold the EPUB-acquisition stage deterministically. Taking
+                    // shift before invoking this stage would deadlock the copy.
+                    epub_stage_tx.send(()).unwrap();
+                    release_stage_rx.recv().unwrap();
+                    crate::pdf_loader::acquire_epub_pin_ranges(&coverage)
+                });
+            renamed_tx.send(report).unwrap();
+        });
+        epub_stage_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        let (copied_tx, copied_rx) = mpsc::channel();
+        let copy_data = data.path().to_path_buf();
+        let copy = std::thread::spawn(move || {
+            copied_tx
+                .send(copy_restore_stores_without_identity_at(
+                    &copy_data,
+                    &[
+                        StoreCopyPathMapping::exact(&source, &sibling),
+                        StoreCopyPathMapping::virtual_prefix(&source, &sibling),
+                    ],
+                ))
+                .unwrap();
+        });
+        let copied = copied_rx.recv_timeout(Duration::from_secs(10));
+        // Release even on failure, so a failed regression cannot strand workers.
+        drop(book);
+        release_stage_tx.send(()).unwrap();
+        let migrated = renamed_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        rename.join().unwrap();
+        copy.join().unwrap();
+        let copied = copied.expect("rename took shift while waiting for EPUB acquisition");
+        assert!(copied.errors.is_empty(), "{:?}", copied.errors);
+        assert!(migrated.errors.is_empty(), "{:?}", migrated.errors);
+        assert_eq!(copied.rows, 1);
+        let connection = rusqlite::Connection::open(data.path().join("rotation.db")).unwrap();
+        for key in [sibling_key, renamed_key] {
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT angle FROM rotations WHERE path = ?1",
+                        [key],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                90
+            );
+        }
+    }
 
     #[test]
     fn pdf_and_image_store_copy_does_not_wait_for_nonoverlapping_epub_range() {

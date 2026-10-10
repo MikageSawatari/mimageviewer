@@ -166,7 +166,75 @@ pub(crate) fn restore_candidates_at_with_progress(
     selected: &[SelectedRestore],
     declined: &[DeclinedRestore],
     load_sidecar_bases: bool,
+    on_progress: impl FnMut(&'static str, usize, usize),
+) -> ContentRestoreReport {
+    // Cover the union before shift maintenance. Resolver/observer book guards
+    // cannot enter these ranges until every copy and promotion has finished.
+    let coverage = restore_epub_coverage(data_dir, selected, declined);
+    let maintenance =
+        match crate::rename_key_migration::acquire_store_maintenance(data_dir, &coverage) {
+            Ok(maintenance) => maintenance,
+            Err(error) => {
+                crate::logger::log(format!(
+                    "content_identity restore maintenance failed: {error}"
+                ));
+                return ContentRestoreReport {
+                    requested_restores: selected.len(),
+                    requested_declines: declined.len(),
+                    errors: vec![format!("spread_shift: {error}")],
+                    ..Default::default()
+                };
+            }
+        };
+    restore_candidates_with_maintenance(
+        data_dir,
+        selected,
+        declined,
+        load_sidecar_bases,
+        &maintenance,
+        on_progress,
+        || {},
+    )
+}
+
+fn restore_epub_coverage(
+    data_dir: &Path,
+    selected: &[SelectedRestore],
+    declined: &[DeclinedRestore],
+) -> Vec<crate::pdf_loader::EpubPinCoverage> {
+    let mappings = selected
+        .iter()
+        .flat_map(|selection| {
+            restore_copy_mappings(data_dir, &selection.candidate, &selection.source)
+        })
+        .collect::<Vec<_>>();
+    let mut coverage = crate::rename_key_migration::store_copy_epub_coverage(&mappings);
+    // Even a same-key or cross-kind restore can promote an EPUB target ledger.
+    for selection in selected {
+        if selection.candidate.target_kind == ContentKind::Epub {
+            coverage.push(crate::pdf_loader::EpubPinCoverage::Exact(
+                selection.candidate.target_path.clone(),
+            ));
+        }
+    }
+    for refusal in declined {
+        if refusal.target_key.to_ascii_lowercase().ends_with(".epub") {
+            coverage.push(crate::pdf_loader::EpubPinCoverage::Exact(PathBuf::from(
+                &refusal.target_key,
+            )));
+        }
+    }
+    coverage
+}
+
+fn restore_candidates_with_maintenance(
+    data_dir: &Path,
+    selected: &[SelectedRestore],
+    declined: &[DeclinedRestore],
+    load_sidecar_bases: bool,
+    maintenance: &crate::rename_key_migration::StoreMaintenanceLease,
     mut on_progress: impl FnMut(&'static str, usize, usize),
+    mut on_epub_coverage: impl FnMut(),
 ) -> ContentRestoreReport {
     let ordinary = selected
         .iter()
@@ -178,9 +246,10 @@ pub(crate) fn restore_candidates_at_with_progress(
             restore_copy_mappings(data_dir, &selection.candidate, &selection.source)
         })
         .collect::<Vec<_>>();
-    let copied = crate::rename_key_migration::copy_stores_at_with_progress(
+    let copied = crate::rename_key_migration::copy_stores_at_with_maintenance(
         data_dir,
         &mappings,
+        maintenance,
         |processed, total| on_progress("copy", processed, total),
     );
     let mut report = ContentRestoreReport {
@@ -221,51 +290,50 @@ pub(crate) fn restore_candidates_at_with_progress(
             on_progress("epub", epub_processed, epub_total);
             continue;
         };
-        let result = crate::pdf_loader::with_epub_pin_guard(
-            &selection.candidate.target_path,
-            || {
-                if super::capture_epub_provenance(&selection.candidate.target_path)?
-                    != super::EpubProvenance::Unpinned(expected)
-                {
-                    return Ok(None);
-                }
-                let db = ContentIdentityDb::open_at(&data_dir.join("content_identity.db"))
-                    .map_err(|error| error.to_string())?;
-                let source_entry = db
-                    .ledger_entry(&selection.source.file_key)?
-                    .ok_or_else(|| "restore source ledger row is missing".to_string())?;
-                if source_entry.full_hash.as_deref() != Some(selection.candidate.full_hash.as_str())
-                {
-                    return Err("restore source hash changed".into());
-                }
-                if db
-                    .ledger_entry(&selection.candidate.target_key)?
-                    .is_some_and(|entry| entry.has_restorable_content)
-                {
-                    return Ok(None);
-                }
-                let copied =
-                    crate::rename_key_migration::copy_restore_stores_without_identity_at_with_progress(
-                        data_dir,
-                        &mappings,
-                        |processed, _| {
-                            on_progress("epub", processed_before + processed, epub_total)
-                        },
-                    );
-                // A later store/promotion may fail after a pin store committed.
-                report.committed_thumbnail_pins += copied.committed_thumbnail_pins;
-                if !copied.errors.is_empty() {
-                    return Err(copied.errors.join("; "));
-                }
-                let (entry, changed) = mark_restored_origin_inner(
-                    &db,
-                    &selection.candidate,
-                    &selection.source,
-                    Some(expected),
-                )?;
-                Ok(Some((entry, changed, copied)))
-            },
-        );
+        // The batch range already excludes pinning and all ledger book guards.
+        // A nested book guard would wait on our own range, so perform the whole
+        // provenance/copy/promotion action directly under the operation owner.
+        let result = (|| {
+            on_epub_coverage();
+            if super::capture_epub_provenance(&selection.candidate.target_path)?
+                != super::EpubProvenance::Unpinned(expected)
+            {
+                return Ok(None);
+            }
+            let db = ContentIdentityDb::open_at(&data_dir.join("content_identity.db"))
+                .map_err(|error| error.to_string())?;
+            let source_entry = db
+                .ledger_entry(&selection.source.file_key)?
+                .ok_or_else(|| "restore source ledger row is missing".to_string())?;
+            if source_entry.full_hash.as_deref() != Some(selection.candidate.full_hash.as_str()) {
+                return Err("restore source hash changed".into());
+            }
+            if db
+                .ledger_entry(&selection.candidate.target_key)?
+                .is_some_and(|entry| entry.has_restorable_content)
+            {
+                return Ok(None);
+            }
+            let copied =
+                crate::rename_key_migration::copy_restore_stores_without_identity_with_maintenance(
+                    data_dir,
+                    &mappings,
+                    maintenance,
+                    |processed, _| on_progress("epub", processed_before + processed, epub_total),
+                );
+            // A later store/promotion may fail after a pin store committed.
+            report.committed_thumbnail_pins += copied.committed_thumbnail_pins;
+            if !copied.errors.is_empty() {
+                return Err(copied.errors.join("; "));
+            }
+            let (entry, changed) = mark_restored_origin_inner(
+                &db,
+                &selection.candidate,
+                &selection.source,
+                Some(expected),
+            )?;
+            Ok(Some((entry, changed, copied)))
+        })();
         match result {
             Ok(Some((entry, changed, copied))) => {
                 report.database_opens += copied.database_opens + 1;
@@ -331,7 +399,7 @@ fn apply_batch_ledger_updates(
     let total = selected.len() + declined.len();
     let mut processed = 0;
     for selection in selected {
-        match mark_restored_origin(&db, &selection.candidate, &selection.source) {
+        match mark_restored_origin_under_coverage(&db, &selection.candidate, &selection.source) {
             Ok(Some((entry, changed))) => {
                 report.rows += usize::from(changed);
                 report.ledger_entries.push(entry);
@@ -346,7 +414,7 @@ fn apply_batch_ledger_updates(
         on_progress("ledger", processed, total);
     }
     for refusal in declined {
-        match record_restore_declined(&db, refusal) {
+        match record_restore_declined_inner(&db, refusal) {
             Ok(changed) => report.rows += usize::from(changed),
             Err(error) => report.errors.push(format!(
                 "content_identity target={}: {error}",
@@ -363,14 +431,21 @@ fn record_restore_declined(
     refusal: &DeclinedRestore,
 ) -> Result<bool, String> {
     super::with_epub_ledger_key_guard(&refusal.target_key, || {
-        db.conn
-            .execute(
-                "INSERT OR IGNORE INTO restore_declined(full_hash, target_key) VALUES (?1, ?2)",
-                rusqlite::params![refusal.full_hash, refusal.target_key],
-            )
-            .map(|rows| rows > 0)
-            .map_err(|error| error.to_string())
+        record_restore_declined_inner(db, refusal)
     })
+}
+
+fn record_restore_declined_inner(
+    db: &ContentIdentityDb,
+    refusal: &DeclinedRestore,
+) -> Result<bool, String> {
+    db.conn
+        .execute(
+            "INSERT OR IGNORE INTO restore_declined(full_hash, target_key) VALUES (?1, ?2)",
+            rusqlite::params![refusal.full_hash, refusal.target_key],
+        )
+        .map(|rows| rows > 0)
+        .map_err(|error| error.to_string())
 }
 
 fn record_internal_byte_copy_decline(
@@ -440,6 +515,7 @@ fn restore_copy_mappings(
     mappings
 }
 
+#[cfg(test)]
 fn mark_restored_origin(
     db: &ContentIdentityDb,
     candidate: &RestoreCandidate,
@@ -467,6 +543,23 @@ fn mark_restored_origin(
     } else {
         action()
     }
+}
+
+/// The caller holds target coverage, including cross-kind ordinary selections.
+fn mark_restored_origin_under_coverage(
+    db: &ContentIdentityDb,
+    candidate: &RestoreCandidate,
+    source: &RestoreSourceCandidate,
+) -> Result<Option<(LedgerEntry, bool)>, String> {
+    let epub_state = if candidate.target_kind == ContentKind::Epub {
+        match super::capture_epub_provenance(&candidate.target_path)? {
+            super::EpubProvenance::Unpinned(state) => Some(state),
+            super::EpubProvenance::Pinned(_) => return Ok(None),
+        }
+    } else {
+        None
+    };
+    mark_restored_origin_inner(db, candidate, source, epub_state).map(Some)
 }
 
 fn mark_restored_origin_inner(
@@ -1057,6 +1150,122 @@ mod tests {
             epub_progress.last().unwrap().2
         );
     }
+
+    #[test]
+    fn epub_restore_and_overlapping_rename_share_maintenance_without_reacquiring() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let data = tempfile::tempdir().unwrap();
+        let origin = data.path().join("origin.epub");
+        let target = data.path().join("copy.epub");
+        let renamed = data.path().join("renamed.epub");
+        std::fs::write(&origin, b"same book bytes").unwrap();
+        std::fs::write(&target, b"same book bytes").unwrap();
+        let origin_key = crate::path_key::normalize_keep_drive(&origin);
+        let target_key = crate::path_key::normalize_keep_drive(&target);
+        let renamed_key = crate::path_key::normalize_keep_drive(&renamed);
+        let db = ContentIdentityDb::open_at(&data.path().join("content_identity.db")).unwrap();
+        db.upsert(
+            &ContentIdentitySource::from_path(&origin).unwrap(),
+            &RecordedFileState {
+                file_key: origin_key.clone(),
+                size: 15,
+                hashed_mtime: 1,
+            },
+            "head",
+            "full",
+            1,
+            ObservationRole::RestorableContent,
+        )
+        .unwrap();
+        create_rotation_rows(data.path(), &[(format!("{origin_key}::page_1"), 90)]);
+        let (mut candidate, source) = candidate(origin, target.clone(), ContentKind::Epub, "full");
+        candidate.epub_source_state = Some(crate::epub_cache::source_state(
+            &std::fs::metadata(&target).unwrap(),
+        ));
+        drop(db);
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (restored_tx, restored_rx) = mpsc::channel();
+        let restore_data = data.path().to_path_buf();
+        let restore = std::thread::spawn(move || {
+            // The batch owner takes union EPUB coverage before shift maintenance.
+            let selected = [SelectedRestore { candidate, source }];
+            let coverage = restore_epub_coverage(&restore_data, &selected, &[]);
+            let maintenance =
+                crate::rename_key_migration::acquire_store_maintenance(&restore_data, &coverage)
+                    .unwrap();
+            let report = restore_candidates_with_maintenance(
+                &restore_data,
+                &selected,
+                &[],
+                false,
+                &maintenance,
+                |_, _, _| {},
+                || {
+                    // Freeze under union EPUB coverage: copying and promotion must
+                    // borrow the same owner without a nested book or shift acquisition.
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+            );
+            drop(maintenance);
+            restored_tx.send(report).unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        let (rename_started_tx, rename_started_rx) = mpsc::channel();
+        let (renamed_tx, renamed_rx) = mpsc::channel();
+        let rename_data = data.path().to_path_buf();
+        let rename = std::thread::spawn(move || {
+            rename_started_tx.send(()).unwrap();
+            renamed_tx
+                .send(crate::rename_key_migration::run_at(
+                    &rename_data,
+                    &target,
+                    &renamed,
+                ))
+                .unwrap();
+        });
+        rename_started_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        release_tx.send(()).unwrap();
+        let restored = restored_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("EPUB copy recursively acquired shift maintenance");
+        let migrated = renamed_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("overlapping rename did not complete after restore released its owner");
+        restore.join().unwrap();
+        rename.join().unwrap();
+        assert!(restored.errors.is_empty(), "{:?}", restored.errors);
+        assert!(migrated.errors.is_empty(), "{:?}", migrated.errors);
+        assert_eq!(restored.ledger_entries.len(), 1);
+        let connection = rusqlite::Connection::open(data.path().join("rotation.db")).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT angle FROM rotations WHERE path = ?1",
+                    [format!("{renamed_key}::page_1")],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            90
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM rotations WHERE path = ?1",
+                    [format!("{target_key}::page_1")],
+                    |row| row.get::<_, usize>(0)
+                )
+                .unwrap(),
+            0
+        );
+    }
     use crate::content_identity::{
         ContentIdentitySource, ObservationRole, RecordedFileState, stage0_target,
     };
@@ -1087,6 +1296,95 @@ mod tests {
                 source_exists: true,
             },
         )
+    }
+
+    #[test]
+    fn restore_union_covers_sources_targets_virtual_families_and_declines() {
+        use crate::pdf_loader::EpubPinCoverage;
+
+        let data = tempfile::tempdir().unwrap();
+        let source = data.path().join("source.epub");
+        let target = data.path().join("target.epub");
+        let declined = data.path().join("declined.epub");
+        let image = data.path().join("image.png");
+        let same_target = data.path().join("same.epub");
+        let (epub_candidate, epub_source) =
+            candidate(source.clone(), target.clone(), ContentKind::Epub, "full");
+        let (mut cross_candidate, cross_source) = candidate(
+            image.clone(),
+            same_target.clone(),
+            ContentKind::Image,
+            "cross",
+        );
+        cross_candidate.target_kind = ContentKind::Epub;
+        let (same_candidate, same_source) = candidate(
+            same_target.clone(),
+            same_target.clone(),
+            ContentKind::Epub,
+            "same",
+        );
+        let coverage = restore_epub_coverage(
+            data.path(),
+            &[
+                SelectedRestore {
+                    candidate: epub_candidate,
+                    source: epub_source,
+                },
+                SelectedRestore {
+                    candidate: cross_candidate,
+                    source: cross_source,
+                },
+                SelectedRestore {
+                    candidate: same_candidate,
+                    source: same_source,
+                },
+            ],
+            &[
+                DeclinedRestore {
+                    full_hash: "declined".into(),
+                    target_key: crate::path_key::normalize_keep_drive(&declined),
+                },
+                DeclinedRestore {
+                    full_hash: "image".into(),
+                    target_key: crate::path_key::normalize_keep_drive(&image),
+                },
+            ],
+        );
+        let exact = coverage
+            .iter()
+            .filter_map(|item| match item {
+                EpubPinCoverage::Exact(path) => Some(crate::path_key::normalize_keep_drive(path)),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            exact,
+            [source.clone(), target.clone(), same_target, declined]
+                .iter()
+                .map(|path| crate::path_key::normalize_keep_drive(path))
+                .collect()
+        );
+        let virtuals = coverage
+            .iter()
+            .filter_map(|item| match item {
+                EpubPinCoverage::VirtualDescendants(path) => {
+                    Some(crate::path_key::normalize_keep_drive(path))
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            virtuals,
+            [source, target]
+                .iter()
+                .map(|path| crate::path_key::normalize_keep_drive(path))
+                .collect()
+        );
+        assert!(
+            !coverage
+                .iter()
+                .any(|item| matches!(item, EpubPinCoverage::PathAndDescendants(_)))
+        );
     }
 
     fn create_rotation_rows(data_dir: &Path, keys: &[(String, i64)]) {

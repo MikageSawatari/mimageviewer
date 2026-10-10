@@ -195,6 +195,70 @@ pub(crate) fn clear_all(connection: &mut Connection) -> Result<usize, String> {
     Ok(changed)
 }
 
+/// Completed book-folder operations retain payload spelling and affect only that root family.
+/// The caller is the single shift worker, with its existing writable connection.
+pub(crate) fn rename_book_root(
+    connection: &mut Connection,
+    source: &str,
+    target: &str,
+) -> Result<usize, String> {
+    validate_storage_key(source)?;
+    validate_storage_key(target)?;
+    if source == target {
+        return Ok(0);
+    }
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let rows = load_rows(&transaction)?;
+    let prefix = format!("{}/", source.trim_end_matches('/'));
+    let mut moved = 0;
+    for (key, reference) in rows {
+        let destination = if key == source {
+            target.to_owned()
+        } else if let Some(suffix) = key.strip_prefix(&prefix) {
+            format!("{}/{suffix}", target.trim_end_matches('/'))
+        } else {
+            continue;
+        };
+        validate_storage_key(&destination)?;
+        let wire = serde_json::to_string(&reference).map_err(|error| error.to_string())?;
+        // Follow the existing destination-priority rule for persisted metadata.
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO spread_shifts(path, anchor_ref) VALUES (?1, ?2)",
+                rusqlite::params![destination, wire],
+            )
+            .map_err(|error| error.to_string())?;
+        moved += transaction
+            .execute("DELETE FROM spread_shifts WHERE path = ?1", [key])
+            .map_err(|error| error.to_string())?;
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(moved)
+}
+
+/// A deleted book root clears its scopes; deleting a page does not match its parent scope.
+pub(crate) fn purge_book_root(connection: &mut Connection, root: &str) -> Result<usize, String> {
+    validate_storage_key(root)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let rows = load_rows(&transaction)?;
+    let prefix = format!("{}/", root.trim_end_matches('/'));
+    let mut removed = 0;
+    for key in rows
+        .keys()
+        .filter(|key| key.as_str() == root || key.starts_with(&prefix))
+    {
+        removed += transaction
+            .execute("DELETE FROM spread_shifts WHERE path = ?1", [key])
+            .map_err(|error| error.to_string())?;
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(removed)
+}
+
 struct PathMappingIndex {
     by_from: HashMap<String, (usize, PathBuf)>,
 }
@@ -299,6 +363,63 @@ pub(crate) fn migrate_page_paths_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_rename_rejects_oversized_child_scope_without_changing_original_rows() {
+        let (_temp, mut connection) = database();
+        let parent = format!(
+            "c:/books/{}",
+            "chapter/".repeat((crate::book_scope::MAX_BOOK_REFERENCE_BYTES - 256) / 8)
+        );
+        let parent = parent.trim_end_matches('/');
+        let source = format!("{parent}/old");
+        let target = format!("{parent}/{}", "n".repeat(200));
+        let child = format!("{source}/{}", "x".repeat(100));
+        validate_storage_key(&target).unwrap();
+        let anchor = SpreadShiftPageRef::RelativePath("Page.JPG".into());
+        set(&mut connection, &source, &anchor).unwrap();
+        set(&mut connection, &child, &anchor).unwrap();
+        let original = load_rows(&connection).unwrap();
+        assert!(rename_book_root(&mut connection, &source, &target).is_err());
+        assert_eq!(load_rows(&connection).unwrap(), original);
+    }
+
+    #[test]
+    fn completed_book_root_operations_preserve_payload_and_destination_priority() {
+        let (_temp, mut connection) = database();
+        let source = "c:/books/old%_book";
+        let target = "c:/books/new_book";
+        let old = SpreadShiftPageRef::RelativePath("NewChapter/Page.JPG".into());
+        let kept = SpreadShiftPageRef::RelativePath("Keep.JPG".into());
+        for key in [
+            source.to_owned(),
+            format!("{source}/chapter"),
+            format!("{source}-other"),
+        ] {
+            set(&mut connection, &key, &old).unwrap();
+        }
+        set(&mut connection, target, &kept).unwrap();
+        assert_eq!(
+            rename_book_root(&mut connection, source, target).unwrap(),
+            2
+        );
+        let rows = load_rows(&connection).unwrap();
+        assert!(!rows.contains_key(source));
+        assert!(!rows.contains_key(&format!("{source}/chapter")));
+        assert_eq!(rows[target], kept);
+        assert_eq!(rows[&format!("{target}/chapter")], old);
+        assert_eq!(rows[&format!("{source}-other")], old);
+        assert_eq!(
+            purge_book_root(
+                &mut connection,
+                &format!("{target}/Page.JPG").to_lowercase()
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(purge_book_root(&mut connection, target).unwrap(), 2);
+        assert_eq!(load_rows(&connection).unwrap().len(), 1);
+    }
 
     fn database() -> (tempfile::TempDir, Connection) {
         let temp = tempfile::tempdir().unwrap();

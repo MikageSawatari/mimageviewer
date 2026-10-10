@@ -32,8 +32,30 @@ pub(crate) fn normalize_level_prefix(prefix: &str) -> Result<String, String> {
     if prefix.is_empty() {
         return Ok(String::new());
     }
-    validate_relative_reference(prefix)?;
-    Ok(prefix.replace('\\', "/").to_lowercase())
+    normalize_relative_reference(prefix)
+}
+
+/// An identity lookup key only. Stored references retain their original spelling.
+pub(crate) fn normalize_relative_reference(reference: &str) -> Result<String, String> {
+    validate_relative_reference(reference)?;
+    Ok(reference.replace('\\', "/").to_lowercase())
+}
+
+/// Strip a logical root using the shared path comparison while preserving the suffix.
+/// Compare at separator boundaries rather than slicing a case-folded string: Unicode
+/// folding can change byte lengths, and the original suffix is needed by byte readers.
+pub(crate) fn relative_reference_from_root(root: &Path, path: &str) -> Result<String, String> {
+    let root_key = crate::path_key::normalize_keep_drive(root);
+    for (boundary, separator) in path.char_indices().filter(|(_, c)| matches!(c, '/' | '\\')) {
+        if crate::path_key::normalize_keep_drive(Path::new(&path[..boundary]))
+            == root_key.trim_end_matches('/')
+        {
+            let relative = &path[boundary + separator.len_utf8()..];
+            validate_relative_reference(relative)?;
+            return Ok(relative.to_owned());
+        }
+    }
+    Err("page identity is outside its logical book".into())
 }
 
 impl BookScopeKey {
@@ -166,6 +188,23 @@ mod tests {
             assert!(BookScopeKey::archive("C:/book.zip", &[invalid.into()]).is_err());
         }
         assert_eq!(normalize_level_prefix("A\\B").unwrap(), "a/b");
+        assert_eq!(normalize_relative_reference("A\\B.JPG").unwrap(), "a/b.jpg");
+    }
+
+    #[test]
+    fn relative_suffix_preserves_spelling_when_root_case_folding_changes_byte_lengths() {
+        let root = BookScopeKey::folder("C:/Books/İ").unwrap();
+        assert_eq!(
+            relative_reference_from_root(&root.logical_root, "C:\\BOOKS\\İ\\Chapter\\Page.JPG")
+                .unwrap(),
+            "Chapter\\Page.JPG"
+        );
+        assert!(
+            relative_reference_from_root(&root.logical_root, "C:/Books/İ-other/Page.JPG").is_err()
+        );
+        assert!(
+            relative_reference_from_root(&root.logical_root, "C:/Books/İ/../Page.JPG").is_err()
+        );
     }
 
     #[test]

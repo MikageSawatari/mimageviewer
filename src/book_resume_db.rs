@@ -513,7 +513,7 @@ enum Command {
 }
 
 struct QueuedCommand {
-    mutation_seq: Option<u64>,
+    position_fence_seq: Option<u64>,
     command: Command,
 }
 
@@ -577,7 +577,7 @@ impl BookResumeWriter {
                 // tx が全て drop されるまで (= App 終了まで) 受信し続ける。channel に
                 // 溜まっている分は Disconnected 前に drain されるので取りこぼしは無い。
                 while let Ok(QueuedCommand {
-                    mutation_seq,
+                    position_fence_seq,
                     command,
                 }) = rx.recv()
                 {
@@ -588,7 +588,8 @@ impl BookResumeWriter {
                             if let Err(e) = &result {
                                 crate::logger::log(format!("book-resume writer: set failed: {e}"));
                             }
-                            let seq = mutation_seq.expect("Record is a mutation");
+                            let seq =
+                                position_fence_seq.expect("Record advances the position fence");
                             // Move the publication out briefly so COW of a held
                             // snapshot never blocks UI admission on a full-map clone.
                             let mut publication =
@@ -633,7 +634,13 @@ impl BookResumeWriter {
                                     snapshot.status = Err(e);
                                 }
                             }
-                            worker_state.lock().unwrap().snapshot = Some(publication);
+                            let seq = position_fence_seq.expect("Read advances the position fence");
+                            snapshot.completed_through = seq;
+                            {
+                                let mut state = worker_state.lock().unwrap();
+                                state.snapshot = Some(publication);
+                                state.watermarks.completed_through = seq;
+                            }
                             let _ = tx.send(result);
                         }
                         Command::ReadPositionAfter(key, cutoff, tx) => {
@@ -669,7 +676,8 @@ impl BookResumeWriter {
                                 ));
                             }
                             {
-                                let seq = mutation_seq.expect("Clear is a mutation");
+                                let seq =
+                                    position_fence_seq.expect("Clear advances the position fence");
                                 let mut publication =
                                     worker_state.lock().unwrap().snapshot.take().unwrap();
                                 let snapshot = Arc::make_mut(&mut publication);
@@ -714,7 +722,13 @@ impl BookResumeWriter {
     }
 
     fn send_locked(&self, command: Command, state: &mut WriterState) -> bool {
-        let mutation_seq = matches!(command, Command::Record(..) | Command::Clear(..)).then(|| {
+        // A maintenance reread changes the published position view, so it must
+        // fence later receipts just like Record/Clear, even though it writes no DB row.
+        let position_fence_seq = matches!(
+            command,
+            Command::Record(..) | Command::Read(..) | Command::Clear(..)
+        )
+        .then(|| {
             state
                 .watermarks
                 .admitted
@@ -724,12 +738,12 @@ impl BookResumeWriter {
         self.pending.fetch_add(1, Ordering::AcqRel);
         if self.tx.as_ref().is_some_and(|tx| {
             tx.send(QueuedCommand {
-                mutation_seq,
+                position_fence_seq,
                 command,
             })
             .is_ok()
         }) {
-            if let Some(seq) = mutation_seq {
+            if let Some(seq) = position_fence_seq {
                 state.watermarks.admitted = seq;
             }
             true
@@ -747,7 +761,7 @@ impl BookResumeWriter {
         ResumeWatermarkReader(Arc::clone(&self.state))
     }
 
-    /// Only offer a warm snapshot when it covers every currently admitted write.
+    /// Only offer a warm snapshot when it covers every admitted write and reload.
     /// A retained older Arc still cannot cover a later receipt's larger cutoff.
     pub(crate) fn position_snapshot(&self) -> Option<Arc<PositionSnapshot>> {
         let state = self.state.lock().unwrap();
@@ -979,6 +993,12 @@ mod tests {
         assert!(!writer.record(Path::new("C:/book.zip"), 2, None));
         assert_eq!(writer.watermarks(), ResumeWatermarks::default());
         assert_eq!(writer.pending.load(Ordering::Acquire), 0);
+        assert!(matches!(
+            writer.read_all().try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        assert_eq!(writer.watermarks(), ResumeWatermarks::default());
+        assert_eq!(writer.pending.load(Ordering::Acquire), 0);
         let reply = position_reply(&writer, Path::new("C:/book.zip"), 0);
         assert!(reply.status.is_err());
     }
@@ -1156,6 +1176,63 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(position_reply(&writer, book, 1).position.is_none());
+    }
+
+    #[test]
+    fn pending_reload_fences_warm_retained_snapshot_and_external_transaction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("resume.db");
+        let writer = BookResumeWriter::spawn_at(db_path.clone()).unwrap();
+        let book = Path::new("C:/book.zip");
+        let key = normalize_path(book);
+        assert!(writer.record(book, 2, None));
+        assert_eq!(position_reply(&writer, book, 1).position.unwrap().page, 2);
+        let before_reload = writer.position_snapshot().unwrap();
+        let db = BookResumeDb::open_at(&db_path).unwrap();
+        let observer = writer.watermark_reader();
+        let release = writer.pause_for_test();
+        // Existing maintenance updates rows externally, then accepts this reread.
+        db.set(book, 17).unwrap();
+        let reloaded = writer.read_all();
+        let cutoff = writer.watermarks().admitted;
+        assert_eq!(cutoff, 2);
+        assert_eq!(writer.watermarks().completed_through, 1);
+        assert_eq!(db.read_position(&key).unwrap().unwrap().page, 17);
+        assert!(writer.position_snapshot().is_none());
+        assert!(before_reload.read_after(&key, cutoff).is_none());
+        // Even an external transaction which could already see the changed DB
+        // cannot prove completion of the accepted, still unfinished reread.
+        assert!(db.read_position_proven(&key, cutoff, &observer).is_none());
+        assert!(db.read_position_proven(&key, 1, &observer).is_none());
+        let restored = writer.read_position_after(&key, cutoff);
+        assert!(matches!(
+            restored.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            reloaded.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        release.send(()).unwrap();
+        let meter = reloaded
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(meter.values[&key], None);
+        let reply = restored.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(reply.cutoff, cutoff);
+        assert_eq!(reply.completed_through, cutoff);
+        assert_eq!(reply.position.unwrap().page, 17);
+        assert_eq!(reply.status, Ok(()));
+        let after_reload = writer.position_snapshot().unwrap();
+        assert_eq!(after_reload.completed_through, cutoff);
+        assert_eq!(after_reload.values[&key].page, 17);
+        assert_eq!(before_reload.values[&key].page, 2);
+        assert!(before_reload.read_after(&key, cutoff).is_none());
+        let proven = db.read_position_proven(&key, cutoff, &observer).unwrap();
+        assert_eq!(proven.completed_through, cutoff);
+        assert_eq!(proven.position.unwrap().page, 17);
+        assert_eq!(proven.status, Ok(()));
     }
 
     #[test]
