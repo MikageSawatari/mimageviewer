@@ -1,4 +1,4 @@
-"""Guard the reviewed scope of public privacy claims, including search metadata."""
+"""Guard final privacy wording and reject obsolete blanket claims."""
 from html.parser import HTMLParser
 import json
 from pathlib import Path
@@ -7,6 +7,10 @@ import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
 PUBLIC = ROOT / 'htdocs/mimageviewer'
+UPDATE_JP = ('音響調整を開いている間、画面表示に使う Windows の機能 (WebView2) が、'
+             'Microsoft に自身の更新を確認することがあります。曲名や画像は送信しません。')
+UPDATE_EN = ('while audio adjustment is open, the Windows feature used to display it (WebView2) '
+             'may contact Microsoft to check for its own updates. It does not send song titles or artwork.')
 
 
 def normalize(text):
@@ -23,7 +27,7 @@ class Blocks(HTMLParser):
         attrs = dict(attrs)
         if tag == 'meta' and 'content' in attrs:
             self.blocks.append(normalize(attrs['content']))
-        if tag in ('p', 'span', 'h2', 'h3'):
+        if tag in ('p', 'span', 'h2', 'h3', 'li', 'div'):
             self.active.append((tag, []))
 
     def handle_data(self, data):
@@ -61,12 +65,12 @@ def json_strings(value):
 def text_assurances(text):
     result = []
     text = normalize(text)
-    topic = re.search(r'広告|アクセス解析|利用状況|advertis|analytics|usage reporting', text, re.I)
-    assurance = re.search(r'一切含みません|含まず|含みません|ありません(?!か)|広告なし|no advertising|no analytics', text, re.I)
-    scope = re.search(r'本体|mImageViewer itself', text, re.I)
-    if topic and assurance and not scope:
-        result.append(text)
-    for match in re.finditer(r'安心して使えます|この\s*4\s*つ以外に通信しません|通信は増えません|本アプリが外部と通信するのは、次の場合に限られます|connects to the internet only|EPUB conversion is not another network case', text, re.I):
+    # The approved final wording allows simple advertising/analytics statements
+    # and the safety heading. Preserve rejection of the actual legacy guarantees
+    # and exclusive network claims, not the superseded blanket scope requirement.
+    for match in re.finditer(r'(?:広告|アクセス解析|利用状況)[^。]*?(?:一切含みません|含まず)|no analytics tools and no advertising|この\s*4\s*つ以外に通信しません|通信は増えません|本アプリが外部と通信するのは、次の場合に限られます|connects to the internet only|EPUB conversion is not another network case', text, re.I):
+        result.append(match.group())
+    for match in re.finditer(r'確認済み|今回の実機確認|実機確認が残|公開前|確認では|この確認では|verified features|has been verified|observed session|hardware session|still pending|finalized before release|were not used in that session', text, re.I):
         result.append(match.group())
     # A scope elsewhere in a paragraph/description cannot qualify a blanket
     # AI sentence: the claim itself must identify the main app's image AI.
@@ -108,20 +112,25 @@ class PublicPrivacyScopeTests(unittest.TestCase):
             '<p>広告、アクセス解析ツール、利用状況の送信を<strong>一切含みません</strong>。</p>',
             '<p>本アプリは、アクセス解析ツール・広告を<strong>一切含みません</strong>。</p>',
             '<p>The App contains <strong>no analytics tools and no advertising</strong>.</p>',
-            '<meta name="description" content="無料・広告なしの画像ビューア">',
-            '<h2>安心して使えます</h2>',
             '<p>EPUB の変換も通信は増えません。</p>',
+            '<p>この4つ以外に通信しません。</p>',
+            '<p>EPUB conversion is not another network case.</p>',
+            '<p>本アプリが外部と通信するのは、次の場合に限られます。</p>',
+            '<p>AI 処理はすべて PC 内で完結します。</p>',
             '<script type="application/ld+json">' + json.dumps({'mainEntity': [{'acceptedAnswer': {'text': '広告・アクセス解析・利用状況の送信は含まず、アカウント登録も不要です。'}}]}, ensure_ascii=False) + '</script>',
         ]
         for source in examples:
             with self.subTest(source=source):
                 self.assertTrue(unscoped_assurances(source))
         self.assertEqual(unscoped_assurances('<h3>広告はありますか？画像が外部に送られることはありませんか？</h3>'), [])
+        self.assertEqual(unscoped_assurances(
+            '<h2>安心して使えます</h2><p>広告・アクセス解析ツール・利用状況の送信はありません。</p>'
+            '<meta name="description" content="無料・広告なしの画像ビューア">'), [])
 
     def test_real_previous_network_and_ai_wordings_fail_in_pages(self):
         cases = [
             ('privacy.html',
-             'mImageViewer 本体で確認済みの外部通信は、次の場面で発生します。',
+             '本アプリでは、次のような通信が発生します。',
              '本アプリが外部と通信するのは、次の場合に限られます。'),
             ('index.html',
              'mImageViewer 本体の画像 AI 処理は PC 内で完結します。',
@@ -163,27 +172,55 @@ class PublicPrivacyScopeTests(unittest.TestCase):
         source = (PUBLIC / 'manual/faq.html').read_text(encoding='utf-8')
         visible, search = faq_answer(source)
         self.assertEqual(visible, search)
-        self.assertIn('確認済みの mImageViewer 本体の機能', search)
+        self.assertIn('広告・アクセス解析ツール・利用状況の送信はありません。', search)
+        self.assertIn(UPDATE_JP, search)
 
-    def test_japanese_hardware_draft_is_consistent_and_bounded(self):
-        descriptions = []
+    def test_japanese_update_notice_is_consistent(self):
         for name in ('index.html', 'privacy.html', 'manual/faq.html'):
-            paragraphs = blocks((PUBLIC / name).read_text(encoding='utf-8'))
-            description = next(text for text in paragraphs if text.startswith('音響調整の画面表示に使う Windows の表示機能'))
-            descriptions.append(description)
-            self.assertIn('Microsoft に自身の更新を確認することがあります', description)
-            self.assertIn('音楽の再生と曲送りを行った確認では', description)
-            self.assertIn('SFZ 音源と音声予測は、この確認では使っていません', description)
-            self.assertNotIn('component updater', description)
-        self.assertEqual(len(set(descriptions)), 1)
+            with self.subTest(page=name):
+                paragraphs = blocks((PUBLIC / name).read_text(encoding='utf-8'))
+                self.assertTrue(any(UPDATE_JP in text for text in paragraphs))
+        privacy = (PUBLIC / 'privacy.html').read_text(encoding='utf-8')
+        network = privacy.split('<h2>ネットワーク通信</h2>', 1)[1].split('</section>', 1)[0]
+        self.assertEqual(sum(UPDATE_JP in normalize(text) for text in re.findall(r'<li>(.*?)</li>', network, re.S)), 1)
 
-    def test_english_draft_matches_observation_scope(self):
+    def test_english_final_wording_and_epub(self):
         text = (PUBLIC / 'privacy.html').read_text(encoding='utf-8')
-        self.assertIn('The verified features of mImageViewer itself contain', text)
-        self.assertIn('may contact Microsoft to check for its own updates', text)
-        self.assertIn('In the observed session of opening audio adjustment, playing music and changing tracks', text)
-        self.assertIn('SFZ instruments and adaptive audio prediction were not used in that session', text)
-        self.assertIn('during EPUB conversion was not examined in this hardware session', text)
+        self.assertIn(UPDATE_EN, text)
+        self.assertIn('Network activity includes the following:', text)
+        self.assertIn('blocks requests to external sites included in the book', text)
+        self.assertIn('本に含まれる外部サイトへの要求を遮断します', text)
+        network = text.split('<h2>Network communication</h2>', 1)[1].split('</section>', 1)[0]
+        self.assertEqual(sum(UPDATE_EN in normalize(item) for item in re.findall(r'<li>(.*?)</li>', network, re.S)), 1)
+
+    def test_sfz_storage_and_learning_match_hardware_facts(self):
+        text = normalize((PUBLIC / 'privacy.html').read_text(encoding='utf-8'))
+        self.assertEqual(text.count('%APPDATA%\\Frieve\\EffeTunePlugin\\sfz-references.json'), 2)
+        for claim in ('名前と保存場所を記録します', 'コピーしません', '元のファイルは削除しません',
+                      '学習内容はメモリ内で使い、ファイルには保存しません',
+                      'instrument names and locations', 'are not copied', 'leaving the source files untouched',
+                      'keeps learned data in memory and does not save it to files'):
+            with self.subTest(claim=claim):
+                self.assertIn(claim, text)
+
+    def test_old_pending_process_wording_is_rejected_in_pages(self):
+        replacements = [
+            ('privacy.html', '本アプリでは、次のような通信が発生します。',
+             'mImageViewer 本体で確認済みの外部通信は、次の場面で発生します。'),
+            ('privacy.html', 'Network activity includes the following:',
+             'The following network activity has been verified for mImageViewer itself:'),
+            ('index.html', UPDATE_JP,
+             '同梱 EffeTune v0.13.0 の新機能については、実機確認が残っています。公開前に説明を確定します。'),
+            ('manual/faq.html', UPDATE_JP,
+             'SFZ instruments and adaptive audio prediction were not used in that session.'),
+        ]
+        for name, final, pending in replacements:
+            source = (PUBLIC / name).read_text(encoding='utf-8')
+            self.assertIn(final, source)
+            for occurrence in re.finditer(re.escape(final), source):
+                with self.subTest(page=name, offset=occurrence.start()):
+                    restored = source[:occurrence.start()] + pending + source[occurrence.end():]
+                    self.assertTrue(unscoped_assurances(restored))
 
 
 if __name__ == '__main__':

@@ -48,7 +48,7 @@
 <p>音程の変更やサンプルレートの変換では、折り返しノイズを自動的に抑えます。</p>
 <p><strong>Retrigger Drop</strong> で、同じ音の検出が続いている間に再発音する条件を調整できます。検出と <strong>Note Hold</strong> の保持期間が終わってから同じ音を再び検出すると、新しい音として発音します。</p>
 <h2 id="音質調整ガイド">音質調整ガイド</h2>
-<p><strong>Select SFZ Folder…</strong> を押し、SFZ ファイル、サンプル、インクルードファイルを含む音源フォルダを選びます。複数の SFZ ファイルが見つかった場合は音源を選んで <strong>Select</strong> を押します。登録した音源は <strong>SFZ</strong> で選べます。元の音源フォルダを保管してください。</p>
+<p><strong>Select SFZ Folder…</strong> を押し、SFZ ファイル、サンプル、インクルードファイルを含む音源フォルダを選びます。複数の SFZ ファイルが見つかった場合は音源を選んで <strong>Select</strong> を押します。登録した音源は <strong>SFZ</strong> で選べます。音源の名前と保存場所は EffeTune の設定フォルダ（%APPDATA%\Frieve\EffeTunePlugin）の sfz-references.json に記録します。サンプルは元のフォルダから読み取り、コピーしません。<strong>Remove</strong> は登録だけを削除し、元のファイルは削除しません。元の音源フォルダを保管してください。</p>
 
 <p>まず <strong>Dry</strong> を 0%、<strong>Wet</strong> を 100% にして音源だけを聴き、<strong>Dry</strong> を上げて原音を重ねます。<strong>Octave</strong> を -1 にすると原音に低い音を、+1 にすると高い音を重ねられます。<strong>Threshold</strong> を上げると、より確実に検出された音だけを拾いやすくなります。<strong>Lowest Note</strong> と <strong>Highest Note</strong> で聴きたい音域に絞れます。音源が常に弱すぎる、または強すぎる場合は <strong>Velocity 1 Level</strong> と <strong>Velocity 127 Level</strong> を調整し、最後に <strong>Output Gain</strong> で音量を揃えます。</p>
 <p>低い旋律を追うには <strong>Lowest</strong> だけを、高い旋律を追うには <strong>Highest</strong> だけを有効にします。</p>

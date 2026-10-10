@@ -922,3 +922,34 @@ Microsoftに自身の更新を確認することがあります」。曲情報�
 
 今回は公開文書／Python回帰のみ。Rust／C++／bundleに変更無し。
 前回のfull gateと確認buildの証拠はこの範囲で有効。build-dev・アプリ起動・commitを行わない。
+
+## 11. 実機gate完了と公開文面の確定 (2026-10-10)
+
+利用者が公開文面の確定・簡素化を承認した。§10の草案／確認待ち状態はこの決定で更新する。
+証拠は `target/D359-agent-hwcheck.md` の09:45–09:55および10:20–10:30の追記と
+`target/hw-agent/` のnet-log／保存先snapshot。ClaudeCodeがisolated mIV data-dirで実施した。
+
+- SFZ選択・読み込み・再生・再登録・RemoveとAdaptive PredictionのLearn／音楽処理で、
+  EffeTune page要求はlocal virtual host、外部要求はWebView2自身のMicrosoft更新確認。
+  listening socket無し、曲名／artworkの外部送信無し。
+- SFZ登録は `%APPDATA%\Frieve\EffeTunePlugin\sfz-references.json` に音源名と保存場所を記録。
+  sampleはコピーせず、Removeは参照だけを削除し、source folder／filesは変更しなかった。
+- Adaptive Predictionの学習内容はメモリ内で、model／learned data／cacheのファイル書き込み無し。
+  これにより§6.2のSFZ／Adaptive Prediction通信・保存gateを完了とする。
+  EPUB runtime通信はこの記録の対象外であり、通信ゼロを説明に追加しない。
+
+公開文書は日英privacy・製品ページ・FAQ本文／JSON-LD・検索metadataから
+「確認済みの本体機能」等の反復と試験／確認待ち／公開前確定の経過説明を除去した。
+通信一覧は非排他的にし、音響調整の画面表示に使うWindowsの機能（WebView2）が
+Microsoftに自身の更新を確認すること、曲名／画像を送信しないことを一項目で案内する。
+SFZの登録保存先・sample非copy・Removeの範囲と、音声予測の学習非保存を日英privacyに記載。
+画像AIは音声予測と混同しないよう「本体の画像AI」の機能範囲を維持する。
+EPUBはbook由来の外部要求を遮断する記述を維持し、Runtime全通信に保証を広げない。
+
+SFZ説明書の既存の外部音源参照の説明は生成元 `docs/effetune-docs-overrides/others.json` に
+保存先・非copy・Removeの確定動作を反映し再生成。Adaptive Prediction説明書の
+「学習済み係数は一時的でプリセットには保存されない」は実機事実と整合し、変更不要。
+回帰は確定文面の通信項目・日英storage・FAQ検索文面一致・経過説明の再流入を検査し、
+旧AI／通信限定保証とFAQ以外のJSON-LDも引き続き拒否する。
+引き継ぎは `target/D359-final-msg2.txt`。通信設定・Runtime・bundleは変更しない。
+署名済み最終artifactの受入れとNow PlayingのVisualizer表示確認は別の残項目。
