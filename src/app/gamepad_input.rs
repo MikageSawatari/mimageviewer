@@ -9626,20 +9626,45 @@ mod next_input_tests {
                 (
                     vec!["Width", "Height"],
                     FullscreenFitMode::Page,
-                    vec![FullscreenFitMode::Original, FullscreenFitMode::Page],
+                    vec![
+                        FullscreenFitMode::Original,
+                        FullscreenFitMode::SpecifiedScale,
+                        FullscreenFitMode::Page,
+                    ],
                 ),
                 (
                     vec!["Width", "Height"],
                     FullscreenFitMode::Width,
-                    vec![FullscreenFitMode::Page, FullscreenFitMode::Original],
+                    vec![
+                        FullscreenFitMode::Page,
+                        FullscreenFitMode::Original,
+                        FullscreenFitMode::SpecifiedScale,
+                    ],
                 ),
                 (
                     vec!["Page", "Width", "Height"],
                     FullscreenFitMode::Page,
-                    vec![FullscreenFitMode::Original, FullscreenFitMode::Original],
+                    vec![
+                        FullscreenFitMode::Original,
+                        FullscreenFitMode::SpecifiedScale,
+                        FullscreenFitMode::Original,
+                    ],
                 ),
                 (
                     vec!["Page", "Width", "Height"],
+                    FullscreenFitMode::Original,
+                    vec![
+                        FullscreenFitMode::SpecifiedScale,
+                        FullscreenFitMode::Original,
+                    ],
+                ),
+                (
+                    vec!["Page", "Width", "Height", "SpecifiedScale"],
+                    FullscreenFitMode::Page,
+                    vec![FullscreenFitMode::Original, FullscreenFitMode::Original],
+                ),
+                (
+                    vec!["Page", "Width", "Height", "SpecifiedScale"],
                     FullscreenFitMode::Original,
                     vec![FullscreenFitMode::Original, FullscreenFitMode::Original],
                 ),
@@ -9683,6 +9708,7 @@ mod next_input_tests {
                     FullscreenFitMode::Width,
                     FullscreenFitMode::Height,
                     FullscreenFitMode::Original,
+                    FullscreenFitMode::SpecifiedScale,
                     FullscreenFitMode::Page,
                 ] {
                     dispatch(

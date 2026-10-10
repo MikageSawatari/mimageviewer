@@ -10705,7 +10705,9 @@ mod tests {
                 rotation: rot,
                 free_rotation_rad: free,
                 content_bbox: None,
-                fit_mode: crate::settings::FullscreenFitMode::Page,
+                fit_mode: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
+                    crate::settings::FullscreenFitMode::Page,
+                ),
                 fit_scale_limits:
                     crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
                 pixels_per_point: 1.0,

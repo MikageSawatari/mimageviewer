@@ -828,6 +828,25 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["拡大", "縮小", "倍率", "zoom"]
     ),
     entry!(
+        "spread/specified-scale",
+        SpreadMode,
+        "指定サイズ",
+        [
+            "幅",
+            "高さ",
+            "％",
+            "%",
+            "px",
+            "point",
+            "サイズ",
+            "余白",
+            "5倍",
+            "最大倍率",
+            "共通",
+            "20倍"
+        ]
+    ),
+    entry!(
         "spread/no-upscale",
         SpreadMode,
         "拡大しない",
@@ -1634,6 +1653,29 @@ mod tests {
                 .iter()
                 .any(|entry| entry.anchor == "spread/continuous-scroll")
         );
+    }
+
+    #[test]
+    fn specified_scale_search_targets_shared_editor_anchor() {
+        for query in [
+            "指定サイズ",
+            "幅 高さ",
+            "％",
+            "px",
+            "5倍",
+            "最大倍率",
+            "20倍",
+        ] {
+            assert!(
+                search_preferences(query, test_tree_position)
+                    .iter()
+                    .any(|entry| {
+                        entry.page == PreferencesPage::SpreadMode
+                            && entry.anchor == "spread/specified-scale"
+                    }),
+                "missing specified-size result for {query}"
+            );
+        }
     }
 
     #[test]

@@ -2386,7 +2386,7 @@ impl App {
         // drawing the default floating bar on top of the text.
         child_ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
 
-        egui::ScrollArea::vertical()
+        let scroll_output = egui::ScrollArea::vertical()
             .id_salt("metadata_scroll")
             .auto_shrink([false, false])
             .show(&mut child_ui, |ui| {
@@ -2681,6 +2681,20 @@ impl App {
                     draw_no_metadata(ui);
                 }
             });
+
+        #[cfg(test)]
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new("metadata_scroll_test_layout"),
+                (
+                    scroll_output.inner_rect,
+                    scroll_output.content_size,
+                    scroll_output.state.offset,
+                ),
+            );
+        });
+        #[cfg(not(test))]
+        let _ = scroll_output;
 
         self.similar_panel
             .finish_thumbnail_frame(ctx, &similar_actions.thumbnail_demand);

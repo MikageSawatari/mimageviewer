@@ -36,7 +36,12 @@ pub fn draw_diagnostics_export_snapshot_fixture(ui: &mut egui::Ui, state: &str) 
 #[doc(hidden)]
 pub fn draw_fullscreen_fit_cycle_settings_snapshot_fixture(ui: &mut egui::Ui) {
     let mut settings = Settings::default();
-    settings.fullscreen_fit_cycle_excluded = vec!["Page".into(), "Width".into(), "Height".into()];
+    settings.fullscreen_fit_cycle_excluded = vec![
+        "Page".into(),
+        "Width".into(),
+        "Height".into(),
+        "SpecifiedScale".into(),
+    ];
     pages::draw_fullscreen_fit_cycle_settings(ui, &mut settings);
 }
 
@@ -45,6 +50,47 @@ pub fn draw_grid_background_double_click_settings_snapshot_fixture(ui: &mut egui
     let mut settings = Settings::default();
     settings.grid_background_double_click_parent = true;
     pages::draw_grid_background_double_click_setting(ui, &mut settings);
+}
+
+/// Preferences editor. The HUD uses its own skin with the same axis controls.
+/// Returns true only when the user changed an axis setting or the common cap.
+pub fn draw_fullscreen_specified_scale_settings(
+    ui: &mut egui::Ui,
+    value: &mut crate::settings::FullscreenSpecifiedScale,
+    max_tenths: &mut u32,
+) -> bool {
+    pages::draw_fullscreen_specified_scale_settings(ui, value, max_tenths)
+}
+
+#[doc(hidden)]
+pub fn draw_fullscreen_fit_cycle_settings(ui: &mut egui::Ui, settings: &mut Settings) {
+    pages::draw_fullscreen_fit_cycle_settings(ui, settings);
+}
+
+#[doc(hidden)]
+pub fn draw_fullscreen_specified_scale_live_settings(
+    ui: &mut egui::Ui,
+    value: &mut crate::settings::FullscreenSpecifiedScale,
+    max_tenths: &mut u32,
+    favorite: bool,
+) -> bool {
+    crate::ui_fullscreen::draw_fs_specified_scale_live_editor(ui, value, max_tenths, favorite)
+}
+
+pub(crate) fn draw_fullscreen_specified_scale_axis_controls(
+    ui: &mut egui::Ui,
+    axis: &mut crate::settings::SpecifiedScaleAxisSetting,
+    label: &str,
+) {
+    pages::draw_fullscreen_specified_scale_axis_controls(ui, axis, label, true);
+}
+
+pub(crate) fn draw_fullscreen_specified_scale_max_controls(
+    ui: &mut egui::Ui,
+    max_tenths: &mut u32,
+    dark_popup: bool,
+) -> bool {
+    pages::draw_fullscreen_specified_scale_max_controls(ui, max_tenths, dark_popup)
 }
 
 mod name_colors;
@@ -2206,6 +2252,16 @@ fn merge_video_media_memory_for_preferences(
 
 impl App {
     pub(crate) fn install_preferences_settings(&mut self, mut settings: Settings) {
+        // A legacy favorite's missing value follows the newly edited common
+        // setting. Read presence from the existing state owner, not effective values.
+        if settings.active_favorite_view_id().is_some()
+            && self
+                .favorite_view_state_for_capture()
+                .fullscreen_specified_scale
+                .is_none()
+        {
+            settings.fullscreen_specified_scale = settings.common_fullscreen_specified_scale();
+        }
         let old_raw_brightness = self.settings.raw_brightness;
         let requested_raw_parallelism = settings.raw_develop_parallelism.clamp(1, 10);
         if requested_raw_parallelism != self.settings.raw_develop_parallelism {
@@ -2225,6 +2281,12 @@ impl App {
             != settings.thumb_show_media_duration
             || self.settings.thumb_show_resume_meter != settings.thumb_show_resume_meter;
         let books_root_changed = self.settings.books_root_path() != settings.books_root_path();
+        // Fit mode is shared across contexts. End the selected continuous unit
+        // at the setting boundary, including parked owners that will not draw
+        // between a mode exit and a later re-entry.
+        if self.settings.fullscreen_fit_mode != settings.fullscreen_fit_mode {
+            self.invalidate_all_continuous_specified_fit_references();
+        }
         self.settings = settings;
         #[cfg(windows)]
         self.publish_effetune_auto_setting();
@@ -3898,11 +3960,11 @@ mod tests {
 
     #[test]
     fn file_type_visibility_page_edits_draft_and_all_show_reset() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
         let live = Settings::default();
         let mut state = preferences_state_for_test(&live);
         state.selected = PreferencesPage::FileTypeVisibility;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(700.0, 650.0))
             .build_state(
                 |ctx, state| {
@@ -3959,10 +4021,10 @@ mod tests {
 
     #[test]
     fn file_type_visibility_preferences_cancel_ok_save_and_reopen() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
         let mut app = crate::app::setup_app_for_test();
         app.open_preferences_request(PreferencesOpenRequest::FILE_TYPE_VISIBILITY);
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1100.0, 850.0))
             .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
         harness.run();
@@ -6232,6 +6294,9 @@ mod tests {
                 sort_order: SortOrder::FileName,
                 default_spread_mode: SpreadMode::Single,
                 default_reading_flow: ReadingFlow::Paged,
+                fullscreen_specified_scale: Some(
+                    crate::settings::FullscreenSpecifiedScale::default(),
+                ),
             },
             1 => FavoriteViewState {
                 grid_view_mode: GridViewMode::Details,
@@ -6247,6 +6312,14 @@ mod tests {
                 sort_order: SortOrder::DateDesc,
                 default_spread_mode: SpreadMode::RtlCover,
                 default_reading_flow: ReadingFlow::Horizontal,
+                fullscreen_specified_scale: Some(crate::settings::FullscreenSpecifiedScale {
+                    width: crate::settings::SpecifiedScaleAxisSetting::disabled(
+                        crate::settings::SpecifiedScaleAxis::PercentTenths(800),
+                    ),
+                    height: crate::settings::SpecifiedScaleAxisSetting::enabled(
+                        crate::settings::SpecifiedScaleAxis::LogicalPixels(800),
+                    ),
+                }),
             },
             _ => FavoriteViewState {
                 grid_view_mode: GridViewMode::Thumbnail,
@@ -6262,6 +6335,14 @@ mod tests {
                 sort_order: SortOrder::Numeric,
                 default_spread_mode: SpreadMode::Ltr,
                 default_reading_flow: ReadingFlow::Vertical,
+                fullscreen_specified_scale: Some(crate::settings::FullscreenSpecifiedScale {
+                    width: crate::settings::SpecifiedScaleAxisSetting::disabled(
+                        crate::settings::SpecifiedScaleAxis::PercentTenths(800),
+                    ),
+                    height: crate::settings::SpecifiedScaleAxisSetting::disabled(
+                        crate::settings::SpecifiedScaleAxis::PercentTenths(800),
+                    ),
+                }),
             },
         }
     }
@@ -6321,6 +6402,222 @@ mod tests {
             assert!(edited.active_favorite_view_id().is_none());
             assert!(!edited.thumb_tooltip_show_filename);
             assert_eq!(edited.details_column_order, vec![DetailsColumnId::Name]);
+        }
+    }
+
+    #[test]
+    fn specified_scale_preferences_install_updates_inheritance_and_preserves_explicit_favorite() {
+        use crate::settings::{FavoriteViewState, FullscreenSpecifiedScale, SpecifiedScaleAxis};
+
+        for explicit in [
+            None,
+            Some(FullscreenSpecifiedScale {
+                width: crate::settings::SpecifiedScaleAxisSetting::disabled(
+                    crate::settings::SpecifiedScaleAxis::PercentTenths(800),
+                ),
+                height: crate::settings::SpecifiedScaleAxisSetting::disabled(
+                    crate::settings::SpecifiedScaleAxis::PercentTenths(800),
+                ),
+            }),
+        ] {
+            let mut app = crate::app::setup_app_for_test();
+            app.settings.remember_favorite_view_state = true;
+            app.settings.fullscreen_specified_scale_max_tenths = 80;
+            let id = uuid::Uuid::new_v4();
+            let mut stored = FavoriteViewState::from_settings(&app.settings);
+            stored.fullscreen_specified_scale = explicit;
+            app.favorite_view_states.insert(id, stored.clone());
+            app.settings.apply_favorite_view_overlay(id, &stored);
+            let new_common = FullscreenSpecifiedScale {
+                width: crate::settings::SpecifiedScaleAxisSetting::enabled(
+                    SpecifiedScaleAxis::LogicalPixels(800),
+                ),
+                height: crate::settings::SpecifiedScaleAxisSetting::enabled(
+                    SpecifiedScaleAxis::PercentTenths(250),
+                ),
+            };
+            let mut edited = app.settings.preferences_snapshot();
+            edited.fullscreen_specified_scale = new_common;
+            edited.fullscreen_specified_scale_max_tenths = 25;
+            assert_eq!(app.settings.fullscreen_specified_scale_max_tenths, 80);
+            prepare_preferences_settings_for_commit(&mut edited, &mut app.settings);
+            assert_eq!(edited.fullscreen_specified_scale_max_tenths, 25);
+            app.install_preferences_settings(edited);
+            assert_eq!(app.settings.fullscreen_specified_scale_max_tenths, 25);
+            assert_eq!(
+                app.settings
+                    .preferences_snapshot()
+                    .fullscreen_specified_scale_max_tenths,
+                25
+            );
+            assert_eq!(app.settings.common_fullscreen_specified_scale(), new_common);
+            assert_eq!(
+                app.settings.fullscreen_specified_scale,
+                explicit.unwrap_or(new_common)
+            );
+            assert_eq!(app.favorite_view_states.get(&id), Some(&stored));
+            assert_eq!(app.settings.active_favorite_view_id(), Some(id));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn specified_scale_preferences_mode_exit_reentry_invalidates_mounted_and_parked_units() {
+        use crate::settings::FullscreenFitMode;
+        use crate::ui_fullscreen::{ContinuousReadingUnitSpec, ContinuousSpecifiedFitReference};
+
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.fullscreen_fit_mode = FullscreenFitMode::SpecifiedScale;
+        let seed = |owner: &mut App| {
+            owner.fs_continuous_fit_reference = ContinuousSpecifiedFitReference::Specified {
+                unit: ContinuousReadingUnitSpec::pages(7, vec![7, 8]),
+                settings: Default::default(),
+                limits: Default::default(),
+                base: None,
+            };
+            owner.fs_zoom = 1.7;
+            owner.fs_vertical_scroll = 123.0;
+        };
+        let parked = app.build_window_context_for_test(13420, seed);
+        seed(&mut app);
+
+        // Applying an unchanged mode preserves the selected reference.
+        let unchanged = app.settings.clone();
+        app.install_preferences_settings(unchanged);
+        assert!(matches!(
+            app.fs_continuous_fit_reference,
+            ContinuousSpecifiedFitReference::Specified { .. }
+        ));
+        app.with_window_context_for_test(parked, |owner| {
+            assert!(matches!(
+                owner.fs_continuous_fit_reference,
+                ContinuousSpecifiedFitReference::Specified { .. }
+            ));
+        });
+
+        let mut edited = app.settings.clone();
+        edited.fullscreen_fit_mode = FullscreenFitMode::Page;
+        app.install_preferences_settings(edited);
+        assert!(matches!(
+            app.fs_continuous_fit_reference,
+            ContinuousSpecifiedFitReference::Legacy
+        ));
+
+        // No layout or parked mount takes place between exit and re-entry.
+        let mut edited = app.settings.clone();
+        edited.fullscreen_fit_mode = FullscreenFitMode::SpecifiedScale;
+        app.install_preferences_settings(edited);
+        assert!(matches!(
+            app.fs_continuous_fit_reference,
+            ContinuousSpecifiedFitReference::Legacy
+        ));
+        assert_eq!(app.fs_zoom, 1.7);
+        assert_eq!(app.fs_vertical_scroll, 123.0);
+        app.with_window_context_for_test(parked, |owner| {
+            assert!(matches!(
+                owner.fs_continuous_fit_reference,
+                ContinuousSpecifiedFitReference::Legacy
+            ));
+            assert_eq!(owner.fs_zoom, 1.7);
+            assert_eq!(owner.fs_vertical_scroll, 123.0);
+        });
+    }
+
+    #[test]
+    fn specified_scale_preferences_numeric_editor_ime_enter_escape_keeps_dialog_open() {
+        use crate::settings::{FullscreenSpecifiedScale, SpecifiedScaleAxis};
+        use egui_kittest::kittest::Queryable;
+
+        for (key, maximum) in [
+            (egui::Key::Enter, 32768.0),
+            (egui::Key::Escape, 32768.0),
+            (egui::Key::Enter, 20.0),
+            (egui::Key::Escape, 20.0),
+        ] {
+            let mut app = crate::app::setup_app_for_test();
+            app.settings.fullscreen_specified_scale = FullscreenSpecifiedScale {
+                width: crate::settings::SpecifiedScaleAxisSetting::enabled(
+                    SpecifiedScaleAxis::LogicalPixels(800),
+                ),
+                height: crate::settings::SpecifiedScaleAxisSetting::enabled(
+                    SpecifiedScaleAxis::PercentTenths(800),
+                ),
+            };
+            let original = app.settings.fullscreen_specified_scale;
+            app.open_preferences_request(PreferencesOpenRequest::anchored(
+                PreferencesPage::SpreadMode,
+                "spread/specified-scale",
+            ));
+            let mut harness = crate::test_ui::builder()
+                .with_size(egui::vec2(1100.0, 850.0))
+                .build_state(
+                    |ctx, app| {
+                        crate::ime_focus::install_ime_input_policy(ctx);
+                        app.show_preferences_dialog(ctx);
+                    },
+                    app,
+                );
+            // The anchor highlight deliberately repaints for a bounded time.
+            // Finish the initial scroll frames, then clear only that visual
+            // test decoration before checking the real numeric input handler.
+            harness.run_steps(5);
+            harness.state_mut().pref_state.as_mut().unwrap().highlight = None;
+            harness
+                .get_by(|node| {
+                    node.min_numeric_value() == Some(1.0)
+                        && node.max_numeric_value() == Some(maximum)
+                })
+                .scroll_to_me();
+            harness.run();
+            harness
+                .get_by(|node| {
+                    node.min_numeric_value() == Some(1.0)
+                        && node.max_numeric_value() == Some(maximum)
+                })
+                .focus();
+            harness.run();
+            assert!(
+                harness
+                    .get_by(|node| {
+                        node.min_numeric_value() == Some(1.0)
+                            && node.max_numeric_value() == Some(maximum)
+                    })
+                    .is_focused()
+            );
+            harness.input_mut().events.extend([
+                egui::Event::Ime(egui::ImeEvent::Enabled),
+                egui::Event::Ime(egui::ImeEvent::Preedit("１２".into())),
+            ]);
+            harness.run();
+            harness.key_press(key);
+            harness.run();
+            assert!(
+                harness.state().show_preferences,
+                "IME {key:?} must not close the preferences dialog; max={maximum}"
+            );
+            assert_eq!(
+                harness
+                    .state()
+                    .settings
+                    .fullscreen_specified_scale_max_tenths,
+                50
+            );
+            assert!(!harness.state().show_preferences_discard_confirm);
+            assert!(harness.state().pref_state.is_some());
+            assert_eq!(
+                harness.state().settings.fullscreen_specified_scale,
+                original
+            );
+            assert!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .fullscreen_specified_scale
+                    .is_valid()
+            );
         }
     }
 

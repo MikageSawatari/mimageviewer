@@ -47,6 +47,14 @@ pub enum FsLoadResult {
         source_dims: [usize; 2],
         animation: StaticAnimationState,
     },
+    /// PDF metadata and pixels cross the same context/generation validation boundary.
+    /// Pixel source coordinates remain raster-sized; fit uses the independent page box.
+    StaticPdf {
+        ci: egui::ColorImage,
+        source_dims: [usize; 2],
+        page_size_points: crate::pdf_loader::PdfPageSizePoints,
+        content_type: crate::pdf_loader::PdfPageContentType,
+    },
     /// 保持済み CPU ピクセルから再投入する静止画。
     ///
     /// PDF ラスタ保持キャッシュの hit では、大きい `ColorImage` を clone せずに
