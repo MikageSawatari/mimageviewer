@@ -7,13 +7,53 @@ import argparse
 from contextlib import closing
 import hashlib
 import json
+import shutil
 import sqlite3
 import sys
+import uuid
 from pathlib import Path
 
 from generate_release_checks_fixture import TRAY_NAMES, isolated_path, reject_reparse
 
 REPO = Path(__file__).resolve().parents[2]
+
+
+def catalog_keys(db, scratch_root):
+    wal = db.with_name(db.name + "-wal")
+    reject_reparse(wal)
+    if not wal.exists() or not wal.stat().st_size:
+        with closing(sqlite3.connect(db.as_uri() + "?mode=ro&immutable=1", uri=True)) as conn:
+            return read_keys(conn)
+
+    # Process exit guarantees a stable DB + WAL, not that SQLite checkpointed
+    # every committed transaction into the main file. Immutable ignores WAL.
+    # Let SQLite recover its own WAL in a private copy, rebuilding SHM there;
+    # never open the evidence/profile source in a mode that can modify it.
+    with wal.open("rb") as stream:
+        header = stream.read(32)
+    page_size = int.from_bytes(header[8:12], "big")
+    if (len(header) != 32 or header[:4] not in (b"\x37\x7f\x06\x82", b"\x37\x7f\x06\x83")
+            or int.from_bytes(header[4:8], "big") != 3007000
+            or page_size < 512 or page_size > 65536 or page_size & (page_size - 1)
+            or (wal.stat().st_size - 32) % (page_size + 24)):
+        raise ValueError(f"invalid stopped catalog WAL: {db}")
+    reject_reparse(scratch_root)
+    scratch_root.mkdir(parents=True, exist_ok=True)
+    scratch = isolated_path(scratch_root / ("snapshot-" + uuid.uuid4().hex), scratch_root)
+    scratch.mkdir()
+    try:
+        copied = scratch / "catalog.db"
+        shutil.copyfile(db, copied)
+        shutil.copyfile(wal, copied.with_name(copied.name + "-wal"))
+        with closing(sqlite3.connect(copied.as_uri() + "?mode=ro", uri=True)) as conn:
+            return read_keys(conn)
+    finally:
+        isolated_path(scratch, scratch_root)
+        shutil.rmtree(scratch)
+
+
+def read_keys(conn):
+    return [row[0] for row in conn.execute("SELECT filename FROM thumbnails WHERE substr(filename,1,9)<>'audioart:'")]
 
 
 def catalog_path(data, folder):
@@ -55,14 +95,7 @@ def preflight(manifest_path, data, case_id, *, stopped=False, repo=REPO):
         reject_reparse(db)
         keys = []
         if db.exists():
-            # Immutable avoids DB/SHM changes. A live/persisted WAL cannot be
-            # ignored as empty cache; require a fully flushed stopped catalog.
-            wal = db.with_name(db.name + "-wal")
-            reject_reparse(wal)
-            if wal.exists() and wal.stat().st_size:
-                raise ValueError("nonempty stopped catalog WAL: cache proof unavailable")
-            with closing(sqlite3.connect(db.as_uri() + "?mode=ro&immutable=1", uri=True)) as conn:
-                keys = [row[0] for row in conn.execute("SELECT filename FROM thumbnails WHERE substr(filename,1,9)<>'audioart:'")]
+            keys = catalog_keys(db, repo / "target" / "release-check-preflight-snapshots")
         opens.append({"folder_path": str(folder), "pre_open_absent": not keys, "catalog_keys": keys})
     return {"schema_version": 1, "case_id": case_id, "stopped": True, "data_dir": str(data),
             "fixture_manifest": str(manifest_path), "opens": opens}

@@ -597,3 +597,31 @@ Ctrl+G と固定検索語の Text 配送、期待hit集合・通常on_exit は�
 
 非対話検証・診断portable再buildの記録は `target/F-phase4-fix6-msg.txt` と
 `target/F-phase4-fix6-evidence/`。アプリ／ui-smokeは実行せず、修正台本の自然な描画数と実suite完走は利用者実行待ち。
+
+### Phase 4 停止済み catalog の WAL 読取とログ帰属修正（2026-10-11）
+
+利用者実行 `release-checks-20261010-184021-8289cf9d` は seed-profile と seed-perf-cached が PASS。
+後者の263 catalog（parent 1、navigation 6、load 256）のうち、parent は本体DBに245件、
+261 catalog は各4件を保存済みだった。最後の `cached/folder-0256` は本体DBが0件、
+53,592 byte のWALに正常commit済みの4件が残っていた。SQLiteによるWALを含む読取で4件を確認した。
+通常on_exit・process終了を待ってからprofileをコピーする順序は正しく、早いコピーやseed漏れではない。
+commitの永続化と本体DBへのcheckpointは別であり、process終了だけでは全catalogのcheckpointを保証しない。
+
+- preflightの非空WAL一律拒否を修正する。停止済みDBとWALを使い捨てscratchへコピーし、
+  SQLite自身の通常のWAL読取で保存済みキーを取得する。SHMはscratch内で再構築し、
+  source profile／元の証跡のDB・WAL・SHMは一切変更しない。WALなしは従来のimmutable読取を維持する。
+  不正・途中までのWAL形式は環境不成立として止める。stopped assertion、exact data path、
+  marker、fixture path、reparse／traversal拒否は維持し、キーの生成やcache missの免除は行わない。
+- static-foregroundはpreflightで止まり、一度も起動していなかった。そのlogはseed-perf-cachedと
+  hashが完全一致する。case directoryの再利用ではなく、起動前にactiveDirを割り当てたためfinallyが
+  復元profileのseed logを誤って保存していた。ログ帰属は実際のStart-Process成功後からarchive完了までに限定する。
+  起動直後の失敗でも旧logを混入させないよう、次の起動直前に既にarchive済みのruntime log 2ファイルだけを
+  隔離dataから取り除く。seedの元証跡、停止済みcopy、設定／cacheは変更しない。
+  preflight stdout／stderrをcase内へ保存し、具体的な失敗理由をsuiteの環境不成立へ引き継ぐ。
+- 5 idle、cached／uncached perfは毎回同じ停止済みseedを復元し、起動前に全528 folderのproofを読む。
+  最後のcached WALを含む全256 loadと6 navigationの保存済みキー、および未読uncached／trayの不在を維持する。
+  各caseの通常終了・archiveは復元より先で、起動後の失敗は当該caseのログだけを保存する。
+  全キー・request／generation・最初のcache/source producer、tray backlog、測定境界、描画数、gap gateは変更しない。
+
+実行済みの非対話検証と引き継ぎは `target/F-phase4-fix7-msg.txt` と `target/F-phase4-fix7-evidence/`。
+Rustソースは変更しておらず、診断portableの再buildは行わない。アプリ／ui-smokeは実行していない。

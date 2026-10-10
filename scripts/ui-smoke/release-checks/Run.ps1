@@ -8,7 +8,7 @@ if (-not $InteractiveApproved) { [Console]::Error.WriteLine('ReleaseChecks requi
 . (Join-Path $PSScriptRoot 'Support.ps1')
 $repo=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\..'))
 $scripts=Join-Path $repo 'scripts'
-Import-ReleaseCheckFunctions (Join-Path $scripts 'ui-smoke.ps1') @('Get-NormalizedPath','Assert-ExactPath','Assert-NoReparsePath','Assert-NoReparseTree','Join-NativeArguments','Quote-NativeArgument','Open-UiSmokeRunnerLock')
+Import-ReleaseCheckFunctions (Join-Path $scripts 'ui-smoke.ps1') @('Get-NormalizedPath','Assert-ExactPath','Assert-NoReparsePath','Assert-NoReparseTree','Join-NativeArguments','Quote-NativeArgument','Open-UiSmokeRunnerLock','Invoke-UiSmokeCapturedProcess')
 Import-ReleaseCheckFunctions (Join-Path $scripts 'build-portable.ps1') @('Get-MivOrdinalUniquePaths','Get-MivSourceFingerprintRecords','Get-MivSourceFingerprint','Assert-SmokeBuildManifest')
 $smoke=Join-Path $repo 'target\portable-smoke'
 $exe=Join-Path $smoke 'mimageviewer.exe'; $data=Join-Path $smoke 'data'
@@ -74,6 +74,15 @@ function Save-ReleaseLogs {
         if(Test-Path -LiteralPath $source -PathType Leaf){Copy-Item -LiteralPath $source -Destination (Join-Path $Directory $name)}
     }
 }
+function Clear-ReleaseLogs {
+    # Previous sessions have already been archived. A restored seed's runtime
+    # logs must never masquerade as a new session, even on an early launch crash.
+    Assert-NoReparseTree (Join-Path $data 'logs') 'release-logs'
+    foreach($name in @('perf_events.jsonl','mimageviewer.log')){
+        $source=Join-Path $data ('logs\'+$name)
+        if(Test-Path -LiteralPath $source -PathType Leaf){Remove-Item -LiteralPath $source -Force}
+    }
+}
 function Restore-ReleaseSeed {
     param([string]$Seed)
     Assert-NoSmokeProcess
@@ -93,6 +102,7 @@ function Complete-ReleaseSession {
     # A later environment error cannot erase ScriptFailure or a crash.
     if($null -ne $exitResult){$cases.Add($exitResult)}
     Save-ReleaseLogs $Directory
+    $script:activeDir=$null # archived session no longer owns the restored logs
     if($null -eq $exitResult){
         $caseEvidence=Join-Path $Directory 'case-evidence.json'
         if(-not (Test-Path -LiteralPath $caseEvidence)){throw "$CaseId missing normal completion evidence."}
@@ -108,9 +118,14 @@ function Invoke-ReleaseSession {
     Assert-ReleaseCheckArtifact $repo
     $dir=Join-Path $run $CaseId
     New-Item -ItemType Directory -Path $dir | Out-Null
-    $script:activeDir=$dir
-    & python (Join-Path $scripts 'ui-smoke\release_checks_preflight.py') --manifest $fixtureManifest --data-dir $data --case-id $CaseId --json-out (Join-Path $dir 'pre-launch-cache.json') --stopped
-    if($LASTEXITCODE -ne 0){throw 'Stopped-profile cache proof unavailable.'}
+    $cacheProof=Invoke-UiSmokeCapturedProcess (Get-Command python -ErrorAction Stop).Source @(
+        (Join-Path $scripts 'ui-smoke\release_checks_preflight.py'),'--manifest',$fixtureManifest,
+        '--data-dir',$data,'--case-id',$CaseId,'--json-out',(Join-Path $dir 'pre-launch-cache.json'),'--stopped'
+    ) $repo (Join-Path $dir 'preflight.stdout.log') (Join-Path $dir 'preflight.stderr.log')
+    if($cacheProof.ExitCode -ne 0){
+        $reason=[string](Get-Content -LiteralPath (Join-Path $dir 'preflight.stderr.log') -Encoding UTF8 -Raw)
+        throw ('Stopped-profile cache proof unavailable: '+$reason.Trim())
+    }
     $scriptPath=Join-Path $dir 'scenario.rhai'
     $template=Get-Content -LiteralPath (Join-Path $scripts 'ui-smoke\release-checks.rhai') -Encoding UTF8 -Raw
     $template=$template.Replace('__CASE_ID__',$CaseId).Replace('__CASE_DIRECTORY__',$dir.Replace('\','/')).Replace('__FIXTURE_ROOT__',$fixture.Replace('\','/')).Replace('__INCLUDE_FIRST_AI__',([bool]$IncludeFirstAi).ToString().ToLowerInvariant())
@@ -137,7 +152,9 @@ function Invoke-ReleaseSession {
     $sessionOverlay.startup_folder_path=if($seedRecipe.Count -eq 1){$seedRecipe[0].startup_path}elseif($CaseId -like 'perf-*'){$many}else{$m.paths.static}
     Write-ReleaseCheckJson (Join-Path $dir 'settings-override.json') $sessionOverlay
     $arguments=@('--data-dir',$data,'--perf-log','--test-script',$scriptPath,'--test-evidence-dir',$dir,'--settings-override',(Join-Path $dir 'settings-override.json'),'--window-size','1328x900')
+    Clear-ReleaseLogs
     $script:owned=Start-Process -FilePath $exe -ArgumentList (Join-NativeArguments $arguments) -WorkingDirectory $smoke -PassThru
+    $script:activeDir=$dir # only a successfully launched session owns app logs
     $null=$script:owned.Handle  # cache the handle so ExitCode is available after exit
     $script:ownedStart=$script:owned.StartTime.ToUniversalTime()
     Write-ReleaseCheckJson (Join-Path $dir 'process.json') @{pid=$script:owned.Id;start_time_utc=$script:ownedStart.ToString('o');exe=$exe;data_dir=$data}
@@ -220,6 +237,8 @@ try {
     $metadata.fixture_version=$m.recipe_version
     # Seed each geometry in a normal session, retaining the same isolated data.
     # No case clone is made until both sessions have exited and flushed.
+    # A committed SQLite WAL is part of that stopped profile; exit does not
+    # promise a main-file checkpoint. Preflight reads DB + WAL without edits.
     foreach($seedRecipe in $m.seed_requirements.sessions){
         $seedSession=Invoke-ReleaseSession $seedRecipe.case_id $m.overlays.($seedRecipe.overlay) $false
         if($null -ne $seedSession.exit_result){throw 'Seed session did not complete successfully; process verdict retained.'}

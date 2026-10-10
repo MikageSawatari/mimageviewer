@@ -172,7 +172,9 @@ foreach($code in @(1,2,-1073741819)){
     $cases=New-Object 'Collections.Generic.List[object]'
     $owned=[pscustomobject]@{Id=101;ExitCode=$code}
     $owned|Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {}
+    $activeDir='C:\fake\run\case'
     $session=Complete-ReleaseSession 'tray-close-after-loading' 'C:\fake\run\case'
+    Assert-True ($null -eq $activeDir) 'Archived session still owns logs after a profile restore.'
     $expected=if($code -eq 2){'SKIPPED'}else{'FAIL'}
     $expectedCode=if($code -eq 2){2}else{1}
     Assert-True ($cases.Count -eq 1 -and $session.exit_result -eq $cases[0]) 'Nonzero app exit was discarded.'
@@ -187,6 +189,51 @@ $owned=[pscustomobject]@{Id=101;ExitCode=1}
 $owned|Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {}
 Assert-Throws {Complete-ReleaseSession 'perf-cached' 'C:\fake\run\case'} 'Fake archive error did not exercise the environment catch.'
 Assert-True ($cases.Count -eq 1 -and $cases[0].verdict -eq 'FAIL' -and $cases[0].failures -like '*exit code 1*') 'Environment archive error erased an already observed application FAIL.'
+& {
+    # Run the real prelaunch and final archive paths with fakes. Restored seed
+    # logs belong to no new case until that case has actually been launched.
+    Import-ReleaseCheckFunctions (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Run.ps1') @('Invoke-ReleaseSession')
+    $ast=Get-TestAst (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Run.ps1')
+    $finally=@($ast.EndBlock.Statements | Where-Object {$_ -is [Management.Automation.Language.TryStatementAst]})[-1].Finally
+    $run='C:\fake\run';$scripts='C:\fake\scripts';$fixtureManifest='fake-manifest';$repo='C:\fake';$data='C:\fake\data'
+    $script:activeDir=$null;$script:background=$null
+    $lock=[pscustomobject]@{};$lock|Add-Member -MemberType ScriptMethod -Name Dispose -Value {}
+    $cases=New-Object 'Collections.Generic.List[object]'
+    $script:fakeArchived=New-Object 'Collections.Generic.List[string]'
+    function Assert-NoSmokeProcess {}
+    function Assert-ReleaseCheckArtifact {param($Repo)}
+    function New-Item {param($ItemType,$Path)}
+    function Get-Command {param($Name,$ErrorAction) [pscustomobject]@{Source='fake-python'}}
+    function Invoke-UiSmokeCapturedProcess {
+        param($FilePath,$ArgumentValues,$WorkingDirectory,$StandardOutputPath,$StandardErrorPath)
+        Assert-True ($ArgumentValues -contains '--stopped') 'Preflight lost the stopped assertion.'
+        Assert-True ($StandardErrorPath -eq 'C:\fake\run\static-foreground\preflight.stderr.log') 'Preflight diagnostic was not captured in its case.'
+        [pscustomobject]@{ExitCode=2}
+    }
+    function Get-Content {param($LiteralPath,$Encoding,[switch]$Raw) 'fake invalid stopped WAL'}
+    function Clear-ReleaseLogs {throw 'Preflight failure discarded profile logs before launch.'}
+    function Start-Process {throw 'Preflight failure launched an application.'}
+    function Stop-OwnedReleaseProcess {}
+    function Save-ReleaseLogs {param($Directory) $script:fakeArchived.Add($Directory)}
+    try {Invoke-ReleaseSession 'static-foreground' 'fake-overlay' $true;throw 'Preflight failure was ignored.'}
+    catch {Assert-True ($_.Exception.Message -eq 'Stopped-profile cache proof unavailable: fake invalid stopped WAL') 'Preflight failure lost its actionable diagnostic.'}
+    & ([scriptblock]::Create($finally.Extent.Text))
+    Assert-True ($null -eq $script:activeDir -and $script:fakeArchived.Count -eq 0) 'Prelaunch failure archived restored seed logs as a new case.'
+}
+& {
+    Import-ReleaseCheckFunctions (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Run.ps1') @('Clear-ReleaseLogs')
+    $data='C:\fake\data'
+    $script:fakeLogOperations=New-Object 'Collections.Generic.List[string]'
+    function Assert-NoReparseTree {param($Path,$Label) $script:fakeLogOperations.Add('check:'+ $Path)}
+    function Test-Path {param($LiteralPath,$PathType) $true}
+    function Remove-Item {param($LiteralPath,[switch]$Force) $script:fakeLogOperations.Add('remove:'+ $LiteralPath)}
+    Clear-ReleaseLogs
+    Assert-True (($script:fakeLogOperations -join '|') -eq 'check:C:\fake\data\logs|remove:C:\fake\data\logs\perf_events.jsonl|remove:C:\fake\data\logs\mimageviewer.log') 'Log cleanup escaped the checked disposable runtime log files.'
+    $ast=Get-TestAst (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Run.ps1')
+    $invoke=@($ast.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-ReleaseSession'},$true))[0]
+    $body=$invoke.Body.Extent.Text
+    Assert-True ($body.IndexOf('Clear-ReleaseLogs') -lt $body.IndexOf('$script:owned=Start-Process') -and $body.IndexOf('$script:activeDir=$dir') -gt $body.IndexOf('$script:owned=Start-Process')) 'Session log ownership does not bracket the actual launch.'
+}
 # Exercise the prepare/analyzer helper with the uncached ExitCode=null behavior.
 & {
     Import-ReleaseCheckFunctions (Join-Path $PSScriptRoot 'ui-smoke.ps1') @('Invoke-UiSmokeCapturedProcess','Join-NativeArguments','Quote-NativeArgument')
