@@ -74,6 +74,8 @@ impl StackPreparePending {
 }
 
 struct StackGroupingSource {
+    visibility: crate::file_type_visibility::FileTypeVisibility,
+    logical_container: Option<PathBuf>,
     folder: PathBuf,
     items: Vec<GridItem>,
     image_metas: Vec<Option<(i64, i64)>>,
@@ -173,6 +175,7 @@ impl StackCandidateOrder {
 }
 
 struct StackReadData {
+    page_identity_index: Arc<crate::app::file_type_resume::PreparedPageIdentityIndex>,
     edits: crate::app::page_edit_snapshot::StablePageEditProjection,
     rating_cache: std::collections::HashMap<usize, u8>,
     tags_cache: std::collections::HashMap<String, Vec<String>>,
@@ -191,6 +194,7 @@ struct StackSwitchReady {
 }
 
 pub(crate) struct StackPreparedItems {
+    pub page_identity_index: Arc<crate::app::file_type_resume::PreparedPageIdentityIndex>,
     pub items: Vec<GridItem>,
     pub metas: Vec<Option<(i64, i64)>>,
     pub videos: Vec<(usize, PathBuf, u64)>,
@@ -208,6 +212,7 @@ enum StackSwitchTarget {
 }
 
 pub(crate) struct StackSwitchPending {
+    visibility: crate::file_type_visibility::FileTypeVisibility,
     cancel: Arc<AtomicBool>,
     rx: Receiver<StackSwitchReady>,
     view: Arc<StackView>,
@@ -244,6 +249,7 @@ enum StackRetrySource {
 }
 
 pub(crate) struct StackRetryPending {
+    visibility: crate::file_type_visibility::FileTypeVisibility,
     cancel: Arc<AtomicBool>,
     source: StackRetrySource,
     context_id: crate::app::ViewerContextId,
@@ -358,6 +364,8 @@ fn read_stack_candidate(
     rating_available: bool,
     tags_available: bool,
     cancel: &AtomicBool,
+    visibility: crate::file_type_visibility::FileTypeVisibility,
+    logical_container: Option<PathBuf>,
 ) -> StackReadOutcome {
     let result = (|| -> Result<Option<StackReadData>, String> {
         #[cfg(test)]
@@ -444,7 +452,15 @@ fn read_stack_candidate(
         {
             return Ok(None);
         }
+        let page_identity_index = Arc::new(
+            crate::app::file_type_resume::PreparedPageIdentityIndex::prepare(
+                &order.items,
+                logical_container.as_deref(),
+                visibility,
+            ),
+        );
         Ok(Some(StackReadData {
+            page_identity_index,
             edits,
             rating_cache,
             tags_cache,
@@ -468,6 +484,7 @@ impl StackReadOutcome {
             ..
         } = self.order;
         Ok(Some(StackPreparedItems {
+            page_identity_index: data.page_identity_index,
             items,
             metas,
             videos,
@@ -591,6 +608,8 @@ impl crate::app::App {
                 )
         );
         let source = StackGroupingSource {
+            visibility: self.settings.file_type_visibility.clone(),
+            logical_container: self.archive_source_override.clone(),
             folder,
             items: Vec::new(),
             image_metas: Vec::new(),
@@ -782,6 +801,8 @@ impl crate::app::App {
                     worker_source.rating_available,
                     worker_source.tags_available,
                     &cancel_w,
+                    worker_source.visibility.clone(),
+                    worker_source.logical_container.clone(),
                 );
                 let _ = tx.send(Ok(Some(StackGroupReady {
                     view,
@@ -835,6 +856,8 @@ impl crate::app::App {
         let availability = source.available_edits;
         let rating_available = source.rating_available;
         let tags_available = source.tags_available;
+        let visibility = source.visibility.clone();
+        let logical_container = source.logical_container.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         #[cfg(test)]
         let test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::capture();
@@ -850,6 +873,8 @@ impl crate::app::App {
                     rating_available,
                     tags_available,
                     &worker_cancel,
+                    visibility.clone(),
+                    logical_container,
                 );
                 let _ = tx.send(Ok(Some(StackGroupReady {
                     view,
@@ -920,6 +945,7 @@ impl crate::app::App {
         }
         if !self.stack_group_config_current(&pending.source) {
             self.rebase_stack_group_source(
+                ctx,
                 &pending.source,
                 pending.existing_keys,
                 pending.folder_signature,
@@ -957,17 +983,23 @@ impl crate::app::App {
     }
 
     fn stack_group_config_current(&self, source: &StackGroupingSource) -> bool {
-        source.separator == self.settings.stack_separator
+        source.visibility == self.settings.file_type_visibility
+            && source.separator == self.settings.stack_separator
             && source.script_enabled == self.settings.stack_script_enabled
             && source.display_order == self.settings.grid_display_order
     }
 
     fn rebase_stack_group_source(
         &mut self,
+        ctx: &egui::Context,
         source: &StackGroupingSource,
         existing_keys: std::collections::HashSet<String>,
         folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
     ) {
+        if source.visibility != self.settings.file_type_visibility {
+            self.apply_file_type_visibility_change(ctx);
+            return;
+        }
         // Separator, script and display-order changes re-group the same listing. Its captured
         // sort request remains valid until an explicit listing preparation replaces it.
         self.spawn_stack_script_worker(
@@ -1008,6 +1040,7 @@ impl crate::app::App {
         if !self.stack_group_config_current(&pending.source) {
             pending.cancel.store(true, Ordering::Relaxed);
             self.rebase_stack_group_source(
+                ctx,
                 &pending.source,
                 pending.existing_keys,
                 pending.folder_signature,
@@ -1119,7 +1152,25 @@ impl crate::app::App {
         let is_subfolder_expansion_stack =
             crate::folder_tree::path_eq(&folder, &crate::app::subfolder_expansion_synthetic_path());
         let pin_map = std::mem::take(&mut self.folder_pin_map);
-        self.start_loading_stack_items(folder, prepared, existing_keys, folder_signature, pin_map);
+        // Resolve against this exact candidate order; script groups and subfolder members
+        // can share display names. The accepted hydration owns this final cursor tail.
+        let select = self
+            .stack_selection_target
+            .take()
+            .and_then(|target| match target {
+                StackSelectionTarget::MemberPath(path) => {
+                    view.aggregated_index_for_member_path(&path)
+                }
+                StackSelectionTarget::GroupKey(key) => view.aggregated_index_for_group_key(&key),
+            });
+        self.start_loading_stack_items(
+            folder,
+            prepared,
+            existing_keys,
+            folder_signature,
+            pin_map,
+            select,
+        );
         if is_subfolder_expansion_stack {
             self.restore_subfolder_expansion_view_state_after_items_install();
         }
@@ -1127,17 +1178,6 @@ impl crate::app::App {
         self.stack_view = Some(view);
         self.stack_active_rule = rule.clone();
         self.stack_script_error = error.clone();
-        if let Some(target) = self.stack_selection_target.take()
-            && let Some(idx) = self.stack_view.as_ref().and_then(|view| match target {
-                StackSelectionTarget::MemberPath(path) => {
-                    view.aggregated_index_for_member_path(&path)
-                }
-                StackSelectionTarget::GroupKey(key) => view.aggregated_index_for_group_key(&key),
-            })
-        {
-            self.selected = Some(idx);
-            self.scroll_to_selected = true;
-        }
         let stack_notice = if error.is_some() {
             Some(
                 "スタックのスクリプトでエラー。既定ルールで表示します (詳細はヘルプ参照)"
@@ -1187,6 +1227,9 @@ impl crate::app::App {
         let available_edits = crate::app::page_edit_snapshot::PageEditAvailability::for_app(self);
         let rating_available = self.rating_db.is_some();
         let tags_available = self.tags_db.is_some();
+        let visibility = self.listing_file_type_visibility().clone();
+        let worker_visibility = visibility.clone();
+        let logical_container = self.archive_source_override.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let worker_view = Arc::clone(&view);
@@ -1223,6 +1266,8 @@ impl crate::app::App {
                     rating_available,
                     tags_available,
                     &worker_cancel,
+                    worker_visibility.clone(),
+                    logical_container.clone(),
                 );
                 let retained_aggregate = retained_order.map(|order| {
                     read_stack_candidate(
@@ -1231,6 +1276,8 @@ impl crate::app::App {
                         rating_available,
                         tags_available,
                         &worker_cancel,
+                        worker_visibility.clone(),
+                        logical_container.clone(),
                     )
                 });
                 let _ = tx.send(StackSwitchReady {
@@ -1249,6 +1296,7 @@ impl crate::app::App {
             return;
         }
         self.stack_script_pending = Some(StackPreparePending::Switching(StackSwitchPending {
+            visibility,
             cancel,
             rx,
             view,
@@ -1262,7 +1310,8 @@ impl crate::app::App {
     }
 
     fn poll_stack_switch(&mut self, ctx: &egui::Context, pending: StackSwitchPending) {
-        let current = self.stack_mode_requested
+        let current = pending.visibility == *self.listing_file_type_visibility()
+            && self.stack_mode_requested
             && self.virtual_list_context_id() == pending.context_id
             && self.items_generation == pending.items_generation
             && self.items.len() == pending.item_count
@@ -1437,6 +1486,7 @@ impl crate::app::App {
             }
         }
         self.stack_script_pending = Some(StackPreparePending::Retry(StackRetryPending {
+            visibility: self.settings.file_type_visibility.clone(),
             cancel: Arc::new(AtomicBool::new(false)),
             source,
             context_id: self.virtual_list_context_id(),
@@ -1459,6 +1509,7 @@ impl crate::app::App {
 
     fn poll_stack_retry(&mut self, ctx: &egui::Context, pending: StackRetryPending) {
         if pending.cancel.load(Ordering::Relaxed)
+            || pending.visibility != self.settings.file_type_visibility
             || self.virtual_list_context_id() != pending.context_id
             || self.items_generation != pending.items_generation
             || self.items.len() != pending.item_count
@@ -1492,7 +1543,7 @@ impl crate::app::App {
                         pending.retry_attempt,
                     );
                 } else {
-                    self.rebase_stack_group_source(&source, existing_keys, folder_signature);
+                    self.rebase_stack_group_source(ctx, &source, existing_keys, folder_signature);
                 }
             }
             StackRetrySource::GroupReady(
@@ -1517,7 +1568,7 @@ impl crate::app::App {
                         pending.retry_attempt,
                     );
                 } else {
-                    self.rebase_stack_group_source(&source, existing_keys, folder_signature);
+                    self.rebase_stack_group_source(ctx, &source, existing_keys, folder_signature);
                 }
             }
             StackRetrySource::SwitchReady(view, target, order, retained)
@@ -1903,9 +1954,10 @@ impl crate::app::App {
             edits,
             rating_cache,
             tags_cache,
+            page_identity_index,
             ..
         } = prepared;
-        self.install_prepared_aggregate_items(items, metas);
+        self.install_prepared_aggregate_items(items, metas, page_identity_index);
         if crate::folder_tree::path_eq(folder, &crate::app::subfolder_expansion_synthetic_path()) {
             self.restore_subfolder_expansion_view_state_after_items_install();
         }
@@ -1941,6 +1993,85 @@ impl crate::app::App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visibility_settings_ok_retires_extracting_and_grouping_on_worker_scan_path() {
+        for grouping in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let folder = app.tmp.path().join("preparing-policy");
+            std::fs::create_dir(&folder).unwrap();
+            image::RgbImage::new(1, 1)
+                .save(folder.join("a_1.png"))
+                .unwrap();
+            image::RgbImage::new(1, 1)
+                .save(folder.join("b_1.jpg"))
+                .unwrap();
+            app.load_folder(folder.clone());
+            app.finish_page_identity_preparation_for_test();
+            app.stack_mode_requested = true;
+            app.spawn_stack_script_worker(
+                folder,
+                StackListingSource::Normal(Arc::new(Vec::new()), StackRatingSource::Standard),
+                '_',
+                crate::rating_sort::ListingOrderRequest::Standard(SortOrder::FileName),
+                Default::default(),
+                None,
+                false,
+                false,
+            );
+            let Some(StackPreparePending::Extracting(extracting)) = app.stack_script_pending.take()
+            else {
+                panic!("extracting owner expected");
+            };
+            let cancel = Arc::clone(&extracting.cancel);
+            // A held channel models a worker still preparing when settings OK arrives.
+            let (_held_tx, rx) = std::sync::mpsc::channel();
+            app.stack_script_pending = Some(if grouping {
+                StackPreparePending::Grouping(StackScriptPending {
+                    cancel: extracting.cancel,
+                    rx,
+                    source: Arc::new(extracting.source),
+                    context_id: extracting.context_id,
+                    items_generation: extracting.items_generation,
+                    item_count: extracting.item_count,
+                    sequence: extracting.sequence,
+                    existing_keys: extracting.existing_keys,
+                    folder_signature: extracting.folder_signature,
+                    retry_attempt: 0,
+                })
+            } else {
+                StackPreparePending::Extracting(extracting)
+            });
+            let before = crate::app::folder_scan::caller_scan_count_for_test();
+            let mut policy = crate::file_type_visibility::FileTypeVisibility::default();
+            policy.excluded_extensions.insert("png".into());
+            app.set_visibility_preferences_for_test(policy);
+            let ctx = egui::Context::default();
+            app.apply_preferences_dialog(&ctx);
+            assert!(cancel.load(Ordering::Relaxed));
+            assert!(app.stack_script_pending.is_none());
+            assert!(app.folder_order_refresh_pending_for_test());
+            app.poll_stack_script(&ctx); // Frame order: stack poll precedes scan collection.
+            assert!(app.folder_order_refresh_pending_for_test());
+            assert_eq!(
+                crate::app::folder_scan::caller_scan_count_for_test(),
+                before,
+                "settings OK and the next stack poll must not scan on this thread"
+            );
+        }
+    }
+
+    fn finish_list_hydration_for_test(app: &mut crate::app::App, ctx: &egui::Context) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.sidecar_restore_active() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stack list hydration did not settle"
+            );
+            app.poll_sidecar_restore(ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
 
     #[test]
     fn rating_subfolder_stack_toggle_keeps_prepared_order_in_aggregate_and_flat_views() {
@@ -2131,8 +2262,10 @@ mod tests {
             }
             app.settings.sort_order = initial;
             app.load_folder_with_scan(folder.clone(), None);
+            finish_list_hydration_for_test(&mut app, &ctx);
             app.stack_mode_requested = true;
             app.load_folder_with_scan(folder, None);
+            finish_list_hydration_for_test(&mut app, &ctx);
             let Some(StackPreparePending::Extracting(pending)) = app.stack_script_pending.as_ref()
             else {
                 panic!("physical listing must start stack extraction: {initial:?}");
@@ -2154,10 +2287,19 @@ mod tests {
             };
             assert_eq!(rebased.source.order, captured);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while app.stack_view.is_none() && std::time::Instant::now() < deadline {
-                app.poll_stack_script(&ctx);
+            while (app.stack_view.is_none() || app.sidecar_restore_active())
+                && std::time::Instant::now() < deadline
+            {
+                if !app.sidecar_restore_active() {
+                    app.poll_stack_script(&ctx);
+                }
+                app.poll_sidecar_restore(&ctx);
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
+            assert!(
+                !app.sidecar_restore_active(),
+                "stack hydration did not settle"
+            );
             let view = app.stack_view.as_ref().expect("rebased stack grouping");
             assert_eq!(
                 view.materialize_flat()
@@ -2193,6 +2335,7 @@ mod tests {
                 .unwrap();
         }
         app.load_folder_with_scan(folder.clone(), None);
+        finish_list_hydration_for_test(&mut app, &ctx);
         app.stack_mode_requested = true;
         let spec = crate::rating_sort::RatingSortSpec {
             direction: crate::rating_sort::RatingSortDirection::Desc,
@@ -2202,10 +2345,19 @@ mod tests {
             app.load_folder_with_scan(folder.clone(), None)
         });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while app.stack_view.is_none() && std::time::Instant::now() < deadline {
-            app.poll_stack_script(&ctx);
+        while (app.stack_view.is_none() || app.sidecar_restore_active())
+            && std::time::Instant::now() < deadline
+        {
+            if !app.sidecar_restore_active() {
+                app.poll_stack_script(&ctx);
+            }
+            app.poll_sidecar_restore(&ctx);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        assert!(
+            !app.sidecar_restore_active(),
+            "stack hydration did not settle"
+        );
         let pending = match app.stack_script_pending.as_ref() {
             Some(StackPreparePending::Extracting(_)) => "extracting",
             Some(StackPreparePending::Grouping(_)) => "grouping",
@@ -2281,10 +2433,19 @@ mod tests {
             app.load_folder_with_scan(folder, None)
         });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while app.stack_view.is_none() && std::time::Instant::now() < deadline {
-            app.poll_stack_script(&ctx);
+        while (app.stack_view.is_none() || app.sidecar_restore_active())
+            && std::time::Instant::now() < deadline
+        {
+            if !app.sidecar_restore_active() {
+                app.poll_stack_script(&ctx);
+            }
+            app.poll_sidecar_restore(&ctx);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        assert!(
+            !app.sidecar_restore_active(),
+            "stack hydration did not settle"
+        );
         let view = app.stack_view.as_ref().expect("reloaded stack view");
         assert_eq!(view.groups[0].key, "a");
         assert_eq!(
@@ -2305,6 +2466,7 @@ mod tests {
             std::fs::write(folder.join(name), b"image").unwrap();
         }
         app.load_folder_with_scan(folder.clone(), None);
+        finish_list_hydration_for_test(&mut app, &ctx);
         let db_path = app.tmp.path().join("stack-failed-rating.db");
         app.rating_db = Some(crate::rating_db::RatingDb::open_at(&db_path).unwrap());
         rusqlite::Connection::open(&db_path)
@@ -2320,10 +2482,19 @@ mod tests {
             app.load_folder_with_scan(folder, None)
         });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while app.stack_view.is_none() && std::time::Instant::now() < deadline {
-            app.poll_stack_script(&ctx);
+        while (app.stack_view.is_none() || app.sidecar_restore_active())
+            && std::time::Instant::now() < deadline
+        {
+            if !app.sidecar_restore_active() {
+                app.poll_stack_script(&ctx);
+            }
+            app.poll_sidecar_restore(&ctx);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        assert!(
+            !app.sidecar_restore_active(),
+            "stack hydration did not settle"
+        );
         assert_eq!(app.stack_view.as_ref().unwrap().groups.len(), 2);
         assert_eq!(
             app.stack_view.as_ref().unwrap().index_map_builds,
@@ -2351,6 +2522,7 @@ mod tests {
         }
         app.settings.sort_order = SortOrder::FileNameDesc;
         app.load_folder_with_scan(folder.clone(), None);
+        finish_list_hydration_for_test(&mut app, &ctx);
         let db_path = app.tmp.path().join("rating-stack-name-fallback.db");
         app.rating_db = Some(crate::rating_db::RatingDb::open_at(&db_path).unwrap());
         rusqlite::Connection::open(&db_path)
@@ -2365,6 +2537,7 @@ mod tests {
         crate::rating_sort::with_test_rating_order(spec, || {
             app.load_folder_with_scan(folder, None)
         });
+        finish_list_hydration_for_test(&mut app, &ctx);
         let names = |items: &[GridItem]| {
             items
                 .iter()
@@ -2393,10 +2566,19 @@ mod tests {
         let rebased_order = pending.source.order;
         let rebased_config_current = app.stack_group_config_current(&pending.source);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while app.stack_view.is_none() && std::time::Instant::now() < deadline {
-            app.poll_stack_script(&ctx);
+        while (app.stack_view.is_none() || app.sidecar_restore_active())
+            && std::time::Instant::now() < deadline
+        {
+            if !app.sidecar_restore_active() {
+                app.poll_stack_script(&ctx);
+            }
+            app.poll_sidecar_restore(&ctx);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        assert!(
+            !app.sidecar_restore_active(),
+            "stack hydration did not settle"
+        );
         let view = app.stack_view.as_ref().expect("fallback stack grouping");
         assert_eq!(
             names(&view.materialize_flat().0),
@@ -2630,6 +2812,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn visibility_stack_preparation_pairs_final_order_policy_and_logical_identity() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut policy = crate::file_type_visibility::FileTypeVisibility::default();
+        policy.excluded_extensions.insert("png".into());
+        let logical = PathBuf::from("book.cbr");
+        let rows = vec![
+            GridItem::Image(PathBuf::from("later.jpg")),
+            GridItem::ZipImage {
+                zip_path: PathBuf::from("converted-cache.zip"),
+                entry_name: "chapter/page.jpg".into(),
+            },
+            GridItem::Image(PathBuf::from("first.jpg")),
+        ];
+        let expected = rows
+            .iter()
+            .map(|item| crate::book_resume_db::PageIdentity::for_item(item, Some(&logical)))
+            .collect::<Vec<_>>();
+        let prepared = read_stack_candidate(
+            StackCandidateOrder::new(rows, vec![None; 3]),
+            Default::default(),
+            false,
+            false,
+            &AtomicBool::new(false),
+            policy.clone(),
+            Some(logical),
+        )
+        .into_prepared()
+        .unwrap()
+        .unwrap();
+        assert_eq!(prepared.page_identity_index.policy, policy);
+        for (index, identity) in expected.into_iter().enumerate() {
+            assert_eq!(
+                prepared
+                    .page_identity_index
+                    .resolve(&crate::book_resume_db::ReadingPosition { page: 99, identity }),
+                crate::app::file_type_resume::PositionResolution::Restored(index)
+            );
+        }
+        assert_eq!(
+            prepared
+                .page_identity_index
+                .resolve(&crate::book_resume_db::ReadingPosition {
+                    page: 0,
+                    identity: None,
+                }),
+            crate::app::file_type_resume::PositionResolution::LegacyWithExclusions
+        );
+    }
+
     fn pending_group_for_test(
         app: &mut crate::app::App,
         view: Arc<StackView>,
@@ -2642,6 +2874,8 @@ mod tests {
             app.rating_db.is_some(),
             app.tags_db.is_some(),
             &AtomicBool::new(false),
+            Default::default(),
+            None,
         );
         match &read.result {
             Ok(Some(_)) => {}
@@ -2662,6 +2896,8 @@ mod tests {
         app.stack_view = None;
         app.stack_mode_requested = true;
         let source = Arc::new(StackGroupingSource {
+            visibility: app.settings.file_type_visibility.clone(),
+            logical_container: app.archive_source_override.clone(),
             folder,
             items: Vec::new(),
             image_metas: Vec::new(),
@@ -2689,6 +2925,87 @@ mod tests {
             existing_keys: Default::default(),
             folder_signature: None,
             retry_attempt: 0,
+        }
+    }
+
+    #[test]
+    fn stack_group_selection_survives_list_hydration_after_raw_indices_change() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        for use_group_key in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let ctx = egui::Context::default();
+            let folder = app.tmp.path().join("group-selection-hydration");
+            let same_name_folder = folder.join("a");
+            std::fs::create_dir_all(&same_name_folder).unwrap();
+            let pages = ["a_1.png", "a_2.png", "b_1.png", "b_2.png"].map(|name| folder.join(name));
+            for page in &pages {
+                image::RgbaImage::new(1, 1).save(page).unwrap();
+            }
+            app.settings.sidecar_backup_enabled = false;
+            app.settings.tag_sidecar_backup_enabled = false;
+            app.settings.stack_separator = '_';
+            app.settings.stack_script_enabled = false;
+            app.current_folder = Some(folder.clone());
+            let view = Arc::new(StackView::build(
+                folder.clone(),
+                vec![GridItem::Folder(same_name_folder.clone())],
+                vec![None],
+                pages
+                    .iter()
+                    .map(|path| StackMember {
+                        path: path.clone(),
+                        mtime: 0,
+                        size: Some(1),
+                        is_video: false,
+                    })
+                    .collect(),
+                '_',
+                SortOrder::FileName,
+            ));
+            let target_index = view.aggregated_index_for_member_path(&pages[1]).unwrap();
+            let mut pending = pending_group_for_test(&mut app, view, &ctx);
+            app.items = std::iter::once(GridItem::Folder(same_name_folder))
+                .chain(pages.iter().cloned().map(GridItem::Image))
+                .collect();
+            app.image_metas = vec![None; app.items.len()];
+            app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending; app.items.len()];
+            let raw_selected = 2;
+            assert_eq!(app.items[raw_selected], GridItem::Image(pages[1].clone()));
+            assert_ne!(target_index, raw_selected);
+            app.selected = Some(raw_selected);
+            app.scroll_offset_y = 125.0;
+            app.folder_history
+                .insert(folder.clone(), (125.0, Some(raw_selected)));
+            app.select_after_load = None;
+            app.stack_selection_target = Some(if use_group_key {
+                StackSelectionTarget::GroupKey("a".into())
+            } else {
+                StackSelectionTarget::MemberPath(pages[1].clone())
+            });
+            pending.item_count = app.items.len();
+            app.stack_script_pending = Some(StackPreparePending::Grouping(pending));
+
+            app.poll_stack_script(&ctx);
+            assert!(app.stack_view.is_some(), "grouping must be accepted");
+            assert!(app.sidecar_restore_active(), "drain the actual map worker");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while app.sidecar_restore_active() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "stack hydration did not settle"
+                );
+                app.poll_sidecar_restore(&ctx);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+
+            assert_eq!(app.items[0].name(), "a");
+            assert_eq!(app.items[target_index].name(), "a");
+            assert!(matches!(&app.items[raw_selected], GridItem::Stack { key, .. } if key == "b"));
+            assert_eq!(app.selected, Some(target_index), "target={use_group_key}");
+            assert_eq!(app.scroll_offset_y, 125.0);
+            assert!(app.scroll_to_selected);
+            assert_eq!(app.current_folder.as_ref(), Some(&folder));
+            assert_eq!(app.folder_history[&folder], (125.0, Some(raw_selected)));
         }
     }
 
@@ -2945,6 +3262,8 @@ mod tests {
             app.rating_db.is_some(),
             app.tags_db.is_some(),
             &AtomicBool::new(false),
+            Default::default(),
+            None,
         )
         .into_prepared()
         .unwrap()

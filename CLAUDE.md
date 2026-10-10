@@ -2095,7 +2095,22 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
      `target/idle-health/*-perf.json` の原因と反復 key を確認する。
    - **4 番目はトレイ常駐が既定 OFF** なので、環境設定 →「タスクトレイ常駐」を ON にしてから
      `[×]` で閉じる。最小化では成立しない (Win32 は最小化したウィンドウも `IsWindowVisible` が
-     真を返すため)。サムネイルが多いフォルダを読込完了前に閉じた状態で測る。
+     真を返すため)。cache の無い Folder 代表を多数含む一覧で、**未完了要求が残る読込中**と
+     **通常ロード / idle upgrade 完了後**の 2 ケースを両方必須とし、同じ
+     `-Scenario tray-residency` を 2 回使う。前者は hide をまたぐ要求、後者は Loaded→Evicted の
+     GPU 解放後の再取得を検査する。利用者 cache / 設定を消さず、各ケースに使い捨て fixture・
+     隔離データまたは利用者が用意した cache 未作成の対象を使う。2 回目が cache hit のみなら
+     source の画像 / 保存完了の二通知を検査したことにはならないので cache 状態を分けて記録する。
+   - tray のケース名、対象、cache 状態、close 時の requested / backlog、hide から収束までの
+     時系列と各 report をリリース記録に残す。close は測定窓外に置き、直後からの work / backlog
+     経過も残す。warmup 5 秒 / 測定 15 秒、開始 / 終了の visible windows=0、PID / session と
+     閾値は維持する。正当な初回 load が測定中に残れば準備条件と収束時点を記録し、収束後も
+     同じケースで静止窓を測る。重複生成を warmup 延長で隠さない。読込中の時点を合わせにくい
+     ことを理由に完了後ケースを無効扱いしない。active media は静止ケースに混ぜない。
+   - `input.modifier_probe` のうち `trigger=heartbeat` / `keys=[]` / `wheel=false` が揃う
+     受動 snapshot だけは操作件数から除く (focus と修飾キーの値は問わない)。key / wheel / 他の
+     input、矛盾 heartbeat、欠損・未知形式は入力として FAIL。総 event 数と repaint / work の
+     反復検査には snapshot を残す。
    - `-Scenario` は上記4値だけを受け付ける。perf log の session PID と測定対象 PID が違えば失敗し、
      空の測定窓は同一 session を確認できた場合だけ完全 sleep として扱う。動画ピンシナリオは
      準備開始後の `thumb.idle_upgrade_ineligible` が無ければセットアップ不成立として失敗する。

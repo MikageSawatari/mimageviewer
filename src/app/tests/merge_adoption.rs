@@ -6,6 +6,13 @@ fn reading_shell_with_audio() -> (phase_c_support::AppTestEnv, PathBuf, PathBuf)
     let origin = app.tmp.path().join("origin");
     std::fs::create_dir(&origin).unwrap();
     app.load_folder(origin.clone());
+    let ctx = egui::Context::default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.sidecar_restore_active() {
+        app.poll_sidecar_restore(&ctx);
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
     let audio = app.tmp.path().join("song.flac");
     let cover = app.tmp.path().join("song.jpg");
     std::fs::write(&audio, b"audio").unwrap();
@@ -44,6 +51,7 @@ fn finish_sources(app: &mut App) {
         .reading_history_sources_pending
         .contains_key(&app.projected_viewer_context_id())
     {
+        app.poll_sidecar_restore(&ctx);
         app.poll_reading_history_thumbnail_sources(&ctx);
         assert!(
             std::time::Instant::now() < deadline,
@@ -349,4 +357,42 @@ fn reading_hydration_pending_search_preserves_unsent_other_edit() {
 #[test]
 fn reading_hydration_pending_search_preserves_unsent_empty_edit() {
     reading_hydration_with_unsent_edit(false, "");
+}
+
+#[test]
+fn reading_hydration_retains_completed_reply_during_owned_identity_preparation() {
+    let (mut app, audio, cover) = reading_shell_with_audio();
+    let owner = app.projected_viewer_context_id();
+    assert!(
+        !app.sidecar_restore_active(),
+        "empty shell has a complete pure identity map"
+    );
+    let policy = app.settings.file_type_visibility.clone();
+    app.prepare_current_listing_page_identity_index(policy, None);
+    assert!(app.sidecar_restore_active());
+    let pending = app.reading_history_sources_pending.get_mut(&owner).unwrap();
+    let prepared = pending
+        .rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    let (tx, rx) = mpsc::channel();
+    tx.send(prepared).unwrap();
+    pending.rx = rx;
+    let generation = app.items_generation;
+    let surface = app.top_level_grid_view.generation();
+    let ctx = egui::Context::default();
+    app.poll_reading_history_thumbnail_sources(&ctx);
+    assert!(app.reading_history_sources_pending.contains_key(&owner));
+    assert!(app.items.is_empty());
+    assert!(app.video_thumb_overrides.is_empty());
+    assert_eq!(app.items_generation, generation);
+    assert_eq!(app.top_level_grid_view.generation(), surface);
+    finish_sources(&mut app);
+    assert!(matches!(&app.items[..], [GridItem::Audio(path)] if path == &audio));
+    assert_eq!(
+        app.video_thumb_overrides
+            .get(&crate::path_key::normalize_keep_drive(&audio)),
+        Some(&cover)
+    );
+    assert_eq!(app.top_level_grid_view.generation(), surface);
 }

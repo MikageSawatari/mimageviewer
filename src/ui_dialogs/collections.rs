@@ -15,6 +15,8 @@ use crossbeam_channel::Receiver;
 use eframe::egui;
 
 use crate::app::App;
+#[path = "collection_visible_order.rs"]
+mod collection_visible_order;
 use crate::collection_store::{
     CollectionAllExportFailure, CollectionAllExportSnapshot, CollectionBatchAddOutcome,
     CollectionCatalogSnapshot, CollectionEntry, CollectionEntryId, CollectionId,
@@ -449,8 +451,22 @@ struct CollectionReorderEntry {
     texture: Option<egui::TextureHandle>,
 }
 
+struct CollectionReorderProjection {
+    receiver: std::sync::mpsc::Receiver<Result<Vec<CollectionEntryId>, CollectionPrepareError>>,
+    selected_entry_id: Option<CollectionEntryId>,
+    cancel: Arc<AtomicBool>,
+    textures: HashMap<CollectionEntryId, egui::TextureHandle>,
+}
+
+impl Drop for CollectionReorderProjection {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+}
+
 enum CollectionReorderPhase {
     Ready,
+    Projecting(CollectionReorderProjection),
     Saving {
         receiver: Receiver<Result<CollectionSnapshot, CollectionStoreError>>,
     },
@@ -465,7 +481,10 @@ enum CollectionReorderPhase {
 
 impl CollectionReorderPhase {
     fn is_busy(&self) -> bool {
-        matches!(self, Self::Saving { .. } | Self::Refreshing { .. })
+        matches!(
+            self,
+            Self::Projecting(_) | Self::Saving { .. } | Self::Refreshing { .. }
+        )
     }
 }
 
@@ -473,6 +492,9 @@ struct CollectionReorderState {
     collection_id: CollectionId,
     collection_name: String,
     base_revision: u64,
+    full_entries: Vec<CollectionEntry>,
+    visible_ids: HashSet<CollectionEntryId>,
+    visibility: crate::file_type_visibility::FileTypeVisibility,
     entries: Vec<CollectionReorderEntry>,
     selected: Option<usize>,
     selected_ids: HashSet<CollectionEntryId>,
@@ -484,6 +506,43 @@ struct CollectionReorderState {
     thumb_tile_px: f32,
     dirty: bool,
     phase: CollectionReorderPhase,
+}
+
+fn prepare_collection_reorder_projection(
+    snapshot: CollectionSnapshot,
+    display_order: crate::settings::GridDisplayOrder,
+    visibility: crate::file_type_visibility::FileTypeVisibility,
+    selected_entry_id: Option<CollectionEntryId>,
+    textures: HashMap<CollectionEntryId, egui::TextureHandle>,
+) -> CollectionReorderPhase {
+    let (tx, receiver) = std::sync::mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+    let _ = std::thread::Builder::new()
+        .name("collection-reorder-prepare".into())
+        .spawn(move || {
+            let result = crate::collection_store::prepare_collection_snapshot(
+                &snapshot,
+                &display_order,
+                &worker_cancel,
+                |_, _| {},
+            )
+            .map(|prepared| {
+                prepared
+                    .entries
+                    .iter()
+                    .filter(|entry| visibility.allows_grid_item(&entry.item))
+                    .map(|entry| entry.entry_id)
+                    .collect()
+            });
+            let _ = tx.send(result);
+        });
+    CollectionReorderPhase::Projecting(CollectionReorderProjection {
+        receiver,
+        selected_entry_id,
+        cancel,
+        textures,
+    })
 }
 
 enum CollectionDialogOperation {
@@ -1482,29 +1541,29 @@ impl App {
         snapshot: CollectionSnapshot,
         selected_entry_id: Option<CollectionEntryId>,
     ) {
+        let full_entries = snapshot.entries.to_vec();
+        let visibility = self.settings.file_type_visibility.clone();
         let textures =
             self.collection_reorder_textures_for(snapshot.collection_id(), snapshot.revision());
-        let entries = snapshot
-            .entries
-            .iter()
-            .cloned()
-            .map(|entry| CollectionReorderEntry {
-                texture: textures.get(&entry.id).cloned(),
-                entry,
-            })
-            .collect::<Vec<_>>();
-        let selected = selected_entry_id
-            .and_then(|id| entries.iter().position(|entry| entry.entry.id == id))
-            .or((!entries.is_empty()).then_some(0));
-        let selected_ids = selected
-            .and_then(|index| entries.get(index))
-            .map(|entry| HashSet::from([entry.entry.id]))
-            .unwrap_or_default();
+        let phase = prepare_collection_reorder_projection(
+            snapshot.clone(),
+            self.settings.grid_display_order.clone(),
+            visibility.clone(),
+            selected_entry_id,
+            textures,
+        );
+        // Until worker classification finishes no row may be edited or saved.
+        let entries = Vec::new();
+        let selected = None;
+        let selected_ids = HashSet::new();
         let base_revision = snapshot.revision();
         self.collection_ui.reorder = Some(CollectionReorderState {
             collection_id: snapshot.collection_id(),
             collection_name: snapshot.definition.name,
             base_revision,
+            full_entries,
+            visible_ids: HashSet::new(),
+            visibility,
             entries,
             selected,
             selected_ids,
@@ -1515,7 +1574,7 @@ impl App {
             scroll_offset_y: 0.0,
             thumb_tile_px: COLLECTION_REORDER_DEFAULT_TILE_PX,
             dirty: false,
-            phase: CollectionReorderPhase::Ready,
+            phase,
         });
     }
 
@@ -1555,11 +1614,35 @@ impl App {
             };
             return;
         };
-        let order = state
+        if state.visibility != self.settings.file_type_visibility {
+            state.phase = CollectionReorderPhase::Error {
+                message: "表示するファイル種類が変更されました。最新内容を読み直してください。"
+                    .into(),
+                conflict: true,
+            };
+            return;
+        }
+        let full_order = state
+            .full_entries
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        let visible_order = state
             .entries
             .iter()
             .map(|entry| entry.entry.id)
             .collect::<Vec<_>>();
+        let Some(order) = collection_visible_order::merge_visible_order(
+            &full_order,
+            &state.visible_ids,
+            &visible_order,
+        ) else {
+            state.phase = CollectionReorderPhase::Error {
+                message: "並べ替え対象が一致しません。最新内容を読み直してください。".into(),
+                conflict: true,
+            };
+            return;
+        };
         match client.reorder_manual(state.collection_id, state.base_revision, order) {
             Ok(receiver) => state.phase = CollectionReorderPhase::Saving { receiver },
             Err(error) => {
@@ -1604,6 +1687,54 @@ impl App {
         match phase {
             CollectionReorderPhase::Ready | CollectionReorderPhase::Error { .. } => {
                 state.phase = phase;
+            }
+            CollectionReorderPhase::Projecting(projection) => {
+                match projection.receiver.try_recv() {
+                    Ok(Ok(ids)) if state.visibility == self.settings.file_type_visibility => {
+                        state.visible_ids = ids.into_iter().collect();
+                        state.entries = state
+                            .full_entries
+                            .iter()
+                            .filter(|entry| state.visible_ids.contains(&entry.id))
+                            .cloned()
+                            .map(|entry| CollectionReorderEntry {
+                                texture: projection.textures.get(&entry.id).cloned(),
+                                entry,
+                            })
+                            .collect();
+                        state.selected = projection
+                            .selected_entry_id
+                            .and_then(|id| {
+                                state.entries.iter().position(|entry| entry.entry.id == id)
+                            })
+                            .or((!state.entries.is_empty()).then_some(0));
+                        state.selection_anchor = state.selected;
+                        ensure_collection_reorder_selection(state);
+                        state.phase = CollectionReorderPhase::Ready;
+                    }
+                    Ok(Ok(_)) => state.phase = CollectionReorderPhase::Error {
+                        message:
+                            "表示するファイル種類が変更されました。最新内容を読み直してください。"
+                                .into(),
+                        conflict: true,
+                    },
+                    Ok(Err(error)) => {
+                        state.phase = CollectionReorderPhase::Error {
+                            message: format!("コレクションの表示を準備できませんでした: {error}"),
+                            conflict: false,
+                        }
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        state.phase = CollectionReorderPhase::Projecting(projection);
+                        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        state.phase = CollectionReorderPhase::Error {
+                            message: "コレクション表示準備の応答が失われました。".into(),
+                            conflict: false,
+                        }
+                    }
+                }
             }
             CollectionReorderPhase::Saving { receiver } => match receiver.try_recv() {
                 Ok(Ok(snapshot)) if snapshot.collection_id() == state.collection_id => {
@@ -1653,8 +1784,7 @@ impl App {
                     if snapshot.collection_id() == state.collection_id
                         && snapshot.definition.order_mode == CollectionOrderMode::Manual =>
                 {
-                    let revision = snapshot.revision();
-                    let old_textures = state
+                    let textures = state
                         .entries
                         .iter()
                         .filter_map(|entry| {
@@ -1663,27 +1793,27 @@ impl App {
                                 .clone()
                                 .map(|texture| (entry.entry.id, texture))
                         })
-                        .collect::<HashMap<_, _>>();
-                    state.collection_name = snapshot.definition.name;
-                    state.base_revision = revision;
-                    state.entries = snapshot
-                        .entries
-                        .iter()
-                        .cloned()
-                        .map(|entry| CollectionReorderEntry {
-                            texture: old_textures.get(&entry.id).cloned(),
-                            entry,
-                        })
                         .collect();
-                    state.selected = (!state.entries.is_empty()).then_some(0);
+                    state.collection_name = snapshot.definition.name.clone();
+                    state.base_revision = snapshot.revision();
+                    state.full_entries = snapshot.entries.to_vec();
+                    state.visibility = self.settings.file_type_visibility.clone();
+                    state.visible_ids.clear();
+                    state.entries.clear();
+                    state.selected = None;
                     state.selected_ids.clear();
-                    state.selection_anchor = state.selected;
+                    state.selection_anchor = None;
                     state.dragging = None;
                     state.drag_auto_scroll_enabled = false;
                     state.drag_insert_index = None;
                     state.dirty = false;
-                    state.phase = CollectionReorderPhase::Ready;
-                    ensure_collection_reorder_selection(state);
+                    state.phase = prepare_collection_reorder_projection(
+                        snapshot,
+                        self.settings.grid_display_order.clone(),
+                        state.visibility.clone(),
+                        None,
+                        textures,
+                    );
                 }
                 Ok(Ok(_)) => {
                     state.phase = CollectionReorderPhase::Error {
@@ -4541,6 +4671,13 @@ impl App {
                 };
                 ensure_collection_reorder_selection(state);
                 let busy = state.phase.is_busy();
+                if !busy && state.entries.len() != state.full_entries.len() {
+                    ui.label(format!(
+                        "表示 {} / 登録 {} 件",
+                        state.entries.len(),
+                        state.full_entries.len()
+                    ));
+                }
                 if let CollectionReorderPhase::Error { message, conflict } = &state.phase {
                     let conflict = *conflict;
                     ui.colored_label(ui.visuals().error_fg_color, message);
@@ -4638,6 +4775,7 @@ impl App {
                     if busy {
                         ui.spinner();
                         let label = match &state.phase {
+                            CollectionReorderPhase::Projecting(_) => "表示準備中…",
                             CollectionReorderPhase::Saving { .. } => "保存中…",
                             CollectionReorderPhase::Refreshing { .. } => "再読込中…",
                             _ => "処理中…",
@@ -5105,6 +5243,15 @@ mod tests {
             assert!(Instant::now() < deadline, "collection UI did not settle");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    fn wait_for_reorder_ready(app: &mut App) {
+        wait_for(app, |app| {
+            app.collection_ui
+                .reorder
+                .as_ref()
+                .is_some_and(|state| matches!(state.phase, CollectionReorderPhase::Ready))
+        });
     }
 
     fn assert_manager_read_slots_not_failed(app: &App) {
@@ -5857,6 +6004,9 @@ mod tests {
             collection_id,
             collection_name: "Reorder fixture".into(),
             base_revision: 7,
+            full_entries: entries.iter().map(|entry| entry.entry.clone()).collect(),
+            visible_ids: entries.iter().map(|entry| entry.entry.id).collect(),
+            visibility: Default::default(),
             entries,
             selected: first_id.map(|_| 0),
             selected_ids: first_id.into_iter().collect(),
@@ -5869,6 +6019,137 @@ mod tests {
             dirty: false,
             phase: CollectionReorderPhase::Ready,
         }
+    }
+
+    #[test]
+    fn reorder_visibility_saves_full_order_and_rejects_changed_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths =
+            ["A.jpg", "H.png", "B.jpg", "J.png", "C.jpg"].map(|name| temp.path().join(name));
+        for path in &paths {
+            std::fs::write(path, b"source").unwrap();
+        }
+        let (mut app, client) = start_ready_app(&temp);
+        let created = create_collection(&mut app, "Visible order");
+        let added = client
+            .add_batch(
+                created.collection_id(),
+                created.revision(),
+                paths
+                    .iter()
+                    .map(|path| {
+                        CollectionRegistration::from_trusted_path(
+                            path,
+                            CollectionResolvedKind::Image,
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
+            )
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap()
+            .snapshot;
+        let full = added
+            .entries
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        app.settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("png".into());
+        app.open_collection_reorder(added.clone(), Some(full[4]));
+        wait_for_reorder_ready(&mut app);
+        {
+            let state = app.collection_ui.reorder.as_mut().unwrap();
+            assert_eq!(
+                state
+                    .entries
+                    .iter()
+                    .map(|entry| entry.entry.id)
+                    .collect::<Vec<_>>(),
+                vec![full[0], full[2], full[4]]
+            );
+            assert!(move_selected_collection_reorder_group(state, 0));
+            state.dirty = true;
+        }
+        app.start_collection_reorder_save();
+        wait_for(&mut app, |app| app.collection_ui.reorder.is_none());
+        let saved = client
+            .load_collection(added.collection_id())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved
+                .entries
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            vec![full[4], full[1], full[0], full[3], full[2]]
+        );
+        app.open_collection_reorder(saved.clone(), Some(full[4]));
+        wait_for_reorder_ready(&mut app);
+        app.collection_ui.reorder.as_mut().unwrap().dirty = true;
+        app.settings
+            .file_type_visibility
+            .excluded_extensions
+            .clear();
+        app.start_collection_reorder_save();
+        assert!(matches!(
+            app.collection_ui.reorder.as_ref().unwrap().phase,
+            CollectionReorderPhase::Error { conflict: true, .. }
+        ));
+        let unchanged = client
+            .load_collection(added.collection_id())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved, unchanged);
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn reorder_projection_resolves_actual_directories_before_category_filtering() {
+        use crate::file_type_visibility::FileTypeCategory;
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("passage.zip");
+        let missing_zip = temp.path().join("missing.zip");
+        std::fs::create_dir(&directory).unwrap();
+        let (mut app, client) = start_ready_app(&temp);
+        let created = create_collection(&mut app, "Actual kind");
+        let added = client
+            .add_batch(
+                created.collection_id(),
+                created.revision(),
+                [&directory, &missing_zip]
+                    .into_iter()
+                    .map(|path| {
+                        CollectionRegistration::from_trusted_path(path, CollectionResolvedKind::Zip)
+                            .unwrap()
+                    })
+                    .collect(),
+            )
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap()
+            .snapshot;
+        app.settings
+            .file_type_visibility
+            .excluded_categories
+            .insert(FileTypeCategory::Zip);
+        app.open_collection_reorder(added.clone(), None);
+        wait_for_reorder_ready(&mut app);
+        let state = app.collection_ui.reorder.as_ref().unwrap();
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.entries[0].entry.id, added.entries[0].id);
+        assert_eq!(state.full_entries.len(), 2);
+        app.shutdown_collection_runtime_for_exit();
     }
 
     #[test]
@@ -6018,7 +6299,7 @@ mod tests {
         assert_eq!(app.collection_ui.selected_id, manager_selection);
         let ui_app = std::rc::Rc::new(std::cell::RefCell::new(app));
         let render_app = std::rc::Rc::clone(&ui_app);
-        let mut harness = egui_kittest::Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1040.0, 760.0))
             .build(move |ctx| render_app.borrow_mut().show_collection_manager(ctx));
         harness.step();
@@ -6313,12 +6594,10 @@ mod tests {
         theme: crate::os_theme::ResolvedTheme,
         preview: bool,
     ) {
-        use egui_kittest::Harness;
-
         let app = std::rc::Rc::new(std::cell::RefCell::new(snapshot_app(preview)));
         let ui_app = std::rc::Rc::clone(&app);
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1040.0, 760.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, theme);
@@ -6356,8 +6635,6 @@ mod tests {
     }
 
     fn snapshot_collection_remove_confirm(name: &str) {
-        use egui_kittest::Harness;
-
         let mut app = snapshot_app(false);
         let collection_id = app.collection_ui.selected_id.unwrap();
         let entry_id = app.collection_ui.snapshot.as_ref().unwrap().entries[0].id;
@@ -6380,7 +6657,7 @@ mod tests {
             ),
         };
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1040.0, 760.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Light);
@@ -6402,19 +6679,18 @@ mod tests {
     }
 
     fn snapshot_collection_reorder(name: &str) {
-        use egui_kittest::Harness;
-
         let mut app = snapshot_app(false);
         app.collection_ui.show_manager = false;
         let snapshot = app.collection_ui.snapshot.clone().unwrap();
         app.open_collection_reorder(snapshot.clone(), Some(snapshot.entries[0].id));
+        wait_for_reorder_ready(&mut app);
         if let Some(state) = app.collection_ui.reorder.as_mut() {
             state.selected_ids = HashSet::from([snapshot.entries[0].id, snapshot.entries[2].id]);
             state.selected = Some(2);
             state.selection_anchor = Some(0);
         }
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1040.0, 760.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
@@ -6661,6 +6937,7 @@ mod tests {
             .unwrap()
             .id;
         app.open_collection_reorder(added.clone(), Some(first_id));
+        wait_for_reorder_ready(&mut app);
         {
             let state = app.collection_ui.reorder.as_mut().unwrap();
             assert!(move_selected_collection_reorder_group(
@@ -6972,7 +7249,12 @@ mod tests {
             CollectionGridSnapshotAction::OpenReorder,
         );
         wait_for(&mut app, |app| {
-            app.collection_ui.operation.is_idle() && app.collection_ui.reorder.is_some()
+            app.collection_ui.operation.is_idle()
+                && app
+                    .collection_ui
+                    .reorder
+                    .as_ref()
+                    .is_some_and(|state| matches!(state.phase, CollectionReorderPhase::Ready))
         });
         {
             let state = app.collection_ui.reorder.as_mut().unwrap();
@@ -7100,6 +7382,7 @@ mod tests {
             .unwrap()
             .snapshot;
         app.open_collection_reorder(added.clone(), Some(added.entries[0].id));
+        wait_for_reorder_ready(&mut app);
         {
             let state = app.collection_ui.reorder.as_mut().unwrap();
             let end = state.entries.len();
@@ -7187,7 +7470,7 @@ mod tests {
         }
         let ui_app = std::rc::Rc::new(std::cell::RefCell::new(app));
         let render_app = std::rc::Rc::clone(&ui_app);
-        let mut harness = egui_kittest::Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1040.0, 760.0))
             .build(move |ctx| render_app.borrow_mut().draw_collection_reorder(ctx));
         harness.step();
@@ -7232,6 +7515,7 @@ mod tests {
             .unwrap()
             .snapshot;
         app.open_collection_reorder(added.clone(), Some(added.entries[0].id));
+        wait_for_reorder_ready(&mut app);
         {
             let state = app.collection_ui.reorder.as_mut().unwrap();
             let end = state.entries.len();
@@ -7241,7 +7525,7 @@ mod tests {
 
         let ui_app = std::rc::Rc::new(std::cell::RefCell::new(app));
         let render_app = std::rc::Rc::clone(&ui_app);
-        let mut harness = egui_kittest::Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1040.0, 760.0))
             .build(move |ctx| render_app.borrow_mut().draw_collection_reorder(ctx));
         harness.step();
@@ -8407,6 +8691,7 @@ mod tests {
         let target = app.collection_grid_content_target().unwrap();
 
         app.open_collection_reorder(added.clone(), Some(added.entries[0].id));
+        wait_for_reorder_ready(&mut app);
         {
             let state = app.collection_ui.reorder.as_mut().unwrap();
             state.entries.reverse();
@@ -8651,7 +8936,7 @@ mod tests {
             task,
         };
         let ui_app = std::rc::Rc::clone(&app);
-        let mut harness = egui_kittest::Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1040.0, 760.0))
             .build(move |ctx| ui_app.borrow_mut().show_collection_manager(ctx));
         harness.step();
@@ -8702,7 +8987,7 @@ mod tests {
             task,
         };
         let ui_app = std::rc::Rc::clone(&app);
-        let mut harness = egui_kittest::Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1040.0, 760.0))
             .build(move |ctx| ui_app.borrow_mut().show_collection_manager(ctx));
         harness.step();

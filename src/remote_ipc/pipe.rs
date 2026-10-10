@@ -770,7 +770,9 @@ impl ServerGuard {
         ));
         let archive_jobs = super::archive_job::RemoteArchiveJobRegistry::new(archive_executor);
         session_handle.install_archive_jobs(&archive_jobs);
-        let video_stream_engine = Arc::new(VideoStreamEngine::new());
+        let video_stream_engine = Arc::new(VideoStreamEngine::new_with_container_engine(
+            Arc::clone(&container_engine),
+        ));
         let collection_engine = Arc::new(CollectionEngine::new_with_live_favorites(
             settings, favorites,
         ));
@@ -1128,6 +1130,12 @@ fn worker_loop(
                         id,
                         response: container_engine.folder_list(request),
                     },
+                    ClientMessage::SourceReadEligibility { id, address, .. } => {
+                        ServerMessage::SourceReadEligibility {
+                            id,
+                            response: container_engine.source_read_eligibility(&address),
+                        }
+                    }
                     ClientMessage::Container { id, request, .. } => ServerMessage::Container {
                         id,
                         response: container_engine.container(request),
@@ -1272,6 +1280,12 @@ fn home_worker_loop(
                         id,
                         response: container_engine.folder_list(request),
                     },
+                    ClientMessage::SourceReadEligibility { id, address, .. } => {
+                        ServerMessage::SourceReadEligibility {
+                            id,
+                            response: container_engine.source_read_eligibility(&address),
+                        }
+                    }
                     ClientMessage::PersistentCollectionCatalog { id, .. } => {
                         match persistent_collection_engine {
                             Some(engine) => ServerMessage::PersistentCollectionCatalog {
@@ -1889,6 +1903,7 @@ fn request_kind(message: &ClientMessage) -> &'static str {
         ClientMessage::TagBrowse { .. } => "tag_browse",
         ClientMessage::TagItems { .. } => "tag_items",
         ClientMessage::FolderList { .. } => "folder_list",
+        ClientMessage::SourceReadEligibility { .. } => "source_read_eligibility",
         ClientMessage::Container { .. } => "container",
         ClientMessage::Page { request, .. } => match request.priority {
             PagePriority::Foreground => "page_foreground",
@@ -1926,6 +1941,7 @@ fn work_lane(message: &ClientMessage) -> WorkLane {
     match message {
         ClientMessage::Home { .. }
         | ClientMessage::FolderList { .. }
+        | ClientMessage::SourceReadEligibility { .. }
         | ClientMessage::PersistentCollectionCatalog { .. } => WorkLane::Home,
         ClientMessage::Write { .. } => WorkLane::Write,
         ClientMessage::VideoStreamStart { .. }
@@ -1965,6 +1981,7 @@ fn message_owner(message: &ClientMessage) -> Option<&RemoteSessionIdentity> {
         | ClientMessage::TagItems { owner, .. }
         | ClientMessage::Container { owner, .. }
         | ClientMessage::FolderList { owner, .. }
+        | ClientMessage::SourceReadEligibility { owner, .. }
         | ClientMessage::Page { owner, .. }
         | ClientMessage::PageDemand { owner, .. }
         | ClientMessage::RawPrefetchWindow { owner, .. }
@@ -2023,6 +2040,7 @@ fn operation_description(message: &ClientMessage) -> String {
         ClientMessage::TagItems { .. } => "タグの項目を検索中".to_owned(),
         ClientMessage::Container { .. } => "コンテナを列挙中".to_owned(),
         ClientMessage::FolderList { .. } => "フォルダ一覧を読み込み中".to_owned(),
+        ClientMessage::SourceReadEligibility { .. } => "読み出し対象を確認中".to_owned(),
         ClientMessage::Page { request, .. } => match request.address.subresource {
             mimageviewer_ipc::RemoteSubresource::PdfPage { page_number } => {
                 format!("PDF {} ページ目をレンダリング中", page_number + 1)
@@ -2232,6 +2250,10 @@ fn response_outcome(response: &ServerMessage) -> &'static str {
             response: FolderListResponse::Success(_),
             ..
         }
+        | ServerMessage::SourceReadEligibility {
+            response: mimageviewer_ipc::SourceReadEligibilityResponse::Success,
+            ..
+        }
         | ServerMessage::Page {
             response: PageResponse::Success(_),
             ..
@@ -2374,6 +2396,10 @@ fn response_outcome(response: &ServerMessage) -> &'static str {
         }
         | ServerMessage::FolderList {
             response: FolderListResponse::Error(_),
+            ..
+        }
+        | ServerMessage::SourceReadEligibility {
+            response: mimageviewer_ipc::SourceReadEligibilityResponse::Error(_),
             ..
         }
         | ServerMessage::Page {
@@ -3549,6 +3575,13 @@ fn service_stopped_response(message: &ClientMessage) -> ServerMessage {
                 "mIV 本体のフォルダ一覧ワーカーが停止しています",
             )),
         },
+        ClientMessage::SourceReadEligibility { id, .. } => ServerMessage::SourceReadEligibility {
+            id: *id,
+            response: mimageviewer_ipc::SourceReadEligibilityResponse::Error(MediaError::new(
+                MediaErrorCode::Internal,
+                "mIV 本体のフォルダ一覧ワーカーが停止しています",
+            )),
+        },
         ClientMessage::Page { id, .. } => ServerMessage::Page {
             id: *id,
             response: PageResponse::Error(MediaError::new(
@@ -3889,6 +3922,13 @@ fn queue_busy_response(message: &ClientMessage) -> ServerMessage {
                 "mIV 本体のリモートフォルダ一覧 queue が混み合っています",
             )),
         },
+        ClientMessage::SourceReadEligibility { id, .. } => ServerMessage::SourceReadEligibility {
+            id: *id,
+            response: mimageviewer_ipc::SourceReadEligibilityResponse::Error(MediaError::new(
+                MediaErrorCode::Busy,
+                "mIV 本体のリモートフォルダ一覧 queue が混み合っています",
+            )),
+        },
         ClientMessage::Page { id, .. } => ServerMessage::Page {
             id: *id,
             response: PageResponse::Error(MediaError::new(
@@ -4031,13 +4071,13 @@ fn frame_error_kind(error: &mimageviewer_ipc::FrameError) -> &'static str {
 
 /// `PIPE_REJECT_REMOTE_CLIENTS` はネットワーク経由だけを拒否する。既定 DACL はローカルの
 /// Everyone に read を許すため、current user だけに full access を与える DACL を明示する。
-struct CurrentUserPipeSecurity {
+pub(crate) struct CurrentUserPipeSecurity {
     _acl: Vec<u32>,
     descriptor: SECURITY_DESCRIPTOR,
 }
 
 impl CurrentUserPipeSecurity {
-    fn attributes(&mut self) -> SECURITY_ATTRIBUTES {
+    pub(crate) fn attributes(&mut self) -> SECURITY_ATTRIBUTES {
         SECURITY_ATTRIBUTES {
             nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: (&mut self.descriptor as *mut SECURITY_DESCRIPTOR).cast(),
@@ -4046,7 +4086,7 @@ impl CurrentUserPipeSecurity {
     }
 }
 
-fn current_user_pipe_security() -> Result<CurrentUserPipeSecurity, std::io::Error> {
+pub(crate) fn current_user_pipe_security() -> Result<CurrentUserPipeSecurity, std::io::Error> {
     let mut token = HANDLE::default();
     unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
         .map_err(|_| std::io::Error::last_os_error())?;

@@ -1927,17 +1927,23 @@ impl crate::app::App {
                     }
                 }
                 ClaimedRemoteUiRequest::BookResumeRead(pending) => {
-                    let latest = self.last_book_resume.as_ref().and_then(|(path, page, _)| {
-                        (crate::path_key::normalize(path)
-                            == crate::path_key::normalize(pending.path()))
-                        .then_some(*page)
-                    });
+                    let latest =
+                        self.last_book_resume
+                            .as_ref()
+                            .and_then(|(path, page, _, identity)| {
+                                (crate::path_key::normalize(path)
+                                    == crate::path_key::normalize(pending.path()))
+                                .then(|| crate::book_resume_db::ReadingPosition {
+                                    page: *page,
+                                    identity: identity.clone(),
+                                })
+                            });
                     let page = latest.or_else(|| {
                         self.book_resume_db
                             .as_ref()
-                            .and_then(|db| db.get(pending.path()))
+                            .and_then(|db| db.get_position(pending.path()))
                     });
-                    pending.complete(page);
+                    pending.complete_position(page);
                 }
                 ClaimedRemoteUiRequest::VideoStream(pending) => {
                     if self.sidecar_restore_active() {
@@ -2034,6 +2040,19 @@ impl crate::app::App {
             });
         if let Err(error) = ownership {
             claimed.complete(video_stream_ui_failure(error));
+            return;
+        }
+
+        // Recheck the UI's latest snapshot at the player ownership boundary.
+        if !self
+            .settings
+            .file_type_visibility
+            .allows_physical_file(&requested_path)
+        {
+            claimed.complete(VideoStreamUiOutcome::Error(VideoStreamError::new(
+                VideoStreamErrorCode::Unsupported,
+                "表示するファイル種類の設定で、このファイルは非表示になっています",
+            )));
             return;
         }
 
@@ -2791,7 +2810,34 @@ impl crate::app::App {
         let page_index = page_index as usize;
         if record_resume {
             // Remoteの従来のNULL記録を維持し、旧meterを消す。
-            self.persist_book_resume(target.container_path.clone(), page_index, None);
+            let identity = match &address.subresource {
+                mimageviewer_ipc::RemoteSubresource::File => {
+                    Some(crate::book_resume_db::PageIdentity::Image {
+                        path: crate::path_key::normalize_keep_drive(std::path::Path::new(
+                            &address.path,
+                        )),
+                    })
+                }
+                mimageviewer_ipc::RemoteSubresource::ZipEntry { entry_name } => {
+                    Some(crate::book_resume_db::PageIdentity::Archive {
+                        container: crate::path_key::normalize_keep_drive(&target.container_path),
+                        entry_name: entry_name.replace('\\', "/"),
+                    })
+                }
+                mimageviewer_ipc::RemoteSubresource::PdfPage { page_number } => {
+                    Some(crate::book_resume_db::PageIdentity::Document {
+                        container: crate::path_key::normalize_keep_drive(&target.container_path),
+                        page_num: *page_number as usize,
+                    })
+                }
+                mimageviewer_ipc::RemoteSubresource::ZipDirectory { .. } => None,
+            };
+            self.persist_book_resume_with_identity(
+                target.container_path.clone(),
+                page_index,
+                None,
+                identity,
+            );
         }
 
         if self.settings.reading_history_enabled
@@ -5096,6 +5142,107 @@ mod tests {
     }
 
     #[test]
+    fn queued_video_and_audio_start_rechecks_latest_policy_before_replacing_player() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.remote_video_streaming_enabled = true;
+        let (handle, owner, _) = active_session();
+        app.set_remote_session_handle(handle.clone());
+        let original_path = std::path::PathBuf::from(r"C:\videos\original.mp4");
+        let original_request = VideoStreamUiRequest::start_for_test(
+            owner.clone(),
+            original_path.clone(),
+            mimageviewer_ipc::VideoStreamQuality::Standard,
+        );
+        let (original_claimed, original_rx) = ClaimedVideoStreamUiRequest::for_test(
+            handle
+                .begin_operation(&owner, "previous start".into())
+                .unwrap(),
+            original_request,
+        );
+        app.remote_session_ui.video_stream =
+            Some(AppRemoteVideoStreamState::Opening(AppRemoteVideoOpening {
+                claimed: original_claimed,
+                owner: owner.clone(),
+                requested_path: original_path.clone(),
+                quality: crate::video::stream::quality::QualityPreset::Standard,
+                audio_track: None,
+                player: Some(Box::new(
+                    crate::video::VideoPlayer::stream_ready_disconnected_for_test(
+                        original_path.clone(),
+                    ),
+                )),
+                budget: VideoStreamStartBudget::from_enqueued_at(std::time::Instant::now()),
+                dsp_admission_deadline: std::time::Instant::now(),
+            }));
+        for (name, category, extension) in [
+            (
+                r"C:\videos\requested.mp4",
+                crate::file_type_visibility::FileTypeCategory::Video,
+                "mp4",
+            ),
+            (
+                r"C:\audio\requested.mp3",
+                crate::file_type_visibility::FileTypeCategory::Audio,
+                "mp3",
+            ),
+        ] {
+            for category_exclusion in [true, false] {
+                // Capture an already-admitted request, then change the UI snapshot
+                // before dispatch. No worker or decoder participates in this test.
+                let request = VideoStreamUiRequest::start_for_test(
+                    owner.clone(),
+                    name.into(),
+                    mimageviewer_ipc::VideoStreamQuality::Standard,
+                );
+                let (claimed, result_rx) = ClaimedVideoStreamUiRequest::for_test(
+                    handle
+                        .begin_operation(&owner, "queued start".into())
+                        .unwrap(),
+                    request,
+                );
+                app.settings
+                    .file_type_visibility
+                    .excluded_categories
+                    .clear();
+                app.settings
+                    .file_type_visibility
+                    .excluded_extensions
+                    .clear();
+                if category_exclusion {
+                    app.settings
+                        .file_type_visibility
+                        .excluded_categories
+                        .insert(category);
+                } else {
+                    app.settings
+                        .file_type_visibility
+                        .excluded_extensions
+                        .insert(extension.into());
+                }
+                app.apply_remote_video_stream_request(claimed);
+                assert!(matches!(
+                    result_rx.try_recv(),
+                    Ok(VideoStreamUiOutcome::Error(VideoStreamError {
+                        code: VideoStreamErrorCode::Unsupported,
+                        ..
+                    }))
+                ));
+                let Some(AppRemoteVideoStreamState::Opening(original)) =
+                    app.remote_session_ui.video_stream.as_ref()
+                else {
+                    panic!("previous player was replaced");
+                };
+                assert_eq!(original.requested_path, original_path);
+                assert_eq!(original.player.as_ref().unwrap().path(), &original_path);
+                assert!(matches!(
+                    original_rx.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn app_drain_lease_drop_terminals_every_representative_resource_before_one_ack() {
         let (handle, owner, generation) = active_session();
 
@@ -6260,7 +6407,17 @@ mod tests {
             true,
         );
         assert!(matches!(response, RemoteWriteResponse::Success(_)));
-        assert_eq!(app.last_book_resume, Some((folder.clone(), 1, None)));
+        assert_eq!(
+            app.last_book_resume,
+            Some((
+                folder.clone(),
+                1,
+                None,
+                Some(crate::book_resume_db::PageIdentity::Image {
+                    path: crate::path_key::normalize_keep_drive(&second)
+                })
+            ))
+        );
         assert_eq!(app.book_resume_meters.get(&folder), None);
         settle_book_resume_meter(&mut app);
         assert_eq!(
@@ -6276,11 +6433,8 @@ mod tests {
             handle.snapshot().phase,
             super::super::session::RemoteControlPhase::Local
         );
-        app.current_folder = Some(folder);
-        app.items = vec![
-            crate::grid_item::GridItem::Image(first),
-            crate::grid_item::GridItem::Image(second),
-        ];
+        app.load_folder(folder);
+        app.finish_page_identity_preparation_for_test();
         assert_eq!(app.resume_page_for_container(), Some(1));
     }
 

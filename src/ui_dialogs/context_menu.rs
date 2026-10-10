@@ -4469,7 +4469,7 @@ mod delete_confirm_tests {
 
     #[test]
     fn delete_confirm_modal_blocks_background_pointer_action() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
         use std::sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -4478,7 +4478,7 @@ mod delete_confirm_tests {
         let background_clicked = Arc::new(AtomicBool::new(false));
         let clicked_in_ui = Arc::clone(&background_clicked);
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(480.0, 300.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Light);

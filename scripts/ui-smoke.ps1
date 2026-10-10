@@ -28,19 +28,30 @@ RatingFolderBack records scrolled Rating folder/ZIP returns for every default hi
 [CmdletBinding()]
 param(
     [Alias('Suite')]
-    [ValidateSet('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort', 'RatingSortCollection', 'AudioTracks', 'FolderHistory', 'RatingFolderBack', 'AlwaysOnTop', 'ClipboardCapture')]
+    [ValidateSet('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort', 'RatingSortCollection', 'AudioTracks', 'FolderHistory', 'RatingFolderBack', 'AlwaysOnTop', 'ClipboardCapture', 'ReleaseChecks')]
     [string] $Scenario = 'MultiWindowPdf',
     [switch] $SkipBuild,
     [int] $TimeoutSeconds = 120,
     [ValidatePattern('^[0-9]+x[0-9]+$')]
     [string] $Idle198WindowSize = '1328x900',
-    [switch] $InteractiveApproved
+    [switch] $InteractiveApproved,
+    [switch] $IncludeFirstAi
 )
 
 if (-not $InteractiveApproved) {
     [Console]::Error.WriteLine(
         '[ui-smoke] interactive UI run requires explicit user approval; use -InteractiveApproved only after the user agrees to the scenario and expected duration.')
     exit 2
+}
+if ($IncludeFirstAi -and $Scenario -ne 'ReleaseChecks') {
+    [Console]::Error.WriteLine('[ui-smoke] IncludeFirstAi is valid only for ReleaseChecks.')
+    exit 2
+}
+if ($Scenario -eq 'ReleaseChecks') {
+    $suiteArgs = @{ InteractiveApproved = $true; SkipBuild = $SkipBuild; IncludeFirstAi = $IncludeFirstAi }
+    if ($PSBoundParameters.ContainsKey('TimeoutSeconds')) { $suiteArgs.TimeoutSeconds = $TimeoutSeconds }
+    & (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Run.ps1') @suiteArgs
+    exit $LASTEXITCODE
 }
 if ($Scenario -eq 'ClipboardCapture') {
     # Check every installation before preparation can launch anything. Another

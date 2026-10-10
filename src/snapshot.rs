@@ -125,6 +125,13 @@ impl SnapshotEntryKind {
 /// tooltip / debug log 用。filter 変化検出には使わない (= それは [`FilterState`])。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SnapshotSourceLabel {
+    /// External physical media owns one explicit initial page beside projected siblings.
+    DirectMedia {
+        target: PathBuf,
+        policy: crate::file_type_visibility::FileTypeVisibility,
+        reader_order: Vec<usize>,
+        details_sort: Option<(crate::settings::DetailsSortKey, bool)>,
+    },
     /// ★ filter から (active な ★ レベルの一覧)
     RatingFilter { active_levels: Vec<u8> },
     /// Ctrl+F text search の query
@@ -509,6 +516,9 @@ pub struct SnapshotState {
     // ── 退避 state (= snapshot OFF 時に復元) ──
     /// snapshot ON 時点の `App.items` (= 通常フォルダの GridItem 一覧)
     pub saved_items: Vec<crate::grid_item::GridItem>,
+    /// Immutable prepared identities stay paired with the saved basis rows.
+    pub(crate) saved_page_identity_index:
+        std::sync::Arc<crate::app::file_type_resume::PreparedPageIdentityIndex>,
     /// snapshot ON 時点の `App.thumbnails` (= GPU texture 状態含む)
     pub saved_thumbnails: Vec<crate::grid_item::ThumbnailState>,
     /// snapshot ON 時点の `App.image_metas`。
@@ -539,6 +549,8 @@ pub struct SnapshotState {
     pub list_view_thumbnails: Vec<crate::grid_item::ThumbnailState>,
     /// 同上、`list_view_items` と位置対応する画像 metadata。
     pub list_view_image_metas: Vec<Option<(i64, i64)>>,
+    pub(crate) list_view_page_identity_index:
+        std::sync::Arc<crate::app::file_type_resume::PreparedPageIdentityIndex>,
 
     /// 検索 view (Ctrl+G/Ctrl+S) から ★固定した場合の「戻り先フォルダ」。
     ///

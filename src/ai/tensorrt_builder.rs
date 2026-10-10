@@ -33,13 +33,16 @@ pub const TRT_BUILD_ARG: &str = "--tensorrt-build";
 /// `--tensorrt-build <model_kind>` で起動された子プロセスのエントリ。
 /// 成功で exit 0、失敗で exit 1 を返す。
 pub fn run_worker_process() -> ! {
+    run_worker_with_args(std::env::args().collect())
+}
+
+fn run_worker_with_args(args: Vec<String>) -> ! {
     // 引数解析: --tensorrt-build <model_kind_str>
-    let args: Vec<String> = std::env::args().collect();
     let kind_str = match args.iter().position(|a| a == TRT_BUILD_ARG) {
         Some(i) if i + 1 < args.len() => args[i + 1].clone(),
         _ => {
             eprintln!("usage: mimageviewer.exe {} <model_kind>", TRT_BUILD_ARG);
-            std::process::exit(1);
+            crate::exit_startup(1);
         }
     };
 
@@ -47,7 +50,7 @@ pub fn run_worker_process() -> ! {
         Some(k) => k,
         None => {
             eprintln!("unknown model_kind: {kind_str}");
-            std::process::exit(1);
+            crate::exit_startup(1);
         }
     };
 
@@ -61,7 +64,7 @@ pub fn run_worker_process() -> ! {
             "[skip] {kind_str}: TRT pack v3 ではこのモデルは DirectML 専用です。\n\
              build をスキップします (engine cache は作成されません)。"
         );
-        std::process::exit(0);
+        crate::exit_startup(0);
     }
 
     // モデルパスの取得
@@ -71,7 +74,7 @@ pub fn run_worker_process() -> ! {
         Some(p) => p,
         None => {
             eprintln!("model file not found for {kind:?}");
-            std::process::exit(1);
+            crate::exit_startup(1);
         }
     };
 
@@ -83,7 +86,7 @@ pub fn run_worker_process() -> ! {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("[error] {kind_str}: AiRuntime init failed: {e}");
-            std::process::exit(1);
+            crate::exit_startup(1);
         }
     };
 
@@ -94,7 +97,7 @@ pub fn run_worker_process() -> ! {
             active.effective,
             active.fallback_reason.as_deref().unwrap_or("unknown")
         );
-        std::process::exit(1);
+        crate::exit_startup(1);
     }
 
     // load_model → session.commit_from_file が走り、形状情報が固定されると
@@ -105,7 +108,7 @@ pub fn run_worker_process() -> ! {
     let t0 = std::time::Instant::now();
     if let Err(e) = runtime.load_model(kind, &model_path) {
         eprintln!("[error] {kind_str}: load_model failed: {e}");
-        std::process::exit(1);
+        crate::exit_startup(1);
     }
 
     // ── warmup inference: runtime tile size でダミー session.run ──
@@ -125,7 +128,7 @@ pub fn run_worker_process() -> ! {
     });
     if let Err(e) = warmup_result {
         eprintln!("[error] {kind_str}: warmup inference failed: {e}");
-        std::process::exit(1);
+        crate::exit_startup(1);
     }
 
     let elapsed_ms = t0.elapsed().as_millis() as u64;
@@ -134,7 +137,7 @@ pub fn run_worker_process() -> ! {
         "[done] {kind_str}: {elapsed_ms} ms, cache={}",
         cache_dir.display()
     );
-    std::process::exit(0);
+    crate::exit_startup(0);
 }
 
 /// 各 ModelKind に対する warmup 推論の入力テンソル shape (N, C, H, W)。
@@ -160,5 +163,64 @@ fn warmup_input_shape(kind: ModelKind) -> (usize, usize, usize, usize) {
         | ModelKind::UpscaleRealEsrganAnime6B
         | ModelKind::UpscaleRealCugan4x
         | ModelKind::UpscaleNmkdSiax4x => (1, 3, 256, 256),
+    }
+}
+
+#[cfg(test)]
+mod exit_tests {
+    #[test]
+    fn builder_usage_invalid_and_skip_exit_preserve_startup_tail() {
+        for (mode, code) in [("usage", 1), ("invalid", 1), ("skip", 0)] {
+            let directory = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ai::tensorrt_builder::exit_tests::builder_exit_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("MIV_BUILDER_EXIT_TEST", mode)
+                .env("LOCALAPPDATA", directory.path())
+                .env_remove(miv_startup::HANDOFF_ENV)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(code), "{:?}", output);
+            let log = std::fs::read_dir(directory.path().join("mimageviewer/startup-logs"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+                .unwrap();
+            let rows = std::fs::read_to_string(log)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert!(
+                rows.iter()
+                    .any(|row| row["detail"] == "builder-pending-before-exit")
+            );
+            assert_eq!(rows.last().unwrap()["name"], "process.terminal");
+            assert_eq!(
+                rows.last().unwrap()["outcome"],
+                if code == 0 { "Ok" } else { "Error" }
+            );
+        }
+    }
+    #[test]
+    #[ignore = "isolated actual builder entry and process exit; no runtime/model work"]
+    fn builder_exit_child() {
+        let mode = std::env::var("MIV_BUILDER_EXIT_TEST").unwrap();
+        miv_startup::init_process(miv_startup::Role::Core, env!("CARGO_PKG_VERSION"), false);
+        for _ in 0..512 {
+            miv_startup::record_detail("exit-fixture", "builder-pending-before-exit");
+        }
+        let mut args = vec!["test-worker".to_owned(), super::TRT_BUILD_ARG.to_owned()];
+        match mode.as_str() {
+            "usage" => {}
+            "invalid" => args.push("invalid-kind".into()),
+            "skip" => args.push("realesr_general_v3".into()),
+            _ => panic!("bad fixture"),
+        }
+        super::run_worker_with_args(args);
     }
 }

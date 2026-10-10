@@ -2788,7 +2788,7 @@ mod book_resume_meter_tests {
     }
     fn reserved_meter_snapshot(name: &str, theme: crate::os_theme::ResolvedTheme, dpi: f32) {
         let mut ready = false;
-        let mut harness = egui_kittest::Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(580.0, 1190.0))
             .with_pixels_per_point(dpi)
             .build(move |ctx| {
@@ -2844,7 +2844,7 @@ mod book_resume_meter_tests {
         mut build_ui: impl FnMut(&mut egui::Ui),
     ) {
         let mut fonts_ready = false;
-        let mut harness = egui_kittest::Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(480.0, 400.0))
             .with_pixels_per_point(dpi)
             .build(move |ctx| {

@@ -64,7 +64,7 @@ tests/
 - 必要に応じて `ui_helpers` などから切り出した整形系関数
 
 UI コードをスナップショットしたい場合は、まずロジックを `fn foo(ui, args) -> ()`
-の形に切り出してから、その関数を `Harness::builder().build_ui(|ui| foo(ui, ...))`
+の形に切り出してから、その関数を `test_ui::builder().build_ui(|ui| foo(ui, ...))`
 でラップするのが基本パターン。
 
 ### 2. ハーネスは `tests/ui_snapshot.rs` 内のヘルパーを使う
@@ -89,6 +89,15 @@ Meiryo UI 10pt) も更新し、通常文字、ツールバー専用 family、日
 fallback の縦位置を確認する。9/10pt は 96 DPI の typographic point を egui logical
 point へ換算して描画する。同じ snapshot の「動画・音声 HUD」は `x1`、`Norm`、`0.0dB`、
 再生時間を `miv-hud-text` で描き、選択フォントを変えても字面・位置が変わらないことを確認する。
+
+Windows の integration / lib UI テストは共通 `tests/support/ui_harness.rs` の builder を使う。
+`tests/ui_snapshot.rs` では `test_ui::builder()`、lib では `crate::test_ui::builder()` を入口とし、
+raw `egui_kittest::Harness::builder()` / `Harness::new()` へ戻さない。
+製品と同じ `DX12 | VULKAN` mask (`src/wgpu_backend_policy.rs`) を要求し、製品が使わない
+WGL context の初期化を避ける。`WGPU_BACKEND` による mask 上書きも製品と同様に無効。
+CPU adapter 優先 / predictable rendering / lazy 初期化は従来どおりで、各 Harness の
+Device / Renderer は独立し、並列性と画像比較は維持する。非 Windows の設定は変更しない。
+背景と採取 stack は [GPU snapshot 調査記録](ui-snapshot-gpu-investigation.md) を参照。
 
 ### 3. サイズは固定
 
@@ -174,16 +183,15 @@ module を含み、実行ファイルは薄い入口である。ただし `app` 
 `App::draw_local_adjust_*` のような `pub(crate)` 関数は integration test から直接呼べない。
 
 crate 内部の純粋な UI 描画をスナップショットしたいときは、**lib unit test
-(`src/<module>.rs` 内 `#[cfg(test)] mod`) の中で直接 `egui_kittest::Harness` を使う**。
+(`src/<module>.rs` 内 `#[cfg(test)] mod`) の中で `crate::test_ui::builder()` を使う**。
 これは App 全体を構築する snapshot を許可するものではなく、対象は上記の純粋な描画関数とする:
 
 ```rust
 // src/ui_adjustment_panel.rs::local_adjust_segmentation_tests 内
 #[test]
 fn local_adjust_panel_snapshot_empty_layer_list() {
-    use egui_kittest::Harness;
     let mut fonts_ready = false;
-    let mut harness = Harness::builder()
+    let mut harness = crate::test_ui::builder()
         .with_size(egui::vec2(280.0, 200.0))
         .build(move |ctx| {
             crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
