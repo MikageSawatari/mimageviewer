@@ -6865,7 +6865,8 @@ mod tests {
             .replace("__SEARCH_HITS__", "[]")
             .replace("__CACHE_PATHS__", "[]")
             .replace("__NAVIGATION_PATHS__", "[]")
-            .replace("__INCLUDE_FIRST_AI__", "false");
+            .replace("__INCLUDE_FIRST_AI__", "false")
+            .replace("__RUNNER_PID__", "202");
         engine.compile(source).expect("release recipe syntax");
         assert_eq!(
             parse_navigation_key("G").unwrap(),
@@ -6930,7 +6931,8 @@ mod tests {
             .replace("__SEARCH_HITS__", "[]")
             .replace("__CACHE_PATHS__", "[\"C:/fixture/cache\"]")
             .replace("__NAVIGATION_PATHS__", "[]")
-            .replace("__INCLUDE_FIRST_AI__", "false");
+            .replace("__INCLUDE_FIRST_AI__", "false")
+            .replace("__RUNNER_PID__", "202");
         let helpers = source.split("\nrelease_check_begin(").next().unwrap();
         let branch = source.split("let evidence =").nth(1).unwrap();
         engine
@@ -6958,7 +6960,8 @@ mod tests {
             .replace("__SEARCH_HITS__", "[]")
             .replace("__CACHE_PATHS__", "[]")
             .replace("__NAVIGATION_PATHS__", "[]")
-            .replace("__INCLUDE_FIRST_AI__", "false");
+            .replace("__INCLUDE_FIRST_AI__", "false")
+            .replace("__RUNNER_PID__", "202");
         let ast = engine.compile(source).unwrap().clone_functions_only();
         let selectable = |windows| {
             let snapshot = TestScriptSnapshot {
@@ -7015,7 +7018,8 @@ mod tests {
             .replace("__SEARCH_HITS__", "[]")
             .replace("__CACHE_PATHS__", "[]")
             .replace("__NAVIGATION_PATHS__", "[]")
-            .replace("__INCLUDE_FIRST_AI__", "false");
+            .replace("__INCLUDE_FIRST_AI__", "false")
+            .replace("__RUNNER_PID__", "202");
         let bootstrap = source.split("\nfor attempt in 0..1800 {").next().unwrap();
         let publisher = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(50));

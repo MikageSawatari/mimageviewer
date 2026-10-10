@@ -1,5 +1,6 @@
 // Sequential suite recipe. All paths are generated literals from the verified manifest.
 const CASE_ID = "__CASE_ID__";
+const RUNNER_PID = __RUNNER_PID__;
 const CASE_DIRECTORY = "__CASE_DIRECTORY__";
 const STATIC_PATH = "__STATIC_PATH__";
 const MANY_PATH = "__MANY_PATH__";
@@ -140,7 +141,7 @@ if CASE_ID == "seed-profile" {
     }
     // One worker sleep includes warmup, actual sample, and completion margins.
     // pause waits read-only for sampler-finished.json after writing its real end clock.
-    release_check_pause(CASE_DIRECTORY, 35);
+    release_check_pause(CASE_DIRECTORY, 35, RUNNER_PID);
 }
 release_check_evidence(CASE_DIRECTORY, evidence);
 release_check_quit();

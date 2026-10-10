@@ -114,6 +114,7 @@ function Invoke-ReleaseSession {
     $scriptPath=Join-Path $dir 'scenario.rhai'
     $template=Get-Content -LiteralPath (Join-Path $scripts 'ui-smoke\release-checks.rhai') -Encoding UTF8 -Raw
     $template=$template.Replace('__CASE_ID__',$CaseId).Replace('__CASE_DIRECTORY__',$dir.Replace('\','/')).Replace('__FIXTURE_ROOT__',$fixture.Replace('\','/')).Replace('__INCLUDE_FIRST_AI__',([bool]$IncludeFirstAi).ToString().ToLowerInvariant())
+    $template=$template.Replace('__RUNNER_PID__',([string]$PID))
     $mode=if($CaseId -eq 'perf-uncached'){'uncached'}else{'cached'}
     $many=if($CaseId -eq 'tray-close-while-loading'){$m.paths.'tray-while'}elseif($CaseId -eq 'tray-close-after-loading'){$m.paths.'tray-after'}else{$m.paths.$mode}
     foreach($token in @{
@@ -159,8 +160,9 @@ function Invoke-ReleaseSession {
                 Add-Type -AssemblyName System.Windows.Forms
                 $script:background=New-Object Windows.Forms.Form
                 $script:background.Text='mIV disposable release-check background';$script:background.Width=480;$script:background.Height=160
-                $script:background.Show(); $script:background.Activate()
-                $backgroundHwnd=$script:background.Handle.ToInt64()
+                $foregroundProof=Set-ReleaseCheckBackgroundForeground $r $script:owned.Id $script:background $PID
+                $backgroundHwnd=$foregroundProof.foreground_hwnd
+                Write-ReleaseCheckJson (Join-Path $dir 'background-ready.json') $foregroundProof
             } elseif($CaseId -eq 'static-foreground'){
                 $null=[MivReleaseCheckNative]::SetForegroundWindow([IntPtr][long]$r.root_hwnd)
             }

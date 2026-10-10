@@ -656,15 +656,32 @@ pub(super) fn register(engine: &mut Engine, bridge: RunnerBridge) {
         },
     );
     let b = bridge.clone();
-    engine.register_fn("release_check_pause", move |dir: ImmutableString, seconds: rhai::INT| -> Result<(),Box<EvalAltResult>> {
+    engine.register_fn("release_check_pause", move |dir: ImmutableString, seconds: rhai::INT, runner_pid: rhai::INT| -> Result<(),Box<EvalAltResult>> {
         let directory=output_path(dir.as_str()).map_err(rhai_error)?;
         if !(30..=60).contains(&seconds) { return Err(rhai_error("environment: release idle pause must be 30..60 seconds")); }
         // Active preparation may wake ROOT to drain real worker messages. It
         // ends BEFORE ready.json and the following no-command idle interval.
         let o=wait_idle_ready(&b).map_err(rhai_error)?;
+        let case_id=session().lock().unwrap().as_ref().ok_or_else(||rhai_error("environment: release session lost"))?.case_id.clone();
+        let grant=if matches!(case_id.as_str(), "static-background" | "video-pin-background") {
+            use windows::Win32::UI::WindowsAndMessaging::{AllowSetForegroundWindow,GetForegroundWindow,GetWindowThreadProcessId};
+            let runner_pid=u32::try_from(runner_pid).map_err(|_|rhai_error("environment: invalid runner PID"))?;
+            let root=o.value["root_hwnd"].as_u64().unwrap_or(0);
+            let foreground=unsafe {GetForegroundWindow()};
+            let mut foreground_pid=0;
+            unsafe {GetWindowThreadProcessId(foreground,Some(&mut foreground_pid))};
+            validate_foreground_grant(&case_id,root,foreground.0 as usize as u64,foreground_pid,std::process::id(),runner_pid).map_err(rhai_error)?;
+            // This runs on the Rhai worker, before ready/sleep. Only the exact
+            // runner PID supplied by the generated recipe receives permission;
+            // no global grant, input attachment or measured-interval wake.
+            unsafe {AllowSetForegroundWindow(runner_pid)}.map_err(|e|rhai_error(format!("environment: runner foreground grant failed: {e}")))?;
+            let proof=json!({"granted":true,"app_pid":std::process::id(),"root_hwnd":root,"runner_pid":runner_pid});
+            trace("foreground_grant",proof.clone());
+            proof
+        } else {Value::Null};
         let start=unix_ms();
         let target=o.value["targets"].as_array().and_then(|t|t.first()).map(|t|t["key"].clone()).unwrap_or(Value::Null);
-        write_json(&directory.join("ready.json"),&json!({"pid":std::process::id(),"root_hwnd":o.value["root_hwnd"],"target_key":target,"sleep_start_unix_ms":start,"sleep_duration_seconds":seconds,"index_scan_wait":if o.value["index_settled"]==true {"settled"} else {"pending"}})).map_err(rhai_error)?;
+        write_json(&directory.join("ready.json"),&json!({"pid":std::process::id(),"root_hwnd":o.value["root_hwnd"],"target_key":target,"sleep_start_unix_ms":start,"sleep_duration_seconds":seconds,"background_foreground_grant":grant,"index_scan_wait":if o.value["index_settled"]==true {"settled"} else {"pending"}})).map_err(rhai_error)?;
         b.interrupt.wait(Duration::from_secs(seconds as u64)).map_err(rhai_error)?;
         write_json(&directory.join("completion.json"),&json!({"pid":std::process::id(),"sleep_start_unix_ms":start,"sleep_end_unix_ms":unix_ms()})).map_err(rhai_error)?;
         let deadline=Instant::now()+Duration::from_secs(30);
@@ -747,6 +764,28 @@ pub(super) fn register(engine: &mut Engine, bridge: RunnerBridge) {
         }
     });
 }
+fn validate_foreground_grant(
+    case_id: &str,
+    root: u64,
+    foreground: u64,
+    foreground_pid: u32,
+    app_pid: u32,
+    runner_pid: u32,
+) -> Result<(), String> {
+    if !matches!(case_id, "static-background" | "video-pin-background")
+        || root == 0
+        || root != foreground
+        || app_pid == 0
+        || foreground_pid != app_pid
+        || runner_pid == 0
+        || runner_pid == u32::MAX
+        || runner_pid == app_pid
+    {
+        return Err("environment: exact root foreground / runner grant identity mismatch".into());
+    }
+    Ok(())
+}
+
 fn wait_idle_ready(bridge: &RunnerBridge) -> Result<Observation, String> {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
@@ -791,6 +830,27 @@ fn protocol_ai_trace(proof: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn foreground_grant_requires_background_case_exact_root_and_one_runner() {
+        for case in ["static-background", "video-pin-background"] {
+            assert!(validate_foreground_grant(case, 888, 888, 101, 101, 202).is_ok());
+            for runner in [0, 101, u32::MAX] {
+                assert!(validate_foreground_grant(case, 888, 888, 101, 101, runner).is_err());
+            }
+            assert!(validate_foreground_grant(case, 0, 0, 101, 101, 202).is_err());
+            assert!(validate_foreground_grant(case, 888, 889, 101, 101, 202).is_err());
+            assert!(validate_foreground_grant(case, 888, 888, 303, 101, 202).is_err());
+        }
+        for case in [
+            "static-foreground",
+            "tray-close-while-loading",
+            "tray-close-after-loading",
+            "perf-cached",
+            "perf-uncached",
+        ] {
+            assert!(validate_foreground_grant(case, 888, 888, 101, 101, 202).is_err());
+        }
+    }
     #[test]
     fn release_layout_refuses_real_data_and_other_binaries() {
         let root = Path::new(r"C:\repo\target\portable-smoke");

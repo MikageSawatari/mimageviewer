@@ -127,6 +127,25 @@ function Get-ReleaseCheckWindowSample {
     return [pscustomobject]@{ unix_ms = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(); foreground_pid = $owner; foreground_hwnd = $h.ToInt64(); total = $counts[0]; visible = $counts[1] }
 }
 
+function Set-ReleaseCheckBackgroundForeground {
+    param($Ready, [int]$AppPid, $Window, [int]$RunnerPid)
+    # The foreground app grants ONLY this runner before publishing ready.json.
+    # Showing/activating a form from a nonforeground process is not sufficient.
+    $grant=$Ready.background_foreground_grant
+    if ($Ready.pid -ne $AppPid -or $grant.granted -ne $true -or
+        $grant.app_pid -ne $AppPid -or $grant.runner_pid -ne $RunnerPid -or
+        $grant.root_hwnd -ne $Ready.root_hwnd -or $Ready.root_hwnd -le 0 -or
+        $RunnerPid -le 0 -or $RunnerPid -eq $AppPid) { throw 'Exact runner foreground grant missing or mismatched.' }
+    $hwnd=$Window.Handle.ToInt64(); [uint32]$owner=0
+    $null=[MivReleaseCheckNative]::GetWindowThreadProcessId([IntPtr]$hwnd,[ref]$owner)
+    if ($hwnd -le 0 -or $hwnd -eq $Ready.root_hwnd -or $owner -ne $RunnerPid) { throw 'Background HWND is not owned by this runner.' }
+    $Window.Show()
+    if (-not [MivReleaseCheckNative]::SetForegroundWindow([IntPtr]$hwnd)) { throw 'Runner background foreground activation was refused.' }
+    $sample=Get-ReleaseCheckWindowSample $AppPid
+    Assert-ReleaseCheckWindowSamples @($sample) 'static-background' $AppPid $Ready.root_hwnd $hwnd $RunnerPid
+    return $sample
+}
+
 function Assert-ReleaseCheckWindowSamples {
     param($Samples, [string]$Scenario, [int]$AppPid, [long]$RootHwnd, [long]$BackgroundHwnd, [int]$BackgroundProcessId=0)
     foreach ($s in $Samples) {
@@ -137,7 +156,7 @@ function Assert-ReleaseCheckWindowSamples {
         } else {
             if ($BackgroundHwnd -eq 0 -or $BackgroundProcessId -le 0 -or
                 $s.foreground_hwnd -ne $BackgroundHwnd -or $s.foreground_pid -ne $BackgroundProcessId -or
-                $s.foreground_pid -eq $AppPid) { throw 'Runner-owned background window condition was not maintained.' }
+                $s.foreground_pid -eq $AppPid) { throw "Runner-owned background window condition was not maintained: expected PID=$BackgroundProcessId HWND=$BackgroundHwnd, observed PID=$($s.foreground_pid) HWND=$($s.foreground_hwnd)." }
         }
     }
 }

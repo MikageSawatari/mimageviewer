@@ -524,3 +524,42 @@ static-foreground は実 requested_px=281 と lifetime coverage 不足で SKIPPE
 非対話のfake sampler回帰で1.2秒WMI遅延を再現し、測定窓からの分離・handle保持・終了拒否・
 既観測FAILの保持を確認する。非対話検証は `target/F-phase4-fix4-msg.txt` に記録する。
 Rust変更はなく、診断portableは再buildしない。実アプリ／ui-smokeは実行せず、修正後の実測は利用者実行待ち。
+
+### Phase 4 背面用窓への foreground handoff 修正（2026-10-11）
+
+利用者実行 `release-checks-20261010-173802-495b0aad` は seed-profile と static-foreground が PASS。
+static-background は SKIPPED。期待した背面用窓は runner PID 148312 が作った WinForms Form、
+HWND 165683580。一方、約15秒の61サンプルすべては mIV PID 39676 / root HWND 57811440 を
+foreground としていた。測定中に他アプリへ移った証跡はなく、利用者も他のGUI操作なしと報告した。
+
+- runner は既に mIV をforegroundにした後で Form.Show / Activate を呼び、その成功を検証せず
+  sampler を開始していた。Activate は非アクティブな呼出し元ではタイトル点滅になる場合があり、
+  foreground移行を保証しない（[Microsoft の Form.Activate 仕様](https://learn.microsoft.com/en-us/dotnet/api/system.windows.forms.form.activate?view=netframework-4.8.1)）。
+  旧runはAPI戻り値や準備時の実foregroundを保存していないため、拒否の厳密な時点は確定できない。
+  ただし背面状態が成立したと見なして測定を始めた準備経路の欠陥は確認できる。
+- Rhai recipe にrunner自身のPIDを生成リテラルとして渡す。static-background / video-pin-background
+  の pause 準備で、現在のforegroundが観測済みのexact root HWND / app PIDであることを検査し、
+  app側のRhai workerからrunnerのPIDだけへ AllowSetForegroundWindow を呼ぶ。
+  [Microsoft の権限引渡しAPI](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-allowsetforegroundwindow)
+  を使い、0 / 自PID / ASFW_ANYを拒否する。許可証拠をready.jsonとqa/foreground_grantへ保存する。
+  セッションの固定exe/data/output検査とroot owner照合は維持する。
+- runner はgrantのapp PID / root HWND / runner PID、実Form HWNDのownerを照合した後で
+  Show / SetForegroundWindow を実行し、実foregroundのPID / HWNDがそのFormと一致した場合だけ
+  samplerを起動する。背景準備のnative snapshotはbackground-ready.jsonへ保存する。
+  OS拒否・別窓・別PIDなら引き続き環境不成立。ユーザー窓の操作、input queue接続、global grant、
+  focus制限解除、測定中の再foreground化やretryは追加しない。
+- samplerのUTC窓は1791653975685–1791653990687、Stopwatchは15.0046447秒で正常だった。
+  completion.jsonには実sleep境界1791653965762–1791654000764も存在する。旧samplerは
+  lifetime条件検証でthrowしたため、それを読み込む前にcatchへ移り、clock.jsonも生成しなかった。
+  「UTC/sleep/Stopwatch boundaries」診断は独立した時計故障ではなく、保存を打ち切った結果。
+  window条件の失敗を残したまま実completionを読み、clock変換・包含証拠を保存する。
+  有効な時計だけでSKIPPEDをPASSへ変えず、独立に観測したCPU/logのFAILも維持する。
+- video-pin-background は同じhandoffとrunner-owned HWNDの寿命検証を使う。両trayはgrantを
+  行わず、既存のclose/witness/非表示lifetime条件を使うが、失敗時も独立した時計証拠を残す。
+  perf 2ケースは背景窓・samplerを使わず、前ケースのFormを破棄して停止済みseedを復元し、
+  新しいrootのforeground確認から始める。static-foregroundの条件・374±8の証明は変更しない。
+
+native権限引渡しはready/sleepより前だけに行い、測定中のObserve / UI command / repaintは追加しない。
+非対話fakeでgrant/owner/activation/実foregroundの拒否、およびwindow失敗と時計証拠の独立保存を検査する。
+検証とRust変更に伴う診断portable再buildは `target/F-phase4-fix5-msg.txt` に記録する。
+アプリ／ui-smokeは実行しない。修正後の実suite完走は利用者実行待ち。

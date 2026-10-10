@@ -782,6 +782,23 @@ class IdleTests(unittest.TestCase):
         sampler["window_samples"][6]["foreground_pid"] = 100
         self.assertEqual(analyze_idle_case(events, sampler, evidence, thresholds, PID)["verdict"], "SKIPPED")
 
+    def test_background_failure_preserves_clock_and_external_measurement_verdict(self):
+        for cpu, expected in ((.01, "SKIPPED"), (.2, "FAIL")):
+            with self.subTest(cpu=cpu):
+                events, sampler, evidence, thresholds = self.setup_case()
+                evidence["case_id"] = sampler["case_id"] = "static-background"
+                next(e for e in events if e.get("kind") == "on_exit")["case_id"] = "static-background"
+                # Reproduce the real run: all native samples still name the app,
+                # but the independent sleep/clock evidence has been preserved.
+                sampler.update(background_hwnd=456, background_process_id=99,
+                               cpu_core_ratio=cpu, verdict="SKIPPED",
+                               environment_errors=["Runner-owned background window condition was not maintained."])
+                result = analyze_idle_case(events, sampler, evidence, thresholds, PID)
+                self.assertEqual(result["verdict"], expected)
+                self.assertTrue(result["evidence"]["clock"]["included"])
+                self.assertTrue(any("background" in error for error in result["environment_errors"]))
+                self.assertFalse(any("boundaries" in error for error in result["environment_errors"]))
+
     def test_static_requested_pixel_boundaries_and_real_worker_match(self):
         for pixels, expected in ((366, "PASS_WITH_WARNINGS"), (382, "PASS_WITH_WARNINGS"),
                                  (281, "SKIPPED"), (365, "SKIPPED"), (383, "SKIPPED")):

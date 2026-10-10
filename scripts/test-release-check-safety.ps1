@@ -37,6 +37,11 @@ if(-not ('MivReleaseCheckNative' -as [type])){
     Add-Type @'
 using System.Text.RegularExpressions;
 public static class MivReleaseCheckNative {
+ public static uint BackgroundOwner=202;
+ public static bool ActivationSucceeds=true;
+ public static int ActivationCalls=0;
+ public static uint GetWindowThreadProcessId(System.IntPtr h,out uint p){p=BackgroundOwner;return 1;}
+ public static bool SetForegroundWindow(System.IntPtr h){ActivationCalls++;return ActivationSucceeds;}
  public static string[] Arguments(string s) {var m=Regex.Matches(s,"\"([^\"]*)\"|([^ ]+)");var a=new string[m.Count];for(int i=0;i<a.Length;i++)a[i]=m[i].Groups[1].Success?m[i].Groups[1].Value:m[i].Groups[2].Value;return a;}
 }
 '@
@@ -62,6 +67,29 @@ $sample.foreground_pid=202;$sample.foreground_hwnd=999
 Assert-ReleaseCheckWindowSamples @($sample) 'static-background' 101 888 999 202
 Assert-Throws {Assert-ReleaseCheckWindowSamples @($sample) 'static-background' 101 888 998 202} 'User window accepted instead of runner-owned window.'
 Assert-Throws {Assert-ReleaseCheckWindowSamples @($sample) 'static-background' 101 888 999 203} 'Reused runner HWND owned by another PID was accepted.'
+& {
+    $ready=[pscustomobject]@{pid=101;root_hwnd=888;background_foreground_grant=[pscustomobject]@{granted=$true;app_pid=101;root_hwnd=888;runner_pid=202}}
+    $window=[pscustomobject]@{Handle=[IntPtr]999}
+    $window|Add-Member -MemberType ScriptMethod -Name Show -Value {}
+    $script:backgroundSample=[pscustomobject]@{unix_ms=1700000000000;foreground_pid=202;foreground_hwnd=999;total=2;visible=1}
+    function Get-ReleaseCheckWindowSample {param($AppPid) $script:backgroundSample}
+    $proof=Set-ReleaseCheckBackgroundForeground $ready 101 $window 202
+    Assert-True ($proof.foreground_pid -eq 202 -and $proof.foreground_hwnd -eq 999) 'Runner foreground preparation lost the native PID/HWND proof.'
+    [MivReleaseCheckNative]::ActivationCalls=0
+    $ready.background_foreground_grant.runner_pid=203
+    Assert-Throws {Set-ReleaseCheckBackgroundForeground $ready 101 $window 202} 'Mismatched grant receiver was accepted.'
+    $ready.background_foreground_grant.runner_pid=202
+    [MivReleaseCheckNative]::BackgroundOwner=303
+    Assert-Throws {Set-ReleaseCheckBackgroundForeground $ready 101 $window 202} 'Another process background HWND was activated.'
+    Assert-True ([MivReleaseCheckNative]::ActivationCalls -eq 0) 'Identity refusal still attempted foreground activation.'
+    [MivReleaseCheckNative]::BackgroundOwner=202;[MivReleaseCheckNative]::ActivationSucceeds=$false
+    Assert-Throws {Set-ReleaseCheckBackgroundForeground $ready 101 $window 202} 'OS foreground refusal was accepted.'
+    [MivReleaseCheckNative]::ActivationSucceeds=$true
+    $script:backgroundSample.foreground_hwnd=1000
+    Assert-Throws {Set-ReleaseCheckBackgroundForeground $ready 101 $window 202} 'Activation success replaced actual HWND verification.'
+    $script:backgroundSample.foreground_hwnd=999;$script:backgroundSample.foreground_pid=101
+    Assert-Throws {Set-ReleaseCheckBackgroundForeground $ready 101 $window 202} 'App foreground was accepted for background setup.'
+}
 $sample.visible=0
 Assert-ReleaseCheckWindowSamples @($sample) 'tray-residency' 101 888 0
 $sample.total=0
@@ -220,5 +248,23 @@ Assert-True ($samplerText.Contains("perf_evaluation='deferred_until_normal_exit'
     & ([scriptblock]::Create($body[0].Extent.Text))
     foreach($statement in $verdicts){& ([scriptblock]::Create($statement.Extent.Text))}
     Assert-True ($report.verdict -eq 'SKIPPED' -and ($report.environment_errors -join ' ') -like '*Owned measured process exited*') 'Process exit during sampling was accepted.'
+    # Reproduce the real background failure after a completed measurement.
+    # It must still wait for/import worker completion and convert its clock.
+    $report=[ordered]@{failures=@();environment_errors=@();warnings=@();verdict='SKIPPED';exit_code=2}
+    $script:fakeMeasured.HasExited=$false;$Scenario='static-background'
+    $thresholds.max_cpu_core_ratio=100;$thresholds.target_cpu_core_ratio=100
+    function Get-ReleaseCheckWindowSample {param($ProcessId) [pscustomobject]@{unix_ms=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds();foreground_pid=101;foreground_hwnd=1001;total=1;visible=1}}
+    function Assert-ReleaseCheckWindowSamples {param($Samples,$Scenario,$ProcessId,$RootHwnd,$BackgroundHwnd,$BackgroundProcessId) throw 'fake lost runner background'}
+    function Get-Content {
+        param($LiteralPath,$Encoding,[switch]$Raw)
+        if($LiteralPath -like '*clock.json'){return '{"evidence":{"clock":{"included":true}}}'}
+        return '{"pid":101,"sleep_start_unix_ms":1,"sleep_end_unix_ms":2}'
+    }
+    $script:fakeClockConverted=$false
+    function python {$script:fakeClockConverted=$true;$global:LASTEXITCODE=0}
+    & ([scriptblock]::Create($body[0].Extent.Text))
+    foreach($statement in $verdicts){& ([scriptblock]::Create($statement.Extent.Text))}
+    Assert-True ($report.verdict -eq 'SKIPPED' -and $report.environment_errors -contains 'fake lost runner background') 'Lost background condition was erased by successful clock proof.'
+    Assert-True ($report.sleep_start_unix_ms -eq 1 -and $report.sleep_end_unix_ms -eq 2 -and $script:fakeClockConverted -and $report.evidence.clock.included) 'Window failure discarded independent UTC/sleep/clock evidence.'
 }
 Write-Host 'release-check safety: PASS (approval, path, exact PID/start time, lifetime windows and clock routing; no applications/process commands)'

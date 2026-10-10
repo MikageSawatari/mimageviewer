@@ -84,7 +84,10 @@ try {
     # Revalidate exe/data/command line against the same held process, after
     # capturing all external metrics (including already observed failures).
     $null = Get-ExactMeasuredProcess $p
-    Assert-ReleaseCheckWindowSamples $samples $Scenario $ProcessId $RootHwnd $BackgroundHwnd $BackgroundProcessId
+    # Window validity is independent of clock containment. Preserve a failed
+    # lifetime verdict and still collect the real worker completion boundaries.
+    try { Assert-ReleaseCheckWindowSamples $samples $Scenario $ProcessId $RootHwnd $BackgroundHwnd $BackgroundProcessId }
+    catch { $report.environment_errors += $_.Exception.Message }
     # The real worker boundary, not notification arrival, closes the clock window.
     $wait = [Diagnostics.Stopwatch]::StartNew()
     while (-not (Test-Path -LiteralPath $SleepEvidencePath -PathType Leaf)) {
