@@ -417,3 +417,34 @@ feature 有無の Rust 焦点テスト、normal / portable check、full lib、fm
   normal／portable check のみ。アプリ起動、ui-smoke、commit、独立レビューは行わない。
   初回 run を成功へ読み替えず、修正後の Phase 4 実測・採用確認は未実施。
   修正差分と検証証拠の引き継ぎ先は `target/F-phase4-fix-msg.txt`。
+
+### Phase 4 seed の root 選択修正（2026-10-11）
+
+- 利用者実行の `154647-a89c39d2` は最初の snapshot より先に `select_root`、
+  `160117-cd52b366` は窓の公開後・identity の公開前に選択して失敗した。
+  `160307-9c1116e4` は root に detached 専用の `host_incarnation` を要求して timeout。
+  timeout 診断には実 root owner が既に存在し、27 frame の後に約29秒静止していた。
+- root identity は main context serial / HWND / backend token。`host_incarnation` は常に absent。
+  serializer の `host_ready` は `select_root` が使う実 identity の存在を表すので、
+  全 case 共通の開始待機を `root_selectable(snapshot)`（root かつ host_ready）へ合わせる。
+  snapshot の受動待機だけでよく、bootstrap repaint、偽 incarnation、identity の検証緩和は不要。
+- `idle198-convergence.rhai` も同じ host_ready 契約を使う。`always-on-top.rhai` は選択前に
+  操作・capture を行うため、即時 select の startup race の参考にはならない。
+- 実 serializer による root / identity 未公開 / stale scalar / detached の回帰と、
+  遅延公開まで wake せず実 recipe の bootstrap と select_root を実行する headless 回帰を追加。
+  Rust の製品 plumbing と窓公開経路は変更しない。
+
+後続の静的確認（実アプリの完走証拠ではない）:
+
+| 対象 | 公開・待機の経路 |
+| --- | --- |
+| 共通 index settle | 選択後の Observe は fresh owner 検証と UI queue の wake を行い、実 index 状態を読む |
+| seed cache / video pin / search | Open 後の Observe で folder / loading / index を待ち、通常 pin producer の保存を確認。Ctrl+G の受理と TextEdit focus 後に text event を送り、検索の query / done / searching / hits を確認 |
+| static 2件 / video-pin-background | 同じ Open / settle を使い、pause 前に実 readiness を確認 |
+| tray 2件 | close 前の実 loading / cache 不在と exact PID/HWND を確認。非表示後も update の早期 return より前に UI request が処理され、既存 request ID witness が成立するまで Observe を行う |
+| perf 2件 | startup の many-folder を再 open せず、ready 後に navigation の実 Ctrl+Down と generation/path の変化を待つ。検索も seed と同じ通常入力経路 |
+| optional first-ai | root 選択後、通常 fullscreen / AI action と Observe で実 ready / backend を確認。今回の必須8 sessionとは別の了承範囲 |
+| idle / evidence / exit | `ready.json` 後は既存の単一 interrupt wait と sampler 完了待ちだけで、Observe・UI command を送らない。計測完了後に evidence を読むための wake と通常 tray Quit を行う |
+
+非対話検証と診断 portable の再準備は `target/F-phase4-fix2-msg.txt` へ記録する。
+修正後の実 suite 完走・採用は利用者実行待ち。アプリ起動、ui-smoke、commit は行わない。

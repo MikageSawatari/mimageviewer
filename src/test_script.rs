@@ -6874,6 +6874,106 @@ mod tests {
         // This check compiles a recipe; it never evaluates begin or accesses a window.
     }
 
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn release_checks_root_readiness_uses_the_serialized_selection_identity() {
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let engine = build_engine(bridge);
+        let source = include_str!("../scripts/ui-smoke/release-checks.rhai")
+            .replace("__SEARCH_HITS__", "[]")
+            .replace("__CACHE_PATHS__", "[]")
+            .replace("__NAVIGATION_PATHS__", "[]")
+            .replace("__INCLUDE_FIRST_AI__", "false");
+        let ast = engine.compile(source).unwrap().clone_functions_only();
+        let selectable = |windows| {
+            let snapshot = TestScriptSnapshot {
+                windows,
+                ..Default::default()
+            };
+            engine
+                .call_fn::<bool>(
+                    &mut rhai::Scope::new(),
+                    &ast,
+                    "root_selectable",
+                    (snapshot.to_rhai_map(),),
+                )
+                .unwrap()
+        };
+        assert!(!selectable(vec![]));
+        let owner = root_identity(0, 0x4a11);
+        let mut root = window_snapshot(owner, 1, 0, "static.png");
+        assert!(root.to_rhai_map()["host_incarnation"].is_unit());
+        assert!(selectable(vec![root.clone()]));
+        root.identity = None;
+        // Even stale scalar HWND/backend fields cannot authorize selection.
+        assert!(!selectable(vec![root]));
+        assert!(!selectable(vec![window_snapshot(
+            window_identity(7, 11, 13),
+            1,
+            0,
+            "detached.png",
+        )]));
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn release_checks_bootstrap_waits_for_published_root_without_waking_it() {
+        let owner = root_identity(0, 0x4a11);
+        let root = window_snapshot(owner.clone(), 1, 0, "static.png");
+        let mut unready = root.clone();
+        unready.identity = None;
+        let (bridge, rx, wakes) = runner_bridge(TestScriptSnapshot {
+            windows: vec![unready],
+            ..Default::default()
+        });
+        let published = Arc::clone(&bridge.snapshot);
+        let selection = Arc::clone(&bridge.action_selection);
+        let wake_count = Arc::clone(&wakes);
+        let mut engine = build_engine(bridge);
+        // Stub only the isolated-filesystem setup. The actual recipe wait,
+        // serializer and select_root execute; no native window is created.
+        engine.register_fn(
+            "release_check_begin",
+            |_: ImmutableString, _: ImmutableString| {},
+        );
+        let source = include_str!("../scripts/ui-smoke/release-checks.rhai")
+            .replace("__SEARCH_HITS__", "[]")
+            .replace("__CACHE_PATHS__", "[]")
+            .replace("__NAVIGATION_PATHS__", "[]")
+            .replace("__INCLUDE_FIRST_AI__", "false");
+        let bootstrap = source.split("\nfor attempt in 0..1800 {").next().unwrap();
+        let publisher = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(wake_count.load(AtomicOrdering::Relaxed), 0);
+            published.write().unwrap().windows = vec![root];
+        });
+        let selected = engine
+            .eval::<Map>(bootstrap)
+            .expect("release root bootstrap");
+        assert_eq!(
+            selected["target_mode"]
+                .clone_cast::<ImmutableString>()
+                .as_str(),
+            "targeted"
+        );
+        assert!(selected["current"].clone_cast::<bool>());
+        publisher.join().unwrap();
+        assert_eq!(
+            *selection.lock().unwrap(),
+            TestScriptActionSelection::Targeted(owner.clone())
+        );
+        assert!(
+            matches!(rx.try_recv().unwrap(), UiCommand::Precondition(trace)
+            if trace.name == "wait_until" && trace.satisfied)
+        );
+        assert!(matches!(rx.try_recv().unwrap(), UiCommand::Log(message)
+            if message.contains(&owner.describe())));
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        // Completion publishes one precondition trace, then selection logs the
+        // owner. Both happen after readiness, before any measured idle window.
+        assert_eq!(wakes.load(AtomicOrdering::Relaxed), 2);
+    }
+
     fn receive_through_finished(rx: &mpsc::Receiver<UiCommand>) -> Vec<UiCommand> {
         let mut commands = Vec::new();
         loop {

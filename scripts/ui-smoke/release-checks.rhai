@@ -12,6 +12,13 @@ const CACHE_PATHS = __CACHE_PATHS__;
 const NAVIGATION_PATHS = __NAVIGATION_PATHS__;
 const INCLUDE_FIRST_AI = __INCLUDE_FIRST_AI__;
 
+fn root_selectable(s) {
+    for w in s.windows {
+        if w.role == "root" && w.host_ready { return true; }
+    }
+    false
+}
+
 // Win32 canonical paths can carry a verbatim prefix and backslash separators.
 // Normalize only for comparing observed physical paths to generated literals.
 fn comparable_path(path) {
@@ -61,8 +68,10 @@ fn search() {
 }
 
 release_check_begin(CASE_ID, CASE_DIRECTORY);
-// The root window is published a moment after startup; wait for it like the other scenarios do.
-wait_until(|s| { for w in s.windows { if w.role == "root" && type_of(w.hwnd) == "string" && type_of(w.host_incarnation) == "i64" { return true; } } false }, 30000);
+// host_ready joins the real context/HWND/backend identity used by select_root.
+// host_incarnation belongs to detached hosts and is always absent on root.
+// This passive startup wait adds no repaint or input to the measured idle window.
+wait_until(|s| root_selectable(s), 30000);
 select_root();
 for attempt in 0..1800 {
     if release_check_observe().index_settled { break; }
