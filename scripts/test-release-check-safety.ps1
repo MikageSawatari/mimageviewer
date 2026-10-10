@@ -167,14 +167,27 @@ Assert-True ($samplerText.Contains("perf_evaluation='deferred_until_normal_exit'
     $body=@($ast.EndBlock.Statements | Where-Object {$_ -is [Management.Automation.Language.TryStatementAst]})
     $verdicts=@($ast.EndBlock.Statements | Where-Object {$_.Extent.Text -match '^\$report\.(verdict|exit_code)='})
     Assert-True ($body.Count -eq 1 -and $verdicts.Count -eq 2) 'Sampler fake cannot identify its real measurement/verdict statements.'
-    $thresholds=[pscustomobject]@{warmup_seconds=0;measure_seconds=0.005;max_cpu_core_ratio=0.02;target_cpu_core_ratio=0.01;max_app_log_growth_bytes=100;max_perf_log_growth_bytes=100}
+    Import-ReleaseCheckFunctions (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Sampler.ps1') @('Get-ExactMeasuredProcess')
+    $thresholds=[pscustomobject]@{warmup_seconds=0;measure_seconds=0.3;max_cpu_core_ratio=0.02;target_cpu_core_ratio=0.01;max_app_log_growth_bytes=100;max_perf_log_growth_bytes=100}
     $report=[ordered]@{failures=@();environment_errors=@();warnings=@();verdict='SKIPPED';exit_code=2}
     $ProcessId=101;$Scenario='tray-residency';$TargetKey='';$RootHwnd=1001;$BackgroundHwnd=0;$BackgroundProcessId=0
     $perf='fake-perf';$app='fake-app';$reportPath='fake-report';$OutputDirectory='fake-output';$SleepEvidencePath='fake-completion';$scripts='fake-scripts';$ExpectedStartTimeUtc=[datetime]'2026-10-09T00:00:00Z'
-    $script:fakeCpuCounter=0
-    function Get-ExactMeasuredProcess {$script:fakeCpuCounter++;[pscustomobject]@{TotalProcessorTime=[timespan]::FromSeconds($script:fakeCpuCounter)}}
+    $script:fakeCpuCounter=0;$script:fakeProcessQueries=0
+    $script:fakeWmiWindows=New-Object 'Collections.Generic.List[object]'
+    $script:fakeMeasured=[pscustomobject]@{Id=101;HasExited=$false;StartTime=$ExpectedStartTimeUtc;Path=$exe;Handle=[IntPtr]101}
+    $script:fakeMeasured|Add-Member -MemberType ScriptMethod -Name Refresh -Value {$script:fakeCpuCounter++}
+    $script:fakeMeasured|Add-Member -MemberType ScriptProperty -Name TotalProcessorTime -Value {[timespan]::FromSeconds($script:fakeCpuCounter / 10.0)}
+    function Get-Process {param($Id,$ErrorAction) $script:fakeProcessQueries++;return $script:fakeMeasured}
+    function Get-CimInstance {
+        param($ClassName,$Filter,$ErrorAction)
+        $begin=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        # Reproduce the slow identity lookup from Phase 4, using only a fake.
+        Microsoft.PowerShell.Utility\Start-Sleep -Milliseconds 1200
+        $script:fakeWmiWindows.Add(@{start=$begin;end=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()})
+        return $script:cim
+    }
     function Test-InitialIndexScanSettled {param($Path) $true}
-    function Start-Sleep {param($Seconds,$Milliseconds)}
+    function Start-Sleep {param($Seconds,$Milliseconds) if($Milliseconds){Microsoft.PowerShell.Utility\Start-Sleep -Milliseconds $Milliseconds}}
     function Get-FileLength {param($Path) 0}
     function Get-ReleaseCheckWindowSample {param($ProcessId) [pscustomobject]@{unix_ms=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds();total=1;visible=0}}
     function Assert-ReleaseCheckWindowSamples {param($Samples,$Scenario,$ProcessId,$RootHwnd,$BackgroundHwnd,$BackgroundProcessId)}
@@ -186,5 +199,26 @@ Assert-True ($samplerText.Contains("perf_evaluation='deferred_until_normal_exit'
     foreach($statement in $verdicts){& ([scriptblock]::Create($statement.Extent.Text))}
     Assert-True ($report.verdict -eq 'FAIL' -and $report.exit_code -eq 1) 'Clock environment failure erased the completed external CPU FAIL.'
     Assert-True ($report.failures -contains 'CPU one-core limit exceeded.' -and $report.environment_errors -contains 'fake missing session clock anchor') ('External CPU failure or clock evidence was lost: '+($report|ConvertTo-Json -Depth 4 -Compress))
+    Assert-True ($script:fakeProcessQueries -eq 1 -and $script:fakeWmiWindows.Count -eq 3) 'Sampler reacquired a PID or polled WMI during measurement.'
+    foreach($lookup in $script:fakeWmiWindows){
+        Assert-True ($lookup.end -le $report.measure_start_unix_ms -or $lookup.start -ge $report.measure_end_unix_ms) 'Slow identity query overlapped the CPU/log/foreground window.'
+    }
+    Assert-True ($report.wall_seconds -ge 0.3 -and $report.wall_seconds -lt 0.55) 'Identity latency or a full extra sleep distorted the measured duration.'
+    Assert-True ($report.window_samples.Count -ge 3 -and $report.window_samples[0].unix_ms -le $report.measure_start_unix_ms -and $report.window_samples[-1].unix_ms -ge $report.measure_end_unix_ms - 100) 'Native samples did not bracket the measurement window.'
+    for($i=1;$i -lt $report.window_samples.Count;$i++){
+        Assert-True ($report.window_samples[$i].unix_ms-$report.window_samples[$i-1].unix_ms -le 1100) 'Slow WMI caused a lifetime sampling gap.'
+    }
+    # A held handle is only useful if process exit still invalidates the run.
+    $report=[ordered]@{failures=@();environment_errors=@();warnings=@();verdict='SKIPPED';exit_code=2}
+    $script:fakeMeasured.HasExited=$false;$script:fakeSampleCount=0
+    function Get-ReleaseCheckWindowSample {
+        param($ProcessId)
+        $script:fakeSampleCount++
+        if($script:fakeSampleCount -eq 2){$script:fakeMeasured.HasExited=$true}
+        [pscustomobject]@{unix_ms=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds();total=1;visible=0}
+    }
+    & ([scriptblock]::Create($body[0].Extent.Text))
+    foreach($statement in $verdicts){& ([scriptblock]::Create($statement.Extent.Text))}
+    Assert-True ($report.verdict -eq 'SKIPPED' -and ($report.environment_errors -join ' ') -like '*Owned measured process exited*') 'Process exit during sampling was accepted.'
 }
 Write-Host 'release-check safety: PASS (approval, path, exact PID/start time, lifetime windows and clock routing; no applications/process commands)'

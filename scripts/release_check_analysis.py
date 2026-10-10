@@ -824,10 +824,14 @@ def analyze_idle_case(events: list[dict], sampler: dict, evidence: dict,
         result["environment_errors"].append("foreground/window lifetime samples missing or invalid")
     else:
         samples = sorted(samples, key=lambda s: s["unix_ms"])
+        max_gap = max(b["unix_ms"] - a["unix_ms"] for a, b in zip(samples, samples[1:]))
+        result["metrics"]["window_sample_max_gap_ms"] = max_gap
         if (samples[0]["unix_ms"] > clock["measure_start_unix_ms"] + 100 or
-                samples[-1]["unix_ms"] < clock["measure_end_unix_ms"] - 100 or
-                any(b["unix_ms"] - a["unix_ms"] > 1100 for a, b in zip(samples, samples[1:]))):
+                samples[-1]["unix_ms"] < clock["measure_end_unix_ms"] - 100):
             result["environment_errors"].append("lifetime samples do not cover the complete measurement window")
+        if max_gap > 1100:
+            result["environment_errors"].append(
+                f"lifetime sample gap {max_gap} ms exceeds 1100 ms coverage limit")
         if result["case_id"] == "static-foreground":
             root_hwnd = sampler.get("root_hwnd")
             if (not isinstance(root_hwnd, int) or root_hwnd <= 0 or

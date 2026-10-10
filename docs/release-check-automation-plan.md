@@ -75,7 +75,7 @@ fixture generator は既存 PNG generator と同梱 FFmpeg を使い、次を作
 
 | fixture | 構成・成立証拠 |
 | --- | --- |
-| static | 884×444 の byte-distinct 画像を含む画像フォルダ。窓 1328×900 / 7 列を出発点に、実要求が 374px 付近になる条件を記録する。DPI で変わるので列数だけで成立としない |
+| static | 884×444 の byte-distinct 画像を含む画像フォルダ。窓 1328×900 / 7 列 / 明示的 Portrait3x4（auto=false）を出発点に、実要求が 374px 付近になる条件を記録する。DPI で変わるので設定値だけで成立としない |
 | many-folders | 512 サブフォルダ、各 4 画像以上、keep 範囲だけでも 8 枚の upload 予算を超える配置。相異なる画像で生成し、初期 `lf_scan` とフォルダ代表サムネの負荷を持つ。枚数だけでは backlog 発生の証拠にせず、tray は§4の実観測を必須にする |
 | cached / uncached | 同じ構成の別 subtree。cached は正常ロード・保存・終了後の cache 読取を確認。uncached は準備時に開かず、当該キーの cache が無いことと初回 `from_cache=false` を確認。tray 用はさらに保存省略・close直前の cache 不在・格納後 source 再生成を必須にする（§4） |
 | video-pin | 640×360 の短い無音生成動画を child folder の代表に正常 pin 経路で固定。保存完了して App を再起動し、親のタイルが cache から読み直されたことを確認する。動画再生は始めない |
@@ -490,3 +490,37 @@ feature 有無の Rust 焦点テスト、normal / portable check、full lib、fm
 
 非対話検証と Rust 変更による診断 portable の再準備は `target/F-phase4-fix3-msg.txt` へ記録する。
 アプリ／ui-smoke は実行せず、修正後の実 suite 完走は利用者実行待ち。
+
+### Phase 4 static layout と sampler cadence 修正（2026-10-11）
+
+利用者実行 `release-checks-20261010-171936-a4a68144` で seed-profile は PASS。
+static-foreground は実 requested_px=281 と lifetime coverage 不足で SKIPPED。元の証跡・判定は保持する。
+
+- DPI 証跡は 144（150%）。overlay は窓 1328×900 / 7 列だが Landscape16x9 だった。
+  `compute_cell_size` はセル幅を floor、セル高を aspect 比で round し、`compute_display_px` は
+  セル長辺×DPI を ceil する。この run の 281px は幅約187論理px×1.5 と一致する。
+  元の§1.198の条件は縦長3:4で、同じ幅ならセル高249論理px×1.5 → 374px。
+  fixture の static 前面・背面と seed-static を明示的 Portrait3x4 に揃える。
+  281px から期待値を作り直すと整数decode回帰の条件を失うため、374±8 の実要求証明と
+  request ID / key / generation の相関は維持する。違うDPI等で範囲外なら引き続き環境不成立。
+- seed-profile は seed-static overlay で全 cache を通常 producer から作る。復元 profile に残る
+  Always が runtime へ漏れないよう、static / video-pin / perf には Auto を明示する。
+  tray 2ケースは既存の Off / 10列 / Landscape16x9 を維持し、perf も既存の7列 / Landscape16x9。
+  cached と uncached の別ルート、停止後のcache有無証明、pin / 検索の証拠は維持する。
+  fixture recipe を v3 にし、settings と manifest の検証・hash で変更内容を記録する。
+- 測定UTC窓は 1791652840039–1791652855258。先頭サンプルは開始+19ms、末尾は終了+3ms。
+  clock.json の session anchor 変換と35秒 worker sleep 内の包含も PASS であり、端点や時計変換の
+  不具合ではない。14サンプルの途中の間隔が1147–1367msに達し、1100ms上限を超えた。
+  sampler の250ms sleepに毎回の Get-CimInstance が加わっていた。
+- sampler は最初に完全照合した process handle を保持し、測定中はその生存とnative HWNDを
+  約250msごとに観測する。PIDの再取得はせず、開始前・終了後には同じ process へexe / start time /
+  command line / data-dir の完全照合を行う。CPU / log 終点を終了後WMI照会より前に採る。
+  最終sleepは残り測定時間で制限し、端点をnativeサンプルで挟む。アプリへの入力・repaintは追加しない。
+  5 idleケースがこのsamplerを共有し、perfケースはsamplerを使わず従来のperf区間を使う。
+- analyzer の100ms端点許容と1100ms最大間隔は変更しない。最大gapをmetricへ残し、端点不足と
+  cadence不足の診断を分ける。今回の全サンプルは対象rootをforegroundとしており、利用者も
+  foreground干渉なしと報告した。SKIPPEDをユーザー操作のせいとは扱わない。
+
+非対話のfake sampler回帰で1.2秒WMI遅延を再現し、測定窓からの分離・handle保持・終了拒否・
+既観測FAILの保持を確認する。非対話検証は `target/F-phase4-fix4-msg.txt` に記録する。
+Rust変更はなく、診断portableは再buildしない。実アプリ／ui-smokeは実行せず、修正後の実測は利用者実行待ち。

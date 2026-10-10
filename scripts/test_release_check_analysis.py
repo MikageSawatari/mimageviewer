@@ -691,6 +691,28 @@ class IdleTests(unittest.TestCase):
         sampler["window_samples"][7]["foreground_pid"] = 99
         self.assertEqual(analyze_idle_case(events, sampler, evidence, thresholds, PID)["verdict"], "SKIPPED")
 
+    def test_lifetime_gap_diagnostic_does_not_relax_coverage(self):
+        for gap, expected in ((1100, "PASS_WITH_WARNINGS"), (1101, "SKIPPED"),
+                              (1367, "SKIPPED")):
+            with self.subTest(gap=gap):
+                events, sampler, evidence, thresholds = self.setup_case()
+                sampler["window_samples"][1]["unix_ms"] = sampler["window_samples"][0]["unix_ms"] + gap
+                result = analyze_idle_case(events, sampler, evidence, thresholds, PID)
+                self.assertEqual(result["verdict"], expected)
+                self.assertEqual(result["metrics"]["window_sample_max_gap_ms"], gap)
+                self.assertEqual(any("sample gap" in error for error in result["environment_errors"]), gap > 1100)
+                self.assertFalse(any("complete measurement window" in error for error in result["environment_errors"]))
+
+    def test_lifetime_endpoints_still_require_complete_measurement_window(self):
+        for endpoint, delta in ((0, 100), (0, 101), (-1, -100), (-1, -101)):
+            with self.subTest(endpoint=endpoint, delta=delta):
+                events, sampler, evidence, thresholds = self.setup_case()
+                sampler["window_samples"][endpoint]["unix_ms"] += delta
+                result = analyze_idle_case(events, sampler, evidence, thresholds, PID)
+                self.assertEqual(result["verdict"], "SKIPPED" if abs(delta) > 100 else "PASS_WITH_WARNINGS")
+                self.assertEqual(any("complete measurement window" in error for error in result["environment_errors"]),
+                                 abs(delta) > 100)
+
     def test_tray_reproduction_complete_by_converted_start_not_measurement_or_sleep_end(self):
         for completed in (False, True):
             for finalized_t, expected in ((8.4, "PASS_WITH_WARNINGS"), (10, "PASS"),
@@ -762,7 +784,7 @@ class IdleTests(unittest.TestCase):
 
     def test_static_requested_pixel_boundaries_and_real_worker_match(self):
         for pixels, expected in ((366, "PASS_WITH_WARNINGS"), (382, "PASS_WITH_WARNINGS"),
-                                 (365, "SKIPPED"), (383, "SKIPPED")):
+                                 (281, "SKIPPED"), (365, "SKIPPED"), (383, "SKIPPED")):
             with self.subTest(pixels=pixels):
                 events, sampler, evidence, thresholds = self.setup_case()
                 evidence["requested_px"] = pixels

@@ -116,7 +116,9 @@ class ReleaseChecksFixtureTests(unittest.TestCase):
             self.assertEqual(overlay["startup_folder_mode"], "specific")
             self.assertEqual(overlay["startup_window_state"], "normal")
             self.assertEqual(overlay["grid_view_mode"], "Thumbnail")
-            self.assertEqual(overlay["thumb_aspect"], "Landscape16x9")
+            static = case.startswith("static-") or case == "seed-static"
+            self.assertEqual(overlay["thumb_aspect"], "Portrait3x4" if static else "Landscape16x9")
+            self.assertFalse(overlay["thumb_aspect_auto"])
             self.assertEqual(overlay["keymap"]["overrides"], [])
             self.assertTrue(overlay["minimize_to_tray_on_close"])
             self.assertEqual(overlay["favorites"][0]["path"], manifest["paths"]["search"])
@@ -126,12 +128,38 @@ class ReleaseChecksFixtureTests(unittest.TestCase):
                 self.assertEqual(overlay["cache_policy"], "Off")
                 self.assertEqual(overlay["grid_cols"], 10)
             else:
-                self.assertNotEqual(overlay.get("cache_policy"), "Off")
+                self.assertEqual(overlay["cache_policy"],
+                                 "Always" if case.startswith("seed-") and case != "seed-search" else "Auto")
                 self.assertEqual(overlay["grid_cols"], 7)
         self.assertFalse(list(self.output.rglob("*.db")))
         self.assertTrue(manifest["seed_requirements"]["app_launch_requires_interactive_approval"])
         self.assertEqual(set(manifest["seed_requirements"]["index"]["roots"]),
                          {manifest["paths"]["search"]})
+
+    def test_static_seed_and_runtime_keep_regression_aspect_after_profile_restore(self):
+        manifest = self.generate_small()
+        seed = json.loads(Path(manifest["overlays"]["seed-static"]).read_text(encoding="utf-8"))
+        self.assertEqual(seed["cache_policy"], "Always")
+        for case in fixture.CASE_PATHS:
+            runtime = json.loads(Path(manifest["overlays"][case]).read_text(encoding="utf-8"))
+            effective = seed | runtime
+            self.assertEqual(effective["cache_policy"], "Off" if case.startswith("tray-") else "Auto")
+            if case.startswith("static-"):
+                self.assertEqual(effective["thumb_aspect"], seed["thumb_aspect"])
+                self.assertEqual(effective["thumb_aspect"], manifest["static"]["thumb_aspect"])
+                self.assertEqual(effective["thumb_aspect"], "Portrait3x4")
+
+        # Refuse the old 281px-producing layout even with its integrity hashes
+        # refreshed. Settings verification proves the recipe as well as bytes.
+        overlay = Path(manifest["overlays"]["static-background"])
+        wrong = json.loads(overlay.read_text(encoding="utf-8"))
+        wrong["thumb_aspect"] = "Landscape16x9"
+        overlay.write_text(json.dumps(wrong), encoding="utf-8")
+        entry = next(item for item in manifest["files"] if item["path"] == str(overlay))
+        entry.update(sha256=fixture.sha256(overlay), size_bytes=overlay.stat().st_size)
+        (self.output / "fixture-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "settings overlay"):
+            self.verify_small()
 
     def test_full_topology_keeps_perf_shape_and_known_tray_regression_shape(self):
         # The encoder is covered separately; substitute tiny bytes to cheaply
