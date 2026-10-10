@@ -15296,6 +15296,9 @@ pub struct App {
     /// 編集・表示状態・★・タグの commit 後に、対象の物理ファイルを ledger worker へ渡す。
     /// この handle 自体は I/O を行わず、全ファイル読み出しは worker 側に閉じる。
     pub(crate) content_identity_recorder: Option<crate::content_identity::ContentIdentityRecorder>,
+    pub(crate) spread_shift_service: Option<crate::spread_shift::SpreadShiftService>,
+    spread_shift_process_owner:
+        Option<Arc<std::sync::Mutex<Option<crate::spread_shift::SpreadShiftProcessOwner>>>>,
     pub(crate) content_identity_index_load_pending:
         Option<crate::content_identity::ContentIdentityIndexLoadPending>,
     pub(crate) content_identity_index: crate::content_identity::ContentIdentityIndex,
@@ -18471,6 +18474,7 @@ pub struct App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        self.transfer_spread_shift_exit_ownership();
         self.diagnostics_export.retire();
         self.retire_pending_startup_result();
         crate::thumb_loader::cancel_raw_thumb_tickets(&self.raw_thumb_develop);
@@ -18488,6 +18492,55 @@ impl Default for App {
     /// 走らない** (= boot race の元にならない)。
     fn default() -> Self {
         Self::new_from_settings(crate::settings::Settings::load())
+    }
+}
+
+impl App {
+    pub(crate) fn install_spread_shift_runtime(
+        &mut self,
+        service: crate::spread_shift::SpreadShiftService,
+        owner: Arc<std::sync::Mutex<Option<crate::spread_shift::SpreadShiftProcessOwner>>>,
+    ) {
+        self.spread_shift_service = Some(service);
+        self.spread_shift_process_owner = Some(owner);
+    }
+
+    fn poll_spread_shift_service(&mut self) {
+        let Some(service) = &self.spread_shift_service else {
+            return;
+        };
+        let results = service.drain_results();
+        let clear_results = service.drain_clear_results();
+        let errors = service.drain_errors();
+        // D2 will attach accepted context dependencies at this exact scope boundary.
+        let _changed_scopes = service.drain_changed_scope_keys();
+        // D1 has no pairing input producers. Commit facts survive the originating context.
+        for result in results {
+            if let Err(error) = result.status {
+                self.show_feedback_toast(format!("見開き調整を保存できませんでした: {error}"));
+            }
+        }
+        for error in errors {
+            self.show_feedback_toast(format!(
+                "見開き調整の保存データを処理できませんでした: {error}"
+            ));
+        }
+        for result in clear_results {
+            if let Err(error) = result.status {
+                self.show_feedback_toast(format!("見開き調整を削除できませんでした: {error}"));
+            }
+        }
+    }
+
+    fn transfer_spread_shift_exit_ownership(&mut self) {
+        if let Some(service) = &self.spread_shift_service {
+            service.close_admission();
+        }
+        if let Some(owner) = &self.spread_shift_process_owner
+            && let Some(owner) = owner.lock().unwrap().as_mut()
+        {
+            owner.retain_recorder_for_exit(self.content_identity_recorder.take());
+        }
     }
 }
 
@@ -19434,6 +19487,8 @@ impl App {
             view_trim_save_pending: false,
             view_trim_db,
             content_identity_recorder,
+            spread_shift_service: None,
+            spread_shift_process_owner: None,
             content_identity_index_load_pending,
             content_identity_index: crate::content_identity::ContentIdentityIndex::default(),
             content_identity_ledger_state,
@@ -45440,6 +45495,10 @@ impl App {
             .is_some_and(|handle| handle.has_unfinished_work())
             || !self.local_adjust_write_pending.is_empty();
         tag_busy
+            || self
+                .spread_shift_service
+                .as_ref()
+                .is_some_and(|service| service.is_busy())
             || book_resume_busy
             || rating_busy
             || edit_preview_busy
@@ -49005,6 +49064,22 @@ impl App {
         collection_tree_migration: Option<(&Path, &Path)>,
     ) {
         self.migrate_book_page_bookmarks(mappings, bookmark_migration_journal_id);
+        // Capture the final filesystem map once; SQLite and snapshot publication
+        // stay in the shift FIFO, before subsequent opens or maintenance.
+        if let Some(service) = &self.spread_shift_service {
+            let moves = mappings
+                .iter()
+                .map(|mapping| (mapping.from.clone(), mapping.to.clone()))
+                .collect();
+            if let Err(error) = service.migrate_page_paths(moves) {
+                crate::logger::log(format!(
+                    "spread_shift: page mapping admission failed: {error}"
+                ));
+                self.show_feedback_toast(format!(
+                    "見開き調整のページ移動を反映できませんでした: {error}"
+                ));
+            }
+        }
         let collection_mappings =
             book_collection_source_mappings(mappings, collection_tree_migration);
         self.enqueue_collection_source_migration_batch(collection_mappings);
@@ -91767,6 +91842,7 @@ impl App {
         self.draw_collection_reorder(ctx);
         self.show_cache_manager_dialog(ctx);
         self.show_metadata_cleanup_dialog(ctx);
+        self.poll_spread_shift_service();
         self.show_metadata_transfer_dialog(ctx);
         self.show_sidecar_restore_dialog(ctx);
         self.show_archive_cache_manager_dialog(ctx);

@@ -5,6 +5,32 @@
 
 ---
 
+## 本別見開き調整の永続化基盤（§1.364 D1、2026-10-10）
+
+`SpreadShiftService`のUI handleは送信・immutable snapshot lookup・結果pollだけを行い、
+一つのworkerが`spread_shift.db`の接続とSet/Clear/読取を所有する。受付sequenceはchannel送信成功後、
+完了sequenceはtransaction終端後に公開する。通常warm読取にはDB round-tripを足さない。
+`RestoreReceipt`はcontext/scope/items/settings世代とshift/resumeのadmitted cutoffを捕捉し、
+pureな`RestoreReadDependencies`が両writerの固定した読取点の完了証明を照合して一回だけ返す。
+viewerのfirst-display continuationへの組込みはD2で、現在のwarm PDF表示/既存setterは変えない。
+
+既存`BookResumeWriter`に`ReadPositionAfter`と位置snapshotを追加した。外部準備workerの位置SELECTは、
+transaction開始前にcutoffが完了し、前後の受付/完了watermarkが同一の時だけ証明可能。
+証明できない時は同writerのFIFO読取を使う契約とし、Record/schema/meterの意味は保持する。
+既存maintenance後のmeter Readは位置snapshotも更新する。
+
+rename/copy/purge/cleanup/metadata workerは`maintenance_at(data_dir)`を一回取得する。
+Begin ACKは先行保存・成功Setの内容ID送信と接続closeの後。Endは再読込とepoch公開の後に待機readを返す。
+待機readをEndより前のworker queueへ入れて相互待ちにしない。実変更scopeだけ通知する。
+Setとimportのcommit済追加/置換は捕捉logical rootを既存recorderへEditとして送る。
+取消importの確定batchもworkerが送るため、UI receiverの破棄で観測集合を失わない。
+
+App終了は既存metadata workerを回収し、最終resumeをenqueueしてshift受付を閉じる。
+`SpreadShiftProcessOwner`が`run_native`外で末尾までdrain/joinし、成功結果の内容ID送信までrecorderを保持する。
+recorderの既存終了時hash取消契約は変えない。shift UI callbackにjoin/DB待機はない。
+まれな失敗はlog＋通知＋原本保持。retry、再作成、多段回復を追加しない。
+
+
 §1.241 Phase A: `crates/startup-diagnostics` の常時timelineはlauncher/coreの共通QPC基準と
 run ID/PIDを持つ。呼出元は固定サイズeventとstage atomicsをpublishし、独立writerがJSONLを
 保存する（UIからファイルwrite/flush/joinしない）。通常保存先は

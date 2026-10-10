@@ -763,6 +763,13 @@ where
     F: FnMut(),
 {
     let mut report = DeleteReport::default();
+    let _shift_maintenance = match crate::spread_shift::maintenance_at(data_dir) {
+        Ok(lease) => lease,
+        Err(error) => {
+            report.errors.push(format!("spread_shift: {error}"));
+            return report;
+        }
+    };
     let mut deleted = BTreeMap::<String, usize>::new();
     let mut protected = BTreeMap::<String, usize>::new();
     // One cleanup request can delete from several stores. Keep a prepare from
@@ -862,6 +869,24 @@ fn delete_descriptor<F>(
             return;
         }
     };
+    if descriptor.file == "spread_shift.db" {
+        let validation = (|| -> Result<bool, String> {
+            let present =
+                table_exists(&connection, descriptor.table).map_err(|error| error.to_string())?;
+            if present {
+                crate::spread_shift::validate_database_rows(&connection)?;
+            }
+            Ok(present)
+        })();
+        match validation {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                report.errors.push(format!("{}: {error}", descriptor.file));
+                return;
+            }
+        }
+    }
     let _rating_write =
         (descriptor.file == "rating.db").then(|| crate::rating_db::RATING_WRITES.begin());
     let _tag_write = (descriptor.file == "tags.db").then(|| crate::tags_db::TAG_WRITES.begin());
@@ -1025,6 +1050,7 @@ fn store_label(descriptor: &StoreDescriptor) -> &'static str {
         "folder_thumb_pins.db" => "代表サムネピン",
         "book_resume.db" => "読書位置",
         "spread.db" => "ページ表示モード",
+        "spread_shift.db" => "見開きの調整",
         "reading_history.db" => "閲覧履歴",
         _ => descriptor.file,
     }
@@ -1095,6 +1121,10 @@ mod tests {
     }
 
     fn create_table(data_dir: &Path, descriptor: &StoreDescriptor) -> rusqlite::Connection {
+        if descriptor.file == "spread_shift.db" {
+            crate::spread_shift::initialize_database_at(&data_dir.join(descriptor.file)).unwrap();
+            return rusqlite::Connection::open(data_dir.join(descriptor.file)).unwrap();
+        }
         let connection = rusqlite::Connection::open(data_dir.join(descriptor.file)).unwrap();
         connection
             .execute(
@@ -1114,6 +1144,17 @@ mod tests {
     fn insert_key(data_dir: &Path, index: usize, key: &str) {
         let descriptor = &STORES[index];
         let connection = create_table(data_dir, descriptor);
+        if descriptor.file == "spread_shift.db" {
+            let reference =
+                crate::spread_shift::SpreadShiftPageRef::ArchiveEntry("missing.jpg".into());
+            connection
+                .execute(
+                    "INSERT INTO spread_shifts(path, anchor_ref) VALUES (?1, ?2)",
+                    rusqlite::params![key, serde_json::to_string(&reference).unwrap()],
+                )
+                .unwrap();
+            return;
+        }
         connection
             .execute(
                 &format!(
@@ -1239,6 +1280,93 @@ mod tests {
                 .excluded
                 .iter()
                 .any(|entry| entry.store == "ページ表示モード" && entry.rows == 1)
+        );
+    }
+
+    #[test]
+    fn logical_shift_cleanup_counts_scopes_but_does_not_treat_missing_anchor_as_orphan() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let files = temp.path().join("books");
+        std::fs::create_dir(&data_dir).unwrap();
+        std::fs::create_dir(&files).unwrap();
+        let existing = files.join("existing.zip");
+        std::fs::write(&existing, b"fixture").unwrap();
+        let missing = files.join("missing.zip");
+        let index = descriptor_index("spread_shift.db", "spread_shifts");
+        insert_key(
+            &data_dir,
+            index,
+            &format!(
+                "{}/chapter",
+                crate::path_key::normalize_keep_drive(&existing)
+            ),
+        );
+        insert_key(
+            &data_dir,
+            index,
+            &format!(
+                "{}/chapter",
+                crate::path_key::normalize_keep_drive(&missing)
+            ),
+        );
+        let scan = run_scan_at(
+            &data_dir,
+            Path::new(""),
+            &AtomicBool::new(false),
+            &progress(PHASE_SCANNING),
+        )
+        .unwrap();
+        assert_eq!(scan.scanned_rows, 2);
+        assert_eq!(scan.orphan_total(), 1);
+        assert_eq!(
+            scan.orphan_by_store,
+            vec![StoreCount {
+                store: "見開きの調整".into(),
+                rows: 1
+            }]
+        );
+    }
+
+    #[test]
+    fn cleanup_refuses_shift_deletion_when_original_json_is_invalid() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let files = temp.path().join("files");
+        std::fs::create_dir(&data_dir).unwrap();
+        std::fs::create_dir(&files).unwrap();
+        let key = crate::path_key::normalize_keep_drive(&files.join("missing.zip"));
+        let index = descriptor_index("spread_shift.db", "spread_shifts");
+        insert_key(&data_dir, index, &key);
+        let scan = run_scan_at(
+            &data_dir,
+            Path::new(""),
+            &AtomicBool::new(false),
+            &progress(PHASE_SCANNING),
+        )
+        .unwrap();
+        assert_eq!(scan.orphan_total(), 1);
+        let connection = create_table(&data_dir, &STORES[index]);
+        connection
+            .execute("UPDATE spread_shifts SET anchor_ref = 'not-json'", [])
+            .unwrap();
+        drop(connection);
+        let report = run_delete_at(
+            &data_dir,
+            Path::new(""),
+            &scan,
+            &AtomicBool::new(false),
+            &progress(PHASE_DELETING),
+        );
+        assert!(!report.errors.is_empty());
+        assert_eq!(report.deleted_total(), 0);
+        let connection = rusqlite::Connection::open(data_dir.join("spread_shift.db")).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT anchor_ref FROM spread_shifts", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "not-json"
         );
     }
 

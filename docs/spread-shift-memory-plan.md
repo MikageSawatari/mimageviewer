@@ -81,7 +81,7 @@ mount 中の App.current_folder を保存 reply の宛先にする、兄弟窓�
 
 ### 3.1 本の scope と論理・物理キー
 
-G と共通の `BookScope { logical_root, level_prefix }` を使う。prefix は raw tree で同定した、
+G と共通の `BookScopeKey { logical_root, level_prefix }` を使う。prefix は raw tree で同定した、
 wrapper collapse 後の実効階層。種類 policy / facet で表示行が減っても別の本に付け替えない。
 永続 `path` は `spread_db::container_key(logical_root, level_prefix)` と同じ合成を
 `path_key::normalize_keep_drive` で正規化する（現行 helper: `src/spread_db.rs:30`、`src/path_key.rs:34`）。
@@ -148,7 +148,7 @@ coordinator 指示により `<data_dir>/spread_shift.db` に次のテーブル�
 
 ```text
 spread_shifts(
-    path TEXT PRIMARY KEY,       -- KeepDrive の logical BookScope key
+    path TEXT PRIMARY KEY,       -- KeepDrive の logical BookScopeKey
     anchor_ref TEXT NOT NULL     -- 検証済み tagged relative PageRef、版1
 )
 ```
@@ -539,7 +539,7 @@ raw page の `::` copy、既存 source/cache の四面 mapping は維持する�
 
 **内容 ID の観測契約（R1 P2-4）**:
 新規Setのcommit成功、およびmetadata importで実際にcommitしたshift追加/置換は、
-操作準備時に捕捉した `BookScope.logical_root` を既存
+操作準備時に捕捉した `BookScopeKey.logical_root` を既存
 `record_content_identity_for_path(path, ContentIdentityTrigger::Edit)`（`src/app.rs:75947`）へ渡す。
 current mountからrootを作る `record_current_container_content_identity`（`:75957`）をreply時に呼ばない。
 nestedはouter logical root、変換書庫は元書庫、PDF/EPUBは元ファイル。Folderは既存非対応で送らない。
@@ -601,7 +601,19 @@ ON の Book と再入場依存だけを更新する。Composed の cache には 
 
 ## 10. G が消費する固定インターフェース
 
-次の意味契約を先に共有し、実装順によって同名型の duplicate を作らない。Rust の配置は実装レビューで定める。
+次の意味契約を先に共有し、実装順によって同名型の duplicate を作らない。
+
+**Rust配置決定（2026-10-10 coordinator）**: 永続keyの正本はcrate-level
+`src/book_scope.rs` の `BookScopeKey { logical_root, level_prefix }`。
+KeepDrive正規化・実効prefix正規化・scope/coverage codecをこのmoduleだけが所有し、
+`archive(logical_root, &[String])` / `document` / `folder` constructorを供給する。
+Gの`src/app/book_materialization.rs::BookScope`はProjectionRecipeの意味分類
+（Archive/Document/ImageFolder/CompiledFolder）として維持する。
+G3がそのenumから上記constructorへadaptする消費点であり、G側でkey正規化を再実装しない。
+E固有のC1–C12 receipt/state/request/replyはcrate-level `src/spread_shift.rs`（`model`/`service`/`store`）に置く。
+D1はpure契約とworker/lifecycleを供給し、現viewerのRestore/表示/inputへの接続はD2で行う。
+`EffectiveLayoutSnapshot<T>`のtokenはaccepted layout ownerの既存tokenをそのままcaptureする。
+shift側で代替hashや新しいlayout世代を生成せず、units/role/placementと同じcaptureに含める。
 
 提案する公開型/入口（DBの接続や保存rowをGへ公開しない）:
 
@@ -609,7 +621,7 @@ ON の Book と再入場依存だけを更新する。Composed の cache には 
 ResolveShiftRequest {
   receipt: RestoreReceipt,                  // §6.1 の受付・完了証明
   cause: FreshOpen | RetainedReadoption | CompositionRemoved,
-  scope: BookScope, manifest, nav_order, identity_index,
+  scope: BookScopeKey, manifest, nav_order, identity_index,
   rules: ResolvedAutomaticRules, memory_policy, layout_eligibility
 }
 ResolveShiftReply {
@@ -633,7 +645,7 @@ Composed/Unreadable/A2はGの資格判定で先に排除し、このshift復元r
 
 | 番号 | G の消費点 | 1.364 が供給する正確な契約 |
 | --- | --- | --- |
-| C1 | scope / PreparedBook | BookScope の logical_root + raw 実効 level_prefix、KeepDrive key、階層 fallback なし。physical base spread key は別入力 |
+| C1 | scope / PreparedBook（G3 adapter） | BookScopeKey の logical_root + raw 実効 level_prefix、KeepDrive key、階層 fallback なし。Gの意味分類BookScopeはconstructorへadaptする。physical base spread key は別入力 |
 | C2 | `resolve_book_layout_source(scope)` | 構成 snapshot を先に判定。Composed なら shift の取得/解決/適用を行わず Composed を返す。構成なし Automatic だけ `resolved_rules + optional_shift`。構成読込不明をなし扱いしない |
 | C3 | Automatic optional_shift | 上記request/replyと §6.1 の先行shift/resume完了を供給。ON新規入場はfenced saved ref、操作/Preparingはaccepted live ref。OFF新規入場はNone。Missing/filteredはNone + 保持HUD状態、旧形式行はない。DB未作成はNone、不正/未知schemaは §4.4 に従い、raw代用なし |
 | C4 | 作成初期値 | Preparing受付の短い境界でscope/items/nav/rules/LayoutSource/live shift tokenと現在units/role/placementを一体capture。ON/OFF/Savingを問わず**現在の実効live組**。saved storeを再読込せず、save replyで初期値を差し替えない。saved rowを消去/更新/新規作成しない |

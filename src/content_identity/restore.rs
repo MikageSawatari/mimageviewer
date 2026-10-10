@@ -1283,6 +1283,11 @@ mod tests {
             .iter()
             .filter(|descriptor| descriptor.unique && descriptor.file != "content_identity.db")
         {
+            if descriptor.file == "spread_shift.db" {
+                crate::spread_shift::initialize_database_at(&data_dir.join(descriptor.file))
+                    .unwrap();
+                continue;
+            }
             let connection = rusqlite::Connection::open(data_dir.join(descriptor.file)).unwrap();
             let sql = match descriptor.table {
                 "ratings" => {
@@ -1386,6 +1391,7 @@ mod tests {
             crate::book_resume_db::BookResumeDb::open_at(&data_dir.join("book_resume.db")).unwrap(),
         );
         drop(crate::spread_db::SpreadDb::open_at(&data_dir.join("spread.db")).unwrap());
+        crate::spread_shift::initialize_database_at(&data_dir.join("spread_shift.db")).unwrap();
         drop(
             crate::reading_history_db::ReadingHistoryDb::open_at(
                 data_dir.join("reading_history.db"),
@@ -1836,8 +1842,8 @@ mod tests {
         let hundred = measure_batch_database_opens(100);
 
         assert_eq!(
-            one, 34,
-            "25 store copy + 1 origin batch + 8 runtime reads, including endpoint and page-alone placement"
+            one, 35,
+            "26 store copy + 1 origin batch + 8 runtime reads, including endpoint, page-alone and shift placement"
         );
         assert_eq!(hundred, one, "DB open 回数を候補数に比例させない");
     }

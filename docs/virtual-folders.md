@@ -1,5 +1,22 @@
 # 仮想フォルダ (ZIP / RAR / PDF / EPUB) 処理
 
+## 本別見開き調整のscope/転送基盤（§1.364 D1、未リリース）
+
+永続scopeは`book_scope::BookScopeKey`。元書庫/PDF/EPUBの論理rootをKeepDrive正規化し、
+ZIPはcollapse後に受け入れたraw実効prefixをconstructorへ渡す。root/親章へのfallbackはしない。
+基点は画像本の相対path、書庫のouterからの完全entry chain、文書の物理page identityで、
+cache ZIP/PDF pathやHUD ordinal/raw items indexを保存しない。Missing/種類除外でも行を保持する。
+
+明示metadata v10は`spread_shift_family { coverage, scopes }`をlogical entryに所有させる。
+元RARのshiftとcache ZIPの既存spread/trimは独立originのまま共存する。
+画像本はfolder entryがownerで子Imageには載せない。旧v7/v8/v9の字段不在は保存値を保持し、
+新coverage内の未記載scopeは空familyと同様に解除、coverage外は保持する。
+familyのdelete/insertは既存item SAVEPOINTとbatch commitに参加する。
+外部folder移動は従来どおり内容ID非対応で、明示metadata転送を使う。
+書庫/PDF/EPUBは内容IDcopy/probeのlogical slash-familyでnested-onlyの調整も搬送する。
+D1では既存viewerのshift表示/操作を変えず、Restore/一覧再解決/F12/HUDはD2、RemoteはD3で接続する。
+
+
 ## 本への再入場とfacetの帰路（§1.339）
 
 通常open、履歴←/→、親移動/BSはtyped場所と`FacetRoute`を保持した要求を成功時だけ採用する。

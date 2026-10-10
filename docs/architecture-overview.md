@@ -439,6 +439,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `comic.db` | Ctrl+T テキスト注釈のページ単位 JSON。吹き出し・テキスト・ウィンドウ・スタンプ配置の正本で、ユーザー画像スタンプは配置先の注釈に `Embedded` として埋め込む | `comic_db.rs` + `ui_text.rs` + `sidecar.rs` |
 | `comic_user_stamps.db` | Ctrl+T スタンプピッカーのユーザー画像履歴。配置時の長辺 1024px 上限 PNG を再利用用 MRU として保持する。履歴から選んでも配置先には `Embedded` をコピーするため、履歴削除は既存注釈に影響しない | `comic_user_stamps.rs` + `ui_text.rs` |
 | `spread.db` | フォルダ別表示モード (ページ構成、連結方式、綴じ方向、末尾表紙補助、見開き端の単ページ配置) | `spread_db.rs` |
+| `spread_shift.db`（§1.364 D1、未リリース） | 論理本scopeごとの相対PageRef。KeepDriveのroot＋実効ZIP prefix、一冊一行。schema v1。新規storeのためmigrationなし、不正schema/JSONは原本を保って書込停止。既存spread設定・resumeとは独立 | `book_scope.rs`、`spread_shift/{model,service,store}.rs` |
 | `book_resume.db` | コンテナpathとraw items indexで位置を復元。記録時のHUD読み順ordinal/totalをnullable列に保存し、通常Folder/ZIP/PDF一覧の下端メーターに常に左から右へ表示。旧2列DBへのALTERと一覧全行読込は既存writerで実行。App共通メモリmapを記録受付時にも更新し、描画はmap参照のみ。動画/音声の同じ帯は既存video_resume_positionsと取得済みvideo_metaを読み、別の位置map/DB列は作らない。Remoteは補助列NULL (IPC不変) | `book_resume_db.rs`, `app/book_resume_meter.rs`, [設計・割り切り](book-resume-meter-plan.md) |
 | `reading_history.db` | ユーザー操作で開いた画像フォルダ / ZIP / PDF / 変換アーカイブと動画・音声ファイルの MRU。既存 kind 文字列を維持し、`video` / `audio` と専用の `media_position_ms` / `media_duration_ms` を追加する。未知 kind は行ごと読み飛ばす。保持件数は 1..=1000 | `reading_history_db.rs` + `App::record_reading_history` |
 | `folder_thumb_pins.db` | 親コンテナ (Folder/ZipFile/PdfFile/ConvertibleArchive) の代表サムネ手動ピン。container_key 主キー (= normalize_keep_drive 済みパス) で 1 行 1 コンテナ、source は kind + container 相対 rel + (zipentry の) entry / (pdfpage の) page。`apply_folder_thumb_pin` と変換アーカイブの `archivethumb:*#pin:*` が cache key suffix `#pin:{source_id}` で identity を表現し、cascade 時は途中コンテナを含む経路 hash を source_id に加える | `folder_thumb_pins.rs` |
@@ -456,6 +457,15 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | デスクトップ `mImageViewer_diag_<日時>.zip` | 環境設定「開発者」→「ログを zip にする」で生成する診断 zip。workerの完了barrierで両ログの固定prefixを取得し、補助ログ + `system_info.txt` + `delivery_manifest.json` をまとめる。過去dropは証拠不完全と知らせ保存 | `diagnostics.rs` / `log_writer.rs` |
 
 **パスキーの正規化**: Windows は大文字小文字非区別なので、すべての DB は **小文字化 + バックスラッシュ→スラッシュ** に正規化してから格納する。新しい DB を追加するときも同じ規約に従う (`rotation_db.rs` / `adjustment_db.rs` を参照)。
+
+§1.364 D1の`BookScopeKey`/coverage codecは`book_scope.rs`が共通owner。
+Gの意味分類`BookScope`はG3でconstructorへadaptする。shift保存はAppの単一workerだけが書き、
+移動・purge・cleanup・metadata転送は同workerのFIFOをfenceして接続を閉じるmaintenance leaseを使う。
+copy/probeの`LogicalBookFamily`は指定descriptorだけにroot exact＋境界付きslash範囲を有効にする。
+相対payloadは本rootの改名で不変、製本の旧→最終ページmappingはworkerで更新し、scope外移動はMissing保持。
+settings単体reset、履歴/resume/cache削除、自動sidecarにはshiftを混ぜない。
+明示metadata v10のlogical `spread_shift_family`は物理cache由来の`container_state`とは別に搬送する。
+D1はstore/完了契約と登録までで、既存spread setter・表示Restore・HUD・F12・Remoteへの接続はD2/D3。
 
 ### フォルダ側サイドカー (`mimageviewer.dat`)
 
