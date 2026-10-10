@@ -1091,3 +1091,39 @@ HUDの描画境界だけで戻し、描画後に残りも消費する。右パ�
 render_fullscreen_viewportと実metadata ScrollAreaでpopupなしなら動くoffsetがpopup中は不変であること、
 前面popup自身はスクロールすることを確認する。同じHUDの見開き・スライドショーも背面入力を
 消費する。snapshotはfit popupの意図した画像だけを更新・目視する。
+
+## 23. HUD前面regionへの配送先と閉じるframe（2026-10-10）
+
+§22の配送はoverflow（「その他の機能」）にも必要である。同パネルはmetadataより後、同じUi layerで
+ScrollAreaを描くため、描画後のwheel消費だけではmetadataのoffset更新を取り消せない。
+既存のframe-local入力退避に配送先（上HUD / 静止画seek列menu / overflow）を付け、背面panel描画前に
+一度だけ選ぶ。描画・hitに使う既存overflow矩形内ではoverflowへ、外側では従来consumerへ配送する。
+overflowをmodalへ変更せず、外側のクリック・ホイール・キー操作と既存の閉じ方を維持する。
+新しいApp状態、open flag、独立したpending ownerは作らない。
+
+配送先を描く直前だけ入力を戻し、全HUD前面描画の後で残りを消費する。閉じるクリックとwheelが
+同じframeに届いても、そのframe開始時の配送先が所有する。targetが閉じて描画されなくなった場合も
+残りを消費し、次frameの新しいwheelは通常の背面consumerへ戻る。
+egui InputStateはwheelを複数frameへ平滑化するため、publicなdeltaとeventを消費するだけでは
+未配送分が閉じた後に再生成される。targetの終了時だけvendor/eguiのInputState自身の
+`discard_pending_scroll`でその未配送のscroll / scroll-zoom分を破棄する。開いている間の平滑化、
+新規wheel、touch gestureは維持する。時間窓やAppのpendingフラグによる遮断は行わない。
+
+前面UIの棚卸し:
+
+| 前面UI | 扱い |
+| --- | --- |
+| fit / 見開き / スライドショー | 上HUD配送を継続。fitのvalue/unit ComboBoxもその描画境界内 |
+| その他の機能 Root / ナビゲータ位置 submenu | 既存panel矩形に限定してoverflowの描画境界へ配送。実ScrollAreaで背面との重なりを検証 |
+| 投影方式 | 同じ上HUDへ追加。panorama中は通常左右panelを描かないが、未使用wheelを一覧等へ残さない |
+| 回転menu | egui Foreground popupだが同じ上HUDの後段consumerなので、上HUD配送へ含める |
+| 静止画サムネイル列menu | 背面panelの後・上HUDの前に描く既存menuへ専用の配送先を指定。既存のmenu後消費も維持 |
+| fullscreen右クリックmenu | Windows native menu / egui Tooltip Windowの別経路。HUDの同一layer ScrollAreaではなく、既存のcontext-menu入力／layer境界を維持して変更しない |
+| ナビゲータ | 背面panelより先に描く既存の専用input reducer・予約経路。HUD後段のScrollArea配送ではなく、そのownerを変更しない |
+| seek thumbnail preview / tooltip / ring guide / feedback | スクロール本文を持たない受動的な描画。新しいwheel ownerを付けない |
+| 音楽・native video HUD / 一般dialog | 別の描画・入力owner。今回の静止画共通HUDの後段panel経路ではないため変更しない |
+
+実回帰は短い窓で実overflowと長い固定metadataを重ね、前面だけscrollして背面offsetが不変となること、
+広い窓ではoverflow外側のmetadataのwheelが動くことを検証する。実HUD buttonでpopupを開き、
+fit項目選択とoverflowの×で閉じるクリック＋wheelを同じframeに送り、残り入力と背面offsetを検査する。
+閉じた後の新規wheelでmetadataが再びscrollするところまで通す。snapshotの外観・opacityを変えない。

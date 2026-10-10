@@ -5599,7 +5599,7 @@ fn draw_fs_overflow_panel_surface(
         let mut body = child.new_child(egui::UiBuilder::new().max_rect(body_rect));
         body.set_clip_rect(body_rect);
         body.spacing_mut().scroll = egui::style::ScrollStyle::solid();
-        egui::ScrollArea::vertical()
+        let output = egui::ScrollArea::vertical()
             .id_salt("fs_overflow_panel_body")
             .max_height(body_rect.height())
             .auto_shrink([false, false])
@@ -5656,7 +5656,17 @@ fn draw_fs_overflow_panel_surface(
                     FsOverflowPanelState::Closed => {}
                 }
             });
+        #[cfg(test)]
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new("fs_overflow_scroll_test_layout"),
+                (output.inner_rect, output.content_size, output.state.offset),
+            );
+        });
+        #[cfg(not(test))]
+        let _ = output;
     }
+
     action
 }
 
@@ -24714,9 +24724,9 @@ impl App {
 
                         // Panels precede the HUD in draw order. Reserve its wheel input now,
                         // so a foreground popup and a backing ScrollArea cannot both use it.
-                        let mut hud_popup_wheel = (self.fullscreen_top_bar_chrome_allowed(fs_idx)
-                            && (self.fit_popup_open || self.spread_popup_open || self.slideshow_popup_open))
-                            .then(|| FsHudPopupWheelInput::take(ctx));
+                        let mut hud_popup_wheel = self
+                            .fullscreen_front_popup_wheel_target(ctx, full_rect, fs_idx)
+                            .map(|target| FsHudPopupWheelInput::take(ctx, target));
 
                         // ── 分析パネル（分析モード時、見開き中は無効）──
                         let panels_t0 = std::time::Instant::now();
@@ -24902,6 +24912,9 @@ impl App {
                         }
                         // 静止画は左右どちらかの実パネルが表示中なら、上部バーと下部
                         // ページシークバーを同時表示する。callout だけの hover は含めない。
+                        if let Some(wheel) = hud_popup_wheel.as_mut() {
+                            wheel.restore_at(ctx, FsHudPopupWheelTarget::SeekStrip);
+                        }
                         if !state.is_video
                             && let Some(seek_target) = self.draw_fullscreen_seek_overlay_with_geometry(
                                 ui,
@@ -25082,7 +25095,7 @@ impl App {
                             let cursor_hidden = self.cursor_hidden();
                             let effective_top_bar_locked = self.resolved_still_chrome().top_locked;
                             if let Some(wheel) = hud_popup_wheel.as_mut() {
-                                wheel.restore(ctx);
+                                wheel.restore_at(ctx, FsHudPopupWheelTarget::TopBar);
                             }
                             Self::draw_fs_hover_bar(
                                 ui,
@@ -25156,10 +25169,6 @@ impl App {
                                 touch_chrome_latched,
                                 self.frame_counter,
                             );
-                            if hud_popup_wheel.is_some() {
-                                // The reserved frame remains owned even if a popup closed while drawing.
-                                consume_fs_hud_popup_wheel(ctx);
-                            }
                             if top_bar_lock_pressed {
                                 self.settings.fullscreen_top_bar_locked =
                                     !self.settings.fullscreen_top_bar_locked;
@@ -25269,6 +25278,9 @@ impl App {
                                 page_nav = saved_nav;
                             }
                         }
+                        if let Some(wheel) = hud_popup_wheel.as_mut() {
+                            wheel.restore_at(ctx, FsHudPopupWheelTarget::Overflow);
+                        }
                         if self.fs_overflow_panel_state.is_open() {
                             let overflow_available = !state.is_video
                                 && !is_music_view
@@ -25278,6 +25290,16 @@ impl App {
                                 self.draw_fs_overflow_panel(ui, ctx, full_rect, is_spread_double);
                             } else {
                                 self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+                            }
+                        }
+                        if let Some(wheel) = hud_popup_wheel.as_ref() {
+                            // Ownership lasts for the whole frame, including a click that closes
+                            // the target before (or during) its drawing boundary.
+                            consume_fs_hud_popup_wheel(ctx);
+                            if !self.fullscreen_front_popup_wheel_target_is_open(ctx, wheel.target) {
+                                // The smoothing tail belongs to the closing popup too; it must
+                                // not be synthesized again for a new backing consumer next frame.
+                                ctx.input_mut(|input| input.discard_pending_scroll());
                             }
                         }
                         fs_hover_bar_ms = hover_bar_t0.elapsed().as_secs_f64() * 1000.0;
@@ -31669,6 +31691,57 @@ impl App {
             state: self.fs_overflow_panel_state,
             root_rows,
             navigator_corner: self.settings.fullscreen_navigator_corner.normalized(),
+        }
+    }
+
+    /// Select the front consumer before backing panels draw. This is frame-local routing;
+    /// overflow remains modeless and owns only its existing painted/hit rectangle.
+    fn fullscreen_front_popup_wheel_target(
+        &self,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        fs_idx: usize,
+    ) -> Option<FsHudPopupWheelTarget> {
+        if fs_still_seek_strip_popup_open(ctx) {
+            return Some(FsHudPopupWheelTarget::SeekStrip);
+        }
+        if !self.fullscreen_top_bar_chrome_allowed(fs_idx) {
+            return None;
+        }
+        // A native egui popup has a foreground layer above same-layer painted panels.
+        if fs_rotation_popup_open(ctx) {
+            return Some(FsHudPopupWheelTarget::TopBar);
+        }
+        if fs_overflow_panel_rect(full_rect, self.fs_overflow_panel_state).is_some_and(|rect| {
+            ctx.input(|i| i.pointer.hover_pos().is_some_and(|pos| rect.contains(pos)))
+        }) {
+            return Some(FsHudPopupWheelTarget::Overflow);
+        }
+        if self.fit_popup_open
+            || self.spread_popup_open
+            || self.slideshow_popup_open
+            || self.panorama_projection_popup_open
+        {
+            return Some(FsHudPopupWheelTarget::TopBar);
+        }
+        None
+    }
+
+    fn fullscreen_front_popup_wheel_target_is_open(
+        &self,
+        ctx: &egui::Context,
+        target: FsHudPopupWheelTarget,
+    ) -> bool {
+        match target {
+            FsHudPopupWheelTarget::SeekStrip => fs_still_seek_strip_popup_open(ctx),
+            FsHudPopupWheelTarget::TopBar => {
+                self.fit_popup_open
+                    || self.spread_popup_open
+                    || self.slideshow_popup_open
+                    || self.panorama_projection_popup_open
+                    || fs_rotation_popup_open(ctx)
+            }
+            FsHudPopupWheelTarget::Overflow => self.fs_overflow_panel_state.is_open(),
         }
     }
 
@@ -42520,7 +42593,11 @@ impl App {
         touch_chrome_latched: bool,
         touch_target_frame: u64,
     ) {
-        let popup_wheel_owned = *fit_popup_open || *spread_popup_open || *slideshow_popup_open;
+        let popup_wheel_owned = *fit_popup_open
+            || *spread_popup_open
+            || *slideshow_popup_open
+            || *panorama_projection_popup_open
+            || fs_rotation_popup_open(ctx);
         let hover_in_top = ctx.input(|i| {
             !cursor_hidden
                 && i.pointer
@@ -43799,7 +43876,13 @@ impl App {
             }
         }
 
-        if popup_wheel_owned || *fit_popup_open || *spread_popup_open || *slideshow_popup_open {
+        if popup_wheel_owned
+            || *fit_popup_open
+            || *spread_popup_open
+            || *slideshow_popup_open
+            || *panorama_projection_popup_open
+            || fs_rotation_popup_open(ctx)
+        {
             consume_fs_hud_popup_wheel(ctx);
         }
 
@@ -44101,15 +44184,23 @@ fn draw_fs_prefetch_status_row(ui: &mut egui::Ui, indicator: &FsPrefetchIndicato
     });
 }
 
-/// Reserve wheel input while backing fullscreen panels render, then hand it to the HUD.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FsHudPopupWheelTarget {
+    SeekStrip,
+    TopBar,
+    Overflow,
+}
+
+/// Reserve wheel input while backing panels render, then hand it to its front drawing boundary.
 struct FsHudPopupWheelInput {
+    target: FsHudPopupWheelTarget,
     raw: egui::Vec2,
     smooth: egui::Vec2,
     events: Vec<egui::Event>,
 }
 
 impl FsHudPopupWheelInput {
-    fn take(ctx: &egui::Context) -> Self {
+    fn take(ctx: &egui::Context, target: FsHudPopupWheelTarget) -> Self {
         ctx.input_mut(|input| {
             let mut events = Vec::new();
             input.events.retain(|event| {
@@ -44121,6 +44212,7 @@ impl FsHudPopupWheelInput {
                 }
             });
             Self {
+                target,
                 raw: std::mem::take(&mut input.raw_scroll_delta),
                 smooth: std::mem::take(&mut input.smooth_scroll_delta),
                 events,
@@ -44128,7 +44220,10 @@ impl FsHudPopupWheelInput {
         })
     }
 
-    fn restore(&mut self, ctx: &egui::Context) {
+    fn restore_at(&mut self, ctx: &egui::Context, target: FsHudPopupWheelTarget) {
+        if self.target != target {
+            return;
+        }
         ctx.input_mut(|input| {
             input.raw_scroll_delta = std::mem::take(&mut self.raw);
             input.smooth_scroll_delta = std::mem::take(&mut self.smooth);
@@ -80303,8 +80398,9 @@ mod specified_scale_consumer_tests {
     }
 
     #[cfg(windows)]
-    #[test]
-    fn specified_scale_popup_wheel_does_not_scroll_the_real_metadata_panel() {
+    fn specified_popup_metadata_fixture(
+        size: egui::Vec2,
+    ) -> (egui::Context, crate::app::AppTestEnvForTest, egui::Rect) {
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
         install_fs_navigator_input_tracking(&ctx);
@@ -80329,7 +80425,14 @@ mod specified_scale_consumer_tests {
                 )],
             }),
         );
-        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(820.0, 400.0));
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        (ctx, app, viewport)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn specified_scale_popup_wheel_does_not_scroll_the_real_metadata_panel() {
+        let (ctx, mut app, viewport) = specified_popup_metadata_fixture(egui::vec2(820.0, 400.0));
         let mut frame = 0;
         let mut draw = |app: &mut App, events| {
             frame += 1;
@@ -80378,10 +80481,19 @@ mod specified_scale_consumer_tests {
             metadata().2.y > initial.y,
             "baseline without a popup really scrolls"
         );
-        for popup in 0..3 {
+        for popup in 0..5 {
             app.fit_popup_open = popup == 0;
             app.spread_popup_open = popup == 1;
             app.slideshow_popup_open = popup == 2;
+            let menu_id = match popup {
+                3 => Some(egui::Id::new("fs_rotation_btn").with("popup")),
+                4 => Some(egui::Id::new(FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID).with("popup")),
+                _ => None,
+            };
+            if let Some(id) = menu_id {
+                app.settings.fullscreen_seek_bar_locked = true;
+                egui::Popup::open_id(&ctx, id);
+            }
             for _ in 0..5 {
                 let _ = draw(&mut app, vec![]);
             }
@@ -80398,6 +80510,14 @@ mod specified_scale_consumer_tests {
                 assert!(
                     overlap.is_positive(),
                     "pointer must be over popup and panel"
+                );
+                overlap.center()
+            } else if let Some(id) = menu_id {
+                let front = ctx.memory(|memory| memory.area_rect(id)).unwrap();
+                let overlap = front.intersect(panel);
+                assert!(
+                    overlap.is_positive(),
+                    "the real menu must overlap metadata: {front:?} {panel:?}"
                 );
                 overlap.center()
             } else {
@@ -80441,6 +80561,195 @@ mod specified_scale_consumer_tests {
                     "the front popup still receives and uses the wheel"
                 );
             }
+            if let Some(id) = menu_id {
+                egui::Popup::close_id(&ctx, id);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn metadata_scroll_state(ctx: &egui::Context) -> (egui::Rect, egui::Vec2, egui::Vec2) {
+        ctx.data(|data| data.get_temp(egui::Id::new("metadata_scroll_test_layout")))
+            .unwrap()
+    }
+
+    #[cfg(windows)]
+    fn popup_wheel_events(pos: egui::Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -100.0),
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+
+    #[cfg(windows)]
+    fn assert_popup_wheel_consumed(ctx: &egui::Context) {
+        assert!(ctx.input(|i| {
+            i.raw_scroll_delta == egui::Vec2::ZERO
+                && i.smooth_scroll_delta == egui::Vec2::ZERO
+                && !i
+                    .events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::MouseWheel { .. }))
+        }));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn specified_scale_overflow_wheel_reaches_real_front_panel_only_inside_its_rect() {
+        for size in [egui::vec2(820.0, 240.0), egui::vec2(820.0, 600.0)] {
+            let (ctx, mut app, viewport) = specified_popup_metadata_fixture(size);
+            let mut frame = 0;
+            let mut draw = |app: &mut App, events| {
+                frame += 1;
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(viewport),
+                        time: Some(frame as f64 / 60.0),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| app.render_fullscreen_viewport(ctx),
+                )
+            };
+            for _ in 0..5 {
+                let _ = draw(&mut app, vec![]);
+            }
+            let button = ctx
+                .read_response(egui::Id::new("fs_overflow_btn"))
+                .unwrap()
+                .rect;
+            let _ = draw(&mut app, click(button.center()));
+            assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Root);
+            for _ in 0..5 {
+                let _ = draw(&mut app, vec![]);
+            }
+            let front: (egui::Rect, egui::Vec2, egui::Vec2) = ctx
+                .data(|data| data.get_temp(egui::Id::new("fs_overflow_scroll_test_layout")))
+                .unwrap();
+            let panel = metadata_scroll_state(&ctx).0;
+            let overlap = front.0.intersect(panel);
+            assert!(
+                overlap.is_positive(),
+                "real front and back bodies must overlap"
+            );
+            let _ = draw(&mut app, vec![egui::Event::PointerMoved(overlap.center())]);
+            let before = metadata_scroll_state(&ctx).2;
+            let _ = draw(&mut app, popup_wheel_events(overlap.center()));
+            assert_popup_wheel_consumed(&ctx);
+            for _ in 0..30 {
+                let _ = draw(&mut app, vec![]);
+            }
+            assert_eq!(metadata_scroll_state(&ctx).2, before);
+            if size.y < 300.0 {
+                let after: (egui::Rect, egui::Vec2, egui::Vec2) = ctx
+                    .data(|data| data.get_temp(egui::Id::new("fs_overflow_scroll_test_layout")))
+                    .unwrap();
+                assert!(after.1.y > after.0.height());
+                assert!(
+                    after.2.y > front.2.y,
+                    "the front overflow ScrollArea receives the wheel"
+                );
+            } else {
+                let outside = egui::pos2(panel.center().x, panel.bottom() - 20.0);
+                assert!(
+                    !fs_overflow_panel_rect(viewport, app.fs_overflow_panel_state)
+                        .unwrap()
+                        .contains(outside)
+                );
+                let _ = draw(&mut app, vec![egui::Event::PointerMoved(outside)]);
+                let _ = draw(&mut app, popup_wheel_events(outside));
+                for _ in 0..30 {
+                    let _ = draw(&mut app, vec![]);
+                }
+                assert!(
+                    metadata_scroll_state(&ctx).2.y > before.y,
+                    "overflow is nonmodal: outside wheel still reaches the metadata panel"
+                );
+                assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Root);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn specified_scale_popup_closing_frame_consumes_wheel_then_restores_back_panel() {
+        for overflow in [false, true] {
+            let (ctx, mut app, viewport) =
+                specified_popup_metadata_fixture(egui::vec2(820.0, 400.0));
+            let mut frame = 0;
+            let mut draw = |app: &mut App, events| {
+                frame += 1;
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(viewport),
+                        time: Some(frame as f64 / 60.0),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| app.render_fullscreen_viewport(ctx),
+                )
+            };
+            for _ in 0..5 {
+                let _ = draw(&mut app, vec![]);
+            }
+            let id = if overflow {
+                "fs_overflow_btn"
+            } else {
+                "fs_margin_fit_btn"
+            };
+            let button = ctx.read_response(egui::Id::new(id)).unwrap().rect;
+            let _ = draw(&mut app, click(button.center()));
+            let mut output = draw(&mut app, vec![]);
+            for _ in 0..5 {
+                output = draw(&mut app, vec![]);
+            }
+            let close_pos = if overflow {
+                ctx.read_response(egui::Id::new("fs_overflow_panel_close"))
+                    .unwrap()
+                    .rect
+                    .center()
+            } else {
+                assert!(app.fit_popup_open);
+                painted_label(&output, FullscreenFitMode::Original.label())
+                    .unwrap()
+                    .center()
+            };
+            let _ = draw(&mut app, vec![egui::Event::PointerMoved(close_pos)]);
+            let before = metadata_scroll_state(&ctx).2;
+            let mut events = click(close_pos);
+            events.extend(popup_wheel_events(close_pos));
+            let _ = draw(&mut app, events);
+            assert!(!app.fit_popup_open);
+            assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+            if !overflow {
+                assert_eq!(
+                    app.effective_fullscreen_fit_mode(),
+                    FullscreenFitMode::Original
+                );
+            }
+            assert_popup_wheel_consumed(&ctx);
+            for _ in 0..30 {
+                let _ = draw(&mut app, vec![]);
+            }
+            assert_eq!(
+                metadata_scroll_state(&ctx).2,
+                before,
+                "closing frame is still front-owned"
+            );
+            let point = metadata_scroll_state(&ctx).0.center();
+            let _ = draw(&mut app, vec![egui::Event::PointerMoved(point)]);
+            let _ = draw(&mut app, popup_wheel_events(point));
+            for _ in 0..30 {
+                let _ = draw(&mut app, vec![]);
+            }
+            assert!(
+                metadata_scroll_state(&ctx).2.y > before.y,
+                "a fresh wheel after closing returns to the backing panel"
+            );
         }
     }
 
