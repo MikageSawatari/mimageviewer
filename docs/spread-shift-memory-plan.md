@@ -1,9 +1,9 @@
-# §1.364 見開きの一ページずらしの本別記憶 — 設計 R2
+# §1.364 見開きの一ページずらしの本別記憶 — 設計 R3
 
 更新: 2026-10-10。対象: `mimageviewer-nextview` / `next-viewer`、照合基点
-`1d45bb5dab6b33ea8472fe97cf50bf5acb063afe`（R1 文書コミット。製品コードは §1.342 統合済みの `fa280d0d0` と同じ）。
-状態: **R1 独立レビュー REVISE（P1なし / P2 5件）への修正版。Q1/Q3/Q4 と再レビューは未完了。実装の許可・検収ではない。**
-今回の変更は本書と `target/D-1364-design-r2-msg.txt` だけ。コード変更、テスト実行、ビルド、
+`ec4a43b38da862f577b2872ed7c7d626f996be5d`（R2 `1837ded3f` と master の新しいまれな失敗方針を統合済み。製品コードは §1.342 統合済みの `fa280d0d0` と同じ）。
+状態: **Q1〜Q5 はすべて決定済み。利用者への未決質問なし。独立再レビュー・構造合意は別工程で、実装の許可・検収ではない。**
+今回の変更は本書と `target/D-1364-design-r3-msg.txt` だけ。コード変更、テスト実行、ビルド、
 製品起動、コミットは行わない。以下の型・メソッド・テーブル名は、現行と明記したもの以外は提案。
 
 ## 1. 正本・確定要件
@@ -19,7 +19,9 @@ G の参照正本は **`C:/home/mimageviewer-nextbook/docs/book-composition-plan
 R1では独立 ACCEPT 済み R6 を参照し、R2では E 統合後 G0（`76488f0ec`）の §6.1 / §7 / §9.3 / §14 と
 `C:/home/mimageviewer-nextbook/target/G-1242-g0-msg.txt:22`–31 の8契約を再照合した。
 G の文書・worktreeは変更しない。特に G Q1/Q6 等の利用者決定を再質問しない。
-本書の判断待ちは末尾 §12 に集約し、G0との対応は §10 に明記する。
+利用者の決定と日付は §12、G0との対応は §10 に記録する。
+R3では2026-10-10の全回答を反映し、CLAUDE.md「まれな失敗は既定で割り切る」と
+AGENTS.mdの更新済み方針を §4.4 に適用した。R2の通常再入場・正常終了・G契約は維持する。
 
 R1レビューからの修正:
 
@@ -156,7 +158,7 @@ spread_shifts(
 永続 revision / tombstone / pending 行は不要。サービス内の採用 sequence はプロセス内だけ。
 新 DB の初回作成だけで、shift の旧形式 migration はない。ファイル未作成は正常な「保存なし」。
 read-only probe が欠落 table を正常不在にできる descriptor と、稼働 service が自分の DB の
-不正 schema / JSON を検出した場合とは分け、後者を「保存なし」で上書きしない（Q4）。
+不正 schema / JSON を検出した場合とは分け、後者を「保存なし」で上書きしない（§4.4）。
 
 `SpreadShiftService` は App 所有の単一 worker / writable connection owner。
 既存 `SpreadDb` 接続・全 setter・commit後表示変更はそのまま。base mode/flow/direction の値を
@@ -173,7 +175,7 @@ DB lifecycle が一つ増える費用は §9 の登録で負担する。G の公
 maintenance は既存操作の worker / modal lifecycle を再利用する。service の FIFO に
 `BeginMaintenance` を送り、先行 command・成功結果の内容ID送信を回収して接続を閉じた ACK 後にのみ
 既存 rename/purge/copy/import worker が DB を開く。writer lease はその一処理だけに渡す。
-完了・取消・失敗いずれでも接続を閉じて返し、service が再読込して新 snapshot を公開してから通常受付へ戻る。
+既存maintenanceの終了経路で接続を閉じてleaseを返し、serviceが再読込して新snapshotを公開してから通常受付へ戻る。
 新 open の Restore は同じ maintenance 完了依存へ接続し、古い snapshot を完成済みと扱わない。
 lease中は新しいDB commandをworkerへ流さず、既存保守operationの依存として保持する。
 EndMaintenance/再openを待機Readの後ろへenqueueして相互待ちにしない。
@@ -187,7 +189,7 @@ read-only export も開始時に先行保存を fence して一つの DB read tr
 入力元 context ID、items generation、操作 sequence、要求時の logical root、資格 snapshot を捕捉する。
 受付で最新の共通資格を確認し、**送信に成功した時点で admitted sequence を公開**して worker へ送る。
 commit sequence / 保存行 snapshot の公開とは別であり、前者は未完了の先行要求を open が見落とさないための受付順。
-順序は完了時の mount / focus に依存しない。送信失敗は受理成功とせず Q4 の通知へ。
+順序は完了時の mount / focus に依存しない。送信失敗は受理成功とせず §4.4 に従う。
 新しい入力による保存を close 時まで遅らせない。close / fork / restore は新規 save の producer ではない。
 
 1. Automatic の有効 nudge の後者 anchor を ref に変換する。端の no-op は write / 保存通知なし。
@@ -197,13 +199,13 @@ commit sequence / 保存行 snapshot の公開とは別であり、前者は未�
    「保存しました」はこの完了後だけ。古い reply でも保存済み事実は service に反映し、
    古い seq を現 context の live state に戻さない。
 4. Clear は context の shift を外して既存の位置正規化へ送り、保存行があれば削除する。
-   **明示解除は記憶 OFF 中にもこの本の保存行を消す**という推奨（Q1）。
+   **明示解除は記憶 OFF 中にもこの本の保存行を消す**（Q1決定）。
    Clear 成功後に「見開き調整を解除しました」。保存なしの session 解除は即時通知できる。
-5. エラーなら成功と表示せず、session と durable の差を通知する（Q4）。自動 retry / rollback 網は作らない。
+5. エラーは §4.4 の既定方針に従う。
 
 長押し/連打は既存 navigation sequence の admission を維持し、受理済み command を FIFO で一回実行する。
 後続 nudge は要求元 context の即時更新済み live state、後続 mode/flow/direction は現行同期 setter が
-採用した状態を基準にする。Q3 採択なら setter 成功または同mode再押下の現行resetに対応する
+採用した状態を基準にする。Q3決定に従い、記憶ONではsetter成功または同mode再押下の現行resetに対応する
 Clearをその受付順で送る（同modeでは既存DB write自体がない）。
 例: nudge(Set s1)→同期 mode 成功(Clear s2)→nudge(Set s3) はこの順。setter 失敗で
 現行 reset が起きなければ Clear も発行しない。既存全 spread 状態を保存 reply から採用し直すことはない。
@@ -211,6 +213,10 @@ save reply は target を動かさない。未受理 command と既に送信し�
 送信済みは元 scope に一度だけ確定し、元窓が消えていれば App の既存通知面へ結果を報告する。
 正常再入場 / 正常終了の確定は §6.1 の fence、Remote 取得は §8.2 の drain を使う。
 DBの完了・joinは worker / process終了ownerで扱い、UI スレッドで待たない。
+
+### 4.4 まれな失敗の既定方針（Q4確認済み）
+
+まれな失敗は既定で割り切る（ログ＋通知＋原本保持）。保存失敗ではsession調整、解除保存失敗では解除後の現表示を保ち、成功と通知しない。読めない原本は削除・再作成せず書込を止め、再生成可能な索引・cacheだけを必要なら作り直す。再試行・途中状態保持・失敗分類・多段回復・回復内の回復・失敗のための完了待ちは追加しない。相談は利用者作成データの損失・破損や通常利用で起こる問題だけとし、この既定方針は再相談しない。通常の保存中再入場・連続入力・正常終了は別の構造要件（§6.1）。
 
 ## 5. session state・設定変更・既存 reset
 
@@ -227,7 +233,7 @@ settings transfer では portable な利用設定として含める（接点: `s
 本別 anchor データは settings transfer には含めず、metadata transfer に含める。
 履歴 ON/OFF、履歴クリア、resume クリアで shift を消さない。
 
-Q1 推奨の ON/OFF 規則:
+Q1決定済みの ON/OFF 規則（2026-10-10）:
 
 | 操作 | 現在表示 / 保存行 |
 | --- | --- |
@@ -246,15 +252,15 @@ None 代入の分類と置換方針:
 | producer / lifecycle | 共通 owner に渡す意味 |
 | --- | --- |
 | 本初回/再入場、ZIP 階層切替、PDF direction adoption | `Restore(scope, accepted_rows)`。base 値だけを読む段では session を確定せず、最終列と saved ref を一緒に解く |
-| 明示 mode 変更、同じ mode のキー再押下、flow / direction 変更 | 現行の session reset を保つ。ON なら saved row も Clear にする案（Q3）。OFF なら従来 session reset だけ |
+| 明示 mode 変更、同じ mode のキー再押下、flow / direction 変更 | 現行のsession resetを保つ。ONならsaved rowもClearし通知（Q3決定）。OFFなら従来session resetだけ。Composedのmode-onlyは休眠値を消さない |
 | favorite / 全体既定 / 文書方向の hydration、import | ユーザーのずらし解除と推定しない。受入済み規則と保存 ref から再解決。import の明示空は §9 の転送契約で解除 |
 | page-edit の一時 Single pivot | mode 永続変更ではない。調整を保存/消去しない（現行 `src/app.rs:11937`） |
 | row 削除・追加・sort/filter/F5 | identity を新投影へ解き直す。shift だけのための DB 書込なし |
 | fullscreen close、本切替、fork、park/mount/deposit/drop | 当該 context の session を移送または終了。close 時に古い anchor を保存しない |
 | G composition 作成/編集/解除 | §10 の LayoutSource で切替。保存/消去を付随させない |
 
-mode/flow reset が保存済み調整を消す Q3 は利用者データに関わるため未承認で実装しない。
-逆に reset 後すぐ hydration で saved shift を再適用して、既存の基本 pairing へ戻す操作を無効にもしない。
+mode/flow/direction resetで保存済み調整も消す規則はQ3で承認済み。
+reset後すぐhydrationで旧saved shiftを再適用して、既存の基本pairingへ戻す操作を無効にしない。
 
 ## 6. open・restore・一覧変更の一つの採用点
 
@@ -276,7 +282,7 @@ cold 未準備・保存中・maintenance 中は既存 typed open/hydration conti
 「同じ HUD ordinal へ行く」より「同じ実ページを含む組」の再現を優先する。
 resume と shift を一つの DB transaction にまとめる必要はない。
 **通常の再入場は両 writer の先行要求完了を満たした結果だけを採用する**（§6.1）。
-異常終了時の二 DB 同時確定までは保証せず、そこだけを Q4 の割り切り候補とする。
+異常終了時の二DB同時確定までは保証せず、§4.4の既定方針を適用する。
 
 ### 6.1 先行保存・resume・open の整列（R1 P2-1）
 
@@ -318,7 +324,7 @@ shift適用用読取は不要だが、送信済み保存の完了ownerは残る�
 `ReadPositionAfter(r1)` の両完了後に s1 の組と r1 の実ページを採用。
 `Clear s2→close→同本open` は s2 の解除後の base unit から開始する。
 旧窓のreplyを適用できなくても、新窓の復元結果は自分のreceiptから得られる。
-この保証は通常動作の構造要件であり、Q4の異常終了扱いへ押し込まない。
+この保証は通常動作の構造要件であり、§4.4の異常終了扱いへ押し込まない。
 
 **正常終了**では新 producer の受付を既存終了経路で閉じ、最後の通常resume記録と
 metadata取消の適用済みbatchを確定した後、shift FIFOを閉じて末尾までdrainする。
@@ -327,7 +333,7 @@ metadata取消の適用済みbatchを確定した後、shift FIFOを閉じて末
 shift は process owner に終了receipt/worker join権限を渡し、UI callbackに新joinを追加しない。
 既存 outer process の終了owner（`src/lib.rs:1899`）と同型に、drainと成功結果の回収・内容ID送信が
 終わってから processを終了する。窓closeだけではwriterを終了せず、timeoutで正常成功を偽らない。
-通常の正常終了後は全受理済み成功保存が残る。書込失敗は成功と通知せずQ4、kill/停電は異常終了と区別する。
+通常の正常終了後は全受理済み成功保存が残る。まれな失敗は §4.4 に従い、kill/停電は正常終了と区別する。
 
 ### 6.2 入口・Missing・一覧変更
 
@@ -428,7 +434,7 @@ Composed は G の「構成あり」indicator を使い、休眠 shift の印を
 
 ON の操作は保存中を状態行/印の tooltip に出し、成功後に「見開きの調整をこの本に記憶しました」。
 OFF は既存 nudge toast を「見開きを1ページずらしました（この閲覧中のみ）」とする。
-明示解除の成功、保存失敗、解除保存失敗は §4.3/Q4 の結果を一度通知する。
+明示解除の成功と保存結果は §4.3/§4.4 に従って一度通知する。
 seq の古い成功で最新失敗の表示を消したり、別本へ移った後に新本の成功として表示したりしない。
 通知の表示制御だけを理由に commit 事実を捨てない。
 
@@ -505,7 +511,7 @@ Web の rendition key には既存の partner/slot と受入済み layout identi
 | --- | --- |
 | data-dir / 起動 / 保存先移動 | `data_dir::get()`（`src/data_dir.rs:56`）の直下 `spread_shift.db`。通常/portable/`--data-dir`/test overrideを既存共通解決に従わせ、固定APPDATAや別worktreeを参照しない。起動workerがopen/schema確認/read snapshotを作る。data-dir一式の移送ではDBと存在するSQLite家族ファイルを含め、稼働writerを閉じてから扱う。既存settings単体backupとは別 |
 | writer / 終了 / maintenance | App所有service一つ。通常は専用worker、共通保守期間だけ §4.1 のleaseを渡す。`rename_migration_writers_busy`（`src/app.rs:45417`）にも未完了command/未消費成功結果を登録し、旧key write後の移行を保証。通常close/forkでは閉じない。正常process終了は §6.1 のdrain→接続close→process側join。未消費成功reply/内容ID観測も保守開始前に完了 |
-| `rename_key_migration::STORES`（`src/rename_key_migration.rs:939`） | `spread_shift.db / spread_shifts / path / unique=true / KeepDrive / OptionalInLegacySchema` を登録（constructorは `:914`）。未作成ファイル/保守probeの欠落tableは正常不在。serviceが検出した不正DBはQ4。対象descriptorのlogical slash-family capabilityも登録 |
+| `rename_key_migration::STORES`（`src/rename_key_migration.rs:939`） | `spread_shift.db / spread_shifts / path / unique=true / KeepDrive / OptionalInLegacySchema` を登録（constructorは `:914`）。未作成ファイル/保守probeの欠落tableは正常不在。serviceが検出した不正DBは §4.4。対象descriptorのlogical slash-family capabilityも登録 |
 | root 改名・アプリ内 folder 移動 / copy | exact + `/` + `::` の既存 family 処理。相対 payload は root 改名では不変。destination があれば既存 conflict 規則を守る |
 | 個別画像の改名 / 製本順替え | key だけでなく payload の RelativePath を同じ旧→最終 path mapping で変換。しおりの mapping（`src/book_bookmarks.rs:1102`）を共有。scope 内だけ更新、scope 外移動は旧本の Missing を保持し、新本へ shift を勝手にコピーしない |
 | 外部 folder move / rename | Folder は内容 ID 非対応（`src/content_identity.rs:62`）。shift の新 sidecar を作らず、既存 per-book spread と同じく明示 metadata export/import を案内。旧 DB 行は保持。アプリ内移動との違いを明記 |
@@ -543,7 +549,7 @@ importは項目SAVEPOINTの成功だけでは観測せず、batch commitでroot�
 Appの保守完了ownerが集合をdedupしてrecorderへ送ってから完了を回収する。
 終了でimportが回収された場合も同じ成功集合を送る。未閲覧本のimportにも観測を作り、
 表示窓/refreshの有無・履歴設定に依存させない。既存recorderのworker/内容hashを再利用し、shiftをhashへ混ぜない。
-観測/保存のまれな失敗はQ4へ。独自ledger retryや二DB回復は追加しない。
+観測/保存のまれな失敗は §4.4 の既定方針に従う。
 受入は**nested shiftだけ（他の復元行なし）のrootが候補検出→flag保持→復元→nested再入場まで通ること**、
 および**未閲覧本へimport→外部移動→内容ID候補→shift復元**の両方を必須とする。
 
@@ -629,7 +635,7 @@ Composed/Unreadable/A2はGの資格判定で先に排除し、このshift復元r
 | --- | --- | --- |
 | C1 | scope / PreparedBook | BookScope の logical_root + raw 実効 level_prefix、KeepDrive key、階層 fallback なし。physical base spread key は別入力 |
 | C2 | `resolve_book_layout_source(scope)` | 構成 snapshot を先に判定。Composed なら shift の取得/解決/適用を行わず Composed を返す。構成なし Automatic だけ `resolved_rules + optional_shift`。構成読込不明をなし扱いしない |
-| C3 | Automatic optional_shift | 上記request/replyと §6.1 の先行shift/resume完了を供給。ON新規入場はfenced saved ref、操作/Preparingはaccepted live ref。OFF新規入場はNone。Missing/filteredはNone + 保持HUD状態、旧形式行はない。DB未作成はNone、不正/未知schemaはQ4で原本保持し、raw代用なし |
+| C3 | Automatic optional_shift | 上記request/replyと §6.1 の先行shift/resume完了を供給。ON新規入場はfenced saved ref、操作/Preparingはaccepted live ref。OFF新規入場はNone。Missing/filteredはNone + 保持HUD状態、旧形式行はない。DB未作成はNone、不正/未知schemaは §4.4 に従い、raw代用なし |
 | C4 | 作成初期値 | Preparing受付の短い境界でscope/items/nav/rules/LayoutSource/live shift tokenと現在units/role/placementを一体capture。ON/OFF/Savingを問わず**現在の実効live組**。saved storeを再読込せず、save replyで初期値を差し替えない。saved rowを消去/更新/新規作成しない |
 | C5 | Composed command gate | Single/Splitの通常nav fallbackを先に分離。その後PairingEditAvailabilityでComposed/Unreadable/A2を判定し、全producerと再送をshift変更前に拒否。record/revision/shift/global binding/resume/unit/cache のwriteゼロ。拒否理由とeditor案内を返す |
 | C6 | 構成解除 | 新 Book adoption で現在の記憶設定・scope・identity 規則から一回再解決。ON + resolved のみ復活、OFF/Missing は復活しない。G 独自 fallback/offset は作らない |
@@ -638,7 +644,7 @@ Composed/Unreadable/A2はGの資格判定で先に排除し、このshift復元r
 | C9 | editor / HUD 説明 | 「本の構成で設定されています。組を変えるには本の構成を編集してください」。local editor 導線は G、shift group/marker は 1.364。Remote は PC 編集案内のみ |
 | C10 | maintenance / metadata | Eが専用DBの全 §9 lifecycleを所有。descriptor限定slash-family helperをcopy/probe共有し、nestedのみでも候補/flag維持。Set/importのcommit済追加/置換は捕捉logical rootを既存recorderへ。coverage内未記載は解除/外は保持/旧不在は保持。実変更scopeのみE snapshot通知、G revision/transactionへ混ぜない。PageRefとscope/coverage codecだけ共有 |
 | C11 | Single/Spread/Split mode-only | G の構成あり mode-only は dormant shift を Clear しない。既存結合 setter からの自動 reset を流用しない |
-| C12 | 限定例外 / 共同fixture | document identityはG Q6既決定に従う。未決Q1/Q3/Q4はEが反映しGに実効契約を返す。Gはfallback/記憶規則を再実装しない。§11.2のD1→D2→D3とG3接続で下記8項目の共同fixtureを採択する |
+| C12 | 限定例外 / 共同fixture | document identityはG Q6既決定に従う。§12のQ1〜Q5決定をEの実効契約としてGへ供給。Gはfallback/記憶規則を再実装しない。§11.2のD1→D2→D3とG3接続で下記8項目の共同fixtureを採択する |
 
 ExtractedResult は G A2 固定 Automatic(shift=None)、OrdinaryList は G の元 scope の操作資格を使用。
 構成「存在」と表示 recipe を混同し、mixed/本扱い OFF で外部 shift を許可する裏口を作らない。
@@ -670,24 +676,25 @@ G0 handoff（`C:/home/mimageviewer-nextbook/target/G-1242-g0-msg.txt:22`–31）
 | composition と shift の全組合せ | G 決定の二択 LayoutSource で排除。Composed は休眠保持だけ、解除時に一回再評価 |
 | 保存を modal にして navigation/F12 を止める | 不採用。連続 nudge / 普通のページ送りが遅くなり、手間も増える。短い一行保存の scope/ref を捕捉すれば DB write で navigation を待つ必要がない。必要だと判明したら利用者へ相談 |
 | 全窓に最後の saved shift を即時反映 | 不採用。読んでいる兄弟窓を移動/再pair させる。session は窓別、保存は last explicit action、再入場で最新値という単純規則 |
-| OFF 時の全データ削除 | 不採用推奨。不可逆な利用者データ損失。保持+新規 read/write 停止で済む（Q1） |
+| OFF 時の全データ削除 | Q1決定により不採用。不可逆な利用者データ損失。保持+新規 read/write 停止で済む |
 | spread.db再利用 / 既存writer非同期移管 | R2で不採用。連続setterが旧全状態を捕捉する問題と、commit後mode採用/nudge/resetの組合せが増える。同じDBの常設第二writerも作らない |
 | shift専用DB / worker | R2採択。既存setterの同期契約を維持してP2-2を設計から除く。shiftだけ単一owner/commit点、増えるDB lifecycleは §9 に全登録。全状態の差分mergeや入力modal停止は不要 |
 | maintenanceの別同時writer / 専用rebuild | 不採用。既存modal/workerへwriter leaseを渡し、同じ完了経路でsnapshot再読込。新openもその依存を待つ。新たな全窓live-rebuild網は作らない |
 | 毎 open の anchor 内容 hash / 近いページ探索 | 不採用。既存 stable identity を越えるコストと誤適用。Missing を残して明示解除できる方が単純 |
-| disk/DB failure の自動 retry / durable pending / 二 DB rollback | 不採用推奨。ログ/通知/利用者の再操作（Q4）。失敗回復の中の失敗を設計しない |
+| まれな失敗の追加機構 | §4.4の既定方針を採用。まれな失敗の組合せを仕組みで塞がない |
 
 既存利用を削る候補は保存modal、warm PDF全列待ち、既存mode setterの非同期化、
 兄弟窓強制更新、implicit resetの保存行削除。前四者は本案で採用しない。
 先行保存中の同本再入場は誤復元防止に必要な完了依存のみ。通常nudgeやページ送りの入力は止めない。
-OFF→ONで操作元sessionを保存するQ1、implicit resetの保存行削除Q3、まれな失敗のQ4は未決。
+OFF→ONで操作元sessionを保存するQ1とimplicit resetの保存行削除Q3は承認済み。
+まれな失敗はQ4で確認済みの既定方針を適用する。これらに未決質問はない。
 新規DB待ちやmaintenance入力停止が通常利用を遅くすると測定で判明したら、
 実装担当は costs/options を返し、未承認の挙動変更を採用しない。
 G の構成あり操作禁止と A2 は既に承認済みで、追加の承認待ちへ戻さない。
 
 ### 11.2 coherent chunks と責任
 
-1. D0: R2の再レビューとQ1/Q3/Q4の回答を本書へ反映し、独立 `gpt-6.1-sol / xhigh` が設計そのものを review。
+1. D0: R3の決定済み契約を前提に、独立 `gpt-6.1-sol / xhigh` が設計そのものを review。
    設計担当が指摘を裏取りして構造合意、detached §11 の予定範囲を確定。
 2. D1: shift専用store/worker、受付watermark/FIFO読取、既存resume writerの位置読取/fence、
    open/正常exitの完了契約を先に実装。§9のlifecycle/転送/観測/copy/probe登録とpure tests。
@@ -705,7 +712,7 @@ G の構成あり操作禁止と A2 は既に承認済みで、追加の承認�
 | --- | --- |
 | pure nudge / resolution | LTR/RTL、cover ありなし、横長・非pairable・page-alone・末尾・連続 nudge。 `(new=2,anchor=0)` の後者を保存。端 no-op。Single/Split は従来移動 |
 | identity / store | 途中追加/削除/順替え、Missing/filtered/復帰、違う同idxを代用しない。cache再生成、nested chain/collapse、prefix間非継承、KeepDrive非衝突。G Q6のPDF/EPUB再編/reflow制限 |
-| reopening / P2-1 | workerを決定的にpauseし、Set/Clear受付→commit前close→同本openで旧snapshotを採用しない。resume Recordもpauseして二つのreply順を反転、両cutoff充足後だけfirst unit。explicit target/履歴ON/OFF/retainedも同じ。正常exit直前Set/Clear/Recordをdrain→次processで値一致。異常killは別Q4 |
+| reopening / P2-1 | workerを決定的にpauseし、Set/Clear受付→commit前close→同本openで旧snapshotを採用しない。resume Recordもpauseして二つのreply順を反転、両cutoff充足後だけfirst unit。explicit target/履歴ON/OFF/retainedも同じ。正常exit直前Set/Clear/Recordをdrain→次processで値一致。異常終了は §4.4 の扱いで正常保証と区別 |
 | open lifecycle | 本切替、履歴/しおり/required target/startup、warm PDF/password/cancel/error、F5。通常warmの余分なDB往復/全列待ちなし。取消したopen replyは不採用、送信済writeは元scopeへ完了。後続兄弟saveは次の再入場だけに反映 |
 | cache / UI | 旧 unit token を事前生成→saved restore で新組。paged/連結/seek/capture/holdover、指定サイズfit・PDF demand・zoom保持。印/状態/実基点 jump/解除/保存結果、dark/light・小画面・touch到達 snapshot |
 | common handlers / P2-2除去 | 四KeyAction、カスタムキー、gamepad/ring、HUD、mode再押下/flow/direction/import reset。既存mode→flowが同期採用状態を保つ、Set→mode成功Clear→SetはFIFO、setter失敗でClearなし。既存setter非同期化なし。Composed/Unreadable/A2拒否は全状態/DB/cache無変更、Single/Split movementは通る |
@@ -715,7 +722,7 @@ G の構成あり操作禁止と A2 は既に承認済みで、追加の承認�
 | transfer coverage / P2-5 | v7/v8/v9字段不在は全既存値保持、新空はcovered解除。**非空familyでrootあり/子章未記載は子章の旧値を削除**。明示prefix集合の外の子章は保持。skipは全保持。summary解除数も一致、family項目rollbackでdelete/insert共に戻る |
 | transfer一般 | folder/nested、元RAR shift + cache spread/trim + 元RAR構成の同居、休眠/Missing搬送、unsafe値拒否、一括確認一回、context限定refresh、専用DB lease/schema/ATTACH/journal登録 |
 | Remote / G | memory ON/OFF、PC と group/anchor parity、forceSingle、budget途中、取得write drain、返却、既存 SetSpread reset。構成作成/cancel/編集/解除、OFF休眠、mode-only非消去、A2/OrdinaryList資格 |
-| 失敗 / 性能 | Q4 採択済みの write/clear/open failure と abrupt終了。成功通知を偽らない。UI 同期 I/O ゼロ、warm fast path維持、連打保存で navigation を blockしない。余分な decode/hash/全列照合なし |
+| 通知 / 性能 | §4.4の既定方針に従う基本通知と原本保持を確認し、まれな失敗の組合せ専用の回復試験は追加しない。UI同期I/Oゼロ、warm fast path維持、連打保存でnavigationをblockしない。余分なdecode/hash/全列照合なし |
 
 narrow unit/handler/integration/snapshot を先に実装者が所有。既存 §1.342 と detached tests を削除・弱体化しない。
 shared behavior を触る最終実装では `scripts/test-full.ps1`、fmt、UI glyph check を実施し、
@@ -727,32 +734,17 @@ display-pipeline、async-architecture、virtual-folders、keymap、web-remote、
 新キーで解除/jump を追加する場合だけ KeyAction 一式を揃え、既定キーは衝突確認の上で別途決める。
 本案は HUD の操作のみを追加し、Ctrl+左右の既定割当は変えない。
 
-## 12. 利用者への未決質問（一項目一問）
+## 12. 決定済み事項（番号固定）
 
-以下は今回の設計を review 可能にするための選択肢であり、回答がないまま実装方針として確定しない。
+2026-10-10の利用者回答で全推奨案を採択。Q2はG Q6の既決定、Q5はR2 coordinator採択を
+利用者が再確認したもの。以下は利用者への質問ではなく、実装・レビューが守る決定記録。
 
-**Q2 確認（再決定は求めない）:** PDF/EPUBはG Q6と同じ既存個別編集の物理ページidentityを使い、
-内部再編・再変換/reflowで同番号の内容がずれる制限を受容しマニュアルへ明記する、という既決定に従う。
+| 番号 | 決定 | 決定・確認日 |
+| --- | --- | --- |
+| Q1 記憶OFF/ON・明示解除 | OFFでは保存shiftを休眠保持し現表示を変えない。ON復帰で旧値をその場に適用せず次回入場で使う。ただし適格な操作元Bookにsession調整があればその値を保存し、その本の旧休眠値を上書きする。siblings/parkedは一斉保存しない。OFF中も本別の明示解除はsessionと保存値を消す。Composedでは休眠値を維持 | 2026-10-10 |
+| Q2 PDF/EPUB identity | G Q6に従い既存個別編集と同じ物理ページidentityを使う。内部再編・再変換/reflow後の内容ずれは受容しマニュアルに明記。items index/表示順番号は禁止 | 2026-10-10（G Q6に準拠・確認） |
+| Q3 既存resetと保存値 | 記憶ONではmode再押下・mode/flow/direction変更のresetで保存shiftもClearし通知。OFFでは従来session resetだけ。Composedのmode-onlyでは休眠保存値を消さない | 2026-10-10 |
+| Q4 まれな失敗 | §4.4の新しい既定方針を確認。通常再入場の先行保存/resume整列と正常終了drainは §6.1 の構造保証として独立に必須 | 2026-10-10 |
+| Q5 保存先・writer | R2のshift専用 `spread_shift.db` と単一workerを採択。既存spread.db writerを移管せず、既存spread setterを非同期化しない | 2026-10-10（R2採択・再確認） |
 
-1. **Q1: OFFで保存値を休眠保持し、ONに戻す時は操作元本のsession調整を保存する規則でよいですか。**
-   推奨: 全保存行を休眠保持し、現在表示はそのまま、次回入場と新規 nudge の read/write だけ停止。
-   ON に戻した時は操作元の session 調整があれば保存し、なければ次回入場で旧値を使う。
-   明示「解除」は OFF 中でもこの本の保存値を消す、と UI に説明する。
-   利点: OFF切替では保存値を失わず、全窓reload不要。費用: ON復帰時の保存は操作元本の以前の休眠値を上書きする。
-   代案: ON復帰ではsessionを保存せず次の明示nudgeまで待つ。上書きを避けるが、次回入場は今と違う旧値になり得る。
-   「OFFで全削除」は単純でも**全冊の利用者調整を失う**ため、承認なしで採らない。
-
-2. **Q3: 既存のmode再押下・mode/flow/方向変更でresetする時、記憶ONなら保存値も解除してよいですか。**
-   推奨: 既存の「基本の組へ戻る」表示を維持し、ON時だけ保存行も Clear、解除を通知。
-   利点: 開き直して旧ずらしが復活しない。費用: これらの既存操作でも保存した利用者調整が消える。
-   代案: 保存値は休眠保持して現 session だけ reset。データは残るが、次回入場で再適用される。
-   G の構成あり mode-only はどちらの回答でも休眠値を消さない。
-
-3. **Q4: まれなDB失敗・異常終了は、原本保持・ログと通知・利用者の再操作で扱ってよいですか。**
-   推奨: 保存失敗時は現在の session 調整を維持し「記憶できませんでした」。解除保存失敗時は現在を基本に戻したまま
-   「保存済み調整は解除できませんでした。開き直すと戻る場合があります」。DB の旧値を保持し自動再試行なし。
-   読込不明は通知/原本保持/その保存機能への write 停止、旧 DB を作り直さない。
-   急な終了では最後の未commit調整やresumeとの二DB同時確定が失われ得るが、再開時に残る正本を解く。
-   **通常再入場の先行保存/resume整列と正常終了のdrainは §6.1 で必須保証し、この質問で免除しない。**
-   利点: 多段回復/再試行/journalを増やさない。代案: 異常終了向けにdurable journal/二DB回復を別設計する。
-   費用: 新しい永続状態・I/O・回復の検証が増える。既存保存データの破棄はどちらでも許可しない。
+**利用者への未決質問はない。** 独立設計レビューと構造合意は §11.2 の工程として別に行う。
