@@ -141,17 +141,22 @@ always-active guidance.
   changes, rather than adding a dedicated live-rebuild path. Record in the
   design document which simplification was considered and why it was or was
   not used. (User direction 2026-09-28; see CLAUDE.md "設計の簡素化".)
-- For rare failures that ordinary use almost never hits (disk/DB write failures,
-  abrupt termination mid-operation), do not design retry loops, preserved
-  partial states, typed failure taxonomies or multi-step recovery on your own.
-  Rebuildable data (indexes, caches) may be handled crudely: log, notify the
-  user, and rebuild on next start. Raise such cases to the design owner, who
-  confirms with the user, instead of closing each one with more machinery;
-  stop when you find yourself handling a failure inside a recovery path. Data
-  the user created (settings, tags, collections) must not be dropped this way
-  without asking. As a reviewer, report a rare-failure gap together with the
-  crude option, not only the full-handling option. (User direction 2026-10-02;
-  see CLAUDE.md "まれな失敗への対処".)
+- Rare failures that ordinary use almost never hits (disk/DB write failures,
+  disk full, abrupt termination mid-operation) are handled crudely **by
+  default, without asking**: do not design retry loops, preserved partial
+  states, typed failure taxonomies, multi-step recovery or completion waits.
+  Log, notify the user, and where possible offer one simple recovery entry
+  (e.g. rebuild on next start); rebuildable data (indexes, caches) is rebuilt.
+  Never delete or recreate stored data because of such a failure. Raise to the
+  design owner/user only when (1) data the user created (settings, tags,
+  collections, book compositions, bookmarks) would be lost or corrupted, or
+  (2) the case is not rare but reachable in ordinary use (e.g. reopening
+  before a save completes, ordering of rapid inputs), which must be handled
+  structurally. Never add handling for a failure inside a recovery path. As a
+  reviewer, do not ask for machinery for rare-failure combinations; note them
+  as covered by the default crude policy unless they fall under (1) or (2).
+  (User direction 2026-10-02, made the default 2026-10-10; see CLAUDE.md
+  "まれな失敗は既定で割り切る".)
 - If a new feature or fix would make ordinary use slower, add steps, or remove
   released behavior, stop before implementing and ask the design owner/user
   with the options and costs. Do not choose the behavior-removing option on
