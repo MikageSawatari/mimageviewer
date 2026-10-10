@@ -1851,12 +1851,36 @@ fn fullscreen_specified_scale_live_popup_snapshots() {
                     size,
                     None,
                     |ui| {
-                        egui::Frame::popup(ui.style()).show(ui, |ui| {
-                            mimageviewer::draw_fullscreen_specified_scale_live_settings(
-                                ui, &mut value, favorite,
-                            );
-                        });
+                        mimageviewer::draw_fullscreen_specified_scale_live_settings(
+                            ui, &mut value, favorite,
+                        );
                     },
+                    |_| {},
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn fullscreen_fit_hud_popup_snapshots() {
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    for (theme_name, theme) in [
+        ("light", mimageviewer::os_theme::ResolvedTheme::Light),
+        ("dark", mimageviewer::os_theme::ResolvedTheme::Dark),
+    ] {
+        for (size_name, size) in [
+            ("normal1093", egui::vec2(1093.0, 614.0)),
+            ("narrow", egui::vec2(280.0, 320.0)),
+        ] {
+            for (scope, favorite) in [("standard", false), ("favorite", true)] {
+                snapshots.extend(snapshot_with_theme_options_collect(
+                    &format!("fullscreen_fit_hud_popup_{scope}_{size_name}_{theme_name}"),
+                    theme,
+                    mimageviewer::settings::TextContrast::Standard,
+                    size,
+                    None,
+                    |ui| mimageviewer::draw_fs_fit_popup_snapshot_fixture(ui, favorite),
                     |_| {},
                 ));
             }

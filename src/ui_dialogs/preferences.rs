@@ -35,7 +35,7 @@ pub fn draw_grid_background_double_click_settings_snapshot_fixture(ui: &mut egui
     pages::draw_grid_background_double_click_setting(ui, &mut settings);
 }
 
-/// Shared pure editor for preferences and the current-view fit popup.
+/// Preferences editor. The HUD uses its own skin with the same axis controls.
 /// Returns true only when the user changed a width/height constraint.
 pub fn draw_fullscreen_specified_scale_settings(
     ui: &mut egui::Ui,
@@ -55,12 +55,15 @@ pub fn draw_fullscreen_specified_scale_live_settings(
     value: &mut crate::settings::FullscreenSpecifiedScale,
     favorite: bool,
 ) -> bool {
-    ui.label(if favorite {
-        "指定サイズ（お気に入り用）"
-    } else {
-        "指定サイズ（共通）"
-    });
-    draw_fullscreen_specified_scale_settings(ui, value)
+    crate::ui_fullscreen::draw_fs_specified_scale_live_editor(ui, value, favorite)
+}
+
+pub(crate) fn draw_fullscreen_specified_scale_axis_controls(
+    ui: &mut egui::Ui,
+    axis: &mut Option<crate::settings::SpecifiedScaleAxis>,
+    label: &str,
+) {
+    pages::draw_fullscreen_specified_scale_axis_controls(ui, axis, label, true);
 }
 
 mod name_colors;

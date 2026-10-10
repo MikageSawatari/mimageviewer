@@ -9706,6 +9706,101 @@ pub(super) fn draw_fullscreen_fit_cycle_settings(
     ui.small("1つ以上選択してください。0キー・リング・ジェスチャ・マウスボタンの循環に適用します。直接選択メニューにはすべてのモードが表示されます。");
 }
 
+pub(super) fn draw_fullscreen_specified_scale_axis_controls(
+    ui: &mut egui::Ui,
+    axis: &mut Option<crate::settings::SpecifiedScaleAxis>,
+    label: &str,
+    dark_popup: bool,
+) {
+    use crate::settings::SpecifiedScaleAxis;
+    let current = axis.unwrap_or(SpecifiedScaleAxis::PercentTenths(1000));
+    let (mut number, mut pixels) = match current {
+        SpecifiedScaleAxis::PercentTenths(value) => (value as f64 / 10.0, false),
+        SpecifiedScaleAxis::LogicalPixels(value) => (value as f64, true),
+    };
+    let range = if pixels {
+        SpecifiedScaleAxis::LOGICAL_PIXELS_MIN as f64
+            ..=SpecifiedScaleAxis::LOGICAL_PIXELS_MAX as f64
+    } else {
+        SpecifiedScaleAxis::PERCENT_TENTHS_MIN as f64 / 10.0
+            ..=SpecifiedScaleAxis::PERCENT_TENTHS_MAX as f64 / 10.0
+    };
+    let drag = egui::DragValue::new(&mut number)
+        .range(range)
+        .speed(if pixels { 1.0 } else { 0.1 })
+        .fixed_decimals(if pixels { 0 } else { 1 });
+    let response = if dark_popup {
+        ui.add_sized(egui::vec2(64.0_f32.min(ui.available_width()), 24.0), drag)
+    } else {
+        ui.add(drag)
+    };
+    if response.changed() {
+        *axis = Some(
+            if pixels {
+                SpecifiedScaleAxis::LogicalPixels(number.round() as u32)
+            } else {
+                SpecifiedScaleAxis::PercentTenths((number * 10.0).round() as u32)
+            }
+            .sanitized(),
+        );
+    }
+    // ComboBox itself contains an unmeasured horizontal child.
+    // Preallocate its real button dimensions so the outer wrapping
+    // row chooses a new line before that child is positioned.
+    let unit_text = if pixels { "px" } else { "％" };
+    let galley = ui.painter().layout_no_wrap(
+        unit_text.to_owned(),
+        egui::TextStyle::Button.resolve(ui.style()),
+        ui.visuals().text_color(),
+    );
+    let padding = ui.spacing().button_padding;
+    let unit_size = egui::vec2(
+        48.0_f32
+            .max(
+                galley.size().x
+                    + ui.spacing().icon_spacing
+                    + ui.spacing().icon_width
+                    + 2.0 * padding.x,
+            )
+            .ceil(),
+        ui.spacing()
+            .interact_size
+            .y
+            .max(galley.size().y.max(ui.spacing().icon_width) + 2.0 * padding.y)
+            .ceil(),
+    );
+    let _unit_response = ui
+        .allocate_ui_with_layout(
+            unit_size,
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                let combo = egui::ComboBox::from_id_salt("unit")
+                    .selected_text(unit_text)
+                    .width(unit_size.x);
+                let combo = if dark_popup {
+                    combo.popup_style(crate::os_theme::dark_popup_style(ui.ctx()))
+                } else {
+                    combo
+                };
+                combo.show_ui(ui, |ui| {
+                    ui.selectable_value(&mut pixels, false, "％");
+                    ui.selectable_value(&mut pixels, true, "px");
+                })
+            },
+        )
+        .inner;
+    #[cfg(test)]
+    ui.ctx().data_mut(|data| {
+        data.insert_temp(
+            egui::Id::new(("specified_scale_unit_response", label)),
+            _unit_response.response.rect,
+        );
+    });
+    if pixels != matches!(current, SpecifiedScaleAxis::LogicalPixels(_)) {
+        *axis = Some(axis.unwrap_or(current).with_pixel_unit(pixels));
+    }
+}
+
 pub(super) fn draw_fullscreen_specified_scale_settings(
     ui: &mut egui::Ui,
     value: &mut crate::settings::FullscreenSpecifiedScale,
@@ -9728,86 +9823,7 @@ pub(super) fn draw_fullscreen_specified_scale_settings(
                 if !enabled {
                     ui.disable();
                 }
-                let current = axis.unwrap_or(SpecifiedScaleAxis::PercentTenths(1000));
-                let (mut number, mut pixels) = match current {
-                    SpecifiedScaleAxis::PercentTenths(value) => (value as f64 / 10.0, false),
-                    SpecifiedScaleAxis::LogicalPixels(value) => (value as f64, true),
-                };
-                let range = if pixels {
-                    SpecifiedScaleAxis::LOGICAL_PIXELS_MIN as f64
-                        ..=SpecifiedScaleAxis::LOGICAL_PIXELS_MAX as f64
-                } else {
-                    SpecifiedScaleAxis::PERCENT_TENTHS_MIN as f64 / 10.0
-                        ..=SpecifiedScaleAxis::PERCENT_TENTHS_MAX as f64 / 10.0
-                };
-                if ui
-                    .add(
-                        egui::DragValue::new(&mut number)
-                            .range(range)
-                            .speed(if pixels { 1.0 } else { 0.1 })
-                            .fixed_decimals(if pixels { 0 } else { 1 }),
-                    )
-                    .changed()
-                {
-                    *axis = Some(
-                        if pixels {
-                            SpecifiedScaleAxis::LogicalPixels(number.round() as u32)
-                        } else {
-                            SpecifiedScaleAxis::PercentTenths((number * 10.0).round() as u32)
-                        }
-                        .sanitized(),
-                    );
-                }
-                // ComboBox itself contains an unmeasured horizontal child.
-                // Preallocate its real button dimensions so the outer wrapping
-                // row chooses a new line before that child is positioned.
-                let unit_text = if pixels { "px" } else { "％" };
-                let galley = ui.painter().layout_no_wrap(
-                    unit_text.to_owned(),
-                    egui::TextStyle::Button.resolve(ui.style()),
-                    ui.visuals().text_color(),
-                );
-                let padding = ui.spacing().button_padding;
-                let unit_size = egui::vec2(
-                    48.0_f32
-                        .max(
-                            galley.size().x
-                                + ui.spacing().icon_spacing
-                                + ui.spacing().icon_width
-                                + 2.0 * padding.x,
-                        )
-                        .ceil(),
-                    ui.spacing()
-                        .interact_size
-                        .y
-                        .max(galley.size().y.max(ui.spacing().icon_width) + 2.0 * padding.y)
-                        .ceil(),
-                );
-                let _unit_response = ui
-                    .allocate_ui_with_layout(
-                        unit_size,
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            egui::ComboBox::from_id_salt("unit")
-                                .selected_text(unit_text)
-                                .width(unit_size.x)
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut pixels, false, "％");
-                                    ui.selectable_value(&mut pixels, true, "px");
-                                })
-                        },
-                    )
-                    .inner;
-                #[cfg(test)]
-                ui.ctx().data_mut(|data| {
-                    data.insert_temp(
-                        egui::Id::new(("specified_scale_unit_response", label)),
-                        _unit_response.response.rect,
-                    );
-                });
-                if pixels != matches!(current, SpecifiedScaleAxis::LogicalPixels(_)) {
-                    *axis = Some(axis.unwrap_or(current).with_pixel_unit(pixels));
-                }
+                draw_fullscreen_specified_scale_axis_controls(ui, axis, label, false);
             });
         });
     }

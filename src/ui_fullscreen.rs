@@ -43710,29 +43710,38 @@ impl App {
                     .max(bounds.top()),
             );
             let popup_rect = egui::Rect::from_min_size(origin, egui::vec2(width, height));
-            let popup_response = ui.scope_builder(egui::UiBuilder::new().id_salt("fs_fit_popup_body").max_rect(popup_rect), |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.set_width((width - 16.0).max(1.0));
-                    egui::ScrollArea::vertical().id_salt("fs_fit_popup_scroll")
-                        .max_height((height - 16.0).max(1.0)).auto_shrink([false, false]).show(ui, |ui| {
-                            ui.label("ズーム/フィット");
-                            for &mode in FullscreenFitMode::selectable_for_flow(*reading_flow) {
-                                if ui.selectable_label(mode == fit_mode, mode.label()).clicked() {
-                                    *fit_mode_choice = Some(mode);
-                                    *fit_popup_open = false;
-                                }
-                            }
-                            ui.separator();
-                            let mut no_up = fit_no_upscale;
-                            let mut no_down = fit_no_downscale;
-                            if ui.checkbox(&mut no_up, "拡大しない").changed() { *fit_no_upscale_choice = Some(no_up); }
-                            if ui.checkbox(&mut no_down, "縮小しない").changed() { *fit_no_downscale_choice = Some(no_down); }
-                            ui.separator();
-                            *specified_scale_changed |= crate::ui_dialogs::preferences::draw_fullscreen_specified_scale_live_settings(
-                                ui, specified_scale_edit, specified_scale_favorite);
-                        });
-                })
-            }).inner.response;
+            let popup = ui
+                .scope_builder(
+                    egui::UiBuilder::new()
+                        .id_salt("fs_fit_popup_body")
+                        .max_rect(popup_rect),
+                    |ui| {
+                        draw_fs_fit_popup(
+                            ui,
+                            keymap,
+                            *reading_flow,
+                            fit_mode,
+                            fit_no_upscale,
+                            fit_no_downscale,
+                            specified_scale_edit,
+                            specified_scale_favorite,
+                            popup_rect.size(),
+                        )
+                    },
+                )
+                .inner;
+            let popup_response = popup.response;
+            if let Some(mode) = popup.inner.mode {
+                *fit_mode_choice = Some(mode);
+                *fit_popup_open = false;
+            }
+            if let Some(value) = popup.inner.no_upscale {
+                *fit_no_upscale_choice = Some(value);
+            }
+            if let Some(value) = popup.inner.no_downscale {
+                *fit_no_downscale_choice = Some(value);
+            }
+            *specified_scale_changed |= popup.inner.specified_changed;
             if ui.input(|i| i.pointer.any_click())
                 && ui.input(|i| i.pointer.interact_pos()).is_some_and(|pos| {
                     !popup_response.rect.contains(pos) && !fit_resp_rect.contains(pos)
@@ -44038,6 +44047,252 @@ fn draw_fs_prefetch_status_row(ui: &mut egui::Ui, indicator: &FsPrefetchIndicato
         );
         draw_fs_prefetch_indicator(ui, indicator);
     });
+}
+
+fn fs_fit_popup_frame() -> egui::Frame {
+    egui::Frame::new()
+        .inner_margin(4.0)
+        .corner_radius(6.0)
+        .fill(egui::Color32::from_rgba_unmultiplied(30, 30, 30, 240))
+        .stroke(egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(100, 100, 100, 180),
+        ))
+}
+
+fn fs_fit_popup_header(ui: &mut egui::Ui, label: &str) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), egui::Sense::hover());
+    ui.painter().text(
+        rect.min + egui::vec2(8.0, 16.0),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(11.0),
+        egui::Color32::from_gray(150),
+    );
+}
+
+fn fs_fit_popup_separator(ui: &egui::Ui) {
+    let rect = ui.available_rect_before_wrap();
+    ui.painter().line_segment(
+        [
+            rect.min + egui::vec2(4.0, -2.0),
+            egui::pos2(rect.right() - 4.0, rect.top() - 2.0),
+        ],
+        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(90, 90, 90, 170)),
+    );
+}
+
+/// The same allocated rect owns the custom HUD row's paint and click target.
+fn fs_fit_popup_row(
+    ui: &mut egui::Ui,
+    id: &str,
+    label: &str,
+    active: bool,
+    on_off: bool,
+) -> egui::Response {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), egui::Sense::hover());
+    let response = ui.interact(rect, ui.id().with(id), egui::Sense::click());
+    let fill = if active {
+        egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
+    } else if response.hovered() {
+        egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, 4.0, fill);
+    ui.painter().text(
+        egui::pos2(rect.left() + 16.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(13.0),
+        egui::Color32::from_gray(220),
+    );
+    if on_off {
+        ui.painter().text(
+            egui::pos2(rect.right() - 16.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            if active { "ON" } else { "OFF" },
+            egui::FontId::proportional(12.0),
+            if active {
+                egui::Color32::WHITE
+            } else {
+                egui::Color32::from_gray(150)
+            },
+        );
+    }
+    response
+}
+
+fn fs_fit_popup_axis(
+    ui: &mut egui::Ui,
+    label: &str,
+    axis: &mut Option<crate::settings::SpecifiedScaleAxis>,
+) {
+    ui.push_id(label, |ui| {
+        let row = fs_fit_popup_row(ui, "enabled", label, axis.is_some(), true);
+        if row.clicked() {
+            *axis = if axis.is_some() {
+                None
+            } else {
+                Some(crate::settings::SpecifiedScaleAxis::PercentTenths(1000))
+            };
+        }
+        let mut controls = |ui: &mut egui::Ui| {
+            if axis.is_none() {
+                ui.disable();
+            }
+            ui.style_mut().override_font_id = Some(egui::FontId::proportional(13.0));
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
+            crate::ui_dialogs::preferences::draw_fullscreen_specified_scale_axis_controls(
+                ui, axis, label,
+            );
+        };
+        if row.rect.width() >= 240.0 {
+            // Leave the right-aligned ON/OFF target outside the widget rect.
+            // Child widgets have their own input owners; clicking a value/unit
+            // must never toggle the containing axis row.
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(row.rect.right() - 180.0, row.rect.top() + 4.0),
+                egui::pos2(row.rect.right() - 56.0, row.rect.bottom() - 4.0),
+            );
+            let mut child = ui.new_child(
+                egui::UiBuilder::new()
+                    .id_salt("axis_controls")
+                    .max_rect(rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            controls(&mut child);
+        } else {
+            // A genuinely narrow viewport wraps the same controls below the
+            // toggle; their actual child height remains in the scroll layout.
+            ui.horizontal_wrapped(|ui| {
+                ui.add_space(16.0);
+                controls(ui);
+            });
+        }
+    });
+}
+
+fn fs_fit_popup_specified_editor(
+    ui: &mut egui::Ui,
+    value: &mut crate::settings::FullscreenSpecifiedScale,
+    favorite: bool,
+) -> bool {
+    let before = *value;
+    fs_fit_popup_header(
+        ui,
+        if favorite {
+            "指定サイズ（お気に入り用）"
+        } else {
+            "指定サイズ（共通）"
+        },
+    );
+    fs_fit_popup_axis(ui, "幅", &mut value.width);
+    fs_fit_popup_axis(ui, "高さ", &mut value.height);
+    ui.add(egui::Label::new(egui::RichText::new(
+        "％は画像表示領域基準。pxは表示倍率に追従。両軸指定は枠へ内接。\n縮小しないは枠より優先。自動fitはAI前原寸の5倍まで（手動zoom・Zは上限外）。",
+    ).size(11.0).color(egui::Color32::from_gray(150))).wrap());
+    *value != before
+}
+
+pub(crate) fn draw_fs_specified_scale_live_editor(
+    ui: &mut egui::Ui,
+    value: &mut crate::settings::FullscreenSpecifiedScale,
+    favorite: bool,
+) -> bool {
+    fs_fit_popup_frame()
+        .show(ui, |ui| {
+            crate::os_theme::apply_dark_ui(ui);
+            fs_fit_popup_specified_editor(ui, value, favorite)
+        })
+        .inner
+}
+
+#[derive(Default)]
+struct FsFitPopupChoice {
+    mode: Option<FullscreenFitMode>,
+    no_upscale: Option<bool>,
+    no_downscale: Option<bool>,
+    specified_changed: bool,
+}
+
+fn draw_fs_fit_popup(
+    ui: &mut egui::Ui,
+    keymap: &Keymap,
+    flow: ReadingFlow,
+    mode: FullscreenFitMode,
+    no_upscale: bool,
+    no_downscale: bool,
+    value: &mut crate::settings::FullscreenSpecifiedScale,
+    favorite: bool,
+    size: egui::Vec2,
+) -> egui::InnerResponse<FsFitPopupChoice> {
+    fs_fit_popup_frame().show(ui, |ui| {
+        crate::os_theme::apply_dark_ui(ui);
+        ui.spacing_mut().item_spacing.y = 4.0;
+        ui.set_width((size.x - 8.0).max(1.0));
+        egui::ScrollArea::vertical()
+            .id_salt("fs_fit_popup_scroll")
+            .max_height((size.y - 8.0).max(1.0))
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                let mut choice = FsFitPopupChoice::default();
+                let header = keymap
+                    .first_chord_label(KeyAction::FsFitModeCycle)
+                    .map(|label| format!("ズーム/フィット  [{label}で循環]"))
+                    .unwrap_or_else(|| "ズーム/フィット".to_owned());
+                fs_fit_popup_header(ui, &header);
+                for &candidate in FullscreenFitMode::selectable_for_flow(flow) {
+                    if fs_fit_popup_row(
+                        ui,
+                        candidate.cycle_id(),
+                        candidate.label(),
+                        candidate == mode,
+                        false,
+                    )
+                    .clicked()
+                    {
+                        choice.mode = Some(candidate);
+                    }
+                }
+                fs_fit_popup_separator(ui);
+                fs_fit_popup_header(ui, "倍率制限");
+                if fs_fit_popup_row(ui, "no_upscale", "拡大しない", no_upscale, true).clicked()
+                {
+                    choice.no_upscale = Some(!no_upscale);
+                }
+                if fs_fit_popup_row(ui, "no_downscale", "縮小しない", no_downscale, true).clicked()
+                {
+                    choice.no_downscale = Some(!no_downscale);
+                }
+                fs_fit_popup_separator(ui);
+                choice.specified_changed = fs_fit_popup_specified_editor(ui, value, favorite);
+                choice
+            })
+            .inner
+    })
+}
+
+#[doc(hidden)]
+pub fn draw_fs_fit_popup_snapshot_fixture(ui: &mut egui::Ui, favorite: bool) {
+    let mut value = crate::settings::FullscreenSpecifiedScale::default();
+    let size = egui::vec2(
+        ui.available_width().min(320.0),
+        ui.available_height().min(480.0),
+    );
+    draw_fs_fit_popup(
+        ui,
+        &Keymap::default(),
+        ReadingFlow::Paged,
+        FullscreenFitMode::SpecifiedScale,
+        true,
+        false,
+        &mut value,
+        favorite,
+        size,
+    );
 }
 
 fn draw_raw_prefetch_status_row(ui: &mut egui::Ui, indicator: &FsPrefetchIndicator) {
@@ -79514,6 +79769,13 @@ mod specified_scale_consumer_tests {
             FullscreenSpecifiedScale::default().width,
             "actual numeric changes must reach the live setter"
         );
+        assert!(
+            matches!(
+                final_value.width,
+                Some(SpecifiedScaleAxis::PercentTenths(_))
+            ),
+            "the numeric child must edit the axis, never toggle its containing row OFF"
+        );
         assert_eq!(app.settings.fullscreen_specified_scale, final_value);
         assert_eq!(crate::settings::save_generation(), generation);
         app.persist_window_state_and_flush(crate::app::PersistScope::ProcessKeepsRunning);
@@ -79525,6 +79787,86 @@ mod specified_scale_consumer_tests {
     }
 
     #[test]
+    fn specified_scale_real_hover_popup_keeps_hud_header_and_row_style() {
+        for size in [egui::vec2(1093.0, 614.0), egui::vec2(280.0, 320.0)] {
+            let ctx = egui::Context::default();
+            let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            let mut open = true;
+            let mut value = FullscreenSpecifiedScale::default();
+            let output = fit_popup_frame(&ctx, rect, vec![], &mut open, &mut value);
+            let title = painted_label(&output, "ズーム/フィット  [0で循環]")
+                .expect("HUD header retains the current fit-cycle shortcut");
+            assert!(rect.contains_rect(title));
+            fn selected_rect(shape: &egui::epaint::Shape) -> Option<egui::Rect> {
+                match shape {
+                    egui::epaint::Shape::Vec(shapes) => shapes.iter().find_map(selected_rect),
+                    egui::epaint::Shape::Rect(shape)
+                        if shape.fill
+                            == egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200) =>
+                    {
+                        Some(shape.rect)
+                    }
+                    _ => None,
+                }
+            }
+            let selected = output
+                .shapes
+                .iter()
+                .find_map(|s| selected_rect(&s.shape))
+                .expect("current mode uses the custom HUD blue fill");
+            assert_eq!(selected.height(), 32.0);
+            assert!(rect.contains_rect(selected));
+            assert!(open);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn specified_scale_real_hud_rows_route_mode_and_limit_to_existing_handlers() {
+        let ctx = egui::Context::default();
+        install_fs_navigator_input_tracking(&ctx);
+        let mut app = pdf_app(&ctx, 1);
+        app.items[0] = GridItem::Image(app.tmp.path().join("popup.png"));
+        app.settings.fullscreen_top_bar_locked = true;
+        app.native_video_in_window_active = true;
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        app.fit_popup_open = true;
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1093.0, 614.0));
+        let draw = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.render_fullscreen_viewport(ctx),
+            )
+        };
+        let mut output = draw(&mut app, vec![]);
+        for _ in 0..4 {
+            output = draw(&mut app, vec![]);
+        }
+        let limit = painted_label(&output, "拡大しない").unwrap();
+        assert!(rect.contains_rect(limit));
+        let was_no_upscale = app.settings.fullscreen_fit_no_upscale;
+        draw(&mut app, click(limit.center()));
+        assert_eq!(app.settings.fullscreen_fit_no_upscale, !was_no_upscale);
+        assert!(app.fit_popup_open, "ON/OFF keeps the editor open");
+        output = draw(&mut app, vec![]);
+        let original = painted_label(&output, FullscreenFitMode::Original.label()).unwrap();
+        assert!(rect.contains_rect(original));
+        draw(&mut app, click(original.center()));
+        assert_eq!(
+            app.effective_fullscreen_fit_mode(),
+            FullscreenFitMode::Original
+        );
+        assert!(
+            !app.fit_popup_open,
+            "mode selection uses the existing close boundary"
+        );
+    }
+
+    #[test]
     fn specified_scale_real_hover_popup_scrolls_edits_and_survives_ime_in_a_small_viewport() {
         let ctx = egui::Context::default();
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 320.0));
@@ -79532,8 +79874,12 @@ mod specified_scale_consumer_tests {
         let mut value = FullscreenSpecifiedScale::default();
         let first = fit_popup_frame(&ctx, rect, vec![], &mut open, &mut value);
         assert!(open);
-        let title = painted_label(&first, "ズーム/フィット").unwrap();
+        let title = painted_label(&first, "ズーム/フィット  [0で循環]").unwrap();
         assert!(rect.contains_rect(title));
+        assert!(
+            painted_label(&first, "幅").is_none(),
+            "narrow HUD really needs scrolling"
+        );
         let scroll = vec![
             egui::Event::PointerMoved(egui::pos2(160.0, 200.0)),
             egui::Event::MouseWheel {
@@ -79543,14 +79889,22 @@ mod specified_scale_consumer_tests {
             },
         ];
         fit_popup_frame(&ctx, rect, scroll, &mut open, &mut value);
+        // Exercise the existing egui wheel animation until it settles; no
+        // product delay/repaint is introduced to reveal the taller HUD rows.
+        for _ in 0..24 {
+            fit_popup_frame(&ctx, rect, vec![], &mut open, &mut value);
+        }
         let output = fit_popup_frame(&ctx, rect, vec![], &mut open, &mut value);
-        let checkbox = painted_label(&output, "幅を指定する").expect("scroll exposes width editor");
-        assert!(rect.contains_rect(checkbox));
+        let checkbox = painted_label(&output, "幅").expect("scroll exposes width editor");
+        assert!(
+            rect.contains_rect(checkbox),
+            "viewport={rect:?} axis={checkbox:?}"
+        );
         fit_popup_frame(&ctx, rect, click(checkbox.center()), &mut open, &mut value);
         assert!(open, "an edit inside the actual popup must retain it");
         assert_eq!(value.width, None);
         let output = fit_popup_frame(&ctx, rect, vec![], &mut open, &mut value);
-        let checkbox = painted_label(&output, "幅を指定する").unwrap();
+        let checkbox = painted_label(&output, "幅").unwrap();
         fit_popup_frame(&ctx, rect, click(checkbox.center()), &mut open, &mut value);
         assert!(
             value.width.is_some(),
@@ -79585,6 +79939,22 @@ mod specified_scale_consumer_tests {
             &mut value,
         );
         assert!(open, "IME composition does not dismiss the fit popup");
+        for key in [egui::Key::Enter, egui::Key::Escape] {
+            fit_popup_frame(
+                &ctx,
+                rect,
+                vec![egui::Event::Key {
+                    key,
+                    physical_key: Some(key),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                &mut open,
+                &mut value,
+            );
+            assert!(open, "IME Enter/Esc must not dismiss the whole popup");
+        }
         fit_popup_frame(
             &ctx,
             rect,

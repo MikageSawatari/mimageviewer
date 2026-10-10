@@ -939,3 +939,33 @@ snapshot画像を変更せず、指定サイズの通常幅・狭幅を目視確
 実機確認・commitは未実施。利用者指示により確認用buildを作らず、`target/dev-runtime` は変更しない。
 次のbuild向けの追加実機手順は `target/E-1342-hardware-check.md`、全結果と変更範囲は
 `target/E-1342-fix2-msg.txt` に記録する。
+
+## 18. HUD fit popupの既存意匠へ復元（利用者指示、2026-10-10）
+
+ff068456eの実機指摘をコードで確認した。旧masterのcustom-painted行を標準の
+selectable_label / checkboxと環境設定用editorへ置換したことが外観差の原因である。
+HUDの行描画・割当rectを共通化し、11pt gray150の見出し（現在のkeymap循環キー付き）、
+32ptの描画行、13pt gray220のlabel、半径4のblue current / gray hover、区切り線、
+「倍率制限」と右端ON/OFFを復元する。「指定サイズ」は同じ5番目のmode行とし、
+共通／お気に入り用の小見出しと幅・高さON/OFF行を続ける。
+
+数値・単位のwidgetとsanitize / 単位切替は環境設定と同じaxis controlsへ集約する。
+環境設定は従来のcheckbox / draft外観を保ち、HUDだけdark UI / dark_popup_styleを使う。
+数値・単位のchild rectをON/OFFの右端から分離し、狭幅では同じcontrolsを下へ折り返す。
+全体は既存のviewport内clampとScrollAreaを維持する。helpは11pt gray150の短い説明にする。
+新しい保存・focus・IME・循環・popup寿命ownerは作らず、live値を既存handlerへ返す。
+同期保存・再描画待ち・viewport再生成で外観を直す案は不要であり採らない。
+
+実HUD回帰は1093×614／狭幅の旧header・blue row、実handlerへのmode／倍率制限、
+実数値dragで軸がOFFにならないことと既存の保存境界、wheel scroll→軸ON/OFF→単位変更、
+IME Enter / Esc→外側clickを通す。scrollの既存animationはCPUフレームを進めて確認し、
+productにdelay / 追加repaintを入れない。修正前header欠落のredは `target/E-1342-ui-red.log`。
+既存のlive editor PNGだけを更新し、同じ描画関数の全popup PNGを追加する。対象test限定で
+UPDATE_SNAPSHOTSを使い、環境設定と他のPNGを更新しない。結果・PNG一覧は
+`target/E-1342-ui-msg.txt` に記録する。利用者指示によりbuild-dev・製品起動・commitは行わない。
+
+最終検証（2026-10-10）: `cargo fmt --check`、glyph lint（危険glyph 0）、指定サイズ71件、
+fit循環4件、dark style8件成功。全libは11,478件成功・52件ignore・失敗0（991.23秒、exit 0）、
+全ui_snapshotは144件成功。対象PNGは既存live editor 8枚更新／全popup 8枚新規で、全16枚を目視確認した。
+通常／portable core check、viewer context audit 36件と実監査もexit 0。CRLFとdiff checkを確認し、
+build-dev・`target/dev-runtime`への書込み・製品起動・commitは行っていない。

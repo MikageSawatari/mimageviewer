@@ -1516,6 +1516,13 @@ runtimeの受理済みAuto結果（trimなしを含む）を優先する。新�
 既存identity／検出ownerの定義と寿命を変えない。実退去した入力を持つ別contextのmount回帰で、
 別窓の現在値とmain参照・trim状態の不変を確認する。
 
+2026-10-10 §1.342 HUD popup意匠復元: 利用者の明示指示に従い、`ui_fullscreen.rs` の
+fit popup bodyを共通のcustom-painted行／rectへ戻し、指定サイズを同じ意匠で追加する。
+既存のviewport内clamp / ScrollAreaを保持し、数値・単位は既存widget / axis検証へ接続する。
+共通／favorite live handler、IME / 0キー、context identity、host / placement、画像fit geometry、
+worker・保存境界は変更しない。既存popup ownerの描画とhitを揃える構造修正であり、
+別窓症状guard・新state・待機・再生成を追加しない。実HUDの狭幅scroll / 入力とsnapshotを検証する。
+
 2026-10-09 master統合後の一覧公開境界修正: 利用者指定の構造修正として、Bookmark一覧buildをmainの既存Surface lease・switch sequenceで所有し、mainの成功したitems交換だけが旧buildを退役させる。detached contextのmount・items交換・pollはmainのbuildを退役も採用もしない。同じBookmarkのsortは要求ownerを継続し、A/B記憶クリアは新epochで既存refreshを再開始する。Ctrl+Fの完了filterは送信済み条件を一緒に保持し、ViewerContextBundleの既存swap/park/dropとSmart退避で一緒に運ぶ。新しいdetached predicate・viewport・placement・待機・retry・pending ownerを設けず、公開先の所有証明と既存payloadの未接続を直すため、§2の症状パッチに当たらない。
 
 2026-10-09 §1.355追加修正: Coordinator指定の構造修正として、別窓bookmarkの既存startup resolve workerからtyped RAR header証明を採用境界へ運び、cache hit前に後続巻を拒否する。DFSも同じ証明で候補から除外する。新しいdetached predicate／viewport／待機／retryを作らず、既存requestの取消・held-owner再開・context所有を保つ。旧cacheの直接採用が共通の開封不変条件を迂回していた根因を入口ownerで直すため、§2の症状パッチに当たらない。
