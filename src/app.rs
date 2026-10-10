@@ -15443,8 +15443,8 @@ pub struct App {
     // ── 統合環境設定ダイアログ ─────────────────────────────────────
     pub(crate) show_preferences: bool,
     pub(crate) diagnostics_export: crate::diagnostics::ExportOwner,
-    /// 前フレームの環境設定可視フラグ。false -> true の open edge だけを検出する。
-    pub(crate) preferences_open_last_frame: bool,
+    /// 編集の保存・破棄とは独立した、プロセス内だけの環境設定表示位置。
+    pub(crate) preferences_view_position: crate::ui_dialogs::preferences::PreferencesViewPosition,
     /// 右ペイン ScrollArea の id に使う、ダイアログを閉じても保持する単調増加値。
     pub(crate) preferences_right_panel_scroll_sequence: u64,
     /// 一覧内の導線などから、環境設定を特定ページで開く one-shot request。
@@ -19393,7 +19393,7 @@ impl App {
             rename_migration_data_dir_override: None,
             show_preferences: false,
             diagnostics_export: crate::diagnostics::ExportOwner::Idle,
-            preferences_open_last_frame: false,
+            preferences_view_position: Default::default(),
             preferences_right_panel_scroll_sequence: 0,
             preferences_requested_page: None,
             show_preferences_discard_confirm: false,

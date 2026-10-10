@@ -342,6 +342,23 @@ impl PreferencesOpenRequest {
         Self::anchored(PreferencesPage::Folder, "folder/hidden-files");
 }
 
+/// App owns the last rendered page position, independently of the settings draft.
+/// Search result lists do not replace this position. Nothing here is persisted.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PreferencesViewPosition {
+    page: PreferencesPage,
+    scroll_y: f32,
+}
+
+impl Default for PreferencesViewPosition {
+    fn default() -> Self {
+        Self {
+            page: PreferencesPage::General,
+            scroll_y: 0.0,
+        }
+    }
+}
+
 impl PreferencesPage {
     #[cfg(test)]
     const ALL: &'static [Self] = &[
@@ -1953,19 +1970,6 @@ fn advance_preferences_scroll_generation(
     }
 }
 
-fn advance_preferences_scroll_generation_on_open(
-    show_preferences: bool,
-    open_last_frame: &mut bool,
-    sequence: &mut u64,
-) -> Option<u64> {
-    let opened = show_preferences && !*open_last_frame;
-    *open_last_frame = show_preferences;
-    opened.then(|| {
-        *sequence = sequence.wrapping_add(1);
-        *sequence
-    })
-}
-
 const PREFERENCE_HIGHLIGHT_SECS: f64 = 2.5;
 
 /// ページ内の検索対象コントロールへ anchor を付ける。
@@ -2389,6 +2393,12 @@ impl App {
                     .unwrap_or(0),
             );
             new_state.favorite_view_state_entry_count = self.favorite_view_states.len();
+            new_state.selected = self.preferences_view_position.page;
+            new_state
+                .expanded
+                .insert(preference_category(new_state.selected).0);
+            new_state.right_panel_scroll_generation =
+                self.preferences_right_panel_scroll_sequence.wrapping_add(1);
             // 既にスキャン済みの VST3 プラグイン候補を引き継ぐ (= 再スキャン不要で表示)
             #[cfg(windows)]
             {
@@ -2808,26 +2818,21 @@ impl App {
     }
 
     pub(crate) fn show_preferences_dialog(&mut self, ctx: &egui::Context) {
-        // ScrollArea の id は open edge でだけ変える。毎フレーム変えると利用者が
-        // スクロールできない。sequence は PreferencesState より長寿命にして、閉じて
-        // state が破棄されても次回 open で過去の id を再利用しない。
-        let opened_scroll_generation = advance_preferences_scroll_generation_on_open(
-            self.show_preferences,
-            &mut self.preferences_open_last_frame,
-            &mut self.preferences_right_panel_scroll_sequence,
-        );
         if !self.show_preferences {
             return;
         }
 
         // 初回: 一時コピーを作成
         self.ensure_preferences_state();
-        if let Some(generation) = opened_scroll_generation {
-            self.pref_state
-                .as_mut()
-                .expect("preferences state was initialized above")
-                .right_panel_scroll_generation = generation;
-        }
+        // A fresh draft gets a fresh ScrollArea id, with one explicit restore.
+        // This also works when close and reopen happen without a hidden frame.
+        let mut restore_scroll_y = (self
+            .pref_state
+            .as_ref()
+            .unwrap()
+            .right_panel_scroll_generation
+            != self.preferences_right_panel_scroll_sequence)
+            .then_some(self.preferences_view_position.scroll_y);
         let favorite_view_state_active = self.settings.active_favorite_view_id().is_some();
         let clipboard_capture_startup_failed = self.clipboard_capture_startup_failed();
         if let Some(state) = self.pref_state.as_mut() {
@@ -2842,20 +2847,16 @@ impl App {
 
         if let Some(requested) = self.preferences_requested_page.take() {
             if let Some(state) = self.pref_state.as_mut() {
-                let previous = state.selected;
                 state.selected = requested.page;
-                advance_preferences_scroll_generation(
-                    previous,
-                    state.selected,
-                    &mut state.right_panel_scroll_generation,
-                );
+                state.expanded.insert(preference_category(state.selected).0);
+                state.right_panel_scroll_generation =
+                    state.right_panel_scroll_generation.wrapping_add(1);
+                restore_scroll_y = Some(0.0);
+                state.pending_anchor = requested.anchor;
+                state.highlight = None;
+                state.showing_results = false;
                 // 項目まで指定された要求は、検索結果から飛んだときと同じ
                 // スクロール + 一時強調を通す。ここで別の見せ方を作らない。
-                if let Some(anchor) = requested.anchor {
-                    state.pending_anchor = Some(anchor);
-                    state.highlight = None;
-                    state.showing_results = false;
-                }
             }
         }
 
@@ -2952,6 +2953,9 @@ impl App {
                     state.selected,
                     &mut state.right_panel_scroll_generation,
                 );
+                if selected_before_tree != state.selected {
+                    restore_scroll_y = None;
+                }
 
                 // 区切り線
                 let sep_x = outer_rect.min.x + tree_width + 3.0;
@@ -2976,27 +2980,46 @@ impl App {
                         .next();
                     if let Some(entry) = first {
                         select_preference_search_result(state, entry);
+                        restore_scroll_y = None;
                     }
                 }
-                egui::ScrollArea::vertical()
+                let rendered_page = state.selected;
+                let rendered_generation = state.right_panel_scroll_generation;
+                let rendered_results = state.showing_results;
+                let mut scroll = egui::ScrollArea::vertical()
                     .id_salt(("pref_panel", state.right_panel_scroll_generation))
                     .scroll_bar_visibility(
                         egui::containers::scroll_area::ScrollBarVisibility::AlwaysVisible,
                     )
                     .auto_shrink([false, false])
-                    .max_height(main_height)
-                    .show(&mut right_ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        command_capture_waiting = state.command_capture_slot.is_some();
-                        if state.showing_results {
-                            let query = state.search_query.clone();
-                            if let Some(entry) = draw_preference_search_results(ui, &query) {
-                                select_preference_search_result(state, entry);
-                            }
-                        } else {
-                            draw_page(ui, state, enter_pressed);
+                    .max_height(main_height);
+                if let Some(scroll_y) = restore_scroll_y {
+                    scroll = scroll.vertical_scroll_offset(scroll_y);
+                }
+                let output = scroll.show(&mut right_ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    command_capture_waiting = state.command_capture_slot.is_some();
+                    if state.showing_results {
+                        let query = state.search_query.clone();
+                        if let Some(entry) = draw_preference_search_results(ui, &query) {
+                            select_preference_search_result(state, entry);
                         }
-                    });
+                    } else {
+                        draw_page(ui, state, enter_pressed);
+                    }
+                });
+                // ScrollArea clamps its output against the current content and viewport.
+                // Capture before any close path drops the draft; never associate a result
+                // list's offset with the page selected by a click inside that list.
+                if !rendered_results
+                    && rendered_page == state.selected
+                    && rendered_generation == state.right_panel_scroll_generation
+                {
+                    self.preferences_view_position = PreferencesViewPosition {
+                        page: rendered_page,
+                        scroll_y: output.state.offset.y,
+                    };
+                }
 
                 // 全体の高さを確保
                 ui.allocate_space(egui::vec2(available.x, main_height));
@@ -5997,51 +6020,302 @@ mod tests {
         assert_eq!(generation, 8);
     }
 
-    #[test]
-    fn preferences_scroll_generation_advances_once_per_open_edge() {
-        let mut open_last_frame = false;
-        let mut sequence = 11;
+    fn preferences_position_harness()
+    -> egui_kittest::Harness<'static, crate::app::AppTestEnvForTest> {
+        use egui_kittest::kittest::Queryable;
+        let mut app = crate::app::setup_app_for_test();
+        app.open_preferences_page(PreferencesPage::Cache);
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(1093.0, 614.0))
+            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+        harness.run();
+        harness.get_by_label("確認せず変換する").scroll_to_me();
+        harness.run();
+        assert!(harness.state().preferences_view_position.scroll_y > 100.0);
+        harness
+    }
 
+    fn assert_preferences_position(
+        harness: &egui_kittest::Harness<'_, crate::app::AppTestEnvForTest>,
+        page: PreferencesPage,
+        scroll_y: f32,
+    ) {
+        assert_eq!(harness.state().pref_state.as_ref().unwrap().selected, page);
+        assert_eq!(harness.state().preferences_view_position.page, page);
+        assert!(
+            (harness.state().preferences_view_position.scroll_y - scroll_y).abs() < 1.0,
+            "expected {scroll_y}, got {:?}",
+            harness.state().preferences_view_position,
+        );
+    }
+
+    #[test]
+    fn preferences_position_reopen_after_ok_cancel_window_close_and_escape() {
+        use egui_kittest::kittest::Queryable;
+        for close in ["ok", "cancel", "window", "escape"] {
+            let mut harness = preferences_position_harness();
+            let position = harness.state().preferences_view_position;
+            let old = harness.state().settings.skip_zip_if_folder_exists;
+            harness
+                .state_mut()
+                .pref_state
+                .as_mut()
+                .unwrap()
+                .settings
+                .skip_zip_if_folder_exists = !old;
+            match close {
+                "ok" => harness.get_by_label("  OK  ").click(),
+                "cancel" => harness.get_by_label("キャンセル").click(),
+                "window" => harness.get_by_label("Close window").click(),
+                "escape" => harness.event(egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }),
+                _ => unreachable!(),
+            }
+            harness.run();
+            if close != "ok" {
+                assert!(harness.state().show_preferences_discard_confirm);
+                harness.get_by_label("破棄して閉じる").click();
+                harness.run();
+            }
+            assert!(!harness.state().show_preferences);
+            assert!(harness.state().pref_state.is_none());
+            assert_eq!(
+                harness.state().settings.skip_zip_if_folder_exists,
+                if close == "ok" { !old } else { old }
+            );
+            harness.state_mut().show_preferences = true;
+            harness.run();
+            assert_preferences_position(&harness, position.page, position.scroll_y);
+        }
+    }
+
+    #[test]
+    fn preferences_position_reopen_without_hidden_frame_and_new_process_default() {
+        let mut harness = preferences_position_harness();
+        let position = harness.state().preferences_view_position;
+        // Exercise the same handler as an unchanged Cancel/title close, immediately
+        // followed by any ordinary menu/toolbar/key/gamepad open flag.
+        harness.state_mut().request_close_preferences_dialog();
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        assert_preferences_position(&harness, position.page, position.scroll_y);
+        harness.state_mut().discard_preferences_dialog();
+        drop(harness);
+        let mut app = crate::app::setup_app_for_test();
+        app.show_preferences = true;
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(1093.0, 614.0))
+            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+        harness.run();
+        assert_preferences_position(&harness, PreferencesPage::General, 0.0);
+    }
+
+    #[test]
+    fn preferences_position_tree_switch_then_reopen_starts_at_top() {
+        use egui_kittest::kittest::Queryable;
+        let mut harness = preferences_position_harness();
+        harness.get_by_label("全体設定").click();
+        harness.run();
+        assert_preferences_position(&harness, PreferencesPage::General, 0.0);
+        harness.get_by_label("キャンセル").click();
+        harness.run();
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        assert_preferences_position(&harness, PreferencesPage::General, 0.0);
+    }
+
+    #[test]
+    fn preferences_position_explicit_page_and_anchor_override_memory() {
+        let mut harness = preferences_position_harness();
+        for page in [PreferencesPage::Cache, PreferencesPage::General] {
+            harness.state_mut().request_close_preferences_dialog();
+            harness.state_mut().open_preferences_page(page);
+            harness.run();
+            assert_preferences_position(&harness, page, 0.0);
+        }
+        harness
+            .state_mut()
+            .open_preferences_request(PreferencesOpenRequest::EPUB_HANDLING);
+        harness.run_steps(1);
         assert_eq!(
-            advance_preferences_scroll_generation_on_open(
-                false,
-                &mut open_last_frame,
-                &mut sequence
-            ),
-            None
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .highlight
+                .unwrap()
+                .0,
+            "cache/epub-handling"
+        );
+        harness.state_mut().pref_state.as_mut().unwrap().highlight = None;
+        harness.run();
+        assert!(harness.state().preferences_view_position.scroll_y > 100.0);
+        // A page-only request while already open also overrides an anchor/offset.
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::Cache);
+        harness.run();
+        assert_preferences_position(&harness, PreferencesPage::Cache, 0.0);
+    }
+
+    #[test]
+    fn preferences_position_search_jump_overrides_and_results_do_not_replace_page() {
+        let mut harness = preferences_position_harness();
+        let position = harness.state().preferences_view_position;
+        harness
+            .state_mut()
+            .pref_state
+            .as_mut()
+            .unwrap()
+            .search_query = "テーマ".into();
+        harness
+            .state_mut()
+            .pref_state
+            .as_mut()
+            .unwrap()
+            .showing_results = true;
+        harness.run();
+        assert_preferences_position(&harness, position.page, position.scroll_y);
+        let entry = search_preferences("テーマ", preference_category)
+            .into_iter()
+            .next()
+            .unwrap();
+        harness.event(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run_steps(1);
+        assert_eq!(
+            harness.state().pref_state.as_ref().unwrap().selected,
+            entry.page
         );
         assert_eq!(
-            advance_preferences_scroll_generation_on_open(
-                true,
-                &mut open_last_frame,
-                &mut sequence
-            ),
-            Some(12)
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .highlight
+                .unwrap()
+                .0,
+            entry.anchor
         );
+        harness.state_mut().pref_state.as_mut().unwrap().highlight = None;
+        harness.run();
+        let position = harness.state().preferences_view_position;
+        assert_preferences_position(&harness, PreferencesPage::General, 0.0);
+        harness.state_mut().discard_preferences_dialog();
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        assert_preferences_position(&harness, position.page, position.scroll_y);
+    }
+
+    #[test]
+    fn preferences_position_clamps_when_content_changes() {
+        let mut harness = preferences_position_harness();
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::General);
+        harness.run();
+        // Transient import feedback can make a page much taller; it disappears
+        // with the draft. Restore must use the new page's actual scroll range.
+        harness.state_mut().discard_preferences_dialog();
+        harness.state_mut().preferences_view_position.scroll_y = 100_000.0;
+        harness.state_mut().ensure_preferences_state();
+        harness
+            .state_mut()
+            .pref_state
+            .as_mut()
+            .unwrap()
+            .transfer_feedback = Some(PreferencesTransferFeedback::Failed(
+            "長い取り込み結果\n".repeat(120),
+        ));
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        let tall_content_limit = harness.state().preferences_view_position.scroll_y;
+        assert!(tall_content_limit > 1000.0 && tall_content_limit < 100_000.0);
+        harness.state_mut().request_close_preferences_dialog();
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        assert!(harness.state().preferences_view_position.scroll_y < tall_content_limit - 1000.0);
+        assert!(harness.state().preferences_view_position.scroll_y >= 0.0);
+        let clamped = harness.state().preferences_view_position.scroll_y;
+        harness.state_mut().request_close_preferences_dialog();
+        harness.state_mut().show_preferences = true;
+        harness.run();
+        assert_preferences_position(&harness, PreferencesPage::General, clamped);
+    }
+
+    #[test]
+    fn preferences_position_clamps_when_dialog_height_changes() {
+        let mut app = crate::app::setup_app_for_test();
+        app.preferences_view_position = PreferencesViewPosition {
+            page: PreferencesPage::Cache,
+            scroll_y: 100_000.0,
+        };
+        app.show_preferences = true;
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(1100.0, 900.0))
+            .build_state(
+                |ctx, (app, saved_ctx)| {
+                    *saved_ctx = ctx.clone();
+                    app.show_preferences_dialog(ctx);
+                },
+                (app, egui::Context::default()),
+            );
+        harness.run();
+        let before_y = harness.state().0.preferences_view_position.scroll_y;
+        let window_id = egui::Id::new("環境設定");
+        let before_rect = harness
+            .state()
+            .1
+            .memory(|memory| memory.area_rect(window_id).unwrap());
+        let start = before_rect.right_bottom() - egui::vec2(2.0, 2.0);
+        let end = start + egui::vec2(0.0, 120.0);
+        // Resize the actual egui Window using headless input, keeping page
+        // content and width fixed. Merely growing the app viewport is insufficient.
+        harness.event(egui::Event::PointerMoved(start));
+        harness.run_steps(1);
+        harness.event(egui::Event::PointerButton {
+            pos: start,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run_steps(1);
+        harness.event(egui::Event::PointerMoved(end));
+        harness.run_steps(1);
+        harness.event(egui::Event::PointerButton {
+            pos: end,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+        let after_rect = harness
+            .state()
+            .1
+            .memory(|memory| memory.area_rect(window_id).unwrap());
+        assert!(after_rect.height() > before_rect.height() + 80.0);
+        let clamped = harness.state().0.preferences_view_position.scroll_y;
+        assert!(clamped >= 0.0 && clamped < before_y - 80.0);
+        harness.state_mut().0.request_close_preferences_dialog();
+        harness.state_mut().0.show_preferences = true;
+        harness.run();
         assert_eq!(
-            advance_preferences_scroll_generation_on_open(
-                true,
-                &mut open_last_frame,
-                &mut sequence
-            ),
-            None
+            harness.state().0.pref_state.as_ref().unwrap().selected,
+            PreferencesPage::Cache
         );
-        assert_eq!(
-            advance_preferences_scroll_generation_on_open(
-                false,
-                &mut open_last_frame,
-                &mut sequence
-            ),
-            None
-        );
-        assert_eq!(
-            advance_preferences_scroll_generation_on_open(
-                true,
-                &mut open_last_frame,
-                &mut sequence
-            ),
-            Some(13)
-        );
+        assert!((harness.state().0.preferences_view_position.scroll_y - clamped).abs() < 1.0);
     }
 
     #[test]
