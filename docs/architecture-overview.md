@@ -3,6 +3,32 @@
 mimageviewer 全体の構造を俯瞰するための入口ドキュメント。**修正作業の前に必ず目を通すこと**。
 個別の詳細は下の「関連ドキュメント」にある専用ページに任せる。
 
+一覧の種類・拡張子の採否は `file_type_visibility` が一つのpure policyとして所有する。
+一覧producerは同名除去・本判定・集約・代表選定より前にこのpolicyを適用し、facetは
+その後の表示条件として組み合わせる。PCは準備workerにimmutable snapshotを渡し、
+Remoteは次の一覧・読出し要求から最新設定を使う。読書位置の論理ページidentity mapは
+既存sidecar hydration ownerまたは各一覧producerのworkerで最終行順と対で準備し、
+各viewer contextで所有する。退避した親一覧・Collection root・固定一覧にも同じimmutable
+対応表を保持し、行削除は共有する論理identityを再探索せず整数slotだけを変換する。
+本内ブックマークの投影rows・container/採用済みpolicy key・typed request・編集draftも
+既存ViewerContextBundleが所有する。共有DB actorの応答は既存context tableで要求元へ
+配送し、worker結果はそのcontextの世代と採用済みpolicyで採用する。通常のmount/depositは
+保持し、登録変更は同じ本を投影するownerを失効させる。異なるpolicyの兄弟reader間で
+要求を共有・置換しない。変換書庫の再読込は受入済みの物理cacheと既存Collection/Rating
+return ownerを保持する。共有open admissionの種類判定だけは、同じcontextが保持する
+current_folderと元書庫overrideの対応から論理sourceを使う。元書庫がなくても既存のF5
+cache再読込を維持し、別のpathや兄弟contextへaliasを適用しない。
+集約一覧の`ArchiveVisibilityProjection`は元書庫参照と物理cache参照を型で区別する。
+元書庫のcurrentnessを確認するのは前者だけで、後者の実在memberは実cacheのmanifest／
+legacy規則が可視性を所有する。物理パスの通常／Windows verbatim表記は`path_key`の
+I/Oなしhelperで比較し、`archive_cache::is_under_cache_root`とcache対応表の照合で共有する。
+代表ページとRAW先読みはこのcache-root判定を使い、既存DBキーと公開addressは保持する。
+来歴と状態遷移の正本は [表示するファイル種類](file-type-visibility-plan.md)。
+動画・音声の補助画像は表示行とは独立した`AuxiliaryMediaCandidates`として既存走査で保持する。
+sourceの種類採否と派生動画判定後、producer既存のsort／走査順で採用し、画像種類の非表示で
+採用候補を変えない。候補metadataを既存signatureへ含め、追加I/Oやcontext ownerを作らない。
+
+
 検索索引の所有判定は `metadata_ownership`、metadata の構成変更は
 `metadata_reconfiguration`、名前索引の root 所有は `name_index_manager` に集約する。
 UI は snapshot 提出と進捗参照を行い、停止・join・DB cleanup は各 manager worker が担う。
@@ -14,7 +40,7 @@ UI は snapshot 提出と進捗参照を行い、停止・join・DB cleanup は�
 
 ### 音声サムネイル (§1.347、2026-10-08)
 
-`audio_album_art` は先頭 ID3v2 タグ限定の bounded PIC/APIC reader、`audio_thumbnail` は worker stat・選定・decode・catalog を共通化する。動画の同名 sidecar discovery / 設定を Audio に拡張し、一覧出所は既存 `video_thumb_overrides` に統一する。Local / Remote は共通 I/O owner と catalog admission を使い、再生 decoder は変更しない。Remote IPC は v67、永続コレクションも snapshot / navigation 準備で thumbnail address を確定する。Web の NoArt / Failed は DOM 外の一覧 owner が持ち、明示 refresh で epoch と HTTP URL を更新する。[詳細設計](audio-album-art-plan.md)。
+`audio_album_art` は先頭 ID3v2 タグ限定の bounded PIC/APIC reader、`audio_thumbnail` は worker stat・選定・decode・catalog を共通化する。動画の同名 sidecar discovery / 設定を Audio に拡張し、一覧出所は既存 `video_thumb_overrides` に統一する。Local / Remote は共通 I/O owner と catalog admission を使い、再生 decoder は変更しない。Remote IPC は統合版 v69（§1.345 v68＋master v67）、永続コレクションも snapshot / navigation 準備で thumbnail address を確定する。Web の NoArt / Failed は DOM 外の一覧 owner が持ち、明示 refresh で epoch と HTTP URL を更新する。[詳細設計](audio-album-art-plan.md)。
 
 
 ## 1. レイヤー構造
@@ -423,11 +449,11 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `pdf_passwords` | PDF パスワード (DPAPI 暗号化) | `pdf_passwords.rs` |
 | `pdfium.dll` | 初回起動時に exe から展開 | `lib.rs` (`run`) |
 | `models/*.onnx` | 初回起動時に exe から展開 | `ai/model_manager.rs` |
-| `mimageviewer.log` | **常時記録** (旧 `--log` ゲートは撤廃、`--log` 引数は no-op)。起動ごとに truncate し、前回分を `mimageviewer.log.prev` に退避。実行中は 16 MiB 超で `mimageviewer.log.bak` にローテーション | `logger.rs` |
+| `mimageviewer.log` | **常時記録** (旧 `--log` ゲートは撤廃、`--log` 引数は no-op)。起動ごとに truncate し、前回分を `mimageviewer.log.prev` に退避。実行中は 16 MiB 超で `mimageviewer.log.bak` にローテーション。非blocking facade、単一writerが各batchを直ちにflush | `logger.rs` / `log_writer.rs` |
 | `logs/panic.log` | Rust panic フックが backtrace 付きで append。セッションを跨いで蓄積するため 4 MiB 超で `panic.log.bak` に 1 世代退避 | `lib.rs` (`append_panic_log_entry`) |
 | `logs/settings.log` | 設定復旧経路の永続診断ログ。**logger の初期化状態に依存しない独立 sink** なので起動ごく初期の復旧フェーズでも残る。SQLite open 時の primary code + extended code、bak 復旧の経路、quarantine、preupgrade snapshot、save 抑止のイベントが残る。再現が難しい設定リセット系報告の事後解析用 | `settings.rs` (`settings_diag_log`) + `settings_db.rs` (`log_diag`) |
-| `logs/perf_events.jsonl` | 構造化イベントログ (JSON Lines)。`--perf-log` 引数または環境設定「開発者」タブの「性能ログを記録する」が ON のときだけ生成。起動ごとに rotate (`perf_events.1..4.jsonl`) | `perf.rs` |
-| デスクトップ `mImageViewer_diag_<日時>.zip` | 環境設定「開発者」→「ログを zip にする」で生成する診断 zip。logs ディレクトリのログ群 + `system_info.txt` をまとめる | `diagnostics.rs` |
+| `logs/perf_events.jsonl` | 構造化イベントログ (JSON Lines)。`--perf-log` 引数または環境設定「開発者」タブの「性能ログを記録する」が ON のときだけ生成。起動ごとに rotate (`perf_events.1..4.jsonl`)。単一writer、250ms周期flushと完了checkpoint | `perf.rs` / `log_writer.rs` |
+| デスクトップ `mImageViewer_diag_<日時>.zip` | 環境設定「開発者」→「ログを zip にする」で生成する診断 zip。workerの完了barrierで両ログの固定prefixを取得し、補助ログ + `system_info.txt` + `delivery_manifest.json` をまとめる。過去dropは証拠不完全と知らせ保存 | `diagnostics.rs` / `log_writer.rs` |
 
 **パスキーの正規化**: Windows は大文字小文字非区別なので、すべての DB は **小文字化 + バックスラッシュ→スラッシュ** に正規化してから格納する。新しい DB を追加するときも同じ規約に従う (`rotation_db.rs` / `adjustment_db.rs` を参照)。
 

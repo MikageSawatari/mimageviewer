@@ -432,7 +432,7 @@ fn rar_archive_cache_header_encrypted_first_volume_real_password_retry_converts(
     assert!(app.try_archive_cache_lookup(&later).is_none());
     app.record_book_resume(0);
     assert_eq!(
-        app.last_book_resume.as_ref().map(|(key, _, _)| key),
+        app.last_book_resume.as_ref().map(|(key, _, _, _)| key),
         Some(&crate::archive_cache::cache_zip_path_for_data_dir(
             app.tmp.path(),
             &first

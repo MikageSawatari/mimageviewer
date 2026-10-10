@@ -141,10 +141,12 @@ const {
   ViewerAdjustmentPanel,
   ViewerImageUpdateExitReason,
   ViewerViewTrimPanel,
+  ViewerBookmarkPanel,
   VIEWER_MENU_MAX_ACTIONS,
   VIEWER_PANEL_TABS,
   activateFolderContainerForImage,
   applyContainerData,
+  applyCollectionData,
   applyRemoteSessionId,
   browserDoubleTapTelemetryEvent,
   commandTelemetryEvent,
@@ -156,6 +158,7 @@ const {
   enqueueVideoProgress,
   reportVideoProgressBeforePageHide,
   containerInitialImageIndex,
+  containerResumeRefusalNotice,
   createRemoteHomeDataRefreshCoordinator,
   createFavoriteSearchForm,
   createGridTile,
@@ -1184,6 +1187,7 @@ test("book bookmark rows preserve DB order and keep hint separate from resolved 
   };
   const list = normalizeRemoteBookBookmarkList({
     supported: true,
+    visibility_notice: "再変換後に表示できます",
     rows: [
       {
         id: 20,
@@ -1207,6 +1211,8 @@ test("book bookmark rows preserve DB order and keep hint separate from resolved 
   });
 
   assert.equal(list.supported, true);
+  assert.equal(list.visibilityNotice, "再変換後に表示できます");
+  assert.equal(normalizeRemoteBookBookmarkList({ supported: true, rows: [] }).visibilityNotice, null);
   assert.deepEqual(list.rows.map((row) => row.id), [20, 10]);
   assert.equal(remoteBookBookmarkDisplayPage(list.rows[0]), 5);
   assert.equal(remoteBookBookmarkDisplayPage(list.rows[1]), 8);
@@ -1252,6 +1258,16 @@ test("container opening resumes the matching page and otherwise falls back safel
     resumePage: images[1].address,
     images,
   }), -1);
+  for (const resumeRefusal of ["saved_page_unavailable", "legacy_position_unverified"]) {
+    assert.equal(containerInitialImageIndex({
+      openMode: "resume_page",
+      resumePage: null,
+      resumeRefusal,
+      images,
+    }), -1);
+    assert.match(containerResumeRefusalNotice(resumeRefusal), /一覧からページを選んでください/);
+  }
+  assert.equal(containerResumeRefusalNotice(null), "");
 });
 
 test("a collection root returns to its list without exposing a root kind", () => {
@@ -4694,6 +4710,85 @@ test("folder rating fallback notice is visible on the rendered grid", async () =
     assert.equal(notice.textContent, noticeText);
   } finally {
     globalThis.fetch = imageFetch;
+  }
+});
+
+test("visibility resume refusals remain on the grid with a visible selection notice", () => {
+  const previousResizeObserver = globalThis.ResizeObserver;
+  const previousHistory = globalThis.history;
+  globalThis.ResizeObserver = class { observe() {} disconnect() {} };
+  globalThis.history = { state: {} };
+  const address = { path: testPath("refused-book"), subresource: { kind: "file" } };
+  const entry = {
+    kind: "image",
+    name: "002.jpg",
+    address: { path: testPath("refused-book/002.jpg"), subresource: { kind: "file" } },
+  };
+  const findNotice = (node) => {
+    if (node.classList?.contains("grid-action-notice") ||
+        String(node.className ?? "").split(/\s+/).includes("grid-action-notice")) return node;
+    for (const child of node.children ?? []) {
+      const found = findNotice(child);
+      if (found) return found;
+    }
+    return null;
+  };
+  try {
+    for (const reason of ["saved_page_unavailable", "legacy_position_unverified"]) {
+      applyContainerData(address, {
+        kind: "folder",
+        effective_address: address,
+        entries: [entry],
+        page_groups: [{ anchor: entry.address, pages: [entry.address], slice: "full" }],
+        image_count: 1,
+        resume_page: null,
+        resume_refusal: reason,
+        open_mode: "grid",
+      }, false);
+      const installed = containerRuntimeStateForTest().container;
+      assert.equal(installed.resumeRefusal, reason);
+      assert.equal(containerInitialImageIndex({ ...installed, images: [entry] }), -1);
+      renderFolder();
+      const notice = findNotice(app);
+      assert.ok(notice);
+      assert.equal(notice.hidden, false);
+      assert.equal(notice.textContent, containerResumeRefusalNotice(reason));
+    }
+  } finally {
+    globalThis.ResizeObserver = previousResizeObserver;
+    globalThis.history = previousHistory;
+  }
+});
+
+test("archive visibility notices are visible in aggregate grid and in-book bookmarks", () => {
+  const noticeText = "古い変換キャッシュのため表示できない項目があります。本を開くか、キャッシュを作り直すと表示されます。";
+  const previousHistory = globalThis.history;
+  globalThis.history = { state: {} };
+  const find = (node, className) => {
+    if (node.classList?.contains(className) || String(node.className ?? "").split(/\s+/).includes(className)) return node;
+    for (const child of node.children ?? []) {
+      const found = find(child, className);
+      if (found) return found;
+    }
+    return null;
+  };
+  try {
+    for (const collectionKind of ["rating", "bookmarks"]) {
+      applyCollectionData({ collectionKind, value: "4" }, {
+        entries: [], visibility_notice: noticeText,
+      }, false);
+      renderFolder();
+      const notice = find(app, "grid-action-notice");
+      assert.ok(notice);
+      assert.equal(notice.hidden, false);
+      assert.equal(notice.textContent, noticeText);
+    }
+    const panel = new ViewerBookmarkPanel();
+    panel.list = normalizeRemoteBookBookmarkList({ supported: true, rows: [], visibility_notice: noticeText });
+    panel.render();
+    assert.ok(panel.content.children.some((node) => node.textContent === noticeText));
+  } finally {
+    globalThis.history = previousHistory;
   }
 });
 

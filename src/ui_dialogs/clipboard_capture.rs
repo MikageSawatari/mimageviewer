@@ -525,7 +525,7 @@ fn draw_capture_cell(ui: &mut egui::Ui, cell: &mut CaptureCell, enabled: bool) {
 mod tests {
     use super::*;
     use base64::Engine;
-    use egui_kittest::{Harness, kittest::Queryable};
+    use egui_kittest::kittest::Queryable;
 
     fn ready_dialog() -> crate::app::AppTestEnvForTest {
         let mut bytes = Vec::new();
@@ -644,7 +644,7 @@ mod tests {
         assert_eq!(selected[0].extension, "gif");
         assert_eq!(selected[1].extension, "gif");
         let output = app.tmp.path().join("paste");
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(900.0, 700.0))
             .build_state(
                 |ctx, app: &mut crate::app::AppTestEnvForTest| {
@@ -675,7 +675,7 @@ mod tests {
     #[test]
     fn clipboard_fetching_all_three_close_routes_cancel_modal() {
         for route in ["button", "escape", "title"] {
-            let mut harness = Harness::builder()
+            let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(900.0, 700.0))
                 .build_state(
                     |ctx, app: &mut crate::app::AppTestEnvForTest| {
@@ -697,7 +697,7 @@ mod tests {
 
     #[test]
     fn clipboard_minimum_dialog_edit_save_reload_sets_next_dialog_initial_value() {
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(900.0, 700.0))
             .build_state(
                 |ctx, app: &mut crate::app::AppTestEnvForTest| {
@@ -760,7 +760,7 @@ mod tests {
 
     #[test]
     fn clipboard_save_and_escape_in_same_frame_keeps_saving_modal() {
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(900.0, 700.0))
             .build_state(
                 |ctx, app: &mut crate::app::AppTestEnvForTest| {

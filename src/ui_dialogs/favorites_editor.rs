@@ -1877,7 +1877,6 @@ mod tests {
     #[test]
     fn similar_index_progress_snapshot_dark() {
         use crate::similar_index::{IndexDegradedReason, IndexProgress, IndexStage};
-        use egui_kittest::Harness;
 
         let fixtures = vec![
             ("無効", false, IndexProgress::Complete(report())),
@@ -1911,7 +1910,7 @@ mod tests {
             ),
         ];
         let mut fonts_ready = false;
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(900.0, 270.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);

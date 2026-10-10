@@ -723,6 +723,10 @@ impl App {
                 Some(self.settings.folder_thumb_sort),
                 self.settings.folder_thumb_depth,
             )?;
+            let storage_key = crate::thumb_loader::representative_cache_key_for_policy(
+                &storage_key,
+                self.listing_file_type_visibility(),
+            );
             let pin = item.container_path().and_then(|path| {
                 self.folder_pin_map
                     .get(&crate::path_key::normalize_keep_drive(path))
@@ -758,7 +762,7 @@ impl App {
         }
         let (mtime, file_size) = self.image_metas.get(idx).copied().flatten()?;
         let empty_pins = std::collections::HashMap::new();
-        let mut req = make_load_request(
+        let mut req = make_load_request_with_visibility(
             item,
             idx,
             mtime,
@@ -778,6 +782,7 @@ impl App {
             self.folder_thumb_pin_db.as_deref(),
             self.video_pin_db.as_ref(),
             self.use_full_path_cache_keys(),
+            self.listing_file_type_visibility(),
         )?;
         req.relative_page_provenance = self.relative_page_provenance_for_idx(idx);
         req.context_epoch = crate::pdf_loader::current_render_context_epoch();
@@ -1029,6 +1034,37 @@ mod tests {
         ];
         env.image_metas = vec![Some((10, 20)); 2];
         env
+    }
+
+    #[test]
+    fn color_representatives_keep_accepted_reader_policy_until_close() {
+        let mut env = representative_app();
+        let accepted = crate::file_type_visibility::FileTypeVisibility::default();
+        env.page_identity_index = std::sync::Arc::new(
+            crate::app::file_type_resume::PreparedPageIdentityIndex::prepare(
+                &env.items,
+                None,
+                accepted.clone(),
+            ),
+        );
+        let accepted_key = env.color_identity_for_idx(0).unwrap().0;
+        env.settings
+            .file_type_visibility
+            .excluded_categories
+            .insert(crate::file_type_visibility::FileTypeCategory::Image);
+        env.fullscreen_idx = Some(0);
+
+        let (reader_key, reader_request) = env.color_work_identity_for_idx(0).unwrap();
+        assert_eq!(reader_key, accepted_key);
+        assert_eq!(reader_request.file_type_visibility, accepted);
+
+        env.fullscreen_idx = None;
+        let (grid_key, grid_request) = env.color_work_identity_for_idx(0).unwrap();
+        assert_ne!(grid_key, accepted_key);
+        assert_eq!(
+            grid_request.file_type_visibility,
+            env.settings.file_type_visibility
+        );
     }
 
     #[test]

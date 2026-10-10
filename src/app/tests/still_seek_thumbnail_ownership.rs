@@ -212,7 +212,22 @@ fn last_owner_prunes_queued_material_but_keeps_popped_request_until_worker_resul
     let mut app = setup_thumbnail_app(4);
     app.keep_set = HashSet::from([0, 1, 2, 3]);
     app.thumbnail_eviction_generation = Some(app.items_generation);
-    app.requested.extend((0..4).map(|idx| (idx, false)));
+    let input_seq = app.input_seq;
+    let items_generation = app.items_generation;
+    for idx in 0..4 {
+        app.requested
+            .begin(
+                idx,
+                items_generation,
+                crate::app::thumbnail_requests::ThumbnailRequestKind::Normal,
+                None,
+            )
+            .unwrap();
+    }
+    let queued_id = app.requested.id(0).unwrap();
+    let popped_id = app.requested.id(1).unwrap();
+    let cached_id = app.requested.id(2).unwrap();
+    let finalized_id = app.requested.id(3).unwrap();
     app.reload_queue
         .as_ref()
         .unwrap()
@@ -221,12 +236,14 @@ fn last_owner_prunes_queued_material_but_keeps_popped_request_until_worker_resul
         .unwrap()
         .push(LoadRequest {
             idx: 0,
+            request_id: queued_id,
+            input_seq,
+            items_gen: items_generation,
             ..Default::default()
         });
-    let input_seq = app.input_seq;
-    let items_generation = app.items_generation;
-    app.texture_backlog
-        .push(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+    queue_thumbnail_for_test!(
+        app,
+        crate::thumb_loader::ThumbMsg::from_legacy_parts(
             2,
             Some(egui::ColorImage::filled([1, 1], egui::Color32::WHITE)),
             crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
@@ -238,8 +255,33 @@ fn last_owner_prunes_queued_material_but_keeps_popped_request_until_worker_resul
             false,
             input_seq,
             items_generation,
-        ));
-    app.pending_finalize.insert(3);
+        )
+        .with_request_id(cached_id)
+    );
+    // A finalized source image still awaiting upload is disposable on release.
+    // Finalized alone would instead model a worker result whose image has not arrived.
+    queue_thumbnail_for_test!(
+        app,
+        crate::thumb_loader::ThumbMsg::from_legacy_parts(
+            3,
+            Some(egui::ColorImage::filled([1, 1], egui::Color32::WHITE)),
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                evaluated_display_px: 320,
+            },
+            false,
+            None,
+            Some((1, 1)),
+            None,
+            false,
+            false,
+            input_seq,
+            items_generation,
+        )
+        .with_request_id(finalized_id)
+        .source_pixels()
+    );
+    app.requested.mark_finalized_for_test(3);
+    assert!(app.requested.finalized_image_wait(3));
 
     let item_count = app.items.len();
     let projection = thumbnail_keep_projection(item_count, [], [], None, [], []);
@@ -258,8 +300,8 @@ fn last_owner_prunes_queued_material_but_keeps_popped_request_until_worker_resul
         app.requested.keys().copied().collect::<HashSet<_>>(),
         HashSet::from([1])
     );
-    assert!(app.texture_backlog.is_empty());
-    assert!(app.pending_finalize.is_empty());
+    assert!((app.requested.images_len() == 0));
+    assert!(!app.requested.any_finalized_image_wait());
 
     app.ensure_still_seek_thumbnail_requests(&ctx, &[1]);
     assert!(
@@ -273,8 +315,9 @@ fn last_owner_prunes_queued_material_but_keeps_popped_request_until_worker_resul
         "reacquiring an in-flight page must not queue a duplicate decode"
     );
 
-    app.tx
-        .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+    send_thumbnail_for_test!(
+        app,
+        crate::thumb_loader::ThumbMsg::from_legacy_parts(
             1,
             None,
             crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
@@ -288,8 +331,10 @@ fn last_owner_prunes_queued_material_but_keeps_popped_request_until_worker_resul
             false,
             app.input_seq,
             app.items_generation,
-        ))
-        .unwrap();
+        )
+        .with_request_id(popped_id)
+    )
+    .unwrap();
     app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::PassthroughRendition);
     assert!(!app.requested.contains_key(&1));
     assert!(matches!(app.thumbnails[1], ThumbnailState::Evicted));
@@ -311,8 +356,9 @@ fn finalized_first_and_error_results_preserve_existing_worker_lifecycle() {
     app.thumbnail_eviction_generation = Some(app.items_generation);
     app.requested.extend([(0, false), (1, false)]);
 
-    app.tx
-        .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+    send_thumbnail_for_test!(
+        app,
+        crate::thumb_loader::ThumbMsg::from_legacy_parts(
             0,
             None,
             crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
@@ -326,14 +372,16 @@ fn finalized_first_and_error_results_preserve_existing_worker_lifecycle() {
             true,
             app.input_seq,
             app.items_generation,
-        ))
-        .unwrap();
+        )
+    )
+    .unwrap();
     app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::PassthroughRendition);
     assert!(app.requested.contains_key(&0));
-    assert!(app.pending_finalize.contains(&0));
+    assert!(app.requested.finalized_image_wait(0));
 
-    app.tx
-        .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+    send_thumbnail_for_test!(
+        app,
+        crate::thumb_loader::ThumbMsg::from_legacy_parts(
             0,
             Some(egui::ColorImage::filled([1, 1], egui::Color32::WHITE)),
             crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
@@ -347,10 +395,12 @@ fn finalized_first_and_error_results_preserve_existing_worker_lifecycle() {
             false,
             app.input_seq,
             app.items_generation,
-        ))
-        .unwrap();
-    app.tx
-        .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+        )
+    )
+    .unwrap();
+    send_thumbnail_for_test!(
+        app,
+        crate::thumb_loader::ThumbMsg::from_legacy_parts(
             1,
             None,
             crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
@@ -362,12 +412,13 @@ fn finalized_first_and_error_results_preserve_existing_worker_lifecycle() {
             false,
             app.input_seq,
             app.items_generation,
-        ))
-        .unwrap();
+        )
+    )
+    .unwrap();
     app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::PassthroughRendition);
 
     assert!(!app.requested.contains_key(&0));
-    assert!(!app.pending_finalize.contains(&0));
+    assert!(!app.requested.finalized_image_wait(0));
     assert!(matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }));
     assert!(!app.requested.contains_key(&1));
     assert!(matches!(app.thumbnails[1], ThumbnailState::Failed));
@@ -402,7 +453,12 @@ fn show_bookmark_panel(
     app.fullscreen_idx = Some(fullscreen_idx);
     app.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
     app.settings.fullscreen_left_panel_tab = crate::settings::FullscreenLeftPanelTab::Bookmarks;
-    app.current_book_bookmarks_key = Some(container_key);
+    app.current_book_bookmarks_key = Some(BookBookmarkProjectionKey {
+        container_key,
+        visibility: app.listing_file_type_visibility().clone(),
+        context_id: app.virtual_list_context_id(),
+        items_generation: app.items_generation,
+    });
     app.current_book_bookmarks = bookmarks;
 }
 
@@ -416,8 +472,9 @@ fn bookmark_panel_owner_survives_poll_then_projection_without_a_second_decode() 
     assert!(app.requested.contains_key(&3));
     app.reload_queue.as_ref().unwrap().0.lock().unwrap().clear();
 
-    app.tx
-        .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+    send_thumbnail_for_test!(
+        app,
+        crate::thumb_loader::ThumbMsg::from_legacy_parts(
             3,
             Some(egui::ColorImage::filled([2, 2], egui::Color32::WHITE)),
             crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
@@ -431,8 +488,9 @@ fn bookmark_panel_owner_survives_poll_then_projection_without_a_second_decode() 
             false,
             app.input_seq,
             app.items_generation,
-        ))
-        .unwrap();
+        )
+    )
+    .unwrap();
     app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::PassthroughRendition);
     app.update_keep_range_and_requests(&ctx, std::time::Instant::now());
 
@@ -452,8 +510,9 @@ fn bookmark_panel_owner_survives_poll_then_projection_without_a_second_decode() 
             .is_empty()
     );
 
-    app.tx
-        .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+    send_thumbnail_for_test!(
+        app,
+        crate::thumb_loader::ThumbMsg::from_legacy_parts(
             3,
             None,
             crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
@@ -467,8 +526,9 @@ fn bookmark_panel_owner_survives_poll_then_projection_without_a_second_decode() 
             true,
             app.input_seq,
             app.items_generation,
-        ))
-        .unwrap();
+        )
+    )
+    .unwrap();
     app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::PassthroughRendition);
     app.update_keep_range_and_requests(&ctx, std::time::Instant::now());
 
@@ -586,8 +646,9 @@ fn stale_generation_result_cannot_restore_a_released_bookmark_owner() {
     app.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
     app.reconcile_details_thumbnail_keep_owners();
 
-    app.tx
-        .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+    send_thumbnail_for_test!(
+        app,
+        crate::thumb_loader::ThumbMsg::from_legacy_parts(
             3,
             Some(egui::ColorImage::filled([2, 2], egui::Color32::WHITE)),
             crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
@@ -601,8 +662,9 @@ fn stale_generation_result_cannot_restore_a_released_bookmark_owner() {
             false,
             app.input_seq,
             old_generation,
-        ))
-        .unwrap();
+        )
+    )
+    .unwrap();
     app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::PassthroughRendition);
 
     assert!(!app.keep_set.contains(&3));
@@ -739,18 +801,21 @@ fn audio_no_art_is_terminal_across_grid_details_hover_and_stale_completions() {
     app.keep_set.insert(0);
     app.keep_range = (0, 1);
     app.requested.insert(0, false);
-    app.tx
-        .send(crate::thumb_loader::ThumbMsg {
+    send_thumbnail_for_test!(
+        app,
+        crate::thumb_loader::ThumbMsg {
+            request_id: crate::thumb_loader::ThumbnailRequestId::Standalone,
             idx: 0,
             input_seq: app.input_seq,
             items_gen: app.items_generation,
             payload: crate::thumb_loader::ThumbMsgPayload::NoArt,
-        })
-        .unwrap();
+        }
+    )
+    .unwrap();
     app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
     assert!(matches!(app.thumbnails[0], ThumbnailState::NoArt));
     assert!(!app.requested.contains_key(&0));
-    assert!(!app.pending_finalize.contains(&0));
+    assert!(!app.requested.finalized_image_wait(0));
     for _ in 0..3 {
         app.set_details_hover_thumbnail_idx(Some(0));
         app.set_details_hover_thumbnail_idx(None);
@@ -775,14 +840,17 @@ fn audio_no_art_is_terminal_across_grid_details_hover_and_stale_completions() {
     );
 
     app.thumbnails[0] = loaded_thumbnail(&ctx, "audio-current-generation");
-    app.tx
-        .send(crate::thumb_loader::ThumbMsg {
+    send_thumbnail_for_test!(
+        app,
+        crate::thumb_loader::ThumbMsg {
+            request_id: crate::thumb_loader::ThumbnailRequestId::Standalone,
             idx: 0,
             input_seq: app.input_seq,
             items_gen: app.items_generation.wrapping_sub(1),
             payload: crate::thumb_loader::ThumbMsgPayload::NoArt,
-        })
-        .unwrap();
+        }
+    )
+    .unwrap();
     app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
     assert!(
         matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }),

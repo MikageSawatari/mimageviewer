@@ -89,6 +89,7 @@ struct PersistentCollectionCachedView {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PersistentCollectionViewKey {
+    file_type_visibility: crate::file_type_visibility::FileTypeVisibility,
     order: CollectionPrepareReuseKey,
     spread: SpreadRequest,
     spread_page_gap_px: u32,
@@ -100,6 +101,7 @@ struct PersistentCollectionViewKey {
 impl PersistentCollectionViewKey {
     fn new(id: CollectionId, revision: u64, settings: &Settings, spread: SpreadRequest) -> Self {
         Self {
+            file_type_visibility: settings.file_type_visibility.clone(),
             order: CollectionPrepareReuseKey::new(id, revision, &settings.grid_display_order),
             spread,
             spread_page_gap_px: settings.spread_page_gap_px,
@@ -1041,12 +1043,13 @@ fn exact_prepared(
         let loaded = actor_result??;
         let mut observed = watch.take_latest();
         if let Some(cached) = reuse.filter(|cached| {
-            cached.key.order
-                == CollectionPrepareReuseKey::new(
-                    collection_id,
-                    loaded.revision(),
-                    &settings.grid_display_order,
-                )
+            cached.key.file_type_visibility == settings.file_type_visibility
+                && cached.key.order
+                    == CollectionPrepareReuseKey::new(
+                        collection_id,
+                        loaded.revision(),
+                        &settings.grid_display_order,
+                    )
                 && cached.key.order.matches_prepared(&cached.prepared)
         }) {
             if notice_invalidates(&loaded, observed.as_ref()) {
@@ -1110,6 +1113,10 @@ fn exact_prepared(
                 "コレクションの内容を確認できませんでした",
             ),
         })?;
+        let prepared = crate::app::collection_grid::project_collection_display_snapshot(
+            prepared,
+            &settings.file_type_visibility,
+        );
         if let Some(notice) = watch.take_latest() {
             observed = Some(notice);
         }
@@ -1538,6 +1545,7 @@ fn wire_snapshot(
         }
     }
     Some(PersistentCollectionSnapshotPayload {
+        registered_total: exact.prepared.registered_total,
         thumbnail_presentation: super::thumbnail_presentation(settings),
         collection_id: exact.prepared.collection_id.to_string(),
         collection_revision: exact.prepared.collection_revision,
@@ -1766,7 +1774,8 @@ fn exact_view_token_prefix(
     spread: SpreadRequest,
 ) -> Sha256 {
     let mut digest = Sha256::new();
-    digest.update(b"mimageviewer:persistent-collection-view:v2\0");
+    digest.update(b"mimageviewer:persistent-collection-view:v3\0");
+    digest.update(settings.file_type_visibility.fingerprint().to_le_bytes());
     digest.update(exact.prepared.collection_id.to_string().as_bytes());
     digest.update(exact.prepared.collection_revision.to_le_bytes());
     digest.update(format!("{:?}", settings.grid_display_order).as_bytes());
@@ -2215,6 +2224,7 @@ mod tests {
 
     fn prepared(entries: Vec<PreparedCollectionEntry>) -> CollectionPreparedSnapshot {
         CollectionPreparedSnapshot {
+            registered_total: entries.len(),
             collection_id: CollectionId::new(),
             collection_revision: 1,
             collection_name: "test".to_owned(),

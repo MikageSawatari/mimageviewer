@@ -228,6 +228,7 @@ struct SearchViewWish {
     run_sequence: u64,
     query: String,
     filters: GlobalSearchFilters,
+    visibility: crate::file_type_visibility::FileTypeVisibility,
     source_generation: u64,
     context: crate::app::ViewerContextId,
     through_batch: u64,
@@ -266,6 +267,7 @@ enum SearchPrepareOutput {
 }
 
 struct SearchPreparedItems {
+    page_identity_index: Arc<crate::app::file_type_resume::PreparedPageIdentityIndex>,
     items: Vec<GridItem>,
     image_metas: Vec<Option<(i64, i64)>>,
     video_thumb_overrides: HashMap<String, std::path::PathBuf>,
@@ -317,6 +319,7 @@ impl SearchPageEditPrepare {
     fn spawn(
         ctx: &egui::Context,
         available: crate::app::page_edit_snapshot::PageEditAvailability,
+        visibility: crate::file_type_visibility::FileTypeVisibility,
         settings: crate::settings::Settings,
     ) -> Result<Self, String> {
         let (tx, command_rx) = mpsc::channel();
@@ -338,6 +341,7 @@ impl SearchPageEditPrepare {
                     worker_cancel,
                     repaint,
                     available,
+                    visibility,
                     settings,
                 );
             })
@@ -393,6 +397,8 @@ pub struct GlobalSearchState {
     pub last_executed: String,
     /// Changes on every new search intent, including the debounce interval.
     pub run_sequence: u64,
+    /// Immutable policy of the run that produced the retained hits and aggregates.
+    pub visibility: crate::file_type_visibility::FileTypeVisibility,
     /// 次フレームでフォーカス要求
     pub focus_request: bool,
     /// TextEdit がフォーカスを持っているか (他キーバインドが取らないようにするため)
@@ -480,6 +486,7 @@ impl Default for GlobalSearchState {
             query: String::new(),
             last_executed: String::new(),
             run_sequence: 0,
+            visibility: Default::default(),
             focus_request: false,
             has_focus: false,
             last_change_at: None,
@@ -620,6 +627,9 @@ impl GlobalSearchState {
 
     /// 集約ロジック (docs §10.4.2): 1 ヒットをコンテナに追加 + 生データも保持
     pub(crate) fn accumulate_hit(&mut self, hit: &GlobalHit) {
+        if !crate::global_search::search_hit_type_is_visible(&self.visibility, &hit.path) {
+            return;
+        }
         let (container_path, kind) = parent_container(&hit.path);
         let representative = image_representative_from_hit(&hit.path);
         let entry = self
@@ -1454,9 +1464,13 @@ fn search_prepare_worker(
     cancel: Arc<AtomicBool>,
     ctx: egui::Context,
     available: crate::app::page_edit_snapshot::PageEditAvailability,
+    visibility: crate::file_type_visibility::FileTypeVisibility,
     sidecar_settings: crate::settings::Settings,
 ) {
     let mut state = GlobalSearchState::default();
+    let mut archive_visibility =
+        crate::archive_visibility::ArchiveVisibilityProjection::new(&visibility, &cancel);
+    state.visibility = visibility.clone();
     let rating_db =
         crate::rating_db::RatingDb::open_readonly(&crate::rating_db::RatingDb::db_path()).ok();
     let mut snapshot = crate::app::page_edit_snapshot::PageEditSnapshot::default();
@@ -1482,6 +1496,15 @@ fn search_prepare_worker(
                 }
             }
             SearchPrepareCommand::Batch(sequence, mut hits) => {
+                hits.retain(|hit| {
+                    crate::global_search::search_hit_type_is_visible(&state.visibility, &hit.path)
+                        && hit
+                            .path
+                            .split_once(crate::search_norm::ZIP_ENTRY_SEP)
+                            .is_none_or(|(container, member)| {
+                                archive_visibility.allows_member(Path::new(container), member)
+                            })
+                });
                 if let Some(db) = rating_db.as_ref() {
                     let keys = hits
                         .iter()
@@ -1699,9 +1722,17 @@ fn search_prepare_worker(
                     }
                     let video_thumb_overrides = sidecars.by_video_path;
                     cache_completion = after.completed_writes;
+                    let page_identity_index = Arc::new(
+                        crate::app::file_type_resume::PreparedPageIdentityIndex::prepare(
+                            &items,
+                            None,
+                            wish.visibility.clone(),
+                        ),
+                    );
                     let _ = tx.send(SearchPrepareOutput::Ready(
                         wish,
                         SearchPreparedItems {
+                            page_identity_index,
                             items,
                             image_metas,
                             video_thumb_overrides,
@@ -1748,7 +1779,7 @@ impl App {
         items: Vec<GridItem>,
         image_metas: Vec<Option<(i64, i64)>>,
     ) {
-        self.replace_search_view_items_with_ratings(items, image_metas, None, false);
+        self.replace_search_view_items_with_ratings(items, image_metas, None, false, None);
     }
 
     fn replace_search_view_items_with_ratings(
@@ -1757,6 +1788,7 @@ impl App {
         image_metas: Vec<Option<(i64, i64)>>,
         prepared_ratings: Option<(HashMap<usize, u8>, u64)>,
         preserve_rating_details_order: bool,
+        page_identity_index: Option<Arc<crate::app::file_type_resume::PreparedPageIdentityIndex>>,
     ) {
         use std::sync::atomic::Ordering;
         debug_assert_eq!(items.len(), image_metas.len());
@@ -1858,6 +1890,17 @@ impl App {
         // これ以降に届く旧ワーカーの ThumbMsg は poll_thumbnails の
         // 世代不一致チェックで破棄される。
         self.install_new_items(items, image_metas);
+        if let Some(index) = page_identity_index {
+            let previous = std::mem::replace(&mut self.page_identity_index, index);
+            self.retire_smart_folder_payloads([
+                Box::new(previous) as crate::app::smart_folder::RetiredSmartFolderPayload
+            ]);
+        } else {
+            self.prepare_current_listing_page_identity_index(
+                self.global_search.visibility.clone(),
+                None,
+            );
+        }
         // install_new_items は既定で false に倒すので、合成ビューであることを上書き。
         // rating 変更時の rebuild_items_from_global_search 判定で参照される (Codex P2)。
         self.items_are_global_search_view = true;
@@ -2299,6 +2342,7 @@ impl App {
         match SearchPageEditPrepare::spawn(
             ctx,
             crate::app::page_edit_snapshot::PageEditAvailability::for_app(self),
+            self.settings.file_type_visibility.clone(),
             self.settings.thumbnail_source_discovery_snapshot(),
         ) {
             Ok(prepare) => self.global_search.page_edit_prepare = Some(prepare),
@@ -2332,6 +2376,7 @@ impl App {
             self.retire_main_list_requests_for_surface_switch();
         }
         self.global_search.reset_for_new_query();
+        self.global_search.visibility = self.settings.file_type_visibility.clone();
         if !self.restart_search_page_edit_prepare(ctx) {
             return;
         }
@@ -2357,6 +2402,7 @@ impl App {
             target: self.global_search.filters.target.clone(),
             mode: self.global_search.filters.or_mode.into(),
             ignore_epub: self.settings.epub_file_handling_ignores_epub(),
+            visibility: self.global_search.visibility.clone(),
         };
 
         let repaint_ctx = ctx.clone();
@@ -2450,7 +2496,11 @@ impl App {
                     hits,
                     scanned_candidates,
                     valid_hits,
+                    visibility_notice,
                 }) => {
+                    if let Some(notice) = visibility_notice {
+                        self.show_feedback_toast(notice.message().into());
+                    }
                     // Accepted batches enter the worker FIFO in order. The worker does
                     // the rating lookup before returning each rated batch to this owner.
                     if let Some(prepare) = self.global_search.page_edit_prepare.as_mut() {
@@ -2614,6 +2664,8 @@ impl App {
                         && wish.run_sequence == self.global_search.run_sequence
                         && wish.query == self.global_search.query
                         && wish.filters == self.global_search.filters
+                        && wish.visibility == self.settings.file_type_visibility
+                        && wish.visibility == self.global_search.visibility
                         && wish.context == self.virtual_list_context_id()
                         && wish.source_generation == self.items_generation
                         && (self.items_are_global_search_view
@@ -2674,6 +2726,7 @@ impl App {
                                 prepared.image_metas,
                                 prepared.ratings,
                                 wish.survivor_order.is_some(),
+                                Some(prepared.page_identity_index),
                             );
                         }) {
                             prepare.desired = None;
@@ -2785,6 +2838,7 @@ impl App {
             SearchPageEditPrepare::spawn(
                 ctx,
                 crate::app::page_edit_snapshot::PageEditAvailability::for_app(self),
+                self.settings.file_type_visibility.clone(),
                 self.settings.thumbnail_source_discovery_snapshot(),
             )
             .unwrap(),
@@ -3027,6 +3081,7 @@ impl App {
                 run_sequence: self.global_search.run_sequence,
                 query: self.global_search.query.clone(),
                 filters: self.global_search.filters.clone(),
+                visibility: self.global_search.visibility.clone(),
                 source_generation: self.items_generation,
                 context,
                 through_batch: prepare.raw_batch_sequence,
@@ -3983,7 +4038,11 @@ mod tests {
             direction: crate::rating_sort::RatingSortDirection::Desc,
             unrated_position: crate::rating_sort::RatingSortUnratedPosition::BelowAll,
         };
+        let mut visibility = crate::file_type_visibility::FileTypeVisibility::default();
+        visibility.excluded_extensions.insert("png".into());
+        let worker_visibility = visibility.clone();
         let wish = SearchViewWish {
+            visibility,
             adoption: SearchViewAdoption::Reprojection,
             sequence: 1,
             run_sequence: 1,
@@ -4011,6 +4070,7 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
                 egui::Context::default(),
                 crate::app::page_edit_snapshot::PageEditAvailability::default(),
+                worker_visibility,
                 crate::settings::Settings::default(),
             );
         });
@@ -4050,6 +4110,20 @@ mod tests {
         assert!(ready[1].rating_sort_failed);
         assert_eq!(ready[1].items.len(), 1);
         assert_eq!(ready[1].items[0].name(), "499.jpg");
+        for prepared in &ready {
+            assert!(!prepared.page_identity_index.policy.is_all_visible());
+            for (index, item) in prepared.items.iter().enumerate() {
+                assert_eq!(
+                    prepared
+                        .page_identity_index
+                        .resolve(&crate::book_resume_db::ReadingPosition {
+                            page: 999,
+                            identity: crate::book_resume_db::PageIdentity::for_item(item, None),
+                        }),
+                    crate::app::file_type_resume::PositionResolution::Restored(index)
+                );
+            }
+        }
     }
 
     #[test]
@@ -4147,6 +4221,7 @@ mod tests {
                 }],
                 scanned_candidates: 1,
                 valid_hits: 1,
+                visibility_notice: None,
             })
             .unwrap();
         stream
@@ -4251,6 +4326,7 @@ mod tests {
                     hits,
                     scanned_candidates: (batch + 1) * 500,
                     valid_hits: (batch + 1) * 500,
+                    visibility_notice: None,
                 })
                 .unwrap();
         }

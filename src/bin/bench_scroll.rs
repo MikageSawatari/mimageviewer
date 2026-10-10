@@ -556,7 +556,7 @@ fn run_bench(
                     }
                 };
                 match req_opt {
-                    Some(req) => {
+                    Some(mut req) => {
                         if cancel_w.load(Ordering::Relaxed) {
                             break;
                         }
@@ -567,7 +567,7 @@ fn run_bench(
                         }
                         let dp = display_px_w.load(Ordering::Relaxed);
                         process_load_request(
-                            &req,
+                            &mut req,
                             &cache_map_w,
                             &tx_w,
                             catalog_w.as_ref(),
@@ -586,6 +586,8 @@ fn run_bench(
                             Some(&pin_db_w),
                             // 編集プレビューキャッシュはベンチ対象外。
                             None,
+                            None,
+                            // RAW half handoff はベンチ対象外。
                             None,
                         );
                     }
@@ -696,7 +698,10 @@ fn run_bench(
             let idx = msg.idx;
             requested.remove(&idx);
             completed.insert(idx);
-            if msg.origin.from_cache() {
+            if msg
+                .pixels()
+                .is_some_and(|pixels| pixels.origin.from_cache())
+            {
                 cache_hits += 1;
             } else {
                 cache_misses += 1;

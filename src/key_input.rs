@@ -47,7 +47,8 @@ impl PhysicalKeySlot {
 
 /// Navigation keys, Backspace, and F12 supported by the synthetic-input timeline.
 ///
-/// Printable keys, JIS symbols, numpad-specific keys, clipboard shortcuts,
+/// G is supported for the diagnostic Ctrl+G chord; it does not inject text.
+/// Other printable keys, JIS symbols, numpad-specific keys, clipboard shortcuts,
 /// text events, and IME events are intentionally not representable here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyntheticNavigationKey {
@@ -63,6 +64,8 @@ pub enum SyntheticNavigationKey {
     Backspace,
     Escape,
     F12,
+    #[cfg(any(test, feature = "test-script"))]
+    G,
 }
 
 impl SyntheticNavigationKey {
@@ -81,6 +84,8 @@ impl SyntheticNavigationKey {
             Self::Backspace => "Backspace",
             Self::Escape => "Escape",
             Self::F12 => "F12",
+            #[cfg(any(test, feature = "test-script"))]
+            Self::G => "G",
         }
     }
 
@@ -98,6 +103,8 @@ impl SyntheticNavigationKey {
             Self::Backspace => PhysicalKeySlot::new(0x08, false),
             Self::Escape => PhysicalKeySlot::new(0x1B, false),
             Self::F12 => PhysicalKeySlot::new(0x7B, false),
+            #[cfg(any(test, feature = "test-script"))]
+            Self::G => PhysicalKeySlot::new(0x47, false),
         }
     }
 
@@ -115,6 +122,8 @@ impl SyntheticNavigationKey {
             Self::Backspace => 0x0E,
             Self::Escape => 0x01,
             Self::F12 => 0x58,
+            #[cfg(any(test, feature = "test-script"))]
+            Self::G => 0x22,
         }
     }
 
@@ -132,6 +141,8 @@ impl SyntheticNavigationKey {
             Self::Backspace => egui::Key::Backspace,
             Self::Escape => egui::Key::Escape,
             Self::F12 => egui::Key::F12,
+            #[cfg(any(test, feature = "test-script"))]
+            Self::G => egui::Key::G,
         }
     }
 }
@@ -2349,6 +2360,34 @@ impl SyntheticInputPlugin {
         };
         input.events.extend(batch.events.iter().cloned());
         if !prepared.delivered_viewports.contains(&input.viewport_id) {
+            #[cfg(all(windows, feature = "test-script"))]
+            if crate::test_script::release_checks::is_active() {
+                let hwnd = eframe::miv_test_script_window_witness::latest(input.viewport_id)
+                    .map(|w| w.hwnd());
+                for event in &batch.events {
+                    if let egui::Event::Key {
+                        key,
+                        pressed,
+                        repeat,
+                        modifiers,
+                        ..
+                    } = event
+                    {
+                        let name = match key {
+                            egui::Key::ArrowDown => "Down",
+                            egui::Key::G => "G",
+                            _ => continue,
+                        };
+                        crate::test_script::release_checks::trace(
+                            "key_materialized",
+                            serde_json::json!({
+                                "key":name,"pressed":pressed,"repeat":repeat,"ctrl":modifiers.ctrl,"shift":modifiers.shift,"alt":modifiers.alt,
+                                "target_viewport":if input.viewport_id==egui::ViewportId::ROOT {"ROOT"} else {"other"},"target_hwnd":hwnd
+                            }),
+                        );
+                    }
+                }
+            }
             prepared.delivered_viewports.push(input.viewport_id);
         }
     }
@@ -3481,6 +3520,17 @@ unsafe extern "system" fn main_key_input_subclass_proc(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn diagnostic_g_maps_to_the_physical_ctrl_g_key_without_text() {
+        let key = super::SyntheticNavigationKey::G;
+        assert_eq!(
+            key.physical_slot(),
+            super::PhysicalKeySlot::new(0x47, false)
+        );
+        assert_eq!(key.scan_code(), 0x22);
+        assert_eq!(key.egui_key(), egui::Key::G);
+    }
+
     use super::{
         KeyEdge, KeyInputState, PhysicalKeySlot, RawKeyEdge, RegisterHwndResult, ReturnKeyState,
         SyntheticInputFact, SyntheticInputIssue, SyntheticInputPlugin, SyntheticKeyCommand,

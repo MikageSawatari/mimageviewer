@@ -421,10 +421,13 @@ wipe/diff比較はpair生成時、360度パノラマはbase upload時だけ同�
 同時保持するerase / local-adjust / conceal / edit / final composite / comic / adjustment textureを
 TextureIdで重複排除して見積もり、補正レイヤーの比較previewも同じkeep-set evictionへ追従させる。
 
-### 3.2 サムネイルアップロードは per-frame スロットリング不要
+### 3.2 サムネイルアップロードは8枚/frameを維持
 
-`thumb.ready` の `upload_ms` は 1 枚 0.3-1ms 程度 (762×572 RGBA)。1 フレームに 50 枚来ても
-合計 50ms なので致命的ではない。サムネイルは特別なペーシングなしで OK。
+サムネイルの `load_texture` はGPU uploadを伴うため、既存の上限8枚/frameを維持する。
+上限超過のColorImageはcontext-localな `ThumbnailRequests` が要求と一緒に所有し、
+sourceのFinalizedが先に届いても画像の採用/破棄まで再enqueueを許可しない（§1.360）。
+表示がEvictedまたはLoaded高画質化中でも同じ契約であり、backlogを増やして予算を迂回しない。
+新しい同期I/O・decode・待機・timerは足さず、keep外動画retry全件の毎frame走査もしない。
 
 ---
 
@@ -690,6 +693,20 @@ python scripts\analyze_perf.py $Perf collection # collection read lease の相�
 python scripts\analyze_perf.py $Perf hitches --ms 100  # 100ms 超フレームギャップ
 python scripts\analyze_perf.py $Perf dump <seq>  # 特定 input_seq のイベント列
 ```
+
+### 7.0 ログの配送と保存完了（§1.356）
+
+UI／stderr reader／workerの `logger::log` / `perf::event` は自身のtimestamp／tid付きで
+有界journalへ非blocking受付する。通常／perfのopen・write・flush・rotationは単一writerの仕事。
+UIから `flush()` を呼んでも待機しない。通常writerは到着batchを直ちにflush、perfだけ250ms周期。
+これにより、ログ保存先の停止がUIやchild stderr排出へ伝播する所有lockを除いた。
+OS側のwrite stall原因は未確定で、Storeの起動問題全体の修正保証ではない。
+
+保存完了が必要な診断ZIPは、Appの単一ownerからworkerを起動し、完了barrierを最大2秒待つ。
+UIは保存中／結果のpollだけ。過去dropは証拠不完全と知らせZIPを保存し、今回要求印drop・
+timeout・必須snapshotの読取り失敗は通知して失敗。解析gateもcheckpointなしをPASSにしない。
+panic.log／UI hang watchdogは直接writeのまま。終了時だけ一般／startup writer合計2秒待つ。
+[設計・利用者決定](async-log-writer-plan.md)を参照。
 
 ### 7.1 `pre_grid` 区間の内訳
 

@@ -240,12 +240,13 @@ impl CollectionEngine {
             FavoriteSearchKind::Zip => Some(IndexKind::ZipFile),
             FavoriteSearchKind::Pdf => Some(IndexKind::PdfFile),
         };
-        let index_entries = match db.search_with_epub(
+        let index_entries = match db.search_with_visibility(
             &request.query,
             &favorite_paths,
             kind,
             crate::search_query::MatchMode::And,
             !settings.epub_file_handling_ignores_epub(),
+            &settings.file_type_visibility,
         ) {
             Ok(entries) => entries,
             Err(error) => {
@@ -385,15 +386,17 @@ impl CollectionEngine {
         request: &TagItemsRequest,
         sort_order: crate::settings::SortOrder,
     ) -> Result<TagItemsPayload, CollectionError> {
-        let key_scan_limit = tag_item_key_scan_limit(request.kind);
+        let key_scan_limit = tag_item_key_scan_limit(request.kind, &settings.file_type_visibility);
         let item_keys =
             crate::tag_view::select_tag_view_item_keys(db, request.tag.trim(), key_scan_limit + 1);
-        let (entries, truncated) = map_tag_item_keys(
+        let (entries, truncated) = map_tag_item_keys_with_visibility(
             item_keys,
             request.kind,
             key_scan_limit,
             !settings.archive_file_handling_ignores_convertible(),
             !settings.epub_file_handling_ignores_epub(),
+            MAX_REMOTE_COLLECTION_ENTRIES,
+            &settings.file_type_visibility,
         );
         Ok(TagItemsPayload {
             listing: self.tag_items_listing(settings, sort_order, entries, truncated),
@@ -521,6 +524,11 @@ impl CollectionEngine {
             ));
         }
         let db_path = crate::rating_db::RatingDb::db_path();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut visibility = crate::archive_visibility::ArchiveVisibilityProjection::new(
+            &settings.file_type_visibility,
+            &cancel,
+        );
         let mut rows = if db_path.try_exists().unwrap_or(false) {
             let db = crate::rating_db::RatingDb::open_readonly(&db_path)
                 .map_err(|error| internal_error("レーティングを読み込めませんでした", error))?;
@@ -528,6 +536,7 @@ impl CollectionEngine {
                 .map_err(|error| internal_error("レーティングを読み込めませんでした", error))?
                 .iter()
                 .filter_map(crate::rating_view::rating_row_to_view_row)
+                .filter(|row| visibility.allows_item(&row.item))
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
@@ -537,14 +546,18 @@ impl CollectionEngine {
             .into_iter()
             .filter_map(|row| candidate_from_grid_item(row.item, None, Some(stars)))
             .collect();
-        self.payload(
+        let mut payload = self.payload_from_projected(
             settings,
             &format!("レーティング ★{stars}"),
             candidates,
             sort_order,
             Some(super::FIXED_LIST_SORT_LOCK_REASON),
             spread_request,
-        )
+        )?;
+        payload.visibility_notice = visibility
+            .notice()
+            .map(|notice| notice.message().to_owned());
+        Ok(payload)
     }
 
     fn bookmarks(
@@ -553,9 +566,12 @@ impl CollectionEngine {
         sort_order: crate::settings::SortOrder,
         spread_request: CollectionSpreadRequest,
     ) -> Result<CollectionPayload, CollectionError> {
-        let rows = crate::bookmark_browser::build_rows_readonly()
-            .map_err(|error| internal_error("ブックマークを読み込めませんでした", error))?;
-        let candidates = rows
+        let built = crate::bookmark_browser::build_rows_readonly_with_visibility_and_total(
+            &settings.file_type_visibility,
+        )
+        .map_err(|error| internal_error("ブックマークを読み込めませんでした", error))?;
+        let candidates = built
+            .rows
             .into_iter()
             .map(|row| {
                 let name = row.details_name();
@@ -598,14 +614,19 @@ impl CollectionEngine {
                 }
             })
             .collect();
-        self.payload(
+        let mut payload = self.payload_from_projected(
             settings,
             "ブックマーク",
             candidates,
             sort_order,
             Some(super::FIXED_LIST_SORT_LOCK_REASON),
             spread_request,
-        )
+        )?;
+        payload.registered_total = Some(built.registered_total);
+        payload.visibility_notice = built
+            .visibility_notice
+            .map(|notice| notice.message().to_owned());
+        Ok(payload)
     }
 
     fn bookshelf(
@@ -618,16 +639,31 @@ impl CollectionEngine {
         let candidates = crate::books::list_books(&root)
             .map_err(|error| internal_error("本棚を読み込めませんでした", error))?
             .into_iter()
-            .map(|book| CandidateEntry {
-                name: book.name,
-                path: book.path,
-                kind: RemoteEntryKind::Folder,
-                detail: Some(format!("{} ページ", book.page_count)),
-                progress_current: None,
-                progress_total: Some(book.page_count as u64),
-                rating: None,
+            .map(|book| {
+                let scan =
+                    crate::app::folder_scan::scan_directory_with_settings(&book.path, settings)
+                        .map_err(|error| {
+                            internal_error("本のページ数を読み込めませんでした", error)
+                        })?;
+                let listing = crate::app::folder_scan::materialize_local_folder_listing(
+                    &book.path, scan, settings,
+                );
+                let page_count = listing
+                    .items
+                    .iter()
+                    .filter(|item| matches!(item, GridItem::Image(_)))
+                    .count();
+                Ok(CandidateEntry {
+                    name: book.name,
+                    path: book.path,
+                    kind: RemoteEntryKind::Folder,
+                    detail: Some(format!("{} ページ", page_count)),
+                    progress_current: None,
+                    progress_total: Some(page_count as u64),
+                    rating: None,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, CollectionError>>()?;
         self.payload(
             settings,
             "本棚",
@@ -710,10 +746,34 @@ impl CollectionEngine {
         locked_reason: Option<&str>,
         spread_request: CollectionSpreadRequest,
     ) -> Result<CollectionPayload, CollectionError> {
-        let entries = to_remote_entries_bounded(
+        self.payload_from_projected(
+            settings,
+            title,
             candidates
                 .into_iter()
                 .filter(|candidate| include_collection_candidate(settings, candidate))
+                .collect(),
+            sort_order,
+            locked_reason,
+            spread_request,
+        )
+    }
+
+    /// Aggregate leaf projection has already happened before conversion to container links.
+    /// Reapplying the outer container's type here would erase allowed virtual page hits.
+    fn payload_from_projected(
+        &self,
+        settings: &Settings,
+        title: &str,
+        candidates: Vec<CandidateEntry>,
+        sort_order: crate::settings::SortOrder,
+        locked_reason: Option<&str>,
+        spread_request: CollectionSpreadRequest,
+    ) -> Result<CollectionPayload, CollectionError> {
+        let entries = to_remote_entries_bounded(
+            candidates
+                .into_iter()
+                .filter(|candidate| include_collection_candidate_handling(settings, candidate))
                 .collect(),
             MAX_REMOTE_COLLECTION_ENTRIES.saturating_add(1),
         );
@@ -743,6 +803,7 @@ fn collection_payload(
 ) -> CollectionPayload {
     let spread = collection_spread_payload(&entries, spread_request);
     CollectionPayload {
+        visibility_notice: None,
         thumbnail_presentation: super::thumbnail_presentation(settings),
         title: title.to_owned(),
         thumb_aspect_height_ratio: aggregate_thumb_aspect_height_ratio(settings),
@@ -756,6 +817,7 @@ fn collection_payload(
         page_groups: spread.groups,
         entry_limit,
         truncated,
+        registered_total: None,
     }
 }
 
@@ -1110,6 +1172,17 @@ fn candidate_from_tag_item_key(key: String, filter: TagItemKind) -> Option<Candi
 }
 
 fn include_collection_candidate(settings: &Settings, candidate: &CandidateEntry) -> bool {
+    if candidate.kind != RemoteEntryKind::Folder
+        && !settings
+            .file_type_visibility
+            .allows_physical_file(&candidate.path)
+    {
+        return false;
+    }
+    include_collection_candidate_handling(settings, candidate)
+}
+
+fn include_collection_candidate_handling(settings: &Settings, candidate: &CandidateEntry) -> bool {
     if candidate.kind == RemoteEntryKind::Archive {
         return !settings.archive_file_handling_ignores_convertible();
     }
@@ -1150,6 +1223,26 @@ fn map_tag_item_keys_with_entry_limit(
     include_epub: bool,
     entry_limit: usize,
 ) -> (Vec<RemoteEntry>, bool) {
+    map_tag_item_keys_with_visibility(
+        item_keys,
+        filter,
+        key_scan_limit,
+        include_archives,
+        include_epub,
+        entry_limit,
+        &Default::default(),
+    )
+}
+
+fn map_tag_item_keys_with_visibility(
+    item_keys: Vec<String>,
+    filter: TagItemKind,
+    key_scan_limit: usize,
+    include_archives: bool,
+    include_epub: bool,
+    entry_limit: usize,
+    policy: &crate::file_type_visibility::FileTypeVisibility,
+) -> (Vec<RemoteEntry>, bool) {
     let key_limit_reached = item_keys.len() > key_scan_limit;
     let mapped_limit = entry_limit.saturating_add(1);
     let mut candidates = Vec::with_capacity(mapped_limit);
@@ -1157,6 +1250,11 @@ fn map_tag_item_keys_with_entry_limit(
         let Some(candidate) = candidate_from_tag_item_key(key, filter) else {
             continue;
         };
+        if candidate.kind != RemoteEntryKind::Folder
+            && !policy.allows_physical_file(&candidate.path)
+        {
+            continue;
+        }
         if !include_archives && candidate.kind == RemoteEntryKind::Archive {
             continue;
         }
@@ -1184,12 +1282,11 @@ fn map_tag_item_keys_with_entry_limit(
     (entries, matched_truncated || key_limit_reached)
 }
 
-fn tag_item_key_scan_limit(filter: TagItemKind) -> usize {
-    if filter == TagItemKind::All {
-        crate::tag_view::TAG_VIEW_RESULT_LIMIT
-    } else {
-        crate::tag_view::TAG_VIEW_FILTERED_KEY_SCAN_LIMIT
-    }
+fn tag_item_key_scan_limit(
+    filter: TagItemKind,
+    policy: &crate::file_type_visibility::FileTypeVisibility,
+) -> usize {
+    crate::tag_view::key_scan_limit_for_projection(filter == TagItemKind::All, policy)
 }
 
 fn tag_item_kind_matches(filter: TagItemKind, kind: RemoteEntryKind) -> bool {
@@ -1583,6 +1680,124 @@ fn collection_settings_error(
 mod tests {
     use super::*;
     use crate::settings::FavoriteEntry;
+
+    #[test]
+    fn remote_rating_visibility_filters_nested_origins_before_container_payloads() {
+        use std::io::Write;
+        let data = crate::data_dir::TestDataDirGuard::new();
+        let nested_path = data.path().join("nested.cbz");
+        let directory_path = data.path().join("directory.cbz");
+        let mut inner = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        inner
+            .start_file("page.png", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        inner.write_all(b"nested image").unwrap();
+        let inner = inner.finish().unwrap().into_inner();
+        let mut nested = zip::ZipWriter::new(std::fs::File::create(&nested_path).unwrap());
+        nested
+            .start_file("chapter.zip", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        nested.write_all(&inner).unwrap();
+        nested.finish().unwrap();
+        let mut directory = zip::ZipWriter::new(std::fs::File::create(&directory_path).unwrap());
+        directory
+            .start_file(
+                "notes.zip/page.png",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        directory.write_all(b"directory image").unwrap();
+        directory.finish().unwrap();
+        let db =
+            crate::rating_db::RatingDb::open_at(&crate::rating_db::RatingDb::db_path()).unwrap();
+        for (path, member) in [
+            (&nested_path, "chapter.zip/page.png"),
+            (&directory_path, "notes.zip/page.png"),
+        ] {
+            let mut meta =
+                crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::ZipImage)
+                    .with_source_path(path);
+            meta.entry_name = Some(member.into());
+            db.set_user_rating(&format!("{}::{member}", path.display()), 4, Some(&meta))
+                .unwrap();
+        }
+        let mut settings = Settings::default();
+        settings
+            .file_type_visibility
+            .excluded_categories
+            .insert(crate::file_type_visibility::FileTypeCategory::Zip);
+        let engine = CollectionEngine::new(settings.clone());
+        let payload = engine
+            .rating(
+                &settings,
+                4,
+                crate::settings::SortOrder::Numeric,
+                CollectionSpreadRequest::default(),
+            )
+            .unwrap();
+        assert_eq!(payload.entries.len(), 1);
+        assert_eq!(payload.entries[0].path, directory_path.to_string_lossy());
+        assert_eq!(db.list_by_stars(4).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn remote_registration_lists_publish_legacy_cache_notice_and_restore_after_conversion() {
+        let data = crate::data_dir::TestDataDirGuard::new();
+        let (source, cached) = crate::archive_visibility::legacy_conversion_fixture(data.path());
+        let db =
+            crate::rating_db::RatingDb::open_at(&crate::rating_db::RatingDb::db_path()).unwrap();
+        let mut meta =
+            crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::ZipImage)
+                .with_source_path(&cached);
+        meta.entry_name = Some("root.jpg".into());
+        db.set_user_rating(&format!("{}::root.jpg", cached.display()), 4, Some(&meta))
+            .unwrap();
+        crate::book_bookmarks::load_all_from_disk().unwrap();
+        let conn = rusqlite::Connection::open(crate::book_bookmarks::db_path()).unwrap();
+        conn.execute("INSERT INTO book_bookmarks (id, container_key, container_path, container_kind, page_kind, page_value, page_key, page_index_hint, created_at_ms) VALUES (1, ?1, ?2, 'other_archive', 'archive_entry', 'root.jpg', 'root.jpg', 0, 1)", rusqlite::params![crate::book_bookmarks::container_key(&source), source.to_string_lossy()]).unwrap();
+        let mut settings = Settings::default();
+        settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("cbz".into());
+        let engine = CollectionEngine::new(settings.clone());
+        let expected =
+            crate::archive_visibility::ArchiveVisibilityNotice::LegacyConvertedCache.message();
+        for restored in [false, true] {
+            if restored {
+                crate::archive_visibility::regenerate_conversion_fixture(&source, &cached);
+            }
+            let rating = engine
+                .rating(
+                    &settings,
+                    4,
+                    crate::settings::SortOrder::Numeric,
+                    CollectionSpreadRequest::default(),
+                )
+                .unwrap();
+            let bookmarks = engine
+                .bookmarks(
+                    &settings,
+                    crate::settings::SortOrder::Numeric,
+                    CollectionSpreadRequest::default(),
+                )
+                .unwrap();
+            for payload in [rating, bookmarks] {
+                assert_eq!(payload.entries.len(), usize::from(restored));
+                assert_eq!(
+                    payload.visibility_notice.as_deref(),
+                    (!restored).then_some(expected)
+                );
+            }
+            assert_eq!(db.list_by_stars(4).unwrap().len(), 1);
+            assert_eq!(
+                crate::book_bookmarks::load_all_from_disk_readonly()
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+    }
 
     #[test]
     fn settings_family_quiescing_maps_to_collection_busy() {
@@ -2925,5 +3140,112 @@ mod tests {
             search_success(CollectionEngine::new(settings).favorite_search(search_request("book")));
         assert_eq!(payload.listing.entries.len(), 1);
         assert_eq!(payload.listing.entries[0].path, pdf.to_string_lossy());
+    }
+
+    #[test]
+    fn favorite_search_visibility_filters_hidden_zip_before_index_limit() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = data_dir.path().join("favorite");
+        std::fs::create_dir_all(&root).unwrap();
+        let pdf = root.join("zzz-book.pdf");
+        std::fs::write(&pdf, b"pdf").unwrap();
+        let mut indexed = (0..SEARCH_RESULT_LIMIT + 1)
+            .map(|n| {
+                let path = root.join(format!("aaa-book-{n:05}.zip"));
+                IndexEntry {
+                    display_name: path.file_name().unwrap().to_string_lossy().into_owned(),
+                    path,
+                    kind: IndexKind::ZipFile,
+                    mtime: 0,
+                }
+            })
+            .collect::<Vec<_>>();
+        indexed.push(IndexEntry {
+            path: pdf.clone(),
+            display_name: "zzz-book.pdf".into(),
+            kind: IndexKind::PdfFile,
+            mtime: 0,
+        });
+        let db = SearchIndexDb::open_at(&SearchIndexDb::db_path()).unwrap();
+        db.upsert_children(&root, &root, &indexed).unwrap();
+        let mut settings = Settings {
+            favorites: vec![favorite_with_container_index(root, true)],
+            ..Default::default()
+        };
+        settings
+            .file_type_visibility
+            .excluded_categories
+            .insert(crate::file_type_visibility::FileTypeCategory::Zip);
+        let payload =
+            search_success(CollectionEngine::new(settings).favorite_search(search_request("book")));
+        assert_eq!(payload.listing.entries.len(), 1);
+        assert_eq!(payload.listing.entries[0].path, pdf.to_string_lossy());
+        assert_eq!(db.total_count().unwrap(), indexed.len() as u64);
+    }
+
+    #[test]
+    fn tag_all_visibility_uses_filtered_scan_bound_for_late_visible_target() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let root = data_dir.path().join("favorite");
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = crate::tags_db::TagsDb::db_path();
+        drop(crate::tags_db::TagsDb::open_at(&db_path).unwrap());
+        let mut conn = rusqlite::Connection::open(&db_path).unwrap();
+        let tx = conn.transaction().unwrap();
+        {
+            let mut insert = tx.prepare(
+                "INSERT INTO item_tags(item_key,tag,tag_key,applied_at) VALUES (?1,'book','book',0)",
+            ).unwrap();
+            for n in 0..crate::tag_view::TAG_VIEW_RESULT_LIMIT + 1 {
+                let path = root.join(format!("aaa-book-{n:05}.zip"));
+                std::fs::write(&path, b"").unwrap();
+                insert
+                    .execute([crate::tags_db::item_key_for_path(&path)])
+                    .unwrap();
+            }
+            let pdf = root.join("zzz-book.pdf");
+            std::fs::write(&pdf, b"pdf").unwrap();
+            insert
+                .execute([crate::tags_db::item_key_for_path(&pdf)])
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        drop(conn);
+
+        let mut settings = Settings::default();
+        settings
+            .file_type_visibility
+            .excluded_categories
+            .insert(crate::file_type_visibility::FileTypeCategory::Zip);
+        assert_eq!(
+            tag_item_key_scan_limit(TagItemKind::All, &settings.file_type_visibility),
+            crate::tag_view::TAG_VIEW_FILTERED_KEY_SCAN_LIMIT,
+        );
+        assert_eq!(
+            tag_item_key_scan_limit(TagItemKind::All, &Default::default()),
+            crate::tag_view::TAG_VIEW_RESULT_LIMIT,
+        );
+        let db = crate::tags_db::TagsDb::open_readonly(&db_path).unwrap();
+        let engine = CollectionEngine::new(settings.clone());
+        let payload = engine
+            .tag_items_from_db(
+                &settings,
+                &db,
+                &tag_request("book"),
+                crate::settings::SortOrder::Numeric,
+            )
+            .unwrap();
+        assert_eq!(payload.listing.entries.len(), 1);
+        assert!(payload.listing.entries[0].path.ends_with("zzz-book.pdf"));
+        assert!(!payload.listing.truncated);
+        assert_eq!(
+            crate::tag_view::select_tag_view_item_keys(
+                &db,
+                "book",
+                crate::tag_view::TAG_VIEW_FILTERED_KEY_SCAN_LIMIT,
+            )
+            .len(),
+            crate::tag_view::TAG_VIEW_RESULT_LIMIT + 2,
+        );
     }
 }

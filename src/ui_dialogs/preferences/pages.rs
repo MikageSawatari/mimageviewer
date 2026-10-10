@@ -9090,6 +9090,110 @@ pub(super) fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
     });
 }
 
+pub(super) fn page_file_type_visibility(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    use crate::file_type_visibility::{FileTypeCategory, FileTypeVisibility, normalize_extension};
+    anchored(ui, state, "file-types/categories", |ui, state| {
+        ui.label("一覧に表示する種類を選んでください。");
+        ui.small(
+            "種類と拡張子の両方が許可された項目を表示します。フォルダ・ドライブは表示します。",
+        );
+        ui.small("評価・タグ・ブックマークなどの登録データは削除しません。");
+        egui::Grid::new("file_type_categories")
+            .num_columns(2)
+            .show(ui, |ui| {
+                for (index, category) in FileTypeCategory::ALL.into_iter().enumerate() {
+                    let mut visible = !state
+                        .settings
+                        .file_type_visibility
+                        .excluded_categories
+                        .contains(&category);
+                    if ui.checkbox(&mut visible, category.label()).changed() {
+                        if visible {
+                            state
+                                .settings
+                                .file_type_visibility
+                                .excluded_categories
+                                .remove(&category);
+                        } else {
+                            state
+                                .settings
+                                .file_type_visibility
+                                .excluded_categories
+                                .insert(category);
+                        }
+                    }
+                    if index % 2 == 1 {
+                        ui.end_row();
+                    }
+                }
+            });
+    });
+    ui.add_space(8.0);
+    anchored(ui, state, "file-types/extensions", |ui, state| {
+        ui.label("個別に非表示にする拡張子");
+        ui.small("例: png、cr2。別名拡張子は個別に指定します。");
+        ui.horizontal_wrapped(|ui| {
+            let input_width = 120.0_f32.min(ui.available_width().max(40.0));
+            crate::ime_focus::show_singleline(
+                ui,
+                &mut state.file_type_extension_input,
+                None,
+                |edit| edit.hint_text("拡張子").desired_width(input_width),
+            );
+            if ui.button("非表示に追加").clicked() {
+                match normalize_extension(&state.file_type_extension_input) {
+                    Ok(extension) => {
+                        state
+                            .settings
+                            .file_type_visibility
+                            .excluded_extensions
+                            .insert(extension);
+                        state.file_type_extension_input.clear();
+                        state.file_type_extension_error = None;
+                    }
+                    Err(error) => state.file_type_extension_error = Some(error),
+                }
+            }
+        });
+        if let Some(error) = state.file_type_extension_error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
+        let extensions: Vec<_> = state
+            .settings
+            .file_type_visibility
+            .excluded_extensions
+            .iter()
+            .cloned()
+            .collect();
+        let mut remove = None;
+        for extension in extensions {
+            ui.horizontal(|ui| {
+                ui.label(format!(".{extension}"));
+                if ui.small_button("表示する").clicked() {
+                    remove = Some(extension);
+                }
+            });
+        }
+        if let Some(extension) = remove {
+            state
+                .settings
+                .file_type_visibility
+                .excluded_extensions
+                .remove(&extension);
+        }
+    });
+    ui.add_space(8.0);
+    if ui.button("すべて表示に戻す").clicked() {
+        state.settings.file_type_visibility = FileTypeVisibility::default();
+        state.file_type_extension_error = None;
+    }
+    ui.small("OK で確定すると一覧を作り直します。検索結果・サブ展開は閉じます。");
+    ui.small(
+        "開いている本・再生中のメディアは終了まで継続します。登録・評価・タグは削除しません。",
+    );
+    ui.small("書庫の開封処理は「キャッシュ」の書庫・EPUB 設定に従います。");
+}
+
 pub(super) fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesState) {
     anchored(ui, state, "duplicate/archive-folder", |ui, state| {
         let s = &mut state.settings;
@@ -10356,10 +10460,7 @@ mod context_menu_layout_settings_tests {
 
     #[test]
     fn fit_cycle_subset_ui_keeps_the_last_mode_enabled() {
-        use egui_kittest::{
-            Harness,
-            kittest::{NodeT, Queryable},
-        };
+        use egui_kittest::kittest::{NodeT, Queryable};
         let mut settings = crate::settings::Settings::default();
         settings.fullscreen_fit_cycle_excluded = vec![
             "Page".into(),
@@ -10367,7 +10468,7 @@ mod context_menu_layout_settings_tests {
             "Height".into(),
             "SpecifiedScale".into(),
         ];
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(480.0, 300.0))
             .build_state(
                 |ctx, (settings, fonts_ready)| {
@@ -10412,14 +10513,14 @@ mod context_menu_layout_settings_tests {
 
     #[test]
     fn actual_settings_ui_scrolls_and_edits_move_hide_show_all_and_reset() {
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
         let state = (
             ContextMenuLayoutSettings::default(),
             ContextMenuPreviewScenario::GridImageWithDynamicApps,
             false,
         );
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(620.0, 420.0))
             .build_state(
                 |ctx, (layout, scenario, fonts_ready)| {
@@ -10775,6 +10876,53 @@ pub(super) fn page_susie_plugins(ui: &mut egui::Ui, state: &mut PreferencesState
     });
 }
 
+/// 本体とsnapshotで共用する描画。I/Oは提出後にworkerだけが行う。
+pub(super) fn draw_diagnostics_export(
+    ui: &mut egui::Ui,
+    view: &crate::diagnostics::ExportView,
+) -> (bool, Option<std::path::PathBuf>) {
+    use crate::diagnostics::ExportView;
+    let submit = ui
+        .add_enabled(
+            !matches!(view, ExportView::Running),
+            egui::Button::new("ログを zip にする"),
+        )
+        .clicked();
+    let mut open_folder = None;
+    match view {
+        ExportView::Running => {
+            ui.label("保存中…");
+        }
+        ExportView::Finished(Ok(saved)) => {
+            ui.add_space(6.0);
+            ui.colored_label(
+                egui::Color32::from_rgb(120, 200, 120),
+                format!("保存しました: {}", saved.path.display()),
+            );
+            if saved.evidence_incomplete {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    "証拠不完全: 一部のログが欠けています。残っているログを保存しました",
+                );
+            }
+            if let Some(parent) = saved.path.parent() {
+                if ui.button("保存先フォルダを開く").clicked() {
+                    open_folder = Some(parent.to_path_buf());
+                }
+            }
+        }
+        ExportView::Finished(Err(message)) => {
+            ui.add_space(6.0);
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("書き出しに失敗しました: {message}"),
+            );
+        }
+        ExportView::Idle => {}
+    }
+    (submit, open_folder)
+}
+
 /// 開発者 / 診断ページ。
 ///
 /// 普通の利用者が「再生できない」「重い」等の不具合をサポートに伝えるとき、
@@ -10796,34 +10944,12 @@ pub(super) fn page_developer(ui: &mut egui::Ui, state: &mut PreferencesState) {
         );
         ui.add_space(6.0);
 
-        if ui.button("ログを zip にする").clicked() {
-            // 利用者が明示的に押すボタンなので同期実行で問題ない
-            // (ログは通常数 MB、最大でも数十 MB で deflate 圧縮は速い)。
-            state.diag_export_result = Some(crate::diagnostics::export_diagnostics_zip());
+        let (submit, open_folder) = draw_diagnostics_export(ui, &state.diag_export_view);
+        if submit {
+            state.diag_export_submit = true;
         }
-
-        match &state.diag_export_result {
-            Some(Ok(path)) => {
-                ui.add_space(6.0);
-                ui.colored_label(
-                    egui::Color32::from_rgb(120, 200, 120),
-                    format!("保存しました: {}", path.display()),
-                );
-                let parent = path.parent().map(|p| p.to_path_buf());
-                if let Some(parent) = parent {
-                    if ui.button("保存先フォルダを開く").clicked() {
-                        open_in_explorer(&parent);
-                    }
-                }
-            }
-            Some(Err(msg)) => {
-                ui.add_space(6.0);
-                ui.colored_label(
-                    egui::Color32::from_rgb(230, 120, 120),
-                    format!("書き出しに失敗しました: {msg}"),
-                );
-            }
-            None => {}
+        if let Some(folder) = open_folder {
+            open_in_explorer(&folder);
         }
 
         ui.add_space(8.0);
@@ -10909,9 +11035,9 @@ mod tests {
     fn specified_scale_editor_off_on_discards_old_value_and_uses_percent_default() {
         use crate::settings::{FullscreenSpecifiedScale, SpecifiedScaleAxis};
         use eframe::egui;
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(300.0, 540.0))
             .build_state(
                 |ctx, (value, changed, fonts_ready)| {
@@ -10965,9 +11091,9 @@ mod tests {
     fn specified_scale_editor_unit_change_preserves_number_and_rounds_pixels() {
         use crate::settings::{FullscreenSpecifiedScale, SpecifiedScaleAxis};
         use eframe::egui;
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
-        let mut harness = Harness::builder()
+        let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(400.0, 540.0))
             .build_state(
                 |ctx, (value, fonts_ready)| {
@@ -11011,7 +11137,7 @@ mod tests {
     fn specified_scale_editor_numeric_text_keeps_valid_axis_values() {
         use crate::settings::{FullscreenSpecifiedScale, SpecifiedScaleAxis};
         use eframe::egui;
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
         for (axis, text, expected) in [
             (
@@ -11046,7 +11172,7 @@ mod tests {
             ),
         ] {
             let pixels = matches!(axis, SpecifiedScaleAxis::LogicalPixels(_));
-            let mut harness = Harness::builder()
+            let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(400.0, 520.0))
                 .build_state(
                     |ctx, (value, fonts_ready)| {
@@ -11101,11 +11227,11 @@ mod tests {
     fn specified_scale_editor_narrow_controls_remain_visible_and_clickable() {
         use crate::settings::{FullscreenSpecifiedScale, SpecifiedScaleAxis};
         use eframe::egui;
-        use egui_kittest::{Harness, kittest::Queryable};
+        use egui_kittest::kittest::Queryable;
 
         for width in [220.0, 280.0] {
             let size = egui::vec2(width, 640.0);
-            let mut harness = Harness::builder().with_size(size).build_state(
+            let mut harness = crate::test_ui::builder().with_size(size).build_state(
                 |ctx, (value, fonts_ready)| {
                     if !*fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);

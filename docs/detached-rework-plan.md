@@ -1526,6 +1526,73 @@ worker・保存境界は変更しない。既存popup ownerの描画とhitを揃
 IME input policy→App→`render_fullscreen_viewport`で全画面／popup継続を検証し、一時close漏れの
 mutationで検出力も確認する。製品述語・keyboard ownerは変更せず、説明文だけを利用者用語へ揃える。
 
+2026-10-09 §1.360: 利用者が独立設計再レビュー ACCEPT 済みの thumbnail-request-lifecycle-plan に従い、既存 ViewerContextBundle の requested・pending_finalize・CPU texture_backlog を一つの typed ThumbnailRequests owner に集約する。mount/unmount は画像と request ID を含む owner 全体を移動し、fork は in-flight を複製しない。park の画像破棄も同じ owner の画像側終端を通し、未終端 worker の保存完了を偽装しない。main の tray hide/restore は既存の対象範囲を維持し、兄弟 context の owner・channel・queue・世代・token に触れない。detached predicate・viewport・HWND・placement・park 発火条件・repaint scheduler は変更せず、表示状態から要求完了を推測していた所有境界を直す構造修正として §2 に適合する。設計担当の採用方針と独立 reviewer の合意は同 plan の §10 に記録されている。
+
+2026-10-09、§1.345 独立レビュー #1–#4 の修正では、閲覧中に延期した種類設定の再読込を
+既存 `apply_file_type_visibility_change` の source/return owner に戻す。Snapshot の通常reloadを
+変えず、閲覧終了後の設定適用が Q11 の元場所reloadを通る。新しい detached predicate、
+viewport 操作、待機flag、再描画guardは追加しない。旧スタック要求の取消も同じ設定適用ownerで行う。
+本内ブックマークの rows・container/採用済みpolicy key・ReadingRows/Projecting要求・編集draftを
+既存ViewerContextBundleへ所属させる（2026-10-09 coordinator決定(a)）。App上のfieldはmounted
+payloadの投影だけであり、App-global cacheや新しいcross-context registryは作らない。
+共有DB actorの応答は既存ContextRefでrequest id/containerを照合し、要求元だけ既存mountで
+処理する。workerのdrain/adoptもそのownerのitems generationと採用済みpolicyを照合する。
+通常のmount/depositはrows・要求・編集draftを保持し、退役はそのbundleのtyped requestをdropする。
+登録変更の失効は同じcontainerを投影するownerだけで行い、別本・別viewportの編集focus claimは保つ。
+格納中も完了できるcache workerなので、document-openのpark時に一括取消するowner群には追加しない。
+panelを閉じる簡素化は検討したが、既存の同時表示と採用済み読順を削減するため採用しない。
+同じ本を異なるpolicyで表示するMain/Detachedは各bundleのrowsと取消tokenを独立に保つ。
+利用者の独立レビュー修正指示と確定済み Q11/Q12 を実装範囲とし、Sol/xhigh の構造レビューも
+症状パッチでないことに事前合意した。投影resourceをitems/policyと同じ既存ownerへ移す変更であり、
+viewport述語・geometry・待機flag・delay・新しいrouting mapは追加しない。実機操作は未実施。
+
+**2026-10-08 §1.345 表示種類と一時 reader の所有者**
+
+合意済みの [表示種類 plan](file-type-visibility-plan.md) に従い、採用した一覧の
+`PreparedPageIdentityIndex` を items と同じ viewer context に保持する。通常 snapshot は
+既存 sidecar restore の worker / continuation で対応表だけを準備し、表示の再読込や
+metadata import は行わない。deferred fullscreen は対応表の採用後だけ継続する。
+
+除外中の画像・動画・音声を外部から明示して開く `DirectMedia` は、親一覧と一時 reader の
+対を既存 snapshot owner に保持する。materialized still と `LiveMediaPark` の共通 fork が
+成功した時点で、その対と採用済み対応表を実際の reader context へ移送し、main は元の
+表示種類を適用した親一覧へ戻す。次の source 要求を受け付けただけでは退役させず、既存の
+source 採用境界で移送・park 後に残る owner だけを終了する。これにより、再生中の窓を残す
+既存機能を維持し、同じ reader の owner を main と別窓へ重複させない。
+
+実装担当と独立 Sol / xhigh reviewer は、共通 fork / 採用境界への集約を実装前に確認した。
+これは items・対応表・snapshot の所有境界を揃える構造修正で、detached predicate、
+viewport / host / placement / geometry、公開・focus protocol を変更しない。新しい時間窓、
+待機 flag、retry、機能制限を追加しないため §2 の症状パッチに該当しない。
+設計担当による今回の実装差分の検収は未実施で、検収済みとは記録しない。
+
+同項目の回帰検証で、detached の画像フォルダ採用が「まだ fullscreen index がない」ことを
+失敗と判定する境界も確認した。通常の sidecar owner が持つ採用済み
+`AutoFullscreenFolder` continuation は、対応表準備を含む非同期初期表示要求の正本である。
+実装担当と独立 reviewer は、current context / source / items generation と live cancel token、
+`detached_physical` を照合したこの typed continuation を、物理フォルダ open と
+GridFolderCandidate の二つの採用結果で継続中として扱う修正へ実装前に合意した。
+準備終了時に読書位置の復元拒否や可視ページなしで初期ページを選べなかった場合は、
+既存の初回 open terminal へ一度だけ送る。新しい bool / pending や detached lifecycle の
+待機状態・outstanding 述語を増やさず、
+既存要求の採用と終了を対にする構造修正で、viewport / geometry / focus を変更しない。
+
+同じ確認で、Collection rootを別窓へ開くplanにも、generationを照合したrootの
+immutableページ対応表を必須で保持する。別窓に以前の対応表を残したまま行だけを
+交換しない。ZIP階層や固定一覧の対応表だけを準備する`IndexOnly`が切断した場合は、
+所有するdeferred openを破棄し、既存のnavigation失敗・fullscreen close・初回open
+terminalを使って終了する。旧fullscreen indexを新しい行に当てて別ページを表示せず、
+退避したSnapshotの対応表とDB記録は維持する。この失敗処理も構造レビューで合意した。
+
+同項目のlib回帰では、bookmarkの動画・音声fallbackが新規別窓を作る際も、
+対応表準備前のfullscreen indexを成功条件としていた。既存
+`start_active_detached_loading_context`へ集約し、DetachedPhysical scope、実window binding、
+準備中の公開と失敗時の破棄を共通ownerで行う。成功判定は、current context / source /
+items generation、live cancel、detached scope、exact media pathを照合した既存deferred要求を
+使い、最終表示は同じhydration ownerへ任せる。実装担当と独立Sol / xhigh reviewerは、
+実装前にこの構造へ合意した。新しいpendingやwindow predicateを足さず、
+video/audioのseek継続、既存窓再利用、Mainと退避した別窓の内容を維持する。
+準備worker切断は公開した窓だけを既存の初回open terminalで閉じる。
 2026-10-09 master統合後の一覧公開境界修正: 利用者指定の構造修正として、Bookmark一覧buildをmainの既存Surface lease・switch sequenceで所有し、mainの成功したitems交換だけが旧buildを退役させる。detached contextのmount・items交換・pollはmainのbuildを退役も採用もしない。同じBookmarkのsortは要求ownerを継続し、A/B記憶クリアは新epochで既存refreshを再開始する。Ctrl+Fの完了filterは送信済み条件を一緒に保持し、ViewerContextBundleの既存swap/park/dropとSmart退避で一緒に運ぶ。新しいdetached predicate・viewport・placement・待機・retry・pending ownerを設けず、公開先の所有証明と既存payloadの未接続を直すため、§2の症状パッチに当たらない。
 
 2026-10-09 §1.355追加修正: Coordinator指定の構造修正として、別窓bookmarkの既存startup resolve workerからtyped RAR header証明を採用境界へ運び、cache hit前に後続巻を拒否する。DFSも同じ証明で候補から除外する。新しいdetached predicate／viewport／待機／retryを作らず、既存requestの取消・held-owner再開・context所有を保つ。旧cacheの直接採用が共通の開封不変条件を迂回していた根因を入口ownerで直すため、§2の症状パッチに当たらない。
@@ -4304,3 +4371,44 @@ production 呼出し拒否を維持する。新しい状態や runtime 経路は
 関連 lib の `resume_meter` 75 件 / `rar_` 96 件 / `effetune` 85 件成功。
 `cargo fmt --check`、通常 / portable core check、`git diff --check` 成功。
 全変更ファイルの CRLF を維持し、製品起動・コミットは行っていない。
+
+
+### 2026-10-09 v4.5.0 master と §1.345 の統合
+
+利用者指定のmergeでは、出荷済み§1.339のmain専用facet/adoption proof、
+BookmarkBrowserBuildのSurface lease・switch sequence、§1.355のtyped RAR header証明を保持する。
+§1.345の本内bookmark rows・policy key・request・draftとページ対応表は既存の
+ViewerContextBundleで引き続きswap/park/dropし、mainの全体bookmark buildとは共有しない。
+全体buildの既存結果に登録総数・可視性通知・音声sidecar mapを揃え、採用成功後に公開する。
+親移動のキーと背景操作はmasterの共通入口を使い、その入口へ§1.345の既存direct-reader退役を接続する。
+新しいcontext registry、detached述語、viewport/placement、待機・retryを追加しない。
+実装担当と独立Sol / xhigh reviewerは、既存ownerを保つ統合であり§2の症状パッチではないと合意した。
+viewer_context_auditはmasterの規則・既知項目ゼロを保持し、§1.345の四つの読み取り専用ContextRef APIの
+fingerprintだけを用途を説明して追加する。新しいmutating APIを包括的に許可しない。
+
+同じ統合テストで、閲覧履歴loading shellのidentity準備中にsource worker応答を回収すると、
+masterの`prepare_visible_install`がbusyで拒否した後に応答を失うことを確認した。
+既存consumerはcontext/items世代/switch sequenceの失効を先に確認し、その後は既存sidecar ownerの
+準備中に受信せず、同じPendingに応答を保持する。準備終了後に一度だけhydrateする。
+masterの採用拒否境界は維持し、bool・registry・retryを追加しない処理順の接続として、
+実装担当と独立Sol / xhigh reviewerが構造面で合意した。回帰は準備中の応答保持、
+行・map・surface世代の未変更、準備完了後の同じsurfaceへの採用を本番consumerで検証する。
+
+空のloading shellからの即時ナビゲーションも出荷版のまま保つ。
+共通`begin_sidecar_restore`は、既存ownerのbusy判定後、`items.is_empty() && !restore_sidecar`
+ならI/Oの不要な`empty(policy)`を同期確定し、既存display continuationへ進む。
+特定pathを例外化せず、空でもsidecar復元対象なら元の復元手順を維持する。
+独立Sol / xhigh reviewerは、採用済み入力の同期処理であり継続の義務を失わない構造と確認した。
+受信延期の回帰は既存の`prepare_current_listing_page_identity_index`を同じshellに開始して実際の
+準備中を作り、保留応答の保持とその後の一度だけの採用を確認する。出荷版の即時reselect回帰も保持する。
+
+### 2026-10-10 §1.360 と master / §1.345 / next-qa の統合
+
+利用者指定のmergeで、§1.345のsidecar・可視性projectionとページidentity ownerを保持し、
+サムネイル要求は§1.360のcontext-local `ThumbnailRequests`へ集約する。
+live-park復元のitems世代更新は同じownerで要求・CPU画像を退役させ、削除済みの分散状態を再導入しない。
+可視性で除外されたarchive pinのfallbackは元要求のrow・request ID・items世代・入力sequence・
+context epoch・優先度を継承し、元contextへ一度だけ画像とworker終端を返す。
+QAのcache-read witnessは相関済み画像の受理時に記録し、進捗は既存の通常要求projectionとkeep内画像から導出する。
+detached述語・viewport生成・placement・focus・registry protocolは変更しない。
+これは両側の既存ownerを保持する統合であり、新しい待機状態・retry・時間窓を追加しない。

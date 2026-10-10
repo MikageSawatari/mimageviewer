@@ -70,7 +70,19 @@ pub struct ThumbnailClient {
     next_request_id: AtomicU64,
     next_connection_id: AtomicU64,
     remote_web_info: Mutex<Option<RemoteWebConnectionInfo>>,
+    #[cfg(test)]
+    source_read_test_handler: Mutex<Option<SourceReadTestHandler>>,
 }
+
+#[cfg(test)]
+type SourceReadTestHandler = Arc<
+    dyn Fn(
+            &RemoteSessionIdentity,
+            &RemoteAddress,
+        ) -> mimageviewer_ipc::SourceReadEligibilityResponse
+        + Send
+        + Sync,
+>;
 
 pub struct ConnectionMaintainer {
     stop: Arc<AtomicBool>,
@@ -309,6 +321,8 @@ impl ThumbnailClient {
             next_request_id: AtomicU64::new(1),
             next_connection_id: AtomicU64::new(1),
             remote_web_info: Mutex::new(None),
+            #[cfg(test)]
+            source_read_test_handler: Mutex::new(None),
         }
     }
 
@@ -821,6 +835,60 @@ impl ThumbnailClient {
                     "response_type_mismatch",
                     None,
                     "tag items request received another response type",
+                )),
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+            }),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_source_read_test_handler(&self, handler: SourceReadTestHandler) {
+        *self.source_read_test_handler.lock().unwrap() = Some(handler);
+    }
+
+    pub fn source_read_eligibility(
+        &self,
+        owner: &RemoteSessionIdentity,
+        address: RemoteAddress,
+    ) -> Result<(), ClientFailure> {
+        #[cfg(test)]
+        if let Some(handler) = self.source_read_test_handler.lock().unwrap().clone() {
+            return match handler(owner, &address) {
+                mimageviewer_ipc::SourceReadEligibilityResponse::Success => Ok(()),
+                mimageviewer_ipc::SourceReadEligibilityResponse::Error(error) => {
+                    Err(ClientFailure {
+                        error: ClientError::MediaRemote(error),
+                        retry_count: 0,
+                        retry_statuses: Vec::new(),
+                    })
+                }
+            };
+        }
+        self.collection_request(|id| ClientMessage::SourceReadEligibility {
+            id,
+            owner: owner.clone(),
+            address: address.clone(),
+        })
+        .and_then(|success| match success.value {
+            ServerMessage::SourceReadEligibility {
+                response: mimageviewer_ipc::SourceReadEligibilityResponse::Success,
+                ..
+            } => Ok(()),
+            ServerMessage::SourceReadEligibility {
+                response: mimageviewer_ipc::SourceReadEligibilityResponse::Error(error),
+                ..
+            } => Err(ClientFailure {
+                error: ClientError::MediaRemote(error),
+                retry_count: success.retry_count,
+                retry_statuses: success.retry_statuses,
+            }),
+            _ => Err(ClientFailure {
+                error: ClientError::Protocol(protocol_failure(
+                    "response_route",
+                    "response_type_mismatch",
+                    None,
+                    "source read eligibility received another response type",
                 )),
                 retry_count: success.retry_count,
                 retry_statuses: success.retry_statuses,
@@ -2779,6 +2847,7 @@ mod tests {
 
         let client = Arc::new(ThumbnailClient {
             pipe_name,
+            source_read_test_handler: Mutex::new(None),
             connection: Mutex::new(None),
             next_request_id: AtomicU64::new(1),
             next_connection_id: AtomicU64::new(1),

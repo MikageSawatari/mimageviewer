@@ -7,14 +7,27 @@
 
 ### 音声セルの代表画像 (§1.347、2026-10-08)
 
+同名補助画像の採用は表示行の種類投影から独立している。画像種類を隠しても既存の候補順で
+選んだ表紙／動画sidecarを維持する。通常／Remoteは一覧sort、Smart／集約は既存走査順を使い、
+候補mapを表示画像で上書きしない（[候補採用規則](audio-album-art-plan.md)）。
+
+
 Audio は既存 worker / texture backlog に乗り、同名 sidecar → MP3 先頭 ID3v2 の前面表紙優先 → 音楽アイコンの順で表示する。`ThumbnailState::NoArt` は正常終端で、Failed とともに一覧世代内では再投入・hover repaint を続けない。Loaded の画像寸法を Auto 比率へ使い、画像のない音声を分母から除く。全音声が終端なら Auto 未確定も現在の比率で終わる。
 
-`ThumbMsgPayload` が Pixels / NoArt / Failed / Canceled / Finalized を一つに所有する。Audio は保存完了後に一通知を送り、既存の他媒体の Finalized 通知は維持する。音声マークは `AudioThumbnailIndicator` の音楽アイコン (既定) / 文字バッジ / なし。画像なしではどの設定でも音楽アイコンを描く。音声を補正対象の画像ページにせず、再生画面・入力操作は保持する。[詳細設計](audio-album-art-plan.md)。
+`ThumbMsgPayload` が Pixels / SourcePixels / ProvisionalPixels / NoArt / Failed / Canceled / Finalized を一つに所有する。Audio は保存完了後に終端 Pixels または画像なし終端を一通知で送り、source生成の二通知契約とは分ける。音声マークは `AudioThumbnailIndicator` の音楽アイコン (既定) / 文字バッジ / なし。画像なしではどの設定でも音楽アイコンを描く。音声を補正対象の画像ページにせず、再生画面・入力操作は保持する。[詳細設計](audio-album-art-plan.md)。
 
 
 ## 1. サムネイル表示パイプライン
 
 ### 1.1 状態機械
+
+表示状態と要求の寿命は別である。context-local な `ThumbnailRequests` が request ID / items
+generation・要求種別・未採用CPU画像を一体で所有し、sourceは `SourcePixels` の採用/破棄と
+workerの保存/保存省略終端 `Finalized` の両方まで再要求を拒否する。cache / Audio / video /
+直接画像の `Pixels` は採用/破棄だけで終了する。ドライブの `ProvisionalPixels` は検証終端を待つ。
+Pending / Evicted / Loaded高画質化の表示状態から終端を推測しない。
+uploadは既存の8枚/frameを維持し、範囲外動画はGridが採用、Rendition consumerが破棄する。
+hideのCPU画像解放も同ownerのdiscardを通す。[寿命計画と検証](thumbnail-request-lifecycle-plan.md)。
 
 `GridItem` 1 個につき 1 つの `ThumbnailState` (grid_item.rs) を持つ:
 
@@ -467,10 +480,10 @@ keep へ入れてから要求し、次の投影は現在の membership と実パ
 navigation / bookmark の ensure は既存 bbox と union してから worker へ公開する。
 離れた still seek ページは bbox を広げず、従来の exact set で読み込みを許可する。
 
-最後の利用元が離れたページだけを退去し、未処理キューやUI側のbacklog / finalize待ちから
-実際に取り除いた要求の `requested` を解除する。worker が既に pop して処理中の要求は、結果・cancel・error・finalized の
-既存通知で終える。`SourceGenerated` は画像到着後に Loaded となっても cache 確定通知まで
-requested を保持し、同じページの重複 decode を防ぐ。
+最後の利用元が離れたページだけを退去する。lock下で実行前queueから除いた一致するrequest IDは
+局所取消で終了する。未採用source画像のkeep外破棄は画像側終端だけであり、保存終端まで予約を残す。
+workerが既にpopした要求は相関済みの通知と画像採用/破棄で終える。VideoBatchの画像はkeep投影で
+捨てず、既存Grid / Rendition消費policyに渡す。世代・source失効だけが旧request namespaceを退役させる。
 
 しおり候補照合は loaded bookmark の typed HashSet と keep 候補を使い O(B+K) に留める。
 フォルダ本の適格性に必要な全画像分類は既存 `ViewerNavigationCaches` の context / source 世代で

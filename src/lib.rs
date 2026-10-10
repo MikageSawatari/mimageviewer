@@ -21,6 +21,11 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#[cfg(test)]
+#[path = "../tests/support/ui_harness.rs"]
+pub(crate) mod test_ui;
+mod wgpu_backend_policy;
+
 pub mod activity_gate;
 pub mod adjustment;
 pub mod adjustment_db;
@@ -49,6 +54,7 @@ pub use ui_dialogs::settings_restore::draw_preferences_transfer_disabled_entry_s
 pub use ui_dialogs::settings_restore::draw_preferences_transfer_entry_snapshot_fixture;
 pub mod archive_cache;
 pub mod archive_converter;
+pub mod archive_origin;
 pub(crate) mod audio_album_art;
 pub mod audio_decode;
 pub mod audio_normalize_db;
@@ -97,6 +103,7 @@ pub mod dwm_iconic_thumbnail;
 #[cfg(windows)]
 pub mod dwm_transitions;
 mod empty_items_reason;
+pub mod file_type_visibility;
 mod fullscreen_specified_scale;
 mod gpu_anime4k;
 mod gpu_lanczos;
@@ -182,7 +189,10 @@ pub mod local_adjust_catalog;
 pub mod local_adjust_db;
 pub mod local_adjust_effect_ui;
 pub(crate) mod local_adjust_write_worker;
+pub(crate) mod log_writer;
 pub mod logger;
+#[doc(hidden)]
+pub use ui_dialogs::preferences::draw_diagnostics_export_snapshot_fixture;
 mod manual_mask_tools;
 pub mod margin_fit;
 pub mod mask_db;
@@ -521,8 +531,7 @@ fn install_panic_log_hook() {
             .unwrap_or_else(|| "unknown location".to_string());
         let bt = std::backtrace::Backtrace::force_capture();
         let msg = format!("PANIC at {location}: {payload}\n{bt}");
-        logger::log(&msg);
-        append_panic_log_entry(&msg);
+        write_critical_diagnostic(&msg, append_panic_log_entry, |message| logger::log(message));
     }));
 }
 
@@ -533,6 +542,15 @@ const MAX_PANIC_LOG_BYTES: u64 = 4 * 1024 * 1024;
 
 fn append_panic_log_entry(msg: &str) {
     let log_dir = data_dir::logs_dir();
+    append_panic_log_entry_in(&log_dir, msg);
+}
+
+fn write_critical_diagnostic(message: &str, direct: impl FnOnce(&str), normal: impl FnOnce(&str)) {
+    direct(message);
+    normal(message);
+}
+
+fn append_panic_log_entry_in(log_dir: &std::path::Path, msg: &str) {
     let _ = std::fs::create_dir_all(&log_dir);
     let panic_log = log_dir.join("panic.log");
     // 追記前にサイズを確認し、上限超過なら panic.log -> panic.log.bak へ
@@ -576,8 +594,9 @@ fn install_ui_heartbeat_watchdog() {
                 std::thread::sleep(Duration::from_secs(1));
                 #[cfg(windows)]
                 for message in crate::video::native_window_health::poll_native_window_watchdogs() {
-                    crate::logger::log(message.clone());
-                    append_panic_log_entry(&message);
+                    write_critical_diagnostic(&message, append_panic_log_entry, |message| {
+                        crate::logger::log(message)
+                    });
                 }
                 let now_ms = state.start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                 if state.suspended.load(Ordering::Acquire) {
@@ -1007,6 +1026,22 @@ fn exit_startup(code: i32) -> ! {
     } else {
         miv_startup::Outcome::Error
     });
+    exit_with_logs(code)
+}
+
+/// Final boundary only: all runtime producers have already stopped. Both
+/// writers share one total deadline; blocked file owners are never joined.
+pub fn finish_logs() {
+    static DEADLINE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let deadline =
+        *DEADLINE.get_or_init(|| std::time::Instant::now() + std::time::Duration::from_secs(2));
+    logger::log("logging shutdown requested");
+    let _ = log_writer::shutdown_until(deadline);
+    let _ = miv_startup::shutdown_until(deadline);
+}
+
+pub(crate) fn exit_with_logs(code: i32) -> ! {
+    finish_logs();
     std::process::exit(code)
 }
 
@@ -1256,6 +1291,16 @@ pub fn run() -> eframe::Result {
     let perf_enabled = std::env::args().any(|a| a == "--perf-log" || a == "--perf-log-path")
         || perf_log_path.is_some();
     perf::init_with_path(perf_enabled, Some(prog_start), perf_log_path);
+    #[cfg(all(feature = "test-script", windows))]
+    if test_script_path.is_some() {
+        if let Some(directory) = test_evidence_dir.as_deref() {
+            if let Err(error) = test_script::release_checks::arm_startup(directory) {
+                write_to_parent_console(&format!("error: {error}\n"));
+                entry_trace.finish(miv_startup::Outcome::Error);
+                exit_startup(2);
+            }
+        }
+    }
 
     // WASAPI can take over a second to create the first output stream on a cold
     // boot. Warm it in the background so the first video open does not freeze
@@ -1477,8 +1522,8 @@ pub fn run() -> eframe::Result {
     // wgpu 既定のスコアリングでは Vulkan が DX12 より優先選択される環境があるため、
     // カスタムアダプタセレクタで明示的に DX12 アダプタを最優先する。DX12 が無ければ
     // Vulkan、それも無ければ任意の adapter を返す (eframe / egui 自体は描画される)。
-    // 動画 GPU 経路は実行時に `cc.wgpu_render_state.adapter.get_info().backend` を見て
-    // DX12 のときだけ有効化、Vulkan ならスキップして CPU readback で再生する。
+    // native video は独立した D3D11 device、HUD は別の DX12 Instance を使い、
+    // root GUI の選択 backend に依存しない。
     let mut wgpu_options = egui_wgpu::WgpuConfiguration::default();
     configure_wgpu_presentation(&mut wgpu_options);
     wgpu_options.startup_diagnostics = Some(Arc::new(|event| {
@@ -1529,7 +1574,7 @@ pub fn run() -> eframe::Result {
         }
     }));
     if let egui_wgpu::WgpuSetup::CreateNew(create_new) = &mut wgpu_options.wgpu_setup {
-        create_new.instance_descriptor.backends = wgpu::Backends::DX12 | wgpu::Backends::VULKAN;
+        create_new.instance_descriptor.backends = wgpu_backend_policy::native_backends();
         create_new.native_adapter_selector = Some(std::sync::Arc::new(
             |adapters: &[wgpu::Adapter], _surface: Option<&wgpu::Surface<'_>>| {
                 if let Some(a) = adapters
@@ -1775,11 +1820,8 @@ pub fn run() -> eframe::Result {
             if let Some(rs) = cc.wgpu_render_state.clone() {
                 #[cfg(windows)]
                 {
-                    // 実際に選ばれた wgpu バックエンドを確認。動画 GPU 経路は
-                    // `wgpu_hal::api::Dx12` 経由で D3D11 NT shared texture を
-                    // import するので **DX12 でないと使えない**。Vulkan
-                    // (= リモートデスクトップ等の fallback) では GPU video device を
-                    // 作らず CPU readback + swscale 経路にフォールバックする。
+                    // root GUI の backend を診断用に記録する。native video の
+                    // 独立した D3D11 device 作成を、この値で制限しない。
                     let backend = rs.adapter.get_info().backend;
                     crate::logger::log(format!("wgpu backend selected: {backend:?}"));
                     // GpuVideoDevice は wgpu backend に依存せず独立した D3D11 device を
@@ -1880,6 +1922,7 @@ pub fn run() -> eframe::Result {
         } else {
             miv_startup::Outcome::Error
         });
+        finish_logs();
         test_script::exit_after_run_native();
     }
     miv_startup::terminal(if run_result.is_ok() {
@@ -1887,6 +1930,7 @@ pub fn run() -> eframe::Result {
     } else {
         miv_startup::Outcome::Error
     });
+    finish_logs();
     run_result
 }
 
@@ -1903,7 +1947,7 @@ fn run_trt_smoke_test() -> ! {
         }
         Err(e) => {
             eprintln!("[smoke] start failed: {e}");
-            std::process::exit(1);
+            exit_with_logs(1);
         }
     };
 
@@ -1917,7 +1961,7 @@ fn run_trt_smoke_test() -> ! {
             Ok(ms) => println!("[smoke] LoadModel {:?} OK in {ms} ms", kind),
             Err(e) => {
                 eprintln!("[smoke] LoadModel {:?} failed: {e}", kind);
-                std::process::exit(1);
+                exit_with_logs(1);
             }
         }
     }
@@ -1937,7 +1981,7 @@ fn run_trt_smoke_test() -> ! {
             );
             if out.len() != expected_total {
                 eprintln!("[smoke] FAIL: output len mismatch");
-                std::process::exit(1);
+                exit_with_logs(1);
             }
             // ゼロ入力の anime6b 出力は数値的にゼロ近傍のはず。
             // 値域 [0,1] (× 255 で 0-255 にスケール) で大きく外れていないかチェック。
@@ -1947,14 +1991,14 @@ fn run_trt_smoke_test() -> ! {
         }
         Err(e) => {
             eprintln!("[smoke] Infer failed: {e}");
-            std::process::exit(1);
+            exit_with_logs(1);
         }
     }
 
     println!("[smoke] shutdown (Drop)");
     drop(pool);
     println!("[smoke] all OK");
-    std::process::exit(0);
+    exit_with_logs(0);
 }
 
 fn parse_window_size_arg() -> Option<[f32; 2]> {
@@ -2120,6 +2164,47 @@ mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
 
+    #[test]
+    fn panic_and_watchdog_direct_log_remains_independent_of_full_stalled_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let writer = crate::log_writer::test_support::writer(directory.path(), 1, 65536);
+        let pause = writer.pause_write();
+        assert!(writer.submit_normal("occupy queue budget during disk stall"));
+        pause.entered();
+        let root = directory.path().to_owned();
+        let producer = writer.clone();
+        let (finished, received) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let unwind = std::panic::catch_unwind(|| {
+                write_critical_diagnostic(
+                    "PANIC witness",
+                    |message| append_panic_log_entry_in(&root, message),
+                    |message| {
+                        assert!(!producer.submit_normal(message));
+                    },
+                );
+                panic!("isolated panic fixture");
+            });
+            assert!(unwind.is_err());
+            // The UI-hang watchdog uses this direct sink without the general queue.
+            append_panic_log_entry_in(&root, "UI THREAD HANG witness");
+            finished.send(()).unwrap();
+        });
+        let complete = received
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .is_ok();
+        let direct = std::fs::read_to_string(directory.path().join("panic.log")).unwrap();
+        drop(pause);
+        thread.join().unwrap();
+        assert!(
+            complete,
+            "critical diagnostics waited on the general writer"
+        );
+        assert!(direct.contains("PANIC witness"));
+        assert!(direct.contains("UI THREAD HANG witness"));
+        assert!(writer.shutdown());
+    }
+
     fn os_args(args: &[&str]) -> Vec<OsString> {
         args.iter().map(OsString::from).collect()
     }
@@ -2192,7 +2277,11 @@ mod tests {
     }
 }
 
+pub use ui_dialogs::preferences::draw_file_type_visibility_snapshot_fixture;
 pub use ui_dialogs::preferences::{
     draw_fullscreen_fit_cycle_settings, draw_fullscreen_specified_scale_live_settings,
     draw_fullscreen_specified_scale_settings,
 };
+pub use ui_main::draw_file_type_visibility_status_snapshot_fixture;
+
+pub(crate) mod archive_visibility;
