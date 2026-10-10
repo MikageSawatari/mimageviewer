@@ -2033,8 +2033,9 @@ replayから現在の指定値や新しいraster寸法を後読みしない。
 見開きは既存高さ合わせと仮想slotを維持し、2枚＋gap全体をfitする。幅指定が極小なら表示だけ
 `gap = min(saved_gap, max(0, specified_width - 1/ppp))` とし、保存gapを書き換えない。
 連結の `ContinuousSpecifiedFitReference` は選択 / 明示値変更時の中央unitを保持し、scrollで
-基準を替えない。同じunitの確定済みgeometryは元texture / 派生cache退去後も保持し、
-参照unit自身の配置にも使う。resize / DPIでは同じunitへ再計算し、手動zoomは保持する。可視枚数上限では
+基準を替えない。同じunitの確定済みAI前・非回転の元寸法は元texture / 派生cache退去後も保持する。
+現在のtrim / rotationからgeometryを各layoutで再解決し、fitと参照unit自身の配置に同じ値を使う。
+解決済みbboxを退去時の値に固定しない。resize / DPIでは同じunitへ再計算し、手動zoomは保持する。可視枚数上限では
 既存の遠いunit描画除外を使い、新方式のfit / fs_zoomを変更しない。旧4方式のper-unit fitと
 可視上限時のauto zoomは維持する。
 

@@ -878,3 +878,64 @@ snapshot画像を変更せず、指定サイズの狭幅表示を目視確認し
 `.\scripts\build-dev.ps1 -PreserveRuntime` もexit 0で完了した。別worktreeのnative build完了を
 待って通常featureの確認用runtimeを配置し、稼働プロセスを停止せず製品も起動しなかった。
 修正の実機手順は `target/E-1342-hardware-check.md` の追加確認を参照する。
+
+## 17. 退去後の明示trim変更と参照入力の分離（2026-10-10）
+
+独立再レビューのP2を確認し、指摘に同意した。§16で保持したgeometryには古いbboxと回転・
+高さ合わせ済み寸法が含まれ、実退去後の「本全体」trim変更に追従しなかった。
+単に参照をresetすると選択時のunitを失うため、その案は採用しない。
+
+既存 `ContinuousSpecifiedFitReference::Specified.base` の確定値を、非回転・AI前の正規化原寸
+`sources[].size` と現在の解決結果 `resolved` を一組で持つ型へ置き換える。新しい保存先や
+独立したpending / boolを設けない。取得済み元寸法だけを退去後も保持し、共有の
+`continuous_unit_base_size` に渡して現在のtrim・回転・分割bbox・高さ合わせを再解決する。
+解決結果はlayout準備で一度作り、fitと参照unitの配置が共有する。新しいUI同期I/Oはない。
+モーダル化でtrim変更を禁止する案は既存の閲覧中編集を損なうため採用しない。
+
+| 参照ページ退去中に変わる入力 | 現在の解決／再選択境界 |
+| --- | --- |
+| 本全体／ページ個別の表示trim | `ui_view_trim.rs` の既存scope値とreanchorを維持。次のlayoutで現在の `view_trim_single_content_bbox / view_trim_spread_content_bboxes` を保持元寸法へ適用する。scroll再anchorだけで古いbboxを残さない |
+| 自動トリムの検出入力 | 画素から既に検出したsource座標のraw bboxも同じsource recordへ保持する。手動設定bbox・左右調停後bbox・回転済bboxを保持入力にしない。現在のAuto／Manual policyで毎layout解決し、画素があるときは既存detectorのload sequence／pixel pointer検証から結果を更新する |
+| 保存回転・回転一括reset | `app.rs::set_image_rotation / apply_rotation` とrotation cacheを使用。毎layoutで非回転原寸へ現在の回転を適用し、連結の回転ページはtrimを落とす既存例外を維持する。構成unitが変われば既存の中央unit選択へ戻る |
+| 左右分割・見開き構成 | `apply_fullscreen_spread_mode` が既存連結ownerを終端し、`build_presentation_steps_for_nav / continuous_reading_units_and_pos` が新しいhalf / pairを作る。新構成の現在の中央unitからfitを解く |
+| 見開き端のslot・白slot設定 | `invalidate_singleton_spread_placement_display` の既存resetとcompositionを使い、実ページ＋仮想slotの新構成で中央unitを選び直す |
+| 指定値・原寸制限・fit方式の明示編集 | 既存live setter／fit設定入口とpolicy比較が中央unitを選び直す。古いunit・指定値のgeometryを使わない。§16のlive共通値の保存境界は維持する |
+| viewport resize / DPI / UI倍率・gap | 同じ参照unitの元寸法へ現在のimage rect、ppp、実効gap、5倍上限を適用する。resizeだけでは参照unitを選び直さず、手動zoomを保持する |
+| index remap / source交換・削除 | 同じsourceを保つ純粋なindex remapは元寸法とpresentation順を保持し、occurrenceを対応付け直す。sourceの削除・交換は既存source失効ownerで参照を終端する |
+
+未確定の新しいunitは既存どおり元寸法到着を待つ。構成／policy編集で新しい中央unitを選ぶ場合に、
+古い参照ページの元寸法を別ページへ流用しない。保持元寸法は同じcontext・参照unitにだけ属し、
+別contextのcache・worker・設定を変更しない。
+
+回帰は寸法fallbackなしの実prefetch退去→本全体trim変更／参照ページ再入場時の個別trim変更→
+同じlayoutを通す。縦／横連結・単ページ／見開きでfit倍率とbboxを確認する。
+実退去後の回転・分割・slot・指定値・resize / DPI、および純粋remapも確認し、
+§16の通常退去・live共通値保存回帰を保持する。結果は `target/E-1342-fix2-msg.txt` に記録する。
+利用者の実機確認中につき、`scripts/build-dev.ps1` は実行せず `target/dev-runtime` へ書き込まない。
+
+横断確認では `cached_margin_bbox` が画素未取得時に結果を破棄するため、Autoを単純に再読込すると
+通常退去の倍率保持が退行することも確認した（実検出→実退去のredでは1.6339871→1.0）。
+参照source recordの既知検出結果を入力として保持し、共有geometry入口で現在のAuto policy・
+左右調停・rotationを適用する。Manual切替では現在の設定を使い、Autoへ戻してもManual bboxを
+自動検出結果へ流用しない。新しい画素がある場合は既存detector／cacheの検証を使い、
+異なるload sequence／pixel pointerの古い検出を持ち越さない。既存4方式や検出cacheの破棄規則は変えない。
+実退去→Auto保持→Manual→Auto→新画素での再検出の回帰を追加した。
+この追加確認のため最初の全libを中断し、最終差分で全件を再実行する。中断を製品test失敗とは数えない。
+
+別窓のAutoは既存のwindow identityに対応するruntimeの既知検出結果を優先する。
+画素がない場合も、runtimeの受理済みbbox（既知の「trimなし」を含む）を退去用入力で覆わない。
+既存のread-only getterへ接続し、runtimeの検出・保存・失効ownerは変えない。
+実退去した入力を持つ別contextをmountする回帰で、runtimeのbbox変更とtrimなし、および
+main参照／trim状態の不変を確認する。この横断確認後の最終差分で全libを実行し直す。
+
+最終検証: 焦点延べ **205件**（specified 69、continuous_reading 21、view_trim 48、fit_cycle 4、
+settings_transfer 20、displayed_image_transform 43。重複あり）、全lib **11,476成功 / 52 ignore /
+0失敗**、ui_snapshot **143成功**、viewer context監査テスト **36成功** と実監査がexit 0。
+`cargo fmt --check`、glyph lint（危険glyph 0）、通常 / portable core checkもexit 0。
+レビュー関連6件には既存の実退去保持・live保存回帰を含む。修正前失敗は
+`target/E-1342-fix2-red.log` と `target/E-1342-fix2-auto-red.log` に保存した。
+最終全libの前に中断した2回は途中ログを分離し、上記の完走結果とは区別する。
+snapshot画像を変更せず、指定サイズの通常幅・狭幅を目視確認した。今回の差分の独立再レビュー・
+実機確認・commitは未実施。利用者指示により確認用buildを作らず、`target/dev-runtime` は変更しない。
+次のbuild向けの追加実機手順は `target/E-1342-hardware-check.md`、全結果と変更範囲は
+`target/E-1342-fix2-msg.txt` に記録する。

@@ -8157,8 +8157,25 @@ pub(crate) enum ContinuousSpecifiedFitReference {
         unit: ContinuousReadingUnitSpec,
         settings: crate::settings::FullscreenSpecifiedScale,
         limits: FullscreenFitScaleLimits,
-        base: Option<ContinuousReadingUnitSize>,
+        base: Option<ContinuousSpecifiedFitReferenceBasis>,
     },
+}
+
+/// One confirmed input/output pair: source dimensions survive eviction, while
+/// resolved geometry is refreshed from current trim/rotation on each layout pass.
+#[derive(Clone, Debug)]
+pub(crate) struct ContinuousSpecifiedFitReferenceBasis {
+    /// Unrotated, pre-AI normalized originals in the unit's presentation order.
+    sources: Vec<ContinuousSpecifiedFitReferenceSource>,
+    resolved: ContinuousReadingUnitSize,
+}
+
+#[derive(Clone, Debug)]
+struct ContinuousSpecifiedFitReferenceSource {
+    size: egui::Vec2,
+    /// Accepted pixel-derived detection, before trim policy, pair harmonization
+    /// or rotation. Missing pixels cannot recompute this input.
+    auto_content_bbox: Option<egui::Rect>,
 }
 
 impl ContinuousSpecifiedFitReference {
@@ -8183,8 +8200,13 @@ impl ContinuousSpecifiedFitReference {
         }
         unit.anchor_idx = anchor;
         unit.presentation = presentation;
-        // Dimensions are source-derived and recomputed on the next layout pass.
-        *base = None;
+        // Pure index remapping preserves the same sources and presentation order.
+        // Keep their originals; the next layout re-resolves current geometry.
+        if let Some(base) = base {
+            for (page, occurrence) in base.resolved.pages.iter_mut().zip(&unit.presentation) {
+                page.occurrence = *occurrence;
+            }
+        }
     }
 }
 
@@ -37910,17 +37932,82 @@ impl App {
         )
     }
 
+    fn continuous_reference_pixel_key(&self, idx: usize) -> Option<(u64, usize)> {
+        match self.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Static {
+                load_seq, pixels, ..
+            }) => Some((*load_seq, Arc::as_ptr(pixels) as usize)),
+            Some(FsCacheEntry::RawPreview {
+                load_seq,
+                preview: Some(preview),
+                ..
+            }) => Some((*load_seq, Arc::as_ptr(&preview.pixels) as usize)),
+            _ => None,
+        }
+    }
+
+    fn continuous_reference_content_bbox(
+        &mut self,
+        idx: usize,
+        side: Option<crate::view_trim::ViewTrimSpreadSide>,
+        source: &ContinuousSpecifiedFitReferenceSource,
+    ) -> Option<egui::Rect> {
+        if self.effective_view_trim_apply_mode_for_idx(idx)
+            == crate::view_trim::ViewTrimApplyMode::Auto
+            && self.continuous_reference_pixel_key(idx).is_none()
+        {
+            // The existing detached runtime can still have a current, accepted
+            // result (including a confirmed no-trim result) without resident
+            // pixels. It takes precedence over this reference's eviction input.
+            #[cfg(windows)]
+            if self.viewer_session_is_detached()
+                && let Some(window_id) = self.detached_viewer_window_id()
+                && let Some(baked) = self.detached_window_runtime_trim_bbox(window_id, idx)
+            {
+                return baked;
+            }
+            source.auto_content_bbox
+        } else if let Some(side) = side {
+            self.view_trim_spread_content_bbox(idx, side)
+        } else {
+            self.view_trim_single_content_bbox(idx)
+        }
+    }
+
     fn continuous_unit_base_size(
         &mut self,
         unit: &ContinuousReadingUnitSpec,
         fallback: egui::Vec2,
         prefer_processed: bool,
+        sources: Option<&[ContinuousSpecifiedFitReferenceSource]>,
     ) -> ContinuousReadingUnitSize {
         let paired_content_bboxes = if unit.presentation.len() == 2 {
             let left_idx = unit.presentation[0].idx;
             let right_idx = unit.presentation[1].idx;
             if self.get_rotation(left_idx).is_none() && self.get_rotation(right_idx).is_none() {
-                Some(self.view_trim_spread_content_bboxes(left_idx, right_idx))
+                Some(
+                    if let Some(sources) = sources
+                        && self.effective_view_trim_apply_mode_for_idx(left_idx)
+                            == crate::view_trim::ViewTrimApplyMode::Auto
+                        && self.effective_view_trim_apply_mode_for_idx(right_idx)
+                            == crate::view_trim::ViewTrimApplyMode::Auto
+                    {
+                        crate::view_trim::harmonize_spread_auto_bboxes(
+                            self.continuous_reference_content_bbox(
+                                left_idx,
+                                Some(crate::view_trim::ViewTrimSpreadSide::Left),
+                                &sources[0],
+                            ),
+                            self.continuous_reference_content_bbox(
+                                right_idx,
+                                Some(crate::view_trim::ViewTrimSpreadSide::Right),
+                                &sources[1],
+                            ),
+                        )
+                    } else {
+                        self.view_trim_spread_content_bboxes(left_idx, right_idx)
+                    },
+                )
             } else {
                 None
             }
@@ -37935,8 +38022,12 @@ impl App {
             .enumerate()
             .map(|(screen_pos, occurrence)| {
                 let idx = occurrence.idx;
-                let base = self.vertical_reading_base_size(idx, fallback, prefer_processed);
                 let rotation = self.get_rotation(idx);
+                let base = if let Some(sources) = sources {
+                    rotated_display_size(sources[screen_pos].size, rotation)
+                } else {
+                    self.vertical_reading_base_size(idx, fallback, prefer_processed)
+                };
                 let content_bbox = if unit.slice.is_half() {
                     // 分割中は分割が勝つ (表示トリムとは併用しない)。
                     Some(unit.slice.source_bbox(rotation))
@@ -37953,7 +38044,17 @@ impl App {
                         } else {
                             crate::view_trim::ViewTrimSpreadSide::Right
                         };
-                        self.view_trim_spread_content_bbox(idx, side)
+                        if let Some(sources) = sources {
+                            self.continuous_reference_content_bbox(
+                                idx,
+                                Some(side),
+                                &sources[screen_pos],
+                            )
+                        } else {
+                            self.view_trim_spread_content_bbox(idx, side)
+                        }
+                    } else if let Some(sources) = sources {
+                        self.continuous_reference_content_bbox(idx, None, &sources[screen_pos])
                     } else {
                         self.view_trim_single_content_bbox(idx)
                     }
@@ -38045,18 +38146,53 @@ impl App {
         for idx in unit.source_indices() {
             self.adopt_retained_pdf_page_metadata(idx);
         }
-        let base = if unit
+        let retained_sources = retained_base.map(|base| base.sources);
+        let sizes = unit
             .source_indices()
-            .all(|idx| self.continuous_specified_fit_basis_for_idx(idx).is_some())
-        {
-            let mut base = self.continuous_unit_base_size(&unit, fallback, prefer_processed);
-            apply_continuous_spread_geometry(&mut base, true);
-            Some(base)
-        } else {
-            // A texture/cache lifetime must not invalidate a confirmed fit unit.
-            // A newly selected unit still waits for its own source dimensions.
-            retained_base
-        };
+            .map(|idx| {
+                self.continuous_specified_fit_basis_for_idx(idx)
+                    .map(|basis| basis.normalized_original_size())
+            })
+            .collect::<Option<Vec<_>>>();
+        let sources = sizes
+            .map(|sizes| {
+                sizes
+                    .into_iter()
+                    .enumerate()
+                    .map(|(pos, size)| {
+                        let previous = retained_sources
+                            .as_ref()
+                            .and_then(|sources| sources.get(pos))
+                            .filter(|source| source.size == size);
+                        ContinuousSpecifiedFitReferenceSource {
+                            size,
+                            auto_content_bbox: previous.and_then(|source| source.auto_content_bbox),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .or(retained_sources);
+        let base = sources.map(|mut sources| {
+            // Only source facts survive eviction. Current Manual policy, Auto
+            // harmonization, rotation and height matching are resolved here.
+            let mut resolved =
+                self.continuous_unit_base_size(&unit, fallback, prefer_processed, Some(&sources));
+            apply_continuous_spread_geometry(&mut resolved, true);
+            for (idx, source) in unit.source_indices().zip(&mut sources) {
+                if let Some((seq, ptr)) = self.continuous_reference_pixel_key(idx) {
+                    // The existing detector owns validation/recomputation. Never
+                    // carry a detection from different live pixels into eviction.
+                    source.auto_content_bbox = self
+                        .fs_margin_bbox_cache
+                        .get(&idx)
+                        .filter(|(cached_seq, cached_ptr, _)| {
+                            *cached_seq == seq && *cached_ptr == ptr
+                        })
+                        .and_then(|(_, _, bbox)| *bbox);
+                }
+            }
+            ContinuousSpecifiedFitReferenceBasis { sources, resolved }
+        });
         self.fs_continuous_fit_reference = ContinuousSpecifiedFitReference::Specified {
             unit,
             settings,
@@ -38079,6 +38215,7 @@ impl App {
         else {
             return None;
         };
+        let base = &base.resolved;
         let saved_gap = quantize_points_to_physical_pixels(
             self.settings.spread_page_gap_px.min(200) as f32,
             pixels_per_point,
@@ -38112,9 +38249,9 @@ impl App {
         pixels_per_point: f32,
     ) -> ContinuousReadingUnitSize {
         let fit_mode = self.effective_fullscreen_fit_mode();
-        // Reuse the same confirmed geometry for the reference unit's layout,
-        // not just its fit scale: viewport fallbacks would change scroll offsets
-        // after eviction. The retained pair already includes height matching.
+        // Fit and the reference unit's placement consume the same geometry,
+        // freshly resolved from retained originals and current trim/rotation.
+        // The pair already includes height matching.
         let retained_base = match &self.fs_continuous_fit_reference {
             ContinuousSpecifiedFitReference::Specified {
                 unit: reference,
@@ -38123,17 +38260,14 @@ impl App {
             } if fit_mode == FullscreenFitMode::SpecifiedScale
                 && reference.presentation == unit.presentation
                 && reference.slice == unit.slice
-                && reference.singleton_placement == unit.singleton_placement
-                && unit
-                    .source_indices()
-                    .any(|idx| self.continuous_specified_fit_basis_for_idx(idx).is_none()) =>
+                && reference.singleton_placement == unit.singleton_placement =>
             {
-                Some(base.clone())
+                Some(base.resolved.clone())
             }
             _ => None,
         };
         let mut base = retained_base.unwrap_or_else(|| {
-            let mut base = self.continuous_unit_base_size(unit, fallback, prefer_processed);
+            let mut base = self.continuous_unit_base_size(unit, fallback, prefer_processed, None);
             apply_continuous_spread_geometry(&mut base, spread_should_match_page_heights(fit_mode));
             base
         });
@@ -78732,59 +78866,66 @@ mod specified_scale_consumer_tests {
         ]
     }
 
+    fn specified_eviction_fixture(
+        ctx: &egui::Context,
+        flow: ReadingFlow,
+        paired: bool,
+    ) -> (
+        crate::app::AppTestEnvForTest,
+        Vec<ContinuousReadingUnitSpec>,
+    ) {
+        let mut app = pdf_app(&ctx, 48);
+        app.reading_flow = flow;
+        app.spread_mode = if paired {
+            crate::settings::SpreadMode::Ltr
+        } else {
+            crate::settings::SpreadMode::Single
+        };
+        app.settings.fullscreen_specified_scale = FullscreenSpecifiedScale {
+            width: Some(SpecifiedScaleAxis::PercentTenths(800)),
+            height: Some(SpecifiedScaleAxis::PercentTenths(800)),
+        };
+        app.settings.fullscreen_fit_no_upscale = false;
+        app.settings.fullscreen_fit_no_downscale = false;
+        for idx in 0..48 {
+            app.items[idx] = GridItem::Image(app.tmp.path().join(format!("unloaded-{idx}.png")));
+            let dims = match idx {
+                0 => [100, 100],
+                1 => [160, 200],
+                _ => [200, 600],
+            };
+            app.record_page_layout_dims_for_spread(idx, (dims[0], dims[1]));
+            if let Some(FsCacheEntry::Static { source_dims, .. }) = app.fs_cache.get_mut(&idx) {
+                *source_dims = Some([dims[0] as usize, dims[1] as usize]);
+            }
+        }
+        // The only known originals are the selected unit and the distant current one.
+        // No early dimensions, thumbnail or retained AI/PDF source can hide eviction.
+        app.fs_cache.retain(|idx, _| {
+            if paired {
+                [0, 1, 40, 41].contains(idx)
+            } else {
+                [0, 40].contains(idx)
+            }
+        });
+        let units = if paired {
+            (0..24)
+                .map(|pos| ContinuousReadingUnitSpec::pages(pos * 2, vec![pos * 2, pos * 2 + 1]))
+                .collect::<Vec<_>>()
+        } else {
+            (0..48)
+                .map(|idx| ContinuousReadingUnitSpec::pages(idx, vec![idx]))
+                .collect::<Vec<_>>()
+        };
+        (app, units)
+    }
+
     #[test]
     fn specified_scale_review_real_eviction_keeps_confirmed_reference_and_layout() {
         for flow in [ReadingFlow::Vertical, ReadingFlow::Horizontal] {
             for paired in [false, true] {
                 let ctx = egui::Context::default();
-                let mut app = pdf_app(&ctx, 48);
-                app.reading_flow = flow;
-                app.spread_mode = if paired {
-                    crate::settings::SpreadMode::Ltr
-                } else {
-                    crate::settings::SpreadMode::Single
-                };
-                app.settings.fullscreen_specified_scale = FullscreenSpecifiedScale {
-                    width: Some(SpecifiedScaleAxis::PercentTenths(800)),
-                    height: Some(SpecifiedScaleAxis::PercentTenths(800)),
-                };
-                app.settings.fullscreen_fit_no_upscale = false;
-                app.settings.fullscreen_fit_no_downscale = false;
-                for idx in 0..48 {
-                    app.items[idx] =
-                        GridItem::Image(app.tmp.path().join(format!("unloaded-{idx}.png")));
-                    let dims = match idx {
-                        0 => [100, 100],
-                        1 => [160, 200],
-                        _ => [200, 600],
-                    };
-                    app.record_page_layout_dims_for_spread(idx, (dims[0], dims[1]));
-                    if let Some(FsCacheEntry::Static { source_dims, .. }) =
-                        app.fs_cache.get_mut(&idx)
-                    {
-                        *source_dims = Some([dims[0] as usize, dims[1] as usize]);
-                    }
-                }
-                // The only known originals are the selected unit and the distant current one.
-                // No early dimensions, thumbnail or retained AI/PDF source can hide eviction.
-                app.fs_cache.retain(|idx, _| {
-                    if paired {
-                        [0, 1, 40, 41].contains(idx)
-                    } else {
-                        [0, 40].contains(idx)
-                    }
-                });
-                let units = if paired {
-                    (0..24)
-                        .map(|pos| {
-                            ContinuousReadingUnitSpec::pages(pos * 2, vec![pos * 2, pos * 2 + 1])
-                        })
-                        .collect::<Vec<_>>()
-                } else {
-                    (0..48)
-                        .map(|idx| ContinuousReadingUnitSpec::pages(idx, vec![idx]))
-                        .collect::<Vec<_>>()
-                };
+                let (mut app, units) = specified_eviction_fixture(&ctx, flow, paired);
                 let current_pos = if paired { 20 } else { 40 };
                 let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
                 app.continuous_reading_layout(&ctx, rect, &units, 0, false)
@@ -78811,7 +78952,7 @@ mod specified_scale_consumer_tests {
                 let fit_after = app
                     .continuous_specified_reference_fit(rect, flow, 1.0)
                     .expect("confirmed geometry must outlive all reference cache entries");
-                close(fit_after.scale, fit_before.scale);
+                assert_eq!(fit_after.scale, fit_before.scale);
                 assert_eq!(reference_idx(&app), 0);
                 assert_eq!(app.fs_zoom, 1.3);
                 assert_eq!(app.fs_vertical_scroll, 37.0);
@@ -78836,6 +78977,477 @@ mod specified_scale_consumer_tests {
                 assert_eq!(reference_idx(&app), 0);
             }
         }
+    }
+
+    #[test]
+    fn specified_scale_review_real_eviction_re_resolves_book_and_page_trim() {
+        use crate::view_trim::{ViewTrimApplyMode, ViewTrimMargins, ViewTrimPageOverride};
+        for flow in [ReadingFlow::Vertical, ReadingFlow::Horizontal] {
+            for paired in [false, true] {
+                for page_scope in [false, true] {
+                    let ctx = egui::Context::default();
+                    let (mut app, units) = specified_eviction_fixture(&ctx, flow, paired);
+                    app.settings.fullscreen_specified_scale = height(100);
+                    app.settings.spread_page_gap_px = 0;
+                    app.view_trim_apply_mode = ViewTrimApplyMode::Book;
+                    let rect =
+                        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+                    app.continuous_reading_layout(&ctx, rect, &units, 0, false)
+                        .unwrap();
+                    let original_fit = app
+                        .continuous_specified_reference_fit(rect, flow, 1.0)
+                        .unwrap();
+                    let apply_trim = |app: &mut App| {
+                        let margins = ViewTrimMargins {
+                            top: 0.1,
+                            bottom: 0.1,
+                            ..Default::default()
+                        };
+                        if page_scope {
+                            for idx in units[0].source_indices() {
+                                app.view_trim_page_overrides
+                                    .insert(idx, ViewTrimPageOverride::from_margins(margins));
+                            }
+                        } else {
+                            app.view_trim_book_settings.enabled = true;
+                            app.view_trim_book_settings.single = margins;
+                            app.view_trim_book_settings.spread_linked.top = margins.top;
+                            app.view_trim_book_settings.spread_linked.bottom = margins.bottom;
+                        }
+                    };
+                    // Resolve the expected trim geometry while real originals are available.
+                    apply_trim(&mut app);
+                    let mut expected =
+                        app.continuous_unit_base_size(&units[0], rect.size(), false, None);
+                    apply_continuous_spread_geometry(&mut expected, true);
+                    let expected_fit = resolve_specified_scale(
+                        rect.size(),
+                        egui::vec2(expected.width, expected.height),
+                        0.0,
+                        app.settings.fullscreen_specified_scale,
+                        app.fullscreen_fit_scale_limits(1.0),
+                    )
+                    .unwrap();
+                    assert!(expected_fit.scale > original_fit.scale);
+                    app.view_trim_book_settings = Default::default();
+                    app.view_trim_page_overrides.clear();
+                    let distant_pos = if paired { 20 } else { 40 };
+                    app.fullscreen_idx = Some(40);
+                    app.fs_zoom = 1.3;
+                    app.continuous_reading_layout(&ctx, rect, &units, distant_pos, false)
+                        .unwrap();
+                    app.update_continuous_reading_prefetch_window(&units, &[distant_pos], &[]);
+                    for idx in units[0].source_indices() {
+                        assert!(!app.fs_cache.contains_key(&idx));
+                        assert!(app.continuous_specified_fit_basis_for_idx(idx).is_none());
+                    }
+                    // The same stored-scope mutation and reanchor boundary used by the panel.
+                    // Page edits run on the reference page before its reload has completed.
+                    let edit_idx = if page_scope { 0 } else { 40 };
+                    app.fullscreen_idx = Some(edit_idx);
+                    apply_trim(&mut app);
+                    app.fs_vertical_scroll = 37.0;
+                    app.reanchor_continuous_reading_after_view_trim_change(edit_idx);
+                    assert_eq!(app.fs_vertical_scroll, 0.0);
+                    let current_pos = if page_scope { 0 } else { distant_pos };
+                    app.continuous_reading_layout(&ctx, rect, &units, current_pos, false)
+                        .unwrap();
+                    let actual_fit = app
+                        .continuous_specified_reference_fit(rect, flow, 1.0)
+                        .unwrap();
+                    assert!(
+                        (actual_fit.scale - expected_fit.scale).abs() < 0.00001,
+                        "trim fit: {} != {}",
+                        actual_fit.scale,
+                        expected_fit.scale
+                    );
+                    let actual = app.continuous_unit_size_for_flow(
+                        &units[0],
+                        flow,
+                        rect,
+                        1.3,
+                        rect.size(),
+                        false,
+                        1.0,
+                    );
+                    assert_eq!(
+                        actual.pages.iter().map(|p| p.bbox()).collect::<Vec<_>>(),
+                        expected.pages.iter().map(|p| p.bbox()).collect::<Vec<_>>()
+                    );
+                    assert_eq!(reference_idx(&app), 0);
+                    assert_eq!(app.fs_zoom, 1.3);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn specified_scale_review_evicted_reference_re_resolves_other_geometry_inputs() {
+        #[derive(Clone, Copy, Debug)]
+        enum Change {
+            Rotation,
+            Split,
+            Slot,
+            Specified,
+            ResizeDpi,
+        }
+        for change in [
+            Change::Rotation,
+            Change::Split,
+            Change::Slot,
+            Change::Specified,
+            Change::ResizeDpi,
+        ] {
+            let ctx = egui::Context::default();
+            let (mut app, units) = specified_eviction_fixture(&ctx, ReadingFlow::Vertical, false);
+            app.current_folder = Some(app.tmp.path().to_path_buf());
+            app.spread_db = Ok(crate::spread_db::SpreadDb::open_at(
+                &app.tmp.path().join("reference-spread.db"),
+            )
+            .unwrap());
+            app.rotation_db = Some(
+                crate::rotation_db::RotationDb::open_at(
+                    &app.tmp.path().join("reference-rotation.db"),
+                )
+                .unwrap(),
+            );
+            let original = if matches!(change, Change::Slot) {
+                [100, 200]
+            } else {
+                [400, 100]
+            };
+            app.record_page_layout_dims_for_spread(0, (original[0], original[1]));
+            if let Some(FsCacheEntry::Static { source_dims, .. }) = app.fs_cache.get_mut(&0) {
+                *source_dims = Some([original[0] as usize, original[1] as usize]);
+            }
+            // A mode change selects the current center unit. Its original must
+            // be known; evicted off-screen units may still await normal reload.
+            if matches!(change, Change::Split) {
+                app.record_page_layout_dims_for_spread(40, (400, 100));
+                if let Some(FsCacheEntry::Static { source_dims, .. }) = app.fs_cache.get_mut(&40) {
+                    *source_dims = Some([400, 100]);
+                }
+            }
+            for idx in [39, 41] {
+                let Some(FsCacheEntry::Static { tex, pixels, .. }) = app.fs_cache.get(&40) else {
+                    panic!("fixture original");
+                };
+                let entry = FsCacheEntry::Static {
+                    tex: tex.clone(),
+                    pixels: pixels.clone(),
+                    source_dims: Some([200, 600]),
+                    load_seq: 0,
+                    animation: StaticAnimationState::Still,
+                };
+                app.fs_cache.insert(idx, entry);
+            }
+            app.settings.fullscreen_specified_scale = if matches!(change, Change::ResizeDpi) {
+                FullscreenSpecifiedScale {
+                    width: None,
+                    height: Some(SpecifiedScaleAxis::PercentTenths(800)),
+                }
+            } else {
+                height(100)
+            };
+            if matches!(change, Change::Rotation) {
+                app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Book;
+                app.view_trim_book_settings.enabled = true;
+                app.view_trim_book_settings.single.top = 0.1;
+                app.view_trim_book_settings.single.bottom = 0.1;
+            }
+            let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+            app.continuous_reading_layout(&ctx, rect, &units, 0, false)
+                .unwrap();
+            app.fullscreen_idx = Some(40);
+            app.fs_zoom = 1.3;
+            app.continuous_reading_layout(&ctx, rect, &units, 40, false)
+                .unwrap();
+            app.update_continuous_reading_prefetch_window(&units, &[40], &[]);
+            assert!(app.continuous_specified_fit_basis_for_idx(0).is_none());
+            assert!(!app.fs_cache.contains_key(&0));
+            match change {
+                Change::Rotation => {
+                    app.set_image_rotation(0, crate::rotation_db::Rotation::Cw90)
+                        .unwrap();
+                    app.continuous_reading_layout(&ctx, rect, &units, 40, false)
+                        .unwrap();
+                    let fit = app
+                        .continuous_specified_reference_fit(rect, ReadingFlow::Vertical, 1.0)
+                        .unwrap();
+                    assert!((fit.scale - 0.25).abs() < 0.00001);
+                    let ContinuousSpecifiedFitReference::Specified {
+                        base: Some(base), ..
+                    } = &app.fs_continuous_fit_reference
+                    else {
+                        panic!("held originals");
+                    };
+                    assert_eq!(
+                        base.sources
+                            .iter()
+                            .map(|source| source.size)
+                            .collect::<Vec<_>>(),
+                        vec![egui::vec2(400.0, 100.0)]
+                    );
+                    assert_eq!(
+                        base.resolved.pages[0].rotation,
+                        crate::rotation_db::Rotation::Cw90
+                    );
+                    assert_eq!(
+                        base.resolved.pages[0].content_bbox, None,
+                        "keep the existing rotated continuous trim exception"
+                    );
+                    // Remapping indices preserves those same sources and occurrence order.
+                    let mut remapped = app.fs_continuous_fit_reference.clone();
+                    remapped.remap_indices(&|idx| Some(idx + 100));
+                    let ContinuousSpecifiedFitReference::Specified {
+                        unit,
+                        base: Some(base),
+                        ..
+                    } = remapped
+                    else {
+                        panic!("remapped originals");
+                    };
+                    assert_eq!(unit.anchor_idx, 100);
+                    assert_eq!(
+                        base.sources
+                            .iter()
+                            .map(|source| source.size)
+                            .collect::<Vec<_>>(),
+                        vec![egui::vec2(400.0, 100.0)]
+                    );
+                    assert_eq!(base.resolved.pages[0].occurrence.idx, 100);
+                    assert_eq!(reference_idx(&app), 0);
+                }
+                Change::Split | Change::Slot => {
+                    let mode = if matches!(change, Change::Split) {
+                        SpreadMode::SplitLtr
+                    } else {
+                        SpreadMode::RtlCover
+                    };
+                    app.apply_fullscreen_spread_mode(&ctx, 40, mode);
+                    assert_eq!(app.spread_mode, mode);
+                    if matches!(change, Change::Slot) {
+                        app.set_singleton_spread_endpoint_preferences_for_fullscreen(
+                            &ctx,
+                            crate::settings::SingletonSpreadEndpointPreferences::from(
+                                crate::settings::SingletonSpreadPlacementPreference::Place,
+                            ),
+                        );
+                    }
+                    let current = app.fullscreen_idx.unwrap();
+                    let (new_units, pos) = app.continuous_reading_units_and_pos(current).unwrap();
+                    if matches!(change, Change::Split) {
+                        assert!(new_units[pos].contains_idx(40));
+                        assert!(new_units[pos].slice.is_half());
+                    } else {
+                        assert_ne!(
+                            new_units[0].singleton_placement,
+                            SingletonSpreadPlacement::Center
+                        );
+                    }
+                    app.continuous_reading_layout(&ctx, rect, &new_units, pos, false)
+                        .unwrap();
+                    assert_eq!(reference_idx(&app), new_units[pos].anchor_idx);
+                    assert!(
+                        app.continuous_specified_reference_fit(rect, ReadingFlow::Vertical, 1.0)
+                            .is_some()
+                    );
+                }
+                Change::Specified => {
+                    assert!(app.set_current_fullscreen_specified_scale(height(120)));
+                    app.continuous_reading_layout(&ctx, rect, &units, 40, false)
+                        .unwrap();
+                    assert_eq!(
+                        reference_idx(&app),
+                        40,
+                        "explicit policy edit selects the current center unit"
+                    );
+                    let fit = app
+                        .continuous_specified_reference_fit(rect, ReadingFlow::Vertical, 1.0)
+                        .unwrap();
+                    assert!((fit.scale - 0.2).abs() < 0.00001);
+                    assert_eq!(app.fs_zoom, 1.3);
+                }
+                Change::ResizeDpi => {
+                    ctx.set_pixels_per_point(2.0);
+                    let resized =
+                        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 400.0));
+                    app.continuous_reading_layout(&ctx, resized, &units, 40, false)
+                        .unwrap();
+                    let fit = app
+                        .continuous_specified_reference_fit(resized, ReadingFlow::Vertical, 2.0)
+                        .unwrap();
+                    assert!(
+                        (fit.scale - 2.5).abs() < 0.00001,
+                        "current area and 5x/DPI cap must be re-resolved"
+                    );
+                    assert_eq!(reference_idx(&app), 0);
+                    assert_eq!(app.fs_zoom, 1.3);
+                }
+            }
+            assert!(
+                app.continuous_specified_fit_basis_for_idx(0).is_none(),
+                "no source reload or size fallback hid eviction"
+            );
+        }
+    }
+
+    #[test]
+    fn specified_scale_review_real_eviction_keeps_auto_detection_as_source_input() {
+        let ctx = egui::Context::default();
+        let (mut app, units) = specified_eviction_fixture(&ctx, ReadingFlow::Vertical, false);
+        app.settings.fullscreen_specified_scale = height(100);
+        app.record_page_layout_dims_for_spread(0, (400, 100));
+        let pixels = |inset: usize| {
+            let mut pixels = egui::ColorImage::filled([400, 100], egui::Color32::WHITE);
+            for y in inset..100 - inset {
+                for x in 80..320 {
+                    pixels[(x, y)] = egui::Color32::BLACK;
+                }
+            }
+            Arc::new(pixels)
+        };
+        let install = |app: &mut App, pixels: Arc<egui::ColorImage>, seq| {
+            let tex = ctx.load_texture(
+                format!("retained-auto-{seq}"),
+                (*pixels).clone(),
+                egui::TextureOptions::LINEAR,
+            );
+            app.fs_cache.insert(
+                0,
+                FsCacheEntry::Static {
+                    tex,
+                    pixels,
+                    source_dims: Some([400, 100]),
+                    load_seq: seq,
+                    animation: StaticAnimationState::Still,
+                },
+            );
+        };
+        install(&mut app, pixels(20), 1);
+        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Auto;
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        app.continuous_reading_layout(&ctx, rect, &units, 0, false)
+            .unwrap();
+        let first = app
+            .continuous_specified_reference_fit(rect, ReadingFlow::Vertical, 1.0)
+            .unwrap();
+        let auto_bbox = app
+            .view_trim_single_content_bbox(0)
+            .expect("real detector finds the black content");
+        assert!(auto_bbox.height() < 1.0);
+        app.fullscreen_idx = Some(40);
+        app.continuous_reading_layout(&ctx, rect, &units, 40, false)
+            .unwrap();
+        app.update_continuous_reading_prefetch_window(&units, &[40], &[]);
+        assert!(app.continuous_specified_fit_basis_for_idx(0).is_none());
+        app.continuous_reading_layout(&ctx, rect, &units, 40, false)
+            .unwrap();
+        let evicted = app
+            .continuous_specified_reference_fit(rect, ReadingFlow::Vertical, 1.0)
+            .unwrap();
+        assert_eq!(
+            evicted.scale, first.scale,
+            "pixel-derived input also outlives real eviction"
+        );
+        // Manual policy reads current settings; returning to Auto uses only the
+        // accepted detection input, never the previous Manual policy's bbox.
+        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Book;
+        app.view_trim_book_settings.enabled = true;
+        app.view_trim_book_settings.single.top = 0.1;
+        app.view_trim_book_settings.single.bottom = 0.1;
+        app.reanchor_continuous_reading_after_view_trim_change(40);
+        app.continuous_reading_layout(&ctx, rect, &units, 40, false)
+            .unwrap();
+        let manual = app
+            .continuous_specified_reference_fit(rect, ReadingFlow::Vertical, 1.0)
+            .unwrap();
+        assert!((manual.scale - 1.25).abs() < 0.00001);
+        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Auto;
+        app.reanchor_continuous_reading_after_view_trim_change(40);
+        app.continuous_reading_layout(&ctx, rect, &units, 40, false)
+            .unwrap();
+        let restored = app
+            .continuous_specified_reference_fit(rect, ReadingFlow::Vertical, 1.0)
+            .unwrap();
+        assert_eq!(restored.scale, first.scale);
+        install(&mut app, pixels(10), 2);
+        app.continuous_reading_layout(&ctx, rect, &units, 40, false)
+            .unwrap();
+        let next_bbox = app.view_trim_single_content_bbox(0).unwrap();
+        assert!(next_bbox.height() > auto_bbox.height());
+        let next = app
+            .continuous_specified_reference_fit(rect, ReadingFlow::Vertical, 1.0)
+            .unwrap();
+        assert!(
+            next.scale < first.scale,
+            "new pixels use the existing detector and invalidate old facts"
+        );
+        assert_eq!(reference_idx(&app), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn specified_scale_review_evicted_reference_preserves_detached_auto_owner() {
+        let ctx = egui::Context::default();
+        let (mut app, units) = specified_eviction_fixture(&ctx, ReadingFlow::Vertical, false);
+        app.settings.fullscreen_specified_scale = height(100);
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        app.continuous_reading_layout(&ctx, rect, &units, 0, false)
+            .unwrap();
+        app.fullscreen_idx = Some(40);
+        app.continuous_reading_layout(&ctx, rect, &units, 40, false)
+            .unwrap();
+        app.update_continuous_reading_prefetch_window(&units, &[40], &[]);
+        assert!(app.continuous_specified_fit_basis_for_idx(0).is_none());
+        let items = app.items.clone();
+        let reference = app.fs_continuous_fit_reference.clone();
+        let window_id = 13422;
+        let parked = app.build_window_context_for_test(window_id, |owner| {
+            owner.items = items;
+            owner.thumbnails = (0..48).map(|_| ThumbnailState::Pending).collect();
+            owner.fullscreen_idx = Some(40);
+            owner.reading_flow = ReadingFlow::Vertical;
+            owner.spread_mode = crate::settings::SpreadMode::Single;
+            owner.viewer_presentation = ViewerPresentation::DetachedWindow;
+            owner.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Auto;
+            owner.fs_continuous_fit_reference = reference;
+            owner.transition_detached_window_state(
+                window_id,
+                crate::app::DetachedWindowState::Active,
+                "specified_reference_test",
+            );
+        });
+        app.with_window_context_for_test(parked, |owner| {
+            assert_eq!(owner.detached_viewer_window_id(), Some(window_id));
+            let bbox = egui::Rect::from_min_max(egui::pos2(0.0, 0.25), egui::pos2(1.0, 0.75));
+            owner.set_detached_window_runtime_trim_bbox(window_id, 0, Some(bbox), "test");
+            owner
+                .continuous_reading_layout(&ctx, rect, &units, 40, false)
+                .unwrap();
+            let fit = owner
+                .continuous_specified_reference_fit(rect, ReadingFlow::Vertical, 1.0)
+                .unwrap();
+            assert_eq!(fit.scale, 2.0);
+            assert!(owner.continuous_specified_fit_basis_for_idx(0).is_none());
+            owner.set_detached_window_runtime_trim_bbox(window_id, 0, None, "test");
+            owner
+                .continuous_reading_layout(&ctx, rect, &units, 40, false)
+                .unwrap();
+            let fit = owner
+                .continuous_specified_reference_fit(rect, ReadingFlow::Vertical, 1.0)
+                .unwrap();
+            assert_eq!(
+                fit.scale, 1.0,
+                "confirmed no-trim belongs to the runtime too"
+            );
+            assert_eq!(reference_idx(owner), 0);
+        });
+        assert_eq!(reference_idx(&app), 0);
+        assert_eq!(
+            app.view_trim_apply_mode,
+            crate::view_trim::ViewTrimApplyMode::None
+        );
     }
 
     #[cfg(windows)]

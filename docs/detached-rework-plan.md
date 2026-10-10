@@ -1497,6 +1497,25 @@ texture寿命から独立したfit ownerと既存保存ownerを使う構造修�
 保存頻度を検証する。利用者指示・レビューの構造判定への合意に従い、§2の症状パッチを避ける。
 修正後gate結果は `target/E-1342-fix-msg.txt` へ記録し、再レビュー合格とは区別する。
 
+2026-10-10 §1.342 再レビューP2 follow-up: `ui_fullscreen.rs` の参照basisを、保持する非回転・
+AI前元寸法と、そのlayoutで現在のtrim / rotationを解いたgeometryの一組へ置換した。
+通常cache退去は入力寸法を失効させず、明示trim変更は共有layout ownerで再解決する。
+同じ解決結果をfitと配置が使用し、純粋index remapは元寸法を保持してoccurrenceを更新する。
+現在のbboxを固定する症状guardや、trim時の参照一括reset・新しいbool / pending / workerは追加しない。
+変更範囲は参照型、共有unit geometry入口、fit / 配置consumer、remapとそれらの実退去回帰である。
+viewport predicates、context identity / mount / deposit / swap、placement / HWND / focusとworker寿命、
+共通設定・favorite保存境界は変更しない。利用者指示・再レビューの構造判定に従う修正として記録し、
+独立再レビューの合格とは区別する。確認用runtimeは実機確認中のため書き換えない。
+
+同じsource recordには、既存detectorが受理したraw Auto bboxも画素由来の入力として保持する。
+画素退去でAuto入力まで失う退行を防ぎ、Manual bboxや左右調停・rotation後の結果を入力へ戻さない。
+新しい画素では既存load sequence／pixel pointerによる検出cache検証を使う。検出owner・cache・
+workerの寿命と破棄規則は変えず、参照geometry入口で現在のpolicyを適用する。
+同じ入口で既存のwindow identityと `detached_window_runtime_trim_bbox` を読み、画素がない場合も
+runtimeの受理済みAuto結果（trimなしを含む）を優先する。新しいpredicateやruntime保存経路は作らず、
+既存identity／検出ownerの定義と寿命を変えない。実退去した入力を持つ別contextのmount回帰で、
+別窓の現在値とmain参照・trim状態の不変を確認する。
+
 2026-10-09 master統合後の一覧公開境界修正: 利用者指定の構造修正として、Bookmark一覧buildをmainの既存Surface lease・switch sequenceで所有し、mainの成功したitems交換だけが旧buildを退役させる。detached contextのmount・items交換・pollはmainのbuildを退役も採用もしない。同じBookmarkのsortは要求ownerを継続し、A/B記憶クリアは新epochで既存refreshを再開始する。Ctrl+Fの完了filterは送信済み条件を一緒に保持し、ViewerContextBundleの既存swap/park/dropとSmart退避で一緒に運ぶ。新しいdetached predicate・viewport・placement・待機・retry・pending ownerを設けず、公開先の所有証明と既存payloadの未接続を直すため、§2の症状パッチに当たらない。
 
 2026-10-09 §1.355追加修正: Coordinator指定の構造修正として、別窓bookmarkの既存startup resolve workerからtyped RAR header証明を採用境界へ運び、cache hit前に後続巻を拒否する。DFSも同じ証明で候補から除外する。新しいdetached predicate／viewport／待機／retryを作らず、既存requestの取消・held-owner再開・context所有を保つ。旧cacheの直接採用が共通の開封不変条件を迂回していた根因を入口ownerで直すため、§2の症状パッチに当たらない。
