@@ -1455,6 +1455,44 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+2026-10-10 §1.364 D2 本別見開き調整のcontext接続（独立確認・検証待ち）:
+`src/app/spread_shift_owner.rs::ViewerSpreadShift`を`ViewerContextBundle`へ持たせ、
+Appとregistryの既存swap/fork/park/mountの境界でlive調整・PageRef解決・操作receiptを移送する。
+forkは`fork_accepted`で実効layoutだけを複製し、保存rowの再読取やSet/Clearを副作用にしない。
+元contextのwrite受付・receiverは引き継がず、保存待ち/失敗の調整は新contextでsession扱いにする。
+write完了はcontext/items/operation sequence/scopeが一致するmountedまたはat-rest ownerへ
+配送する。兄弟のlive組は更新せず、retired元の完了を新本へ適用しない。
+OFF/ONは既存ownerをsession扱いにし、ON化の操作元Bookだけを保存する。
+
+触れる範囲は`app.rs`のlive field/service poll、`viewer_context_registry.rs`のbundle交換・
+clone・at-rest配送、`sidecar_restore.rs`のfirst-display依存、items/snapshot remap、
+`ui_fullscreen.rs`の共通unit consumer・入力受付・HUD。fresh-openはglobal Common内の
+`ViewerBookRestore`、retained ONはbundle内の`RetainedReadoption::Idle | Reading`が待機を所有する。
+既存async inventoryへ`ContextAsyncOwner::RetainedSpreadShift`を登録してpoll/cancel-on-parkを担わせる。
+parkはreceiverをdropしてaccepted sessionを保ち、再採用はfresh cutoffを捕捉、forkはaccepted stateだけを
+複製する。fresh-openの`FencedResume`は同open continuationの初回採用完了で終了し、後のsession内
+resume参照を固定しない。global Commonと別contextのretained待機は併存し、既存のtarget-context semantic gate
+(`sidecar_restore_blocks_projected_context`)と復元dialogで対象窓だけを止める。
+他窓を一括modalにする案はreleased sibling input契約を損なうため不採用とした。
+新しいdetached専用predicateやgeometry推測ではなく、既存意味gateがqueryするcontext-owned依存の追加である。
+明示global policy変更では`session_only`がretained receiverを取り消してaccepted stateを保つ。
+表示済みsiblingsへ旧保存値を適用せず、fresh-openのCommon依存は捕捉済みtarget/context/items/open/scopeと
+元resume cutoffを保持して、新settings世代・現在のshift受付cutoffへ再受付する。
+通常の設定変更遷移であり、retryやまれな失敗の回復機構を追加するものではない。
+retainedは受入済みidentity indexを使い、OFFはlive調整を維持する。retained/import採用は
+現在の実ページを含むunitへ正規化するだけで、共有resume/historyを書かない。
+metadataの捕捉FIFO読取はContextRequest workerが待ち、context/items世代の採用後に
+current scope + ON + Automaticを照合する。OFFではshift結果を使わない。
+成功済みroot/page操作のmappingをpure helperでmounted/at-restへ反映し、追加save/mountは行わない。
+snapshotはdurable scopeを切り離して現在のnumeric session pairingを保持する。
+viewport生成/登録、HWND同定、geometry/placement/focus、
+recreate判定へ新しい推測経路を加える変更ではない。
+一つのviewer ownerと受理済みreceiptを既存lifecycleに載せる構造修正として記録し、
+追加guard・delay・retry・repaint・兄弟一括resetによる症状修正として扱わない。
+これは実装範囲と判断理由の追記であり、ClaudeCode/独立reviewerの今回の構造確認・完了レビュー合格や
+自動検証・利用者の実機受入済みを表すものではない。確認結果は取得後に別途記録する。
+正本は[spread-shift-memory-plan.md §11.4](spread-shift-memory-plan.md#114-d2実装接続記録2026-10-10検証完了レビュー待ち)。
+
 2026-10-10 §1.342 最大倍率・保持軸モデル: 利用者承認の共通capを既存fit descriptorへ
 snapshotとして接続し、ui_fullscreenの単ページ／見開き／連結・capture／navigator consumerが
 同じpolicyを使う。共通cap編集はfavorite専用値を作らず、live編集はメモリだけを変える。

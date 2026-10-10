@@ -439,7 +439,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `comic.db` | Ctrl+T テキスト注釈のページ単位 JSON。吹き出し・テキスト・ウィンドウ・スタンプ配置の正本で、ユーザー画像スタンプは配置先の注釈に `Embedded` として埋め込む | `comic_db.rs` + `ui_text.rs` + `sidecar.rs` |
 | `comic_user_stamps.db` | Ctrl+T スタンプピッカーのユーザー画像履歴。配置時の長辺 1024px 上限 PNG を再利用用 MRU として保持する。履歴から選んでも配置先には `Embedded` をコピーするため、履歴削除は既存注釈に影響しない | `comic_user_stamps.rs` + `ui_text.rs` |
 | `spread.db` | フォルダ別表示モード (ページ構成、連結方式、綴じ方向、末尾表紙補助、見開き端の単ページ配置) | `spread_db.rs` |
-| `spread_shift.db`（§1.364 D1、未リリース） | 論理本scopeごとの相対PageRef。KeepDriveのroot＋実効ZIP prefix、一冊一行。schema v1。新規storeのためmigrationなし、不正schema/JSONは原本を保って書込停止。既存spread設定・resumeとは独立 | `book_scope.rs`、`spread_shift/{model,service,store}.rs` |
+| `spread_shift.db`（§1.364 D1/D2、未リリース） | 論理本scopeごとの相対PageRef。KeepDriveのroot＋実効ZIP prefix、一冊一行。schema v1。新規storeのためmigrationなし、不正schema/JSONは原本を保って書込停止。既存spread設定・resumeとは独立 | `book_scope.rs`、`spread_shift/{model,service,store}.rs`、`app/spread_shift_owner.rs` |
 | `book_resume.db` | コンテナpathとraw items indexで位置を復元。記録時のHUD読み順ordinal/totalをnullable列に保存し、通常Folder/ZIP/PDF一覧の下端メーターに常に左から右へ表示。旧2列DBへのALTERと一覧全行読込は既存writerで実行。App共通メモリmapを記録受付時にも更新し、描画はmap参照のみ。動画/音声の同じ帯は既存video_resume_positionsと取得済みvideo_metaを読み、別の位置map/DB列は作らない。Remoteは補助列NULL (IPC不変) | `book_resume_db.rs`, `app/book_resume_meter.rs`, [設計・割り切り](book-resume-meter-plan.md) |
 | `reading_history.db` | ユーザー操作で開いた画像フォルダ / ZIP / PDF / 変換アーカイブと動画・音声ファイルの MRU。既存 kind 文字列を維持し、`video` / `audio` と専用の `media_position_ms` / `media_duration_ms` を追加する。未知 kind は行ごと読み飛ばす。保持件数は 1..=1000 | `reading_history_db.rs` + `App::record_reading_history` |
 | `folder_thumb_pins.db` | 親コンテナ (Folder/ZipFile/PdfFile/ConvertibleArchive) の代表サムネ手動ピン。container_key 主キー (= normalize_keep_drive 済みパス) で 1 行 1 コンテナ、source は kind + container 相対 rel + (zipentry の) entry / (pdfpage の) page。`apply_folder_thumb_pin` と変換アーカイブの `archivethumb:*#pin:*` が cache key suffix `#pin:{source_id}` で identity を表現し、cascade 時は途中コンテナを含む経路 hash を source_id に加える | `folder_thumb_pins.rs` |
@@ -469,7 +469,45 @@ copy/probeの`LogicalBookFamily`は指定descriptorだけにroot exact＋境界�
 PageRefは保存表記を維持し、照合時だけ共通のcase/slash正規化を使う。
 settings単体reset、履歴/resume/cache削除、自動sidecarにはshiftを混ぜない。
 明示metadata v10のlogical `spread_shift_family`は物理cache由来の`container_state`とは別に搬送する。
-D1はstore/完了契約と登録までで、既存spread setter・表示Restore・HUD・F12・Remoteへの接続はD2/D3。
+D1はstore/完了契約と登録まで。D2の接続差分では`app/spread_shift_owner.rs`の
+`ViewerSpreadShift`がscope、`ViewerShift::None | Ordinary | Book`、操作receipt、
+fenced resume、identity/nav投影を一つのviewer ownerへ集約する。通常一覧のずらしはOrdinaryで
+sessionだけ、本はPageRefと`SpreadShiftState`で扱う。旧raw anchor fieldは独立の正本にせず、
+`spread_shift_anchor_idx()`が現在解決済みの投影だけを既存display-unit resolverへ渡す。
+items削除・snapshotのslot変換はlive解決位置をremapし、identity/nav列が変わればPageRefを再解決する。
+snapshot化ではdurable scopeを切り離し、その時点のnumeric pairingをOrdinaryのsession調整として保持する。
+`spread_shift_live_mappings`は成功済みroot/page操作と同じmappingをmounted/at-restのlive ownerへ
+pureに反映する。durable移行は既存workerが所有し、live反映のための追加saveやmountは行わない。
+
+`ViewerContextBundle`がこのownerを交換・保持する。F12のcloneはその時のlive調整を複製し、
+保存replyはcontext/items/operation sequenceとscopeが一致する操作ownerへだけ配送する。
+at-rest ownerにも同じreceipt判定を使い、保存完了はページ移動や兄弟unitの失効を起こさない。
+ON/OFFは全体設定の世代を進め、全ownerの現表示をsession扱いにし、ON化元のBookに
+live調整がある場合だけ保存する。base spread setterの同期契約は維持し、成功後のQ3 resetだけを
+shift Clearへ接続する。HUDと環境設定転送には全体boolを、metadata転送には本別PageRefを渡す。
+この明示設定変更で`session_only`はretainedのpending receiverを取り消し、受入済みsessionを保つ。
+表示済みの無関係な兄弟窓へ旧保存値を復元しない。fresh-openのCommon依存は世代不一致だけで
+破棄せず、`refresh_pending_book_shift_memory_policy`が捕捉済みtarget/context/items/open/scopeと
+元のresume cutoffを維持して、新settings世代・現在のshift受付cutoffで読取依存を再受付する。
+これは設定変更に伴う通常遷移であり、retryやまれな失敗の復旧ではない。
+
+新規openのRestoreは既存`sidecar_restore::Common`の`ViewerBookRestore`として受け、最終identity/navへ
+shiftを解決してから同じcontinuationの位置復元・first-displayへ進む。
+retained ONの`begin_retained_shift_readoption`は受入済みidentity indexを再利用し、
+読取待ちはbundle内の`ViewerSpreadShift.retained: RetainedReadoption::Idle | Reading`が所有する。
+global Commonとは別contextの読取を併存させ、既存のtarget-context semantic gate
+(`sidecar_restore_blocks_projected_context`)と復元dialogを対象窓だけに使う。兄弟窓の入力は止めない。
+`ContextAsyncOwner::RetainedSpreadShift`が既存async inventoryでpollとcancel-on-parkを扱う。
+parkはreceiverをdropして受入済みsessionを保ち、次の再採用がfresh cutoffを捕捉する。
+forkは`fork_accepted`でaccepted layoutだけを複製し、receiverと元contextのwrite受付を引き継がない。
+保存待ち/失敗の調整は新contextではsession扱いにする。OFFはlive調整をそのまま保持する。
+fresh-openの`FencedResume`はopen continuationの初回採用完了時に終了し、後のsession内参照を固定しない。
+retainedとimportの復元では
+`adopt_shift_layout_without_navigation`が現在の実ページを含むunitへ正規化するだけで、
+共有resume/historyを書かない。metadata importは捕捉FIFO読取をContextRequest workerで待ち、
+context/items世代の採用判定後にcurrent scope + ON + Automaticの一致で調整を採用する。
+OFFではそのshift読取結果を使わない。D2の自動検証・独立完了レビュー・
+利用者確認はこの記述では完了扱いにしない。Remote saved/groupとG3共同fixtureはD3の範囲。
 
 ### フォルダ側サイドカー (`mimageviewer.dat`)
 

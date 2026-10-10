@@ -158,6 +158,7 @@ struct Common {
     favorite_failures: Vec<crate::favorite_view_state::FavoriteViewStoreCommand>,
     warning: Option<String>,
     source_change_reprobe: bool,
+    book_restore: Option<super::spread_shift_owner::ViewerBookRestore>,
     /// A main-context folder transition historically flushed and dropped every old sidecar
     /// cache value. Checking leaves them live while its worker owns immutable reservations;
     /// successful completion evicts only exact captured clean owners, while detached opens and
@@ -650,6 +651,22 @@ impl SidecarRestoreState {
 }
 
 impl App {
+    /// A global memory change supersedes only the shift dependency of an unopened Book.
+    /// Its original resume cutoff remains mandatory; an already shown sibling keeps its session.
+    pub(super) fn refresh_pending_book_shift_memory_policy(&mut self) {
+        if let Some(restore) = self
+            .sidecar_restore
+            .as_mut()
+            .and_then(|state| state.common.book_restore.as_mut())
+        {
+            restore.refresh_memory_policy(
+                self.spread_shift_settings_generation,
+                self.settings.remember_spread_shift_per_book,
+                self.spread_shift_service.as_ref(),
+                self.book_resume_writer.as_ref(),
+            );
+        }
+    }
     #[cfg(test)]
     pub(super) fn attach_sidecar_checking_relay_for_test(
         &mut self,
@@ -682,7 +699,7 @@ impl App {
     }
 
     pub(crate) fn sidecar_restore_active(&self) -> bool {
-        self.sidecar_restore.is_some()
+        self.sidecar_restore.is_some() || self.spread_shift.retained_readoption_pending()
     }
 
     /// Index-only preparation follows an already-installed list. It gates exact page opens,
@@ -722,9 +739,10 @@ impl App {
     /// viewer owns the wait modal and semantic-input block. Independent native-video
     /// windows continue their normal event path while another context is restoring.
     pub(crate) fn sidecar_restore_blocks_projected_context(&self) -> bool {
-        self.sidecar_restore.as_ref().is_some_and(|state| {
-            state.common.target_context == self.sidecar_restore_projected_context()
-        })
+        self.spread_shift.retained_readoption_pending()
+            || self.sidecar_restore.as_ref().is_some_and(|state| {
+                state.common.target_context == self.sidecar_restore_projected_context()
+            })
     }
 
     /// Whether the mounted viewer owns an exact fullscreen reopen that is paused behind its
@@ -823,6 +841,7 @@ impl App {
                 favorite_failures: Vec::new(),
                 warning: None,
                 source_change_reprobe: false,
+                book_restore: None,
                 clear_sidecar_cache_after_flush: false,
                 effects: RestoreEffects::default(),
             },
@@ -879,6 +898,7 @@ impl App {
                 favorite_failures: Vec::new(),
                 warning: None,
                 source_change_reprobe: false,
+                book_restore: None,
                 clear_sidecar_cache_after_flush: false,
                 effects: RestoreEffects::default(),
             },
@@ -1179,6 +1199,7 @@ impl App {
             .wrapping_add(self.input_seq)
             .wrapping_add(1);
         let started_at = continuation.restore_started_at;
+        let book_restore = self.begin_book_shift_restore(request_id);
         self.sidecar_restore = Some(SidecarRestoreState {
             #[cfg(test)]
             checking_relay: None,
@@ -1197,6 +1218,7 @@ impl App {
                 favorite_failures: Vec::new(),
                 warning: None,
                 source_change_reprobe: false,
+                book_restore,
                 clear_sidecar_cache_after_flush,
                 effects: RestoreEffects::default(),
             },
@@ -1324,6 +1346,15 @@ impl App {
             // ordinary poll cancels any deferred open through the same failure tail.
         }
         let cancel = Arc::new(AtomicBool::new(false));
+        let book_restore = if self.spread_shift.scope != self.current_spread_shift_scope() {
+            self.begin_book_shift_restore(
+                self.frame_counter
+                    .wrapping_add(self.input_seq)
+                    .wrapping_add(1),
+            )
+        } else {
+            None
+        };
         self.sidecar_restore = Some(SidecarRestoreState {
             #[cfg(test)]
             checking_relay: None,
@@ -1348,6 +1379,7 @@ impl App {
                 favorite_failures: Vec::new(),
                 warning: None,
                 source_change_reprobe: false,
+                book_restore,
                 clear_sidecar_cache_after_flush: false,
                 effects: RestoreEffects::default(),
             },
@@ -1683,6 +1715,7 @@ impl App {
 
     /// Advance the restore state without waiting. Called once per root frame.
     pub(crate) fn poll_sidecar_restore(&mut self, ctx: &egui::Context) {
+        self.poll_retained_shift_readoption(ctx);
         let Some(mut state) = self.sidecar_restore.take() else {
             return;
         };
@@ -2222,7 +2255,22 @@ impl App {
             }
             Phase::Resuming => Phase::Resuming,
         };
-        let keep = !matches!(state.phase, Phase::Resuming);
+        let mut keep = !matches!(state.phase, Phase::Resuming);
+        if !keep && let Some(restore) = state.common.book_restore.as_mut() {
+            match self.poll_book_shift_restore(restore) {
+                Ok(false) => keep = true,
+                Ok(true) => state.common.book_restore = None,
+                Err(error) => {
+                    crate::logger::log(format!("book shift restore failed: {error}"));
+                    self.show_feedback_toast(format!("見開き調整を復元できませんでした: {error}"));
+                    state.common.book_restore = None;
+                }
+            }
+        }
+        if !keep {
+            let nav = self.get_nav_indices();
+            self.spread_shift.resolve(&self.page_identity_index, &nav);
+        }
 
         if keep {
             self.sidecar_restore = Some(state);
@@ -2254,6 +2302,7 @@ impl App {
                     );
                 }
             }
+            self.spread_shift.finish_fenced_book_resume();
             ctx.request_repaint();
             return;
         }
@@ -2304,6 +2353,7 @@ impl App {
                 "sidecar_restore_deferred_identity_mismatch"
             });
         }
+        self.spread_shift.finish_fenced_book_resume();
         ctx.request_repaint();
     }
 
@@ -3012,6 +3062,7 @@ mod tests {
                 favorite_failures: Vec::new(),
                 warning: None,
                 source_change_reprobe: false,
+                book_restore: None,
                 clear_sidecar_cache_after_flush: false,
                 effects: RestoreEffects::default(),
             },
@@ -4668,11 +4719,14 @@ mod tests {
                     .excluded_extensions
                     .insert("png".into());
                 app.settings.book_open_resume = crate::settings::ResumeMode::Resume;
-                app.book_resume_db
-                    .as_ref()
-                    .unwrap()
-                    .set(&folder, 0)
-                    .unwrap();
+                // Fresh Book adoption reads through the writer's captured FIFO fence.
+                // Use the production producer rather than bypassing its immutable snapshot.
+                assert!(
+                    app.book_resume_writer
+                        .as_ref()
+                        .unwrap()
+                        .record(&folder, 0, None)
+                );
             }
             let ctx = egui::Context::default();
             assert!(app.start_active_detached_book_context(

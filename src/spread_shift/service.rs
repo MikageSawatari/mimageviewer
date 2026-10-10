@@ -284,6 +284,27 @@ impl SpreadShiftService {
         self.shared.admission.lock().unwrap().watermarks
     }
 
+    pub(crate) fn maintenance_epoch(&self) -> u64 {
+        self.shared
+            .admission
+            .lock()
+            .unwrap()
+            .snapshot
+            .as_ref()
+            .map_or(0, |s| s.maintenance_epoch)
+    }
+
+    /// HUD-only observation. This is not a completion proof for open/restore.
+    pub(crate) fn observed_row(&self, scope: &BookScopeKey) -> Option<SpreadShiftPageRef> {
+        self.shared
+            .admission
+            .lock()
+            .unwrap()
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.rows.get(&scope.storage_key()).cloned())
+    }
+
     pub(crate) fn read_after(
         &self,
         scope: BookScopeKey,

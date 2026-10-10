@@ -572,7 +572,12 @@ mod recursive_snapshot_scan;
 mod runtime_ops;
 mod saved_group_actions;
 mod sidecar_restore;
+mod spread_shift_live_mappings;
+pub(crate) mod spread_shift_owner;
+#[cfg(test)]
+mod spread_shift_owner_tests;
 pub(crate) use sidecar_restore::SidecarRestorePresentation;
+use spread_shift_owner::ViewerSpreadShift;
 pub(crate) mod collection_grid;
 pub(crate) mod collection_navigation;
 pub(crate) mod raw_page_store;
@@ -14816,6 +14821,7 @@ pub(crate) enum FsOverflowPanelState {
     Closed,
     Root,
     NavigatorPosition,
+    SpreadAdjustment,
 }
 
 impl FsOverflowPanelState {
@@ -15296,6 +15302,7 @@ pub struct App {
     /// 編集・表示状態・★・タグの commit 後に、対象の物理ファイルを ledger worker へ渡す。
     /// この handle 自体は I/O を行わず、全ファイル読み出しは worker 側に閉じる。
     pub(crate) content_identity_recorder: Option<crate::content_identity::ContentIdentityRecorder>,
+    pub(crate) spread_shift_settings_generation: u64,
     pub(crate) spread_shift_service: Option<crate::spread_shift::SpreadShiftService>,
     spread_shift_process_owner:
         Option<Arc<std::sync::Mutex<Option<crate::spread_shift::SpreadShiftProcessOwner>>>>,
@@ -16551,9 +16558,9 @@ pub struct App {
     pub(crate) singleton_spread_endpoint_preferences:
         crate::settings::SingletonSpreadEndpointPreferences,
     pub(crate) page_alone_preferences: crate::settings::PageAlonePreferences,
-    /// Ctrl+←/→ の「1 ページずらし」用セッション内アンカー。
-    /// 保存はせず、この idx から先だけ見開きの組み始めを一時的にずらす。
-    pub(crate) spread_shift_anchor_idx: Option<usize>,
+    /// この viewer の見開き調整と、保存・復元に対する受付済み依存。
+    /// 描画用 index は identity/nav 投影から取得し、durable rows は共有 service が所有する。
+    pub(crate) spread_shift: ViewerSpreadShift,
     /// 現在の連結方式（ページ単位 / 縦連結 / 横連結）。
     pub(crate) reading_flow: crate::settings::ReadingFlow,
     /// 横連結時の読書方向。
@@ -18512,12 +18519,38 @@ impl App {
         let results = service.drain_results();
         let clear_results = service.drain_clear_results();
         let errors = service.drain_errors();
-        // D2 will attach accepted context dependencies at this exact scope boundary.
         let _changed_scopes = service.drain_changed_scope_keys();
-        // D1 has no pairing input producers. Commit facts survive the originating context.
         for result in results {
-            if let Err(error) = result.status {
+            let accepted = if result.operation.context_id == self.spread_shift_context_id() {
+                self.spread_shift
+                    .accept_write_reply(&result, self.settings.remember_spread_shift_per_book)
+            } else {
+                #[cfg(windows)]
+                {
+                    self.deliver_spread_shift_reply_at_rest(&result)
+                }
+                #[cfg(not(windows))]
+                {
+                    None
+                }
+            };
+            // Save completion never moves a page, rebuilds units, or updates a sibling's live shift.
+            if let Err(error) = &result.status {
                 self.show_feedback_toast(format!("見開き調整を保存できませんでした: {error}"));
+            } else if let Some(clear) = accepted {
+                self.show_feedback_toast(
+                    if clear {
+                        "見開き調整を解除しました"
+                    } else {
+                        "見開き調整を保存しました"
+                    }
+                    .into(),
+                );
+            } else if matches!(
+                self.viewer_context_residence(result.operation.context_id),
+                viewer_context_registry::ContextResidence::Retired
+            ) {
+                self.show_feedback_toast("見開き調整を保存しました".into());
             }
         }
         for error in errors {
@@ -19487,6 +19520,7 @@ impl App {
             view_trim_save_pending: false,
             view_trim_db,
             content_identity_recorder,
+            spread_shift_settings_generation: 0,
             spread_shift_service: None,
             spread_shift_process_owner: None,
             content_identity_index_load_pending,
@@ -19960,7 +19994,7 @@ impl App {
             singleton_spread_endpoint_preferences:
                 crate::settings::SingletonSpreadEndpointPreferences::default(),
             page_alone_preferences: crate::settings::PageAlonePreferences::default(),
-            spread_shift_anchor_idx: None,
+            spread_shift: Default::default(),
             reading_flow: crate::settings::ReadingFlow::default(),
             reading_direction: crate::settings::ReadingDirection::default(),
             spread_popup_open: false,
@@ -25403,6 +25437,7 @@ impl App {
             current_rating_key: None,
             spread_container_path: None,
             spread_container_fallback: None,
+            shift_read: None,
             // The producer has already removed an unpinned key from the mounted map. Include
             // the visible container keys so removal also invalidates its previous materialization.
             old_folder_pin_keys: paths
@@ -25937,7 +25972,7 @@ impl App {
         } else {
             self.spread_mode = stored_spread;
         }
-        self.spread_shift_anchor_idx = None;
+        // Base-rule hydration preserves the accepted shift owner; open adoption resolves it.
         Ok(())
     }
 
@@ -43135,6 +43170,7 @@ impl App {
             self.page_identity_index
                 .without_removed_indices(&sorted_asc),
         );
+        self.spread_shift.remap(&sorted_asc);
         let previous_index = std::mem::replace(&mut self.page_identity_index, remapped_index);
         self.retire_smart_folder_payloads([
             Box::new(previous_index) as smart_folder::RetiredSmartFolderPayload
@@ -44088,6 +44124,10 @@ impl App {
             index: &mut Option<MetadataImportRefreshIndex>,
             context_id: ViewerContextId,
             spread_container_key: Option<crate::spread_db::SpreadContainerKey>,
+            shift_read: Option<(
+                crate::book_scope::BookScopeKey,
+                std::sync::mpsc::Receiver<crate::spread_shift::ShiftReadReply>,
+            )>,
             old_folder_pin_keys: std::collections::HashSet<String>,
         ) -> Option<metadata_import_refresh::ContextRequest> {
             let index = index.take()?;
@@ -44102,6 +44142,7 @@ impl App {
                 current_rating_key: index.current_rating_key,
                 spread_container_path,
                 spread_container_fallback,
+                shift_read,
                 old_folder_pin_keys,
                 folder_pin_paths: index.folder_pin_paths,
                 folder_pin_aliases: index.folder_pin_aliases,
@@ -44118,10 +44159,12 @@ impl App {
                 if let Err(error) = self.with_viewer_context(context_id, |app| {
                     let spread_key = app.spread_container_key_with_fallback();
                     let old_folder_pin_keys = app.folder_pin_map.keys().cloned().collect();
+                    let shift_read = app.admit_imported_shift_read(changed.spread_shift);
                     if let Some(request) = take_current(
                         &mut app.metadata_import_refresh_index,
                         context_id,
                         spread_key,
+                        shift_read,
                         old_folder_pin_keys,
                     ) {
                         requests.push(request);
@@ -44138,10 +44181,12 @@ impl App {
             let context_id = ViewerContextId::single_context();
             let spread_key = self.spread_container_key_with_fallback();
             let old_folder_pin_keys = self.folder_pin_map.keys().cloned().collect();
+            let shift_read = self.admit_imported_shift_read(changed.spread_shift);
             if let Some(request) = take_current(
                 &mut self.metadata_import_refresh_index,
                 context_id,
                 spread_key,
+                shift_read,
                 old_folder_pin_keys,
             ) {
                 requests.push(request);
@@ -44615,7 +44660,7 @@ impl App {
             }
             // 読み順の対応表は `SpreadMode::reading_direction` が正本 (上と同じ理由)。
             self.update_reading_direction_from_spread_mode(self.spread_mode);
-            self.spread_shift_anchor_idx = None;
+            // Base-rule hydration preserves the accepted shift owner; open adoption resolves it.
             self.final_cover_spread_preference = container.final_cover_spread_preference;
             self.singleton_spread_endpoint_preferences =
                 container.singleton_spread_endpoint_preferences;
@@ -44630,6 +44675,9 @@ impl App {
             self.view_trim_book_settings = trim.book_settings;
             self.view_trim_page_apply_root_idx = None;
             self.view_trim_page_spread_separate = self.view_trim_book_settings.spread_separate;
+        }
+        if let Some((scope, read)) = result.shift_read.take() {
+            self.adopt_imported_shift_read(scope, read);
         }
         let folder_pin_reset_indices =
             if let Some(prepared) = result.folder_pin_materializations.take() {
@@ -49086,6 +49134,16 @@ impl App {
                 ));
             }
         }
+        // Mirror only the admitted filesystem mutation in the matching live owner.
+        if spread_shift_live_mappings::migrate(
+            &mut self.spread_shift,
+            mappings,
+            collection_tree_migration,
+        ) {
+            self.invalidate_fullscreen_display_unit_owners();
+        }
+        #[cfg(windows)]
+        self.migrate_at_rest_spread_shifts(mappings, collection_tree_migration);
         let collection_mappings =
             book_collection_source_mappings(mappings, collection_tree_migration);
         self.enqueue_collection_source_migration_batch(collection_mappings);
@@ -57112,7 +57170,13 @@ impl App {
     fn saved_resume_is_unresolvable(&self) -> bool {
         self.current_folder
             .as_deref()
-            .and_then(|folder| self.book_resume_db.as_ref()?.get_position(folder))
+            .and_then(|folder| {
+                self.fenced_book_resume(folder).unwrap_or_else(|| {
+                    self.book_resume_db
+                        .as_ref()
+                        .and_then(|db| db.get_position(folder))
+                })
+            })
             .is_some_and(|position| {
                 matches!(
                     self.page_identity_index.resolve(&position),
@@ -57128,7 +57192,11 @@ impl App {
     }
 
     fn resume_page_for_path(&mut self, folder: &Path) -> Option<usize> {
-        let position = self.book_resume_db.as_ref()?.get_position(folder)?;
+        let position = self.fenced_book_resume(folder).unwrap_or_else(|| {
+            self.book_resume_db
+                .as_ref()
+                .and_then(|db| db.get_position(folder))
+        })?;
         match self.page_identity_index.resolve(&position) {
             file_type_resume::PositionResolution::Restored(index)
                 if self.is_readable_page_idx(index) =>
@@ -61827,6 +61895,7 @@ impl App {
             let activation = self.with_viewer_context(context_id, |app| {
                 app.activate_mounted_as_independent_detached(snapshot.id);
                 app.adopt_active_detached_viewport_runtime_from_passive("resume_viewer_context");
+                app.begin_retained_shift_readoption(ctx);
                 app.rearm_final_ai_prefetch_after_detached_resume();
                 Self::viewer_context_bundle_detached_source(ContextRef::mounted(app))
             });
@@ -62131,6 +62200,7 @@ impl App {
                 let close_viewport_id = (app.fs_viewport_shown
                     && app.fs_viewport_presentation == Some(ViewerPresentation::DetachedWindow))
                 .then(|| app.fullscreen_viewport_id());
+                app.poll_retained_shift_readoption(ctx);
                 // 前面の viewer への入力は、この context の polling / 描画より前に配る。
                 // ここは mount 済みなので、`fullscreen_idx` も items も**この viewer のもの**
                 // (2026-08-29 レビュー R-02)。

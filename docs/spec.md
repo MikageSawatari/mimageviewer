@@ -151,7 +151,7 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
   directoryへ、評価、タグ（表示順・最近使用順を保つ適用時刻と空タグを含む決定状態を含む）、
   動画・音声ブックマーク（横断一覧用WebPサムネイルを含む）、
   本ブックマーク、見開きモード・
-  連結方式・綴じ方向、表示トリム（本 / ページ）、非破壊回転、ページごとの画像補正・
+  連結方式・綴じ方向、本別見開き調整、表示トリム（本 / ページ）、非破壊回転、ページごとの画像補正・
   消しゴムマスク・隠蔽加工・部分補正・書き出しクロップ・テキスト注釈、フォルダ / 本の
   代表サムネピン、動画ピン（位置と WebP）を保存する。`mimageviewer.dat` の自動バックアップ
   設定が OFF でも、明示 export は中央 DB からこれらを読み、自己完結した manifest を作る。
@@ -183,6 +183,11 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
   `spread.db`は本の見開き・連結方式・綴じ方向がexport元環境のグローバル既定と一致すると行を持たないため、
   その本に明示値はexportされず、移送先では移送先のグローバル既定を使う。グローバル設定自体を
   転送対象外とする仕様に対応した挙動である。
+  本別見開き調整はmetadata transfer v10の`spread_shifts`とcoverageに含む。scopeは元本の
+  logical rootと実効ZIP level prefix、anchorはPageRefで、変換cacheの物理keyへ置換しない。
+  OFF休眠・Missingの保存値も搬送する。covered範囲の未記載scopeは既存調整をClearし、
+  coverage外は保持する。v7/v8/v9の字段不在は既存値を保持する。settings transferには
+  全体記憶boolだけを含め、本別anchorは含めない。外部フォルダ移動にはexport/importを使える。
 - インポートは先に sidecar 全体を検証し、存在件数、欠落件数、ファイル種別・サイズ相違件数を
   確認表示してから実行する。sidecar に記載された物理項目は、含まれる各メタ情報区分を
   ファイル単位で上書きする（空の区分は既存値を消す）。sidecar に記載がないファイルの
@@ -859,6 +864,38 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
 
 ### 4.2 表示仕様
 
+- 本別見開き調整 (§1.364 D2): `Ctrl+←/→` の1ページずらしを、既定ONの
+  `remember_spread_shift_per_book`に従って`spread_shift.db`へ非同期保存する。
+  保存するのはキー押下位置や符号offsetではなく実際のre-pairing anchorのPageRef。
+  本はlogical root + 実効ZIP level prefixで区別し、items/nav変更後もidentityから解決する。
+  Missing/filteredは他ページへ代用せず保存値を保持し、ページ復帰後は再解決できる。
+  新規/再入場は先行shift/resume writeの完了を満たした一つの受入結果からfirst unitを作る。
+  normal exitは先行writeをdrainする。履歴/読書位置の削除は調整を削除しない。
+  各viewerのlive調整はcontext別。同本siblingsをsave後に移動・再pairせず、最新保存値は
+  次の入場で使う。F12のfork/park/mount/closeはlive stateを移送/終了するだけで保存しない。
+  retained ONは受入済みidentity indexで再採用し、bundle内のtyped read ownerが待機を持つ。
+  fresh-openのglobal Commonと別contextのretained readは併存し、既存target-context gate/dialogで
+  対象窓だけを止める。兄弟窓の操作を維持し、parkはreceiverだけをdrop、forkはreceiverをcloneしない。
+  再採用はfresh cutoffを捕捉する。OFFはlive調整を保つ。
+  明示ON/OFFはretained待機を取り消し、受入済みの兄弟窓へ旧保存値を適用しない。
+  fresh-open待機は元のresume cutoffと捕捉済み対象を保ち、新settings世代・現在のshift受付cutoffで
+  依存を再受付する。設定変更で元の読書位置の完了待ちを失わない。
+  retained/import復元は現在の実ページを含むunitへ正規化するだけで共有resume/historyを書かない。
+  importの捕捉FIFO読取はContextRequest workerで待ち、context/items世代採用後に
+  current scope + ON + Automaticの一致で使う。成功済みroot/page操作はpureなlive mappingで
+  mounted/at-restへ反映し、追加save/mountなし。snapshotはdurable scopeを切り離して現在のnumeric session組を保つ。
+  記憶OFFは現表示をsession扱いで保持し、保存値を休眠させ、新規openの復元とnudge保存を止める。
+  OFF→ONは適格な操作元Bookのlive調整だけを保存し、調整なしではその場で旧保存値を適用しない。
+  siblings/parkedを一斉保存しない。明示ClearはOFF中もlive調整と保存値を消す (Q1)。
+  mode再押下・mode/flow/direction変更は従来のsession resetに加え、ONなら保存値もClearして通知する。
+  OFFならsession resetだけ。hydrationや一時Single pivotは明示Clearと推定しない (Q3)。
+  HUD `… → 見開きの調整` に状態、実re-pairing anchorへのjump、本別Clear、全体記憶checkboxを置く。
+  見開き操作の近くには調整の印を添え、保存結果は成功/失敗を通知する。新しいKeyActionは追加しない。
+  Composed/Unreadable/ExtractedResultでは調整groupを無効にし、Single/Splitの従来移動は保持する。
+  構成ありのmode-only変更は休眠保存値をClearせず、global boolは環境設定から変更できる。
+  PDF/EPUBは既存個別編集と同じ物理ページidentityを使う。内部再編・再変換/reflowで
+  内容がずれる制限をマニュアルに明記する。Remote saved/group統合はD3で、D2の提供範囲ではない。
+
 - 静止画 / ZIP 内画像 / PDF ページのフルスクリーンでは、タッチの中央矩形をタップすると
   上部バー（閉じる × を含む）と下部シークバーを表示 / 非表示にする。表示は時間切れにせず、
   ページ移動またはフルスクリーン終了で解除する。中央以外の左右タップは既存の読み方向と
@@ -1004,7 +1041,7 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
   クリップボードにコピーする。範囲コピーは一回限りで、永続的な切り取り設定や本ページの実体は変更しない。
 - 静止画の上部ホバーバーでは、`…` を `×` のすぐ左に置き、上部バー直下の画面右上へ暗色固定の
   「その他の機能」パネルを開く。中央タップには新しい意味を追加せず、タッチもマウスも同じ上部ボタンを
-  入口にする。パネルの操作行は 48pt とし、ナビゲータ ON / OFF、4 隅から選ぶ配置サブメニュー、
+  入口にする。パネルの操作行は 48pt とし、見開きの調整、ナビゲータ ON / OFF、4 隅から選ぶ配置サブメニュー、
   分析ツール、ピクセルグリッド、ルーペ固定をこの固定順で、現在状態と実効ショートカット付きで表示する。
   サブメニューには戻る行を置く。パネル矩形はタップ分類の除外領域とし、表示中は共通モーダル入力規則に
   従って背面の wheel / key / pointer 操作を止める。
@@ -2230,6 +2267,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `detached_viewer_open_images_in_window` | bool | false | 環境設定「ビューワモード」の複数ウィンドウ。ON のとき通常画像 / ZIP 内画像 / PDF ページを開くたびに新しい別ウィンドウで開き、動画 / 音声は 1 つのメディア別ウィンドウを再利用する。画像編集機能は複数ウィンドウ側では無効。ON の間は ZIP/PDF/対応アーカイブの直開き実効値も true になるが、`auto_fullscreen_zip_pdf` の保存値は変更しない。フル機能ウィンドウ用の「ページを開く」/「一覧を開く」コマンドは、どの入力経路でも理由をトースト表示して副作用なしの no-op にする |
 | `auto_fullscreen_zip_pdf` | bool | false | フル機能ウィンドウモードで、ZIP/PDF/対応アーカイブを一覧、起動引数、SendTo、外部ファイラ経由で明示的に開いたとき、ページ一覧を経由せずページをフルスクリーンで表示する保存値。複数ウィンドウモードではこの保存値に関わらず実効的に ON として扱う。開く位置 (1 ページ目 / 続きから) は位置復元マトリクスの `book_open_resume` に従う。フルスクリーン中の Esc/Enter で親一覧 (L1)、Backspace でそのファイルのページ一覧 (L2) へ戻る |
 | `auto_fullscreen_image_folders` | bool | false | 直開きの実効値が ON のとき、表示上の項目が 1 件以上かつ通常画像だけのフォルダも、ページ一覧を経由せずフルスクリーンで表示する。サブフォルダ、動画、ZIP/PDF、対応アーカイブが混ざるフォルダは対象外。開く位置は `book_open_resume` に従い、Esc/Enter は親一覧、Backspace はそのフォルダのページ一覧へ戻る |
+| `remember_spread_shift_per_book` | bool | true | 本別の見開き1ページずらしを記憶・復元する全体設定。旧設定で字段なしもtrue。OFFは保存済み調整を休眠保持し現在表示を変えない。ON復帰は操作元本のsession調整だけを保存し、旧値の復元は次回入場から。settings transferに含め、本別anchorはmetadata transferへ分離する |
 | `fullscreen_image_margin_color` | `[u8; 3]` | `[0, 0, 0]` | フルスクリーン表示の共通 RGB 余白色。通常 / F12 の静止画・本では単ページ / 見開き / 連結 / 比較、回転 / 表示トリム、360 度 / 分析のメインキャンバスと、サムネイルストリップのセル外空欄へ適用する。native 動画では映像表示矩形のレターボックスと、拡大・パン / scaling resolve で source 外になる画素へ適用する。透過画像内の黒 / 白 / 市松、実動画画素と素材に含まれる黒帯、字幕、音声 / 動画の音声モード、HUD / 左右パネル、ナビゲータ / ルーペなど部品内部の背景、画像画素と copy / capture / export は変更しない |
 | `fullscreen_fit_mode` | FullscreenFitMode | Page | フルスクリーンのズーム/フィット基準。ページ全体 / 横幅 / 縦幅 / 100%原寸。旧ページ全体+余白カットは表示トリムの自動余白カットへ移行する |
 | `fullscreen_fit_cycle_excluded` | Vec<String> | [] | フィット循環から除外するstable ID。既定は全選択可能モード有効。最低1つ必須。未知IDを保持し、新モードは明示除外済みでなければ有効（変更済みの集合にも適用）。全候補除外の読込値は先頭モードを有効化。環境設定転送の対象 |

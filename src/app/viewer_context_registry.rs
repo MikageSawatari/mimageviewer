@@ -1076,7 +1076,7 @@ pub(in crate::app) struct ViewerContextBundle {
     final_cover_spread_preference: crate::settings::FinalCoverSpreadPreference,
     singleton_spread_endpoint_preferences: crate::settings::SingletonSpreadEndpointPreferences,
     page_alone_preferences: crate::settings::PageAlonePreferences,
-    spread_shift_anchor_idx: Option<usize>,
+    pub(super) spread_shift: super::spread_shift_owner::ViewerSpreadShift,
     reading_flow: crate::settings::ReadingFlow,
     reading_direction: crate::settings::ReadingDirection,
     slideshow_playing: bool,
@@ -1179,6 +1179,7 @@ pub(in crate::app) struct ContextRef<'a> {
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::app) enum ContextAsyncOwner {
+    RetainedSpreadShift,
     PathClassification,
     HistoryTransition,
     CollectionGrid,
@@ -1209,7 +1210,8 @@ pub(in crate::app) enum ContextAsyncServicePhase {
 
 #[cfg(windows)]
 impl ContextAsyncOwner {
-    pub(in crate::app) const ALL: [Self; 19] = [
+    pub(in crate::app) const ALL: [Self; 20] = [
+        Self::RetainedSpreadShift,
         Self::EpubConversion,
         Self::PdfPassword,
         Self::PathClassification,
@@ -1235,6 +1237,7 @@ impl ContextAsyncOwner {
         macro_rules! pending {
             ($owner:ident) => {
                 match self {
+                    Self::RetainedSpreadShift => $owner.spread_shift.retained_readoption_pending(),
                     Self::PathClassification => $owner
                         .top_level_grid_view
                         .open_path_classification()
@@ -1315,6 +1318,7 @@ impl ContextAsyncOwner {
             return;
         }
         match self {
+            Self::RetainedSpreadShift => app.poll_retained_shift_readoption(ctx),
             Self::PathClassification => app.poll_open_path_classification(ctx),
             Self::HistoryTransition => app.poll_collection_history_transition(ctx),
             Self::CollectionGrid => app.poll_collection_grid(ctx),
@@ -1453,6 +1457,7 @@ impl ContextAsyncOwner {
                 }
             }
             Self::SimilarPreview => app.similar_panel.preview.terminate_on_park(),
+            Self::RetainedSpreadShift => app.spread_shift.cancel_retained_readoption(),
         }
     }
 }
@@ -2056,7 +2061,7 @@ impl ViewerContextBundle {
             singleton_spread_endpoint_preferences:
                 crate::settings::SingletonSpreadEndpointPreferences::default(),
             page_alone_preferences: crate::settings::PageAlonePreferences::default(),
-            spread_shift_anchor_idx: None,
+            spread_shift: Default::default(),
             reading_flow: crate::settings::ReadingFlow::default(),
             reading_direction: crate::settings::ReadingDirection::default(),
             slideshow_playing: false,
@@ -2423,7 +2428,7 @@ impl App {
             final_cover_spread_preference,
             singleton_spread_endpoint_preferences,
             page_alone_preferences,
-            spread_shift_anchor_idx,
+            spread_shift,
             reading_flow,
             reading_direction,
             slideshow_playing,
@@ -2708,7 +2713,7 @@ impl App {
         swap_field!(final_cover_spread_preference);
         swap_field!(singleton_spread_endpoint_preferences);
         swap_field!(page_alone_preferences);
-        swap_field!(spread_shift_anchor_idx);
+        swap_field!(spread_shift);
         swap_field!(reading_flow);
         swap_field!(reading_direction);
         swap_field!(slideshow_playing);
@@ -3040,7 +3045,7 @@ impl App {
             final_cover_spread_preference,
             singleton_spread_endpoint_preferences,
             page_alone_preferences,
-            spread_shift_anchor_idx,
+            spread_shift,
             reading_flow,
             reading_direction,
             slideshow_playing,
@@ -3364,7 +3369,7 @@ impl App {
             final_cover_spread_preference,
             singleton_spread_endpoint_preferences,
             page_alone_preferences,
-            spread_shift_anchor_idx,
+            spread_shift,
             reading_flow,
             reading_direction,
             pdf_enumerate_pending,
@@ -3463,7 +3468,7 @@ impl App {
         detached.final_cover_spread_preference = self.final_cover_spread_preference;
         detached.singleton_spread_endpoint_preferences = self.singleton_spread_endpoint_preferences;
         detached.page_alone_preferences = self.page_alone_preferences;
-        detached.spread_shift_anchor_idx = self.spread_shift_anchor_idx;
+        detached.spread_shift = self.spread_shift.fork_accepted();
         detached.reading_flow = self.reading_flow;
         detached.reading_direction = self.reading_direction;
 
@@ -3688,6 +3693,49 @@ impl App {
 
     pub(in crate::app) fn viewer_context_residence(&self, id: ViewerContextId) -> ContextResidence {
         self.viewer_contexts.table.residence(id)
+    }
+
+    pub(in crate::app) fn deliver_spread_shift_reply_at_rest(
+        &mut self,
+        reply: &crate::spread_shift::ShiftWriteReply,
+    ) -> Option<bool> {
+        self.viewer_contexts
+            .table
+            .at_rest_mut(reply.operation.context_id)
+            .and_then(|bundle| {
+                bundle
+                    .spread_shift
+                    .accept_write_reply(reply, self.settings.remember_spread_shift_per_book)
+            })
+    }
+
+    pub(in crate::app) fn make_at_rest_spread_shifts_session_only(&mut self) {
+        for slot in self.viewer_contexts.table.slots.values_mut() {
+            let bundle = match slot {
+                Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
+            };
+            bundle.spread_shift.session_only();
+        }
+    }
+
+    pub(in crate::app) fn migrate_at_rest_spread_shifts(
+        &mut self,
+        mappings: &[crate::books::BookPathMapping],
+        root_move: Option<(&std::path::Path, &std::path::Path)>,
+    ) {
+        for slot in self.viewer_contexts.table.slots.values_mut() {
+            let bundle = match slot {
+                Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
+            };
+            if super::spread_shift_live_mappings::migrate(
+                &mut bundle.spread_shift,
+                mappings,
+                root_move,
+            ) {
+                bundle.fullscreen_navigator_interaction.invalidate();
+                bundle.similar_panel.preview.invalidate();
+            }
+        }
     }
 
     pub(crate) fn locate_window_context(

@@ -5,14 +5,54 @@
 
 ---
 
-## 本別見開き調整の永続化基盤（§1.364 D1、2026-10-10）
+## 本別見開き調整の永続化基盤とviewer接続（§1.364 D1/D2、2026-10-10）
 
 `SpreadShiftService`のUI handleは送信・immutable snapshot lookup・結果pollだけを行い、
 一つのworkerが`spread_shift.db`の接続とSet/Clear/読取を所有する。受付sequenceはownerのFIFOへの受理後、
 完了sequenceはtransaction終端後に公開する。通常warm読取にはDB round-tripを足さない。
 `RestoreReceipt`はcontext/scope/items/settings世代とshift/resumeのadmitted cutoffを捕捉し、
 pureな`RestoreReadDependencies`が両writerの固定した読取点の完了証明を照合して一回だけ返す。
-viewerのfirst-display continuationへの組込みはD2で、現在のwarm PDF表示/既存setterは変えない。
+基盤だけのD1に続き、D2の接続差分では`App::begin_book_shift_restore`が
+`ViewerBookRestore { receipt, reads, resume_key, memory, cause }`を既存sidecar continuationへ渡す。
+`poll_book_shift_restore`はcontext/scope/items/settings世代とmaintenance epochを照合し、
+両writerの先行要求が完了した結果だけを一回採用する。保存済みPageRefを最終identity/navへ解決し、
+位置はownerの`FencedResume`に保持して既存のresume consumerへ渡す。
+同open continuationの初回採用が終わった時点で`finish_fenced_book_resume`が依存を終了する。
+後のsession内resume参照に初回の位置を使い続けず、従来の現在位置参照へ戻す。
+新しい表示後restore callbackやDB待ちloopを作らず、既存warm PDF準備とbase setterの同期契約を保持する。
+
+明示nudge/Clearはscopeと`ShiftOperation { context_id, items_generation, operation_sequence }`を
+捕捉してserviceへ送り、`ViewerSpreadShift`の現在操作だけが同sequenceのreplyを採用する。
+保存完了は`ShiftPersistence`の更新と通知だけで、ページ移動や兄弟窓のlive再解決を起こさない。
+Appの一つのpollからmounted ownerまたはregistry内のat-rest bundleへ配送し、元ownerが
+retiredでも保存済みの元scopeを別本へ読み替えない。OFFへ切り替えた後も送信済みwriteは完了させる。
+ON/OFF時は既存live調整をsession扱いにし、ON化元のBookだけを保存する。
+`session_only`はretainedのpending receiverを取り消して受入済みsessionを保持するため、
+表示済みsiblingsへ旧保存値を後から適用しない。fresh-openのCommon依存は元のresume fenceを
+捨てず、明示設定変更時だけ`refresh_pending_book_shift_memory_policy`で読取依存を再受付する。
+捕捉済みtarget/context/items/open/scope・元のresume cutoffを維持し、settings世代とshift受付cutoff
+だけを現値へ更新する。通常のpolicy遷移であり、retry・まれな失敗の復旧機構ではない。
+
+新規openの`ViewerBookRestore`は従来どおりglobal `Common` continuationが所有する。
+retained ONの`begin_retained_shift_readoption`は受入済みidentity indexを再利用し、
+待機receiverをbundle内の`ViewerSpreadShift.retained: RetainedReadoption::Idle | Reading`へ入れる。
+global Commonと別contextのretained readは併存できる。既存のtarget-context semantic gate
+(`sidecar_restore_blocks_projected_context`)と`show_sidecar_restore_dialog`で対象窓だけを停止し、
+無関係な兄弟窓の操作は維持する。全窓modalはreleased sibling input契約を削るため採らない。
+既存async inventoryの`ContextAsyncOwner::RetainedSpreadShift`がpollとcancel-on-parkを持つ。
+parkでreceiverをdropしてaccepted sessionを保ち、次のreadoptionはfresh cutoffを捕捉する。
+forkは`fork_accepted`でaccepted layoutだけを複製し、receiver・元contextのwrite受付は引き継がない。
+保存待ち/失敗の調整は新contextではsession扱いにし、元contextだけがwrite完了を受け取る。
+OFFは何も再読取せずlive調整を保つ。retained/import採用は
+`adopt_shift_layout_without_navigation`で現在の実ページを含むunitへ正規化し、
+共有resume/historyへのbackground writeを作らない。
+metadata importのContextRequestは受付時にscopeとFIFO読取を捕捉する。既存refresh workerが
+その結果を待ち、context/items世代の採用後にcurrent scope + ON + Automaticを照合する。
+shift未変更の区分は捕捉読取を待たず、OFFではshift結果を無視する。
+成功済みroot/page移行をlive ownerへ反映する`spread_shift_live_mappings`はpureで、
+mounted/at-restを追加mountや保存なしで更新する。永続側の移行は同workerの既存FIFOが所有する。
+本節は現在の実装差分の説明で、自動検証・独立完了レビュー合格を表すものではない。
+Remote saved resolution/group・G3共同fixtureはD3で接続する。
 
 既存`BookResumeWriter`に`ReadPositionAfter`と位置snapshotを追加した。外部準備workerの位置SELECTは、
 transaction開始前にcutoffが完了し、前後の受付/完了watermarkが同一の時だけ証明可能。

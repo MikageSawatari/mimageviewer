@@ -2287,6 +2287,9 @@ impl App {
         if self.settings.fullscreen_fit_mode != settings.fullscreen_fit_mode {
             self.invalidate_all_continuous_specified_fit_references();
         }
+        if self.settings.remember_spread_shift_per_book != settings.remember_spread_shift_per_book {
+            self.spread_shift_memory_setting_changed(settings.remember_spread_shift_per_book);
+        }
         self.settings = settings;
         #[cfg(windows)]
         self.publish_effetune_auto_setting();

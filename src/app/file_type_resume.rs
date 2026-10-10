@@ -17,6 +17,7 @@ pub(crate) struct PreparedPageIdentityIndex {
     // Logical paths never need cloning during UI deletion. Original slots remain stable
     // while the small integer projection changes with the same row-removal rule.
     identities: Arc<HashMap<PageIdentity, usize>>,
+    shift_identities: Arc<HashMap<PageIdentity, usize>>,
     current_slots: Vec<Option<usize>>,
     readable_indices: HashSet<usize>,
 }
@@ -45,9 +46,14 @@ impl PreparedPageIdentityIndex {
                 readable_indices.insert(index);
             }
         }
+        let shift_identities = identities
+            .iter()
+            .map(|(identity, index)| (shift_identity_key(identity), *index))
+            .collect();
         Self {
             policy,
             identities: Arc::new(identities),
+            shift_identities: Arc::new(shift_identities),
             current_slots: (0..items.len()).map(Some).collect(),
             readable_indices,
         }
@@ -72,6 +78,7 @@ impl PreparedPageIdentityIndex {
         Self {
             policy: self.policy.clone(),
             identities: Arc::clone(&self.identities),
+            shift_identities: Arc::clone(&self.shift_identities),
             current_slots: self
                 .current_slots
                 .iter()
@@ -124,9 +131,14 @@ impl PreparedPageIdentityIndex {
                     .map_or(0, |max| max + 1),
             )
             .max(slots.iter().flatten().max().map_or(0, |max| max + 1));
+        let shift_identities = identities
+            .iter()
+            .map(|(identity, index)| (shift_identity_key(identity), *index))
+            .collect();
         Self {
             policy: self.policy.clone(),
             identities: Arc::new(identities),
+            shift_identities: Arc::new(shift_identities),
             current_slots: (0..len).map(Some).collect(),
             readable_indices,
         }
@@ -149,6 +161,35 @@ impl PreparedPageIdentityIndex {
         } else {
             PositionResolution::InvalidRaw
         }
+    }
+
+    /// Shift lookup shares the accepted row slots, with its own specified slash/case rule.
+    /// It never invokes the legacy resume raw-index fallback.
+    pub(crate) fn resolve_shift_identity(&self, identity: &PageIdentity) -> Option<usize> {
+        self.shift_identities
+            .get(&shift_identity_key(identity))
+            .and_then(|slot| self.current_slots.get(*slot).copied().flatten())
+    }
+}
+
+fn shift_identity_key(identity: &PageIdentity) -> PageIdentity {
+    let path = |value: &str| value.replace('\\', "/").to_lowercase();
+    match identity {
+        PageIdentity::Image { path: value } => PageIdentity::Image { path: path(value) },
+        PageIdentity::Archive {
+            container,
+            entry_name,
+        } => PageIdentity::Archive {
+            container: path(container),
+            entry_name: path(entry_name),
+        },
+        PageIdentity::Document {
+            container,
+            page_num,
+        } => PageIdentity::Document {
+            container: path(container),
+            page_num: *page_num,
+        },
     }
 }
 

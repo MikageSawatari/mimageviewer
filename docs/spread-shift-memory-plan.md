@@ -6,6 +6,10 @@
 今回の変更は本書と `target/D-1364-design-r3-msg.txt` だけ。コード変更、テスト実行、ビルド、
 製品起動、コミットは行わない。以下の型・メソッド・テーブル名は、現行と明記したもの以外は提案。
 
+上記はR3文書作成時の作業範囲の記録。後続D2の現在の実装差分は§11.4に追記し、
+設計決定・過去の確認記録は保持する。実装記述だけで自動検証・独立完了レビュー・利用者確認の
+完了を表さない。
+
 ## 1. 正本・確定要件
 
 正本は [next-release-backlog.md §1.364](next-release-backlog.md)。全節と指定された
@@ -271,6 +275,11 @@ reset後すぐhydrationで旧saved shiftを再適用して、既存の基本pair
 cold 未準備・保存中・maintenance 中は既存 typed open/hydration continuation が依存を所有する。
 既存 `SidecarLoadContinuation` / `FirstDisplayAction`（`src/app/sidecar_restore.rs:91`、`:104`）の
 同じ open recipe に依存を足し、ZIP/document/retained の対応する受入点へ渡す。既存 base spread 読取は移管しない。
+D2の所有はfresh-openが`Common.ViewerBookRestore`、retainedがbundle内の
+`ViewerSpreadShift.retained: RetainedReadoption::Idle | Reading`とする。既存のtarget-context
+semantic gate/dialogで自分の依存だけを待ち、別contextのglobal Commonやretained読取と併存できる。
+全窓modalへまとめる案は、global sidecar recovery中も無関係なsiblingsを操作できるreleased契約を
+損なうため採らない。読取待ちはcontextごとの一つのtyped ownerに載せ、全interleavingを救済する機構を加えない。
 新しい shift_pending bool や、表示後の別 save-restore callback を作らない。
 **キャッシュ済み PDF の即時 placeholder / 最初の表示を全ページ列挙待ちへ変更しない**。
 最初の unit に使う saved ref はその受入経路で準備し、後から基本 pair→復元 pair と画面を飛ばさない。
@@ -455,6 +464,9 @@ A の保存で B のページや組を live に変えない。B が後から nud
 B の close / passive capture / mount だけでは旧値を保存しない。
 再入場時は §6.1 の receipt / 先行要求完了を満たした snapshot を使い、retained Book も既存復帰 adoption
 で同じ causal fence を通す。commit済sequenceだけの照合では先行未完了Set/Clearを見落とすため禁止。
+retainedのpending receiverはbundle所有で、`ContextAsyncOwner::RetainedSpreadShift`がpollと
+cancel-on-parkを扱う。parkはreceiverをdropし受入済みsessionを保持する。将来の再採用は新しいcutoffを
+捕捉し、forkは受入済みstateだけをcloneしてreceiverを共有しない。
 退避中の別本には何もしない。memory OFF の live/retained session は従来の移送契約を維持する。
 復帰は現実ページidentityを保ってreceiptの読取点の保存値でunitを解き、共有resume/historyへ背景writeしない。
 
@@ -690,6 +702,7 @@ G0 handoff（`C:/home/mimageviewer-nextbook/target/G-1242-g0-msg.txt:22`–31）
 | 単一 commit 点 | 採用。Set/Clear の一行 transaction 成功だけで saved publication。読み取り・close・resize・初期化から write しない |
 | 先行保存と再入場の全interleaving | 固定receipt + writer FIFO読取を既存open continuationへ合流。admitted/committedを区別し、後着reply救済/永続pending/二DB同時commitなしで通常再入場の組合せを削減 |
 | 既存 open / reload / index / unit paths | 採用。準備 worker と既存 adoption に Restore を含める。設定 OFF で全窓を閉じる専用 rebuild は不要 |
+| retained読取待ちをglobal Commonへ合流し全窓modalにする | 不採用。別窓のglobal sidecar復元中も無関係なsiblingsを操作できるreleased契約を失う。fresh-openはCommon、retainedはbundle内の一つのtyped `RetainedReadoption`が依存を所有し、既存target-context semantic gate/dialogで対象だけを止める。全interleavingの救済機構・全窓停止を追加しない |
 | composition と shift の全組合せ | G 決定の二択 LayoutSource で排除。Composed は休眠保持だけ、解除時に一回再評価 |
 | 保存を modal にして navigation/F12 を止める | 不採用。連続 nudge / 普通のページ送りが遅くなり、手間も増える。短い一行保存の scope/ref を捕捉すれば DB write で navigation を待つ必要がない。必要だと判明したら利用者へ相談 |
 | 全窓に最後の saved shift を即時反映 | 不採用。読んでいる兄弟窓を移動/再pair させる。session は窓別、保存は last explicit action、再入場で最新値という単純規則 |
@@ -750,6 +763,47 @@ shared behavior を触る最終実装では `scripts/test-full.ps1`、fmt、UI g
 display-pipeline、async-architecture、virtual-folders、keymap、web-remote、docs index、detached §11。
 新キーで解除/jump を追加する場合だけ KeyAction 一式を揃え、既定キーは衝突確認の上で別途決める。
 本案は HUD の操作のみを追加し、Ctrl+左右の既定割当は変えない。
+
+### 11.4 D2実装・自動検証記録（2026-10-10、独立完了レビュー待ち）
+
+基点はD1統合後の`33e862221`。この節は`next-viewer`作業差分の実装箇所を記録する。
+自動検証の実施結果は本節末尾に記録する。独立レビューと実機受入は未実施。
+
+| 所有境界 | 現在のD2接続 |
+| --- | --- |
+| live state | `src/app/spread_shift_owner.rs::ViewerSpreadShift`にscope、`ViewerShift::None / Ordinary / Book`、現在writeの`ShiftCommand`、`FencedResume`、typedな`RetainedReadoption`、identity/nav投影を集約。`App`の旧raw anchor fieldを独立ownerとして使わず、`spread_shift_anchor_idx()`で描画indexを投影する |
+| 保存受付 | `set_live_spread_shift`は実re-pairing anchorからPageRefを捕捉し、記憶ONのBookだけSetを受理。ordinary listの従来ずらしはsession調整。Q3 resetは既存base setter成功後に`reset_live_spread_shift(false)`へ、HUD明示解除は`true`へ接続 |
+| reply | sequence/context/items/operation/scopeが同じ現在操作だけが`accept_write_reply`を採用。Appの一つのpollがmounted ownerかregistryのat-rest bundleへ配送し、保存完了からページ移動・兄弟unit失効を行わない |
+| Restore | fresh-openは`sidecar_restore::Common`に`ViewerBookRestore`を保持し、`begin_book_shift_restore`でreceipt/cutoffを捕捉、`poll_book_shift_restore`で先行shift/resume完了と世代を照合。最終identity/navへ調整を解決してから同continuationの位置復元・first-displayへ進む。resumeは既存root-only資格を保持し、`finish_fenced_book_resume`が同open continuationの初回採用完了で依存を終了する。後のsession内resume参照を初回値へ固定しない |
+| items/cache | `PreparedPageIdentityIndex::resolve_shift_identity`とnav membershipでPageRefを解決。Missing/filteredは`NotInView`でref保持。削除とsnapshot remapはlive resolutionへ適用。snapshot化ではdurable scopeを切り離して、その時点のnumeric pairingをOrdinary sessionに保つ。共通display-unit/cacheにはownerから解決済みindexを渡す |
+| retained | ONの`begin_retained_shift_readoption`は受入済みindexを再利用。待機はbundle内の`RetainedReadoption::Idle / Reading`が所有し、global Commonと別contextのreadを併存できる。既存target-context semantic gate/dialogで対象窓だけを停止する。`ContextAsyncOwner::RetainedSpreadShift`がpoll/cancel-on-parkを扱い、parkはreceiverをdropしてaccepted sessionを保つ。将来の再採用はfresh cutoffを捕捉し、forkはaccepted stateだけをclone。OFFはlive調整を変更しない |
+| import採用 | 捕捉FIFO読取はContextRequest workerで待ち、context/items世代の採用後にcurrent scope + ON + Automaticを照合して採用。OFFでは結果を使わない。retained/import両採用とも`adopt_shift_layout_without_navigation`で現在の実ページを含むunitへ正規化し、共有resume/historyを書かない |
+| live移行 | `spread_shift_live_mappings`は成功済みroot/page操作と同じmappingをmounted/at-rest ownerへpureに反映。追加save/mountを発生させず、durable移行は既存maintenance workerが所有する |
+| F12 | `ViewerContextBundle`にlive ownerを保持して既存swapで移送。forkは`fork_accepted`でaccepted layoutだけを複製し、元contextのwrite受付・receiverを引き継がない。保存待ち/失敗の調整は新contextでsession扱い。park/mount/drop/closeは保存producerではない。OFF/ONでat-restもsession扱いにし、操作元BookだけがON復帰Setの対象 |
+| 設定/HUD | Settingsの`remember_spread_shift_per_book`はdefault/旧設定ともtrue。preferences採用点で世代とQ1を更新。settings transferはboolのみ。HUD `… → 見開きの調整`に状態、実基点jump、Clear、全体checkboxを追加し、見開きcontrol近くの印も同ownerから作る。新KeyActionは追加しない |
+| policy変更中の依存 | 明示ON/OFFで`ViewerSpreadShift::session_only`はretained pending receiverを取り消してaccepted sessionを保ち、表示済みsiblingsへ旧保存値を復元しない。fresh-openのCommon依存は元resume fenceを破棄せず、`refresh_pending_book_shift_memory_policy`が捕捉済みtarget/context/items/open/scopeと元resume cutoffを保って、新settings世代・現在のshift受付cutoffで読取依存を再受付する。明示設定変更の通常遷移だけで、retry/まれな失敗の復旧ではない |
+| 文書 | spec/manual/製品ページ/privacyにQ1/Q3、物理ページidentityのPDF/EPUB制限、metadata v10の本別調整搬送・外部移動を反映。architecture/display/asyncとdetached §11に所有境界を記録 |
+
+retained readoptionとmetadata import後のcontext限定refreshは同D2 chunkに接続した。
+構造補正としてretained待機をglobal Commonからcontext ownerへ移した。global sidecar recovery中も
+別の兄弟窓が操作できるreleased契約がコードで確認されたため、一括modal化は採らない。
+既存target-context semantic gate/dialog、async inventory、park取消を使い、別の全interleaving machineryを作らない。
+この実装接続説明だけをC1–C12共同fixtureの受入証拠として扱わない。
+G3のLayoutSource/構成解除統合、Remote saved resolution/group parity/reset、共同fixtureはD3。
+detached §11の記録は実変更範囲と構造的な判断理由であり、独立完了レビューによる確認待ち。
+利用者指定のD2検証matrixを実施した。全libは指定どおり1回実行し、11,848成功・55 ignored・
+3失敗だった。失敗はwriterを迂回したresume fixture、初回`FencedResume`の寿命、HUD追加行による
+高さ前提であり、期待する終了・現在位置参照・48px touch/右上配置を保持して修正した。
+修正後のfocused 84件、sidecar restore 51件、startup restore 73件、overflow 5件、context registry
+74件は全成功。保存待ちF12 forkと初回採用後のresume更新も追加回帰で確認した。
+修正の影響を受けない全libの成功結果は再利用し、全libの非ゼロ結果をclean passとは記録しない。
+metadata refresh 9件、`cargo test --test ui_snapshot` 155件も成功。HUDの8基準画像
+（light/dark・通常/狭幅・解決済み/一覧外）と更新したroot menu画像を目視確認した。
+`cargo fmt --all --check`、UI glyph検査（危険glyph 0）、通常/portable core check、
+`scripts/build-dev.ps1 -PreserveRuntime`は成功。normal featureのdev-runtime coreとcompanionsを用意し、
+製品は起動していない。実装者handoffは`target/D-1364-d2-msg.txt`へ保存する。
+workspace full gate・共同fixtureはD3の最終統合へ、独立構造確認・完了レビューと別承認の実機確認は
+§11.3の検証ownerへ引き継ぐ。コミットは利用者の指示どおり行っていない。
 
 ## 12. 決定済み事項（番号固定）
 

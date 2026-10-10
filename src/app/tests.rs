@@ -1218,6 +1218,7 @@ fn mutation_refresh_synthetic_materialization_rejects_changed_cache_owner() {
         video_pin_blobs: None,
         video_items: None,
         container_state: None,
+        shift_read: None,
     };
     let new_map = Arc::new(std::sync::RwLock::new(Default::default()));
     app.current_color_cache_map = Some(new_map.clone());
@@ -4342,6 +4343,7 @@ fn metadata_import_keeps_unaffected_thumb_adjustment() {
         video_pin_blobs: None,
         video_items: None,
         container_state: None,
+        shift_read: None,
     };
     assert!(app.apply_current_metadata_import_terminal_result(
         result,
@@ -4396,6 +4398,7 @@ fn phase_a2_metadata_import_updates_virtual_keyed_owner() {
         video_pin_blobs: None,
         video_items: None,
         container_state: None,
+        shift_read: None,
     };
     let changed = crate::metadata_transfer::ImportChangedSections {
         page_state: true,
@@ -6688,7 +6691,7 @@ fn spread_page_dims_survive_fs_cache_and_thumbnail_eviction() {
         .collect();
     app.items_generation = 7;
     app.spread_mode = crate::settings::SpreadMode::Rtl;
-    app.spread_shift_anchor_idx = None;
+    app.set_spread_shift_anchor_for_test(None);
 
     let portrait_tex = ctx.load_texture(
         "spread_portrait_thumb",
@@ -6967,7 +6970,7 @@ fn spread_cache_token_tracks_every_pairing_input() {
         2
     );
 
-    app.spread_shift_anchor_idx = Some(2);
+    app.set_spread_shift_anchor_for_test(Some(2));
     app.spread_display_unit_pages_for_test(&nav);
     assert_eq!(
         crate::ui_fullscreen::spread_display_units_build_count_for_test(),
@@ -7368,6 +7371,7 @@ fn metadata_context_result(
         video_pin_blobs: None,
         video_items: None,
         container_state: None,
+        shift_read: None,
     }
 }
 
@@ -9164,6 +9168,7 @@ fn metadata_import_terminal_refresh_reaches_main_and_detached_context_for_same_b
         video_pin_blobs: None,
         video_items: None,
         container_state: None,
+        shift_read: None,
     };
     let result = crate::app::metadata_import_refresh::RefreshResult {
         contexts: vec![context(main_id), context(detached_id)],
@@ -10025,6 +10030,7 @@ fn metadata_import_terminal_refresh_rejects_stale_items_generation() {
             video_pin_blobs: None,
             video_items: None,
             container_state: None,
+            shift_read: None,
         }],
         page_snapshot: None,
         errors: Vec::new(),
@@ -10160,6 +10166,7 @@ fn metadata_import_terminal_refresh_keeps_untagged_loaded_and_restarts_rating_re
         video_pin_blobs: None,
         video_items: None,
         container_state: None,
+        shift_read: None,
     };
     let result = crate::app::metadata_import_refresh::RefreshResult {
         contexts: vec![context(main_id), context(active_id), context(paused_id)],
@@ -38514,7 +38521,7 @@ mod favorite_adjustment_defaults_tests {
             app.visible_indices = (0..5).collect();
             app.viewer_navigation_caches.invalidate();
             app.spread_mode = mode;
-            app.spread_shift_anchor_idx = anchor;
+            app.set_spread_shift_anchor_for_test(anchor);
             app.fullscreen_idx = Some(final_unit_start);
 
             assert_eq!(
@@ -38576,7 +38583,7 @@ mod favorite_adjustment_defaults_tests {
             .compute_spread_offset_nudge(0, 1)
             .expect("前方ずらしは範囲内");
         assert_eq!(new_idx, 1);
-        app.spread_shift_anchor_idx = Some(anchor_idx);
+        app.set_spread_shift_anchor_for_test(Some(anchor_idx));
         app.fullscreen_idx = Some(new_idx);
         assert_eq!(
             app.resolve_spread_pair(new_idx),
@@ -38589,7 +38596,7 @@ mod favorite_adjustment_defaults_tests {
             .compute_spread_offset_nudge(1, 1)
             .expect("前方ずらしは範囲内");
         assert_eq!(new_idx, 2);
-        app.spread_shift_anchor_idx = Some(anchor_idx);
+        app.set_spread_shift_anchor_for_test(Some(anchor_idx));
         app.fullscreen_idx = Some(new_idx);
         assert_eq!(
             app.resolve_spread_pair(new_idx),
@@ -38631,7 +38638,7 @@ mod favorite_adjustment_defaults_tests {
             anchor_idx, 0,
             "表紙ありでは先頭から組み直し、直前ページの孤立を避ける"
         );
-        app.spread_shift_anchor_idx = Some(anchor_idx);
+        app.set_spread_shift_anchor_for_test(Some(anchor_idx));
         app.fullscreen_idx = Some(new_idx);
         assert_eq!(
             app.resolve_spread_pair(new_idx),
@@ -38691,7 +38698,7 @@ mod favorite_adjustment_defaults_tests {
             .compute_spread_offset_nudge(1, -1)
             .expect("後方ずらしは範囲内");
         assert_eq!(new_idx, 0);
-        app.spread_shift_anchor_idx = Some(anchor_idx);
+        app.set_spread_shift_anchor_for_test(Some(anchor_idx));
         assert_eq!(
             app.resolve_spread_pair(new_idx),
             SpreadPair::Double { left: 0, right: 1 }
@@ -38726,7 +38733,7 @@ mod favorite_adjustment_defaults_tests {
             .compute_spread_offset_nudge(0, 1)
             .expect("ずらしは範囲内");
         assert_eq!(new_idx, 1);
-        app.spread_shift_anchor_idx = Some(anchor_idx);
+        app.set_spread_shift_anchor_for_test(Some(anchor_idx));
         assert_eq!(
             app.resolve_spread_pair(1),
             SpreadPair::Double { left: 2, right: 1 },
@@ -38756,7 +38763,7 @@ mod favorite_adjustment_defaults_tests {
             .compute_spread_offset_nudge(0, 1)
             .expect("2ページ見開きから末尾単独表示へのずらしは有効");
         assert_eq!(new_idx, 1);
-        app.spread_shift_anchor_idx = Some(anchor_idx);
+        app.set_spread_shift_anchor_for_test(Some(anchor_idx));
         app.fullscreen_idx = Some(new_idx);
 
         assert!(
@@ -51233,7 +51240,7 @@ mod pipeline_cache_refactor_tests {
         assert_eq!(app.fs_display_unit_page_indices(1), vec![2, 1]);
 
         app.spread_mode = crate::settings::SpreadMode::LtrCover;
-        app.spread_shift_anchor_idx = Some(5);
+        app.set_spread_shift_anchor_for_test(Some(5));
         assert_eq!(app.fs_display_unit_page_indices(4), vec![4]);
         assert_eq!(app.fs_display_unit_page_indices(5), vec![5, 6]);
         assert_eq!(app.fs_display_unit_page_indices(7), vec![7]);
@@ -83813,7 +83820,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         }));
 
         app.slideshow_anchor_idx = Some(before);
-        app.spread_shift_anchor_idx = Some(excluded);
+        app.set_spread_shift_anchor_for_test(Some(excluded));
         app.fs_pdf_rerender_demand.note_legacy(video, 1.0);
         app.slideshow_scroll_range_cache = Some((video, 1.0, 2.0));
         let _ = app.collect_image_indices();
@@ -83833,7 +83840,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert!(app.fs_nav_locked_gen.is_none());
         assert!(app.fs_holdover_tex.is_none());
         assert_eq!(app.slideshow_anchor_idx, Some(2));
-        assert_eq!(app.spread_shift_anchor_idx, None);
+        assert_eq!(app.spread_shift_anchor_idx(), None);
         assert_eq!(app.fs_pdf_rerender_demand.legacy_idx(), Some(1));
         assert!(app.slideshow_scroll_range_cache.is_none());
         assert!(!app.viewer_navigation_caches.has_entries_for_test());

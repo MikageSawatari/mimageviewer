@@ -264,7 +264,7 @@ impl App {
             .collect();
 
         self.slideshow_anchor_idx = self.slideshow_anchor_idx.and_then(&remap);
-        self.spread_shift_anchor_idx = self.spread_shift_anchor_idx.and_then(&remap);
+        self.spread_shift.remap_with(&remap);
         self.fs_pdf_rerender_demand.remap_indices(&remap);
         self.fs_continuous_fit_reference.remap_indices(&remap);
 
@@ -941,6 +941,8 @@ impl App {
             list_view_page_identity_index: Default::default(),
             pre_snapshot_search_origin,
         });
+        // A fixed/synthetic list keeps today's live pairing but has no durable Book scope.
+        self.spread_shift.detach_book_scope_for_ordinary_list();
         let return_origin = top_level_return.map(|restore| {
             let route = self
                 .top_level_grid_view

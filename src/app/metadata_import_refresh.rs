@@ -9,7 +9,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::ViewerContextId;
+use crate::book_scope::BookScopeKey;
 use crate::metadata_transfer::{ImportChangedSections, ImportPageStateSnapshot};
+use crate::spread_shift::ShiftReadReply;
 
 /// SQLiteのbind上限回避と終了時cancel応答を兼ねるworker work unit。
 const DB_KEY_CHUNK: usize = 500;
@@ -53,6 +55,8 @@ pub(crate) struct ContextRequest {
     pub(crate) current_rating_key: Option<String>,
     pub(crate) spread_container_path: Option<PathBuf>,
     pub(crate) spread_container_fallback: Option<PathBuf>,
+    /// UI admission captures the scope and FIFO read point; only this worker waits.
+    pub(crate) shift_read: Option<(BookScopeKey, std::sync::mpsc::Receiver<ShiftReadReply>)>,
     pub(crate) old_folder_pin_keys: HashSet<String>,
     pub(crate) folder_pin_paths: Vec<PathBuf>,
     pub(crate) folder_pin_aliases: Vec<(String, String)>,
@@ -70,6 +74,7 @@ pub(crate) struct ContextResult {
     pub(crate) video_pin_blobs: Option<HashMap<PathBuf, Vec<u8>>>,
     pub(crate) video_items: Option<Vec<(usize, PathBuf, u64)>>,
     pub(crate) container_state: Option<ContainerStateResult>,
+    pub(crate) shift_read: Option<(BookScopeKey, ShiftReadReply)>,
 }
 
 pub(crate) struct ContainerStateResult {
@@ -226,8 +231,28 @@ pub(crate) fn run(
     }
 
     let mut contexts = Vec::with_capacity(requests.len());
-    for request in requests {
-        contexts.push(build_context_result(
+    for mut request in requests {
+        let shift_read = if changed.spread_shift {
+            request
+                .shift_read
+                .take()
+                .and_then(|(scope, receiver)| match receiver.recv() {
+                    Ok(reply) => match &reply.status {
+                        Ok(()) => Some((scope, reply)),
+                        Err(error) => {
+                            errors.push(format!("見開き調整を再読込できませんでした: {error}"));
+                            None
+                        }
+                    },
+                    Err(error) => {
+                        errors.push(format!("見開き調整を再読込できませんでした: {error}"));
+                        None
+                    }
+                })
+        } else {
+            None
+        };
+        let mut context = build_context_result(
             request,
             changed,
             rating_db.as_ref().and_then(|result| result.as_ref().ok()),
@@ -257,7 +282,9 @@ pub(crate) fn run(
                 .as_ref()
                 .and_then(|result| result.as_ref().ok()),
             cancel,
-        )?);
+        )?;
+        context.shift_read = shift_read;
+        contexts.push(context);
     }
     if cancel.load(Ordering::Relaxed) {
         return None;
@@ -610,6 +637,7 @@ fn build_context_result(
         video_pin_blobs,
         video_items,
         container_state,
+        shift_read: None,
     })
 }
 
@@ -644,6 +672,124 @@ impl Default for PageStateResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shift_request(
+        scope: BookScopeKey,
+        receiver: std::sync::mpsc::Receiver<ShiftReadReply>,
+    ) -> ContextRequest {
+        ContextRequest {
+            pin_materialization: Default::default(),
+            context_id: ViewerContextId::for_test(3),
+            items_generation: 19,
+            items: Vec::new(),
+            current_rating_key: None,
+            spread_container_path: None,
+            spread_container_fallback: None,
+            shift_read: Some((scope, receiver)),
+            old_folder_pin_keys: HashSet::new(),
+            folder_pin_paths: Vec::new(),
+            folder_pin_aliases: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn shift_only_import_preserves_fenced_row_and_covered_clear_without_other_refresh() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let scope = BookScopeKey::folder(std::path::Path::new("c:/books/book")).unwrap();
+        for row in [
+            Some(crate::spread_shift::SpreadShiftPageRef::RelativePath(
+                "chapter/page.jpg".into(),
+            )),
+            None,
+        ] {
+            let reply = ShiftReadReply {
+                cutoff: 7,
+                completed_through: 9,
+                maintenance_epoch: 4,
+                row,
+                status: Ok(()),
+            };
+            let (sender, receiver) = std::sync::mpsc::channel();
+            sender.send(reply.clone()).unwrap();
+            let result = run(
+                temp.path().join("missing-data-dir"),
+                vec![shift_request(scope.clone(), receiver)],
+                ImportChangedSections {
+                    spread_shift: true,
+                    ..Default::default()
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+
+            assert!(result.errors.is_empty());
+            assert!(result.page_snapshot.is_none());
+            let context = &result.contexts[0];
+            assert_eq!(context.context_id, ViewerContextId::for_test(3));
+            assert_eq!(context.items_generation, 19);
+            assert_eq!(context.shift_read, Some((scope.clone(), reply)));
+            assert!(context.rating_cache.is_none());
+            assert!(context.tags_cache.is_none());
+            assert!(context.current_rating.is_none());
+            assert!(context.page_state.is_none());
+            assert!(context.container_state.is_none());
+            assert!(context.folder_pin_map.is_none());
+            assert!(context.folder_pin_materializations.is_none());
+            assert!(context.video_pin_blobs.is_none());
+            assert!(context.video_items.is_none());
+            assert!(!temp.path().join("missing-data-dir").exists());
+        }
+    }
+
+    #[test]
+    fn shift_read_failure_reports_error_without_publishing_an_empty_shift() {
+        let scope = BookScopeKey::folder(std::path::Path::new("c:/books/book")).unwrap();
+        for reply in [
+            Some(ShiftReadReply {
+                cutoff: 7,
+                completed_through: 7,
+                maintenance_epoch: 4,
+                row: None,
+                status: Err("saved shift unavailable".into()),
+            }),
+            None,
+        ] {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            if let Some(reply) = reply {
+                sender.send(reply).unwrap();
+            }
+            drop(sender);
+            let result = run(
+                PathBuf::from("unused"),
+                vec![shift_request(scope.clone(), receiver)],
+                ImportChangedSections {
+                    spread_shift: true,
+                    ..Default::default()
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+
+            assert_eq!(result.errors.len(), 1);
+            assert!(result.contexts[0].shift_read.is_none());
+        }
+    }
+
+    #[test]
+    fn unchanged_shift_section_does_not_wait_for_captured_shift_read() {
+        let scope = BookScopeKey::folder(std::path::Path::new("c:/books/book")).unwrap();
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let result = run(
+            PathBuf::from("unused"),
+            vec![shift_request(scope, receiver)],
+            ImportChangedSections::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert!(result.errors.is_empty());
+        assert!(result.contexts[0].shift_read.is_none());
+    }
 
     #[test]
     fn worker_reloads_rating_and_tags_for_compact_context_keys() {
@@ -729,6 +875,7 @@ mod tests {
                 current_rating_key: Some(key.clone()),
                 spread_container_path: None,
                 spread_container_fallback: None,
+                shift_read: None,
                 old_folder_pin_keys: HashSet::new(),
                 folder_pin_paths: Vec::new(),
                 folder_pin_aliases: Vec::new(),
@@ -792,6 +939,7 @@ mod tests {
                 current_rating_key: None,
                 spread_container_path: None,
                 spread_container_fallback: None,
+                shift_read: None,
                 old_folder_pin_keys: HashSet::new(),
                 folder_pin_paths: Vec::new(),
                 folder_pin_aliases: Vec::new(),
@@ -869,6 +1017,7 @@ mod tests {
                     current_rating_key: None,
                     spread_container_path: Some(nested.clone()),
                     spread_container_fallback: Some(root.clone()),
+                    shift_read: None,
                     old_folder_pin_keys: HashSet::new(),
                     folder_pin_paths: Vec::new(),
                     folder_pin_aliases: Vec::new(),
@@ -990,6 +1139,7 @@ mod tests {
                 current_rating_key: None,
                 spread_container_path: None,
                 spread_container_fallback: None,
+                shift_read: None,
                 old_folder_pin_keys: HashSet::new(),
                 folder_pin_paths: Vec::new(),
                 folder_pin_aliases: Vec::new(),
@@ -1051,6 +1201,7 @@ mod tests {
                 current_rating_key: None,
                 spread_container_path: None,
                 spread_container_fallback: None,
+                shift_read: None,
                 old_folder_pin_keys: HashSet::new(),
                 folder_pin_paths: vec![effective],
                 folder_pin_aliases: vec![(literal_key.clone(), effective_key)],
