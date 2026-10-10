@@ -840,7 +840,10 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
             "point",
             "サイズ",
             "余白",
-            "5倍"
+            "5倍",
+            "最大倍率",
+            "共通",
+            "20倍"
         ]
     ),
     entry!(
@@ -1654,7 +1657,15 @@ mod tests {
 
     #[test]
     fn specified_scale_search_targets_shared_editor_anchor() {
-        for query in ["指定サイズ", "幅 高さ", "％", "px", "5倍"] {
+        for query in [
+            "指定サイズ",
+            "幅 高さ",
+            "％",
+            "px",
+            "5倍",
+            "最大倍率",
+            "20倍",
+        ] {
             assert!(
                 search_preferences(query, test_tree_position)
                     .iter()

@@ -1790,38 +1790,69 @@ fn fullscreen_specified_scale_editor_snapshots() {
     let cases = [
         ("default", FullscreenSpecifiedScale::default()),
         (
+            "disabled_mixed",
+            FullscreenSpecifiedScale {
+                width: mimageviewer::settings::SpecifiedScaleAxisSetting::disabled(
+                    SpecifiedScaleAxis::LogicalPixels(1234),
+                ),
+                height: mimageviewer::settings::SpecifiedScaleAxisSetting::disabled(
+                    SpecifiedScaleAxis::PercentTenths(375),
+                ),
+            },
+        ),
+        (
             "width_only",
             FullscreenSpecifiedScale {
-                width: Some(SpecifiedScaleAxis::PercentTenths(800)),
-                height: None,
+                width: mimageviewer::settings::SpecifiedScaleAxisSetting::enabled(
+                    SpecifiedScaleAxis::PercentTenths(800),
+                ),
+                height: mimageviewer::settings::SpecifiedScaleAxisSetting::disabled(
+                    mimageviewer::settings::SpecifiedScaleAxis::PercentTenths(800),
+                ),
             },
         ),
         (
             "height_only",
             FullscreenSpecifiedScale {
-                width: None,
-                height: Some(SpecifiedScaleAxis::LogicalPixels(800)),
+                width: mimageviewer::settings::SpecifiedScaleAxisSetting::disabled(
+                    mimageviewer::settings::SpecifiedScaleAxis::PercentTenths(800),
+                ),
+                height: mimageviewer::settings::SpecifiedScaleAxisSetting::enabled(
+                    SpecifiedScaleAxis::LogicalPixels(800),
+                ),
             },
         ),
         (
             "mixed",
             FullscreenSpecifiedScale {
-                width: Some(SpecifiedScaleAxis::PercentTenths(500)),
-                height: Some(SpecifiedScaleAxis::LogicalPixels(800)),
+                width: mimageviewer::settings::SpecifiedScaleAxisSetting::enabled(
+                    SpecifiedScaleAxis::PercentTenths(500),
+                ),
+                height: mimageviewer::settings::SpecifiedScaleAxisSetting::enabled(
+                    SpecifiedScaleAxis::LogicalPixels(800),
+                ),
             },
         ),
         (
             "none",
             FullscreenSpecifiedScale {
-                width: None,
-                height: None,
+                width: mimageviewer::settings::SpecifiedScaleAxisSetting::disabled(
+                    mimageviewer::settings::SpecifiedScaleAxis::PercentTenths(800),
+                ),
+                height: mimageviewer::settings::SpecifiedScaleAxisSetting::disabled(
+                    mimageviewer::settings::SpecifiedScaleAxis::PercentTenths(800),
+                ),
             },
         ),
         (
             "limits",
             FullscreenSpecifiedScale {
-                width: Some(SpecifiedScaleAxis::PercentTenths(1)),
-                height: Some(SpecifiedScaleAxis::LogicalPixels(32768)),
+                width: mimageviewer::settings::SpecifiedScaleAxisSetting::enabled(
+                    SpecifiedScaleAxis::PercentTenths(1),
+                ),
+                height: mimageviewer::settings::SpecifiedScaleAxisSetting::enabled(
+                    SpecifiedScaleAxis::LogicalPixels(32768),
+                ),
             },
         ),
     ];
@@ -1834,6 +1865,11 @@ fn fullscreen_specified_scale_editor_snapshots() {
             ("narrow", egui::vec2(280.0, 570.0)),
         ] {
             for (case, mut value) in cases {
+                let mut max_tenths = if case == "disabled_mixed" {
+                    25
+                } else {
+                    mimageviewer::settings::FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS
+                };
                 if size_name == "narrow" && matches!(case, "width_only" | "height_only" | "limits")
                 {
                     continue;
@@ -1850,7 +1886,9 @@ fn fullscreen_specified_scale_editor_snapshots() {
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 assert!(!mimageviewer::draw_fullscreen_specified_scale_settings(
-                                    ui, &mut value
+                                    ui,
+                                    &mut value,
+                                    &mut max_tenths
                                 ));
                             });
                     },
@@ -1882,7 +1920,7 @@ fn fullscreen_specified_scale_live_popup_snapshots() {
                     None,
                     |ui| {
                         mimageviewer::draw_fullscreen_specified_scale_live_settings(
-                            ui, &mut value, favorite,
+                            ui, &mut value, &mut { mimageviewer::settings::FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS }, favorite,
                         );
                     },
                     |_| {},

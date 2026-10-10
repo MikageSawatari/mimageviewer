@@ -8438,10 +8438,16 @@ fn specified_pdf_provisional_target(
         crate::settings::SpecifiedScaleAxis::LogicalPixels(value) => value as f32,
     };
     let size = egui::vec2(
-        specified.width.map_or(viewport.x, |v| axis(v, viewport.x)),
-        specified.height.map_or(viewport.y, |v| axis(v, viewport.y)),
+        specified
+            .width
+            .active()
+            .map_or(viewport.x, |v| axis(v, viewport.x)),
+        specified
+            .height
+            .active()
+            .map_or(viewport.y, |v| axis(v, viewport.y)),
     );
-    let mode = match (specified.width.is_some(), specified.height.is_some()) {
+    let mode = match (specified.width.enabled, specified.height.enabled) {
         (true, false) => crate::pdf_loader::PdfDisplayFitMode::Width,
         (false, true) => crate::pdf_loader::PdfDisplayFitMode::Height,
         _ => crate::pdf_loader::PdfDisplayFitMode::Page,
@@ -8466,6 +8472,13 @@ fn fit_input_specified_size(
     }
 }
 
+fn fit_input_specified_max_tenths(input: FullscreenFitInput) -> Option<u32> {
+    match input {
+        FullscreenFitInput::SpecifiedScale { max_tenths, .. } => Some(max_tenths),
+        _ => None,
+    }
+}
+
 fn resolve_paged_auto_fit(
     mode: FullscreenFitMode,
     specified: crate::settings::FullscreenSpecifiedScale,
@@ -8473,9 +8486,10 @@ fn resolve_paged_auto_fit(
     unit: egui::Vec2,
     gap: f32,
     limits: FullscreenFitScaleLimits,
+    max_tenths: u32,
 ) -> Option<crate::fullscreen_specified_scale::ResolvedSpecifiedScale> {
     if mode == FullscreenFitMode::SpecifiedScale {
-        return resolve_specified_scale(viewport.size(), unit, gap, specified, limits);
+        return resolve_specified_scale(viewport.size(), unit, gap, specified, limits, max_tenths);
     }
     let page = ((viewport.width() - gap).max(1.0) / unit.x).min(viewport.height() / unit.y);
     let requested = match mode {
@@ -18525,6 +18539,8 @@ impl App {
             geometry.fit_size,
             spread_gap,
             fit_scale_limits,
+            fit_input_specified_max_tenths(left_page.fit_input)
+                .unwrap_or(self.settings.fullscreen_specified_scale_max_tenths),
         ) else {
             return Vec::new();
         };
@@ -24995,6 +25011,7 @@ impl App {
                             self.reconcile_specified_pdf_demand(ctx);
                             let mut fit_mode_choice: Option<FullscreenFitMode> = None;
                             let mut specified_scale_edit = self.settings.fullscreen_specified_scale;
+                            let mut specified_scale_max_edit = self.settings.fullscreen_specified_scale_max_tenths;
                             let specified_scale_favorite = self.settings.remember_favorite_view_state && self.settings.active_favorite_view_id().is_some();
                             let mut specified_scale_changed = false;
                             let mut fit_no_upscale_choice: Option<bool> = None;
@@ -25102,6 +25119,7 @@ impl App {
                                 &mut self.settings.slideshow_continuous_scroll_secs,
                                 &mut self.settings.slideshow_continuous_scroll_percent,
                                 &mut specified_scale_edit,
+                                &mut specified_scale_max_edit,
                                 specified_scale_favorite,
                                 &mut specified_scale_changed,
                                 &mut fit_mode_choice,
@@ -25167,8 +25185,11 @@ impl App {
                             // ズーム/フィットモード: ツールバーボタンはメニューから選択
                             // (0 キーは従来どおり循環)。
                             if specified_scale_changed {
-                                self.set_current_fullscreen_specified_scale(specified_scale_edit);
-                                self.fs_continuous_fit_reference = ContinuousSpecifiedFitReference::Legacy;
+                                if specified_scale_edit != self.settings.fullscreen_specified_scale {
+                                    self.set_current_fullscreen_specified_scale(specified_scale_edit);
+                                    self.fs_continuous_fit_reference = ContinuousSpecifiedFitReference::Legacy;
+                                }
+                                self.set_fullscreen_specified_scale_max_tenths(specified_scale_max_edit);
                             }
                             if let Some(mode) = fit_mode_choice {
                                 self.set_fullscreen_fit_mode_for_current(ctx, fs_idx, mode);
@@ -27370,6 +27391,7 @@ impl App {
             mode,
             self.settings.fullscreen_specified_scale,
             FullscreenFitBasis::new(aspect, original)?,
+            self.settings.fullscreen_specified_scale_max_tenths,
         ))
     }
 
@@ -27389,6 +27411,7 @@ impl App {
             } else {
                 self.specified_fit_basis_for_idx(idx)?
             },
+            self.settings.fullscreen_specified_scale_max_tenths,
         ))
     }
 
@@ -31877,6 +31900,8 @@ impl App {
                 geometry.fit_size,
                 spread_gap,
                 self.fullscreen_fit_scale_limits(pixels_per_point),
+                fit_input_specified_max_tenths(left.main.fit_input)
+                    .unwrap_or(self.settings.fullscreen_specified_scale_max_tenths),
             ) else {
                 return self.fs_zoom_factor;
             };
@@ -36664,6 +36689,7 @@ impl App {
                     asset.layout_source_size.unwrap_or(asset.source_size),
                     asset.source_size,
                 )?,
+                self.settings.fullscreen_specified_scale_max_tenths,
             ),
             fit_scale_limits: self.fullscreen_fit_scale_limits(pixels_per_point),
             pixels_per_point,
@@ -38237,6 +38263,7 @@ impl App {
             gap,
             *settings,
             self.fullscreen_fit_scale_limits(pixels_per_point),
+            self.settings.fullscreen_specified_scale_max_tenths,
         )
     }
 
@@ -38284,6 +38311,7 @@ impl App {
                 saved_spread_gap,
                 self.settings.fullscreen_specified_scale,
                 self.fullscreen_fit_scale_limits(pixels_per_point),
+                self.settings.fullscreen_specified_scale_max_tenths,
             )
             .map_or(saved_spread_gap, |resolved| resolved.gap)
         } else {
@@ -38317,6 +38345,7 @@ impl App {
                         fit_gap_total,
                         self.settings.fullscreen_specified_scale,
                         fit_scale_limits,
+                        self.settings.fullscreen_specified_scale_max_tenths,
                     )
                 })
                 .map_or(1.0, |resolved| resolved.scale)
@@ -41722,6 +41751,9 @@ impl App {
                 geometry.fit_size,
                 spread_gap,
                 fit_scale_limits,
+                display_override
+                    .and_then(|(left, _)| fit_input_specified_max_tenths(left.fit_input))
+                    .unwrap_or(self.settings.fullscreen_specified_scale_max_tenths),
             ) else {
                 return FsNavigatorTextureSources::default();
             };
@@ -42438,6 +42470,7 @@ impl App {
         slideshow_continuous_scroll_secs: &mut f32,
         slideshow_continuous_scroll_percent: &mut u32,
         specified_scale_edit: &mut crate::settings::FullscreenSpecifiedScale,
+        specified_scale_max_edit: &mut u32,
         specified_scale_favorite: bool,
         specified_scale_changed: &mut bool,
         fit_mode_choice: &mut Option<FullscreenFitMode>,
@@ -43726,6 +43759,7 @@ impl App {
                             fit_no_upscale,
                             fit_no_downscale,
                             specified_scale_edit,
+                            specified_scale_max_edit,
                             specified_scale_favorite,
                             popup_rect.size(),
                         )
@@ -44130,19 +44164,15 @@ fn fs_fit_popup_row(
 fn fs_fit_popup_axis(
     ui: &mut egui::Ui,
     label: &str,
-    axis: &mut Option<crate::settings::SpecifiedScaleAxis>,
+    axis: &mut crate::settings::SpecifiedScaleAxisSetting,
 ) {
     ui.push_id(label, |ui| {
-        let row = fs_fit_popup_row(ui, "enabled", label, axis.is_some(), true);
+        let row = fs_fit_popup_row(ui, "enabled", label, axis.enabled, true);
         if row.clicked() {
-            *axis = if axis.is_some() {
-                None
-            } else {
-                Some(crate::settings::SpecifiedScaleAxis::PercentTenths(1000))
-            };
+            axis.enabled = !axis.enabled;
         }
         let mut controls = |ui: &mut egui::Ui| {
-            if axis.is_none() {
+            if !axis.enabled {
                 ui.disable();
             }
             ui.style_mut().override_font_id = Some(egui::FontId::proportional(13.0));
@@ -44177,12 +44207,43 @@ fn fs_fit_popup_axis(
     });
 }
 
+fn fs_fit_popup_max_scale(ui: &mut egui::Ui, max_tenths: &mut u32) {
+    ui.push_id("max_scale", |ui| {
+        let row = fs_fit_popup_row(ui, "max_scale_row", "最大倍率（共通）", false, false);
+        let mut controls = |ui: &mut egui::Ui| {
+            ui.style_mut().override_font_id = Some(egui::FontId::proportional(13.0));
+            crate::ui_dialogs::preferences::draw_fullscreen_specified_scale_max_controls(
+                ui, max_tenths, true,
+            );
+        };
+        if row.rect.width() >= 240.0 {
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(row.rect.right() - 96.0, row.rect.top() + 4.0),
+                egui::pos2(row.rect.right() - 16.0, row.rect.bottom() - 4.0),
+            );
+            let mut child = ui.new_child(
+                egui::UiBuilder::new()
+                    .id_salt("max_scale_controls")
+                    .max_rect(rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            controls(&mut child);
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                ui.add_space(16.0);
+                controls(ui);
+            });
+        }
+    });
+}
+
 fn fs_fit_popup_specified_editor(
     ui: &mut egui::Ui,
     value: &mut crate::settings::FullscreenSpecifiedScale,
+    max_tenths: &mut u32,
     favorite: bool,
 ) -> bool {
-    let before = *value;
+    let before = (*value, *max_tenths);
     fs_fit_popup_header(
         ui,
         if favorite {
@@ -44193,21 +44254,23 @@ fn fs_fit_popup_specified_editor(
     );
     fs_fit_popup_axis(ui, "幅", &mut value.width);
     fs_fit_popup_axis(ui, "高さ", &mut value.height);
+    fs_fit_popup_max_scale(ui, max_tenths);
     ui.add(egui::Label::new(egui::RichText::new(
-        "％は画像表示領域が基準。pxは画面の表示倍率に追従。幅・高さの枠に収めます。\n「縮小しない」は枠より優先。自動フィットはAI拡大前の元画像サイズの5倍まで。手動ズーム・Zは5倍を超えられます。",
+        "％は画像表示領域が基準。pxは画面の表示倍率に追従。幅・高さの枠に収めます。\n「縮小しない」は枠より優先。最大倍率は共通設定。AI拡大前の元画像サイズが基準。手動ズーム・Zは上限の対象外。",
     ).size(11.0).color(egui::Color32::from_gray(150))).wrap());
-    *value != before
+    (*value, *max_tenths) != before
 }
 
 pub(crate) fn draw_fs_specified_scale_live_editor(
     ui: &mut egui::Ui,
     value: &mut crate::settings::FullscreenSpecifiedScale,
+    max_tenths: &mut u32,
     favorite: bool,
 ) -> bool {
     fs_fit_popup_frame()
         .show(ui, |ui| {
             crate::os_theme::apply_dark_ui(ui);
-            fs_fit_popup_specified_editor(ui, value, favorite)
+            fs_fit_popup_specified_editor(ui, value, max_tenths, favorite)
         })
         .inner
 }
@@ -44228,6 +44291,7 @@ fn draw_fs_fit_popup(
     no_upscale: bool,
     no_downscale: bool,
     value: &mut crate::settings::FullscreenSpecifiedScale,
+    max_tenths: &mut u32,
     favorite: bool,
     size: egui::Vec2,
 ) -> egui::InnerResponse<FsFitPopupChoice> {
@@ -44280,7 +44344,8 @@ fn draw_fs_fit_popup(
                     choice.no_downscale = Some(!no_downscale);
                 }
                 fs_fit_popup_separator(ui);
-                choice.specified_changed = fs_fit_popup_specified_editor(ui, value, favorite);
+                choice.specified_changed =
+                    fs_fit_popup_specified_editor(ui, value, max_tenths, favorite);
                 choice
             });
         #[cfg(test)]
@@ -44307,6 +44372,7 @@ fn draw_fs_fit_popup(
 #[doc(hidden)]
 pub fn draw_fs_fit_popup_snapshot_fixture(ui: &mut egui::Ui, favorite: bool) {
     let mut value = crate::settings::FullscreenSpecifiedScale::default();
+    let mut max_tenths = crate::settings::FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS;
     let size = egui::vec2(
         ui.available_width().min(320.0),
         ui.available_height().min(480.0),
@@ -44319,6 +44385,7 @@ pub fn draw_fs_fit_popup_snapshot_fixture(ui: &mut egui::Ui, favorite: bool) {
         true,
         false,
         &mut value,
+        &mut max_tenths,
         favorite,
         size,
     );
@@ -55391,6 +55458,7 @@ mod tests {
                         &mut slideshow_scroll,
                         &mut slideshow_percent,
                         &mut crate::settings::FullscreenSpecifiedScale::default(),
+                        &mut { crate::settings::FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS },
                         false,
                         &mut false,
                         &mut fit_mode_choice,
@@ -55537,6 +55605,7 @@ mod tests {
                         &mut slideshow_scroll,
                         &mut slideshow_percent,
                         &mut crate::settings::FullscreenSpecifiedScale::default(),
+                        &mut { crate::settings::FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS },
                         false,
                         &mut false,
                         &mut fit_mode_choice,
@@ -78039,8 +78108,12 @@ mod specified_scale_consumer_tests {
 
     fn height(value: u32) -> FullscreenSpecifiedScale {
         FullscreenSpecifiedScale {
-            width: None,
-            height: Some(SpecifiedScaleAxis::LogicalPixels(value)),
+            width: crate::settings::SpecifiedScaleAxisSetting::disabled(
+                crate::settings::SpecifiedScaleAxis::PercentTenths(800),
+            ),
+            height: crate::settings::SpecifiedScaleAxisSetting::enabled(
+                SpecifiedScaleAxis::LogicalPixels(value),
+            ),
         }
     }
 
@@ -78428,8 +78501,12 @@ mod specified_scale_consumer_tests {
             let mut app = pdf_app(&ctx, 3);
             app.reading_flow = flow;
             app.settings.fullscreen_specified_scale = FullscreenSpecifiedScale {
-                width: Some(SpecifiedScaleAxis::PercentTenths(500)),
-                height: None,
+                width: crate::settings::SpecifiedScaleAxisSetting::enabled(
+                    SpecifiedScaleAxis::PercentTenths(500),
+                ),
+                height: crate::settings::SpecifiedScaleAxisSetting::disabled(
+                    crate::settings::SpecifiedScaleAxis::PercentTenths(800),
+                ),
             };
             app.record_page_layout_dims_for_spread(1, (900_000, 600_000));
             let units = (0..3)
@@ -79076,6 +79153,7 @@ mod specified_scale_consumer_tests {
                         &mut slideshow_scroll,
                         &mut slideshow_percent,
                         value,
+                        &mut { crate::settings::FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS },
                         false,
                         &mut false,
                         &mut fit_mode_choice,
@@ -79162,8 +79240,12 @@ mod specified_scale_consumer_tests {
             crate::settings::SpreadMode::Single
         };
         app.settings.fullscreen_specified_scale = FullscreenSpecifiedScale {
-            width: Some(SpecifiedScaleAxis::PercentTenths(800)),
-            height: Some(SpecifiedScaleAxis::PercentTenths(800)),
+            width: crate::settings::SpecifiedScaleAxisSetting::enabled(
+                SpecifiedScaleAxis::PercentTenths(800),
+            ),
+            height: crate::settings::SpecifiedScaleAxisSetting::enabled(
+                SpecifiedScaleAxis::PercentTenths(800),
+            ),
         };
         app.settings.fullscreen_fit_no_upscale = false;
         app.settings.fullscreen_fit_no_downscale = false;
@@ -79198,6 +79280,45 @@ mod specified_scale_consumer_tests {
                 .collect::<Vec<_>>()
         };
         (app, units)
+    }
+
+    #[test]
+    fn specified_scale_common_cap_re_resolves_evicted_continuous_reference() {
+        for flow in [ReadingFlow::Vertical, ReadingFlow::Horizontal] {
+            for paired in [false, true] {
+                let ctx = egui::Context::default();
+                let (mut app, units) = specified_eviction_fixture(&ctx, flow, paired);
+                let distant = if paired { 20 } else { 40 };
+                let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+                app.continuous_reading_layout(&ctx, rect, &units, 0, false)
+                    .unwrap();
+                app.fullscreen_idx = Some(40);
+                app.continuous_reading_layout(&ctx, rect, &units, distant, false)
+                    .unwrap();
+                app.update_continuous_reading_prefetch_window(&units, &[distant], &[]);
+                assert!(app.continuous_specified_fit_basis_for_idx(0).is_none());
+                assert!(app.set_fullscreen_specified_scale_max_tenths(10));
+                app.continuous_reading_layout(&ctx, rect, &units, distant, false)
+                    .unwrap();
+                let lower = app
+                    .continuous_specified_reference_fit(rect, flow, 1.0)
+                    .unwrap();
+                assert_eq!(lower.scale, 1.0);
+                assert!(app.set_fullscreen_specified_scale_max_tenths(20));
+                app.continuous_reading_layout(&ctx, rect, &units, distant, false)
+                    .unwrap();
+                let higher = app
+                    .continuous_specified_reference_fit(rect, flow, 1.0)
+                    .unwrap();
+                assert_eq!(higher.scale, 2.0);
+                assert_eq!(
+                    reference_idx(&app),
+                    0,
+                    "cap edit does not move the selected center-unit basis"
+                );
+                assert!(app.continuous_specified_fit_basis_for_idx(0).is_none());
+            }
+        }
     }
 
     #[test]
@@ -79306,6 +79427,7 @@ mod specified_scale_consumer_tests {
                         0.0,
                         app.settings.fullscreen_specified_scale,
                         app.fullscreen_fit_scale_limits(1.0),
+                        app.settings.fullscreen_specified_scale_max_tenths,
                     )
                     .unwrap();
                     assert!(expected_fit.scale > original_fit.scale);
@@ -79423,8 +79545,12 @@ mod specified_scale_consumer_tests {
             }
             app.settings.fullscreen_specified_scale = if matches!(change, Change::ResizeDpi) {
                 FullscreenSpecifiedScale {
-                    width: None,
-                    height: Some(SpecifiedScaleAxis::PercentTenths(800)),
+                    width: crate::settings::SpecifiedScaleAxisSetting::disabled(
+                        crate::settings::SpecifiedScaleAxis::PercentTenths(800),
+                    ),
+                    height: crate::settings::SpecifiedScaleAxisSetting::enabled(
+                        SpecifiedScaleAxis::PercentTenths(800),
+                    ),
                 }
             } else {
                 height(100)
@@ -79790,13 +79916,13 @@ mod specified_scale_consumer_tests {
         drop(draw);
         let final_value = app.settings.common_fullscreen_specified_scale();
         assert_ne!(
-            final_value.width,
-            FullscreenSpecifiedScale::default().width,
+            final_value.width.active(),
+            FullscreenSpecifiedScale::default().width.active(),
             "actual numeric changes must reach the live setter"
         );
         assert!(
             matches!(
-                final_value.width,
+                final_value.width.active(),
                 Some(SpecifiedScaleAxis::PercentTenths(_))
             ),
             "the numeric child must edit the axis, never toggle its containing row OFF"
@@ -79842,6 +79968,164 @@ mod specified_scale_consumer_tests {
             assert_eq!(selected.height(), 32.0);
             assert!(rect.contains_rect(selected));
             assert!(open);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn specified_scale_real_popup_retains_disabled_axes_and_edits_common_cap() {
+        use crate::settings::{FavoriteEntry, FavoriteViewState, SpecifiedScaleAxisSetting};
+        for (favorite, inherited) in [(false, false), (true, false), (true, true)] {
+            let ctx = egui::Context::default();
+            install_fs_navigator_input_tracking(&ctx);
+            let mut app = pdf_app(&ctx, 1);
+            let folder = app.tmp.path().to_path_buf();
+            app.items[0] = GridItem::Image(folder.join("live.png"));
+            app.current_folder = Some(folder.clone());
+            let initial = FullscreenSpecifiedScale {
+                width: SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::LogicalPixels(1234)),
+                height: SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::PercentTenths(375)),
+            };
+            app.settings.fullscreen_specified_scale = initial;
+            app.settings.fullscreen_top_bar_locked = true;
+            app.spread_mode = crate::settings::SpreadMode::Single;
+            app.native_video_in_window_active = true;
+            app.fit_popup_open = true;
+            if favorite {
+                let entry = FavoriteEntry::new("fixture".into(), folder);
+                app.settings.favorites.push(entry.clone());
+                app.settings.remember_favorite_view_state = true;
+                let mut state = FavoriteViewState::from_settings(&app.settings);
+                if inherited {
+                    state.fullscreen_specified_scale = None;
+                }
+                app.favorite_view_states.insert(entry.id, state.clone());
+                app.settings.apply_favorite_view_overlay(entry.id, &state);
+            }
+            let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 900.0));
+            let draw = |app: &mut App, events| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(rect),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| app.render_fullscreen_viewport(ctx),
+                )
+            };
+            let mut output = draw(&mut app, vec![]);
+            for _ in 0..4 {
+                output = draw(&mut app, vec![]);
+            }
+            let popup = painted_label(&output, "ズーム/フィット  [0で循環]")
+                .unwrap_or_else(|| painted_label(&output, "幅").unwrap());
+            draw(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(popup.center()),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -2000.0),
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            for _ in 0..24 {
+                output = draw(&mut app, vec![]);
+            }
+            let generation = crate::settings::save_generation();
+            if !inherited {
+                for (label, original) in [("幅", initial.width), ("高さ", initial.height)] {
+                    let toggle = painted_label(&output, label).expect("scroll reaches axis row");
+                    draw(&mut app, click(toggle.center()));
+                    let disabled = if label == "幅" {
+                        app.settings.fullscreen_specified_scale.width
+                    } else {
+                        app.settings.fullscreen_specified_scale.height
+                    };
+                    assert!(!disabled.enabled);
+                    assert_eq!(disabled.value, original.value);
+                    output = draw(&mut app, vec![]);
+                    let toggle = painted_label(&output, label).unwrap();
+                    draw(&mut app, click(toggle.center()));
+                    output = draw(&mut app, vec![]);
+                    let restored = if label == "幅" {
+                        app.settings.fullscreen_specified_scale.width
+                    } else {
+                        app.settings.fullscreen_specified_scale.height
+                    };
+                    assert_eq!(
+                        restored, original,
+                        "OFF/ON retains the real popup value and unit"
+                    );
+                }
+            }
+            let before = app.settings.fullscreen_specified_scale;
+            let favorite_before = app.favorite_view_states.clone();
+            let cap = ctx
+                .data(|data| {
+                    data.get_temp::<egui::Rect>(egui::Id::new("specified_scale_max_response"))
+                })
+                .unwrap();
+            assert!(
+                painted_label(&output, "5.0 倍").is_some(),
+                "cap editor is actually visible"
+            );
+            let press = cap.center();
+            draw(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(press),
+                    egui::Event::PointerButton {
+                        pos: press,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            for delta in [10.0, 20.0, 30.0] {
+                draw(
+                    &mut app,
+                    vec![egui::Event::PointerMoved(press + egui::vec2(delta, 0.0))],
+                );
+                assert_eq!(
+                    crate::settings::save_generation(),
+                    generation,
+                    "live cap drags are memory-only"
+                );
+            }
+            draw(
+                &mut app,
+                vec![egui::Event::PointerButton {
+                    pos: egui::pos2(1199.0, 899.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            assert!(app.settings.fullscreen_specified_scale_max_tenths > 50);
+            assert_eq!(app.settings.fullscreen_specified_scale, before);
+            assert_eq!(
+                app.favorite_view_states, favorite_before,
+                "common cap never creates favorite values"
+            );
+            if inherited {
+                assert!(
+                    app.favorite_view_writes
+                        .next_due_in_at(std::time::Instant::now())
+                        .is_none(),
+                    "common cap is not an explicit favorite axis edit"
+                );
+            }
+            assert!(app.fit_popup_open);
+            assert_eq!(crate::settings::save_generation(), generation);
+            app.persist_window_state_and_flush(crate::app::PersistScope::ProcessKeepsRunning);
+            assert!(crate::settings::save_generation() > generation);
+            assert_eq!(
+                crate::settings::Settings::load().fullscreen_specified_scale_max_tenths,
+                app.settings.fullscreen_specified_scale_max_tenths
+            );
         }
     }
 
@@ -79962,6 +80246,16 @@ mod specified_scale_consumer_tests {
                                 "unit button must remain outside the bar: {unit:?} {bar:?}"
                             );
                         }
+                    }
+                }
+                if let Some(cap) = ctx.data(|data| {
+                    data.get_temp::<egui::Rect>(egui::Id::new("specified_scale_max_response"))
+                }) {
+                    if bar.is_positive() {
+                        assert!(
+                            cap.right() <= bar.left(),
+                            "maximum editor must exclude the scrollbar"
+                        );
                     }
                 }
                 assert!(open);
@@ -80170,7 +80464,7 @@ mod specified_scale_consumer_tests {
         let after = app.settings.common_fullscreen_specified_scale();
         if key == egui::Key::Enter {
             assert_eq!(
-                after.width,
+                after.width.active(),
                 Some(SpecifiedScaleAxis::PercentTenths(1250)),
                 "Enter confirms the actual numeric value"
             );
@@ -80237,12 +80531,13 @@ mod specified_scale_consumer_tests {
         );
         fit_popup_frame(&ctx, rect, click(checkbox.center()), &mut open, &mut value);
         assert!(open, "an edit inside the actual popup must retain it");
-        assert_eq!(value.width, None);
+        assert!(!value.width.enabled);
+        assert_eq!(value.width.value, SpecifiedScaleAxis::PercentTenths(800));
         let output = fit_popup_frame(&ctx, rect, vec![], &mut open, &mut value);
         let checkbox = painted_label(&output, "幅").unwrap();
         fit_popup_frame(&ctx, rect, click(checkbox.center()), &mut open, &mut value);
         assert!(
-            value.width.is_some(),
+            value.width.enabled,
             "the width unit control must be enabled"
         );
         let output = fit_popup_frame(&ctx, rect, vec![], &mut open, &mut value);
@@ -80259,7 +80554,7 @@ mod specified_scale_consumer_tests {
             painted_label(&output, "px").expect("unit selector opens inside the fit popup");
         fit_popup_frame(&ctx, rect, click(pixels.center()), &mut open, &mut value);
         assert!(matches!(
-            value.width,
+            value.width.active(),
             Some(SpecifiedScaleAxis::LogicalPixels(_))
         ));
         assert!(open);

@@ -2,7 +2,7 @@
 
 作成: 2026-10-08 / 改訂: 2026-10-09（r5の決定仕様・設計合意に基づく実装接続の記録）/ ラインE。
 状態: **Q1〜Q11は決定済み（§10.1）。設計・構造判定への合意を受領し実装中。実装差分の独立レビュー・自動gate・実機確認は未完了（§15）**。
-コード照合基準: 初版 `6078f6595`、r2 `2d327da31`、r3 `ab99c0a6b`（レビュー対象文書 `d648a5d54`）、r4 `511694cd7`。v4.5.0出荷後の `840c309ec` での再照合は§14。実装の受入設計基準は `ebc6ce987`。過去のfile:lineと文書のみの作業範囲は各ラウンド時点の記録として残し、現在の実装状況は§15へ集約する。
+コード照合基準: 初版 `6078f6595`、r2 `2d327da31`、r3 `ab99c0a6b`（レビュー対象文書 `d648a5d54`）、r4 `511694cd7`。v4.5.0出荷後の `840c309ec` での再照合は§14。実装の受入設計基準は `ebc6ce987`。過去のfile:lineと文書のみの作業範囲は各ラウンド時点の記録として残し、現在の実装状況は§15以降、2026-10-10の利用者改訂は§21へ記録する。
 
 ## 1. 要求と境界
 
@@ -138,19 +138,23 @@ effective pppで物理表示寸法へ変換される。main Contextのpppを別�
 viewportを超える画像は既存clipと閲覧操作を使う。物理格子整列と丸めの画素単位の差は既存契約を維持。
 paint / hit / UVを異なる倍率で解かない。
 
-**過大拡大の上限（Q4決定、2026-10-09）**: SpecifiedScaleの自動fitに固定 **5.0倍**を追加する。
-過大な拡大による画質低下を避ける元の要望に対応し、この既定の固定上限も確認ケースにする。
+**過大拡大の上限（Q4-b改訂、利用者決定2026-10-10）**: 指定サイズの自動fitだけに適用する
+共通の最大倍率設定を追加する。既定は **5.0倍**、範囲は **1.0〜20.0倍、0.1倍刻み**。
+1倍以上に限定すれば「縮小しない」の1倍下限と矛盾しない。20倍は小さい元画像でも十分な
+調整幅を確保しつつ自動fitの過大拡大を有限にする。さらに拡大したい場合は従来の手動操作を使える。
+整数の0.1倍単位で保存し、NaN / infinityや等価な小数表現を増やさない。追加の有効boolは作らない。
 原寸基準Oをpointへ正規化した物理原寸倍率`1/P`に対し、
-`s_auto = min(FullscreenFitScaleLimits::apply(s_requested), 5.0 / P)`とする。
-「拡大しない」は1倍までなので5倍上限より強い。「縮小しない」は1倍を下限として指定枠より
-優先し、その上で5倍上限を守る。両方ONは1倍。両NoneのPage相当fitにも5倍上限を適用する。
-5.0は初版では固定値とし、別の上限設定・保存fieldは作らない。画像生成・AIの拡大率や
-PDF raster要求の上限ではない。見開きでは既存高さ合わせ後の合成単位に掛かる自動倍率を
-制限する（従来no_up / no_downと同じ段階）。小さい相方を高さ合わせする内部倍率まで5以下に
-する契約ではない。連結は基準unitの自動倍率に適用し、周辺unitを個別に再fitしない。
-手動zoomはこの後に掛け、5倍を超えられる。単ページZはPage・制限なし、見開きZの照準は
-上限適用済みfitを使い、確定Zは既存専用solveを維持する。Zの結果や手動操作まで5倍に
-制限しない。追加の上限入力欄は作らない。
+`s_auto = min(FullscreenFitScaleLimits::apply(s_requested), max_tenths / 10.0 / P)`とする。
+「拡大しない」の1倍上限が勝つ。「縮小しない」は1倍を下限として指定枠より優先し、
+その上で共通上限を守る。両方ONは1倍。両軸OFFのPage相当fitにも同じ上限を適用する。
+これは画像生成・AI倍率やPDF raster要求の直接の上限ではない。見開きは高さ合わせ後の合成単位への
+自動倍率を制限し、小さい相方を高さ合わせする内部倍率までは制限しない。
+連結は選択済み基準unitへ適用し、最大倍率だけの変更で参照unitを別の中央unitへ替えない。
+手動zoomは自動fitの後に掛かり、上限を超えられる。単ページZはPage・制限なし、
+見開きZの照準は上限適用済みfitを使い、確定Zは既存専用solveを維持する。
+共通値なのでお気に入りの幅・高さとは別の行「最大倍率（共通）」で編集する。
+HUDもprefsもメモリlive値／draftを変えるだけで、widget変更ごとの同期保存は行わない。
+背景RGBA(30,30,30,240)は利用者が他HUD popupと同じ透過度と確認したため変更しない。
 
 ### 4.3 resolver入力: アスペクトとAI前の物理原寸（Q3決定、2026-10-09）
 
@@ -159,7 +163,7 @@ canonical寸法を「原寸の画素数」として渡さない。共通resolver
 | 入力 | 単位・役割 |
 | --- | --- |
 | アスペクト基準 `A` | ページの縦横比と構成を決める寸法。取得済みcanonical layoutを優先。PDFはpage boxの1/1000 pointであり、長さを物理pxやpppへ直接変換しない |
-| 物理原寸基準 `O` | 自動fitの拡大 / 縮小制限・5倍上限に用いるfull-pageの画素基準。通常画像はAI前にそのconsumerが使う原寸を維持し、新方式のPDFは下記の固定原寸方針。AI出力と現在のPDF raster寸法を渡さない |
+| 物理原寸基準 `O` | 自動fitの拡大 / 縮小制限・共通最大倍率に用いるfull-pageの画素基準。通常画像はAI前にそのconsumerが使う原寸を維持し、新方式のPDFは下記の固定原寸方針。AI出力と現在のPDF raster寸法を渡さない |
 | content bbox・rotation | §5.1で解決したsource座標の正規化bboxと保存回転。分割・trimの優先を解決してから渡し、回転とbbox変換を一度だけ行う |
 | 表示先・構成 | 実image rect（point）、そのContextのeffective ppp、ページのlogical scale・slot・実効gap。frozenはcapture時の入力を使う |
 
@@ -436,14 +440,18 @@ PDF request比較cacheの型は§5.2に従って置き換えるが、手動入�
 loader / worker / generationのownerは追加・変更しない。
 既存layout再計算以外にdecode・同期I/O・folder scan・GPU uploadを設定操作へ足さない。
 
-## 7. 保存・転送・環境設定（Q4・Q9・Q10）
+## 7. 保存・転送・環境設定（Q4・Q9・Q10、2026-10-10改訂）
 
-新規`Settings::fullscreen_specified_scale`を一つ追加する案。
+幅・高さの`Settings::fullscreen_specified_scale`と、共通の`fullscreen_specified_scale_max_tenths`を使う。
 
 ```rust
 struct FullscreenSpecifiedScale {
-    width: Option<SpecifiedScaleAxis>,
-    height: Option<SpecifiedScaleAxis>,
+    width: SpecifiedScaleAxisSetting,
+    height: SpecifiedScaleAxisSetting,
+}
+struct SpecifiedScaleAxisSetting {
+    enabled: bool,
+    value: SpecifiedScaleAxis,
 }
 enum SpecifiedScaleAxis {
     PercentTenths(u32), // 1000 = 100.0%
@@ -451,16 +459,18 @@ enum SpecifiedScaleAxis {
 }
 ```
 
-Noneは指定なし。％は0.1％単位の整数でNaN / infinity / 等価な複数表現をなくす。
-初期値は幅・高さとも`Some(PercentTenths(800))`。新フィールドにserde defaultを付け、
-新設定が欠落した既存Settingsもこの両軸80％を使う。各軸Noneは利用者が明示した指定なしであり、
-初期値で埋め直さない。お気に入り行のfield欠落は§7.1の共通値継承、旧転送の欠落は転送先保持に従う。
+各軸のenabledと数値・単位を分けて保存する。OFF中もvalueを保持し、再ONで同じ数値・単位へ
+戻す。両OFFはPage相当。共通・favorite専用値、HUD・prefs、保存／再起動・転送で同じ型を使う。
+％は0.1％単位の整数。初期は両軸enabled=true / PercentTenths(800)。Settingsのfield欠落だけを
+この初期値で補完し、明示OFFや保持valueを初期化しない。favoriteの外側Optionは継承／専用値の
+区別のためだけに保持し、各軸OFFを外側Noneと混同しない。
+共通最大倍率はu32のtenthsで既定50、10〜200。ローカル読込はclamp、転送は不正値を拒否する。
 **新規・未リリース**の機能・キー・型なので専用migration・schema version・DDLは不要。
 旧指定倍率設定の読み替えはしない。汎用settings_kvを使い、既存fit modeや実データを保持する。
 旧版の新variant読込は既存互換性保護に従い、旧版用silent fallbackを増設しない。
 
 転送は既存fit関連と同じ値schemaのexport / import（共通 / favoriteへのrouteは§7.1）。
-各軸の単位・範囲・Noneを検証し、混在と両Noneは正当。
+OFF中も各軸の保持単位・範囲を検証し、混在と両OFFは正当。共通最大倍率も転送対象とする。
 無効単位・範囲は既存field拒否 / issue報告へ乗せ、部分正規化して受け入れない。
 旧転送文書にキーがなければ転送先の値を維持。未知ID保持と5方式の最低1候補も検証する。
 新設定はprefs draftの編集対象なので「環境設定外の最新値移送」には分類しない。
@@ -473,20 +483,21 @@ Noneは指定なし。％は0.1％単位の整数でNaN / infinity / 等価な�
 [レイアウト指針](preferences-layout-guidelines.md)のsolid scrollbar / available_widthを使う。
 preferences/search_indexへ幅・高さ・％・px・指定サイズの検索anchorを追加。
 表示領域100％、100%表示時のpx相当（DPI / UI倍率で拡大）、縮小しない優先、
-5倍は自動fitだけの上限であること、初期の両軸80％は余白を残す変更可能な設定例であることを短く示す。
+最大倍率（既定5倍）は自動fitだけの共通上限であること、初期の両軸80％は余白を残す変更可能な設定例であることを短く示す。
 
 Q10の決定範囲は**0.1〜1000.0％ / 1〜32768px**。数値widgetとvalidatorで範囲を共有。
 0・負値・超過・小数pxを保存値にしない。ローカル読込範囲補修はsanitize、転送は範囲外拒否。
 単位切替は画面から逆算せず数値を維持（px化は丸め、新範囲へclamp）。
-OFFはNone、再ONは100％。以前の単位・数値の別保存は作らない（Q10）。OK前は既存draft内に留める。
+OFFはenabledだけを変更し、再ONは保持した数値・単位へ戻す（Q10改訂、2026-10-10）。
+最大倍率も同じページの共通設定rowで編集する。OK前は既存draft内に留める。
 DragValue等の既存widgetを使い、独自TextEdit parserや確定用キーを追加しない。
 TextEditが必要ならime_focus helperを使用。Enter / Escは既存dialog helperとwidget focusの優先を保つ。
 
 ### 7.1 共通値とお気に入り別表示状態（Q9決定、2026-10-09）
 
 新しい指定値を既存`FavoriteViewState`の対象へ加える。favoriteに保存するのは
-**幅 / 高さそれぞれの未指定・単位・数値からなる`fullscreen_specified_scale`だけ**。
-現行でfavorite対象外のfit mode、no_up / no_down、循環除外、固定5倍の定数まで新たに
+**幅 / 高さそれぞれのenabled・保持単位・数値からなる`fullscreen_specified_scale`だけ**。
+現行でfavorite対象外のfit mode、no_up / no_down、循環除外、共通最大倍率を
 favorite別へ広げない。手動zoom / pan、連結の基準unit、viewport / DPIも保存しない。
 既存8項目とUUID・最長一致・reset / 削除の意味を維持する。
 
@@ -677,13 +688,13 @@ manualには「初期は幅・高さ80％の枠へ内接して余白を残す設
 | Q1 | 100％は現在の画像表示領域。固定HUD / 右パネルの予約を除く。F11抑制後は広がった領域を使う |
 | Q2 | 推奨どおり、pxは他の表示寸法設定と同じ100％時のlogical point相当。800pxは800pointで、Windows拡大率とアプリUI倍率に追従する。両方100％なら800物理px、Windows150％・アプリ100％なら1200物理px。画像生成解像度やOriginalの物理1:1は変更しない |
 | Q3 | 通常画像の既存「拡大しない / 縮小しない」を維持。新方式のAI結果は拡大前の原寸を使い、到着だけで表示を大きくも小さくもしない。単ページ / 見開き / 連結・AI後の合成textureも対象。PDF固定A / Oは§4.3のまま |
-| Q4 | Q4-aは推奨と異なり、初期幅80％・高さ80％の両軸指定へ決定。枠へ内接して周囲に余白を残す設定例で、利用者が変更する前提。Q4-bは推奨どおり、指定サイズの自動fitだけAI前原寸基準の固定5.0倍上限。「拡大しない」は1倍まで、「縮小しない」は1〜5倍、両方ONは1倍。手動zoom / Zは5倍超を許し、上限入力欄を追加しない。見開きは高さ合わせ後の全体への自動倍率を制限し、内部の高さ合わせ倍率までは制限しない。画質低下を避ける元の要望に対する確認ケースにもする。両軸未指定fallback / 明示除外による循環は維持 |
+| Q4 | 初期幅80％・高さ80％。Q4-bは利用者が2026-10-10に改訂: 固定5.0倍を共通設定へ置き換え、既定5.0倍、1.0〜20.0倍・0.1倍刻み。favorite専用値には含めない。指定サイズ自動fitと両軸OFFのPage相当へ適用し、「拡大しない」の1倍上限が勝つ。「縮小しない」の1倍下限、手動zoom / Zの上限なしは維持。見開き内部の高さ合わせ倍率は対象外。HUD・prefsで編集し、同期saveを増やさない |
 | Q5 | 見開きは2枚と間隔を合わせた全体へ指定枠を適用。既存高さ合わせと空き側slotを維持。極小指定の実効gap補正は表示だけへ適用 |
 | Q6 | 連結は選択 / 変更時に焦点となる中央page pair（単ページはその1枚）を基準にし、scrollで倍率を替えない。幅 / 高さとも同じ式。既存flow変更時の既定fitは維持。コードのper-unit計算・可視枚数zoom例外との差と接続は§5.3 |
 | Q7 | 新方式も既存trim入力経路と回転時の例外を今版では維持。全方式の統一は別件§1.358。費用を1.342の追加質問にしない |
 | Q8 | 画像 / 本のページのみ。動画・音楽はfit modeを持たず、その表示方式は変更しない |
 | Q9 | アプリ共通の指定値を持ち、既存remember_favorite_view_state / favorite_view_state_for_pathへ参加。favoriteには指定幅・高さ・単位・未指定を保存し、共通値の転送と専用値の保持を分ける（§7.1） |
-| Q10 | ％0.1〜1000.0 / px1〜32768。単位変更は数値維持、pxは整数へ丸め範囲へclamp。OFFから再ONは100％。OFF値の別保存なし、既存draft / widget / IME境界を使う |
+| Q10 | ％0.1〜1000.0 / px1〜32768。単位変更は数値維持、pxは整数へ丸めclamp。2026-10-10改訂: 各軸enabledを保持数値・単位から分離し、OFF→ONで値・単位を復元。共通・favorite、popup・prefs、保存／再起動・転送で維持する。未リリース型の形変更にmigrationなし。既存draft / widget / IME境界を使う |
 | Q11 | 単ページZはPage・制限なし、見開きZは選択fitを照準基準にする現行差を維持。新方式のPDFは実Z geometryに合わせた絶対需要を送り、解除 / resize / 結果採用後の収束も検証。既存4方式のZ / PDF制限は今版では変更しない |
 
 ## 11. 独立設計レビューへの対応（r2、2026-10-09）
@@ -1025,3 +1036,28 @@ popupのScrollArea ownerだけで `floating_allocated_width` を少なくとも
 意図した全fit popupのsnapshot testだけを更新し、PNG一覧と最終gate結果は
 `target/E-1342-ui3-msg.txt` へ記録する。build-dev・製品起動・commitを行わず、
 実機確認中の `target/dev-runtime` を変更しない。
+
+## 21. 最大倍率とOFF値の保持（利用者決定2026-10-10）
+
+Q4-b / Q10の上記改訂が旧固定5倍・OFF→100％の記録に優先する。未リリースの軸JSONを
+`{enabled, value}`へ破壊的に変更し、旧開発版Option形式のmigrationは作らない。
+リリース済みSettingsのfield欠落とlegacy favoriteの継承は維持する。favorite欠落値をcaptureで
+具体値に固定しない規則もそのまま適用し、最大倍率の編集はfavorite専用値を作らない。
+capは既存fit descriptorへsnapshotとして含め、capture / holdover / frozen / navigator replayに
+新しいlive capを後から混ぜない。PDFはそのgeometryから需要を作り、O / Aをraster到着で変えない。
+連結の参照texture退去後も保持sourceで解決したgeometryへ現在の共通capを掛ける。
+
+状態簡素化: OFF用の別backup値、pending保存、新しいvisibility bool / workerを作る案を除外。
+軸は常に一つのvalueを持ち、enabledだけで制約の参加を選ぶ。capは常に有効な共通数値一つ。
+既存共通settingsの確定・tray／exit保存境界とfavorite capture ownerを再利用する。
+HUDの32point行・色・floating scrollbar予約、IME Enter / Esc、0キー循環は保持する。
+
+検証: configurable capでgeometryが変わること、DPI・no_up / no_down・両OFF、手動／Zの上限なし、
+captureのcap保持、連結退去後の同じ基準unitを検証する。実HUDで共通／favoriteのOFF→ONを操作し、
+value / unitの復元とcap dragの同期saveなし・favorite専用値非変更・既存保存境界後の再読込を確認する。
+実prefs数値編集、IME、draft commit、JSON／DB再読込、transfer round tripと不正field拒否も通す。
+通常1093×614と狭いF12の全row / editor / helpの到達性・scrollbar非交差回帰を維持する。
+settings分類は455 field（142対象 / 313除外）、wire項目140。幅・高さは一つのfieldの型変更、
+最大倍率が対象field一つの追加である。対象popup／prefs snapshotだけを意図して更新・目視確認する。
+今回の新しい独立レビュー合格を意味する記録ではない。製品起動・build-dev・commitは行わず、
+実機確認中のtarget/dev-runtimeには書き込まない。

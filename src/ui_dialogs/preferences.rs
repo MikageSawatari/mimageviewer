@@ -53,12 +53,13 @@ pub fn draw_grid_background_double_click_settings_snapshot_fixture(ui: &mut egui
 }
 
 /// Preferences editor. The HUD uses its own skin with the same axis controls.
-/// Returns true only when the user changed a width/height constraint.
+/// Returns true only when the user changed an axis setting or the common cap.
 pub fn draw_fullscreen_specified_scale_settings(
     ui: &mut egui::Ui,
     value: &mut crate::settings::FullscreenSpecifiedScale,
+    max_tenths: &mut u32,
 ) -> bool {
-    pages::draw_fullscreen_specified_scale_settings(ui, value)
+    pages::draw_fullscreen_specified_scale_settings(ui, value, max_tenths)
 }
 
 #[doc(hidden)]
@@ -70,17 +71,26 @@ pub fn draw_fullscreen_fit_cycle_settings(ui: &mut egui::Ui, settings: &mut Sett
 pub fn draw_fullscreen_specified_scale_live_settings(
     ui: &mut egui::Ui,
     value: &mut crate::settings::FullscreenSpecifiedScale,
+    max_tenths: &mut u32,
     favorite: bool,
 ) -> bool {
-    crate::ui_fullscreen::draw_fs_specified_scale_live_editor(ui, value, favorite)
+    crate::ui_fullscreen::draw_fs_specified_scale_live_editor(ui, value, max_tenths, favorite)
 }
 
 pub(crate) fn draw_fullscreen_specified_scale_axis_controls(
     ui: &mut egui::Ui,
-    axis: &mut Option<crate::settings::SpecifiedScaleAxis>,
+    axis: &mut crate::settings::SpecifiedScaleAxisSetting,
     label: &str,
 ) {
     pages::draw_fullscreen_specified_scale_axis_controls(ui, axis, label, true);
+}
+
+pub(crate) fn draw_fullscreen_specified_scale_max_controls(
+    ui: &mut egui::Ui,
+    max_tenths: &mut u32,
+    dark_popup: bool,
+) -> bool {
+    pages::draw_fullscreen_specified_scale_max_controls(ui, max_tenths, dark_popup)
 }
 
 mod name_colors;
@@ -6303,8 +6313,12 @@ mod tests {
                 default_spread_mode: SpreadMode::RtlCover,
                 default_reading_flow: ReadingFlow::Horizontal,
                 fullscreen_specified_scale: Some(crate::settings::FullscreenSpecifiedScale {
-                    width: None,
-                    height: Some(crate::settings::SpecifiedScaleAxis::LogicalPixels(800)),
+                    width: crate::settings::SpecifiedScaleAxisSetting::disabled(
+                        crate::settings::SpecifiedScaleAxis::PercentTenths(800),
+                    ),
+                    height: crate::settings::SpecifiedScaleAxisSetting::enabled(
+                        crate::settings::SpecifiedScaleAxis::LogicalPixels(800),
+                    ),
                 }),
             },
             _ => FavoriteViewState {
@@ -6322,8 +6336,12 @@ mod tests {
                 default_spread_mode: SpreadMode::Ltr,
                 default_reading_flow: ReadingFlow::Vertical,
                 fullscreen_specified_scale: Some(crate::settings::FullscreenSpecifiedScale {
-                    width: None,
-                    height: None,
+                    width: crate::settings::SpecifiedScaleAxisSetting::disabled(
+                        crate::settings::SpecifiedScaleAxis::PercentTenths(800),
+                    ),
+                    height: crate::settings::SpecifiedScaleAxisSetting::disabled(
+                        crate::settings::SpecifiedScaleAxis::PercentTenths(800),
+                    ),
                 }),
             },
         }
@@ -6394,25 +6412,44 @@ mod tests {
         for explicit in [
             None,
             Some(FullscreenSpecifiedScale {
-                width: None,
-                height: None,
+                width: crate::settings::SpecifiedScaleAxisSetting::disabled(
+                    crate::settings::SpecifiedScaleAxis::PercentTenths(800),
+                ),
+                height: crate::settings::SpecifiedScaleAxisSetting::disabled(
+                    crate::settings::SpecifiedScaleAxis::PercentTenths(800),
+                ),
             }),
         ] {
             let mut app = crate::app::setup_app_for_test();
             app.settings.remember_favorite_view_state = true;
+            app.settings.fullscreen_specified_scale_max_tenths = 80;
             let id = uuid::Uuid::new_v4();
             let mut stored = FavoriteViewState::from_settings(&app.settings);
             stored.fullscreen_specified_scale = explicit;
             app.favorite_view_states.insert(id, stored.clone());
             app.settings.apply_favorite_view_overlay(id, &stored);
             let new_common = FullscreenSpecifiedScale {
-                width: Some(SpecifiedScaleAxis::LogicalPixels(800)),
-                height: Some(SpecifiedScaleAxis::PercentTenths(250)),
+                width: crate::settings::SpecifiedScaleAxisSetting::enabled(
+                    SpecifiedScaleAxis::LogicalPixels(800),
+                ),
+                height: crate::settings::SpecifiedScaleAxisSetting::enabled(
+                    SpecifiedScaleAxis::PercentTenths(250),
+                ),
             };
             let mut edited = app.settings.preferences_snapshot();
             edited.fullscreen_specified_scale = new_common;
+            edited.fullscreen_specified_scale_max_tenths = 25;
+            assert_eq!(app.settings.fullscreen_specified_scale_max_tenths, 80);
             prepare_preferences_settings_for_commit(&mut edited, &mut app.settings);
+            assert_eq!(edited.fullscreen_specified_scale_max_tenths, 25);
             app.install_preferences_settings(edited);
+            assert_eq!(app.settings.fullscreen_specified_scale_max_tenths, 25);
+            assert_eq!(
+                app.settings
+                    .preferences_snapshot()
+                    .fullscreen_specified_scale_max_tenths,
+                25
+            );
             assert_eq!(app.settings.common_fullscreen_specified_scale(), new_common);
             assert_eq!(
                 app.settings.fullscreen_specified_scale,
@@ -6491,11 +6528,20 @@ mod tests {
         use crate::settings::{FullscreenSpecifiedScale, SpecifiedScaleAxis};
         use egui_kittest::kittest::Queryable;
 
-        for key in [egui::Key::Enter, egui::Key::Escape] {
+        for (key, maximum) in [
+            (egui::Key::Enter, 32768.0),
+            (egui::Key::Escape, 32768.0),
+            (egui::Key::Enter, 20.0),
+            (egui::Key::Escape, 20.0),
+        ] {
             let mut app = crate::app::setup_app_for_test();
             app.settings.fullscreen_specified_scale = FullscreenSpecifiedScale {
-                width: Some(SpecifiedScaleAxis::LogicalPixels(800)),
-                height: Some(SpecifiedScaleAxis::PercentTenths(800)),
+                width: crate::settings::SpecifiedScaleAxisSetting::enabled(
+                    SpecifiedScaleAxis::LogicalPixels(800),
+                ),
+                height: crate::settings::SpecifiedScaleAxisSetting::enabled(
+                    SpecifiedScaleAxis::PercentTenths(800),
+                ),
             };
             let original = app.settings.fullscreen_specified_scale;
             app.open_preferences_request(PreferencesOpenRequest::anchored(
@@ -6519,14 +6565,14 @@ mod tests {
             harness
                 .get_by(|node| {
                     node.min_numeric_value() == Some(1.0)
-                        && node.max_numeric_value() == Some(32768.0)
+                        && node.max_numeric_value() == Some(maximum)
                 })
                 .scroll_to_me();
             harness.run();
             harness
                 .get_by(|node| {
                     node.min_numeric_value() == Some(1.0)
-                        && node.max_numeric_value() == Some(32768.0)
+                        && node.max_numeric_value() == Some(maximum)
                 })
                 .focus();
             harness.run();
@@ -6534,7 +6580,7 @@ mod tests {
                 harness
                     .get_by(|node| {
                         node.min_numeric_value() == Some(1.0)
-                            && node.max_numeric_value() == Some(32768.0)
+                            && node.max_numeric_value() == Some(maximum)
                     })
                     .is_focused()
             );
@@ -6547,7 +6593,14 @@ mod tests {
             harness.run();
             assert!(
                 harness.state().show_preferences,
-                "IME {key:?} must not close the preferences dialog"
+                "IME {key:?} must not close the preferences dialog; max={maximum}"
+            );
+            assert_eq!(
+                harness
+                    .state()
+                    .settings
+                    .fullscreen_specified_scale_max_tenths,
+                50
             );
             assert!(!harness.state().show_preferences_discard_confirm);
             assert!(harness.state().pref_state.is_some());

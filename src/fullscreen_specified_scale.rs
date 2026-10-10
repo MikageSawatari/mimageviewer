@@ -3,9 +3,10 @@ use eframe::egui;
 
 use crate::displayed_image_transform::{FullscreenFitScaleLimits, physical_pixel_scale};
 use crate::pdf_loader::{PDF_ORIGINAL_RENDER_MIN_LONG_PX, PdfPageContentType};
-use crate::settings::{FullscreenFitMode, FullscreenSpecifiedScale, SpecifiedScaleAxis};
-
-pub(crate) const SPECIFIED_SCALE_MAX_UPSCALE: f32 = 5.0;
+use crate::settings::{
+    FULLSCREEN_SPECIFIED_SCALE_MAX_MAX_TENTHS, FULLSCREEN_SPECIFIED_SCALE_MAX_MIN_TENTHS,
+    FullscreenFitMode, FullscreenSpecifiedScale, SpecifiedScaleAxis,
+};
 
 /// Full unrotated, untrimmed page basis; never a current AI/PDF output texture.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -57,6 +58,7 @@ pub(crate) enum FullscreenFitInput {
     SpecifiedScale {
         size: FullscreenSpecifiedScale,
         basis: FullscreenFitBasis,
+        max_tenths: u32,
     },
 }
 
@@ -69,9 +71,14 @@ impl FullscreenFitInput {
         mode: FullscreenFitMode,
         size: FullscreenSpecifiedScale,
         basis: FullscreenFitBasis,
+        max_tenths: u32,
     ) -> Self {
         match mode {
-            FullscreenFitMode::SpecifiedScale => Self::SpecifiedScale { size, basis },
+            FullscreenFitMode::SpecifiedScale => Self::SpecifiedScale {
+                size,
+                basis,
+                max_tenths,
+            },
             _ => Self::Legacy(mode),
         }
     }
@@ -110,6 +117,7 @@ pub(crate) fn resolve_specified_scale(
     saved_gap: f32,
     size: FullscreenSpecifiedScale,
     limits: FullscreenFitScaleLimits,
+    max_tenths: u32,
 ) -> Option<ResolvedSpecifiedScale> {
     if !valid_size(viewport_size)
         || !valid_size(unit_size)
@@ -118,8 +126,14 @@ pub(crate) fn resolve_specified_scale(
     {
         return None;
     }
-    let width = size.width.map(|axis| resolve_axis(axis, viewport_size.x));
-    let height = size.height.map(|axis| resolve_axis(axis, viewport_size.y));
+    let width = size
+        .width
+        .active()
+        .map(|axis| resolve_axis(axis, viewport_size.x));
+    let height = size
+        .height
+        .active()
+        .map(|axis| resolve_axis(axis, viewport_size.y));
     let gap = width.map_or(saved_gap.max(0.0), |width| {
         saved_gap
             .max(0.0)
@@ -134,7 +148,7 @@ pub(crate) fn resolve_specified_scale(
             ((viewport_size.x - gap).max(1.0) / unit_size.x).min(viewport_size.y / unit_size.y)
         }
     };
-    let scale = apply_specified_scale_limits(requested, limits);
+    let scale = apply_specified_scale_limits(requested, limits, max_tenths);
     if !scale.is_finite() || scale <= 0.0 {
         return None;
     }
@@ -142,15 +156,21 @@ pub(crate) fn resolve_specified_scale(
 }
 
 /// Apply the shared original-pixel limits and new-mode cap to an automatic request.
-/// Both-None callers may reuse their existing Page fit formula, including its
+/// Both-disabled callers may reuse their existing Page fit formula, including its
 /// composition-specific subpoint minimum width, before reaching this boundary.
 pub(crate) fn apply_specified_scale_limits(
     requested: f32,
     limits: FullscreenFitScaleLimits,
+    max_tenths: u32,
 ) -> f32 {
+    let max_upscale = max_tenths.clamp(
+        FULLSCREEN_SPECIFIED_SCALE_MAX_MIN_TENTHS,
+        FULLSCREEN_SPECIFIED_SCALE_MAX_MAX_TENTHS,
+    ) as f32
+        / 10.0;
     limits
         .apply(requested)
-        .min(SPECIFIED_SCALE_MAX_UPSCALE * physical_pixel_scale(limits.pixels_per_point))
+        .min(max_upscale * physical_pixel_scale(limits.pixels_per_point))
 }
 
 fn resolve_axis(axis: SpecifiedScaleAxis, viewport_length: f32) -> f32 {
@@ -167,6 +187,9 @@ fn valid_size(size: egui::Vec2) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::{
+        FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS, SpecifiedScaleAxisSetting,
+    };
 
     fn close(actual: f32, expected: f32) {
         assert!(
@@ -193,6 +216,7 @@ mod tests {
                 no_upscale,
                 no_downscale,
             },
+            FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS,
         )
         .unwrap()
     }
@@ -205,6 +229,7 @@ mod tests {
         let specified = FullscreenFitInput::SpecifiedScale {
             size: FullscreenSpecifiedScale::default(),
             basis,
+            max_tenths: 127,
         };
         assert_eq!(
             specified.for_single_page_z(),
@@ -251,29 +276,45 @@ mod tests {
         for (size, expected) in [
             (
                 FullscreenSpecifiedScale {
-                    width: Some(SpecifiedScaleAxis::PercentTenths(500)),
-                    height: None,
+                    width: SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::PercentTenths(
+                        500,
+                    )),
+                    height: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(
+                        800,
+                    )),
                 },
                 0.5,
             ),
             (
                 FullscreenSpecifiedScale {
-                    width: None,
-                    height: Some(SpecifiedScaleAxis::LogicalPixels(800)),
+                    width: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(
+                        800,
+                    )),
+                    height: SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::LogicalPixels(
+                        800,
+                    )),
                 },
                 0.4,
             ),
             (
                 FullscreenSpecifiedScale {
-                    width: Some(SpecifiedScaleAxis::PercentTenths(500)),
-                    height: Some(SpecifiedScaleAxis::LogicalPixels(800)),
+                    width: SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::PercentTenths(
+                        500,
+                    )),
+                    height: SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::LogicalPixels(
+                        800,
+                    )),
                 },
                 0.4,
             ),
             (
                 FullscreenSpecifiedScale {
-                    width: None,
-                    height: None,
+                    width: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(
+                        800,
+                    )),
+                    height: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(
+                        800,
+                    )),
                 },
                 0.4,
             ),
@@ -286,8 +327,12 @@ mod tests {
                 view,
                 egui::vec2(4000.0, 1000.0),
                 FullscreenSpecifiedScale {
-                    width: None,
-                    height: Some(SpecifiedScaleAxis::LogicalPixels(800)),
+                    width: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(
+                        800,
+                    )),
+                    height: SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::LogicalPixels(
+                        800,
+                    )),
                 },
                 1.0,
                 false,
@@ -305,8 +350,12 @@ mod tests {
                 egui::vec2(1000.0, 1000.0),
                 egui::vec2(1000.0, 2000.0),
                 FullscreenSpecifiedScale {
-                    width: None,
-                    height: Some(SpecifiedScaleAxis::LogicalPixels(800)),
+                    width: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(
+                        800,
+                    )),
+                    height: SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::LogicalPixels(
+                        800,
+                    )),
                 },
                 ppp,
                 false,
@@ -318,53 +367,72 @@ mod tests {
     }
 
     #[test]
-    fn limits_then_five_times_cap_all_four_combinations() {
+    fn configurable_cap_and_original_limits_cover_all_four_combinations() {
         for ppp in [1.0, 1.25, 1.5, 2.0] {
-            for requested_physical in [0.1, 0.999, 1.0, 1.001, 4.999, 5.0, 5.001, 50.0] {
-                let view = egui::vec2(1000.0 * requested_physical / ppp, 1000.0);
-                let size = FullscreenSpecifiedScale {
-                    width: Some(SpecifiedScaleAxis::PercentTenths(1000)),
-                    height: None,
-                };
-                for (up, down) in [(false, false), (true, false), (false, true), (true, true)] {
-                    let mut expected = requested_physical;
-                    if up {
-                        expected = expected.min(1.0);
+            for max_tenths in [0, 10, 11, 35, 50, 127, 200, u32::MAX] {
+                let cap = max_tenths.clamp(10, 200) as f32 / 10.0;
+                for requested_physical in [0.1, 0.999, 1.0, 1.001, 4.999, 5.0, 5.001, 20.0, 50.0] {
+                    for (up, down) in [(false, false), (true, false), (false, true), (true, true)] {
+                        let mut expected: f32 = requested_physical;
+                        if up {
+                            expected = expected.min(1.0);
+                        }
+                        if down {
+                            expected = expected.max(1.0);
+                        }
+                        expected = expected.min(cap);
+                        let limits = FullscreenFitScaleLimits {
+                            pixels_per_point: ppp,
+                            no_upscale: up,
+                            no_downscale: down,
+                        };
+                        close(
+                            apply_specified_scale_limits(
+                                requested_physical / ppp,
+                                limits,
+                                max_tenths,
+                            ) * ppp,
+                            expected,
+                        );
                     }
-                    if down {
-                        expected = expected.max(1.0);
-                    }
-                    expected = expected.min(5.0);
-                    close(
-                        fit(view, egui::vec2(1000.0, 1000.0), size, ppp, up, down).scale * ppp,
-                        expected,
-                    );
                 }
             }
         }
-        // Both None keeps the selected mode's five-times contract.
-        close(
-            fit(
-                egui::vec2(1000.0, 1000.0),
-                egui::vec2(10.0, 10.0),
-                FullscreenSpecifiedScale {
-                    width: None,
-                    height: None,
-                },
-                2.0,
-                false,
-                false,
-            )
-            .scale,
-            2.5,
-        );
+    }
+
+    #[test]
+    fn changed_cap_applies_to_active_axes_and_both_disabled_page_fit() {
+        let both_disabled = FullscreenSpecifiedScale {
+            width: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::LogicalPixels(1)),
+            height: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(1)),
+        };
+        for size in [both_disabled, FullscreenSpecifiedScale::default()] {
+            for max_tenths in [10, 35, 50, 127, 200] {
+                for ppp in [1.0, 1.25, 1.5, 2.0] {
+                    let result = resolve_specified_scale(
+                        egui::vec2(1000.0, 1000.0),
+                        egui::vec2(10.0, 10.0),
+                        40.0,
+                        size,
+                        FullscreenFitScaleLimits {
+                            pixels_per_point: ppp,
+                            ..Default::default()
+                        },
+                        max_tenths,
+                    )
+                    .unwrap();
+                    close(result.scale * ppp, max_tenths as f32 / 10.0);
+                    close(result.gap, 40.0);
+                }
+            }
+        }
     }
 
     #[test]
     fn spread_width_includes_gap_and_small_width_only_adjusts_display_gap() {
         let size = FullscreenSpecifiedScale {
-            width: Some(SpecifiedScaleAxis::LogicalPixels(800)),
-            height: None,
+            width: SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::LogicalPixels(800)),
+            height: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(800)),
         };
         let result = resolve_specified_scale(
             egui::vec2(1000.0, 1000.0),
@@ -372,13 +440,14 @@ mod tests {
             40.0,
             size,
             FullscreenFitScaleLimits::default(),
+            FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS,
         )
         .unwrap();
         close(result.scale * 2000.0 + result.gap, 800.0);
         for ppp in [1.0, 1.25, 1.5, 2.0] {
             let tiny = FullscreenSpecifiedScale {
-                width: Some(SpecifiedScaleAxis::LogicalPixels(1)),
-                height: None,
+                width: SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::LogicalPixels(1)),
+                height: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(800)),
             };
             let result = resolve_specified_scale(
                 egui::vec2(1000.0, 1000.0),
@@ -389,6 +458,7 @@ mod tests {
                     pixels_per_point: ppp,
                     ..Default::default()
                 },
+                FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS,
             )
             .unwrap();
             close(result.gap, (1.0 - 1.0 / ppp).max(0.0));
@@ -399,10 +469,11 @@ mod tests {
             egui::vec2(2000.0, 2000.0),
             40.0,
             FullscreenSpecifiedScale {
-                width: None,
-                height: None,
+                width: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(800)),
+                height: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(800)),
             },
             FullscreenFitScaleLimits::default(),
+            FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS,
         )
         .unwrap();
         close(fallback.gap, 40.0);
@@ -422,8 +493,10 @@ mod tests {
                     egui::vec2(1000.0, 1000.0),
                     egui::vec2(1000.0, 1000.0),
                     FullscreenSpecifiedScale {
-                        width: Some(axis),
-                        height: None
+                        width: SpecifiedScaleAxisSetting::enabled(axis),
+                        height: SpecifiedScaleAxisSetting::disabled(
+                            SpecifiedScaleAxis::PercentTenths(800)
+                        )
                     },
                     1.0,
                     false,
@@ -446,7 +519,8 @@ mod tests {
                     egui::vec2(1.0, 1.0),
                     0.0,
                     FullscreenSpecifiedScale::default(),
-                    FullscreenFitScaleLimits::default()
+                    FullscreenFitScaleLimits::default(),
+                    FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS,
                 )
                 .is_none()
             );

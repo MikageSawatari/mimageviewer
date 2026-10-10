@@ -1455,6 +1455,14 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+2026-10-10 §1.342 最大倍率・保持軸モデル: 利用者承認の共通capを既存fit descriptorへ
+snapshotとして接続し、ui_fullscreenの単ページ／見開き／連結・capture／navigator consumerが
+同じpolicyを使う。共通cap編集はfavorite専用値を作らず、live編集はメモリだけを変える。
+各軸enabledと保持valueを同じ型へ集約し、OFFの値破棄をstate ownerで解消する構造修正である。
+capだけの変更で連結参照unitを替えず、元寸法・trim再解決ownerと退去時保持は維持する。
+viewport述語・HWND同定・placement・focus・context移送・workerを変更しない。
+popup背景RGBA(30,30,30,240)と前回のscrollbar予約を保持する。今回の独立レビュー合格は未記録。
+
 2026-10-10 §1.342 HUD fit popupのscrollbar予約: 利用者の実機指摘とCLAUDE.mdの
 floating scrollbar規則に従い、`ui_fullscreen.rs` の共通popup ScrollArea ownerで
 全行・本文・数値／単位widgetが使うcontent幅へバーのgutterを予約する。

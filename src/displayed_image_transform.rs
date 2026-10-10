@@ -382,14 +382,19 @@ impl DisplayedImageGeometry {
             }
         };
         let fit_scale = match input.fit_mode {
-            FullscreenFitInput::SpecifiedScale { size, .. }
-                if size.width.is_none() && size.height.is_none() && singleton.is_none() =>
+            FullscreenFitInput::SpecifiedScale {
+                size, max_tenths, ..
+            } if size.width.active().is_none()
+                && size.height.active().is_none()
+                && singleton.is_none() =>
             {
                 // Page has no minimum one-point width for a real single page. Spread's
                 // legacy one-point minimum is composition-specific, including gap=0.
-                apply_specified_scale_limits(fit_scale, input.fit_scale_limits)
+                apply_specified_scale_limits(fit_scale, input.fit_scale_limits, max_tenths)
             }
-            FullscreenFitInput::SpecifiedScale { size, .. } => {
+            FullscreenFitInput::SpecifiedScale {
+                size, max_tenths, ..
+            } => {
                 let (width, height, _) =
                     bbox_fit.unwrap_or((display_size.x, display_size.y, egui::Vec2::ZERO));
                 let resolved = resolve_specified_scale(
@@ -398,6 +403,7 @@ impl DisplayedImageGeometry {
                     singleton.map_or(0.0, |(_, gap, _)| gap),
                     size,
                     input.fit_scale_limits,
+                    max_tenths,
                 )?;
                 if let Some((_, gap, _)) = singleton.as_mut() {
                     *gap = resolved.gap;
@@ -1970,6 +1976,10 @@ pub(crate) fn z_aim_frame_rect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::{
+        FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS, SpecifiedScaleAxis,
+        SpecifiedScaleAxisSetting,
+    };
 
     fn input(
         fit_mode: FullscreenFitMode,
@@ -2852,6 +2862,7 @@ mod tests {
             size,
             basis: crate::fullscreen_specified_scale::FullscreenFitBasis::new(original, original)
                 .unwrap(),
+            max_tenths: FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS,
         };
         value.placement = ResolvedDisplayPlacement::Normal { zoom_pan: None };
         value.pixel_fit = RectPixelFit::Proportional;
@@ -2871,8 +2882,12 @@ mod tests {
             let mut before = specified_input(
                 egui::vec2(800.0, 800.0),
                 FullscreenSpecifiedScale {
-                    width: None,
-                    height: Some(SpecifiedScaleAxis::LogicalPixels(800)),
+                    width: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(
+                        800,
+                    )),
+                    height: SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::LogicalPixels(
+                        800,
+                    )),
                 },
             );
             before.content_bbox = Some(trim);
@@ -2986,21 +3001,90 @@ mod tests {
     }
 
     #[test]
+    fn configured_cap_changes_auto_fit_without_affecting_legacy_page() {
+        use crate::settings::FullscreenSpecifiedScale;
+        for size in [
+            FullscreenSpecifiedScale::default(),
+            FullscreenSpecifiedScale {
+                width: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::LogicalPixels(1)),
+                height: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::LogicalPixels(1)),
+            },
+        ] {
+            for max_tenths in [10, 35, 50, 127, 200] {
+                let mut value = specified_input(egui::vec2(10.0, 20.0), size);
+                if let FullscreenFitInput::SpecifiedScale {
+                    max_tenths: cap, ..
+                } = &mut value.fit_mode
+                {
+                    *cap = max_tenths;
+                }
+                value.pixels_per_point = 1.25;
+                value.fit_scale_limits.pixels_per_point = 1.25;
+                let fitted = DisplayedImageTransform::resolve(value).unwrap();
+                close(
+                    fitted.layout_full_image_rect.height(),
+                    20.0 * (max_tenths as f32 / 10.0) / 1.25,
+                );
+                let legacy = DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+                    fit_mode: FullscreenFitInput::legacy(FullscreenFitMode::Page),
+                    ..value
+                })
+                .unwrap();
+                close(legacy.layout_full_image_rect.height(), 800.0);
+            }
+        }
+    }
+
+    #[test]
+    fn captured_specified_descriptor_retains_its_cap_after_live_policy_changes() {
+        use crate::settings::FullscreenSpecifiedScale;
+        let mut value =
+            specified_input(egui::vec2(10.0, 20.0), FullscreenSpecifiedScale::default());
+        let FullscreenFitInput::SpecifiedScale { size, basis, .. } = value.fit_mode else {
+            unreachable!()
+        };
+        value.fit_mode =
+            FullscreenFitInput::from_mode(FullscreenFitMode::SpecifiedScale, size, basis, 35);
+        let captured = DisplayedImageTransform::resolve(value).unwrap();
+        let mut live = value;
+        live.fit_mode =
+            FullscreenFitInput::from_mode(FullscreenFitMode::SpecifiedScale, size, basis, 127);
+        let changed = DisplayedImageTransform::resolve(live).unwrap();
+        close(captured.layout_full_image_rect.height(), 70.0);
+        close(changed.layout_full_image_rect.height(), 254.0);
+        value.fit_mode = captured.fit_input;
+        let replay = DisplayedImageTransform::resolve(value).unwrap();
+        assert_eq!(captured.fit_input, replay.fit_input);
+        assert_eq!(
+            captured.layout_full_image_rect,
+            replay.layout_full_image_rect
+        );
+        assert_eq!(captured.paint_rect, replay.paint_rect);
+    }
+
+    #[test]
     fn specified_cap_is_before_manual_zoom_and_rotation_swaps_axes_once() {
         use crate::settings::{FullscreenSpecifiedScale, SpecifiedScaleAxis};
         let mut tiny = specified_input(egui::vec2(10.0, 20.0), FullscreenSpecifiedScale::default());
+        if let FullscreenFitInput::SpecifiedScale { max_tenths, .. } = &mut tiny.fit_mode {
+            *max_tenths = 35;
+        }
         tiny.placement = ResolvedDisplayPlacement::Normal {
             zoom_pan: Some((2.0, egui::Vec2::ZERO)),
         };
         let enlarged = DisplayedImageTransform::resolve(tiny).unwrap();
-        close(enlarged.full_image_rect.height(), 200.0);
-        close(enlarged.total_scale, 10.0);
+        close(enlarged.full_image_rect.height(), 140.0);
+        close(enlarged.total_scale, 7.0);
         for rotation in [Rotation::Cw90, Rotation::Cw270] {
             let mut rotated = specified_input(
                 egui::vec2(1000.0, 2000.0),
                 FullscreenSpecifiedScale {
-                    width: None,
-                    height: Some(SpecifiedScaleAxis::LogicalPixels(800)),
+                    width: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(
+                        800,
+                    )),
+                    height: SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::LogicalPixels(
+                        800,
+                    )),
                 },
             );
             rotated.rotation = rotation;
@@ -3016,8 +3100,8 @@ mod tests {
         let mut value = specified_input(
             egui::vec2(1000.0, 2000.0),
             FullscreenSpecifiedScale {
-                width: Some(SpecifiedScaleAxis::LogicalPixels(800)),
-                height: None,
+                width: SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::LogicalPixels(800)),
+                height: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(800)),
             },
         );
         value.placement = ResolvedDisplayPlacement::SingletonSpread {
@@ -3033,14 +3117,15 @@ mod tests {
         );
         value.fit_mode = FullscreenFitInput::SpecifiedScale {
             size: FullscreenSpecifiedScale {
-                width: Some(SpecifiedScaleAxis::LogicalPixels(1)),
-                height: None,
+                width: SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::LogicalPixels(1)),
+                height: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(800)),
             },
             basis: crate::fullscreen_specified_scale::FullscreenFitBasis::new(
                 value.source_size,
                 value.source_size,
             )
             .unwrap(),
+            max_tenths: FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS,
         };
         let geometry = DisplayedImageTransform::resolve(value).unwrap();
         close(geometry.full_image_rect.width(), 0.5);
@@ -3056,8 +3141,8 @@ mod tests {
         let mut value = specified_input(
             egui::vec2(1000.0, 1000.0),
             FullscreenSpecifiedScale {
-                width: None,
-                height: Some(SpecifiedScaleAxis::LogicalPixels(100)),
+                width: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(800)),
+                height: SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::LogicalPixels(100)),
             },
         );
         value.fit_scale_limits.no_upscale = true;
@@ -3105,16 +3190,25 @@ mod tests {
                     let mut value = specified_input(
                         basis.normalized_original_size(),
                         FullscreenSpecifiedScale {
-                            width: None,
-                            height: Some(SpecifiedScaleAxis::LogicalPixels(100)),
+                            width: SpecifiedScaleAxisSetting::disabled(
+                                SpecifiedScaleAxis::PercentTenths(800),
+                            ),
+                            height: SpecifiedScaleAxisSetting::enabled(
+                                SpecifiedScaleAxis::LogicalPixels(100),
+                            ),
                         },
                     );
                     value.fit_mode = FullscreenFitInput::SpecifiedScale {
                         size: FullscreenSpecifiedScale {
-                            width: None,
-                            height: Some(SpecifiedScaleAxis::LogicalPixels(100)),
+                            width: SpecifiedScaleAxisSetting::disabled(
+                                SpecifiedScaleAxis::PercentTenths(800),
+                            ),
+                            height: SpecifiedScaleAxisSetting::enabled(
+                                SpecifiedScaleAxis::LogicalPixels(100),
+                            ),
                         },
                         basis,
+                        max_tenths: FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS,
                     };
                     value.rotation = rotation;
                     value.pixels_per_point = pixels_per_point;
@@ -3178,11 +3272,14 @@ mod tests {
     }
 
     #[test]
-    fn specified_single_z_has_no_five_times_cap_in_aim_or_confirmed_geometry() {
+    fn specified_single_z_ignores_configured_cap_in_aim_or_confirmed_geometry() {
         use crate::settings::FullscreenSpecifiedScale;
         for active in [false, true] {
             let mut value =
                 specified_input(egui::vec2(10.0, 20.0), FullscreenSpecifiedScale::default());
+            if let FullscreenFitInput::SpecifiedScale { max_tenths, .. } = &mut value.fit_mode {
+                *max_tenths = 10;
+            }
             value.fit_scale_limits.no_upscale = true;
             value.fit_scale_limits.no_downscale = true;
             let result = ResolvedZTransform::resolve(ZTransformInput {
@@ -3203,13 +3300,13 @@ mod tests {
     }
 
     #[test]
-    fn specified_both_none_keeps_real_single_page_subpoint_formula() {
+    fn specified_both_disabled_keeps_real_single_page_subpoint_formula() {
         use crate::settings::FullscreenSpecifiedScale;
         let mut value = specified_input(
             egui::vec2(2000.0, 1000.0),
             FullscreenSpecifiedScale {
-                width: None,
-                height: None,
+                width: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(800)),
+                height: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(800)),
             },
         );
         value.viewport_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(0.5, 0.8));
@@ -3239,8 +3336,8 @@ mod tests {
         let mut value = specified_input(
             egui::vec2(1000.0, 2000.0),
             FullscreenSpecifiedScale {
-                width: None,
-                height: Some(SpecifiedScaleAxis::LogicalPixels(800)),
+                width: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(800)),
+                height: SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::LogicalPixels(800)),
             },
         );
         value.content_bbox = Some(egui::Rect::from_min_max(
@@ -3277,16 +3374,17 @@ mod tests {
         let mut value = specified_input(
             basis.normalized_original_size(),
             FullscreenSpecifiedScale {
-                width: None,
-                height: Some(SpecifiedScaleAxis::LogicalPixels(100)),
+                width: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(800)),
+                height: SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::LogicalPixels(100)),
             },
         );
         value.fit_mode = FullscreenFitInput::SpecifiedScale {
             size: FullscreenSpecifiedScale {
-                width: None,
-                height: Some(SpecifiedScaleAxis::LogicalPixels(100)),
+                width: SpecifiedScaleAxisSetting::disabled(SpecifiedScaleAxis::PercentTenths(800)),
+                height: SpecifiedScaleAxisSetting::enabled(SpecifiedScaleAxis::LogicalPixels(100)),
             },
             basis,
+            max_tenths: FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS,
         };
         value.fit_scale_limits.no_downscale = true;
         value.placement = ResolvedDisplayPlacement::Normal {

@@ -84361,6 +84361,20 @@ impl App {
         changed
     }
 
+    /// Memory-only HUD edits. Common settings save at the existing tray/exit or
+    /// preferences commit boundary; this field never enters favorite view state.
+    pub(crate) fn set_fullscreen_specified_scale_max_tenths(&mut self, value: u32) -> bool {
+        if !(crate::settings::FULLSCREEN_SPECIFIED_SCALE_MAX_MIN_TENTHS
+            ..=crate::settings::FULLSCREEN_SPECIFIED_SCALE_MAX_MAX_TENTHS)
+            .contains(&value)
+        {
+            return false;
+        }
+        let changed = self.settings.fullscreen_specified_scale_max_tenths != value;
+        self.settings.fullscreen_specified_scale_max_tenths = value;
+        changed
+    }
+
     fn rating_view_destination_display_order(&self) -> crate::settings::GridDisplayOrder {
         self.favorite_view_state_for_path(&rating_view_synthetic_path())
             .grid_display_order
@@ -96596,8 +96610,12 @@ mod specified_scale_contract_tests {
         app.transition_favorite_view_for_path(Some(&outside));
         assert!(app.favorite_view_writes.next_due_in_at(now).is_none());
         let updated_common = FullscreenSpecifiedScale {
-            width: None,
-            height: Some(SpecifiedScaleAxis::LogicalPixels(900)),
+            width: crate::settings::SpecifiedScaleAxisSetting::disabled(
+                crate::settings::SpecifiedScaleAxis::PercentTenths(800),
+            ),
+            height: crate::settings::SpecifiedScaleAxisSetting::enabled(
+                SpecifiedScaleAxis::LogicalPixels(900),
+            ),
         };
         app.settings.fullscreen_specified_scale = updated_common;
         app.current_folder = Some(favorite.path.clone());
@@ -96629,8 +96647,12 @@ mod specified_scale_contract_tests {
             FullscreenSpecifiedScale::default()
         );
         let explicit = FullscreenSpecifiedScale {
-            width: None,
-            height: None,
+            width: crate::settings::SpecifiedScaleAxisSetting::disabled(
+                crate::settings::SpecifiedScaleAxis::PercentTenths(800),
+            ),
+            height: crate::settings::SpecifiedScaleAxisSetting::disabled(
+                crate::settings::SpecifiedScaleAxis::PercentTenths(800),
+            ),
         };
         app.set_current_fullscreen_specified_scale(explicit);
         assert_eq!(
@@ -96655,16 +96677,24 @@ mod specified_scale_contract_tests {
         let id = uuid::Uuid::new_v4();
         let mut state = FavoriteViewState::from_settings(&app.settings);
         state.fullscreen_specified_scale = Some(FullscreenSpecifiedScale {
-            width: None,
-            height: Some(SpecifiedScaleAxis::LogicalPixels(240)),
+            width: crate::settings::SpecifiedScaleAxisSetting::disabled(
+                crate::settings::SpecifiedScaleAxis::PercentTenths(800),
+            ),
+            height: crate::settings::SpecifiedScaleAxisSetting::enabled(
+                SpecifiedScaleAxis::LogicalPixels(240),
+            ),
         });
         app.settings.remember_favorite_view_state = true;
         app.favorite_view_states.insert(id, state.clone());
         app.settings.apply_favorite_view_overlay(id, &state);
         app.settings.remember_favorite_view_state = false;
         let value = FullscreenSpecifiedScale {
-            width: Some(SpecifiedScaleAxis::LogicalPixels(400)),
-            height: None,
+            width: crate::settings::SpecifiedScaleAxisSetting::enabled(
+                SpecifiedScaleAxis::LogicalPixels(400),
+            ),
+            height: crate::settings::SpecifiedScaleAxisSetting::disabled(
+                crate::settings::SpecifiedScaleAxis::PercentTenths(800),
+            ),
         };
         assert!(app.set_current_fullscreen_specified_scale(value));
         assert_eq!(app.settings.common_fullscreen_specified_scale(), value);
