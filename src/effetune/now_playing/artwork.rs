@@ -451,7 +451,7 @@ fn normalize(bytes: &[u8], extension: &str, cancel: &AtomicBool) -> Result<Encod
     } else {
         crate::thumb_loader::apply_orientation(decoded, orientation)
     };
-    // Static, bounded PNG/JPEG/WebP can retain their original encoded bytes.
+    // Static, bounded square PNG/JPEG/WebP can retain their original bytes.
     // An animation marker conservatively selects reencoding of the first frame.
     let mime = match format {
         Some(ImageFormat::Png) => Some("image/png"),
@@ -465,6 +465,7 @@ fn normalize(bytes: &[u8], extension: &str, cancel: &AtomicBool) -> Result<Encod
         && !wic_orientation_applied
         && !animated
         && orientation == 1
+        && decoded.width() == decoded.height()
         && decoded.width().max(decoded.height()) <= 1024
         && bytes.len() <= MAX_ARTWORK_BYTES
     {
@@ -479,6 +480,22 @@ fn encode(image: DynamicImage, cancel: &AtomicBool) -> Result<EncodedArt, String
     } else {
         image
     };
+    check(cancel)?;
+    // EffeTune's Visualizer uses cover fit. A transparent square keeps all of
+    // a rectangular source visible in its usual square artwork box. Resize
+    // first, so this extra RGBA allocation is at most 1024 * 1024 * 4 bytes.
+    let image = if image.width() != image.height() {
+        let side = image.width().max(image.height());
+        let x = i64::from((side - image.width()) / 2);
+        let y = i64::from((side - image.height()) / 2);
+        let source = image.into_rgba8();
+        let mut square = image::RgbaImage::new(side, side);
+        image::imageops::replace(&mut square, &source, x, y);
+        DynamicImage::ImageRgba8(square)
+    } else {
+        image
+    };
+    check(cancel)?;
     let mut bytes = Vec::new();
     let mime = if image.has_alpha() {
         image
@@ -546,10 +563,14 @@ mod tests {
         )
         .unwrap()
         .to_rgba8();
-        assert_eq!((decoded.width(), decoded.height()), (16, 8));
-        assert_eq!(decoded.get_pixel(0, 0).0, [0, 0, 0, 255]);
-        assert_eq!(decoded.get_pixel(4, 0).0, [255, 255, 255, 255]);
-        assert_eq!(decoded, wic.to_rgba8());
+        assert_eq!((decoded.width(), decoded.height()), (16, 16));
+        assert_eq!(decoded.get_pixel(0, 0).0, [0, 0, 0, 0]);
+        assert_eq!(decoded.get_pixel(0, 4).0, [0, 0, 0, 255]);
+        assert_eq!(decoded.get_pixel(4, 4).0, [255, 255, 255, 255]);
+        assert_eq!(
+            image::imageops::crop_imm(&decoded, 0, 4, 16, 8).to_image(),
+            wic.to_rgba8()
+        );
     }
 
     #[cfg(windows)]
@@ -601,19 +622,29 @@ mod tests {
         bytes
     }
     #[test]
-    fn now_playing_static_webp_and_png_reuse_respects_1024_boundary() {
+    fn now_playing_square_png_webp_and_jpeg_passthrough_at_1024_boundary() {
         let cancel = AtomicBool::new(false);
-        for format in [ImageFormat::Png, ImageFormat::WebP] {
+        for (format, mime) in [
+            (ImageFormat::Png, "image/png"),
+            (ImageFormat::WebP, "image/webp"),
+            (ImageFormat::Jpeg, "image/jpeg"),
+        ] {
             let image = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
                 1024,
-                10,
+                1024,
                 image::Rgba([10, 20, 30, 200]),
             ));
+            let image = if format == ImageFormat::Jpeg {
+                DynamicImage::ImageRgb8(image.into_rgb8())
+            } else {
+                image
+            };
             let mut bytes = Vec::new();
             image
                 .write_to(&mut Cursor::new(&mut bytes), format)
                 .unwrap();
             let art = normalize(&bytes, "", &cancel).unwrap();
+            assert_eq!(art.mime, mime);
             assert_eq!(
                 base64::engine::general_purpose::STANDARD
                     .decode(&*art.base64)
@@ -627,9 +658,83 @@ mod tests {
                 .decode(&*art.base64)
                 .unwrap(),
         )
-        .unwrap();
-        assert_eq!((decoded.width(), decoded.height()), (1024, 256));
+        .unwrap()
+        .to_rgba8();
+        assert_eq!((decoded.width(), decoded.height()), (1024, 1024));
+        assert_eq!(decoded.get_pixel(0, 383).0, [0, 0, 0, 0]);
+        assert_eq!(decoded.get_pixel(0, 384).0, [255, 10, 20, 100]);
+        assert_eq!(decoded.get_pixel(1023, 639).0, [255, 10, 20, 100]);
+        assert_eq!(decoded.get_pixel(1023, 640).0, [0, 0, 0, 0]);
         assert_eq!(art.mime, "image/png");
+    }
+    #[test]
+    fn now_playing_landscape_and_portrait_are_centered_with_source_alpha() {
+        for (width, height) in [(900, 450), (450, 900), (901, 450)] {
+            let input = png(width, height);
+            let art = normalize(&input, "png", &AtomicBool::new(false)).unwrap();
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&*art.base64)
+                .unwrap();
+            assert_ne!(bytes, input);
+            assert_eq!(art.mime, "image/png");
+            let decoded = image::load_from_memory(&bytes).unwrap().to_rgba8();
+            let side = width.max(height);
+            let x = (side - width) / 2;
+            let y = (side - height) / 2;
+            assert_eq!(decoded.dimensions(), (side, side));
+            for (px, py, pixel) in decoded.enumerate_pixels() {
+                let expected = if (x..x + width).contains(&px) && (y..y + height).contains(&py) {
+                    [255, 10, 20, 100]
+                } else {
+                    [0, 0, 0, 0]
+                };
+                assert_eq!(
+                    pixel.0, expected,
+                    "source={width}x{height}, pixel={px},{py}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn now_playing_rectangular_jpeg_reencodes_as_png_with_transparent_padding() {
+        let image = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            128,
+            64,
+            image::Rgb([20, 30, 40]),
+        ));
+        let mut input = Vec::new();
+        image
+            .write_to(&mut Cursor::new(&mut input), ImageFormat::Jpeg)
+            .unwrap();
+        let art = normalize(&input, "jpg", &AtomicBool::new(false)).unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&*art.base64)
+            .unwrap();
+        assert_eq!(image::guess_format(&bytes).unwrap(), ImageFormat::Png);
+        assert_eq!(art.mime, "image/png");
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        assert!(decoded.has_alpha());
+        let decoded = decoded.to_rgba8();
+        assert_eq!(decoded.dimensions(), (128, 128));
+        assert_eq!(decoded.get_pixel(0, 31).0, [0, 0, 0, 0]);
+        assert_eq!(decoded.get_pixel(0, 32).0[3], 255);
+        assert_eq!(decoded.get_pixel(127, 95).0[3], 255);
+        assert_eq!(decoded.get_pixel(127, 96).0, [0, 0, 0, 0]);
+    }
+    #[test]
+    fn now_playing_padding_at_exact_1024_boundary_stays_within_payload_limit() {
+        let art = normalize(&png(1024, 512), "png", &AtomicBool::new(false)).unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&*art.base64)
+            .unwrap();
+        assert!(bytes.len() <= MAX_ARTWORK_BYTES);
+        assert_eq!(art.mime, "image/png");
+        let decoded = image::load_from_memory(&bytes).unwrap().to_rgba8();
+        assert_eq!(decoded.dimensions(), (1024, 1024));
+        assert_eq!(decoded.get_pixel(0, 255).0, [0, 0, 0, 0]);
+        assert_eq!(decoded.get_pixel(0, 256).0, [255, 10, 20, 100]);
+        assert_eq!(decoded.get_pixel(1023, 767).0, [255, 10, 20, 100]);
+        assert_eq!(decoded.get_pixel(1023, 768).0, [0, 0, 0, 0]);
     }
     #[test]
     fn now_playing_large_encoded_input_can_shrink_and_output_limit_is_exact() {
@@ -671,6 +776,8 @@ mod tests {
         .unwrap()
         .to_rgba8();
         assert_eq!(decoded.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(decoded.dimensions(), (2, 2));
+        assert_eq!(decoded.get_pixel(0, 1).0, [0, 0, 0, 0]);
         assert_eq!(art.mime, "image/png");
     }
     #[test]
@@ -699,9 +806,14 @@ mod tests {
                 .decode(&*art.base64)
                 .unwrap(),
         )
-        .unwrap();
-        assert_eq!((decoded.width(), decoded.height()), (100, 200));
-        assert_eq!(art.mime, "image/jpeg");
+        .unwrap()
+        .to_rgba8();
+        assert_eq!((decoded.width(), decoded.height()), (200, 200));
+        assert_eq!(decoded.get_pixel(49, 0).0, [0, 0, 0, 0]);
+        assert_eq!(decoded.get_pixel(50, 0).0[3], 255);
+        assert_eq!(decoded.get_pixel(149, 199).0[3], 255);
+        assert_eq!(decoded.get_pixel(150, 199).0, [0, 0, 0, 0]);
+        assert_eq!(art.mime, "image/png");
     }
     #[test]
     fn now_playing_source_selection_sidecar_off_non_mp3_and_cancellation() {

@@ -520,11 +520,15 @@ snapshotの空title判定も制限後の文字列で行い、trim／cloneを上�
 
 ### 4.4 画像変換と予算
 
-**推奨: 長辺1024px以下、縦横比維持、拡大なし、static一枚**（§7.3）。
+**決定: 長辺1024px以下、縦横比維持、拡大なし、static一枚**（§7.3）。
 PNG／JPEG／GIF／WebPでも画像寸法、orientation、encoded bytesを検査する。
-cap内かつ正常なstatic PNG／JPEG／WebPはbytesを再利用可（特に既存cache WebP）。
+cap内かつ正常で正方形のstatic PNG／JPEG／WebPはbytesを再利用可（特に既存cache WebP）。
 GIF／animated WebP／APNGは最初の一枚、orientationが必要な原本やJXL／HEIC／RAW等は
 既存decoderをworkerで使って縮小し、透過ありはPNG、他はJPEG（quality85目安）へ再encodeする。
+orientation適用と縮小の後、非正方形は長辺を一辺とする正方形に透明な余白を足して中央配置する。
+元のalphaと縦横比を維持し、端数一pixelは右／下の余白へ置く。paddingが必要なJPEGもPNGへ
+再encodeする。正方形には余白を足さない。canvasは最大1024×1024 RGBA（4 MiB）で、
+既存worker内の処理とし、新しいqueue・再試行・UI-thread処理を増やさない。
 RAWは既存executor、色／回転は既存代表画像の規則に従い、画像AI・追加の高解像度現像を始めない。
 
 8 MiBは**decode前入力画像の一律拒否条件にはしない**。
@@ -729,6 +733,7 @@ bundleを足して今回のnative受入れの代わりにはしない。新版pl
 3. **画像は長辺1024ピクセルまで、動く画像は最初の一枚でよいですか。**
    **決定: 推奨案を採用。** 再生を待たせず、先に曲名を出し、画像が用意できたら表示する。
    音楽は同名画像・MP3表紙、動画は一覧と同じ代表画像を使う。
+   2026-10-10追加決定: 非正方形は透明な余白で正方形にして中央配置し、元の画像を切らない。
 4. **曲情報は音響調整の使用中に自動で渡し、専用のON/OFF設定は増やさなくてよいですか。**
    **決定: 推奨案を採用。** PC内のプラグインに渡すだけで、未使用ならプラグインをこのために起動しない。
    Visualizerで表示するかと起動時の画面はEffeTune側で選ぶ。
@@ -953,3 +958,36 @@ SFZ説明書の既存の外部音源参照の説明は生成元 `docs/effetune-d
 旧AI／通信限定保証とFAQ以外のJSON-LDも引き続き拒否する。
 引き継ぎは `target/D359-final-msg2.txt`。通信設定・Runtime・bundleは変更しない。
 署名済み最終artifactの受入れとNow PlayingのVisualizer表示確認は別の残項目。
+
+## 12. 非正方形の代表画像に透明な余白を追加 (2026-10-10)
+
+利用者のNow Playing表示確認は成功し、非正方形の画像を切らずに見せる追加要望を受けた。
+`target/D359-agent-hwcheck.md` 最終節では横長／縦長画像がcover fitで切られる一方、
+透明な余白のある正方形は全体が表示された。
+原本 `vendor/effetune-mixwright/EffeTune Mixwright.vst3/Contents/Resources/webview/js/visualizer/visualizer-renderer.js:184`
+の `drawCover` は大きい方のscaleで描画する。原本を変更せず、mIV側で透明な余白を足す利用者決定。
+
+実装は `src/effetune/now_playing/artwork.rs` の既存worker内だけとする。
+orientation適用→長辺1024pxまで縮小→非正方形なら透明な正方形に中央配置→encodeの順で、
+音楽sidecar／APIC、動画pin／sidecar／Shell、RAW／WICの全送り元を同じencode境界で扱う。
+paddingはRGBAの画素コピーでsource alphaを保持し、余白はRGBA全成分0。
+正方形を変更する追加処理は無く、cap内static正方形のPNG／JPEG／WebPのみbytesを再利用する。
+非正方形JPEGはPNGに再encodeし、MIMEと8 MiBのencode後検査を維持する。
+canvasは最大4 MiB、RGB→RGBA変換も縮小後に行い最大4 MiB。
+既存decode budgetは各rasterの制限であり、process全体のpeak上限を新たに保証しない。
+animated入力のfirst frame、取消・generation guard・worker数・通知・Remote lifecycleは既存どおり。
+
+簡素化: paddingだけで利用者の通常の正方形Artwork boxに対応できるため、
+Visualizer側の変更依頼、設定追加、専用worker／queue、再試行機構を増やさない。
+まれな失敗は既定の割り切り（ログ＋通知）を維持し、復旧処理内の復旧は足さない。
+縦横長／odd margin／source alpha、正方形bytes再利用、JPEG→PNG、1024px／8 MiB境界、
+縮小→padding、orientation→padding、GIF first frame、WIC fallbackの回帰を検査する。
+検証結果とbuild条件は `target/D359-square-msg.txt` に記録する。独立レビューの実施を主張しない。
+
+自動検証: now_playing焦点53/53、通常／portable core check成功。
+全libは一度実行し11791成功・1失敗・55除外。
+失敗は無変更の `video::tests::real_decoder_eof_full_loop_preserves_single_tail_burst_per_epoch` の
+`src/video/mod.rs:13261`（first-frame-readyの非blocking送信がfalseになったassert）。
+同テストは単独診断1/1成功（74.90秒）だが、全libの失敗を解消済み扱いにはしない。
+このfixtureは代表画像workerを呼ばない。動画コードやテストの期待値をこの変更で修正・緩和しない。
+ログは `target/D359-square-lib.log` と `target/D359-square-eof-diagnostic.log`。
