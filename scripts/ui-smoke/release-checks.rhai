@@ -62,7 +62,7 @@ fn search() {
 
 release_check_begin(CASE_ID, CASE_DIRECTORY);
 // The root window is published a moment after startup; wait for it like the other scenarios do.
-wait_until(|s| { for w in s.windows { if w.role == "root" { return true; } } false }, 30000);
+wait_until(|s| { for w in s.windows { if w.role == "root" && type_of(w.hwnd) == "string" && type_of(w.host_incarnation) == "i64" { return true; } } false }, 30000);
 select_root();
 for attempt in 0..1800 {
     if release_check_observe().index_settled { break; }
