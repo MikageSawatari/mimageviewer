@@ -23,18 +23,22 @@ from pathlib import Path
 from generate_rating_sort_fixture import png
 
 
-RECIPE_VERSION = "release-checks-v1"
+RECIPE_VERSION = "release-checks-v2"
 SCHEMA_VERSION = 1
 WIDTH, HEIGHT = 884, 444
 STATIC_COUNT = 16
 STATIC_REQUESTED_PX_TARGET = 374
 STATIC_REQUESTED_PX_TOLERANCE = 8
 FOLDER_COUNT, IMAGES_PER_FOLDER = 512, 4
+TRAY_FOLDER_COUNT, TRAY_IMAGES_PER_FOLDER = 600, 1
+TRAY_WIDTH, TRAY_HEIGHT = 400, 300
+TRAY_GRID_COLS = 10
 NAVIGATION_COUNT = 6
 SEARCH_TERM = "mivreleasefixtureorchid"
 SEARCH_HIT_NUMBERS = (1, 3, 6)
 DEFAULT_ALLOWED_ROOT = Path(__file__).resolve().parents[2] / "target" / "ui-smoke" / "runs"
-MANY_NAMES = ("cached", "uncached", "tray-while", "tray-after")
+MANY_NAMES = ("cached", "uncached")
+TRAY_NAMES = ("tray-while", "tray-after")
 CASE_PATHS = {
     "static-foreground": "static",
     "static-background": "static",
@@ -75,17 +79,18 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def fixture_png(identity: int, prompt: str | None = None) -> bytes:
+def fixture_png(identity: int, prompt: str | None = None, *,
+                width: int = WIDTH, height: int = HEIGHT) -> bytes:
     # Reuse the existing PNG encoder. Identity lives in pixels, not merely text:
     # every generated image differs even after a decoder discards metadata.
     if not 0 < identity < 1 << 24:
         raise ValueError("image identity must fit a nonzero 24-bit RGB value")
     color = ((identity >> 16) & 255, (identity >> 8) & 255, identity & 255)
-    encoded = png(color, width=WIDTH, height=HEIGHT)
+    encoded = png(color, width=width, height=height)
     if prompt is not None:
         payload = b"parameters\0" + (
             prompt + "\nNegative prompt: synthetic noise\n"
-            "Steps: 20, Sampler: Euler, CFG scale: 7, Seed: 1, Size: 884x444"
+            f"Steps: 20, Sampler: Euler, CFG scale: 7, Seed: 1, Size: {width}x{height}"
         ).encode("ascii")
         kind = b"tEXt"
         chunk = struct.pack(">I", len(payload)) + kind + payload
@@ -125,11 +130,20 @@ def settings_overlay(start_path: Path, search_root: Path, *, tray_case: bool = F
     }
     if tray_case:
         overlay["cache_policy"] = "Off"
+        overlay["grid_cols"] = TRAY_GRID_COLS
     elif seed_cache:
         # Normal saving producer, with the released Always policy, prepares small
         # generated PNGs reliably. Runtime non-tray cases retain default Auto.
         overlay["cache_policy"] = "Always"
     return overlay
+
+
+def tray_recipe() -> dict:
+    # A's isolated hardware control reproduced both tray regressions with small,
+    # fast-decoding images. Large slow decodes do not build the same backlog.
+    return {"width": TRAY_WIDTH, "height": TRAY_HEIGHT,
+            "subtrees": len(TRAY_NAMES), "folders_per_subtree": TRAY_FOLDER_COUNT,
+            "images_per_folder": TRAY_IMAGES_PER_FOLDER, "grid_cols": TRAY_GRID_COLS}
 
 
 def ffmpeg_arguments(ffmpeg: Path, video: Path) -> list[str]:
@@ -153,17 +167,19 @@ def generate(output: Path, ffmpeg: Path, *, allowed_root: Path = DEFAULT_ALLOWED
     # incomplete media remains evidence, and a rerun must use a fresh run folder.
     output.mkdir(parents=True, exist_ok=True)
     files = []
-    paths = {name: str(output / name) for name in ("static", *MANY_NAMES, "video-pin", "search")}
+    paths = {name: str(output / name)
+             for name in ("static", *MANY_NAMES, *TRAY_NAMES, "video-pin", "search")}
     identity = 0
 
-    def image(path: Path, prompt: str | None = None) -> None:
+    def image(path: Path, prompt: str | None = None, *,
+              width: int = WIDTH, height: int = HEIGHT) -> None:
         nonlocal identity
         identity += 1
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(fixture_png(identity, prompt))
+        path.write_bytes(fixture_png(identity, prompt, width=width, height=height))
         files.append({"path": str(path), "relative_path": path.relative_to(output).as_posix(),
                       "kind": "png", "size_bytes": path.stat().st_size,
-                      "sha256": sha256(path), "width": WIDTH, "height": HEIGHT,
+                      "sha256": sha256(path), "width": width, "height": height,
                       "pixel_identity": identity})
 
     for number in range(1, STATIC_COUNT + 1):
@@ -172,6 +188,11 @@ def generate(output: Path, ffmpeg: Path, *, allowed_root: Path = DEFAULT_ALLOWED
         for folder in range(1, FOLDER_COUNT + 1):
             for number in range(1, IMAGES_PER_FOLDER + 1):
                 image(Path(paths[name]) / f"folder-{folder:04d}" / f"image-{number:02d}.png")
+    for name in TRAY_NAMES:
+        for folder in range(1, TRAY_FOLDER_COUNT + 1):
+            for number in range(1, TRAY_IMAGES_PER_FOLDER + 1):
+                image(Path(paths[name]) / f"folder-{folder:04d}" / f"image-{number:02d}.png",
+                      width=TRAY_WIDTH, height=TRAY_HEIGHT)
 
     perf = {}
     for mode in ("cached", "uncached"):
@@ -234,6 +255,9 @@ def generate(output: Path, ffmpeg: Path, *, allowed_root: Path = DEFAULT_ALLOWED
         "counts": {"static_images": STATIC_COUNT, "many_subtrees": len(MANY_NAMES),
                    "folders_per_many_subtree": FOLDER_COUNT,
                    "images_per_many_folder": IMAGES_PER_FOLDER,
+                   "tray_subtrees": len(TRAY_NAMES),
+                   "folders_per_tray_subtree": TRAY_FOLDER_COUNT,
+                   "images_per_tray_folder": TRAY_IMAGES_PER_FOLDER,
                    "navigation_subtrees": 2, "navigation_folders_per_subtree": NAVIGATION_COUNT,
                    "search_images": 6, "search_hits": len(hits),
                    "png_images": identity, "videos": 1},
@@ -242,6 +266,7 @@ def generate(output: Path, ffmpeg: Path, *, allowed_root: Path = DEFAULT_ALLOWED
                    "requested_px_target": STATIC_REQUESTED_PX_TARGET,
                    "requested_px_tolerance": STATIC_REQUESTED_PX_TOLERANCE,
                    "requested_px_must_be_observed": True},
+        "tray": tray_recipe(),
         "search": {"root": paths["search"], "term": SEARCH_TERM,
                    "metadata_key": "parameters", "expected_hits": hits,
                    "expected_non_hits": non_hits, "index_settle_timeout_seconds": 180},
@@ -288,21 +313,26 @@ def verify_fixture(output: Path, *, allowed_root: Path = DEFAULT_ALLOWED_ROOT) -
     expected_counts = {
         "static_images": STATIC_COUNT, "many_subtrees": len(MANY_NAMES),
         "folders_per_many_subtree": FOLDER_COUNT, "images_per_many_folder": IMAGES_PER_FOLDER,
+        "tray_subtrees": len(TRAY_NAMES), "folders_per_tray_subtree": TRAY_FOLDER_COUNT,
+        "images_per_tray_folder": TRAY_IMAGES_PER_FOLDER,
         "navigation_subtrees": 2, "navigation_folders_per_subtree": NAVIGATION_COUNT,
         "search_images": 6, "search_hits": len(SEARCH_HIT_NUMBERS),
         "png_images": STATIC_COUNT + len(MANY_NAMES) * FOLDER_COUNT * IMAGES_PER_FOLDER
+                      + len(TRAY_NAMES) * TRAY_FOLDER_COUNT * TRAY_IMAGES_PER_FOLDER
                       + 2 * NAVIGATION_COUNT * IMAGES_PER_FOLDER + 6,
         "videos": 1,
     }
     required_overlays = {*CASE_PATHS, "seed-static", "seed-perf-cached", "seed-video-pin", "seed-search"}
     if manifest.get("counts") != expected_counts or set(manifest["overlays"]) != required_overlays:
         raise ValueError("fixture counts or required overlays are incomplete")
+    if manifest.get("tray") != tray_recipe():
+        raise ValueError("tray reproduction shape is invalid")
     if (manifest["static"].get("requested_px_target") != STATIC_REQUESTED_PX_TARGET or
             manifest["static"].get("requested_px_tolerance") != STATIC_REQUESTED_PX_TOLERANCE or
             manifest["static"].get("requested_px_must_be_observed") is not True):
         raise ValueError("static request observation range is invalid")
     expected_paths = {name: str(output / name)
-                      for name in ("static", *MANY_NAMES, "video-pin", "search")}
+                      for name in ("static", *MANY_NAMES, *TRAY_NAMES, "video-pin", "search")}
     expected_paths.update({f"perf-{mode}-navigation": str(output / f"perf-{mode}-navigation")
                            for mode in ("cached", "uncached")})
     expected_paths.update({
@@ -317,6 +347,9 @@ def verify_fixture(output: Path, *, allowed_root: Path = DEFAULT_ALLOWED_ROOT) -
     expected_files.update(output / name / f"folder-{folder:04d}" / f"image-{number:02d}.png"
                           for name in MANY_NAMES for folder in range(1, FOLDER_COUNT + 1)
                           for number in range(1, IMAGES_PER_FOLDER + 1))
+    expected_files.update(output / name / f"folder-{folder:04d}" / f"image-{number:02d}.png"
+                          for name in TRAY_NAMES for folder in range(1, TRAY_FOLDER_COUNT + 1)
+                          for number in range(1, TRAY_IMAGES_PER_FOLDER + 1))
     expected_files.update(output / f"perf-{mode}-navigation" / f"navigation-{folder:02d}"
                           / f"image-{number:02d}.png" for mode in ("cached", "uncached")
                           for folder in range(1, NAVIGATION_COUNT + 1)
@@ -332,6 +365,11 @@ def verify_fixture(output: Path, *, allowed_root: Path = DEFAULT_ALLOWED_ROOT) -
         seen.add(path)
         if path.stat().st_size != entry["size_bytes"] or sha256(path) != entry["sha256"]:
             raise ValueError(f"fixture content changed: {path}")
+        if path.suffix == ".png":
+            dimensions = ((TRAY_WIDTH, TRAY_HEIGHT)
+                          if path.relative_to(output).parts[0] in TRAY_NAMES else (WIDTH, HEIGHT))
+            if entry.get("kind") != "png" or (entry.get("width"), entry.get("height")) != dimensions:
+                raise ValueError(f"fixture PNG dimensions are invalid: {path}")
     if seen != expected_files:
         raise ValueError("fixture file inventory is incomplete or unexpected")
     for name, path in manifest["paths"].items():
@@ -352,6 +390,18 @@ def verify_fixture(output: Path, *, allowed_root: Path = DEFAULT_ALLOWED_ROOT) -
                 "many_folders": expected_paths[mode], "start_folder": order[0],
                 "navigation_order": order, "ctrl_down_count": 5, "cache_prepared": False}:
             raise ValueError("perf preparation recipe is invalid")
+    if manifest["seed_requirements"]["cache"] != {
+            "prepare": [expected_paths["static"], expected_paths["cached"],
+                        *manifest["perf"]["cached"]["navigation_order"]],
+            "read_after_restart": True,
+            "must_remain_unread": [expected_paths["uncached"], expected_paths["tray-while"],
+                                   expected_paths["tray-after"],
+                                   expected_paths["perf-uncached-navigation"]]}:
+        raise ValueError("cache seed isolation requirements are invalid")
+    if manifest["seed_requirements"]["tray"] != {
+            "cache_policy": "Off", "close_boundary_cache_absent": True,
+            "post_close_source_finalized_backlog_correlation": True}:
+        raise ValueError("tray seed observation requirements are invalid")
     for case, path in manifest["overlays"].items():
         if case in CASE_PATHS:
             expected = settings_overlay(Path(manifest["paths"][CASE_PATHS[case]]),

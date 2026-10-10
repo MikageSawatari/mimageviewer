@@ -52,13 +52,13 @@ class ReleaseChecksFixtureTests(unittest.TestCase):
 
     def generate_small(self, **kwargs):
         # Keep the full independent subtree/nav/search shape while avoiding
-        # repeated 512-folder writes in safety tests. Production has no size CLI.
-        with patch.object(fixture, "FOLDER_COUNT", 2):
+        # repeated 512/600-folder writes in safety tests. No production size CLI.
+        with patch.object(fixture, "FOLDER_COUNT", 2), patch.object(fixture, "TRAY_FOLDER_COUNT", 2):
             return fixture.generate(self.output, self.ffmpeg, allowed_root=self.root,
                                     run_command=fake_ffmpeg, **kwargs)
 
     def verify_small(self):
-        with patch.object(fixture, "FOLDER_COUNT", 2):
+        with patch.object(fixture, "FOLDER_COUNT", 2), patch.object(fixture, "TRAY_FOLDER_COUNT", 2):
             return fixture.verify_fixture(self.output, allowed_root=self.root)
 
     def test_wide_png_pixels_metadata_and_crc_are_deterministic(self):
@@ -73,12 +73,24 @@ class ReleaseChecksFixtureTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             fixture.fixture_png(1 << 24)
 
+    def test_small_tray_png_pixels_and_crc_are_deterministic(self):
+        encoded = fixture.fixture_png(258, width=400, height=300)
+        self.assertEqual(encoded, fixture.fixture_png(258, width=400, height=300))
+        self.assertNotEqual(encoded, fixture.fixture_png(259, width=400, height=300))
+        chunks = dict(png_chunks(encoded))
+        self.assertEqual(struct.unpack(">II", chunks[b"IHDR"][:8]), (400, 300))
+        self.assertEqual(zlib.decompress(chunks[b"IDAT"]),
+                         (b"\0" + bytes((0, 1, 2)) * 400) * 300)
+        self.assertNotIn(b"tEXt", chunks)
+
     def test_recipe_media_inventory_search_and_settings(self):
         manifest = self.generate_small()
         self.assertEqual(self.verify_small(), manifest)
         self.assertEqual(manifest["seed_state"], "not_prepared")
-        self.assertEqual(manifest["counts"]["many_subtrees"], 4)
+        self.assertEqual(manifest["counts"]["many_subtrees"], 2)
         self.assertEqual(manifest["counts"]["images_per_many_folder"], 4)
+        self.assertEqual(manifest["counts"]["tray_subtrees"], 2)
+        self.assertEqual(manifest["counts"]["images_per_tray_folder"], 1)
         self.assertEqual(manifest["counts"]["navigation_folders_per_subtree"], 6)
         self.assertEqual(manifest["static"]["requested_px_target"], 374)
         self.assertEqual(manifest["static"]["requested_px_tolerance"], 8)
@@ -89,6 +101,10 @@ class ReleaseChecksFixtureTests(unittest.TestCase):
             self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), entry["sha256"])
             if entry["kind"] == "png":
                 hashes.append(entry["sha256"])
+                dimensions = (400, 300) if Path(entry["relative_path"]).parts[0] in fixture.TRAY_NAMES else (884, 444)
+                self.assertEqual((entry["width"], entry["height"]), dimensions)
+                self.assertEqual(struct.unpack(">II", dict(png_chunks(path.read_bytes()))[b"IHDR"][:8]),
+                                 dimensions)
         self.assertEqual(len(hashes), len(set(hashes)))
         self.assertEqual(len(manifest["search"]["expected_hits"]), 3)
         hits = set(manifest["search"]["expected_hits"])
@@ -108,29 +124,38 @@ class ReleaseChecksFixtureTests(unittest.TestCase):
             self.assertFalse(overlay["favorites"][0]["auto_index_similar"])
             if case.startswith("tray-"):
                 self.assertEqual(overlay["cache_policy"], "Off")
+                self.assertEqual(overlay["grid_cols"], 10)
             else:
                 self.assertNotEqual(overlay.get("cache_policy"), "Off")
+                self.assertEqual(overlay["grid_cols"], 7)
         self.assertFalse(list(self.output.rglob("*.db")))
         self.assertTrue(manifest["seed_requirements"]["app_launch_requires_interactive_approval"])
         self.assertEqual(set(manifest["seed_requirements"]["index"]["roots"]),
                          {manifest["paths"]["search"]})
 
-    def test_full_topology_has_512_distinct_folders_for_each_condition(self):
+    def test_full_topology_keeps_perf_shape_and_known_tray_regression_shape(self):
         # The encoder is covered separately; substitute tiny bytes to cheaply
-        # exercise the production counts and uniqueness across all 8,262 files.
-        def tiny(identity, prompt=None):
-            return f"png-id={identity};prompt={prompt}".encode()
+        # exercise the production counts and uniqueness across all 5,366 PNGs.
+        def tiny(identity, prompt=None, **dimensions):
+            return f"png-id={identity};prompt={prompt};dimensions={dimensions}".encode()
         with patch.object(fixture, "fixture_png", side_effect=tiny):
             manifest = fixture.generate(self.output, self.ffmpeg, allowed_root=self.root,
                                         run_command=fake_ffmpeg)
         fixture.verify_fixture(self.output, allowed_root=self.root)
-        self.assertEqual(manifest["counts"]["png_images"], 8262)
+        self.assertEqual(manifest["counts"]["png_images"], 5366)
         for name in fixture.MANY_NAMES:
             folders = list(Path(manifest["paths"][name]).iterdir())
             self.assertEqual(len(folders), 512)
             self.assertTrue(all(len(list(folder.iterdir())) == 4 for folder in folders))
+        for name in fixture.TRAY_NAMES:
+            folders = list(Path(manifest["paths"][name]).iterdir())
+            self.assertEqual(len(folders), 600)
+            self.assertTrue(all(len(list(folder.iterdir())) == 1 for folder in folders))
+        self.assertEqual(manifest["tray"], {
+            "width": 400, "height": 300, "subtrees": 2, "folders_per_subtree": 600,
+            "images_per_folder": 1, "grid_cols": 10})
         hashes = [entry["sha256"] for entry in manifest["files"] if entry["kind"] == "png"]
-        self.assertEqual(len(set(hashes)), 8262)
+        self.assertEqual(len(set(hashes)), 5366)
 
     def test_nonempty_output_refused_without_changes(self):
         self.output.mkdir(parents=True)
@@ -172,7 +197,7 @@ class ReleaseChecksFixtureTests(unittest.TestCase):
                        lambda *a, **k: (_ for _ in ()).throw(subprocess.TimeoutExpired("ffmpeg", 120))):
             with self.subTest(failed=failed):
                 output = self.root / str(id(failed)) / "fixture"
-                with patch.object(fixture, "FOLDER_COUNT", 1):
+                with patch.object(fixture, "FOLDER_COUNT", 1), patch.object(fixture, "TRAY_FOLDER_COUNT", 1):
                     with self.assertRaises((ValueError, subprocess.TimeoutExpired)):
                         fixture.generate(output, self.ffmpeg, allowed_root=self.root,
                                          run_command=failed)
@@ -236,6 +261,39 @@ class ReleaseChecksFixtureTests(unittest.TestCase):
             modified["static"][field] = value
             path.write_text(json.dumps(modified), encoding="utf-8")
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, "observation range"):
+                self.verify_small()
+
+    def test_manifest_cannot_substitute_large_tray_images_or_relax_seed_evidence(self):
+        manifest = self.generate_small()
+        path = self.output / "fixture-manifest.json"
+        mutations = (
+            ("tray", "width", 6000, "reproduction shape"),
+            ("tray", "height", 4000, "reproduction shape"),
+            ("tray", "grid_cols", 7, "reproduction shape"),
+            ("tray", "images_per_folder", 4, "reproduction shape"),
+        )
+        for section, field, value, reason in mutations:
+            modified = json.loads(json.dumps(manifest))
+            modified[section][field] = value
+            path.write_text(json.dumps(modified), encoding="utf-8")
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, reason):
+                self.verify_small()
+        modified = json.loads(json.dumps(manifest))
+        entry = next(e for e in modified["files"] if e["relative_path"].startswith("tray-while/"))
+        entry.update(width=6000, height=4000)
+        path.write_text(json.dumps(modified), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "PNG dimensions"):
+            self.verify_small()
+        for section, field, value, reason in (
+                ("tray", "cache_policy", "Auto", "tray seed observation"),
+                ("tray", "close_boundary_cache_absent", False, "tray seed observation"),
+                ("tray", "post_close_source_finalized_backlog_correlation", False, "tray seed observation"),
+                ("cache", "must_remain_unread", [manifest["paths"]["uncached"]], "cache seed isolation"),
+                ("cache", "prepare", [manifest["paths"]["tray-while"]], "cache seed isolation")):
+            modified = json.loads(json.dumps(manifest))
+            modified["seed_requirements"][section][field] = value
+            path.write_text(json.dumps(modified), encoding="utf-8")
+            with self.subTest(section=section, field=field), self.assertRaisesRegex(ValueError, reason):
                 self.verify_small()
 
 

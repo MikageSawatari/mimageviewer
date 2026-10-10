@@ -50316,30 +50316,21 @@ impl App {
                 continue;
             }
             #[cfg(all(windows, feature = "test-script"))]
-            let cache_read = msg
-                .pixels()
-                .filter(|pixels| pixels.origin.from_cache())
-                .map(|_| (msg.items_gen, msg.input_seq));
+            let release_receipt = self.release_check_receipt(&msg);
             match self.requested.receive(msg) {
                 ThumbnailReceipt::Ignored => continue,
-                ThumbnailReceipt::Queued => {
+                ThumbnailReceipt::Queued =>
+                {
                     #[cfg(all(windows, feature = "test-script"))]
-                    if let Some((items_gen, input_seq)) = cache_read
-                        && let Some(item) = self.items.get(i)
-                    {
-                        crate::test_script::release_checks::trace(
-                            "cache_read",
-                            serde_json::json!({
-                                "key": item.perf_key(),
-                                "idx": i,
-                                "items_gen": items_gen,
-                                "input_seq": input_seq,
-                                "from_cache": true,
-                            }),
-                        );
+                    if let Some(("cache_read", proof)) = release_receipt {
+                        crate::test_script::release_checks::trace("cache_read", proof);
                     }
                 }
                 ThumbnailReceipt::Finalized { source_changed } => {
+                    #[cfg(all(windows, feature = "test-script"))]
+                    if let Some(("finalized", proof)) = release_receipt {
+                        crate::test_script::release_checks::trace("finalized", proof);
+                    }
                     if source_changed {
                         self.invalidate_color_representative(i);
                         self.fire_virtual_folder_writeback_if_ready(i);
