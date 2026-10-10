@@ -1999,6 +1999,28 @@ fn preferences_favorite_view_state_dark() {
 }
 
 #[test]
+fn preferences_restore_position_light_on() {
+    snapshot_with_theme_at_size(
+        "preferences_restore_position_light_on",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(480.0, 80.0),
+        None,
+        |ui| mimageviewer::draw_preferences_restore_position_snapshot_fixture(ui, true),
+    );
+}
+
+#[test]
+fn preferences_restore_position_dark_off_narrow() {
+    snapshot_with_theme_at_size(
+        "preferences_restore_position_dark_off_narrow",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(260.0, 80.0),
+        None,
+        |ui| mimageviewer::draw_preferences_restore_position_snapshot_fixture(ui, false),
+    );
+}
+
+#[test]
 fn video_thumbnail_indicator_modes_and_dense_badges_dark() {
     snapshot_with_theme_at_size(
         "video_thumbnail_indicator_modes_and_dense_badges_dark",

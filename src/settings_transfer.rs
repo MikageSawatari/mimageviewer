@@ -258,6 +258,7 @@ macro_rules! preferences_policy {
 preferences_policy! {
     export {
         ui_theme: UiTheme => ("テーマ", |v, _raw| matches!(v, UiTheme::System | UiTheme::Light | UiTheme::Dark), plain, plain);
+        preferences_restore_position: bool => ("環境設定の前回位置を復元", |_, _| true, plain, plain);
         text_contrast: TextContrast => ("文字コントラスト", |v, _raw| matches!(v, TextContrast::Standard | TextContrast::Strong), plain, plain);
         raw_brightness: crate::raw::RawBrightness => ("RAW の明るさ", |v, _raw| matches!(v, crate::raw::RawBrightness::MatchPreview | crate::raw::RawBrightness::None), plain, plain);
         ai_feature_mode: AiFeatureMode => ("AI利用範囲", |_, _| true, plain, plain);
@@ -921,6 +922,7 @@ mod tests {
         settings.auto_fullscreen_image_folders = !settings.auto_fullscreen_image_folders;
         settings.fullfeature_media_window = !settings.fullfeature_media_window;
         settings.restore_last_cursor = !settings.restore_last_cursor;
+        settings.preferences_restore_position = !settings.preferences_restore_position;
         settings.startup_window_state = different_enum(
             &settings.startup_window_state,
             &[
@@ -1821,13 +1823,20 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 455);
+        assert_eq!(entries.len(), 456);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            142
+            143
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|(_, reason)| reason.is_some())
+                .count(),
+            313
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -1837,7 +1846,7 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 140);
+        assert_eq!(wire.len(), 141);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);
@@ -1852,6 +1861,33 @@ mod tests {
                 .collect::<HashSet<_>>(),
             wire.into_iter().collect()
         );
+    }
+
+    #[test]
+    fn preferences_restore_position_transfer_roundtrip_and_missing_preserves_value() {
+        for enabled in [false, true] {
+            let mut source = Settings::default();
+            source.preferences_restore_position = enabled;
+            let exported = export_preferences(&source).unwrap();
+            assert!(exported.issues.is_empty());
+            let mut destination = Settings::default();
+            destination.preferences_restore_position = !enabled;
+            let report = parse_preferences(&exported.json)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert!(report.issues.is_empty());
+            assert_eq!(destination.preferences_restore_position, enabled);
+            parse_preferences(INITIAL_V1)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(destination.preferences_restore_position, enabled);
+            let parsed =
+                parse_preferences(&document(json!({"preferences_restore_position": "false"})))
+                    .unwrap();
+            assert_eq!(parsed.issues.len(), 1);
+            parsed.apply_to(&mut destination);
+            assert_eq!(destination.preferences_restore_position, enabled);
+        }
     }
 
     #[test]

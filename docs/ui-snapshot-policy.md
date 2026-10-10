@@ -39,6 +39,10 @@ Light／Dark × 標準／強い、計8枚を保持する。前者は六分類・
 `external_tool_preparing_light/dark` の4枚を追加する。本体と同じ記法説明・準備中の件数・
 キャンセルボタンを描き、アプリの起動や外部プロセスの実起動は行わない。
 
+環境設定の位置復元 (§1.365) は `preferences_restore_position_light_on` と
+`preferences_restore_position_dark_off_narrow` の2枚で、本体と共通のチェック項目を描く。
+既定 ON のライト表示と、OFF のダーク表示・狭い幅での折り返しを確認する。
+
 ## ディレクトリ構成
 
 ```

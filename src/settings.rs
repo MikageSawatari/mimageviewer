@@ -5341,6 +5341,10 @@ pub struct Settings {
     #[serde(default)]
     pub ui_theme: UiTheme,
 
+    /// 環境設定を開き直したときに、プロセス内で覚えたページとスクロール位置を復元する。
+    #[serde(default = "default_true")]
+    pub preferences_restore_position: bool,
+
     /// ラベル、ボタン、メニュー、ダイアログ、フルスクリーン HUD の文字コントラスト。
     #[serde(default)]
     pub text_contrast: TextContrast,
@@ -7734,6 +7738,7 @@ impl Default for Settings {
             auto_fullscreen_image_folders: false,
             margin_fit_enabled: false,
             ui_theme: UiTheme::default(),
+            preferences_restore_position: true,
             text_contrast: TextContrast::default(),
             ui_scale_factor: default_ui_scale_factor(),
             ui_font: UiFontSettings::default(),
@@ -10610,6 +10615,40 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn preferences_restore_position_defaults_on_and_sqlite_roundtrip() {
+        assert!(Settings::default().preferences_restore_position);
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert!(missing.preferences_restore_position);
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::settings_db::SettingsDb::create_new(tmp.path()).unwrap();
+        for enabled in [false, true] {
+            let mut settings = Settings::default();
+            settings.preferences_restore_position = enabled;
+            db.save_full(&settings).unwrap();
+            assert_eq!(
+                db.load_into_settings()
+                    .unwrap()
+                    .preferences_restore_position,
+                enabled
+            );
+        }
+        drop(db);
+        let conn = rusqlite::Connection::open(tmp.path().join("settings.db")).unwrap();
+        conn.execute(
+            "DELETE FROM settings_kv WHERE key = 'preferences_restore_position'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let db = crate::settings_db::SettingsDb::open(tmp.path()).unwrap();
+        assert!(
+            db.load_into_settings()
+                .unwrap()
+                .preferences_restore_position
+        );
+    }
+
     #[test]
     fn details_name_colors_legacy_missing_and_sqlite_roundtrip() {
         use crate::details_name_colors::{DetailsNameColor, DetailsNameColors};

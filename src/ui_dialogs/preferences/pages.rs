@@ -24,6 +24,19 @@ use crate::settings::{
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
 
+pub(super) fn draw_preferences_restore_position_setting(
+    ui: &mut egui::Ui,
+    settings: &mut Settings,
+) {
+    ui.checkbox(
+        &mut settings.preferences_restore_position,
+        "環境設定を開き直したときに前回の位置を復元する",
+    )
+    .on_hover_text(
+        "アプリを終了するまで、ページ、スクロール位置、選択項目や折りたたみ状態を覚えます。",
+    );
+}
+
 pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
     if state.transfer_feedback.is_some() {
         super::transfer::render_transfer_feedback(ui, state.transfer_feedback.as_ref());
@@ -74,6 +87,10 @@ pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
             )
             .weak(),
         );
+    });
+    ui.add_space(12.0);
+    anchored(ui, state, "general/restore-position", |ui, state| {
+        draw_preferences_restore_position_setting(ui, &mut state.settings);
     });
     ui.add_space(12.0);
     ui.label(
@@ -4872,9 +4889,16 @@ pub(super) fn page_menu_layout(ui: &mut egui::Ui, state: &mut PreferencesState) 
                 );
             });
 
-            egui::CollapsingHeader::new(format!("{} の項目", top.label()))
-                .id_salt(("menu_layout_top", top))
-                .default_open(top_visible)
+            // The view owner controls openness; egui only keeps rendering caches.
+            let open = state
+                .menu_expanded
+                .get(&top)
+                .copied()
+                .unwrap_or(top_visible);
+            let response = egui::CollapsingHeader::new(format!("{} の項目", top.label()))
+                .id_salt(("menu_layout_top", top, state.right_panel_scroll_generation))
+                .default_open(open)
+                .open(Some(open))
                 .show(ui, |ui| {
                     egui::Grid::new(("menu_layout_commands", top))
                         .num_columns(4)
@@ -4933,6 +4957,12 @@ pub(super) fn page_menu_layout(ui: &mut egui::Ui, state: &mut PreferencesState) 
                             }
                         });
                 });
+            state
+                .menu_expanded
+                .insert(top, open ^ response.header_response.clicked());
+            if response.header_response.clicked() {
+                ui.ctx().request_repaint();
+            }
         }
 
         if let Some(edit) = edit {
@@ -4947,6 +4977,8 @@ pub(super) fn page_context_menu_layout(ui: &mut egui::Ui, state: &mut Preference
             ui,
             &mut state.settings.context_menu_layout,
             &mut state.context_menu_preview_scenario,
+            &mut state.context_menu_expanded,
+            state.right_panel_scroll_generation,
         );
     });
 }
@@ -4955,6 +4987,8 @@ pub(super) fn draw_context_menu_layout_settings(
     ui: &mut egui::Ui,
     layout: &mut ContextMenuLayoutSettings,
     scenario: &mut ContextMenuPreviewScenario,
+    expanded: &mut HashMap<ContextMenuParentId, bool>,
+    view_generation: u64,
 ) {
     const ITEM_PREVIEW_WIDTH: f32 = 18.0;
     const ITEM_COLUMN_MIN_WIDTH: f32 = 260.0;
@@ -5019,9 +5053,14 @@ pub(super) fn draw_context_menu_layout_settings(
     for &parent in ContextMenuParentId::ALL {
         let order = snapshot.resolved_order(parent);
         ui.add_space(6.0);
-        egui::CollapsingHeader::new(parent.label())
-            .id_salt(("context_menu_layout_parent", parent))
-            .default_open(parent == ContextMenuParentId::Root)
+        let open = expanded
+            .get(&parent)
+            .copied()
+            .unwrap_or(parent == ContextMenuParentId::Root);
+        let response = egui::CollapsingHeader::new(parent.label())
+            .id_salt(("context_menu_layout_parent", parent, view_generation))
+            .default_open(open)
+            .open(Some(open))
             .show(ui, |ui| {
                 egui::Grid::new(("context_menu_layout_items", parent))
                     .num_columns(4)
@@ -5319,6 +5358,10 @@ pub(super) fn draw_context_menu_layout_settings(
                         }
                     });
             });
+        expanded.insert(parent, open ^ response.header_response.clicked());
+        if response.header_response.clicked() {
+            ui.ctx().request_repaint();
+        }
     }
     ui.small(
         "外部ツール、関連付けアプリ、そのサブメニューと Windows のメニューは固定枠です。\
@@ -8762,8 +8805,9 @@ pub(super) fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
         .collect();
     let available_height = ui.available_height().max(120.0);
     let mut clicked_add: Option<String> = None;
-    egui::ScrollArea::vertical()
+    let output = egui::ScrollArea::vertical()
         .id_salt("vst3-pref-page-picker-scroll")
+        .vertical_scroll_offset(state.vst3_picker_scroll_y)
         .max_height(available_height)
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -8809,6 +8853,7 @@ pub(super) fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 }
             }
         });
+    state.vst3_picker_scroll_y = output.state.offset.y;
     if let Some(path) = clicked_add {
         if state.settings.vst3_plugins.len() < MAX_CHAIN_LEN
             && !state.settings.vst3_plugins.iter().any(|e| e.path == path)
@@ -9246,9 +9291,10 @@ pub(super) fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesSta
                 let mut swap: Option<(usize, usize)> = None;
                 let len = state.settings.image_ext_priority.len();
 
-                egui::ScrollArea::vertical()
+                let output = egui::ScrollArea::vertical()
                     .max_height(200.0)
                     .id_salt("dup_ext_scroll")
+                    .vertical_scroll_offset(state.duplicate_priority_scroll_y)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         for i in 0..len {
@@ -9288,6 +9334,7 @@ pub(super) fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesSta
                         }
                     });
 
+                state.duplicate_priority_scroll_y = output.state.offset.y;
                 if let Some((a, b)) = swap {
                     state.settings.image_ext_priority.swap(a, b);
                 }
@@ -10556,11 +10603,12 @@ mod context_menu_layout_settings_tests {
             ContextMenuLayoutSettings::default(),
             ContextMenuPreviewScenario::GridImageWithDynamicApps,
             false,
+            HashMap::new(),
         );
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(620.0, 420.0))
             .build_state(
-                |ctx, (layout, scenario, fonts_ready)| {
+                |ctx, (layout, scenario, fonts_ready, expanded)| {
                     if !*fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);
                         *fonts_ready = true;
@@ -10570,7 +10618,7 @@ mod context_menu_layout_settings_tests {
                     egui::CentralPanel::default().show(ctx, |ui| {
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            draw_context_menu_layout_settings(ui, layout, scenario);
+                            draw_context_menu_layout_settings(ui, layout, scenario, expanded, 0);
                         });
                     });
                 },
