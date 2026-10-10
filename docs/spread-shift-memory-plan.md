@@ -1106,6 +1106,28 @@ release core/Remote/EPUB workerは既存で、欠落前提buildは不要だっ�
 3実行ファイルを構築し、VCRT/PE検査`runtime=4 / pe=3`も成功。installed/tray coreは停止せず、
 製品起動・独立レビュー・G統合受入・実機受入は行っていない。
 
+### 11.11 D3b implementation review修正（2026-10-11）
+
+利用者が伝達したD3 reviewのP2-1は、Remoteの`chapter/`および空root prefixを
+Clear側だけ空segment付きで分割していた点である。`remote_shift_scope`を既存の
+container `zip_prefix_segments`へ揃え、archive constructorの安全性検査は維持する。
+実container列挙の`effective_address`を使うSetSpread回帰で、collapse後のchapterだけを
+解除しroot/別chapterを保持する。rootの実応答はFileであり、同じbase keyを持つ
+空prefixのZipDirectory aliasも解除成功の回帰へ含める。wire型・v69・予算制限は変えない。
+
+P3-1はtest-only `preparing_snapshot`のspread-only前提を入口assertとfixture文書へ明記する。
+Gは初期spread規則を解決・設定してから呼ぶ。Single/Splitのpair anchor列挙をこのhelperで
+singletonへ投影しない。拒否回帰は入口assertの理由を検査し、別のpanicで代替しない。
+検証とnormal-profile確認buildは`target/D-1364-d3b-msg.txt`へ記録する。
+本追記は修正後の独立レビュー合格、製品起動、G統合受入を表さない。
+
+D3bの最終ソースで集中shift回帰128件、IPC 67件、Remote 140件が成功。
+全libは1回実行して11,900成功・失敗0・既存ignore 55（974.68秒）。normal/portable core check、
+fmt、diff checkも成功し、変更Rust source hash不変を照合した。UI文字列の変更はない。
+利用者指定の限定修正gateに従いtest-fullの再実行は不要とし、今回の差分で再実行していない。
+当該worktreeのcore不在を確認後に`build-dev.ps1 -PreserveRuntime`が成功し、normal-featureの
+3実行ファイルとVCRT/PE `runtime=4 / pe=3`を検査した。製品起動・commitは行っていない。
+
 ## 12. 決定済み事項（番号固定）
 
 2026-10-10の利用者回答で全推奨案を採択。Q2はG Q6の既決定、Q5はR2 coordinator採択を

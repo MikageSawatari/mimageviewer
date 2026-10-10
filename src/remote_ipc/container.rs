@@ -8645,7 +8645,7 @@ pub(super) fn resolve_spread_state(
     (configured, effective, reading_direction)
 }
 
-fn zip_prefix_segments(prefix: &str) -> Vec<String> {
+pub(super) fn zip_prefix_segments(prefix: &str) -> Vec<String> {
     prefix
         .split('/')
         .filter(|segment| !segment.is_empty())

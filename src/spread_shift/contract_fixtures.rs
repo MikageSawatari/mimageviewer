@@ -134,11 +134,16 @@ pub(crate) fn resolve_automatic(
 
 /// Test-only Preparing input from the real canonical builder. G supplies its
 /// accepted nav generation and existing layout token; E invents neither here.
+/// G must resolve and install the initial spread rules before using this helper.
 pub(crate) fn preparing_snapshot<T>(
     app: &mut crate::app::App,
     nav_generation: u64,
     layout_token: T,
 ) -> EffectiveLayoutSnapshot<T> {
+    assert!(
+        app.spread_mode.is_spread(),
+        "Preparing fixture requires resolved spread mode (Single/Split are unsupported)"
+    );
     let nav = app.get_nav_indices();
     let anchors = app
         .spread_display_unit_pages_for_test(&nav)
@@ -430,6 +435,32 @@ fn joint_03_identity_reorders_filters_returns_and_document_exception_is_physical
             None
         );
         // No hash/reflow mapping is promised: physical page 42 remains identity 42.
+    }
+}
+
+#[test]
+fn joint_preparing_rejects_single_and_split_before_enumerating_pair_anchors() {
+    let mut app = crate::app::tests::phase_c_support::setup_app();
+    for mode in [
+        SpreadMode::Single,
+        SpreadMode::SplitLtr,
+        SpreadMode::SplitRtl,
+    ] {
+        app.spread_mode = mode;
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            preparing_snapshot(&mut app, 0, ())
+        }));
+        let Err(reason) = rejected else {
+            panic!("non-spread fixture mode must be rejected: {mode:?}")
+        };
+        let reason = reason
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| reason.downcast_ref::<String>().map(String::as_str));
+        assert_eq!(
+            reason,
+            Some("Preparing fixture requires resolved spread mode (Single/Split are unsupported)")
+        );
     }
 }
 

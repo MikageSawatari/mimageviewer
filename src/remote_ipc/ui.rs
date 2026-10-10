@@ -4324,7 +4324,7 @@ fn remote_shift_scope(
     match &address.subresource {
         RemoteSubresource::ZipDirectory { prefix } => crate::book_scope::BookScopeKey::archive(
             root,
-            &prefix.split('/').map(str::to_owned).collect::<Vec<_>>(),
+            &super::container::zip_prefix_segments(prefix),
         ),
         RemoteSubresource::File => crate::book_scope::BookScopeKey::folder(root),
         _ => Err("a page is not a book shift scope".into()),

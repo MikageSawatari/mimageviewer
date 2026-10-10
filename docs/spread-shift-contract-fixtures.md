@@ -15,6 +15,9 @@ completed_read, resolve_automatic, preparing_snapshot}` を使用できる。
 製品の読取証明は service の `read_after` から受け取る。
 `preparing_snapshot` へ渡す nav generation / layout token は呼出し側が所有する既存の値。
 E は token を生成・hash 化しない。units は実 App の canonical builder から取得する。
+この helper は **spread mode 専用**で、入口で `is_spread()` を assert する。
+G 側で初期spread規則を解決して App に設定してから呼ぶ。Single / Split の Preparing capture
+には使えない（pair anchor の列挙を singleton に変換するとページが欠落するため）。
 
 ## G0 の八項目とテスト
 

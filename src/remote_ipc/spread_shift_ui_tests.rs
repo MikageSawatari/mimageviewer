@@ -29,6 +29,149 @@ mod spread_shift_d3 {
         }
     }
 
+    fn zip_effective_address(
+        app: &crate::app::App,
+        path: &std::path::Path,
+        names: &[&str],
+    ) -> mimageviewer_ipc::RemoteAddress {
+        use std::io::Write;
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        for name in names {
+            zip.start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"fixture: no decoding in force-single projection")
+                .unwrap();
+        }
+        zip.finish().unwrap();
+        let engine = super::super::super::container::ContainerEngine::new(app.settings.clone());
+        let response = engine.container(mimageviewer_ipc::ContainerRequest {
+            address: mimageviewer_ipc::RemoteAddress {
+                path: path.to_string_lossy().into_owned(),
+                subresource: RemoteSubresource::ZipDirectory {
+                    prefix: String::new(),
+                },
+            },
+            spread_mode: Some(RemoteSpreadMode::Single),
+            reading_direction: Some(RemoteReadingDirection::Ltr),
+            force_single_page: true,
+        });
+        let mimageviewer_ipc::ContainerResponse::Success(payload) = response else {
+            panic!("ZIP container fixture failed: {response:?}")
+        };
+        payload.effective_address
+    }
+
+    fn assert_zip_reset(
+        app: &mut crate::app::App,
+        service: &SpreadShiftService,
+        scope: &BookScopeKey,
+        address: mimageviewer_ipc::RemoteAddress,
+    ) {
+        service.drain_results();
+        let (handle, owner, _) = active_session();
+        app.set_remote_session_handle(handle.clone());
+        app.spread_shift_service = Some(service.clone());
+        app.settings.remember_spread_shift_per_book = true;
+        let before = service.watermarks().admitted;
+        let key = remote_spread_key(&address).unwrap();
+        let (pending, reply) = ClaimedRemoteWrite::for_test(
+            handle
+                .begin_operation(&owner, "ZIP set spread".into())
+                .unwrap(),
+            set_spread(address),
+        );
+        app.apply_pending_remote_write(pending, &egui::Context::default());
+        assert_eq!(service.watermarks().admitted, before + 1);
+        assert_eq!(row(service, scope), None);
+        assert!(matches!(
+            reply.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        let results = service.drain_results();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].status.is_ok());
+        assert!(app.complete_remote_shift_reset(&results[0]));
+        assert!(!app.complete_remote_shift_reset(&results[0]));
+        assert!(matches!(
+            reply.recv_timeout(Duration::from_secs(1)).unwrap(),
+            UiWriteOutcome::Write(RemoteWriteResponse::Success(_))
+        ));
+        assert_eq!(
+            app.spread_db.as_ref().unwrap().get(&key.exact),
+            Some(crate::settings::SpreadMode::RtlCover)
+        );
+        assert!(app.remote_session_ui.pending_shift_resets.is_empty());
+    }
+
+    #[test]
+    fn spread_shift_remote_zip_effective_address_reset_clears_only_accepted_chapter() {
+        let mut app = crate::app::setup_app_for_test();
+        let data = tempfile::tempdir().unwrap();
+        let zip = data.path().join("book.zip");
+        let address = zip_effective_address(&app, &zip, &["chapter/a.jpg", "chapter/b.jpg"]);
+        assert_eq!(
+            address.subresource,
+            RemoteSubresource::ZipDirectory {
+                prefix: "chapter/".into()
+            }
+        );
+        let scope = BookScopeKey::archive(&zip, &["chapter".into()]).unwrap();
+        let root = BookScopeKey::archive(&zip, &[]).unwrap();
+        let sibling = BookScopeKey::archive(&zip, &["other".into()]).unwrap();
+        let (service, process) =
+            SpreadShiftService::spawn_at(data.path().join("store"), None).unwrap();
+        let saved = SpreadShiftPageRef::ArchiveEntry("chapter/b.jpg".into());
+        for target in [&scope, &root, &sibling] {
+            service
+                .set_shift(target.clone(), saved.clone(), operation())
+                .unwrap();
+            assert_eq!(row(&service, target), Some(saved.clone()));
+        }
+        assert_zip_reset(&mut app, &service, &scope, address);
+        assert_eq!(row(&service, &root), Some(saved.clone()));
+        assert_eq!(row(&service, &sibling), Some(saved));
+        drop(process);
+    }
+
+    #[test]
+    fn spread_shift_remote_zip_root_reset_accepts_effective_file_and_empty_prefix() {
+        let mut app = crate::app::setup_app_for_test();
+        let data = tempfile::tempdir().unwrap();
+        let zip = data.path().join("book.zip");
+        let effective = zip_effective_address(&app, &zip, &["a.jpg", "b.jpg"]);
+        assert_eq!(effective.subresource, RemoteSubresource::File);
+        let scope = BookScopeKey::archive(&zip, &[]).unwrap();
+        let sibling = BookScopeKey::archive(&zip, &["chapter".into()]).unwrap();
+        let (service, process) =
+            SpreadShiftService::spawn_at(data.path().join("store"), None).unwrap();
+        let saved = SpreadShiftPageRef::ArchiveEntry("b.jpg".into());
+        service
+            .set_shift(sibling.clone(), saved.clone(), operation())
+            .unwrap();
+        assert_eq!(row(&service, &sibling), Some(saved.clone()));
+        // The production root response is File. Also cover its accepted wire
+        // alias ZipDirectory { prefix: "" }, which previously failed Clear.
+        let empty_prefix = mimageviewer_ipc::RemoteAddress {
+            subresource: RemoteSubresource::ZipDirectory {
+                prefix: String::new(),
+            },
+            ..effective.clone()
+        };
+        assert_eq!(
+            remote_spread_key(&effective).unwrap(),
+            remote_spread_key(&empty_prefix).unwrap()
+        );
+        for address in [effective, empty_prefix] {
+            service
+                .set_shift(scope.clone(), saved.clone(), operation())
+                .unwrap();
+            assert_eq!(row(&service, &scope), Some(saved.clone()));
+            assert_zip_reset(&mut app, &service, &scope, address);
+            assert_eq!(row(&service, &sibling), Some(saved.clone()));
+        }
+        drop(process);
+    }
+
     #[test]
     fn spread_shift_remote_reset_waits_for_clear_commit_and_success_completion() {
         let mut app = crate::app::setup_app_for_test();
