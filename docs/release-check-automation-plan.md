@@ -448,3 +448,45 @@ feature 有無の Rust 焦点テスト、normal / portable check、full lib、fm
 
 非対話検証と診断 portable の再準備は `target/F-phase4-fix2-msg.txt` へ記録する。
 修正後の実 suite 完走・採用は利用者実行待ち。アプリ起動、ui-smoke、commit は行わない。
+
+### Phase 4 seed の pin 再ロード待機修正（2026-10-11）
+
+- 利用者実行の `163355-92a422cd` は root 選択を通過し、193.566秒で video-pin 親の
+  readiness timeout。line 38 の旧条件は、現在フォルダが生成親と一致し、keep の terminal
+  状態／通常要求の終了／startup open 終了／初期索引終了が揃うことだった。
+  failure screenshot は親へ移らず、pin 済み `video-child/pin-source.mp4` を表示している。
+- Shell は3.962秒に動画サムネを生成し、4.012秒に通常 folder pin を保存、4.035秒には
+  `src=pin` の再ロードを完了している。`qa/seed` の video-pin 保存証跡もある。
+  `release_check_pin` は FFmpeg の capture → WebP encode → VideoPinDb 保存を成功確認してから
+  folder pin を要求するため、この停止原因は生成動画／Shell の非対応や FFmpeg DLL 不足ではない。
+  timeout 延長、fixture の代替画像、pin／cache 証拠の緩和は不要。
+- pin の保存完了と、次の一覧操作を受理できる状態は異なる。通常 update の
+  `consume_folder_thumb_pin_dirty` が子を再ロードし、sidecar 復元を開始する。
+  その間の親 Open は `prepare_visible_install` の DocumentOpenBusy 拒否で採用されず、
+  旧診断 API は void の `load_folder` 呼出し後に成功応答を返していた。
+  親の sidecar／watch 開始はログにない。headless 回帰では同じ通常 consumer と物理 Open の
+  採用拒否、復元完了後の成功を再現する。通常の生成フォルダは path classification を使わない。
+- test-script 限定の `interaction_ready` は既存の一覧準備 owner、sidecar、document modal、
+  folder refresh、folder/video pin dirty、当該 context の pin refresh を read-only に投影する。
+  状態 owner の追加、dirty の診断側 drain、製品の再ロード変更は行わない。
+  seed は pin 保存後に子の loading／index／interaction 完了を待ってから親を開く。
+  Open は通常入口の admission 結果も確認し、拒否を成功応答にしない。
+
+後続の静的確認（実 suite の完走証拠ではない）:
+
+- 共通準備、全 Open 後の settle、検索完了、seed 保存と静止開始は interaction 完了も必須。
+  cached seed は従来の kept target／catalog 証拠、動画 case は再起動後の cache read を維持する。
+- tray は thumbnail 完了と interaction 完了を分離する。while-loading は通常要求が残る
+  ready な一覧を閉じ、前の一覧が loading complete でも分類中には早期失敗／close しない。
+  exact HWND/PID、cache 不在、close 世代、同一 request の source／cache／finalized 証拠は維持。
+- perf は startup many-folder を再 open せず、Ctrl+Down 後に path／generation と復元完了を待つ。
+  Ctrl+G と検索入力も直前の復元が完了した一覧から実行する。optional first-ai の追加 Open 後も
+  loading／index／interaction 完了を待ってから通常 fullscreen／AI action へ進む。
+- 実 seed branch を評価する回帰で、検索 helper 内の `SEARCH_TERM` が本 runner の Rhai 評価では
+  未定義になることも確認した。生成定数への暗黙アクセスをやめ、seed／perf の呼出しから
+  検索語と期待 hits を引数で渡す。query／実 hits の証拠と analyzer の一致検証は維持する。
+- Observe による wake は ready.json より前の準備だけ。既存 pause／sampler の計測窓では
+  command、Observe、repaint を追加しない。利用者報告では今回の foreground 干渉はなかった。
+
+非対話検証と Rust 変更による診断 portable の再準備は `target/F-phase4-fix3-msg.txt` へ記録する。
+アプリ／ui-smoke は実行せず、修正後の実 suite 完走は利用者実行待ち。

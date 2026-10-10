@@ -6876,6 +6876,81 @@ mod tests {
 
     #[cfg(feature = "test-script")]
     #[test]
+    fn release_checks_seed_waits_for_pin_refresh_before_opening_parent() {
+        // Execute the real seed branch/helpers with deterministic observations.
+        // No capture, DB, window, input or measured idle interval is involved.
+        let state = Arc::new(Mutex::new((String::new(), 0_u32, Vec::<String>::new())));
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let mut engine = build_engine(bridge);
+        engine.register_fn("sleep", |_: rhai::INT| {});
+        engine.register_fn(
+            "fail",
+            |message: ImmutableString| -> Result<(), Box<EvalAltResult>> {
+                Err(rhai_error(message.to_string()))
+            },
+        );
+        let s = Arc::clone(&state);
+        engine.register_fn("release_check_observe", move || {
+            let mut s = s.lock().unwrap();
+            let ready = s.1 == 0;
+            if !ready {
+                s.1 -= 1;
+                s.2.push("pin-refresh-pending".into());
+            }
+            let value = serde_json::json!({"pid":1,"current_folder_path":s.0,
+                "items_generation":1,"loading_complete":true,"index_settled":true,
+                "interaction_ready":ready,"focused":true,"perf_t":1.0,
+                "search_active":true,"search_focused":true,"search_query":"needle",
+                "search_done":true,"search_searching":false,"search_hits":[]});
+            super::release_checks::to_dynamic(&value)
+        });
+        let s = Arc::clone(&state);
+        engine.register_fn("release_check_open", move |path: ImmutableString| {
+            let mut s = s.lock().unwrap();
+            assert_eq!(s.1, 0, "open must wait for the existing pin refresh owner");
+            s.0 = path.to_string();
+            s.2.push(format!("open:{path}"));
+        });
+        let s = Arc::clone(&state);
+        engine.register_fn("release_check_pin", move |_: ImmutableString| {
+            let mut s = s.lock().unwrap();
+            s.1 = 2;
+            s.2.push("pin-persisted".into());
+        });
+        engine.register_fn("release_check_seed", |_: ImmutableString| {});
+        engine.register_fn("tap_key", |_: ImmutableString, _: ImmutableString| {});
+        engine.register_fn("release_check_text", |_: ImmutableString| {});
+        engine.register_fn("release_check_evidence", |_: ImmutableString, _: Map| {});
+        engine.register_fn("release_check_quit", || {});
+        let source = include_str!("../scripts/ui-smoke/release-checks.rhai")
+            .replace("__CASE_ID__", "seed-profile")
+            .replace("__VIDEO_CHILD__", "C:/fixture/video-child")
+            .replace("__VIDEO_PARENT__", "C:/fixture/video-parent")
+            .replace("__SEARCH_TERM__", "needle")
+            .replace("__SEARCH_HITS__", "[]")
+            .replace("__CACHE_PATHS__", "[\"C:/fixture/cache\"]")
+            .replace("__NAVIGATION_PATHS__", "[]")
+            .replace("__INCLUDE_FIRST_AI__", "false");
+        let helpers = source.split("\nrelease_check_begin(").next().unwrap();
+        let branch = source.split("let evidence =").nth(1).unwrap();
+        engine
+            .eval::<()>(&format!("{helpers}\nlet evidence ={branch}"))
+            .unwrap();
+        assert_eq!(
+            state.lock().unwrap().2,
+            vec![
+                "open:C:/fixture/cache",
+                "open:C:/fixture/video-child",
+                "pin-persisted",
+                "pin-refresh-pending",
+                "pin-refresh-pending",
+                "open:C:/fixture/video-parent",
+            ]
+        );
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
     fn release_checks_root_readiness_uses_the_serialized_selection_identity() {
         let (bridge, _, _) = runner_bridge(ready_snapshot());
         let engine = build_engine(bridge);

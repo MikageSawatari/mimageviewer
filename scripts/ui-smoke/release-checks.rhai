@@ -27,15 +27,19 @@ fn comparable_path(path) {
     path.to_lower()
 }
 fn settled(path) {
+    let last = #{};
     for attempt in 0..1800 {
         let state = release_check_observe();
         if comparable_path(state.current_folder_path) == comparable_path(path)
-            && state.loading_complete && state.index_settled {
+            && state.loading_complete && state.index_settled && state.interaction_ready {
             return state;
         }
+        last = state;
         sleep(100);
     }
-    fail("release-check readiness timeout for " + path);
+    fail("release-check readiness timeout for " + path + ": observed=" + last.current_folder_path
+        + " generation=" + last.items_generation + " interaction_ready=" + last.interaction_ready
+        + " loading_complete=" + last.loading_complete + " index_settled=" + last.index_settled);
 }
 fn focused() {
     for attempt in 0..200 {
@@ -44,7 +48,7 @@ fn focused() {
     }
     fail("environment: exact root foreground was not acquired");
 }
-fn search() {
+fn search(term, expected_hits) {
     focused();
     let before = release_check_observe();
     tap_key("G", "ctrl");
@@ -54,13 +58,14 @@ fn search() {
         if attempt == 299 { fail("environment: Ctrl+G search did not focus"); }
         sleep(100);
     }
-    release_check_text(SEARCH_TERM);
+    release_check_text(term);
     for attempt in 0..1800 {
         let state = release_check_observe();
-        if state.search_query == SEARCH_TERM && state.search_done && !state.search_searching {
+        if state.search_query == term && state.search_done && !state.search_searching
+            && state.interaction_ready {
             return #{ ctrl_g_receipt: true, text_receipt: true, completed: true,
-                start_t: before.perf_t, end_t: state.perf_t, expected_query: SEARCH_TERM, actual_query: state.search_query,
-                expected_hits: SEARCH_HITS, actual_hits: state.search_hits };
+                start_t: before.perf_t, end_t: state.perf_t, expected_query: term, actual_query: state.search_query,
+                expected_hits: expected_hits, actual_hits: state.search_hits };
         }
         sleep(100);
     }
@@ -74,7 +79,8 @@ release_check_begin(CASE_ID, CASE_DIRECTORY);
 wait_until(|s| root_selectable(s), 30000);
 select_root();
 for attempt in 0..1800 {
-    if release_check_observe().index_settled { break; }
+    let state = release_check_observe();
+    if state.index_settled && state.interaction_ready { break; }
     if attempt == 1799 { fail("environment: initial index scans did not settle"); }
     sleep(100);
 }
@@ -88,11 +94,13 @@ if CASE_ID == "seed-profile" {
     release_check_open(VIDEO_CHILD);
     settled(VIDEO_CHILD);
     release_check_pin(VIDEO_SOURCE);
-    // Normal pin worker/capture and cache producers own their completion.
+    // DB persistence precedes the ordinary pin-triggered child reload. Wait for
+    // its dirty/classification/sidecar owners before admitting another open.
+    settled(VIDEO_CHILD);
     release_check_open(VIDEO_PARENT);
     settled(VIDEO_PARENT);
     release_check_seed("cache");
-    evidence.search = search();
+    evidence.search = search(SEARCH_TERM, SEARCH_HITS);
     release_check_seed("search");
 } else if CASE_ID == "first-ai" {
     release_check_open(STATIC_PATH);
@@ -119,7 +127,7 @@ if CASE_ID == "seed-profile" {
             after_path: after.current_folder_path, start_t: before.perf_t, end_t: after.perf_t });
     }
     evidence.navigation = navigation;
-    evidence.search = search();
+    evidence.search = search(SEARCH_TERM, SEARCH_HITS);
 } else {
     let path = if CASE_ID == "video-pin-background" { VIDEO_PARENT }
         else if CASE_ID.starts_with("tray-") { MANY_PATH } else { STATIC_PATH };

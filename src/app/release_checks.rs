@@ -4,6 +4,21 @@ use crate::test_script::release_checks::{self as protocol, Observation, Operatio
 use serde_json::{Value, json};
 
 impl App {
+    // Persistence is not navigation readiness: normal pin consumers can still
+    // start a same-folder reload whose sidecar restore refuses the next open.
+    // Project the existing owners; never drain them or bypass their UI paths.
+    fn release_check_interaction_ready(&self) -> bool {
+        !self.clipboard_capture_navigation_preparing()
+            && !self.sidecar_restore_active()
+            && !self.document_open_modal_admission_blocked()
+            && self.folder_refresh_pending.is_none()
+            && self.folder_thumb_pin_dirty.is_empty()
+            && self.video_thumb_overrides_dirty_paths.is_empty()
+            && !self
+                .current_view_pin_refreshes
+                .contains_key(&self.projected_viewer_context_id())
+    }
+
     // Called before receive; emitted only after the canonical owner accepts the
     // receipt. Finalized must observe the real queued image, before its terminal
     // transition removes/settles that reservation.
@@ -116,6 +131,7 @@ impl App {
                 "keep_count":keep.len(),"loaded_keep_count":loaded,
                 "requested_px":self.display_px_shared.load(std::sync::atomic::Ordering::Relaxed),
                 "loading_complete":complete,"index_settled":!self.initial_scan_settled_pending,
+                "interaction_ready":self.release_check_interaction_ready() && !snapshot.startup_open_pending,
                 "search_active":self.global_search.active,"search_focused":self.global_search.has_focus,
                 "search_query":self.global_search.query,"search_done":self.global_search.done,
                 "search_searching":self.global_search.is_searching(),
@@ -142,7 +158,19 @@ impl App {
                 match request.operation {
                     Operation::Observe => (),
                     Operation::Open(path) => {
-                        self.load_folder(path);
+                        if !self.release_check_interaction_ready() {
+                            return Err("environment: release open attempted before list interaction readiness".into());
+                        }
+                        if !self.load_folder_with_scan_owned(
+                            path,
+                            None,
+                            super::OpenRequestOwner::Navigation,
+                            super::StartupListIntent::ExplicitList,
+                        ) {
+                            return Err(
+                                "environment: normal release folder open was not admitted".into()
+                            );
+                        }
                     }
                     Operation::Text(text) => {
                         if !self.release_check_observation(ctx).value["focused"]
@@ -238,5 +266,76 @@ pub(crate) fn record_tray_hide(app: &App) {
     if let Some(mut proof) = proof {
         proof["window_visible"] = json!(app.window_visible);
         protocol::trace("tray_hide", proof);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn release_pin_refresh_must_finish_before_a_following_open() {
+        let mut app = crate::app::setup_app_for_test();
+        // The shared fixture opts out of automatic recovery for synchronous
+        // navigation tests. This regression needs the production restore path.
+        app.settings.sidecar_backup_enabled = true;
+        app.settings.tag_sidecar_backup_enabled = true;
+        let child = app.tmp.path().join("video-child");
+        let parent = app.tmp.path().join("video-parent");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::create_dir(&parent).unwrap();
+        app.current_folder = Some(child.clone());
+        assert!(app.release_check_interaction_ready());
+
+        // This is the existing dirty owner published by a successful folder
+        // pin, before update reaches its ordinary consumer. No native UI runs.
+        app.folder_thumb_pin_dirty.insert(child.clone());
+        assert!(!app.release_check_interaction_ready());
+        app.consume_folder_thumb_pin_dirty();
+        assert!(app.folder_thumb_pin_dirty.is_empty());
+        // Reproduce the actual failure: the pin consumer starts sidecar
+        // restoration, then the normal physical open refuses visible adoption.
+        assert!(app.sidecar_restore_active());
+        assert!(!app.release_check_interaction_ready());
+        assert!(!app.load_folder_with_scan_owned(
+            parent.clone(),
+            None,
+            super::super::OpenRequestOwner::Navigation,
+            super::super::StartupListIntent::ExplicitList,
+        ));
+        assert_eq!(app.current_folder.as_ref(), Some(&child));
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.sidecar_restore_active() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sidecar did not finish"
+            );
+            app.poll_sidecar_restore(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(app.current_folder.as_ref(), Some(&child));
+        assert!(app.release_check_interaction_ready());
+        assert!(app.load_folder_with_scan_owned(
+            parent.clone(),
+            None,
+            super::super::OpenRequestOwner::Navigation,
+            super::super::StartupListIntent::ExplicitList,
+        ));
+        assert_eq!(app.current_folder.as_ref(), Some(&parent));
+    }
+
+    #[test]
+    fn release_interaction_readiness_includes_deferred_video_and_folder_refresh() {
+        let mut app = crate::app::setup_app_for_test();
+        let path = app.tmp.path().join("pin-source.mp4");
+        assert!(app.release_check_interaction_ready());
+        app.video_thumb_overrides_dirty_paths.insert(path.clone());
+        assert!(!app.release_check_interaction_ready());
+        app.video_thumb_overrides_dirty_paths.clear();
+        app.folder_refresh_pending = Some(path);
+        assert!(!app.release_check_interaction_ready());
+        app.folder_refresh_pending = None;
+        assert!(app.release_check_interaction_ready());
     }
 }

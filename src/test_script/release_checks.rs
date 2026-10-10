@@ -441,7 +441,7 @@ fn write_json(path: &Path, value: &Value) -> Result<(), String> {
     // One producer, fresh case paths. Readers see the complete protocol message.
     std::fs::rename(temporary, path).map_err(|e| e.to_string())
 }
-fn to_dynamic(value: &Value) -> Dynamic {
+pub(super) fn to_dynamic(value: &Value) -> Dynamic {
     match value {
         Value::Null => Dynamic::UNIT,
         Value::Bool(v) => Dynamic::from(*v),
@@ -560,7 +560,7 @@ pub(super) fn register(engine: &mut Engine, bridge: RunnerBridge) {
     let b = bridge.clone();
     engine.register_fn("release_check_seed", move |kind: ImmutableString| -> Result<(),Box<EvalAltResult>> {
         let o = request(&b,Operation::Observe).map_err(rhai_error)?;
-        if o.value["index_settled"] != true || (kind.as_str()=="cache" && o.value["loading_complete"] != true) { return Err(rhai_error("environment: seed not settled")); }
+        if o.value["index_settled"] != true || o.value["interaction_ready"] != true || (kind.as_str()=="cache" && o.value["loading_complete"] != true) { return Err(rhai_error("environment: seed not settled")); }
         match kind.as_str() {
             "cache" => {
                 let proof = cache_probe(&o).map_err(rhai_error)?;
@@ -586,7 +586,10 @@ pub(super) fn register(engine: &mut Engine, bridge: RunnerBridge) {
                 if tray_witness::close_ready(&o.value, mode.as_str()) {
                     break o;
                 }
-                if mode.as_str() == "while-loading" && o.value["loading_complete"] == true {
+                if mode.as_str() == "while-loading"
+                    && o.value["interaction_ready"] == true
+                    && o.value["loading_complete"] == true
+                {
                     return Err(rhai_error(
                         "environment: tray finished before loading close",
                     ));
@@ -712,7 +715,7 @@ pub(super) fn register(engine: &mut Engine, bridge: RunnerBridge) {
         let deadline=Instant::now()+Duration::from_secs(180);
         loop {
             let o=request(&b,Operation::Observe).map_err(rhai_error)?;
-            if o.value["loading_complete"]==true {break;}
+            if o.value["loading_complete"]==true && o.value["interaction_ready"]==true && o.value["index_settled"]==true {break;}
             if Instant::now()>=deadline {return Err(rhai_error("environment: first AI folder did not settle"));}
             b.interrupt.wait(Duration::from_millis(100)).map_err(rhai_error)?;
         }
@@ -764,6 +767,7 @@ fn wait_idle_ready(bridge: &RunnerBridge) -> Result<Observation, String> {
                 None => {
                     observation.value["loading_complete"] == true
                         && observation.value["index_settled"] == true
+                        && observation.value["interaction_ready"] == true
                 }
             }
         };
