@@ -2,7 +2,9 @@
 
 別バージョン検索の長押し表示を修正する際、ナビゲーターの入力順序を
 egui のクリック判定と対応付けるために追加した、読み取り専用の API である。
-クリックの判定条件、時刻、入力イベントの生成・消費は変更しない。
+この読み取り専用APIはクリックの判定条件、時刻、入力イベントの生成・消費を変更しない。
+2026-10-10には、前面popup終了時に未配送のwheel平滑化分を破棄する限定APIを追加した。
+以下の元APIの検証・レビュー記録は当時の差分だけを示す。追加APIの境界は末尾に記録する。
 
 ## 出典
 
@@ -77,3 +79,41 @@ root / eframe / egui-wgpu / egui standalone の cargo tree は、すべて同じ
 アプリ全体の最終 gate は target/r4-test-full-final4-j1.log で成功（main lib 7693成功、38ignored）。
 portable のビルド・24 runtime files の更新照合も成功した。実機確認は利用者の返答待ちである。
 段階結果と残作業は [レビュー修正記録](../../docs/duplicate-detection-review-fixes-20260907.md) を参照。
+
+## InputState::discard_pending_scroll（2026-10-10）
+
+### 必要性と呼出境界
+
+publicなraw_scroll_delta / smooth_scroll_delta / Event::MouseWheelを消費しても、egui内部の
+平滑化待ちwheelが次frameに再生成される。前面popupを閉じた後、同じwheelの残りが背面panelへ
+配送されることを防ぐため、InputState自身に未配送分の終端APIを設ける。
+
+fullscreen共通HUD境界でframeの前面ownerをキー処理・ナビゲータ入力より前に確定し、
+入力を退避して対象regionの描画直前だけ戻す。全前面描画後にpublic delta・wheel eventの残りを
+消費し、選択済みtargetが閉じている終了frameだけ本APIを呼ぶ。開いている間の平滑化を毎frame
+破棄したり、Appの遅延フラグ・時間窓で遮断したりしない。キー終了でも既存キー転送は維持する。
+
+### 破棄対象と保持対象
+
+`src/input_state/mod.rs`の本APIはprivateな`unprocessed_scroll_delta`と
+`unprocessed_scroll_delta_for_zoom`だけをゼロにする。publicなdelta・eventの消費は呼出側の
+既存境界が行う。pointer / focus / touch・gestureの状態、次frameに届く新規wheelは変更しない。
+内部fieldを公開せず、既存入力ownerが保有する未配送queueの終端だけを提供する。
+
+### 回帰と依存更新時に保持すべき差分
+
+src/ui_fullscreen.rsの実render_fullscreen_viewport回帰で、実HUDから開くfit / overflowの
+クリック終了＋wheel、overflowのキー終了＋wheel、後続idle frameの平滑化残り消費、終了後の
+新規wheel配送を確認する。固定ナビゲータとの実重なりでは、元raw snapshotを保持し、即時・
+予約consumerへの射影だけから前面所有wheelを除くことを確認する。
+
+依存更新時は本APIの宣言と上記2内部queueの破棄、fullscreenの終了時呼出、キー・raw navigator
+処理より前のframe所有確定、上記アプリ回帰を保持する。upstreamに同等の終端APIがある場合は
+同じ破棄範囲・終了境界・回帰を満たすAPIへ置換する。読み取り専用の
+released_buttons_with_click_counts APIと元の順序／focus回帰も別途保持する。
+追加APIについて本台帳は独立レビュー完了を主張しない。
+
+2026-10-10の追加実経路2件（specified_scale_overflow_key_close_owns_wheel_and_forwards_key /
+specified_scale_overflow_wheel_owns_real_pinned_navigator_overlap）は、修正前にそれぞれ背面offsetの変化、
+固定ナビゲータsizeの変化で失敗することを確認した。修正後のspecified 88件とnavigator 58件は成功。
+対象APIの実装は本追補では変更せず、終了境界への接続とconsumer用射影を検証した。

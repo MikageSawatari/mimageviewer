@@ -23775,6 +23775,11 @@ impl App {
                     .frame(egui::Frame::new().fill(canvas_color))
                     .show(ctx, |ui| {
                         let full_rect = ui.max_rect();
+                        // Determine this frame's front owner before keys can close it and before
+                        // any backing raw-input consumer or ScrollArea handles its wheel.
+                        let mut hud_popup_wheel = self
+                            .fullscreen_front_popup_wheel_target(ctx, full_rect, fs_idx)
+                            .map(|target| FsHudPopupWheelInput::take(ctx, target));
                         let still_seek_geometry =
                             self.still_seek_geometry_for_idx(full_rect, fs_idx, state.is_video);
                         let resolved_fullscreen_media_rect = self
@@ -23984,6 +23989,7 @@ impl App {
                             is_spread_double,
                             prev_foreground_hwnd,
                             &mut similar_preview_navigator_input,
+                            hud_popup_wheel.as_ref(),
                         );
                         if !wheel_nav.is_none() {
                             page_nav = wheel_nav;
@@ -24721,12 +24727,6 @@ impl App {
                         if adjustment_active && similar_preview_presentation.is_none() {
                             self.draw_continuous_adjust_target_outline(ui, image_rect);
                         }
-
-                        // Panels precede the HUD in draw order. Reserve its wheel input now,
-                        // so a foreground popup and a backing ScrollArea cannot both use it.
-                        let mut hud_popup_wheel = self
-                            .fullscreen_front_popup_wheel_target(ctx, full_rect, fs_idx)
-                            .map(|target| FsHudPopupWheelInput::take(ctx, target));
 
                         // ── 分析パネル（分析モード時、見開き中は無効）──
                         let panels_t0 = std::time::Instant::now();
@@ -31694,7 +31694,7 @@ impl App {
         }
     }
 
-    /// Select the front consumer before backing panels draw. This is frame-local routing;
+    /// Select the front consumer before key handling and backing input. This is frame-local routing;
     /// overflow remains modeless and owns only its existing painted/hit rectangle.
     fn fullscreen_front_popup_wheel_target(
         &self,
@@ -32330,15 +32330,15 @@ impl App {
         ctx: &egui::Context,
         image_rect: egui::Rect,
         fs_idx: usize,
-        reserved_input: Option<&FsNavigatorInputReservation>,
+        frame_input_override: Option<&FsNavigatorFrameInput>,
     ) -> bool {
         if !self.fs_navigator_allowed(ctx, fs_idx) {
             self.fullscreen_navigator_interaction.invalidate();
             return false;
         }
         let captured_input;
-        let frame_input = match reserved_input {
-            Some(reservation) => reservation.frame_input(),
+        let frame_input = match frame_input_override {
+            Some(input) => input,
             None => {
                 captured_input = FsNavigatorFrameInput::for_current_pass(ctx);
                 &captured_input
@@ -32955,7 +32955,13 @@ impl App {
         if let Some(reservation) = reserved_input.take() {
             // Resolve a new PendingCenter on the next real original-layout frame. Consuming it
             // against this frame's pre-interaction layout would add the old screen delta twice.
-            let _ = self.handle_fs_navigator_input(ui, ctx, image_rect, fs_idx, Some(&reservation));
+            let _ = self.handle_fs_navigator_input(
+                ui,
+                ctx,
+                image_rect,
+                fs_idx,
+                Some(reservation.frame_input()),
+            );
         }
     }
 
@@ -33201,6 +33207,7 @@ impl App {
             is_spread_double,
             prev_foreground_hwnd,
             navigator_reservation,
+            None,
         )
     }
 
@@ -33214,9 +33221,18 @@ impl App {
         is_spread_double: bool,
         prev_foreground_hwnd: usize,
         navigator_reservation: &mut Option<FsNavigatorInputReservation>,
+        front_wheel_owner: Option<&FsHudPopupWheelInput>,
     ) -> (FsPageNav, bool) {
         *navigator_reservation = None;
-        let navigator_frame_input = FsNavigatorFrameInput::for_current_pass(ctx);
+        let mut navigator_frame_input = FsNavigatorFrameInput::for_current_pass(ctx);
+        if front_wheel_owner.is_some() {
+            // The begin-pass capture remains intact. Both immediate and reserved consumers
+            // receive the same projection, retaining pointer/focus/release gesture ownership.
+            navigator_frame_input
+                .events
+                .retain(|event| !matches!(event, FsNavigatorInputEvent::MouseWheel { .. }));
+            navigator_frame_input.wheel_y = 0.0;
+        }
         let mut page_nav = FsPageNav::None;
         // 同じ面の認識器を回す呼び出しが下に複数ある。接触の開始フレームを処理した
         // 呼び出しが所有者を決めるので、**全部で同じ値を使う**。
@@ -33287,7 +33303,13 @@ impl App {
         let navigator_consumed = if navigator_reservation.is_some() {
             true
         } else if !modal_input_blocked && let Some(navigator_idx) = self.fullscreen_idx {
-            self.handle_fs_navigator_input(ui, ctx, default_image_rect, navigator_idx, None)
+            self.handle_fs_navigator_input(
+                ui,
+                ctx,
+                default_image_rect,
+                navigator_idx,
+                Some(&navigator_frame_input),
+            )
         } else {
             false
         };
@@ -62798,7 +62820,7 @@ mod tests {
                             ctx,
                             image_rect,
                             fs_idx,
-                            Some(reservation),
+                            Some(reservation.frame_input()),
                         ));
                     });
             },
@@ -62850,13 +62872,17 @@ mod tests {
                             (FsPageNav::None, false)
                         );
                         app.fullscreen_page_layout.clear();
-                        assert!(!app.handle_fs_navigator_input(
-                            ui,
-                            ctx,
-                            image_rect,
-                            fs_idx,
-                            reserved.as_ref(),
-                        ));
+                        assert!(
+                            !app.handle_fs_navigator_input(
+                                ui,
+                                ctx,
+                                image_rect,
+                                fs_idx,
+                                reserved
+                                    .as_ref()
+                                    .map(FsNavigatorInputReservation::frame_input),
+                            )
+                        );
                     });
             },
         );
@@ -62905,7 +62931,7 @@ mod tests {
                             ctx,
                             image_rect,
                             fs_idx,
-                            Some(reservation),
+                            Some(reservation.frame_input()),
                         ));
                     });
             },
@@ -62955,7 +62981,7 @@ mod tests {
                             ctx,
                             image_rect,
                             fs_idx,
-                            Some(reservation),
+                            Some(reservation.frame_input()),
                         ));
                     });
             },
@@ -80751,6 +80777,178 @@ mod specified_scale_consumer_tests {
                 "a fresh wheel after closing returns to the backing panel"
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn specified_scale_overflow_key_close_owns_wheel_and_forwards_key() {
+        let (ctx, mut app, viewport) = specified_popup_metadata_fixture(egui::vec2(820.0, 240.0));
+        let mut frame = 0;
+        let mut draw = |app: &mut App, events| {
+            frame += 1;
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(viewport),
+                    time: Some(frame as f64 / 60.0),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.render_fullscreen_viewport(ctx),
+            )
+        };
+        for _ in 0..5 {
+            let _ = draw(&mut app, vec![]);
+        }
+        let button = ctx
+            .read_response(egui::Id::new("fs_overflow_btn"))
+            .unwrap()
+            .rect;
+        let _ = draw(&mut app, click(button.center()));
+        for _ in 0..5 {
+            let _ = draw(&mut app, vec![]);
+        }
+        assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Root);
+        let front: (egui::Rect, egui::Vec2, egui::Vec2) = ctx
+            .data(|data| data.get_temp(egui::Id::new("fs_overflow_scroll_test_layout")))
+            .unwrap();
+        let overlap = front.0.intersect(metadata_scroll_state(&ctx).0);
+        assert!(overlap.is_positive());
+        let _ = draw(&mut app, vec![egui::Event::PointerMoved(overlap.center())]);
+        let before = metadata_scroll_state(&ctx).2;
+        let was_fit = app.effective_fullscreen_fit_mode();
+        let mut events = popup_wheel_events(overlap.center());
+        for pressed in [true, false] {
+            events.push(egui::Event::Key {
+                key: egui::Key::Num0,
+                physical_key: Some(egui::Key::Num0),
+                pressed,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        let _ = draw(&mut app, events);
+        assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+        assert_ne!(
+            app.effective_fullscreen_fit_mode(),
+            was_fit,
+            "the dismissing key must still reach the existing fit-cycle owner"
+        );
+        assert_eq!(
+            metadata_scroll_state(&ctx).2,
+            before,
+            "key-close frame remains front-owned"
+        );
+        assert_popup_wheel_consumed(&ctx);
+        for _ in 0..30 {
+            let _ = draw(&mut app, vec![]);
+        }
+        assert_eq!(
+            metadata_scroll_state(&ctx).2,
+            before,
+            "no smoothed tail after key-close"
+        );
+        let point = metadata_scroll_state(&ctx).0.center();
+        let _ = draw(&mut app, popup_wheel_events(point));
+        for _ in 0..30 {
+            let _ = draw(&mut app, vec![]);
+        }
+        assert!(
+            metadata_scroll_state(&ctx).2.y > before.y,
+            "fresh wheel reaches metadata again"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn specified_scale_overflow_wheel_owns_real_pinned_navigator_overlap() {
+        let (ctx, mut app, viewport) = specified_popup_metadata_fixture(egui::vec2(820.0, 240.0));
+        app.settings.fullscreen_navigator_visible = true;
+        app.settings.fullscreen_navigator_corner = FullscreenNavigatorCorner::TopRight;
+        app.settings.fullscreen_navigator_size = 240.0;
+        app.fs_zoom = 2.0;
+        let mut frame = 0;
+        let mut draw = |app: &mut App, events| {
+            frame += 1;
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(viewport),
+                    time: Some(frame as f64 / 60.0),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    app.render_fullscreen_viewport(ctx);
+                    let raw = FsNavigatorFrameInput::for_current_pass(ctx);
+                    ctx.data_mut(|data| data.insert_temp(egui::Id::new("front_raw_wheel"), raw));
+                },
+            )
+        };
+        for _ in 0..5 {
+            let _ = draw(&mut app, vec![]);
+        }
+        let button = ctx
+            .read_response(egui::Id::new("fs_overflow_btn"))
+            .unwrap()
+            .rect;
+        let _ = draw(&mut app, click(button.center()));
+        for _ in 0..5 {
+            let _ = draw(&mut app, vec![]);
+        }
+        let front: (egui::Rect, egui::Vec2, egui::Vec2) = ctx
+            .data(|data| data.get_temp(egui::Id::new("fs_overflow_scroll_test_layout")))
+            .unwrap();
+        let image_rect = app.fullscreen_media_rect(viewport, 0, false);
+        let navigator = app.fs_navigator_layout(image_rect).unwrap();
+        let overlap = front.0.intersect(navigator.canvas_rect);
+        assert!(
+            overlap.is_positive(),
+            "real front/navigator must overlap: {:?} {:?}",
+            front.0,
+            navigator.canvas_rect
+        );
+        let _ = draw(&mut app, vec![egui::Event::PointerMoved(overlap.center())]);
+        let before_size = app.settings.fullscreen_navigator_size;
+        let before_zoom = app.fs_zoom;
+        let before_pan = app.fs_pan;
+        let before_metadata = metadata_scroll_state(&ctx).2;
+        let _ = draw(&mut app, popup_wheel_events(overlap.center()));
+        assert!(
+            ctx.data(
+                |data| data.get_temp::<FsNavigatorFrameInput>(egui::Id::new("front_raw_wheel"))
+            )
+            .unwrap()
+            .wheel_y_in(overlap)
+                < 0.0,
+            "keep the original raw capture intact; filter only the consumer projection"
+        );
+        assert_eq!(
+            app.settings.fullscreen_navigator_size, before_size,
+            "front wheel must not resize the pinned backing navigator"
+        );
+        assert_eq!(app.fs_zoom, before_zoom);
+        assert_eq!(app.fs_pan, before_pan);
+        assert_popup_wheel_consumed(&ctx);
+        for _ in 0..30 {
+            let _ = draw(&mut app, vec![]);
+        }
+        let after: (egui::Rect, egui::Vec2, egui::Vec2) = ctx
+            .data(|data| data.get_temp(egui::Id::new("fs_overflow_scroll_test_layout")))
+            .unwrap();
+        assert!(after.2.y > front.2.y, "front overflow still scrolls");
+        assert_eq!(metadata_scroll_state(&ctx).2, before_metadata);
+        let close = ctx
+            .read_response(egui::Id::new("fs_overflow_panel_close"))
+            .unwrap()
+            .rect
+            .center();
+        let _ = draw(&mut app, click(close));
+        assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+        let navigator = app.fs_navigator_layout(image_rect).unwrap();
+        let _ = draw(&mut app, popup_wheel_events(navigator.canvas_rect.center()));
+        assert_ne!(
+            app.settings.fullscreen_navigator_size, before_size,
+            "fresh wheel after closing still reaches the real navigator resize owner"
+        );
     }
 
     #[test]

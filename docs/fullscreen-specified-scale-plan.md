@@ -1096,8 +1096,8 @@ render_fullscreen_viewportと実metadata ScrollAreaでpopupなしなら動くoff
 
 §22の配送はoverflow（「その他の機能」）にも必要である。同パネルはmetadataより後、同じUi layerで
 ScrollAreaを描くため、描画後のwheel消費だけではmetadataのoffset更新を取り消せない。
-既存のframe-local入力退避に配送先（上HUD / 静止画seek列menu / overflow）を付け、背面panel描画前に
-一度だけ選ぶ。描画・hitに使う既存overflow矩形内ではoverflowへ、外側では従来consumerへ配送する。
+既存のframe-local入力退避に配送先（上HUD / 静止画seek列menu / overflow）を付け、キー処理・
+ナビゲータ入力・背面panel描画より前に一度だけ選ぶ。描画・hitに使う既存overflow矩形内ではoverflowへ、外側では従来consumerへ配送する。
 overflowをmodalへ変更せず、外側のクリック・ホイール・キー操作と既存の閉じ方を維持する。
 新しいApp状態、open flag、独立したpending ownerは作らない。
 
@@ -1119,7 +1119,7 @@ egui InputStateはwheelを複数frameへ平滑化するため、publicなdelta�
 | 回転menu | egui Foreground popupだが同じ上HUDの後段consumerなので、上HUD配送へ含める |
 | 静止画サムネイル列menu | 背面panelの後・上HUDの前に描く既存menuへ専用の配送先を指定。既存のmenu後消費も維持 |
 | fullscreen右クリックmenu | Windows native menu / egui Tooltip Windowの別経路。HUDの同一layer ScrollAreaではなく、既存のcontext-menu入力／layer境界を維持して変更しない |
-| ナビゲータ | 背面panelより先に描く既存の専用input reducer・予約経路。HUD後段のScrollArea配送ではなく、そのownerを変更しない |
+| ナビゲータ | 前面owner確定後、即時consumerとsimilar previewの予約consumerへ渡すraw入力の射影からwheel eventとfallback deltaだけを除く。元のbegin-pass記録とpointer / focus / releaseは保持し、前面外では従来ownerへ配送 |
 | seek thumbnail preview / tooltip / ring guide / feedback | スクロール本文を持たない受動的な描画。新しいwheel ownerを付けない |
 | 音楽・native video HUD / 一般dialog | 別の描画・入力owner。今回の静止画共通HUDの後段panel経路ではないため変更しない |
 
@@ -1127,3 +1127,22 @@ egui InputStateはwheelを複数frameへ平滑化するため、publicなdelta�
 広い窓ではoverflow外側のmetadataのwheelが動くことを検証する。実HUD buttonでpopupを開き、
 fit項目選択とoverflowの×で閉じるクリック＋wheelを同じframeに送り、残り入力と背面offsetを検査する。
 閉じた後の新規wheelでmetadataが再びscrollするところまで通す。snapshotの外観・opacityを変えない。
+
+### 23.1 キー終了frameと固定ナビゲータへの同じ所有境界（2026-10-10）
+
+キー処理はoverflowを閉じた後も既存のキー操作を転送する。その前に現在frameの前面ownerを確定し、
+閉じたframeも入力の配送・残り消費・未配送平滑化分の破棄を同じownerで完了する。
+特定キーの例外を増やさず、0キーのfit循環を含む既存転送を維持する。
+
+ナビゲータは背面panelより早くraw入力を処理するため、描画後の消費だけでは保護されない。
+前面ownerがwheelを退避したframeでは、既存FsNavigatorFrameInputのconsumer用コピーから
+wheel eventとfallback deltaを除く。即時処理とsimilar previewの予約処理に同じコピーを渡す。
+元のbegin-pass snapshot、pointer / focus / release、既存gesture ownerは変えない。
+これはfullscreen内の入力順序・配送の修正で、新しい永続状態・modal制約・時間窓を追加しない。
+
+実render_fullscreen_viewport回帰は、overflowを実HUD buttonから開き、重なり上で0キー＋wheelを送り、
+fit循環は実行される一方で背面metadataが同frame・後続idle frameとも不変となることを確認する。
+閉じた後の新規wheelはmetadataへ戻す。別の回帰は右上固定ナビゲータと実overflowを重ね、
+前面だけscrollし、ナビゲータのsize・zoom・panと背面metadata offsetが不変であることを確認する。
+元raw記録にwheelが残ることと、閉じた後の新規wheelでナビゲータがresizeすることも通す。
+vendor APIの必要性・呼出境界・依存更新時の保持差分はvendor/egui/PATCHES.mdに記録する。

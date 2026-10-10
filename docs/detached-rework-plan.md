@@ -4449,3 +4449,17 @@ tests/ui_snapshot.rsは既存の共通GPU harness・fixtureで通常 / 狭窓 / 
 本追補（d138a9a51後）の変更はui_fullscreen.rsとvendor/egui/src/input_state/mod.rs、
 本§11とfullscreen-specified-scale-plan.md §23だけである。metadataの製品処理、tests/ui_snapshot.rs、
 snapshot PNGは変更せず、既存の実metadata観測とsnapshot harnessを再利用する。
+
+#### 2026-10-10 bd0104aa0後: キー終了・固定ナビゲータへの配送補完
+
+本追補はui_fullscreen.rsのframe-local前面wheel ownerを、キー処理とナビゲータ入力より前に確定する。
+キーでoverflowが閉じたframeも既存転送を維持しつつ、前面終了境界で入力と平滑化残りを消費する。
+固定ナビゲータの即時入力とsimilar preview予約入力は同じraw入力コピーを使い、前面所有wheelだけを除く。
+元のbegin-pass記録とpointer / focus / releaseを保持し、前面外と終了後の新規wheelは既存ownerへ戻す。
+ナビゲータ全体の無効化、新しいApp状態、detached述語・viewport生成・placement・context bundle変更はない。
+既存所有者への入力順序と射影を揃える構造修正で、症状guard・時間窓・待機による修正ではない。
+利用者の構造修正指示を根拠とし、本追補について独立レビュー合格を主張しない。
+実render_fullscreen_viewportでキー終了＋wheelと右上固定ナビゲータの実重なりを回帰検証する。
+変更範囲はsrc/ui_fullscreen.rs、本§11、fullscreen-specified-scale-plan.md §23、vendor/egui/PATCHES.md。
+vendorのAPI実装自体は変更せず、台帳へ破棄対象・呼出境界・更新時の保持差分を補う。
+snapshot PNG、runtime、metadata製品処理は変更しない。
