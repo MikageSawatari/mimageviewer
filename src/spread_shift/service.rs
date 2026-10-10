@@ -57,17 +57,32 @@ struct CountRequest {
     reply: mpsc::Sender<ShiftCountReply>,
 }
 
-enum DeferredRead {
-    Position(ReadRequest),
-    Count(CountRequest),
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AdmissionMode {
     Running,
     StartingAfterMaintenance,
     Maintenance,
     Closed,
+    ClosedStartingAfterMaintenance,
+    ClosedMaintenance,
+}
+
+impl AdmissionMode {
+    fn is_closed(self) -> bool {
+        matches!(
+            self,
+            Self::Closed | Self::ClosedStartingAfterMaintenance | Self::ClosedMaintenance
+        )
+    }
+
+    fn close(self) -> Self {
+        match self {
+            Self::StartingAfterMaintenance => Self::ClosedStartingAfterMaintenance,
+            Self::Maintenance => Self::ClosedMaintenance,
+            Self::Running => Self::Closed,
+            closed => closed,
+        }
+    }
 }
 
 struct Admission {
@@ -75,7 +90,7 @@ struct Admission {
     mode: AdmissionMode,
     watermarks: ShiftWatermarks,
     snapshot: Option<Arc<Snapshot>>,
-    deferred_reads: Vec<DeferredRead>,
+    deferred_commands: VecDeque<Command>,
     results: VecDeque<ShiftWriteReply>,
     clear_results: VecDeque<ShiftClearAllReply>,
     changed_scope_keys: Vec<String>,
@@ -210,7 +225,7 @@ impl SpreadShiftService {
                     completed_through: 0,
                 },
                 snapshot: None,
-                deferred_reads: Vec::new(),
+                deferred_commands: VecDeque::new(),
                 results: VecDeque::new(),
                 clear_results: VecDeque::new(),
                 changed_scope_keys: Vec::new(),
@@ -283,8 +298,7 @@ impl SpreadShiftService {
         let mut admission = self.shared.admission.lock().unwrap();
         if let Err(error) = request.scope.validate() {
             send_read_error(&admission, request, error);
-        } else if cutoff > admission.watermarks.admitted || admission.mode == AdmissionMode::Closed
-        {
+        } else if cutoff > admission.watermarks.admitted || admission.mode.is_closed() {
             send_read_error(
                 &admission,
                 request,
@@ -296,8 +310,8 @@ impl SpreadShiftService {
         ) {
             self.shared.pending.fetch_add(1, Ordering::AcqRel);
             admission
-                .deferred_reads
-                .push(DeferredRead::Position(request));
+                .deferred_commands
+                .push_back(Command::Read(request));
         } else if admission.watermarks.admitted == admission.watermarks.completed_through
             && let Some(snapshot) = &admission.snapshot
             && snapshot.completed_through >= cutoff
@@ -326,7 +340,7 @@ impl SpreadShiftService {
         let (reply, rx) = mpsc::channel();
         let request = CountRequest { cutoff, reply };
         let mut admission = self.shared.admission.lock().unwrap();
-        if cutoff > admission.watermarks.admitted || admission.mode == AdmissionMode::Closed {
+        if cutoff > admission.watermarks.admitted || admission.mode.is_closed() {
             send_count_error(
                 &admission,
                 request,
@@ -337,7 +351,9 @@ impl SpreadShiftService {
             AdmissionMode::Maintenance | AdmissionMode::StartingAfterMaintenance
         ) {
             self.shared.pending.fetch_add(1, Ordering::AcqRel);
-            admission.deferred_reads.push(DeferredRead::Count(request));
+            admission
+                .deferred_commands
+                .push_back(Command::Count(request));
         } else if admission.watermarks.admitted == admission.watermarks.completed_through
             && let Some(snapshot) = &admission.snapshot
             && snapshot.completed_through >= cutoff
@@ -446,17 +462,32 @@ impl SpreadShiftService {
 
     fn maintain(&self, action: MaintenanceAction) -> Result<(), String> {
         let mut admission = self.shared.admission.lock().unwrap();
-        require_write_admission(&admission)?;
+        let root_operation = matches!(
+            &action,
+            MaintenanceAction::RenameBookRoot { .. } | MaintenanceAction::PurgeBookRoot(_)
+        );
+        let defer = root_operation
+            && matches!(
+                admission.mode,
+                AdmissionMode::Maintenance | AdmissionMode::StartingAfterMaintenance
+            );
+        if !defer {
+            require_write_admission(&admission)?;
+        }
         let sequence = admission
             .watermarks
             .admitted
             .checked_add(1)
             .ok_or("spread shift sequence exhausted")?;
-        send_command(
-            &self.shared,
-            &mut admission,
-            Command::Maintain { sequence, action },
-        )?;
+        let command = Command::Maintain { sequence, action };
+        if defer {
+            // The filesystem operation already succeeded. Accept it as a lease
+            // dependency, in the same FIFO as reads, without touching the DB.
+            self.shared.pending.fetch_add(1, Ordering::AcqRel);
+            admission.deferred_commands.push_back(command);
+        } else {
+            send_command(&self.shared, &mut admission, command)?;
+        }
         admission.watermarks.admitted = sequence;
         Ok(())
     }
@@ -508,7 +539,8 @@ impl SpreadShiftService {
     }
 
     pub(crate) fn close_admission(&self) {
-        self.shared.admission.lock().unwrap().mode = AdmissionMode::Closed;
+        let mut admission = self.shared.admission.lock().unwrap();
+        admission.mode = admission.mode.close();
     }
 
     #[cfg(test)]
@@ -596,8 +628,10 @@ impl SpreadShiftProcessOwner {
     pub(crate) fn shutdown_and_join(mut self) -> Vec<ShiftWriteReply> {
         {
             let mut admission = self.shared.admission.lock().unwrap();
-            admission.mode = AdmissionMode::Closed;
+            admission.mode = admission.mode.close();
             admission.tx = None;
+            #[cfg(test)]
+            self.shared.phase_changed.notify_all();
         }
         if let Some(handle) = self.handle.take() {
             if handle.join().is_err() {
@@ -633,7 +667,7 @@ impl Drop for SpreadShiftProcessOwner {
         // Only explicit shutdown_and_join waits. Dropping an App-facing guard
         // must not add a UI join; process owner handoff provides the normal drain.
         let mut admission = self.shared.admission.lock().unwrap();
-        admission.mode = AdmissionMode::Closed;
+        admission.mode = admission.mode.close();
         admission.tx = None;
     }
 }
@@ -642,7 +676,7 @@ impl Drop for SpreadShiftProcessOwner {
 /// ACKs close/reload the single writer connection; frontend service Drop never waits.
 pub(crate) struct SpreadShiftMaintenanceLease {
     portal: Arc<MaintenancePortal>,
-    service: Option<Arc<Shared>>,
+    service: Option<(Arc<Shared>, mpsc::Sender<Command>)>,
 }
 
 pub(crate) fn maintenance_at(data_dir: &Path) -> Result<SpreadShiftMaintenanceLease, String> {
@@ -659,39 +693,50 @@ pub(crate) fn maintenance_at(data_dir: &Path) -> Result<SpreadShiftMaintenanceLe
         state.lease = PortalLease::Leased(state.next_generation);
         state.service.upgrade()
     };
-    if let Some(service) = &service {
+    let service = if let Some(service) = service {
         let (reply, rx) = mpsc::channel();
         let begin = {
             let mut admission = service.admission.lock().unwrap();
-            if admission.mode == AdmissionMode::Closed {
+            if admission.mode.is_closed() {
                 Err("spread shift service is closing".into())
             } else {
                 admission.mode = AdmissionMode::Maintenance;
                 let result =
-                    send_command(service, &mut admission, Command::BeginMaintenance(reply));
+                    send_command(&service, &mut admission, Command::BeginMaintenance(reply))
+                        .map(|()| admission.tx.as_ref().unwrap().clone());
                 #[cfg(test)]
                 service.phase_changed.notify_all();
                 result
             }
         };
-        let result = begin.and_then(|()| rx.recv().map_err(|error| error.to_string())?);
-        if let Err(error) = result {
-            portal.state.lock().unwrap().lease = PortalLease::Idle;
-            portal.released.notify_all();
-            return Err(error);
+        match begin.and_then(|tx| {
+            rx.recv().map_err(|error| error.to_string())??;
+            Ok(tx)
+        }) {
+            Ok(tx) => Some((service, tx)),
+            Err(error) => {
+                portal.state.lock().unwrap().lease = PortalLease::Idle;
+                portal.released.notify_all();
+                return Err(error);
+            }
         }
-    }
+    } else {
+        None
+    };
     Ok(SpreadShiftMaintenanceLease { portal, service })
 }
 
 impl Drop for SpreadShiftMaintenanceLease {
     fn drop(&mut self) {
-        if let Some(service) = &self.service {
+        if let Some((service, tx)) = &self.service {
             let (reply, rx) = mpsc::channel();
-            let sent = {
-                let mut admission = service.admission.lock().unwrap();
-                send_command(service, &mut admission, Command::EndMaintenance(reply))
-            };
+            // Keep the actor alive through lease release even after process-exit
+            // admission closes, so accepted dependencies still drain normally.
+            service.pending.fetch_add(1, Ordering::AcqRel);
+            let sent = tx.send(Command::EndMaintenance(reply)).map_err(|error| {
+                service.pending.fetch_sub(1, Ordering::Release);
+                error.to_string()
+            });
             let result = sent.and_then(|()| rx.recv().map_err(|error| error.to_string())?);
             if let Err(error) = result {
                 crate::logger::log(format!("spread shift maintenance end failed: {error}"));
@@ -752,21 +797,6 @@ fn changed_keys(before: &Snapshot, after: &Snapshot) -> Vec<String> {
         .collect()
 }
 
-fn flush_deferred_reads(shared: &Shared, snapshot: &Snapshot, reads: Vec<DeferredRead>) {
-    for request in reads {
-        match request {
-            DeferredRead::Position(request) => {
-                let tx = request.reply.clone();
-                let _ = tx.send(snapshot.read(request));
-            }
-            DeferredRead::Count(request) => {
-                let _ = request.reply.send(snapshot.count(request.cutoff));
-            }
-        }
-        shared.pending.fetch_sub(1, Ordering::Release);
-    }
-}
-
 fn run_worker(
     data_dir: PathBuf,
     shared: Arc<Shared>,
@@ -793,22 +823,29 @@ fn run_worker(
         }
     }
     let (mut connection, snapshot) = open_snapshot(&data_dir, 0, 0);
-    let startup_reads = {
+    let mut ready_commands = {
         let mut admission = shared.admission.lock().unwrap();
         if let Err(error) = &snapshot.status {
             admission.errors.push(error.clone());
         }
         admission.snapshot = Some(Arc::clone(&snapshot));
-        if admission.mode == AdmissionMode::StartingAfterMaintenance {
-            admission.mode = AdmissionMode::Running;
-            std::mem::take(&mut admission.deferred_reads)
+        if matches!(
+            admission.mode,
+            AdmissionMode::StartingAfterMaintenance | AdmissionMode::ClosedStartingAfterMaintenance
+        ) {
+            if !admission.mode.is_closed() {
+                admission.mode = AdmissionMode::Running;
+            } else {
+                admission.mode = AdmissionMode::Closed;
+            }
+            std::mem::take(&mut admission.deferred_commands)
         } else {
-            Vec::new()
+            VecDeque::new()
         }
     };
-    flush_deferred_reads(&shared, &snapshot, startup_reads);
     drop(snapshot);
-    while let Ok(command) = rx.recv() {
+    // Lease dependencies run before any commands admitted after the release.
+    while let Some(command) = ready_commands.pop_front().or_else(|| rx.recv().ok()) {
         match command {
             Command::Write {
                 sequence,
@@ -1007,14 +1044,15 @@ fn run_worker(
                 }
                 admission.snapshot = Some(Arc::clone(&snapshot));
                 admission.changed_scope_keys.extend(changed);
-                if admission.mode != AdmissionMode::Closed {
-                    admission.mode = AdmissionMode::Running;
-                }
-                // Capture all deferred restores at this refreshed snapshot;
-                // later admission cannot replace this immutable read point.
-                let deferred = std::mem::take(&mut admission.deferred_reads);
+                admission.mode = if admission.mode.is_closed() {
+                    AdmissionMode::Closed
+                } else {
+                    AdmissionMode::Running
+                };
+                // Preserve root-operation/read order. Each read captures the
+                // snapshot after its preceding roots, before any later mutation.
+                ready_commands.extend(std::mem::take(&mut admission.deferred_commands));
                 drop(admission);
-                flush_deferred_reads(&shared, &snapshot, deferred);
                 let _ = reply.send(status);
             }
             #[cfg(test)]
@@ -1028,18 +1066,21 @@ fn run_worker(
     connection = None;
     drop(connection);
     let mut admission = shared.admission.lock().unwrap();
-    let deferred = std::mem::take(&mut admission.deferred_reads);
+    let deferred = std::mem::take(&mut admission.deferred_commands);
     for request in deferred {
         match request {
-            DeferredRead::Position(request) => send_read_error(
+            Command::Read(request) => send_read_error(
                 &admission,
                 request,
                 "spread shift service exited during maintenance".into(),
             ),
-            DeferredRead::Count(request) => send_count_error(
+            Command::Count(request) => send_count_error(
                 &admission,
                 request,
                 "spread shift service exited during maintenance".into(),
+            ),
+            _ => crate::logger::log(
+                "spread shift worker exited with unprocessed maintenance dependencies",
             ),
         }
         shared.pending.fetch_sub(1, Ordering::Release);
@@ -1237,6 +1278,140 @@ mod tests {
         );
         assert!(service.is_ready());
         assert_eq!(read(&service, scope(), saved).maintenance_epoch, 1);
+        owner.shutdown_and_join();
+    }
+
+    #[test]
+    fn lease_dependencies_preserve_root_read_count_fifo_and_completion_proofs() {
+        let temp = tempfile::tempdir().unwrap();
+        let (service, owner) = SpreadShiftService::spawn_at(temp.path().into(), None).unwrap();
+        let saved = service.set_shift(scope(), anchor(1), operation(1)).unwrap();
+        assert_eq!(read(&service, scope(), saved).row, Some(anchor(1)));
+        let retained = service
+            .shared
+            .admission
+            .lock()
+            .unwrap()
+            .snapshot
+            .clone()
+            .unwrap();
+        let lease = maintenance_at(temp.path()).unwrap();
+        let before = service.read_after(scope(), saved);
+        service
+            .rename_book_root(
+                Path::new("C:/books/book.zip"),
+                Path::new("C:/books/new.zip"),
+            )
+            .unwrap();
+        let renamed = BookScopeKey::new("C:/books/new.zip", "chapter").unwrap();
+        let after_rename = service.read_after(renamed.clone(), saved + 1);
+        let rename_count = service.count_after(saved + 1);
+        service
+            .purge_book_root(Path::new("C:/books/new.zip"))
+            .unwrap();
+        let after_delete = service.read_after(renamed.clone(), saved + 2);
+        let delete_count = service.count_after(saved + 2);
+        assert_eq!(service.watermarks().admitted, saved + 2);
+        assert_eq!(service.watermarks().completed_through, saved);
+        assert!(retained.completed_through < saved + 1);
+        for receiver in [&before, &after_rename, &after_delete] {
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+        }
+        drop(lease);
+        let before = before.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(before.row, Some(anchor(1)));
+        assert_eq!(before.completed_through, saved);
+        let renamed_reply = after_rename.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(renamed_reply.row, Some(anchor(1)));
+        assert_eq!(renamed_reply.completed_through, saved + 1);
+        let counted = rename_count.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(counted.count, 1);
+        assert_eq!(counted.completed_through, saved + 1);
+        let deleted = after_delete.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(deleted.row, None);
+        assert_eq!(deleted.completed_through, saved + 2);
+        assert!(deleted.status.is_ok());
+        let counted = delete_count.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(counted.count, 0);
+        assert_eq!(counted.completed_through, saved + 2);
+        assert_eq!(read(&service, scope(), saved + 2).row, None);
+        owner.shutdown_and_join();
+        assert!(!service.is_busy());
+    }
+
+    #[test]
+    fn normal_exit_during_real_lease_drains_accepted_root_and_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let (service, owner) = SpreadShiftService::spawn_at(temp.path().into(), None).unwrap();
+        let saved = service.set_shift(scope(), anchor(1), operation(1)).unwrap();
+        read(&service, scope(), saved);
+        service.drain_results();
+        let lease = maintenance_at(temp.path()).unwrap();
+        service
+            .purge_book_root(Path::new("C:/books/book.zip"))
+            .unwrap();
+        let pending = service.read_after(scope(), saved + 1);
+        service.close_admission();
+        assert!(
+            service
+                .purge_book_root(Path::new("C:/books/book.zip"))
+                .is_err()
+        );
+        let (done_tx, done_rx) = mpsc::channel();
+        let exit = std::thread::spawn(move || {
+            owner.shutdown_and_join();
+            done_tx.send(()).unwrap();
+        });
+        {
+            let mut admission = service.shared.admission.lock().unwrap();
+            while admission.tx.is_some() {
+                admission = service.shared.phase_changed.wait(admission).unwrap();
+            }
+        }
+        drop(lease);
+        let deleted = pending.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(deleted.row, None);
+        assert_eq!(deleted.completed_through, saved + 1);
+        assert!(deleted.status.is_ok());
+        done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        exit.join().unwrap();
+        let (reopened, owner) = SpreadShiftService::spawn_at(temp.path().into(), None).unwrap();
+        assert_eq!(read(&reopened, scope(), 0).row, None);
+        owner.shutdown_and_join();
+    }
+
+    #[test]
+    fn root_dependency_at_bootstrap_survives_closed_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let lease = maintenance_at(temp.path()).unwrap();
+        store::initialize_database_at(&temp.path().join("spread_shift.db")).unwrap();
+        let mut connection = store::open_existing(&temp.path().join("spread_shift.db"))
+            .unwrap()
+            .unwrap();
+        store::set(&mut connection, &scope().storage_key(), &anchor(1)).unwrap();
+        drop(connection);
+        let (service, owner) = SpreadShiftService::spawn_at(temp.path().into(), None).unwrap();
+        service
+            .rename_book_root(
+                Path::new("C:/books/book.zip"),
+                Path::new("C:/books/new.zip"),
+            )
+            .unwrap();
+        let renamed = BookScopeKey::new("C:/books/new.zip", "chapter").unwrap();
+        let pending = service.read_after(renamed.clone(), 1);
+        service.close_admission();
+        drop(lease);
+        let reply = pending.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(reply.row, Some(anchor(1)));
+        assert_eq!(reply.completed_through, 1);
+        assert!(reply.status.is_ok());
+        owner.shutdown_and_join();
+        let (reopened, owner) = SpreadShiftService::spawn_at(temp.path().into(), None).unwrap();
+        assert_eq!(read(&reopened, renamed, 0).row, Some(anchor(1)));
+        assert_eq!(read(&reopened, scope(), 0).row, None);
         owner.shutdown_and_join();
     }
 

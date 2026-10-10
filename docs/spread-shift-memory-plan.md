@@ -179,6 +179,9 @@ maintenance は既存操作の worker / modal lifecycle を再利用する。ser
 新 open の Restore は同じ maintenance 完了依存へ接続し、古い snapshot を完成済みと扱わない。
 lease中は新しいDB commandをworkerへ流さず、既存保守operationの依存として保持する。
 EndMaintenance/再openを待機Readの後ろへenqueueして相互待ちにしない。
+本管理の成功済root改名/削除はlease中も同一ownerの待機FIFOへ受理し、その時点でadmittedを進める。
+End/再読込の後、root操作とread/countを受付順で処理し、後続readは先行root操作の完了証明を待つ。
+正常exitは保守中/起動待ちの位相を保持して受付を閉じ、leaseの終了送信経路を残して受理済依存をdrainする。
 read-only export も開始時に先行保存を fence して一つの DB read transaction から採る。
 第二 writer の常時並走・busy retry・独自の全 DB transaction 調停は作らない。
 既存 modal 範囲外で新たな入力停止が必要になったら、通常利用への影響を利用者へ相談してから実装する。

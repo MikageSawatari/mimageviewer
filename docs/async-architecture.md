@@ -8,7 +8,7 @@
 ## 本別見開き調整の永続化基盤（§1.364 D1、2026-10-10）
 
 `SpreadShiftService`のUI handleは送信・immutable snapshot lookup・結果pollだけを行い、
-一つのworkerが`spread_shift.db`の接続とSet/Clear/読取を所有する。受付sequenceはchannel送信成功後、
+一つのworkerが`spread_shift.db`の接続とSet/Clear/読取を所有する。受付sequenceはownerのFIFOへの受理後、
 完了sequenceはtransaction終端後に公開する。通常warm読取にはDB round-tripを足さない。
 `RestoreReceipt`はcontext/scope/items/settings世代とshift/resumeのadmitted cutoffを捕捉し、
 pureな`RestoreReadDependencies`が両writerの固定した読取点の完了証明を照合して一回だけ返す。
@@ -36,7 +36,9 @@ recorderの既存終了時hash取消契約は変えない。shift UI callbackに
 まれな失敗はlog＋通知＋原本保持。retry、再作成、多段回復を追加しない。
 
 本管理のrename成功は捕捉source/target folderを専用workerのroot migrationへ、delete成功は
-捕捉rootをhard purgeへ登録する。どちらも受付sequenceに参加し、後続readはFIFO完了を待つ。
+捕捉rootをhard purgeへ登録する。lease中もroot操作を同一ownerのread/countと共有する待機FIFOへ
+受理して受付sequenceを進める。End/再読込後に順番に実行し、後続readは先行root操作の完了を待つ。
+正常exitの受付closeは保守/起動待ちの位相とleaseの終了送信経路を保持し、受理済依存をdrainする。
 root migrationは相対payload表記とdestination優先を維持する。ページ一枚の削除では親scopeを消さない。
 
 

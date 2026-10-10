@@ -27,15 +27,15 @@ fn read(service: &SpreadShiftService, root: &Path) -> Option<SpreadShiftPageRef>
 }
 
 #[test]
-fn book_manager_rename_registers_captured_root_and_keeps_relative_anchor() {
+fn book_manager_rename_during_maintenance_lease_keeps_captured_root_and_anchor() {
     let mut app = setup_app();
     let books = app.tmp.path().join("books");
     let old = books.join("Old");
     let new = books.join("New");
     std::fs::create_dir_all(&old).unwrap();
     std::fs::write(old.join("Page.JPG"), b"page").unwrap();
-    let (service, owner) =
-        SpreadShiftService::spawn_at(app.tmp.path().join("shift-data"), None).unwrap();
+    let data = app.tmp.path().join("shift-data");
+    let (service, owner) = SpreadShiftService::spawn_at(data.clone(), None).unwrap();
     let anchor = SpreadShiftPageRef::RelativePath("Page.JPG".into());
     service
         .set_shift(
@@ -55,16 +55,17 @@ fn book_manager_rename_registers_captured_root_and_keeps_relative_anchor() {
         rx,
         intent: BookOpIntent::SourceMutation,
     });
-    let release = service.pause_for_test();
+    let lease = crate::spread_shift::maintenance_at(&data).unwrap();
     let before = service.watermarks().admitted;
     app.poll_book_op_pending(&egui::Context::default());
     assert_eq!(service.watermarks().admitted, before + 1);
     let pending = service.read_after(BookScopeKey::folder(&new).unwrap(), before + 1);
     assert!(matches!(pending.try_recv(), Err(mpsc::TryRecvError::Empty)));
-    release.send(()).unwrap();
+    drop(lease);
     let adopted = pending.recv_timeout(Duration::from_secs(10)).unwrap();
     assert_eq!(adopted.row, Some(anchor.clone()));
     assert!(adopted.status.is_ok());
+    assert_eq!(adopted.completed_through, before + 1);
     assert_eq!(read(&service, &old), None);
     let scope = BookScopeKey::folder(&new).unwrap();
     let index = crate::spread_shift::ShiftIdentityIndex::prepare(
@@ -82,7 +83,7 @@ fn book_manager_rename_registers_captured_root_and_keeps_relative_anchor() {
 }
 
 #[test]
-fn book_manager_delete_purges_before_same_name_read_and_preserves_sibling() {
+fn book_manager_delete_during_maintenance_lease_purges_same_name_and_preserves_sibling() {
     let mut app = setup_app();
     let books = app.tmp.path().join("books");
     let root = books.join("Deleted");
@@ -111,7 +112,7 @@ fn book_manager_delete_purges_before_same_name_read_and_preserves_sibling() {
         rx,
         intent: BookOpIntent::Delete { path: root.clone() },
     });
-    let release = service.pause_for_test();
+    let lease = crate::spread_shift::maintenance_at(&data).unwrap();
     let before = service.watermarks().admitted;
     app.poll_book_op_pending(&egui::Context::default());
     assert_eq!(service.watermarks().admitted, before + 1);
@@ -119,9 +120,10 @@ fn book_manager_delete_purges_before_same_name_read_and_preserves_sibling() {
     std::fs::write(root.join("Page.JPG"), b"new page").unwrap();
     let pending = service.read_after(BookScopeKey::folder(&root).unwrap(), before + 1);
     assert!(matches!(pending.try_recv(), Err(mpsc::TryRecvError::Empty)));
-    release.send(()).unwrap();
+    drop(lease);
     let adopted = pending.recv_timeout(Duration::from_secs(10)).unwrap();
     assert!(adopted.status.is_ok());
+    assert_eq!(adopted.completed_through, before + 1);
     assert_eq!(adopted.row, None);
     assert_eq!(read(&service, &sibling), Some(anchor));
     owner.shutdown_and_join();
