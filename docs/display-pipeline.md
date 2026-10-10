@@ -1944,7 +1944,16 @@ resume/historyを書かない。metadata importはContextRequest workerの捕捉
 context/items世代の採用後、current scope + ON + Automaticが一致するときだけ使う。
 HUDの`… → 見開きの調整`と見開きcontrol近くの印はこのownerの状態から作り、jumpは実re-pairing anchor、
 Clearと全体記憶設定は同じ操作ownerへ戻す。構成等の資格は`PairingEditAvailability`を共通受付へ渡す。
-Remote saved/groupとG3接続はD3であり、現在のD2差分がRemoteへ同じ調整を提供したとは扱わない。
+RemoteのD3接続も、App serviceから登録されたread handleを通して保存PageRefを解決し、
+この共通Automatic resolverへoptional shiftを渡す。PCのlive indexを流用しない。
+scope/identityはresponse budgetで切り詰める前のfull本を使い、その後の応答で保存基点が
+見えなくてもMissingや本の末尾とみなさない。完全応答のgroupは同じrules・列のPC unitから
+anchor/画面順/slot/roleを派生する。bounded応答は既存のgroup生成・cap・ページアクセスを維持する。
+切詰め境界差はshiftなしのmasterにもある既存制限であり、省略ページの全寸法走査や境界group削除で
+変更しない。master証明とD3の検証結果は設計§11.10および`target/D-1364-d3-msg.txt`を参照する。
+記憶OFFのopenはshiftなし、force_single_pageとorientationは表示投影だけで保存値を変えない。
+Q3 SetSpreadの成功公開・group cache失効はshift Clearのcommit結果を同requestで受け取ってから行う。
+新しいWeb nudge/記憶UIは追加せず、G3構成consumerは未統合のまま共有C1–C12 fixtureだけを供給する。
 本記述は接続の実装箇所を記録し、完了検証・レビュー合格を主張しない。
 
 実際の配置は従来の次の手順を使う。

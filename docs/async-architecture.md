@@ -5,7 +5,7 @@
 
 ---
 
-## 本別見開き調整の永続化基盤とviewer接続（§1.364 D1/D2f、2026-10-11）
+## 本別見開き調整の永続化基盤とviewer/Remote接続（§1.364 D1–D3、2026-10-11）
 
 `SpreadShiftService`のUI handleは送信・immutable snapshot lookup・結果pollだけを行い、
 一つのworkerが`spread_shift.db`の接続とSet/Clear/読取を所有する。受付sequenceはownerのFIFOへの受理後、
@@ -73,7 +73,19 @@ root改名ではmounted/at-restの参照元・items・identity index・pending l
 新rootはそこから改めて開いたcontextが使う。旧contextの後続Set/Clearも捕捉済み旧keyへ送る。
 旧keyを再作成・解除し得る点は利用者了承済みの割り切りとし、retryや新しい待機契約を追加しない。
 本節は現在の実装差分の説明で、自動検証・独立完了レビュー合格を表すものではない。
-Remote saved resolution/group・G3共同fixtureはD3で接続する。
+Remote D3接続はApp serviceのread handleをSessionHandleへ登録する。
+ContainerEngine workerはcloneしたhandleの完了証明付きsnapshot/FIFO読取を使い、専用DB接続を増やさない。
+logical scopeとfull本のidentityで保存PageRefを解く。完全応答では同じrulesと列のPC Automatic unitに一致する。
+response budgetの切詰め時も保存基点をfull scopeで解くが、bounded group生成とcap・ページアクセスは維持する。
+shiftなしのmasterにもある切詰め境界差はD3の範囲外とし、追加の省略ページ寸法I/Oや境界group削除は行わない。
+acquireは先行shift writeとresume writeの完了・snapshot公開を同じ取得continuationへ合流し、
+UI threadで待たずreadyになってからFinishAcquireへ進む。Remoteのresume読取は既存UI request ownerから
+BookResumeWriterのReadPositionAfterへ送り、同request continuationが固定読取点の結果を所有する。
+既存SetSpreadのbase setterは同期のまま、記憶ONでQ3 Clearが必要ならrequest/sequence-ownedな
+continuationがそのClear replyを待つ。実commit成功後にだけ成功応答・generation更新・group cache失効を行い、
+元requestが終了しても送信済みwriteはserviceが所有する。memory OFF・forceSingle/orientationの投影はwriteを作らない。
+G3は未統合で、C1–C12共有fixtureの供給はG側consumerの完了を表さない。
+master比較とD3検証結果は設計§11.10および`target/D-1364-d3-msg.txt`で別に記録する。
 
 既存`BookResumeWriter`に`ReadPositionAfter`と位置snapshotを追加した。外部準備workerの位置SELECTは、
 transaction開始前にcutoffが完了し、前後の受付/完了watermarkが同一の時だけ証明可能。

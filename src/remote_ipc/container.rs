@@ -5610,7 +5610,11 @@ impl ContainerEngine {
                 .all(|item| matches!(item, crate::grid_item::GridItem::Image(_)));
         let complete_book_eligible =
             canonical_image_book && entries.len() == total && !byte_truncated;
-        let spread = self.spread_payload(
+        let shift_scope = listing
+            .sort_locked
+            .then(|| crate::book_scope::BookScopeKey::folder(&resolved.logical).ok())
+            .flatten();
+        let spread = self.spread_payload_with_read(
             request,
             resolved,
             &items,
@@ -5618,6 +5622,9 @@ impl ContainerEngine {
             None,
             canonical_image_book,
             complete_book_eligible,
+            None,
+            None,
+            shift_scope,
         )?;
         let (entry_limit, truncated) =
             container_limit_metadata(total, entries.len(), byte_truncated);
@@ -5748,7 +5755,8 @@ impl ContainerEngine {
         let mut bounded_items = Vec::new();
         let mut entries = Vec::new();
         let mut byte_truncated = false;
-        for item in items.into_iter().take(CONTAINER_ENTRY_LIMIT) {
+        let source_items = items;
+        for item in source_items.iter().take(CONTAINER_ENTRY_LIMIT) {
             let name = item.name().into_owned();
             let entry = match &item {
                 crate::grid_item::GridItem::ZipDir { dir_prefix, .. } => ContainerEntry {
@@ -5774,20 +5782,23 @@ impl ContainerEngine {
                 byte_truncated = true;
                 break;
             }
-            bounded_items.push(item);
+            bounded_items.push(item.clone());
             entries.push(entry);
         }
         let items = bounded_items;
         let complete_book_eligible =
             canonical_image_book && entries.len() == total && !byte_truncated;
-        let spread = self.spread_payload(
+        let spread = self.spread_payload_with_read(
             request,
             resolved,
             &items,
-            None,
+            Some(&source_items),
             Some((&effective_segments, &resolved.logical)),
             true,
             complete_book_eligible,
+            None,
+            None,
+            crate::book_scope::BookScopeKey::archive(&resolved.logical, &effective_segments).ok(),
         )?;
         let (entry_limit, truncated) =
             container_limit_metadata(total, entries.len(), byte_truncated);
@@ -5912,6 +5923,8 @@ impl ContainerEngine {
             true,
             complete_book_eligible,
             Some(&read),
+            Some(page_count),
+            crate::book_scope::BookScopeKey::document(&resolved.logical).ok(),
         )?;
         let (entry_limit, truncated) =
             container_limit_metadata(page_count as usize, entries.len(), byte_truncated);
@@ -5961,6 +5974,7 @@ impl ContainerEngine {
         })
     }
 
+    #[cfg(test)]
     fn spread_payload(
         &self,
         request: &ContainerRequest,
@@ -5971,6 +5985,23 @@ impl ContainerEngine {
         use_book_defaults: bool,
         complete_book_eligible: bool,
     ) -> Result<SpreadPayload, MediaError> {
+        // Legacy snapshot-only fixtures have no accepted folder listing.
+        // Production passes its accepted scope, never the startup Settings.
+        let shift_scope = if !use_book_defaults {
+            None
+        } else if let Some((segments, _)) = zip_context {
+            crate::book_scope::BookScopeKey::archive(&resolved.logical, segments).ok()
+        } else if crate::folder_tree::is_paged_document_path(&resolved.logical) {
+            crate::book_scope::BookScopeKey::document(&resolved.logical).ok()
+        } else if crate::app::physical_page_order_locked(
+            &self.settings,
+            &resolved.logical,
+            source_items.unwrap_or(items),
+        ) {
+            crate::book_scope::BookScopeKey::folder(&resolved.logical).ok()
+        } else {
+            None
+        };
         self.spread_payload_with_read(
             request,
             resolved,
@@ -5980,6 +6011,8 @@ impl ContainerEngine {
             use_book_defaults,
             complete_book_eligible,
             None,
+            None,
+            shift_scope,
         )
     }
 
@@ -5994,6 +6027,8 @@ impl ContainerEngine {
         use_book_defaults: bool,
         complete_book_eligible: bool,
         read: Option<&crate::pdf_loader::ReadTarget>,
+        document_page_count: Option<u32>,
+        shift_scope: Option<crate::book_scope::BookScopeKey>,
     ) -> Result<SpreadPayload, MediaError> {
         let reading_settings = self
             .reading_settings
@@ -6075,8 +6110,16 @@ impl ContainerEngine {
             default_direction,
             request.force_single_page,
         );
+        // ZIP has always reported media counts for the bounded response. Its
+        // complete manifest is retained only for stable saved-shift identity;
+        // folders retain their existing full-list media counts.
+        let media_items = if zip_context.is_some() {
+            items
+        } else {
+            source_items
+        };
         let (image_count, video_count, other_count) =
-            crate::ui_fullscreen::seek_overlay_media_counts(source_items);
+            crate::ui_fullscreen::seek_overlay_media_counts(media_items);
         // Single は横長判定を一切見ない。**見ないものを作らない** (PDF は寸法の取得に
         // worker 往復が要るので、開くたびに払うと無駄になる)。
         let landscape = if effective == RemoteSpreadMode::Single {
@@ -6097,7 +6140,16 @@ impl ContainerEngine {
                 after_cover: reading_settings.page_after_cover_alone_enabled,
                 last: reading_settings.last_page_alone_enabled,
             });
-        let index_groups = crate::ui_fullscreen::build_remote_spread_page_groups_with_page_alone(
+        let shift_anchor = if reading_settings.remember_spread_shift_per_book {
+            shift_scope
+                .as_ref()
+                .map(|scope| self.saved_shift_anchor(scope, source_items, document_page_count))
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
+        let index_groups = crate::ui_fullscreen::build_remote_spread_page_groups_with_shift(
             items,
             core_spread_mode(effective),
             &landscape,
@@ -6105,6 +6157,7 @@ impl ContainerEngine {
             singleton_placement_enabled,
             page_alone_enabled,
             complete_book_eligible,
+            shift_anchor,
         );
         let container_address = page_identity_from_resolved(resolved, &request.address.subresource);
         let groups = index_groups
@@ -6178,6 +6231,80 @@ impl ContainerEngine {
             other_count,
             groups,
         })
+    }
+
+    /// Resolve against the full accepted scope, before response-budget slicing.
+    /// No raw page/ordinal fallback, DB connection, or PC session state is used.
+    fn saved_shift_anchor(
+        &self,
+        scope: &crate::book_scope::BookScopeKey,
+        source_items: &[crate::grid_item::GridItem],
+        document_page_count: Option<u32>,
+    ) -> Result<Option<usize>, MediaError> {
+        use crate::spread_shift::{ShiftIdentityIndex, SpreadShiftPageRef};
+        let service = self
+            .session
+            .as_ref()
+            .and_then(|session| session.spread_shift_service());
+        let Some(service) = service else {
+            // Snapshot-only engines exist only in unit fixtures. Production
+            // always installs the App service before Remote acquisition.
+            #[cfg(test)]
+            if self.session.is_none() {
+                return Ok(None);
+            }
+            return Err(media_error(
+                MediaErrorCode::Internal,
+                "見開き調整の読取サービスを利用できません",
+            ));
+        };
+        let cutoff = service.watermarks().admitted;
+        let read = service
+            .read_after(scope.clone(), cutoff)
+            .recv()
+            .map_err(|_| {
+                media_error(MediaErrorCode::Internal, "見開き調整を読み取れませんでした")
+            })?;
+        Self::validate_saved_shift_read(&read, cutoff, service.maintenance_epoch_for(scope))?;
+        let Some(reference) = read.row else {
+            return Ok(None);
+        };
+        if let (Some(count), SpreadShiftPageRef::DocumentPageIdentity(page)) =
+            (document_page_count, &reference)
+        {
+            // The full document manifest is its already-known physical count.
+            // Do not enumerate/decode omitted PDF pages to resolve an identity.
+            return Ok((*page < count).then_some(*page as usize));
+        }
+        let identities = source_items.iter().enumerate().filter_map(|(idx, item)| {
+            crate::book_resume_db::PageIdentity::for_item(item, Some(&scope.logical_root))
+                .map(|identity| (identity, idx))
+        });
+        let index = ShiftIdentityIndex::prepare(scope, identities)
+            .map_err(|error| media_error(MediaErrorCode::Internal, error))?;
+        Ok(index.resolve(&reference))
+    }
+
+    /// Row presence is meaningful only after the read proof passes. An
+    /// expired empty reply must never be accepted as "no saved adjustment".
+    fn validate_saved_shift_read(
+        read: &crate::spread_shift::ShiftReadReply,
+        cutoff: u64,
+        current_epoch: u64,
+    ) -> Result<(), MediaError> {
+        read.status
+            .as_ref()
+            .map_err(|error| media_error(MediaErrorCode::Internal, error.clone()))?;
+        if read.cutoff != cutoff
+            || read.completed_through < cutoff
+            || read.maintenance_epoch != current_epoch
+        {
+            return Err(media_error(
+                MediaErrorCode::Internal,
+                "見開き調整の読取結果が失効しました",
+            ));
+        }
+        Ok(())
     }
 
     fn stored_spread_state(
@@ -8978,6 +9105,8 @@ fn thumbnail_error(code: ThumbnailErrorCode, message: impl Into<String>) -> Thum
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    include!("spread_shift_container_tests.rs");
 
     pub(super) fn initialize_remote_page_edit_databases() {
         drop(crate::adjustment_db::AdjustmentDb::open().unwrap());

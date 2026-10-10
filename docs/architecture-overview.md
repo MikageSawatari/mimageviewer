@@ -439,7 +439,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `comic.db` | Ctrl+T テキスト注釈のページ単位 JSON。吹き出し・テキスト・ウィンドウ・スタンプ配置の正本で、ユーザー画像スタンプは配置先の注釈に `Embedded` として埋め込む | `comic_db.rs` + `ui_text.rs` + `sidecar.rs` |
 | `comic_user_stamps.db` | Ctrl+T スタンプピッカーのユーザー画像履歴。配置時の長辺 1024px 上限 PNG を再利用用 MRU として保持する。履歴から選んでも配置先には `Embedded` をコピーするため、履歴削除は既存注釈に影響しない | `comic_user_stamps.rs` + `ui_text.rs` |
 | `spread.db` | フォルダ別表示モード (ページ構成、連結方式、綴じ方向、末尾表紙補助、見開き端の単ページ配置) | `spread_db.rs` |
-| `spread_shift.db`（§1.364 D1/D2、未リリース） | 論理本scopeごとの相対PageRef。KeepDriveのroot＋実効ZIP prefix、一冊一行。schema v1。新規storeのためmigrationなし、不正schema/JSONは原本を保って書込停止。既存spread設定・resumeとは独立 | `book_scope.rs`、`spread_shift/{model,service,store}.rs`、`app/spread_shift_owner.rs` |
+| `spread_shift.db`（§1.364 D1–D3、未リリース） | 論理本scopeごとの相対PageRef。KeepDriveのroot＋実効ZIP prefix、一冊一行。schema v1。新規storeのためmigrationなし、不正schema/JSONは原本を保って書込停止。既存spread設定・resumeとは独立 | `book_scope.rs`、`spread_shift/{model,service,store}.rs`、`app/spread_shift_owner.rs` |
 | `book_resume.db` | コンテナpathとraw items indexで位置を復元。記録時のHUD読み順ordinal/totalをnullable列に保存し、通常Folder/ZIP/PDF一覧の下端メーターに常に左から右へ表示。旧2列DBへのALTERと一覧全行読込は既存writerで実行。App共通メモリmapを記録受付時にも更新し、描画はmap参照のみ。動画/音声の同じ帯は既存video_resume_positionsと取得済みvideo_metaを読み、別の位置map/DB列は作らない。Remoteは補助列NULL (IPC不変) | `book_resume_db.rs`, `app/book_resume_meter.rs`, [設計・割り切り](book-resume-meter-plan.md) |
 | `reading_history.db` | ユーザー操作で開いた画像フォルダ / ZIP / PDF / 変換アーカイブと動画・音声ファイルの MRU。既存 kind 文字列を維持し、`video` / `audio` と専用の `media_position_ms` / `media_duration_ms` を追加する。未知 kind は行ごと読み飛ばす。保持件数は 1..=1000 | `reading_history_db.rs` + `App::record_reading_history` |
 | `folder_thumb_pins.db` | 親コンテナ (Folder/ZipFile/PdfFile/ConvertibleArchive) の代表サムネ手動ピン。container_key 主キー (= normalize_keep_drive 済みパス) で 1 行 1 コンテナ、source は kind + container 相対 rel + (zipentry の) entry / (pdfpage の) page。`apply_folder_thumb_pin` と変換アーカイブの `archivethumb:*#pin:*` が cache key suffix `#pin:{source_id}` で identity を表現し、cascade 時は途中コンテナを含む経路 hash を source_id に加える | `folder_thumb_pins.rs` |
@@ -523,8 +523,23 @@ main一覧の旧path再読込・F12の旧items保持はmaster `02079f95d`の挙�
 D1の単一FIFOが受理済みshift write/read/root操作を整列する。旧contextのSet/Clearが旧keyを
 再作成・解除し得る点は利用者了承済みの割り切りで、新rowへ書き換えない。
 snapshotのanchor remapはfullscreenの有無によらずitems交換で行う。最新決定は設計§11.6。
-OFFではそのshift読取結果を使わない。D2の自動検証・独立完了レビュー・
-利用者確認はこの記述では完了扱いにしない。Remote saved/groupとG3共同fixtureはD3の範囲。
+OFFではそのshift読取結果を使わない。
+
+D3のRemoteはApp所有serviceのread handleを`SessionHandle`へ登録し、ContainerEngine workerがcloneして使う。
+shift専用のDB reader/writerは追加せず、保存済みlogical scope/relative PageRefをfull本のidentityへ解決し、
+共通Automatic builderのoptional shiftへ渡す。完全応答では同じrulesと列のPC unitに一致する。
+応答budgetで切り詰めてもfull-scopeの基点解決は維持するが、bounded group生成は既存の契約を保つ。
+切詰め境界のgroup差はshiftなしのmasterでも存在し、既存cap・ページアクセスを変えず、
+省略ページの全寸法走査や境界group削除を追加しない。Webは既存PageGroupをそのまま描く。
+PCのviewer-local live調整を借用しない。記憶OFF・forceSingle・orientationも保存行を書き換えない。
+acquireは受理済みshift/resumeの完了とsnapshot公開を既存取得continuationで待つ。
+SetSpreadのbase setterは同期のまま、Q3のshift Clearだけをsequence-ownedな同request continuationで待ち、
+commit成功後にwrite success/generation/group cacheを公開する。UI threadでDB完了をblockしない。
+Remoteのnudge/記憶設定UIは増やさない。wire/address/slot/roleの契約を変えないためIPC v69・Web asset tokenを維持する。
+変換書庫のRemote baseは元書庫のlogical keyを保持し、PCのcache側baseへの移行を行わない。
+この既存差と切詰め境界のmaster証明・D3検証記録は設計§11.10と`target/D-1364-d3-msg.txt`を参照する。
+G3は未統合で、C1–C12共有fixtureの供給だけを構成consumerの統合・検収証拠としない。
+本記述は実装の所有境界を示し、自動検証・独立完了レビュー・利用者確認の完了を主張しない。
 
 ### フォルダ側サイドカー (`mimageviewer.dat`)
 

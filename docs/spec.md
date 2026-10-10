@@ -864,7 +864,7 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
 
 ### 4.2 表示仕様
 
-- 本別見開き調整 (§1.364 D2): `Ctrl+←/→` の1ページずらしを、既定ONの
+- 本別見開き調整 (§1.364 D1–D3): `Ctrl+←/→` の1ページずらしを、既定ONの
   `remember_spread_shift_per_book`に従って`spread_shift.db`へ非同期保存する。
   保存するのはキー押下位置や符号offsetではなく実際のre-pairing anchorのPageRef。
   本はlogical root + 実効ZIP level prefixで区別し、items/nav変更後もidentityから解決する。
@@ -904,7 +904,23 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
   Composed/Unreadable/ExtractedResultでは調整groupを無効にし、Single/Splitの従来移動は保持する。
   構成ありのmode-only変更は休眠保存値をClearせず、global boolは環境設定から変更できる。
   PDF/EPUBは既存個別編集と同じ物理ページidentityを使う。内部再編・再変換/reflowで
-  内容がずれる制限をマニュアルに明記する。Remote saved/group統合はD3で、D2の提供範囲ではない。
+  内容がずれる制限をマニュアルに明記する。
+  RemoteはApp serviceからSessionHandleへ登録したclone可能なread handleを使い、PCのlive調整を読まない。
+  Bookのlogical scopeとfull本のidentityで保存基点を解き、共通Automatic builderへoptional shiftを渡す。
+  応答budgetでページ列を切り詰める前に解決し、基点が応答外にあるだけでMissingとみなさない。
+  完全応答では同じrules・列のPC unitとgroup/anchor/相方/slot/roleを共有する。bounded応答は
+  既存group生成・cap・ページアクセスを維持する。切詰め境界差はshiftなしのmasterでも確認した
+  既存制限であり、省略ページの全寸法走査や境界group削除を追加しない。
+  記憶OFFの新規openには適用せず、force_single_page/orientationはread-onlyな表示投影で保存値を変えない。
+  acquireは先行shift/resume完了とsnapshot公開を待ってFinishAcquireへ進む。
+  Remoteの既存SetSpreadは同期base setterを維持し、Q3のClearが必要なら同requestのsequence-owned
+  continuationでcommit結果を待つ。成功応答・remote_state_generation更新・group cache失効はClear成功後だけ。
+  新しいRemote nudge/記憶設定UIは追加しない。wire/address/slot/roleの契約を変えないためIPC v69と
+  Web asset tokenを維持する。
+  現行Remoteの変換書庫base設定は元書庫のlogical keyを保持する。PCのcache側base設定とは異なり、
+  この既存境界をD3で変更・移行しない。master証明とD3検証記録は設計§11.10および
+  `target/D-1364-d3-msg.txt`を参照する。
+  G3の構成統合は未実施。C1–C12の共有fixture供給はG側consumerの統合・検収を意味しない。
 
 - 静止画 / ZIP 内画像 / PDF ページのフルスクリーンでは、タッチの中央矩形をタップすると
   上部バー（閉じる × を含む）と下部シークバーを表示 / 非表示にする。表示は時間切れにせず、

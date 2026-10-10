@@ -5,6 +5,9 @@ mod model;
 mod service;
 mod store;
 
+#[cfg(test)]
+pub(crate) mod contract_fixtures;
+
 pub(crate) use model::*;
 pub(crate) use service::{
     SpreadShiftMaintenanceLease, SpreadShiftProcessOwner, SpreadShiftService, maintenance_at,

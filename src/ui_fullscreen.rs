@@ -15303,6 +15303,29 @@ pub(crate) fn build_remote_spread_page_groups_with_page_alone(
     page_alone: crate::settings::PageAloneSettings,
     complete_book_eligible: bool,
 ) -> Vec<RemotePageGroupSpec> {
+    build_remote_spread_page_groups_with_shift(
+        items,
+        spread_mode,
+        is_landscape,
+        final_cover_enabled,
+        singleton_placement_enabled,
+        page_alone,
+        complete_book_eligible,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_remote_spread_page_groups_with_shift(
+    items: &[GridItem],
+    spread_mode: SpreadMode,
+    is_landscape: &[bool],
+    final_cover_enabled: bool,
+    singleton_placement_enabled: impl Into<crate::settings::SingletonSpreadEndpointSettings>,
+    page_alone: crate::settings::PageAloneSettings,
+    complete_book_eligible: bool,
+    shift_anchor_idx: Option<usize>,
+) -> Vec<RemotePageGroupSpec> {
     let singleton_placement_enabled = singleton_placement_enabled.into();
     let visible = (0..items.len()).collect::<Vec<_>>();
     let nav = build_image_reading_indices(items, &visible);
@@ -15330,7 +15353,7 @@ pub(crate) fn build_remote_spread_page_groups_with_page_alone(
     let units = build_spread_display_units_with_page_alone(
         &nav,
         spread_mode,
-        None,
+        shift_anchor_idx,
         if complete_book_eligible {
             page_alone
         } else {
@@ -17195,7 +17218,7 @@ impl App {
     /// navigation. The shared pure resolver keeps the unit's canonical anchor for Remote;
     /// local display rebinds occurrences to the accepted fullscreen anchor without changing
     /// the Navigation projection.
-    fn spread_display_composition_for_anchor(
+    pub(crate) fn spread_display_composition_for_anchor(
         &mut self,
         anchor_idx: usize,
     ) -> SpreadDisplayComposition {

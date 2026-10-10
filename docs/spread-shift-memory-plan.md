@@ -503,7 +503,9 @@ core の worker に shift snapshot の登録/取得を加え、DB準備は背景
 記憶 ON の Book open は PC 保存 shift を解き、OFF なら適用しない。
 force_single_page / 端末 orientation は表示投影だけで、保存行を clear/save しない。
 応答 budget 切詰めより前の full 本 scope で anchor を解く。途中応答に anchor がないことを
-保存値 Missing や本の末尾と誤判定しない。group の相方・slot・role は同じ accepted layout から生成する。
+保存値 Missing や本の末尾と誤判定しない。完全応答のgroupの相方・slot・roleは同じaccepted layoutから生成する。
+budgetによる途中応答のgroup生成はreleased Remoteの既存制限を保持する（2026-10-11 coordinator決定、
+master比較の証明と受入範囲は§11.10）。本項でbudget/cap/ページアクセスや未掲載ページの寸法取得を変更しない。
 resume は従来の RecordReadingProgress と再開規則、shift は別の保存正本を読み、履歴設定に依存しない。
 
 現行 Remote に一ページ nudge の機能はない。**本項では新規 Remote nudge editor / memory toggle UI を追加しない**。
@@ -1056,6 +1058,54 @@ normal-profile coreと両companionを構築し、VCRT/PE検査はruntime=4・pe=
 検証結果は`target/D-1364-d2f-*.log`と`target/D-1364-d2f-msg.txt`へ記録する。
 本記録は独立レビュー合格、製品起動や実機受入を表さない。
 
+### 11.10 D3 Remote接続・既存制限の受入範囲（2026-10-11）
+
+当初はbudget途中のgroup差で停止したが、coordinatorはmasterでの比較を指示し、既存制限なら
+§1.364の範囲外としてbudget/cap/ページアクセスを維持する方針を採択した。
+master `dd511eea5cd397bf922328afc6be1c3b2d169852`からRemote builderを直接抽出し、共通の6関数が
+masterとsource同一であることを照合した非対話テストで、**ずらしなし**でも次の差を確認した。
+7ページ、LTR表紙、表紙直後単独ONの完全本先頭は`[0], [1], [2,3]`、4ページ応答は
+`[0], [1,2], [3]`。通常LTRの完全4ページは`[0,1], [2,3]`、3ページ応答は`[0,1], [2]`。
+Webはentries外の相方を採用しない。証明は`target/D-1364-d3-master-source-proof.log`と
+`target/D-1364-d3-master-budget.log`。製品起動やmaster全体buildの証拠ではない。
+
+この差は§1.364で導入したものではない。ignored受入witnessはreleased制限を明示assertする
+active回帰へ置換し、保存基点が応答外でも同じbounded結果、応答内のずらしでも全掲載ページを
+一回ずつ保つことを検証する。完全応答のpartner/anchor/slot/role parityは別の回帰で維持する。
+保存基点自体はfull本scopeで解決し、応答外をMissingと判定せず保存rowを保持する。
+未掲載sourceの寸法取得追加やページ省略など、予算制限の修正は行わない。
+ZIPの全件manifestは保存identity解決へ渡すが、既存の媒体件数は返却範囲で数える。
+folderの全listing件数は従来どおり保ち、identity解決用sourceで応答の件数契約を変えない。
+既存制限の別backlog提案は`target/D-1364-d3-msg.txt`へ記録し、coordinatorが登録する。
+
+変換書庫のPC既存base spreadはcache側、Remoteは既存logical元書庫keyのまま維持する。
+今回の保存shiftのlogical元書庫scopeと混同せず、移行・redirect・既存base設定の変更を行わない。
+folderのshift資格は受入済みlistingの`sort_locked`から捕捉し、Engineの起動時Settingsに戻らない。
+documentのfull physical page countは既存manifestとして使い、identity解決に省略ページの寸法は不要。
+service readのcutoff/completed-through/book epoch/statusはrow有無より先に照合し、expired emptyも
+有効な不在とは扱わない。別scope保守は無関係なreadを失効させない。
+
+Q3のClearは既存base setter成功後に受理し、同じclaimed requestが実Clear結果を一回消費してから
+成功応答と既存generation/cache失効を公開する。OFFは休眠rowを保持し、base失敗はClearを受理しない。
+待機中は既存Remote tickの16ms repaintでApp frame pollへ合流する。終了はreply ownerを退役し、
+受理済みClearのservice所有を取り消さない。acquire/resumeの先行write fenceは同じcontinuationで守る。
+rare failureは既定のlog/通知/既存失敗応答にとどめ、retryや回復待ちの状態機構は追加しない。
+
+IPC payload・address・slot/roleの意味・request/response enumを変えず、既存Webは返された組を描くため、
+protocol v69とWeb asset tokenを維持する。core/Remote/EPUB workerは同sourceの確認buildへそろえる。
+fixtureはE側のC1–C12契約を供給し、G editor/store/mode-only/revision/cacheの統合検収を表さない。
+最終gate・確認buildの証拠は`target/D-1364-d3-msg.txt`へ記録する。独立レビュー・製品起動は別工程。
+
+最終ソースの集中shift回帰125件（D3 14件・joint fixture 8件を含む）は全成功。
+`MSBUILDDISABLENODEREUSE=1`で`test-full.ps1 -SuppressCrashDialogs`も成功し、
+本体libは11,897成功・失敗0・既存ignore 55、UI snapshot 155件、IPC 67件、Remote 140件、
+vendor egui 25件・egui-wgpu 11件・eframe 18件が成功した。fmt/glyph/diff checkも成功。
+ZIPの件数回帰修正後の全gateを正本とし、その間のRust source hash不変を照合した。
+release core/Remote/EPUB workerは既存で、欠落前提buildは不要だった。
+当該worktreeのcore不在を再確認後、`build-dev.ps1 -PreserveRuntime`でnormal-profileの
+3実行ファイルを構築し、VCRT/PE検査`runtime=4 / pe=3`も成功。installed/tray coreは停止せず、
+製品起動・独立レビュー・G統合受入・実機受入は行っていない。
+
 ## 12. 決定済み事項（番号固定）
 
 2026-10-10の利用者回答で全推奨案を採択。Q2はG Q6の既決定、Q5はR2 coordinator採択を
@@ -1069,4 +1119,5 @@ normal-profile coreと両companionを構築し、VCRT/PE検査はruntime=4・pe=
 | Q4 まれな失敗 | §4.4の新しい既定方針を確認。通常再入場の先行保存/resume整列と正常終了drainは §6.1 の構造保証として独立に必須 | 2026-10-10 |
 | Q5 保存先・writer | R2のshift専用 `spread_shift.db` と単一workerを採択。既存spread.db writerを移管せず、既存spread setterを非同期化しない | 2026-10-10（R2採択・再確認） |
 
-**利用者への未決質問はない。** 独立設計レビューと構造合意は §11.2 の工程として別に行う。
+**Q1–Q5について利用者への未決質問はない。** D3で判明した前提差は§11.10を参照。
+独立設計レビューと構造合意は §11.2 の工程として別に行う。

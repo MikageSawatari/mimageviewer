@@ -18508,6 +18508,9 @@ impl App {
         service: crate::spread_shift::SpreadShiftService,
         owner: Arc<std::sync::Mutex<Option<crate::spread_shift::SpreadShiftProcessOwner>>>,
     ) {
+        if let Some(handle) = self.remote_session_handle() {
+            handle.install_spread_shift_service(Some(service.clone()));
+        }
         self.spread_shift_service = Some(service);
         self.spread_shift_process_owner = Some(owner);
     }
@@ -18521,6 +18524,9 @@ impl App {
         let errors = service.drain_errors();
         let _changed_scopes = service.drain_changed_scope_keys();
         for result in results {
+            if self.complete_remote_shift_reset(&result) {
+                continue;
+            }
             let accepted = if result.operation.context_id == self.spread_shift_context_id() {
                 self.spread_shift
                     .accept_write_reply(&result, self.settings.remember_spread_shift_per_book)

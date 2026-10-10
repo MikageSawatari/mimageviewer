@@ -1,6 +1,6 @@
 # 仮想フォルダ (ZIP / RAR / PDF / EPUB) 処理
 
-## 本別見開き調整のscope/転送基盤（§1.364 D1、未リリース）
+## 本別見開き調整のscope/転送とRemote（§1.364 D1–D3、未リリース）
 
 永続scopeは`book_scope::BookScopeKey`。元書庫/PDF/EPUBの論理rootをKeepDrive正規化し、
 ZIPはcollapse後に受け入れたraw実効prefixをconstructorへ渡す。root/親章へのfallbackはしない。
@@ -16,7 +16,16 @@ case/slash keyを使う。ページ改名の元表記やimportのbackslash表記
 familyのdelete/insertは既存item SAVEPOINTとbatch commitに参加する。
 外部folder移動は従来どおり内容ID非対応で、明示metadata転送を使う。
 書庫/PDF/EPUBは内容IDcopy/probeのlogical slash-familyでnested-onlyの調整も搬送する。
-D1では既存viewerのshift表示/操作を変えず、Restore/一覧再解決/F12/HUDはD2、RemoteはD3で接続する。
+D1のstore基盤にD2のRestore/一覧再解決/F12/HUD、D3のRemote保存基点解決を接続する。
+Remoteのlogical scopeは元書庫とcollapse後の実効prefixを使う。
+現行Remoteのbase spreadも元書庫のlogical keyを保持する。PCのphysical cache側baseとは異なり、
+この既存境界はD3で変更・移行しない。
+App serviceのread handleで先行保存完了を満たしたrefを読み、full本のidentity/navへ解いてから
+応答budgetで切り詰める。応答外のanchorをMissingとみなさず、共通Automatic builderへ渡す。
+完全応答では同じrulesと列のPC unitに一致する。bounded応答は既存group生成・cap・ページアクセスを保ち、
+shiftなしのmasterにもある切詰め境界差を変更しない。省略ページの全寸法走査や境界group削除は追加しない。
+master証明とD3検証記録は設計§11.10および`target/D-1364-d3-msg.txt`を参照する。
+OFFのopenとforceSingle/orientationの投影は保存行を変えない。G3構成consumerの統合は別工程。
 2026-10-11のD2c決定では、root改名の永続移行だけを維持し、開いているcontextの論理/物理参照元・
 items・shift scopeは旧rootを保つ。新rootへのlive追従・自動reopen・同本pending-open直列化は行わない。
 ページ改名の相対参照移行は維持する。最新契約は[spread-shift-memory-plan.md §11.6](spread-shift-memory-plan.md#116-d2c-root追従と同本pending-open直列化の撤去2026-10-11利用者決定)。
