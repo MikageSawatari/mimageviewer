@@ -2,6 +2,8 @@
 use super::presentation_transition::{DetachedHostLease, DetachedTargetLease, PresentationRequest};
 use super::*;
 
+#[path = "tests/thumbnail_request_lifecycle.rs"]
+mod thumbnail_request_lifecycle;
 impl App {
     pub(crate) fn folder_order_refresh_pending_for_test(&self) -> bool {
         self.folder_pane_open_pending
@@ -694,9 +696,13 @@ fn latest_seek_during_raw_development_supersedes_waiting_pages_and_promotes_raw(
     drop(blocker_permit);
 }
 
-fn raw_half_followup_for_prune(idx: usize) -> crate::thumb_loader::LoadRequest {
+fn raw_half_followup_for_prune(
+    idx: usize,
+    request_id: crate::thumb_loader::ThumbnailRequestId,
+) -> crate::thumb_loader::LoadRequest {
     crate::thumb_loader::LoadRequest {
         idx,
+        request_id,
         input_seq: 42,
         items_gen: 7,
         raw_source: crate::thumb_loader::LoadRequestSource::RawHalfDeveloped {
@@ -717,16 +723,33 @@ fn keep_projection_prunes_queued_raw_followups_and_counts_both_completions() {
         .collect();
     app.thumbnails = vec![ThumbnailState::Pending; 2];
     app.keep_set = [0, 1].into_iter().collect();
+    app.items_generation = 7;
+    let first_id = app
+        .requested
+        .begin(
+            0,
+            7,
+            crate::app::thumbnail_requests::ThumbnailRequestKind::Normal,
+            None,
+        )
+        .unwrap();
+    let second_id = app
+        .requested
+        .begin(
+            1,
+            7,
+            crate::app::thumbnail_requests::ThumbnailRequestKind::Normal,
+            None,
+        )
+        .unwrap();
     app.reload_queue = Some(Arc::new((
-        Mutex::new(vec![raw_half_followup_for_prune(0)]),
+        Mutex::new(vec![raw_half_followup_for_prune(0, first_id)]),
         Condvar::new(),
     )));
     app.heavy_io_queue = Some(Arc::new((
-        Mutex::new(vec![raw_half_followup_for_prune(1)]),
+        Mutex::new(vec![raw_half_followup_for_prune(1, second_id)]),
         Condvar::new(),
     )));
-    app.requested.insert(0, false);
-    app.requested.insert(1, false);
 
     app.install_thumbnail_keep_projection(thumbnail_keep_projection(2, [], [], None, [], []), true);
     assert_eq!(app.cache_gen_done.load(Ordering::Relaxed), 2);
@@ -734,6 +757,10 @@ fn keep_projection_prunes_queued_raw_followups_and_counts_both_completions() {
     let mut canceled = [app.rx.try_recv().unwrap(), app.rx.try_recv().unwrap()].map(|msg| {
         assert!(msg.is_canceled() && !msg.is_finalized());
         assert_eq!((msg.input_seq, msg.items_gen), (42, 7));
+        assert_eq!(
+            msg.request_id,
+            if msg.idx == 0 { first_id } else { second_id }
+        );
         msg.idx
     });
     canceled.sort();
@@ -749,18 +776,28 @@ fn grid_queue_prune_counts_queued_raw_followup() {
     app.thumbnails = vec![ThumbnailState::Pending; 2];
     app.image_metas = vec![None; 2];
     app.visible_indices = vec![0];
+    app.items_generation = 7;
+    let request_id = app
+        .requested
+        .begin(
+            1,
+            7,
+            crate::app::thumbnail_requests::ThumbnailRequestKind::Normal,
+            None,
+        )
+        .unwrap();
     app.reload_queue = Some(Arc::new((
-        Mutex::new(vec![raw_half_followup_for_prune(1)]),
+        Mutex::new(vec![raw_half_followup_for_prune(1, request_id)]),
         Condvar::new(),
     )));
     app.heavy_io_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
-    app.requested.insert(1, false);
 
     app.update_keep_range_and_requests(&egui::Context::default(), std::time::Instant::now());
     assert_eq!(app.cache_gen_done.load(Ordering::Relaxed), 1);
     assert!(!app.requested.contains_key(&1));
     let msg = app.rx.try_recv().unwrap();
     assert_eq!((msg.idx, msg.input_seq, msg.items_gen), (1, 42, 7));
+    assert_eq!(msg.request_id, request_id);
     assert!(msg.is_canceled() && !msg.is_finalized());
 }
 
@@ -17774,13 +17811,13 @@ mod phase_c_key_tests {
         app.keep_range = (0, 1);
         app.requested.insert(0, false);
         let ctx = egui::Context::default();
-        app.tx.send(seed).unwrap();
+        send_thumbnail_for_test!(app, seed).unwrap();
         app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
         let first_texture = match &app.thumbnails[0] {
             ThumbnailState::Loaded { tex, .. } => tex.id(),
             _ => panic!("seed should be visible"),
         };
-        app.tx.send(validated).unwrap();
+        send_thumbnail_for_test!(app, validated).unwrap();
         app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
         let validated_texture = match &app.thumbnails[0] {
             ThumbnailState::Loaded { tex, .. } => tex.id(),
@@ -18059,6 +18096,7 @@ mod phase_c_key_tests {
         app.keep_set = (0..9).collect();
         app.keep_range = (0, 9);
         app.requested.insert(8, false);
+        let items_generation = app.items_generation;
         let message = |idx, image, origin| {
             crate::thumb_loader::ThumbMsg::from_legacy_parts(
                 idx,
@@ -18071,36 +18109,42 @@ mod phase_c_key_tests {
                 false,
                 false,
                 0,
-                app.items_generation,
+                items_generation,
             )
         };
         for idx in 0..8 {
-            app.tx
-                .send(message(
+            send_thumbnail_for_test!(
+                app,
+                message(
                     idx,
                     Some(egui::ColorImage::filled([2, 2], egui::Color32::LIGHT_BLUE)),
                     crate::thumb_loader::ThumbLoadOrigin::FinalCache,
-                ))
-                .unwrap();
+                )
+            )
+            .unwrap();
         }
-        app.tx
-            .send(message(
+        send_thumbnail_for_test!(
+            app,
+            message(
                 8,
                 Some(egui::ColorImage::filled([2, 2], egui::Color32::RED)),
                 crate::thumb_loader::ThumbLoadOrigin::DriveListChildSeed,
-            ))
-            .unwrap();
-        app.tx
-            .send(message(
+            )
+        )
+        .unwrap();
+        send_thumbnail_for_test!(
+            app,
+            message(
                 8,
                 None,
                 crate::thumb_loader::ThumbLoadOrigin::DriveListChildMiss,
-            ))
-            .unwrap();
+            )
+        )
+        .unwrap();
         let ctx = egui::Context::default();
         app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
         assert!(matches!(app.thumbnails[8], ThumbnailState::Failed));
-        assert!(app.texture_backlog.iter().all(|msg| msg.idx != 8));
+        assert!(app.requested.images().all(|msg| msg.idx != 8));
         app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
         assert!(matches!(app.thumbnails[8], ThumbnailState::Failed));
     }
@@ -18533,13 +18577,13 @@ mod phase_c_key_tests {
             app.requested.insert(0, false);
             let ctx = egui::Context::default();
             let mut messages = messages.into_iter();
-            app.tx.send(messages.next().unwrap()).unwrap();
+            send_thumbnail_for_test!(app, messages.next().unwrap()).unwrap();
             app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
             let seed_tex = match &app.thumbnails[0] {
                 ThumbnailState::Loaded { tex, .. } => tex.id(),
                 _ => panic!("old-generation seed should appear provisionally"),
             };
-            app.tx.send(messages.next().unwrap()).unwrap();
+            send_thumbnail_for_test!(app, messages.next().unwrap()).unwrap();
             app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
             let current_tex = match &app.thumbnails[0] {
                 ThumbnailState::Loaded { tex, origin, .. } => {
@@ -36218,8 +36262,9 @@ mod favorite_adjustment_defaults_tests {
         let cur_gen = app.items_generation;
         let ctx = egui::Context::default();
         let color = egui::ColorImage::from_rgba_unmultiplied([2, 2], &[255u8; 16]);
-        app.tx
-            .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+        send_thumbnail_for_test!(
+            app,
+            crate::thumb_loader::ThumbMsg::from_legacy_parts(
                 0,
                 Some(color),
                 crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
@@ -36231,8 +36276,9 @@ mod favorite_adjustment_defaults_tests {
                 false,
                 0,
                 cur_gen,
-            ))
-            .unwrap();
+            )
+        )
+        .unwrap();
 
         app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
 
@@ -36241,7 +36287,7 @@ mod favorite_adjustment_defaults_tests {
             "a ready thumbnail must upload immediately; viewport teardown has no caller-side defer window"
         );
         assert!(
-            app.texture_backlog.is_empty(),
+            (app.requested.images_len() == 0),
             "viewport lifecycle must not park a ready texture delta"
         );
     }
@@ -36264,8 +36310,9 @@ mod favorite_adjustment_defaults_tests {
         app.last_scroll_change_time = std::time::Instant::now() - std::time::Duration::from_secs(2);
         app.last_input_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
         app.display_px_shared.store(1024, Ordering::Relaxed);
-        app.tx
-            .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+        send_thumbnail_for_test!(
+            app,
+            crate::thumb_loader::ThumbMsg::from_legacy_parts(
                 0,
                 Some(egui::ColorImage::filled(
                     [64, 64],
@@ -36280,8 +36327,9 @@ mod favorite_adjustment_defaults_tests {
                 false,
                 0,
                 app.items_generation,
-            ))
-            .unwrap();
+            )
+        )
+        .unwrap();
 
         app.poll_thumbnails(&egui::Context::default(), ThumbnailConsumptionPolicy::Grid);
         app.enqueue_idle_upgrades();
@@ -36609,10 +36657,20 @@ mod favorite_adjustment_defaults_tests {
         app.last_scroll_change_time = std::time::Instant::now() - std::time::Duration::from_secs(2);
         app.last_input_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
         app.display_px_shared.store(374, Ordering::Relaxed);
-        app.requested.insert(0, true);
+        let items_generation = app.items_generation;
+        let request_id = app
+            .requested
+            .begin(
+                0,
+                items_generation,
+                crate::app::thumbnail_requests::ThumbnailRequestKind::Upgrade,
+                None,
+            )
+            .unwrap();
 
         let request = LoadRequest {
             idx: 0,
+            request_id,
             path: image_path,
             mtime: 10,
             file_size: 20,
@@ -36756,8 +36814,9 @@ mod favorite_adjustment_defaults_tests {
 
         let items_gen = app.items_generation;
         for idx in 0..8 {
-            app.tx
-                .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+            send_thumbnail_for_test!(
+                app,
+                crate::thumb_loader::ThumbMsg::from_legacy_parts(
                     idx,
                     Some(egui::ColorImage::filled([1, 1], egui::Color32::DARK_GRAY)),
                     crate::thumb_loader::ThumbLoadOrigin::FinalCache,
@@ -36769,11 +36828,13 @@ mod favorite_adjustment_defaults_tests {
                     false,
                     0,
                     items_gen,
-                ))
-                .unwrap();
+                )
+            )
+            .unwrap();
         }
-        app.tx
-            .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+        send_thumbnail_for_test!(
+            app,
+            crate::thumb_loader::ThumbMsg::from_legacy_parts(
                 8,
                 Some(egui::ColorImage::filled(
                     [247, 124],
@@ -36790,10 +36851,12 @@ mod favorite_adjustment_defaults_tests {
                 false,
                 0,
                 items_gen,
-            ))
-            .unwrap();
-        app.tx
-            .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+            )
+        )
+        .unwrap();
+        send_thumbnail_for_test!(
+            app,
+            crate::thumb_loader::ThumbMsg::from_legacy_parts(
                 8,
                 None,
                 crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
@@ -36805,27 +36868,35 @@ mod favorite_adjustment_defaults_tests {
                 true,
                 0,
                 items_gen,
-            ))
-            .unwrap();
+            )
+        )
+        .unwrap();
 
         let ctx = egui::Context::default();
         app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
         assert!(matches!(app.thumbnails[8], ThumbnailState::Pending));
-        assert_eq!(app.texture_backlog.len(), 1);
+        assert_eq!(app.requested.images_len(), 1);
         assert!(matches!(
-            app.texture_backlog[0].pixels().unwrap().origin,
+            app.requested
+                .images()
+                .next()
+                .unwrap()
+                .pixels()
+                .unwrap()
+                .origin,
             crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
                 evaluated_display_px: 374
             }
         ));
         assert!(app.requested.contains_key(&8));
         assert!(
-            app.pending_finalize.contains(&8),
+            app.requested.finalized_image_wait(8),
             "finalize must wait until the source image leaves the texture backlog"
         );
 
-        app.tx
-            .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+        send_thumbnail_for_test!(
+            app,
+            crate::thumb_loader::ThumbMsg::from_legacy_parts(
                 8,
                 Some(egui::ColorImage::filled(
                     [400, 201],
@@ -36842,8 +36913,9 @@ mod favorite_adjustment_defaults_tests {
                 false,
                 0,
                 items_gen.wrapping_add(1),
-            ))
-            .unwrap();
+            )
+        )
+        .unwrap();
         app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
 
         assert!(matches!(
@@ -36856,8 +36928,8 @@ mod favorite_adjustment_defaults_tests {
                 ..
             }
         ));
-        assert!(app.texture_backlog.is_empty());
-        assert!(!app.pending_finalize.contains(&8));
+        assert!((app.requested.images_len() == 0));
+        assert!(!app.requested.finalized_image_wait(8));
         assert!(!app.requested.contains_key(&8));
         app.enqueue_idle_upgrades();
         assert!(app.requested.is_empty());
@@ -36909,8 +36981,9 @@ mod favorite_adjustment_defaults_tests {
         // A request evaluated while the cell was smaller must replace, rather than merge with,
         // the previous 400px coverage when its image lands after the cell grows again.
         app.requested.insert(0, true);
-        app.tx
-            .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+        send_thumbnail_for_test!(
+            app,
+            crate::thumb_loader::ThumbMsg::from_legacy_parts(
                 0,
                 Some(egui::ColorImage::filled(
                     [247, 124],
@@ -36927,10 +37000,12 @@ mod favorite_adjustment_defaults_tests {
                 false,
                 0,
                 items_gen,
-            ))
-            .unwrap();
-        app.tx
-            .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+            )
+        )
+        .unwrap();
+        send_thumbnail_for_test!(
+            app,
+            crate::thumb_loader::ThumbMsg::from_legacy_parts(
                 0,
                 None,
                 crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
@@ -36942,8 +37017,9 @@ mod favorite_adjustment_defaults_tests {
                 true,
                 0,
                 items_gen,
-            ))
-            .unwrap();
+            )
+        )
+        .unwrap();
         app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
         assert!(matches!(
             app.thumbnails[0],
@@ -36967,8 +37043,9 @@ mod favorite_adjustment_defaults_tests {
         }
 
         // Cancellation has no replacement image, so it must keep the resident coverage intact.
-        app.tx
-            .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+        send_thumbnail_for_test!(
+            app,
+            crate::thumb_loader::ThumbMsg::from_legacy_parts(
                 0,
                 None,
                 crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
@@ -36980,8 +37057,9 @@ mod favorite_adjustment_defaults_tests {
                 false,
                 0,
                 items_gen,
-            ))
-            .unwrap();
+            )
+        )
+        .unwrap();
         app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
         assert!(matches!(
             app.thumbnails[0],
@@ -36997,8 +37075,9 @@ mod favorite_adjustment_defaults_tests {
 
         // A real load error is terminal for the resident image and therefore drops its coverage.
         app.requested.insert(0, true);
-        app.tx
-            .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+        send_thumbnail_for_test!(
+            app,
+            crate::thumb_loader::ThumbMsg::from_legacy_parts(
                 0,
                 None,
                 crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
@@ -37010,8 +37089,9 @@ mod favorite_adjustment_defaults_tests {
                 false,
                 0,
                 items_gen,
-            ))
-            .unwrap();
+            )
+        )
+        .unwrap();
         app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
         assert!(matches!(app.thumbnails[0], ThumbnailState::Failed));
         assert!(app.requested.is_empty());
@@ -42445,6 +42525,8 @@ mod favorite_adjustment_defaults_tests {
             cache_key_override: Some("archivethumb:rar:must-not-open.rar".to_string()),
             resolve_override: Some(crate::thumb_loader::ResolveStrategy::ZipFirstImage),
             source_policy: LoadSourcePolicy::CacheOnly,
+            request_id: crate::thumb_loader::ThumbnailRequestId::Registered(1360),
+            items_gen: 17,
             ..Default::default()
         };
         let cache_map = std::sync::RwLock::new(std::collections::HashMap::new());
@@ -42474,6 +42556,16 @@ mod favorite_adjustment_defaults_tests {
             None,
         );
 
+        let message = rx
+            .try_recv()
+            .expect("cache-only miss must emit an image-less terminal");
+        assert!(matches!(
+            message.payload,
+            crate::thumb_loader::ThumbMsgPayload::CacheOnlyMiss
+        ));
+        assert!(!message.is_finalized());
+        assert_eq!(message.request_id, request.request_id);
+        assert_eq!(message.items_gen, request.items_gen);
         assert!(matches!(
             rx.try_recv(),
             Err(std::sync::mpsc::TryRecvError::Empty)
@@ -42527,6 +42619,120 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn cache_only_miss_keep_exit_reentry_and_judgement_release_only_the_finished_request() {
+        for judgement_before_reentry in [false, true] {
+            let ctx = egui::Context::default();
+            let (mut app, keys, decision_tx) = pending_archive_batch_for_resolution_test();
+            app.reload_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+            app.heavy_io_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+            let projection = || ThumbnailKeepProjection {
+                pages: HashSet::from([0]),
+                bounded_range: (0, 1),
+                interactive_pages: HashSet::new(),
+            };
+            app.install_thumbnail_keep_projection(projection(), true);
+            app.enqueue_priority_thumbnail(0);
+            let mut request = app
+                .heavy_io_queue
+                .as_ref()
+                .unwrap()
+                .0
+                .lock()
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(request.source_policy, LoadSourcePolicy::CacheOnly);
+            let old_id = request.request_id;
+            let cache_map = std::sync::RwLock::new(std::collections::HashMap::new());
+            let done = Arc::new(AtomicUsize::new(0));
+            let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
+            crate::thumb_loader::process_load_request(
+                &mut request,
+                &cache_map,
+                &app.tx,
+                None,
+                64,
+                75,
+                64,
+                CacheDecision::from_settings(&crate::settings::Settings::default()),
+                &done,
+                &stats,
+                None,
+                &app.keep_start_shared,
+                &app.keep_end_shared,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            assert_eq!(done.load(Ordering::Relaxed), 1);
+            // The worker is finished, and scrolling out can exclude this archive from judgement.
+            app.install_thumbnail_keep_projection(ThumbnailKeepProjection::default(), true);
+            app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+            assert_eq!(
+                app.requested.legacy_len(),
+                0,
+                "finished miss must not sustain tail repaint"
+            );
+            assert!(!app.requested.blocks_idle_upgrade());
+            assert_eq!(
+                app.requested.id(0),
+                None,
+                "there is no live worker or image waiting"
+            );
+            assert_eq!(app.requested.images_len(), 0);
+            assert_eq!(
+                app.requested.progress_counts(&HashSet::from([0])),
+                (0, 0, 0)
+            );
+            assert!(!matches!(app.thumbnails[0], ThumbnailState::Failed));
+
+            if !judgement_before_reentry {
+                app.install_thumbnail_keep_projection(projection(), true);
+                for _ in 0..3 {
+                    app.enqueue_priority_thumbnail(0);
+                }
+                assert!(
+                    app.heavy_io_queue
+                        .as_ref()
+                        .unwrap()
+                        .0
+                        .lock()
+                        .unwrap()
+                        .is_empty(),
+                    "a completed cache miss must not be re-enqueued before archive judgement"
+                );
+            }
+            decision_tx
+                .send(ConvertedArchiveCachePathsMsg::Resolved {
+                    archive_key: keys[0].clone(),
+                    state: crate::app::ConvertedArchiveSourceState::CachedZip {
+                        logical_source: app.items[0].drag_source_path().unwrap().to_path_buf(),
+                        path: app.tmp.path().join("first.zip"),
+                    },
+                    idx: 0,
+                    ordinal: 1,
+                    elapsed_ms: 5.0,
+                    input_seq: 7,
+                })
+                .unwrap();
+            app.poll_converted_archive_cache_paths(&ctx);
+            app.install_thumbnail_keep_projection(projection(), true);
+            app.enqueue_priority_thumbnail(0);
+            let queue = app.heavy_io_queue.as_ref().unwrap().0.lock().unwrap();
+            assert_eq!(
+                queue.len(),
+                1,
+                "judgement must restore the ordinary reload route"
+            );
+            assert!(queue[0].source_policy.allows_source());
+            assert_ne!(queue[0].request_id, old_id);
+            assert_eq!(Some(queue[0].request_id), app.requested.id(0));
+        }
+    }
+
+    #[test]
     fn resolved_archive_does_not_evict_a_thumbnail_the_cache_only_request_already_drew() {
         // The cache-only request made while the candidate was Pending uses the same cache key
         // and the same mtime/file_size as the resolved one, so a hit is already the final
@@ -42569,10 +42775,65 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn cache_only_miss_judgement_overtakes_terminal_without_reblocking_reload() {
+        let ctx = egui::Context::default();
+        let (mut app, keys, decision_tx) = pending_archive_batch_for_resolution_test();
+        app.heavy_io_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+        app.enqueue_priority_thumbnail(0);
+        let old = app
+            .heavy_io_queue
+            .as_ref()
+            .unwrap()
+            .0
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap();
+        decision_tx
+            .send(ConvertedArchiveCachePathsMsg::Resolved {
+                archive_key: keys[0].clone(),
+                state: crate::app::ConvertedArchiveSourceState::CachedZip {
+                    logical_source: app.items[0].drag_source_path().unwrap().to_path_buf(),
+                    path: app.tmp.path().join("first.zip"),
+                },
+                idx: 0,
+                ordinal: 1,
+                elapsed_ms: 5.0,
+                input_seq: 7,
+            })
+            .unwrap();
+        app.poll_converted_archive_cache_paths(&ctx);
+        app.enqueue_priority_thumbnail(0);
+        let new_id = app.requested.id(0).unwrap();
+        assert_ne!(new_id, old.request_id);
+        for (id, generation) in [
+            (old.request_id, old.items_gen),
+            (new_id, old.items_gen.wrapping_sub(1)),
+        ] {
+            app.tx
+                .send(ThumbMsg {
+                    idx: 0,
+                    input_seq: 0,
+                    items_gen: generation,
+                    request_id: id,
+                    payload: crate::thumb_loader::ThumbMsgPayload::CacheOnlyMiss,
+                })
+                .unwrap();
+            app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+            assert_eq!(app.requested.id(0), Some(new_id));
+            assert_eq!(app.requested.legacy_len(), 1);
+            assert!(matches!(app.thumbnails[0], ThumbnailState::Evicted));
+            let queue = app.heavy_io_queue.as_ref().unwrap().0.lock().unwrap();
+            assert_eq!(queue.len(), 1);
+            assert!(queue[0].source_policy.allows_source());
+        }
+    }
+
+    #[test]
     fn resolved_archive_reloads_a_tile_whose_cache_only_request_missed() {
         // The other half of the pair: nothing is on screen, so the tile has to be requested
-        // again now that the source is known. Without this the cache-only miss would sit in
-        // `requested` forever and the archive would never get a thumbnail.
+        // again now that the source is known. The archive-judgement admission gate must
+        // be removed along with any old request correlation, without affecting cache hits.
         let ctx = egui::Context::default();
         let (mut app, keys, tx) = pending_archive_batch_for_resolution_test();
         app.thumbnails[0] = ThumbnailState::Pending;
@@ -47670,7 +47931,7 @@ mod favorite_adjustment_defaults_tests {
     #[test]
     fn restored_viewer_context_keeps_thumbnail_request_markers_without_requeue() {
         // review-v2.3.0 P2-8: thumb channel / cancel_token / ワーカーキューを bundle 化した
-        // ので、bundle swap は requested / pending_finalize を clear しない (channel が
+        // ので、bundle swap は requested owner を clear しない (channel が
         // コンテキストと一緒に移動するため in-flight マーカーは swap 後も有効)。
         // 旧実装は swap ごとに clear → 可視 Pending が毎フレーム再エンキューされ、同じ
         // サムネを何度もデコードする churn だった。
@@ -47692,7 +47953,7 @@ mod favorite_adjustment_defaults_tests {
         app.reload_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
         app.heavy_io_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
         app.requested.insert(0, false);
-        app.pending_finalize.insert(0);
+        app.requested.mark_finalized_for_test(0);
 
         let original = app.stash_mounted_and_start_fresh("test_thumbnail_request_context");
         app.with_viewer_context(original, |mounted| {
@@ -47701,7 +47962,7 @@ mod favorite_adjustment_defaults_tests {
                 "bundle round-trip must preserve in-flight request markers (P2-8)"
             );
             assert!(
-                mounted.pending_finalize.contains(&0),
+                mounted.requested.finalized_image_wait(0),
                 "bundle round-trip must preserve finalize markers (P2-8)"
             );
         })
@@ -47738,8 +47999,9 @@ mod favorite_adjustment_defaults_tests {
             app.requested.insert(0, false);
         };
         let send = |app: &mut App, red: u8| {
-            app.tx
-                .send(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+            send_thumbnail_for_test!(
+                app,
+                crate::thumb_loader::ThumbMsg::from_legacy_parts(
                     0,
                     Some(egui::ColorImage::new(
                         [2, 2],
@@ -47754,8 +48016,9 @@ mod favorite_adjustment_defaults_tests {
                     false,
                     0,
                     app.items_generation,
-                ))
-                .unwrap();
+                )
+            )
+            .unwrap();
         };
         prepare(&mut app, first);
         send(&mut app, 90);
@@ -50511,7 +50774,7 @@ mod thumbnail_progress_tests {
     fn seed_stale_progress_peaks(app: &mut App) {
         app.requested.clear();
         app.keep_set.clear();
-        app.texture_backlog.clear();
+        app.requested.discard_images();
         app.progress_normal_peak = 7;
         app.progress_upgrade_peak = 11;
     }
@@ -50592,7 +50855,7 @@ mod thumbnail_progress_tests {
         app.requested.clear();
         app.requested.insert(0, false);
         app.requested.insert(1, true);
-        app.texture_backlog.clear();
+        app.requested.discard_images();
         app.progress_normal_peak = 0;
         app.progress_upgrade_peak = 0;
         app.fullscreen_idx = Some(0);
@@ -70315,12 +70578,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             .insert(history_folder.clone(), (88.0, Some(0)));
         app.requested.insert(1, false);
         let main_generation = app.items_generation;
-        app.texture_backlog.push(thumbnail_msg_for_test(
-            1,
-            main_generation,
-            [3, 3],
-            Some((3, 3)),
-        ));
+        queue_thumbnail_for_test!(
+            app,
+            thumbnail_msg_for_test(1, main_generation, [3, 3], Some((3, 3)),)
+        );
 
         let expected_folder = app.current_folder.clone();
         let expected_item_paths: Vec<PathBuf> = app
@@ -70340,10 +70601,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         let expected_search_origin = app.search_filter_origin_folder.clone();
         let expected_rating_filter = app.settings.rating_filter;
         let expected_history = app.folder_history.clone();
-        let expected_requested = app.requested.clone();
+        let expected_requested = app.requested.snapshot();
         let expected_backlog = app
-            .texture_backlog
-            .iter()
+            .requested
+            .images()
             .map(|msg| {
                 (
                     msg.idx,
@@ -70366,8 +70627,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             bundle.keep_set.insert(0);
             bundle.requested.insert(0, false);
             bundle
-                .tx
-                .send(thumbnail_msg_for_test(
+                .send_thumbnail_for_test(thumbnail_msg_for_test(
                     0,
                     bundle.items_generation,
                     [4, 6],
@@ -70397,10 +70657,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_eq!(app.search_filter_origin_folder, expected_search_origin);
         assert_eq!(app.settings.rating_filter, expected_rating_filter);
         assert_eq!(app.folder_history, expected_history);
-        assert_eq!(app.requested, expected_requested);
+        assert_eq!(app.requested.snapshot(), expected_requested);
         let actual_backlog = app
-            .texture_backlog
-            .iter()
+            .requested
+            .images()
             .map(|msg| {
                 (
                     msg.idx,
@@ -70429,7 +70689,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 "the owner context must retain CPU pixels for pass-through rendition"
             );
             assert!(detached.requested.is_empty());
-            assert!(detached.texture_backlog.is_empty());
+            assert!((detached.requested.images_len() == 0));
         })
         .expect("the detached transition must remain isolated from the preserved main context");
     }
@@ -70454,8 +70714,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 .extend((0..item_count).map(|idx| (idx, false)));
             for idx in 0..item_count {
                 bundle
-                    .tx
-                    .send(thumbnail_msg_for_test(
+                    .send_thumbnail_for_test(thumbnail_msg_for_test(
                         idx,
                         bundle.items_generation,
                         [4, 6],
@@ -70476,7 +70735,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                     .count(),
                 8
             );
-            assert_eq!(detached.texture_backlog.len(), 2);
+            assert_eq!(detached.requested.images_len(), 2);
             assert_eq!(detached.thumb_pixels.len(), 8);
         })
         .unwrap();
@@ -70490,7 +70749,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                     .all(|state| matches!(state, ThumbnailState::Loaded { .. })),
                 "the owner must drain its staged results on the next frame"
             );
-            assert!(detached.texture_backlog.is_empty());
+            assert!((detached.requested.images_len() == 0));
             assert_eq!(detached.thumb_pixels.len(), item_count);
             assert!(detached.requested.is_empty());
         })
@@ -70511,8 +70770,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             bundle.keep_set.insert(0);
             bundle.requested.insert(0, false);
             bundle
-                .tx
-                .send(thumbnail_msg_for_test(
+                .send_thumbnail_for_test(thumbnail_msg_for_test(
                     0,
                     bundle.items_generation,
                     [5, 7],
@@ -70531,7 +70789,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 ThumbnailState::Loaded { .. }
             ));
             assert!(
-                detached.texture_backlog.is_empty(),
+                (detached.requested.images_len() == 0),
                 "a main font-setting update must not defer a detached owner's ready texture"
             );
             assert_eq!(
@@ -70558,8 +70816,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             bundle.keep_range = (0, 0);
             bundle.keep_set.clear();
             bundle
-                .tx
-                .send(thumbnail_msg_for_test(
+                .send_thumbnail_for_test(thumbnail_msg_for_test(
                     0,
                     bundle.items_generation,
                     [16, 9],
@@ -70572,7 +70829,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         run_active_detached_frame_for_test(&mut app, &ctx);
         app.with_active_viewer_context(|detached| {
             assert!(matches!(detached.thumbnails[0], ThumbnailState::Evicted));
-            assert!(detached.texture_backlog.is_empty());
+            assert!((detached.requested.images_len() == 0));
             assert!(detached.thumb_pixels.is_empty());
         })
         .unwrap();
@@ -70605,8 +70862,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             ));
             bundle.scroll_offset_y = 250.0;
             bundle
-                .tx
-                .send(thumbnail_msg_for_test(
+                .send_thumbnail_for_test(thumbnail_msg_for_test(
                     0,
                     bundle.items_generation,
                     [16, 9],
@@ -70642,19 +70898,16 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.image_metas = vec![None];
         app.keep_range = (0, 0);
         app.keep_set.clear();
-        app.tx
-            .send(thumbnail_msg_for_test(
-                0,
-                app.items_generation,
-                [16, 9],
-                None,
-            ))
-            .unwrap();
+        send_thumbnail_for_test!(
+            app,
+            thumbnail_msg_for_test(0, app.items_generation, [16, 9], None,)
+        )
+        .unwrap();
 
         app.poll_thumbnails(&egui::Context::default(), ThumbnailConsumptionPolicy::Grid);
 
         assert!(matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }));
-        assert!(app.texture_backlog.is_empty());
+        assert!((app.requested.images_len() == 0));
     }
 
     #[test]
@@ -70678,14 +70931,11 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             8,
         ));
         app.last_input_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
-        app.tx
-            .send(thumbnail_msg_for_test(
-                0,
-                app.items_generation,
-                [3, 4],
-                Some((3, 4)),
-            ))
-            .unwrap();
+        send_thumbnail_for_test!(
+            app,
+            thumbnail_msg_for_test(0, app.items_generation, [3, 4], Some((3, 4)),)
+        )
+        .unwrap();
 
         app.poll_thumbnails(&egui::Context::default(), ThumbnailConsumptionPolicy::Grid);
 
@@ -72818,13 +73068,13 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     #[cfg(windows)]
     fn bundle_swap_preserves_thumb_request_bookkeeping_and_load_complex() {
         // review-v2.3.0 P2-8/P2-9: thumb channel / cancel_token / ワーカーキューを bundle 化した
-        // ので、(a) swap しても requested / pending_finalize が clear されない (P2-8: detached 窓
+        // ので、(a) swap しても requested owner が clear されない (P2-8: detached 窓
         // 表示中の毎フレーム swap がサムネ bookkeeping を消して重複デコード churn になっていた)、
         // (b) cancel_token はコンテキストごとに独立し、detached context のロードキャンセルが
         // main のロード (動画サムネ抽出含む) に波及しない (P2-9)。
         let mut app = setup_app();
         app.requested.insert(3, false);
-        app.pending_finalize.insert(4);
+        app.requested.mark_finalized_for_test(4);
         app.vst3_deferred_media_open = Some(5);
         let main_cancel = std::sync::Arc::clone(&app.cancel_token);
         let context_id = app.stash_mounted_as_active_for_test(93);
@@ -72846,7 +73096,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         // unmount: main の bookkeeping が clear されずそのまま戻る (P2-8 の核心)。
         app.with_viewer_context(context_id, |mounted| {
             assert!(mounted.requested.contains_key(&3));
-            assert!(mounted.pending_finalize.contains(&4));
+            assert!(mounted.requested.finalized_image_wait(4));
             assert_eq!(mounted.vst3_deferred_media_open, Some(5));
             assert!(std::sync::Arc::ptr_eq(&mounted.cancel_token, &main_cancel));
         })
@@ -72922,7 +73172,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.set_detached_window_binding_for_test(Some(88));
         app.begin_active_detached_session(88, DetachedSource::Video);
         app.requested.insert(video, false);
-        app.pending_finalize.insert(video);
+        app.requested.mark_finalized_for_test(video);
         app.native_video_source_swap_pending =
             Some(source_swap_pending_for_test(&app, video, None));
         let video_path = match &app.items[video] {
@@ -72939,10 +73189,11 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             parked_live_window_id: None,
         });
         let items_gen = app.items_generation;
-        app.texture_backlog
-            .push(crate::thumb_loader::ThumbMsg::from_legacy_parts(
+        queue_thumbnail_for_test!(
+            app,
+            crate::thumb_loader::ThumbMsg::from_legacy_parts(
                 video,
-                None,
+                Some(egui::ColorImage::filled([2, 2], egui::Color32::GRAY)),
                 crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
                 false,
                 None,
@@ -72952,13 +73203,14 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 false,
                 0,
                 items_gen,
-            ));
+            )
+        );
 
         assert!(app.park_current_viewer_context_as_live_media(&ctx, "test"));
 
         assert!(app.requested.contains_key(&video));
-        assert!(app.pending_finalize.contains(&video));
-        assert_eq!(app.texture_backlog.len(), 1);
+        assert!(app.requested.finalized_image_wait(video));
+        assert_eq!(app.requested.images_len(), 1);
         assert_eq!(
             app.native_video_source_swap_pending
                 .as_ref()
@@ -72973,8 +73225,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         );
         app.with_window_viewer_context(88, |parked| {
             assert!(parked.requested.is_empty());
-            assert!(parked.pending_finalize.is_empty());
-            assert!(parked.texture_backlog.is_empty());
+            assert!(!parked.requested.any_finalized_image_wait());
+            assert!((parked.requested.images_len() == 0));
         })
         .unwrap();
     }

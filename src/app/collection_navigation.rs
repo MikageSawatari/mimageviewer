@@ -6812,7 +6812,7 @@ mod tests {
         let items = app.items.clone();
         let image_metas = app.image_metas.clone();
         let thumbnail_kinds = thumbnail_state_kinds(&app);
-        let requested = app.requested.clone();
+        let requested = app.requested.snapshot();
         let cancel = Arc::clone(&app.cancel_token);
         let reload_queue = app.reload_queue.as_ref().map(Arc::clone).unwrap();
         let heavy_io_queue = app.heavy_io_queue.as_ref().map(Arc::clone).unwrap();
@@ -6835,7 +6835,7 @@ mod tests {
         assert_eq!(app.items, items);
         assert_eq!(app.image_metas, image_metas);
         assert_eq!(thumbnail_state_kinds(&app), thumbnail_kinds);
-        assert_eq!(app.requested, requested);
+        assert_eq!(app.requested.snapshot(), requested);
         assert_eq!(
             app.auto_aspect.current,
             Some(crate::settings::ThumbAspect::Landscape16x9)
@@ -6910,7 +6910,7 @@ mod tests {
         let generation = app.items_generation;
         let items = app.items.clone();
         let thumbnail_kinds = thumbnail_state_kinds(&app);
-        let requested = app.requested.clone();
+        let requested = app.requested.snapshot();
         let cancel = Arc::clone(&app.cancel_token);
         let reload_queue = app.reload_queue.as_ref().map(Arc::clone).unwrap();
         let heavy_io_queue = app.heavy_io_queue.as_ref().map(Arc::clone).unwrap();
@@ -6934,7 +6934,7 @@ mod tests {
             assert_eq!(app.items_generation, generation);
             assert_eq!(app.items, items);
             assert_eq!(thumbnail_state_kinds(&app), thumbnail_kinds);
-            assert_eq!(app.requested, requested);
+            assert_eq!(app.requested.snapshot(), requested);
             assert_eq!(
                 app.auto_aspect.current,
                 Some(crate::settings::ThumbAspect::Landscape16x9)
@@ -7194,7 +7194,7 @@ mod tests {
         let main_generation = app.items_generation;
         let main_items = app.items.clone();
         let main_thumbnail_kinds = thumbnail_state_kinds(&app);
-        let main_requested = app.requested.clone();
+        let main_requested = app.requested.snapshot();
         let main_cancel = Arc::clone(&app.cancel_token);
         let main_reload_queue = app.reload_queue.as_ref().map(Arc::clone).unwrap();
         let main_heavy_io_queue = app.heavy_io_queue.as_ref().map(Arc::clone).unwrap();
@@ -7221,7 +7221,7 @@ mod tests {
         assert_eq!(app.items_generation, main_generation);
         assert_eq!(app.items, main_items);
         assert_eq!(thumbnail_state_kinds(&app), main_thumbnail_kinds);
-        assert_eq!(app.requested, main_requested);
+        assert_eq!(app.requested.snapshot(), main_requested);
         assert_eq!(
             app.auto_aspect.current,
             Some(crate::settings::ThumbAspect::Landscape16x9)

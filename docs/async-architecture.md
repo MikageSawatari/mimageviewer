@@ -441,7 +441,7 @@ ZIP 自動/pin 代表を `process_load_request` の `RawThumbHandoff::DedicatedW
 
 | 名前 | 方向 | 内容 |
 | --- | --- | --- |
-| `tx / rx` (App) | ワーカー → UI | `ThumbMsg`: (idx, ColorImage, `ThumbLoadOrigin`, source_dims, canceled, finalized)。origin は `Source` / `UpgradeableCache` / `FinalCache` の 3 状態で、最後は編集 preview・drive-list・再帰 pin WebP など元ソースへ idle upgrade しない完成済み派生 cache。from-source 経路 (cache miss) では **2 シグナル**: ① 第 1 シグナル = display ColorImage (canceled=false, finalized=false) → UI は Loaded 化、`requested` は保持 ② 第 2 シグナル = cache save 完了通知 (None + finalized=true) → UI は `requested` を抜くだけで **`thumbnails[i]` は変更しない**。cache hit は 1 ショット (canceled=false で即 remove)。`canceled=true` は STALE 専用 (worker bail-out) で、UI は Evicted に戻して再試行可能にする (Failed にしない)。`finalized=true` と `canceled=true` は排他 |
+| `tx / rx` (App) | ワーカー → UI | `ThumbMsg` は idx / items_gen / request_id と typed payload を持つ。`SourcePixels` は画像側の採用/破棄と保存/保存省略の `Finalized` の両終端、終端 `Pixels` は採用/破棄、`ProvisionalPixels` はseed検証も待つ。`NoArt` / `Failed` / `Canceled` は画像なし終端。context-localな `ThumbnailRequests` が予約とCPU画像を所有し、UI副作用より先に相関を検査する。通知契約をoriginや表示状態から推測しない |
 | `fs_pending[idx].1` | フルスクリーンスレッド → UI | `FsLoadResult`: **DimsOnly / AnimationExpansionStarted (ともに非終端) / Static / Animated / Failed**。pending は `fs_cache` / `fs_early_dims` / `fs_upload_backlog` と同じ viewer-context-owned `items_generation` を保持する。`DimsOnly` はヘッダ解析直後に先行送信される原寸ヒントで、UI は同世代だけ `fs_early_dims` に積み fs_pending は維持する。`AnimationExpansionStarted` は GIF / APNG / Animated WebP と decoder が確認した時刻で、pending が保持して終端結果と一緒に upload backlog へ渡す。ページ離脱、cancel、世代変更では確認時刻を捨てる。終端結果も upload backlog と final cache の各着地点で同世代だけ採用し、不一致は通常ログへ記録して破棄する。詳細は [display-pipeline.md §2.2](display-pipeline.md) 参照 |
 | `ai_upscale_pending[idx].1` | AI スレッド → UI | `UpscaleResult` |
 | `final_effect_pending[key].rx` | カラー化 / 最終エフェクト worker → UI | 共有 executor の `FinalCompositeResult::Ready { pixels, elapsed_ms, timing }` / `Cancelled`。`timing` は色調補正、smart sharpen、カラー化判定／適用、Creative LUT、post filter の段階別時間を保持する。receiver は composite key、画像 index、`items_generation`、表示 / 先読み区分と同じ viewer context に保持し、stale 結果を texture cache へ公開しない。先読み結果も UI 側で完成 texture を 1 枚ずつ upload する |
@@ -882,53 +882,40 @@ texture backlogは画像とoriginを一緒に保持し、旧items世代やkeep�
 合成しない。contextの移動・forkでもLoaded画像のprovenanceとして扱い、App-globalな
 完了フラグや別contextへの失効通知を追加しない。
 
-サムネイルは「keep_range 内かどうか」が毎フレーム変化するため、単純なキャンセルでは
-**同じ idx が in-flight なのに scroll 戻りで再エンキューされ、PDF 再レンダが二重に走る**
-事故を起こす。2026-04 のセッションで以下のルールを確立した:
+§1.360では、表示状態とworker終端を混同していた `requested / pending_finalize /
+texture_backlog` をcontext-localな `ThumbnailRequests` に集約した。sourceの予約は
+**workerの保存/省略終端と、その要求の画像の採用/破棄の両方**まで残す。
+Pending / Evicted / Loaded高画質化のどれでも同じで、8枚/frameの超過画像も同ownerに残る。
+通知はitems generationとrequest IDを照合してから、texture・寸法・色代表・writebackへ触れる。
+input_seqは操作計装であり、要求identityには使わない。
 
-- **`update_keep_range_and_requests` は `self.requested` を範囲外一括 remove しない**。
-  ワーカー処理中の idx まで抜いてしまい再エンキューを誘発するため。step 1 は Loaded→Evicted
-  の遷移だけ行う。
-- **`requested` の cleanup 経路は 4 本**:
-  1. エンキュー済・pop 前の取消 → step 2 の `q.retain` が dropped idx を `requested.remove`
-  2. ワーカー pop 後の STALE → ワーカーが `ThumbMsg` に `canceled=true` を載せて送信 →
-     `poll_thumbnails` が `requested.remove` + `Evicted` (Failed にしない)
-  3. cache hit 正常完了 → 第 1 シグナルで `poll_thumbnails` が `requested.remove`
-  4. cache miss 正常完了 → **第 1 シグナル (display ColorImage) では remove しない**、
-     第 2 シグナル (cache save 完了、`finalized=true`) で remove。`finalized=true` の場合は
-     `thumbnails[i]` を **変更しない** (texture アップロード待ちの Pending を Evicted に
-     書き換えると次フレームに再エンキュー → 重複デコード地獄になる事故を防ぐ)。
-     旧実装は STALE と同じ `canceled=true` で送信していたため、texture_backlog に
-     アップロード待ちが詰まっている時に Pending → Evicted の上書きが起きていた。
+- lock下で実行前queueから除いた一致するIDは局所取消で終了する。
+- 実行中 / backlog / 採用済保存中のkeep退出とGPU evictionはscope失効にしない。
+  source画像だけの破棄ではFinalizedを待ち、終端後に既存需要へ戻る。
+- cache / edit preview / Audio / video / 直接画像は終端 `Pixels` の採用/破棄で終了する。
+  ドライブの暫定seedは `ProvisionalPixels` と検証終端/置換を同ownerで扱う。
+- `NoArt` / `Failed` / `Canceled` は一致する要求の未採用画像も捨てて終了する。
+  Canceledは既存Loadedを維持し、未LoadedをEvictedへ戻す。
+- `CacheOnlyMiss` はID/gen相関付き一通知で画像なしの両終端を確定する。requestを除去し、
+  同owner内にID/worker/画像のない `AwaitingArchiveJudgement` 需要slotだけ残す。
+  このslotは再投入受付を抑制するがidle blocker/repaint/progressには数えない。
+  keep出退やGPU解放では維持し、判定publish→既存reload/source更新/世代退役で除去する。
+- items generation変更 / source失効 / channel交換 / context dropは旧namespaceを退役する。
+  同一generation更新では予約を変えず、遅着通知が新ownerを解除することもない。
+- tray hide / park のCPU画像破棄は同ownerの画像側終端を通す。restoreは既存需要再評価であり、
+  保存待ちを取消済みと推測しない。mountはowner全体を移動、forkはin-flightを複製しない。
 
-     **さらに finalized-vs-backlog レース**: 第 2 シグナルが先着したが第 1 シグナルの
-     ColorImage は `texture_backlog` に積まれてアップロード待ち、というケースで
-     即 `requested.remove` すると `Pending && !requested.contains` → 次フレーム再エンキュー
-     の無限ループになる。対策として `pending_finalize: HashSet<usize>` を追加し、
-     finalized 受信時に thumbnails[i] が **Pending のとき** は idx を pending_finalize
-     へ積む。アップロード完了 (新規 or backlog から) で Loaded 化した瞬間に
-     `pending_finalize.remove(&i)` が true を返せばその場で `requested.remove` する。
+VideoBatch / DirectPixelsは通常要求の投影へ足さない。idle upgrade blockerと
+requested repaint理由はNormal / Upgradeだけ、backlog理由は全種別の未採用画像、
+動画待ち理由はkeep内VideoBatchの画像Awaiting / Queuedだけである。通常/upgrade進捗は
+需要内の各種別だけを数え、通常peakから引くのは需要内NormalのQueued画像だけ。
+keep外動画retryでupgrade・repaint・進捗を増減させない。VideoBatch / DirectPixelsの画像はkeep投影で
+捨てず、既存Grid / Renditionのpoll消費policyで採用/破棄する。各frameでkeep外動画全件を走査しない。
 
-     **さらに finalized-vs-evict レース (v0.7.3)**: 第 1 シグナル到着後にユーザーが
-     スクロールして keep_range から外れると、`update_keep_range_and_requests` が
-     Loaded → Evicted に落とす (この時点では `requested` は意図的に残す = cache-save 完了
-     待ち)。その直後に第 2 シグナルが届くと、旧実装は state=Evicted でも pending_finalize
-     に積んでしまい、pending_finalize は Loaded 遷移時にしか掃除されないため、
-     `requested[i]` が永久に居座る。スクロールで戻ってきても再エンキューループの
-     `if requested.contains_key { continue; }` に弾かれてサムネが Evicted のまま固着する。
-     対策として finalize ハンドラを 3 分岐に分け、**Evicted / Failed のときは
-     `requested.remove + pending_finalize.remove` で即時掃除**する (ワーカーは第 2 シグナル
-     送信済みなので「処理中の idx を抜くな」の規約には違反しない)。ログ `[poll] finalize
-     on Evicted idx=N → cleanup requested` で発動を可視化する。
-     `canceled` / 失敗 / `load_folder` リセット時にも pending_finalize をクリア
-- **STALE チェックはワーカーパイプラインの 3 箇所**:
-  - `spawn_worker` が pop 直後 (app.rs): キャッシュ lookup すら不要な明白な範囲外
-  - `process_load_request` の heavy I/O resolve 後 (thumb_loader.rs): ZIP/folder の
-    I/O (秒単位) 完了後に範囲外になっていないか
-  - `process_load_request` の PDF レンダ直前 (thumb_loader.rs): cache miss で PDFium
-    に投げる前。これがないと scroll 往復で同じページの 1 秒レンダが重複する
-- 3 箇所とも `canceled=true` を送信して `requested` cleanup する。`continue` だけでは
-  `requested` に残って「再エンキューされない idx=Pending」状態で固まる。
+STALE checkpointは従来どおりworker pop直後、ZIP/Folder heavy I/O resolve後、PDF render前。
+取消は同request IDのCanceledを送り、ただのcontinueで予約を残さない。
+RAW deferred callback/follow-upとEPUB fallbackも元のID・世代・操作sequence・context epochを保つ。
+[寿命計画・回帰・検証証拠](thumbnail-request-lifecycle-plan.md)。
 
 静止画ページシークのサムネイル列 / hover preview はグリッド保持帯から遠いページを
 要求できるため、`keep_range` を広げず `still_seek_thumbnail_pages` の bounded exact set
@@ -946,13 +933,10 @@ idx 空間の無効化、および `set_items_generation` での世代変更に�
 集合と worker 可視 projection は viewer context ごとに所有し、mount では一緒に交換、
 fork では独立した `RwLock` へ複製する。別 context の置換・失効・close は兄弟の集合に届かない。
 
-**なぜ 2 シグナル方式か**: `load_one_cached` は decode → tx.send (display) → WebP encode →
-DB save → cache_map.insert の順で処理する。もし第 1 シグナル到着時に `requested` を抜くと、
-cache save 進行中 (数百 ms) は `requested` 空かつ cache_map にも未登録の窓が開き、
-その間に scroll 往復が起きると別 worker が同じ idx を cache miss 扱いで取得し重い decode
-(ZIP 取り出し・PDFium レンダ等) を二重に走らせる。第 2 シグナルで cache save 完了後に
-初めて `requested` を抜くことで、cache save 中の再エンキューは `requested.contains_key=true`
-で弾かれる。
+**なぜ2シグナル方式か**: `load_one_cached` はdecode → SourcePixels → WebP encode / DB save /
+cache_map更新 → Finalizedの順であり、保存省略時にもFinalizedを送る。
+画像採用だけで予約を外すと保存中のcache missで同じdecodeが走り、Finalizedだけで外すと
+upload待ち画像があるEvicted / Loaded-upgradeを再投入する。両終端を待つことで双方を防ぐ。
 
 ### 3.4.1 検索系のキャンセル規約
 
@@ -1155,9 +1139,8 @@ bump + idx ベース状態の破棄を忘れずに行う。忘れると、進行
 
 1. `items_generation` を必ず `bump_items_generation()` で bump (`install_new_items` も同 helper を使用)。
    これにより generation-stamped fullscreen state 4 種も同じ context 内で原子的に進む
-2. `invalidate_idx_state_and_queues()` を呼ぶ — requested / idle upgrade の idx memo /
-   pending_finalize /
-   texture_backlog / checked / keep_range / keep_set / keep_*_shared / idx-keyed
+2. `invalidate_idx_state_and_queues()` を呼ぶ — thumbnail request owner（CPU画像・両終端待ちを含む） / idle upgrade の idx memo /
+   checked / keep_range / keep_set / keep_*_shared / idx-keyed
    HashMap 群 / in-flight pending (fs_pending / ai_upscale_pending) / reload_queue /
    heavy_io_queue を一括で片付ける
 3. path-keyed キャッシュ (metadata_cache / exif_cache / xmp_cache / tags_cache) も

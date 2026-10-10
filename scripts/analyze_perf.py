@@ -2060,7 +2060,20 @@ def analyze_idle_health(
         for e in selected
         if e.get("cat") == "ui" and e.get("kind") == "tail_repaint"
     ]
-    input_events = [e for e in selected if e.get("cat") == "input"]
+    # A passive modifier snapshot records an existing frame, not user activity.
+    # Match its exact no-input shape; missing fields and wheel=0 are not evidence
+    # of a heartbeat. Focus and modifier levels do not affect this classification.
+    input_events = [
+        e
+        for e in selected
+        if e.get("cat") == "input"
+        and not (
+            e.get("kind") == "modifier_probe"
+            and e.get("trigger") == "heartbeat"
+            and e.get("keys") == []
+            and e.get("wheel") is False
+        )
+    ]
 
     action_counts: dict[str, int] = defaultdict(int)
     reason_counts: dict[str, int] = defaultdict(int)

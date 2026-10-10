@@ -1455,6 +1455,8 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+2026-10-09 §1.360: 利用者が独立設計再レビュー ACCEPT 済みの thumbnail-request-lifecycle-plan に従い、既存 ViewerContextBundle の requested・pending_finalize・CPU texture_backlog を一つの typed ThumbnailRequests owner に集約する。mount/unmount は画像と request ID を含む owner 全体を移動し、fork は in-flight を複製しない。park の画像破棄も同じ owner の画像側終端を通し、未終端 worker の保存完了を偽装しない。main の tray hide/restore は既存の対象範囲を維持し、兄弟 context の owner・channel・queue・世代・token に触れない。detached predicate・viewport・HWND・placement・park 発火条件・repaint scheduler は変更せず、表示状態から要求完了を推測していた所有境界を直す構造修正として §2 に適合する。設計担当の採用方針と独立 reviewer の合意は同 plan の §10 に記録されている。
+
 2026-10-09、§1.345 独立レビュー #1–#4 の修正では、閲覧中に延期した種類設定の再読込を
 既存 `apply_file_type_visibility_change` の source/return owner に戻す。Snapshot の通常reloadを
 変えず、閲覧終了後の設定適用が Q11 の元場所reloadを通る。新しい detached predicate、
@@ -4328,3 +4330,14 @@ masterの採用拒否境界は維持し、bool・registry・retryを追加しな
 独立Sol / xhigh reviewerは、採用済み入力の同期処理であり継続の義務を失わない構造と確認した。
 受信延期の回帰は既存の`prepare_current_listing_page_identity_index`を同じshellに開始して実際の
 準備中を作り、保留応答の保持とその後の一度だけの採用を確認する。出荷版の即時reselect回帰も保持する。
+
+### 2026-10-10 §1.360 と master / §1.345 / next-qa の統合
+
+利用者指定のmergeで、§1.345のsidecar・可視性projectionとページidentity ownerを保持し、
+サムネイル要求は§1.360のcontext-local `ThumbnailRequests`へ集約する。
+live-park復元のitems世代更新は同じownerで要求・CPU画像を退役させ、削除済みの分散状態を再導入しない。
+可視性で除外されたarchive pinのfallbackは元要求のrow・request ID・items世代・入力sequence・
+context epoch・優先度を継承し、元contextへ一度だけ画像とworker終端を返す。
+QAのcache-read witnessは相関済み画像の受理時に記録し、進捗は既存の通常要求projectionとkeep内画像から導出する。
+detached述語・viewport生成・placement・focus・registry protocolは変更しない。
+これは両側の既存ownerを保持する統合であり、新しい待機状態・retry・時間窓を追加しない。

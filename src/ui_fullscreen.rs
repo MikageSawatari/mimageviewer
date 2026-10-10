@@ -28460,8 +28460,8 @@ impl App {
             fs_idx.and_then(|idx| nav.iter().position(|candidate| *candidate == idx));
         let pending_thumbs = self
             .requested
-            .len()
-            .saturating_add(self.texture_backlog.len())
+            .legacy_len()
+            .saturating_add(self.requested.images_len())
             .saturating_add(self.fs_upload_backlog.len());
         let collection_root_order = self.collection_grid_root_order().and_then(Result::ok);
         let (collection_runtime_phase, collection_runtime_error, collection_seeded_id_present) =

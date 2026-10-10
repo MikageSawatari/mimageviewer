@@ -501,6 +501,7 @@ fn decode_remote_source(
     zip_directory: bool,
     preloaded_zip_bytes: Option<Vec<u8>>,
 ) -> Result<RemoteDecodedSource, MediaError> {
+    request.request_id = crate::thumb_loader::ThumbnailRequestId::Standalone;
     let (tx, rx) = mpsc::channel();
     let done = Arc::new(AtomicUsize::new(0));
     let keep_start = Arc::new(AtomicUsize::new(0));
@@ -538,6 +539,7 @@ fn decode_remote_source(
             request.priority,
             request.input_seq,
             request.items_gen,
+            request.request_id,
             request.context_epoch,
             crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
             false,
@@ -576,7 +578,9 @@ fn decode_remote_source(
     let drain_started = Instant::now();
     let mut saw_canceled = false;
     let loaded = rx.into_iter().find_map(|message| match message.payload {
-        crate::thumb_loader::ThumbMsgPayload::Pixels(pixels) => {
+        crate::thumb_loader::ThumbMsgPayload::Pixels(pixels)
+        | crate::thumb_loader::ThumbMsgPayload::SourcePixels(pixels)
+        | crate::thumb_loader::ThumbMsgPayload::ProvisionalPixels(pixels) => {
             Some((pixels.image, pixels.source_dims))
         }
         crate::thumb_loader::ThumbMsgPayload::Canceled => {

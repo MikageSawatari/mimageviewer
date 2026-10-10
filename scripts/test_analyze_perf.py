@@ -93,6 +93,18 @@ def analyze_complete_idle_health(events, start_t, end_t, **kwargs):
     return analyze_idle_health(delivery_events(events, end_t), start_t, end_t, **kwargs)
 
 
+def modifier_probe(t: float = 2.0, **fields) -> dict:
+    return {
+        "t": t,
+        "cat": "input",
+        "kind": "modifier_probe",
+        "trigger": "heartbeat",
+        "keys": [],
+        "wheel": False,
+        **fields,
+    }
+
+
 def collection_lease(
     t: float,
     request_id: int,
@@ -1345,7 +1357,7 @@ class IdleHealthTests(unittest.TestCase):
         for blank in ("", "   "):
             with self.assertRaises(ValueError):
                 analyze_complete_idle_health(
-                    delivery_events(events, 10.0),
+                    events,
                     1.0,
                     10.0,
                     expected_pid=42,
@@ -1391,6 +1403,105 @@ class IdleHealthTests(unittest.TestCase):
 
         self.assertEqual(report["status"], "fail")
         self.assertEqual(report["metrics"]["input_events"], 1)
+
+    def test_passive_modifier_heartbeat_is_not_idle_input(self) -> None:
+        for focused in (True, False, None):
+            for ctrl in (True, False):
+                probe = modifier_probe(egui_ctrl=ctrl, os_ctrl=ctrl)
+                if focused is not None:
+                    probe["focused"] = focused
+                with self.subTest(focused=focused, ctrl=ctrl):
+                    events = [frame(0.0, 0), tail(0.0, 0), probe]
+                    report = analyze_complete_idle_health(events, 0.0, 10.0)
+                    self.assertEqual(report["status"], "pass", report["failures"])
+                    self.assertEqual(report["metrics"]["input_events"], 0)
+                    # The delivery helper adds the session metadata at t=0.
+                    self.assertEqual(report["metrics"]["events"], 4)
+                    self.assertEqual(report["metrics"]["frames"], 1)
+                    self.assertEqual(report["metrics"]["tail_repaint_events"], 1)
+
+    def test_modifier_key_press_release_and_wheel_are_idle_input(self) -> None:
+        probes = [
+            modifier_probe(trigger="key_event", keys=["ArrowRight:down"]),
+            modifier_probe(trigger="key_event", keys=["ArrowRight:up"]),
+            modifier_probe(trigger="wheel", wheel=True),
+            modifier_probe(trigger="key_event"),
+            modifier_probe(trigger="wheel"),
+            modifier_probe(kind="modified_action"),
+            modifier_probe(kind="unknown_input"),
+        ]
+        for probe in probes:
+            with self.subTest(probe=probe):
+                report = analyze_complete_idle_health(
+                    [frame(0.0, 0), tail(0.0, 0), probe], 0.0, 10.0
+                )
+                self.assertEqual(report["status"], "fail")
+                self.assertEqual(report["metrics"]["input_events"], 1)
+                self.assertTrue(any("input event" in f for f in report["failures"]))
+
+    def test_contradictory_or_malformed_heartbeat_is_idle_input(self) -> None:
+        probes = [
+            modifier_probe(keys=["ArrowRight:down"]),
+            modifier_probe(wheel=True),
+            modifier_probe(keys=None),
+            modifier_probe(keys=""),
+            modifier_probe(keys={}),
+            modifier_probe(keys=()),
+            modifier_probe(keys=False),
+            modifier_probe(wheel=None),
+            modifier_probe(wheel=0),
+            modifier_probe(wheel="false"),
+            modifier_probe(trigger="unknown"),
+            modifier_probe(trigger=None),
+        ]
+        for field in ("kind", "trigger", "keys", "wheel"):
+            probe = modifier_probe()
+            del probe[field]
+            probes.append(probe)
+        for probe in probes:
+            with self.subTest(probe=probe):
+                report = analyze_complete_idle_health(
+                    [frame(0.0, 0), tail(0.0, 0), probe], 0.0, 10.0
+                )
+                self.assertEqual(report["status"], "fail")
+                self.assertEqual(report["metrics"]["input_events"], 1)
+                self.assertTrue(any("input event" in f for f in report["failures"]))
+
+    def test_heartbeat_exclusion_preserves_work_and_repaint_failures(self) -> None:
+        for cause in ("work", "repaint"):
+            events = [frame(0.0, 0), tail(0.0, 0), modifier_probe()]
+            if cause == "work":
+                for n in range(4):
+                    events.append(
+                        {
+                            "t": 1.0 + n * 0.01,
+                            "cat": "thumb",
+                            "kind": "enqueue",
+                            "key": "dir::C:/books/uncached",
+                            "idx": 7,
+                            "items_gen": 42,
+                            "request_id": n,
+                        }
+                    )
+            else:
+                for n in range(5):
+                    t = 1.0 + n * 0.7
+                    events.append(frame(t, n + 1))
+                    events.append(tail(t, n + 1, ["requested_nonempty"]))
+            with self.subTest(cause=cause):
+                report = analyze_complete_idle_health(events, 0.0, 10.0)
+                self.assertEqual(report["status"], "fail")
+                self.assertEqual(report["metrics"]["input_events"], 0)
+                self.assertEqual(report["metrics"]["events"], len(events) + 1)
+                self.assertFalse(any("input event" in f for f in report["failures"]))
+                if cause == "work":
+                    self.assertEqual(report["metrics"]["max_same_work"], 4)
+                    self.assertTrue(any("thumbnail work" in f for f in report["failures"]))
+                else:
+                    self.assertGreater(
+                        report["max_reason_streaks_secs"]["requested_nonempty"], 2.0
+                    )
+                    self.assertTrue(any("repaint reason" in f for f in report["failures"]))
 
     def test_low_frequency_repaint_loop_still_fails_reason_streak(self) -> None:
         events = [session(42)]
@@ -2020,6 +2131,39 @@ class DeliveryCompletenessTests(unittest.TestCase):
                                      10.0, 25.0, expected_pid=42, allow_sleeping_window=True)
         self.assertEqual(report["status"], "CannotJudge")
         self.assertEqual(report["metrics"]["frames"], 0)
+
+    def test_modifier_heartbeat_and_delivery_contract_compose(self):
+        cases = [
+            ("complete", {}),
+            ("missing", None),
+            ("coverage", {"coverage_t": 9.0}),
+            ("normal_drop", {"normal_dropped_total": 1}),
+            ("perf_drop", {"perf_dropped_total": 1}),
+            ("diagnostic_drop", {"diagnostic_dropped_total": 1}),
+            ("unsettled", {"settled_watermark": 19}),
+        ]
+        for active in (False, True):
+            probe = modifier_probe(**({"trigger": "key_event"} if active else {}))
+            for label, change in cases:
+                rows = delivery_events([frame(0.0, 0), tail(0.0, 0), probe], 10.0)
+                if change is None:
+                    rows.pop()
+                else:
+                    rows[-1].update(change)
+                expected_status = ("fail" if active else "pass") if label == "complete" else "CannotJudge"
+                expected_exit = (1 if active else 0) if label == "complete" else 2
+                with self.subTest(active=active, delivery=label):
+                    report = analyze_idle_health(rows, 0.0, 10.0)
+                    self.assertEqual(report["status"], expected_status)
+                    self.assertEqual(report["metrics"]["input_events"], int(active))
+                    self.assertEqual(report["metrics"]["frames"], 1)
+                    self.assertEqual(bool(report["delivery"]["reasons"]), label != "complete")
+                    self.assertEqual(bool(report["failures"]), active)
+                    with contextlib.redirect_stdout(io.StringIO()) as output:
+                        exit_code = cmd_idle_health(rows, 0.0, 10.0, 15.0,
+                                                    2.0, 10.0, 2.0, 3, 0, None)
+                    self.assertEqual(exit_code, expected_exit)
+                    self.assertIn(f"判定: {expected_status.upper()}", output.getvalue())
 
     def test_complete_zero_event_sleep_requires_stored_matching_nonce(self):
         rows = delivery_events([session(42), frame(1.0, 1), tail(1.0, 1)], 25.0)
