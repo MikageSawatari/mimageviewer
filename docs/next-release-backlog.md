@@ -39,6 +39,8 @@
 - 直らない理由 (コードの参照): 起動時 reconciliation は `status != Ok` の行だけを扱い Tantivy の存在を見ない (`src/indexer_manager.rs:714`)。Full scan も FS と SQLite の比較だけで、status=Ok かつ mtime/size 一致なら unchanged (`src/search_walker.rs:311` / `:356`)。そのため再起動・「今すぐ確認」でも欠落が残る。`docs/search-architecture.md:275` の「3-way diff で補修」は実装を過大に説明している。
 - 直し方: (1) 起動時の点検: supervisor 起動前の静止状態で SQLite の Ok 行数と Tantivy の生存文書数を比べ、Tantivy < Ok ならログ・通知のうえ既存の rebuild pending 経路で両方を作り直す (まれな失敗は作り直しで復旧する既定方針)。**UI スレッドと起動の待ちに入れない**。既存 ownership scan に集計を足すなど追加の全行読取を避け、起動時間を計測して影響があれば (1) は見送る。(2) 作り直しの順序の統一: schema 不一致・index 不在の再作成も `open_stores_with_rebuild_sync` に集約し、SQLite inventory reset + durable pending → Tantivy wipe/create の順にして、途中終了で古い Ok 行が残る穴を塞ぐ (`src/fts_index.rs:810` の `remove_dir_all` 失敗後も続行する点も見直す)。(3) `docs/search-architecture.md` の記述を実装に合わせる。
 - 復旧 (既存 UI): お気に入りの編集でアイテム索引を OFF → 削除完了 (件数 0) を待つ → ON。「今すぐ確認」だけでは不十分。
+- **追加観測 (ClaudeCode、2026-10-11 夜間の復旧作業、インストール版 v4.5.0)**: OFF→ON 後の全件再取り込み中に、3 つのお気に入りで `indexer[...]: ingest apply failed: An IO error occurred: 'アクセスが拒否されました。 (os error 5)'` が出て (00:07:48 / 00:08:18 / 00:41:40)、以後そのお気に入りの取り込みが止まったまま、編集画面は「監視中」表示で件数だけ少ない状態になった (comfyui 5,108 / 552,977 など)。通知も再開もない。「今すぐ確認」で未取り込み分 (comfyui 548,171 件など) が再開した。アクセス拒否の相手は未特定 (ClaudeCode の進捗見張りは 10 分おきに `fts_index/meta.json` を読んでいたが時刻は一致しない。ウイルス対策の走査などが候補)。**この「書き込み 1 回の失敗で取り込みが黙って止まる」経路が、元の欠落の原因候補でもある**。直し方では、取り込み失敗時に止めずに既存の作り直し / 再走査へ戻す、または少なくとも通知する方針を決める (まれな失敗の既定方針: ログ + 通知 + 作り直し)。
+
 - 規模 / 優先度: Small〜Medium / P1 (次の版)。
 
 ### 1.366 `/` 区切りで開いたフォルダから Ctrl+↓ で次のフォルダへ進めない (無反応) — 利用者の実機報告 (2026-10-10)
