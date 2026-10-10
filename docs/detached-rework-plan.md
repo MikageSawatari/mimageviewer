@@ -4463,3 +4463,40 @@ snapshot PNGは変更せず、既存の実metadata観測とsnapshot harnessを�
 変更範囲はsrc/ui_fullscreen.rs、本§11、fullscreen-specified-scale-plan.md §23、vendor/egui/PATCHES.md。
 vendorのAPI実装自体は変更せず、台帳へ破棄対象・呼出境界・更新時の保持差分を補う。
 snapshot PNG、runtime、metadata製品処理は変更しない。
+
+
+### 2026-10-10 §1.242 本の構成 — context投影・提示許可の所有拡張 (設計)
+
+本の構成設計R6は独立再レビューACCEPT。330e070f6でreceiptの所有表現を訂正した。
+E §1.342統合済tree 76488f0ecをG0で再照合し、下記をcontext所有境界の構造的拡張として扱う。
+G0差分の合意記録: 2026-10-10 独立レビュー (GPT-6.1 Sol / xhigh) がG0差分をACCEPTし、本記録の方針を「症状パッチではなく構造的修正」と合意。設計担当 (起草) と ClaudeCode (検収) も同じ主張に合意。
+本記録は設計の接続範囲であり、製品実装/実行検証が完了したことを示さない。
+
+本の列挙後に一つのprojection ownerでitems/identity/order/explicit unitsを確定し、
+既存ViewerContextBundleが構成snapshot・revision・presentation permitを保持する。
+mount/deposit/fork/park/closeは同じ所有contextの値を移し、現在mountのApp値で兄弟の構成/editor所在を判定しない。
+DBサービスとsidecar同期receiptはApp共通storeに残す。receiptをF12 bundleへ運ばない。
+
+editor draftはcontext所有、操作ownerはUI routerがmount非依存に一つ登録する。
+start/save受付はRemote BeginAcquireと同じSessionHandle.innerの短い確定境界で順序付ける。
+後から取得するRemoteは既存の全ローカル窓closeにeditorを含め、未保存draftを終了する。
+送信済save ticketはApp共通worker完了管理へ残し、窓close/AI静止に加えてticket終端後に既存FinishAcquireする。
+新しい取得拒否gate/別session owner/終了後draft回復は作らない。
+
+★固定・元一覧・F12保持列の復帰はrecipeを保持する共通adoptionへ接続する。
+Bookの依存が変われば既存reloadで更新し、結果一覧は構成保存を理由にrefreshしない。
+各窓のidentity着地と、保存元から一回だけの共有resume intentを分け、復帰/自動reanchorから位置を奪わない。
+
+連結読みは既存continuous unit/viewport表示ownerが新入場候補の許可要求を作る。
+Checking/Hiddenをtexture選択・paint・layout/hit/traceへ渡さず、キャッシュを提示許可と同一視しない。
+mode切替の新相方も同じ許可済みunit projectionを使う。連結読みを禁止せず、全結果の事前照合も追加しない。
+EのContinuousSpecifiedFitReference/retained source/captured fit入力はそのcontextで維持し、
+新しいunitの参照選択は許可後だけ。source/role/slot/sliceが変わる投影では既存の失効/remap境界を使う。
+HUD editor entryはEのframe-local前面wheel ownerを共有し、閉じるframeに背面入力を漏らさない。
+
+予定接点: app.rsのitems install/resume/既存close、app/viewer_context_registry.rsのbundle/復帰adoption、
+app/snapshot_ops.rsの保持列復帰、ui_fullscreen.rsのunit/許可/連結表示/HUD、remote_ipc/session.rsとui.rsの取得barrier。
+window predicate/HWND同定/placement/focus/viewport生成やrect一致捕捉を変更せず、
+detached専用bool・repaint/retry/時間窓による症状修復を追加しない。
+検証はG0 source照合のみ。実装後はcontext後着・兄弟不変・取得順反転・退避復帰・cached Hidden新入場・
+mode新相方・E指定サイズ/前面wheelの自動回帰を実施し、実行証拠を別途記録する。
