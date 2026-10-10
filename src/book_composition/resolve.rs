@@ -102,22 +102,74 @@ impl ResolvedComposition {
     /// Pure deletion transaction: applies the same old -> new slots to navigation,
     /// helpers, anchors and targets. Caller must adopt this with its rows/identity
     /// manifest in one generation, and retain the saved identity-based composition.
-    pub fn remap_removed_items(&self, old_to_new: &[Option<usize>]) -> CompositionResult<Self> {
+    /// Removed identities are required even for hidden/policy/facet pages, whose
+    /// presentation status deliberately has no row index. They must describe the
+    /// same deletion as the slot map; hiding/filtering is not physical deletion.
+    pub fn remap_removed_items(
+        &self,
+        old_to_new: &[Option<usize>],
+        removed_pages: &[CompositionPageRef],
+    ) -> CompositionResult<Self> {
         for (expected, index) in old_to_new.iter().flatten().enumerate() {
             if *index != expected {
                 return Err(CompositionError::Invalid("invalid deletion slot map"));
             }
         }
-        self.remap_slots(old_to_new)
+        let mut removed = HashSet::new();
+        for page in removed_pages {
+            let key = page.matching_key();
+            if !removed.insert(key.clone())
+                || matches!(
+                    self.page_status(&key),
+                    PageStatus::Missing | PageStatus::Invalid
+                )
+            {
+                return Err(CompositionError::Invalid("invalid removed page identity"));
+            }
+        }
+        for page in &self.visible_pages {
+            let slot = old_to_new
+                .get(page.item_index)
+                .ok_or(CompositionError::Invalid(
+                    "slot map does not cover projection",
+                ))?;
+            if slot.is_none() != removed.contains(&page.page.matching_key()) {
+                return Err(CompositionError::Invalid(
+                    "deletion identities disagree with slot map",
+                ));
+            }
+        }
+        let mut result = self.remap_slots(old_to_new)?;
+        for key in removed {
+            result.statuses.insert(key, PageStatus::Missing);
+        }
+        // An unsaved tail page has no saved occurrence to retain as Missing.
+        result.new_tail.retain(|page| {
+            let key = page.matching_key();
+            if result.statuses.get(&key) == Some(&PageStatus::Missing) {
+                result.statuses.remove(&key);
+                false
+            } else {
+                true
+            }
+        });
+        result.complete = !result
+            .statuses
+            .values()
+            .any(|status| *status == PageStatus::FilteredOut);
+        Ok(result)
     }
 
     /// Reorder/filter materialized rows without declaring any real page Missing.
     /// Hidden/policy/facet rows may have no output slot, but all navigation and
-    /// helper occurrences must survive. This is not a Remote budget projection.
+    /// helper occurrences must survive. The output is a dense permutation/filter
+    /// of the input rows: exactly 0..count(Some), with no holes or new rows.
+    /// This is not a Remote budget projection or a physical deletion operation.
     pub fn reindex_items(&self, old_to_new: &[Option<usize>]) -> CompositionResult<Self> {
         let mut targets = HashSet::new();
+        let output_len = old_to_new.iter().flatten().count();
         for index in old_to_new.iter().flatten() {
-            if *index >= old_to_new.len() || !targets.insert(*index) {
+            if *index >= output_len || !targets.insert(*index) {
                 return Err(CompositionError::Invalid("invalid item reindex map"));
             }
         }
@@ -193,17 +245,6 @@ impl ResolvedComposition {
                 };
             }
         }
-        // A removed unsaved tail page has no saved occurrence to retain as Missing.
-        // Match fresh resolution against the updated raw manifest.
-        result.new_tail.retain(|page| {
-            let key = page.matching_key();
-            if result.statuses.get(&key) == Some(&PageStatus::Missing) {
-                result.statuses.remove(&key);
-                false
-            } else {
-                true
-            }
-        });
         Ok(result)
     }
 }

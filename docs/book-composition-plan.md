@@ -1346,13 +1346,18 @@ G1の完了条件へG2以降の構成fixtureを先取りしない。G4F未実装
 `BookComposition`はPair/Singleのみ、BlankはSingleCompanionの値であり独立page/IDを持たない。
 hiddenは登録済refの集合指定、Missingはmanifest不在から導出する。resolverは寸法・自動規則・shift・
 App/UIの入力を持たず、元slotの欠落Singleと新tail中央Singleを生成する。saved recordは変更しない。
-`ResolvedComposition::remap_removed_items`はrowsと同時採用するold→new mapを受け、
+`ResolvedComposition::remap_removed_items`はrowsと同時採用するold→new mapと削除identityを受け、
 unit/anchor/helper/target/実ページflat列をまとめてremapし、登録済みの削除refをMissingへ更新する。
+不可視refはpresentation statusにrow indexを持たないため、Hidden/policy/facetの実削除も
+必須のidentityで更新する。可視ページのidentityとmapの削除指定が違えば操作全体を拒否する。
+未保存tailの削除はstatus/tailから除き、残るfacet状態からcompleteを再計算する。
 G3は同じtransactionで元manifest/identity表も更新し、永続refを削除しない。
 resolverのindexは入力manifestのrow空間を維持する。G3で構成順のrowsを作る時は
 `reindex_items`でtarget/unit/anchor/helperを同じ新slotへ写してから一括採用し、
 並べ替えの未採用row空間をviewerのitems indexとして公開しない。
-`fixtures::four_page_book` / `editor_unit_edits`はG3/G4の再利用用pure checkpoint。
+reindexの出力は旧rowsの並べ替え/絞り込みだけで、新rowsを追加しない密な列
+`0..count(Some)`とする。旧row数以内でも出力範囲外/穴/重複は拒否する。
+`fixtures::four_page_book` / `editor_unit_edits` / `hidden_blank_deletion_book`はG3/G4の再利用用pure checkpoint。
 draft操作はcloneに適用→同じvalidatorで検証し、拒否なら元draft/revisionを変更しない。
 coverを含むPair作成は明示`clear_cover`と補助除去を同じ操作で行える。
 
@@ -1369,6 +1374,9 @@ G2Aは種類/階層の検証用`PageDomain`だけを定義し、root/key/store�
 G2 part BはE統合後。store/rename/purge/content restore/Edit ledger/transfer/sidecar/runtime接続は本chunkに含めない。
 JSON round-tripはpure memory内の検証であり、DB transaction rollbackの検証を済ませた意味ではない。
 自動検証のcommand/件数/exit/logは`target/G-1242-g2a-msg.txt`へ記録し、独立レビュー/製品実機確認は主張しない。
+G2A REVISEの境界修正・fixture・G1入力テストの共有native frame所有・master照合と
+再検証結果は`target/G-1242-g2a2-msg.txt`へ記録する。最初のfull-lib失敗はstartup restoreと
+G1 extracted key handlerであり、video EOF/saved-group modalの失敗として扱わない。
 
 受入:
 

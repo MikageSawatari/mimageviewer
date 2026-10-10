@@ -581,7 +581,7 @@ fn deletion_remap_preserves_c_d_and_b_missing_before_reload() {
         let before = book.clone();
         let projection = resolve(&book, &document_manifest(4));
         let remapped = projection
-            .remap_removed_items(&[Some(0), None, Some(1), Some(2)])
+            .remap_removed_items(&[Some(0), None, Some(1), Some(2)], &[document_page(1)])
             .unwrap();
         assert_single(
             &remapped.units[0],
@@ -622,7 +622,7 @@ fn remap_covers_both_pair_sides_empty_units_helpers_and_blank_partner() {
     let fixture = editor_unit_edits(ReadingDirection::Ltr);
     let projection = resolve(&fixture.with_cover_helper, &document_manifest(4));
     let mapped = projection
-        .remap_removed_items(&[None, Some(0), Some(1), Some(2)])
+        .remap_removed_items(&[None, Some(0), Some(1), Some(2)], &[document_page(0)])
         .unwrap();
     assert_single(
         mapped.units.last().unwrap(),
@@ -633,7 +633,7 @@ fn remap_covers_both_pair_sides_empty_units_helpers_and_blank_partner() {
     );
     let blank = resolve(&fixture.blank, &document_manifest(4));
     let mapped = blank
-        .remap_removed_items(&[Some(0), None, Some(1), Some(2)])
+        .remap_removed_items(&[Some(0), None, Some(1), Some(2)], &[document_page(1)])
         .unwrap();
     assert!(!mapped.units.iter().any(|unit| matches!(
         unit,
@@ -651,7 +651,10 @@ fn remap_covers_both_pair_sides_empty_units_helpers_and_blank_partner() {
     ));
     let pair = resolve(&fixture.original, &document_manifest(4));
     let mapped = pair
-        .remap_removed_items(&[None, Some(0), None, None])
+        .remap_removed_items(
+            &[None, Some(0), None, None],
+            &[document_page(0), document_page(2), document_page(3)],
+        )
         .unwrap();
     assert_eq!(mapped.units.len(), 1);
     assert_single(
@@ -662,7 +665,7 @@ fn remap_covers_both_pair_sides_empty_units_helpers_and_blank_partner() {
         ResolvedCompanion::Vacant,
     );
     assert!(
-        pair.remap_removed_items(&[None; 4])
+        pair.remap_removed_items(&[None; 4], &(0..4).map(document_page).collect::<Vec<_>>())
             .unwrap()
             .units
             .is_empty()
@@ -675,8 +678,119 @@ fn remap_covers_both_pair_sides_empty_units_helpers_and_blank_partner() {
         vec![Some(4), None, None, None],
         vec![Some(1), Some(2), None, None],
     ] {
-        assert!(pair.remap_removed_items(&map).is_err());
+        assert!(pair.remap_removed_items(&map, &[]).is_err());
     }
+}
+
+#[test]
+fn physical_deletion_of_hidden_b_and_hidden_blank_b_matches_fresh_resolve() {
+    for direction in [ReadingDirection::Ltr, ReadingDirection::Rtl] {
+        let hidden_pair = four_page_book(direction)
+            .edited(
+                &PageDomain::Document,
+                UnitEdit::SetHidden {
+                    page: document_page(1),
+                    hidden: true,
+                },
+            )
+            .unwrap();
+        for book in [hidden_pair, hidden_blank_deletion_book(direction)] {
+            let saved = book.to_json(&PageDomain::Document).unwrap();
+            let before = resolve(&book, &document_manifest(4));
+            let sibling = before.clone();
+            let map = [Some(0), None, Some(1), Some(2)];
+            assert_eq!(
+                before.page_status(&document_page(1)),
+                PageStatus::HiddenByComposition
+            );
+            let deleted = before
+                .remap_removed_items(&map, &[document_page(1)])
+                .unwrap();
+            assert_eq!(deleted.page_status(&document_page(1)), PageStatus::Missing);
+            let mut manifest = document_manifest(4);
+            manifest.remove(1);
+            for (item_index, entry) in manifest.iter_mut().enumerate() {
+                entry.availability = ManifestAvailability::Present { item_index };
+            }
+            assert_eq!(deleted, resolve(&book, &manifest));
+            assert_eq!(book.to_json(&PageDomain::Document).unwrap(), saved);
+            assert_eq!(before, sibling);
+            assert_eq!(resolve(&book, &document_manifest(4)), before);
+            if book.units.iter().any(|unit| {
+                matches!(
+                    unit,
+                    CompositionUnit::Single {
+                        companion: SingleCompanion::Blank,
+                        ..
+                    }
+                )
+            }) {
+                let shown = book
+                    .edited(
+                        &PageDomain::Document,
+                        UnitEdit::SetHidden {
+                            page: document_page(1),
+                            hidden: false,
+                        },
+                    )
+                    .unwrap();
+                assert!(resolve(&shown, &document_manifest(4)).units.iter().any(|unit| matches!(unit, ResolvedUnit::Single { page, companion: ResolvedCompanion::Blank, .. } if page.page == document_page(1))));
+            }
+        }
+    }
+}
+
+#[test]
+fn deletion_identities_cover_policy_facet_tail_and_reject_inconsistent_visible_maps() {
+    let book = four_page_book(ReadingDirection::Ltr);
+    for availability in [
+        ManifestAvailability::ExcludedByPolicy,
+        ManifestAvailability::FilteredOut,
+    ] {
+        let mut manifest = document_manifest(5);
+        manifest[1].availability = availability;
+        manifest[4].availability = availability;
+        let before = resolve(&book, &manifest);
+        let deleted = before
+            .remap_removed_items(
+                &[Some(0), None, Some(1), Some(2), None],
+                &[document_page(1), document_page(4)],
+            )
+            .unwrap();
+        let manifest = vec![
+            manifest[0].clone(),
+            ManifestPage {
+                page: document_page(2),
+                availability: ManifestAvailability::Present { item_index: 1 },
+            },
+            ManifestPage {
+                page: document_page(3),
+                availability: ManifestAvailability::Present { item_index: 2 },
+            },
+        ];
+        assert_eq!(deleted, resolve(&book, &manifest));
+        assert_eq!(deleted.page_status(&document_page(1)), PageStatus::Missing);
+        assert_eq!(deleted.page_status(&document_page(4)), PageStatus::Invalid);
+        assert!(deleted.complete);
+    }
+    let projection = resolve(&book, &document_manifest(4));
+    for removed in [
+        vec![],
+        vec![document_page(0)],
+        vec![document_page(1), document_page(1)],
+        vec![document_page(99)],
+    ] {
+        assert!(
+            projection
+                .remap_removed_items(&[Some(0), None, Some(1), Some(2)], &removed)
+                .is_err()
+        );
+    }
+    assert!(
+        projection
+            .remap_removed_items(&[Some(0), Some(1), Some(2), Some(3)], &[document_page(1)])
+            .is_err()
+    );
 }
 
 #[test]
@@ -1180,6 +1294,17 @@ fn adoption_reindex_keeps_units_helpers_and_targets_in_one_row_space() {
             .is_err()
     );
     let hidden = resolve(&fixture.hidden, &document_manifest(4));
+    // Filtering B must produce three dense output rows, not old indices 0/2/3.
+    assert!(
+        hidden
+            .reindex_items(&[Some(0), None, Some(2), Some(3)])
+            .is_err()
+    );
+    assert!(
+        hidden
+            .reindex_items(&[Some(1), None, Some(2), Some(3)])
+            .is_err()
+    );
     assert_eq!(
         hidden
             .reindex_items(&[Some(0), None, Some(1), Some(2)])
@@ -1222,7 +1347,10 @@ fn deleting_unsaved_tail_matches_fresh_manifest_and_other_projection_is_unchange
     let before = resolve(&book, &document_manifest(5));
     let sibling = before.clone();
     let deleted = before
-        .remap_removed_items(&[Some(0), Some(1), Some(2), Some(3), None])
+        .remap_removed_items(
+            &[Some(0), Some(1), Some(2), Some(3), None],
+            &[document_page(4)],
+        )
         .unwrap();
     assert_eq!(deleted, resolve(&book, &document_manifest(4)));
     assert_eq!(before, sibling);

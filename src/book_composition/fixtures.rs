@@ -42,6 +42,21 @@ pub(crate) fn document_manifest(count: u32) -> Vec<ManifestPage> {
         .collect()
 }
 
+/// B remains an ordinary saved page with a subordinate Blank even when hidden.
+/// Raw source slots are still A/B/C/D; deletion must name B, not just drop a slot.
+pub(crate) fn hidden_blank_deletion_book(direction: ReadingDirection) -> BookComposition {
+    editor_unit_edits(direction)
+        .blank
+        .edited(
+            &PageDomain::Document,
+            UnitEdit::SetHidden {
+                page: document_page(1),
+                hidden: true,
+            },
+        )
+        .unwrap()
+}
+
 pub(crate) struct EditorUnitEditFixture {
     pub original: BookComposition,
     pub split: BookComposition,

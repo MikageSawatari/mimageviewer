@@ -73847,6 +73847,11 @@ mod tests {
     #[test]
     fn g1_extracted_key_handlers_ignore_old_db_rows_and_never_persist() {
         use crate::app::book_materialization::{ExtractedSurface, ProjectionRecipe};
+        // AppTestEnv serializes settings, not the process-global Win32 input
+        // frame. Wait for its ownership token before taking the App fixture lock.
+        // Otherwise another input test's ROOT frame suppresses egui key fallback.
+        #[cfg(windows)]
+        let _input_guard = crate::key_input::lock_test_input();
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("spread.db");
         let mut app = final_cover_local_test_app(4);
@@ -73890,6 +73895,9 @@ mod tests {
         assert_eq!(app.spread_container_key(), None);
         app.fullscreen_idx = Some(0);
         let ctx = egui::Context::default();
+        assert_eq!(app.modal_dialog_block_reason(), None);
+        #[cfg(windows)]
+        assert!(!crate::key_input::is_frame_active(ctx.viewport_id()));
         for (key, expected) in [
             (egui::Key::Num3, SpreadMode::Rtl),
             (egui::Key::Num7, SpreadMode::Rtl),
@@ -73929,6 +73937,61 @@ mod tests {
             app.spread_db.as_ref().unwrap().get(&key),
             Some(SpreadMode::LtrCover)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn g1_extracted_key_fixture_exposes_foreign_native_frame_interference() {
+        use crate::app::book_materialization::{ExtractedSurface, ProjectionRecipe};
+        let _input_guard = crate::key_input::lock_test_input();
+        let mut app = final_cover_local_test_app(4);
+        app.projection_recipe = ProjectionRecipe::ExtractedResult(ExtractedSurface::Search(
+            crate::app::top_level_grid_view::TopLevelSearchView::Global,
+        ));
+        app.settings.default_reading_direction = ReadingDirection::Rtl;
+        app.begin_extracted_result_view();
+        app.fullscreen_idx = Some(0);
+        assert_eq!(app.modal_dialog_block_reason(), None);
+        let ctx = egui::Context::default();
+        // Model the concurrent input test's unrelated ROOT edge. With native
+        // evidence present, keymap correctly uses that queue instead of egui.
+        crate::key_input::set_test_frame(vec![crate::key_input::KeyEdge {
+            source_hwnd: 1,
+            source_viewport: egui::ViewportId::ROOT,
+            virtual_key: 0x87, // F24: unrelated to the injected spread shortcut.
+            scan_code: 0,
+            extended: false,
+            pressed: true,
+            repeat: false,
+            ctrl: false,
+            shift: false,
+            alt: false,
+        }]);
+        let press_spread = |app: &mut crate::app::AppTestEnvForTest| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    focused: true,
+                    events: vec![egui::Event::Key {
+                        key: egui::Key::Num3,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |ctx| {
+                    app.handle_fs_key_input(ctx, 0, false);
+                },
+            );
+        };
+        press_spread(&mut app);
+        assert_eq!(app.spread_mode, SpreadMode::Single);
+        // Finish the foreign frame explicitly; no timing delay or retry.
+        crate::key_input::clear_test_frame();
+        assert!(!crate::key_input::is_frame_active(ctx.viewport_id()));
+        press_spread(&mut app);
+        assert_eq!(app.spread_mode, SpreadMode::Rtl);
     }
 
     #[test]
