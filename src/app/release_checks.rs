@@ -4,6 +4,50 @@ use crate::test_script::release_checks::{self as protocol, Observation, Operatio
 use serde_json::{Value, json};
 
 impl App {
+    // Called before receive; emitted only after the canonical owner accepts the
+    // receipt. Finalized must observe the real queued image, before its terminal
+    // transition removes/settles that reservation.
+    pub(super) fn release_check_receipt(
+        &self,
+        msg: &crate::thumb_loader::ThumbMsg,
+    ) -> Option<(&'static str, Value)> {
+        use crate::thumb_loader::{ThumbLoadOrigin, ThumbMsgPayload, ThumbnailRequestId};
+        if !protocol::is_active() {
+            return None;
+        }
+        let ThumbnailRequestId::Registered(id) = msg.request_id else {
+            return None;
+        };
+        let projection =
+            self.requested
+                .diagnostic_projection(msg.idx, msg.request_id, msg.items_gen)?;
+        let item = self.items.get(msg.idx)?;
+        let mut proof = json!({"request_id":id,"key":item.perf_key(),"idx":projection.idx,
+            "items_gen":projection.items_gen,"input_seq":msg.input_seq,
+            "worker_pending":projection.worker_pending,
+            "image_backlog_contains_request":projection.image_backlog_contains_request,
+            "window_visible":self.window_visible});
+        if matches!(msg.payload, ThumbMsgPayload::Finalized) {
+            proof["close_sequence"] = protocol::session()
+                .lock()
+                .ok()
+                .and_then(|s| s.as_ref().map(|s| json!(s.close_sequence)))
+                .unwrap_or(Value::Null);
+            return Some(("finalized", proof));
+        }
+        let origin = msg.pixels()?.origin;
+        let name = match origin {
+            ThumbLoadOrigin::UpgradeableCache => "upgradeable_cache",
+            ThumbLoadOrigin::FinalCache => "final_cache",
+            ThumbLoadOrigin::DriveListChildSeed => "drive_list_child_seed",
+            ThumbLoadOrigin::EditPreviewCache { .. } => "edit_preview_cache",
+            _ => return None,
+        };
+        proof["origin"] = json!(name);
+        proof["from_cache"] = json!(true);
+        Some(("cache_read", proof))
+    }
+
     pub(super) fn release_check_record_early_tail(&self, ctx: &egui::Context) {
         if !crate::test_script::release_checks::is_active() {
             return;
@@ -56,11 +100,19 @@ impl App {
             && loaded == keep.len()
             && !self.requested.blocks_idle_upgrade()
             && !snapshot.startup_open_pending;
+        let requests = self.requested.diagnostic_requests();
+        let worker_pending_count = requests.iter().filter(|r| r.worker_pending).count();
+        let request_projections: Vec<_> = requests.iter().filter_map(|r| {
+            let crate::thumb_loader::ThumbnailRequestId::Registered(id) = r.request_id else { return None; };
+            Some(json!({"request_id":id,"idx":r.idx,"items_gen":r.items_gen,
+                "worker_pending":r.worker_pending,"image_backlog_contains_request":r.image_backlog_contains_request}))
+        }).collect();
         Observation {
             value: json!({"pid":std::process::id(),"root_hwnd":self.main_hwnd.map(|h|h as u64),"perf_t":crate::perf::program_start().map(|s|s.elapsed().as_secs_f64()),
                 "window_visible":self.window_visible,"focused":snapshot.focused,
                 "current_folder_path":snapshot.current_folder_path,"items_generation":self.items_generation,
                 "items_len":self.items.len(),"requested_count":self.requested.legacy_len(),
+                "worker_pending_count":worker_pending_count,"request_projections":request_projections,
                 "keep_count":keep.len(),"loaded_keep_count":loaded,
                 "requested_px":self.display_px_shared.load(std::sync::atomic::Ordering::Relaxed),
                 "loading_complete":complete,"index_settled":!self.initial_scan_settled_pending,
@@ -177,13 +229,14 @@ pub(crate) fn record_close_accept(app: &App) {
     drop(session);
     protocol::trace("close_accept", proof);
 }
-pub(crate) fn record_tray_hide(_app: &App) {
+pub(crate) fn record_tray_hide(app: &App) {
     let proof = protocol::session().lock().ok().and_then(|s| {
         s.as_ref()
             .filter(|s| s.close_sequence > 0)
             .map(|s| s.close_proof.clone())
     });
-    if let Some(proof) = proof {
+    if let Some(mut proof) = proof {
+        proof["window_visible"] = json!(app.window_visible);
         protocol::trace("tray_hide", proof);
     }
 }

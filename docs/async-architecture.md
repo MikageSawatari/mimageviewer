@@ -241,6 +241,9 @@ session 取消で通知・未開始仕事を失効させ、最後の fetch / sav
 | 製本並べ替えサムネイル | `std::thread` + mpsc | 最大 4 in-flight | 本の並べ替え専用ビューの焼き込み済みページを小サムネとして先行 decode。通常グリッドのキャッシュ/drag-out 経路とは分離し、UI 側は結果 backlog から `load_texture` を 1 フレーム 1 枚だけ実行する |
 | フルスクリーンロード | `std::thread` (使い捨て) | 1 枚ごとに spawn | フルサイズ画像デコード + アニメ展開 |
 | RAW 現像 | App 共有 `RawDevelopExecutor` | 設定 1〜10、既定 3 | High / Normal / Background の優先度付き LibRaw Full / half 現像。RAW fullscreen worker は ZIP/verified bytes を fs scheduler permit 内で解決し、permit を返してから Full の結果 channel を待つ。fs ticket の cancel flag は permit 解放後も executor job と共有し、executor ticket は context-owned `fs_pending` が保持して prefetch → displayed の High 昇格と cancel を行う。UI drop は queued job を取消し、実行中 native call は join しない |
+| 通常／perf log | `std::thread` (`log-writer`) | processごとに一つ | 全ファイルI/O・通常batch即flush・perf250ms flush、有界非blocking受付、drop summary、barrier／snapshot、終了合計2秒 |
+| log排出確認 | `std::thread` (`log-delivery-control`) | perf有効processごとに一つ | current-user DACLとremote拒否の専用named pipe。完了ACKだけを返し、UIやRemote operationへ配送しない |
+| 診断ZIP | `std::thread` (`diagnostics-export`) | Appに一要求 | Desktop解決・barrier待ち・snapshot読取り・圧縮・ZIP flushをworkerで実施。App終了は要求をretireしjoinしない |
 | PDF ワーカー | **別プロセス** (`--pdf-worker`) + 各プロセス専用のディスパッチャースレッド | 設定 3〜10、既定 5 (うち 1 を Critical 予約) | PDFium は非スレッドセーフ → マルチプロセスで並列化。設定は App 起動時に static snapshot へ固定し、遅延初期化時には読み直さない。要求は JobQueue に enqueue。同時 open は 3 件 (背景は 2 件) に別途制限する (下表 `pdf_pool.queue` 参照) |
 | PDF ページ列挙 | `std::thread` (`pdf-enumerate-nav`) + `PdfEnumerateCoordinator` | 実行中の `(実読込パス, password, want_direction)` ごとに 1 | 通常 PDF と固定済み EPUB は I/O 無しで読込パスを得て UI 呼出中に待ち手を登録する。新ハンドル受領後に旧ハンドルを捨てる App の handoff でも同じ要求に合流する。未固定 EPUB は背景スレッドで source stat・DB 照合・合流登録・要求エンコードを行う。固定表 mutex はメモリ検索だけを保護し、stat・DB 照合中は保持しない。PDF pool は列挙スレッドで遅延初期化する。登録前 cancel・spawn 失敗も receiver を完了させる。合流した全 waiter へ `PdfReadError` (`PasswordRequired` / `NotConverted` / `EpubUnavailable` / `Other`) を型を保ったまま配る。1 waiter の離脱では他を維持し、全 waiter が離れた時だけ source request を cancel する。EPUB の方向は世代行から、通常 PDF の方向は要求時だけ PDFium の追加 open から応答に載せる |
 | PDF メタ catch-up / 隣接 prefetch | `std::thread` (常駐、`pdf-meta-catchup`) | 1 | `pdf_meta` テーブルへの背景書き込みを統括 (v1.0.0)。WebP cache hit で render_page を skip した PDF (= アップグレードユーザーの既存サムネ) の `pdf_meta` 補完 (`MetaOnly`、low lane) と、`load_pdf_as_folder` 直後の ±1 隣接 PDF の page 0 render + WebP 温め (`NeighborPrefetch`、high lane) を、`CatchupQueue` 経由でシリアル処理する。重複は pending HashSet で dedup、low → high の優先昇格あり |
@@ -1570,7 +1573,27 @@ installer shutdown はこの遮断を迂回して通常終了する。
 ## 7. パフォーマンス計装 (perf.rs)
 
 「キー入力 → 画面表示」レイテンシを後から解析するための構造化イベントログ。
-既存 `logger.rs` (人間可読) はそのまま残り、`perf.rs` が JSON Lines を別ファイルに書く。
+`logger.rs` (人間可読) と `perf.rs` (JSON Lines) はmemory facade。process内の一つの
+`log-writer` が両ファイルのopen・write・flush・rotation・retentionを所有する。producerは
+時刻・OS tidを自身で採取し、既存crossbeamの有界channelへ一度だけtry_sendする。
+producer／writer間の共有Mutexは置かず、通常の受付競合では捨てない（実機確認後の利用者決定、2026-10-09）。
+上限は262,144件／本文128MiB／1件1MiBで、発行予約・未処理batchも書込み完了まで会計に含む。
+容量上限／oversizeはdrop-new。登録・cohort選択・cutoff・closeは一つのatomic所有者で確定し、
+barrierを跨ぐ発行を拒否せず、終了はclose前に登録済みの発行も排出する。
+`records_dropped` はsink／理由／差分・累計・発生時刻幅をwriterから直接保存する。
+通常logは各到着batchを直ちにwrite・flush、perfだけdirty時250ms周期。`logger::flush` /
+`perf::flush` はcoalesced非blocking要求であり、保存完了の保証ではない。
+
+診断ZIPはAppの `ExportOwner` が一要求だけ所有し、workerが要求印・完了barrier・固定prefix
+snapshotを取得してから圧縮する。過去のdropはmanifestと画面で証拠不完全を知らせ保存できる。
+今回の要求印drop／barrier timeout／必須snapshot読取り失敗は作成失敗。UIはsubmit/pollのみ。
+
+perf session.startはqueueから独立した初期化metadataとして先頭に保存。解析は同session・nonceの
+`drain_checkpoint`、coverage、watermark、sink status、既知の欠落数、ACKのfile identity／byte offsetを
+照合する。idle-health / hitches / scroll / startupは証明不明または欠落ありでCannotJudge／exit 2。
+通常終了はruntime cleanup・startup terminal公開後に、一般writerとstartup writer合計2秒で待つ。
+panic.log／UI watchdogは直接writeを維持し、startupとRemoteの独立ownerは統合しない。
+詳細: [§1.356設計・決定](async-log-writer-plan.md)、[idle health](idle-health-check.md)。
 
 ### 7.1 有効化
 
@@ -1618,7 +1641,7 @@ installer shutdown はこの遮断を迂回して通常終了する。
   `pre_grid_breakdown` は `n` / `total_ms` と、検索・お気に入り・タグ・ファセット・遅延状態・
   下部情報・フォルダペイン・選択 overlay・scroll routing・stack reconcile の各 `*_ms` を持つ
 - `log` — 共用 logger の `slow_io`（wait / hold が50 ms以上のときのみ）と `diagnostic_dropped`。
-  通常 / perf logger の待ち・保持・write/flush と holder snapshot を有界メモリキューに記録し、
+  writerのwrite/flushとholder snapshotを有界メモリキューに記録し、`io_owner=writer`を付ける。
   後続perf書込で再帰なしに排出する。`ui.other_worker_polls_breakdown` と
   `thumb.load_phases` の追加区間も含む詳細・入れ子・時刻の読み方は
   [UI応答性の計装一覧](ui-responsiveness.md#恒久的に使える計装) を参照。
@@ -1652,7 +1675,8 @@ context/surface generation の整合を確認する。旧 collection event は�
 thumbnail work の反復を検査し、閾値超過で exit 1 を返す。アプリが正常に sleep すると
 区間内 event が 0 件になるため、wall time はプロセス外から `--start-t` / `--end-t` で渡す。
 空区間は既定では窓ずれとして失敗し、外部 sampler が perf log の `session.start.pid` と測定対象
-PID の一致を確認した場合だけ `--allow-sleeping-window` で明示的に許可する。
+PID・process creation・測定末尾までの同nonce checkpointとdrop zeroを確認した場合だけ
+`--allow-sleeping-window` で明示的に許可する。保存未完了／証拠不完全はexit 2。
 CPU time とログ増加量も含むリリース前手順は
 [idle-health-check.md](idle-health-check.md) を参照する。
 

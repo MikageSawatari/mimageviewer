@@ -1304,9 +1304,29 @@ fn snapshot_with_theme_options(
     contrast: mimageviewer::settings::TextContrast,
     size: egui::Vec2,
     animated_steps: Option<usize>,
-    mut build_ui: impl FnMut(&mut egui::Ui),
+    build_ui: impl FnMut(&mut egui::Ui),
     interact: impl FnOnce(&mut Harness<'_>),
 ) {
+    drop(snapshot_with_theme_options_collect(
+        name,
+        resolved,
+        contrast,
+        size,
+        animated_steps,
+        build_ui,
+        interact,
+    ));
+}
+
+fn snapshot_with_theme_options_collect(
+    name: &str,
+    resolved: mimageviewer::os_theme::ResolvedTheme,
+    contrast: mimageviewer::settings::TextContrast,
+    size: egui::Vec2,
+    animated_steps: Option<usize>,
+    mut build_ui: impl FnMut(&mut egui::Ui),
+    interact: impl FnOnce(&mut Harness<'_>),
+) -> egui_kittest::SnapshotResults {
     let mut fonts_ready = false;
     let mut harness = test_ui::builder().with_size(size).build(move |ctx| {
         mimageviewer::os_theme::apply_resolved_with_contrast(ctx, resolved, contrast);
@@ -1332,6 +1352,7 @@ fn snapshot_with_theme_options(
     }
     interact(&mut harness);
     harness.snapshot(name);
+    harness.take_snapshot_results()
 }
 
 #[cfg(windows)]
@@ -1760,6 +1781,205 @@ fn fullscreen_fit_cycle_single_mode_dark() {
         None,
         mimageviewer::draw_fullscreen_fit_cycle_settings_snapshot_fixture,
     );
+}
+
+#[test]
+fn fullscreen_specified_scale_editor_snapshots() {
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    use mimageviewer::settings::{FullscreenSpecifiedScale, SpecifiedScaleAxis};
+    let cases = [
+        ("default", FullscreenSpecifiedScale::default()),
+        (
+            "disabled_mixed",
+            FullscreenSpecifiedScale {
+                width: mimageviewer::settings::SpecifiedScaleAxisSetting::disabled(
+                    SpecifiedScaleAxis::LogicalPixels(1234),
+                ),
+                height: mimageviewer::settings::SpecifiedScaleAxisSetting::disabled(
+                    SpecifiedScaleAxis::PercentTenths(375),
+                ),
+            },
+        ),
+        (
+            "width_only",
+            FullscreenSpecifiedScale {
+                width: mimageviewer::settings::SpecifiedScaleAxisSetting::enabled(
+                    SpecifiedScaleAxis::PercentTenths(800),
+                ),
+                height: mimageviewer::settings::SpecifiedScaleAxisSetting::disabled(
+                    mimageviewer::settings::SpecifiedScaleAxis::PercentTenths(800),
+                ),
+            },
+        ),
+        (
+            "height_only",
+            FullscreenSpecifiedScale {
+                width: mimageviewer::settings::SpecifiedScaleAxisSetting::disabled(
+                    mimageviewer::settings::SpecifiedScaleAxis::PercentTenths(800),
+                ),
+                height: mimageviewer::settings::SpecifiedScaleAxisSetting::enabled(
+                    SpecifiedScaleAxis::LogicalPixels(800),
+                ),
+            },
+        ),
+        (
+            "mixed",
+            FullscreenSpecifiedScale {
+                width: mimageviewer::settings::SpecifiedScaleAxisSetting::enabled(
+                    SpecifiedScaleAxis::PercentTenths(500),
+                ),
+                height: mimageviewer::settings::SpecifiedScaleAxisSetting::enabled(
+                    SpecifiedScaleAxis::LogicalPixels(800),
+                ),
+            },
+        ),
+        (
+            "none",
+            FullscreenSpecifiedScale {
+                width: mimageviewer::settings::SpecifiedScaleAxisSetting::disabled(
+                    mimageviewer::settings::SpecifiedScaleAxis::PercentTenths(800),
+                ),
+                height: mimageviewer::settings::SpecifiedScaleAxisSetting::disabled(
+                    mimageviewer::settings::SpecifiedScaleAxis::PercentTenths(800),
+                ),
+            },
+        ),
+        (
+            "limits",
+            FullscreenSpecifiedScale {
+                width: mimageviewer::settings::SpecifiedScaleAxisSetting::enabled(
+                    SpecifiedScaleAxis::PercentTenths(1),
+                ),
+                height: mimageviewer::settings::SpecifiedScaleAxisSetting::enabled(
+                    SpecifiedScaleAxis::LogicalPixels(32768),
+                ),
+            },
+        ),
+    ];
+    for (theme_name, theme) in [
+        ("light", mimageviewer::os_theme::ResolvedTheme::Light),
+        ("dark", mimageviewer::os_theme::ResolvedTheme::Dark),
+    ] {
+        for (size_name, size) in [
+            ("normal", egui::vec2(560.0, 430.0)),
+            ("narrow", egui::vec2(280.0, 570.0)),
+        ] {
+            for (case, mut value) in cases {
+                let mut max_tenths = if case == "disabled_mixed" {
+                    25
+                } else {
+                    mimageviewer::settings::FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS
+                };
+                if size_name == "narrow" && matches!(case, "width_only" | "height_only" | "limits")
+                {
+                    continue;
+                }
+                snapshots.extend(snapshot_with_theme_options_collect(
+                    &format!("fullscreen_specified_scale_{case}_{size_name}_{theme_name}"),
+                    theme,
+                    mimageviewer::settings::TextContrast::Standard,
+                    size,
+                    None,
+                    |ui| {
+                        ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                assert!(!mimageviewer::draw_fullscreen_specified_scale_settings(
+                                    ui,
+                                    &mut value,
+                                    &mut max_tenths
+                                ));
+                            });
+                    },
+                    |_| {},
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn fullscreen_specified_scale_live_popup_snapshots() {
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    for (theme_name, theme) in [
+        ("light", mimageviewer::os_theme::ResolvedTheme::Light),
+        ("dark", mimageviewer::os_theme::ResolvedTheme::Dark),
+    ] {
+        for (size_name, size) in [
+            ("normal", egui::vec2(480.0, 450.0)),
+            ("narrow", egui::vec2(280.0, 620.0)),
+        ] {
+            for (scope, favorite) in [("standard", false), ("favorite", true)] {
+                let mut value = mimageviewer::settings::FullscreenSpecifiedScale::default();
+                snapshots.extend(snapshot_with_theme_options_collect(
+                    &format!("fullscreen_specified_scale_live_{scope}_{size_name}_{theme_name}"),
+                    theme,
+                    mimageviewer::settings::TextContrast::Standard,
+                    size,
+                    None,
+                    |ui| {
+                        mimageviewer::draw_fullscreen_specified_scale_live_settings(
+                            ui, &mut value, &mut { mimageviewer::settings::FULLSCREEN_SPECIFIED_SCALE_MAX_DEFAULT_TENTHS }, favorite,
+                        );
+                    },
+                    |_| {},
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn fullscreen_fit_hud_popup_snapshots() {
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    for (theme_name, theme) in [
+        ("light", mimageviewer::os_theme::ResolvedTheme::Light),
+        ("dark", mimageviewer::os_theme::ResolvedTheme::Dark),
+    ] {
+        for (size_name, size) in [
+            ("tall", egui::vec2(1200.0, 1000.0)),
+            ("normal1093", egui::vec2(1093.0, 614.0)),
+            ("narrow", egui::vec2(280.0, 320.0)),
+        ] {
+            for (scope, favorite) in [("standard", false), ("favorite", true)] {
+                snapshots.extend(snapshot_with_theme_options_collect(
+                    &format!("fullscreen_fit_hud_popup_{scope}_{size_name}_{theme_name}"),
+                    theme,
+                    mimageviewer::settings::TextContrast::Standard,
+                    size,
+                    None,
+                    |ui| mimageviewer::draw_fs_fit_popup_snapshot_fixture(ui, favorite),
+                    |_| {},
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn fullscreen_fit_cycle_all_modes_snapshots() {
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    for (theme_name, theme) in [
+        ("light", mimageviewer::os_theme::ResolvedTheme::Light),
+        ("dark", mimageviewer::os_theme::ResolvedTheme::Dark),
+    ] {
+        for (size_name, size) in [
+            ("normal", egui::vec2(480.0, 320.0)),
+            ("narrow", egui::vec2(280.0, 410.0)),
+        ] {
+            let mut settings = mimageviewer::settings::Settings::default();
+            snapshots.extend(snapshot_with_theme_options_collect(
+                &format!("fullscreen_fit_cycle_all_{size_name}_{theme_name}"),
+                theme,
+                mimageviewer::settings::TextContrast::Standard,
+                size,
+                None,
+                |ui| mimageviewer::draw_fullscreen_fit_cycle_settings(ui, &mut settings),
+                |_| {},
+            ));
+        }
+    }
 }
 
 #[test]
@@ -3266,4 +3486,68 @@ fn external_tool_preparing_dark() {
             mimageviewer::external_tool::draw_external_tool_preparing_body(ui, 128);
         },
     );
+}
+
+fn diagnostics_export_snapshot(
+    state: &str,
+    theme_name: &str,
+    theme: mimageviewer::os_theme::ResolvedTheme,
+) {
+    snapshot_with_theme_contrast_and_size(
+        &format!("diagnostics_export_{state}_{theme_name}"),
+        theme,
+        mimageviewer::settings::TextContrast::Standard,
+        egui::vec2(620.0, 180.0),
+        |ui| mimageviewer::draw_diagnostics_export_snapshot_fixture(ui, state),
+    );
+}
+
+#[test]
+fn diagnostics_export_running_light() {
+    diagnostics_export_snapshot(
+        "running",
+        "light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+    );
+}
+
+#[test]
+fn diagnostics_export_running_dark() {
+    diagnostics_export_snapshot(
+        "running",
+        "dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+    );
+}
+
+#[test]
+fn diagnostics_export_incomplete_light() {
+    diagnostics_export_snapshot(
+        "incomplete",
+        "light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+    );
+}
+
+#[test]
+fn diagnostics_export_incomplete_dark() {
+    diagnostics_export_snapshot(
+        "incomplete",
+        "dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+    );
+}
+
+#[test]
+fn diagnostics_export_error_light() {
+    diagnostics_export_snapshot(
+        "error",
+        "light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+    );
+}
+
+#[test]
+fn diagnostics_export_error_dark() {
+    diagnostics_export_snapshot("error", "dark", mimageviewer::os_theme::ResolvedTheme::Dark);
 }

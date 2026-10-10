@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Noninteractive release-check analysis. Missing witnesses never become PASS.
 
-JSON contracts and synthetic tests are Phase 2; this module never starts an app.
+Canonical lifecycle reconciliation is Phase 3b; this module never starts an app.
 All reports use schema_version=1 and exit precedence FAIL(1), SKIPPED(2), PASS(0).
 """
 from __future__ import annotations
@@ -12,7 +12,7 @@ import math
 from collections import Counter
 from pathlib import Path
 
-from analyze_perf import analyze_idle_health, percentile
+from analyze_perf import PerfEvents, analyze_idle_health, percentile, validate_delivery
 
 REQUIRED_CASES = (
     "static-foreground", "static-background", "video-pin-background",
@@ -20,12 +20,61 @@ REQUIRED_CASES = (
 )
 HITCH_MS = 100.0
 MIN_DRAWN_SAMPLES = 200
+U64_MAX = (1 << 64) - 1
+SOURCE_ORIGINS = {"source_generated", "source_intrinsic"}
+CACHE_ORIGINS = {"upgradeable_cache", "final_cache", "drive_list_child_seed", "edit_preview_cache"}
 
 
 def number(value: object) -> float | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
         return float(value)
     return None
+
+
+def uint(value: object, *, positive: bool = False) -> bool:
+    return type(value) is int and (1 if positive else 0) <= value <= U64_MAX
+
+
+def request_identity(event: dict) -> tuple | None:
+    """Only the registered canonical u64 ID identifies a request; seq never does."""
+    key = event.get("key")
+    if (not uint(event.get("request_id"), positive=True) or not isinstance(key, str) or not key
+            or not uint(event.get("idx")) or not uint(event.get("items_gen"))):
+        return None
+    return event["request_id"], key, event["idx"], event["items_gen"]
+
+
+def request_begins(events: list[dict]) -> dict[tuple, dict]:
+    """Exclude missing/ambiguous registration rather than guessing from a result."""
+    groups = {}
+    for event in events:
+        if event.get("cat") == "qa" and event.get("kind") == "request_begin":
+            identity = request_identity(event)
+            if identity is not None:
+                groups.setdefault(identity[0], []).append(event)
+    return {request_identity(group[0]): group[0] for group in groups.values()
+            if len(group) == 1 and number(group[0].get("t")) is not None
+            and group[0]["t"] >= 0 and uint(group[0].get("evaluated_display_px"), positive=True)}
+
+
+def correlated_producer(event: dict, begins: dict[tuple, dict]) -> dict | None:
+    identity = request_identity(event)
+    begin = begins.get(identity)
+    timestamp = number(event.get("t"))
+    if begin is None or timestamp is None or timestamp < begin["t"]:
+        return None
+    if event.get("kind") == "source" and event.get("from_cache") is False and event.get("origin") in SOURCE_ORIGINS:
+        return begin
+    if event.get("kind") == "cache_read" and event.get("from_cache") is True and event.get("origin") in CACHE_ORIGINS:
+        return begin
+    return None
+
+
+def delivery_evidence(result: dict, events: list[dict], expected_pid: int | None,
+                      *, coverage_end_t: float | None = None) -> None:
+    delivery = validate_delivery(events, expected_pid=expected_pid, coverage_end_t=coverage_end_t)
+    result["evidence"]["delivery"] = delivery
+    result["environment_errors"].extend(f"log delivery: {reason}" for reason in delivery["reasons"])
 
 
 def report(case_id: str) -> dict:
@@ -50,12 +99,14 @@ def read_json(path: Path) -> dict:
 
 def load_events_strict(path: Path) -> tuple[list[dict], list[str]]:
     """Unlike the exploratory CLI, the release gate retains malformed-line errors."""
-    events, errors = [], []
+    events, errors = PerfEvents(), []
     try:
         with path.open(encoding="utf-8-sig") as stream:
             for line_no, line in enumerate(stream, 1):
                 if not line.strip():
                     continue
+                if not line.endswith("\n"):
+                    errors.append(f"incomplete JSONL tail at line {line_no}")
                 try:
                     event = json.loads(line, parse_constant=lambda s: (_ for _ in ()).throw(ValueError(s)))
                     if (not isinstance(event, dict) or number(event.get("t")) is None
@@ -69,6 +120,7 @@ def load_events_strict(path: Path) -> tuple[list[dict], list[str]]:
         errors.append(f"cannot read perf log: {exc}")
     if not events:
         errors.append("perf log contains no valid events")
+    events.evidence_errors.extend(errors)
     return events, errors
 
 
@@ -218,6 +270,7 @@ def cache_errors(events: list[dict], evidence: dict, case_id: str) -> list[str]:
     else:
         intended = [opens[0].get("folder_path", "")] if isinstance(opens[0], dict) else []
     valid_folders = set()
+    begins = request_begins(events)
     for opened in opens:
         if not isinstance(opened, dict) or not opened.get("folder_path"):
             continue
@@ -240,18 +293,20 @@ def cache_errors(events: list[dict], evidence: dict, case_id: str) -> list[str]:
             required_keys = [evidence["target_key"]] if case_id == "video-pin-background" else keys
             if all(any(e.get("cat") == "qa" and e.get("kind") == "cache_read"
                        and e.get("key") == key and e.get("items_gen") == generation
-                       and e.get("from_cache") is True for e in events) for key in required_keys):
+                       and correlated_producer(e, begins) is not None for e in events) for key in required_keys):
                 valid_folders.add(folder)
         elif opened.get("pre_open_absent") is True:
-            begin_times = {e.get("request_id"): e["t"] for e in events if e.get("cat") == "qa"
-                           and e.get("kind") == "request_begin" and number(e.get("t")) is not None}
             first_sources = []
             for key in keys:
                 producers = [e for e in events if e.get("cat") == "qa" and e.get("kind") in ("source", "cache_read")
                              and e.get("key") == key and e.get("items_gen") == generation]
-                producers.sort(key=lambda e: begin_times.get(e.get("request_id"), e.get("t", math.inf)))
-                first_sources.append(bool(producers and producers[0].get("from_cache") is False
-                                          and producers[0].get("kind") == "source"))
+                # Every candidate needs its actual begin, including the first cache hit.
+                # Missing provenance cannot silently sort behind a later source result.
+                if any(correlated_producer(e, begins) is None for e in producers):
+                    first_sources.append(False)
+                    continue
+                producers.sort(key=lambda e: (begins[request_identity(e)]["t"], e["t"]))
+                first_sources.append(bool(producers and producers[0].get("kind") == "source"))
             if all(first_sources):
                 valid_folders.add(folder)
     missing = [p for p in intended if normalize_search_path(p) not in valid_folders]
@@ -317,8 +372,10 @@ def static_request_errors(events: list[dict], evidence: dict, case_id: str) -> l
     if not opens or not isinstance(opens[0], dict):
         return ["static request target/generation proof missing"]
     keys, gen = target_keys(opens[0].get("target_keys")), opens[0].get("items_gen")
-    if not any(e.get("cat") == "qa" and e.get("kind") == "request_begin" and e.get("key") in keys
-               and e.get("items_gen") == gen and number(e.get("evaluated_display_px")) == px for e in events):
+    begins = request_begins(events)
+    if not any(e.get("cat") == "qa" and e.get("kind") in ("source", "cache_read") and e.get("key") in keys
+               and e.get("items_gen") == gen and (begin := correlated_producer(e, begins)) is not None
+               and number(begin.get("evaluated_display_px")) == px for e in events):
         return ["static worker request has no matching actual display pixels/key/generation witness"]
     return []
 
@@ -341,6 +398,8 @@ def analyze_perf_smoke(events: list[dict], *, expected_pid: int | None = None,
             valid_events.append(event)
     events = valid_events
     session_witness(events, expected_pid, errors)
+    delivery_evidence(result, events, expected_pid,
+                      coverage_end_t=max((e["t"] for e in events if e.get("cat") != "log"), default=0))
     evidence = evidence or {}
     if not isinstance(evidence, dict):
         errors.append("case evidence must be an object")
@@ -571,15 +630,19 @@ def analyze_case_evidence(events: list[dict], evidence: dict, expected_pid: int 
                           *, setup_deadline_t: float | None = None) -> dict:
     """Validate actual diagnostic witnesses; recipe claims alone prove no app work.
 
-    qa.begin/close_accept/tray_hide/finalized/seed/on_exit are read-only hooks.
+    qa.request_begin/source/cache_read/close_accept/tray_hide/finalized are
+    read-only projections of the canonical lifecycle; thumb timing is not proof.
     A finalized event's request_id must match source work, independently of seq.
     Tray reproduction must be complete by the converted measurement start.
-    Absent Phase 3 hooks intentionally leave the Phase 2 run SKIPPED.
+    Missing lifecycle or log-delivery witnesses leave the run SKIPPED.
     """
     case_id = evidence.get("case_id", "evidence")
     result = report(case_id)
     errors = result["environment_errors"]
-    session_witness(events, expected_pid if expected_pid is not None else evidence.get("pid"), errors)
+    session = session_witness(events, expected_pid if expected_pid is not None else evidence.get("pid"), errors)
+    delivery_evidence(result, events, expected_pid if expected_pid is not None else evidence.get("pid"),
+                      coverage_end_t=max((e["t"] for e in events if e.get("cat") != "log"
+                                          and number(e.get("t")) is not None), default=0))
     errors.extend(cache_errors(events, evidence, case_id))
     errors.extend(static_request_errors(events, evidence, case_id))
     qa = [e for e in events if e.get("cat") == "qa" and e.get("case_id") == case_id]
@@ -630,18 +693,21 @@ def analyze_case_evidence(events: list[dict], evidence: dict, expected_pid: int 
             deadline = None
 
         def established_by_start(timestamp: float) -> bool:
-            return deadline is not None and timestamp <= deadline
+            return deadline is not None and 0 <= timestamp <= deadline
 
         closes = [e for e in qa if e.get("kind") == "close_accept"]
         hides = [e for e in qa if e.get("kind") == "tray_hide"]
         accepted = None
         for close in closes:
             for hide in hides:
-                if (isinstance(close.get("close_sequence"), int)
+                if (uint(close.get("close_sequence"), positive=True)
+                        and uint(close.get("items_gen"))
+                        and uint(hide.get("close_sequence"), positive=True) and uint(hide.get("items_gen"))
                         and hide.get("close_sequence") == close["close_sequence"]
                         and hide.get("items_gen") == close.get("items_gen")
                         and hide.get("folder_path") == close.get("folder_path")
-                        and hide.get("folder_path")
+                        and isinstance(hide.get("folder_path"), str) and hide["folder_path"]
+                        and hide.get("window_visible") is False
                         and number(close.get("t")) is not None and number(hide.get("t")) is not None
                         and established_by_start(close["t"]) and established_by_start(hide["t"])
                         and hide["t"] >= close["t"]):
@@ -650,63 +716,64 @@ def analyze_case_evidence(events: list[dict], evidence: dict, expected_pid: int 
             errors.append("exactly one native close acceptance and correlated tray hide required")
         else:
             close, hide = accepted
+            cache_check_ms = number(close.get("cache_check_unix_ms"))
+            anchor_ms, anchor_t = number(session.get("wall_unix_ms")), number(session.get("wall_t"))
+            cache_check_t = (anchor_t + (cache_check_ms - anchor_ms) / 1000
+                             if cache_check_ms is not None and cache_check_ms > 0
+                             and anchor_ms is not None and anchor_ms > 0 and anchor_t is not None and anchor_t >= 0 else None)
+            if (cache_check_t is None or not established_by_start(cache_check_t) or cache_check_t > close["t"]
+                    or hide.get("cache_check_unix_ms") != close.get("cache_check_unix_ms")):
+                errors.append("tray cache-absence check clock missing/invalid or later than close acceptance")
             expected_complete = case_id == "tray-close-after-loading"
             if close.get("loading_complete") is not expected_complete or hide.get("loading_complete") is not expected_complete:
                 errors.append("loading state at close acceptance/hide does not establish this case")
             valid_targets = []
-            for target in hide.get("targets", []):
+            begins = request_begins(events)
+            for target in hide.get("targets", []) if isinstance(hide.get("targets"), list) else []:
                 if (not isinstance(target, dict) or target.get("catalog_absent") is not True
                         or target.get("cache_map_absent") is not True
-                        or not target.get("key") or not isinstance(target.get("idx"), int)
+                        or not isinstance(target.get("key"), str) or not target["key"] or not uint(target.get("idx"))
+                        or not uint(target.get("items_gen"))
                         or target.get("items_gen") != hide.get("items_gen")):
                     continue
-                accepted_targets = [t for t in close.get("targets", []) if
-                                    all(t.get(f) == target.get(f) for f in ("key", "idx", "items_gen"))
+                accepted_targets = [t for t in close.get("targets", []) if isinstance(t, dict)
+                                    and uint(t.get("idx")) and uint(t.get("items_gen"))
+                                    and all(t.get(f) == target.get(f) for f in ("key", "idx", "items_gen"))
                                     and t.get("catalog_absent") is True and t.get("cache_map_absent") is True]
                 if not accepted_targets:
-                    continue
-                if any(e.get("cat") in ("qa", "thumb") and e.get("kind") in ("source", "load_phases")
-                       and all(e.get(f) == target.get(f) for f in ("key", "idx", "items_gen"))
-                       and e.get("should_save") is True for e in events):
                     continue
                 # A unique owner ID is not inferred from seq: retries can reuse it.
                 finalized = [e for e in qa if e.get("kind") == "finalized"
                              and all(e.get(f) == target.get(f) for f in ("key", "idx", "items_gen"))
+                             and uint(e.get("close_sequence"), positive=True)
                              and e.get("close_sequence") == hide.get("close_sequence")
                              and number(e.get("t")) is not None and e["t"] > hide["t"]
                              and established_by_start(e["t"])
                              and e.get("image_backlog_contains_request") is True and e.get("window_visible") is False]
                 for final in finalized:
-                    req_id = final.get("request_id")
-                    loads = [e for e in events if e.get("cat") == "thumb" and e.get("kind") == "load_phases"
-                             and all(e.get(f) == target.get(f) for f in ("key", "idx", "items_gen"))
-                             and e.get("should_save") is False and e.get("force_cache", False) is False
-                             and interval(e) is not None and interval(e)[0] > hide["t"]
-                             and established_by_start(interval(e)[1])]
-                    sources = [e for e in events if e.get("cat") in ("thumb", "qa")
-                               and e.get("kind") in ("decode_end", "source") and e.get("from_cache") is False
-                               and all(e.get(f) == target.get(f) for f in ("key", "idx", "items_gen"))
-                               and number(e.get("t")) is not None and e["t"] > hide["t"]
-                               and established_by_start(e["t"])]
-                    begins = [e for e in events if e.get("cat") == "qa" and e.get("kind") == "request_begin"
-                              and e.get("request_id") == req_id and number(e.get("t")) is not None
-                              and e["t"] > hide["t"]
-                              and established_by_start(e["t"])
-                              and all(e.get(f) == target.get(f) for f in ("key", "idx", "items_gen"))]
-                    matching_sources = [e for e in sources if e.get("request_id") == req_id]
-                    save_times = ([interval(e)[1] for e in loads if e.get("request_id") == req_id]
-                                  + [e["t"] for e in matching_sources if e.get("cat") == "qa"
-                                     and e.get("should_save") is False and e.get("force_cache", False) is False])
-                    if (isinstance(req_id, int) and not isinstance(req_id, bool) and req_id > 0
-                            and save_times and matching_sources and begins):
-                        valid_targets.append({**target, "request_id": req_id, "finalized_t": final["t"],
-                                              "request_begin_t": min(e["t"] for e in begins),
-                                              "source_t": min(e["t"] for e in matching_sources),
-                                              "save_skipped_t": min(save_times)})
+                    identity = request_identity(final)
+                    begin = begins.get(identity)
+                    if begin is None or not hide["t"] < begin["t"] <= final["t"]:
+                        continue
+                    sources = [e for e in qa if e.get("kind") == "source"
+                               and request_identity(e) == identity
+                               and correlated_producer(e, begins) is not None
+                               and e.get("origin") == "source_generated"
+                               and begin["t"] <= e["t"] <= final["t"]
+                               and established_by_start(e["t"])
+                               and e.get("should_save") is False and e.get("force_cache") is False]
+                    if any(e.get("kind") == "source" and request_identity(e) == identity
+                           and (e.get("should_save") is True or e.get("force_cache") is True) for e in qa):
+                        continue
+                    if sources:
+                        source = min(sources, key=lambda e: e["t"])
+                        valid_targets.append({**target, "request_id": identity[0], "finalized_t": final["t"],
+                                              "request_begin_t": begin["t"], "source_t": source["t"],
+                                              "save_skipped_t": source["t"], "origin": source["origin"]})
             if not valid_targets:
                 errors.append("tray save-skip/cache absence/post-hide source/Finalized-image-backlog request correlation missing by measurement start")
             result["evidence"]["tray"] = {"close": close, "hide": hide, "valid_targets": valid_targets,
-                                           "setup_deadline_t": deadline}
+                                           "setup_deadline_t": deadline, "cache_check_t": cache_check_t}
     return finish(result)
 
 
@@ -716,23 +783,37 @@ def analyze_idle_case(events: list[dict], sampler: dict, evidence: dict,
     result = convert_clock_window(events, sampler, expected_pid)
     result["case_id"] = evidence.get("case_id", sampler.get("case_id", "idle"))
     clock = result["evidence"].get("clock")
+    clock_valid = clock is not None and not result["environment_errors"]
     witnesses = analyze_case_evidence(events, evidence, expected_pid,
                                      setup_deadline_t=clock["start_t"] if clock else None)
     result["environment_errors"].extend(witnesses["environment_errors"])
     result["evidence"].update(witnesses["evidence"])
     result["metrics"].update(witnesses["metrics"])
-    if not clock or result["environment_errors"]:
-        return finish(result)
-    if sampler.get("index_scan_wait") != "settled":
-        result["environment_errors"].append("fixture index initial scan completion not confirmed")
-    if sampler.get("identity_evidence") != "command_line" or sampler.get("portable_identity_verified") is not True:
-        result["environment_errors"].append("exact portable exe/data/command-line identity missing")
+    # External CPU/log measurements and the sampler verdict do not depend on
+    # mapping UTC to perf time. Preserve them even when that mapping is invalid.
     result["environment_errors"].extend(sampler.get("environment_errors", []))
     result["warnings"].extend(sampler.get("warnings", []))
     if sampler.get("verdict") == "PASS_WITH_WARNINGS" and not sampler.get("warnings"):
         result["warnings"].append("external sampler reported warnings (details absent)")
     if sampler.get("verdict") == "FAIL":
         result["failures"].extend(sampler.get("failures") or ["external sampler FAIL"])
+    for field, limit in (("cpu_core_ratio", "max_cpu_core_ratio"),
+                         ("app_log_growth_bytes", "max_app_log_growth_bytes"),
+                         ("perf_log_growth_bytes", "max_perf_log_growth_bytes")):
+        value = number(sampler.get(field))
+        if value is None or value < 0:
+            result["environment_errors"].append(f"missing/invalid external {field}")
+        elif value > thresholds[limit]:
+            result["failures"].append(f"{field} {value} exceeds {thresholds[limit]}")
+        elif field == "cpu_core_ratio" and value > thresholds["target_cpu_core_ratio"]:
+            result["warnings"].append(f"CPU one-core ratio {value} exceeds target {thresholds['target_cpu_core_ratio']}")
+        result["metrics"][field] = value
+    if not clock_valid:
+        return finish(result)
+    if sampler.get("index_scan_wait") != "settled":
+        result["environment_errors"].append("fixture index initial scan completion not confirmed")
+    if sampler.get("identity_evidence") != "command_line" or sampler.get("portable_identity_verified") is not True:
+        result["environment_errors"].append("exact portable exe/data/command-line identity missing")
     if abs(clock["wall_seconds"] - thresholds["measure_seconds"]) > .25:
         result["environment_errors"].append("external measurement duration does not match threshold window")
     if sampler.get("process_alive_start") is not True or sampler.get("process_alive_end") is not True:
@@ -772,19 +853,11 @@ def analyze_idle_case(events: list[dict], sampler: dict, evidence: dict,
         max_same_work=thresholds["max_same_work"], max_input_events=thresholds["max_input_events"],
     )
     result["metrics"]["idle"] = idle["metrics"]
+    result["evidence"]["idle_delivery"] = idle["delivery"]
+    if idle["status"] == "CannotJudge":
+        result["environment_errors"].extend(f"idle log delivery: {reason}" for reason in idle["delivery"]["reasons"])
     result["failures"].extend(idle["failures"])
     result["warnings"].extend(idle["warnings"])
-    for field, limit in (("cpu_core_ratio", "max_cpu_core_ratio"),
-                         ("app_log_growth_bytes", "max_app_log_growth_bytes"),
-                         ("perf_log_growth_bytes", "max_perf_log_growth_bytes")):
-        value = number(sampler.get(field))
-        if value is None or value < 0:
-            result["environment_errors"].append(f"missing/invalid external {field}")
-        elif value > thresholds[limit]:
-            result["failures"].append(f"{field} {value} exceeds {thresholds[limit]}")
-        elif field == "cpu_core_ratio" and value > thresholds["target_cpu_core_ratio"]:
-            result["warnings"].append(f"CPU one-core ratio {value} exceeds target {thresholds['target_cpu_core_ratio']}")
-        result["metrics"][field] = value
     if result["case_id"] == "video-pin-background":
         key = evidence.get("target_key")
         latest_open = max((e.get("t", 0) for e in events if e.get("cat") == "nav"

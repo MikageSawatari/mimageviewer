@@ -60,7 +60,7 @@ pub fn run_infer_worker() -> ! {
                 "AiRuntime init failed: {e}"
             )));
             crate::logger::log(format!("[TRT-worker] AiRuntime init 失敗: {e}"));
-            std::process::exit(1);
+            crate::exit_with_logs(1);
         }
     };
 
@@ -75,7 +75,7 @@ pub fn run_infer_worker() -> ! {
             "[TRT-worker] TRT で初期化されず、effective={:?}",
             active.effective
         ));
-        std::process::exit(1);
+        crate::exit_with_logs(1);
     }
 
     // ハンドシェイク: 起動成功を親に通知
@@ -159,7 +159,7 @@ pub fn run_infer_worker() -> ! {
     }
 
     // ここまで来たら明示的に exit 0
-    std::process::exit(0);
+    crate::exit_with_logs(0);
 }
 
 /// 共有メモリのキャッシュ (worker 側、永続 shm を使い回す)。

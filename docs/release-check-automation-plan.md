@@ -130,7 +130,7 @@ tray 2ケースだけは起動時 overlay で既存の `cache_policy=off` を指
 
 両 tray ケースについて、同じ対象キー / idx / items generation と要求を相関させ、次を必須にする。
 
-1. source 要求の `load_phases.should_save=false`、close直前（受理・格納境界）の catalog / cache_map
+1. source 要求の実保存判定 `qa/source.should_save=false`、close直前（受理・格納境界）の catalog / cache_map
    両方で有効な対象 cache が無いことを、読取専用の証拠で確認する。while-loading の未完了要求は
    保存判定到達後の証拠も照合する。初回の cache miss だけでは代替しない。
 2. 格納後、GPU 解放で対象が再要求され、`from_cache=false` の source 生成と `Finalized` が
@@ -354,9 +354,9 @@ suite が具体化した後、5 idle ケース・2 perf ケース、見込み **
   `Finalized` 時点の実画像 queue 所属を接続する。F の現行 terminal / requested 観測もそこで見直す。
   測定開始前に成立を待つ worker と無操作 sleep の境界を整合させ、同じ ID の正例・別 ID / late 証拠の
   負例を再検証する。新たな所有 state や UI-thread I/O は作らない。
-- 接続前は tray close hook が EnvironmentFailure / 2 を返し、計測を始めない。worker begin/source 証拠を
-  撤去したため、static の requested_px と uncached の source 証明も Phase 3b まで未接続となる。
-  欠損を免除しないので、現段階の suite を PASS／採用済みとは記録しない。
+- Phase 3b 接続前は tray close hook が EnvironmentFailure / 2 を返し、static の requested_px と
+  uncached の source 証明も未接続だった。下記の接続後も、欠損証拠を免除せず、Phase 4 の実測なしに
+  suite を PASS／採用済みとは記録しない。
 - 診断用 G は `cfg(any(test, feature="test-script"))` で variant と全 match arm を限定する。
 
 実行窓の明示了承後の入口は `scripts/ui-smoke.ps1 -Scenario ReleaseChecks -InteractiveApproved`。
@@ -365,5 +365,34 @@ AI / GPU 経路変更版だけ `-IncludeFirstAi` を追加する。出力は各 
 
 非対話検証は Python の analyzer / fixture / preflight 回帰、`scripts/test-release-check-safety.ps1`、
 Rust の diagnostic / recipe / payload 焦点テストと feature 有無の check。検証証跡の引き継ぎ先は
-`target/F-1361-impl-msg.txt`。Line A の modifier_probe 入力集計と §1.360 lifecycle 修正の統合、
-tray 2ケースの旧版 FAIL / 修正版 PASS、固定 PC 各3回の成立率・閾値、実 foreground は Phase 4 に残す。
+`target/F-1361-impl-msg.txt`。tray 2ケースの旧版 FAIL / 修正版 PASS、固定 PC 各3回の成立率・閾値、
+実 foreground は Phase 4 に残す。
+
+### Phase 3b 接続（2026-10-10、master 0a5bf3689 後）
+
+- A の `ThumbnailRequestId::Registered(u64)` をそのまま使う。`ThumbnailRequests` の test-only
+  `diagnostic_projection` は ID / idx / generation を照合し、既存 Phase と実画像 queue の所属、
+  worker 終端待ちを読むだけ。追加の request 所有 state、TLS 採番、`diagnostic_id`、旧 backlog 観測はない。
+- worker の cache 判定前に `qa/request_begin` と実際の `evaluated_display_px` を記録する。
+  source 生成の通常保存判定位置で `qa/source` の origin / `should_save` / `force_cache` を記録する。
+  cache receipt と Finalized は ROOT が正本 owner に受理した結果だけを記録し、Finalized の queue 所属は
+  受理直前の同一 ID の投影を使う。outer item の key を導出できない経路は証拠を捏造しない。
+- tray close は loading mode と正本の worker activity を確認し、実 `WM_CLOSE` を送る。
+  その後の準備待ちでは Observe を許すが、close / hide / 同一 ID の格納後 worker begin / source-save skip /
+  Finalized 実画像 queue 所属がすべて成立するまで `ready.json` を出さない。成立後の一つの idle sleep では
+  Observe / UI command を送らない。外部計測開始への UTC anchor 変換による deadline 判定も維持する。
+- §1.360 の passive `modifier_probe` は master の idle 集計を再利用し、入力集計コードには変更を加えない。
+  §1.356 の配送 gate に合わせて perf 判定は正常終了後の保存済み shutdown checkpoint を使う。
+  sampler は外部 CPU / log / window の測定と時計変換のみを担当し、稼働中に配送未確定の perf 判定をしない。
+  欠損配送は SKIPPED / 2、独立に観測済みの失敗は環境不成立を併記しても FAIL / 1 を維持する。
+- tray fixture は perf fixture と分離した `release-checks-v2`。各 mode に **600 subfolder × 1枚の
+  400×300 PNG、10列、Cache Off** を用意する。停止時の読み取り専用 preflight に tray 親 catalog 2個を追加し、
+  close 直前は kept target の cache 不在を再確認する。perf の 512×4、static / navigation / video / search は維持する。
+  PNG 内容は既存の決定的 encoder を使用する。A の実機記録
+  `C:\home\mimageviewer-nexttray\target\A-1360-agent-hwcheck.md` はこの小画像形状で旧版 FAIL / 修正版 PASS
+  （両 mode）、6000×4000 では非再現を確認済みだが、F suite での再確認は Phase 4 に残す。
+
+非対話検証は analyzer / 既存 perf / fixture / preflight Python、safety fake、正本 projection と tray barrier の
+feature 有無の Rust 焦点テスト、normal / portable check、full lib、fmt / diff check。
+引き継ぎ先は `target/F-1361-3b-msg.txt`。新規ファイルは test-only の
+`src/test_script/release_checks/tray_witness.rs`。アプリ起動・Phase 4・commit はこの接続作業に含めない。
