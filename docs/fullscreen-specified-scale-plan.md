@@ -969,3 +969,37 @@ fit循環4件、dark style8件成功。全libは11,478件成功・52件ignore・
 全ui_snapshotは144件成功。対象PNGは既存live editor 8枚更新／全popup 8枚新規で、全16枚を目視確認した。
 通常／portable core check、viewer context audit 36件と実監査もexit 0。CRLFとdiff checkを確認し、
 build-dev・`target/dev-runtime`への書込み・製品起動・commitは行っていない。
+
+## 19. popup再レビューの回帰・利用者説明修正（2026-10-10）
+
+P2を確認した。§18の描画fixtureは数値編集にフォーカスせず、Appの全画面キー処理も
+通していなかった。狭幅の描画fixtureはscroll・軸・単位・外側clickだけを検証する名前へ
+改め、IME保証は実際の数値編集を始める二つのApp回帰へ置換する。
+
+`specified_scale_real_numeric_ime_enter_is_owned_by_popup` / `_escape_is_owned_by_popup`
+は1093×614と320×320で実popupのDragValueをクリックし、TextEditのfocusと実bufferを確認する。
+既存IME input plugin、`App::update_ime_state`、`render_fullscreen_viewport`を通してpreeditを
+数値欄へ届け、変換中のEnter / EscとCommit / Disabled→同frameのキーを検証する。
+全画面とpopupの継続、IME keyboard owner、数値の確定／取消を確認する。
+DragValueのEnterによる編集終了はwidgetの既存動作として区別し、popup／全画面終了とは扱わない。
+
+検出力はAppのclose経路へキー所有権を迂回する一時mutationを入れて確認した。
+Enterは変換中、EscはDisabledと同frameのキーで`fullscreen_idx=None`となり、両テストが
+失敗した（exit 101、`target/E-1342-ui2-ime-leak-red.log`）。このmutationを撤去した状態で両回帰のgreen（exit 0）も確認した。
+製品のIME・keyboard・viewport predicate・保存ownerは変更せず、待機・repaint・追加stateを作らない。
+
+P3はpopup／環境設定の説明を「自動フィット」「手動ズーム」「AI拡大前の元画像サイズ」へ
+統一した。「両軸／内接／UI倍率」も幅と高さ・枠に収まる・アプリの表示倍率と説明する。
+意図した文言変更だけを指定サイズeditor・live editor・全popupのexact snapshot testで更新する。
+最終検証、変更PNGと新規ファイルの一覧は`target/E-1342-ui2-msg.txt`へ記録する。
+利用者の実機確認中のためbuild-dev／`target/dev-runtime`への書込み・製品起動・commitは行わない。
+
+最終検証（2026-10-10）: fmt check・glyph lint（危険glyph 0）、指定サイズ73件、IME helper23件、
+全ui_snapshot144件成功。変更PNG34枚を9枚の確認用一覧画像と個別画像で目視確認し、
+操作部・見出し領域の画素とPNG寸法が旧版と不変であることも比較した（scroll thumbは比較領域外）。
+初回の全libは11,479件成功／既知の負荷依存EOF 1件失敗／52件ignore（exit 101、1056.79秒）。
+EOF単独再実行は1件成功、全libの4並列再実行は11,480件成功／失敗0／52件ignore
+（exit 0、1010.08秒）。テストの除外・改変はしていない。通常／portable core checkもexit 0。
+新規source・test・docs・snapshotファイルなし。変更PNG全名、red→greenと検証の実ログ、
+新規確認成果物は`target/E-1342-ui2-msg.txt`へ記録する。製品起動・build-dev・commitは行わず、
+利用者が実機確認中の`target/dev-runtime`には書き込まない。

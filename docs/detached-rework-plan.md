@@ -1522,6 +1522,9 @@ fit popup bodyを共通のcustom-painted行／rectへ戻し、指定サイズを
 共通／favorite live handler、IME / 0キー、context identity、host / placement、画像fit geometry、
 worker・保存境界は変更しない。既存popup ownerの描画とhitを揃える構造修正であり、
 別窓症状guard・新state・待機・再生成を追加しない。実HUDの狭幅scroll / 入力とsnapshotを検証する。
+2026-10-10 popup再レビュー追加: 描画fixtureのIME主張を実viewport内の数値編集回帰へ置換する。
+IME input policy→App→`render_fullscreen_viewport`で全画面／popup継続を検証し、一時close漏れの
+mutationで検出力も確認する。製品述語・keyboard ownerは変更せず、説明文だけを利用者用語へ揃える。
 
 2026-10-09 master統合後の一覧公開境界修正: 利用者指定の構造修正として、Bookmark一覧buildをmainの既存Surface lease・switch sequenceで所有し、mainの成功したitems交換だけが旧buildを退役させる。detached contextのmount・items交換・pollはmainのbuildを退役も採用もしない。同じBookmarkのsortは要求ownerを継続し、A/B記憶クリアは新epochで既存refreshを再開始する。Ctrl+Fの完了filterは送信済み条件を一緒に保持し、ViewerContextBundleの既存swap/park/dropとSmart退避で一緒に運ぶ。新しいdetached predicate・viewport・placement・待機・retry・pending ownerを設けず、公開先の所有証明と既存payloadの未接続を直すため、§2の症状パッチに当たらない。
 

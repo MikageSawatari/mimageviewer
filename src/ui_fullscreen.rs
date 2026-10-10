@@ -44192,7 +44192,7 @@ fn fs_fit_popup_specified_editor(
     fs_fit_popup_axis(ui, "幅", &mut value.width);
     fs_fit_popup_axis(ui, "高さ", &mut value.height);
     ui.add(egui::Label::new(egui::RichText::new(
-        "％は画像表示領域基準。pxは表示倍率に追従。両軸指定は枠へ内接。\n縮小しないは枠より優先。自動fitはAI前原寸の5倍まで（手動zoom・Zは上限外）。",
+        "％は画像表示領域が基準。pxは画面の表示倍率に追従。幅・高さの枠に収めます。\n「縮小しない」は枠より優先。自動フィットはAI拡大前の元画像サイズの5倍まで。手動ズーム・Zは5倍を超えられます。",
     ).size(11.0).color(egui::Color32::from_gray(150))).wrap());
     *value != before
 }
@@ -79866,8 +79866,187 @@ mod specified_scale_consumer_tests {
         );
     }
 
+    #[cfg(windows)]
+    fn run_specified_scale_real_numeric_ime_popup(key: egui::Key, size: egui::Vec2) {
+        let ctx = egui::Context::default();
+        install_fs_navigator_input_tracking(&ctx);
+        crate::ime_focus::install_ime_input_policy(&ctx);
+        let mut app = pdf_app(&ctx, 1);
+        app.items[0] = GridItem::Image(app.tmp.path().join("ime-popup.png"));
+        app.settings.fullscreen_specified_scale = FullscreenSpecifiedScale::default();
+        app.settings.fullscreen_top_bar_locked = true;
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        app.native_video_in_window_active = true;
+        app.fit_popup_open = true;
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        let draw = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    // The installed plugin normalizes input before egui focus handling.
+                    // Embedded fullscreen then uses the same App entry as update().
+                    app.update_ime_state(ctx);
+                    app.render_fullscreen_viewport(ctx);
+                },
+            )
+        };
+        let mut output = draw(&mut app, vec![]);
+        for _ in 0..4 {
+            output = draw(&mut app, vec![]);
+        }
+        if painted_label(&output, "80.0").is_none() {
+            let header = painted_label(&output, "ズーム/フィット  [0で循環]").unwrap();
+            draw(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(header.center() + egui::vec2(0.0, 120.0)),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -200.0),
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            for _ in 0..24 {
+                output = draw(&mut app, vec![]);
+            }
+        }
+        let number = painted_label(&output, "80.0").expect("real popup numeric control is visible");
+        assert!(rect.contains_rect(number));
+        draw(&mut app, click(number.center()));
+        draw(&mut app, vec![]);
+        let edit_id = ctx
+            .memory(|memory| memory.focused())
+            .expect("click starts numeric editing");
+        assert!(ctx.wants_keyboard_input());
+        assert!(egui::TextEdit::load_state(&ctx, edit_id).is_some());
+        assert_eq!(
+            ctx.data(|data| data.get_temp::<String>(edit_id)),
+            Some("80.0".to_owned()),
+            "focus must belong to the real DragValue text buffer"
+        );
+        let before = app.settings.common_fullscreen_specified_scale();
+        draw(
+            &mut app,
+            vec![
+                egui::Event::Ime(egui::ImeEvent::Enabled),
+                egui::Event::Ime(egui::ImeEvent::Preedit("１２５".into())),
+            ],
+        );
+        assert!(app.ime_input_active(&ctx));
+        assert!(matches!(
+            app.keyboard_owner_for_pass(&ctx),
+            crate::keyboard_input::KeyboardOwner::TextInput { .. }
+        ));
+        assert_eq!(
+            ctx.data(|data| data.get_temp::<String>(edit_id)),
+            Some("１２５".to_owned()),
+            "the numeric TextEdit must receive real IME preedit"
+        );
+        let key_event = |pressed| egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        draw(&mut app, vec![key_event(true)]);
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(0),
+            "composition {key:?} must not close fullscreen"
+        );
+        assert!(
+            app.fit_popup_open,
+            "composition {key:?} belongs to the numeric editor"
+        );
+        if key == egui::Key::Escape {
+            assert_eq!(ctx.memory(|memory| memory.focused()), Some(edit_id));
+            draw(&mut app, vec![key_event(false)]);
+        } else {
+            // DragValue's numeric TextEdit ends on Enter. That is widget-local,
+            // not a fullscreen close; start another real edit for commit ordering.
+            assert_ne!(ctx.memory(|memory| memory.focused()), Some(edit_id));
+            draw(
+                &mut app,
+                vec![egui::Event::Ime(egui::ImeEvent::Disabled), key_event(false)],
+            );
+            output = draw(&mut app, vec![]);
+            let number = painted_label(&output, "80.0").unwrap();
+            draw(&mut app, click(number.center()));
+            draw(&mut app, vec![]);
+            assert_eq!(ctx.memory(|memory| memory.focused()), Some(edit_id));
+            draw(
+                &mut app,
+                vec![
+                    egui::Event::Ime(egui::ImeEvent::Enabled),
+                    egui::Event::Ime(egui::ImeEvent::Preedit("１２５".into())),
+                ],
+            );
+        }
+        // Windows can deliver commit/disable before the same Enter/Esc edge.
+        // This crosses both the IME plugin and the App shortcut grace policy.
+        let end = if key == egui::Key::Enter {
+            egui::ImeEvent::Commit("125".into())
+        } else {
+            egui::ImeEvent::Disabled
+        };
+        draw(&mut app, vec![egui::Event::Ime(end), key_event(true)]);
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(0),
+            "IME end + {key:?} must not close fullscreen"
+        );
+        assert!(
+            app.fit_popup_open,
+            "IME end + {key:?} must retain the popup"
+        );
+        assert!(app.ime_input_active(&ctx));
+        assert_ne!(
+            ctx.memory(|memory| memory.focused()),
+            Some(edit_id),
+            "numeric {key:?} ends the edit"
+        );
+        let after = app.settings.common_fullscreen_specified_scale();
+        if key == egui::Key::Enter {
+            assert_eq!(
+                after.width,
+                Some(SpecifiedScaleAxis::PercentTenths(1250)),
+                "Enter confirms the actual numeric value"
+            );
+        } else {
+            assert_eq!(
+                after, before,
+                "Esc cancels preedit without changing the value"
+            );
+        }
+        draw(&mut app, vec![key_event(false)]);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert!(app.fit_popup_open);
+    }
+
+    #[cfg(windows)]
     #[test]
-    fn specified_scale_real_hover_popup_scrolls_edits_and_survives_ime_in_a_small_viewport() {
+    fn specified_scale_real_numeric_ime_enter_is_owned_by_popup() {
+        for size in [egui::vec2(1093.0, 614.0), egui::vec2(320.0, 320.0)] {
+            run_specified_scale_real_numeric_ime_popup(egui::Key::Enter, size);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn specified_scale_real_numeric_ime_escape_is_owned_by_popup() {
+        for size in [egui::vec2(1093.0, 614.0), egui::vec2(320.0, 320.0)] {
+            run_specified_scale_real_numeric_ime_popup(egui::Key::Escape, size);
+        }
+    }
+
+    #[test]
+    fn specified_scale_real_hover_popup_scrolls_edits_in_a_small_viewport() {
         let ctx = egui::Context::default();
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 320.0));
         let mut open = true;
@@ -79928,33 +80107,6 @@ mod specified_scale_consumer_tests {
             Some(SpecifiedScaleAxis::LogicalPixels(_))
         ));
         assert!(open);
-        fit_popup_frame(
-            &ctx,
-            rect,
-            vec![
-                egui::Event::Ime(egui::ImeEvent::Enabled),
-                egui::Event::Ime(egui::ImeEvent::Preedit("幅".into())),
-            ],
-            &mut open,
-            &mut value,
-        );
-        assert!(open, "IME composition does not dismiss the fit popup");
-        for key in [egui::Key::Enter, egui::Key::Escape] {
-            fit_popup_frame(
-                &ctx,
-                rect,
-                vec![egui::Event::Key {
-                    key,
-                    physical_key: Some(key),
-                    pressed: true,
-                    repeat: false,
-                    modifiers: egui::Modifiers::NONE,
-                }],
-                &mut open,
-                &mut value,
-            );
-            assert!(open, "IME Enter/Esc must not dismiss the whole popup");
-        }
         fit_popup_frame(
             &ctx,
             rect,
